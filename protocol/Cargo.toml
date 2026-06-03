@@ -1,0 +1,13 @@
+[package]
+name = "helios_protocol"
+version = "0.1.0"
+edition = "2021"
+description = "Shared no_std wire-format definitions for the Helios vGPU ICD <-> KMD <-> virtio-gpu path. Single source of truth so the ICD and KMD can never drift on struct layout."
+
+[lib]
+# Pure definitions: usable from the no_std KMD, the std ICD, and the host tool.
+crate-type = ["lib"]
+
+[dependencies]
+# bytemuck is no_std by default; `derive` works without std.
+bytemuck = { version = "1", features = ["derive"] }

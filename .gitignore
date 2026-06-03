@@ -1,0 +1,24 @@
+# Build artifacts — Linux and Windows MUST use separate target dirs.
+# See CLAUDE.md: CARGO_TARGET_DIR=target/linux (Linux) / target/windows (Windows).
+/target
+/**/target
+target/
+
+# WDK / driver packaging output
+*.sys
+*.pdb
+*.cat
+*.cer
+/**/package/
+
+# Editor / OS cruft
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/
+System\ Volume\ Information
+
+# Local environment overrides
+.env
+*.local.toml

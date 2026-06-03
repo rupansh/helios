@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "win": {
+      "type": "stdio",
+      "command": "/home/rupansh/helios-vgpu/target/linux/release/win-mcp",
+      "args": [],
+      "env": {}
+    }
+  }
+}

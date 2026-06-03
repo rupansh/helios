@@ -1,0 +1,19 @@
+# cargo-make driver build, per windows-drivers-rs. `cargo make` packages the
+# .sys + .inf (+ test cert) into target/<profile>/package/.
+# wdk-build's load_rust_driver_makefile writes rust-driver-makefile.toml to
+# `${CARGO_MAKE_WORKSPACE_WORKING_DIRECTORY}/target/` (hardcoded `target/`, it
+# does NOT honor CARGO_TARGET_DIR). So this stays the default `target/...`.
+# IMPORTANT: build from a LOCAL disk (C:\), never the Z:\ share — Rust file IO
+# (this very copy) fails on the 9p/virtio share with OS error 87. See TOOLCHAIN.md.
+extend = "target/rust-driver-makefile.toml"
+
+[config]
+load_script = '''
+#!@rust
+//! ```cargo
+//! [dependencies]
+//! wdk-build = "0.5"
+//! ```
+#![allow(unused_doc_comments)]
+wdk_build::cargo_make::load_rust_driver_makefile()?
+'''

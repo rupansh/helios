@@ -1,0 +1,73 @@
+; helios_kmd.inx — Helios vGPU render-only WDDM display miniport driver.
+; Matches the virtio-gpu PCI device (VEN_1AF4 & DEV_1050). The wdk-build
+; toolchain stamps DriverVer and produces helios_kmd.inf during packaging.
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = Display
+ClassGUID   = {4D36E968-E325-11CE-BFC1-08002BE10318}
+Provider    = %ProviderName%
+CatalogFile = helios_kmd.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+DefaultDestDir = 13  ; driver store (DIRID 13) — required for a universal INF
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+helios_kmd.sys = 1,,
+
+; ──── Manufacturer / Models ────────────────────────────────────────────────
+
+; TargetOSVersion decoration (...16299 = Win10 1709) — required because the
+; install section copies to DIRID 13 (driver store), introduced in 10.0.16299.
+[Manufacturer]
+%ProviderName% = Helios_Models,NTamd64.10.0...16299
+
+[Helios_Models.NTamd64.10.0...16299]
+%DeviceDesc% = Helios_Install, PCI\VEN_1AF4&DEV_1050
+
+; ──── Installation ─────────────────────────────────────────────────────────
+
+[Helios_Install]
+CopyFiles = Helios_CopyFiles
+
+[Helios_CopyFiles]
+helios_kmd.sys
+
+[Helios_Install.Services]
+AddService = helios_kmd, 0x00000002, Helios_ServiceInstall
+
+[Helios_ServiceInstall]
+ServiceType    = 1                   ; SERVICE_KERNEL_DRIVER
+StartType      = 3                   ; SERVICE_DEMAND_START
+ErrorControl   = 0                   ; SERVICE_ERROR_IGNORE
+ServiceBinary  = %13%\helios_kmd.sys
+LoadOrderGroup = Video
+
+; ──── Software key (display driver registration) ───────────────────────────
+
+[Helios_Install.SoftwareSettings]
+AddReg = Helios_SoftwareSettings_Reg
+
+[Helios_SoftwareSettings_Reg]
+HKR,, InstalledDisplayDrivers, %REG_MULTI_SZ%, "helios_icd"
+HKR,, Version,                 %REG_DWORD%,    1
+
+; ──── Vulkan ICD registration ──────────────────────────────────────────────
+; A universal INF may only write device-relative (HKR) registry keys, not the
+; absolute HKLM\SOFTWARE\Khronos\Vulkan\Drivers value the Vulkan loader reads.
+; ICD registration is therefore handled at ICD deployment (Phase 5/6) — via the
+; ICD's own installer / a setup step that registers helios_vulkan.json — not by
+; this KMD package.
+
+; ──── Strings ──────────────────────────────────────────────────────────────
+
+[Strings]
+ProviderName = "Helios Project"
+DeviceDesc   = "Helios vGPU Render Adapter"
+DiskName     = "Helios vGPU Driver Disk"
+REG_DWORD    = 0x00010001
+REG_MULTI_SZ = 0x00010000

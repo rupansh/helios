@@ -1,0 +1,101 @@
+//! Build script for the Helios KMD.
+//!
+//! Two jobs:
+//!   1. Generate Rust bindings for the WDDM display-miniport DDIs. `wdk-sys`
+//!      only generates a fixed set of `ApiSubset`s (Base/Wdf/Gpio/Hid/...) and
+//!      has NO display subset and no "add a header" API, so the entire
+//!      `dispmprt.h` / `d3dkmddi.h` surface (DRIVER_INITIALIZATION_DATA,
+//!      DXGKRNL_INTERFACE, every DXGKARG_*, DxgkInitialize, ...) is missing.
+//!      We run our own bindgen over those headers, reusing the clang args /
+//!      include paths that `wdk-build` computes via `Builder::wdk_default`.
+//!   2. Configure downstream linking against the WDK (`configure_binary_build`).
+//!
+//! The generated file lands at `$OUT_DIR/dxgk_bindings.rs` and is pulled in by
+//! `src/dxgk.rs`.
+//!
+//! NOTE (first-build tuning): bindgen pulls in every base type the display DDIs
+//! transitively reference (DEVICE_OBJECT, LARGE_INTEGER, ...). We blocklist the
+//! common ones and redirect them to `wdk_sys` via a `use` prelude so there is a
+//! single canonical definition. The blocklist below is a starting set; the first
+//! real build against the installed WDK will surface any remaining duplicate-
+//! definition conflicts, which get added here. This is expected for layered
+//! bindgen and is not a design problem.
+
+use wdk_build::{BuilderExt, Config};
+
+/// Headers that declare the WDDM render-path DDIs we implement.
+const DXGK_HEADER_CONTENTS: &str = r#"
+#include <ntddk.h>
+#include <dispmprt.h>
+#include <d3dkmddi.h>
+"#;
+
+/// Base types that `wdk-sys` already defines. We blocklist them here and import
+/// `wdk_sys::*` so DDI code uses one canonical set instead of two incompatible
+/// copies. Extend this list as the first build reports conflicts.
+const BLOCKLISTED_BASE_TYPES: &[&str] = &[
+    "_?DEVICE_OBJECT",
+    "_?DRIVER_OBJECT",
+    "_?UNICODE_STRING",
+    "_?LARGE_INTEGER",
+    "_?ULARGE_INTEGER",
+    "_?LIST_ENTRY",
+    "_?SINGLE_LIST_ENTRY",
+    "_?PHYSICAL_ADDRESS",
+    "_?GUID",
+    "_?KEVENT",
+    "_?DISPATCHER_HEADER",
+    "_?IRP",
+    "_?IO_STACK_LOCATION",
+    "_?KDPC",
+    "_?KSPIN_LOCK",
+    "NTSTATUS",
+];
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    generate_dxgk_bindings()?;
+
+    // Emit the link configuration for a WDK binary (resolves ntoskrnl, etc.).
+    Config::from_env_auto()?.configure_binary_build()?;
+
+    // displib.lib provides DxgkInitialize — the WDDM display-miniport entry that
+    // registers our DDI table. wdk-build links the base kernel libs (ntoskrnl,
+    // hal, wmilib, ...) but not the display-miniport import lib, so add it here.
+    // Its directory is already on the linker search path (km\<ver>\x64).
+    println!("cargo:rustc-link-lib=static=displib");
+    Ok(())
+}
+
+fn generate_dxgk_bindings() -> Result<(), Box<dyn std::error::Error>> {
+    let out_dir = std::env::var("OUT_DIR")?;
+    let out_path = std::path::Path::new(&out_dir).join("dxgk_bindings.rs");
+
+    // `wdk_default` seeds the builder with the correct target triple, kernel-mode
+    // defines (_KERNEL_MODE, _AMD64_, ...) and WDK/SDK include paths.
+    let mut builder = bindgen::Builder::wdk_default(Config::from_env_auto()?)?
+        .header_contents("helios-dxgk-input.h", DXGK_HEADER_CONTENTS)
+        // Generate only the display surface; base types come from wdk_sys.
+        .allowlist_type("DXGK.*")
+        .allowlist_type("_?DRIVER_INITIALIZATION_DATA")
+        .allowlist_type("D3DKMT_.*")
+        .allowlist_type("D3DDDI_.*")
+        .allowlist_type("DXGK_.*")
+        .allowlist_function("Dxgk.*")
+        .allowlist_var("DXGK.*")
+        .allowlist_var("D3DKMDT_.*")
+        .allowlist_var("KMT_.*")
+        // Re-export the base types from wdk_sys so blocklisted references resolve.
+        // (The allow(...) lints are applied as an outer attribute on the `bindings`
+        // module in src/dxgk.rs — an inner attribute here is illegal under include!.)
+        .raw_line("pub use wdk_sys::*;");
+
+    for ty in BLOCKLISTED_BASE_TYPES {
+        builder = builder.blocklist_type(ty);
+    }
+
+    builder
+        .generate()?
+        .write_to_file(&out_path)?;
+
+    Ok(())
+}

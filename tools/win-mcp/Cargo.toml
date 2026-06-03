@@ -1,0 +1,20 @@
+[package]
+name = "win-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "Local stdio MCP server that runs commands and cargo/cargo-make builds on the Helios win11 dev VM over SSH, without cmd.exe quoting pain."
+
+[[bin]]
+name = "win-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# Official Rust MCP SDK.
+rmcp = { version = "0.3", features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-std", "time"] }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+base64 = "0.22"
+
+[profile.release]
+opt-level = 2
