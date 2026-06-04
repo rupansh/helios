@@ -20,12 +20,16 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use alloc::vec::Vec;
+
 use bytemuck::Zeroable;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy,
-    VirtioGpuRespDisplayInfo, HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES,
+    VirtioGpuResourceCreateBlob, VirtioGpuRespDisplayInfo, VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
+    HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES,
     VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
-    VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE,
+    VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
+    VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
 };
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::pci::bus::{DeviceFunction, PciRoot};
@@ -43,6 +47,146 @@ const CTRL_QUEUE_SIZE: usize = 64;
 /// One page of contiguous DMA scratch, split into request/response halves.
 const SCRATCH_BYTES: usize = 4096;
 
+// ── Host-visible shared-memory window (ARCH §6) ─────────────────────────────
+// PCI config-space byte offsets used by the capability walk.
+const PCI_CFG_STATUS: u16 = 0x04; // command (low 16) | status (high 16)
+const PCI_STATUS_CAP_LIST: u32 = 1 << 4; // status bit 4: capabilities list present
+const PCI_CFG_CAP_PTR: u16 = 0x34; // first capability offset (in the low byte)
+const PCI_CFG_BAR0: u16 = 0x10; // BAR0; BARn at 0x10 + n*4
+const PCI_CAP_ID_VNDR: u32 = 0x09; // generic PCI vendor-specific capability id
+
+/// The host-visible memory window: a prefetchable 64-bit PCI BAR (QEMU
+/// `hostmem=`) that `RESOURCE_MAP_BLOB` injects resource mappings into. Discovered
+/// from the `SHARED_MEMORY_CFG`/`HOST_VISIBLE` capability during `init`.
+#[derive(Clone, Copy)]
+pub struct HostVisibleWindow {
+    /// Guest-physical base of the window (BAR base + the cap's offset).
+    pub base: u64,
+    /// Window length in bytes (== QEMU `hostmem=`).
+    pub len: u64,
+}
+
+/// Walk the PCI capability list for the virtio `SHARED_MEMORY_CFG` capability
+/// whose shmid is `HOST_VISIBLE`, returning its guest-physical (base, length).
+/// virtio-drivers' `PciTransport` ignores cap type 8, so we scan it ourselves
+/// over the bus interface. Returns `None` if absent (a device built without
+/// blob/hostmem), which makes `MAP_BLOB` unavailable rather than crashing.
+fn scan_host_visible_window(access: &KmdfConfigAccess) -> Option<HostVisibleWindow> {
+    if (access.read32(PCI_CFG_STATUS) >> 16) & PCI_STATUS_CAP_LIST == 0 {
+        return None;
+    }
+    // Capability pointers are dword-aligned; mask the reserved low 2 bits.
+    let mut cap = (access.read32(PCI_CFG_CAP_PTR) & 0xFF) as u16 & 0xFC;
+    // Bounded walk — a corrupt cap_next cannot escape the 256-byte config space.
+    for _ in 0..48 {
+        if cap == 0 {
+            break;
+        }
+        let d0 = access.read32(cap);
+        let cap_id = d0 & 0xFF;
+        let cap_next = ((d0 >> 8) & 0xFF) as u16 & 0xFC;
+        let cfg_type = (d0 >> 24) & 0xFF;
+        if cap_id == PCI_CAP_ID_VNDR && cfg_type == VIRTIO_PCI_CAP_SHARED_MEMORY_CFG as u32 {
+            // `virtio_pci_cap`: bar at +4 byte0, id (shmid) at +4 byte1.
+            let d1 = access.read32(cap + 4);
+            let bar = (d1 & 0xFF) as u16;
+            let shmid = (d1 >> 8) & 0xFF;
+            if shmid == VIRTIO_GPU_SHM_ID_HOST_VISIBLE as u32 {
+                // `virtio_pci_cap64`: offset lo/hi at +8/+16, length lo/hi at +12/+20.
+                let off =
+                    access.read32(cap + 8) as u64 | ((access.read32(cap + 16) as u64) << 32);
+                let len =
+                    access.read32(cap + 12) as u64 | ((access.read32(cap + 20) as u64) << 32);
+                let base = bar_base(access, bar)?;
+                return Some(HostVisibleWindow { base: base + off, len });
+            }
+        }
+        cap = cap_next;
+    }
+    None
+}
+
+/// Read the guest-physical base a memory BAR was assigned, handling the 64-bit
+/// (type 0b10) layout the prefetchable host-visible window uses.
+fn bar_base(access: &KmdfConfigAccess, bar: u16) -> Option<u64> {
+    if bar > 5 {
+        return None;
+    }
+    let reg = PCI_CFG_BAR0 + bar * 4;
+    let lo = access.read32(reg);
+    if lo & 0x1 != 0 {
+        return None; // I/O-space BAR — not the memory window
+    }
+    let base = (lo & 0xFFFF_FFF0) as u64;
+    // Memory BAR type in bits [2:1]: 0b10 == 64-bit (high half in BARn+1).
+    if (lo >> 1) & 0x3 == 0x2 {
+        Some(base | ((access.read32(reg + 4) as u64) << 32))
+    } else {
+        Some(base)
+    }
+}
+
+/// Base for guest-assigned blob resource ids. Started well above the low ids a
+/// prior display driver (inbox VioGpuDod) may have used for scanout/framebuffer
+/// resources that can survive the driver swap — the host rejects a colliding id
+/// with `VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID` (0x1203). Phase 4b.
+const RESOURCE_ID_BASE: u32 = 0x1000;
+
+/// Max concurrently-live blob resources tracked per device. The registry's
+/// backing buffer is reserved to this capacity once at init; the cap bounds
+/// growth so inserts never reallocate. Generous for bring-up; the ICD's working
+/// set is far smaller. Table-full → OutOfMemory.
+const MAX_BLOBS: usize = 256;
+
+/// One tracked blob resource. Phase 4c will add `window_offset`/`user_va`/`mdl`
+/// when the blob is mapped.
+#[derive(Clone, Copy)]
+struct BlobSlot {
+    resource_id: u32,
+    /// Blob size in bytes (from ALLOC_BLOB; MAP_BLOB needs it to size the MDL).
+    size: u64,
+}
+
+/// Blob registry (resource_id → metadata). The backing `Vec` is **heap**-allocated
+/// (NOT an inline array) — an inline `[BlobSlot; 256]` lived in `VirtioGpu`, which
+/// is built by value on the kernel stack in `init`, and the ~4 KB array overflowed
+/// the small kernel stack → `0x7F` double fault on every driver load. The buffer
+/// is reserved to `MAX_BLOBS` at init (PASSIVE_LEVEL); `insert` stays within that
+/// reserved capacity so it never reallocates and is therefore safe to call under
+/// the virtio spinlock at DISPATCH_LEVEL.
+struct BlobTable {
+    slots: Vec<BlobSlot>,
+}
+
+impl BlobTable {
+    /// Reserve the backing buffer up front (PASSIVE_LEVEL). After this, `insert`
+    /// up to `MAX_BLOBS` entries performs no further allocation.
+    fn with_reserved_capacity() -> Self {
+        Self {
+            slots: Vec::with_capacity(MAX_BLOBS),
+        }
+    }
+
+    /// Record a freshly created blob. Errors (without allocating) if the table is
+    /// at capacity — `push` below stays within the reserved buffer, so it makes no
+    /// allocator call and is safe under the spinlock.
+    fn insert(&mut self, resource_id: u32, size: u64) -> Result<(), VirtioError> {
+        if self.slots.len() >= MAX_BLOBS {
+            return Err(VirtioError::OutOfMemory);
+        }
+        self.slots.push(BlobSlot { resource_id, size });
+        Ok(())
+    }
+
+    /// Look up a tracked blob's size (None if `resource_id` is unknown).
+    fn size_of(&self, resource_id: u32) -> Option<u64> {
+        self.slots
+            .iter()
+            .find(|s| s.resource_id == resource_id)
+            .map(|s| s.size)
+    }
+}
+
 /// An initialized virtio-gpu transport.
 pub struct VirtioGpu {
     /// The virtio-modern PCI transport (owns the mapped cfg-region VAs).
@@ -57,6 +201,11 @@ pub struct VirtioGpu {
     next_ctx_id: AtomicU32,
     /// Next virtio-gpu resource id to hand out (0 is reserved). Phase 3 (M3.5).
     next_resource_id: AtomicU32,
+    /// The host-visible blob window (SHARED_MEMORY_CFG / HOST_VISIBLE), or `None`
+    /// if the device exposes none. `MAP_BLOB` maps resources from here (ARCH §6).
+    host_visible: Option<HostVisibleWindow>,
+    /// Tracks live blob resources (id → size); see [`BlobTable`].
+    blobs: BlobTable,
 }
 
 impl VirtioGpu {
@@ -153,13 +302,30 @@ impl VirtioGpu {
         }
         crate::kmsg(c"Helios: virtio-gpu GET_DISPLAY_INFO OK\n");
 
+        // ── M5: locate the host-visible blob window (ARCH §6) ───────────────
+        // Best-effort: absence only disables MAP_BLOB, it does not fail init.
+        let host_visible = scan_host_visible_window(access);
+        crate::kmsg(if host_visible.is_some() {
+            c"Helios: host-visible window found\n"
+        } else {
+            c"Helios: no host-visible window (MAP_BLOB unavailable)\n"
+        });
+
         Ok(Self {
             transport,
             control,
             scratch,
             next_ctx_id: AtomicU32::new(1),
-            next_resource_id: AtomicU32::new(1),
+            next_resource_id: AtomicU32::new(RESOURCE_ID_BASE),
+            host_visible,
+            blobs: BlobTable::with_reserved_capacity(),
         })
+    }
+
+    /// The host-visible blob window discovered at init, if any. `MAP_BLOB` uses
+    /// it to translate a resource's window offset into a guest-physical range.
+    pub fn host_visible(&self) -> Option<HostVisibleWindow> {
+        self.host_visible
     }
 
     // ── Venus control path (Phase 3, M3.2) ──────────────────────────────────
@@ -196,6 +362,43 @@ impl VirtioGpu {
         cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
         cmd.hdr.ctx_id = ctx_id;
         self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))
+    }
+
+    /// Allocate a virtio-gpu blob resource in `ctx_id` and return its guest-
+    /// assigned resource id (Phase 4b). `blob_mem`/`blob_flags` are the caller's
+    /// `VIRTIO_GPU_BLOB_MEM_*` / `VIRTIO_GPU_BLOB_FLAG_*` (HOST3D + USE_MAPPABLE
+    /// for a host-visible mappable blob). HOST3D blobs are host-backed, so
+    /// `nr_entries = 0` (no guest page list follows the command). The size is
+    /// recorded so a later `MAP_BLOB` can size the MDL.
+    ///
+    /// NOTE (Phase 5 protocol gap): real venus device-memory blobs need
+    /// `blob_id` = the venus memory id; `HeliosEscapeAllocBlob` has no such field
+    /// yet, so `blob_id` is 0 here. Fine for a standalone mappable scratch blob.
+    pub fn alloc_blob(
+        &mut self,
+        ctx_id: u32,
+        blob_mem: u32,
+        blob_flags: u32,
+        size: u64,
+    ) -> Result<u32, VirtioError> {
+        if size == 0 {
+            return Err(VirtioError::DeviceError);
+        }
+        let resource_id = self.next_resource_id.fetch_add(1, Ordering::Relaxed);
+        let mut cmd = VirtioGpuResourceCreateBlob::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+        cmd.hdr.ctx_id = ctx_id;
+        cmd.resource_id = resource_id;
+        cmd.blob_mem = blob_mem;
+        cmd.blob_flags = blob_flags;
+        cmd.nr_entries = 0;
+        cmd.blob_id = 0;
+        cmd.size = size;
+        self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))?;
+        // Record only after the host accepted the create (so a failed create
+        // doesn't occupy a slot). Done under the caller's spinlock — alloc-free.
+        self.blobs.insert(resource_id, size)?;
+        Ok(resource_id)
     }
 
     /// Submit an opaque Venus command stream to `ctx_id`, fenced with `fence_id`.

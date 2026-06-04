@@ -41,27 +41,34 @@ impl KmdfConfigAccess {
             set_bus_data: bus.SetBusData,
         }
     }
-}
 
-impl ConfigurationAccess for KmdfConfigAccess {
-    fn read_word(&self, _device_function: DeviceFunction, register_offset: u8) -> u32 {
+    /// Read a 32-bit dword from our device's PCI config space at byte `offset`.
+    /// `offset` is a `u16` (not `u8`) so the host-visible cap walk can index the
+    /// full 256-byte config window without `u8` add-overflow on `cap + 20`.
+    pub fn read32(&self, offset: u16) -> u32 {
         let mut val: u32 = 0;
         if let Some(get) = self.get_bus_data {
-            // SAFETY: reads 4 bytes of our device's PCI config space at
-            // `register_offset`; `val` is a valid 4-byte buffer. The bus driver
-            // returns the number of bytes read (ignored — a short read leaves the
-            // remaining bytes 0, which the cap walk treats as "no capability").
+            // SAFETY: reads 4 bytes of our device's PCI config space at `offset`;
+            // `val` is a valid 4-byte buffer. The bus driver returns the number
+            // of bytes read (ignored — a short read leaves the remaining bytes 0,
+            // which the cap walk treats as "no capability").
             unsafe {
                 get(
                     self.context,
                     PCI_WHICHSPACE_CONFIG,
                     (&mut val as *mut u32).cast::<c_void>(),
-                    register_offset as ULONG,
+                    offset as ULONG,
                     4,
                 );
             }
         }
         val
+    }
+}
+
+impl ConfigurationAccess for KmdfConfigAccess {
+    fn read_word(&self, _device_function: DeviceFunction, register_offset: u8) -> u32 {
+        self.read32(register_offset as u16)
     }
 
     fn write_word(&mut self, _device_function: DeviceFunction, register_offset: u8, data: u32) {

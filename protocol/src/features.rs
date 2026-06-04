@@ -50,6 +50,10 @@ pub const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
 pub const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
 pub const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
 pub const VIRTIO_PCI_CAP_PCI_CFG: u8 = 5;
+/// Shared-memory region capability (`virtio_pci_cap64`); its `id` byte selects a
+/// shmid. virtio-drivers' `PciTransport` ignores this type, so the host-visible
+/// blob window (ARCH §6) is found by a manual cap walk over the bus interface.
+pub const VIRTIO_PCI_CAP_SHARED_MEMORY_CFG: u8 = 8;
 
 /// PCI device identity for the virtio-gpu device (OVERVIEW.md / TRANSPORT.md).
 pub const VIRTIO_PCI_VENDOR_ID: u16 = 0x1AF4;

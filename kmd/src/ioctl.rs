@@ -17,9 +17,10 @@ use core::slice;
 
 use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
-    HeliosEscapeCtxCreate, HeliosEscapeCtxDestroy, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence,
-    IOCTL_HELIOS_ALLOC_BLOB, IOCTL_HELIOS_CTX_CREATE, IOCTL_HELIOS_CTX_DESTROY,
-    IOCTL_HELIOS_MAP_BLOB, IOCTL_HELIOS_SUBMIT_VENUS, IOCTL_HELIOS_WAIT_FENCE,
+    HeliosEscapeAllocBlob, HeliosEscapeCtxCreate, HeliosEscapeCtxDestroy, HeliosEscapeSubmitVenus,
+    HeliosEscapeWaitFence, IOCTL_HELIOS_ALLOC_BLOB, IOCTL_HELIOS_CTX_CREATE,
+    IOCTL_HELIOS_CTX_DESTROY, IOCTL_HELIOS_MAP_BLOB, IOCTL_HELIOS_SUBMIT_VENUS,
+    IOCTL_HELIOS_WAIT_FENCE,
 };
 use wdk_sys::{
     call_unsafe_wdf_function_binding, NTSTATUS, PVOID, ULONG, ULONG_PTR, WDFOBJECT, WDFQUEUE,
@@ -55,9 +56,8 @@ pub unsafe extern "C" fn evt_io_device_control(
         IOCTL_HELIOS_CTX_DESTROY => handle_ctx_destroy(adapter, request),
         IOCTL_HELIOS_SUBMIT_VENUS => handle_submit_venus(adapter, request),
         IOCTL_HELIOS_WAIT_FENCE => handle_wait_fence(adapter, request),
-        // Blob verbs land in Phase 3/4 (ALLOC_BLOB) and Phase 4 (MAP_BLOB).
-        // STUB: documented not-implemented rather than a silent success.
-        IOCTL_HELIOS_ALLOC_BLOB => (STATUS_NOT_IMPLEMENTED, 0),
+        IOCTL_HELIOS_ALLOC_BLOB => handle_alloc_blob(adapter, request),
+        // MAP_BLOB lands in Phase 4c. STUB: documented not-implemented.
         IOCTL_HELIOS_MAP_BLOB => (STATUS_NOT_IMPLEMENTED, 0),
         // Unknown control codes are rejected (CLAUDE.md invariant).
         _ => (STATUS_INVALID_DEVICE_REQUEST, 0),
@@ -151,6 +151,35 @@ unsafe fn handle_ctx_destroy(adapter: &AdapterContext, request: WDFREQUEST) -> (
     let req: HeliosEscapeCtxDestroy = pod_read_unaligned(slice::from_raw_parts(in_ptr, sz));
     match adapter.with_virtio(|v| v.ctx_destroy(req.ctx_id)) {
         Ok(Ok(())) => (STATUS_SUCCESS, 0),
+        Ok(Err(ve)) => (ve.into(), 0),
+        Err(de) => (de.into(), 0),
+    }
+}
+
+/// `IOCTL_HELIOS_ALLOC_BLOB` → create a virtio-gpu blob resource; write the
+/// guest-assigned `out_resource_id` back into the (METHOD_BUFFERED in/out) buffer.
+unsafe fn handle_alloc_blob(adapter: &AdapterContext, request: WDFREQUEST) -> (NTSTATUS, usize) {
+    let sz = size_of::<HeliosEscapeAllocBlob>();
+    let (in_ptr, _) = match input_buffer(request, sz) {
+        Ok(b) => b,
+        Err(s) => return (s, 0),
+    };
+    let (out_ptr, _) = match output_buffer(request, sz) {
+        Ok(b) => b,
+        Err(s) => return (s, 0),
+    };
+    // SAFETY: WDF guaranteed ≥ sz bytes at in_ptr/out_ptr. Read unaligned.
+    let req: HeliosEscapeAllocBlob = pod_read_unaligned(slice::from_raw_parts(in_ptr, sz));
+    match adapter
+        .with_virtio(|v| v.alloc_blob(req.ctx_id, req.blob_mem, req.blob_flags, req.size))
+    {
+        Ok(Ok(resource_id)) => {
+            let mut out = req;
+            out.out_resource_id = resource_id;
+            // SAFETY: ≥ sz writable bytes at out_ptr.
+            slice::from_raw_parts_mut(out_ptr, sz).copy_from_slice(bytes_of(&out));
+            (STATUS_SUCCESS, sz)
+        }
         Ok(Err(ve)) => (ve.into(), 0),
         Err(de) => (de.into(), 0),
     }

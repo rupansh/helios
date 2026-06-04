@@ -60,6 +60,14 @@ pub const VIRTIO_GPU_CAPSET_GFXSTREAM: u32 = 3;
 /// Vulkan via Venus. This is the capset Helios drives.
 pub const VIRTIO_GPU_CAPSET_VENUS: u32 = 4;
 
+// ── Shared-memory region ids (`virtio_gpu_shm_id`) ──────────────────────────
+/// No region. The cap's `id` byte holds one of these.
+pub const VIRTIO_GPU_SHM_ID_UNDEFINED: u8 = 0;
+/// The host-visible memory window: a prefetchable 64-bit PCI BAR (QEMU
+/// `hostmem=`) that `RESOURCE_MAP_BLOB` injects resource mappings into. **= 1**
+/// (linux/virtio_gpu.h: UNDEFINED=0, HOST_VISIBLE=1) — not 0. See ARCH §6.
+pub const VIRTIO_GPU_SHM_ID_HOST_VISIBLE: u8 = 1;
+
 // ── Blob memory / flags ─────────────────────────────────────────────────────
 pub const VIRTIO_GPU_BLOB_MEM_GUEST: u32 = 1;
 pub const VIRTIO_GPU_BLOB_MEM_HOST3D: u32 = 2;

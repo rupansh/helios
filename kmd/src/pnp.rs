@@ -53,6 +53,12 @@ pub unsafe extern "C" fn evt_device_add(
         wdk_sys::_WDF_DEVICE_IO_TYPE::WdfDeviceIoDirect as wdk_sys::WDF_DEVICE_IO_TYPE
     );
 
+    // NOTE: a device SDDL (WdfDeviceInitAssignSDDLString) for non-elevated
+    // user-mode ICD access is a Phase 5 TODO — the first attempt produced an
+    // invalid SECURITY_DESCRIPTOR (Code 31). It must be added with a SDDL
+    // validated offline (e.g. ConvertStringSecurityDescriptorToSecurityDescriptor)
+    // before going back on the device.
+
     // (b) Device attributes: register our typed context + a cleanup callback that
     //     frees the heap AdapterContext when the device is destroyed.
     let mut attrs = wdf::object_attributes_for_context(device_context_type_info());
