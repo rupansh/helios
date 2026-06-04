@@ -66,8 +66,14 @@ pub const IOCTL_HELIOS_ALLOC_BLOB: u32 =
     ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 3, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
 /// Map a blob into the calling process; returns a user VA.
 /// In/out: [`crate::HeliosEscapeMapBlob`].
+///
+/// METHOD_BUFFERED (not OUT_DIRECT): the request only carries an 8-byte user VA
+/// out + a resource id in — there is no bulk buffer to transfer. The actual page
+/// mapping is a side effect (`MmMapLockedPagesSpecifyCache(UserMode)` in the KMD),
+/// not data copied into an output buffer, so a locked output MDL would be pure
+/// overhead. The small fixed verb fits the double-buffered system buffer.
 pub const IOCTL_HELIOS_MAP_BLOB: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 4, METHOD_OUT_DIRECT, HELIOS_IOCTL_ACCESS);
+    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 4, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
 /// Wait on a fence id. In: [`crate::HeliosEscapeWaitFence`].
 pub const IOCTL_HELIOS_WAIT_FENCE: u32 =
     ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 5, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
@@ -78,7 +84,7 @@ const _: () = {
     assert!(IOCTL_HELIOS_CTX_DESTROY == 0x0022_E404);
     assert!(IOCTL_HELIOS_SUBMIT_VENUS == 0x0022_E409);
     assert!(IOCTL_HELIOS_ALLOC_BLOB == 0x0022_E40C);
-    assert!(IOCTL_HELIOS_MAP_BLOB == 0x0022_E412);
+    assert!(IOCTL_HELIOS_MAP_BLOB == 0x0022_E410);
     assert!(IOCTL_HELIOS_WAIT_FENCE == 0x0022_E414);
 };
 

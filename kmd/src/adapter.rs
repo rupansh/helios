@@ -23,6 +23,7 @@ use wdk_sys::{
 
 use crate::error::DriverError;
 use crate::fence::FenceTable;
+use crate::mapping::MappingTable;
 use crate::virtio::VirtioGpu;
 
 /// The WDF typed context stored inline in the device object. POD: a zeroed
@@ -133,6 +134,10 @@ pub struct AdapterContext {
     /// submit path is synchronous, so WAIT_FENCE completes trivially).
     #[allow(dead_code)]
     pub fences: FenceTable,
+    /// Live host-visible blob mappings (resource_id → user VA + MDL), recorded by
+    /// `IOCTL_HELIOS_MAP_BLOB` and drained by `EvtFileCleanup`. Lives here (not in
+    /// `virtio`) so teardown survives transport release — see [`MappingTable`].
+    pub mappings: MappingTable,
 }
 
 // SAFETY: `virtio` is interior-mutable but every access goes through
@@ -149,6 +154,7 @@ impl AdapterContext {
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
             fences: FenceTable::new(),
+            mappings: MappingTable::new(),
         }
     }
 

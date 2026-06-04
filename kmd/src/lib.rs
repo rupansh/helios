@@ -39,6 +39,7 @@ mod fence;
 #[allow(dead_code)]
 mod interrupt;
 mod ioctl;
+mod mapping;
 mod pnp;
 mod wdf;
 // The transport carries some not-yet-consumed scaffolding (blob/async-fence

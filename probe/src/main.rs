@@ -274,6 +274,10 @@ fn alloc_blob(h: Handle, ctx_id: u32, size: u64) -> Result<u32, String> {
     let req = HeliosEscapeAllocBlob {
         hdr: HeliosEscapeHeader::new(HELIOS_ESCAPE_ALLOC_BLOB, sz as u32),
         size,
+        // Standalone scratch blob: no venus device-memory backing (the host will
+        // reject it — see phase4-blob-plan; a real backing id only exists under
+        // the ICD's vkAllocateMemory). 0 = none.
+        blob_id: 0,
         blob_flags: VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
         blob_mem: VIRTIO_GPU_BLOB_MEM_HOST3D,
         ctx_id,

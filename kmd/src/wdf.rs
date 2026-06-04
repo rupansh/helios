@@ -11,12 +11,14 @@
 use core::mem::size_of;
 
 use wdk_sys::{
-    GUID, ULONG, WDF_DRIVER_CONFIG, WDF_EXECUTION_LEVEL, WDF_INTERRUPT_CONFIG, WDF_IO_QUEUE_CONFIG,
-    WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS, WDF_SYNCHRONIZATION_SCOPE, WDF_TRI_STATE,
-    _WDF_EXECUTION_LEVEL, _WDF_IO_QUEUE_DISPATCH_TYPE, _WDF_SYNCHRONIZATION_SCOPE, _WDF_TRI_STATE,
+    GUID, ULONG, WDF_DRIVER_CONFIG, WDF_EXECUTION_LEVEL, WDF_FILEOBJECT_CLASS, WDF_FILEOBJECT_CONFIG,
+    WDF_INTERRUPT_CONFIG, WDF_IO_QUEUE_CONFIG, WDF_OBJECT_ATTRIBUTES, WDF_PNPPOWER_EVENT_CALLBACKS,
+    WDF_SYNCHRONIZATION_SCOPE, WDF_TRI_STATE, _WDF_EXECUTION_LEVEL, _WDF_FILEOBJECT_CLASS,
+    _WDF_IO_QUEUE_DISPATCH_TYPE, _WDF_SYNCHRONIZATION_SCOPE, _WDF_TRI_STATE,
     PFN_WDF_DRIVER_DEVICE_ADD, PFN_WDF_DEVICE_PREPARE_HARDWARE, PFN_WDF_DEVICE_RELEASE_HARDWARE,
-    PFN_WDF_DEVICE_D0_ENTRY, PFN_WDF_DEVICE_D0_EXIT, PFN_WDF_IO_QUEUE_IO_DEVICE_CONTROL,
-    PFN_WDF_INTERRUPT_ISR, PFN_WDF_INTERRUPT_DPC, PCWDF_OBJECT_CONTEXT_TYPE_INFO,
+    PFN_WDF_DEVICE_D0_ENTRY, PFN_WDF_DEVICE_D0_EXIT, PFN_WDF_FILE_CLEANUP,
+    PFN_WDF_IO_QUEUE_IO_DEVICE_CONTROL, PFN_WDF_INTERRUPT_ISR, PFN_WDF_INTERRUPT_DPC,
+    PCWDF_OBJECT_CONTEXT_TYPE_INFO,
 };
 
 /// `GUID_DEVINTERFACE_HELIOS` — the device interface the ICD opens. Built from
@@ -48,8 +50,8 @@ pub const PCI_WHICHSPACE_CONFIG: ULONG = 0;
 /// `KPROCESSOR_MODE` values (the enum lives in a bindgen module; spell the two
 /// we use as explicit typed constants — `KPROCESSOR_MODE` is a `CCHAR`/`i8`).
 pub const KERNEL_MODE: i8 = 0;
-/// Used by the Phase 4 `MAP_BLOB` user-space mapping path.
-#[allow(dead_code)]
+/// `UserMode` — `MmMapLockedPagesSpecifyCache` access mode for the `MAP_BLOB`
+/// user-space mapping path (ioctl.rs).
 pub const USER_MODE: i8 = 1;
 
 /// `WDF_DRIVER_CONFIG_INIT(config, EvtDriverDeviceAdd)`.
@@ -128,6 +130,28 @@ pub fn io_queue_config(io_device_control: PFN_WDF_IO_QUEUE_IO_DEVICE_CONTROL) ->
     // `(ULONG)-1`. Writing a union field is safe; this is the fix for the blocker.
     cfg.Settings.Parallel.NumberOfPresentedRequests = ULONG::MAX;
     cfg
+}
+
+/// `WDF_FILEOBJECT_CONFIG_INIT(config, NULL create, NULL close, cleanup)`.
+///
+/// Registers an `EvtFileCleanup` callback so the KMD can unmap host-visible blob
+/// mappings in the closing process's context (Phase 4c teardown, ioctl.rs). We
+/// need no FsContext storage (mappings are tracked in the AdapterContext mapping
+/// table), so `FileObjectClass = WdfFileObjectWdfCannotUseFsContexts` and no file
+/// object context is attached. `AutoForwardCleanupClose = WdfUseDefault` keeps the
+/// framework's default Create/Cleanup/Close IRP forwarding. All fields are set
+/// explicitly (no `..Default::default()`) so this does not depend on whether
+/// bindgen derived `Default` for `WDF_FILEOBJECT_CONFIG`.
+pub fn fileobject_config(cleanup: PFN_WDF_FILE_CLEANUP) -> WDF_FILEOBJECT_CONFIG {
+    WDF_FILEOBJECT_CONFIG {
+        Size: size_of::<WDF_FILEOBJECT_CONFIG>() as ULONG,
+        EvtDeviceFileCreate: None,
+        EvtFileClose: None,
+        EvtFileCleanup: cleanup,
+        AutoForwardCleanupClose: _WDF_TRI_STATE::WdfUseDefault as WDF_TRI_STATE,
+        FileObjectClass: _WDF_FILEOBJECT_CLASS::WdfFileObjectWdfCannotUseFsContexts
+            as WDF_FILEOBJECT_CLASS,
+    }
 }
 
 /// `WDF_INTERRUPT_CONFIG_INIT(config, isr, dpc)`.

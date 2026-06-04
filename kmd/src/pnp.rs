@@ -21,7 +21,7 @@ use wdk_sys::NT_SUCCESS;
 use crate::adapter::{
     adapter_of, device_context_mut, device_context_type_info, free_adapter, AdapterContext,
 };
-use crate::ioctl::evt_io_device_control;
+use crate::ioctl::{evt_file_cleanup, evt_io_device_control};
 use crate::kmsg;
 use crate::virtio::{KmdfConfigAccess, VirtioGpu};
 use crate::wdf::{self, GUID_BUS_INTERFACE_STANDARD, GUID_DEVINTERFACE_HELIOS};
@@ -51,6 +51,20 @@ pub unsafe extern "C" fn evt_device_add(
         WdfDeviceInitSetIoType,
         device_init,
         wdk_sys::_WDF_DEVICE_IO_TYPE::WdfDeviceIoDirect as wdk_sys::WDF_DEVICE_IO_TYPE
+    );
+
+    // File-object callbacks: EvtFileCleanup unmaps any host-visible blob mappings
+    // (IOCTL_HELIOS_MAP_BLOB) in the closing process's context, before the process
+    // tears down (else bugcheck 0x76 PROCESS_HAS_LOCKED_PAGES). No FsContext is
+    // needed (mappings live in the AdapterContext mapping table), so we pass
+    // WDF_NO_OBJECT_ATTRIBUTES. Must precede WdfDeviceCreate. SAFETY: device_init
+    // valid; &mut fcfg is a valid PWDF_FILEOBJECT_CONFIG.
+    let mut fcfg = wdf::fileobject_config(Some(evt_file_cleanup));
+    call_unsafe_wdf_function_binding!(
+        WdfDeviceInitSetFileObjectConfig,
+        device_init,
+        &mut fcfg,
+        WDF_NO_OBJECT_ATTRIBUTES
     );
 
     // NOTE: a device SDDL (WdfDeviceInitAssignSDDLString) for non-elevated

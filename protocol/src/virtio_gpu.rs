@@ -76,6 +76,17 @@ pub const VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE: u32 = 1;
 pub const VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE: u32 = 2;
 pub const VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE: u32 = 4;
 
+// ── Blob map caching (`map_info` in `VirtioGpuRespMapInfo`) ──────────────────
+// The host returns the caching mode it wants the guest to map the host-visible
+// blob with, in the low nibble of `map_info`. The KMD translates this to a
+// Windows `MEMORY_CACHING_TYPE` for `MmMapLockedPagesSpecifyCache`. (QEMU
+// `honor-guest-pat=on` makes the guest-chosen cache type effective.)
+pub const VIRTIO_GPU_MAP_CACHE_MASK: u32 = 0x0f;
+pub const VIRTIO_GPU_MAP_CACHE_NONE: u32 = 0x00;
+pub const VIRTIO_GPU_MAP_CACHE_CACHED: u32 = 0x01;
+pub const VIRTIO_GPU_MAP_CACHE_UNCACHED: u32 = 0x02;
+pub const VIRTIO_GPU_MAP_CACHE_WC: u32 = 0x03;
+
 pub const VIRTIO_GPU_MAX_SCANOUTS: usize = 16;
 
 /// Control command header — prepended to every virtio-gpu command and response.

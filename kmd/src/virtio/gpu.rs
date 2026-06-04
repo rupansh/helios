@@ -25,11 +25,12 @@ use alloc::vec::Vec;
 use bytemuck::Zeroable;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy,
-    VirtioGpuResourceCreateBlob, VirtioGpuRespDisplayInfo, VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
+    VirtioGpuResourceCreateBlob, VirtioGpuResourceMapBlob, VirtioGpuRespDisplayInfo,
+    VirtioGpuRespMapInfo, VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
     HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES,
     VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
-    VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
-    VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
+    VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_MAP_CACHE_MASK,
+    VIRTIO_GPU_SHM_ID_HOST_VISIBLE, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
 };
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::pci::bus::{DeviceFunction, PciRoot};
@@ -64,6 +65,37 @@ pub struct HostVisibleWindow {
     pub base: u64,
     /// Window length in bytes (== QEMU `hostmem=`).
     pub len: u64,
+}
+
+/// Page size for host-visible window offset allocation + MDL sizing. The window
+/// is a PCI BAR; mappings are page-granular.
+const BLOB_PAGE: u64 = 4096;
+
+/// Upper bound on a single host-visible blob mapping (256 MiB). Bounds the user-VA
+/// pressure of one `MAP_BLOB` so a single map cannot request multi-GB — this
+/// shrinks (does not close) the window in which
+/// `MmMapLockedPagesSpecifyCache(UserMode)` raises an uncatchable failure exception
+/// (ioctl.rs `map_io_pages_to_user`; the load-bearing fix there is a SEH shim,
+/// pending). Generous for bring-up; bump if a real venus allocation exceeds it.
+const MAX_BLOB_MAP_BYTES: u64 = 256 << 20;
+
+/// Round `n` up to the next [`BLOB_PAGE`] multiple (saturating).
+const fn round_up_page(n: u64) -> u64 {
+    n.saturating_add(BLOB_PAGE - 1) & !(BLOB_PAGE - 1)
+}
+
+/// Result of the under-lock phase of `MAP_BLOB` ([`VirtioGpu::map_blob_prepare`]):
+/// the guest-physical range to map and the host's requested caching. The user-space
+/// mapping itself (MDL + `MmMapLockedPagesSpecifyCache`) is built by the caller at
+/// PASSIVE_LEVEL, OUTSIDE the virtio spinlock (ARCH §6; the IRQL split).
+#[derive(Clone, Copy)]
+pub struct BlobMapPrep {
+    /// Guest-physical base of the resource's mapping inside the host-visible window.
+    pub gpa: u64,
+    /// Page-rounded length to map, in bytes.
+    pub size: u64,
+    /// Host caching nibble (`VIRTIO_GPU_MAP_CACHE_*`) from `RESP_OK_MAP_INFO`.
+    pub map_cache: u32,
 }
 
 /// Walk the PCI capability list for the virtio `SHARED_MEMORY_CFG` capability
@@ -206,6 +238,11 @@ pub struct VirtioGpu {
     host_visible: Option<HostVisibleWindow>,
     /// Tracks live blob resources (id → size); see [`BlobTable`].
     blobs: BlobTable,
+    /// Bump allocator for host-visible window offsets. Each `MAP_BLOB` claims
+    /// `[next_window_offset, next_window_offset + round_up_page(size))` and advances
+    /// the pointer. Never reclaimed (bring-up): the window is multi-GB and the ICD's
+    /// mapped working set is small. Guarded by the AdapterContext virtio lock.
+    next_window_offset: u64,
 }
 
 impl VirtioGpu {
@@ -319,6 +356,7 @@ impl VirtioGpu {
             next_resource_id: AtomicU32::new(RESOURCE_ID_BASE),
             host_visible,
             blobs: BlobTable::with_reserved_capacity(),
+            next_window_offset: 0,
         })
     }
 
@@ -371,14 +409,16 @@ impl VirtioGpu {
     /// `nr_entries = 0` (no guest page list follows the command). The size is
     /// recorded so a later `MAP_BLOB` can size the MDL.
     ///
-    /// NOTE (Phase 5 protocol gap): real venus device-memory blobs need
-    /// `blob_id` = the venus memory id; `HeliosEscapeAllocBlob` has no such field
-    /// yet, so `blob_id` is 0 here. Fine for a standalone mappable scratch blob.
+    /// `blob_id` is the venus device-memory id backing a HOST3D mappable blob
+    /// (the ICD's `bo_ops.create_from_device_memory(mem_id)` → ALLOC_BLOB; ARCH §5).
+    /// A standalone scratch blob with no venus backing passes `blob_id = 0` (the
+    /// host then rejects a HOST3D mappable blob — see phase4-blob-plan).
     pub fn alloc_blob(
         &mut self,
         ctx_id: u32,
         blob_mem: u32,
         blob_flags: u32,
+        blob_id: u64,
         size: u64,
     ) -> Result<u32, VirtioError> {
         if size == 0 {
@@ -392,7 +432,7 @@ impl VirtioGpu {
         cmd.blob_mem = blob_mem;
         cmd.blob_flags = blob_flags;
         cmd.nr_entries = 0;
-        cmd.blob_id = 0;
+        cmd.blob_id = blob_id;
         cmd.size = size;
         self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))?;
         // Record only after the host accepted the create (so a failed create
@@ -449,6 +489,81 @@ impl VirtioGpu {
         let resp: &VirtioGpuCtrlHdr = bytemuck::from_bytes(&resp_buf[..resp_len]);
         if resp_is_ok(resp.type_) {
             Ok(())
+        } else {
+            Err(VirtioError::DeviceError)
+        }
+    }
+
+    /// Phase-1 (under-lock) half of `MAP_BLOB` (ARCH §6): reserve a host-visible
+    /// window offset for `resource_id`, tell the host to inject the resource's
+    /// mapping there (`RESOURCE_MAP_BLOB`), and return the guest-physical range +
+    /// host caching for the caller to map into user space at PASSIVE_LEVEL.
+    ///
+    /// Runs under the AdapterContext virtio spinlock (DISPATCH_LEVEL) — alloc-free.
+    /// The window offset is consumed (bumped) only after the host accepts the
+    /// command, so a rejected map does not waste window space. The caller
+    /// ([`crate::ioctl`]) must ensure the resource is not already mapped (it tracks
+    /// live mappings in the AdapterContext mapping table) before calling this.
+    pub fn map_blob_prepare(&mut self, resource_id: u32) -> Result<BlobMapPrep, VirtioError> {
+        let window = self.host_visible.ok_or(VirtioError::DeviceError)?;
+        // The resource must have been created (ALLOC_BLOB) so we know its size.
+        let size = self.blobs.size_of(resource_id).ok_or(VirtioError::DeviceError)?;
+        let map_len = round_up_page(size);
+        if map_len == 0 || map_len > MAX_BLOB_MAP_BYTES {
+            return Err(VirtioError::DeviceError);
+        }
+        // Bump-allocate a page-aligned window offset; refuse if the window is full.
+        let offset = self.next_window_offset;
+        let end = offset.checked_add(map_len).ok_or(VirtioError::OutOfMemory)?;
+        if end > window.len {
+            return Err(VirtioError::OutOfMemory);
+        }
+
+        // Host round-trip FIRST — only mutate `next_window_offset` on success so a
+        // rejected map leaves the allocator state unchanged.
+        let mut cmd = VirtioGpuResourceMapBlob::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+        cmd.resource_id = resource_id;
+        cmd.offset = offset;
+        let map_info = self.map_blob_roundtrip(&cmd)?;
+
+        self.next_window_offset = end;
+        Ok(BlobMapPrep {
+            gpa: window.base + offset,
+            size: map_len,
+            map_cache: map_info & VIRTIO_GPU_MAP_CACHE_MASK,
+        })
+    }
+
+    /// Send `RESOURCE_MAP_BLOB` and return the host's `map_info` caching word from
+    /// the `RESP_OK_MAP_INFO` reply. Reuses the scratch page (req low / resp high).
+    fn map_blob_roundtrip(&mut self, cmd: &VirtioGpuResourceMapBlob) -> Result<u32, VirtioError> {
+        let req = bytemuck::bytes_of(cmd);
+        let resp_len = core::mem::size_of::<VirtioGpuRespMapInfo>();
+        // SAFETY: owned contiguous page; disjoint req/resp halves, serialized by
+        // the caller's spinlock. Raw pointer (not a &mut borrow of self.scratch) so
+        // self.control/transport can be borrowed for the round-trip.
+        let buf = unsafe {
+            core::slice::from_raw_parts_mut(
+                self.scratch.as_slice().as_ptr() as *mut u8,
+                SCRATCH_BYTES,
+            )
+        };
+        let (req_buf, resp_buf) = buf.split_at_mut(SCRATCH_BYTES / 2);
+        if req.len() > req_buf.len() || resp_len > resp_buf.len() {
+            return Err(VirtioError::DeviceError);
+        }
+        req_buf[..req.len()].copy_from_slice(req);
+        self.control
+            .add_notify_wait_pop(
+                &[&req_buf[..req.len()]],
+                &mut [&mut resp_buf[..resp_len]],
+                &mut self.transport,
+            )
+            .map_err(|_| VirtioError::DeviceError)?;
+        let resp: &VirtioGpuRespMapInfo = bytemuck::from_bytes(&resp_buf[..resp_len]);
+        if resp_is_ok(resp.hdr.type_) {
+            Ok(resp.map_info)
         } else {
             Err(VirtioError::DeviceError)
         }

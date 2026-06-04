@@ -91,12 +91,19 @@ pub struct HeliosEscapeCtxDestroy {
 }
 
 /// `HELIOS_ESCAPE_ALLOC_BLOB`. The KMD allocates a virtio-gpu blob resource and
-/// returns its id. 40 bytes.
+/// returns its id. 48 bytes.
+///
+/// `blob_id` is the venus device-memory id that backs a HOST3D mappable blob: the
+/// ICD's `bo_ops.create_from_device_memory(size, mem_id)` passes the venus memory
+/// id here, and the KMD forwards it as `VirtioGpuResourceCreateBlob.blob_id` so
+/// virglrenderer's venus context can bind the blob to that `VkDeviceMemory` (see
+/// ARCH.md §5/§6). A standalone scratch blob (no venus backing) passes `blob_id = 0`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosEscapeAllocBlob {
     pub hdr: HeliosEscapeHeader,
     pub size: u64,             // in:  blob size in bytes
+    pub blob_id: u64,          // in:  venus device-memory id backing the blob (0 = none)
     pub blob_flags: u32,       // in:  VIRTIO_GPU_BLOB_FLAG_*
     pub blob_mem: u32,         // in:  VIRTIO_GPU_BLOB_MEM_*
     pub ctx_id: u32,           // in:  owning context
@@ -128,7 +135,7 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeHeader>() == 16);
     assert!(core::mem::size_of::<HeliosEscapeSubmitVenus>() == 32);
     assert!(core::mem::size_of::<HeliosEscapeCtxCreate>() == 24);
-    assert!(core::mem::size_of::<HeliosEscapeAllocBlob>() == 40);
+    assert!(core::mem::size_of::<HeliosEscapeAllocBlob>() == 48);
     assert!(core::mem::size_of::<HeliosEscapeMapBlob>() == 32);
     assert!(core::mem::size_of::<HeliosEscapeWaitFence>() == 32);
 };
