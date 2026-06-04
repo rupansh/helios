@@ -211,15 +211,34 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Sync the project to the local build mirror and run cargo (or cargo make) there. The Z:\\ share cannot host cargo/wdk build IO (OS error 87), so this robocopy-mirrors Z:\\ -> C:\\Users\\Rupansh\\helios-vgpu (excluding target and .git) and builds inside the mirror with LIBCLANG_PATH set for bindgen. Edit sources on the Linux/Z:\\ side — the mirror is re-synced on every call. crate_dir is relative to the project root (e.g. \"kmd\"); args is the cargo argv (e.g. [\"make\",\"--makefile\",\"Cargo.make.toml\"] or [\"build\"])."
+        description = "Sync the project to the local build mirror and run cargo (or cargo make) there. The Z:\\ share cannot host cargo/wdk build IO (OS error 87), so this robocopy-mirrors Z:\\ -> C:\\Users\\Rupansh\\helios-vgpu (excluding target/ and all .git; FAT-time incremental so the large vendored Mesa submodule at icd/mesa is skipped on re-sync once copied) and builds inside the mirror with LIBCLANG_PATH set for bindgen. Edit sources on the Linux/Z:\\ side — the mirror is re-synced on every call. crate_dir is relative to the project root (e.g. \"kmd\"); args is the cargo argv (e.g. [\"make\",\"--makefile\",\"Cargo.make.toml\"] or [\"build\"])."
     )]
     async fn win_cargo(&self, Parameters(a): Parameters<WinCargoArgs>) -> String {
         let mut env = HashMap::new();
         env.insert("LIBCLANG_PATH".to_string(), LIBCLANG_PATH.to_string());
         // 1) mirror the tree to local disk (cargo/wdk IO fails on the share),
         // 2) cd into the crate in the mirror, 3) build with the local default target.
+        //
+        // robocopy flags (kept fast now that icd/mesa vendors the whole Mesa tree):
+        //   /MIR            mirror = copy changed + purge removed.
+        //   /XD target .git skip cargo target dirs and every .git DIRECTORY. This
+        //                   already excludes the Mesa submodule's multi-GB history,
+        //                   which lives under the superproject's
+        //                   .git/modules/icd/mesa (not in the icd/mesa working tree).
+        //   /XF .git        skip the submodule's .git POINTER FILE (icd/mesa/.git);
+        //                   it would just dangle in the mirror. (.gitmodules etc. are
+        //                   a different name and are kept.)
+        //   /FFT /DST       compare with FAT 2-second file-time granularity. This
+        //                   absorbs the 9p<->NTFS timestamp-precision mismatch so
+        //                   UNCHANGED files (above all the large, rarely-hand-edited
+        //                   icd/mesa source) are SKIPPED on re-sync instead of being
+        //                   needlessly recopied every build. Safe for correctness:
+        //                   robocopy stamps the dest with the source mtime, so a real
+        //                   edit (mtime jumps to "now") is always far outside the 2s
+        //                   window and is still copied.
+        //   /MT:16          16-thread copy — the many small Mesa files copy faster.
         let command = format!(
-            "robocopy {PROJECT_DRIVE} {MIRROR_ROOT} /MIR /XD target .git /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
+            "robocopy {PROJECT_DRIVE} {MIRROR_ROOT} /MIR /XD target .git /XF .git /FFT /DST /MT:16 /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
              if ($LASTEXITCODE -ge 8) {{ \"win_cargo: robocopy mirror sync failed (exit $LASTEXITCODE)\"; exit $LASTEXITCODE }}\n\
              Set-Location -LiteralPath '{MIRROR_ROOT}\\{}'\n\
              cargo {}",
