@@ -21,6 +21,13 @@ wdk-alloc = "0.4"
 wdk-panic = "0.4"
 # Shared wire-format definitions (no_std), so virtio-gpu structs match the ICD.
 helios_protocol = { path = "../protocol" }
+# no_std; used to serialize helios_protocol command structs (Pod) into the DMA
+# scratch buffers. default-features=false keeps it std-free for the kernel target.
+bytemuck = { version = "1", default-features = false, features = ["derive"] }
+# Maintained no_std virtio transport. We implement its Hal + ConfigurationAccess
+# over WDK primitives (see virtio/hal.rs, virtio/config.rs) and drive a raw
+# VirtQueue with helios_protocol commands, skipping its built-in 2D GPU driver.
+virtio-drivers = "0.13"
 
 [build-dependencies]
 wdk-build = "0.5"

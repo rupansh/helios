@@ -4,7 +4,9 @@
 
 You are the **primary author** of this project. The human overseer has OS/driver/Rust expertise and will review your work, but you must drive all implementation decisions, write all code, and flag blockers proactively.
 
-**Implementation reality (learned — authoritative over older prose in these docs):** The KMD is a **WDDM 2.0 render-only graphics** miniport (NOT MCDM/ComputeAccelerator). `wdk-sys` exposes no display DDIs, so `kmd/build.rs` custom-bindgens `dispmprt.h` + `d3dkmddi.h` into a `crate::dxgk` module and links `displib.lib` (for `DxgkInitialize`). Windows builds **cannot run on the `Z:\` share** (Rust IO fails with OS error 87 — windows-drivers-rs#481); build through the **`win` MCP server's `win_cargo`**, which mirrors `Z:\` → `C:\Users\Rupansh\helios-vgpu` and builds locally. See OVERVIEW.md "Driver Model & WDDM Targeting" and the errata banners in KMD.md / TOOLCHAIN.md.
+**Implementation reality (learned — authoritative over older prose in these docs):** The KMD is a **WDDM render-only graphics** miniport (NOT MCDM/ComputeAccelerator), declared at the **OS-native `DXGKDDI_INTERFACE_VERSION`** (WDDM 3.2 on the 24H2/26100 WDK — an earlier WDDM-2.0 pin was reverted because 24H2 rejects a 2.0 adapter's user-mode driver). `wdk-sys` exposes no display DDIs, so `kmd/build.rs` custom-bindgens `dispmprt.h` + `d3dkmddi.h` into a `crate::dxgk` module and links `displib.lib` (for `DxgkInitialize`). Windows builds **cannot run on the `Z:\` share** (Rust IO fails with OS error 87 — windows-drivers-rs#481); build through the **`win` MCP server's `win_cargo`**, which mirrors `Z:\` → `C:\Users\Rupansh\helios-vgpu` and builds locally. See OVERVIEW.md "Driver Model & WDDM Targeting" and the errata banners in KMD.md / TOOLCHAIN.md.
+
+**Phase 3 status (2026-06-04 — detail in the `addadapter-umd-blocker`, `venus-host-blocker`, `mesa-venus-icd-port` memories):** Phases 1–2 done (driver loads, virtio-gpu transport up, GET_DISPLAY_INFO round-trips). The venus host stack now works (libvirt `seccomp_sandbox=0`; `virtio-gpu-gl,venus=on,blob=on,hostmem=4G`; egl-headless on the Intel iGPU / Mesa ANV; `honor-guest-pat=on`), so `DxgkDdiStartDevice` passes virtio feature negotiation. The Phase-3 KMD spine (M3.1–M3.3: lock-guarded `AdapterContext` with `with_virtio`/`set_virtio`; `ctx_create`/`ctx_destroy`/`submit_venus`; full `DxgkDdiEscape` dispatch) is written and compiles but is **not yet runtime-verified** — the device is still at **Code 43**: a WDDM *render* adapter must register a version-matched user-mode driver (`UserModeDriverName`). A pure-Rust **stub D3D UMD** (`umd/`) clears the `OBJECT_NAME_NOT_FOUND`, but the runtime still `REVISION_MISMATCH`es it (the UMD version handshake is the current blocker; next step is to log the runtime's requested `Interface`/`Version` from `OpenAdapter10_2`). The **Mesa-venus Vulkan-ICD port is the Phase-5 plan, DEFERRED** until the adapter is healthy; the stub D3D UMD is the interim. NOTE: `kmd/src/diag.rs` is a TEMPORARY registry-breadcrumb tracer — remove once Code 43 clears.
 
 ---
 
@@ -128,6 +130,9 @@ Goal: Can send `VIRTIO_GPU_CMD_GET_DISPLAY_INFO` and get a response.
 **Test:** Send GET_DISPLAY_INFO from a test IOCTL, receive valid response in DebugView.
 
 ### Phase 3: WDDM Memory Management
+
+> **NOTE (2026-06-04): Phases 3 & 4 are being executed together as ONE KMD push.** The Vulkan ICD's real kernel channel is the `DxgkDdiEscape` protocol (`helios_protocol::escape`), which sidesteps GPU VA — so the cheapest route to first host traffic is: clear **Code 43** with minimal GPU-VA DDI bodies (`GetRootPageTableSize` ≠ 0, `BuildPagingBuffer` always-SUCCESS, `CreateProcess` real) + implement `DxgkDdiEscape` (CTX_CREATE/SUBMIT_VENUS/WAIT_FENCE/...). `SubmitCommandVirtual`/`SubmitCommand` stay `STATUS_SUCCESS` no-ops (error → BugCheck 0x119). Venus byte *encoding* (`VN_CS_ENCODER`) is the icd/ crate's job (Phase 5); the KMD forwards opaque Venus bytes. **The `phase3-kickoff` memory is the authoritative start point** (the Phase 3/4 code sketches in KMD.md/TRANSPORT.md predate the virtio-drivers adoption and carry errata banners).
+
 Goal: `CreateAllocation` / `DestroyAllocation` work, segments are set up.
 
 - [ ] `DxgkDdiQueryAdapterInfo(DXGKQAITYPE_QUERYSEGMENT4)` — report one CPU-visible aperture segment backed by host memory (hostmem blob region)
@@ -151,8 +156,9 @@ Goal: First real Vulkan command reaches virglrenderer on the host.
 ### Phase 5: Vulkan ICD (icd/)
 Goal: `vulkaninfo` reports the Helios device.
 
-- [ ] Implement Vulkan loader entrypoints (`vk_icdGetInstanceProcAddr`, negotiation)
-- [ ] Implement instance/device creation dispatching to Venus encoder
+> **REVISED PLAN (2026-06-04, user-approved — see the `mesa-venus-icd-port` memory):** do NOT hand-write the Vulkan ICD / Venus encoder. **Port Mesa's `venus` driver (`vulkan-drivers=virtio`)** to Windows, swapping its Linux virtgpu-DRM `vn_renderer` backend for our `D3DKMTEscape` channel (`helios_protocol::escape`). This reuses Mesa's mature, byte-correct Venus encoder (virglrenderer's decoder is also Mesa → wire-compatible) and follows the mvisor-win-vgpu-driver porting pattern. The win11 Mesa build toolchain is already installed. This is **deferred** until the WDDM adapter is healthy (Code 43 cleared via the stub D3D UMD in `umd/`). A separate **stub D3D UMD** (not the Vulkan ICD) is what dxgkrnl needs to start the adapter.
+
+- [ ] (Deferred) Port Mesa venus → Windows Vulkan ICD over D3DKMTEscape (see memory)
 - [ ] Implement `vkEnumeratePhysicalDevices` → forward to host, deserialize capabilities
 - [ ] Implement `vkCreateDevice`, queues, command pools
 

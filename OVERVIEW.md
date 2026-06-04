@@ -39,6 +39,8 @@ Helios is a **render-only WDDM 2.0 display miniport** — a graphics-capable ada
 | 5 Vulkan ICD | The paired user-mode driver (substitutes for the classic D3D UMD) |
 | 6 DXVK / VKD3D | App-level validation (roadmap test/debug + WHLK) |
 
+**STATUS (2026-06-04):** Phases 1–1.5 ✅ (driver loads; Code 37 cleared) and **Phase 2 ✅** (virtio-gpu bring-up via the `virtio-drivers` crate — `GET_DISPLAY_INFO` round-trips on real HW; the hand-rolled virtqueue in KMD.md is **superseded**). The device currently sits at **Code 43** (post-start GPU-VA gate). Phase 3 = clear Code 43 + the **`DxgkDdiEscape`** Venus spine; Phases 3 & 4 are being landed together as one KMD push, because the escape protocol (the real ICD↔KMD contract, in `helios_protocol::escape`) is independent of GPU VA and is the cheapest route to first host traffic. First Venus bring-up uses an interim `fence_id`→KEVENT model rather than the `DxgkCbNotifyInterrupt` monitored fence listed above. See the `phase3-kickoff` memory.
+
 **DDIs still to register for a *loadable, render-capable* adapter (stubs OK in Phase 1, but the slots must be non-NULL so device creation succeeds):** `Render`/`RenderKm`, `Patch`, `OpenAllocation`/`CloseAllocation`, `DescribeAllocation`, `GetStandardAllocationDriverData`, `GetNodeMetadata`, `SetRootPageTable`/`GetRootPageTableSize` (GpuMmu), `CollectDbgInfo`, `ControlInterrupt`, `QueryCurrentFence`. CPU/GPU sync uses the WDDM 2.0 **monitored fence** (`DxgkDdiSignalMonitoredFence` / `DxgkCbSignalMonitoredFence`), not the WDDM 3.1+ native fence.
 
 ---

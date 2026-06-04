@@ -35,12 +35,29 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // Save the callback interface for the driver's lifetime (Copy struct).
     adapter.dxgkrnl = Some(unsafe { *dxgkrnl_interface });
 
-    // STUB (Phase 2): initialize the virtio-gpu device here —
-    //   1. DxgkCbGetDeviceInformation → translated PCI resource list
-    //   2. scan VirtIO PCI vendor caps, map BARs
-    //   3. reset → ACK → DRIVER → negotiate features → FEATURES_OK → DRIVER_OK
-    //   4. init control virtqueue, GET_DISPLAY_INFO smoke test
-    // For Phase 1 the adapter simply starts so it appears in Device Manager.
+    // ── Phase 2: bring up the virtio-gpu transport ──────────────────────────
+    // VirtioGpu::init reads PCI config + maps BARs through the Dxgkrnl callbacks
+    // (DxgkConfigAccess / WdkHal) and discovers the virtio device. Hard-fail
+    // StartDevice on error so a virtio bring-up failure is unambiguous: it shows
+    // up as a StartDevice failure code with the VirtioError-mapped NTSTATUS in
+    // the device's ProblemStatus — distinct from the post-start Code 43.
+    // Drop any prior transport before re-init (e.g. on a stop/start cycle): its
+    // Drop resets the device and frees its rings/scratch. Doing it *before*
+    // init keeps the ordering safe — otherwise assigning the new transport would
+    // drop the old one (resetting the device) right after init configured it.
+    adapter.set_virtio(None);
+    // SAFETY: dxgkrnl_interface is valid per the DDI contract (also copied into
+    // adapter.dxgkrnl just above); init only borrows it for the call.
+    match crate::virtio::VirtioGpu::init(unsafe { &*dxgkrnl_interface }) {
+        Ok(gpu) => {
+            crate::kmsg(c"Helios: virtio-gpu transport up\n");
+            adapter.set_virtio(Some(gpu));
+        }
+        Err(e) => {
+            crate::kmsg(c"Helios: virtio-gpu init FAILED\n");
+            return e.into();
+        }
+    }
 
     // Render-only adapter: no scanout sources, no child devices (no monitors).
     // SAFETY: out-pointers validated non-null above.
@@ -55,8 +72,13 @@ pub unsafe extern "C" fn dxgkddi_start_device(
 /// `DxgkDdiStopDevice` — quiesce the adapter (inverse of StartDevice).
 pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_void) -> NTSTATUS {
     crate::kmsg(c"Helios: StopDevice\n");
-    // STUB (Phase 2): reset the device, disable queues, unmap BARs.
-    let _ = miniport_device_context;
+    if !miniport_device_context.is_null() {
+        // SAFETY: our adapter context, handed back from AddDevice.
+        let adapter = unsafe { &mut *(miniport_device_context as *mut AdapterContext) };
+        // Tear down the virtio transport: VirtioGpu::drop resets the device and
+        // frees its rings + scratch. A later StartDevice re-initializes.
+        adapter.set_virtio(None);
+    }
     STATUS_SUCCESS
 }
 
@@ -127,16 +149,30 @@ pub unsafe extern "C" fn dxgkddi_query_device_descriptor(
 // render/GPU-VA DDIs were registered.
 
 /// `DxgkDdiUnload` — driver-wide unload (no device context). Inverse of
-/// DriverEntry; nothing global to tear down yet.
+/// DriverEntry. All devices have been removed by now, so release the cached BAR
+/// MMIO mappings that `WdkHal` reused across stop/start cycles.
 pub unsafe extern "C" fn dxgkddi_unload() {
     crate::kmsg(c"Helios: Unload\n");
+    crate::virtio::hal::WdkHal::unmap_all();
 }
 
 /// `DxgkDdiQueryInterface` — export a driver-defined interface. We expose none.
 pub unsafe extern "C" fn dxgkddi_query_interface(
     _miniport_device_context: IN_CONST_PVOID,
-    _query_interface: IN_PQUERY_INTERFACE,
+    query_interface: IN_PQUERY_INTERFACE,
 ) -> NTSTATUS {
+    // DIAG: log each interface GUID dxgkrnl asks for during AddAdapter. If
+    // AddAdapter dies (OBJECT_NAME_NOT_FOUND) right after a query we reject, that
+    // interface is the suspect. Marker 0x04000000 then the GUID's Data1.
+    crate::diag::record(0x0400_0000);
+    if !query_interface.is_null() {
+        // SAFETY: non-null per the check; Dxgkrnl provides a valid QUERY_INTERFACE.
+        let qi = unsafe { &*query_interface };
+        if !qi.InterfaceType.is_null() {
+            // SAFETY: InterfaceType points to a GUID for the duration of the call.
+            crate::diag::record(unsafe { (*qi.InterfaceType).Data1 });
+        }
+    }
     STATUS_NOT_SUPPORTED
 }
 

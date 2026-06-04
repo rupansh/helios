@@ -1,0 +1,15 @@
+[package]
+name = "helios_umd"
+version = "0.1.0"
+edition = "2021"
+description = "Helios stub WDDM D3D user-mode driver — satisfies dxgkrnl's UserModeDriverName resolution so the render adapter starts (clears Code 43). Not a functional D3D UMD; real rendering goes through the Vulkan ICD (Mesa venus port)."
+
+# A user-mode DLL (x86_64-pc-windows-msvc). dxgkrnl/the D3D runtime loads this by
+# the name registered in the INF's UserModeDriverName.
+[lib]
+name = "helios_umd"
+crate-type = ["cdylib"]
+
+[profile.release]
+panic = "abort"
+opt-level = 1

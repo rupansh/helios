@@ -19,6 +19,15 @@ pub struct DeviceContext {
     pub adapter: *mut AdapterContext,
 }
 
+/// State for one GPU process object (WDDM 2.0 GPU-VA requirement). We keep no
+/// per-process GPU virtual address space (host-owned VA), but dxgkrnl requires a
+/// non-NULL driver handle it can round-trip through every per-process DDI and
+/// hand back at DestroyProcess, so we allocate a real object to back the handle.
+pub struct ProcessContext {
+    /// Back-pointer to the owning adapter (valid for the process's lifetime).
+    pub adapter: *mut AdapterContext,
+}
+
 /// `DxgkDdiCreateDevice` — allocate per-device state.
 pub unsafe extern "C" fn dxgkddi_create_device(
     miniport_device_context: *mut c_void,
@@ -63,19 +72,41 @@ pub unsafe extern "C" fn dxgkddi_destroy_context(_h_context: *mut c_void) -> NTS
 }
 
 /// `DxgkDdiCreateProcess` — GPU-VA process object (WDDM 2.0 requirement).
-// STUB: Phase 3 — track per-process GPU virtual address space.
+///
+/// dxgkrnl creates a process object during GPU-VA adapter bring-up and expects a
+/// non-NULL driver handle back in `hKmdProcess`; leaving this a
+/// `STATUS_NOT_IMPLEMENTED` stub fails post-StartDevice (one of the Code-43
+/// triggers). We allocate a `ProcessContext`, hand its pointer back as the
+/// handle, and reclaim it in DestroyProcess. No GPU virtual address space is
+/// tracked (host-owned VA — see build_paging_buffer.rs).
 pub unsafe extern "C" fn dxgkddi_create_process(
-    _miniport_device_context: *mut c_void,
-    _args: *mut DXGKARG_CREATEPROCESS,
+    miniport_device_context: *mut c_void,
+    args: *mut DXGKARG_CREATEPROCESS,
 ) -> NTSTATUS {
-    STATUS_NOT_IMPLEMENTED
+    // DIAG: confirm dxgkrnl reaches CreateProcess during AddAdapter.
+    crate::diag::record(0x0600_0000);
+    if miniport_device_context.is_null() || args.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: Dxgkrnl passes our adapter context and a valid args struct.
+    let args = unsafe { &mut *args };
+    let ctx = Box::new(ProcessContext {
+        adapter: miniport_device_context as *mut AdapterContext,
+    });
+    // Hand the process handle back to Dxgkrnl; reclaimed in destroy_process.
+    args.hKmdProcess = Box::into_raw(ctx) as HANDLE;
+    STATUS_SUCCESS
 }
 
-/// `DxgkDdiDestroyProcess`.
-// STUB: Phase 3.
+/// `DxgkDdiDestroyProcess` — free the per-process state from CreateProcess.
 pub unsafe extern "C" fn dxgkddi_destroy_process(
     _miniport_device_context: *mut c_void,
-    _h_process: *mut c_void,
+    h_process: *mut c_void,
 ) -> NTSTATUS {
+    if !h_process.is_null() {
+        // SAFETY: h_process was produced by Box::into_raw in create_process and
+        // is destroyed exactly once.
+        drop(unsafe { Box::from_raw(h_process as *mut ProcessContext) });
+    }
     STATUS_SUCCESS
 }

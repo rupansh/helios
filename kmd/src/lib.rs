@@ -32,8 +32,14 @@ static GLOBAL_ALLOCATOR: WdkAllocator = WdkAllocator;
 mod adapter;
 mod ddi;
 mod device;
+// TEMPORARY: post-start bring-up tracer to locate the AddAdapter failure.
+mod diag;
 mod dxgk;
 mod error;
+// Scaffolding: the transport's types/parsers are wired into the StartDevice path
+// over Phase-2 milestones M1–M4; allow dead_code until M4 consumes them all.
+#[allow(dead_code)]
+mod virtio;
 
 use dxgk::*;
 
@@ -61,36 +67,7 @@ pub unsafe extern "system" fn driver_entry(
     let mut init = build_ddi_table();
     // SAFETY: pointers are valid for the call; `init` outlives the call on this
     // stack frame, and DxgkInitialize copies what it needs.
-    let status = unsafe { DxgkInitialize(driver_object, registry_path, &mut init) };
-
-    // DIAGNOSTIC (Phase 1.5, temporary): the OS only surfaces a generic
-    // STATUS_FAILED_DRIVER_ENTRY for the device, hiding what DxgkInitialize
-    // actually returned. Record the real NTSTATUS under the service key so it can
-    // be read headlessly with `reg query HKLM\SYSTEM\CurrentControlSet\Services\
-    // helios_kmd /v InitStatus`. Remove once the load path is green.
-    // "helios_kmd\0" and "InitStatus\0" as UTF-16, NUL-terminated.
-    static SVC_PATH: [u16; 11] = [
-        b'h' as u16, b'e' as u16, b'l' as u16, b'i' as u16, b'o' as u16, b's' as u16, b'_' as u16,
-        b'k' as u16, b'm' as u16, b'd' as u16, 0,
-    ];
-    static VAL_NAME: [u16; 11] = [
-        b'I' as u16, b'n' as u16, b'i' as u16, b't' as u16, b'S' as u16, b't' as u16, b'a' as u16,
-        b't' as u16, b'u' as u16, b's' as u16, 0,
-    ];
-    // SAFETY: PASSIVE_LEVEL in DriverEntry; the service key exists; the strings
-    // are NUL-terminated and `status` is a live 4-byte value for the call.
-    unsafe {
-        let _ = wdk_sys::ntddk::RtlWriteRegistryValue(
-            1, // RTL_REGISTRY_SERVICES
-            SVC_PATH.as_ptr(),
-            VAL_NAME.as_ptr(),
-            4, // REG_DWORD
-            &status as *const NTSTATUS as *mut core::ffi::c_void,
-            core::mem::size_of::<NTSTATUS>() as u32,
-        );
-    }
-
-    status
+    unsafe { DxgkInitialize(driver_object, registry_path, &mut init) }
 }
 
 /// Build the `DRIVER_INITIALIZATION_DATA` DDI table.
@@ -99,18 +76,13 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     // registered"; we then fill in the callbacks we support.
     let mut data: DRIVER_INITIALIZATION_DATA = unsafe { core::mem::zeroed() };
 
-    // Per the documented contract (DriverEntry / DxgkInitialize MSDN sample):
-    // Version = DXGKDDI_INTERFACE_VERSION, the build-time alias. Against the
-    // 26100 WDK headers this is WDDM3_2 (0x11007), matching the struct layout
-    // bindgen compiles (the header is conditionally compiled at this default).
-    //
-    // NOTE (2026-06-04): the Version value does NOT drive the load result.
-    // Disassembly of the 26100 displib `DxgkInitialize` shows it whitelists
-    // every official interface version (WDDM2_0 0x5023 included) before handing
-    // off to dxgkrnl; empirically, WDDM2_0, WDDM3_2 and 0 all returned
-    // STATUS_REVISION_MISMATCH (0xC0000059) identically. The rejection comes from
-    // dxgkrnl validating the init-data CONTENT, not the version — the base
-    // lifecycle DDIs registered below were the missing piece.
+    // Declare the OS-native WDDM version: DXGKDDI_INTERFACE_VERSION is the
+    // build-time default (WDDM3_2 / 0x11007 on the 26100 WDK), matching the struct
+    // layout bindgen compiles. Declaring WDDM 2.0 instead made 24H2 reject the
+    // user-mode driver at AddAdapter with STATUS_REVISION_MISMATCH (a 2.0 adapter
+    // is too old for the OS's UMD), so we stay native. dxgkrnl then queries some
+    // WDDM 2.6/2.9 cap types (DXGKQAITYPE_WDDMDEVICECAPS=29, PHYSICAL_MEMORY_CAPS=34)
+    // which we answer STATUS_NOT_SUPPORTED — tolerated during bring-up.
     data.Version = DXGKDDI_INTERFACE_VERSION;
 
     // ── PnP / power lifecycle (Phase 1, real) ──────────────────────────────

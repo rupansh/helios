@@ -25,12 +25,19 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
     // SAFETY: valid per the DDI contract; we only read the args struct.
     let args = unsafe { &*query_adapter_info };
 
+    // DIAG: log every QueryAdapterInfo type dxgkrnl requests during AddAdapter.
+    crate::diag::record(0x0100_0000 | (args.Type as u32 & 0xFFFF));
+
     match args.Type {
         DXGKQAITYPE_DRIVERCAPS => unsafe { query_driver_caps(args) },
         DXGKQAITYPE_QUERYSEGMENT4 => unsafe { query_segments(args) },
         DXGKQAITYPE_GPUMMUCAPS => unsafe { query_gpummu_caps(args) },
         // Everything else: let Dxgkrnl apply its defaults.
-        _ => STATUS_NOT_SUPPORTED,
+        other => {
+            // DIAG: which type we rejected (suspect if AddAdapter dies right after).
+            crate::diag::record(0x0200_0000 | (other as u32 & 0xFFFF));
+            STATUS_NOT_SUPPORTED
+        }
     }
 }
 
@@ -145,6 +152,8 @@ pub unsafe extern "C" fn dxgkddi_get_node_metadata(
     node_ordinal: UINT,
     get_node_metadata: OUT_PDXGKARG_GETNODEMETADATA,
 ) -> NTSTATUS {
+    // DIAG: log node-metadata enumeration during AddAdapter.
+    crate::diag::record(0x0300_0000 | (node_ordinal & 0xFFFF));
     // Only node 0 exists; any other ordinal is out of range.
     if get_node_metadata.is_null() || node_ordinal != 0 {
         return STATUS_INVALID_PARAMETER;

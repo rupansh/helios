@@ -24,6 +24,14 @@
 use wdk_build::{BuilderExt, Config};
 
 /// Headers that declare the WDDM render-path DDIs we implement.
+///
+/// `DXGKDDI_INTERFACE_VERSION` is left at the header default (WDDM 3.2 on the
+/// 26100 WDK) so every generated struct matches the buffers 24H2 dxgkrnl hands a
+/// native driver. We declare the same version in `DriverEntry` (consistent → no
+/// BUFFER_TOO_SMALL). An earlier experiment pinned this to WDDM 2.0 (0x5023) to
+/// shrink the cap surface, but 24H2 then rejects the UMD revision
+/// (STATUS_REVISION_MISMATCH) — a 2.0 adapter is too old for the OS's user-mode
+/// driver, so we stay OS-native.
 const DXGK_HEADER_CONTENTS: &str = r#"
 #include <ntddk.h>
 #include <dispmprt.h>

@@ -423,6 +423,8 @@ fn query_gpummu_caps(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
 
 ## Phase 2: VirtIO PCI Initialization
 
+> **STATUS (2026-06-04): Phase 2 COMPLETE — implemented via the `virtio-drivers` 0.13 crate, NOT the hand-rolled code in this section.** The `struct Virtqueue` + helpers below (`add_buffer`/`notify_head`/`poll_used`/`free_chain`/`desc_phys`, and the `VirtioGpuCmd*` redefinitions) **do not exist in the codebase** — they are reference-only prose. The real transport is `VirtQueue<WdkHal, 64>` + `PciTransport` in `kmd/src/virtio/{gpu,hal,config}.rs` (`WdkHal` impls `virtio_drivers::Hal`; `DxgkConfigAccess` impls `ConfigurationAccess` over `DxgkCbReadDeviceSpace`). Wire structs come from `helios_protocol`. `GET_DISPLAY_INFO` round-trips on real HW. See the `phase2-virtio-drivers` memory.
+
 ### VirtIO PCI Device Layout
 
 The virtio-gpu device presents as PCI vendor `0x1AF4`, device `0x1050`.
@@ -756,6 +758,8 @@ impl Virtqueue {
 
 ## Phase 3: DxgkDdiSubmitCommandVirtual
 
+> **ERRATA (2026-06-04): the Venus submit path is `DxgkDdiEscape` (D3DKMTEscape), NOT `DxgkDdiSubmitCommandVirtual`.** The Vulkan ICD's only kernel channel is the private escape protocol in `helios_protocol::escape` (CTX_CREATE / SUBMIT_VENUS / WAIT_FENCE / ...), which sidesteps GPU-VA. `DxgkDdiSubmitCommandVirtual` and `DxgkDdiSubmitCommand` MUST stay `STATUS_SUCCESS` no-ops — returning any error BugChecks 0x119. The `submit_3d_cmd(...)` body sketched below calls hand-rolled `Virtqueue` methods that no longer exist; the real submit lives in `VirtioGpu::submit_3d` (kmd/src/virtio/gpu.rs) over virtio-drivers `VirtQueue::{add_notify_wait_pop, add, pop_used}`. See the `phase3-kickoff` memory.
+
 This is the hot path — called for every GPU command buffer submission.
 
 **Reference:** https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmddi/nc-d3dkmddi-dxgkddi_submitcommandvirtual
@@ -809,6 +813,8 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
 ---
 
 ## Phase 3: Interrupt Handling
+
+> **ERRATA (2026-06-04): use the virtio-drivers token API, not the hand-rolled helpers below.** ISR (`dxgkddi_interrupt_routine`, DIRQL — no alloc/pageable): `transport.ack_interrupt()` + `DxgkCbQueueDpc` + return BOOLEAN. DPC (`dxgkddi_dpc_routine`, DISPATCH): under the control-queue spinlock, `VirtQueue::pop_used(token)` → map token→fence_id → set the per-fence KEVENT (interim fence model). `read_isr` / `poll_used(&mut [u16])` / `free_chain` / `get_fence_for_descriptor` **do not exist**. The monitored-fence path (`DxgkCbNotifyInterrupt`) stays deferred.
 
 ```rust
 // src/ddi/interrupt.rs

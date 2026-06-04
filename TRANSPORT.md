@@ -268,6 +268,8 @@ D3DKMTEscape(&escape_params)?;
 
 ## 3. ICD ↔ KMD Communication
 
+> **ERRATA (2026-06-04): `helios_protocol::escape` (protocol/src/escape.rs) is the SOURCE OF TRUTH for these layouts, not the sketches below.** The real `HeliosEscapeSubmitVenus` is **`fence_id`-first** (8-byte aligned, padding-free, `Pod`) — a different field order from §3.1. The §3.2 `dxgkddi_escape` match is also **missing the `WAIT_FENCE` and `CTX_DESTROY` arms** (both ops are defined in escape.rs); the real handler dispatches all six ops. Validate every guest-supplied size/offset before reading (guest→kernel trust boundary).
+
 ### 3.1 D3DKMTEscape Protocol
 
 D3DKMTEscape is the standard WDDM mechanism for user-mode → kernel-mode out-of-band communication. The ICD uses this for:
@@ -585,6 +587,7 @@ The closest prior art is **[tenclass/mvisor-win-vgpu-driver](https://github.com/
 - **Two-descriptor `SUBMIT_3D`** (Phase 4): a small *mutable* `virtio_gpu_cmd_submit` header in descriptor 0, and the large command body passed **by physical address** in descriptor 1, pointing into a pre-reserved page-aligned slice of a contiguous pool. Avoids per-submit allocation; keeps the fence-flag header writable.
 - **Bitmap page sub-allocator** (Phase 3): one big `MmAllocateContiguousMemory` region sub-allocated with an `RtlBitmap` (page-granular, last-free-index hint), instead of many per-allocation contiguous allocs.
 - **Host-visible blob mapping** (Phase 3): `RESOURCE_CREATE_BLOB(HOST3D)` → `RESOURCE_MAP_BLOB` → read `virtio_gpu_resp_map_info { map_info, gpa, size }` → `MmMapIoSpaceEx(gpa, …)` using the **cache mode the host returns in `map_info`** (CACHED / WC / UNCACHED). That `map_info` byte is how the aperture segment should choose `PAGE_WRITECOMBINE` vs cached — the spec-sanctioned coherent-host-memory path.
+  > **OPEN ITEM (2026-06-04):** the actual `VirtioGpuRespMapInfo` (protocol/src/virtio_gpu.rs, 32B) carries ONLY `map_info` (+padding) — **NOT `gpa`/`size`**. The blob GPA almost certainly comes from the virtio-gpu **shared-memory PCI region** (`VIRTIO_PCI_CAP_SHARED_MEMORY_CFG` / hostmem), addressed by an offset, not from this response struct. Confirm against the virtio-gpu spec + virglrenderer BEFORE coding MAP_BLOB — this same region also fills `query_segments` `seg.BaseAddress` (currently 0). Mis-sourcing the GPA = silent host-memory corruption.
 - **Capset / `context_init` negotiation** (Phase 4): `GET_CAPSET_INFO`/`GET_CAPSET` + a supported-capset bitmask + `CTX_CREATE` with `context_init` = capset id. Identical in shape for Venus — use `VIRTIO_GPU_CAPSET_VENUS` and parse the Venus caps.
 - **ISR/DPC split** (Phase 2): the ISR only reads ISR/MSI status and queues a DPC; the DPC drains the used ring, dispatches on `hdr.type`, frees command buffers, and signals fences — per-queue spinlock + MSI-X message→queue map. Enforces the invariant *free descriptors only on used-ring completion*.
 - **Interim fences** (before WDDM monitored fences): a `fence_id → KEVENT` map signaled from the DPC + a blocking wait.
