@@ -192,28 +192,63 @@ the four ops tables (§4); and `vn_renderer_create_helios` mirroring `vn_rendere
 `<setupapi.h>`, `<initguid.h>`+`<cfgmgr32.h>` as needed). Re-declare the Helios structs/IOCTL codes
 from §2 (or generate a shared C header from `protocol/` — a future nicety).
 
-### 6.4 Build (from a VS 2022 x64 Native Tools dev shell, local C: build dir)
+### 6.4 Build — VALIDATED 2026-06-04 (configures + compiles from `Z:\`, NO robocopy)
+
+**Build from the share directly — confirmed working.** meson reads `Z:\icd\mesa` and cl compiles to a
+local C: build dir; the 9p share is fine for the compiler's reads (only cargo/wdk artifact *writes*
+fail on it). **187 objects compiled** (the whole Vulkan runtime + util + WSI incl. `wsi_common_win32.cpp`
++ DirectX-Headers + zlib) before stopping at the venus portability gap (below). So `icd/mesa` is
+EXCLUDED from the `win_cargo` mirror and Mesa is built via the new **`win_meson`** MCP tool (runs meson
+under vcvars; src `Z:\icd\mesa` → build `C:\Users\Rupansh\helios-mesa-build`).
+
+**The exact working `meson setup` (corrected from the draft above — `gallium-va`/`gallium-vdpau` are
+gone, folded into `-Dvideo-codecs=`):**
 ```
 meson setup C:\Users\Rupansh\helios-mesa-build Z:\icd\mesa ^
-  -Dvulkan-drivers=virtio -Dgallium-drivers= -Dplatforms=windows ^
-  -Dvulkan-layers= -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dopengl=false ^
-  -Dgles1=disabled -Dgles2=disabled -Dllvm=disabled -Dshared-llvm=disabled ^
-  -Dvideo-codecs= -Dgallium-va=disabled -Dgallium-vdpau=disabled ^
-  -Dshader-cache=disabled -Dbuild-tests=false -Dzstd=disabled -Dperfetto=false ^
-  -Dintel-rt=disabled --buildtype=debugoptimized
-meson compile -C C:\Users\Rupansh\helios-mesa-build
+  -Dvulkan-drivers=virtio -Dgallium-drivers= -Dplatforms=windows -Dvideo-codecs= ^
+  -Dvulkan-layers= -Degl=disabled -Dgbm=disabled -Dglx=disabled -Dopengl=false ^
+  -Dgles1=disabled -Dgles2=disabled -Dllvm=disabled -Dshader-cache=disabled ^
+  -Dbuild-tests=false -Dperfetto=false --buildtype=debugoptimized
 ```
-**Why `-Dvulkan-drivers=virtio` explicitly:** `auto` resolves to `[]` on Windows (meson.build:282 —
-"No vulkan driver supports windows currently"). **Why empty `-Dgallium-drivers=`:** `auto` pulls
-llvmpipe/zink/d3d12 + LLVM. **Configure gates, in order:** (1) meson≥1.4 + ninja + pkgconf on PATH;
-(2) the meson python needs `mako` AND `pyyaml` (`pip install mako pyyaml`); (3) Vulkan-Headers (vk.xml
-is vendored, but headers may be probed — add the wrap/subproject if it errors); (4) **DirectX-Headers**
-(`meson.build:681` forces `dep_dxheaders` for vk-on-Windows because of `wsi_common_win32.cpp` —
-`meson subprojects download` or install it); (5) `cc.find_library('setupapi')` needs the VS dev shell
-(WDK/SDK on `LIB`); (6) NO Rust/bindgen needed (venus is pure C — don't let `vulkan-drivers`
-accidentally include nouveau/gfxstream). win11 toolchain state per the `mesa-venus-icd-port` memory
-(python3.12/meson1.11/ninja1.13/mako present; LLVM/VS2022 present; pkgconf/pyyaml/DirectX-Headers may
-need installing).
+`-Degl=disabled` is REQUIRED (else `src/egl/meson.build` errors on `libgallium_wgl` since gallium is
+empty). `-Dvulkan-drivers=virtio` is mandatory (`auto`→`[]` on Windows, meson.build:282). Via `win_meson`:
+`win_meson(["setup","C:\\Users\\Rupansh\\helios-mesa-build","Z:\\icd\\mesa","-Dvulkan-drivers=virtio",...])`
+then `win_meson([])` (defaults to `compile -C` the build dir).
+
+**Configure gates ACTUALLY hit + how they were cleared (all done on win11 already):**
+1. Python deps in the meson interpreter: `pip install mako pyyaml packaging setuptools` (3.12 dropped
+   `distutils` → `packaging` is required; mako + pyyaml for codegen). ✅ installed.
+2. **pkgconf NOT needed** — meson falls back to CMake, which found+built DirectX-Headers from its wrap
+   (`subprojects/DirectX-Headers.wrap`, auto-downloaded) and zlib from its wrap. ✅
+3. No Vulkan-Headers gate hit (vk.xml is vendored; the lite runtime supplies headers). ✅
+4. No Rust/bindgen (venus is pure C with this option set). ✅
+`meson setup` returns 0 cleanly.
+
+### 6.5 ⚠️ venus MSVC-portability gap (the real first task, NOT a share/IO problem)
+
+venus has **never** been compiled on Windows (vtest excluded, virtgpu Linux-only), so `cl` hits genuine
+GCC-isms once it reaches `src/virtio/vulkan/*.c`:
+1. **C11 atomics**: `vcruntime_c11_stdatomic.h: #error "C atomic support is not enabled"` — needs
+   `/experimental:c11atomics` in the venus C args (MSVC) — i.e. a `meson.build` `vn_c_args` addition.
+2. **`void*` pointer arithmetic** (`C2036 'void*': unknown size`) — pervasive in `vn_cs.h`, `vn_ring.h`,
+   `vn_common.h`, **and the generated `src/virtio/venus-protocol/vn_protocol_driver_*.h`** + `vn_command_buffer.c`.
+   GCC/clang treat `sizeof(void)==1`; MSVC rejects it. This is the hard one (it's in generated headers).
+3. **`pid_t` / `gettid`** in `vn_common.c` (`vn_gettid`) — Linux types; need a Win32 shim
+   (`GetCurrentThreadId`).
+
+**Two ways forward (decide early — this gates everything):**
+- **(A) clang-cl** (LLVM is installed) accepts the `void*` arithmetic + GCC-isms, the natural fix and
+  what mesa-on-Windows generally uses. BUT a first attempt tripped on the **zlib subproject**
+  (`deflate.c: #include nested too deeply`) and `llvm-rc` on `zlib1.rc` — clang-cl needs extra setup
+  (force zlib to the system/again, or `-Db_pch`/include tweaks, or build zlib with cl while venus uses
+  clang-cl). Not a drop-in; budget time to get clang-cl configured cleanly.
+- **(B) Stay on cl + patch venus**: add `/experimental:c11atomics`, then cast every `void*` arithmetic
+  to `char*` (incl. fixing the encoder generator `src/virtio/venus-protocol/` or its `.py` so the
+  generated headers are MSVC-clean) and shim `pid_t`/`gettid`. Larger, touches generated code, but keeps
+  one toolchain. Some of this may be upstreamable.
+
+Either way this is real work and should be the **first** Phase 5 task — `vn_renderer_helios.c` can't link
+until venus compiles. (The KMD/IOCTL side is done and waiting.)
 
 ---
 
