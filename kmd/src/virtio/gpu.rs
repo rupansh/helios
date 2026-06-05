@@ -38,6 +38,7 @@ use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::pci::bus::{DeviceFunction, PciRoot};
 use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::{DeviceStatus, Transport};
+use virtio_drivers::Error as VirtError;
 
 use super::config::KmdfConfigAccess;
 use super::hal::{DmaBuffer, WdkHal};
@@ -221,6 +222,88 @@ impl BlobTable {
     }
 }
 
+// ── Async submission (Phase 4e) ─────────────────────────────────────────────
+//
+// `submit_venus` is non-blocking: it adds the SUBMIT_3D descriptors to the
+// control queue, notifies, and RETURNS without polling the used ring. Each such
+// in-flight submission keeps its device-visible buffers alive in
+// [`VirtioGpu::inflight`] until the host completes it; completions are reaped
+// (popped + freed) lazily from `submit_venus`/`fence_complete`/`quiesce_into`.
+//
+// IRQL: these run under the AdapterContext virtio spinlock at DISPATCH_LEVEL, so
+// they MUST NOT allocate or free `DmaBuffer`s (Mm{Allocate,Free}ContiguousMemory
+// are PASSIVE-only). Buffers are allocated by the caller at PASSIVE before the
+// lock; completed `InFlight` entries are *moved* (never dropped) into a
+// caller-supplied `retired` Vec under the lock and dropped by the caller at
+// PASSIVE after the lock releases.
+
+/// Bytes reserved at the front of a submit's metadata `DmaBuffer`: the
+/// device-read SUBMIT_3D header followed by the device-written ctrl response.
+/// `[0, hdr) = VirtioGpuCmdSubmit`, `[hdr, hdr+resp) = VirtioGpuCtrlHdr`.
+pub const SUBMIT_META_BYTES: usize =
+    core::mem::size_of::<VirtioGpuCmdSubmit>() + core::mem::size_of::<VirtioGpuCtrlHdr>();
+
+/// Max simultaneously in-flight async submissions tracked + max entries reaped
+/// into one `retired` Vec. The control queue (`CTRL_QUEUE_SIZE` descriptors, 3
+/// per submit) caps real concurrency well below this; the generous bound makes
+/// the in-flight `Vec` never reallocate (so `push` is alloc-free under the lock).
+pub const MAX_INFLIGHT: usize = CTRL_QUEUE_SIZE;
+
+/// One outstanding async SUBMIT_3D. Owns its device-visible buffers for as long
+/// as the device may DMA them (until `pop_used`).
+pub struct InFlight {
+    /// Descriptor-chain head returned by `VirtQueue::add` (the pop_used token).
+    token: u16,
+    /// The submit's fence id (monotonic; the ICD assigns it). `fence_complete`
+    /// reports a fence done once no in-flight entry carries its id.
+    fence_id: u64,
+    /// `[SUBMIT_3D header | ctrl response]` (see [`SUBMIT_META_BYTES`]).
+    meta: DmaBuffer,
+    /// The opaque Venus command stream (device-read).
+    venus: DmaBuffer,
+}
+
+impl InFlight {
+    /// A carrier that owns ONLY buffers awaiting free — no live token/fence. Used
+    /// by `submit_venus`'s error paths to hand `meta`/`venus` back to the caller's
+    /// `retired` list so they are freed at PASSIVE_LEVEL, never dropped inside the
+    /// DISPATCH-level virtio spinlock (`Mm*ContiguousMemory` is PASSIVE-only).
+    /// `pop_used` is never called on a carrier (it is only dropped).
+    fn to_free(meta: DmaBuffer, venus: DmaBuffer) -> Self {
+        Self {
+            token: 0,
+            fence_id: 0,
+            meta,
+            venus,
+        }
+    }
+}
+
+/// Reconstruct the exact `(hdr, venus, resp)` slices a submit was `add`ed with,
+/// from the raw buffer pointers, so `pop_used` can be handed the matching set
+/// without forming a `&`/`&mut` borrow of `self.inflight` across the
+/// `self.control` call (mirrors the scratch raw-pointer pattern).
+///
+/// # Safety
+/// `meta`/`venus` must point at the live `InFlight`'s buffers; `meta` must hold
+/// at least [`SUBMIT_META_BYTES`] and `venus` at least `venus_len` bytes. The
+/// returned slices alias those buffers and must not outlive them.
+unsafe fn submit_slices<'a>(
+    meta: *mut u8,
+    venus: *mut u8,
+    venus_len: usize,
+) -> (&'a [u8], &'a [u8], &'a mut [u8]) {
+    let hdr_len = core::mem::size_of::<VirtioGpuCmdSubmit>();
+    let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
+    // SAFETY: the three sub-spans are disjoint and within the buffers' lengths
+    // (hdr at [0,hdr_len), resp at [hdr_len,hdr_len+resp_len) in `meta`; venus is
+    // a separate buffer). The caller upholds the pointer/length contract.
+    let hdr = core::slice::from_raw_parts(meta, hdr_len);
+    let resp = core::slice::from_raw_parts_mut(meta.add(hdr_len), resp_len);
+    let venus = core::slice::from_raw_parts(venus, venus_len);
+    (hdr, venus, resp)
+}
+
 /// An initialized virtio-gpu transport.
 pub struct VirtioGpu {
     /// The virtio-modern PCI transport (owns the mapped cfg-region VAs).
@@ -245,6 +328,19 @@ pub struct VirtioGpu {
     /// the pointer. Never reclaimed (bring-up): the window is multi-GB and the ICD's
     /// mapped working set is small. Guarded by the AdapterContext virtio lock.
     next_window_offset: u64,
+    /// In-flight async SUBMIT_3D submissions (Phase 4e). Completions are matched
+    /// by descriptor token, NOT by position: with per-queue `ring_idx` fence
+    /// routing the host can retire fenced commands out of submission order, so the
+    /// used-ring head is not necessarily this list's front. Capacity is reserved
+    /// to [`MAX_INFLIGHT`] at init so `push` never reallocates (alloc-free under
+    /// the spinlock).
+    inflight: Vec<InFlight>,
+    /// Highest fence id ever submitted. Fence ids are globally monotonic (the ICD
+    /// assigns them under its device mutex), so a fence `f` has been submitted iff
+    /// `f <= max_submitted_fence_id`; combined with "`f` is no longer in-flight"
+    /// that means it has completed. Drives `IOCTL_HELIOS_WAIT_FENCE`
+    /// (out-of-order-safe — see [`VirtioGpu::fence_complete`]).
+    max_submitted_fence_id: u64,
 }
 
 impl VirtioGpu {
@@ -359,6 +455,8 @@ impl VirtioGpu {
             host_visible,
             blobs: BlobTable::with_reserved_capacity(),
             next_window_offset: 0,
+            inflight: Vec::with_capacity(MAX_INFLIGHT),
+            max_submitted_fence_id: 0,
         })
     }
 
@@ -381,7 +479,17 @@ impl VirtioGpu {
 
     /// Create a virtio-gpu 3D context bound to `capset_id` (Venus = 4) and return
     /// the guest-assigned context id.
-    pub fn ctx_create(&mut self, capset_id: u32) -> Result<u32, VirtioError> {
+    ///
+    /// Like every synchronous roundtrip it first [`quiesce_into`]s any in-flight
+    /// async submits: those occupy the shared control queue, and the synchronous
+    /// `add_notify_wait_pop` below pops by token assuming ITS chain is next on the
+    /// used ring — which only holds once the queue has no async work ahead of it.
+    pub fn ctx_create(
+        &mut self,
+        capset_id: u32,
+        retired: &mut Vec<InFlight>,
+    ) -> Result<u32, VirtioError> {
+        self.quiesce_into(retired)?;
         let ctx_id = self.next_ctx_id.fetch_add(1, Ordering::Relaxed);
         let mut cmd = VirtioGpuCtxCreate::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_CREATE;
@@ -397,7 +505,12 @@ impl VirtioGpu {
     }
 
     /// Destroy a previously created 3D context.
-    pub fn ctx_destroy(&mut self, ctx_id: u32) -> Result<(), VirtioError> {
+    pub fn ctx_destroy(
+        &mut self,
+        ctx_id: u32,
+        retired: &mut Vec<InFlight>,
+    ) -> Result<(), VirtioError> {
+        self.quiesce_into(retired)?;
         let mut cmd = VirtioGpuCtxDestroy::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
         cmd.hdr.ctx_id = ctx_id;
@@ -422,10 +535,14 @@ impl VirtioGpu {
         blob_flags: u32,
         blob_id: u64,
         size: u64,
+        retired: &mut Vec<InFlight>,
     ) -> Result<u32, VirtioError> {
         if size == 0 {
             return Err(VirtioError::DeviceError);
         }
+        // Drain in-flight async submits before the synchronous create+attach
+        // roundtrips (shared control queue; see `ctx_create`).
+        self.quiesce_into(retired)?;
         let resource_id = self.next_resource_id.fetch_add(1, Ordering::Relaxed);
         let mut cmd = VirtioGpuResourceCreateBlob::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
@@ -457,23 +574,50 @@ impl VirtioGpu {
         Ok(resource_id)
     }
 
-    /// Submit an opaque Venus command stream to `ctx_id`, fenced with `fence_id`.
+    /// Submit an opaque Venus command stream to `ctx_id`, fenced with `fence_id`
+    /// — **non-blocking** (Phase 4e). Adds the SUBMIT_3D descriptors, notifies the
+    /// device, records the submission as in-flight, and RETURNS WITHOUT WAITING.
+    /// Completion is observed later (here on the next call, in `fence_complete`,
+    /// or in `quiesce_into`). This breaks the synchronous-submit deadlock class: a
+    /// submit whose host fence can only retire after a *later* submit no longer
+    /// stalls the single control channel.
     ///
-    /// `venus` MUST be physically contiguous (carve it from a [`DmaBuffer`]) — it
-    /// rides a single device-readable descriptor. The command is fenced and this
-    /// blocks (polled) until the device acknowledges it on the used ring, so by
-    /// the time it returns the work is host-visible-complete (interim sync fence
-    /// model; the async/KEVENT model lands in M3.4).
+    /// Buffer ownership: the device DMAs `meta`/`venus`'s physical pages until the
+    /// matching `pop_used`, so this TAKES OWNERSHIP of both and parks them in the
+    /// in-flight pool. `meta` must be ≥ [`SUBMIT_META_BYTES`] (this writes the
+    /// SUBMIT_3D header into it and reserves the response tail); `venus` is the
+    /// command stream (`venus_len` device-read bytes). Both must be allocated by
+    /// the caller at PASSIVE_LEVEL.
+    ///
+    /// `retired` collects in-flight entries reaped here (drain-before-submit, plus
+    /// backpressure draining when the queue is full); the caller drops them at
+    /// PASSIVE to free their `DmaBuffer`s — never under this spinlock.
     pub fn submit_venus(
         &mut self,
         ctx_id: u32,
         fence_id: u64,
         ring_idx: u32,
-        venus: &[u8],
+        mut meta: DmaBuffer,
+        venus: DmaBuffer,
+        venus_len: usize,
+        retired: &mut Vec<InFlight>,
     ) -> Result<(), VirtioError> {
-        if venus.is_empty() {
+        // Every error path below routes `meta`/`venus` into `retired` so the
+        // caller frees them at PASSIVE — they must never be dropped here at the
+        // DISPATCH-level spinlock. Success parks them in the in-flight pool.
+        if venus_len == 0
+            || venus_len > venus.as_slice().len()
+            || meta.as_slice().len() < SUBMIT_META_BYTES
+        {
+            retired.push(InFlight::to_free(meta, venus));
             return Err(VirtioError::DeviceError);
         }
+        // Reap anything the host has already completed, freeing queue slots.
+        if let Err(e) = self.drain_completed(retired) {
+            retired.push(InFlight::to_free(meta, venus));
+            return Err(e);
+        }
+
         let mut cmd = VirtioGpuCmdSubmit::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_SUBMIT_3D;
         cmd.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
@@ -488,36 +632,176 @@ impl VirtioGpu {
             cmd.hdr.flags |= VIRTIO_GPU_FLAG_INFO_RING_IDX;
             cmd.hdr.ring_idx = ring_idx as u8;
         }
-        cmd.size = venus.len() as u32;
+        cmd.size = venus_len as u32;
 
         let hdr_len = core::mem::size_of::<VirtioGpuCmdSubmit>();
-        let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
-        // SAFETY: `scratch` is our owned contiguous page; the low half holds the
-        // submit header (device-read), the high half the response (device-write).
-        // Disjoint halves; serialized by the caller's spinlock. We take a raw
-        // pointer (not a &mut borrow of self.scratch) so self.control/transport
-        // can be borrowed for the round-trip below.
-        let buf = unsafe {
-            core::slice::from_raw_parts_mut(self.scratch.as_slice().as_ptr() as *mut u8, SCRATCH_BYTES)
-        };
-        let (hdr_buf, resp_buf) = buf.split_at_mut(SCRATCH_BYTES / 2);
-        hdr_buf[..hdr_len].copy_from_slice(bytemuck::bytes_of(&cmd));
+        meta.as_mut_slice()[..hdr_len].copy_from_slice(bytemuck::bytes_of(&cmd));
+
+        // Raw pointers to the owned buffers so the `(hdr, venus, resp)` slices do
+        // not borrow `self.inflight`/`meta`/`venus` across the `self.control` call
+        // (and so the same slices can be rebuilt verbatim for `pop_used`).
+        let meta_ptr = meta.as_slice().as_ptr() as *mut u8;
+        let venus_ptr = venus.as_slice().as_ptr() as *mut u8;
 
         // Two device-readable descriptors (submit header + Venus stream) and one
         // device-writable response descriptor (TRANSPORT §7 two-descriptor + resp).
-        self.control
-            .add_notify_wait_pop(
-                &[&hdr_buf[..hdr_len], venus],
-                &mut [&mut resp_buf[..resp_len]],
-                &mut self.transport,
-            )
-            .map_err(|_| VirtioError::DeviceError)?;
-        let resp: &VirtioGpuCtrlHdr = bytemuck::from_bytes(&resp_buf[..resp_len]);
-        if resp_is_ok(resp.type_) {
-            Ok(())
-        } else {
-            Err(VirtioError::DeviceError)
+        // On QueueFull, block-drain completions (the device is making progress on
+        // earlier submits) until a slot frees, then retry. The loop yields a
+        // Result (no conditional move of meta/venus inside it); the single move
+        // onto the error path happens once, after the loop.
+        let token_result: Result<u16, VirtioError> = loop {
+            // SAFETY: `meta`/`venus` are owned and outlive the in-flight entry
+            // (parked below until `pop_used`); the slices are within their lengths.
+            let (hdr, venus_in, resp) = unsafe { submit_slices(meta_ptr, venus_ptr, venus_len) };
+            // SAFETY: the buffers remain valid until the matching `pop_used`
+            // (drain_completed / quiesce_into / fence_complete), per `add`'s contract.
+            match unsafe { self.control.add(&[hdr, venus_in], &mut [resp]) } {
+                Ok(t) => break Ok(t),
+                Err(VirtError::QueueFull) => {
+                    if self.inflight.is_empty() {
+                        // Empty pool but the queue rejects a 3-descriptor chain —
+                        // nothing will free up. Surface rather than spin forever.
+                        break Err(VirtioError::DeviceError);
+                    }
+                    while !self.control.can_pop() {
+                        core::hint::spin_loop();
+                    }
+                    if let Err(e) = self.drain_completed(retired) {
+                        break Err(e);
+                    }
+                }
+                Err(_) => break Err(VirtioError::DeviceError),
+            }
+        };
+        let token = match token_result {
+            Ok(t) => t,
+            Err(e) => {
+                retired.push(InFlight::to_free(meta, venus));
+                return Err(e);
+            }
+        };
+
+        if self.control.should_notify() {
+            self.transport.notify(CTRL_QUEUE);
         }
+
+        // Park the submission. `push` stays within the reserved capacity
+        // (drain above keeps `inflight.len() < MAX_INFLIGHT`), so it is alloc-free.
+        self.inflight.push(InFlight {
+            token,
+            fence_id,
+            meta,
+            venus,
+        });
+        if fence_id > self.max_submitted_fence_id {
+            self.max_submitted_fence_id = fence_id;
+        }
+        Ok(())
+    }
+
+    /// Pop every control-queue completion the host has posted, moving each retired
+    /// [`InFlight`] into `retired` (for the caller to free at PASSIVE).
+    /// Non-blocking: stops as soon as the used ring is empty.
+    ///
+    /// Completions are matched by descriptor token (`peek_used` → find the
+    /// in-flight entry with that token), NOT by list position: per-`ring_idx` fence
+    /// routing lets the host retire fenced commands out of submission order, so the
+    /// used-ring head may be any in-flight entry. `pop_used` requires the exact
+    /// `(inputs, outputs)` the chain was `add`ed with, reconstructed here from the
+    /// matched entry's buffers.
+    fn drain_completed(&mut self, retired: &mut Vec<InFlight>) -> Result<(), VirtioError> {
+        while self.control.can_pop() {
+            // The token (descriptor-chain head) of the next used element.
+            let next_token = match self.control.peek_used() {
+                Some(t) => t,
+                None => break,
+            };
+            // Find which in-flight submission that completion belongs to.
+            let i = match self.inflight.iter().position(|e| e.token == next_token) {
+                Some(i) => i,
+                None => {
+                    // A completion whose token we don't track. We cannot `pop_used`
+                    // it without its matching buffers, and skipping it would desync
+                    // the used ring. Post-quiesce every queued chain is a submit we
+                    // track, so this is not expected; stop draining defensively.
+                    break;
+                }
+            };
+            // Copy out Copy fields + raw buffer pointers so no borrow of
+            // `self.inflight` is held across the `self.control.pop_used` call.
+            let (token, meta_ptr, venus_ptr, venus_len) = {
+                let e = &self.inflight[i];
+                (
+                    e.token,
+                    e.meta.as_slice().as_ptr() as *mut u8,
+                    e.venus.as_slice().as_ptr() as *mut u8,
+                    e.venus.as_slice().len(),
+                )
+            };
+            // SAFETY: same `(hdr, venus, resp)` set originally `add`ed (the buffers
+            // are still owned by `inflight[i]`); `pop_used` consumes this token,
+            // which equals the next used element (peeked above).
+            let (hdr, venus_in, resp) = unsafe { submit_slices(meta_ptr, venus_ptr, venus_len) };
+            let popped = unsafe { self.control.pop_used(token, &[hdr, venus_in], &mut [resp]) };
+            match popped {
+                Ok(_) => {
+                    // The slot is done regardless of the host's response status.
+                    // Move (do not drop) into the caller's PASSIVE-level free list.
+                    let done = self.inflight.remove(i);
+                    retired.push(done);
+                }
+                // NotReady/WrongToken: nothing more to reap right now.
+                Err(_) => break,
+            }
+        }
+        Ok(())
+    }
+
+    /// Block-drain ALL in-flight async submits to completion. Used before any
+    /// synchronous control roundtrip (which assumes an otherwise-idle queue) and
+    /// from teardown. Retired entries go to `retired` (freed by the caller at
+    /// PASSIVE).
+    fn quiesce_into(&mut self, retired: &mut Vec<InFlight>) -> Result<(), VirtioError> {
+        while !self.inflight.is_empty() {
+            while !self.control.can_pop() {
+                core::hint::spin_loop();
+            }
+            let before = self.inflight.len();
+            self.drain_completed(retired)?;
+            if self.inflight.len() == before {
+                // A completion was signaled but did not retire the front entry
+                // (out-of-order/WrongToken) — should not happen on the FIFO control
+                // queue. Bail rather than spin forever.
+                return Err(VirtioError::DeviceError);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reap completions, then report whether `fence_id` has completed. A fence is
+    /// complete iff it was submitted (`fence_id <= max_submitted_fence_id`) and is
+    /// no longer in-flight — which is correct even when fences retire out of
+    /// submission order (per-`ring_idx` routing). `fence_id == 0` (the ICD's
+    /// "no specific fence") is always complete. Drives `IOCTL_HELIOS_WAIT_FENCE`
+    /// (the IOCTL handler does the PASSIVE-level wait/poll loop around this).
+    ///
+    /// The ICD only waits on a fence it has already submitted, so a `fence_id`
+    /// that is `<= max_submitted_fence_id` and absent from `inflight` has truly
+    /// completed (it is not a not-yet-submitted future id).
+    pub fn fence_complete(
+        &mut self,
+        fence_id: u64,
+        retired: &mut Vec<InFlight>,
+    ) -> Result<bool, VirtioError> {
+        self.drain_completed(retired)?;
+        if fence_id == 0 {
+            return Ok(true);
+        }
+        // Submitted (id assigned monotonically, so `<= max`) AND no longer parked
+        // in the in-flight pool ⇒ the host retired it. Robust to out-of-order
+        // completion across rings.
+        let still_pending = self.inflight.iter().any(|e| e.fence_id == fence_id);
+        Ok(fence_id <= self.max_submitted_fence_id && !still_pending)
     }
 
     /// Phase-1 (under-lock) half of `MAP_BLOB` (ARCH §6): reserve a host-visible
@@ -530,7 +814,14 @@ impl VirtioGpu {
     /// command, so a rejected map does not waste window space. The caller
     /// ([`crate::ioctl`]) must ensure the resource is not already mapped (it tracks
     /// live mappings in the AdapterContext mapping table) before calling this.
-    pub fn map_blob_prepare(&mut self, resource_id: u32) -> Result<BlobMapPrep, VirtioError> {
+    pub fn map_blob_prepare(
+        &mut self,
+        resource_id: u32,
+        retired: &mut Vec<InFlight>,
+    ) -> Result<BlobMapPrep, VirtioError> {
+        // Drain in-flight async submits before the synchronous RESOURCE_MAP_BLOB
+        // roundtrip (shared control queue; see `ctx_create`).
+        self.quiesce_into(retired)?;
         let window = self.host_visible.ok_or(VirtioError::DeviceError)?;
         // The resource must have been created (ALLOC_BLOB) so we know its size.
         let size = self.blobs.size_of(resource_id).ok_or(VirtioError::DeviceError)?;
@@ -632,9 +923,13 @@ impl Drop for VirtioGpu {
         // Quiesce the device (resets queues) so it stops touching the rings we
         // are about to free.
         self.transport.set_status(DeviceStatus::empty());
-        // The `scratch` DmaBuffer frees its contiguous page on its own drop, and
-        // the control `VirtQueue` frees its ring memory on its drop (via
-        // `Hal::dma_dealloc`).
+        // The `scratch` DmaBuffer frees its contiguous page on its own drop, the
+        // control `VirtQueue` frees its ring memory on its drop (via
+        // `Hal::dma_dealloc`), and the `inflight` Vec drops every parked
+        // `InFlight`'s buffers. The device was reset above (set_status empty), so
+        // it no longer DMAs those pages. `VirtioGpu::drop` runs at PASSIVE_LEVEL
+        // (set_virtio drops the old transport outside the spinlock), as the
+        // contiguous-memory free requires.
         //
         // The BAR MMIO mappings made inside `PciTransport` are intentionally NOT
         // freed here: `WdkHal` caches them by physical address and reuses them on

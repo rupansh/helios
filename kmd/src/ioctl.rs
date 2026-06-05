@@ -15,6 +15,7 @@
 use core::mem::size_of;
 use core::slice;
 
+use alloc::vec::Vec;
 use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeCtxCreate, HeliosEscapeCtxDestroy, HeliosEscapeMapBlob,
@@ -24,18 +25,20 @@ use helios_protocol::{
     VIRTIO_GPU_MAP_CACHE_WC,
 };
 use wdk_sys::ntddk::{
-    IoAllocateMdl, IoFreeMdl, MmMapLockedPagesSpecifyCache, MmUnmapLockedPages,
+    IoAllocateMdl, IoFreeMdl, KeDelayExecutionThread, MmMapLockedPagesSpecifyCache,
+    MmUnmapLockedPages,
 };
 use wdk_sys::{
-    call_unsafe_wdf_function_binding, MDL, NTSTATUS, PMDL, PVOID, ULONG, ULONG_PTR, WDFFILEOBJECT,
-    WDFOBJECT, WDFQUEUE, WDFREQUEST, NT_SUCCESS, STATUS_DEVICE_DOES_NOT_EXIST,
+    call_unsafe_wdf_function_binding, LARGE_INTEGER, MDL, NTSTATUS, PMDL, PVOID, ULONG, ULONG_PTR,
+    WDFFILEOBJECT, WDFOBJECT, WDFQUEUE, WDFREQUEST, NT_SUCCESS, STATUS_DEVICE_DOES_NOT_EXIST,
     STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER,
-    STATUS_SUCCESS, _MEMORY_CACHING_TYPE,
+    STATUS_IO_TIMEOUT, STATUS_SUCCESS, _MEMORY_CACHING_TYPE,
 };
 
 use crate::adapter::{adapter_of, AdapterContext};
+use crate::virtio::gpu::{InFlight, MAX_INFLIGHT, SUBMIT_META_BYTES};
 use crate::virtio::hal::DmaBuffer;
-use crate::wdf::USER_MODE;
+use crate::wdf::{KERNEL_MODE, USER_MODE};
 
 // ── MDL / user-mapping constants (Phase 4c) ─────────────────────────────────
 /// log2(page size). The host-visible window is mapped page-granular.
@@ -150,7 +153,10 @@ unsafe fn handle_ctx_create(adapter: &AdapterContext, request: WDFREQUEST) -> (N
     };
     // SAFETY: WDF guaranteed ≥ sz bytes at in_ptr/out_ptr. Read unaligned.
     let req: HeliosEscapeCtxCreate = pod_read_unaligned(slice::from_raw_parts(in_ptr, sz));
-    match adapter.with_virtio(|v| v.ctx_create(req.capset_id)) {
+    // Per-call free list for any in-flight async submits reaped while quiescing
+    // the control queue; dropped here at PASSIVE after with_virtio releases the lock.
+    let mut retired: Vec<InFlight> = Vec::with_capacity(MAX_INFLIGHT);
+    match adapter.with_virtio(|v| v.ctx_create(req.capset_id, &mut retired)) {
         Ok(Ok(ctx_id)) => {
             let mut out = req;
             out.out_ctx_id = ctx_id;
@@ -172,7 +178,8 @@ unsafe fn handle_ctx_destroy(adapter: &AdapterContext, request: WDFREQUEST) -> (
     };
     // SAFETY: ≥ sz bytes at in_ptr.
     let req: HeliosEscapeCtxDestroy = pod_read_unaligned(slice::from_raw_parts(in_ptr, sz));
-    match adapter.with_virtio(|v| v.ctx_destroy(req.ctx_id)) {
+    let mut retired: Vec<InFlight> = Vec::with_capacity(MAX_INFLIGHT);
+    match adapter.with_virtio(|v| v.ctx_destroy(req.ctx_id, &mut retired)) {
         Ok(Ok(())) => (STATUS_SUCCESS, 0),
         Ok(Err(ve)) => (ve.into(), 0),
         Err(de) => (de.into(), 0),
@@ -193,9 +200,17 @@ unsafe fn handle_alloc_blob(adapter: &AdapterContext, request: WDFREQUEST) -> (N
     };
     // SAFETY: WDF guaranteed ≥ sz bytes at in_ptr/out_ptr. Read unaligned.
     let req: HeliosEscapeAllocBlob = pod_read_unaligned(slice::from_raw_parts(in_ptr, sz));
-    match adapter
-        .with_virtio(|v| v.alloc_blob(req.ctx_id, req.blob_mem, req.blob_flags, req.blob_id, req.size))
-    {
+    let mut retired: Vec<InFlight> = Vec::with_capacity(MAX_INFLIGHT);
+    match adapter.with_virtio(|v| {
+        v.alloc_blob(
+            req.ctx_id,
+            req.blob_mem,
+            req.blob_flags,
+            req.blob_id,
+            req.size,
+            &mut retired,
+        )
+    }) {
         Ok(Ok(resource_id)) => {
             let mut out = req;
             out.out_resource_id = resource_id;
@@ -232,39 +247,124 @@ unsafe fn handle_submit_venus(adapter: &AdapterContext, request: WDFREQUEST) -> 
         Err(s) => return (s, 0),
     };
 
-    // Copy the stream into device-visible contiguous memory (PASSIVE_LEVEL).
-    let mut dma = match DmaBuffer::new(payload) {
+    // Allocate the two device-visible contiguous buffers the in-flight async
+    // submission OWNS until the host completes it (PASSIVE_LEVEL, before the
+    // lock): `meta` carries the SUBMIT_3D header + the response slot, `venus`
+    // carries the command stream. The KMD must keep both alive past this IOCTL's
+    // return because submit is non-blocking now — so they move into the in-flight
+    // pool inside `submit_venus` and are freed only when the matching `pop_used`
+    // reaps them (here, via the `retired` list, or in a later drain).
+    let meta = match DmaBuffer::new(SUBMIT_META_BYTES) {
+        Some(d) => d,
+        None => return (STATUS_INSUFFICIENT_RESOURCES, 0),
+    };
+    let mut venus = match DmaBuffer::new(payload) {
         Some(d) => d,
         None => return (STATUS_INSUFFICIENT_RESOURCES, 0),
     };
     // SAFETY: WDF guaranteed ≥ payload readable bytes at venus_ptr.
-    dma.as_mut_slice()
+    venus
+        .as_mut_slice()
         .copy_from_slice(slice::from_raw_parts(venus_ptr, payload));
 
     let (ctx_id, fence_id, ring_idx) = (req.ctx_id, req.fence_id, req.ring_idx);
-    let status = match adapter
-        .with_virtio(|v| v.submit_venus(ctx_id, fence_id, ring_idx, dma.as_slice()))
-    {
+    // Pre-reserved free list for completions reaped during this submit (drain
+    // before add + backpressure draining) AND for `meta`/`venus` on a submit
+    // error path; freed below at PASSIVE.
+    let mut retired: Vec<InFlight> = Vec::with_capacity(MAX_INFLIGHT);
+    // `meta`/`venus` are MOVED into submit_venus (it parks them in the in-flight
+    // pool on success, or hands them back via `retired` on error — it never drops
+    // a DmaBuffer itself, since that would free contiguous memory at the
+    // DISPATCH-level lock). `retired` is captured by &mut (the `move` only moves
+    // the meta/venus bindings + the reference, not the Vec itself).
+    let retired_ref = &mut retired;
+    let status = match adapter.with_virtio(move |v| {
+        v.submit_venus(ctx_id, fence_id, ring_idx, meta, venus, payload, retired_ref)
+    }) {
         Ok(Ok(())) => STATUS_SUCCESS,
         Ok(Err(ve)) => ve.into(),
         Err(de) => de.into(),
     };
-    // `dma` drops here, at PASSIVE_LEVEL, after the lock has been released.
+    // `retired` drops here at PASSIVE_LEVEL after the lock released, freeing every
+    // reaped/handed-back DmaBuffer. If the transport was down (with_virtio Err),
+    // `meta`/`venus` were moved into the closure and dropped when the closure was
+    // dropped — but with_virtio drops the closure AFTER releasing the spinlock, so
+    // that drop is also at PASSIVE. (See adapter.rs::with_virtio.)
     (status, 0)
 }
 
-/// `IOCTL_HELIOS_WAIT_FENCE` → interim synchronous fence model.
+/// Poll interval between used-ring re-checks in `handle_wait_fence`, in 100ns
+/// units (negative = relative). 100µs keeps latency low without busy-spinning.
+const WAIT_FENCE_POLL_INTERVAL_100NS: i64 = -1_000;
+/// The same interval in nanoseconds, for deriving the timeout iteration count.
+const WAIT_FENCE_POLL_INTERVAL_NS: u64 = 100_000;
+
+/// `IOCTL_HELIOS_WAIT_FENCE` → block until `fence_id` completes or `timeout_ns`
+/// elapses (Phase 4e). Submission is now asynchronous, so the host fence may not
+/// be retired yet when this runs.
 ///
-/// `submit_venus` blocks on the used ring until the device acknowledges the
-/// fenced command, so any fence the ICD asks to wait on has already completed by
-/// the time SUBMIT_VENUS returned. We validate the request shape and report
-/// success. PHASE 4 (async submission): read the request and call
-/// `adapter.fences.wait_and_remove(req.fence_id, req.timeout_ns)`.
-unsafe fn handle_wait_fence(_adapter: &AdapterContext, request: WDFREQUEST) -> (NTSTATUS, usize) {
+/// Poll-first model (no interrupt yet — see the interrupt blocker in the Phase-4e
+/// handover): there is no DPC to signal a KEVENT, so this drives the used ring
+/// itself. Each iteration reaps completions under the virtio lock
+/// ([`VirtioGpu::fence_complete`]) and, if the target is not yet complete, sleeps
+/// a short interval at PASSIVE_LEVEL before re-checking. `fence_complete` is
+/// out-of-order-safe (a fence is done once it is submitted and no longer
+/// in-flight), so this is correct even under per-`ring_idx` fence routing.
+///
+/// `timeout_ns == 0` → poll once (non-blocking). A huge value (venus passes
+/// `UINT64_MAX`) is effectively infinite. On timeout this completes with
+/// `STATUS_IO_TIMEOUT` — an *error* status (`!NT_SUCCESS`), so `DeviceIoControl`
+/// returns FALSE and the ICD can tell timeout from completion (`STATUS_TIMEOUT`,
+/// 0x102, is a success code and would be indistinguishable from completion).
+unsafe fn handle_wait_fence(adapter: &AdapterContext, request: WDFREQUEST) -> (NTSTATUS, usize) {
     let sz = size_of::<HeliosEscapeWaitFence>();
-    match input_buffer(request, sz) {
-        Ok(_) => (STATUS_SUCCESS, 0),
-        Err(s) => (s, 0),
+    let (in_ptr, _) = match input_buffer(request, sz) {
+        Ok(b) => b,
+        Err(s) => return (s, 0),
+    };
+    // SAFETY: ≥ sz bytes at in_ptr.
+    let req: HeliosEscapeWaitFence = pod_read_unaligned(slice::from_raw_parts(in_ptr, sz));
+
+    // Reaped completions land here each iteration and are freed (dropped) at
+    // PASSIVE before the next sleep; the capacity is reused via `clear`.
+    let mut retired: Vec<InFlight> = Vec::with_capacity(MAX_INFLIGHT);
+
+    // Bound the poll loop by the timeout, counted in poll-interval steps. Each
+    // KeDelayExecutionThread may sleep slightly LONGER than requested, so this
+    // over-waits rather than ever timing out early (a false timeout would be the
+    // dangerous direction). `timeout_ns == 0` → 0 sleeps → poll once. A huge
+    // value (venus passes UINT64_MAX) yields an astronomically large count, i.e.
+    // effectively infinite. (KeQueryInterruptTime is a header inline, not an
+    // exported symbol, so it is unavailable to bindgen — hence step counting.)
+    let max_sleeps = req.timeout_ns / WAIT_FENCE_POLL_INTERVAL_NS;
+    let mut sleeps: u64 = 0;
+
+    loop {
+        let done = match adapter.with_virtio(|v| v.fence_complete(req.fence_id, &mut retired)) {
+            Ok(Ok(d)) => d,
+            Ok(Err(ve)) => {
+                retired.clear();
+                return (ve.into(), 0);
+            }
+            Err(de) => {
+                retired.clear();
+                return (de.into(), 0);
+            }
+        };
+        // Free reaped buffers at PASSIVE (lock released); keep the capacity.
+        retired.clear();
+        if done {
+            return (STATUS_SUCCESS, 0);
+        }
+        if sleeps >= max_sleeps {
+            return (STATUS_IO_TIMEOUT, 0);
+        }
+        sleeps += 1;
+        // Sleep a short interval at PASSIVE before re-polling the used ring.
+        let mut interval: LARGE_INTEGER = core::mem::zeroed();
+        interval.QuadPart = WAIT_FENCE_POLL_INTERVAL_100NS;
+        // SAFETY: PASSIVE_LEVEL; non-alertable kernel-mode relative delay.
+        let _ = KeDelayExecutionThread(KERNEL_MODE, 0, &mut interval);
     }
 }
 
@@ -311,8 +411,11 @@ unsafe fn handle_map_blob(adapter: &AdapterContext, request: WDFREQUEST) -> (NTS
     }
 
     // Phase 1 — under the virtio spinlock (DISPATCH): RESOURCE_MAP_BLOB at a fresh
-    // window offset; returns the guest-physical range + host caching.
-    let prep = match adapter.with_virtio(|v| v.map_blob_prepare(req.resource_id)) {
+    // window offset; returns the guest-physical range + host caching. Quiescing
+    // the control queue inside map_blob_prepare may reap in-flight submits into
+    // `retired`, which drops (frees) at PASSIVE at the end of this handler.
+    let mut retired: Vec<InFlight> = Vec::with_capacity(MAX_INFLIGHT);
+    let prep = match adapter.with_virtio(|v| v.map_blob_prepare(req.resource_id, &mut retired)) {
         Ok(Ok(p)) => p,
         Ok(Err(ve)) => return (ve.into(), 0),
         Err(de) => return (de.into(), 0),
