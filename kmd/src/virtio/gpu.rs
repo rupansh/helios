@@ -25,9 +25,11 @@ use alloc::vec::Vec;
 use bytemuck::Zeroable;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy,
-    VirtioGpuCtxResource, VirtioGpuResourceCreateBlob, VirtioGpuResourceMapBlob,
-    VirtioGpuRespDisplayInfo, VirtioGpuRespMapInfo, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
-    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
+    VirtioGpuCtxResource, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush,
+    VirtioGpuResourceMapBlob, VirtioGpuRespDisplayInfo, VirtioGpuRespMapInfo,
+    VirtioGpuSetScanoutBlob, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
+    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_FLUSH,
+    VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_SET_SCANOUT_BLOB,
     HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES,
     VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
     VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
@@ -572,6 +574,64 @@ impl VirtioGpu {
         // create doesn't occupy a slot). Done under the caller's spinlock — alloc-free.
         self.blobs.insert(resource_id, size)?;
         Ok(resource_id)
+    }
+
+    /// Bind a venus blob `resource_id` to scanout 0 for zero-copy display
+    /// (`VIRTIO_GPU_CMD_SET_SCANOUT_BLOB`) — the Phase-7 go/no-go gate path
+    /// (DISPLAY.md §8). The blob must already be an **exportable** HOST3D resource
+    /// (created via `alloc_blob(blob_id = venus mem id)` and rendered into); QEMU's
+    /// `virgl_cmd_set_scanout_blob` materializes its `dmabuf_fd` (set at blob-create
+    /// by `virgl_renderer_resource_get_info`) and the host GL backend presents it
+    /// under `-spice gl=on`. A non-OK roundtrip here (e.g. `RESP_ERR_UNSPEC`,
+    /// "resource not backed by a dmabuf") is the gate's *failure* signal — the venus
+    /// image wasn't created exportable / ANV didn't export it.
+    ///
+    /// `stride`/`offset` are the plane-0 geometry of a LINEAR image (the host needs
+    /// them to interpret the imported dmabuf). This is a device-global scanout
+    /// command, not a 3D-context one, so `hdr.ctx_id = 0`.
+    pub fn set_scanout_blob(
+        &mut self,
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        stride: u32,
+        offset: u32,
+        retired: &mut Vec<InFlight>,
+    ) -> Result<(), VirtioError> {
+        // Drain in-flight async submits before the synchronous control roundtrip
+        // (shared control queue; see `ctx_create`/`alloc_blob`).
+        self.quiesce_into(retired)?;
+        let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
+        cmd.r = VirtioGpuRect { x: 0, y: 0, width, height };
+        cmd.scanout_id = 0;
+        cmd.resource_id = resource_id;
+        cmd.width = width;
+        cmd.height = height;
+        cmd.format = format;
+        cmd.strides[0] = stride;
+        cmd.offsets[0] = offset;
+        self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))
+    }
+
+    /// Flush a scanout resource's full rect to the display
+    /// (`VIRTIO_GPU_CMD_RESOURCE_FLUSH`). For a GL/blob scanout under `-spice
+    /// gl=on` this is what drives the actual host present. Device-global
+    /// (`hdr.ctx_id = 0`).
+    pub fn resource_flush(
+        &mut self,
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        retired: &mut Vec<InFlight>,
+    ) -> Result<(), VirtioError> {
+        self.quiesce_into(retired)?;
+        let mut cmd = VirtioGpuResourceFlush::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+        cmd.r = VirtioGpuRect { x: 0, y: 0, width, height };
+        cmd.resource_id = resource_id;
+        self.ctrl_roundtrip(bytemuck::bytes_of(&cmd))
     }
 
     /// Submit an opaque Venus command stream to `ctx_id`, fenced with `fence_id`

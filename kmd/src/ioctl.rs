@@ -19,10 +19,10 @@ use alloc::vec::Vec;
 use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeCtxCreate, HeliosEscapeCtxDestroy, HeliosEscapeMapBlob,
-    HeliosEscapeSubmitVenus, HeliosEscapeWaitFence, IOCTL_HELIOS_ALLOC_BLOB, IOCTL_HELIOS_CTX_CREATE,
-    IOCTL_HELIOS_CTX_DESTROY, IOCTL_HELIOS_MAP_BLOB, IOCTL_HELIOS_SUBMIT_VENUS,
-    IOCTL_HELIOS_WAIT_FENCE, VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED,
-    VIRTIO_GPU_MAP_CACHE_WC,
+    HeliosEscapePresentBlob, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence, IOCTL_HELIOS_ALLOC_BLOB,
+    IOCTL_HELIOS_CTX_CREATE, IOCTL_HELIOS_CTX_DESTROY, IOCTL_HELIOS_MAP_BLOB,
+    IOCTL_HELIOS_PRESENT_BLOB, IOCTL_HELIOS_SUBMIT_VENUS, IOCTL_HELIOS_WAIT_FENCE,
+    VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED, VIRTIO_GPU_MAP_CACHE_WC,
 };
 use wdk_sys::ntddk::{
     IoAllocateMdl, IoFreeMdl, KeDelayExecutionThread, MmMapLockedPagesSpecifyCache,
@@ -85,6 +85,7 @@ pub unsafe extern "C" fn evt_io_device_control(
         IOCTL_HELIOS_WAIT_FENCE => handle_wait_fence(adapter, request),
         IOCTL_HELIOS_ALLOC_BLOB => handle_alloc_blob(adapter, request),
         IOCTL_HELIOS_MAP_BLOB => handle_map_blob(adapter, request),
+        IOCTL_HELIOS_PRESENT_BLOB => handle_present_blob(adapter, request),
         // Unknown control codes are rejected (CLAUDE.md invariant).
         _ => (STATUS_INVALID_DEVICE_REQUEST, 0),
     };
@@ -180,6 +181,44 @@ unsafe fn handle_ctx_destroy(adapter: &AdapterContext, request: WDFREQUEST) -> (
     let req: HeliosEscapeCtxDestroy = pod_read_unaligned(slice::from_raw_parts(in_ptr, sz));
     let mut retired: Vec<InFlight> = Vec::with_capacity(MAX_INFLIGHT);
     match adapter.with_virtio(|v| v.ctx_destroy(req.ctx_id, &mut retired)) {
+        Ok(Ok(())) => (STATUS_SUCCESS, 0),
+        Ok(Err(ve)) => (ve.into(), 0),
+        Err(de) => (de.into(), 0),
+    }
+}
+
+/// `IOCTL_HELIOS_PRESENT_BLOB` → throwaway Phase-7 go/no-go gate (DISPLAY.md §8).
+/// Bind a venus blob `resource_id` to scanout 0 (`SET_SCANOUT_BLOB`) and flush it
+/// (`RESOURCE_FLUSH`) so the host displays it zero-copy under `-spice gl=on`. A
+/// non-success return (the host rejecting the scanout because the resource has no
+/// exported `dmabuf_fd`, `RESP_ERR_UNSPEC`) is the gate's *failure* signal — i.e.
+/// the venus image wasn't created exportable. Input-only. Removed once the DOD's
+/// real `HELIOS_PRESENT_BLOB` escape supersedes it.
+unsafe fn handle_present_blob(adapter: &AdapterContext, request: WDFREQUEST) -> (NTSTATUS, usize) {
+    let sz = size_of::<HeliosEscapePresentBlob>();
+    let (in_ptr, _) = match input_buffer(request, sz) {
+        Ok(b) => b,
+        Err(s) => return (s, 0),
+    };
+    // SAFETY: WDF guaranteed ≥ sz bytes at in_ptr. Read unaligned.
+    let req: HeliosEscapePresentBlob = pod_read_unaligned(slice::from_raw_parts(in_ptr, sz));
+    if req.resource_id == 0 || req.width == 0 || req.height == 0 {
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
+    let mut retired: Vec<InFlight> = Vec::with_capacity(MAX_INFLIGHT);
+    // Both control commands run under the one virtio spinlock (DISPATCH, alloc-free).
+    match adapter.with_virtio(|v| {
+        v.set_scanout_blob(
+            req.resource_id,
+            req.width,
+            req.height,
+            req.format,
+            req.stride,
+            req.offset,
+            &mut retired,
+        )
+        .and_then(|()| v.resource_flush(req.resource_id, req.width, req.height, &mut retired))
+    }) {
         Ok(Ok(())) => (STATUS_SUCCESS, 0),
         Ok(Err(ve)) => (ve.into(), 0),
         Err(de) => (de.into(), 0),
