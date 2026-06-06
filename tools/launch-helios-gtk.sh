@@ -32,7 +32,18 @@ pkill -f 'virtiofsd.*helios-tpm' 2>/dev/null||true; pkill -f 'swtpm.*helios-tpm'
 /usr/lib/virtiofsd --shared-dir "$SHARE" --socket-path "$TPMDIR/fs.sock" --tag helios-vgpu --sandbox none &
 /usr/bin/swtpm socket --tpmstate dir="$TPMDIR/state" --ctrl type=unixio,path="$TPMDIR/swtpm-sock" --tpm2 --daemon
 sleep 1
-echo '>>> QEMU (gtk gl=on, virtio-gpu-gl-pci, native Wayland). Z:\ = repo. SSH 192.168.122.120 <<<'
+# Display backend (HELIOS_DISPLAY): "spice" → -spice on :5930 (view with
+# `remote-viewer spice://127.0.0.1:5930`; no QXL here so spice binds the sole
+# virtio-gpu console — sidesteps the gtk eglMakeCurrent issue). Spice GL is off by
+# default (software 2D display); HELIOS_SPICE_GL=on for the venus dmabuf path.
+# Anything else is a -display value (default "gtk" = software, no EGL).
+if [ "${HELIOS_DISPLAY:-gtk}" = spice ]; then
+  DISP=(-spice "port=5930,addr=127.0.0.1,disable-ticketing=on,gl=${HELIOS_SPICE_GL:-off}" -display none)
+  echo '>>> QEMU (spice :5930, virtio-gpu SOLE display). View: remote-viewer spice://127.0.0.1:5930. SSH .120 <<<'
+else
+  DISP=(-display "${HELIOS_DISPLAY:-gtk}")
+  echo ">>> QEMU (display=${HELIOS_DISPLAY:-gtk}, virtio-gpu SOLE display). Z:\\ = repo. SSH .120 <<<"
+fi
 exec /usr/bin/qemu-system-x86_64 \
   -name \
   guest=win11,debug-threads=on \
@@ -155,5 +166,4 @@ exec /usr/bin/qemu-system-x86_64 \
   off \
   -msg \
   timestamp=on \
-  -display \
-  "${HELIOS_DISPLAY:-gtk}"
+  "${DISP[@]}"
