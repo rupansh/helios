@@ -21,8 +21,7 @@ use base64::Engine as _;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, tool::Parameters},
     model::*,
-    schemars, tool, tool_handler, tool_router,
-    ServerHandler, ServiceExt,
+    schemars, tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
 use serde::Deserialize;
 use tokio::process::Command;
@@ -117,7 +116,9 @@ fn format_output(o: &ExecOutput) -> String {
     let code = if o.timed_out {
         "TIMEOUT".to_string()
     } else {
-        o.code.map(|c| c.to_string()).unwrap_or_else(|| "unknown".to_string())
+        o.code
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
     };
     format!(
         "exit_code: {code}\n--- stdout ---\n{}\n--- stderr ---\n{}",
@@ -136,13 +137,17 @@ async fn run_ssh(
     // Build a PowerShell script: set env, cd, run, then propagate the exit code.
     // SilentlyContinue on progress stops PowerShell from CLIXML-serializing its
     // "Preparing modules…" progress records into our captured stderr.
-    let mut script =
-        String::from("$ProgressPreference = 'SilentlyContinue';\n$ErrorActionPreference = 'Continue';\n");
+    let mut script = String::from(
+        "$ProgressPreference = 'SilentlyContinue';\n$ErrorActionPreference = 'Continue';\n",
+    );
     for (k, v) in env {
         script.push_str(&format!("$env:{k} = '{}';\n", ps_single_quote(v)));
     }
     let dir = cwd.unwrap_or(PROJECT_DRIVE);
-    script.push_str(&format!("Set-Location -LiteralPath '{}';\n", ps_single_quote(dir)));
+    script.push_str(&format!(
+        "Set-Location -LiteralPath '{}';\n",
+        ps_single_quote(dir)
+    ));
     script.push_str(command);
     // For native programs $LASTEXITCODE holds the code; cmdlets leave it null.
     script.push_str("\n$c = $LASTEXITCODE; if ($null -eq $c) { $c = 0 }; exit $c\n");
@@ -226,6 +231,32 @@ struct WinMesonArgs {
     timeout_secs: Option<u64>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct WinLookingGlassArgs {
+    /// Source root on the Windows VM. Defaults to Z:\. Override if the shared
+    /// tree is exposed at another path.
+    #[serde(default)]
+    source_root: Option<String>,
+    /// CMake configure arguments. If empty, the tool configures LookingGlass/host
+    /// with the default Ninja + RelWithDebInfo + USE_NVFBC=OFF settings.
+    #[serde(default)]
+    configure_args: Vec<String>,
+    /// CMake build arguments after `cmake --build <build_dir>`. If empty, builds
+    /// the default target.
+    #[serde(default)]
+    build_args: Vec<String>,
+    /// Build directory on the Windows VM. Defaults to
+    /// C:\Users\Rupansh\helios-lookingglass-host-build.
+    #[serde(default)]
+    build_dir: Option<String>,
+    /// If true, skip CMake configure and only run the build step.
+    #[serde(default)]
+    no_configure: bool,
+    /// Timeout in seconds. Defaults to 1800.
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
 #[tool_router]
 impl WinHost {
     fn new() -> Self {
@@ -239,7 +270,14 @@ impl WinHost {
     )]
     async fn win_exec(&self, Parameters(a): Parameters<WinExecArgs>) -> String {
         let env = a.env.unwrap_or_default();
-        match run_ssh(&a.command, a.cwd.as_deref(), &env, a.timeout_secs.unwrap_or(600)).await {
+        match run_ssh(
+            &a.command,
+            a.cwd.as_deref(),
+            &env,
+            a.timeout_secs.unwrap_or(600),
+        )
+        .await
+        {
             Ok(o) => format_output(&o),
             Err(e) => format!("error launching ssh: {e}"),
         }
@@ -290,9 +328,78 @@ impl WinHost {
         // ignores the MSVC INCLUDE/LIB env. meson reads Mesa source from Z:\ directly
         // (no robocopy); ninja artifacts go to the local C: build dir. cmd expands
         // %PATH% at parse time, which is correct here (single prepend, no prior env mutation).
-        let command =
-            format!("cmd /c 'set \"PATH={MINGW_BIN};%PATH%\" && meson {meson_args}'");
-        match run_ssh(&command, None, &HashMap::new(), a.timeout_secs.unwrap_or(1800)).await {
+        let command = format!("cmd /c 'set \"PATH={MINGW_BIN};%PATH%\" && meson {meson_args}'");
+        match run_ssh(
+            &command,
+            None,
+            &HashMap::new(),
+            a.timeout_secs.unwrap_or(1800),
+        )
+        .await
+        {
+            Ok(o) => format_output(&o),
+            Err(e) => format!("error launching ssh: {e}"),
+        }
+    }
+
+    #[tool(
+        description = "Sync the project to the local Windows mirror and build the Looking Glass Windows host server from LookingGlass\\host. This mirrors Z:\\ -> C:\\Users\\Rupansh\\helios-vgpu with robocopy (excluding target/, all .git dirs, and icd\\mesa), then builds from local disk into C:\\Users\\Rupansh\\helios-lookingglass-host-build using mingw-w64 gcc + Ninja. Edit sources on the Linux/Z:\\ side; the mirror is re-synced on every call. Empty args configure with Ninja RelWithDebInfo USE_NVFBC=OFF and build the default target."
+    )]
+    async fn win_looking_glass(&self, Parameters(a): Parameters<WinLookingGlassArgs>) -> String {
+        let source_root = a.source_root.unwrap_or_else(|| PROJECT_DRIVE.to_string());
+        let build_dir = a
+            .build_dir
+            .unwrap_or_else(|| "C:\\Users\\Rupansh\\helios-lookingglass-host-build".to_string());
+        let lg_src = format!("{MIRROR_ROOT}\\LookingGlass\\host");
+
+        let configure = if a.no_configure {
+            String::new()
+        } else if a.configure_args.is_empty() {
+            format!(
+                "cmake -S \"{lg_src}\" -B \"{build_dir}\" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_NVFBC=OFF"
+            )
+        } else {
+            format!(
+                "cmake -S \"{lg_src}\" -B \"{build_dir}\" {}",
+                a.configure_args.join(" ")
+            )
+        };
+        let build = if a.build_args.is_empty() {
+            format!("cmake --build \"{build_dir}\"")
+        } else {
+            format!("cmake --build \"{build_dir}\" {}", a.build_args.join(" "))
+        };
+        let mesa_exclude = if source_root.ends_with("\\.") || source_root.ends_with("/.") {
+            format!("{}\\icd\\mesa", &source_root[..source_root.len() - 2])
+        } else {
+            format!("{source_root}\\icd\\mesa")
+        };
+
+        let command = format!(
+            "if (!(Test-Path -LiteralPath '{source_root}')) {{ \"win_looking_glass: source root not found: {source_root}\"; exit 3 }}\n\
+             robocopy \"{source_root}\" {MIRROR_ROOT} /MIR /XD target .git icd\\mesa \"{mesa_exclude}\" /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
+             if ($LASTEXITCODE -ge 8) {{ \"win_looking_glass: robocopy mirror sync failed (exit $LASTEXITCODE)\"; exit $LASTEXITCODE }}\n\
+             if (!(Test-Path -LiteralPath '{MIRROR_ROOT}\\LookingGlass\\host')) {{ \"win_looking_glass: LookingGlass\\host missing after sync\"; exit 2 }}\n\
+             $env:PATH = '{MINGW_BIN};' + $env:PATH\n\
+             {}\n\
+             if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}\n\
+             {}\n",
+            if configure.is_empty() {
+                "\"win_looking_glass: skipping configure\"".to_string()
+            } else {
+                configure
+            },
+            build,
+        );
+
+        match run_ssh(
+            &command,
+            None,
+            &HashMap::new(),
+            a.timeout_secs.unwrap_or(1800),
+        )
+        .await
+        {
             Ok(o) => format_output(&o),
             Err(e) => format!("error launching ssh: {e}"),
         }
@@ -319,7 +426,10 @@ impl ServerHandler for WinHost {
 async fn main() -> Result<()> {
     // Drop any stale SSH ControlMaster so the first build picks up the current
     // machine environment (PATH/vars updated by recent toolchain installs).
-    let _ = Command::new("ssh").args(["-O", "exit", SSH_HOST]).output().await;
+    let _ = Command::new("ssh")
+        .args(["-O", "exit", SSH_HOST])
+        .output()
+        .await;
 
     let service = WinHost::new()
         .serve((tokio::io::stdin(), tokio::io::stdout()))
