@@ -18,6 +18,7 @@
 
 use core::ffi::c_void;
 use core::mem::size_of;
+use core::sync::atomic::Ordering;
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -27,8 +28,8 @@ use crate::dxgk::*;
 use crate::virtio::{DxgkConfigAccess, VirtioGpu};
 
 /// Single-output DOD: one video-present source, one monitor child.
-const MAX_VIEWS: u32 = 1;
-const MAX_CHILDREN: u32 = 1;
+pub(crate) const MAX_VIEWS: u32 = 1;
+pub(crate) const MAX_CHILDREN: u32 = 1;
 /// The monitor child id == the VidPN target id == 0 (must match everywhere).
 const CHILD_UID: u32 = 0;
 /// Default desktop mode when no POST framebuffer geometry is available.
@@ -98,6 +99,7 @@ pub unsafe extern "C" fn start_device(
     let adapter = unsafe { &mut *(miniport_device_context as *mut AdapterContext) };
     // Save the callback interface for the driver's lifetime (Copy struct).
     adapter.dxgkrnl = Some(unsafe { *dxgkrnl_interface });
+    adapter.reset_current_mode();
 
     // Bring up the virtio transport (PCI cap scan + BAR map + virtqueue) over the
     // Dxgkrnl config-space callbacks. Hard-fail StartDevice on error so a bring-up
@@ -107,10 +109,19 @@ pub unsafe extern "C" fn start_device(
     match VirtioGpu::init(&access) {
         Ok(gpu) => {
             crate::kmsg(c"Helios DOD: virtio-gpu transport up\n");
+            // Publish the ISR status register VA BEFORE any command that could make
+            // the device assert an interrupt, so DxgkDdiInterruptRoutine can ack it
+            // (read de-asserts INTx) rather than leaving it asserted → storm/hang.
+            let isr_va = gpu.isr_status_va();
             adapter.set_virtio(Some(gpu));
+            adapter.isr_status_va.store(isr_va, Ordering::Release);
         }
         Err(e) => {
             crate::kmsg(c"Helios DOD: virtio-gpu init FAILED\n");
+            // NOTE: do NOT record() here — it would overwrite the last init milestone
+            // in HeliosStep, which is exactly the localization we want (init RETURNS
+            // Err, confirmed; the surviving milestone shows WHERE: 0x2F feature-reject,
+            // 0x23 entering VirtQueue::new, etc.).
             return e.into();
         }
     }
@@ -127,7 +138,7 @@ pub unsafe extern "C" fn start_device(
     // path end-to-end (the host shows a black primary) even before the VidPN
     // mode-commit flow runs. A failure here does NOT fail StartDevice — the mode
     // is (re)set later by CommitVidPn.
-    let _ = set_desktop_mode(adapter, DEFAULT_WIDTH, DEFAULT_HEIGHT);
+    let _ = set_desktop_mode(adapter, DEFAULT_WIDTH, DEFAULT_HEIGHT, false);
     crate::diag::record(0x0200_00FF);
 
     STATUS_SUCCESS
@@ -137,9 +148,16 @@ pub unsafe extern "C" fn start_device(
 /// scanout fb + resets the device).
 pub unsafe extern "C" fn stop_device(miniport_device_context: *mut c_void) -> NTSTATUS {
     crate::kmsg(c"Helios DOD: StopDevice\n");
+    crate::diag::record_step_only(0x1100_0000); // TEMP: StopDevice entered (preserve HeliosPost)
     if let Some(adapter) = unsafe { adapter(miniport_device_context) } {
+        // Tear the transport down first (VirtioGpu::drop resets the device so it
+        // stops asserting), THEN stop the ISR from acking (its register is going away
+        // conceptually; the mapping itself survives in the WdkHal cache).
         adapter.set_virtio(None);
+        crate::diag::record_step_only(0x1100_0001); // TEMP: VirtioGpu::drop completed
+        adapter.isr_status_va.store(0, Ordering::Release);
     }
+    crate::diag::record_step_only(0x1100_00FF); // TEMP: StopDevice returning SUCCESS
     STATUS_SUCCESS
 }
 
@@ -168,6 +186,7 @@ pub unsafe extern "C" fn stop_device_and_release_post_display_ownership(
     }
     if let Some(adapter) = unsafe { adapter(miniport_device_context) } {
         adapter.set_virtio(None);
+        adapter.isr_status_va.store(0, Ordering::Release);
     }
     STATUS_SUCCESS
 }
@@ -193,26 +212,43 @@ pub unsafe extern "C" fn query_adapter_info(
     // SAFETY: valid per the DDI contract; we only read the args.
     let args = unsafe { &*p_query_adapter_info };
     crate::diag::record(0x0300_0000 | (args.Type as u32 & 0xFFFF));
-    if args.Type != _DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_DRIVERCAPS {
-        return STATUS_NOT_SUPPORTED;
+    match args.Type {
+        _DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_DRIVERCAPS => {
+            if (args.OutputDataSize as usize) < size_of::<DXGK_DRIVERCAPS>() {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+            // SAFETY: pOutputData points to a DXGK_DRIVERCAPS of sufficient size.
+            let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_DRIVERCAPS) };
+            unsafe {
+                core::ptr::write_bytes(caps as *mut _ as *mut u8, 0, size_of::<DXGK_DRIVERCAPS>())
+            };
+            // 64-bit addressable; not a legacy VGA device. No HW cursor advertised
+            // (PointerCaps stays zero) → dxgkrnl composites a software cursor into
+            // the present source, so we need no virtio cursor queue yet.
+            caps.HighestAcceptableAddress.QuadPart = -1;
+            caps.SupportNonVGA = 1;
+            // Match VioGpuDod's rotation contract: DMM may pin Identity or Rotate90,
+            // and PresentDisplayOnly rotates the blit when dxgkrnl sets Flags.Rotate.
+            caps.SupportSmoothRotation = 1;
+            // A DOD reports its WDDM version in DRIVERCAPS. The Microsoft KMDOD sample
+            // sets DXGKDDI_WDDMv1_2 here (even though it compiles at the native interface
+            // version), so mirror that exactly.
+            caps.WDDMVersion = _DXGK_WDDMVERSION::DXGKDDI_WDDMv1_2;
+            STATUS_SUCCESS
+        }
+        // EXPERIMENT (un-bundling): the OS queries this at start time on WDDM 2.0+
+        // (build 26100); KMDOD answers it with VirtualModeSupport=1 (bdd.cxx).
+        // Setting it made dxgkrnl drive a SOURCE-PIVOT cofunc enum whose target
+        // AddMode our fixed timing failed (0xC01E030A) → no cofunctional VidPN → no
+        // present. Reverted to NOT_SUPPORTED to confirm that correlation while
+        // keeping the HeliosQai breadcrumb (proves the query still arrives). The
+        // Code-43 fix is the DDI-table trim (lib.rs), not this cap.
+        _DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_DISPLAY_DRIVERCAPS_EXTENSION => {
+            crate::diag::record_qai(0x0300_0010); // sticky: extension query arrived
+            STATUS_NOT_SUPPORTED
+        }
+        _ => STATUS_NOT_SUPPORTED,
     }
-    if (args.OutputDataSize as usize) < size_of::<DXGK_DRIVERCAPS>() {
-        return STATUS_BUFFER_TOO_SMALL;
-    }
-    // SAFETY: pOutputData points to a DXGK_DRIVERCAPS of sufficient size.
-    let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_DRIVERCAPS) };
-    unsafe { core::ptr::write_bytes(caps as *mut _ as *mut u8, 0, size_of::<DXGK_DRIVERCAPS>()) };
-    // 64-bit addressable; not a legacy VGA device; allow smooth rotation. No HW
-    // cursor advertised (PointerCaps stays zero) → dxgkrnl composites a software
-    // cursor into the present source, so we need no virtio cursor queue yet.
-    caps.HighestAcceptableAddress.QuadPart = -1;
-    caps.SupportNonVGA = 1;
-    caps.SupportSmoothRotation = 1;
-    // A DOD reports its WDDM version in DRIVERCAPS. The Microsoft KMDOD sample
-    // sets DXGKDDI_WDDMv1_2 here (even though it compiles at the native interface
-    // version), so mirror that exactly.
-    caps.WDDMVersion = _DXGK_WDDMVERSION::DXGKDDI_WDDMv1_2;
-    STATUS_SUCCESS
 }
 
 /// `DxgkDdiQueryChildRelations` — report the single monitor child (video output
@@ -235,6 +271,10 @@ pub unsafe extern "C" fn query_child_relations(
     let desc = unsafe { &mut *child_relations };
     desc.ChildDeviceType = _DXGK_CHILD_DEVICE_TYPE::TypeVideoOutput;
     desc.ChildCapabilities.HpdAwareness = _DXGK_CHILD_DEVICE_HPD_AWARENESS::HpdAwarenessInterruptible;
+    // VOT_HD15. NOTE: VOT_INTERNAL was tried (KMDOD uses VOT_INTERNAL/VOT_OTHER) and
+    // REGRESSES bring-up — dxgkrnl then never even enumerates the VidPN for the
+    // internal panel (it expects EDID/descriptor data we don't supply), so no commit/
+    // present happens at all. HD15 is what lets the VidPN flow run.
     desc.ChildCapabilities
         .Type
         .VideoOutput
@@ -252,7 +292,7 @@ pub unsafe extern "C" fn query_child_relations(
 /// `DxgkDdiQueryChildStatus` — the monitor is always connected while we are
 /// started.
 pub unsafe extern "C" fn query_child_status(
-    _miniport_device_context: *mut c_void,
+    miniport_device_context: *mut c_void,
     child_status: *mut DXGK_CHILD_STATUS,
     _non_destructive_only: BOOLEAN,
 ) -> NTSTATUS {
@@ -264,8 +304,12 @@ pub unsafe extern "C" fn query_child_status(
     crate::diag::record(0x0500_0000 | (status.Type as u32 & 0xFFFF));
     match status.Type {
         _DXGK_CHILD_STATUS_TYPE::StatusConnection => {
-            // The HotPlug arm of the union is valid for StatusConnection. (A union
-            // field *write* needs no `unsafe`; only reads do.)
+            // Always connected (virtual monitor). NOTE: coupling this to the virtio
+            // transport being bound REGRESSES bring-up — dxgkrnl queries child status
+            // before StartDevice binds virtio, so reporting Connected=0 there makes it
+            // mark the monitor permanently disconnected and never enumerate the VidPN.
+            // The HotPlug arm of the union is valid for StatusConnection.
+            let _ = miniport_device_context;
             status.__bindgen_anon_1.HotPlug.Connected = 1;
             STATUS_SUCCESS
         }
@@ -305,13 +349,35 @@ pub unsafe extern "C" fn dispatch_io_request(
     STATUS_NOT_SUPPORTED
 }
 
-/// `DxgkDdiInterruptRoutine` — the transport polls (device notifications
-/// suppressed), so never claim the interrupt.
+/// `DxgkDdiInterruptRoutine` — the control path polls the used ring, but the device
+/// still asserts INTx for events we don't suppress (notably config-change/display
+/// events, which `set_dev_notify(false)` does NOT mask). The ONLY way to de-assert a
+/// virtio INTx line is to read its ISR status register; if we never do, an asserted
+/// interrupt re-fires forever → interrupt storm that hard-hangs the guest. So read it
+/// here (the read both acks and de-asserts) and claim the interrupt when it was ours.
 pub unsafe extern "C" fn interrupt_routine(
-    _miniport_device_context: *mut c_void,
+    miniport_device_context: *mut c_void,
     _message_number: u32,
 ) -> BOOLEAN {
-    0
+    let Some(adapter) = (unsafe { adapter(miniport_device_context) }) else {
+        return 0;
+    };
+    let va = adapter.isr_status_va.load(Ordering::Acquire);
+    if va == 0 {
+        return 0; // no mapped ISR register (or transport down) — not ours
+    }
+    // SAFETY: `va` is the device's mapped 1-byte VIRTIO_PCI_ISR status register, valid
+    // for the driver's lifetime (WdkHal cache, released only at DxgkDdiUnload). A single
+    // volatile read ACKs + de-asserts the virtio interrupt (virtio 1.x §4.1.4.5);
+    // it is a plain MMIO read, valid at DIRQL.
+    let isr = unsafe { core::ptr::read_volatile(va as *const u8) };
+    // Bit 0 = used-ring, bit 1 = config-change. Non-zero ⇒ the interrupt was ours and
+    // is now acked → claim it; zero ⇒ a shared-line interrupt for another device.
+    if isr & 0x3 != 0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// `DxgkDdiDpcRoutine` — nothing to drain while polling.
@@ -333,11 +399,14 @@ pub unsafe extern "C" fn query_interface(
 /// `DxgkDdiIsSupportedVidPn` — a VidPN is rejected by setting the out bool FALSE,
 /// never by returning a failure status. We accept all (single source/target).
 pub unsafe extern "C" fn is_supported_vidpn(
-    _h_adapter: *mut c_void,
+    h_adapter: *mut c_void,
     p_is_supported_vidpn: *mut DXGKARG_ISSUPPORTEDVIDPN,
 ) -> NTSTATUS {
     crate::diag::record(0x0700_0000);
-    unsafe { crate::vidpn::is_supported_vidpn(p_is_supported_vidpn) }
+    let Some(adapter) = (unsafe { adapter(h_adapter) }) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    unsafe { crate::vidpn::is_supported_vidpn(adapter, p_is_supported_vidpn) }
 }
 
 /// `DxgkDdiRecommendFunctionalVidPn` — we recommend none (dxgkrnl builds one).
@@ -365,10 +434,26 @@ pub unsafe extern "C" fn enum_vidpn_cofunc_modality(
 /// `DxgkDdiSetVidPnSourceVisibility` — track visibility; blackout handled at the
 /// scanout when hidden (7.1b).
 pub unsafe extern "C" fn set_vidpn_source_visibility(
-    _h_adapter: *mut c_void,
-    _p_set_vidpn_source_visibility: *const _DXGKARG_SETVIDPNSOURCEVISIBILITY,
+    h_adapter: *mut c_void,
+    p_set_vidpn_source_visibility: *const _DXGKARG_SETVIDPNSOURCEVISIBILITY,
 ) -> NTSTATUS {
-    crate::diag::record(0x0C00_0000);
+    // Record the Visible flag (sticky `HeliosVis`): a healthy post-commit bring-up
+    // calls this with Visible=TRUE just before PresentDisplayOnly; a Visible=FALSE
+    // here means dxgkrnl is blanking/tearing the source down (the reject already
+    // happened upstream). Low bit = Visible.
+    let (source_id, visible) = if p_set_vidpn_source_visibility.is_null() {
+        (0xFF, 0)
+    } else {
+        // SAFETY: non-null per the check; Visible is a plain BOOLEAN field.
+        let arg = unsafe { &*p_set_vidpn_source_visibility };
+        (arg.VidPnSourceId & 0xFF, (arg.Visible as u32) & 1)
+    };
+    let vis_code = 0x0C00_0000 | (source_id << 8) | visible;
+    crate::diag::record(vis_code);
+    crate::diag::record_vis(vis_code);
+    if let Some(adapter) = unsafe { adapter(h_adapter) } {
+        adapter.set_source_visible(visible != 0);
+    }
     STATUS_SUCCESS
 }
 
@@ -380,6 +465,7 @@ pub unsafe extern "C" fn commit_vidpn(
     p_commit_vidpn: *const _DXGKARG_COMMITVIDPN,
 ) -> NTSTATUS {
     crate::diag::record(0x0900_0000);
+    crate::diag::record_commit(0x0900_0000); // sticky: CommitVidPn fired
     let Some(adapter) = (unsafe { adapter(h_adapter) }) else {
         return STATUS_INVALID_PARAMETER;
     };
@@ -388,10 +474,23 @@ pub unsafe extern "C" fn commit_vidpn(
 
 /// `DxgkDdiUpdateActiveVidPnPresentPath`.
 pub unsafe extern "C" fn update_active_vidpn_present_path(
-    _h_adapter: *mut c_void,
-    _p_update_active_vidpn_present_path: *const _DXGKARG_UPDATEACTIVEVIDPNPRESENTPATH,
+    h_adapter: *mut c_void,
+    p_update_active_vidpn_present_path: *const _DXGKARG_UPDATEACTIVEVIDPNPRESENTPATH,
 ) -> NTSTATUS {
     crate::diag::record(0x0E00_0000);
+    if p_update_active_vidpn_present_path.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let arg = unsafe { &*p_update_active_vidpn_present_path };
+    let reason = crate::vidpn::active_present_path_reason(&arg.VidPnPresentPathInfo);
+    if reason != 0 {
+        crate::diag::record(0x0E00_0000 | reason);
+        return 0xC01E_0306u32 as NTSTATUS; // STATUS_GRAPHICS_VIDPN_MODALITY_NOT_SUPPORTED
+    }
+    if let Some(adapter) = unsafe { adapter(h_adapter) } {
+        adapter.mark_fullscreen_present();
+        adapter.set_rotation(arg.VidPnPresentPathInfo.ContentTransformation.Rotation);
+    }
     STATUS_SUCCESS
 }
 
@@ -409,9 +508,16 @@ pub unsafe extern "C" fn recommend_monitor_modes(
 /// (everything driver-handled by dxgkrnl) is correct for a DOD.
 pub unsafe extern "C" fn query_vidpn_hw_capability(
     _h_adapter: *mut c_void,
-    _io_p_vidpn_hw_caps: *mut _DXGKARG_QUERYVIDPNHWCAPABILITY,
+    io_p_vidpn_hw_caps: *mut _DXGKARG_QUERYVIDPNHWCAPABILITY,
 ) -> NTSTATUS {
     crate::diag::record(0x0B00_0000);
+    if !io_p_vidpn_hw_caps.is_null() {
+        // Match VioGpuDod: the DOD blit path handles the active rotation.
+        // SAFETY: dxgkrnl provides a valid in/out struct.
+        let caps = unsafe { &mut (*io_p_vidpn_hw_caps).VidPnHWCaps };
+        caps.set_DriverRotation(1);
+        caps.set_DriverColorConvert(1);
+    }
     STATUS_SUCCESS
 }
 
@@ -428,21 +534,41 @@ pub unsafe extern "C" fn present_display_only(
     if p_present_display_only.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-    crate::diag::record(0x0D00_0000);
     // SAFETY: valid per the DDI contract; read-only.
     let arg = unsafe { &*p_present_display_only };
+    let pitch = arg.Pitch;
+    let rotate_present = arg.Flags.__bindgen_anon_1.__bindgen_anon_1.Rotate() != 0;
+    let present_flags = ((arg.BytesPerPixel as u32) & 0xFF) << 8
+        | if pitch < 0 {
+            0x2
+        } else if pitch == 0 {
+            0x1
+        } else {
+            0
+        }
+        | ((rotate_present as u32) << 16);
+    crate::diag::record(0x0D00_0000 | present_flags);
+    crate::diag::record_present(0x0D00_0000 | present_flags); // sticky: PresentDisplayOnly fired
     if arg.BytesPerPixel < 4 || arg.pSource.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
     let Some(adapter) = (unsafe { adapter(h_adapter) }) else {
         return STATUS_INVALID_PARAMETER;
     };
-    // Top-down source only (Pitch > 0) for first light.
-    let pitch = arg.Pitch;
-    if pitch <= 0 {
+    if adapter.source_not_visible() {
         return STATUS_SUCCESS;
     }
-    let src_pitch = pitch as usize;
+    if !adapter.framebuffer_active() {
+        return STATUS_UNSUCCESSFUL;
+    }
+    if pitch == 0 {
+        return STATUS_SUCCESS;
+    }
+    let rotation = if rotate_present {
+        adapter.rotation()
+    } else {
+        _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::D3DKMDT_VPPR_IDENTITY
+    };
     // The committed scanout geometry (CommitVidPn → set_desktop_mode); (0,0) if
     // no mode is committed yet → drop the frame. `desktop_dims` height bounds the
     // source read: CommitVidPn pinned the source mode to this height, so the
@@ -452,18 +578,33 @@ pub unsafe extern "C" fn present_display_only(
     if h == 0 {
         return STATUS_SUCCESS;
     }
-    let src_len = src_pitch.saturating_mul(h as usize);
-    // SAFETY: dxgkrnl guarantees `pSource` is a locked non-paged surface of at
-    // least `Pitch * Height` bytes for this call; `present_desktop` clamps each
-    // row copy to `src.len()`.
-    let src = unsafe { core::slice::from_raw_parts(arg.pSource as *const u8, src_len) };
 
     let mut retired: Vec<crate::virtio::gpu::InFlight> = Vec::new();
-    let r = adapter.with_virtio(|v| v.present_desktop(src, src_pitch, &mut retired));
+    // Capture diag_last_cmd/is_wedged in the same lock acquisition so a failed
+    // present can be attributed to the exact stalling command at PASSIVE below.
+    let r = adapter.with_virtio(|v| {
+        let res = unsafe {
+            v.present_desktop(
+                arg.pSource as *const u8,
+                pitch as isize,
+                rotation,
+                &mut retired,
+            )
+        };
+        (res, v.diag_last_cmd(), v.is_wedged())
+    });
     drop(retired);
     match r {
-        Ok(Ok(())) => STATUS_SUCCESS,
-        Ok(Err(_)) | Err(_) => STATUS_SUCCESS, // soft-fail a present; never bugcheck
+        Ok((Ok(sample), _, _)) => {
+            crate::diag::record_surf(sample);
+            STATUS_SUCCESS
+        }
+        Ok((Err(_), last_cmd, wedged)) => {
+            // Breadcrumb: phase 0x02 (present_desktop), which command, wedged vs error.
+            crate::diag::record_cmd(0x0200_0000 | ((wedged as u32) << 20) | (last_cmd & 0xFFFF));
+            STATUS_SUCCESS // soft-fail a present; never bugcheck
+        }
+        Err(_) => STATUS_SUCCESS, // virtio not bound; soft-fail
     }
 }
 
@@ -479,12 +620,14 @@ pub unsafe extern "C" fn set_pointer_position(
     STATUS_SUCCESS
 }
 
-/// `DxgkDdiSetPointerShape`.
+/// `DxgkDdiSetPointerShape` — accept-and-ignore (we advertise no HW pointer caps, so
+/// dxgkrnl composites the cursor in software; NOT_IMPLEMENTED here can read as a
+/// failed present-pipeline DDI, so return SUCCESS like SetPointerPosition).
 pub unsafe extern "C" fn set_pointer_shape(
     _h_adapter: *mut c_void,
     _p_set_pointer_shape: *const _DXGKARG_SETPOINTERSHAPE,
 ) -> NTSTATUS {
-    STATUS_NOT_IMPLEMENTED
+    STATUS_SUCCESS
 }
 
 // ── System display (bugcheck screen) — not supported (virtio is not VGA) ─────
@@ -524,7 +667,9 @@ pub unsafe extern "C" fn system_display_write(
 /// `DxgkDdiResetDevice` — reset to a known state (e.g. pre-bugcheck). No-op.
 pub unsafe extern "C" fn reset_device(_miniport_device_context: *mut c_void) {}
 
-/// `DxgkDdiNotifyAcpiEvent` — we service no ACPI events.
+/// `DxgkDdiNotifyAcpiEvent` — we service no ACPI events. Accept-and-ignore: a
+/// REGISTERED DDI must not return NOT_IMPLEMENTED (dxgkrnl treats that as a contract
+/// violation, which can tear the adapter down post-start / Code 43).
 pub unsafe extern "C" fn notify_acpi_event(
     _miniport_device_context: *mut c_void,
     _event_type: DXGK_EVENT_TYPE,
@@ -532,7 +677,7 @@ pub unsafe extern "C" fn notify_acpi_event(
     _argument: *mut c_void,
     _acpi_flags: *mut u32,
 ) -> NTSTATUS {
-    STATUS_NOT_IMPLEMENTED
+    STATUS_SUCCESS
 }
 
 /// `DxgkDdiControlEtwLogging` — we emit no ETW; no-op.
@@ -554,30 +699,41 @@ pub unsafe extern "C" fn collect_dbg_info(
     STATUS_NOT_SUPPORTED
 }
 
-/// `DxgkDdiGetScanLine` — no scanline reporting.
+/// `DxgkDdiGetScanLine` — no real scanline counter. Report "in vertical blank" so
+/// dxgkrnl's present scheduler treats any time as safe to present. Accept-and-ignore
+/// (registered DDI must not return NOT_IMPLEMENTED — see `notify_acpi_event`).
 pub unsafe extern "C" fn get_scan_line(
     _h_adapter: *mut c_void,
-    _p_get_scan_line: *mut DXGKARG_GETSCANLINE,
+    p_get_scan_line: *mut DXGKARG_GETSCANLINE,
 ) -> NTSTATUS {
-    STATUS_NOT_IMPLEMENTED
+    if !p_get_scan_line.is_null() {
+        // SAFETY: dxgkrnl provides a valid out struct.
+        let arg = unsafe { &mut *p_get_scan_line };
+        arg.InVerticalBlank = 1;
+        arg.ScanLine = 0;
+    }
+    STATUS_SUCCESS
 }
 
-/// `DxgkDdiControlInterrupt` — the transport polls; service no interrupt classes.
+/// `DxgkDdiControlInterrupt` — the transport polls; we service no interrupt classes,
+/// but accept the enable/disable request (registered DDI must not return
+/// NOT_IMPLEMENTED — see `notify_acpi_event`).
 pub unsafe extern "C" fn control_interrupt(
     _h_adapter: *mut c_void,
     _interrupt_type: DXGK_INTERRUPT_TYPE,
     _enable_interrupt: BOOLEAN,
 ) -> NTSTATUS {
-    STATUS_NOT_IMPLEMENTED
+    STATUS_SUCCESS
 }
 
-/// `DxgkDdiGetChildContainerId` — no container id.
+/// `DxgkDdiGetChildContainerId` — no container id; accept-and-ignore (registered DDI
+/// must not return NOT_IMPLEMENTED — see `notify_acpi_event`).
 pub unsafe extern "C" fn get_child_container_id(
     _miniport_device_context: *mut c_void,
     _child_uid: u32,
     _container_id: *mut DXGK_CHILD_CONTAINER_ID,
 ) -> NTSTATUS {
-    STATUS_NOT_IMPLEMENTED
+    STATUS_SUCCESS
 }
 
 /// `DxgkDdiNotifySurpriseRemoval` — accept.
@@ -602,7 +758,22 @@ pub unsafe extern "C" fn escape(
 /// contiguous framebuffer at PASSIVE_LEVEL (outside the virtio spinlock), installs
 /// it under the lock via [`VirtioGpu::set_desktop_mode`], and drops the old
 /// framebuffer (if any) back at PASSIVE. Returns the command result.
-pub(crate) fn set_desktop_mode(adapter: &AdapterContext, width: u32, height: u32) -> Result<(), crate::error::DriverError> {
+pub(crate) fn set_desktop_mode(adapter: &AdapterContext, width: u32, height: u32, force: bool) -> Result<(), crate::error::DriverError> {
+    // Idempotent fast-path (only when NOT forced): skip the teardown+recreate churn
+    // when the scanout is already programmed to this geometry. StartDevice uses this
+    // (force=false). CommitVidPn uses force=TRUE: it MUST re-realize the scanout for
+    // the committed VidPN on every commit — KMDOD/VioGpuDod program the scanout on
+    // every CommitVidPn (SetSourceModeAndPath / CreateFrameBufferObj), and dxgkrnl
+    // validates that "realize" after the first probe present; an idempotent no-op
+    // commit makes dxgkrnl conclude the source was never brought online → it
+    // StopDevices + Code 43 after one present, with no restart.
+    if !force {
+        if let Ok((true, (cw, ch))) = adapter.with_virtio(|v| (v.desktop_programmed(), v.desktop_dims())) {
+            if cw == width && ch == height {
+                return Ok(());
+            }
+        }
+    }
     let bytes = (width as usize)
         .saturating_mul(height as usize)
         .saturating_mul(BYTES_PER_PIXEL as usize);
@@ -613,10 +784,17 @@ pub(crate) fn set_desktop_mode(adapter: &AdapterContext, width: u32, height: u32
     let mut retired: Vec<crate::virtio::gpu::InFlight> = Vec::new();
     // SAFETY/IRQL: with_virtio runs the closure at DISPATCH; the closure performs
     // no allocation/free (the fb came in pre-allocated, the old fb comes back out
-    // to be dropped here at PASSIVE).
-    let (old_fb, result) =
-        adapter.with_virtio(|v| v.set_desktop_mode(fb, width, height, &mut retired))?;
+    // to be dropped here at PASSIVE). diag_last_cmd/is_wedged are read inside the
+    // same lock acquisition and recorded to the registry below at PASSIVE.
+    let (old_fb, result, last_cmd, wedged) = adapter.with_virtio(|v| {
+        let (old, result) = v.set_desktop_mode(fb, width, height, &mut retired);
+        (old, result, v.diag_last_cmd(), v.is_wedged())
+    })?;
     drop(old_fb); // PASSIVE_LEVEL — frees the prior contiguous framebuffer
     drop(retired);
+    if result.is_err() {
+        // Breadcrumb: phase 0x01 (set_desktop_mode), which command, wedged vs error.
+        crate::diag::record_cmd(0x0100_0000 | ((wedged as u32) << 20) | (last_cmd & 0xFFFF));
+    }
     result.map_err(|_| crate::error::DriverError::IoError)
 }

@@ -1,5 +1,9 @@
 # TOOLCHAIN.md — Build Environment Setup
 
+> **DIRECTION RESET (2026-06-07):** active KMD work is System-class KMDF + DeviceIoControl + Mesa Venus.
+> DOD/dxgk build artifacts may remain as archived reference, but the active build should follow `ARCH.md` and
+> `SYSTEM_CLASS_REFOCUS_2026_06_07.md`.
+
 ## Overview
 
 You need two environments:
@@ -155,7 +159,7 @@ A Windows 11 dev VM named `win11` is reachable via `ssh win` (preconfigured). It
 
 - **VS 2022 Build Tools** — "Desktop development with C++" (MSVC v143 + Spectre-mitigated x64 libs).
 - **WDK** — kit **10.0.26100.0**. Must be a *complete* kit (SDK **and** WDK at the same version): `wdk-build` picks the **highest** installed kit with **no override**, so an incomplete higher kit (e.g. a winget WDK with no matching SDK → missing `specstrings.h`) breaks the build. Keep only complete kits.
-- **LLVM 17.0.6** at `C:\Program Files\LLVM\bin`; set `LIBCLANG_PATH` to it for bindgen (LLVM 18 has a bindgen bug). bindgen/LLVM is needed only for any virtio-gpu PCI/MMIO (and WDF) header bindings — NOT for the old display DDIs, which no longer exist under KMDF.
+- **LLVM 17.0.6** at `C:\Program Files\LLVM\bin`; set `LIBCLANG_PATH` to it for bindgen (LLVM 18 has a bindgen bug). bindgen/LLVM is needed only for active WDF/PCI support or archived dxgk reference builds; the System-class KMDF build should not depend on display DDIs.
 - **Rust nightly + `rust-src`** (for `no_std` build-std), target `x86_64-pc-windows-msvc`.
 - **cargo-make** — `cargo install --locked cargo-make`.
 - **coreutils** are installed (Unix tools like `ls`/`cp`/`grep` work in `win_exec`).

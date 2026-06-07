@@ -4,9 +4,11 @@
 
 You are the **primary author** of this project. The human overseer has OS/driver/Rust expertise and will review your work, but you must drive all implementation decisions, write all code, and flag blockers proactively.
 
-**Implementation reality (learned — authoritative over older prose in these docs):** The KMD is a **System-class KMDF function driver** for the virtio-gpu PCI device (PCI\VEN_1AF4&DEV_1050), Setup class **System {4d36e97d-e325-11ce-bfc1-08002be10318}** — NOT a display/WDDM miniport. User mode reaches the KMD via **`DeviceIoControl` on a device interface** (`GUID_DEVINTERFACE_HELIOS`, discovered with SetupDiGetClassDevs + CreateFile). `kmd/build.rs` uses only `wdk-sys`/WDF — collapse it to `Config::from_env_auto()?.configure_binary_build()?`; the `dispmprt.h`/`d3dkmddi.h` custom bindgen (the `crate::dxgk` module) and the `displib.lib`/`DxgkInitialize` link are **deleted**. Windows builds **cannot run on the `Z:\` share** (Rust IO fails with OS error 87 — windows-drivers-rs#481); build through the **`win` MCP server's `win_cargo`**, which mirrors `Z:\` → `C:\Users\Rupansh\helios-vgpu` and builds locally. See ARCH.md (canonical) and the errata banners in KMD.md / TOOLCHAIN.md. **(Phase 7 / `DISPLAY.md` reverses part of this:** the driver becomes a **WDDM Display-Only Driver**, so a **DOD-scoped** `dispmprt.h` bindgen + `DxgkInitializeDisplayOnlyDriver` come BACK and `build.rs` re-adds that bindgen — recover the shapes from git `658168f`; but the **render** `d3dkmddi.h`/`displib.lib`/`DxgkInitialize`/AddAdapter pieces stay deleted.)**
+**Implementation reality (authoritative):** The KMD is a **System-class KMDF function driver** for the virtio-gpu PCI device (PCI\VEN_1AF4&DEV_1050), Setup class **System {4d36e97d-e325-11ce-bfc1-08002be10318}** — NOT a display/WDDM miniport. User mode reaches the KMD via **`DeviceIoControl` on a device interface** (`GUID_DEVINTERFACE_HELIOS`, discovered with SetupDiGetClassDevs + CreateFile). `kmd/build.rs` should use the KMDF/WDF path. The DOD-scoped `dispmprt.h`/`d3dkmddi.h` bindgen and `kmd/src/dxgk.rs` may remain in the repository as archived reference material, but they are not part of the active System-class build.
 
-**Status (2026-06-06):** The venus stack RENDERS end-to-end (System-class KMDF + DeviceIoControl + Mesa venus ICD; `vulkaninfo`/`vkcube`/`vkCmdFillBuffer` round-trip on the Intel ARL iGPU). **NOW PIVOTING THE DISPLAY PATH (Phase 7):** Helios becomes a **WDDM Display-Only Driver (DOD)** that owns the virtio-gpu scanout and displays venus content **directly + zero-copy** via **`SET_SCANOUT_BLOB`** under **`-spice gl=on`** — replacing the abandoned software-WSI present (it was <1 fps and architecturally cannot use the host GL display). The driver model flips System-class KMDF → DOD; the venus carrier flips IOCTL → **`DxgkDdiEscape`** (the six op byte layouts unchanged); the venus transport/ICD core is reused. The WDDM **render** miniport stays rejected (needs a multi-man-year native D3D-to-venus UMD). **Canonical for display: `DISPLAY.md` (read FIRST), then `PHASE7_DISPLAY_HANDOVER.md`; the `display-pivot` memory is the authoritative start point.** `ARCH.md` stays canonical for the reused venus/transport/blob layers. Host venus stack unchanged (libvirt `seccomp_sandbox=0`; `virtio-gpu-gl,venus=on,blob=on,hostmem=4G`; Intel iGPU / Mesa ANV; `honor-guest-pat=on`) EXCEPT the display backend moves **egl-headless → spice gl=on**.
+Windows builds **cannot run on the `Z:\` share** (Rust IO fails with OS error 87 — windows-drivers-rs#481); build through the **`win` MCP server's `win_cargo`**, which mirrors `Z:\` → `C:\Users\Rupansh\helios-vgpu` and builds locally. See `ARCH.md` (canonical) and `SYSTEM_CLASS_REFOCUS_2026_06_07.md`.
+
+**Status (updated 2026-06-07):** The Venus stack renders end-to-end on the System-class KMDF + DeviceIoControl + Mesa Venus ICD path (`vulkaninfo`, device creation, mapped Venus memory, `vkCmdFillBuffer` readback). The WDDM Display-Only Driver pivot is **archived** because it does not directly solve the Venus performance goal and consumed effort in VidPN/Code 43 bring-up. Active work is to restore the old working VM/device setup, benchmark offscreen Venus, and improve submit/fence/blob performance before revisiting presentation.
 
 ---
 
@@ -156,27 +158,18 @@ Goal: D3D11/D3D12 apps render via DXVK → Helios ICD → Venus → host GPU.
 
 **Test:** d3d11-triangle or dxvk-tests pass.
 
-### Phase 7: Display Engine — DOD + Venus + zero-copy present (canonical: `DISPLAY.md`)
-Goal: the venus-accelerated device displays the Windows VM's output **directly** — a real desktop on SPICE +
-fullscreen venus content **zero-copy** via `SET_SCANOUT_BLOB` under `-spice gl=on`. **Driver model flips
-System-class KMDF → WDDM Display-Only Driver; venus carrier flips IOCTL → `DxgkDdiEscape`.** (Replaces the
-abandoned Phase-6 software-WSI present.)
+### Phase 7: Presentation / Display Integration — archived, not active
 
-- [x] **7.0 Go/no-go gate:** GO — venus blob exports a real `DRM_FORMAT_MODIFIER(LINEAR)` dma-buf, host accepts
-      `SET_SCANOUT_BLOB` (`dmabuf_fd>=0`). (On-screen pixels deferred to 7.1's gate; host display-backend bugs.)
-- [~] **7.1 DOD skeleton:** **7.1a DONE** — loads as a Display adapter, Code 0 (commit `b3eb40f`); the
-      canonical reference is the **Microsoft KMDOD sample** (`Windows-driver-samples/video/KMDOD`).
-      **7.1b IN PROGRESS** — real VidPN + present ported from KMDOD (`ca8af7f`); the monitor enumerates but
-      `CommitVidPn`/`Present` don't fire (an `EnumVidPnCofuncModality` bug). See `PHASE7_DISPLAY_HANDOVER.md` §0
-      + the `dod-7-1a-loads` memory. (Viewer: run `tools/launch-helios-gtk.sh` as your user; `gtk,gl=on`
-      eglMakeCurrent in the standalone is UNRESOLVED — default `HELIOS_DISPLAY=gtk` software, or spice.)
-- [ ] **7.2 Venus over `DxgkDdiEscape`:** port the escape dispatch (body = today's `ioctl.rs`); switch the Mesa
-      `vn_renderer_helios` transport to `D3DKMTOpenAdapterFromLuid` + `D3DKMTEscape`.
-- [ ] **7.3 Fullscreen present:** `HELIOS_PRESENT_BLOB` escape op + scanout-0 arbiter (desktop ⇄ venus blob),
-      double-buffered. **Gate: fullscreen vkcube on spice, fast AND visually correct, zero-copy.**
-- [ ] **7.4 Harden + DXVK/VKD3D:** CTX_DESTROY/blob-free on escape-close; fullscreen DXVK/VKD3D titles.
+The DOD + `SET_SCANOUT_BLOB` pivot is archived in `DISPLAY.md`, `PHASE7_DISPLAY_HANDOVER.md`, and
+`CODE43_HANDOFF_FOR_CODEX.md`. Do not continue DOD VidPN/Code 43 work unless the owner explicitly asks for a
+display-driver experiment.
 
-**Test:** fullscreen vkcube renders on the spice display, fast and visually correct, via `SET_SCANOUT_BLOB`.
+Active replacement:
+
+- Restore System-class KMDF + IOCTL setup.
+- Benchmark offscreen Venus rendering and submit/fence latency.
+- Fix the renderer path before display integration.
+- Revisit presentation only after renderer performance is acceptable.
 
 ---
 
@@ -204,7 +197,8 @@ abandoned Phase-6 software-WSI present.)
 
 ## Files Not to Touch
 
-- `*.inx` files after initial creation — only modify with explicit instruction. **Exception (Phase 7 / `DISPLAY.md` §3.1):** `helios_kmd.inx` is rewritten for the DOD pivot — Class **Display** {4d36e968-…} + a Display-Only service install (reversing the System-class {4d36e97d-…}/`[.Wdf]` form the pivot put in per ARCH.md §9). Reference VioGpuDod's INF + git `658168f:kmd/helios_kmd.inx` for the display-class shape.
+- `*.inx` files after initial creation — only modify with explicit instruction. The active INF shape is
+  System-class KMDF. The Display-class DOD INF shape is historical reference only.
 
 ---
 

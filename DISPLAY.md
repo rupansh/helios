@@ -1,12 +1,12 @@
-# DISPLAY.md — Helios Display Engine (Phase 7): WDDM Display-Only Driver + Venus + zero-copy `SET_SCANOUT_BLOB`
+# DISPLAY.md — Archived Display Pivot Notes
 
-**Status: CANONICAL for the display subsystem (decided 2026-06-06, owner-directed, research+adversarially-verified).**
-This supersedes ARCH.md §8 ("Presentation: headless-first / GDI readback"), the whole Mesa-`wsi_win32`
-software-present plan (`wsi-present-plan` / `wsi-bringup-status` / `icd/PHASE6_WSI_HANDOVER.md`), and the
-"System-class KMDF, no display adapter" framing of ARCH.md §1 / OVERVIEW. The **virtio-gpu transport
-(ARCH.md §4), host-visible blob mapping (§6), and the Mesa venus ICD (§5)** are **reused**; what changes is
-the **driver model** (System-class KMDF → WDDM Display-Only miniport) and the **present path** (software GDI
-blit → `SET_SCANOUT_BLOB` displayed by the host GL backend). **Read this first for anything display-related.**
+> **ARCHIVED (2026-06-07):** this file is no longer canonical. The active project direction is
+> **System-class KMDF + DeviceIoControl + Mesa Venus**. Read
+> [`SYSTEM_CLASS_REFOCUS_2026_06_07.md`](SYSTEM_CLASS_REFOCUS_2026_06_07.md) and [`ARCH.md`](ARCH.md) first.
+> Keep this file only as historical reference for the DOD/`SET_SCANOUT_BLOB` display experiment and its
+> assumptions.
+
+Original title: Helios Display Engine (Phase 7): WDDM Display-Only Driver + Venus + zero-copy `SET_SCANOUT_BLOB`.
 
 ---
 

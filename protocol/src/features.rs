@@ -24,17 +24,26 @@ pub const VIRTIO_GPU_F_RESOURCE_BLOB: u64 = 1 << 3;
 /// Context init — lets us request the Venus capset on CTX_CREATE. REQUIRED.
 pub const VIRTIO_GPU_F_CONTEXT_INIT: u64 = 1 << 4;
 
-/// The set of features Helios requires from the device. Negotiation MUST
-/// confirm all of these survive the FEATURES_OK handshake; if the device drops
-/// any of them, init fails (we cannot run Venus without them).
-pub const HELIOS_REQUIRED_FEATURES: u64 = VIRTIO_F_VERSION_1
-    | VIRTIO_GPU_F_VIRGL
-    | VIRTIO_GPU_F_RESOURCE_BLOB
-    | VIRTIO_GPU_F_CONTEXT_INIT;
+/// The set of features Helios requires from the device. Only `VIRTIO_F_VERSION_1`
+/// (modern virtio) is truly mandatory for the driver to bind.
+///
+/// The venus features (VIRGL / RESOURCE_BLOB / CONTEXT_INIT) are NOT required here:
+/// requiring them made `init` fail FEATURES_OK negotiation on a plain 2D
+/// `virtio-gpu-pci` device (which offers none of them) → device Code 43, even though
+/// the 2D desktop needs none of them. They are OPTIONAL below (negotiated when the
+/// device is a `virtio-gpu-gl-pci` with venus/blob); the IOCTL Venus path re-checks
+/// for them at the point it actually needs them.
+pub const HELIOS_REQUIRED_FEATURES: u64 = VIRTIO_F_VERSION_1;
 
-/// Features we will accept if offered but do not strictly require.
-pub const HELIOS_OPTIONAL_FEATURES: u64 =
-    VIRTIO_F_RING_RESET | VIRTIO_GPU_F_EDID | VIRTIO_GPU_F_RESOURCE_UUID;
+/// Features we will accept if offered but do not strictly require. Includes the
+/// venus stack's features (virgl/blob/context-init) — present on a `-gl` device,
+/// absent on a plain 2D device.
+pub const HELIOS_OPTIONAL_FEATURES: u64 = VIRTIO_GPU_F_VIRGL
+    | VIRTIO_GPU_F_RESOURCE_BLOB
+    | VIRTIO_GPU_F_CONTEXT_INIT
+    | VIRTIO_F_RING_RESET
+    | VIRTIO_GPU_F_EDID
+    | VIRTIO_GPU_F_RESOURCE_UUID;
 
 // ── Device status bits (VirtIO spec §2.1) ──────────────────────────────────
 pub const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1;

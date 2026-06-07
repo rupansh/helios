@@ -23,6 +23,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use alloc::vec::Vec;
 
 use bytemuck::Zeroable;
+use crate::dxgk::_D3DKMDT_VIDPN_PRESENT_PATH_ROTATION;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy,
     VirtioGpuCtxResource, VirtioGpuMemEntry, VirtioGpuRect, VirtioGpuResourceAttachBacking,
@@ -38,13 +39,16 @@ use helios_protocol::{
     VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
     VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
     VIRTIO_GPU_MAP_CACHE_MASK,
-    VIRTIO_GPU_SHM_ID_HOST_VISIBLE, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
+    VIRTIO_GPU_SHM_ID_HOST_VISIBLE, VIRTIO_PCI_CAP_ISR_CFG, VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
 };
+use virtio_drivers::Hal;
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::pci::bus::{DeviceFunction, PciRoot};
 use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::{DeviceStatus, Transport};
 use virtio_drivers::Error as VirtError;
+
+use wdk_sys::ntddk::KeStallExecutionProcessor;
 
 use super::config::DxgkConfigAccess;
 use super::hal::{DmaBuffer, WdkHal};
@@ -56,6 +60,24 @@ const CTRL_QUEUE: u16 = 0;
 const CTRL_QUEUE_SIZE: usize = 64;
 /// One page of contiguous DMA scratch, split into request/response halves.
 const SCRATCH_BYTES: usize = 4096;
+
+// ── Bounded synchronous control-queue wait ──────────────────────────────────
+// gpu.rs busy-polls the control used ring for synchronous commands. The host
+// (QEMU) completes commands on its own thread, independent of the guest vCPU, so
+// a command the poll never observes completing means the host *wedged* (e.g. a
+// stalled GL present backend). An unbounded poll then hangs the guest forever —
+// and these synchronous round-trips run under the virtio spinlock at
+// DISPATCH_LEVEL (`AdapterContext::with_virtio`), where an unbounded spin is a
+// hard VM hang that eventually trips the DPC watchdog (bugcheck 0x133).
+//
+// So every poll is bounded: each iteration stalls `CTRL_WAIT_STALL_US` µs
+// (`KeStallExecutionProcessor` is wall-clock-calibrated and callable at any IRQL),
+// up to `CTRL_WAIT_MAX_STALLS` iterations ≈ 500 ms, then the command fails with
+// `DeviceError` and the transport latches [`VirtioGpu::wedged`]. 500 ms is ~15×
+// any healthy command yet well under the single-DPC watchdog budget; once
+// `wedged` latches, later commands fail fast so total stall stays ≈ one timeout.
+const CTRL_WAIT_STALL_US: u32 = 20;
+const CTRL_WAIT_MAX_STALLS: u32 = 25_000;
 
 // ── Host-visible shared-memory window (ARCH §6) ─────────────────────────────
 // PCI config-space byte offsets used by the capability walk.
@@ -165,6 +187,37 @@ fn bar_base(access: &DxgkConfigAccess, bar: u16) -> Option<u64> {
     } else {
         Some(base)
     }
+}
+
+/// Walk the PCI capability list for the virtio `ISR_CFG` capability and return the
+/// guest-physical address of the 1-byte ISR status register (`bar_base + offset`),
+/// or `None` if absent. Reading that register acks + de-asserts the device's INTx
+/// line; the DOD's `DxgkDdiInterruptRoutine` needs its kernel VA (mapped in `init`)
+/// to ack interrupts lock-free at DIRQL. Same cap-walk as [`scan_host_visible_window`],
+/// but the ISR cap is a plain 32-bit `virtio_pci_cap` (offset at +8).
+fn scan_isr_status(access: &DxgkConfigAccess) -> Option<u64> {
+    if (access.read32(PCI_CFG_STATUS) >> 16) & PCI_STATUS_CAP_LIST == 0 {
+        return None;
+    }
+    let mut cap = (access.read32(PCI_CFG_CAP_PTR) & 0xFF) as u16 & 0xFC;
+    for _ in 0..48 {
+        if cap == 0 {
+            break;
+        }
+        let d0 = access.read32(cap);
+        let cap_id = d0 & 0xFF;
+        let cap_next = ((d0 >> 8) & 0xFF) as u16 & 0xFC;
+        let cfg_type = (d0 >> 24) & 0xFF;
+        if cap_id == PCI_CAP_ID_VNDR && cfg_type == VIRTIO_PCI_CAP_ISR_CFG as u32 {
+            // `virtio_pci_cap`: bar at +4 byte0, offset (u32) at +8.
+            let bar = (access.read32(cap + 4) & 0xFF) as u16;
+            let off = access.read32(cap + 8) as u64;
+            let base = bar_base(access, bar)?;
+            return Some(base + off);
+        }
+        cap = cap_next;
+    }
+    None
 }
 
 /// Base for guest-assigned blob resource ids. Started well above the low ids a
@@ -356,6 +409,29 @@ pub struct VirtioGpu {
     /// Current desktop mode width/height (pixels); valid iff `desktop_fb.is_some()`.
     desktop_w: u32,
     desktop_h: u32,
+    /// True iff the last [`Self::set_desktop_mode`] actually programmed the scanout
+    /// (CREATE_2D → ATTACH → SET_SCANOUT all succeeded), as opposed to merely
+    /// installing the framebuffer. Gates the idempotent CommitVidPn fast-path so a
+    /// transient host command-error on the StartDevice install does not suppress the
+    /// retry CommitVidPn would otherwise perform. Distinct from `desktop_fb.is_some()`,
+    /// which is set before the commands run (so the fb is freed on teardown even on
+    /// failure). Cleared by a fresh transport (StopDevice → StartDevice).
+    desktop_programmed: bool,
+    /// Latched once a synchronous control round-trip times out waiting for the
+    /// host to complete it (the control queue wedged — see [`CTRL_WAIT_MAX_STALLS`]).
+    /// Every subsequent command fails fast (`DeviceError`) instead of re-stalling,
+    /// bounding total DISPATCH-level spin to one timeout. Cleared only by a fresh
+    /// transport (StopDevice → StartDevice rebuilds `VirtioGpu`).
+    wedged: bool,
+    /// virtio-gpu `type_` of the most recent synchronous control command, recorded
+    /// before the round-trip so a wedged/failed present can be attributed to the
+    /// exact command at PASSIVE_LEVEL (after the spinlock drops) — see
+    /// [`VirtioGpu::diag_last_cmd`]. Diagnostic only; benign cross-IRQL read.
+    diag_last_cmd: u32,
+    /// Kernel VA of the `VIRTIO_PCI_ISR` status register (0 if the cap is absent),
+    /// mapped in `init`. Copied to `AdapterContext::isr_status_va` so the DOD's ISR
+    /// can ack the virtio interrupt lock-free at DIRQL (see that field).
+    isr_status_va: usize,
 }
 
 /// Fixed virtio-gpu resource id for the 2D desktop scanout. Held well clear of
@@ -379,6 +455,9 @@ impl VirtioGpu {
         };
         let mut transport = PciTransport::new::<WdkHal, _>(&mut root, device_function)
             .map_err(|_| VirtioError::DeviceError)?;
+        // TEMP init-progress breadcrumb (→ HeliosStep, survives a hung re-init since
+        // no DDI runs after to overwrite it). 0x0200_001N = init milestone N.
+        crate::diag::record(0x0200_0011); // M1: PCI transport mapped
 
         // ── M2: feature negotiation (VirtIO 1.2 spec §3.1.1) ────────────────
         transport.set_status(DeviceStatus::empty()); // reset
@@ -386,10 +465,12 @@ impl VirtioGpu {
         while !transport.get_status().is_empty() && spins < 100_000 {
             spins += 1;
         }
+        crate::diag::record(0x0200_0021); // M2a: reset-wait done
         transport.set_status(DeviceStatus::ACKNOWLEDGE);
         transport.set_status(DeviceStatus::ACKNOWLEDGE | DeviceStatus::DRIVER);
 
         let offered = transport.read_device_features();
+        crate::diag::record(0x0200_0022); // M2b: device features read
         let accepted = offered & (HELIOS_REQUIRED_FEATURES | HELIOS_OPTIONAL_FEATURES);
         transport.write_driver_features(accepted);
         transport.set_status(
@@ -398,9 +479,11 @@ impl VirtioGpu {
         if !transport.get_status().contains(DeviceStatus::FEATURES_OK)
             || accepted & HELIOS_REQUIRED_FEATURES != HELIOS_REQUIRED_FEATURES
         {
+            crate::diag::record(0x0200_002F); // M2x: FEATURES_OK rejected
             transport.set_status(DeviceStatus::FAILED);
             return Err(VirtioError::FeatureRejected);
         }
+        crate::diag::record(0x0200_0023); // M2c: features OK, entering VirtQueue::new
 
         // ── M3: control virtqueue (queue 0), then DRIVER_OK ─────────────────
         let mut control = VirtQueue::<WdkHal, CTRL_QUEUE_SIZE>::new(
@@ -426,6 +509,7 @@ impl VirtioGpu {
                 | DeviceStatus::FEATURES_OK
                 | DeviceStatus::DRIVER_OK,
         );
+        crate::diag::record(0x0200_0013); // M3: control virtqueue up, DRIVER_OK
 
         // ── M4: GET_DISPLAY_INFO polled round-trip (smoke test) ─────────────
         // Request + response live in one contiguous page so each buffer is
@@ -442,6 +526,7 @@ impl VirtioGpu {
         req.type_ = VIRTIO_GPU_CMD_GET_DISPLAY_INFO;
         req_buf[..hdr_len].copy_from_slice(bytemuck::bytes_of(&req));
 
+        crate::diag::record(0x0200_0014); // M4a: about to poll GET_DISPLAY_INFO (UNBOUNDED)
         control
             .add_notify_wait_pop(
                 &[&req_buf[..hdr_len]],
@@ -449,6 +534,7 @@ impl VirtioGpu {
                 &mut transport,
             )
             .map_err(|_| VirtioError::DeviceError)?;
+        crate::diag::record(0x0200_0015); // M4b: GET_DISPLAY_INFO completed
 
         let resp: &VirtioGpuRespDisplayInfo = bytemuck::from_bytes(&resp_buf[..resp_len]);
         if !resp_is_ok(resp.hdr.type_) {
@@ -465,6 +551,23 @@ impl VirtioGpu {
             c"Helios: no host-visible window (MAP_BLOB unavailable)\n"
         });
 
+        // ── M6: map the ISR status register so the DOD ISR can ack the virtio
+        // interrupt (read de-asserts INTx). Best-effort: 0 ⇒ the ISR declines every
+        // interrupt as before (only safe if the device never asserts).
+        let isr_status_va = match scan_isr_status(access) {
+            // SAFETY: maps the device's 1-byte ISR status BAR register at PASSIVE
+            // (WdkHal caches it; the VA stays valid until DxgkDdiUnload). A single
+            // volatile read of it at DIRQL acks the interrupt — that is its only use.
+            Some(gpa) => unsafe { WdkHal::mmio_phys_to_virt(gpa, 4) }.as_ptr() as usize,
+            None => 0,
+        };
+        crate::kmsg(if isr_status_va != 0 {
+            c"Helios: ISR status register mapped\n"
+        } else {
+            c"Helios: no ISR cap (interrupts unacked!)\n"
+        });
+        crate::diag::record(0x0200_0016); // M6: scans done, init succeeding
+
         Ok(Self {
             transport,
             control,
@@ -479,6 +582,10 @@ impl VirtioGpu {
             desktop_fb: None,
             desktop_w: 0,
             desktop_h: 0,
+            desktop_programmed: false,
+            wedged: false,
+            diag_last_cmd: 0,
+            isr_status_va,
         })
     }
 
@@ -486,6 +593,12 @@ impl VirtioGpu {
     /// it to translate a resource's window offset into a guest-physical range.
     pub fn host_visible(&self) -> Option<HostVisibleWindow> {
         self.host_visible
+    }
+
+    /// Kernel VA of the `VIRTIO_PCI_ISR` status register (0 if absent). Copied into
+    /// `AdapterContext` so the DOD's ISR can ack the virtio interrupt lock-free.
+    pub fn isr_status_va(&self) -> usize {
+        self.isr_status_va
     }
 
     // ── Venus control path (Phase 3, M3.2) ──────────────────────────────────
@@ -797,12 +910,23 @@ impl VirtioGpu {
             self.attach_backing_contiguous(DESKTOP_RES_ID, addr, length, retired)?;
             self.set_scanout(0, DESKTOP_RES_ID, width, height, retired)
         })();
+        // Record whether the scanout is actually live, so the idempotent CommitVidPn
+        // fast-path skips re-programming only a *successfully* programmed mode (a
+        // failed/partial program here leaves this false → CommitVidPn retries).
+        self.desktop_programmed = result.is_ok();
         (old, result)
     }
 
     /// True once a desktop scanout mode has been installed.
     pub fn desktop_ready(&self) -> bool {
         self.desktop_fb.is_some()
+    }
+
+    /// True iff the current scanout was *successfully* programmed (not merely the
+    /// framebuffer installed). Gates the idempotent CommitVidPn fast-path — see
+    /// [`Self::desktop_programmed`] (the field).
+    pub fn desktop_programmed(&self) -> bool {
+        self.desktop_programmed
     }
 
     /// Current desktop scanout geometry `(width, height)`, or `(0, 0)` if no mode
@@ -815,34 +939,116 @@ impl VirtioGpu {
         }
     }
 
-    /// Blt the present source surface (full frame) into the desktop framebuffer,
-    /// then push it to the host scanout (`TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH`
-    /// of the whole frame). `src` is the system-memory desktop primary (locked
-    /// non-paged for the present); `src_pitch` its row stride in bytes. Per-row
-    /// copy handles src/dst pitch mismatch. (Dirty-rect optimization deferred —
-    /// first light pushes the full frame.)
-    pub fn present_desktop(
+    /// TEMP diagnostic: fill the desktop scanout with a solid BGRX color and
+    /// flush it to the host. Used to distinguish "source hidden/black" from a
+    /// broken virtio transfer/scanout path.
+    pub fn fill_desktop_color(
         &mut self,
-        src: &[u8],
-        src_pitch: usize,
+        b: u8,
+        g: u8,
+        r: u8,
         retired: &mut Vec<InFlight>,
     ) -> Result<(), VirtioError> {
         let (w, h) = (self.desktop_w, self.desktop_h);
-        let dst_pitch = (w as usize).saturating_mul(4);
-        let copy_bytes = dst_pitch.min(src_pitch);
         {
             let fb = self.desktop_fb.as_mut().ok_or(VirtioError::DeviceError)?;
             let dst = fb.as_mut_slice();
-            for y in 0..h as usize {
-                let so = y.saturating_mul(src_pitch);
-                let doo = y.saturating_mul(dst_pitch);
-                if so + copy_bytes <= src.len() && doo + copy_bytes <= dst.len() {
-                    dst[doo..doo + copy_bytes].copy_from_slice(&src[so..so + copy_bytes]);
-                }
+            for px in dst.chunks_exact_mut(4) {
+                px[0] = b;
+                px[1] = g;
+                px[2] = r;
+                px[3] = 0xFF;
             }
         }
         self.transfer_to_host_2d(DESKTOP_RES_ID, 0, 0, w, h, 0, retired)?;
         self.resource_flush(DESKTOP_RES_ID, w, h, retired)
+    }
+
+    /// Blt the present source surface (full frame) into the desktop framebuffer,
+    /// then push it to the host scanout (`TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH`
+    /// of the whole frame). `src` is the system-memory desktop primary (locked
+    /// non-paged for the present); `src_pitch` is signed and can be negative for a
+    /// bottom-up surface. Per-row copy handles src/dst pitch mismatch. (Dirty-rect
+    /// optimization deferred — first light pushes the full frame.)
+    pub unsafe fn present_desktop(
+        &mut self,
+        src: *const u8,
+        src_pitch: isize,
+        rotation: _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::Type,
+        retired: &mut Vec<InFlight>,
+    ) -> Result<u32, VirtioError> {
+        if src.is_null() || src_pitch == 0 {
+            return Err(VirtioError::DeviceError);
+        }
+        let (w, h) = (self.desktop_w, self.desktop_h);
+        let dst_pitch = (w as usize).saturating_mul(4);
+        let src_row_bytes = if src_pitch < 0 {
+            src_pitch.saturating_neg() as usize
+        } else {
+            src_pitch as usize
+        };
+        let copy_bytes = dst_pitch.min(src_row_bytes);
+        let mut src_or: u8 = 0;
+        let mut dst_or: u8 = 0;
+        {
+            let fb = self.desktop_fb.as_mut().ok_or(VirtioError::DeviceError)?;
+            let dst = fb.as_mut_slice();
+            if rotation == _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::D3DKMDT_VPPR_ROTATE90 {
+                let src_width = h as usize;
+                let src_height = w as usize;
+                let src_needed = src_width.saturating_mul(4);
+                if src_row_bytes < src_needed {
+                    return Err(VirtioError::DeviceError);
+                }
+                for dy in 0..h as usize {
+                    let dst_row = dy.saturating_mul(dst_pitch);
+                    for dx in 0..w as usize {
+                        let sx = dy;
+                        let sy = src_height.saturating_sub(1).saturating_sub(dx);
+                        let row = unsafe { src.offset((sy as isize).saturating_mul(src_pitch)) };
+                        let so = sx.saturating_mul(4);
+                        let doo = dst_row.saturating_add(dx.saturating_mul(4));
+                        if doo + 4 <= dst.len() && so + 4 <= src_row_bytes {
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(row.add(so), dst[doo..doo + 4].as_mut_ptr(), 4);
+                            }
+                            if dy < 16 && dx < 64 {
+                                for i in 0..4 {
+                                    let b = unsafe { core::ptr::read(row.add(so + i)) };
+                                    src_or |= b;
+                                    dst_or |= dst[doo + i];
+                                }
+                            }
+                        }
+                    }
+                }
+            } else {
+                for y in 0..h as usize {
+                    let doo = y.saturating_mul(dst_pitch);
+                    if doo + copy_bytes <= dst.len() {
+                        let row = unsafe { src.offset((y as isize).saturating_mul(src_pitch)) };
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                row,
+                                dst[doo..doo + copy_bytes].as_mut_ptr(),
+                                copy_bytes,
+                            );
+                        }
+                        if y < 16 {
+                            let sample = copy_bytes.min(256);
+                            for i in 0..sample {
+                                let b = unsafe { core::ptr::read(row.add(i)) };
+                                src_or |= b;
+                                dst_or |= dst[doo + i];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.transfer_to_host_2d(DESKTOP_RES_ID, 0, 0, w, h, 0, retired)?;
+        self.resource_flush(DESKTOP_RES_ID, w, h, retired)?;
+        Ok(0x0D00_0000 | ((src_or as u32) << 8) | dst_or as u32)
     }
 
     /// Submit an opaque Venus command stream to `ctx_id`, fenced with `fence_id`
@@ -883,6 +1089,15 @@ impl VirtioGpu {
             retired.push(InFlight::to_free(meta, venus));
             return Err(VirtioError::DeviceError);
         }
+        // Honor the wedged latch (like ctrl_roundtrip / map_blob_roundtrip): once a
+        // synchronous command timed out, a stale chain sits permanently at the used-
+        // ring head, so adding here would push onto a desynced queue whose
+        // completion can never be reaped. Fail fast, routing the buffers to `retired`
+        // for the PASSIVE-level free (never dropped under this DISPATCH spinlock).
+        if self.wedged {
+            retired.push(InFlight::to_free(meta, venus));
+            return Err(VirtioError::DeviceError);
+        }
         // Reap anything the host has already completed, freeing queue slots.
         if let Err(e) = self.drain_completed(retired) {
             retired.push(InFlight::to_free(meta, venus));
@@ -920,6 +1135,9 @@ impl VirtioGpu {
         // earlier submits) until a slot frees, then retry. The loop yields a
         // Result (no conditional move of meta/venus inside it); the single move
         // onto the error path happens once, after the loop.
+        // ONE ~500 ms budget shared across ALL QueueFull retries (not reset per
+        // retry) — same DPC-watchdog reasoning as `quiesce_into`.
+        let mut qf_budget = CTRL_WAIT_MAX_STALLS;
         let token_result: Result<u16, VirtioError> = loop {
             // SAFETY: `meta`/`venus` are owned and outlive the in-flight entry
             // (parked below until `pop_used`); the slices are within their lengths.
@@ -934,8 +1152,10 @@ impl VirtioGpu {
                         // nothing will free up. Surface rather than spin forever.
                         break Err(VirtioError::DeviceError);
                     }
-                    while !self.control.can_pop() {
-                        core::hint::spin_loop();
+                    // Bounded wait for a slot to free (was an unbounded spin); a
+                    // wedged host surfaces as DeviceError instead of hanging.
+                    if let Err(e) = self.wait_can_pop_budget(&mut qf_budget) {
+                        break Err(e);
                     }
                     if let Err(e) = self.drain_completed(retired) {
                         break Err(e);
@@ -1033,10 +1253,14 @@ impl VirtioGpu {
     /// from teardown. Retired entries go to `retired` (freed by the caller at
     /// PASSIVE).
     fn quiesce_into(&mut self, retired: &mut Vec<InFlight>) -> Result<(), VirtioError> {
+        // ONE ~500 ms budget for the WHOLE drain (not per completion) — a slow host
+        // completing each parked entry just under a per-call cap must not let the
+        // loop spin for N × 500 ms at DISPATCH and trip the DPC watchdog.
+        let mut budget = CTRL_WAIT_MAX_STALLS;
         while !self.inflight.is_empty() {
-            while !self.control.can_pop() {
-                core::hint::spin_loop();
-            }
+            // Bounded (was an unbounded spin) — a wedged host must not hang the
+            // DISPATCH-level caller. On budget exhaustion `wedged` latches and we bail.
+            self.wait_can_pop_budget(&mut budget)?;
             let before = self.inflight.len();
             self.drain_completed(retired)?;
             if self.inflight.len() == before {
@@ -1141,14 +1365,35 @@ impl VirtioGpu {
         if req.len() > req_buf.len() || resp_len > resp_buf.len() {
             return Err(VirtioError::DeviceError);
         }
+        if self.wedged {
+            return Err(VirtioError::DeviceError);
+        }
+        self.diag_last_cmd = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
         req_buf[..req.len()].copy_from_slice(req);
-        self.control
-            .add_notify_wait_pop(
-                &[&req_buf[..req.len()]],
-                &mut [&mut resp_buf[..resp_len]],
-                &mut self.transport,
-            )
-            .map_err(|_| VirtioError::DeviceError)?;
+        // Bounded add → notify → poll → pop (see `ctrl_roundtrip` for the rationale
+        // and the safety argument for leaving a chain queued on a wedged timeout).
+        // SAFETY: `req_buf`/`resp_buf` alias `scratch` via a raw pointer (alive for
+        // the transport's lifetime), not a borrow of `self`; valid through pop_used.
+        let token = match unsafe {
+            self.control
+                .add(&[&req_buf[..req.len()]], &mut [&mut resp_buf[..resp_len]])
+        } {
+            Ok(t) => t,
+            Err(_) => {
+                self.wedged = true;
+                return Err(VirtioError::DeviceError);
+            }
+        };
+        if self.control.should_notify() {
+            self.transport.notify(CTRL_QUEUE);
+        }
+        self.wait_can_pop_bounded()?;
+        // SAFETY: same buffers passed to `add`; still valid (see above).
+        unsafe {
+            self.control
+                .pop_used(token, &[&req_buf[..req.len()]], &mut [&mut resp_buf[..resp_len]])
+        }
+        .map_err(|_| VirtioError::DeviceError)?;
         let resp: &VirtioGpuRespMapInfo = bytemuck::from_bytes(&resp_buf[..resp_len]);
         if resp_is_ok(resp.hdr.type_) {
             Ok(resp.map_info)
@@ -1157,10 +1402,72 @@ impl VirtioGpu {
         }
     }
 
+    /// Poll the control used ring for one completion, charging the busy-wait
+    /// against a caller-owned stall budget (each `KeStallExecutionProcessor` tick
+    /// decrements it). When the budget hits zero it latches [`Self::wedged`] and
+    /// returns `DeviceError`. A *shared* budget is what bounds a MULTI-completion
+    /// drain (`quiesce_into`, the `submit_venus` QueueFull loop): the budget must
+    /// span the whole drain, not reset per completion — otherwise a slow-but-alive
+    /// host that completes each entry just under the per-call cap never latches
+    /// `wedged`, and N entries × ~500 ms cumulatively spin the DISPATCH-level caller
+    /// long enough to trip the DPC watchdog (0x133).
+    fn wait_can_pop_budget(&mut self, budget: &mut u32) -> Result<(), VirtioError> {
+        if self.wedged {
+            return Err(VirtioError::DeviceError);
+        }
+        while !self.control.can_pop() {
+            if *budget == 0 {
+                self.wedged = true;
+                return Err(VirtioError::DeviceError);
+            }
+            // SAFETY: KeStallExecutionProcessor is callable at any IRQL (we may be
+            // at DISPATCH under the virtio spinlock); it only busy-waits ~µs.
+            unsafe { KeStallExecutionProcessor(CTRL_WAIT_STALL_US) };
+            *budget -= 1;
+        }
+        Ok(())
+    }
+
+    /// Wait for ONE completion with a fresh ~500 ms budget ([`CTRL_WAIT_MAX_STALLS`]).
+    /// Correct for the single-command synchronous round-trips (`ctrl_roundtrip`,
+    /// `map_blob_roundtrip`), which wait on exactly one completion before the
+    /// spinlock is released. Multi-completion drains must use
+    /// [`Self::wait_can_pop_budget`] with a carried budget instead.
+    fn wait_can_pop_bounded(&mut self) -> Result<(), VirtioError> {
+        let mut budget = CTRL_WAIT_MAX_STALLS;
+        self.wait_can_pop_budget(&mut budget)
+    }
+
+    /// virtio-gpu `type_` of the most recent synchronous control command. Read at
+    /// PASSIVE (after the spinlock drops) to attribute a wedged/failed present to
+    /// the exact command — e.g. `0x0104` RESOURCE_FLUSH, `0x0105` TRANSFER_TO_HOST_2D,
+    /// `0x0103` SET_SCANOUT, `0x0102` RESOURCE_UNREF, `0x0101` RESOURCE_CREATE_2D.
+    pub fn diag_last_cmd(&self) -> u32 {
+        self.diag_last_cmd
+    }
+
+    /// True once a synchronous control command timed out (the host stopped
+    /// completing the control queue). Latches until a fresh transport is built.
+    pub fn is_wedged(&self) -> bool {
+        self.wedged
+    }
+
     /// Send a single-buffer control command (already serialized to `req` bytes)
     /// and wait for the device's ctrl-header response. Reuses the scratch page
-    /// (request in the low half, response in the high half).
+    /// (request in the low half, response in the high half). The used-ring wait is
+    /// bounded ([`Self::wait_can_pop_bounded`]) so a wedged host fails this command
+    /// rather than spinning the (DISPATCH-level) caller forever.
     fn ctrl_roundtrip(&mut self, req: &[u8]) -> Result<(), VirtioError> {
+        if self.wedged {
+            return Err(VirtioError::DeviceError);
+        }
+        // Record the command type for the PASSIVE-level breadcrumb (written after
+        // the spinlock drops): the ctrl header's `type_` is its first LE u32.
+        self.diag_last_cmd = if req.len() >= 4 {
+            u32::from_le_bytes([req[0], req[1], req[2], req[3]])
+        } else {
+            0
+        };
         let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
         // SAFETY: owned contiguous page; disjoint req/resp halves, serialized by
         // the caller's spinlock. Raw pointer (not a &mut borrow of self.scratch)
@@ -1173,13 +1480,34 @@ impl VirtioGpu {
             return Err(VirtioError::DeviceError);
         }
         req_buf[..req.len()].copy_from_slice(req);
-        self.control
-            .add_notify_wait_pop(
-                &[&req_buf[..req.len()]],
-                &mut [&mut resp_buf[..resp_len]],
-                &mut self.transport,
-            )
-            .map_err(|_| VirtioError::DeviceError)?;
+        // Manual add → notify → bounded poll → pop (the crate's
+        // `add_notify_wait_pop` is an UNBOUNDED spin). If the wait times out we
+        // leave the chain queued and latch `wedged`: the device was reset on Drop
+        // before `scratch` is freed, so it never DMAs freed memory, and `wedged`
+        // stops any further command from reusing the now-desynced queue.
+        // SAFETY: `req_buf`/`resp_buf` alias `scratch` (alive for the transport's
+        // lifetime) via the raw pointer above, not a borrow of `self`; they remain
+        // valid through the matching `pop_used` and are not otherwise accessed.
+        let token = match unsafe {
+            self.control
+                .add(&[&req_buf[..req.len()]], &mut [&mut resp_buf[..resp_len]])
+        } {
+            Ok(t) => t,
+            Err(_) => {
+                self.wedged = true;
+                return Err(VirtioError::DeviceError);
+            }
+        };
+        if self.control.should_notify() {
+            self.transport.notify(CTRL_QUEUE);
+        }
+        self.wait_can_pop_bounded()?;
+        // SAFETY: same buffers passed to `add`; still valid (see above).
+        unsafe {
+            self.control
+                .pop_used(token, &[&req_buf[..req.len()]], &mut [&mut resp_buf[..resp_len]])
+        }
+        .map_err(|_| VirtioError::DeviceError)?;
         let resp: &VirtioGpuCtrlHdr = bytemuck::from_bytes(&resp_buf[..resp_len]);
         if resp_is_ok(resp.type_) {
             Ok(())

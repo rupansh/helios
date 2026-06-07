@@ -44,6 +44,14 @@ helios_kmd.sys = 1,,
 %ProviderName% = Helios_Models,NTamd64.10.0...16299
 
 [Helios_Models.NTamd64.10.0...16299]
+; Match the SPECIFIC hardware id (with SUBSYS+REV) first — the inbox VioGpuDod INF
+; matches PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01, and Windows ranks by match
+; specificity BEFORE DriverVer date. Without an equally-specific entry here, a fresh
+; PnP enumeration always prefers VioGpuDod (more specific) over Helios (generic),
+; regardless of our newer date — which is why forcing Helios required devcon. With
+; the specific match the two tie on rank, and Helios's newer DriverVer then wins, so
+; the device auto-binds Helios on add. The generic id stays as a fallback.
+%DeviceDesc% = Helios_Install, PCI\VEN_1AF4&DEV_1050&SUBSYS_11001AF4&REV_01
 %DeviceDesc% = Helios_Install, PCI\VEN_1AF4&DEV_1050
 
 ; ──── Installation ─────────────────────────────────────────────────────────

@@ -1,11 +1,9 @@
-# Phase 7 Handover — Helios Display Engine (DOD + Venus + zero-copy `SET_SCANOUT_BLOB`)
+# Phase 7 Handover — Archived DOD Display Pivot
 
-**Read `DISPLAY.md` first (canonical spec).** This is the actionable handover for the display pivot decided
-2026-06-06. It replaces the Phase-6 WSI plan (`icd/PHASE6_WSI_HANDOVER.md`), which is now **abandoned**: the
-Mesa `wsi_win32` software present is architecturally incapable of using the host GL display (it issues no
-scanout flush; <1 fps is a host-visibility lag the backend change alone cannot fix — verified against QEMU
-source). Do **not** revive `VN_PERF=no_fence_feedback` (fast but corrupt; rejected twice) and do **not** revive
-the WDDM **render** miniport (confirmed dead end: needs a multi-man-year native D3D-to-venus UMD — LB3/LB4).
+> **ARCHIVED (2026-06-07):** do not use this as the active handover. The active direction is
+> System-class KMDF + DeviceIoControl + Mesa Venus; see
+> [`SYSTEM_CLASS_REFOCUS_2026_06_07.md`](SYSTEM_CLASS_REFOCUS_2026_06_07.md). This file is kept as a historical
+> record of the DOD/`SET_SCANOUT_BLOB` pivot and the work that followed it.
 
 ---
 
@@ -168,11 +166,15 @@ Per `DISPLAY.md` §3–§5 and §9. In order:
 
 ---
 
-## 5. Reading order for the new session
+## 5. Historical Reading Order
 
-1. `DISPLAY.md` (canonical spec — the whole design + the §8 gate + §10 repo deltas).
-2. This file (the ordered steps).
-3. Memories: `display-pivot` (start here), `systemclass-pivot` + `addadapter-umd-blocker` (what's rejected and
-   why — so you don't redo it), `phase5-backend-status` + `mesa-venus-icd-port` (the venus ICD you're keeping),
-   `fence-feedback-hack` + `wsi-bringup-status` (the dead software path + the host-lag root cause).
-4. Git `658168f` for the reusable old WDDM display/escape/config code.
+For active work, read `SYSTEM_CLASS_REFOCUS_2026_06_07.md` and `ARCH.md` first.
+
+For historical DOD/display investigation only:
+
+1. `DISPLAY.md` (archived spec — the old design + the §8 gate + §10 repo deltas).
+2. This file (the old ordered steps).
+3. Prior memory names are historical breadcrumbs only: `display-pivot`, `systemclass-pivot`,
+   `addadapter-umd-blocker`, `phase5-backend-status`, `mesa-venus-icd-port`, `fence-feedback-hack`,
+   `wsi-bringup-status`.
+4. Git `658168f` for reusable old WDDM display/escape/config code if a future DOD experiment resumes.

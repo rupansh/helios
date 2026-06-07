@@ -278,10 +278,9 @@ pub struct VirtioGpuResourceFlush {
     pub padding: u32,
 }
 
-// ── 2D desktop scanout (Phase 7 DOD desktop primary) ────────────────────────
-// The non-blob 2D path: a guest-page-backed scanout resource onto which the DOD
-// paints the Windows desktop primary (DxgkDdiPresentDisplayOnly), displayed on
-// the host under `-spice gl=on`. Distinct from the zero-copy venus blob path.
+// ── 2D scanout helpers ──────────────────────────────────────────────────────
+// The non-blob 2D path: a guest-page-backed scanout resource. Kept for display
+// experiments and diagnostics; distinct from the zero-copy venus blob path.
 
 /// BGRX8888 — matches the Windows desktop primary `D3DDDIFMT_X8R8G8B8` byte
 /// order in memory (B,G,R,X little-endian). (virtio_gpu_formats enum value 2.)

@@ -51,6 +51,17 @@ else
   DISP=(-display "$DISPLAY_BACKEND")
   echo ">>> QEMU (display=$DISPLAY_BACKEND, virtio-gpu SOLE display). Z:\\ = repo. SSH .120 <<<"
 fi
+# GPU device (HELIOS_GPU): "gl" (default) = virtio-gpu-gl-pci + venus/blob/hostmem —
+# REQUIRES a GL display backend (spice gl=on or gtk,gl=on); QEMU refuses it on a
+# software display. "plain" = virtio-gpu-pci (no venus/GL) — boots with the SOFTWARE
+# gtk display, for the 2D DOD desktop / Code-43 bring-up test (the DOD's venus path
+# is still a stub, so this loses nothing for now). Both are NON-VGA (what the DOD needs).
+if [ "${HELIOS_GPU:-gl}" = plain ]; then
+  GPU_DEV=(-device '{"driver":"virtio-gpu-pci","id":"ua-heliosgpu","max_outputs":1,"bus":"pci.8","addr":"0x0"}')
+  echo ">>> GPU: virtio-gpu-pci (plain, non-VGA, NO venus/GL — works with the software display) <<<"
+else
+  GPU_DEV=(-device '{"driver":"virtio-gpu-gl-pci","id":"ua-heliosgpu","max_outputs":1,"bus":"pci.8","addr":"0x0","venus":true,"blob":true,"hostmem":4294967296,"max_hostmem":4294967296}')
+fi
 exec /usr/bin/qemu-system-x86_64 \
   -name \
   guest=win11,debug-threads=on \
@@ -157,8 +168,7 @@ exec /usr/bin/qemu-system-x86_64 \
   '{"driver":"tpm-crb","tpmdev":"tpm-tpm0","id":"tpm0"}' \
   -device \
   '{"driver":"usb-tablet","id":"input2","bus":"usb.0","port":"1"}' \
-  -device \
-  '{"driver":"virtio-gpu-gl-pci","id":"ua-heliosgpu","max_outputs":1,"bus":"pci.8","addr":"0x0","venus":true,"blob":true,"hostmem":4294967296,"max_hostmem":4294967296}' \
+  "${GPU_DEV[@]}" \
   -global \
   ICH9-LPC.noreboot=off \
   -watchdog-action \

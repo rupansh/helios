@@ -12,6 +12,7 @@
 //! Dxgkrnl callback interface.
 
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use wdk_sys::ntddk::{KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock};
 use wdk_sys::KSPIN_LOCK;
@@ -36,7 +37,24 @@ pub struct AdapterContext {
     /// The virtio-gpu transport, brought up in `DxgkDdiStartDevice`.
     /// Guarded by `virtio_lock`; `None` until StartDevice (and after StopDevice).
     virtio: UnsafeCell<Option<VirtioGpu>>,
+    /// Kernel VA of the virtio `VIRTIO_PCI_ISR` status register (0 = none/down).
+    /// Read+ack'd LOCK-FREE from `DxgkDdiInterruptRoutine` at DIRQL — it cannot take
+    /// `virtio_lock` (a DISPATCH-level spinlock), so the ISR register VA lives here
+    /// as a plain atomic, set in StartDevice after the transport is up and cleared in
+    /// StopDevice. Reading the register de-asserts the virtio INTx line; without it
+    /// an asserted (e.g. config-change) interrupt re-fires forever — an interrupt
+    /// storm that hard-hangs the guest (our ISR previously never acked).
+    pub isr_status_va: AtomicUsize,
+    /// VioGpuDod-style per-source current-mode flags. The scanout can exist from
+    /// StartDevice, but the VidPN source is not considered active until
+    /// CommitVidPn realizes the committed source mode.
+    current_mode_flags: AtomicU32,
+    current_rotation: AtomicU32,
 }
+
+const CM_FRAMEBUFFER_ACTIVE: u32 = 1 << 0;
+const CM_SOURCE_NOT_VISIBLE: u32 = 1 << 1;
+const CM_FULLSCREEN_PRESENT: u32 = 1 << 2;
 
 // SAFETY: `dxgkrnl` is written only during the device-lifecycle DDIs, which
 // Dxgkrnl serializes. `virtio` is interior-mutable but every access goes through
@@ -52,6 +70,11 @@ impl AdapterContext {
             dxgkrnl: None,
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
+            isr_status_va: AtomicUsize::new(0),
+            current_mode_flags: AtomicU32::new(CM_SOURCE_NOT_VISIBLE),
+            current_rotation: AtomicU32::new(
+                _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::D3DKMDT_VPPR_IDENTITY as u32,
+            ),
         })
     }
 
@@ -93,5 +116,64 @@ impl AdapterContext {
         };
         unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
         result
+    }
+
+    pub fn reset_current_mode(&self) {
+        self.current_mode_flags
+            .store(CM_SOURCE_NOT_VISIBLE, Ordering::Release);
+        self.current_rotation.store(
+            _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::D3DKMDT_VPPR_IDENTITY as u32,
+            Ordering::Release,
+        );
+    }
+
+    pub fn mark_framebuffer_active(&self, active: bool) {
+        if active {
+            self.current_mode_flags.fetch_or(
+                CM_FRAMEBUFFER_ACTIVE | CM_FULLSCREEN_PRESENT,
+                Ordering::AcqRel,
+            );
+        } else {
+            self.current_mode_flags
+                .fetch_and(!CM_FRAMEBUFFER_ACTIVE, Ordering::AcqRel);
+        }
+    }
+
+    pub fn mark_fullscreen_present(&self) {
+        self.current_mode_flags
+            .fetch_or(CM_FULLSCREEN_PRESENT, Ordering::AcqRel);
+    }
+
+    pub fn set_source_visible(&self, visible: bool) {
+        if visible {
+            self.current_mode_flags.fetch_and(!CM_SOURCE_NOT_VISIBLE, Ordering::AcqRel);
+            self.current_mode_flags
+                .fetch_or(CM_FULLSCREEN_PRESENT, Ordering::AcqRel);
+        } else {
+            self.current_mode_flags
+                .fetch_or(CM_SOURCE_NOT_VISIBLE, Ordering::AcqRel);
+        }
+    }
+
+    pub fn source_not_visible(&self) -> bool {
+        self.current_mode_flags.load(Ordering::Acquire) & CM_SOURCE_NOT_VISIBLE != 0
+    }
+
+    pub fn framebuffer_active(&self) -> bool {
+        self.current_mode_flags.load(Ordering::Acquire) & CM_FRAMEBUFFER_ACTIVE != 0
+    }
+
+    pub fn set_rotation(&self, rotation: _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::Type) {
+        self.current_rotation
+            .store(rotation as u32, Ordering::Release);
+    }
+
+    pub fn rotation(&self) -> _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::Type {
+        match self.current_rotation.load(Ordering::Acquire) {
+            x if x == _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::D3DKMDT_VPPR_ROTATE90 as u32 => {
+                _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::D3DKMDT_VPPR_ROTATE90
+            }
+            _ => _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::D3DKMDT_VPPR_IDENTITY,
+        }
     }
 }

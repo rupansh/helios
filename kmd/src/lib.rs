@@ -93,6 +93,15 @@ fn build_dod_init_data() -> KMDDOD_INITIALIZATION_DATA {
     let mut data: KMDDOD_INITIALIZATION_DATA = unsafe { core::mem::zeroed() };
     data.Version = DXGKDDI_INTERFACE_VERSION;
 
+    // Full DDI table. NOTE: trimming this to KMDOD's 28-entry set (leaving the
+    // optional DDIs NULL) was found to REGRESS the VidPN commit path — dxgkrnl then
+    // rejects our target mode `pfnAddMode` with STATUS_GRAPHICS_INVALID_FREQUENCY
+    // (0xC01E030A) in every enum context, so no cofunctional VidPN forms and Present
+    // never fires (which only *masked* the post-present Code 43, it did not fix it).
+    // With the full table the target mode is accepted and the desktop commits. The
+    // optional DDIs that previously returned NOT_IMPLEMENTED now return SUCCESS
+    // (accept-and-ignore) so a registered present-window DDI never fails a call.
+
     // ── Lifecycle / PnP / power ─────────────────────────────────────────────
     data.DxgkDdiAddDevice = Some(dod::add_device);
     data.DxgkDdiStartDevice = Some(dod::start_device);
@@ -108,9 +117,7 @@ fn build_dod_init_data() -> KMDDOD_INITIALIZATION_DATA {
     data.DxgkDdiUnload = Some(dod::unload);
     data.DxgkDdiQueryInterface = Some(dod::query_interface);
     data.DxgkDdiQueryAdapterInfo = Some(dod::query_adapter_info);
-    // Mandatory base-block DDIs — dxgkrnl rejects the init table (FAILED_DRIVER_ENTRY,
-    // Code 37) if ResetDevice / NotifyAcpiEvent / ControlEtwLogging are NULL.
-    data.DxgkDdiResetDevice = Some(dod::reset_device);
+    data.DxgkDdiResetDevice = Some(dod::reset_device); // load-mandatory (Code 37 if NULL)
     data.DxgkDdiNotifyAcpiEvent = Some(dod::notify_acpi_event);
     data.DxgkDdiControlEtwLogging = Some(dod::control_etw_logging);
     data.DxgkDdiSetPalette = Some(dod::set_palette);
@@ -144,9 +151,5 @@ fn build_dod_init_data() -> KMDDOD_INITIALIZATION_DATA {
     // The venus carrier — STUB for now (NOT_SUPPORTED); the real escape dispatch
     // (today's ioctl.rs body) lands in Phase 7.2.
     data.DxgkDdiEscape = Some(dod::escape);
-
-    // The WDDM2.0+ power-runtime DDIs (SetPowerComponentFState /
-    // PowerRuntimeControlRequest / PowerRuntimeSetDeviceHandle) stay None — they
-    // are past the declared WIN8 version, so dxgkrnl does not validate them here.
     data
 }

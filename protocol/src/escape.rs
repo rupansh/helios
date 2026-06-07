@@ -144,9 +144,10 @@ pub struct HeliosEscapeWaitFence {
     pub timeout_ns: u64,
 }
 
-/// `HELIOS_ESCAPE_PRESENT_BLOB` — throwaway Phase-7 gate op (DISPLAY.md §8). Bind
-/// a venus blob `resource_id` to scanout 0 (`SET_SCANOUT_BLOB` + `RESOURCE_FLUSH`)
-/// so the host displays it zero-copy under `-spice gl=on`. Input-only. 40 bytes.
+/// `HELIOS_ESCAPE_PRESENT_BLOB` — optional presentation experiment. Bind a venus
+/// blob `resource_id` to scanout 0 (`SET_SCANOUT_BLOB` + `RESOURCE_FLUSH`) so the
+/// host displays it zero-copy when the VM/display backend supports it. Input-only.
+/// 40 bytes.
 ///
 /// `stride`/`offset` are plane-0 geometry (from `vkGetImageSubresourceLayout` on
 /// the LINEAR swapchain-like image) the host needs to interpret the exported

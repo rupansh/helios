@@ -77,8 +77,8 @@ pub const IOCTL_HELIOS_MAP_BLOB: u32 =
 /// Wait on a fence id. In: [`crate::HeliosEscapeWaitFence`].
 pub const IOCTL_HELIOS_WAIT_FENCE: u32 =
     ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 5, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
-/// Throwaway Phase-7 gate op (DISPLAY.md §8): present a venus blob on scanout 0.
-/// In: [`crate::HeliosEscapePresentBlob`]. Removed once the DOD path lands.
+/// Optional presentation experiment: present a venus blob on scanout 0.
+/// In: [`crate::HeliosEscapePresentBlob`].
 pub const IOCTL_HELIOS_PRESENT_BLOB: u32 =
     ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 6, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
 

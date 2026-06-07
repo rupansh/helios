@@ -4,7 +4,7 @@
 
 The KMD (Kernel-Mode Driver) is a **System-class KMDF function driver** for the virtio-gpu PCI device. It lives in the Windows kernel, talks to the virtio-gpu device, and exposes the virtio-gpu Venus transport to user mode via a **DeviceIoControl device interface** (`GUID_DEVINTERFACE_HELIOS`). It is **not** a display/WDDM miniport: there is no dxgkrnl, no GPU-VA / segment / monitored-fence contract, and no user-mode display driver. The Vulkan ICD (a Windows port of Mesa's `venus`) reaches the KMD purely through IOCTLs on that device interface, and is enumerated independently by the Windows Vulkan loader via the Khronos registry JSON.
 
-See `ARCH.md` (canonical) for the full v2 architecture; this guide is the implementation companion for the `kmd/` crate.
+See `ARCH.md` (canonical) and `SYSTEM_CLASS_REFOCUS_2026_06_07.md` for the active architecture; this guide is the implementation companion for the `kmd/` crate.
 
 **References:**
 - KMDF getting started: https://learn.microsoft.com/en-us/windows-hardware/drivers/wdf/getting-started-with-kmdf
@@ -18,7 +18,7 @@ See `ARCH.md` (canonical) for the full v2 architecture; this guide is the implem
 
 The working, building source under `kmd/` is the ground truth — prefer it over the snippets below. Key facts for the System-class KMDF model (confirmed against the WDK 10.0.26100 / KMDF 1.33 bindings):
 
-- **KMDF only — `wdk-sys` + WDF, no display bindgen.** The driver uses the WDF function table that `wdk-sys` auto-wires; calls go through `wdk_sys::call_unsafe_wdf_function_binding!`. There is **no** `dispmprt.h`/`d3dkmddi.h` bindgen, **no** `src/dxgk.rs`, and **no** `cargo:rustc-link-lib=static=displib`. `build.rs` collapses to `Config::from_env_auto()?.configure_binary_build()?`. None of `DxgkInitialize`, `DRIVER_INITIALIZATION_DATA`, `DXGKDDI_INTERFACE_VERSION`, `DXGK_DRIVERCAPS`, the QUERYSEGMENT/GPUMMU caps, the render-DDI list, or any `DXGK*` symbol is used — that whole surface, plus Code 43 and the AddAdapter capability/version handshake, is gone. Use `use wdk_sys::*;` for kernel types.
+- **KMDF active build — `wdk-sys` + WDF.** The driver uses the WDF function table that `wdk-sys` auto-wires; calls go through `wdk_sys::call_unsafe_wdf_function_binding!`. The active build should not link `displib` or depend on `DxgkInitialize*`, `DRIVER_INITIALIZATION_DATA`, `DXGK_DRIVERCAPS`, the QUERYSEGMENT/GPUMMU caps, the render-DDI list, or any `DXGK*` symbol. The DOD-scoped `dispmprt.h`/`d3dkmddi.h` bindgen / `src/dxgk.rs` may remain in the repository as archived reference material, but it is not part of the active System-class KMDF path.
 - **`Cargo.toml` driver-type is `KMDF`** with `kmdf-version` set (1.33); the bindgen build-dependency is dropped.
 - **Panic handler:** do **not** define your own `#[panic_handler]` — just `extern crate wdk_panic;` (it supplies one; a second is a duplicate lang item).
 - **Build on local disk, never `Z:\`** (cargo/wdk IO fails on the 9p share — OS error 87, windows-drivers-rs#481): the `win` MCP `win_cargo` tool robocopy-mirrors to `C:\Users\Rupansh\helios-vgpu` and builds there. See TOOLCHAIN.md.

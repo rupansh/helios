@@ -1,27 +1,23 @@
 # OVERVIEW.md — Helios vGPU Architecture
 
-> ⚠️ **DISPLAY PIVOT (2026-06-06):** the goal below ("no display output, headless GPU") described the
-> System-class phase, which reached **working venus rendering end-to-end**. The project now adds a **display
-> path**: Helios becomes a **WDDM Display-Only Driver (DOD)** that owns the virtio-gpu scanout and displays
-> venus content **directly** via **`SET_SCANOUT_BLOB`** (zero-copy dmabuf) under **`-spice gl=on`**. Canonical
-> spec: **`DISPLAY.md`** (+ `PHASE7_DISPLAY_HANDOVER.md`). The venus transport/ICD below is reused; the
-> "registers no display adapter" line is superseded.
+> **DIRECTION RESET (2026-06-07):** the active project direction is again
+> **System-class KMDF + DeviceIoControl + Mesa Venus**. The WDDM DOD/display pivot is archived, not deleted;
+> see [`SYSTEM_CLASS_REFOCUS_2026_06_07.md`](SYSTEM_CLASS_REFOCUS_2026_06_07.md) for the decision record.
 
 ## Project Goal
 
-Build a virtio-gpu driver for a Windows 11 VM under KVM/QEMU that gives guest apps a Vulkan-capable GPU **and**
-displays the VM's output to the host with GPU acceleration. Two layers:
+Build a virtio-gpu driver for a Windows 11 VM under KVM/QEMU that gives guest apps a performant
+Vulkan-capable GPU through Venus. Display integration is a separate layer and must not block renderer
+performance work.
 
-- **Render (working):** a Mesa-venus Vulkan ICD encodes Vulkan over the **virtio-gpu Venus protocol** to
+- **Render (active, working baseline):** a Mesa-venus Vulkan ICD encodes Vulkan over the **virtio-gpu Venus protocol** to
   virglrenderer on the Linux host, executing on the host's physical GPU (ANV/RADV). DirectX rides DXVK/VKD3D →
   Vulkan in the guest. (Reached end-to-end in the System-class phase.)
-- **Display (Phase 7, `DISPLAY.md`):** Helios is a **WDDM Display-Only Driver** that owns the virtio-gpu
-  scanout — it drives the **2D Windows desktop** (DOD present path, GL-displayed) and presents **fullscreen
-  venus content zero-copy** via **`SET_SCANOUT_BLOB`** of an exportable host-GPU venus blob, displayed under
-  **`-spice gl=on`**. The venus ops ride **`DxgkDdiEscape`**.
+- **Display (future/separate):** windowed Win32 WSI and DOD scanout experiments are archived. Revisit display
+  only after offscreen Venus submit/fence/blob throughput is fast enough.
 - Does NOT use GPU passthrough — host retains full GPU access.
-- Does NOT GPU-composite the 2D desktop (no WDDM render adapter is feasible — that needs a multi-man-year
-  native D3D-to-venus UMD; the desktop is WARP-composited, which is fine for 2D). See `DISPLAY.md` §7.
+- Does NOT GPU-composite the Windows desktop. A native WDDM render adapter remains rejected because it requires
+  a native D3D-to-venus UMD.
 
 ---
 
@@ -50,16 +46,14 @@ User mode reaches the KMD via **`DeviceIoControl` on a device interface** (`GUID
 | 5 Vulkan ICD | Mesa venus port over IOCTL; loader-registry JSON |
 | 6 DXVK / VKD3D | App-level validation |
 
-**STATUS (2026-06-06):** Phases 0–5 + 4e async + WSI bring-up ✅ — the System-class KMDF driver + the Mesa
+**STATUS (updated 2026-06-07):** Phases 0–5 + WSI bring-up reached a working baseline — the System-class KMDF driver + the Mesa
 **venus ICD** render end-to-end on real hardware: `vulkaninfo` reports `driverName venus`, and
 `vkCreateDevice` + host-visible `vkAllocateMemory`/`vkMapMemory` + a `vkCmdFillBuffer`+`vkQueueSubmit`
 round-trip real GPU output on the Intel ARL iGPU; vkcube even renders via the software WSI path (but at
-<1 fps — that path is now abandoned). The WDDM **render** miniport stays abandoned (Code-43 / needs a
-multi-man-year D3D-to-venus UMD). **NEXT = Phase 7: the Display Engine** — flip the driver model to a **WDDM
-Display-Only Driver** and present venus content **zero-copy** via **`SET_SCANOUT_BLOB`** under `-spice gl=on`.
-Canonical: **`DISPLAY.md`** + **`PHASE7_DISPLAY_HANDOVER.md`** (do the §8 go/no-go gate first). The driver
-model, present path, and the venus carrier (IOCTL → `DxgkDdiEscape`) all change; the venus/transport core is
-reused.
+<1 fps, so it is not a renderer-performance benchmark). The WDDM **render** miniport stays abandoned. The DOD
+display pivot is archived. **NEXT:** restore the System-class driver setup and improve Venus performance
+directly: async submit, interrupt/DPC fence completion, blob mapping lifetime, offscreen render throughput, then
+DXVK/VKD3D validation.
 
 **KMDF callbacks the driver registers:** `EvtDriverDeviceAdd`, `EvtDevicePrepareHardware`, `EvtDeviceReleaseHardware`, `EvtDeviceD0Entry`, `EvtDeviceD0Exit`, `EvtIoDeviceControl`, `EvtInterruptIsr`, `EvtInterruptDpc`.
 
