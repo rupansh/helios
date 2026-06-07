@@ -347,6 +347,7 @@ impl WinHost {
     )]
     async fn win_looking_glass(&self, Parameters(a): Parameters<WinLookingGlassArgs>) -> String {
         let source_root = a.source_root.unwrap_or_else(|| PROJECT_DRIVE.to_string());
+        let source_root_no_slash = source_root.trim_end_matches(['\\', '/']);
         let build_dir = a
             .build_dir
             .unwrap_or_else(|| "C:\\Users\\Rupansh\\helios-lookingglass-host-build".to_string());
@@ -369,10 +370,15 @@ impl WinHost {
         } else {
             format!("cmake --build \"{build_dir}\" {}", a.build_args.join(" "))
         };
-        let mesa_exclude = if source_root.ends_with("\\.") || source_root.ends_with("/.") {
-            format!("{}\\icd\\mesa", &source_root[..source_root.len() - 2])
+        let mesa_exclude = if source_root_no_slash.ends_with("\\.")
+            || source_root_no_slash.ends_with("/.")
+        {
+            format!(
+                "{}\\icd\\mesa",
+                &source_root_no_slash[..source_root_no_slash.len() - 2]
+            )
         } else {
-            format!("{source_root}\\icd\\mesa")
+            format!("{source_root_no_slash}\\icd\\mesa")
         };
 
         let command = format!(

@@ -32,12 +32,32 @@ configure:   cmake -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_NVFBC=OFF
 ```
 
 If the VM source share is not mounted as `Z:\`, call `win_looking_glass` with `source_root` set to the active share
-path. As of this note, the current Windows SSH session sees only the stale local mirror and does **not** see `Z:\`
-or WSL UNC paths, so the new tool cannot sync until the share is restored or an alternate source path is supplied.
+path.
+
+The Windows VM currently sees the repository at `Z:\` again after updating the host virtiofsd package. The
+dedicated MCP build path has also been verified manually with the same commands used by `win_looking_glass`.
+The tool normalizes `source_root` before forming the absolute `icd\mesa` exclude path; without that normalization,
+`Z:\` became `Z:\\icd\mesa`, robocopy did not exclude Mesa, and the sync failed on Linux-only Mesa filenames.
+
+```text
+robocopy Z:\ C:\Users\Rupansh\helios-vgpu /MIR /XD target .git icd\mesa Z:\icd\mesa ...
+cmake -S C:\Users\Rupansh\helios-vgpu\LookingGlass\host \
+      -B C:\Users\Rupansh\helios-lookingglass-host-build \
+      -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DUSE_NVFBC=OFF
+cmake --build C:\Users\Rupansh\helios-lookingglass-host-build
+```
+
+Result:
+
+```text
+[15/15] Linking C executable looking-glass-host.exe
+```
+
+One upstream Looking Glass source file needed a MinGW `-Werror=format-truncation` fix in the DXGI RGB24
+postprocessor before the Windows host would compile.
 
 ## Open items
 
-- Build the modified Looking Glass host on Windows using the new MCP tool after source sync is available.
 - Validate the Vulkan sink against the current Helios ICD JSON.
 - Decide whether `HELIOS_GATE_RESID_FILE` remains acceptable for the prototype or should be replaced by a real
   Helios Vulkan extension / private query API that returns the backing virtio resource id for a memory object.

@@ -8,7 +8,7 @@ You are the **primary author** of this project. The human overseer has OS/driver
 
 Windows builds **cannot run on the `Z:\` share** (Rust IO fails with OS error 87 — windows-drivers-rs#481); build through the **`win` MCP server's `win_cargo`**, which mirrors `Z:\` → `C:\Users\Rupansh\helios-vgpu` and builds locally. See `ARCH.md` (canonical) and `SYSTEM_CLASS_REFOCUS_2026_06_07.md`.
 
-**Status (updated 2026-06-07):** The Venus stack renders end-to-end on the System-class KMDF + DeviceIoControl + Mesa Venus ICD path (`vulkaninfo`, device creation, mapped Venus memory, `vkCmdFillBuffer` readback). The WDDM Display-Only Driver pivot is **archived** because it does not directly solve the Venus performance goal and consumed effort in VidPN/Code 43 bring-up. Active work is to restore the old working VM/device setup, benchmark offscreen Venus, and improve submit/fence/blob performance before revisiting presentation.
+**Status (updated 2026-06-08):** The Venus stack renders end-to-end on the System-class KMDF + DeviceIoControl + Mesa Venus ICD path (`vulkaninfo`, device creation, mapped Venus memory, `vkCmdFillBuffer` readback, `vkcube`). The WDDM Display-Only Driver pivot is **archived**. Active display work is the Looking Glass host sink experiment: capture IDD/DXGI frames in the Windows host server, copy them into a persistent Helios Venus image, submit through the ICD, and present with `IOCTL_HELIOS_PRESENT_BLOB`. `LookingGlass\host` builds on Windows with the MinGW/Ninja `win_looking_glass` path; next validation is running the host with `helios.enable=yes` against the current Helios ICD JSON.
 
 ---
 
