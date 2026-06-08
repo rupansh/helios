@@ -37,6 +37,15 @@ HeliosGateFile REG_SZ Path used for the temporary Venus allocation-size -> resou
 HeliosGpu      REG_SZ Substring used to select the Venus physical device, default "Intel".
 ```
 
+For WUDFHost/LocalService, keep `HeliosGateFile` under a service-writable directory, not a user profile:
+
+```text
+HeliosGateFile = C:\ProgramData\HeliosVulkan\helios_lg_idd_resid.txt
+```
+
+The Mesa Helios renderer reads `HELIOS_GATE_RESID_FILE` with `GetEnvironmentVariableA`, not CRT `getenv()`, so the
+handoff still works when the ICD is statically linked and loaded into a process using a different CRT.
+
 Client-side SPICE display fallback is now opt-in with `spice:display=yes`. For Helios/IDD testing, keep the client
 on the KVMFR stream while still allowing SPICE input:
 
@@ -104,11 +113,75 @@ C:\Users\Rupansh\helios-vgpu\LookingGlass\idd\x64\Release\LGIdd\LGIdd.inf
 C:\Users\Rupansh\helios-vgpu\LookingGlass\idd\x64\Release\LGIdd\lgidd.cat
 ```
 
+## Service-safe Vulkan ICD
+
+The IDD runs inside WUDFHost as `NT AUTHORITY\LOCAL SERVICE`. Elevated/service Vulkan loader paths ignore
+`VK_DRIVER_FILES`, so the Helios ICD must be registered in HKLM and loadable from a service-readable directory.
+
+Current working deployment:
+
+```text
+C:\ProgramData\HeliosVulkan\vulkan_virtio.dll
+C:\ProgramData\HeliosVulkan\virtio_devenv_icd.x86_64.json
+HKLM\SOFTWARE\Khronos\Vulkan\Drivers
+  C:\ProgramData\HeliosVulkan\virtio_devenv_icd.x86_64.json = DWORD 0
+```
+
+The JSON uses a relative library path:
+
+```json
+{
+  "file_format_version": "1.0.1",
+  "ICD": {
+    "api_version": "1.4.352",
+    "library_arch": "64",
+    "library_path": ".\\vulkan_virtio.dll"
+  }
+}
+```
+
+`icd/win-build/mingw-native.ini` links the Mesa ICD with the MinGW runtime statically (`-static`,
+`-static-libgcc`, `-static-libstdc++`). This removes the `libwinpthread-1.dll` runtime dependency that prevented
+LocalService from loading `vulkan_virtio.dll` with loader error 126.
+
+Validation command used through a LocalService scheduled task:
+
+```text
+C:\Windows\System32\vulkaninfo.exe --summary
+```
+
+Expected result:
+
+```text
+GPU0: Virtio-GPU Venus (Intel(R) Graphics (ARL)), driverName=venus
+GPU1: Virtio-GPU Venus (llvmpipe ...), driverName=venus
+```
+
+## Current validation
+
+Validated on 2026-06-08:
+
+- `vulkaninfo --summary` works both interactively and as LocalService using the ProgramData ICD registration.
+- Restarting the Looking Glass IDD initializes the Helios Vulkan sink inside WUDFHost.
+- The IDD sink creates a persistent 1920x1080 BGRA Venus scanout image:
+
+```text
+Helios: IDD scanout image 1920x1080 res_id=4180 stride=7680 offset=0 memFlags=0xf
+```
+
+- A short git-built Looking Glass client run stays on the IDD/KVMFR stream:
+
+```text
+LookingGlass/client/build/looking-glass-client app:shmFile=/dev/kvmfr0 spice:input=yes spice:display=no win:disableWaitingMessage=yes
+```
+
+The IDD log showed no `PRESENT_BLOB` failure during that smoke run.
+
 ## Open items
 
-- Install the rebuilt IDD driver, enable `HeliosEnable`, and validate that the IDD sink presents through Helios
-  while the normal KVMFR client stream remains functional.
 - Decide whether `HELIOS_GATE_RESID_FILE` remains acceptable for the prototype or should be replaced by a real
   Helios Vulkan extension / private query API that returns the backing virtio resource id for a memory object.
 - Replace the prototype CPU copy with a true fast path: copy or alias the completed IDD D3D12 frame into a
   Venus-exportable image without a CPU round trip, then present the same blob via `IOCTL_HELIOS_PRESENT_BLOB`.
+- Investigate the transient `IddCxSwapChainSetDevice` keyed-mutex-abandoned log seen immediately after IDD
+  restart; the second swapchain start recovered and produced frames.
