@@ -56,6 +56,9 @@ const VCVARS: &str =
 /// (icd/win-build/mingw-native.ini). gcc compiles venus's GNU-isms natively and
 /// builds straight from Z:\. Installed via `winget install BrechtSanders.WinLibs.POSIX.UCRT`.
 const MINGW_BIN: &str = "C:\\Users\\Rupansh\\AppData\\Local\\Microsoft\\WinGet\\Packages\\BrechtSanders.WinLibs.POSIX.UCRT_Microsoft.Winget.Source_8wekyb3d8bbwe\\mingw64\\bin";
+/// MSBuild used for Looking Glass IDD's WDK/Visual Studio solution.
+const MSBUILD: &str =
+    "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\Msbuild\\Current\\Bin\\MSBuild.exe";
 
 #[derive(Clone)]
 pub struct WinHost {
@@ -257,6 +260,47 @@ struct WinLookingGlassArgs {
     timeout_secs: Option<u64>,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+struct WinLookingGlassIddArgs {
+    /// Source root on the Windows VM. Defaults to Z:\. Override if the shared
+    /// tree is exposed at another path.
+    #[serde(default)]
+    source_root: Option<String>,
+    /// MSBuild arguments after the solution path. If empty, builds Release|x64
+    /// with RunInfVerif=false.
+    #[serde(default)]
+    msbuild_args: Vec<String>,
+    /// MSBuild path. Defaults to the VS 2022 Community MSBuild installation.
+    #[serde(default)]
+    msbuild_path: Option<String>,
+    /// If true, only sync the local mirror and Mesa Vulkan headers; do not build.
+    #[serde(default)]
+    sync_only: bool,
+    /// Timeout in seconds. Defaults to 1800.
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+fn mesa_exclude_for_source(source_root: &str) -> String {
+    let source_root_no_slash = source_root.trim_end_matches(['\\', '/']);
+    if source_root_no_slash.ends_with("\\.") || source_root_no_slash.ends_with("/.") {
+        format!(
+            "{}\\icd\\mesa",
+            &source_root_no_slash[..source_root_no_slash.len() - 2]
+        )
+    } else {
+        format!("{source_root_no_slash}\\icd\\mesa")
+    }
+}
+
+fn ps_join_path(root: &str, rel: &str) -> String {
+    if root.ends_with(['\\', '/']) {
+        format!("{root}{rel}")
+    } else {
+        format!("{root}\\{rel}")
+    }
+}
+
 #[tool_router]
 impl WinHost {
     fn new() -> Self {
@@ -347,7 +391,6 @@ impl WinHost {
     )]
     async fn win_looking_glass(&self, Parameters(a): Parameters<WinLookingGlassArgs>) -> String {
         let source_root = a.source_root.unwrap_or_else(|| PROJECT_DRIVE.to_string());
-        let source_root_no_slash = source_root.trim_end_matches(['\\', '/']);
         let build_dir = a
             .build_dir
             .unwrap_or_else(|| "C:\\Users\\Rupansh\\helios-lookingglass-host-build".to_string());
@@ -370,16 +413,7 @@ impl WinHost {
         } else {
             format!("cmake --build \"{build_dir}\" {}", a.build_args.join(" "))
         };
-        let mesa_exclude = if source_root_no_slash.ends_with("\\.")
-            || source_root_no_slash.ends_with("/.")
-        {
-            format!(
-                "{}\\icd\\mesa",
-                &source_root_no_slash[..source_root_no_slash.len() - 2]
-            )
-        } else {
-            format!("{source_root_no_slash}\\icd\\mesa")
-        };
+        let mesa_exclude = mesa_exclude_for_source(&source_root);
 
         let command = format!(
             "if (!(Test-Path -LiteralPath '{source_root}')) {{ \"win_looking_glass: source root not found: {source_root}\"; exit 3 }}\n\
@@ -396,6 +430,58 @@ impl WinHost {
                 configure
             },
             build,
+        );
+
+        match run_ssh(
+            &command,
+            None,
+            &HashMap::new(),
+            a.timeout_secs.unwrap_or(1800),
+        )
+        .await
+        {
+            Ok(o) => format_output(&o),
+            Err(e) => format!("error launching ssh: {e}"),
+        }
+    }
+
+    #[tool(
+        description = "Sync the project to the local Windows mirror and build the Looking Glass IDD WDK driver from LookingGlass\\idd\\LGIdd.sln. This mirrors Z:\\ -> C:\\Users\\Rupansh\\helios-vgpu with robocopy (excluding target/, all .git dirs, and icd\\mesa), copies only icd\\mesa\\include\\vulkan into the mirror for Vulkan headers, then builds the IDD solution from local NTFS with MSBuild. Edit sources on the Linux/Z:\\ side; the mirror is re-synced on every call. Empty msbuild_args builds Release|x64 with RunInfVerif=false."
+    )]
+    async fn win_looking_glass_idd(
+        &self,
+        Parameters(a): Parameters<WinLookingGlassIddArgs>,
+    ) -> String {
+        let source_root = a.source_root.unwrap_or_else(|| PROJECT_DRIVE.to_string());
+        let mesa_exclude = mesa_exclude_for_source(&source_root);
+        let mesa_vulkan_src = ps_join_path(&source_root, "icd\\mesa\\include\\vulkan");
+        let msbuild = a.msbuild_path.unwrap_or_else(|| MSBUILD.to_string());
+        let sln = format!("{MIRROR_ROOT}\\LookingGlass\\idd\\LGIdd.sln");
+        let msbuild_args = if a.msbuild_args.is_empty() {
+            "/p:Configuration=Release /p:Platform=x64 /p:RunInfVerif=false /m /v:minimal"
+                .to_string()
+        } else {
+            a.msbuild_args.join(" ")
+        };
+        let build = if a.sync_only {
+            "\"win_looking_glass_idd: sync_only requested; skipping MSBuild\"\n$global:LASTEXITCODE = 0"
+                .to_string()
+        } else {
+            format!(
+                "if (!(Test-Path -LiteralPath '{msbuild}')) {{ \"win_looking_glass_idd: MSBuild not found: {msbuild}\"; exit 4 }}\n\
+                 & '{msbuild}' '{sln}' {msbuild_args}\n"
+            )
+        };
+
+        let command = format!(
+            "if (!(Test-Path -LiteralPath '{source_root}')) {{ \"win_looking_glass_idd: source root not found: {source_root}\"; exit 3 }}\n\
+             robocopy \"{source_root}\" {MIRROR_ROOT} /MIR /XD target .git icd\\mesa \"{mesa_exclude}\" /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
+             if ($LASTEXITCODE -ge 8) {{ \"win_looking_glass_idd: robocopy mirror sync failed (exit $LASTEXITCODE)\"; exit $LASTEXITCODE }}\n\
+             New-Item -ItemType Directory -Force -Path '{MIRROR_ROOT}\\icd\\mesa\\include\\vulkan' | Out-Null\n\
+             robocopy \"{mesa_vulkan_src}\" {MIRROR_ROOT}\\icd\\mesa\\include\\vulkan /MIR /NFL /NDL /NJH /NJS /NP /R:1 /W:1 | Out-Null\n\
+             if ($LASTEXITCODE -ge 8) {{ \"win_looking_glass_idd: Vulkan header sync failed (exit $LASTEXITCODE)\"; exit $LASTEXITCODE }}\n\
+             if (!(Test-Path -LiteralPath '{sln}')) {{ \"win_looking_glass_idd: LGIdd.sln missing after sync: {sln}\"; exit 2 }}\n\
+             {build}"
         );
 
         match run_ssh(

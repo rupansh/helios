@@ -84,14 +84,17 @@ Result:
 One upstream Looking Glass source file needed a MinGW `-Werror=format-truncation` fix in the DXGI RGB24
 postprocessor before the Windows host would compile.
 
-The IDD driver is a WDK/MSBuild project, not part of the `win_looking_glass` host-server CMake build. Build it from
-a local NTFS mirror, not directly from `Z:\`, to avoid case-sensitive share and WDK tooling issues:
+The IDD driver is a WDK/MSBuild project, not part of the `win_looking_glass` host-server CMake build. Build it with
+the dedicated MCP helper:
 
 ```text
-robocopy Z:\ C:\Users\Rupansh\helios-vgpu /MIR /XD Z:\target Z:\.git Z:\icd\mesa /XF .git ...
-robocopy Z:\icd\mesa\include\vulkan C:\Users\Rupansh\helios-vgpu\icd\mesa\include\vulkan /MIR ...
-MSBuild.exe C:\Users\Rupansh\helios-vgpu\LookingGlass\idd\LGIdd.sln /p:Configuration=Release /p:Platform=x64 /p:RunInfVerif=false /m
+win_looking_glass_idd {}
 ```
+
+`win_looking_glass_idd` mirrors the tree to local NTFS with robocopy, excludes `icd\mesa`, copies only
+`icd\mesa\include\vulkan` for the IDD Vulkan headers, then runs MSBuild on
+`C:\Users\Rupansh\helios-vgpu\LookingGlass\idd\LGIdd.sln`. This avoids both WDK build I/O on `Z:\` and Windows
+reserved-name failures from the full Mesa include tree.
 
 The current IDD build completes and emits:
 
