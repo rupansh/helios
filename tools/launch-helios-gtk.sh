@@ -229,6 +229,7 @@ elif [ "$QEMU_RENDER_GPU" != "default" ]; then
       __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
       __GLX_VENDOR_LIBRARY_NAME=nvidia
       __VK_LAYER_NV_optimus=NVIDIA_only
+      VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
       GBM_BACKEND=nvidia-drm
     )
   else
