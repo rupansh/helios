@@ -90,12 +90,17 @@ frame slot by IVSHMEM offset, and asks the IDD to post the frame to LGMP. This b
 failures fall back to the normal GDI path for that process. Set `HELIOS_LG_DIRECT=0` to force the old GDI path for
 an A/B run.
 
-The NVIDIA/default path remains available for controlled testing only:
+The NVIDIA path remains available for controlled testing only. Use the explicit `nvidia` mode rather than the vague
+host `default` mode; the launcher checks `nvidia-smi` first and forces the NVIDIA GLVND/EGL environment for QEMU:
 
 ```text
-HELIOS_QEMU_RENDER_GPU=default \
+HELIOS_QEMU_RENDER_GPU=nvidia \
   HELIOS_DISPLAY=looking-glass ./tools/launch-helios-gtk.sh
 ```
+
+If the NVIDIA kernel module reports NVRM register-read errors or `nvidia-smi` cannot talk to the driver after a run,
+the host driver is wedged below QEMU/virglrenderer. Reboot or reload the NVIDIA driver before collecting further
+Venus data; guest Helios IOCTL timings are not meaningful for that failure mode.
 
 Looking Glass KVMFR defaults to 512 MiB so the normal desktop queue and Helios overlay queue have separate frame
 pools. The host `/dev/kvmfr0` backing device must be created at the same size, or the launcher must be overridden

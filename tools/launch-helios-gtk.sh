@@ -19,7 +19,7 @@
 #   HELIOS_LG_DISPLAY_SERVER=x11 HELIOS_LG_RENDERER=OpenGL HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
 #
 # Host GPU used by QEMU/virglrenderer/Venus:
-#   HELIOS_QEMU_RENDER_GPU=default HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
+#   HELIOS_QEMU_RENDER_GPU=nvidia HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
 #
 # Host GPU used by the Looking Glass client:
 #   HELIOS_LG_RENDER_GPU=intel HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
@@ -53,8 +53,8 @@ KVMFR_DEV=${HELIOS_KVMFR_DEV:-/dev/kvmfr0}
 KVMFR_SIZE=${HELIOS_KVMFR_SIZE:-536870912}
 LG_CLIENT=${HELIOS_LG_CLIENT:-$SHARE/LookingGlass/client/build/looking-glass-client}
 LG_RENDER_GPU=${HELIOS_LG_RENDER_GPU:-default}
-LG_DISPLAY_SERVER=${HELIOS_LG_DISPLAY_SERVER:-x11}
-LG_RENDERER=${HELIOS_LG_RENDERER:-OpenGL}
+LG_DISPLAY_SERVER=${HELIOS_LG_DISPLAY_SERVER:-wayland}
+LG_RENDERER=${HELIOS_LG_RENDERER:-EGL}
 LG_ALLOW_DMA=${HELIOS_LG_ALLOW_DMA:-no}
 LG_START_CLIENT=${HELIOS_LG_START_CLIENT:-yes}
 LG_RESTART_CLIENT=${HELIOS_LG_RESTART_CLIENT:-no}
@@ -219,8 +219,22 @@ if [ "$QEMU_RENDER_GPU" = "intel" ]; then
   )
   qemu_egl_headless="egl-headless,rendernode=$INTEL_RENDER_NODE"
 elif [ "$QEMU_RENDER_GPU" != "default" ]; then
-  echo "unknown HELIOS_QEMU_RENDER_GPU=$QEMU_RENDER_GPU (expected default or intel)"
-  exit 1
+  if [ "$QEMU_RENDER_GPU" = "nvidia" ]; then
+    if ! nvidia-smi -L >/dev/null 2>&1; then
+      echo "NVIDIA driver is not healthy enough for QEMU/Venus (nvidia-smi failed)"
+      exit 1
+    fi
+    qemu_env_prefix=(
+      env
+      __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+      __GLX_VENDOR_LIBRARY_NAME=nvidia
+      __VK_LAYER_NV_optimus=NVIDIA_only
+      GBM_BACKEND=nvidia-drm
+    )
+  else
+    echo "unknown HELIOS_QEMU_RENDER_GPU=$QEMU_RENDER_GPU (expected default, intel, or nvidia)"
+    exit 1
+  fi
 fi
 
 if [ "$DISPLAY_MODE" = "looking-glass" ]; then
