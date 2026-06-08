@@ -26,12 +26,13 @@ use bytemuck::Zeroable;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy,
     VirtioGpuCtxResource, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush,
-    VirtioGpuResourceMapBlob, VirtioGpuResourceUnref, VirtioGpuRespDisplayInfo,
-    VirtioGpuRespMapInfo, VirtioGpuSetScanoutBlob, HELIOS_OPTIONAL_FEATURES,
-    HELIOS_REQUIRED_FEATURES, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_CTX_CREATE,
-    VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
+    VirtioGpuResourceMapBlob, VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref,
+    VirtioGpuRespDisplayInfo, VirtioGpuRespMapInfo, VirtioGpuSetScanoutBlob,
+    HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
+    VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
     VIRTIO_GPU_CMD_GET_DISPLAY_INFO, VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
-    VIRTIO_GPU_CMD_RESOURCE_FLUSH, VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNREF,
+    VIRTIO_GPU_CMD_RESOURCE_FLUSH, VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
+    VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNREF,
     VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE,
     VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_MAP_CACHE_MASK, VIRTIO_GPU_SHM_ID_HOST_VISIBLE,
     VIRTIO_PCI_CAP_SHARED_MEMORY_CFG,
@@ -176,6 +177,7 @@ const RESOURCE_ID_BASE: u32 = 0x1000;
 /// set is far smaller. Table-full → OutOfMemory.
 const MAX_BLOBS: usize = 256;
 const MAX_CONTEXTS: usize = 64;
+const MAX_WINDOW_RANGES: usize = MAX_BLOBS;
 
 #[derive(Clone, Copy)]
 struct ContextSlot {
@@ -226,6 +228,12 @@ struct BlobSlot {
     resource_id: u32,
     /// Blob size in bytes (from ALLOC_BLOB; MAP_BLOB needs it to size the MDL).
     size: u64,
+    /// RESOURCE_MAP_BLOB succeeded and should be paired with RESOURCE_UNMAP_BLOB.
+    mapped: bool,
+    /// Host-visible window offset used for RESOURCE_MAP_BLOB.
+    map_offset: u64,
+    /// Rounded mapped length in the host-visible window.
+    map_len: u64,
 }
 
 /// Blob registry (resource_id → metadata). The backing `Vec` is **heap**-allocated
@@ -259,14 +267,34 @@ impl BlobTable {
             ctx_id,
             resource_id,
             size,
+            mapped: false,
+            map_offset: 0,
+            map_len: 0,
         });
         Ok(())
     }
 
     /// Remove and return one blob owned by `ctx_id`.
-    fn take_one_for_ctx(&mut self, ctx_id: u32) -> Option<u32> {
+    fn take_one_for_ctx(&mut self, ctx_id: u32) -> Option<BlobSlot> {
         let idx = self.slots.iter().position(|s| s.ctx_id == ctx_id)?;
-        Some(self.slots.swap_remove(idx).resource_id)
+        Some(self.slots.swap_remove(idx))
+    }
+
+    /// Remove and return `resource_id`, if it belongs to `ctx_id`.
+    fn take(&mut self, ctx_id: u32, resource_id: u32) -> Option<BlobSlot> {
+        let idx = self
+            .slots
+            .iter()
+            .position(|s| s.ctx_id == ctx_id && s.resource_id == resource_id)?;
+        Some(self.slots.swap_remove(idx))
+    }
+
+    /// Look up one blob owned by `ctx_id`.
+    fn get(&self, ctx_id: u32, resource_id: u32) -> Option<BlobSlot> {
+        self.slots
+            .iter()
+            .find(|s| s.ctx_id == ctx_id && s.resource_id == resource_id)
+            .copied()
     }
 
     /// Look up a tracked blob's size (None if `resource_id` is unknown).
@@ -276,6 +304,30 @@ impl BlobTable {
             .find(|s| s.resource_id == resource_id)
             .map(|s| s.size)
     }
+
+    /// Mark a tracked blob as mapped into the host-visible window.
+    fn mark_mapped(
+        &mut self,
+        resource_id: u32,
+        map_offset: u64,
+        map_len: u64,
+    ) -> Result<(), VirtioError> {
+        let slot = self
+            .slots
+            .iter_mut()
+            .find(|s| s.resource_id == resource_id)
+            .ok_or(VirtioError::DeviceError)?;
+        slot.mapped = true;
+        slot.map_offset = map_offset;
+        slot.map_len = map_len;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct WindowRange {
+    offset: u64,
+    len: u64,
 }
 
 // ── Async submission (Phase 4e) ─────────────────────────────────────────────
@@ -382,11 +434,12 @@ pub struct VirtioGpu {
     /// Tracks live Venus contexts by owning file object. `EvtFileCleanup` uses
     /// this to destroy contexts if the client exits before issuing CTX_DESTROY.
     contexts: ContextTable,
-    /// Bump allocator for host-visible window offsets. Each `MAP_BLOB` claims
-    /// `[next_window_offset, next_window_offset + round_up_page(size))` and advances
-    /// the pointer. Never reclaimed (bring-up): the window is multi-GB and the ICD's
-    /// mapped working set is small. Guarded by the AdapterContext virtio lock.
+    /// High-water mark for host-visible window offsets. Freed ranges are reused
+    /// through `free_window_ranges` before this grows.
     next_window_offset: u64,
+    /// Free ranges in the host-visible window. Capacity is reserved at init so
+    /// release/map bookkeeping does not allocate under the AdapterContext lock.
+    free_window_ranges: Vec<WindowRange>,
     /// In-flight async SUBMIT_3D submissions (Phase 4e). Completions are matched
     /// by descriptor token, NOT by position: with per-queue `ring_idx` fence
     /// routing the host can retire fenced commands out of submission order, so the
@@ -515,6 +568,7 @@ impl VirtioGpu {
             blobs: BlobTable::with_reserved_capacity(),
             contexts: ContextTable::with_reserved_capacity(),
             next_window_offset: 0,
+            free_window_ranges: Vec::with_capacity(MAX_WINDOW_RANGES),
             inflight: Vec::with_capacity(MAX_INFLIGHT),
             max_submitted_fence_id: 0,
         })
@@ -605,20 +659,106 @@ impl VirtioGpu {
     }
 
     fn destroy_ctx_resources(&mut self, ctx_id: u32) -> Result<(), VirtioError> {
-        while let Some(resource_id) = self.blobs.take_one_for_ctx(ctx_id) {
-            let mut detach = VirtioGpuCtxResource::zeroed();
-            detach.hdr.type_ = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
-            detach.hdr.ctx_id = ctx_id;
-            detach.resource_id = resource_id;
-            self.ctrl_roundtrip(bytemuck::bytes_of(&detach))?;
-
-            let mut unref = VirtioGpuResourceUnref::zeroed();
-            unref.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNREF;
-            unref.resource_id = resource_id;
-            self.ctrl_roundtrip(bytemuck::bytes_of(&unref))?;
+        while let Some(slot) = self.blobs.take_one_for_ctx(ctx_id) {
+            self.release_blob_slot(slot)?;
         }
 
         Ok(())
+    }
+
+    /// Explicitly release one blob while the process is alive. This closes the
+    /// HOST3D resource leak that otherwise persisted until CTX_DESTROY.
+    pub fn release_blob(
+        &mut self,
+        ctx_id: u32,
+        resource_id: u32,
+        retired: &mut Vec<InFlight>,
+    ) -> Result<(), VirtioError> {
+        self.quiesce_into(retired)?;
+        let Some(slot) = self.blobs.get(ctx_id, resource_id) else {
+            return Ok(());
+        };
+        self.release_blob_slot(slot)?;
+        self.blobs.take(ctx_id, resource_id);
+        Ok(())
+    }
+
+    fn release_blob_slot(&mut self, slot: BlobSlot) -> Result<(), VirtioError> {
+        if slot.mapped {
+            let mut unmap = VirtioGpuResourceUnmapBlob::zeroed();
+            unmap.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
+            unmap.resource_id = slot.resource_id;
+            self.ctrl_roundtrip(bytemuck::bytes_of(&unmap))?;
+            self.free_window_range(slot.map_offset, slot.map_len);
+        }
+
+        let mut detach = VirtioGpuCtxResource::zeroed();
+        detach.hdr.type_ = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
+        detach.hdr.ctx_id = slot.ctx_id;
+        detach.resource_id = slot.resource_id;
+        self.ctrl_roundtrip(bytemuck::bytes_of(&detach))?;
+
+        let mut unref = VirtioGpuResourceUnref::zeroed();
+        unref.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+        unref.resource_id = slot.resource_id;
+        self.ctrl_roundtrip(bytemuck::bytes_of(&unref))
+    }
+
+    fn alloc_window_range(&mut self, len: u64, window_len: u64) -> Result<u64, VirtioError> {
+        if let Some(idx) = self.free_window_ranges.iter().position(|r| r.len >= len) {
+            let offset = self.free_window_ranges[idx].offset;
+            if self.free_window_ranges[idx].len == len {
+                self.free_window_ranges.swap_remove(idx);
+            } else {
+                self.free_window_ranges[idx].offset += len;
+                self.free_window_ranges[idx].len -= len;
+            }
+            return Ok(offset);
+        }
+
+        let offset = self.next_window_offset;
+        let end = offset.checked_add(len).ok_or(VirtioError::OutOfMemory)?;
+        if end > window_len {
+            return Err(VirtioError::OutOfMemory);
+        }
+
+        self.next_window_offset = end;
+        Ok(offset)
+    }
+
+    fn free_window_range(&mut self, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+
+        if offset.checked_add(len) == Some(self.next_window_offset) {
+            self.next_window_offset = offset;
+            while let Some(idx) = self
+                .free_window_ranges
+                .iter()
+                .position(|r| r.offset.checked_add(r.len) == Some(self.next_window_offset))
+            {
+                let r = self.free_window_ranges.swap_remove(idx);
+                self.next_window_offset = r.offset;
+            }
+            return;
+        }
+
+        for range in &mut self.free_window_ranges {
+            if range.offset.checked_add(range.len) == Some(offset) {
+                range.len += len;
+                return;
+            }
+            if offset.checked_add(len) == Some(range.offset) {
+                range.offset = offset;
+                range.len += len;
+                return;
+            }
+        }
+
+        if self.free_window_ranges.len() < MAX_WINDOW_RANGES {
+            self.free_window_ranges.push(WindowRange { offset, len });
+        }
     }
 
     /// Allocate a virtio-gpu blob resource in `ctx_id` and return its guest-
@@ -1004,24 +1144,23 @@ impl VirtioGpu {
         if map_len == 0 || map_len > MAX_BLOB_MAP_BYTES {
             return Err(VirtioError::DeviceError);
         }
-        // Bump-allocate a page-aligned window offset; refuse if the window is full.
-        let offset = self.next_window_offset;
-        let end = offset
-            .checked_add(map_len)
-            .ok_or(VirtioError::OutOfMemory)?;
-        if end > window.len {
-            return Err(VirtioError::OutOfMemory);
-        }
+        let offset = self.alloc_window_range(map_len, window.len)?;
 
-        // Host round-trip FIRST — only mutate `next_window_offset` on success so a
-        // rejected map leaves the allocator state unchanged.
+        // Host round-trip before recording the blob as mapped. If the host rejects
+        // the map, return the reserved aperture range for later reuse.
         let mut cmd = VirtioGpuResourceMapBlob::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
         cmd.resource_id = resource_id;
         cmd.offset = offset;
-        let map_info = self.map_blob_roundtrip(&cmd)?;
+        let map_info = match self.map_blob_roundtrip(&cmd) {
+            Ok(map_info) => map_info,
+            Err(e) => {
+                self.free_window_range(offset, map_len);
+                return Err(e);
+            }
+        };
 
-        self.next_window_offset = end;
+        self.blobs.mark_mapped(resource_id, offset, map_len)?;
         Ok(BlobMapPrep {
             gpa: window.base + offset,
             size: map_len,

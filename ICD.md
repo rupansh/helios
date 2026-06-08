@@ -41,6 +41,19 @@ HKLM\SOFTWARE\Khronos\Vulkan\Drivers\
 
 The KMD is a System-class KMDF universal INF, which **cannot write absolute `HKLM` values** — so the **ICD installer (or a postinstall script) writes this Khronos Vulkan Drivers registry value**, independent of the KMD INF. (Precedent: lavapipe and SwiftShader register via exactly this mechanism with no display adapter.)
 
+For the Mesa Venus Helios ICD, the canonical deployment command is:
+
+```powershell
+Z:\tools\install-helios-icd.ps1
+```
+
+It installs the DLL under `C:\ProgramData\HeliosVulkan` using a content-hashed
+filename, writes the JSON manifest there, removes stale Helios/Virtio registry
+entries, and registers the ProgramData manifest under the Khronos Vulkan Drivers
+key. Tests should use
+`VK_DRIVER_FILES=C:\ProgramData\HeliosVulkan\virtio_devenv_icd.x86_64.json` when
+forcing this ICD explicitly.
+
 ### 1.2 Required ICD Exports
 
 ```rust
@@ -444,6 +457,9 @@ Recent caveats:
   Doom 2016 show black/white frames and could corrupt/freeze the Linux host desktop. Intel-backed Venus is correct
   enough to play Doom, but slower. Keep Intel as the default correctness baseline until the NVIDIA path is isolated
   and fixed.
+- Do not carry NVIDIA-specific ICD workarounds in Helios. The observed host-side lockups match current NVIDIA
+  Blackwell/Xid 109 reports; keep Helios close to Linux Venus behavior and treat NVIDIA renderer tests as a host
+  driver risk until upstream changes.
 - WDDM/DXGI remains a possible future escape hatch, not the next default step. It would require a real WDDM render
   adapter path rather than only the current System-class DeviceIoControl KMD, and it would not by itself implement
   D3D12. Optimize and measure the current Venus path first.

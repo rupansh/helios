@@ -19,21 +19,21 @@ use alloc::vec::Vec;
 use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeCtxCreate, HeliosEscapeCtxDestroy, HeliosEscapeMapBlob,
-    HeliosEscapePresentBlob, HeliosEscapeSubmitVenus, HeliosEscapeWaitFence,
-    IOCTL_HELIOS_ALLOC_BLOB, IOCTL_HELIOS_CTX_CREATE, IOCTL_HELIOS_CTX_DESTROY,
-    IOCTL_HELIOS_MAP_BLOB, IOCTL_HELIOS_PRESENT_BLOB, IOCTL_HELIOS_SUBMIT_VENUS,
-    IOCTL_HELIOS_WAIT_FENCE, VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED,
-    VIRTIO_GPU_MAP_CACHE_WC,
+    HeliosEscapePresentBlob, HeliosEscapeReleaseBlob, HeliosEscapeSubmitVenus,
+    HeliosEscapeWaitFence, IOCTL_HELIOS_ALLOC_BLOB, IOCTL_HELIOS_CTX_CREATE,
+    IOCTL_HELIOS_CTX_DESTROY, IOCTL_HELIOS_MAP_BLOB, IOCTL_HELIOS_PRESENT_BLOB,
+    IOCTL_HELIOS_RELEASE_BLOB, IOCTL_HELIOS_SUBMIT_VENUS, IOCTL_HELIOS_WAIT_FENCE,
+    VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED, VIRTIO_GPU_MAP_CACHE_WC,
 };
 use wdk_sys::ntddk::{
     IoAllocateMdl, IoFreeMdl, KeDelayExecutionThread, MmMapLockedPagesSpecifyCache,
     MmUnmapLockedPages,
 };
 use wdk_sys::{
-    call_unsafe_wdf_function_binding, _MEMORY_CACHING_TYPE, LARGE_INTEGER, MDL, NTSTATUS,
-    NT_SUCCESS, PMDL, PVOID, STATUS_DEVICE_DOES_NOT_EXIST, STATUS_INSUFFICIENT_RESOURCES,
-    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER, STATUS_IO_TIMEOUT, STATUS_SUCCESS,
-    ULONG, ULONG_PTR, WDFFILEOBJECT, WDFOBJECT, WDFQUEUE, WDFREQUEST,
+    call_unsafe_wdf_function_binding, LARGE_INTEGER, MDL, NTSTATUS, NT_SUCCESS, PMDL, PVOID,
+    STATUS_DEVICE_DOES_NOT_EXIST, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,
+    STATUS_INVALID_PARAMETER, STATUS_IO_TIMEOUT, STATUS_SUCCESS, ULONG, ULONG_PTR, WDFFILEOBJECT,
+    WDFOBJECT, WDFQUEUE, WDFREQUEST, _MEMORY_CACHING_TYPE,
 };
 
 use crate::adapter::{adapter_of, AdapterContext};
@@ -87,6 +87,7 @@ pub unsafe extern "C" fn evt_io_device_control(
         IOCTL_HELIOS_ALLOC_BLOB => handle_alloc_blob(adapter, request),
         IOCTL_HELIOS_MAP_BLOB => handle_map_blob(adapter, request),
         IOCTL_HELIOS_PRESENT_BLOB => handle_present_blob(adapter, request),
+        IOCTL_HELIOS_RELEASE_BLOB => handle_release_blob(adapter, request),
         // Unknown control codes are rejected (CLAUDE.md invariant).
         _ => (STATUS_INVALID_DEVICE_REQUEST, 0),
     };
@@ -190,6 +191,37 @@ unsafe fn handle_ctx_destroy(adapter: &AdapterContext, request: WDFREQUEST) -> (
     let req: HeliosEscapeCtxDestroy = pod_read_unaligned(slice::from_raw_parts(in_ptr, sz));
     let mut retired: Vec<InFlight> = Vec::with_capacity(MAX_INFLIGHT);
     match adapter.with_virtio(|v| v.ctx_destroy(req.ctx_id, &mut retired)) {
+        Ok(Ok(())) => (STATUS_SUCCESS, 0),
+        Ok(Err(ve)) => (ve.into(), 0),
+        Err(de) => (de.into(), 0),
+    }
+}
+
+/// `IOCTL_HELIOS_RELEASE_BLOB` → release a blob before process/context teardown.
+unsafe fn handle_release_blob(adapter: &AdapterContext, request: WDFREQUEST) -> (NTSTATUS, usize) {
+    let sz = size_of::<HeliosEscapeReleaseBlob>();
+    let (in_ptr, _) = match input_buffer(request, sz) {
+        Ok(b) => b,
+        Err(s) => return (s, 0),
+    };
+    // SAFETY: WDF guaranteed ≥ sz bytes at in_ptr. Read unaligned.
+    let req: HeliosEscapeReleaseBlob = pod_read_unaligned(slice::from_raw_parts(in_ptr, sz));
+    if req.ctx_id == 0 || req.resource_id == 0 {
+        return (STATUS_INVALID_PARAMETER, 0);
+    }
+
+    // The user VA can only be unmapped in the process/file object that created it.
+    let file_object = call_unsafe_wdf_function_binding!(WdfRequestGetFileObject, request);
+    if file_object.is_null() {
+        return (STATUS_INVALID_DEVICE_REQUEST, 0);
+    }
+    let owner = file_object as usize;
+    if let Some((user_va, mdl)) = adapter.mappings.take_for_resource(owner, req.resource_id) {
+        unmap_io_pages_from_user(user_va, mdl as PMDL);
+    }
+
+    let mut retired: Vec<InFlight> = Vec::with_capacity(MAX_INFLIGHT);
+    match adapter.with_virtio(|v| v.release_blob(req.ctx_id, req.resource_id, &mut retired)) {
         Ok(Ok(())) => (STATUS_SUCCESS, 0),
         Ok(Err(ve)) => (ve.into(), 0),
         Err(de) => (de.into(), 0),

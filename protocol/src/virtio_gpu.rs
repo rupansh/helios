@@ -255,12 +255,12 @@ pub struct VirtioGpuRespDisplayInfo {
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct VirtioGpuSetScanoutBlob {
     pub hdr: VirtioGpuCtrlHdr,
-    pub r: VirtioGpuRect,  // target rect on the scanout
+    pub r: VirtioGpuRect, // target rect on the scanout
     pub scanout_id: u32,
-    pub resource_id: u32,  // a blob resource (0 disables this scanout)
-    pub width: u32,        // blob image width in pixels
-    pub height: u32,       // blob image height in pixels
-    pub format: u32,       // VIRTIO_GPU_FORMAT_*
+    pub resource_id: u32, // a blob resource (0 disables this scanout)
+    pub width: u32,       // blob image width in pixels
+    pub height: u32,      // blob image height in pixels
+    pub format: u32,      // VIRTIO_GPU_FORMAT_*
     pub padding: u32,
     pub strides: [u32; 4], // per-plane row stride in bytes
     pub offsets: [u32; 4], // per-plane byte offset into the blob
@@ -305,7 +305,10 @@ mod virtio_bindings_pin {
             assert_eq!(
                 $ours,
                 vb::$theirs as u32,
-                concat!("wire constant drift vs virtio-bindings::", stringify!($theirs)),
+                concat!(
+                    "wire constant drift vs virtio-bindings::",
+                    stringify!($theirs)
+                ),
             );
         };
     }
@@ -314,45 +317,156 @@ mod virtio_bindings_pin {
     fn ctrl_types_match_virtio_bindings() {
         use super::*;
         // 2d
-        pin!(VIRTIO_GPU_CMD_GET_DISPLAY_INFO, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_GET_DISPLAY_INFO);
-        pin!(VIRTIO_GPU_CMD_RESOURCE_CREATE_2D, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_CREATE_2D);
-        pin!(VIRTIO_GPU_CMD_RESOURCE_UNREF, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_UNREF);
-        pin!(VIRTIO_GPU_CMD_SET_SCANOUT, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_SET_SCANOUT);
-        pin!(VIRTIO_GPU_CMD_RESOURCE_FLUSH, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_FLUSH);
-        pin!(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D);
-        pin!(VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING);
-        pin!(VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING);
-        pin!(VIRTIO_GPU_CMD_GET_CAPSET_INFO, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_GET_CAPSET_INFO);
-        pin!(VIRTIO_GPU_CMD_GET_CAPSET, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_GET_CAPSET);
-        pin!(VIRTIO_GPU_CMD_GET_EDID, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_GET_EDID);
-        pin!(VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID);
-        pin!(VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB);
-        pin!(VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_SET_SCANOUT_BLOB);
+        pin!(
+            VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_GET_DISPLAY_INFO
+        );
+        pin!(
+            VIRTIO_GPU_CMD_RESOURCE_CREATE_2D,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_CREATE_2D
+        );
+        pin!(
+            VIRTIO_GPU_CMD_RESOURCE_UNREF,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_UNREF
+        );
+        pin!(
+            VIRTIO_GPU_CMD_SET_SCANOUT,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_SET_SCANOUT
+        );
+        pin!(
+            VIRTIO_GPU_CMD_RESOURCE_FLUSH,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_FLUSH
+        );
+        pin!(
+            VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D
+        );
+        pin!(
+            VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING
+        );
+        pin!(
+            VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING
+        );
+        pin!(
+            VIRTIO_GPU_CMD_GET_CAPSET_INFO,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_GET_CAPSET_INFO
+        );
+        pin!(
+            VIRTIO_GPU_CMD_GET_CAPSET,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_GET_CAPSET
+        );
+        pin!(
+            VIRTIO_GPU_CMD_GET_EDID,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_GET_EDID
+        );
+        pin!(
+            VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_ASSIGN_UUID
+        );
+        pin!(
+            VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB
+        );
+        pin!(
+            VIRTIO_GPU_CMD_SET_SCANOUT_BLOB,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_SET_SCANOUT_BLOB
+        );
         // 3d
-        pin!(VIRTIO_GPU_CMD_CTX_CREATE, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_CTX_CREATE);
-        pin!(VIRTIO_GPU_CMD_CTX_DESTROY, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_CTX_DESTROY);
-        pin!(VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE);
-        pin!(VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE);
-        pin!(VIRTIO_GPU_CMD_RESOURCE_CREATE_3D, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_CREATE_3D);
-        pin!(VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D);
-        pin!(VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D);
-        pin!(VIRTIO_GPU_CMD_SUBMIT_3D, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_SUBMIT_3D);
-        pin!(VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB);
-        pin!(VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB, virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB);
+        pin!(
+            VIRTIO_GPU_CMD_CTX_CREATE,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_CTX_CREATE
+        );
+        pin!(
+            VIRTIO_GPU_CMD_CTX_DESTROY,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_CTX_DESTROY
+        );
+        pin!(
+            VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE
+        );
+        pin!(
+            VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE
+        );
+        pin!(
+            VIRTIO_GPU_CMD_RESOURCE_CREATE_3D,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_CREATE_3D
+        );
+        pin!(
+            VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D
+        );
+        pin!(
+            VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D
+        );
+        pin!(
+            VIRTIO_GPU_CMD_SUBMIT_3D,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_SUBMIT_3D
+        );
+        pin!(
+            VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB
+        );
+        pin!(
+            VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB
+        );
         // responses
-        pin!(VIRTIO_GPU_RESP_OK_NODATA, virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_OK_NODATA);
-        pin!(VIRTIO_GPU_RESP_OK_DISPLAY_INFO, virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_OK_DISPLAY_INFO);
-        pin!(VIRTIO_GPU_RESP_OK_CAPSET_INFO, virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_OK_CAPSET_INFO);
-        pin!(VIRTIO_GPU_RESP_OK_CAPSET, virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_OK_CAPSET);
-        pin!(VIRTIO_GPU_RESP_OK_EDID, virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_OK_EDID);
-        pin!(VIRTIO_GPU_RESP_OK_RESOURCE_UUID, virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_OK_RESOURCE_UUID);
-        pin!(VIRTIO_GPU_RESP_OK_MAP_INFO, virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_OK_MAP_INFO);
-        pin!(VIRTIO_GPU_RESP_ERR_UNSPEC, virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_ERR_UNSPEC);
-        pin!(VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY, virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY);
-        pin!(VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID, virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID);
-        pin!(VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID, virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID);
-        pin!(VIRTIO_GPU_RESP_ERR_INVALID_CONTEXT_ID, virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_ERR_INVALID_CONTEXT_ID);
-        pin!(VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER, virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER);
+        pin!(
+            VIRTIO_GPU_RESP_OK_NODATA,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_OK_NODATA
+        );
+        pin!(
+            VIRTIO_GPU_RESP_OK_DISPLAY_INFO,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_OK_DISPLAY_INFO
+        );
+        pin!(
+            VIRTIO_GPU_RESP_OK_CAPSET_INFO,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_OK_CAPSET_INFO
+        );
+        pin!(
+            VIRTIO_GPU_RESP_OK_CAPSET,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_OK_CAPSET
+        );
+        pin!(
+            VIRTIO_GPU_RESP_OK_EDID,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_OK_EDID
+        );
+        pin!(
+            VIRTIO_GPU_RESP_OK_RESOURCE_UUID,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_OK_RESOURCE_UUID
+        );
+        pin!(
+            VIRTIO_GPU_RESP_OK_MAP_INFO,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_OK_MAP_INFO
+        );
+        pin!(
+            VIRTIO_GPU_RESP_ERR_UNSPEC,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_ERR_UNSPEC
+        );
+        pin!(
+            VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_ERR_OUT_OF_MEMORY
+        );
+        pin!(
+            VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_ERR_INVALID_SCANOUT_ID
+        );
+        pin!(
+            VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID
+        );
+        pin!(
+            VIRTIO_GPU_RESP_ERR_INVALID_CONTEXT_ID,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_ERR_INVALID_CONTEXT_ID
+        );
+        pin!(
+            VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER,
+            virtio_gpu_ctrl_type_VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER
+        );
     }
 
     #[test]
@@ -360,10 +474,22 @@ mod virtio_bindings_pin {
         use super::*;
         pin!(VIRTIO_GPU_BLOB_MEM_GUEST, VIRTIO_GPU_BLOB_MEM_GUEST);
         pin!(VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_BLOB_MEM_HOST3D);
-        pin!(VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST, VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST);
-        pin!(VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE);
-        pin!(VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE, VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE);
-        pin!(VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE, VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE);
+        pin!(
+            VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST,
+            VIRTIO_GPU_BLOB_MEM_HOST3D_GUEST
+        );
+        pin!(
+            VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+            VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE
+        );
+        pin!(
+            VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
+            VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE
+        );
+        pin!(
+            VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE,
+            VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE
+        );
         pin!(
             VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
             virtio_gpu_formats_VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM
@@ -379,12 +505,22 @@ mod virtio_bindings_pin {
             assert_eq!(
                 core::mem::size_of::<$ours>(),
                 core::mem::size_of::<$theirs>(),
-                concat!("size drift: ", stringify!($ours), " vs ", stringify!($theirs)),
+                concat!(
+                    "size drift: ",
+                    stringify!($ours),
+                    " vs ",
+                    stringify!($theirs)
+                ),
             );
             assert_eq!(
                 core::mem::align_of::<$ours>(),
                 core::mem::align_of::<$theirs>(),
-                concat!("align drift: ", stringify!($ours), " vs ", stringify!($theirs)),
+                concat!(
+                    "align drift: ",
+                    stringify!($ours),
+                    " vs ",
+                    stringify!($theirs)
+                ),
             );
         }};
     }
@@ -395,14 +531,23 @@ mod virtio_bindings_pin {
         pin_layout!(VirtioGpuCtrlHdr, vb::virtio_gpu_ctrl_hdr);
         pin_layout!(VirtioGpuRect, vb::virtio_gpu_rect);
         pin_layout!(VirtioGpuResourceUnref, vb::virtio_gpu_resource_unref);
-        pin_layout!(VirtioGpuDisplayOne, vb::virtio_gpu_resp_display_info_virtio_gpu_display_one);
+        pin_layout!(
+            VirtioGpuDisplayOne,
+            vb::virtio_gpu_resp_display_info_virtio_gpu_display_one
+        );
         pin_layout!(VirtioGpuRespDisplayInfo, vb::virtio_gpu_resp_display_info);
         pin_layout!(VirtioGpuCtxCreate, vb::virtio_gpu_ctx_create);
         pin_layout!(VirtioGpuCtxResource, vb::virtio_gpu_ctx_resource);
         pin_layout!(VirtioGpuCmdSubmit, vb::virtio_gpu_cmd_submit);
-        pin_layout!(VirtioGpuResourceCreateBlob, vb::virtio_gpu_resource_create_blob);
+        pin_layout!(
+            VirtioGpuResourceCreateBlob,
+            vb::virtio_gpu_resource_create_blob
+        );
         pin_layout!(VirtioGpuResourceMapBlob, vb::virtio_gpu_resource_map_blob);
-        pin_layout!(VirtioGpuResourceUnmapBlob, vb::virtio_gpu_resource_unmap_blob);
+        pin_layout!(
+            VirtioGpuResourceUnmapBlob,
+            vb::virtio_gpu_resource_unmap_blob
+        );
         pin_layout!(VirtioGpuRespMapInfo, vb::virtio_gpu_resp_map_info);
         pin_layout!(VirtioGpuSetScanoutBlob, vb::virtio_gpu_set_scanout_blob);
         pin_layout!(VirtioGpuResourceFlush, vb::virtio_gpu_resource_flush);

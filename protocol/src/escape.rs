@@ -36,6 +36,7 @@ pub const HELIOS_ESCAPE_WAIT_FENCE: u32 = 0x0006;
 /// resource on scanout 0 for zero-copy display. Not part of the steady-state
 /// protocol; removed once the DOD's `HELIOS_PRESENT_BLOB` escape supersedes it.
 pub const HELIOS_ESCAPE_PRESENT_BLOB: u32 = 0x0007;
+pub const HELIOS_ESCAPE_RELEASE_BLOB: u32 = 0x0008;
 
 /// Header for all escape commands. 16 bytes.
 #[repr(C)]
@@ -90,8 +91,8 @@ pub struct HeliosEscapeSubmitVenus {
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosEscapeCtxCreate {
     pub hdr: HeliosEscapeHeader,
-    pub capset_id: u32,   // in:  VIRTIO_GPU_CAPSET_VENUS
-    pub out_ctx_id: u32,  // out: assigned context id
+    pub capset_id: u32,  // in:  VIRTIO_GPU_CAPSET_VENUS
+    pub out_ctx_id: u32, // out: assigned context id
 }
 
 /// `HELIOS_ESCAPE_CTX_DESTROY`. 24 bytes.
@@ -115,12 +116,12 @@ pub struct HeliosEscapeCtxDestroy {
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosEscapeAllocBlob {
     pub hdr: HeliosEscapeHeader,
-    pub size: u64,             // in:  blob size in bytes
-    pub blob_id: u64,          // in:  venus device-memory id backing the blob (0 = none)
-    pub blob_flags: u32,       // in:  VIRTIO_GPU_BLOB_FLAG_*
-    pub blob_mem: u32,         // in:  VIRTIO_GPU_BLOB_MEM_*
-    pub ctx_id: u32,           // in:  owning context
-    pub out_resource_id: u32,  // out: assigned resource id
+    pub size: u64,            // in:  blob size in bytes
+    pub blob_id: u64,         // in:  venus device-memory id backing the blob (0 = none)
+    pub blob_flags: u32,      // in:  VIRTIO_GPU_BLOB_FLAG_*
+    pub blob_mem: u32,        // in:  VIRTIO_GPU_BLOB_MEM_*
+    pub ctx_id: u32,          // in:  owning context
+    pub out_resource_id: u32, // out: assigned resource id
 }
 
 /// `HELIOS_ESCAPE_MAP_BLOB`. Maps a blob into the calling process; the KMD maps
@@ -130,9 +131,21 @@ pub struct HeliosEscapeAllocBlob {
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
 pub struct HeliosEscapeMapBlob {
     pub hdr: HeliosEscapeHeader,
-    pub out_user_va: u64,  // out: user-mode virtual address of the mapping
-    pub resource_id: u32,  // in:  blob to map
-    pub map_cache: u32,    // in/out: requested/effective VIRTIO_GPU_MAP_CACHE_*
+    pub out_user_va: u64, // out: user-mode virtual address of the mapping
+    pub resource_id: u32, // in:  blob to map
+    pub map_cache: u32,   // in/out: requested/effective VIRTIO_GPU_MAP_CACHE_*
+}
+
+/// `HELIOS_ESCAPE_RELEASE_BLOB`. Unmaps this file object's user view, then
+/// detaches and unrefs the virtio-gpu blob resource. 32 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapeReleaseBlob {
+    pub hdr: HeliosEscapeHeader,
+    pub ctx_id: u32,
+    pub resource_id: u32,
+    pub flags: u32,
+    pub padding: u32,
 }
 
 /// `HELIOS_ESCAPE_WAIT_FENCE`. 32 bytes.
@@ -169,6 +182,7 @@ const _: () = {
     assert!(core::mem::size_of::<HeliosEscapeCtxCreate>() == 24);
     assert!(core::mem::size_of::<HeliosEscapeAllocBlob>() == 48);
     assert!(core::mem::size_of::<HeliosEscapeMapBlob>() == 32);
+    assert!(core::mem::size_of::<HeliosEscapeReleaseBlob>() == 32);
     assert!(core::mem::size_of::<HeliosEscapeWaitFence>() == 32);
     assert!(core::mem::size_of::<HeliosEscapePresentBlob>() == 40);
 };

@@ -32,3 +32,20 @@ win_meson(["setup","C:\\Users\\Rupansh\\helios-mesa-build","Z:\\icd\\mesa",
   "-Dbuild-tests=false","-Dperfetto=false","--buildtype=debugoptimized"])
 win_meson([])   # => compile
 ```
+
+Install the built ICD into the canonical loader location from an elevated
+PowerShell in the guest:
+
+```
+Z:\tools\install-helios-icd.ps1
+```
+
+The installer copies `vulkan_virtio.dll` from
+`C:\Users\Rupansh\helios-mesa-build\src\virtio\vulkan\` to a content-hashed
+ProgramData filename such as `vulkan_virtio-ed15edb62e6d.dll`, writes
+`C:\ProgramData\HeliosVulkan\virtio_devenv_icd.x86_64.json` with
+`library_path` pointing at that versioned DLL, removes stale Helios/Virtio Vulkan registry values, and registers the manifest under
+`HKLM\SOFTWARE\Khronos\Vulkan\Drivers`. Use that ProgramData JSON for
+`VK_DRIVER_FILES`; do not point tests at Mesa build-tree JSONs or old
+`helios-mesa-mingw` paths. The versioned DLL avoids failed installs when the
+previous ICD DLL is still mapped by a running process.

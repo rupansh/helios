@@ -135,4 +135,21 @@ impl MappingTable {
         unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
         popped
     }
+
+    /// Pop the mapping for `resource_id` owned by `owner`, if one exists. Used by
+    /// explicit BO release while the process is still alive.
+    pub fn take_for_resource(&self, owner: usize, resource_id: u32) -> Option<(u64, usize)> {
+        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.lock.get()) };
+        // SAFETY: spinlock-guarded exclusive access to the entries.
+        let entries = unsafe { &mut *self.entries.get() };
+        let popped = entries
+            .iter()
+            .position(|m| m.owner == owner && m.resource_id == resource_id)
+            .map(|i| {
+                let m = entries.swap_remove(i);
+                (m.user_va, m.mdl)
+            });
+        unsafe { KeReleaseSpinLock(self.lock.get(), irql) };
+        popped
+    }
 }

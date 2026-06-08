@@ -52,18 +52,34 @@ pub const HELIOS_FN_BASE: u32 = 0x900;
 // shifts the Access bits (14-15) of every code vs the original ARCH.md §3 table.
 
 /// Create a Venus virtio-gpu context. In/out: [`crate::HeliosEscapeCtxCreate`].
-pub const IOCTL_HELIOS_CTX_CREATE: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
+pub const IOCTL_HELIOS_CTX_CREATE: u32 = ctl_code(
+    FILE_DEVICE_UNKNOWN,
+    HELIOS_FN_BASE,
+    METHOD_BUFFERED,
+    HELIOS_IOCTL_ACCESS,
+);
 /// Destroy a context. In: [`crate::HeliosEscapeCtxDestroy`].
-pub const IOCTL_HELIOS_CTX_DESTROY: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 1, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
+pub const IOCTL_HELIOS_CTX_DESTROY: u32 = ctl_code(
+    FILE_DEVICE_UNKNOWN,
+    HELIOS_FN_BASE + 1,
+    METHOD_BUFFERED,
+    HELIOS_IOCTL_ACCESS,
+);
 /// Submit an opaque Venus command stream. Buffered header
 /// [`crate::HeliosEscapeSubmitVenus`] + Venus blob via the input MDL.
-pub const IOCTL_HELIOS_SUBMIT_VENUS: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 2, METHOD_IN_DIRECT, HELIOS_IOCTL_ACCESS);
+pub const IOCTL_HELIOS_SUBMIT_VENUS: u32 = ctl_code(
+    FILE_DEVICE_UNKNOWN,
+    HELIOS_FN_BASE + 2,
+    METHOD_IN_DIRECT,
+    HELIOS_IOCTL_ACCESS,
+);
 /// Allocate a virtio-gpu blob resource. In/out: [`crate::HeliosEscapeAllocBlob`].
-pub const IOCTL_HELIOS_ALLOC_BLOB: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 3, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
+pub const IOCTL_HELIOS_ALLOC_BLOB: u32 = ctl_code(
+    FILE_DEVICE_UNKNOWN,
+    HELIOS_FN_BASE + 3,
+    METHOD_BUFFERED,
+    HELIOS_IOCTL_ACCESS,
+);
 /// Map a blob into the calling process; returns a user VA.
 /// In/out: [`crate::HeliosEscapeMapBlob`].
 ///
@@ -72,15 +88,35 @@ pub const IOCTL_HELIOS_ALLOC_BLOB: u32 =
 /// mapping is a side effect (`MmMapLockedPagesSpecifyCache(UserMode)` in the KMD),
 /// not data copied into an output buffer, so a locked output MDL would be pure
 /// overhead. The small fixed verb fits the double-buffered system buffer.
-pub const IOCTL_HELIOS_MAP_BLOB: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 4, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
+pub const IOCTL_HELIOS_MAP_BLOB: u32 = ctl_code(
+    FILE_DEVICE_UNKNOWN,
+    HELIOS_FN_BASE + 4,
+    METHOD_BUFFERED,
+    HELIOS_IOCTL_ACCESS,
+);
 /// Wait on a fence id. In: [`crate::HeliosEscapeWaitFence`].
-pub const IOCTL_HELIOS_WAIT_FENCE: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 5, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
+pub const IOCTL_HELIOS_WAIT_FENCE: u32 = ctl_code(
+    FILE_DEVICE_UNKNOWN,
+    HELIOS_FN_BASE + 5,
+    METHOD_BUFFERED,
+    HELIOS_IOCTL_ACCESS,
+);
 /// Throwaway Phase-7 gate op (DISPLAY.md §8): present a venus blob on scanout 0.
 /// In: [`crate::HeliosEscapePresentBlob`]. Removed once the DOD path lands.
-pub const IOCTL_HELIOS_PRESENT_BLOB: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, HELIOS_FN_BASE + 6, METHOD_BUFFERED, HELIOS_IOCTL_ACCESS);
+pub const IOCTL_HELIOS_PRESENT_BLOB: u32 = ctl_code(
+    FILE_DEVICE_UNKNOWN,
+    HELIOS_FN_BASE + 6,
+    METHOD_BUFFERED,
+    HELIOS_IOCTL_ACCESS,
+);
+/// Release a blob resource and any user mapping owned by this file object.
+/// In: [`crate::HeliosEscapeReleaseBlob`].
+pub const IOCTL_HELIOS_RELEASE_BLOB: u32 = ctl_code(
+    FILE_DEVICE_UNKNOWN,
+    HELIOS_FN_BASE + 7,
+    METHOD_BUFFERED,
+    HELIOS_IOCTL_ACCESS,
+);
 
 // Lock the wire values (with Access bits 14-15 = 0b11 = read+write).
 const _: () = {
@@ -91,6 +127,7 @@ const _: () = {
     assert!(IOCTL_HELIOS_MAP_BLOB == 0x0022_E410);
     assert!(IOCTL_HELIOS_WAIT_FENCE == 0x0022_E414);
     assert!(IOCTL_HELIOS_PRESENT_BLOB == 0x0022_E418);
+    assert!(IOCTL_HELIOS_RELEASE_BLOB == 0x0022_E41C);
 };
 
 // ── Device interface GUID ───────────────────────────────────────────────────

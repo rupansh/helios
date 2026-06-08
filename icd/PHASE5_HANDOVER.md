@@ -300,6 +300,13 @@ the `vtn_*` SPIR-V→NIR link dep (link libvtn, or confirm the IOCTL transport p
   The KMDF universal INF cannot write this — an ICD installer/postinstall script does it (independent
   of the PnP device). Precedent: lavapipe + SwiftShader enumerate via exactly this with no display
   adapter. (Or just set `VK_DRIVER_FILES`/`VK_ICD_FILENAMES` env for testing.)
+- **Helios installer:** use `Z:\tools\install-helios-icd.ps1` after every Mesa ICD rebuild. It copies the
+  DLL to a content-hashed ProgramData path (`vulkan_virtio-<hash>.dll`), rewrites
+  `C:\ProgramData\HeliosVulkan\virtio_devenv_icd.x86_64.json`, removes stale Helios/Virtio registry
+  entries, and registers that ProgramData JSON under the Khronos Vulkan Drivers key. This avoids the
+  failure mode where the loader keeps using an old build-tree JSON such as
+  `C:\Users\Rupansh\helios-mesa-mingw\...`, and also avoids overwrite failures when the previous ICD
+  DLL is still mapped.
 
 ---
 
