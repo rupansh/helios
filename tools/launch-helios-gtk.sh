@@ -1,23 +1,44 @@
 #!/usr/bin/env bash
-# tools/launch-helios-gtk.sh — standalone QEMU for win11, -display gtk,gl=on (venus),
-# native Wayland, as the desktop user. Pure virtio-gpu-gl-pci (no VGA/QXL) = clean GL
-# console. virtiofs shares the repo as Z:\ so builds work in-VM.
-#   sudo bash tools/launch-helios-gtk.sh        # libvirt win11 must be shut off first
+# tools/launch-helios-gtk.sh — standalone QEMU for win11.
+#
+# Default mode keeps the original GTK GL console:
+#   sudo bash tools/launch-helios-gtk.sh
+#
+# Looking Glass mode adds KVMFR ivshmem + SPICE input and starts the git-built
+# client on the host:
+#   sudo HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
 set -uo pipefail
 USER_NAME=${SUDO_USER:-rupansh}; USER_UID=$(id -u "$USER_NAME")
 DISK=/var/lib/libvirt/images/win11.qcow2; NVRAM=/var/lib/libvirt/qemu/nvram/win11_VARS.fd
 SWSRC=/var/lib/libvirt/swtpm/bfe8dc1f-8c5b-435c-8045-1ef3a5c19053/tpm2; TPMDIR=/tmp/helios-tpm; SHARE=/home/rupansh/helios-vgpu
+DISPLAY_MODE=${HELIOS_DISPLAY:-gtk}
+KVMFR_DEV=${HELIOS_KVMFR_DEV:-/dev/kvmfr0}
+KVMFR_SIZE=${HELIOS_KVMFR_SIZE:-134217728}
+LG_CLIENT=${HELIOS_LG_CLIENT:-$SHARE/LookingGlass/client/build/looking-glass-client}
+LG_RENDER_GPU=${HELIOS_LG_RENDER_GPU:-intel}
+LG_ALLOW_DMA=${HELIOS_LG_ALLOW_DMA:-no}
+LG_START_CLIENT=${HELIOS_LG_START_CLIENT:-yes}
+LG_CLIENT_DELAY=${HELIOS_LG_CLIENT_DELAY:-12}
 if [ "${HELIOS_PHASE:-}" != "user" ]; then
   [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
   cleanup() { ip link del heltap0 2>/dev/null||true; chown libvirt-qemu:libvirt-qemu "$DISK" "$NVRAM" 2>/dev/null||true; }
   trap cleanup EXIT INT TERM
   chown "$USER_NAME" "$DISK" "$NVRAM"
+  if [ "$DISPLAY_MODE" = "looking-glass" ]; then
+    [ -e "$KVMFR_DEV" ] || { echo "missing $KVMFR_DEV (load kvmfr first)"; exit 1; }
+    chown "$USER_NAME" "$KVMFR_DEV" 2>/dev/null || true
+  fi
   mkdir -p "$TPMDIR/state"; cp -a "$SWSRC"/. "$TPMDIR/state/" 2>/dev/null || echo "WARN fresh TPM"
   chown -R "$USER_NAME" "$TPMDIR"
   ip link del heltap0 2>/dev/null||true; ip tuntap add dev heltap0 mode tap user "$USER_NAME"
   ip link set heltap0 master virbr0 && ip link set heltap0 up
   sudo -u "$USER_NAME" env HELIOS_PHASE=user XDG_RUNTIME_DIR=/run/user/$USER_UID \
-    WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1} GDK_BACKEND=wayland bash "$0"
+    WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1} GDK_BACKEND=wayland \
+    HELIOS_DISPLAY="$DISPLAY_MODE" HELIOS_KVMFR_DEV="$KVMFR_DEV" \
+    HELIOS_KVMFR_SIZE="$KVMFR_SIZE" HELIOS_LG_CLIENT="$LG_CLIENT" \
+    HELIOS_LG_RENDER_GPU="$LG_RENDER_GPU" HELIOS_LG_ALLOW_DMA="$LG_ALLOW_DMA" \
+    HELIOS_LG_START_CLIENT="$LG_START_CLIENT" HELIOS_LG_CLIENT_DELAY="$LG_CLIENT_DELAY" \
+    bash "$0"
   exit $?
 fi
 # ---- user phase (desktop user, native Wayland) ----
@@ -25,7 +46,48 @@ pkill -f 'virtiofsd.*helios-tpm' 2>/dev/null||true; pkill -f 'swtpm.*helios-tpm'
 /usr/lib/virtiofsd --shared-dir "$SHARE" --socket-path "$TPMDIR/fs.sock" --tag helios-vgpu --sandbox none &
 /usr/bin/swtpm socket --tpmstate dir="$TPMDIR/state" --ctrl type=unixio,path="$TPMDIR/swtpm-sock" --tpm2 --daemon
 sleep 1
-echo '>>> QEMU (gtk gl=on, virtio-gpu-gl-pci, native Wayland). Z:\ = repo. SSH 192.168.122.120 <<<'
+
+qemu_display_args=(-display gtk,gl=on)
+qemu_lg_args=()
+lg_client_args=()
+if [ "$DISPLAY_MODE" = "looking-glass" ]; then
+  qemu_display_args=(-display egl-headless)
+  qemu_lg_args=(
+    -spice port=5900,addr=127.0.0.1,disable-ticketing=on,image-compression=off
+    -chardev spicevmc,id=charchannel0,name=vdagent
+    -device '{"driver":"virtserialport","bus":"virtio-serial0.0","nr":1,"chardev":"charchannel0","id":"channel0","name":"com.redhat.spice.0"}'
+    -device '{"driver":"ivshmem-plain","id":"shmem0","memdev":"looking-glass"}'
+    -object "{\"qom-type\":\"memory-backend-file\",\"id\":\"looking-glass\",\"mem-path\":\"$KVMFR_DEV\",\"size\":$KVMFR_SIZE,\"share\":true}"
+  )
+
+  lg_client_args=(
+    app:shmFile="$KVMFR_DEV"
+    app:allowDMA="$LG_ALLOW_DMA"
+    spice:input=yes
+    spice:display=no
+    win:disableWaitingMessage=yes
+  )
+
+  if [ "$LG_RENDER_GPU" = "intel" ]; then
+    lg_client_env=(
+      __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json
+      DRI_PRIME=pci-0000_00_02_0
+      MESA_LOADER_DRIVER_OVERRIDE=iris
+    )
+  else
+    lg_client_env=()
+  fi
+
+  if [ "$LG_START_CLIENT" = "yes" ]; then
+    (
+      sleep "$LG_CLIENT_DELAY"
+      echo '>>> Starting Looking Glass client <<<'
+      exec env "${lg_client_env[@]}" "$LG_CLIENT" "${lg_client_args[@]}"
+    ) &
+  fi
+fi
+
+echo ">>> QEMU ($DISPLAY_MODE, virtio-gpu-gl-pci, native Wayland). Z:\\ = repo. SSH 192.168.122.120 <<<"
 exec /usr/bin/qemu-system-x86_64 \
   -name \
   guest=win11,debug-threads=on \
@@ -106,6 +168,7 @@ exec /usr/bin/qemu-system-x86_64 \
   '{"driver":"virtio-scsi-pci","id":"scsi0","bus":"pci.9","addr":"0x0"}' \
   -device \
   '{"driver":"virtio-serial-pci","id":"virtio-serial0","bus":"pci.3","addr":"0x0"}' \
+  "${qemu_lg_args[@]}" \
   -blockdev \
   '{"driver":"file","filename":"/var/lib/libvirt/images/win11.qcow2","node-name":"libvirt-1-storage","auto-read-only":true,"discard":"unmap"}' \
   -blockdev \
@@ -148,5 +211,4 @@ exec /usr/bin/qemu-system-x86_64 \
   off \
   -msg \
   timestamp=on \
-  -display \
-  gtk,gl=on
+  "${qemu_display_args[@]}"
