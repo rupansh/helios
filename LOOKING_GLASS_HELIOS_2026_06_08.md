@@ -1,25 +1,29 @@
-# Looking Glass + Helios Integration Goal
+# Looking Glass IDD Pivot Notes
 
 **Date:** 2026-06-08
 
-The current display experiment is to make the Looking Glass IDD producer mirror completed desktop frames into
-the Helios System-class Venus path, while keeping the normal Looking Glass ivshmem client stream intact.
+The direct IDD-to-Helios scanout experiment is no longer the active direction. The IDD was able to initialize
+Helios/Venus and feed nonzero test-pattern pixels into `IOCTL_HELIOS_PRESENT_BLOB`, but every host display backend
+tested either failed before scanout, showed a grey window, or showed black. The active path is back to the normal
+Looking Glass IDD producer with KVMFR/ivshmem transport. The current Helios System-class device is not a WDDM/DXGI
+adapter, so it cannot be used by IddCx as a hardware render adapter.
 
 ## Current direction
 
-- Keep the existing System-class Helios KMD and Mesa Venus ICD as the renderer/output path.
-- Use the Looking Glass IDD swapchain path as the desktop-frame producer.
-- Add an optional IDD-side sink (`HKLM\SOFTWARE\LookingGlass\IDD\HeliosEnable=1`) that:
-  1. creates a persistent exportable Venus-backed Vulkan image through the Helios ICD;
-  2. mirrors completed IDD/KVMFR BGRA frame bytes into the image's mapped memory;
-  3. submits an empty Vulkan queue operation so the Helios ICD flushes cached coherent mappings;
-  4. calls `IOCTL_HELIOS_PRESENT_BLOB` so the KMD issues `SET_SCANOUT_BLOB` + `RESOURCE_FLUSH`.
-- Preserve the standard Looking Glass LGMP/ivshmem frame path for debugging and fallback.
-- Keep the Helios sink off by default so the upstream IDD behavior is unchanged unless the registry switch is set.
+- Keep the existing System-class Helios KMD and Mesa Venus ICD for application Vulkan/DXVK/vkd3d workloads.
+- Use the Looking Glass IDD driver for the virtual desktop output.
+- Use the standard Looking Glass KVMFR/ivshmem frame path for display transport.
+- Disable the IDD Helios sink registry path by default:
+  - `HeliosEnable=0`
+  - `HeliosTestPattern=0`
+- Prefer a real hardware DXGI adapter for the IDD render/copy path only if one exists independently of Helios. The
+  IDD now logs every candidate adapter and supports an optional registry selector:
+  - `RenderAdapter=substring of DXGI adapter description`
 
-The earlier Windows host-server sink (`helios.enable=yes`) remains useful as a reference, but the active fast path
-now lives in `LookingGlass\idd\LGIdd\CHeliosSink.cpp` and is called after the D3D12 frame copy completes in
-`CSwapChainProcessor::CompletionFunction`.
+vkd3d is not a drop-in replacement inside the IDD UMDF driver. It is a D3D12-to-Vulkan user-mode runtime for
+applications. The IDD receives compositor-owned DXGI/D3D textures from Windows; the meaningful acceleration switch
+there is the DXGI render adapter selected by IddCx, not a Vulkan translation layer inside the driver. Hardware
+acceleration through Helios would require a future Helios WDDM/DXGI render adapter.
 
 ## Runtime switches
 
@@ -32,25 +36,23 @@ HKLM\SOFTWARE\LookingGlass\IDD
 Values:
 
 ```text
-HeliosEnable  DWORD   1 to enable the IDD Vulkan mirror path; default is disabled.
-HeliosGateFile REG_SZ Path used for the temporary Venus allocation-size -> resource-id handoff.
-HeliosGpu      REG_SZ Substring used to select the Venus physical device, default "Intel".
+HeliosEnable      DWORD  keep 0 for the active KVMFR/ivshmem path.
+HeliosTestPattern DWORD  keep 0; diagnostic only for the retired direct-Helios path.
+RenderAdapter     REG_SZ optional substring used to pick the IDD DXGI render adapter.
+ExtraMode         REG_SZ optional preferred mode, currently 1920x1080@60*.
 ```
 
-For WUDFHost/LocalService, keep `HeliosGateFile` under a service-writable directory, not a user profile:
+The standalone launcher now uses KVMFR by default for Looking Glass mode:
 
 ```text
-HeliosGateFile = C:\ProgramData\HeliosVulkan\helios_lg_idd_resid.txt
+HELIOS_DISPLAY=looking-glass ./tools/launch-helios-gtk.sh
 ```
 
-The Mesa Helios renderer reads `HELIOS_GATE_RESID_FILE` with `GetEnvironmentVariableA`, not CRT `getenv()`, so the
-handoff still works when the ICD is statically linked and loaded into a process using a different CRT.
-
-Client-side SPICE display fallback is now opt-in with `spice:display=yes`. For Helios/IDD testing, keep the client
-on the KVMFR stream while still allowing SPICE input:
+This attaches `/dev/kvmfr0` as ivshmem, enables SPICE input, starts the git-built Looking Glass client, and keeps
+the QEMU display backend headless. A SPICE-display client fallback remains available:
 
 ```text
-LookingGlass/client/build/looking-glass-client app:shmFile=/dev/kvmfr0 spice:input=yes spice:display=no
+HELIOS_DISPLAY=looking-glass HELIOS_LG_TRANSPORT=spice ./tools/launch-helios-gtk.sh
 ```
 
 ## Build tooling
@@ -159,29 +161,31 @@ GPU1: Virtio-GPU Venus (llvmpipe ...), driverName=venus
 
 ## Current validation
 
-Validated on 2026-06-08:
+Validated/changed on 2026-06-08:
 
 - `vulkaninfo --summary` works both interactively and as LocalService using the ProgramData ICD registration.
-- Restarting the Looking Glass IDD initializes the Helios Vulkan sink inside WUDFHost.
-- The IDD sink creates a persistent 1920x1080 BGRA Venus scanout image:
-
-```text
-Helios: IDD scanout image 1920x1080 res_id=4180 stride=7680 offset=0 memFlags=0xf
-```
-
-- A short git-built Looking Glass client run stays on the IDD/KVMFR stream:
-
-```text
-LookingGlass/client/build/looking-glass-client app:shmFile=/dev/kvmfr0 spice:input=yes spice:display=no win:disableWaitingMessage=yes
-```
-
-The IDD log showed no `PRESENT_BLOB` failure during that smoke run.
+- Direct IDD-to-Helios scanout was abandoned after black/grey output despite nonzero test-pattern input.
+- IDD rollback build installed as a new driver package; `HeliosEnable=0` and `HeliosTestPattern=0`.
+- IDD now logs DXGI render-adapter candidates and selection.
+- `HELIOS_DISPLAY=looking-glass` in the standalone script defaults back to KVMFR/ivshmem transport.
+- The standalone script shuts down the VM through QMP/ACPI when the Looking Glass client exits.
+- IDD capture now drops a frame instead of waiting up to 100 ms when all D3D12 copy queues are busy. This favors
+  fresh display output over freeze-then-catch-up behavior.
+- The IddCx 1.10 HDR/WCG path now advertises 10 bpc only, so Windows is pushed toward `FRAME_TYPE_RGBA10` instead
+  of selecting the 8-bit BGRA path.
 
 ## Open items
 
-- Decide whether `HELIOS_GATE_RESID_FILE` remains acceptable for the prototype or should be replaced by a real
-  Helios Vulkan extension / private query API that returns the backing virtio resource id for a memory object.
-- Replace the prototype CPU copy with a true fast path: copy or alias the completed IDD D3D12 frame into a
-  Venus-exportable image without a CPU round trip, then present the same blob via `IOCTL_HELIOS_PRESENT_BLOB`.
-- Investigate the transient `IddCxSwapChainSetDevice` keyed-mutex-abandoned log seen immediately after IDD
-  restart; the second swapchain start recovered and produced frames.
+- Boot with the standalone KVMFR path and confirm the IDD monitor is not phantom.
+- Inspect `C:\ProgramData\Looking Glass (IDD)\looking-glass-idd.txt` for:
+  - `IDD render adapter[...]`
+  - `IDD selected render adapter: ...`
+  - `Created CD3D12Device`
+  - `D3D12 copy queues busy, dropping frame` only under real capture pressure
+- Inspect the Linux client log for `FRAME_TYPE_RGBA10` after a display replug or guest reboot.
+- If a non-Helios hardware DXGI adapter exists and the selected adapter is wrong, set:
+
+```powershell
+New-ItemProperty -Path HKLM:\SOFTWARE\LookingGlass\IDD `
+  -Name RenderAdapter -Value "<substring>" -PropertyType String -Force
+```

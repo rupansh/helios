@@ -2,29 +2,78 @@
 # tools/launch-helios-gtk.sh — standalone QEMU for win11.
 #
 # Default mode keeps the original GTK GL console:
-#   sudo bash tools/launch-helios-gtk.sh
+#   bash tools/launch-helios-gtk.sh
 #
 # Looking Glass mode adds KVMFR ivshmem + SPICE input and starts the git-built
 # client on the host:
-#   sudo HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
+#   HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
+#
+# Transport overrides:
+#   HELIOS_DISPLAY=looking-glass HELIOS_LG_TRANSPORT=spice bash tools/launch-helios-gtk.sh
+#
+# Ctrl-C requests ACPI shutdown by default. To stop only the LG client and leave
+# the VM running:
+#   HELIOS_INT_ACTION=client HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
+#
+# Host client display backend:
+#   HELIOS_LG_DISPLAY_SERVER=x11 HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
+#
+# If another VM is holding 5900:
+#   HELIOS_SPICE_PORT=5901 HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
 set -uo pipefail
+
+if [ "${HELIOS_PHASE:-}" != "user" ] && [ "$(id -u)" -ne 0 ]; then
+  exec sudo --preserve-env=HELIOS_DISPLAY,HELIOS_LG_TRANSPORT,HELIOS_SPICE_PORT,HELIOS_KVMFR_DEV,HELIOS_KVMFR_SIZE,HELIOS_LG_CLIENT,HELIOS_LG_RENDER_GPU,HELIOS_LG_DISPLAY_SERVER,HELIOS_LG_RENDERER,HELIOS_LG_ALLOW_DMA,HELIOS_LG_START_CLIENT,HELIOS_LG_RESTART_CLIENT,HELIOS_LG_CLIENT_DELAY,HELIOS_LG_CLIENT_LOG,HELIOS_INT_ACTION,DISPLAY,WAYLAND_DISPLAY,GDK_BACKEND,SDL_VIDEODRIVER \
+    bash "$0" "$@"
+fi
+
 USER_NAME=${SUDO_USER:-rupansh}; USER_UID=$(id -u "$USER_NAME")
 DISK=/var/lib/libvirt/images/win11.qcow2; NVRAM=/var/lib/libvirt/qemu/nvram/win11_VARS.fd
 SWSRC=/var/lib/libvirt/swtpm/bfe8dc1f-8c5b-435c-8045-1ef3a5c19053/tpm2; TPMDIR=/tmp/helios-tpm; SHARE=/home/rupansh/helios-vgpu
 DISPLAY_MODE=${HELIOS_DISPLAY:-gtk}
+LG_TRANSPORT=${HELIOS_LG_TRANSPORT:-kvmfr}
+SPICE_PORT=${HELIOS_SPICE_PORT:-5900}
 KVMFR_DEV=${HELIOS_KVMFR_DEV:-/dev/kvmfr0}
 KVMFR_SIZE=${HELIOS_KVMFR_SIZE:-134217728}
 LG_CLIENT=${HELIOS_LG_CLIENT:-$SHARE/LookingGlass/client/build/looking-glass-client}
-LG_RENDER_GPU=${HELIOS_LG_RENDER_GPU:-intel}
+LG_RENDER_GPU=${HELIOS_LG_RENDER_GPU:-default}
+LG_DISPLAY_SERVER=${HELIOS_LG_DISPLAY_SERVER:-x11}
+LG_RENDERER=${HELIOS_LG_RENDERER:-auto}
 LG_ALLOW_DMA=${HELIOS_LG_ALLOW_DMA:-no}
 LG_START_CLIENT=${HELIOS_LG_START_CLIENT:-yes}
+LG_RESTART_CLIENT=${HELIOS_LG_RESTART_CLIENT:-no}
 LG_CLIENT_DELAY=${HELIOS_LG_CLIENT_DELAY:-12}
+LG_CLIENT_LOG=${HELIOS_LG_CLIENT_LOG:-/tmp/helios-looking-glass-client.log}
+INT_ACTION=${HELIOS_INT_ACTION:-shutdown}
 if [ "${HELIOS_PHASE:-}" != "user" ]; then
   [ "$(id -u)" -eq 0 ] || { echo "run with sudo"; exit 1; }
-  cleanup() { ip link del heltap0 2>/dev/null||true; chown libvirt-qemu:libvirt-qemu "$DISK" "$NVRAM" 2>/dev/null||true; }
-  trap cleanup EXIT INT TERM
+  USER_PHASE_PID=
+  cleanup() {
+    trap - EXIT INT TERM
+    if [ -n "${USER_PHASE_PID:-}" ]; then
+      kill "$USER_PHASE_PID" 2>/dev/null || true
+      wait "$USER_PHASE_PID" 2>/dev/null || true
+    fi
+    ip link del heltap0 2>/dev/null||true
+    chown libvirt-qemu:libvirt-qemu "$DISK" "$NVRAM" 2>/dev/null||true
+  }
+  handle_root_int() {
+    if [ "$INT_ACTION" = "shutdown" ]; then
+      echo '>>> SIGINT received; requesting clean VM shutdown. <<<'
+      if [ -n "${USER_PHASE_PID:-}" ]; then
+        kill -INT "$USER_PHASE_PID" 2>/dev/null || true
+        wait "$USER_PHASE_PID" 2>/dev/null || true
+        USER_PHASE_PID=
+      fi
+      cleanup
+      exit 130
+    fi
+    echo '>>> SIGINT received; leaving VM running. <<<'
+  }
+  trap cleanup EXIT TERM
+  trap handle_root_int INT
   chown "$USER_NAME" "$DISK" "$NVRAM"
-  if [ "$DISPLAY_MODE" = "looking-glass" ]; then
+  if [ "$DISPLAY_MODE" = "looking-glass" ] && [ "$LG_TRANSPORT" = "kvmfr" ]; then
     [ -e "$KVMFR_DEV" ] || { echo "missing $KVMFR_DEV (load kvmfr first)"; exit 1; }
     chown "$USER_NAME" "$KVMFR_DEV" 2>/dev/null || true
   fi
@@ -33,40 +82,152 @@ if [ "${HELIOS_PHASE:-}" != "user" ]; then
   ip link del heltap0 2>/dev/null||true; ip tuntap add dev heltap0 mode tap user "$USER_NAME"
   ip link set heltap0 master virbr0 && ip link set heltap0 up
   sudo -u "$USER_NAME" env HELIOS_PHASE=user XDG_RUNTIME_DIR=/run/user/$USER_UID \
-    WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1} GDK_BACKEND=wayland \
-    HELIOS_DISPLAY="$DISPLAY_MODE" HELIOS_KVMFR_DEV="$KVMFR_DEV" \
+    DISPLAY=${DISPLAY:-:0} WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-1} GDK_BACKEND=${GDK_BACKEND:-wayland,x11,*} SDL_VIDEODRIVER=${SDL_VIDEODRIVER:-wayland} \
+    HELIOS_DISPLAY="$DISPLAY_MODE" HELIOS_LG_TRANSPORT="$LG_TRANSPORT" HELIOS_SPICE_PORT="$SPICE_PORT" HELIOS_KVMFR_DEV="$KVMFR_DEV" \
     HELIOS_KVMFR_SIZE="$KVMFR_SIZE" HELIOS_LG_CLIENT="$LG_CLIENT" \
-    HELIOS_LG_RENDER_GPU="$LG_RENDER_GPU" HELIOS_LG_ALLOW_DMA="$LG_ALLOW_DMA" \
-    HELIOS_LG_START_CLIENT="$LG_START_CLIENT" HELIOS_LG_CLIENT_DELAY="$LG_CLIENT_DELAY" \
-    bash "$0"
-  exit $?
+    HELIOS_LG_RENDER_GPU="$LG_RENDER_GPU" HELIOS_LG_DISPLAY_SERVER="$LG_DISPLAY_SERVER" HELIOS_LG_RENDERER="$LG_RENDERER" HELIOS_LG_ALLOW_DMA="$LG_ALLOW_DMA" \
+    HELIOS_LG_START_CLIENT="$LG_START_CLIENT" HELIOS_LG_RESTART_CLIENT="$LG_RESTART_CLIENT" \
+    HELIOS_LG_CLIENT_DELAY="$LG_CLIENT_DELAY" HELIOS_LG_CLIENT_LOG="$LG_CLIENT_LOG" \
+    HELIOS_INT_ACTION="$INT_ACTION" \
+    bash "$0" &
+  USER_PHASE_PID=$!
+  while kill -0 "$USER_PHASE_PID" 2>/dev/null; do
+    wait "$USER_PHASE_PID"
+    USER_PHASE_STATUS=$?
+    if [ "$USER_PHASE_STATUS" -eq 130 ] && [ "$INT_ACTION" != "shutdown" ]; then
+      continue
+    fi
+    break
+  done
+  USER_PHASE_PID=
+  exit "$USER_PHASE_STATUS"
 fi
 # ---- user phase (desktop user, native Wayland) ----
 pkill -f 'virtiofsd.*helios-tpm' 2>/dev/null||true; pkill -f 'swtpm.*helios-tpm' 2>/dev/null||true
+VIRTIOFSD_PID=
+LG_CLIENT_PID=
+QEMU_PID=
+
+qmp_cmd() {
+  command -v socat >/dev/null 2>&1 || return 1
+  [ -S "$TPMDIR/mon.sock" ] || return 1
+  printf '%s\n%s\n' '{"execute":"qmp_capabilities"}' "$1" | socat - "UNIX-CONNECT:$TPMDIR/mon.sock" >/dev/null 2>&1
+}
+
+shutdown_qemu() {
+  [ -n "${QEMU_PID:-}" ] || return 0
+  kill -0 "$QEMU_PID" 2>/dev/null || return 0
+
+  echo '>>> Requesting guest shutdown <<<'
+  if qmp_cmd '{"execute":"system_powerdown"}'; then
+    for _ in $(seq 1 45); do
+      kill -0 "$QEMU_PID" 2>/dev/null || return 0
+      sleep 1
+    done
+  fi
+
+  echo '>>> Guest did not stop, asking QEMU to quit <<<'
+  qmp_cmd '{"execute":"quit"}' || true
+  for _ in $(seq 1 10); do
+    kill -0 "$QEMU_PID" 2>/dev/null || return 0
+    sleep 1
+  done
+
+  echo '>>> QEMU did not quit, terminating process <<<'
+  kill "$QEMU_PID" 2>/dev/null || true
+  for _ in $(seq 1 5); do
+    kill -0 "$QEMU_PID" 2>/dev/null || return 0
+    sleep 1
+  done
+  kill -KILL "$QEMU_PID" 2>/dev/null || true
+}
+
+cleanup_user() {
+  trap - EXIT TERM
+  trap - INT
+  if [ -n "${LG_CLIENT_PID:-}" ]; then
+    kill "$LG_CLIENT_PID" 2>/dev/null || true
+    wait "$LG_CLIENT_PID" 2>/dev/null || true
+  fi
+  shutdown_qemu
+  if [ -n "${QEMU_PID:-}" ]; then
+    wait "$QEMU_PID" 2>/dev/null || true
+  fi
+  if [ -n "${VIRTIOFSD_PID:-}" ]; then
+    kill "$VIRTIOFSD_PID" 2>/dev/null || true
+    wait "$VIRTIOFSD_PID" 2>/dev/null || true
+  fi
+  pkill -f 'swtpm.*helios-tpm' 2>/dev/null || true
+}
+handle_user_int() {
+  if [ "$INT_ACTION" = "shutdown" ]; then
+    cleanup_user
+    exit 130
+  fi
+  if [ -n "${LG_CLIENT_PID:-}" ]; then
+    echo '>>> SIGINT received; stopping Looking Glass client supervisor, VM remains running. <<<'
+    kill "$LG_CLIENT_PID" 2>/dev/null || true
+    wait "$LG_CLIENT_PID" 2>/dev/null || true
+    LG_CLIENT_PID=
+  else
+    echo '>>> SIGINT received; VM remains running. <<<'
+  fi
+}
+trap cleanup_user EXIT TERM
+trap handle_user_int INT
+
 /usr/lib/virtiofsd --shared-dir "$SHARE" --socket-path "$TPMDIR/fs.sock" --tag helios-vgpu --sandbox none &
-/usr/bin/swtpm socket --tpmstate dir="$TPMDIR/state" --ctrl type=unixio,path="$TPMDIR/swtpm-sock" --tpm2 --daemon
+VIRTIOFSD_PID=$!
+/usr/bin/swtpm socket --tpmstate dir="$TPMDIR/state" --ctrl type=unixio,path="$TPMDIR/swtpm-sock" --tpm2 --daemon --pid file="$TPMDIR/swtpm.pid"
 sleep 1
 
 qemu_display_args=(-display gtk,gl=on)
 qemu_lg_args=()
 lg_client_args=()
+lg_client_env_prefix=(env)
 if [ "$DISPLAY_MODE" = "looking-glass" ]; then
-  qemu_display_args=(-display egl-headless)
-  qemu_lg_args=(
-    -spice port=5900,addr=127.0.0.1,disable-ticketing=on,image-compression=off
-    -chardev spicevmc,id=charchannel0,name=vdagent
-    -device '{"driver":"virtserialport","bus":"virtio-serial0.0","nr":1,"chardev":"charchannel0","id":"channel0","name":"com.redhat.spice.0"}'
-    -device '{"driver":"ivshmem-plain","id":"shmem0","memdev":"looking-glass"}'
-    -object "{\"qom-type\":\"memory-backend-file\",\"id\":\"looking-glass\",\"mem-path\":\"$KVMFR_DEV\",\"size\":$KVMFR_SIZE,\"share\":true}"
-  )
-
-  lg_client_args=(
-    app:shmFile="$KVMFR_DEV"
-    app:allowDMA="$LG_ALLOW_DMA"
-    spice:input=yes
-    spice:display=no
-    win:disableWaitingMessage=yes
-  )
+  if [ "$LG_TRANSPORT" = "kvmfr" ]; then
+    qemu_display_args=(-display egl-headless)
+    qemu_lg_args=(
+      -spice port="$SPICE_PORT",addr=127.0.0.1,disable-ticketing=on,image-compression=off
+      -chardev spicevmc,id=charchannel0,name=vdagent
+      -device '{"driver":"virtserialport","bus":"virtio-serial0.0","nr":1,"chardev":"charchannel0","id":"channel0","name":"com.redhat.spice.0"}'
+      -device '{"driver":"ivshmem-plain","id":"shmem0","memdev":"looking-glass"}'
+      -object "{\"qom-type\":\"memory-backend-file\",\"id\":\"looking-glass\",\"mem-path\":\"$KVMFR_DEV\",\"size\":$KVMFR_SIZE,\"share\":true}"
+    )
+    lg_client_args=(
+      app:shmFile="$KVMFR_DEV"
+      app:allowDMA="$LG_ALLOW_DMA"
+      spice:input=yes
+      spice:host=127.0.0.1
+      spice:port="$SPICE_PORT"
+      spice:display=no
+      win:size=1920x1080
+      win:setGuestRes=no
+      win:disableWaitingMessage=yes
+    )
+  elif [ "$LG_TRANSPORT" = "spice" ]; then
+    qemu_display_args=(-display egl-headless)
+    qemu_lg_args=(
+      -spice port="$SPICE_PORT",addr=127.0.0.1,disable-ticketing=on,image-compression=off
+      -chardev spicevmc,id=charchannel0,name=vdagent
+      -device '{"driver":"virtserialport","bus":"virtio-serial0.0","nr":1,"chardev":"charchannel0","id":"channel0","name":"com.redhat.spice.0"}'
+    )
+    lg_client_args=(
+      app:lgmp=no
+      app:allowDMA=no
+      spice:input=yes
+      spice:host=127.0.0.1
+      spice:port="$SPICE_PORT"
+      spice:display=yes
+      win:size=1920x1080
+      win:setGuestRes=no
+      win:disableWaitingMessage=yes
+    )
+  else
+    echo "unknown HELIOS_LG_TRANSPORT=$LG_TRANSPORT (expected kvmfr or spice)"
+    exit 1
+  fi
 
   if [ "$LG_RENDER_GPU" = "intel" ]; then
     lg_client_env=(
@@ -78,17 +239,66 @@ if [ "$DISPLAY_MODE" = "looking-glass" ]; then
     lg_client_env=()
   fi
 
+  if [ "$LG_DISPLAY_SERVER" = "x11" ]; then
+    lg_client_env_prefix=(env -u WAYLAND_DISPLAY)
+    lg_client_env+=(
+      DISPLAY="${DISPLAY:-:0}"
+      GDK_BACKEND=x11
+      SDL_VIDEODRIVER=x11
+    )
+    if [ "$LG_RENDERER" = "auto" ]; then
+      LG_RENDERER=OpenGL
+    fi
+  elif [ "$LG_DISPLAY_SERVER" = "wayland" ]; then
+    lg_client_env+=(
+      WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}"
+      GDK_BACKEND=wayland
+      SDL_VIDEODRIVER=wayland
+    )
+  elif [ "$LG_DISPLAY_SERVER" != "auto" ]; then
+    echo "unknown HELIOS_LG_DISPLAY_SERVER=$LG_DISPLAY_SERVER (expected x11, wayland, or auto)"
+    exit 1
+  fi
+
+  if [ "$LG_RENDERER" != "auto" ]; then
+    lg_client_args+=(app:renderer="$LG_RENDERER")
+  fi
+
   if [ "$LG_START_CLIENT" = "yes" ]; then
     (
       sleep "$LG_CLIENT_DELAY"
-      echo '>>> Starting Looking Glass client <<<'
-      exec env "${lg_client_env[@]}" "$LG_CLIENT" "${lg_client_args[@]}"
+      restart_count=0
+      while true; do
+        echo ">>> Starting Looking Glass client (log: $LG_CLIENT_LOG) <<<"
+        start_time=$(date +%s)
+        {
+          printf '\n=== Looking Glass client start %s ===\n' "$(date --iso-8601=seconds)"
+          "${lg_client_env_prefix[@]}" "${lg_client_env[@]}" "$LG_CLIENT" "${lg_client_args[@]}"
+          status=$?
+          printf '=== Looking Glass client exited status=%s %s ===\n' "$status" "$(date --iso-8601=seconds)"
+        } >>"$LG_CLIENT_LOG" 2>&1
+        [ "$LG_RESTART_CLIENT" = "yes" ] || exit "$status"
+
+        run_time=$(( $(date +%s) - start_time ))
+        if [ "$run_time" -lt 5 ]; then
+          restart_count=$((restart_count + 1))
+          if [ "$restart_count" -ge 5 ]; then
+            echo ">>> Looking Glass client failed quickly $restart_count times; not restarting. See $LG_CLIENT_LOG <<<"
+            exit "$status"
+          fi
+          sleep $((restart_count * 2))
+        else
+          restart_count=0
+          sleep 2
+        fi
+      done
     ) &
+    LG_CLIENT_PID=$!
   fi
 fi
 
 echo ">>> QEMU ($DISPLAY_MODE, virtio-gpu-gl-pci, native Wayland). Z:\\ = repo. SSH 192.168.122.120 <<<"
-exec /usr/bin/qemu-system-x86_64 \
+setsid /usr/bin/qemu-system-x86_64 \
   -name \
   guest=win11,debug-threads=on \
   -blockdev \
@@ -123,7 +333,6 @@ exec /usr/bin/qemu-system-x86_64 \
   base=localtime,driftfix=slew \
   -global \
   kvm-pit.lost_tick_policy=delay \
-  -no-shutdown \
   -global \
   ICH9-LPC.disable_s3=1 \
   -global \
@@ -211,4 +420,27 @@ exec /usr/bin/qemu-system-x86_64 \
   off \
   -msg \
   timestamp=on \
-  "${qemu_display_args[@]}"
+  "${qemu_display_args[@]}" &
+QEMU_PID=$!
+while kill -0 "$QEMU_PID" 2>/dev/null; do
+  if [ -n "${LG_CLIENT_PID:-}" ] && ! kill -0 "$LG_CLIENT_PID" 2>/dev/null; then
+    wait "$LG_CLIENT_PID" 2>/dev/null
+    RUN_STATUS=$?
+    LG_CLIENT_PID=
+    echo '>>> Looking Glass client exited; requesting clean VM shutdown. <<<'
+    shutdown_qemu
+    if [ -n "${QEMU_PID:-}" ]; then
+      wait "$QEMU_PID" 2>/dev/null || true
+      QEMU_PID=
+    fi
+    break
+  fi
+
+  sleep 1
+done
+if [ -n "${QEMU_PID:-}" ]; then
+  wait "$QEMU_PID"
+  RUN_STATUS=$?
+fi
+QEMU_PID=
+exit "$RUN_STATUS"
