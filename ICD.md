@@ -446,13 +446,17 @@ Recent caveats:
   to split a software-present frame into common WSI fence wait, memory invalidate, Win32 copy, `GetDC`, and
   `StretchDIBits` cost. Keep `HELIOS_PERF_LIVE` unset for Doom runs; live per-IOCTL logging perturbs timing.
 - The Win32 software WSI backend copies mapped Venus image data into the normal DIB by default before calling
-  `StretchDIBits`. Directly passing the mapped Venus image to GDI is kept only as `HELIOS_WSI_DIRECT_MAP=1` for A/B
-  testing because GDI reads from that mapped memory measured much slower on Doom.
+  GDI. The fallback path keeps GDI on its own DIB section and presents with `BitBlt`; directly passing the mapped
+  Venus image to GDI is kept only as `HELIOS_WSI_DIRECT_MAP=1` for A/B testing. The real bottleneck was cache
+  coherency when GDI read the Venus-mapped BAR memory directly, not `StretchDIBits` being inherently slow.
 - The direct Looking Glass producer path is enabled by default. Mesa Win32 WSI opens the dedicated
   `\\.\pipe\LookingGlassIDDHelios` pipe, maps the IVSHMEM/KVMFR device, asks the IDD for a writable frame slot,
   copies the Venus software-present image into that slot, and asks the IDD to post the LGMP frame. If pipe setup,
   IVSHMEM mapping, acquire, or commit fails, the ICD disables the path for the process and falls back to GDI. Set
   `HELIOS_LG_DIRECT=0` to opt out and force the old GDI path for a process.
+- After switching the GDI fallback to DIB-shadow + `BitBlt`, `HELIOS_LG_DIRECT=0` has measured roughly as fast as
+  `HELIOS_LG_DIRECT=1`. Keep both paths for now while testing, but the direct Looking Glass producer path is no
+  longer assumed to be a required performance path and can be removed if it continues to show no benefit.
 - Host renderer choice is now a first-order test variable. On this machine, NVIDIA-backed virglrenderer/Venus made
   Doom 2016 show black/white frames and could corrupt/freeze the Linux host desktop. Intel-backed Venus is correct
   enough to play Doom, but slower. Keep Intel as the default correctness baseline until the NVIDIA path is isolated
