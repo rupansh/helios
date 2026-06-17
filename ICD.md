@@ -449,13 +449,9 @@ Recent caveats:
   GDI. The fallback path keeps GDI on its own DIB section and presents with `BitBlt`; directly passing the mapped
   Venus image to GDI is kept only as `HELIOS_WSI_DIRECT_MAP=1` for A/B testing. The real bottleneck was cache
   coherency when GDI read the Venus-mapped BAR memory directly, not `StretchDIBits` being inherently slow.
-- The direct Looking Glass producer path is **opt-in** (`HELIOS_LG_DIRECT=1`; default off since 2026-06-10). When
-  enabled, Mesa Win32 WSI opens the dedicated `\\.\pipe\LookingGlassIDDHelios` pipe, maps the IVSHMEM/KVMFR device,
-  asks the IDD for a writable frame slot, copies the Venus software-present image into that slot, and asks the IDD
-  to post the LGMP frame. If pipe setup, IVSHMEM mapping, acquire, or commit fails, the ICD disables the path for
-  the process and falls back to GDI. The default GDI DIB-shadow + `BitBlt` path measures equivalently (Doom at the
-  200 fps engine cap on NVIDIA uses it), which is why direct is no longer the default; it can be removed entirely
-  if it continues to show no benefit.
+- The direct Looking Glass producer path (`HELIOS_LG_DIRECT`, `\\.\pipe\LookingGlassIDDHelios`, and the client-side
+  Helios overlay queue) was removed on 2026-06-17. The default GDI DIB-shadow + `BitBlt` path measures equivalently
+  after the cache-coherency fix, so the extra KVMFR overlay producer only added maintenance risk.
 - **NVIDIA host renderer: root cause found and fixed (2026-06-10).** The Doom-on-NVIDIA white screen (working only
   early after host boot, escalating to Xid 31 `FAULT_UNSUPPORTED_APERTURE` GPU faults and Xid 13 FECS fatals) was
   spec-violating Venus behavior that ANV tolerates and NVIDIA does not: vkr force-exports every HOST_VISIBLE

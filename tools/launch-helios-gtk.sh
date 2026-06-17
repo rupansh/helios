@@ -31,7 +31,7 @@
 # If another VM is holding 5900:
 #   HELIOS_SPICE_PORT=5901 HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
 #
-# Looking Glass KVMFR defaults to 512 MiB for desktop + Helios overlay queues.
+# Looking Glass KVMFR defaults to 512 MiB for the normal desktop stream.
 # Ensure /dev/kvmfr0 was created with the same size, or override:
 #   HELIOS_KVMFR_SIZE=134217728 HELIOS_DISPLAY=looking-glass bash tools/launch-helios-gtk.sh
 set -uo pipefail
