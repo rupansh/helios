@@ -22,6 +22,8 @@ System\ Volume\ Information
 # Local environment overrides
 .env
 *.local.toml
+/.vm/
+/tibix/
 
 # Windows share junk
 $RECYCLE.BIN/
@@ -59,3 +61,6 @@ __pycache__/
 # umd12/bindgen/cached/ are deliberately COMMITTED and must not be ignored.
 /umd12/target/
 /umd_common/target/
+
+# Local reverse-engineering and compatibility investigation notes
+/INVESTIGATIONS/
