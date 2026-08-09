@@ -2,10 +2,11 @@
 name = "helios_protocol"
 version = "0.1.0"
 edition = "2021"
-description = "Shared no_std wire-format definitions for the Helios vGPU ICD <-> KMD <-> virtio-gpu path. Single source of truth so the ICD and KMD can never drift on struct layout."
+description = "Shared no_std wire-format definitions for the Helios vGPU UMD/ICD <-> KMD <-> virtio-gpu/QEMU path: HWA2/HOB1/HOS1/HOC1, HQA1/HTS1, HVC1/HNR2/HVM1/HVR1, HPM1, and the ETW schema. Single source of truth (including the atomic package generation) so no two halves of a boundary can drift on struct layout."
 
 [lib]
-# Pure definitions: usable from the no_std KMD, the std ICD, and the host tool.
+# Pure definitions: usable from the no_std KMD, the std UMDs/ICD, and host tools.
+# Layout is pinned by `const` assertions, so a wrong offset breaks the build.
 crate-type = ["lib"]
 
 [dependencies]
