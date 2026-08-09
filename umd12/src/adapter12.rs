@@ -101,34 +101,24 @@ const fn ddi12_supported(interface_version: u32, build_version: u32) -> u64 {
     ((interface_version as u64) << 32) | ((build_version as u64) << 16)
 }
 
-/// `D3D12DDI_BUILD_VERSION_0116` — **the one hand-written DDI ABI value in this
-/// crate**, and the comment below is what licenses it.
+/// `D3D12DDI_BUILD_VERSION_0116` — ⭐ **GENERATED as of the retirement's U0.**
 ///
-/// ⛔ `DECISIONS.md` §7.2 bans hand-written DDI ABI values and [`ddi12_supported`]
-/// above says why. This constant is the single exception, because the header
-/// this build's bindings are generated from **cannot supply it**: the guest's
-/// installed WDK is 10.0.26100.0 and its `d3d12umddi.h` stops at
-/// `D3D12DDI_SUPPORTED_0110`. Regenerating against WDK 28000 is the retirement
-/// lane's U0 and is a separate, larger change (it moves the table shapes too).
+/// ⛔ This used to be *"the one hand-written DDI ABI value in this crate"*, an
+/// explicit exception to `DECISIONS.md` §7.2's ban, licensed only by the fact
+/// that the bindings could not supply it: WDK 26100's `d3d12umddi.h` stops at
+/// `D3D12DDI_SUPPORTED_0110`. U0 regenerated `bindgen/cached/d3d12umddi.rs`
+/// against **WDK 10.0.28000.2526** (`umd12/build.rs`, `WDK_DDI_INCLUDE_DEFAULT`),
+/// so the exception is retired: the value below is `ddi12`'s own
+/// `pub const D3D12DDI_BUILD_VERSION_0116: u32 = 116;`, and the alias exists only
+/// so the two arms below read alike.
 ///
-/// ✅ Transcribed from the staged WDK 28000 header, which is in the tree and
-/// readable on both sides (`tmp/wdk-28000/Include/10.0.28000.0/um/d3d12umddi.h`,
-/// `Z:\tmp\wdk-28000\…` from the VM):
-///
-/// ```text
-/// 14734: #define D3D12DDI_BUILD_VERSION_0116 116
-/// 14735: #define D3D12DDI_SUPPORTED_0116 ((((UINT64)D3D12DDI_INTERFACE_VERSION_R8) << 32) | (((UINT64)D3D12DDI_BUILD_VERSION_0116) << 16))
-/// 10301: #define D3D12DDI_MINOR_VERSION_R8 80
-/// ```
-///
-/// ⭐ Two things that transcription rests on are **machine-checked below rather
-/// than asserted in prose**: that `_0116` is an **R8** token (so the interface
-/// half is the generated `D3D12DDI_INTERFACE_VERSION_R8`, not another constant),
-/// and that at this generation the build half is the decimal `NNNN` — proved by
-/// the generated `D3D12DDI_BUILD_VERSION_0110 == 110` sitting in the same
-/// numbering run. `DDI_REFERENCE.md` §1.5 records the worked example that got
-/// `_0080` wrong by assuming that rule *below* `_0090`, where it does not hold.
-const BUILD_VERSION_0116: u32 = 116;
+/// ⚠ The premise the retired transcription rested on is still asserted, and now
+/// on both sides: the compile-time block further down proves
+/// `D3D12DDI_BUILD_VERSION_0110 == 110` and `_0116 == 116`, i.e. that at this
+/// generation the build half of a token is the decimal `NNNN`.
+/// `DDI_REFERENCE.md` §1.5 records the worked example that got `_0080` wrong by
+/// assuming that rule *below* `_0090`, where it does not hold.
+const BUILD_VERSION_0116: u32 = ddi12::D3D12DDI_BUILD_VERSION_0116;
 
 /// The one-element set advertised on the **110** arm — today's behaviour.
 const SUPPORTED_DDI_VERSIONS_0110: &[u64] = &[ddi12_supported(
@@ -136,7 +126,9 @@ const SUPPORTED_DDI_VERSIONS_0110: &[u64] = &[ddi12_supported(
     ddi12::D3D12DDI_BUILD_VERSION_0110,
 )];
 
-/// The one-element set advertised on the **116** arm — the experiment.
+/// The one-element set advertised on the **116** arm — the retirement's target
+/// (`HELIOS_PRESENT_SYNC_RETIREMENT.md` §10.2), now composed from two generated
+/// halves like its sibling above rather than from a transcribed constant.
 const SUPPORTED_DDI_VERSIONS_0116: &[u64] = &[ddi12_supported(
     ddi12::D3D12DDI_INTERFACE_VERSION_R8,
     BUILD_VERSION_0116,
@@ -153,7 +145,8 @@ const SUPPORTED_DDI_VERSIONS_0116: &[u64] = &[ddi12_supported(
 pub(crate) enum Ddi12Interface {
     /// `D3D12DDI_SUPPORTED_0110` — release R8, build 110. Fills the
     /// `_0109`-generation tables (D12: `_0110` adds no table struct of its own).
-    /// **The default, and the only arm whose tables this driver implements.**
+    /// **The default, and — as [`Self::tables_implemented`] derives rather than
+    /// declares — the arm whose tables this driver currently fills.**
     R8_0110,
     /// `D3D12DDI_SUPPORTED_0116` — release R8, build 116. The Core DDI the
     /// HPS2-retirement reference requires (`HELIOS_PRESENT_SYNC_RETIREMENT.md`
@@ -161,12 +154,20 @@ pub(crate) enum Ddi12Interface {
     /// or later"* — Core 0112 adds native-fence **create**, 0116 native-fence
     /// **open**).
     ///
-    /// ⛔⛔ **THE TABLE SHAPES FOR THIS ARM ARE NOT IMPLEMENTED**, and that is
-    /// why `device12::create_device` refuses it before constructing anything.
-    /// This variant exists to answer exactly one question — *does the inbox
-    /// D3D12 runtime on build 26100 accept the 0116 token at all, or is the
-    /// 26100 WDK header limit also a runtime limit?* — and it answers it by
-    /// being advertised, not by being served.
+    /// ⭐ **The token is no longer the open question.** `FINDINGS.md` F1 settled
+    /// it by measurement: on guest build 26100.8875 with the inbox runtime, a
+    /// one-element `_0116` set is negotiated and handed straight back at
+    /// `pfnCreateDevice` as `Interface=0x000c0050 Version=0x00740000`. The 28000
+    /// package minimum in §2 was a statement about a *header*, not a kernel, and
+    /// U0 has now supplied the header.
+    ///
+    /// ⛔⛔ **What is still missing is the driver-side TABLE SHAPES**, and until
+    /// they exist [`Self::tables_implemented`] reads `false` for this arm and
+    /// `device12::create_device` refuses before constructing anything. That is
+    /// not a placeholder judgement — it is derived from
+    /// `forward12::tables12`'s own type aliases (see [`TableShape`]), so the
+    /// day those aliases move to the 0116 generation this arm becomes servable
+    /// without anyone editing a flag.
     R8_0116,
 }
 
@@ -225,6 +226,26 @@ impl Ddi12Interface {
         }
     }
 
+    /// The arm a `Umd12CoreDdi` build number names, or `None`.
+    ///
+    /// ⚠ Split out of [`Self::selected`] as a `const fn` so the compile-time
+    /// block below can ask the same question about
+    /// [`knobs12::UMD12_CORE_DDI_DEFAULT`] that the runtime asks about the
+    /// registry value. Two copies of this mapping — one for the assertion, one
+    /// for the read — would be two chances for the assertion to check something
+    /// the driver does not do.
+    ///
+    /// ⛔ Patterns are the **generated** `D3D12DDI_BUILD_VERSION_*` constants,
+    /// not literals: `DECISIONS.md` §7.2's rule survives U0 rather than being
+    /// relaxed by it.
+    pub(crate) const fn arm_for_build(build: u32) -> Option<Self> {
+        match build {
+            ddi12::D3D12DDI_BUILD_VERSION_0110 => Some(Self::R8_0110),
+            BUILD_VERSION_0116 => Some(Self::R8_0116),
+            _ => None,
+        }
+    }
+
     /// The arm `HKLM\SOFTWARE\Helios!Umd12CoreDdi` selects. **Absent = 110.**
     ///
     /// ⛔ An unrecognised value is a **counted refusal that falls back to 110**,
@@ -239,10 +260,11 @@ impl Ddi12Interface {
     /// `pfnGetSupportedVersions` and `pfnCreateDevice` must agree about which
     /// single pair is legal.
     pub(crate) fn selected() -> Self {
-        match knobs12::umd12_core_ddi() {
-            110 => Self::R8_0110,
-            116 => Self::R8_0116,
-            other => {
+        let raw = knobs12::umd12_core_ddi();
+        match Self::arm_for_build(raw) {
+            Some(arm) => arm,
+            None => {
+                let other = raw;
                 UMD12_REFUSALS.core_ddi_knob_unknown.bump();
                 let n = UMD12_REFUSALS.core_ddi_knob_unknown.get();
                 if n <= LOG_BUDGET {
@@ -285,7 +307,172 @@ impl Ddi12Interface {
             Self::R8_0116 => "_0116",
         }
     }
+
+    /// The three driver-side table shapes this arm's negotiation selects, as
+    /// `(DEVICE_CORE, COMMAND_LIST_3D, COMMAND_QUEUE_CORE)` build numbers.
+    ///
+    /// ⛔ **A negotiated version selects a table shape**, and the mapping is a
+    /// property of `d3d12umddi.h`, not a choice: the runtime uses the newest
+    /// table struct at or below the negotiated build. Read off WDK 28000's
+    /// `d3d12umddi.h`, which declares device-core tables at
+    /// `…_0109/_0111/_0112/_0113/_0116`, command-list tables at
+    /// `…_0108/_0114`, and exactly one command-queue table, `…_CORE_0001`.
+    ///
+    /// * `_0110` → `(109, 108, 1)` — 0110 adds no table struct of its own.
+    /// * `_0116` → `(116, 114, 1)`.
+    pub(crate) const fn table_builds(self) -> (u32, u32, u32) {
+        match self {
+            Self::R8_0110 => (109, 108, 1),
+            Self::R8_0116 => (116, 114, 1),
+        }
+    }
+
+    /// Whether `forward12::tables12` actually fills the shapes [`Self::table_builds`]
+    /// names.
+    ///
+    /// ⭐⭐ **DERIVED, not declared.** The obvious implementation of this is a
+    /// hand-maintained `const TABLES_0116_DONE: bool`, and a hand-maintained
+    /// flag about whether some *other* file has been changed is exactly the kind
+    /// of assurance that is not real — it is correct only until someone forgets
+    /// it, in either direction. Instead this reads
+    /// `forward12::tables12`'s three `pub(crate) type` aliases through
+    /// [`TableShape`], so:
+    ///
+    /// * while `tables12::CommandListTable = D3D12DDI_COMMAND_LIST_FUNCS_3D_0108`
+    ///   this returns `false` for `_0116` and `true` for `_0110`;
+    /// * the moment those aliases move to the 0116/0114 generation it returns
+    ///   `true` for `_0116` and `false` for `_0110` — which is also right, because
+    ///   `tables12` fills **one** shape and a driver that filled 0108 handlers
+    ///   into a runtime expecting 0114 semantics would be serving 38 slots the
+    ///   wrong first argument (see [`TableShape`]).
+    ///
+    /// ⚠ **Necessary, not sufficient**, and the bound is stated rather than
+    /// glossed: this proves the driver builds the right *shape*. It cannot prove
+    /// that every slot inside it honours the newer *contract* — that
+    /// `pfnCreateFence` reads `D3D12DDIARG_CREATE_FENCE_0116` rather than the
+    /// 16-byte `_0110` struct, or that the 38 bypass slots call
+    /// `GetDriverCommandListHandle`. Those are the owning lanes' definitions of
+    /// done; this is the gate that stops the runtime reaching them early.
+    pub(crate) const fn tables_implemented(self) -> bool {
+        let (dev, list, queue) = self.table_builds();
+        dev == <forward12::tables12::DeviceCoreTable as TableShape>::BUILD
+            && list == <forward12::tables12::CommandListTable as TableShape>::BUILD
+            && queue == <forward12::tables12::CommandQueueTable as TableShape>::BUILD
+    }
 }
+
+/// Which `d3d12umddi.h` build revision a driver-side DDI table struct is.
+///
+/// ⛔ **This exists because `size_of` cannot answer the question.**
+/// `D3D12DDI_COMMAND_LIST_FUNCS_3D_0108` and `_0114` are **both 600 bytes, both
+/// 75 slots, and every field is at the same offset** — the 0114 revision changes
+/// 38 of the 75 *signatures*, replacing the driver handle
+/// `D3D12DDI_HCOMMANDLIST` with the runtime-bypass application handle
+/// `D3D12DDI_API_HCOMMANDLIST`, from which the driver must recover its own
+/// object through `GetDriverCommandListHandle` (a `D3D12DDI_RUNTIME_BYPASS_HEADER`
+/// deref). Serving 0108 bodies to a 0114 caller therefore passes *every size and
+/// alignment check there is* and then dereferences the runtime's bypass header
+/// as this driver's `CommandListState`.
+///
+/// Rust has no stable const type equality, so the discriminator is an associated
+/// const on a private trait with one impl per shape. Adding a shape without a
+/// build number fails to compile at the use site; giving one the wrong number is
+/// caught by the size assertions below, which pair each build with the byte
+/// count the released header dictates.
+pub(crate) trait TableShape {
+    /// The `NNNN` in the struct's `_NNNN` suffix (`_CORE_0001` → 1).
+    const BUILD: u32;
+    /// Slot count — `size_of::<Self>() / size_of::<usize>()`, restated so the
+    /// assertion block below reads as a table rather than as arithmetic.
+    const SLOTS: usize;
+}
+
+macro_rules! table_shape {
+    ($ty:ty, $build:expr, $slots:expr) => {
+        impl TableShape for $ty {
+            const BUILD: u32 = $build;
+            const SLOTS: usize = $slots;
+        }
+        const _: () = {
+            // §18.1: "generated Rust/C table sizes and offsets … match the
+            // released headers". The slot count is the header's field count;
+            // every slot is one pointer.
+            assert!(core::mem::size_of::<$ty>() == $slots * core::mem::size_of::<usize>());
+            assert!(core::mem::align_of::<$ty>() == core::mem::align_of::<usize>());
+        };
+    };
+}
+
+// The `_0110` arm's three shapes — what this driver fills today.
+table_shape!(ddi12::D3D12DDI_DEVICE_FUNCS_CORE_0109, 109, 124);
+table_shape!(ddi12::D3D12DDI_COMMAND_LIST_FUNCS_3D_0108, 108, 75);
+table_shape!(ddi12::D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001, 1, 7);
+// The `_0116` arm's two additional shapes. ⚠ Declared here even though nothing
+// fills them yet, because [`Ddi12Interface::tables_implemented`] is only a real
+// check if the *target* shape is nameable and sized — an arm whose shape the
+// crate cannot name would make the gate vacuous rather than closed.
+table_shape!(ddi12::D3D12DDI_DEVICE_FUNCS_CORE_0116, 116, 128);
+table_shape!(ddi12::D3D12DDI_COMMAND_LIST_FUNCS_3D_0114, 114, 75);
+
+/// The compile-time record of what U0 actually obtained, and of the two facts
+/// the 0116 arm's implementation rests on.
+///
+/// ⭐ Stated as assertions rather than as prose because this is precisely the
+/// §18.1 build gate — *"WDK 28000 bindings expose Core 0116 exactly; generated
+/// Rust/C table sizes and offsets … match the released headers"* — and a gate
+/// that lives in a comment is not a gate. `build.rs::require_core_0116` is the
+/// other half: it fails the Windows build if a generation cannot even *name*
+/// these types.
+const _: () = {
+    // 1. The corelayer callback table grows by exactly the two native-fence
+    //    callbacks, appended. This is what licenses `device12` keeping ONE
+    //    `_0062`-typed pointer for `pfnSetErrorCb` / `pfnSetCommandListErrorCb`
+    //    / `pfnSetCommandListDDITableCb` on both arms: on the 0116 arm it is a
+    //    read of a byte-identical prefix, not a reinterpretation.
+    assert!(
+        core::mem::size_of::<ddi12::D3D12DDI_CORELAYER_DEVICECALLBACKS_0116>()
+            == core::mem::size_of::<ddi12::D3D12DDI_CORELAYER_DEVICECALLBACKS_0062>()
+                + 2 * core::mem::size_of::<usize>()
+    );
+    // 2. The device-core table grows by exactly four slots, appended, and the
+    //    124 the `_0110` arm fills stay at their offsets. (The five slots whose
+    //    *signatures* change at 0116 are pointers either way, so this says
+    //    nothing about them — see `TableShape`.)
+    assert!(
+        <ddi12::D3D12DDI_DEVICE_FUNCS_CORE_0116 as TableShape>::SLOTS
+            == <ddi12::D3D12DDI_DEVICE_FUNCS_CORE_0109 as TableShape>::SLOTS + 4
+    );
+    // 3. ⛔ The command-list table does NOT change size, which is the whole
+    //    reason `TableShape` exists rather than a `size_of` comparison.
+    assert!(
+        core::mem::size_of::<ddi12::D3D12DDI_COMMAND_LIST_FUNCS_3D_0114>()
+            == core::mem::size_of::<ddi12::D3D12DDI_COMMAND_LIST_FUNCS_3D_0108>()
+    );
+    // 4. The two arms cannot both be servable by one build of `tables12`, and
+    //    exactly one of them is. A build in which neither is true is a
+    //    `tables12` mid-migration and must not ship: every `pfnCreateDevice`
+    //    would refuse.
+    assert!(
+        Ddi12Interface::R8_0110.tables_implemented()
+            != Ddi12Interface::R8_0116.tables_implemented()
+    );
+    // 5. And the DEFAULT arm is the servable one. ⛔ This is CLAUDE.md rule 8
+    //    as an assertion: *"a knob's default is a decision, and it must match
+    //    the measured configuration"*. If a future changeset moves `tables12`
+    //    to the 0116 generation, this fires — and the same changeset must move
+    //    `knobs12::UMD12_CORE_DDI_DEFAULT` with it, which is the point.
+    //
+    //    ⚠ It asks the question through `arm_for_build`, the same function
+    //    `selected()` uses, so it cannot pass by checking a mapping the driver
+    //    does not actually perform.
+    assert!(match Ddi12Interface::arm_for_build(knobs12::UMD12_CORE_DDI_DEFAULT) {
+        Some(arm) => arm.tables_implemented(),
+        // A default the knob cannot even name would fall back to `R8_0110` with
+        // a counted refusal on every adapter open. That is a build defect, not
+        // a configuration.
+        None => false,
+    });
+};
 
 /// The Core DDI **build** number this process actually advertises, for
 /// `knobs12::resolved_inventory`.
@@ -319,9 +506,12 @@ pub(crate) fn decode_pair(interface: u32, version: u32) -> (u32, u32, u32) {
 // invariants were only checked on the default arm would be exactly the shape of
 // assurance that is not real.
 const _: () = {
-    // The build half is the decimal `NNNN` at this generation. Generated, and
-    // the premise `BUILD_VERSION_0116` is transcribed under.
+    // The build half is the decimal `NNNN` at this generation. ⚠ Both sides are
+    // generated now (U0), so this no longer licenses a transcription — it pins
+    // the numbering rule `DDI_REFERENCE.md` §1.5 records as NOT holding below
+    // `_0090`, which is what a future `_0120` arm would rest on.
     assert!(ddi12::D3D12DDI_BUILD_VERSION_0110 == 110);
+    assert!(BUILD_VERSION_0116 == 116);
 
     assert!(SUPPORTED_DDI_VERSIONS_0110.len() == 1);
     assert!((SUPPORTED_DDI_VERSIONS_0110[0] >> 32) as u32 == Ddi12Interface::R8_0110.interface());

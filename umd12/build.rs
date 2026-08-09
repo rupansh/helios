@@ -108,11 +108,125 @@ fn find_msvc_include() -> String {
         })
 }
 
-fn generate_d3d12umddi_bindings() {
-    let sdk_inc = def(
-        "HELIOS_WDK_INCLUDE",
-        r"C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0",
+/// The **DDI** include root — where `d3d12umddi.h` and its WDK siblings come
+/// from. Default: the WDK 10.0.28000.2526 tree staged in the repo at
+/// `tmp/wdk-28000/`, as it lands inside `win_cargo`'s local build mirror.
+///
+/// ⛔ **28000, not the installed 26100, and that is the whole point of the
+/// retirement's U0.** `HELIOS_PRESENT_SYNC_RETIREMENT.md` §10.2 requires a
+/// negotiated `D3D12DDI_SUPPORTED_0116`, and §1 records why the installed WDK
+/// cannot serve it: 26100's `d3d12umddi.h` *"ends at Core build 0110"*. There is
+/// no `D3D12DDI_DEVICE_FUNCS_CORE_0116`, no `PFND3D12DDI_CREATEFENCE_0116`, no
+/// `pfnOpenNativeFenceCb` and no `D3D12DDICAPS_TYPE_0112_NATIVE_FENCE_SUPPORT`
+/// in it at all.
+///
+/// ⚠ The path is inside `C:\Users\Rupansh\helios-vgpu`, which is
+/// `win_cargo`'s robocopy mirror of `Z:\` — **local disk**, as CLAUDE.md
+/// requires (Rust/cargo file IO on the `Z:\` 9p share fails with OS error 87).
+/// `tmp/` is not in the mirror's `/XD` exclusion list, so the staged tree
+/// arrives there on every `win_cargo` call with no separate copy step.
+const WDK_DDI_INCLUDE_DEFAULT: &str =
+    r"C:\Users\Rupansh\helios-vgpu\tmp\wdk-28000\Include\10.0.28000.0";
+
+/// The **platform** include root — `windows.h`, the CRT, and every SDK header
+/// the DDI graph reaches through that the staged WDK package does not ship.
+///
+/// ⚠ **The staged 28000 package is a WDK, not an SDK**: its `shared/` holds 11
+/// headers and its `um/` 44, so `d3dkmdt.h`, `d3dukmdt.h`, `d3dkmthk.h`,
+/// `dxmini.h`, `dxgiddi.h`, `winapifamily.h` and `windows.h` itself all resolve
+/// from here.
+///
+/// ⛔ Include ORDER is what makes the mix a mix rather than a coin toss —
+/// [`generate_d3d12umddi_bindings`] lists `{28000}\um` first, so
+/// `d3d12umddi.h`, `d3d10umddi.h` and `d3dumddi.h` come from the newer package
+/// and **everything else, `shared/` included, falls through to this one**. The
+/// exclusion of the 28000 `shared/` is not an oversight; the measured clang
+/// errors that force it are quoted at the include list.
+const SDK_PLATFORM_INCLUDE_DEFAULT: &str =
+    r"C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0";
+
+/// Symbols the generated bindings MUST contain for this crate to be able to
+/// serve Core 0116 — `HELIOS_PRESENT_SYNC_RETIREMENT.md` §18.1's first build
+/// gate, executed instead of trusted.
+///
+/// ⛔ **This exists because the failure it catches is SILENT.** Point
+/// `HELIOS_WDK_INCLUDE` at the installed 26100 SDK — by typo, by a stale
+/// environment, or by the staged tree not having reached the mirror — and
+/// bindgen succeeds, emits a perfectly good 26100 generation, and the only
+/// signal is `compare_or_refresh_cache`'s *warning*, which does not fail a
+/// build. The crate then compiles against a cache that cannot name a single
+/// 0116 type, and the first evidence is a runtime version mismatch on the
+/// guest. §18.1 asks for *"WDK 28000 bindings expose Core 0116 exactly"*; this
+/// is that sentence as a build step.
+///
+/// ⚠ Presence only. That the sizes and offsets match the released header is the
+/// job of bindgen's own `layout_tests(true)` assertions, which are compile-time
+/// `const` evaluations in the generated file itself, plus the per-arm table-size
+/// assertions in `adapter12.rs`.
+const CORE_0116_REQUIRED_SYMBOLS: &[&str] = &[
+    // The version token halves `adapter12::ddi12_supported` composes from.
+    "D3D12DDI_BUILD_VERSION_0116",
+    // The three table shapes a 0116 negotiation selects.
+    "D3D12DDI_DEVICE_FUNCS_CORE_0116",
+    "D3D12DDI_COMMAND_LIST_FUNCS_3D_0114",
+    "D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001",
+    // The corelayer callback arm 0116 selects, and the two callbacks that are
+    // the entire reason the retirement wants this build.
+    "D3D12DDI_CORELAYER_DEVICECALLBACKS_0116",
+    "PFND3D12DDI_CREATENATIVEFENCE_CB_0112",
+    "PFND3D12DDI_OPENNATIVEFENCE_CB_0116",
+    // The fence DDI: §10.6's `NATIVE` / `OPENED_NATIVE` create.
+    "PFND3D12DDI_CREATEFENCE_0116",
+    "PFND3D12DDI_CALCPRIVATEFENCESIZE_0116",
+    "D3D12DDIARG_CREATE_FENCE_0116",
+    "D3D12DDI_FENCE_TYPE_0112",
+    // The admission cap of §10.2's table.
+    "D3D12DDICAPS_NATIVE_FENCE_SUPPORT_DATA_0112",
+    // The KMT objects the two callbacks carry, from the SDK half of the mix —
+    // listed here because a wrong platform root breaks them and nothing else.
+    "_D3DKMT_CREATENATIVEFENCE",
+    "_D3DKMT_OPENNATIVEFENCEFROMNTHANDLE",
+    "_D3DDDI_NATIVEFENCEMAPPING",
+    // §10.6 step 2's queue model, and the callback the whole submit spine uses.
+    "_D3DDDICB_CREATECONTEXTVIRTUAL",
+    "_D3DDDICB_SUBMITCOMMAND",
+    // §12.1's 64-byte HNF1 payload length, so no consumer transcribes it.
+    "D3DDDI_NATIVE_FENCE_PDD_SIZE",
+];
+
+/// Fail the build if the generated bindings cannot name Core 0116.
+///
+/// ⚠ Fatal, unlike [`compare_or_refresh_cache`]'s warning, and the asymmetry is
+/// deliberate: a stale *cache* only degrades the Linux cross-check, while a
+/// generation from the wrong SDK is a shipping DLL built against an ABI the
+/// package has already declared insufficient.
+fn require_core_0116(generated: &str) {
+    let missing: Vec<&str> = CORE_0116_REQUIRED_SYMBOLS
+        .iter()
+        .copied()
+        .filter(|sym| !generated.contains(sym))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    panic!(
+        "helios_umd12: the generated d3d12umddi bindings do not expose Core 0116. Missing: {}. \
+         The DDI headers must come from WDK 28000 (staged at tmp/wdk-28000/, mirrored to \
+         {WDK_DDI_INCLUDE_DEFAULT}); WDK 26100's d3d12umddi.h ends at Core build 0110. Override \
+         with HELIOS_WDK_INCLUDE (DDI root) and HELIOS_SDK_INCLUDE (platform root).",
+        missing.join(", "),
     );
+}
+
+fn generate_d3d12umddi_bindings() {
+    let wdk_inc = def("HELIOS_WDK_INCLUDE", WDK_DDI_INCLUDE_DEFAULT);
+    let sdk_inc = def("HELIOS_SDK_INCLUDE", SDK_PLATFORM_INCLUDE_DEFAULT);
+    // Named at the point the path is chosen, so a missing staged WDK says
+    // "HELIOS_WDK_INCLUDE directory not found" rather than surfacing 200 lines
+    // later as `'d3d12umddi.h' file not found`.
+    require_path("HELIOS_WDK_INCLUDE", &format!(r"{wdk_inc}\um"), true);
+    require_path("HELIOS_SDK_INCLUDE", &format!(r"{sdk_inc}\um"), true);
+    require_path("HELIOS_SDK_INCLUDE", &format!(r"{sdk_inc}\ucrt"), true);
     let msvc_inc = find_msvc_include();
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
 
@@ -121,6 +235,46 @@ fn generate_d3d12umddi_bindings() {
         .clang_args([
             "-target".to_string(),
             "x86_64-pc-windows-msvc".to_string(),
+            // ⛔ THE 28000 DDI HEADERS FIRST. clang searches `-I` in order, so
+            // this is what decides that `d3d12umddi.h` is the Core-0116 one and
+            // not the installed 26100 copy of the same file name.
+            //
+            // ⛔⛔ **`um` ONLY — `shared` and `km` are deliberately NOT on the
+            // path, and this is MEASURED, not preference.** With
+            // `{wdk_inc}\shared` ahead of the SDK's, `d3d10umddi.h`'s
+            // `#include "d3dkmddi.h"` resolves to the 28000 KMD DDI header,
+            // which needs the 28000 `d3dukmdt.h` — and the staged package is a
+            // WDK, not an SDK, so that file is not in it. clang then reports,
+            // verbatim (2026-08-10, win11):
+            //
+            // ```text
+            // ...\28000\shared\d3dkmddi.h:1689:5: error: unknown type name
+            //     'D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS'
+            // ...\28000\shared\d3dkmddi.h:1693:71: error: use of undeclared
+            //     identifier 'D3DDDI_UMS_PDD_SIZE'
+            // ...\28000\shared\d3dkmddi.h:10517:29: (same)
+            // ...\28000\shared\d3dkmddi.h:10584:28: (same)
+            // ```
+            //
+            // A grep of the whole staged tree finds both identifiers in exactly
+            // one file — the header that *uses* them — so nothing in the package
+            // declares them.
+            //
+            // ⭐ Excluding `shared` is not a fallback and costs this crate
+            // nothing, because the boundary is clean: `d3dkmddi.h` is the
+            // **KMD** DDI (it is `kmd_render`'s input, not this crate's), while
+            // every D3D12 UMD type comes from `{wdk_inc}\um\d3d12umddi.h` and
+            // the `D3DDDI_DEVICECALLBACKS` kernel table from
+            // `{wdk_inc}\um\d3dumddi.h`. The two 0116 KMT objects
+            // (`D3DKMT_CREATENATIVEFENCE`, `D3DKMT_OPENNATIVEFENCEFROMNTHANDLE`)
+            // are **forward-declared opaque** inside `d3d12umddi.h` itself
+            // (`typedef struct _D3DKMT_CREATENATIVEFENCE D3DKMT_CREATENATIVEFENCE;`)
+            // and defined by the SDK's `d3dkmthk.h`, which 26100 already
+            // carries. `require_core_0116` asserts all four are present, so the
+            // exclusion cannot silently lose them.
+            format!(r"-I{wdk_inc}\um"),
+            // Then the platform: the CRT/STL, then the SDK's own um/shared for
+            // `windows.h`, `d3dkmthk.h`, `d3dkmdt.h`, `dxmini.h`, `dxgiddi.h`.
             format!("-I{msvc_inc}"),
             format!(r"-I{sdk_inc}\um"),
             format!(r"-I{sdk_inc}\shared"),
@@ -163,6 +317,19 @@ fn generate_d3d12umddi_bindings() {
         .allowlist_type("DXGI_?DDI.*")
         .allowlist_var("D3D12DDI_.*")
         .allowlist_var("D3D12_.*")
+        // ⭐ `D3DDDI_NATIVE_FENCE_PDD_SIZE` — 64, from the SDK's `d3dukmdt.h`
+        // (`10.0.26100.0\shared\d3dukmdt.h:1905`). It is the length of the
+        // object-associated KMD private data both `D3DKMT_CREATENATIVEFENCE`
+        // and `D3DKMT_OPENNATIVEFENCEFROMNTHANDLE` carry, and therefore the
+        // exact size of the retirement's `HeliosNativeFencePddV1`
+        // (`HELIOS_PRESENT_SYNC_RETIREMENT.md` §12.1's 64-byte table).
+        //
+        // ⛔ Allowlisted **narrowly, and only this family**, so the fence lane
+        // can assert its record against the released header instead of against
+        // a literal `64`. A bare `D3DDDI_.*` would pull in hundreds of
+        // unrelated `#define`s; §12 rule 1's point is that the ABI number comes
+        // from the header, not that every number in the header comes along.
+        .allowlist_var("D3DDDI_NATIVE_FENCE_.*")
         // ⛔ THE DELIVERABLE. Compile-time size/alignment/offset assertions for
         // every generated type. bindgen 0.70 emits them as
         //   const _: () = { ["Offset of field: X::y"][offset_of!(X, y) - N]; };
@@ -179,14 +346,19 @@ fn generate_d3d12umddi_bindings() {
         .generate()
         .expect("bindgen failed to generate d3d12umddi bindings");
 
+    let generated = out.join("d3d12umddi.rs");
     bindings
-        .write_to_file(out.join("d3d12umddi.rs"))
+        .write_to_file(&generated)
         .expect("failed to write d3d12umddi.rs");
+
+    // ⛔ §18.1's build gate, before anything consumes the file.
+    require_core_0116(&std::fs::read_to_string(&generated).unwrap_or_default());
 
     println!("cargo:rerun-if-changed=bindgen/d3d12umddi_wrapper.h");
     println!("cargo:rerun-if-env-changed=HELIOS_WDK_INCLUDE");
-    // These bindings are generated against this include path, so changing the
+    // These bindings are generated against these include paths, so changing any
     // selection must regenerate them.
+    println!("cargo:rerun-if-env-changed=HELIOS_SDK_INCLUDE");
     println!("cargo:rerun-if-env-changed=HELIOS_MSVC_INCLUDE");
 }
 

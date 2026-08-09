@@ -19,7 +19,7 @@
 //! |---|---|---|
 //! | `Umd12Trace` | DWORD | `false` (explicit non-zero enables) |
 //! | `UmdD3D12` | DWORD | `false` — **the D3D12 kill switch** (D11) |
-//! | `Umd12CoreDdi` | DWORD | **`110`** — which Core DDI build `pfnGetSupportedVersions` advertises; `116` is the HPS2-retirement experiment arm |
+//! | `Umd12CoreDdi` | DWORD | **`110`** — which Core DDI build `pfnGetSupportedVersions` advertises; `116` is the HPS2-retirement target arm, negotiable but not yet servable |
 //! | `Umd12FormatCaps` | DWORD | `0` — `pfnCheckFormatSupport`'s encoding, as an A/B |
 //! | `Umd12FenceSignalDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnSignalFence` |
 //! | `Umd12EclDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnExecuteCommandLists` |
@@ -153,22 +153,41 @@ pub(crate) fn umd_d3d12() -> bool {
 /// | value | meaning |
 /// |---:|---|
 /// | `110` | advertise `D3D12DDI_SUPPORTED_0110`. **The default**, and bit-identical to the driver before this knob existed. |
-/// | `116` | advertise `D3D12DDI_SUPPORTED_0116`. ⛔ **EXPERIMENT ARM — device creation REFUSES.** |
+/// | `116` | advertise `D3D12DDI_SUPPORTED_0116`. ⛔ **device creation still refuses — see below.** |
 /// | anything else | a counted refusal (`CoreDdiKnobUnknown`), logged loudly, falling back to `110`. |
 ///
-/// # ⛔⛔ Why the 116 arm refuses instead of serving
+/// # ⛔⛔ Why the 116 arm still refuses, and what changed under it
 ///
-/// A negotiated version selects a **table shape**, and this driver implements
-/// exactly one: `D3D12DDI_DEVICE_FUNCS_CORE_0109` (124) +
-/// `D3D12DDI_COMMAND_LIST_FUNCS_3D_0108` (75) +
-/// `D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001` (7). If the runtime accepted 0116 it
-/// would be entitled to a 0116-generation device — including
-/// `pfnCreateFence_0116`'s native-fence create/open, which this build's bindings
-/// cannot even name. Constructing a device there would be the
-/// `ARCHITECTURE.md` §12 trap 2 surface (*"a 376..392 byte out-of-bounds write
-/// into the runtime's heap"*) with the version negotiated rather than guessed.
+/// A negotiated version selects a **table shape**, and this driver fills exactly
+/// one: `D3D12DDI_DEVICE_FUNCS_CORE_0109` (124 slots, 992 B) +
+/// `D3D12DDI_COMMAND_LIST_FUNCS_3D_0108` (75, 600 B) +
+/// `D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001` (7, 56 B). A 0116 negotiation
+/// entitles the runtime to `…_CORE_0116` (128, 1024 B) +
+/// `…_FUNCS_3D_0114` (75, 600 B) + the same queue table.
+///
+/// ⭐ **Two of the three reasons this used to give are now GONE**, and saying so
+/// is the point of the entry:
+///
+/// * *"this build's bindings cannot even name `pfnCreateFence_0116`"* — **false
+///   as of the retirement's U0.** `bindgen/cached/d3d12umddi.rs` is generated
+///   from WDK 10.0.28000.2526 and carries every 0116 type.
+/// * *"the runtime may not even accept the token"* — **settled by measurement.**
+///   `FINDINGS.md` F1: the inbox 26100.8737 runtime negotiates `_0116` and hands
+///   build 116 back at `pfnCreateDevice`.
+///
+/// ⛔ **What remains is the reason that actually bites, and it is bigger than it
+/// looks.** Beyond the four appended device-core slots, the 0114 command-list
+/// revision changes 38 of its 75 signatures from `D3D12DDI_HCOMMANDLIST` to the
+/// runtime-bypass `D3D12DDI_API_HCOMMANDLIST` — **same 600 bytes, same 75
+/// offsets**, but the driver must now recover its own object through
+/// `GetDriverCommandListHandle`'s `D3D12DDI_RUNTIME_BYPASS_HEADER`. Serving the
+/// current bodies to a 0114 caller passes every size check there is and then
+/// dereferences the runtime's bypass header as this driver's `CommandListState`.
 /// ⇒ `device12::create_device` logs the exact received `(Interface, Version)`
-/// and refuses **before** it constructs anything.
+/// and refuses **before** it constructs anything, and the gate that decides it
+/// is derived from `forward12::tables12`'s own type aliases
+/// (`adapter12::Ddi12Interface::tables_implemented`) rather than from a flag
+/// anyone has to remember to flip.
 ///
 /// ⚠ `pfnFillDDITable` is *not* the hazard, and that was checked rather than
 /// assumed, twice over. **Measured:** on 26100.8737 the runtime fills the tables
@@ -189,8 +208,23 @@ pub(crate) fn umd_d3d12() -> bool {
 /// merely a green negotiation — and the evidence goes in a comment right here,
 /// as CLAUDE.md rule 8 requires. Until then `110` is both the default and the
 /// only arm anyone has measured a working device on, and `116` stays reachable
-/// as the experiment it is.
-pub(crate) static UMD12_CORE_DDI: DwordKnob = DwordKnob::new(c"Umd12CoreDdi", 110);
+/// as the negotiation arm it is.
+///
+/// ⭐ **And the flip is now COUPLED rather than remembered.** `adapter12`'s
+/// compile-time block asserts that the arm [`UMD12_CORE_DDI_DEFAULT`] names is
+/// the arm `forward12::tables12` actually fills, so a changeset that moves
+/// `tables12` to the 0116 generation without moving this default fails to
+/// compile — and so does the reverse.
+pub(crate) static UMD12_CORE_DDI: DwordKnob =
+    DwordKnob::new(c"Umd12CoreDdi", UMD12_CORE_DDI_DEFAULT);
+
+/// The value [`UMD12_CORE_DDI`] resolves to when the registry says nothing.
+///
+/// ⚠ Named rather than inlined into `DwordKnob::new` so `adapter12` can assert
+/// against it at compile time. `DwordKnob`'s default is otherwise only readable
+/// at runtime, and "the default matches the implemented table shape" is exactly
+/// the kind of claim that must not be checkable only by reading two files.
+pub(crate) const UMD12_CORE_DDI_DEFAULT: u32 = 110;
 
 /// Resolve `HKLM\SOFTWARE\Helios!Umd12CoreDdi` (REG_DWORD), forcing its
 /// `OnceLock`. **Absent = `110`.**

@@ -20,9 +20,27 @@
  * include different DDI headers and a shared wrapper would be a header that
  * pulls BOTH DDIs into BOTH drivers.
  *
- * Built against SDK 10.0.26100 um+shared under clang, matching the pin every
- * `d3d12umddi.h:NNNN` citation in docs/dx12/ is written against
- * (`DECISIONS.md`'s staging note). */
+ * ⛔ BUILT AGAINST **WDK 10.0.28000.2526** um+shared+km under clang, with the
+ * platform headers (windows.h, the CRT, d3dkmthk.h, d3dkmdt.h, d3dukmdt.h,
+ * dxmini.h, dxgiddi.h) still coming from the installed SDK 10.0.26100. The
+ * staged 28000 package is a WDK, not an SDK — 44 `um` and 11 `shared` headers —
+ * so the mix is not a shortcut, it is the only shape that compiles.
+ * `build.rs`'s include order is what makes it deterministic: the 28000
+ * directories are listed first, so `d3d12umddi.h`, `d3d10umddi.h`,
+ * `d3dumddi.h` and `d3dkmddi.h` come from there and everything else falls
+ * through.
+ *
+ * The retarget is the HPS2 retirement's U0: §10.2 requires a negotiated
+ * `D3D12DDI_SUPPORTED_0116`, and 26100's `d3d12umddi.h` ends at Core build
+ * 0110 — no `D3D12DDI_DEVICE_FUNCS_CORE_0116`, no `PFND3D12DDI_CREATEFENCE_0116`,
+ * no `pfnOpenNativeFenceCb`, no `D3D12DDICAPS_TYPE_0112_NATIVE_FENCE_SUPPORT`.
+ * `build.rs::require_core_0116` fails the build if a generation cannot name
+ * them, because a silent fallback to 26100 is otherwise indistinguishable from
+ * success.
+ *
+ * ⚠ Line citations: `d3d12umddi.h:NNNN` references in docs/dx12/ predate this
+ * retarget and are written against the 26100 copy. Retirement-era citations are
+ * against `tmp/wdk-28000/Include/10.0.28000.0/um/d3d12umddi.h`. */
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>

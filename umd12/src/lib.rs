@@ -422,18 +422,37 @@ pub(crate) struct Umd12Refusals {
     /// because that is the default" from "110 because 112 was rejected".
     pub(crate) core_ddi_knob_unknown: RefusalCounter,
     /// The runtime **negotiated** a Core DDI build whose device/command-list/
-    /// queue table shapes this driver does not implement, and `pfnCreateDevice`
-    /// refused before constructing anything.
+    /// queue table shapes `forward12::tables12` does not fill, and
+    /// `pfnCreateDevice` refused before constructing anything.
     ///
     /// ⛔ **Expected 0 on the default arm and expected 1 per create on
-    /// `Umd12CoreDdi=116`** — where it is the whole result, not a fault: a hit
-    /// says the inbox D3D12 runtime **accepted** the 0116 token, which is the
-    /// question the knob exists to answer. A zero on a 116 run says the runtime
-    /// refused the handshake and never reached `pfnCreateDevice` at all.
+    /// `Umd12CoreDdi=116`**, and the reading changed with the retirement's U0.
+    /// It used to be *the* result — a hit meant the inbox runtime had accepted
+    /// the 0116 token, the question the knob was built to ask. `FINDINGS.md` F1
+    /// has since answered that question by measurement, so a hit now means only
+    /// what it says: the negotiation succeeded and the **driver-side tables** are
+    /// still the 0110 generation. The log line beside it prints both the
+    /// selected and the filled shapes.
     ///
     /// ⚠ Registry counter values persist across boots (CLAUDE.md rule 6):
     /// verify this one MOVED this boot before reading anything into it.
     pub(crate) create_device_core_ddi_unimplemented: RefusalCounter,
+    /// The runtime asked `D3D12DDICAPS_TYPE_0112_NATIVE_FENCE_SUPPORT` (1093)
+    /// and this driver answered `NativeGpuFenceSupported = FALSE`.
+    ///
+    /// ⛔ **The retirement's admission cap, withheld.**
+    /// `HELIOS_PRESENT_SYNC_RETIREMENT.md` §10.2 requires TRUE for the package
+    /// to be admitted and §10.9 makes a missing cap a package rejection — so
+    /// every hit here is one unit of distance from that gate, recorded rather
+    /// than papered over with an untruthful TRUE.
+    ///
+    /// ⚠ **Expected NON-ZERO today, and that is the honest state**, which makes
+    /// it the one counter in this set whose zero is not the goal *yet*. It reads
+    /// zero for two very different reasons and the log line beside it is what
+    /// separates them: either the runtime never asked (the `_0110` arm — the
+    /// enumerator is a 0112 addition), or the fence DDI landed and the answer
+    /// became TRUE. `caps12::native_gpu_fence_supported` is the predicate.
+    pub(crate) caps_native_fence_withheld: RefusalCounter,
 }
 
 pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
@@ -481,6 +500,7 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
     node_map_unexpected_adapter_count: RefusalCounter::new("NodeMapUnexpectedAdapterCount"),
     core_ddi_knob_unknown: RefusalCounter::new("CoreDdiKnobUnknown"),
     create_device_core_ddi_unimplemented: RefusalCounter::new("CreateDeviceCoreDdiUnimplemented"),
+    caps_native_fence_withheld: RefusalCounter::new("CapsNativeFenceWithheld"),
 };
 
 /// The **spine's** set, in the order the summary prints them. ⛔ This order is
@@ -493,7 +513,7 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
 /// FIRST in [`UMD12_REFUSAL_SETS`] precisely so every pre-fan-out
 /// `D3D12 DDI refusals:` line is still a byte-for-byte prefix of a post-fan-out
 /// one. A lane appends to **its own** set, in its own file.
-static UMD12_REFUSAL_SET: [&RefusalCounter; 44] = [
+static UMD12_REFUSAL_SET: [&RefusalCounter; 45] = [
     &UMD12_REFUSALS.open_adapter12,
     &UMD12_REFUSALS.probe12_bad_arg,
     &UMD12_REFUSALS.probe12_create_failed,
@@ -538,6 +558,7 @@ static UMD12_REFUSAL_SET: [&RefusalCounter; 44] = [
     &UMD12_REFUSALS.node_map_unexpected_adapter_count,
     &UMD12_REFUSALS.core_ddi_knob_unknown,
     &UMD12_REFUSALS.create_device_core_ddi_unimplemented,
+    &UMD12_REFUSALS.caps_native_fence_withheld,
 ];
 
 /// Every refusal set this DLL prints, in print order: the spine's, then one per

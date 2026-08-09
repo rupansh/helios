@@ -1,5 +1,23 @@
-//! **L1 — the caps gauntlet.** `pfnGetCaps` over the 43 `D3D12DDICAPS_TYPE`
+//! **L1 — the caps gauntlet.** `pfnGetCaps` over the `D3D12DDICAPS_TYPE`
 //! enumerators, plus the three device-core format/MSAA query slots.
+//!
+//! ⚠ **The enumerator count moved with the retirement's U0**, so "the 43" is no
+//! longer the number: regenerating the bindings against WDK 28000 took
+//! `D3D12DDICAPS_TYPE` from **43 to 49**. The six additions are
+//! `TIGHT_ALIGNMENT_TIER_0111` (1089), `GUID_TEXTURE_LAYOUT_TIER_0111` (1090),
+//! `GUID_TEXTURE_LAYOUT_GUID_SUPPORT_0111` (1092),
+//! `_0112_NATIVE_FENCE_SUPPORT` (1093),
+//! `D3D12DDI_APPLICATION_SPECIFIC_DRIVER_STATE_113` (1094) and `OPTIONS_0118`
+//! (1095).
+//!
+//! ⛔ **Exactly one of the six is answered**, and the choice is not arbitrary:
+//! [`native_fence_support`] is `HELIOS_PRESENT_SYNC_RETIREMENT.md` §10.2's
+//! admission cap — the one the runtime reads to decide whether to hand this
+//! driver `FenceType=NATIVE` — and it is the only answer in this file derived
+//! from what *another module* implements rather than from the substrate. The
+//! other five fall to the §11.2 zero-fill default with `CapsDefaulted`, exactly
+//! as any unrecognised type does, and their `type=NNNN` log lines are what would
+//! say the runtime had started asking.
 //!
 //! # ⛔ Why this lane is one agent's, whole, and why it comes first
 //!
@@ -267,6 +285,11 @@ mod v {
         D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_OPTIONS_0110;
     pub(super) const CAPS_UMD_QUEUE_PRIORITY: D3D12DDICAPS_TYPE =
         D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_0023_UMD_BASED_COMMAND_QUEUE_PRIORITY;
+    /// `1093` — ⭐ **nameable for the first time as of the retirement's U0.**
+    /// The enumerator does not exist in WDK 26100's `d3d12umddi.h`; the
+    /// bindings are now generated from 28000.
+    pub(super) const CAPS_NATIVE_FENCE_SUPPORT: D3D12DDICAPS_TYPE =
+        D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_0112_NATIVE_FENCE_SUPPORT;
 }
 
 /// ⭐ **The feature level this driver asserts, and the single value the whole
@@ -554,16 +577,30 @@ pub(crate) unsafe fn get_caps(arg: *const ddi12::D3D12DDIARG_GETCAPS) -> Hresult
         v::CAPS_OPTIONS_0102 => unsafe { options_0102(a, data_size) },
         v::CAPS_ADAPTER_COMPUTE_ONLY => unsafe { adapter_compute_only(a, data_size) },
         v::CAPS_UMD_QUEUE_PRIORITY => unsafe { umd_queue_priority(a, data_size) },
+        v::CAPS_NATIVE_FENCE_SUPPORT => unsafe { native_fence_support(a, data_size) },
 
         // ── The §11.2 safe default ──────────────────────────────────────────
         //
-        // ⭐ **`_SHADERCACHE_ABI_SUPPORT` IS A DECISION MADE HERE, and it can only
-        // be made here.** The runtime has a string for it — *"Driver failed
-        // D3D12DDICAPS_TYPE_SHADERCACHE_ABI_SUPPORT Caps."*, strings:2 — but the
-        // enumerator is **not in the SDK 26100 header** (`SPECS.md:258`), so this
-        // build cannot name its value or its struct and an explicit arm is
-        // impossible. Zero-fill + `S_OK` is therefore the deliberate answer, and
-        // it is the right one:
+        // ⭐ **`_SHADERCACHE_ABI_SUPPORT` IS A DECISION MADE HERE.** The runtime
+        // has a string for it — *"Driver failed
+        // D3D12DDICAPS_TYPE_SHADERCACHE_ABI_SUPPORT Caps."*, strings:2 — and
+        // zero-fill + `S_OK` is the deliberate answer.
+        //
+        // ⛔ **CORRECTED by the retirement's U0.** This comment used to justify
+        // the absence of an explicit arm with *"the enumerator is not in the SDK
+        // 26100 header, so this build cannot name its value or its struct and an
+        // explicit arm is impossible"*. The WDK 28000 bindings **do** name both:
+        // `D3D12DDICAPS_TYPE_SHADERCACHE_ABI_SUPPORT` and the 264-byte
+        // `D3D12DDI_SHADERCACHE_ABI_SUPPORT_DATA`. So the *reason* was wrong.
+        //
+        // ⚠ The **conclusion survives, on a better fact**: the enumerator is not
+        // a member of `D3D12DDICAPS_TYPE` at all. It is the sole member of a
+        // separate `D3D12DDICAPS_TYPE_SHADERCACHE` enum and its value is **0**,
+        // while every `D3D12DDICAPS_TYPE` starts at 1000 — so it cannot arrive
+        // through this dispatch as anything but a `Type` of 0, which lands right
+        // here. An explicit arm would be an arm for a value from another
+        // namespace. The reasoning below is unchanged and is what still decides
+        // the answer:
         //
         // ⛔ `DDI_REFERENCE.md:2565` prescribes *"answer `E_INVALIDARG` and count"*
         // for it. That prescription is BACKWARDS — strings:2 fires when the driver
@@ -761,6 +798,18 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         // (see [`v::CONSERVATIVE_RASTER_MAX`]).
         ConservativeRasterizationTier: v::CONSERVATIVE_RASTER_MAX,
         TiledResourcesTier: tiled_resources_tier(),
+        // ⛔ **NOT_SUPPORTED, and the retirement makes it a package requirement
+        // rather than a default.** `HELIOS_PRESENT_SYNC_RETIREMENT.md` §10.2's
+        // topology row admits *"one physical node; no LDA/cross-adapter feature
+        // bits"*, and §12.1 step 7 says this generation *"rejects LDA,
+        // `SHARED_CROSS_ADAPTER`, cross-adapter resources, and any open that
+        // would convert a peer to a monitored fence"*. This field is the only
+        // place in the whole caps surface where a cross-node claim could be
+        // made — every other struct here is single-node by shape — so keeping it
+        // at NOT_SUPPORTED is that row, discharged. ⚠ The *other* half of the
+        // row (`pfnGetImplicitPhysicalAdapterMask` / `pfnQueryNodeMap`) lives in
+        // `forward12::misc.rs`, whose `NodeMapUnexpectedAdapterCount` counter is
+        // what would say the single-node assumption had been reached for real.
         CrossNodeSharingTier: v::CROSS_NODE_NONE,
         // ⭐ RAISED 0 -> 1, 2026-08-07. Engine: 1 —
         // `OPTIONS,VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation,1`
@@ -1527,6 +1576,79 @@ unsafe fn umd_queue_priority(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -
     };
     // SAFETY: as [`get_caps`].
     unsafe { write_caps("UMD_BASED_COMMAND_QUEUE_PRIORITY", a.pData, data_size, caps) }
+}
+
+/// `1093 _0112_NATIVE_FENCE_SUPPORT` — ⛔ **the retirement's admission cap, and
+/// it is reported from what the driver IMPLEMENTS, never from what the package
+/// wants.**
+///
+/// `HELIOS_PRESENT_SYNC_RETIREMENT.md` §10.2's admission table demands
+/// `NativeGpuFenceSupported = TRUE` and §10.9 makes a missing cap a package
+/// rejection. That is a statement about the *finished* package, and this
+/// function is deliberately not the place it becomes true: CLAUDE.md's rule is
+/// that an untruthful cap is worse than a refusal, and this cap is the exact
+/// mechanism by which the runtime decides to hand this driver `FenceType=NATIVE`
+/// at `pfnCreateFence`. Answering TRUE before the fence DDI can serve it does
+/// not admit the package — it makes every `ID3D12Fence` creation in the process
+/// take a path the driver cannot complete.
+///
+/// # What TRUE requires, and how this function knows
+///
+/// [`native_gpu_fence_supported`] derives it. Today it reads FALSE and
+/// `CapsNativeFenceWithheld` counts every query, which is the loud form of "not
+/// yet".
+///
+/// ⚠ **`pInfo` is documented as a `NodeIndex`-shaped input for several caps in
+/// this family; this one carries none** and it is not dereferenced. The struct
+/// is a single `BOOL`, so `write_caps`'s zero-fill-then-write is safe — there is
+/// no runtime input in `pData` to destroy.
+///
+/// # Safety
+/// As [`get_caps`].
+unsafe fn native_fence_support(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresult {
+    let supported = native_gpu_fence_supported();
+    if !supported {
+        note_refusal(&UMD12_REFUSALS.caps_native_fence_withheld);
+    }
+    let caps = ddi12::D3D12DDICAPS_NATIVE_FENCE_SUPPORT_DATA_0112 {
+        // `BOOL` is `i32`; `TRUE`/`FALSE` are the only values the runtime reads.
+        NativeGpuFenceSupported: ddi12::BOOL::from(supported),
+    };
+    // SAFETY: as [`get_caps`].
+    unsafe { write_caps("0112_NATIVE_FENCE_SUPPORT", a.pData, data_size, caps) }
+}
+
+/// Whether this driver can actually serve a Core-0116 native fence.
+///
+/// ⭐⭐ **Two conjuncts, both derived, neither a flag anyone maintains.**
+///
+/// 1. **The advertised Core DDI arm must be `_0116`.** `pfnCreateFence_0116`'s
+///    `FenceType` / `pNativeFenceArgs` / `pNativeFenceOpenArgs` union and the
+///    `pfnCreateNativeFenceCb` / `pfnOpenNativeFenceCb` callbacks exist only in
+///    the 0116 generation of the DDI. On the `_0110` arm the runtime would have
+///    no way to *give* this driver a native fence even if it wanted one, so TRUE
+///    there is not merely optimistic, it is unmeaning.
+/// 2. **That arm's table shapes must be the ones `forward12::tables12` fills**
+///    (`adapter12::Ddi12Interface::tables_implemented`). Otherwise
+///    `device12::create_device` refuses the negotiation outright and no device
+///    exists to hold a fence.
+///
+/// ⚠ **Necessary, not sufficient, and the gap is named.** Neither conjunct
+/// proves that `forward12::fence.rs` handles `NATIVE` / `OPENED_NATIVE`, stores
+/// the `HRTFENCE` and the local `hSyncObject`, and fails a `MONITORED` create
+/// (§10.6's Queue Wait/Signal contract, §12.1 steps 1-2), nor that the KMD
+/// exposes `DXGK_FEATURE_NATIVE_FENCE` and `DXGKQAITYPE_NATIVE_FENCE_CAPS`
+/// (§10.2's third and fourth admission rows — a *different component*, and this
+/// process cannot observe it). ⛔ The commit that makes this cap capable of
+/// answering TRUE is the commit that lands the fence DDI, and it must extend
+/// this function with the third conjunct rather than delete the first two.
+///
+/// ⚠ Adapter-scoped, like every other answer in this file: `pfnGetCaps` runs
+/// before any device exists, so this reads the process-wide knob arm and never
+/// a `HeliosD3D12Device`.
+fn native_gpu_fence_supported() -> bool {
+    let arm = crate::adapter12::Ddi12Interface::selected();
+    matches!(arm, crate::adapter12::Ddi12Interface::R8_0116) && arm.tables_implemented()
 }
 
 /// `1088 OPTIONS_0110` — ⛔ **the zero-fill default writes an out-of-range

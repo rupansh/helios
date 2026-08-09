@@ -47,7 +47,7 @@ use helios_umd_common::hr::{
 
 use crate::adapter12::{self, Ddi12Interface};
 use crate::bridge12::BridgeDevice12;
-use crate::{ddi12, log_error, note_refusal, UMD12_REFUSALS};
+use crate::{ddi12, forward12, log_error, note_refusal, UMD12_REFUSALS};
 
 /// The Helios D3D12 device: what this driver keeps for the lifetime of one
 /// `ID3D12Device`.
@@ -64,13 +64,14 @@ pub(crate) struct HeliosD3D12Device {
 
     /// The negotiated interface.
     ///
-    /// ⚠ **`R8_0110` on every device that exists**, and that is enforced rather
-    /// than assumed: `Umd12CoreDdi` can make the *advertised* token `_0116`, but
-    /// [`create_device`]'s table-shape gate refuses that arm before this struct
-    /// is written, so no `HeliosD3D12Device` can ever carry it. Stored anyway,
-    /// because a lane that needs to know which revision it is serving must read
-    /// it from here rather than assume — and the day the 0116 tables are
-    /// implemented this is the field that stops being a constant.
+    /// ⚠ **The arm `Ddi12Interface::tables_implemented()` admits, and nothing
+    /// else** — today that is `R8_0110` on every device that exists, but it is
+    /// enforced rather than assumed: `Umd12CoreDdi` can make the *advertised*
+    /// token `_0116`, and [`create_device`]'s table-shape gate refuses any arm
+    /// whose shapes `forward12::tables12` does not fill, before this struct is
+    /// written. A lane that needs to know which revision it is serving reads it
+    /// from here rather than assuming, and the day the 0116 tables land this is
+    /// the field that stops being a constant.
     pub(crate) negotiated: Ddi12Interface,
 
     /// `D3D12DDI_CREATE_DEVICE_FLAGS` as the runtime gave them, including
@@ -107,7 +108,81 @@ pub(crate) struct HeliosD3D12Device {
     /// ⚠ Dropping this drops all of that, which is why `destroy_device` is
     /// `drop_in_place` and not a bare "null the handle".
     pub(crate) engine: BridgeDevice12,
+
+    // ── Appended for the Core-0116 arm (`PARALLEL.md` §5: new fields go at the
+    // END). ──────────────────────────────────────────────────────────────────
+    /// The corelayer callbacks at the **`_0116`** revision, or NULL.
+    ///
+    /// ⭐ **The whole reason the retirement wants Core 0116.** `_0116` is
+    /// `_0062` plus exactly two appended slots — `pfnCreateNativeFenceCb` at
+    /// offset 144 and `pfnOpenNativeFenceCb` at 152 — and those two are the only
+    /// documented route from a D3D12 `HFENCE` to a kernel native fence
+    /// (`HELIOS_PRESENT_SYNC_RETIREMENT.md` §12.1 steps 1-2). Nothing else in
+    /// the D3D12 DDI can create one.
+    ///
+    /// ⛔ **NULL on the `_0110` arm, and that is a fact about the runtime, not a
+    /// convenience.** The union arm the runtime filled is chosen by the
+    /// negotiated version; reading `p12UMCallbacks_0116` out of a `_0062`
+    /// negotiation would be reading 16 bytes past the table the runtime
+    /// allocated. [`create_device`] selects the arm with an exhaustive match and
+    /// stores NULL here for every arm that is not `_0116`.
+    ///
+    /// ⚠ [`Self::um_callbacks`] stays the `_0062` view on **both** arms and is
+    /// what `set_error` / `set_command_list_error` read. That is a prefix read,
+    /// not a reinterpretation: the compile-time block below asserts all 18
+    /// shared fields are at identical offsets in the two shapes.
+    pub(crate) um_callbacks_0116: *const ddi12::D3D12DDI_CORELAYER_DEVICECALLBACKS_0116,
 }
+
+/// `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` is a byte-exact **prefix** of
+/// `_0116`, field for field.
+///
+/// ⛔ This is the premise of [`HeliosD3D12Device::um_callbacks`] keeping its
+/// `_0062` type on the 0116 arm, and it is the `ARCHITECTURE.md` §12 trap 2
+/// surface in its D3D12 form: `p12UMCallbacks` is a union of six arms of
+/// 12/14/17/18/19/20 pointer-wide members, and reading the wrong one reads past
+/// the end of a shorter table. Here the direction is safe — a shorter *view* of
+/// a longer table — but "safe" is a claim about offsets, so the offsets are
+/// asserted rather than described.
+macro_rules! assert_corelayer_prefix {
+    ($($field:ident),* $(,)?) => {
+        const _: () = {
+            $(assert!(
+                core::mem::offset_of!(ddi12::D3D12DDI_CORELAYER_DEVICECALLBACKS_0062, $field)
+                    == core::mem::offset_of!(ddi12::D3D12DDI_CORELAYER_DEVICECALLBACKS_0116, $field)
+            );)*
+            // ⭐ And the list is COMPLETE: naming 17 of the 18 fields would
+            // assert a prefix relation that holds on the fields someone
+            // remembered. The count comes from the macro's own argument list.
+            const NAMED: usize = [$(stringify!($field)),*].len();
+            assert!(
+                NAMED * core::mem::size_of::<usize>()
+                    == core::mem::size_of::<ddi12::D3D12DDI_CORELAYER_DEVICECALLBACKS_0062>()
+            );
+        };
+    };
+}
+
+assert_corelayer_prefix!(
+    pfnSetErrorCb,
+    pfnSetCommandListErrorCb,
+    pfnSetCommandListDDITableCb,
+    pfnCreateContextCb,
+    pfnCreateContextVirtualCb,
+    pfnDestroyContextCb,
+    pfnCreatePagingQueueCb,
+    pfnDestroyPagingQueueCb,
+    pfnMakeResidentCb,
+    pfnEvictCb,
+    pfnReclaimAllocations2Cb,
+    pfnOfferAllocationsCb,
+    pfnAllocateCb,
+    pfnDeallocateCb,
+    pfnCreateSchedulingGroupContextCb,
+    pfnCreateSchedulingGroupContextVirtualCb,
+    pfnCreateHwQueueCb,
+    pfnQueueBackgroundProcessingWorkCb,
+);
 
 /// The size of the private block the runtime must allocate for one device.
 ///
@@ -317,14 +392,19 @@ pub(crate) unsafe fn create_device(
     // the only structural defence against a version being advertised without
     // its tables.
     //
-    // ⛔ **A negotiated version selects a TABLE SHAPE.** This driver implements
-    // exactly one — `_0109`/`_0108`/`_0001`, 124 + 75 + 7 slots — and its device
-    // block, its `p12UMCallbacks` union arm (`_0062`) and every handler in
-    // `forward12` are typed against it. Constructing a device for a build whose
-    // shapes we have not written is `ARCHITECTURE.md` §12 trap 2 with the
-    // version *negotiated* instead of guessed: the D3D11 driver's `else` arm
-    // filled 150 pointer slots into a 101-slot table, *"a 376..392 byte
-    // out-of-bounds write into the runtime's heap"*.
+    // ⛔ **A negotiated version selects a TABLE SHAPE**, and `forward12::tables12`
+    // fills exactly one set of them — whichever its three `pub(crate) type`
+    // aliases name. Every handler in `forward12` is typed against those aliases,
+    // and so is this device block's `p12UMCallbacks` union arm. Constructing a
+    // device for a build whose shapes are not the filled ones is
+    // `ARCHITECTURE.md` §12 trap 2 with the version *negotiated* instead of
+    // guessed: the D3D11 driver's `else` arm filled 150 pointer slots into a
+    // 101-slot table, *"a 376..392 byte out-of-bounds write into the runtime's
+    // heap"*.
+    //
+    // ⚠ The shapes are deliberately NOT restated here as `_0109`/`_0108`/`_0001`.
+    // A second copy of that fact in a file that does not own it is the thing
+    // that goes stale; the log line below reads it off `tables12` instead.
     //
     // ⚠ Refusing HERE — before `BridgeDevice12::create` and before the in-place
     // `core::ptr::write` — is the whole point: nothing is constructed, nothing
@@ -345,25 +425,61 @@ pub(crate) unsafe fn create_device(
     // count from the runtime's own `SIZE_T` in both directions and stub-fills
     // the whole buffer first. The ordering makes the question moot rather than
     // merely survivable.
-    match negotiated {
-        Ddi12Interface::R8_0110 => {}
-        Ddi12Interface::R8_0116 => {
-            note_refusal(&UMD12_REFUSALS.create_device_core_ddi_unimplemented);
-            log_error!(
-                "CreateDevice: the runtime NEGOTIATED Core DDI build {build} (token {:#018x}) -- \
-                 the 0116 device/command-list/queue table shapes are NOT IMPLEMENTED in this \
-                 build, so no device is constructed. This is `Umd12CoreDdi=116`'s ANSWER, not a \
-                 fault: the inbox D3D12 runtime accepts D3D12DDI_SUPPORTED_0116. -> \
-                 DXGI_ERROR_UNSUPPORTED",
-                ((a.Interface as u64) << 32) | (a.Version as u64),
-            );
-            // ⛔ `DXGI_ERROR_UNSUPPORTED` (0x887A_0004), NEVER
-            // `DXGI_ERROR_DRIVER_INTERNAL_ERROR` (0x887A_0020): the latter is
-            // recorded by the runtime and by ETW as a *driver fault*, and this
-            // is a declined negotiation. R801 is the scar on the D3D11 side.
-            return DXGI_ERROR_UNSUPPORTED;
-        }
+    // ⭐ **DERIVED, as of the retirement's U0.** The gate used to be a literal
+    // `R8_0116 => refuse` arm, which was correct and unmaintainable in the same
+    // breath: it said "0116 is not implemented" in a file that would not notice
+    // when it became implemented. It now asks
+    // `Ddi12Interface::tables_implemented()`, which reads
+    // `forward12::tables12`'s own three type aliases through `TableShape` — so
+    // the day `tables12` fills `…_CORE_0116` + `…_FUNCS_3D_0114` this gate opens
+    // by construction, and if `tables12` ever moves while the knob default does
+    // not, `adapter12`'s compile-time block fails the build first.
+    if !negotiated.tables_implemented() {
+        let (dev, list, queue) = negotiated.table_builds();
+        note_refusal(&UMD12_REFUSALS.create_device_core_ddi_unimplemented);
+        log_error!(
+            "CreateDevice: the runtime NEGOTIATED Core DDI build {build} (token {:#018x}), which \
+             selects the DEVICE_CORE_{dev:04} + COMMAND_LIST_3D_{list:04} + \
+             COMMAND_QUEUE_CORE_{queue:04} table shapes -- this build's forward12::tables12 fills \
+             DEVICE_CORE_{:04} + COMMAND_LIST_3D_{:04} + COMMAND_QUEUE_CORE_{:04}, so no device is \
+             constructed. ⛔ The command-list tables are the SAME 600 bytes at the SAME 75 \
+             offsets, so this is the one mismatch no size check can catch: 38 of the 0114 slots \
+             take D3D12DDI_API_HCOMMANDLIST (a runtime-bypass header) where the 0108 bodies \
+             expect D3D12DDI_HCOMMANDLIST. -> DXGI_ERROR_UNSUPPORTED",
+            ((a.Interface as u64) << 32) | (a.Version as u64),
+            <forward12::tables12::DeviceCoreTable as adapter12::TableShape>::BUILD,
+            <forward12::tables12::CommandListTable as adapter12::TableShape>::BUILD,
+            <forward12::tables12::CommandQueueTable as adapter12::TableShape>::BUILD,
+        );
+        // ⛔ `DXGI_ERROR_UNSUPPORTED` (0x887A_0004), NEVER
+        // `DXGI_ERROR_DRIVER_INTERNAL_ERROR` (0x887A_0020): the latter is
+        // recorded by the runtime and by ETW as a *driver fault*, and this is a
+        // declined negotiation. R801 is the scar on the D3D11 side.
+        return DXGI_ERROR_UNSUPPORTED;
     }
+
+    // ── 2b. The corelayer union arm ─────────────────────────────────────────
+    //
+    // ⛔ **Still an exhaustive match, and this is now where that property
+    // earns its keep.** The gate above is a boolean; picking which of the six
+    // `p12UMCallbacks*` union arms the runtime actually filled is the
+    // `ARCHITECTURE.md` §12 trap 2 landmine itself, and it must be decided by
+    // the negotiated version and nothing else. A third arm added to
+    // `Ddi12Interface` fails to compile here until someone says which callback
+    // table it brings.
+    //
+    // ⚠ `um_callbacks_raw` (the `_0062` view, null-checked above) is kept on
+    // BOTH arms — a prefix read of the longer table, asserted field-by-field at
+    // the top of this file — so `set_error` and `set_command_list_error` need
+    // no arm of their own.
+    let um_callbacks_0116 = match negotiated {
+        Ddi12Interface::R8_0110 => core::ptr::null(),
+        // SAFETY: every arm of this union is a pointer at offset 0 — machine
+        // checked by the bindgen layout assertions — and the negotiated version
+        // is `_0116`, which is what makes `p12UMCallbacks_0116` the arm the
+        // runtime filled. The pointer is not dereferenced here.
+        Ddi12Interface::R8_0116 => unsafe { a.__bindgen_anon_1.p12UMCallbacks_0116 },
+    };
 
     // ⚠ `pReserveRanges` / `NumReserveRanges` are read and reported, not acted
     // on. They are the GPU-virtual-address ranges the runtime asks the driver to
@@ -415,6 +531,7 @@ pub(crate) unsafe fn create_device(
                 um_callbacks: um_callbacks_raw,
                 kt_callbacks: a.pKTCallbacks,
                 engine,
+                um_callbacks_0116,
             },
         );
     }
@@ -482,12 +599,13 @@ pub(crate) unsafe fn destroy_device(h_device: ddi12::D3D12DDI_HDEVICE) {
 ///   device touched rather than what the whole adapter did.
 fn log_device_teardown(dev: &HeliosD3D12Device) {
     log_error!(
-        "DestroyDevice: {} hRTDevice={:p} Flags={:#x} p12UMCallbacks={:p} pKTCallbacks={:p} \
-         venusCtx={}",
+        "DestroyDevice: {} hRTDevice={:p} Flags={:#x} p12UMCallbacks={:p} p12UMCallbacks_0116={:p} \
+         pKTCallbacks={:p} venusCtx={}",
         dev.negotiated.name(),
         dev.h_rt_device.handle,
         dev.flags,
         dev.um_callbacks,
+        dev.um_callbacks_0116,
         dev.kt_callbacks,
         dev.engine.venus_context_id(),
     );
