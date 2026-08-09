@@ -2130,4 +2130,52 @@ mod tests {
             })
         );
     }
+
+    /// `protocol/include/helios_translation_session.h` hand-copies every
+    /// constant below. Pin the exact literals here so a change on the Rust side
+    /// without the matching header edit is caught by a failing test that names
+    /// the header, not by a live VM admitting an outer context into the wrong
+    /// host namespace. (Offsets and sizes need no test: both sides assert them
+    /// at compile time.)
+    ///
+    /// The two aliased constants are pinned to their *literal* values on
+    /// purpose. The header aliases them too — `HELIOS_HQA1_FLAG_*` through
+    /// `helios_wddm.h` and `HELIOS_HTS1_MAX_OUTSTANDING_CONTEXT_BATCHES` /
+    /// `HELIOS_HTS1_MAX_CONTEXT_BATCH_BYTES` through `helios_wddm.h` and
+    /// `helios_native_render.h` — so asserting alias-equals-alias would prove
+    /// nothing. The literal is what a C compiler ends up with.
+    #[test]
+    fn c_mirror_carries_these_exact_constants() {
+        // protocol/include/helios_translation_session.h
+        assert_eq!(crate::HELIOS_PACKAGE_GENERATION, 0x4845_4C49_0000_0001);
+
+        assert_eq!(HELIOS_HQA1_MAGIC, 0x3141_5148);
+        assert_eq!(HELIOS_HQA1_ABI_VERSION, 1);
+        assert_eq!(HELIOS_HQA1_SIZE, 72);
+        assert_eq!(HELIOS_HQA1_FLAG_D3D11_PHYSICAL, 1);
+        assert_eq!(HELIOS_HQA1_FLAG_D3D12_VIRTUAL, 2);
+        assert_eq!(HELIOS_HQA1_FLAGS_MASK, 3);
+
+        assert_eq!(HELIOS_HTS1_INIT_MAGIC, 0x3153_5448);
+        assert_eq!(HELIOS_HTS1_REPLY_MAGIC, 0x3152_5448);
+        assert_eq!(HELIOS_HTS1_ABI_VERSION, 1);
+        assert_eq!(HELIOS_HTS1_INIT_SIZE, 32);
+        assert_eq!(HELIOS_HTS1_REPLY_SIZE, 56);
+        assert_eq!(HELIOS_HTS1_ENDPOINT_SIZE, 16);
+
+        assert_eq!(HELIOS_ENGINE_CLASS_GRAPHICS, 1);
+        assert_eq!(HELIOS_ENGINE_CLASS_COMPUTE, 2);
+        assert_eq!(HELIOS_ENGINE_CLASS_COPY, 3);
+
+        assert_eq!(HELIOS_CONTROL_CLASS_PURE, 1);
+        assert_eq!(HELIOS_CONTROL_CLASS_OUTER_ALLOCATION_BACKED, 2);
+        assert_eq!(HELIOS_CONTROL_CLASS_GPU_DEPENDENT, 3);
+
+        assert_eq!(HELIOS_HTS1_MAX_SESSIONS_PER_PROCESS, 16);
+        assert_eq!(HELIOS_HTS1_MAX_RING_INDEX, 255);
+        assert_eq!(HELIOS_HTS1_MAX_ENDPOINTS_PER_SESSION, 64);
+        assert_eq!(HELIOS_HTS1_MAX_OUTSTANDING_CONTEXT_BATCHES, 64);
+        assert_eq!(HELIOS_HTS1_MAX_CONTEXT_BATCH_BYTES, 15_728_640);
+        assert_eq!(HELIOS_HTS1_MAX_HOST_DISPATCH_FIFO_DEPTH, 256);
+    }
 }

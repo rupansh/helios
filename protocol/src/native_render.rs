@@ -3708,4 +3708,105 @@ mod tests {
             Err(Hnr2DmaReject::AllocationGenerationStale)
         );
     }
+
+    /// `protocol/include/helios_native_render.h` hand-copies every constant
+    /// below. Pin the exact literals here so a change on the Rust side without
+    /// the matching header edit is caught by a failing test that names the
+    /// header, not by a live VM mis-parsing a Render fragment or a reply slot.
+    /// (Offsets and sizes need no test: both sides assert them at compile time.)
+    ///
+    /// ⛔ The header deliberately mirrors NOTHING from [`kernel_dma`]:
+    /// `Hnr2PhysicalCapability` carries a physical address, a segment ID and an
+    /// HPM1 placement epoch, and §17.1 states the record "exists only in
+    /// scheduler DMA and is never returned to user mode". So no constant of that
+    /// module is pinned here either — an assertion that a Mesa-facing header
+    /// carries a kernel-internal value would be asserting the wrong thing.
+    ///
+    /// [`HELIOS_NATIVE_RENDER_CAPSET`] is aliased from
+    /// [`crate::virtio_gpu::VIRTIO_GPU_CAPSET_VENUS`] on this side but must be a
+    /// literal in C (there is no C mirror of `virtio_gpu.rs`), so it is pinned to
+    /// the literal — asserting alias-equals-alias would prove nothing.
+    #[test]
+    fn c_mirror_carries_these_exact_constants() {
+        // protocol/include/helios_native_render.h
+        assert_eq!(crate::HELIOS_PACKAGE_GENERATION, 0x4845_4C49_0000_0001);
+        assert_eq!(HELIOS_NATIVE_RENDER_CAPSET, 4);
+
+        assert_eq!(HELIOS_HVC1_MAGIC, 0x3143_5648);
+        assert_eq!(HELIOS_HVC1_ABI_VERSION, 1);
+        assert_eq!(HELIOS_HVC1_SIZE, 32);
+        assert_eq!(HELIOS_HVC1_MODE_FINITE_HNR2_RENDER, 2);
+        assert_eq!(HELIOS_HVC1_CONTROL_ORDINAL, 0xFFFF_FFFF);
+        assert_eq!(HELIOS_HVC1_NODE_ORDINAL, 0);
+        assert_eq!(HELIOS_HVC1_ENGINE_AFFINITY, 0);
+        assert_eq!(HELIOS_HVC1_FENCE_ENGINE_AFFINITY, 1);
+        assert_eq!(HELIOS_HVC1_DMA_BUFFER_BYTES, 262_144);
+        assert_eq!(HELIOS_HVC1_ALLOCATION_LIST_ENTRIES, 4096);
+        assert_eq!(HELIOS_HVC1_PATCH_LOCATION_ENTRIES, 4096);
+        assert_eq!(HELIOS_HVC1_DMA_PRIVATE_DATA_BYTES, 64);
+        assert_eq!(HELIOS_HVC1_DMA_BUFFER_SEGMENT_SET, 0);
+        assert_eq!(HELIOS_HVC1_CONTROL_RING_INDEX, 0);
+        assert_eq!(HELIOS_HVC1_CREATE_CONTEXT_FLAGS, 0);
+
+        assert_eq!(HELIOS_HNR2_MAGIC, 0x3252_4E48);
+        assert_eq!(HELIOS_HNR2_ABI_VERSION, 2);
+        assert_eq!(HELIOS_HNR2_HEADER_SIZE, 112);
+        assert_eq!(HELIOS_HNR2_MAX_PAYLOAD_BYTES, 15_728_640);
+        assert_eq!(HELIOS_HNR2_MAX_FRAGMENTS, 64);
+        assert_eq!(HELIOS_HNR2_MAX_USE_RECORDS, 4096);
+        assert_eq!(HELIOS_HNR2_MAX_PATCH_RECORDS, 8192);
+        assert_eq!(HELIOS_HNR2_USE_RECORD_SIZE, 24);
+        assert_eq!(HELIOS_HNR2_PATCH_RECORD_SIZE, 16);
+        assert_eq!(HELIOS_HNR2_MAX_OUTSTANDING_SUBMISSIONS, 64);
+        assert_eq!(HELIOS_HNR2_SLOT_POOL_BYTES, 15_728_640);
+        assert_eq!(HELIOS_HNR2_FLAG_BEGIN, 1);
+        assert_eq!(HELIOS_HNR2_FLAG_COMMIT, 2);
+        assert_eq!(HELIOS_HNR2_FLAG_HAS_REPLY, 4);
+        assert_eq!(HELIOS_HNR2_FLAG_MASK, 7);
+        assert_eq!(HELIOS_HNR2_NO_REPLY_ALLOCATION_INDEX, 0xFFFF_FFFF);
+        assert_eq!(HELIOS_HNR2_REPLY_OFFSET_ALIGN, 8);
+        assert_eq!(HELIOS_HNR2_ACCESS_READ, 1);
+        assert_eq!(HELIOS_HNR2_ACCESS_WRITE, 2);
+        assert_eq!(HELIOS_HNR2_ACCESS_MASK, 3);
+        assert_eq!(HELIOS_HNR2_OPERAND_KIND_INVALID, 0);
+        assert_eq!(HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32, 1);
+        assert_eq!(HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID64, 2);
+        assert_eq!(HELIOS_HNR2_OPERAND_WIDTH_32, 4);
+        assert_eq!(HELIOS_HNR2_OPERAND_WIDTH_64, 8);
+        assert_eq!(HELIOS_HNR2_OPERAND_ALIGN, 4);
+
+        assert_eq!(HELIOS_HVM1_MAGIC, 0x314D_5648);
+        assert_eq!(HELIOS_HVM1_ABI_VERSION, 1);
+        assert_eq!(HELIOS_HVM1_SIZE, 64);
+        assert_eq!(HELIOS_HVM1_ROLE_REPLY_POOL, 1);
+        assert_eq!(HELIOS_HVM1_ROLE_VULKAN_HOST_VISIBLE, 2);
+        assert_eq!(HELIOS_HVM1_ROLE_FEEDBACK, 3);
+        assert_eq!(HELIOS_HVM1_ROLE_VULKAN_DEVICE_LOCAL, 4);
+        assert_eq!(HELIOS_HVM1_ACCESS_CPU_READ, 1);
+        assert_eq!(HELIOS_HVM1_ACCESS_CPU_WRITE, 2);
+        assert_eq!(HELIOS_HVM1_ACCESS_HOST_READ, 4);
+        assert_eq!(HELIOS_HVM1_ACCESS_HOST_WRITE, 8);
+        assert_eq!(HELIOS_HVM1_ACCESS_MASK, 15);
+        assert_eq!(HELIOS_HVM1_CACHE_NOT_CPU_VISIBLE, 0);
+        assert_eq!(HELIOS_HVM1_CACHE_WRITE_COMBINED, 1);
+        assert_eq!(HELIOS_HVM1_SEGMENT_PAGE_SHIFT, 12);
+        assert_eq!(HELIOS_HVM1_REPLY_POOL_BYTES, 67_108_864);
+        assert_eq!(HELIOS_HVM1_REPLY_SLOT_BYTES, 16_777_216);
+        assert_eq!(HELIOS_HVM1_REPLY_SLOT_COUNT, 4);
+
+        assert_eq!(HELIOS_HVR1_MAGIC, 0x3152_5648);
+        assert_eq!(HELIOS_HVR1_VERSION, 1);
+        assert_eq!(HELIOS_HVR1_HEADER_SIZE, 80);
+        assert_eq!(HELIOS_HVR1_MAX_SNAPSHOT_BYTES, 67_108_864);
+        assert_eq!(HELIOS_HVR1_MAX_LIVE_SNAPSHOTS, 4);
+        assert_eq!(HELIOS_HVR1_MAX_LIVE_SNAPSHOT_BYTES, 268_435_456);
+        assert_eq!(HELIOS_HVR1_MAX_CHUNK_BYTES, 15_728_640);
+        assert_eq!(HELIOS_HVR1_FLAG_MORE, 1);
+        assert_eq!(HELIOS_HVR1_FLAG_FINAL, 2);
+        assert_eq!(HELIOS_HVR1_FLAG_MASK, 3);
+
+        // The 40-byte continuation request has no size constant on either side;
+        // both assert the literal at compile time.
+        assert_eq!(core::mem::size_of::<HeliosVenusReplyContinuationV1>(), 40);
+    }
 }
