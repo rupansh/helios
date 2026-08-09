@@ -22,7 +22,7 @@
 //!
 //! | slot | S5 |
 //! |---|---|
-//! | `pfnGetSupportedVersions` | **real** — the one-token set, D12 |
+//! | `pfnGetSupportedVersions` | **real** — the one-token set, D12; which token is `Umd12CoreDdi`'s |
 //! | `pfnGetOptionalDDITables` | **real** — `*puEntries = 0`, the measured-correct answer (`DDI_REFERENCE.md` §2.2) |
 //! | `pfnCloseAdapter` | **real** — validates the handle and dumps the refusal set |
 //! | `pfnGetCaps` | **real** as of L1 — delegates to `caps12` |
@@ -45,12 +45,28 @@
 //!
 //! `ARCHITECTURE.md` §1.2, steps 7-12: `pfnGetSupportedVersions` →
 //! `pfnGetCaps` ×43 → `pfnGetOptionalDDITables` → `pfnFillDDITable` ×N →
-//! `pfnCalcPrivateDeviceSize` → `pfnCreateDevice`. ⚠ **`pfnFillDDITable` runs
-//! before `pfnCreateDevice`**, i.e. the tables are adapter-scoped and filled
-//! before any device exists — the opposite of the D3D11 shape, where
-//! `CreateDevice` fills the device-funcs table itself. At S5 the runtime never
+//! `pfnCalcPrivateDeviceSize` → `pfnCreateDevice`. At S5 the runtime never
 //! gets past `pfnGetCaps`, and it says so in English on ETW: *"Driver did not
 //! respond to D3D12DDICAPS_TYPE_D3D12_OPTIONS caps query."*
+//!
+//! ⛔ **CORRECTION, measured 2026-08-09 on 26100.8737: `pfnFillDDITable` runs
+//! AFTER `pfnCreateDevice`, not before.** This paragraph used to say the
+//! opposite — *"the tables are adapter-scoped and filled before any device
+//! exists"* — and `ARCHITECTURE.md` §1.2 still does. The order this driver
+//! actually sees, on its own adapter, is
+//!
+//! ```text
+//! OpenAdapter12 -> pfnGetCaps(1074) -> pfnGetSupportedVersions x2
+//!   -> pfnCalcPrivateDeviceSize -> pfnCreateDevice
+//!   -> pfnGetCaps x24 -> pfnGetOptionalDDITables -> pfnFillDDITable x5
+//! ```
+//!
+//! (`tmp/dx12/core-ddi-0116/final-A-110-default/umd12.log:11-47`, three
+//! device cycles in one process, identical each time). The tables are still
+//! **adapter**-scoped — they are filled through the adapter table and not by
+//! `CreateDevice`, which is the real difference from D3D11 — but "before any
+//! device exists" was wrong, and `device12::create_device`'s table-shape gate
+//! depends on which way round it is.
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -85,39 +101,160 @@ const fn ddi12_supported(interface_version: u32, build_version: u32) -> u64 {
     ((interface_version as u64) << 32) | ((build_version as u64) << 16)
 }
 
-/// The DDI interface versions `pfnGetSupportedVersions` advertises.
+/// `D3D12DDI_BUILD_VERSION_0116` — **the one hand-written DDI ABI value in this
+/// crate**, and the comment below is what licenses it.
 ///
-/// ⛔ **Exactly one entry, and that is `DECISIONS.md` D12's load-bearing half.**
-/// With a one-element set the runtime either negotiates `_0110` or fails the
-/// handshake with its own string (*"Failed to find matching DDI versions"*), so
-/// there is exactly one legal `(Interface, Version)` pair and exactly one legal
-/// table shape. A second entry would make a second table shape reachable —
-/// which is precisely the `ARCHITECTURE.md` §12 trap 2 / R702 surface that
-/// D12 closes by construction rather than by guarding.
-const SUPPORTED_DDI_VERSIONS: &[u64] = &[ddi12_supported(
+/// ⛔ `DECISIONS.md` §7.2 bans hand-written DDI ABI values and [`ddi12_supported`]
+/// above says why. This constant is the single exception, because the header
+/// this build's bindings are generated from **cannot supply it**: the guest's
+/// installed WDK is 10.0.26100.0 and its `d3d12umddi.h` stops at
+/// `D3D12DDI_SUPPORTED_0110`. Regenerating against WDK 28000 is the retirement
+/// lane's U0 and is a separate, larger change (it moves the table shapes too).
+///
+/// ✅ Transcribed from the staged WDK 28000 header, which is in the tree and
+/// readable on both sides (`tmp/wdk-28000/Include/10.0.28000.0/um/d3d12umddi.h`,
+/// `Z:\tmp\wdk-28000\…` from the VM):
+///
+/// ```text
+/// 14734: #define D3D12DDI_BUILD_VERSION_0116 116
+/// 14735: #define D3D12DDI_SUPPORTED_0116 ((((UINT64)D3D12DDI_INTERFACE_VERSION_R8) << 32) | (((UINT64)D3D12DDI_BUILD_VERSION_0116) << 16))
+/// 10301: #define D3D12DDI_MINOR_VERSION_R8 80
+/// ```
+///
+/// ⭐ Two things that transcription rests on are **machine-checked below rather
+/// than asserted in prose**: that `_0116` is an **R8** token (so the interface
+/// half is the generated `D3D12DDI_INTERFACE_VERSION_R8`, not another constant),
+/// and that at this generation the build half is the decimal `NNNN` — proved by
+/// the generated `D3D12DDI_BUILD_VERSION_0110 == 110` sitting in the same
+/// numbering run. `DDI_REFERENCE.md` §1.5 records the worked example that got
+/// `_0080` wrong by assuming that rule *below* `_0090`, where it does not hold.
+const BUILD_VERSION_0116: u32 = 116;
+
+/// The one-element set advertised on the **110** arm — today's behaviour.
+const SUPPORTED_DDI_VERSIONS_0110: &[u64] = &[ddi12_supported(
     ddi12::D3D12DDI_INTERFACE_VERSION_R8,
     ddi12::D3D12DDI_BUILD_VERSION_0110,
+)];
+
+/// The one-element set advertised on the **116** arm — the experiment.
+const SUPPORTED_DDI_VERSIONS_0116: &[u64] = &[ddi12_supported(
+    ddi12::D3D12DDI_INTERFACE_VERSION_R8,
+    BUILD_VERSION_0116,
 )];
 
 /// The negotiated DDI interface, as a **closed set**.
 ///
 /// `ARCHITECTURE.md` §12 trap 2: never let an unknown interface fall into an
 /// `else` that fills the largest table. The D3D11 driver paid 376..392 bytes of
-/// the runtime's heap to learn that. Here the set has one member, so the match
-/// below is exhaustive with a single legal arm and every other pair is a
-/// counted refusal.
+/// the runtime's heap to learn that. Here the set has one member **at runtime**
+/// — the arm [`Ddi12Interface::selected`] resolves to — so [`Self::from_pair`]
+/// admits exactly one pair and every other pair is a counted refusal.
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub(crate) enum Ddi12Interface {
     /// `D3D12DDI_SUPPORTED_0110` — release R8, build 110. Fills the
     /// `_0109`-generation tables (D12: `_0110` adds no table struct of its own).
+    /// **The default, and the only arm whose tables this driver implements.**
     R8_0110,
+    /// `D3D12DDI_SUPPORTED_0116` — release R8, build 116. The Core DDI the
+    /// HPS2-retirement reference requires (`HELIOS_PRESENT_SYNC_RETIREMENT.md`
+    /// §10.2, line 982: *"build 28000+ and negotiated `D3D12DDI_SUPPORTED_0116`
+    /// or later"* — Core 0112 adds native-fence **create**, 0116 native-fence
+    /// **open**).
+    ///
+    /// ⛔⛔ **THE TABLE SHAPES FOR THIS ARM ARE NOT IMPLEMENTED**, and that is
+    /// why `device12::create_device` refuses it before constructing anything.
+    /// This variant exists to answer exactly one question — *does the inbox
+    /// D3D12 runtime on build 26100 accept the 0116 token at all, or is the
+    /// 26100 WDK header limit also a runtime limit?* — and it answers it by
+    /// being advertised, not by being served.
+    R8_0116,
 }
 
 impl Ddi12Interface {
+    /// The token's **build** half, as the header's `D3D12DDI_BUILD_VERSION_NNNN`
+    /// spells it.
+    const fn build(self) -> u32 {
+        match self {
+            Self::R8_0110 => ddi12::D3D12DDI_BUILD_VERSION_0110,
+            Self::R8_0116 => BUILD_VERSION_0116,
+        }
+    }
+
     /// The high 32 bits of the token: `(12 << 16) | MINOR_VERSION_R8`.
-    const R8_0110_INTERFACE: u32 = ddi12::D3D12DDI_INTERFACE_VERSION_R8;
-    /// The low 32 bits: `BUILD_VERSION_0110 << 16`.
-    const R8_0110_VERSION: u32 = ddi12::D3D12DDI_BUILD_VERSION_0110 << 16;
+    ///
+    /// ⚠ Identical for both arms and that is a **fact about the header, not a
+    /// simplification**: WDK 28000 gives `_0110` through `_0119` the same
+    /// `D3D12DDI_INTERFACE_VERSION_R8 == ((12 << 16) | 80)` and differs them
+    /// only in `D3D12DDI_BUILD_VERSION_NNNN`. So the 116 experiment moves the
+    /// *build* number and nothing else — which is also why an 0116 negotiation
+    /// cannot be detected by looking at `Interface` alone.
+    const fn interface(self) -> u32 {
+        match self {
+            Self::R8_0110 | Self::R8_0116 => ddi12::D3D12DDI_INTERFACE_VERSION_R8,
+        }
+    }
+
+    /// The low 32 bits: `BUILD_VERSION_NNNN << 16`.
+    const fn version(self) -> u32 {
+        self.build() << 16
+    }
+
+    /// The whole `D3D12DDI_SUPPORTED_NNNN` token.
+    const fn token(self) -> u64 {
+        ddi12_supported(self.interface(), self.build())
+    }
+
+    /// This arm's advertised set — what `pfnGetSupportedVersions` hands back.
+    ///
+    /// ⛔ **Exactly one entry, and that is `DECISIONS.md` D12's load-bearing
+    /// half.** With a one-element set the runtime either negotiates that token
+    /// or fails the handshake with its own string (*"Failed to find matching
+    /// DDI versions"*), so there is exactly one legal `(Interface, Version)`
+    /// pair and exactly one legal table shape. A second entry would make a
+    /// second table shape reachable — precisely the `ARCHITECTURE.md` §12 trap 2
+    /// / R702 surface D12 closes by construction rather than by guarding.
+    ///
+    /// ⚠ **`Umd12CoreDdi` selects WHICH one-element set, never how many
+    /// elements.** Both arms are one-element constants and the compile-time
+    /// block below asserts the length of *each*, so the property above survives
+    /// the knob rather than depending on it.
+    const fn advertised(self) -> &'static [u64] {
+        match self {
+            Self::R8_0110 => SUPPORTED_DDI_VERSIONS_0110,
+            Self::R8_0116 => SUPPORTED_DDI_VERSIONS_0116,
+        }
+    }
+
+    /// The arm `HKLM\SOFTWARE\Helios!Umd12CoreDdi` selects. **Absent = 110.**
+    ///
+    /// ⛔ An unrecognised value is a **counted refusal that falls back to 110**,
+    /// never a value passed through to the runtime: advertising a token this
+    /// driver has no arm for would put the runtime into a negotiation whose
+    /// table shape nothing in this crate knows, which is the
+    /// `ARCHITECTURE.md` §12 trap 2 surface arriving through the registry
+    /// instead of through an `else`.
+    ///
+    /// Read through [`knobs12::umd12_core_ddi`], whose `OnceLock` makes the
+    /// answer stable for the process — load-bearing, because
+    /// `pfnGetSupportedVersions` and `pfnCreateDevice` must agree about which
+    /// single pair is legal.
+    pub(crate) fn selected() -> Self {
+        match knobs12::umd12_core_ddi() {
+            110 => Self::R8_0110,
+            116 => Self::R8_0116,
+            other => {
+                UMD12_REFUSALS.core_ddi_knob_unknown.bump();
+                let n = UMD12_REFUSALS.core_ddi_knob_unknown.get();
+                if n <= LOG_BUDGET {
+                    log_error!(
+                        "Umd12CoreDdi={other} names no Core DDI build this driver can advertise \
+                         (110 or 116) -- falling back to 110 (x{n})",
+                    );
+                }
+                Self::R8_0110
+            }
+        }
+    }
 
     /// ✅ `D12-G5` confirmed the split rather than inferring it:
     /// `D3D12DDIARG_CREATEDEVICE::Interface` carries the token's **high** 32
@@ -126,29 +263,79 @@ impl Ddi12Interface {
     /// bit. Matching on the pair keeps this site independent of that split
     /// being re-derived correctly a second time.
     ///
-    /// Panic-free: a match over two `u32`s, no indexing.
+    /// ⛔ It admits the **selected** arm and nothing else — not "any arm this
+    /// enum can name". A runtime that handed back 116 while this process
+    /// advertised 110 is a `Ddi12VersionMismatch`, exactly as a runtime that
+    /// handed back `_0040` would be: the one-element set means one legal pair,
+    /// and that property must not weaken just because the enum grew a variant.
+    ///
+    /// Panic-free: two `u32` comparisons, no indexing.
     pub(crate) fn from_pair(interface: u32, version: u32) -> Option<Self> {
-        match (interface, version) {
-            (Self::R8_0110_INTERFACE, Self::R8_0110_VERSION) => Some(Self::R8_0110),
-            _ => None,
+        let selected = Self::selected();
+        if interface == selected.interface() && version == selected.version() {
+            Some(selected)
+        } else {
+            None
         }
     }
 
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::R8_0110 => "_0110",
+            Self::R8_0116 => "_0116",
         }
     }
 }
 
-// Keep the enum and the advertised set in lockstep at COMPILE time, the way
+/// The Core DDI **build** number this process actually advertises, for
+/// `knobs12::resolved_inventory`.
+///
+/// ⚠ The effective value, not the raw DWORD: an unrecognised `Umd12CoreDdi`
+/// falls back to 110 and the inventory line must say 110, because that is the
+/// configuration the run had. `CoreDdiKnobUnknown` beside it is what says the
+/// registry value was rejected rather than honoured.
+pub(crate) fn selected_core_ddi_build() -> u32 {
+    Ddi12Interface::selected().build()
+}
+
+/// Decode any `(Interface, Version)` pair the way `d3d12umddi.h` composes one:
+/// `Interface = (MAJOR << 16) | MINOR_Rn` and `Version = BUILD << 16`. Returns
+/// `(major, minor, build)`.
+///
+/// ⭐ Deliberately total — it decodes a pair this driver did **not** advertise,
+/// which is the only case where the numbers are worth printing. A log line that
+/// can only decode the values we already know is not an instrument.
+pub(crate) fn decode_pair(interface: u32, version: u32) -> (u32, u32, u32) {
+    (interface >> 16, interface & 0xffff, version >> 16)
+}
+
+// Keep the enum and the advertised sets in lockstep at COMPILE time, the way
 // `umd/src/adapter.rs:90-95` does: adding a token without adding a variant
-// fails here, and adding a variant without a dispatch arm fails the exhaustive
-// match in `from_pair`. That is the property the `else`-as-default did not have.
+// fails here, and adding a variant without an arm fails the exhaustive matches
+// above. That is the property the `else`-as-default did not have.
+//
+// ⭐ Every assertion is stated **per arm**, not over "the advertised set", so
+// the knob cannot make one of them vacuous — a knob-selected set whose
+// invariants were only checked on the default arm would be exactly the shape of
+// assurance that is not real.
 const _: () = {
-    assert!(SUPPORTED_DDI_VERSIONS.len() == 1);
-    assert!((SUPPORTED_DDI_VERSIONS[0] >> 32) as u32 == Ddi12Interface::R8_0110_INTERFACE);
-    assert!(SUPPORTED_DDI_VERSIONS[0] as u32 == Ddi12Interface::R8_0110_VERSION);
+    // The build half is the decimal `NNNN` at this generation. Generated, and
+    // the premise `BUILD_VERSION_0116` is transcribed under.
+    assert!(ddi12::D3D12DDI_BUILD_VERSION_0110 == 110);
+
+    assert!(SUPPORTED_DDI_VERSIONS_0110.len() == 1);
+    assert!((SUPPORTED_DDI_VERSIONS_0110[0] >> 32) as u32 == Ddi12Interface::R8_0110.interface());
+    assert!(SUPPORTED_DDI_VERSIONS_0110[0] as u32 == Ddi12Interface::R8_0110.version());
+    assert!(SUPPORTED_DDI_VERSIONS_0110[0] == Ddi12Interface::R8_0110.token());
+
+    assert!(SUPPORTED_DDI_VERSIONS_0116.len() == 1);
+    assert!((SUPPORTED_DDI_VERSIONS_0116[0] >> 32) as u32 == Ddi12Interface::R8_0116.interface());
+    assert!(SUPPORTED_DDI_VERSIONS_0116[0] as u32 == Ddi12Interface::R8_0116.version());
+    assert!(SUPPORTED_DDI_VERSIONS_0116[0] == Ddi12Interface::R8_0116.token());
+
+    // The two arms must be distinguishable, or the experiment reads its own
+    // control arm and calls it a result.
+    assert!(Ddi12Interface::R8_0110.token() != Ddi12Interface::R8_0116.token());
 };
 
 // `D3D12DDIARG_OPENADAPTER::pAdapterFuncs` is typed `D3D12DDI_ADAPTERFUNCS*`
@@ -165,6 +352,13 @@ const _: () = {
 // assert: `D3D12DDIARG_CREATEDEVICE_0109` is `_0003` plus two trailing fields,
 // so reading it against a `_0003` arg would read past the end. Advertising one
 // token means a `_0003`-generation create can never be negotiated.
+//
+// ⭐ **`Umd12CoreDdi=116` does not touch this table**, and that was checked
+// rather than assumed: WDK 28000's `d3d12umddi.h` still declares exactly two
+// adapter-funcs shapes, `D3D12DDI_ADAPTERFUNCS` (`:2686`) and
+// `D3D12DDI_ADAPTERFUNCS_0109` (`:13797`), both eight slots. There is no
+// `_0116` shape, and in any case this table is written **before** any version
+// is negotiated, so its shape cannot depend on the advertised token.
 const _: () = {
     assert!(
         core::mem::size_of::<ddi12::D3D12DDI_ADAPTERFUNCS>()
@@ -320,11 +514,19 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut c_void) -> Hresult {
         return E_INVALIDARG;
     }
 
+    let selected = Ddi12Interface::selected();
     log_error!(
-        "OpenAdapter12: knob ON, hRTAdapter={:p} pAdapterCallbacks={:p} advertising {:#018x?}",
+        "OpenAdapter12: knob ON, hRTAdapter={:p} pAdapterCallbacks={:p} advertising {} \
+         token={:#018x} Interface={:#010x} (major={} minor={}) Version={:#010x} (build={})",
         open.hRTAdapter.handle,
         open.pAdapterCallbacks,
-        SUPPORTED_DDI_VERSIONS,
+        selected.name(),
+        selected.token(),
+        selected.interface(),
+        selected.interface() >> 16,
+        selected.interface() & 0xffff,
+        selected.version(),
+        selected.build(),
     );
 
     // ── 4. The driver's adapter handle ──────────────────────────────────────
@@ -394,19 +596,34 @@ unsafe extern "C" fn get_supported_versions(
     // SAFETY: non-null per the check above; the DDI declares it `_Inout_`, so
     // the runtime guarantees a live, writable `UINT32` for the call.
     let requested = unsafe { *entries };
+
+    // ⛔ Resolved ONCE per call and reused for the log line, the count and the
+    // fill. Reading the knob three times would be three chances for the three to
+    // disagree about which single pair is legal — and this DDI's whole contract
+    // is that there is exactly one.
+    let selected = Ddi12Interface::selected();
+    let advertised = selected.advertised();
     log_error!(
-        "GetSupportedVersions: requested={requested} bufNull={} advertising {:#018x?}",
+        "GetSupportedVersions: requested={requested} bufNull={} advertising {} entries={} \
+         token={:#018x} Interface={:#010x} (major={} minor={}) Version={:#010x} (build={})",
         supported_versions.is_null(),
-        SUPPORTED_DDI_VERSIONS,
+        selected.name(),
+        advertised.len(),
+        selected.token(),
+        selected.interface(),
+        selected.interface() >> 16,
+        selected.interface() & 0xffff,
+        selected.version(),
+        selected.build(),
     );
     // SAFETY: as above. Written before the early return below, because the
     // count-query form's whole purpose is this store.
-    unsafe { *entries = SUPPORTED_DDI_VERSIONS.len() as ddi12::UINT32 };
+    unsafe { *entries = advertised.len() as ddi12::UINT32 };
 
     if supported_versions.is_null() {
         return S_OK;
     }
-    if (requested as usize) < SUPPORTED_DDI_VERSIONS.len() {
+    if (requested as usize) < advertised.len() {
         // ⚠ Not a refusal counter: the runtime asking with a short buffer is a
         // legal first half of the count-then-fill idiom, and `*entries` above
         // has already told it the real count. Counting it would put a normal
@@ -414,10 +631,10 @@ unsafe extern "C" fn get_supported_versions(
         return E_OUTOFMEMORY;
     }
 
-    for (index, version) in SUPPORTED_DDI_VERSIONS.iter().enumerate() {
+    for (index, version) in advertised.iter().enumerate() {
         // SAFETY: the runtime declared storage for `requested` entries and
-        // `requested >= SUPPORTED_DDI_VERSIONS.len()` was just checked, so every
-        // index in this loop is inside the buffer.
+        // `requested >= advertised.len()` was just checked, so every index in
+        // this loop is inside the buffer.
         unsafe { *supported_versions.add(index) = *version };
     }
     S_OK

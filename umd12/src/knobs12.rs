@@ -19,6 +19,7 @@
 //! |---|---|---|
 //! | `Umd12Trace` | DWORD | `false` (explicit non-zero enables) |
 //! | `UmdD3D12` | DWORD | `false` — **the D3D12 kill switch** (D11) |
+//! | `Umd12CoreDdi` | DWORD | **`110`** — which Core DDI build `pfnGetSupportedVersions` advertises; `116` is the HPS2-retirement experiment arm |
 //! | `Umd12FormatCaps` | DWORD | `0` — `pfnCheckFormatSupport`'s encoding, as an A/B |
 //! | `Umd12FenceSignalDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnSignalFence` |
 //! | `Umd12EclDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnExecuteCommandLists` |
@@ -126,6 +127,81 @@ pub(crate) fn umd12_trace() -> bool {
 /// `adapter12::OpenAdapter12`.
 pub(crate) fn umd_d3d12() -> bool {
     UMD_D3D12.get()
+}
+
+/// ⭐⭐ **Which Core DDI build `pfnGetSupportedVersions` advertises. DEFAULT
+/// `110`, and that default is today's shipping behaviour byte for byte.**
+///
+/// # The question this knob exists to settle
+///
+/// `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` §10.2 (line 982) requires
+/// *"build 28000+ and negotiated `D3D12DDI_SUPPORTED_0116` or later"*, and §10.9
+/// (line 2843) makes *"Core DDI <0116"* an adapter/device/fence-creation
+/// failure. Core 0112 adds native-fence **create** and 0116 adds native-fence
+/// **open** — the association the whole D3D12 half of that design rests on.
+///
+/// ⛔ The guest is build **26100**, whose installed WDK (10.0.26100.0) declares
+/// `d3d12umddi.h` only up to `D3D12DDI_SUPPORTED_0110`. **Whether that is merely
+/// a HEADER limit or also a RUNTIME limit is not answerable from a header**, and
+/// it decides whether the reference's Core-0116 requirement is reachable on this
+/// guest at all or forces the 28000 package minimum it also states. The only
+/// instrument that can answer it is the runtime itself, and this knob is how it
+/// is asked: with a one-element advertised set the runtime either negotiates the
+/// token or fails the handshake with its own string (*"Failed to find matching
+/// DDI versions"*), so the two outcomes are distinguishable without a spy proxy.
+///
+/// | value | meaning |
+/// |---:|---|
+/// | `110` | advertise `D3D12DDI_SUPPORTED_0110`. **The default**, and bit-identical to the driver before this knob existed. |
+/// | `116` | advertise `D3D12DDI_SUPPORTED_0116`. ⛔ **EXPERIMENT ARM — device creation REFUSES.** |
+/// | anything else | a counted refusal (`CoreDdiKnobUnknown`), logged loudly, falling back to `110`. |
+///
+/// # ⛔⛔ Why the 116 arm refuses instead of serving
+///
+/// A negotiated version selects a **table shape**, and this driver implements
+/// exactly one: `D3D12DDI_DEVICE_FUNCS_CORE_0109` (124) +
+/// `D3D12DDI_COMMAND_LIST_FUNCS_3D_0108` (75) +
+/// `D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001` (7). If the runtime accepted 0116 it
+/// would be entitled to a 0116-generation device — including
+/// `pfnCreateFence_0116`'s native-fence create/open, which this build's bindings
+/// cannot even name. Constructing a device there would be the
+/// `ARCHITECTURE.md` §12 trap 2 surface (*"a 376..392 byte out-of-bounds write
+/// into the runtime's heap"*) with the version negotiated rather than guessed.
+/// ⇒ `device12::create_device` logs the exact received `(Interface, Version)`
+/// and refuses **before** it constructs anything.
+///
+/// ⚠ `pfnFillDDITable` is *not* the hazard, and that was checked rather than
+/// assumed, twice over. **Measured:** on 26100.8737 the runtime fills the tables
+/// *after* `pfnCreateDevice`, not before, so the refusal is upstream of the fill
+/// and no 0116-shaped table is ever presented (see the read site in
+/// [`crate::device12::create_device`] for the observed call order). **And even
+/// if it were not:** `forward12::tables12::fill` takes its byte count from the
+/// runtime's own `SIZE_T` in both directions and stub-fills the whole buffer
+/// first, so an 0116-sized table would get counted stubs in its tail rather
+/// than a NULL slot or an overrun.
+///
+/// ⚠ Read once per process. `dwm.exe` calls `OpenAdapter12` in production, so a
+/// running compositor keeps the arm it started with; newly created processes
+/// pick the change up, and `pnputil /restart-device` re-runs the load without a
+/// reboot.
+///
+/// ⛔ **Flipping this default to 116 requires the 0116 tables to exist**, not
+/// merely a green negotiation — and the evidence goes in a comment right here,
+/// as CLAUDE.md rule 8 requires. Until then `110` is both the default and the
+/// only arm anyone has measured a working device on, and `116` stays reachable
+/// as the experiment it is.
+pub(crate) static UMD12_CORE_DDI: DwordKnob = DwordKnob::new(c"Umd12CoreDdi", 110);
+
+/// Resolve `HKLM\SOFTWARE\Helios!Umd12CoreDdi` (REG_DWORD), forcing its
+/// `OnceLock`. **Absent = `110`.**
+///
+/// ⚠ Returns the **raw** DWORD. Validation — and the counted fallback for a
+/// value that names no arm — belongs to `adapter12::Ddi12Interface::selected`,
+/// because that is where the refusal counter and the closed set live. A knob
+/// module that decided which DDI versions are legal would be policy in the
+/// mechanism, which is the split `helios_umd_common::knobs` exists to keep.
+pub(crate) fn umd12_core_ddi() -> u32 {
+    UMD12_CORE_DDI.get()
 }
 
 /// The largest delay either diagnostic arm below will honour, in microseconds.
@@ -595,7 +671,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 8] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 9] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -623,5 +699,13 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 8] {
         // capture that records `Umd12EclFence=1` alone describes a boundary the
         // run did not have.
         ("Umd12EclDrain", umd12_ecl_drain() as u32),
+        // ⭐ APPENDED, the Core-DDI negotiation experiment. ⛔ Reports the
+        // **EFFECTIVE** build — the arm `Ddi12Interface::selected` resolved to —
+        // not the raw DWORD, for the same reason the two delay knobs report
+        // their clamped value: a mistyped `Umd12CoreDdi=112` that falls back to
+        // 110 must be captured as the configuration the run actually had, and
+        // the `CoreDdiKnobUnknown` counter beside it is what says the value was
+        // rejected rather than honoured.
+        ("Umd12CoreDdi", crate::adapter12::selected_core_ddi_build()),
     ]
 }

@@ -45,7 +45,7 @@ use helios_umd_common::hr::{
     DXGI_ERROR_UNSUPPORTED, E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, S_OK,
 };
 
-use crate::adapter12::Ddi12Interface;
+use crate::adapter12::{self, Ddi12Interface};
 use crate::bridge12::BridgeDevice12;
 use crate::{ddi12, log_error, note_refusal, UMD12_REFUSALS};
 
@@ -62,10 +62,15 @@ pub(crate) struct HeliosD3D12Device {
     /// (`DECISIONS.md` §7.6).
     pub(crate) h_rt_device: ddi12::D3D12DDI_HRTDEVICE,
 
-    /// The negotiated interface. One value today (D12 advertises one token), and
-    /// stored anyway: a lane that needs to know which revision it is serving
-    /// must read it from here rather than assume, and the day a second token is
-    /// ever advertised this is the field that stops being a constant.
+    /// The negotiated interface.
+    ///
+    /// ⚠ **`R8_0110` on every device that exists**, and that is enforced rather
+    /// than assumed: `Umd12CoreDdi` can make the *advertised* token `_0116`, but
+    /// [`create_device`]'s table-shape gate refuses that arm before this struct
+    /// is written, so no `HeliosD3D12Device` can ever carry it. Stored anyway,
+    /// because a lane that needs to know which revision it is serving must read
+    /// it from here rather than assume — and the day the 0116 tables are
+    /// implemented this is the field that stops being a constant.
     pub(crate) negotiated: Ddi12Interface,
 
     /// `D3D12DDI_CREATE_DEVICE_FLAGS` as the runtime gave them, including
@@ -177,13 +182,24 @@ pub(crate) unsafe fn calc_private_device_size(
     // sized for a shape nobody agreed on.
     if Ddi12Interface::from_pair(a.Interface, a.Version).is_none() {
         note_refusal(&UMD12_REFUSALS.ddi12_version_mismatch);
+        let (major, minor, build) = adapter12::decode_pair(a.Interface, a.Version);
         log_error!(
-            "CalcPrivateDeviceSize: UNADVERTISED Interface={:#010x} Version={:#010x} -> 0",
+            "CalcPrivateDeviceSize: UNADVERTISED Interface={:#010x} (major={major} minor={minor}) \
+             Version={:#010x} (build={build}) -> 0",
             a.Interface,
             a.Version,
         );
         return 0;
     }
+
+    // ⚠ A negotiated-but-unimplemented Core build (`Umd12CoreDdi=116`) does
+    // **not** refuse here, and that is deliberate rather than an oversight. This
+    // DDI only states how many bytes the runtime should allocate for a block
+    // this driver owns and never writes on that arm; refusing with a 0 could
+    // stop the runtime before `pfnCreateDevice`, which is the exact call whose
+    // arrival — with which `(Interface, Version)` — is the experiment's whole
+    // reading. The refusal lives one call later, where nothing is constructed
+    // either way.
 
     let size = device_private_size(a.Flags);
     log_error!(
@@ -199,10 +215,12 @@ pub(crate) unsafe fn calc_private_device_size(
 ///
 /// 0. validate **every** runtime-supplied pointer, before constructing anything;
 /// 1. dispatch the interface through the closed set — never an `else`;
-/// 2. bring up the engine device;
-/// 3. write `HeliosD3D12Device` into the runtime's private block, under the
+/// 2. refuse a negotiated build whose **table shapes** are not implemented,
+///    still before constructing anything (`Umd12CoreDdi=116`);
+/// 3. bring up the engine device;
+/// 4. write `HeliosD3D12Device` into the runtime's private block, under the
 ///    unwind guard;
-/// 4. defuse the guard and return.
+/// 5. defuse the guard and return.
 ///
 /// ⚠ There is no table fill here. D3D12 fills its tables at **adapter** scope
 /// through `pfnFillDDITable`, before any device exists (`ARCHITECTURE.md` §1.2,
@@ -257,20 +275,33 @@ pub(crate) unsafe fn create_device(
         // slots into a 101-slot table. Here there is no arm that builds anything
         // for an unrecognised pair, so the mistake is unrepresentable rather
         // than merely avoided.
+        let (major, minor, build) = adapter12::decode_pair(a.Interface, a.Version);
         log_error!(
-            "CreateDevice: UNADVERTISED Interface={:#010x} Version={:#010x} -> \
+            "CreateDevice: UNADVERTISED Interface={:#010x} (major={major} minor={minor}) \
+             Version={:#010x} (build={build}) token={:#018x} advertised={} -> \
              DXGI_ERROR_UNSUPPORTED",
             a.Interface,
             a.Version,
+            ((a.Interface as u64) << 32) | (a.Version as u64),
+            adapter12::selected_core_ddi_build(),
         );
         note_refusal(&UMD12_REFUSALS.ddi12_version_mismatch);
         return DXGI_ERROR_UNSUPPORTED;
     };
 
+    // ⭐ The received token, decoded, on every create — not only on the
+    // mismatch path. It is the one line that says which Core DDI build the
+    // runtime actually negotiated, and "the runtime accepted the token we
+    // advertised" is not a fact a driver may infer from having advertised it.
+    let (major, minor, build) = adapter12::decode_pair(a.Interface, a.Version);
     log_error!(
-        "CreateDevice: {} hRTDevice={:p} hDrvDevice={:p} pKTCallbacks={:p} \
+        "CreateDevice: {} Interface={:#010x} (major={major} minor={minor}) Version={:#010x} \
+         (build={build}) token={:#018x} hRTDevice={:p} hDrvDevice={:p} pKTCallbacks={:p} \
          p12UMCallbacks={:p} Flags={:#x} NumReserveRanges={}",
         negotiated.name(),
+        a.Interface,
+        a.Version,
+        ((a.Interface as u64) << 32) | (a.Version as u64),
         a.hRTDevice.handle,
         a.hDrvDevice.pDrvPrivate,
         a.pKTCallbacks,
@@ -278,6 +309,61 @@ pub(crate) unsafe fn create_device(
         a.Flags,
         a.NumReserveRanges,
     );
+
+    // ── 2. ⛔⛔ THE TABLE-SHAPE GATE ─────────────────────────────────────────
+    //
+    // An exhaustive match, not an `if`: the day a third arm is added the
+    // compiler makes someone decide which side of this gate it is on, which is
+    // the only structural defence against a version being advertised without
+    // its tables.
+    //
+    // ⛔ **A negotiated version selects a TABLE SHAPE.** This driver implements
+    // exactly one — `_0109`/`_0108`/`_0001`, 124 + 75 + 7 slots — and its device
+    // block, its `p12UMCallbacks` union arm (`_0062`) and every handler in
+    // `forward12` are typed against it. Constructing a device for a build whose
+    // shapes we have not written is `ARCHITECTURE.md` §12 trap 2 with the
+    // version *negotiated* instead of guessed: the D3D11 driver's `else` arm
+    // filled 150 pointer slots into a 101-slot table, *"a 376..392 byte
+    // out-of-bounds write into the runtime's heap"*.
+    //
+    // ⚠ Refusing HERE — before `BridgeDevice12::create` and before the in-place
+    // `core::ptr::write` — is the whole point: nothing is constructed, nothing
+    // is leaked, and the runtime gets a clean decline.
+    //
+    // ⭐ **And it is early enough that no table is ever filled for an
+    // unimplemented shape.** ⛔ MEASURED, 2026-08-09, and it CORRECTS this
+    // crate's own module docs: `adapter12`'s header and `ARCHITECTURE.md` §1.2
+    // both say `pfnFillDDITable` runs *before* `pfnCreateDevice`. On
+    // 26100.8737 it does not — the observed order is `OpenAdapter12` →
+    // `pfnGetCaps`(1074) → `pfnGetSupportedVersions` ×2 →
+    // `pfnCalcPrivateDeviceSize` → **`pfnCreateDevice`** → `pfnGetCaps` ×24 →
+    // `pfnGetOptionalDDITables` → `pfnFillDDITable` ×5
+    // (`tmp/dx12/core-ddi-0116/final-A-110-default/umd12.log:11-47`). So this
+    // refusal is upstream of the fill, and the 0116 arm never presents a table
+    // of a shape this driver has not written.
+    // ⚠ It would be safe either way: `forward12::tables12::fill` takes its byte
+    // count from the runtime's own `SIZE_T` in both directions and stub-fills
+    // the whole buffer first. The ordering makes the question moot rather than
+    // merely survivable.
+    match negotiated {
+        Ddi12Interface::R8_0110 => {}
+        Ddi12Interface::R8_0116 => {
+            note_refusal(&UMD12_REFUSALS.create_device_core_ddi_unimplemented);
+            log_error!(
+                "CreateDevice: the runtime NEGOTIATED Core DDI build {build} (token {:#018x}) -- \
+                 the 0116 device/command-list/queue table shapes are NOT IMPLEMENTED in this \
+                 build, so no device is constructed. This is `Umd12CoreDdi=116`'s ANSWER, not a \
+                 fault: the inbox D3D12 runtime accepts D3D12DDI_SUPPORTED_0116. -> \
+                 DXGI_ERROR_UNSUPPORTED",
+                ((a.Interface as u64) << 32) | (a.Version as u64),
+            );
+            // ⛔ `DXGI_ERROR_UNSUPPORTED` (0x887A_0004), NEVER
+            // `DXGI_ERROR_DRIVER_INTERNAL_ERROR` (0x887A_0020): the latter is
+            // recorded by the runtime and by ETW as a *driver fault*, and this
+            // is a declined negotiation. R801 is the scar on the D3D11 side.
+            return DXGI_ERROR_UNSUPPORTED;
+        }
+    }
 
     // ⚠ `pReserveRanges` / `NumReserveRanges` are read and reported, not acted
     // on. They are the GPU-virtual-address ranges the runtime asks the driver to
@@ -288,7 +374,7 @@ pub(crate) unsafe fn create_device(
         note_refusal(&UMD12_REFUSALS.reserve_ranges_ignored);
     }
 
-    // ── 2. Bring the engine up ──────────────────────────────────────────────
+    // ── 3. Bring the engine up ──────────────────────────────────────────────
     //
     // ⚠ `(0, 0)` means "do not match on LUID", and it is what the D3D11 driver
     // passes too (`umd/src/adapter.rs:390`). Three reasons it is the honest
@@ -311,7 +397,7 @@ pub(crate) unsafe fn create_device(
         return E_FAIL;
     };
 
-    // ── 3. Construct in place, under the guard ──────────────────────────────
+    // ── 4. Construct in place, under the guard ──────────────────────────────
     let device = a.hDrvDevice.pDrvPrivate.cast::<HeliosD3D12Device>();
     // SAFETY: `pDrvPrivate` is non-null (checked above) and points at the block
     // the runtime allocated using the size THIS driver returned from
@@ -339,7 +425,7 @@ pub(crate) unsafe fn create_device(
     // once L2 mints WDDM contexts and L4 honours `pReserveRanges`, and this is
     // where they go.
 
-    // ── 4. Hand it to the runtime ───────────────────────────────────────────
+    // ── 5. Hand it to the runtime ───────────────────────────────────────────
     guard.defuse();
     S_OK
 }

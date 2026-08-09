@@ -409,6 +409,31 @@ pub(crate) struct Umd12Refusals {
     /// reject a bad remapping. A hit means the multi-adapter assumption behind
     /// `ARCHITECTURE.md` §13 UNVERIFIED-11 has been reached for real.
     pub(crate) node_map_unexpected_adapter_count: RefusalCounter,
+
+    // ── The Core-DDI negotiation experiment (`Umd12CoreDdi`). Appended at the
+    // END, because the set's order is the evidence contract. ────────────────
+    /// `HKLM\SOFTWARE\Helios!Umd12CoreDdi` named a Core DDI build this driver
+    /// has no arm for, so it fell back to `110`.
+    ///
+    /// ⛔ Expected 0. A hit means the advertised token is **not** the one the
+    /// operator asked for, which makes every other number in that run
+    /// unattributable — the knob's inventory line reports the *effective* build
+    /// for exactly this reason, and this counter is what distinguishes "110
+    /// because that is the default" from "110 because 112 was rejected".
+    pub(crate) core_ddi_knob_unknown: RefusalCounter,
+    /// The runtime **negotiated** a Core DDI build whose device/command-list/
+    /// queue table shapes this driver does not implement, and `pfnCreateDevice`
+    /// refused before constructing anything.
+    ///
+    /// ⛔ **Expected 0 on the default arm and expected 1 per create on
+    /// `Umd12CoreDdi=116`** — where it is the whole result, not a fault: a hit
+    /// says the inbox D3D12 runtime **accepted** the 0116 token, which is the
+    /// question the knob exists to answer. A zero on a 116 run says the runtime
+    /// refused the handshake and never reached `pfnCreateDevice` at all.
+    ///
+    /// ⚠ Registry counter values persist across boots (CLAUDE.md rule 6):
+    /// verify this one MOVED this boot before reading anything into it.
+    pub(crate) create_device_core_ddi_unimplemented: RefusalCounter,
 }
 
 pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
@@ -454,6 +479,8 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
     caps_msaa_bits_dropped: RefusalCounter::new("CapsMsaaBitsDropped"),
     node_map_bad_arg: RefusalCounter::new("NodeMapBadArg"),
     node_map_unexpected_adapter_count: RefusalCounter::new("NodeMapUnexpectedAdapterCount"),
+    core_ddi_knob_unknown: RefusalCounter::new("CoreDdiKnobUnknown"),
+    create_device_core_ddi_unimplemented: RefusalCounter::new("CreateDeviceCoreDdiUnimplemented"),
 };
 
 /// The **spine's** set, in the order the summary prints them. ⛔ This order is
@@ -466,7 +493,7 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
 /// FIRST in [`UMD12_REFUSAL_SETS`] precisely so every pre-fan-out
 /// `D3D12 DDI refusals:` line is still a byte-for-byte prefix of a post-fan-out
 /// one. A lane appends to **its own** set, in its own file.
-static UMD12_REFUSAL_SET: [&RefusalCounter; 42] = [
+static UMD12_REFUSAL_SET: [&RefusalCounter; 44] = [
     &UMD12_REFUSALS.open_adapter12,
     &UMD12_REFUSALS.probe12_bad_arg,
     &UMD12_REFUSALS.probe12_create_failed,
@@ -509,6 +536,8 @@ static UMD12_REFUSAL_SET: [&RefusalCounter; 42] = [
     &UMD12_REFUSALS.caps_msaa_bits_dropped,
     &UMD12_REFUSALS.node_map_bad_arg,
     &UMD12_REFUSALS.node_map_unexpected_adapter_count,
+    &UMD12_REFUSALS.core_ddi_knob_unknown,
+    &UMD12_REFUSALS.create_device_core_ddi_unimplemented,
 ];
 
 /// Every refusal set this DLL prints, in print order: the spine's, then one per
