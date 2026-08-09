@@ -1,0 +1,468 @@
+# Lane: QEMU host (HPM1 paging, HOB1 execution, plane lifetime) + packaging / tools / docs
+
+Reference: `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` (5918 lines, static-analysis
+snapshot 2026-08-09). Everything below cites it by line range. Where this brief
+and the reference disagree, the reference wins — except where §6 records that the
+reference is silent or self-contradictory, in which case the fail-closed reading
+named here is the working rule until the owner rules otherwise.
+
+Provenance checked at write time: `qemu-helios` is a **git submodule** pinned at
+`d4fde50ccb5ec51a635003fda441d0ea4bbb2818` (detached HEAD, worktree clean) —
+matching §1's table (doc line 86). Every QEMU line number below is exact for that
+commit.
+
+---
+
+## 1. Normative sources
+
+| Section | Doc lines | What it binds for this lane |
+|---|---|---|
+| §2 executive decision | 112-358 | *Why*: points 1, 4, 6 are this lane's charter — the WDDM command carries the actual work (QEMU executes it), display-reader lifetime becomes exact per-plane state (retires the `resid` ledger), and every native-Vulkan allocation is one WDDM allocation whose bytes HPM1 makes authoritative in QEMU. Point 4's last sentence is the *reason* the whole read-ledger route dies. |
+| §3 hard constraints | 359-396 | Bounds every choice: no Escape, no global registry/service/polling thread/sleep, no heuristic identity, no CPU wait on GPU completion in steady state, no version/feature fallback, "never delete the old mapped file while any legacy process can still map it". |
+| §10.7 native-Vulkan KMT execution | 1675-2700 | The bulk of the host contract. Load-bearing sub-ranges: **1964-2012** (segment table, HLM1 flags, no CPU-host-aperture, HPM1 physical resolver domains, physical-ADL-only profile); **2013-2025** (C64 per-ProcessContext page tables, paging completion withheld until QEMU publishes the mapping/TLB epoch, `SetRootPageTable` record-and-ignore deleted); **2070-2123** (BuildPagingBuffer/Patch/SubmitCommand split, `HeliosPhysicalMemoryDmaV1` header + 24-byte run record, device-side execute/publish/revoke ordering, reset generation invalidation); **1842-1896** (48-byte `HNR2PhysicalCapability`, QEMU revalidates + resolves through HPM1 page owner + one `SUBMIT_3D` with `FLAG_FENCE|FLAG_INFO_RING_IDX`, ring-0 means decode/reply only, nonzero ring is the VkQueue terminal fence); **2125-2168** (HVR1 reply snapshot, host writes payload + HVR1 + release publication *before* completing its context/ring fence; no `vn_ring`); **2170-2175** (teardown/adapter-stop drain order). Sub-ranges 2196-2700 (WSI layer) are the Mesa/ICD lane's; this lane reads them only for the §18.5 per-frame budget. |
+| §10.8 display consumption | 2701-2833 | Plane lifetime. **2800-2822** is the host-facing core: backend acknowledges *latch* separately from *old-reader release*; the prior binding is released only after replacement/unbind **and** QEMU/display has acknowledged no reader uses it; the newly current allocation stays referenced until another accepted bind replaces it or the plane is disabled. **2831-2832** deletes the `read_ledger`, 65-slot page, event registration, 10 ms signaler, and snapshot fallback. |
+| §12.3 ETW/diagnostics | 3240-3327 | Provider GUID `{6D9A1A95-2B6A-4DEF-BCF7-847B6F158B0E}`, ETW descriptor version 1, one 72-byte align-8 `HeliosGraphicsEtwPayloadV1` descriptor, event IDs 1-12 (7/8/9 are the plane events this lane's host events must correlate with), keyword bits 0-4. 3289-3291: ETW may drop; no reader ack, delivery, or counter participates in synchronization/lifetime/admission — that is what makes `tools/helios_etw_capture.ps1` legal and `read_ledger_dump` illegal. |
+| §17.7 host/packaging/docs manifest | 4496-4609 | This lane's file manifest and the host behavioural spec (4548-4608): batch completion + separate latch/release events, D3D12 virtual submit consumes only KMD-originated process/address-space generation + GPUVA/size, HPM1 per-packet validation and terminal acknowledgement, HNR2 COMMIT handling, one `VkInstance` per HTS1 session/host context, remove the 10-ms fence timer, finite-reply admission probe, generation tagging of every context/ring/fence callback, packaging as one generation. |
+| §17.8 atomic activation | 4610-4633 | Nine ordered steps. Steps 2/3/5 are host-side staging + mutual generation/feature-bitmap exchange before KMD admits any allocation or command; steps 6/7/8 are the installer's verify → prove-no-mapper → delete `helios_present_sync_v2.bin`. |
+| §18.4 display/reader gates | 5067-5104 | Acceptance for the plane lifetime work; 5095-5103 are host-observable: retain-candidate-before-accept, cancel releases only the candidate, replacement releases the prior binding only after a **distinct** backend old-reader-release acknowledgement, transitions drain backend leases, delayed/duplicated/stale QEMU latch and release callbacks cannot replace or release a newer binding, and no `read_ledger` page/event/thread/Escape is created. |
+| §18.5 perf/deployment gates | 5105-5141 | One HPM1/complete-linear-BAR negotiation per adapter; one real paging DMA + mandatory side-effect-free Patch + device completion per placement transaction; one Lock2/Unlock2 per HVM1 CPU-map lifetime; prove no CPU-host-aperture callback/protocol, scan, polling, retry sleep, **CPU-side QEMU wait**, or Present-path mapping work exists; deployment test must reject every mixed generation. |
+| Appendix A | 5634-5778 | Current-state disposition rows this lane owns: 5677 (installer HPS/ACL), 5727 (virgl context/ring fences are the completion source), 5728 (`read_ledger_dump.c`, `window_burst_capture.ps1:246-296`, `CONFORMANCE.md:245`), 5729 (`scanout_timeline_dump.c` + 3 blob probes), 5730 (5 dev probes), 5731 (`ui/egl-headless.c:93-233`, `ui/trace-events:189-190`, `hw/display/trace-events:234` — **may remain**, passive diagnostics), 5732 (documentation-only), 5762-5766 + 5774 + 5776 + 5777 (residual closure: archive labelling, rutabaga non-selection proof, BAR/segment foundation, virgl host endpoint, probe rewrites). |
+| Appendix B | 5779-5918 | B.5 (5883-5910) is the exact reverse edge this lane deletes; B.1-B.4 are producer-side context only. |
+
+---
+
+## 2. Current source inventory
+
+### 2.1 QEMU — files the manifest names under "Modify:"
+
+| Path (all under `qemu-helios/`) | Lines | What it does today | Verdict |
+|---|---:|---|---|
+| `hw/display/virtio-gpu-virgl.c` | 1671 | The Helios host endpoint. Blob map/unmap into the hostmem BAR (`virtio_gpu_virgl_map_resource_blob` 189-265, `..._unmap_resource_blob` 270-342, async 3-step MR teardown that suspends cmd processing via `b->renderer_blocked++` + `cmdq_resume_bh`); `virgl_cmd_submit_3d` 638-667 (finite `virgl_renderer_submit_cmd` of an exactly copied stream — the precedent §17.7:4584 says to keep); `virgl_cmd_resource_create_blob` 845-963 incl. the HOST3D blob budget; `virgl_cmd_resource_map_blob` 965-1005; `virgl_cmd_set_scanout_blob` 1032-1119; `virtio_gpu_virgl_process_cmd` 1120-1249 incl. the ring-idx context-fence creation at 1224-1236; `virgl_write_fence` 1251-1279 / `virgl_write_context_fence` 1281-1301 / `virtio_gpu_virgl_reset_async_fences` 1303-1317 / `virtio_gpu_virgl_async_fence_bh` 1318-1366 / `push_async_fence` 1367-1383 / `virgl_write_async_{,context_}fence` 1384-1398 (Appendix A row 5727: *the* completion source); `virtio_gpu_fence_poll` 1469-1483 (**the 10-ms timer**, re-arms itself at 1481); `virtio_gpu_virgl_reset` 1500-1521; `virtio_gpu_virgl_init` 1523-1599 (creates `gl->fence_poll` at 1577, selects `VIRGL_RENDERER_ASYNC_FENCE_CB` only when `qemu_egl_display` and virglrenderer ≥ 1.1.2). | **MODIFY (heavy)** |
+| `hw/display/virtio-gpu.c` | 1808 | Generic virtio-gpu. Relevant: `virtio_gpu_update_scanout` 598-621 and `virtio_gpu_do_set_scanout` 622-698 (the classic + blob scanout binding; calls `virtio_gpu_update_dmabuf` at 654), `virtio_gpu_set_scanout_blob` 810-849, `virtio_gpu_disable_scanout` 381-401, `virtio_gpu_resource_unref` 423-446, `virtio_gpu_reset_bh` 1618-1647 / `virtio_gpu_reset` 1649-1679 (destroys all resources, replaces every surface with NULL, flushes cmdq/fenceq). | **MODIFY** |
+| `hw/display/virtio-gpu-gl.c` | 248 | GL/virgl device wrapper. `virtio_gpu_gl_handle_ctrl` (…-88) ends every ctrl batch with `virtio_gpu_virgl_fence_poll(g)`; realize at 145-160 owns the hostmem background mapping (`qemu_ram_mmap` + `memory_region_init_ram_ptr(&gl->hostmem_background …)` + `memory_region_add_subregion(&b->hostmem, 0, …)`) — §17.7:4561-4563 says this must participate in HLM1 initialization and **drained** teardown; unrealize at 177-205 frees the timers and calls `virgl_renderer_cleanup`. | **MODIFY** |
+| `include/hw/virtio/virtio-gpu.h` | 411 | `struct virtio_gpu_simple_resource` 44-66, `virtio_gpu_framebuffer` 68-74, `virtio_gpu_scanout` 76-84, `VirtIOGPUBase` 148-166 (owns `MemoryRegion hostmem`), `VirtIOGPU` 187-224 (owns `dmabuf.primary[]`), `virtio_gpu_virgl_context_fence` 240-245, `VirtIOGPUGL` 255-268 (`fence_poll`, `async_fenceq`, `hostmem_background`, `hostmem_mmap`). | **MODIFY** (add HPM1/plane state; do not disturb the rutabaga/vhost-user members) |
+| `include/standard-headers/linux/virtio_gpu.h` | 460 | Verbatim copy of the Linux uapi header. 433-458 is `resource_map_blob` / `resp_map_info` / `resource_unmap_blob` (Appendix A:5776 cites exactly this). | **DO NOT MODIFY** — see §6 item 4. The Helios vendor protocol belongs in a *separate generated* header, which is what §17.7:4504-4506 actually asks for ("plus a generated Helios vendor-protocol header"). |
+| `hw/display/trace-events` | 234 | virtio-gpu tracepoints; line 234 is `helios_scanout_blob_layout(...)`. Appendix A:5731 explicitly permits the `helios_scanout_*` tracepoints to remain (passive, no producer reads them). | **MODIFY** (add batch/paging/plane events; keep line 234) |
+| `ui/egl-headless.c` | 761 | The active display backend. `helios_scanout_stats` 93-135, `helios_dmabuf_ino` 137-151, readback cache glue 153-185, `egl_trace_scanout_bind` 186-217 / `egl_trace_scanout_read` 218-240 (the A:5731 diagnostics), CPU dmabuf map/flush 241-443, `egl_scanout_disable` 450-461, `egl_scanout_texture` 462-488, **`egl_scanout_dmabuf` 489-575** (binds the new reader), `egl_release_dmabuf` 598-614 (**releases the old reader — today synchronously**), `egl_scanout_flush` 625-672, `egl_ops` 673-688. | **MODIFY** |
+| `ui/trace-events` | 190 | 189-190 are `helios_scanout_bind` / `helios_scanout_read`. | **MODIFY** (add latch/release; keep 189-190) |
+| "the display-listener headers that carry exact plane latch, replacement, and release" | — | Resolves to `include/ui/console.h` (481 lines; `DisplayChangeListenerOps` 239-266 incl. `dpy_gl_scanout_dmabuf` 252 and `dpy_gl_release_dmabuf` 262; free-function decls 327-347). | **MODIFY** — but see §6 item 1: a header alone cannot carry the calls. |
+
+### 2.2 QEMU — files the manifest does **not** name but this lane cannot avoid
+
+| Path | Lines | Why it is unavoidable | Verdict |
+|---|---:|---|---|
+| `ui/console.c` | 1616 | The DCL dispatcher. `dpy_gl_scanout_dmabuf` 1050-1070, `dpy_gl_release_dmabuf` 1101-1121, listener registration 563. Any new latch/release op is dead without a dispatcher here. | **MODIFY (required)** |
+| `hw/display/virtio-gpu-udmabuf.c` | 247 | **The actual plane latch/replacement/release site.** `virtio_gpu_create_dmabuf` 185-211, `virtio_gpu_free_dmabuf` 153-162 (calls `dpy_gl_release_dmabuf` then immediately frees), `virtio_gpu_update_dmabuf` 213-247 (installs `g->dmabuf.primary[scanout_id] = new_primary`, calls `dpy_gl_scanout_dmabuf`, then **unconditionally frees the old primary in the same call**), `virtio_gpu_fini_udmabuf` 164-183. §10.8:2816-2818 and §18.4:5097-5098 are literally about these lines. | **MODIFY (required)** |
+| `hw/display/meson.build` | 144 | Source lists for `virtio-gpu`/`virtio-gpu-gl` modules (lines 70-83). Any added `.c` is unbuildable without it. | **MODIFY (required if any file is added)** |
+| `ui/gtk.c`, `ui/sdl2.c`, `ui/spice-display.c`, `ui/dbus-listener.c`, `ui/dbus-console.c` | — | The five other `DisplayChangeListenerOps` tables that set `dpy_gl_scanout_dmabuf` / `dpy_gl_release_dmabuf`. A new mandatory op needs at minimum a compile-clean absent/NULL path in each; a *non-acknowledging* backend must be refused, not silently treated as "released". | **MODIFY (minimal, required)** |
+| `hw/display/virtio-gpu-pci.c` | 128 | `virtio_gpu_pci_base_realize` 29-69: BAR4 = `pow2ceil(g->conf.hostmem)`, prefetchable 64-bit, `virtio_pci_add_shm_cap(vpci_dev, 4, 0, g->conf.hostmem, VIRTIO_GPU_SHM_ID_HOST_VISIBLE)`. §17.7:4559-4561 says this "remains the source" — i.e. **retain**; A.4:5774 adds "Fail cold adapter start on any capability/base/length/flag mismatch", which needs a check *somewhere*. | **RETAIN** (+ possibly one admission assert; see §6 item 5) |
+| `hw/display/virtio-vga.c` | 300 | Same BAR4 realization for the VGA wrapper, lines 101-153. | **RETAIN** |
+| `hw/display/virtio-gpu-rutabaga.c` | 1141 | Alternate backend. A.4:5763 requires a package/backend test proving it is not selected for this generation. | **RETAIN**, add a non-selection proof (§6 item 15) |
+| `hw/display/virtio-gpu-base.c` | 361 | `virtio_gpu_base_reset`, hostmem region ownership. Touched only if HPM1 state hangs off `VirtIOGPUBase`. | **MODIFY (probable, small)** |
+| `include/hw/virtio/virtio-gpu-helios.h` (new) | 0 | The §17.7:4504-4506 "generated Helios vendor-protocol header" landing site. | **ADD** |
+| `hw/display/virtio-gpu-helios-hpm1.c` (new) | 0 | HPM1 state, BAR/HLM1 admission, paging execution, C64 page tables. | **ADD** |
+| `hw/display/virtio-gpu-helios-batch.c` (new) | 0 | HOB1 virtual-submit execution + HNR2 COMMIT capability verification. | **ADD** |
+
+### 2.3 packaging/windows
+
+| Path | Lines | Today | Verdict |
+|---|---:|---|---|
+| `Install-Helios.ps1` | 353 | Named at §17.7:4511 and A.1:5677. **Lines 198-217 create `C:\ProgramData\Helios\helios_present_sync_v2.bin` and `icacls`-grant it to Authenticated Users / LOCAL SERVICE / the Window Manager group** — the only HPS2 lifecycle owner outside the graphics binaries. Also: 110-114 resolves `payload\driver\helios_kmd_render.inf`; 179-196 builds `install-state.json` (schemaVersion 1, runtimeFiles + sha256); 218-232 copies `mesa`/`opencl`/`loaders`/`smoke` payloads; 295-307 `pnputil /add-driver …/install` + active-INF assertions; 319-332 writes `helios_vulkan.json` and registers it under `HKLM:\SOFTWARE\Khronos\Vulkan\Drivers`, sets `OpenGLDriverName/Version/Flags`, registers the OpenCL vendor; 339-341 copies the state scripts; 347-351 runs Verify. There is **no** implicit-layer registration and **no** generation/host-attestation check. | **MODIFY (heavy)** |
+| `Install-Helios.cmd` | 13 | Elevation shim → `Install-Helios.ps1 -EnableTestSigning`; prints a reboot hint for `%HELIOS_RC%==194`. Nothing HPS-related. | **MODIFY (cosmetic only)** — named at §17.7:4512; the only defensible change is the exit-code/reboot text if `Install-Helios.ps1`'s codes change. Do not invent work here. |
+| `Verify-Helios.ps1` | 94 | Hash-verifies `runtimeFiles`, checks PnP status/class key. **Not in the manifest**, but §17.8 step 6 ("The guest installer verifies the active KMD, both UMDs, ICD, translators, WSI layer, manifests, and host-attested generation; no legacy DLL may load") is unimplementable without it. | **MODIFY (required)** — cross-lane request |
+| `Uninstall-Helios.ps1` | 117 | Reverses loaders/registry/driver. Does **not** touch the HPS file. §17.8 step 8's "installer cleanup after quiescence" most naturally lives here. **Not in the manifest.** | **MODIFY (required)** — cross-lane request |
+| `Helios-PackageCommon.ps1` | 212 | Shared helpers (`Get-HeliosSha256`, `Write-HeliosJson`, `Invoke-HeliosNative`, device/class-key lookup). A generation-compare helper belongs here. **Not in the manifest.** | **MODIFY (probable)** |
+| `README.md` | 91 | Describes the ProgramData layout and flows. | **MODIFY (small)** |
+| `probes/{d3d11-smoke.cpp,opengl-smoke.c,opencl-smoke.c,vulkan-smoke.c}` | — | No Escape / no HPS references (verified by grep). | **RETAIN** |
+| `compat/adl-shim` | — | Unrelated. | **RETAIN** |
+
+### 2.4 tools/ — all 13 manifest-named existing files verified present
+
+Delete (§17.7:4513-4521) — every one exists at the named path:
+
+| Path | Lines | Why it dies |
+|---|---:|---|
+| `tools/read_ledger_dump.c` | 325 | `HELIOS_ESCAPE_MAP_READ_LEDGER` consumer (A.1:5728) |
+| `tools/scanout_timeline_dump.c` | 268 | `HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE` ring reader (A.2:5729) |
+| `tools/blob_capacity_probe.c` | 200 | private Escape blob ABI |
+| `tools/blob_map_size_probe.c` | 276 | private Escape `MAP_BLOB` sweep |
+| `tools/escape_owner_probe.c` | 380 | Escape trust-boundary probe |
+| `tools/d3d11_shared_blob_truth_probe.cpp` | 361 | `HELIOS_ESCAPE_MAP_BLOB` content probe |
+| `tools/d3dkmt_alloc_probe.c` | 225 | venus context over Escape |
+| `tools/d3dkmt_sync_probe.cpp` | 238 | old sync-object form probe |
+| `tools/vehicle_flipwait_probe.c` | 333 | vehicle/flip-wait model |
+| `tools/vidmm_tracking_probe.c` | 1042 | old tracking/blob model |
+| `tools/d3d11_kmt_shared_probe.cpp` | 270 | superseded by C57 admission (§17.3:3976 also orders this removal — shared with the Mesa lane) |
+| `tools/vk_ring_fence_probe.cpp` | 365 | OPAQUE_WIN32 named-timeline model |
+
+Add (§17.7:4522-4533) — **none exists today**; all eight are new files:
+`tools/native_fence_context_probe.cpp`, `tools/wddm_batch_completion_probe.cpp`,
+`tools/wddm_physical_paging_probe.cpp`, `tools/wddm_linear_bar_lock_probe.cpp`,
+`tools/finite_venus_reply_probe.cpp`, `tools/translation_session_attach_probe.cpp`,
+`tools/direct_flip_mpo_profile_probe.cpp`, `tools/helios_etw_capture.ps1`.
+Constraint (4530-4533): the ETW tool enables the fixed §12.3 GUID and decodes only
+its versioned event IDs/payload, sends no KMD request or acknowledgement; the probes
+use only ordinary runtime/KMT objects, the OS display path, and C42 ETW — **no new
+tool invokes a private Escape**.
+
+Modify:
+
+| Path | Lines | Today | Verdict |
+|---|---:|---|---|
+| `tools/window_burst_capture.ps1` | 509 | Named at §17.7:4534 and A.1:5728. Lines 245-296+ hard-code `C:\ProgramData\Helios\scanout_timeline_dump.exe` and `read_ledger_dump.exe`, plus `Get-TimelineCursor` (`--cursor`) and `Invoke-CausalSnapshot` writing `read-ledger-<phase>.csv` and `timeline-<phase>-cursor.txt`. Both tools are deleted. | **MODIFY (heavy)** |
+| `tools/kmd-gate-surface.ps1` | — | Comment references `escape_owner_probe.c (QUERY_STATS)`. Not in the manifest. | **MODIFY (comment only)** |
+
+Grep confirms the complete `tools/` + `packaging/` closure that touches
+`HELIOS_ESCAPE` / `D3DKMTEscape` / `read_ledger` / `scanout_timeline` /
+`present_sync` is exactly: the 10 Escape-using probes above + `window_burst_capture.ps1`
++ `Install-Helios.ps1`. No other tool has a hidden dependency.
+
+### 2.5 docs — all exist
+
+`CONFORMANCE.md` 570 · `ROADMAP.md` 4672 · `DX12.md` 485 · `TRANSPORT.md` 611 ·
+`docs/dx12/PRESENT.md` 1900 · `ARCHITECTURE.md` 2008 · `DECISIONS.md` 947 ·
+`KMD_IMPACT.md` 1094 · `PENDING.md` 687 · `GATES.md` 2281 · `SUBSTRATE.md` 2211 ·
+`PARALLEL.md` 396 · `research/R4-umd-template-and-split.md` 1120 ·
+`R5-kmd-gap.md` 799 · `R6-d3dkmt-surface.md` 669 · `R7-present-swapchain.md` 916 ·
+`R9-test-conformance.md` 899 · `research/guest-vulkaninfo-full.txt` 1732
+(§17.7:4543-4545: label it **historical target evidence, not live behavior**).
+All **MODIFY**. `docs/archive/**` stays immutable and labelled historical
+(A.4:5762) — do not edit, do not resurrect.
+
+Known dangling citations the doc update must resolve (found by grep):
+`CONFORMANCE.md:210,214,236,239,240,241,242,243,244,245,246,250` describe eleven
+of the twelve deleted probes; `ROADMAP.md:2206,2233,2856,2872,3037,4654,4659` and
+`DX12.md:102` cite `vk_ring_fence_probe.cpp`, `vehicle_flipwait_probe.c`,
+`blob_map_size_probe.c` as *live* evidence; `ROADMAP.md:79,428` cite
+`escape_owner_probe.c` / `vidmm_tracking_probe`.
+
+---
+
+## 3. Work decomposition
+
+Ordered. "Owns" is the exhaustive file set for parallel-safety; two units may run
+concurrently only if their owned sets are disjoint.
+
+| id | Goal | Owns | Depends on | Size |
+|---|---|---|---|---|
+| **H0** | Land the generated Helios vendor-protocol C header and wire it into the build. Header carries the HPM1 feature/generation + BAR admission fields, `HeliosPhysicalMemoryDmaV1` + 24-byte run record, the 48-byte `HNR2PhysicalCapability`, HOB1/HOS1 layouts, the plane latch/release records, and the one shared package-generation constant (§17.1:3758-3766, 3797-3798). Static asserts on every offset/size. | `qemu-helios/include/hw/virtio/virtio-gpu-helios.h` (new), `qemu-helios/hw/display/meson.build` | protocol lane §17.1 (`physical_memory.rs`, `wddm.rs`, `diagnostics.rs`) must define the Rust side first, or the generator has no input | M |
+| **H1** | HPM1 device state + StartDevice negotiation: reserve/validate the complete prefetchable 64-bit host-visible BAR, negotiate byte capacity + page shift (12 in this generation), initialize bounded physical-placement/renderer-view state **before** KMD exposes segments; refuse any logical-ADL/IOMMU profile; fail cold start on capability/base/length/flag mismatch (§10.7:1964-1985, 2002-2011; §17.7:4556-4565). | `qemu-helios/hw/display/virtio-gpu-helios-hpm1.c` (new), `include/hw/virtio/virtio-gpu.h`, `hw/display/virtio-gpu-gl.c`, `hw/display/virtio-gpu-base.c` | H0 | L |
+| **H2** | HPM1 paging-DMA execution: per packet validate package/adapter/allocation generation, operation, segment/ADL page runs, range, prior epoch; perform copy/fill/discard/resource-view bind; retain source/destination/aperture/local placement + host-job refs; publish the new placement epoch only after bytes are ready; return the terminal acknowledgement that alone permits KMD's paging completion; hold old mappings until copy + queued users retire, then address-space/RCU revoke before acknowledging (§10.7:2100-2123; §17.7:4567-4582). Local placement = exact HLM1 segment offset + complete BAR bounds; system placement = exact OS physical ADL runs only. | `virtio-gpu-helios-hpm1.c`, `hw/display/virtio-gpu-virgl.c` | H1 | XL |
+| **H3** | C64 address-space service: `SetRootPageTable` root + monotonically increasing generation, `UPDATE_PAGE_TABLE` / `COPY_PAGE_TABLE_ENTRIES` / `FLUSH_TLB` / map / unmap, atomic mapping+TLB epoch publication before paging completion is granted (§10.7:2013-2025). | `virtio-gpu-helios-hpm1.c`, `include/hw/virtio/virtio-gpu-helios.h` | H1; **KMD lane** must co-fix the PTE encoding (§6 item 11) | L |
+| **H4** | HOB1 virtual-submit execution: consume only the KMD-originated process/address-space generation + GPUVA/size descriptor, walk the *current* HPM1 root/PTE/TLB state, read the complete HOB1 (112-byte header, 40-byte use records, 16-byte typed operands, doc lines 1257-1296), validate every range/generation/typed operand, substitute renderer IDs **only in a host-private copy**, issue one fenced `SUBMIT_3D`. HOS1 is never sent as a command. Stale/unmapped PTE, cross-process page, checksum mismatch, or page-table generation change fails **before** renderer dispatch and can never advance `SubmissionFenceId` (§17.7:4550-4556; §10.9:2862). | `qemu-helios/hw/display/virtio-gpu-helios-batch.c` (new), `hw/display/virtio-gpu-virgl.c` | H0, H2, H3 | XL |
+| **H5** | HNR2 COMMIT path: accept one finite COMMIT + its patched 48-byte physical-capability table, verify every entry against HPM1 (segment 2 only when its exact range is current; segment 1 only when the contiguous aperture range resolves to the current system-page runs), substitute renderer IDs in the host-private copy, one `VIRTIO_GPU_CMD_SUBMIT_3D` (§10.7:1868-1896; §17.7:4584-4586). | `virtio-gpu-helios-batch.c`, `hw/display/virtio-gpu-virgl.c` | H4 (shares both files → **serialize with H4 or give one owner**) | L |
+| **H6** | Session/ring/fence discipline: exactly one object namespace and one `VkInstance` per HTS1 session/host context (not per process/queue/KMT device); ring 0 for CPU/decode control only, unique nonzero GPU rings; report `(ctx_id,ring_idx,fence_id)` completion only after the timeline's actual contract (processing + reply publication for zero, VkQueue completion for nonzero); reject a generated GPU opcode on zero; never report a ring-0 event as device/queue idle; tag every context/ring/fence callback with the owning session/package generation and reject duplicate nonzero ring bindings, a second instance in one context, cross-session object use, stale KMD host-dispatch serial, and late completion after reset; expose no session capability or renderer ID to user mode. **Delete the 10-ms fence timer** (§17.7:4586-4603). | `hw/display/virtio-gpu-virgl.c`, `hw/display/virtio-gpu-gl.c`, `include/hw/virtio/virtio-gpu.h` | H0; **serialize with H2/H4/H5 on `virtio-gpu-virgl.c`** | L |
+| **H7** | Finite-reply admission probe: send `SetReplyCommandStreamMESA` plus a harmless reply-producing command in one direct stream; validate header, token, size, and context fence; failure rejects this package generation and never re-enables `vn_ring` (§17.7:4594-4598). | `virtio-gpu-helios-batch.c` | H5, H6 | M |
+| **H8** | Plane lifetime: candidate → latch → replacement → old-reader release. New display-listener ops (latch-ack + old-reader-release-ack) with a monotonic binding sequence; QEMU/backend acknowledges latch **separately** from release; the prior binding's allocation/backing/dmabuf ref is held until the backend acks; delayed/duplicated/stale acks cannot replace or release a newer binding; mode/power/reset/adapter-stop unbind every affected plane and drain leases; a DCL with no ack op is refused, not assumed released (§10.8:2807-2832; §18.4:5095-5103). Exact latch/replace/release trace events. | `include/ui/console.h`, `ui/console.c`, `ui/egl-headless.c`, `ui/trace-events`, `hw/display/virtio-gpu-udmabuf.c`, `hw/display/virtio-gpu.c`, `hw/display/trace-events`, `ui/gtk.c`, `ui/sdl2.c`, `ui/spice-display.c`, `ui/dbus-listener.c`, `ui/dbus-console.c` | H0 (for the record layout) — **otherwise fully parallel with H1-H7** | L |
+| **H9** | Reset/teardown ordering: reset invalidates adapter/backing/address-space generations and cannot acknowledge stale work; adapter stop drains paging DMA, placements, host jobs, and QEMU BAR/aperture bindings before destroying HPM1 and the BAR region; plane bindings unbound first (§10.7:2120-2123, 2170-2175; §17.7:4562-4563). | `virtio-gpu-helios-hpm1.c`, `hw/display/virtio-gpu-virgl.c`, `hw/display/virtio-gpu-gl.c`, `hw/display/virtio-gpu.c` | H2, H6, H8 (**serialize on `virtio-gpu-virgl.c` and `virtio-gpu.c`**) | M |
+| **P1** | Installer: delete the HPS create+ACL block (lines 198-217) and every `icacls` grant for it; add the shared package-generation constant to `install-state.json` and to the payload-manifest check; add the implicit Vulkan layer JSON + `HKLM:\SOFTWARE\Khronos\Vulkan\ImplicitLayers` registration for `VK_LAYER_HELIOS_present`; install both UMDs, ICD, translators, KMD/INF, protocol and host component as one generation; reject incomplete/mismatched payloads (§17.7:4605-4608). Add the §17.8-step-8 cleanup of `C:\ProgramData\Helios\helios_present_sync_v2.bin` — see §6 item 8 for where it may legally run. | `packaging/windows/Install-Helios.ps1`, `packaging/windows/Install-Helios.cmd`, `packaging/windows/Helios-PackageCommon.ps1` | protocol lane (generation constant); Mesa/ICD lane (layer JSON name/path) | M |
+| **P2** | Verify/Uninstall/README: host-attested generation check, "no legacy DLL may load" assertion, prove-no-mapper before deletion (§17.8 steps 6-8). | `packaging/windows/Verify-Helios.ps1`, `packaging/windows/Uninstall-Helios.ps1`, `packaging/windows/README.md` | P1 | S |
+| **T1** | Add the 7 new C++ probes + `tools/helios_etw_capture.ps1`. | the 8 new `tools/` paths | protocol lane (§12.3 event IDs / payload) for the ETW decoder; KMD lane for the provider actually emitting | L |
+| **T2** | Rework `tools/window_burst_capture.ps1`: replace `Get-TimelineCursor` / `Invoke-CausalSnapshot` with an ETW session started/stopped around the burst; drop the `read-ledger-*.csv` and `timeline-*-cursor.txt` outputs rather than repurposing their columns. | `tools/window_burst_capture.ps1`, `tools/kmd-gate-surface.ps1` | T1 (`helios_etw_capture.ps1`) | M |
+| **T3** | Delete the 12 probes. **Must run after T1+T2 and after D1**, so no live script or doc points at a missing file at any commit. | the 12 `tools/` paths | T1, T2, D1 | S |
+| **D1** | `CONFORMANCE.md`: replace the deleted-probe inventory (lines 210, 214, 236, 239-246, 250) with the eight new probes and their pass criteria. | `CONFORMANCE.md` | T1 | M |
+| **D2** | `ROADMAP.md`, `DX12.md`, `TRANSPORT.md`: relabel every deleted-probe evidence citation as historical, retire the Escape/present-stream transport sections, and record the new stage state. | `ROADMAP.md`, `DX12.md`, `TRANSPORT.md` | D1 | L |
+| **D3** | `docs/dx12/{PRESENT,ARCHITECTURE,DECISIONS,KMD_IMPACT,PENDING,GATES,SUBSTRATE,PARALLEL}.md` + research `R4,R5,R6,R7,R9`; label `research/guest-vulkaninfo-full.txt` historical target evidence. | those 13 paths | D2 | L |
+
+**Shared-file serialization inside this lane (hard):**
+`hw/display/virtio-gpu-virgl.c` is touched by H2, H4, H5, H6, H9 → one owner, sequential.
+`virtio-gpu-helios-batch.c` is touched by H4, H5, H7 → one owner, sequential.
+`hw/display/virtio-gpu.c` is touched by H8 and H9 → H9 after H8.
+`include/hw/virtio/virtio-gpu.h` is touched by H1 and H6 → H6 after H1.
+H8 (the whole `ui/**` + udmabuf set) shares nothing with H1-H7 except `virtio-gpu.c`
+(H9 only) — it is the one unit that can be developed fully in parallel.
+
+---
+
+## 4. Shared-file hazards (with other lanes)
+
+| File | Other lane | Collision and serialization |
+|---|---|---|
+| `tools/d3d11_kmt_shared_probe.cpp` | Mesa/ICD (§17.3, doc line 3976) orders the same deletion that §17.7:4520 orders | Delete **exactly once**. Assign to this lane (T3); the Mesa lane must not touch `tools/`. |
+| `qemu-helios/include/hw/virtio/virtio-gpu-helios.h` (generated) | protocol (§17.1:3758 "generated QEMU C declarations", 3784 "generated C bindings") | The protocol lane owns the *generator and its Rust source*; this lane owns the *checked-in generated header and the QEMU build wiring*. Neither may hand-edit the other's side. Generation constant (§17.1:3797) is a single shared symbol — protocol lane defines, this lane consumes. |
+| `packaging/windows/Install-Helios.ps1` | Mesa/ICD lane needs the `VK_LAYER_HELIOS_present` implicit-layer JSON registered; UMD12/vkd3d lane needs `UserModeDriverName[3]`/translator binaries staged | Only this lane edits the file. Other lanes file the requirement as a cross-lane request naming the exact registry path, JSON filename, and payload subdirectory. |
+| `CONFORMANCE.md` | Named in §17.7 only, but it is the D3D11 correctness charter that the UMD11 lane's counters feed | Only this lane edits it. UMD11 lane supplies counter names. |
+| `ROADMAP.md`, `DX12.md`, `docs/dx12/*` | Every lane produces stage state | Only this lane edits them, at the end (D2/D3), consuming the other lanes' finished summaries. A mid-flight edit by another lane will conflict. |
+| `qemu-helios` submodule pointer | root repo | Every QEMU change is a submodule commit **plus** a root-repo pointer bump. The pointer bump is a root-tree change that will conflict with any other lane's root commit. Batch it: one pointer bump at the end of the QEMU work, not per unit. |
+| `ci/windows/Assemble-Package.ps1` | **no lane** — outside §17's entire manifest | It writes `packageId`/manifest and stages the payload the installer consumes. P1's payload/generation changes are inert without it. See §6 item 9. |
+
+---
+
+## 5. Build and verification
+
+### QEMU — Linux host, verified working today (2026-08-09)
+
+The existing build directory was **stale**: it pinned `/usr/lib/libvulkan.so.1.4.350`
+while the host now ships `1.4.357`, and `ninja` failed with
+`missing and no known rule to make it`. The working sequence is:
+
+```sh
+cd /home/rupansh/helios-vgpu/qemu-helios/build-helios
+meson setup --reconfigure . ..      # required whenever a host lib version moves
+ninja -j"$(nproc)"
+```
+
+Verified result: 3246 steps, **exit 0**, 38 s wall on 24 cores, producing
+`qemu-helios/build-helios/qemu-system-x86_64` (87 MB) plus the modular
+`ui-egl-headless.so` / `hw-display-virtio-gpu-gl.so`.
+
+From-scratch configuration (recorded verbatim from `build-helios/config.status:34`):
+
+```sh
+cd /home/rupansh/helios-vgpu/qemu-helios
+mkdir -p build-helios && cd build-helios
+../configure --target-list=x86_64-softmmu --enable-kvm --enable-opengl \
+             --enable-virglrenderer --enable-modules --enable-vnc --disable-werror
+ninja -j"$(nproc)"
+```
+
+Host dependency versions this build resolved against: virglrenderer **1.3.0**,
+vulkan-loader **1.4.357**, QEMU project version **11.0.1**, ninja 1.13.2, meson.
+`build-helios/` is `.gitignore`d (`.gitignore:3`), so rebuilding it does not dirty
+the submodule worktree.
+
+Runtime shape the launcher uses (`tools/launch-helios-gtk.sh:591`), which is what
+the §18.4/§18.5 gates run against:
+
+```
+virtio-gpu-gl-pci, max_outputs=1, venus=true, blob=true,
+hostmem=8589934592 (8 GiB, HELIOS_GPU_HOSTMEM_BYTES), max_hostmem=same,
+display: egl-headless (+ -vnc), optional host3d_blob_limit
+```
+
+⚠ Per CLAUDE.md, changing `tools/launch-helios-gtk.sh`, the QEMU display/debug
+transport, or launcher env vars means **stop and ask the owner to restart the VM**.
+This lane's units H1-H9 do not require a launcher change; if one becomes necessary,
+that is an owner gate, not a lane decision.
+
+### packaging / tools
+
+Nothing in `packaging/windows/**` compiles on Linux. PowerShell scripts can be
+lint-parsed only where `pwsh` exists (not assumed present here). The 7 new `.cpp`
+probes compile **only on the win11 VM** (WinLibs g++ or MSVC + WDK 28000 headers;
+see `ROADMAP.md:4659` for the existing g++ recipe pattern) — everything in T1 is
+**Windows-VM-only verification**, and this lane must not drive the VM.
+
+### docs
+
+No build. The only mechanical check available is a link/citation sweep: every
+`tools/<name>` referenced from `CONFORMANCE.md`, `ROADMAP.md`, `DX12.md`, and
+`docs/dx12/**` must exist after T3. Run it as the D3 exit criterion.
+
+### What this lane can prove on Linux, and what it cannot
+
+Provable here: QEMU compiles and links; HPM1/HOB1/plane state machines can carry
+unit-style assertions inside QEMU; the generated header's static asserts hold;
+`virtio-gpu-rutabaga` is or is not in the built module set.
+**Not** provable here: every §18.4 display gate, every §18.5 per-frame budget, the
+finite-reply admission probe (needs a real guest ICD), the installer, and all 8 new
+tools. Those are VM/owner-gated and must be reported as such, never as passing.
+
+---
+
+## 6. Blockers, ambiguities, and contradictions
+
+**16 items.**
+
+1. **The plane latch/release wire format is never specified — anywhere.** Every
+   other cross-component record in the document gets an exact byte table: HVC1
+   (1698-1707), HNR2 (1755-1777), HVM1 (1939-1952), HOC1 (1486-1498), HOB1
+   (1257-1276), HOS1 (1308-1320), HVR1 (2134-2149), HPM1 (2080-2091), the ETW
+   payload (3258-3270). The plane protocol gets only prose: §10.8:2815-2818
+   ("the backend acknowledges actual latch separately from eventual old-reader
+   release"), §17.7:4548-4550 ("return exact batch completion plus separate exact
+   plane-latch and old-binding-release events; neither event is reconstructed from
+   Present timing"), and §18.4:5101-5102 ("delayed/duplicated/stale QEMU latch and
+   release callbacks cannot replace or release a newer binding"). §17.1 does not
+   list a protocol module for it either. **This is the largest under-specification
+   in the lane.** Fail-closed working rule: define a `HeliosPlaneBindingV1` record
+   in the generated vendor header carrying `{magic, version, size, packageGeneration,
+   adapterGeneration, vidPnSourceId, planeIndex, bindingSequence (u64, monotonic,
+   KMD-assigned), allocationGeneration, event (CANDIDATE|LATCH|RELEASE|UNBIND),
+   status, reservedZero}`; QEMU echoes `bindingSequence` unchanged and KMD drops any
+   ack whose sequence is not the exact expected one. Requires owner ratification and
+   a protocol-lane home.
+2. **`hw/display/virtio-gpu-udmabuf.c` is missing from the §17.7 "Modify:" list**,
+   yet `virtio_gpu_update_dmabuf` (lines 213-247) installs the new primary and then
+   **unconditionally frees the old one in the same call** — precisely the behaviour
+   §10.8:2817-2818 and §18.4:5097-5098 forbid. The manifest cannot be satisfied
+   without editing this file. Treat the list as incomplete, not as a prohibition.
+3. **"the display-listener headers that carry exact plane latch, replacement, and
+   release" (§17.7:4508-4510) is under-specified.** A header carries a declaration;
+   it cannot carry a call. The real blast radius is `include/ui/console.h`
+   (`DisplayChangeListenerOps` 239-266) **plus** the dispatcher `ui/console.c`
+   (`dpy_gl_scanout_dmabuf` 1050-1070, `dpy_gl_release_dmabuf` 1101-1121) **plus**
+   the five other DCL tables that implement those ops (`ui/gtk.c`, `ui/sdl2.c`,
+   `ui/spice-display.c`, `ui/dbus-listener.c`, `ui/dbus-console.c`). Fail-closed
+   rule: a listener that does not implement the release-acknowledgement op must make
+   the Helios plane path **refuse to bind**, never be treated as an implicit release —
+   otherwise §18.4:5098's "distinct acknowledgement" degenerates to a no-op on gtk/sdl.
+4. **`include/standard-headers/linux/virtio_gpu.h` should not be edited.** §17.7:4504
+   lists it for modification, but it is a verbatim mirror of the Linux uapi header
+   (QEMU regenerates it from Linux with `scripts/update-linux-headers.sh`); local
+   edits are silently reverted by any future header sync. The same bullet already
+   says "**plus** a generated Helios vendor-protocol header", and A.4:5763 says to
+   "retain standards declarations needed by unrelated backends". Conservative reading:
+   leave the uapi file byte-identical and put every Helios opcode/field in the new
+   generated header. If the owner insists on touching it, that decision must be
+   recorded at the edit site, because it will be lost on the next header sync.
+5. **BAR size vs. hostmem size — "the complete linear host-visible BAR" is
+   ambiguous.** `virtio-gpu-pci.c:53` and `virtio-vga.c:143` register BAR4 at
+   `pow2ceil(g->conf.hostmem)` while `virtio_pci_add_shm_cap(..., 0, g->conf.hostmem,
+   VIRTIO_GPU_SHM_ID_HOST_VISIBLE)` declares only `hostmem` bytes at offset 0 (this is
+   what commit `d4fde50 virtio-gpu: allow non-power-of-two hostmem sizes` introduced).
+   §10.7:1964-1968 requires StartDevice to "reserve the complete prefetchable 64-bit
+   host-visible BAR range" and makes "the negotiated HPM1 byte capacity and page shift
+   exactly the size and page granularity later reported for HLM1", while §10.7:1976
+   sets `CpuTranslatedAddress = BAR guest-physical base`. With the default 8 GiB
+   hostmem the two are equal and the ambiguity is invisible; with any non-power-of-two
+   hostmem, HLM1 would either over-report (padding is not backed) or the "complete BAR"
+   requirement is unmet. Fail-closed rule: **HLM1 size = the SHM-capability length =
+   the negotiated HPM1 capacity**, the padding tail is never placeable, and cold start
+   fails if the BAR is smaller than the capability length or the base is not the SHM
+   region base. Flag to the owner.
+6. **Removing the 10-ms fence timer conflicts with the non-async virglrenderer
+   configuration.** §17.7:4594 says "Remove the 10-ms fence timer as correctness
+   fallback." But `virtio_gpu_fence_poll` (`virtio-gpu-virgl.c:1469-1483`) is the only
+   completion pump when `VIRGL_RENDERER_ASYNC_FENCE_CB` is *not* selected — and
+   `virtio_gpu_virgl_init:1528-1537` only selects it when `qemu_egl_display` is
+   non-NULL **and** `VIRGL_CHECK_VERSION(1,1,2)`. It is also called unconditionally at
+   the end of every ctrl batch (`virtio-gpu-gl.c:87`). Deleting the timer without
+   another change silently converts "slow" into "never completes" on any host without
+   an EGL display. Fail-closed rule: make async fence callbacks **mandatory** for the
+   Helios generation — fail `virtio_gpu_virgl_init` when `VIRGL_RENDERER_ASYNC_FENCE_CB`
+   cannot be enabled (§3's "no version or feature fallback" supports this) — then delete
+   both the timer and the end-of-batch poll call. The doc never states this
+   prerequisite; record it at the deletion site.
+7. **"No CPU-side QEMU wait" (§18.5:5112) vs. the RCU/revoke ordering
+   (§17.7:4576-4578).** HPM1 must keep old local/aperture mappings and host refs alive
+   "until copy and queued users retire, after which QEMU performs any required
+   address-space/RCU revoke before acknowledging completion". QEMU's only existing
+   mechanism for that is the blob-unmap dance in
+   `virtio_gpu_virgl_unmap_resource_blob:270-342`, which increments
+   `b->renderer_blocked`, sets `*cmd_suspended = true`, and resumes from
+   `virtio_gpu_virgl_hostmem_region_finalize` via `cmdq_resume_bh`. Meanwhile
+   §17.7:4580-4582 says "asynchronous self-heal paths are not used for HVM1 or
+   paging". Reading: the suspend/resume BH is a *deferred completion*, not a poll,
+   sleep, self-heal, or CPU wait — it is the only legal shape. The "self-heal" ban
+   targets the old retry/rescan behaviour. This must be stated explicitly in the code,
+   or a later reviewer will read the suspend as a banned wait.
+8. **§17.8 step 8 is self-contradictory with the installer's own automatic mode.**
+   Step 8 (doc 4627-4630) says deleting `helios_present_sync_v2.bin` is "an installer
+   cleanup after quiescence, **never startup behavior**". But `Install-Helios.ps1`
+   registers `HeliosGraphicsProvisioning` as an **AtStartup** scheduled task
+   (lines 45-54) that re-runs `Install-Helios.ps1 -Automatic`; any cleanup placed in
+   that script *is* startup behaviour in the automatic path. Fail-closed reading: put
+   the deletion in `Uninstall-Helios.ps1` and in a non-`-Automatic`, post-verify arm
+   of `Install-Helios.ps1` gated on "no process can still map it" (step 7), and never
+   in the AtStartup provisioning path. §3:385 ("Never delete the old mapped file while
+   any legacy process can still map it") makes the conservative reading mandatory
+   anyway. Needs owner ratification because §17.7 does not list `Uninstall-Helios.ps1`.
+9. **The installer cannot be made "one generation" without files no lane owns.**
+   §17.7:4605-4608 requires packaging to install "the matching layer DLL/JSON, ICD,
+   both UMDs, KMD/INF, translator binaries, protocol and host component as one
+   generation" and to "reject incomplete/mismatched payloads"; §17.8 step 6 requires
+   the installer to verify a **host-attested** generation. Three of the four files
+   that would implement this are outside §17's manifest entirely:
+   `packaging/windows/Verify-Helios.ps1`, `packaging/windows/Uninstall-Helios.ps1`,
+   and `ci/windows/Assemble-Package.ps1` (which is what actually writes `packageId`
+   and stages `payload/`). Also, "host component" has no meaning on a Windows guest —
+   QEMU is on the Linux host — so "installs … the host component as one generation"
+   can only mean *verifies the host-attested generation*, per §17.8 step 5's mutual
+   exchange. **Cross-lane request** filed below.
+10. **How the host attests its generation before KMD admits work is not specified.**
+    §17.8 step 5 requires host and KMD to "mutually exchange and compare the exact
+    protocol/package generation and required feature bitmap" before KMD admits any
+    allocation or command, and §17.7:4556-4558 puts that at `DxgkDdiStartDevice` /
+    HPM1 negotiation. But no opcode, capset, config-space field, or record is named
+    for the exchange. Fail-closed rule: carry it in the HPM1 negotiation packet
+    defined by §17.1's `physical_memory.rs` ("exact HPM1 feature/generation and
+    complete-HLM1-BAR admission fields") — i.e. HPM1 negotiation **is** the
+    attestation — and fail adapter start on mismatch. Needs protocol-lane agreement.
+11. **The guest page-table (PTE) encoding QEMU must walk is undefined.** §17.7:4552
+    requires QEMU to "walk C64's current HPM1 root/PTE/TLB state" and §10.7:2016-2019
+    lists what the paging packets carry ("every copied PTE/run needed by the device"),
+    but no bit layout, level count, page-size set, or permission encoding appears
+    anywhere in the document. C64 (doc 648) only cites the Microsoft
+    `UPDATE_PAGE_TABLE` structure, which describes what dxgkrnl gives the **KMD**, not
+    what the KMD writes for the device. This is a genuine co-design item with the KMD
+    lane and must be settled in `protocol/src/physical_memory.rs` before H3/H4 can
+    start. Conservative default: a single-level, 4-KiB-granule (segment page shift 12,
+    per §10.7:1950) flat table with an explicit valid bit, segment id, and
+    read/write bits, plus an address-space generation stamped in every entry batch.
+12. **`tools/scanout_timeline_dump.c` cannot be deleted before its replacement
+    exists.** §17.7:4514-4515 says to "capture the C42 ETW provider with standard ETW
+    tooling instead", but the C42 provider is emitted by the **KMD lane**, and
+    `tools/window_burst_capture.ps1` is the only causal-capture instrument in the tree.
+    Deleting the tool first leaves a window with no causal instrument at all. Hard
+    ordering: T1 (`helios_etw_capture.ps1`) → KMD provider lands → T2 (rework
+    burst-capture) → T3 (delete). Recorded as a dependency in §3.
+13. **`tools/helios_etw_capture.ps1`'s enable path is under-specified against
+    §12.3.** §17.7:4529-4531 says the tool "enables the fixed section-12.3 provider
+    GUID and decodes only its versioned event IDs/payload; it sends no KMD request or
+    acknowledgement". §12.3:3245-3248 says `DxgkDdiControlEtwLogging` changes only an
+    atomic enabled bit + max level and that an event is constructed only when **both**
+    that OS gate and `EtwProviderEnabled(...)` accept it. A user-mode `logman`/`wpr`
+    enable of the provider GUID drives `EtwProviderEnabled`, but whether dxgkrnl also
+    calls `DxgkDdiControlEtwLogging` is an OS behaviour the document does not assert.
+    Fail-closed rule: the script uses only standard `logman`/`wpr` on the GUID, and the
+    KMD's failure to emit is reported by the script as "provider not gated on", never
+    worked around with a private call. Note that §12.3:3288-3290 already makes dropped
+    events legal, so a partial trace is not a correctness failure.
+14. **Deleting twelve probes destroys the evidence base that live docs cite.**
+    `ROADMAP.md:2206,2233,4654,4659` cite `vk_ring_fence_probe.cpp` as the proof that
+    signals retire at host GPU completion; `ROADMAP.md:2872` and `DX12.md:102` cite
+    `vehicle_flipwait_probe.c` as proving queued GPU-side monitored-fence waits on this
+    software-scheduled adapter (a claim the D3D12 native-fence design leans on);
+    `ROADMAP.md:2856,3037` cite `blob_map_size_probe.c`. §17.7 lists those docs for
+    update but never says the *evidence* must be re-derived. Fail-closed rule: D1/D2
+    must either relabel each claim "historical, proven on the retired Escape/ledger
+    generation" **or** name the new probe that re-proves it — never leave a live claim
+    resting on a deleted tool. `tools/native_fence_context_probe.cpp` is the natural
+    successor for the two fence claims.
+15. **A.4:5763 mandates a test with no home.** "Package/backend tests must prove the
+    alternate rutabaga module is not selected for this Helios generation." No file in
+    §17.7 (or anywhere in §17) is assigned this. `hw/display/virtio-gpu-rutabaga.c`
+    (1141 lines) is built as a separate module (`hw/display/meson.build:89-90`) whenever
+    rutabaga is configured. Fail-closed rule: assert it in the same place that
+    negotiates HPM1 (H1) — refuse adapter start if the realized device type is not
+    `virtio-gpu-gl` — and record the module inventory in the build/verification step.
+16. **The §17.7 doc-update list is inconsistent with Appendix A.4.**
+    `docs/dx12/METHOD.md` (236 lines) is absent from the §17.7 list even though
+    `CLAUDE.md` declares it authoritative over SEQUENCING for all of `docs/dx12/` and
+    it describes the working loop for the retired probe-driven ladder; research
+    snapshots `R1, R2, R3, R8, R10, R11, R12` are likewise absent even though
+    A.4:5762 explicitly names `docs/dx12/research/R3-vkd3d-internals.md` as a residual
+    literal hit that must be labelled historical. Fail-closed rule: D3 also touches
+    `METHOD.md` and `R3`, labelling rather than rewriting the rest, and records that
+    it went beyond the manifest.
+
+*Explicit non-issue, recorded so a later pass does not "fix" it:* the two
+`Start-Sleep -Seconds 2` calls in `Install-Helios.ps1` (around `pnputil`) are PnP
+settling in an installer, not the runtime "polling thread, sleeps" that §3:363-366
+bans. Leave them.
+
+---
+
+## CROSS-LANE REQUESTS
+
+1. **protocol lane (§17.1)** — this lane needs, before H0 can land:
+   (a) `protocol/src/physical_memory.rs` **plus its generated QEMU C declarations**,
+   including the HPM1 negotiation/feature/generation fields that also serve as the
+   §17.8-step-5 host attestation (item 10);
+   (b) the PTE/root encoding for C64 (item 11) — currently undefined on both sides;
+   (c) a home for the plane latch/release record (item 1);
+   (d) the single shared package-generation constant (§17.1:3797) exported in a form
+   a C header and a PowerShell script can both consume.
+2. **KMD lane** — must emit the §12.3 provider (events 7/8/9) before T2/T3 can
+   proceed, and must own the guest side of the plane binding-sequence contract
+   (item 1) and the PTE encoding (item 11).
+3. **Mesa/ICD lane** — supply the exact `VK_LAYER_HELIOS_present` manifest filename,
+   DLL name, and payload subdirectory so P1 can register the implicit layer; and do
+   **not** delete `tools/d3d11_kmt_shared_probe.cpp` (this lane owns that deletion).
+4. **Whoever owns CI** — `ci/windows/Assemble-Package.ps1` is outside §17's manifest
+   but writes the payload/manifest the installer consumes (item 9). Either add it to a
+   lane or accept that P1's generation gate cannot be end-to-end verified.
+5. **Owner decision required** on items 1, 5, 6, 8, 10, and 16 before the
+   corresponding units start; items 2, 3, 4, 9, 12, 15 are manifest gaps this brief
+   proposes to fill without changing any stated rule.
