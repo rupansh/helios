@@ -16,6 +16,7 @@
 //! |---|---|
 //! | `protocol/include/helios_wddm.h` | [`wddm`] — HWA2, HOB1 + its use/operand records, HOS1, HOC1 |
 //! | `protocol/include/helios_diagnostics.h` | [`diagnostics`] — the §12.3 ETW schema |
+//! | `protocol/include/helios_translator_dispatch.h` | [`translator_dispatch`] — the private direct-dispatch ABI (in-process, not a wire format) |
 //! | `qemu-helios/include/hw/virtio/helios_physical_memory.h` | [`physical_memory`] — HPM1 and the HLM1 BAR profile |
 //!
 //! # Module map (HELIOS_PRESENT_SYNC_RETIREMENT.md section 17.1)
@@ -24,6 +25,7 @@
 //! |---|---|---|
 //! | [`wddm`] | D3D UMD -> KMD allocation identity (HWA2), outer batch (HOB1), D3D12 submit descriptor (HOS1), command pool (HOC1) | 10.3, 10.4, 10.6 |
 //! | [`translation_session`] | Mesa `vn_instance` -> KMD session establishment (HTS1) and outer-context attach (HQA1) | 10.4 |
+//! | [`translator_dispatch`] | D3D UMD bridge <-> DXVK/vkd3d <-> Helios Mesa, **in-process only**: the private direct-dispatch entry point and its versioned two-half function table | 2.8, 10.4, 13 |
 //! | [`native_render`] | native Vulkan ICD -> KMD Render (HVC1/HNR2), allocation (HVM1), synchronous reply (HVR1) | 10.7 |
 //! | [`physical_memory`] | KMD paging DMA -> QEMU device page tables (HPM1) and the HLM1 BAR profile | 10.7 |
 //! | [`diagnostics`] | KMD -> OS ETW, one-way lossy schema | 12.3 |
@@ -71,6 +73,15 @@ pub mod ioctl;
 pub mod native_render;
 pub mod physical_memory;
 pub mod translation_session;
+// ⛔ `translator_dispatch` is authored but NOT WIRED IN, deliberately. It has two
+// confirmed blockers from adversarial review that were mid-repair when the
+// session ended, so the file on disk is a half-applied fix: `vk_instance` was
+// added to `HeliosTranslatorInstanceV1` (the correct fix — the slot's argument
+// was previously unobtainable) without updating its size assertion or the C
+// mirror. Finishing that repair is the next step; see the commit that added it
+// for the full finding list. Until then no lane may consume this contract, and
+// the module stays out of the build so `protocol/` keeps compiling.
+// pub mod translator_dispatch;
 pub mod virtio_gpu;
 pub mod wddm;
 pub mod wddm_legacy;
@@ -82,6 +93,7 @@ pub use ioctl::*;
 pub use native_render::*;
 pub use physical_memory::*;
 pub use translation_session::*;
+// pub use translator_dispatch::*;   // see the ⛔ note above the module line
 pub use virtio_gpu::*;
 pub use wddm::*;
 pub use wddm_legacy::*;
