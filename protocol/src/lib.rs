@@ -37,7 +37,10 @@
 //! package (explicitly including `QUERY_STATS` and `QUERY_SCANOUT_TIMELINE`,
 //! which may **not** be retained as an observability fallback), and `ioctl.rs`
 //! with the obsolete `kmd/` package, since no IOCTL verb may become a
-//! compatibility carrier for the new generation. They remain declared here only
+//! compatibility carrier for the new generation. [`wddm_legacy`] joins them: it
+//! is the pre-retirement content of [`wddm`], carried verbatim so the same three
+//! consumers keep compiling while each migrates to HWA2/HOB1/HOS1/HOC1.
+//! They remain declared here only
 //! because their current consumers (`kmd_render`, `umd`, `umd12`) have not yet
 //! migrated; deletion is a later cleanup phase of the same one-shot change.
 //! **They must not gain a new caller, a new symbol, or a new field.** The
@@ -70,6 +73,7 @@ pub mod physical_memory;
 pub mod translation_session;
 pub mod virtio_gpu;
 pub mod wddm;
+pub mod wddm_legacy;
 
 pub use diagnostics::*;
 pub use escape::*;
@@ -80,6 +84,7 @@ pub use physical_memory::*;
 pub use translation_session::*;
 pub use virtio_gpu::*;
 pub use wddm::*;
+pub use wddm_legacy::*;
 
 // ── The atomic package generation ───────────────────────────────────────────
 //
