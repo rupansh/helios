@@ -4,6 +4,53 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ⭐ In progress since 2026-08-09: the HPS2 retirement (WDDM 3.2 uplift)
+
+A one-shot, all-or-nothing architecture change across nine repositories,
+specified in `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` (frozen at corrective pass
+82). It retires the `helios_present_sync_v2.bin` shared mapping, the private
+Escape transport, the read-ledger, and the shared Venus rings — not by replacing
+them with another registry, but by **correcting where translated work is
+submitted**: DXVK and vkd3d become record-only, and the sealed Venus batch is
+submitted as the real WDDM command on the runtime's own context. `WrittenPrimaries`
+then becomes truthful and stock DXGI/dxgkrnl carries the DWM handoff.
+
+Planning artefacts, all under `docs/retirement/`:
+
+| File | What |
+|---|---|
+| `lane-*.md` (6) | per-lane briefs: current source inventory, DELETE/REWRITE/MODIFY/ADD per file, work units, and each lane's blockers |
+| `OWNERSHIP.md` | who edits what, the atomic cross-repo pairs, and the activation switch |
+| `FINDINGS.md` | ⭐ target measurements that **supersede** the frozen reference |
+
+**Two of the reference's load-bearing assumptions have been falsified by
+measurement (`FINDINGS.md`), and both were blockers:**
+
+- **F1 — Core DDI 0116 negotiates on build 26100.** The "Windows 11 26H1 / build
+  28000, no fallback" package minimum was an artefact of what WDK 26100's
+  `d3d12umddi.h` *declares*. The inbox `26100.8737` runtime accepts the 0116
+  token and drives `pfnCreateDevice` with it. The remaining input is a bindgen
+  regen against WDK 28000, staged at `tmp/wdk-28000/`.
+- **F2 — a CpuVisible memory segment does not Code-43.** §10.7's required HLM1
+  segment shape is the shape the CLAUDE.md invariant called ETW-proven fatal.
+  `BarSegFlags=0x02` starts `OK/CM_PROB_NONE` and `helios_paintcap` shows a
+  fully composited live desktop. The invariant is corrected in place; the KMD
+  memory lane is unblocked.
+
+Both are bounded in `FINDINGS.md` — read the bounds before building on them.
+
+**Landed so far:** `protocol/` carries the complete new wire ABI (HWA2, HOB1/HOS1/
+HOC1, HQA1/HTS1, HVC1/HNR2/HVM1/HVR1, HPM1/HLM1, the §12.3 ETW schema) with
+compile-time offset assertions and four C mirrors; `wddm_legacy.rs` keeps the
+pre-retirement symbols alive so `kmd_render`/`umd`/`umd12` still build while each
+migrates; vkd3d's Wine-Escape and `\\.\SharedGpuResource` transports are gone;
+QEMU has HPM1 negotiation and HLM1 BAR admission.
+
+⛔ **Nothing is activated.** `wddm_surface.rs`'s `SURFACE` stays `Wddm2_1GpuMmu`
+until the MPO3 table, the native-fence surface and the cold-DWM gate are all in;
+it is the last edit of the whole retirement (`OWNERSHIP.md` §3). §18's runtime
+gates remain unexecuted.
+
 ## Stage pivot, 2026-08-05
 
 The **Performance, Stability, Conformance (PSC)** stage is closed as a *stage*;
