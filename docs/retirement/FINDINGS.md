@@ -1,0 +1,118 @@
+# Retirement target-gate findings
+
+Measurements taken against the real target that **revise claims in the frozen
+reference** (`docs/HELIOS_PRESENT_SYNC_RETIREMENT.md`). The reference is frozen
+as of corrective pass 82 and is not rewritten in place; where a measurement
+contradicts it, the measurement wins and is recorded here.
+
+Each entry states what was measured, on what, and — importantly — the **bound**
+on the claim, so a later reader cannot inflate it.
+
+---
+
+## F1 — Core DDI 0116 negotiates on build 26100. The "build 28000" package minimum is a header artifact.
+
+**Date** 2026-08-10 · **Revises** §2 (lines 114-115, 309-317), §3 (line 381),
+§10.2 (line 982), §10.9 (line 2843), §18.1 (line 4639)
+
+The reference makes "Windows 11 26H1 OS build 28000 or later" part of the
+package ABI with "no version or feature fallback", and §10.9 fails
+adapter/device/fence creation below Core DDI 0116. Its own §1 justifies the
+28000 minimum solely by the observation that WDK 26100's `d3d12umddi.h` "ends at
+Core build 0110; it cannot supply the selected open association" — a statement
+about a **header**, not about a kernel.
+
+**Measured.** Guest build 26100.8875, inbox runtime (`d3d12.dll` and
+`d3d12core.dll` both `10.0.26100.8737`, no Agility redist). Advertising a
+one-element supported-version set containing `D3D12DDI_SUPPORTED_0116`:
+
+```
+GetSupportedVersions: advertising _0116 token=0x000c005000740000
+CalcPrivateDeviceSize: Flags=0x0 -> 40
+CreateDevice: _0116 Interface=0x000c0050 (major=12 minor=80) Version=0x00740000 (build=116)
+```
+
+The control arm advertising `_0110` received build 110 and created a device
+normally, byte-identical to the pre-knob driver. The runtime's own mismatch
+string *"Failed to find matching DDI versions"* — which is present in
+`d3d12core`'s string table — never fired in any arm. The conclusion rests on the
+**pairing across arms**, not on a single line.
+
+**Bound.** This shows the runtime does not *reject* 0116 and hands it back. It
+does **not** show the runtime exercises 0116 semantics — whether it asks
+`D3D12DDICAPS_TYPE_0112_NATIVE_FENCE_SUPPORT` or expects `pfnCreateFence_0116`
+is untested by design, because the experiment's refusal gate fires at
+`pfnCreateDevice` before the caps gauntlet and before any `pfnFillDDITable`.
+That question needs the 0116 tables to exist first.
+
+**Consequence.** Core 0116 is reachable on this guest. The remaining input is
+regenerating `umd12/bindgen/cached/d3d12umddi.rs` against WDK 28000, whose
+headers are staged at `tmp/wdk-28000/` (gitignored, nupkg SHA-256 matches the
+hash §1 records) and readable from the VM over `Z:\`. `umd12/build.rs` already
+honours `HELIOS_WDK_INCLUDE`.
+
+Knob: `Umd12CoreDdi`, default 110. Both arms stay reachable per CLAUDE.md rule 8.
+
+---
+
+## F2 — A CpuVisible memory segment does not Code-43. The HLM1 flag shape is admitted.
+
+**Date** 2026-08-10 · **Revises** the CLAUDE.md invariant table · **relieves**
+§10.9 line 2858 and §2 line 17 of their assumed failure mode
+
+The kmd-core lane brief called this "the single highest-risk item in the lane":
+§10.7:1973-1976 requires HLM1 to be `Aperture=0, CpuVisible=1,
+CacheCoherent=0, SupportsCpuHostAperture=0, SupportsCachedCpuHostAperture=0`,
+which is precisely the shape CLAUDE.md recorded as *"classic CpuVisible memory
+segments are rejected — AddAdapter Code 43 (ETW-proven 2026-07-05)"*. §10.9
+makes such a rejection a package rejection with no fallback.
+
+**Measured.** `BarSegFlags=0x02` → `pnputil /restart-device` → adapter
+`Status=OK`, `Problem=CM_PROB_NONE`, mode preserved at 1896x1030, and
+`helios_paintcap` returned a **fully composited live desktop** — wallpaper,
+taskbar, icons, live clock. Reverted to the `0x1C` default in the same script;
+also OK. The `BarF` breadcrumb moved `28 → 2 → 28` across the arms, so the knob
+provably took effect that boot rather than being read stale.
+
+**Bound.** This is the **current** segment table with the BAR segment's flags
+changed. It is not §10.7's exact two-segment profile (aperture id 1 + HLM1 id 2
+with their exact base/size/CommitLimit), and the driver still **registers** the
+Map/UnmapCpuHostAperture callbacks that §17.6 deletes. So the flag combination
+is admitted and non-fatal; the full HLM1 profile remains an unexecuted gate.
+
+**Consequence.** The KMD memory lane is not blocked on a Code-43 wall. The
+CLAUDE.md invariant has been corrected in place with this evidence.
+
+---
+
+## F3 — The guest is Windows 11, and `ProductName` says otherwise.
+
+**Date** 2026-08-10
+
+`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProductName` reads
+**"Windows 10 IoT Enterprise LTSC 2024"**, but the desktop watermark reads
+**"Windows 11 IoT Enterprise LTSC, Build 26100"**. 26100 is the 24H2 kernel and
+carries WDDM 3.2. Do not classify this guest from `ProductName` — it is stale,
+and reading it as "Windows 10" produces a false conclusion that the target OS is
+wrong.
+
+Corroborating: WDK 26100's `d3dkmddi.h`/`dispmprt.h` already declare every KMD
+native-fence slot (`DXGKQAITYPE_NATIVE_FENCE_CAPS`, `DXGK_NATIVE_FENCE_CAPS`,
+`DXGK_INTERRUPT_NATIVE_FENCE_SIGNALED`) and all seven MPO3/Display-Core slots.
+
+---
+
+## F4 — `pfnFillDDITable` runs after `pfnCreateDevice`.
+
+**Date** 2026-08-10 · **Revises** `docs/dx12/ARCHITECTURE.md` §1.2
+
+Measured order on 26100.8737:
+
+```
+OpenAdapter12 -> GetCaps(1074) -> GetSupportedVersions x2 -> CalcPrivateDeviceSize
+  -> CreateDevice -> GetCaps x24 -> GetOptionalDDITables -> FillDDITable x5
+```
+
+This matters for the Core-0116 uplift: the table-shape hazard is at
+`pfnCreateDevice`, not at `pfnFillDDITable`, so a version gate placed at
+CreateDevice is upstream of every fill.

@@ -8,6 +8,16 @@ UNAUTHORIZED PENDING HTS1/HLM1 AND RUNTIME GATES**
 
 Static-analysis snapshot: **2026-08-09**
 
+> ⚠ **This file is frozen and is NOT rewritten in place. Target measurements
+> that revise claims below are recorded in `docs/retirement/FINDINGS.md`, and
+> where a measurement contradicts this text the measurement wins.** As of
+> 2026-08-10 that already includes the build-28000 package minimum (F1: Core DDI
+> 0116 negotiates on build 26100 — the 28000 requirement was an artifact of what
+> WDK 26100's header *declares*, not of the kernel) and the assumed Code-43
+> failure of HLM1's segment shape (F2: it starts clean and the desktop
+> composites on it). Implementation planning lives in
+> `docs/retirement/OWNERSHIP.md` and the per-lane briefs beside it.
+
 Target baseline: **Windows 11 26H1 (build 28000) / WDDM 3.2 / D3D12 Core
 DDI 0116 or later, traditional kernel submission**
 
