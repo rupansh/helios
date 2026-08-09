@@ -1,0 +1,210 @@
+# WDDM 3.2 DRIVER_INITIALIZATION_DATA slot classification.
+#
+# Normative: docs/HELIOS_PRESENT_SYNC_RETIREMENT.md section 17.6:4460-4462
+# ('classify every slot through 3.2 as implemented or disabled behind a
+# truthful zero capability') and section 18.1:4653-4656.
+#
+# Format: <slot name>\t<Implemented|Disabled|Pending>\t<reason>
+# Rows MUST be in WDK declaration order; the generator hard-fails otherwise.
+#
+#   Implemented - registered by build_ddi_table(); must be non-NULL.
+#   Disabled    - must be NULL; the reason names the zero capability that
+#                 makes the slot unreachable.
+#   Pending     - must be NULL today; the reason names the retirement lane
+#                 that will register it. Reclassify in the SAME changeset
+#                 that registers the slot, or DriverEntry refuses to load.
+#
+# Regenerate the outputs with:
+#   python3 kmd_render/tools/gen_wddm32_slot_audit.py
+DxgkDdiAddDevice	Implemented	PnP: adapter object creation.
+DxgkDdiStartDevice	Implemented	PnP: transport bring-up, HPM1 negotiation, segment/placement init.
+DxgkDdiStopDevice	Implemented	PnP: drain and tear down the transport.
+DxgkDdiRemoveDevice	Implemented	PnP: free the adapter object.
+DxgkDdiDispatchIoRequest	Implemented	Legacy video-port IRP path; refuses every code and counts through StVrp.
+DxgkDdiInterruptRoutine	Implemented	INTx ISR: read-to-clear virtio ISR status, queue the DPC.
+DxgkDdiDpcRoutine	Implemented	Drain the used ring and complete WDDM submissions.
+DxgkDdiQueryChildRelations	Implemented	One video-output child when the display half is active.
+DxgkDdiQueryChildStatus	Implemented	Child connection status for that one target.
+DxgkDdiQueryDeviceDescriptor	Implemented	EDID for the one monitor target.
+DxgkDdiSetPowerState	Implemented	Power transitions for the adapter and its one child.
+DxgkDdiNotifyAcpiEvent	Implemented	Platform ACPI events; services none and reports zero flags.
+DxgkDdiResetDevice	Implemented	Crash-dump quiesce; deliberately programs no hardware.
+DxgkDdiUnload	Implemented	Driver-wide unload; releases the cached BAR MMIO mappings.
+DxgkDdiQueryInterface	Implemented	Exports no driver interface; logs the requested GUID and refuses.
+DxgkDdiControlEtwLogging	Implemented	C42 provider enable bit and level (section 12.3).
+DxgkDdiQueryAdapterInfo	Implemented	The whole capability surface, including NATIVE_FENCE_CAPS.
+DxgkDdiCreateDevice	Implemented	Per-D3D-device state, exact hKmdProcess.
+DxgkDdiCreateAllocation	Implemented	HWA2 create-time descriptor, HVM1 roles, HOC1 admission.
+DxgkDdiDestroyAllocation	Implemented	Allocation teardown with generation-safe host unref.
+DxgkDdiDescribeAllocation	Implemented	Primary geometry for the display path.
+DxgkDdiGetStandardAllocationDriverData	Implemented	Standard (shared primary / cross-adapter) allocation shapes.
+DxgkDdiAcquireSwizzlingRange	Disabled	DXGK_DRIVERCAPS::NumberOfSwizzlingRanges=0; the swizzling-range family is unreachable.
+DxgkDdiReleaseSwizzlingRange	Disabled	DXGK_DRIVERCAPS::NumberOfSwizzlingRanges=0; the swizzling-range family is unreachable.
+DxgkDdiPatch	Implemented	Infallible idempotent physical-capability snapshotter (section 10.7:1856).
+DxgkDdiSubmitCommand	Implemented	Physical submit: epoch validation plus one fenced SUBMIT_3D.
+DxgkDdiPreemptCommand	Implemented	Preemption request; reports DMA_PREEMPTED.
+DxgkDdiBuildPagingBuffer	Implemented	HPM1 paging DMA encoding (section 17.6:4421).
+DxgkDdiSetPalette	Disabled	No palettized mode is enumerated; every VidPn source mode is 32bpp RGB.
+DxgkDdiSetPointerPosition	Implemented	Hardware pointer position.
+DxgkDdiSetPointerShape	Implemented	Hardware pointer shape.
+DxgkDdiResetFromTimeout	Implemented	TDR reset.
+DxgkDdiRestartFromTimeout	Implemented	TDR restart.
+DxgkDdiEscape	Disabled	Section 17.6:4494 and 18.1:4667: DxgkDdiEscape is NULL and no Escape entry point is present in the selected KMD.
+DxgkDdiCollectDbgInfo	Implemented	OS-requested bounded debug snapshot.
+DxgkDdiQueryCurrentFence	Implemented	Last completed submission fence for a node.
+DxgkDdiIsSupportedVidPn	Implemented	VidPn validation.
+DxgkDdiRecommendFunctionalVidPn	Implemented	VidPn recommendation.
+DxgkDdiEnumVidPnCofuncModality	Implemented	Cofunctional modality enumeration.
+DxgkDdiSetVidPnSourceAddress	Implemented	Classic scanout binding through validate_direct_scanout_binding.
+DxgkDdiSetVidPnSourceVisibility	Implemented	Source visibility.
+DxgkDdiCommitVidPn	Implemented	VidPn commit.
+DxgkDdiUpdateActiveVidPnPresentPath	Implemented	Active present-path update.
+DxgkDdiRecommendMonitorModes	Implemented	Monitor mode recommendation.
+DxgkDdiRecommendVidPnTopology	Disabled	Optional. One source and one target, so the OS-built topology is accepted unchanged.
+DxgkDdiGetScanLine	Implemented	Scan-line query.
+DxgkDdiStopCapture	Disabled	No capture/VPE surface is advertised.
+DxgkDdiControlInterrupt	Implemented	CRTC_VSYNC enable/disable; every other class is refused.
+DxgkDdiCreateOverlay	Disabled	DXGK_DRIVERCAPS::MaxOverlays=0; the legacy overlay family is unreachable.
+DxgkDdiDestroyDevice	Implemented	Per-device teardown.
+DxgkDdiOpenAllocation	Implemented	Ordinary open; reads private data only, never restamps it.
+DxgkDdiCloseAllocation	Implemented	Per-device allocation close.
+DxgkDdiRender	Implemented	HVC1/HNR2 fragment assembly, validation and output patch generation.
+DxgkDdiPresent	Implemented	Present DMA packet construction.
+DxgkDdiUpdateOverlay	Disabled	DXGK_DRIVERCAPS::MaxOverlays=0; the legacy overlay family is unreachable.
+DxgkDdiFlipOverlay	Disabled	DXGK_DRIVERCAPS::MaxOverlays=0; the legacy overlay family is unreachable.
+DxgkDdiDestroyOverlay	Disabled	DXGK_DRIVERCAPS::MaxOverlays=0; the legacy overlay family is unreachable.
+DxgkDdiCreateContext	Implemented	HVC1 / HQA1 context admission (section 10.7, 10.4).
+DxgkDdiDestroyContext	Implemented	Context teardown.
+DxgkDdiLinkDevice	Disabled	Section 10.2 topology row: one physical node, LDA is not advertised.
+DxgkDdiSetDisplayPrivateDriverFormat	Disabled	No private display format is negotiated; the host owns the scanout format.
+DxgkDdiDescribePageTable	Disabled	Obsolete WIN7-era PVOID slot; the WDK declares no callback type for it.
+DxgkDdiUpdatePageTable	Disabled	Obsolete WIN7-era PVOID slot; the WDK declares no callback type for it.
+DxgkDdiUpdatePageDirectory	Disabled	Obsolete WIN7-era PVOID slot; the WDK declares no callback type for it.
+DxgkDdiMovePageDirectory	Disabled	Obsolete WIN7-era PVOID slot; the WDK declares no callback type for it.
+DxgkDdiSubmitRender	Disabled	Obsolete WIN7-era PVOID slot; the WDK declares no callback type for it.
+DxgkDdiCreateAllocation2	Disabled	Obsolete WIN7-era PVOID slot; the WDK declares no callback type for it.
+DxgkDdiRenderKm	Implemented	Kernel-mode command buffer arm.
+Reserved	Disabled	Reserved by the WDK; must stay NULL.
+DxgkDdiQueryVidPnHWCapability	Implemented	Per-path hardware capability.
+DxgkDdiSetPowerComponentFState	Disabled	No power components are declared and SupportRuntimePowerManagement is 0, so no F-state transition is requested.
+DxgkDdiQueryDependentEngineGroup	Implemented	One node, one engine.
+DxgkDdiQueryEngineStatus	Implemented	Per-engine progress for the TDR path.
+DxgkDdiResetEngine	Implemented	Per-engine reset (SupportPerEngineTDR=1).
+DxgkDdiStopDeviceAndReleasePostDisplayOwnership	Implemented	PnP stop with post-display ownership release.
+DxgkDdiSystemDisplayEnable	Implemented	Bugcheck/system-display path.
+DxgkDdiSystemDisplayWrite	Implemented	Bugcheck/system-display path.
+DxgkDdiCancelCommand	Implemented	Cancel a queued packet.
+DxgkDdiGetChildContainerId	Implemented	Mandatory once a monitor target is advertised.
+DxgkDdiPowerRuntimeControlRequest	Implemented	Runtime power control requests.
+DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay	Disabled	Superseded revision. Section 17.6:4465 selects only the MPO3 revision.
+DxgkDdiNotifySurpriseRemoval	Disabled	DXGK_DRIVERCAPS::SupportSurpriseRemoval=0; the OS never notifies surprise removal.
+DxgkDdiGetNodeMetadata	Implemented	One node, GpuMmuSupported consistent with the reported surface.
+DxgkDdiSetPowerPState	Disabled	No GPU P-states are declared; the device has no programmable clock domain.
+DxgkDdiControlInterrupt2	Disabled	The driver services exactly one interrupt class (CRTC_VSYNC) and registers ControlInterrupt; revisions 2 and 3 only add classes it never raises.
+DxgkDdiCheckMultiPlaneOverlaySupport	Disabled	Superseded revision. Section 17.6:4465 selects only the MPO3 revision; MaxPlanes=1 is advertised there.
+DxgkDdiCalibrateGpuClock	Implemented	GPU clock calibration for the scheduler.
+DxgkDdiFormatHistoryBuffer	Implemented	History buffer formatting.
+DxgkDdiRenderGdi	Implemented	PENDING DELETE with the retired GDI path (K6; A.4 row 5770). Registered until the display lane confirms nothing lands here.
+DxgkDdiSubmitCommandVirtual	Implemented	D3D12 virtual submit: HOS1 validation plus nonblocking GPUVA enqueue.
+DxgkDdiSetRootPageTable	Implemented	C64 authoritative per-process root.
+DxgkDdiGetRootPageTableSize	Implemented	GpuMmu root table sizing.
+DxgkDdiMapCpuHostAperture	Implemented	COUPLED DELETE: goes with the HLM1 two-segment table (K1/K2); the current segment table still advertises SupportsCpuHostAperture, so removing the slot alone would break a live cap.
+DxgkDdiUnmapCpuHostAperture	Implemented	COUPLED DELETE: pairs with MapCpuHostAperture; see that row.
+DxgkDdiCheckMultiPlaneOverlaySupport2	Disabled	Superseded revision. Section 17.6:4465 selects only the MPO3 revision.
+DxgkDdiCreateProcess	Implemented	One bounded ProcessContext HTS1 session list (section 17.6:4336).
+DxgkDdiDestroyProcess	Implemented	Process teardown cancels all sessions.
+DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay2	Disabled	Superseded revision. Section 17.6:4465 selects only the MPO3 revision.
+Reserved1	Disabled	Reserved by the WDK; must stay NULL.
+Reserved2	Disabled	Reserved by the WDK; must stay NULL.
+DxgkDdiPowerRuntimeSetDeviceHandle	Implemented	Runtime power device handle.
+DxgkDdiSetStablePowerState	Implemented	Stable power state for profiling tools.
+DxgkDdiSetVideoProtectedRegion	Disabled	No protected-content surface is advertised (no OPM/PVP capability).
+DxgkDdiCheckMultiPlaneOverlaySupport3	Pending	KMD display lane unit D3 (section 17.6:4465). NULL until the one-primary MPO3 validator lands.
+DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3	Pending	KMD display lane unit D3 (section 17.6:4466). NULL until the one-primary MPO3 binder lands.
+DxgkDdiPostMultiPlaneOverlayPresent	Pending	KMD display lane unit D3 (section 17.6:4497), an always-success bounded diagnostic callback with a named hit counter.
+DxgkDdiValidateUpdateAllocationProperty	Pending	KMD display lane unit D3 (section 17.6:4475).
+DxgkDdiControlModeBehavior	Pending	KMD display lane unit D3 (section 17.6:4478).
+DxgkDdiUpdateMonitorLinkInfo	Implemented	Mandatory once a monitor target is advertised; revalidated under the 3.2 table.
+DxgkDdiCreateHwContext	Disabled	Section 17.6:4385: HWS/HWQueue is not advertised in this generation, and DXGKQAITYPE_HWSCHEDULINGCAPS is refused, so the hardware-scheduling family is unreachable.
+DxgkDdiDestroyHwContext	Disabled	Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable.
+DxgkDdiCreateHwQueue	Disabled	Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable.
+DxgkDdiDestroyHwQueue	Disabled	Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable.
+DxgkDdiSubmitCommandToHwQueue	Disabled	Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable.
+DxgkDdiSwitchToHwContextList	Disabled	Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable.
+DxgkDdiResetHwEngine	Disabled	HWS-only engine reset; per-engine TDR uses DxgkDdiResetEngine instead.
+DxgkDdiCreatePeriodicFrameNotification	Disabled	No periodic frame notification is advertised.
+DxgkDdiDestroyPeriodicFrameNotification	Disabled	No periodic frame notification is advertised.
+DxgkDdiSetTimingsFromVidPn	Disabled	Display-Core timing programming is not advertised; the host owns modeset and the guest programs no CRTC.
+DxgkDdiSetTargetGamma	Disabled	No per-target gamma/LUT hardware is exposed.
+DxgkDdiSetTargetContentType	Disabled	No per-target content-type signalling is exposed.
+DxgkDdiSetTargetAnalogCopyProtection	Disabled	No analog output and no copy-protection hardware.
+DxgkDdiSetTargetAdjustedColorimetry	Disabled	No per-target colorimetry adjustment hardware; only SDR RGB is advertised.
+DxgkDdiDisplayDetectControl	Disabled	The single child is indicated statically from the virtio-gpu config-change event; there is no detection engine to gate.
+DxgkDdiQueryConnectionChange	Disabled	No DisplayPort topology/connection-change surface is exposed.
+DxgkDdiExchangePreStartInfo	Implemented	Pre-start info exchange.
+DxgkDdiGetMultiPlaneOverlayCaps	Pending	KMD display lane unit D3 (section 17.6:4473). NULL until the one-plane cap values land.
+DxgkDdiGetPostCompositionCaps	Pending	KMD display lane unit D3 (section 17.6:4474). NULL until the no-post-transform cap values land.
+DxgkDdiUpdateHwContextState	Disabled	HWS-only; the hardware-scheduling family is unreachable.
+DxgkDdiCreateProtectedSession	Disabled	No protected-content session surface is advertised.
+DxgkDdiDestroyProtectedSession	Disabled	No protected-content session surface is advertised.
+DxgkDdiSetSchedulingLogBuffer	Disabled	Scheduling log buffers are HWS-scoped; HWS is not advertised.
+DxgkDdiSetupPriorityBands	Disabled	No priority bands are advertised.
+DxgkDdiNotifyFocusPresent	Disabled	Focus-present notification is not requested by this driver.
+DxgkDdiSetContextSchedulingProperties	Disabled	Context scheduling properties are not advertised.
+DxgkDdiSuspendContext	Disabled	Context suspend/resume is HWS-scoped; HWS is not advertised.
+DxgkDdiResumeContext	Disabled	Context suspend/resume is HWS-scoped; HWS is not advertised.
+DxgkDdiSetVirtualMachineData	Implemented	VM data hand-off.
+DxgkDdiBeginExclusiveAccess	Disabled	No GPU-P exclusive-access surface is advertised.
+DxgkDdiEndExclusiveAccess	Disabled	No GPU-P exclusive-access surface is advertised.
+DxgkDdiQueryDiagnosticTypesSupport	Pending	KMD ETW/diagnostics lane. Display brief section 6 item 11: if CollectDiagnosticInfo proves unreachable without this slot, it must be implemented and the evidence recorded.
+DxgkDdiControlDiagnosticReporting	Pending	KMD ETW/diagnostics lane. Sibling of QueryDiagnosticTypesSupport; classified explicitly per display brief section 6 item 11.
+DxgkDdiResumeHwEngine	Disabled	HWS-only engine resume; the hardware-scheduling family is unreachable.
+DxgkDdiSignalMonitoredFence	Disabled	HWQueue-scoped monitored-fence signalling; HWS/HWQueue is not advertised, and native fences use the Core-0116 slots instead.
+DxgkDdiPresentToHwQueue	Disabled	Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable.
+DxgkDdiValidateSubmitCommand	Disabled	Not advertised; SubmitCommand validates its own packet inline.
+DxgkDdiSetTargetAdjustedColorimetry2	Disabled	No per-target colorimetry adjustment hardware; only SDR RGB is advertised.
+DxgkDdiSetTrackedWorkloadPowerLevel	Disabled	No tracked workloads are advertised.
+DxgkDdiSaveMemoryForHotUpdate	Disabled	Driver hot-update is not supported by this package.
+DxgkDdiRestoreMemoryForHotUpdate	Disabled	Driver hot-update is not supported by this package.
+DxgkDdiCollectDiagnosticInfo	Pending	KMD ETW/diagnostics lane (section 17.6:4483); C42 requires the WDDM 2.7+ black-screen diagnostic type.
+Reserved3	Disabled	Reserved by the WDK; must stay NULL.
+DxgkDdiControlInterrupt3	Disabled	The driver services exactly one interrupt class (CRTC_VSYNC) and registers ControlInterrupt; revisions 2 and 3 only add classes it never raises.
+DxgkDdiSetFlipQueueLogBuffer	Disabled	Section 17.6:4497 forbids the hardware-flip-queue flags; no HW flip queue is advertised.
+DxgkDdiUpdateFlipQueueLog	Disabled	Section 17.6:4497 forbids the hardware-flip-queue flags; no HW flip queue is advertised.
+DxgkDdiCancelQueuedFlips	Disabled	Section 17.6:4497 forbids the hardware-flip-queue flags; no HW flip queue is advertised.
+DxgkDdiSetInterruptTargetPresentId	Disabled	Requires the HW flip queue / target PresentId interrupt, neither of which is advertised.
+DxgkDdiSetAllocationBackingStore	Disabled	DXGK_FEATURE_SHARE_BACKING_STORE_WITH_KMD is not enabled (section 9 rejects it as a Venus transport).
+DxgkDdiCreateCpuEvent	Disabled	DXGK_FEATURE_KMD_SIGNAL_CPU_EVENT is not enabled.
+DxgkDdiDestroyCpuEvent	Disabled	DXGK_FEATURE_KMD_SIGNAL_CPU_EVENT is not enabled.
+DxgkDdiCancelFlips	Disabled	No HW flip queue is advertised, so there is no queued flip to cancel.
+DxgkDdiCreateNativeFence	Implemented	Core-0116 native fence create (section 12.1); returns the driver global handle and validated HNF1 PDD.
+DxgkDdiDestroyNativeFence	Implemented	Native fence destroy after the final global reference.
+DxgkDdiUpdateMonitoredValues	Implemented	OS-driven monitored-value publication into the OS-owned storage.
+DxgkDdiUpdateCurrentValuesFromCpu	Implemented	OS-driven CPU-side current-value publication.
+DxgkDdiCreateDoorbell	Disabled	DXGK_FEATURE_USER_MODE_SUBMISSION is not enabled; there is no doorbell surface.
+DxgkDdiConnectDoorbell	Disabled	DXGK_FEATURE_USER_MODE_SUBMISSION is not enabled; there is no doorbell surface.
+DxgkDdiDisconnectDoorbell	Disabled	DXGK_FEATURE_USER_MODE_SUBMISSION is not enabled; there is no doorbell surface.
+DxgkDdiDestroyDoorbell	Disabled	DXGK_FEATURE_USER_MODE_SUBMISSION is not enabled; there is no doorbell surface.
+DxgkDdiNotifyWorkSubmission	Disabled	DXGK_FEATURE_USER_MODE_SUBMISSION is not enabled; there is no doorbell surface.
+Reserved4	Disabled	Reserved by the WDK; must stay NULL.
+DxgkDdiCreateMemoryBasis	Disabled	DXGKQAITYPE_DIRTYBITTRACKINGCAPS is reported all-zero; the memory-basis/dirty-tracking family is unreachable.
+DxgkDdiDestroyMemoryBasis	Disabled	DXGKQAITYPE_DIRTYBITTRACKINGCAPS is reported all-zero; the memory-basis/dirty-tracking family is unreachable.
+DxgkDdiStartDirtyTracking	Disabled	DXGKQAITYPE_DIRTYBITTRACKINGCAPS is reported all-zero; the dirty-tracking family is unreachable.
+DxgkDdiStopDirtyTracking	Disabled	DXGKQAITYPE_DIRTYBITTRACKINGCAPS is reported all-zero; the dirty-tracking family is unreachable.
+DxgkDdiQueryDirtyBitData	Disabled	DXGKQAITYPE_DIRTYBITTRACKINGCAPS is reported all-zero; the dirty-tracking family is unreachable.
+DxgkDdiPrepareLiveMigration	Disabled	No GPU-P live migration is advertised.
+DxgkDdiSaveImmutableMigrationData	Disabled	No GPU-P live migration is advertised.
+DxgkDdiSaveMutableMigrationData	Disabled	No GPU-P live migration is advertised.
+DxgkDdiEndLiveMigration	Disabled	No GPU-P live migration is advertised.
+DxgkDdiRestoreImmutableMigrationData	Disabled	No GPU-P live migration is advertised.
+DxgkDdiRestoreMutableMigrationData	Disabled	No GPU-P live migration is advertised.
+DxgkDdiWriteVirtualizedInterrupt	Disabled	No GPU partitioning (GPU-P/SR-IOV) surface is advertised.
+DxgkDdiSetVirtualGpuResources2	Disabled	No GPU partitioning (GPU-P/SR-IOV) surface is advertised.
+DxgkDdiSetVirtualFunctionPauseState	Disabled	No GPU partitioning (GPU-P/SR-IOV) surface is advertised.
+DxgkDdiOpenNativeFence	Implemented	Cross-process open; returns the driver local handle and validated HNF1 PDD.
+DxgkDdiCloseNativeFence	Implemented	Per-process local close.
+DxgkDdiSetNativeFenceLogBuffer	Disabled	Native-fence log buffers are HWQueue-scoped (DXGKARG_SETNATIVEFENCELOGBUFFER::hHwQueue) and DXGK_VIDSCHCAPS::OptimizedNativeFenceSignaledInterrupt=0, so dxgkrnl rescans waiters instead of reading a log.
+DxgkDdiUpdateNativeFenceLogs	Disabled	Native-fence log buffers are HWQueue-scoped and OptimizedNativeFenceSignaledInterrupt=0; see SetNativeFenceLogBuffer.
+DxgkDdiCollectDbgInfo2	Pending	KMD ETW/diagnostics lane (section 17.6:4483).
+DxgkDdiNotifyContextPriorityChange	Disabled	Context priority-change notification is not requested by this driver.
+DxgkDdiResetDisplayEngine	Disabled	There is no guest-side display engine to reset; scanout is a host SET_SCANOUT_BLOB. Display lane to revisit if the cold-DWM admission gate demands it.

@@ -5594,3 +5594,751 @@ mod present_stream_boundary_tests {
         assert!(slot_handle(GENERATION_MAX, MAX_STREAMS - 1) < (1 << 31));
     }
 }
+
+/// Core-0116 native-fence object lifecycle, and the HNF1 private-driver-data
+/// record it travels with.
+///
+/// Normative: `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` section 12.1 (lines
+/// 3130-3195, the `HeliosNativeFencePddV1` byte table and the
+/// create/open/wait/signal/CPU/close/multi-adapter sequence), section 10.2's
+/// admission table (lines 990-1004), and section 17.6:4328-4333 ("Driver
+/// global/local handles reference bounded native-fence objects directly; there
+/// is no hash table, scan, name, or process-global discovery registry").
+///
+/// # Why the rules live here and not in `kmd_render`
+///
+/// `kmd_render` is a `panic = "abort"` `no_std` cdylib and cannot run a test, so
+/// a `#[cfg(test)]` there is assurance that is not real (CLAUDE.md). Everything
+/// in this module is a function of its arguments: the DDI bodies in
+/// `kmd_render/src/ddi/native_fence.rs` do the pointer work and call in here for
+/// every decision that has a right and a wrong answer.
+///
+/// # Bounded, with no discovery structure
+///
+/// Section 10.1 invariant 10 forbids any adapter- or process-global resource or
+/// synchronization *discovery* structure. So this model has no table: identity
+/// is the OS-delivered `hGlobalNativeFence` / `hLocalNativeFence`, which the KMD
+/// sets to the object's own address. What is bounded is the *population*
+/// ([`admit_create`] / [`admit_open`]) and the *validity* of each object, which
+/// is a single adapter-wide epoch ([`epoch_is_current`]) rather than an
+/// enumeration — reset invalidates every object with one store and no scan.
+pub mod native_fence_lifecycle {
+    /// HNF1 magic at offset 0 — `0x31464e48`, i.e. the bytes `H N F 1`
+    /// little-endian (section 12.1 line 3138).
+    pub const HNF1_MAGIC: u32 = 0x3146_4e48;
+    /// HNF1 ABI version at offset 4 (section 12.1 line 3139).
+    pub const HNF1_ABI_VERSION: u16 = 1;
+    /// HNF1 structure size at offset 6, and the whole record's length. Equal to
+    /// the WDK's `D3DDDI_NATIVE_FENCE_PDD_SIZE`; `kmd_render` asserts that
+    /// equality against the generated bindings.
+    pub const HNF1_SIZE: usize = 64;
+
+    /// Byte offsets of the section-12.1 table. Named so the parser and the
+    /// encoder cannot drift from each other.
+    pub const OFF_MAGIC: usize = 0;
+    /// Offset of the 2-byte ABI version.
+    pub const OFF_ABI_VERSION: usize = 4;
+    /// Offset of the 2-byte structure size.
+    pub const OFF_STRUCT_SIZE: usize = 6;
+    /// Offset of the 8-byte atomic package generation.
+    pub const OFF_PACKAGE_GENERATION: usize = 8;
+    /// Offset of the 8-byte KMD-assigned object generation.
+    pub const OFF_OBJECT_GENERATION: usize = 16;
+    /// Offset of the 4-byte `D3DDDI_NATIVEFENCE_TYPE`.
+    pub const OFF_NATIVE_TYPE: usize = 24;
+    /// Offset of the 4-byte flag word.
+    pub const OFF_FLAGS: usize = 28;
+    /// Offset of the 8-byte creating adapter LUID.
+    pub const OFF_ADAPTER_LUID: usize = 32;
+    /// Offset of the 24 reserved bytes, which must be zero.
+    pub const OFF_RESERVED: usize = 40;
+    /// Length of the reserved tail.
+    pub const RESERVED_LEN: usize = 24;
+
+    /// HNF1 flags bit 0 — the object is shareable (section 12.1 line 3144).
+    pub const HNF1_FLAG_SHARED: u32 = 1 << 0;
+    /// Every other flag bit, including cross-adapter, is zero in this
+    /// generation (section 12.1 line 3144, section 12.1 item 7).
+    pub const HNF1_FLAGS_RESERVED_MASK: u32 = !HNF1_FLAG_SHARED;
+
+    /// `D3DDDI_NATIVEFENCE_TYPE_DEFAULT`.
+    pub const NATIVE_FENCE_TYPE_DEFAULT: u32 = 0;
+    /// `D3DDDI_NATIVEFENCE_TYPE_INTRA_GPU`.
+    pub const NATIVE_FENCE_TYPE_INTRA_GPU: u32 = 1;
+
+    /// Live global (created) native-fence objects admitted per adapter.
+    ///
+    /// "Bounded" is a requirement, not a tuning parameter (section 17.6:4331).
+    /// Each object is one small non-paged allocation; 4096 is far above any
+    /// observed D3D12 fence population and still a hard ceiling that turns a
+    /// runaway creator into a counted refusal instead of pool exhaustion.
+    pub const MAX_LIVE_GLOBAL: u32 = 4096;
+    /// Live local (opened) native-fence objects admitted per adapter. A shared
+    /// fence may be opened once per process/device, so the local ceiling is
+    /// deliberately larger than the global one.
+    pub const MAX_LIVE_LOCAL: u32 = 16384;
+
+    /// Why a PDD was refused. Every variant is a distinct counted refusal in
+    /// `kmd_render`; none of them is ever silently repaired.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum PddReject {
+        /// Offset 0 is not [`HNF1_MAGIC`].
+        Magic,
+        /// Offset 4 is not [`HNF1_ABI_VERSION`]. There is no version fallback
+        /// (section 3: "no version or feature fallback").
+        AbiVersion,
+        /// Offset 6 is not [`HNF1_SIZE`].
+        StructSize,
+        /// Offset 8 is not this package's generation.
+        PackageGeneration,
+        /// Offset 16 was nonzero on the way in. The object generation is
+        /// KMD-assigned; a caller-supplied value is a forged identity attempt.
+        ObjectGenerationNotZero,
+        /// Offset 24 is not a documented `D3DDDI_NATIVEFENCE_TYPE`.
+        NativeType,
+        /// Offset 24 disagrees with the type the OS passed in the DDI argument.
+        NativeTypeMismatch,
+        /// Offset 28 has a bit set outside [`HNF1_FLAG_SHARED`].
+        Flags,
+        /// Offset 32 is neither zero nor the exact creating adapter LUID.
+        AdapterLuid,
+        /// The 24 reserved bytes at offset 40 are not all zero.
+        Reserved,
+    }
+
+    /// The parsed HNF1 payload. Pointer-free by construction — the record
+    /// carries no pointer, NT handle, PID, GPUVA, host token, or allocation ID
+    /// (section 12.1 line 3152).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Hnf1 {
+        /// Offset 8.
+        pub package_generation: u64,
+        /// Offset 16.
+        pub object_generation: u64,
+        /// Offset 24.
+        pub native_type: u32,
+        /// Offset 28.
+        pub flags: u32,
+        /// Offset 32.
+        pub adapter_luid: i64,
+    }
+
+    fn rd_u16(b: &[u8; HNF1_SIZE], off: usize) -> u16 {
+        u16::from_le_bytes([b[off], b[off + 1]])
+    }
+
+    fn rd_u32(b: &[u8; HNF1_SIZE], off: usize) -> u32 {
+        u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
+    }
+
+    fn rd_u64(b: &[u8; HNF1_SIZE], off: usize) -> u64 {
+        let mut v = [0u8; 8];
+        let mut i = 0;
+        while i < 8 {
+            v[i] = b[off + i];
+            i += 1;
+        }
+        u64::from_le_bytes(v)
+    }
+
+    /// Decode the record without judging it. Used by both validators and by the
+    /// diagnostics path; every caller that acts on the contents goes through
+    /// [`validate_create`] or [`validate_open`] first.
+    pub fn parse(bytes: &[u8; HNF1_SIZE]) -> Hnf1 {
+        Hnf1 {
+            package_generation: rd_u64(bytes, OFF_PACKAGE_GENERATION),
+            object_generation: rd_u64(bytes, OFF_OBJECT_GENERATION),
+            native_type: rd_u32(bytes, OFF_NATIVE_TYPE),
+            flags: rd_u32(bytes, OFF_FLAGS),
+            adapter_luid: rd_u64(bytes, OFF_ADAPTER_LUID) as i64,
+        }
+    }
+
+    /// The header checks both create and open share: magic, ABI version,
+    /// structure size, package generation, a zero object generation, a flag
+    /// word with no undefined bit, and a zero reserved tail.
+    fn validate_header(
+        bytes: &[u8; HNF1_SIZE],
+        package_generation: u64,
+    ) -> Result<Hnf1, PddReject> {
+        if rd_u32(bytes, OFF_MAGIC) != HNF1_MAGIC {
+            return Err(PddReject::Magic);
+        }
+        if rd_u16(bytes, OFF_ABI_VERSION) != HNF1_ABI_VERSION {
+            return Err(PddReject::AbiVersion);
+        }
+        if rd_u16(bytes, OFF_STRUCT_SIZE) as usize != HNF1_SIZE {
+            return Err(PddReject::StructSize);
+        }
+        let parsed = parse(bytes);
+        if parsed.package_generation != package_generation {
+            return Err(PddReject::PackageGeneration);
+        }
+        if parsed.object_generation != 0 {
+            return Err(PddReject::ObjectGenerationNotZero);
+        }
+        if parsed.flags & HNF1_FLAGS_RESERVED_MASK != 0 {
+            return Err(PddReject::Flags);
+        }
+        let mut i = 0;
+        while i < RESERVED_LEN {
+            if bytes[OFF_RESERVED + i] != 0 {
+                return Err(PddReject::Reserved);
+            }
+            i += 1;
+        }
+        Ok(parsed)
+    }
+
+    /// Validate a `DxgkDdiCreateNativeFence` PDD.
+    ///
+    /// `ddi_native_type` is `DXGKARG_CREATENATIVEFENCE::Type`, which the record
+    /// must agree with — the OS's type and the UMD's claim about it are two
+    /// separate inputs, and a disagreement is a refusal rather than a silent
+    /// preference for one of them.
+    ///
+    /// `adapter_luid` is the exact creating adapter's LUID. Section 12.1 line
+    /// 3145 makes the KMD the writer of that field, so a caller may leave it
+    /// zero; any *other* value is a claim about a different adapter and is
+    /// refused (`AdapterLuid`). See this module's tests.
+    pub fn validate_create(
+        bytes: &[u8; HNF1_SIZE],
+        package_generation: u64,
+        adapter_luid: i64,
+        ddi_native_type: u32,
+    ) -> Result<Hnf1, PddReject> {
+        let parsed = validate_header(bytes, package_generation)?;
+        if !native_type_is_documented(parsed.native_type) {
+            return Err(PddReject::NativeType);
+        }
+        if parsed.native_type != ddi_native_type {
+            return Err(PddReject::NativeTypeMismatch);
+        }
+        if parsed.adapter_luid != 0 && parsed.adapter_luid != adapter_luid {
+            return Err(PddReject::AdapterLuid);
+        }
+        Ok(parsed)
+    }
+
+    /// Validate a `DxgkDdiOpenNativeFence` PDD.
+    ///
+    /// Deliberately weaker than [`validate_create`] on type and LUID: section
+    /// 12.1 item 2 puts that comparison on the *opening UMD* ("UMD validates
+    /// HNF1/package/LUID/type and stores only the returned local state"), and
+    /// the KMD overwrites both fields from the global object before returning.
+    /// Requiring the opener to pre-state them would invent a contract the
+    /// reference does not have.
+    pub fn validate_open(
+        bytes: &[u8; HNF1_SIZE],
+        package_generation: u64,
+    ) -> Result<Hnf1, PddReject> {
+        validate_header(bytes, package_generation)
+    }
+
+    /// Whether `native_type` is one of the documented `D3DDDI_NATIVEFENCE_TYPE`
+    /// values (section 12.1 line 3143).
+    pub fn native_type_is_documented(native_type: u32) -> bool {
+        native_type == NATIVE_FENCE_TYPE_DEFAULT || native_type == NATIVE_FENCE_TYPE_INTRA_GPU
+    }
+
+    /// Render the KMD's answer: the same header, the assigned nonzero object
+    /// generation, the exact creating adapter LUID, and a zero reserved tail.
+    ///
+    /// Always builds the full record from scratch rather than editing the
+    /// caller's bytes in place, so no unvalidated input byte can survive into
+    /// the reply.
+    pub fn encode(
+        package_generation: u64,
+        object_generation: u64,
+        native_type: u32,
+        flags: u32,
+        adapter_luid: i64,
+    ) -> [u8; HNF1_SIZE] {
+        let mut out = [0u8; HNF1_SIZE];
+        out[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&HNF1_MAGIC.to_le_bytes());
+        out[OFF_ABI_VERSION..OFF_ABI_VERSION + 2].copy_from_slice(&HNF1_ABI_VERSION.to_le_bytes());
+        out[OFF_STRUCT_SIZE..OFF_STRUCT_SIZE + 2]
+            .copy_from_slice(&(HNF1_SIZE as u16).to_le_bytes());
+        out[OFF_PACKAGE_GENERATION..OFF_PACKAGE_GENERATION + 8]
+            .copy_from_slice(&package_generation.to_le_bytes());
+        out[OFF_OBJECT_GENERATION..OFF_OBJECT_GENERATION + 8]
+            .copy_from_slice(&object_generation.to_le_bytes());
+        out[OFF_NATIVE_TYPE..OFF_NATIVE_TYPE + 4].copy_from_slice(&native_type.to_le_bytes());
+        out[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+        out[OFF_ADAPTER_LUID..OFF_ADAPTER_LUID + 8]
+            .copy_from_slice(&(adapter_luid as u64).to_le_bytes());
+        out
+    }
+
+    /// Why a native-fence lifecycle operation was refused.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum Refusal {
+        /// The bounded object population is full ([`MAX_LIVE_GLOBAL`] /
+        /// [`MAX_LIVE_LOCAL`]).
+        PoolExhausted,
+        /// The object was minted before the current adapter epoch. Reset and
+        /// removal invalidate every object with one epoch bump (section 12.1
+        /// item 6: "Reset/removal invalidates every local mapping and
+        /// generation").
+        StaleEpoch,
+        /// The native-fence surface is not admitted: either the OS declined
+        /// `DXGK_FEATURE_NATIVE_FENCE`, or the adapter LUID is not known yet,
+        /// or the reported WDDM surface is below 3.2.
+        NotAdmitted,
+        /// A global object still has opened local objects referencing it, so
+        /// freeing it now would dangle them.
+        LocalReferencesOutstanding,
+        /// A close was issued against a global object with no outstanding local
+        /// reference — an OS ordering violation, or our own accounting bug.
+        NoLocalReference,
+        /// The object is already draining or dead.
+        NotLive,
+    }
+
+    /// The observable state of one global native-fence object.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum FenceState {
+        /// Created and usable.
+        Live,
+        /// Destroy has been requested but local references remain.
+        Draining,
+        /// Freed. No further operation is legal.
+        Dead,
+    }
+
+    /// The bounded population accounting for one adapter. Two counters and one
+    /// epoch; deliberately not a table (section 10.1 invariant 10).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+    pub struct Population {
+        /// Live global (created) objects.
+        pub live_global: u32,
+        /// Live local (opened) objects.
+        pub live_local: u32,
+    }
+
+    /// Admit one `DxgkDdiCreateNativeFence`.
+    pub fn admit_create(pop: Population) -> Result<Population, Refusal> {
+        if pop.live_global >= MAX_LIVE_GLOBAL {
+            return Err(Refusal::PoolExhausted);
+        }
+        Ok(Population {
+            live_global: pop.live_global + 1,
+            ..pop
+        })
+    }
+
+    /// Admit one `DxgkDdiOpenNativeFence`.
+    pub fn admit_open(pop: Population) -> Result<Population, Refusal> {
+        if pop.live_local >= MAX_LIVE_LOCAL {
+            return Err(Refusal::PoolExhausted);
+        }
+        Ok(Population {
+            live_local: pop.live_local + 1,
+            ..pop
+        })
+    }
+
+    /// Retire one local object. Underflow is a refusal, never a wrap.
+    pub fn retire_local(pop: Population) -> Result<Population, Refusal> {
+        if pop.live_local == 0 {
+            return Err(Refusal::NoLocalReference);
+        }
+        Ok(Population {
+            live_local: pop.live_local - 1,
+            ..pop
+        })
+    }
+
+    /// Retire one global object. Underflow is a refusal, never a wrap.
+    pub fn retire_global(pop: Population) -> Result<Population, Refusal> {
+        if pop.live_global == 0 {
+            return Err(Refusal::NotLive);
+        }
+        Ok(Population {
+            live_global: pop.live_global - 1,
+            ..pop
+        })
+    }
+
+    /// One global object's reference state.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct GlobalFence {
+        /// Lifecycle state.
+        pub state: FenceState,
+        /// Opened local objects that still point at this global object.
+        pub local_refs: u32,
+        /// The adapter epoch this object was minted under.
+        pub epoch: u32,
+        /// The KMD-assigned nonzero diagnostic/stale-validation generation.
+        pub object_generation: u64,
+    }
+
+    impl GlobalFence {
+        /// A freshly created object.
+        pub fn new(epoch: u32, object_generation: u64) -> Self {
+            Self {
+                state: FenceState::Live,
+                local_refs: 0,
+                epoch,
+                object_generation,
+            }
+        }
+    }
+
+    /// Whether an object minted under `object_epoch` is still valid.
+    ///
+    /// A single adapter-wide epoch is what lets reset invalidate every object
+    /// at once with no enumeration and no discovery table.
+    pub fn epoch_is_current(object_epoch: u32, adapter_epoch: u32) -> bool {
+        object_epoch == adapter_epoch
+    }
+
+    /// Take a local reference on a global object (`DxgkDdiOpenNativeFence`).
+    pub fn open_local(fence: GlobalFence, adapter_epoch: u32) -> Result<GlobalFence, Refusal> {
+        if fence.state != FenceState::Live {
+            return Err(Refusal::NotLive);
+        }
+        if !epoch_is_current(fence.epoch, adapter_epoch) {
+            return Err(Refusal::StaleEpoch);
+        }
+        if fence.local_refs == u32::MAX {
+            return Err(Refusal::PoolExhausted);
+        }
+        Ok(GlobalFence {
+            local_refs: fence.local_refs + 1,
+            ..fence
+        })
+    }
+
+    /// Drop a local reference (`DxgkDdiCloseNativeFence`).
+    ///
+    /// Close must succeed across a reset — the OS is tearing state down and a
+    /// refusal would leak — so a stale epoch is *not* an error here. It is an
+    /// error to close a reference that was never taken.
+    pub fn close_local(fence: GlobalFence) -> Result<GlobalFence, Refusal> {
+        if fence.state == FenceState::Dead {
+            return Err(Refusal::NotLive);
+        }
+        if fence.local_refs == 0 {
+            return Err(Refusal::NoLocalReference);
+        }
+        let local_refs = fence.local_refs - 1;
+        let state = if fence.state == FenceState::Draining && local_refs == 0 {
+            FenceState::Dead
+        } else {
+            fence.state
+        };
+        Ok(GlobalFence {
+            local_refs,
+            state,
+            ..fence
+        })
+    }
+
+    /// Destroy the global object (`DxgkDdiDestroyNativeFence`).
+    ///
+    /// Freeing while a local object still points here would dangle it, so an
+    /// early destroy moves to [`FenceState::Draining`] and is refused with
+    /// [`Refusal::LocalReferencesOutstanding`]. Leaking a bounded object is the
+    /// fail-closed choice against a use-after-free in a DDI.
+    pub fn destroy_global(fence: GlobalFence) -> Result<GlobalFence, Refusal> {
+        match fence.state {
+            FenceState::Dead => Err(Refusal::NotLive),
+            _ if fence.local_refs != 0 => Err(Refusal::LocalReferencesOutstanding),
+            _ => Ok(GlobalFence {
+                state: FenceState::Dead,
+                ..fence
+            }),
+        }
+    }
+
+    /// The next KMD-assigned object generation.
+    ///
+    /// Section 12.1 line 3142 requires it nonzero on return, and line 3148
+    /// forbids treating it as an object key — it exists for stale-validation and
+    /// diagnostics. Saturating rather than wrapping: reaching `u64::MAX` would
+    /// otherwise wrap to 0, which is the "UMD supplied it" sentinel.
+    pub fn next_object_generation(previous: u64) -> u64 {
+        previous.saturating_add(1).max(1)
+    }
+
+    /// Whether a monitored/current value update moves forward.
+    ///
+    /// Recorded, never enforced: the OS owns these values, and `UINT64_MAX` is
+    /// a legal always-signaled terminal. A driver that *refused* a backwards
+    /// update would deadlock the runtime's fence, so `kmd_render` counts a
+    /// `false` here instead of failing the DDI.
+    pub fn value_update_is_forward(previous: u64, next: u64) -> bool {
+        next >= previous
+    }
+
+    /// Whether every native-fence admission gate in section 10.2's table is
+    /// satisfied. All four are conjunctive; a single false makes the whole
+    /// surface refuse rather than partially advertise.
+    pub fn surface_is_admitted(
+        wddm_3_2_reported: bool,
+        os_enabled_feature: bool,
+        adapter_luid_known: bool,
+        native_gpu_fence_cap: bool,
+    ) -> bool {
+        wddm_3_2_reported && os_enabled_feature && adapter_luid_known && native_gpu_fence_cap
+    }
+}
+
+#[cfg(test)]
+mod native_fence_lifecycle_tests {
+    use super::native_fence_lifecycle::*;
+
+    const PKG: u64 = 0x0102_0304_0506_0708;
+    const LUID: i64 = 0x0000_1234_5678_9abc_u64 as i64;
+
+    fn good_pdd() -> [u8; HNF1_SIZE] {
+        encode(PKG, 0, NATIVE_FENCE_TYPE_DEFAULT, HNF1_FLAG_SHARED, 0)
+    }
+
+    #[test]
+    fn magic_is_the_ascii_tag_hnf1_little_endian() {
+        assert_eq!(HNF1_MAGIC.to_le_bytes(), *b"HNF1");
+    }
+
+    #[test]
+    fn the_byte_table_fields_tile_the_record_exactly() {
+        // Section 12.1 lines 3136-3146: 4 + 2 + 2 + 8 + 8 + 4 + 4 + 8 + 24 = 64,
+        // with no gap and no overlap. Checked as a running cursor so a future
+        // offset edit cannot quietly open a hole.
+        let spans = [
+            (OFF_MAGIC, 4),
+            (OFF_ABI_VERSION, 2),
+            (OFF_STRUCT_SIZE, 2),
+            (OFF_PACKAGE_GENERATION, 8),
+            (OFF_OBJECT_GENERATION, 8),
+            (OFF_NATIVE_TYPE, 4),
+            (OFF_FLAGS, 4),
+            (OFF_ADAPTER_LUID, 8),
+            (OFF_RESERVED, RESERVED_LEN),
+        ];
+        let mut cursor = 0usize;
+        for (off, len) in spans {
+            assert_eq!(off, cursor, "field at {off} does not abut the previous one");
+            cursor += len;
+        }
+        assert_eq!(cursor, HNF1_SIZE);
+    }
+
+    #[test]
+    fn encode_round_trips_through_parse() {
+        let bytes = encode(PKG, 7, NATIVE_FENCE_TYPE_INTRA_GPU, HNF1_FLAG_SHARED, LUID);
+        let parsed = parse(&bytes);
+        assert_eq!(parsed.package_generation, PKG);
+        assert_eq!(parsed.object_generation, 7);
+        assert_eq!(parsed.native_type, NATIVE_FENCE_TYPE_INTRA_GPU);
+        assert_eq!(parsed.flags, HNF1_FLAG_SHARED);
+        assert_eq!(parsed.adapter_luid, LUID);
+        // The reserved tail is zero by construction, never copied from input.
+        assert!(bytes[OFF_RESERVED..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn a_well_formed_create_pdd_is_admitted() {
+        let ok = validate_create(&good_pdd(), PKG, LUID, NATIVE_FENCE_TYPE_DEFAULT);
+        assert_eq!(ok.map(|h| h.flags), Ok(HNF1_FLAG_SHARED));
+    }
+
+    #[test]
+    fn every_header_field_has_its_own_refusal() {
+        let mut b = good_pdd();
+        b[OFF_MAGIC] ^= 1;
+        assert_eq!(
+            validate_create(&b, PKG, LUID, NATIVE_FENCE_TYPE_DEFAULT),
+            Err(PddReject::Magic)
+        );
+
+        let mut b = good_pdd();
+        b[OFF_ABI_VERSION] = 2;
+        assert_eq!(
+            validate_create(&b, PKG, LUID, NATIVE_FENCE_TYPE_DEFAULT),
+            Err(PddReject::AbiVersion)
+        );
+
+        let mut b = good_pdd();
+        b[OFF_STRUCT_SIZE] = 63;
+        assert_eq!(
+            validate_create(&b, PKG, LUID, NATIVE_FENCE_TYPE_DEFAULT),
+            Err(PddReject::StructSize)
+        );
+
+        let b = good_pdd();
+        assert_eq!(
+            validate_create(&b, PKG ^ 1, LUID, NATIVE_FENCE_TYPE_DEFAULT),
+            Err(PddReject::PackageGeneration)
+        );
+
+        // A caller-supplied object generation is a forged identity attempt.
+        let b = encode(PKG, 1, NATIVE_FENCE_TYPE_DEFAULT, 0, 0);
+        assert_eq!(
+            validate_create(&b, PKG, LUID, NATIVE_FENCE_TYPE_DEFAULT),
+            Err(PddReject::ObjectGenerationNotZero)
+        );
+
+        // Cross-adapter and every other bit are zero in this generation.
+        let b = encode(PKG, 0, NATIVE_FENCE_TYPE_DEFAULT, HNF1_FLAG_SHARED | 2, 0);
+        assert_eq!(
+            validate_create(&b, PKG, LUID, NATIVE_FENCE_TYPE_DEFAULT),
+            Err(PddReject::Flags)
+        );
+
+        let mut b = good_pdd();
+        b[OFF_RESERVED + RESERVED_LEN - 1] = 1;
+        assert_eq!(
+            validate_create(&b, PKG, LUID, NATIVE_FENCE_TYPE_DEFAULT),
+            Err(PddReject::Reserved)
+        );
+    }
+
+    #[test]
+    fn an_undocumented_native_type_is_refused_before_the_ddi_comparison() {
+        let b = encode(PKG, 0, 2, 0, 0);
+        assert_eq!(
+            validate_create(&b, PKG, LUID, 2),
+            Err(PddReject::NativeType),
+            "an undocumented type must not be admitted just because the OS echoed it"
+        );
+    }
+
+    #[test]
+    fn the_pdd_type_must_agree_with_the_ddi_type() {
+        let b = encode(PKG, 0, NATIVE_FENCE_TYPE_DEFAULT, 0, 0);
+        assert_eq!(
+            validate_create(&b, PKG, LUID, NATIVE_FENCE_TYPE_INTRA_GPU),
+            Err(PddReject::NativeTypeMismatch)
+        );
+    }
+
+    #[test]
+    fn create_accepts_a_zero_or_exact_luid_and_nothing_else() {
+        // Section 12.1 line 3145 makes the KMD the writer, so zero is the
+        // ordinary input...
+        let zero = encode(PKG, 0, NATIVE_FENCE_TYPE_DEFAULT, 0, 0);
+        assert!(validate_create(&zero, PKG, LUID, NATIVE_FENCE_TYPE_DEFAULT).is_ok());
+        // ...and a UMD that already knows the adapter may restate it...
+        let exact = encode(PKG, 0, NATIVE_FENCE_TYPE_DEFAULT, 0, LUID);
+        assert!(validate_create(&exact, PKG, LUID, NATIVE_FENCE_TYPE_DEFAULT).is_ok());
+        // ...but a claim about a different adapter is refused, never rewritten.
+        let other = encode(PKG, 0, NATIVE_FENCE_TYPE_DEFAULT, 0, LUID ^ 1);
+        assert_eq!(
+            validate_create(&other, PKG, LUID, NATIVE_FENCE_TYPE_DEFAULT),
+            Err(PddReject::AdapterLuid)
+        );
+    }
+
+    #[test]
+    fn open_validates_the_header_but_not_type_or_luid() {
+        // Section 12.1 item 2 puts type/LUID validation on the opening UMD,
+        // after the KMD writes them back from the global object.
+        let b = encode(PKG, 0, 999, 0, LUID ^ 1);
+        assert!(validate_open(&b, PKG).is_ok());
+        assert_eq!(validate_open(&b, PKG ^ 1), Err(PddReject::PackageGeneration));
+    }
+
+    #[test]
+    fn the_population_is_bounded_in_both_directions() {
+        let full = Population {
+            live_global: MAX_LIVE_GLOBAL,
+            live_local: 0,
+        };
+        assert_eq!(admit_create(full), Err(Refusal::PoolExhausted));
+        let full_local = Population {
+            live_global: 0,
+            live_local: MAX_LIVE_LOCAL,
+        };
+        assert_eq!(admit_open(full_local), Err(Refusal::PoolExhausted));
+
+        let empty = Population::default();
+        assert_eq!(retire_local(empty), Err(Refusal::NoLocalReference));
+        assert_eq!(retire_global(empty), Err(Refusal::NotLive));
+
+        let one = admit_create(empty).unwrap();
+        assert_eq!(one.live_global, 1);
+        assert_eq!(retire_global(one).unwrap(), empty);
+    }
+
+    #[test]
+    fn a_stale_epoch_blocks_open_but_never_blocks_close() {
+        let f = GlobalFence::new(4, 1);
+        assert_eq!(open_local(f, 5), Err(Refusal::StaleEpoch));
+
+        // Take the reference before the reset, then close it after: teardown
+        // must still work or the object leaks.
+        let f = open_local(f, 4).unwrap();
+        assert_eq!(f.local_refs, 1);
+        let f = close_local(f).expect("close must survive a reset");
+        assert_eq!(f.local_refs, 0);
+    }
+
+    #[test]
+    fn destroy_with_live_locals_refuses_rather_than_dangling_them() {
+        let f = GlobalFence::new(0, 1);
+        let f = open_local(f, 0).unwrap();
+        assert_eq!(
+            destroy_global(f),
+            Err(Refusal::LocalReferencesOutstanding),
+            "freeing the global object here is a use-after-free in every local"
+        );
+        let f = close_local(f).unwrap();
+        let f = destroy_global(f).unwrap();
+        assert_eq!(f.state, FenceState::Dead);
+        assert_eq!(destroy_global(f), Err(Refusal::NotLive));
+        assert_eq!(close_local(f), Err(Refusal::NotLive));
+    }
+
+    #[test]
+    fn draining_becomes_dead_when_the_last_local_closes() {
+        let mut f = GlobalFence::new(0, 1);
+        f = open_local(f, 0).unwrap();
+        f = open_local(f, 0).unwrap();
+        f.state = FenceState::Draining;
+        f = close_local(f).unwrap();
+        assert_eq!(f.state, FenceState::Draining, "one reference still holds it");
+        f = close_local(f).unwrap();
+        assert_eq!(f.state, FenceState::Dead);
+    }
+
+    #[test]
+    fn a_dead_object_cannot_be_reopened() {
+        let f = GlobalFence {
+            state: FenceState::Dead,
+            ..GlobalFence::new(0, 1)
+        };
+        assert_eq!(open_local(f, 0), Err(Refusal::NotLive));
+    }
+
+    #[test]
+    fn the_object_generation_is_never_zero_and_never_wraps_to_zero() {
+        assert_eq!(next_object_generation(0), 1);
+        assert_eq!(next_object_generation(1), 2);
+        // Saturation, not wrap: 0 is the "supplied by the UMD" sentinel and must
+        // never be handed back as an assigned generation.
+        assert_eq!(next_object_generation(u64::MAX), u64::MAX);
+        assert_ne!(next_object_generation(u64::MAX), 0);
+    }
+
+    #[test]
+    fn value_updates_are_reported_not_enforced() {
+        assert!(value_update_is_forward(4, 4));
+        assert!(value_update_is_forward(4, 5));
+        assert!(value_update_is_forward(4, u64::MAX));
+        assert!(!value_update_is_forward(5, 4));
+    }
+
+    #[test]
+    fn admission_is_conjunctive() {
+        assert!(surface_is_admitted(true, true, true, true));
+        for i in 0..4 {
+            let g = |n: usize| n != i;
+            assert!(
+                !surface_is_admitted(g(0), g(1), g(2), g(3)),
+                "gate {i} alone must be able to refuse the whole surface"
+            );
+        }
+    }
+}
