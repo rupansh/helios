@@ -56,6 +56,46 @@
 //! adapter, and a registered-but-unreached slot is visible in the slot audit
 //! while an unregistered one would have to be rediscovered later.
 //!
+//! # ⛔ The one unclosed window — `NF-UAF-1`
+//!
+//! **`DxgkDdiOpenNativeFence` racing `DxgkDdiDestroyNativeFence` on the same
+//! global object is a use-after-free.** Found by the Phase-2 adversarial review
+//! (2026-08-10), not yet fixed, and unreachable today because
+//! [`NATIVE_FENCE_ADVERTISED`] is false — it becomes reachable at the single
+//! atomic activation switch, which is precisely when a kernel UAF is most
+//! expensive to discover by running.
+//!
+//! ```text
+//!   A: open    model_of()             reads state = LIVE, refs = 0  -> Ok
+//!   B: destroy model_of()             reads refs = 0                -> Ok
+//!   B: destroy CAS(LIVE -> DEAD)      succeeds
+//!   B: destroy free_global()          the object is FREED
+//!   A: open    local_refs.fetch_add() writes freed memory, and hands dxgkrnl a
+//!              LocalFenceObject whose `global` pointer dangles
+//! ```
+//!
+//! The cause is structural rather than local: every decision here is taken from
+//! a [`model_of`] snapshot and published by a *separate* atomic operation, so
+//! any rule that reads both `state` and `local_refs` has a window between
+//! deciding and acting. The sibling window on the teardown side — destroy
+//! parking the object in `DRAINING` just after the last close already gave up
+//! its own free attempt — was closed by [`finish_teardown_if_drained`], which
+//! works only because both parties converge *after* `DRAINING` is published.
+//! No such convergence point exists for open-versus-free.
+//!
+//! **The fix, which is deliberately not a re-read after the increment.** That
+//! would narrow the window without closing it, and a narrowed race in kernel
+//! code is a stopgap wearing a fix's clothes. `state` and `local_refs` must
+//! become one `AtomicU64` (state in the high half, reference count in the low
+//! half) so that deciding and transitioning are a single compare-exchange:
+//! decode the word, hand the model to the `kmd_logic` rule that owns the
+//! decision, then publish with a compare-exchange against the exact word the
+//! rule saw, retrying if it moved. That keeps `kmd_logic` authoritative — the
+//! rule is still the pure function — while removing the snapshot's TOCTOU.
+//! It also needs `nf::destroy_global` to express "refused, and park in
+//! `Draining`" as a transition rather than a bare `Err`, which is a signature
+//! change in `kmd_logic` and its tests.
+//!
 //! # What is deliberately NOT here
 //!
 //! `DxgkDdiSetNativeFenceLogBuffer` / `DxgkDdiUpdateNativeFenceLogs` are
@@ -725,6 +765,16 @@ pub unsafe extern "C" fn dxgkddi_open_native_fence(
         NF_OPEN_REJ.fetch_add(1, Ordering::Relaxed);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    // ⛔ KNOWN DEFECT — `NF-UAF-1`, open racing destroy. See the module header's
+    // "The one unclosed window" section. Do not read the increment below as
+    // safe: `nf::open_local` decided against the `model_of` snapshot taken
+    // above, and a concurrent `DxgkDdiDestroyNativeFence` that sampled
+    // `local_refs == 0` in its own snapshot frees this object between that
+    // decision and this line. Closing it needs `state` and `local_refs` packed
+    // into one atomic word so the rule and the transition are a single
+    // compare-exchange; a re-read after the increment only narrows the window
+    // and would be a stopgap. Unreachable today: `NATIVE_FENCE_ADVERTISED` is
+    // false, so dxgkrnl never calls this DDI.
     global.local_refs.fetch_add(1, Ordering::AcqRel);
 
     let local = Box::new(LocalFenceObject {
@@ -802,22 +852,8 @@ pub unsafe extern "C" fn dxgkddi_close_native_fence(
     let global_ptr = local.global;
     drop(local);
 
-    // The last close of an object whose destroy already ran owns the free. The
-    // compare-exchange is the exactly-once claim: only the thread that moves
-    // DRAINING -> DEAD calls `free_global`.
-    if global.local_refs.load(Ordering::Acquire) == 0
-        && global
-            .state
-            .compare_exchange(
-                STATE_DRAINING,
-                STATE_DEAD,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    {
-        free_global(global_ptr);
-    }
+    // The last close of an object whose destroy already ran owns the free.
+    finish_teardown_if_drained(global, global_ptr);
     NF_CLOSE_OK.fetch_add(1, Ordering::Relaxed);
     STATUS_SUCCESS
 }
@@ -858,6 +894,13 @@ pub unsafe extern "C" fn dxgkddi_destroy_native_fence(
                 .compare_exchange(STATE_LIVE, STATE_DEAD, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
+                // The rule said Ok, so references are drained — but the state
+                // was not LIVE, which means an earlier destroy already parked
+                // this object in DRAINING. Nobody else will come: the closes
+                // are done and this is the destroy. Reclaim it here rather
+                // than refusing and leaking the object plus its LIVE_GLOBAL
+                // slot.
+                finish_teardown_if_drained(global, handle as *mut GlobalFenceObject);
                 NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
                 return STATUS_INVALID_DEVICE_REQUEST;
             }
@@ -867,14 +910,20 @@ pub unsafe extern "C" fn dxgkddi_destroy_native_fence(
             STATUS_SUCCESS
         }
         Err(nf::Refusal::LocalReferencesOutstanding) => {
-            // Do NOT free: locals hold a raw pointer to this object. Hand the
-            // free to whichever close drops the last reference.
+            // Do NOT free here: locals hold a raw pointer to this object. Hand
+            // the free to whichever close drops the last reference.
             let _ = global.state.compare_exchange(
                 STATE_LIVE,
                 STATE_DRAINING,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             );
+            // ⚠ The last close may have landed between `model_of` above and the
+            // compare-exchange just now, in which case its own DRAINING -> DEAD
+            // attempt failed against a state that was still LIVE and nobody
+            // owns the free. Re-check now that DRAINING is published; see
+            // `finish_teardown_if_drained` for the full interleaving.
+            finish_teardown_if_drained(global, handle as *mut GlobalFenceObject);
             NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
             STATUS_INVALID_DEVICE_REQUEST
         }
@@ -882,6 +931,48 @@ pub unsafe extern "C" fn dxgkddi_destroy_native_fence(
             NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
             STATUS_INVALID_DEVICE_REQUEST
         }
+    }
+}
+
+/// The one place a `DRAINING` object is reclaimed, and the only exactly-once
+/// claim on that transition.
+///
+/// # Why this must be called from three places and not one
+///
+/// A destroy that finds local references outstanding parks the object in
+/// `DRAINING` and hands the free to "whichever close drops the last reference".
+/// That is correct only if every party that can *observe* the reference count
+/// reach zero also re-checks, because the count and the state are two separate
+/// atomics and the decision to park is taken from a snapshot of both.
+///
+/// Concretely, the interleaving this closes (`local_refs == 1`, destroy on
+/// thread A, the last close on thread B):
+///
+/// ```text
+///   A: model_of()          reads local_refs = 1  -> LocalReferencesOutstanding
+///   B: retire(local_refs)  1 -> 0
+///   B: CAS(DRAINING->DEAD) FAILS, state is still LIVE  -> B does not free
+///   A: CAS(LIVE->DRAINING) succeeds                    -> A does not free
+///   =>  state = DRAINING, local_refs = 0, and no further close will ever
+///       arrive, so the object and its LIVE_GLOBAL slot leak forever.
+/// ```
+///
+/// Re-checking here, *after* `DRAINING` is published, makes the two orderings
+/// converge: whichever party observes zero last performs the free, and the
+/// compare-exchange makes sure only one of them does.
+fn finish_teardown_if_drained(global: &GlobalFenceObject, p: *mut GlobalFenceObject) {
+    if global.local_refs.load(Ordering::Acquire) == 0
+        && global
+            .state
+            .compare_exchange(
+                STATE_DRAINING,
+                STATE_DEAD,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    {
+        free_global(p);
     }
 }
 
