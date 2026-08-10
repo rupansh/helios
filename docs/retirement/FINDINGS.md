@@ -574,3 +574,101 @@ failure in the informative Nt2 call was reported as the legacy call's
 `0xc000000d`. It now reports both. That is the third time in this session that
 a refusal naming nothing cost a round trip — the other two were the
 external-image query's `VkResult` and the required-device-proc check.
+
+---
+
+## F8 — An `ID3D12Fence` shared handle cannot be opened through the D3DKMT sync path *on any adapter*. The failure is not ours, and the sharing direction is backwards.
+
+`F7 addendum 3` left the Ready/Release fence import open with a hypothesis and
+an instruction to measure before touching either repository. Measured, on
+22.22.263.0, by `tools/d3d12_shared_fence_probe.cpp`, with three controls.
+
+### What was measured
+
+Per adapter: an `ID3D12Fence` created with `D3D12_FENCE_FLAG_SHARED`, its
+`CreateSharedHandle` NT handle put through the kernel's own object-type query
+and then through every D3DKMT open the ICD could plausibly use — against a
+device on the *same* adapter, against devices on *other* adapters, with
+`Flags=0` and with `NtSecuritySharing`, plus the legacy open, the native-fence
+open, and the resource-info query. Alongside it, three controls that decide
+what a failure means.
+
+```
+                                      Helios     MBRD       MBRD/WARP
+  NT object type of the handle        DxgkSharedSyncObject  (all three, granted 0x001F0003)
+  ID3D12Device::OpenSharedHandle      OK         OK         OK
+  D3DKMTOpenSyncObjectFromNtHandle2   0xC000000D 0xC000000D 0xC000000D   (both flag settings,
+                                                                          same + other adapters)
+  D3DKMTOpenSyncObjectFromNtHandle    0xC000000D 0xC000000D 0xC000000D
+  D3DKMTOpenNativeFenceFromNtHandle   0xC000000D 0xC000000D 0xC000000D
+  D3DKMTQueryResourceInfoFromNtHandle 0xC000000D 0xC000000D 0xC000000D
+
+  CONTROL our own monitored fence, D3DKMTShareObjects -> ...FromNtHandle2
+                                      SUCCESS    SUCCESS    SUCCESS      (same device, 2nd device,
+                                                                          both flag settings)
+  CONTROL ID3D12Device::OpenSharedHandle(our KMT fence) -> ID3D12Fence
+                                      OK         OK         OK
+```
+
+### What follows, and what does not
+
+**It is not a Helios defect.** The identical refusal appears on both Microsoft
+Basic Render Driver adapters, one of them WARP. Nothing in `icd/mesa`, the KMD
+or the layer caused it, and no change to any of them can fix it. ⇒ **Do not
+change either repository for this**, which was the instruction F7 addendum 3
+left.
+
+**The instrument is sound.** The control fence — created by
+`D3DKMTCreateSynchronizationObject2(MONITORED, Shared, NtSecuritySharing)` and
+shared by `D3DKMTShareObjects` — opens with `STATUS_SUCCESS` through the exact
+same call, in the same process, from two different devices, on all three
+adapters. So the refusal is a statement about the object, not about the call,
+the process, the device or the adapter.
+
+**The handle is valid.** `ID3D12Device::OpenSharedHandle` round-trips it back
+into an `ID3D12Fence` every time. A D3D12 fence handle is a real
+`DxgkSharedSyncObject` of the same NT type and granted access as ours — the
+type name is not the discriminator, which is why reading it was necessary
+before assuming a class difference.
+
+⇒ **`F7 addendum 3`'s hypothesis is confirmed in its consequence, not in its
+mechanism.** vkd3d's `d3d12_shared_fence` path (`libs/vkd3d/command.c:612-656`,
+`d3dkmt.c:55-78`) can only work where vkd3d itself created the fence — the
+app-local arm. Under the UMD arm the fence belongs to the D3D12 runtime and no
+user-mode component can open it through a public D3DKMT entry point. *Why*
+dxgkrnl refuses is still unmeasured and this finding does not claim it.
+
+### ⭐ The actionable half: the direction is backwards
+
+The last control is the one that changes the work. `ID3D12Device::OpenSharedHandle`
+**accepts a plain D3DKMT monitored fence** that we created and shared —
+returning a working `ID3D12Fence` — **and it does so on Helios.**
+
+So the two sides can share a fence; only one direction works:
+
+* D3D12 → Vulkan (import an `ID3D12Fence`): impossible, everywhere.
+* Vulkan/KMT → D3D12 (the ICD creates and exports, D3D12 opens): **works.**
+
+⇒ §10.3's Ready/Release fences must be **created by the ICD and opened by the
+D3D12 side**, not imported from `ID3D12Fence`. This costs no new ICD
+capability: `helios_wddm_sync_create` + `helios_wddm_sync_share_nt`
+(`vn_renderer_helios.c:~900-1075`) already build exactly the object the control
+arm used. It is a change to the *layer's* protocol, and it belongs to
+`lane-mesa`.
+
+### Two rows that measured nothing, recorded so nobody re-runs them
+
+* `D3DKMTOpenNativeFenceFromNtHandle` refuses the control fence too, and no
+  adapter on this box advertises native fences. The row therefore does **not**
+  show that the native-fence path is or is not the right one for an
+  `ID3D12Fence`; it shows only that it is unavailable today. Re-run it after
+  K7 + the `SURFACE` flip if the question still matters.
+* `D3DKMTShareObjects` with two sync objects in one NT handle is itself
+  refused (`0xC000000D`), so the "the runtime shared a composite handle"
+  explanation could not be tested this way. It is neither supported nor
+  eliminated.
+
+**Bound.** This says what cannot be opened and which direction can. It does not
+say the redirected design works: no fence has been signalled or waited across
+the boundary, no acquire, no present, no frame. `ID3D12Fence::CreateSharedHandle`
+itself succeeds — the D3D12 correctness fix recorded in F7 addendum 2 stands.
