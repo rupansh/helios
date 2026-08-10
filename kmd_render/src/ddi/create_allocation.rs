@@ -763,6 +763,12 @@ fn bump_with_code(counter: &AtomicU32, name: &[u8], code: u32) {
 /// in command allocation lists / CloseAllocation.
 const OPEN_ALLOCATION_CTX_MAGIC: u32 = 0x484F_504E; // "HOPN"
 
+/// `DXGK_OPENALLOCATIONFLAGS::Create` — "Indicates that this allocation is being
+/// created, if not set then allocation is being opened" (`d3dkmddi.h`). Read
+/// from the union's `Value` because the bitfield accessor's bindgen name is not
+/// stable across kits, and the bit position is.
+const DXGK_OPENALLOCATION_FLAG_CREATE: u32 = 0x0000_0001;
+
 struct OpenAllocationContext {
     magic: u32,
     /// Validated immutable view captured from open-time private data. Present
@@ -772,6 +778,16 @@ struct OpenAllocationContext {
     present: Option<PresentAllocInfo>,
     /// Trace-only companion; never read by a decision path.
     present_diag: Option<PresentAllocDiag>,
+    /// `(generation, kind)` exactly as PUBLISHED to the guest in this open's
+    /// private buffer, for K6's Render/Patch staleness check
+    /// ([`open_allocation_identity`]).
+    ///
+    /// ⛔ It lives here and not on [`AllocationContext`] because
+    /// `DXGK_ALLOCATIONLIST::hDeviceSpecificAllocation` — the handle Render and
+    /// Patch resolve — is THIS object, and the create-time handle never appears
+    /// in an allocation list at all. Storing what the guest was told, rather
+    /// than re-deriving it, is what makes the two sides unable to disagree.
+    identity: Option<(u64, u32)>,
 }
 
 /// Surface identity + geometry for a Present allocation-list entry, resolved from
@@ -1655,16 +1671,16 @@ pub(crate) unsafe fn allocation_resource_id(h: HANDLE) -> u32 {
 /// with, or [`ALLOC_KIND_HVM1`] / [`ALLOC_KIND_HOC1`]. `None` for a null or
 /// foreign handle.
 ///
-/// # ⚠ IMPLEMENTED BUT NEVER EXERCISED — there is no caller yet, and the reader
-/// is named
+/// # ⛔ NOT K6's READER — that is [`open_allocation_identity`]
 ///
-/// §15:3516-3520 puts "the expected live allocation generation" in HOB1, and
-/// §18.1:4723-4726 makes Render/Patch resolve a use record only through the
-/// exact patched WDDM capability against the live allocation. Both are **K6**
-/// (`ddi/native_render.rs`, which does not exist). The accessor is written here,
-/// with the field it reads, rather than left for K6 to bolt on, because
-/// `AllocationContext` is private to this file by design: a later unit must not
-/// reach into it, and the shape of what it may ask for is this unit's decision.
+/// This answers what the KERNEL OBJECT holds, keyed on the create-time
+/// `hAllocation`. Render and Patch never see that handle:
+/// `DXGK_ALLOCATIONLIST::hDeviceSpecificAllocation` is the OPEN handle
+/// (`d3dkmddi.h`), so a K6 check written against this accessor would compare the
+/// create-minted generation with the OPEN-minted one the guest actually holds
+/// and refuse every use record. The doc here used to name K6 as the reader; that
+/// was written before the create-time write was measured to go nowhere
+/// (`FINDINGS.md` F11), and it would have cost K6 a whole debugging round.
 ///
 /// ⛔ It answers "what generation does this object hold", NEVER "which object has
 /// this generation". §10.3:1049 forbids the second reading and nothing that
@@ -4623,8 +4639,26 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         // allocations in bulk once A3 lands, and offering those to the binder
         // would make `TsPoolRej` — a counter documented as an anomaly — climb on
         // the normal path. Every role is stamped; only role 1 is bound.
-        let hvm1 =
-            unsafe { stamp_open_hvm1(info.pPrivateDriverData, info.PrivateDriverDataSize) };
+        // ⛔ The STAMP happens only on a create-flagged open. §17.6:4384 —
+        // "`DxgkDdiOpenAllocation` only reads private data on an ORDINARY open" —
+        // so the write is licensed exactly here, and
+        // `DXGK_OPENALLOCATIONFLAGS::Create` ("if not set then allocation is
+        // being opened", `d3dkmddi.h`) is the bit that says which open this is.
+        // An ordinary open reads the record the creating open already published.
+        let open_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
+        let hvm1 = if open_flags & DXGK_OPENALLOCATION_FLAG_CREATE != 0 {
+            unsafe { stamp_open_hvm1(info.pPrivateDriverData, info.PrivateDriverDataSize) }
+        } else {
+            unsafe { read_open_hvm1(info.pPrivateDriverData, info.PrivateDriverDataSize) }
+        };
+        // What the guest was TOLD, for K6 to check its use records against.
+        // HWA2's generation comes from the descriptor for the same reason: it is
+        // the value the opener reads out of the identical bytes.
+        let open_identity = match (hvm1, desc) {
+            (Some((_, _, generation)), _) => Some((generation, ALLOC_KIND_HVM1)),
+            (None, Some(d)) => Some((d.allocation_generation, d.allocation_kind)),
+            (None, None) => None,
+        };
         if let Some((Hvm1Role::ReplyPool, byte_size, generation)) = hvm1 {
             if let Some(device) = unsafe { crate::device::DeviceHandleRef::from_raw(h_device) } {
                 crate::ddi::translation_session::bind_reply_pool(
@@ -4658,7 +4692,6 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         if desc.is_some() {
             OPEN_NO_RESOURCE_ID.fetch_add(1, Ordering::Relaxed);
         }
-        let open_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
         let present_diag = desc.map(|desc| PresentAllocDiag {
             runtime_allocation: info.hAllocation,
             // §10.3 offset 84 carries the exact OS enum when `STANDARD` is set
@@ -4680,6 +4713,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
             magic: OPEN_ALLOCATION_CTX_MAGIC,
             present: None,
             present_diag,
+            identity: open_identity,
         });
         record_alloc_event(
             0,
@@ -4763,6 +4797,55 @@ unsafe fn read_open_descriptor(
         return None;
     }
     Some(desc)
+}
+
+/// Read an already-published HVM1 create-output. The ORDINARY-open half of
+/// [`stamp_open_hvm1`]: same answer, no write.
+///
+/// `None` for anything that is not a complete HVM1 create-output — including a
+/// still-unstamped create-input, which on an ordinary open means the creating
+/// open never ran or never published, and is not something this DDI may repair.
+///
+/// # Safety
+/// `private` is dxgkrnl's per-allocation private buffer and `private_size` its
+/// authoritative length. NOTHING here writes through the pointer.
+unsafe fn read_open_hvm1(
+    private: *const c_void,
+    private_size: UINT,
+) -> Option<(Hvm1Role, u64, u64)> {
+    if private.is_null() || private_size as usize != HELIOS_HVM1_SIZE as usize {
+        return None;
+    }
+    // SAFETY: non-null and the length is exactly the record size, checked above.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(private as *const u8, HELIOS_HVM1_SIZE as usize) };
+    let record = HeliosVenusMemoryAllocationV1::from_private_data(bytes).ok()?;
+    if record.magic != HELIOS_HVM1_MAGIC {
+        return None;
+    }
+    let role = record
+        .validate(HELIOS_PACKAGE_GENERATION, Hvm1Stage::CreateOutput)
+        .ok()?;
+    Some((role, record.byte_size, record.object_generation))
+}
+
+/// The identity this open PUBLISHED, resolved from the device-specific handle
+/// dxgkrnl puts in `DXGK_ALLOCATIONLIST::hDeviceSpecificAllocation`.
+///
+/// ⛔ **This, not [`allocation_identity`], is K6's reader.** Render and Patch
+/// receive the open handle and never the create handle, and the value here is
+/// the one the guest was told — so a use record's
+/// `expected_allocation_generation` is compared against exactly the number its
+/// producer read back, with no second derivation that could disagree.
+///
+/// # Safety
+/// `h` is either null or an `hDeviceSpecificAllocation` this driver returned
+/// from `DxgkDdiOpenAllocation`, round-tripped unmodified.
+#[allow(dead_code)] // reader is K6 (`ddi/native_render.rs`).
+pub(crate) unsafe fn open_allocation_identity(h: HANDLE) -> Option<(u64, u32)> {
+    // SAFETY: validated by `open_allocation_context`, which checks the magic.
+    let open = unsafe { open_allocation_context(h)? };
+    open.identity
 }
 
 /// Complete an HVM1 record's create-output at OPEN and publish it through the
