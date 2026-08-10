@@ -852,6 +852,19 @@ run_gate "VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT agrees across the two repos" \
     python3 -c "$K4_RUST_MASK_PY
 $K4_VKD3D_FLAG_PY" "$REPO"
 
+# ── A2: the ICD's HNR2 encoder, run against protocol/'s validator.
+#
+# Every other gate here compares two texts. This one EXECUTES an ICD source file
+# — `vn_helios_native_kmt.c`'s encoder half, which is platform-independent for
+# exactly this reason — and feeds what it emits to `HeliosNativeRenderV2::validate`
+# and `validate_commit_tables`, the code the KMD will run. Eight deliberate
+# mutations (A1's old use-table offset, a zeroed allocation generation, ungrouped
+# patch runs, an unclamped fragment split, a command-buffer-relative payload
+# offset, a retained no-reply sentinel, a wrong CRC domain, one mistyped CRC
+# table entry) were each caught by it before it was checked in.
+run_gate "A2 HNR2 encoder validates against protocol (executed, not compared)" \
+    bash "$REPO/tools/hnr2-encoder-gate.sh"
+
 printf '\n'
 if [ ${#FAILED[@]} -eq 0 ]; then
     if [ ${#SKIPPED[@]} -eq 0 ]; then

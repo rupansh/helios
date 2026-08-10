@@ -379,7 +379,12 @@ typedef struct HeliosNativeRenderV2 {
                                            *     aligned range in one slot */
     uint64_t reply_capacity_bytes;        /* 80  zero without a reply; exactly
                                            *     HVR1 header + maxChunkBytes */
-    uint64_t fragment_crc64;              /* 88  corruption diagnostic ONLY */
+    uint64_t fragment_crc64;              /* 88  corruption diagnostic ONLY.
+                                           *     Domain fixed by this ABI (§10.7
+                                           *     states none): THIS FRAGMENT'S
+                                           *     payload slice -- so a
+                                           *     one-fragment batch has
+                                           *     fragment == full_payload. */
     uint64_t full_payload_crc64;          /* 96  zero before COMMIT; diagnostic */
     uint64_t reply_slot_generation;       /* 104 zero without a reply; the exact
                                            *     nonzero checked-out slot

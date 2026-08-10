@@ -632,6 +632,14 @@ pub struct HeliosNativeRenderV2 {
     pub reply_capacity_bytes: u64,
     /// CRC64-ECMA of this fragment. **Corruption diagnostic, never validation
     /// authority** — no validator here reads it.
+    ///
+    /// Domain, fixed by this ABI because section 10.7 does not state one and two
+    /// halves would otherwise pick differently: **this fragment's payload
+    /// slice**, exactly the bytes at [`Hnr2CommandLayout::payload_offset`] for
+    /// [`Hnr2CommandLayout::payload_bytes`]. Not the command buffer, not the
+    /// header. A one-fragment batch therefore has `fragment_crc64 ==
+    /// full_payload_crc64`. The C encoder states the same domain at its write
+    /// site and `tools/hnr2-encoder-gate.sh` checks it.
     pub fragment_crc64: u64,
     /// Zero before COMMIT; the exact reassembled-payload CRC64-ECMA on COMMIT.
     /// Diagnostic only, and legitimately zero-valued, so it is checked for
