@@ -256,7 +256,12 @@ main(int argc, char **argv)
    const char *inst_exts[] = {"VK_KHR_surface", "VK_KHR_win32_surface"};
    VkApplicationInfo app = {VK_STRUCTURE_TYPE_APPLICATION_INFO};
    app.pApplicationName = "vk_surface_recreate_probe";
-   app.apiVersion = VK_API_VERSION_1_1;
+   /* 1.3, not 1.1: the loader returns NULL from vkGetDeviceProcAddr for core
+    * functions above this version, so a 1.1 declaration hides vkQueueSubmit2
+    * and vkCmdPipelineBarrier2 on a 1.4 device — which is what
+    * VK_LAYER_HELIOS_present needs. The Helios ICD reports 1.4, so nothing
+    * this probe did at 1.1 becomes unavailable. */
+   app.apiVersion = VK_API_VERSION_1_3;
    VkInstanceCreateInfo ici = {VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
    ici.pApplicationInfo = &app;
    ici.enabledExtensionCount = 2;

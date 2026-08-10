@@ -459,3 +459,45 @@ through the Helios WDDM sync path. The work is `vn_physical_device.c`
 (advertise), `vn_queue.c` (stop stripping `D3D12_FENCE_BIT`, accept it in the
 named export/import arms), and it must be recorded that the two names denote
 one object *on this stack* — that is a property of Helios, not of Vulkan.
+
+### F7 addendum 2 — both §10.3 capability gates are closed; the layer creates a WSI device
+
+Implemented and measured on 22.22.263.0, in order, each gate closed by the
+refusal the previous one produced:
+
+| gate | closed by |
+|---|---|
+| `D3D12_RESOURCE_BIT` not supported | `33d3a10678b` — advertise + route into the existing C57 carrier |
+| `D3D12_FENCE_BIT` not IMPORTABLE | `becb64a8c70` — same, for the WDDM monitored fence |
+| the layer asked about a BINARY semaphore | `26f0930bd4f` — chain `VkSemaphoreTypeCreateInfo{TIMELINE}` |
+| `create_device_refused_missing_device_proc` (unnamed) | `26f0930bd4f` — pair each proc with its name |
+| `vkQueueSubmit2` NULL on a 1.4 device | the app declared apiVersion 1.1; the loader filters core functions above it |
+
+The layer now reports:
+
+```
+[helios-wsi] physical device ... admitted: canonical family 0, q=16
+[helios-wsi] device ... created (wsi=1 canonical=0 private=1)
+[helios-wsi] REFUSE swapchain_refused_tag_call_absent (-3):
+             vkSetHeliosPresentableImageHELIOS is not provided by the lower chain
+```
+
+**The next unit is named by the layer itself**: `vkSetHeliosPresentableImage-
+HELIOS`, the private device-scoped tag call of §10.7:2571-2578 (lane-mesa
+ambiguity A4) that records a `VkImage` as a swapchain slot's presentable image
+and thereby legalises `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` for it. The layer
+resolves it only through the captured next-layer `vkGetDeviceProcAddr` and
+refuses `vkCreateSwapchainKHR` outright when it is absent, which is what it is
+doing now.
+
+⚠ **`ID3D12Fence::CreateSharedHandle` was broken on Helios independently of any
+of this**, and nothing had noticed. vkd3d refuses to create a shared fence
+unless the driver reports `D3D12_FENCE_BIT` in
+`exportFromImportedHandleTypes`; it did not. That is a D3D12 correctness fix
+that happens to fall out of the WSI lane.
+
+**Bound.** Everything above `vkCreateSwapchainKHR` is still unexecuted: no
+image has been imported, no fence shared, no frame presented. The capability
+queries are answered and the device is built; the import chain itself has run
+zero times. `helios_paintcap` shows a fully composited live desktop after both
+ICD installs, so the DXVK/dwm path is undisturbed.
