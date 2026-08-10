@@ -29,6 +29,7 @@ pub(crate) mod scanout_trace;
 mod scheduler;
 pub(crate) mod segment_table;
 pub(crate) mod submit_command;
+pub(crate) mod translation_session;
 pub(crate) mod vidpn;
 pub(crate) mod wddm32_slot_audit;
 pub(crate) mod wddm_surface;
@@ -92,6 +93,7 @@ pub(crate) use submit_command::{
     abandon_pending_submissions, record_present_handoff_telemetry, AbandonOutcome,
     ABANDONED_FENCES, DMA_STALE_SKIP_COUNT,
 };
+pub use translation_session::diag_dump_translation_session_atomics;
 pub use submit_command::{
     diag_dump_engine_atomics, dxgkddi_collect_dbg_info, dxgkddi_patch, dxgkddi_preempt_command,
     dxgkddi_query_current_fence, dxgkddi_render, dxgkddi_render_gdi, dxgkddi_render_km,

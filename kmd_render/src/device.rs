@@ -14,6 +14,9 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use helios_kmd_logic::snapshot_bind::SnapshotDescriptor;
 
 use crate::adapter::AdapterContext;
+use crate::ddi::translation_session::{
+    self as hts1, ProcessSessionList, SessionObject as TranslationSessionObject,
+};
 use crate::dxgk::*;
 
 /// State for one D3D device opened on the adapter.
@@ -32,6 +35,10 @@ pub struct DeviceContext {
     /// stream registration/marker use is refused while ordinary rendering stays
     /// available.
     creator_process: usize,
+    /// K5: the one HTS1 session this raw KMT device's HVC1 control context
+    /// created, if it is a raw device at all. `None` for every ordinary D3D
+    /// device, which is most of them. §10.7:1720-1721 permits exactly one.
+    session: crate::sync::SpinLock<Option<core::ptr::NonNull<TranslationSessionObject>>>,
 }
 
 /// State for one scheduler context opened on a D3D device.
@@ -89,6 +96,45 @@ pub struct ContextContext {
     /// nor blocks below DISPATCH; `SpinLock` raises/restores IRQL around the
     /// handful of scalar accesses.
     present_stream_marker: crate::sync::SpinLock<Option<(u32, u32, u64)>>,
+    /// K5: what this context is, and the strong session reference it holds.
+    /// Written once at create and read once at destroy — the live context object
+    /// is the identity, and nothing looks the numeric generation up again
+    /// (§10.4:1250-1253).
+    helios: HeliosContextRole,
+}
+
+/// What a context is to K5. `Legacy` is every D3D-runtime and CDD context and
+/// holds nothing.
+enum HeliosContextRole {
+    Legacy,
+    /// The one HVC1 control context of a raw KMT device.
+    Control(core::ptr::NonNull<TranslationSessionObject>),
+    /// An HQA1-attached outer context, with the generation it was admitted under.
+    Attached {
+        session: core::ptr::NonNull<TranslationSessionObject>,
+        context_generation: u64,
+        /// CROSS-LANE: the reader is K6 — `DxgkDdiSubmitCommand` assigns this
+        /// endpoint's next arrival-order host-dispatch serial (§10.4:1255-1258).
+        #[allow(dead_code)]
+        endpoint_id: u32,
+    },
+}
+
+impl DeviceContext {
+    /// The bounded HTS1 session list of the `hKmdProcess` this device was
+    /// created under, if it has one.
+    ///
+    /// # Safety of the cast
+    /// `creator_process` is `DXGKARG_CREATEDEVICE::hKmdProcess`, which dxgkrnl
+    /// obtained from `DxgkDdiCreateProcess`'s `Box::into_raw` and round-trips
+    /// verbatim; dxgkrnl destroys a process's devices before the process. Zero
+    /// means the device has no process object and every K5 arm refuses.
+    fn process_sessions(&self) -> Option<&ProcessSessionList> {
+        // SAFETY: the pointer is our own `ProcessContext`, live for at least as
+        // long as this device.
+        unsafe { (self.creator_process as *const ProcessContext).as_ref() }
+            .map(|process| &process.sessions)
+    }
 }
 
 /// Typed borrowed view of a scheduler context handle.
@@ -223,6 +269,15 @@ impl<'a> DeviceHandleRef<'a> {
         unsafe { self.device.adapter.as_ref() }
     }
 
+    /// The device's HTS1 session cell, for `DxgkDdiOpenAllocation`'s role-1
+    /// reply-pool binding. Exposed through the checked traversal rather than as
+    /// a public field, for the same reason the back-pointers are private.
+    pub fn session_cell(
+        &self,
+    ) -> &'a crate::sync::SpinLock<Option<core::ptr::NonNull<TranslationSessionObject>>> {
+        &self.device.session
+    }
+
     /// The raw back-pointer, for the one caller that stores it rather than
     /// borrowing through it (`scheduler.rs`'s `HwContext`).
     pub fn adapter_ptr(&self) -> *mut AdapterContext {
@@ -245,11 +300,12 @@ impl<'a> DeviceHandleRef<'a> {
 /// does not exist. The allocation stays — dxgkrnl needs the non-NULL handle — but
 /// the object is an opaque token and nothing more.
 pub struct ProcessContext {
-    /// Zero-sized structs still get a unique non-null address from `Box`, but a
-    /// field makes the allocation's purpose (a handle dxgkrnl can round-trip)
-    /// legible and keeps `Box::into_raw` returning a real pointer under any
-    /// future allocator.
-    _opaque: u32,
+    /// K5 reverses the "deliberately empty" note above for exactly one field.
+    /// §17.6:4336 requires `DxgkDdiCreateProcess` to allocate one bounded HTS1
+    /// session list, and invariant 10 permits exactly one edge into it: create-
+    /// context admission. Submit, Present, allocation open and display never
+    /// reach it.
+    sessions: ProcessSessionList,
 }
 
 /// `DxgkDdiCreateDevice` — allocate per-device state.
@@ -265,6 +321,7 @@ pub unsafe extern "C" fn dxgkddi_create_device(
     let ctx = Box::new(DeviceContext {
         adapter: miniport_device_context as *mut AdapterContext,
         creator_process: args.hKmdProcess as usize,
+        session: crate::sync::SpinLock::new(None),
     });
     // Hand the device handle back to Dxgkrnl; reclaimed in destroy_device.
     args.hDevice = Box::into_raw(ctx) as *mut c_void;
@@ -293,7 +350,18 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
             (unsafe { DeviceHandleRef::from_raw(h_device) }).and_then(|d| d.adapter())
         else {
             // The Box still has to be reclaimed even if the back-pointer is
-            // somehow null — leaking it would be the worse failure.
+            // somehow null — leaking it would be the worse failure — and so does
+            // any session reference it still holds, which the main path below
+            // releases and this arm used to walk past.
+            let stale = (unsafe { (h_device as *const DeviceContext).as_ref() })
+                .and_then(|d| d.session.lock().take());
+            if let Some(session) = stale {
+                // SAFETY: the device's own reference. `take()` under the cell's
+                // spinlock is what makes this single-release: whichever of this
+                // and `dxgkddi_destroy_context` runs first gets the pointer and
+                // the other sees `None`.
+                unsafe { hts1::release_device_session(session, None) };
+            }
             // SAFETY: produced by Box::into_raw in create_device.
             drop(unsafe { Box::from_raw(h_device as *mut DeviceContext) });
             return STATUS_SUCCESS;
@@ -353,6 +421,7 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // establishes the zero baseline that makes the post-flip numbers mean
         // something.
         crate::ddi::diag_dump_native_fence_atomics();
+        crate::ddi::diag_dump_translation_session_atomics();
         // D4a: drop this device's scanout retirement-event registrations —
         // dereference ONLY, no signal (the process is exiting; a wake would
         // land nowhere). Its read-ledger page mapping needs nothing here: it
@@ -381,6 +450,20 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         crate::diag::record(0x0E02_0000 | before.min(0xFFFF));
         // 0x0E03_RRCC = reclaimed blobs (RR) + contexts (CC).
         crate::diag::record(0x0E03_0000 | ((blobs.min(0xFF) << 8) | contexts.min(0xFF)));
+        // A raw KMT device whose control context was already destroyed has
+        // `session == None`; a nonempty one means dxgkrnl tore the device down
+        // without the context, so release it here rather than leak the session.
+        // `take()` under the cell's spinlock is what makes this single-release:
+        // whichever of this and `dxgkddi_destroy_context` runs first gets the
+        // pointer and the other sees `None`, so the "two owners" are one.
+        let stale = { unsafe { (h_device as *const DeviceContext).as_ref() } }
+            .and_then(|d| d.session.lock().take());
+        if let Some(session) = stale {
+            let list = unsafe { (h_device as *const DeviceContext).as_ref() }
+                .and_then(|d| d.process_sessions());
+            // SAFETY: the device's own reference, released exactly once.
+            unsafe { crate::ddi::translation_session::release_device_session(session, list) };
+        }
         // SAFETY: produced by Box::into_raw in create_device; destroyed exactly once.
         drop(unsafe { Box::from_raw(h_device as *mut DeviceContext) });
     }
@@ -404,6 +487,57 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     }
 
     let args = unsafe { &mut *create_context };
+
+    // SAFETY: `Flags` is a C union whose `Value` member is its UINT view.
+    let context_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
+    // SAFETY: h_device is the DeviceContext we returned from DxgkDdiCreateDevice.
+    let Some(device) = (unsafe { (h_device as *const DeviceContext).as_ref() }) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let process_list = device.process_sessions();
+    // SAFETY: dxgkrnl owns a valid create-context private buffer of the stated
+    // size for the duration of the call; `classify_context` only reads it.
+    let request = match unsafe {
+        hts1::classify_context(
+            args.pPrivateDriverData,
+            args.PrivateDriverDataSize,
+            context_flags,
+            device.creator_process,
+            device.adapter as *const AdapterContext,
+            &device.session,
+            process_list,
+        )
+    } {
+        Ok(request) => request,
+        Err(status) => return status,
+    };
+
+    let (role, info) = match request {
+        hts1::ContextRequest::Legacy => (HeliosContextRole::Legacy, ContextInfoProfile::Legacy),
+        hts1::ContextRequest::HeliosControl => {
+            // `classify_context` published the session into `device.session`.
+            match *device.session.lock() {
+                Some(session) => (HeliosContextRole::Control(session), ContextInfoProfile::Hvc1),
+                None => return STATUS_INVALID_DEVICE_REQUEST,
+            }
+        }
+        hts1::ContextRequest::HeliosAttach {
+            session,
+            context_generation,
+            endpoint_id,
+        } => (
+            HeliosContextRole::Attached {
+                session,
+                context_generation,
+                endpoint_id,
+            },
+            // An HQA1 outer context is an ordinary D3D runtime context; its
+            // `DmaBufferPrivateDataSize` sizing for the 64-byte HOS1 prefix is
+            // K6's (§10.4:1332-1335), so it keeps today's profile until then.
+            ContextInfoProfile::Legacy,
+        ),
+    };
+
     let ctx = Box::new(ContextContext {
         device: h_device as *mut DeviceContext,
         snap_resid: AtomicU32::new(0),
@@ -416,26 +550,62 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         snap_memory_type: AtomicU32::new(0),
         snap_purpose: AtomicU32::new(0),
         present_stream_marker: crate::sync::SpinLock::new(None),
+        helios: role,
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;
-
-    // Use the paging aperture for DMA buffers. With the decorative GpuMmu model,
-    // dxgkrnl's CDD context creates a privileged DMA pool with GPU-VA mapping
-    // enabled; if this is 0, dxgmms2 uses contiguous system memory, skips creating
-    // a VIDMM allocation object, then later dereferences that null allocation in
-    // VidMmInitDmaPool. A nonzero aperture segment set makes VidMm back the pool
-    // through the normal aperture allocation path.
-    args.ContextInfo.DmaBufferSegmentSet = 1; // segment id 1 (aperture)
-    args.ContextInfo.DmaBufferSize = 256 * 1024;
-    // ONE definition site: present_packet.rs, beside the two records that live
-    // in the buffer and the compile-time proof they fit it (40 -> 80 with the
-    // D4b snapshot descriptor plus the stream-boundary scheduler handoff).
-    args.ContextInfo.DmaBufferPrivateDataSize =
-        crate::ddi::present_packet::PRESENT_DMA_PRIVATE_DATA_BYTES;
-    args.ContextInfo.AllocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
-    args.ContextInfo.PatchLocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
-
+    write_context_info(&mut args.ContextInfo, info);
     STATUS_SUCCESS
+}
+
+/// Which `DXGK_CONTEXTINFO` a context gets.
+///
+/// ⛔ The two profiles differ in `DmaBufferSegmentSet`, and the difference is not
+/// cosmetic: a zero segment set makes dxgmms2 skip the VIDMM allocation object
+/// and then null-deref it in `VidMmInitDmaPool` for a runtime context. §10.7:1981
+/// keeps segment 1 as "the only nonzero `DmaBufferSegmentSet` choice for existing
+/// D3D runtime contexts, while HVC1 selects zero", so this is a per-arm branch
+/// and never a global flip.
+enum ContextInfoProfile {
+    Legacy,
+    Hvc1,
+}
+
+fn write_context_info(info: &mut DXGK_CONTEXTINFO, profile: ContextInfoProfile) {
+    match profile {
+        ContextInfoProfile::Legacy => {
+            // Use the paging aperture for DMA buffers. With the decorative GpuMmu
+            // model, dxgkrnl's CDD context creates a privileged DMA pool with
+            // GPU-VA mapping enabled; if this is 0, dxgmms2 uses contiguous system
+            // memory, skips creating a VIDMM allocation object, then later
+            // dereferences that null allocation in VidMmInitDmaPool.
+            info.DmaBufferSegmentSet = 1; // segment id 1 (aperture)
+            info.DmaBufferSize = 256 * 1024;
+            // ONE definition site: present_packet.rs, beside the two records that
+            // live in the buffer and the compile-time proof they fit it.
+            info.DmaBufferPrivateDataSize =
+                crate::ddi::present_packet::PRESENT_DMA_PRIVATE_DATA_BYTES;
+            info.AllocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
+            info.PatchLocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
+        }
+        ContextInfoProfile::Hvc1 => {
+            // §10.7:1734-1738, verbatim: a 256-KiB DMA buffer, a 4096-entry
+            // allocation list, a 4096-entry patch-location capacity, 64 bytes of
+            // KMD-only DMA private data, `DmaBufferSegmentSet=0`,
+            // `Caps.NoPatchingRequired=0`, every other cap/reserved field zero.
+            info.DmaBufferSize = helios_protocol::native_render::HELIOS_HVC1_DMA_BUFFER_BYTES;
+            info.DmaBufferSegmentSet =
+                helios_protocol::native_render::HELIOS_HVC1_DMA_BUFFER_SEGMENT_SET;
+            info.DmaBufferPrivateDataSize =
+                helios_protocol::native_render::HELIOS_HVC1_DMA_PRIVATE_DATA_BYTES;
+            info.AllocationListSize =
+                helios_protocol::native_render::HELIOS_HVC1_ALLOCATION_LIST_ENTRIES;
+            info.PatchLocationListSize =
+                helios_protocol::native_render::HELIOS_HVC1_PATCH_LOCATION_ENTRIES;
+            info.Caps.__bindgen_anon_1.Value = 0;
+            info.PagingCompanionNodeId = 0;
+            info.Reserved = 0;
+        }
+    }
 }
 
 /// `DxgkDdiDestroyContext`.
@@ -443,7 +613,34 @@ pub unsafe extern "C" fn dxgkddi_create_context(
 pub unsafe extern "C" fn dxgkddi_destroy_context(h_context: *mut c_void) -> NTSTATUS {
     crate::diag::record(0x0800_0002);
     if !h_context.is_null() {
-        drop(unsafe { Box::from_raw(h_context as *mut ContextContext) });
+        // SAFETY: produced by Box::into_raw in create_context; destroyed once.
+        let ctx = unsafe { Box::from_raw(h_context as *mut ContextContext) };
+        match ctx.helios {
+            HeliosContextRole::Legacy => {}
+            HeliosContextRole::Control(session) => {
+                // ⛔ CLEAR THE CELL FIRST. `release_device_session` may drop the
+                // last reference and free the object; a `DxgkDdiOpenAllocation`
+                // on this device between the free and the clear would read a
+                // dangling pointer out of `device.session`.
+                let device = unsafe { ctx.device.as_ref() };
+                if let Some(device) = device {
+                    *device.session.lock() = None;
+                }
+                let list = device.and_then(|d| d.process_sessions());
+                // SAFETY: the device's own reference, taken at control-context
+                // creation and released exactly once here. The list entry is
+                // removed under the list lock inside.
+                unsafe { hts1::release_device_session(session, list) };
+            }
+            HeliosContextRole::Attached {
+                session,
+                context_generation,
+                ..
+            } => {
+                // SAFETY: the reference this context took at HQA1 attach.
+                unsafe { hts1::release_attached_context(session, context_generation) };
+            }
+        }
     }
     STATUS_SUCCESS
 }
@@ -469,7 +666,9 @@ pub unsafe extern "C" fn dxgkddi_create_process(
     let args = unsafe { &mut *args };
     // The handle is an opaque token: dxgkrnl only round-trips it. The old
     // `adapter` back-pointer here was written and never read.
-    let ctx = Box::new(ProcessContext { _opaque: 0 });
+    let ctx = Box::new(ProcessContext {
+        sessions: ProcessSessionList::new(),
+    });
     // Hand the process handle back to Dxgkrnl; reclaimed in destroy_process.
     args.hKmdProcess = Box::into_raw(ctx) as HANDLE;
     STATUS_SUCCESS
@@ -483,7 +682,17 @@ pub unsafe extern "C" fn dxgkddi_destroy_process(
     if !h_process.is_null() {
         // SAFETY: h_process was produced by Box::into_raw in create_process and
         // is destroyed exactly once.
-        drop(unsafe { Box::from_raw(h_process as *mut ProcessContext) });
+        let process = unsafe { Box::from_raw(h_process as *mut ProcessContext) };
+        // §14: stop admission and invalidate every capability before anything
+        // else. dxgkrnl destroys this process's devices — and therefore their
+        // control contexts, each of which removes its own entry — before the
+        // process, so the list is empty here on every ordinary path. A nonempty
+        // one means a session outlived its owning device, which is an accounting
+        // bug elsewhere: draining stops a later attach from reaching it, and the
+        // `SessionObject` then LEAKS rather than dangling, because the only
+        // pointers to it die with this box.
+        process.sessions.drain_all();
+        drop(process);
     }
     STATUS_SUCCESS
 }

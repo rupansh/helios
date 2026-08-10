@@ -8142,3 +8142,2062 @@ mod allocation_identity_tests {
         assert_eq!(ADMITTED_ABI_VERSIONS, (2, 1, 1));
     }
 }
+
+/// HTS1 translation sessions and HQA1 outer-context attach — the K5 rules, with
+/// every kernel handle removed.
+///
+/// `kmd_render/src/ddi/translation_session.rs` owns the DDI plumbing (the
+/// `DXGKARG_CREATECONTEXT` decode, the boxed objects, the CSPRNG, the counters,
+/// the locking); this module owns the part that is a function of its arguments,
+/// so it can be tested. `helios_protocol` owns every wire record and its
+/// validator — nothing here re-derives one, and the wrapping refusal variants
+/// carry protocol's own named rejection so the KMD counter and the ETW field
+/// share one vocabulary.
+pub mod translation_session {
+    use helios_protocol::native_render::{
+        Hvm1Role, HELIOS_HNR2_ACCESS_WRITE, HELIOS_HVM1_REPLY_POOL_BYTES,
+        HELIOS_HVM1_REPLY_SLOT_BYTES, HELIOS_HVM1_REPLY_SLOT_COUNT,
+    };
+    use helios_protocol::native_render::{
+        admit_snapshot, Hnr2CapacityRefusal, HELIOS_HVR1_MAX_SNAPSHOT_BYTES,
+    };
+    use helios_protocol::translation_session::{
+        admit_host_dispatch_enqueue, admit_new_session, admit_ring_index, check_generation_match,
+        AttachRefusal, CapabilityRefusal, GenerationField, GenerationRefusal, HeliosAttachAdmission,
+        HeliosAttachExpectation, HeliosCapacityLimit, HeliosCapacityRefusal, HeliosEngineClass,
+        HeliosQueueAttachV1, HeliosSessionAdmission, HeliosSessionCapability,
+        HeliosTranslationEndpointV1, HeliosTranslationSessionInitV1,
+        HeliosTranslationSessionReplyV1, InitRefusal, HELIOS_HTS1_MAX_ENDPOINTS_PER_SESSION,
+    };
+
+    /// Endpoint slots one session can hold, as an array bound.
+    ///
+    /// `#![no_std]` here has no allocator, so the endpoint table is inline. 64
+    /// entries × 16 bytes is 1 KiB per session and 16 sessions per process is the
+    /// protocol cap, so the worst case is 16 KiB of nonpaged state per process.
+    pub const ENDPOINT_SLOTS: usize = HELIOS_HTS1_MAX_ENDPOINTS_PER_SESSION as usize;
+
+    /// Reply slots in one session's role-1 pool, as an array bound.
+    pub const REPLY_SLOTS: usize = HELIOS_HVM1_REPLY_SLOT_COUNT as usize;
+
+    /// Why a session-model operation was refused. Every variant is a distinct
+    /// counted refusal in `kmd_render`; none is ever silently repaired.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SessionRefusal {
+        /// An HTS1 INIT request or reply was refused by `protocol`.
+        Init(InitRefusal),
+        /// An HQA1 attach packet was refused by `protocol`.
+        Attach(AttachRefusal),
+        /// A bounded capacity declared by `protocol` was exhausted.
+        Capacity(HeliosCapacityRefusal),
+        /// A bounded native-side pool declared by `protocol` was exhausted. Its
+        /// snapshot arms are the point at which the caller drops its lock and
+        /// event-waits for the oldest C51 owner; they are not a resource failure.
+        Hnr2Capacity(Hnr2CapacityRefusal),
+
+        /// The operation needs a live (INIT-completed) session and this one has
+        /// not run INIT yet.
+        SessionProvisional,
+        /// A second INIT arrived on a session that already ran one. Section 10.4
+        /// grants exactly one host Venus context and `VkInstance` per session:
+        /// "No second `VkInstance` may be created in that host context."
+        SessionAlreadyInitialised,
+        /// The session is `Draining` — reset, removal, or a hard refusal stopped
+        /// admission. Every later admission fails; nothing is revalidated.
+        SessionDraining,
+        /// The process released a session it never admitted. An accounting bug,
+        /// not a wire event, and refused rather than wrapped: a wrapped live
+        /// count would let a 17th session in.
+        SessionLedgerUnderflow,
+        /// The 64-bit session-generation space is exhausted. Deliberately not
+        /// saturating, for [`super::allocation_identity`]'s reason: a saturated
+        /// counter hands one generation to two live sessions and every exact-match
+        /// check starts admitting the wrong session's packets.
+        SessionGenerationSpaceExhausted,
+        /// The KMD's CSPRNG produced [`HeliosSessionCapability::INVALID`]. The
+        /// all-zero pair is the invalidated sentinel, so it can never be issued
+        /// as a live capability — the caller draws again or fails INIT.
+        CapabilityIsInvalidSentinel,
+
+        /// A second role-1 pool was offered to a session that already has one.
+        /// The raw device creates exactly one (section 10.7, lines 2037-2039).
+        ReplyPoolAlreadyBound,
+        /// The operation needs the role-1 pool and none is bound.
+        ReplyPoolNotBound,
+        /// The allocation offered as a reply pool is not role 1.
+        ReplyPoolRoleMismatch { found: u32 },
+        /// The allocation offered as a reply pool is not exactly 64 MiB.
+        /// Unreachable while `protocol`'s HVM1 validator enforces the role's exact
+        /// size at create; kept because the pool's slot arithmetic is derived from
+        /// this number and an unchecked assumption here is a range error later.
+        ReplyPoolSizeMismatch { found: u64 },
+        /// The KMD wrote a zero `object_generation` into the pool's HVM1
+        /// write-back. Every HNR2 use record naming the pool carries this value,
+        /// and `protocol` refuses a zero `expected_allocation_generation` on the
+        /// wire — refuse at the source instead.
+        ReplyPoolGenerationZero,
+
+        /// An endpoint ordinal outside `1..=endpoint_capacity`.
+        EndpointOutOfRange { found: u32, capacity: u32 },
+        /// An endpoint was reached before a host ring index was bound to it. The
+        /// binder is K6/K11 — see [`TranslationSession::bind_ring`].
+        EndpointRingUnassigned { endpoint_id: u32 },
+        /// A host ring index is already bound, to this endpoint or another one.
+        /// Invariant 12 forbids recycling a ring while any job or reference lives.
+        EndpointRingAlreadyTaken { ring_index: u32 },
+        /// The endpoint's host-dispatch FIFO has nothing to retire — an
+        /// accounting bug, refused rather than wrapped.
+        HostDispatchFifoUnderflow { endpoint_id: u32 },
+        /// The endpoint's arrival-order serial space is exhausted.
+        HostDispatchSerialExhausted { endpoint_id: u32 },
+        /// A snapshot release named more bytes than the session holds live.
+        SnapshotAccountingUnderflow,
+        /// The endpoint this attach names was already declared with a different
+        /// descriptor. The ordinals are cross-checks, so they are compared and
+        /// refused — never used to look an endpoint up.
+        EndpointDescriptorConflict { endpoint_id: u32 },
+        /// The session's live outer-context count would overflow. Bounded by the
+        /// same number as one endpoint's host-dispatch FIFO.
+        AttachedContextOverflow,
+        /// A detach named a context generation this session never admitted.
+        DetachUnknownContext { context_generation: u64 },
+
+        /// A control Render arrived on something other than the session's one
+        /// HVC1 control context.
+        ControlRenderNotOnControlContext,
+        /// A control Render with `HAS_REPLY` did not list exactly the one
+        /// allocation this carrier may name.
+        ControlRenderAllocationCountNotOne { found: u32 },
+        /// A control Render without a reply listed an allocation. The reply slot
+        /// is the only entry this carrier ever lists (section 10.4, lines
+        /// 1337-1345).
+        ControlRenderAllocationWithoutReply { found: u32 },
+        /// The listed allocation is not this session's own reply pool. Ring zero
+        /// never receives or resolves an outer allocation.
+        ControlRenderForeignAllocation,
+        /// The listed allocation is the pool but its generation is stale.
+        ControlRenderPoolGenerationStale { found: u64, expected: u64 },
+        /// The use record's access word is not exactly `WRITE`.
+        ControlRenderAccessNotWrite { found: u32 },
+        /// The reply slot generation did not strictly increase for the slot the
+        /// reply offset selects.
+        ControlRenderSlotGenerationStale { found: u64, watermark: u64 },
+        /// The slot the reply offset selects already has a different generation
+        /// in flight. One checkout, one Render.
+        ControlRenderSlotBusy { in_flight: u64 },
+        /// A publish/retire named a slot generation that is not the one in
+        /// flight on that slot.
+        ControlRenderSlotGenerationUnknown { found: u64 },
+        /// A slot index derived from a reply offset fell outside the pool.
+        /// Unreachable while `protocol`'s HNR2 validator enforces
+        /// `ReplySlotIndexOutOfRange` first; present so this module has no
+        /// panicking index.
+        ControlRenderSlotIndexOutOfRange { found: usize },
+    }
+
+    // ── the bounded per-process session list (section 17.6, line 4336) ────────
+
+    /// `DxgkDdiCreateProcess`'s bounded session list, as a count.
+    ///
+    /// The list itself is `kmd_render`'s (it holds pointers); the *admission* is
+    /// here, because "session-capacity exhaustion fails device creation or removes
+    /// that device" is a rule and a `const` is not.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct ProcessSessionLedger {
+        live: u32,
+    }
+
+    impl ProcessSessionLedger {
+        pub const fn new() -> Self {
+            Self { live: 0 }
+        }
+
+        pub const fn live(&self) -> u32 {
+            self.live
+        }
+
+        /// Admit one more session, or refuse. Never waits and never spills.
+        pub fn admit(&mut self) -> Result<(), SessionRefusal> {
+            admit_new_session(self.live).map_err(SessionRefusal::Capacity)?;
+            self.live += 1;
+            Ok(())
+        }
+
+        pub fn release(&mut self) -> Result<(), SessionRefusal> {
+            match self.live.checked_sub(1) {
+                Some(next) => {
+                    self.live = next;
+                    Ok(())
+                }
+                None => Err(SessionRefusal::SessionLedgerUnderflow),
+            }
+        }
+    }
+
+    // ── the session-generation source ─────────────────────────────────────────
+
+    /// One monotone nonzero session generation per adapter.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SessionGenerationSource {
+        next: u64,
+    }
+
+    impl Default for SessionGenerationSource {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl SessionGenerationSource {
+        pub const fn new() -> Self {
+            Self { next: 1 }
+        }
+
+        pub fn mint(&mut self) -> Result<u64, SessionRefusal> {
+            let value = self.next;
+            if value == 0 {
+                return Err(SessionRefusal::SessionGenerationSpaceExhausted);
+            }
+            self.next = match value.checked_add(1) {
+                Some(next) => next,
+                None => 0,
+            };
+            Ok(value)
+        }
+    }
+
+    // ── the session phase ─────────────────────────────────────────────────────
+
+    /// Where a session is in its life. The HVC1 control context creates it
+    /// `Provisional`; the finite INIT makes it `Live`; reset, removal, or a hard
+    /// refusal makes it `Draining`, which is terminal — section 14 (line 3430)
+    /// names that transition ("marks every HTS1 session `Draining`, invalidates
+    /// all HQA1 capabilities"), and destruction waits for references to drain.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SessionPhase {
+        Provisional,
+        Live,
+        Draining,
+    }
+
+    /// One physical lower-queue endpoint of a session.
+    ///
+    /// The ring index is the KMD's — minted at INIT, unique, nonzero, never
+    /// recycled (invariant 12). The descriptor is the guest's, because only the
+    /// guest knows its own Vulkan queue topology; see
+    /// [`TranslationSession::declare_endpoint`].
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct SessionEndpoint {
+        /// `endpoint_id == 0` means "never declared".
+        pub descriptor: HeliosTranslationEndpointV1,
+        /// Unique nonzero host `INFO_RING_IDX`. Zero before INIT assigns it.
+        pub ring_index: u32,
+        /// Already-eligible DMAs queued on this endpoint's host-dispatch FIFO.
+        pub fifo_depth: u32,
+        /// Next arrival-order host-dispatch serial.
+        pub next_serial: u64,
+    }
+
+    impl SessionEndpoint {
+        const UNASSIGNED: Self = Self {
+            descriptor: HeliosTranslationEndpointV1 {
+                endpoint_id: 0,
+                engine_class: 0,
+                queue_family: 0,
+                queue_index: 0,
+            },
+            ring_index: 0,
+            fifo_depth: 0,
+            next_serial: 1,
+        };
+    }
+
+    // ── the reply pool and its four slots ─────────────────────────────────────
+
+    /// What one reply slot is doing.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SlotState {
+        /// Nothing in flight. `retired_generation` still bounds what may be
+        /// checked out next.
+        Idle,
+        /// A Render naming this slot has been admitted and its C51 value has not
+        /// completed.
+        InFlight,
+        /// The host published; the CPU has not consumed it yet. Section 10.7:
+        /// "A slot is not reusable until its matching C51 value completed, the CPU
+        /// copied or decoded the reply, and the slot generation was retired."
+        Published,
+    }
+
+    /// One slot of the role-1 pool, as the KMD sees it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ReplySlot {
+        pub state: SlotState,
+        /// Nonzero while `InFlight`/`Published`.
+        pub generation: u64,
+        /// Highest generation this slot has retired; the strictly-increasing
+        /// floor for the next checkout.
+        pub retired_generation: u64,
+        pub owner_context_generation: u64,
+        pub batch_token: u64,
+        pub reply_offset: u64,
+        pub reply_capacity_bytes: u64,
+        pub c51_value: u64,
+    }
+
+    impl ReplySlot {
+        const IDLE: Self = Self {
+            state: SlotState::Idle,
+            generation: 0,
+            retired_generation: 0,
+            owner_context_generation: 0,
+            batch_token: 0,
+            reply_offset: 0,
+            reply_capacity_bytes: 0,
+            c51_value: 0,
+        };
+    }
+
+    /// The session's one role-1 HVM1 pool, as an identity plus its slot states.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ReplyPool {
+        /// The HVM1 `object_generation` the KMD wrote back at create. Every HNR2
+        /// use record naming the pool must repeat it.
+        pub allocation_generation: u64,
+        pub slots: [ReplySlot; REPLY_SLOTS],
+    }
+
+    /// One control Render's session-level facts, as `DxgkDdiRender` resolved
+    /// them. Everything `protocol`'s HNR2 header validator already enforces
+    /// (shape, ordering, reply alignment/range/capacity) is assumed done: this is
+    /// only what needs the *session*.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ControlRenderRequest {
+        /// Is the submitting context this session's HVC1 control context?
+        pub on_control_context: bool,
+        /// HNR2 `flags & HAS_REPLY`.
+        pub has_reply: bool,
+        /// The COMMIT `AllocationCount`.
+        pub allocation_count: u32,
+        /// Did the caller resolve the one listed allocation to this session's own
+        /// reply pool? Resolved from the kernel allocation object, never from the
+        /// wire.
+        pub names_reply_pool: bool,
+        /// The use record's `expected_allocation_generation` for that entry.
+        pub expected_allocation_generation: u64,
+        /// The use record's access word.
+        pub access_flags: u32,
+        /// HNR2 `reply_offset`.
+        pub reply_offset: u64,
+        /// HNR2 `reply_capacity_bytes`.
+        pub reply_capacity_bytes: u64,
+        /// HNR2 `reply_slot_generation`.
+        pub reply_slot_generation: u64,
+        /// HNR2 `batch_token`.
+        pub batch_token: u64,
+        /// The submitting context's HQA1 generation, or 0 for the raw HVC1
+        /// control context (which has none — it predates every attach).
+        pub owner_context_generation: u64,
+    }
+
+    /// A control Render admitted: which slot it took, if any.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ControlRenderAdmission {
+        /// `None` for a reply-less control Render.
+        pub slot_index: Option<usize>,
+        pub slot_generation: u64,
+    }
+
+    // ── the session ───────────────────────────────────────────────────────────
+
+    /// The KMD-side HTS1 session: everything `DxgkDdiCreateContext`,
+    /// `DxgkDdiCreateAllocation` and the control `DxgkDdiRender` compare against.
+    #[derive(Debug, Clone, Copy)]
+    pub struct TranslationSession {
+        phase: SessionPhase,
+        package_generation: u64,
+        capset: u32,
+        session_generation: u64,
+        capability: HeliosSessionCapability,
+        endpoint_capacity: u32,
+        endpoints: [SessionEndpoint; ENDPOINT_SLOTS],
+        highest_context_generation: u64,
+        attached_contexts: u32,
+        pool: Option<ReplyPool>,
+        live_snapshots: u32,
+        live_snapshot_bytes: u64,
+    }
+
+    impl TranslationSession {
+        /// The provisional session the HVC1 control context creates. It has no
+        /// generation and no capability yet: both come from INIT, and every
+        /// admission that needs them refuses until then.
+        pub const fn new_provisional(package_generation: u64, capset: u32) -> Self {
+            Self {
+                phase: SessionPhase::Provisional,
+                package_generation,
+                capset,
+                session_generation: 0,
+                capability: HeliosSessionCapability::INVALID,
+                endpoint_capacity: 0,
+                endpoints: [SessionEndpoint::UNASSIGNED; ENDPOINT_SLOTS],
+                highest_context_generation: 0,
+                attached_contexts: 0,
+                pool: None,
+                live_snapshots: 0,
+                live_snapshot_bytes: 0,
+            }
+        }
+
+        pub const fn phase(&self) -> SessionPhase {
+            self.phase
+        }
+
+        pub const fn session_generation(&self) -> u64 {
+            self.session_generation
+        }
+
+        pub const fn endpoint_capacity(&self) -> u32 {
+            self.endpoint_capacity
+        }
+
+        pub const fn attached_contexts(&self) -> u32 {
+            self.attached_contexts
+        }
+
+        pub const fn highest_context_generation(&self) -> u64 {
+            self.highest_context_generation
+        }
+
+        pub const fn pool(&self) -> Option<ReplyPool> {
+            self.pool
+        }
+
+        /// Does `presented` equal this session's live capability?
+        ///
+        /// For the ONE caller that needs it as a lookup key rather than as a
+        /// validation (§10.4:1215-1217). A `Draining` session's capability is the
+        /// invalidated sentinel, which `check_match` refuses, so this is `false`
+        /// for it without a separate phase test.
+        pub fn capability_matches(&self, presented: HeliosSessionCapability) -> bool {
+            presented.check_match(self.capability).is_ok()
+        }
+
+        /// Reset, removal, or a hard refusal. Terminal: the capability is
+        /// invalidated first so a waiter woken by the caller can never be admitted
+        /// afterwards (section 13, "invalidates all HQA1 capabilities … and
+        /// cancels C51/HQC1 event waiters as device-lost"), and no slot is marked
+        /// complete — "Reset poisons all slots and wakes device-lost; it never
+        /// marks a reply complete."
+        pub fn begin_draining(&mut self) {
+            self.capability = HeliosSessionCapability::INVALID;
+            self.phase = SessionPhase::Draining;
+        }
+
+        /// Bind the one role-1 HVM1 pool the raw device created before INIT.
+        ///
+        /// `role`/`byte_size`/`object_generation` come from the HVM1 record the
+        /// allocation path already validated; they are re-checked here because
+        /// this is where the slot arithmetic starts depending on them.
+        pub fn bind_reply_pool(
+            &mut self,
+            role: Hvm1Role,
+            byte_size: u64,
+            object_generation: u64,
+        ) -> Result<(), SessionRefusal> {
+            if self.phase == SessionPhase::Draining {
+                return Err(SessionRefusal::SessionDraining);
+            }
+            if self.pool.is_some() {
+                return Err(SessionRefusal::ReplyPoolAlreadyBound);
+            }
+            if role != Hvm1Role::ReplyPool {
+                return Err(SessionRefusal::ReplyPoolRoleMismatch {
+                    found: role.to_u32(),
+                });
+            }
+            if byte_size != HELIOS_HVM1_REPLY_POOL_BYTES {
+                return Err(SessionRefusal::ReplyPoolSizeMismatch { found: byte_size });
+            }
+            if object_generation == 0 {
+                return Err(SessionRefusal::ReplyPoolGenerationZero);
+            }
+            self.pool = Some(ReplyPool {
+                allocation_generation: object_generation,
+                slots: [ReplySlot::IDLE; REPLY_SLOTS],
+            });
+            Ok(())
+        }
+
+        /// Validate a finite HTS1 INIT request and say how many endpoints the
+        /// session may grant. Does not mutate: the caller still has to create the
+        /// host Venus context, and a session that fails that must not look
+        /// initialised.
+        pub fn admit_init(
+            &self,
+            request: &HeliosTranslationSessionInitV1,
+        ) -> Result<u32, SessionRefusal> {
+            match self.phase {
+                SessionPhase::Draining => return Err(SessionRefusal::SessionDraining),
+                SessionPhase::Live => return Err(SessionRefusal::SessionAlreadyInitialised),
+                SessionPhase::Provisional => {}
+            }
+            if self.pool.is_none() {
+                return Err(SessionRefusal::ReplyPoolNotBound);
+            }
+            request
+                .validate(self.package_generation, self.capset)
+                .map_err(SessionRefusal::Init)
+        }
+
+        /// Complete INIT: record the minted generation, the CSPRNG capability and
+        /// the granted endpoint capacity, and return the exact reply bytes.
+        ///
+        /// `granted_endpoint_capacity` may be smaller than what
+        /// [`Self::admit_init`] returned but never larger; `protocol`'s own reply
+        /// validator is run here so the KMD can never emit a reply the ICD will
+        /// refuse.
+        pub fn complete_init(
+            &mut self,
+            requested_endpoint_capacity: u32,
+            granted_endpoint_capacity: u32,
+            session_generation: u64,
+            capability: HeliosSessionCapability,
+        ) -> Result<HeliosTranslationSessionReplyV1, SessionRefusal> {
+            match self.phase {
+                SessionPhase::Draining => return Err(SessionRefusal::SessionDraining),
+                SessionPhase::Live => return Err(SessionRefusal::SessionAlreadyInitialised),
+                SessionPhase::Provisional => {}
+            }
+            if self.pool.is_none() {
+                return Err(SessionRefusal::ReplyPoolNotBound);
+            }
+            if capability.is_invalid() {
+                return Err(SessionRefusal::CapabilityIsInvalidSentinel);
+            }
+            if session_generation == 0 {
+                return Err(SessionRefusal::Init(InitRefusal::Generation {
+                    field: GenerationField::Session,
+                    reason: GenerationRefusal::Zero,
+                }));
+            }
+            let reply = HeliosTranslationSessionReplyV1::new(
+                self.package_generation,
+                session_generation,
+                capability,
+                self.capset,
+                granted_endpoint_capacity,
+            );
+            let admission: HeliosSessionAdmission = reply
+                .validate(
+                    self.package_generation,
+                    self.capset,
+                    requested_endpoint_capacity,
+                )
+                .map_err(SessionRefusal::Init)?;
+
+            // ⛔ No ring index is minted here. An endpoint ordinal is not a ring
+            // (`translation_session.rs:632-635`), and line 1727 gives the ring to a
+            // *queue context* bound to a real VkQueue — which a record-only session
+            // never creates. Minting one per granted ordinal would burn the 255-entry
+            // wire ceiling on endpoints that never materialise. [`Self::bind_ring`]
+            // is the seam.
+            self.session_generation = admission.session_generation;
+            self.capability = admission.capability;
+            self.endpoint_capacity = admission.endpoint_capacity;
+            self.phase = SessionPhase::Live;
+            Ok(reply)
+        }
+
+        /// The endpoint this session holds for `endpoint_id`. Its `descriptor`
+        /// carries `endpoint_id == 0` if the ordinal has never been declared.
+        pub fn endpoint(&self, endpoint_id: u32) -> Result<SessionEndpoint, SessionRefusal> {
+            if endpoint_id == 0 || endpoint_id > self.endpoint_capacity {
+                return Err(SessionRefusal::EndpointOutOfRange {
+                    found: endpoint_id,
+                    capacity: self.endpoint_capacity,
+                });
+            }
+            match self.endpoints.get((endpoint_id - 1) as usize) {
+                Some(endpoint) => Ok(*endpoint),
+                None => Err(SessionRefusal::EndpointOutOfRange {
+                    found: endpoint_id,
+                    capacity: self.endpoint_capacity,
+                }),
+            }
+        }
+
+        /// The unique nonzero host ring bound to `endpoint_id`.
+        pub fn ring_index(&self, endpoint_id: u32) -> Result<u32, SessionRefusal> {
+            let endpoint = self.endpoint(endpoint_id)?;
+            if endpoint.ring_index == 0 {
+                return Err(SessionRefusal::EndpointRingUnassigned { endpoint_id });
+            }
+            Ok(endpoint.ring_index)
+        }
+
+        /// Bind the unique nonzero host `INFO_RING_IDX` for `endpoint_id`, once.
+        ///
+        /// CROSS-LANE SEAM: the caller is whichever of K6/K11 creates the real
+        /// host queue — line 1727 gives the ring to a queue context bound to a
+        /// real VkQueue, and nothing in K5 creates one. Rebinding is refused
+        /// because invariant 12 forbids recycling a ring before every endpoint
+        /// job and context reference retires.
+        pub fn bind_ring(&mut self, endpoint_id: u32, ring_index: u32) -> Result<(), SessionRefusal> {
+            if self.phase == SessionPhase::Draining {
+                return Err(SessionRefusal::SessionDraining);
+            }
+            admit_ring_index(ring_index).map_err(SessionRefusal::Capacity)?;
+            if ring_index == 0 {
+                // Ring 0 is the CPU/decode-only control ring; no endpoint owns it.
+                return Err(SessionRefusal::EndpointRingUnassigned { endpoint_id });
+            }
+            let capacity = self.endpoint_capacity;
+            if endpoint_id == 0 || endpoint_id > capacity {
+                return Err(SessionRefusal::EndpointOutOfRange {
+                    found: endpoint_id,
+                    capacity,
+                });
+            }
+            let mut taken = false;
+            let mut i = 0usize;
+            while i < ENDPOINT_SLOTS {
+                if let Some(other) = self.endpoints.get(i) {
+                    if other.ring_index == ring_index && i != (endpoint_id - 1) as usize {
+                        taken = true;
+                    }
+                }
+                i += 1;
+            }
+            if taken {
+                return Err(SessionRefusal::EndpointRingAlreadyTaken { ring_index });
+            }
+            let Some(endpoint) = self.endpoints.get_mut((endpoint_id - 1) as usize) else {
+                return Err(SessionRefusal::EndpointOutOfRange {
+                    found: endpoint_id,
+                    capacity,
+                });
+            };
+            if endpoint.ring_index != 0 {
+                return Err(SessionRefusal::EndpointRingAlreadyTaken {
+                    ring_index: endpoint.ring_index,
+                });
+            }
+            endpoint.ring_index = ring_index;
+            Ok(())
+        }
+
+        /// Assign the next arrival-order host-dispatch serial on `endpoint_id`.
+        ///
+        /// `DxgkDdiSubmitCommand` calls this at `DISPATCH_LEVEL` under the short
+        /// endpoint lock and releases it before any host/GPU wait (line 1255-1258).
+        /// Exhaustion is refused, never waited on.
+        pub fn enqueue_host_dispatch(&mut self, endpoint_id: u32) -> Result<u64, SessionRefusal> {
+            if self.phase != SessionPhase::Live {
+                return Err(match self.phase {
+                    SessionPhase::Draining => SessionRefusal::SessionDraining,
+                    _ => SessionRefusal::SessionProvisional,
+                });
+            }
+            let capacity = self.endpoint_capacity;
+            if endpoint_id == 0 || endpoint_id > capacity {
+                return Err(SessionRefusal::EndpointOutOfRange {
+                    found: endpoint_id,
+                    capacity,
+                });
+            }
+            let Some(endpoint) = self.endpoints.get_mut((endpoint_id - 1) as usize) else {
+                return Err(SessionRefusal::EndpointOutOfRange {
+                    found: endpoint_id,
+                    capacity,
+                });
+            };
+            if endpoint.ring_index == 0 {
+                return Err(SessionRefusal::EndpointRingUnassigned { endpoint_id });
+            }
+            admit_host_dispatch_enqueue(endpoint.fifo_depth).map_err(SessionRefusal::Capacity)?;
+            let Some(next) = endpoint.next_serial.checked_add(1) else {
+                return Err(SessionRefusal::HostDispatchSerialExhausted { endpoint_id });
+            };
+            let serial = endpoint.next_serial;
+            endpoint.next_serial = next;
+            endpoint.fifo_depth += 1;
+            Ok(serial)
+        }
+
+        /// One enqueued host-dispatch entry retired.
+        pub fn retire_host_dispatch(&mut self, endpoint_id: u32) -> Result<(), SessionRefusal> {
+            let capacity = self.endpoint_capacity;
+            if endpoint_id == 0 || endpoint_id > capacity {
+                return Err(SessionRefusal::EndpointOutOfRange {
+                    found: endpoint_id,
+                    capacity,
+                });
+            }
+            let Some(endpoint) = self.endpoints.get_mut((endpoint_id - 1) as usize) else {
+                return Err(SessionRefusal::EndpointOutOfRange {
+                    found: endpoint_id,
+                    capacity,
+                });
+            };
+            match endpoint.fifo_depth.checked_sub(1) {
+                Some(depth) => {
+                    endpoint.fifo_depth = depth;
+                    Ok(())
+                }
+                None => Err(SessionRefusal::HostDispatchFifoUnderflow { endpoint_id }),
+            }
+        }
+
+        /// Admit one more immutable reply snapshot of `bytes` on this session.
+        ///
+        /// The refusal is the point at which the caller drops its lock and
+        /// event-waits for the oldest exact C51 owner (line 2138-2140) — it is not
+        /// a resource failure and must never become a retry loop.
+        pub fn admit_snapshot_bytes(&mut self, bytes: u64) -> Result<(), SessionRefusal> {
+            if self.phase == SessionPhase::Draining {
+                return Err(SessionRefusal::SessionDraining);
+            }
+            admit_snapshot(self.live_snapshots, self.live_snapshot_bytes, bytes)
+                .map_err(SessionRefusal::Hnr2Capacity)?;
+            self.live_snapshots += 1;
+            self.live_snapshot_bytes = self.live_snapshot_bytes.saturating_add(bytes);
+            Ok(())
+        }
+
+        /// One snapshot consumed or cancelled.
+        pub fn release_snapshot_bytes(&mut self, bytes: u64) -> Result<(), SessionRefusal> {
+            let Some(live) = self.live_snapshots.checked_sub(1) else {
+                return Err(SessionRefusal::SnapshotAccountingUnderflow);
+            };
+            let Some(live_bytes) = self.live_snapshot_bytes.checked_sub(bytes) else {
+                return Err(SessionRefusal::SnapshotAccountingUnderflow);
+            };
+            self.live_snapshots = live;
+            self.live_snapshot_bytes = live_bytes;
+            Ok(())
+        }
+
+        pub const fn live_snapshots(&self) -> u32 {
+            self.live_snapshots
+        }
+
+        pub const fn live_snapshot_bytes(&self) -> u64 {
+            self.live_snapshot_bytes
+        }
+
+        /// The largest snapshot one session may hold, re-exported so a caller
+        /// never re-derives the cap.
+        pub const MAX_SNAPSHOT_BYTES: u64 = HELIOS_HVR1_MAX_SNAPSHOT_BYTES;
+
+        /// Declare one physical endpoint, or re-declare it identically.
+        ///
+        /// ⚠ This is the KMD's only source of endpoint descriptors today. A
+        /// record-only translator creates no HVC1 queue context (section 10.7,
+        /// lines 1752-1755), and neither the INIT request nor its reply carries an
+        /// endpoint array, so nothing on the wire tells the KMD a session's queue
+        /// topology before the first HQA1 arrives. The first attach on an ordinal
+        /// therefore *declares* it and every later one is compared against that
+        /// record; a conflict is refused. See the cross-lane request in
+        /// `ROADMAP.md` — if the descriptors are to be KMD-authored, INIT needs a
+        /// field it does not have.
+        pub fn declare_endpoint(
+            &mut self,
+            endpoint: HeliosTranslationEndpointV1,
+        ) -> Result<(), SessionRefusal> {
+            let existing = self.endpoint(endpoint.endpoint_id)?;
+            if existing.descriptor.endpoint_id != 0 {
+                if existing.descriptor != endpoint {
+                    return Err(SessionRefusal::EndpointDescriptorConflict {
+                        endpoint_id: endpoint.endpoint_id,
+                    });
+                }
+                return Ok(());
+            }
+            let capacity = self.endpoint_capacity;
+            match self.endpoints.get_mut((endpoint.endpoint_id - 1) as usize) {
+                Some(slot) => slot.descriptor = endpoint,
+                None => {
+                    return Err(SessionRefusal::EndpointOutOfRange {
+                        found: endpoint.endpoint_id,
+                        capacity,
+                    })
+                }
+            }
+            Ok(())
+        }
+
+        /// The one-time HQA1 attach `DxgkDdiCreateContext` performs.
+        ///
+        /// Mutates only on success: the context-generation watermark advances and
+        /// the endpoint is declared, so a refused packet leaves nothing behind for
+        /// the next one to trip over.
+        pub fn attach(
+            &mut self,
+            packet: &HeliosQueueAttachV1,
+        ) -> Result<HeliosAttachAdmission, SessionRefusal> {
+            match self.phase {
+                SessionPhase::Draining => {
+                    return Err(SessionRefusal::Attach(AttachRefusal::Capability(
+                        CapabilityRefusal::SessionInvalidated,
+                    )))
+                }
+                SessionPhase::Provisional => return Err(SessionRefusal::SessionProvisional),
+                SessionPhase::Live => {}
+            }
+            if self.attached_contexts == u32::MAX {
+                return Err(SessionRefusal::AttachedContextOverflow);
+            }
+
+            // The endpoint the packet claims, as this session records it — or, on
+            // the first attach to that ordinal, the packet's own descriptor. Shape
+            // is validated either way by `HeliosQueueAttachV1::validate`, which
+            // runs `HeliosTranslationEndpointV1::validate` on whatever is here.
+            let recorded = self.endpoint(packet.endpoint_id)?;
+            let expect_endpoint = if recorded.descriptor.endpoint_id == 0 {
+                HeliosTranslationEndpointV1 {
+                    endpoint_id: packet.endpoint_id,
+                    engine_class: packet.engine_class,
+                    queue_family: packet.queue_family,
+                    queue_index: packet.queue_index,
+                }
+            } else {
+                recorded.descriptor
+            };
+
+            let expect = HeliosAttachExpectation {
+                package_generation: self.package_generation,
+                session_generation: self.session_generation,
+                capability: self.capability,
+                endpoint: expect_endpoint,
+                endpoint_capacity: self.endpoint_capacity,
+                highest_context_generation: self.highest_context_generation,
+            };
+            let admission = packet.validate(&expect).map_err(SessionRefusal::Attach)?;
+
+            self.declare_endpoint(expect_endpoint)?;
+            self.highest_context_generation = admission.context_generation;
+            self.attached_contexts += 1;
+            Ok(admission)
+        }
+
+        /// One attached outer context went away. The watermark deliberately does
+        /// not move: a generation is "never reused within this HTS1 session", so a
+        /// dead context's number stays spent.
+        pub fn detach(&mut self, context_generation: u64) -> Result<(), SessionRefusal> {
+            if context_generation == 0 || context_generation > self.highest_context_generation {
+                return Err(SessionRefusal::DetachUnknownContext { context_generation });
+            }
+            match self.attached_contexts.checked_sub(1) {
+                Some(next) => {
+                    self.attached_contexts = next;
+                    Ok(())
+                }
+                None => Err(SessionRefusal::DetachUnknownContext { context_generation }),
+            }
+        }
+
+        /// Which slot a reply offset selects.
+        fn slot_index(reply_offset: u64) -> Result<usize, SessionRefusal> {
+            let index = (reply_offset / HELIOS_HVM1_REPLY_SLOT_BYTES) as usize;
+            if index >= REPLY_SLOTS {
+                return Err(SessionRefusal::ControlRenderSlotIndexOutOfRange { found: index });
+            }
+            Ok(index)
+        }
+
+        /// The session-level admission of one control-context `DxgkDdiRender`.
+        ///
+        /// Runs on a `Provisional` session too: the INIT that makes a session live
+        /// is itself a control Render.
+        pub fn admit_control_render(
+            &mut self,
+            request: &ControlRenderRequest,
+        ) -> Result<ControlRenderAdmission, SessionRefusal> {
+            if self.phase == SessionPhase::Draining {
+                return Err(SessionRefusal::SessionDraining);
+            }
+            if !request.on_control_context {
+                return Err(SessionRefusal::ControlRenderNotOnControlContext);
+            }
+            if !request.has_reply {
+                if request.allocation_count != 0 {
+                    return Err(SessionRefusal::ControlRenderAllocationWithoutReply {
+                        found: request.allocation_count,
+                    });
+                }
+                return Ok(ControlRenderAdmission {
+                    slot_index: None,
+                    slot_generation: 0,
+                });
+            }
+
+            let Some(pool) = self.pool else {
+                return Err(SessionRefusal::ReplyPoolNotBound);
+            };
+            if request.allocation_count != 1 {
+                return Err(SessionRefusal::ControlRenderAllocationCountNotOne {
+                    found: request.allocation_count,
+                });
+            }
+            if !request.names_reply_pool {
+                return Err(SessionRefusal::ControlRenderForeignAllocation);
+            }
+            if request.expected_allocation_generation != pool.allocation_generation {
+                return Err(SessionRefusal::ControlRenderPoolGenerationStale {
+                    found: request.expected_allocation_generation,
+                    expected: pool.allocation_generation,
+                });
+            }
+            // Exactly WRITE, not "WRITE among others": READ on the reply slot
+            // would be the control carrier reading a buffer the host is still
+            // writing, and an unknown bit is `protocol`'s own hard reject.
+            if request.access_flags != HELIOS_HNR2_ACCESS_WRITE {
+                return Err(SessionRefusal::ControlRenderAccessNotWrite {
+                    found: request.access_flags,
+                });
+            }
+
+            let index = Self::slot_index(request.reply_offset)?;
+            let slot = pool.slots[index];
+            if slot.state != SlotState::Idle {
+                return Err(SessionRefusal::ControlRenderSlotBusy {
+                    in_flight: slot.generation,
+                });
+            }
+            if request.reply_slot_generation <= slot.retired_generation {
+                return Err(SessionRefusal::ControlRenderSlotGenerationStale {
+                    found: request.reply_slot_generation,
+                    watermark: slot.retired_generation,
+                });
+            }
+
+            let Some(pool_mut) = self.pool.as_mut() else {
+                return Err(SessionRefusal::ReplyPoolNotBound);
+            };
+            pool_mut.slots[index] = ReplySlot {
+                state: SlotState::InFlight,
+                generation: request.reply_slot_generation,
+                retired_generation: slot.retired_generation,
+                owner_context_generation: request.owner_context_generation,
+                batch_token: request.batch_token,
+                reply_offset: request.reply_offset,
+                reply_capacity_bytes: request.reply_capacity_bytes,
+                c51_value: 0,
+            };
+            Ok(ControlRenderAdmission {
+                slot_index: Some(index),
+                slot_generation: request.reply_slot_generation,
+            })
+        }
+
+        /// The host published this slot's reply and its C51 value is known.
+        pub fn publish_slot(
+            &mut self,
+            slot_index: usize,
+            slot_generation: u64,
+            c51_value: u64,
+        ) -> Result<(), SessionRefusal> {
+            let slot = self.slot_in_flight(slot_index, slot_generation)?;
+            slot.state = SlotState::Published;
+            slot.c51_value = c51_value;
+            Ok(())
+        }
+
+        /// The CPU consumed the reply and the slot generation retires. Only now
+        /// is the slot reusable.
+        pub fn retire_slot(
+            &mut self,
+            slot_index: usize,
+            slot_generation: u64,
+        ) -> Result<(), SessionRefusal> {
+            let slot = self.slot_in_flight(slot_index, slot_generation)?;
+            if slot.state != SlotState::Published {
+                return Err(SessionRefusal::ControlRenderSlotBusy {
+                    in_flight: slot.generation,
+                });
+            }
+            *slot = ReplySlot {
+                retired_generation: slot_generation,
+                ..ReplySlot::IDLE
+            };
+            Ok(())
+        }
+
+        fn slot_in_flight(
+            &mut self,
+            slot_index: usize,
+            slot_generation: u64,
+        ) -> Result<&mut ReplySlot, SessionRefusal> {
+            if self.phase == SessionPhase::Draining {
+                return Err(SessionRefusal::SessionDraining);
+            }
+            let Some(pool) = self.pool.as_mut() else {
+                return Err(SessionRefusal::ReplyPoolNotBound);
+            };
+            let Some(slot) = pool.slots.get_mut(slot_index) else {
+                return Err(SessionRefusal::ControlRenderSlotIndexOutOfRange { found: slot_index });
+            };
+            if slot.state == SlotState::Idle || slot.generation != slot_generation {
+                return Err(SessionRefusal::ControlRenderSlotGenerationUnknown {
+                    found: slot_generation,
+                });
+            }
+            Ok(slot)
+        }
+    }
+
+    /// The engine class an endpoint ordinal is admitted with, decoded once.
+    /// A convenience for `kmd_render`'s counter naming; it re-decodes nothing the
+    /// attach path did not already validate.
+    pub fn engine_class_of(
+        endpoint: &HeliosTranslationEndpointV1,
+        endpoint_capacity: u32,
+    ) -> Result<HeliosEngineClass, SessionRefusal> {
+        endpoint
+            .validate(endpoint_capacity)
+            .map_err(|reason| SessionRefusal::Attach(AttachRefusal::Endpoint(reason)))
+    }
+
+    /// The capacity limit a [`HeliosCapacityRefusal`] names, for a counter label.
+    pub const fn capacity_limit_code(limit: HeliosCapacityLimit) -> u32 {
+        match limit {
+            HeliosCapacityLimit::SessionsPerProcess => 1,
+            HeliosCapacityLimit::RingIndex => 2,
+            HeliosCapacityLimit::OutstandingContextBatches => 3,
+            HeliosCapacityLimit::ContextBatchBytes => 4,
+            HeliosCapacityLimit::HostDispatchFifoDepth => 5,
+        }
+    }
+
+    /// Package/session generation cross-check for a later record (HOB1/HOS1)
+    /// that repeats the session generation as an anti-stale check.
+    pub fn check_session_generation(found: u64, session: &TranslationSession) -> Result<(), SessionRefusal> {
+        check_generation_match(found, session.session_generation).map_err(|reason| {
+            SessionRefusal::Init(InitRefusal::Generation {
+                field: GenerationField::Session,
+                reason,
+            })
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use helios_protocol::native_render::{
+            HELIOS_HNR2_ACCESS_READ, HELIOS_HVM1_REPLY_SLOT_BYTES,
+        };
+        use helios_protocol::translation_session::{
+            EndpointRefusal, HeliosOuterContextKind, HELIOS_ENGINE_CLASS_COMPUTE,
+            HELIOS_ENGINE_CLASS_GRAPHICS, HELIOS_HQA1_FLAGS_MASK, HELIOS_HQA1_MAGIC,
+            HELIOS_HQA1_SIZE, HELIOS_HTS1_MAX_HOST_DISPATCH_FIFO_DEPTH,
+            HELIOS_HTS1_MAX_SESSIONS_PER_PROCESS,
+        };
+
+        const PKG: u64 = 0x2026_0810_0000_0001;
+        const CAPSET: u32 = helios_protocol::virtio_gpu::VIRTIO_GPU_CAPSET_VENUS;
+        const POOL_GEN: u64 = 0x5EED_0001;
+        const CAP: HeliosSessionCapability = HeliosSessionCapability {
+            low: 0x0123_4567_89AB_CDEF,
+            high: 0xFEDC_BA98_7654_3210,
+        };
+
+        fn endpoint(id: u32) -> HeliosTranslationEndpointV1 {
+            HeliosTranslationEndpointV1::new(id, HeliosEngineClass::Graphics, 0, 0)
+        }
+
+        /// A session taken all the way to `Live` with a bound pool.
+        fn live_session(endpoint_capacity: u32) -> TranslationSession {
+            let mut s = TranslationSession::new_provisional(PKG, CAPSET);
+            s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN)
+                .expect("pool binds");
+            let request = HeliosTranslationSessionInitV1::new(PKG, CAPSET, endpoint_capacity);
+            let requested = s.admit_init(&request).expect("INIT admitted");
+            s.complete_init(requested, endpoint_capacity, 7, CAP)
+                .expect("INIT completes");
+            s
+        }
+
+        fn attach_packet(endpoint_id: u32, context_generation: u64) -> HeliosQueueAttachV1 {
+            HeliosQueueAttachV1::new(
+                PKG,
+                7,
+                CAP,
+                endpoint(endpoint_id),
+                context_generation,
+                HeliosOuterContextKind::D3d11PhysicalRender,
+            )
+        }
+
+        fn reply_request(slot: usize, slot_generation: u64) -> ControlRenderRequest {
+            ControlRenderRequest {
+                on_control_context: true,
+                has_reply: true,
+                allocation_count: 1,
+                names_reply_pool: true,
+                expected_allocation_generation: POOL_GEN,
+                access_flags: HELIOS_HNR2_ACCESS_WRITE,
+                reply_offset: slot as u64 * HELIOS_HVM1_REPLY_SLOT_BYTES,
+                reply_capacity_bytes: 80 + 4096,
+                reply_slot_generation: slot_generation,
+                batch_token: 1,
+                owner_context_generation: 0,
+            }
+        }
+
+        // ── the per-process session ledger ────────────────────────────────
+
+        #[test]
+        fn the_session_ledger_admits_exactly_the_protocol_cap() {
+            let mut ledger = ProcessSessionLedger::new();
+            for _ in 0..HELIOS_HTS1_MAX_SESSIONS_PER_PROCESS {
+                ledger.admit().expect("under the cap");
+            }
+            assert_eq!(ledger.live(), HELIOS_HTS1_MAX_SESSIONS_PER_PROCESS);
+            assert!(matches!(
+                ledger.admit(),
+                Err(SessionRefusal::Capacity(HeliosCapacityRefusal {
+                    limit: HeliosCapacityLimit::SessionsPerProcess,
+                    ..
+                }))
+            ));
+            // Refusing must not have consumed a slot, or the cap would ratchet
+            // down every time a process hit it.
+            assert_eq!(ledger.live(), HELIOS_HTS1_MAX_SESSIONS_PER_PROCESS);
+            ledger.release().expect("one goes away");
+            ledger.admit().expect("and the slot is reusable");
+        }
+
+        #[test]
+        fn releasing_a_session_that_was_never_admitted_is_a_refusal_not_a_wrap() {
+            let mut ledger = ProcessSessionLedger::new();
+            assert_eq!(
+                ledger.release(),
+                Err(SessionRefusal::SessionLedgerUnderflow)
+            );
+            assert_eq!(ledger.live(), 0);
+        }
+
+        // ── the session-generation source ─────────────────────────────────
+
+        #[test]
+        fn session_generations_are_nonzero_and_strictly_increasing() {
+            let mut src = SessionGenerationSource::new();
+            let a = src.mint().expect("first");
+            let b = src.mint().expect("second");
+            assert_ne!(a, 0);
+            assert!(b > a);
+        }
+
+        #[test]
+        fn session_generation_exhaustion_refuses_rather_than_saturating() {
+            let mut src = SessionGenerationSource::new();
+            // Drive the counter to the wrap sentinel the way `mint` sets it.
+            for _ in 0..2 {
+                src.mint().expect("warm up");
+            }
+            src = SessionGenerationSource { next: u64::MAX };
+            assert_eq!(src.mint(), Ok(u64::MAX));
+            assert_eq!(
+                src.mint(),
+                Err(SessionRefusal::SessionGenerationSpaceExhausted)
+            );
+            // And it stays refused: a second caller must not get 0 either.
+            assert_eq!(
+                src.mint(),
+                Err(SessionRefusal::SessionGenerationSpaceExhausted)
+            );
+        }
+
+        // ── the reply pool ────────────────────────────────────────────────
+
+        #[test]
+        fn the_reply_pool_binds_once_and_only_as_role_one() {
+            let mut s = TranslationSession::new_provisional(PKG, CAPSET);
+            assert_eq!(
+                s.bind_reply_pool(
+                    Hvm1Role::VulkanHostVisible,
+                    HELIOS_HVM1_REPLY_POOL_BYTES,
+                    POOL_GEN
+                ),
+                Err(SessionRefusal::ReplyPoolRoleMismatch {
+                    found: Hvm1Role::VulkanHostVisible.to_u32()
+                })
+            );
+            assert_eq!(
+                s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES / 2, POOL_GEN),
+                Err(SessionRefusal::ReplyPoolSizeMismatch {
+                    found: HELIOS_HVM1_REPLY_POOL_BYTES / 2
+                })
+            );
+            assert_eq!(
+                s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, 0),
+                Err(SessionRefusal::ReplyPoolGenerationZero)
+            );
+            // None of the three refusals may have left a pool behind.
+            assert!(s.pool().is_none());
+
+            s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN)
+                .expect("binds");
+            assert_eq!(
+                s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN),
+                Err(SessionRefusal::ReplyPoolAlreadyBound)
+            );
+        }
+
+        // ── INIT ──────────────────────────────────────────────────────────
+
+        #[test]
+        fn init_refuses_before_the_pool_is_bound() {
+            let s = TranslationSession::new_provisional(PKG, CAPSET);
+            let request = HeliosTranslationSessionInitV1::new(PKG, CAPSET, 4);
+            assert_eq!(
+                s.admit_init(&request),
+                Err(SessionRefusal::ReplyPoolNotBound)
+            );
+        }
+
+        #[test]
+        fn init_refuses_a_foreign_package_or_capset() {
+            let mut s = TranslationSession::new_provisional(PKG, CAPSET);
+            s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN)
+                .unwrap();
+            assert!(matches!(
+                s.admit_init(&HeliosTranslationSessionInitV1::new(PKG + 1, CAPSET, 4)),
+                Err(SessionRefusal::Init(InitRefusal::Generation {
+                    field: GenerationField::Package,
+                    ..
+                }))
+            ));
+            assert!(matches!(
+                s.admit_init(&HeliosTranslationSessionInitV1::new(PKG, CAPSET + 1, 4)),
+                Err(SessionRefusal::Init(InitRefusal::CapsetMismatch { .. }))
+            ));
+        }
+
+        #[test]
+        fn init_runs_exactly_once_per_session() {
+            let mut s = live_session(4);
+            assert_eq!(s.phase(), SessionPhase::Live);
+            let request = HeliosTranslationSessionInitV1::new(PKG, CAPSET, 4);
+            assert_eq!(
+                s.admit_init(&request),
+                Err(SessionRefusal::SessionAlreadyInitialised)
+            );
+            assert_eq!(
+                s.complete_init(4, 4, 9, CAP),
+                Err(SessionRefusal::SessionAlreadyInitialised)
+            );
+            // And the second attempt did not overwrite the first's identity.
+            assert_eq!(s.session_generation(), 7);
+        }
+
+        #[test]
+        fn init_may_grant_fewer_endpoints_than_requested_but_never_more() {
+            let mut s = TranslationSession::new_provisional(PKG, CAPSET);
+            s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN)
+                .unwrap();
+            assert!(matches!(
+                s.complete_init(4, 5, 7, CAP),
+                Err(SessionRefusal::Init(
+                    InitRefusal::EndpointCapacityExceedsRequest { .. }
+                ))
+            ));
+            // The refused reply must not have made the session live.
+            assert_eq!(s.phase(), SessionPhase::Provisional);
+            s.complete_init(4, 2, 7, CAP).expect("fewer is fine");
+            assert_eq!(s.endpoint_capacity(), 2);
+        }
+
+        #[test]
+        fn init_refuses_the_all_zero_capability_and_a_zero_generation() {
+            let mut s = TranslationSession::new_provisional(PKG, CAPSET);
+            s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN)
+                .unwrap();
+            assert_eq!(
+                s.complete_init(4, 4, 7, HeliosSessionCapability::INVALID),
+                Err(SessionRefusal::CapabilityIsInvalidSentinel)
+            );
+            assert!(matches!(
+                s.complete_init(4, 4, 0, CAP),
+                Err(SessionRefusal::Init(InitRefusal::Generation {
+                    field: GenerationField::Session,
+                    reason: GenerationRefusal::Zero,
+                }))
+            ));
+            assert_eq!(s.phase(), SessionPhase::Provisional);
+        }
+
+        #[test]
+        fn a_capability_with_one_zero_half_is_still_a_live_capability() {
+            // A CSPRNG may legitimately produce a zero half; only the all-zero
+            // pair is the invalidated sentinel.
+            let mut s = TranslationSession::new_provisional(PKG, CAPSET);
+            s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN)
+                .unwrap();
+            let half = HeliosSessionCapability::from_halves(0, 0xDEAD_BEEF);
+            s.complete_init(4, 4, 7, half).expect("admitted");
+            let mut packet = attach_packet(1, 1);
+            packet.capability_low = 0;
+            packet.capability_high = 0xDEAD_BEEF;
+            s.attach(&packet).expect("attaches");
+        }
+
+        // ── HQA1 attach ───────────────────────────────────────────────────
+
+        #[test]
+        fn attach_refuses_before_init() {
+            let mut s = TranslationSession::new_provisional(PKG, CAPSET);
+            assert_eq!(
+                s.attach(&attach_packet(1, 1)),
+                Err(SessionRefusal::SessionProvisional)
+            );
+        }
+
+        #[test]
+        fn attach_admits_then_refuses_a_repeated_context_generation() {
+            let mut s = live_session(4);
+            let admission = s.attach(&attach_packet(1, 10)).expect("first attach");
+            assert_eq!(admission.context_generation, 10);
+            assert_eq!(admission.endpoint_id, 1);
+            assert_eq!(admission.engine_class, HeliosEngineClass::Graphics);
+            assert_eq!(admission.kind, HeliosOuterContextKind::D3d11PhysicalRender);
+            assert_eq!(s.attached_contexts(), 1);
+
+            for repeat in [10u64, 9, 1] {
+                assert!(matches!(
+                    s.attach(&attach_packet(1, repeat)),
+                    Err(SessionRefusal::Attach(AttachRefusal::Generation {
+                        field: GenerationField::Context,
+                        reason: GenerationRefusal::NotMonotonic { .. },
+                    }))
+                ));
+            }
+            assert_eq!(s.attached_contexts(), 1);
+            s.attach(&attach_packet(1, 11)).expect("strictly greater");
+            assert_eq!(s.attached_contexts(), 2);
+        }
+
+        #[test]
+        fn a_dead_contexts_generation_stays_spent() {
+            let mut s = live_session(4);
+            s.attach(&attach_packet(1, 10)).unwrap();
+            s.detach(10).expect("context goes away");
+            assert_eq!(s.attached_contexts(), 0);
+            assert!(matches!(
+                s.attach(&attach_packet(1, 10)),
+                Err(SessionRefusal::Attach(AttachRefusal::Generation { .. }))
+            ));
+            assert_eq!(s.highest_context_generation(), 10);
+        }
+
+        #[test]
+        fn detach_refuses_a_generation_the_session_never_admitted() {
+            let mut s = live_session(4);
+            s.attach(&attach_packet(1, 10)).unwrap();
+            assert_eq!(
+                s.detach(0),
+                Err(SessionRefusal::DetachUnknownContext {
+                    context_generation: 0
+                })
+            );
+            assert_eq!(
+                s.detach(11),
+                Err(SessionRefusal::DetachUnknownContext {
+                    context_generation: 11
+                })
+            );
+            assert_eq!(s.attached_contexts(), 1);
+        }
+
+        #[test]
+        fn attach_refuses_a_foreign_capability_a_stale_session_and_a_bad_package() {
+            let mut s = live_session(4);
+            let mut wrong_cap = attach_packet(1, 10);
+            wrong_cap.capability_low ^= 1;
+            assert_eq!(
+                s.attach(&wrong_cap),
+                Err(SessionRefusal::Attach(AttachRefusal::Capability(
+                    CapabilityRefusal::Mismatch
+                )))
+            );
+
+            let mut wrong_session = attach_packet(1, 10);
+            wrong_session.session_generation = 8;
+            assert!(matches!(
+                s.attach(&wrong_session),
+                Err(SessionRefusal::Attach(AttachRefusal::Generation {
+                    field: GenerationField::Session,
+                    ..
+                }))
+            ));
+
+            let mut wrong_pkg = attach_packet(1, 10);
+            wrong_pkg.package_generation = PKG + 1;
+            assert!(matches!(
+                s.attach(&wrong_pkg),
+                Err(SessionRefusal::Attach(AttachRefusal::Generation {
+                    field: GenerationField::Package,
+                    ..
+                }))
+            ));
+
+            // Not one of the three may have advanced the watermark.
+            assert_eq!(s.highest_context_generation(), 0);
+            assert_eq!(s.attached_contexts(), 0);
+        }
+
+        #[test]
+        fn attach_refuses_a_malformed_packet_shape() {
+            let mut s = live_session(4);
+            for mutate in [
+                (|p: &mut HeliosQueueAttachV1| p.magic ^= 1) as fn(&mut HeliosQueueAttachV1),
+                |p| p.abi_version += 1,
+                |p| p.struct_size += 1,
+                |p| p.reserved = 1,
+                |p| p.flags = 0,
+                |p| p.flags = HELIOS_HQA1_FLAGS_MASK,
+                |p| p.flags = 1 << 5,
+            ] {
+                let mut packet = attach_packet(1, 10);
+                mutate(&mut packet);
+                assert!(
+                    matches!(s.attach(&packet), Err(SessionRefusal::Attach(_))),
+                    "a mutated HQA1 must be refused"
+                );
+            }
+            assert_eq!(s.highest_context_generation(), 0);
+        }
+
+        #[test]
+        fn an_endpoint_ordinal_outside_the_granted_capacity_is_refused() {
+            let mut s = live_session(2);
+            assert_eq!(
+                s.attach(&attach_packet(0, 10)),
+                Err(SessionRefusal::EndpointOutOfRange {
+                    found: 0,
+                    capacity: 2
+                })
+            );
+            assert_eq!(
+                s.attach(&attach_packet(3, 10)),
+                Err(SessionRefusal::EndpointOutOfRange {
+                    found: 3,
+                    capacity: 2
+                })
+            );
+            s.attach(&attach_packet(2, 10)).expect("the last ordinal");
+        }
+
+        #[test]
+        fn the_first_attach_declares_an_endpoint_and_later_ones_are_cross_checked() {
+            let mut s = live_session(4);
+            s.attach(&attach_packet(1, 10)).expect("declares endpoint 1");
+            assert_eq!(s.endpoint(1).unwrap().descriptor, endpoint(1));
+
+            // Same ordinal, different engine class: refused as a mismatch against
+            // what the session recorded, not silently re-declared.
+            let mut other_class = attach_packet(1, 11);
+            other_class.engine_class = HELIOS_ENGINE_CLASS_COMPUTE;
+            assert_eq!(
+                s.attach(&other_class),
+                Err(SessionRefusal::Attach(AttachRefusal::EngineClassMismatch {
+                    found: HELIOS_ENGINE_CLASS_COMPUTE,
+                    expected: HELIOS_ENGINE_CLASS_GRAPHICS,
+                }))
+            );
+
+            // Same ordinal, different diagnostic queue index: also a mismatch.
+            let mut other_index = attach_packet(1, 11);
+            other_index.queue_index = 3;
+            assert_eq!(
+                s.attach(&other_index),
+                Err(SessionRefusal::Attach(AttachRefusal::QueueIndexMismatch {
+                    found: 3,
+                    expected: 0,
+                }))
+            );
+
+            // A different ordinal is free to have its own class.
+            let mut second = attach_packet(2, 11);
+            second.engine_class = HELIOS_ENGINE_CLASS_COMPUTE;
+            second.queue_family = 1;
+            s.attach(&second).expect("endpoint 2 is its own declaration");
+            assert_eq!(
+                s.endpoint(2).unwrap().descriptor.engine_class,
+                HELIOS_ENGINE_CLASS_COMPUTE
+            );
+            // Declaring 2 must not have disturbed 1.
+            assert_eq!(s.endpoint(1).unwrap().descriptor, endpoint(1));
+        }
+
+        #[test]
+        fn an_endpoint_may_never_carry_the_hvc1_control_sentinel() {
+            let mut s = live_session(4);
+            let mut packet = attach_packet(1, 10);
+            packet.queue_family = u32::MAX;
+            packet.queue_index = u32::MAX;
+            assert_eq!(
+                s.attach(&packet),
+                Err(SessionRefusal::Attach(AttachRefusal::Endpoint(
+                    EndpointRefusal::ControlSentinelEndpoint
+                )))
+            );
+        }
+
+        #[test]
+        fn declare_endpoint_is_idempotent_and_refuses_a_conflict() {
+            let mut s = live_session(4);
+            s.declare_endpoint(endpoint(1)).expect("declares");
+            s.declare_endpoint(endpoint(1)).expect("re-declares identically");
+            let conflicting =
+                HeliosTranslationEndpointV1::new(1, HeliosEngineClass::Copy, 0, 0);
+            assert_eq!(
+                s.declare_endpoint(conflicting),
+                Err(SessionRefusal::EndpointDescriptorConflict { endpoint_id: 1 })
+            );
+        }
+
+        // ── poisoning ─────────────────────────────────────────────────────
+
+        #[test]
+        fn draining_invalidates_the_capability_before_anything_else() {
+            let mut s = live_session(4);
+            s.attach(&attach_packet(1, 10)).unwrap();
+            s.begin_draining();
+            assert_eq!(s.phase(), SessionPhase::Draining);
+            // A packet carrying the exact capability the session issued is now
+            // refused as an invalidated session, not as a mismatch.
+            assert_eq!(
+                s.attach(&attach_packet(1, 11)),
+                Err(SessionRefusal::Attach(AttachRefusal::Capability(
+                    CapabilityRefusal::SessionInvalidated
+                )))
+            );
+            assert_eq!(
+                s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN),
+                Err(SessionRefusal::SessionDraining)
+            );
+            assert_eq!(
+                s.admit_control_render(&reply_request(0, 1)),
+                Err(SessionRefusal::SessionDraining)
+            );
+        }
+
+        #[test]
+        fn draining_never_marks_a_reply_complete() {
+            let mut s = live_session(4);
+            let admitted = s.admit_control_render(&reply_request(0, 1)).unwrap();
+            s.begin_draining();
+            let slot = s.pool().unwrap().slots[admitted.slot_index.unwrap()];
+            assert_eq!(slot.state, SlotState::InFlight);
+            assert_eq!(slot.retired_generation, 0);
+            assert_eq!(
+                s.publish_slot(0, 1, 5),
+                Err(SessionRefusal::SessionDraining)
+            );
+        }
+
+        // ── the control-context Render ────────────────────────────────────
+
+        #[test]
+        fn a_control_render_must_arrive_on_the_control_context() {
+            let mut s = live_session(4);
+            let mut request = reply_request(0, 1);
+            request.on_control_context = false;
+            assert_eq!(
+                s.admit_control_render(&request),
+                Err(SessionRefusal::ControlRenderNotOnControlContext)
+            );
+        }
+
+        #[test]
+        fn the_reply_slot_is_the_only_allocation_this_carrier_ever_lists() {
+            let mut s = live_session(4);
+
+            let mut foreign = reply_request(0, 1);
+            foreign.names_reply_pool = false;
+            assert_eq!(
+                s.admit_control_render(&foreign),
+                Err(SessionRefusal::ControlRenderForeignAllocation)
+            );
+
+            let mut two = reply_request(0, 1);
+            two.allocation_count = 2;
+            assert_eq!(
+                s.admit_control_render(&two),
+                Err(SessionRefusal::ControlRenderAllocationCountNotOne { found: 2 })
+            );
+
+            let mut none = reply_request(0, 1);
+            none.allocation_count = 0;
+            assert_eq!(
+                s.admit_control_render(&none),
+                Err(SessionRefusal::ControlRenderAllocationCountNotOne { found: 0 })
+            );
+
+            let mut no_reply = reply_request(0, 1);
+            no_reply.has_reply = false;
+            no_reply.allocation_count = 1;
+            assert_eq!(
+                s.admit_control_render(&no_reply),
+                Err(SessionRefusal::ControlRenderAllocationWithoutReply { found: 1 })
+            );
+
+            let mut bare = reply_request(0, 1);
+            bare.has_reply = false;
+            bare.allocation_count = 0;
+            assert_eq!(
+                s.admit_control_render(&bare),
+                Ok(ControlRenderAdmission {
+                    slot_index: None,
+                    slot_generation: 0
+                })
+            );
+        }
+
+        #[test]
+        fn a_control_render_must_name_the_pools_current_generation_and_write_access() {
+            let mut s = live_session(4);
+
+            let mut stale = reply_request(0, 1);
+            stale.expected_allocation_generation = POOL_GEN - 1;
+            assert_eq!(
+                s.admit_control_render(&stale),
+                Err(SessionRefusal::ControlRenderPoolGenerationStale {
+                    found: POOL_GEN - 1,
+                    expected: POOL_GEN,
+                })
+            );
+
+            for access in [
+                0,
+                HELIOS_HNR2_ACCESS_READ,
+                HELIOS_HNR2_ACCESS_READ | HELIOS_HNR2_ACCESS_WRITE,
+            ] {
+                let mut wrong = reply_request(0, 1);
+                wrong.access_flags = access;
+                assert_eq!(
+                    s.admit_control_render(&wrong),
+                    Err(SessionRefusal::ControlRenderAccessNotWrite { found: access })
+                );
+            }
+        }
+
+        #[test]
+        fn one_checkout_one_render_and_a_slot_is_reusable_only_after_retire() {
+            let mut s = live_session(4);
+            let admitted = s.admit_control_render(&reply_request(0, 1)).unwrap();
+            assert_eq!(admitted.slot_index, Some(0));
+
+            // A second Render naming the same slot while one is in flight.
+            assert_eq!(
+                s.admit_control_render(&reply_request(0, 2)),
+                Err(SessionRefusal::ControlRenderSlotBusy { in_flight: 1 })
+            );
+
+            // Published is not retired: the CPU has not consumed it yet.
+            s.publish_slot(0, 1, 42).expect("host published");
+            assert_eq!(
+                s.admit_control_render(&reply_request(0, 2)),
+                Err(SessionRefusal::ControlRenderSlotBusy { in_flight: 1 })
+            );
+            assert_eq!(s.pool().unwrap().slots[0].c51_value, 42);
+
+            s.retire_slot(0, 1).expect("CPU consumed it");
+            assert_eq!(s.pool().unwrap().slots[0].state, SlotState::Idle);
+            assert_eq!(s.pool().unwrap().slots[0].retired_generation, 1);
+            s.admit_control_render(&reply_request(0, 2))
+                .expect("the slot is reusable now");
+        }
+
+        #[test]
+        fn a_retired_slot_generation_can_never_come_back() {
+            let mut s = live_session(4);
+            s.admit_control_render(&reply_request(0, 5)).unwrap();
+            s.publish_slot(0, 5, 1).unwrap();
+            s.retire_slot(0, 5).unwrap();
+            for replay in [1u64, 5] {
+                assert_eq!(
+                    s.admit_control_render(&reply_request(0, replay)),
+                    Err(SessionRefusal::ControlRenderSlotGenerationStale {
+                        found: replay,
+                        watermark: 5,
+                    })
+                );
+            }
+            s.admit_control_render(&reply_request(0, 6))
+                .expect("strictly greater");
+        }
+
+        #[test]
+        fn retiring_out_of_order_or_with_the_wrong_generation_is_refused() {
+            let mut s = live_session(4);
+            s.admit_control_render(&reply_request(0, 1)).unwrap();
+            assert_eq!(
+                s.publish_slot(0, 2, 7),
+                Err(SessionRefusal::ControlRenderSlotGenerationUnknown { found: 2 })
+            );
+            // Retiring before the host published is refused: the reply bytes are
+            // not there yet.
+            assert_eq!(
+                s.retire_slot(0, 1),
+                Err(SessionRefusal::ControlRenderSlotBusy { in_flight: 1 })
+            );
+            // An idle slot has nothing to publish.
+            assert_eq!(
+                s.publish_slot(1, 1, 7),
+                Err(SessionRefusal::ControlRenderSlotGenerationUnknown { found: 1 })
+            );
+            assert_eq!(
+                s.retire_slot(REPLY_SLOTS, 1),
+                Err(SessionRefusal::ControlRenderSlotIndexOutOfRange {
+                    found: REPLY_SLOTS
+                })
+            );
+        }
+
+        #[test]
+        fn all_four_slots_are_independent() {
+            let mut s = live_session(4);
+            for slot in 0..REPLY_SLOTS {
+                let admitted = s.admit_control_render(&reply_request(slot, 1)).unwrap();
+                assert_eq!(admitted.slot_index, Some(slot));
+            }
+            // Every one is now in flight; each keeps its own generation.
+            for slot in 0..REPLY_SLOTS {
+                assert_eq!(
+                    s.pool().unwrap().slots[slot].state,
+                    SlotState::InFlight,
+                    "slot {slot}"
+                );
+                assert_eq!(
+                    s.admit_control_render(&reply_request(slot, 2)),
+                    Err(SessionRefusal::ControlRenderSlotBusy { in_flight: 1 })
+                );
+            }
+        }
+
+        #[test]
+        fn a_reply_offset_past_the_pool_cannot_index_a_slot() {
+            let mut s = live_session(4);
+            let mut past = reply_request(0, 1);
+            past.reply_offset = HELIOS_HVM1_REPLY_POOL_BYTES;
+            assert_eq!(
+                s.admit_control_render(&past),
+                Err(SessionRefusal::ControlRenderSlotIndexOutOfRange {
+                    found: REPLY_SLOTS
+                })
+            );
+        }
+
+        #[test]
+        fn a_control_render_before_the_pool_is_bound_is_refused() {
+            let mut s = TranslationSession::new_provisional(PKG, CAPSET);
+            assert_eq!(
+                s.admit_control_render(&reply_request(0, 1)),
+                Err(SessionRefusal::ReplyPoolNotBound)
+            );
+        }
+
+        #[test]
+        fn the_init_render_itself_runs_on_a_provisional_session() {
+            // The Render that carries INIT is a control Render, and the session
+            // is not live until its reply lands — so admission may not require it.
+            let mut s = TranslationSession::new_provisional(PKG, CAPSET);
+            s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN)
+                .unwrap();
+            let admitted = s.admit_control_render(&reply_request(0, 1)).unwrap();
+            assert_eq!(admitted.slot_index, Some(0));
+            assert_eq!(s.phase(), SessionPhase::Provisional);
+        }
+
+        // ── the reply bytes the KMD emits ─────────────────────────────────
+
+        #[test]
+        fn the_emitted_init_reply_is_exactly_what_the_icd_validates() {
+            let mut s = TranslationSession::new_provisional(PKG, CAPSET);
+            s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN)
+                .unwrap();
+            let reply = s.complete_init(8, 3, 7, CAP).expect("completes");
+            // The ICD re-validates with its own requested capacity; the KMD must
+            // never emit a reply that fails on the other side.
+            let admission = reply.validate(PKG, CAPSET, 8).expect("ICD accepts");
+            assert_eq!(admission.session_generation, 7);
+            assert_eq!(admission.capability, CAP);
+            assert_eq!(admission.endpoint_capacity, 3);
+            assert_eq!(reply.reserved, 0);
+            assert_eq!(reply.capset, CAPSET);
+        }
+
+        #[test]
+        fn the_attach_packet_the_umd_builds_from_our_reply_round_trips() {
+            let mut s = TranslationSession::new_provisional(PKG, CAPSET);
+            s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN)
+                .unwrap();
+            let reply = s.complete_init(4, 4, 7, CAP).unwrap();
+            let packet = HeliosQueueAttachV1::new(
+                reply.package_generation,
+                reply.session_generation,
+                reply.capability(),
+                endpoint(1),
+                1,
+                HeliosOuterContextKind::D3d12VirtualSubmit,
+            );
+            assert_eq!(packet.magic, HELIOS_HQA1_MAGIC);
+            assert_eq!(packet.struct_size, HELIOS_HQA1_SIZE);
+            let admission = s.attach(&packet).expect("attaches");
+            assert_eq!(admission.kind, HeliosOuterContextKind::D3d12VirtualSubmit);
+        }
+
+        #[test]
+        fn engine_class_of_decodes_a_declared_endpoint() {
+            let mut s = live_session(4);
+            s.attach(&attach_packet(1, 10)).unwrap();
+            let ep = s.endpoint(1).unwrap().descriptor;
+            assert_eq!(
+                engine_class_of(&ep, s.endpoint_capacity()),
+                Ok(HeliosEngineClass::Graphics)
+            );
+        }
+
+        #[test]
+        fn check_session_generation_refuses_zero_and_a_foreign_value() {
+            let s = live_session(4);
+            assert_eq!(check_session_generation(7, &s), Ok(()));
+            assert!(matches!(
+                check_session_generation(0, &s),
+                Err(SessionRefusal::Init(InitRefusal::Generation {
+                    reason: GenerationRefusal::Zero,
+                    ..
+                }))
+            ));
+            assert!(matches!(
+                check_session_generation(8, &s),
+                Err(SessionRefusal::Init(InitRefusal::Generation {
+                    reason: GenerationRefusal::Mismatch { .. },
+                    ..
+                }))
+            ));
+            // A provisional session has no generation, so nothing matches it.
+            let provisional = TranslationSession::new_provisional(PKG, CAPSET);
+            assert!(check_session_generation(7, &provisional).is_err());
+        }
+
+        // ── endpoints, rings, and the host-dispatch FIFO ──────────────────
+
+        #[test]
+        fn init_mints_no_ring_at_all() {
+            // An endpoint ordinal is not a ring. Rings belong to queue contexts
+            // bound to a real VkQueue, which a record-only session never creates.
+            let s = live_session(4);
+            for id in 1..=4u32 {
+                assert_eq!(
+                    s.ring_index(id),
+                    Err(SessionRefusal::EndpointRingUnassigned { endpoint_id: id })
+                );
+            }
+        }
+
+        #[test]
+        fn a_ring_binds_once_and_is_never_shared_or_recycled() {
+            let mut s = live_session(4);
+            s.bind_ring(1, 7).expect("first bind");
+            assert_eq!(s.ring_index(1), Ok(7));
+            assert_eq!(
+                s.bind_ring(1, 8),
+                Err(SessionRefusal::EndpointRingAlreadyTaken { ring_index: 7 })
+            );
+            assert_eq!(
+                s.bind_ring(2, 7),
+                Err(SessionRefusal::EndpointRingAlreadyTaken { ring_index: 7 })
+            );
+            s.bind_ring(2, 8).expect("its own ring");
+            assert_eq!(
+                s.bind_ring(3, 0),
+                Err(SessionRefusal::EndpointRingUnassigned { endpoint_id: 3 })
+            );
+            assert!(matches!(
+                s.bind_ring(3, u32::MAX),
+                Err(SessionRefusal::Capacity(HeliosCapacityRefusal {
+                    limit: HeliosCapacityLimit::RingIndex,
+                    ..
+                }))
+            ));
+        }
+
+        #[test]
+        fn a_draining_session_binds_no_ring() {
+            let mut s = live_session(4);
+            s.begin_draining();
+            assert_eq!(s.bind_ring(1, 7), Err(SessionRefusal::SessionDraining));
+        }
+
+        #[test]
+        fn a_provisional_session_has_no_rings_and_no_endpoints() {
+            let mut s = TranslationSession::new_provisional(PKG, CAPSET);
+            s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN)
+                .unwrap();
+            assert_eq!(
+                s.bind_ring(1, 1),
+                Err(SessionRefusal::EndpointOutOfRange {
+                    found: 1,
+                    capacity: 0
+                })
+            );
+        }
+
+        #[test]
+        fn only_the_granted_endpoints_may_take_a_ring() {
+            let mut s = TranslationSession::new_provisional(PKG, CAPSET);
+            s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN)
+                .unwrap();
+            s.complete_init(8, 2, 7, CAP).unwrap();
+            s.bind_ring(1, 1).expect("granted");
+            s.bind_ring(2, 2).expect("granted");
+            assert_eq!(
+                s.bind_ring(3, 3),
+                Err(SessionRefusal::EndpointOutOfRange {
+                    found: 3,
+                    capacity: 2
+                })
+            );
+        }
+
+        #[test]
+        fn host_dispatch_serials_are_arrival_order_and_per_endpoint() {
+            let mut s = live_session(4);
+            s.bind_ring(1, 1).unwrap();
+            s.bind_ring(2, 2).unwrap();
+            let a1 = s.enqueue_host_dispatch(1).unwrap();
+            let a2 = s.enqueue_host_dispatch(1).unwrap();
+            let b1 = s.enqueue_host_dispatch(2).unwrap();
+            assert!(a2 > a1, "same endpoint must be strictly increasing");
+            assert_eq!(b1, a1, "a second endpoint starts its own sequence");
+        }
+
+        #[test]
+        fn the_host_dispatch_fifo_refuses_at_its_bound_and_never_waits() {
+            let mut s = live_session(4);
+            s.bind_ring(1, 1).unwrap();
+            s.bind_ring(2, 2).unwrap();
+            let depth = HELIOS_HTS1_MAX_HOST_DISPATCH_FIFO_DEPTH;
+            for _ in 0..depth {
+                s.enqueue_host_dispatch(1).expect("under the bound");
+            }
+            assert!(matches!(
+                s.enqueue_host_dispatch(1),
+                Err(SessionRefusal::Capacity(HeliosCapacityRefusal {
+                    limit: HeliosCapacityLimit::HostDispatchFifoDepth,
+                    ..
+                }))
+            ));
+            // A refused enqueue must not have consumed a serial or a slot.
+            s.retire_host_dispatch(1).expect("one retires");
+            s.enqueue_host_dispatch(1).expect("and the slot is reusable");
+            // Endpoint 2 is untouched by endpoint 1's exhaustion.
+            s.enqueue_host_dispatch(2).expect("independent FIFO");
+        }
+
+        #[test]
+        fn host_dispatch_refuses_an_endpoint_with_no_ring_bound() {
+            let mut s = live_session(4);
+            assert_eq!(
+                s.enqueue_host_dispatch(1),
+                Err(SessionRefusal::EndpointRingUnassigned { endpoint_id: 1 })
+            );
+        }
+
+        #[test]
+        fn retiring_an_empty_fifo_is_a_refusal_not_a_wrap() {
+            let mut s = live_session(4);
+            s.bind_ring(1, 1).unwrap();
+            assert_eq!(
+                s.retire_host_dispatch(1),
+                Err(SessionRefusal::HostDispatchFifoUnderflow { endpoint_id: 1 })
+            );
+        }
+
+        #[test]
+        fn a_draining_session_enqueues_nothing() {
+            let mut s = live_session(4);
+            s.bind_ring(1, 1).unwrap();
+            s.begin_draining();
+            assert_eq!(
+                s.enqueue_host_dispatch(1),
+                Err(SessionRefusal::SessionDraining)
+            );
+        }
+
+        // ── snapshot accounting ───────────────────────────────────────────
+
+        #[test]
+        fn a_session_holds_at_most_four_live_snapshots() {
+            let mut s = live_session(4);
+            for _ in 0..4 {
+                s.admit_snapshot_bytes(1024).expect("under the bound");
+            }
+            assert!(matches!(
+                s.admit_snapshot_bytes(1024),
+                Err(SessionRefusal::Hnr2Capacity(_))
+            ));
+            assert_eq!(s.live_snapshots(), 4);
+            assert_eq!(s.live_snapshot_bytes(), 4096);
+            s.release_snapshot_bytes(1024).expect("one is consumed");
+            s.admit_snapshot_bytes(1024).expect("and the slot returns");
+        }
+
+        #[test]
+        fn one_snapshot_may_not_exceed_the_per_result_cap() {
+            let mut s = live_session(4);
+            assert!(matches!(
+                s.admit_snapshot_bytes(TranslationSession::MAX_SNAPSHOT_BYTES + 1),
+                Err(SessionRefusal::Hnr2Capacity(_))
+            ));
+            assert_eq!(s.live_snapshots(), 0);
+        }
+
+        #[test]
+        fn releasing_more_snapshot_bytes_than_are_live_is_refused() {
+            let mut s = live_session(4);
+            assert_eq!(
+                s.release_snapshot_bytes(1),
+                Err(SessionRefusal::SnapshotAccountingUnderflow)
+            );
+            s.admit_snapshot_bytes(16).unwrap();
+            assert_eq!(
+                s.release_snapshot_bytes(32),
+                Err(SessionRefusal::SnapshotAccountingUnderflow)
+            );
+            assert_eq!(s.live_snapshots(), 1);
+            assert_eq!(s.live_snapshot_bytes(), 16);
+        }
+
+        #[test]
+        fn a_draining_session_admits_no_new_snapshot() {
+            let mut s = live_session(4);
+            s.begin_draining();
+            assert_eq!(
+                s.admit_snapshot_bytes(16),
+                Err(SessionRefusal::SessionDraining)
+            );
+        }
+
+        #[test]
+        fn every_capacity_limit_has_a_distinct_counter_code() {
+            let codes = [
+                capacity_limit_code(HeliosCapacityLimit::SessionsPerProcess),
+                capacity_limit_code(HeliosCapacityLimit::RingIndex),
+                capacity_limit_code(HeliosCapacityLimit::OutstandingContextBatches),
+                capacity_limit_code(HeliosCapacityLimit::ContextBatchBytes),
+                capacity_limit_code(HeliosCapacityLimit::HostDispatchFifoDepth),
+            ];
+            for (i, a) in codes.iter().enumerate() {
+                assert_ne!(*a, 0);
+                for b in &codes[i + 1..] {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+}

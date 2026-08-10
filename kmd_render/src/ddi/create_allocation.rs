@@ -4584,6 +4584,28 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         let desc =
             unsafe { read_open_descriptor(info.pPrivateDriverData, info.PrivateDriverDataSize) };
 
+        // K5: bind the role-1 HVM1 reply pool to the raw device's provisional
+        // HTS1 session. This DDI is the ONLY allocation DDI that carries
+        // `hDevice` — `DXGKARG_CREATEALLOCATION` has none — so it is the only
+        // place the binding §10.4:1205-1206 requires can happen. Read-only, and
+        // a refusal never fails the open (see `bind_reply_pool`).
+        // ⛔ Role 1 ONLY. A raw device also opens role-2/role-4 allocations in
+        // bulk once A3 lands, and offering those to the binder would make
+        // `TsPoolRej` — a counter documented as an anomaly — climb on the normal
+        // path, which is worse than not counting at all.
+        if let Some((Hvm1Role::ReplyPool, byte_size, generation)) =
+            unsafe { read_open_hvm1(info.pPrivateDriverData, info.PrivateDriverDataSize) }
+        {
+            if let Some(device) = unsafe { crate::device::DeviceHandleRef::from_raw(h_device) } {
+                crate::ddi::translation_session::bind_reply_pool(
+                    device.session_cell(),
+                    Hvm1Role::ReplyPool,
+                    byte_size,
+                    generation,
+                );
+            }
+        }
+
         // ⛔ C1's liveness gate is GONE with the resid it gated on.
         //
         // It refused an open whose venus resource was no longer alive, and it
@@ -4711,6 +4733,37 @@ unsafe fn read_open_descriptor(
         return None;
     }
     Some(desc)
+}
+
+/// Read an allocation's create-time HVM1 record at open time, for K5's reply-pool
+/// binding. Returns `(role, byte_size, object_generation)`.
+///
+/// `None` for a buffer that is absent, the wrong length, or not an HVM1 —
+/// `DxgkDdiOpenAllocation` is called for every allocation, and an HWA2 or HOC1
+/// legitimately is not one. The record is re-validated as a `CreateOutput`
+/// because that is the stage these bytes are at by the time the open sees them.
+///
+/// # Safety
+/// `private` is dxgkrnl's per-allocation private buffer and `private_size` its
+/// authoritative length. NOTHING here writes through the pointer.
+unsafe fn read_open_hvm1(
+    private: *const c_void,
+    private_size: UINT,
+) -> Option<(Hvm1Role, u64, u64)> {
+    if private.is_null() || private_size as usize != HELIOS_HVM1_SIZE as usize {
+        return None;
+    }
+    // SAFETY: non-null and the length is exactly the record size, checked above.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(private as *const u8, HELIOS_HVM1_SIZE as usize) };
+    let record = HeliosVenusMemoryAllocationV1::from_private_data(bytes).ok()?;
+    if record.magic != HELIOS_HVM1_MAGIC {
+        return None;
+    }
+    let role = record
+        .validate(HELIOS_PACKAGE_GENERATION, Hvm1Stage::CreateOutput)
+        .ok()?;
+    Some((role, record.byte_size, record.object_generation))
 }
 
 /// `DxgkDdiCloseAllocation` — release device-local allocation references.
