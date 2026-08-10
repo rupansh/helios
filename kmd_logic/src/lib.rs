@@ -8202,8 +8202,16 @@ pub mod translation_session {
         /// grants exactly one host Venus context and `VkInstance` per session:
         /// "No second `VkInstance` may be created in that host context."
         SessionAlreadyInitialised,
-        /// The session is `Draining` — reset, removal, or a hard refusal stopped
+        /// The session is `Draining` — reset, removal or teardown stopped
         /// admission. Every later admission fails; nothing is revalidated.
+        ///
+        /// ⚠ No *refusal* reaches this state. Every refusal arm returns before its
+        /// mutation, so a refused request leaves the session byte-identical and the
+        /// next valid one is admitted. §17.6's "any outer-allocation operand on
+        /// control poisons the session" is K6's, in the Render decoder that
+        /// classifies the opcode — and it must call [`TranslationSession::begin_draining`]
+        /// *and* wake the C51 waiters device-lost (§14:3430), which is why the
+        /// escalation lives in the platform half rather than here.
         SessionDraining,
         /// The process released a session it never admitted. An accounting bug,
         /// not a wire event, and refused rather than wrapped: a wrapped live
@@ -8583,12 +8591,16 @@ pub mod translation_session {
             presented.check_match(self.capability).is_ok()
         }
 
-        /// Reset, removal, or a hard refusal. Terminal: the capability is
-        /// invalidated first so a waiter woken by the caller can never be admitted
-        /// afterwards (section 13, "invalidates all HQA1 capabilities … and
-        /// cancels C51/HQC1 event waiters as device-lost"), and no slot is marked
-        /// complete — "Reset poisons all slots and wakes device-lost; it never
-        /// marks a reply complete."
+        /// Reset, removal, or teardown. Terminal: the capability is invalidated
+        /// first so a waiter woken by the caller can never be admitted afterwards
+        /// (section 13, "invalidates all HQA1 capabilities … and cancels C51/HQC1
+        /// event waiters as device-lost"), and no slot is marked complete —
+        /// "Reset poisons all slots and wakes device-lost; it never marks a reply
+        /// complete."
+        ///
+        /// ⚠ It does only the first half of §14:3430. The caller still owes the
+        /// device-lost wakeup, which is why no refusal arm in this module calls it:
+        /// a silently-draining session with unwoken waiters is a hang.
         pub fn begin_draining(&mut self) {
             self.capability = HeliosSessionCapability::INVALID;
             self.phase = SessionPhase::Draining;
@@ -9659,6 +9671,52 @@ pub mod translation_session {
         }
 
         // ── poisoning ─────────────────────────────────────────────────────
+
+        #[test]
+        fn no_refusal_arm_moves_the_session_out_of_its_phase() {
+            // The invariant a future edit acting on "a hard refusal poisons the
+            // session" would silently break: every refusal returns before its
+            // mutation, so the next valid request still works.
+            let mut s = live_session(4);
+            let mut foreign = reply_request(0, 1);
+            foreign.names_reply_pool = false;
+            assert!(s.admit_control_render(&foreign).is_err());
+            assert_eq!(s.phase(), SessionPhase::Live);
+
+            let mut bad_access = reply_request(0, 1);
+            bad_access.access_flags = HELIOS_HNR2_ACCESS_READ;
+            assert!(s.admit_control_render(&bad_access).is_err());
+            assert_eq!(s.phase(), SessionPhase::Live);
+
+            assert!(s.attach(&attach_packet(1, 0)).is_err());
+            assert_eq!(s.phase(), SessionPhase::Live);
+            assert_eq!(s.highest_context_generation(), 0);
+
+            // ...and the session is still fully usable afterwards.
+            s.admit_control_render(&reply_request(0, 1))
+                .expect("a refused predecessor left nothing behind");
+            s.attach(&attach_packet(1, 1)).expect("still admits a good packet");
+        }
+
+        #[test]
+        fn the_release_paths_deliberately_do_not_gate_on_draining() {
+            // detach / retire_host_dispatch / release_snapshot_bytes must keep
+            // working while a session drains: `dxgkddi_destroy_context` calls
+            // `detach` for attached contexts AFTER the control context has already
+            // begun draining, and dxgkrnl does not order the two.
+            let mut s = live_session(4);
+            s.bind_ring(1, 1).unwrap();
+            s.attach(&attach_packet(1, 10)).unwrap();
+            s.enqueue_host_dispatch(1).unwrap();
+            s.admit_snapshot_bytes(64).unwrap();
+
+            s.begin_draining();
+            s.detach(10).expect("an attached context still detaches");
+            s.retire_host_dispatch(1).expect("an enqueued DMA still retires");
+            s.release_snapshot_bytes(64).expect("a live snapshot still releases");
+            assert_eq!(s.attached_contexts(), 0);
+            assert_eq!(s.live_snapshots(), 0);
+        }
 
         #[test]
         fn draining_invalidates_the_capability_before_anything_else() {
