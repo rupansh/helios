@@ -16,8 +16,8 @@
 //!    from the audited one is a build failure rather than a short struct handed
 //!    to a longer-expecting dxgkrnl (`STATUS_REVISION_MISMATCH`).
 //! 2. **Classification.** [`SLOTS`] carries every slot through WDDM 3.2 as
-//!    `Implemented`, or `Disabled`/`Pending` with the truthful zero capability
-//!    that makes it unreachable.
+//!    `Implemented`/`Retiring` (registered today), or `Disabled`/`Pending`
+//!    (NULL today) with the truthful zero capability that makes it unreachable.
 //! 3. **Agreement.** [`verify`] walks the table `build_ddi_table()` actually
 //!    produced and checks each slot's pointer word against its class. A
 //!    disagreement fails `DriverEntry` — a registered slot that the audit calls
@@ -70,8 +70,8 @@ pub(crate) struct SlotAudit {
     pub(crate) min_version: &'static str,
     /// Expected presence in the built table.
     pub(crate) class: SlotClass,
-    /// Why. For `Disabled`, the truthful zero capability; for `Pending`, the
-    /// owning lane and the normative line.
+    /// Why. For `Disabled`, the truthful zero capability; for `Pending` and
+    /// `Retiring`, the owning lane and the normative line.
     pub(crate) reason: &'static str,
 }
 
@@ -110,9 +110,6 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         offset: 16,
         min_version: "BASE",
         class: SlotClass::Implemented,
-        // HPM1 negotiation was part of this slot's intended job; the QEMU
-        // memory lane is parked (docs/retirement/FINDINGS.md F5), so naming it
-        // here would point a reader at code that is no longer in the tree.
         reason: "PnP: transport bring-up, segment/placement init.",
     },
     SlotAudit {

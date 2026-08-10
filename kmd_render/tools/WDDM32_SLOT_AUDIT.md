@@ -9,8 +9,9 @@ Audited header: `tmp/wdk-28000/Include/10.0.28000.0/km/dispmprt.h`
 Slots: **192** (plus `Version`), struct size **1544** bytes.
 
 * `Implemented` — 82
-* `Disabled` — 99 (unreachable behind a truthful zero capability)
+* `Disabled` — 91 (unreachable behind a truthful zero capability)
 * `Pending` — 11 (a named retirement lane will register it; NULL until then)
+* `Retiring` — 8 (registered today; a named retirement lane will unregister it)
 
 The machine-checked half of this table lives in
 `kmd_render/src/ddi/wddm32_slot_audit.rs`: compile-time `offset_of!`/
@@ -20,7 +21,7 @@ refuses to load if any slot disagrees with its class here.
 | # | Offset | Slot | Since | Class | Reason |
 |--:|-------:|------|-------|-------|--------|
 | 0 | 8 | `DxgkDdiAddDevice` | BASE | Implemented | PnP: adapter object creation. |
-| 1 | 16 | `DxgkDdiStartDevice` | BASE | Implemented | PnP: transport bring-up, HPM1 negotiation, segment/placement init. |
+| 1 | 16 | `DxgkDdiStartDevice` | BASE | Implemented | PnP: transport bring-up, segment/placement init. |
 | 2 | 24 | `DxgkDdiStopDevice` | BASE | Implemented | PnP: drain and tear down the transport. |
 | 3 | 32 | `DxgkDdiRemoveDevice` | BASE | Implemented | PnP: free the adapter object. |
 | 4 | 40 | `DxgkDdiDispatchIoRequest` | BASE | Implemented | Legacy video-port IRP path; refuses every code and counts through StVrp. |
@@ -52,7 +53,7 @@ refuses to load if any slot disagrees with its class here.
 | 30 | 248 | `DxgkDdiSetPointerShape` | BASE | Implemented | Hardware pointer shape. |
 | 31 | 256 | `DxgkDdiResetFromTimeout` | BASE | Implemented | TDR reset. |
 | 32 | 264 | `DxgkDdiRestartFromTimeout` | BASE | Implemented | TDR restart. |
-| 33 | 272 | `DxgkDdiEscape` | BASE | Disabled | Section 17.6:4494 and 18.1:4667: DxgkDdiEscape is NULL and no Escape entry point is present in the selected KMD. |
+| 33 | 272 | `DxgkDdiEscape` | BASE | Retiring | Section 17.6:4494 and 18.1:4667 delete the Escape entry point, but escape.rs is live today (diagnostic counters, scanout timeline). RETIRING: flips to Disabled when the host/tools lane deletes escape.rs and its consumers. |
 | 34 | 280 | `DxgkDdiCollectDbgInfo` | BASE | Implemented | OS-requested bounded debug snapshot. |
 | 35 | 288 | `DxgkDdiQueryCurrentFence` | BASE | Implemented | Last completed submission fence for a node. |
 | 36 | 296 | `DxgkDdiIsSupportedVidPn` | BASE | Implemented | VidPn validation. |
@@ -128,12 +129,12 @@ refuses to load if any slot disagrees with its class here.
 | 106 | 856 | `DxgkDdiValidateUpdateAllocationProperty` | WDDM2_1 | Pending | KMD display lane unit D3 (section 17.6:4475). |
 | 107 | 864 | `DxgkDdiControlModeBehavior` | WDDM2_1 | Pending | KMD display lane unit D3 (section 17.6:4478). |
 | 108 | 872 | `DxgkDdiUpdateMonitorLinkInfo` | WDDM2_1 | Implemented | Mandatory once a monitor target is advertised; revalidated under the 3.2 table. |
-| 109 | 880 | `DxgkDdiCreateHwContext` | WDDM2_2 | Disabled | Section 17.6:4385: HWS/HWQueue is not advertised in this generation, and DXGKQAITYPE_HWSCHEDULINGCAPS is refused, so the hardware-scheduling family is unreachable. |
-| 110 | 888 | `DxgkDdiDestroyHwContext` | WDDM2_2 | Disabled | Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable. |
-| 111 | 896 | `DxgkDdiCreateHwQueue` | WDDM2_2 | Disabled | Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable. |
-| 112 | 904 | `DxgkDdiDestroyHwQueue` | WDDM2_2 | Disabled | Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable. |
-| 113 | 912 | `DxgkDdiSubmitCommandToHwQueue` | WDDM2_2 | Disabled | Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable. |
-| 114 | 920 | `DxgkDdiSwitchToHwContextList` | WDDM2_2 | Disabled | Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable. |
+| 109 | 880 | `DxgkDdiCreateHwContext` | WDDM2_2 | Retiring | Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family. |
+| 110 | 888 | `DxgkDdiDestroyHwContext` | WDDM2_2 | Retiring | Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family. |
+| 111 | 896 | `DxgkDdiCreateHwQueue` | WDDM2_2 | Retiring | Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family. |
+| 112 | 904 | `DxgkDdiDestroyHwQueue` | WDDM2_2 | Retiring | Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family. |
+| 113 | 912 | `DxgkDdiSubmitCommandToHwQueue` | WDDM2_2 | Retiring | Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family. |
+| 114 | 920 | `DxgkDdiSwitchToHwContextList` | WDDM2_2 | Retiring | Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family. |
 | 115 | 928 | `DxgkDdiResetHwEngine` | WDDM2_2 | Disabled | HWS-only engine reset; per-engine TDR uses DxgkDdiResetEngine instead. |
 | 116 | 936 | `DxgkDdiCreatePeriodicFrameNotification` | WDDM2_2 | Disabled | No periodic frame notification is advertised. |
 | 117 | 944 | `DxgkDdiDestroyPeriodicFrameNotification` | WDDM2_2 | Disabled | No periodic frame notification is advertised. |
@@ -163,7 +164,7 @@ refuses to load if any slot disagrees with its class here.
 | 141 | 1136 | `DxgkDdiControlDiagnosticReporting` | WDDM2_4 | Pending | KMD ETW/diagnostics lane. Sibling of QueryDiagnosticTypesSupport; classified explicitly per display brief section 6 item 11. |
 | 142 | 1144 | `DxgkDdiResumeHwEngine` | WDDM2_4 | Disabled | HWS-only engine resume; the hardware-scheduling family is unreachable. |
 | 143 | 1152 | `DxgkDdiSignalMonitoredFence` | WDDM2_5 | Disabled | HWQueue-scoped monitored-fence signalling; HWS/HWQueue is not advertised, and native fences use the Core-0116 slots instead. |
-| 144 | 1160 | `DxgkDdiPresentToHwQueue` | WDDM2_5 | Disabled | Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable. |
+| 144 | 1160 | `DxgkDdiPresentToHwQueue` | WDDM2_5 | Retiring | Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family. |
 | 145 | 1168 | `DxgkDdiValidateSubmitCommand` | WDDM2_5 | Disabled | Not advertised; SubmitCommand validates its own packet inline. |
 | 146 | 1176 | `DxgkDdiSetTargetAdjustedColorimetry2` | WDDM2_5 | Disabled | No per-target colorimetry adjustment hardware; only SDR RGB is advertised. |
 | 147 | 1184 | `DxgkDdiSetTrackedWorkloadPowerLevel` | WDDM2_5 | Disabled | No tracked workloads are advertised. |

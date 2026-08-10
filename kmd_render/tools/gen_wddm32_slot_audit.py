@@ -66,11 +66,24 @@ DEFAULT_CLASSES = os.path.join(REPO, "kmd_render", "tools", "wddm32_slot_classes
 DEFAULT_RS = os.path.join(REPO, "kmd_render", "src", "ddi", "wddm32_slot_audit.rs")
 DEFAULT_MD = os.path.join(REPO, "kmd_render", "tools", "WDDM32_SLOT_AUDIT.md")
 
-# The three classes the verifier understands.  `Pending` is `Disabled` as far as
-# the check is concerned — a NULL slot is always the fail-closed state — but it
-# records that a named lane is going to register it, so the reclassification is
-# a one-row edit rather than an archaeology exercise.
-CLASSES = ("Implemented", "Disabled", "Pending")
+# The four classes the verifier understands.  Two are terminal and two are
+# transitional, and the transitional pair is what makes the audit armable at
+# all: this table describes the driver that is BUILT, not the driver the
+# retirement intends.
+#
+#   Implemented  must be non-NULL.
+#   Disabled     must be NULL, and unreachable behind a truthful zero capability.
+#   Pending      NULL today; a named lane will register it.  Checked like
+#                `Disabled` — NULL is always the fail-closed state — but the
+#                reason names the owner, so reclassifying is a one-row edit
+#                rather than an archaeology exercise.
+#   Retiring     registered today; a named lane will unregister it.  Checked
+#                like `Implemented`.  ⚠ Without this class the audit cannot be
+#                armed: eight slots the retirement ends up disabling are live in
+#                `build_ddi_table()` right now, so classifying them `Disabled` —
+#                the state they will reach — makes `verify` refuse a correct
+#                driver.
+CLASSES = ("Implemented", "Disabled", "Pending", "Retiring")
 
 # Every member of DRIVER_INITIALIZATION_DATA other than `Version` is a pointer,
 # so the layout is `Version` (ULONG) + 4 bytes of padding + one 8-byte slot each.
@@ -185,8 +198,8 @@ RS_HEADER = '''//! GENERATED — do not edit by hand.
 //!    from the audited one is a build failure rather than a short struct handed
 //!    to a longer-expecting dxgkrnl (`STATUS_REVISION_MISMATCH`).
 //! 2. **Classification.** [`SLOTS`] carries every slot through WDDM 3.2 as
-//!    `Implemented`, or `Disabled`/`Pending` with the truthful zero capability
-//!    that makes it unreachable.
+//!    `Implemented`/`Retiring` (registered today), or `Disabled`/`Pending`
+//!    (NULL today) with the truthful zero capability that makes it unreachable.
 //! 3. **Agreement.** [`verify`] walks the table `build_ddi_table()` actually
 //!    produced and checks each slot's pointer word against its class. A
 //!    disagreement fails `DriverEntry` — a registered slot that the audit calls
@@ -213,6 +226,20 @@ pub(crate) enum SlotClass {
     /// Verified exactly like `Disabled` — NULL is the fail-closed state — but
     /// the reason names the owner so reclassification is a one-row TSV edit.
     Pending,
+    /// Registered **today**, and a named lane of the retirement will delete it.
+    /// The mirror of [`Self::Pending`], and it exists for the same reason: this
+    /// table describes the driver that is built, not the driver that is
+    /// intended.
+    ///
+    /// ⚠ **Without this class the audit cannot be armed at all.** Eight slots
+    /// the retirement ends up disabling are live in `build_ddi_table()` right
+    /// now, so classifying them `Disabled` — the state they will reach — makes
+    /// [`verify`] refuse a correct driver, and the only ways out are to not run
+    /// the audit or to delete eight subsystems in one commit. Verified exactly
+    /// like `Implemented` (non-NULL is the correct state today); the reason
+    /// names the lane that will flip it to `Disabled`, and that flip is one
+    /// word per row.
+    Retiring,
 }
 
 /// One audited slot of `DRIVER_INITIALIZATION_DATA`.
@@ -225,8 +252,8 @@ pub(crate) struct SlotAudit {
     pub(crate) min_version: &'static str,
     /// Expected presence in the built table.
     pub(crate) class: SlotClass,
-    /// Why. For `Disabled`, the truthful zero capability; for `Pending`, the
-    /// owning lane and the normative line.
+    /// Why. For `Disabled`, the truthful zero capability; for `Pending` and
+    /// `Retiring`, the owning lane and the normative line.
     pub(crate) reason: &'static str,
 }
 
@@ -275,7 +302,10 @@ pub(crate) fn verify(data: &DRIVER_INITIALIZATION_DATA) -> Result<(), SlotAuditF
         // caller's struct alignment is not this function's to assume.
         let word = unsafe { base.add(slot.offset).cast::<usize>().read_unaligned() };
         let registered = word != 0;
-        let expected = matches!(slot.class, SlotClass::Implemented);
+        // `Retiring` is verified like `Implemented` and `Pending` like
+        // `Disabled`: the audit checks the table that is BUILT, and the two
+        // transitional classes are the two directions it is still moving in.
+        let expected = matches!(slot.class, SlotClass::Implemented | SlotClass::Retiring);
         if registered != expected {
             return Err(SlotAuditFailure {
                 index: i,
@@ -353,6 +383,7 @@ def emit_md(joined, header_path: str) -> str:
         f"* `Implemented` — {counts['Implemented']}",
         f"* `Disabled` — {counts['Disabled']} (unreachable behind a truthful zero capability)",
         f"* `Pending` — {counts['Pending']} (a named retirement lane will register it; NULL until then)",
+        f"* `Retiring` — {counts['Retiring']} (registered today; a named retirement lane will unregister it)",
         "",
         "The machine-checked half of this table lives in",
         "`kmd_render/src/ddi/wddm32_slot_audit.rs`: compile-time `offset_of!`/",
