@@ -865,6 +865,9 @@ $K4_VKD3D_FLAG_PY" "$REPO"
 run_gate "A2 HNR2 encoder validates against protocol (executed, not compared)" \
     bash "$REPO/tools/hnr2-encoder-gate.sh"
 
+run_gate "K5 HTS1/HQA1: the C mirror's records replayed through the KMD session" \
+    bash "$REPO/tools/hts1-attach-gate.sh"
+
 printf '\n'
 if [ ${#FAILED[@]} -eq 0 ]; then
     if [ ${#SKIPPED[@]} -eq 0 ]; then
