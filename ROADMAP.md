@@ -58,16 +58,27 @@ layer now loads and runs — F7). Do not assume it is active:
 |---|---|---|
 | `wddm_surface.rs` `SURFACE` | still `Wddm2_1GpuMmu` | the single atomic activation switch, and the **last** edit of the retirement (`OWNERSHIP.md` §3) |
 
-**`VK_LAYER_HELIOS_present` now LOADS AND EXECUTES** (`FINDINGS.md` F7). Staged
-by `tools/install-helios-present-layer.ps1`, driven by
-`tools/run-helios-layer-app.ps1`. It admits **no** device, for a measured
-reason: the ICD reports `VK_ERROR_FORMAT_NOT_SUPPORTED` for
-`D3D12_RESOURCE_BIT` (and every other D3D handle type) and supports only
-`OPAQUE_WIN32`, so §10.3's import chain has no lower half yet — see
-`tools/vk_external_handle_probe.cpp` for the capability matrix and its control
-row. A native Vulkan app asking for `VK_KHR_swapchain` gets
-`VK_ERROR_EXTENSION_NOT_PRESENT` from `vkCreateDevice`, loudly, which is
-correct. It is deliberately **not** registered machine-wide: an implicit layer
+**`VK_LAYER_HELIOS_present` LOADS, RUNS, and now BUILDS A WSI DEVICE**
+(`FINDINGS.md` F7 + its two addenda). Staged by
+`tools/install-helios-present-layer.ps1`, driven by
+`tools/run-helios-layer-app.ps1` (which carries a `-NoLayer` control arm),
+interrogated by `tools/vk_external_handle_probe.cpp`.
+
+Both §10.3 capability gates are closed: the ICD now imports
+`D3D12_RESOURCE_BIT` images (`IMPORTABLE|DEDICATED_ONLY`, import-only, its own
+compatibility class) and exports/imports `D3D12_FENCE_BIT` timeline semaphores.
+The layer admits the physical device and creates a device with its private
+helper queue. **The next unit is named by the layer's own refusal**:
+`vkSetHeliosPresentableImageHELIOS`, the private tag call of §10.7:2571-2578
+(lane-mesa A4) that legalises `PRESENT_SRC_KHR` for a slot's image — without it
+`vkCreateSwapchainKHR` refuses. Nothing above `vkCreateSwapchainKHR` has ever
+run.
+
+⚠ Falling out of that work: **`ID3D12Fence::CreateSharedHandle` could never
+have worked on Helios** — vkd3d refuses a shared fence unless the driver
+reports `D3D12_FENCE_BIT` in `exportFromImportedHandleTypes`, and it did not.
+
+The layer is deliberately **not** registered machine-wide: an implicit layer
 enters dwm's `dxvk-helios` instances, which §2 item 8 forbids. ⚠ Check the
 build with `ninja <the layer target>` — **mingw-w64 g++, the compiler Mesa is
 written for**; a clang-cl side-check was tried and deleted (`REVIEW-ROUND-1.md`
