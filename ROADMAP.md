@@ -50,21 +50,29 @@ QEMU has HPM1 negotiation and HLM1 BAR admission.
 against WDK 28000 (355 `_0112` / 346 `_0116` symbols, `HRTFENCE`,
 `pfnCreateNativeFenceCb`/`pfnOpenNativeFenceCb`).
 
-⛔ **Four components are committed but deliberately NOT wired in.** Each is
+⛔ **Two components are committed but deliberately NOT wired in** (was four; the
+first two were wired in on 2026-08-10 by `b4b613c` and `fa8489e`). Each is
 labelled in its own commit message; do not assume any is active:
 
 | Component | State | Why |
 |---|---|---|
-| `protocol/src/translator_dispatch.rs` | commented out of `lib.rs` | two verified blockers, repair half-applied — **this is the next step**, and it gates the Mesa/DXVK/vkd3d lanes |
-| `kmd_render/src/ddi/{native_fence,wddm32_slot_audit}.rs` | orphaned, not in `ddi/mod.rs` | DDI table registration not done |
-| `icd/mesa/.../helios_present_layer.{h,cpp}` | 4269 lines, not in `meson.build` | no `.def`, no layer JSON yet |
+| `icd/mesa/.../helios_present_layer.{h,cpp}` | 4269 lines, not in `meson.build` | no `.def`, no layer JSON yet. ⚠ It has therefore **never been compiled**, which is why it is not a review target: `win_meson` will find more in one command than a reading pass would |
 | `wddm_surface.rs` `SURFACE` | still `Wddm2_1GpuMmu` | the single atomic activation switch, and the **last** edit of the retirement (`OWNERSHIP.md` §3) |
 
-No lane's adversarial review completed — Phase 2 is verified-compiling, not
-reviewed. §18's runtime gates remain unexecuted.
+**Phase 2 round 1 has now run** for `protocol`, `kmd_render` and
+`vkd3d-proton-helios` — see `docs/retirement/REVIEW-ROUND-1.md` for the findings
+and their bounds. The QEMU review is moot (F5). ⛔ Round 1 is **not** saturation:
+`METHOD.md` §3 requires two consecutive dry rounds with different lens
+compositions, and this one found things. §18's runtime gates remain unexecuted,
+except the WDDM 3.2 slot audit's refusal path, which is now proven on the target
+(`FINDINGS.md` F6).
 
-**Everything Linux-verifiable is green:** `protocol` 119 tests, `kmd_logic` 189
-tests, `tools/umd12-host-check.sh`, vkd3d ninja, QEMU ninja. Note there is no
+**Everything Linux-verifiable is green**, and it is now one command:
+`tools/retirement-gates.sh` (protocol tests, Rust↔C ABI parity, the C mirrors
+compiling, `kmd_logic` tests, slot-audit staleness, and the cross-repo
+`VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT` mirror). `protocol` 140 tests, `kmd_logic`
+189. Separately: `tools/umd12-host-check.sh`, vkd3d ninja, QEMU ninja.
+Note there is no
 workspace root — build `protocol` from `protocol/`, not with `-p` from the repo
 root.
 
