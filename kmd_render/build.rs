@@ -61,6 +61,7 @@ const BLOCKLISTED_BASE_TYPES: &[&str] = &[
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    verify_slot_audit_not_stale();
     generate_dxgk_bindings()?;
     compile_version_resource()?;
     compile_seh_shim();
@@ -74,6 +75,98 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Its directory is already on the linker search path (km\<ver>\x64).
     println!("cargo:rustc-link-lib=static=displib");
     Ok(())
+}
+
+/// Fail the build if `src/ddi/wddm32_slot_audit.rs` has drifted from the
+/// generator and classification table that produce it.
+///
+/// # Why this exists
+///
+/// The audit file's own header says "GENERATED — do not edit by hand" and names
+/// the command to regenerate it. On 2026-08-10 that command **reverted the fix
+/// that made the audit armable**: the `Retiring` class lived only in the
+/// hand-edited `.rs`, so regenerating reclassified eight live slots to
+/// `Disabled` and `verify()` would then have refused to load a correct driver
+/// at `DriverEntry` with `0xC0000182`. A generated file that its generator
+/// cannot reproduce is a trap aimed at whoever follows its instructions.
+///
+/// # Why it is advisory when its inputs are absent
+///
+/// The check needs `python3` and the staged WDK 28000 `dispmprt.h`, which is
+/// gitignored (`tmp/wdk-28000/`, see `docs/retirement/FINDINGS.md` F1). Hard-
+/// failing without them would break the build on any machine that has not
+/// staged the headers, which is a worse failure than the one being prevented.
+/// So: **present ⇒ enforced as a build error; absent ⇒ a loud `cargo:warning`**.
+/// It is never silent, because a check that can pass by being skipped is the
+/// kind of assurance this tree keeps discovering is not real.
+fn verify_slot_audit_not_stale() {
+    use std::path::Path;
+    use std::process::Command;
+
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("kmd_render always has a parent directory")
+        .to_path_buf();
+    let generator = repo.join("kmd_render/tools/gen_wddm32_slot_audit.py");
+    let header = repo.join("tmp/wdk-28000/Include/10.0.28000.0/km/dispmprt.h");
+
+    println!("cargo:rerun-if-changed=tools/gen_wddm32_slot_audit.py");
+    println!("cargo:rerun-if-changed=tools/wddm32_slot_classes.tsv");
+    println!("cargo:rerun-if-changed=src/ddi/wddm32_slot_audit.rs");
+
+    if !generator.exists() || !header.exists() {
+        println!(
+            "cargo:warning=slot-audit staleness check SKIPPED (generator or staged \
+             WDK 28000 dispmprt.h absent). Run tools/retirement-gates.sh on a host \
+             that has tmp/wdk-28000 staged."
+        );
+        return;
+    }
+
+    // ⛔ Decide on the generator's OWN words, never on a bare exit status.
+    //
+    // The first version of this check treated "ran, exit != 0" as STALE, and it
+    // broke the VM build on 2026-08-10 without anything being stale. Windows
+    // ships an **App Execution Alias** stub named `python3.exe`: it launches
+    // fine (so `Err(e)` never fires), prints "Python was not found; run without
+    // arguments to install from the Microsoft Store", and exits non-zero. That
+    // is "could not run the checker", which is the opposite of "the checker
+    // says no" — and inferring one from the other blocks work for the wrong
+    // reason, which is the mirror of a check that passes by being skipped.
+    //
+    // So require a POSITIVE marker from the generator in each direction, and
+    // treat everything else as could-not-run.
+    let (marker_ok, marker_stale) = ("up to date", "STALE:");
+    match Command::new("python3")
+        .arg(&generator)
+        .arg("--check")
+        .output()
+    {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if stderr.contains(marker_stale) {
+                panic!(
+                    "kmd_render/src/ddi/wddm32_slot_audit.rs is STALE with respect to \
+                     gen_wddm32_slot_audit.py + wddm32_slot_classes.tsv.\n\
+                     Regenerate it (python3 kmd_render/tools/gen_wddm32_slot_audit.py) \
+                     and review the diff — a class that exists only in the .rs will be \
+                     silently reverted, and the audit then refuses to load the driver.\n\
+                     --- generator output ---\n{stdout}{stderr}"
+                );
+            }
+            if !stdout.contains(marker_ok) {
+                println!(
+                    "cargo:warning=slot-audit staleness check SKIPPED: python3 produced \
+                     neither marker (no working python3 on this machine?). Run \
+                     tools/retirement-gates.sh on the Linux host."
+                );
+            }
+        }
+        Err(e) => println!(
+            "cargo:warning=slot-audit staleness check SKIPPED (could not run python3: {e})"
+        ),
+    }
 }
 
 /// Compile the SEH shim for `MmMapLockedPagesSpecifyCache(UserMode)` (which

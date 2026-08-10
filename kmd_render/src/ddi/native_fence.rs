@@ -83,18 +83,47 @@
 //! works only because both parties converge *after* `DRAINING` is published.
 //! No such convergence point exists for open-versus-free.
 //!
-//! **The fix, which is deliberately not a re-read after the increment.** That
-//! would narrow the window without closing it, and a narrowed race in kernel
-//! code is a stopgap wearing a fix's clothes. `state` and `local_refs` must
-//! become one `AtomicU64` (state in the high half, reference count in the low
-//! half) so that deciding and transitioning are a single compare-exchange:
-//! decode the word, hand the model to the `kmd_logic` rule that owns the
-//! decision, then publish with a compare-exchange against the exact word the
-//! rule saw, retrying if it moved. That keeps `kmd_logic` authoritative — the
-//! rule is still the pure function — while removing the snapshot's TOCTOU.
-//! It also needs `nf::destroy_global` to express "refused, and park in
-//! `Draining`" as a transition rather than a bare `Err`, which is a signature
-//! change in `kmd_logic` and its tests.
+//! ## ⛔ The fix is NOT the obvious one, and the reason decides the design
+//!
+//! The obvious repair is to pack `state` and `local_refs` into one `AtomicU64`
+//! so the rule and the transition become a single compare-exchange. **That was
+//! designed and rejected**, because it fixes the wrong half. It closes the
+//! *decision* TOCTOU — open can no longer take a reference against a `LIVE` it
+//! read a moment ago — but it does nothing about **object lifetime**: destroy
+//! frees the allocation *after* its exchange succeeds, while open is still
+//! holding the `&GlobalFenceObject` it resolved from the handle and may be
+//! re-reading the word in its retry loop. The dereference moves; it does not
+//! go away. Shipping it would convert a visible hole into a hidden one.
+//!
+//! A lock does not rescue it either. Any lock is acquired *through* the object,
+//! and [`global_from_handle`] must already dereference the pointer to check its
+//! magic before there is anything to lock. The only structure that would make a
+//! handle safe against a concurrent free is an adapter-wide registry to
+//! validate against — and §10.1 invariant 10 plus §17.6:4328-4333 forbid
+//! exactly that ("no hash table, scan, name, or process-global discovery
+//! registry"). ⇒ **Within the normative design, no purely guest-side mechanism
+//! closes this.**
+//!
+//! ## Therefore the real question is a premise, not a patch
+//!
+//! This module is only sound if **dxgkrnl serialises lifetime operations on one
+//! global native-fence object** — i.e. never calls `DxgkDdiOpenNativeFence` and
+//! `DxgkDdiDestroyNativeFence` concurrently for the same `hGlobalNativeFence`.
+//! That assumption is load-bearing and was nowhere written down, which is the
+//! actual defect this review found.
+//!
+//! * If dxgkrnl **does** serialise them, `NF-UAF-1` is unreachable, and the
+//!   `DRAINING` machinery below is defence in depth rather than necessity.
+//! * If it does **not**, the handle-only design cannot be made safe and the
+//!   normative constraint has to be revisited with the owner.
+//!
+//! ⚠ `docs/dx12/METHOD.md` §3 names dxgkrnl's internal behaviour as something
+//! static analysis provably cannot settle, and says such questions need **one
+//! deliberate experiment**, not another reading round. So this stays recorded
+//! and unfixed on purpose: the experiment (hammer open/destroy on one shared
+//! fence from two processes once the surface flips, with the population
+//! counters and a poisoned freed-object magic as the instrument) is the next
+//! step, and any repair chosen before it would be guessing.
 //!
 //! # What is deliberately NOT here
 //!
