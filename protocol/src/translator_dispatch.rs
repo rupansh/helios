@@ -243,20 +243,33 @@
 //! this file exists to centralise. So each check below is written twice, once
 //! per language, and the pairs are:
 //!
-//! | Rust | C |
-//! |---|---|
-//! | [`HeliosTranslatorCreateInfoV1::validate`] | `helios_translator_check_create_info` |
-//! | [`HeliosTranslatorHostCallbacksV1::validate`] | `helios_translator_check_host_callbacks` |
-//! | [`HeliosTranslatorDispatchV1::validate`] | `helios_translator_check_dispatch` |
-//! | [`HeliosTranslatorInstanceV1::validate`] | `helios_translator_check_instance` |
-//! | [`HeliosQueueAttachRequestV1::validate`] | `helios_translator_check_queue_attach_request` |
-//! | [`HeliosSealedBatchV1::validate`] | `helios_translator_check_sealed_batch` |
-//! | [`HeliosSealedResourceUseV1::validate`] | `helios_translator_check_sealed_use` |
-//! | [`HeliosSealedOperandV1::validate`] | `helios_translator_check_sealed_operand` |
-//! | [`HeliosSealedOperandV1::validate_payload_zero`] | `helios_translator_check_operand_payload_zero` |
-//! | [`HeliosOuterScopeCloseV1::validate`] | `helios_translator_check_scope_close` |
-//! | [`HeliosSyncProgressResultV1::validate_join`] | `helios_translator_check_join_result` |
-//! | [`HeliosSyncProgressResultV1::validate_query`] | `helios_translator_check_query_result` |
+//! **Every record that crosses this interface as an input has one**, in both
+//! languages. That completeness is the property, not the count: a record with
+//! no validator is a record whose stated constraints are prose the receiver has
+//! to remember, and the three that were missing when this table was first
+//! written were [`HeliosSealedBatchCopyV1`] — three caller-owned buffers the
+//! ICD *writes into* — [`HeliosSyncProgressJoinV1`], whose unchecked
+//! `context_generation` is a use-after-free, and
+//! [`HeliosOuterContextAttachV1`], whose NULL cookie is uncatchable later.
+//!
+//! | Rust | C | run by |
+//! |---|---|---|
+//! | [`HeliosTranslatorCreateInfoV1::validate`] | `helios_translator_check_create_info` | ICD |
+//! | [`HeliosTranslatorHostCallbacksV1::validate`] | `helios_translator_check_host_callbacks` | ICD |
+//! | [`HeliosTranslatorDispatchV1::validate`] | `helios_translator_check_dispatch` | bridge |
+//! | [`HeliosTranslatorInstanceV1::validate`] | `helios_translator_check_instance` | bridge |
+//! | [`HeliosQueueAttachRequestV1::validate`] | `helios_translator_check_queue_attach_request` | ICD |
+//! | [`HeliosOuterContextAttachV1::validate`] | `helios_translator_check_context_attach` | ICD |
+//! | [`HeliosOuterScopeBeginV1::validate`] | `helios_translator_check_scope_begin` | ICD |
+//! | [`HeliosSealedBatchV1::validate`] | `helios_translator_check_sealed_batch` | bridge |
+//! | [`HeliosSealedBatchCopyV1::validate`] | `helios_translator_check_sealed_batch_copy` | ICD |
+//! | [`HeliosSealedResourceUseV1::validate`] | `helios_translator_check_sealed_use` | bridge |
+//! | [`HeliosSealedOperandV1::validate`] | `helios_translator_check_sealed_operand` | bridge |
+//! | [`HeliosSealedOperandV1::validate_payload_zero`] | `helios_translator_check_operand_payload_zero` | bridge |
+//! | [`HeliosOuterScopeCloseV1::validate`] | `helios_translator_check_scope_close` | ICD |
+//! | [`HeliosSyncProgressJoinV1::validate`] | `helios_translator_check_join_request` | bridge |
+//! | [`HeliosSyncProgressResultV1::validate_join`] | `helios_translator_check_join_result` | ICD |
+//! | [`HeliosSyncProgressResultV1::validate_query`] | `helios_translator_check_query_result` | ICD |
 //!
 //! `protocol/src/translator_dispatch.rs` remains the source of truth: where the
 //! two disagree the Rust wins and the header is the bug.
@@ -684,6 +697,14 @@ pub struct HeliosTranslatorScopeOpaque {
 /// A live outer-operation scope: the window during which the translator may
 /// record into the batch that the owning D3D11 flush or D3D12 ECL association
 /// will submit. See [`HeliosTranslatorDispatchV1::open_outer_scope`].
+///
+/// ⚠ **Two things end a scope, not one.** The obvious one is
+/// [`HeliosTranslatorDispatchV1::close_outer_scope`] on this handle. The other
+/// is a [`HeliosTranslatorHostCallbacksV1::sync_progress_join`] initiated from
+/// *inside* it: the join is required to seal and submit pending work, so it
+/// ends this scope and reopens a fresh one on the same context. The handle is
+/// dead across such a join and the caller re-acquires — see that slot's
+/// "what the cut invalidates".
 pub type HeliosTranslatorScope = *mut HeliosTranslatorScopeOpaque;
 
 // ── Scope disposition ───────────────────────────────────────────────────────
@@ -700,7 +721,7 @@ pub const HELIOS_TRANSLATOR_SCOPE_DISPOSITION_ABANDONED: u32 = 2;
 /// The decoded [`HeliosOuterScopeCloseV1::disposition`].
 ///
 /// The distinction is not bookkeeping. Section 10.4 (1346-1352): an
-/// outer-allocation-backed operation "become[s] real only in the first actual
+/// outer-allocation-backed operation "become\[s\] real only in the first actual
 /// outer batch whose allocation list/GPUVA names every exact allocation", and "no
 /// deferred success is exposed unless its WDDM allocation/backing reservation has
 /// already succeeded". `Committed` is what tells the ICD that the deferred
@@ -778,7 +799,21 @@ pub const HELIOS_TRANSLATOR_SCOPE_CLOSE_BYTES: u32 = 24;
 /// [`HeliosSealedBatchV1`] size.
 pub const HELIOS_TRANSLATOR_SEALED_BATCH_BYTES: u32 = 72;
 /// [`HeliosSealedResourceUseV1`] size — deliberately the same 40 bytes as HOB1's
-/// use record, field-for-field parallel, differing only in the identity pair.
+/// use record ([`crate::wddm::HeliosOuterBatchUseV1`]), with every field at the
+/// same offset as the HOB1 field it stands in for.
+///
+/// ⚠ **Same offsets, not the same fields.** Three of the eight carry a
+/// different meaning, and they are exactly the WDDM identity the ICD may not
+/// supply: `outer_allocation_token` at 0 stands where `address_or_index` does,
+/// `byte_offset` at 16 where `expected_allocation_generation` does, and
+/// `reserved0` at 28 where `identity_kind` does. The other five —
+/// `byte_length`, `access_flags`, `operand_count`, `first_operand`, `reserved1`
+/// — are the same field with the same meaning. So this is a **field-by-field
+/// conversion, never a memcpy plus a patch**: a block copy would leave
+/// `identity_kind` holding a reserved zero, which is an invalid arm, and the
+/// encoder that "only patched the identity pair" would never notice. The
+/// `const` block at the bottom of this file asserts both sides' offsets so the
+/// parallel cannot silently drift.
 pub const HELIOS_TRANSLATOR_SEALED_USE_BYTES: u32 = 40;
 /// [`HeliosSealedOperandV1`] size — the same 16 bytes as HOB1's typed operand.
 pub const HELIOS_TRANSLATOR_SEALED_OPERAND_BYTES: u32 = 16;
@@ -794,10 +829,12 @@ pub const HELIOS_TRANSLATOR_REFUSAL_COUNTERS_BYTES: u32 = 112;
 /// The exact byte size the [`HeliosTranslatorDispatchV1::build_queue_attach`] out
 /// buffer must have: [`crate::translation_session::HELIOS_HQA1_SIZE`].
 ///
-/// Restated here as a `u32` only so the C mirror can `_Static_assert` the
-/// parameter contract without depending on the HQA1 mirror header, which is a
-/// separate file. The `const` block at the bottom pins the two together, so they
-/// cannot drift.
+/// Restated here as a `u32` so a slot's parameter contract can be stated in the
+/// units it is checked in, without a consumer having to reach for a sibling
+/// record's `sizeof`. The `const` block at the bottom pins it against
+/// [`HeliosQueueAttachV1`], and the C mirror carries the twin pin against both
+/// `HELIOS_HQA1_SIZE` and `sizeof(HeliosQueueAttachV1)`, so the restatement
+/// cannot drift from what it restates.
 pub const HELIOS_TRANSLATOR_HQA1_BYTES: u32 =
     crate::translation_session::HELIOS_HQA1_SIZE as u32;
 
@@ -1119,11 +1156,45 @@ pub struct HeliosTranslatorHostCallbacksV1 {
     ///      `required_progress_value` when it is nonzero), then fill
     ///      [`HeliosSyncProgressResultV1`].
     ///
-    /// ⛔ **The ICD must not cache a [`HeliosTranslatorScope`] across this
-    /// call.** Its thread-current scope identity changes across a join by
-    /// design; it re-reads it on return. This is the one place in the ABI where
-    /// a scope handle is invalidated by something other than
-    /// `close_outer_scope` being called on it directly.
+    /// **What the cut invalidates, and what the ICD must re-acquire.** Step 1
+    /// is a *seal*, and a seal is terminal: section 10.4 (1354-1360) says the
+    /// join must "force the owning outer UMD to submit pending batches", and
+    /// the only way this ABI expresses that is
+    /// [`HeliosTranslatorDispatchV1::seal_outer_scope`] followed by
+    /// [`HeliosTranslatorDispatchV1::close_outer_scope`]. So a join does not
+    /// suspend the caller's scope — it **ends** it, and the scope the caller
+    /// resumes into is a different one with a different batch. Three
+    /// consequences, all of them the ICD's obligation:
+    ///
+    ///   1. **The scope handle is dead.** Its thread-current scope identity
+    ///      changes across a join by design; it re-reads it on return, and must
+    ///      never cache a [`HeliosTranslatorScope`] across an up-call. This is
+    ///      the one place in the ABI where a scope handle is invalidated by
+    ///      something other than `close_outer_scope` being called on it
+    ///      directly.
+    ///   2. **Everything derived from the sealed batch is dead with it** — the
+    ///      context-local batch ID, every index into that batch's use and
+    ///      operand tables, and any partially built record the ICD was
+    ///      accumulating for it. The reopened scope starts an empty batch at
+    ///      the next batch ID (gaps are legal, reuse is not), and recording
+    ///      resumes there. Nothing already sealed is re-recorded into it.
+    ///   3. **A join may therefore only be initiated at a complete generated
+    ///      command/API operation boundary**, exactly like the size split of
+    ///      section 10.4 (1297-1304), and for the same reason: the seal it
+    ///      performs cannot bisect a generated operation. A GPU-dependent
+    ///      synchronous Vulkan call is such a boundary — it is *between*
+    ///      operations by construction — which is why the triggering set is
+    ///      the fence/query/idle calls and nothing else. An ICD that called up
+    ///      from the middle of expanding one API command into several Venus
+    ///      commands would split where the contract forbids splitting, and no
+    ///      refusal here could detect it: the ICD is the only party that knows
+    ///      where its operation boundaries are.
+    ///
+    /// The pre-join batch's deferred outer-allocation-backed operations are
+    /// realised (`COMMITTED`) or not (`ABANDONED`) as of the close in step 1
+    /// or 2, on the ordinary rules of
+    /// [`HeliosTranslatorDispatchV1::close_outer_scope`]; the join adds no
+    /// third disposition and no deferred re-realisation in the new scope.
     ///
     /// A join nested inside a join is a cycle and is refused with
     /// [`HeliosTranslatorStatus::ReentrantJoin`], counted by
@@ -1646,7 +1717,7 @@ pub struct HeliosTranslatorRefusalCountersV1 {
     /// (section 10.4: "No second `VkInstance` may be created in that host
     /// context", and section 10.9's HTS1 row makes a second instance in one host
     /// context a device-creation failure), or any Win32 surface/swapchain entry
-    /// point (section 13.2: a translator instance "advertise[s] no Win32
+    /// point (section 13.2: a translator instance "advertise\[s\] no Win32
     /// surface/swapchain extension").
     ///
     /// Also returned as `NULL`, and counted for the same reason as its
@@ -2041,6 +2112,12 @@ pub struct HeliosTranslatorDispatchV1 {
     /// the conservative reading: D3D serialises its own per-context calls, and
     /// blocking here would invent a lock that section 13.3 does not allow and that
     /// would be held across translator code.
+    ///
+    /// ⚠ **The bridge also calls this slot from inside step 3 of a
+    /// [`HeliosTranslatorHostCallbacksV1::sync_progress_join`]**, to replace the
+    /// scope that join's seal-and-submit just ended. That reopen is an ordinary
+    /// open on the same context — it is legal precisely because the join closed
+    /// the previous scope first, so it is never `ScopeAlreadyOpen`.
     pub open_outer_scope: PfnHeliosTranslatorOpenOuterScope,
 
     /// **Direction:** bridge → ICD. **May block: NO. Locks:** the bounded
@@ -2300,6 +2377,65 @@ impl HeliosTranslatorInstanceV1 {
     }
 }
 
+impl HeliosQueueAttachRequestV1 {
+    /// Total check on the request, run by the **ICD** before it seals a single
+    /// byte of HQA1.
+    ///
+    /// ⚠ **Every check here is field-local, and that is the point of the
+    /// division.** Three of this record's fields are only fully checkable
+    /// against session state the ICD holds and this crate does not:
+    ///
+    ///   - [`Self::context_generation`] must be "nonzero, monotonically
+    ///     increasing and never reused within this HTS1 session"
+    ///     (section 10.4, 1233). Only *nonzero* is a property of the record;
+    ///     monotonic-and-unused is a property of the session's issued set, so
+    ///     the ICD re-checks it there and returns the same
+    ///     [`HeliosTranslatorStatus::ContextGeneration`].
+    ///   - [`Self::endpoint_id`] must name an endpoint of *this* session. Only
+    ///     nonzero is checkable here; the ICD's resolution returns
+    ///     [`HeliosTranslatorStatus::UnknownEndpoint`].
+    ///   - [`Self::engine_class`] must be "the exact graphics/compute/copy class
+    ///     admitted for the outer context" — i.e. the selected endpoint's class.
+    ///     Only *defined* is checkable here; the comparison against the resolved
+    ///     endpoint is the ICD's, and returns the same
+    ///     [`HeliosTranslatorStatus::EngineClass`].
+    ///
+    /// So passing this is necessary and not sufficient, by construction. It is
+    /// still worth having as the one place both languages agree on the shape,
+    /// and it is why each of those three refusals has exactly one code shared by
+    /// the field check and the state check: a consumer that saw two codes for
+    /// one cause would have to learn which layer refused it.
+    pub fn validate(&self) -> Result<(), HeliosTranslatorStatus> {
+        if self.struct_bytes != HELIOS_TRANSLATOR_QUEUE_ATTACH_REQUEST_BYTES {
+            return Err(HeliosTranslatorStatus::StructBytes);
+        }
+        if self.abi_version != HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION {
+            return Err(HeliosTranslatorStatus::AbiVersion);
+        }
+        if self.reserved != 0 {
+            return Err(HeliosTranslatorStatus::ReservedNonZero);
+        }
+        if self.context_generation == 0 {
+            return Err(HeliosTranslatorStatus::ContextGeneration);
+        }
+        if self.endpoint_id == 0 {
+            return Err(HeliosTranslatorStatus::UnknownEndpoint);
+        }
+        if self.engine_class != crate::translation_session::HELIOS_ENGINE_CLASS_GRAPHICS
+            && self.engine_class != crate::translation_session::HELIOS_ENGINE_CLASS_COMPUTE
+            && self.engine_class != crate::translation_session::HELIOS_ENGINE_CLASS_COPY
+        {
+            return Err(HeliosTranslatorStatus::EngineClass);
+        }
+        if self.context_flags != crate::translation_session::HELIOS_HQA1_FLAG_D3D11_PHYSICAL
+            && self.context_flags != crate::translation_session::HELIOS_HQA1_FLAG_D3D12_VIRTUAL
+        {
+            return Err(HeliosTranslatorStatus::ContextFlags);
+        }
+        Ok(())
+    }
+}
+
 impl HeliosSealedBatchV1 {
     /// Total check the bridge runs on a seal descriptor before it sizes a buffer
     /// or encodes a byte.
@@ -2387,6 +2523,167 @@ impl HeliosSealedBatchV1 {
             Some(total) if total <= crate::wddm::HELIOS_HOB1_MAX_BYTES => Ok(()),
             _ => Err(HeliosTranslatorStatus::BatchBoundExceeded),
         }
+    }
+}
+
+impl HeliosSealedBatchCopyV1 {
+    /// Total check on the copy destination, run by the **ICD** before
+    /// [`HeliosTranslatorDispatchV1::copy_sealed_batch`] writes a single byte.
+    ///
+    /// ⛔ **This is the one validator in the file whose absence is a memory
+    /// error rather than a wrong answer.** Every other record here is data the
+    /// receiver interprets; this one is three caller-owned buffers and their
+    /// capacities, and the ICD is about to *write* into them. "Must be `>=
+    /// payload_bytes`" as a doc comment is a rule the ICD has to remember; as a
+    /// function it is a rule the ICD cannot forget, and the crate's whole
+    /// premise is that the check lives once rather than three times in three
+    /// repositories.
+    ///
+    /// `batch` is the [`HeliosSealedBatchV1`] the seal returned, which is where
+    /// every required size comes from — never from the descriptor. Validate the
+    /// batch first ([`HeliosSealedBatchV1::validate`]); this function trusts its
+    /// counts, and they are already bounded there.
+    ///
+    /// A short capacity is [`HeliosTranslatorStatus::BufferTooSmall`] and
+    /// **nothing is written**: section 10.4 point 4 makes the copy "synchronous
+    /// and total", so there is no partial copy and no resize handshake.
+    pub fn validate(&self, batch: &HeliosSealedBatchV1) -> Result<(), HeliosTranslatorStatus> {
+        if self.struct_bytes != HELIOS_TRANSLATOR_SEALED_BATCH_COPY_BYTES {
+            return Err(HeliosTranslatorStatus::StructBytes);
+        }
+        if self.abi_version != HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION {
+            return Err(HeliosTranslatorStatus::AbiVersion);
+        }
+        if self.reserved0 != 0 || self.reserved1 != 0 {
+            return Err(HeliosTranslatorStatus::ReservedNonZero);
+        }
+        // The payload is never empty — a sealed batch has nonzero
+        // `payload_bytes` — so its destination is unconditionally required.
+        if self.payload.is_null() {
+            return Err(HeliosTranslatorStatus::NullArgument);
+        }
+        if self.payload_capacity < batch.payload_bytes {
+            return Err(HeliosTranslatorStatus::BufferTooSmall);
+        }
+        // ⚠ The NULL check is conditioned on the batch's count, not on the
+        // caller's capacity. A descriptor with `uses = NULL, use_capacity = 8`
+        // would otherwise pass a capacity test and be dereferenced; and a batch
+        // with `use_count == 0` is legal (a pure state-setting operation
+        // touches no allocation), so an unconditional NULL check would refuse a
+        // correct caller.
+        if batch.use_count > 0 && self.uses.is_null() {
+            return Err(HeliosTranslatorStatus::NullArgument);
+        }
+        if self.use_capacity < batch.use_count {
+            return Err(HeliosTranslatorStatus::BufferTooSmall);
+        }
+        if batch.operand_count > 0 && self.operands.is_null() {
+            return Err(HeliosTranslatorStatus::NullArgument);
+        }
+        if self.operand_capacity < batch.operand_count {
+            return Err(HeliosTranslatorStatus::BufferTooSmall);
+        }
+        Ok(())
+    }
+}
+
+impl HeliosOuterContextAttachV1 {
+    /// Total check on the attach record, run by the **ICD** when the bridge
+    /// reports that the runtime accepted an HQA1.
+    ///
+    /// Field-local, on the same division as
+    /// [`HeliosQueueAttachRequestV1::validate`]: whether this generation is one
+    /// the ICD actually sealed a packet for, and whether it is already attached,
+    /// are properties of the session's state, and the ICD answers them with
+    /// [`HeliosTranslatorStatus::UnknownContext`] and
+    /// [`HeliosTranslatorStatus::ContextAlreadyAttached`] respectively.
+    pub fn validate(&self) -> Result<(), HeliosTranslatorStatus> {
+        if self.struct_bytes != HELIOS_TRANSLATOR_CONTEXT_ATTACH_BYTES {
+            return Err(HeliosTranslatorStatus::StructBytes);
+        }
+        if self.abi_version != HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION {
+            return Err(HeliosTranslatorStatus::AbiVersion);
+        }
+        if self.context_generation == 0 {
+            return Err(HeliosTranslatorStatus::ContextGeneration);
+        }
+        if self.endpoint_id == 0 {
+            return Err(HeliosTranslatorStatus::UnknownEndpoint);
+        }
+        if self.context_flags != crate::translation_session::HELIOS_HQA1_FLAG_D3D11_PHYSICAL
+            && self.context_flags != crate::translation_session::HELIOS_HQA1_FLAG_D3D12_VIRTUAL
+        {
+            return Err(HeliosTranslatorStatus::ContextFlags);
+        }
+        // The cookie is the only argument every later up-call carries. A NULL
+        // one produces an up-call the bridge cannot resolve, and there is no
+        // later point at which it becomes checkable.
+        if self.host_context_cookie.is_null() {
+            return Err(HeliosTranslatorStatus::NullArgument);
+        }
+        Ok(())
+    }
+}
+
+impl HeliosOuterScopeBeginV1 {
+    /// Total check on the scope-begin record, run by the **ICD** in
+    /// [`HeliosTranslatorDispatchV1::open_outer_scope`].
+    ///
+    /// Field-local for the same reason as its neighbours: that the named context
+    /// is attached to *this* instance is session state, and the ICD answers it
+    /// with [`HeliosTranslatorStatus::UnknownContext`].
+    pub fn validate(&self) -> Result<(), HeliosTranslatorStatus> {
+        if self.struct_bytes != HELIOS_TRANSLATOR_SCOPE_BEGIN_BYTES {
+            return Err(HeliosTranslatorStatus::StructBytes);
+        }
+        if self.abi_version != HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION {
+            return Err(HeliosTranslatorStatus::AbiVersion);
+        }
+        if self.reserved != 0 {
+            return Err(HeliosTranslatorStatus::ReservedNonZero);
+        }
+        if self.context_generation == 0 {
+            return Err(HeliosTranslatorStatus::ContextGeneration);
+        }
+        if self.endpoint_id == 0 {
+            return Err(HeliosTranslatorStatus::UnknownEndpoint);
+        }
+        Ok(())
+    }
+}
+
+impl HeliosSyncProgressJoinV1 {
+    /// Total check on a join request, run by the **UMD bridge** the moment the
+    /// up-call arrives and before it dereferences anything.
+    ///
+    /// `live_context_generation` is the generation of the context that
+    /// `host_context_cookie` belongs to, read from the bridge's own state. This
+    /// is the check [`Self::context_generation`] exists for, and it is the one
+    /// place in the ABI where skipping a validator is a **use-after-free**
+    /// rather than a wrong answer: without it a join in flight on thread B
+    /// against a queue thread A has already destroyed hands the bridge a freed
+    /// cookie and nothing to compare it against.
+    ///
+    /// A mismatch is [`HeliosTranslatorStatus::UnknownContext`] — a refusal,
+    /// never a lookup that finds the right context. Generations are never
+    /// reused within a session (section 10.4), so a mismatch is always a stale
+    /// caller and never an ambiguity.
+    ///
+    /// [`Self::required_progress_value`] is deliberately unconstrained here:
+    /// zero is the legal "everything pending" form, and whether a nonzero value
+    /// is one this bridge ever issued is bridge state
+    /// ([`HeliosTranslatorStatus::HostCallbackFailed`]).
+    pub fn validate(&self, live_context_generation: u64) -> Result<(), HeliosTranslatorStatus> {
+        if self.struct_bytes != HELIOS_TRANSLATOR_SYNC_PROGRESS_JOIN_BYTES {
+            return Err(HeliosTranslatorStatus::StructBytes);
+        }
+        if self.abi_version != HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION {
+            return Err(HeliosTranslatorStatus::AbiVersion);
+        }
+        if live_context_generation == 0 || self.context_generation != live_context_generation {
+            return Err(HeliosTranslatorStatus::UnknownContext);
+        }
+        Ok(())
     }
 }
 
@@ -2651,7 +2948,7 @@ const _: () = {
     assert!(core::mem::offset_of!(HeliosTranslatorCreateInfoV1, adapter_luid_high) == 28);
     assert!(core::mem::offset_of!(HeliosTranslatorCreateInfoV1, host_callbacks) == 32);
 
-    assert!(core::mem::size_of::<HeliosTranslatorInstanceV1>() == 40);
+    assert!(core::mem::size_of::<HeliosTranslatorInstanceV1>() == 48);
     assert!(
         core::mem::size_of::<HeliosTranslatorInstanceV1>()
             == HELIOS_TRANSLATOR_INSTANCE_BYTES as usize
@@ -2661,9 +2958,10 @@ const _: () = {
     assert!(core::mem::offset_of!(HeliosTranslatorInstanceV1, abi_version) == 4);
     assert!(core::mem::offset_of!(HeliosTranslatorInstanceV1, handle) == 8);
     assert!(core::mem::offset_of!(HeliosTranslatorInstanceV1, dispatch) == 16);
-    assert!(core::mem::offset_of!(HeliosTranslatorInstanceV1, session_generation) == 24);
-    assert!(core::mem::offset_of!(HeliosTranslatorInstanceV1, endpoint_capacity) == 32);
-    assert!(core::mem::offset_of!(HeliosTranslatorInstanceV1, submission_mode) == 36);
+    assert!(core::mem::offset_of!(HeliosTranslatorInstanceV1, vk_instance) == 24);
+    assert!(core::mem::offset_of!(HeliosTranslatorInstanceV1, session_generation) == 32);
+    assert!(core::mem::offset_of!(HeliosTranslatorInstanceV1, endpoint_capacity) == 40);
+    assert!(core::mem::offset_of!(HeliosTranslatorInstanceV1, submission_mode) == 44);
 
     // ── The two tables ──
     assert!(core::mem::size_of::<HeliosTranslatorHostCallbacksV1>() == 32);
@@ -2701,20 +2999,27 @@ const _: () = {
     assert!(core::mem::offset_of!(HeliosTranslatorDispatchV1, destroy_instance) == 104);
 
     // ── Parameter records ──
-    assert!(core::mem::size_of::<HeliosQueueAttachRequestV1>() == 24);
+    assert!(core::mem::size_of::<HeliosQueueAttachRequestV1>() == 32);
     assert!(
         core::mem::size_of::<HeliosQueueAttachRequestV1>()
             == HELIOS_TRANSLATOR_QUEUE_ATTACH_REQUEST_BYTES as usize
     );
+    assert!(core::mem::offset_of!(HeliosQueueAttachRequestV1, struct_bytes) == 0);
+    assert!(core::mem::offset_of!(HeliosQueueAttachRequestV1, abi_version) == 4);
     assert!(core::mem::offset_of!(HeliosQueueAttachRequestV1, context_generation) == 8);
     assert!(core::mem::offset_of!(HeliosQueueAttachRequestV1, endpoint_id) == 16);
-    assert!(core::mem::offset_of!(HeliosQueueAttachRequestV1, context_flags) == 20);
+    assert!(core::mem::offset_of!(HeliosQueueAttachRequestV1, engine_class) == 20);
+    assert!(core::mem::offset_of!(HeliosQueueAttachRequestV1, context_flags) == 24);
+    assert!(core::mem::offset_of!(HeliosQueueAttachRequestV1, reserved) == 28);
 
     assert!(core::mem::size_of::<HeliosOuterContextAttachV1>() == 32);
     assert!(
         core::mem::size_of::<HeliosOuterContextAttachV1>()
             == HELIOS_TRANSLATOR_CONTEXT_ATTACH_BYTES as usize
     );
+    assert!(core::mem::align_of::<HeliosOuterContextAttachV1>() == 8);
+    assert!(core::mem::offset_of!(HeliosOuterContextAttachV1, struct_bytes) == 0);
+    assert!(core::mem::offset_of!(HeliosOuterContextAttachV1, abi_version) == 4);
     assert!(core::mem::offset_of!(HeliosOuterContextAttachV1, context_generation) == 8);
     assert!(core::mem::offset_of!(HeliosOuterContextAttachV1, endpoint_id) == 16);
     assert!(core::mem::offset_of!(HeliosOuterContextAttachV1, context_flags) == 20);
@@ -2725,6 +3030,8 @@ const _: () = {
         core::mem::size_of::<HeliosOuterScopeBeginV1>()
             == HELIOS_TRANSLATOR_SCOPE_BEGIN_BYTES as usize
     );
+    assert!(core::mem::offset_of!(HeliosOuterScopeBeginV1, struct_bytes) == 0);
+    assert!(core::mem::offset_of!(HeliosOuterScopeBeginV1, abi_version) == 4);
     assert!(core::mem::offset_of!(HeliosOuterScopeBeginV1, context_generation) == 8);
     assert!(core::mem::offset_of!(HeliosOuterScopeBeginV1, endpoint_id) == 16);
     assert!(core::mem::offset_of!(HeliosOuterScopeBeginV1, reserved) == 20);
@@ -2734,6 +3041,8 @@ const _: () = {
         core::mem::size_of::<HeliosOuterScopeCloseV1>()
             == HELIOS_TRANSLATOR_SCOPE_CLOSE_BYTES as usize
     );
+    assert!(core::mem::offset_of!(HeliosOuterScopeCloseV1, struct_bytes) == 0);
+    assert!(core::mem::offset_of!(HeliosOuterScopeCloseV1, abi_version) == 4);
     assert!(core::mem::offset_of!(HeliosOuterScopeCloseV1, disposition) == 8);
     assert!(core::mem::offset_of!(HeliosOuterScopeCloseV1, reserved) == 12);
     assert!(core::mem::offset_of!(HeliosOuterScopeCloseV1, progress_value) == 16);
@@ -2744,6 +3053,8 @@ const _: () = {
         core::mem::size_of::<HeliosSealedBatchV1>() == HELIOS_TRANSLATOR_SEALED_BATCH_BYTES as usize
     );
     assert!(core::mem::align_of::<HeliosSealedBatchV1>() == 8);
+    assert!(core::mem::offset_of!(HeliosSealedBatchV1, struct_bytes) == 0);
+    assert!(core::mem::offset_of!(HeliosSealedBatchV1, abi_version) == 4);
     assert!(core::mem::offset_of!(HeliosSealedBatchV1, package_generation) == 8);
     assert!(core::mem::offset_of!(HeliosSealedBatchV1, session_generation) == 16);
     assert!(core::mem::offset_of!(HeliosSealedBatchV1, context_generation) == 24);
@@ -2768,14 +3079,34 @@ const _: () = {
             == crate::wddm::HELIOS_HOB1_USE_RECORD_BYTES as usize
     );
     assert!(core::mem::align_of::<HeliosSealedResourceUseV1>() == 8);
+    // ⚠ Every offset below is the offset of the HOB1 field it stands in for, so
+    // the pairs are pinned rather than described: `byte_length` and
+    // `access_flags`/`operand_count`/`first_operand`/`reserved1` are the same
+    // field at the same offset, and the three that differ — token/`address_or_index`
+    // at 0, `byte_offset`/`expected_allocation_generation` at 16, and
+    // `reserved0`/`identity_kind` at 28 — are exactly the WDDM identity the ICD
+    // may not supply. An accidental field reorder here silently breaks the
+    // field-by-field conversion in the UMD encoder, so the parallel is asserted.
     assert!(core::mem::offset_of!(HeliosSealedResourceUseV1, outer_allocation_token) == 0);
-    assert!(core::mem::offset_of!(HeliosSealedResourceUseV1, byte_offset) == 8);
-    assert!(core::mem::offset_of!(HeliosSealedResourceUseV1, byte_length) == 16);
+    assert!(core::mem::offset_of!(HeliosSealedResourceUseV1, byte_length) == 8);
+    assert!(core::mem::offset_of!(HeliosSealedResourceUseV1, byte_offset) == 16);
     assert!(core::mem::offset_of!(HeliosSealedResourceUseV1, access_flags) == 24);
-    assert!(core::mem::offset_of!(HeliosSealedResourceUseV1, operand_count) == 28);
-    assert!(core::mem::offset_of!(HeliosSealedResourceUseV1, reserved0) == 30);
+    assert!(core::mem::offset_of!(HeliosSealedResourceUseV1, reserved0) == 28);
+    assert!(core::mem::offset_of!(HeliosSealedResourceUseV1, operand_count) == 30);
     assert!(core::mem::offset_of!(HeliosSealedResourceUseV1, first_operand) == 32);
     assert!(core::mem::offset_of!(HeliosSealedResourceUseV1, reserved1) == 36);
+    // The HOB1 twins, so a change on either side breaks the build here.
+    assert!(core::mem::offset_of!(crate::wddm::HeliosOuterBatchUseV1, address_or_index) == 0);
+    assert!(core::mem::offset_of!(crate::wddm::HeliosOuterBatchUseV1, byte_length) == 8);
+    assert!(
+        core::mem::offset_of!(crate::wddm::HeliosOuterBatchUseV1, expected_allocation_generation)
+            == 16
+    );
+    assert!(core::mem::offset_of!(crate::wddm::HeliosOuterBatchUseV1, access_flags) == 24);
+    assert!(core::mem::offset_of!(crate::wddm::HeliosOuterBatchUseV1, identity_kind) == 28);
+    assert!(core::mem::offset_of!(crate::wddm::HeliosOuterBatchUseV1, operand_count) == 30);
+    assert!(core::mem::offset_of!(crate::wddm::HeliosOuterBatchUseV1, first_operand) == 32);
+    assert!(core::mem::offset_of!(crate::wddm::HeliosOuterBatchUseV1, reserved) == 36);
 
     assert!(core::mem::size_of::<HeliosSealedOperandV1>() == 16);
     assert!(
@@ -2797,6 +3128,9 @@ const _: () = {
         core::mem::size_of::<HeliosSealedBatchCopyV1>()
             == HELIOS_TRANSLATOR_SEALED_BATCH_COPY_BYTES as usize
     );
+    assert!(core::mem::align_of::<HeliosSealedBatchCopyV1>() == 8);
+    assert!(core::mem::offset_of!(HeliosSealedBatchCopyV1, struct_bytes) == 0);
+    assert!(core::mem::offset_of!(HeliosSealedBatchCopyV1, abi_version) == 4);
     assert!(core::mem::offset_of!(HeliosSealedBatchCopyV1, payload) == 8);
     assert!(core::mem::offset_of!(HeliosSealedBatchCopyV1, payload_capacity) == 16);
     assert!(core::mem::offset_of!(HeliosSealedBatchCopyV1, uses) == 24);
@@ -2812,6 +3146,9 @@ const _: () = {
         core::mem::size_of::<HeliosSyncProgressJoinV1>()
             == HELIOS_TRANSLATOR_SYNC_PROGRESS_JOIN_BYTES as usize
     );
+    assert!(core::mem::align_of::<HeliosSyncProgressJoinV1>() == 8);
+    assert!(core::mem::offset_of!(HeliosSyncProgressJoinV1, struct_bytes) == 0);
+    assert!(core::mem::offset_of!(HeliosSyncProgressJoinV1, abi_version) == 4);
     assert!(core::mem::offset_of!(HeliosSyncProgressJoinV1, required_progress_value) == 8);
     assert!(core::mem::offset_of!(HeliosSyncProgressJoinV1, context_generation) == 16);
 
@@ -2820,18 +3157,63 @@ const _: () = {
         core::mem::size_of::<HeliosSyncProgressResultV1>()
             == HELIOS_TRANSLATOR_SYNC_PROGRESS_RESULT_BYTES as usize
     );
+    assert!(core::mem::align_of::<HeliosSyncProgressResultV1>() == 8);
+    assert!(core::mem::offset_of!(HeliosSyncProgressResultV1, struct_bytes) == 0);
+    assert!(core::mem::offset_of!(HeliosSyncProgressResultV1, abi_version) == 4);
     assert!(core::mem::offset_of!(HeliosSyncProgressResultV1, completed_progress_value) == 8);
     assert!(core::mem::offset_of!(HeliosSyncProgressResultV1, last_submitted_progress_value) == 16);
     assert!(core::mem::offset_of!(HeliosSyncProgressResultV1, flags) == 24);
     assert!(core::mem::offset_of!(HeliosSyncProgressResultV1, reserved) == 28);
 
-    assert!(core::mem::size_of::<HeliosTranslatorRefusalCountersV1>() == 88);
+    assert!(core::mem::size_of::<HeliosTranslatorRefusalCountersV1>() == 112);
     assert!(
         core::mem::size_of::<HeliosTranslatorRefusalCountersV1>()
             == HELIOS_TRANSLATOR_REFUSAL_COUNTERS_BYTES as usize
     );
+    assert!(core::mem::align_of::<HeliosTranslatorRefusalCountersV1>() == 8);
+    // Every counter's offset, not a first-and-last pair: a consumer that reads
+    // these through the C mirror indexes by offset, and an inserted field would
+    // otherwise renumber every counter after it without breaking anything.
+    assert!(core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, struct_bytes) == 0);
+    assert!(core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, abi_version) == 4);
     assert!(core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, queue_submit_without_scope) == 8);
+    assert!(
+        core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, queue_submit2_without_scope) == 16
+    );
+    assert!(
+        core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, queue_bind_sparse_without_scope)
+            == 24
+    );
+    assert!(core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, queue_present_refused) == 32);
+    assert!(
+        core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, queue_wait_idle_without_scope) == 40
+    );
+    assert!(
+        core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, device_wait_idle_without_scope)
+            == 48
+    );
+    assert!(
+        core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, loader_provenance_rejected) == 56
+    );
+    assert!(
+        core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, control_opcode_class_violation)
+            == 64
+    );
+    assert!(
+        core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, deferred_use_without_outer_batch)
+            == 72
+    );
     assert!(core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, batch_bound_exceeded) == 80);
+    assert!(
+        core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, foreign_vulkan_handle_rejected)
+            == 88
+    );
+    assert!(
+        core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, withheld_proc_addr_refused) == 96
+    );
+    assert!(
+        core::mem::offset_of!(HeliosTranslatorRefusalCountersV1, reentrant_join_refused) == 104
+    );
 
     // ── Cross-module pins ──
     // The two constants this module restates as `u32` for the C mirror must equal
@@ -2852,7 +3234,7 @@ const _: () = {
     assert!(HELIOS_TRANSLATOR_SCOPE_DISPOSITION_ABANDONED == 2);
     assert!(HELIOS_TRANSLATOR_PROGRESS_FLAGS_MASK == 1);
     assert!(HeliosTranslatorStatus::Ok.wire() == 0);
-    assert!(HeliosTranslatorStatus::MAX == 38);
+    assert!(HeliosTranslatorStatus::MAX == 45);
 };
 
 #[cfg(test)]
@@ -2873,6 +3255,7 @@ mod tests {
 
     extern "C" fn stub_query(
         _cookie: *mut c_void,
+        _context_generation: u64,
         _out: *mut HeliosSyncProgressResultV1,
     ) -> HeliosTranslatorStatusCode {
         HeliosTranslatorStatus::Ok.wire()
@@ -2889,6 +3272,7 @@ mod tests {
         _i: HeliosTranslatorHandle,
         _c: *mut u32,
         _e: *mut HeliosTranslationEndpointV1,
+        _b: u32,
     ) -> HeliosTranslatorStatusCode {
         HeliosTranslatorStatus::Ok.wire()
     }
@@ -3132,6 +3516,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_queue_attach_request_states_the_outer_contexts_own_class() {
+        let base = HeliosQueueAttachRequestV1 {
+            struct_bytes: HELIOS_TRANSLATOR_QUEUE_ATTACH_REQUEST_BYTES,
+            abi_version: HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION,
+            context_generation: 11,
+            endpoint_id: 2,
+            engine_class: crate::translation_session::HELIOS_ENGINE_CLASS_COPY,
+            context_flags: HELIOS_HQA1_FLAG_D3D12_VIRTUAL,
+            reserved: 0,
+        };
+        assert_eq!(base.validate(), Ok(()));
+
+        // A zeroed record is refused field by field, never defaulted.
+        let mut r = base;
+        r.context_generation = 0;
+        assert_eq!(
+            r.validate(),
+            Err(HeliosTranslatorStatus::ContextGeneration)
+        );
+
+        let mut r = base;
+        r.endpoint_id = 0;
+        assert_eq!(r.validate(), Err(HeliosTranslatorStatus::UnknownEndpoint));
+
+        // Zero is not "whatever the endpoint says": the field exists so that a
+        // COPY queue selecting a GRAPHICS endpoint is refusable at all.
+        let mut r = base;
+        r.engine_class = 0;
+        assert_eq!(r.validate(), Err(HeliosTranslatorStatus::EngineClass));
+        let mut r = base;
+        r.engine_class = 4;
+        assert_eq!(r.validate(), Err(HeliosTranslatorStatus::EngineClass));
+
+        // Exactly one context-kind flag: neither zero nor both.
+        let mut r = base;
+        r.context_flags = 0;
+        assert_eq!(r.validate(), Err(HeliosTranslatorStatus::ContextFlags));
+        let mut r = base;
+        r.context_flags = HELIOS_HQA1_FLAG_D3D11_PHYSICAL | HELIOS_HQA1_FLAG_D3D12_VIRTUAL;
+        assert_eq!(r.validate(), Err(HeliosTranslatorStatus::ContextFlags));
+
+        let mut r = base;
+        r.reserved = 1;
+        assert_eq!(r.validate(), Err(HeliosTranslatorStatus::ReservedNonZero));
+
+        let mut r = base;
+        r.struct_bytes = HELIOS_TRANSLATOR_QUEUE_ATTACH_REQUEST_BYTES - 8;
+        assert_eq!(r.validate(), Err(HeliosTranslatorStatus::StructBytes));
+    }
+
     // ── The sealed batch ────────────────────────────────────────────────────
 
     #[test]
@@ -3148,7 +3583,9 @@ mod tests {
             Ok(())
         );
         // A stale session, context, or endpoint is a named refusal, never a
-        // lookup that finds the right one.
+        // lookup that finds the right one — and a stale *generation* is
+        // `SessionGeneration`, not `SessionInit`, which means the session never
+        // came up at all.
         assert_eq!(
             s.validate(
                 HELIOS_PACKAGE_GENERATION,
@@ -3157,7 +3594,7 @@ mod tests {
                 2,
                 HELIOS_HQA1_FLAG_D3D12_VIRTUAL
             ),
-            Err(HeliosTranslatorStatus::SessionInit)
+            Err(HeliosTranslatorStatus::SessionGeneration)
         );
         assert_eq!(
             s.validate(
@@ -3273,11 +3710,23 @@ mod tests {
             Err(HeliosTranslatorStatus::NullArgument)
         );
 
+        // A zero-length use is an illegal *range*, not a too-small destination
+        // buffer: `BufferTooSmall` names a caller's copy-out buffer.
         let mut u = base;
         u.byte_length = 0;
         assert_eq!(
             u.validate(HELIOS_HQA1_FLAG_D3D11_PHYSICAL),
-            Err(HeliosTranslatorStatus::BufferTooSmall)
+            Err(HeliosTranslatorStatus::SealedUseRange)
+        );
+
+        // …and so is a range that wraps 64 bits, which is the other half of
+        // that code's documented meaning.
+        let mut u = base;
+        u.byte_offset = u64::MAX - 16;
+        u.byte_length = 4096;
+        assert_eq!(
+            u.validate(HELIOS_HQA1_FLAG_D3D12_VIRTUAL),
+            Err(HeliosTranslatorStatus::SealedUseRange)
         );
 
         // PRIMARY_WRITE implies WRITE (section 10.4, line 1283).
@@ -3317,25 +3766,30 @@ mod tests {
         };
         assert_eq!(base.validate(4096, 1), Ok(()));
 
+        // An operand that runs off the end of the payload, and a misaligned one,
+        // are both illegal *encodings*. Neither is `BatchBoundExceeded`, which
+        // means "the producer failed to split at 4096 uses / 8192 operands /
+        // 15 MiB" and would send a gate hunting the wrong defect.
         let mut o = base;
         o.payload_relative_offset = 4092;
         assert_eq!(
             o.validate(4096, 1),
-            Err(HeliosTranslatorStatus::BatchBoundExceeded)
+            Err(HeliosTranslatorStatus::OperandEncoding)
         );
 
         let mut o = base;
         o.payload_relative_offset = 17;
         assert_eq!(
             o.validate(4096, 1),
-            Err(HeliosTranslatorStatus::BatchBoundExceeded)
+            Err(HeliosTranslatorStatus::OperandEncoding)
         );
 
+        // An out-of-range use index is an index error and has its own code.
         let mut o = base;
         o.use_index = 1;
         assert_eq!(
             o.validate(4096, 1),
-            Err(HeliosTranslatorStatus::BatchBoundExceeded)
+            Err(HeliosTranslatorStatus::OperandUseIndex)
         );
 
         let mut o = base;
@@ -3351,6 +3805,164 @@ mod tests {
             o.validate(4096, 1),
             Err(HeliosTranslatorStatus::OperandEncoding)
         );
+    }
+
+    #[test]
+    fn a_copy_destination_is_checked_against_the_seal_not_against_itself() {
+        let batch = good_sealed();
+        let mut uses = [HeliosSealedResourceUseV1::default(); 4];
+        let mut operands = [HeliosSealedOperandV1::default(); 4];
+        let mut payload = [0u8; 4096];
+        let good = HeliosSealedBatchCopyV1 {
+            struct_bytes: HELIOS_TRANSLATOR_SEALED_BATCH_COPY_BYTES,
+            abi_version: HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION,
+            payload: payload.as_mut_ptr() as *mut c_void,
+            payload_capacity: payload.len() as u64,
+            uses: uses.as_mut_ptr(),
+            use_capacity: uses.len() as u32,
+            reserved0: 0,
+            operands: operands.as_mut_ptr(),
+            operand_capacity: operands.len() as u32,
+            reserved1: 0,
+        };
+        assert_eq!(good.validate(&batch), Ok(()));
+
+        // One byte short is a refusal, not a truncated copy.
+        let mut d = good;
+        d.payload_capacity = batch.payload_bytes - 1;
+        assert_eq!(
+            d.validate(&batch),
+            Err(HeliosTranslatorStatus::BufferTooSmall)
+        );
+
+        let mut d = good;
+        d.use_capacity = batch.use_count - 1;
+        assert_eq!(
+            d.validate(&batch),
+            Err(HeliosTranslatorStatus::BufferTooSmall)
+        );
+
+        let mut d = good;
+        d.operand_capacity = batch.operand_count - 1;
+        assert_eq!(
+            d.validate(&batch),
+            Err(HeliosTranslatorStatus::BufferTooSmall)
+        );
+
+        // ⛔ The trap this validator exists for: a NULL destination carrying a
+        // capacity large enough to pass every size test. Checking capacity
+        // alone would accept it and the ICD would write through NULL.
+        let mut d = good;
+        d.uses = core::ptr::null_mut();
+        assert_eq!(
+            d.validate(&batch),
+            Err(HeliosTranslatorStatus::NullArgument)
+        );
+        let mut d = good;
+        d.operands = core::ptr::null_mut();
+        assert_eq!(
+            d.validate(&batch),
+            Err(HeliosTranslatorStatus::NullArgument)
+        );
+        let mut d = good;
+        d.payload = core::ptr::null_mut();
+        assert_eq!(
+            d.validate(&batch),
+            Err(HeliosTranslatorStatus::NullArgument)
+        );
+
+        // ...and the converse: a batch that touches no allocation is legal, and
+        // a NULL table for it must NOT be refused.
+        let mut empty = batch;
+        empty.use_count = 0;
+        empty.operand_count = 0;
+        let mut d = good;
+        d.uses = core::ptr::null_mut();
+        d.use_capacity = 0;
+        d.operands = core::ptr::null_mut();
+        d.operand_capacity = 0;
+        assert_eq!(d.validate(&empty), Ok(()));
+
+        let mut d = good;
+        d.reserved1 = 1;
+        assert_eq!(
+            d.validate(&batch),
+            Err(HeliosTranslatorStatus::ReservedNonZero)
+        );
+    }
+
+    #[test]
+    fn an_attach_and_a_scope_begin_are_checked_before_the_session_is_consulted() {
+        let mut cookie = 0u64;
+        let attach = HeliosOuterContextAttachV1 {
+            struct_bytes: HELIOS_TRANSLATOR_CONTEXT_ATTACH_BYTES,
+            abi_version: HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION,
+            context_generation: 11,
+            endpoint_id: 2,
+            context_flags: HELIOS_HQA1_FLAG_D3D11_PHYSICAL,
+            host_context_cookie: (&mut cookie) as *mut u64 as *mut c_void,
+        };
+        assert_eq!(attach.validate(), Ok(()));
+
+        // The cookie is every later up-call's only argument; a NULL one is an
+        // up-call the bridge can never resolve, and nothing later can catch it.
+        let mut a = attach;
+        a.host_context_cookie = core::ptr::null_mut();
+        assert_eq!(a.validate(), Err(HeliosTranslatorStatus::NullArgument));
+
+        let mut a = attach;
+        a.context_generation = 0;
+        assert_eq!(a.validate(), Err(HeliosTranslatorStatus::ContextGeneration));
+
+        let mut a = attach;
+        a.context_flags = 0;
+        assert_eq!(a.validate(), Err(HeliosTranslatorStatus::ContextFlags));
+
+        let begin = HeliosOuterScopeBeginV1 {
+            struct_bytes: HELIOS_TRANSLATOR_SCOPE_BEGIN_BYTES,
+            abi_version: HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION,
+            context_generation: 11,
+            endpoint_id: 2,
+            reserved: 0,
+        };
+        assert_eq!(begin.validate(), Ok(()));
+
+        let mut b = begin;
+        b.reserved = 1;
+        assert_eq!(b.validate(), Err(HeliosTranslatorStatus::ReservedNonZero));
+
+        let mut b = begin;
+        b.endpoint_id = 0;
+        assert_eq!(b.validate(), Err(HeliosTranslatorStatus::UnknownEndpoint));
+    }
+
+    #[test]
+    fn a_join_request_is_refused_when_its_context_has_moved_on() {
+        let req = HeliosSyncProgressJoinV1 {
+            struct_bytes: HELIOS_TRANSLATOR_SYNC_PROGRESS_JOIN_BYTES,
+            abi_version: HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION,
+            // Zero is the legal "everything pending on this context" form and
+            // must never be refused as a missing value.
+            required_progress_value: 0,
+            context_generation: 11,
+        };
+        assert_eq!(req.validate(11), Ok(()));
+
+        // The use-after-free guard: thread A destroyed the queue and the
+        // bridge's live generation moved; thread B's in-flight join must be
+        // refused rather than resolved against the newer object.
+        assert_eq!(req.validate(12), Err(HeliosTranslatorStatus::UnknownContext));
+        // A bridge with no live context for that cookie refuses too — zero is
+        // never a wildcard that matches.
+        assert_eq!(req.validate(0), Err(HeliosTranslatorStatus::UnknownContext));
+
+        let mut r = req;
+        r.required_progress_value = 42;
+        assert_eq!(r.validate(11), Ok(()));
+
+        let mut r = req;
+        r.struct_bytes = 16;
+        assert_eq!(r.validate(11), Err(HeliosTranslatorStatus::StructBytes));
     }
 
     // ── Scope disposition and progress ──────────────────────────────────────
@@ -3376,10 +3988,10 @@ mod tests {
             reserved: 0,
             progress_value: 0,
         };
-        assert_eq!(
-            close.validate(),
-            Err(HeliosTranslatorStatus::HostCallbackFailed)
-        );
+        // A value that contradicts the disposition beside it is a malformed
+        // argument (`ProgressValue`) — not a failed up-call and not a reserved
+        // field, both of which would point a reader at the wrong subsystem.
+        assert_eq!(close.validate(), Err(HeliosTranslatorStatus::ProgressValue));
         close.progress_value = 42;
         assert_eq!(
             close.validate(),
@@ -3387,10 +3999,7 @@ mod tests {
         );
 
         close.disposition = HELIOS_TRANSLATOR_SCOPE_DISPOSITION_ABANDONED;
-        assert_eq!(
-            close.validate(),
-            Err(HeliosTranslatorStatus::ReservedNonZero)
-        );
+        assert_eq!(close.validate(), Err(HeliosTranslatorStatus::ProgressValue));
         close.progress_value = 0;
         assert_eq!(
             close.validate(),
@@ -3422,12 +4031,15 @@ mod tests {
             Err(HeliosTranslatorStatus::HostCallbackFailed)
         );
 
-        // Completion may never exceed what was submitted.
+        // Completion may never exceed what was submitted. That is a
+        // self-contradictory record, not a callback that failed to reach a
+        // value — `ProgressValue`, and the same code from a query.
         r.completed_progress_value = 11;
         assert_eq!(
             r.validate_join(10),
-            Err(HeliosTranslatorStatus::HostCallbackFailed)
+            Err(HeliosTranslatorStatus::ProgressValue)
         );
+        assert_eq!(r.validate_query(), Err(HeliosTranslatorStatus::ProgressValue));
 
         // Device loss is device loss, whatever the values say.
         r.completed_progress_value = 10;
@@ -3489,11 +4101,11 @@ mod tests {
         assert_eq!(HELIOS_TRANSLATOR_SUBMISSION_MODE_RECORD_ONLY, 1);
 
         assert_eq!(HELIOS_TRANSLATOR_CREATE_INFO_BYTES, 40);
-        assert_eq!(HELIOS_TRANSLATOR_INSTANCE_BYTES, 40);
+        assert_eq!(HELIOS_TRANSLATOR_INSTANCE_BYTES, 48);
         assert_eq!(HELIOS_TRANSLATOR_HOST_CALLBACKS_BYTES, 32);
         assert_eq!(HELIOS_TRANSLATOR_DISPATCH_BYTES, 112);
         assert_eq!(HELIOS_TRANSLATOR_CONTEXT_ATTACH_BYTES, 32);
-        assert_eq!(HELIOS_TRANSLATOR_QUEUE_ATTACH_REQUEST_BYTES, 24);
+        assert_eq!(HELIOS_TRANSLATOR_QUEUE_ATTACH_REQUEST_BYTES, 32);
         assert_eq!(HELIOS_TRANSLATOR_SCOPE_BEGIN_BYTES, 24);
         assert_eq!(HELIOS_TRANSLATOR_SCOPE_CLOSE_BYTES, 24);
         assert_eq!(HELIOS_TRANSLATOR_SEALED_BATCH_BYTES, 72);
@@ -3502,7 +4114,7 @@ mod tests {
         assert_eq!(HELIOS_TRANSLATOR_SEALED_BATCH_COPY_BYTES, 56);
         assert_eq!(HELIOS_TRANSLATOR_SYNC_PROGRESS_JOIN_BYTES, 24);
         assert_eq!(HELIOS_TRANSLATOR_SYNC_PROGRESS_RESULT_BYTES, 32);
-        assert_eq!(HELIOS_TRANSLATOR_REFUSAL_COUNTERS_BYTES, 88);
+        assert_eq!(HELIOS_TRANSLATOR_REFUSAL_COUNTERS_BYTES, 112);
 
         // The two constants restated for the C mirror because their records live
         // in a sibling header.
@@ -3558,7 +4170,17 @@ mod tests {
         assert_eq!(HeliosTranslatorStatus::AccessFlags.wire(), 36);
         assert_eq!(HeliosTranslatorStatus::OperandEncoding.wire(), 37);
         assert_eq!(HeliosTranslatorStatus::BatchId.wire(), 38);
-        assert_eq!(HeliosTranslatorStatus::MAX, 38);
+        // The seven causes that used to borrow a neighbour's code. Appended, so
+        // no existing value moved — a C consumer built against the previous
+        // header still decodes 0..=38 identically.
+        assert_eq!(HeliosTranslatorStatus::SessionGeneration.wire(), 39);
+        assert_eq!(HeliosTranslatorStatus::SealedUseRange.wire(), 40);
+        assert_eq!(HeliosTranslatorStatus::OperandUseIndex.wire(), 41);
+        assert_eq!(HeliosTranslatorStatus::ProgressValue.wire(), 42);
+        assert_eq!(HeliosTranslatorStatus::ContextStillAttached.wire(), 43);
+        assert_eq!(HeliosTranslatorStatus::UnknownAllocationToken.wire(), 44);
+        assert_eq!(HeliosTranslatorStatus::PayloadPlaceholderNonZero.wire(), 45);
+        assert_eq!(HeliosTranslatorStatus::MAX, 45);
     }
 
     /// The prohibitions in the module header are kept by *absence*, and absence
@@ -3571,10 +4193,10 @@ mod tests {
         // must re-check the "prohibited payloads" table in the module header
         // before updating the number.
         assert_eq!(core::mem::size_of::<HeliosTranslatorCreateInfoV1>(), 40);
-        assert_eq!(core::mem::size_of::<HeliosTranslatorInstanceV1>(), 40);
+        assert_eq!(core::mem::size_of::<HeliosTranslatorInstanceV1>(), 48);
         assert_eq!(core::mem::size_of::<HeliosTranslatorHostCallbacksV1>(), 32);
         assert_eq!(core::mem::size_of::<HeliosTranslatorDispatchV1>(), 112);
-        assert_eq!(core::mem::size_of::<HeliosQueueAttachRequestV1>(), 24);
+        assert_eq!(core::mem::size_of::<HeliosQueueAttachRequestV1>(), 32);
         assert_eq!(core::mem::size_of::<HeliosOuterContextAttachV1>(), 32);
         assert_eq!(core::mem::size_of::<HeliosOuterScopeBeginV1>(), 24);
         assert_eq!(core::mem::size_of::<HeliosOuterScopeCloseV1>(), 24);
@@ -3584,7 +4206,10 @@ mod tests {
         assert_eq!(core::mem::size_of::<HeliosSealedBatchCopyV1>(), 56);
         assert_eq!(core::mem::size_of::<HeliosSyncProgressJoinV1>(), 24);
         assert_eq!(core::mem::size_of::<HeliosSyncProgressResultV1>(), 32);
-        assert_eq!(core::mem::size_of::<HeliosTranslatorRefusalCountersV1>(), 88);
+        assert_eq!(
+            core::mem::size_of::<HeliosTranslatorRefusalCountersV1>(),
+            112
+        );
         // Eleven down slots and two up slots. A twelfth or a third is an ABI
         // version bump, not an addition.
         assert_eq!(

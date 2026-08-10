@@ -73,15 +73,7 @@ pub mod ioctl;
 pub mod native_render;
 pub mod physical_memory;
 pub mod translation_session;
-// ⛔ `translator_dispatch` is authored but NOT WIRED IN, deliberately. It has two
-// confirmed blockers from adversarial review that were mid-repair when the
-// session ended, so the file on disk is a half-applied fix: `vk_instance` was
-// added to `HeliosTranslatorInstanceV1` (the correct fix — the slot's argument
-// was previously unobtainable) without updating its size assertion or the C
-// mirror. Finishing that repair is the next step; see the commit that added it
-// for the full finding list. Until then no lane may consume this contract, and
-// the module stays out of the build so `protocol/` keeps compiling.
-// pub mod translator_dispatch;
+pub mod translator_dispatch;
 pub mod virtio_gpu;
 pub mod wddm;
 pub mod wddm_legacy;
@@ -93,7 +85,7 @@ pub use ioctl::*;
 pub use native_render::*;
 pub use physical_memory::*;
 pub use translation_session::*;
-// pub use translator_dispatch::*;   // see the ⛔ note above the module line
+pub use translator_dispatch::*;
 pub use virtio_gpu::*;
 pub use wddm::*;
 pub use wddm_legacy::*;
