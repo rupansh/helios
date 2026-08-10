@@ -3011,13 +3011,63 @@ unsafe fn admit_hwa2(
     if created.venus_alloc_size != 0 && created.venus_alloc_size != desc.byte_size {
         LINEAR_BLOB_SIZE_DIVERGENCE.fetch_add(1, Ordering::Relaxed);
     }
-    // ⛔ ACTED ON: an UNDERSIZED backing. §10.3:1050 makes `byte_size` bound
-    // every plane, and the descriptor is echoed verbatim, so admitting a backing
-    // smaller than it would publish a descriptor whose planes run off the end of
-    // the real allocation. A blob smaller than the image requirement binds
-    // "successfully" and then MMU-faults when the sampler reads the slack region
-    // (host Xid 31, FAULT_PTE VIRT_READ — killed the IDD feed live 2026-07-04).
-    if created.venus_alloc_size != 0 && created.venus_alloc_size < desc.byte_size {
+
+    // ── the KMD's OWN estimate is not evidence about the host ────────────────
+    //
+    // ⛔ A STANDARD descriptor is authored by `dxgkddi_get_standard_allocation_
+    // driver_data` BEFORE any backing exists, so its `byte_size` and plane
+    // record are an ESTIMATE — `linear_blob_size`, which §1.3 and its own doc
+    // call "deliberately LARGER" (128-row round-up plus a 64 KiB tail slack).
+    // The `LinearScanoutImage` arm is the one backing whose size the HOST
+    // decides, and the host's answer is smaller: measured on the live desktop,
+    // `SdgLReq=7910400 SdgLPch=7680` gives `venus_alloc_size = 7_913_472`
+    // against `linear_blob_size(7680,1030) = 8_912_896`.
+    //
+    // Round 2 of the Phase-2 review found that refusing on that comparison
+    // rejects EVERY OS shared primary — no primary, no composited desktop —
+    // and that the pre-retirement code did the opposite: it OVERWROTE the guess
+    // (`41d13f8:create_allocation.rs:2427`, `ap.size = created.blob_size.bytes()`)
+    // and only counted the divergence.
+    //
+    // So the KMD adopts the host's answer for the descriptor it authored itself.
+    // This is not "correcting a UMD's field" — §1.1's echo rule protects a claim
+    // the UMD made, and on this arm there is no UMD: the KMD wrote the input and
+    // is replacing its own pre-create estimate with the measured extent. The
+    // published descriptor is then TRUE, which is what §10.3's "exact backing
+    // extent" asks for and what an opener bounding planes against it needs.
+    //
+    // The stride moves with it for the same reason, and the code already knew
+    // this one: the returned `Pitch` below prefers `created.pitch` because "a
+    // `width*4`-derived stride shears the scan-out (1896*4 = 7584 against the
+    // real 7680)". Publishing that same wrong stride inside the descriptor while
+    // handing the runtime the right one would make the two disagree.
+    let kmd_authored = desc.has_flag(HELIOS_HWA2_FLAG_STANDARD);
+    if kmd_authored && created.blob_size.is_host_authoritative() {
+        desc.byte_size = created.blob_size.bytes();
+        if created.pitch != 0 {
+            desc.planes[0].offset = created.plane_offset;
+            desc.planes[0].row_pitch = created.pitch;
+            desc.planes[0].slice_pitch = created
+                .pitch
+                .saturating_mul(desc.height)
+                .min(u32::try_from(desc.byte_size.saturating_sub(created.plane_offset)).unwrap_or(u32::MAX));
+        }
+    }
+
+    // ⛔ ACTED ON: an UNDERSIZED backing, for every descriptor whose extent this
+    // driver did NOT author. §10.3:1050 makes `byte_size` bound every plane, and
+    // a UMD's descriptor is echoed verbatim, so admitting a backing smaller than
+    // it would publish a descriptor whose planes run off the end of the real
+    // allocation. A blob smaller than the image requirement binds "successfully"
+    // and then MMU-faults when the sampler reads the slack region (host Xid 31,
+    // FAULT_PTE VIRT_READ — killed the IDD feed live 2026-07-04).
+    //
+    // The KMD-authored arm above cannot reach this: it has just SET `byte_size`
+    // to the backing's own size, so the comparison is an identity. Leaving the
+    // guard unconditional would therefore be dead on that arm and fatal on it if
+    // the adoption above were ever removed — hence the explicit condition rather
+    // than relying on the identity.
+    if !kmd_authored && created.venus_alloc_size != 0 && created.venus_alloc_size < desc.byte_size {
         bump(&CREATE_SIZE_REJECT, b"AcSize");
         crate::diag::record(0x0C01_00E7);
         // The backing is destroyed by the caller's unwind through
