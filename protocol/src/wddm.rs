@@ -222,6 +222,27 @@ pub const HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED: u32 = 1 << 9;
 pub const HELIOS_HWA2_FLAG_STANDARD: u32 = 1 << 10;
 /// Union of every defined flag. Any bit outside this mask is a hard reject.
 pub const HELIOS_HWA2_FLAG_MASK: u32 = 0x0000_07FF;
+/// The flag bits **only the KMD may set** — and therefore the exact set a
+/// create-*input* descriptor must leave clear.
+///
+/// §10.3 states both as assertions the kernel makes about a finished
+/// allocation: "KMD sets `D3D12_RUNTIME_PRIMARY` only when the D3D12 create
+/// record, runtime `PRIMARY` flag, and required `D3DDDI_ID_UNINITIALIZED` value
+/// agree … KMD sets `DIRECT_FLIP_COMPATIBLE` only when the exact allocation is
+/// a non-protected, non-cross-adapter managed primary in a swizzle/layout class
+/// the selected display backend implements", and of both: "neither is inferred
+/// by an opener".
+///
+/// A UMD that pre-set either would be asserting a property of an allocation
+/// that does not exist yet, and once the KMD echoes the input word back there
+/// is nothing in the finished record to distinguish a UMD's guess from the
+/// kernel's finding. So [`HeliosWddmAllocationDescV2::validate_create_input`]
+/// refuses the bit by name rather than silently clearing it — a silent
+/// correction would make the descriptor disagree with the resource the UMD
+/// believes it asked for. Named once here so the input rule, the refusal
+/// payload, and the C mirror cannot drift apart.
+pub const HELIOS_HWA2_FLAG_KMD_OWNED_MASK: u32 =
+    HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE | HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY;
 
 // ── bind flags (§10.3, offset 72) ───────────────────────────────────────────
 //
@@ -355,6 +376,18 @@ pub struct HeliosWddmPlaneRecordV2 {
 /// restamped the first 48 bytes at open time, so two openers of one allocation
 /// could disagree about what they had.
 ///
+/// # The two create stages
+///
+/// The buffer is `[in/out]` and the kernel cannot invent texel dimensions, so
+/// the create is a request and a total acceptance: the UMD fills a complete
+/// [`Hwa2Stage::CreateInput`] record, the KMD validates it with
+/// [`Self::validate_create_input`], and the KMD then writes all 168 bytes back,
+/// echoing every field it validated and stamping
+/// [`Self::allocation_generation`] plus any bit of
+/// [`HELIOS_HWA2_FLAG_KMD_OWNED_MASK`] it has established. "KMD writes it only
+/// on create" stays literally true — the kernel performs the write and no
+/// opener writes any of it — and a refused input creates nothing.
+///
 /// # What it deliberately does not contain
 ///
 /// No host resource token, `resid`, PID, process handle, synchronization
@@ -381,6 +414,7 @@ pub struct HeliosWddmAllocationDescV2 {
     /// and the installer.
     pub package_generation: u64,
     /// Nonzero KMD-assigned stale-validation/diagnostic generation (offset 16).
+    /// **Zero on create-input**; the kernel alone assigns it.
     ///
     /// ⛔ **Never an identity lookup key.** HOB1 use records repeat it as
     /// `expected_allocation_generation` so a stale batch is refused; nothing
@@ -411,7 +445,8 @@ pub struct HeliosWddmAllocationDescV2 {
     pub sample_quality: u32,
     /// `HELIOS_HWA2_KIND_*` (offset 64).
     pub allocation_kind: u32,
-    /// `HELIOS_HWA2_FLAG_*` (offset 68); every other bit zero.
+    /// `HELIOS_HWA2_FLAG_*` (offset 68); every other bit zero. On create-input
+    /// every bit of [`HELIOS_HWA2_FLAG_KMD_OWNED_MASK`] is zero too.
     pub flags: u32,
     /// `HELIOS_HWA2_BIND_*` (offset 72) — the shared protocol vocabulary, never
     /// a raw D3D11/D3D12 bit reinterpretation.
@@ -424,6 +459,11 @@ pub struct HeliosWddmAllocationDescV2 {
     /// runtime primary must preserve [`D3DDDI_ID_UNINITIALIZED`]; a non-primary
     /// uses that same sentinel. The sentinel means *any source on this exact
     /// adapter* and is never replaced or compared as a concrete identity.
+    ///
+    /// On create-input a primary carrying the sentinel is admitted — it is the
+    /// D3D12 request whose `D3D12_RUNTIME_PRIMARY` bit the kernel has not stamped
+    /// yet, and the creator is forbidden from stamping it itself
+    /// ([`HELIOS_HWA2_FLAG_KMD_OWNED_MASK`]).
     pub vidpn_source: u32,
     /// Exact `D3DKMDT_STANDARDALLOCATION_TYPE` when
     /// [`HELIOS_HWA2_FLAG_STANDARD`] is set (offset 84), otherwise zero. The OS
@@ -496,6 +536,11 @@ const _: () = {
                 | HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED
                 | HELIOS_HWA2_FLAG_STANDARD
     );
+    // The KMD-owned pair is a subset of the eleven, and is exactly the two bits
+    // §10.3 says the kernel sets and no opener infers. The C mirror pins the
+    // same literal, because there the union is spelled out by hand.
+    assert!(HELIOS_HWA2_FLAG_KMD_OWNED_MASK & !HELIOS_HWA2_FLAG_MASK == 0);
+    assert!(HELIOS_HWA2_FLAG_KMD_OWNED_MASK == 0x0000_0030);
     assert!(HELIOS_HWA2_MAX_PLANES == 4);
 
     // Four ASCII bytes read little-endian; see the same block under HOB1.
@@ -504,6 +549,48 @@ const _: () = {
     assert!(HELIOS_HWA2_MAGIC.to_le_bytes()[2] == b'A');
     assert!(HELIOS_HWA2_MAGIC.to_le_bytes()[3] == b'2');
 };
+
+/// Which side of the `DxgkDdiCreateAllocation` descriptor write is being
+/// validated.
+///
+/// The allocation-private buffer is `[in/out]` and the KMD cannot invent texel
+/// dimensions, so §10.3's "KMD writes it only on create" completes exactly one
+/// way: the UMD supplies a complete create-input record, the KMD validates it
+/// in full, and then the kernel writes all 168 bytes back — echoing every field
+/// it validated and stamping the ones only it can know
+/// (`docs/retirement/K4-CONTRACT.md` §1). The input is a *request* whose
+/// acceptance is total; a rejected request creates nothing, and no opener ever
+/// writes a byte.
+///
+/// The difference between the two sides is two bits, one field, and the one
+/// cross-field rule those bits make stage-dependent:
+///
+/// 1. [`HeliosWddmAllocationDescV2::allocation_generation`] — zero in, nonzero
+///    out.
+/// 2. The two flags in [`HELIOS_HWA2_FLAG_KMD_OWNED_MASK`] — clear in,
+///    KMD-decided out.
+/// 3. C44's primary/VidPn rule. Because `D3D12_RUNTIME_PRIMARY` is one of those
+///    KMD-owned bits, a D3D12 runtime primary's **input** is PRIMARY + the
+///    [`D3DDDI_ID_UNINITIALIZED`] sentinel + the bit clear — that shape is the
+///    request, and refusing it (as this crate did until the seam review) makes
+///    the kernel's stamp unreachable, since no legal input could ever reach it.
+///    On the **output** side the pair is cross-validated in both directions,
+///    unchanged: see [`HeliosAllocDescRejection::PrimaryVidPnSourceNotConcrete`].
+///
+/// Everything else is identical, which is
+/// why both stages run the same core rather than two hand-kept copies. Same
+/// shape, and for the same reason, as [`crate::native_render::Hvm1Stage`] and
+/// [`HeliosOuterCommandAllocationV1::validate_create_input`] /
+/// [`HeliosOuterCommandAllocationV1::validate_create_output`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hwa2Stage {
+    /// The bytes user mode supplies to `pfnAllocateCb`: the allocation
+    /// generation is zero and neither KMD-owned flag bit is set.
+    CreateInput,
+    /// The bytes the KMD wrote back — and, byte for byte, what every later
+    /// opener reads, because nothing writes the record again.
+    CreateOutput,
+}
 
 /// Which scalar geometry field a [`HeliosAllocDescRejection`] is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,7 +603,9 @@ pub enum HeliosAllocDescField {
     SampleQuality,
 }
 
-/// Why [`HeliosWddmAllocationDescV2::validate`] refused.
+/// Why [`HeliosWddmAllocationDescV2::validate`],
+/// [`HeliosWddmAllocationDescV2::validate_create_input`] or
+/// [`HeliosWddmAllocationDescV2::validate_create_output`] refused.
 ///
 /// One named variant per rejection: a caller can raise a distinct counter for
 /// every reason without re-deriving the check, and no refusal is a bare
@@ -628,6 +717,14 @@ pub enum HeliosAllocDescRejection {
     },
     /// A conventional D3D11 primary carrying the sentinel instead of a concrete
     /// source.
+    ///
+    /// ⚠ [`Hwa2Stage::CreateOutput`] **only**. On the input stage the identical
+    /// bytes — PRIMARY, the sentinel, and `D3D12_RUNTIME_PRIMARY` clear because
+    /// the creator may not set a KMD-owned bit — are the legal C44 D3D12 request
+    /// awaiting the kernel's stamp, and there is nothing in the record that could
+    /// distinguish the two before the KMD reads the D3D12 create record. On the
+    /// output side the bit has been decided, so a primary that still carries the
+    /// sentinel without it is a stamp the KMD failed to write.
     PrimaryVidPnSourceNotConcrete,
     /// A non-primary carrying anything other than the sentinel.
     NonPrimaryVidPnSourceNotSentinel {
@@ -661,6 +758,23 @@ pub enum HeliosAllocDescRejection {
     MemoryClassCpuVisibilityMismatch {
         memory_class: u32,
         flags: u32,
+    },
+    // ⚠ Variants below are append-only additions made when HWA2 gained its
+    // create-input stage. The order of this enum is its stable numbering for
+    // KMD counters and ETW fields; never insert into the middle.
+    /// [`Hwa2Stage::CreateInput`] carried a nonzero allocation generation. The
+    /// KMD assigns it, so an input that already has one is a UMD inventing an
+    /// identity — never an adoption. Identical rule, and identical name, to
+    /// [`HeliosOuterCommandAllocRejection::AllocationGenerationNonZeroOnInput`].
+    AllocationGenerationNonZeroOnInput {
+        found: u64,
+    },
+    /// [`Hwa2Stage::CreateInput`] set a bit in
+    /// [`HELIOS_HWA2_FLAG_KMD_OWNED_MASK`]. `bits` is the offending subset, so
+    /// a counter can name which of `DIRECT_FLIP_COMPATIBLE` /
+    /// `D3D12_RUNTIME_PRIMARY` the creator tried to assert for itself.
+    KmdOwnedFlagSetOnInput {
+        bits: u32,
     },
 }
 
@@ -742,13 +856,27 @@ impl HeliosWddmAllocationDescV2 {
         helios_hwa2_kind_is_image(self.allocation_kind)
     }
 
-    /// Total validation of one descriptor, in the order a reader must apply it:
-    /// identity → generations → vocabulary → geometry → planes → cross-field
-    /// rules (§10.3).
+    /// Total validation of one descriptor at one create stage, in the order a
+    /// reader must apply it: identity → generations → vocabulary → geometry →
+    /// planes → cross-field rules (§10.3).
+    ///
+    /// This is the single cross-field core behind all three entry points
+    /// ([`Self::validate`], [`Self::validate_create_input`],
+    /// [`Self::validate_create_output`]), for the same reason
+    /// `HeliosOuterCommandAllocationV1::validate_fixed` is HOC1's: three
+    /// copies of a rule set is three chances to enforce a rule on one path and
+    /// not another, and the path it would go missing from is the create path
+    /// that produces the bytes every later opener trusts as `const`. Exactly
+    /// two `match stage` arms below differ between the stages; everything else
+    /// is common by construction rather than by review.
     ///
     /// Total function, no panic, no allocation: every arithmetic step is
     /// checked and every refusal is named.
-    pub fn validate(&self, package_generation: u64) -> Result<(), HeliosAllocDescRejection> {
+    fn validate_stage(
+        &self,
+        package_generation: u64,
+        stage: Hwa2Stage,
+    ) -> Result<(), HeliosAllocDescRejection> {
         use HeliosAllocDescField as F;
         use HeliosAllocDescRejection as R;
 
@@ -775,8 +903,28 @@ impl HeliosWddmAllocationDescV2 {
                 expected: package_generation,
             });
         }
-        if self.allocation_generation == 0 {
-            return Err(R::AllocationGenerationZero);
+        // ── the one field the KMD alone writes ──────────────────────────────
+        //
+        // §10.3 gives `allocation_generation` no create-input meaning at all:
+        // it is "nonzero KMD-assigned", so an input carrying one is a UMD that
+        // invented an identity rather than requesting an allocation. HOC1
+        // states the same rule at the same position for the same reason
+        // (`AllocationGenerationNonZeroOnInput`), and the check stays here —
+        // in the "generations" step, before any vocabulary check — so the
+        // documented refusal order is one order for all three entry points.
+        match stage {
+            Hwa2Stage::CreateInput => {
+                if self.allocation_generation != 0 {
+                    return Err(R::AllocationGenerationNonZeroOnInput {
+                        found: self.allocation_generation,
+                    });
+                }
+            }
+            Hwa2Stage::CreateOutput => {
+                if self.allocation_generation == 0 {
+                    return Err(R::AllocationGenerationZero);
+                }
+            }
         }
         if self.reserved != 0 {
             return Err(R::ReservedNonZero {
@@ -799,6 +947,16 @@ impl HeliosWddmAllocationDescV2 {
             return Err(R::UnknownFlagBits {
                 found: self.flags & !HELIOS_HWA2_FLAG_MASK,
             });
+        }
+        // The KMD-owned pair, checked immediately after the mask because both
+        // are facts about the same word. Unknown bits are refused first: a
+        // garbage `flags` word is the worse failure and its reason carries more
+        // information than "you set a bit you do not own".
+        if matches!(stage, Hwa2Stage::CreateInput) {
+            let kmd_owned = self.flags & HELIOS_HWA2_FLAG_KMD_OWNED_MASK;
+            if kmd_owned != 0 {
+                return Err(R::KmdOwnedFlagSetOnInput { bits: kmd_owned });
+            }
         }
         if self.bind_flags & !HELIOS_HWA2_BIND_MASK != 0 {
             return Err(R::UnknownBindBits {
@@ -924,6 +1082,30 @@ impl HeliosWddmAllocationDescV2 {
         //
         // ⛔ Neither is inferred by an opener. Both are checked here, together,
         // so a reader can never accept one without the other.
+        //
+        // ⚠ One arm of this block — and only one — is genuinely stage-dependent,
+        // and it is the third difference between the two stages (see
+        // [`Hwa2Stage`]). `D3D12_RUNTIME_PRIMARY` is KMD-owned, so the create
+        // *input* for a D3D12 runtime primary is necessarily PRIMARY + the
+        // sentinel + the bit CLEAR: the input rule above refuses the bit by name,
+        // so a D3D12 UMD has no other shape available to it. Requiring a concrete
+        // VidPn source of every bit-less primary on the input stage therefore
+        // refuses the only legal D3D12 request, and — worse than a refusal —
+        // makes the kernel's own stamp unreachable by construction, because the
+        // create never survives long enough for the KMD to decide the bit.
+        //
+        // That is not hypothetical; it is what this crate did until the seam
+        // review enumerated the four reachable shapes against it: a D3D12 primary
+        // input with the bit clear returned `PrimaryVidPnSourceNotConcrete`, the
+        // same input with the bit set returned `KmdOwnedFlagSetOnInput`, and
+        // `Ok` was reachable *only* for a record that had already been stamped —
+        // i.e. only ever from the KMD's own output, never from a UMD.
+        //
+        // Nothing is weakened on the side every opener reads. On `CreateOutput`
+        // the pair is still cross-validated in both directions: PRIMARY + the
+        // sentinel still requires the bit (a stamped-looking record that lost the
+        // bit is refused here), and the bit still requires PRIMARY + the
+        // sentinel. An opener still infers neither from the other.
         let primary = self.has_flag(HELIOS_HWA2_FLAG_PRIMARY);
         if self.has_flag(HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY) {
             if !primary {
@@ -935,7 +1117,14 @@ impl HeliosWddmAllocationDescV2 {
                 });
             }
         } else if primary {
-            if self.vidpn_source == D3DDDI_ID_UNINITIALIZED {
+            // Output: a primary without the bit is a D3D11 primary and must name
+            // its concrete source — the sentinel here would mean the KMD echoed a
+            // D3D12 primary back without stamping it, and every opener would then
+            // read a primary belonging to no source at all.
+            // Input: the same bytes are the D3D12 request awaiting that stamp.
+            if matches!(stage, Hwa2Stage::CreateOutput)
+                && self.vidpn_source == D3DDDI_ID_UNINITIALIZED
+            {
                 return Err(R::PrimaryVidPnSourceNotConcrete);
             }
         } else if self.vidpn_source != D3DDDI_ID_UNINITIALIZED {
@@ -1006,6 +1195,51 @@ impl HeliosWddmAllocationDescV2 {
         }
 
         Ok(())
+    }
+
+    /// Open-time validation of the descriptor as the KMD wrote it.
+    ///
+    /// Unchanged in meaning and signature from before HWA2 had a create-input
+    /// stage, and deliberately so: an opener and a create-output reader are
+    /// asking the same question because they are reading the same bytes.
+    /// `DxgkDdiOpenAllocation` never writes the record (§10.3), so what an
+    /// opener sees is exactly what create produced — this is
+    /// [`Self::validate_create_output`] under the name every open-path caller
+    /// already uses.
+    pub fn validate(&self, package_generation: u64) -> Result<(), HeliosAllocDescRejection> {
+        self.validate_stage(package_generation, Hwa2Stage::CreateOutput)
+    }
+
+    /// KMD-side validation of the record the UMD supplied to `pfnAllocateCb`.
+    ///
+    /// The same total check as [`Self::validate`] with the two stage rules
+    /// inverted: the allocation generation must be zero, and neither bit of
+    /// [`HELIOS_HWA2_FLAG_KMD_OWNED_MASK`] may be set. Every other field is
+    /// UMD-supplied, validated here, and echoed verbatim into the output
+    /// record — the KMD refuses the create rather than correcting a field
+    /// (`docs/retirement/K4-CONTRACT.md` §1.1).
+    ///
+    /// Mirrors [`HeliosOuterCommandAllocationV1::validate_create_input`]; a
+    /// reader who knows one knows this one.
+    pub fn validate_create_input(
+        &self,
+        package_generation: u64,
+    ) -> Result<(), HeliosAllocDescRejection> {
+        self.validate_stage(package_generation, Hwa2Stage::CreateInput)
+    }
+
+    /// Validation of the complete record the KMD wrote back at create: the same
+    /// total check plus the nonzero create-time generation stamp.
+    ///
+    /// The KMD calls it on its own output — the cheapest possible self-check
+    /// that the 168 bytes about to become immutable are the ones every opener
+    /// will accept — and a UMD calls it on the buffer that came back. Mirrors
+    /// [`HeliosOuterCommandAllocationV1::validate_create_output`].
+    pub fn validate_create_output(
+        &self,
+        package_generation: u64,
+    ) -> Result<(), HeliosAllocDescRejection> {
+        self.validate_stage(package_generation, Hwa2Stage::CreateOutput)
     }
 }
 
@@ -3713,6 +3947,188 @@ mod tests {
         assert_eq!(buffer_desc().validate(PKG), Ok(()));
     }
 
+    /// The create-input form of [`primary_desc`]: the same 168 bytes with the
+    /// two things only the kernel may write taken back out.
+    fn primary_create_input() -> HeliosWddmAllocationDescV2 {
+        let mut d = primary_desc();
+        d.allocation_generation = 0;
+        d.flags &= !HELIOS_HWA2_FLAG_KMD_OWNED_MASK;
+        d
+    }
+
+    /// HWA2 is a two-stage record (`docs/retirement/K4-CONTRACT.md` §1): the
+    /// UMD supplies a complete descriptor, the KMD validates it in full, and
+    /// the KMD writes back all 168 bytes. This pins the whole difference
+    /// between the two sides — `allocation_generation` plus
+    /// [`HELIOS_HWA2_FLAG_KMD_OWNED_MASK`] — by round-tripping one record
+    /// through both stages and asserting the echo is verbatim.
+    #[test]
+    fn hwa2_create_input_becomes_the_output_by_adding_only_kmd_owned_fields() {
+        let input = primary_create_input();
+        assert_eq!(input.validate_create_input(PKG), Ok(()));
+
+        // Before the write-back, the output form must refuse — exactly as
+        // HOC1's does, and with the pre-existing zero-generation reason.
+        assert_eq!(
+            input.validate_create_output(PKG),
+            Err(HeliosAllocDescRejection::AllocationGenerationZero)
+        );
+        assert_eq!(
+            input.validate(PKG),
+            Err(HeliosAllocDescRejection::AllocationGenerationZero)
+        );
+
+        // The KMD stamps its generation and the Direct Flip finding it has
+        // now actually established, and touches nothing else.
+        let mut output = input;
+        output.allocation_generation = 0x51;
+        output.flags |= HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE;
+        assert_eq!(output.validate_create_output(PKG), Ok(()));
+        assert_eq!(output.validate(PKG), Ok(()));
+        // …and that is byte-for-byte the canonical output record.
+        assert_eq!(output, primary_desc());
+
+        // The finished record is no longer a legal input: a UMD that resubmits
+        // it is claiming an identity the kernel assigns.
+        assert_eq!(
+            output.validate_create_input(PKG),
+            Err(HeliosAllocDescRejection::AllocationGenerationNonZeroOnInput { found: 0x51 })
+        );
+
+        // Every UMD-supplied field is echoed verbatim: undo the two KMD-owned
+        // writes and the output is the input again, all 168 bytes.
+        let mut echoed = output;
+        echoed.allocation_generation = 0;
+        echoed.flags &= !HELIOS_HWA2_FLAG_KMD_OWNED_MASK;
+        assert_eq!(echoed, input);
+    }
+
+    /// The input stage's own two rules, each by name. §10.3 says the KMD sets
+    /// `DIRECT_FLIP_COMPATIBLE` and `D3D12_RUNTIME_PRIMARY` and that "neither
+    /// is inferred by an opener" — so a UMD that pre-sets one is refused, not
+    /// silently corrected, because after an echo nothing in the finished record
+    /// could distinguish the UMD's guess from the kernel's finding.
+    #[test]
+    fn hwa2_create_input_refuses_the_fields_only_the_kmd_writes() {
+        let mut input = buffer_desc();
+        input.allocation_generation = 0;
+        assert_eq!(input.validate_create_input(PKG), Ok(()));
+
+        let mut prefilled = input;
+        prefilled.allocation_generation = 1;
+        assert_eq!(
+            prefilled.validate_create_input(PKG),
+            Err(HeliosAllocDescRejection::AllocationGenerationNonZeroOnInput { found: 1 })
+        );
+
+        // Each KMD-owned bit alone. Note the buffer kind could never legally
+        // carry `DIRECT_FLIP_COMPATIBLE` at all — and the input stage still
+        // refuses it for being KMD-owned, ahead of the Direct Flip cross-field
+        // rule, so the counter names the defect the UMD actually has.
+        for bit in [
+            HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE,
+            HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY,
+        ] {
+            let mut d = input;
+            d.flags |= bit;
+            assert_eq!(
+                d.validate_create_input(PKG),
+                Err(HeliosAllocDescRejection::KmdOwnedFlagSetOnInput { bits: bit })
+            );
+        }
+
+        // Both at once: the payload names the whole offending subset, not the
+        // first bit found.
+        let mut both = input;
+        both.flags |= HELIOS_HWA2_FLAG_KMD_OWNED_MASK;
+        assert_eq!(
+            both.validate_create_input(PKG),
+            Err(HeliosAllocDescRejection::KmdOwnedFlagSetOnInput {
+                bits: HELIOS_HWA2_FLAG_KMD_OWNED_MASK,
+            })
+        );
+
+        // An undefined bit still wins: the flags word is checked as a
+        // vocabulary before it is checked as ownership.
+        let mut junk = input;
+        junk.flags |= HELIOS_HWA2_FLAG_KMD_OWNED_MASK | (1 << 31);
+        assert_eq!(
+            junk.validate_create_input(PKG),
+            Err(HeliosAllocDescRejection::UnknownFlagBits { found: 1 << 31 })
+        );
+
+        // The KMD-owned bits are legal on the output side, which is the whole
+        // asymmetry: the same record passes once the kernel owns it.
+        let mut stamped = both;
+        stamped.allocation_generation = 9;
+        stamped.flags = input.flags | HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY;
+        assert_eq!(
+            stamped.validate_create_output(PKG),
+            Err(HeliosAllocDescRejection::D3D12RuntimePrimaryWithoutPrimary)
+        );
+        let mut df = primary_desc();
+        df.flags |= HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY;
+        df.vidpn_source = D3DDDI_ID_UNINITIALIZED;
+        assert_eq!(df.validate_create_output(PKG), Ok(()));
+    }
+
+    /// One core behind three entry points, so no §10.3 cross-field rule can be
+    /// enforced on the open path and missed on the create path that produces
+    /// the bytes the open path then trusts as `const`. Each rule below is
+    /// asserted on all three, with only the stage fields changed.
+    #[test]
+    fn hwa2_cross_field_rules_hold_on_every_stage() {
+        let legal_input = primary_create_input();
+
+        // A non-image kind carrying texel geometry.
+        let mut geometry = buffer_desc();
+        geometry.allocation_generation = 0;
+        geometry.width = 64;
+        let expected = Err(HeliosAllocDescRejection::NonImageGeometryNonZero {
+            field: HeliosAllocDescField::Width,
+            found: 64,
+        });
+        assert_eq!(geometry.validate_create_input(PKG), expected);
+        geometry.allocation_generation = 7;
+        assert_eq!(geometry.validate_create_output(PKG), expected);
+        assert_eq!(geometry.validate(PKG), expected);
+
+        // A plane escaping `byte_size`.
+        let mut plane = legal_input;
+        plane.planes[0].slice_pitch = plane.planes[0].slice_pitch.wrapping_add(4);
+        plane.byte_size = plane.planes[0].slice_pitch as u64 - 4;
+        let expected = Err(HeliosAllocDescRejection::PlaneRangeExceedsByteSize { index: 0 });
+        assert_eq!(plane.validate_create_input(PKG), expected);
+        plane.allocation_generation = 7;
+        assert_eq!(plane.validate_create_output(PKG), expected);
+        assert_eq!(plane.validate(PKG), expected);
+
+        // Memory class disagreeing with CPU visibility.
+        let mut memory = buffer_desc();
+        memory.allocation_generation = 0;
+        memory.memory_class = HELIOS_HWA2_MEMORY_DEVICE_LOCAL;
+        let expected = Err(HeliosAllocDescRejection::MemoryClassCpuVisibilityMismatch {
+            memory_class: HELIOS_HWA2_MEMORY_DEVICE_LOCAL,
+            flags: memory.flags,
+        });
+        assert_eq!(memory.validate_create_input(PKG), expected);
+        memory.allocation_generation = 7;
+        assert_eq!(memory.validate_create_output(PKG), expected);
+        assert_eq!(memory.validate(PKG), expected);
+
+        // And the identity/package rules, which precede every stage rule.
+        let mut wrong_package = legal_input;
+        wrong_package.package_generation = PKG ^ 1;
+        let expected = Err(HeliosAllocDescRejection::PackageGeneration {
+            found: PKG ^ 1,
+            expected: PKG,
+        });
+        assert_eq!(wrong_package.validate_create_input(PKG), expected);
+        wrong_package.allocation_generation = 7;
+        assert_eq!(wrong_package.validate_create_output(PKG), expected);
+        assert_eq!(wrong_package.validate(PKG), expected);
+    }
+
     /// Zero is never a wildcard on *either* side of the package-generation
     /// comparison. A zeroed private-data buffer reaching a caller that has not
     /// yet established the package generation must be refused, not admitted
@@ -3787,6 +4203,25 @@ mod tests {
         assert_eq!(
             HeliosOuterCommandAllocationV1::from_private_data(&staging[4..68]),
             Ok(c)
+        );
+
+        // Same for HWA2, at an *odd* offset: `allocation_generation` is a `u64`
+        // at offset 16 and the record's alignment is 8, so this slice satisfies
+        // neither. It must still parse — the read is unaligned on purpose —
+        // and a longer-than-exact buffer must still be refused by length.
+        let d = primary_desc();
+        let mut staging = [0u8; 180];
+        staging[1..169].copy_from_slice(bytemuck::bytes_of(&d));
+        assert_eq!(
+            HeliosWddmAllocationDescV2::from_private_data(&staging[1..169]),
+            Ok(d)
+        );
+        assert_eq!(
+            HeliosWddmAllocationDescV2::from_private_data(&staging[1..170]),
+            Err(HeliosAllocDescRejection::PrivateDataSize {
+                found: 169,
+                expected: HELIOS_HWA2_BYTES as usize,
+            })
         );
     }
 
@@ -3890,6 +4325,173 @@ mod tests {
             Err(HeliosAllocDescRejection::UnknownAllocationKind {
                 found: HELIOS_HWA2_KIND_MAX + 1
             })
+        );
+    }
+
+    /// The create-input form of a C44 D3D12 runtime primary: PRIMARY, the
+    /// [`D3DDDI_ID_UNINITIALIZED`] sentinel, and `D3D12_RUNTIME_PRIMARY` **clear**
+    /// — because it is KMD-owned and the creator may not assert it.
+    ///
+    /// This is not one shape among several: it is the *only* shape a D3D12 UMD
+    /// can put on the wire (`docs/retirement/K4-CONTRACT.md` §1.1).
+    fn d3d12_primary_create_input() -> HeliosWddmAllocationDescV2 {
+        let mut d = primary_create_input();
+        d.vidpn_source = D3DDDI_ID_UNINITIALIZED;
+        d
+    }
+
+    /// Both primary shapes, both stages, end to end — the regression test for a
+    /// defect the seam review found by enumerating what a D3D12 UMD can actually
+    /// send: the C44 primary/VidPn rule was stage-INDEPENDENT, so
+    /// [`d3d12_primary_create_input`] was refused with
+    /// `PrimaryVidPnSourceNotConcrete`, the same record with the bit pre-set was
+    /// refused with `KmdOwnedFlagSetOnInput`, and those are the only two shapes
+    /// that exist. A D3D12 runtime primary could therefore never be created, and
+    /// the KMD's stamp was unreachable code — a rule that refuses every input
+    /// that could reach the stamp is indistinguishable from not implementing the
+    /// stamp at all.
+    #[test]
+    fn hwa2_admits_both_primary_shapes_as_input_and_refuses_them_unstamped_on_output() {
+        // ── the D3D11 shape: PRIMARY with a concrete source ─────────────────
+        let d11_in = primary_create_input();
+        assert_eq!(d11_in.validate_create_input(PKG), Ok(()));
+        // Output before the KMD writes anything: refused for the missing stamp,
+        // not for the VidPn source.
+        assert_eq!(
+            d11_in.validate_create_output(PKG),
+            Err(HeliosAllocDescRejection::AllocationGenerationZero)
+        );
+        let mut d11_out = d11_in;
+        d11_out.allocation_generation = 0x51;
+        d11_out.flags |= HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE;
+        assert_eq!(d11_out.validate_create_output(PKG), Ok(()));
+        assert_eq!(d11_out.validate(PKG), Ok(()));
+
+        // ── the D3D12 shape: PRIMARY with the sentinel and no bit ───────────
+        let d12_in = d3d12_primary_create_input();
+        assert_eq!(d12_in.validate_create_input(PKG), Ok(()));
+
+        // The one alternative a D3D12 UMD might try — asserting the bit itself —
+        // is still refused by name, and by the KMD-ownership rule rather than by
+        // C44, so the counter names the defect the creator actually has.
+        let mut d12_presumptuous = d12_in;
+        d12_presumptuous.flags |= HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY;
+        assert_eq!(
+            d12_presumptuous.validate_create_input(PKG),
+            Err(HeliosAllocDescRejection::KmdOwnedFlagSetOnInput {
+                bits: HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY,
+            })
+        );
+
+        // Output before the stamp: still the generation, for the same reason.
+        assert_eq!(
+            d12_in.validate_create_output(PKG),
+            Err(HeliosAllocDescRejection::AllocationGenerationZero)
+        );
+
+        // ⛔ The output rule is NOT weakened. A generation-stamped record whose
+        // C44 bit the KMD forgot is exactly the "primary belonging to no source"
+        // an opener must never see, and it is still refused by name.
+        let mut d12_half = d12_in;
+        d12_half.allocation_generation = 0x52;
+        assert_eq!(
+            d12_half.validate_create_output(PKG),
+            Err(HeliosAllocDescRejection::PrimaryVidPnSourceNotConcrete)
+        );
+        assert_eq!(
+            d12_half.validate(PKG),
+            Err(HeliosAllocDescRejection::PrimaryVidPnSourceNotConcrete)
+        );
+
+        // Fully stamped: accepted on both output entry points.
+        let mut d12_out = d12_half;
+        d12_out.flags |= HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY;
+        assert_eq!(d12_out.validate_create_output(PKG), Ok(()));
+        assert_eq!(d12_out.validate(PKG), Ok(()));
+
+        // And the finished record is not a legal input again: the generation
+        // check precedes the flag check, so the refusal order is the documented
+        // one even when both KMD-owned things are present at once.
+        assert_eq!(
+            d12_out.validate_create_input(PKG),
+            Err(HeliosAllocDescRejection::AllocationGenerationNonZeroOnInput { found: 0x52 })
+        );
+        let mut regen = d12_out;
+        regen.allocation_generation = 0;
+        assert_eq!(
+            regen.validate_create_input(PKG),
+            Err(HeliosAllocDescRejection::KmdOwnedFlagSetOnInput {
+                bits: HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY,
+            })
+        );
+
+        // Undoing the two KMD-owned writes gives back the input, all 168 bytes:
+        // the D3D12 stamp echoes every UMD field exactly as the D3D11 one does.
+        let mut echoed = d12_out;
+        echoed.allocation_generation = 0;
+        echoed.flags &= !HELIOS_HWA2_FLAG_KMD_OWNED_MASK;
+        assert_eq!(echoed, d12_in);
+    }
+
+    /// Every illegal C44 combination, named, on the stage that can reach it.
+    ///
+    /// The point of the single shared core is that a rule cannot be enforced on
+    /// one path and not another, so the two arms that are NOT stage-dependent are
+    /// asserted on both stages here — only the bit-less-primary arm differs, and
+    /// it differs in exactly one direction.
+    #[test]
+    fn hwa2_c44_illegal_combinations_are_refused_by_name_on_every_reachable_stage() {
+        // The bit without the sentinel — output only, since the bit itself is
+        // illegal on input.
+        let mut bit_no_sentinel = primary_desc();
+        bit_no_sentinel.flags |= HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY;
+        assert_eq!(
+            bit_no_sentinel.validate_create_output(PKG),
+            Err(HeliosAllocDescRejection::D3D12RuntimePrimaryNotSentinel { found: 0 })
+        );
+
+        // The bit without PRIMARY — likewise output only.
+        let mut bit_no_primary = primary_desc();
+        bit_no_primary.flags &=
+            !(HELIOS_HWA2_FLAG_PRIMARY | HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE);
+        bit_no_primary.flags |= HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY;
+        bit_no_primary.vidpn_source = D3DDDI_ID_UNINITIALIZED;
+        assert_eq!(
+            bit_no_primary.validate_create_output(PKG),
+            Err(HeliosAllocDescRejection::D3D12RuntimePrimaryWithoutPrimary)
+        );
+
+        // A non-primary carrying a concrete source. Nothing about this arm is
+        // stage-dependent, and it is asserted on both so the gate above cannot
+        // quietly grow to cover it.
+        let mut non_primary = buffer_desc();
+        non_primary.allocation_generation = 0;
+        non_primary.vidpn_source = 2;
+        let expected = Err(HeliosAllocDescRejection::NonPrimaryVidPnSourceNotSentinel { found: 2 });
+        assert_eq!(non_primary.validate_create_input(PKG), expected);
+        non_primary.allocation_generation = 7;
+        assert_eq!(non_primary.validate_create_output(PKG), expected);
+        assert_eq!(non_primary.validate(PKG), expected);
+
+        // A D3D11 primary that lost its concrete source: refused on output,
+        // admitted on input as the D3D12 request it is indistinguishable from.
+        // ⚠ This asymmetry is the whole fix, and it is deliberate — before the
+        // KMD reads the D3D12 create record there is nothing in these 168 bytes
+        // that could tell the two apart, so the input stage cannot decide it and
+        // must not pretend to.
+        let mut sentinel_primary = primary_desc();
+        sentinel_primary.vidpn_source = D3DDDI_ID_UNINITIALIZED;
+        assert_eq!(
+            sentinel_primary.validate_create_output(PKG),
+            Err(HeliosAllocDescRejection::PrimaryVidPnSourceNotConcrete)
+        );
+        assert_eq!(
+            sentinel_primary.validate(PKG),
+            Err(HeliosAllocDescRejection::PrimaryVidPnSourceNotConcrete)
+        );
+        assert_eq!(
+            d3d12_primary_create_input().validate_create_input(PKG),
+            Ok(())
         );
     }
 
@@ -4756,6 +5358,7 @@ mod tests {
         assert_eq!(HELIOS_HWA2_ABI_VERSION, 2);
         assert_eq!(HELIOS_HWA2_BYTES, 168);
         assert_eq!(HELIOS_HWA2_FLAG_MASK, 0x0000_07FF);
+        assert_eq!(HELIOS_HWA2_FLAG_KMD_OWNED_MASK, 0x0000_0030);
         assert_eq!(HELIOS_HWA2_BIND_MASK, 0x0000_07FF);
         assert_eq!(HELIOS_HWA2_MISC_MASK, 0x0000_000F);
         assert_eq!(HELIOS_HWA2_MAX_PLANES, 4);

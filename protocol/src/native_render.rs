@@ -1876,6 +1876,11 @@ pub enum Hvm1Reject {
     SegmentPageShiftUnexpected,
     /// The KMD returned a zero or non-power-of-two alignment.
     AllocationAlignmentInvalid,
+    /// The `(pPrivateDriverData, PrivateDriverDataSize)` buffer is not exactly
+    /// [`HELIOS_HVM1_SIZE`] bytes. Appended when
+    /// [`HeliosVenusMemoryAllocationV1::from_private_data`] was added; the codes
+    /// above are stable and this one continues them.
+    PrivateDataSizeMismatch,
 }
 
 impl Hvm1Reject {
@@ -1899,6 +1904,7 @@ impl Hvm1Reject {
             Self::ObjectGenerationZeroOnOutput => 0x040F,
             Self::SegmentPageShiftUnexpected => 0x0410,
             Self::AllocationAlignmentInvalid => 0x0411,
+            Self::PrivateDataSizeMismatch => 0x0412,
         }
     }
 }
@@ -1935,6 +1941,33 @@ impl HeliosVenusMemoryAllocationV1 {
                 | HELIOS_HVM1_ACCESS_HOST_READ
                 | HELIOS_HVM1_ACCESS_HOST_WRITE,
         )
+    }
+
+    /// Read one HVM1 out of a `(pPrivateDriverData, PrivateDriverDataSize)`
+    /// pair that must be exactly [`HELIOS_HVM1_SIZE`] bytes long.
+    ///
+    /// Owned and unaligned for the same reason as
+    /// [`crate::wddm::HeliosWddmAllocationDescV2::from_private_data`] and
+    /// [`crate::wddm::HeliosOuterCommandAllocationV1::from_private_data`], and
+    /// carrying the identical obligation: the runtime's buffer carries no
+    /// alignment promise, and a KMD that read 64 bytes out of a shorter one
+    /// would take an out-of-bounds **kernel** read this crate could not catch.
+    /// Every consumer must enter through here rather than casting the pointer.
+    ///
+    /// ⚠ Like HOC1's, this is the validation entry point and not a substitute
+    /// for the write-back: `object_generation`, `segment_page_shift` and
+    /// `allocation_alignment` are filled in the *runtime's own buffer* at
+    /// create, so a KMD that parses through here must write those bytes back
+    /// through the original pointer. It also does not validate — call
+    /// [`Self::validate`] with the right [`Hvm1Stage`] on the returned record.
+    pub fn from_private_data(bytes: &[u8]) -> Result<Self, Hvm1Reject> {
+        if bytes.len() != core::mem::size_of::<Self>() {
+            return Err(Hvm1Reject::PrivateDataSizeMismatch);
+        }
+        // With the length already exact, `try_pod_read_unaligned` cannot fail;
+        // the arm is kept because a total function may not `unwrap`.
+        bytemuck::try_pod_read_unaligned::<Self>(bytes)
+            .map_err(|_| Hvm1Reject::PrivateDataSizeMismatch)
     }
 
     /// Total validation of one HVM1 record at the given stage.
@@ -3482,6 +3515,65 @@ mod tests {
             wc.validate(PKG, Hvm1Stage::CreateInput),
             Err(Hvm1Reject::CachePolicyNotRoleExact)
         );
+    }
+
+    /// §10.7's HVM1 arrives on the same `(pPrivateDriverData,
+    /// PrivateDriverDataSize)` pair as HWA2 and HOC1, and the KMD reads it in
+    /// kernel mode: the length must be a gate taken *before* the read, or a
+    /// short user buffer is an out-of-bounds kernel read that no field
+    /// validation afterwards can undo. `HeliosVenusMemoryAllocationV1` does not
+    /// derive `PartialEq` (unlike its two siblings), so the round-trip is
+    /// asserted on the bytes.
+    #[test]
+    fn hvm1_is_read_through_a_bounded_reader() {
+        let pool = HeliosVenusMemoryAllocationV1::new_reply_pool(PKG);
+        let bytes = bytemuck::bytes_of(&pool);
+        let parsed = HeliosVenusMemoryAllocationV1::from_private_data(bytes)
+            .expect("an exactly-64-byte buffer must parse");
+        assert_eq!(bytemuck::bytes_of(&parsed), bytes);
+
+        // Short: the whole point of the gate.
+        assert_eq!(
+            HeliosVenusMemoryAllocationV1::from_private_data(&bytes[..63]).unwrap_err(),
+            Hvm1Reject::PrivateDataSizeMismatch
+        );
+        // Empty, and one byte too long: both are "not exactly 64".
+        assert_eq!(
+            HeliosVenusMemoryAllocationV1::from_private_data(&[]).unwrap_err(),
+            Hvm1Reject::PrivateDataSizeMismatch
+        );
+        let mut over = [0u8; 65];
+        over[..64].copy_from_slice(bytes);
+        assert_eq!(
+            HeliosVenusMemoryAllocationV1::from_private_data(&over).unwrap_err(),
+            Hvm1Reject::PrivateDataSizeMismatch
+        );
+
+        // A correct-length buffer at an ODD address must parse: the record has
+        // `u64` fields and alignment 8, the runtime promises neither, and the
+        // read is unaligned on purpose. It must not be refused with a *length*
+        // error that names the correct length.
+        let mut staging = [0u8; 72];
+        staging[1..65].copy_from_slice(bytes);
+        let parsed = HeliosVenusMemoryAllocationV1::from_private_data(&staging[1..65])
+            .expect("an unaligned exactly-64-byte buffer must parse");
+        assert_eq!(bytemuck::bytes_of(&parsed), bytes);
+        assert_eq!(
+            parsed.validate(PKG, Hvm1Stage::CreateInput),
+            Ok(Hvm1Role::ReplyPool)
+        );
+
+        // The reader is not a validator: a 64-byte buffer of garbage parses and
+        // is then refused by name, which is what keeps the two jobs separate.
+        assert_eq!(
+            HeliosVenusMemoryAllocationV1::from_private_data(&[0u8; 64])
+                .expect("length is exact")
+                .validate(PKG, Hvm1Stage::CreateInput),
+            Err(Hvm1Reject::MagicMismatch)
+        );
+
+        // The appended code continues the stable 0x04xx block.
+        assert_eq!(Hvm1Reject::PrivateDataSizeMismatch.code(), 0x0412);
     }
 
     #[test]

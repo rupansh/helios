@@ -125,6 +125,19 @@ HELIOS_WDDM_STATIC_ASSERT(HELIOS_PACKAGE_GENERATION == UINT64_C(0x48454C49000000
 #define HELIOS_HWA2_FLAG_STANDARD              (1u << 10)
 #define HELIOS_HWA2_FLAG_MASK                  0x000007FFu
 
+/* The two bits ONLY the KMD may set, and therefore the exact set a create-INPUT
+ * descriptor must leave clear. §10.3: "KMD sets `D3D12_RUNTIME_PRIMARY` only
+ * when the D3D12 create record, runtime `PRIMARY` flag, and required
+ * `D3DDDI_ID_UNINITIALIZED` value agree … KMD sets `DIRECT_FLIP_COMPATIBLE`
+ * only when the exact allocation is a non-protected, non-cross-adapter managed
+ * primary in a swizzle/layout class the selected display backend implements",
+ * and of both: "neither is inferred by an opener". A producer that pre-sets
+ * either is refused by name (Rust `KmdOwnedFlagSetOnInput`), never silently
+ * corrected — a silent correction makes the finished descriptor disagree with
+ * the resource the producer believes it asked for. */
+#define HELIOS_HWA2_FLAG_KMD_OWNED_MASK \
+    (HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE | HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY)
+
 /* Bind flags (§10.3, offset 72) — the shared protocol vocabulary, never a raw
  * D3D11/D3D12 bit reinterpretation. */
 #define HELIOS_HWA2_BIND_SHADER_RESOURCE  (1u << 0)
@@ -191,15 +204,36 @@ HELIOS_WDDM_STATIC_ASSERT(offsetof(HeliosWddmPlaneRecordV2, slice_pitch) == 12, 
  * the retired `HeliosWddmOpenIdentity` restamped its first 48 bytes at open
  * time, so two openers of one allocation could disagree about what they had.
  *
+ * ⛔ TWO CREATE STAGES, ONE LAYOUT. The buffer is `[in/out]` and the kernel
+ * cannot invent texel dimensions, so the create is a request and a total
+ * acceptance: user mode fills a complete create-INPUT record, KMD validates it
+ * in full, and KMD then writes all 168 bytes back, echoing every field it
+ * validated and stamping the ones only the kernel can know. The whole
+ * difference between the two sides is `allocation_generation` (zero in, nonzero
+ * out), `HELIOS_HWA2_FLAG_KMD_OWNED_MASK` (clear in, KMD-decided out), and the
+ * one C44 cross-field rule those bits make stage-dependent: because
+ * `HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY` is KMD-owned, a D3D12 runtime
+ * primary's INPUT is `FLAG_PRIMARY` + `HELIOS_D3DDDI_ID_UNINITIALIZED` + that
+ * bit CLEAR, and is admitted; on OUTPUT the same primary+sentinel pair without
+ * the bit is refused, so the two are still cross-validated in both directions on
+ * the bytes every opener treats as const.
+ * A refused input creates nothing. Rust `Hwa2Stage` /
+ * `validate_create_input` / `validate_create_output`.
+ *
  * Any malformed, unknown, TRUNCATED, mismatched-generation, or reserved-nonzero
- * descriptor makes create/open fail; it never selects a legacy parser.
+ * descriptor makes create/open fail; it never selects a legacy parser. TRUNCATED
+ * is a length gate on the `(pPrivateDriverData, PrivateDriverDataSize)` pair
+ * itself — exactly 168 bytes, checked BEFORE the read — because a consumer that
+ * reads 168 bytes out of a shorter buffer has already taken the out-of-bounds
+ * read no later validation can undo (Rust `from_private_data`).
  */
 typedef struct HeliosWddmAllocationDescV2 {
     uint32_t magic;                    /* 0   == HELIOS_HWA2_MAGIC */
     uint16_t abi_version;              /* 4   == HELIOS_HWA2_ABI_VERSION */
     uint16_t struct_size;              /* 6   == HELIOS_HWA2_BYTES */
     uint64_t package_generation;       /* 8   exact; zero is never a wildcard */
-    uint64_t allocation_generation;    /* 16  nonzero; NEVER a lookup key */
+    uint64_t allocation_generation;    /* 16  zero IN, nonzero OUT; KMD assigns
+                                        *     it; NEVER a lookup key */
     uint64_t byte_size;                /* 24  nonzero; bounds every plane */
     uint32_t width;                    /* 32  zero only for a non-image kind */
     uint32_t height;                   /* 36 */
@@ -211,10 +245,14 @@ typedef struct HeliosWddmAllocationDescV2 {
     uint32_t sample_count;             /* 56 */
     uint32_t sample_quality;           /* 60 */
     uint32_t allocation_kind;          /* 64  HELIOS_HWA2_KIND_* */
-    uint32_t flags;                    /* 68  HELIOS_HWA2_FLAG_* */
+    uint32_t flags;                    /* 68  HELIOS_HWA2_FLAG_*; on input every
+                                        *     KMD_OWNED_MASK bit is clear */
     uint32_t bind_flags;               /* 72  HELIOS_HWA2_BIND_* */
     uint32_t misc_flags;               /* 76  HELIOS_HWA2_MISC_* */
-    uint32_t vidpn_source;             /* 80  concrete, or the C44 sentinel */
+    uint32_t vidpn_source;             /* 80  concrete, or the C44 sentinel; a
+                                        *     PRIMARY carrying the sentinel is a
+                                        *     D3D12 request on INPUT and the
+                                        *     RUNTIME_PRIMARY bit on OUTPUT */
     uint32_t standard_allocation_type; /* 84  nonzero iff FLAG_STANDARD */
     uint32_t swizzle_class;            /* 88  HELIOS_HWA2_SWIZZLE_* */
     uint32_t memory_class;             /* 92  HELIOS_HWA2_MEMORY_* */
@@ -262,6 +300,10 @@ HELIOS_WDDM_STATIC_ASSERT(HELIOS_HWA2_FLAG_MASK ==
                                HELIOS_HWA2_FLAG_CPU_VISIBLE |
                                HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED | HELIOS_HWA2_FLAG_STANDARD),
                           "the §10.3 flag mask is exactly its eleven bits");
+HELIOS_WDDM_STATIC_ASSERT(HELIOS_HWA2_FLAG_KMD_OWNED_MASK == 0x00000030u,
+                          "the KMD-owned pair is exactly DIRECT_FLIP_COMPATIBLE|D3D12_RUNTIME_PRIMARY");
+HELIOS_WDDM_STATIC_ASSERT((HELIOS_HWA2_FLAG_KMD_OWNED_MASK & ~HELIOS_HWA2_FLAG_MASK) == 0u,
+                          "the KMD-owned pair must be a subset of the defined flags");
 
 /* ------------------------------------------------------------------------ */
 /* §10.4 — HOB1: one complete contiguous translated outer command           */

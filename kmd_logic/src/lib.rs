@@ -7,11 +7,18 @@
 //! tested in place. This crate is where it goes.
 //!
 //! The contract that makes that worth doing is the absent dependency edge: there
-//! is no `wdk-sys`, no `wdk-build`, no `bytemuck`, and no generated `dxgk`
-//! binding reachable from here, so nothing in this crate can read a `DXGKARG_*`
-//! field, a `HANDLE`, or an atomic out of `AdapterContext`. Every rule below is
-//! a function of its arguments and nothing else, which is exactly the property
-//! that makes it testable on the host.
+//! is no `wdk-sys`, no `wdk-build`, no generated `dxgk`/`ntddk` binding, and no
+//! `kmd_render` type reachable from here, so nothing in this crate can read a
+//! `DXGKARG_*` field, a `HANDLE`, or an atomic out of `AdapterContext`. Every
+//! rule below is a function of its arguments and nothing else, which is exactly
+//! the property that makes it testable on the host.
+//!
+//! ⚠ The one admitted edge is `helios_protocol` (K4, 2026-08-10). It is
+//! `no_std`, it is already a `kmd_render` dependency, and its records carry no
+//! handle, pointer or kernel state by construction, so it does not weaken the
+//! rule above — see the argument in `kmd_logic/Cargo.toml`. Note that
+//! [`native_fence_lifecycle`] predates the decision and still re-declares the
+//! HNF1 offset table locally; that is history, not a pattern to copy.
 //!
 //! Run the tests with `cargo test` inside `kmd_logic/`, the same way `protocol/`
 //! is tested. Nothing else runs them.
@@ -188,65 +195,34 @@ impl Pfn {
     }
 }
 
-/// The private-data trailer layouts this driver actually accepts.
-///
-/// The trailer is guest-supplied (`D3DKMTCreateAllocation` private data), and
-/// the length test used to be a max-union bound — "at least 24, copy up to 48" —
-/// so any length in 25..=47 was accepted and copied into the MIDDLE of a field,
-/// zero-extending the remainder. A 30-byte trailer yielded
-/// `venus_alloc_size = real & 0x0000_FFFF_FFFF_FFFF` and `plane_offset = 0`: a
-/// plausible-looking but wrong exact import size, which is the undersize-import
-/// class that previously produced host Xid 31 FAULT_PTE. Per-arm validation,
-/// not max-union (k-alloc-03).
-///
-/// The byte counts are duplicated from `helios_protocol` because this crate
-/// deliberately has no dependency edge to it; `kmd_render` pins them together
-/// with a `const` assertion at the use site.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MetaLayout {
-    /// Geometry + bind/misc only, no venus identity fields. Exactly the first
-    /// 24 bytes of the full layout, so it parses into a zero-extended meta and
-    /// an allocation created by a pre-identity driver instance can still be
-    /// opened after a component update without a reboot.
-    Legacy24,
-    /// The full trailer. Longer buffers are accepted and the excess ignored —
-    /// that is how a future writer adds fields without breaking this one.
-    Full48,
-}
-
-impl MetaLayout {
-    pub const LEGACY_BYTES: usize = 24;
-    pub const FULL_BYTES: usize = 48;
-
-    /// Classify a trailer length, or `None` if it is not one of the two real
-    /// layouts. `None` must produce a refusal, never a partial read.
-    pub const fn from_trailer_len(len: usize) -> Option<Self> {
-        if len == Self::LEGACY_BYTES {
-            Some(Self::Legacy24)
-        } else if len >= Self::FULL_BYTES {
-            Some(Self::Full48)
-        } else {
-            None
-        }
-    }
-
-    /// How many bytes to copy. Comes from the layout, never from arithmetic on
-    /// the caller-supplied size.
-    pub const fn copy_bytes(self) -> usize {
-        match self {
-            Self::Legacy24 => Self::LEGACY_BYTES,
-            Self::Full48 => Self::FULL_BYTES,
-        }
-    }
-}
-
-impl TryFrom<usize> for MetaLayout {
-    type Error = ();
-
-    fn try_from(len: usize) -> Result<Self, Self::Error> {
-        Self::from_trailer_len(len).ok_or(())
-    }
-}
+// ⛔ TOMBSTONE — `MetaLayout` (the `Legacy24` / `Full48` trailer classifier, its
+// `LEGACY_BYTES` / `FULL_BYTES` counts, `from_trailer_len`, `copy_bytes` and the
+// `TryFrom<usize>` impl) was DELETED by K4, 2026-08-10.
+//
+// It classified the length of the retired `HeliosWddmAllocMeta` trailer, and its
+// own doc said out loud what made it a defect: "the byte counts are duplicated
+// from `helios_protocol` because this crate deliberately has no dependency edge
+// to it". K4 admitted that edge (see the `helios_protocol` argument in
+// `kmd_logic/Cargo.toml`), so the duplication no longer buys anything — and a
+// second declaration of a RETIRED wire record's layout, sitting in the very
+// crate whose new dependency argument cites exactly that as the thing to avoid,
+// is worse than a duplicate: it is a duplicate of something that no longer
+// exists. Its last consumer (`create_allocation.rs`'s trailer parse, which
+// pinned the two together with `const _: () = assert!(size_of::<…>() ==
+// MetaLayout::FULL_BYTES)`) died with the trailer; `rg MetaLayout kmd_render/`
+// is empty.
+//
+// ⭐ The ARGUMENT it carried is not deleted, because it is still live — it is
+// the "validate per-arm, never max-union" rule (k-alloc-03). A max-union bound
+// ("at least 24, copy up to 48") accepted any length in 25..=47 and copied it
+// into the MIDDLE of a field, zero-extending the remainder: a 30-byte trailer
+// yielded `venus_alloc_size = real & 0x0000_FFFF_FFFF_FFFF` and
+// `plane_offset = 0`, a plausible-looking but wrong exact import size, which is
+// the undersize-import class that produced host Xid 31 FAULT_PTE. That rule now
+// lives where the record does: HWA2/HVM1/HOC1 are ONE fixed size each and are
+// parsed only through `helios_protocol`'s `from_private_data`, which refuses any
+// length that is not exact rather than reading a prefix — see
+// [`allocation_identity`], whose tests are its oracle.
 
 /// Verdict of one seqlock read attempt over a published descriptor.
 ///
@@ -1328,34 +1304,14 @@ mod tests {
         assert_eq!(Pfn(1 << 51).physical_address(), None);
     }
 
-    #[test]
-    fn meta_layout_accepts_only_the_two_real_layouts() {
-        assert_eq!(MetaLayout::try_from(24), Ok(MetaLayout::Legacy24));
-        assert_eq!(MetaLayout::try_from(48), Ok(MetaLayout::Full48));
-        // 96 is what both live writers emit (48 prefix + 48 trailer).
-        assert_eq!(MetaLayout::try_from(96), Ok(MetaLayout::Full48));
-        assert_eq!(MetaLayout::try_from(usize::MAX), Ok(MetaLayout::Full48));
-    }
-
-    /// The whole point: a length that lands mid-field is refused, not truncated
-    /// into a plausible-looking wrong value.
-    #[test]
-    fn meta_layout_rejects_partial_trailers() {
-        for len in [0usize, 1, 8, 16, 23, 25, 30, 32, 40, 47] {
-            assert_eq!(MetaLayout::try_from(len), Err(()), "len {len}");
-        }
-    }
-
-    #[test]
-    fn meta_layout_copy_length_comes_from_the_layout() {
-        assert_eq!(MetaLayout::Legacy24.copy_bytes(), 24);
-        assert_eq!(MetaLayout::Full48.copy_bytes(), 48);
-        // A longer buffer copies the full layout, never `len`.
-        assert_eq!(
-            MetaLayout::from_trailer_len(96).unwrap().copy_bytes(),
-            MetaLayout::FULL_BYTES
-        );
-    }
+    // ⛔ The three `meta_layout_*` tests were DELETED with the type they tested
+    // (K4, 2026-08-10 — see the tombstone above `SeqRead`). They are NOT
+    // re-homed: a test whose subject is gone is not coverage, it is the
+    // appearance of coverage. The rule they defended — refuse a length that is
+    // not exactly one real layout, never read a prefix — is now tested against
+    // the record that actually crosses the seam, in
+    // `allocation_identity::tests` — `hwa2_private_data_is_an_exact_length_gate`
+    // and its HVM1/HOC1 siblings.
 
     #[test]
     fn seq_read_accepts_only_an_even_unchanged_sequence() {
@@ -6340,5 +6296,1849 @@ mod native_fence_lifecycle_tests {
                 "gate {i} alone must be able to refuse the whole surface"
             );
         }
+    }
+}
+
+/// The allocation-identity subsystem: the create/open state machine for the
+/// three per-allocation private-data records, and the generation lifecycle that
+/// ties them to the KMD allocation object.
+///
+/// # Why this module exists at all
+///
+/// `dxgkddi_create_allocation` receives HWA2 (168 bytes), HVM1 (64) or HOC1
+/// (64) on the same `(pPrivateDriverData, PrivateDriverDataSize)` pair, parses
+/// it, validates it, stamps the fields only the kernel can know, and writes the
+/// record back through the runtime's own buffer. `protocol/` validates **one
+/// record at a time** — it is a pure function of the bytes in front of it. It
+/// cannot express the parts of the contract that only exist *across* calls:
+///
+/// * that the create-input a UMD sends and the create-output the KMD returns
+///   differ in exactly the KMD-owned fields and in nothing else (§10.3's
+///   "every opener treats it as const" is worthless if create silently
+///   rewrites a field the UMD believes it chose);
+/// * that a generation is minted once, per allocation, at create, is never
+///   zero, is never restarted by an adapter reset, and is never resolved *from*
+///   (`wddm.rs:383-388`: "⛔ Never an identity lookup key");
+/// * that the C65 pool's live-extent ledger, which `validate_pool_extent` takes
+///   as an *argument*, actually advances and retires.
+///
+/// Those are this module's subject. It is the acceptance evidence for
+/// `docs/retirement/K4-CONTRACT.md` §8 obligations 1-4 and the only part of K4
+/// that runs on Linux at all — `kmd_render` cannot be built here, let alone
+/// tested.
+///
+/// # What it deliberately does not do
+///
+/// It does not re-declare a wire record, a field offset, a flag value or a
+/// validation rule that `protocol/` already owns. Every admission below routes
+/// through `protocol`'s own validator and wraps `protocol`'s own named
+/// rejection, so a rule can never be enforced here and not there. The one
+/// apparent exception is [`encode_hwa2`] and its two siblings, which write the
+/// documented byte layout by hand: they are an *independent oracle* for the
+/// offset table (the tests assert `from_private_data(encode(x)) == x`, which
+/// fails if either side drifts), not a second declaration — they construct no
+/// type and define no rule.
+pub mod allocation_identity {
+    use helios_protocol::{
+        validate_pool_extent, HeliosAllocDescRejection, HeliosExtentRejection,
+        HeliosExtentRetirementV1, HeliosExtentSealState, HeliosOuterCommandAllocRejection,
+        HeliosOuterCommandAllocationV1, HeliosRetirementRejection, HeliosSealTransitionRejection,
+        HeliosVenusMemoryAllocationV1, HeliosWddmAllocationDescV2, Hvm1Placement, Hvm1Reject,
+        Hvm1Role, Hvm1Stage, HELIOS_HOC1_ABI_VERSION, HELIOS_HOC1_BYTES, HELIOS_HOC1_MAGIC,
+        HELIOS_HVM1_ABI_VERSION, HELIOS_HVM1_MAGIC, HELIOS_HVM1_SEGMENT_PAGE_SHIFT,
+        HELIOS_HVM1_SIZE, HELIOS_HWA2_ABI_VERSION, HELIOS_HWA2_BYTES,
+        HELIOS_HWA2_FLAG_KMD_OWNED_MASK, HELIOS_HWA2_MAGIC, HELIOS_SEGMENT_ID_HLM1,
+    };
+
+    // ── The exact HWA2 flag bits the KMD owns, per `K4-CONTRACT.md` §1.1.
+    //
+    // Both are `== 0` on create-input and are the only two bits create may add.
+    // `DIRECT_FLIP_COMPATIBLE` is a claim about the *display backend* ("only
+    // when the exact allocation is a non-protected, non-cross-adapter managed
+    // primary in a swizzle/layout class the selected display backend
+    // implements") and `D3D12_RUNTIME_PRIMARY` is the C44 bit whose sentinel is
+    // cross-validated — neither is inferrable by a UMD, and §10.3 forbids an
+    // opener inferring either one. Every other bit in the word is the UMD's and
+    // is echoed verbatim.
+    //
+    // ⛔ That reasoning is kept; the VALUE is not. This module used to declare
+    // its own `HWA2_KMD_OWNED_FLAGS = DIRECT_FLIP_COMPATIBLE | D3D12_RUNTIME_PRIMARY`,
+    // which is a second declaration of a rule `protocol` already owns as
+    // [`HELIOS_HWA2_FLAG_KMD_OWNED_MASK`] (`wddm.rs:245`) — the same rule was
+    // ALSO re-derived by hand in `umd/src/forward/resource.rs` and
+    // `umd12/src/forward12/resource12.rs`, so one rule had four declarations and
+    // nothing compared them. The failure mode is not a typo today, it is the day
+    // a third KMD-owned bit is added: `protocol`'s validator refuses the bit on
+    // input, and every stale copy keeps clearing only two bits in its echo
+    // check, so the echo silently starts comparing a field the KMD legitimately
+    // stamped. Every consumer now reads the one constant, and the C mirror is
+    // pinned to it by `helios_wddm.h`'s own static assert.
+
+    /// Why an allocation-identity operation was refused.
+    ///
+    /// Every variant is a distinct counted refusal in `kmd_render`; none is
+    /// ever silently repaired, and the four wrapping variants carry
+    /// `protocol`'s own named rejection so the KMD counter and the ETW field
+    /// can use one vocabulary rather than two.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum IdentityRefusal {
+        /// An HWA2 record was refused by `protocol`.
+        Hwa2(HeliosAllocDescRejection),
+        /// An HVM1 record was refused by `protocol`.
+        Hvm1(Hvm1Reject),
+        /// An HOC1 record was refused by `protocol`.
+        Hoc1(HeliosOuterCommandAllocRejection),
+        /// A C65 pool extent was refused by `protocol`.
+        Extent(HeliosExtentRejection),
+        /// A C65 seal-state transition was refused by `protocol`.
+        SealTransition(HeliosSealTransitionRejection),
+        /// A C65 retirement tuple was refused by `protocol`.
+        Retirement(HeliosRetirementRejection),
+        /// The generation counter was read out of a zeroed structure, i.e. one
+        /// that never went through [`GenerationCounter::new`]. Minting from it
+        /// would hand out generation 0, which every validator in `protocol`
+        /// reads as "the UMD supplied it" and refuses — but only *after* the
+        /// KMD has already created the object. Refuse at the source instead.
+        GenerationCounterUninitialised,
+        /// The 64-bit generation space is exhausted.
+        ///
+        /// Deliberately **not** saturating, and this is the one place this
+        /// module diverges from [`super::native_fence_lifecycle`]'s
+        /// `next_object_generation`. A saturating counter hands `u64::MAX` to
+        /// every subsequent allocation, so two live allocations share one
+        /// generation and every `expected_allocation_generation` stale check in
+        /// HOB1 (`wddm.rs:1430`) and HNR2 (`native_render.rs:615`) starts
+        /// silently accepting a batch aimed at the wrong object. At one
+        /// allocation per nanosecond the arm is 584 years away; it is here so
+        /// the failure is a counted refusal instead of a correctness hole.
+        GenerationSpaceExhausted,
+        /// The adapter-epoch space is exhausted, so a reset could no longer
+        /// invalidate the previous epoch's objects by bumping it.
+        AdapterEpochSpaceExhausted,
+        /// The object was minted before the current adapter epoch. §14 (adapter
+        /// reset) requires that "all generations change" together; a stale
+        /// object is refused rather than revalidated.
+        StaleAdapterEpoch {
+            /// The epoch the object was minted under.
+            object_epoch: u32,
+            /// The adapter's current epoch.
+            adapter_epoch: u32,
+        },
+        /// One allocation accumulated `u32::MAX` opens. Refused rather than
+        /// wrapped: a wrapped open count would let the last close free backing
+        /// that other openers still hold.
+        OpenCountOverflow,
+        /// The KMD tried to stamp a zero `allocation_generation` /
+        /// `object_generation` into a create-output record.
+        GenerationZeroAtStamp,
+        /// The KMD tried to set an HWA2 flag bit outside
+        /// [`HELIOS_HWA2_FLAG_KMD_OWNED_MASK`] during the create write-back. The bits
+        /// outside that mask belong to the UMD and are echoed, never authored.
+        KmdFlagOutsidePartition {
+            /// The offending bits.
+            bits: u32,
+        },
+        /// A `stale`-validation comparison was handed a zero expectation.
+        /// `protocol` refuses a zero `expected_allocation_generation` on the
+        /// wire (`wddm.rs:1652`, `native_render.rs:1517`); accepting it here
+        /// would turn "I did not fill this in" into "matches anything".
+        ExpectedGenerationZero,
+        /// HVM1 placement names [`HELIOS_SEGMENT_ID_HLM1`] for every role and
+        /// the segment is not exposed yet (K2 is blocked; `FINDINGS.md` F5
+        /// parked the QEMU/HPM1 half). Refused and counted per role — never
+        /// substituted onto the aperture segment, which `K4-CONTRACT.md` §4
+        /// forbids outright.
+        Hlm1SegmentNotExposed {
+            /// `HELIOS_HVM1_ROLE_*` of the refused create.
+            role: u32,
+        },
+        /// A role-4 (device-local) allocation was offered to `Lock2` /
+        /// `MapCpuHostAperture`. §10.7: role 4 "may never be passed to Lock2".
+        /// There is no CPU VA to hand back, so the only honest answer is a
+        /// counted refusal.
+        Role4NeverLockable,
+        /// The `DXGK_ALLOCATIONINFOFLAGS`/`Flags2` word the KMD is about to
+        /// write disagrees with [`Hvm1Placement`] for the role.
+        PlacementMismatch {
+            /// Which flag disagreed.
+            field: PlacementField,
+        },
+        /// The live-extent counter would overflow. Unreachable while
+        /// `validate_pool_extent` refuses at 256, and present because an
+        /// unchecked `+ 1` on a DDI path is never worth the byte saved.
+        LiveExtentCounterOverflow,
+        /// A retirement was accepted by the tuple validator but its
+        /// `hqc1_value` has not been reached by the context's completed value
+        /// yet, so the extent is still owned by in-flight GPU work.
+        ExtentNotRetiredYet {
+            /// The extent's recorded bottom-of-pipe value.
+            recorded: u64,
+            /// The context's completed value.
+            completed: u64,
+        },
+        /// A retirement arrived with no live extent to retire — an accounting
+        /// bug or a double retire.
+        NoLiveExtent,
+    }
+
+    // ── the allocation generation ───────────────────────────────────────────
+
+    /// The KMD's allocation-generation source: one monotone counter plus the
+    /// adapter epoch, per adapter.
+    ///
+    /// Deliberately **not** `Default` and deliberately not zero-initialisable,
+    /// for the same reason `HeliosWddmAllocationDescV2` is not `Default`: a
+    /// zeroed counter would mint generation 0, and 0 is the "user mode supplied
+    /// it" sentinel every validator in `protocol` refuses.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct GenerationCounter {
+        /// The next generation to hand out. Never 0 after [`Self::new`].
+        pub next: u64,
+        /// The adapter epoch. §14: an adapter reset "first changes
+        /// adapter/package-visible generation" and then "invalidates queue,
+        /// endpoint/ring, allocation/HPM1, host-batch, native-fence mapping,
+        /// WSI, and flip generations together" — one bump invalidates every
+        /// object with no enumeration and no discovery table.
+        pub epoch: u32,
+    }
+
+    impl GenerationCounter {
+        /// A fresh counter. Epoch starts at 1 so that a zeroed structure is not
+        /// a *valid* epoch either, and generation at 1 so the first allocation
+        /// is already nonzero.
+        ///
+        /// ⛔ No `Default`, and the lint is silenced on purpose: a derived
+        /// `Default` is the all-zero counter, which mints generation 0 — the
+        /// exact "user mode supplied it" sentinel every validator in
+        /// `protocol` refuses. The zero value of this type is invalid by
+        /// construction, so offering it under the name `default()` would be a
+        /// trap, not a convenience.
+        #[allow(clippy::new_without_default)]
+        pub const fn new() -> Self {
+            Self { next: 1, epoch: 1 }
+        }
+
+        /// Mint the next allocation generation.
+        ///
+        /// This is the *only* place a generation is created, and it is called
+        /// exactly once per allocation, from create. Open never calls it — see
+        /// [`AllocationIdentity::open`], whose whole point is that the
+        /// generation it returns is the one it was given.
+        pub fn mint(self) -> Result<(u64, Self), IdentityRefusal> {
+            if self.next == 0 {
+                return Err(IdentityRefusal::GenerationCounterUninitialised);
+            }
+            let value = self.next;
+            let next = match value.checked_add(1) {
+                Some(next) => next,
+                None => return Err(IdentityRefusal::GenerationSpaceExhausted),
+            };
+            Ok((value, Self { next, ..self }))
+        }
+
+        /// Bump the adapter epoch on reset.
+        ///
+        /// ⚠ `next` is **preserved**, not restarted. Restarting it would make a
+        /// post-reset allocation reuse a pre-reset generation, and a stale HOB1
+        /// use record naming that value would then pass its
+        /// `expected_allocation_generation` check against a different object.
+        /// The epoch is what invalidates; the counter is what disambiguates.
+        pub fn on_adapter_reset(self) -> Result<Self, IdentityRefusal> {
+            let epoch = match self.epoch.checked_add(1) {
+                Some(epoch) => epoch,
+                None => return Err(IdentityRefusal::AdapterEpochSpaceExhausted),
+            };
+            Ok(Self { epoch, ..self })
+        }
+    }
+
+    /// The KMD-side identity of one allocation object.
+    ///
+    /// ⚠ This is *not* the allocation object. `AllocationContext` in
+    /// `kmd_render` carries 21 mutable display fields beside it and none of
+    /// them belong here (`K4-CONTRACT.md` §3.1). This is only the immutable
+    /// identity triple the const descriptor is stamped from.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct AllocationIdentity {
+        /// The nonzero KMD-assigned generation written into HWA2 offset 16 /
+        /// HVM1 offset 16 / HOC1 offset 16.
+        pub generation: u64,
+        /// The adapter epoch this allocation was minted under.
+        pub epoch: u32,
+        /// How many `DxgkDdiOpenAllocation` references are outstanding.
+        pub opens: u32,
+    }
+
+    impl AllocationIdentity {
+        /// Mint one identity at create. Returns the advanced counter, so a
+        /// caller cannot mint twice from the same value by accident.
+        pub fn create(counter: GenerationCounter) -> Result<(Self, GenerationCounter), IdentityRefusal> {
+            let (generation, counter) = counter.mint()?;
+            Ok((
+                Self {
+                    generation,
+                    epoch: counter.epoch,
+                    opens: 0,
+                },
+                counter,
+            ))
+        }
+
+        /// Take one open reference.
+        ///
+        /// The returned identity has the **same** generation: `DxgkDdiOpen-
+        /// Allocation` neither mints nor restamps. The retired
+        /// `HeliosWddmOpenIdentity` restamped the first 48 bytes at open time,
+        /// so two openers of one allocation could disagree about what they had
+        /// (`wddm.rs:349-356`); this signature is what makes that
+        /// unrepresentable rather than merely discouraged.
+        pub fn open(self, adapter_epoch: u32) -> Result<Self, IdentityRefusal> {
+            if self.epoch != adapter_epoch {
+                return Err(IdentityRefusal::StaleAdapterEpoch {
+                    object_epoch: self.epoch,
+                    adapter_epoch,
+                });
+            }
+            let opens = match self.opens.checked_add(1) {
+                Some(opens) => opens,
+                None => return Err(IdentityRefusal::OpenCountOverflow),
+            };
+            Ok(Self { opens, ..self })
+        }
+
+        /// Does a batch's `expected_allocation_generation` still describe this
+        /// object?
+        ///
+        /// ⛔ This is the *only* direction the generation is ever used in. There
+        /// is deliberately no `fn find(generation) -> AllocationIdentity` in
+        /// this module and there must never be one: §10.3 says the generation
+        /// is "never an identity lookup key", and the caller here already holds
+        /// the object — dxgkrnl resolved the allocation handle for it. A zero
+        /// expectation is refused rather than treated as a wildcard.
+        pub fn matches_expected(
+            &self,
+            expected_allocation_generation: u64,
+            adapter_epoch: u32,
+        ) -> Result<bool, IdentityRefusal> {
+            if expected_allocation_generation == 0 {
+                return Err(IdentityRefusal::ExpectedGenerationZero);
+            }
+            if self.epoch != adapter_epoch {
+                return Err(IdentityRefusal::StaleAdapterEpoch {
+                    object_epoch: self.epoch,
+                    adapter_epoch,
+                });
+            }
+            Ok(self.generation == expected_allocation_generation)
+        }
+    }
+
+    // ── HWA2: the create-input / create-output / open state machine ──────────
+
+    /// `DxgkDdiCreateAllocation`, HWA2 arm, step 1: parse the runtime's buffer
+    /// through the bounded reader and admit it as a create *request*.
+    ///
+    /// The length gate is the whole reason `from_private_data` exists: a KMD
+    /// that read 168 bytes out of a shorter buffer would take an out-of-bounds
+    /// kernel read no validator in `protocol` could catch.
+    pub fn hwa2_admit_create_input(
+        bytes: &[u8],
+        package_generation: u64,
+    ) -> Result<HeliosWddmAllocationDescV2, IdentityRefusal> {
+        let desc =
+            HeliosWddmAllocationDescV2::from_private_data(bytes).map_err(IdentityRefusal::Hwa2)?;
+        desc.validate_create_input(package_generation)
+            .map_err(IdentityRefusal::Hwa2)?;
+        Ok(desc)
+    }
+
+    /// `DxgkDdiCreateAllocation`, HWA2 arm, step 2: the KMD write-back.
+    ///
+    /// Every field except `allocation_generation` and the bits in
+    /// [`HELIOS_HWA2_FLAG_KMD_OWNED_MASK`] is echoed from the admitted input untouched.
+    /// `K4-CONTRACT.md` §1.1: "The KMD refuses the create rather than
+    /// correcting a field. Silent correction would make the descriptor
+    /// disagree with the resource the UMD believes it made." The output is
+    /// re-validated before it is handed back, so a stamp that produces an
+    /// inadmissible pairing (a Direct Flip bit on a non-primary, a C44 primary
+    /// bit against a concrete VidPn source) fails the create instead of
+    /// shipping a descriptor no opener will accept.
+    pub fn hwa2_stamp_create_output(
+        input: &HeliosWddmAllocationDescV2,
+        allocation_generation: u64,
+        kmd_flags: u32,
+        package_generation: u64,
+    ) -> Result<HeliosWddmAllocationDescV2, IdentityRefusal> {
+        if allocation_generation == 0 {
+            return Err(IdentityRefusal::GenerationZeroAtStamp);
+        }
+        let stray = kmd_flags & !HELIOS_HWA2_FLAG_KMD_OWNED_MASK;
+        if stray != 0 {
+            return Err(IdentityRefusal::KmdFlagOutsidePartition { bits: stray });
+        }
+        let mut output = *input;
+        output.allocation_generation = allocation_generation;
+        output.flags |= kmd_flags;
+        output
+            .validate_create_output(package_generation)
+            .map_err(IdentityRefusal::Hwa2)?;
+        Ok(output)
+    }
+
+    /// `DxgkDdiOpenAllocation`, HWA2 arm: parse, validate, **read only**.
+    ///
+    /// The signature is the contract: `&[u8]` in, an owned copy out, no `&mut`
+    /// anywhere. `describe_allocation`'s answers come from the KMD allocation
+    /// object, not from re-parsing, and no byte of the private buffer is
+    /// written on this path (obligation 5).
+    pub fn hwa2_admit_open(
+        bytes: &[u8],
+        package_generation: u64,
+    ) -> Result<HeliosWddmAllocationDescV2, IdentityRefusal> {
+        let desc =
+            HeliosWddmAllocationDescV2::from_private_data(bytes).map_err(IdentityRefusal::Hwa2)?;
+        desc.validate(package_generation)
+            .map_err(IdentityRefusal::Hwa2)?;
+        Ok(desc)
+    }
+
+    /// Do two descriptors agree on every field the KMD does **not** own?
+    ///
+    /// Field-wise rather than byte-wise, which is the same thing here: HWA2 is
+    /// `#[repr(C)]`, its fields tile offsets 0..168 with no gap, and it
+    /// derives `PartialEq`. The tests additionally compare the encoded byte
+    /// images with the same two regions masked, so "byte-identical" is proven
+    /// on bytes and not only on fields.
+    pub fn hwa2_echoed_fields_equal(
+        a: &HeliosWddmAllocationDescV2,
+        b: &HeliosWddmAllocationDescV2,
+    ) -> bool {
+        let mut a = *a;
+        let mut b = *b;
+        a.allocation_generation = 0;
+        b.allocation_generation = 0;
+        a.flags &= !HELIOS_HWA2_FLAG_KMD_OWNED_MASK;
+        b.flags &= !HELIOS_HWA2_FLAG_KMD_OWNED_MASK;
+        a == b
+    }
+
+    // ── HVM1: role admission and placement ──────────────────────────────────
+
+    /// `DxgkDdiCreateAllocation`, HVM1 arm, step 1. Returns the decoded role,
+    /// because `validate` hands back the role and the admission in one call and
+    /// re-deriving it from the `u32` would be a second decode that could
+    /// disagree.
+    pub fn hvm1_admit_create_input(
+        bytes: &[u8],
+        package_generation: u64,
+    ) -> Result<(HeliosVenusMemoryAllocationV1, Hvm1Role), IdentityRefusal> {
+        let record = HeliosVenusMemoryAllocationV1::from_private_data(bytes)
+            .map_err(IdentityRefusal::Hvm1)?;
+        let role = record
+            .validate(package_generation, Hvm1Stage::CreateInput)
+            .map_err(IdentityRefusal::Hvm1)?;
+        Ok((record, role))
+    }
+
+    /// `DxgkDdiCreateAllocation`, HVM1 arm, step 2: fill the three write-back
+    /// fields and self-check against the output contract.
+    ///
+    /// `segment_page_shift` is not a parameter: §10.7 fixes it at
+    /// [`HELIOS_HVM1_SEGMENT_PAGE_SHIFT`] for this generation, and letting a
+    /// call site choose it is how the two halves of a boundary drift.
+    pub fn hvm1_stamp_create_output(
+        input: &HeliosVenusMemoryAllocationV1,
+        object_generation: u64,
+        allocation_alignment: u64,
+        package_generation: u64,
+    ) -> Result<HeliosVenusMemoryAllocationV1, IdentityRefusal> {
+        if object_generation == 0 {
+            return Err(IdentityRefusal::GenerationZeroAtStamp);
+        }
+        let mut output = *input;
+        output.object_generation = object_generation;
+        output.segment_page_shift = HELIOS_HVM1_SEGMENT_PAGE_SHIFT;
+        output.allocation_alignment = allocation_alignment;
+        output
+            .validate(package_generation, Hvm1Stage::CreateOutput)
+            .map_err(IdentityRefusal::Hvm1)?;
+        Ok(output)
+    }
+
+    /// The role's placement, or a counted refusal while HLM1 does not exist.
+    ///
+    /// `Hvm1Role::placement()` names [`HELIOS_SEGMENT_ID_HLM1`] as the
+    /// preferred read/write segment for **every** role, and §10.7 makes HLM1's
+    /// exposure conditional on `DxgkDdiStartDevice` negotiating HPM1 first.
+    /// `FINDINGS.md` F5 parked the host half of that negotiation, so the
+    /// condition cannot be satisfied today.
+    ///
+    /// ⚠ `K4-CONTRACT.md` §4 states the rule for role 4 — "admitted and
+    /// counted, not satisfied … never a silent substitution onto the aperture
+    /// segment". This model applies it to all four roles, because the
+    /// substitution it forbids is a property of the placement record and not of
+    /// role 4: every role's `preferred_segment` is HLM1, so satisfying any of
+    /// them without HLM1 means substituting. The counter carries the role, so
+    /// the role-4 case the contract names stays separable in telemetry.
+    pub fn hvm1_admit_placement(
+        role: Hvm1Role,
+        hlm1_segment_exposed: bool,
+    ) -> Result<Hvm1Placement, IdentityRefusal> {
+        let placement = role.placement();
+        if placement.preferred_segment == HELIOS_SEGMENT_ID_HLM1 && !hlm1_segment_exposed {
+            return Err(IdentityRefusal::Hlm1SegmentNotExposed {
+                role: role.to_u32(),
+            });
+        }
+        Ok(placement)
+    }
+
+    /// May this role ever reach `D3DKMTLock2` / `MapCpuHostAperture`?
+    ///
+    /// Role 4 has `CpuVisible=0` and no CPU VA exists for it, so the refusal is
+    /// not a policy choice — there is nothing to return.
+    pub fn hvm1_lock_admissible(role: Hvm1Role) -> Result<(), IdentityRefusal> {
+        if role.placement().lockable {
+            Ok(())
+        } else {
+            Err(IdentityRefusal::Role4NeverLockable)
+        }
+    }
+
+    /// Which placement flag disagreed with the role table.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PlacementField {
+        /// `DXGK_ALLOCATIONINFOFLAGS::CpuVisible`.
+        CpuVisible,
+        /// `DXGK_ALLOCATIONINFOFLAGS::Cached`.
+        Cached,
+        /// `DXGK_ALLOCATIONINFOFLAGS::AccessedPhysically`.
+        AccessedPhysically,
+        /// `DXGK_ALLOCATIONINFOFLAGS::ExplicitResidencyNotification`.
+        ExplicitResidencyNotification,
+        /// `DXGK_ALLOCATIONINFO::Flags2::DisablePartialResidency`.
+        DisablePartialResidency,
+        /// `DXGK_ALLOCATIONINFO::Flags2::RestrictedToSingleSegment`.
+        RestrictedToSingleSegment,
+        /// The preferred read/write segment id.
+        PreferredSegment,
+        /// The declared HVM1 cache policy.
+        CachePolicy,
+    }
+
+    /// The flag word the KMD is about to write into `DXGK_ALLOCATIONINFO`,
+    /// mirrored as plain booleans.
+    ///
+    /// ⚠ This structure is a **model of** the WDK union, not the union. Nothing
+    /// in `kmd_logic` can see `DXGK_ALLOCATIONINFOFLAGS`, so the bridge from
+    /// these booleans to the real bitfield lives in `kmd_render` and is the one
+    /// place the table can still drift. `K4-CONTRACT.md` §8 obligation 8 flags
+    /// the `Flags2` half as "first-time union writes with zero field evidence".
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct WrittenAllocationFlags {
+        /// `CpuVisible`.
+        pub cpu_visible: bool,
+        /// `Cached`.
+        pub cached: bool,
+        /// `AccessedPhysically`.
+        pub accessed_physically: bool,
+        /// `ExplicitResidencyNotification`.
+        pub explicit_residency_notification: bool,
+        /// `Flags2::DisablePartialResidency`.
+        pub disable_partial_residency: bool,
+        /// `Flags2::RestrictedToSingleSegment`.
+        pub restricted_to_single_segment: bool,
+        /// Preferred read/write segment id.
+        pub preferred_segment: u32,
+        /// The HVM1 `cache_policy` the KMD writes back.
+        pub cache_policy: u32,
+    }
+
+    /// Compare what the KMD is about to write against the role table.
+    ///
+    /// `Hvm1Placement` exists so "the KMD cannot express it differently per
+    /// call site" (`native_render.rs:1659-1662`) — but it is a plain data
+    /// struct and `protocol` ships no comparison, so today a KMD can call
+    /// `placement()` and then write different bits with nothing failing. This
+    /// is that missing comparison, KMD-side, one field at a time so the counter
+    /// names which bit drifted.
+    pub fn hvm1_written_flags_match(
+        placement: &Hvm1Placement,
+        written: &WrittenAllocationFlags,
+    ) -> Result<(), IdentityRefusal> {
+        let mismatch = |field| Err(IdentityRefusal::PlacementMismatch { field });
+        if written.cpu_visible != placement.cpu_visible {
+            return mismatch(PlacementField::CpuVisible);
+        }
+        if written.cached != placement.cached {
+            return mismatch(PlacementField::Cached);
+        }
+        if written.accessed_physically != placement.accessed_physically {
+            return mismatch(PlacementField::AccessedPhysically);
+        }
+        if written.explicit_residency_notification != placement.explicit_residency_notification {
+            return mismatch(PlacementField::ExplicitResidencyNotification);
+        }
+        if written.disable_partial_residency != placement.disable_partial_residency {
+            return mismatch(PlacementField::DisablePartialResidency);
+        }
+        if written.restricted_to_single_segment != placement.restricted_to_single_segment {
+            return mismatch(PlacementField::RestrictedToSingleSegment);
+        }
+        if written.preferred_segment != placement.preferred_segment {
+            return mismatch(PlacementField::PreferredSegment);
+        }
+        if written.cache_policy != placement.cache_policy {
+            return mismatch(PlacementField::CachePolicy);
+        }
+        Ok(())
+    }
+
+    /// Field-wise equality for HVM1.
+    ///
+    /// `HeliosVenusMemoryAllocationV1` derives `Pod`/`Zeroable` but **not**
+    /// `PartialEq` (`native_render.rs:1797`), so `assert_eq!` on two records is
+    /// not available and the echo check needs this instead.
+    pub fn hvm1_fields_equal(
+        a: &HeliosVenusMemoryAllocationV1,
+        b: &HeliosVenusMemoryAllocationV1,
+    ) -> bool {
+        a.magic == b.magic
+            && a.abi_version == b.abi_version
+            && a.struct_size == b.struct_size
+            && a.package_generation == b.package_generation
+            && a.object_generation == b.object_generation
+            && a.byte_size == b.byte_size
+            && a.role == b.role
+            && a.access == b.access
+            && a.cache_policy == b.cache_policy
+            && a.segment_page_shift == b.segment_page_shift
+            && a.allocation_alignment == b.allocation_alignment
+            && a.reserved == b.reserved
+    }
+
+    // ── HOC1: the C65 command pool ──────────────────────────────────────────
+
+    /// `DxgkDdiCreateAllocation`, HOC1 arm, step 1.
+    pub fn hoc1_admit_create_input(
+        bytes: &[u8],
+        package_generation: u64,
+    ) -> Result<HeliosOuterCommandAllocationV1, IdentityRefusal> {
+        let record = HeliosOuterCommandAllocationV1::from_private_data(bytes)
+            .map_err(IdentityRefusal::Hoc1)?;
+        record
+            .validate_create_input(package_generation)
+            .map_err(IdentityRefusal::Hoc1)?;
+        Ok(record)
+    }
+
+    /// `DxgkDdiCreateAllocation`, HOC1 arm, step 2: the one create-time
+    /// write-back in this ABI.
+    pub fn hoc1_stamp_create_output(
+        input: &HeliosOuterCommandAllocationV1,
+        allocation_generation: u64,
+        package_generation: u64,
+    ) -> Result<HeliosOuterCommandAllocationV1, IdentityRefusal> {
+        if allocation_generation == 0 {
+            return Err(IdentityRefusal::GenerationZeroAtStamp);
+        }
+        let mut output = *input;
+        output.allocation_generation = allocation_generation;
+        output
+            .validate_create_output(package_generation)
+            .map_err(IdentityRefusal::Hoc1)?;
+        Ok(output)
+    }
+
+    /// The live-extent ledger for one C65 pool.
+    ///
+    /// `validate_pool_extent` takes the live count as an **argument** and
+    /// `HeliosExtentRetirementV1::validate` takes the previous HQC1 value as an
+    /// argument, which means `protocol` can check one reservation and one
+    /// retirement in isolation but cannot check that the count ever advances or
+    /// that the values ever increase across calls. That is what this is.
+    ///
+    /// ⚠ Overlap between live extents is deliberately **not** modelled here.
+    /// `validate_pool_extent` does not check it either — the allocator owns it,
+    /// and on this pool the allocator is the D3D12 UMD's, not the KMD's. The
+    /// KMD admits the pool; it does not carve it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Hoc1Pool {
+        /// Extents currently reserved-or-later and not yet retired.
+        pub live_extents: u32,
+        /// The last retirement value accepted on this context. Retirements must
+        /// strictly increase, so this is the floor for the next one.
+        pub last_retired_hqc1_value: u64,
+    }
+
+    impl Hoc1Pool {
+        /// A freshly created, empty pool. Unlike [`GenerationCounter`], the
+        /// all-zero value of this type *is* the valid initial state — no
+        /// extents live, no retirement recorded — so `Default` is offered and
+        /// delegates here rather than being suppressed.
+        pub const fn new() -> Self {
+            Self {
+                live_extents: 0,
+                last_retired_hqc1_value: 0,
+            }
+        }
+
+        /// Reserve one extent, returning its initial seal state.
+        ///
+        /// The seal state is produced by walking `Free -> Reserved` through
+        /// `protocol`'s own transition table rather than by naming `Reserved`
+        /// directly, so this ledger and the C65 lifecycle can never disagree
+        /// about where an extent starts.
+        pub fn reserve(
+            self,
+            offset: u64,
+            bytes: u64,
+        ) -> Result<(HeliosExtentSealState, Self), IdentityRefusal> {
+            validate_pool_extent(offset, bytes, self.live_extents)
+                .map_err(IdentityRefusal::Extent)?;
+            let state = HeliosExtentSealState::Free
+                .advance(HeliosExtentSealState::Reserved)
+                .map_err(IdentityRefusal::SealTransition)?;
+            let live_extents = match self.live_extents.checked_add(1) {
+                Some(live) => live,
+                None => return Err(IdentityRefusal::LiveExtentCounterOverflow),
+            };
+            Ok((state, Self { live_extents, ..self }))
+        }
+
+        /// Retire one extent against its owning context's completed HQC1 value.
+        ///
+        /// Three separate gates, in order: the tuple must be complete and
+        /// strictly increasing (`protocol`), the GPU must actually have reached
+        /// it, and there must be a live extent to retire. Retiring an extent
+        /// the GPU still owns is exactly the use-after-free the C65 lifecycle
+        /// exists to prevent, so it is a refusal and not a warning.
+        pub fn retire(
+            self,
+            retirement: &HeliosExtentRetirementV1,
+            completed_hqc1_value: u64,
+        ) -> Result<Self, IdentityRefusal> {
+            retirement
+                .validate(self.last_retired_hqc1_value)
+                .map_err(IdentityRefusal::Retirement)?;
+            if !retirement.is_retired_at(completed_hqc1_value) {
+                return Err(IdentityRefusal::ExtentNotRetiredYet {
+                    recorded: retirement.hqc1_value,
+                    completed: completed_hqc1_value,
+                });
+            }
+            if self.live_extents == 0 {
+                return Err(IdentityRefusal::NoLiveExtent);
+            }
+            Ok(Self {
+                live_extents: self.live_extents - 1,
+                last_retired_hqc1_value: retirement.hqc1_value,
+            })
+        }
+    }
+
+    impl Default for Hoc1Pool {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    // ── the independent offset oracle ───────────────────────────────────────
+    //
+    // These three encoders write the byte layout the doc's §10.3/§10.6/§10.7
+    // tables state, by hand, from the offsets alone. They exist so the tests
+    // can feed `from_private_data` a real byte buffer at a real (possibly odd)
+    // address without borrowing `protocol`'s own view of the layout: if either
+    // side's offsets drift, the round-trip test fails. They construct no type
+    // and define no rule, so they are not a second declaration of a wire
+    // record — see this module's header.
+
+    fn wr_u16(out: &mut [u8], off: usize, value: u16) {
+        out[off..off + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn wr_u32(out: &mut [u8], off: usize, value: u32) {
+        out[off..off + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn wr_u64(out: &mut [u8], off: usize, value: u64) {
+        out[off..off + 8].copy_from_slice(&value.to_le_bytes());
+    }
+
+    /// Encode one HWA2 record into its 168 documented bytes.
+    pub fn encode_hwa2(desc: &HeliosWddmAllocationDescV2) -> [u8; HELIOS_HWA2_BYTES as usize] {
+        let mut out = [0u8; HELIOS_HWA2_BYTES as usize];
+        wr_u32(&mut out, 0, desc.magic);
+        wr_u16(&mut out, 4, desc.abi_version);
+        wr_u16(&mut out, 6, desc.struct_size);
+        wr_u64(&mut out, 8, desc.package_generation);
+        wr_u64(&mut out, 16, desc.allocation_generation);
+        wr_u64(&mut out, 24, desc.byte_size);
+        wr_u32(&mut out, 32, desc.width);
+        wr_u32(&mut out, 36, desc.height);
+        wr_u32(&mut out, 40, desc.depth_or_array_size);
+        wr_u32(&mut out, 44, desc.mip_levels);
+        wr_u32(&mut out, 48, desc.dxgi_format);
+        wr_u32(&mut out, 52, desc.d3d_ddi_format);
+        wr_u32(&mut out, 56, desc.sample_count);
+        wr_u32(&mut out, 60, desc.sample_quality);
+        wr_u32(&mut out, 64, desc.allocation_kind);
+        wr_u32(&mut out, 68, desc.flags);
+        wr_u32(&mut out, 72, desc.bind_flags);
+        wr_u32(&mut out, 76, desc.misc_flags);
+        wr_u32(&mut out, 80, desc.vidpn_source);
+        wr_u32(&mut out, 84, desc.standard_allocation_type);
+        wr_u32(&mut out, 88, desc.swizzle_class);
+        wr_u32(&mut out, 92, desc.memory_class);
+        wr_u32(&mut out, 96, desc.plane_count);
+        wr_u32(&mut out, 100, desc.reserved);
+        let mut i = 0usize;
+        while i < 4 {
+            let base = 104 + i * 16;
+            wr_u64(&mut out, base, desc.planes[i].offset);
+            wr_u32(&mut out, base + 8, desc.planes[i].row_pitch);
+            wr_u32(&mut out, base + 12, desc.planes[i].slice_pitch);
+            i += 1;
+        }
+        out
+    }
+
+    /// Encode one HVM1 record into its 64 documented bytes.
+    pub fn encode_hvm1(record: &HeliosVenusMemoryAllocationV1) -> [u8; HELIOS_HVM1_SIZE as usize] {
+        let mut out = [0u8; HELIOS_HVM1_SIZE as usize];
+        wr_u32(&mut out, 0, record.magic);
+        wr_u16(&mut out, 4, record.abi_version);
+        wr_u16(&mut out, 6, record.struct_size);
+        wr_u64(&mut out, 8, record.package_generation);
+        wr_u64(&mut out, 16, record.object_generation);
+        wr_u64(&mut out, 24, record.byte_size);
+        wr_u32(&mut out, 32, record.role);
+        wr_u32(&mut out, 36, record.access);
+        wr_u32(&mut out, 40, record.cache_policy);
+        wr_u32(&mut out, 44, record.segment_page_shift);
+        wr_u64(&mut out, 48, record.allocation_alignment);
+        wr_u64(&mut out, 56, record.reserved);
+        out
+    }
+
+    /// Encode one HOC1 record into its 64 documented bytes.
+    pub fn encode_hoc1(record: &HeliosOuterCommandAllocationV1) -> [u8; HELIOS_HOC1_BYTES as usize] {
+        let mut out = [0u8; HELIOS_HOC1_BYTES as usize];
+        wr_u32(&mut out, 0, record.magic);
+        wr_u16(&mut out, 4, record.abi_version);
+        wr_u16(&mut out, 6, record.struct_size);
+        wr_u64(&mut out, 8, record.package_generation);
+        wr_u64(&mut out, 16, record.allocation_generation);
+        wr_u64(&mut out, 24, record.byte_size);
+        wr_u32(&mut out, 32, record.extent_alignment);
+        wr_u32(&mut out, 36, record.access);
+        wr_u32(&mut out, 40, record.cache_policy);
+        wr_u32(&mut out, 44, record.physical_adapter_mask);
+        out[48..64].copy_from_slice(&record.reserved);
+        out
+    }
+
+    /// The three records' identity headers, so a discriminator can peek at a
+    /// `(pPrivateDriverData, size)` pair without a second copy of the magic
+    /// table. HVM1 and HOC1 are the **same length**, so length alone cannot
+    /// discriminate them and the magic is load-bearing.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AllocPrivateKind {
+        /// 168 bytes, magic `'HWA2'`.
+        Hwa2,
+        /// 64 bytes, magic `'HVM1'`.
+        Hvm1,
+        /// 64 bytes, magic `'HOC1'`.
+        Hoc1,
+    }
+
+    /// Classify a create-time private-data buffer by its length and magic.
+    ///
+    /// `None` is a refusal, not a default: §10.3 says a malformed, unknown or
+    /// truncated descriptor "makes create/open fail; it never selects a legacy
+    /// parser". The caller must count the `None` and fail the DDI, never fall
+    /// back to `HeliosWddmAllocPrivate`.
+    ///
+    /// ⚠ This is a *peek*. It checks the length and the four magic bytes and
+    /// nothing else; the record's own validator still owns admission. It is
+    /// here rather than in `protocol` because `protocol` does not ship a
+    /// discriminator yet (recon R5) — if one lands there, this must be deleted
+    /// rather than kept as a second table.
+    pub fn classify_alloc_private_data(bytes: &[u8]) -> Option<AllocPrivateKind> {
+        if bytes.len() < 4 {
+            return None;
+        }
+        let magic = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        match (bytes.len(), magic) {
+            (len, HELIOS_HWA2_MAGIC) if len == HELIOS_HWA2_BYTES as usize => {
+                Some(AllocPrivateKind::Hwa2)
+            }
+            (len, HELIOS_HVM1_MAGIC) if len == HELIOS_HVM1_SIZE as usize => {
+                Some(AllocPrivateKind::Hvm1)
+            }
+            (len, HELIOS_HOC1_MAGIC) if len == HELIOS_HOC1_BYTES as usize => {
+                Some(AllocPrivateKind::Hoc1)
+            }
+            _ => None,
+        }
+    }
+
+    /// The three ABI versions, re-exported as a single tuple so a reviewer can
+    /// see at a glance that none of them is negotiable. A mismatch is a hard
+    /// reject on every one and never selects a legacy parser.
+    pub const ADMITTED_ABI_VERSIONS: (u16, u16, u16) = (
+        HELIOS_HWA2_ABI_VERSION,
+        HELIOS_HVM1_ABI_VERSION,
+        HELIOS_HOC1_ABI_VERSION,
+    );
+}
+
+#[cfg(test)]
+mod allocation_identity_tests {
+    use super::allocation_identity::*;
+    use helios_protocol::*;
+
+    const PKG: u64 = HELIOS_PACKAGE_GENERATION;
+
+    // ── fixtures ────────────────────────────────────────────────────────────
+
+    /// The create-**input** form of a D3D11 shared primary: everything the UMD
+    /// legitimately knows, and nothing the KMD owns. Note the two differences
+    /// from `protocol`'s own `primary_desc()` fixture: `allocation_generation`
+    /// is 0 and `DIRECT_FLIP_COMPATIBLE` is clear, which is precisely the
+    /// partition `K4-CONTRACT.md` §1.1 pins.
+    fn primary_input() -> HeliosWddmAllocationDescV2 {
+        let mut d = HeliosWddmAllocationDescV2::header(PKG, 0);
+        d.byte_size = 1920 * 4 * 1080;
+        d.width = 1920;
+        d.height = 1080;
+        d.depth_or_array_size = 1;
+        d.mip_levels = 1;
+        d.dxgi_format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.d3d_ddi_format = D3DDDIFMT_A8R8G8B8;
+        d.sample_count = 1;
+        d.sample_quality = 0;
+        d.allocation_kind = HELIOS_HWA2_KIND_STANDARD_PRIMARY;
+        d.flags = HELIOS_HWA2_FLAG_PRIMARY
+            | HELIOS_HWA2_FLAG_DISPLAYABLE
+            | HELIOS_HWA2_FLAG_SHARED
+            | HELIOS_HWA2_FLAG_STANDARD;
+        d.bind_flags = HELIOS_HWA2_BIND_RENDER_TARGET | HELIOS_HWA2_BIND_SHADER_RESOURCE;
+        d.vidpn_source = 0;
+        d.standard_allocation_type = 1; // D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE
+        d.swizzle_class = HELIOS_HWA2_SWIZZLE_LINEAR;
+        d.memory_class = HELIOS_HWA2_MEMORY_DEVICE_LOCAL;
+        d.plane_count = 1;
+        d.planes[0] = HeliosWddmPlaneRecordV2 {
+            offset: 0,
+            row_pitch: 1920 * 4,
+            slice_pitch: 1920 * 4 * 1080,
+        };
+        d
+    }
+
+    /// A plain constant buffer: the non-image arm, so the geometry rules are
+    /// exercised from the other side too.
+    fn buffer_input() -> HeliosWddmAllocationDescV2 {
+        let mut d = HeliosWddmAllocationDescV2::header(PKG, 0);
+        d.byte_size = 65536;
+        d.allocation_kind = HELIOS_HWA2_KIND_BUFFER;
+        d.bind_flags = HELIOS_HWA2_BIND_CONSTANT_BUFFER;
+        d.swizzle_class = HELIOS_HWA2_SWIZZLE_LINEAR;
+        d.memory_class = HELIOS_HWA2_MEMORY_CPU_VISIBLE;
+        d.flags = HELIOS_HWA2_FLAG_CPU_VISIBLE;
+        d
+    }
+
+    fn host_visible_input() -> HeliosVenusMemoryAllocationV1 {
+        HeliosVenusMemoryAllocationV1::new(
+            PKG,
+            Hvm1Role::VulkanHostVisible,
+            65536,
+            HELIOS_HVM1_ACCESS_CPU_READ | HELIOS_HVM1_ACCESS_CPU_WRITE,
+        )
+    }
+
+    fn device_local_input() -> HeliosVenusMemoryAllocationV1 {
+        HeliosVenusMemoryAllocationV1::new(
+            PKG,
+            Hvm1Role::VulkanDeviceLocal,
+            4096,
+            HELIOS_HVM1_ACCESS_HOST_READ | HELIOS_HVM1_ACCESS_HOST_WRITE,
+        )
+    }
+
+    fn retirement(hqc1_value: u64) -> HeliosExtentRetirementV1 {
+        HeliosExtentRetirementV1 {
+            queue_context: 0xDEAD_BEEF,
+            context_generation: 0x2222_2222_2222_2222,
+            batch_id: 7,
+            hqc1_value,
+        }
+    }
+
+    // ── (b) the allocation generation lifecycle ─────────────────────────────
+
+    /// Nonzero, minted once per allocation, and — the part `protocol` cannot
+    /// see — not restarted by an adapter reset. §14 requires that a reset
+    /// change every generation; if the counter restarted, a post-reset
+    /// allocation would reuse a pre-reset value and a stale HOB1 use record
+    /// naming it would pass its `expected_allocation_generation` check against
+    /// the wrong object.
+    #[test]
+    fn generations_are_nonzero_unique_and_survive_an_adapter_reset() {
+        let counter = GenerationCounter::new();
+        let (first, counter) = AllocationIdentity::create(counter).expect("first create");
+        let (second, counter) = AllocationIdentity::create(counter).expect("second create");
+        assert_ne!(first.generation, 0);
+        assert_ne!(second.generation, 0);
+        assert_ne!(first.generation, second.generation);
+
+        let counter = counter.on_adapter_reset().expect("reset bumps the epoch");
+        let (third, _) = AllocationIdentity::create(counter).expect("post-reset create");
+        assert_ne!(third.generation, first.generation);
+        assert_ne!(third.generation, second.generation);
+        assert!(third.generation > second.generation);
+        assert_ne!(third.epoch, first.epoch);
+
+        // And the pre-reset objects are refused, not revalidated.
+        assert_eq!(
+            first.open(third.epoch),
+            Err(IdentityRefusal::StaleAdapterEpoch {
+                object_epoch: first.epoch,
+                adapter_epoch: third.epoch,
+            })
+        );
+    }
+
+    /// The counter refuses at exhaustion instead of wrapping to 0 or saturating
+    /// at `u64::MAX`. Both alternatives hand one generation to two live
+    /// allocations; 0 additionally collides with the "user mode supplied it"
+    /// sentinel.
+    #[test]
+    fn the_generation_counter_refuses_exhaustion_rather_than_repeating() {
+        let counter = GenerationCounter {
+            next: u64::MAX - 1,
+            epoch: 1,
+        };
+        let (value, counter) = counter.mint().expect("the penultimate value is legal");
+        assert_eq!(value, u64::MAX - 1);
+        assert_eq!(counter.next, u64::MAX);
+        assert_eq!(
+            counter.mint().err(),
+            Some(IdentityRefusal::GenerationSpaceExhausted)
+        );
+
+        // A zeroed structure never mints; it is not a valid counter.
+        assert_eq!(
+            GenerationCounter { next: 0, epoch: 0 }.mint().err(),
+            Some(IdentityRefusal::GenerationCounterUninitialised)
+        );
+        assert_eq!(
+            GenerationCounter {
+                next: 1,
+                epoch: u32::MAX,
+            }
+            .on_adapter_reset()
+            .err(),
+            Some(IdentityRefusal::AdapterEpochSpaceExhausted)
+        );
+    }
+
+    /// Open takes a reference and returns the same generation. This is the
+    /// executable form of "`DxgkDdiOpenAllocation` never writes it": the retired
+    /// `HeliosWddmOpenIdentity` restamped the first 48 bytes at open, so two
+    /// openers could disagree about what they had.
+    #[test]
+    fn open_never_restamps_the_generation() {
+        let (identity, _) = AllocationIdentity::create(GenerationCounter::new()).expect("create");
+        let mut current = identity;
+        for expected_opens in 1..=8u32 {
+            current = current.open(identity.epoch).expect("open");
+            assert_eq!(current.generation, identity.generation);
+            assert_eq!(current.epoch, identity.epoch);
+            assert_eq!(current.opens, expected_opens);
+        }
+
+        let saturated = AllocationIdentity {
+            opens: u32::MAX,
+            ..identity
+        };
+        assert_eq!(
+            saturated.open(identity.epoch),
+            Err(IdentityRefusal::OpenCountOverflow)
+        );
+    }
+
+    /// The generation is a stale check, never a lookup key. The only exposed
+    /// direction takes an object the caller already holds; a zero expectation
+    /// is a refusal, not a wildcard.
+    #[test]
+    fn the_generation_is_a_stale_check_and_zero_is_never_a_wildcard() {
+        let (identity, counter) =
+            AllocationIdentity::create(GenerationCounter::new()).expect("create");
+        let (other, _) = AllocationIdentity::create(counter).expect("second create");
+
+        assert_eq!(
+            identity.matches_expected(identity.generation, identity.epoch),
+            Ok(true)
+        );
+        assert_eq!(
+            identity.matches_expected(other.generation, identity.epoch),
+            Ok(false)
+        );
+        assert_eq!(
+            identity.matches_expected(0, identity.epoch),
+            Err(IdentityRefusal::ExpectedGenerationZero)
+        );
+        assert_eq!(
+            identity.matches_expected(identity.generation, identity.epoch + 1),
+            Err(IdentityRefusal::StaleAdapterEpoch {
+                object_epoch: identity.epoch,
+                adapter_epoch: identity.epoch + 1,
+            })
+        );
+    }
+
+    // ── (a) the HWA2 create-input / create-output state machine ─────────────
+
+    /// A UMD may not prefill any KMD-owned field. All three refusals are
+    /// distinct and named, so the KMD counter says which one a UMD got wrong.
+    #[test]
+    fn hwa2_create_input_refuses_every_kmd_owned_field() {
+        let good = encode_hwa2(&primary_input());
+        assert!(hwa2_admit_create_input(&good, PKG).is_ok());
+
+        let mut with_generation = primary_input();
+        with_generation.allocation_generation = 0x51;
+        assert_eq!(
+            hwa2_admit_create_input(&encode_hwa2(&with_generation), PKG),
+            Err(IdentityRefusal::Hwa2(
+                HeliosAllocDescRejection::AllocationGenerationNonZeroOnInput { found: 0x51 }
+            ))
+        );
+
+        for bit in [
+            HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE,
+            HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY,
+        ] {
+            let mut d = primary_input();
+            // C44 also requires the sentinel; set it so the *only* thing wrong
+            // with this record is that the UMD claimed a KMD-owned bit.
+            if bit == HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY {
+                d.vidpn_source = D3DDDI_ID_UNINITIALIZED;
+            }
+            d.flags |= bit;
+            assert_eq!(
+                hwa2_admit_create_input(&encode_hwa2(&d), PKG),
+                Err(IdentityRefusal::Hwa2(
+                    HeliosAllocDescRejection::KmdOwnedFlagSetOnInput { bits: bit }
+                )),
+                "flag {bit:#x} is KMD-owned and must be refused on input"
+            );
+        }
+    }
+
+    /// The write-back produces a record that passes create-output and that no
+    /// longer passes create-input — the two stages partition the record, they
+    /// do not overlap.
+    #[test]
+    fn hwa2_write_back_passes_create_output_and_then_fails_create_input() {
+        let input = hwa2_admit_create_input(&encode_hwa2(&primary_input()), PKG).expect("admit");
+        let output = hwa2_stamp_create_output(
+            &input,
+            0x51,
+            HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE,
+            PKG,
+        )
+        .expect("stamp");
+
+        assert_eq!(output.validate_create_output(PKG), Ok(()));
+        assert_eq!(output.validate(PKG), Ok(()));
+        assert_eq!(
+            output.validate_create_input(PKG),
+            Err(HeliosAllocDescRejection::AllocationGenerationNonZeroOnInput { found: 0x51 })
+        );
+    }
+
+    /// A zero generation is refused at the stamp, before it can reach the
+    /// record — the KMD's own bug is caught by the KMD's own counter rather
+    /// than by the record validator after the object already exists.
+    #[test]
+    fn hwa2_create_output_with_a_zero_generation_is_refused() {
+        let input = hwa2_admit_create_input(&encode_hwa2(&buffer_input()), PKG).expect("admit");
+        assert_eq!(
+            hwa2_stamp_create_output(&input, 0, 0, PKG),
+            Err(IdentityRefusal::GenerationZeroAtStamp)
+        );
+
+        // And a record that reaches an opener with a zero generation is refused
+        // there too, so neither end can be the only guard.
+        let mut unstamped = input;
+        unstamped.allocation_generation = 0;
+        assert_eq!(
+            hwa2_admit_open(&encode_hwa2(&unstamped), PKG),
+            Err(IdentityRefusal::Hwa2(
+                HeliosAllocDescRejection::AllocationGenerationZero
+            ))
+        );
+    }
+
+    /// Every non-KMD field is byte-identical between input and output.
+    ///
+    /// Checked on the encoded byte images, not only on the fields: the two
+    /// buffers must differ in exactly bytes 16..24 and in exactly the
+    /// [`HELIOS_HWA2_FLAG_KMD_OWNED_MASK`] bits of the flag word at offset 68, and be
+    /// equal everywhere else. This is the check that would catch a KMD that
+    /// "helpfully" recomputed a pitch or normalised a format.
+    #[test]
+    fn hwa2_echoes_every_non_kmd_byte_verbatim() {
+        for input in [primary_input(), buffer_input()] {
+            let kmd_flags = if input.has_flag(HELIOS_HWA2_FLAG_PRIMARY) {
+                HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE
+            } else {
+                0
+            };
+            let admitted = hwa2_admit_create_input(&encode_hwa2(&input), PKG).expect("admit");
+            let output =
+                hwa2_stamp_create_output(&admitted, 0xABCD, kmd_flags, PKG).expect("stamp");
+
+            assert!(hwa2_echoed_fields_equal(&admitted, &output));
+
+            let before = encode_hwa2(&admitted);
+            let after = encode_hwa2(&output);
+            for offset in 0..before.len() {
+                if (16..24).contains(&offset) {
+                    continue; // allocation_generation, KMD-owned
+                }
+                if (68..72).contains(&offset) {
+                    continue; // the flag word, masked separately below
+                }
+                assert_eq!(
+                    before[offset], after[offset],
+                    "byte {offset} is not KMD-owned and must be echoed verbatim"
+                );
+            }
+            let flags_before = u32::from_le_bytes([before[68], before[69], before[70], before[71]]);
+            let flags_after = u32::from_le_bytes([after[68], after[69], after[70], after[71]]);
+            assert_eq!(
+                flags_before & !HELIOS_HWA2_FLAG_KMD_OWNED_MASK,
+                flags_after & !HELIOS_HWA2_FLAG_KMD_OWNED_MASK,
+                "only the two KMD-owned bits may change in the flag word"
+            );
+            assert_eq!(flags_after & HELIOS_HWA2_FLAG_KMD_OWNED_MASK, kmd_flags);
+        }
+    }
+
+    /// The stamp is not a rubber stamp: it re-validates the pairing it just
+    /// created, so a Direct Flip claim on a non-primary or a C44 primary bit
+    /// against a concrete VidPn source fails the create rather than shipping a
+    /// descriptor no opener will accept.
+    #[test]
+    fn the_kmd_stamp_is_not_a_rubber_stamp() {
+        let buffer = hwa2_admit_create_input(&encode_hwa2(&buffer_input()), PKG).expect("admit");
+        assert_eq!(
+            hwa2_stamp_create_output(&buffer, 1, HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE, PKG),
+            Err(IdentityRefusal::Hwa2(
+                HeliosAllocDescRejection::DirectFlipWithoutPrimary
+            ))
+        );
+
+        let primary = hwa2_admit_create_input(&encode_hwa2(&primary_input()), PKG).expect("admit");
+        assert_eq!(
+            hwa2_stamp_create_output(&primary, 1, HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY, PKG),
+            Err(IdentityRefusal::Hwa2(
+                HeliosAllocDescRejection::D3D12RuntimePrimaryNotSentinel { found: 0 }
+            ))
+        );
+
+        // And the KMD may not author a bit outside its own partition, even a
+        // legal one — those belong to the UMD and are echoed, never added.
+        assert_eq!(
+            hwa2_stamp_create_output(&primary, 1, HELIOS_HWA2_FLAG_PROTECTED, PKG),
+            Err(IdentityRefusal::KmdFlagOutsidePartition {
+                bits: HELIOS_HWA2_FLAG_PROTECTED
+            })
+        );
+    }
+
+    /// An opener validates the full output contract and produces the same
+    /// record it was given.
+    ///
+    /// The "never writes" half is carried by the signature — [`hwa2_admit_open`]
+    /// takes `&[u8]` and there is no `&mut` on the path — so the assertion here
+    /// is the observable consequence: re-encoding what the opener parsed
+    /// reproduces the original buffer bit for bit, which a normalising or
+    /// restamping opener would not.
+    #[test]
+    fn open_is_a_pure_read() {
+        let input = hwa2_admit_create_input(&encode_hwa2(&primary_input()), PKG).expect("admit");
+        let output = hwa2_stamp_create_output(
+            &input,
+            0x51,
+            HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE,
+            PKG,
+        )
+        .expect("stamp");
+        let on_the_wire = encode_hwa2(&output);
+
+        let opened = hwa2_admit_open(&on_the_wire, PKG).expect("open");
+        assert_eq!(opened, output);
+        assert_eq!(encode_hwa2(&opened), on_the_wire);
+
+        // A foreign package generation is refused at open just as at create;
+        // there is no "open is lenient" arm.
+        assert_eq!(
+            hwa2_admit_open(&on_the_wire, PKG ^ 1),
+            Err(IdentityRefusal::Hwa2(
+                HeliosAllocDescRejection::PackageGeneration {
+                    found: PKG,
+                    expected: PKG ^ 1,
+                }
+            ))
+        );
+    }
+
+    // ── (c) HVM1 role admission ─────────────────────────────────────────────
+
+    /// Role 4 has no CPU VA, so it may not claim a CPU access bit and may never
+    /// be locked. Both halves matter: `permitted_access` refuses a record that
+    /// *claims* CPU access, and [`hvm1_lock_admissible`] refuses a later `Lock2`
+    /// against a record that never claimed it.
+    #[test]
+    fn hvm1_role_four_refuses_cpu_access_and_is_never_lockable() {
+        let (record, role) =
+            hvm1_admit_create_input(&encode_hvm1(&device_local_input()), PKG).expect("admit");
+        assert_eq!(role, Hvm1Role::VulkanDeviceLocal);
+        assert_eq!(record.cache_policy, HELIOS_HVM1_CACHE_NOT_CPU_VISIBLE);
+        assert_eq!(
+            hvm1_lock_admissible(Hvm1Role::VulkanDeviceLocal),
+            Err(IdentityRefusal::Role4NeverLockable)
+        );
+
+        for bit in [HELIOS_HVM1_ACCESS_CPU_READ, HELIOS_HVM1_ACCESS_CPU_WRITE] {
+            let mut cpu = device_local_input();
+            cpu.access |= bit;
+            // `.err()` rather than the whole `Result`, here and below:
+            // `HeliosVenusMemoryAllocationV1` derives `Pod`/`Zeroable` but not
+            // `PartialEq` (`native_render.rs:1798`), so the Ok arm is not
+            // comparable and `assert_eq!` on the Result does not compile.
+            assert_eq!(
+                hvm1_admit_create_input(&encode_hvm1(&cpu), PKG).err(),
+                Some(IdentityRefusal::Hvm1(Hvm1Reject::AccessNotRoleCompatible)),
+                "role 4 must refuse CPU access bit {bit:#x}"
+            );
+        }
+
+        for role in [
+            Hvm1Role::ReplyPool,
+            Hvm1Role::VulkanHostVisible,
+            Hvm1Role::Feedback,
+        ] {
+            assert_eq!(hvm1_lock_admissible(role), Ok(()));
+        }
+    }
+
+    /// Role 1 fixes its own size, and the KMD entry point enforces it — the
+    /// point being that the size gate is reached through the same
+    /// parse-then-validate path as everything else, not bypassed by a
+    /// convenience constructor. (`protocol` proves the rule on a constructed
+    /// record; this proves the KMD's entry reaches it.)
+    #[test]
+    fn hvm1_reply_pool_size_is_fixed_at_the_kmd_entry_point() {
+        let pool = HeliosVenusMemoryAllocationV1::new_reply_pool(PKG);
+        assert_eq!(pool.byte_size, HELIOS_HVM1_REPLY_POOL_BYTES);
+        assert_eq!(HELIOS_HVM1_REPLY_POOL_BYTES, 64 * 1024 * 1024);
+        let (_, role) = hvm1_admit_create_input(&encode_hvm1(&pool), PKG).expect("admit");
+        assert_eq!(role, Hvm1Role::ReplyPool);
+
+        let mut half = pool;
+        half.byte_size = HELIOS_HVM1_REPLY_POOL_BYTES / 2;
+        assert_eq!(
+            hvm1_admit_create_input(&encode_hvm1(&half), PKG).err(),
+            Some(IdentityRefusal::Hvm1(Hvm1Reject::ByteSizeNotExactForRole))
+        );
+    }
+
+    /// The write-back fields are refused nonzero on input and exact on output,
+    /// and the stamp echoes everything else.
+    #[test]
+    fn hvm1_write_back_fields_are_refused_nonzero_on_input() {
+        let input = host_visible_input();
+        for prefill in [
+            |r: &mut HeliosVenusMemoryAllocationV1| r.object_generation = 9,
+            |r: &mut HeliosVenusMemoryAllocationV1| r.segment_page_shift = 12,
+            |r: &mut HeliosVenusMemoryAllocationV1| r.allocation_alignment = 4096,
+        ] {
+            let mut prefilled = input;
+            prefill(&mut prefilled);
+            assert_eq!(
+                hvm1_admit_create_input(&encode_hvm1(&prefilled), PKG).err(),
+                Some(IdentityRefusal::Hvm1(
+                    Hvm1Reject::WriteBackFieldNotZeroOnInput
+                ))
+            );
+        }
+
+        let (admitted, role) =
+            hvm1_admit_create_input(&encode_hvm1(&input), PKG).expect("admit");
+        assert_eq!(role, Hvm1Role::VulkanHostVisible);
+        let output = hvm1_stamp_create_output(&admitted, 42, 4096, PKG).expect("stamp");
+        assert_eq!(output.object_generation, 42);
+        assert_eq!(output.segment_page_shift, HELIOS_HVM1_SEGMENT_PAGE_SHIFT);
+        assert_eq!(output.allocation_alignment, 4096);
+
+        // Everything else is echoed: zero the three write-back fields back out
+        // and the record is the admitted input again.
+        let mut echoed = output;
+        echoed.object_generation = 0;
+        echoed.segment_page_shift = 0;
+        echoed.allocation_alignment = 0;
+        assert!(hvm1_fields_equal(&echoed, &admitted));
+
+        assert_eq!(
+            hvm1_stamp_create_output(&admitted, 0, 4096, PKG).err(),
+            Some(IdentityRefusal::GenerationZeroAtStamp)
+        );
+        assert_eq!(
+            hvm1_stamp_create_output(&admitted, 42, 4095, PKG).err(),
+            Some(IdentityRefusal::Hvm1(
+                Hvm1Reject::AllocationAlignmentInvalid
+            ))
+        );
+    }
+
+    /// Placement is refused, per role and by name, until HLM1 exists. K2 is
+    /// blocked (`FINDINGS.md` F5), and `K4-CONTRACT.md` §4 forbids substituting
+    /// the aperture segment: the create fails loudly instead.
+    #[test]
+    fn hvm1_placement_is_refused_until_the_hlm1_segment_exists() {
+        for role in [
+            Hvm1Role::ReplyPool,
+            Hvm1Role::VulkanHostVisible,
+            Hvm1Role::Feedback,
+            Hvm1Role::VulkanDeviceLocal,
+        ] {
+            assert_eq!(
+                hvm1_admit_placement(role, false),
+                Err(IdentityRefusal::Hlm1SegmentNotExposed {
+                    role: role.to_u32()
+                }),
+                "role {} must be counted, not substituted",
+                role.to_u32()
+            );
+            let placement = hvm1_admit_placement(role, true).expect("HLM1 present");
+            assert_eq!(placement.preferred_segment, HELIOS_SEGMENT_ID_HLM1);
+            assert_ne!(HELIOS_SEGMENT_ID_HLM1, HELIOS_SEGMENT_ID_APERTURE);
+        }
+    }
+
+    /// The bridge `protocol` does not ship: what the KMD writes must equal what
+    /// the role table says, field by field, and the refusal names the field.
+    #[test]
+    fn hvm1_written_flags_must_match_the_role_table_field_by_field() {
+        for role in [
+            Hvm1Role::ReplyPool,
+            Hvm1Role::VulkanHostVisible,
+            Hvm1Role::Feedback,
+            Hvm1Role::VulkanDeviceLocal,
+        ] {
+            let placement = role.placement();
+            let faithful = WrittenAllocationFlags {
+                cpu_visible: placement.cpu_visible,
+                cached: placement.cached,
+                accessed_physically: placement.accessed_physically,
+                explicit_residency_notification: placement.explicit_residency_notification,
+                disable_partial_residency: placement.disable_partial_residency,
+                restricted_to_single_segment: placement.restricted_to_single_segment,
+                preferred_segment: placement.preferred_segment,
+                cache_policy: placement.cache_policy,
+            };
+            assert_eq!(hvm1_written_flags_match(&placement, &faithful), Ok(()));
+
+            // §10.7 fixes the same four bits for every role; dropping either
+            // Flags2 bit is the drift obligation 8 has no field evidence for.
+            let mut dropped = faithful;
+            dropped.disable_partial_residency = false;
+            assert_eq!(
+                hvm1_written_flags_match(&placement, &dropped),
+                Err(IdentityRefusal::PlacementMismatch {
+                    field: PlacementField::DisablePartialResidency
+                })
+            );
+            let mut dropped = faithful;
+            dropped.restricted_to_single_segment = false;
+            assert_eq!(
+                hvm1_written_flags_match(&placement, &dropped),
+                Err(IdentityRefusal::PlacementMismatch {
+                    field: PlacementField::RestrictedToSingleSegment
+                })
+            );
+            let mut flipped = faithful;
+            flipped.cpu_visible = !flipped.cpu_visible;
+            assert_eq!(
+                hvm1_written_flags_match(&placement, &flipped),
+                Err(IdentityRefusal::PlacementMismatch {
+                    field: PlacementField::CpuVisible
+                })
+            );
+            let mut aperture = faithful;
+            aperture.preferred_segment = HELIOS_SEGMENT_ID_APERTURE;
+            assert_eq!(
+                hvm1_written_flags_match(&placement, &aperture),
+                Err(IdentityRefusal::PlacementMismatch {
+                    field: PlacementField::PreferredSegment
+                })
+            );
+        }
+    }
+
+    // ── (d) HOC1 pool admission and the extent ledger ───────────────────────
+
+    /// HOC1's single write-back, through the KMD entry points.
+    #[test]
+    fn hoc1_create_stamps_the_generation_exactly_once() {
+        let bytes = encode_hoc1(&HeliosOuterCommandAllocationV1::new(PKG));
+        let input = hoc1_admit_create_input(&bytes, PKG).expect("admit");
+        assert_eq!(input.allocation_generation, 0);
+        assert_eq!(input.byte_size, HELIOS_HOC1_POOL_BYTES);
+
+        let output = hoc1_stamp_create_output(&input, 0x9, PKG).expect("stamp");
+        assert_eq!(output.allocation_generation, 0x9);
+        assert_eq!(
+            hoc1_admit_create_input(&encode_hoc1(&output), PKG),
+            Err(IdentityRefusal::Hoc1(
+                HeliosOuterCommandAllocRejection::AllocationGenerationNonZeroOnInput { found: 0x9 }
+            ))
+        );
+        assert_eq!(
+            hoc1_stamp_create_output(&input, 0, PKG),
+            Err(IdentityRefusal::GenerationZeroAtStamp)
+        );
+    }
+
+    /// The live-extent cap is a property of the ledger across calls, which is
+    /// what `validate_pool_extent`'s `live_extents` *argument* cannot express
+    /// on its own: reserve 256 and the 257th is refused; retire one and the
+    /// next reservation is admitted again.
+    #[test]
+    fn the_pool_ledger_enforces_the_live_extent_cap_across_calls() {
+        let mut pool = Hoc1Pool::new();
+        for i in 0..HELIOS_HOC1_MAX_LIVE_EXTENTS {
+            let offset = u64::from(i) * u64::from(HELIOS_HOC1_EXTENT_ALIGNMENT);
+            let (state, next) = pool.reserve(offset, 4096).expect("reservation inside the pool");
+            assert_eq!(state, HeliosExtentSealState::Reserved);
+            assert!(state.cpu_writable());
+            pool = next;
+        }
+        assert_eq!(pool.live_extents, HELIOS_HOC1_MAX_LIVE_EXTENTS);
+        assert_eq!(
+            pool.reserve(0, 4096),
+            Err(IdentityRefusal::Extent(
+                HeliosExtentRejection::LiveExtentLimit {
+                    live: HELIOS_HOC1_MAX_LIVE_EXTENTS,
+                    limit: HELIOS_HOC1_MAX_LIVE_EXTENTS,
+                }
+            ))
+        );
+
+        let pool = pool.retire(&retirement(10), 10).expect("retire one");
+        assert_eq!(pool.live_extents, HELIOS_HOC1_MAX_LIVE_EXTENTS - 1);
+        let (_, pool) = pool.reserve(0, 4096).expect("a slot came free");
+        assert_eq!(pool.live_extents, HELIOS_HOC1_MAX_LIVE_EXTENTS);
+    }
+
+    /// One extent's whole life, with the ledger and the seal state moving
+    /// together. `cpu_writable` is true only while Reserved: from Sealed onward
+    /// the write-combining drain has already published the bytes.
+    #[test]
+    fn the_pool_ledger_walks_reserve_seal_submit_retire() {
+        let pool = Hoc1Pool::new();
+        let (mut state, pool) = pool.reserve(0, HELIOS_HOB1_MAX_BYTES).expect("reserve");
+        assert_eq!(pool.live_extents, 1);
+        assert!(state.cpu_writable());
+
+        for next in [
+            HeliosExtentSealState::Sealed,
+            HeliosExtentSealState::Submitted,
+            HeliosExtentSealState::Retired,
+        ] {
+            state = state.advance(next).expect("legal C65 transition");
+            assert!(!state.cpu_writable());
+        }
+
+        // The GPU has not reached the extent's value yet: retiring now would
+        // hand back bytes in-flight work still reads.
+        assert_eq!(
+            pool.retire(&retirement(12), 11),
+            Err(IdentityRefusal::ExtentNotRetiredYet {
+                recorded: 12,
+                completed: 11,
+            })
+        );
+        let pool = pool.retire(&retirement(12), 12).expect("retire");
+        assert_eq!(pool.live_extents, 0);
+        assert_eq!(pool.last_retired_hqc1_value, 12);
+        assert_eq!(
+            state.advance(HeliosExtentSealState::Free),
+            Ok(HeliosExtentSealState::Free)
+        );
+
+        // Double retire has no live extent to consume.
+        assert_eq!(
+            pool.retire(&retirement(13), 13),
+            Err(IdentityRefusal::NoLiveExtent)
+        );
+    }
+
+    /// Retirement values must strictly increase *across calls* on one context,
+    /// which is the state `HeliosExtentRetirementV1::validate`'s
+    /// `previous_hqc1_value` argument leaves to the caller.
+    #[test]
+    fn retirement_values_must_strictly_increase_across_calls() {
+        let (_, pool) = Hoc1Pool::new().reserve(0, 4096).expect("reserve");
+        let (_, pool) = pool
+            .reserve(u64::from(HELIOS_HOC1_EXTENT_ALIGNMENT), 4096)
+            .expect("reserve");
+        let pool = pool.retire(&retirement(5), 100).expect("first retire");
+        assert_eq!(
+            pool.retire(&retirement(5), 100),
+            Err(IdentityRefusal::Retirement(
+                HeliosRetirementRejection::Hqc1ValueNotIncreasing {
+                    found: 5,
+                    previous: 5,
+                }
+            ))
+        );
+        let pool = pool.retire(&retirement(6), 100).expect("second retire");
+        assert_eq!(pool.live_extents, 0);
+    }
+
+    /// The two bounds the pool geometry fixes, reached through the ledger: an
+    /// extent may not exceed the 15 MiB HOB1 limit and may not leave the 64 MiB
+    /// pool, and the offset must be 64 KiB aligned.
+    #[test]
+    fn extent_bounds_are_the_hob1_limit_and_the_pool_end() {
+        let pool = Hoc1Pool::new();
+        assert_eq!(HELIOS_HOB1_MAX_BYTES, 15 * 1024 * 1024);
+        assert_eq!(HELIOS_HOC1_POOL_BYTES, 64 * 1024 * 1024);
+        assert_eq!(HELIOS_HOC1_EXTENT_ALIGNMENT, 64 * 1024);
+
+        assert_eq!(
+            pool.reserve(0, HELIOS_HOB1_MAX_BYTES + 1),
+            Err(IdentityRefusal::Extent(
+                HeliosExtentRejection::ByteLengthAboveHob1Limit {
+                    found: HELIOS_HOB1_MAX_BYTES + 1,
+                    limit: HELIOS_HOB1_MAX_BYTES,
+                }
+            ))
+        );
+        assert_eq!(
+            pool.reserve(HELIOS_HOC1_POOL_BYTES - u64::from(HELIOS_HOC1_EXTENT_ALIGNMENT), 65537),
+            Err(IdentityRefusal::Extent(
+                HeliosExtentRejection::RangeOutsidePool {
+                    end: HELIOS_HOC1_POOL_BYTES + 1,
+                    pool_bytes: HELIOS_HOC1_POOL_BYTES,
+                }
+            ))
+        );
+        assert_eq!(
+            pool.reserve(4096, 4096),
+            Err(IdentityRefusal::Extent(
+                HeliosExtentRejection::OffsetMisaligned {
+                    offset: 4096,
+                    alignment: HELIOS_HOC1_EXTENT_ALIGNMENT,
+                }
+            ))
+        );
+        assert_eq!(
+            pool.reserve(0, 0),
+            Err(IdentityRefusal::Extent(
+                HeliosExtentRejection::ByteLengthZero
+            ))
+        );
+    }
+
+    // ── (e) the bounds discipline of `from_private_data` ────────────────────
+
+    /// One byte short, exactly right, one byte over, and correct-length at an
+    /// odd address — for all three records.
+    ///
+    /// The short arm is the one that matters: a KMD that read 168 bytes out of
+    /// a 167-byte runtime buffer takes an out-of-bounds *kernel* read, and no
+    /// validator downstream can catch it because the damage is already done.
+    /// The oversize arm matters for a different reason — `from_private_data` is
+    /// an exact-length gate, not a prefix parser, so a longer buffer is a
+    /// disagreement about the ABI and not a superset.
+    #[test]
+    fn hwa2_private_data_is_an_exact_length_gate() {
+        let record = primary_input();
+        let bytes = encode_hwa2(&record);
+        let expected = HELIOS_HWA2_BYTES as usize;
+        assert_eq!(bytes.len(), expected);
+
+        assert_eq!(hwa2_admit_create_input(&bytes, PKG), Ok(record));
+        assert_eq!(
+            hwa2_admit_create_input(&bytes[..expected - 1], PKG),
+            Err(IdentityRefusal::Hwa2(
+                HeliosAllocDescRejection::PrivateDataSize {
+                    found: expected - 1,
+                    expected,
+                }
+            ))
+        );
+
+        let mut oversize = [0u8; (HELIOS_HWA2_BYTES as usize) + 1];
+        oversize[..expected].copy_from_slice(&bytes);
+        assert_eq!(
+            hwa2_admit_create_input(&oversize, PKG),
+            Err(IdentityRefusal::Hwa2(
+                HeliosAllocDescRejection::PrivateDataSize {
+                    found: expected + 1,
+                    expected,
+                }
+            ))
+        );
+
+        // Correct length at an odd address must parse, not be refused with a
+        // length error naming the correct length: the runtime's buffer carries
+        // no alignment promise, so the reader is an unaligned read by contract.
+        let mut staging = [0u8; (HELIOS_HWA2_BYTES as usize) + 8];
+        staging[3..3 + expected].copy_from_slice(&bytes);
+        assert_eq!(
+            hwa2_admit_create_input(&staging[3..3 + expected], PKG),
+            Ok(record)
+        );
+    }
+
+    #[test]
+    fn hvm1_private_data_is_an_exact_length_gate() {
+        let record = host_visible_input();
+        let bytes = encode_hvm1(&record);
+        let expected = HELIOS_HVM1_SIZE as usize;
+        assert_eq!(bytes.len(), expected);
+
+        let (parsed, role) = hvm1_admit_create_input(&bytes, PKG).expect("exact length");
+        assert!(hvm1_fields_equal(&parsed, &record));
+        assert_eq!(role, Hvm1Role::VulkanHostVisible);
+
+        // `Hvm1Reject::PrivateDataSizeMismatch` carries no found/expected pair,
+        // unlike HWA2's and HOC1's `PrivateDataSize { found, expected }`. That
+        // asymmetry is `protocol`'s, not this model's; the refusal is still
+        // named, and its stable code is 0x0412.
+        assert_eq!(
+            hvm1_admit_create_input(&bytes[..expected - 1], PKG).err(),
+            Some(IdentityRefusal::Hvm1(Hvm1Reject::PrivateDataSizeMismatch))
+        );
+        let mut oversize = [0u8; (HELIOS_HVM1_SIZE as usize) + 1];
+        oversize[..expected].copy_from_slice(&bytes);
+        assert_eq!(
+            hvm1_admit_create_input(&oversize, PKG).err(),
+            Some(IdentityRefusal::Hvm1(Hvm1Reject::PrivateDataSizeMismatch))
+        );
+        assert_eq!(Hvm1Reject::PrivateDataSizeMismatch.code(), 0x0412);
+
+        let mut staging = [0u8; (HELIOS_HVM1_SIZE as usize) + 8];
+        staging[3..3 + expected].copy_from_slice(&bytes);
+        let (parsed, _) =
+            hvm1_admit_create_input(&staging[3..3 + expected], PKG).expect("odd address");
+        assert!(hvm1_fields_equal(&parsed, &record));
+    }
+
+    #[test]
+    fn hoc1_private_data_is_an_exact_length_gate() {
+        let record = HeliosOuterCommandAllocationV1::new(PKG);
+        let bytes = encode_hoc1(&record);
+        let expected = HELIOS_HOC1_BYTES as usize;
+        assert_eq!(bytes.len(), expected);
+
+        assert_eq!(hoc1_admit_create_input(&bytes, PKG), Ok(record));
+        assert_eq!(
+            hoc1_admit_create_input(&bytes[..expected - 1], PKG),
+            Err(IdentityRefusal::Hoc1(
+                HeliosOuterCommandAllocRejection::PrivateDataSize {
+                    found: expected - 1,
+                    expected,
+                }
+            ))
+        );
+        let mut oversize = [0u8; (HELIOS_HOC1_BYTES as usize) + 1];
+        oversize[..expected].copy_from_slice(&bytes);
+        assert_eq!(
+            hoc1_admit_create_input(&oversize, PKG),
+            Err(IdentityRefusal::Hoc1(
+                HeliosOuterCommandAllocRejection::PrivateDataSize {
+                    found: expected + 1,
+                    expected,
+                }
+            ))
+        );
+
+        let mut staging = [0u8; (HELIOS_HOC1_BYTES as usize) + 8];
+        staging[3..3 + expected].copy_from_slice(&bytes);
+        assert_eq!(
+            hoc1_admit_create_input(&staging[3..3 + expected], PKG),
+            Ok(record)
+        );
+    }
+
+    /// The discriminator, and the reason it cannot be a length switch: HVM1 and
+    /// HOC1 are both 64 bytes. A buffer whose magic and length disagree selects
+    /// nothing at all — §10.3 forbids falling back to a legacy parser.
+    #[test]
+    fn the_private_data_discriminator_needs_the_magic_not_just_the_length() {
+        assert_eq!(HELIOS_HVM1_SIZE, HELIOS_HOC1_BYTES);
+        assert_eq!(
+            classify_alloc_private_data(&encode_hwa2(&primary_input())),
+            Some(AllocPrivateKind::Hwa2)
+        );
+        assert_eq!(
+            classify_alloc_private_data(&encode_hvm1(&host_visible_input())),
+            Some(AllocPrivateKind::Hvm1)
+        );
+        assert_eq!(
+            classify_alloc_private_data(&encode_hoc1(&HeliosOuterCommandAllocationV1::new(PKG))),
+            Some(AllocPrivateKind::Hoc1)
+        );
+
+        // Right magic, wrong length, and the retired 48-byte record: both
+        // select nothing.
+        let hvm1 = encode_hvm1(&host_visible_input());
+        assert_eq!(classify_alloc_private_data(&hvm1[..48]), None);
+        assert_eq!(classify_alloc_private_data(&[0u8; 48]), None);
+        assert_eq!(classify_alloc_private_data(&[]), None);
+        assert_eq!(classify_alloc_private_data(&[0u8; 3]), None);
+    }
+
+    /// The hand-written encoders and `protocol`'s own readers agree on every
+    /// offset, in both directions. If either table drifts, this fails — which
+    /// is the entire reason the encoders exist rather than borrowing
+    /// `bytemuck::bytes_of`.
+    #[test]
+    fn the_independent_encoder_agrees_with_protocols_reader() {
+        for desc in [primary_input(), buffer_input()] {
+            assert_eq!(
+                HeliosWddmAllocationDescV2::from_private_data(&encode_hwa2(&desc)),
+                Ok(desc)
+            );
+        }
+        for record in [
+            host_visible_input(),
+            device_local_input(),
+            HeliosVenusMemoryAllocationV1::new_reply_pool(PKG),
+        ] {
+            let parsed = HeliosVenusMemoryAllocationV1::from_private_data(&encode_hvm1(&record))
+                .expect("round trip");
+            assert!(hvm1_fields_equal(&parsed, &record));
+        }
+        let hoc1 = HeliosOuterCommandAllocationV1::new(PKG);
+        assert_eq!(
+            HeliosOuterCommandAllocationV1::from_private_data(&encode_hoc1(&hoc1)),
+            Ok(hoc1)
+        );
+
+        // None of the three ABI versions is negotiable, and the constants the
+        // encoders write are the constants the readers require.
+        assert_eq!(ADMITTED_ABI_VERSIONS, (2, 1, 1));
     }
 }

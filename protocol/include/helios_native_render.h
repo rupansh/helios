@@ -566,6 +566,13 @@ HELIOS_NR_STATIC_ASSERT(HELIOS_HNR2_ACCESS_MASK == (HELIOS_HNR2_ACCESS_READ |
  * `allocation_alignment` are ZERO on input and filled by the KMD. Validate as
  * create-INPUT before the call and as create-OUTPUT after it — the same struct,
  * two different exact contracts (Rust `Hvm1Stage`).
+ *
+ * ⛔ THE LENGTH IS A GATE, NOT AN EXPECTATION: the private-data buffer must be
+ * exactly 64 bytes, checked BEFORE the record is read. A consumer that reads 64
+ * bytes out of a shorter buffer has already taken the out-of-bounds read that no
+ * later field validation can undo, and in the KMD that read is a kernel one.
+ * Rust `HeliosVenusMemoryAllocationV1::from_private_data` is that gate and is
+ * the only admitted entry point; do not cast the pointer.
  */
 typedef struct HeliosVenusMemoryAllocationV1 {
     uint32_t magic;                /* 0  == HELIOS_HVM1_MAGIC */

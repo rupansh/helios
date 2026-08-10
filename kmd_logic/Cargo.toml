@@ -12,7 +12,29 @@ description = "Host-testable no_std leaf logic shared with the Helios WDDM minip
 crate-type = ["lib"]
 
 [dependencies]
-# Intentionally empty. A dependency edge to `wdk-sys` or the generated `dxgk`
-# bindings would let this arithmetic read a DXGKARG_* field or an AdapterContext
-# atomic; keeping the edge absent makes the page/pitch rules expressible only as
-# functions of their arguments.
+# ⚠ The invariant this list protects is NOT "no dependencies". It is: nothing
+# reachable from here may read kernel state. Concretely, and this is the whole
+# rule — no `wdk-sys`, no `wdk-build`, no generated `dxgk`/`ntddk` bindings, and
+# no `kmd_render` types (`AdapterContext`, `DeviceContext`, any HANDLE). With
+# that edge absent, every function in this crate is a function of its arguments
+# and nothing else, which is exactly the property that makes it runnable under
+# a host libtest harness.
+#
+# `helios_protocol` satisfies that invariant and is admitted (K4, 2026-08-10).
+# It is `#![no_std]`, it is already a `kmd_render` dependency, and it declares
+# wire records — HWA2/HVM1/HOC1 — that carry no handle, no pointer and no
+# kernel state by construction (§10.3: "no host resource token, resid, PID,
+# process handle, synchronization object, mutable value, or independently
+# usable identity"). The alternative was worse and there is prior art for how
+# much worse: `native_fence_lifecycle` below re-declares the whole HNF1 offset
+# table locally because this edge was absent, which is a second declaration of
+# a wire record and exactly what the "shared private data has ONE declaration"
+# directive forbids. K4 models the allocation-identity state machine against
+# protocol's own validators instead.
+#
+# The edge does pull `bytemuck` into the graph transitively. That is not a
+# regression of the rule above: `bytemuck` is not re-exported by
+# `helios_protocol` (`protocol/src/lib.rs:81-91` re-exports only the record
+# modules), so it is not nameable from this crate, and it reads nothing but the
+# bytes it is handed.
+helios_protocol = { path = "../protocol" }

@@ -25,9 +25,20 @@
 //! | [`HeliosWddmAllocPrivate`] (create-time private data) + [`HeliosWddmAllocMeta`] (geometry/venus-identity trailer) + [`HeliosWddmOpenIdentity`] (open-time restamp) | [`crate::wddm::HeliosWddmAllocationDescV2`] — `HWA2`. One immutable `const` descriptor instead of a mutable create/open pair. |
 //! | [`HeliosD3D12SubmitCmd`] (D3D12 ECL submit marker through `pfnRenderCb`) | [`crate::wddm::HeliosOuterSubmitV1`] (`HOS1`, the `pPrivateDriverData` descriptor) plus [`crate::wddm::HeliosOuterBatchV1`] (`HOB1`, the translated outer-command record it points at). |
 //! | The `HeliosPresent*` present-ticket family — [`HeliosPresentPrivateData`], [`HeliosPresentRenderCmd`], [`HeliosPresentRefreshCmd`], and their `HELIOS_PRESENT_*` magics/flags/purposes | **Deleted outright, no direct replacement record.** Superseded by an ordinary WDDM `Present` plus exact per-plane display state (`HELIOS_PRESENT_SYNC_RETIREMENT.md` §10.8) — identity is the WDDM allocation object plus a KMD-assigned generation, never a renderer resource id, ticket, PID, handle, or timing/dimension inference. |
-//! | [`HeliosWddmCmdBuf`] (`D3DKMTRender` venus-stream header) | Folded into the [`crate::wddm::HeliosOuterBatchV1`] / `HOB1` record. |
+//! | [`HeliosWddmCmdBuf`] (`D3DKMTRender` venus-stream header) | **Split by submit path; not folded into one record.** The native-Vulkan Render stream Mesa submits is [`crate::native_render::HeliosNativeRenderV2`] (`HNR2`, §10.7 — the 112-byte fragment header that carries the venus payload plus the use/patch tables); the translated outer-command stream is [`crate::wddm::HeliosOuterBatchV1`] (`HOB1`, §10.4) submitted through [`crate::wddm::HeliosOuterSubmitV1`] (`HOS1`). ⚠ Neither is a doc claim: the retirement doc never names this struct (`grep -n CmdBuf docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` is empty), so this row states which record carries the venus bytes on each path, nothing more. |
 //! | [`AllocationBacking`] / [`ClassifyRefusal`] / [`classify`] (pure allocation-backing classifier over the retired create-time pair) | No 1:1 replacement; a new classifier over `HWA2` belongs in [`crate::wddm`] if/when a consumer needs one. |
-//! | [`GlobalVidMmTracker`] (transferable VidMm-tracker identity carried in the retired pair) | Folded into `HWA2`'s own tracking-kind fields; see [`crate::wddm::HeliosWddmAllocationDescV2`]. |
+//! | [`GlobalVidMmTracker`] (transferable VidMm-tracker identity carried in the retired pair) | **No successor. Deleted outright with the UMD-backing adoption path it attested.** §10.3 forbids any "independently usable identity", so the tracker's global share + cookie cannot come back under another name: [`crate::wddm::HeliosWddmAllocationDescV2`] has no tracking kind, no cookie, no global-share field and no tracker flag bit. Identity after the retirement is the exact WDDM allocation object plus the KMD-assigned `allocation_generation`, which is a stale-validation value and never a lookup key. |
+//!
+//! ⛔ That last row said *"Folded into `HWA2`'s own tracking-kind fields"* until
+//! 2026-08-10. There are no such fields and there never were — `grep -in track
+//! protocol/src/wddm.rs` returns nothing — so a lane reading it went looking for
+//! a cookie, a global share and a `TRACKING` kind that exist nowhere in the new
+//! ABI. Corrected per `docs/retirement/K4-CONTRACT.md` §6, which is the decision
+//! record for the mechanism's deletion. Every other row was re-read against the
+//! code in the same pass; the `HeliosWddmCmdBuf` row was the only other one that
+//! named an incomplete successor. A row here is a claim about code in
+//! [`crate::wddm`] / [`crate::native_render`] and must be checked against it, not
+//! against the intent of the retirement.
 //!
 //! `D3DDDIFMT_A8R8G8B8` / `D3DDDIFMT_X8R8G8B8` are the one exception: the
 //! retirement kept them (they are frozen Windows ABI values, not a Helios
