@@ -9,15 +9,31 @@
 //! The `kmd_render`, `umd`, and `umd12` crates depend on this crate, and Mesa
 //! and QEMU mirror the same records in C, so no two halves of a boundary can
 //! ever drift on struct layout. It is `#![no_std]` so the kernel-mode KMD can
-//! use it. The three C mirrors, each with `_Static_assert`s on every size,
-//! alignment, and offset its Rust side asserts:
+//! use it. The **five** C mirrors, each with `_Static_assert`s on every size,
+//! alignment, and offset its Rust side asserts (`ls protocol/include/`):
 //!
-//! | C header | Mirrors |
-//! |---|---|
-//! | `protocol/include/helios_wddm.h` | [`wddm`] — HWA2, HOB1 + its use/operand records, HOS1, HOC1 |
-//! | `protocol/include/helios_diagnostics.h` | [`diagnostics`] — the §12.3 ETW schema |
-//! | `protocol/include/helios_translator_dispatch.h` | [`translator_dispatch`] — the private direct-dispatch ABI (in-process, not a wire format) |
-//! | `qemu-helios/include/hw/virtio/helios_physical_memory.h` | [`physical_memory`] — HPM1 and the HLM1 BAR profile |
+//! | C header | Mirrors | Who actually includes it |
+//! |---|---|---|
+//! | `protocol/include/helios_wddm.h` | [`wddm`] — HWA2, HOB1 + its use/operand records, HOS1, HOC1 | **Mesa**, via `icd/mesa/src/virtio/vulkan/vn_helios_hwa2.h` — the one mirror evaluated inside a real consumer's build |
+//! | `protocol/include/helios_native_render.h` | [`native_render`] — HVC1, HNR2 + its use/patch records, HVM1, HVR1 | nobody yet; `tools/retirement-gates.sh` only |
+//! | `protocol/include/helios_translation_session.h` | [`translation_session`] — HTS1 + HQA1 | nobody yet; `tools/retirement-gates.sh` only |
+//! | `protocol/include/helios_translator_dispatch.h` | [`translator_dispatch`] — the private direct-dispatch ABI (in-process, not a wire format) | nobody yet; `tools/retirement-gates.sh` only |
+//! | `protocol/include/helios_diagnostics.h` | [`diagnostics`] — the §12.3 ETW schema | nobody yet; `tools/retirement-gates.sh` only |
+//!
+//! ⛔ A sixth row used to read
+//! "`qemu-helios/include/hw/virtio/helios_physical_memory.h` | [`physical_memory`]
+//! — HPM1 and the HLM1 BAR profile". **That header is not in the tree**:
+//! `docs/retirement/FINDINGS.md` **F5** declined HPM1 and reset `qemu-helios` to
+//! its pre-retirement base, so the header survives only on branch
+//! `helios/hpm1-parked`. [`physical_memory`] therefore has **no** C mirror, is
+//! covered by **neither** `tools/retirement-gates.sh`'s mirror-compile gate nor
+//! `protocol/tools/abi_parity.py`, and is declared-but-unwired by owner
+//! decision. Read that module's banner before touching it.
+//!
+//! ⚠ Four of the five mirrors above are compiled by nothing but the gate
+//! script. "The `_Static_assert`s hold" is a statement about `gcc
+//! -fsyntax-only`, not evidence that a consumer of those bytes exists — see
+//! each module's own producer-status banner.
 //!
 //! # Module map (HELIOS_PRESENT_SYNC_RETIREMENT.md section 17.1)
 //!
@@ -27,7 +43,7 @@
 //! | [`translation_session`] | Mesa `vn_instance` -> KMD session establishment (HTS1) and outer-context attach (HQA1) | 10.4 |
 //! | [`translator_dispatch`] | D3D UMD bridge <-> DXVK/vkd3d <-> Helios Mesa, **in-process only**: the private direct-dispatch entry point and its versioned two-half function table | 2.8, 10.4, 13 |
 //! | [`native_render`] | native Vulkan ICD -> KMD Render (HVC1/HNR2), allocation (HVM1), synchronous reply (HVR1) | 10.7 |
-//! | [`physical_memory`] | KMD paging DMA -> QEMU device page tables (HPM1) and the HLM1 BAR profile | 10.7 |
+//! | [`physical_memory`] | ⛔ **DECLINED (F5).** Was: KMD paging DMA -> QEMU device page tables (HPM1) and the HLM1 BAR profile. Only [`HELIOS_SEGMENT_ID_SYSTEM`]/[`HELIOS_SEGMENT_ID_APERTURE`]/[`HELIOS_SEGMENT_ID_HLM1`] are live | 10.7 |
 //! | [`diagnostics`] | KMD -> OS ETW, one-way lossy schema | 12.3 |
 //! | [`virtio_gpu`] | standard virtio-gpu control headers/capsets | VirtIO 1.2 §5.7 |
 //! | [`features`] | virtio feature bits | — |
@@ -96,11 +112,32 @@ pub use wddm_legacy::*;
 // protocol/package generation constant shared by protocol, Mesa, UMD11, UMD12,
 // KMD, QEMU, and installer. Generation mismatch is fatal."
 //
-// This is that constant, and this is its only definition in the guest tree. All
-// three C mirrors listed in the module header carry a `_Static_assert`-guarded
-// copy under the same name (`helios_wddm.h` and `helios_diagnostics.h` guard
-// theirs with `#ifndef` so both may be included in one translation unit), and
-// the value must be changed in all four places together.
+// This is that constant, and this is its only definition in the guest tree.
+//
+// Measured 2026-08-10 — the exact shape, because the old comment here ("all
+// three C mirrors … all four places together") was wrong in both numbers and
+// counted a QEMU header that no longer exists:
+//
+//   - `helios_wddm.h`, `helios_native_render.h`, `helios_translation_session.h`
+//     each `#define` it behind `#ifndef HELIOS_PACKAGE_GENERATION`.
+//   - `helios_diagnostics.h` `#define`s it **unguarded**.
+//   - `helios_translator_dispatch.h` only *names* it in comments and field
+//     annotations; it defines nothing.
+//   - There is no host-side copy. F5 reset `qemu-helios`, so the sixth site
+//     lives on branch `helios/hpm1-parked` only.
+//
+// ⇒ the value must be changed in **five** places together: this file and the
+// four defining headers.
+//
+// ⚠ And nothing mechanically enforces that. `abi_parity.py` compares only
+// size/align/offset claims, not macro values, so the four headers' copies are
+// checked by no tool. Worse, the `#ifndef` guards actively *suppress* the one
+// check C would have given for free: if two headers disagreed on the value, the
+// guard makes the second one silently skip instead of raising "macro
+// redefinition" — and `tools/retirement-gates.sh` includes all five in one
+// translation unit, so that error is exactly what it would otherwise catch. The
+// `c_mirrors_carry_this_exact_value` test below pins the Rust literal and names
+// the headers, but a reader has to open them; it cannot fail on their behalf.
 
 /// The ASCII tag `'HELI'` occupying the high 32 bits of
 /// [`HELIOS_PACKAGE_GENERATION`].
@@ -117,9 +154,32 @@ pub const HELIOS_PACKAGE_GENERATION_TAG: u32 = 0x4845_4C49;
 ///
 /// `1` is the HPS2-retirement generation: the first generation in which
 /// `helios_present_sync_v2.bin` is neither published nor read, HWA2/HOB1/HOS1/
-/// HOC1/HQA1/HTS1/HVC1/HNR2/HVM1/HVR1/HPM1 are the complete guest ABI, and the
+/// HOC1/HQA1/HTS1/HVC1/HNR2/HVM1/HVR1 are the complete guest ABI, and the
 /// `escape`/`ioctl` verbs are retired. Bump it for **any** change to any record
 /// in this crate, including a field that only widens a reserved region.
+///
+/// ⛔ **HPM1 was in that list and has been removed.** `docs/retirement/
+/// FINDINGS.md` **F5** declines it — owner decision, maintenance grounds — and
+/// resets `qemu-helios` to its pre-retirement base, so HPM1 is no part of the
+/// guest ABI this generation names. See [`physical_memory`]'s banner.
+///
+/// ⚠ Of the ten records still listed, only **HWA2**, **HVM1** and **HOC1** have
+/// a producer or consumer at HEAD (measured 2026-08-10 by grepping each
+/// record's constant prefix across `kmd_render/src kmd_logic/src umd/src
+/// umd12/src umd_common/src icd/mesa/src`). Precisely:
+///
+///   - **HWA2** — 418 references; the UMDs build it, the KMD validates it, the
+///     ICD asserts its offsets via `vn_helios_hwa2.h`.
+///   - **HVM1**, **HOC1** — read and written by
+///     `kmd_render/src/ddi/create_allocation.rs`.
+///   - **HOB1** — 5 references, all to the single bound `HELIOS_HOB1_MAX_BYTES`
+///     inside `kmd_logic` tests. **No HOB1 record is built or parsed anywhere.**
+///   - **HOS1**, **HQA1**, **HTS1**, **HVC1**, **HNR2**, **HVR1** — zero
+///     references outside `protocol/`.
+///
+/// For everything after the first two bullets, this constant appearing in a
+/// header is a contract binding a future implementer, not traffic anybody
+/// sends. Each module's banner names the unit that will produce it.
 pub const HELIOS_PACKAGE_GENERATION_ORDINAL: u32 = 1;
 
 /// The exact atomic package generation.
@@ -143,8 +203,14 @@ pub const HELIOS_PACKAGE_GENERATION_ORDINAL: u32 = 1;
 ///     mismatch against the host at adapter start fails `StartDevice`.
 ///   - **UMD11 / UMD12 / ICD**: a mismatch fails device creation before any
 ///     context, allocation, or resource is exposed.
-///   - **QEMU**: a mismatch fails the HPM1 negotiation and the device never
-///     accepts a paging or batch transaction.
+///   - **QEMU**: ⛔ **no such gate exists, and none is planned.** This line
+///     read "a mismatch fails the HPM1 negotiation and the device never accepts
+///     a paging or batch transaction." `docs/retirement/FINDINGS.md` **F5**
+///     declines HPM1 and resets `qemu-helios` to its pre-retirement base, so
+///     there is no HPM1 negotiation to fail and the host carries no copy of
+///     this constant. §17.8 step 5's KMD↔host generation exchange is
+///     consequently **unimplemented on the host side**; nothing in the tree
+///     enforces it. Whoever implements it names the host mechanism here.
 ///   - **Installer**: a mismatch across the staged KMD/UMDs/ICD/translators/WSI
 ///     layer/manifests/host attestation fails activation (section 17.8 step 6).
 ///
@@ -209,15 +275,30 @@ mod package_generation_tests {
         );
     }
 
-    /// The two C mirrors hand-copy this value. Pin the exact literal here so a
-    /// change to the Rust side without the matching header edit is caught by a
-    /// failing test naming the headers, not by a runtime generation mismatch on
-    /// a deployed VM.
+    /// The **four** C mirrors that define this value hand-copy it. Pin the exact
+    /// literal here so a change to the Rust side without the matching header
+    /// edit is caught by a failing test naming the headers, not by a runtime
+    /// generation mismatch on a deployed VM.
+    ///
+    /// ⚠ Bound on what this proves: it pins the **Rust** literal only. Nothing
+    /// reads the headers' copies, so this test cannot fail because a header
+    /// drifted — it fails only if someone edits the Rust constant and not this
+    /// assertion. See the comment above [`HELIOS_PACKAGE_GENERATION`] for why
+    /// the `#ifndef` guards mean the C compiler will not catch a drift either.
     #[test]
     fn c_mirrors_carry_this_exact_value() {
-        // protocol/include/helios_wddm.h: HELIOS_PACKAGE_GENERATION
-        // protocol/include/helios_diagnostics.h: HELIOS_PACKAGE_GENERATION
-        // qemu-helios/include/hw/virtio/helios_physical_memory.h: HELIOS_PACKAGE_GENERATION
+        // Defining sites, verified 2026-08-10 with
+        // `grep -n 'define HELIOS_PACKAGE_GENERATION' protocol/include/*.h`:
+        //   protocol/include/helios_wddm.h                (#ifndef-guarded)
+        //   protocol/include/helios_native_render.h       (#ifndef-guarded)
+        //   protocol/include/helios_translation_session.h (#ifndef-guarded)
+        //   protocol/include/helios_diagnostics.h         (UNGUARDED)
+        // protocol/include/helios_translator_dispatch.h only names it in
+        // comments; it defines nothing.
+        //
+        // ⛔ `qemu-helios/include/hw/virtio/helios_physical_memory.h` used to be
+        // listed here. F5 declined HPM1 and reset the submodule; that header is
+        // on branch `helios/hpm1-parked` only and is NOT a site to keep in sync.
         assert_eq!(HELIOS_PACKAGE_GENERATION, 0x4845_4C49_0000_0001);
     }
 }

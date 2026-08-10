@@ -3,18 +3,51 @@
 //! HELIOS_PRESENT_SYNC_RETIREMENT.md §12.3 ("ETW and OS-diagnostic contract"),
 //! with the emission contract in §17.6 and the module mandate in §17.1.
 //!
-//! # The boundary these bytes cross
+//! # ⛔ Producer status: DECLARED, NOT WIRED — there are ZERO ETW emitters
 //!
-//! `kmd_render` registers ONE task-owned kernel provider at PASSIVE driver
-//! initialization (`EtwRegister`, [`HELIOS_ETW_PROVIDER_GUID`]) and keeps the
-//! returned `REGHANDLE` for driver lifetime. At each instrumented site it
+//! **Measured 2026-08-10.** Nothing in the tree emits one of these events, and
+//! nothing decodes one:
+//!
+//! ```text
+//! grep -rn 'HELIOS_ETW\|HeliosGraphicsEtwPayloadV1\|EtwWrite\|EtwRegister' \
+//!   kmd_render umd umd12 kmd_logic icd/mesa/src tools
+//! → only icd/mesa/src/gallium/frontends/mediafoundation/wppconfig/**  (upstream
+//!   Mesa WPP boilerplate, unrelated to Helios)
+//! ```
+//!
+//! No component references `helios_protocol::diagnostics` at all (`grep -rn
+//! 'diagnostics::' kmd_render/src kmd_logic/src umd/src umd12/src` → nothing).
+//! Both halves of the pipeline are unbuilt, and both have a **named owner**:
+//!
+//! | half | unit | artifact | state |
+//! |---|---|---|---|
+//! | emitter | **D0**, `docs/retirement/lane-kmd-display.md` | `kmd_render/src/ddi/diag_etw.rs` (ADD) | file does not exist; `lane-kmd-display.md:204` records that D0 hard-blocks on this module |
+//! | decoder | **T1**, `docs/retirement/lane-host-tools.md` | `tools/helios_etw_capture.ps1` | file does not exist |
+//!
+//! ⚠ `kmd_render` does register `DxgkDdiControlEtwLogging`
+//! (`kmd_render/src/lib.rs`, pointing at `ddi/base.rs`'s
+//! `dxgkddi_control_etw_logging`) — but that is the pre-retirement `{}` no-op
+//! §17.6 retargets, not an emitter. Do not read it as evidence this schema is
+//! live.
+//!
+//! ⚠ **This file compiles, its C mirror's every `_Static_assert` holds, and its
+//! unit tests pass. None of that is evidence an emitter exists.** That is
+//! METHOD.md §3 criterion 6's fourth state, *implemented but never exercised*,
+//! and the changeset's report must not count it as implemented. Nothing here
+//! has ever run.
+//!
+//! # The boundary these bytes cross (the contract D0 and T1 are bound by)
+//!
+//! `kmd_render` **is to** register ONE task-owned kernel provider at PASSIVE
+//! driver initialization (`EtwRegister`, [`HELIOS_ETW_PROVIDER_GUID`]) and keep
+//! the returned `REGHANDLE` for driver lifetime. At each instrumented site it
 //! constructs one [`HeliosGraphicsEtwPayloadV1`] and issues one `EtwWrite` with
 //! exactly ONE data descriptor ([`HELIOS_ETW_DATA_DESCRIPTOR_COUNT`], far below
 //! the documented [`HELIOS_ETW_MAX_DATA_DESCRIPTORS`] limit). Standard ETW
-//! tooling on the other side (`tools/helios_etw_capture.ps1`, §17.7) enables the
-//! fixed GUID and decodes only these versioned IDs and this payload. Nothing
-//! travels the other way: **there is no reader, no acknowledgement, no query,
-//! and no control verb in this file.**
+//! tooling on the other side (`tools/helios_etw_capture.ps1`, §17.7 — unit T1,
+//! also unwritten) enables the fixed GUID and decodes only these versioned IDs
+//! and this payload. Nothing travels the other way: **there is no reader, no
+//! acknowledgement, no query, and no control verb in this file.**
 //!
 //! # What this module supersedes
 //!

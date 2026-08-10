@@ -163,7 +163,10 @@ pub(crate) const fn epoch_of(generation: u64) -> u32 {
 ///
 /// This is the ONLY comparison anything may make against a generation. It
 /// answers "is this value stale", never "which allocation is this" — §10.3:1049
-/// and `protocol/src/wddm.rs:384-387` both forbid the second reading.
+/// and the "⛔ **Never an identity lookup key.**" rule on
+/// [`helios_protocol::HeliosWddmAllocationDescV2::allocation_generation`] both
+/// forbid the second reading. (Cite the symbol: `:384-387` was that rule's
+/// address before the two-stage split and now lands on the echo description.)
 ///
 /// A zero generation is never current: zero is the create-*input* value of all
 /// three records, so a caller that reaches here with one has skipped the

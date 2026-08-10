@@ -18,7 +18,7 @@ request** naming the exact edit. It does not make the edit.
 | `kmd_render/src/ddi/create_allocation.rs` | KMD core (**K4**) | Added 2026-08-10. It is the second most cross-lane-coupled file in the KMD after `lib.rs`, and K4 rewrites it. Measured with `rg -n 'create_allocation::' kmd_render/src/`: **`ddi/display.rs` — the display lane — imports or calls ten of its symbols**: `present_alloc_info`, `PresentAllocationStorage`, `ScanoutTarget` (`:14`), `present_alloc_diag` (`:349,350`), `scanout_allocation_for_resource` (`:866`), `allocation_resource_id` (`:1375`), `set_vidpn_primary_address` (`:1379,1635`), `scanout_alloc_info` (`:1502,2276`), `SCANOUT_ALLOC_FULL` (`:2061`), `submit_primary_scanout_copy` (`:2806`). (An eleventh name, `SCANOUT_ALLOCS` at `:862`, appears only in a comment.) Plus `ddi/build_paging_buffer.rs:60` (`paging_alloc_info`, `set_bar_placement` — K3), `ddi/cpu_host_aperture.rs:37,143,150,264` (`paging_alloc_info`, `PagingAllocInfo`, `APERTURE_MISSING_CPU_VISIBLE`, `LINEAR_BLOB_SIZE_DIVERGENCE` — K1 deletes that file, so K1 must re-home or delete those two counters), `ddi/submit_command.rs:212` (`RECLAIM_BAD_HANDLE` — K6), the six DDI re-exports at `ddi/mod.rs:54`, and a comment reference in `ddi/present_packet.rs:81`. Any rename or deletion in that set breaks another lane's file at compile time, in a build only the VM can run. |
 | `kmd_render/build.rs` | KMD core | One bindgen invocation and allowlist. |
 | `kmd_render/src/adapter/scanout.rs` | KMD display | KMD core's read-ledger deletions are a cross-lane request against it. |
-| `kmd_logic/src/lib.rs` | shared, partitioned | 5596 lines, three lanes (batch/queue, native-fence lifecycle, plane). Partition by `pub mod` block; merge by whole-module insert; never interleave. |
+| `kmd_logic/src/lib.rs` | shared, partitioned | **8144** lines at HEAD (`wc -l`; this row said 5596, and `lane-kmd-core.md` §2.6 said 6344 — both were wrong on the day they were written, so **do not cite a figure from a doc, run `wc -l`**). Four lanes now, not three: batch/queue, native-fence lifecycle, plane, **and `allocation_identity` (the K4 model)**. Partition by `pub mod` block; merge by whole-module insert; never interleave. Enumerate the blocks with `rg -n -e '^pub mod ' -e '^mod ' kmd_logic/src/lib.rs` — ⛔ **`-e`, not `'^pub mod \|^mod '`**: `rg` reads `\|` as a literal pipe and returns nothing. |
 | `umd_common/**` | D3D11 UMD | `umd12` compiles the same sources into a second cdylib. `umd_common/src/window.rs` must survive — D3D11 still needs it after D3D12 drops the legacy context. |
 | `packaging/windows/Install-Helios.ps1`, `.cmd` | host/packaging | Mesa needs the implicit-layer JSON registered; UMD12 needs `UserModeDriverName[3]`. Both file requests. |
 | `ROADMAP.md`, `DX12.md`, `CONFORMANCE.md`, `docs/dx12/**` | host/packaging, **last** | Consumes other lanes' finished summaries. A mid-flight edit conflicts. |
@@ -101,7 +101,7 @@ record at `wddm_surface.rs:25-28`. Whoever flips it cites both lanes.
 ## 4. Orchestrator decision: the private direct-dispatch ABI has one home
 
 Three lanes independently reported this as unspecified (mesa A3, dxvk 6.14,
-vkd3d 9). §10.4:1182-1184 requires "a private, versioned in-process interface
+vkd3d 9). §10.4:1192-1194 requires "a private, versioned in-process interface
 … between the D3D UMD bridge, DXVK/vkd3d, and Helios Mesa" with no global
 discovery, and §2.8 requires translators to reach the ICD through it rather
 than the Vulkan loader — but the reference never names the entry point, its
@@ -160,10 +160,17 @@ It settles four things no lane may re-decide on its own:
   `allocation_generation != 0`, so it can only ever check the output side, while
   HVM1 and HOC1 both already have the pair. `Hwa2Stage::{CreateInput,
   CreateOutput}` and the two validators belong to the **protocol lane**,
-  mirroring HOC1's naming exactly. (Measured 2026-08-10: already present in the
-  working tree — `Hwa2Stage` at `protocol/src/wddm.rs:568`, the shared
-  cross-field core at `:852`, and the `AllocationGenerationNonZeroOnInput` /
-  `KmdOwnedFlagSetOnInput` rejection variants at `:743`/`:750`.)
+  mirroring HOC1's naming exactly. (⛔ **Re-derived 2026-08-10 — all three line
+  numbers in the earlier version of this bullet were wrong, and they disagreed
+  with `K4-CONTRACT.md`, which is what makes a reader distrust both documents.**
+  Cite the **symbols**, which cannot drift: `pub enum Hwa2Stage`
+  (`protocol/src/wddm.rs:586`, not `:568`); the shared cross-field core is `fn
+  validate_stage` (`:875`, doc block from `:858` — the old `:852` lands inside
+  `pub const fn has_flag`, a different function); and the rejection variants
+  `AllocationGenerationNonZeroOnInput` / `KmdOwnedFlagSetOnInput` are at
+  `:769`/`:776`, not `:743`/`:750`. Regenerate with
+  `rg -n -e 'pub enum Hwa2Stage' -e 'fn validate_stage' -e 'AllocationGenerationNonZeroOnInput'
+  -e 'KmdOwnedFlagSetOnInput' protocol/src/wddm.rs`.)
 - **HVM1 gains `from_private_data`.** It was the one record of the three with no
   length-and-alignment constructor; without it a short user buffer is an
   out-of-bounds *kernel* read. (Measured 2026-08-10: landed at

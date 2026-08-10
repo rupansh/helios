@@ -34,8 +34,11 @@
 //! # ⚠ The named gap: HWA2 carries no host resource id (`K4-CONTRACT` §5)
 //!
 //! The retired open-identity blob carried a `resource_id` at offset 24 and four
-//! consumers read it. HWA2 deliberately carries none (`protocol/src/wddm.rs`
-//! :355-361), and `DXGK_OPENALLOCATIONINFO::hAllocation` is dxgkrnl's runtime
+//! consumers read it. HWA2 deliberately carries none (the "No host resource
+//! token, `resid`, PID, process handle, …" paragraph on
+//! `protocol::wddm::HeliosWddmAllocationDescV2` — cite the SYMBOL: that block
+//! has moved twice and the `:355-361` this line used to carry now lands inside
+//! `HeliosWddmPlaneRecordV2`), and `DXGK_OPENALLOCATIONINFO::hAllocation` is dxgkrnl's runtime
 //! token, not this driver's `AllocationContext*` — so **the open path cannot
 //! resolve a host resource id at all**, and no adapter-global table may be added
 //! to bridge it (§3:373-379, §13.3:3398-3406). The replacement is a different
@@ -467,6 +470,34 @@ static OPEN_NO_RESOURCE_ID: AtomicU32 = AtomicU32::new(0);
 /// the OPEN as well as the create; the open is not a place to be lenient,
 /// because the receiving UMD reads the identical bytes.
 static OPEN_HWA2_REJECT: AtomicU32 = AtomicU32::new(0);
+/// Presents refused because [`present_alloc_info`] answered `None` — the A3 gap
+/// reaching the DISPLAY path (`PrNoRid`).
+///
+/// ⭐ Added by round 3 of the Phase-2 review, which found the symptom site
+/// silent. [`PresentAllocationStorage`] is permanently `None`
+/// ([`PresentAllocInfo`]'s doc has the argument), so BOTH of `ddi/display.rs`'s
+/// present-side consumers now take their `else` arm on every call — and they
+/// did so through the pre-existing last-value breadcrumbs `PBFlip`/`PBCpy =
+/// 0xE1`, whose meaning in that file is "dxgkrnl handed us a source handle we
+/// could not resolve", i.e. a handle-lifetime bug. An operator reading
+/// `PBFlip = 0xE1` after this changeset would have been looking for the wrong
+/// defect, and because those are last-value writes rather than counts, could not
+/// even tell whether it fired once or per frame.
+///
+/// So the two sites now write a distinct breadcrumb (`0xEA`, unused in both
+/// families) *and* bump this. [`OPEN_NO_RESOURCE_ID`] is the same gap measured
+/// one stage earlier, at the open; this is the stage the desktop actually dies
+/// at, and the pair localises whether an open ever produced usable state.
+///
+/// ⛔ Expected LARGE and rising until mesa unit **A3** plus K6 land. Like
+/// `OaNoRid` it must be **revisited, not merely zeroed**, when the KMD gains a
+/// way to name the real host image.
+///
+/// ⛔ A PLAIN `fetch_add`, never [`bump`]: `DxgkDdiPresent` is a per-frame path
+/// and a registry write there is the producer-side CPU stall this project has
+/// already paid for once. Mirrored from [`ALLOC_COUNTERS`] on the create-path
+/// cadence.
+pub(crate) static PRESENT_NO_ALLOC_INFO: AtomicU32 = AtomicU32::new(0);
 /// HWA2 descriptors whose `RESOURCE_ASSOCIATED` claim disagreed with
 /// `DXGK_CREATEALLOCATIONFLAGS::Resource` on the call that carried them
 /// (`AcRcAssoc`). See the read site for why this is counted and not refused.
@@ -507,6 +538,29 @@ static CREATE_RESOURCE_ASSOC_DIVERGENCE: AtomicU32 = AtomicU32::new(0);
 /// fires on every SUCCESSFUL D3D12 texture create. It is mirrored from
 /// [`ALLOC_COUNTERS`].
 static CREATE_OPTIMAL_AS_LINEAR: AtomicU32 = AtomicU32::new(0);
+/// HVM1 creates refused because the role asks for memory this KMD cannot
+/// allocate (`AcHvm1Mem`); the low word is the WIRE role number.
+///
+/// The only role that can reach it today is 4, `VulkanDeviceLocal`, whose
+/// `placement()` publishes `cpu_visible = false` and whose `cache_policy` is
+/// `HELIOS_HVM1_CACHE_NOT_CPU_VISIBLE`. This venus client allocates every plain
+/// memory blob from the single host-visible/host-coherent memory type chosen at
+/// bring-up — a memory blob has no `vkGet*MemoryRequirements` query to feed
+/// [`helios_kmd_logic::choose_device_local_memory_type`] — so honouring the role
+/// is not currently expressible and substituting host-visible memory would be a
+/// silent contradiction of a field the KMD had just validated.
+///
+/// ⚠ NOT a statement about K2's schedule, and must not be read as one: the
+/// segment-reporting question is `segment_is_reported`, checked at runtime per
+/// `K4-CONTRACT.md` §4. This is a capability of the venus client, and it is
+/// lifted by mesa unit A3 plus K6 giving the KMD a requirements query — at which
+/// point this arm is deleted, not widened.
+///
+/// ⛔ **Must read absent** at HEAD, and absence proves nothing: no component in
+/// this package produces an HVM1 record at all, so this refusal — like every
+/// other `AcHvm1*` and `AcSegRole*` value — cannot fire yet. See
+/// [`admit_hvm1`]'s banner.
+static CREATE_HVM1_MEMORY_CLASS_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// `DxgkDdiGetStandardAllocationDriverData` calls refused because the runtime's
 /// `D3DDDIFORMAT` has no DXGI peer (`StdFmt`).
 ///
@@ -530,12 +584,13 @@ static STANDARD_SELF_REJECT: AtomicU32 = AtomicU32::new(0);
 /// names sharing a 14-byte prefix would MERGE into one registry value — a
 /// refusal counter reading someone else's number. Same guard
 /// `diag::FaultCounter` and `native_fence.rs` use.
-const RETIREMENT_COUNTER_NAMES: [&[u8]; 24] = [
+const RETIREMENT_COUNTER_NAMES: [&[u8]; 26] = [
     b"AcOk",
     b"AcMagic",
     b"AcHwa2Rej",
     b"AcHwa2Out",
     b"AcHvm1Rej",
+    b"AcHvm1Mem",
     b"AcHvm1Out",
     b"AcHoc1Rej",
     b"AcHoc1Out",
@@ -558,6 +613,7 @@ const RETIREMENT_COUNTER_NAMES: [&[u8]; 24] = [
     // truncation assert of its own, so this list is the only thing standing
     // between it and a silent merge with another value.
     b"OaNoRid",
+    b"PrNoRid",
     b"AcGenEpoch",
     b"AcOptLin",
     b"OaHwa2Rej",
@@ -620,6 +676,15 @@ static ALLOC_FLUSH_FAILURES: AtomicU32 = AtomicU32::new(0);
 /// wrong number, and `DiagLevel >= 1` flushes every call regardless.
 static ALLOC_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
     entries: &[
+        crate::diag::CounterEntry {
+            name: b"PrNoRid",
+            value: crate::diag::CounterRef::U32(&PRESENT_NO_ALLOC_INFO),
+            // A VALUE entry for [`OPEN_NO_RESOURCE_ID`]'s reason, one level
+            // further along: while the A3 gap is open this fires on EVERY
+            // present, so a failure entry would force a registry flush per
+            // frame.
+            failure: false,
+        },
         crate::diag::CounterEntry {
             name: b"OaNoRid",
             value: crate::diag::CounterRef::U32(&OPEN_NO_RESOURCE_ID),
@@ -698,12 +763,26 @@ struct OpenAllocationContext {
 ///
 /// ⚠ **NOTHING CONSTRUCTS THIS TODAY, and that is the A3 gap, not an oversight.**
 /// Its `resource_id` is a host resource id, HWA2 deliberately carries none
-/// (`protocol/src/wddm.rs:355-361`), and `DXGK_OPENALLOCATIONINFO::hAllocation`
+/// (the "No host resource token, `resid`, PID, …" paragraph on
+/// [`helios_protocol::HeliosWddmAllocationDescV2`]; the line range this cite
+/// used to carry is stale), and `DXGK_OPENALLOCATIONINFO::hAllocation`
 /// is dxgkrnl's runtime token rather than this driver's `AllocationContext*` —
 /// so `dxgkddi_open_allocation` has nothing to build one FROM and refuses to
-/// fabricate one (see that DDI's doc and the `OaNoRid` counter). The type,
+/// fabricate one (see that DDI's doc and the `OaNoRid` counter).
+///
+/// ⭐ CROSS-LANE, RESOLVED — round 3 of the Phase-2 review found the SYMPTOM
+/// site silent. Both of `ddi/display.rs`'s consumers refuse on every call while
+/// this is `None`, and they did so through the pre-existing last-value
+/// breadcrumb `PBFlip`/`PBCpy = 0xE1`, which in that file already means
+/// "dxgkrnl handed us a handle we could not resolve" — so the retirement's
+/// intended intermediate state was indistinguishable from a handle-lifetime bug,
+/// and a last-value write could not even say whether it fired once or per frame.
+/// The display sites now write `0xEA` and bump [`PRESENT_NO_ALLOC_INFO`]
+/// (`PrNoRid`), the symptom-side pair to [`OPEN_NO_RESOURCE_ID`]'s cause side.
+///
+/// The type,
 /// `present_alloc_info`, and `ddi/display.rs`'s exhaustive consumers are all
-/// retained unchanged so that mesa lane unit **A3** plus K6 re-point the
+/// otherwise retained unchanged so that mesa lane unit **A3** plus K6 re-point the
 /// producer and nothing else has to move.
 #[derive(Clone, Copy)]
 #[allow(dead_code)] // no producer until A3/K6; see the paragraph above.
@@ -910,13 +989,41 @@ fn linear_blob_size(pitch: u64, height: u64) -> u64 {
         .max(PAGE as u64)
 }
 
-/// Blobs whose guessed linear size differed from the Vulkan memory requirement
-/// the create path later learned — value is the count.
+/// Allocations **this driver authored** whose pre-create size estimate differed
+/// from the Vulkan memory requirement the create path later learned — value is
+/// the count. Read as a VALUE, never as a failure: nothing acts on it.
 ///
-/// The guess is currently AUTHORITATIVE for shadow/staging/GDI-staging surfaces
-/// (`create_one` passes `ap.size` straight to `allocate_memory_blob` and only
-/// back-fills `meta.venus_alloc_size`), so this measures how good it is without
-/// changing it.
+/// ⭐ RE-GRADED by round 3 of the Phase-2 review, and the old grading is kept
+/// below because reading the counter under it inverts what it means.
+///
+/// It used to read: *"the guess is currently AUTHORITATIVE for
+/// shadow/staging/GDI-staging surfaces (`create_one` passes `ap.size` straight
+/// to `allocate_memory_blob` and only back-fills `meta.venus_alloc_size`), so
+/// this measures how good it is without changing it."* Neither `ap` nor `meta`
+/// is code anywhere in this file any more — both records were retired with the
+/// pre-retirement ABI — and the increment site had been left unscoped, so it
+/// compared the host's **page-rounded** blob size against the **UMD's** resource
+/// extent. `allocate_memory_blob` does `round_up_page(size.max(4096))`, and
+/// `K4-CONTRACT.md` §1.3 rules that a UMD's `byte_size` is the RESOURCE's extent
+/// and deliberately need not equal the backing's. So the counter had degenerated
+/// into a census of allocations whose size is not a multiple of 4096 — most
+/// D3D11 and D3D12 textures — while §1.3 and this doc both still described it as
+/// a measurement of `NV_LINEAR_ROW_ALIGN`/`NV_LINEAR_TAIL_SLACK`. A reader would
+/// have taken a large value as proof those constants were catastrophically
+/// wrong.
+///
+/// What it measures now: for the two surfaces
+/// `dxgkddi_get_standard_allocation_driver_data` authors — the LINEAR scan-out
+/// primary and the `OPAQUE_OPTIMAL` GDI texture — the count of creates where the
+/// KMD's own pre-create estimate disagreed with the host's measured requirement.
+/// That is the question the constants are on trial for. The comparison is taken
+/// against the estimate as authored, before `create_one`'s Tier-1 adoption can
+/// overwrite it; comparing after the adoption would make it an identity on the
+/// LINEAR arm and the counter a constant zero.
+///
+/// ⚠ It does NOT distinguish the two arms, and their consequences differ: on the
+/// LINEAR arm the host's answer is adopted, on the OPTIMAL arm the estimate
+/// survives. Split it before using it to argue about either arm alone.
 pub(crate) static LINEAR_BLOB_SIZE_DIVERGENCE: AtomicU32 = AtomicU32::new(0);
 
 /// The three DXGI formats this driver ever names.
@@ -2529,19 +2636,32 @@ unsafe fn destroy_allocation_ctx(
 
 /// Where an allocation's backing size came from.
 ///
-/// `PagingAllocInfo::size` is `round_up_page(ap.size)`, and `ap.size` is
-/// ICD-supplied for ADOPTED allocations — it is overwritten with a
-/// host-authoritative value only in the KMD-created arms. `MapCpuHostAperture`'s
-/// whole-allocation refusal computes its page count from that size while
-/// `map_blob_at` maps whatever length the TRACKED BLOB size implies, a
-/// different source. The refusal therefore compares dxgkrnl's page count
-/// against a number of different provenance.
+/// ⭐ Doc re-derived against HEAD by round 3 of the Phase-2 review. It used to
+/// explain itself in terms of `ap.size` being "ICD-supplied for ADOPTED
+/// allocations", and of `bar_eligible` resting on "an incidental property" of
+/// `venus_memory_id != 0`. **Both describe the pre-retirement tree.** There are
+/// no adopted allocations — UMD-backing adoption is deleted with the VidMm
+/// tracker (`K4-CONTRACT.md` §6) and `tools/retirement-gates.sh` §8.6 proves it
+/// — and `ap` is not code anywhere in this file. That mattered: this predicate
+/// is the whole gate on the KMD overwriting its own `byte_size`
+/// (`create_one`'s Tier-1 adoption block), so a reviewer checking that gate was
+/// being sent to look for a mechanism that no longer exists.
 ///
-/// That cannot bite today only because `bar_eligible` required
-/// `venus_memory_id != 0`, which only the KMD-created arms set — i.e. the safety
-/// of an aperture size check rested on an incidental property of an unrelated
-/// field. Making the provenance a value lets the aperture path eventually
-/// REQUIRE `HostAuthoritative` in its signature.
+/// What the variants separate at HEAD: every backing `build_backing` creates is
+/// `HostAuthoritative` — the host allocated it and reported the size back — and
+/// `NonHostAuthoritative` marks the one allocation that has no venus object at
+/// all, the HOC1 outer-command pool (§10.6; `admit_hoc1` constructs it with
+/// `backing: None`, where the size is valid for VidMm accounting and for nothing
+/// else). So the type is not degenerate; it separates "a host backing exists and
+/// reported its extent" from "a VidMm-only allocation".
+///
+/// Why it is a type rather than a bool at the call site: it gives Tier 1's
+/// adoption and the aperture path a **typed precondition** instead of an
+/// implicit one, so the aperture path can eventually REQUIRE `HostAuthoritative`
+/// in its signature. `MapCpuHostAperture`'s whole-allocation refusal computes a
+/// page count from `PagingAllocInfo::size` while `map_blob_at` maps whatever the
+/// TRACKED BLOB size implies — two sources — and that comparison is only sound
+/// where the size came from the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackingSize {
     /// The host allocated it and reported the size back.
@@ -2583,9 +2703,11 @@ struct CreatedBacking {
     /// for a plain buffer.
     pitch: u32,
     plane_offset: u64,
-    /// The creator's exact `vkAllocateMemory` size + memory type. §10.3:355-361
-    /// keeps these OUT of HWA2 — they are host-side detail the KMD allocation
-    /// object owns and no descriptor may name.
+    /// The creator's exact `vkAllocateMemory` size + memory type. §10.3's "no
+    /// host resource token … or independently usable identity" rule — stated on
+    /// [`helios_protocol::HeliosWddmAllocationDescV2`], and on `memory_class` for
+    /// the memory-type half — keeps these OUT of HWA2: they are host-side detail
+    /// the KMD allocation object owns and no descriptor may name.
     venus_alloc_size: u64,
     memory_type_index: u32,
     /// The extent VidMm is charged, WITH its provenance. NOT always the created
@@ -3163,11 +3285,33 @@ unsafe fn admit_hwa2(
     let backing_class = classify_hwa2(&desc)?;
     let created = build_backing(passive, adapter, backing_class)?;
 
-    // MEASURE THE GUESS (R719). `desc.byte_size` is what the authoring side
-    // computed; `created.venus_alloc_size` is the exact Vulkan requirement the
-    // host reported. Counted, not acted on — this measures how far off the
-    // empirical constants are.
-    if created.venus_alloc_size != 0 && created.venus_alloc_size != desc.byte_size {
+    // The extent the AUTHOR claimed, captured before the adoption below can move
+    // it. Every "estimate versus host answer" measurement must compare against
+    // this rather than against `desc.byte_size`, which the KMD-authored LINEAR
+    // arm overwrites forty lines down — comparing after the overwrite makes the
+    // comparison an identity and the counter a constant.
+    let authored_byte_size = desc.byte_size;
+    let kmd_authored = desc.has_flag(HELIOS_HWA2_FLAG_STANDARD);
+
+    // MEASURE THE GUESS (R719). `authored_byte_size` is what the authoring side
+    // computed before any backing existed; `created.venus_alloc_size` is the
+    // exact Vulkan requirement the host reported. Counted, never acted on — this
+    // measures how far off the KMD's empirical pre-create estimate is.
+    //
+    // ⛔ SCOPED to `kmd_authored`, and round 3 of the Phase-2 review is why.
+    // Unscoped, it compared the host's PAGE-ROUNDED blob size against the UMD's
+    // resource extent — two quantities `K4-CONTRACT.md` §1.3 requires to differ,
+    // since `allocate_memory_blob` does `round_up_page(size.max(4096))`. It
+    // therefore fired on essentially every allocation whose extent is not a
+    // multiple of 4096, i.e. most D3D11 and D3D12 textures, and a reader
+    // following §1.3 would have read a page-alignment census as evidence that
+    // `NV_LINEAR_ROW_ALIGN`/`NV_LINEAR_TAIL_SLACK` were catastrophically wrong.
+    // The question the counter exists to answer — "how far is OUR estimate from
+    // the host's real requirement" — only has a meaning where WE authored the
+    // estimate. Both KMD-authored arms are in scope; what differs between them
+    // is what the code then DOES, which is the block below.
+    if kmd_authored && created.venus_alloc_size != 0 && created.venus_alloc_size != authored_byte_size
+    {
         LINEAR_BLOB_SIZE_DIVERGENCE.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -3200,17 +3344,54 @@ unsafe fn admit_hwa2(
     // `width*4`-derived stride shears the scan-out (1896*4 = 7584 against the
     // real 7680)". Publishing that same wrong stride inside the descriptor while
     // handing the runtime the right one would make the two disagree.
-    let kmd_authored = desc.has_flag(HELIOS_HWA2_FLAG_STANDARD);
-    if kmd_authored && created.blob_size.is_host_authoritative() {
+    //
+    // ⛔⛔ THE ADOPTION IS A PAIR — size AND plane record, or NEITHER. Round 3 of
+    // the Phase-2 review found this, from three independent lenses, and it is
+    // round 2's own repair overreaching by one arm.
+    //
+    // `HELIOS_HWA2_FLAG_STANDARD` is true for BOTH surfaces this DDI authors:
+    // the LINEAR scan-out primary and the OPAQUE_OPTIMAL GDI texture. The
+    // OPTIMAL arm returns `pitch: 0` by construction ("No row layout: this is a
+    // tiled image, not a byte buffer"), so gating only the plane half on
+    // `created.pitch != 0` moved `byte_size` to the host's TILED requirement
+    // while leaving `planes[0]` holding the author's 256-byte-aligned LINEAR
+    // estimate — two numbers with no defined relationship. Whenever the tiled
+    // requirement came in under `cross_adapter_pitch(width) * height`, which is
+    // the whole `width < 64` band and much else besides, the KMD published a
+    // descriptor that fails its OWN `validate_create_output` at
+    // `PlaneRangeExceedsByteSize`, bumped `AcHwa2Out` — documented "**Must read
+    // 0** — a nonzero value is a driver bug" — and refused a legal GDI-surface
+    // create. That is DWM's redirected-window texture.
+    //
+    // `K4-CONTRACT.md` §1.3 Tier 1 step 2 says the KMD overwrites `byte_size`
+    // "— and the plane record's offset/pitch —" with "the measured extent and
+    // Vulkan's real stride". Where there is no real stride to adopt there is no
+    // adoption: the pair cannot be completed, so it is not begun.
+    //
+    // ⇒ What the OPTIMAL arm keeps instead, and why that is correct rather than
+    // merely safe. Its descriptor is self-consistent as authored
+    // (`dxgkddi_get_standard_allocation_driver_data` sizes `byte_size` FROM the
+    // notional stride precisely so the plane fits), and §10.3 forbids a zero
+    // `row_pitch` on a declared plane, so "describe the tiling honestly" is not
+    // expressible in this record — the author says so at its own plane site: the
+    // runtime is told "no byte addressing exists" (`pitch` resolves to 0 below)
+    // and the descriptor carries the notional span, with `swizzle_class` telling
+    // a reader which interpretation applies. Nothing byte-addresses an
+    // `OPAQUE_OPTIMAL` allocation: `pitch` is 0, `bar_eligible` excludes the
+    // class outright, and VidMm is charged `max(backing, byte_size)` below. The
+    // backing IS the image's own `vkGetImageMemoryRequirements` answer, so it is
+    // exactly right for the image — this is not the Xid-31 undersize shape,
+    // which is a blob smaller than the requirement for the SAME layout.
+    let adopt_host_extent =
+        kmd_authored && created.blob_size.is_host_authoritative() && created.pitch != 0;
+    if adopt_host_extent {
         desc.byte_size = created.blob_size.bytes();
-        if created.pitch != 0 {
-            desc.planes[0].offset = created.plane_offset;
-            desc.planes[0].row_pitch = created.pitch;
-            desc.planes[0].slice_pitch = created
-                .pitch
-                .saturating_mul(desc.height)
-                .min(u32::try_from(desc.byte_size.saturating_sub(created.plane_offset)).unwrap_or(u32::MAX));
-        }
+        desc.planes[0].offset = created.plane_offset;
+        desc.planes[0].row_pitch = created.pitch;
+        desc.planes[0].slice_pitch = created
+            .pitch
+            .saturating_mul(desc.height)
+            .min(u32::try_from(desc.byte_size.saturating_sub(created.plane_offset)).unwrap_or(u32::MAX));
     }
 
     // ⛔ ACTED ON: an UNDERSIZED backing, for every descriptor whose extent this
@@ -3221,11 +3402,25 @@ unsafe fn admit_hwa2(
     // and then MMU-faults when the sampler reads the slack region (host Xid 31,
     // FAULT_PTE VIRT_READ — killed the IDD feed live 2026-07-04).
     //
-    // The KMD-authored arm above cannot reach this: it has just SET `byte_size`
-    // to the backing's own size, so the comparison is an identity. Leaving the
-    // guard unconditional would therefore be dead on that arm and fatal on it if
-    // the adoption above were ever removed — hence the explicit condition rather
-    // than relying on the identity.
+    // ⚠ The condition is `!kmd_authored`, which is Tier 2's own wording — "every
+    // descriptor this driver did NOT author" — and it is deliberately NOT
+    // `!adopt_host_extent`. The two now differ by exactly one arm, the
+    // KMD-authored OPAQUE_OPTIMAL GDI texture, and applying the guard there
+    // would re-introduce the defect the adoption gate above was narrowed to
+    // remove: it would compare the author's notional 256-aligned LINEAR estimate
+    // against the host's TILED requirement and refuse the create — the same
+    // failure as before, under a different counter. §10.3's plane bound is what
+    // makes an undersized backing dangerous, and on that arm no consumer
+    // byte-addresses the allocation at all (see the adoption block above).
+    //
+    // On the arms this DOES cover the reasoning is unchanged: a UMD's descriptor
+    // is echoed verbatim, so admitting a backing smaller than it publishes a
+    // descriptor whose planes run off the end of the real allocation.
+    //
+    // The adopting arm cannot reach this either: it has just SET `byte_size` to
+    // the backing's own size, so the comparison is an identity. Both exclusions
+    // are stated conditions rather than inferred from an identity, so removing
+    // the adoption above cannot silently turn this guard fatal.
     if !kmd_authored && created.venus_alloc_size != 0 && created.venus_alloc_size < desc.byte_size {
         bump(&CREATE_SIZE_REJECT, b"AcSize");
         crate::diag::record(0x0C01_00E7);
@@ -3348,8 +3543,41 @@ unsafe fn admit_hwa2(
     // the arms that set `venus_memory_id`. What that buys is that the aperture
     // path's safety rests on a stated fact rather than on an incidental property
     // of an unrelated field.
+    //
+    // ⛔ THE THIRD TERM IS LOAD-BEARING AND IS NEW: **BAR eligibility requires a
+    // MAPPABLE blob**, and since K4 that is no longer true by construction.
+    // Round 3 of the Phase-2 review found the disagreement.
+    //
+    // Before K4, `create_one` passed `mappable = true` unconditionally
+    // (`d1c820a:create_allocation.rs:2214`), so every host-authoritative blob
+    // could be mapped and this predicate did not need to care. `classify_hwa2`
+    // now derives `mappable` from `HELIOS_HWA2_FLAG_CPU_VISIBLE`, and
+    // `allocate_memory_blob` omits `VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE` when it
+    // is false. Meanwhile this predicate had no CPU-visibility term at all — so
+    // a D3D12 `D3D12_HEAP_TYPE_DEFAULT` resource (`CPUPageProperty ==
+    // CPU_NOT_AVAILABLE` ⇒ the flag clear ⇒ a non-mappable blob) was published
+    // BAR-eligible, `vidmm_placement` PREFERRED it into the BAR, and the paging
+    // engine then issued `VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB` against a blob the
+    // host was never asked to make mappable — `build_paging_buffer.rs`'s
+    // not-eligible arm says in terms that the eligible arm is the one that maps.
+    // `BAR_ERR_MAP` would then name the symptom and not the cause.
+    //
+    // The term also states the thing the placement is FOR: the BAR exposes CPU
+    // access through the CpuHostAperture, so an allocation with no CPU view has
+    // no reason to prefer it. The excluded population falls back to the aperture
+    // segment, which is where every other non-eligible allocation already goes.
+    //
+    // ⚠ The live D3D11 desktop cannot reach the broken arm today — the D3D11
+    // producer sets `HELIOS_HWA2_FLAG_CPU_VISIBLE` unconditionally — and `umd12`
+    // is behind the default-OFF `UmdD3D12` knob. This is fixed before its first
+    // boot rather than after, which is the point of reviewing before flipping.
+    //
+    // The `OPAQUE_OPTIMAL` exclusion is the same invariant from the other side:
+    // `scanout.rs` records that the OPTIMAL GDI image "is deliberately not
+    // mappable". Both terms now say one thing — BAR ⇒ mappable.
     let bar_eligible = created.blob_size.is_host_authoritative()
         && desc.swizzle_class != HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL
+        && desc.has_flag(HELIOS_HWA2_FLAG_CPU_VISIBLE)
         && bar_seg_id.is_some();
     let placement = vidmm_placement(
         bar_eligible,
@@ -3396,6 +3624,32 @@ unsafe fn admit_hwa2(
 
 /// Admit one HVM1 create-input record (§10.7), create its renderer-view backing,
 /// and stamp the three write-back fields.
+///
+/// # ⚠⚠ NO PRODUCER EXISTS — this function has never been called and cannot be
+///
+/// Measured 2026-08-10 (round 3 of the Phase-2 review, re-verified here):
+/// `HELIOS_HVM1_MAGIC` and `HeliosVenusMemoryAllocationV1` appear outside
+/// `protocol/` in exactly two places — this file, the consumer, and
+/// `kmd_logic`, the model. **No UMD, no ICD and no tool ever builds one.** The
+/// ICD's only mentions are prose comments in `vn_renderer_helios.c` saying the
+/// KMD *will* own the venus allocation after mesa unit **A3**; that unit is the
+/// producer, and it does not exist. `create_one`'s magic dispatch therefore
+/// never reaches here.
+///
+/// ⛔ **What that means for the counters, which is the trap:** `AcHvm1Rej`,
+/// `AcHvm1Mem`, `AcHvm1Out`, `AcSegRole1`..`AcSegRole4` and (for the sibling)
+/// `AcHoc1Rej`, `AcHoc1Out`, `AcSegHoc1` are all **absent** from the service
+/// key, and their absence is evidence of **nothing**. In particular it is not
+/// evidence that `HELIOS_SEGMENT_ID_HLM1` is in the reported segment table —
+/// the natural reading of "no role was refused for a missing segment". Nothing
+/// asked. `K4-CONTRACT.md` §4's amended ruling ("check the segment, do not
+/// hardcode the role") is written as though role-1..3 creates arrive and are
+/// refused; none can arrive.
+///
+/// This is METHOD.md §3 criterion 6's fourth state, and it is stronger than
+/// "implemented but never exercised": nothing in this package **can** exercise
+/// it. It is deliberate sequencing — the KMD consumer is authored before its
+/// producer so A3 has a contract to write against — not an oversight.
 ///
 /// # SAFETY
 /// As [`admit_hwa2`].
@@ -3479,17 +3733,65 @@ unsafe fn admit_hvm1(
         return Err(STATUS_NOT_SUPPORTED);
     }
 
+    // ⛔ THE KMD CANNOT ALLOCATE DEVICE-LOCAL MEMORY, so a role that asks for it
+    // is REFUSED rather than quietly given host-visible memory.
+    //
+    // Found by round 3 of the Phase-2 review as "a validated-then-discarded
+    // field". `Hvm1Role::VulkanDeviceLocal` (role 4) validates with
+    // `cache_policy = HELIOS_HVM1_CACHE_NOT_CPU_VISIBLE` and its
+    // `placement()` publishes `cpu_visible = false, lockable = false`; its own
+    // doc says "**Rejects map and has no CPU VA**". But `allocate_memory_blob`
+    // allocates from `self.memory_type_index` unconditionally — the ONE
+    // host-visible/host-coherent type chosen at bring-up — because a plain
+    // memory blob has no `vkGet*MemoryRequirements` query to feed
+    // `choose_device_local_memory_type`, which is the only way this client picks
+    // a type (the scan-out image path is the one caller that has such a query).
+    // So role 4 would have been backed by mappable host-visible memory while
+    // dxgkrnl was told the allocation has no CPU view: the record's `role`,
+    // `cache_policy` and `access` validated and then contradicted by the only
+    // code that acts on them. That is fake success, which CLAUDE.md rule 2
+    // forbids ahead of a loud failure.
+    //
+    // ⚠ This is a CAPABILITY statement, not a schedule claim, and it must not be
+    // confused with the segment check above: `K4-CONTRACT.md` §4 forbids
+    // hardcoding a role number as a stand-in for "K2 has not landed", and rightly
+    // — that check is `segment_is_reported`, evaluated at runtime. This one says
+    // something the code can state truthfully today and that no other lane's
+    // schedule can change: this venus client has no way to request a device-local
+    // Vulkan memory type. Giving it one is mesa unit A3 plus K6 work; when it
+    // lands, delete this arm rather than widening it.
+    //
+    // Costs nothing today — nothing in this package produces an HVM1 record at
+    // all (see this function's banner) — which is precisely why it is written
+    // before the first producer exists rather than after.
+    let placement_rules = role.placement();
+    if !placement_rules.cpu_visible {
+        // `to_u32`, not `as u32`: the counter's low word must be the WIRE role
+        // number a reader can look up in §10.7, not this enum's declaration
+        // order, which is one lower.
+        bump_with_code(
+            &CREATE_HVM1_MEMORY_CLASS_REFUSED,
+            b"AcHvm1Mem",
+            role.to_u32(),
+        );
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+
     // §10.7:1936-1940 — one ordinary, nonprimary, unshared WDDM allocation and
     // one KMD-owned renderer resource descriptor of the same page-rounded size.
-    // Roles 1-3 are CPU-visible and Lock2-mappable, so the blob is MAPPABLE; it
-    // is never SHAREABLE, because §10.7:1971-1972 requires every sharing flag
-    // zero.
+    // The blob is MAPPABLE exactly when the role's own placement says the
+    // allocation has a CPU view — derived, not asserted, so the blob flag and
+    // the WDDM `CpuVisible` flag can never disagree. (With the refusal above
+    // that is every admitted role, i.e. 1-3; it is written as a derivation so
+    // that widening the refusal cannot silently leave a non-CPU-visible role
+    // with a `USE_MAPPABLE` blob.) It is never SHAREABLE, because
+    // §10.7:1971-1972 requires every sharing flag zero.
     let created = build_backing(
         passive,
         adapter,
         Hwa2Backing::LinearMemory {
             bytes: record.byte_size,
-            mappable: true,
+            mappable: placement_rules.cpu_visible,
             shareable: false,
         },
     )?;
@@ -3555,6 +3857,17 @@ unsafe fn admit_hvm1(
 }
 
 /// Admit the one HOC1 outer-command pool for a D3D12 device (§10.6).
+///
+/// # ⚠⚠ NO PRODUCER EXISTS — as [`admit_hvm1`], and for the same measurement
+///
+/// `HELIOS_HOC1_MAGIC` and `HeliosOuterCommandAllocationV1` appear outside
+/// `protocol/` only in this file and in `kmd_logic`. `helios_umd12.dll` does not
+/// build one: its D3D12 submit path does not use the HOB1/HOS1 GPUVA pool at
+/// all — see `FINDINGS.md` F5's "option zero", where vkd3d translates to Vulkan
+/// and needs no D3D12 GPUVA semantics *from the KMD*, and the D3D12 lane reached
+/// device + queues + command lists + DXIL PSOs on the existing submit path.
+/// So `AcHoc1Rej`, `AcHoc1Out` and `AcSegHoc1` are absent and their absence
+/// attributes nothing. Read [`admit_hvm1`]'s banner for the full argument.
 ///
 /// # SAFETY
 /// As [`admit_hwa2`].
@@ -3882,12 +4195,25 @@ unsafe fn create_one(
         // change. §10.7:2002-2003 requires it on every HVM1 role and
         // §18.1:4751-4753 gates it. It is set only where the doc requires it —
         // `vidmm_placement` leaves it false — so the proven D3D11 surface is
-        // byte-identical and the new bit rides only on the HVM1 path, which
-        // `admit_hvm1`'s segment check now makes unreachable BY REFUSAL (not
-        // merely by dxgkrnl declining it downstream) for as long as the reported
-        // table lacks the role's preferred segment. The A/B disable is
-        // `hvm1_placement`'s `explicit_residency_notification` field
-        // (CLAUDE.md rule 8: the opposite value stays reachable).
+        // byte-identical and the new bit rides only on the HVM1 path.
+        //
+        // ⛔ CORRECTED after round 3: this comment used to attribute the bit's
+        // unreachability to `admit_hvm1`'s segment check, "for as long as the
+        // reported table lacks the role's preferred segment" — a condition that
+        // would LIFT, and which implies HVM1 creates arrive and are refused.
+        // They do not arrive at all: **nothing in this package produces an HVM1
+        // record**, so `admit_hvm1` has never been called (its banner has the
+        // measurement). Two consequences a reader needs: the bit is unreachable
+        // for a reason no other lane's schedule changes, and it stays unreachable
+        // after K2 lands — the producer is mesa unit A3, not K2. And the segment
+        // check is *additionally* wrong to lean on here: measured at HEAD,
+        // `HELIOS_SEGMENT_ID_HLM1` is the constant 2 and `SegmentTable::iter`
+        // numbers positionally from 1, so the production `[Aperture, Bar]` table
+        // **already reports id 2** and `segment_is_reported` returns true.
+        //
+        // The A/B disable is `hvm1_placement`'s
+        // `explicit_residency_notification` field (CLAUDE.md rule 8: the
+        // opposite value stays reachable).
         if placement.explicit_residency_notification {
             info.__bindgen_anon_4
                 .FlagsWddm2
@@ -3919,6 +4245,17 @@ unsafe fn create_one(
         // whole retirement). That is correct, not a bug to "fix" — do not
         // conclude from an unchanged `PgUn`/residency trace that the writes are
         // not happening.
+        //
+        // ⛔ AND THERE IS A SECOND, STRONGER REASON, added after round 3, because
+        // the paragraph above names only a condition that will lift and so reads
+        // as "these go live at the SURFACE flip". They do not. Both bits ride on
+        // `placement`, which on this path is `hvm1_placement`'s — and **nothing
+        // in this package produces an HVM1 record**, so `admit_hvm1` has never
+        // run (see its banner). Flipping `SURFACE` alone will not exercise these
+        // writes; the producer is mesa unit A3. `K4-CONTRACT.md` §8 obligation 8
+        // says "treat as unexercised until measured on the target" — it is
+        // stronger than that: it cannot be measured on the target at all until
+        // A3 lands, and that is what the acceptance table must say.
         if placement.disable_partial_residency {
             info.Flags2
                 .__bindgen_anon_1
@@ -4593,11 +4930,33 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         // exact memory requirement before reporting Size to VidMm. It may not
         // any more — the descriptor is echoed verbatim, and correcting a field
         // would make it disagree with the resource the creator believes it made
-        // (`K4-CONTRACT.md` §1.1). The estimate therefore survives into the
-        // published descriptor; the create path validates that the real backing
-        // is at least this large (refusing otherwise, `AcSize`), charges VidMm
-        // the larger of the two, and keeps the exact host size on the KMD
-        // allocation object where §10.3:355-361 says host detail belongs.
+        // (`K4-CONTRACT.md` §1.1).
+        //
+        // ⭐ Re-derived after round 3 of the Phase-2 review, because two of the
+        // three clauses that used to follow this sentence had gone false and
+        // the third named the wrong instrument. What is true at HEAD, for THIS
+        // arm — the `OPAQUE_OPTIMAL` GDI texture — is:
+        //
+        //   * the estimate DOES survive into the published descriptor. §1.3
+        //     Tier 1's "adopt the host's measured extent" is a PAIR with the
+        //     plane record and is applied only where a real Vulkan stride
+        //     exists to adopt; this arm reports `pitch: 0`, so nothing moves.
+        //     Round 2 briefly moved `byte_size` here without the plane record
+        //     and made the descriptor fail its own plane-range check;
+        //     `create_one`'s adoption block carries that argument in full.
+        //   * `AcSize` does NOT validate it. The undersize guard is Tier 2's,
+        //     scoped to descriptors this driver did not author — comparing this
+        //     LINEAR notional span against a TILED requirement would refuse
+        //     legal creates, which is exactly the defect just described.
+        //   * VidMm IS charged the larger of the two, which is the direction
+        //     that matters for the aperture page count.
+        //   * the exact host size stays on the KMD allocation object, where
+        //     `protocol/src/wddm.rs`'s `HeliosWddmAllocationDescV2` doc (the
+        //     "No host resource token, `resid`, PID, …" paragraph — cite the
+        //     symbol, the line has moved twice) says host detail belongs.
+        //
+        // The divergence between this estimate and the host's answer is counted
+        // by [`LINEAR_BLOB_SIZE_DIVERGENCE`] and acted on by nothing.
         round_up_page(
             (plane_pitch as u64)
                 .saturating_mul(height as u64)

@@ -1387,10 +1387,17 @@ const COUNTER_NAMES: [&[u8]; 21] = [
 /// PASSIVE_LEVEL only — `diag::record_named_bytes` is a synchronous
 /// `RtlWriteRegistryValue`.
 ///
-/// CROSS-LANE: `device.rs::dxgkddi_destroy_device` already calls the sibling
-/// `diag_dump_*_atomics` helpers and should call this one too. Until it does,
-/// [`free_global`] publishes when the last fence on the adapter goes away, which
-/// is bounded (one burst per population drain) rather than per operation.
+/// Two publishers, and the FIRST one is the load-bearing one:
+///
+/// 1. `device.rs::dxgkddi_destroy_device` calls this unconditionally, beside the
+///    sibling `diag_dump_{gpummu,engine,present}_atomics` helpers. This is the
+///    only publisher that can run while the surface is `Wddm2_1GpuMmu`, because
+///    dxgkrnl invokes no native-fence callback on a 2.1 adapter, so no fence is
+///    ever created and (2) never fires. That call is what establishes the
+///    all-zero pre-flip baseline the post-flip numbers are read against.
+/// 2. [`free_global`] publishes when the last fence on the adapter goes away.
+///    Bounded (one burst per population drain) rather than per operation, and
+///    reachable only once the surface actually carries native fences.
 pub fn diag_dump_native_fence_atomics() {
     let values: [u32; 21] = [
         NF_CREATE_OK.load(Ordering::Relaxed),

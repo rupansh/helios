@@ -1465,11 +1465,14 @@ fn whole_heap_allocation_info(
 /// ⚠ **This function used to target the D3D11 DDI bind word**, because the retired
 /// `HeliosWddmAllocMeta::bind_flags`'s reader was the D3D11 driver's
 /// `pfnOpenResource` and that field carried raw `D3D10DDI_BIND_*`. HWA2 offset 72 is
-/// a **third, deliberately non-coincident** vocabulary — `HELIOS_HWA2_BIND_*`,
-/// `protocol/src/wddm.rs:230-262`, whose own comment says the retired trailer's raw
-/// D3D11 word "is not what this field carries". So targeting the D3D11 DDI word here
-/// would now be a *wrong-vocabulary* bug of exactly the class the old comment
-/// described, one enum further along.
+/// a **third, deliberately non-coincident** vocabulary — the `HELIOS_HWA2_BIND_*`
+/// constants in `protocol/src/wddm.rs` (grep the symbol; that file churns and a line
+/// range here goes stale). Their own comment states the design: *"The bit assignment
+/// below is therefore chosen to be NON-COINCIDENT with both D3D11 and D3D12:
+/// `SHADER_RESOURCE` is 0x1 here and 0x8 at the D3D11 DDI, `RENDER_TARGET` is 0x2 here
+/// and 0x1 in the D3D12 DDI."* So targeting the D3D11 DDI word here would now be a
+/// *wrong-vocabulary* bug of exactly the class the old comment described, one enum
+/// further along.
 ///
 /// The failure mode the old comment recorded is worth keeping, because it is the
 /// reason this is a `match` and never a cast: a swapchain back buffer arrives with
@@ -4720,8 +4723,44 @@ struct L4Refusals {
     /// claiming one `venus_res_id` — and it died with the id: `identity12` holds no
     /// host resource id and §10.3 forbids it keeping one, so there is nothing left to
     /// collide. It remains in its historical position so refusal-summary field order
-    /// does not change. The property it protected is settled in the kernel's own
-    /// allocation objects plus mesa unit A3.
+    /// does not change.
+    ///
+    /// ⚠⚠ **THE SUCCESSOR DOES NOT EXIST YET, and it is recorded here rather than
+    /// asserted away.** `identity12`'s module doc says the property "is now settled in
+    /// the kernel's own allocation objects plus mesa unit **A3**". Measured at HEAD,
+    /// the A3 half is future work and the kernel half is not there at all:
+    ///
+    /// * `kmd_render`'s `AllocationContext::resource_id` is the resid's sole legal
+    ///   home, but those contexts are per-`hAllocation` boxes with no adapter-wide
+    ///   index, and the allocation generation is explicitly *"never an identity lookup
+    ///   key"* (`adapter/allocation_object.rs`). Nothing scans for a duplicate.
+    /// * The one adapter-wide resid index that does exist — `create_allocation.rs`'s
+    ///   `SCANOUT_ALLOCS` — does **not** detect duplicates.
+    ///   `register_scanout_allocation` CASes the first *free* slot without checking
+    ///   whether the resid is already registered, so two allocations sharing one resid
+    ///   take two slots;
+    ///   `scanout_allocation_for_resource` returns whichever comes first in array
+    ///   order; and `unregister_scanout_allocation` clears the first match, which can
+    ///   be the *other* allocation's slot.
+    ///
+    /// ⭐ **Unreachable today**, which is why this is a recorded gap and not a live
+    /// defect: the KMD mints one venus resource per allocation (`blob.res_id`, from
+    /// its own create), so resids are unique per allocation by construction, and this
+    /// driver's `IdentityOffsetNonZero` refuses the suballocated committed resource
+    /// that is the usual route to a shared id. ⛔ **It becomes reachable exactly when
+    /// mesa unit A3 lands** and the resid starts arriving from
+    /// `HeliosNativeRenderPatch` instead of a KMD-local create. At that point the
+    /// failure is worse than the lost surface the deleted detector caught: a destroy
+    /// can clear the *surviving* allocation's slot and leave a freed
+    /// `AllocationContext*` published under the id for `DxgkDdiPresent` to read.
+    /// `destroy_allocation_ctx`'s comment — *"after this no Present can resolve this
+    /// resource id to a handle whose Box is about to be dropped"* — is a claim that
+    /// holds only while resids are unique.
+    ///
+    /// ⇒ **CROSS-LANE**, against the A3 unit and `ddi/create_allocation.rs`: A3 must
+    /// not land without a duplicate-resid check in `register_scanout_allocation` and a
+    /// named counter for it. This slot cannot be that counter — it is a UMD counter
+    /// and the collision is no longer visible from user mode at all.
     identity_res_id_shared: RefusalCounter,
     /// A committed allocation was recorded with `ctx_id == 0`, because the
     /// instance-scoped venus context id was unavailable. ⚠ **Not a refusal and not a

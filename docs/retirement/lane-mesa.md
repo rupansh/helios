@@ -1,5 +1,18 @@
 # Lane: Mesa/ICD — record-only submit, direct dispatch, HTS1 session, native KMT lane, and the new WSI layer
 
+⛔ **Doc line numbers here were swept +10 on 2026-08-10 and mechanically
+verified.** `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` is **5973 lines** (`wc -l`)
+— 5918 when this brief was written, 5928 after commit `c17f17c` inserted a
+ten-line banner at `:11-20`, and 5973 after `afebe66` **appended** the SUPERSEDED
+CLAIMS INDEX at `:5932`. Only the banner moved anything: it shifted every body
+line after 8 by +10, so every citation written here before 2026-08-10 was 10 too
+low. All of them have now been shifted, and the sweep was checked by requiring
+each `§N.M`-anchored cite to land inside §N.M's own heading-to-heading range —
+not by adding 10 on faith. ⚠ **Source-file line numbers were deliberately NOT touched** — `foo.rs:123`, `virtio-gpu-virgl.c` function ranges and the like are cites into the tree, not into the doc, and the banner never moved them. If a number here is not a doc line, it was correct before this sweep and is correct now. ⚠ The one row already corrected on 2026-08-10 (the
+`HWA2 (168 B)` wire-record row in §2) was **not** shifted again. Re-grep the
+cited text before relying on any number below, and read the SUPERSEDED CLAIMS
+INDEX at `:5932` before treating any doc line as a requirement.
+
 Reconnaissance brief. No implementation code was written. Every line/symbol
 reference below was re-verified against the working tree at
 `icd/mesa` commit `8559b66299a8f91fcde30edfdd23310195cc7ca6` — the same commit
@@ -24,19 +37,19 @@ independently implementable.
 
 | Section | Doc lines | What it contributes to this lane |
 |---|---|---|
-| §2 executive decision | 112–358 | *Why*: items 1, 6, 7, 8, 9 are this lane. Item 6 is the whole native-KMT carrier; item 7 is the whole WSI layer; item 8 is the acyclicity rule that forbids any ICD→DXGI edge; item 9 is HTS1 pre-queue control. The responsibility table (292–307) names the replacement owner for every retired mechanism. |
-| §3 hard constraints | 359–396 | The bounding non-goals: no Escape, no global registry/polling/PID keys, **no ICD call to DXGI/D3D11/D3D12**, no CPU wait on GPU completion in steady state, no cross-adapter inference, no version/feature fallback. |
-| §10.3 resource identity | 1004–1179 | The `HeliosWddmAllocationDescV2` (HWA2, 168 bytes) create-time descriptor this lane must *read* on import; the "Native Vulkan WSI" subsection (1111–1178) is the exact canonical import chain: `VkExternalMemoryImageCreateInfo{D3D12_RESOURCE_BIT}` → `vkGetMemoryWin32HandlePropertiesKHR` → `VkImportMemoryWin32HandleInfoKHR` + `VkMemoryDedicatedAllocateInfo` → C57 `D3DKMTQueryResourceInfoFromNtHandle` + `D3DKMTOpenResourceFromNtHandle`; plus the Ready/Release `D3D12_FENCE_BIT` timeline-semaphore import chain (1170–1178). |
-| §10.4 record-only translation | 1180–1420 | HTS1 session creation per `vn_instance`; the 72-byte HQA1 create-context packet (the ICD *produces* the endpoint descriptor, the outer UMD sends the packet); the C60 three-way control classification (pure control / outer-allocation-backed / GPU-dependent, 1335–1366); the five-point record-only submit contract (1368–1396); `HELIOS_TRANSLATOR_SUBMISSION_MODE_RECORD_ONLY`; the rejection rule for any queue entry point without a live outer scope (1387–1396). |
-| §10.7 native KMT + WSI layer | 1675–2700 | The single largest source. Sub-parts: normal-ICD KMT carrier (1677–1748, incl. the 32-byte HVC1 table at 1698–1707 and the legacy `DXGK_CONTEXTINFO` minima at 1725–1740); HNR2 (1749–1840, header table 1755–1777, 24-byte use / 16-byte patch records 1779–1783, fragmentation arithmetic 1810–1819); Patch/SubmitCommand expectations (1856–1896); the one unshared monitored progress fence per context (1898–1924); HVM1 (1926–1962, table 1939–1952); segment/HLM1/HPM1 admission (1964–2011); reply pool + Lock2 rules (2027–2050); the two exposed memory types (2052–2068); HVR1 reply/snapshot storage (2125–2168); teardown (2170–2175). Then the WSI layer: virtual surface ownership (2196–2223), extension discovery/dispatch closure (2225–2262), `vkCreateDevice` interception + helper-queue construction (2264–2301), singleton device-group + swapchain-memory alias contract (2303–2435), the normative copy-only surface profile table (2437–2477), D3D12 object creation + canonical import + C57 carrier (2479–2551), fence import (2553–2569), presentable-image tagging (2571–2578), sharing mode / helper queue (2580–2596), Acquire (2598–2633), Present (2635–2699). |
-| §11.3 native Vulkan sequence | 2970–3015 | The end-to-end mermaid ordering for allocation → paging → Lock2 → HNR2 BEGIN/COMMIT → Patch → SUBMIT_3D → reply decode. Use it as the acceptance ordering for sub-lane (a). |
-| §11.4 native Vulkan WSI sequence | 3016–3040 | The Acquire/Present arrow order for sub-lane (b). |
-| §12.2 native-WSI ICD-side fence contract | 3187–3239 | Exact `D3DKMT_OPENNATIVEFENCEFROMNTHANDLE` field rules (`EngineAffinity=1u<<0`, `Shared=1`+`NtSecuritySharing=1` only, 64-byte HNF1 private data, acceptance conditions), and the wait/signal placement rule: `D3DKMTWaitForSynchronizationObjectFromGpu` before the acquire barrier, `D3DKMTSignalSynchronizationObjectFromGpu` (**not** `FromGpu2`) after the release barrier, both on the submitting ICD context. |
-| §13 no-recursion proof | 3328–3406 | §13.1 allowed call graph, §13.2 the enforced-dispatch bullet list (incl. the static import-table test that must reject `dxgi.dll`/`d3d11.dll`/`d3d12.dll` from the ICD DLL), §13.3 the lock/reentrancy rules that constrain every mutex this lane adds. |
-| §17.3 Mesa/ICD manifest | 3878–4073 | The file manifest and the "Required result" prose. This is the checklist. |
-| §18.3 WSI gates | 4965–5066 | Acceptance criteria for sub-lane (b) (and the two fence bullets at 5018–5024 for sub-lane (a)). |
-| Appendix A.1/A.2/A.3/A.4 | 5640–5678, 5679–5734, 5735–5752, 5753–5778 | Current-state dependency inventory. The rows that name this lane are A.1 (`wsi_helios_present_sync.*`, `wsi_common.c:2647-2665`, `wsi_common_private.h:288-299`, `wsi_common_win32.cpp:998-1054,1591-1609,2100-2147`, `meson.build:30-31`, `vn_queue.c:4356-4425`+`vn_renderer.h:245-308`+`vn_renderer_helios.c:4708-4865`), A.2 (`vn_renderer_helios.c:3582-3949`, `:708-760`, `vn_wsi.c:133-162,239-242`, `wsi_common.c:2996-3080`+`vn_image.c:559-622,717-760`, `wsi_common_win32.cpp:229-266,268-352,850-887,1940-2057,2233-2255`, `vn_queue.c:1688-1795,3540-3546`, `vn_renderer_helios.c:1520-1611,2069-2209`), A.3 (`vn_renderer_helios.c:1399-1464,1663-1689,1780-2001,2271-2309,2482-2551` and `:3991,4163,4200,4243-4266,4314-4496,4630,5040-5042,5171-5184`), A.4 (`vn_renderer_helios.c:95-106,531-538,1333-1397,5076-5079,5235`, `vn_renderer.h:245-308,11-29,83-104,175-179`, `vn_renderer_util.h:21-35`, `vn_ring.c:298-344,701-730,887-958`, `vn_instance.c:177-184,309-342`, `vn_device.c:83-104,573-582,721-734`, `vn_buffer.c:262-300`, `vn_image.c:386-407`, `vn_pipeline.c:685-687,1801-1817`, `vn_query_pool.c:201-260`, `vn_queue.c:1494-1504,2796-2879`, `vn_renderer_helios.c:2005-2023,2120-2145`). |
-| §17.7 (read-only, other lane) | 4496–4608 | Only for the cross-lane facts: packaging installs "the matching layer DLL/JSON" (4605–4608); QEMU keeps one `VkInstance` per HTS1 session and ring-0 semantics (4584–4603). |
+| §2 executive decision | 122–368 | *Why*: items 1, 6, 7, 8, 9 are this lane. Item 6 is the whole native-KMT carrier; item 7 is the whole WSI layer; item 8 is the acyclicity rule that forbids any ICD→DXGI edge; item 9 is HTS1 pre-queue control. The responsibility table (302–317) names the replacement owner for every retired mechanism. |
+| §3 hard constraints | 369–406 | The bounding non-goals: no Escape, no global registry/polling/PID keys, **no ICD call to DXGI/D3D11/D3D12**, no CPU wait on GPU completion in steady state, no cross-adapter inference, no version/feature fallback. |
+| §10.3 resource identity | 1014–1189 | The `HeliosWddmAllocationDescV2` (HWA2, 168 bytes) create-time descriptor this lane must *read* on import; the "Native Vulkan WSI" subsection (1121–1188) is the exact canonical import chain: `VkExternalMemoryImageCreateInfo{D3D12_RESOURCE_BIT}` → `vkGetMemoryWin32HandlePropertiesKHR` → `VkImportMemoryWin32HandleInfoKHR` + `VkMemoryDedicatedAllocateInfo` → C57 `D3DKMTQueryResourceInfoFromNtHandle` + `D3DKMTOpenResourceFromNtHandle`; plus the Ready/Release `D3D12_FENCE_BIT` timeline-semaphore import chain (1180–1188). |
+| §10.4 record-only translation | 1190–1430 | HTS1 session creation per `vn_instance`; the 72-byte HQA1 create-context packet (the ICD *produces* the endpoint descriptor, the outer UMD sends the packet); the C60 three-way control classification (pure control / outer-allocation-backed / GPU-dependent, 1345–1376); the five-point record-only submit contract (1378–1406); `HELIOS_TRANSLATOR_SUBMISSION_MODE_RECORD_ONLY`; the rejection rule for any queue entry point without a live outer scope (1397–1406). |
+| §10.7 native KMT + WSI layer | 1685–2710 | The single largest source. Sub-parts: normal-ICD KMT carrier (1687–1758, incl. the 32-byte HVC1 table at 1708–1717 and the legacy `DXGK_CONTEXTINFO` minima at 1735–1750); HNR2 (1759–1850, header table 1765–1787, 24-byte use / 16-byte patch records 1789–1793, fragmentation arithmetic 1820–1829); Patch/SubmitCommand expectations (1866–1906); the one unshared monitored progress fence per context (1908–1934); HVM1 (1936–1972, table 1949–1962); segment/HLM1/HPM1 admission (1974–2021); reply pool + Lock2 rules (2037–2060); the two exposed memory types (2062–2078); HVR1 reply/snapshot storage (2135–2178); teardown (2180–2185). Then the WSI layer: virtual surface ownership (2206–2233), extension discovery/dispatch closure (2235–2272), `vkCreateDevice` interception + helper-queue construction (2274–2311), singleton device-group + swapchain-memory alias contract (2313–2445), the normative copy-only surface profile table (2447–2487), D3D12 object creation + canonical import + C57 carrier (2489–2561), fence import (2563–2579), presentable-image tagging (2581–2588), sharing mode / helper queue (2590–2606), Acquire (2608–2643), Present (2645–2709). |
+| §11.3 native Vulkan sequence | 2980–3025 | The end-to-end mermaid ordering for allocation → paging → Lock2 → HNR2 BEGIN/COMMIT → Patch → SUBMIT_3D → reply decode. Use it as the acceptance ordering for sub-lane (a). |
+| §11.4 native Vulkan WSI sequence | 3026–3050 | The Acquire/Present arrow order for sub-lane (b). |
+| §12.2 native-WSI ICD-side fence contract | 3197–3249 | Exact `D3DKMT_OPENNATIVEFENCEFROMNTHANDLE` field rules (`EngineAffinity=1u<<0`, `Shared=1`+`NtSecuritySharing=1` only, 64-byte HNF1 private data, acceptance conditions), and the wait/signal placement rule: `D3DKMTWaitForSynchronizationObjectFromGpu` before the acquire barrier, `D3DKMTSignalSynchronizationObjectFromGpu` (**not** `FromGpu2`) after the release barrier, both on the submitting ICD context. |
+| §13 no-recursion proof | 3338–3416 | §13.1 allowed call graph, §13.2 the enforced-dispatch bullet list (incl. the static import-table test that must reject `dxgi.dll`/`d3d11.dll`/`d3d12.dll` from the ICD DLL), §13.3 the lock/reentrancy rules that constrain every mutex this lane adds. |
+| §17.3 Mesa/ICD manifest | 3888–4083 | The file manifest and the "Required result" prose. This is the checklist. |
+| §18.3 WSI gates | 4975–5076 | Acceptance criteria for sub-lane (b) (and the two fence bullets at 5028–5034 for sub-lane (a)). |
+| Appendix A.1/A.2/A.3/A.4 | 5650–5688, 5689–5744, 5745–5762, 5763–5788 | Current-state dependency inventory. The rows that name this lane are A.1 (`wsi_helios_present_sync.*`, `wsi_common.c:2647-2665`, `wsi_common_private.h:288-299`, `wsi_common_win32.cpp:998-1054,1591-1609,2100-2147`, `meson.build:30-31`, `vn_queue.c:4356-4425`+`vn_renderer.h:245-308`+`vn_renderer_helios.c:4708-4865`), A.2 (`vn_renderer_helios.c:3582-3949`, `:708-760`, `vn_wsi.c:133-162,239-242`, `wsi_common.c:2996-3080`+`vn_image.c:559-622,717-760`, `wsi_common_win32.cpp:229-266,268-352,850-887,1940-2057,2233-2255`, `vn_queue.c:1688-1795,3540-3546`, `vn_renderer_helios.c:1520-1611,2069-2209`), A.3 (`vn_renderer_helios.c:1399-1464,1663-1689,1780-2001,2271-2309,2482-2551` and `:3991,4163,4200,4243-4266,4314-4496,4630,5040-5042,5171-5184`), A.4 (`vn_renderer_helios.c:95-106,531-538,1333-1397,5076-5079,5235`, `vn_renderer.h:245-308,11-29,83-104,175-179`, `vn_renderer_util.h:21-35`, `vn_ring.c:298-344,701-730,887-958`, `vn_instance.c:177-184,309-342`, `vn_device.c:83-104,573-582,721-734`, `vn_buffer.c:262-300`, `vn_image.c:386-407`, `vn_pipeline.c:685-687,1801-1817`, `vn_query_pool.c:201-260`, `vn_queue.c:1494-1504,2796-2879`, `vn_renderer_helios.c:2005-2023,2120-2145`). |
+| §17.7 (read-only, other lane) | 4506–4618 | Only for the cross-lane facts: packaging installs "the matching layer DLL/JSON" (4615–4618); QEMU keeps one `VkInstance` per HTS1 session and ring-0 semantics (4594–4613). |
 
 ---
 
@@ -57,7 +70,7 @@ misplaced. The four "Add" files under `src/virtio/vulkan/` and the four under
 | `wsi_common.c` | 3786 | Upstream WSI core, **151 Helios-modified lines**: perf counters (`:55-130`), insurance-blit knob (`:144`), async software-present worker (`:194-336`, `helios_async` queue), vehicle-serving gate (`:224-225`), and the vehicle producer timeline signal (`:2647-2665`). Upstream singleton device-group returns at `:2996-3015` and `wsi_common_create_swapchain_image` at `:3017-3074`. | **MODIFY** — delete every `helios_*` addition (perf, insurance blit, async worker, `helios_present_order` signal, `helios_vehicle_serving`). `:2996-3015` and `:3017-3074` are the *precedent* the layer re-implements; leave upstream behavior for non-Windows builds untouched. |
 | `wsi_common.h` | 369 | 3 Helios lines: `wsi_device.win32.get_helios_resource_identity` fn ptr (`:152-157`) and the vehicle's named-release timeline import (`:265`). | **MODIFY** — delete both. |
 | `wsi_common_private.h` | 697 | 20 Helios lines: `wsi_image_info::helios_image_export_handle_types` (`:122-127`), `wsi_image::helios_present_value` (`:186-189`), `wsi_helios_present_job`/`wsi_helios_async_present_enabled`/`wsi_helios_vehicle_enabled`/`wsi_helios_present_worker_finish` (`:229-253`), `wsi_swapchain::helios_async` (`:267-286`), `::helios_present_order` (`:288-299`), `::helios_vehicle_serving` (`:301-310`). | **MODIFY** — delete all of it. |
-| `wsi_common_win32.cpp` | 2702 | **193 Helios lines.** The whole D3D11/DXGI/DComp vehicle: counters (`:87-115`), design comment (`:230-268`), UMD export typedefs (`:268-275`), vehicle state (`:277-460`), process-wide runtime + `LoadLibraryA("d3d11.dll"/"dxgi.dll"/"dcomp.dll")` (`:470-540`), per-HWND dcomp target cache (`:541-616`), UMD export resolution (`:711-735`), vehicle build/thread/start/finish (`:770-1107`), plus the ordinary Win32 WSI backend (surface `:1109-1437`, DXGI image path `:1439-1537`, GDI/DIB image path `:1539-1612`, acquire `:1746-1882`, present `:1884-2372`, swapchain create `:2374-2633`, init/finish `:2635-2701`). | **REWRITE** (near-total). §2.8 line 261 is explicit: "The current `wsi_common_win32.cpp` D3D11/DComp vehicle is **deleted, not adapted**." §10.7 line 2199 additionally stops the ICD advertising Win32 surface/swapchain at all. Conservative fail-closed result: the file survives as a compile unit whose `wsi_win32_init_wsi` registers **no** surface/swapchain implementation and whose every entry point returns the documented unsupported result; the vehicle, GDI/DIB blit path, DXGI path, HPS publish/release and the three UMD export bindings are gone. See ambiguity **A6**. |
+| `wsi_common_win32.cpp` | 2702 | **193 Helios lines.** The whole D3D11/DXGI/DComp vehicle: counters (`:87-115`), design comment (`:230-268`), UMD export typedefs (`:268-275`), vehicle state (`:277-460`), process-wide runtime + `LoadLibraryA("d3d11.dll"/"dxgi.dll"/"dcomp.dll")` (`:470-540`), per-HWND dcomp target cache (`:541-616`), UMD export resolution (`:711-735`), vehicle build/thread/start/finish (`:770-1107`), plus the ordinary Win32 WSI backend (surface `:1109-1437`, DXGI image path `:1439-1537`, GDI/DIB image path `:1539-1612`, acquire `:1746-1882`, present `:1884-2372`, swapchain create `:2374-2633`, init/finish `:2635-2701`). | **REWRITE** (near-total). §2.8 line 271 is explicit: "The current `wsi_common_win32.cpp` D3D11/DComp vehicle is **deleted, not adapted**." §10.7 line 2209 additionally stops the ICD advertising Win32 surface/swapchain at all. Conservative fail-closed result: the file survives as a compile unit whose `wsi_win32_init_wsi` registers **no** surface/swapchain implementation and whose every entry point returns the documented unsupported result; the vehicle, GDI/DIB blit path, DXGI path, HPS publish/release and the three UMD export bindings are gone. See ambiguity **A6**. |
 | `helios_present_layer.cpp` | — | **does not exist** | **ADD** |
 | `helios_present_layer.h` | — | **does not exist** | **ADD** |
 | `helios_present_layer.def` | — | **does not exist** | **ADD** |
@@ -70,14 +83,14 @@ misplaced. The four "Add" files under `src/virtio/vulkan/` and the four under
 | `vn_renderer_helios.c` | 5304 | The only Windows `vn_renderer` backend and the centre of gravity for this lane. Regions: hand-mirrored protocol structs + `_Static_assert` size guards (`:255-352`); diag (`:657-712`); **10 `__declspec(dllexport)` raw-identity exports** (`:711-915`, incl. `helios_venus_memory_res_id` at `:752-767`); WDDM sync create/open/share/destroy/signal/wait (`:915-1192`); retired IOCTL residue (`:1318-1420`, `dev` is permanently `INVALID_HANDLE_VALUE`); `D3DKMTEscape` helper (`:1421-1519`); present-stream register/unregister (`:1520-1618`); Escape CTX create/destroy (`:1663-1686`); adapter/device probe (`:1687-1779`); Escape `SUBMIT_VENUS` (`:1780-1958`); GPU-fence submit + `helios_venus_queue_gpu_fence` export (`:1959-2270`); Escape blob alloc/map/release/attach + fence wait/event (`:2271-2554`); sync retire thread (`:2555-2928`); perf (`:2929-3077`); `helios_open_d3dkmt` (`:3078-3245`); VidMm mirror alloc/free/open-shared (`:3246-3580`); **external-memory create/open/export/get-handle/destroy (`:3564-3960`)**; `helios_submit`/`helios_wait` (`:3961-4193`); shmem/BO ops (`:4194-4549`); sync ops + named export/import (`:4550-4915`); renderer info/init/destroy/create (`:4916-5266`). | **REWRITE** (largest single unit in the lane). Everything Escape-, IOCTL-, blob-, present-stream-, named-fence- and raw-`res_id`-shaped is deleted; what survives is the KMT device/adapter open, the VidMm/allocation plumbing (re-pointed at HVM1), and the external-memory open (re-pointed at C57/`D3D12_RESOURCE_BIT`). |
 | `vn_renderer.h` | 668 | The renderer vtable + the Windows-only Helios declarations at `:245-309` (named sync create/share/export, feedback shadow, present-stream register/unregister) and `:331-400` (external memory create/open/prepare_export/get_handle/destroy, VidMm alloc). `struct vn_renderer_shmem`/`_bo` expose raw `res_id` (`:11-29,83-104,175-179`). | **MODIFY** — delete `:253-273` (named sync), `:282-309` (feedback shadow + present stream); rewrite `:340-377` (external memory) for `D3D12_RESOURCE_BIT` and drop `out_resource_id`; replace `res_id` in the shmem/bo structs with an opaque HVM1 allocation capability + generation. |
 | `vn_renderer_internal.c` / `.h` | 225 / 58 | The shmem-size-bucket cache (`vn_renderer_shmem_cache_*`) plus `vn_renderer_bo_export_sync_file_internal`. | **MODIFY** — the cache stays, but the cached object's identity becomes the HVM1 capability, not `res_id`. |
-| `vn_ring.c` / `.h` | 992 / 152 | The shared-memory command ring: `vkCreateRingMESA` (`:545`), submit/seqno bookkeeping (`:594-870`), `vkNotifyRingMESA` (`:862`), `vkSetReplyCommandStreamMESA` (`:901`), `vn_ring_submit_command` (`:907`), `vn_ring_submit_roundtrip` + `vkWaitVirtqueueSeqnoMESA` (`:970-991`). | **MODIFY** — on Windows the entire ring is replaced by direct HNR2 dispatch. `vkSetReplyCommandStreamMESA` survives conceptually but moves into the HNR2 COMMIT prefix (§10.7:2162). See ambiguity **A10** (§17.3 says preserve the generic path for non-Helios builds; Appendix A.4 says "Delete `vn_ring`"). |
+| `vn_ring.c` / `.h` | 992 / 152 | The shared-memory command ring: `vkCreateRingMESA` (`:545`), submit/seqno bookkeeping (`:594-870`), `vkNotifyRingMESA` (`:862`), `vkSetReplyCommandStreamMESA` (`:901`), `vn_ring_submit_command` (`:907`), `vn_ring_submit_roundtrip` + `vkWaitVirtqueueSeqnoMESA` (`:970-991`). | **MODIFY** — on Windows the entire ring is replaced by direct HNR2 dispatch. `vkSetReplyCommandStreamMESA` survives conceptually but moves into the HNR2 COMMIT prefix (§10.7:2172). See ambiguity **A10** (§17.3 says preserve the generic path for non-Helios builds; Appendix A.4 says "Delete `vn_ring`"). |
 | `vn_queue.c` / `.h` | 4566 / 311 | `vn_QueueSubmit` (`:2014`), `vn_QueueSubmit2` (`:2174`), `vn_QueueBindSparse` (`:2445`), `vn_QueueWaitIdle` (`:2504`); present-stream tag on exported-semaphore signal (`:1740-1795`) and its unregister (`:3540-3546`); the semaphore create-info sanitizer that **strips `D3D12_FENCE_BIT`** (`:3371-3399`); named export/import of Win32 semaphores (`:4356-4425`); fence/semaphore feedback (`:1494-1504`, `:2796-2879`). | **REWRITE** of the submit half; **MODIFY** elsewhere. Record-only mode: seal-and-return, no lower queue submission. Normal mode: HNR2 fragment/COMMIT construction + same-context imported-native-fence wait/signal placement. Delete present-stream tagging and the named-semaphore path; **stop stripping `D3D12_FENCE_BIT`** (it becomes a supported import type). |
 | `vn_device_memory.c` / `.h` | 1127 / 104 | `vn_device_memory_import_resource_id` (`:255`); alloc dispatch (`:541-548`); `vn_device_memory_import_win32` (`:550-583`) which currently gates on `OPAQUE_WIN32_BIT` and threads a raw `resource_id`; unwind (`:585-600`); `vn_AllocateMemory` dispatch incl. the win32 import/export arms (`:669-738`); `mem->helios_external_memory`; `.h:61` documents the "Native OPAQUE_WIN32 payload … owns/retains the Venus resource". | **REWRITE** — every ordinary `vkAllocateMemory` becomes one HVM1 `D3DKMTCreateAllocation2` allocation (`pSystemMem=NULL`) in one of the four roles; `D3D12_RESOURCE_BIT` import becomes a separate allocation class; delete `vn_device_memory_import_resource_id` and the `OPAQUE_WIN32` arms; only host-visible roles reach `D3DKMTLock2`. |
 | `vn_physical_device.c` / `.h` | 3301 / 214 | Queue-family init incl. the Android emulated second queue (`:908-984`, exactly the doc's `:909-979`); external memory handle types (`:1119-1145`, `:2816-2846`, `:3032-3150`) — all `OPAQUE_WIN32`; external semaphore handle types (`:1255-1290`) — `OPAQUE_WIN32` only; `KHR_external_memory_win32` (`:1345`), `KHR_external_semaphore_win32` (`:1291`); WSI extension advertisement `KHR_swapchain`/`_maintenance1`/`_mutable_format` (`:1350-1377`). | **MODIFY** — advertise `D3D12_RESOURCE_BIT` (memory, IMPORTABLE + DEDICATED_ONLY) and `D3D12_FENCE_BIT` (semaphore, IMPORTABLE); stop advertising `KHR_swapchain*` on Windows; expose exactly two memory types over the one HLM1 heap; clamp descriptor-indexing and every related limit so an indivisible operation's allocation closure ≤ 4096 and typed operand occurrences ≤ 8192 in normal-loader mode (record-only mode keeps Tier-3). **Do not** reuse `emulate_second_queue`. |
 | `vn_instance.c` / `.h` | 478 / 129 | Instance extension table incl. `KHR_surface`/`KHR_surface_maintenance1`/`KHR_surface_protected_capabilities` (`:39-43`) and `KHR_win32_surface` (`:62-65`); ring bring-up (`:177-184`, `:309-342`); `vn_ring_submit_command` use (`:448`). | **MODIFY** — stop advertising Win32 surface on Windows; one HTS1 session per `vn_instance`; ring bring-up replaced by HVC1 control context + finite INIT. |
 | `vn_device.c` / `.h` | 765 / 83 | Device extension gating (`:257-366`, incl. `KHR_external_memory_win32`/`KHR_external_semaphore_win32`), queue construction, ring/renderer wiring (`:83-104`, `:573-582`, `:721-734`). | **MODIFY** — owns device/queue/context/ring generation and drain order; one HVC1 queue context + one unshared monitored progress fence per real lower queue; `vkDeviceWaitIdle` joins every nonzero queue milestone. |
 | `vn_buffer.c` / `.h` | 611 / 78 | Buffer create + the cached-memory-requirements path (`:262-300`). | **MODIFY** — C60 classification: requirement queries are pure control; bind records the exact HVM1 allocation/offset/range. |
-| `vn_image.c` / `.h` | 1174 / 111 | `vn_CreateImage` (`:546`) with `VkImageSwapchainCreateInfoKHR` handling at `:559-622`; memory-requirement cache (`:386-407`); `vn_image_bind_wsi_memory` (`:719`) and `vn_BindImageMemory2` (`:759`) with `VkBindImageMemorySwapchainInfoKHR` at `:737-739`. | **MODIFY** — the swapchain-alias arms move **up into the layer**; the ICD's job becomes (i) ordinary external-image creation with `D3D12_RESOURCE_BIT`, (ii) the presentable-image tag that legalises `PRESENT_SRC_KHR` for tagged images (§10.7:2571-2578), (iii) C60 classification for requirements/create/bind. |
+| `vn_image.c` / `.h` | 1174 / 111 | `vn_CreateImage` (`:546`) with `VkImageSwapchainCreateInfoKHR` handling at `:559-622`; memory-requirement cache (`:386-407`); `vn_image_bind_wsi_memory` (`:719`) and `vn_BindImageMemory2` (`:759`) with `VkBindImageMemorySwapchainInfoKHR` at `:737-739`. | **MODIFY** — the swapchain-alias arms move **up into the layer**; the ICD's job becomes (i) ordinary external-image creation with `D3D12_RESOURCE_BIT`, (ii) the presentable-image tag that legalises `PRESENT_SRC_KHR` for tagged images (§10.7:2581-2588), (iii) C60 classification for requirements/create/bind. |
 | `vn_pipeline.c` / `.h` | 2019 / 76 | Pipeline create + cache data (`:685-687`, `:1801-1817`). | **MODIFY** — descriptor-independent compilation is pure control; pipeline-cache data keeps the `VK_INCOMPLETE` partial rule for results > 64 MiB. |
 | `vn_query_pool.c` / `.h` | 471 / 40 | `vn_GetQueryPoolResults` (`:201-260`). | **MODIFY** — query `WAIT` is GPU-dependent (HQC1 join first); result data > 64 MiB partitions into consecutive query ranges after one GPU join; `VK_NOT_READY` preserved. |
 | `vn_wsi.c` / `.h` | 1112 / 107 | `vn_wsi_get_helios_resource_identity` (`:132-163`), `vn_wsi_init` forcing `sw_device=true` on Windows (`:165-246`), `vn_CreateSwapchainKHR` (`:904`), `vn_AcquireNextImage2KHR` (`:966`), `vn_QueuePresentKHR` (`:1098`), extension gating (`:625`, `:648`). | **MODIFY** — delete `vn_wsi_get_helios_resource_identity` and the `win32.get_helios_resource_identity` hook; on Windows the swapchain/present entry points become unreachable (see ambiguity **A5**). |
@@ -142,7 +155,7 @@ touched, M ≈ 200–800, L ≈ 800–2000, XL ≈ >2000.
 exposes its API through `vn_helios_native_kmt.h` and A3/A4 call it. A0's
 asserts land inside A1's first commit so no unit ships an unasserted mirror.
 A6 must not land before A3, or the ICD will advertise an import type whose
-implementation does not exist (the doc's fail-closed rule at §10.7:2542 —
+implementation does not exist (the doc's fail-closed rule at §10.7:2552 —
 "any failure refuses the import and leaves the `D3D12_RESOURCE_BIT` capability
 unadvertised").
 
@@ -150,10 +163,10 @@ unadvertised").
 
 | Id | Goal | Files it owns (exclusive) | Deps | Size |
 |---|---|---|---|---|
-| **B1** | Layer skeleton: `vkNegotiateLoaderLayerInterfaceVersion`, instance/device dispatch capture, `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr` returning exactly the §10.7:2240-2257 lists and `NULL` elsewhere, both extension-enumeration forms with the two-call/`VK_INCOMPLETE` contract for both `pLayerName` forms, instance/device create-chain copy + consumption + lower-name filtering, the generated entry-point manifest compared byte-for-byte. | `helios_present_layer.h`, `helios_present_layer.def`, `VkLayer_HELIOS_present.json.in` | — | L |
+| **B1** | Layer skeleton: `vkNegotiateLoaderLayerInterfaceVersion`, instance/device dispatch capture, `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr` returning exactly the §10.7:2250-2267 lists and `NULL` elsewhere, both extension-enumeration forms with the two-call/`VK_INCOMPLETE` contract for both `pLayerName` forms, instance/device create-chain copy + consumption + lower-name filtering, the generated entry-point manifest compared byte-for-byte. | `helios_present_layer.h`, `helios_present_layer.def`, `VkLayer_HELIOS_present.json.in` | — | L |
 | **B2** | Device creation: require lower Vulkan 1.3; add `VK_KHR_external_memory_win32` + `VK_KHR_external_semaphore_win32`; force `timelineSemaphore` + `synchronization2` without duplicating feature structs or mutating app memory; the **one** private helper queue appended to the app's own canonical `flags=0` record (`q-1` reported, private index hidden from both getters); singleton device-group admission. | `helios_present_layer.cpp` (shared — see note) | B1 | L |
-| **B3** | Surface + profile: `vkCreateWin32SurfaceKHR`/`vkDestroySurfaceKHR`, support/caps/formats/present-modes/`capabilities2`, `vkGetPhysicalDeviceWin32PresentationSupportKHR`, `vkGetPhysicalDevicePresentRectanglesKHR`, `vkGetDeviceGroupPresentCapabilitiesKHR`, `vkGetDeviceGroupSurfacePresentModesKHR`; the §10.7:2444-2453 admission table enforced as *queries return unsupported*, not as later failures; `(0,0)` client extent; resize/minimize → `OUT_OF_DATE`, destroyed HWND → `SURFACE_LOST`. | `helios_present_layer.cpp` (shared) | B2 | L |
-| **B4** | D3D12/DXGI object graph: adapter selection by exact LUID; D3D12 device + copy queue; `CreateSwapChainForHwnd` FLIP_DISCARD / `DXGI_SCALING_NONE` / `ALPHA_MODE_IGNORE` / `CheckColorSpaceSupport`+`SetColorSpace1`; `S[i]` `CreateCommittedResource` with exactly the §10.7:2482-2490 flag set; two `CreateFence(0, SHARED)` per slot; one `CreateSharedHandle` per object; per-slot allocator/list. | `helios_present_layer.cpp` (shared) | B3 | L |
+| **B3** | Surface + profile: `vkCreateWin32SurfaceKHR`/`vkDestroySurfaceKHR`, support/caps/formats/present-modes/`capabilities2`, `vkGetPhysicalDeviceWin32PresentationSupportKHR`, `vkGetPhysicalDevicePresentRectanglesKHR`, `vkGetDeviceGroupPresentCapabilitiesKHR`, `vkGetDeviceGroupSurfacePresentModesKHR`; the §10.7:2454-2463 admission table enforced as *queries return unsupported*, not as later failures; `(0,0)` client extent; resize/minimize → `OUT_OF_DATE`, destroyed HWND → `SURFACE_LOST`. | `helios_present_layer.cpp` (shared) | B2 | L |
+| **B4** | D3D12/DXGI object graph: adapter selection by exact LUID; D3D12 device + copy queue; `CreateSwapChainForHwnd` FLIP_DISCARD / `DXGI_SCALING_NONE` / `ALPHA_MODE_IGNORE` / `CheckColorSpaceSupport`+`SetColorSpace1`; `S[i]` `CreateCommittedResource` with exactly the §10.7:2492-2500 flag set; two `CreateFence(0, SHARED)` per slot; one `CreateSharedHandle` per object; per-slot allocator/list. | `helios_present_layer.cpp` (shared) | B3 | L |
 | **B5** | Canonical import: per slot, lower external `VkImage` → `vkGetMemoryWin32HandlePropertiesKHR` → dedicated `VkImportMemoryWin32HandleInfoKHR` → offset-zero bind → ICD presentable-image tag, **all before `vkGetSwapchainImagesKHR` can expose the image**; permanent `D3D12_FENCE_BIT` timeline-semaphore import for `Ready[i]`/`Release[i]` with the transient NT handle closed immediately after. | `helios_present_layer.cpp` (shared) | B4, **A3**, **A6**, **A7** | L |
 | **B6** | Acquire/Present state machine: the nine-state slot machine, epoch `e[i]`, `GetCompletedValue` selection, `SetEventOnCompletion` blocking with no polling, `VK_NOT_READY`/`VK_TIMEOUT`; the single `vkQueueSubmit2` release on the app's queue, per-slot release command buffers, `Ready[i]=e` signal; then per-`(swapchain,image)` D3D wait → `GetCurrentBackBufferIndex` → `CopyResource` → `Release[i]=e` → `Present(1,0)`; per-swapchain `pResults`. | `helios_present_layer.cpp` (shared) | B5 | XL |
 | **B7** | C45 alias images: intercept `vkCreateImage`/`vkBindImageMemory2`/`vkDestroyImage`; VUID 00995/01630/01631/01644 enforcement; `swapchain=VK_NULL_HANDLE` consume-and-strip pass-through; mixed batches preserving order and `VkBindMemoryStatus`; `ALIAS_ONLY` survival past swapchain destruction. | `helios_present_layer.cpp` (shared) | B6 | L |
@@ -164,7 +177,7 @@ unadvertised").
 **Serialization note for (b), and it is the important one.** The manifest names
 exactly **one** `.cpp` for the whole layer, so B2–B8 all write
 `helios_present_layer.cpp`. They cannot be parallelised as written.
-Recommended (and, I believe, permitted — §17 line 3735 calls the manifest "the
+Recommended (and, I believe, permitted — §17 line 3745 calls the manifest "the
 minimum exact file manifest … may not omit a listed live owner", not a
 prohibition on additional files): keep `helios_present_layer.cpp` as the live
 owner of the loader/dispatch surface (B1/B2) and add
@@ -188,9 +201,9 @@ output constrains:
 | The private direct-dispatch table (`vn_helios_direct_dispatch.h`) | §17.2 DXVK, §17.5 vkd3d/UMD12 | The header is authored here but *consumed* across two other repositories (`dxvk-helios/`, `vkd3d-proton-helios/`) and by `umd/bridge/`. Today those consumers reach the ICD purely by `GetProcAddress` on names (`umd/bridge/bridge_icd_exports.cpp:308-344`), which the doc deletes. Agree the table's shape and its `extern "C"` header location **before** A5 lands, or three lanes will invent three ABIs. See CROSS-LANE REQUESTS. |
 | HQA1 (72 B) | §17.4 D3D11 UMD, §17.5 UMD12, §17.6 KMD | This lane *produces* the endpoint id / engine class / queue family+index values and consumes nothing; the UMD builds and sends the packet; KMD validates. Only the endpoint-descriptor accessor is ours. |
 | HWA2 (168 B) | §17.6 KMD (writer), §17.4 D3D11 UMD (opener) | This lane is a **reader only**, at C57 import. Any field-layout drift breaks the import silently unless offsets are asserted (A0). ⛔ **Corrected 2026-08-10 per `docs/retirement/K4-CONTRACT.md` §5: re-pointing this ICD from the retired 48-byte `helios_wddm_open_identity` to HWA2 is NOT a field substitution, and must not be planned as one.** HWA2 deliberately carries **no host resource id** and **no Vulkan memory-type index** (`protocol/src/wddm.rs:393-394` — "No host resource token, `resid`, PID, process handle, synchronization object, mutable value, or independently usable identity"; and `:326-327` on `memory_class` — "no Vulkan memory-type index. ⛔ The retired trailer carried `memory_type_index`; it is gone"). Today `identity.resource_id` (read at `vn_renderer_helios.c:3848-3862`) is passed straight into `VkImportMemoryResourceInfoMESA::resourceId` and `vn_renderer_bo_create_from_resource_id` (`vn_device_memory.c:267-277`) — it is how the guest names the host object, and it has **no successor field**. The replacement is a different *mechanism*: the ICD stops naming host resources at all and the KMD patches the host resid in from `HeliosNativeRenderPatch` (`protocol/src/native_render.rs:622-642`). That is this lane's unit **A3** plus KMD **K6**. ⇒ Until both land, every reader of a field HWA2 does not carry must fail **loudly, with a named counter that names A3** — never fall back, never fabricate — and "an ICD in this state cannot import" is the retirement's intended intermediate state, not a regression to be papered over. |
-| `D3DKMTRender` with the resize flags and `CommandLength=0` | §17.6 KMD (`DxgkDdiRender`) | The KMD must tolerate the buffer-resize transition Render that carries no HNR2 (§10.7:1734-1740). Cross-lane request below. |
-| `packaging/windows/Install-Helios.ps1` / `.cmd` | §17.7 | The layer's JSON manifest must be registered as a Windows **implicit** layer (registry key, not a filesystem search path). This lane produces `VkLayer_HELIOS_present.json` + the DLL; §17.7's lane installs them (§17.7:4605-4608). |
-| `tools/d3d11_kmt_shared_probe.cpp`, `tools/vk_ring_fence_probe.cpp` | §17.7 | §17.3:3976 says "Remove `tools/d3d11_kmt_shared_probe.cpp`" but the file lives in the `tools/` lane and §17.7:4520 already lists it for deletion. **This lane must not delete it.** Reported below. |
+| `D3DKMTRender` with the resize flags and `CommandLength=0` | §17.6 KMD (`DxgkDdiRender`) | The KMD must tolerate the buffer-resize transition Render that carries no HNR2 (§10.7:1744-1750). Cross-lane request below. |
+| `packaging/windows/Install-Helios.ps1` / `.cmd` | §17.7 | The layer's JSON manifest must be registered as a Windows **implicit** layer (registry key, not a filesystem search path). This lane produces `VkLayer_HELIOS_present.json` + the DLL; §17.7's lane installs them (§17.7:4615-4618). |
+| `tools/d3d11_kmt_shared_probe.cpp`, `tools/vk_ring_fence_probe.cpp` | §17.7 | §17.3:3986 says "Remove `tools/d3d11_kmt_shared_probe.cpp`" but the file lives in the `tools/` lane and §17.7:4530 already lists it for deletion. **This lane must not delete it.** Reported below. |
 | `src/vulkan/wsi/meson.build` | inside this lane only (B0 vs B9) | B0 first. |
 
 No other lane edits anything under `icd/mesa/`.
@@ -305,7 +318,7 @@ traces, and every pixel result. None of it can be reached from this lane.
 **A1 — No C declaration source exists for any of the new records, and the doc
 never says who emits one.** §17.1 asks the protocol lane for "generated QEMU C
 declarations" (3758) and "generated C bindings" for diagnostics (3784), and for
-`wddm.rs` to "Generate/assert both Rust and C offsets" (3770-3771) — but says
+`wddm.rs` to "Generate/assert both Rust and C offsets" (3780-3781) — but says
 nothing about C declarations for HVC1/HNR2/HVM1/HVR1, which only Mesa and KMD
 consume. The current tree's answer is hand-mirroring with size-only asserts
 (`vn_renderer_helios.c:255-352`). *Conservative reading:* refuse to hand-mirror;
@@ -314,30 +327,30 @@ A0/A1. *If overruled:* mirror with **offset** asserts
 (`_Static_assert(offsetof(...) == N)`) on every field, not size asserts.
 
 **A2 — `vn_icd.c`/`vn_icd.h` are in the Modify list with no stated change.**
-§17.3:3904 lists them; no sentence in §10.4, §10.7, §13 or §17.3 says what
+§17.3:3914 lists them; no sentence in §10.4, §10.7, §13 or §17.3 says what
 changes. Both files together are 57 lines and contain only
 `vk_icdGetInstanceProcAddr` and `vn_icd_supports_api_version`. *Conservative
 reading:* this is where the one private direct-dispatch export is declared and
-where a loader-provenance check belongs (§13.2:3355-3358 requires rejecting a
+where a loader-provenance check belongs (§13.2:3365-3368 requires rejecting a
 proc "whose owning module is the Vulkan loader or WSI layer"). Implement exactly
 that and nothing else.
 
 **A3 — The private direct-dispatch entry point is never named or specified.**
-§2.8:250-253 says translators "load the Helios ICD through a private direct
-dispatch entry point rather than the Vulkan loader"; §10.4:1182-1184 says "the
+§2.8:260-263 says translators "load the Helios ICD through a private direct
+dispatch entry point rather than the Vulkan loader"; §10.4:1192-1194 says "the
 UMD receives the function table directly while creating its translator
-instance"; §13.2:3356 says "vkd3d's instance creation receives the same private
+instance"; §13.2:3366 says "vkd3d's instance creation receives the same private
 direct-ICD proc table". No name, no signature, no version negotiation, no
 package-generation check location. Meanwhile the mechanism being deleted
 (`umd/bridge/bridge_icd_exports.cpp:308-344`, ten `GetProcAddress`-by-name
-exports) is exactly the "loaded-module discovery" A.4:5767 forbids. *Conservative
+exports) is exactly the "loaded-module discovery" A.4:5777 forbids. *Conservative
 reading:* exactly **one** exported symbol, versioned, generation-checked,
 returning a const table; every other `__declspec(dllexport)` in
 `vn_renderer_helios.c:711-915` deleted. Shape must be agreed with the DXVK and
 UMD12 lanes before A5 (CROSS-LANE REQUEST 2).
 
 **A4 — The presentable-image tag call has no name, ABI, or discovery rule.**
-§10.7:2571-2578 requires "a device/image-scoped private dispatch call" from the
+§10.7:2581-2588 requires "a device/image-scoped private dispatch call" from the
 layer into the lower ICD that makes `VK_IMAGE_LAYOUT_PRESENT_SRC_KHR` legal for
 `S[i]` and enables validation of the `PRESENT_SRC_KHR → GENERAL →
 VK_QUEUE_FAMILY_EXTERNAL` release. But §2.8/§13.1 put the layer *above* the
@@ -349,10 +362,10 @@ that no section defines. *Conservative reading:* a single
 captured next-layer GDPA, refusing if the lower chain does not provide it (which
 then fails `vkCreateSwapchainKHR`, never silently degrades).
 
-**A5 — Does `vn_QueuePresentKHR` survive on Windows?** §17.3:3987-3988 says make
+**A5 — Does `vn_QueuePresentKHR` survive on Windows?** §17.3:3997-3998 says make
 it "unavailable to **translator instances**", which implies it stays available
-to normal instances. §10.7:2199 says "The ICD itself stops advertising Win32
-surface and swapchain entry points to ordinary loader clients", and §17.3:3944
+to normal instances. §10.7:2209 says "The ICD itself stops advertising Win32
+surface and swapchain entry points to ordinary loader clients", and §17.3:3954
 says lower WSI names/functions are filtered by the layer — which makes the ICD's
 swapchain path unreachable by anyone on Windows. *Conservative reading:* on
 Windows, `KHR_swapchain`/`KHR_win32_surface` are not advertised at all and
@@ -360,8 +373,8 @@ Windows, `KHR_swapchain`/`KHR_win32_surface` are not advertised at all and
 `VK_ERROR_EXTENSION_NOT_PRESENT`-class failure) for **every** instance; the
 non-Windows path is untouched.
 
-**A6 — What is left of `wsi_common_win32.cpp`?** §2.8:261 says the vehicle is
-"deleted, not adapted" and §17.3:3890-3892 says "remove the entire D3D11/DXGI/
+**A6 — What is left of `wsi_common_win32.cpp`?** §2.8:271 says the vehicle is
+"deleted, not adapted" and §17.3:3900-3902 says "remove the entire D3D11/DXGI/
 DComp vehicle, HPS publish/release, named fences, GDI fallback selected by that
 vehicle, and recursive callbacks" — but the file stays in the Modify list, and
 §10.7 removes the ICD's Win32 surface/swapchain entirely, which removes the
@@ -375,7 +388,7 @@ result; delete the vehicle, HPS, and the three `helios_umd_*` bindings. That is
 fail-closed and reversible. Do **not** silently keep a working GDI presenter —
 it would be a second, unadvertised present path.
 
-**A7 — Implicit vs explicit layer manifest.** §10.7:2198 says "one mandatory
+**A7 — Implicit vs explicit layer manifest.** §10.7:2208 says "one mandatory
 **implicit** layer, `VK_LAYER_HELIOS_present`". The only templates in-tree
 (`src/vulkan/*-layer/VkLayer_MESA_*.json.in` + their `meson.build`) produce
 `"type": "GLOBAL"` manifests installed into `explicit_layer.d`. An implicit
@@ -387,12 +400,12 @@ Vulkan\{Implicit,Explicit}Layers`, so this is also a packaging-lane input.
 `disable_environment` key and document it; flag to the packaging lane.
 
 **A8 — The imported `D3D12_RESOURCE_BIT` memory has no memory type, but Vulkan
-requires one.** §10.7:2066-2068: "C57 `D3D12_RESOURCE_BIT` imports are a
+requires one.** §10.7:2076-2078: "C57 `D3D12_RESOURCE_BIT` imports are a
 separate allocation class: they never masquerade as an ordinary HVM1 allocation,
 are **never exposed through an ordinary memory type**, and are never locked."
-§10.7:2052-2054 exposes exactly two memory types (role 4 device-local, role 2
+§10.7:2062-2064 exposes exactly two memory types (role 4 device-local, role 2
 device-local+host-visible+coherent). But `vkAllocateMemory` needs a
-`memoryTypeIndex`, and §10.3:1143-1145 / §10.7:2514-2516 require
+`memoryTypeIndex`, and §10.3:1153-1155 / §10.7:2524-2526 require
 `vkGetMemoryWin32HandlePropertiesKHR` to report a **compatible** memory-type
 bit, which must be one of those two. The three statements cannot all be literally
 true. *Conservative reading:* `vkGetMemoryWin32HandlePropertiesKHR` returns the
@@ -402,9 +415,9 @@ import-class, has no HVM1 role record, is never `D3DKMTLock2`'d, and
 means *never allocated from* one, not *never reported as compatible with* one.
 
 **A9 — HVC1 `EngineAffinity=0` vs native-fence/monitored-fence
-`EngineAffinity=1u<<0`.** §10.7:1694-1695 specifies context creation with
-"zero-based `EngineAffinity=0`"; §10.7:1905 specifies the monitored progress
-fence with `EngineAffinity=1u << 0`; §12.2:3197-3199 specifies native-fence open
+`EngineAffinity=1u<<0`.** §10.7:1704-1705 specifies context creation with
+"zero-based `EngineAffinity=0`"; §10.7:1915 specifies the monitored progress
+fence with `EngineAffinity=1u << 0`; §12.2:3207-3209 specifies native-fence open
 with `EngineAffinity=1u << 0` and says "Zero, multiple bits, overflow, or a bit
 outside the queried device topology is rejected before the call". These are
 different structures with different documented semantics, so it is probably not
@@ -413,18 +426,18 @@ a contradiction — but it is exactly the kind of inconsistency an implementer
 propagate one value to the other site.
 
 **A10 — "Preserve `vn_ring` for non-Helios builds" vs "Delete `vn_ring`".**
-§17.3:4048-4049: "Preserve generic upstream ring code only for non-Helios
-platform builds." Appendix A.4:5772 (last sentence): "Delete `vn_ring` and every
+§17.3:4058-4059: "Preserve generic upstream ring code only for non-Helios
+platform builds." Appendix A.4:5782 (last sentence): "Delete `vn_ring` and every
 user-visible host resource ID or shared head/status sample." *Conservative
 reading:* §17 is the implementation manifest and A.4 is a disposition summary;
 keep `vn_ring.c`/`.h` compiled only when `!with_platform_windows`, and make
 every Windows call site a compile error rather than a runtime branch (no
-fallback between modes — §3:381-382, §17.3:4072).
+fallback between modes — §3:391-392, §17.3:4082).
 
-**A11 — Where is the provisional HTS1 session created?** §10.4:1189-1192 says
+**A11 — Where is the provisional HTS1 session created?** §10.4:1199-1202 says
 the ICD "creates a raw KMT device, and creates one legacy nonvirtual HVC1
 control context. KMD binds that raw device … **and creates a provisional,
-refcounted `TranslationSession`**" — i.e. at device create. §10.7:1686-1690 says
+refcounted `TranslationSession`**" — i.e. at device create. §10.7:1696-1700 says
 "At `D3DKMTCreateDevice`, the KMD device object records the exact
 `hKmdProcess`/adapter/package generation but **creates no host object
 namespace**. … It first creates one ordinary control context; **that HVC1
@@ -435,27 +448,27 @@ call order (device then context either way); material to the KMD lane. Reported
 below.
 
 **A12 — The buffer-resize `D3DKMTRender` conflicts with "all flags … zero".**
-§10.7:1801-1804 requires the ordinary Render to have "all flags/history/broadcast
-fields zero"; §10.7:1734-1740 requires the ICD to use `ResizeAllocationList` and
+§10.7:1811-1814 requires the ordinary Render to have "all flags/history/broadcast
+fields zero"; §10.7:1744-1750 requires the ICD to use `ResizeAllocationList` and
 `ResizePatchLocationList` (which are `D3DKMT_RENDERFLAGS` bits) and to "adopt all
 three returned pointers/sizes even on failure", with a transition that "carries
 no application work". *Conservative reading:* the resize is a **separate**
 `D3DKMTRender` whose only nonzero flags are the two resize bits, with
 `CommandLength=0` and `AllocationCount=0`; ordinary Renders keep all flags zero.
 This requires the KMD's `DxgkDdiRender` to accept a zero-length command (CROSS-LANE
-REQUEST 3), which nothing in §10.7's KMD paragraph (1821-1840) allows for — it
+REQUEST 3), which nothing in §10.7's KMD paragraph (1831-1850) allows for — it
 begins by validating `CommandLength` against the advertised maximum and taking a
 slot.
 
 **A13 — Command-pool host synchronization across the app queue and the helper
-queue is unspecified.** §10.7:2503-2505 gives each slot "one resettable
+queue is unspecified.** §10.7:2513-2515 gives each slot "one resettable
 lower-Vulkan command pool with separate per-slot present-release and acquire
 barrier command buffers". The acquire buffer is recorded and submitted on the
-private helper queue (2612-2613); the release buffer is recorded and submitted
-on the **application's** queue inside `vkQueuePresentKHR` (2650-2663). Vulkan
+private helper queue (2622-2623); the release buffer is recorded and submitted
+on the **application's** queue inside `vkQueuePresentKHR` (2660-2673). Vulkan
 requires external synchronization of a `VkCommandPool` across all recording and
-reset. §13.3:3388-3390 only says the layer "transitions state under a short
-per-image lock" and §10.7:2593-2594 says "No mutex is held while waiting for
+reset. §13.3:3398-3400 only says the layer "transitions state under a short
+per-image lock" and §10.7:2603-2604 says "No mutex is held while waiting for
 completion or across a D3D/DXGI call". *Conservative reading:* the per-slot lock
 covers pool reset and both `vkBeginCommandBuffer`/`vkEndCommandBuffer` windows
 for that slot; it is released before `vkQueueSubmit2` and before any D3D/DXGI
@@ -464,12 +477,12 @@ lock" does not obviously cover command-pool recording.
 
 **A14 — A native Vulkan process must host two `vn_instance`s in two modes
 simultaneously, and nothing says how the direct-dispatch table and the loader
-instance stay isolated.** §10.7:2479-2480 says the layer "creates a D3D12
+instance stay isolated.** §10.7:2489-2490 says the layer "creates a D3D12
 device/queue and DXGI flip-model swapchain on the exact adapter. **D3D12 uses
 the selected actual ordinary-context translator path**" — so a native Vulkan
 app's Present drives UMD12 → vkd3d → a *record-only* `vn_instance` inside
 `vulkan_virtio.dll`, while the app's own *normal-loader* `vn_instance` lives in
-the same module. §10.4:1211-1213 and §17.3:4001-4002 confirm two sessions, two
+the same module. §10.4:1221-1223 and §17.3:4011-4012 confirm two sessions, two
 host contexts, two namespaces. But nothing states that the ICD's process-wide
 state (module pin, diag, TLS, `vn_renderer` globals — today
 `vn_renderer_helios.c:3063-3077,5124-5141`) is safe under that, nor how the
@@ -506,20 +519,20 @@ on the instance created through the direct-dispatch entry point, never through
 3. **KMD lane (§17.6): `DxgkDdiRender` must accept the buffer-resize Render.**
    Per A12, the ICD's `ResizeAllocationList`/`ResizePatchLocationList`
    transition is a `D3DKMTRender` with `CommandLength=0`, `AllocationCount=0`
-   and no HNR2 payload. §10.7:1821-1840 as written validates `CommandLength`
+   and no HNR2 payload. §10.7:1831-1850 as written validates `CommandLength`
    against a maximum and takes a slot; please make the zero-length resize
    Render an explicit accepted, counted, no-op arm rather than an error.
 4. **KMD lane (§17.6): resolve A11** — is the provisional `TranslationSession`
-   created at `DxgkDdiCreateDevice` (§10.4:1191) or at the HVC1
-   `DxgkDdiCreateContext` (§10.7:1688-1690)? The ICD's call order is the same
+   created at `DxgkDdiCreateDevice` (§10.4:1201) or at the HVC1
+   `DxgkDdiCreateContext` (§10.7:1698-1700)? The ICD's call order is the same
    either way; the KMD's object lifetime is not.
 5. **Packaging lane (§17.7): register `VkLayer_HELIOS_present` as an implicit
    layer** under `HKLM\SOFTWARE\Khronos\Vulkan\ImplicitLayers`, and settle the
    `disable_environment` key name with this lane (A7).
 6. **Tools lane (§17.7): `tools/d3d11_kmt_shared_probe.cpp` and
-   `tools/vk_ring_fence_probe.cpp`.** §17.3:3976 tells the Mesa lane to remove
+   `tools/vk_ring_fence_probe.cpp`.** §17.3:3986 tells the Mesa lane to remove
    the first; both live outside this lane's scope and are already listed at
-   §17.7:4520. This lane will not touch them.
+   §17.7:4530. This lane will not touch them.
 7. **Docs (§17.7): record the Linux cross-build recipe** in `TOOLCHAIN.md`. The
    Mesa ICD cross-compiles to `vulkan_virtio.dll` on the Linux host with
    `x86_64-w64-mingw32-gcc` + a meson cross file + a `mako`/`packaging` venv

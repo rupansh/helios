@@ -341,7 +341,31 @@ unsafe extern "C" fn present(
         return;
     };
 
+    // The source allocation travels in the D3D12 present descriptor below. Keep the
+    // table's non-zero invariant explicit before that channel is used.
+    if identity.h_allocation == 0 {
+        // ⛔ Unreachable by the table's invariant — `identity12`'s module doc: an
+        // entry exists **iff** this driver owns a WDDM allocation, so
+        // `h_allocation != 0` on every recorded entry. Counted because "unreachable
+        // by construction" is a claim, and this is where it would be observed
+        // breaking.
+        note_refusal(&L8_REFUSALS.present_source_allocation_zero);
+        return;
+    }
+
     // ── ⛔ THE FRAME'S IDENTITY CANNOT BE BUILT, and this is the §5 gap ─────
+    //
+    // ⛔⛔ **ORDER IS LOAD-BEARING: this block must stay BELOW every arm that
+    // returns.** It is `PresentEntered`'s terminal term — it fires on exactly the
+    // presents that complete — so it has to be the last thing counted before the
+    // descriptor write, and the `h_allocation == 0` refusal above was moved up
+    // past it for that reason. While it sat above that arm, a
+    // `PresentSourceAllocationZero` event was counted in BOTH terms and
+    // `PresentEntered`'s documented identity over-counted by exactly the number of
+    // hits on the one arm the identity exists to catch. That is the
+    // instrument-attribution failure class this project has already paid for with
+    // `WfBWire`, `RING_SUBMIT_COUNT` and `RENDER_COUNT`: an arithmetic check that
+    // breaks hardest precisely when the thing it watches for happens.
     //
     // ⚠ **This block used to submit `HeliosPresentRenderCmd` on the queue's WDDM
     // context (UP-9) and the reversal is recorded rather than quietly edited.** The
@@ -386,18 +410,6 @@ unsafe extern "C" fn present(
                 identity.geometry.dxgi_format,
             );
         }
-    }
-
-    // The source allocation travels in the D3D12 present descriptor below. Keep the
-    // table's non-zero invariant explicit before that channel is used.
-    if identity.h_allocation == 0 {
-        // ⛔ Unreachable by the table's invariant — `identity12`'s module doc: an
-        // entry exists **iff** this driver owns a WDDM allocation, so
-        // `h_allocation != 0` on every recorded entry. Counted because "unreachable
-        // by construction" is a claim, and this is where it would be observed
-        // breaking.
-        note_refusal(&L8_REFUSALS.present_source_allocation_zero);
-        return;
     }
 
     // ── the descriptor ──────────────────────────────────────────────────────
@@ -585,11 +597,25 @@ struct L8Refusals {
     /// the driver can be: `PresentEntered == PresentIdentityNoResourceId +
     /// PresentBadArg + PresentNoOutStruct + PresentDstResourceRefused +
     /// PresentSourceUnresolved + PresentSourceNotAdopted +
-    /// PresentQueueContextUnavailable + PresentSourceAllocationZero`. ⚠ The four
-    /// identity-submission slots (`PresentIdentitySubmitted` in L2's set,
-    /// `PresentIdentityRefused`, `PresentIdentityUnavailable`,
-    /// `PresentIdentityInvalid`) are no longer terms of it: nothing reaches them.
-    /// Same construction and
+    /// PresentQueueContextUnavailable + PresentSourceAllocationZero`.
+    ///
+    /// ⛔⛔ **What makes that hold is that every term is a path that RETURNS, plus
+    /// exactly one terminal term.** `PresentIdentityNoResourceId` is the terminal
+    /// one — it is counted after the last refusal arm, so it equals the presents
+    /// that complete. It did NOT hold when it was first written: the
+    /// `PresentIdentityNoResourceId` bump sat *above* the `h_allocation == 0` arm,
+    /// so every `PresentSourceAllocationZero` was counted in both terms and the
+    /// right-hand side over-counted by exactly the hits on the arm this identity
+    /// exists to catch. The site now carries a comment forbidding the move back.
+    ///
+    /// ⚠ **`PresentExtraSurfacesIgnored` is deliberately NOT a term** — it does not
+    /// return, so a present that hits it goes on to land in one of the terms above.
+    /// Summing "all of L8's counters" therefore does not reproduce this identity,
+    /// and neither does adding `PresentPrivateDataSizeQueries`, which counts a
+    /// different DDI. ⚠ The four identity-submission slots
+    /// (`PresentIdentitySubmitted` in L2's set, `PresentIdentityRefused`,
+    /// `PresentIdentityUnavailable`, `PresentIdentityInvalid`) are no longer terms
+    /// either: nothing reaches them. Same construction and
     /// the same reason as `FenceSignalEntered`: a zero here and a zero everywhere else
     /// is *"the runtime never presented through this driver"*, which is a completely
     /// different finding from *"every present refused"*, and before this counter the
@@ -627,6 +653,11 @@ struct L8Refusals {
     /// resource id, and §10.3 forbids any UMD, ICD, batch or private descriptor
     /// naming or supplying one. HWA2 carries no such field, `identity12` no longer
     /// holds one, and nothing here fabricates one.
+    ///
+    /// ⛔ **Counted after the LAST arm that returns**, which makes it exactly the
+    /// presents that complete and makes `PresentEntered`'s documented identity an
+    /// equality rather than an over-count. Moving this bump back above the
+    /// `h_allocation == 0` refusal would double-count that arm; the site says so.
     ///
     /// ⚠ **Expected to equal `PresentEntered` minus the other refusals, i.e. to fire
     /// on EVERY present**, until mesa lane unit **A3** lands: the ICD stops naming

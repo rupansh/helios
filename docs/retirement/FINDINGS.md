@@ -12,8 +12,17 @@ on the claim, so a later reader cannot inflate it.
 
 ## F1 — Core DDI 0116 negotiates on build 26100. The "build 28000" package minimum is a header artifact.
 
-**Date** 2026-08-10 · **Revises** §2 (lines 114-115, 309-317), §3 (line 381),
-§10.2 (line 982), §10.9 (line 2843), §18.1 (line 4639)
+**Date** 2026-08-10 · **Revises** §2 (lines 124-125, 319-327), §3 (line 391),
+§10.2 (line 992), §10.9 (line 2853), §18.1 (line 4649)
+
+⛔ **Anchors re-derived 2026-08-10 (round-3 repair).** Every number above was 10
+too low — commit `c17f17c` inserted a ten-line banner at the frozen doc's
+`:11-20` and shifted every body line after 8. They were re-derived by grepping
+the cited text, not by adding 10: `:124-125` is the "**Decision: retire HPS2
+only with an atomic Windows 11 26H1/build 28000**" sentence, `:391` is "No
+version or feature fallback. Windows build 28000+", `:992` is the `OS/runtime`
+admission row, `:2853` is §10.9's `Core DDI <0116` row, and `:4649` is "WDK
+28000 bindings expose Core 0116 exactly".
 
 The reference makes "Windows 11 26H1 OS build 28000 or later" part of the
 package ABI with "no version or feature fallback", and §10.9 fails
@@ -58,10 +67,19 @@ Knob: `Umd12CoreDdi`, default 110. Both arms stay reachable per CLAUDE.md rule 8
 ## F2 — A CpuVisible memory segment does not Code-43. The HLM1 flag shape is admitted.
 
 **Date** 2026-08-10 · **Revises** the CLAUDE.md invariant table · **relieves**
-§10.9 line 2858 and §2 line 17 of their assumed failure mode
+§10.9 line 2868 and the preamble sentence at line 27 of their assumed failure
+mode
+
+⛔ **Anchors re-derived 2026-08-10 (round-3 repair)**, same +10 banner shift as
+F1, verified by grepping the text rather than by arithmetic: `:2868` is §10.9's
+`HLM1 descriptor/BAR/linear-offset/Lock2/WC/coherency admission failure` row
+(was cited `2858`), and `:27` is "HLM1's cold two-segment admission, and the
+other section-18 target gates pass" (was cited "§2 line 17" — ⚠ **and the
+section label was wrong even before the shift**: line 27 is in the document
+*preamble*, above §1 at `:84`, not in §2, which starts at `:122`).
 
 The kmd-core lane brief called this "the single highest-risk item in the lane":
-§10.7:1973-1976 requires HLM1 to be `Aperture=0, CpuVisible=1,
+§10.7:1983-1986 requires HLM1 to be `Aperture=0, CpuVisible=1,
 CacheCoherent=0, SupportsCpuHostAperture=0, SupportsCachedCpuHostAperture=0`,
 which is precisely the shape CLAUDE.md recorded as *"classic CpuVisible memory
 segments are rejected — AddAdapter Code 43 (ETW-proven 2026-07-05)"*. §10.9
@@ -819,16 +837,33 @@ both layouts, which the original write-up did not do.
 
 ### The instrument that could NOT have answered it, recorded so it is not re-used
 
-`umd12`'s `AllocPrivateWrittenBack` counter looks like the right instrument and
-is not. It fires only when the write-back **differs** from what the UMD sent
-(`private.meta.pitch != pitch || venus_alloc_size != … || memory_type_index !=
-…`), so a KMD that faithfully echoed the UMD's own values would leave it at
-zero, exactly like a KMD whose write never arrived. A D3D12 clear probe run on
-the deployed build produced **no `umd12` log at all** — the log file is created
-lazily on the first `log_error!` — which under that counter is equally
-consistent with both hypotheses. The D3D11 line answers it because it compares a
-**pre-call snapshot** against the post-call buffer rather than against an
-expectation.
+`umd12`'s `AllocPrivateWrittenBack` counter looked like the right instrument and
+was not. **In the pre-retirement build** it fired only when the write-back
+*differed* from what the UMD sent (`private.meta.pitch != pitch ||
+venus_alloc_size != … || memory_type_index != …`), so a KMD that faithfully
+echoed the UMD's own values would have left it at zero, exactly like a KMD whose
+write never arrived. A D3D12 clear probe run on that build produced **no `umd12`
+log at all** — the log file is created lazily on the first `log_error!` — which
+under that counter was equally consistent with both hypotheses. The D3D11 line
+answered it because it compares a **pre-call snapshot** against the post-call
+buffer rather than against an expectation.
+
+⚠⚠ **The counter has since been RE-GRADED, and this paragraph is history — do
+not read it as a description of the deployed build.** At HEAD the predicate it
+quotes cannot even be evaluated: the `HeliosWddmAllocMeta` trailer is gone from
+both UMDs (only tombstone comments name it), so there is no `private.meta`.
+`alloc_private_written_back` is now a **success census** — in
+`umd12/src/forward12/resource12.rs` it is bumped once per create whose HWA2
+write-back *arrived and validated*, immediately after `validate_create_output`
+succeeds, and the bump site is explicitly annotated *"Not a refusal — the census
+that answers recon's open question with a number"*. Its declaration carries the
+⚠⚠ re-grade banner and states the new expectation: **equal to
+`IdentityRecorded`**, with `Hwa2WriteBackAbsent` as its complement. (Symbols,
+not lines, on purpose — `rg -n alloc_private_written_back
+umd12/src/forward12/resource12.rs` gives the declaration, the constructor, the
+single bump site and the summary-set entry.) The wire name was deliberately **not** changed, because `D3D12 DDI
+refusals:` lines are diffed across builds. ⇒ The lesson below still stands as a
+lesson; the counter it was drawn from no longer has that shape.
 
 ⇒ Same lesson as `WfBWire` / `RENDER_COUNT` / `RING_SUBMIT_COUNT`: a counter
 whose firing condition is "the value changed from what I predicted" cannot
@@ -841,13 +876,16 @@ prove the same for 168 bytes (the size changes), nor for the D3D12
 Those remain to be measured on the deployed K4 build; both producers already
 refuse loudly if the generation comes back zero, so the failure mode is a
 counted refusal rather than a corrupt descriptor. ⚠ **The two counters have
-different names** — the D3D12 arm's is `Hwa2WriteBackAbsent`
-(`umd12/src/forward12/resource12.rs:4925`), which is the only place that name
-exists; the D3D11 arm's is `hwa2_output_invalid`
-(`umd/src/forward.rs:475`, in `DDI_REFUSAL_SET` at `:505`), and it is broader —
-it fires on a zero generation, a mutated echo, or a package-generation mismatch
-alike. Grepping the tree for `Hwa2WriteBackAbsent` alone will miss the D3D11
-half.
+different names** — the D3D12 arm's is `Hwa2WriteBackAbsent`, declared in
+`umd12/src/forward12/resource12.rs` and nowhere else; the D3D11 arm's is
+`hwa2_output_invalid`, declared in `umd/src/forward.rs` and listed in that
+file's `DDI_REFUSAL_SET`, and it is broader — it fires on a zero generation, a
+mutated echo, or a package-generation mismatch alike. Grepping the tree for
+`Hwa2WriteBackAbsent` alone will miss the D3D11 half. ⛔ **Line numbers are
+deliberately omitted here** (round-3 repair): the earlier `:4925` / `:475` /
+`:505` cites drifted inside a single review round, and both files are edited by
+other lanes. Locate them with
+`rg -n -e Hwa2WriteBackAbsent -e hwa2_output_invalid umd/src umd12/src`.
 
 Incidental, from the same run: `tools/d3d12_clear_probe.cpp` **passes** on the
 deployed build — 65536/65536 pixels exactly `(0,51,102,255)`, `SetEventOn-

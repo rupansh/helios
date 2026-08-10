@@ -16,10 +16,47 @@
 //! `lane-vkd3d-umd12.md` item 9). `docs/retirement/OWNERSHIP.md` section 4 records
 //! the decision: it gets exactly one declaration, here, and this file is it.
 //!
-//! Mesa **implements** this ABI (`icd/mesa/src/virtio/vulkan/
+//! Mesa **will implement** this ABI (`icd/mesa/src/virtio/vulkan/
 //! vn_helios_direct_dispatch.{c,h}`, section 17.3). DXVK, vkd3d, `umd/bridge` and
-//! `umd12/bridge` **consume** it. No consumer may declare its own copy of the
-//! table, the entry-point name, or the mode constant.
+//! `umd12/bridge` **will consume** it. No consumer may declare its own copy of
+//! the table, the entry-point name, or the mode constant.
+//!
+//! # ⛔ Producer status: DECLARED, NOT WIRED — all five parties are hypothetical
+//!
+//! **Measured 2026-08-10.** Of this module's 65 exported symbols, **zero** are
+//! referenced anywhere outside `protocol/`:
+//!
+//! ```text
+//! grep -rn -E 'HELIOS_TRANSLATOR|HeliosTranslator|helios_translator|PfnHeliosTranslator|HELIOS_ICD_CREATE_TRANSLATOR' \
+//!   kmd_render kmd_logic umd umd12 umd_common dxvk-helios/src icd/mesa/src \
+//!   vkd3d-proton-helios/libs tools packaging qemu-helios
+//! → tools/retirement-gates.sh:78:  "#include \"helios_translator_dispatch.h\""
+//! ```
+//!
+//! That single hit is the gate script feeding the C mirror to `gcc
+//! -fsyntax-only` so its `_Static_assert`s are evaluated. **Nothing calls this
+//! ABI and nothing implements it.** Concretely, against the five parties
+//! `OWNERSHIP.md` §4 names:
+//!
+//! | party | role per OWNERSHIP §4 | state at HEAD |
+//! |---|---|---|
+//! | Helios Mesa | implements | `icd/mesa/src/virtio/vulkan/vn_helios_direct_dispatch.{c,h}` **does not exist** (`ls` that path). Mesa lane unit **A5** creates it; A5 depends on A1 and A4, neither of which has started. |
+//! | DXVK | consumes | no reference in `dxvk-helios/src` |
+//! | vkd3d | consumes | no reference in `vkd3d-proton-helios/libs` |
+//! | `umd/bridge` | consumes | no reference in `umd/` |
+//! | `umd12/bridge` | consumes | no reference in `umd12/` |
+//!
+//! ⚠ **This file compiles, `abi_parity.py` passes, the C mirror's every
+//! `_Static_assert` holds, and its unit tests are green. None of that is
+//! evidence that a consumer exists** — it is evidence about a 4298-line Rust
+//! file and its 2264-line transliteration. This is METHOD.md §3 criterion 6's
+//! fourth state, *implemented but never exercised*, and the changeset's report
+//! must not count it as implemented. Nothing here has ever run.
+//!
+//! Everything below this banner therefore describes an **intended** contract.
+//! The refusal rules, the counters, and the `_INVALID` sentinels are real
+//! declarations that a future implementer is bound by — they are not behaviour
+//! anything exhibits today, and no counter in this file can have moved.
 //!
 //! # This is the one module in the crate that is NOT a wire format
 //!

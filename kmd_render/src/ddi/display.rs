@@ -33,6 +33,17 @@ pub static PRESENT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Drives the throttle for this DDI's IDENTITY dumps (`diag::sample_tick`).
 /// Failure values — PBRet, PBCpy, PBSyWt, PBSyCp and PBFlip's error arms — are
 /// never sampled; they stay unconditional.
+///
+/// ⚠ `PBCpy`/`PBFlip` **`0xEA`** is the newest of those and the one to expect
+/// first after the HPS2 retirement lands: it means `present_alloc_info` answered
+/// `None`, i.e. the **A3 gap** — mesa unit A3 plus K6 have not re-pointed the
+/// KMD at a host resource id, so `DxgkDdiOpenAllocation` builds no
+/// `PresentAllocInfo` and every present refuses. It is counted by
+/// `create_allocation::PRESENT_NO_ALLOC_INFO` (`PrNoRid`), because a last-value
+/// breadcrumb cannot distinguish "once" from "every frame". ⛔ Do NOT read this
+/// as `0xE1`, which means "dxgkrnl handed us a handle we could not resolve" — a
+/// handle-lifetime bug, an entirely different investigation. The two shared one
+/// value until round 3 of the Phase-2 review separated them.
 static PRESENT_TRACE_TICK: AtomicU32 = AtomicU32::new(0);
 /// Drives the independent success-result mirror. `PBRet` used to perform a
 /// synchronous registry write for every successful Present, directly on the
@@ -459,9 +470,30 @@ unsafe fn dxgkddi_present_inner(
                 }
             }
 
+            // ⚠ THE A3 GAP REACHING THE DISPLAY PATH, separated from the
+            // handle-lifetime failure it used to be indistinguishable from.
+            //
+            // `present_alloc_info` answers `None` for every allocation while
+            // `PresentAllocationStorage` has no producer (K4-CONTRACT §5: HWA2
+            // carries no host resource id, so `DxgkDdiOpenAllocation` has
+            // nothing to build one from and refuses to fabricate one). So this
+            // arm is taken on EVERY present, and it used to report `0xE1` —
+            // whose meaning here is "dxgkrnl handed us a handle we could not
+            // resolve", a handle-lifetime bug. An operator would have chased the
+            // wrong defect. `0xEA` is the A3 arm and
+            // `create_allocation::PRESENT_NO_ALLOC_INFO` (`PrNoRid`) counts it,
+            // because a last-value breadcrumb cannot say whether this fired once
+            // or once per frame.
+            let alloc_info_absent = src_info.is_none() || dst_info.is_none();
             let (Some(adapter), Some(source), Some(destination)) = (adapter, src_info, dst_info)
             else {
-                crate::diag::record_named_bytes(b"PBCpy", 0xE1);
+                if alloc_info_absent {
+                    crate::ddi::create_allocation::PRESENT_NO_ALLOC_INFO
+                        .fetch_add(1, Ordering::Relaxed);
+                    crate::diag::record_named_bytes(b"PBCpy", 0xEA);
+                } else {
+                    crate::diag::record_named_bytes(b"PBCpy", 0xE1);
+                }
                 PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
                 return STATUS_INVALID_PARAMETER;
             };
@@ -781,8 +813,14 @@ unsafe fn dxgkddi_present_inner(
         // scanout only from that Windows-owned handle and the immutable
         // private-data snapshot captured by OpenAllocation. In particular, do
         // not let the UMD command payload independently select a resource.
+        // ⚠ As the BLT arm above: this is the A3 gap, not a handle-lifetime
+        // failure, and it is the arm every DWM flip now takes. `0xEA` + `PrNoRid`
+        // (`create_allocation::PRESENT_NO_ALLOC_INFO`) so the two are
+        // distinguishable and countable; `0xE1` stays reserved for its original
+        // meaning even though nothing can currently reach it here.
         let Some(source) = src_info else {
-            crate::diag::record_named_bytes(b"PBFlip", 0xE1);
+            crate::ddi::create_allocation::PRESENT_NO_ALLOC_INFO.fetch_add(1, Ordering::Relaxed);
+            crate::diag::record_named_bytes(b"PBFlip", 0xEA);
             PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
             return STATUS_INVALID_PARAMETER;
         };
@@ -796,7 +834,7 @@ unsafe fn dxgkddi_present_inner(
         // SetVidPnSourceAddress), a difference localises the break to the
         // flip-retirement contract rather than to the bind path.
         crate::ddi::scanout_trace::PRESENT_FLIP_HISTOGRAM.note(source.resource_id);
-        // Flip identity, SAMPLED (the 0xE1/0xE2 failure arms above stay
+        // Flip identity, SAMPLED (the 0xEA/0xE2 failure arms above stay
         // unconditional — those are the values a failed Present is read from).
         if sample {
             crate::diag::record_named_bytes(b"PBsrc", source.resource_id);

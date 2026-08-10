@@ -2,7 +2,81 @@
 //! host-visible linear BAR admission
 //! (`docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` §10.7, §17.1, §17.6, §17.7).
 //!
-//! # The boundary these bytes cross
+//! # ⛔⛔ HPM1 IS DECLINED. This is the guest half of a protocol the owner said no to.
+//!
+//! `docs/retirement/FINDINGS.md` **F5** is an **owner decision**, dated
+//! 2026-08-10. Not deferred, not blocked, not "pending review" — **declined**,
+//! on maintenance grounds. Everything about the host side is already undone:
+//!
+//! * `qemu-helios` is **reset** from `6a7398a72d` to `d4fde50ccb`, dropping all
+//!   three HPM1 commits (the 726-line C mirror, the ~970-line negotiation +
+//!   HLM1 BAR admission, and the ~2,780-line paging-DMA executor).
+//! * They are preserved on branch `helios/hpm1-parked` and tag
+//!   `helios-hpm1-parked-2026-08-10`, and **nothing walking the tree reaches
+//!   them** — which F5 says is the point.
+//! * ⚠ Therefore `qemu-helios/include/hw/virtio/helios_physical_memory.h`,
+//!   which the "Mirroring" section below calls this file's C mirror, **does not
+//!   exist at HEAD.** Verify with `ls`; it is on the parked branch only. This
+//!   file currently mirrors nothing, and no `_Static_assert` anywhere evaluates
+//!   its layout.
+//! * F5's Consequence: "no lane in flight has [a QEMU dependency] … **do not
+//!   add a new QEMU dependency to any lane**." Reopening HPM1 means un-parking
+//!   the branch *and* running its adversarial review first — review before
+//!   reachable, not after.
+//!
+//! # ⛔ Producer status: DECLARED, NOT WIRED — and the producer is *nothing, by decision*
+//!
+//! **Measured 2026-08-10** (`grep -cE '^pub (fn|struct|enum|const|type|trait|union|mod) '`).
+//! Of this module's **57** top-level exported symbols, exactly **three** are
+//! referenced outside `protocol/`:
+//! [`HELIOS_SEGMENT_ID_SYSTEM`], [`HELIOS_SEGMENT_ID_APERTURE`] and
+//! [`HELIOS_SEGMENT_ID_HLM1`], by `kmd_render/src/ddi/create_allocation.rs` and
+//! `kmd_logic/src/lib.rs`. Every other symbol — the negotiation record, the DMA
+//! packet, the page-run array, the page-table and TLB-epoch machinery, the
+//! ~3,000 lines that *are* HPM1 — has **zero** consumers:
+//!
+//! ```text
+//! grep -rn -E 'HELIOS_HPM1|HpmContext|HpmOperation|HpmReject' \
+//!   kmd_render/src kmd_logic/src umd/src umd12/src tools icd/mesa/src \
+//!   qemu-helios/hw qemu-helios/include
+//! → (no output)
+//! ```
+//!
+//! This is unlike every other unwired module in the crate. `translator_dispatch`
+//! is waiting on mesa **A5**; `translation_session` on **A1**; `diagnostics` on
+//! **D0** and **T1**. **HPM1 is waiting on nobody.** There is no unit, no lane,
+//! and no plan that produces or consumes it, and F5's C63 analysis supplies the
+//! replacement the KMD will use instead — a bounds-checked offset into the
+//! KMD's own permanently-mapped 64 MiB HOC1 command pool, which is *stricter*
+//! than HPM1 on the invariant C63 states, plus "option zero", which is what
+//! actually runs today: do not adopt GPUVA/HOB1 submit for D3D12 at all.
+//!
+//! ⚠ **This file compiles and its unit tests pass. That is evidence about this
+//! file and nothing else** — and here it is weaker than usual, because the C
+//! mirror that would cross-check the layout is not in the tree. This is
+//! METHOD.md §3 criterion 6's fourth state, *implemented but never exercised*,
+//! and the changeset's report must not count it as implemented. Nothing here
+//! has ever run, and on the current plan nothing ever will.
+//!
+//! ⛔ **Do not build on this module. Do not cite it as an existing mechanism.**
+//! If you need what §C55 bought — "the host is the authority on identity" — read
+//! [`crate::native_render`]'s banner, which records that the property has been
+//! **traded away** and names what replaced it (the KMD substitutes the host
+//! resid guest-side; `K4-CONTRACT.md` §5, mesa unit **A3** plus K6).
+//!
+//! ⭐ **What survives, and must not be deleted by association:** the three
+//! segment-id constants above are the *live* two-segment table the shipped KMD
+//! uses. They are declared in this file for historical reasons — they were
+//! written alongside HPM1 — but they are **not** part of the declined surface,
+//! they have real callers today, and deleting this module's HPM1 half must not
+//! take them with it. They are marked individually at their declarations.
+//!
+//! Everything from "The boundary these bytes cross" down describes the
+//! **declined** design. It is kept, unedited except for this banner and the
+//! per-item markers, so that anyone reopening F5 can read what was proposed —
+//! not because any of it is a requirement.
+//!
+//! # The boundary these bytes cross (⛔ DECLINED — F5; describes what was proposed)
 //!
 //! This module is the **KMD ↔ QEMU device** contract, and nothing else. Two
 //! traffic shapes cross it:
@@ -54,11 +128,28 @@
 //! DMA. §17.1 deletes both legacy files outright; that deletion is a later
 //! cleanup phase because `kmd_render`, `umd`, and `umd12` have not migrated yet.
 //!
-//! # Mirroring
+//! # Mirroring (⛔ FALSE AT HEAD — F5)
 //!
-//! `qemu-helios/include/hw/virtio/helios_physical_memory.h` is the hand-written
-//! C mirror of this file. **Both sides must be edited together**; every size,
-//! alignment, and field offset asserted here is `_Static_assert`ed there.
+//! `qemu-helios/include/hw/virtio/helios_physical_memory.h` **was** the
+//! hand-written C mirror of this file, and the rule was "both sides must be
+//! edited together". **That file is not in the tree.** F5 reset `qemu-helios`
+//! to `d4fde50ccb`; the header exists only on branch `helios/hpm1-parked`
+//! (`git -C qemu-helios ls-tree -r --name-only helios/hpm1-parked --
+//! include/hw/virtio/`). Consequences a reader must not miss:
+//!
+//! * There is **one** side, not two. Nothing `_Static_assert`s the offsets this
+//!   file asserts, so the usual "a reorder fails the other side's build"
+//!   guarantee does not hold here.
+//! * `tools/retirement-gates.sh`'s "protocol C mirrors compile" gate compiles
+//!   the five headers in `protocol/include/` — `helios_diagnostics.h`,
+//!   `helios_native_render.h`, `helios_translation_session.h`,
+//!   `helios_translator_dispatch.h`, `helios_wddm.h`. This module has no header
+//!   there and is **not** covered by that gate.
+//! * `protocol/tools/abi_parity.py` likewise has nothing to compare this file
+//!   against.
+//!
+//! Anyone un-parking HPM1 restores the header and both gates before trusting a
+//! single offset below.
 //!
 //! All structs are `#[repr(C)]`, little-endian, pointer-free, and padding-free
 //! (explicit `reserved*` fields, never implicit padding), so they derive
@@ -165,17 +256,35 @@ pub const HELIOS_HPM1_REQUIRED_FEATURES: u64 = HELIOS_HPM1_FEATURE_PAGING_DMA
     | HELIOS_HPM1_FEATURE_PHYSICAL_ADL;
 
 // ── The immutable two-segment table (§10.7, §17.6, C52) ─────────────────────
+//
+// ⭐ LIVE. These three constants are the ONLY symbols in this file with callers
+// outside `protocol/` (`kmd_render/src/ddi/create_allocation.rs`,
+// `kmd_logic/src/lib.rs`). They are NOT part of the HPM1 surface `FINDINGS.md`
+// F5 declined, and a demolition of that surface must NOT take them with it.
+// They live here only because they were written alongside HPM1.
 
 /// Segment id used in a run record for **guest system memory**: the page
 /// numbers come from the OS-supplied physical ADL/MDL admitted by this
 /// non-IOMMU profile. This is WDDM's own `SegmentId == 0` convention.
+///
+/// ⭐ **LIVE — has real callers. Not part of the declined HPM1 surface.**
 pub const HELIOS_SEGMENT_ID_SYSTEM: u32 = 0;
 /// Segment 1 — "the sole WDDM aperture segment and `PagingBufferSegmentId`"
 /// (§10.7). It remains the only nonzero `DmaBufferSegmentSet` choice for
 /// existing D3D runtime contexts; HVC1 native-ICD contexts select zero.
+///
+/// ⭐ **LIVE — has real callers. Not part of the declined HPM1 surface.**
+/// `kmd_render/src/ddi/create_allocation.rs` asserts it equals
+/// `crate::ddi::gpummu::APERTURE_SEGMENT_ID`.
 pub const HELIOS_SEGMENT_ID_APERTURE: u32 = 1;
 /// Segment 2 — HLM1, the package's fully CPU-visible linear local-memory
 /// segment backed by the prefetchable 64-bit host-visible BAR.
+///
+/// ⭐ **LIVE — has real callers. Not part of the declined HPM1 surface.** It is
+/// `Hvm1Role::placement()`'s preferred segment for every role. ⚠ Note that the
+/// HLM1 *segment id* being live does not make the HLM1 *BAR profile* live:
+/// F5 parks the QEMU-side BAR admission, and `FINDINGS.md` F2 records what the
+/// shipped segment table actually is.
 pub const HELIOS_SEGMENT_ID_HLM1: u32 = 2;
 /// The package reports exactly two segments, in this order (§10.7, §17.6).
 pub const HELIOS_SEGMENT_COUNT: u32 = 2;

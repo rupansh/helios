@@ -39,10 +39,39 @@
 //!     object; it is not a renderer identity and resolves to nothing on the host.
 //!   * The **generated Venus encoders write ZERO into every host-resource-id
 //!     operand.** A [`HeliosNativeRenderPatch`] names the byte position and
-//!     encoded width of each such zeroed operand so the KMD can rewrite it to a
-//!     DMA-local capability ordinal at COMMIT, and QEMU substitutes the
-//!     renderer-private resource ID only in its own host-only copy of the
-//!     stream, after resolving the capability through HPM1.
+//!     encoded width of each such zeroed operand, and **the KMD substitutes the
+//!     host resource id itself, guest-side, as it builds the `SUBMIT_3D`.**
+//!     That is `docs/retirement/K4-CONTRACT.md` §5 — "the KMD patches the host
+//!     resid in from `HeliosNativeRenderPatch`" — and it is mesa lane unit
+//!     **A3** plus K6. Sites across `umd/`, `umd12/` and `kmd_render/` already
+//!     state it in those words — re-derive with `grep -rn
+//!     'patches the host resid' umd/src umd12/src kmd_render/src`, which does
+//!     not go stale the way a count would. This banner was the last place that
+//!     still said otherwise.
+//!
+//!     ⛔ **SUPERSEDED BY `docs/retirement/FINDINGS.md` F5.** This bullet used
+//!     to end "…so the KMD can rewrite it to a DMA-local capability ordinal at
+//!     COMMIT, and QEMU substitutes the renderer-private resource ID only in
+//!     its own host-only copy of the stream, after resolving the capability
+//!     through HPM1." HPM1 is **DECLINED** — on maintenance grounds, not
+//!     deferred — `qemu-helios` is reset to its pre-retirement base, and the
+//!     three HPM1 commits survive only on branch `helios/hpm1-parked`. No host
+//!     component resolves a capability, so the substitution is guest-side or it
+//!     does not happen at all.
+//!
+//!     ⚖ **The property this trades away, named.** F5's own C55 discussion
+//!     requires it be recorded wherever it is relied on, so: *the host is no
+//!     longer the authority on resource identity.* Under §C55 no host resource
+//!     id could reach guest code at all, so a buggy or hostile guest component
+//!     could not name one; with guest-side substitution that structural
+//!     impossibility is downgraded to "host virglrenderer validates resource
+//!     ids per context" — defence in depth rather than a property of the
+//!     design. F5 accepts the trade because the guest is the user's own VM.
+//!     C55's *other* benefit, late binding of placement, was already
+//!     unrealized and stays so: it pays off only once allocations actually
+//!     move, and today's stack pins.
+//!     [`HeliosNativeRenderUse::expected_allocation_generation`] is what
+//!     refuses a batch whose allocation went stale in the meantime.
 //!   * A nonzero host-resource-id operand arriving from user mode is therefore
 //!     not "already resolved" — it is a rejected batch.
 //!
@@ -100,6 +129,22 @@
 //! protocol/package generation constant shared by protocol, Mesa, UMD11, UMD12,
 //! KMD, QEMU, and installer. Generation mismatch is fatal."). Zero is never a
 //! wildcard on either side of the comparison.
+//!
+//! # ⚠ Producer status — this file is only *partly* wired (METHOD.md §3 crit. 6)
+//!
+//! Measured 2026-08-10 by grepping each record family's constants across
+//! `kmd_render/src kmd_logic/src umd/src umd12/src icd/mesa/src tools`:
+//!
+//! | family | status |
+//! |---|---|
+//! | **HVM1** ([`HeliosVenusMemoryAllocationV1`], [`Hvm1Stage`], [`Hvm1Role`], [`Hvm1Placement`]) | **WIRED.** `kmd_render/src/ddi/create_allocation.rs` reads and writes it; `kmd_logic` tests its rules. |
+//! | **HVC1**, **HNR2**, **HVR1** (`HELIOS_HVC1_*`, `HELIOS_HNR2_*`, `HELIOS_HVR1_*` and their structs) | **DECLARED, NOT WIRED.** Zero references outside `protocol/`. The producer is mesa lane units **A1** (HTS1 session + role-1 reply pool), **A2** (the HNR2 encoder/fragmenter and HVC1 queue contexts) and **A4** (submit), per `docs/retirement/lane-mesa.md`; the KMD-side consumer is `DxgkDdiRender`/`DxgkDdiSubmitCommand`, which do not parse HNR2 today. |
+//! | [`kernel_dma`] | **DECLARED, NOT WIRED.** Zero references outside `protocol/`, including from the KMD that is nominally its only author. See that module's own banner. |
+//!
+//! Compiling here and passing this file's own tests is **not** evidence that a
+//! producer or consumer exists — it is evidence about this file. Everything in
+//! the second and third rows is METHOD.md §3 criterion 6's fourth state,
+//! *implemented but never exercised*, and must not be reported as done.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -625,6 +670,22 @@ pub struct HeliosNativeRenderUse {
 /// host-resource-id operand whose payload bytes the encoder wrote as **zero**.
 /// Arbitrary byte patching is rejected: the offset/kind/width must identify such
 /// an operand in the generated, fully parsed opcode schema.
+///
+/// **Who fills the hole: the KMD, guest-side.** `K4-CONTRACT.md` §5 cites this
+/// record by name — "the KMD patches the host resid in from
+/// `HeliosNativeRenderPatch`" — as the *replacement mechanism* for the retired
+/// 48-byte `HeliosWddmOpenIdentity::resource_id` that HWA2 deliberately does not
+/// carry. It is not a substitution of one field for another; it is a different
+/// mechanism, and it is mesa lane unit **A3** plus K6. Not QEMU: HPM1 is
+/// declined (`docs/retirement/FINDINGS.md` F5) and there is no host-side
+/// resolver.
+///
+/// ⚠ **No producer or consumer exists at HEAD.** `grep -rn
+/// HeliosNativeRenderPatch kmd_render/src umd/src umd12/src icd/mesa/src`
+/// returns matches, but **not one of them is a use of this type** — every hit
+/// is a doc comment or a refusal-message string literal naming this record as
+/// the thing A3 will build, sited where the driver fails loudly meanwhile. This
+/// record is declared, not wired.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable, PartialEq, Eq)]
 pub struct HeliosNativeRenderPatch {
@@ -2681,7 +2742,7 @@ const _: () = {
 /// rather than by a comment somebody has to find:
 ///
 ///   * [`kernel_dma::Hnr2PhysicalCapability`] carries a **physical address**, a
-///     segment ID, and an HPM1 placement epoch. Handing any of those to user mode
+///     segment ID, and a placement epoch. Handing any of those to user mode
 ///     would leak the guest-physical layout of HLM1's BAR window.
 ///   * [`kernel_dma::Hnr2KmdDmaPrivateV1`] is the `DmaBufferPrivateDataSize`
 ///     record; Dxgkrnl
@@ -2689,9 +2750,40 @@ const _: () = {
 ///     [`HELIOS_HVC1_DMA_PRIVATE_DATA_BYTES`] and this struct is exactly that.
 ///
 /// The pointer-free rule still holds inside the kernel: no pointer, handle, PID,
-/// **host resource ID**, or name enters DMA. QEMU resolves each capability
-/// through the exact HPM1 page owner and substitutes renderer-private resource
-/// IDs only in its own host-only copy of the command stream.
+/// **host resource ID**, or name enters DMA. The KMD resolves each capability
+/// against its own allocation objects and substitutes the host resource id
+/// guest-side as it builds the `SUBMIT_3D` (`K4-CONTRACT.md` §5; mesa unit
+/// **A3** plus K6).
+///
+/// ⛔ **SUPERSEDED BY `docs/retirement/FINDINGS.md` F5.** The two paragraphs
+/// above previously read "an HPM1 placement epoch" and "QEMU resolves each
+/// capability through the exact HPM1 page owner and substitutes
+/// renderer-private resource IDs only in its own host-only copy of the command
+/// stream". HPM1 is declined and `qemu-helios` is at its pre-retirement base,
+/// so there is no host-side resolver and no host-only copy. See the file
+/// banner's "⛔⛔ no resid may appear" block for the property that trades away.
+///
+/// # ⚠ Producer status: this whole module is DECLARED, NOT WIRED
+///
+/// Measured 2026-08-10: `grep -rn 'Hnr2PhysicalCapability\|Hnr2KmdDmaPrivateV1\|
+/// Hnr2CapabilityExpect\|Hnr2DmaReject\|kernel_dma' kmd_render/src kmd_logic/src
+/// umd/src umd12/src icd/mesa/src tools` returns **nothing**. The KMD is
+/// nominally this module's only author and it does not reference it: no
+/// `DxgkDdiRender` emits a capability table, no `DxgkDdiPatch` snapshots a
+/// placement into one, and no `DxgkDdiSubmitCommand` calls
+/// [`kernel_dma::Hnr2PhysicalCapability::validate_at_submit`]. The producer is
+/// the KMD's native-Render path, which arrives with mesa units **A2**/**A4**
+/// (the HNR2 encoder and submit) plus the KMD-side Render/Submit work — none of
+/// which exists at HEAD.
+///
+/// The `hpm_epoch` field and [`kernel_dma::Hnr2DmaReject::PlacementEpochStale`]
+/// keep their names because this file is the wire ABI and a rename is a layout
+/// event with C mirrors and `_Static_assert` twins; their *meaning* is now "the
+/// KMD's own placement epoch", not HPM1's. Whoever wires this module renames
+/// them in the same change that gives them a producer.
+///
+/// Passing this file's unit tests is evidence about this file. It is not
+/// evidence that a producer exists — METHOD.md §3 criterion 6's fourth state.
 pub mod kernel_dma {
     use super::{
         HELIOS_HNR2_ACCESS_MASK, HELIOS_HNR2_MAX_USE_RECORDS, HELIOS_HVC1_DMA_PRIVATE_DATA_BYTES,
@@ -2731,8 +2823,13 @@ pub mod kernel_dma {
         pub allocation_offset: u64,
         /// Byte length of the used range.
         pub byte_length: u64,
-        /// HPM1 placement epoch this capability was snapshotted against. A
-        /// stale epoch removes the context; it is never repaired by a lookup.
+        /// Placement epoch this capability was snapshotted against. A stale
+        /// epoch removes the context; it is never repaired by a lookup.
+        ///
+        /// ⛔ The name is HPM1's, the meaning is not: per `FINDINGS.md` F5 the
+        /// epoch is the **KMD's own** placement epoch, because HPM1 is declined
+        /// and no host-side page owner exists. The field keeps its wire name
+        /// only because renaming it is a layout event across the C mirrors.
         pub hpm_epoch: u64,
     }
 
@@ -2799,7 +2896,8 @@ pub mod kernel_dma {
         CapabilityUnplacedAtSubmit,
         /// `allocation_generation` no longer matches the KMD allocation object.
         AllocationGenerationStale,
-        /// `hpm_epoch` is not the current HPM1 placement epoch.
+        /// `hpm_epoch` is not the current placement epoch. (Named for HPM1;
+        /// the epoch is the KMD's own — `FINDINGS.md` F5.)
         PlacementEpochStale,
         /// The capability's segment is not the allocation's current segment.
         SegmentNotCurrent,
@@ -2844,15 +2942,16 @@ pub mod kernel_dma {
     }
 
     /// The current placement of one allocation, as `DxgkDdiSubmitCommand` sees
-    /// it. Everything here is live KMD/HPM1 state, never anything the batch
-    /// supplied.
+    /// it. Everything here is live KMD state, never anything the batch
+    /// supplied. (Was "live KMD/HPM1 state" — HPM1 is declined, `FINDINGS.md`
+    /// F5, so the KMD is the only source.)
     #[derive(Debug, Clone, Copy)]
     pub struct Hnr2CapabilityExpect {
         /// The allocation object's current generation.
         pub allocation_generation: u64,
         /// The allocation's current segment.
         pub segment_id: u32,
-        /// The current HPM1 placement epoch.
+        /// The current placement epoch (the KMD's own — `FINDINGS.md` F5).
         pub hpm_epoch: u64,
         /// The allocation's byte size.
         pub allocation_bytes: u64,
@@ -2898,8 +2997,11 @@ pub mod kernel_dma {
             Ok(())
         }
 
-        /// Full validation against still-current HPM1 ownership at
-        /// `DxgkDdiSubmitCommand`. A stale, unresident, or mismatched capability
+        /// Full validation against the still-current KMD-side placement at
+        /// `DxgkDdiSubmitCommand` (was "still-current HPM1 ownership";
+        /// `FINDINGS.md` F5 declines HPM1, so the KMD's allocation objects are
+        /// the only ownership record).
+        /// A stale, unresident, or mismatched capability
         /// removes the context/device — it is **never** repaired by looking up a
         /// host ID.
         pub fn validate_at_submit(
@@ -3808,8 +3910,8 @@ mod tests {
     /// (Offsets and sizes need no test: both sides assert them at compile time.)
     ///
     /// ⛔ The header deliberately mirrors NOTHING from [`kernel_dma`]:
-    /// `Hnr2PhysicalCapability` carries a physical address, a segment ID and an
-    /// HPM1 placement epoch, and §17.1 states the record "exists only in
+    /// `Hnr2PhysicalCapability` carries a physical address, a segment ID and a
+    /// placement epoch, and §17.1 states the record "exists only in
     /// scheduler DMA and is never returned to user mode". So no constant of that
     /// module is pinned here either — an assertion that a Mesa-facing header
     /// carries a kernel-internal value would be asserting the wrong thing.

@@ -23,6 +23,41 @@
 //! Present, allocation-open, or display callback may attach a session or
 //! reinterpret HQA1 (section 10.4, lines 1327-1333).
 //!
+//! # ⛔ Producer status: DECLARED, NOT WIRED — neither boundary is crossed today
+//!
+//! **Measured 2026-08-10.** Of this module's 54 top-level exported symbols,
+//! **zero** are referenced outside `protocol/`:
+//!
+//! ```text
+//! grep -rn -E 'HELIOS_HTS1|HELIOS_HQA1|HeliosTranslationSession|HeliosQueueAttachV1|HeliosTranslationEndpointV1|HeliosSessionCapability|HELIOS_ENGINE_CLASS' \
+//!   kmd_render/src kmd_logic/src umd/src umd12/src umd_common/src \
+//!   dxvk-helios/src icd/mesa/src vkd3d-proton-helios/libs tools packaging
+//! → (no output)
+//! ```
+//!
+//! The C mirror `protocol/include/helios_translation_session.h` has exactly one
+//! reader, `tools/retirement-gates.sh:77`, which `#include`s it so `gcc
+//! -fsyntax-only` evaluates its `_Static_assert`s. Neither boundary in the
+//! section above is crossed by anything:
+//!
+//! * **HTS1 INIT/reply** — the producer is mesa lane unit **A1**
+//!   (`vn_helios_translation_session.{c,h}` per `docs/retirement/lane-mesa.md`),
+//!   which does not exist; `ls icd/mesa/src/virtio/vulkan/` shows only
+//!   `vn_helios_hwa2.{c,h}` and `vn_renderer_helios.c`. The KMD-side consumer
+//!   is the HVC1 control-Render path, which is likewise unbuilt (see
+//!   [`crate::native_render`]'s producer-status table).
+//! * **HQA1** — the producers are the D3D11 and D3D12 UMDs at
+//!   `pfnCreateContextCb` / `pfnCreateContextVirtualCb`, and the consumer is
+//!   `DxgkDdiCreateContext`. Neither UMD builds an HQA1 and the KMD does not
+//!   parse one.
+//!
+//! ⚠ **Compiling here, passing this file's tests, and satisfying
+//! `abi_parity.py` is evidence about this file — not evidence that a producer
+//! or consumer exists.** That is METHOD.md §3 criterion 6's fourth state,
+//! *implemented but never exercised*; the changeset's report must not count it
+//! as implemented. Every rule below is a binding contract on a future
+//! implementer, not behaviour anything exhibits. Nothing here has ever run.
+//!
 //! # What supersedes what
 //!
 //! This module supersedes the *context/session establishment* verbs of the
@@ -75,9 +110,15 @@
 //!
 //! Every wire struct is `#[repr(C)]`, little-endian, pointer-free, and
 //! padding-free (explicit reserved fields, never implicit padding), so it derives
-//! `Pod`/`Zeroable` and the C mirror in Mesa/QEMU cannot drift. Every size,
-//! alignment, and field offset in the section-10.4 table is a `const` assertion
-//! at the bottom of this file: a wrong offset breaks the build, not a test.
+//! `Pod`/`Zeroable` and its C mirror cannot drift. Every size, alignment, and
+//! field offset in the section-10.4 table is a `const` assertion at the bottom
+//! of this file: a wrong offset breaks the build, not a test.
+//!
+//! ⚠ The mirror is `protocol/include/helios_translation_session.h`, and the
+//! phrase "the C mirror in Mesa/QEMU" that stood here was wrong twice over:
+//! Mesa does not `#include` it (only `helios_wddm.h`, via `vn_helios_hwa2.h`),
+//! and QEMU mirrors nothing from this module at all. Its `_Static_assert`s are
+//! evaluated only by `tools/retirement-gates.sh`.
 //!
 //! Every validator is a total function returning a `Result` with a *named*
 //! reason per rejection — never a `bool`, never a panic. Reserved fields are

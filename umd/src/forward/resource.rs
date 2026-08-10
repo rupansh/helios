@@ -284,15 +284,22 @@ pub(crate) unsafe fn allocate_wddm_resource(
     // one this UMD can compute, and it is byte-for-byte the value the retired
     // `HeliosWddmAllocPrivate::size` carried.
     //
-    // ⚠ OPEN, and flagged rather than guessed (`K4-CONTRACT.md` §1.3): the KMD
+    // ⭐ DECIDED — `K4-CONTRACT.md` §1.3, and this arm is **Tier 2**. The KMD
     // computes a KMD-side linear extent of its own — `create_allocation.rs`
     // `linear_blob_size(pitch, height)` = `pitch * round_up(height, 128) + 64
     // KiB`, floor one page — from two constants that are private to
-    // `kmd_render` and are NOT in `protocol/`. §1.3 says K4 keeps that
-    // computation and VALIDATES the UMD's `byte_size` against it. This driver
-    // therefore sends the extent it actually knows; whether the KMD accepts it
-    // as a lower bound or demands equality is a KMD-lane decision that this
-    // side cannot make (see the cross-lane request in the K4 report).
+    // `kmd_render` and deliberately NOT in `protocol/`. That estimate is
+    // *strictly larger* than the number computed here, which is exactly why the
+    // question needed a ruling rather than a guess.
+    //
+    // §1.3's answer for a descriptor this driver authored (Tier 2, i.e. NOT a
+    // `STANDARD` allocation the KMD wrote itself): the KMD requires `byte_size
+    // != 0`, every plane record bounded inside it, and `byte_size <=` the
+    // backing extent it created. **Exceeding the backing is refused; the reverse
+    // is admitted, and nothing is rewritten — the UMD's claim stands or the
+    // create fails.** It does NOT demand equality with `linear_blob_size` on
+    // this arm; had it done so, every D3D11 create would have failed. So the
+    // extent this driver can actually compute is the right thing to send.
     let size = (pitch as u64)
         .saturating_mul(mip0.TexelHeight.max(1) as u64)
         .max(4096);
@@ -518,13 +525,27 @@ pub(crate) unsafe fn allocate_wddm_resource(
     // it would leave `store_resource` holding a handle whose descriptor nobody
     // can trust, which is exactly the disagreement §10.3 exists to prevent.
     //
-    // ⚠ UNEXERCISED AND KNOWN TO BE: whether dxgkrnl propagates the KMD's
-    // create-time private write back into THIS buffer at all is not established
-    // anywhere in the doc set (recon §7 item 6; `umd12`'s `AllocPrivateWrittenBack`
-    // detector was added to measure exactly that and its result has never been
-    // reported). If the answer is "no", every create fails here with
-    // `AllocationGenerationZero` — which is the loud, correct symptom of a
-    // design assumption being false, and is why this refusal names the field.
+    // ⚠ UNEXERCISED AND KNOWN TO BE. `FINDINGS.md` F10 answered the general
+    // question — dxgkrnl DOES copy the KMD's create-time private write back into
+    // the creating UMD's buffer, proven by a pre/post byte comparison in which a
+    // 48-byte kernel-authored record arrives intact — but read F10's **Bound**:
+    // that proof covers the D3D11 arm at a **96-byte** `PrivateDriverDataSize`
+    // and explicitly NOT 168. This arm sends exactly `HELIOS_HWA2_BYTES` = 168
+    // (`private_size`, above), so the length that was measured is not the length
+    // that ships, and propagation AT THIS LENGTH is still unproven. If it does
+    // not hold, every create fails here with `AllocationGenerationZero` — the
+    // loud, correct symptom of a design assumption being false, and why this
+    // refusal names the field.
+    //
+    // The instruments that answer it on the deployed build are this file's own
+    // `hwa2_output_invalid` (below — deliberately broad: zero generation,
+    // mutated echo, or package-generation mismatch alike) and, on the D3D12
+    // arm, `Hwa2WriteBackAbsent` in `umd12/src/forward12/resource12.rs`.
+    // ⛔ NOT `AllocPrivateWrittenBack`: F10's "the instrument that could NOT
+    // have answered it" section records why — it fired only when the write-back
+    // DIFFERED from what the UMD sent, so "no write" and "the write agreed with
+    // me" were indistinguishable — and at HEAD it has been re-graded into a
+    // success census (expected to equal `IdentityRecorded`), not a detector.
     if let Err(rejection) = desc.validate_create_output(HELIOS_PACKAGE_GENERATION) {
         note_ddi_refusal(&DDI_REFUSALS.hwa2_output_invalid);
         log_error!(
@@ -685,8 +706,11 @@ pub(crate) unsafe fn finish_wddm_tex2d(
     // cookie, no global-share field and no tracker flag bit, and §10.3's "no …
     // independently usable identity" forbids reintroducing it under another
     // name). The out-parameter survives only because the C++ bridge declares it
-    // (`umd/bridge/`, not this lane); see the K4 report's cross-lane request to
-    // drop the parameter on both sides in one changeset.
+    // (`umd/bridge/`, not this lane). Removing it must change the Rust extern
+    // and the C++ declaration in ONE changeset or the bridge stops linking —
+    // that is an open cross-lane request against `umd/bridge/`, and §6 rules
+    // only that the tracker has no successor; it does not itself cover the
+    // bridge signature.
     let (mut venus_alloc_size, mut memory_type_index) = (0u64, 0u32);
     let mut retired_global_vidmm_tracker = 0u64;
     if backing_resource_id != 0 {

@@ -161,9 +161,14 @@ flag day, because the moment `dxgkddi_create_allocation` stops accepting the
 | `icd/mesa` | reads HWA2 from `protocol/include` — the hand-mirrored 48-byte records are gone, so the header's per-field `offsetof` asserts now fire in the ICD's own TU | ninja green |
 | `tools/retirement-gates.sh` | the two §8 gates that were named but never written | 8 gates, ALL PASS |
 
-⛔ **Nothing has run.** Every HWA2 path is *implemented but never exercised* —
-`METHOD.md`'s distinct third state, not "done". No deploy: round 2 of the review
-is the gate, and `OWNERSHIP.md` §3's activation conditions are not met (F9).
+⛔ **No HWA2 path has run.** Every one of them is *implemented but never
+exercised* — `METHOD.md`'s distinct third state, not "done". No deploy:
+**saturation** is the gate, not any single round (three have run; the arithmetic
+and the full state classification are below), and `OWNERSHIP.md` §3's activation
+conditions are not met (F9). ⚠ The blanket *"nothing in the changeset has ever
+run on the target"* is **false** and keeps being repeated: `fa8489e` is inside
+`d1c820a..HEAD`, and F6 measured its slot audit on the target in both arms. Scope
+the claim to the HWA2 paths, which is where it is true.
 
 ⇒ **When it does deploy, every Win32 shared-memory import and export refuses and
 the desktop dies**, until mesa **A3** lands. That follows from §10.3 forbidding
@@ -255,13 +260,48 @@ purpose — `create_allocation.rs` was in flight while this was written, and a
 cite into a moving file is stale before it is read.) A hardcoded role number
 would have been a claim about K2's schedule embedded in kernel code.
 
-**Phase 2 round 1 has now run** for `protocol`, `kmd_render` and
-`vkd3d-proton-helios` — see `docs/retirement/REVIEW-ROUND-1.md` for the findings
-and their bounds. The QEMU review is moot (F5). ⛔ Round 1 is **not** saturation:
-`METHOD.md` §3 requires two consecutive dry rounds with different lens
-compositions, and this one found things. §18's runtime gates remain unexecuted,
-except the WDDM 3.2 slot audit's refusal path, which is now proven on the target
-(`FINDINGS.md` F6).
+### ⭐ Three review rounds have run, and the earliest saturation can arrive is round 5
+
+`METHOD.md` §2 phase 2 is the loop; `METHOD.md` §3 is the test it turns on.
+
+| round | scope | lenses | raw → survived | recorded in |
+|---|---|---|---|---|
+| 1 | `protocol`, `kmd_render`, `vkd3d-proton-helios` | — | see the doc | `docs/retirement/REVIEW-ROUND-1.md` |
+| 2 | the whole changeset | 6 rotated, a skeptic per lens | 57 → 24 | ⚠ **only commit `2e04189`'s message**, plus `d803346` for the blocker it split out |
+| 3 | the whole changeset | 8 rotated — security/§15, failure-policy §10.9 row by row, deployment-readiness, kernel-safety, producer/consumer field agreement, instrument attribution, claim-integrity-at-HEAD, gate-defeat — a skeptic per lens, plus a completeness critic | 53 → 30, **plus 6 confirmed acceptance-gate defeats** | `docs/retirement/REVIEW-ROUND-3.md` |
+
+⚠ **Round 2 has no review document.** It is legible only as `git log -1 2e04189`,
+which is not where anyone looks. Recorded as a gap rather than back-filled: a
+reconstruction written from memory a round later would be a worse artefact than
+the commit message it paraphrased.
+
+⛔ **Round 3 is not dry, so `METHOD.md` §3 criterion 1 cannot be satisfied before
+round 5.** The criterion is two *consecutive* dry rounds with **different** lens
+compositions. Round 3 produced 30 surviving findings, so it is not the first dry
+round; round 4 reviews the repairs those 30 force — new code, read for the first
+time — so the best case is that round 4 is the first dry round and round 5 the
+second. `REVIEW-ROUND-3.md` states the same conclusion in its own words. Two more
+rounds is the **floor, not the estimate**: rounds 1, 2 and 3 each found real
+defects in the previous round's repairs.
+
+⚠ **Known weakening of all three rounds, recorded rather than glossed:** reviewer
+and author are the same party, which `METHOD.md` §2 phase 3 forbids in the
+parallel-lane case. What was actually done instead — each lens reads the whole
+changeset rather than a slice, each finding goes to a *separate* skeptic
+instructed to default to refuted, and the repairs are routed to authors over
+disjoint file sets, none of whom reviewed — is a mitigation, not the control.
+Weigh the findings accordingly, and see `REVIEW-ROUND-3.md`'s own note.
+
+⛔ A **gate-defeat lens is now standing composition, not a one-off.** Round 2's
+completeness critic did not argue that the §8.5 gate was weak — it wrote the
+defeating patch and ran it (`2e04189`: a three-line alias hop passed the old gate
+with exit 0), and round 3 confirmed six more acceptance-gate defeats the same
+way. ⇒ **Ask a reviewer to defeat a gate, not to assess it.**
+
+The runtime side is unchanged: §18's runtime gates remain unexecuted, except the
+WDDM 3.2 slot audit, which has run on the target in **both** arms (`FINDINGS.md`
+F6) — see state A below, because that row is regularly mis-filed as unexercised.
+The QEMU review is moot (F5).
 
 **Everything Linux-verifiable is green**, and it is now one command:
 `tools/retirement-gates.sh` — now **8 gates, all PASS**: protocol tests, Rust↔C
@@ -275,6 +315,257 @@ Separately: `tools/umd12-host-check.sh`, vkd3d ninja, QEMU ninja.
 Note there is no
 workspace root — build `protocol` from `protocol/`, not with `-p` from the repo
 root.
+
+### ⭐ What K4 will actually do on deploy — the state classification `METHOD.md` §3 criterion 6 requires
+
+Criterion 6 requires the changeset's own report to distinguish **implemented /
+refused / unreachable / implemented-but-never-exercised**. K4 does not fit four
+buckets: "implemented but never exercised" splits into ungated and knob-gated,
+which have completely different blast radii; a whole class has **no producer
+anywhere**, which is dead rather than unexercised; and one subsystem is
+implemented *twice*. Seven rows below, each mapped to its METHOD state and each
+re-measured against HEAD rather than inherited.
+
+#### A. Implemented **and exercised on the target** — do not re-file this as unexercised
+
+* **`DriverEntry` → `ddi::wddm32_slot_audit::verify`** — the 192-slot audit
+  (`SLOT_COUNT = 192`) that refuses the load with
+  `STATUS_DEVICE_CONFIGURATION_ERROR` (`0xC000_0182`, written as a literal) on any
+  disagreement, before `DxgkInitialize` ever sees the table. It ran, it passed,
+  and its refusal arm was proven with one deliberately flipped row
+  (`FINDINGS.md` F6 — `22.22.261.0` refused at index 187 with `S1=0x0DA010BB` /
+  `S2=0x0DA02002`; `22.22.262.0` `OK`/`CM_PROB_NONE` with a composited desktop).
+  ⭐ **And the table it audited is the table at HEAD:**
+  `git log d1c820a..HEAD -- kmd_render/src/lib.rs` ends at `fa63ba6` and
+  `-- kmd_render/src/ddi/wddm32_slot_audit.rs` ends at `97ad14b`, both **older**
+  than F6's measurement commit `d76b137`, so nothing K4 landed afterwards touched
+  `build_ddi_table()` or the classification. Bound, F6's own: one row, one of the
+  two failure arms (`0x0DA0_2001`, registered-but-classified-unreachable, is still
+  unexecuted), and the walk was proven to reach index 187 of 192, not 191.
+
+#### B. Implemented, never exercised, **FIRST to run on deploy, and ungated**
+
+The highest-blast-radius unexercised code in the changeset. All of it is on DWM's
+and GDI's own boot path and none of it is behind a knob — there is no arm in which
+it is off and the desktop still runs.
+
+* **`DxgkDdiGetStandardAllocationDriverData`** — the KMD now *authors* an HWA2
+  (`PRIV_SIZE = HELIOS_HWA2_BYTES`) for the OS standard allocations:
+  `SHAREDPRIMARYSURFACE`, `SHADOWSURFACE`, `STAGINGSURFACE` and `GDISURFACE`
+  (including the OPTIMAL GDI-texture arm, which has no linear row layout).
+* **`DxgkDdiCreateAllocation` → `admit_hwa2` → { `classify_hwa2` →
+  `build_backing` → `allocation_object::mint` → the `validate_create_output`
+  write-back }.** The write-back *model* is measured sound (F10 — dxgkrnl does
+  propagate the KMD's create-time private data back to the creating UMD); the
+  path through it is not.
+* **`umd/src/forward/alloc.rs`**, the D3D11 HWA2 producer — **no kill switch
+  exists.** `grep -i hwa2 umd/src/knobs.rs` is empty (verified), and none of the
+  ten knobs that file does declare gates the allocation path. `UmdD3D12` is the
+  D3D12 switch and covers none of this. dwm loads this UMD at boot.
+* **`DxgkDdiOpenAllocation` → `read_open_descriptor`** and its `OaHwa2Rej`
+  counter (which counts only buffers that were HWA2-shaped and still failed — a
+  non-HWA2 168-byte record is not counted, deliberately).
+
+#### C. Implemented, never exercised, behind a **default-OFF** knob
+
+* The **entire `umd12` HWA2 producer** — `BoolKnob::new(c"UmdD3D12", false)`
+  (`umd12/src/knobs12.rs`), the D3D12 kill switch.
+* The **`Umd12CoreDdi=116` arm** — absent ⇒ **110**, and an unrecognised value is
+  a *counted* refusal that falls back to 110 (`CoreDdiArm::selected`,
+  `umd12/src/adapter12.rs`), never a token passed through to the runtime.
+* **`VK_LAYER_HELIOS_present`** — 4135 lines
+  (`icd/mesa/src/vulkan/helios-present-layer/helios_present_layer.cpp`, plus a
+  243-line header), deliberately **not** registered machine-wide (an implicit
+  layer would enter dwm's `dxvk-helios` instances, which §2 item 8 forbids). It
+  loads only through `tools/install-helios-present-layer.ps1` +
+  `tools/run-helios-layer-app.ps1`.
+
+#### D. Unreachable by construction at this surface (METHOD state: *unreachable*)
+
+* **All six native-fence DDIs** — `Create` / `Destroy` / `Open` / `Close` /
+  `UpdateMonitoredValues` / `UpdateCurrentValuesFromCpu`, registered
+  unconditionally in `build_ddi_table()` **so the slot audit can see them**, and
+  gated inside on `NATIVE_FENCE_ADVERTISED = matches!(SURFACE, Wddm3_2GpuMmu)` —
+  **false**, because `ddi/wddm_surface.rs` declares `Wddm2_1GpuMmu`. Their **21**
+  counters (`NfCreateOk` … `NfLiveLocal`) therefore cannot move. ⚠ F9 is the
+  other half of this row: nine symbols in that file have no caller at all, and
+  `OWNERSHIP.md` §3's "the native-fence DDI surface is complete" activation gate
+  is **NOT met** — four registered slots is not the surface.
+* **The three residency / `Flags2` union writes** —
+  `set_ExplicitResidencyNotification` (on the **WDDM2_0** flags word, *not* on
+  `Flags2`, so grepping `Flags2` will not find it), `set_DisablePartialResidency`
+  and `set_RestrictedToSingleSegment`. Doubly unreachable: they sit on the HVM1
+  placement arm, which has no producer (state F), and `Flags2` is a WDDM 3.2 field
+  that is **inert** at `Wddm2_1GpuMmu`. K4-CONTRACT §8 obligation 8 says treat as
+  unexercised until measured on the target; an unchanged residency trace is *not*
+  evidence the writes are missing.
+* **`adapter::allocation_object::invalidate_all()` has no call site at all** —
+  `grep -rn invalidate_all kmd_render/src/` returns the definition, doc
+  references, and nothing else. `ALLOCATION_EPOCH` starts at 1 and stays 1;
+  `GENERATION_EPOCH_BUMPS` (registry `AcGenEpoch`) can never move. ⛔ This is not
+  cosmetic: §14 requires the allocation generation and the native-fence generation
+  to be invalidated **together**, and **neither call exists** —
+  `ddi::native_fence::invalidate_all` has no call site either. **An adapter reset
+  invalidates nothing today, so the anti-stale mechanism is defeated.** This is
+  cross-lane request **X1** below.
+
+#### E. Refused loudly with a named counter (METHOD state: *refused*) — this part genuinely works
+
+* **D3D11 open** — `hwa2_open_needs_mesa_a3` → `E_FAIL`
+  (`umd/src/forward/resource.rs`, counter declared in `umd/src/forward.rs` and
+  published in the `DDI refusals:` block).
+* **The ICD's A3 gaps** — `HELIOS_A3_GAP_IMPORT_WIN32` and
+  `HELIOS_A3_GAP_EXPORT_ADOPTION`, each with a self-explaining site name and
+  reason string in `vn_helios_hwa2.c`, returning
+  `VK_ERROR_INVALID_EXTERNAL_HANDLE`. (Plus `HELIOS_A3_GAP_HANDLE_PROPERTIES`,
+  which is in `vkGetMemoryWin32HandlePropertiesKHR` and is not an allocation at
+  all, and `HELIOS_A3_GAP_VIDMM_TRACKER`.)
+* **D3D12 present** — `PresentIdentityNoResourceId`
+  (`umd12/src/forward12/present12.rs`), which names mesa A3 rather than
+  fabricating an identity §10.3 forbids the UMD to supply.
+
+#### F. **No producer exists anywhere** — dead, not merely unexercised
+
+Everything here compiles, is asserted, and is reached by nothing. Measured at
+`2e04189`, `.rs` + its `protocol/include` C mirror where one exists. ⚠ **The line
+counts below are a snapshot and will drift** — re-derive with `wc -l` rather than
+citing them onward; what does not drift is that **nothing outside `protocol/`
+calls any of it**, and that is the load-bearing half:
+
+| dead surface | size | measurement |
+|---|---|---|
+| `protocol/src/translator_dispatch.rs` + `helios_translator_dispatch.h` | 4298 + 2264 = **6562** | **0 of its 65 top-level `pub` items** is referenced by `kmd_render`, `kmd_logic`, `umd`, `umd12`, `umd_common`, `icd/mesa/src`, `dxvk-helios/src` or `tools` |
+| `protocol/src/translation_session.rs` + `helios_translation_session.h` | 2181 + 580 = **2761** | only `protocol/src/lib.rs` itself uses it (`check_package_generation` → `check_generation_match`) |
+| `protocol/src/diagnostics.rs` + `helios_diagnostics.h` | 1414 + 696 = **2110** | the §12.3 ETW schema with **zero emitters**: no `EventWrite` / `TraceLoggingWrite` / `McGenEventWrite` anywhere in `kmd_render`, `umd`, `umd12`, `umd_common` or `protocol`. (The only `TraceLoggingWrite` in the tree is upstream Mesa's `gallium/frontends/mediafoundation`, unrelated to Helios.) |
+| `protocol/src/physical_memory.rs` | **3155** | **55 of its 57** top-level `pub` items have no consumer; the two that do are `HELIOS_SEGMENT_ID_APERTURE` and `HELIOS_SEGMENT_ID_HLM1`. This is the HPM1 surface F5 **declined** |
+| the HVM1 / HOC1 admission surface in `ddi/create_allocation.rs`, and its `AcSegRole1`…`AcSegRole4` + `AcSegHoc1` counters | — | nothing outside `protocol/` **constructs** an HVM1 or HOC1 record; `kmd_render` is a consumer and `kmd_logic` a model. The producer is mesa A3 (HVM1) and K5/K6 (HOC1), neither started |
+
+≈ **14.4k lines** carried by a changeset in which none of it can run. That is a
+deliberate consequence of authoring the protocol lane ahead of its consumers — but
+it is also the largest single reservoir of unverifiable claims in the tree, and
+every review round has found defects in it.
+
+#### G. The fifth state — **implemented twice, exercised once, and the exercised copy is the one nothing ships**
+
+⛔ **`kmd_render` calls ZERO functions from `kmd_logic::allocation_identity`.**
+Measured per module: of `kmd_logic`'s 17 `pub mod`s, `kmd_render` references 15 —
+`scanout_lease` 16 refs, `present_stream` 14, `snapshot_bind` 11,
+`scanout_publish_txn` 10, `scanout_presentation_epoch` 6, … — and exactly two
+have zero: `scanout_fast_bind` and **`allocation_identity`**.
+
+`allocation_identity` implements precisely the decisions the KMD makes —
+`hwa2_admit_create_input`, `hwa2_stamp_create_output`, `hwa2_admit_open`,
+`hwa2_echoed_fields_equal`, `hvm1_admit_create_input`, `hvm1_admit_placement`,
+`hvm1_written_flags_match`, `hoc1_admit_create_input`, `Hoc1Pool::reserve` /
+`::retire`, `GenerationCounter::mint` / `::on_adapter_reset`,
+`classify_alloc_private_data`. `kmd_render` re-derives every one of them in
+`ddi/create_allocation.rs` (`classify_hwa2`, `admit_hwa2`, `admit_hvm1`,
+`admit_hoc1`) and `adapter/allocation_object.rs` (`mint`, `is_current`,
+`invalidate_all`). **It is a parallel re-implementation, not the shipped logic.**
+
+⇒ **Consequence for acceptance.** `K4-CONTRACT.md` §8 rows 1–4 name `kmd_logic`
+as where the obligation is proven. Those rows prove a *model of* the KMD, not the
+KMD: **25 of `kmd_logic`'s 211 tests** live in `allocation_identity_tests`, and
+those 25 exercise code that is in no driver image. (The other 186 are fine — they
+cover modules `kmd_render` genuinely calls.) The §8 rows are being restated
+accordingly by their owner this round; what belongs here is the outstanding work.
+
+⇒ **Outstanding wiring unit — named `K4-W` here for the first time** (the name is
+free: `grep -rn 'K4-W' docs/` was empty). Route `ddi/create_allocation.rs` and
+`adapter/allocation_object.rs` **through** `kmd_logic::allocation_identity`
+instead of beside it, exactly as `ddi/display.rs` already routes through
+`kmd_logic::scanout_lease`. Until it lands, every `kmd_logic` allocation test is
+assurance about a second implementation — the same defect class CLAUDE.md's last
+invariant row names for `kmd_render`'s own `#[cfg(test)]` modules. Owner:
+`ddi/create_allocation.rs`'s owner (`OWNERSHIP.md` §1 makes it single-owner);
+sequence it with **K13**, the `kmd_logic` model rewrite, which is the only other
+unit that touches both sides.
+
+### ⭐ Cross-lane register — requests filed in source comments and tracked nowhere else
+
+K4's authors could not make these edits: every target is in a file another unit
+owns (`docs/retirement/OWNERSHIP.md` §1), and inventing a back channel to reach
+one would have been worse than the gap. Until now they existed **only** as
+comments inside the requesting file, which is not a tracker. Status re-derived at
+HEAD; symbols cited rather than line numbers, because these files move.
+
+| # | filed in | against | request | status |
+|---|---|---|---|---|
+| **X1** | `kmd_render/src/adapter/allocation_object.rs` (module header) | `ddi/lifecycle.rs::dxgkddi_stop_device`, `ddi/lifecycle.rs::dxgkddi_remove_device` (**K10**); `ddi/submit_command.rs::dxgkddi_reset_from_timeout` (**K9**) | call `adapter::allocation_object::invalidate_all()` beside the `ddi::native_fence::invalidate_all()` call the same units owe. Both are lock-free, allocation-free and legal at any IRQL. §14 requires the two generations be invalidated **together** (so they may not be split across two reset paths) and §18.2 fixes the order: capability invalidation precedes the device-lost wakeup | ⛔ **OPEN, and neither call site exists** — `grep -rn invalidate_all kmd_render/src/` finds no caller for *either* function. An adapter reset invalidates nothing; `AcGenEpoch` staying 0 is the evidence the request has not been honoured, and a nonzero value is the evidence it has |
+| **X2** | `umd12/src/bridge12.rs` (the deleted cxx declaration block, and again at the deleted wrapper) | `umd12/bridge/vkd3d_bridge.{h,cpp}` | delete the C++ member `HeliosVkd3dDevice::transfer_resource_ownership`. There is no adoption to transfer: HWA2 carries no host resource token (§10.3) and the KMD creates the backing rather than taking the guest's | ⛔ **OPEN.** The Rust side is gone; the C++ side is **fully intact** — declared in `vkd3d_bridge.h`, defined in `vkd3d_bridge.cpp`, and still resolving `helios_venus_memory_transfer_resource_ownership` via `GetProcAddress`, with its `g_vkd3dOwnershipTransferFailed` counter. An unused C++ member is not a build failure, which is exactly why it will rot silently |
+| **X3** | `kmd_render/src/ddi/display.rs` (display lane) | the present-side A3 refusal in `ddi/display.rs` | *(row reserved — the display-lane author is expected to file this in round 3's repair; take the request text and status from `REVIEW-ROUND-3.md` rather than guessing, and do not treat an empty row as "no request")* | ⛔ OPEN, text pending |
+| **X4** | `umd/src/forward/resource.rs` (the `global_vidmm_tracker` out-parameter, in the tex2d create path) | `umd/bridge/` — the D3D11 cxx bridge | remove the `global_vidmm_tracker` out-parameter from `get_resource_alloc_identity`. It is a **write-only sink**: `GlobalVidMmTracker` has no successor at all (K4-CONTRACT §6 — HWA2 has no tracking kind, no cookie, no global-share field, no tracker flag bit, and §10.3 forbids reintroducing it under another name). The Rust extern and the C++ declaration must change in **one** changeset or the bridge stops linking | ⛔ **OPEN.** ⚠ This request was filed as "see the K4 report" — a document that **has never existed** (`docs/retirement/` holds `FINDINGS.md`, `K4-CONTRACT.md`, `OWNERSHIP.md`, the six `lane-*.md` and the review rounds; `grep -rln 'K4 report' docs/` is empty). Round 3 caught it and the citation is being re-pointed at `K4-CONTRACT.md` §6 by the owning author. **A cross-lane request that names a nonexistent document is untrackable by construction — that is why this register exists.** The request text now lives at the site as "an open cross-lane request against `umd/bridge/`" |
+
+⇒ **A new cross-lane request gets a row here in the same edit that writes the
+source comment.** A comment in the requesting file is a note to nobody: neither
+the lane that owes the work nor the lane that will deploy it reads that file.
+
+### ⭐ Sequencing after round 3
+
+In order:
+
+1. **Repair what round 3 found** — `METHOD.md` §2 phase 3, by the authors, with
+   every claim's documentation changed *in the same edit* as the claim.
+2. **Round 4** — rotate at least two lenses again (§3 criterion 1 requires
+   *different* compositions), keep the gate-defeat lens, and re-run the
+   completeness critic. See the arithmetic above: round 4 is at best the *first*
+   dry round.
+3. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
+   correction below before touching it.
+4. **mesa A3 (+ K6)** — the unblocking dependency for everything the deploy
+   breaks. See the scope warning below.
+5. **K1 (demolition), K3, K5, K6** — and `SURFACE` last of all
+   (`OWNERSHIP.md` §3).
+
+⛔ **`protocol/src/wddm_legacy.rs` CANNOT be deleted as a file, and its module
+header is TRUE at HEAD, not stale.** Measured: the file declares **48**
+top-level `pub` items (plus 10 inherent `pub fn`s). **19 of the 48 have live,
+non-comment Rust callers**, in three groups: the `HELIOS_PRESENT_*` ticket family
+with `HeliosPresentPrivateData` / `HeliosPresentRenderCmd` /
+`HeliosPresentRefreshCmd` (**13 files** across `umd/`, `umd12/` and
+`kmd_render/`, incl. `umd/src/forward/{present,snapshot,resource,state}.rs`,
+`umd/src/device_funcs.rs`, `kmd_render/src/ddi/{submit_command,display}.rs`,
+`kmd_render/src/device.rs`); `HeliosD3D12SubmitCmd` with its magic and version
+(**7 files**, incl. `umd12/src/forward12/queue.rs`, `umd12/src/bridge12.rs`,
+`kmd_render/src/ddi/{submit_command,present_packet}.rs`,
+`kmd_render/src/virtio/gpu/mod.rs`); and
+`HELIOS_WDDM_ALLOC_KIND_{DEVICE_MEMORY,STANDARD}`, whose only caller is
+`kmd_render/src/ddi/display.rs`. Deleting the file fails to compile
+`kmd_render`, `umd` **and** `umd12`, in a build only the VM can run. ⇒ the
+header's *"`kmd_render`, `umd`, and `umd12` still call it and cannot be made to
+compile without it"* is a correct description of HEAD.
+⚠ **What is legitimate today is deleting the other 29 symbols.** The
+present-ticket family waits on **K5**. And do not conflate this with the §8.6
+gate: that gate lists **8** *allocation-identity* names
+(`HeliosWddmOpenIdentity`, `HeliosWddmAllocPrivate`, `HeliosWddmAllocMeta`,
+`GlobalVidMmTracker`, `VidMmTrackerTable`, `AdoptedUmdResource`,
+`HELIOS_WDDM_ALLOC_KIND_TRACKING`, `write_open_identity`) — only **5** of which
+are among the 48 (`VidMmTrackerTable`, `AdoptedUmdResource` and
+`write_open_identity` no longer exist anywhere). "All eight retired symbols have
+zero live callers" is correct **and is a statement about a proper subset**; it
+does not license deleting the file.
+
+⛔ **Deploying K4 without mesa A3 renders nothing at all — and that is the
+retirement's intended intermediate state (`K4-CONTRACT.md` §5), not a
+regression.** State the scope precisely, per §5.1: **every Win32 shared-memory
+import and export refuses; ordinary venus allocation still works.** Exactly two
+of `vn_AllocateMemory`'s five arms refuse (`VkImportMemoryWin32HandleInfoKHR`,
+and an `export_handle_types` including `..._OPAQUE_WIN32_BIT`); the plain arm,
+the `VkImportMemoryResourceInfoMESA` resource-id import and the dma-buf import
+still allocate. *"Every `vkAllocateMemory` fails"* is the overstatement §5.1
+exists to correct — a plain venus render allocation working is **not** evidence
+the deploy went well.
+
+⛔ **mesa A3 as scoped in `docs/retirement/lane-mesa.md` needs a scope decision
+before anyone authors it.** A3 is an **XL** rewrite of `vn_renderer_helios.c`
+(**5261** lines measured at HEAD; the lane brief's inventory says 5304 and is
+stale) whose stated dependencies are **A1** (HTS1 translation session,
+`vn_helios_translation_session.{c,h}`, **L**) and **A2** (native KMT lane,
+`vn_helios_native_kmt.{c,h}`, **XL**) — and neither file exists. ⇒ the subset
+that actually unblocks the deploy (the C57 import carrier re-pointed at HWA2,
+plus K6's host-resid patch) is **narrower than the lane brief's A3**, and picking
+that subset is a decision, not an implementation detail. Do not start A3 by
+reading the brief's row as a work item.
 
 ## Stage pivot, 2026-08-05
 
