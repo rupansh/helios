@@ -757,7 +757,24 @@ K4 changeset's own build.
 
 ---
 
-## F10 — dxgkrnl DOES propagate the KMD's create-time private-data write back to the creating UMD. HWA2's write-back model is sound.
+## F10 — ⛔ FALSIFIED BY F11 (2026-08-11). ~~dxgkrnl DOES propagate the KMD's create-time private-data write back to the creating UMD. HWA2's write-back model is sound.~~
+
+⛔⛔ **READ F11 FIRST. This finding's conclusion is WRONG and its title must not
+be cited.** dxgkrnl discards a KMD write into
+`DXGK_ALLOCATIONINFO::pPrivateDriverData` for any user-supplied buffer; the
+channel that works is the write at `DxgkDdiOpenAllocation`, which the
+pre-retirement KMD *also* performed. The instrument below was sound and the
+inference from it was under-determined — the same 48-byte record was written at
+BOTH sites, so a pre/post diff across `pfnAllocateCb` cannot say which write the
+bytes came from. The rest of this entry is kept unedited, because the
+correction it already carries ("a pre/post byte comparison over a reinterpreted
+buffer proves *that* bytes changed and can never, on its own, say *which field*
+changed") is one step short of the one that mattered: it also cannot say **which
+write site**.
+
+⚠ The lesson is not "the instrument was bad". It is that a measurement over a
+system with two writers pinned neither, and nobody asked how many writers there
+were. F11's probe answers it by removing one writer at a time.
 
 The D3D12 producer named this the single highest-risk assumption in the K4
 changeset: *"dxgkrnl propagates the KMD's create-time private-data write back to
@@ -891,3 +908,91 @@ Incidental, from the same run: `tools/d3d12_clear_probe.cpp` **passes** on the
 deployed build — 65536/65536 pixels exactly `(0,51,102,255)`, `SetEventOn-
 Completion` signalled in 0.6 µs, `GetDeviceRemovedReason` clean. That is the
 pre-change D3D12 control arm for the K4 changeset.
+
+---
+
+## F11 — dxgkrnl DISCARDS the KMD's create-time private-data write. `DxgkDdiOpenAllocation` is the only channel, and K4 had closed it.
+
+**Measured 2026-08-11** with `tools/hwa2_writeback_probe.c`, which issues the
+same record through four create-call shapes from one process so that record
+type, size, adapter and driver image are all held fixed and only the call shape
+moves. On **22.22.266.0** (K4+K5, before the repair):
+
+| variant | record | shape | `allocation_generation` / `object_generation` back |
+|---|---|---|---|
+| A | HWA2 168 B | bare, `D3DKMTCreateAllocation2` | **0** |
+| B | HWA2 168 B | `Flags.CreateResource`, `…2` | **0** |
+| C | HWA2 168 B | `CreateResource` + resource-level private data, `…2` | **0** |
+| D | HWA2 168 B | bare, `D3DKMTCreateAllocation` (v1 struct) | **0** |
+| E | HWA2 168 B | `CreateResource` + resource-level private data, v1 | **0** |
+| F | HVM1 64 B | bare, `…2` (mesa A1's exact shape) | **0** |
+| G | HVM1 64 B | `CreateResource` | refused, `AcShape` (§10.7's bare-shape rule) |
+| H | HVM1 64 B | bare, v1 | **0** |
+
+Seven admitted creates, seven zeros. The **call shape is not the variable** —
+resource association, resource-level private data, the thunk version and the
+record type all move without moving the result.
+
+**And the same bytes arrive unstamped at the open.** With the diag ring cleared
+and the driver image reloaded, the probe's run recorded 7 HWA2 opens
+(`0x0C21_00A8`) of which **5 were rejected** by `read_open_descriptor`
+(`0x0C02_00E6`) — exactly the five the probe created. The two that validated are
+the OS **standard allocations this driver authors itself** in
+`DxgkDdiGetStandardAllocationDriverData` (`0x0C02_0012` / `0x0C02_0022` in the
+same ring: types 1 and 2), whose buffer dxgkrnl owns rather than copies from user
+mode. `validate_create_output` requires a nonzero generation and
+`validate_create_input` forbids the producer from supplying one, so "validated at
+open" is a *proof* that the KMD's create-time write survived — and it survives
+only for that one KMD-authored case.
+
+⇒ **A KMD write into `DXGK_ALLOCATIONINFO::pPrivateDriverData` reaches nobody**:
+not the caller, not `DxgkDdiOpenAllocation`, not a later opener.
+
+### The headers said so, and this project read one field's annotation as the other's
+
+* `d3dkmddi.h` `DXGK_ALLOCATIONINFO::pPrivateDriverData` — `// in:`
+* `d3dkmddi.h` `DXGK_OPENALLOCATIONINFO::pPrivateDriverData` — `// in/out:`
+* `d3dukmdt.h` `D3DDDI_ALLOCATIONINFO2::pPrivateDriverData` — `// in(out optional):`
+
+The user-mode `out` is fulfilled by the **open**, not the create. Both header
+copies are in-tree (`tmp/wdk-28000/Include/10.0.28000.0/shared/`,
+`icd/win-build/wdk-include/`) and were readable throughout.
+
+### Confirmation, on the other side of the repair
+
+`22.22.267.0` moves the HVM1 stamp to `DxgkDdiOpenAllocation`
+(`stamp_open_hvm1`). On a **cold boot**:
+
+* `tools/hts1_session_probe.c` **15/15** (was 14/15); H2 passes.
+* `OaHvm1Stamp=1`, **`TsPoolBind=1`** — K5's reply-pool binding fires for the
+  first time. It had never been reachable.
+* Variants F and H come back stamped (`object_generation` 4294967307 /
+  4294967309, `segment_page_shift` 12, `allocation_alignment` 4096) — both
+  thunks.
+* Variants A–E still return 0, because only HVM1 is stamped.
+
+**Bound.** This is measured on build 26100.8875 with this driver. It says
+nothing about a Windows build that behaves differently, and it does not claim
+the create-time write is *illegal* — only that it is not observable anywhere.
+The KMD-authored standard-allocation exception is the one case where a
+create-time write does survive, and it is not a channel a UMD can use.
+
+### ⛔ The open consequence: HWA2 has the same defect, and it is not repaired
+
+Every D3D11 and D3D12 create on a K4 build reads its descriptor back, finds
+`allocation_generation == 0`, and refuses — `hwa2_output_invalid` in
+`umd/src/forward.rs`, `Hwa2WriteBackAbsent` in
+`umd12/src/forward12/resource12.rs`. That is the likeliest cause of the
+`dwmcore.dll` `0xc00001ad` crash-loop `ROADMAP.md`'s K4-without-A3 table records
+against the HWA2-producing UMD, and it means **the retirement's "written once at
+create, dxgkrnl carries the identical bytes to `OpenResource`" premise is false
+for every UMD-supplied allocation**, not only for HVM1.
+
+Repairing it means the same open-time stamp for HWA2 — the write
+`K4-CONTRACT.md` §8.5 still forbids, and unlike HVM1 an HWA2 *can* have several
+openers that could disagree. Options, none taken here: stamp at open and mint
+per-open (identity becomes per-(device, allocation), which is the scope Render
+and Patch resolve in anyway); have the producer supply the generation and the
+KMD record it (the guest→kernel direction is the one channel that provably
+carries, since the create-input bytes reach the open intact); or return
+identities through the HNR2 reply channel. It is an owner decision.

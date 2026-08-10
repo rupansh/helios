@@ -585,10 +585,11 @@ In order:
    ICD + present layer link clean, vkd3d native build green.
 3. **A1 → A2 → A3 → K5 → K6** ← **THE CRITICAL PATH.** A1 ✅ (`icd/mesa`
    `6ad43fb`, rewritten onto A2 in `1b97c64`), **A2 ✅** (`1b97c64`, gate
-   `c20d162`), **K5 ✅** (this changeset; gate `tools/hts1-attach-gate.sh`,
-   verified on the target at KMD 22.22.264.0). Remaining: **A3** and **K6**.
-   ⛔ Before either, settle the HVM1 write-back question K5's probe surfaced —
-   see "K5 landed" below; A1 cannot create its reply pool until it is answered.
+   `c20d162`), **K5 ✅** (gate `tools/hts1-attach-gate.sh`, acceptance
+   `tools/hts1_session_probe.c` **15/15** on KMD 22.22.267.0). Remaining: **A3**
+   and **K6**. ⭐ The HVM1 write-back blocker is **CLOSED** (`a8527e2`,
+   `FINDINGS.md` F11) — see "The write-back blocker is CLOSED" below; A1 can
+   create its reply pool, and `win_build_kmd` works again.
 4. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
    correction below before touching it. Not on the critical path.
 5. **K1 (demolition), K3** — and `SURFACE` last of all (`OWNERSHIP.md` §3).
@@ -752,19 +753,52 @@ declarations, and the probe's forged-HQA1 case passes through `TsNoSess`, not
 through packet validation. That is `K4-CONTRACT.md` §8's third state, stated
 rather than implied.
 
-⛔ **The one probe failure is NOT K5's, and it blocks A1.** `AcOk=1` proves K4's
-`admit_hvm1` admitted the pool create — but the three HVM1 write-back fields
-(`object_generation`, `segment_page_shift`, `allocation_alignment`) read back
-**ZERO** in the caller's buffer, and the reply-pool binding at
-`DxgkDdiOpenAllocation` never fired (`TsPoolBind=0` **and** `TsPoolRej=0`). Two
-explanations remain and this session did not distinguish them: dxgkrnl does not
-propagate the KMD's per-allocation private-data write-back back to user mode on
-`D3DKMTCreateAllocation2`, or it does not deliver it to `DxgkDdiOpenAllocation` in
-a form that validates as `CreateOutput`. **Either way A1 breaks**, because A1 reads
-`hvm1.object_generation` back and refuses a zero
-(`vn_helios_translation_session.c:635-640`). ⇒ **Settle this before A3.**
-`wsl-dxgkrnl-is-a-citable-d3dkmt-oracle` is the instrument: Microsoft's own
-open-source D3DKMT thunk says whether that buffer is copied back.
+#### ⭐ The write-back blocker is CLOSED (2026-08-11, KMD 22.22.267.0) — and it was neither of the two candidates
+
+The K5 probe's one failure — `object_generation` / `segment_page_shift` /
+`allocation_alignment` all zero in the caller's buffer, with `TsPoolBind=0` **and**
+`TsPoolRej=0` — had two named explanations and the answer was a third:
+**dxgkrnl discards a KMD write into `DXGK_ALLOCATIONINFO::pPrivateDriverData`
+altogether** whenever the buffer came from user mode. Not "does not copy it back";
+it does not keep it at all. The full measurement is `FINDINGS.md` **F11**; the
+short version:
+
+* `tools/hwa2_writeback_probe.c` issues the SAME record through four create-call
+  shapes from one process. Seven admitted creates on 22.22.266.0 — HWA2 at 168
+  bytes and HVM1 at 64, bare and resource-associated, both thunks — **seven
+  zeros.** The call shape is not the variable.
+* The diag ring shows the same bytes arriving **unstamped at the open**: 5 of 7
+  HWA2 opens rejected (`0x0C02_00E6`). The two that validated are the OS standard
+  allocations this driver authors itself, whose buffer dxgkrnl owns.
+* The WDK headers said so: `DXGK_ALLOCATIONINFO::pPrivateDriverData` is `// in:`,
+  `DXGK_OPENALLOCATIONINFO::pPrivateDriverData` is `// in/out:`, and
+  `D3DDDI_ALLOCATIONINFO2`'s `in(out optional)` is fulfilled by the OPEN.
+* ⇒ **`FINDINGS.md` F10 is FALSIFIED.** Its instrument was sound; its inference
+  was under-determined, because the pre-retirement KMD wrote the identical
+  48-byte record at BOTH create and open, so a pre/post diff across
+  `pfnAllocateCb` could never say which write the bytes came from.
+
+**Repaired** in `a8527e2`: `stamp_open_hvm1` completes the HVM1 create-output at
+`DxgkDdiOpenAllocation`, through the pointer the WDK annotates `in/out`. On a
+**cold-booted 22.22.267.0** `tools/hts1_session_probe.c` is **15/15** (was 14/15),
+`OaHvm1Stamp=1`, and **`TsPoolBind=1`** — K5's reply-pool binding fires for the
+first time. mesa A1 is unblocked. `K4-CONTRACT.md` §8.5's gate was amended, not
+deleted (HWA2/HOC1 still untouchable; the one HVM1 write is itself checked and was
+defeated 7 ways).
+
+⛔ **STILL BROKEN, and now named: HWA2 has the same defect.** Every D3D11/D3D12
+create on a K4 build reads back `allocation_generation == 0` and refuses
+(`hwa2_output_invalid`, `Hwa2WriteBackAbsent`) — the likeliest cause of the
+`dwmcore.dll` `0xc00001ad` crash-loop in the table below, which this document
+previously attributed to "the identity A3 owes". Repairing it means the same stamp
+for HWA2, which §8.5 forbids and which *does* have openers that can disagree; the
+three candidate designs are in F11's last paragraph. **Owner decision, not a
+drive-by.**
+
+⭐ **`win_build_kmd` is FIXED.** The cert in `CurrentUser\WDRTestCertStore` was
+removed so cargo-make's `generate-certificate` regenerated it; both signtool
+invocations now succeed and `install-helios-kmd.ps1` re-imports the new `.cer`
+into Root and TrustedPublisher. KMD builds are no longer blocked.
 
 ⭐ **A measurement that sharpens `K4-CONTRACT.md` §5, taken 2026-08-10 while
 reverting a deploy.** "Deploying K4 without mesa A3 renders nothing at all" is
