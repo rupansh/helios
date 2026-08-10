@@ -64,15 +64,22 @@ layer now loads and runs — F7). Do not assume it is active:
 `tools/run-helios-layer-app.ps1` (which carries a `-NoLayer` control arm),
 interrogated by `tools/vk_external_handle_probe.cpp`.
 
-Both §10.3 capability gates are closed: the ICD now imports
-`D3D12_RESOURCE_BIT` images (`IMPORTABLE|DEDICATED_ONLY`, import-only, its own
-compatibility class) and exports/imports `D3D12_FENCE_BIT` timeline semaphores.
-The layer admits the physical device and creates a device with its private
-helper queue. **The next unit is named by the layer's own refusal**:
-`vkSetHeliosPresentableImageHELIOS`, the private tag call of §10.7:2571-2578
-(lane-mesa A4) that legalises `PRESENT_SRC_KHR` for a slot's image — without it
-`vkCreateSwapchainKHR` refuses. Nothing above `vkCreateSwapchainKHR` has ever
-run.
+Both §10.3 capability gates are closed and the private tag call
+`vkSetHeliosPresentableImageHELIOS` is implemented (declared once in
+`icd/mesa/src/vulkan/helios_private_wsi.h`, published only through
+`vn_GetDeviceProcAddr`). **§10.3's image chain runs end to end**: four D3D12
+committed textures import into Vulkan per swapchain, through
+`CreateSharedHandle` → `vkGetMemoryWin32HandlePropertiesKHR` → dedicated import
+→ bind → tag.
+
+⛔ **Open — the Ready/Release fence import.** Both sync-object opens reject the
+handle from `ID3D12Fence::CreateSharedHandle` with `STATUS_INVALID_PARAMETER`,
+and it is proven the ICD created no WDDM sync in that process, so the handle is
+not ours. The hypothesis — `ID3D12Fence` is a *runtime* object over a dxgkrnl
+monitored fence under the UMD arm, making vkd3d's `d3d12_shared_fence` path
+app-local-only — is **to be measured, not assumed** (`FINDINGS.md` F7 addendum
+3). Nothing above `vkCreateSwapchainKHR` has run: no acquire, no present, no
+frame.
 
 ⚠ Falling out of that work: **`ID3D12Fence::CreateSharedHandle` could never
 have worked on Helios** — vkd3d refuses a shared fence unless the driver
