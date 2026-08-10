@@ -72,13 +72,25 @@ committed textures import into Vulkan per swapchain, through
 `CreateSharedHandle` → `vkGetMemoryWin32HandlePropertiesKHR` → dedicated import
 → bind → tag.
 
-⛔ **Open — the Ready/Release fence import.** Both sync-object opens reject the
-handle from `ID3D12Fence::CreateSharedHandle` with `STATUS_INVALID_PARAMETER`,
-and it is proven the ICD created no WDDM sync in that process, so the handle is
-not ours. The hypothesis — `ID3D12Fence` is a *runtime* object over a dxgkrnl
-monitored fence under the UMD arm, making vkd3d's `d3d12_shared_fence` path
-app-local-only — is **to be measured, not assumed** (`FINDINGS.md` F7 addendum
-3). Nothing above `vkCreateSwapchainKHR` has run: no acquire, no present, no
+⭐ **CLOSED by measurement — the Ready/Release fence import is impossible, and
+backwards** (`FINDINGS.md` **F8**, `tools/d3d12_shared_fence_probe.cpp`). An
+`ID3D12Fence::CreateSharedHandle` handle is refused by
+`D3DKMTOpenSyncObjectFromNtHandle2` with `STATUS_INVALID_PARAMETER` **on every
+adapter on the box, including both Microsoft Basic Render Driver ones** — so it
+is not a Helios defect and no change to `icd/mesa`, the KMD or the layer can fix
+it. The controls make that readable: our own monitored fence, shared with
+`D3DKMTShareObjects`, opens with `STATUS_SUCCESS` through the identical call in
+the same process from two devices, and `ID3D12Device::OpenSharedHandle`
+round-trips the D3D12 handle every time, so the call works and the handle is
+valid. The object type is `DxgkSharedSyncObject` in both cases.
+
+The actionable half is the last control: **`ID3D12Device::OpenSharedHandle`
+accepts a monitored fence *we* created and shared, on Helios.** The two sides
+can share a fence in exactly one direction. ⇒ §10.3's Ready/Release fences must
+be **created by the ICD and opened by the D3D12 side**, not imported from
+`ID3D12Fence` — a `lane-mesa` protocol change needing no new ICD capability,
+since `helios_wddm_sync_create` + `helios_wddm_sync_share_nt` already build that
+object. Nothing above `vkCreateSwapchainKHR` has run: no acquire, no present, no
 frame.
 
 ⚠ Falling out of that work: **`ID3D12Fence::CreateSharedHandle` could never
@@ -118,6 +130,44 @@ lane's adopt path is the **writer**, and K3 (paging DMA) and K6 (HNR2) both sit
 downstream of the allocation model. The D3D12 import landed on 2026-08-10
 validates the *pre-retirement* `helios_wddm_open_identity` blob and is expected
 to be re-pointed at HWA2 by K4.
+
+### ⭐ K4's contract is written down, and it corrects the plan in five places
+
+`docs/retirement/K4-CONTRACT.md` (2026-08-10) is **normative for the allocation
+identity subsystem** and is the entry condition `METHOD.md` phase 1 requires. A
+ground-truth survey found the plan resting on facts the tree does not support:
+
+- **HWA2 had no create-*input* contract.** `validate()` requires a nonzero
+  `allocation_generation`, so it could only ever validate the output side, and
+  nothing said what a UMD may legally *send*. HVM1 and HOC1 both carry the
+  two-stage pair; HWA2, the record K4 is built on, was the odd one out. The
+  contract adds `validate_create_input`/`validate_create_output` and pins the
+  field partition — the UMD supplies a request, the KMD validates it in full and
+  then writes all 168 bytes, which is the only reading consistent with both
+  "the buffer is `[in/out]`" and "the KMD cannot invent texel dimensions".
+- **`adapter/kobj.rs` holds zero allocation state** — its own module doc says
+  *kernel dispatcher objects*: the venus/scanout mutexes, the HPD worker and the
+  VSync timer/DPC pair. The brief read the filename. K4 drops it and adds
+  `adapter/allocation_object.rs` instead, because there is today **no** file
+  that owns the KMD allocation object.
+- **`adapter/backing.rs` has 14 of its 18 call sites outside K4**, so its
+  deletion is re-sequenced to K3 with a display-lane request.
+- **The ICD re-point is not a substitution.** HWA2 deliberately carries no host
+  `resid` and no Vulkan memory-type index, and both are load-bearing in the
+  ICD's import today. What replaces them is a *mechanism* — mesa A3 plus K6 —
+  so K4's obligation there is a loud named refusal, never a bridge.
+- **A third cross-repo atomic pair**, which `OWNERSHIP.md` §2 was missing: the
+  ICD hand-declares the three retired 48-byte records with `_Static_assert`s and
+  includes nothing from `protocol/include`, so the KMD-side and ICD-side edits
+  are one change. The moment create stops accepting the legacy record, every
+  venus `vkAllocateMemory` on Helios fails.
+
+⚠ K4's stated dependency K2 is itself blocked — its host counterpart is parked
+(F5) and §10.7 requires HPM1 negotiation before `QUERYSEGMENT4` can expose HLM1.
+The contract's §4 resolves it: K4 records `HELIOS_SEGMENT_ID_HLM1` in HVM1
+placement and **admits role 4 without satisfying it**, returning the documented
+failure with a named counter rather than silently substituting the aperture
+segment.
 
 **Phase 2 round 1 has now run** for `protocol`, `kmd_render` and
 `vkd3d-proton-helios` — see `docs/retirement/REVIEW-ROUND-1.md` for the findings
