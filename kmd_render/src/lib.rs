@@ -93,6 +93,13 @@ pub unsafe extern "system" fn driver_entry(
     // bindgen allowlist is a build-time input this file must not depend on;
     // 0xC000_0182 is the same code an INF/FILEVERSION mismatch produces, and it
     // is the honest one — the driver's configuration disagrees with itself.
+    // ⚠ The audit's breadcrumbs live at `0x0DA0_xxxx`, NOT in the `0x0D00_xxxx`
+    // space the two records above use. `virtio::venus::protocol` records
+    // `0x0D00_0000 | (code & 0xFFFF)`, so the venus bring-up sequence owns the
+    // whole low 16 bits of `0x0D00_` — a "slot audit passed" written as
+    // `0x0D00_0003` is indistinguishable from venus bring-up stage 3, which is
+    // a breadcrumb that misleads instead of reporting. (The two records above
+    // predate that collision and are read by position; do not add a third.)
     const STATUS_DEVICE_CONFIGURATION_ERROR: NTSTATUS = 0xC000_0182u32 as NTSTATUS;
     if let Err(failure) = ddi::wddm32_slot_audit::verify(&init) {
         kmsg(c"Helios: DDI slot audit FAILED; refusing to load\n");
@@ -100,17 +107,18 @@ pub unsafe extern "system" fn driver_entry(
         // index (0..192) and the direction it disagreed in. `failure.name` is
         // in the audit table at that index; a reader resolves it there rather
         // than trying to format a string at this IRQL.
-        diag::record(0x0D00_1000 | (failure.index as u32));
+        diag::record(0x0DA0_1000 | (failure.index as u32));
         diag::record(if failure.registered {
             // Registered, classified unreachable.
-            0x0D00_2001
+            0x0DA0_2001
         } else {
             // NULL, classified implemented.
-            0x0D00_2002
+            0x0DA0_2002
         });
         return STATUS_DEVICE_CONFIGURATION_ERROR;
     }
-    diag::record(0x0D00_0003);
+    // Audit passed on the built table.
+    diag::record(0x0DA0_0001);
 
     // SAFETY: pointers are valid for the call; `init` outlives the call on this
     // stack frame, and DxgkInitialize copies what it needs.
