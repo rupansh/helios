@@ -298,3 +298,115 @@ they are *in*, and `verify` would then have refused to load a correct driver.
 Fixed in `97ad14b`; the generator now round-trips byte-identical and `--check`
 is clean. Check the checker against the thing it checks — the same lesson the
 audit table itself taught when it classified 8 live slots as "must be NULL".
+
+---
+
+## F7 — `VK_LAYER_HELIOS_present` loads and runs. It refuses every device, and the reason is measured: the ICD supports exactly one Win32 external handle type, and it is not one the reference asks for.
+
+**Date** 2026-08-10 · target 22.22.263.0, loader 1.4.350, Mesa
+`26.2.0-devel (git-8559b66299)`.
+
+The layer had never executed. It does now — installed by
+`tools/install-helios-present-layer.ps1`, run through
+`tools/run-helios-layer-app.ps1`:
+
+```
+[helios-wsi] instance ... created (surface=1 win32=1 caps2=1)
+[helios-wsi] REFUSE physdev_refused_no_external_image_import (-3): external image
+             query: FORMAT_NOT_SUPPORTED - the lower ICD does not support
+             D3D12_RESOURCE_BIT for the C37 tuple
+[helios-wsi] REFUSE create_device_refused_not_admitted (-7)
+[helios-wsi] counters (vkDestroyInstance):
+[helios-wsi]   physdev_refused_no_external_image_import       1
+```
+
+`vulkaninfo --summary` lists `VK_LAYER_HELIOS_present` and completes; a native
+Vulkan app that asks for `VK_KHR_swapchain` gets
+`VK_ERROR_EXTENSION_NOT_PRESENT` out of `vkCreateDevice`. The layer's own
+`vkNegotiateLoaderLayerInterfaceVersion` was exercised separately by the
+installer: `VkResult=0 version=2 gipa=ok gdpa=ok gpdpa=ok`.
+
+### The capability matrix, measured (`tools/vk_external_handle_probe.cpp`)
+
+For the layer's exact C37 tuple — `B8G8R8A8_UNORM` / `2D` / `OPTIMAL` /
+`COLOR_ATTACHMENT|TRANSFER_SRC|TRANSFER_DST`, straight at the ICD with no
+layer in the chain:
+
+| handle type | `vkGetPhysicalDeviceImageFormatProperties2` | features |
+|---|---|---|
+| `D3D12_RESOURCE` | `VK_ERROR_FORMAT_NOT_SUPPORTED` | — |
+| `D3D12_HEAP` | `VK_ERROR_FORMAT_NOT_SUPPORTED` | — |
+| `D3D11_TEXTURE` | `VK_ERROR_FORMAT_NOT_SUPPORTED` | — |
+| `D3D11_TEXTURE_KMT` | `VK_ERROR_FORMAT_NOT_SUPPORTED` | — |
+| `OPAQUE_WIN32` | `VK_SUCCESS` | `EXPORTABLE IMPORTABLE`, compatible=0x2 |
+| `OPAQUE_WIN32_KMT` | `VK_ERROR_FORMAT_NOT_SUPPORTED` | — |
+| **(none) — control** | `VK_SUCCESS` | (the tuple itself is fine) |
+
+External semaphore, timeline: `D3D12_FENCE` reports **no** features and
+`compatibleHandleTypes=0`; `OPAQUE_WIN32` is `EXPORTABLE IMPORTABLE`.
+
+The control row is what makes this attributable: the format/usage tuple is
+supported, so the refusal is about the external handle type and nothing else.
+`VK_KHR_external_memory_win32` and `VK_KHR_external_semaphore_win32` ARE
+advertised — the layer's extension-presence gate passes and the *capability*
+gate is what fails, which is why the extension check alone was not enough to
+see this.
+
+### What this costs the mesa lane
+
+§10.3:1121-1188 is normative and specific: each swapchain image is a shareable
+committed D3D12 texture imported with
+`VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT` + a dedicated allocation,
+and Ready/Release are D3D12 fences imported with `D3D12_FENCE_BIT`. Neither
+exists in the ICD today: `grep -r D3D12_RESOURCE icd/mesa/src/virtio` is empty,
+and venus' Windows external-memory path is `OPAQUE_WIN32` only
+(`vn_device_memory.c`). `OPAQUE_WIN32` is not a substitute — the spec confines
+it to payloads a Vulkan implementation exported, and these are created by D3D12.
+And even for `OPAQUE_WIN32` the ICD does **not** report `DEDICATED_ONLY`, which
+§10.3 requires of the admitted type.
+
+⇒ The layer is complete enough to be blocked on someone else. The next mesa
+unit is the lower-ICD import chain (§10.3's C57 carrier:
+`D3DKMTQueryResourceInfoFromNtHandle` → `D3DKMTOpenResourceFromNtHandle`),
+plus advertising `D3D12_RESOURCE_BIT` as `IMPORTABLE|DEDICATED_ONLY` and
+`D3D12_FENCE_BIT` as importable. Until then no native Vulkan app can create a
+device with `VK_KHR_swapchain` through the layer — loudly, which is correct.
+
+**Bound.** One physical device, one format tuple, `OPTIMAL` tiling only. The
+probe did not attempt an actual import, so it establishes what the ICD
+*reports*, not that a report of `IMPORTABLE` would work. Everything above the
+device-creation gate — surfaces, swapchains, acquire, present, teardown, the
+D3D12/DXGI half — remains unexecuted.
+
+### ⛔ The trap that hid this: the Vulkan loader ignores its environment in an elevated process
+
+`win_exec`/SSH lands **elevated** (`IsInRole(Administrator) = True`). The
+loader's `loader_secure_getenv` drops `VK_LAYER_PATH`,
+`VK_ADD_IMPLICIT_LAYER_PATH`, `VK_INSTANCE_LAYERS`, `VK_LOADER_LAYERS_ENABLE`
+and `VK_DRIVER_FILES` for such a process, **silently** — with
+`VK_LOADER_DEBUG=layer` it prints every registry directory it searches and
+never mentions the env-var path at all. A staged layer looks exactly like a
+layer that failed to build. `tools/run-helios-layer-app.ps1` exists for this:
+it runs the app from a scheduled task as the interactive user at RunLevel
+Limited, which is unelevated, and which also puts the app in session 1 where a
+WSI layer can have a window.
+
+⚠ The same trap is live in `tools/install-helios-icd.ps1`, whose smoke test
+sets `VK_DRIVER_FILES` before running `vulkaninfo`. That has always been inert;
+it passes because the ICD is also registered in HKLM.
+
+### Why the layer is NOT registered machine-wide
+
+An implicit layer loads into **every** Vulkan instance, which on this box
+includes `dxvk-helios` under dwm — and §2 item 8 makes "translators never enter
+this layer" an acyclicity rule. The manifest's `disable_environment` cannot
+carve dwm back out, because of the elevation rule above. So
+`install-helios-present-layer.ps1` stages by default and writes the
+`ImplicitLayers` value only under an explicit `-Register Implicit`.
+
+⇒ **This answers the `OWNERSHIP.md` §1 cross-lane request against
+`packaging/windows/Install-Helios.ps1` with a "not yet, and here is why".** The
+bundle must not register this layer while the layer refuses every device: it
+would gain nothing and put unfinished code in the compositor's path.
+`ci/windows/build-mesa.sh` does not build it either (`-Dvulkan-layers=`), so
+the value would name a file the payload does not contain.

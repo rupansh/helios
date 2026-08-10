@@ -308,3 +308,11 @@ both violated by an arrangement that could fold these objects into
 ⚠ **"Builds" is not "installed."** Packaging and loader registration are a
 cross-lane request against `packaging/windows/Install-Helios.ps1`
 (`OWNERSHIP.md` §1). Nothing loads this yet.
+
+> **Superseded 2026-08-10 — it loads now.** `FINDINGS.md` F7 records the first
+> execution: the layer is staged by `tools/install-helios-present-layer.ps1`,
+> run through `tools/run-helios-layer-app.ps1`, and refuses every device
+> because the ICD supports no D3D handle type. The cross-lane request against
+> `Install-Helios.ps1` is answered there with a *deliberate no* — an implicit
+> layer would enter dwm's DXVK instances. And, in the spirit of this section:
+> running it found what compiling it could not, exactly as predicted.

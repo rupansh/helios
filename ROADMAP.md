@@ -50,14 +50,34 @@ QEMU has HPM1 negotiation and HLM1 BAR admission.
 against WDK 28000 (355 `_0112` / 346 `_0116` symbols, `HRTFENCE`,
 `pfnCreateNativeFenceCb`/`pfnOpenNativeFenceCb`).
 
-⛔ **Two components are committed but deliberately NOT wired in** (was four; the
-first two were wired in on 2026-08-10 by `b4b613c` and `fa8489e`). Each is
-labelled in its own commit message; do not assume any is active:
+⛔ **One component is committed but deliberately NOT wired in** (was four; two
+were wired in on 2026-08-10 by `b4b613c` and `fa8489e`, and the Mesa present
+layer now loads and runs — F7). Do not assume it is active:
 
 | Component | State | Why |
 |---|---|---|
-| `icd/mesa/.../helios-present-layer/` | **BUILDS** — `-Dvulkan-layers=helios-present` produces `VkLayer_HELIOS_present.dll` + manifest | Not **installed**: packaging and loader registration are a cross-lane request against `packaging/windows/Install-Helios.ps1` (`OWNERSHIP.md` §1), so nothing loads it yet. It had never been compiled at all; first contact found **17 errors** of self-drift, one gate that would have been permanently dark, and a silent DLL-name mismatch (`REVIEW-ROUND-1.md` review 4). A `.def` is **not** needed: all eight loader entry points are exported, verified with `objdump -p` on the built DLL. ⚠ Check it with `ninja <the layer target>` — **mingw-w64 g++, the compiler Mesa is written for**; a clang-cl side-check was tried and deleted, see the correction in review 4 |
 | `wddm_surface.rs` `SURFACE` | still `Wddm2_1GpuMmu` | the single atomic activation switch, and the **last** edit of the retirement (`OWNERSHIP.md` §3) |
+
+**`VK_LAYER_HELIOS_present` now LOADS AND EXECUTES** (`FINDINGS.md` F7). Staged
+by `tools/install-helios-present-layer.ps1`, driven by
+`tools/run-helios-layer-app.ps1`. It admits **no** device, for a measured
+reason: the ICD reports `VK_ERROR_FORMAT_NOT_SUPPORTED` for
+`D3D12_RESOURCE_BIT` (and every other D3D handle type) and supports only
+`OPAQUE_WIN32`, so §10.3's import chain has no lower half yet — see
+`tools/vk_external_handle_probe.cpp` for the capability matrix and its control
+row. A native Vulkan app asking for `VK_KHR_swapchain` gets
+`VK_ERROR_EXTENSION_NOT_PRESENT` from `vkCreateDevice`, loudly, which is
+correct. It is deliberately **not** registered machine-wide: an implicit layer
+enters dwm's `dxvk-helios` instances, which §2 item 8 forbids. ⚠ Check the
+build with `ninja <the layer target>` — **mingw-w64 g++, the compiler Mesa is
+written for**; a clang-cl side-check was tried and deleted (`REVIEW-ROUND-1.md`
+review 4).
+
+⛔ **The Vulkan loader ignores `VK_LAYER_PATH` / `VK_ADD_IMPLICIT_LAYER_PATH` /
+`VK_INSTANCE_LAYERS` / `VK_DRIVER_FILES` in an elevated process, silently**, and
+`win_exec` is elevated. Any Vulkan env-var experiment must go through a
+scheduled task at RunLevel Limited (F7). This also makes
+`tools/install-helios-icd.ps1`'s `VK_DRIVER_FILES` smoke test inert.
 
 **Phase 2 round 1 has now run** for `protocol`, `kmd_render` and
 `vkd3d-proton-helios` — see `docs/retirement/REVIEW-ROUND-1.md` for the findings
