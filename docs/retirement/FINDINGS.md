@@ -672,3 +672,58 @@ arm used. It is a change to the *layer's* protocol, and it belongs to
 say the redirected design works: no fence has been signalled or waited across
 the boundary, no acquire, no present, no frame. `ID3D12Fence::CreateSharedHandle`
 itself succeeds — the D3D12 correctness fix recorded in F7 addendum 2 stands.
+
+---
+
+## F9 — K7's native-fence surface is four DDI slots, not a surface. Eight of its own functions are unreachable, and `OWNERSHIP.md` §3's second activation gate is not met.
+
+Measured incidentally while taking a pre-change `cargo check` baseline of
+`kmd_render` on the VM (2026-08-10). The build is green; the finding is in its
+22 warnings, which nothing had read.
+
+```
+win_cargo kmd_render check --message-format=short   -> exit 0, 22 warnings, of which:
+  native_fence.rs:316  constant `FEATURE_DECLINED` is never used
+  native_fence.rs:326  constant `DXGK_FEATURE_SUPPORT_STABLE_VALUE` is never used
+  native_fence.rs:391  function `ensure_feature_admitted` is never used
+  native_fence.rs:421  function `query_feature_support` is never used
+  native_fence.rs:1215 function `fill_native_fence_caps` is never used
+  native_fence.rs:1250 struct `NotifyCtx` is never constructed
+  native_fence.rs:1263 function `notify_routine` is never used
+  native_fence.rs:1303 function `signal_native_fence_signaled` is never used
+  native_fence.rs:1355 function `has_live_fences` is never used
+```
+
+Each has **zero references outside `native_fence.rs`** (`grep -rn '\b<name>\b'
+kmd_render/src/ | grep -v native_fence.rs` → 0 for all nine), and rustc's
+"never used" means no reachable use inside it either.
+
+### What is actually wired
+
+| K7 obligation (`lane-kmd-core.md` §3) | State |
+|---|---|
+| `DxgkDdiCreateNativeFence` / `Destroy` / `Open` / `Close` | **registered** — `lib.rs:282-285` |
+| `DxgkDdiSetNativeFenceLogBuffer`, `UpdateNativeFenceLogs` | not registered — classified Disabled, consistent with F6 |
+| `DXGKQAITYPE_NATIVE_FENCE_CAPS` (=37) arm | ⛔ **absent** — `grep -n 'NATIVE_FENCE_CAPS' kmd_render/src/ddi/query_adapter_info.rs` is empty; `fill_native_fence_caps` has no caller |
+| `DXGK_FEATURE_NATIVE_FENCE` enablement | ⛔ **absent** — `query_feature_support` / `ensure_feature_admitted` have no caller |
+| `DXGK_VIDSCHCAPS::NativeGpuFence=1`, `No64BitAtomics=0` | ⛔ not written |
+| `DXGK_INTERRUPT_NATIVE_FENCE_SIGNALED` (=19) reporting | ⛔ **absent** — `signal_native_fence_signaled` / `notify_routine` have no caller |
+
+### Why this is a sequencing fact and not a defect
+
+The caps arm belongs to **K8** (`query_adapter_info.rs` end state) and the
+interrupt to **K9** (`interrupt.rs`); both are unstarted, and both files are
+owned by units other than K7. Writing the helper next to its subject and leaving
+the call site to its owning unit is a legitimate choice. ⇒ Nothing here needs
+fixing. What needs fixing is the **claim**.
+
+⛔ **`OWNERSHIP.md` §3 gates the `SURFACE` flip on "the native-fence DDI surface
+is complete".** It is not, and the phrase "the `kmd_render` native-fence surface
+is WIRED IN" — true of the four slots and the slot audit — reads as though it
+is. Whoever flips `SURFACE` must check the six rows above, not the sentence.
+
+**Bound.** This says which symbols have no caller. It does not say the four
+registered slots are wrong, and it does not re-open F6, which proved the slot
+audit's refusal path on the target in both index and direction. The 22-warning
+baseline was taken on a clean tree at `fb9b09a` and is the control arm for the
+K4 changeset's own build.
