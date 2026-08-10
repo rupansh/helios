@@ -48,9 +48,48 @@ wdk-build = "0.5"
 cc = "1"
 # We generate the WDDM display-miniport DDIs ourselves: wdk-sys has no display
 # ApiSubset, so build.rs runs bindgen over dispmprt.h + d3dkmddi.h. See build.rs.
-# MUST match the bindgen version wdk-build uses (0.71), so its BuilderExt
+# MUST match the bindgen version wdk-build uses, so its BuilderExt
 # (Builder::wdk_default) applies to the same bindgen::Builder type we construct.
-bindgen = "0.71"
+# That is now 0.72.1, pinned by the [patch.crates-io] below — see it for why.
+bindgen = "0.72"
+
+# ⛔ WHY THE WHOLE windows-drivers-rs FAMILY IS PATCHED TO GIT (2026-08-10)
+#
+# `wdk-sys` 0.5.1 as PUBLISHED pins `bindgen = "0.71.1"`, and bindgen 0.71 +
+# libclang 22 mis-binds any struct that is forward-declared before it is
+# defined: it emits the opaque `pub _address: u8` (size 1) for the type AND a
+# layout assertion computed from the real definition. The two disagree, so every
+# such assertion underflows and the crate does not compile:
+#
+#   types.rs:302  error[E0080]: attempt to compute `1_usize - 352_usize`
+#   ... 40 of them, 39 opaque types, all CRT/Windows structs, none of them ours.
+#
+# This is not a Helios defect and not a WDK defect. It was proven by building a
+# scratch crate whose only dependency is `wdk-sys = "0.5.1"` and which contains
+# no Helios code at all: it fails identically. The breakage had been latent
+# since the LLVM 22 upgrade and was masked by a cached 2026-08-08 `types.rs`; the
+# first change that invalidated that fingerprint regenerated it and exposed it.
+# ⚠ Downgrading is NOT the fix and was measured not to be: forcing MSVC 14.44
+# (`VCToolsInstallDir`) regenerates the identical 39 opaque types. The toolchain
+# is the newer one deliberately, so the bindgen has to catch up to it.
+#
+# Upstream already fixed it — `windows-drivers-rs` main moved the workspace to
+# `bindgen = "0.72.1"` — but has not published a release since, so crates.io
+# still serves 0.5.1/0.4.1 with the 0.71 pin. Every crate's version in the graph
+# is IDENTICAL upstream (wdk-build/wdk-sys/wdk-macros 0.5.1, wdk/wdk-alloc/
+# wdk-panic 0.4.1), so the patch applies without changing a single requirement.
+#
+# ⭐ Pinned to an exact rev, never a branch: `[patch]` against a moving branch
+# would silently re-resolve the kernel's entire binding surface on someone
+# else's schedule. Revisit when a release ships with bindgen >= 0.72, and delete
+# this block rather than repointing it.
+[patch.crates-io]
+wdk = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }
+wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }
+wdk-alloc = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }
+wdk-panic = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }
+wdk-build = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }
+wdk-macros = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "6b040c03e56fbbebc10ed86136839774a82c3b59" }
 
 [profile.dev]
 panic = "abort"
