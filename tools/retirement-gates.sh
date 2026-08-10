@@ -929,9 +929,11 @@ run_gate "A2 HNR2 encoder validates against protocol (executed, not compared)" \
 # adds the three checks only the KMD side can make (staging admission, the
 # one-slot-per-use patch plan, and the `WriteOperation` cross-check `protocol`
 # structurally cannot make because it never sees a `DXGK_ALLOCATIONLIST`).
-# Defeated 5 ways: dropping the open-batch store, dropping the per-entry
+# Defeated 7 ways: dropping the open-batch store, dropping the per-entry
 # write-operation check, counting typed operands instead of uses, a no-op staging
-# retire, and a token watermark that never advances.
+# retire, a token watermark that never advances, substituting the advertised
+# command-buffer constant for the returned `DmaSize`, and making the assembler a
+# process-global instead of per-context.
 run_gate "K6 HNR2 decode: the ICD encoder's corpus replayed through the KMD assembler" \
     bash "$REPO/tools/hnr2-decode-gate.sh"
 

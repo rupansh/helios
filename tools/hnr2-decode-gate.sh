@@ -63,16 +63,19 @@ BATCHES=$(printf '%s\n' "$SUMMARY" | sed -E 's/^HNR2 decode: ([0-9]+) batches.*/
 FRAGMENTS=$(printf '%s\n' "$SUMMARY" | sed -E 's/.*, ([0-9]+) fragments,.*/\1/')
 COMMITS=$(printf '%s\n' "$SUMMARY" | sed -E 's/.*, ([0-9]+) commits,.*/\1/')
 SLOTS=$(printf '%s\n' "$SUMMARY" | sed -E 's/.*, ([0-9]+) output patch slots planned,.*/\1/')
-MUTATIONS=$(printf '%s\n' "$SUMMARY" | sed -E 's/.* ([0-9]+) write-bit mutations refused/\1/')
+MUTATIONS=$(printf '%s\n' "$SUMMARY" | sed -E 's/.*, ([0-9]+) write-bit mutations refused,.*/\1/')
+SHORTBUF=$(printf '%s\n' "$SUMMARY" | sed -E 's/.*, ([0-9]+) short-DMA-buffer refusals,.*/\1/')
+INTERLEAVED=$(printf '%s\n' "$SUMMARY" | sed -E 's/.* ([0-9]+) interleaved fragments/\1/')
 # Floors, not exact counts: the corpus is meant to grow. They exist so a corpus
 # that silently stopped being generated cannot report PASS. Kept in step with
 # tools/hnr2-encoder-gate.sh, which shares the producer.
 if [ "$BATCHES" -lt 18 ] || [ "$FRAGMENTS" -lt 85 ] || [ "$COMMITS" -lt 18 ] \
-   || [ "$SLOTS" -lt 1 ] || [ "$MUTATIONS" -lt 1 ]; then
+   || [ "$SLOTS" -lt 1 ] || [ "$MUTATIONS" -lt 1 ] || [ "$SHORTBUF" -lt 1 ] \
+   || [ "$INTERLEAVED" -lt 4 ]; then
     echo "$SUMMARY"
     echo "hnr2-decode-gate: FAIL the corpus is too small to be a real corpus" \
          "(want >=18 batches, >=85 fragments, >=18 commits, >=1 patch slot," \
-         ">=1 write-bit mutation)"
+         ">=1 write-bit mutation, >=1 short-buffer refusal, >=4 interleaved fragments)"
     exit 1
 fi
 
