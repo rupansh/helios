@@ -218,12 +218,18 @@ fn main() {
         .include(format!(r"{dxvk_src}\include\spirv\include"))
         // Generated headers (version.h / buildenv.h) live at the meson build root.
         .include(&dxvk_build)
-        // Suppresses the MSVC STL's own #error when the clang-cl version falls
-        // outside the STL's supported-compiler window. Deliberately accepted:
-        // removing it hard-fails the only working build. It is a runtime-risk
-        // acknowledgement, not a fix — the ABI still rests on the two objects
-        // agreeing, which nothing here can prove.
-        .define("_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH", None)
+        // ⭐ `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` WAS HERE AND IS GONE
+        // (2026-08-10). It suppressed the MSVC STL's own `#error` when the
+        // clang-cl version fell outside the STL's supported-compiler window,
+        // and it was carried as "a runtime-risk acknowledgement, not a fix —
+        // the ABI still rests on the two objects agreeing, which nothing here
+        // can prove."
+        //
+        // clang-cl and libclang moved 17.0.6 -> 22.1.8, which satisfies both
+        // installed MSVC toolsets (14.44 wants Clang 19+, 14.51 wants 20+), so
+        // the define is unnecessary and is deleted rather than left as a
+        // now-false claim about the toolchain. See `umd12/build.rs` for the
+        // full account. ⇒ If a future MSVC raises the bar again, RAISE CLANG.
         .define("NOMINMAX", None)
         .define("WIN32_LEAN_AND_MEAN", None)
         .define("_WIN32_WINNT", "0x0A00")

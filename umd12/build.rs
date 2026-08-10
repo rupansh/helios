@@ -483,14 +483,30 @@ fn build_vkd3d_bridge() {
         // (`tmp/dx12/gates/G1-static/RESULT.md`), so the bridge sees only SDK
         // headers.
         //
-        // Suppresses the MSVC STL's own #error when the clang-cl version falls
-        // outside the STL's supported-compiler window (MSVC 14.44 demands Clang
-        // 19; installed clang-cl is 17.0.6). Deliberately accepted: removing it
-        // hard-fails the only working build. ⚠ It is a runtime-risk
-        // acknowledgement, not a fix — the ABI still rests on the objects
-        // agreeing, which nothing here can prove — and it is the FIRST suspect
-        // if the engine misbehaves.
-        .define("_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH", None)
+        // ⭐ `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` WAS HERE AND IS GONE
+        // (2026-08-10). It suppressed the MSVC STL's own `#error` when the
+        // clang-cl version fell outside the STL's supported-compiler window,
+        // and it was carried with an explicit warning that it was "a
+        // runtime-risk acknowledgement, not a fix — the ABI still rests on the
+        // objects agreeing, which nothing here can prove — and it is the FIRST
+        // suspect if the engine misbehaves."
+        //
+        // The mismatch it acknowledged was real: MSVC 14.44's `<yvals_core.h>`
+        // hard-asserts "expected Clang 19.0.0 or newer" and the installed
+        // clang-cl was 17.0.6. VS 18 then landed MSVC 14.51, which raises the
+        // bar to Clang 20 and whose `__msvc_doom_core.hpp` assumes
+        // `defined(__clang__)` implies `__builtin_verbose_trap` (a Clang 19
+        // builtin) — so the define stopped being sufficient and the build
+        // failed outright.
+        //
+        // The fix was the root cause, not a wider suppression: clang-cl and
+        // libclang moved 17.0.6 -> 22.1.8, which satisfies both toolsets. The
+        // define is unnecessary, so it is deleted rather than left as a
+        // now-false claim about the toolchain. Verified: vkd3d's 215-target
+        // build and this bridge both compile with it absent.
+        //
+        // ⇒ If a future MSVC raises the bar again, RAISE CLANG. Re-adding this
+        // define would restore an ABI risk nothing can measure.
         .define("NOMINMAX", None)
         .define("WIN32_LEAN_AND_MEAN", None)
         .define("_WIN32_WINNT", "0x0A00")

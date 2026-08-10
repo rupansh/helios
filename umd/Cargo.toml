@@ -28,7 +28,11 @@ windows = { version = "0.58", features = [
 
 [build-dependencies]
 cxx-build = "1"
-bindgen = "0.70"
+# 0.70 -> 0.72 on 2026-08-10 with the clang 17.0.6 -> 22.1.8 upgrade; kept in
+# lockstep with `umd12` so both drivers' generated ABI still comes out of one
+# code generator. See `umd12/Cargo.toml` for what 0.70 and 0.71 got wrong under
+# libclang 22.
+bindgen = "0.72"
 
 [profile.dev]
 panic = "abort"

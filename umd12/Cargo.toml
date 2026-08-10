@@ -124,7 +124,33 @@ windows = { version = "0.58", features = [
 # ARE the deliverable -- if this crate compiles, the D3D12 DDI ABI is
 # machine-checked against the SDK header. Same bindgen version as `umd`, so both
 # drivers' generated ABI comes out of one code generator.
-bindgen = "0.70"
+#
+# ⭐ 0.70 -> 0.72 on 2026-08-10, forced by the clang 17.0.6 -> 22.1.8 upgrade.
+#
+# Under libclang 22, bindgen 0.70 bound the FORWARD DECLARATION rather than the
+# definition for every struct `d3d12umddi.h` declares before defining --
+# `D3D12DDI_CORELAYER_DEVICECALLBACKS_00{22,50,62,112,116}` appear as
+# `const struct ...*` inside a union hundreds of lines before their
+# `typedef struct ... {}` -- so they came out as `pub _address: u8`, size 1.
+# Every field access failed E0609 and every layout assertion underflowed
+# (`1_usize - 144_usize`).
+#
+# ⚠ NOT a header problem, and that was checked rather than assumed: the
+# preprocessed output was verified COMPLETE (all fields present at
+# `d3d12umddi.h` line ~92267) and `clang -fsyntax-only` reported ZERO errors.
+# The generated file merely SHRANK 57 KB. It is a bindgen-vs-libclang version
+# gap.
+#
+# ⚠ 0.71 WAS TRIED AND FAILS THE SAME WAY -- worth recording, because 0.71 is
+# what `kmd_render` pins (to match wdk-build 0.5.1's `BuilderExt`) and "just
+# match the KMD" is the obvious wrong move. 0.72.1 is the first release that
+# handles libclang 22.
+#
+# ⇒ `kmd_render` stays on 0.71 because wdk-build's `Builder::wdk_default`
+# extends that exact `bindgen::Builder` type; it is verified working against
+# libclang 22. So the three crates share ONE libclang, which is the thing that
+# has to agree, and `umd`/`umd12` share one bindgen with each other.
+bindgen = "0.72"
 
 # S4: compiles `bridge/vkd3d_bridge.cpp` + the cxx glue with clang-cl and links
 # the engine. ⭐ The link set is MEASURED, not a guess (`D12-G1` static arm,

@@ -674,19 +674,35 @@ impl WinHost {
         // enable_tests stays OFF: the conformance suite is built by the mingw
         // cross arm on the Linux host (D12-G0/G2), not here.
         //
-        // ⛔ `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` is REQUIRED, not optional.
-        // MSVC 14.44's <yvals_core.h> hard-asserts "expected Clang 19.0.0 or
-        // newer" and the installed clang-cl is 17.0.6, so without it the
-        // dxbc-spirv objects fail to compile at all (verified: 143-target build
-        // goes from `ninja: build stopped` to clean). This is the same define
-        // `umd/build.rs` already applies to the DXVK bridge shim, with the same
-        // caveat recorded there: it is a runtime-risk acknowledgement, not a fix
-        // — the ABI still rests on the objects agreeing, which nothing here can
-        // prove. Removing it hard-fails the only working build.
-        let stl = "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH";
+        // ⭐ `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` WAS HERE AND IS GONE
+        // (2026-08-10). It was documented as REQUIRED because MSVC 14.44's
+        // <yvals_core.h> hard-asserts "expected Clang 19.0.0 or newer" while
+        // the installed clang-cl was 17.0.6 — and with the same caveat
+        // `umd/build.rs` carried: a runtime-risk acknowledgement, not a fix,
+        // because the ABI still rested on objects agreeing that nothing could
+        // prove.
+        //
+        // It stopped working when VS 18 landed MSVC 14.51, which raises the bar
+        // to Clang 20 AND whose `__msvc_doom_core.hpp` assumes
+        // `defined(__clang__)` implies `__builtin_verbose_trap`, a Clang 19
+        // builtin. The define cannot suppress a missing builtin, so the build
+        // failed outright.
+        //
+        // Fixed at the root: clang-cl and libclang moved 17.0.6 -> 22.1.8,
+        // satisfying both installed toolsets. Verified with `-Dcpp_args=` empty:
+        // 215/215 targets clean. ⇒ If a future MSVC raises the bar again, RAISE
+        // CLANG; do not restore the define.
+        //
+        // `-Wno-error=incompatible-pointer-types` IS still needed, and it is a
+        // different thing: Clang 19+ promotes that warning to an error in C, and
+        // upstream vkd3d passes `LONG*`/`HRESULT*` where a `uint32_t*` is
+        // declared (command.c, device.c, resource.c). Same width on Windows, so
+        // it is a type-safety complaint rather than a bug — and demoting it in
+        // the BUILD keeps the fix out of the fork, which is where divergence is
+        // expensive. C only; the C++ half needs nothing.
         let setup = format!(
             "meson setup {VKD3D_BUILD} {VKD3D_MIRROR} --buildtype release -Db_vscrt=md \
-             -Denable_tests=false \"-Dcpp_args={stl}\" \"-Dc_args={stl}\""
+             -Denable_tests=false \"-Dc_args=-Wno-error=incompatible-pointer-types\""
         );
         let meson_cmd = if !a.args.is_empty() {
             format!("meson {}", a.args.join(" "))
