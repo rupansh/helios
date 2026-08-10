@@ -1,34 +1,87 @@
-//! Allocation management DDIs (Gate 5a Stage 2).
+//! Allocation management DDIs — the HPS2 retirement's allocation identity model.
 //!
-//! `DxgkDdiCreateAllocation` reads the ICD's `HeliosWddmAllocPrivate` (passed via
-//! `D3DKMTCreateAllocation` per-allocation private driver data) and creates the
-//! backing virtio-gpu HOST3D blob (`resource_create_blob` = create_blob +
-//! ctx_attach), recording the `resource_id` so later stages can map it into the
-//! host-visible window (`DxgkDdiBuildPagingBuffer`, Stage 2b) and tear it down
-//! (`DxgkDdiDestroyAllocation`). See `GATE5_STAGE2_ALLOC_DESIGN.md`.
+//! Normative: `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` and the orchestrator's
+//! decision record `docs/retirement/K4-CONTRACT.md`, which wins wherever it
+//! completes or contradicts the frozen reference.
 //!
-//! TRUST BOUNDARY: `pPrivateDriverData` is ICD-supplied. `PrivateDriverDataSize`
-//! is the only authoritative length; we bounds-check it against the struct size
-//! before reading, validate the magic/version, and read with `pod_read_unaligned`.
+//! * §10.3 (`:1014-1189`) — **HWA2**, `HeliosWddmAllocationDescV2`, the
+//!   versioned 168-byte create-time descriptor. KMD writes it **only** at
+//!   create; every opener treats it as `const`.
+//! * §10.7 (`:1946-2011`) — **HVM1**, `HeliosVenusMemoryAllocationV1`, the
+//!   64-byte record for one ordinary native-Vulkan `VkDeviceMemory`, admitted
+//!   only as one of four exact storage roles.
+//! * §10.6 (`:1464-1517`) — **HOC1**, `HeliosOuterCommandAllocationV1`, the
+//!   64-byte record for the one D3D12 outer-command pool per device.
+//! * §14 (`:3417-3469`) — lifetime/identity/reset. The allocation generation
+//!   this file stamps is minted by `crate::adapter::allocation_object`.
+//!
+//! # The one rule that shapes every path below
+//!
+//! §10.3:1040-1041: *"The creator allocates the complete buffer, KMD writes it
+//! only on create, and every opener treats it as const."* Concretely, and this
+//! is the whole point of the retirement's identity model:
+//!
+//! * `DxgkDdiCreateAllocation` parses the create-**input** record, validates it
+//!   in full, creates the backing **itself**, and writes the complete
+//!   create-**output** record back into the `[in/out]` per-allocation buffer.
+//! * ⛔ `DxgkDdiOpenAllocation` writes **no byte** of any private buffer. The
+//!   retired `HeliosWddmOpenIdentity` restamped the first 48 bytes at open time,
+//!   so two openers of one allocation could disagree about what they had.
+//! * ⛔ There is no UMD-supplied backing. §18.1:4723-4726 makes "no raw `resid`
+//!   or host backing token is accepted from a UMD/ICD, batch, or create/open
+//!   private descriptor" a static gate; the adoption arm is gone, not disabled.
+//!
+//! # ⚠ The named gap: HWA2 carries no host resource id (`K4-CONTRACT` §5)
+//!
+//! The retired open-identity blob carried a `resource_id` at offset 24 and four
+//! consumers read it. HWA2 deliberately carries none (`protocol/src/wddm.rs`
+//! :355-361), and `DXGK_OPENALLOCATIONINFO::hAllocation` is dxgkrnl's runtime
+//! token, not this driver's `AllocationContext*` — so **the open path cannot
+//! resolve a host resource id at all**, and no adapter-global table may be added
+//! to bridge it (§3:373-379, §13.3:3398-3406). The replacement is a different
+//! mechanism, not a different field: the ICD stops naming host resources and the
+//! KMD patches the host resid in from `HeliosNativeRenderPatch`. That is mesa
+//! lane unit **A3** plus K6.
+//!
+//! ⇒ [`dxgkddi_open_allocation`] therefore publishes **no** [`PresentAllocInfo`]
+//! and counts every such open in `OaNoRid`. `present_alloc_info` answers `None`,
+//! the Present path refuses at its own gates, and the desktop does not composite
+//! until A3 lands. That is the retirement's intended intermediate state, not a
+//! regression (`ROADMAP.md` sequencing decision: "the KMD lane goes next,
+//! desktop breakage accepted"). Never fabricate a resid to make it look alive.
+//!
+//! TRUST BOUNDARY: `pPrivateDriverData` is guest-supplied and
+//! `PrivateDriverDataSize` is the only authoritative length. Every record is
+//! entered through its `from_private_data`, which owns the exact-length check —
+//! **never** a pointer cast to the record type. The one raw read below the
+//! record types is the 4-byte magic used to pick the arm, and it is bounds
+//! checked per-arm, not against a max-union.
 
 use alloc::boxed::Box;
 use core::ffi::c_void;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use bytemuck::{bytes_of, pod_read_unaligned, Zeroable};
+use bytemuck::bytes_of;
 use helios_protocol::{
-    HeliosWddmAllocMeta, HeliosWddmAllocPrivate, HeliosWddmOpenIdentity,
-    HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD,
-    HELIOS_WDDM_ALLOC_KIND_TRACKING, HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT,
-    HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK, HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT,
-    HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE, HELIOS_WDDM_ALLOC_MISC_PRIMARY,
-    HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED, HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK,
-    HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT, HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING,
-    VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
-    VIRTIO_GPU_MAP_CACHE_WC,
+    helios_hwa2_kind_is_image, helios_hwa2_swizzle_is_direct_flip_capable,
+    HeliosOuterCommandAllocationV1, HeliosVenusMemoryAllocationV1, HeliosWddmAllocationDescV2,
+    HeliosWddmPlaneRecordV2, Hvm1Role, Hvm1Stage, D3DDDI_ID_UNINITIALIZED, HELIOS_HOC1_BYTES,
+    HELIOS_HOC1_MAGIC, HELIOS_HVM1_MAGIC, HELIOS_HVM1_SEGMENT_PAGE_SHIFT, HELIOS_HVM1_SIZE,
+    HELIOS_HWA2_BIND_RENDER_TARGET, HELIOS_HWA2_BIND_SHADER_RESOURCE,
+    HELIOS_HWA2_BIND_UNORDERED_ACCESS, HELIOS_HWA2_BYTES, HELIOS_HWA2_FLAG_CPU_VISIBLE,
+    HELIOS_HWA2_FLAG_CROSS_ADAPTER, HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY,
+    HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE, HELIOS_HWA2_FLAG_DISPLAYABLE,
+    HELIOS_HWA2_FLAG_PRIMARY, HELIOS_HWA2_FLAG_PROTECTED, HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED,
+    HELIOS_HWA2_FLAG_SHARED, HELIOS_HWA2_FLAG_STANDARD, HELIOS_HWA2_FLAG_STEREO,
+    HELIOS_HWA2_KIND_BUFFER, HELIOS_HWA2_KIND_IMAGE, HELIOS_HWA2_KIND_PAGING_OBJECT,
+    HELIOS_HWA2_KIND_STANDARD_PRIMARY, HELIOS_HWA2_KIND_STANDARD_SHADOW,
+    HELIOS_HWA2_KIND_STANDARD_STAGING, HELIOS_HWA2_MAGIC, HELIOS_HWA2_MEMORY_CPU_VISIBLE,
+    HELIOS_HWA2_MEMORY_DEVICE_LOCAL, HELIOS_HWA2_MISC_GDI_COMPATIBLE, HELIOS_HWA2_SWIZZLE_LINEAR,
+    HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL, HELIOS_PACKAGE_GENERATION, HELIOS_SEGMENT_ID_HLM1,
 };
 
+use crate::adapter::allocation_object;
 use crate::adapter::{AdapterContext, ScanoutGuard};
 use crate::ddi::display::ScanoutReject;
 use crate::dxgk::_D3DDDIFORMAT::{D3DDDIFMT_A8B8G8R8, D3DDDIFMT_A8R8G8B8, D3DDDIFMT_X8R8G8B8};
@@ -54,8 +107,25 @@ struct AllocationContext {
     /// [`ALLOCATION_CTX_MAGIC`] — must be the FIRST field (paging-DDI cast check).
     magic: u32,
     ctx_id: u32,
+    /// The host resource id. §10.3:1087-1093 — "a host `resid` may live
+    /// **solely** inside the KMD allocation object"; this field is that sole
+    /// home. It is never written into any private buffer, protocol message, or
+    /// log-visible descriptor, and there is no path from a UMD/ICD value to it.
     resource_id: u32,
-    owns_resource: bool,
+    /// The allocation generation minted once at create
+    /// (`crate::adapter::allocation_object::mint`), stamped into the descriptor
+    /// this create wrote back, and `const` for the object's whole life.
+    ///
+    /// ⛔ Stale-validation and diagnostics only. Nothing resolves an allocation
+    /// *from* it (§10.3:1049, §15:3516-3520); K6's HOB1 use records repeat it as
+    /// `expected_allocation_generation` so a stale batch is refused.
+    generation: u64,
+    /// The exact `HELIOS_HWA2_KIND_*` this allocation was created with, or
+    /// [`ALLOC_KIND_HVM1`] / [`ALLOC_KIND_HOC1`] for the two records that are
+    /// not HWA2. The classification is recorded rather than re-derived: every
+    /// later decision that used to sniff geometry or memory visibility now names
+    /// this instead.
+    kind: u32,
     /// Nonzero for KMD-backed standard allocations: the kernel venus client's
     /// `VkDeviceMemory` object id behind the blob, freed (`vkFreeMemory`) at
     /// DestroyAllocation after the resource unref.
@@ -181,9 +251,23 @@ struct AllocationContext {
     bar_eligible: bool,
     /// Provenance of `size`. See [`BackingSize`].
     size_provenance: BackingSize,
-    /// Nonzero only for a registered VidMm tracker allocation.
-    vidmm_tracker_cookie: u32,
 }
+
+/// Pseudo-kinds for the two records that are not HWA2, so
+/// [`AllocationContext::kind`] is total over every admitted create.
+///
+/// Chosen above [`helios_protocol::HELIOS_HWA2_KIND_MAX`] and asserted distinct
+/// from every real kind below, so a reader can never confuse one with an HWA2
+/// value that happens to collide.
+const ALLOC_KIND_HVM1: u32 = 0x8000_0001;
+/// See [`ALLOC_KIND_HVM1`].
+const ALLOC_KIND_HOC1: u32 = 0x8000_0002;
+
+const _: () = {
+    assert!(ALLOC_KIND_HVM1 > helios_protocol::HELIOS_HWA2_KIND_MAX);
+    assert!(ALLOC_KIND_HOC1 > helios_protocol::HELIOS_HWA2_KIND_MAX);
+    assert!(ALLOC_KIND_HVM1 != ALLOC_KIND_HOC1);
+};
 
 /// Per-resource KMD state. Dxgkrnl requires a non-null KMD resource handle for
 /// `Flags.Resource` CreateAllocation calls (not just per-allocation handles);
@@ -210,6 +294,326 @@ static MULTI_ENTRY_OPENS: AtomicU32 = AtomicU32::new(0);
 /// Ticks the per-CreateAllocation breadcrumb throttle (R317 / k-alloc-05).
 static CREATE_BREADCRUMB_TICKS: AtomicU32 = AtomicU32::new(0);
 
+// ── Retirement refusal counters (CLAUDE.md operating rule 2) ────────────────
+//
+// Every refused create/open below increments exactly one of these and returns a
+// documented NTSTATUS. They are plain atomics mirrored through
+// `diag::record_named_bytes` on the file's existing 1st-then-every-64th cadence
+// ([`bump`]) rather than `diag::record` breadcrumbs, because `record` is
+// DiagLevel-gated: a refusal reported only through it leaves no trace on a
+// default boot. The cadence matters — every one of these paths is
+// guest-reachable, so an unthrottled synchronous `RtlWriteRegistryValue` per
+// call is a registry-write storm a caller could trigger deliberately.
+//
+// ⚠ They are NOT flushed from a central dump site. `ApMiss` and `BlbSzD` are,
+// from `cpu_host_aperture.rs:141-151`, and K1 deletes that file — which is
+// exactly the trap this shape avoids: an inline flush cannot lose its home.
+
+/// Successful `DxgkDdiCreateAllocation` allocations, all record types (`AcOk`).
+/// The denominator every refusal counter below needs.
+static CREATE_ADMITTED: AtomicU32 = AtomicU32::new(0);
+/// Per-allocation private data that was null, shorter than the 4-byte magic, or
+/// carried no magic this driver knows (`AcMagic`). §10.3:1079-1080 — a malformed
+/// or unknown descriptor fails the create and **never selects a legacy parser**;
+/// the retired `HeliosWddmAllocPrivate` path is one of the things it must not
+/// select, which is why an unrecognised magic lands here rather than in a
+/// fallback.
+static CREATE_UNKNOWN_RECORD: AtomicU32 = AtomicU32::new(0);
+/// HWA2 create-input records refused by
+/// `HeliosWddmAllocationDescV2::validate_create_input` (`AcHwa2Rej`), including
+/// the exact-length arm.
+static CREATE_HWA2_REJECT: AtomicU32 = AtomicU32::new(0);
+/// HWA2 create-**output** records this KMD built and its own
+/// `validate_create_output` then refused (`AcHwa2Out`). **Must read 0** — a
+/// nonzero value is a driver bug, not a guest one: the KMD produced a descriptor
+/// it would itself reject on open.
+static CREATE_HWA2_OUTPUT_REJECT: AtomicU32 = AtomicU32::new(0);
+/// HVM1 create-input records refused, packed `(count << 16) | Hvm1Reject::code()`
+/// so one registry value names both how often and which field (`AcHvm1Rej`).
+static CREATE_HVM1_REJECT: AtomicU32 = AtomicU32::new(0);
+/// HVM1 create-output records this KMD built and its own `CreateOutput`
+/// validation refused (`AcHvm1Out`). Must read 0; same reasoning as
+/// [`CREATE_HWA2_OUTPUT_REJECT`].
+static CREATE_HVM1_OUTPUT_REJECT: AtomicU32 = AtomicU32::new(0);
+/// HOC1 create-input records refused (`AcHoc1Rej`). §17.6:4419-4420 — "every
+/// other size/flag/cache/node/role combination fails allocation".
+static CREATE_HOC1_REJECT: AtomicU32 = AtomicU32::new(0);
+/// HOC1 create-output records this KMD built and its own `validate_create_output`
+/// refused (`AcHoc1Out`). Must read 0.
+static CREATE_HOC1_OUTPUT_REJECT: AtomicU32 = AtomicU32::new(0);
+/// HVM1 creates refused because the role's `preferred_segment` is not a segment
+/// this driver actually reports — ONE COUNTER PER ROLE, `AcSegRole1` (reply
+/// pool) … `AcSegRole4` (Vulkan device-local).
+///
+/// `K4-CONTRACT.md` §4, **as amended 2026-08-10**. The first draft of that clause
+/// said "role 4 is admitted and counted, not satisfied", and this file
+/// implemented exactly that: it refused `VulkanDeviceLocal` and admitted roles
+/// 1-3. Both halves were wrong, and the admitting half is the dangerous one.
+/// `Hvm1Role::placement()` (`native_render.rs:1763-1775`) hardcodes
+/// `HELIOS_SEGMENT_ID_HLM1` for **every** role, so a role-1..3 create was handed
+/// a `PreferredSegment` that `QUERYSEGMENT4` may never have reported — and
+/// dxgkrnl then refuses that create **outside this driver, with no Helios
+/// counter at all**. That is exactly the invisible refusal CLAUDE.md's "every
+/// skipped/refused path gets a named counter" rule exists to prevent, and it is
+/// invisible in the way this project has repeatedly been burned by.
+///
+/// ⇒ The rule is neither "role 4" nor "all roles": the KMD asks the segment
+/// table it actually reported ([`segment_is_reported`]) and refuses per role when
+/// the answer is no. A hardcoded role number is a claim about K2's schedule
+/// embedded in kernel code and goes stale silently; a runtime question about the
+/// reported table cannot. `FINDINGS.md` F2 measured that the HLM1 *flag shape* is
+/// already admitted by the OS (`BarSegFlags=0x02` starts `OK/CM_PROB_NONE` with a
+/// fully composited desktop), so segment id 2 may well be reported before K2
+/// lands at all — which is precisely why this is read at runtime instead of
+/// assumed in either direction.
+///
+/// There is no honest substitution to fall back to: §10.7:1999-2002 fixes HLM1 as
+/// the preferred segment for every role, and quietly preferring the aperture
+/// instead would hand VidMm a placement the doc forbids, on a role-4 object that
+/// has `CpuVisible=0` and no CPU VA at all, and would hide the sequencing gap
+/// behind a create that looked like success.
+///
+/// ⚠ Nonzero here is EXPECTED until K2 reports the segment; it measures that gap
+/// rather than a fault. Which of the four moves also names which client is
+/// asking, which one packed reason code could not: 1 reply pool, 2 host-visible
+/// Vulkan, 3 feedback, 4 device-local.
+static CREATE_ROLE1_SEGMENT_ABSENT: AtomicU32 = AtomicU32::new(0);
+static CREATE_ROLE2_SEGMENT_ABSENT: AtomicU32 = AtomicU32::new(0);
+static CREATE_ROLE3_SEGMENT_ABSENT: AtomicU32 = AtomicU32::new(0);
+static CREATE_ROLE4_SEGMENT_ABSENT: AtomicU32 = AtomicU32::new(0);
+/// The HOC1 pool refused by the same check for the same reason (`AcSegHoc1`).
+///
+/// ⚠ BEYOND THE LETTER of `K4-CONTRACT.md` §4, which is written about HVM1 roles,
+/// and recorded here as such. [`hoc1_placement`] hardcodes the identical
+/// `HELIOS_SEGMENT_ID_HLM1` (§10.6:1510-1512), so an HOC1 create carries the
+/// identical exposure: refused by dxgkrnl, outside this driver, with nothing in
+/// the guest naming it. Applying §4's argument to the one other placement in this
+/// file that shares its shape is the whole change; the alternative was to
+/// knowingly leave one uncounted external refusal sitting beside the one just
+/// fixed. Revert by deleting the check in [`admit_hoc1`] — the placement itself
+/// is untouched.
+static CREATE_HOC1_SEGMENT_ABSENT: AtomicU32 = AtomicU32::new(0);
+/// Creates refused because the OS call shape contradicts the record
+/// (`AcShape`). HVM1 (§10.7:1964-1972) and HOC1 (§10.6:1489-1494) both fix the
+/// exact `pfnAllocateCb` shape: `hResource = NULL`, one allocation, outer flags
+/// zero, and no resource-level private bytes. §18.1:4750-4751 tests those
+/// properties; a shape checked only by the guest is not checked (CLAUDE.md).
+static CREATE_CALL_SHAPE: AtomicU32 = AtomicU32::new(0);
+/// Creates refused because the KMD has no backing constructor for the descriptor
+/// (`AcKind`): an HWA2 `PAGING_OBJECT`, or a geometry/format the kernel venus
+/// client cannot build.
+static CREATE_UNSUPPORTED_KIND: AtomicU32 = AtomicU32::new(0);
+/// Creates refused because `byte_size` contradicts the KMD's own size rule, or
+/// because the backing the KMD created is SMALLER than the descriptor's
+/// `byte_size` (`AcSize`).
+///
+/// The undersize arm is the Xid-31 class: a blob smaller than the image
+/// requirement binds "successfully" and then MMU-faults when the sampler reads
+/// the slack region (host FAULT_PTE VIRT_READ, killed the IDD feed live
+/// 2026-07-04). §10.3:1050 makes `byte_size` bound every plane, so admitting a
+/// short backing would make the descriptor lie about its own planes.
+static CREATE_SIZE_REJECT: AtomicU32 = AtomicU32::new(0);
+/// Creates refused because the host/transport could not produce the backing
+/// (`AcBackFail`). Distinct from [`CREATE_UNSUPPORTED_KIND`]: the KMD knew how
+/// to ask and the ask failed.
+static CREATE_BACKING_FAILED: AtomicU32 = AtomicU32::new(0);
+/// Creates refused because the allocation-generation ordinal is exhausted
+/// (`AcGenExh`); see `adapter::allocation_object::GENERATION_EXHAUSTED`.
+static CREATE_GENERATION_EXHAUSTED: AtomicU32 = AtomicU32::new(0);
+/// Opens that could NOT publish a [`PresentAllocInfo`] because HWA2 carries no
+/// host resource id (`OaNoRid`) — the A3 gap named in the module doc and in
+/// `K4-CONTRACT.md` §5.
+///
+/// ⚠ This counter is expected to be LARGE and rising until mesa lane unit **A3**
+/// and K6 land. It is not a fault; it is the measurement of how much of the
+/// present path is waiting on them. It must reach 0 when they do.
+///
+/// ⛔ A PLAIN `fetch_add`, NOT [`bump`], and the distinction is the point.
+/// [`bump`] mirrors on n==1 and every 64th hit, forever, through
+/// `diag::record_named_bytes` — a synchronous `RtlWriteRegistryValue`. Every
+/// OTHER name in [`RETIREMENT_COUNTER_NAMES`] marks a REFUSAL, which is rare by
+/// construction and stays rare; this one fires on every SUCCESSFUL open, i.e. on
+/// DWM's own path, for as long as the A3 gap is open. Putting a registry write
+/// there would make the throttle's period the only thing between this driver and
+/// a per-open kernel registry round-trip on the hot path, and it would make one
+/// array mean two different things. It is mirrored instead from [`ALLOC_COUNTERS`]
+/// on a PASSIVE create-path cadence — the same shape
+/// [`APERTURE_MISSING_CPU_VISIBLE`] uses.
+static OPEN_NO_RESOURCE_ID: AtomicU32 = AtomicU32::new(0);
+/// Opens whose per-allocation private data failed HWA2 create-**output**
+/// validation (`OaHwa2Rej`). §10.3:1079-1080 makes a malformed descriptor fail
+/// the OPEN as well as the create; the open is not a place to be lenient,
+/// because the receiving UMD reads the identical bytes.
+static OPEN_HWA2_REJECT: AtomicU32 = AtomicU32::new(0);
+/// HWA2 descriptors whose `RESOURCE_ASSOCIATED` claim disagreed with
+/// `DXGK_CREATEALLOCATIONFLAGS::Resource` on the call that carried them
+/// (`AcRcAssoc`). See the read site for why this is counted and not refused.
+///
+/// ⚠ Expected NONZERO for OS standard allocations, exactly once per
+/// resource-associated standard create. A nonzero value here is a measurement of
+/// the field-definition gap, not a fault — but a value that tracks EVERY create
+/// rather than the standard ones would mean a UMD is not filling the field at
+/// all.
+static CREATE_RESOURCE_ASSOC_DIVERGENCE: AtomicU32 = AtomicU32::new(0);
+/// `DxgkDdiGetStandardAllocationDriverData` calls refused because the runtime's
+/// `D3DDDIFORMAT` has no DXGI peer (`StdFmt`).
+///
+/// BEHAVIOUR CHANGE, recorded here because it is easy to mistake for a
+/// regression: the retired trailer wrote `dxgi_format = 0` for such a surface
+/// and let the opener fall back to BGRA. HWA2 §10.3:1055 requires an image kind
+/// to carry an exact DXGI format and `validate` rejects `UNKNOWN` outright, so
+/// the zero hint is no longer expressible. Refusing here is the fail-closed
+/// reading; the alternative is authoring a format the KMD guessed.
+static STANDARD_FORMAT_REFUSED: AtomicU32 = AtomicU32::new(0);
+/// `DxgkDdiGetStandardAllocationDriverData` authored a descriptor its own
+/// `validate_create_input` refused (`StdSelf`). **Must read 0** — a nonzero
+/// value means this driver produces a record the create path will reject, i.e.
+/// the two halves of one file disagree.
+static STANDARD_SELF_REJECT: AtomicU32 = AtomicU32::new(0);
+
+/// Every registry name the counters above publish, so the compile-time
+/// no-truncation proof below has one list to check.
+///
+/// `diag::record_named_bytes` clamps silently at `diag::MAX_CONFIG_NAME`, so two
+/// names sharing a 14-byte prefix would MERGE into one registry value — a
+/// refusal counter reading someone else's number. Same guard
+/// `diag::FaultCounter` and `native_fence.rs` use.
+const RETIREMENT_COUNTER_NAMES: [&[u8]; 22] = [
+    b"AcOk",
+    b"AcMagic",
+    b"AcHwa2Rej",
+    b"AcHwa2Out",
+    b"AcHvm1Rej",
+    b"AcHvm1Out",
+    b"AcHoc1Rej",
+    b"AcHoc1Out",
+    b"AcSegRole1",
+    b"AcSegRole2",
+    b"AcSegRole3",
+    b"AcSegRole4",
+    b"AcSegHoc1",
+    b"AcShape",
+    b"AcKind",
+    b"AcSize",
+    b"AcBackFail",
+    b"AcGenExh",
+    b"AcRcAssoc",
+    // The two [`ALLOC_COUNTERS`] names, published by that block rather than by
+    // [`bump`] — see its own doc for why. Listed here anyway because this array
+    // is the file's ONE truncation proof, and a name that skips it is a name
+    // nothing checks. `AcGenEpoch` is 10 bytes; `diag::CounterBlock` has no
+    // truncation assert of its own, so this list is the only thing standing
+    // between it and a silent merge with another value.
+    b"OaNoRid",
+    b"AcGenEpoch",
+    b"OaHwa2Rej",
+];
+
+const _: () = {
+    let mut i = 0;
+    while i < RETIREMENT_COUNTER_NAMES.len() {
+        assert!(
+            RETIREMENT_COUNTER_NAMES[i].len() <= crate::diag::MAX_CONFIG_NAME,
+            "allocation counter name exceeds MAX_CONFIG_NAME and would merge with another"
+        );
+        i += 1;
+    }
+    // The two GetStandardAllocationDriverData names are not in the array above
+    // because they are authored on a different DDI; check them here.
+    assert!(b"StdFmt".len() <= crate::diag::MAX_CONFIG_NAME);
+    assert!(b"StdSelf".len() <= crate::diag::MAX_CONFIG_NAME);
+};
+
+/// Count one refusal and mirror it on the file's bounded cadence.
+///
+/// Returns the new count so a caller that wants to pack a reason code into the
+/// mirrored value can do so.
+///
+/// PASSIVE_LEVEL only — `diag::record_named_bytes` is a synchronous
+/// `RtlWriteRegistryValue`. Every caller is a PASSIVE allocation DDI.
+fn bump(counter: &AtomicU32, name: &[u8]) -> u32 {
+    let n = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if n == 1 || n % 64 == 0 {
+        crate::diag::record_named_bytes(name, n);
+    }
+    n
+}
+
+static ALLOC_FLUSH_TICKS: AtomicU32 = AtomicU32::new(0);
+static ALLOC_FLUSH_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+/// The counters this file publishes WITHOUT [`bump`], because their sites are
+/// success paths rather than refusals.
+///
+/// [`bump`] is the right emitter for a refusal: refusals are rare, so a mirror on
+/// the 1st and every 64th is bounded by construction. It is the WRONG emitter for
+/// anything that fires on success — `diag::record_named_bytes` is a synchronous
+/// `RtlWriteRegistryValue`, and a success-path counter's period is set by the
+/// workload, not by the driver. `OaNoRid` is exactly that: one hit per successful
+/// open, on DWM's path, for as long as the A3 gap stays open.
+///
+/// So the atomic stays hot-path-free and this block mirrors it, which is the
+/// shape [`APERTURE_MISSING_CPU_VISIBLE`] already uses (`diag::CounterBlock`,
+/// x-dup-dead-27: three modules had each hand-rolled the same dump with
+/// different throttles).
+///
+/// ⚠ The flush site is the CREATE DDI, not the open DDI, and that is deliberate:
+/// flushing from the site being measured would just re-impose the same period on
+/// the same path. An allocation is created once and opened at least once per
+/// device that binds it, so creates are the rarer event — one block flush per 64
+/// creates, at `PASSIVE_LEVEL`, off the open path entirely. The value is a
+/// cumulative atomic, so a create-less stretch costs mirror LATENCY and never a
+/// wrong number, and `DiagLevel >= 1` flushes every call regardless.
+static ALLOC_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
+    entries: &[
+        crate::diag::CounterEntry {
+            name: b"OaNoRid",
+            value: crate::diag::CounterRef::U32(&OPEN_NO_RESOURCE_ID),
+            // A VALUE entry, not a failure: it is expected to be large and
+            // rising until A3/K6 land, and marking it a failure would force an
+            // immediate flush on every single open — reintroducing precisely the
+            // per-open registry write this block exists to remove.
+            failure: false,
+        },
+        crate::diag::CounterEntry {
+            name: b"AcGenEpoch",
+            value: crate::diag::CounterRef::U32(
+                &crate::adapter::allocation_object::GENERATION_EPOCH_BUMPS,
+            ),
+            // Homed HERE, in a K4 file, rather than left as a second cross-lane
+            // request: `adapter/allocation_object.rs` owns the epoch but owns no
+            // dump site, and its own doc named that as an open item. This block
+            // closes it. The atomic's OWN gap — `invalidate_all` still has no
+            // caller — is unaffected and stays reported; what changes is that
+            // when K9/K10 wire it, the evidence is readable with `reg query`
+            // instead of only under a debugger.
+            //
+            // A FAILURE entry, so any movement flushes on the next create rather
+            // than up to 63 creates later. Adapter resets are rare by
+            // construction, so the forced flush is bounded — unlike `OaNoRid`
+            // above, which is why the two entries differ.
+            failure: true,
+        },
+    ],
+    ticks: &ALLOC_FLUSH_TICKS,
+    failures: &ALLOC_FLUSH_FAILURES,
+    policy: crate::diag::FlushPolicy::EveryNth(64),
+};
+
+/// Mirror [`ALLOC_COUNTERS`] on its own throttle. PASSIVE_LEVEL only.
+fn dump_alloc_counters() {
+    ALLOC_COUNTERS.flush();
+}
+
+/// [`bump`] for a counter whose mirrored value carries a reason code in the low
+/// 16 bits, so one registry read names both how often and why.
+fn bump_with_code(counter: &AtomicU32, name: &[u8], code: u32) {
+    let n = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if n == 1 || n % 64 == 0 {
+        crate::diag::record_named_bytes(name, (n << 16) | (code & 0xFFFF));
+    }
+}
+
 /// Per-device open state for an allocation. Dxgkrnl's `hAllocation` in
 /// `DXGK_OPENALLOCATIONINFO` is its non-device-specific allocation handle; the
 /// miniport must return its own device-specific handle here and later receives it
@@ -229,7 +633,18 @@ struct OpenAllocationContext {
 
 /// Surface identity + geometry for a Present allocation-list entry, resolved from
 /// its `hDeviceSpecificAllocation` ([`present_alloc_info`]).
+///
+/// ⚠ **NOTHING CONSTRUCTS THIS TODAY, and that is the A3 gap, not an oversight.**
+/// Its `resource_id` is a host resource id, HWA2 deliberately carries none
+/// (`protocol/src/wddm.rs:355-361`), and `DXGK_OPENALLOCATIONINFO::hAllocation`
+/// is dxgkrnl's runtime token rather than this driver's `AllocationContext*` —
+/// so `dxgkddi_open_allocation` has nothing to build one FROM and refuses to
+/// fabricate one (see that DDI's doc and the `OaNoRid` counter). The type,
+/// `present_alloc_info`, and `ddi/display.rs`'s exhaustive consumers are all
+/// retained unchanged so that mesa lane unit **A3** plus K6 re-point the
+/// producer and nothing else has to move.
 #[derive(Clone, Copy)]
+#[allow(dead_code)] // no producer until A3/K6; see the paragraph above.
 pub struct PresentAllocInfo {
     pub resource_id: u32,
     /// Versioned allocation kind from the creator/open identity. Present uses
@@ -294,8 +709,11 @@ pub struct PresentAllocDiag {
     pub resource_private_size: u32,
 }
 
+/// ⚠ No variant is constructed today — same A3 gap as [`PresentAllocInfo`],
+/// which is the only thing that holds one.
 #[repr(u32)]
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // no producer until A3/K6; see `PresentAllocInfo`.
 pub enum PresentAllocationStorage {
     /// Ordinary UMD shared OPTIMAL image, imported through OPAQUE_FD.
     OptimalOpaqueFdImage = 0,
@@ -343,9 +761,16 @@ pub(crate) struct RowPitch(u32);
 impl RowPitch {
     /// The single rule.
     ///
-    ///   OPTIMAL GDI texture -> `None`  (no linear row layout exists)
-    ///   authored pitch      -> that pitch
-    ///   otherwise           -> `cross_adapter_pitch(width)`
+    ///   no linear row layout -> `None`  (a tiled/OPTIMAL surface)
+    ///   authored pitch       -> that pitch
+    ///   otherwise            -> `cross_adapter_pitch(width)`
+    ///
+    /// ⚠ The first parameter used to be the retired trailer's `misc_flags` word,
+    /// tested against `HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE`. HWA2 has no
+    /// such misc bit — §10.3 offset 88's swizzle/layout class is the field that
+    /// says whether a linear row layout exists — so the parameter is now the
+    /// PREDICATE itself and each caller states which field it derived it from.
+    /// Passing a flags word here would silently be `true` for any nonzero value.
     ///
     /// ⚠ `cross_adapter_pitch` HARDCODES 32 bpp (`width * 4`, 256-aligned),
     /// while the UMD's equivalent uses `dxgi_bytes_per_pixel`. The fallback
@@ -353,8 +778,8 @@ impl RowPitch {
     /// today -- `GetStandardAllocationDriverData` authors them all that way --
     /// and it is the assumption to revisit first if a non-32-bpp standard
     /// allocation ever appears.
-    pub(crate) fn resolve(misc_flags: u32, pitch: u32, width: u32) -> Option<Self> {
-        if misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0 {
+    pub(crate) fn resolve(has_linear_row_layout: bool, pitch: u32, width: u32) -> Option<Self> {
+        if !has_linear_row_layout {
             return None;
         }
         Some(Self(if pitch != 0 {
@@ -369,12 +794,12 @@ impl RowPitch {
     /// A scan-out target is linear by construction -- an OPTIMAL GDI texture can
     /// never be a primary -- so the tiled arm cannot apply and this is total.
     pub(crate) fn linear(pitch: u32, width: u32) -> Self {
-        match Self::resolve(0, pitch, width) {
+        match Self::resolve(true, pitch, width) {
             Some(p) => p,
-            // Unreachable: `resolve` answers None only for the
-            // OPTIMAL_GDI_TEXTURE flag, which is not set above. Falls back to
-            // the value the pre-R1007 two-arm expression produced rather than
-            // refusing; this tranche adds no refusals.
+            // Unreachable: `resolve` answers None only when the caller states
+            // there is no linear row layout, which is not what is passed above.
+            // Falls back to the value the pre-R1007 two-arm expression produced
+            // rather than refusing; this tranche adds no refusals.
             None => Self(cross_adapter_pitch(width)),
         }
     }
@@ -1038,6 +1463,44 @@ pub(crate) unsafe fn allocation_resource_id(h: HANDLE) -> u32 {
     ctx.resource_id
 }
 
+/// The allocation generation and record kind held by one KMD allocation object.
+///
+/// The generation is the value this unit minted at create and stamped into the
+/// descriptor it wrote back; the kind is the `HELIOS_HWA2_KIND_*` it was created
+/// with, or [`ALLOC_KIND_HVM1`] / [`ALLOC_KIND_HOC1`]. `None` for a null or
+/// foreign handle.
+///
+/// # ⚠ IMPLEMENTED BUT NEVER EXERCISED — there is no caller yet, and the reader
+/// is named
+///
+/// §15:3516-3520 puts "the expected live allocation generation" in HOB1, and
+/// §18.1:4723-4726 makes Render/Patch resolve a use record only through the
+/// exact patched WDDM capability against the live allocation. Both are **K6**
+/// (`ddi/native_render.rs`, which does not exist). The accessor is written here,
+/// with the field it reads, rather than left for K6 to bolt on, because
+/// `AllocationContext` is private to this file by design: a later unit must not
+/// reach into it, and the shape of what it may ask for is this unit's decision.
+///
+/// ⛔ It answers "what generation does this object hold", NEVER "which object has
+/// this generation". §10.3:1049 forbids the second reading and nothing that
+/// resolves an allocation *from* a generation may be added beside it.
+///
+/// # Safety
+/// Same contract as [`scanout_alloc_info`]: `h` is either null or an
+/// `hAllocation` this driver returned from `DxgkDdiCreateAllocation` and
+/// dxgkrnl has round-tripped unmodified.
+#[allow(dead_code)] // reader is K6 (`ddi/native_render.rs`); see the note above.
+pub(crate) unsafe fn allocation_identity(h: HANDLE) -> Option<(u64, u32)> {
+    if h.is_null() {
+        return None;
+    }
+    let ctx = unsafe { &*(h as *const AllocationContext) };
+    if ctx.magic != ALLOCATION_CTX_MAGIC {
+        return None;
+    }
+    Some((ctx.generation, ctx.kind))
+}
+
 /// Resolve a primary allocation's `hAllocation` (the CreateAllocation handle
 /// dxgkrnl passes in `SetVidPnSourceAddress`) to its scan-out geometry + layout
 /// for `SET_SCANOUT_BLOB`. Returns `None` for a null/foreign handle or an
@@ -1490,164 +1953,25 @@ fn record_alloc_event(resid: u32, width: u32, height: u32, ctx_id: u32, is_open:
     );
 }
 
-/// Trailer lengths that named neither real layout and were therefore refused
-/// (registry-visible as `MetaLen`). Zero is the expected value forever: the KMD
-/// reports PRIV_SIZE 48 + 48 = 96 and the UMD's RuntimeAllocPrivate is exactly
-/// 96 with NumAllocations = 1, so no live writer can produce one.
-static META_LEN_REJECTS: AtomicU32 = AtomicU32::new(0);
-
-unsafe fn read_standard_meta(
-    private: *const c_void,
-    private_size: UINT,
-) -> Option<HeliosWddmAllocMeta> {
-    use helios_kmd_logic::MetaLayout;
-
-    // The layout enum's byte counts are a copy of the protocol's (kmd_logic has
-    // no dependency edge to helios_protocol); this pins them together.
-    const _: () = assert!(size_of::<HeliosWddmAllocMeta>() == MetaLayout::FULL_BYTES);
-
-    let base = size_of::<HeliosWddmAllocPrivate>();
-    if private.is_null() {
-        return None;
-    }
-    let Some(trailer_len) = (private_size as usize).checked_sub(base) else {
-        return None;
-    };
-    // PER-ARM, not max-union: the copy length comes from the layout, never from
-    // arithmetic on an untrusted size, so a trailer that stops mid-field is
-    // refused instead of being zero-extended into a plausible wrong value.
-    let Ok(layout) = MetaLayout::try_from(trailer_len) else {
-        if trailer_len >= MetaLayout::LEGACY_BYTES {
-            // A trailer long enough to have been accepted by the old bound.
-            // Shorter ones are "no trailer at all" and keep their existing
-            // silent refusal.
-            let n = META_LEN_REJECTS.fetch_add(1, Ordering::Relaxed) + 1;
-            // PASSIVE (both call sites are PASSIVE DDIs). First occurrence plus
-            // every 64th: this path is guest-reachable, so it must not be able
-            // to turn into a registry-write storm.
-            if n == 1 || n % 64 == 0 {
-                crate::diag::record_named_bytes(b"MetaLen", n);
-            }
-        }
-        return None;
-    };
-    let have = layout.copy_bytes();
-    let mut raw = [0u8; size_of::<HeliosWddmAllocMeta>()];
-    // SAFETY: `have` is 24 or 48 and `trailer_len >= have` was proven by the
-    // layout classification, so that many trailer bytes exist past the prefix.
-    // A Legacy24 read leaves the remaining 24 bytes zeroed, which is the
-    // documented zero-extension.
-    unsafe {
-        core::ptr::copy_nonoverlapping((private as *const u8).add(base), raw.as_mut_ptr(), have);
-    }
-    Some(pod_read_unaligned(&raw))
-}
-
-/// Identity summary parsed from an allocation's private driver data at
-/// OpenAllocation time. Sourced from either layout the buffer may hold:
-/// the creator's [`HeliosWddmAllocPrivate`] (with the create-time adopt id
-/// resid write-back), or a [`HeliosWddmOpenIdentity`] a previous open of the
-/// same allocation already wrote (dxgkrnl keeps ONE per-allocation buffer, so
-/// KMD mutations persist across opens — proven by the old adopt-id patching).
-#[derive(Clone, Copy)]
-struct ParsedAllocIdentity {
-    resource_id: u32,
-    blob_size: u64,
-    venus_alloc_size: u64,
-    memory_type_index: u32,
-    ctx_id: u32,
-    kind: u32,
-    /// System-wide KMT share and association cookie for the allocation's VidMm
-    /// tracker. Both zero mean the adopted allocation keeps its full charge.
-    global_vidmm_tracker_share: u32,
-    global_vidmm_tracker_cookie: u32,
-}
-
-unsafe fn read_alloc_identity(
-    private: *const c_void,
-    private_size: UINT,
-) -> Option<ParsedAllocIdentity> {
-    if private.is_null() || (private_size as usize) < size_of::<HeliosWddmAllocPrivate>() {
-        return None;
-    }
-    // SAFETY: bounds-checked above; both candidate layouts are exactly 48 bytes.
-    let bytes = unsafe {
-        core::slice::from_raw_parts(private as *const u8, size_of::<HeliosWddmAllocPrivate>())
-    };
-    let ident: HeliosWddmOpenIdentity = pod_read_unaligned(bytes);
-    if ident.is_valid() && ident.resource_id != 0 {
-        let tracker = ident.global_vidmm_tracker();
-        return Some(ParsedAllocIdentity {
-            resource_id: ident.resource_id,
-            blob_size: ident.blob_size,
-            venus_alloc_size: ident.venus_alloc_size,
-            memory_type_index: ident.memory_type_index,
-            ctx_id: ident.ctx_id,
-            kind: ident.kind,
-            global_vidmm_tracker_share: tracker.map_or(0, |tracker| tracker.global_share),
-            global_vidmm_tracker_cookie: tracker.map_or(0, |tracker| tracker.cookie),
-        });
-    }
-    let ap: HeliosWddmAllocPrivate = pod_read_unaligned(bytes);
-    if ap.is_valid() && ap.adopt_resource_id != 0 {
-        let meta = unsafe { read_standard_meta(private, private_size) };
-        let tracker = ap.global_vidmm_tracker();
-        return Some(ParsedAllocIdentity {
-            resource_id: ap.adopt_resource_id,
-            blob_size: ap.size,
-            venus_alloc_size: meta
-                .map(|m| m.venus_alloc_size)
-                .filter(|&s| s != 0)
-                .unwrap_or(ap.size),
-            memory_type_index: meta.map(|m| m.memory_type_index).unwrap_or(0),
-            ctx_id: ap.ctx_id,
-            kind: ap.kind,
-            global_vidmm_tracker_share: tracker.map_or(0, |tracker| tracker.global_share),
-            global_vidmm_tracker_cookie: tracker.map_or(0, |tracker| tracker.cookie),
-        });
-    }
-    None
-}
-
-/// Write the C1 [`HeliosWddmOpenIdentity`] record over the first 48 bytes of an
-/// open-time private-data buffer (the meta trailer at bytes 48.. is preserved).
-/// Replaces the old adopt-id smuggling: the UMD's pfnOpenResource parses this
-/// versioned struct instead of heuristically preferring "whichever buffer has a
-/// nonzero adopt id". Idempotent — rewriting the same record is harmless.
-unsafe fn write_open_identity(
-    private: *mut c_void,
-    private_size: UINT,
-    ident: &ParsedAllocIdentity,
-) {
-    if private.is_null() || (private_size as usize) < size_of::<HeliosWddmOpenIdentity>() {
-        return;
-    }
-    let record = HeliosWddmOpenIdentity {
-        venus_alloc_size: ident.venus_alloc_size,
-        blob_size: ident.blob_size,
-        magic: helios_protocol::HELIOS_WDDM_IDENTITY_MAGIC,
-        version: helios_protocol::HELIOS_WDDM_IDENTITY_VERSION,
-        resource_id: ident.resource_id,
-        memory_type_index: ident.memory_type_index,
-        ctx_id: ident.ctx_id,
-        kind: ident.kind,
-        reserved: if ident.global_vidmm_tracker_share != 0 && ident.global_vidmm_tracker_cookie != 0
-        {
-            [
-                ident.global_vidmm_tracker_share,
-                ident.global_vidmm_tracker_cookie,
-            ]
-        } else {
-            [0; 2]
-        },
-    };
-    // SAFETY: bounds-checked; the buffer is writable for the DDI call's duration
-    // (same contract create_one relies on for its create-time write-back).
-    let bytes = unsafe {
-        core::slice::from_raw_parts_mut(private as *mut u8, size_of::<HeliosWddmOpenIdentity>())
-    };
-    bytes.copy_from_slice(bytes_of(&record));
-}
+// ⛔ DELETED with the retirement's identity model, and named here so a reader
+// who greps for them finds the reason rather than a hole:
+//
+//   * `read_standard_meta` + `META_LEN_REJECTS` (`MetaLen`) — the per-arm
+//     `HeliosWddmAllocMeta` trailer parse. HWA2 is one fixed 168-byte record
+//     with no trailer and no optional-length arm, so the trailer-length
+//     classification it protected no longer exists. Its discipline survives:
+//     the record types own the exact-length check inside `from_private_data`,
+//     which is the same rule expressed once instead of per call site.
+//   * `ParsedAllocIdentity` + `read_alloc_identity` — the open-time identity
+//     parser, whose second arm read the UMD's `adopt_resource_id`. Both halves
+//     die with UMD-backing adoption (§18.1:4723-4726).
+//   * `write_open_identity` — the `HeliosWddmOpenIdentity` stamp. It had THREE
+//     call sites: create (retained, now as the HWA2 write-back below) and the
+//     two ORDINARY-OPEN restamps (illegal: §10.3:1033-1034, §18.1:4769,
+//     A.2 row 5694). Deleting the helper without noticing the create site, or
+//     deleting the create site while chasing the restamps, are the two
+//     symmetrical ways to get this wrong; both are closed because the create
+//     write is now a different function writing a different record.
 
 /// What VidMm is told about one allocation: where it goes and how it may be
 /// touched.
@@ -1687,13 +2011,93 @@ struct VidMmPlacement {
     cpu_visible: bool,
     cached: bool,
     accessed_physically: bool,
+    /// `DXGK_ALLOCATIONINFOFLAGS_WDDM2_0::ExplicitResidencyNotification`.
+    /// §10.7:2002-2003 requires it on every HVM1 role; §18.1:4751-4753 gates it.
+    explicit_residency_notification: bool,
+    /// `DXGK_ALLOCATIONINFOFLAGS2::DisablePartialResidency`
+    /// (§10.7:2005-2007, gated §18.1:4752-4753).
+    disable_partial_residency: bool,
+    /// `DXGK_ALLOCATIONINFOFLAGS2::RestrictedToSingleSegment`. Whole-allocation
+    /// residency in ONE segment at a time; §10.7:2010-2011 is explicit that this
+    /// is **not** a claim that an offset is pinned, so nothing may assume a
+    /// fixed BAR offset for an allocation carrying it.
+    restricted_to_single_segment: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TrackingBudget {
-    None,
-    Local,
-    NonLocal,
+/// The aperture segment's bit in a `SupportedSegmentSet` word.
+///
+/// `crate::ddi::gpummu::APERTURE_SEGMENT_ID` and
+/// `helios_protocol::HELIOS_SEGMENT_ID_APERTURE` are the same segment named from
+/// the two sides of the wire; the assertion below is what keeps them the same
+/// number, because the HVM1/HOC1 placements state their segments in the protocol
+/// vocabulary while the WDDM word is built from the driver's.
+const _: () =
+    assert!(crate::ddi::gpummu::APERTURE_SEGMENT_ID == helios_protocol::HELIOS_SEGMENT_ID_APERTURE);
+
+/// A `SupportedSegmentSet` bit for a 1-based WDDM segment id.
+///
+/// Total and panic-free: segment id 0 is `HELIOS_SEGMENT_ID_SYSTEM`, which is
+/// the implicit system-memory segment and is never named in a supported set, and
+/// an id above 32 cannot be expressed in the word at all. Both answer 0 rather
+/// than shifting out of range — a DDI may not panic on a runtime value.
+const fn segment_bit(seg_id: u32) -> u32 {
+    if seg_id == 0 || seg_id > 32 {
+        0
+    } else {
+        1u32 << (seg_id - 1)
+    }
+}
+
+/// Is `seg_id` a segment this driver actually REPORTED to dxgkrnl?
+///
+/// The reported set is `ddi/segment_table.rs`'s immutable post-StartDevice
+/// [`crate::ddi::segment_table::SegmentTable`], rendered by
+/// `DXGKQAITYPE_QUERYSEGMENT4` (`query_adapter_info.rs::query_segments`). Its ids
+/// are POSITIONAL — index 0 is id 1 — and that type owns the mapping precisely so
+/// the id and the slot cannot be maintained separately in two files. Asking it is
+/// therefore the only way to answer this question without re-deriving the
+/// topology; `bar_seg_id()` is the same question asked about the BAR segment, and
+/// [`vidmm_placement`] already routes through it.
+///
+/// `None` — StartDevice has not published a table — resolves to `APERTURE_ONLY`,
+/// byte-for-byte the fallback `query_segments` renders in the same case.
+/// Answering a placement question against a different table than the one dxgkrnl
+/// was shown is the one answer here that would be worse than either true or
+/// false.
+///
+/// ⚠ This is a snapshot of an immutable-after-StartDevice value, so there is no
+/// race to close: the table cannot change under a create. If K2 ever makes the
+/// table mutable at runtime, this becomes a TOCTOU and the check must move to
+/// wherever the table is locked.
+fn segment_is_reported(adapter: &AdapterContext, seg_id: u32) -> bool {
+    let table = adapter
+        .segment_table()
+        .unwrap_or(crate::ddi::segment_table::SegmentTable::APERTURE_ONLY);
+    // ⚠ Bound to a local rather than returned as the tail expression.
+    // `SegmentTable::iter` borrows the table (`+ '_`), and a temporary in a tail
+    // expression is dropped AFTER the block's locals — so returning the `any(..)`
+    // directly is an E0597 on `table`. The bool is what leaves this function; the
+    // borrow must end first.
+    let reported = table.iter().any(|(id, _)| id == seg_id);
+    reported
+}
+
+/// The per-role counter and registry name for "this role's preferred segment is
+/// not reported" (`K4-CONTRACT.md` §4).
+///
+/// An exhaustive `match` rather than an array index: `Hvm1Role` is a closed
+/// vocabulary, and a `[AtomicU32; 4]` indexed by `role.to_u32() - 1` would be a
+/// panicking index on a value that ultimately came from guest bytes. A DDI may
+/// not panic — a panic in any DDI is a silent graphics deadlock — and this shape
+/// cannot, while still forcing a new role to be given a name here before it
+/// compiles.
+fn role_segment_absent_counter(role: Hvm1Role) -> (&'static AtomicU32, &'static [u8]) {
+    match role {
+        Hvm1Role::ReplyPool => (&CREATE_ROLE1_SEGMENT_ABSENT, b"AcSegRole1"),
+        Hvm1Role::VulkanHostVisible => (&CREATE_ROLE2_SEGMENT_ABSENT, b"AcSegRole2"),
+        Hvm1Role::Feedback => (&CREATE_ROLE3_SEGMENT_ABSENT, b"AcSegRole3"),
+        Hvm1Role::VulkanDeviceLocal => (&CREATE_ROLE4_SEGMENT_ABSENT, b"AcSegRole4"),
+    }
 }
 
 /// Allocations marked CpuVisible in the BAR segment WITHOUT an aperture segment
@@ -1705,45 +2109,33 @@ enum TrackingBudget {
 ///
 /// A per-allocation ATOMIC, flushed from an existing PASSIVE dump site — never a
 /// per-allocation registry write (T1b's k-alloc-05).
+///
+/// ⚠ CROSS-LANE: its flush site is `ddi/cpu_host_aperture.rs:141-144`, which K1
+/// deletes. K4 does not re-home it (that would be an edit to a file this unit
+/// does not own); the counter must be re-homed by whichever of K1/K4's successor
+/// runs second, or it silently stops being readable.
 pub(crate) static APERTURE_MISSING_CPU_VISIBLE: AtomicU32 = AtomicU32::new(0);
 
+/// The placement for an ordinary HWA2 allocation.
+///
+/// ⚠ The `TrackingBudget` parameter and its two arms are GONE with the VidMm
+/// tracker (`K4-CONTRACT.md` §6): they existed only to place the one-page
+/// identity object of a `HELIOS_WDDM_ALLOC_KIND_TRACKING` allocation, a kind
+/// HWA2 does not have. Everything else is byte-identical to the pre-retirement
+/// rule, including the `DisplayHalf` gate and the `ApMiss` measurement.
+///
+/// The three WDDM-3.2 flags are **not** set here: §10.7:2005-2007 states them
+/// for HVM1 roles, and asserting whole-allocation single-segment residency for
+/// every D3D11 texture would be a new claim with no evidence behind it. See
+/// [`hvm1_placement`].
 fn vidmm_placement(
     bar_eligible: bool,
-    tracking_budget: TrackingBudget,
     bar_seg_id: Option<u32>,
     is_primary: bool,
-    is_optimal_gdi_texture: bool,
+    cpu_visible: bool,
     display_half: bool,
 ) -> VidMmPlacement {
-    let aperture_bit = 1u32 << (crate::ddi::gpummu::APERTURE_SEGMENT_ID - 1);
-
-    // A tracking allocation represents bytes already owned by Venus. Its
-    // one-page KMD resource is identity only: VidMm charges the full declared
-    // size to the matching Vulkan heap's budget, but must never make it
-    // CPU-visible or route content paging through the blob engine. Local
-    // tracking requires the opted-in device segment; non-local tracking (and a
-    // local request without that segment) uses the aperture/shared budget.
-    match (tracking_budget, bar_seg_id) {
-        (TrackingBudget::Local, Some(seg_id)) => {
-            return VidMmPlacement {
-                preferred_segment: seg_id,
-                supported_segments: 1u32 << (seg_id - 1),
-                cpu_visible: false,
-                cached: false,
-                accessed_physically: false,
-            };
-        }
-        (TrackingBudget::Local | TrackingBudget::NonLocal, _) => {
-            return VidMmPlacement {
-                preferred_segment: crate::ddi::gpummu::APERTURE_SEGMENT_ID,
-                supported_segments: aperture_bit,
-                cpu_visible: false,
-                cached: false,
-                accessed_physically: false,
-            };
-        }
-        (TrackingBudget::None, _) => {}
-    }
+    let aperture_bit = segment_bit(crate::ddi::gpummu::APERTURE_SEGMENT_ID);
 
     let (preferred_segment, supported_segments) =
         if let (true, Some(seg_id)) = (bar_eligible, bar_seg_id) {
@@ -1768,7 +2160,7 @@ fn vidmm_placement(
             // segment without AccessedPhysically, iommu-dma-remapping.md) is an
             // eviction-only fallback not exercised at this scale — negligible runtime cost.
             let needs_aperture = is_primary || display_half;
-            let supp = 1u32 << (seg_id - 1);
+            let supp = segment_bit(seg_id);
             (
                 seg_id,
                 if needs_aperture {
@@ -1780,9 +2172,6 @@ fn vidmm_placement(
         } else {
             (crate::ddi::gpummu::APERTURE_SEGMENT_ID, aperture_bit)
         };
-    // CpuVisible for everything but an OPTIMAL GDI texture, which has no linear
-    // CPU byte view.
-    let cpu_visible = !is_optimal_gdi_texture;
     // THE MEASUREMENT. Counted here, at the one site that constructs the shape:
     // CpuVisible, preferred to the BAR, with no aperture segment to fall back to.
     if cpu_visible
@@ -1794,19 +2183,123 @@ fn vidmm_placement(
     VidMmPlacement {
         preferred_segment,
         supported_segments,
+        // §10.3 offset 68/92: CPU visibility is a descriptor field the creator
+        // states and the KMD validates, not something inferred from the tiling
+        // class. The pre-retirement rule inferred it (`!is_optimal_gdi_texture`)
+        // because there was no field to read; there is one now, and
+        // `validate` already cross-checks it against `memory_class`.
         cpu_visible,
         // Omit `Cached` on the scan-out primary: dxgkrnl rejects
         // Cached-with-Primary (AzureTriage; 36th-session primary-creation
         // failure -> no VidPn path). The primary is host-scanned-out, not
         // CPU-read-hot, so write-combined is fine. The `AllocCached` kill switch
         // is applied by the caller, which owns the knob snapshot.
-        cached: !is_primary && !is_optimal_gdi_texture,
+        cached: !is_primary && cpu_visible,
         // A D3DDDI primary is selected by the display engine using the physical
         // address delivered in SetVidPnSourceAddress. Tell VidMm that exact
         // access model so it allocates the primary contiguously in a
         // GPU-addressable segment rather than at a non-identifiable implicit
         // system-memory address.
         accessed_physically: is_primary,
+        explicit_residency_notification: false,
+        disable_partial_residency: false,
+        restricted_to_single_segment: false,
+    }
+}
+
+/// The placement §10.7:1999-2011 fixes for every HVM1 role.
+///
+/// It is `Hvm1Role::placement()` transcribed into the WDDM vocabulary and
+/// nothing else: the protocol states the contract once
+/// (`protocol/src/native_render.rs:1755-1780`) precisely so the KMD cannot
+/// express it differently per call site, and every field below is copied rather
+/// than re-decided. The two things this function adds are the WDDM segment-set
+/// word and the `AllocCached` interaction, neither of which the protocol can
+/// know.
+///
+/// ⛔ **`preferred_segment` is `HELIOS_SEGMENT_ID_HLM1`, which the segment table
+/// may not report.** `K4-CONTRACT.md` §4 is explicit that K4 records the constant
+/// and does not depend on the segment existing: K2 (the two-segment table) is
+/// unstarted and its host half is parked (`FINDINGS.md` F5). Substituting the
+/// aperture segment here would produce a create that "works" while placing
+/// native-Vulkan memory somewhere §10.7 forbids, so this function keeps stating
+/// the contract exactly.
+///
+/// ⭐ What it does NOT do any more is let that placement leave the driver
+/// unchecked. This doc used to end "so an HVM1 create is refused by dxgkrnl,
+/// loudly" — and a refusal by dxgkrnl is a refusal with NO HELIOS COUNTER, which
+/// is the opposite of loud from inside the guest. [`admit_hvm1`] now asks
+/// [`segment_is_reported`] whether this exact `preferred_segment` is in the table
+/// this driver reported, and refuses per role with a named counter when it is not
+/// (§4 as amended 2026-08-10). The placement is unchanged; only who refuses it,
+/// and whether anyone can see that, changed.
+///
+/// The aperture bit IS in the supported set, because §10.7:2001-2002 names "the
+/// package's ordinary aperture as the documented system-residency
+/// physical-address domain" — that is the eviction/system-residency domain, not
+/// an alternative preference.
+fn hvm1_placement(role: Hvm1Role) -> VidMmPlacement {
+    let contract = role.placement();
+    VidMmPlacement {
+        preferred_segment: contract.preferred_segment,
+        supported_segments: segment_bit(contract.preferred_segment)
+            | segment_bit(crate::ddi::gpummu::APERTURE_SEGMENT_ID),
+        cpu_visible: contract.cpu_visible,
+        // §10.7:2003-2005 — `Cached = 0` for every role, and the CPU publication
+        // ordering proof depends on it: a `HOST_CACHED` mapping would break the
+        // `HOST_VISIBLE|HOST_COHERENT` advertisement (§18.1:4763-4766). NOT
+        // subject to the `AllocCached` knob, which is a BAR-readback tuning
+        // switch for the D3D11 surfaces and has no authority here.
+        cached: contract.cached,
+        // §10.7:2007-2010 — truthful, not a contiguity request: the legacy
+        // physical Render engine really does dereference the final
+        // segment/physical-address capability patched from the allocation list.
+        // ⚠ If K6's Render/Patch path ever stops dereferencing it, this bit
+        // becomes a lie even though it is set exactly as specified.
+        accessed_physically: contract.accessed_physically,
+        explicit_residency_notification: contract.explicit_residency_notification,
+        disable_partial_residency: contract.disable_partial_residency,
+        restricted_to_single_segment: contract.restricted_to_single_segment,
+    }
+}
+
+/// The placement §10.6:1510-1512 and §17.6:4414-4418 fix for the HOC1 pool.
+///
+/// ⚠ Note the DELIBERATE ASYMMETRY with [`hvm1_placement`], which is the obvious
+/// implementation error here: HOC1 must **not** claim `AccessedPhysically`
+/// (§17.6:4417-4418) whereas every HVM1 role must (§10.7:2002-2003). HOC1 is
+/// executed through C64/HPM1 page-table handling from a GPUVA, not through a
+/// patched physical capability, so the claim would be untrue.
+///
+/// "No HAP flags" (§10.6:1511) is satisfied by construction: this driver's
+/// CpuHostAperture participation is a segment property, and the HOC1 allocation
+/// names no BAR segment.
+///
+/// ⛔ Same HLM1 caveat as [`hvm1_placement`], and now the same check —
+/// "preferred in HLM1, with ordinary system placement supported" needs K2's
+/// segment table, so [`admit_hoc1`] refuses through [`segment_is_reported`] and
+/// [`CREATE_HOC1_SEGMENT_ABSENT`] rather than letting dxgkrnl refuse it where no
+/// Helios counter can see it. The aperture bit is the "ordinary system placement"
+/// half and does exist today.
+fn hoc1_placement() -> VidMmPlacement {
+    VidMmPlacement {
+        preferred_segment: HELIOS_SEGMENT_ID_HLM1,
+        supported_segments: segment_bit(HELIOS_SEGMENT_ID_HLM1)
+            | segment_bit(crate::ddi::gpummu::APERTURE_SEGMENT_ID),
+        // §10.6:1510-1511 — nonprimary, nonshared, CPU-visible/WC.
+        cpu_visible: true,
+        // Write-combined, and the D3D12 UMD's whole seal protocol depends on it:
+        // §18.2:4946-4949 rejects device qualification if the returned mapping's
+        // cache policy is not WC, because a cached mapping makes the x64 drain
+        // that seals an HOB1 unobservable.
+        cached: false,
+        accessed_physically: false,
+        // §10.7's Flags2/residency-notification set is stated for HVM1 roles.
+        // §17.6:4414-4418's HOC1 list does not include them, and asserting them
+        // here would be a claim with no line behind it.
+        explicit_residency_notification: false,
+        disable_partial_residency: false,
+        restricted_to_single_segment: false,
     }
 }
 
@@ -1820,20 +2313,25 @@ unsafe fn destroy_allocation_ctx(
     ctx: Box<AllocationContext>,
 ) {
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
-    adapter.vidmm_trackers.remove(ctx.vidmm_tracker_cookie);
     // Withdraw the DMA-flip lookup FIRST: after this no Present can resolve
     // this resource id to a handle whose Box is about to be dropped.
     unregister_scanout_allocation(ctx.resource_id);
-    // The system-backing entry is removed on EVERY teardown exit, including the
-    // scanout-retire failure below.
+    // ⛔ `adapter.system_backings.remove(ctx.resource_id)` was here.
     //
-    // It used to sit after that early return, so an allocation destroyed while
-    // QEMU could not confirm the scanout disable left a stale entry in a table
-    // of 128 (k-paging-04). Bounded damage — resource ids are monotonic and
-    // never recycled (`virtio/gpu.rs`), so the entry consumes a slot rather than
-    // aliasing a new allocation — but the slot is never reclaimed, and the
-    // Present-time mirror keys off `contains(resource_id)`.
-    adapter.system_backings.remove(ctx.resource_id);
+    // `adapter/backing.rs` is the private byte mirror §10.7:1940 forbids ("its
+    // bytes are never an independent private copy") and its deletion is
+    // sequenced to K3, which owns 8 of its 10 call sites
+    // (`K4-CONTRACT.md` §3). K4 removes only its own call so K3 can delete the
+    // file without editing this one.
+    //
+    // ⚠ TRANSIENT CONSEQUENCE, recorded rather than absorbed: until K3 lands, a
+    // destroyed BAR allocation leaves its entry in a table of 128 and
+    // `BAR_SYSTEM_BACKING_ERRORS` will start counting once the table fills. The
+    // damage is bounded exactly as the k-paging-04 comment argued — resource ids
+    // are monotonic and never recycled within a transport generation, so a stale
+    // entry consumes a slot rather than aliasing a new allocation, and the
+    // Present-time mirror's `contains(resource_id)` therefore cannot answer true
+    // for the wrong surface.
     // Retire the exact Windows/KMD allocation identity before any backing
     // resource, Venus image, or cached copy can be torn down. If QEMU cannot
     // confirm resource_id=0 scanout disable, retain every host object until
@@ -1916,7 +2414,12 @@ unsafe fn destroy_allocation_ctx(
     if ctx.resource_id != 0 && !adapter_owned_scanout {
         adapter.forget_primary_scanout(ctx.resource_id);
     }
-    if ctx.resource_id != 0 && ctx.owns_resource && !adapter_owned_scanout {
+    // `ctx.owns_resource` used to gate this arm. It is GONE: it was false only
+    // for a non-owning `AdoptedUmdResource`, and with adoption deleted the KMD
+    // creates every backing it names, so the field was a constant `true` for
+    // every reachable arm. `resource_id != 0` is the surviving, honest test —
+    // an HOC1 pool and a failed backing both have none.
+    if ctx.resource_id != 0 && !adapter_owned_scanout {
         // Drop the owner-0 tracking slot (registered at CreateAllocation, or
         // re-owned to the allocation at adopt), unmapping the GDI executor's
         // host-visible mapping if one is live.
@@ -1997,12 +2500,12 @@ impl BackingSize {
     }
 }
 
-/// Everything one [`helios_protocol::AllocationBacking`] arm must answer.
+/// Everything one [`Hwa2Backing`] arm must answer.
 ///
 /// NO `Option` fields and NO `Default`, deliberately: that is what forces every
 /// arm of [`build_backing`] to produce a COMPLETE descriptor, and what makes
 /// adding a backing class a compile error until it is handled. Arms that do not
-/// change a field pass the incoming `meta`/`ap` value through explicitly — the
+/// change a field pass the descriptor's value through explicitly — the
 /// pass-through is the point, because the defect class here is an arm that
 /// forgets one (the historical `width*4` = 7584 pitch shear against the real
 /// 7680, and the exact-size import mismatches).
@@ -2013,122 +2516,180 @@ struct CreatedBacking {
     resource_id: u32,
     venus_memory_id: u64,
     venus_image_id: u64,
+    /// The row stride the HOST actually laid the surface out with, which for the
+    /// LINEAR scan-out arm is NOT derived from width. 0 for a tiled image and
+    /// for a plain buffer.
     pitch: u32,
     plane_offset: u64,
-    dxgi_format: u32,
+    /// The creator's exact `vkAllocateMemory` size + memory type. §10.3:355-361
+    /// keeps these OUT of HWA2 — they are host-side detail the KMD allocation
+    /// object owns and no descriptor may name.
     venus_alloc_size: u64,
     memory_type_index: u32,
-    /// The value `ap.size` takes afterwards — the blob size the write-back
-    /// publishes and VidMm rounds up — WITH its provenance. NOT always the
-    /// created blob's size: the KMD standard-buffer arm keeps the requested
-    /// size, as it always has.
+    /// The extent VidMm is charged, WITH its provenance. NOT always the created
+    /// blob's size: the plain-buffer arm keeps the requested size, as it always
+    /// has.
     blob_size: BackingSize,
+}
+
+/// Which backing the KMD must create for one validated HWA2 descriptor.
+///
+/// # Why the KMD classifies at all
+///
+/// §10.3:1026-1027 and §18.1:4723-4726 — the KMD creates and owns the
+/// host/Venus backing *as part of creating the exact WDDM allocation*, and no
+/// raw `resid` or host backing token is accepted from a UMD/ICD. So the
+/// descriptor is a *request* and this enum is the KMD's total reading of it.
+///
+/// The retired `helios_protocol::classify` answered the same question over
+/// `HeliosWddmAllocPrivate` + `HeliosWddmAllocMeta` and lives in
+/// `wddm_legacy.rs`, whose own module header records that there is **no 1:1
+/// HWA2 replacement**. This is deliberately a KMD-local decision rather than a
+/// protocol one: it maps a wire record onto *this driver's* venus-client
+/// constructors, and a second consumer with different constructors would need a
+/// different map. It defines no wire struct, so it does not cross the
+/// "this lane consumes `helios_protocol`, never defines a wire struct" line.
+enum Hwa2Backing {
+    /// A KMD-created LINEAR scan-out image: the shared-primary standard surface
+    /// the display path binds through `SET_SCANOUT_BLOB`.
+    LinearScanoutImage { width: u32, height: u32 },
+    /// A KMD-created OPTIMAL cross-context image. Tiled, no linear row layout,
+    /// sampled by a compositor and rendered into by D3D.
+    OptimalImage {
+        width: u32,
+        height: u32,
+        dxgi_format: u32,
+        /// D3D11 **DDI** bind bits, translated out of the HWA2 vocabulary by
+        /// [`hwa2_bind_to_ddi`] — see that function for why the two vocabularies
+        /// are deliberately non-coincident.
+        ddi_bind_flags: u32,
+    },
+    /// A KMD-created linear venus `VkDeviceMemory` blob: shadow/staging/GDI
+    /// staging surfaces and ordinary buffers.
+    LinearMemory {
+        bytes: u64,
+        mappable: bool,
+        shareable: bool,
+    },
+}
+
+/// Translate the HWA2 bind vocabulary into the D3D11 DDI bits the kernel venus
+/// image constructor speaks.
+///
+/// ⛔ These two vocabularies are NON-COINCIDENT ON PURPOSE
+/// (`protocol/src/wddm.rs`, the offset-72 comment): `SHADER_RESOURCE` is `0x1`
+/// in HWA2 and `0x8` at the D3D11 DDI; `RENDER_TARGET` is `0x2` here and `0x1`
+/// in the D3D12 DDI. The retired trailer carried the raw DDI word and a second
+/// producer wrote a *D3D12* word into the same field — a different vocabulary at
+/// overlapping bit positions, which is not a mismatch any reader can detect.
+/// Passing an HWA2 word straight into `create_optimal_present_image_alias`
+/// would silently drop SAMPLED and add nothing, so this translation is
+/// load-bearing rather than cosmetic.
+///
+/// Only the three bits `create_optimal_present_image_alias` reads are mapped;
+/// the rest have no effect on the created image and are deliberately not
+/// invented into DDI bits the venus client would ignore anyway.
+const fn hwa2_bind_to_ddi(bind_flags: u32) -> u32 {
+    const DDI_BIND_SHADER_RESOURCE: u32 = 0x0000_0008;
+    const DDI_BIND_RENDER_TARGET: u32 = 0x0000_0020;
+    const DDI_BIND_UNORDERED_ACCESS: u32 = 0x0000_0100;
+    let mut ddi = 0;
+    if bind_flags & HELIOS_HWA2_BIND_SHADER_RESOURCE != 0 {
+        ddi |= DDI_BIND_SHADER_RESOURCE;
+    }
+    if bind_flags & HELIOS_HWA2_BIND_RENDER_TARGET != 0 {
+        ddi |= DDI_BIND_RENDER_TARGET;
+    }
+    if bind_flags & HELIOS_HWA2_BIND_UNORDERED_ACCESS != 0 {
+        ddi |= DDI_BIND_UNORDERED_ACCESS;
+    }
+    ddi
+}
+
+/// The KMD's total reading of a validated HWA2 descriptor.
+///
+/// `desc` MUST already have passed `validate_create_input`, which is what makes
+/// every field read below meaningful: an image kind is known to carry nonzero
+/// geometry and a known DXGI format, a non-image kind is known to carry none,
+/// and `plane_count >= 1` is guaranteed for every image.
+fn classify_hwa2(desc: &HeliosWddmAllocationDescV2) -> Result<Hwa2Backing, NTSTATUS> {
+    let cpu_visible = desc.has_flag(HELIOS_HWA2_FLAG_CPU_VISIBLE);
+    let shareable = desc.has_flag(HELIOS_HWA2_FLAG_SHARED);
+    match desc.allocation_kind {
+        // The scan-out primary. Its bytes must be a real LINEAR VkImage the host
+        // can bind to a virtio scan-out, not a plain buffer — that is what
+        // `allocate_linear_scanout_image_blob` builds, and the display lane's
+        // `venus_image_id != 0` branch in `submit_primary_scanout_copy` selects
+        // on it.
+        HELIOS_HWA2_KIND_STANDARD_PRIMARY => Ok(Hwa2Backing::LinearScanoutImage {
+            width: desc.width,
+            height: desc.height,
+        }),
+        // Everything else with texel geometry. The SWIZZLE CLASS decides, not
+        // the kind: §10.3 offset 88 is the field that says whether a linear row
+        // layout exists, and it is the only honest carrier now that the retired
+        // trailer's `MISC_OPTIMAL_GDI_TEXTURE` bit is gone. A
+        // `D3DKMDT_STANDARDALLOCATION_GDISURFACE` has no kind of its own (it is
+        // `IMAGE` + `STANDARD` + the OS enum at offset 84), so its two variants —
+        // the tiled texture and the CPU-visible staging surface — are separated
+        // here and nowhere else.
+        kind if helios_hwa2_kind_is_image(kind) => {
+            if desc.swizzle_class == HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL {
+                Ok(Hwa2Backing::OptimalImage {
+                    width: desc.width,
+                    height: desc.height,
+                    dxgi_format: desc.dxgi_format,
+                    ddi_bind_flags: hwa2_bind_to_ddi(desc.bind_flags),
+                })
+            } else {
+                Ok(Hwa2Backing::LinearMemory {
+                    bytes: desc.byte_size,
+                    mappable: cpu_visible,
+                    shareable,
+                })
+            }
+        }
+        HELIOS_HWA2_KIND_BUFFER => Ok(Hwa2Backing::LinearMemory {
+            bytes: desc.byte_size,
+            mappable: cpu_visible,
+            shareable,
+        }),
+        // STUB: the C65 outer-command pool is the only paging object this
+        // package defines, and it arrives as an HOC1 record on its own
+        // (§10.6:1489-1494), not as an HWA2 with this kind. There is no second
+        // paging object and therefore no backing constructor to call. Refused by
+        // name so a future one is a visible counter rather than a wrong arm.
+        HELIOS_HWA2_KIND_PAGING_OBJECT => {
+            bump(&CREATE_UNSUPPORTED_KIND, b"AcKind");
+            crate::diag::record(0x0C01_00E6);
+            Err(STATUS_NOT_SUPPORTED)
+        }
+        // Unreachable: `validate_create_input` refuses `KIND_INVALID` and every
+        // value above `KIND_MAX`. Refused rather than `unreachable!()` — a DDI
+        // may not panic on a runtime value, and the counter proves the premise.
+        _ => {
+            bump(&CREATE_UNSUPPORTED_KIND, b"AcKind");
+            crate::diag::record(0x0C01_00E6);
+            Err(STATUS_NOT_SUPPORTED)
+        }
+    }
 }
 
 /// Produce the backing for one classified allocation.
 ///
 /// Every diag code and every returned NTSTATUS here is byte-identical to the
-/// if/else chain this replaces — including `STATUS_NO_MEMORY` rather than
-/// `STATUS_UNSUCCESSFUL`, because `0xC0000001` is not in `DxgkDdiCreateAllocation`'s
-/// legal return set and dxgkrnl logged it as "Driver returned an invalid
-/// NTSTATUS" (197x) and responded with adapter resets during boot.
+/// pre-retirement arms — including `STATUS_NO_MEMORY` rather than
+/// `STATUS_UNSUCCESSFUL`, because `0xC0000001` is not in
+/// `DxgkDdiCreateAllocation`'s legal return set and dxgkrnl logged it as "Driver
+/// returned an invalid NTSTATUS" (197x) and responded with adapter resets during
+/// boot.
 fn build_backing(
     passive: PassiveLevel,
     adapter: &AdapterContext,
-    backing: helios_protocol::AllocationBacking,
-    ap: &HeliosWddmAllocPrivate,
-    meta: &HeliosWddmAllocMeta,
+    backing: Hwa2Backing,
 ) -> Result<CreatedBacking, NTSTATUS> {
-    use helios_protocol::AllocationBacking as Backing;
-
-    // The venus identity a cross-process opener needs. For adopted and raw
-    // resources the UMD recorded it in the trailer at create time; a 0 there
-    // means unknown, and the (page-rounded) blob size is the documented
-    // fallback. The KMD-created arms below always answer with the real size, so
-    // this fallback belongs to those two arms and nowhere else — it used to be
-    // applied after the chain, where it silently covered for any arm that
-    // forgot.
-    let claimed_alloc_size = if meta.venus_alloc_size == 0 {
-        ap.size
-    } else {
-        meta.venus_alloc_size
-    };
-
     match backing {
-        Backing::VidMmTracking { size } => {
-            // VidMm only treats a normal resource-backed WDDM allocation as
-            // local video memory. The real bytes remain owned by Venus, so this
-            // resource is a one-page identity object; `blob_size` below remains
-            // the full Venus allocation size that VidMm must charge.
-            let tracking_resource_size = PAGE as u64;
-            let resource_id = crate::virtio::ctrl::resource_create_blob(
-                passive,
-                adapter,
-                ap.ctx_id,
-                VIRTIO_GPU_BLOB_MEM_HOST3D,
-                VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
-                0,
-                tracking_resource_size,
-            )
-            .map_err(|_| STATUS_NO_MEMORY)?;
-            let _ = adapter.with_virtio(|v| v.note_blob_size(resource_id, tracking_resource_size));
-            Ok(CreatedBacking {
-                resource_id,
-                venus_memory_id: 0,
-                venus_image_id: 0,
-                pitch: 0,
-                plane_offset: 0,
-                dxgi_format: 0,
-                venus_alloc_size: size,
-                memory_type_index: meta.memory_type_index,
-                blob_size: BackingSize::NonHostAuthoritative(size),
-            })
-        }
-        Backing::AdoptedUmdResource {
-            resource_id,
-            take_ownership,
-        } => {
-            // C1 lifetime fix: adopting transfers the blob's ownership from the
-            // ICD's escape owner (D3DKMT device handle) to THIS allocation, so a
-            // later DestroyDevice sweep of the creating process cannot unref a
-            // host resource that live shared WDDM allocations still denote (the
-            // res-45 invalid-import class). Adopting a DEAD resid is a hard
-            // error: succeeding here would create a permanently-black shared
-            // surface that poisons every opener's venus ring at import time.
-            let adopted_blob_size = match adapter.with_virtio(|v| {
-                if take_ownership {
-                    v.adopt_blob_for_allocation(resource_id)
-                } else {
-                    v.live_blob_size(resource_id)
-                }
-            }) {
-                Ok(Some(size)) if size != 0 => size,
-                Ok(_) => {
-                    crate::diag::record(0x0C01_00E4);
-                    return Err(STATUS_INVALID_PARAMETER);
-                }
-                Err(_de) => {
-                    crate::diag::record(0x0C01_00E1);
-                    return Err(STATUS_DEVICE_NOT_READY);
-                }
-            };
-            Ok(CreatedBacking {
-                resource_id,
-                venus_memory_id: 0,
-                venus_image_id: 0,
-                pitch: meta.pitch,
-                plane_offset: meta.plane_offset,
-                dxgi_format: meta.dxgi_format,
-                venus_alloc_size: claimed_alloc_size,
-                memory_type_index: meta.memory_type_index,
-                // The escape-time blob table records the size that actually
-                // created this resource. Keep the non-host-authoritative
-                // provenance (adopted payloads are not BAR-eligible), but do
-                // not trust a second, potentially inconsistent create claim.
-                blob_size: BackingSize::NonHostAuthoritative(adopted_blob_size),
-            })
-        }
-        Backing::KmdLinearPrimary { width, height } => {
+        Hwa2Backing::LinearScanoutImage { width, height } => {
             match adapter.with_venus_client(passive, |c| {
                 c.allocate_linear_scanout_image_blob(adapter, width, height)
             }) {
@@ -2138,41 +2699,39 @@ fn build_backing(
                     venus_image_id: scanout.image_id.get(),
                     pitch: scanout.row_pitch,
                     plane_offset: scanout.plane_offset as u64,
-                    // The primary arm never set this; the D3DDDIFORMAT stays
-                    // authoritative for it.
-                    dxgi_format: meta.dxgi_format,
                     venus_alloc_size: scanout.blob.size,
                     memory_type_index: scanout.memory_type_index,
                     blob_size: BackingSize::HostAuthoritative(scanout.blob.size),
                 }),
                 Ok(Err(_ve)) => {
                     crate::diag::record(0x0C01_00E5);
+                    bump(&CREATE_BACKING_FAILED, b"AcBackFail");
                     Err(STATUS_NO_MEMORY)
                 }
                 Err(_de) => {
                     crate::diag::record(0x0C01_00E1);
+                    bump(&CREATE_BACKING_FAILED, b"AcBackFail");
                     Err(STATUS_DEVICE_NOT_READY)
                 }
             }
         }
-        Backing::KmdOptimalGdiTexture {
+        Hwa2Backing::OptimalImage {
             width,
             height,
             dxgi_format,
-            bind_flags,
+            ddi_bind_flags,
         } => {
-            // D3DKMDT_GDISURFACE_TEXTURE is a shared, non-CPU-visible texture
-            // used as both a DWM sample source and a DirectX render target.
-            // Preserve that contract with a real cross-context OPTIMAL image.
-            // Reinterpreting this allocation as pitched host bytes makes DWM
-            // sample tiled memory as a different resource shape and produces a
-            // black redirected window.
+            // A shared, non-CPU-visible tiled texture used as both a compositor
+            // sample source and a DirectX render target. Preserve that contract
+            // with a real cross-context OPTIMAL image: reinterpreting this
+            // allocation as pitched host bytes makes DWM sample tiled memory as
+            // a different resource shape and produces a black redirected window.
             match adapter.with_venus_client(passive, |client| {
                 client.allocate_optimal_gdi_image_blob(
                     adapter,
                     width,
                     height,
-                    bind_flags,
+                    ddi_bind_flags,
                     dxgi_format,
                 )
             }) {
@@ -2183,27 +2742,34 @@ fn build_backing(
                     // No row layout: this is a tiled image, not a byte buffer.
                     pitch: 0,
                     plane_offset: 0,
-                    dxgi_format,
                     venus_alloc_size: image.blob.size,
                     memory_type_index: image.memory_type_index,
                     blob_size: BackingSize::HostAuthoritative(image.blob.size),
                 }),
                 Ok(Err(_ve)) => {
+                    // The constructor refuses width/height 0 and every DXGI
+                    // format outside {87, 88}, so this arm also covers "the KMD
+                    // has no OPTIMAL constructor for that format". Both are a
+                    // refusal, never a substituted format.
                     crate::diag::record_named_bytes(b"GdiOImg", 0xE1);
+                    bump(&CREATE_BACKING_FAILED, b"AcBackFail");
                     Err(STATUS_NO_MEMORY)
                 }
                 Err(_de) => {
                     crate::diag::record_named_bytes(b"GdiOImg", 0xE2);
+                    bump(&CREATE_BACKING_FAILED, b"AcBackFail");
                     Err(STATUS_DEVICE_NOT_READY)
                 }
             }
         }
-        Backing::KmdStandardBuffer { size, primary } => {
-            // KMD-originated standard allocation (indirect-swapchain backbuffer,
-            // GDI redirection/staging surface). Back it with a REAL venus
-            // `VkDeviceMemory` blob through the kernel venus client: user-mode
-            // venus contexts (DWM opening the surface) import it by resource id
-            // and vkBindImageMemory2 against it — a raw `blob_id = 0` shmem blob
+        Hwa2Backing::LinearMemory {
+            bytes,
+            mappable,
+            shareable,
+        } => {
+            // Back it with a REAL venus `VkDeviceMemory` blob through the kernel
+            // venus client: user-mode venus contexts import it by resource id and
+            // `vkBindImageMemory2` against it — a raw `blob_id = 0` shmem blob
             // has no memory object behind it, and that bind poisons the
             // importer's venus ring (host: "failed to look up object of type 8"
             // -> fatal decoder state -> context destroyed). `allocate_memory_blob`
@@ -2211,347 +2777,795 @@ fn build_backing(
             // GDI executor's `blob_kernel_range` resolves. PASSIVE flow under the
             // venus mutex (never the DISPATCH spinlock).
             match adapter.with_venus_client(passive, |c| {
-                c.allocate_memory_blob(adapter, size, true, primary)
+                c.allocate_memory_blob(adapter, bytes, mappable, shareable)
                     .map(|b| (b, c.memory_type_index()))
             }) {
                 Ok(Ok((blob, kernel_mti))) => Ok(CreatedBacking {
                     resource_id: blob.res_id,
                     venus_memory_id: blob.blob_id,
                     venus_image_id: 0,
-                    pitch: meta.pitch,
-                    plane_offset: meta.plane_offset,
-                    dxgi_format: meta.dxgi_format,
+                    // A plain memory blob has no row layout of its own; the
+                    // descriptor's plane record is the authority and the caller
+                    // reads it from there.
+                    pitch: 0,
+                    plane_offset: 0,
                     // The EXACT venus allocation parameters, so cross-process
                     // openers import with the creator's size + memory type.
                     venus_alloc_size: blob.size,
                     memory_type_index: kernel_mti,
-                    // NOT blob.size: this arm has always left `ap.size` at the
-                    // requested value. Still HostAuthoritative — the host
-                    // allocated exactly this request and reported back a size
-                    // that is its page-rounded form, and this arm is part of
-                    // the `venus_memory_id != 0` set `bar_eligible` used to
-                    // test, so the eligible population is unchanged.
-                    blob_size: BackingSize::HostAuthoritative(ap.size),
+                    // NOT `blob.size`: this arm has always charged VidMm the
+                    // REQUESTED size. Still HostAuthoritative — the host
+                    // allocated exactly this request and reported back its
+                    // page-rounded form, and this arm is part of the
+                    // `venus_memory_id != 0` set `bar_eligible` used to test, so
+                    // the eligible population is unchanged.
+                    blob_size: BackingSize::HostAuthoritative(bytes),
                 }),
                 Ok(Err(_ve)) => {
                     crate::diag::record(0x0C01_00E3);
+                    bump(&CREATE_BACKING_FAILED, b"AcBackFail");
                     Err(STATUS_NO_MEMORY)
                 }
                 Err(_de) => {
                     crate::diag::record(0x0C01_00E1);
+                    bump(&CREATE_BACKING_FAILED, b"AcBackFail");
                     Err(STATUS_DEVICE_NOT_READY)
                 }
             }
         }
-        Backing::RawHost3dBlob {
-            ctx_id,
-            blob_mem,
-            blob_flags,
-            blob_id,
-            size,
-        } => match crate::virtio::ctrl::resource_create_blob(
-            passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size,
-        ) {
-            Ok(rid) => {
-                // Register the blob in the tracking table (owner 0 =
-                // KMD-internal) so the GDI executor's `blob_kernel_range` can
-                // resolve and host-map this allocation by resource id. Removed
-                // again in `destroy_allocation_ctx` via `forget_allocation_blob`.
-                let _ = adapter.with_virtio(|v| v.note_blob_size(rid, size));
-                Ok(CreatedBacking {
-                    resource_id: rid,
-                    venus_memory_id: 0,
-                    venus_image_id: 0,
-                    pitch: meta.pitch,
-                    plane_offset: meta.plane_offset,
-                    dxgi_format: meta.dxgi_format,
-                    venus_alloc_size: claimed_alloc_size,
-                    memory_type_index: meta.memory_type_index,
-                    blob_size: BackingSize::NonHostAuthoritative(size),
-                })
-            }
-            Err(_ve) => {
-                // Host rejected the blob (e.g. the .56 blob_id=0
-                // RESP_ERR_UNSPEC case).
-                crate::diag::record(0x0C01_00E0);
-                Err(STATUS_NO_MEMORY)
-            }
-        },
     }
 }
 
-/// Create the virtio blob for one allocation and fill its VidMm metadata. On
-/// failure nothing is stored (the caller unwinds prior allocations).
-unsafe fn create_one(
+/// The shape of the `pfnAllocateCb` / `D3DKMTCreateAllocation` call itself, as
+/// opposed to the record inside it.
+///
+/// It exists because HVM1 (§10.7:1964-1972) and HOC1 (§10.6:1489-1494) both fix
+/// the OUTER call, not just the private bytes, and §18.1:4750-4751 tests those
+/// properties. The doc states them as what the ICD/UMD *does*; the KMD enforces
+/// them, because a guest-supplied shape checked only by the guest is not checked
+/// (CLAUDE.md: validate every runtime-supplied value before acting on it).
+#[derive(Clone, Copy)]
+struct CreateCallShape {
+    /// `DXGK_CREATEALLOCATIONFLAGS::Value` — "outer flags zero" for HVM1/HOC1.
+    /// The binding defines exactly one named bit (`Resource`) plus `Reserved`,
+    /// so this is the whole word.
+    flags: u32,
+    /// Whether `DXGKARG_CREATEALLOCATION::hResource` is non-null — i.e. whether
+    /// a runtime resource handle exists at all. Both records require none.
+    has_resource_handle: bool,
+    /// `DXGKARG_CREATEALLOCATION::NumAllocations`.
+    num_allocations: u32,
+    /// `DXGKARG_CREATEALLOCATION::PrivateDriverDataSize` — the RESOURCE-level
+    /// private data. Both records require zero of it.
+    resource_private_size: u32,
+}
+
+impl CreateCallShape {
+    /// The exact shape §10.7:1964-1972 / §10.6:1489-1494 require: no resource
+    /// handle, no resource-level private bytes, exactly one allocation, outer
+    /// flags zero.
+    fn is_bare_single_allocation(self) -> bool {
+        self.flags == 0
+            && !self.has_resource_handle
+            && self.num_allocations == 1
+            && self.resource_private_size == 0
+    }
+}
+
+/// The result of admitting one allocation: what to place, what to publish, and
+/// what to remember.
+///
+/// Built once per record arm and consumed once by [`create_one`]'s tail, which
+/// is what stops the three arms from each open-coding the `DXGK_ALLOCATIONINFO`
+/// write-out and drifting apart.
+struct AdmittedAllocation {
+    kind: u32,
+    generation: u64,
+    /// The exact extent charged to VidMm, page-rounded.
+    vidmm_size: SIZE_T,
+    placement: VidMmPlacement,
+    /// `None` for a record whose allocation has no host backing at all (HOC1).
+    backing: Option<CreatedBacking>,
+    /// Geometry the KMD keeps for `DxgkDdiDescribeAllocation`, the scan-out
+    /// path, and the prepared-copy setup. Zero for a non-image allocation.
+    width: u32,
+    height: u32,
+    d3d_ddi_format: u32,
+    dxgi_format: u32,
+    ddi_bind_flags: u32,
+    /// Byte offset and stride of plane 0, from the descriptor's plane record for
+    /// HWA2 and from the created backing for the LINEAR scan-out arm (whose true
+    /// stride is Vulkan's, not a function of width).
+    plane_offset: u64,
+    pitch: u32,
+    /// The allocation is a UMD-created LINEAR primary, i.e. one the display path
+    /// may bind directly through `SET_SCANOUT_BLOB` without an intermediate
+    /// copy. Derived from the descriptor, never from geometry.
+    direct_scanout: bool,
+    bar_eligible: bool,
+    size_provenance: BackingSize,
+}
+
+/// Admit one HWA2 create-input record, create its backing, and stamp the
+/// create-output record back into the `[in/out]` buffer.
+///
+/// # The write-back is the create's last act, deliberately
+///
+/// §10.3:1040-1041 makes the KMD the sole writer and only at create. The record
+/// is therefore written AFTER the backing exists and the generation is minted,
+/// so a failed create leaves the input bytes untouched rather than a
+/// half-stamped descriptor a later opener could validate.
+///
+/// # SAFETY
+/// `private` is the runtime's `[in/out]` per-allocation buffer and
+/// `private_size` is its authoritative length; both come straight from
+/// `DXGK_ALLOCATIONINFO`.
+unsafe fn admit_hwa2(
     passive: PassiveLevel,
     adapter: &AdapterContext,
-    resource_private: *const c_void,
-    resource_private_size: UINT,
-    info: &mut DXGK_ALLOCATIONINFO,
-    resource_associated: bool,
-) -> Result<(), NTSTATUS> {
-    // ── Read + validate the ICD's private driver data ───────────────────────
-    //
-    // TWO SEPARATE DECISIONS (M3/k-alloc-11). The READ may fall back to the
-    // resource-level buffer when it is the larger of the two; the WRITE-BACK
-    // below may not. Both HeliosWddmAllocPrivate and HeliosWddmOpenIdentity put
-    // `magic` at byte offset 16, so stamping the identity into the shared
-    // resource buffer makes the NEXT allocation in the same call fail
-    // HeliosWddmAllocPrivate::is_valid. `write_target` is therefore always the
-    // per-allocation buffer.
-    //
-    // The fallback is believed unreachable today (CARAPSz and CARRSz both read
-    // 96 on the live box, so `resource_private_size > priv_len` is false), but
-    // proving that needs DiagLevel >= 1 for the 0x0C01_0040 breadcrumb, so it is
-    // kept rather than deleted.
-    let write_target = info.pPrivateDriverData as *const u8;
-    let write_target_len = info.PrivateDriverDataSize as usize;
-    let mut priv_ptr = write_target;
-    let mut priv_len = write_target_len;
-    if !resource_private.is_null() && (resource_private_size as usize) > priv_len {
-        priv_ptr = resource_private as *const u8;
-        priv_len = resource_private_size as usize;
-        crate::diag::record(0x0C01_0040);
-    }
-    if priv_ptr.is_null() || priv_len < size_of::<HeliosWddmAllocPrivate>() {
+    private: *mut u8,
+    private_size: usize,
+    shape: CreateCallShape,
+) -> Result<AdmittedAllocation, NTSTATUS> {
+    // SAFETY: `private_size` is the runtime's authoritative length for this
+    // buffer and the slice is bounded by the record size we are about to
+    // require; `from_private_data` owns the exact-length check and refuses any
+    // other length, so a shorter buffer never reaches a read of 168 bytes.
+    if private_size != HELIOS_HWA2_BYTES as usize {
+        bump(&CREATE_HWA2_REJECT, b"AcHwa2Rej");
         crate::diag::record(0x0C01_0002);
         return Err(STATUS_INVALID_PARAMETER);
     }
-    // SAFETY: bounds-checked above; the runtime guarantees `priv_len` bytes at
-    // `priv_ptr`. Read unaligned — the buffer carries no alignment guarantee.
-    let priv_bytes =
-        unsafe { core::slice::from_raw_parts(priv_ptr, size_of::<HeliosWddmAllocPrivate>()) };
-    let ap: HeliosWddmAllocPrivate = pod_read_unaligned(priv_bytes);
-    crate::diag::record(0x0C11_0000 | (ap.kind & 0xFFFF));
-    crate::diag::record(0x0C30_0000 | ((info.PrivateDriverDataSize as u32).min(0xFFFF)));
-    crate::diag::record(0x0C31_0000 | ((resource_private_size as u32).min(0xFFFF)));
-    crate::diag::record(0x0C32_0000 | (ap.ctx_id & 0xFFFF));
-    if !ap.is_valid() {
+    // ⚠ THE READ SLICE LIVES IN THIS BLOCK AND NOWHERE ELSE. The create-output
+    // write at the end of this function forms a `&mut [u8]` over the identical
+    // address range, and holding a live `&[u8]` across it is aliasing UB under
+    // every model that gives `&mut` uniqueness — even though borrowck cannot see
+    // it, because both slices are raw-pointer-derived. `from_private_data`
+    // returns the record BY VALUE, so nothing needs the read slice afterwards.
+    let parsed = {
+        // SAFETY: length checked exactly above; the runtime guarantees the buffer.
+        let bytes = unsafe { core::slice::from_raw_parts(private as *const u8, private_size) };
+        HeliosWddmAllocationDescV2::from_private_data(bytes)
+    };
+    let Ok(mut desc) = parsed else {
+        bump(&CREATE_HWA2_REJECT, b"AcHwa2Rej");
+        crate::diag::record(0x0C01_0003);
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    if desc
+        .validate_create_input(HELIOS_PACKAGE_GENERATION)
+        .is_err()
+    {
+        // §10.3:1079-1080 — "any malformed, unknown, truncated,
+        // mismatched-generation, or reserved-nonzero descriptor makes
+        // create/open fail; it never selects a legacy parser." There is
+        // deliberately no fallback arm below this line.
+        bump(&CREATE_HWA2_REJECT, b"AcHwa2Rej");
         crate::diag::record(0x0C01_0003);
         return Err(STATUS_INVALID_PARAMETER);
     }
-    if ap.kind == HELIOS_WDDM_ALLOC_KIND_TRACKING
-        && (ap.size == 0
-            || ap.size > (SIZE_T::MAX - (PAGE - 1)) as u64
-            || ap.ctx_id == 0
-            || ap.blob_id != 0
-            || ap.map_cache == 0
-            || ap.adopt_resource_id != 0)
+
+    // ── cross-checks the descriptor alone cannot express ────────────────────
+    //
+    // A `STANDARD_PRIMARY` kind without the `PRIMARY` flag is legal to
+    // `validate` (the standard coupling only binds the STANDARD flag to the
+    // offset-84 type) but is not legal here: every later placement decision
+    // reads the FLAG, so a primary-kind allocation without it would be placed as
+    // an ordinary texture — CpuVisible-with-Cached, no AccessedPhysically, no
+    // aperture fallback — and the VidPn commit would fail with nothing naming
+    // why.
+    let is_primary = desc.has_flag(HELIOS_HWA2_FLAG_PRIMARY);
+    if desc.allocation_kind == HELIOS_HWA2_KIND_STANDARD_PRIMARY && !is_primary {
+        bump(&CREATE_HWA2_REJECT, b"AcHwa2Rej");
+        crate::diag::record(0x0C01_0003);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // §10.3 offset 68: `RESOURCE_ASSOCIATED` is "preserved verbatim so later
+    // diagnostics never have to infer it from dimensions, process, or order".
+    //
+    // ⚠ COUNTED, NOT REFUSED, and the asymmetry is forced rather than chosen.
+    // The pre-retirement code OR-ed the bit in from `DXGK_CREATEALLOCATIONFLAGS
+    // ::Resource` at create — i.e. the KMD *set* it. Under the echo rule the KMD
+    // may not: `K4-CONTRACT.md` §1.1 puts this field in the "echoed verbatim"
+    // row and says the KMD refuses rather than corrects. But for an OS standard
+    // allocation the author is `dxgkddi_get_standard_allocation_driver_data`,
+    // which is called BEFORE dxgkrnl decides whether the create carries a
+    // resource and therefore cannot know the answer — so refusing a mismatch
+    // would fail every DWM primary, and correcting one is forbidden. There is no
+    // producer that can be right, which is a gap in the field's definition
+    // rather than in either implementation. Recorded as a divergence so it is
+    // visible and measurable instead of silently absorbed.
+    if desc.has_flag(HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED)
+        != (shape.flags & DXGK_CREATEALLOCATION_FLAG_RESOURCE != 0)
     {
-        // A tracking allocation is deliberately only a VidMm charge. Reject
-        // contradictory host-resource identity instead of silently ignoring
-        // it, and bound the page-rounding operation below.
-        crate::diag::record(0x0C01_00E3);
+        bump(&CREATE_RESOURCE_ASSOC_DIVERGENCE, b"AcRcAssoc");
+    }
+
+    // ── `byte_size` for a KMD-created LINEAR image (`K4-CONTRACT.md` §1.3) ───
+    //
+    // §10.3 gives no rule for computing it, so the existing empirical
+    // computation stays AUTHORITATIVE and the descriptor is validated against it
+    // rather than replacing it. It applies to exactly the surfaces
+    // `dxgkddi_get_standard_allocation_driver_data` authors below with
+    // `linear_blob_size`: a STANDARD allocation with a linear row layout. An
+    // ordinary UMD buffer or image is not covered — the doc gives no rule for
+    // those either, and inventing one would refuse legal creates.
+    let plane0 = desc.planes[0];
+    if desc.has_flag(HELIOS_HWA2_FLAG_STANDARD) && desc.swizzle_class == HELIOS_HWA2_SWIZZLE_LINEAR
+    {
+        let expected = linear_blob_size(plane0.row_pitch as u64, desc.height as u64);
+        if desc.byte_size != expected {
+            bump(&CREATE_SIZE_REJECT, b"AcSize");
+            crate::diag::record(0x0C01_00E7);
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+    }
+
+    let backing_class = classify_hwa2(&desc)?;
+    let created = build_backing(passive, adapter, backing_class)?;
+
+    // MEASURE THE GUESS (R719). `desc.byte_size` is what the authoring side
+    // computed; `created.venus_alloc_size` is the exact Vulkan requirement the
+    // host reported. Counted, not acted on — this measures how far off the
+    // empirical constants are.
+    if created.venus_alloc_size != 0 && created.venus_alloc_size != desc.byte_size {
+        LINEAR_BLOB_SIZE_DIVERGENCE.fetch_add(1, Ordering::Relaxed);
+    }
+    // ⛔ ACTED ON: an UNDERSIZED backing. §10.3:1050 makes `byte_size` bound
+    // every plane, and the descriptor is echoed verbatim, so admitting a backing
+    // smaller than it would publish a descriptor whose planes run off the end of
+    // the real allocation. A blob smaller than the image requirement binds
+    // "successfully" and then MMU-faults when the sampler reads the slack region
+    // (host Xid 31, FAULT_PTE VIRT_READ — killed the IDD feed live 2026-07-04).
+    if created.venus_alloc_size != 0 && created.venus_alloc_size < desc.byte_size {
+        bump(&CREATE_SIZE_REJECT, b"AcSize");
+        crate::diag::record(0x0C01_00E7);
+        // The backing is destroyed by the caller's unwind through
+        // `destroy_allocation_ctx` only if an `AllocationContext` exists, and it
+        // does not yet — so tear it down here rather than leak a host resource.
+        release_orphan_backing(passive, adapter, &created);
         return Err(STATUS_INVALID_PARAMETER);
     }
 
-    // For a KMD-originated standard allocation (DWM/IddCx composition surface), the
-    // private data carries a geometry trailer the KMD itself wrote in
-    // GetStandardAllocationDriverData, and `ctx_id` is the KMD's internal venus
-    // context — which must be live (it is at Code 0; defensive otherwise).
-    let mut meta = unsafe { read_standard_meta(priv_ptr as *const c_void, priv_len as UINT) }
-        .unwrap_or_else(HeliosWddmAllocMeta::zeroed);
-    if resource_associated {
-        meta.misc_flags |= HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED;
-    }
-    let mut ap = ap;
-    let mut supplied_resource_id = 0u32;
-    if ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
-        if ap.ctx_id == 0 {
-            ap.ctx_id = adapter.venus_ctx_id();
-        }
-        if ap.ctx_id == 0 {
-            crate::diag::record(0x0C01_00E2);
-            return Err(STATUS_DEVICE_NOT_READY);
-        }
-        // Runtime-created standard allocations may either be backed by a Venus
-        // VkDeviceMemory object supplied by the UMD (composition/render targets)
-        // or by a KMD-created scratch blob (legacy shadow/staging surfaces). Keep
-        // a nonzero blob id intact so dxgkrnl/IddCx and DXVK observe the same
-        // backing store.
-        ap.size = if ap.size == 0 { PAGE as u64 } else { ap.size };
-        if ap.adopt_resource_id != 0 {
-            supplied_resource_id = ap.adopt_resource_id;
-            crate::diag::record(0x0C39_0000 | (supplied_resource_id & 0xFFFF));
-        }
-    } else if ap.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY && ap.adopt_resource_id != 0 {
-        supplied_resource_id = ap.adopt_resource_id;
-        crate::diag::record(0x0C39_0000 | (supplied_resource_id & 0xFFFF));
-    }
-
-    // ── Create the backing virtio-gpu blob (create_blob + ctx_attach) ───────
-    crate::diag::record(0x0C01_0010 | (ap.kind & 0xFF));
-    // Classify ONCE, build ONCE, update `meta`/`ap` at exactly ONE site.
-    let backing = match helios_protocol::classify(&ap, &meta, supplied_resource_id) {
-        Ok(backing) => backing,
-        Err(helios_protocol::ClassifyRefusal::UnsupportedGdiFormat { format }) => {
-            crate::diag::record_named_bytes(b"GdiOFmt", format);
-            return Err(STATUS_NOT_SUPPORTED);
-        }
+    let Some(generation) = allocation_object::mint() else {
+        bump(&CREATE_GENERATION_EXHAUSTED, b"AcGenExh");
+        release_orphan_backing(passive, adapter, &created);
+        // `STATUS_NO_MEMORY`, not `STATUS_INSUFFICIENT_RESOURCES`: the former is
+        // in this DDI's documented return set and the latter is not, and
+        // dxgkrnl logs an illegal NTSTATUS as a driver bug ("Driver returned an
+        // invalid NTSTATUS", 197x) and answers with adapter resets.
+        return Err(STATUS_NO_MEMORY);
     };
-    let adopt_supplied_resource = matches!(
-        backing,
-        helios_protocol::AllocationBacking::AdoptedUmdResource { .. }
-    );
-    let is_primary = (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_PRIMARY) != 0;
-    // Deliberately the FLAG, not the backing arm. This is a VidMm policy input
-    // (CpuVisible=0, no Cached, not BAR-eligible), not a backing class, and
-    // deriving it from the arm would silently change policy for the unreachable
-    // PRIMARY | OPTIMAL_GDI_TEXTURE combination, which classifies as the primary.
-    let is_optimal_gdi_texture = ap.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
-        && (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE) != 0;
-    let created = build_backing(passive, adapter, backing, &ap, &meta)?;
 
-    // THE one update site. `meta`/`ap` used to be mutated in place by each arm
-    // and read again 100-470 lines later, with nothing stating which fields an
-    // arm owed an answer for.
-    let resource_id = created.resource_id;
-    let venus_memory_id = created.venus_memory_id;
-    let venus_image_id = created.venus_image_id;
-    meta.pitch = created.pitch;
-    meta.plane_offset = created.plane_offset;
-    meta.dxgi_format = created.dxgi_format;
-    // MEASURE THE GUESS (R719). `ap.size` is what `linear_blob_size` (or the
-    // GDI-texture estimate) produced and what was handed to
-    // `allocate_memory_blob`; `created.venus_alloc_size` is the exact Vulkan
-    // requirement the host reported. For the shadow/staging/GDI-staging arms the
-    // guess is AUTHORITATIVE — this arm does not overwrite `ap.size` — so a
-    // divergence is not a failure, it is how far off the empirical constants are.
-    // Counted, not acted on.
-    if created.venus_alloc_size != 0 && created.venus_alloc_size != ap.size {
-        LINEAR_BLOB_SIZE_DIVERGENCE.fetch_add(1, Ordering::Relaxed);
+    // ── the create-output record ────────────────────────────────────────────
+    //
+    // Every field is ECHOED; exactly three are stamped. `K4-CONTRACT.md` §1.1:
+    // "the KMD refuses the create rather than correcting a field", because a
+    // silent correction would make the descriptor disagree with the resource the
+    // UMD believes it made.
+    desc.allocation_generation = generation;
+    // §10.3:1071-1073 / C44 — set ONLY when the D3D12 create record, the runtime
+    // PRIMARY flag, and the required `D3DDDI_ID_UNINITIALIZED` sentinel all
+    // agree. The KMD sees the last two directly; the first is what produced the
+    // sentinel in the first place, since the D3D12 runtime is the only thing
+    // that overwrites `VidPnSourceId` with it on a primary. The bit and the
+    // sentinel are set together, here, so no opener has to infer either.
+    if is_primary && desc.vidpn_source == D3DDDI_ID_UNINITIALIZED {
+        desc.flags |= HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY;
     }
-    meta.venus_alloc_size = created.venus_alloc_size;
-    meta.memory_type_index = created.memory_type_index;
-    ap.size = created.blob_size.bytes();
-    let size = round_up_page(if ap.size == 0 {
+    // §10.3:1074-1076 — set ONLY for a non-protected, non-cross-adapter managed
+    // primary in a swizzle class the selected display backend implements. This
+    // backend scans out a LINEAR image through `SET_SCANOUT_BLOB`, which is
+    // exactly what `helios_hwa2_swizzle_is_direct_flip_capable` names.
+    //
+    // ⚠ Necessary, never sufficient (§10.3:1076-1078): the D3D11 UMD must still
+    // compare both live wrappers and every C43 field, and KMD `CheckMPO3` must
+    // still accept the actual display attributes. STEREO is excluded here even
+    // though `validate` does not require it, because §10.8:2740-2748 makes the
+    // display path refuse it — promoting a flip the display path will refuse is
+    // a wrong claim, not a harmless one.
+    if is_primary
+        && desc.has_flag(HELIOS_HWA2_FLAG_DISPLAYABLE)
+        && !desc.has_flag(HELIOS_HWA2_FLAG_PROTECTED)
+        && !desc.has_flag(HELIOS_HWA2_FLAG_CROSS_ADAPTER)
+        && !desc.has_flag(HELIOS_HWA2_FLAG_STEREO)
+        && desc.plane_count == 1
+        && helios_hwa2_swizzle_is_direct_flip_capable(desc.swizzle_class)
+    {
+        desc.flags |= HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE;
+    }
+
+    // Self-check BEFORE the write: the record this KMD is about to publish must
+    // pass the validator every opener will run on it. A failure here is a driver
+    // bug, not a guest one, and refusing the create is the only way it can be
+    // noticed at all — a published descriptor that fails open-time validation
+    // would present as an unexplained `OpenResource` failure much later.
+    if desc
+        .validate_create_output(HELIOS_PACKAGE_GENERATION)
+        .is_err()
+    {
+        bump(&CREATE_HWA2_OUTPUT_REJECT, b"AcHwa2Out");
+        release_orphan_backing(passive, adapter, &created);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    // SAFETY: `private_size == HELIOS_HWA2_BYTES` was proven above and the
+    // runtime owns a writable buffer of that length for the DDI call's duration.
+    // `bytes_of` yields exactly `size_of::<HeliosWddmAllocationDescV2>()` bytes,
+    // which the assertion in `protocol` pins at 168.
+    let out = unsafe { core::slice::from_raw_parts_mut(private, private_size) };
+    out.copy_from_slice(bytes_of(&desc));
+    crate::diag::record(0x0C3B_0000 | (created.resource_id & 0xFFFF));
+
+    // The pitch a byte-addressing consumer must use. For the LINEAR scan-out arm
+    // it is VULKAN'S stride, not the descriptor's: `allocate_linear_scanout_image_blob`
+    // reports what the host actually laid out, and a `width*4`-derived stride
+    // shears the scan-out (1896*4 = 7584 against the real 7680). For every other
+    // arm the descriptor's plane record is the authority.
+    let pitch = if created.pitch != 0 {
+        created.pitch
+    } else {
+        plane0.row_pitch
+    };
+    let plane_offset = if created.pitch != 0 {
+        created.plane_offset
+    } else {
+        plane0.offset
+    };
+
+    let bar_seg_id = adapter.bar_segment().map(|b| b.seg_id);
+    // HostAuthoritative is exactly the three KMD-created arms, which are exactly
+    // the arms that set `venus_memory_id`. What that buys is that the aperture
+    // path's safety rests on a stated fact rather than on an incidental property
+    // of an unrelated field.
+    let bar_eligible = created.blob_size.is_host_authoritative()
+        && desc.swizzle_class != HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL
+        && bar_seg_id.is_some();
+    let placement = vidmm_placement(
+        bar_eligible,
+        bar_seg_id,
+        is_primary,
+        desc.has_flag(HELIOS_HWA2_FLAG_CPU_VISIBLE),
+        adapter.display_half(),
+    );
+
+    // VidMm is charged the LARGER of the descriptor's extent and the backing the
+    // host actually produced. The descriptor is const and may under-state a
+    // host-rounded image requirement; charging the smaller number would let
+    // `MapCpuHostAperture` compute a page count below the tracked blob's length.
+    let charged = created.blob_size.bytes().max(desc.byte_size);
+    let vidmm_size = round_up_page(if charged == 0 {
         PAGE
     } else {
-        ap.size as SIZE_T
+        charged as SIZE_T
     });
-    let supplied_tracker = ap.global_vidmm_tracker();
-    let tracker_attested = ap.kind == HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
-        && supplied_resource_id != 0
-        && supplied_tracker
-            .is_some_and(|tracker| adapter.vidmm_trackers.matches(tracker.cookie, size));
 
+    Ok(AdmittedAllocation {
+        kind: desc.allocation_kind,
+        generation,
+        vidmm_size,
+        placement,
+        // Derived from the DESCRIPTOR, never from geometry: a UMD-created
+        // primary with a linear row layout is exactly the shape the display path
+        // may bind directly. A KMD-authored standard primary is excluded because
+        // its bytes are the adapter's own LINEAR scan-out image, which the
+        // display path reaches through `venus_image_id`, not through the
+        // resid->handle bridge.
+        direct_scanout: is_primary
+            && desc.swizzle_class == HELIOS_HWA2_SWIZZLE_LINEAR
+            && !desc.has_flag(HELIOS_HWA2_FLAG_STANDARD),
+        width: desc.width,
+        height: desc.height,
+        d3d_ddi_format: desc.d3d_ddi_format,
+        dxgi_format: desc.dxgi_format,
+        ddi_bind_flags: hwa2_bind_to_ddi(desc.bind_flags),
+        plane_offset,
+        pitch,
+        bar_eligible,
+        size_provenance: created.blob_size,
+        backing: Some(created),
+    })
+}
+
+/// Admit one HVM1 create-input record (§10.7), create its renderer-view backing,
+/// and stamp the three write-back fields.
+///
+/// # SAFETY
+/// As [`admit_hwa2`].
+unsafe fn admit_hvm1(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    private: *mut u8,
+    private_size: usize,
+    shape: CreateCallShape,
+) -> Result<AdmittedAllocation, NTSTATUS> {
+    if private_size != HELIOS_HVM1_SIZE as usize {
+        bump_with_code(&CREATE_HVM1_REJECT, b"AcHvm1Rej", 0);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // Scoped for the reason `admit_hwa2` states in full: the write-back below
+    // forms a `&mut [u8]` over the same bytes.
+    let parsed = {
+        // SAFETY: length checked exactly above; the runtime owns the buffer.
+        let bytes = unsafe { core::slice::from_raw_parts(private as *const u8, private_size) };
+        HeliosVenusMemoryAllocationV1::from_private_data(bytes)
+    };
+    let mut record = match parsed {
+        Ok(record) => record,
+        Err(reject) => {
+            bump_with_code(&CREATE_HVM1_REJECT, b"AcHvm1Rej", reject.code());
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+    };
+    let role = match record.validate(HELIOS_PACKAGE_GENERATION, Hvm1Stage::CreateInput) {
+        Ok(role) => role,
+        Err(reject) => {
+            bump_with_code(&CREATE_HVM1_REJECT, b"AcHvm1Rej", reject.code());
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+    };
+
+    // §10.7:1964-1972 — the KMT create-call shape is fixed and the KMD enforces
+    // it. The doc states it as what the ICD does; §18.1:4750-4751 tests that the
+    // properties hold, and a guest-supplied shape checked only by the guest is
+    // not checked.
+    //
+    // ⚠ The `pSystemMem = NULL` / `ExistingSysMem` / `CreateShared` /
+    // `NtSecuritySharing` / `ExistingKernelSysMem` / `ExistingSection` /
+    // `PermanentSysMem` half of that list is a `D3DDDI_ALLOCATIONINFO` /
+    // `D3DKMT_CREATEALLOCATION` property that dxgkrnl consumes and does NOT
+    // surface to the miniport: `DXGKARG_CREATEALLOCATION` carries only
+    // `Flags{Resource, Reserved}`, `NumAllocations`, `hResource`, and the two
+    // private-data pairs (`tmp/dxgk_bindings.rs:64212-64219`). So this check
+    // covers the four properties the KMD can see and CANNOT cover the other
+    // seven — recorded here rather than implied, because §18.1:4750-4751 asks
+    // for a proof this DDI cannot supply.
+    if !shape.is_bare_single_allocation() {
+        bump(&CREATE_CALL_SHAPE, b"AcShape");
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    // ⛔ THE ROLE'S PREFERRED SEGMENT MUST BE ONE THIS DRIVER ACTUALLY REPORTS
+    // (`K4-CONTRACT.md` §4, as AMENDED 2026-08-10 — the amendment overrides the
+    // role-4-only refusal that stood here).
+    //
+    // `Hvm1Role::placement()` prefers `HELIOS_SEGMENT_ID_HLM1` for EVERY role, so
+    // the refusal that keyed on role 4 caught the one create it could name and
+    // let roles 1-3 through onto the same unreportable segment — where dxgkrnl
+    // refuses them outside this driver, with nothing here counting it. The check
+    // is the segment, not the role: it is correct whether or not K2 has landed,
+    // it needs no knowledge of K2's schedule, and it cannot go stale. See
+    // [`CREATE_ROLE1_SEGMENT_ABSENT`] for the full argument and for why no
+    // substitute placement is admissible (role 4 in particular has
+    // `CpuVisible = 0`, no CPU VA, and may never reach Lock2 — §10.7:2004-2005,
+    // :2049-2050).
+    //
+    // Checked BEFORE `build_backing` so a refusal has no host resource to orphan.
+    let placement = hvm1_placement(role);
+    if !segment_is_reported(adapter, placement.preferred_segment) {
+        let (counter, name) = role_segment_absent_counter(role);
+        bump(counter, name);
+        // `STATUS_NOT_SUPPORTED`, unchanged from the role-4 refusal this
+        // replaces: the record is well-formed and legal, and it is this adapter's
+        // current segment topology that cannot host it. `STATUS_INVALID_PARAMETER`
+        // would blame the caller for a KMD/host sequencing state.
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+
+    // §10.7:1936-1940 — one ordinary, nonprimary, unshared WDDM allocation and
+    // one KMD-owned renderer resource descriptor of the same page-rounded size.
+    // Roles 1-3 are CPU-visible and Lock2-mappable, so the blob is MAPPABLE; it
+    // is never SHAREABLE, because §10.7:1971-1972 requires every sharing flag
+    // zero.
+    let created = build_backing(
+        passive,
+        adapter,
+        Hwa2Backing::LinearMemory {
+            bytes: record.byte_size,
+            mappable: true,
+            shareable: false,
+        },
+    )?;
+    if created.venus_alloc_size != 0 && created.venus_alloc_size < record.byte_size {
+        bump(&CREATE_SIZE_REJECT, b"AcSize");
+        release_orphan_backing(passive, adapter, &created);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    let Some(generation) = allocation_object::mint() else {
+        bump(&CREATE_GENERATION_EXHAUSTED, b"AcGenExh");
+        release_orphan_backing(passive, adapter, &created);
+        // `STATUS_NO_MEMORY`, not `STATUS_INSUFFICIENT_RESOURCES`: the former is
+        // in this DDI's documented return set and the latter is not, and
+        // dxgkrnl logs an illegal NTSTATUS as a driver bug ("Driver returned an
+        // invalid NTSTATUS", 197x) and answers with adapter resets.
+        return Err(STATUS_NO_MEMORY);
+    };
+
+    // The three write-back fields (§10.7:1955, :1960, :1961), and nothing else.
+    record.object_generation = generation;
+    record.segment_page_shift = HELIOS_HVM1_SEGMENT_PAGE_SHIFT;
+    // §10.7:1961 — "the KMD returns the exact alignment". Every backing this
+    // driver creates is page-granular (`allocate_memory_blob` rounds up to
+    // `PAGE`), and `validate` requires a nonzero power of two.
+    record.allocation_alignment = PAGE as u64;
+    if record
+        .validate(HELIOS_PACKAGE_GENERATION, Hvm1Stage::CreateOutput)
+        .is_err()
+    {
+        bump(&CREATE_HVM1_OUTPUT_REJECT, b"AcHvm1Out");
+        release_orphan_backing(passive, adapter, &created);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // SAFETY: length proven exactly `HELIOS_HVM1_SIZE` above; the runtime owns a
+    // writable buffer of that length for the call's duration.
+    let out = unsafe { core::slice::from_raw_parts_mut(private, private_size) };
+    out.copy_from_slice(bytes_of(&record));
+
+    Ok(AdmittedAllocation {
+        kind: ALLOC_KIND_HVM1,
+        generation,
+        vidmm_size: round_up_page(created.blob_size.bytes().max(record.byte_size) as SIZE_T),
+        // The same value the segment check above interrogated — computed once so
+        // the placement that was validated is the placement that ships.
+        placement,
+        width: 0,
+        height: 0,
+        d3d_ddi_format: 0,
+        dxgi_format: 0,
+        ddi_bind_flags: 0,
+        plane_offset: 0,
+        pitch: 0,
+        direct_scanout: false,
+        // ⛔ NOT BAR-eligible. An HVM1 object's placement is HLM1 plus the
+        // ordinary aperture (§10.7:1999-2002); the CpuHostAperture BAR path is
+        // the mechanism §17.6 deletes, and routing native-Vulkan memory through
+        // it would re-create exactly what the retirement removes.
+        bar_eligible: false,
+        size_provenance: created.blob_size,
+        backing: Some(created),
+    })
+}
+
+/// Admit the one HOC1 outer-command pool for a D3D12 device (§10.6).
+///
+/// # SAFETY
+/// As [`admit_hwa2`].
+unsafe fn admit_hoc1(
+    adapter: &AdapterContext,
+    private: *mut u8,
+    private_size: usize,
+    shape: CreateCallShape,
+) -> Result<AdmittedAllocation, NTSTATUS> {
+    if private_size != HELIOS_HOC1_BYTES as usize {
+        bump(&CREATE_HOC1_REJECT, b"AcHoc1Rej");
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // Scoped for the reason `admit_hwa2` states in full: the write-back below
+    // forms a `&mut [u8]` over the same bytes.
+    let parsed = {
+        // SAFETY: length checked exactly above; the runtime owns the buffer.
+        let bytes = unsafe { core::slice::from_raw_parts(private as *const u8, private_size) };
+        HeliosOuterCommandAllocationV1::from_private_data(bytes)
+    };
+    let Ok(mut record) = parsed else {
+        bump(&CREATE_HOC1_REJECT, b"AcHoc1Rej");
+        return Err(STATUS_INVALID_PARAMETER);
+    };
+    // §17.6:4419-4420 — "every other size/flag/cache/node/role combination fails
+    // allocation". `validate_create_input` is that rule: exactly 64 MiB, 64-KiB
+    // extent alignment, `CPU_WRITE|DEVICE_READ`, write-combined, node bit 0,
+    // reserved zero, and a zero generation awaiting this KMD's write-back.
+    if record
+        .validate_create_input(HELIOS_PACKAGE_GENERATION)
+        .is_err()
+    {
+        bump(&CREATE_HOC1_REJECT, b"AcHoc1Rej");
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // §10.6:1489-1494 / §17.6:4414-4415 — admit ONLY from
+    // `pfnAllocateCb{hResource = NULL}` with one zeroed legacy
+    // `D3DDDI_ALLOCATIONINFO` and no resource-level private data.
+    if !shape.is_bare_single_allocation() {
+        bump(&CREATE_CALL_SHAPE, b"AcShape");
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // The same segment check `admit_hvm1` performs, for the same reason: this
+    // placement also prefers `HELIOS_SEGMENT_ID_HLM1`, so without it an HOC1
+    // create is refused by dxgkrnl with nothing in the guest naming why. See
+    // [`CREATE_HOC1_SEGMENT_ABSENT`], which records that this goes one step
+    // beyond §4's letter and how to revert it.
+    let placement = hoc1_placement();
+    if !segment_is_reported(adapter, placement.preferred_segment) {
+        bump(&CREATE_HOC1_SEGMENT_ABSENT, b"AcSegHoc1");
+        return Err(STATUS_NOT_SUPPORTED);
+    }
+
+    let Some(generation) = allocation_object::mint() else {
+        bump(&CREATE_GENERATION_EXHAUSTED, b"AcGenExh");
+        // See the same site in `admit_hwa2` for why this is `STATUS_NO_MEMORY`.
+        return Err(STATUS_NO_MEMORY);
+    };
+    // §17.6:4418-4419 — "KMD writes ONE allocation generation into HOC1 and lets
+    // C64/HPM1 map its pages for virtual execution".
+    record.allocation_generation = generation;
+    if record
+        .validate_create_output(HELIOS_PACKAGE_GENERATION)
+        .is_err()
+    {
+        bump(&CREATE_HOC1_OUTPUT_REJECT, b"AcHoc1Out");
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // SAFETY: length proven exactly `HELIOS_HOC1_BYTES` above.
+    let out = unsafe { core::slice::from_raw_parts_mut(private, private_size) };
+    out.copy_from_slice(bytes_of(&record));
+
+    Ok(AdmittedAllocation {
+        kind: ALLOC_KIND_HOC1,
+        generation,
+        vidmm_size: round_up_page(record.byte_size as SIZE_T),
+        // Validated by the segment check above; computed once so the placement
+        // that was validated is the placement that ships.
+        placement,
+        // ⛔ NO BACKING, and that is the contract, not an omission
+        // (§10.6:1511-1512, §17.6:4416-4417): the pool is "not an HVM1 renderer
+        // resource", has "no renderer view", and its bytes are ordinary VidMm
+        // memory the UMD Lock2-maps and C64/HPM1 page-tables for execution.
+        // Creating a venus object here would give it exactly the renderer view
+        // the doc forbids.
+        backing: None,
+        width: 0,
+        height: 0,
+        d3d_ddi_format: 0,
+        dxgi_format: 0,
+        ddi_bind_flags: 0,
+        plane_offset: 0,
+        pitch: 0,
+        direct_scanout: false,
+        bar_eligible: false,
+        size_provenance: BackingSize::NonHostAuthoritative(record.byte_size),
+    })
+}
+
+/// Tear down a backing created for an allocation that then failed admission.
+///
+/// The ordinary teardown path is `destroy_allocation_ctx`, which needs an
+/// `AllocationContext`; between `build_backing` succeeding and the `Box` being
+/// leaked into `info.hAllocation` there is none, so a refusal in that window
+/// would leak a host resource with no handle able to reclaim it. Best-effort on
+/// every step, exactly like the teardown path: a refusal must not get stuck.
+fn release_orphan_backing(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    created: &CreatedBacking,
+) {
+    if created.resource_id == 0 {
+        return;
+    }
+    let _ = crate::virtio::ctrl::forget_allocation_blob(passive, adapter, created.resource_id);
+    let first_teardown = adapter
+        .with_virtio(|v| v.take_live_resource(created.resource_id))
+        .unwrap_or(false);
+    if first_teardown {
+        // Detach before unref, exactly as `destroy_allocation_ctx` does: the
+        // blob was ctx-attached by `resource_create_blob` at creation, and
+        // unref'ing an attached resource is the shape that produced QEMU's
+        // "virgl_cmd_resource_unref: resource does not exist" burst.
+        let _ = crate::virtio::ctrl::ctx_detach_resource(
+            passive,
+            adapter,
+            adapter.venus_ctx_id(),
+            created.resource_id,
+        );
+        let _ = crate::virtio::ctrl::resource_unref(passive, adapter, created.resource_id);
+    }
+    if created.venus_image_id != 0 {
+        let _ = adapter.with_venus_client(passive, |c| {
+            c.destroy_image(adapter, created.venus_image_id)
+        });
+    }
+    if created.venus_memory_id != 0 {
+        let _ = adapter.with_venus_client(passive, |c| {
+            c.free_memory_blob(adapter, created.venus_memory_id)
+        });
+    }
+}
+
+/// `DXGK_CREATEALLOCATIONFLAGS::Resource`, as a mask over the flags word.
+///
+/// The binding exposes the bit only through an accessor; the mask is needed here
+/// to state "outer flags zero" and the RESOURCE_ASSOCIATED cross-check over the
+/// same word, so it is named once with its provenance rather than spelled `1`.
+const DXGK_CREATEALLOCATION_FLAG_RESOURCE: u32 = 1 << 0;
+
+/// Create one allocation: parse the record, create the backing, stamp the
+/// create-output descriptor, and fill the `DXGK_ALLOCATIONINFO`.
+///
+/// On failure nothing is stored and no byte of the private buffer is written
+/// (the caller unwinds prior allocations).
+///
+/// # The three-record dispatch
+///
+/// One `pfnAllocateCb` per-allocation buffer may hold exactly one of HWA2 (168
+/// B), HVM1 (64 B) or HOC1 (64 B). They are told apart by the 4-byte magic at
+/// offset 0, read through a BOUNDED copy before any record-sized read, and each
+/// arm then requires its own exact length. That is per-arm validation: nothing
+/// reads 168 bytes out of a buffer that only claimed 64, and nothing takes the
+/// max-union of the three sizes as a bound.
+unsafe fn create_one(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    info: &mut DXGK_ALLOCATIONINFO,
+    shape: CreateCallShape,
+) -> Result<(), NTSTATUS> {
+    let private = info.pPrivateDriverData as *mut u8;
+    let private_size = info.PrivateDriverDataSize as usize;
+    crate::diag::record(0x0C30_0000 | ((info.PrivateDriverDataSize as u32).min(0xFFFF)));
+    crate::diag::record(0x0C31_0000 | ((shape.resource_private_size as u32).min(0xFFFF)));
+
+    // ⛔ The RESOURCE-level buffer is NOT a fallback source any more.
+    //
+    // The pre-retirement read fell back to it when it was the larger of the two,
+    // with a breadcrumb recording that the fallback was believed unreachable.
+    // Under §10.3 the descriptor is per-allocation by construction — dxgkrnl
+    // associates one HWA2 with one allocation and carries it to `OpenResource` —
+    // so a resource-level read would be reading another allocation's identity.
+    // HVM1 and HOC1 forbid resource-level private data outright.
+    if private.is_null() || private_size < size_of::<u32>() {
+        bump(&CREATE_UNKNOWN_RECORD, b"AcMagic");
+        crate::diag::record(0x0C01_0002);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    // Bounded 4-byte read to pick the arm. Copied rather than referenced: the
+    // buffer carries no alignment promise, and forming a `&u32` over it would
+    // assert one. Nothing wider is read until an arm has required its own exact
+    // length.
+    let mut magic_bytes = [0u8; 4];
+    // SAFETY: `private_size >= 4` was proven above and the runtime guarantees
+    // `private_size` readable bytes at `private`.
+    unsafe {
+        core::ptr::copy_nonoverlapping(private as *const u8, magic_bytes.as_mut_ptr(), 4);
+    }
+    let magic = u32::from_le_bytes(magic_bytes);
+    crate::diag::record(0x0C11_0000 | (magic & 0xFFFF));
+
+    let admitted = match magic {
+        HELIOS_HWA2_MAGIC => unsafe { admit_hwa2(passive, adapter, private, private_size, shape) }?,
+        HELIOS_HVM1_MAGIC => unsafe { admit_hvm1(passive, adapter, private, private_size, shape) }?,
+        HELIOS_HOC1_MAGIC => unsafe { admit_hoc1(adapter, private, private_size, shape) }?,
+        _ => {
+            // §10.3:1104-1107 — a descriptor that fails makes the create fail;
+            // NOTHING selects a legacy parser. The retired
+            // `HeliosWddmAllocPrivate` is one of the parsers this must not
+            // select, and a UMD still sending it lands here by construction:
+            // its `magic` sits at byte 16, so byte 0 is its `size` field and
+            // will not match any of the three above.
+            bump(&CREATE_UNKNOWN_RECORD, b"AcMagic");
+            crate::diag::record(0x0C01_0003);
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+    };
+
+    let backing = admitted.backing.as_ref();
+    let resource_id = backing.map_or(0, |b| b.resource_id);
     crate::diag::record(0x0C01_0020);
     crate::diag::record(resource_id);
-    let owns_resource = match backing {
-        // Only DEVICE_MEMORY adopts take the blob's lifetime.
-        helios_protocol::AllocationBacking::AdoptedUmdResource { take_ownership, .. } => {
-            take_ownership
-        }
-        _ => true,
-    };
-    if adopt_supplied_resource {
-        // UMD/Venus-backed allocations arrive with a Mesa BO resource id in
-        // the adopt id. The UMD transfers lifetime ownership from the ICD to this WDDM
-        // allocation after pfnAllocateCb succeeds (blob-slot re-owned above), so
-        // DestroyAllocation releases DEVICE_MEMORY resources even though they
-        // were not created through this CreateAllocation call. Cross-context
-        // imports attach explicitly through HELIOS_ESCAPE_ATTACH_RESOURCE.
-        crate::diag::record(0x0C3A_1000 | (resource_id & 0x0FFF));
-    }
-    if ap.kind != HELIOS_WDDM_ALLOC_KIND_TRACKING
-        && write_target_len >= size_of::<HeliosWddmOpenIdentity>()
-        && !write_target.is_null()
-    {
-        // Create-time write-back into dxgkrnl's per-allocation buffer (the copy
-        // OpenAllocation later reads). This must happen for BOTH KMD-created
-        // standard allocations and UMD/Venus-backed adopted allocations:
-        // windowed DXGI presents hand DWM an allocation token, and the opener
-        // can only import the rendered Venus image if this buffer carries the
-        // live resource id plus exact vkAllocateMemory identity.
-        let ident = ParsedAllocIdentity {
-            resource_id,
-            blob_size: ap.size,
-            venus_alloc_size: meta.venus_alloc_size,
-            memory_type_index: meta.memory_type_index,
-            ctx_id: ap.ctx_id,
-            kind: ap.kind,
-            global_vidmm_tracker_share: supplied_tracker
-                .filter(|_| tracker_attested)
-                .map_or(0, |tracker| tracker.global_share),
-            global_vidmm_tracker_cookie: supplied_tracker
-                .filter(|_| tracker_attested)
-                .map_or(0, |tracker| tracker.cookie),
-        };
-        unsafe {
-            write_open_identity(
-                write_target as *mut c_void,
-                write_target_len as UINT,
-                &ident,
-            );
-        }
-        if write_target_len
-            >= size_of::<HeliosWddmAllocPrivate>() + size_of::<HeliosWddmAllocMeta>()
-        {
-            // SAFETY: bounds-checked; trailer follows the 48-byte prefix in the
-            // per-allocation runtime-owned buffer.
-            let meta_dst = unsafe {
-                core::slice::from_raw_parts_mut(
-                    (write_target as *mut u8).add(size_of::<HeliosWddmAllocPrivate>()),
-                    size_of::<HeliosWddmAllocMeta>(),
-                )
-            };
-            meta_dst.copy_from_slice(bytes_of(&meta));
-        }
-        crate::diag::record(0x0C3B_0000 | (resource_id & 0xFFFF));
-    }
-    record_alloc_event(resource_id, meta.width, meta.height, ap.ctx_id, false);
-
-    // A DEVICE_MEMORY allocation that adopts a UMD/Venus resource is only a
-    // one-page VidMm identity when its cookie names a live tracker whose size
-    // matches the KMD's recorded adopted-blob size. Every cross-process opener
-    // receives that cookie plus the system-wide share, then validates the opened
-    // tracker's private data, so the charge follows the global allocation rather
-    // than the creator.
-    //
-    // The older VIDMM_TRACKED bit is deliberately insufficient here: a new KMD
-    // paired with an old UMD must retain the full fail-safe adopted charge, not
-    // recreate the creator-exit under-report. Conversely, a new UMD leaves the
-    // old bit clear, so an old KMD also retains the conservative full charge.
-    // Keep the exact renderer size in AllocationContext/open identity in both
-    // cases. The adopted object stays in its proven aperture placement.
-    let vidmm_size = if tracker_attested { PAGE } else { size };
-    // CPU-rasterized surfaces (GDI/shadow/staging/shared-primary standard
-    // allocations, KMD-backed by a mappable venus blob) go to the BAR memory
-    // segment: CPU raster then lands in the SAME bytes the allocation's venus
-    // blob exposes (two-memory-split fix). UMD/venus-backed adopted allocations
-    // stay off this path for now: making every adopted present/shared resource
-    // BAR-eligible destabilized the LogonUI/DWM boot path, so the 3D-present
-    // equivalent needs a narrower resource-class gate.
-    let bar_seg_id = adapter.bar_segment().map(|b| b.seg_id);
-    // Truth table verified identical to `venus_memory_id != 0 && ...`:
-    // HostAuthoritative is exactly the three KMD-created arms, which are exactly
-    // the arms that set venus_memory_id. What changes is that the aperture
-    // path's safety now rests on a stated fact rather than on an incidental
-    // property of an unrelated field.
-    let bar_eligible = created.blob_size.is_host_authoritative()
-        && !is_optimal_gdi_texture
-        && bar_seg_id.is_some();
-    // The ICD classifies the backing Vulkan heap. Non-device-local memory stays
-    // in the aperture/shared budget. Device-local tracking enters the local
-    // budget only when `VidMmVramMB` explicitly supplies its capacity;
-    // otherwise preserve the legacy aperture placement.
-    let tracking_budget = if ap.kind != HELIOS_WDDM_ALLOC_KIND_TRACKING {
-        TrackingBudget::None
-    } else if ap.blob_flags & HELIOS_WDDM_BLOB_FLAG_NONLOCAL_TRACKING != 0 {
-        TrackingBudget::NonLocal
-    } else if crate::ddi::bar_segment::vidmm_vram_size(&adapter.knobs()).is_some() {
-        TrackingBudget::Local
-    } else {
-        TrackingBudget::NonLocal
-    };
+    record_alloc_event(
+        resource_id,
+        admitted.width,
+        admitted.height,
+        adapter.venus_ctx_id(),
+        false,
+    );
 
     let ctx = Box::new(AllocationContext {
         magic: ALLOCATION_CTX_MAGIC,
-        ctx_id: ap.ctx_id,
+        ctx_id: adapter.venus_ctx_id(),
         resource_id,
-        owns_resource,
-        venus_memory_id,
-        venus_image_id,
+        generation: admitted.generation,
+        kind: admitted.kind,
+        venus_memory_id: backing.map_or(0, |b| b.venus_memory_id),
+        venus_image_id: backing.map_or(0, |b| b.venus_image_id),
         scanout_copy_image_id: core::sync::atomic::AtomicU64::new(0),
         scanout_copy_memory_id: core::sync::atomic::AtomicU64::new(0),
         scanout_copy_conversion_image_id: core::sync::atomic::AtomicU64::new(0),
@@ -2574,31 +3588,21 @@ unsafe fn create_one(
         vidpn_snap_dxgi_format: AtomicU32::new(0),
         vidpn_snap_plane_offset: AtomicU32::new(0),
         vidpn_snap_alloc_size: AtomicU64::new(0),
-        size,
-        width: meta.width,
-        height: meta.height,
-        format: meta.format,
-        bind_flags: meta.bind_flags,
-        pitch: meta.pitch,
-        dxgi_format: meta.dxgi_format,
-        direct_scanout: (meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT) != 0,
-        plane_offset: meta.plane_offset,
-        venus_alloc_size: meta.venus_alloc_size,
-        memory_type_index: meta.memory_type_index,
+        size: admitted.vidmm_size,
+        width: admitted.width,
+        height: admitted.height,
+        format: admitted.d3d_ddi_format,
+        bind_flags: admitted.ddi_bind_flags,
+        pitch: admitted.pitch,
+        dxgi_format: admitted.dxgi_format,
+        direct_scanout: admitted.direct_scanout,
+        plane_offset: admitted.plane_offset,
+        venus_alloc_size: backing.map_or(0, |b| b.venus_alloc_size),
+        memory_type_index: backing.map_or(0, |b| b.memory_type_index),
         bar_placed: core::sync::atomic::AtomicU64::new(BAR_UNPLACED),
-        bar_eligible,
-        size_provenance: created.blob_size,
-        vidmm_tracker_cookie: 0,
+        bar_eligible: admitted.bar_eligible,
+        size_provenance: admitted.size_provenance,
     });
-
-    let mut ctx = ctx;
-    if ap.kind == HELIOS_WDDM_ALLOC_KIND_TRACKING {
-        if !adapter.vidmm_trackers.register(ap.map_cache, size) {
-            unsafe { destroy_allocation_ctx(passive, adapter, ctx) };
-            return Err(STATUS_NO_MEMORY);
-        }
-        ctx.vidmm_tracker_cookie = ap.map_cache;
-    }
 
     // ── VidMm metadata: segment placement + CPU visibility ──────────────────
     let is_direct_scanout = ctx.direct_scanout;
@@ -2609,26 +3613,15 @@ unsafe fn create_one(
     if is_direct_scanout {
         register_scanout_allocation(ctx_resource_id, info.hAllocation as usize);
     }
-    info.Size = vidmm_size;
-    info.PitchAlignedSize = vidmm_size;
-    // The scan-out display primary (CpuVisible SHAREDPRIMARYSURFACE) needs special
-    // handling: dxgkrnl rejects it unless the supported segment set includes an
-    // APERTURE segment ("CPUVisible allocations must include an aperture segment in
-    // the supported segment set" — ETW-confirmed 36th session), which without it
-    // fails the whole VidPn commit → 0-path VidPn → display never activates.
-    let placement = vidmm_placement(
-        bar_eligible,
-        tracking_budget,
-        bar_seg_id,
-        is_primary,
-        is_optimal_gdi_texture,
-        adapter.display_half(),
-    );
-    let (preferred_segment, supported_segments) =
-        (placement.preferred_segment, placement.supported_segments);
-    info.SupportedWriteSegmentSet = supported_segments;
+    info.Size = admitted.vidmm_size;
+    info.PitchAlignedSize = admitted.vidmm_size;
+    let placement = &admitted.placement;
+    info.SupportedWriteSegmentSet = placement.supported_segments;
     info.EvictionSegmentSet = 0;
     info.HintedBank.__bindgen_anon_1.Value = 0;
+    // §10.7:1999-2001 — normal priority and physical-adapter index 0 for HVM1;
+    // unchanged from the pre-retirement value for everything else, which is the
+    // same constant.
     info.AllocationPriority = D3DDDI_ALLOCATIONPRIORITY_NORMAL;
     info.pAllocationUsageHint = core::ptr::null_mut();
     unsafe {
@@ -2636,8 +3629,8 @@ unsafe fn create_one(
         info.PreferredSegment
             .__bindgen_anon_1
             .__bindgen_anon_1
-            .set_SegmentId0(preferred_segment);
-        info.__bindgen_anon_2.SupportedReadSegmentSet = supported_segments;
+            .set_SegmentId0(placement.preferred_segment);
+        info.__bindgen_anon_2.SupportedReadSegmentSet = placement.supported_segments;
         info.__bindgen_anon_3.MaximumRenamingListLength = 0;
         info.__bindgen_anon_3.PhysicalAdapterIndex = 0;
         info.__bindgen_anon_4
@@ -2649,8 +3642,7 @@ unsafe fn create_one(
         // address delivered in SetVidPnSourceAddress. Tell VidMm that exact
         // access model so it allocates the primary contiguously in a
         // GPU-addressable segment rather than at a non-identifiable implicit
-        // system-memory address. `is_primary` comes only from Windows'
-        // pPrimaryDesc/standard-allocation contract preserved in private data.
+        // system-memory address.
         if placement.accessed_physically {
             info.__bindgen_anon_4
                 .FlagsWddm2
@@ -2658,19 +3650,31 @@ unsafe fn create_one(
                 .__bindgen_anon_1
                 .set_AccessedPhysically(1);
         }
+        // ⚠ FIRST-TIME FIELD WRITE, and reported as such: `grep -rn
+        // ExplicitResidencyNotification kmd_render/src/` was empty before this
+        // change. §10.7:2002-2003 requires it on every HVM1 role and
+        // §18.1:4751-4753 gates it. It is set only where the doc requires it —
+        // `vidmm_placement` leaves it false — so the proven D3D11 surface is
+        // byte-identical and the new bit rides only on the HVM1 path, which
+        // `admit_hvm1`'s segment check now makes unreachable BY REFUSAL (not
+        // merely by dxgkrnl declining it downstream) for as long as the reported
+        // table lacks the role's preferred segment. The A/B disable is
+        // `hvm1_placement`'s `explicit_residency_notification` field
+        // (CLAUDE.md rule 8: the opposite value stays reachable).
+        if placement.explicit_residency_notification {
+            info.__bindgen_anon_4
+                .FlagsWddm2
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                .set_ExplicitResidencyNotification(1);
+        }
         // WB-cacheable CPU views: without `Cached`, dxgkrnl maps user views of
         // these allocations write-combined; WC READS of the BAR window measured
         // ~200 MB/s (36 ms per 7.8 MiB IDD readback frame, 2026-07-06). The BAR
         // is RAM-backed host shmem — cache-coherent on x86 for every agent on
-        // the same physical pages, and the host reports the venus blobs
-        // CACHED (blob_map honors the same hint for kernel maps). Service-key
+        // the same physical pages, and the host reports the venus blobs CACHED
+        // (blob_map honors the same hint for kernel maps). Service-key
         // `AllocCached=0` is the kill switch (read at StartDevice).
-        // Omit `Cached` on the scan-out primary: dxgkrnl rejects Cached-with-Primary
-        // (AzureTriage; 36th-session primary-creation failure → no VidPn path). The
-        // primary is host-scanned-out, not CPU-read-hot, so write-combined is fine.
-        if is_primary {
-            crate::diag::record(0x0C3E_0000 | (resource_id & 0xFFFF));
-        }
         if adapter.alloc_cached() && placement.cached {
             info.__bindgen_anon_4
                 .FlagsWddm2
@@ -2678,14 +3682,36 @@ unsafe fn create_one(
                 .__bindgen_anon_1
                 .set_Cached(1);
         }
+        // ⚠ TWO MORE FIRST-TIME FIELD WRITES, into a union member this driver
+        // has never touched: `grep -rn Flags2 kmd_render/src/` was empty.
+        // §10.7:2005-2007 requires both on every HVM1 role; §18.1:4752-4753
+        // gates them. `Flags2` is a WDDM-3.2 field and
+        // `ddi/wddm_surface.rs` still declares `Wddm2_1GpuMmu`, so these bits
+        // are INERT until the single activation commit that flips the surface
+        // (`docs/retirement/OWNERSHIP.md` §3 makes that the last edit of the
+        // whole retirement). That is correct, not a bug to "fix" — do not
+        // conclude from an unchanged `PgUn`/residency trace that the writes are
+        // not happening.
+        if placement.disable_partial_residency {
+            info.Flags2
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                .set_DisablePartialResidency(1);
+        }
+        if placement.restricted_to_single_segment {
+            info.Flags2
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                .set_RestrictedToSingleSegment(1);
+        }
     }
     // Allocation creation is not a scanout-selection event. Modern DWM creates
     // and rotates multiple ManagedPrimary allocations; only
     // SetVidPnSourceAddress identifies the one Windows selected for this flip.
-    crate::diag::record(0x0C12_0000 | ((size >> 12).min(0xFFFF) as u32));
+    crate::diag::record(0x0C12_0000 | ((admitted.vidmm_size >> 12).min(0xFFFF) as u32));
     crate::diag::record(
         0x0C13_0000
-            | (((info.__bindgen_anon_1.Alignment as u32 >> 12) & 0xFF) << 8)
+            | (((unsafe { info.__bindgen_anon_1.Alignment } as u32 >> 12) & 0xFF) << 8)
             | (info.PitchAlignedSize.min(0xFF) as u32),
     );
     crate::diag::record(
@@ -2698,10 +3724,12 @@ unsafe fn create_one(
             | ((info.EvictionSegmentSet & 0xFF) << 8)
             | (unsafe { info.__bindgen_anon_4.FlagsWddm2.__bindgen_anon_1.Value } & 0xFF),
     );
+    crate::diag::record(0x0C1A_0000 | (unsafe { info.Flags2.__bindgen_anon_1.Value } & 0xFFFF));
     crate::diag::record(0x0C19_0000 | ((info.AllocationPriority >> 16) & 0xFFFF));
-    crate::diag::record(0x0C16_0000 | (meta.width.min(0xFFFF) as u32));
-    crate::diag::record(0x0C17_0000 | (meta.height.min(0xFFFF) as u32));
-    crate::diag::record(0x0C18_0000 | (meta.format & 0xFFFF));
+    crate::diag::record(0x0C16_0000 | (admitted.width.min(0xFFFF)));
+    crate::diag::record(0x0C17_0000 | (admitted.height.min(0xFFFF)));
+    crate::diag::record(0x0C18_0000 | (admitted.d3d_ddi_format & 0xFFFF));
+    bump(&CREATE_ADMITTED, b"AcOk");
     Ok(())
 }
 
@@ -2781,22 +3809,26 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
         crate::diag::record_named_bytes(b"CAROutHi", (output_resource >> 32) as u32);
     }
 
+    // The OUTER call's shape, captured once and passed to every allocation.
+    // `hResource` is read BEFORE the mint above could have replaced it — hence
+    // `input_resource`, not `args.hResource`: HVM1/HOC1 require "no runtime
+    // resource handle", and a handle this DDI minted itself is not one the
+    // caller supplied. Reading the post-mint value would make the check answer
+    // the wrong question.
+    let shape = CreateCallShape {
+        flags: create_flags,
+        has_resource_handle: input_resource != 0,
+        num_allocations: args.NumAllocations,
+        resource_private_size: args.PrivateDriverDataSize,
+    };
+
     for i in 0..args.NumAllocations as usize {
         // SAFETY: pAllocationInfo points to NumAllocations elements.
         let info = unsafe { &mut *args.pAllocationInfo.add(i) };
         if sample_create {
             crate::diag::record_named_bytes(b"CARAPSz", info.PrivateDriverDataSize);
         }
-        if let Err(status) = unsafe {
-            create_one(
-                passive,
-                adapter,
-                args.pPrivateDriverData,
-                args.PrivateDriverDataSize,
-                info,
-                wants_resource,
-            )
-        } {
+        if let Err(status) = unsafe { create_one(passive, adapter, info, shape) } {
             // Unwind the allocations already created in this call, then the
             // ResourceContext this call minted — leaving it published over a
             // failed create handed dxgkrnl a handle to pool nothing would ever
@@ -2817,6 +3849,14 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
         }
     }
 
+    // The PASSIVE dump site for the counters that must not mirror from their own
+    // (success-path) sites — today just `OaNoRid`. `DxgkDdiCreateAllocation` is
+    // documented PASSIVE_LEVEL, which `passive` above already asserts, and the
+    // block's own throttle bounds this to one mirror per 64 creates. Placed on
+    // the success tail only: a failed create returns early above, and the values
+    // are cumulative atomics, so skipping it there costs mirror latency and never
+    // a wrong number.
+    dump_alloc_counters();
     STATUS_SUCCESS
 }
 
@@ -2868,25 +3908,22 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
 
 // ── Allocation lifetime DDIs. ───────────────────────────────────────────────
 
-/// Free AND NULL every `hDeviceSpecificAllocation` published by entries
-/// `0..upto` of this OpenAllocation call.
-///
-/// Freeing and nulling together is what makes this safe under either dxgkrnl
-/// convention (whether or not it calls CloseAllocation for a failed open): a
-/// nulled slot cannot be double-freed, and a freed-but-published pointer cannot
-/// be dereferenced. It is the exact behaviour the liveness-refusal arm already
-/// had by hand; the transport-error arm had none at all (k-alloc-09).
-///
-/// # Safety
-/// `args.pOpenAllocation` must hold at least `upto` entries this call published.
-unsafe fn unwind_opens(args: &mut DXGKARG_OPENALLOCATION, upto: usize) {
-    for j in 0..upto {
-        // SAFETY: j < upto <= NumAllocations, checked by the caller.
-        let prev = unsafe { &mut *args.pOpenAllocation.add(j) };
-        drop(unsafe { take_open_ctx(prev.hDeviceSpecificAllocation) });
-        prev.hDeviceSpecificAllocation = core::ptr::null_mut();
-    }
-}
+// ⛔ `unwind_opens` was here, and it is DELETED rather than kept for a future
+// caller.
+//
+// It freed and nulled every `hDeviceSpecificAllocation` published by entries
+// `0..i` when an open refused partway through the loop (k-alloc-09). There is no
+// longer a refusal to unwind: the only two were C1's `resource_is_live` liveness
+// gate and its transport-error sibling, and both died with the UMD-supplied
+// resid they were gating on (see the DDI's own comment below). Every remaining
+// step of the loop is infallible, so `DxgkDdiOpenAllocation` cannot return
+// anything but `STATUS_SUCCESS` once it starts publishing handles.
+//
+// Keeping it as dead code would be assurance that is not real — an unwind path
+// no failure can reach is untested by construction. If K6 reintroduces a refusal
+// here (the allocation-generation check §18.1:4723-4726 puts in Render/Patch is
+// the candidate), it must reintroduce the unwind WITH it, in the same commit, so
+// the two are written and reviewed together.
 
 /// `DxgkDdiOpenAllocation` — bind a device to allocations. dxgkrnl calls this for
 /// EVERY allocation (including ones the same device just created via
@@ -2894,6 +3931,34 @@ unsafe fn unwind_opens(args: &mut DXGKARG_OPENALLOCATION, upto: usize) {
 /// `D3DKMTCreateAllocation` fails with the open status. For each open-info entry
 /// return a miniport-owned, device-specific tracking handle as required by the
 /// DDI contract.
+///
+/// # ⛔ THIS DDI WRITES NO BYTE OF ANY PRIVATE BUFFER
+///
+/// That is the whole point of the retirement's identity model (§10.3:1033-1034,
+/// §18.1:4769, A.2 row 5694). Two `write_open_identity` restamps used to live
+/// here — one per entry, one call-level — and their existence is exactly why two
+/// openers of one allocation could disagree about what they had. There is no
+/// arm below that takes a `*mut` to `pPrivateDriverData`, and there must never
+/// be one: the create-time descriptor is `const` from the instant
+/// `DxgkDdiCreateAllocation` returns.
+///
+/// The thing the restamps were FOR — giving a UMD opener of a KMD-created
+/// standard allocation something to alias the venus resource with — is not
+/// solved by writing a different record here. It is solved structurally: HWA2 is
+/// written once at create and dxgkrnl carries the identical bytes to
+/// `OpenResource`.
+///
+/// # ⚠ And the identity it cannot rebuild: the A3 gap
+///
+/// See the module doc. HWA2 carries no host resource id, and
+/// `DXGK_OPENALLOCATIONINFO::hAllocation` is dxgkrnl's runtime `D3DKMT_HANDLE`,
+/// not this driver's `AllocationContext*`, so there is nothing here to resolve
+/// one *from* — and §3:373-379 forbids adding an adapter-global table to bridge
+/// it. So this DDI publishes a device-specific handle whose
+/// [`PresentAllocInfo`] is `None`, counts `OaNoRid`, and lets the Present path
+/// refuse at its own gates. It does NOT fabricate a zero resid into a
+/// present-looking record; a `PresentAllocInfo { resource_id: 0, .. }` would be
+/// acted on by `ddi/display.rs` and is the one outcome worse than refusing.
 pub unsafe extern "C" fn dxgkddi_open_allocation(
     h_device: IN_CONST_HANDLE,
     open_allocation: IN_CONST_PDXGKARG_OPENALLOCATION,
@@ -2908,7 +3973,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
     // This site used to dereference the back-pointer in ONE expression with no
     // null check at all, unlike its two siblings in scheduler.rs and
     // submit_command.rs. The checked traversal is now the only route.
-    let Some(adapter) =
+    let Some(_adapter) =
         (unsafe { crate::device::DeviceHandleRef::from_raw(h_device) }).and_then(|d| d.adapter())
     else {
         return STATUS_INVALID_PARAMETER;
@@ -2917,6 +3982,10 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
     // `NumAllocations` entries whose `hDeviceSpecificAllocation` we fill.
     // The struct has output fields (`Pitch`, `SubresourceOffset`) despite the WDK
     // typedef being exposed through a const pointer in our bindings.
+    //
+    // ⚠ The `*mut` is for `hDeviceSpecificAllocation`, `SubresourceOffset` and
+    // `Pitch` — the OUT fields the DDI defines — and for NOTHING else. In
+    // particular it is not a licence to write `pPrivateDriverData`.
     let args = unsafe { &mut *(open_allocation as *mut DXGKARG_OPENALLOCATION) };
     if args.NumAllocations != 0 && args.pOpenAllocation.is_null() {
         return STATUS_INVALID_PARAMETER;
@@ -2933,111 +4002,69 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
             crate::diag::record_named_bytes(b"OaMulti", n);
         }
     }
-    let mut subresource_meta = None;
-    let mut subresource_ident = None;
+    let mut subresource_desc: Option<HeliosWddmAllocationDescV2> = None;
     for i in 0..args.NumAllocations as usize {
         let info = unsafe { &mut *args.pOpenAllocation.add(i) };
         crate::diag::record(0x0C21_0000 | ((info.PrivateDriverDataSize as u32).min(0xFFFF)));
         crate::diag::record(0x0C35_0000 | ((info.hAllocation as usize as u32) & 0xFFFF));
 
-        // Capture the backing venus identity + geometry from the open-time
-        // private data (the create-time `HeliosWddmAllocPrivate` write-back or a
-        // previous open's `HeliosWddmOpenIdentity`, plus the meta trailer).
-        // Present only hands us `hDeviceSpecificAllocation`, so this is where
-        // the source/destination surfaces become resolvable for the composition
-        // blit.
-        let meta = unsafe {
-            read_standard_meta(info.pPrivateDriverData, info.PrivateDriverDataSize)
-                .or_else(|| read_standard_meta(args.pPrivateDriverData, args.PrivateDriverSize))
-        };
-        let ident = unsafe {
-            read_alloc_identity(info.pPrivateDriverData, info.PrivateDriverDataSize)
-                .or_else(|| read_alloc_identity(args.pPrivateDriverData, args.PrivateDriverSize))
-        };
-        let resource_id = ident.map(|d| d.resource_id).unwrap_or(0);
+        // Read-only, and only from the PER-ALLOCATION buffer. The resource-level
+        // fallback the pre-retirement path had is gone for the same reason the
+        // create-time one is: §10.3 associates one descriptor with one
+        // allocation, so reading the resource-level copy would be reading a
+        // different allocation's identity.
+        let desc =
+            unsafe { read_open_descriptor(info.pPrivateDriverData, info.PrivateDriverDataSize) };
 
-        // C1 liveness gate: an identified allocation whose venus resource is no
-        // longer alive must FAIL the open loudly. Succeeding here is what used
-        // to hand consumers a dead resid — the opener's venus import then
-        // poisoned its whole ring (host `invalid res_id` → CS error → fatal
-        // decoder state; dwm abort, boot #3 2026-07-03) or, with the UMD's old
-        // fallback, silently rendered a black substitute texture forever.
-        if resource_id != 0 {
-            match adapter.with_virtio(|v| v.resource_is_live(resource_id)) {
-                Ok(true) => {}
-                Ok(false) => {
-                    crate::diag::record(0x0C02_00E4);
-                    crate::diag::record(0x0C3E_0000 | (resource_id & 0xFFFF));
-                    record_alloc_event(resource_id, 0xDEAD, 0xDEAD, 0, true);
-                    unsafe { unwind_opens(args, i) };
-                    return STATUS_INVALID_PARAMETER;
-                }
-                Err(_de) => {
-                    crate::diag::record(0x0C02_00E5);
-                    // Was a bare return: a transport error mid-OpenAllocation
-                    // leaked every OpenAllocationContext already published in
-                    // this call. Both failure arms unwind identically now.
-                    unsafe { unwind_opens(args, i) };
-                    return STATUS_DEVICE_NOT_READY;
-                }
-            }
+        // ⛔ C1's liveness gate is GONE with the resid it gated on.
+        //
+        // It refused an open whose venus resource was no longer alive, and it
+        // was a trust boundary because the resid came from the UMD. Under HWA2
+        // the KMD owns every resid it hands out and no descriptor names one, so
+        // the check has nothing to check: `resource_is_live(0)` is not a weaker
+        // form of the gate, it is a different question. K6 re-establishes the
+        // property where it now belongs — Render/Patch resolving the exact
+        // patched WDDM capability against the live allocation generation
+        // (§18.1:4723-4726).
+
+        // ⚠ A3: no `PresentAllocInfo` is constructible here. See the DDI doc.
+        // The trace-only companion IS built, because every field it carries
+        // comes from the descriptor and none of them is an identity.
+        //
+        // A PLAIN `fetch_add`: this is the SUCCESS path of every open, so `bump`
+        // would put a synchronous `RtlWriteRegistryValue` on DWM's open path at a
+        // period the workload chooses. The atomic is mirrored from
+        // [`ALLOC_COUNTERS`] on the create DDI's PASSIVE cadence instead.
+        if desc.is_some() {
+            OPEN_NO_RESOURCE_ID.fetch_add(1, Ordering::Relaxed);
         }
-
         let open_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
-        let present = ident.map(|identity| {
-            let misc_flags = meta.map(|m| m.misc_flags).unwrap_or(0);
-            let storage = if identity.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD {
-                if misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0 {
-                    PresentAllocationStorage::OptimalCrossContextImage
-                } else {
-                    PresentAllocationStorage::PitchedStandardBuffer
-                }
-            } else if misc_flags & HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT != 0 {
-                PresentAllocationStorage::OptimalCrossContextImage
-            } else {
-                PresentAllocationStorage::OptimalOpaqueFdImage
-            };
-            PresentAllocInfo {
-                resource_id,
-                kind: identity.kind,
-                width: meta.map(|m| m.width).unwrap_or(0),
-                height: meta.map(|m| m.height).unwrap_or(0),
-                pitch: meta.map(|m| m.pitch).unwrap_or(0),
-                plane_offset: meta.map(|m| m.plane_offset).unwrap_or(0),
-                format: meta.map(|m| m.format).unwrap_or(0),
-                dxgi_format: meta.map(|m| m.dxgi_format).unwrap_or(0),
-                bind_flags: meta.map(|m| m.bind_flags).unwrap_or(0),
-                storage,
-                venus_alloc_size: identity.venus_alloc_size,
-                memory_type_index: identity.memory_type_index,
-                direct_scanout: misc_flags & HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT != 0,
-            }
-        });
-        // Trace-only companion (R316): these seven values have no consumer
-        // outside the Present identity dump.
-        let present_diag = ident.map(|_| {
-            let misc_flags = meta.map(|m| m.misc_flags).unwrap_or(0);
-            PresentAllocDiag {
-                runtime_allocation: info.hAllocation,
-                standard_allocation_type: (misc_flags & HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK)
-                    >> HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT,
-                standard_gdi_surface_type: (misc_flags & HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK)
-                    >> HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT,
-                open_flags,
-                resource_associated: misc_flags & HELIOS_WDDM_ALLOC_MISC_RESOURCE_ASSOCIATED != 0,
-                allocation_private_size: info.PrivateDriverDataSize,
-                resource_private_size: args.PrivateDriverSize,
-            }
+        let present_diag = desc.map(|desc| PresentAllocDiag {
+            runtime_allocation: info.hAllocation,
+            // §10.3 offset 84 carries the exact OS enum when `STANDARD` is set
+            // and zero otherwise, which is precisely this field's contract.
+            standard_allocation_type: desc.standard_allocation_type,
+            // ⛔ NOT CARRIED BY HWA2. The retired trailer packed
+            // `D3DKMDT_GDISURFACETYPE` into its misc word; §10.3's misc
+            // vocabulary has four bits and none of them is it. The honest
+            // successor is the swizzle class — a GDI texture is the OPAQUE
+            // OPTIMAL one — but that is a different value with a different
+            // meaning, so this trace field reports 0 rather than a lookalike.
+            standard_gdi_surface_type: 0,
+            open_flags,
+            resource_associated: desc.has_flag(HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED),
+            allocation_private_size: info.PrivateDriverDataSize,
+            resource_private_size: args.PrivateDriverSize,
         });
         let open = Box::new(OpenAllocationContext {
             magic: OPEN_ALLOCATION_CTX_MAGIC,
-            present,
+            present: None,
             present_diag,
         });
         record_alloc_event(
-            resource_id,
-            meta.map(|m| m.width).unwrap_or(0),
-            meta.map(|m| m.height).unwrap_or(0),
+            0,
+            desc.map_or(0, |d| d.width),
+            desc.map_or(0, |d| d.height),
             0,
             true,
         );
@@ -3045,66 +4072,77 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         crate::diag::record(
             0x0C36_0000 | ((info.hDeviceSpecificAllocation as usize as u32) & 0xFFFF),
         );
-        crate::diag::record(0x0C3C_0000 | (resource_id & 0xFFFF));
-
-        // Write the versioned C1 identity record into the open-time private-data
-        // buffers (replaces the adopt-id smuggling). For KMD-created standard
-        // allocations (indirect-swapchain backbuffers, GDI redirection textures)
-        // the runtime's UMD-visible RESOURCE-level copy is the pristine
-        // GetStandardAllocationDriverData output, so the UMD's pfnOpenResource
-        // could not alias the venus resource without this. This is the only
-        // KMD-side point where the open-path buffers are reachable, and the
-        // record is only written for a validated-live resource (gate above).
-        if let Some(ident) = ident {
-            // Per-allocation buffer here; the RESOURCE-level copy is written
-            // once after the loop, from the designated entry only (M4) — it is
-            // one buffer shared by every entry in the call, so writing it per
-            // iteration meant the last entry silently won.
-            unsafe {
-                write_open_identity(
-                    info.pPrivateDriverData as *mut c_void,
-                    info.PrivateDriverDataSize,
-                    &ident,
-                );
-            }
-        }
 
         // `Pitch` and `SubresourceOffset` are CALL-level OUT fields, not
         // per-entry ones; writing them inside the loop meant the last entry won
         // silently. They are computed once after the loop, from the entry
         // args.SubresourceIndex designates (M4/k-alloc-12).
         if i == subresource_entry {
-            subresource_meta = meta;
-            subresource_ident = ident;
+            subresource_desc = desc;
         }
     }
 
-    // The resource-level identity buffer is call-level, like Pitch: written once,
-    // from the designated entry. Load-bearing for KMD-created standard
-    // allocations, whose UMD-visible resource-level copy is otherwise the
-    // pristine GetStandardAllocationDriverData output — without this the UMD's
-    // pfnOpenResource cannot alias the venus resource.
-    if let Some(ident) = subresource_ident {
-        unsafe {
-            write_open_identity(
-                args.pPrivateDriverData as *mut c_void,
-                args.PrivateDriverSize,
-                &ident,
-            );
-        }
-    }
-
-    if let Some(meta) = subresource_meta {
+    if let Some(desc) = subresource_desc {
         args.SubresourceOffset = 0;
-        // R1007: one resolver. `None` -- a tiled surface with no linear row
-        // layout -- reports 0 to the runtime, which is what OpenAllocation has
-        // always done and is the documented "no pitch" answer for a GDI
-        // texture.
-        args.Pitch =
-            RowPitch::resolve(meta.misc_flags, meta.pitch, meta.width).map_or(0, RowPitch::get);
+        // R1007's one resolver, restated over the descriptor that now owns the
+        // layout. A tiled surface has no linear row layout and reports 0, which
+        // is what OpenAllocation has always done and is the documented "no
+        // pitch" answer for a GDI texture. `plane_count >= 1` is guaranteed for
+        // an image kind by `validate`, and a non-image kind has `plane_count ==
+        // 0` and therefore an all-zero plane record — so both arms are total
+        // without an index that could be out of range.
+        args.Pitch = RowPitch::resolve(
+            desc.swizzle_class != HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL,
+            desc.planes[0].row_pitch,
+            desc.width,
+        )
+        .map_or(0, RowPitch::get);
         crate::diag::record(0x0C38_0000 | (args.Pitch.min(0xFFFF) as u32));
     }
     STATUS_SUCCESS
+}
+
+/// Parse and validate an allocation's create-time HWA2 descriptor at open time.
+///
+/// `None` for a buffer that is absent, the wrong length, or fails
+/// `validate_create_output` — §10.3:1079-1080 makes a malformed descriptor fail
+/// the OPEN as well as the create, and the open is not a place to be lenient
+/// because the receiving UMD reads the identical bytes.
+///
+/// ⚠ It answers `None` rather than an error because `DxgkDdiOpenAllocation` is
+/// called for every allocation including HVM1 and HOC1 ones, whose private data
+/// is a different 64-byte record and legitimately is not an HWA2. Refusing the
+/// whole open there would fail every native-Vulkan and D3D12 allocation.
+/// `OaHwa2Rej` counts only the buffers that were HWA2-shaped and still failed.
+///
+/// # Safety
+/// `private` is dxgkrnl's per-allocation private buffer and `private_size` its
+/// authoritative length. NOTHING here writes through the pointer.
+unsafe fn read_open_descriptor(
+    private: *const c_void,
+    private_size: UINT,
+) -> Option<HeliosWddmAllocationDescV2> {
+    if private.is_null() || private_size as usize != HELIOS_HWA2_BYTES as usize {
+        return None;
+    }
+    // SAFETY: non-null and the length is exactly the record size, checked above.
+    let bytes =
+        unsafe { core::slice::from_raw_parts(private as *const u8, HELIOS_HWA2_BYTES as usize) };
+    let desc = HeliosWddmAllocationDescV2::from_private_data(bytes).ok()?;
+    if desc.magic != HELIOS_HWA2_MAGIC {
+        // Not an HWA2 record that merely happens to be 168 bytes long. Not
+        // counted: it is not a rejected HWA2, it is a different record.
+        return None;
+    }
+    if desc
+        .validate_create_output(HELIOS_PACKAGE_GENERATION)
+        .is_err()
+    {
+        bump(&OPEN_HWA2_REJECT, b"OaHwa2Rej");
+        crate::diag::record(0x0C02_00E6);
+        return None;
+    }
+    Some(desc)
 }
 
 /// `DxgkDdiCloseAllocation` — release device-local allocation references.
@@ -3191,9 +4229,21 @@ pub unsafe extern "C" fn dxgkddi_describe_allocation(
 ///   2. **Fill** — buffers provided: write the private data the runtime then hands
 ///      to `DxgkDdiCreateAllocation`, and fill the surface `Pitch` out-fields.
 ///
-/// We fill a [`HeliosWddmAllocPrivate`] (`kind = STANDARD`, `blob_id = 0` so the
-/// host allocates a HOST3D mappable blob, `ctx_id` = the KMD's internal venus
-/// context) plus a [`HeliosWddmAllocMeta`] geometry trailer.
+/// # This DDI is the create-INPUT author for every OS standard allocation
+///
+/// It writes ONE [`HeliosWddmAllocationDescV2`] — 168 bytes, not the retired
+/// 48+48 pair — with `allocation_generation == 0`, and
+/// `DxgkDdiCreateAllocation` hands the identical buffer back with the generation
+/// and the KMD-owned flags stamped in. So the two halves of this file are the
+/// two stages of one record, and the self-check before the write below is what
+/// keeps them from drifting: if this DDI ever authors something
+/// `validate_create_input` refuses, `StdSelf` moves and the surface fails HERE
+/// rather than at an unexplained create.
+///
+/// ⚠ H16 in the obligation checklist is INFERRED, not stated: §10.3 defines the
+/// `STANDARD` flag (`:1060`), the standard kinds (`:1059`) and the offset-84
+/// rule (`:1064`) but never names this DDI. The reading below is the only one
+/// consistent with all three.
 pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
     h_adapter: IN_CONST_HANDLE,
     standard_allocation: INOUT_PDXGKARG_GETSTANDARDALLOCATIONDRIVERDATA,
@@ -3202,14 +4252,17 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         return STATUS_INVALID_PARAMETER;
     }
     // SAFETY: dxgkrnl hands back our AdapterContext and a writable args struct.
-    let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     let args = unsafe { &mut *standard_allocation };
     let standard_allocation_type = args.StandardAllocationType as u32;
     crate::diag::record_named_bytes(b"StdType", standard_allocation_type);
     crate::diag::record(0x0C02_0002 | ((args.StandardAllocationType as u32 & 0xFF) << 4));
 
-    const PRIV_SIZE: u32 =
-        (size_of::<HeliosWddmAllocPrivate>() + size_of::<HeliosWddmAllocMeta>()) as u32;
+    // §10.3:1039-1040 — ONE record, exactly `HELIOS_HWA2_BYTES`. The retired
+    // shape was `size_of::<HeliosWddmAllocPrivate>() +
+    // size_of::<HeliosWddmAllocMeta>()` = 96; the runtime allocates whatever is
+    // reported here and `from_private_data` requires exactly it, so this
+    // constant and that check are one contract expressed twice.
+    const PRIV_SIZE: u32 = HELIOS_HWA2_BYTES as u32;
 
     // ── Phase 1: size query (runtime passes a null allocation buffer) ────────
     if args.pAllocationPrivateDriverData.is_null() {
@@ -3237,10 +4290,18 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
     // guarantees the matching surface-data pointer is valid for the fill call.
     let is_primary = args.StandardAllocationType == D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE;
     let mut is_optimal_gdi_texture = false;
-    let mut gdi_surface_type = 0u32;
+    // The exact create-time `VidPnSourceId` (§10.3 offset 80). Only the
+    // shared-primary arm has one; every other standard allocation is a
+    // non-primary and carries the sentinel, which is what `validate` requires of
+    // one. ⭐ `D3DKMDT_SHAREDPRIMARYSURFACEDATA` really does carry the field
+    // (`tmp/dxgk_bindings.rs`, the struct's fifth member) — without it a
+    // KMD-authored primary could not satisfy §10.3:1063's "concrete source for a
+    // conventional D3D11 primary" at all.
+    let mut vidpn_source = D3DDDI_ID_UNINITIALIZED;
     let (width, height, format): (u32, u32, u32) = match args.StandardAllocationType {
         D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE => {
             let sd = unsafe { &*args.__bindgen_anon_1.pCreateSharedPrimarySurfaceData };
+            vidpn_source = sd.VidPnSourceId;
             (sd.Width, sd.Height, sd.Format as u32)
         }
         D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE => {
@@ -3255,23 +4316,15 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         }
         D3DKMDT_STANDARDALLOCATION_GDISURFACE => {
             let sd = unsafe { &mut *args.__bindgen_anon_1.pCreateGdiSurfaceData };
-            gdi_surface_type = sd.Type as u32;
+            let gdi_surface_type = sd.Type as u32;
             crate::diag::record_named_bytes(b"GdiType", gdi_surface_type);
             // D3DKMDT_GDISURFACE_TEXTURE (enum value 1) is explicitly not
             // CPU-visible and has no linear-pitch contract. The CPU-visible
             // staging variants are the only GDI types for which Windows
             // requires the miniport to return a pitch.
             is_optimal_gdi_texture = gdi_surface_type == GDI_SURFACE_TYPE_TEXTURE;
-            sd.Pitch = RowPitch::resolve(
-                if is_optimal_gdi_texture {
-                    HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE
-                } else {
-                    0
-                },
-                0,
-                sd.Width,
-            )
-            .map_or(0, RowPitch::get);
+            sd.Pitch =
+                RowPitch::resolve(!is_optimal_gdi_texture, 0, sd.Width).map_or(0, RowPitch::get);
             (sd.Width, sd.Height, sd.Format as u32)
         }
         _ => {
@@ -3280,127 +4333,198 @@ pub unsafe extern "C" fn dxgkddi_get_standard_allocation_driver_data(
         }
     };
 
-    // THE PRODUCER of `meta.pitch`, and the reason the consumers' fallback arm
-    // is `cross_adapter_pitch(width)` at all: KMD standard allocations are
-    // AUTHORED with exactly that value, so the consumers agree with the
-    // producer by construction rather than by coincidence. `RowPitch::resolve`
-    // is the consumer side of the same rule -- with `pitch: 0` here, it answers
-    // `cross_adapter_pitch(width)` for exactly the surfaces this arm authors
-    // and `None` for the OPTIMAL GDI texture this one reports as 0.
+    // THE PRODUCER of the descriptor's plane pitch, and the reason a consumer's
+    // fallback arm is `cross_adapter_pitch(width)` at all: KMD standard
+    // allocations are AUTHORED with exactly that value, so the consumers agree
+    // with the producer by construction rather than by coincidence.
     //
-    // ⚠ The one arm that breaks the correspondence is not here: the `is_primary`
-    // path in `create_one` overwrites `meta.pitch` with Vulkan's
-    // `scanout.row_pitch`, which is NOT derived from width. That is why the
-    // consumers prefer a non-zero authored pitch over recomputing one.
-    let pitch = RowPitch::resolve(
-        if is_optimal_gdi_texture {
-            HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE
-        } else {
-            0
-        },
-        0,
-        width,
-    )
-    .map_or(0, RowPitch::get);
+    // ⚠ The one arm that breaks the correspondence is not here: the KMD-created
+    // LINEAR scan-out image's real stride is Vulkan's `scanout.row_pitch`, which
+    // is NOT derived from width. `admit_hwa2` therefore prefers the created
+    // backing's pitch over the descriptor's plane record for that arm alone, and
+    // that is the ONLY place the two can differ.
+    //
+    // An OPTIMAL GDI texture has no linear row layout, so `RowPitch::resolve`
+    // answers `None` and the runtime is told 0 — but §10.3 still requires an
+    // image kind to declare one plane with nonzero pitches, so the descriptor's
+    // plane record carries the notional 256-aligned stride instead. The two
+    // answers are deliberately different: the runtime is told "no byte
+    // addressing exists", the descriptor is told "this is how much memory one
+    // slice spans", and the swizzle class is what tells a reader which
+    // interpretation applies.
+    let plane_pitch = RowPitch::linear(0, width).get();
     let size = if is_optimal_gdi_texture {
-        // CreateAllocation replaces this estimate with Vulkan's exact memory
-        // requirement before reporting Size to VidMm.
-        (width as u64)
-            .saturating_mul(height as u64)
-            .saturating_mul(4)
-            .max(PAGE as u64)
+        // An ESTIMATE. Deliberately computed from the notional 256-aligned
+        // stride rather than `width * height * 4`, because §10.3:1050 makes
+        // `byte_size` bound every plane and the plane below spans
+        // `plane_pitch * height`; the older `width*height*4` estimate is smaller
+        // than that whenever the 256 alignment inflates the stride, which would
+        // make the descriptor fail its own plane-range check.
+        //
+        // ⚠ CONSEQUENCE OF THE ECHO RULE, recorded because it is a real change:
+        // `DxgkDdiCreateAllocation` used to REPLACE this estimate with Vulkan's
+        // exact memory requirement before reporting Size to VidMm. It may not
+        // any more — the descriptor is echoed verbatim, and correcting a field
+        // would make it disagree with the resource the creator believes it made
+        // (`K4-CONTRACT.md` §1.1). The estimate therefore survives into the
+        // published descriptor; the create path validates that the real backing
+        // is at least this large (refusing otherwise, `AcSize`), charges VidMm
+        // the larger of the two, and keeps the exact host size on the KMD
+        // allocation object where §10.3:355-361 says host detail belongs.
+        round_up_page(
+            (plane_pitch as u64)
+                .saturating_mul(height as u64)
+                .max(PAGE as u64),
+        )
     } else {
-        linear_blob_size(pitch as u64, height as u64)
+        linear_blob_size(plane_pitch as u64, height as u64)
     };
+    // The plane's extent. `slice_pitch` is a `u32` by §10.3's plane record, so a
+    // surface whose slice does not fit one must be refused rather than
+    // truncated: a truncated slice pitch would under-state the plane and the
+    // descriptor's own bound check would then pass on a lie.
+    let slice_pitch = (plane_pitch as u64).saturating_mul(height as u64);
+    if slice_pitch == 0 || slice_pitch > u32::MAX as u64 || slice_pitch > size {
+        bump(&STANDARD_SELF_REJECT, b"StdSelf");
+        return STATUS_NOT_SUPPORTED;
+    }
 
-    let map_cache = if is_primary {
-        VIRTIO_GPU_MAP_CACHE_WC
-    } else {
-        VIRTIO_GPU_MAP_CACHE_CACHED
-    };
-    let ap = HeliosWddmAllocPrivate::new(
-        HELIOS_WDDM_ALLOC_KIND_STANDARD,
-        adapter.venus_ctx_id(),
-        0, // blob_id 0 → host-allocated HOST3D mappable blob (no UMD venus memory)
-        size,
-        VIRTIO_GPU_BLOB_MEM_HOST3D,
-        VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
-        map_cache,
-        // Nothing to adopt: the KMD creates this resource itself. R805 made
-        // this an explicit parameter rather than a field the constructor
-        // zeroed and a later assignment could overwrite.
-        0,
-    );
-    let meta = HeliosWddmAllocMeta {
-        width,
-        height,
-        format,
-        pitch,
-        // D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET. Keep standard
-        // cross-adapter surfaces usable by the UMD when another process opens
-        // them through the shared-resource path.
-        bind_flags: 0x0000_0008 | 0x0000_0020,
-        // Flag a shared-primary surface so create_one omits the illegal
-        // `Cached`-with-Primary flag on the scanout primary.
-        misc_flags: ((standard_allocation_type << HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_SHIFT)
-            & HELIOS_WDDM_ALLOC_MISC_STANDARD_TYPE_MASK)
-            | ((gdi_surface_type << HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_SHIFT)
-                & HELIOS_WDDM_ALLOC_MISC_GDI_TYPE_MASK)
-            | if is_primary {
-                HELIOS_WDDM_ALLOC_MISC_PRIMARY
-            } else if is_optimal_gdi_texture {
-                HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE
-            } else {
-                0
-            },
-        // Filled by DxgkDdiCreateAllocation's write-back once the kernel venus
-        // client has actually allocated the backing memory.
-        venus_alloc_size: 0,
-        memory_type_index: 0,
+    // §10.3:1055 — an image kind must carry an EXACT `DXGI_FORMAT`, and
+    // `validate` refuses `UNKNOWN` outright. The retired trailer wrote 0 here
+    // for a format with no DXGI peer and let the opener fall back to BGRA; that
+    // is no longer expressible, so refuse rather than guess. See
+    // `STANDARD_FORMAT_REFUSED` for why this is a deliberate behaviour change.
+    let dxgi_format = if is_primary {
         // The display primary must scan out as XR24/XRGB (see
-        // `scanout_dxgi_for_primary`). Non-primary standard allocations keep the
-        // legacy zero hint so UMD openers use the existing BGRA fallback, which
-        // is why an unmapped format is 0 rather than a refusal here.
-        dxgi_format: if is_primary {
-            scanout_dxgi_for_primary().as_u32()
-        } else {
-            match d3dddi_to_dxgi(format) {
-                // A8B8G8R8 has no scan-out meaning for a standard allocation and
-                // kept the zero hint before this change; preserve that exactly.
-                Some(DxgiFormat::R8G8B8A8Unorm) | None => 0,
-                Some(fmt) => fmt.as_u32(),
+        // `scanout_dxgi_for_primary`): the Linux virtio primary plane advertises
+        // XRGB only, and the matching CachyOS dma-buf probe reached egl-headless
+        // only with XR24.
+        scanout_dxgi_for_primary().as_u32()
+    } else {
+        match d3dddi_to_dxgi(format) {
+            Some(fmt) => fmt.as_u32(),
+            None => {
+                bump(&STANDARD_FORMAT_REFUSED, b"StdFmt");
+                return STATUS_NOT_SUPPORTED;
             }
-        },
-        // KMD standard allocations carry no scan-out plane offset.
-        plane_offset: 0,
+        }
     };
 
-    // SAFETY: AllocationPrivateDriverDataSize bytes (>= PRIV_SIZE) are writable.
-    let dst = args.pAllocationPrivateDriverData as *mut u8;
+    let allocation_kind = match args.StandardAllocationType {
+        D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE => HELIOS_HWA2_KIND_STANDARD_PRIMARY,
+        D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE => HELIOS_HWA2_KIND_STANDARD_SHADOW,
+        D3DKMDT_STANDARDALLOCATION_STAGINGSURFACE => HELIOS_HWA2_KIND_STANDARD_STAGING,
+        // §10.3 has no GDI-surface kind: "a `D3DKMDT_STANDARDALLOCATION_GDISURFACE`
+        // is `HELIOS_HWA2_KIND_IMAGE` plus the `STANDARD` bit and the exact OS
+        // enum in `standard_allocation_type`" (`protocol/src/wddm.rs`, the
+        // `helios_hwa2_kind_is_image` doc).
+        _ => HELIOS_HWA2_KIND_IMAGE,
+    };
+    // An OPTIMAL GDI texture is a shared, non-CPU-visible tiled texture; every
+    // other standard allocation is a CPU-rasterizable linear surface.
+    let cpu_visible = !is_optimal_gdi_texture;
+    // ⛔ `SHARED` is deliberately NOT set, even though DWM does open these.
+    // It is not a decoration: `classify_hwa2` maps it onto
+    // `allocate_memory_blob`'s `shareable` argument, which adds
+    // `VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE` and a `MemoryPNext::Export{DMA_BUF}`
+    // to the venus allocation. The pre-retirement classifier reached the
+    // standard-buffer arm only with `primary == false` (a primary classified as
+    // the LINEAR scan-out image first), so NO standard allocation has ever been
+    // created shareable, and the 38th session's two dma-buf regressions —
+    // global modifier-ext enable inflating the IMPORT memory requirement, and
+    // dma_buf advertisement breaking enumerate through the WSI proxy — are
+    // exactly what an unmeasured flip of this bit risks. Flipping it needs a
+    // measurement, not a reading of the flag's name (CLAUDE.md rule 8).
+    let mut flags = HELIOS_HWA2_FLAG_STANDARD;
+    if cpu_visible {
+        flags |= HELIOS_HWA2_FLAG_CPU_VISIBLE;
+    }
+    if is_primary {
+        flags |= HELIOS_HWA2_FLAG_PRIMARY | HELIOS_HWA2_FLAG_DISPLAYABLE;
+    }
+    // ⛔ `DIRECT_FLIP_COMPATIBLE` and `D3D12_RUNTIME_PRIMARY` are NOT set here.
+    // §10.3:1071-1076 makes both KMD-owned *create-time* decisions and
+    // `K4-CONTRACT.md` §1.1 requires them zero on the input side;
+    // `admit_hwa2` stamps them. Setting one here would be this DDI answering a
+    // question the create path is the authority for.
+
+    let mut desc = HeliosWddmAllocationDescV2::header(HELIOS_PACKAGE_GENERATION, 0);
+    desc.byte_size = size;
+    desc.width = width;
+    desc.height = height;
+    // One 2D surface, one mip, one sample: the exact shape every standard
+    // allocation has, stated rather than defaulted because `validate` requires
+    // each of them nonzero for an image kind.
+    desc.depth_or_array_size = 1;
+    desc.mip_levels = 1;
+    desc.sample_count = 1;
+    desc.sample_quality = 0;
+    desc.dxgi_format = dxgi_format;
+    desc.d3d_ddi_format = format;
+    desc.allocation_kind = allocation_kind;
+    desc.flags = flags;
+    // D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET, in the SHARED
+    // PROTOCOL VOCABULARY — never the raw DDI word. Keeps standard cross-adapter
+    // surfaces usable by the UMD when another process opens them.
+    desc.bind_flags = HELIOS_HWA2_BIND_SHADER_RESOURCE | HELIOS_HWA2_BIND_RENDER_TARGET;
+    desc.misc_flags = if args.StandardAllocationType == D3DKMDT_STANDARDALLOCATION_GDISURFACE {
+        HELIOS_HWA2_MISC_GDI_COMPATIBLE
+    } else {
+        0
+    };
+    desc.vidpn_source = vidpn_source;
+    desc.standard_allocation_type = standard_allocation_type;
+    desc.swizzle_class = if is_optimal_gdi_texture {
+        HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL
+    } else {
+        HELIOS_HWA2_SWIZZLE_LINEAR
+    };
+    desc.memory_class = if cpu_visible {
+        HELIOS_HWA2_MEMORY_CPU_VISIBLE
+    } else {
+        HELIOS_HWA2_MEMORY_DEVICE_LOCAL
+    };
+    desc.plane_count = 1;
+    desc.planes[0] = HeliosWddmPlaneRecordV2 {
+        offset: 0,
+        row_pitch: plane_pitch,
+        // Bounded against `byte_size` above, which is why this cast cannot
+        // truncate.
+        slice_pitch: slice_pitch as u32,
+    };
+
+    // The self-check that keeps the two halves of this file honest. A failure is
+    // a driver bug: this DDI would be authoring a record `create_one` will
+    // refuse, and the surface would fail with no line naming why.
+    if desc
+        .validate_create_input(HELIOS_PACKAGE_GENERATION)
+        .is_err()
+    {
+        bump(&STANDARD_SELF_REJECT, b"StdSelf");
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    // SAFETY: AllocationPrivateDriverDataSize bytes (>= PRIV_SIZE) are writable,
+    // checked above, and `bytes_of` yields exactly `PRIV_SIZE` of them.
     unsafe {
         core::ptr::copy_nonoverlapping(
-            &ap as *const _ as *const u8,
-            dst,
-            size_of::<HeliosWddmAllocPrivate>(),
-        );
-        core::ptr::copy_nonoverlapping(
-            &meta as *const _ as *const u8,
-            dst.add(size_of::<HeliosWddmAllocPrivate>()),
-            size_of::<HeliosWddmAllocMeta>(),
+            bytes_of(&desc).as_ptr(),
+            args.pAllocationPrivateDriverData as *mut u8,
+            PRIV_SIZE as usize,
         );
     }
     if !args.pResourcePrivateDriverData.is_null() {
-        let dst = args.pResourcePrivateDriverData as *mut u8;
+        // The resource-level copy is the same bytes. It is NOT a second identity
+        // and nothing reads it as one: `DxgkDdiCreateAllocation` reads only the
+        // per-allocation buffer (§10.3 associates one descriptor with one
+        // allocation), and `DxgkDdiOpenAllocation` writes neither.
+        //
+        // SAFETY: ResourcePrivateDriverDataSize >= PRIV_SIZE, checked above.
         unsafe {
             core::ptr::copy_nonoverlapping(
-                &ap as *const _ as *const u8,
-                dst,
-                size_of::<HeliosWddmAllocPrivate>(),
-            );
-            core::ptr::copy_nonoverlapping(
-                &meta as *const _ as *const u8,
-                dst.add(size_of::<HeliosWddmAllocPrivate>()),
-                size_of::<HeliosWddmAllocMeta>(),
+                bytes_of(&desc).as_ptr(),
+                args.pResourcePrivateDriverData as *mut u8,
+                PRIV_SIZE as usize,
             );
         }
         args.ResourcePrivateDriverDataSize = PRIV_SIZE;

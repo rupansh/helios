@@ -2904,109 +2904,29 @@ unsafe fn submit_wddm_render<T: Copy>(
     WddmSubmit::Submitted
 }
 
-/// Submit one present's identity record on the queue's WDDM context — **UP-9, and
-/// L8's second seam into this file** ([`present_context`] is the first).
-///
-/// ⭐ It exists rather than L8 calling [`submit_wddm_render`] directly for the same
-/// reason [`present_context`] returns a handle: `submit_wddm_render` needs a
-/// `&QueueState`, and handing one across the module boundary would export
-/// [`QueueState::windows`]' guard discipline — the guard that must span write →
-/// `pfnRenderCb` → re-latch — to a file that does not own it.
-///
-/// ⛔ **The caller decides what a failure means, and this function decides
-/// nothing.** It reports the [`WddmSubmit`] verbatim; `report_present_submit_error`
-/// is the channel for the one arm that must reach the runtime.
-///
-/// ⚠ `WddmSubmit::Unavailable` is returned for a queue handle that did not resolve,
-/// which is *not* the same shape as [`submit_wddm_render`]'s other unavailable arms —
-/// but it is the same fact for the caller (no packet went in, nothing to report to the
-/// runtime), so it takes the same variant with its own counter.
-///
-/// # Safety
-/// `h_queue` must be a handle [`create_command_queue`] returned `S_OK` for.
-/// ⛔ The caller must be inside `pfnPresent` on the thread that entered it —
-/// [`submit_wddm_render`]'s obligations 1 and 2, forwarded unchanged.
-pub(crate) unsafe fn submit_present_identity(
-    h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
-    record: &helios_protocol::HeliosPresentRenderCmd,
-) -> WddmSubmit {
-    // SAFETY: forwarded to `queue_state`'s identical precondition; the borrow ends
-    // inside this function.
-    let Some(queue) = (unsafe { queue_state(h_queue) }) else {
-        note_refusal(&L2_REFUSALS.present_submit_no_queue);
-        return WddmSubmit::Unavailable;
-    };
-    // SAFETY: `queue.h_device` is the device handle this queue was created against
-    // and the queue is live, so the device is.
-    let Some(dev) = (unsafe { device12::device(queue.h_device) }) else {
-        // Expected unreachable — a live queue implies a live device — and its own
-        // counter rather than the queue one, because the two would need different
-        // fixes.
-        note_refusal(&L2_REFUSALS.present_submit_no_device);
-        return WddmSubmit::Unavailable;
-    };
-    // SAFETY: `dev` is the live device `queue` was created against, `queue` is live
-    // for this call, and the caller guarantees we are inside `pfnPresent` on the
-    // entering thread — `submit_wddm_render`'s three obligations.
-    let outcome = unsafe { submit_wddm_render(dev, queue, record, "Present identity") };
-    if matches!(outcome, WddmSubmit::Submitted) {
-        // ⭐ Counted HERE and not in L8, because this function is present-scoped by
-        // construction — nothing else calls it — so the counter cannot be confounded
-        // the way `EclWddmSubmitted` would have been. L8 keeps its own refusals.
-        note_refusal(&L2_REFUSALS.present_identity_submitted);
-    }
-    outcome
-}
-
-/// Report a **refused** present-identity submission to the runtime.
-///
-/// ⛔ **`pfnSetErrorCb`, and the argument is [`report_ecl_submit_error`]'s three
-/// reasons re-derived for a slot that has a command-list handle in scope** — which is
-/// exactly the situation in which this project got the channel wrong 49 times, so it
-/// is argued rather than copied:
-///
-/// 1. ⛔ **`pfnSetCommandListErrorCb` quarantines RECORDING, and a present records
-///    nothing.** Its documented effect is *"the runtime will drop all calls into the
-///    driver which record commands on the specified command list"*. `pfnPresent` is
-///    handed an `hCommandList`, but this driver writes nothing into it —
-///    `AddedGpuWork` is FALSE precisely because nothing is recorded — so dropping
-///    future recording calls on it reports the failure to nobody.
-/// 2. **What failed is not one list's recording.** It is the queue's kernel
-///    submission of this frame's identity, on the queue's own WDDM context.
-/// 3. **There is no per-queue error callback in `_0062`**, so the device callback is
-///    the only channel left. Same conclusion as `fence_operation` and
-///    [`report_ecl_submit_error`], down to reusing `QueueSetErrorUnavailable` when
-///    the channel itself is absent.
-///
-/// # ⛔ Why the severity is device removal and no knob softens it
-///
-/// `pfnRenderCb` refused a packet this driver built, on the context every later
-/// present on this queue will use. That does not get better next frame, and
-/// `METHOD.md` §2 Phase 4 consequence 1 forbids a knob whose default exists to keep a
-/// run alive. ⚠ It is deliberately **not** the severity of `Unavailable`: that arm is
-/// *this driver* failing to make a packet, which is the same state the ECL path
-/// declines to raise, and it leaves the frame without an identity rather than without
-/// a device.
-///
-/// # Safety
-/// `h_queue` must be a handle [`create_command_queue`] returned `S_OK` for.
-pub(crate) unsafe fn report_present_submit_error(
-    h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
-    hr: ddi12::HRESULT,
-) {
-    // SAFETY: forwarded to `queue_state`'s identical precondition.
-    let Some(queue) = (unsafe { queue_state(h_queue) }) else {
-        note_refusal(&L2_REFUSALS.queue_set_error_unavailable);
-        return;
-    };
-    // SAFETY: as `submit_present_identity` — the device behind a live queue; the
-    // borrow lives only until the end of this statement.
-    let reported =
-        unsafe { device12::device(queue.h_device) }.is_some_and(|dev| device12::set_error(dev, hr));
-    if !reported {
-        note_refusal(&L2_REFUSALS.queue_set_error_unavailable);
-    }
-}
+// ⛔⛔ **DELETED BY THE HPS2 RETIREMENT (K4): `submit_present_identity` and
+// `report_present_submit_error`.** They were L8's second seam into this file — the
+// `pfnRenderCb` submission of `HeliosPresentRenderCmd` on the queue's own WDDM
+// context (UP-9), and the `pfnSetErrorCb` channel for the one arm that had to reach
+// the runtime.
+//
+// That record's load-bearing field is `HeliosPresentPrivateData::resource_id`, the
+// back buffer's **host** venus resource id, and `HELIOS_PRESENT_SYNC_RETIREMENT.md`
+// §10.3 is explicit: *"no host resource token, resid … no UMD, ICD, batch, or private
+// descriptor can name or supply one"* (`docs/retirement/K4-CONTRACT.md` §5). There is
+// therefore nothing left to submit, and a function taking a record no caller may
+// build is not scaffolding to keep — R908 is the standing record of what unreachable
+// D3D12 scaffolding costs.
+//
+// ⚠ **What replaces it is not a different submission.** `present12` counts
+// `PresentIdentityNoResourceId` and the present PROCEEDS, because a windowed D3D12
+// frame reaches the screen through DWM's own D3D11 composition; the kernel learns no
+// identity for it until **mesa lane unit A3** lands (the ICD stops naming host
+// resources and the KMD patches the resid in from `HeliosNativeRenderPatch`). Whoever
+// implements A3's guest half writes the successor here, against whatever record
+// replaces `HeliosPresentRenderCmd` — not against this one.
+//
+// ⚠ [`submit_wddm_render`] itself is untouched: the ECL path still uses it.
 
 /// Report a **refused** WDDM submission to the runtime.
 ///
@@ -4691,23 +4611,21 @@ pub(crate) struct L2Refusals {
     /// ⛔ Its own counter rather than `EclWddmSubmitted`, deliberately — see
     /// [`submit_wddm_render`]'s doc.
     ///
-    /// ⭐ **The arithmetic is the check, and `PresentEntered` (L8's set) is what makes
-    /// it one**: `PresentEntered` must equal `PresentIdentitySubmitted` plus
-    /// `PresentIdentityRefused` plus `PresentIdentityUnavailable` plus every L8
-    /// refusal that returns before the submission. A `D3D12 DDI refusals:` line where
-    /// that does not hold is reporting something other than what this code does. ⚠ It
-    /// had no left-hand side until `PresentEntered` was added, which is exactly the
-    /// state `EclForwarded` exists to prevent on the ECL path.
+    /// ⛔ **Retired append-only telemetry slot: PERMANENTLY 0 as of the HPS2
+    /// retirement (K4).** It counted present-identity records submitted through
+    /// `pfnRenderCb`, and it was the right-hand side of L8's `PresentEntered`
+    /// arithmetic. `submit_present_identity` is deleted — see the block comment where
+    /// it stood — because its record names a host venus resource id §10.3 forbids any
+    /// UMD supplying. ⚠ The replacement term in that arithmetic is
+    /// `PresentIdentityNoResourceId`; this slot keeps its position because
+    /// `D3D12 DDI refusals:` field order is the evidence contract.
     present_identity_submitted: RefusalCounter,
-    /// A present identity submission was attempted on a queue handle that did not
-    /// resolve to a live `QueueState`. **Expected 0**: L8 resolves the same handle
-    /// through [`present_context`] two statements earlier, so a hit means the queue
-    /// was destroyed between them — a lifetime finding, not a missing feature.
+    /// ⛔ **Retired append-only telemetry slot: PERMANENTLY 0**, same reason. It
+    /// counted a present-identity submission on a queue handle that did not resolve.
     present_submit_no_queue: RefusalCounter,
-    /// A present identity submission found no live device behind its queue.
-    /// **Expected 0** — a live queue implies a live device — and its own counter
-    /// rather than [`Self::present_submit_no_queue`]'s because the two would need
-    /// different fixes.
+    /// ⛔ **Retired append-only telemetry slot: PERMANENTLY 0**, same reason. It
+    /// counted a present-identity submission that found no live device behind its
+    /// queue.
     present_submit_no_device: RefusalCounter,
 }
 

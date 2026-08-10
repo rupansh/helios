@@ -219,9 +219,50 @@ pub(crate) unsafe fn allocate_wddm_resource(
         return Err(E_FAIL);
     };
 
-    let venus_ctx_id = dev.dxvk.venus_context_id();
-    if venus_ctx_id == 0 {
-        log_error!("DDI allocate_wddm_resource: no Venus context id");
+    // ⛔⛔ K4 / `K4-CONTRACT.md` §5 — the resid gap, at the producer end.
+    //
+    // A `Some(backing)` create is the one this driver used to answer by putting
+    // the venus resource id in `HeliosWddmAllocPrivate::adopt_resource_id` and
+    // asking the kernel to ADOPT the memory DXVK had already allocated. HWA2
+    // carries no host resource id, no venus context id and no blob id, and
+    // §10.3 forbids adding one: "no UMD, ICD, batch, or private descriptor can
+    // name or supply" a host resid — it may live SOLELY inside the KMD
+    // allocation object.
+    //
+    // There is no substitution available and inventing one is explicitly out of
+    // bounds. Proceeding without the id is worse than refusing: the kernel
+    // would allocate its OWN blob, `stamp_dxvk_resource_kmt_handles` would then
+    // bind a KMT handle to a DXVK image whose memory that blob does not
+    // describe, and the result is the two-memory split — a resident, storable,
+    // real-handled alias that renders black forever (15th session). That is
+    // fake success; this is loud failure.
+    //
+    // ⇒ Refuse, count, and name the successor mechanism: **Mesa lane unit A3**
+    // (plus K6) — the ICD stops naming host resources at all and the KMD
+    // patches the resid in from `HeliosNativeRenderPatch`. Until A3 lands,
+    // every shared / keyed-mutex / present / primary D3D11 texture create
+    // fails here. §5 records that as the retirement's intended intermediate
+    // state, not a regression.
+    if let Some(b) = backing {
+        note_ddi_refusal(&DDI_REFUSALS.hwa2_create_venus_backing_needs_mesa_a3);
+        log_error!(
+            "DDI allocate_wddm_resource REFUSED: venus-backed create needs an adopted host \
+             resource id, which HWA2 cannot carry (blob=0x{:x} res_id={} blob_size={} \
+             {}x{} fmt={} bind=0x{:x} misc=0x{:x} primary={} direct_scanout={}) -> \
+             blocked on mesa unit A3 (+K6): the ICD stops naming host resources and the KMD \
+             patches the resid in from HeliosNativeRenderPatch",
+            b.blob_id.get(),
+            b.resource_id.get(),
+            b.blob_size,
+            mip0.TexelWidth,
+            mip0.TexelHeight,
+            a.Format,
+            a.BindFlags,
+            a.MiscFlags,
+            !a.pPrimaryDesc.is_null(),
+            direct_scanout_primary,
+        );
+        return Err(E_OUTOFMEMORY);
     }
 
     const CROSS_ADAPTER_PITCH_ALIGN: u32 = 256;
@@ -237,117 +278,175 @@ pub(crate) unsafe fn allocate_wddm_resource(
         Some(g) => g.pitch.get(),
         None => pitch,
     };
-    let linear_size = (pitch as u64)
+    // ⚠ `backing` is `None` from here down — the `Some` arm returned above — so
+    // the "a live blob_size overrides the computed linear size" fallback that
+    // used to sit here has no reachable input. The extent HWA2 records is the
+    // one this UMD can compute, and it is byte-for-byte the value the retired
+    // `HeliosWddmAllocPrivate::size` carried.
+    //
+    // ⚠ OPEN, and flagged rather than guessed (`K4-CONTRACT.md` §1.3): the KMD
+    // computes a KMD-side linear extent of its own — `create_allocation.rs`
+    // `linear_blob_size(pitch, height)` = `pitch * round_up(height, 128) + 64
+    // KiB`, floor one page — from two constants that are private to
+    // `kmd_render` and are NOT in `protocol/`. §1.3 says K4 keeps that
+    // computation and VALIDATES the UMD's `byte_size` against it. This driver
+    // therefore sends the extent it actually knows; whether the KMD accepts it
+    // as a lower bound or demands equality is a KMD-lane decision that this
+    // side cannot make (see the cross-lane request in the K4 report).
+    let size = (pitch as u64)
         .saturating_mul(mip0.TexelHeight.max(1) as u64)
         .max(4096);
-    // A live backing with a zero blob_size still falls back to the linear size:
-    // blob_id is the only field that gates a mode.
-    let size = match backing {
-        Some(b) if b.blob_size != 0 => b.blob_size,
-        _ => linear_size,
-    };
 
     // pPrimaryDesc is the runtime's authoritative primary classification.
     // A dedicated-copy source is intentionally OPTIMAL and has no scanout
     // pitch, but it still must be a WDDM primary or DXGI rejects every Flip
     // before DxgkDdiPresent with "Source of Flip must be primary".
-    let marks_scanout_primary = !a.pPrimaryDesc.is_null();
-    let meta_misc_flags = if direct_scanout_primary {
-        a.MiscFlags | HELIOS_WDDM_ALLOC_MISC_PRIMARY | HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT
-    } else if marks_scanout_primary {
-        a.MiscFlags | HELIOS_WDDM_ALLOC_MISC_PRIMARY
-    } else {
-        a.MiscFlags
+    //
+    // ⛔ It is also the ONLY source for HWA2's `vidpn_source` (offset 80): a
+    // conventional D3D11 primary must carry its concrete source and everything
+    // else must carry `D3DDDI_ID_UNINITIALIZED`, cross-validated by `validate`.
+    let primary_vidpn_source = (!a.pPrimaryDesc.is_null()).then(|| (*a.pPrimaryDesc).VidPnSourceId);
+
+    // The four dimensions HWA2's kind enum can express. `create_resource`
+    // already refused an unknown one (`unhandled_resource_dimension`), so this
+    // is unreachable through the DDI — counted anyway, because the alternative
+    // to a counted refusal here is allocating with a GUESSED allocation kind.
+    let Some(dimension) = ResourceDimension::from_ddi(a.ResourceDimension) else {
+        note_ddi_refusal(&DDI_REFUSALS.hwa2_unknown_dimension);
+        log_error!(
+            "DDI allocate_wddm_resource REFUSED: dimension {} has no HWA2 allocation kind",
+            a.ResourceDimension
+        );
+        return Err(E_INVALIDARG);
     };
 
-    let mut private = RuntimeAllocPrivate {
-        alloc: HeliosWddmAllocPrivate::new(
-            if backing.is_some() {
-                HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY
-            } else {
-                HELIOS_WDDM_ALLOC_KIND_STANDARD
-            },
-            venus_ctx_id,
-            backing.map_or(0, |b| b.blob_id.get()),
-            size,
-            backing
-                .and_then(|b| b.global_vidmm_tracker)
-                .map_or(VIRTIO_GPU_BLOB_MEM_HOST3D, |tracker| tracker.cookie),
-            if backing.is_some() {
-                // DXVK render targets are normally backed by device-local Venus
-                // memory. virglrenderer rejects USE_MAPPABLE for non-host-visible
-                // memory ("mem cannot support mappable blob"). They still must
-                // be shareable so the host can export/import the backing memory.
-                VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE
-                    | if backing.is_some_and(|b| b.global_vidmm_tracker.is_some()) {
-                        HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER
-                    } else {
-                        0
-                    }
-            } else {
-                VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE
-            },
-            // On the typed GLOBAL_VIDMM_TRACKER shape this field carries the
-            // system-wide KMT share handle instead of a cache policy. The KMD
-            // and protocol helper interpret it only under that private bit.
-            backing
-                .and_then(|b| b.global_vidmm_tracker)
-                .map_or(VIRTIO_GPU_MAP_CACHE_CACHED, |tracker| tracker.global_share),
-            // The venus resource id for the KMD to adopt. Was patched into the
-            // struct after construction because the constructor could not
-            // express the field; it is a parameter now, so the record reaches
-            // the kernel fully initialised by one expression. R805.
-            backing.map_or(0, |b| b.adopt_resource_id()),
-        ),
-        meta: HeliosWddmAllocMeta {
-            width: mip0.TexelWidth,
-            height: mip0.TexelHeight,
-            format: dxgi_to_d3dddi_format(a.Format as u32),
-            pitch,
-            bind_flags: a.BindFlags,
-            misc_flags: meta_misc_flags,
-            // C1 identity: the creating vkAllocateMemory's exact parameters for
-            // adopted venus-backed resources (a cross-process opener must import
-            // with them). Zero for KMD-backed standard allocations — the KMD
-            // fills them at CreateAllocation from its kernel venus client.
-            venus_alloc_size: backing.map_or(0, |b| b.alloc_size),
-            memory_type_index: backing.map_or(0, |b| b.memory_type_index),
-            // Carry the creator's EXACT DXGI format so a cross-process opener
-            // rebuilds the image with the same bpp/layout instead of a squashed
-            // BGRA (the `format` field below is a lossy D3DDDIFORMAT for the
-            // KMD's DescribeAllocation). `a.Format` is already a DXGI_FORMAT.
-            dxgi_format: a.Format as u32,
-            // Scan-out primary's real memory-plane-0 offset (0 for everything
-            // else); the KMD adds it to the blob base in SET_SCANOUT_BLOB.
-            plane_offset: scanout.map_or(0, |g| g.plane_offset),
-        },
+    let input = Hwa2CreateInput {
+        dimension,
+        // `ResourceDimension` collapses RES_TEXCUBE into Texture2D, so the cube
+        // signal has to be read from the raw DDI value before that conversion.
+        texture_cube: a.ResourceDimension == RES_TEXCUBE,
+        texel_width: mip0.TexelWidth,
+        texel_height: mip0.TexelHeight,
+        texel_depth: mip0.TexelDepth,
+        array_size: a.ArraySize,
+        mip_levels: a.MipLevels,
+        // The creator's EXACT DXGI format, so a cross-process opener rebuilds
+        // the image with the same bpp/layout instead of a squashed BGRA. The
+        // lossy D3DDDIFORMAT travels beside it for `DxgkDdiDescribeAllocation`.
+        dxgi_format: a.Format as u32,
+        d3d_ddi_format: dxgi_to_d3dddi_format(a.Format as u32),
+        sample_count: a.SampleDesc.Count,
+        sample_quality: a.SampleDesc.Quality,
+        ddi_bind_flags: a.BindFlags,
+        ddi_misc_flags: a.MiscFlags,
+        byte_size: size,
+        row_pitch: pitch,
+        // Scan-out primary's real memory-plane-0 offset (0 for everything
+        // else); the KMD adds it to the blob base in SET_SCANOUT_BLOB.
+        plane_offset: scanout.map_or(0, |g| g.plane_offset),
+        primary_vidpn_source,
+        direct_scanout_primary,
     };
-    let pre_private_alloc = private.alloc;
-    let pre_private_meta = private.meta;
+
+    let mut desc = match input.build() {
+        Ok(desc) => desc,
+        Err(refusal) => {
+            // One counter per reason — the caller of a refused create needs to
+            // know WHICH field could not be expressed, not that "something" was.
+            match refusal {
+                Hwa2InputRefusal::ImageDxgiFormatUnknown => {
+                    note_ddi_refusal(&DDI_REFUSALS.hwa2_image_format_unknown)
+                }
+                Hwa2InputRefusal::ByteSizeZero | Hwa2InputRefusal::PlaneUnrepresentable { .. } => {
+                    note_ddi_refusal(&DDI_REFUSALS.hwa2_plane_unrepresentable)
+                }
+            }
+            log_error!(
+                "DDI allocate_wddm_resource REFUSED: cannot build HWA2 create input: {:?} \
+                 ({}x{} fmt={} pitch={} size={} bind=0x{:x} misc=0x{:x})",
+                refusal,
+                mip0.TexelWidth,
+                mip0.TexelHeight,
+                a.Format,
+                pitch,
+                size,
+                a.BindFlags,
+                a.MiscFlags
+            );
+            return Err(E_INVALIDARG);
+        }
+    };
+
+    // The producer's own gate. `validate_create_input` is the input half of the
+    // two-stage HWA2 contract (`K4-CONTRACT.md` §1.1): it enforces the shared
+    // cross-field core PLUS `allocation_generation == 0` and the two KMD-owned
+    // flag bits clear. Running it here is not belt-and-braces — the KMD refuses
+    // the create rather than correcting a field, so a descriptor that fails it
+    // is a create that was going to fail anyway, and failing it HERE names the
+    // field instead of surfacing an opaque callback HRESULT.
+    if let Err(rejection) = desc.validate_create_input(HELIOS_PACKAGE_GENERATION) {
+        note_ddi_refusal(&DDI_REFUSALS.hwa2_input_invalid);
+        log_error!(
+            "DDI allocate_wddm_resource REFUSED: own HWA2 create input is invalid: {:?} \
+             (kind={} flags=0x{:x} bind=0x{:x} misc=0x{:x} {}x{} dxgi={} planes={} size={})",
+            rejection,
+            desc.allocation_kind,
+            desc.flags,
+            desc.bind_flags,
+            desc.misc_flags,
+            desc.width,
+            desc.height,
+            desc.dxgi_format,
+            desc.plane_count,
+            desc.byte_size
+        );
+        return Err(E_INVALIDARG);
+    }
 
     let pre_n = WDDM_ALLOC_LOG_COUNT.peek();
     if pre_n < 128 {
         log_error!(
-            "DDI allocate_wddm_resource pre: blob=0x{:x} res_id={} ctx={} kind={} size={} alloc_size={} mti={} {}x{} fmt={} bind=0x{:x} misc=0x{:x} primary_desc={}",
-            private.alloc.blob_id,
-            private.alloc.adopt_resource_id,
-            private.alloc.ctx_id,
-            private.alloc.kind,
-            private.alloc.size,
-            backing.map_or(0, |b| b.alloc_size),
-            backing.map_or(0, |b| b.memory_type_index),
-            mip0.TexelWidth,
-            mip0.TexelHeight,
-            a.Format,
-            a.BindFlags,
-            a.MiscFlags,
-            !a.pPrimaryDesc.is_null()
+            "DDI allocate_wddm_resource pre: HWA2 kind={} flags=0x{:x} bind=0x{:x} misc=0x{:x} \
+             size={} {}x{}x{} mips={} dxgi={} d3dddi={} samples={}x{} vidpn={} swizzle={} \
+             memory={} planes={} pitch={} plane_off={} pkg_gen=0x{:x}",
+            desc.allocation_kind,
+            desc.flags,
+            desc.bind_flags,
+            desc.misc_flags,
+            desc.byte_size,
+            desc.width,
+            desc.height,
+            desc.depth_or_array_size,
+            desc.mip_levels,
+            desc.dxgi_format,
+            desc.d3d_ddi_format,
+            desc.sample_count,
+            desc.sample_quality,
+            desc.vidpn_source,
+            desc.swizzle_class,
+            desc.memory_class,
+            desc.plane_count,
+            desc.planes[0].row_pitch,
+            desc.planes[0].offset,
+            desc.package_generation
         );
     }
 
+    // The descriptor exactly as it goes in, for the write-back diff below.
+    // `HeliosWddmAllocationDescV2` is `Copy`, so this is a value snapshot.
+    //
+    // ⚠ Taken BEFORE `private_ptr` is derived, deliberately: reading the local
+    // `desc` place after taking `&mut desc` would invalidate the raw pointer the
+    // kernel is about to write through, and every later read of `desc` is
+    // AFTER the callback has returned.
+    let sent = desc;
+
     let mut allocation_info = ddi::D3DDDI_ALLOCATIONINFO2::default();
-    let private_ptr = (&mut private as *mut RuntimeAllocPrivate).cast();
-    let private_size = core::mem::size_of::<RuntimeAllocPrivate>() as u32;
+    let private_ptr = (&mut desc as *mut HeliosWddmAllocationDescV2).cast();
+    // ⛔ Exactly `HELIOS_HWA2_BYTES`. `from_private_data` requires the length to
+    // be exact on the far side (`==`, not `>=`), so 96 -> 168 is a hard ABI
+    // step, not a growth an older KMD tolerates.
+    let private_size = u32::from(HELIOS_HWA2_BYTES);
     allocation_info.pPrivateDriverData = private_ptr;
     allocation_info.PrivateDriverDataSize = private_size;
     let is_present = (a.BindFlags & DDI_BIND_PRESENT) != 0;
@@ -373,13 +472,12 @@ pub(crate) unsafe fn allocate_wddm_resource(
 
     let hr = allocate_cb(dev.h_rt_device, &mut alloc);
     let h_allocation = allocation_info.hAllocation;
-    let post_private_alloc = private.alloc;
-    let post_private_meta = private.meta;
-    let post_open_identity = unsafe { read_open_identity(private_ptr, private_size) };
     let n = WDDM_ALLOC_LOG_COUNT.next();
     if n < 128 || hr != 0 {
         log_error!(
-            "DDI allocate_wddm_resource: hr=0x{:08x} alloc=0x{:x} km=0x{:x} rt={:p} assoc={:p} info={} rpriv={} size={} pitch={} blob=0x{:x} res_id={} ctx={} kind={} primary={} present={} vidpn={} {}x{} fmt={} bind=0x{:x} misc=0x{:x}",
+            "DDI allocate_wddm_resource: hr=0x{:08x} alloc=0x{:x} km=0x{:x} rt={:p} assoc={:p} \
+             info={} rpriv={} size={} pitch={} kind={} primary={} present={} vidpn={} {}x{} \
+             fmt={} bind=0x{:x} misc=0x{:x} alloc_gen=0x{:x}",
             hr as u32,
             h_allocation,
             alloc.hKMResource,
@@ -389,10 +487,7 @@ pub(crate) unsafe fn allocate_wddm_resource(
             alloc.PrivateDriverDataSize,
             size,
             pitch,
-            backing.map_or(0, |b| b.blob_id.get()),
-            private.alloc.adopt_resource_id,
-            private.alloc.ctx_id,
-            private.alloc.kind,
+            desc.allocation_kind,
             is_primary_allocation,
             is_present,
             allocation_info.VidPnSourceId,
@@ -400,59 +495,120 @@ pub(crate) unsafe fn allocate_wddm_resource(
             mip0.TexelHeight,
             a.Format,
             a.BindFlags,
-            a.MiscFlags
+            a.MiscFlags,
+            desc.allocation_generation
         );
-        if pre_private_alloc.adopt_resource_id != post_private_alloc.adopt_resource_id
-            || pre_private_alloc.kind != post_private_alloc.kind
-            || pre_private_alloc.ctx_id != post_private_alloc.ctx_id
-            || pre_private_alloc.blob_id != post_private_alloc.blob_id
-            || pre_private_meta.venus_alloc_size != post_private_meta.venus_alloc_size
-            || pre_private_meta.memory_type_index != post_private_meta.memory_type_index
-        {
-            log_error!(
-                "DDI allocate_wddm_resource private mutated: pre blob=0x{:x} res_id={} ctx={} kind={} vas={} mti={} -> post blob=0x{:x} res_id={} ctx={} kind={} vas={} mti={}",
-                pre_private_alloc.blob_id,
-                pre_private_alloc.adopt_resource_id,
-                pre_private_alloc.ctx_id,
-                pre_private_alloc.kind,
-                pre_private_meta.venus_alloc_size,
-                pre_private_meta.memory_type_index,
-                post_private_alloc.blob_id,
-                post_private_alloc.adopt_resource_id,
-                post_private_alloc.ctx_id,
-                post_private_alloc.kind,
-                post_private_meta.venus_alloc_size,
-                post_private_meta.memory_type_index
-            );
-        }
-        if let Some((ident, meta)) = post_open_identity {
-            let meta = meta.unwrap_or_default();
-            log_error!(
-                "DDI allocate_wddm_resource callback private: hRT={:p} hKM=0x{:x} \
-                 hAlloc=0x{:x} identity=res_id:{} kind:{} ctx:{} blob_size:{} \
-                 venus_size:{} mem_type:{} meta={}x{} pitch:{} d3dfmt:{} \
-                 dxgifmt:{} bind:0x{:x} misc:0x{:x}",
-                h_rt.handle,
-                alloc.hKMResource,
-                h_allocation,
-                ident.resource_id,
-                ident.kind,
-                ident.ctx_id,
-                ident.blob_size,
-                ident.venus_alloc_size,
-                ident.memory_type_index,
-                meta.width,
-                meta.height,
-                meta.pitch,
-                meta.format,
-                meta.dxgi_format,
-                meta.bind_flags,
-                meta.misc_flags,
-            );
-        }
     }
     if hr != 0 {
         return Err(hr);
+    }
+
+    // ── the write-back, checked (K4 obligation 2) ───────────────────────────
+    //
+    // ⛔ Before K4 NOTHING checked what came back. The old code diffed six
+    // fields into a log line and then used the allocation regardless, so a KMD
+    // that wrote nothing, wrote a stale generation, or silently corrected a
+    // field was indistinguishable from one that agreed with us.
+    //
+    // `validate_create_output` is the output half of the two-stage contract: the
+    // same cross-field core as `validate_create_input`, plus the requirement
+    // that `allocation_generation` is now NONZERO — i.e. the kernel really did
+    // stamp this buffer. A descriptor that fails it describes a resource we do
+    // not have, so the allocation is rolled back and the create fails; keeping
+    // it would leave `store_resource` holding a handle whose descriptor nobody
+    // can trust, which is exactly the disagreement §10.3 exists to prevent.
+    //
+    // ⚠ UNEXERCISED AND KNOWN TO BE: whether dxgkrnl propagates the KMD's
+    // create-time private write back into THIS buffer at all is not established
+    // anywhere in the doc set (recon §7 item 6; `umd12`'s `AllocPrivateWrittenBack`
+    // detector was added to measure exactly that and its result has never been
+    // reported). If the answer is "no", every create fails here with
+    // `AllocationGenerationZero` — which is the loud, correct symptom of a
+    // design assumption being false, and is why this refusal names the field.
+    if let Err(rejection) = desc.validate_create_output(HELIOS_PACKAGE_GENERATION) {
+        note_ddi_refusal(&DDI_REFUSALS.hwa2_output_invalid);
+        log_error!(
+            "DDI allocate_wddm_resource REFUSED: HWA2 write-back is invalid: {:?} \
+             (alloc=0x{:x} km=0x{:x} alloc_gen=0x{:x} pkg_gen=0x{:x} kind={} flags=0x{:x} \
+             size={} {}x{}) -> deallocating",
+            rejection,
+            h_allocation,
+            alloc.hKMResource,
+            desc.allocation_generation,
+            desc.package_generation,
+            desc.allocation_kind,
+            desc.flags,
+            desc.byte_size,
+            desc.width,
+            desc.height
+        );
+        unsafe { deallocate_standalone(dev, h_allocation) };
+        return Err(E_OUTOFMEMORY);
+    }
+
+    // The KMD echoes every field it validated and stamps only the two it owns
+    // (`allocation_generation`, and the `DIRECT_FLIP_COMPATIBLE` /
+    // `D3D12_RUNTIME_PRIMARY` bits). Anything else that moved is a contract
+    // violation on the kernel side rather than an error here — it is not
+    // refused, because the descriptor is still internally valid and refusing
+    // would hide which field moved behind a dead resource. It IS logged with
+    // both values, because "the KMD corrected a field" is precisely what §1.1
+    // says cannot happen.
+    //
+    // The mask is `protocol`'s, not a local re-derivation of it. This site used
+    // to declare `const KMD_OWNED_FLAGS = DIRECT_FLIP_COMPATIBLE |
+    // D3D12_RUNTIME_PRIMARY`, and so did three others (`protocol` itself,
+    // `kmd_logic`, `umd12`): one rule, four declarations, nothing comparing
+    // them. Add a third KMD-owned bit and every hand copy keeps clearing two —
+    // the echo check then reports a mismatch on a field the KMD legitimately
+    // stamped, which is a false finding in the one place whose whole job is to
+    // be believed. Imported here rather than through `forward.rs`'s re-export
+    // block because this is the only consumer in the crate.
+    if n < 128 {
+        use helios_protocol::HELIOS_HWA2_FLAG_KMD_OWNED_MASK;
+        let echoed = HeliosWddmAllocationDescV2 {
+            allocation_generation: sent.allocation_generation,
+            flags: desc.flags & !HELIOS_HWA2_FLAG_KMD_OWNED_MASK,
+            ..desc
+        };
+        if echoed != sent {
+            log_error!(
+                "DDI allocate_wddm_resource: KMD did NOT echo the create input verbatim \
+                 (alloc=0x{:x}) sent kind={} flags=0x{:x} bind=0x{:x} misc=0x{:x} size={} \
+                 {}x{} dxgi={} d3dddi={} vidpn={} swizzle={} memory={} planes={} pitch={} \
+                 -> got kind={} flags=0x{:x} bind=0x{:x} misc=0x{:x} size={} {}x{} dxgi={} \
+                 d3dddi={} vidpn={} swizzle={} memory={} planes={} pitch={}",
+                h_allocation,
+                sent.allocation_kind,
+                sent.flags,
+                sent.bind_flags,
+                sent.misc_flags,
+                sent.byte_size,
+                sent.width,
+                sent.height,
+                sent.dxgi_format,
+                sent.d3d_ddi_format,
+                sent.vidpn_source,
+                sent.swizzle_class,
+                sent.memory_class,
+                sent.plane_count,
+                sent.planes[0].row_pitch,
+                desc.allocation_kind,
+                desc.flags,
+                desc.bind_flags,
+                desc.misc_flags,
+                desc.byte_size,
+                desc.width,
+                desc.height,
+                desc.dxgi_format,
+                desc.d3d_ddi_format,
+                desc.vidpn_source,
+                desc.swizzle_class,
+                desc.memory_class,
+                desc.plane_count,
+                desc.planes[0].row_pitch,
+            );
+        }
     }
 
     match unsafe { make_resident(dev, h_allocation) } {
@@ -512,17 +668,34 @@ pub(crate) unsafe fn finish_wddm_tex2d(
         }
         (0, 0, 0)
     };
-    // C1: record the creating vkAllocateMemory's exact size + memory type into
-    // the allocation trailer so cross-process openers import with them.
-    let (mut venus_alloc_size, mut memory_type_index, mut global_vidmm_tracker) =
-        (0u64, 0u32, 0u64);
+    // The creating `vkAllocateMemory`'s exact size + memory type.
+    //
+    // ⛔ K4: these NO LONGER reach any allocation private data. HWA2 carries no
+    // `venus_alloc_size` and §10.3 is explicit that the Vulkan memory-type index
+    // is gone ("no Vulkan memory-type index … the retired trailer carried
+    // `memory_type_index`; it is gone"). Both are still read here for exactly
+    // one surviving consumer — `SnapshotSourceDesc` below, the windowed-BLT
+    // snapshot descriptor, which is a UMD-internal record that never crosses
+    // the allocation seam.
+    //
+    // ⚠ `global_vidmm_tracker` is now a WRITE-ONLY sink. The `GlobalVidMmTracker`
+    // system-wide KMT share + cookie has NO successor at all
+    // (`K4-CONTRACT.md` §6: `wddm_legacy.rs:30`'s claim that it was "folded into
+    // HWA2's own tracking-kind fields" is false — HWA2 has no tracking kind, no
+    // cookie, no global-share field and no tracker flag bit, and §10.3's "no …
+    // independently usable identity" forbids reintroducing it under another
+    // name). The out-parameter survives only because the C++ bridge declares it
+    // (`umd/bridge/`, not this lane); see the K4 report's cross-lane request to
+    // drop the parameter on both sides in one changeset.
+    let (mut venus_alloc_size, mut memory_type_index) = (0u64, 0u32);
+    let mut retired_global_vidmm_tracker = 0u64;
     if backing_resource_id != 0 {
         if let Some(dev) = helios_device(h) {
             if !dev.dxvk.get_resource_alloc_identity(
                 res.as_raw() as usize,
                 &mut venus_alloc_size,
                 &mut memory_type_index,
-                &mut global_vidmm_tracker,
+                &mut retired_global_vidmm_tracker,
             ) {
                 log_error!(
                     "DDI create_resource(tex2d): no venus alloc identity for res_id={}",
@@ -531,14 +704,7 @@ pub(crate) unsafe fn finish_wddm_tex2d(
             }
         }
     }
-    let backing = VenusBacking::new(
-        backing_blob_id,
-        backing_blob_size,
-        backing_resource_id,
-        venus_alloc_size,
-        memory_type_index,
-        global_vidmm_tracker,
-    );
+    let backing = VenusBacking::new(backing_blob_id, backing_blob_size, backing_resource_id);
     // A shared/present/primary texture must bind its WDDM allocation to the
     // exact exportable Venus resource that backs the DXVK image. Falling back
     // to a fresh KMD blob would create two disconnected allocations; treating
@@ -573,6 +739,14 @@ pub(crate) unsafe fn finish_wddm_tex2d(
         .as_ref()
         .map(ResidentAllocation::handle)
         .unwrap_or(0);
+    // ⚠ K4: UNREACHABLE until mesa unit A3 lands, and deliberately kept.
+    // `backing_resource_id != 0` implies `backing.is_some()`, and
+    // `allocate_wddm_resource` refuses that create outright (HWA2 cannot name a
+    // host resource id — see its `hwa2_create_venus_backing_needs_mesa_a3`
+    // refusal), so this arm has no reachable input today. It is the ownership
+    // hand-off the adopt path needs the moment the KMD starts patching the
+    // resid in from `HeliosNativeRenderPatch`; deleting it would silently drop
+    // that hand-off from the A3 changeset.
     if allocation_handle != 0 && backing_resource_id != 0 {
         if let Some(dev) = helios_device(h) {
             // SAFETY: `res` is the live resource this DDI just created.
@@ -1297,6 +1471,86 @@ pub(crate) unsafe extern "C" fn destroy_resource(h: Hdevice, h_resource: ddi::D3
     release_resource(h, h_resource);
 }
 
+/// Log and classify ONE open-time HWA2 candidate buffer; returns the descriptor
+/// when it is valid.
+///
+/// A free function rather than a closure inside `open_resource` on purpose: a
+/// closure with an annotated `&mut` parameter is given one inferred region for
+/// all of its call sites, which would hold `descriptor` borrowed across the whole
+/// scan. Nothing here needs to capture.
+///
+/// The two counters are separate because the two failures are separate facts: a
+/// buffer of the WRONG LENGTH is a producer/ABI mismatch (a 96-byte
+/// pre-retirement record, or the oversized resource-level buffer), while a
+/// 168-byte buffer that fails validation is a malformed or stale descriptor. The
+/// pre-K4 reader returned `None` for both and for "nothing there", so the
+/// refusal could not say which had happened.
+fn note_open_candidate(
+    result: Result<HeliosWddmAllocationDescV2, HeliosAllocDescRejection>,
+    what: &str,
+    ptr: *const c_void,
+    size: u32,
+    size_rejections: &mut usize,
+    content_rejections: &mut usize,
+) -> Option<HeliosWddmAllocationDescV2> {
+    match result {
+        Ok(desc) => {
+            log_error!(
+                "DDI open_resource {}: HWA2 alloc_gen=0x{:x} kind={} flags=0x{:x} bind=0x{:x} \
+                 misc=0x{:x} size={} {}x{}x{} mips={} dxgi={} d3dddi={} samples={}x{} vidpn={} \
+                 swizzle={} memory={} planes={} pitch={} plane_off={}",
+                what,
+                desc.allocation_generation,
+                desc.allocation_kind,
+                desc.flags,
+                desc.bind_flags,
+                desc.misc_flags,
+                desc.byte_size,
+                desc.width,
+                desc.height,
+                desc.depth_or_array_size,
+                desc.mip_levels,
+                desc.dxgi_format,
+                desc.d3d_ddi_format,
+                desc.sample_count,
+                desc.sample_quality,
+                desc.vidpn_source,
+                desc.swizzle_class,
+                desc.memory_class,
+                desc.plane_count,
+                desc.planes[0].row_pitch,
+                desc.planes[0].offset
+            );
+            Some(desc)
+        }
+        Err(HeliosAllocDescRejection::PrivateDataSize { found, expected }) => {
+            *size_rejections += 1;
+            log_error!(
+                "DDI open_resource {}: private={:p}/{} is not an HWA2 buffer (found {} bytes, \
+                 need exactly {})",
+                what,
+                ptr,
+                size,
+                found,
+                expected
+            );
+            None
+        }
+        Err(rejection) => {
+            *content_rejections += 1;
+            log_error!(
+                "DDI open_resource {}: private={:p}/{} is a 168-byte buffer that FAILED HWA2 \
+                 validation: {:?}",
+                what,
+                ptr,
+                size,
+                rejection
+            );
+            None
+        }
+    }
+}
+
 pub(crate) unsafe extern "C" fn open_resource(
     h: Hdevice,
     arg: *const ddi::D3D10DDIARG_OPENRESOURCE,
@@ -1314,257 +1568,151 @@ pub(crate) unsafe extern "C" fn open_resource(
     let a = &*arg;
     let info2 = unsafe { a.__bindgen_anon_1.pOpenAllocationInfo2 };
     let mut allocation: ddi::D3DKMT_HANDLE = 0;
-    // C1 identity ABI: the KMD wrote a versioned HeliosWddmOpenIdentity record
-    // into the open-time private data in DxgkDdiOpenAllocation, after
-    // validating the backing venus resource is LIVE. Prefer the per-allocation
-    // buffer; fall back to the resource-level one. No adopt-id heuristics.
-    let mut identity =
-        unsafe { read_opened_allocation(a.pPrivateDriverData, a.PrivateDriverDataSize) };
-    // Distinguishes "no identity anywhere" from "identity present, trailer
-    // absent" in the refusal below; the second is a producer/KMD bug that used
-    // to be swallowed by a 1x1 default.
-    let mut identity_without_trailer = matches!(
-        unsafe { read_open_identity(a.pPrivateDriverData, a.PrivateDriverDataSize) },
-        Some((_, None))
-    );
+
     if a.NumAllocations != 0 && info2.is_null() {
         log_error!("DDI open_resource FAILED: allocation array is null");
         set_runtime_error(h, E_INVALIDARG);
         return;
     }
+
+    // ── the HWA2 open contract (K4) ─────────────────────────────────────────
+    //
+    // ⛔ What changed, and it is a change of MODEL, not of parser: the KMD used
+    // to WRITE a `HeliosWddmOpenIdentity` over the first 48 bytes of the
+    // open-time buffer in `DxgkDdiOpenAllocation`, so this driver waited for a
+    // kernel write and two openers of one allocation could disagree about what
+    // they had. `DxgkDdiOpenAllocation` now writes NO byte of the private
+    // buffer (K4 acceptance obligation 5): the descriptor is written once at
+    // create and is `const` for every opener. An opener VALIDATES AND READS.
+    //
+    // Every candidate buffer is parsed through
+    // `HeliosWddmAllocationDescV2::from_private_data`, never a pointer cast, and
+    // the length must be EXACTLY 168 — §10.3: a malformed, unknown, truncated
+    // or mismatched-generation descriptor makes the open fail and "never selects
+    // a legacy parser". The three outcomes are counted separately (wrong size /
+    // invalid content / valid) because the old reader collapsed all of them into
+    // `None` and the refusal could not say which had happened.
+    let mut size_rejections = 0usize;
+    let mut content_rejections = 0usize;
+    // The resource-level buffer first, then each allocation's own. Order is a
+    // preference, not a fallback chain that changes meaning: every candidate is
+    // held to the identical validator.
+    let mut descriptor = note_open_candidate(
+        unsafe { read_open_descriptor(a.pPrivateDriverData, a.PrivateDriverDataSize) },
+        "resource",
+        a.pPrivateDriverData,
+        a.PrivateDriverDataSize,
+        &mut size_rejections,
+        &mut content_rejections,
+    );
     for index in 0..a.NumAllocations as usize {
         let info = &*info2.add(index);
         if index == 0 {
             allocation = info.hAllocation;
         }
-        let allocation_identity =
-            unsafe { read_open_identity(info.pPrivateDriverData, info.PrivateDriverDataSize) };
-        // Only a candidate that carries the meta TRAILER can be selected — the
-        // type says so now. The KMD stamps the identity into both the
-        // per-allocation and the resource-level private buffer
-        // (create_allocation.rs `write_open_identity`), but the resource-level
-        // copy for KMD standard allocations is the pristine
-        // GetStandardAllocationDriverData output whose size the KMD does not
-        // choose: it can hold a valid 48-byte identity with no 16-byte trailer,
-        // and selecting it loses the real geometry.
-        match allocation_identity {
-            Some((ident, Some(meta))) => {
-                if identity.is_none() {
-                    identity = Some(OpenedAllocation { ident, meta });
-                }
-            }
-            Some((_, None)) => identity_without_trailer = true,
-            None => {}
-        }
-        if let Some((ident, meta)) = allocation_identity {
-            let meta = meta.unwrap_or_default();
-            log_error!(
-                "DDI OpenResource allocation: index={} hDrv={:p} hRT={:p} hKM=0x{:x} \
-                 hAlloc=0x{:x} private={:p}/{} gpuva=0x{:x} res_id={} kind={} ctx={} \
-                 blob_size={} venus_size={} mem_type={} {}x{} pitch={} d3dfmt={} \
-                 dxgifmt={} bind=0x{:x} misc=0x{:x}",
-                index,
-                h_resource.pDrvPrivate,
-                h_rt.handle,
-                a.hKMResource.handle,
-                info.hAllocation,
-                info.pPrivateDriverData,
-                info.PrivateDriverDataSize,
-                info.GpuVirtualAddress,
-                ident.resource_id,
-                ident.kind,
-                ident.ctx_id,
-                ident.blob_size,
-                ident.venus_alloc_size,
-                ident.memory_type_index,
-                meta.width,
-                meta.height,
-                meta.pitch,
-                meta.format,
-                meta.dxgi_format,
-                meta.bind_flags,
-                meta.misc_flags,
-            );
-        } else {
-            log_error!(
-                "DDI OpenResource allocation: index={} hDrv={:p} hRT={:p} hKM=0x{:x} \
-                 hAlloc=0x{:x} private={:p}/{} gpuva=0x{:x} identity=missing",
-                index,
-                h_resource.pDrvPrivate,
-                h_rt.handle,
-                a.hKMResource.handle,
-                info.hAllocation,
-                info.pPrivateDriverData,
-                info.PrivateDriverDataSize,
-                info.GpuVirtualAddress,
-            );
+        log_error!(
+            "DDI open_resource allocation: index={} hDrv={:p} hRT={:p} hKM=0x{:x} \
+             hAlloc=0x{:x} private={:p}/{} gpuva=0x{:x}",
+            index,
+            h_resource.pDrvPrivate,
+            h_rt.handle,
+            a.hKMResource.handle,
+            info.hAllocation,
+            info.pPrivateDriverData,
+            info.PrivateDriverDataSize,
+            info.GpuVirtualAddress,
+        );
+        let candidate = note_open_candidate(
+            unsafe { read_open_descriptor(info.pPrivateDriverData, info.PrivateDriverDataSize) },
+            "allocation",
+            info.pPrivateDriverData,
+            info.PrivateDriverDataSize,
+            &mut size_rejections,
+            &mut content_rejections,
+        );
+        // First valid candidate wins. Every allocation is still parsed and
+        // logged, so a per-allocation disagreement stays visible instead of
+        // being short-circuited away.
+        if descriptor.is_none() {
+            descriptor = candidate;
         }
     }
-    log_error!(
-        "DDI OpenResource resource: hDrv={:p} hRT={:p} num_alloc={} hKM=0x{:x} private={:p}/{}",
-        h_resource.pDrvPrivate,
-        h_rt.handle,
-        a.NumAllocations,
-        a.hKMResource.handle,
-        a.pPrivateDriverData,
-        a.PrivateDriverDataSize,
-    );
 
-    // A shared open without a KMD identity record cannot alias the real
-    // surface. The old metadata-texture fallback fabricated a blank texture
-    // here and stamped it with the real KMT handles — draws "succeeded" and
-    // the shared content stayed black forever (audit U-B2). Fail loudly
-    // instead so the producer-side bug gets found.
-    //
-    // The trailer is part of that record, not an optional extra: it carries the
-    // width/height/pitch/format the import is built from. Defaulting it to
-    // 1x1 BGRA produced exactly the audited failure — a real-KMT-stamped,
-    // resident, storable alias whose geometry was wrong. Because that alias is
-    // UNDERSIZE relative to the true allocation, the oversize guard that caught
-    // the 38th-session import regression cannot see it either.
-    let Some(opened) = identity else {
-        if identity_without_trailer {
-            log_error!(
-                "DDI open_resource FAILED: venus identity carries no meta trailer (hKM={:?} alloc=0x{:x}) -> E_FAIL",
-                a.hKMResource, allocation
-            );
+    // A shared open without a KMD descriptor cannot alias the real surface. The
+    // old metadata-texture fallback fabricated a blank texture here and stamped
+    // it with the real KMT handles — draws "succeeded" and the shared content
+    // stayed black forever (audit U-B2). Fail loudly instead, and say WHICH of
+    // the two failures happened.
+    let Some(descriptor) = descriptor else {
+        if content_rejections != 0 {
+            note_ddi_refusal(&DDI_REFUSALS.hwa2_open_desc_invalid);
         } else {
-            log_error!(
-                "DDI open_resource FAILED: no venus identity record (hKM={:?} alloc=0x{:x}) -> E_FAIL",
-                a.hKMResource, allocation
-            );
+            note_ddi_refusal(&DDI_REFUSALS.hwa2_open_private_size);
         }
+        log_error!(
+            "DDI open_resource FAILED: no valid HWA2 descriptor (hKM={:?} alloc=0x{:x} \
+             num_alloc={} wrong_size={} invalid={}) -> E_FAIL",
+            a.hKMResource,
+            allocation,
+            a.NumAllocations,
+            size_rejections,
+            content_rejections
+        );
         set_runtime_error(h, E_FAIL);
         return;
     };
-    let ident = opened.ident;
-    let meta = opened.meta;
 
     if a.hKMResource.handle == 0 {
         log_error!(
-            "DDI open_resource FAILED: no hKMResource (res_id={}) -> E_FAIL",
-            ident.resource_id
+            "DDI open_resource FAILED: no hKMResource (alloc_gen=0x{:x}) -> E_FAIL",
+            descriptor.allocation_generation
         );
         set_runtime_error(h, E_FAIL);
         return;
     }
 
-    let Some(dev) = helios_device(h) else {
-        log_error!("DDI open_resource FAILED: no Helios device -> E_FAIL");
-        set_runtime_error(h, E_FAIL);
-        return;
-    };
-
-    let open_bind = api_bind_flags(meta.bind_flags);
-    let open_misc = meta.misc_flags
-        & (D3D11_RESOURCE_MISC_SHARED.0 as u32
-            | D3D11_RESOURCE_MISC_RESOURCE_CLAMP.0 as u32
-            | D3D11_RESOURCE_MISC_GDI_COMPATIBLE.0 as u32);
-    // Prefer the identity's venus alloc size; the meta trailer carries the
-    // creator-recorded copy for KMD standard allocations.
-    let venus_alloc_size = if ident.venus_alloc_size != 0 {
-        ident.venus_alloc_size
-    } else {
-        meta.venus_alloc_size
-    };
-    // Rebuild the image with the creator's EXACT DXGI format. Falls back to the
-    // lossy D3DDDIFORMAT translation only when the creator did not record a DXGI
-    // format (0 = legacy trailer / KMD standard allocation, which are BGRA). The
-    // old unconditional `d3dddi_to_dxgi_format(meta.format)` collapsed every
-    // surface to BGRA — an A8/R8 mask then rebuilt as 4bpp needed 4x the memory
-    // and its (correctly sized) import was refused as "undersized".
-    let open_dxgi_format = if meta.dxgi_format != 0 {
-        meta.dxgi_format
-    } else {
-        d3dddi_to_dxgi_format(meta.format).0 as u32
-    };
-    let cross_context_optimal = ident.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD
-        && meta.misc_flags & HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE != 0;
+    // ⛔⛔ K4 / `K4-CONTRACT.md` §5 — the resid gap, at the consumer end.
+    //
+    // The descriptor above is valid and carries the full geometry: extent,
+    // exact `DXGI_FORMAT`, bind/misc vocabulary, swizzle class, plane layout.
+    // What it does not carry — and may never be extended to carry — is the host
+    // resource id, the creating `vkAllocateMemory`'s size, and the Vulkan
+    // memory-type index. `dxvk.open_texture2d` needs all three: they are how
+    // the guest names the host object it is importing
+    // (`VkImportMemoryResourceInfoMESA::resourceId`).
+    //
+    // §5 is explicit that re-pointing this reader at HWA2 is NOT a substitution
+    // and must not be planned as one. The replacement is a different MECHANISM:
+    // the ICD stops naming host resources at all and the KMD patches the resid
+    // in from `HeliosNativeRenderPatch` — **mesa lane unit A3**, plus K6. Until
+    // that lands, an ICD in this state CANNOT IMPORT, and §5 requires that to
+    // be recorded as the retirement's intended intermediate state rather than a
+    // regression.
+    //
+    // Refuse. Do not fall back, do not fabricate a 1x1 alias, do not reconstruct
+    // an identity from the allocation handle: an alias that is UNDERSIZE
+    // relative to the true allocation defeats even the oversize guard that
+    // caught the 38th-session import regression.
+    note_ddi_refusal(&DDI_REFUSALS.hwa2_open_needs_mesa_a3);
     log_error!(
-        "DDI open_resource identity: res_id={} alloc_size={} mem_type={} kind={} ctx={} meta_bind=0x{:x} meta_misc=0x{:x} open_bind=0x{:x} open_misc=0x{:x} dxgi_fmt={} d3dddi_fmt={}",
-        ident.resource_id, venus_alloc_size, ident.memory_type_index, ident.kind, ident.ctx_id,
-        meta.bind_flags, meta.misc_flags, open_bind, open_misc, open_dxgi_format, meta.format
-    );
-    // Ordinary shared images always retain their creator's OPTIMAL contract.
-    // Production scanout uses a separate KMD-owned plain-LINEAR target; never
-    // rebuild DWM imports as DRM-modifier images (the .38 regression).
-    let opened = dev.dxvk.open_texture2d(
-        meta.width.max(1),
-        meta.height.max(1),
-        open_dxgi_format,
-        open_bind,
-        open_misc,
-        a.hKMResource.handle,
-        ident.resource_id,
-        venus_alloc_size,
-        ident.memory_type_index,
-        ident.global_vidmm_tracker().map_or(0, |tracker| {
-            (u64::from(tracker.cookie) << 32) | u64::from(tracker.global_share)
-        }),
-        false,
-        false,
-        cross_context_optimal,
-    );
-    if opened.is_none() {
-        // Import of a KMD-validated-live resource failed: a real bug, not a
-        // condition to paper over with substitute content (audit C1.3).
-        log_error!(
-            "DDI open_resource FAILED: ddi-shared import {}x{} d3dfmt={} alloc=0x{:x} hKM={:?} res_id={} -> E_FAIL",
-            meta.width, meta.height, meta.format, allocation, a.hKMResource, ident.resource_id
-        );
-        set_runtime_error(h, E_FAIL);
-        return;
-    }
-
-    let Some(res) = opened else {
-        return;
-    };
-    let raw = res.as_raw() as usize;
-    stamp_dxvk_resource_kmt_handles(h, &res, allocation, a.hKMResource.handle);
-    let resident = match unsafe { make_resident(dev, allocation) } {
-        Ok(resident) => resident,
-        Err(hr) => {
-            log_error!(
-                "DDI open_resource FAILED: MakeResident alloc=0x{:x} hr=0x{:08x}",
-                allocation,
-                hr as u32
-            );
-            set_runtime_error(h, hr);
-            return;
-        }
-    };
-    log_error!(
-        "DDI open_resource ddi-shared ok: {}x{} d3dfmt={} alloc=0x{:x} hKM={:?} raw=0x{:x}",
-        meta.width,
-        meta.height,
-        meta.format,
-        allocation,
+        "DDI open_resource REFUSED: HWA2 carries no host resource id, venus allocation size \
+         or memory-type index, and the D3D11 import needs all three (hKM={:?} alloc=0x{:x} \
+         alloc_gen=0x{:x} {}x{} dxgi={} bind=0x{:x} misc=0x{:x} swizzle={} planes={}) -> \
+         blocked on mesa unit A3 (+K6): the ICD stops naming host resources and the KMD \
+         patches the resid in from HeliosNativeRenderPatch. An ICD in this state cannot \
+         import; this is the retirement's intended intermediate state, not a regression.",
         a.hKMResource,
-        raw
+        allocation,
+        descriptor.allocation_generation,
+        descriptor.width,
+        descriptor.height,
+        descriptor.dxgi_format,
+        descriptor.bind_flags,
+        descriptor.misc_flags,
+        descriptor.swizzle_class,
+        descriptor.plane_count
     );
-    let snapshot_source = (ident.resource_id != 0
-        && venus_alloc_size != 0
-        && meta.width != 0
-        && meta.height != 0
-        && open_dxgi_format != 0)
-        .then_some(SnapshotSourceDesc {
-            resource_id: ident.resource_id,
-            venus_alloc_size,
-            memory_type_index: ident.memory_type_index,
-            width: meta.width,
-            height: meta.height,
-            dxgi_format: open_dxgi_format,
-        });
-    store_resource(
-        h_resource,
-        res,
-        Some(resident),
-        a.hKMResource.handle,
-        h_rt.handle,
-        AllocationOwnership::OpenedByRuntime,
-        empty_present_private(),
-        snapshot_source,
-    );
+    set_runtime_error(h, E_FAIL);
 }
 
 pub(crate) unsafe extern "C" fn calc_size_opened_resource(

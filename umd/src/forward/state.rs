@@ -1,9 +1,11 @@
 //! Per-object state behind `pDrvPrivate`, and the accessors that reach it.
 //!
 //! `ResourceState`, `RtvState`, `ResidentAllocation` with its eviction Drop,
-//! the allocation-ownership and deallocate-form enums, the standard-allocation
-//! metadata readers, the device/context getters, and the store/load/release
-//! helpers for COM handles, resources and RTVs.
+//! the allocation-ownership and deallocate-form enums, the OPEN-time HWA2
+//! allocation-descriptor reader (K4 — it replaced the tolerant legacy trailer
+//! parsers and the `HeliosWddmOpenIdentity` restamp readers), the device/context
+//! getters, and the store/load/release helpers for COM handles, resources and
+//! RTVs.
 //!
 //! The typed slot decoding itself lives in [`super::handles`] (T5/R803); this
 //! module is the state those slots point AT.
@@ -76,6 +78,16 @@ pub(crate) enum AllocationOwnership {
     /// The runtime handed us the handle at `open_resource`. Passing these to
     /// `pfnDeallocateCb`'s HandleList form is what returned 0x80070057 and
     /// leaked the runtime's side of the open.
+    ///
+    /// ⚠ K4: currently UNCONSTRUCTED, and kept deliberately. `open_resource`
+    /// refuses every open until Mesa unit A3 supplies the host resource id HWA2
+    /// cannot carry (`K4-CONTRACT.md` §5), so nothing reaches `store_resource`
+    /// on the opened path today. Deleting the variant would delete the
+    /// deallocate-form rule that made the 0x80070057 leak unrepresentable, and
+    /// it would have to be reinvented — from the same bug — the moment A3
+    /// lands. `#[allow(dead_code)]` because "never constructed" is the true and
+    /// intended state of this variant right now, not an oversight.
+    #[allow(dead_code)]
     OpenedByRuntime,
 }
 
@@ -190,12 +202,13 @@ pub struct RtvState {
     pub(crate) format: u32,
 }
 
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub(crate) struct RuntimeAllocPrivate {
-    pub(crate) alloc: HeliosWddmAllocPrivate,
-    pub(crate) meta: HeliosWddmAllocMeta,
-}
+// ⛔ K4: `RuntimeAllocPrivate` (the 96-byte `HeliosWddmAllocPrivate` +
+// `HeliosWddmAllocMeta` pair this driver used to send into `pfnAllocateCb`) is
+// DELETED. The create-time record is one `HeliosWddmAllocationDescV2`, built by
+// `alloc::Hwa2CreateInput::build`. It had no `const _` layout assertion pinning
+// the two halves' adjacency either, which HWA2 does not need: it is a single
+// `#[repr(C)]` protocol struct whose every offset is asserted in
+// `protocol/src/wddm.rs`.
 
 #[inline]
 pub(crate) fn env_flag(name: &str) -> bool {
@@ -249,126 +262,65 @@ pub(crate) fn empty_present_private() -> HeliosPresentPrivateData {
     }
 }
 
-/// Legacy 24-byte trailer (geometry + bind/misc, no venus identity) written by
-/// pre-identity driver builds. Parse-only.
-#[repr(C)]
-#[derive(Default, Copy, Clone)]
-pub(crate) struct StandardAllocMetaV2 {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) format: u32,
-    pub(crate) pitch: u32,
-    pub(crate) bind_flags: u32,
-    pub(crate) misc_flags: u32,
-}
+// ⛔⛔ K4 DELETED four things that used to live here, and none of them may come
+// back under another name:
+//
+//  * `StandardAllocMetaV1` / `StandardAllocMetaV2` and `read_alloc_meta` — the
+//    TOLERANT trailer parser that accepted a 16-, 24- or 48-byte trailer and
+//    zero-extended it. HWA2 is exact-length by construction
+//    (`from_private_data` requires `bytes.len() == HELIOS_HWA2_BYTES`, not
+//    `>=`) because §10.3 says a malformed or truncated descriptor "makes
+//    create/open fail; it never selects a legacy parser". A tolerant parser IS
+//    a legacy parser.
+//  * `OpenedAllocation`, `read_open_identity`, `read_opened_allocation` — the
+//    readers of the KMD's open-time `HeliosWddmOpenIdentity` restamp. ⛔ The
+//    whole open-time restamp EXPECTATION is gone with them: the KMD no longer
+//    writes any byte of the private buffer at `DxgkDdiOpenAllocation` (K4
+//    acceptance obligation 5), the descriptor is written once at create and is
+//    `const` for every opener. An opener validates and reads; it never waits
+//    for a kernel write and never distinguishes "identity present, trailer
+//    absent".
+//
+// The successor is one function, below.
 
-/// Oldest legacy 16-byte trailer. Parse-only.
-#[repr(C)]
-#[derive(Default, Copy, Clone)]
-pub(crate) struct StandardAllocMetaV1 {
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) format: u32,
-    pub(crate) pitch: u32,
-}
-
-// The eight range tables that used to sit here are one row per format in
-// `crate::format`, which also carries the `0..=200` equivalence test that pins
-// every answer to the pre-change predicate. These are the thin adapters that
-// keep the call sites reading as they did.
-
-/// Parse the meta trailer at `base_off` bytes into the buffer, tolerating the
-/// two legacy (shorter) layouts. Returns a zero-extended [`HeliosWddmAllocMeta`].
-pub(crate) unsafe fn read_alloc_meta(
-    ptr: *const c_void,
-    size: u32,
-    base_off: usize,
-) -> Option<HeliosWddmAllocMeta> {
-    let avail = (size as usize).checked_sub(base_off)?;
-    let meta_ptr = (ptr as *const u8).add(base_off);
-    if avail >= core::mem::size_of::<HeliosWddmAllocMeta>() {
-        return Some(core::ptr::read_unaligned(
-            meta_ptr as *const HeliosWddmAllocMeta,
-        ));
-    }
-    if avail >= core::mem::size_of::<StandardAllocMetaV2>() {
-        let legacy = core::ptr::read_unaligned(meta_ptr as *const StandardAllocMetaV2);
-        return Some(HeliosWddmAllocMeta {
-            width: legacy.width,
-            height: legacy.height,
-            format: legacy.format,
-            pitch: legacy.pitch,
-            bind_flags: legacy.bind_flags,
-            misc_flags: legacy.misc_flags,
-            venus_alloc_size: 0,
-            memory_type_index: 0,
-            dxgi_format: 0,
-            plane_offset: 0,
-        });
-    }
-    if avail >= core::mem::size_of::<StandardAllocMetaV1>() {
-        let legacy = core::ptr::read_unaligned(meta_ptr as *const StandardAllocMetaV1);
-        return Some(HeliosWddmAllocMeta {
-            width: legacy.width,
-            height: legacy.height,
-            format: legacy.format,
-            pitch: legacy.pitch,
-            // KMD standard allocations predate these trailer fields. Use the
-            // composition-surface baseline so opened resources are renderable and
-            // shader-readable instead of constructing a zero-usage texture.
-            bind_flags: (D3D11_BIND_RENDER_TARGET.0 | D3D11_BIND_SHADER_RESOURCE.0) as u32,
-            misc_flags: 0,
-            venus_alloc_size: 0,
-            memory_type_index: 0,
-            dxgi_format: 0,
-            plane_offset: 0,
-        });
-    }
-    None
-}
-
-/// A fully identified open: the KMD's identity record AND the creator's meta
-/// trailer. The trailer is non-optional by construction — the import geometry
-/// is read out of it, so there is no `Option` left to default at the
-/// `open_ddi_texture2d` call and the 1x1 alias cannot be reconstructed.
-#[derive(Clone, Copy)]
-pub(crate) struct OpenedAllocation {
-    pub(crate) ident: HeliosWddmOpenIdentity,
-    pub(crate) meta: HeliosWddmAllocMeta,
-}
-
-/// Parse the OPEN-time private data: the KMD's versioned [`HeliosWddmOpenIdentity`]
-/// record (written in `DxgkDdiOpenAllocation` after validating the venus resource
-/// is LIVE) plus the creator's meta trailer. This replaces the adopt-id
-/// heuristics: an open-time buffer either carries a valid identity or the open is
-/// not backed by an identified venus resource.
+/// Read and validate the OPEN-time HWA2 descriptor out of one
+/// `(pPrivateDriverData, PrivateDriverDataSize)` pair.
 ///
-/// This is the DIAGNOSTIC parse: it tolerates a missing trailer so the C1
-/// identity evidence lines can still print what the buffer actually held. An
-/// open must go through [`read_opened_allocation`] instead — an identity with
-/// no trailer carries no geometry and is not openable.
-pub(crate) unsafe fn read_open_identity(
+/// Two-stage on purpose, and the stages are separately countable at the call
+/// site: a buffer of the wrong LENGTH is a different fact from a 168-byte
+/// buffer whose CONTENT is invalid. The old reader collapsed both (and a third,
+/// "no identity at all") into `None`, so `open_resource`'s refusal could not say
+/// which had happened.
+///
+/// # Safety
+///
+/// `ptr` must be null or point to at least `size` readable bytes — i.e. exactly
+/// the contract dxgkrnl states for the pair. Nothing beyond `size` is read: the
+/// slice is built with the runtime's own length and
+/// [`HeliosWddmAllocationDescV2::from_private_data`] does the exact-length
+/// check, so a short buffer is refused rather than over-read. That is the
+/// out-of-bounds read the constructor's doc exists to prevent, and it is why
+/// this never casts the pointer to the struct type.
+pub(crate) unsafe fn read_open_descriptor(
     ptr: *const c_void,
     size: u32,
-) -> Option<(HeliosWddmOpenIdentity, Option<HeliosWddmAllocMeta>)> {
-    if ptr.is_null() || (size as usize) < core::mem::size_of::<HeliosWddmOpenIdentity>() {
-        return None;
+) -> Result<HeliosWddmAllocationDescV2, HeliosAllocDescRejection> {
+    if ptr.is_null() {
+        return Err(HeliosAllocDescRejection::PrivateDataSize {
+            found: 0,
+            expected: HELIOS_HWA2_BYTES as usize,
+        });
     }
-    let ident = core::ptr::read_unaligned(ptr as *const HeliosWddmOpenIdentity);
-    if !ident.is_valid() || ident.resource_id == 0 {
-        return None;
-    }
-    let meta = read_alloc_meta(ptr, size, core::mem::size_of::<HeliosWddmOpenIdentity>());
-    Some((ident, meta))
-}
-
-/// The parse an OPEN may use: identity plus a present meta trailer, or nothing.
-pub(crate) unsafe fn read_opened_allocation(
-    ptr: *const c_void,
-    size: u32,
-) -> Option<OpenedAllocation> {
-    let (ident, meta) = read_open_identity(ptr, size)?;
-    Some(OpenedAllocation { ident, meta: meta? })
+    // SAFETY: the caller's contract above — `ptr` is readable for `size` bytes.
+    // `size` is a `u32`, so the length can never exceed `isize::MAX` and the
+    // slice cannot wrap the address space.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, size as usize) };
+    let desc = HeliosWddmAllocationDescV2::from_private_data(bytes)?;
+    // The OUTPUT/open-time validator: `validate` requires a nonzero
+    // KMD-assigned `allocation_generation`, which is exactly what distinguishes
+    // a descriptor the kernel has stamped from a create-input request.
+    desc.validate(HELIOS_PACKAGE_GENERATION)?;
+    Ok(desc)
 }
 
 // --- handle <-> COM helpers -------------------------------------------------

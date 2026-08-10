@@ -36,7 +36,7 @@ mod vehicle;
 mod views;
 
 pub(super) use crate::bridge::{DstRes, PresentStreamCorrelation, SrcRes};
-pub(super) use alloc::{ScanoutGeometry, VenusBacking};
+pub(super) use alloc::{Hwa2CreateInput, Hwa2InputRefusal, ScanoutGeometry, VenusBacking};
 pub(crate) use bindings::*;
 pub(crate) use deferred::*;
 pub(crate) use format_caps::*;
@@ -78,19 +78,28 @@ pub(super) use windows::Win32::Graphics::Direct3D::{
 pub(super) use windows::Win32::Graphics::Direct3D11::*;
 pub(super) use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
+// ⛔ K4 / HPS2 retirement: the create-time `HeliosWddmAllocPrivate` +
+// `HeliosWddmAllocMeta` pair, the open-time `HeliosWddmOpenIdentity` restamp,
+// the `HELIOS_WDDM_ALLOC_KIND_*` / `HELIOS_WDDM_ALLOC_MISC_*` vocabularies, the
+// `GLOBAL_VIDMM_TRACKER` blob-flag overload and the `VIRTIO_GPU_BLOB_*` create
+// words are ALL retired from this driver's allocation seam. One record crosses
+// it now — `HeliosWddmAllocationDescV2` (HWA2, 168 B) — and it is built in
+// `forward/alloc.rs` and read in `forward/state.rs`. Nothing here may re-import
+// a `wddm_legacy` allocation symbol: `docs/retirement/K4-CONTRACT.md` §1
+// (the two-stage contract), §5 (the `resource_id` gap is NAMED, not bridged)
+// and §6 (the VidMm tracker has no successor).
+//
+// ⚠ The `HeliosPresent*` family below is a DIFFERENT record set (present
+// tickets, §10.5) with its own retirement unit; K4 does not touch it.
 pub(super) use helios_protocol::{
-    HeliosPresentPrivateData, HeliosPresentRefreshCmd, HeliosPresentRenderCmd, HeliosWddmAllocMeta,
-    HeliosWddmAllocPrivate, HeliosWddmOpenIdentity, HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT,
+    HeliosAllocDescRejection, HeliosPresentPrivateData, HeliosPresentRefreshCmd,
+    HeliosPresentRenderCmd, HeliosWddmAllocationDescV2, HELIOS_HWA2_BYTES,
+    HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY, HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE,
+    HELIOS_PACKAGE_GENERATION, HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT,
     HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT, HELIOS_PRESENT_PRIVATE_FLAG_WINDOWED_BLT_SNAPSHOT,
-    HELIOS_PRESENT_PRIVATE_MAGIC, HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE,
-    HELIOS_PRESENT_SNAPSHOT_PURPOSE_WINDOWED_BLT,
-    HELIOS_PRESENT_PRIVATE_VERSION, HELIOS_PRESENT_REFRESH_MAGIC,
+    HELIOS_PRESENT_PRIVATE_MAGIC, HELIOS_PRESENT_PRIVATE_VERSION, HELIOS_PRESENT_REFRESH_MAGIC,
     HELIOS_PRESENT_REFRESH_VERSION, HELIOS_PRESENT_RENDER_MAGIC, HELIOS_PRESENT_RENDER_VERSION,
-    HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD,
-    HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT, HELIOS_WDDM_ALLOC_MISC_OPTIMAL_GDI_TEXTURE,
-    HELIOS_WDDM_ALLOC_MISC_PRIMARY, HELIOS_WDDM_BLOB_FLAG_GLOBAL_VIDMM_TRACKER,
-    VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
-    VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_CACHED,
+    HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE, HELIOS_PRESENT_SNAPSHOT_PURPOSE_WINDOWED_BLT,
 };
 
 pub(super) use crate::ddi;
@@ -123,7 +132,7 @@ pub(super) type Hdevice = ddi::D3D10DDI_HDEVICE;
 pub(super) use helios_umd_common::throttle::LogThrottle;
 
 // The refusal-counter MECHANISM (`DECISIONS.md` D3b, stage S2). ⛔ Only the
-// mechanism is shared: the eleven counters below are this driver's, and
+// mechanism is shared: the counters below are this driver's, and
 // `umd12` declares its own set. `CONFORMANCE.md`'s charter reads
 // `DDI refusals:` per driver.
 use helios_umd_common::refusals::{self, RefusalCounter};
@@ -163,7 +172,8 @@ pub(super) use crate::format;
 /// The lossy DXGI -> legacy D3DDDIFORMAT downgrade the KMD's
 /// `DxgkDdiDescribeAllocation` consumes. Counted, not refused: only two DXGI
 /// formats have a spelling here, the EXACT format travels beside it in
-/// `HeliosWddmAllocMeta::dxgi_format`, and every consumer that needs
+/// `HeliosWddmAllocationDescV2::dxgi_format` (HWA2 offset 48, K4 -- it was the
+/// retired `HeliosWddmAllocMeta::dxgi_format`), and every consumer that needs
 /// bpp/layout reads that one. It was the last silent answer in the format
 /// readers.
 fn dxgi_to_d3dddi_format(fmt: u32) -> u32 {
@@ -174,9 +184,14 @@ fn dxgi_to_d3dddi_format(fmt: u32) -> u32 {
     d3dddi
 }
 
-fn d3dddi_to_dxgi_format(fmt: u32) -> DXGI_FORMAT {
-    DXGI_FORMAT(format::from_d3dddi(fmt) as i32)
-}
+// ⛔ K4 deleted `d3dddi_to_dxgi_format`, the reverse (D3DDDIFORMAT -> DXGI)
+// translation. Its ONLY caller was `open_resource`'s fallback for a creator
+// that had recorded no DXGI format — a legacy-trailer / KMD-standard-allocation
+// case that assumed BGRA. HWA2 carries the EXACT `DXGI_FORMAT` at offset 48 and
+// hard-fails an image kind that leaves it `UNKNOWN`, so there is no longer a
+// descriptor from which the format has to be guessed. Reintroducing the
+// fallback would reintroduce the collapse-everything-to-BGRA bug that made an
+// A8 mask rebuild at 4 bpp.
 
 /// Bytes per pixel of an (uncompressed) `DXGI_FORMAT`, for computing the WDDM
 /// surface pitch.
@@ -286,7 +301,7 @@ fn device_is_live(device: usize) -> bool {
     }
 }
 
-/// The eleven DDI paths that refuse or silently downgrade runtime-requested work.
+/// The DDI paths that refuse or silently downgrade runtime-requested work.
 ///
 /// Each field is a legitimate runtime decision about runtime-supplied data, so
 /// a *type* encoding would be cosmetic — what they lacked was any record at
@@ -329,16 +344,22 @@ struct DdiRefusals {
     /// `create_resource` with a resource dimension outside the four we handle.
     unhandled_resource_dimension: RefusalCounter,
     /// A DXGI format with no legacy D3DDDIFORMAT spelling, stamped into the
-    /// KMD allocation meta as `D3DDDIFMT_UNKNOWN` (0).
+    /// allocation descriptor as `D3DDDIFMT_UNKNOWN` (0).
     ///
     /// The tenth, added with R1010. `format::to_d3dddi` knows exactly two
     /// formats -- R8G8B8A8_UNORM and B8G8R8A8_UNORM -- and answered 0 for
     /// everything else with no log and no counter; that 0 goes straight into
-    /// `HeliosWddmAllocMeta::format`, which `DxgkDdiDescribeAllocation`
-    /// consumes. It is a legitimate downgrade (the EXACT format travels
+    /// the descriptor's `D3DDDIFORMAT` field, which
+    /// `DxgkDdiDescribeAllocation` consumes. It is a legitimate downgrade (the EXACT format travels
     /// separately in `dxgi_format`, which is what every consumer that needs
     /// bpp/layout reads), so this counts rather than refuses -- but it was the
     /// one silent path the format table's readers still had.
+    ///
+    /// ⚠ K4 renamed the destination, not the counter: the lossy value now lands
+    /// in `HeliosWddmAllocationDescV2::d3d_ddi_format` (HWA2 offset 52) beside
+    /// the exact `dxgi_format` at offset 48. The counter's NAME is the evidence
+    /// contract (`DDI refusals:` lines are diffed across builds), so it keeps
+    /// its spelling.
     alloc_meta_format_unknown: RefusalCounter,
     /// `maybe_log_present_readback` refusing to sample a mapped surface whose
     /// `dxgi_bytes_per_pixel` stride would leave the mapped row.
@@ -349,6 +370,88 @@ struct DdiRefusals {
     /// bounds for a genuinely 16-bpp or block-compressed surface, and a
     /// refusal has to be countable like every other.
     readback_stride_unsafe: RefusalCounter,
+
+    // ── K4 / HPS2 retirement: the HWA2 allocation seam ──────────────────────
+    //
+    // ⛔ APPEND-ONLY, and appended deliberately at the end: `DDI_REFUSAL_SET`'s
+    // order is the evidence contract, and inserting these next to the older
+    // allocation counter would re-order every line a build-to-build diff reads.
+    /// This driver's own create-input descriptor failed
+    /// `HeliosWddmAllocationDescV2::validate_create_input` BEFORE
+    /// `pfnAllocateCb`. A producer bug in `Hwa2CreateInput::build`, never a
+    /// runtime-data condition — the create is refused rather than sent, because
+    /// the KMD would refuse it anyway and a self-check that only logs is not a
+    /// check.
+    hwa2_input_invalid: RefusalCounter,
+    /// `pfnAllocateCb` returned success but the descriptor that came back
+    /// failed `validate_create_output`: a missing/zero `allocation_generation`,
+    /// a mutated field, or a package-generation mismatch.
+    ///
+    /// ⚠ Before K4 NOTHING checked the write-back — the old code diffed six
+    /// fields into a log line and trusted whatever it found. The allocation is
+    /// rolled back and the create fails, because a descriptor that disagrees
+    /// with the resource we believe we made is exactly the state §10.3 exists
+    /// to make impossible.
+    hwa2_output_invalid: RefusalCounter,
+    /// A create needs the kernel to ADOPT this process's venus resource, and
+    /// HWA2 cannot name a host resource id (§10.3: "no host resource token,
+    /// resid, … A host resid may live SOLELY inside the KMD allocation
+    /// object"). Refused, not substituted.
+    ///
+    /// ⛔ The replacement is **Mesa lane unit A3** (plus K6): the ICD stops
+    /// naming host resources at all and the KMD patches the resid in from
+    /// `HeliosNativeRenderPatch`. `K4-CONTRACT.md` §5 is explicit that this is
+    /// NOT a substitution and must not be planned as one — so until A3 lands
+    /// this counter moving IS the expected steady state, and every shared /
+    /// keyed-mutex / present / primary D3D11 texture create fails. That is the
+    /// retirement's intended intermediate state, not a regression.
+    hwa2_create_venus_backing_needs_mesa_a3: RefusalCounter,
+    /// No open-time private buffer (per-allocation or resource-level) was
+    /// exactly `HELIOS_HWA2_BYTES`. `from_private_data` requires an exact
+    /// length — §10.3 forbids ever selecting a legacy parser, so a 96-byte
+    /// pre-retirement buffer or an oversized resource-level buffer is refused
+    /// by name instead of being read as a prefix.
+    hwa2_open_private_size: RefusalCounter,
+    /// An open-time buffer WAS 168 bytes but failed
+    /// `HeliosWddmAllocationDescV2::validate`.
+    hwa2_open_desc_invalid: RefusalCounter,
+    /// A valid HWA2 open descriptor, and the import still cannot proceed: the
+    /// D3D11 import path needs the host `resource_id` / `venus_alloc_size` /
+    /// Vulkan memory-type index that HWA2 deliberately does not carry.
+    ///
+    /// ⛔ Same gap as `hwa2_create_venus_backing_needs_mesa_a3`, other end of
+    /// the wire, same owner: **Mesa unit A3**. `K4-CONTRACT.md` §5 requires
+    /// this to fail loudly and to record that "an ICD in this state cannot
+    /// import" — never to fall back, never to fabricate a 1x1 alias (audit
+    /// U-B2, the black-forever failure).
+    hwa2_open_needs_mesa_a3: RefusalCounter,
+    /// A D3D11 DDI bind bit with no HWA2 counterpart was dropped from the
+    /// descriptor (`D3D11DDI_BIND_CAPTURE`, or anything the runtime adds
+    /// later). A counted downgrade, in the `alloc_meta_format_unknown` class:
+    /// HWA2's bind word is descriptive metadata for an opener and no consumer
+    /// in this stack reads the capture bind.
+    hwa2_bind_bits_dropped: RefusalCounter,
+    /// D3D11 DDI misc bits with no HWA2 counterpart were dropped
+    /// (`AUTO_GEN_MIP_MAP`, `DRAWINDIRECT_ARGS`, `BUFFER_ALLOW_RAW_VIEWS`,
+    /// `BUFFER_STRUCTURED`, `TILED`, `TILE_POOL`). The retired trailer carried
+    /// `MiscFlags` RAW, so these used to reach an opener; HWA2 offset 76 is a
+    /// four-bit protocol vocabulary and they do not. Counted, not silent.
+    hwa2_misc_bits_dropped: RefusalCounter,
+    /// The create's plane-0 record could not be expressed inside `byte_size`:
+    /// a zero row pitch, a `row_pitch * height` that overflows, or an
+    /// `offset + slice_pitch` past the extent. Refused — an unbounded plane is
+    /// the shape the oversize/undersize import guards exist to catch.
+    hwa2_plane_unrepresentable: RefusalCounter,
+    /// An image-kind create whose `DXGI_FORMAT` is `UNKNOWN`. HWA2 hard-fails
+    /// it and there is nothing to substitute: the exact format is what an
+    /// opener rebuilds the image from (the A8-mask-as-BGRA regression).
+    hwa2_image_format_unknown: RefusalCounter,
+    /// A create reached `allocate_wddm_resource` with a
+    /// `D3D10DDIRESOURCE_TYPE` outside the four dimensions HWA2's kind enum can
+    /// express. Unreachable through `create_resource`, which refuses an unknown
+    /// dimension first (`unhandled_resource_dimension`); counted separately so
+    /// a future caller that skips that gate cannot allocate with a guessed kind.
+    hwa2_unknown_dimension: RefusalCounter,
 }
 
 /// ⚠ Each counter now carries its own NAME (`RefusalCounter`, stage S2), so
@@ -368,11 +471,25 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
     unhandled_resource_dimension: RefusalCounter::new("unhandled_resource_dimension"),
     alloc_meta_format_unknown: RefusalCounter::new("alloc_meta_format_unknown"),
     readback_stride_unsafe: RefusalCounter::new("readback_stride_unsafe"),
+    hwa2_input_invalid: RefusalCounter::new("hwa2_input_invalid"),
+    hwa2_output_invalid: RefusalCounter::new("hwa2_output_invalid"),
+    hwa2_create_venus_backing_needs_mesa_a3: RefusalCounter::new(
+        "hwa2_create_venus_backing_needs_mesa_a3",
+    ),
+    hwa2_open_private_size: RefusalCounter::new("hwa2_open_private_size"),
+    hwa2_open_desc_invalid: RefusalCounter::new("hwa2_open_desc_invalid"),
+    hwa2_open_needs_mesa_a3: RefusalCounter::new("hwa2_open_needs_mesa_a3"),
+    hwa2_bind_bits_dropped: RefusalCounter::new("hwa2_bind_bits_dropped"),
+    hwa2_misc_bits_dropped: RefusalCounter::new("hwa2_misc_bits_dropped"),
+    hwa2_plane_unrepresentable: RefusalCounter::new("hwa2_plane_unrepresentable"),
+    hwa2_image_format_unknown: RefusalCounter::new("hwa2_image_format_unknown"),
+    hwa2_unknown_dimension: RefusalCounter::new("hwa2_unknown_dimension"),
 };
 
 /// The set, in the order the summary prints them. ⛔ This order is the
 /// evidence contract: `DDI refusals:` lines from different builds are diffed.
-static DDI_REFUSAL_SET: [&RefusalCounter; 11] = [
+/// The K4 counters are APPENDED so every pre-existing column keeps its place.
+static DDI_REFUSAL_SET: [&RefusalCounter; 22] = [
     &DDI_REFUSALS.srv_raw_hazard,
     &DDI_REFUSALS.resource_raw_hazard,
     &DDI_REFUSALS.text_filter_size_ignored,
@@ -384,9 +501,20 @@ static DDI_REFUSAL_SET: [&RefusalCounter; 11] = [
     &DDI_REFUSALS.unhandled_resource_dimension,
     &DDI_REFUSALS.alloc_meta_format_unknown,
     &DDI_REFUSALS.readback_stride_unsafe,
+    &DDI_REFUSALS.hwa2_input_invalid,
+    &DDI_REFUSALS.hwa2_output_invalid,
+    &DDI_REFUSALS.hwa2_create_venus_backing_needs_mesa_a3,
+    &DDI_REFUSALS.hwa2_open_private_size,
+    &DDI_REFUSALS.hwa2_open_desc_invalid,
+    &DDI_REFUSALS.hwa2_open_needs_mesa_a3,
+    &DDI_REFUSALS.hwa2_bind_bits_dropped,
+    &DDI_REFUSALS.hwa2_misc_bits_dropped,
+    &DDI_REFUSALS.hwa2_plane_unrepresentable,
+    &DDI_REFUSALS.hwa2_image_format_unknown,
+    &DDI_REFUSALS.hwa2_unknown_dimension,
 ];
 
-/// One bounded log line carrying all eleven counters.
+/// One bounded log line carrying every counter.
 ///
 /// The UMD's evidence channel is the log — it has no registry counter surface —
 /// and T5 proved the failure mode this avoids: three of the four R806/R809

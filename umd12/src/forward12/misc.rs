@@ -574,12 +574,13 @@ unsafe fn fill_kmt_allocation_info(
             // this driver and there is no second physical adapter to index.
             PhysicalAdapterIndex: 0,
             hAllocation: identity.h_allocation,
-            // ⚠ The resource's offset **within the allocation**, which is the venus
-            // `VkDeviceMemory` the allocation adopted whole — so it is
-            // `memory_offset`, and UP-3's dedicated export makes it 0. Carried rather
-            // than hardcoded: `adopt_presentable` refuses a non-zero one, so a
-            // non-zero value reaching here would be a finding, and writing a literal
-            // 0 would hide it.
+            // ⚠ The resource's offset **within the `VkDeviceMemory` the engine bound
+            // it to**, which is the extent `HeliosWddmAllocationDescV2::byte_size`
+            // describes — so it is `memory_offset`, and the fork's dedicated
+            // allocation makes it 0. Carried rather than hardcoded:
+            // `create_committed_allocation` refuses a non-zero one, so a non-zero
+            // value reaching here would be a finding, and writing a literal 0 would
+            // hide it.
             Offset: identity.memory_offset,
             // The whole `VkMemoryAllocateInfo::allocationSize`, i.e. the allocation's
             // size — **not** the resource's. `identity12::PresentableIdentity::

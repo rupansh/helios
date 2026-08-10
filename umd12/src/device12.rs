@@ -22,11 +22,21 @@
 //! This block is **per-object, per-process, and crosses no module boundary** —
 //! nothing outside this DLL ever reads it — so it lives here, typed against
 //! `ddi12`, which is what D13's refined form says. What must never be
-//! re-declared here is the private data that *does* cross: the allocation
-//! private driver data (`HeliosWddmAllocPrivate`), the KMD-stamped open identity
-//! (`HeliosWddmOpenIdentity`) and the present identity channel
-//! (`HeliosPresentRenderCmd`). Those are `helios_protocol`'s, already read by
-//! `umd`, `kmd_render` and the Mesa ICD, and L4/L8 reuse them verbatim.
+//! re-declared here is the private data that *does* cross: since the HPS2
+//! retirement that is the single create-time allocation descriptor
+//! `HeliosWddmAllocationDescV2` (`'HWA2'`, 168 bytes), which L4 builds, sends
+//! through `pfnAllocateCb` and validates the kernel's write-back of. It is
+//! `helios_protocol`'s, read by `kmd_render` and by the D3D11 driver, and L4
+//! reuses it verbatim.
+//!
+//! ⚠ The three records this block used to name — `HeliosWddmAllocPrivate`, the
+//! KMD-stamped `HeliosWddmOpenIdentity` and the `HeliosPresentRenderCmd` present
+//! identity channel — are **retired**, and the reversal is recorded rather than
+//! quietly edited. The first two are replaced by HWA2 in one direction only (the
+//! KMD writes at create, every opener treats it as `const`); the third has no
+//! successor in this driver yet, because its `resource_id` is a host resource id
+//! §10.3 forbids any UMD supplying — see `PresentIdentityNoResourceId` and mesa
+//! lane unit A3.
 //!
 //! # The unwind guard
 //!

@@ -143,17 +143,16 @@ mod ffi {
             out_status: *mut u32,
         ) -> bool;
 
-        /// Hand the venus resource behind `resource`'s memory to the WDDM
-        /// allocation that has just adopted it (UP-5). Returns the res_id it
-        /// transferred, or 0 — which is a defect, see the wrapper.
-        ///
-        /// # Safety
-        /// As [`resource_venus_identity`](Self::resource_venus_identity)'s
-        /// `resource`.
-        unsafe fn transfer_resource_ownership(
-            self: &HeliosVkd3dDevice,
-            resource: usize,
-        ) -> u32;
+        // ⛔⛔ **`transfer_resource_ownership` is DELETED by the HPS2 retirement
+        // (K4).** It handed the venus resource behind a resource's memory to the
+        // WDDM allocation that had just **adopted** it, so the ICD would stop
+        // unref'ing it. There is no adoption: `HeliosWddmAllocationDescV2` carries
+        // no host resource token (§10.3), the KMD creates the allocation's backing
+        // rather than taking ownership of the guest's, and the ICD keeps its own
+        // resource — so there is nothing to transfer and no double-unref to
+        // prevent. ⚠ The C++ member of the same name is left standing in
+        // `bridge/vkd3d_bridge.{h,cpp}`, which this lane does not own; an unused
+        // C++ member is not a build failure, and removing it is a cross-lane edit.
 
         /// Create a vkd3d device on the Helios adapter identified by the split
         /// LUID. Returns a null `UniquePtr` on failure (adapter not found,
@@ -310,13 +309,12 @@ impl BridgeDevice12 {
     /// written by the CTX_CREATE of the thread that created **this** device's
     /// instance, which no concurrent create can replace.
     ///
-    /// 0 means the ICD is absent or predates the export. ⚠ A 0 is not fatal: the
-    /// KMD's adopt path never reads `ctx_id` (`helios_protocol::classify` returns
-    /// `AdoptedUmdResource` from `adopt_resource_id` alone, and the adopt arm of
-    /// `build_backing` does not consult it), so the field is a diagnostic that
-    /// reaches `HeliosWddmOpenIdentity::ctx_id` — which that record's own doc
-    /// calls *"diagnostic only"*. It is counted rather than refused for exactly
-    /// that reason.
+    /// 0 means the ICD is absent or predates the export. ⚠ A 0 is not fatal, and
+    /// since the HPS2 retirement it reaches the kernel not at all:
+    /// `HeliosWddmAllocationDescV2` has **no context field**, and the retired
+    /// `HeliosWddmOpenIdentity::ctx_id` it used to travel into was *"diagnostic
+    /// only"* by that record's own doc. It is now process-local evidence, counted
+    /// (`IdentityCtxIdUnavailable`) rather than refused.
     pub(crate) fn venus_instance_context_id(&self) -> u32 {
         self.get().map_or(0, |d| d.venus_instance_context_id())
     }
@@ -332,11 +330,14 @@ impl BridgeDevice12 {
     /// the export chain did not engage. Collapsing it to `None` would throw away
     /// the evidence that distinguishes it from *"this resource has no memory"*.
     ///
-    /// ⛔ **Only `Resolved` may be used to build an allocation.** Every other
-    /// status leaves `venus_res_id == 0`, and 0 is precisely the value that makes
-    /// the KMD *create* a resource instead of adopting ours
-    /// (`create_allocation.rs:2377`), so passing one through would silently
-    /// produce an allocation backed by memory nothing renders into.
+    /// ⚠⚠ **The admission rule this doc used to state is RETIRED, and it is written
+    /// out rather than quietly edited.** It said *"only `Resolved` may be used to
+    /// build an allocation"*, because every other status left `venus_res_id == 0`
+    /// and 0 was the value that made the KMD *create* instead of adopting ours.
+    /// There is no adopt arm: `HeliosWddmAllocationDescV2` carries no host resource
+    /// token at all (§10.3). ⇒ `create_committed_allocation`'s predicate is now the
+    /// **engine half alone** — a nonzero `vk_memory` with a nonzero `memory_size`,
+    /// which is what HWA2's `byte_size` needs — and the venus half is a census.
     ///
     /// # Safety
     /// `resource` must be a live `ID3D12Resource*` **created by this bridge's
@@ -384,26 +385,8 @@ impl BridgeDevice12 {
         }
     }
 
-    /// Hand the venus resource behind `resource`'s memory over to the WDDM
-    /// allocation that has just adopted it. Returns the transferred res_id, or 0.
-    ///
-    /// ⛔ **Call only AFTER `pfnAllocateCb` has succeeded**, and treat a 0 as a
-    /// defect rather than a degraded read: the ICD stops unref'ing the host
-    /// resource only once this has run, so a 0 leaves the resource owned by both
-    /// the ICD and the kernel allocation and it is unref'd twice — the res-45
-    /// invalid-import class `create_allocation.rs`'s adopt arm exists to prevent.
-    /// Transferring *before* the allocation would be the mirror-image bug: an
-    /// allocation failure would then leave the resource owned by nobody.
-    ///
-    /// # Safety
-    /// As [`Self::resource_venus_identity`].
-    pub(crate) unsafe fn transfer_resource_ownership(&self, resource: usize) -> u32 {
-        let Some(device) = self.get() else {
-            return 0;
-        };
-        // SAFETY: as `resource_venus_identity`; no out-params.
-        unsafe { device.transfer_resource_ownership(resource) }
-    }
+    // ⛔ The `transfer_resource_ownership` wrapper is deleted with the cxx
+    // declaration above; see that block for the argument.
 }
 
 /// The venus identity of one `ID3D12Resource`'s bound memory.
@@ -422,19 +405,37 @@ pub(crate) struct ResourceVenusIdentity {
     /// *the resource's first allocation*.
     pub(crate) vk_memory: u64,
     /// The resource's byte offset within `vk_memory`. ⚠ **Must be 0 for anything
-    /// that gets a WDDM allocation.** One venus resource id covering several D3D12
-    /// resources breaks the one-resource-one-allocation rule, and the D3D11 adopt
-    /// path requires `memory_offset == 0` outright
-    /// (`umd/src/forward/resource.rs:488-490`).
+    /// that gets a WDDM allocation**, and `create_committed_allocation` refuses a
+    /// non-zero one.
+    ///
+    /// ⚠ **The reason is restated rather than left stale.** It used to be that one
+    /// venus resource id covering several D3D12 resources breaks the
+    /// one-resource-one-allocation rule, citing the D3D11 *adopt* path. There is no
+    /// adoption and no resource id (K4-CONTRACT §5). The reason now is
+    /// `HeliosWddmAllocationDescV2`'s own shape: `byte_size` is the exact backing
+    /// extent and every plane record is bounded against it, so a suballocated
+    /// resource would have its rows described inside an extent it does not own.
     pub(crate) memory_offset: u64,
     /// The whole `VkDeviceMemory`'s `VkMemoryAllocateInfo::allocationSize`, as
     /// vkd3d recorded it — **not** the resource's size.
     pub(crate) memory_size: u64,
     /// vkd3d's `memoryTypeIndex` for `vk_memory`.
+    ///
+    /// ⛔ **K4-CONTRACT §5's second casualty, by name.** HWA2's `memory_class` is a
+    /// three-value protocol enum and its doc is explicit — *"no Vulkan memory-type
+    /// index. ⛔ The retired trailer carried `memory_type_index`; it is gone"*. Same
+    /// treatment as [`Self::venus_res_id`]: logged once in the A3 census, never sent.
     pub(crate) memory_type_index: u32,
-    /// The venus resource id backing `vk_memory`, i.e. the value that becomes
-    /// `HeliosWddmAllocPrivate::adopt_resource_id`. Non-zero only on
+    /// The venus resource id backing `vk_memory`. Non-zero only on
     /// [`IdentityStatus::Resolved`].
+    ///
+    /// ⛔ **It may not be sent to the kernel, and nothing in this driver sends it.**
+    /// It used to become `HeliosWddmAllocPrivate::adopt_resource_id`; §10.3 forbids
+    /// any UMD naming a host resource id, HWA2 has no field for one, and
+    /// `docs/retirement/K4-CONTRACT.md` §5 forbids inventing a replacement or
+    /// stashing it elsewhere. It is read at exactly one site — the
+    /// `Hwa2VenusResIdDropped` census — so that the drop is a counted event with a
+    /// log line naming **mesa lane unit A3** rather than a silence.
     pub(crate) venus_res_id: u32,
     /// The ICD's own record of the creating `vkAllocateMemory`'s `allocationSize`.
     /// Expected to equal [`Self::memory_size`] — two independent sources for one

@@ -80,61 +80,59 @@
 //! cast. That is the same finding the 80th memory records for formats: D3D11
 //! harmonised its DDI enums with the API's and D3D12 did **not**.
 //!
-//! # ⛔ `DECISIONS.md` D13 — and why this lane now DOES take the dependency
+//! # ⛔ `DECISIONS.md` D13, and the ONE record this lane writes
 //!
 //! D13 binds this lane hardest: private data that CROSSES a module boundary is
-//! declared once, in `helios_protocol`, and reused verbatim —
-//! `HeliosWddmAllocPrivate` (`'HWDM'`), `HeliosWddmAllocMeta`,
-//! `HeliosWddmOpenIdentity` (`'HIDN'`), `HeliosPresentPrivateData` and
-//! `HeliosPresentRenderCmd`.
+//! declared once, in `helios_protocol`, and reused verbatim. Since the HPS2
+//! retirement (`docs/retirement/K4-CONTRACT.md`) that is exactly **one** record on
+//! this path — [`helios_protocol::HeliosWddmAllocationDescV2`] (`'HWA2'`, 168 bytes),
+//! the versioned immutable create-time allocation descriptor.
 //!
-//! ⚠ **This block used to say the opposite**, and the reversal is recorded
-//! rather than quietly edited. It said this lane *"declares no such record and
-//! takes no `helios_protocol` dependency, because it writes none: it mints no
-//! WDDM allocation"* — vkd3d's memory being minted by the Mesa venus ICD
-//! through its own `D3DKMT` path, so this driver never calls `pfnAllocateCb`.
-//! Every clause of that was true of L4 as shipped, and the conclusion is now
-//! **wrong**, because `KMD_IMPACT.md` §14a.3 settled what the D3D12 present path
-//! actually needs: not the ICD handing over a `D3DKMT_HANDLE` (it has none that
-//! means anything — its only `D3DKMTCreateAllocation2` mints a
-//! `kind = TRACKING` VidMm charge the KMD forbids from carrying identity,
-//! `create_allocation.rs:2333-2344`), and not this driver allocating and the ICD
-//! importing (backwards), but the third shape, the one D3D11 ships: **the engine
-//! allocates the Vulkan memory and this driver ADOPTS it**, by calling
-//! `pfnAllocateCb` with `HeliosWddmAllocPrivate.adopt_resource_id = <venus
-//! resid>`. The KMD already accepts exactly that
-//! (`create_allocation.rs:2377-2379`: `kind == DEVICE_MEMORY &&
-//! adopt_resource_id != 0` → `AllocationBacking::AdoptedUmdResource`, with
-//! `write_open_identity` stamping `HeliosWddmOpenIdentity` back so DWM's D3D11
-//! opener works unchanged) — so there is no new allocation shape and no new KMD
-//! verb, only a writer this lane did not have. The model to mirror is
-//! `umd/src/forward/resource.rs:263-324` (build the record) and `:374` (the one
-//! `pfnAllocateCb` call site — there is exactly one, for four callers).
+//! ⚠ **This block has been wrong twice and both reversals are recorded rather than
+//! quietly edited.**
+//!
+//! 1. It first said this lane *"declares no such record and takes no
+//!    `helios_protocol` dependency, because it writes none: it mints no WDDM
+//!    allocation"*. UP-5 falsified that: [`create_committed_allocation`] calls
+//!    `pfnAllocateCb` for every committed resource,
+//!    [`deallocate_committed`] releases the handle in
+//!    [`destroy_heap_and_resource`], and [`check_resource_allocation_handle`] answers
+//!    with the real `D3DKMT_HANDLE` instead of 0.
+//! 2. It then said the record written there was the pair `HeliosWddmAllocPrivate`
+//!    (`'HWDM'`) + `HeliosWddmAllocMeta`, with
+//!    `HeliosWddmAllocPrivate.adopt_resource_id = <venus resid>` so the KMD would
+//!    **adopt** the engine's memory, and `HeliosWddmOpenIdentity` (`'HIDN'`) restamped
+//!    back at open time so DWM's D3D11 opener worked unchanged. **That whole model is
+//!    retired.** §10.3 forbids a UMD naming a host resource id at all; the create
+//!    sends an HWA2 descriptor the KMD validates, echoes and completes, and an opener
+//!    treats the result as `const` — `DxgkDdiOpenAllocation` writes no byte of it.
+//!
+//! # ⛔ The §5 gap this lane now carries, named
+//!
+//! The retired record's host resid was the link between the WDDM allocation and the
+//! `VkDeviceMemory` vkd3d renders into. HWA2 has no successor field and one may not be
+//! invented (`K4-CONTRACT.md` §5). ⇒ this driver mints a valid kernel allocation for
+//! every committed resource and **cannot yet present or export its contents**:
+//! `Hwa2VenusResIdDropped` counts every create that had a host resid available and did
+//! not send it, and `PresentIdentityNoResourceId` refuses the frame's identity record.
+//! Both name **mesa lane unit A3**, which replaces the mechanism rather than the field:
+//! the ICD stops naming host resources and the KMD patches the resid in from
+//! `HeliosNativeRenderPatch`. An ICD in this state cannot import; that is the
+//! retirement's intended intermediate state, recorded rather than worked around.
 //!
 //! ⇒ `PARALLEL.md` §5's *"`umd12` does not yet depend on `helios_protocol`; the
 //! first lane that needs a crossing record adds it, and says so"* is discharged
 //! **here**: `umd12/Cargo.toml` takes it, and this is the saying-so.
 //!
-//! ⚠ **This block's own "what is NOT yet true" note is now discharged**, and the
-//! reversal is recorded rather than quietly edited. It said *"nothing in this crate
-//! calls `pfnAllocateCb` yet. That is UP-5."* UP-5 has landed:
-//! [`adopt_committed_allocation`] calls it for every committed resource,
-//! [`deallocate_adopted`] releases the handle in
-//! [`destroy_heap_and_resource`], and [`check_resource_allocation_handle`] answers
-//! with the real `D3DKMT_HANDLE` instead of 0.
-//!
 //! ⚠ Still not true, and stated so nothing reads more into the above than it
 //! carries: `pfnOpenHeapAndResource` and its sizing call are **still refused** — see
 //! [`open_heap_and_resource`] for exactly what is missing and why — and that is the
-//! *other* direction of D3c, not this one. Rung 1 does not need it: DWM opens the
-//! app's back buffer through `helios_umd.dll`'s existing D3D11 `pfnOpenResource`
-//! reading `HeliosWddmOpenIdentity`, which the KMD stamps for an adopted allocation
-//! with no change on either side. The size and layout asserts for the shared records
-//! are not restated either — `protocol/src/wddm.rs:483-501` already carries all of
-//! them, and a second copy of an assert is a second thing that can drift.
-//! [`AdoptedAllocPrivate`]'s own asserts are a *different* claim: not the records'
-//! sizes but their **adjacency**, which is what the KMD's trailer reader depends on
-//! positionally and which nothing else pins.
+//! *other* direction of D3c, not this one. The size and layout asserts for the shared
+//! record are not restated either: `protocol/src/wddm.rs`'s own `const _` block pins
+//! all 24 HWA2 offsets, and a second copy of an assert is a second thing that can
+//! drift. ⛔ There is no longer a local pair type to assert the **adjacency** of —
+//! `AdoptedAllocPrivate` is deleted with the two records it joined, and HWA2 is one
+//! struct whose layout `protocol` owns end to end.
 //!
 //! The per-object `pDrvPrivate` payloads below ([`HeapState`], [`ResourceState`])
 //! are runtime-allocated, per-object, per-process and read by nothing outside
@@ -302,7 +300,7 @@ mod v {
     /// enum appears in exactly one function-pointer family
     /// (`d3d12umddi.rs:51734`, `:59866`, `:75022`, `:76696`, `:79414`,
     /// `:87548`), and `D3D12DDIARG_CREATERESOURCE_0109` has no field of the
-    /// type. See [`super::adopt_committed_allocation`].
+    /// type. See [`super::create_committed_allocation`].
     pub(super) const RESOURCE_OPT_PRIMARY: D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS =
         D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS_D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_PRIMARY;
 
@@ -536,7 +534,7 @@ struct ResourceState {
 // again on the way out.
 //
 // ⇒ UP-5 threads the handle from `pfnCreateHeapAndResource` into
-// [`adopt_committed_allocation`], which runs *inside* that DDI while the parameter is live, so
+// [`create_committed_allocation`], which runs *inside* that DDI while the parameter is live, so
 // it never needs to be stored on the resource at all. What does need it later is the
 // paired `pfnDeallocateCb`, and that is kept in the [`identity12`] table beside the
 // allocation handle it releases -- for the two reasons that table exists rather than
@@ -764,7 +762,7 @@ fn cpu_page_property(prop: ddi12::D3D12DDI_CPU_PAGE_PROPERTY) -> D3D12_CPU_PAGE_
 /// the arm's behaviour: [`PrimaryTranslation::VenusExport`] turns the declaration
 /// into [`HELIOS_HEAP_FLAG_VENUS_EXPORT`], the fork's private request for
 /// exportable dedicated memory, which is the only way the resource can end up with
-/// a venus resource id for [`adopt_committed_allocation`] to hand the kernel.
+/// a venus resource id for [`create_committed_allocation`] to hand the kernel.
 /// [`PrimaryTranslation::Dropped`] keeps the old behaviour and the old counter, and
 /// is reachable only from the heap-only arm — where the declaration cannot be
 /// honoured at all.
@@ -792,8 +790,9 @@ fn heap_flags(
                     log_error!(
                         "L4: D3D12DDI_HEAP_FLAG_PRIMARY arrived on the committed arm -- \
                          requesting exportable dedicated memory from the engine via the \
-                         private heap flag {:#x} so the resource gets a venus resource id \
-                         the kernel can adopt (x{n})",
+                         private heap flag {:#x}, which is what makes the memory \
+                         allocator-DEDICATED so the HWA2 descriptor's byte_size is the \
+                         whole bound VkDeviceMemory (x{n})",
                         HELIOS_HEAP_FLAG_VENUS_EXPORT.0,
                     );
                 }
@@ -1320,7 +1319,7 @@ unsafe fn create_heap_only(
     // heap"*, i.e. a primary is always the committed arm. If it ever arrives here
     // the UP-4 identity table cannot record it -- there is no `ID3D12Resource` to
     // key on -- so the primary would be silently unrecorded. Counted, not
-    // assumed away, because `adopt_committed_allocation`'s admission predicate
+    // assumed away, because `create_committed_allocation`'s admission predicate
     // depends on the obligation holding.
     if a.Flags & v::HEAP_PRIMARY != 0 {
         note_refusal(&L4_REFUSALS.heap_primary_without_resource);
@@ -1457,94 +1456,70 @@ fn whole_heap_allocation_info(
     }
 }
 
-/// The private driver data one adopted D3D12 allocation carries into
-/// `pfnAllocateCb`.
+/// Translate a `D3D12DDI_RESOURCE_FLAGS_0003` word into
+/// [`helios_protocol::HeliosWddmAllocationDescV2::bind_flags`]'s vocabulary.
 ///
-/// ⛔ **Both members are `helios_protocol`'s, byte for byte** (D13). What is
-/// declared here is only their **adjacency**, and that adjacency is itself the wire
-/// contract: the KMD reads `HeliosWddmAllocPrivate` at offset 0
-/// (`create_allocation.rs:2316-2324`) and then `read_standard_meta` looks for the
-/// trailer at offset 48, so the pair must be exactly 48 + 48 with no padding
-/// between. The `const _` block below asserts both, which is what makes this a
-/// checked layout rather than a hope.
+/// # ⛔⛔ Why this is not a cosmetic translation, and why the target vocabulary
+/// CHANGED
 ///
-/// ⚠ **A DUPLICATE, and it is named as one.** `umd/src/forward/state.rs:193-198`
-/// declares the identical pair as `RuntimeAllocPrivate`, crate-private to `umd`.
-/// Under D13 the *pair* belongs in `helios_protocol` alongside its two members, and
-/// the correct end state is one declaration there with both UMDs using it. That
-/// move is not made here because `protocol/` is outside this lane's ownership; it is
-/// reported as a debt instead of made silently, and the asserts below mean the
-/// duplicate cannot drift from the KMD's expectation without failing to compile.
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct AdoptedAllocPrivate {
-    alloc: helios_protocol::HeliosWddmAllocPrivate,
-    meta: helios_protocol::HeliosWddmAllocMeta,
-}
-
-// ⛔ The two numbers the KMD's reader depends on positionally. `ddi12`'s module doc
-// states the rule these satisfy: bindgen's own assertions are self-consistent, so
-// "anything this crate depends on POSITIONALLY needs its own `const _` beside the
-// code that depends on it".
-const _: () = {
-    assert!(core::mem::size_of::<AdoptedAllocPrivate>() == 96);
-    assert!(core::mem::offset_of!(AdoptedAllocPrivate, alloc) == 0);
-    assert!(core::mem::offset_of!(AdoptedAllocPrivate, meta) == 48);
-};
-
-/// Translate a `D3D12DDI_RESOURCE_FLAGS_0003` word into the **D3D11 DDI bind
-/// word** `HeliosWddmAllocMeta::bind_flags` carries.
+/// ⚠ **This function used to target the D3D11 DDI bind word**, because the retired
+/// `HeliosWddmAllocMeta::bind_flags`'s reader was the D3D11 driver's
+/// `pfnOpenResource` and that field carried raw `D3D10DDI_BIND_*`. HWA2 offset 72 is
+/// a **third, deliberately non-coincident** vocabulary — `HELIOS_HWA2_BIND_*`,
+/// `protocol/src/wddm.rs:230-262`, whose own comment says the retired trailer's raw
+/// D3D11 word "is not what this field carries". So targeting the D3D11 DDI word here
+/// would now be a *wrong-vocabulary* bug of exactly the class the old comment
+/// described, one enum further along.
 ///
-/// # ⛔⛔ Why this is not a cosmetic translation
-///
-/// The field's reader is the D3D11 driver's `pfnOpenResource`, i.e. **DWM opening
-/// this back buffer**: `api_bind_flags` (`umd/src/forward/state.rs`) passes the low
-/// 7 bits through as `D3D11_BIND_*`, and the result becomes
-/// `D3D11_TEXTURE2D_DESC::BindFlags` on the imported alias
-/// (`umd/bridge/dxvk_bridge.cpp`'s `desc.BindFlags = bind_flags`), which is the
-/// `VkImageUsageFlags` DXVK builds it with.
-///
-/// ⇒ passing the D3D12 word verbatim is not "an unread field": it decodes in the
-/// other vocabulary. A swapchain back buffer arrives with
-/// `RENDER_TARGET | SHADER_RESOURCE` = `0x1 | 0x10` = `0x11`, and `0x11` in the
-/// D3D11 DDI is **`VERTEX_BUFFER | STREAM_OUTPUT`** — so DWM would import a
-/// vertex-buffer-and-stream-output image with **no** render-target and **no**
-/// shader-resource usage, and could not sample the frame it is composing. The
-/// overlap is structural rather than unlucky: the two enums number the same
-/// concepts differently and `RENDER_TARGET` is `1` in one and `0x20` in the other.
+/// The failure mode the old comment recorded is worth keeping, because it is the
+/// reason this is a `match` and never a cast: a swapchain back buffer arrives with
+/// `RENDER_TARGET | SHADER_RESOURCE` = `0x1 | 0x10` = `0x11`, and `0x11` read in the
+/// D3D11 DDI vocabulary is **`VERTEX_BUFFER | STREAM_OUTPUT`** — an image with no
+/// render-target and no shader-resource usage, which DWM could not sample. The
+/// overlap is structural rather than unlucky: every one of these three enums numbers
+/// the same concepts differently.
 ///
 /// # The mapping, and what has no counterpart
 ///
-/// | D3D12 DDI | D3D11 DDI bind | note |
+/// | D3D12 DDI | HWA2 bind | note |
 /// |---|---|---|
-/// | `RENDER_TARGET` `0x1` | `RENDER_TARGET` `0x20` | |
-/// | `DEPTH_STENCIL` `0x2` | `DEPTH_STENCIL` `0x40` | |
-/// | `SHADER_RESOURCE` `0x10` | `SHADER_RESOURCE` `0x8` | ⚠ the positive form; the *API* spells it `DENY_SHADER_RESOURCE` |
-/// | `UNORDERED_ACCESS` `0x80` | `UNORDERED_ACCESS` `0x100` | ⚠ `0x100` at the DDI, `0x80` at the API — `api_bind_flags` is what re-maps it |
+/// | `RENDER_TARGET` `0x1` | `HELIOS_HWA2_BIND_RENDER_TARGET` `1 << 1` | |
+/// | `DEPTH_STENCIL` `0x2` | `HELIOS_HWA2_BIND_DEPTH_STENCIL` `1 << 2` | |
+/// | `SHADER_RESOURCE` `0x10` | `HELIOS_HWA2_BIND_SHADER_RESOURCE` `1 << 0` | ⚠ the positive form; the *API* spells it `DENY_SHADER_RESOURCE` |
+/// | `UNORDERED_ACCESS` `0x80` | `HELIOS_HWA2_BIND_UNORDERED_ACCESS` `1 << 3` | |
 ///
 /// ⚠ **`CROSS_ADAPTER`, `SIMULTANEOUS_ACCESS`, the two video-reference bits,
 /// `CONTENT_PROTECTION`, the three placement/alignment bits, `SAMPLER_FEEDBACK` and
 /// `RAYTRACING_ACCELERATION_STRUCTURE` are dropped and that is correct, not lossy:**
-/// none of them is a bind. `SIMULTANEOUS_ACCESS` in particular is a *sharing*
-/// property and is common on a back buffer, so counting it as a dropped bit would
-/// make the counter fire on every healthy frame. They are named here instead.
+/// none of them is a bind. `CROSS_ADAPTER` is not lost either — it becomes
+/// `HELIOS_HWA2_FLAG_CROSS_ADAPTER` in [`hwa2_create_input`], which is where §10.3
+/// puts it. `SIMULTANEOUS_ACCESS` in particular is a *sharing* property and is common
+/// on a back buffer, so counting it as a dropped bit would make the counter fire on
+/// every healthy frame. They are named here instead.
+///
+/// ⚠ **The eight HWA2 bind bits this D3D12 DDI cannot produce** —
+/// `VERTEX_BUFFER`, `INDEX_BUFFER`, `CONSTANT_BUFFER`, `STREAM_OUTPUT`, `PRESENT`,
+/// `VIDEO_DECODER`, `VIDEO_ENCODER` — are absent because D3D12 has no per-resource
+/// bind declaration for them: a buffer is bound by view at draw time. Writing one
+/// would be an inference §10.3 forbids, so the record says "not declared" rather
+/// than guessing.
 ///
 /// ⛔ **A bit outside the known set is counted**, because the only way it can appear
 /// is a header revision adding an enumerator this table has not been told about —
 /// and the failure mode of guessing would be a bind flag nobody asked for.
-fn meta_bind_flags(flags: ddi12::D3D12DDI_RESOURCE_FLAGS_0003) -> u32 {
+fn hwa2_bind_flags(flags: ddi12::D3D12DDI_RESOURCE_FLAGS_0003) -> u32 {
     let mut out = 0u32;
     if flags & v::RES_RENDER_TARGET != 0 {
-        out |= helios_protocol::HELIOS_WDDM_BIND_RENDER_TARGET;
+        out |= helios_protocol::HELIOS_HWA2_BIND_RENDER_TARGET;
     }
     if flags & v::RES_DEPTH_STENCIL != 0 {
-        out |= helios_protocol::HELIOS_WDDM_BIND_DEPTH_STENCIL;
+        out |= helios_protocol::HELIOS_HWA2_BIND_DEPTH_STENCIL;
     }
     if flags & v::RES_SHADER_RESOURCE != 0 {
-        out |= helios_protocol::HELIOS_WDDM_BIND_SHADER_RESOURCE;
+        out |= helios_protocol::HELIOS_HWA2_BIND_SHADER_RESOURCE;
     }
     if flags & v::RES_UNORDERED_ACCESS != 0 {
-        out |= helios_protocol::HELIOS_WDDM_BIND_UNORDERED_ACCESS;
+        out |= helios_protocol::HELIOS_HWA2_BIND_UNORDERED_ACCESS;
     }
     // Every enumerator the header defines, mapped or deliberately not. The mask is
     // built from the aliases rather than written as a literal so that a header
@@ -1569,8 +1544,8 @@ fn meta_bind_flags(flags: ddi12::D3D12DDI_RESOURCE_FLAGS_0003) -> u32 {
         if n <= LOG_BUDGET {
             log_error!(
                 "L4: D3D12DDI_RESOURCE_FLAGS {:#x} carries bits {:#x} this build's bind-flag \
-                 translation does not know -- the primary's HeliosWddmAllocMeta::bind_flags is \
-                 {:#x} and may be missing a usage the opener needs (x{n})",
+                 translation does not know -- the allocation's HWA2 bind_flags is {:#x} and may \
+                 be missing a usage an opener needs (x{n})",
                 flags,
                 flags & !known,
                 out,
@@ -1580,17 +1555,323 @@ fn meta_bind_flags(flags: ddi12::D3D12DDI_RESOURCE_FLAGS_0003) -> u32 {
     out
 }
 
-/// Give a committed resource a kernel allocation the KMD adopts, and record its
-/// identity.
+/// The HWA2 swizzle class (offset 88) for one create's `D3D12DDI_TEXTURE_LAYOUT`.
 ///
-/// `KMD_IMPACT.md` §14a.3 UP-5, on top of UP-2c's bridge accessors. This is the
-/// commit that makes the identity table mean something: the engine allocated the
-/// Vulkan memory, and this driver **adopts** it by calling `pfnAllocateCb` with
-/// `HeliosWddmAllocPrivate.adopt_resource_id = <venus resid>`. The KMD already
-/// accepts exactly that (`create_allocation.rs:2377-2379`: `kind == DEVICE_MEMORY &&
-/// adopt_resource_id != 0` → `AllocationBacking::AdoptedUmdResource`, with
-/// `write_open_identity` stamping `HeliosWddmOpenIdentity` back so DWM's D3D11
-/// opener works unchanged), so there is no new allocation shape and no new KMD verb.
+/// `None` means the layout has **no** HWA2 spelling and the create must be refused:
+/// §10.3's enum is `LINEAR` or `OPAQUE_OPTIMAL` and nothing else, and Direct Flip
+/// requires *equality* between two descriptors' classes — so a third layout mapped
+/// onto either of those two would make two surfaces compare equal that are not.
+///
+/// | `D3D12DDI_TEXTURE_LAYOUT` | HWA2 swizzle class | why |
+/// |---|---|---|
+/// | `TL_ROW_MAJOR` | `LINEAR` | the definition of both |
+/// | `TL_UNDEFINED` | `OPAQUE_OPTIMAL` | "driver chooses"; on Helios the engine picks a Vulkan `OPTIMAL` tiling whose layout no guest code may assume |
+/// | `TL_64KB_TILE_UNDEFINED_SWIZZLE` | `OPAQUE_OPTIMAL` | same: an opaque, driver-defined swizzle |
+/// | `TL_64KB_TILE_STANDARD_SWIZZLE` | ⛔ `None` | a *documented, portable* swizzle. Calling it `OPAQUE_OPTIMAL` would tell an opener the bytes are undefined when the API guarantees they are not, and calling it `LINEAR` is simply false |
+///
+/// ⚠ A buffer has no texture layout; [`hwa2_create_input`] answers `LINEAR` for it
+/// directly rather than routing through here, because `D3D12DDIARG_CREATERESOURCE`'s
+/// `Layout` field is not meaningful on that arm (CLAUDE.md's per-arm validation rule).
+fn hwa2_swizzle_class(layout: ddi12::D3D12DDI_TEXTURE_LAYOUT) -> Option<u32> {
+    if layout == v::TL_ROW_MAJOR {
+        Some(helios_protocol::HELIOS_HWA2_SWIZZLE_LINEAR)
+    } else if layout == v::TL_UNDEFINED || layout == v::TL_64KB_TILE_UNDEFINED_SWIZZLE {
+        Some(helios_protocol::HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL)
+    } else {
+        None
+    }
+}
+
+/// The `D3DDDIFORMAT` (HWA2 offset 52) for one `DXGI_FORMAT`.
+///
+/// ⛔ **Exactly one format is translated, and every other one answers 0.** The
+/// D3DDDIFORMAT↔DXGI translation is lossy in the direction that historically cost
+/// this project a rebuilt A8 mask read as 4 bpp BGRA (`protocol/src/wddm.rs`'s note
+/// on `dxgi_format`), so a general table here would re-introduce exactly that. HWA2
+/// carries `dxgi_format` at offset 48 *verbatim* precisely so no opener has to
+/// consult this field; it is populated only for the one format the display path
+/// itself speaks, and left 0 — "this creator states no D3DDDIFORMAT" — otherwise.
+///
+/// ⚠ The shared validator does not require a nonzero value for an image kind (it
+/// requires **zero** for a non-image kind), so 0 is a legal answer rather than a gap.
+fn hwa2_d3d_ddi_format(dxgi_format: u32) -> u32 {
+    if dxgi_format == helios_protocol::DXGI_FORMAT_B8G8R8A8_UNORM {
+        helios_protocol::D3DDDIFMT_A8R8G8B8
+    } else {
+        0
+    }
+}
+
+/// Build the **HWA2 create-input descriptor** for one committed D3D12 resource.
+///
+/// `docs/retirement/K4-CONTRACT.md` §1.1 is normative for the field partition and
+/// this function implements the producer half of it, exactly:
+///
+/// | field | who writes it | what this function does |
+/// |---|---|---|
+/// | `magic`, `abi_version`, `struct_size`, `package_generation` | UMD | written exactly, via [`helios_protocol::HeliosWddmAllocationDescV2::header`] |
+/// | `allocation_generation` | **KMD only** | written **0**; a nonzero value on input is a hard reject |
+/// | `flags & DIRECT_FLIP_COMPATIBLE` | **KMD only** | written **0** — §10.3: KMD sets it only for a non-protected, non-cross-adapter managed primary in a class the display backend implements, and *an opener never infers it* |
+/// | `flags & D3D12_RUNTIME_PRIMARY` | **KMD only** | written **0** — §10.3 C44: KMD sets it only when the create record, the runtime `PRIMARY` flag and the sentinel all agree |
+/// | everything else | UMD, echoed by KMD | written exactly; the KMD **refuses the create rather than correcting a field** |
+///
+/// ⇒ every value below is a statement this driver is prepared to have the create
+/// fail on. There is no "close enough" field and no field left for the kernel to
+/// fill in except the two it owns.
+///
+/// # ⭐ C44, and it is the one place D3D12 differs from D3D11 in this record
+///
+/// `vidpn_source` (offset 80) is [`helios_protocol::D3DDDI_ID_UNINITIALIZED`], and
+/// that is required rather than convenient. A D3D12 Resource-Heaps primary has its
+/// `VidPnSourceId` overwritten with that sentinel by the runtime, so the KMD's C44
+/// cross-validation *demands* it there; and for a non-primary the shared validator
+/// demands it too (`NonPrimaryVidPnSourceNotSentinel`). Writing a concrete source
+/// would therefore be rejected on both branches. ⛔ The matching
+/// `D3D12_RUNTIME_PRIMARY` bit is **not** set here even so: the bit and the sentinel
+/// are cross-validated by the kernel and neither may be inferred by a producer.
+///
+/// # ⛔ What is deliberately NOT in this record
+///
+/// **No host resource id, and no Vulkan memory type index** (§10.3, K4-CONTRACT §5).
+/// The retired `HeliosWddmAllocPrivate::adopt_resource_id` carried the first and the
+/// retired `HeliosWddmAllocMeta::memory_type_index` the second; HWA2 has an
+/// equivalent for neither and neither may be re-added under another name. The engine
+/// still *knows* both — [`crate::bridge12::BridgeDevice12::resource_venus_identity`]
+/// answers them — and this driver deliberately drops them on the floor, counting
+/// `Hwa2VenusResIdDropped` so the drop is a number rather than a silence. The
+/// mechanism that replaces them is **mesa lane unit A3**: the ICD stops naming host
+/// resources at all and the KMD patches the resid in from `HeliosNativeRenderPatch`.
+///
+/// Returns `None` when some field of this create has no HWA2 spelling; the caller
+/// counts `Hwa2GeometryUnrepresentable` and fails the create. ⛔ Never a partial
+/// record: §10.3's "any malformed … descriptor makes create/open fail; it never
+/// selects a legacy parser" cuts both ways, and a producer that shipped a descriptor
+/// it knew was wrong would be asking the kernel to catch its own bug.
+fn hwa2_create_input(
+    heap_arg: &ddi12::D3D12DDIARG_CREATEHEAP_0001,
+    res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+    byte_size: u64,
+    row_pitch: u32,
+) -> Option<helios_protocol::HeliosWddmAllocationDescV2> {
+    // ⛔ `allocation_generation` = 0. K4-CONTRACT §1.1: the KMD assigns it, and a
+    // nonzero value on the input side is `AllocationGenerationNonZeroOnInput`.
+    let mut desc = helios_protocol::HeliosWddmAllocationDescV2::header(
+        helios_protocol::HELIOS_PACKAGE_GENERATION,
+        0,
+    );
+
+    // ── kind ────────────────────────────────────────────────────────────────
+    //
+    // ⚠ No `STANDARD_*` kind is reachable from here and that is a statement, not an
+    // omission: those three are `D3DKMDT_STANDARDALLOCATION` shapes dxgkrnl asks the
+    // *kernel* to describe, and this is an application's committed resource. The
+    // `STANDARD` flag and `standard_allocation_type` therefore stay 0 together, which
+    // the shared validator cross-checks in both directions.
+    let is_buffer = res_arg.ResourceType == v::RT_BUFFER;
+    desc.allocation_kind = if is_buffer {
+        helios_protocol::HELIOS_HWA2_KIND_BUFFER
+    } else {
+        helios_protocol::HELIOS_HWA2_KIND_IMAGE
+    };
+
+    // ── geometry, per kind class ────────────────────────────────────────────
+    //
+    // ⛔ The validator reads "zero only for a non-image kind" fail-closed in BOTH
+    // directions, so a buffer must carry zero in every geometry field and
+    // `DXGI_FORMAT_UNKNOWN`, and an image must carry a nonzero value in every one of
+    // them. That is why this is two arms and not one arm with `min(1)` clamps: a
+    // clamp would manufacture a geometry the runtime never stated.
+    if is_buffer {
+        // Every geometry field stays zero, as `header` left it, including
+        // `dxgi_format = DXGI_FORMAT_UNKNOWN` and `d3d_ddi_format = 0`.
+        //
+        // ⛔ **The guard is `> 1`, not `!= 0`, and that distinction is the whole of
+        // it.** D3D12 requires a buffer's description to carry the *canonical*
+        // `Height = 1`, `DepthOrArraySize = 1`, `MipLevels = 1`, `SampleDesc = {1, 0}`
+        // and `Format = UNKNOWN` — they are constants of the shape, not geometry — so
+        // a `!= 0` test would refuse every buffer this driver has ever created. What
+        // it must refuse is a buffer carrying something that is genuinely geometry,
+        // which HWA2's non-image arm cannot describe and which zeroing would silently
+        // drop.
+        if res_arg.Format as u32 != helios_protocol::DXGI_FORMAT_UNKNOWN
+            || res_arg.Height > 1
+            || res_arg.DepthOrArraySize > 1
+            || res_arg.MipLevels > 1
+            || res_arg.SampleDesc.Count > 1
+            || res_arg.SampleDesc.Quality != 0
+        {
+            return None;
+        }
+    } else {
+        // ⚠ `Width` is a `UINT64` at the DDI even for a texture and HWA2's `width` is
+        // 32-bit, so the narrowing is checked rather than truncated: a texture wider
+        // than `u32::MAX` cannot be described by this record at all, and a truncated
+        // width would describe a *different* surface.
+        desc.width = u32::try_from(res_arg.Width).ok()?;
+        desc.height = res_arg.Height;
+        desc.depth_or_array_size = u32::from(res_arg.DepthOrArraySize);
+        desc.mip_levels = u32::from(res_arg.MipLevels);
+        desc.sample_count = res_arg.SampleDesc.Count;
+        desc.sample_quality = res_arg.SampleDesc.Quality;
+        desc.dxgi_format = res_arg.Format as u32;
+        desc.d3d_ddi_format = hwa2_d3d_ddi_format(desc.dxgi_format);
+        if desc.width == 0
+            || desc.height == 0
+            || desc.depth_or_array_size == 0
+            || desc.mip_levels == 0
+            || desc.sample_count == 0
+            || desc.dxgi_format == helios_protocol::DXGI_FORMAT_UNKNOWN
+        {
+            return None;
+        }
+    }
+
+    // ── the backing extent, and the plane records bounded against it ────────
+    if byte_size == 0 {
+        return None;
+    }
+    desc.byte_size = byte_size;
+    if !is_buffer {
+        // ⛔ **One plane record, and a 0 row pitch is now a REFUSAL rather than a
+        // carried unknown.** The retired trailer tolerated a 0 pitch because nothing
+        // on the windowed path read it; HWA2's validator does not
+        // (`PlaneRowPitchZero`), so a descriptor with one would fail the create in the
+        // kernel with a rejection this driver could have named itself. The pitch is
+        // still the ENGINE's own `GetCopyableFootprints` answer and is never
+        // re-derived here — the 15th/39th sessions are what a second derivation of a
+        // stride costs.
+        //
+        // ⚠ **Bound: exactly one plane is described.** A planar DXGI format (NV12 and
+        // friends) has two, and this driver has no format table that says so. It has
+        // also never seen one on this DDI. Recorded as a bound rather than guessed at:
+        // `plane_count` is a statement about the record, and stating 2 without knowing
+        // the chroma offset would be worse than stating 1.
+        //
+        // ⛔ **`slice_pitch` is the WHOLE extent, and it is not
+        // `GetCopyableFootprints`'s total.** The record's own doc defines it as "bytes
+        // covered by this plane, i.e. the extent bounded against `byte_size`", and on
+        // this arm one image occupies a dedicated `VkDeviceMemory` at offset 0 — the
+        // caller has already refused a non-zero `memory_offset` — so the plane covers
+        // all of it. ⚠ The engine's linear `pTotalBytes` was the other candidate and is
+        // deliberately NOT used: for an `OPAQUE_OPTIMAL` image it describes a linear
+        // footprint the allocation is not laid out in, and it can legitimately exceed
+        // the tiled allocation's size, which would turn a healthy create into a refusal.
+        let slice_pitch = u32::try_from(byte_size).ok()?;
+        if row_pitch == 0 || row_pitch > slice_pitch {
+            return None;
+        }
+        desc.plane_count = 1;
+        desc.planes[0] = helios_protocol::HeliosWddmPlaneRecordV2 {
+            // The engine dedicates the whole `VkDeviceMemory` to this resource and
+            // binds it at offset 0 — asserted by the caller's `memory_offset == 0`
+            // refusal, not assumed here.
+            offset: 0,
+            row_pitch,
+            slice_pitch,
+        };
+    }
+
+    // ── flags ───────────────────────────────────────────────────────────────
+    //
+    // ⛔ `DIRECT_FLIP_COMPATIBLE` and `D3D12_RUNTIME_PRIMARY` are KMD-owned and stay
+    // 0; see this function's table. The rest are statements this driver can actually
+    // make from the create it is inside:
+    //
+    // * `PRIMARY` / `DISPLAYABLE` — **not set.** The deployed runtime declares neither
+    //   `D3D12DDI_HEAP_FLAG_PRIMARY` nor `RESOURCE_OPTIMIZATION_FLAG_PRIMARY` for
+    //   flip-model back buffers, and the windowed DWM-composited present this lane
+    //   targets never reaches `DxgkDdiPresent` at all. Claiming a primary would aim
+    //   dxgkrnl's primary bookkeeping at VidPn source 0, the live desktop's.
+    // * `SHARED` — **not set**, and this is the inference §10.3 most explicitly
+    //   forbids. The negotiated D3D12 DDI carries no shared-resource declaration on
+    //   the create; every fused resource is made venus-exportable so that it *could*
+    //   be shared, which is a property of this driver's implementation and not a
+    //   statement the runtime made about the resource.
+    // * `STEREO` / `PROTECTED` — not set. This driver reports no protected-resource
+    //   support and refuses stereo shapes upstream.
+    // * `RESOURCE_ASSOCIATED` — **set**, because this create passes `hResource` to
+    //   `pfnAllocateCb` below, which is precisely what makes dxgkrnl create a kernel
+    //   resource object for the allocation. It is knowable at the write site, which is
+    //   the only reason it is written.
+    let mut flags = helios_protocol::HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED;
+    if res_arg.Flags & v::RES_CROSS_ADAPTER != 0 {
+        flags |= helios_protocol::HELIOS_HWA2_FLAG_CROSS_ADAPTER;
+    }
+
+    // ── memory class, and the CPU-visibility bit it is cross-checked against ─
+    //
+    // ⛔ The validator refuses `CPU_VISIBLE` class without the flag and `DEVICE_LOCAL`
+    // class with it, so these two are decided together in one place. The source is the
+    // *heap's* declared CPU page property, which on the fused arm is the heap this
+    // very resource is placed in at offset 0.
+    //
+    // ⚠ `HELIOS_HWA2_MEMORY_SHARED` is never chosen: it means "backing shared with
+    // another agent", and nothing on this arm says that.
+    //
+    // ⛔ An unrecognised page property coerces to NOT_AVAILABLE **exactly as
+    // [`cpu_page_property`] coerces it** for the heap description handed to the
+    // engine, so the record and the heap cannot disagree about CPU visibility. It is
+    // spelled out here rather than routed through that function because that function
+    // bumps `HeapPropertyUnrepresentable`, and one create must not count twice.
+    let cpu_visible = matches!(
+        heap_arg.CPUPageProperty,
+        v::CPU_WRITE_COMBINE | v::CPU_WRITE_BACK
+    );
+    if cpu_visible {
+        flags |= helios_protocol::HELIOS_HWA2_FLAG_CPU_VISIBLE;
+        desc.memory_class = helios_protocol::HELIOS_HWA2_MEMORY_CPU_VISIBLE;
+    } else {
+        desc.memory_class = helios_protocol::HELIOS_HWA2_MEMORY_DEVICE_LOCAL;
+    }
+    desc.flags = flags;
+
+    desc.bind_flags = hwa2_bind_flags(res_arg.Flags);
+    // ⚠ 0, and every one of the four `HELIOS_HWA2_MISC_*` bits is a statement this DDI
+    // does not make. `GDI_COMPATIBLE` and `SHARED_NT_HANDLE` are D3D11 create
+    // descriptions with no D3D12 DDI counterpart; `TEXTURE_CUBE` is a *view*
+    // interpretation of an array in D3D12, not a resource property; `RESOURCE_CLAMP`
+    // is a D3D11 mip-clamp facility. Writing any of them would be an invention.
+    desc.misc_flags = 0;
+    // ⭐ C44 — see this function's doc. The sentinel, on both the primary and the
+    // non-primary branch, and never a concrete source.
+    desc.vidpn_source = helios_protocol::D3DDDI_ID_UNINITIALIZED;
+    desc.standard_allocation_type = 0;
+    desc.swizzle_class = if is_buffer {
+        // A buffer has no texture layout and its bytes are linear by definition; the
+        // DDI's `Layout` field is not meaningful on this arm.
+        helios_protocol::HELIOS_HWA2_SWIZZLE_LINEAR
+    } else {
+        hwa2_swizzle_class(res_arg.Layout)?
+    };
+    Some(desc)
+}
+
+/// Give a committed resource a kernel allocation described by an HWA2 create-input
+/// descriptor, and record its identity.
+///
+/// `KMD_IMPACT.md` §14a.3 UP-5, retired onto the HPS2 successor record by K4.
+///
+/// ⚠ **This block used to describe ADOPTION and the reversal is recorded rather than
+/// quietly edited.** It said the engine allocated the Vulkan memory and this driver
+/// *"**adopts** it by calling `pfnAllocateCb` with
+/// `HeliosWddmAllocPrivate.adopt_resource_id = <venus resid>`"*, which the KMD
+/// classified as `AllocationBacking::AdoptedUmdResource` and then restamped as a
+/// `HeliosWddmOpenIdentity` so DWM's D3D11 opener worked unchanged. **Every clause of
+/// that is retired.** §10.3 forbids a UMD naming a host resource id at all
+/// (K4-CONTRACT §5), so the record this create sends carries none, the KMD creates
+/// the backing rather than adopting one, and the open-time restamp is deleted —
+/// an opener reads the same immutable descriptor the creator sent.
+///
+/// ⛔ **What that costs until mesa unit A3 lands, stated rather than papered over.**
+/// The kernel allocation this function mints is not yet the same host object as the
+/// `VkDeviceMemory` vkd3d renders into; joining them is A3's job (the ICD stops
+/// naming host resources and the KMD patches the resid in from
+/// `HeliosNativeRenderPatch`). Until then this driver owns a valid WDDM allocation
+/// for every committed resource and **cannot present or export its contents** —
+/// `present12` refuses with `PresentIdentityNoResourceId` naming A3, which is the
+/// retirement's intended intermediate state and not a regression. Nothing here
+/// fabricates the missing link, and `Hwa2VenusResIdDropped` counts every create that
+/// had a host resid available and did not send it.
 ///
 /// # ⛔ Every failure fails the CREATE, and that is the contract rather than a
 /// severity choice
@@ -1614,44 +1895,44 @@ fn meta_bind_flags(flags: ddi12::D3D12DDI_RESOURCE_FLAGS_0003) -> u32 {
 ///
 /// | counter | what it means | where the fix is |
 /// |---|---|---|
-/// | `IdentityVkMemoryUnresolved` | the engine could not name the memory a resource is bound to | the vkd3d fork / the interop interface |
-/// | `IdentityVenusUnresolved` | the memory has no venus resource id | the export chain: `HELIOS_HEAP_FLAG_VENUS_EXPORT` did not reach the fork, or the ICD is absent |
-/// | `IdentityOffsetNonZero` | the engine suballocated the resource | the fork's dedicated-allocation arm |
-/// | `IdentityResIdShared` | two live resources share one venus resource id | as above — and buffer rotation is already broken |
+/// | `IdentityVkMemoryUnresolved` | the engine could not name the memory a resource is bound to, so its **size** is unknown and HWA2's `byte_size` cannot be stated | the vkd3d fork / the interop interface |
+/// | `IdentityOffsetNonZero` | the engine suballocated the resource, so the plane records cannot be bounded against a dedicated extent | the fork's dedicated-allocation arm |
+/// | `Hwa2GeometryUnrepresentable` | some field of this create has no HWA2 spelling (a standard-swizzle layout, a 0 row pitch, a width above `u32::MAX`) | this file's translation, or the record |
+/// | `Hwa2CreateInputInvalid` | the descriptor this driver built failed `validate_create_input` — **a bug in this file**, caught before the kernel sees it | this file |
+/// | `Hwa2WriteBackAbsent` | `pfnAllocateCb` succeeded and the private buffer came back with `allocation_generation == 0`, i.e. the kernel's create-time write did not reach this buffer | dxgkrnl's propagation, or the KMD's write site |
+/// | `Hwa2CreateOutputInvalid` | the kernel wrote a descriptor that failed `validate_create_output` | the KMD |
 /// | `AllocateCbMissing` / `AllocateCbFailed` / `AllocateCbNoHandle` | dxgkrnl refused | the record, the flags, or the kernel |
-/// | `OwnershipTransferFailed` | the ICD would not hand the resource over | the ICD |
 /// | `IdentityRegistryAllocFailed` | process memory could not grow the identity registry | process memory pressure |
+///
+/// ⚠ `IdentityVenusUnresolved` is **no longer in that table**: it is now a census,
+/// not a refusal. This create needs the *engine* half of the identity (the bound
+/// memory's size) and needs nothing at all from the ICD, so an unexportable memory no
+/// longer fails a create — it fails a *present*, later, in `present12`.
 ///
 /// # ⚠ What this does NOT set, and why each omission is a decision
 ///
 /// * **`D3D12DDI_ALLOCATION_INFO_FLAGS_0022_PRIMARY` is NOT set**, though
 ///   `KMD_IMPACT.md` §14a.3 UP-5 prescribes `Flags = PRIMARY`. That flag reaches
-///   dxgkrnl as a VidPn-primary claim and is paired with `VidPnSourceId`, which this
-///   driver has no per-swapchain value for — the only source id it owns is **0**,
-///   the live desktop's. The target here is the **windowed** DWM-composited present,
-///   which never reaches `DxgkDdiPresent` at all (measured: `PRESENT_FLAGS_HISTOGRAM`
-///   has only ever seen `0x1` and `0xC`, unsampled and non-overflowing), so nothing
-///   on this path needs the allocation to be a primary — while asserting it would
-///   aim dxgkrnl's primary bookkeeping at source 0. It is the first field a
-///   fullscreen-flip lane must revisit, together with
-///   `HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT`.
-/// * **`HELIOS_WDDM_ALLOC_MISC_PRIMARY` is NOT set** in the meta, for the same
-///   reason and a sharper one: that bit's documented meaning is *"the standard
-///   allocation is the exact VidPn primary selected for direct scanout"*
-///   (`protocol/src/wddm.rs`), and in the KMD it selects `accessed_physically`,
-///   drops `Cached`, and forces the aperture segment
-///   (`create_allocation.rs:1770-1809`). A windowed back buffer is none of those
-///   things.
-/// * **`HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT` is NOT set.** Fullscreen only, and
-///   `PENDING.md` §S-3 item 7 is explicit that setting it before the host stride
-///   agreement is settled turns a hard failure into a *sheared picture*.
+///   dxgkrnl as a VidPn-primary claim, and the HWA2 record this create sends declares
+///   no `PRIMARY` either — the two must agree, and both say the same thing. The target
+///   here is the **windowed** DWM-composited present, which never reaches
+///   `DxgkDdiPresent` at all (measured: `PRESENT_FLAGS_HISTOGRAM` has only ever seen
+///   `0x1` and `0xC`, unsampled and non-overflowing). It is the first field a
+///   fullscreen-flip lane must revisit, together with `HELIOS_HWA2_FLAG_DISPLAYABLE`.
+/// * **`D3D12DDI_ALLOCATION_INFO_0022::VidPnSourceId` is the C44 SENTINEL, not 0**,
+///   and that changed with this record. It used to be 0 with the note *"only
+///   meaningful with the PRIMARY flag this driver does not set"*. HWA2 offset 80 must
+///   carry `D3DDDI_ID_UNINITIALIZED` for a non-primary **and** for a D3D12 runtime
+///   primary, and §10.3 C44 has the KMD cross-validate the record against what
+///   dxgkrnl was told — so leaving a 0 here would make the outer create disagree with
+///   the descriptor inside it.
 ///
 /// # Safety
 /// `dev` must be the live device this create is running on, `resource` the engine
 /// resource it just created, and `h_rt_resource` the runtime handle
 /// `pfnCreateHeapAndResource` was called with — which is live for the duration of
 /// the call, because this runs **inside** that DDI.
-unsafe fn adopt_committed_allocation(
+unsafe fn create_committed_allocation(
     dev: &HeliosD3D12Device,
     device10: &ID3D12Device10,
     resource: &ID3D12Resource,
@@ -1662,40 +1943,41 @@ unsafe fn adopt_committed_allocation(
 ) -> Result<(), Hresult> {
     let engine_resource = resource.as_raw() as usize;
 
-    // ── 1. the identity, from the engine and then from the ICD ─────────────
+    // ── 1. the engine's memory facts ───────────────────────────────────────
+    //
+    // ⛔ **What this create needs from the engine is now much narrower than it was,
+    // and what it needs from the ICD is nothing.** HWA2 offset 24 is the *exact
+    // backing extent* — "nonzero, and bounds every plane" — and only the engine knows
+    // it, so the bound `VkDeviceMemory`'s size is still required. The same call also
+    // answers a venus resource id and a Vulkan memory type index; **neither has an
+    // HWA2 field and neither may be sent** (§10.3: "no host resource token, resid …
+    // or independently usable identity"; K4-CONTRACT §5's second casualty is
+    // `memory_type_index` by name). They are read here only so that dropping them is
+    // a counted event with a log line rather than a silence.
     //
     // SAFETY: `resource` is the `ID3D12Resource` this driver's own engine just
     // created and holds a reference to for the whole call; the bridge borrows it
     // and takes no reference.
     let (id, status) = unsafe { dev.engine.resource_venus_identity(engine_resource) };
-    if status != crate::bridge12::IdentityStatus::Resolved {
-        // ⛔ Two counters, split by WHICH half failed, because the two have
-        // different fixes in different repositories — see the table above. The
-        // engine half failing means vkd3d could not name the memory at all; the
-        // venus half failing means the memory exists and is not exportable, which
-        // is the export chain not engaging.
-        let venus_half = matches!(
-            status,
-            crate::bridge12::IdentityStatus::NoIcd
-                | crate::bridge12::IdentityStatus::NoExport
-                | crate::bridge12::IdentityStatus::IcdRefused
-        );
-        if venus_half {
-            note_refusal(&L4_REFUSALS.identity_venus_unresolved);
-        } else {
-            note_refusal(&L4_REFUSALS.identity_vk_memory_unresolved);
-        }
+
+    // ⚠ **The admission predicate changed with the record, and this is the change.**
+    // It used to be `status == Resolved`, which required the ICD to have a venus
+    // resource for the memory — because the old record's whole purpose was to carry
+    // that id. HWA2 carries no id, so requiring one would fail every create for a
+    // fact the descriptor does not contain. The predicate is now the ENGINE half
+    // alone: a bound memory with a stated size.
+    if id.vk_memory == 0 || id.memory_size == 0 {
+        note_refusal(&L4_REFUSALS.identity_vk_memory_unresolved);
         log_error!(
-            "L4: COMMITTED create REFUSED -- no venus identity for the engine resource {:#x} \
-             (status={:?} vk_memory={:#x} off={} size={} mti={}); a primary with no kernel \
-             allocation cannot be opened, presented or handed to \
-             pfnCheckResourceAllocationHandle. {}x{} fmt={} heapFlags={:#x}",
+            "L4: COMMITTED create REFUSED -- vkd3d could not name the memory the engine \
+             resource {:#x} is bound to (status={:?} vk_memory={:#x} off={} size={}), so HWA2's \
+             byte_size cannot be stated and no allocation may be described. {}x{} fmt={} \
+             heapFlags={:#x}",
             engine_resource,
             status,
             id.vk_memory,
             id.memory_offset,
             id.memory_size,
-            id.memory_type_index,
             res_arg.Width,
             res_arg.Height,
             res_arg.Format,
@@ -1704,64 +1986,94 @@ unsafe fn adopt_committed_allocation(
         return Err(E_FAIL);
     }
 
-    // ⛔ `memory_offset == 0` is a PRECONDITION of the adopt model, not a
-    // preference: one venus resource id covering several D3D12 resources breaks the
-    // one-resource-one-allocation rule the KMD's adopt arm rests on, and D3D11's
-    // path states the same requirement outright
-    // (`umd/src/forward/resource.rs:488-490`). `HELIOS_HEAP_FLAG_VENUS_EXPORT`'s
-    // dedicated allocation is what guarantees it; this is the assertion that the
-    // guarantee held.
+    // ⛔ **THE §5 GAP, counted at the exact site where the value is dropped.** The
+    // engine and the ICD between them can still name the host resource behind this
+    // memory; this driver may not pass it to the kernel and does not. There is no
+    // replacement field, no side channel, and nothing stashed in the identity table.
+    // ⇒ **mesa lane unit A3** is the mechanism that replaces it: the ICD stops naming
+    // host resources at all and the KMD patches the resid in from
+    // `HeliosNativeRenderPatch` (`protocol/src/native_render.rs`'s
+    // `HELIOS_NATIVE_RENDER_PATCH_*`). Until A3 lands, the allocation this create
+    // mints is a valid WDDM allocation whose backing is not yet the memory vkd3d
+    // renders into, which is why `present12` refuses.
+    if status == crate::bridge12::IdentityStatus::Resolved && id.venus_res_id != 0 {
+        L4_REFUSALS.hwa2_venus_res_id_dropped.bump();
+        let n = L4_REFUSALS.hwa2_venus_res_id_dropped.get();
+        if n <= LOG_BUDGET {
+            log_error!(
+                "L4: HWA2 carries NO host resource id -- venus res_id {} and memory type index \
+                 {} for the engine resource {:#x} are DROPPED, not sent. This is mesa unit A3's \
+                 gap: until the ICD stops naming host resources and the KMD patches the resid \
+                 in from HeliosNativeRenderPatch, this allocation's backing is not the memory \
+                 the engine renders into and the frame cannot be presented or opened (x{n})",
+                id.venus_res_id,
+                id.memory_type_index,
+                engine_resource,
+            );
+        }
+    } else {
+        // ⚠ **Re-graded from a refusal to a census.** The memory has no venus
+        // resource, which used to fail the create because the old record needed one.
+        // It no longer does. The counter still says the export chain did not engage,
+        // which stays worth knowing while `HELIOS_HEAP_FLAG_VENUS_EXPORT` is still in
+        // the tree.
+        note_refusal(&L4_REFUSALS.identity_venus_unresolved);
+    }
+
+    // ⛔ `memory_offset == 0` is a PRECONDITION of the record, not a preference, and
+    // the argument survives the retirement intact: HWA2's plane records are bounded
+    // against `byte_size`, and `byte_size` is the whole bound `VkDeviceMemory`. A
+    // suballocated resource would have its rows described inside an extent it does not
+    // own. `HELIOS_HEAP_FLAG_VENUS_EXPORT`'s dedicated allocation is what guarantees
+    // it; this is the assertion that the guarantee held.
     if id.memory_offset != 0 {
         note_refusal(&L4_REFUSALS.identity_offset_nonzero);
         log_error!(
             "L4: COMMITTED create REFUSED -- the engine SUBALLOCATED the resource {:#x} at \
-             offset {} of vk_memory {:#x} (venus res_id {}). The private heap flag {:#x} asks \
-             for a dedicated allocation; a shared VkDeviceMemory would give every swapchain \
-             buffer the same venus resource id and collapse buffer rotation onto one surface",
+             offset {} of vk_memory {:#x}. HWA2 byte_size is the whole bound VkDeviceMemory and \
+             every plane record is bounded against it, so a resource that does not own its \
+             extent cannot be described. The private heap flag {:#x} asks for a dedicated \
+             allocation",
             engine_resource,
             id.memory_offset,
             id.vk_memory,
-            id.venus_res_id,
             HELIOS_HEAP_FLAG_VENUS_EXPORT.0,
         );
         return Err(E_FAIL);
     }
 
-    // ⚠ Two independent readings of one number. vkd3d reports the whole
-    // `VkDeviceMemory`'s `VkMemoryAllocateInfo::allocationSize` from its own
-    // allocator record; the ICD reports what it passed to `vkAllocateMemory`. A
-    // disagreement means one of them is describing a different object, and the
-    // import that a cross-process opener performs is exact-size — so it is counted
-    // rather than reconciled here.
-    if id.memory_size != id.venus_alloc_size {
+    // ⚠ Two independent readings of one number, kept as a cross-check while the ICD
+    // still answers. vkd3d reports the whole `VkDeviceMemory`'s
+    // `VkMemoryAllocateInfo::allocationSize` from its own allocator record; the ICD
+    // reports what it passed to `vkAllocateMemory`. ⛔ Guarded on the venus half
+    // having resolved at all, because an unresolved half is 0 and comparing against a
+    // 0 would make this fire on every create the moment A3 removes the ICD export —
+    // which is a change in the ICD, not a disagreement about a size.
+    if id.venus_alloc_size != 0 && id.memory_size != id.venus_alloc_size {
         note_refusal(&L4_REFUSALS.identity_alloc_size_disagreement);
         log_error!(
             "L4: allocation size DISAGREEMENT for vk_memory {:#x}: engine says {}, the venus \
-             ICD says {}. A cross-process import is exact-size, so one of the two will reject \
-             it; the record carries the ICD's value in venus_alloc_size and the engine's in \
-             size",
+             ICD says {}. HWA2 byte_size carries the ENGINE's value, because that is the extent \
+             the resource is bound inside",
             id.vk_memory,
             id.memory_size,
             id.venus_alloc_size,
         );
     }
 
-    // ── 2. the row pitch, from the ENGINE ──────────────────────────────────
+    // ── 2. the row pitch and the subresource extent, from the ENGINE ───────
     //
-    // ⛔ Asked, never computed. `HeliosWddmAllocMeta::pitch` is what a linear
-    // cross-process opener lays rows out with, and this driver has two ways to
-    // produce a number: ask the engine that owns the layout, or re-derive
-    // `align(width * bpp, 256)` here. The second is a *second* derivation of a
-    // number the engine already owns, and the 15th/39th sessions are what a
-    // disagreeing stride costs (a sheared or black surface). `GetCopyableFootprints`
-    // is the engine's own answer and this lane already calls it from
-    // `check_subresource_info`, with `FOOTPRINT_UNANSWERED_U32` as vkd3d's own
-    // "declined" sentinel.
+    // ⛔ Asked, never computed. HWA2's plane record is what an opener lays rows out
+    // with, and this driver has two ways to produce those numbers: ask the engine that
+    // owns the layout, or re-derive `align(width * bpp, 256)` here. The second is a
+    // *second* derivation of a number the engine already owns, and the 15th/39th
+    // sessions are what a disagreeing stride costs (a sheared or black surface).
     //
-    // ⚠ A pitch of 0 is not fatal and is not a refusal: nothing on the windowed
-    // path reads it (DWM imports an OPTIMAL device-local image by venus resource id,
-    // not by stride). It is carried because the record has the field and an opener
-    // that ever needs it must see the engine's number or none.
+    // ⚠ **A 0 pitch is now a REFUSAL, and that is a change.** The retired trailer
+    // tolerated one because nothing on the windowed path read it; HWA2's shared
+    // validator rejects `PlaneRowPitchZero` outright, so a descriptor carrying one
+    // would fail in the kernel with a rejection this driver could have named itself.
+    //
     let api_desc = resource_desc(desc);
     let mut layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
         Offset: 0,
@@ -1773,9 +2085,9 @@ unsafe fn adopt_committed_allocation(
             RowPitch: FOOTPRINT_UNANSWERED_U32,
         },
     };
-    // SAFETY: `api_desc` and `layout` are live locals; `NumSubresources` is 1, so
-    // the one array this call writes has exactly one element, and the three outputs
-    // this call does not want are declined with `None`.
+    // SAFETY: `api_desc` and `layout` are live locals; `NumSubresources` is 1, so the
+    // one array this call writes has exactly one element, and the three outputs this
+    // call does not want are declined with `None`.
     unsafe {
         device10.GetCopyableFootprints(
             &api_desc,
@@ -1794,77 +2106,81 @@ unsafe fn adopt_committed_allocation(
         layout.Footprint.RowPitch
     };
 
-    // ── 3. the record ──────────────────────────────────────────────────────
-    let ctx_id = dev.engine.venus_instance_context_id();
-    if ctx_id == 0 {
-        // ⚠ Counted, NOT refused. The KMD's adopt path never reads `ctx_id`:
-        // `helios_protocol::classify` reaches `AdoptedUmdResource` from
-        // `adopt_resource_id` alone, and `build_backing`'s adopt arm does not consult
-        // it either. The field travels into `HeliosWddmOpenIdentity::ctx_id`, which
-        // that record's own doc calls "diagnostic only". Failing a create over a
-        // diagnostic would be the wrong severity.
-        note_refusal(&L4_REFUSALS.identity_ctx_id_unavailable);
-    }
-    let mut private = AdoptedAllocPrivate {
-        alloc: helios_protocol::HeliosWddmAllocPrivate::new(
-            // ⛔ DEVICE_MEMORY, which with a non-zero `adopt_resource_id` is the one
-            // combination that makes the KMD take the blob's OWNERSHIP rather than
-            // only validating its liveness (`protocol/src/wddm.rs`'s `classify`:
-            // `take_ownership = kind == DEVICE_MEMORY`). That is what step 5's
-            // ownership transfer pairs with.
-            helios_protocol::HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY,
-            ctx_id,
-            // The venus device-memory id. ⚠ Deliberately 0: this driver has no
-            // `helios_venus_memory_id` accessor and does not need one — the KMD's
-            // adopt arm names the resource by `adopt_resource_id` and never creates a
-            // blob, so `blob_id` is unread on this path. D3D11 passes it because its
-            // non-adopt arms create the blob from it.
-            0,
-            // The engine's allocation size. The KMD overwrites `ap.size` with the
-            // adopted blob's real size from its own table (`create_allocation.rs`'s
-            // `ap.size = created.blob_size.bytes()`), so this is the claim, not the
-            // answer.
-            id.memory_size,
-            // ⚠ `blob_mem` / `blob_flags` / `map_cache` are the virtio blob-create
-            // parameters, and the adopt arm forwards NONE of them: `classify` returns
-            // `AdoptedUmdResource` before it ever reads them. Zero rather than a
-            // plausible-looking `VIRTIO_GPU_BLOB_MEM_HOST3D`, so a future reader
-            // cannot mistake them for a request that was honoured.
-            0,
-            0,
-            0,
-            // ⭐ THE FIELD THIS WHOLE PATH EXISTS FOR.
-            id.venus_res_id,
-        ),
-        meta: helios_protocol::HeliosWddmAllocMeta {
-            width: res_arg.Width.min(u64::from(u32::MAX)) as u32,
-            height: res_arg.Height,
-            // ⚠ The lossy `D3DDDIFORMAT` the KMD reports from
-            // `DxgkDdiDescribeAllocation`. `dxgi_format` below is the one an opener
-            // rebuilds with; this driver does not translate DXGI -> D3DDDIFORMAT at
-            // all, so it carries 0 and lets the KMD's own describe path answer.
-            format: 0,
+    // ── 3. the HWA2 create-input descriptor ────────────────────────────────
+    let Some(create_input) = hwa2_create_input(heap_arg, res_arg, id.memory_size, pitch) else {
+        note_refusal(&L4_REFUSALS.hwa2_geometry_unrepresentable);
+        log_error!(
+            "L4: COMMITTED create REFUSED -- this create has no HWA2 spelling: type={} {}x{}x{} \
+             mips={} samples={}/{} fmt={} layout={} subresource0RowPitch={} byteSize={}. A \
+             standard-swizzle layout, a declined row pitch, a dimension above u32::MAX and a \
+             non-canonical buffer description are the four causes; none may be approximated, \
+             because the kernel echoes every field it validates",
+            res_arg.ResourceType,
+            res_arg.Width,
+            res_arg.Height,
+            res_arg.DepthOrArraySize,
+            res_arg.MipLevels,
+            res_arg.SampleDesc.Count,
+            res_arg.SampleDesc.Quality,
+            res_arg.Format,
+            res_arg.Layout,
             pitch,
-            // ⛔⛔ TRANSLATED, and the comment this replaces was WRONG in the one way
-            // that produces a wrong picture instead of an error. It read: *"The D3D12
-            // resource flags, verbatim. ⚠ NOT D3D11 bind flags: nothing reads this
-            // field for an adopted allocation, and inventing a D3D11 BindFlags word
-            // from a D3D12 resource-flags word would be a translation no reader asked
-            // for."* Both halves are false — see [`meta_bind_flags`] for the reader and
-            // for what the verbatim word decodes as.
-            bind_flags: meta_bind_flags(res_arg.Flags),
-            // ⛔ NOT `HELIOS_WDDM_ALLOC_MISC_PRIMARY`, and NOT
-            // `HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT` -- see this function's doc for
-            // both arguments. A windowed DWM-composited back buffer is not the VidPn
-            // primary selected for direct scanout.
-            misc_flags: 0,
-            venus_alloc_size: id.venus_alloc_size,
-            memory_type_index: id.memory_type_index,
-            dxgi_format: res_arg.Format as u32,
-            // Scanout only; 0 for everything a DWM-composited window presents.
-            plane_offset: 0,
-        },
+            id.memory_size,
+        );
+        return Err(E_FAIL);
     };
+
+    // ⛔ **Validated BEFORE the kernel sees it, and a failure here is a bug in THIS
+    // file.** K4-CONTRACT §1.1 makes the create-input stage a real validator with the
+    // same cross-field core as the output stage, so every rule the kernel will apply
+    // is applied here first. Sending a descriptor this driver could have known was
+    // malformed would turn a local bug into an `AllocateCbFailed` with a kernel-side
+    // rejection nobody can attribute.
+    if let Err(reject) = create_input.validate_create_input(helios_protocol::HELIOS_PACKAGE_GENERATION)
+    {
+        note_refusal(&L4_REFUSALS.hwa2_create_input_invalid);
+        log_error!(
+            "L4: COMMITTED create REFUSED -- the HWA2 create-input descriptor this driver built \
+             is INVALID: {:?}. kind={} flags={:#x} bind={:#x} misc={:#x} vidpn={:#x} swizzle={} \
+             memory={} planes={} byteSize={} {}x{}x{} mips={} samples={} fmt={}",
+            reject,
+            create_input.allocation_kind,
+            create_input.flags,
+            create_input.bind_flags,
+            create_input.misc_flags,
+            create_input.vidpn_source,
+            create_input.swizzle_class,
+            create_input.memory_class,
+            create_input.plane_count,
+            create_input.byte_size,
+            create_input.width,
+            create_input.height,
+            create_input.depth_or_array_size,
+            create_input.mip_levels,
+            create_input.sample_count,
+            create_input.dxgi_format,
+        );
+        return Err(E_FAIL);
+    }
+
+    // ⛔ **A byte buffer, not a struct pointer handed to the kernel.** The buffer is
+    // `[in/out]`: dxgkrnl passes it down and the KMD writes all 168 bytes of the
+    // output descriptor back into it. Keeping it as bytes is what lets the read-back
+    // below enter through `from_private_data` — the constructor whose own doc says
+    // "every consumer must enter through here rather than casting the pointer",
+    // because the runtime's buffer carries no alignment promise.
+    let mut private_bytes = [0u8; helios_protocol::HELIOS_HWA2_BYTES as usize];
+    // SAFETY: `HeliosWddmAllocationDescV2` is `#[repr(C)]` and `bytemuck::Pod`, so it
+    // has no padding and no invalid bit pattern, and `protocol`'s own `const _` block
+    // pins its size at `HELIOS_HWA2_BYTES`. Source and destination are distinct live
+    // locals, so the ranges cannot overlap.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            core::ptr::from_ref(&create_input).cast::<u8>(),
+            private_bytes.as_mut_ptr(),
+            private_bytes.len(),
+        );
+    }
 
     // ── 4. pfnAllocateCb ───────────────────────────────────────────────────
     if dev.um_callbacks.is_null() {
@@ -1879,25 +2195,23 @@ unsafe fn adopt_committed_allocation(
     let Some(allocate_cb) = (unsafe { (*dev.um_callbacks).pfnAllocateCb }) else {
         note_refusal(&L4_REFUSALS.allocate_cb_missing);
         log_error!(
-            "L4: PRIMARY create REFUSED -- p12UMCallbacks->pfnAllocateCb is absent, so this \
-             driver cannot mint a kernel allocation for a primary"
+            "L4: COMMITTED create REFUSED -- p12UMCallbacks->pfnAllocateCb is absent, so this \
+             driver cannot mint a kernel allocation"
         );
         return Err(E_FAIL);
     };
 
-    let private_ptr = core::ptr::from_mut(&mut private).cast::<c_void>();
-    let private_size = u32::try_from(core::mem::size_of::<AdoptedAllocPrivate>()).unwrap_or(0);
+    let private_ptr = private_bytes.as_mut_ptr().cast::<c_void>();
+    let private_size = u32::from(helios_protocol::HELIOS_HWA2_BYTES);
     let mut allocation_info = ddi12::D3D12DDI_ALLOCATION_INFO_0022 {
         hAllocation: 0,
-        // Not a system-memory allocation: the bytes are the host's, behind a venus
-        // resource. D3D11's adopt path leaves the same field null.
+        // Not a system-memory allocation: the bytes are the host's.
         pSystemMem: core::ptr::null(),
         pPrivateDriverData: private_ptr,
         PrivateDriverDataSize: private_size,
-        // ⚠ 0, and it is only meaningful with the PRIMARY flag this driver does not
-        // set -- see the doc. The one source id this adapter owns is 0, the live
-        // desktop's.
-        VidPnSourceId: 0,
+        // ⭐ C44's sentinel, and it must MATCH the descriptor's `vidpn_source` — see
+        // this function's doc. Not 0.
+        VidPnSourceId: helios_protocol::D3DDDI_ID_UNINITIALIZED,
         Flags: ddi12::D3D12DDI_ALLOCATION_INFO_FLAGS_0022_D3D12DDI_ALLOCATION_INFO_FLAGS_0022_NONE,
         // The KMD assigns the GPU VA; this driver never reserves one
         // (`pfnReserveGpuVirtualAddressCb` is not called anywhere in this crate).
@@ -1915,15 +2229,10 @@ unsafe fn adopt_committed_allocation(
         PrivateDriverDataSize: private_size,
         // ⛔⛔ THE ASSOCIATION, and it is NOT optional. D3D11 states it outright for
         // exactly this class of allocation: *"the association itself is not optional
-        // for present-only allocations"* (`umd/src/forward/resource.rs:364-370`).
-        // Without it dxgkrnl gets an allocation tied to no resource, and the KMD's
-        // open path finds nothing to stamp `HeliosWddmOpenIdentity` onto -- so DWM
-        // could never open the back buffer.
-        //
-        // ⚠ This is the parameter `pfnCreateHeapAndResource` used to discard as
-        // `_h_rt_resource`, under a rule in `ResourceState`'s doc that said no
-        // callback takes an `HRTRESOURCE`. That rule was FALSE for this one callback,
-        // and it is corrected there in this commit.
+        // for present-only allocations"* (`umd/src/forward/resource.rs`). It is also
+        // what makes `HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED` in the descriptor above a
+        // true statement rather than a hopeful one: passing `hResource` is precisely
+        // what asks dxgkrnl to create the kernel resource object that flag records.
         hResource: h_rt_resource.handle,
         hKMResource: 0,
         NumAllocations: 1,
@@ -1939,12 +2248,11 @@ unsafe fn adopt_committed_allocation(
         // code, and treating `S_FALSE` as a failure would fail a create that worked.
         note_refusal(&L4_REFUSALS.allocate_cb_failed);
         log_error!(
-            "L4: pfnAllocateCb FAILED hr={:#010x} for the committed resource {:#x} (venus res_id {} \
-             size {} rt_resource {:p} priv {} bytes)",
+            "L4: pfnAllocateCb FAILED hr={:#010x} for the committed resource {:#x} (byteSize {} \
+             rt_resource {:p} priv {} bytes)",
             hr as u32,
             engine_resource,
-            id.venus_res_id,
-            id.memory_size,
+            create_input.byte_size,
             h_rt_resource.handle,
             private_size,
         );
@@ -1964,65 +2272,159 @@ unsafe fn adopt_committed_allocation(
         return Err(E_FAIL);
     }
 
-    // ⚠ **Did anything write the private data back?** The buffer is the runtime's to
-    // pass down and the kernel's to fill: `DxgkDdiCreateAllocation` recomputes
-    // `meta.pitch`, `meta.venus_alloc_size`, `meta.memory_type_index` and
-    // `meta.dxgi_format` from what the host actually did
-    // (`create_allocation.rs`'s "THE one update site"), and whether that reaches this
-    // buffer at CREATE time — rather than only at OPEN, where `write_open_identity`
-    // definitely writes — is **not established anywhere in the doc set**. So it is
-    // measured instead of assumed, at the one moment the answer is visible.
+    // ── 5. the KMD's write-back, validated ─────────────────────────────────
     //
-    // ⛔ The record already stored the values this driver sent; a write-back is
-    // therefore an observation and not an input, and it must not be folded into the
-    // identity — the whole point of two sources is that they can be compared.
-    if private.meta.pitch != pitch
-        || private.meta.venus_alloc_size != id.venus_alloc_size
-        || private.meta.memory_type_index != id.memory_type_index
-    {
-        L4_REFUSALS.alloc_private_written_back.bump();
-        let n = L4_REFUSALS.alloc_private_written_back.get();
-        if n <= LOG_BUDGET {
+    // ⭐⭐ **This is the output stage of K4-CONTRACT §1.1 and it is not optional.**
+    // The buffer is `[in/out]`; the KMD validates the input in full and then writes
+    // the complete 168-byte output descriptor, echoing every field it validated and
+    // stamping the one field only the kernel can know. So the create is not finished
+    // until this driver has read that descriptor back and found it valid: an
+    // allocation whose descriptor never arrived is one no opener can ever describe,
+    // and carrying on would be the survivable lie CLAUDE.md rule 2 forbids.
+    //
+    // ⚠ **Three outcomes, three counters, because they have three different fixes.**
+    // A buffer that did not change at all says dxgkrnl did not propagate the kernel's
+    // create-time write (recon's open question, and the answer is *this* counter);
+    // a changed buffer that fails validation says the KMD wrote something wrong; and
+    // a valid one is the success path.
+    let read_back = helios_protocol::HeliosWddmAllocationDescV2::from_private_data(&private_bytes);
+    let allocation_desc = match read_back {
+        Ok(desc) if desc.allocation_generation == 0 => {
+            // ⛔ The kernel's write did not reach this buffer: `allocation_generation`
+            // is the one field the KMD must stamp and the one this driver sent as 0.
+            note_refusal(&L4_REFUSALS.hwa2_write_back_absent);
             log_error!(
-                "L4: the kernel WROTE BACK the allocation private data for {:#x}: pitch {} -> \
-                 {}, venus_alloc_size {} -> {}, mti {} -> {} (x{n})",
-                engine_resource,
-                pitch,
-                private.meta.pitch,
-                id.venus_alloc_size,
-                private.meta.venus_alloc_size,
-                id.memory_type_index,
-                private.meta.memory_type_index,
+                "L4: COMMITTED create REFUSED -- pfnAllocateCb succeeded (alloc={:#x}) and the \
+                 HWA2 private buffer came back with allocation_generation=0, i.e. the KMD's \
+                 create-time write did not reach this UMD's buffer. Nothing downstream can \
+                 describe this allocation, so it is rolled back",
+                h_allocation,
             );
+            // SAFETY: `h_allocation` is the handle `pfnAllocateCb` just minted for this
+            // driver, not yet recorded anywhere, so this is its only reference.
+            unsafe { deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList) };
+            return Err(E_FAIL);
         }
-    }
+        Ok(desc) => {
+            match desc.validate_create_output(helios_protocol::HELIOS_PACKAGE_GENERATION) {
+                Ok(()) => desc,
+                Err(reject) => {
+                    note_refusal(&L4_REFUSALS.hwa2_create_output_invalid);
+                    log_error!(
+                        "L4: COMMITTED create REFUSED -- the KMD's HWA2 output descriptor for \
+                         alloc={:#x} is INVALID: {:?}. gen={} kind={} flags={:#x} bind={:#x} \
+                         misc={:#x} vidpn={:#x} swizzle={} memory={} planes={} byteSize={}",
+                        h_allocation,
+                        reject,
+                        desc.allocation_generation,
+                        desc.allocation_kind,
+                        desc.flags,
+                        desc.bind_flags,
+                        desc.misc_flags,
+                        desc.vidpn_source,
+                        desc.swizzle_class,
+                        desc.memory_class,
+                        desc.plane_count,
+                        desc.byte_size,
+                    );
+                    // SAFETY: as above -- the only reference to a handle nothing recorded.
+                    unsafe { deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList) };
+                    return Err(E_FAIL);
+                }
+            }
+        }
+        Err(reject) => {
+            // Unreachable by construction — the buffer is exactly `HELIOS_HWA2_BYTES`
+            // long and `from_private_data`'s only failure arm is a length mismatch —
+            // and counted anyway, because "unreachable by construction" is a claim and
+            // this is where it would be observed breaking.
+            note_refusal(&L4_REFUSALS.hwa2_create_output_invalid);
+            log_error!(
+                "L4: COMMITTED create REFUSED -- the HWA2 private buffer could not be parsed \
+                 back for alloc={:#x}: {:?}",
+                h_allocation,
+                reject,
+            );
+            // SAFETY: as above.
+            unsafe { deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList) };
+            return Err(E_FAIL);
+        }
+    };
+    // ⚠ Not a refusal — the census that answers recon's open question with a number:
+    // the kernel's create-time private write DOES reach this buffer. Its historical
+    // name is kept because `D3D12 DDI refusals:` lines are diffed across builds.
+    L4_REFUSALS.alloc_private_written_back.bump();
 
-    // ── 5. hand the venus resource over, then record ───────────────────────
+    // ⛔ **Echo check, and it is deliberately narrow.** K4-CONTRACT §1.1: the KMD
+    // "refuses the create rather than correcting a field", so every field except
+    // `allocation_generation` and the two KMD-owned flag bits must come back exactly
+    // as sent. A silent correction would make the descriptor disagree with the
+    // resource this driver believes it made — the exact failure the field partition
+    // exists to prevent — so it is a finding, not an update.
     //
-    // ⛔ In THIS order. The ICD stops unref'ing the host resource only once the
-    // transfer has run, and the KMD's allocation took ownership inside the callback
-    // above (`adopt_blob_for_allocation`), so the window between them is the one
-    // where both believe they own it. Transferring first would be worse: an
-    // allocation failure would then leave the resource owned by nobody.
-    //
-    // SAFETY: as the identity read above -- the same live engine resource, borrowed.
-    let transferred = unsafe { dev.engine.transfer_resource_ownership(engine_resource) };
-    if transferred != id.venus_res_id {
-        note_refusal(&L4_REFUSALS.ownership_transfer_failed);
+    // The mask is `protocol`'s, not a local re-derivation of it. This site used
+    // to spell out `DIRECT_FLIP_COMPATIBLE | D3D12_RUNTIME_PRIMARY` by hand, and
+    // so did three others (`protocol` itself, `kmd_logic`, `umd`): one rule,
+    // four declarations, nothing comparing them. Add a third KMD-owned bit and
+    // every hand copy keeps clearing two — the echo check then reports a
+    // mismatch on a field the KMD legitimately stamped, which is a false finding
+    // in the one place whose whole job is to be believed.
+    let echoed = helios_protocol::HeliosWddmAllocationDescV2 {
+        allocation_generation: 0,
+        flags: allocation_desc.flags & !helios_protocol::HELIOS_HWA2_FLAG_KMD_OWNED_MASK,
+        ..allocation_desc
+    };
+    if echoed != create_input {
+        note_refusal(&L4_REFUSALS.hwa2_echo_mismatch);
         log_error!(
-            "L4: venus ownership transfer FAILED for the committed resource {:#x}: asked for res_id {}, \
-             the ICD handed back {}. The kernel allocation and the ICD would both unref the \
-             host resource, so the allocation is rolled back and the create fails",
-            engine_resource,
-            id.venus_res_id,
-            transferred,
+            "L4: the KMD's HWA2 output for alloc={:#x} DOES NOT ECHO the create input -- sent \
+             kind={} flags={:#x} bind={:#x} misc={:#x} vidpn={:#x} swizzle={} memory={} \
+             planes={} byteSize={} pitch={}, got kind={} flags={:#x} bind={:#x} misc={:#x} \
+             vidpn={:#x} swizzle={} memory={} planes={} byteSize={} pitch={}. A corrected field \
+             means the descriptor and the resource disagree",
+            h_allocation,
+            create_input.allocation_kind,
+            create_input.flags,
+            create_input.bind_flags,
+            create_input.misc_flags,
+            create_input.vidpn_source,
+            create_input.swizzle_class,
+            create_input.memory_class,
+            create_input.plane_count,
+            create_input.byte_size,
+            create_input.planes[0].row_pitch,
+            allocation_desc.allocation_kind,
+            allocation_desc.flags,
+            allocation_desc.bind_flags,
+            allocation_desc.misc_flags,
+            allocation_desc.vidpn_source,
+            allocation_desc.swizzle_class,
+            allocation_desc.memory_class,
+            allocation_desc.plane_count,
+            allocation_desc.byte_size,
+            allocation_desc.planes[0].row_pitch,
         );
-        // SAFETY: `h_allocation` is the handle `pfnAllocateCb` just minted for this
-        // driver, not yet recorded anywhere, so this is its only reference.
-        unsafe { deallocate_adopted(dev, h_allocation, DeallocateForm::ByHandleList) };
+        // SAFETY: as above -- the only reference to a handle nothing recorded.
+        unsafe { deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList) };
         return Err(E_FAIL);
     }
 
+    // ── 6. record ──────────────────────────────────────────────────────────
+    //
+    // ⚠ **No venus ownership transfer, and its absence is the retirement.** This step
+    // used to hand the host resource behind the memory to the WDDM allocation that had
+    // just adopted it, so the ICD would stop unref'ing it. There is no adoption now:
+    // the kernel allocation owns backing the KMD created, the ICD keeps its own
+    // resource, and neither double-unrefs the other's. `OwnershipTransferFailed` is a
+    // retired counter slot.
+    let ctx_id = dev.engine.venus_instance_context_id();
+    if ctx_id == 0 {
+        // ⚠ Counted, NOT refused, and its consumer is now local. The value used to
+        // travel into `HeliosWddmOpenIdentity::ctx_id`; that record is retired and
+        // HWA2 has no context field, so this is process-local diagnostic evidence and
+        // failing a create over it would be the wrong severity.
+        note_refusal(&L4_REFUSALS.identity_ctx_id_unavailable);
+    }
     let identity = identity12::AllocationIdentity {
         // ⚠ An identity token, never dereferenced by the table -- see
         // `identity12`'s module doc for the whole argument, including how the
@@ -2031,13 +2433,15 @@ unsafe fn adopt_committed_allocation(
         vk_memory: id.vk_memory,
         memory_offset: id.memory_offset,
         memory_size: id.memory_size,
-        venus_res_id: id.venus_res_id,
-        venus_alloc_size: id.venus_alloc_size,
-        memory_type_index: id.memory_type_index,
         h_allocation,
         h_km_resource: alloc.hKMResource,
         h_rt_resource: h_rt_resource.handle as usize,
         ctx_id,
+        // ⭐ The KMD's own stamp, out of the validated output descriptor. ⛔ **Never
+        // an identity lookup key** (§10.3): it is kept so a later stale-descriptor
+        // finding has something to compare against and so the log line below reports
+        // what the kernel assigned rather than what this driver hoped for.
+        allocation_generation: allocation_desc.allocation_generation,
         geometry: identity12::IdentityGeometry {
             width: res_arg.Width,
             height: res_arg.Height,
@@ -2046,12 +2450,10 @@ unsafe fn adopt_committed_allocation(
             sample_count: res_arg.SampleDesc.Count,
             dxgi_format: res_arg.Format as u32,
         },
-        // ⭐ The SAME number that went into `meta.pitch` above, not a second
-        // derivation of it: UP-9's `HeliosPresentPrivateData::pitch` has to agree with
-        // the allocation's, and the only way to guarantee that is one source. ⚠ Read
-        // out of the local rather than `private.meta.pitch`, because the kernel may
-        // have written that field back and the write-back is deliberately kept as an
-        // observation (see the comparison above) instead of becoming an input.
+        // ⭐ The SAME number that went into the descriptor's plane record above, not a
+        // second derivation of it. ⚠ Read out of the local rather than out of the
+        // read-back descriptor, so that the echo check above is comparing two
+        // independent things rather than one thing with itself.
         pitch,
         heap_flags: heap_arg.Flags as u32,
     };
@@ -2077,24 +2479,7 @@ unsafe fn adopt_committed_allocation(
                 heap_arg.Flags,
             );
             // SAFETY: as above -- the only reference to a handle nothing recorded.
-            unsafe { deallocate_adopted(dev, h_allocation, DeallocateForm::ByHandleList) };
-            return Err(E_FAIL);
-        }
-        identity12::RecordOutcome::ResIdShared { holder } => {
-            // ⛔⛔ ROTATION COLLAPSE. See `identity12::RecordOutcome::ResIdShared`.
-            note_refusal(&L4_REFUSALS.identity_res_id_shared);
-            log_error!(
-                "L4: venus res_id {} is ALREADY held by the live resource {:#x} -- the engine \
-                 suballocated two D3D12 resources out of one VkDeviceMemory ({:#x}), so every \
-                 swapchain buffer would name one host surface and rotation would collapse. \
-                 Refusing the committed resource {:#x} and rolling its allocation back",
-                id.venus_res_id,
-                holder,
-                id.vk_memory,
-                engine_resource,
-            );
-            // SAFETY: as above.
-            unsafe { deallocate_adopted(dev, h_allocation, DeallocateForm::ByHandleList) };
+            unsafe { deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList) };
             return Err(E_FAIL);
         }
     }
@@ -2105,25 +2490,22 @@ unsafe fn adopt_committed_allocation(
         // built from**, and that is not stylistic. It prints what was stored rather
         // than what was intended, so a field the construction above got wrong is
         // visible here; and an entry whose fields no code reads is `dead_code`, which
-        // `PARALLEL.md` §10 forbids silencing on hand-written lines (R908). `pitch`
-        // is the one value not in the record — it lives in the wire meta — so it is
-        // printed from its local.
+        // `PARALLEL.md` §10 forbids silencing on hand-written lines (R908) -- so
+        // `pitch` is read out of the record too, even though the local it was built
+        // from is two statements away.
         log_error!(
-            "L4: COMMITTED adopted res={:#x} alloc={:#x} km={:#x} rt={:#x} ctx={} \
-             venus_res_id={} vk_memory={:#x} off={} size={} venus_alloc_size={} mti={} \
-             pitch={} {}x{}x{} mips={} samples={} fmt={} heapFlags={:#x} (x{n})",
-            identity.engine_resource,
+            "L4: COMMITTED alloc={:#x} km={:#x} rt={:#x} res={:#x} ctx={} gen={} vk_memory={:#x} \
+             off={} size={} pitch={} {}x{}x{} mips={} samples={} fmt={} heapFlags={:#x} (x{n})",
             identity.h_allocation,
             identity.h_km_resource,
             identity.h_rt_resource,
+            identity.engine_resource,
             identity.ctx_id,
-            identity.venus_res_id,
+            identity.allocation_generation,
             identity.vk_memory,
             identity.memory_offset,
             identity.memory_size,
-            identity.venus_alloc_size,
-            identity.memory_type_index,
-            pitch,
+            identity.pitch,
             identity.geometry.width,
             identity.geometry.height,
             identity.geometry.depth_or_array_size,
@@ -2157,7 +2539,7 @@ unsafe fn adopt_committed_allocation(
 /// has not already been deallocated; passing one twice is a kernel-handle double
 /// free. On [`DeallocateForm::ByResource`] the handle must be the runtime resource
 /// the allocation was associated with at the create.
-unsafe fn deallocate_adopted(
+unsafe fn deallocate_committed(
     dev: &HeliosD3D12Device,
     h_allocation: ddi12::D3DKMT_HANDLE,
     form: DeallocateForm,
@@ -2166,7 +2548,7 @@ unsafe fn deallocate_adopted(
         note_refusal(&L4_REFUSALS.deallocate_cb_missing);
         return;
     }
-    // SAFETY: non-null per the check; the same table `adopt_committed_allocation` read.
+    // SAFETY: non-null per the check; the same table `create_committed_allocation` read.
     let Some(deallocate_cb) = (unsafe { (*dev.um_callbacks).pfnDeallocateCb }) else {
         // ⛔ A leaked WDDM allocation, and it is counted rather than ignored: the
         // handle is now unreachable and only process exit frees it.
@@ -2220,7 +2602,7 @@ unsafe fn deallocate_adopted(
 /// ⭐ **A mirror of `umd/src/forward/state.rs`'s `DeallocateForm`, and it exists for
 /// the same measured reason**: the wire contract is *either* `hResource` *or*
 /// `NumAllocations`+`HandleList`, and both together returned `0x80070057` and leaked.
-/// Constructing this enum is the only way [`deallocate_adopted`] builds the struct,
+/// Constructing this enum is the only way [`deallocate_committed`] builds the struct,
 /// so the illegal combination is unrepresentable rather than merely avoided.
 ///
 /// ⚠ **Which arm goes where is the D3D11 pairing, not a preference**, and the two
@@ -2262,7 +2644,7 @@ enum DeallocateForm {
 /// is the measured Windows 11 call shape.
 ///
 /// ⭐ **It is also the only arm that creates physical backing and a resource in
-/// one DDI declaration**, so it is where [`adopt_committed_allocation`] runs —
+/// one DDI declaration**, so it is where [`create_committed_allocation`] runs —
 /// see that function for the whole create-time identity path and for why an
 /// unadoptable fused resource fails the create.
 ///
@@ -2311,9 +2693,18 @@ unsafe fn create_fused_heap_and_resource(
     // sends neither HEAP_FLAG_PRIMARY nor RESOURCE_OPTIMIZATION_FLAG_PRIMARY for
     // flip-model back buffers, then later asks dxgkrnl to share the fused
     // resource's allocation. Therefore every fused resource must be born
-    // adoptable: this is the exact DDI arm that creates the backing heap, not a
+    // exportable: this is the exact DDI arm that creates the backing heap, not a
     // format/bind/geometry guess. The fork's private flag makes the memory
-    // allocator-dedicated and venus-exportable so pfnAllocateCb can adopt it below.
+    // allocator-dedicated and venus-exportable.
+    //
+    // ⚠ **The second half of that sentence used to read "so pfnAllocateCb can ADOPT
+    // it below" and it is restated rather than left stale.** Nothing is adopted:
+    // `HeliosWddmAllocationDescV2` carries no host resource token (§10.3,
+    // `docs/retirement/K4-CONTRACT.md` §5) and the KMD creates the allocation's
+    // backing. What the flag still buys the create is the **dedicated** half — a
+    // resource that owns its whole `VkDeviceMemory` at offset 0, which is the
+    // precondition `create_committed_allocation` asserts before it can state HWA2's
+    // `byte_size` and bound a plane record against it.
     engine_heap_flags |= HELIOS_HEAP_FLAG_VENUS_EXPORT;
     L4_REFUSALS.committed_venus_export.bump();
 
@@ -2409,13 +2800,13 @@ unsafe fn create_fused_heap_and_resource(
     // ⚠ **This IS a change of severity from UP-4**, where the identity was recorded
     // and *"never fails the create"*. UP-4 recorded bookkeeping; this mints a kernel
     // object the runtime may later ask dxgkrnl to share, and a committed resource
-    // without one cannot satisfy that contract. `adopt_committed_allocation`'s doc
+    // without one cannot satisfy that contract. `create_committed_allocation`'s doc
     // carries the argument.
     // SAFETY: `dev` is the live device this create is running on, `resource` the
     // engine resource just created (owned here, so alive for the call), and
     // `h_rt_resource` the runtime handle this DDI was invoked with.
     if let Err(hr) = unsafe {
-        adopt_committed_allocation(
+        create_committed_allocation(
             dev,
             device10,
             &resource,
@@ -2706,7 +3097,7 @@ unsafe fn castable_formats(
 /// [`ResourceState`]'s doc that no callback takes an `HRTRESOURCE`. UP-5 falsified
 /// that rule for exactly one callback — `D3D12DDICB_ALLOCATE_0022::hResource` — so
 /// the handle is now threaded to the committed arm. ⛔ It is still not *stored*: it
-/// is a live parameter of this DDI and [`adopt_committed_allocation`] runs inside it, so the
+/// is a live parameter of this DDI and [`create_committed_allocation`] runs inside it, so the
 /// only place it needs to survive to is the identity table, which keeps it as an
 /// integer for the paired `pfnDeallocateCb`.
 unsafe extern "C" fn create_heap_and_resource(
@@ -2938,7 +3329,7 @@ unsafe extern "C" fn destroy_heap_and_resource(
             // `ID3D12Resource` this driver created. The engine address is read
             // out of the state box while the box is still alive and the COM
             // reference it holds is still valid, so the key that is removed is
-            // provably the key `adopt_committed_allocation` inserted -- both are
+            // provably the key `create_committed_allocation` inserted -- both are
             // `ID3D12Resource::as_raw()` on the same object.
             //
             // ⚠ Ordering: before `drop(state)`. After the drop the resource may
@@ -2976,7 +3367,7 @@ unsafe extern "C" fn destroy_heap_and_resource(
                             // other path can reach it, and `h_rt_resource` is the
                             // runtime handle it was associated with at the create.
                             unsafe {
-                                deallocate_adopted(
+                                deallocate_committed(
                                     dev,
                                     identity.h_allocation,
                                     // ⛔ The `hResource` form on the destroy, and the
@@ -3336,10 +3727,8 @@ unsafe extern "C" fn calc_private_opened_heap_and_resource_sizes(
 /// # What is missing, precisely
 ///
 /// This slot is what discharges `DECISIONS.md` D3c — *"D3D12-created resources
-/// must be able to be opened by DWM, using D3D11 and the 11 DDI"* — and it is
-/// the one place in this lane that needs `helios_protocol`'s
-/// `HeliosWddmAllocPrivate` / `HeliosWddmOpenIdentity`. Three things stand
-/// between here and an implementation, and none of them is a line of Rust:
+/// must be able to be opened by DWM, using D3D11 and the 11 DDI"*. Two things stand
+/// between here and an implementation, and neither is a line of Rust:
 ///
 /// 1. **There is no engine entry point to adopt a foreign allocation.**
 ///    `D3D12DDIARG_OPENHEAP_0003` carries `D3DDDI_OPENALLOCATIONINFO` plus a
@@ -3348,11 +3737,17 @@ unsafe extern "C" fn calc_private_opened_heap_and_resource_sizes(
 ///    handle** from `CreateSharedHandle`, not a `D3DKMT` allocation. Bridging
 ///    the two means a new C++ entry point into vkd3d's internals to build a
 ///    `d3d12_resource` over Vulkan external memory the Mesa ICD already owns.
-/// 2. **The other half of the channel does not exist yet either.** For DWM to
-///    open a D3D12-created resource through the 11 DDI, this driver must first
-///    *write* `HeliosWddmAllocPrivate` at create time — which it cannot, because
-///    it mints no WDDM allocation at all (see the module doc).
-/// 3. **Nothing on the triangle path needs it.** `DDI_REFERENCE.md` §14.0's
+///    ⚠⚠ **The item that used to sit here was STALE and is deleted rather than
+///    reworded**, because a lane reading only this block would have concluded the
+///    D3D12 writer does not exist. It said *"the other half of the channel does not
+///    exist yet either: for DWM to open a D3D12-created resource through the 11 DDI,
+///    this driver must first write `HeliosWddmAllocPrivate` at create time — which it
+///    cannot, because it mints no WDDM allocation at all"*. Both clauses are false:
+///    [`create_committed_allocation`] writes the create-time descriptor (now
+///    `HeliosWddmAllocationDescV2`) and calls `pfnAllocateCb` for **every** committed
+///    resource. The channel's creator half exists; what is missing is item 1 and the
+///    §5 host-resource-id gap the module doc names.
+/// 2. **Nothing on the triangle path needs it.** `DDI_REFERENCE.md` §14.0's
 ///    measured `D12-G5` trace — device, queue, swapchain, two PSOs, two draws,
 ///    three presents — never reaches this slot.
 ///
@@ -3559,7 +3954,7 @@ unsafe extern "C" fn check_resource_allocation_info(
     //
     // ⛔ Counted and NOT acted on. This slot has no `D3D12DDI_HRESOURCE`: it is a
     // sizing query about a resource that does not exist yet, so there is nothing
-    // to record an identity against. See `adopt_committed_allocation` for why that
+    // to record an identity against. See `create_committed_allocation` for why that
     // makes §14a.3's "use both signals" unimplementable as written.
     if optimization_flags & v::RESOURCE_OPT_PRIMARY != 0 {
         L4_REFUSALS.resource_optimization_primary.bump();
@@ -3881,7 +4276,7 @@ unsafe extern "C" fn check_resource_virtual_address(
 ///
 /// The DDI asks for the kernel allocation behind a resource. ⭐ Since UP-5 this
 /// driver has one for every committed resource: the `pfnAllocateCb` handle
-/// [`adopt_committed_allocation`] minted, kept in the [`identity12`] registry
+/// [`create_committed_allocation`] minted, kept in the [`identity12`] registry
 /// and looked up here by the engine resource behind the handle.
 ///
 /// ⚠ **0 remains the correct answer for non-committed arms**, and it is not a
@@ -4133,8 +4528,8 @@ struct L4Refusals {
     /// 0 because this driver mints no kernel allocations. Expected non-zero if the
     /// slot is called at all, and driving it to zero is what closing
     /// `DDI_REFERENCE.md` §9.7's kernel-identity gap would mean."* This driver does
-    /// mint kernel allocations now, for every adopted primary, and the slot answers
-    /// with the real handle for those.
+    /// mint kernel allocations now, for every **committed** resource whose HWA2
+    /// create succeeded, and the slot answers with the real handle for those.
     ///
     /// ⇒ It is **expected non-zero and benign**: the runtime is free to ask about any
     /// resource, and an ordinary D3D12 texture has no kernel allocation because its
@@ -4212,19 +4607,28 @@ struct L4Refusals {
     heap_block_unreclaimed: RefusalCounter,
     // -- UP-4, the resource -> kernel-allocation-identity table -------------
     /// Entries made in the `forward12::identity12` registry, i.e. committed
-    /// resources this driver **successfully adopted**. ⚠ **Not a refusal — the
+    /// resources whose **HWA2 create succeeded end to end**. ⚠ **Not a refusal — the
     /// census**, and since UP-5 it is also the count of live-or-once-live WDDM
     /// allocations this driver owns.
     ///
-    /// ⚠ **Re-graded for create-time identity**: its partner is now
-    /// `CommittedVenusExport` (the committed resources this driver *tried* to
-    /// adopt), and the two are deliberately **not** equal-by-construction: every
-    /// refusal in `adopt_committed_allocation` widens the gap, and the gap is the
-    /// interesting quantity. `CommittedVenusExport - IdentityRecorded` is the
-    /// number of committed resources that could not be adopted, and
-    /// the counter that says why is one of `IdentityVenusUnresolved`,
-    /// `IdentityVkMemoryUnresolved`, `IdentityOffsetNonZero`, `IdentityResIdShared`,
-    /// `AllocateCb*`, `OwnershipTransferFailed` or `IdentityRegistryAllocFailed`.
+    /// ⚠ **Re-graded twice.** Its partner is `CommittedVenusExport` (every committed
+    /// create this driver *attempted*), and the two are deliberately **not**
+    /// equal-by-construction: every refusal in `create_committed_allocation` widens
+    /// the gap, and the gap is the interesting quantity.
+    /// `CommittedVenusExport - IdentityRecorded` is the number of committed resources
+    /// that got no kernel allocation, and the counter that says why is one of
+    /// `IdentityVkMemoryUnresolved`, `IdentityOffsetNonZero`,
+    /// `Hwa2GeometryUnrepresentable`, `Hwa2CreateInputInvalid`, `AllocateCb*`,
+    /// `Hwa2WriteBackAbsent`, `Hwa2CreateOutputInvalid`, `Hwa2EchoMismatch` or
+    /// `IdentityRegistryAllocFailed`.
+    ///
+    /// ⚠ The word "adopted" and the counters `IdentityResIdShared` and
+    /// `OwnershipTransferFailed` are struck from this list rather than reworded.
+    /// Both counters survive as retired append-only slots that are **permanently 0**
+    /// — the first had no id left to collide, the second's bridge call is deleted —
+    /// because there is no adoption any more (K4-CONTRACT §5), so neither can widen
+    /// this gap and reading them as a cause would send a reader looking for a
+    /// mechanism that is gone.
     identity_recorded: RefusalCounter,
     /// ⛔ Retired append-only telemetry slot. The fixed 64-entry identity table no
     /// longer exists; the dynamic registry reports allocation pressure through
@@ -4251,28 +4655,31 @@ struct L4Refusals {
     /// invariant is that an entry exists **iff** a WDDM allocation exists.
     ///
     /// It now counts **a committed create refused because the ENGINE could not name
-    /// the memory the resource is bound to** — `IdentityStatus::BadArg`, `NoInterop` or
-    /// `EngineRefused`. ⛔ Expected 0, and non-zero points at the vkd3d fork or the
-    /// interop interface, not at the ICD. Its sibling below is the other half.
+    /// the memory the resource is bound to** — a zero `vk_memory` or a zero
+    /// `memory_size`, i.e. `IdentityStatus::BadArg`, `NoInterop` or `EngineRefused`.
+    /// ⛔ Expected 0, and non-zero points at the vkd3d fork or the interop interface,
+    /// not at the ICD. ⚠ **This is now the ONLY identity failure that refuses a
+    /// create**: HWA2's `byte_size` is the bound memory's extent and only the engine
+    /// knows it, whereas nothing in the record needs the ICD at all.
     identity_vk_memory_unresolved: RefusalCounter,
-    /// ⚠⚠ **RE-GRADED at UP-5 with its sibling above.** It now counts **a committed
-    /// create refused because the memory has no VENUS RESOURCE** —
-    /// `IdentityStatus::NoIcd`, `NoExport` or `IcdRefused`. The engine named the
-    /// memory; the ICD had no resource id for it.
+    /// ⚠⚠ **RE-GRADED AGAIN by the HPS2 retirement (K4), from a refusal to a
+    /// census**, and both gradings are written out so neither change is silent. At
+    /// UP-4 it counted entries recorded with `vk_memory == 0`; at UP-5 it counted **a
+    /// committed create refused because the memory had no venus resource**. It now
+    /// counts a create that simply *proceeded* without one.
     ///
-    /// ⛔ **This is the counter that says the export chain did not engage**, and it is
-    /// the most likely non-zero on a first run: `VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT`
-    /// must reach the fork (check it against `CommittedVenusExport`), the fork must
-    /// take its export arm, and the anchored ICD must export
-    /// `helios_venus_memory_res_id`. A zero `adopt_resource_id` is what makes the KMD
-    /// *create* rather than *adopt* (`protocol/src/wddm.rs:131-138`), so it is refused
-    /// here rather than passed through — which is what the old grading already
-    /// demanded of UP-5.
+    /// ⛔ Nothing in HWA2 names a host resource (§10.3), so a memory the ICD cannot
+    /// export no longer blocks anything at create time — it blocks the *present*,
+    /// where `PresentIdentityNoResourceId` names mesa unit A3. This counter still says
+    /// the export chain did not engage, which stays worth knowing while
+    /// `HELIOS_HEAP_FLAG_VENUS_EXPORT` is still in the tree; read it against
+    /// `CommittedVenusExport` and `Hwa2VenusResIdDropped`, which is its complement —
+    /// the two partition every committed create.
     identity_venus_unresolved: RefusalCounter,
     /// `D3D12DDI_HEAP_FLAG_PRIMARY` arrived on the **heap-only** arm, with no
     /// resource description. ⛔ Expected 0: `ResourceHeaps.md:897` says the flag
     /// obliges the driver to create a resource simultaneously with the heap, and
-    /// the committed-resource adoption path depends on that
+    /// the committed-resource HWA2 create path depends on that
     /// obligation holding. A hit means a primary reached this driver with no
     /// `ID3D12Resource` to key an identity on, so it went unrecorded.
     heap_primary_without_resource: RefusalCounter,
@@ -4298,22 +4705,30 @@ struct L4Refusals {
     heap_primary_venus_export: RefusalCounter,
     /// A committed resource's memory came back with a non-zero **offset**, i.e. the engine
     /// suballocated it. ⛔ Expected 0, and non-zero means the fork's dedicated
-    /// arm did not engage — the create is refused, because one venus resource id
-    /// shared between D3D12 resources breaks the adopt model and D3D11's own path
-    /// requires `memory_offset == 0`.
+    /// arm did not engage — the create is refused.
+    ///
+    /// ⚠ **The reason changed with the record and is restated rather than left
+    /// stale.** It used to be that one venus resource id shared between D3D12
+    /// resources breaks the *adopt* model. There is no adoption
+    /// (`docs/retirement/K4-CONTRACT.md` §5). The reason now is the descriptor's own
+    /// shape: `HeliosWddmAllocationDescV2::byte_size` is the whole bound
+    /// `VkDeviceMemory` and every plane record is bounded against it, so a resource
+    /// that does not own its extent cannot be described at all.
     identity_offset_nonzero: RefusalCounter,
-    /// ⛔⛔ **Two live resources claimed one `venus_res_id`** — the rotation-collapse
-    /// detector (`identity12::RecordOutcome::ResIdShared`). Expected 0. Non-zero
-    /// means every swapchain buffer would name one host surface, which is the 56th
-    /// session's *"scanout pinned to ONE resource"* class reached through
-    /// suballocation instead of through the scanout selector.
+    /// ⛔ **Retired append-only telemetry slot: PERMANENTLY 0 as of the HPS2
+    /// retirement.** It was the rotation-collapse detector — two live resources
+    /// claiming one `venus_res_id` — and it died with the id: `identity12` holds no
+    /// host resource id and §10.3 forbids it keeping one, so there is nothing left to
+    /// collide. It remains in its historical position so refusal-summary field order
+    /// does not change. The property it protected is settled in the kernel's own
+    /// allocation objects plus mesa unit A3.
     identity_res_id_shared: RefusalCounter,
-    /// A committed resource was adopted with `ctx_id == 0`, because the instance-scoped venus
-    /// context id was unavailable. ⚠ **Not a refusal and not a defect**: the KMD's
-    /// adopt path never reads `ctx_id`, so the field is a diagnostic that reaches
-    /// `HeliosWddmOpenIdentity::ctx_id` — *"diagnostic only"* by that record's own
-    /// doc. Non-zero means the ICD is absent or predates
-    /// `helios_venus_instance_ctx_id`.
+    /// A committed allocation was recorded with `ctx_id == 0`, because the
+    /// instance-scoped venus context id was unavailable. ⚠ **Not a refusal and not a
+    /// defect.** The value used to travel into `HeliosWddmOpenIdentity::ctx_id`
+    /// (*"diagnostic only"* by that retired record's own doc); HWA2 has no context
+    /// field at all, so it now stays inside this process. Non-zero means the ICD is
+    /// absent or predates `helios_venus_instance_ctx_id`.
     identity_ctx_id_unavailable: RefusalCounter,
     /// vkd3d's `memory_size` and the ICD's `venus_alloc_size` **disagreed** for one
     /// `VkDeviceMemory`. ⛔ Expected 0: they are two readings of one
@@ -4323,21 +4738,26 @@ struct L4Refusals {
     identity_alloc_size_disagreement: RefusalCounter,
     /// `pfnAllocateCb` was absent from the corelayer table, or the table itself was
     /// null. ⛔ Expected 0 — `create_device` refuses a null `p12UMCallbacks` — and a
-    /// hit means no committed resource can be adopted at all.
+    /// hit means no committed resource can get a kernel allocation at all.
     allocate_cb_missing: RefusalCounter,
     /// `pfnAllocateCb` returned a failure HRESULT. ⛔ Expected 0. The HRESULT is
-    /// dxgkrnl's own and is logged; it is the channel that would report a rejected
-    /// private-data record, a rejected flag combination, or a kernel that refused
-    /// the adopt.
+    /// dxgkrnl's own and is logged; it is the channel that would report an HWA2
+    /// descriptor the KMD's `validate_create_input` rejected, a rejected flag
+    /// combination, or a kernel that refused the create. ⚠ Read it against
+    /// `Hwa2CreateInputInvalid`: a hit *there* means this driver caught its own
+    /// malformed descriptor first, and a hit here with that at 0 means the KMD applies
+    /// a rule this driver's copy of the validator does not.
     allocate_cb_failed: RefusalCounter,
     /// `pfnAllocateCb` succeeded and left `hAllocation == 0`. ⛔ Expected 0: a
     /// runtime contract violation, refused here rather than allowed to become a 0
     /// in `pfnPresent`'s `BroadcastSrcAllocation[0]`.
     allocate_cb_no_handle: RefusalCounter,
-    /// The venus ICD would not hand the host resource's ownership over after the
-    /// allocation was minted. ⛔ Expected 0, and it is a **defect** rather than a
-    /// degraded read: the KMD's allocation and the ICD would both unref the host
-    /// resource. The allocation is rolled back and the create fails.
+    /// ⛔ **Retired append-only telemetry slot: PERMANENTLY 0 as of the HPS2
+    /// retirement.** It counted the venus ICD refusing to hand a host resource's
+    /// ownership to the WDDM allocation that had just adopted it. There is no
+    /// adoption: the KMD creates the backing, the ICD keeps its own resource, and
+    /// neither can double-unref the other's. Kept in position so refusal-summary field
+    /// order does not change.
     ownership_transfer_failed: RefusalCounter,
     /// `pfnDeallocateCb` was unreachable at destroy — absent from the table, or the
     /// device did not resolve. ⛔ Expected 0, and every hit is **one leaked WDDM
@@ -4345,25 +4765,31 @@ struct L4Refusals {
     deallocate_cb_missing: RefusalCounter,
     /// `pfnDeallocateCb` returned a failure HRESULT. ⛔ Expected 0; same leak.
     deallocate_cb_failed: RefusalCounter,
-    /// The kernel **wrote back** into an allocation's private driver data at create
-    /// time — its `meta.pitch`, `venus_alloc_size` or `memory_type_index` differed
-    /// from what this driver sent. ⚠ **Not a refusal, and its expected value is
-    /// UNKNOWN**, which is why it exists: `DxgkDdiCreateAllocation` recomputes all
-    /// three from what the host actually did, and whether that reaches the UMD's
-    /// buffer at CREATE (rather than only at OPEN, where `write_open_identity`
-    /// certainly writes) is established nowhere in the doc set. Non-zero says the
-    /// kernel is the authority for those three fields and a future opener should read
-    /// them back rather than trust the creator's claim.
+    /// ⚠⚠ **RE-GRADED by the HPS2 retirement, and its expected value flipped.** It
+    /// used to count the kernel writing back over the retired trailer's `meta.pitch` /
+    /// `venus_alloc_size` / `memory_type_index`, with an expected value of **UNKNOWN**
+    /// — whether dxgkrnl propagated the KMD's create-time private write to the UMD's
+    /// buffer at all was established nowhere in the doc set.
+    ///
+    /// It now counts a create whose HWA2 write-back **arrived and validated**: a
+    /// nonzero KMD-assigned `allocation_generation` in a descriptor that passed
+    /// `validate_create_output`. ⛔ **Expected to equal `IdentityRecorded`**, because
+    /// K4-CONTRACT §1.1 makes the write-back the output half of the create contract
+    /// rather than an optimisation. Its complement is `Hwa2WriteBackAbsent`, and the
+    /// two answer the old open question with a number.
     alloc_private_written_back: RefusalCounter,
     /// A `D3D12DDI_RESOURCE_FLAGS` word carried a bit
-    /// [`meta_bind_flags`]' translation table does not know.
+    /// [`hwa2_bind_flags`]' translation table does not know. ⚠ Its wire name still
+    /// says *"Meta"* after the record it was named for was retired, and that is
+    /// deliberate: `D3D12 DDI refusals:` lines are diffed across builds, so a counter
+    /// name is part of the evidence contract and renaming it would break every
+    /// cross-build comparison.
     ///
     /// ⛔ **Expected 0, and the only way it can move is a header revision adding an
     /// enumerator** — the mask it is checked against is built out of the `v::RES_*`
-    /// aliases, so it cannot go stale silently. A hit means the primary's
-    /// `HeliosWddmAllocMeta::bind_flags` may be missing a usage the D3D11 opener
-    /// needs, which surfaces as an import failure or a surface DWM cannot sample,
-    /// never as an error at create.
+    /// aliases, so it cannot go stale silently. A hit means the allocation's HWA2
+    /// `bind_flags` may be missing a usage an opener needs, which surfaces as an
+    /// import failure or a surface DWM cannot sample, never as an error at create.
     meta_bind_flag_unknown: RefusalCounter,
     /// Committed resources made venus-exportable and dedicated so their implicit
     /// heaps can receive WDDM allocation identities. Not a refusal; this is the
@@ -4372,6 +4798,59 @@ struct L4Refusals {
     /// The dynamic allocation-identity registry could not reserve another entry.
     /// Expected 0; the just-created WDDM allocation is rolled back.
     identity_registry_alloc_failed: RefusalCounter,
+    // -- K4, the HPS2 retirement: HWA2 replaces the AllocPrivate+Meta pair --------
+    /// A committed create whose shape has **no HWA2 spelling**, refused rather than
+    /// approximated: a `TL_64KB_TILE_STANDARD_SWIZZLE` layout (§10.3's swizzle enum
+    /// has `LINEAR` and `OPAQUE_OPTIMAL` and nothing else), an engine that declined a
+    /// row pitch, a dimension above `u32::MAX`, or a subresource extent that does not
+    /// fit inside the bound memory.
+    ///
+    /// ⛔ Expected 0 on the workloads this driver has seen, and it is a **refusal**
+    /// because the KMD echoes every field it validates: a field this driver rounded
+    /// off would make the descriptor disagree with the resource vkd3d built.
+    hwa2_geometry_unrepresentable: RefusalCounter,
+    /// The HWA2 create-input descriptor this driver built failed
+    /// `validate_create_input` **before** the kernel saw it. ⛔ Expected 0, and a hit
+    /// is a bug in `hwa2_create_input`, not in the runtime or the kernel — the
+    /// rejection variant is logged and names the exact rule.
+    hwa2_create_input_invalid: RefusalCounter,
+    /// `pfnAllocateCb` succeeded and the `[in/out]` private buffer came back with
+    /// `allocation_generation == 0`, i.e. **the KMD's create-time write did not reach
+    /// this UMD's buffer**.
+    ///
+    /// ⛔ Expected 0, and it is the counter that answers an open question rather than
+    /// merely reporting a fault: whether dxgkrnl propagates a create-time kernel write
+    /// of the allocation private data back to the creating UMD was established nowhere
+    /// in the doc set. Non-zero says it does not, and that the whole descriptor has to
+    /// reach this process another way. The create is refused and rolled back, because
+    /// an allocation whose descriptor never arrived is one no opener can describe.
+    hwa2_write_back_absent: RefusalCounter,
+    /// The KMD wrote a descriptor that failed `validate_create_output`, or the buffer
+    /// could not be parsed back at all. ⛔ Expected 0; the rejection variant is logged
+    /// and the allocation is rolled back.
+    hwa2_create_output_invalid: RefusalCounter,
+    /// The KMD's output descriptor **did not echo** the create input: some field other
+    /// than `allocation_generation` and the two KMD-owned flag bits came back changed.
+    ///
+    /// ⛔ Expected 0. K4-CONTRACT §1.1: *"the KMD refuses the create rather than
+    /// correcting a field"*, because a silent correction would make the descriptor
+    /// disagree with the resource this driver believes it made. A hit is therefore a
+    /// finding about the kernel's write site, not a value to adopt — the create is
+    /// refused and rolled back.
+    hwa2_echo_mismatch: RefusalCounter,
+    /// A committed create for which the engine and the ICD **could** name the host
+    /// venus resource id, and this driver deliberately did **not** send it.
+    ///
+    /// ⚠ **Not a refusal — the census of the §5 gap**, at the exact site where the
+    /// value is dropped. HWA2 carries no host resource token (§10.3) and
+    /// `docs/retirement/K4-CONTRACT.md` §5 forbids inventing a replacement field,
+    /// stashing it elsewhere, or keeping the legacy record alive as a side channel.
+    /// ⇒ the mechanism that replaces it is **mesa lane unit A3**: the ICD stops naming
+    /// host resources at all and the KMD patches the resid in from
+    /// `HeliosNativeRenderPatch`. Read it against `IdentityVenusUnresolved`, which is
+    /// its complement, and against `PresentIdentityNoResourceId`, which is where the
+    /// gap is actually paid for.
+    hwa2_venus_res_id_dropped: RefusalCounter,
 }
 
 static L4_REFUSALS: L4Refusals = L4Refusals {
@@ -4441,6 +4920,12 @@ static L4_REFUSALS: L4Refusals = L4Refusals {
     meta_bind_flag_unknown: RefusalCounter::new("MetaBindFlagUnknown"),
     committed_venus_export: RefusalCounter::new("CommittedVenusExport"),
     identity_registry_alloc_failed: RefusalCounter::new("IdentityRegistryAllocFailed"),
+    hwa2_geometry_unrepresentable: RefusalCounter::new("Hwa2GeometryUnrepresentable"),
+    hwa2_create_input_invalid: RefusalCounter::new("Hwa2CreateInputInvalid"),
+    hwa2_write_back_absent: RefusalCounter::new("Hwa2WriteBackAbsent"),
+    hwa2_create_output_invalid: RefusalCounter::new("Hwa2CreateOutputInvalid"),
+    hwa2_echo_mismatch: RefusalCounter::new("Hwa2EchoMismatch"),
+    hwa2_venus_res_id_dropped: RefusalCounter::new("Hwa2VenusResIdDropped"),
 };
 
 /// L4's refusal set, printed by `crate::log_refusal_summary` at this lane's
@@ -4520,4 +5005,13 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L4_REFUSALS.meta_bind_flag_unknown,
     &L4_REFUSALS.committed_venus_export,
     &L4_REFUSALS.identity_registry_alloc_failed,
+    // ⛔ APPENDED, K4 / the HPS2 retirement: the HWA2 create-input + write-back
+    // contract and the §5 host-resource-id gap. At the END for the reason the block
+    // comments above give -- `D3D12 DDI refusals:` lines are diffed across builds.
+    &L4_REFUSALS.hwa2_geometry_unrepresentable,
+    &L4_REFUSALS.hwa2_create_input_invalid,
+    &L4_REFUSALS.hwa2_write_back_absent,
+    &L4_REFUSALS.hwa2_create_output_invalid,
+    &L4_REFUSALS.hwa2_echo_mismatch,
+    &L4_REFUSALS.hwa2_venus_res_id_dropped,
 ];

@@ -6,9 +6,15 @@
 //!
 //! ```text
 //! HRESOURCE -> ResourceState -> ID3D12Resource* -> VkDeviceMemory
-//!           -> helios_venus_memory_res_id -> pfnAllocateCb{adopt_resource_id}
-//!           -> D3DKMT_HANDLE
+//!           -> pfnAllocateCb{HeliosWddmAllocationDescV2} -> D3DKMT_HANDLE
 //! ```
+//!
+//! ⚠ **The middle link used to be `helios_venus_memory_res_id`, and it is gone.**
+//! The chain ran through the ICD's host resource id because the retired create
+//! record carried one; HWA2 carries none and no UMD may supply one (§10.3,
+//! `docs/retirement/K4-CONTRACT.md` §5). The engine's memory is still what the
+//! create *describes* — its extent is HWA2's `byte_size` — but the kernel allocation
+//! is no longer the same host object, and joining them is mesa unit **A3**'s work.
 //!
 //! has to be walkable *after* the create that built it. Every link but the
 //! fourth arrow exists on all three sides already (§14a.3); what does not exist
@@ -38,11 +44,16 @@
 //! `DECISIONS.md` D13's refined form: private data that crosses a module
 //! boundary is declared once in `helios_protocol`; private data that does not
 //! stays in the crate that owns it. **Nothing outside `helios_umd12.dll` reads a
-//! byte of this table.** It is process-local bookkeeping whose *outputs* become
-//! `HeliosWddmAllocPrivate` + `HeliosWddmAllocMeta` at the moment UP-5 calls
-//! `pfnAllocateCb` — and those two records come from `helios_protocol`, byte for
-//! byte, exactly as `umd/src/forward/resource.rs:263-324` writes them. So the
-//! table is `umd12`-local by D13's own rule, and the record it feeds is not.
+//! byte of this table.** It is process-local bookkeeping that sits *beside* the one
+//! record which does cross — `helios_protocol::HeliosWddmAllocationDescV2`, built
+//! and validated in `resource12::create_committed_allocation`. So the table is
+//! `umd12`-local by D13's own rule, and the record it sits beside is not.
+//!
+//! ⛔ **And it is not a place to keep what HWA2 refuses to carry.** The retired
+//! entry held `venus_res_id`, `venus_alloc_size` and `memory_type_index`; all three
+//! are gone, and K4-CONTRACT §5 forbids re-adding them here or anywhere else — "you
+//! may not invent a replacement field, stash it elsewhere, or keep the legacy record
+//! alive as a side channel".
 //!
 //! # ⭐ Why a table and not a field on `ResourceState`
 //!
@@ -91,17 +102,16 @@
 //!   stale entry is replaced by the live one (correct) *and* the failure is
 //!   visible (loud), instead of the new resource inheriting the old memory.
 //!
-//! # ⛔ The second collision, and it is not the same one
+//! # ⛔ The second collision is RETIRED, and its absence is deliberate
 //!
-//! [`RecordOutcome::ResIdShared`] is a *refusal*, not a replacement, and it is what
-//! keeps buffer rotation honest. Two live D3D12 resources sharing one
-//! `venus_res_id` means the engine suballocated them out of one `VkDeviceMemory`;
-//! every WDDM allocation would then name the same host resource and an N-buffered
-//! swapchain would present one surface. That is the 56th session's *"scanout pinned
-//! to ONE resource"* class by a new route, and the table is the only place in the
-//! driver that can see all the live ids at once — so the check lives here and the
-//! caller unwinds. `VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT`'s dedicated allocation is
-//! what makes the refusal unreachable; this is the assertion that it worked.
+//! ⚠ **This block used to describe `RecordOutcome::ResIdShared`** — a refusal, not a
+//! replacement, that fired when two live D3D12 resources shared one `venus_res_id`,
+//! because the engine had suballocated them out of one `VkDeviceMemory` and an
+//! N-buffered swapchain would then present one surface (the 56th session's *"scanout
+//! pinned to ONE resource"* class by a new route). **It is gone with the id it was
+//! about.** The table holds no host resource id, so it can see no such collision, and
+//! §10.3 forbids it keeping one in order to. The property still matters; the place it
+//! is now settled is the kernel's own allocation objects plus mesa unit **A3**.
 //!
 //! # `ctx_id`, and why the field that *was* absent is now present
 //!
@@ -116,11 +126,11 @@
 //! still not stamped; both are read so that a disagreement between them is a log
 //! line rather than a silent wrong id.
 //!
-//! ⚠ A `ctx_id` of 0 is legal and counted. The KMD's adopt path never reads it —
-//! `helios_protocol::classify` reaches `AdoptedUmdResource` from
-//! `adopt_resource_id` alone — so it travels only into
-//! `HeliosWddmOpenIdentity::ctx_id`, which that record's own doc calls *"diagnostic
-//! only"*. Refusing a create over a diagnostic would be the wrong severity.
+//! ⚠ A `ctx_id` of 0 is legal and counted. It used to travel into
+//! `HeliosWddmOpenIdentity::ctx_id`, which that record's own doc called *"diagnostic
+//! only"*; that record is retired and HWA2 has **no context field at all**, so the
+//! value now stays inside this process and never reaches the kernel. Refusing a
+//! create over a diagnostic would be the wrong severity.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -153,9 +163,9 @@ pub(crate) struct IdentityGeometry {
     /// a recorded entry is itself a finding.
     pub(crate) sample_count: u32,
     /// The creator's exact `DXGI_FORMAT`, which is what
-    /// `HeliosWddmAllocMeta::dxgi_format` carries and what a cross-process
-    /// opener must rebuild with — the lossy `D3DDDIFORMAT` collapses every
-    /// non-BGRA surface to BGRA (`protocol/src/wddm.rs:254-263`).
+    /// `HeliosWddmAllocationDescV2::dxgi_format` (offset 48) carries and what a
+    /// cross-process opener must rebuild with — the lossy `D3DDDIFORMAT` at offset 52
+    /// collapses every non-BGRA surface to BGRA, which is why HWA2 carries both.
     pub(crate) dxgi_format: u32,
 }
 
@@ -174,30 +184,28 @@ pub(crate) struct AllocationIdentity {
     /// as a 64-bit handle. **0 = unresolved** (see the module doc's table).
     pub(crate) vk_memory: u64,
     /// The resource's byte offset within `vk_memory`. ⚠ Non-zero means vkd3d
-    /// suballocated, which UP-3 exists to prevent for an adopted allocation: D3D11's adopt
-    /// path requires `memory_offset == 0`
-    /// (`umd/src/forward/resource.rs:488-490`), because one venus resid covering
-    /// several D3D12 resources breaks the one-resource-one-allocation rule.
+    /// suballocated, which `create_committed_allocation` refuses: HWA2's `byte_size`
+    /// is the whole bound `VkDeviceMemory` and every plane record is bounded against
+    /// it, so a resource that does not own its extent cannot be described.
     pub(crate) memory_offset: u64,
     /// The size of the whole `vk_memory` object — its
-    /// `VkMemoryAllocateInfo::allocationSize`, *not* the resource's size. This
-    /// is what `HeliosWddmAllocPrivate::size` and
-    /// `HeliosWddmAllocMeta::venus_alloc_size` mean, and an importer that
-    /// guesses it gets its OPAQUE-fd import rejected for exact-size mismatch.
+    /// `VkMemoryAllocateInfo::allocationSize`, *not* the resource's size. It is what
+    /// `HeliosWddmAllocationDescV2::byte_size` (offset 24) carries: the *exact backing
+    /// extent*, which every plane record is bounded against.
     pub(crate) memory_size: u64,
-    /// The venus resource id backing `vk_memory`, i.e. the value that becomes
-    /// `HeliosWddmAllocPrivate::adopt_resource_id`. **0 = unresolved**, and 0 is
-    /// also the value that makes the KMD *create* instead of *adopt*, so UP-5
-    /// must refuse rather than pass a zero through.
-    pub(crate) venus_res_id: u32,
-    /// The creating `vkAllocateMemory`'s exact `allocationSize` as the ICD
-    /// recorded it. Expected to equal `memory_size` once both halves resolve —
-    /// two independent sources for one number, which is why both are kept: a
-    /// disagreement is a finding, and a single field could not show one.
-    pub(crate) venus_alloc_size: u64,
-    /// The `memoryTypeIndex` of `vk_memory`, which a cross-process opener must
-    /// import with (`protocol/src/wddm.rs:233-236`).
-    pub(crate) memory_type_index: u32,
+    /// The KMD-assigned `HeliosWddmAllocationDescV2::allocation_generation` out of
+    /// the **validated output descriptor** the create read back.
+    ///
+    /// ⛔ **Never an identity lookup key** (§10.3, and the field's own doc in
+    /// `protocol/src/wddm.rs`): nothing resolves an allocation *from* it. It is a
+    /// stale-validation and diagnostic value, kept so that a later descriptor
+    /// mismatch has something to be compared against and so the create's evidence
+    /// line reports what the kernel assigned rather than what this driver hoped for.
+    ///
+    /// ⚠ **Nonzero on every recorded entry** — `create_committed_allocation` refuses
+    /// and rolls back a create whose write-back left it 0, because an allocation with
+    /// no descriptor is one no opener can describe.
+    pub(crate) allocation_generation: u64,
     /// The `D3DKMT_HANDLE` `pfnAllocateCb` minted for this resource (UP-5).
     ///
     /// ⭐ **This is the field the whole table exists to hold**, and it is what
@@ -229,28 +237,25 @@ pub(crate) struct AllocationIdentity {
     /// here rather than in `ResourceState` keeps that block write-once, and it lives
     /// exactly as long as the allocation it releases.
     pub(crate) h_rt_resource: usize,
-    /// The venus context id stamped into `HeliosWddmAllocPrivate::ctx_id`.
+    /// The venus context id of the `VkInstance` this resource's engine belongs to.
     ///
     /// ⛔ The **instance-scoped** one (`helios_venus_instance_ctx_id`), never the
     /// process-global `helios_venus_current_ctx_id` — see
-    /// `bridge12::BridgeDevice12::venus_instance_context_id`. 0 is legal and
-    /// counted: the KMD's adopt path never reads it.
+    /// `bridge12::BridgeDevice12::venus_instance_context_id`. ⚠ It used to be
+    /// *stamped into* `HeliosWddmAllocPrivate::ctx_id`; HWA2 has no context field, so
+    /// it now stays inside this process. 0 is legal and counted.
     pub(crate) ctx_id: u32,
     pub(crate) geometry: IdentityGeometry,
     /// The engine's row pitch for subresource 0, as `GetCopyableFootprints`
-    /// answered it at create time — the value UP-5 put in
-    /// `HeliosWddmAllocMeta::pitch`, kept so UP-9's
-    /// `HeliosPresentPrivateData::pitch` is the **same** number rather than a
-    /// second derivation.
+    /// answered it at create time — the value the create put in the descriptor's
+    /// plane record (`HeliosWddmAllocationDescV2::planes[0].row_pitch`), kept so any
+    /// later consumer uses the **same** number rather than a second derivation.
     ///
-    /// ⚠ **0 is legal and means the engine declined**, not "one byte per row":
-    /// `check_subresource_info`'s `FOOTPRINT_UNANSWERED_U32` sentinel collapses to
-    /// 0 here. Nothing on the windowed path reads it — DWM imports an OPTIMAL
-    /// device-local image by venus resource id, not by stride — so it is carried
-    /// rather than validated. ⛔ Whoever makes a *fullscreen* flip read it must
-    /// treat a 0 as a refusal: the primary's stride is a frozen agreement with the
-    /// host (`align(width*bpp, 256)`), and presenting with a disagreeing stride
-    /// turns a hard failure into a sheared picture (`PENDING.md` §S-3 item 7).
+    /// ⚠ **Never 0 on a recorded entry, and that is a change.** It used to be
+    /// carried unvalidated because nothing on the windowed path read it; HWA2's
+    /// shared validator rejects `PlaneRowPitchZero`, so
+    /// `create_committed_allocation` refuses a create whose engine declined a pitch
+    /// rather than describing a plane it cannot lay out.
     pub(crate) pitch: u32,
     /// The raw `D3D12DDI_HEAP_FLAGS` word the create arrived with.
     ///
@@ -274,24 +279,6 @@ pub(crate) enum RecordOutcome {
     Replaced,
     /// The registry could not reserve storage and the identity was **dropped**.
     RegistryAllocationFailed,
-    /// ⛔⛔ **A DIFFERENT live resource already claims this `venus_res_id`**, so the
-    /// engine suballocated two D3D12 resources out of one `VkDeviceMemory` and the
-    /// identity was **refused**.
-    ///
-    /// ⭐ This is the rotation-collapse detector, and it is the reason the check
-    /// lives in the table rather than at the call site: buffer rotation is *free*
-    /// on this design — each `GetBuffer(i)` is a distinct `ID3D12Resource`, so N
-    /// back buffers are N allocations — but only while N venus resource ids are N
-    /// different numbers. If they shared one, every WDDM allocation would name the
-    /// same host resource and the whole swapchain would present one surface: the
-    /// 56th session's *"scanout pinned to ONE resource"* class, reached by a new
-    /// route. `VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT`'s dedicated allocation is what
-    /// prevents it; this is the assertion that it worked, in the one place that can
-    /// see all the live ids at once.
-    ResIdShared {
-        /// The engine resource that already holds the id.
-        holder: usize,
-    },
 }
 
 /// Process-local allocation identities, indexed both ways required by the
@@ -306,10 +293,20 @@ pub(crate) enum RecordOutcome {
 /// resource. Two hash maps preserve O(1) lookup without an arbitrary resource
 /// ceiling; [`record`] uses `try_reserve` so allocation failure is a loud,
 /// unwindable result rather than a panic in a DDI.
+///
+/// ⚠ **The second index is GONE, and its absence is the retirement.** A
+/// `by_venus_res_id` map lived here so that two live resources sharing one venus
+/// resource id could be refused — the rotation-collapse detector. HWA2 carries no
+/// host resource id and this driver no longer obtains one for any purpose
+/// (K4-CONTRACT §5), so there is nothing left to index by and nothing left to
+/// collide. ⛔ It must not be reintroduced under another name: §10.3's *"no host
+/// resource token, resid … or independently usable identity"* forbids exactly this
+/// table keeping one. The property it protected — N back buffers must be N distinct
+/// allocations — is now a property of the kernel's own allocation objects, and mesa
+/// unit **A3** is where the host side of it is settled.
 #[derive(Default)]
 struct IdentityRegistry {
     by_resource: HashMap<usize, AllocationIdentity>,
-    by_venus_res_id: HashMap<u32, usize>,
 }
 
 /// D3D12 DDIs are FREETHREADED (`DDI_REFERENCE.md` §7.1), so create, lookup and
@@ -340,38 +337,14 @@ fn identities() -> MutexGuard<'static, IdentityRegistry> {
 pub(crate) fn record(identity: AllocationIdentity) -> RecordOutcome {
     let mut registry = identities();
 
-    // ⛔ THE RES-ID SCAN COMES BEFORE ANY WRITE, and it is a refusal rather than a
-    // replacement. A shared `venus_res_id` is not a stale entry to overwrite -- both
-    // resources are live and both would name one host resource -- so the correct
-    // action is to refuse the second identity and let the caller unwind its
-    // allocation. ⚠ Only a non-zero id can collide: `record` is only reached with a
-    // resolved identity, but the guard is written anyway because a zero id is the
-    // one value that would otherwise match every unresolved entry a future caller
-    // might add.
-    if identity.venus_res_id != 0 {
-        if let Some(&holder) = registry.by_venus_res_id.get(&identity.venus_res_id) {
-            if holder != identity.engine_resource {
-                return RecordOutcome::ResIdShared { holder };
-            }
-        }
-    }
-
-    // Reserve both maps before mutating either. Once both succeed, neither
-    // insertion below can allocate, so the two indexes cannot diverge on OOM.
-    if registry.by_resource.try_reserve(1).is_err()
-        || registry.by_venus_res_id.try_reserve(1).is_err()
-    {
+    // Reserve before mutating, so allocation failure is a loud, unwindable result
+    // rather than a panic in a DDI. Once the reservation succeeds the insertion below
+    // cannot allocate.
+    if registry.by_resource.try_reserve(1).is_err() {
         return RecordOutcome::RegistryAllocationFailed;
     }
 
-    let replaced = registry.by_resource.remove(&identity.engine_resource);
-    if let Some(previous) = replaced {
-        registry.by_venus_res_id.remove(&previous.venus_res_id);
-    }
-    registry
-        .by_venus_res_id
-        .insert(identity.venus_res_id, identity.engine_resource);
-    registry
+    let replaced = registry
         .by_resource
         .insert(identity.engine_resource, identity);
 
@@ -412,8 +385,5 @@ pub(crate) fn lookup(engine_resource: usize) -> Option<AllocationIdentity> {
 /// twice. A `lookup` + `remove` pair would have that race, and a double
 /// `pfnDeallocateCb` is a kernel-handle double free.
 pub(crate) fn take(engine_resource: usize) -> Option<AllocationIdentity> {
-    let mut registry = identities();
-    let identity = registry.by_resource.remove(&engine_resource)?;
-    registry.by_venus_res_id.remove(&identity.venus_res_id);
-    Some(identity)
+    identities().by_resource.remove(&engine_resource)
 }

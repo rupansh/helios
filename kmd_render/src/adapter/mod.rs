@@ -21,13 +21,13 @@ use crate::error::NotStarted;
 use crate::virtio::VirtioGpu;
 use helios_kmd_logic::DisplayMode;
 
+pub(crate) mod allocation_object;
 mod backing;
 mod kobj;
 mod locks;
 mod read_ledger;
 mod scanout;
 mod segments;
-mod tracking;
 
 pub(crate) use backing::{SystemBackingSnapshot, SystemBackingTable};
 pub(crate) use locks::{NotifyOrdered, ScanoutGuard, WddmNotifyGuard, WITH_VIRTIO_TORN};
@@ -37,7 +37,6 @@ pub(crate) use read_ledger::{
 };
 pub(crate) use scanout::{PresentStreamMarker, ScanoutRefreshQueue};
 pub(crate) use segments::{BarSegment, PagingRam};
-pub(crate) use tracking::VidMmTrackerTable;
 
 /// Everything `DxgkDdiStartDevice` establishes, as one value published once.
 ///
@@ -498,9 +497,16 @@ pub struct AdapterContext {
     /// Exact system-memory pages Windows associates with a BAR allocation
     /// through paging TRANSFER requests.
     pub(crate) system_backings: SystemBackingTable,
-    /// Live KMD-created VidMm mirrors keyed by the association cookie returned
-    /// to the coherent ICD/UMD stack.
-    pub(crate) vidmm_trackers: VidMmTrackerTable,
+    // ⛔ `vidmm_trackers: VidMmTrackerTable` lived here. It was the attestation
+    // half of UMD-backing adoption: its only producer was the retired
+    // `HELIOS_WDDM_ALLOC_KIND_TRACKING` create and its only consumer the
+    // adopted-allocation one-page VidMm charge. HWA2 has no tracking kind, no
+    // cookie, and no global-share field (`grep -in track protocol/src/wddm.rs`
+    // is empty), so the mechanism has **no successor** — it is not "folded
+    // into" anything (`docs/retirement/K4-CONTRACT.md` §6 corrects
+    // `wddm_legacy.rs:30`, which said it was). §14:3421's "a raw resid or HPS
+    // slot is never accepted as identity" forbids reintroducing it under
+    // another name.
     /// The persistent venus client (ring/reply BAR mappings + Vulkan ids) kept
     /// alive for the device lifetime so the page-table blob stays mapped. `None`
     /// until/unless the StartDevice venus bring-up succeeds. Its `Drop` unmaps the
@@ -1058,7 +1064,6 @@ impl AdapterContext {
             read_ledger: ReadLedger::new(),
             paging_pte_shadow: crate::ddi::PagingPteShadow::new(),
             system_backings: SystemBackingTable::new(),
-            vidmm_trackers: VidMmTrackerTable::new(),
             venus_client: UnsafeCell::new(None),
             // Zeroed placeholder — the real dispatcher header is written by
             // `init_kernel_events` once the context is at its final address.
