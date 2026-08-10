@@ -157,11 +157,11 @@ flag day, because the moment `dxgkddi_create_allocation` stops accepting the
 | component | what it now does | verified |
 |---|---|---|
 | `protocol` | HWA2 gains `validate_create_input`/`validate_create_output` sharing one cross-field core with `validate`; HVM1 gains `from_private_data` | 146 tests (was 140) |
-| `kmd_logic` | the executable state machines a single-record validator cannot express — the input→output transition, the generation lifecycle, HVM1 roles, HOC1 pools | 211 tests (was 189) |
+| `kmd_logic` | the executable state machines a single-record validator cannot express — the input→output transition, the generation lifecycle, HVM1 roles, HOC1 pools, **and the K5 HTS1 session** | 263 tests (was 211 at K4, 189 before it) |
 | `kmd_render` | HWA2 written at create, HVM1/HOC1 admitted, adoption + open-restamp + VidMm tracker deleted, new `adapter/allocation_object.rs` | `cargo check` exit 0, **22 warnings — the same count as the pre-change baseline** |
 | `umd` + `umd12` | both re-pointed as HWA2 producers, and both now validate the KMD's write-back, which nothing did before | release build exit 0 |
 | `icd/mesa` | reads HWA2 from `protocol/include` — the hand-mirrored 48-byte records are gone, so the header's per-field `offsetof` asserts now fire in the ICD's own TU | ninja green |
-| `tools/retirement-gates.sh` | the two §8 gates that were named but never written | 8 gates, ALL PASS |
+| `tools/retirement-gates.sh` | the two §8 gates that were named but never written, plus A2's encoder gate and K5's session gate | 10 gates, ALL PASS |
 
 ⛔ **No HWA2 path has run.** Every one of them is *implemented but never
 exercised* — `METHOD.md`'s distinct third state, not "done". No deploy:
@@ -306,13 +306,14 @@ F6) — see state A below, because that row is regularly mis-filed as unexercise
 The QEMU review is moot (F5).
 
 **Everything Linux-verifiable is green**, and it is now one command:
-`tools/retirement-gates.sh` — now **8 gates, all PASS**: protocol tests, Rust↔C
+`tools/retirement-gates.sh` — now **10 gates, all PASS**: protocol tests, Rust↔C
 ABI parity, the C mirrors compiling, `kmd_logic` tests, slot-audit staleness,
 K4 §8.5 (open writes no private byte), K4 §8.6 (the retired identity symbols
-survive only as tombstones), and the cross-repo
-`VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT` mirror. **`protocol` 146 tests,
-`kmd_logic` 211** — the "140 / 189" that stood here was the pre-K4 count and
-already disagreed with the component table above it in this same file.
+survive only as tombstones), the cross-repo
+`VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT` mirror, **A2's HNR2 encoder gate**, and
+**K5's HTS1/HQA1 session gate**. **`protocol` 146 tests, `kmd_logic` 263** — the
+"140 / 189" that stood here was the pre-K4 count and already disagreed with the
+component table above it in this same file.
 Separately: `tools/umd12-host-check.sh`, vkd3d ninja, QEMU ninja.
 Note there is no
 workspace root — build `protocol` from `protocol/`, not with `-p` from the repo
@@ -583,10 +584,11 @@ In order:
    8/8, `kmd_render` check exit 0 at the 22-warning baseline, `umd` exit 0, mesa
    ICD + present layer link clean, vkd3d native build green.
 3. **A1 → A2 → A3 → K5 → K6** ← **THE CRITICAL PATH.** A1 ✅ (`icd/mesa`
-   `6ad43fb`, rewritten onto A2 in `1b97c64`) and **A2 ✅** (`1b97c64`, gate
-   `c20d162`). Next is **A3** — or **K5**, if the session wants the A-lane to
-   run against a real KMD rather than against a validator. See the scope note
-   below: the owner chose full A3.
+   `6ad43fb`, rewritten onto A2 in `1b97c64`), **A2 ✅** (`1b97c64`, gate
+   `c20d162`), **K5 ✅** (this changeset; gate `tools/hts1-attach-gate.sh`,
+   verified on the target at KMD 22.22.264.0). Remaining: **A3** and **K6**.
+   ⛔ Before either, settle the HVM1 write-back question K5's probe surfaced —
+   see "K5 landed" below; A1 cannot create its reply pool until it is answered.
 4. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
    correction below before touching it. Not on the critical path.
 5. **K1 (demolition), K3** — and `SURFACE` last of all (`OWNERSHIP.md` §3).
@@ -667,7 +669,7 @@ does not implement either:
 | **A1** HTS1 session | `vn_helios_translation_session.{c,h}` | L | ✅ **LANDED** `6ad43fb`; **rewritten onto A2's encoder in `1b97c64`** — see below, its own encoder was wire-invalid in three ways |
 | **A2** native KMT lane | `vn_helios_native_kmt.{c,h}` | XL | ✅ **LANDED** `icd/mesa` `1b97c64`, reviewed and repaired in `f235ca4`, gate `c20d162`/`c90e5a8`. Cross-builds; its encoder half is **executed** by `tools/hnr2-encoder-gate.sh` against `protocol/`'s validator (18 batches / 86 fragments; 10 deliberate mutations caught). ⚠ The KMT half is **compile-verified only** — nothing executes it until K5 |
 | **A3** renderer rewrite | `vn_renderer_helios.c` (**5261** lines at HEAD; the brief's inventory says 5304 and is stale) | XL | absent |
-| **K5** KMD HTS1 sessions | `kmd_render/src/ddi/translation_session.rs` | L | absent — **A1's INIT refuses until this exists** |
+| **K5** KMD HTS1 sessions | `kmd_render/src/ddi/translation_session.rs` | L | ✅ **LANDED.** Pure half in `kmd_logic::translation_session` (263 tests, was 211), platform half in `ddi/translation_session.rs` + `device.rs`, gate `tools/hts1-attach-gate.sh`. `cargo check` exit 0 at the **22-warning baseline**. ⚠ Its INIT arm is **implemented and unreachable** — see below |
 | **K6** KMD HVC1/HNR2 render | `kmd_render/src/ddi/native_render.rs` | XL | absent |
 
 ⭐ **What de-risks it:** every wire record these five need is already written and
@@ -676,15 +678,106 @@ mirrors. That is exactly the "~14.6k lines with no consumer" population
 `K4-CONTRACT.md` §10 records. **A1–A3 and K5–K6 are those consumers**, so the
 work is call sites and state machines, not new ABI.
 
-⚠ **K5 is the unit that makes the A-lane testable on the target.** Nothing in
-the A-lane reaches the KMD before it. ⭐ But "untestable" was too strong, and A2
-proved it: the **encoder** half of the lane is ordinary pure code, and running it
-against `protocol/`'s own validator found three defects in A1 that a reading
-round had already passed over (the use table written after the payload, a zeroed
-`expected_allocation_generation`, a monitored fence missing all three §10.7
-flags). Every one would have been refused on the wire the moment K5 made A1
-reachable. ⇒ **Split any remaining A-lane unit into a pure half and a KMT half,
-and gate the pure half.** The KMT half still waits for K5/K6.
+⛔⛔ **CORRECTION, measured 2026-08-10 while landing K5: `helios_translation_session_create`
+HAS NO CALLER.** This section said "K5 is the unit that makes the A-lane testable
+on the target", and that is **false in the direction nobody checked**. A1 and A2
+are compiled into the ICD (`src/virtio/vulkan/meson.build:134,139`) and invoked
+by **nothing**:
+
+```
+git -C icd/mesa grep -n 'helios_translation_session_create' -- src
+  # only the definition (:540) and the declaration (.h:51)
+grep -rn 'helios_session_generation\|helios_session_device_handle' icd/mesa/src/
+  # empty outside the file that defines them
+```
+
+`helios_native_context_create` (A2) is called only by A1. ⇒ the **whole A-lane KMT
+half is unreachable from the ICD**, and landing K5 does not change that: it makes
+the *kernel* side exist, while the *guest* side still has no caller. The caller is
+**A3**'s `vn_renderer_helios.c` rewrite. ⚠ Both greps are needed and they fail in
+opposite directions — `git grep` does not descend into the `icd/mesa` submodule
+from the parent repo, and `grep -r` descends into `.claude/worktrees/`
+(`K4-CONTRACT.md` §9.1). Neither alone measures reachability.
+
+⇒ **`tools/hts1_session_probe.c` exists because of this.** It performs A1's exact
+KMT sequence plus the refusals K5 owes, checks each against a stated expectation,
+and identifies the Helios adapter by its *legacy* context profile so the test is
+not circular. Pre-K5 baseline, measured on the deployed driver: **4 pass / 7
+fail**, with the two legacy-behaviour controls (E, F) passing. That is the
+negative control that makes a post-deploy pass mean something.
+
+⭐ The rest of the old paragraph stands: "untestable" was too strong, and A2
+proved it. Running A1's encoder against `protocol/`'s own validator found three
+defects a reading round had passed over (the use table written after the payload,
+a zeroed `expected_allocation_generation`, a monitored fence missing all three
+§10.7 flags). ⇒ **Split any remaining A-lane unit into a pure half and a KMT half,
+and gate the pure half.**
+
+#### K5 landed, and what it does NOT do
+
+**Landed:** the pure half is `helios_kmd_logic::translation_session` (the session
+phase machine, the bounded per-process session ledger, the generation source, the
+endpoint table, the four-slot reply pool, the control-Render session admission,
+the per-endpoint host-dispatch FIFO and the snapshot accounting) — **263 kmd_logic
+tests, was 211**. The platform half is `kmd_render/src/ddi/translation_session.rs`
+plus `device.rs`: 22 named counters, the RDRAND capability source, the refcounted
+`SessionObject`, and `DxgkDdiCreateContext`'s private-data dispatch.
+`cargo check` exit 0 at the **22-warning baseline**, measured before and after.
+
+⭐ **Measured on the target, KMD 22.22.264.0** (`tools/hts1_session_probe.c`,
+14/15 checks): the HVC1 control context is admitted and returns the §10.7:1734-1738
+minima — **262144 / 4096 / 4096, `DmaBufferSegmentSet=0`** — while the legacy
+D3D-runtime profile is unchanged and the desktop is unaffected. A second control
+context, an unsupported HVC1 mode, an HVC1 *queue* context and an HQA1 with a
+forged capability are all refused, each with the right counter and reason code
+(`TsHvc1Rej=0x00010107` is exactly `Hvc1Reject::ModeUnsupported`). The role-1
+64-MiB HVM1 pool is created, made resident, Lock2-mapped, and its first byte,
+first slot boundary and last byte are all writable. `TsSessNew=1`, `TsSessFree=1`
+— no leak.
+
+⛔ **The `DmaBufferSegmentSet` value is a PER-ARM branch, not a flip.** `device.rs`
+records a measured dxgmms2 null-deref in `VidMmInitDmaPool` when a runtime
+context gets a zero segment set; §10.7:1981 keeps segment 1 as "the only nonzero
+choice for existing D3D runtime contexts, while HVC1 selects zero". Both arms now
+exist and the probe checks both. A global flip is a boot-killing regression.
+
+⚠ **What K5 does not do, and the boundary is exact.** The finite INIT *is* an HNR2
+control Render (§10.4:1206-1211), so `session_init` has **no caller until K6** —
+and when K6 supplies one it will still refuse, because the host Venus context is
+**K11**'s and `session_init` therefore grants zero endpoints rather than reporting
+a session with nothing behind it. Consequently no session ever reaches `Live`, so
+the whole HQA1 attach arm is unreachable too: `TsAttachOk` / `TsAttachRej` /
+`TsDetachOk` / `TsDetachRej` are graded **unreachable-until-K6** at their
+declarations, and the probe's forged-HQA1 case passes through `TsNoSess`, not
+through packet validation. That is `K4-CONTRACT.md` §8's third state, stated
+rather than implied.
+
+⛔ **The one probe failure is NOT K5's, and it blocks A1.** `AcOk=1` proves K4's
+`admit_hvm1` admitted the pool create — but the three HVM1 write-back fields
+(`object_generation`, `segment_page_shift`, `allocation_alignment`) read back
+**ZERO** in the caller's buffer, and the reply-pool binding at
+`DxgkDdiOpenAllocation` never fired (`TsPoolBind=0` **and** `TsPoolRej=0`). Two
+explanations remain and this session did not distinguish them: dxgkrnl does not
+propagate the KMD's per-allocation private-data write-back back to user mode on
+`D3DKMTCreateAllocation2`, or it does not deliver it to `DxgkDdiOpenAllocation` in
+a form that validates as `CreateOutput`. **Either way A1 breaks**, because A1 reads
+`hvm1.object_generation` back and refuses a zero
+(`vn_helios_translation_session.c:635-640`). ⇒ **Settle this before A3.**
+`wsl-dxgkrnl-is-a-citable-d3dkmt-oracle` is the instrument: Microsoft's own
+open-source D3DKMT thunk says whether that buffer is copied back.
+
+⭐ **The gate is `tools/hts1-attach-gate.sh`** (gate 10 of 10): `tools/hts1_attach_probe.c`
+builds HTS1 INIT and HQA1 records from `protocol/include/helios_translation_session.h`
+— the header the ICD compiles — each carrying the verdict the guest expects, and
+`kmd_logic/tests/hts1_attach_gate.rs` replays all 41 through the KMD's own session,
+decoding by explicit §10.4 offset rather than by the `bytemuck` derive both halves
+share. 6 admitted / 35 refused. **Defeated 5 ways to prove it can fail**: removing
+the capability check, the engine-class comparison and the queue-index cross-check,
+and making the context-generation watermark non-strict, all turn it RED. The fifth
+— deleting `declare_endpoint`'s conflict branch — stayed green, correctly: that
+branch is unreachable from `attach`, which passes the recorded descriptor as the
+expectation, so `protocol`'s own validator catches the mismatch first. A unit test
+covers it directly instead.
 
 #### The A2 review, as the ordinary code review the owner asked for
 
