@@ -501,3 +501,76 @@ image has been imported, no fence shared, no frame presented. The capability
 queries are answered and the device is built; the import chain itself has run
 zero times. `helios_paintcap` shows a fully composited live desktop after both
 ICD installs, so the DXVK/dwm path is undisturbed.
+
+### F7 addendum 3 — the tag call is implemented; four D3D12 textures import; the fence stops it
+
+`vkSetHeliosPresentableImageHELIOS` now exists in the ICD, declared once in
+`icd/mesa/src/vulkan/helios_private_wsi.h` and included by both the layer and
+the ICD (`OWNERSHIP.md` §4's rule applied to a second private ABI). It is
+published **only** through `vn_GetDeviceProcAddr` — it is not in `vk.xml` so the
+generated table cannot carry it, and it is deliberately not a DLL export
+because the layer's contract resolves it exclusively through the next-layer
+`vkGetDeviceProcAddr`.
+
+It is a gate, not a rubber stamp: it refuses an image not created with
+`D3D12_RESOURCE_BIT` (checked against `vk_image::external_handle_types`, which
+the ICD already records), and refuses a re-tag naming a *different* slot while
+staying idempotent for the same one.
+
+**With it in place the swapchain build gets much further, and the import chain
+actually runs.** The ICD diag shows four D3D12 committed textures imported into
+Vulkan:
+
+```
+memory_transfer_resource_ownership mem=... res=447 ctx=59
+memory_transfer_resource_ownership mem=... res=449 ctx=59
+memory_transfer_resource_ownership mem=... res=451 ctx=59
+memory_transfer_resource_ownership mem=... res=453 ctx=59
+```
+
+⇒ D3D12 device creation, the DXGI flip swapchain, `CreateSharedHandle` on the
+resources, `vkGetMemoryWin32HandlePropertiesKHR`, the dedicated import, the
+bind and the tag all succeed. §10.3's **image** chain works end to end.
+
+### ⛔ Open: the Ready/Release fence import fails, and the fence may not be ours
+
+```
+[helios-wsi] REFUSE swapchain_refused_semaphore_import (-3)
+sync_open_nt failed nt2_status=0xc000000d legacy_status=0xc000000d
+             handle=00000000000003a8 dev=0x40000600
+```
+
+Both `D3DKMTOpenSyncObjectFromNtHandle2` and the legacy open reject the handle
+the layer got from `ID3D12Fence::CreateSharedHandle` with
+`STATUS_INVALID_PARAMETER`.
+
+**What is proven:** the ICD created **no** WDDM sync object in that process
+during that run — there is no `sync_create` line for the run's pid, and the
+older ones in the log belong to a recycled pid. So the handle was not produced
+by this ICD's export path, and `vkGetSemaphoreWin32HandleKHR` was never called.
+
+**What is not yet proven** — the hypothesis to test next, not a conclusion:
+`ID3D12Fence` may not be a vkd3d object at all under the UMD arm. In the real
+D3D12 architecture the runtime owns fences over dxgkrnl monitored fences and
+the user-mode driver has no fence DDI, in which case the shared handle is a
+**dxgkrnl** sync object of a different class from the ICD's own, and vkd3d's
+`d3d12_shared_fence` path (`libs/vkd3d/command.c:612-656`,
+`d3dkmt.c:55-78`) only applies to the app-local vkd3d arm where vkd3d *is* the
+whole D3D12 implementation. vkd3d's own capability query is not the problem: it
+correctly chains `VkSemaphoreTypeCreateInfo{TIMELINE}` and would now pass.
+
+Decide it by measurement — whether a `D3D12_FENCE_FLAG_SHARED` fence's shared
+handle on the Helios adapter is openable by `D3DKMTOpenSyncObjectFromNtHandle2`
+at all, and which component created it — before changing either repository.
+
+**Bound.** No frame has been presented. Acquire, present, the copy and teardown
+remain unexecuted. `helios_paintcap` shows a fully composited live desktop after
+every install in this sequence.
+
+### The diagnostic that made this readable
+
+`helios_wddm_sync_open_nt` reported only the *fallback* open's status, so a
+failure in the informative Nt2 call was reported as the legacy call's
+`0xc000000d`. It now reports both. That is the third time in this session that
+a refusal naming nothing cost a round trip — the other two were the
+external-image query's `VkResult` and the required-device-proc check.
