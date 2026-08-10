@@ -786,14 +786,19 @@ first time. mesa A1 is unblocked. `K4-CONTRACT.md` §8.5's gate was amended, not
 deleted (HWA2/HOC1 still untouchable; the one HVM1 write is itself checked and was
 defeated 7 ways).
 
-⛔ **STILL BROKEN, and now named: HWA2 has the same defect.** Every D3D11/D3D12
-create on a K4 build reads back `allocation_generation == 0` and refuses
-(`hwa2_output_invalid`, `Hwa2WriteBackAbsent`) — the likeliest cause of the
-`dwmcore.dll` `0xc00001ad` crash-loop in the table below, which this document
-previously attributed to "the identity A3 owes". Repairing it means the same stamp
-for HWA2, which §8.5 forbids and which *does* have openers that can disagree; the
-three candidate designs are in F11's last paragraph. **Owner decision, not a
-drive-by.**
+⛔ **STILL BROKEN, and now named: HWA2 has the same defect — but it is LATENT.**
+HWA2's create-output is discarded exactly as HVM1's was, so the "written once at
+create, carried to `OpenResource`" premise is false for every UMD-supplied
+allocation. ⚠ **It is NOT what stops the D3D11 UMD today, and this document said
+otherwise for one commit.** Measured with the HWA2-producing UMD hot-installed on
+22.22.267.0: across 9 processes, `hwa2_output_invalid=0` and
+`hwa2_create_venus_backing_needs_mesa_a3=1` — the UMD refuses *earlier*
+(`umd/src/forward/resource.rs:247`) and no create reaches `pfnAllocateCb` at all.
+⇒ the `dwmcore.dll` crash-loop in the table below **is** the A3 gap, as this
+document originally said; the write-back defect sits behind it and becomes
+reachable only when A3 lands. Repairing it means the same stamp for HWA2, which
+§8.5 forbids and which *does* have openers that can disagree; the candidate
+designs are in F11. **Owner decision, and no longer an urgent one.**
 
 ⭐ **`win_build_kmd` is FIXED.** The cert in `CurrentUser\WDRTestCertStore` was
 removed so cargo-make's `generate-certificate` regenerated it; both signtool

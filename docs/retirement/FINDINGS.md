@@ -977,16 +977,39 @@ the create-time write is *illegal* — only that it is not observable anywhere.
 The KMD-authored standard-allocation exception is the one case where a
 create-time write does survive, and it is not a channel a UMD can use.
 
-### ⛔ The open consequence: HWA2 has the same defect, and it is not repaired
+### ⛔ The open consequence: HWA2 has the same defect — but it is LATENT, and the first version of this section over-claimed
 
-Every D3D11 and D3D12 create on a K4 build reads its descriptor back, finds
-`allocation_generation == 0`, and refuses — `hwa2_output_invalid` in
-`umd/src/forward.rs`, `Hwa2WriteBackAbsent` in
-`umd12/src/forward12/resource12.rs`. That is the likeliest cause of the
-`dwmcore.dll` `0xc00001ad` crash-loop `ROADMAP.md`'s K4-without-A3 table records
-against the HWA2-producing UMD, and it means **the retirement's "written once at
-create, dxgkrnl carries the identical bytes to `OpenResource`" premise is false
-for every UMD-supplied allocation**, not only for HVM1.
+HWA2's create-output is discarded exactly as HVM1's was (variants A-E above), so
+the retirement's *"written once at create, dxgkrnl carries the identical bytes to
+`OpenResource`"* premise is false for **every** UMD-supplied allocation, not only
+for HVM1. That much is measured.
+
+⛔ **What is NOT true — and this entry asserted it for one commit — is that the
+defect is what stops the D3D11 UMD today.** Measured 2026-08-11 on 22.22.267.0
+with the HWA2-producing UMD hot-installed (`win_install_umd`, then reverted):
+across **9 processes** that loaded it,
+
+```
+hwa2_output_invalid=0   hwa2_create_venus_backing_needs_mesa_a3=1   (7 of 9)
+```
+
+and **no `allocate_wddm_resource` line with `info=168` was logged at all**. The
+UMD refuses *earlier*, at `umd/src/forward/resource.rs:247`, whose own comment
+says so: *"Until A3 lands, every shared / keyed-mutex / present / primary D3D11
+texture create fails here."* No create reaches `pfnAllocateCb`, so nothing ever
+reads a write-back.
+
+⇒ The `dwmcore.dll` `0xc00001ad` crash-loop is **the A3 gap**, which is what
+`ROADMAP.md` and `K4-CONTRACT.md` §5 said before this finding claimed otherwise.
+The HWA2 write-back defect sits *behind* that refusal: repairing it would not
+move the desktop, and it becomes reachable only when A3 lands. That lowers its
+urgency and it does not lower its reality.
+
+⚠ **The method note, since it is the second time in one session:** the HVM1
+measurement made an HWA2 story feel obvious, and the obvious story was wrong. A
+mechanism that is real is not thereby the mechanism you are looking at. The
+instrument that settled it — reading the UMD's own refusal counters under the
+UMD in question — cost one reversible install.
 
 Repairing it means the same open-time stamp for HWA2 — the write
 `K4-CONTRACT.md` §8.5 still forbids, and unlike HVM1 an HWA2 *can* have several
