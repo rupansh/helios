@@ -766,6 +766,35 @@ a form that validates as `CreateOutput`. **Either way A1 breaks**, because A1 re
 `wsl-dxgkrnl-is-a-citable-d3dkmt-oracle` is the instrument: Microsoft's own
 open-source D3DKMT thunk says whether that buffer is copied back.
 
+⭐ **A measurement that sharpens `K4-CONTRACT.md` §5, taken 2026-08-10 while
+reverting a deploy.** "Deploying K4 without mesa A3 renders nothing at all" is
+right, but it has TWO distinct failure shapes and which one you see depends on
+the UMD half:
+
+| KMD | UMD | `AcMagic` | symptom |
+|---|---|---:|---|
+| 22.22.265/266 (K4+K5) | 6,408,192 (pre-HWA2) | **1920** | every allocation create refused; DWM stable, desktop black |
+| 22.22.266 (K4+K5) | 6,420,480 (HWA2 producer, built from HEAD) | **1** | allocations admitted; **DWM crash-loops** in `dwmcore.dll` (`0xc00001ad`), LogonUI faults, no explorer |
+
+⇒ `AcMagic` is the discriminator for "is the UMD half matched", and a *low*
+`AcMagic` is not good news on its own — it means the failure has moved
+downstream to the identity A3 has not yet supplied. ⛔ Neither shape is K5's:
+`AcMagic` counts `create_one` rejecting an unrecognised record magic, a path K5
+does not touch, and DWM was stable under 265 with K5 already in it.
+
+⚠ The box was left on the **pre-HWA2 UMD** (the first row) — owner's call:
+*"i dont care about a compositing desktop until its expected to have a
+compositing desktop."* Revert it with `win_install_umd`, not a KMD reinstall.
+
+⛔ **`win_build_kmd` is currently BROKEN on the VM** and it is not a code fault:
+`signtool` fails with "No certificates were found that met all the given
+criteria" because the cert in `CurrentUser\WDRTestCertStore` reports
+`HasPrivateKey=True` with a missing key container, and cargo-make's
+`generate-certificate` skips regeneration whenever a cert merely exists. Removing
+that cert so it regenerates is the fix; it needs a permission the agent was
+denied. Until then, **UMD-only changes must go through `win_install_umd`**, which
+needs no signing and no reboot.
+
 ⭐ **The gate is `tools/hts1-attach-gate.sh`** (gate 10 of 10): `tools/hts1_attach_probe.c`
 builds HTS1 INIT and HQA1 records from `protocol/include/helios_translation_session.h`
 — the header the ICD compiles — each carrying the verdict the guest expects, and
