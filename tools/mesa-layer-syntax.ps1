@@ -3,23 +3,29 @@
   Syntax-check VK_LAYER_HELIOS_present without building Mesa.
 
 .DESCRIPTION
-  `icd/mesa/src/vulkan/wsi/helios_present_layer.cpp` is not in `meson.build`
-  yet, so nothing in any build touches it. It sat at 4269 lines for days in that
-  state and the first compile produced 17 errors — the file had drifted from
-  itself because nothing had ever checked it.
+  Runs clang-cl over `icd/mesa/src/vulkan/helios-present-layer/helios_present_layer.cpp`
+  alone: no meson configure, no Mesa dependencies, no build directory.
 
-  This runs clang-cl over the translation unit alone. It needs no meson
-  configure, no Mesa dependencies and no VM build directory, so it is cheap
-  enough to run after every edit to the layer, which is the point: the reason
-  the drift accumulated is that checking it used to require wiring it into a
-  build first.
+  ⭐ THIS IS A SECOND COMPILER, NOT A SUBSTITUTE FOR THE BUILD. The layer IS in
+  meson.build now (`-Dvulkan-layers=helios-present`), built by **mingw-w64
+  g++**. This script uses **clang-cl**, and on 2026-08-10 the two disagreed
+  about what was wrong in ways that matter:
+
+    clang-cl found  17 errors of self-drift (a struct missing a member the
+                    dispatch tables all supply, three gate constants used and
+                    never defined, resize() on a type owning a std::mutex);
+    mingw found     the DLL name_prefix mismatch — which is SILENT, the loader
+                    just never finds the layer — and a dead function via
+                    -Wunused-function.
+
+  Neither compiler alone was sufficient. Keep both.
+
+  It is also still the cheap one: seconds against a meson build, so it is what
+  to run after every edit to the layer.
 
   ⚠ VM ONLY. The layer includes <windows.h>, <directx/d3d12.h> and
   <vulkan/vk_layer.h>; it cannot be checked from the Linux host, which is why it
   is not in tools/retirement-gates.sh.
-
-  Retire this script once the layer is in meson.build and `win_meson` compiles
-  it as a matter of course.
 
 .EXAMPLE
   win_exec: powershell -ExecutionPolicy Bypass -File Z:\tools\mesa-layer-syntax.ps1
@@ -41,7 +47,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 $clang = 'C:\Program Files\LLVM\bin\clang-cl.exe'
-$src   = 'Z:\icd\mesa\src\vulkan\wsi\helios_present_layer.cpp'
+$src   = 'Z:\icd\mesa\src\vulkan\helios-present-layer\helios_present_layer.cpp'
 $log   = 'Z:\tmp\mesa_layer_syntax.log'
 
 if (-not (Test-Path $clang)) { Write-Error "clang-cl not found at $clang"; exit 2 }
