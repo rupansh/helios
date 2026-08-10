@@ -665,7 +665,7 @@ does not implement either:
 | unit | file | size | state |
 |---|---|---|---|
 | **A1** HTS1 session | `vn_helios_translation_session.{c,h}` | L | ✅ **LANDED** `6ad43fb`; **rewritten onto A2's encoder in `1b97c64`** — see below, its own encoder was wire-invalid in three ways |
-| **A2** native KMT lane | `vn_helios_native_kmt.{c,h}` | XL | ✅ **LANDED** `icd/mesa` `1b97c64` + gate `c20d162`. Cross-builds; its encoder half is **executed** by `tools/hnr2-encoder-gate.sh` against `protocol/`'s validator (16 batches / 83 fragments; 8 deliberate mutations caught). The KMT half is still unexercised — that needs K5/K6 |
+| **A2** native KMT lane | `vn_helios_native_kmt.{c,h}` | XL | ✅ **LANDED** `icd/mesa` `1b97c64`, reviewed and repaired in `f235ca4`, gate `c20d162`/`c90e5a8`. Cross-builds; its encoder half is **executed** by `tools/hnr2-encoder-gate.sh` against `protocol/`'s validator (18 batches / 86 fragments; 10 deliberate mutations caught). ⚠ The KMT half is **compile-verified only** — nothing executes it until K5 |
 | **A3** renderer rewrite | `vn_renderer_helios.c` (**5261** lines at HEAD; the brief's inventory says 5304 and is stale) | XL | absent |
 | **K5** KMD HTS1 sessions | `kmd_render/src/ddi/translation_session.rs` | L | absent — **A1's INIT refuses until this exists** |
 | **K6** KMD HVC1/HNR2 render | `kmd_render/src/ddi/native_render.rs` | XL | absent |
@@ -685,6 +685,23 @@ round had already passed over (the use table written after the payload, a zeroed
 flags). Every one would have been refused on the wire the moment K5 made A1
 reachable. ⇒ **Split any remaining A-lane unit into a pure half and a KMT half,
 and gate the pure half.** The KMT half still waits for K5/K6.
+
+#### The A2 review, as the ordinary code review the owner asked for
+
+5 lenses (encoder arithmetic vs the validator arm-by-arm, the D3DKMT contract vs
+the real WDK headers, concurrency/lifetime, the A1 refactor vs its predecessor,
+and "can the gate pass with a broken encoder") + a skeptic per finding. **9
+findings → 5 survivors → 3 distinct defects**, all repaired in `f235ca4`: a
+COMMIT writing past the `D3DDDI_ALLOCATIONLIST` after a mid-batch list shrink;
+reply-slot exhaustion failing the call where §10.7:2046 says wait (the code cited
+§10.7:1849, which is the KMD's *staging* pool — a rule from the right document
+and the wrong pool); and an HVR1 arm that was a strict subset of protocol's
+validator in three ways that each turn a malformed reply into a hang, a prefix
+reported as a complete result, or bytes spliced at the wrong offset.
+
+⭐ Two findings the skeptic **refuted as defects** still changed the tree: their
+coverage argument stood, so they became corpus cases (`c90e5a8`). A refuted
+finding is not always worth nothing — but what it buys is a test, not a patch.
 
 ⭐ **The A2 encoder gate is the shape to copy** (`tools/hnr2-encoder-gate.sh`):
 the ICD source file is compiled and RUN on Linux, its output replayed through the
