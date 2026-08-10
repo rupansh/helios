@@ -291,6 +291,35 @@ main(int argc, char **argv)
    b.allocation_count = 1;
    emit("read-only-single", &b, ++token);
 
+   /* 6d. A mixed manifest: patches on allocations 1 and 3 only, so 0 and 2 carry
+    *     zero-length runs BETWEEN populated ones. A `first_patch` that was not
+    *     advanced for an empty run still tiles [0,count) from the front and
+    *     would pass a laxer check than validate_commit_tables'. */
+   {
+      static struct helios_hnr2_patch_input mixed[5];
+      const uint32_t owners[5] = { 1, 3, 1, 3, 3 };
+      for (unsigned i = 0; i < 5; i++) {
+         mixed[i].payload_offset = (uint32_t)(i * 16);
+         mixed[i].allocation_index = owners[i];
+         mixed[i].operand_kind = HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32;
+      }
+      BASE(512);
+      b.allocations = allocs;
+      b.allocation_count = 4;
+      b.patches = mixed;
+      b.patch_count = 5;
+      emit("empty-runs-between-populated", &b, ++token);
+   }
+
+   /* 6e. The clamp at EXACT equality: with one use record the COMMIT metadata is
+    *     136 bytes, so a payload of exactly `cap_nonfinal` cannot fit one
+    *     fragment, and the non-final take equals what is left -- the `>=` in the
+    *     clamp, not the `>`. */
+   BASE(cap_nonfinal);
+   b.allocations = allocs;
+   b.allocation_count = 1;
+   emit("clamp-at-exact-equality", &b, ++token);
+
    /* 7. The metadata-heavy corner: the maximum tables leave only ~32 KiB for the
     *    COMMIT payload, so the last NON-final fragment must be clamped to leave
     *    the COMMIT at least one byte. */

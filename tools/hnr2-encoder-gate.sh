@@ -57,7 +57,7 @@ BATCHES=$(printf '%s\n' "$SUMMARY" | sed -E 's/^HNR2 corpus: ([0-9]+) batches.*/
 FRAGMENTS=$(printf '%s\n' "$SUMMARY" | sed -E 's/.* ([0-9]+) fragments validated/\1/')
 # Floors, not exact counts: the corpus is meant to grow. They exist so a corpus
 # that silently stopped being generated cannot report PASS.
-if [ "$BATCHES" -lt 16 ] || [ "$FRAGMENTS" -lt 80 ]; then
+if [ "$BATCHES" -lt 18 ] || [ "$FRAGMENTS" -lt 85 ]; then
     echo "hnr2-encoder-gate: FAIL corpus too small ($SUMMARY)"
     exit 1
 fi
