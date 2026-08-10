@@ -161,7 +161,9 @@ A Windows 11 dev VM named `win11` is reachable via `ssh win` (preconfigured). It
 
 - **VS 2022 Build Tools** — "Desktop development with C++" (MSVC v143 + Spectre-mitigated x64 libs).
 - **WDK** — kit **10.0.26100.0**. Must be a *complete* kit (SDK **and** WDK at the same version): `wdk-build` picks the **highest** installed kit with **no override**, so an incomplete higher kit (e.g. a winget WDK with no matching SDK → missing `specstrings.h`) breaks the build. Keep only complete kits.
-- **LLVM 17.0.6** at `C:\Program Files\LLVM\bin`; set `LIBCLANG_PATH` to it for bindgen (LLVM 18 has a bindgen bug). bindgen/LLVM is needed only for active WDF/PCI support or archived dxgk reference builds; the System-class KMDF build should not depend on display DDIs.
+- **LLVM 22.1.8** at `C:\Program Files\LLVM\bin`; `LIBCLANG_PATH` points there for bindgen and it is also the `clang-cl` that builds vkd3d, the DXVK bridge and the umd12 bridge. ⚠ **One LLVM for both** — bindgen parsing headers with one clang while `clang-cl` compiles them with another is the drift class this tree keeps getting bitten by.
+  - ⭐ **Upgraded 17.0.6 → 22.1.8 on 2026-08-10, and it is a floor, not a preference.** VS 18 landed MSVC 14.51, whose `<yvals_core.h>` hard-asserts *"Unexpected compiler version, expected Clang 20 or newer"*; VS 2022's 14.44 asserts Clang 19+. Clang 17 satisfies neither, and no `-D` can suppress it — 14.51's `__msvc_doom_core.hpp` also assumes `defined(__clang__)` implies `__builtin_verbose_trap`, a Clang 19 builtin, so the build fails on a missing builtin rather than on the assert.
+  - ⇒ **If a future MSVC raises the bar again, RAISE CLANG.** Do not reintroduce `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`; it was deleted from all three sites that carried it, each of which recorded it as "a runtime-risk acknowledgement, not a fix".
 - **Rust nightly + `rust-src`** (for `no_std` build-std), target `x86_64-pc-windows-msvc`.
 - **cargo-make** — `cargo install --locked cargo-make`.
 - **coreutils** are installed (Unix tools like `ls`/`cp`/`grep` work in `win_exec`).
@@ -200,16 +202,36 @@ Install the WDK matching your VS 2022. The WDK installs as a VS extension.
 
 Verify: Open VS → Extensions → should show "Windows Driver Kit".
 
-#### LLVM 17.0.6 (not 18 — has a bindgen bug)
+#### LLVM 22.1.8 (minimum 20 — MSVC 14.51's STL asserts it)
+The silent NSIS installer upgrades the existing `C:\Program Files\LLVM` in place,
+which is what keeps `LIBCLANG_PATH` and `HELIOS_CLANG_CL` valid with no config
+change:
 ```powershell
-winget install -i LLVM.LLVM --version 17.0.6 --force
-# Select "Add LLVM to PATH" in the GUI
+$exe = "$env:USERPROFILE\Downloads\LLVM-22.1.8-win64.exe"
+Invoke-WebRequest -UseBasicParsing -OutFile $exe `
+  https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-win64.exe
+Start-Process -FilePath $exe -ArgumentList '/S' -Wait   # /S = silent, default dir
 ```
 
-Verify:
+Verify — and check the STL pairing, not just the version, because the version
+alone is what went stale here:
 ```powershell
-clang --version  # should print 17.0.6
+& 'C:\Program Files\LLVM\bin\clang-cl.exe' --version   # clang version 22.1.8
+(Get-Item 'C:\Program Files\LLVM\bin\libclang.dll').VersionInfo.FileVersion  # 22.1.8
+# The real check: a bare <memory> TU against the newest MSVC STL.
+'#include <memory>
+int main(){ return 0; }' | Set-Content -Encoding ascii $env:TEMP\stlprobe.cpp
+& 'C:\Program Files\LLVM\bin\clang-cl.exe' /c /EHsc /std:c++20 /MD `
+  $env:TEMP\stlprobe.cpp "/Fo$env:TEMP\stlprobe.obj"   # must exit 0, no -D flags
 ```
+
+⚠ **bindgen must keep up with libclang.** 0.70 *and* 0.71 both mis-generate
+against libclang 22 — they bind the forward declaration instead of the
+definition for structs declared before they are defined, yielding
+`pub _address: u8` and size 1. `umd`/`umd12` are on **0.72**; `kmd_render` stays
+on **0.71** because wdk-build 0.5.1's `BuilderExt` extends that exact
+`bindgen::Builder` type, and 0.71 is verified working against libclang 22 for
+the WDK's C headers.
 
 #### Rust (nightly channel — required for no_std kernel mode)
 ```powershell
@@ -463,7 +485,7 @@ unsafe { KdPrint!("Helios: adapter started\n\0"); }
 | Mesa (Linux guest test) | 24.2 | Latest | Venus ICD |
 | WDK | 10.0.26100.0 | 10.0.26100.0 | For KMDF/WDF (KMDF 1.33) |
 | VS | 2022 | 2022 | Earlier versions may work |
-| LLVM | 17.0.6 | 17.0.6 | 18 has bindgen bug, avoid |
+| LLVM | 22.1.8 | 22.1.8 | **Minimum 20** — MSVC 14.51's STL asserts it. One LLVM for bindgen AND clang-cl. |
 | Rust | nightly-2024-11+ | Latest nightly | 2024 edition |
 | windows-drivers-rs | 0.4.x / 0.5.x | Latest | wdk = 0.4, wdk-sys = 0.5 |
 
@@ -475,8 +497,32 @@ unsafe { KdPrint!("Helios: adapter started\n\0"); }
 The WDK is not on PATH or VS Developer Command Prompt was not used.  
 Fix: Build inside "x64 Native Tools Command Prompt for VS 2022".
 
-### bindgen fails with LLVM error
-LLVM 18 has a known bug. Downgrade to 17.0.6.
+### bindgen emits empty structs (`pub _address: u8`, size 1) and E0609 on every field
+The bindgen version predates the installed libclang. It binds a struct's
+FORWARD DECLARATION instead of its definition, so layout assertions underflow
+(`1_usize - 144_usize`) and every field access fails. Seen with bindgen 0.70 and
+0.71 against libclang 22; fixed by 0.72.
+
+Rule out a header cause first, because the symptom looks like one — it is not:
+```powershell
+clang -target x86_64-pc-windows-msvc -fsyntax-only <includes> wrapper.h   # expect 0 errors
+clang -target x86_64-pc-windows-msvc -E        <includes> wrapper.h > pp.txt
+# then confirm the struct body is COMPLETE in pp.txt before touching bindgen
+```
+
+### C++ fails with `use of undeclared identifier '__builtin_verbose_trap'`
+The MSVC STL is newer than clang. Look one error further up for the real gate,
+`error STL1000: Unexpected compiler version, expected Clang N or newer` — the
+builtin is a Clang 19 addition that 14.51's `__msvc_doom_core.hpp` reaches for
+whenever `__clang__` is defined. **Raise clang to N; do not define the builtin
+and do not add `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`** (it cannot suppress
+a missing builtin anyway).
+
+### vkd3d C fails with `incompatible pointer types passing 'LONG *' ... 'uint32_t *'`
+Clang 19+ promotes this to an error in C, and upstream vkd3d relies on the
+implicit conversion (same width on Windows). The build demotes it with
+`-Dc_args=-Wno-error=incompatible-pointer-types` in `win_vkd3d`'s canonical
+meson setup — keep the fix in the BUILD, not in the fork.
 
 ### KMD loads but crashes on start
 Check IRQL. A common mistake is calling pageable functions at DISPATCH_LEVEL during virtqueue init. Use `KeGetCurrentIrql()` assertions in debug.
