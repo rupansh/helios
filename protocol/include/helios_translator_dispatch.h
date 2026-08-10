@@ -2223,6 +2223,40 @@ helios_translator_check_query_result(const HeliosSyncProgressResultV1 *result)
     return helios_translator_check_progress_common(result);
 }
 
+/*
+ * The C twin of HeliosTranslatorRefusalCountersV1::validate — the shape check
+ * the ICD owes `out_counters` BEFORE it writes a byte of it, and the consumer
+ * owes it after query_refusal_counters returns.
+ *
+ * query_refusal_counters takes a `*mut` into the CONSUMER's storage and the two
+ * parties are separately compiled binaries (the ICD is Mesa; the consumer is
+ * DXVK/vkd3d or a umd bridge). Every other record here re-checks struct_bytes
+ * and abi_version on entry even though helios_translator_check_create_info()
+ * already refused a mismatched abi_version at create time — the redundancy is
+ * the point, because what it catches is a record whose SIZE changed without the
+ * VERSION being bumped, which is exactly what create-time negotiation cannot
+ * see.
+ *
+ * This record was the one exception; its sibling out-parameter
+ * HeliosSyncProgressResultV1 has the identical shape and has always been
+ * checked. No cross-field invariant exists to test: all thirteen fields are
+ * independent monotonic counters, and a counter is never "too large".
+ */
+static inline HeliosTranslatorStatusCode
+helios_translator_check_refusal_counters(const HeliosTranslatorRefusalCountersV1 *counters)
+{
+    if (counters == NULL) {
+        return HELIOS_TRANSLATOR_STATUS_NULL_ARGUMENT;
+    }
+    if (counters->struct_bytes != (uint32_t)sizeof(HeliosTranslatorRefusalCountersV1)) {
+        return HELIOS_TRANSLATOR_STATUS_STRUCT_BYTES;
+    }
+    if (counters->abi_version != HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION) {
+        return HELIOS_TRANSLATOR_STATUS_ABI_VERSION;
+    }
+    return HELIOS_TRANSLATOR_STATUS_OK;
+}
+
 #if defined(__cplusplus)
 }
 #endif

@@ -2917,6 +2917,43 @@ impl HeliosSyncProgressResultV1 {
     }
 }
 
+impl HeliosTranslatorRefusalCountersV1 {
+    /// The shape check the ICD owes this record **before it writes a byte of
+    /// it**, and the consumer owes it after the call returns.
+    ///
+    /// [`PfnHeliosTranslatorQueryRefusalCounters`] takes `out_counters` as a
+    /// `*mut` into the *consumer's* storage, and the two parties are separately
+    /// compiled binaries — the ICD is Mesa, the consumer is DXVK/vkd3d or a
+    /// `umd/bridge`. Every other record in this ABI re-checks `struct_bytes`
+    /// and `abi_version` on entry even though
+    /// [`HeliosTranslatorCreateInfoV1::validate`] already refused a mismatched
+    /// `abi_version` at create time; the redundancy is the point, because the
+    /// case it catches is a record whose size changed without the version
+    /// being bumped, which is precisely the error create-time negotiation
+    /// cannot see.
+    ///
+    /// This record was the one exception. Its own field documentation has said
+    /// `struct_bytes` is "`== HELIOS_TRANSLATOR_REFUSAL_COUNTERS_BYTES`, set by
+    /// the caller" since it was written, and nothing enforced it — a stated
+    /// precondition with no code behind it. Its sibling out-parameter
+    /// [`HeliosSyncProgressResultV1`], which has the identical `*mut`-filled-by-
+    /// the-other-binary shape, has always been validated; the asymmetry was an
+    /// oversight rather than a decision, so it is closed here rather than
+    /// documented as intentional.
+    ///
+    /// There is no cross-field invariant to check: all thirteen fields are
+    /// independent monotonic counters, and a counter is never "too large".
+    pub fn validate(&self) -> Result<(), HeliosTranslatorStatus> {
+        if self.struct_bytes != HELIOS_TRANSLATOR_REFUSAL_COUNTERS_BYTES {
+            return Err(HeliosTranslatorStatus::StructBytes);
+        }
+        if self.abi_version != HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION {
+            return Err(HeliosTranslatorStatus::AbiVersion);
+        }
+        Ok(())
+    }
+}
+
 // ── Compile-time layout assertions ──────────────────────────────────────────
 //
 // The same discipline the wire modules use, for the same reason: a wrong size
@@ -3565,6 +3602,43 @@ mod tests {
         let mut r = base;
         r.struct_bytes = HELIOS_TRANSLATOR_QUEUE_ATTACH_REQUEST_BYTES - 8;
         assert_eq!(r.validate(), Err(HeliosTranslatorStatus::StructBytes));
+    }
+
+    // ── The refusal counters ────────────────────────────────────────────────
+
+    #[test]
+    fn the_refusal_counter_block_is_shape_checked_like_every_other_record() {
+        // `query_refusal_counters` hands this record's storage to a separately
+        // compiled binary as a `*mut`. The case that matters is a size change
+        // WITHOUT an abi_version bump, which create-time negotiation cannot
+        // see — so a short block must be refused even though the version is
+        // the one currently negotiated.
+        let good = HeliosTranslatorRefusalCountersV1 {
+            struct_bytes: HELIOS_TRANSLATOR_REFUSAL_COUNTERS_BYTES,
+            abi_version: HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION,
+            ..Default::default()
+        };
+        assert_eq!(good.validate(), Ok(()));
+
+        let mut short = good;
+        short.struct_bytes = HELIOS_TRANSLATOR_REFUSAL_COUNTERS_BYTES - 8;
+        assert_eq!(short.validate(), Err(HeliosTranslatorStatus::StructBytes));
+
+        let mut grown = good;
+        grown.struct_bytes = HELIOS_TRANSLATOR_REFUSAL_COUNTERS_BYTES + 8;
+        assert_eq!(grown.validate(), Err(HeliosTranslatorStatus::StructBytes));
+
+        let mut wrong_abi = good;
+        wrong_abi.abi_version = HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION + 1;
+        assert_eq!(wrong_abi.validate(), Err(HeliosTranslatorStatus::AbiVersion));
+
+        // All-zero is the state a consumer allocates before filling the header
+        // in, and it must NOT pass: a zeroed block is indistinguishable from a
+        // record whose header the caller forgot to set.
+        assert_eq!(
+            HeliosTranslatorRefusalCountersV1::default().validate(),
+            Err(HeliosTranslatorStatus::StructBytes)
+        );
     }
 
     // ── The sealed batch ────────────────────────────────────────────────────

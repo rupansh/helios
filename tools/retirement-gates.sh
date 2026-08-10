@@ -34,9 +34,15 @@ run_gate() {
         # `tail -3` on a cargo run shows the doc-test block, which reads
         # "0 passed" while 139 unit tests passed above it — a display that
         # invites exactly the misreading this file exists to prevent.
+        # ⚠ The doc-test exclusion must anchor on "ok. 0 passed", NOT on
+        # "0 passed": `140 passed` CONTAINS `0 passed` as a substring, so the
+        # unanchored form silently hid the real result line for any count
+        # ending in zero. It read correctly at 139 and 189 and went blind at
+        # 140 — a filter that is right for the counts you happen to have is
+        # the same class of defect as a gate that is not an exit code.
         [ "$QUIET" = "--quiet" ] || printf '%s\n' "$out" \
             | grep -E 'test result:|^OK:|^all mirrors|^up to date' \
-            | grep -v '0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out' \
+            | grep -v 'test result: ok\. 0 passed' \
             | sed 's/^/      /'
     else
         printf 'FAIL  %s  (exit %d)\n' "$name" $rc
