@@ -410,3 +410,52 @@ bundle must not register this layer while the layer refuses every device: it
 would gain nothing and put unfinished code in the compositor's path.
 `ci/windows/build-mesa.sh` does not build it either (`-Dvulkan-layers=`), so
 the value would name a file the payload does not contain.
+
+### F7 addendum — the image half is implemented, and the sizing above was wrong
+
+`33d3a10678b` (icd/mesa) makes the ICD import `D3D12_RESOURCE_BIT`. The
+measured matrix is now:
+
+```
+  D3D12_RESOURCE  VK_SUCCESS  DEDICATED_ONLY IMPORTABLE  compatible=0x40 export=0x0
+  OPAQUE_WIN32    VK_SUCCESS  EXPORTABLE IMPORTABLE      compatible=0x2  export=0x2
+```
+
+and the layer's refusal moves to the next gate in §10.3's chain,
+`D3D12_FENCE_BIT not IMPORTABLE`.
+
+**What the paragraph above got wrong.** It named "the lower-ICD import chain
+(§10.3's C57 carrier: `D3DKMTQueryResourceInfoFromNtHandle` →
+`D3DKMTOpenResourceFromNtHandle`)" as the next unit, which read as work to be
+written. **That carrier already existed** — it is what the `OPAQUE_WIN32`
+import has always used. What was missing was only the handle type's
+advertisement and routing, because on this stack the two types name the same
+object: `helios_umd12` sets `VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT` on **every**
+committed create (`resource12.rs:2317`, unconditional on the fused
+heap+resource arm), so a committed D3D12 resource is already backed by
+venus-exported dedicated memory carrying the identity blob the carrier reads.
+
+⚠ A wrong intermediate conclusion, recorded because it nearly cost the session
+an XL rewrite: reading `heap_flags(..., PrimaryTranslation::VenusExport)` alone
+suggested the export flag was tied to `HEAP_PRIMARY`, i.e. scanout only, from
+which it followed that a *shared* committed resource would have no venus
+identity and the import would need HWA2 and the KMD allocation model (K4, 0%).
+The call site two hundred lines away says the opposite in a comment that
+explains why. **A flag's meaning is where it is set, not where it is
+translated.**
+
+### The semaphore half, and what it needs
+
+`D3D12_FENCE_BIT` is the same shape of problem with one extra consumer.
+vkd3d-proton does not merely accept it — it *requires* it: `command.c:626-644`
+creates shared fences with `export_info.handleTypes = D3D12_FENCE_BIT` and
+refuses unless `exportFromImportedHandleTypes` reports it, and `device.c:7687`
+/ `:7771` export and import under that type. So the ICD must advertise it both
+EXPORTABLE and IMPORTABLE, and ⇒ **`ID3D12Fence::CreateSharedHandle` cannot
+work on Helios today either**, independently of the present layer.
+
+The underlying object is again the same: a venus timeline semaphore exported
+through the Helios WDDM sync path. The work is `vn_physical_device.c`
+(advertise), `vn_queue.c` (stop stripping `D3D12_FENCE_BIT`, accept it in the
+named export/import arms), and it must be recorded that the two names denote
+one object *on this stack* — that is a property of Helios, not of Vulkan.
