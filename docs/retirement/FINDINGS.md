@@ -727,3 +727,63 @@ registered slots are wrong, and it does not re-open F6, which proved the slot
 audit's refusal path on the target in both index and direction. The 22-warning
 baseline was taken on a clean tree at `fb9b09a` and is the control arm for the
 K4 changeset's own build.
+
+---
+
+## F10 — dxgkrnl DOES propagate the KMD's create-time private-data write back to the creating UMD. HWA2's write-back model is sound.
+
+The D3D12 producer named this the single highest-risk assumption in the K4
+changeset: *"dxgkrnl propagates the KMD's create-time private-data write back to
+the UMD's buffer … not established anywhere in the doc set. If the assumption is
+false, every committed D3D12 resource create fails."* HWA2's whole two-stage
+contract rests on it — the KMD stamps `allocation_generation` at create and the
+UMD must be able to read it back.
+
+**It is established now, on the live 22.22.263.0 build, by a pre/post comparison
+the D3D11 UMD has been logging all along** (`umd/src/forward/resource.rs`, the
+`private mutated` line, which brackets `pfnAllocateCb` with a copy of the buffer
+taken before the call):
+
+```
+DDI allocate_wddm_resource private mutated:
+  pre  blob=0x1a  res_id=508 ctx=71 kind=1 vas=512     mti=1
+  ->
+  post blob=0x200 res_id=0   ctx=71 kind=0 vas=512     mti=1
+
+  pre  blob=0x2c  res_id=511 ctx=71 kind=1 vas=4988928 mti=1
+  -> post blob=0x4c2000 res_id=0 ctx=71 kind=0 vas=4988928 mti=1
+```
+
+Three fields — `blob_id`, `adopt_resource_id` and `kind` — differ after the call
+returns. The kernel wrote them; nothing in user mode did. ⇒ **the create-time
+`[in/out]` buffer round-trips.**
+
+### The instrument that could NOT have answered it, recorded so it is not re-used
+
+`umd12`'s `AllocPrivateWrittenBack` counter looks like the right instrument and
+is not. It fires only when the write-back **differs** from what the UMD sent
+(`private.meta.pitch != pitch || venus_alloc_size != … || memory_type_index !=
+…`), so a KMD that faithfully echoed the UMD's own values would leave it at
+zero, exactly like a KMD whose write never arrived. A D3D12 clear probe run on
+the deployed build produced **no `umd12` log at all** — the log file is created
+lazily on the first `log_error!` — which under that counter is equally
+consistent with both hypotheses. The D3D11 line answers it because it compares a
+**pre-call snapshot** against the post-call buffer rather than against an
+expectation.
+
+⇒ Same lesson as `WfBWire` / `RENDER_COUNT` / `RING_SUBMIT_COUNT`: a counter
+whose firing condition is "the value changed from what I predicted" cannot
+distinguish "no write" from "the write agreed with me".
+
+**Bound.** This proves the buffer the UMD passes to `pfnAllocateCb` is copied
+back after the kernel writes it, for the D3D11 arm at 96 bytes. It does **not**
+prove the same for 168 bytes (the size changes), nor for the D3D12
+`pfnAllocateCb` arm, nor that any particular `PrivateDriverDataSize` is accepted.
+Those remain to be measured on the deployed K4 build; the producers already
+refuse loudly (`Hwa2WriteBackAbsent`) if the generation comes back zero, so the
+failure mode is a counted refusal rather than a corrupt descriptor.
+
+Incidental, from the same run: `tools/d3d12_clear_probe.cpp` **passes** on the
+deployed build — 65536/65536 pixels exactly `(0,51,102,255)`, `SetEventOn-
+Completion` signalled in 0.6 µs, `GetDeviceRemovedReason` clean. That is the
+pre-change D3D12 control arm for the K4 changeset.

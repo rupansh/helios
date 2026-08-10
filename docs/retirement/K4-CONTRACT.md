@@ -108,14 +108,51 @@ enforced on one path and not another. New rejection variants are append-only:
 * It does **not** create a fallback. A descriptor that fails either stage fails
   the create; nothing selects a legacy parser (§10.3:1104-1107).
 
-### 1.3 The one thing that stays open
+### 1.3 RULING — `byte_size` is the RESOURCE's extent, not the blob's
 
-`byte_size` (offset 24) for a **KMD-created LINEAR image** is computed today by
-`create_allocation.rs::linear_blob_size` from two empirical constants whose
-derivation is recorded only as measurements (`:392-400`). §10.3 gives no rule.
-⇒ K4 keeps the existing computation, keeps the measurement comment, and
-**validates the UMD's `byte_size` against it** rather than replacing it. Flagged
-here so the review does not read the silence as agreement.
+⭐ Amended 2026-08-10 after the three producers were authored in parallel and
+**each guessed a different rule** — which is precisely why this had to become a
+ruling rather than stay an open item:
+
+| producer | what it assumed |
+|---|---|
+| `umd` (D3D11) | sends `max(pitch * height, 4096)` |
+| `icd/mesa` | reads it as `byte_size >= effective_size` |
+| `kmd_render` | `linear_blob_size(pitch, height)` = `pitch * round_up(height, 128) + 65536`, page-floored — **strictly larger than the D3D11 producer's number** |
+
+⛔ Had the KMD demanded equality, **every D3D11 create would have failed**, and
+it would have failed on the target with no Linux build able to see it.
+
+**The rule.** `byte_size` is **UMD-supplied** and means *the exact extent the
+resource requires*. The KMD:
+
+* validates `byte_size != 0`, that every plane record is bounded inside it, and
+  that `byte_size <= ` the backing extent the KMD is about to create;
+* **refuses** the create if `byte_size` exceeds the backing — the safe
+  direction, since it can never admit an over-bind;
+* **never rewrites it**, exactly as §1.1 says of every non-KMD-owned field.
+
+**The KMD's blob arithmetic stays KMD-private and is never exported.**
+`linear_blob_size`'s two empirical constants (`NV_LINEAR_ROW_ALIGN`,
+`NV_LINEAR_TAIL_SLACK`, `create_allocation.rs:392-400`) exist as *Xid-31
+undersize protection* — the blob is deliberately larger than the resource. That
+slack is a property of the backing, not of the resource's identity, and putting
+it in a descriptor every opener reads would export a private hardware
+work-around into the wire ABI. Read §10.3's "exact backing extent" as *the exact
+extent of this resource's backing*, which the creator states and the kernel
+honours.
+
+⇒ The rejected alternative, recorded so it is not re-proposed: exporting the two
+constants through `protocol/` so the UMD computes the identical number. It
+couples every producer to an NVIDIA-specific measurement, and it makes a change
+to the slack an ABI break.
+
+⚠ **Consequence for the ICD**, which must be revisited when its import is
+un-blocked (§5): under this rule `byte_size` may be *smaller* than a
+page-rounded Vulkan `allocationSize`, so a `>=` comparison against
+`allocationSize` is the wrong test. The ICD's import is a counted refusal today
+so nothing depends on it yet, and the comparison carries a comment saying to
+re-derive it against this ruling.
 
 ---
 
