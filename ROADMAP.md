@@ -131,6 +131,45 @@ downstream of the allocation model. The D3D12 import landed on 2026-08-10
 validates the *pre-retirement* `helios_wddm_open_identity` blob and is expected
 to be re-pointed at HWA2 by K4.
 
+### ⭐ K4 IS AUTHORED, ACROSS FIVE COMPONENTS, AND EVERY ONE OF THEM BUILDS
+
+Landed 2026-08-10 as three commits — the protocol/model/gates half, the atomic
+consumer flip, and the doc corrections. It is deliberately **the whole
+allocation-identity subsystem**, not the KMD unit: recon showed K4 alone is a
+flag day, because the moment `dxgkddi_create_allocation` stops accepting the
+96-byte legacy pair, every producer that still sends one is refused.
+
+| component | what it now does | verified |
+|---|---|---|
+| `protocol` | HWA2 gains `validate_create_input`/`validate_create_output` sharing one cross-field core with `validate`; HVM1 gains `from_private_data` | 146 tests (was 140) |
+| `kmd_logic` | the executable state machines a single-record validator cannot express — the input→output transition, the generation lifecycle, HVM1 roles, HOC1 pools | 211 tests (was 189) |
+| `kmd_render` | HWA2 written at create, HVM1/HOC1 admitted, adoption + open-restamp + VidMm tracker deleted, new `adapter/allocation_object.rs` | `cargo check` exit 0, **22 warnings — the same count as the pre-change baseline** |
+| `umd` + `umd12` | both re-pointed as HWA2 producers, and both now validate the KMD's write-back, which nothing did before | release build exit 0 |
+| `icd/mesa` | reads HWA2 from `protocol/include` — the hand-mirrored 48-byte records are gone, so the header's per-field `offsetof` asserts now fire in the ICD's own TU | ninja green |
+| `tools/retirement-gates.sh` | the two §8 gates that were named but never written | 8 gates, ALL PASS |
+
+⛔ **Nothing has run.** Every HWA2 path is *implemented but never exercised* —
+`METHOD.md`'s distinct third state, not "done". No deploy: round 2 of the review
+is the gate, and `OWNERSHIP.md` §3's activation conditions are not met (F9).
+
+⇒ **When it does deploy, every venus `vkAllocateMemory` fails and the desktop
+dies**, until mesa **A3** lands. That follows from §10.3 forbidding HWA2 to carry
+a host `resid` or a Vulkan memory-type index — both load-bearing in the ICD's
+import — and A3 is XL and unstarted. It is the accepted cost of the sequencing
+decision above, not a regression.
+
+⚠ **A toolchain blocker was found and fixed on the way**, and it was not ours:
+published `wdk-sys` 0.5.1 pins bindgen 0.71.1, which under libclang 22 emits a
+size-1 opaque type *and* a real-layout assertion for every forward-declared
+struct — 40 underflowing const-evals. Proven third-party by building a scratch
+crate whose only dependency is `wdk-sys` and which contains no Helios code. It
+had been latent since the LLVM 22 upgrade, masked by an Aug-8 cached `types.rs`;
+the first fingerprint invalidation exposed it. Downgrading is measurably *not*
+the fix (MSVC 14.44 regenerates the identical 39 opaque types), so
+`kmd_render/Cargo.toml` now `[patch.crates-io]`-es the whole windows-drivers-rs
+family to upstream main, which is already on bindgen 0.72.1, pinned to an exact
+rev.
+
 ### ⭐ K4's contract is written down, and it corrects the plan in five places
 
 `docs/retirement/K4-CONTRACT.md` (2026-08-10) is **normative for the allocation
