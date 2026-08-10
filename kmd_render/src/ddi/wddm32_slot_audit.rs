@@ -92,9 +92,9 @@ pub(crate) const SLOT_COUNT: usize = 192;
 /// `Version` (ULONG + 4 bytes of padding) plus one pointer per slot.
 const EXPECTED_STRUCT_SIZE: usize = 8 + SLOT_COUNT * 8;
 
-/// The audited header: `tmp/wdk-28000/Include/10.0.28000.0/km/dispmprt.h`.
+/// The audited header: `kmd_render/tools/wdk-28000/km/dispmprt.h`.
 #[allow(dead_code, reason = "provenance for the audit, read by humans")]
-pub(crate) const AUDITED_HEADER: &str = "tmp/wdk-28000/Include/10.0.28000.0/km/dispmprt.h";
+pub(crate) const AUDITED_HEADER: &str = "kmd_render/tools/wdk-28000/km/dispmprt.h";
 
 /// The classification, in WDK declaration order.
 pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [

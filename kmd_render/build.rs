@@ -90,17 +90,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// at `DriverEntry` with `0xC0000182`. A generated file that its generator
 /// cannot reproduce is a trap aimed at whoever follows its instructions.
 ///
+/// # Where `dispmprt.h` comes from, in order
+///
+/// ⭐ **Changed 2026-08-10 (owner decision): Windows Kit 10.0.28000.0 is now
+/// INSTALLED on the build VM**, so the first choice is the installed kit and the
+/// gitignored `tmp/wdk-28000/` tree is only a fallback. Round 3 of the Phase-2
+/// review recorded why that ordering matters: while the staged tree was the
+/// *only* source, an untracked directory silently decided whether this check ran
+/// at all, and the same tree was a hard `require_path` in `umd12/build.rs` — so
+/// `helios_umd12.dll` could be built on exactly one computer. The install is
+/// four NuGet packages merged into the kit root; `TOOLCHAIN.md` has the recipe
+/// and the pinned hashes.
+///
+/// 1. `HELIOS_WDK_KM_INCLUDE` — an explicit override, for a host that keeps its
+///    kit somewhere else.
+/// 2. the installed kit's `km\dispmprt.h`.
+/// 3. `kmd_render/tools/wdk-28000/km/dispmprt.h` — the **vendored** copy, which
+///    is in the repository and therefore always present. It is what
+///    `tools/retirement-gates.sh` uses, because that gate runs on the **Linux**
+///    host where no Windows kit is installed, and its provenance (package, both
+///    SHA-256s, re-extraction command) is in that directory's README.
+///
+/// All three are the same package: the header was verified byte-identical
+/// (SHA-256 `cf8bc620…`) across the installed kit, the previously-staged tree
+/// and the vendored copy.
+///
+/// ⇒ Because (3) is tracked, the "no header" arm below is now **unreachable in a
+/// normal checkout**. It is kept because a build from a partial export or a
+/// stripped source drop is not this repository's business to prevent, and a
+/// build script that panics on a missing *advisory* input would be exactly the
+/// "worse failure than the one being prevented" this doc warns about.
+///
 /// # Why it is advisory when its inputs are absent
 ///
-/// The check needs `python3` and the staged WDK 28000 `dispmprt.h`, which is
-/// gitignored (`tmp/wdk-28000/`, see `docs/retirement/FINDINGS.md` F1). Hard-
-/// failing without them would break the build on any machine that has not
-/// staged the headers, which is a worse failure than the one being prevented.
-/// So: **present ⇒ enforced as a build error; absent ⇒ a loud `cargo:warning`**.
-/// It is never silent, because a check that can pass by being skipped is the
-/// kind of assurance this tree keeps discovering is not real.
+/// The check needs `python3` and one of the headers above. Hard-failing without
+/// them would break the build on any machine that has neither, which is a worse
+/// failure than the one being prevented. So: **present ⇒ enforced as a build
+/// error; absent ⇒ a loud `cargo:warning`**. It is never silent, because a check
+/// that can pass by being skipped is the kind of assurance this tree keeps
+/// discovering is not real.
+///
+/// ⚠ On the win11 VM the check is advisory *in practice* for a second reason
+/// that has nothing to do with headers: there is no working `python3` there —
+/// Windows' App Execution Alias stub launches, prints "Python was not found",
+/// and exits non-zero, which is what the marker protocol below exists to tell
+/// apart from a real staleness verdict. The enforcing run is
+/// `tools/retirement-gates.sh` on Linux.
 fn verify_slot_audit_not_stale() {
     use std::path::Path;
+    use std::path::PathBuf;
     use std::process::Command;
 
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -108,17 +146,38 @@ fn verify_slot_audit_not_stale() {
         .expect("kmd_render always has a parent directory")
         .to_path_buf();
     let generator = repo.join("kmd_render/tools/gen_wddm32_slot_audit.py");
-    let header = repo.join("tmp/wdk-28000/Include/10.0.28000.0/km/dispmprt.h");
 
     println!("cargo:rerun-if-changed=tools/gen_wddm32_slot_audit.py");
     println!("cargo:rerun-if-changed=tools/wddm32_slot_classes.tsv");
     println!("cargo:rerun-if-changed=src/ddi/wddm32_slot_audit.rs");
+    println!("cargo:rerun-if-env-changed=HELIOS_WDK_KM_INCLUDE");
 
-    if !generator.exists() || !header.exists() {
+    let header = [
+        std::env::var("HELIOS_WDK_KM_INCLUDE")
+            .ok()
+            .map(|d| PathBuf::from(d).join("dispmprt.h")),
+        Some(PathBuf::from(
+            r"C:\Program Files (x86)\Windows Kits\10\Include\10.0.28000.0\km\dispmprt.h",
+        )),
+        Some(repo.join("kmd_render/tools/wdk-28000/km/dispmprt.h")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|p| p.exists());
+
+    let Some(header) = header else {
         println!(
-            "cargo:warning=slot-audit staleness check SKIPPED (generator or staged \
-             WDK 28000 dispmprt.h absent). Run tools/retirement-gates.sh on a host \
-             that has tmp/wdk-28000 staged."
+            "cargo:warning=slot-audit staleness check SKIPPED (no WDK 28000 km/dispmprt.h: \
+             tried HELIOS_WDK_KM_INCLUDE, the installed kit 10.0.28000.0, and the \
+             vendored kmd_render/tools/wdk-28000/km/dispmprt.h -- the last is tracked, \
+             so this means an incomplete checkout). Run tools/retirement-gates.sh."
+        );
+        return;
+    };
+    if !generator.exists() {
+        println!(
+            "cargo:warning=slot-audit staleness check SKIPPED (generator absent). \
+             Run tools/retirement-gates.sh on the Linux host."
         );
         return;
     }
@@ -137,9 +196,19 @@ fn verify_slot_audit_not_stale() {
     // So require a POSITIVE marker from the generator in each direction, and
     // treat everything else as could-not-run.
     let (marker_ok, marker_stale) = ("up to date", "STALE:");
+    // ⛔ `--header` is PASSED, not merely resolved. Before 2026-08-10 the
+    // resolution above was an existence check and nothing more: the generator
+    // fell back to its own hardcoded `tmp/wdk-28000/...` default, so this build
+    // script could confirm one header exists and then check against a different
+    // one. With kit 28000 installed the two are the same package (verified
+    // byte-identical by SHA-256 at install time), but "the same today" is not a
+    // property to build a checker on — that is exactly the class of assurance
+    // this function's own doc comment warns about.
     match Command::new("python3")
         .arg(&generator)
         .arg("--check")
+        .arg("--header")
+        .arg(&header)
         .output()
     {
         Ok(out) => {

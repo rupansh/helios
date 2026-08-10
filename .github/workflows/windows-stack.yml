@@ -21,7 +21,18 @@ env:
   RUST_TOOLCHAIN: nightly-2026-07-14
   CARGO_MAKE_VERSION: '0.37.24'
   RUST_SCRIPT_VERSION: '0.36.0'
-  LLVM_VERSION: '17.0.6'
+  # ⭐ THE SECOND SITE THE CLANG FLOOR IS EXPRESSED AT. The floor and its
+  # argument live in TOOLCHAIN.md §2.0 (the "RAISE CLANG" bullet) and §4 (the
+  # version matrix); this variable is how CI states the same fact. The tree already treats "one value,
+  # one site" as a rule where a split value has bitten it — the KMD version
+  # lives only in kmd_render/driver-version.env so an INF and a FILEVERSION
+  # cannot disagree — and this is the same shape. It went stale exactly that way
+  # on 2026-08-10: `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` was deleted from
+  # umd/build.rs, umd12/build.rs, win-mcp and ci/windows/Build-Driver.ps1 on the
+  # argument that clang had moved to 22.1.8, while this line still said 17.0.6 —
+  # so the MSVC STL's error STL1000 would have fired in the DXVK bridge compile
+  # with nothing left to suppress it. ⇒ change this and TOOLCHAIN.md together.
+  LLVM_VERSION: '22.1.8'
   VULKAN_SDK_VERSION: '1.4.309.0'
   CLVK_REPOSITORY: https://github.com/winboat-org/clvk-helios.git
   CLVK_COMMIT: 5b16bbba42835d99816d5d1014d08f7a4ea4e1ef
@@ -53,6 +64,21 @@ jobs:
         uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
         with:
           version: ${{ env.LLVM_VERSION }}
+          # ⛔ `force-url` is REQUIRED at this action pin, not a preference, and
+          # bumping the pin does not remove the need. The action resolves a
+          # version through a table baked into its bundle (assets.json ->
+          # dist/main.js) and throws "Unsupported version for platform
+          # (os=win32, arch=x64, version=...)" for anything absent from it.
+          # Checked 2026-08-10 against this exact commit AND against the
+          # action's master: the newest win32/x64 entry in both is 21.1.8, so
+          # 22.1.8 is unlisted either way. `force-url` is the action's own
+          # documented input for this, and the URL below is byte-for-byte what
+          # the action builds for a listed version
+          # (llvmorg-<v>/LLVM-<v>-win64.exe), so nothing else about the step
+          # changes. Verified the same day: the llvmorg-22.1.8 release exists
+          # and ships LLVM-22.1.8-win64.exe. Both halves derive from
+          # LLVM_VERSION so the version still has one site.
+          force-url: https://github.com/llvm/llvm-project/releases/download/llvmorg-${{ env.LLVM_VERSION }}/LLVM-${{ env.LLVM_VERSION }}-win64.exe
       - name: Install Vulkan SDK tools
         uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff
         with:

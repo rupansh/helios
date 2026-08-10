@@ -109,41 +109,70 @@ fn find_msvc_include() -> String {
 }
 
 /// The **DDI** include root — where `d3d12umddi.h` and its WDK siblings come
-/// from. Default: the WDK 10.0.28000.2526 tree staged in the repo at
-/// `tmp/wdk-28000/`, as it lands inside `win_cargo`'s local build mirror.
+/// from. Default: the **installed** Windows Kit 10.0.28000.0.
 ///
-/// ⛔ **28000, not the installed 26100, and that is the whole point of the
-/// retirement's U0.** `HELIOS_PRESENT_SYNC_RETIREMENT.md` §10.2 requires a
-/// negotiated `D3D12DDI_SUPPORTED_0116`, and §1 records why the installed WDK
-/// cannot serve it: 26100's `d3d12umddi.h` *"ends at Core build 0110"*. There is
-/// no `D3D12DDI_DEVICE_FUNCS_CORE_0116`, no `PFND3D12DDI_CREATEFENCE_0116`, no
+/// ⛔ **28000, not 26100, and that is the whole point of the retirement's U0.**
+/// `HELIOS_PRESENT_SYNC_RETIREMENT.md` §10.2 requires a negotiated
+/// `D3D12DDI_SUPPORTED_0116`, and §1 records why 26100 cannot serve it: its
+/// `d3d12umddi.h` *"ends at Core build 0110"*. There is no
+/// `D3D12DDI_DEVICE_FUNCS_CORE_0116`, no `PFND3D12DDI_CREATEFENCE_0116`, no
 /// `pfnOpenNativeFenceCb` and no `D3D12DDICAPS_TYPE_0112_NATIVE_FENCE_SUPPORT`
 /// in it at all.
 ///
-/// ⚠ The path is inside `C:\Users\Rupansh\helios-vgpu`, which is
-/// `win_cargo`'s robocopy mirror of `Z:\` — **local disk**, as CLAUDE.md
-/// requires (Rust/cargo file IO on the `Z:\` 9p share fails with OS error 87).
-/// `tmp/` is not in the mirror's `/XD` exclusion list, so the staged tree
-/// arrives there on every `win_cargo` call with no separate copy step.
+/// ⭐ **CHANGED 2026-08-10 (owner decision): kit 28000 is INSTALLED on the VM,
+/// and this no longer points into a gitignored tree in the repo.** It used to be
+/// `C:\Users\Rupansh\helios-vgpu\tmp\wdk-28000\...`, staged by hand from a
+/// NuGet package and carried into the build mirror by `win_cargo`'s robocopy.
+/// Round 3 of the Phase-2 review made the cost of that concrete: the tree is
+/// `.gitignore`d and untracked, no CI job or installer provisions it, and
+/// `require_path` + `require_core_0116` **panic** without it — so
+/// `helios_umd12.dll` could be built on exactly one computer, and the same tree
+/// silently decided whether `tools/retirement-gates.sh` ran its slot-audit gate
+/// or skipped it.
+///
+/// What is installed and how to reproduce it is `TOOLCHAIN.md`; the short
+/// version is four NuGet packages at **10.0.28000.2526** — `Microsoft.Windows.
+/// {WDK.x86, WDK.x64, SDK.CPP, SDK.CPP.x64}` — merged into the kit root, which
+/// yields a kit whose `Include`/`Lib` subdirectory shape is identical to the
+/// 26100 kit beside it. That completeness is the point: `TOOLCHAIN.md`'s
+/// standing *"keep only complete kits"* rule exists because a partial kit can be
+/// selected by MSBuild and then fail on a missing lib.
 const WDK_DDI_INCLUDE_DEFAULT: &str =
-    r"C:\Users\Rupansh\helios-vgpu\tmp\wdk-28000\Include\10.0.28000.0";
+    r"C:\Program Files (x86)\Windows Kits\10\Include\10.0.28000.0";
 
 /// The **platform** include root — `windows.h`, the CRT, and every SDK header
-/// the DDI graph reaches through that the staged WDK package does not ship.
+/// the DDI graph reaches through.
 ///
-/// ⚠ **The staged 28000 package is a WDK, not an SDK**: its `shared/` holds 11
-/// headers and its `um/` 44, so `d3dkmdt.h`, `d3dukmdt.h`, `d3dkmthk.h`,
-/// `dxmini.h`, `dxgiddi.h`, `winapifamily.h` and `windows.h` itself all resolve
-/// from here.
+/// ⭐ **Now the SAME kit as [`WDK_DDI_INCLUDE_DEFAULT`], and the split that used
+/// to exist here is retired with its reason recorded.** While the DDI headers
+/// came from a hand-staged *WDK* package this root had to be the installed
+/// *SDK*, because that package shipped 11 `shared/` and 27 `um/` headers and so
+/// could not resolve `d3dkmdt.h`, `d3dukmdt.h`, `d3dkmthk.h`, `dxmini.h`,
+/// `dxgiddi.h`, `winapifamily.h` or `windows.h`. Worse, putting its `shared/`
+/// on the include path ahead of the SDK's produced measured clang errors —
+/// `d3dkmddi.h` referencing `D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS`
+/// and `D3DDDI_UMS_PDD_SIZE`, which nothing in that package declared.
 ///
-/// ⛔ Include ORDER is what makes the mix a mix rather than a coin toss —
-/// [`generate_d3d12umddi_bindings`] lists `{28000}\um` first, so
-/// `d3d12umddi.h`, `d3d10umddi.h` and `d3dumddi.h` come from the newer package
-/// and **everything else, `shared/` included, falls through to this one**. The
-/// exclusion of the 28000 `shared/` is not an oversight; the measured clang
-/// errors that force it are quoted at the include list.
+/// The installed kit is complete, so both halves of that are gone. Measured on
+/// the VM, 2026-08-10, after the install:
+///
+/// ```text
+/// 28000 kit   um=1541 shared=255 km=224      (hand-staged tree: um=27 shared=11)
+/// D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS -> d3dkmddi.h, d3dkmthk.h, d3dukmdt.h
+/// D3DDDI_UMS_PDD_SIZE                             -> d3dkmddi.h, d3dkmthk.h, d3dukmdt.h
+/// ```
+///
+/// Both identifiers are now **declared**, by `shared\d3dukmdt.h`, and every
+/// header this crate reaches lives in the same subdirectory it lives in under
+/// 26100. ⇒ One kit, one include order, no mix.
+///
+/// ⚠ The two constants stay **separate** on purpose. They are the shape a future
+/// split would need, `HELIOS_WDK_INCLUDE` / `HELIOS_SDK_INCLUDE` still override
+/// them independently, and `require_core_0116` still fails the build if the DDI
+/// root turns out not to be a 0116 one — so pointing this at 26100 by accident
+/// is still caught rather than silently generating a 0110 binding.
 const SDK_PLATFORM_INCLUDE_DEFAULT: &str =
-    r"C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0";
+    r"C:\Program Files (x86)\Windows Kits\10\Include\10.0.28000.0";
 
 /// Symbols the generated bindings MUST contain for this crate to be able to
 /// serve Core 0116 — `HELIOS_PRESENT_SYNC_RETIREMENT.md` §18.1's first build
@@ -237,41 +266,36 @@ fn generate_d3d12umddi_bindings() {
             "x86_64-pc-windows-msvc".to_string(),
             // ⛔ THE 28000 DDI HEADERS FIRST. clang searches `-I` in order, so
             // this is what decides that `d3d12umddi.h` is the Core-0116 one and
-            // not the installed 26100 copy of the same file name.
+            // not the installed 26100 copy of the same file name. It still
+            // matters even though both roots now default to the same kit: an
+            // override that points `HELIOS_SDK_INCLUDE` at 26100 must not be
+            // able to win the name `d3d12umddi.h`.
             //
-            // ⛔⛔ **`um` ONLY — `shared` and `km` are deliberately NOT on the
-            // path, and this is MEASURED, not preference.** With
-            // `{wdk_inc}\shared` ahead of the SDK's, `d3d10umddi.h`'s
-            // `#include "d3dkmddi.h"` resolves to the 28000 KMD DDI header,
-            // which needs the 28000 `d3dukmdt.h` — and the staged package is a
-            // WDK, not an SDK, so that file is not in it. clang then reports,
-            // verbatim (2026-08-10, win11):
+            // ⭐ **The `shared`-exclusion argument that used to sit here is
+            // RETIRED, and it is retired by measurement, not by preference.**
+            // It read: `{wdk_inc}\shared` on the path makes `d3d10umddi.h`'s
+            // `#include "d3dkmddi.h"` resolve to the 28000 KMD DDI header, which
+            // needs a 28000 `d3dukmdt.h` the hand-staged WDK package did not
+            // ship, so clang reported `unknown type name
+            // 'D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS'` and `use of
+            // undeclared identifier 'D3DDDI_UMS_PDD_SIZE'`.
             //
-            // ```text
-            // ...\28000\shared\d3dkmddi.h:1689:5: error: unknown type name
-            //     'D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS'
-            // ...\28000\shared\d3dkmddi.h:1693:71: error: use of undeclared
-            //     identifier 'D3DDDI_UMS_PDD_SIZE'
-            // ...\28000\shared\d3dkmddi.h:10517:29: (same)
-            // ...\28000\shared\d3dkmddi.h:10584:28: (same)
-            // ```
+            // That was a property of the *package*, not of the headers. With kit
+            // 28000 INSTALLED (owner decision, 2026-08-10 — see
+            // [`WDK_DDI_INCLUDE_DEFAULT`] and `TOOLCHAIN.md`) `shared/` holds 255
+            // headers instead of 11, both identifiers are declared by
+            // `shared\d3dukmdt.h`, and every header this crate reaches lives in
+            // the same subdirectory it lives in under 26100. So `{sdk_inc}\shared`
+            // below IS the 28000 `shared`, deliberately, and `d3dkmddi.h` now
+            // resolves against its own generation rather than 26100's.
             //
-            // A grep of the whole staged tree finds both identifiers in exactly
-            // one file — the header that *uses* them — so nothing in the package
-            // declares them.
-            //
-            // ⭐ Excluding `shared` is not a fallback and costs this crate
-            // nothing, because the boundary is clean: `d3dkmddi.h` is the
-            // **KMD** DDI (it is `kmd_render`'s input, not this crate's), while
-            // every D3D12 UMD type comes from `{wdk_inc}\um\d3d12umddi.h` and
-            // the `D3DDDI_DEVICECALLBACKS` kernel table from
-            // `{wdk_inc}\um\d3dumddi.h`. The two 0116 KMT objects
-            // (`D3DKMT_CREATENATIVEFENCE`, `D3DKMT_OPENNATIVEFENCEFROMNTHANDLE`)
-            // are **forward-declared opaque** inside `d3d12umddi.h` itself
-            // (`typedef struct _D3DKMT_CREATENATIVEFENCE D3DKMT_CREATENATIVEFENCE;`)
-            // and defined by the SDK's `d3dkmthk.h`, which 26100 already
-            // carries. `require_core_0116` asserts all four are present, so the
-            // exclusion cannot silently lose them.
+            // ⚠ Still not on the path: `km\`. That is `kmd_render`'s input, not
+            // this crate's, and nothing in the D3D12 UMD DDI graph includes it.
+            // The two 0116 KMT objects (`D3DKMT_CREATENATIVEFENCE`,
+            // `D3DKMT_OPENNATIVEFENCEFROMNTHANDLE`) are forward-declared opaque
+            // inside `d3d12umddi.h` itself and defined by `shared\d3dkmthk.h`.
+            // `require_core_0116` asserts all four names are present, so no
+            // include-path change can silently lose them.
             format!(r"-I{wdk_inc}\um"),
             // Then the platform: the CRT/STL, then the SDK's own um/shared for
             // `windows.h`, `d3dkmthk.h`, `d3dkmdt.h`, `dxmini.h`, `dxgiddi.h`.

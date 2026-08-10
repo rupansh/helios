@@ -160,10 +160,12 @@ This is where you compile and test the KMD and ICD.
 A Windows 11 dev VM named `win11` is reachable via `ssh win` (preconfigured). It was **not** fully provisioned out of the box — only Rust (stable) was present; everything else below had to be installed. The actually-required, verified toolchain:
 
 - **VS 2022 Build Tools** — "Desktop development with C++" (MSVC v143 + Spectre-mitigated x64 libs).
-- **WDK** — kit **10.0.26100.0**. Must be a *complete* kit (SDK **and** WDK at the same version): `wdk-build` picks the **highest** installed kit with **no override**, so an incomplete higher kit (e.g. a winget WDK with no matching SDK → missing `specstrings.h`) breaks the build. Keep only complete kits.
+- **WDK** — kits **10.0.26100.0** *and* **10.0.28000.0**, both complete. ⭐ Since 2026-08-10 the VM has 28000 installed and **that is the one `wdk-build` selects**, because it picks the **highest** installed kit with **no override**. Both must be *complete* kits (SDK **and** WDK at the same version): an incomplete higher kit (e.g. a winget WDK with no matching SDK → missing `specstrings.h`) breaks the build. **Keep only complete kits** — that rule is why 28000 was installed from four NuGet packages rather than headers alone; see §2.1. Verified after the switch: `kmd_render` checks at the same 22-warning baseline.
 - **LLVM 22.1.8** at `C:\Program Files\LLVM\bin`; `LIBCLANG_PATH` points there for bindgen and it is also the `clang-cl` that builds vkd3d, the DXVK bridge and the umd12 bridge. ⚠ **One LLVM for both** — bindgen parsing headers with one clang while `clang-cl` compiles them with another is the drift class this tree keeps getting bitten by.
   - ⭐ **Upgraded 17.0.6 → 22.1.8 on 2026-08-10, and it is a floor, not a preference.** VS 18 landed MSVC 14.51, whose `<yvals_core.h>` hard-asserts *"Unexpected compiler version, expected Clang 20 or newer"*; VS 2022's 14.44 asserts Clang 19+. Clang 17 satisfies neither, and no `-D` can suppress it — 14.51's `__msvc_doom_core.hpp` also assumes `defined(__clang__)` implies `__builtin_verbose_trap`, a Clang 19 builtin, so the build fails on a missing builtin rather than on the assert.
-  - ⇒ **If a future MSVC raises the bar again, RAISE CLANG.** Do not reintroduce `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`; it was deleted from all three sites that carried it, each of which recorded it as "a runtime-risk acknowledgement, not a fix".
+  - ⇒ **If a future MSVC raises the bar again, RAISE CLANG.** Do not reintroduce `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`; it was deleted from all **four** sites that carried it, each of which recorded it as "a runtime-risk acknowledgement, not a fix": `umd/build.rs`, `umd12/build.rs`, `tools/win-mcp/src/main.rs` (`win_vkd3d`'s meson setup) and `ci/windows/Build-Driver.ps1` (the DXVK meson setup). ⚠ *This bullet said "three" until 2026-08-10, and the fourth was the one that mattered* — the CI copy survived the first pass because the round that deleted the other three touched no file under `ci/` or `.github/`. A `grep -r` still finds a **fifth** mention, `icd/win-build/clang-cl-native.ini`, and that one is prose, not a define: it is the comment header of a deliberately non-preferred alternative toolchain for the Mesa ICD (mingw is the preferred one, and CI's `mesa` job uses msys2/mingw), and it already names its own exit — *"retire it … by moving to LLVM>=19"*, which is what happened. Nothing builds with it; it is stale text in a file this section does not own.
+  - ⛔ **The floor is expressed at TWO sites, and this is the second-site rule the KMD version already lives under.** The argument is here; the value CI builds with is `LLVM_VERSION` in `.github/workflows/windows-stack.yml`. The tree keeps the KMD version at exactly one site (`kmd_render/driver-version.env`) because an INF and a FILEVERSION that disagree produce `FAILED_ADD 0xc0000182`; a clang floor and a CI pin that disagree produce `error STL1000` in the DXVK bridge compile, at a step that used to pass. **Change this section and that variable in the same edit.** (Nothing enforces it mechanically — that would need a gate that parses the workflow, which does not exist.)
+    - ⚠ **CI cannot ask the action for 22.1.8 by version.** `KyleMayes/install-llvm-action` resolves versions from a table baked into its bundle; verified 2026-08-10 at the pinned commit `ebc04262` **and** at the action's `master` that the newest `win32`/`x64` entry in both is `21.1.8`, so an unlisted version throws `Unsupported version for platform`. The workflow therefore passes the action's own `force-url` input, deriving the URL from `LLVM_VERSION` so the version still has one site. Verified the same day: the `llvmorg-22.1.8` release exists and ships `LLVM-22.1.8-win64.exe`, the exact asset name the action's own URL template produces. **Not verified: that the job runs green** — the workflow triggers only on push/PR to `wddm` and the retirement work is on `wddm-dx12`, so it has never fired against this changeset, and the `driver` job has an independent break documented in §2.1's WDK 28000 note.
 - **Rust nightly + `rust-src`** (for `no_std` build-std), target `x86_64-pc-windows-msvc`.
 - **cargo-make** — `cargo install --locked cargo-make`.
 - **coreutils** are installed (Unix tools like `ls`/`cp`/`grep` work in `win_exec`).
@@ -201,6 +203,214 @@ https://learn.microsoft.com/en-us/windows-hardware/drivers/download-the-wdk
 Install the WDK matching your VS 2022. The WDK installs as a VS extension.
 
 Verify: Open VS → Extensions → should show "Windows Driver Kit".
+
+#### ⭐ Windows Kit **10.0.28000.0** — INSTALLED on the VM (owner decision, 2026-08-10)
+
+**Helios targets kit 28000, not 26100.** The kit is installed on `win11` as a
+complete kit beside 26100, so nothing in the build depends on a hand-staged tree
+in the repository any more.
+
+> **Why this changed.** Round 3 of the Phase-2 review found that
+> `umd12/build.rs` `require_path`'d a `.gitignore`d directory
+> (`tmp/wdk-28000/`) and `require_core_0116()` **panicked** without it, so
+> `helios_umd12.dll` could be built on exactly one computer; the same untracked
+> tree also silently decided whether `tools/retirement-gates.sh` ran its
+> slot-audit gate or skipped it, which is why that suite reported 8 PASS on one
+> checkout and 7 PASS + 1 SKIP on another **at the same commit**. Owner
+> decision: install it properly instead.
+
+**What is installed**, and it is a *complete* kit — which matters, because the
+rule two sections up ("keep only complete kits") exists precisely because
+`wdk-build` picks the **highest** installed kit with no override, and a partial
+higher kit breaks the build:
+
+```
+C:\Program Files (x86)\Windows Kits\10\
+  Include\10.0.28000.0\{um, shared, km, ucrt, winrt, cppwinrt}
+  Lib\10.0.28000.0\{um\x64, km\x64, ucrt\x64, ucrt_enclave\x64}
+  bin\10.0.28000.0\{x64, x86, ...}   build\  CrossCertificates\  tools\
+```
+
+Measured after the install: `Include` and `Lib` have **exactly the same
+subdirectory shape** as the 26100 kit beside them, and `um=1541 shared=255
+km=224` headers (the old hand-staged tree had `um=27 shared=11`).
+
+**Installing it** — four NuGet packages, all at **10.0.28000.2526**, merged into
+the kit root. Run on the VM (it has `tar.exe` and needs admin):
+
+```powershell
+$ver = '10.0.28000.2526'
+foreach ($p in 'Microsoft.Windows.WDK.x86','Microsoft.Windows.WDK.x64',
+               'Microsoft.Windows.SDK.CPP','Microsoft.Windows.SDK.CPP.x64') {
+  Invoke-WebRequest "https://api.nuget.org/v3-flatcontainer/$($p.ToLower())/$ver/$($p.ToLower()).$ver.nupkg" `
+    -OutFile "$stage\$p.$ver.nupkg" -UseBasicParsing
+}
+# version-scoped paths ONLY -- never Include\wdf, Lib\wdf, Catalogs\ or the
+# legacy bin\10.0.1xxxx dirs: those are SHARED with the 26100 kit.
+#   from WDK.x86 / WDK.x64 / SDK.CPP:  c/{Include,Lib,bin,build,CrossCertificates,tools}/10.0.28000.0
+#   from SDK.CPP.x64 (different layout): c/{ucrt,ucrt_enclave,um}  ->  Lib\10.0.28000.0\{...}
+```
+
+SHA-256, verified at install:
+
+| package | sha256 |
+|---|---|
+| `Microsoft.Windows.WDK.x86` | `3432999540db204315247f8f904feebfd4a217af5529e3beea59884478f0daef` |
+| `Microsoft.Windows.WDK.x64` | `63c939fb5a79295bf40e941db592681272219b04edff095fe2f3d123e5579a90` |
+| `Microsoft.Windows.SDK.CPP` | `be1b419491607eae6f7c57844ebab39face9643c51e2af1d9176a3ba0d0b23fc` |
+| `Microsoft.Windows.SDK.CPP.x64` | `a9cae2a8c5da7f5dc5838ae6a76d06d0d2e2fdc3d8cfc69ca6c184e4b9193a00` |
+
+⭐ The first hash is the one `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` §1 already
+pinned for the hand-staged tree, so the installed kit is **provably the same
+package** the earlier measurements were taken with. Independently confirmed:
+`km\dispmprt.h`, `um\d3d12umddi.h` and `shared\d3dkmddi.h` hash **identical**
+between the installed kit and `tmp/wdk-28000/`.
+
+**What the install changed in the build**
+
+| Before | After |
+|---|---|
+| `umd12/build.rs` `WDK_DDI_INCLUDE_DEFAULT` → `tmp\wdk-28000\...` | → the installed kit |
+| `SDK_PLATFORM_INCLUDE_DEFAULT` → the **26100** kit, because the staged package was a WDK with 11 `shared/` headers | → the **same 28000** kit; the split is retired |
+| 28000 `shared/` kept OFF the include path (measured clang errors: `D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS`, `D3DDDI_UMS_PDD_SIZE` undeclared) | on the path; both identifiers are declared by `shared\d3dukmdt.h` |
+| `kmd_render/build.rs` hardcoded the staged `dispmprt.h` and never passed it to the generator | resolves `HELIOS_WDK_KM_INCLUDE` → installed kit → staged tree, and **passes `--header`** |
+
+⚠ **The bindings changed, and the change was inspected rather than assumed.**
+Moving `shared/` from 26100 to 28000 grew `umd12/bindgen/cached/d3d12umddi.rs`
+from 6,485,166 to 6,573,255 bytes: **65 top-level items added, 3 removed**. The
+additions are 28000-era kernel types (`D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION`,
+`D3DDDI_SEGMENTPREFERENCE2`, `D3DDDI_NATIVEFENCELOGDETAIL`, `D3DDDI_DOORBELLMAPPING`,
+12 new `DXGK_FEATURE_ID` values); the 3 removals are anonymous `__bindgen_ty_N`
+renumbering inside `_D3DKMT_VIDMM_ESCAPE`, whose union grew. All five
+`require_core_0116` symbols are present in the new generation.
+
+**Verified green after the install** (2026-08-10): `kmd_render` `cargo check`
+exit 0 at **22 warnings — the pre-change baseline count** (with `wdk-sys`
+force-cleaned first, 151.6 MiB removed, so the regeneration was real and not a
+cached green); `umd12` release build exit 0; `umd` release build exit 0; all 8
+Linux gates PASS.
+
+**Why 28000 and not 26100** — `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` §1:
+26100's `d3d12umddi.h` ends at Core build `0110`, so it contains no
+`D3D12DDI_DEVICE_FUNCS_CORE_0116`, no `PFND3D12DDI_CREATEFENCE_0116`, no
+`pfnOpenNativeFenceCb` and no `D3D12DDICAPS_TYPE_0112_NATIVE_FENCE_SUPPORT`.
+⚠ This is a **header** requirement only — F1 measured Core 0116 negotiating on
+the installed *runtime* build 26100.8875, so 28000 is **not** a runtime or
+package minimum and must not be written into one.
+
+#### ⭐ `km/dispmprt.h` is VENDORED — the Linux gate has tracked ground truth
+
+The install above is on the **VM**. `tools/retirement-gates.sh` runs on the
+**Linux host**, where no Windows kit exists, and its slot-audit staleness gate
+used to read `tmp/wdk-28000/…/km/dispmprt.h` — a `.gitignore`d path, so the gate
+**skipped in every fresh clone, worktree and CI runner** while the suite printed
+"ALL … PASS".
+
+That is closed, not merely reported: the generator's single input is checked in
+at **`kmd_render/tools/wdk-28000/km/dispmprt.h`** (167 KB; package, both
+SHA-256s and the re-extraction command are in that directory's `README.md`), the
+generator's `DEFAULT_HEADER` points at it, and the gate's `if [ -f … ]` wrapper
+is **deleted**. The generator resolves no `#include`, which is why one file
+suffices.
+
+Verified the way that matters — the whole `tmp/` directory moved aside, i.e. a
+fresh clone: **all 8 gates PASS, exit 0, with the slot-audit gate RUNNING**
+(`WDDM 3.2 slot audit is not stale vs its generator — up to date`) rather than
+skipping. Regenerating against the vendored copy changed exactly the recorded
+`AUDITED_HEADER` path — **zero** `SlotClass` changes, still 192 slots and 1544
+bytes — which was checked before the regeneration was accepted, because
+`FINDINGS.md` F6 records what happens when it is not.
+
+⚠ Still outstanding, and deliberately deferred: **CI installs only 26100** —
+`ci/windows/Install-WindowsDriverKit.ps1` installs
+`Microsoft.WindowsSDK.10.0.26100` + `Microsoft.WindowsWDK.10.0.26100`, and
+`Build-Driver.ps1` derives `HELIOS_WDK_INCLUDE` from `Find-WindowsKitInclude`,
+which returns the highest **installed** kit. The fix is to install kit 28000 on
+the runner exactly as §2.1 installs it on the VM. Per the owner's sequencing, CI
+is updated at the **end** of the retirement, not per-change.
+
+#### The staged `tmp/wdk-28000/` tree — now optional
+
+Nothing requires it any more: the VM builds from the installed kit and the Linux
+gate reads the vendored header. It remains a convenient way to get the other
+28000 headers on a Linux host (e.g. to read `d3d12umddi.h` without the VM), and
+the recipe below still works.
+
+**Staging it on Linux** (headers only — this is the gate's input, not a build
+input):
+
+**Staging it** (run on the Linux host). ⚠ This used to be load-bearing for the
+VM build too, because `tmp/` is inside `win_cargo`'s and `win_build_kmd`'s
+robocopy mirror and so arrived at `C:\Users\Rupansh\helios-vgpu\tmp\wdk-28000`
+for free. **That is no longer how the VM resolves its headers** — it uses the
+installed kit — so this recipe now serves the Linux gate alone:
+
+```bash
+# Package: Microsoft.Windows.WDK.x86 10.0.28000.2526
+#   https://www.nuget.org/packages/Microsoft.Windows.WDK.x86/10.0.28000.2526
+curl -sSL -o /tmp/wdk28000.nupkg \
+  https://www.nuget.org/api/v2/package/Microsoft.Windows.WDK.x86/10.0.28000.2526
+sha256sum /tmp/wdk28000.nupkg
+# MUST be 3432999540db204315247f8f904feebfd4a217af5529e3beea59884478f0daef
+# (the hash HELIOS_PRESENT_SYNC_RETIREMENT.md §1 records; re-verified 2026-08-10
+#  by downloading the package and hashing it, and the two staged headers below
+#  are byte-identical to the ones inside it)
+mkdir -p tmp/wdk-28000
+bsdtar -xf /tmp/wdk28000.nupkg -C tmp/wdk-28000 --strip-components=1 'c/Include/*'
+```
+The package's `c/Include/` becomes `tmp/wdk-28000/Include/`. Correct result:
+`Include/10.0.28000.0/{um,shared,km}` with **44 / 11 / 247** headers plus
+`Include/wdf`, ≈40 MB — the 44 and 11 are the counts `umd12/build.rs` cites when
+it explains why `HELIOS_SDK_INCLUDE` is a *separate* root (the package is a WDK,
+not an SDK, so `windows.h`, `d3dkmdt.h`, `d3dukmdt.h`, `d3dkmthk.h`, `dxmini.h`,
+`dxgiddi.h` and `winapifamily.h` resolve from the installed
+`Windows Kits\10\Include\10.0.26100.0` instead — that split is
+`HELIOS_SDK_INCLUDE`, and the 28000 `um` must come **first** on the include line
+or `d3d12umddi.h` silently resolves to the 26100 copy of the same file name).
+⭐ This recipe was run end-to-end on 2026-08-10 into a scratch directory and
+`diff -rq`'d against the tree already staged here: no differences. Two spot
+checks worth more than the file counts:
+
+```bash
+grep -c D3D12DDI_DEVICE_FUNCS_CORE_0116 \
+  tmp/wdk-28000/Include/10.0.28000.0/um/d3d12umddi.h      # 2, not 0
+ls tmp/wdk-28000/Include/10.0.28000.0/km/dispmprt.h       # the slot audit's input
+```
+
+**Why the Linux copy stays `.gitignore`d and untracked, by decision.**
+`.gitignore` excludes `/tmp/`; `git ls-files tmp/` is empty. ⚠ *No prior
+document argues this* — `FINDINGS.md` F1 records the fact ("gitignored") and
+stops — so what follows is the argument, written here so it can be attacked
+rather than inherited: the package is 40 MB of Microsoft-redistributed headers
+under Microsoft's licence, and a pinned SHA-256 makes a local copy verifiable
+without vendoring it, the same trade the DXVK/vkd3d/Mesa engines take as
+submodules rather than copies. Vendoring would put a licence question and a
+40 MB blob into every clone to save one `curl`. If that trade ever stops paying,
+reversing it is one commit — and the cheaper reversal is now checking in the
+single ~167 KB `dispmprt.h` the gate actually reads, or a derived manifest.
+
+⭐ **What this decision no longer costs.** It used to be argued here that its
+price was *"CI cannot build `helios_umd12.dll` today"*. That is now the wrong
+attribution: since the VM has kit 28000 **installed**, the untracked tree is not
+a build input at all — it is a Linux-gate input. What CI still cannot do it
+cannot do for its own reasons, which are unchanged and outstanding:
+`ci/windows/Install-WindowsDriverKit.ps1` installs
+`Microsoft.WindowsSDK.10.0.26100` + `Microsoft.WindowsWDK.10.0.26100` and never
+28000, and `Build-Driver.ps1` derives `HELIOS_WDK_INCLUDE` from
+`Find-WindowsKitInclude`, which returns the highest **installed** kit — so on a
+runner that would still be 26100 and `require_core_0116` would panic. (Nor is
+that the job's only gap: `Build-Driver.ps1` also never sets `HELIOS_VKD3D_BUILD`,
+which `umd12/build.rs` `require_path`s.) ⇒ The CI fix is to install kit 28000 on
+the runner exactly as §2.1 installs it on the VM. Per the owner's sequencing,
+that lands at the **end** of the retirement, not per-change.
+
+**What silently degrades without it.** `tools/retirement-gates.sh` guards its
+slot-audit gate on the presence of `.../km/dispmprt.h`; absent the tree it prints
+a `SKIP` line and keeps going, so the same commit reports a different gate result
+on a machine with the tree than in a fresh worktree. ⚠ That script owns the
+wording of its own SKIP and what the run's summary says about it — read it there,
+do not infer it from here (a verbatim quote in this file would be a copy that can
+go stale on somebody else's edit).
 
 #### LLVM 22.1.8 (minimum 20 — MSVC 14.51's STL asserts it)
 The silent NSIS installer upgrades the existing `C:\Program Files\LLVM` in place,
@@ -483,9 +693,12 @@ unsafe { KdPrint!("Helios: adapter started\n\0"); }
 | QEMU | 9.2.0 | Latest | Venus upstreamed in 9.2 |
 | virglrenderer | 1.1.0 | Latest | Build from source with -Dvenus=true |
 | Mesa (Linux guest test) | 24.2 | Latest | Venus ICD |
-| WDK | 10.0.26100.0 | 10.0.26100.0 | For KMDF/WDF (KMDF 1.33) |
+| WDK/SDK kit 26100 (installed) | 10.0.26100.0 | 10.0.26100.0 | Kept for KMDF/WDF (KMDF 1.33). No longer the DDI or platform include root. |
+| ⭐ WDK/SDK kit **28000** (installed) | 10.0.28000.2526 | 10.0.28000.2526 | **The kit Helios targets**, and the one `wdk-build` selects. Required for `helios_umd12.dll`: 26100's `d3d12umddi.h` ends at Core 0110. Installed from four NuGet packages as a *complete* kit; see §2.1 for the recipe and the four SHA-256s. ⚠ Headers only in the sense that matters: NOT a runtime or package minimum (FINDINGS F1). |
+| ⭐ `kmd_render/tools/wdk-28000/km/dispmprt.h` (**vendored**) | 10.0.28000.2526 | 10.0.28000.2526 | The slot-audit generator's only input, checked in so `tools/retirement-gates.sh` has tracked ground truth on the Linux host. See that directory's README. |
+| `tmp/wdk-28000/` (staged, untracked) | 10.0.28000.2526 | 10.0.28000.2526 | **Optional now.** Convenience copy of the other 28000 headers on Linux; nothing builds or gates on it. |
 | VS | 2022 | 2022 | Earlier versions may work |
-| LLVM | 22.1.8 | 22.1.8 | **Minimum 20** — MSVC 14.51's STL asserts it. One LLVM for bindgen AND clang-cl. |
+| LLVM | 22.1.8 | 22.1.8 | **Minimum 20** — MSVC 14.51's STL asserts it. One LLVM for bindgen AND clang-cl. ⚠ Second site: `LLVM_VERSION` in `.github/workflows/windows-stack.yml` — change both together (§2.0). |
 | Rust | nightly-2024-11+ | Latest nightly | 2024 edition |
 | windows-drivers-rs | 0.4.x / 0.5.x | Latest | wdk = 0.4, wdk-sys = 0.5 |
 
@@ -516,7 +729,16 @@ The MSVC STL is newer than clang. Look one error further up for the real gate,
 builtin is a Clang 19 addition that 14.51's `__msvc_doom_core.hpp` reaches for
 whenever `__clang__` is defined. **Raise clang to N; do not define the builtin
 and do not add `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH`** (it cannot suppress
-a missing builtin anyway).
+a missing builtin anyway). If this fires **in CI and not locally**, the clang
+floor has gone stale at its second site: `LLVM_VERSION` in
+`.github/workflows/windows-stack.yml` (§2.0).
+
+### `helios_umd12: the generated d3d12umddi bindings do not expose Core 0116`
+`umd12/build.rs`'s `require_core_0116` panicked: the DDI headers came from the
+installed WDK 26100, whose `d3d12umddi.h` ends at Core build 0110. Stage the WDK
+28000 headers per §2.1 — and note the panic is *deliberately* louder than the
+alternative, because a 26100 generation succeeds in bindgen and would otherwise
+surface only as a runtime version mismatch on the guest.
 
 ### vkd3d C fails with `incompatible pointer types passing 'LONG *' ... 'uint32_t *'`
 Clang 19+ promotes this to an error in C, and upstream vkd3d relies on the

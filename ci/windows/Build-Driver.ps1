@@ -34,8 +34,32 @@ if (Test-Path -LiteralPath $dxvkBuild) {
     Remove-Item -LiteralPath $dxvkBuild -Recurse -Force
 }
 
+# ⭐ `/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` WAS HERE AND IS GONE
+# (2026-08-10), for the same reason it left umd/build.rs, umd12/build.rs and
+# win-mcp's win_vkd3d in the same changeset: its only effect is to suppress the
+# MSVC STL's own `error STL1000: Unexpected compiler version, expected Clang N
+# or newer`, and every site that carried it recorded it as "a runtime-risk
+# acknowledgement, not a fix". The fix is the compiler — LLVM_VERSION in
+# .github/workflows/windows-stack.yml is 22.1.8, which clears both toolsets'
+# floors (14.44 wants 19+, 14.51 wants 20+).
+#
+# ⛔ It had to go WITH that version bump, not after it. Keeping it would have
+# left one job, one runner and one clang-cl stating opposite toolchain
+# assumptions: this meson configure would say "the STL and the compiler may
+# disagree" while the umd/build.rs that this same script later drives (through
+# $env:HELIOS_CLANG_CL, via the `cargo make` below) says the opposite by having
+# deleted the define. `umd` is the FIRST crate Cargo.make.toml's UMD loop
+# builds, so that clang-cl bridge compile is where a stale floor surfaces.
+#
+# ⚠ Bound, stated because it cannot be closed from here: this DXVK configure has
+# NOT been run under clang 22 — the workflow triggers only on push/PR to `wddm`
+# and the retirement branch is `wddm-dx12`. The argument is narrow and holds
+# without a run: removing a `-D` whose sole job is to gate an `#error` can only
+# change the build by letting that `#error` fire, and clang 22 does not trip it.
+# The nearest empirical support is vkd3d, rebuilt on the VM with an empty
+# `-Dcpp_args=` for 215/215 clean targets; DXVK itself was not rebuilt.
+# ⇒ If a future MSVC raises the bar again, RAISE CLANG. Do not restore this.
 $dxvkCppArgs = @(
-    "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
     "-Wno-deprecated-declarations"
     "-Wno-delete-non-abstract-non-virtual-dtor"
     "-Wno-unused-private-field"

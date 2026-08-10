@@ -4,7 +4,7 @@ GENERATED — do not edit by hand. Regenerate with
 `python3 kmd_render/tools/gen_wddm32_slot_audit.py`; edit the
 classification in `kmd_render/tools/wddm32_slot_classes.tsv`.
 
-Audited header: `tmp/wdk-28000/Include/10.0.28000.0/km/dispmprt.h`
+Audited header: `kmd_render/tools/wdk-28000/km/dispmprt.h`
 
 Slots: **192** (plus `Version`), struct size **1544** bytes.
 

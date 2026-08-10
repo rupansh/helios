@@ -25,7 +25,8 @@ display lane's brief section 6 item 2.
 
 Inputs
 ------
-  --header   a WDK ``km/dispmprt.h``.  Default: the staged 28000 headers.
+  --header   a WDK ``km/dispmprt.h``.  Default: the vendored copy at
+             ``kmd_render/tools/wdk-28000/km/dispmprt.h`` (see its README).
   --classes  the checked-in classification TSV (one row per slot).
 
 Outputs
@@ -59,8 +60,19 @@ import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# ⭐ The VENDORED header, checked in beside this generator (2026-08-10).
+#
+# It used to default to `tmp/wdk-28000/Include/10.0.28000.0/km/dispmprt.h`,
+# which `.gitignore` excludes — so `tools/retirement-gates.sh`'s staleness gate
+# SKIPPED in any fresh clone while the suite still printed "ALL ... PASS", and
+# the same commit produced a different gate result on two checkouts. Round 3 of
+# the Phase-2 review demonstrated that with an intentionally stale audit file.
+#
+# `kmd_render/tools/wdk-28000/README.md` records the package, both SHA-256s and
+# the re-extraction command. This generator resolves no `#include`, which is why
+# one vendored file is sufficient input.
 DEFAULT_HEADER = os.path.join(
-    REPO, "tmp", "wdk-28000", "Include", "10.0.28000.0", "km", "dispmprt.h"
+    REPO, "kmd_render", "tools", "wdk-28000", "km", "dispmprt.h"
 )
 DEFAULT_CLASSES = os.path.join(REPO, "kmd_render", "tools", "wddm32_slot_classes.tsv")
 DEFAULT_RS = os.path.join(REPO, "kmd_render", "src", "ddi", "wddm32_slot_audit.rs")

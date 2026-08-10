@@ -818,6 +818,7 @@ pub type UINT8 = ::std::os::raw::c_uchar;
 pub type UINT16 = ::std::os::raw::c_ushort;
 pub type UINT32 = ::std::os::raw::c_uint;
 pub type UINT64 = ::std::os::raw::c_ulonglong;
+pub type INT_PTR = ::std::os::raw::c_longlong;
 pub type UINT_PTR = ::std::os::raw::c_ulonglong;
 pub type ULONG_PTR = ::std::os::raw::c_ulonglong;
 pub type SIZE_T = ULONG_PTR;
@@ -928,6 +929,7 @@ const _: () = {
     ["Offset of field: _GUID::Data4"][::std::mem::offset_of!(_GUID, Data4) - 8usize];
 };
 pub type GUID = _GUID;
+pub type FARPROC = ::std::option::Option<unsafe extern "C" fn() -> INT_PTR>;
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct HWND__ {
@@ -1402,14 +1404,47 @@ impl _DXGK_PTE__bindgen_ty_1__bindgen_ty_1 {
         }
     }
     #[inline]
+    pub fn BlockAccessMode(&self) -> ULONGLONG {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(20usize, 2u8) as u64) }
+    }
+    #[inline]
+    pub fn set_BlockAccessMode(&mut self, val: ULONGLONG) {
+        unsafe {
+            let val: u64 = ::std::mem::transmute(val);
+            self._bitfield_1.set(20usize, 2u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn BlockAccessMode_raw(this: *const Self) -> ULONGLONG {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 8usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                20usize,
+                2u8,
+            ) as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_BlockAccessMode_raw(this: *mut Self, val: ULONGLONG) {
+        unsafe {
+            let val: u64 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 8usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                20usize,
+                2u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
     pub fn Reserved(&self) -> ULONGLONG {
-        unsafe { ::std::mem::transmute(self._bitfield_1.get(20usize, 44u8) as u64) }
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(22usize, 42u8) as u64) }
     }
     #[inline]
     pub fn set_Reserved(&mut self, val: ULONGLONG) {
         unsafe {
             let val: u64 = ::std::mem::transmute(val);
-            self._bitfield_1.set(20usize, 44u8, val as u64)
+            self._bitfield_1.set(22usize, 42u8, val as u64)
         }
     }
     #[inline]
@@ -1417,8 +1452,8 @@ impl _DXGK_PTE__bindgen_ty_1__bindgen_ty_1 {
         unsafe {
             ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 8usize]>>::raw_get(
                 ::std::ptr::addr_of!((*this)._bitfield_1),
-                20usize,
-                44u8,
+                22usize,
+                42u8,
             ) as u64)
         }
     }
@@ -1428,8 +1463,8 @@ impl _DXGK_PTE__bindgen_ty_1__bindgen_ty_1 {
             let val: u64 = ::std::mem::transmute(val);
             <__BindgenBitfieldUnit<[u8; 8usize]>>::raw_set(
                 ::std::ptr::addr_of_mut!((*this)._bitfield_1),
-                20usize,
-                44u8,
+                22usize,
+                42u8,
                 val as u64,
             )
         }
@@ -1446,6 +1481,7 @@ impl _DXGK_PTE__bindgen_ty_1__bindgen_ty_1 {
         PhysicalAdapterIndex: ULONGLONG,
         PageTablePageSize: ULONGLONG,
         SystemReserved0: ULONGLONG,
+        BlockAccessMode: ULONGLONG,
         Reserved: ULONGLONG,
     ) -> __BindgenBitfieldUnit<[u8; 8usize]> {
         let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 8usize]> = Default::default();
@@ -1489,7 +1525,11 @@ impl _DXGK_PTE__bindgen_ty_1__bindgen_ty_1 {
             let SystemReserved0: u64 = unsafe { ::std::mem::transmute(SystemReserved0) };
             SystemReserved0 as u64
         });
-        __bindgen_bitfield_unit.set(20usize, 44u8, {
+        __bindgen_bitfield_unit.set(20usize, 2u8, {
+            let BlockAccessMode: u64 = unsafe { ::std::mem::transmute(BlockAccessMode) };
+            BlockAccessMode as u64
+        });
+        __bindgen_bitfield_unit.set(22usize, 42u8, {
             let Reserved: u64 = unsafe { ::std::mem::transmute(Reserved) };
             Reserved as u64
         });
@@ -5197,6 +5237,682 @@ impl Default for _D3DDDI_SEGMENTPREFERENCE {
     }
 }
 pub type D3DDDI_SEGMENTPREFERENCE = _D3DDDI_SEGMENTPREFERENCE;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct _D3DDDI_SEGMENTPREFERENCE2 {
+    pub __bindgen_anon_1: _D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union _D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1 {
+    pub __bindgen_anon_1: _D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1__bindgen_ty_1,
+    pub Value: UINT,
+}
+#[repr(C)]
+#[repr(align(4))]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct _D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1__bindgen_ty_1 {
+    pub _bitfield_align_1: [u8; 0],
+    pub _bitfield_1: __BindgenBitfieldUnit<[u8; 4usize]>,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1__bindgen_ty_1"]
+        [::std::mem::size_of::<_D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1__bindgen_ty_1>() - 4usize];
+    ["Alignment of _D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1__bindgen_ty_1"]
+        [::std::mem::align_of::<_D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1__bindgen_ty_1>() - 4usize];
+};
+impl _D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1__bindgen_ty_1 {
+    #[inline]
+    pub fn SegmentId0(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(0usize, 4u8) as u32) }
+    }
+    #[inline]
+    pub fn set_SegmentId0(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(0usize, 4u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn SegmentId0_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                0usize,
+                4u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_SegmentId0_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                0usize,
+                4u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn PagePreference0(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(4usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_PagePreference0(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(4usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn PagePreference0_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                4usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_PagePreference0_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                4usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn Direction0(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(5usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_Direction0(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(5usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn Direction0_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                5usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_Direction0_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                5usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn SegmentId1(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(6usize, 4u8) as u32) }
+    }
+    #[inline]
+    pub fn set_SegmentId1(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(6usize, 4u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn SegmentId1_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                6usize,
+                4u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_SegmentId1_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                6usize,
+                4u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn PagePreference1(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(10usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_PagePreference1(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(10usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn PagePreference1_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                10usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_PagePreference1_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                10usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn Direction1(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(11usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_Direction1(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(11usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn Direction1_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                11usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_Direction1_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                11usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn SegmentId2(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(12usize, 4u8) as u32) }
+    }
+    #[inline]
+    pub fn set_SegmentId2(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(12usize, 4u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn SegmentId2_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                12usize,
+                4u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_SegmentId2_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                12usize,
+                4u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn PagePreference2(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(16usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_PagePreference2(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(16usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn PagePreference2_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                16usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_PagePreference2_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                16usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn Direction2(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(17usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_Direction2(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(17usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn Direction2_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                17usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_Direction2_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                17usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn SegmentId3(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(18usize, 4u8) as u32) }
+    }
+    #[inline]
+    pub fn set_SegmentId3(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(18usize, 4u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn SegmentId3_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                18usize,
+                4u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_SegmentId3_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                18usize,
+                4u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn PagePreference3(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(22usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_PagePreference3(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(22usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn PagePreference3_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                22usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_PagePreference3_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                22usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn Direction3(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(23usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_Direction3(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(23usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn Direction3_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                23usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_Direction3_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                23usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn SegmentId4(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(24usize, 4u8) as u32) }
+    }
+    #[inline]
+    pub fn set_SegmentId4(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(24usize, 4u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn SegmentId4_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                24usize,
+                4u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_SegmentId4_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                24usize,
+                4u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn PagePreference4(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(28usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_PagePreference4(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(28usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn PagePreference4_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                28usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_PagePreference4_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                28usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn Direction4(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(29usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_Direction4(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(29usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn Direction4_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                29usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_Direction4_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                29usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn Reserved(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(30usize, 2u8) as u32) }
+    }
+    #[inline]
+    pub fn set_Reserved(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(30usize, 2u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn Reserved_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                30usize,
+                2u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_Reserved_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                30usize,
+                2u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn new_bitfield_1(
+        SegmentId0: UINT,
+        PagePreference0: UINT,
+        Direction0: UINT,
+        SegmentId1: UINT,
+        PagePreference1: UINT,
+        Direction1: UINT,
+        SegmentId2: UINT,
+        PagePreference2: UINT,
+        Direction2: UINT,
+        SegmentId3: UINT,
+        PagePreference3: UINT,
+        Direction3: UINT,
+        SegmentId4: UINT,
+        PagePreference4: UINT,
+        Direction4: UINT,
+        Reserved: UINT,
+    ) -> __BindgenBitfieldUnit<[u8; 4usize]> {
+        let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 4usize]> = Default::default();
+        __bindgen_bitfield_unit.set(0usize, 4u8, {
+            let SegmentId0: u32 = unsafe { ::std::mem::transmute(SegmentId0) };
+            SegmentId0 as u64
+        });
+        __bindgen_bitfield_unit.set(4usize, 1u8, {
+            let PagePreference0: u32 = unsafe { ::std::mem::transmute(PagePreference0) };
+            PagePreference0 as u64
+        });
+        __bindgen_bitfield_unit.set(5usize, 1u8, {
+            let Direction0: u32 = unsafe { ::std::mem::transmute(Direction0) };
+            Direction0 as u64
+        });
+        __bindgen_bitfield_unit.set(6usize, 4u8, {
+            let SegmentId1: u32 = unsafe { ::std::mem::transmute(SegmentId1) };
+            SegmentId1 as u64
+        });
+        __bindgen_bitfield_unit.set(10usize, 1u8, {
+            let PagePreference1: u32 = unsafe { ::std::mem::transmute(PagePreference1) };
+            PagePreference1 as u64
+        });
+        __bindgen_bitfield_unit.set(11usize, 1u8, {
+            let Direction1: u32 = unsafe { ::std::mem::transmute(Direction1) };
+            Direction1 as u64
+        });
+        __bindgen_bitfield_unit.set(12usize, 4u8, {
+            let SegmentId2: u32 = unsafe { ::std::mem::transmute(SegmentId2) };
+            SegmentId2 as u64
+        });
+        __bindgen_bitfield_unit.set(16usize, 1u8, {
+            let PagePreference2: u32 = unsafe { ::std::mem::transmute(PagePreference2) };
+            PagePreference2 as u64
+        });
+        __bindgen_bitfield_unit.set(17usize, 1u8, {
+            let Direction2: u32 = unsafe { ::std::mem::transmute(Direction2) };
+            Direction2 as u64
+        });
+        __bindgen_bitfield_unit.set(18usize, 4u8, {
+            let SegmentId3: u32 = unsafe { ::std::mem::transmute(SegmentId3) };
+            SegmentId3 as u64
+        });
+        __bindgen_bitfield_unit.set(22usize, 1u8, {
+            let PagePreference3: u32 = unsafe { ::std::mem::transmute(PagePreference3) };
+            PagePreference3 as u64
+        });
+        __bindgen_bitfield_unit.set(23usize, 1u8, {
+            let Direction3: u32 = unsafe { ::std::mem::transmute(Direction3) };
+            Direction3 as u64
+        });
+        __bindgen_bitfield_unit.set(24usize, 4u8, {
+            let SegmentId4: u32 = unsafe { ::std::mem::transmute(SegmentId4) };
+            SegmentId4 as u64
+        });
+        __bindgen_bitfield_unit.set(28usize, 1u8, {
+            let PagePreference4: u32 = unsafe { ::std::mem::transmute(PagePreference4) };
+            PagePreference4 as u64
+        });
+        __bindgen_bitfield_unit.set(29usize, 1u8, {
+            let Direction4: u32 = unsafe { ::std::mem::transmute(Direction4) };
+            Direction4 as u64
+        });
+        __bindgen_bitfield_unit.set(30usize, 2u8, {
+            let Reserved: u32 = unsafe { ::std::mem::transmute(Reserved) };
+            Reserved as u64
+        });
+        __bindgen_bitfield_unit
+    }
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1"]
+        [::std::mem::size_of::<_D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1>() - 4usize];
+    ["Alignment of _D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1"]
+        [::std::mem::align_of::<_D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1>() - 4usize];
+    ["Offset of field: _D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1::Value"]
+        [::std::mem::offset_of!(_D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1, Value) - 0usize];
+};
+impl Default for _D3DDDI_SEGMENTPREFERENCE2__bindgen_ty_1 {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DDDI_SEGMENTPREFERENCE2"]
+        [::std::mem::size_of::<_D3DDDI_SEGMENTPREFERENCE2>() - 4usize];
+    ["Alignment of _D3DDDI_SEGMENTPREFERENCE2"]
+        [::std::mem::align_of::<_D3DDDI_SEGMENTPREFERENCE2>() - 4usize];
+};
+impl Default for _D3DDDI_SEGMENTPREFERENCE2 {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type D3DDDI_SEGMENTPREFERENCE2 = _D3DDDI_SEGMENTPREFERENCE2;
 pub const _D3DDDIFORMAT_D3DDDIFMT_UNKNOWN: _D3DDDIFORMAT = 0;
 pub const _D3DDDIFORMAT_D3DDDIFMT_R8G8B8: _D3DDDIFORMAT = 20;
 pub const _D3DDDIFORMAT_D3DDDIFMT_A8R8G8B8: _D3DDDIFORMAT = 21;
@@ -5355,6 +6071,8 @@ pub const D3DDDI_COLOR_SPACE_TYPE_D3DDDI_COLOR_SPACE_YCBCR_STUDIO_G24_LEFT_P2020
     D3DDDI_COLOR_SPACE_TYPE = 23;
 pub const D3DDDI_COLOR_SPACE_TYPE_D3DDDI_COLOR_SPACE_YCBCR_STUDIO_G24_TOPLEFT_P2020:
     D3DDDI_COLOR_SPACE_TYPE = 24;
+pub const D3DDDI_COLOR_SPACE_TYPE_D3DDDI_COLOR_SPACE_RGB_FULL_G10_NONE_P2020:
+    D3DDDI_COLOR_SPACE_TYPE = 25;
 pub const D3DDDI_COLOR_SPACE_TYPE_D3DDDI_COLOR_SPACE_CUSTOM: D3DDDI_COLOR_SPACE_TYPE = -1;
 pub type D3DDDI_COLOR_SPACE_TYPE = ::std::os::raw::c_int;
 pub const _D3DDDI_OUTPUT_WIRE_COLOR_SPACE_TYPE_D3DDDI_OUTPUT_WIRE_COLOR_SPACE_G22_P709:
@@ -10965,7 +11683,8 @@ pub struct _D3DDDI_NATIVEFENCEINFO {
     pub Type: D3DDDI_NATIVEFENCE_TYPE,
     pub Flags: D3DDDI_SYNCHRONIZATIONOBJECT_FLAGS,
     pub NativeFenceMapping: D3DDDI_NATIVEFENCEMAPPING,
-    pub Reserved: [BYTE; 28usize],
+    pub PhysicalAdapterIndex: UINT,
+    pub Reserved: [BYTE; 24usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -10983,8 +11702,10 @@ const _: () = {
         [::std::mem::offset_of!(_D3DDDI_NATIVEFENCEINFO, Flags) - 16usize];
     ["Offset of field: _D3DDDI_NATIVEFENCEINFO::NativeFenceMapping"]
         [::std::mem::offset_of!(_D3DDDI_NATIVEFENCEINFO, NativeFenceMapping) - 24usize];
+    ["Offset of field: _D3DDDI_NATIVEFENCEINFO::PhysicalAdapterIndex"]
+        [::std::mem::offset_of!(_D3DDDI_NATIVEFENCEINFO, PhysicalAdapterIndex) - 80usize];
     ["Offset of field: _D3DDDI_NATIVEFENCEINFO::Reserved"]
-        [::std::mem::offset_of!(_D3DDDI_NATIVEFENCEINFO, Reserved) - 80usize];
+        [::std::mem::offset_of!(_D3DDDI_NATIVEFENCEINFO, Reserved) - 84usize];
 };
 impl Default for _D3DDDI_NATIVEFENCEINFO {
     fn default() -> Self {
@@ -10996,6 +11717,68 @@ impl Default for _D3DDDI_NATIVEFENCEINFO {
     }
 }
 pub type D3DDDI_NATIVEFENCEINFO = _D3DDDI_NATIVEFENCEINFO;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct _D3DDDI_NATIVEFENCELOGDETAIL {
+    pub WaitLogNumberOfEntries: UINT32,
+    pub SignalLogNumberOfEntries: UINT32,
+    pub WaitLogGpuBaseAddress: D3DGPU_VIRTUAL_ADDRESS,
+    pub SignalLogGpuBaseAddress: D3DGPU_VIRTUAL_ADDRESS,
+    pub Reserved: [BYTE; 64usize],
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DDDI_NATIVEFENCELOGDETAIL"]
+        [::std::mem::size_of::<_D3DDDI_NATIVEFENCELOGDETAIL>() - 88usize];
+    ["Alignment of _D3DDDI_NATIVEFENCELOGDETAIL"]
+        [::std::mem::align_of::<_D3DDDI_NATIVEFENCELOGDETAIL>() - 8usize];
+    ["Offset of field: _D3DDDI_NATIVEFENCELOGDETAIL::WaitLogNumberOfEntries"]
+        [::std::mem::offset_of!(_D3DDDI_NATIVEFENCELOGDETAIL, WaitLogNumberOfEntries) - 0usize];
+    ["Offset of field: _D3DDDI_NATIVEFENCELOGDETAIL::SignalLogNumberOfEntries"]
+        [::std::mem::offset_of!(_D3DDDI_NATIVEFENCELOGDETAIL, SignalLogNumberOfEntries) - 4usize];
+    ["Offset of field: _D3DDDI_NATIVEFENCELOGDETAIL::WaitLogGpuBaseAddress"]
+        [::std::mem::offset_of!(_D3DDDI_NATIVEFENCELOGDETAIL, WaitLogGpuBaseAddress) - 8usize];
+    ["Offset of field: _D3DDDI_NATIVEFENCELOGDETAIL::SignalLogGpuBaseAddress"]
+        [::std::mem::offset_of!(_D3DDDI_NATIVEFENCELOGDETAIL, SignalLogGpuBaseAddress) - 16usize];
+    ["Offset of field: _D3DDDI_NATIVEFENCELOGDETAIL::Reserved"]
+        [::std::mem::offset_of!(_D3DDDI_NATIVEFENCELOGDETAIL, Reserved) - 24usize];
+};
+impl Default for _D3DDDI_NATIVEFENCELOGDETAIL {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type D3DDDI_NATIVEFENCELOGDETAIL = _D3DDDI_NATIVEFENCELOGDETAIL;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct _D3DDDI_DOORBELLMAPPING {
+    pub CpuVa: *mut ::std::os::raw::c_void,
+    pub SecondaryCpuVa: *mut ::std::os::raw::c_void,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DDDI_DOORBELLMAPPING"][::std::mem::size_of::<_D3DDDI_DOORBELLMAPPING>() - 16usize];
+    ["Alignment of _D3DDDI_DOORBELLMAPPING"]
+        [::std::mem::align_of::<_D3DDDI_DOORBELLMAPPING>() - 8usize];
+    ["Offset of field: _D3DDDI_DOORBELLMAPPING::CpuVa"]
+        [::std::mem::offset_of!(_D3DDDI_DOORBELLMAPPING, CpuVa) - 0usize];
+    ["Offset of field: _D3DDDI_DOORBELLMAPPING::SecondaryCpuVa"]
+        [::std::mem::offset_of!(_D3DDDI_DOORBELLMAPPING, SecondaryCpuVa) - 8usize];
+};
+impl Default for _D3DDDI_DOORBELLMAPPING {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type D3DDDI_DOORBELLMAPPING = _D3DDDI_DOORBELLMAPPING;
 pub const _D3DDDI_DOORBELLSTATUS_D3DDDI_DOORBELLSTATUS_CONNECTED: _D3DDDI_DOORBELLSTATUS = 0;
 pub const _D3DDDI_DOORBELLSTATUS_D3DDDI_DOORBELLSTATUS_CONNECTED_NOTIFY_KMD:
     _D3DDDI_DOORBELLSTATUS = 1;
@@ -11447,9 +12230,19 @@ pub const _DXGK_FEATURE_ID_DXGK_FEATURE_64K_PT_DEMOTION_FIX: _DXGK_FEATURE_ID = 
 pub const _DXGK_FEATURE_ID_DXGK_FEATURE_GPUPV_PRESENT_HWQUEUE: _DXGK_FEATURE_ID = 35;
 pub const _DXGK_FEATURE_ID_DXGK_FEATURE_GPUVAIOMMU: _DXGK_FEATURE_ID = 36;
 pub const _DXGK_FEATURE_ID_DXGK_FEATURE_NATIVE_FENCE: _DXGK_FEATURE_ID = 37;
+pub const _DXGK_FEATURE_ID_DXGK_FEATURE_EXTENDED_SEGMENT_FLAGS: _DXGK_FEATURE_ID = 38;
+pub const _DXGK_FEATURE_ID_DXGK_FEATURE_FAULT_AND_STALL: _DXGK_FEATURE_ID = 39;
+pub const _DXGK_FEATURE_ID_DXGK_FEATURE_SINGLE_ADAPTER_HYBRID_MODE: _DXGK_FEATURE_ID = 40;
 pub const _DXGK_FEATURE_ID_DXGK_FEATURE_SYNC_PRESENT_RENDER_HWQ_ONLY: _DXGK_FEATURE_ID = 41;
+pub const _DXGK_FEATURE_ID_DXGK_FEATURE_UNIFIED_SCHEDULING_MODEL: _DXGK_FEATURE_ID = 42;
+pub const _DXGK_FEATURE_ID_DXGK_FEATURE_NOTIFY_RESIDENCY2: _DXGK_FEATURE_ID = 43;
 pub const _DXGK_FEATURE_ID_DXGK_FEATURE_PROCESS_DEBUG_BLOB_COLLECTION: _DXGK_FEATURE_ID = 45;
 pub const _DXGK_FEATURE_ID_DXGK_FEATURE_PANEL_BUFFER_CONTROL: _DXGK_FEATURE_ID = 46;
+pub const _DXGK_FEATURE_ID_DXGK_FEATURE_INTELLIGENT_CARVEOUT: _DXGK_FEATURE_ID = 48;
+pub const _DXGK_FEATURE_ID_DXGK_FEATURE_TARGET_PROPERTY_MAP: _DXGK_FEATURE_ID = 49;
+pub const _DXGK_FEATURE_ID_DXGK_FEATURE_PARTITION_SEGMENT: _DXGK_FEATURE_ID = 51;
+pub const _DXGK_FEATURE_ID_DXGK_FEATURE_PAGING_INTENT: _DXGK_FEATURE_ID = 52;
+pub const _DXGK_FEATURE_ID_DXGK_FEATURE_SYSMEM_PAGING: _DXGK_FEATURE_ID = 53;
 pub const _DXGK_FEATURE_ID_DXGK_FEATURE_QUERYSTATISTICS_EXTENSIONS: _DXGK_FEATURE_ID = 268435456;
 pub const _DXGK_FEATURE_ID_DXGK_FEATURE_RESERVE_GPUVA_ZERO_BASE_ADDRESS: _DXGK_FEATURE_ID =
     268435457;
@@ -11458,8 +12251,355 @@ pub const _DXGK_FEATURE_ID_DXGK_FEATURE_FENCE_SIGNAL_FROM_SWS_NODE: _DXGK_FEATUR
 pub const _DXGK_FEATURE_ID_DXGK_FEATURE_SUPPRESSVSYNC_INTERRUPTS: _DXGK_FEATURE_ID = 268435460;
 pub const _DXGK_FEATURE_ID_DXGK_FEATURE_FEATURE_INTERFACE_EXTENSIONS: _DXGK_FEATURE_ID = 268435461;
 pub const _DXGK_FEATURE_ID_DXGK_FEATURE_READONLY_EXISTINGSYSMEM: _DXGK_FEATURE_ID = 268435462;
+pub const _DXGK_FEATURE_ID_DXGK_FEATURE_OPPORTUNISTIC_64KB_PAGES: _DXGK_FEATURE_ID = 268435463;
+pub const _DXGK_FEATURE_ID_DXGK_FEATURE_INTELLIGENT_CARVEOUT_OS: _DXGK_FEATURE_ID = 268435467;
 pub type _DXGK_FEATURE_ID = ::std::os::raw::c_int;
 pub use self::_DXGK_FEATURE_ID as DXGK_FEATURE_ID;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS {
+    pub __bindgen_anon_1: _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1 {
+    pub __bindgen_anon_1:
+        _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1__bindgen_ty_1,
+    pub Value: UINT,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1__bindgen_ty_1 {
+    pub _bitfield_align_1: [u32; 0],
+    pub _bitfield_1: __BindgenBitfieldUnit<[u8; 4usize]>,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1__bindgen_ty_1"]
+        [::std::mem::size_of::<
+            _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1__bindgen_ty_1,
+        >() - 4usize];
+    ["Alignment of _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1__bindgen_ty_1"]
+        [::std::mem::align_of::<
+            _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1__bindgen_ty_1,
+        >() - 4usize];
+};
+impl _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1__bindgen_ty_1 {
+    #[inline]
+    pub fn DisableGpuTimeout(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(0usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_DisableGpuTimeout(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(0usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn DisableGpuTimeout_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                0usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_DisableGpuTimeout_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                0usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn NoBroadcastSignal(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(1usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_NoBroadcastSignal(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(1usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn NoBroadcastSignal_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                1usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_NoBroadcastSignal_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                1usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn NoBroadcastWait(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(2usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_NoBroadcastWait(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(2usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn NoBroadcastWait_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                2usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_NoBroadcastWait_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                2usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn NoKmdAccess(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(3usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_NoKmdAccess(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(3usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn NoKmdAccess_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                3usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_NoKmdAccess_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                3usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn TestQueue(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(4usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_TestQueue(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(4usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn TestQueue_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                4usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_TestQueue_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                4usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn DoorbellRequiresSecondaryCpuVA(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(5usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_DoorbellRequiresSecondaryCpuVA(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(5usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn DoorbellRequiresSecondaryCpuVA_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                5usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_DoorbellRequiresSecondaryCpuVA_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                5usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn Reserved(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(6usize, 26u8) as u32) }
+    }
+    #[inline]
+    pub fn set_Reserved(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(6usize, 26u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn Reserved_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                6usize,
+                26u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_Reserved_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                6usize,
+                26u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn new_bitfield_1(
+        DisableGpuTimeout: UINT,
+        NoBroadcastSignal: UINT,
+        NoBroadcastWait: UINT,
+        NoKmdAccess: UINT,
+        TestQueue: UINT,
+        DoorbellRequiresSecondaryCpuVA: UINT,
+        Reserved: UINT,
+    ) -> __BindgenBitfieldUnit<[u8; 4usize]> {
+        let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 4usize]> = Default::default();
+        __bindgen_bitfield_unit.set(0usize, 1u8, {
+            let DisableGpuTimeout: u32 = unsafe { ::std::mem::transmute(DisableGpuTimeout) };
+            DisableGpuTimeout as u64
+        });
+        __bindgen_bitfield_unit.set(1usize, 1u8, {
+            let NoBroadcastSignal: u32 = unsafe { ::std::mem::transmute(NoBroadcastSignal) };
+            NoBroadcastSignal as u64
+        });
+        __bindgen_bitfield_unit.set(2usize, 1u8, {
+            let NoBroadcastWait: u32 = unsafe { ::std::mem::transmute(NoBroadcastWait) };
+            NoBroadcastWait as u64
+        });
+        __bindgen_bitfield_unit.set(3usize, 1u8, {
+            let NoKmdAccess: u32 = unsafe { ::std::mem::transmute(NoKmdAccess) };
+            NoKmdAccess as u64
+        });
+        __bindgen_bitfield_unit.set(4usize, 1u8, {
+            let TestQueue: u32 = unsafe { ::std::mem::transmute(TestQueue) };
+            TestQueue as u64
+        });
+        __bindgen_bitfield_unit.set(5usize, 1u8, {
+            let DoorbellRequiresSecondaryCpuVA: u32 =
+                unsafe { ::std::mem::transmute(DoorbellRequiresSecondaryCpuVA) };
+            DoorbellRequiresSecondaryCpuVA as u64
+        });
+        __bindgen_bitfield_unit.set(6usize, 26u8, {
+            let Reserved: u32 = unsafe { ::std::mem::transmute(Reserved) };
+            Reserved as u64
+        });
+        __bindgen_bitfield_unit
+    }
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1"][::std::mem::size_of::<
+        _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1,
+    >() - 4usize];
+    ["Alignment of _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1"]
+        [::std::mem::align_of::<_D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1>()
+            - 4usize];
+    ["Offset of field: _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1::Value"][::std::mem::offset_of!(
+        _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1,
+        Value
+    )
+        - 0usize];
+};
+impl Default for _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS__bindgen_ty_1 {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS"]
+        [::std::mem::size_of::<_D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS>() - 4usize];
+    ["Alignment of _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS"]
+        [::std::mem::align_of::<_D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS>() - 4usize];
+};
+impl Default for _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS =
+    _D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS;
 pub type DXGK_FEATURE_VERSION = UINT16;
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -11810,8 +12950,10 @@ pub const _D3DDDI_TESTCOMMANDBUFFEROP_D3DDDI_TESTCOMMANDBUFFEROP_INFINITE_LOOP:
     _D3DDDI_TESTCOMMANDBUFFEROP = 3;
 pub const _D3DDDI_TESTCOMMANDBUFFEROP_D3DDDI_TESTCOMMANDBUFFEROP_INFINITE_PREEMPTABLE_LOOP:
     _D3DDDI_TESTCOMMANDBUFFEROP = 4;
+pub const _D3DDDI_TESTCOMMANDBUFFEROP_D3DDDI_TESTCOMMANDBUFFEROP_FAULT_AND_STALL:
+    _D3DDDI_TESTCOMMANDBUFFEROP = 5;
 pub const _D3DDDI_TESTCOMMANDBUFFEROP_D3DDDI_TESTCOMMANDBUFFEROP_MAX: _D3DDDI_TESTCOMMANDBUFFEROP =
-    5;
+    6;
 pub type _D3DDDI_TESTCOMMANDBUFFEROP = ::std::os::raw::c_int;
 pub use self::_D3DDDI_TESTCOMMANDBUFFEROP as D3DDDI_TESTCOMMANDBUFFEROP;
 #[repr(C)]
@@ -12070,11 +13212,13 @@ pub struct _D3DDDI_DRIVERESCAPE_BUILDTESTCOMMANDBUFFER {
     pub pDmaBufferPrivateData: PVOID,
     pub DmaBufferSize: UINT,
     pub DmaBufferPrivateDataSize: UINT,
+    pub HardwareProgressFenceId: UINT64,
+    pub HardwareProgressFenceGpuVa: UINT64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _D3DDDI_DRIVERESCAPE_BUILDTESTCOMMANDBUFFER"]
-        [::std::mem::size_of::<_D3DDDI_DRIVERESCAPE_BUILDTESTCOMMANDBUFFER>() - 112usize];
+        [::std::mem::size_of::<_D3DDDI_DRIVERESCAPE_BUILDTESTCOMMANDBUFFER>() - 128usize];
     ["Alignment of _D3DDDI_DRIVERESCAPE_BUILDTESTCOMMANDBUFFER"]
         [::std::mem::align_of::<_D3DDDI_DRIVERESCAPE_BUILDTESTCOMMANDBUFFER>() - 8usize];
     ["Offset of field: _D3DDDI_DRIVERESCAPE_BUILDTESTCOMMANDBUFFER::EscapeType"]
@@ -12103,6 +13247,16 @@ const _: () = {
         DmaBufferPrivateDataSize
     )
         - 108usize];
+    ["Offset of field: _D3DDDI_DRIVERESCAPE_BUILDTESTCOMMANDBUFFER::HardwareProgressFenceId"][::std::mem::offset_of!(
+        _D3DDDI_DRIVERESCAPE_BUILDTESTCOMMANDBUFFER,
+        HardwareProgressFenceId
+    )
+        - 112usize];
+    ["Offset of field: _D3DDDI_DRIVERESCAPE_BUILDTESTCOMMANDBUFFER::HardwareProgressFenceGpuVa"][::std::mem::offset_of!(
+        _D3DDDI_DRIVERESCAPE_BUILDTESTCOMMANDBUFFER,
+        HardwareProgressFenceGpuVa
+    )
+        - 120usize];
 };
 impl Default for _D3DDDI_DRIVERESCAPE_BUILDTESTCOMMANDBUFFER {
     fn default() -> Self {
@@ -13961,14 +15115,47 @@ impl _DXGK_NODEMETADATA_FLAGS__bindgen_ty_1__bindgen_ty_1 {
         }
     }
     #[inline]
+    pub fn SupportFaultAndStall(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(5usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_SupportFaultAndStall(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(5usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn SupportFaultAndStall_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                5usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_SupportFaultAndStall_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                5usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
     pub fn Reserved(&self) -> UINT {
-        unsafe { ::std::mem::transmute(self._bitfield_1.get(5usize, 11u8) as u32) }
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(6usize, 10u8) as u32) }
     }
     #[inline]
     pub fn set_Reserved(&mut self, val: UINT) {
         unsafe {
             let val: u32 = ::std::mem::transmute(val);
-            self._bitfield_1.set(5usize, 11u8, val as u64)
+            self._bitfield_1.set(6usize, 10u8, val as u64)
         }
     }
     #[inline]
@@ -13976,8 +15163,8 @@ impl _DXGK_NODEMETADATA_FLAGS__bindgen_ty_1__bindgen_ty_1 {
         unsafe {
             ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
                 ::std::ptr::addr_of!((*this)._bitfield_1),
-                5usize,
-                11u8,
+                6usize,
+                10u8,
             ) as u32)
         }
     }
@@ -13987,8 +15174,8 @@ impl _DXGK_NODEMETADATA_FLAGS__bindgen_ty_1__bindgen_ty_1 {
             let val: u32 = ::std::mem::transmute(val);
             <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
                 ::std::ptr::addr_of_mut!((*this)._bitfield_1),
-                5usize,
-                11u8,
+                6usize,
+                10u8,
                 val as u64,
             )
         }
@@ -14033,6 +15220,7 @@ impl _DXGK_NODEMETADATA_FLAGS__bindgen_ty_1__bindgen_ty_1 {
         SupportTrackedWorkload: UINT,
         UserModeSubmission: UINT,
         SupportBuildTestCommandBuffer: UINT,
+        SupportFaultAndStall: UINT,
         Reserved: UINT,
         MaxInFlightHwQueueBuffers: UINT,
     ) -> __BindgenBitfieldUnit<[u8; 4usize]> {
@@ -14061,7 +15249,11 @@ impl _DXGK_NODEMETADATA_FLAGS__bindgen_ty_1__bindgen_ty_1 {
                 unsafe { ::std::mem::transmute(SupportBuildTestCommandBuffer) };
             SupportBuildTestCommandBuffer as u64
         });
-        __bindgen_bitfield_unit.set(5usize, 11u8, {
+        __bindgen_bitfield_unit.set(5usize, 1u8, {
+            let SupportFaultAndStall: u32 = unsafe { ::std::mem::transmute(SupportFaultAndStall) };
+            SupportFaultAndStall as u64
+        });
+        __bindgen_bitfield_unit.set(6usize, 10u8, {
             let Reserved: u32 = unsafe { ::std::mem::transmute(Reserved) };
             Reserved as u64
         });
@@ -15605,6 +16797,8 @@ pub const _DXGK_PAGE_FAULT_FLAGS_DXGK_PAGE_FAULT_FATAL_HARDWARE_ERROR: _DXGK_PAG
 pub const _DXGK_PAGE_FAULT_FLAGS_DXGK_PAGE_FAULT_IOMMU: _DXGK_PAGE_FAULT_FLAGS = 32;
 pub const _DXGK_PAGE_FAULT_FLAGS_DXGK_PAGE_FAULT_HW_CONTEXT_VALID: _DXGK_PAGE_FAULT_FLAGS = 64;
 pub const _DXGK_PAGE_FAULT_FLAGS_DXGK_PAGE_FAULT_PROCESS_HANDLE_VALID: _DXGK_PAGE_FAULT_FLAGS = 128;
+pub const _DXGK_PAGE_FAULT_FLAGS_DXGK_PAGE_FAULT_AND_STALL: _DXGK_PAGE_FAULT_FLAGS = 256;
+pub const _DXGK_PAGE_FAULT_FLAGS_DXGK_PAGE_FAULT_FIRST_INVALID: _DXGK_PAGE_FAULT_FLAGS = 512;
 pub type _DXGK_PAGE_FAULT_FLAGS = ::std::os::raw::c_int;
 pub use self::_DXGK_PAGE_FAULT_FLAGS as DXGK_PAGE_FAULT_FLAGS;
 pub const _DXGK_GENERAL_ERROR_CODE_DXGK_GENERAL_ERROR_PAGE_FAULT: _DXGK_GENERAL_ERROR_CODE = 0;
@@ -32426,7 +33620,8 @@ pub const _D3DKMT_CLIENTHINT_D3DKMT_CLIENTHINT_QNN: _D3DKMT_CLIENTHINT = 24;
 pub const _D3DKMT_CLIENTHINT_D3DKMT_CLIENTHINT_VITIS: _D3DKMT_CLIENTHINT = 25;
 pub const _D3DKMT_CLIENTHINT_D3DKMT_CLIENTHINT_FFMPEG: _D3DKMT_CLIENTHINT = 26;
 pub const _D3DKMT_CLIENTHINT_D3DKMT_CLIENTHINT_OPEN_VINO: _D3DKMT_CLIENTHINT = 27;
-pub const _D3DKMT_CLIENTHINT_D3DKMT_CLIENTHINT_MAX: _D3DKMT_CLIENTHINT = 28;
+pub const _D3DKMT_CLIENTHINT_D3DKMT_CLIENTHINT_DML_WEBNN: _D3DKMT_CLIENTHINT = 28;
+pub const _D3DKMT_CLIENTHINT_D3DKMT_CLIENTHINT_MAX: _D3DKMT_CLIENTHINT = 29;
 pub type _D3DKMT_CLIENTHINT = ::std::os::raw::c_int;
 pub use self::_D3DKMT_CLIENTHINT as D3DKMT_CLIENTHINT;
 #[repr(C)]
@@ -36804,6 +37999,7 @@ pub union _D3DKMT_FLIPMODEL_PRESENTHISTORYTOKEN__bindgen_ty_1 {
 #[derive(Copy, Clone)]
 pub struct _D3DKMT_FLIPMODEL_PRESENTHISTORYTOKEN__bindgen_ty_1__bindgen_ty_1 {
     pub hSyncObject: HANDLE,
+    pub hLayoutSyncObject: HANDLE,
     pub HDRMetaDataType: D3DDDI_HDR_METADATA_TYPE,
     pub __bindgen_anon_1:
         _D3DKMT_FLIPMODEL_PRESENTHISTORYTOKEN__bindgen_ty_1__bindgen_ty_1__bindgen_ty_1,
@@ -36851,7 +38047,7 @@ impl Default for _D3DKMT_FLIPMODEL_PRESENTHISTORYTOKEN__bindgen_ty_1__bindgen_ty
 const _: () = {
     ["Size of _D3DKMT_FLIPMODEL_PRESENTHISTORYTOKEN__bindgen_ty_1__bindgen_ty_1"]
         [::std::mem::size_of::<_D3DKMT_FLIPMODEL_PRESENTHISTORYTOKEN__bindgen_ty_1__bindgen_ty_1>(
-        ) - 88usize];
+        ) - 96usize];
     ["Alignment of _D3DKMT_FLIPMODEL_PRESENTHISTORYTOKEN__bindgen_ty_1__bindgen_ty_1"]
         [::std::mem::align_of::<_D3DKMT_FLIPMODEL_PRESENTHISTORYTOKEN__bindgen_ty_1__bindgen_ty_1>(
         ) - 8usize];
@@ -36862,11 +38058,17 @@ const _: () = {
         hSyncObject
     ) - 0usize];
     [
+        "Offset of field: _D3DKMT_FLIPMODEL_PRESENTHISTORYTOKEN__bindgen_ty_1__bindgen_ty_1::hLayoutSyncObject",
+    ][::std::mem::offset_of!(
+        _D3DKMT_FLIPMODEL_PRESENTHISTORYTOKEN__bindgen_ty_1__bindgen_ty_1,
+        hLayoutSyncObject
+    ) - 8usize];
+    [
         "Offset of field: _D3DKMT_FLIPMODEL_PRESENTHISTORYTOKEN__bindgen_ty_1__bindgen_ty_1::HDRMetaDataType",
     ][::std::mem::offset_of!(
         _D3DKMT_FLIPMODEL_PRESENTHISTORYTOKEN__bindgen_ty_1__bindgen_ty_1,
         HDRMetaDataType
-    ) - 8usize];
+    ) - 16usize];
 };
 impl Default for _D3DKMT_FLIPMODEL_PRESENTHISTORYTOKEN__bindgen_ty_1__bindgen_ty_1 {
     fn default() -> Self {
@@ -37961,19 +39163,25 @@ pub type D3DKMT_CONNECT_DOORBELL_FLAGS = _D3DKMT_CONNECT_DOORBELL_FLAGS;
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct _D3DKMT_CONNECT_DOORBELL {
-    pub hDoorbell: D3DKMT_HANDLE,
+    pub hHwQueue: D3DKMT_HANDLE,
     pub Flags: D3DKMT_CONNECT_DOORBELL_FLAGS,
+    pub DoorbellMapping: D3DDDI_DOORBELLMAPPING,
+    pub Reserved: [BYTE; 64usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _D3DKMT_CONNECT_DOORBELL"]
-        [::std::mem::size_of::<_D3DKMT_CONNECT_DOORBELL>() - 8usize];
+        [::std::mem::size_of::<_D3DKMT_CONNECT_DOORBELL>() - 88usize];
     ["Alignment of _D3DKMT_CONNECT_DOORBELL"]
-        [::std::mem::align_of::<_D3DKMT_CONNECT_DOORBELL>() - 4usize];
-    ["Offset of field: _D3DKMT_CONNECT_DOORBELL::hDoorbell"]
-        [::std::mem::offset_of!(_D3DKMT_CONNECT_DOORBELL, hDoorbell) - 0usize];
+        [::std::mem::align_of::<_D3DKMT_CONNECT_DOORBELL>() - 8usize];
+    ["Offset of field: _D3DKMT_CONNECT_DOORBELL::hHwQueue"]
+        [::std::mem::offset_of!(_D3DKMT_CONNECT_DOORBELL, hHwQueue) - 0usize];
     ["Offset of field: _D3DKMT_CONNECT_DOORBELL::Flags"]
         [::std::mem::offset_of!(_D3DKMT_CONNECT_DOORBELL, Flags) - 4usize];
+    ["Offset of field: _D3DKMT_CONNECT_DOORBELL::DoorbellMapping"]
+        [::std::mem::offset_of!(_D3DKMT_CONNECT_DOORBELL, DoorbellMapping) - 8usize];
+    ["Offset of field: _D3DKMT_CONNECT_DOORBELL::Reserved"]
+        [::std::mem::offset_of!(_D3DKMT_CONNECT_DOORBELL, Reserved) - 24usize];
 };
 impl Default for _D3DKMT_CONNECT_DOORBELL {
     fn default() -> Self {
@@ -38110,19 +39318,22 @@ pub type D3DKMT_NOTIFY_WORK_SUBMISSION_FLAGS = _D3DKMT_NOTIFY_WORK_SUBMISSION_FL
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct _D3DKMT_NOTIFY_WORK_SUBMISSION {
-    pub hDoorbell: D3DKMT_HANDLE,
+    pub hHwQueue: D3DKMT_HANDLE,
     pub Flags: D3DKMT_NOTIFY_WORK_SUBMISSION_FLAGS,
+    pub PrivateDriverData: [BYTE; 64usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _D3DKMT_NOTIFY_WORK_SUBMISSION"]
-        [::std::mem::size_of::<_D3DKMT_NOTIFY_WORK_SUBMISSION>() - 8usize];
+        [::std::mem::size_of::<_D3DKMT_NOTIFY_WORK_SUBMISSION>() - 72usize];
     ["Alignment of _D3DKMT_NOTIFY_WORK_SUBMISSION"]
         [::std::mem::align_of::<_D3DKMT_NOTIFY_WORK_SUBMISSION>() - 4usize];
-    ["Offset of field: _D3DKMT_NOTIFY_WORK_SUBMISSION::hDoorbell"]
-        [::std::mem::offset_of!(_D3DKMT_NOTIFY_WORK_SUBMISSION, hDoorbell) - 0usize];
+    ["Offset of field: _D3DKMT_NOTIFY_WORK_SUBMISSION::hHwQueue"]
+        [::std::mem::offset_of!(_D3DKMT_NOTIFY_WORK_SUBMISSION, hHwQueue) - 0usize];
     ["Offset of field: _D3DKMT_NOTIFY_WORK_SUBMISSION::Flags"]
         [::std::mem::offset_of!(_D3DKMT_NOTIFY_WORK_SUBMISSION, Flags) - 4usize];
+    ["Offset of field: _D3DKMT_NOTIFY_WORK_SUBMISSION::PrivateDriverData"]
+        [::std::mem::offset_of!(_D3DKMT_NOTIFY_WORK_SUBMISSION, PrivateDriverData) - 8usize];
 };
 impl Default for _D3DKMT_NOTIFY_WORK_SUBMISSION {
     fn default() -> Self {
@@ -38164,6 +39375,262 @@ impl Default for _D3DKMT_ISFEATUREENABLED {
     }
 }
 pub type D3DKMT_ISFEATUREENABLED = _D3DKMT_ISFEATUREENABLED;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct _D3DKMT_QUERYFEATUREINTERFACE {
+    pub hAdapter: D3DKMT_HANDLE,
+    pub FeatureId: DXGK_FEATURE_ID,
+    pub Result: DXGK_ISFEATUREENABLED_RESULT,
+    pub InterfaceTableSize: UINT,
+    pub InterfaceTable: *const FARPROC,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_QUERYFEATUREINTERFACE"]
+        [::std::mem::size_of::<_D3DKMT_QUERYFEATUREINTERFACE>() - 24usize];
+    ["Alignment of _D3DKMT_QUERYFEATUREINTERFACE"]
+        [::std::mem::align_of::<_D3DKMT_QUERYFEATUREINTERFACE>() - 8usize];
+    ["Offset of field: _D3DKMT_QUERYFEATUREINTERFACE::hAdapter"]
+        [::std::mem::offset_of!(_D3DKMT_QUERYFEATUREINTERFACE, hAdapter) - 0usize];
+    ["Offset of field: _D3DKMT_QUERYFEATUREINTERFACE::FeatureId"]
+        [::std::mem::offset_of!(_D3DKMT_QUERYFEATUREINTERFACE, FeatureId) - 4usize];
+    ["Offset of field: _D3DKMT_QUERYFEATUREINTERFACE::Result"]
+        [::std::mem::offset_of!(_D3DKMT_QUERYFEATUREINTERFACE, Result) - 8usize];
+    ["Offset of field: _D3DKMT_QUERYFEATUREINTERFACE::InterfaceTableSize"]
+        [::std::mem::offset_of!(_D3DKMT_QUERYFEATUREINTERFACE, InterfaceTableSize) - 12usize];
+    ["Offset of field: _D3DKMT_QUERYFEATUREINTERFACE::InterfaceTable"]
+        [::std::mem::offset_of!(_D3DKMT_QUERYFEATUREINTERFACE, InterfaceTable) - 16usize];
+};
+impl Default for _D3DKMT_QUERYFEATUREINTERFACE {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type D3DKMT_QUERYFEATUREINTERFACE = _D3DKMT_QUERYFEATUREINTERFACE;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct _D3DKMT_RESIZERINGBUFFER_FLAGS {
+    pub __bindgen_anon_1: _D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union _D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1 {
+    pub __bindgen_anon_1: _D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1__bindgen_ty_1,
+    pub Value: UINT,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct _D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1__bindgen_ty_1 {
+    pub _bitfield_align_1: [u32; 0],
+    pub _bitfield_1: __BindgenBitfieldUnit<[u8; 4usize]>,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1__bindgen_ty_1"][::std::mem::size_of::<
+        _D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1__bindgen_ty_1,
+    >() - 4usize];
+    ["Alignment of _D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1__bindgen_ty_1"][::std::mem::align_of::<
+        _D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1__bindgen_ty_1,
+    >() - 4usize];
+};
+impl _D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1__bindgen_ty_1 {
+    #[inline]
+    pub fn Reserved(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(0usize, 32u8) as u32) }
+    }
+    #[inline]
+    pub fn set_Reserved(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(0usize, 32u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn Reserved_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                0usize,
+                32u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_Reserved_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                0usize,
+                32u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn new_bitfield_1(Reserved: UINT) -> __BindgenBitfieldUnit<[u8; 4usize]> {
+        let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 4usize]> = Default::default();
+        __bindgen_bitfield_unit.set(0usize, 32u8, {
+            let Reserved: u32 = unsafe { ::std::mem::transmute(Reserved) };
+            Reserved as u64
+        });
+        __bindgen_bitfield_unit
+    }
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1"]
+        [::std::mem::size_of::<_D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1>() - 4usize];
+    ["Alignment of _D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1"]
+        [::std::mem::align_of::<_D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1>() - 4usize];
+    ["Offset of field: _D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1::Value"]
+        [::std::mem::offset_of!(_D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1, Value) - 0usize];
+};
+impl Default for _D3DKMT_RESIZERINGBUFFER_FLAGS__bindgen_ty_1 {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_RESIZERINGBUFFER_FLAGS"]
+        [::std::mem::size_of::<_D3DKMT_RESIZERINGBUFFER_FLAGS>() - 4usize];
+    ["Alignment of _D3DKMT_RESIZERINGBUFFER_FLAGS"]
+        [::std::mem::align_of::<_D3DKMT_RESIZERINGBUFFER_FLAGS>() - 4usize];
+};
+impl Default for _D3DKMT_RESIZERINGBUFFER_FLAGS {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type D3DKMT_RESIZERINGBUFFER_FLAGS = _D3DKMT_RESIZERINGBUFFER_FLAGS;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct _D3DKMT_RESIZERINGBUFFER {
+    pub hHwQueue: D3DKMT_HANDLE,
+    pub hRingBuffer: D3DKMT_HANDLE,
+    pub hRingBufferControl: D3DKMT_HANDLE,
+    pub Flags: D3DKMT_RESIZERINGBUFFER_FLAGS,
+    pub PrivateDriverData: [BYTE; 64usize],
+    pub Reserved: [BYTE; 64usize],
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_RESIZERINGBUFFER"]
+        [::std::mem::size_of::<_D3DKMT_RESIZERINGBUFFER>() - 144usize];
+    ["Alignment of _D3DKMT_RESIZERINGBUFFER"]
+        [::std::mem::align_of::<_D3DKMT_RESIZERINGBUFFER>() - 4usize];
+    ["Offset of field: _D3DKMT_RESIZERINGBUFFER::hHwQueue"]
+        [::std::mem::offset_of!(_D3DKMT_RESIZERINGBUFFER, hHwQueue) - 0usize];
+    ["Offset of field: _D3DKMT_RESIZERINGBUFFER::hRingBuffer"]
+        [::std::mem::offset_of!(_D3DKMT_RESIZERINGBUFFER, hRingBuffer) - 4usize];
+    ["Offset of field: _D3DKMT_RESIZERINGBUFFER::hRingBufferControl"]
+        [::std::mem::offset_of!(_D3DKMT_RESIZERINGBUFFER, hRingBufferControl) - 8usize];
+    ["Offset of field: _D3DKMT_RESIZERINGBUFFER::Flags"]
+        [::std::mem::offset_of!(_D3DKMT_RESIZERINGBUFFER, Flags) - 12usize];
+    ["Offset of field: _D3DKMT_RESIZERINGBUFFER::PrivateDriverData"]
+        [::std::mem::offset_of!(_D3DKMT_RESIZERINGBUFFER, PrivateDriverData) - 16usize];
+    ["Offset of field: _D3DKMT_RESIZERINGBUFFER::Reserved"]
+        [::std::mem::offset_of!(_D3DKMT_RESIZERINGBUFFER, Reserved) - 80usize];
+};
+impl Default for _D3DKMT_RESIZERINGBUFFER {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type D3DKMT_RESIZERINGBUFFER = _D3DKMT_RESIZERINGBUFFER;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION {
+    pub hHwContext: D3DKMT_HANDLE,
+    pub Flags: D3DDDI_CREATEHWQUEUEFORUSERMODESUBMISSION_FLAGS,
+    pub hRingBuffer: D3DKMT_HANDLE,
+    pub hRingBufferControl: D3DKMT_HANDLE,
+    pub PrivateDriverData: [BYTE; 64usize],
+    pub hHwQueue: D3DKMT_HANDLE,
+    pub DoorbellStatusCpuVa: *mut ::std::os::raw::c_void,
+    pub hProgressFence: D3DKMT_HANDLE,
+    pub ProgressFenceMapping: D3DDDI_NATIVEFENCEMAPPING,
+    pub ProgressFenceLastQueuedValueCpuVa: *mut ::std::os::raw::c_void,
+    pub LogBufferInfo: D3DDDI_NATIVEFENCELOGDETAIL,
+    pub Reserved: [BYTE; 64usize],
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION"]
+        [::std::mem::size_of::<_D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION>() - 320usize];
+    ["Alignment of _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION"]
+        [::std::mem::align_of::<_D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION>() - 8usize];
+    ["Offset of field: _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION::hHwContext"]
+        [::std::mem::offset_of!(_D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION, hHwContext) - 0usize];
+    ["Offset of field: _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION::Flags"]
+        [::std::mem::offset_of!(_D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION, Flags) - 4usize];
+    ["Offset of field: _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION::hRingBuffer"]
+        [::std::mem::offset_of!(_D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION, hRingBuffer) - 8usize];
+    ["Offset of field: _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION::hRingBufferControl"][::std::mem::offset_of!(
+        _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION,
+        hRingBufferControl
+    )
+        - 12usize];
+    ["Offset of field: _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION::PrivateDriverData"][::std::mem::offset_of!(
+        _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION,
+        PrivateDriverData
+    ) - 16usize];
+    ["Offset of field: _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION::hHwQueue"]
+        [::std::mem::offset_of!(_D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION, hHwQueue) - 80usize];
+    ["Offset of field: _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION::DoorbellStatusCpuVa"][::std::mem::offset_of!(
+        _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION,
+        DoorbellStatusCpuVa
+    )
+        - 88usize];
+    ["Offset of field: _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION::hProgressFence"][::std::mem::offset_of!(
+        _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION,
+        hProgressFence
+    ) - 96usize];
+    ["Offset of field: _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION::ProgressFenceMapping"][::std::mem::offset_of!(
+        _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION,
+        ProgressFenceMapping
+    )
+        - 104usize];
+    [
+        "Offset of field: _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION::ProgressFenceLastQueuedValueCpuVa",
+    ][::std::mem::offset_of!(
+        _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION,
+        ProgressFenceLastQueuedValueCpuVa
+    ) - 160usize];
+    ["Offset of field: _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION::LogBufferInfo"][::std::mem::offset_of!(
+        _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION,
+        LogBufferInfo
+    ) - 168usize];
+    ["Offset of field: _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION::Reserved"]
+        [::std::mem::offset_of!(_D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION, Reserved) - 256usize];
+};
+impl Default for _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+pub type D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION = _D3DKMT_CREATEHWQUEUEFORUSERMODESUBMISSION;
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct _D3DKMT_MAPPROCESSDEBUGBLOB_FLAGS {
@@ -44593,9 +46060,10 @@ pub union _D3DKMT_ADAPTERTYPE__bindgen_ty_1 {
     pub Value: UINT,
 }
 #[repr(C)]
+#[repr(align(4))]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct _D3DKMT_ADAPTERTYPE__bindgen_ty_1__bindgen_ty_1 {
-    pub _bitfield_align_1: [u32; 0],
+    pub _bitfield_align_1: [u16; 0],
     pub _bitfield_1: __BindgenBitfieldUnit<[u8; 4usize]>,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
@@ -45069,14 +46537,80 @@ impl _D3DKMT_ADAPTERTYPE__bindgen_ty_1__bindgen_ty_1 {
         }
     }
     #[inline]
+    pub fn TestOnly(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(14usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_TestOnly(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(14usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn TestOnly_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                14usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_TestOnly_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                14usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn SingleAdapterHybridMode(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(15usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_SingleAdapterHybridMode(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(15usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn SingleAdapterHybridMode_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                15usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_SingleAdapterHybridMode_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                15usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
     pub fn Reserved(&self) -> UINT {
-        unsafe { ::std::mem::transmute(self._bitfield_1.get(14usize, 18u8) as u32) }
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(16usize, 16u8) as u32) }
     }
     #[inline]
     pub fn set_Reserved(&mut self, val: UINT) {
         unsafe {
             let val: u32 = ::std::mem::transmute(val);
-            self._bitfield_1.set(14usize, 18u8, val as u64)
+            self._bitfield_1.set(16usize, 16u8, val as u64)
         }
     }
     #[inline]
@@ -45084,8 +46618,8 @@ impl _D3DKMT_ADAPTERTYPE__bindgen_ty_1__bindgen_ty_1 {
         unsafe {
             ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
                 ::std::ptr::addr_of!((*this)._bitfield_1),
-                14usize,
-                18u8,
+                16usize,
+                16u8,
             ) as u32)
         }
     }
@@ -45095,8 +46629,8 @@ impl _D3DKMT_ADAPTERTYPE__bindgen_ty_1__bindgen_ty_1 {
             let val: u32 = ::std::mem::transmute(val);
             <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
                 ::std::ptr::addr_of_mut!((*this)._bitfield_1),
-                14usize,
-                18u8,
+                16usize,
+                16u8,
                 val as u64,
             )
         }
@@ -45117,6 +46651,8 @@ impl _D3DKMT_ADAPTERTYPE__bindgen_ty_1__bindgen_ty_1 {
         ComputeOnly: UINT,
         Prototype: UINT,
         RuntimePowerManagement: UINT,
+        TestOnly: UINT,
+        SingleAdapterHybridMode: UINT,
         Reserved: UINT,
     ) -> __BindgenBitfieldUnit<[u8; 4usize]> {
         let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 4usize]> = Default::default();
@@ -45179,7 +46715,16 @@ impl _D3DKMT_ADAPTERTYPE__bindgen_ty_1__bindgen_ty_1 {
                 unsafe { ::std::mem::transmute(RuntimePowerManagement) };
             RuntimePowerManagement as u64
         });
-        __bindgen_bitfield_unit.set(14usize, 18u8, {
+        __bindgen_bitfield_unit.set(14usize, 1u8, {
+            let TestOnly: u32 = unsafe { ::std::mem::transmute(TestOnly) };
+            TestOnly as u64
+        });
+        __bindgen_bitfield_unit.set(15usize, 1u8, {
+            let SingleAdapterHybridMode: u32 =
+                unsafe { ::std::mem::transmute(SingleAdapterHybridMode) };
+            SingleAdapterHybridMode as u64
+        });
+        __bindgen_bitfield_unit.set(16usize, 16u8, {
             let Reserved: u32 = unsafe { ::std::mem::transmute(Reserved) };
             Reserved as u64
         });
@@ -46780,14 +48325,47 @@ impl _D3DKMT_ENUMADAPTERS_FILTER__bindgen_ty_1 {
         }
     }
     #[inline]
+    pub fn IncludeTestOnly(&self) -> ULONGLONG {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(3usize, 1u8) as u64) }
+    }
+    #[inline]
+    pub fn set_IncludeTestOnly(&mut self, val: ULONGLONG) {
+        unsafe {
+            let val: u64 = ::std::mem::transmute(val);
+            self._bitfield_1.set(3usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn IncludeTestOnly_raw(this: *const Self) -> ULONGLONG {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 8usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                3usize,
+                1u8,
+            ) as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_IncludeTestOnly_raw(this: *mut Self, val: ULONGLONG) {
+        unsafe {
+            let val: u64 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 8usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                3usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
     pub fn Reserved(&self) -> ULONGLONG {
-        unsafe { ::std::mem::transmute(self._bitfield_1.get(3usize, 61u8) as u64) }
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(4usize, 60u8) as u64) }
     }
     #[inline]
     pub fn set_Reserved(&mut self, val: ULONGLONG) {
         unsafe {
             let val: u64 = ::std::mem::transmute(val);
-            self._bitfield_1.set(3usize, 61u8, val as u64)
+            self._bitfield_1.set(4usize, 60u8, val as u64)
         }
     }
     #[inline]
@@ -46795,8 +48373,8 @@ impl _D3DKMT_ENUMADAPTERS_FILTER__bindgen_ty_1 {
         unsafe {
             ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 8usize]>>::raw_get(
                 ::std::ptr::addr_of!((*this)._bitfield_1),
-                3usize,
-                61u8,
+                4usize,
+                60u8,
             ) as u64)
         }
     }
@@ -46806,8 +48384,8 @@ impl _D3DKMT_ENUMADAPTERS_FILTER__bindgen_ty_1 {
             let val: u64 = ::std::mem::transmute(val);
             <__BindgenBitfieldUnit<[u8; 8usize]>>::raw_set(
                 ::std::ptr::addr_of_mut!((*this)._bitfield_1),
-                3usize,
-                61u8,
+                4usize,
+                60u8,
                 val as u64,
             )
         }
@@ -46817,6 +48395,7 @@ impl _D3DKMT_ENUMADAPTERS_FILTER__bindgen_ty_1 {
         IncludeComputeOnly: ULONGLONG,
         IncludeDisplayOnly: ULONGLONG,
         IncludeVirtualGpuOnly: ULONGLONG,
+        IncludeTestOnly: ULONGLONG,
         Reserved: ULONGLONG,
     ) -> __BindgenBitfieldUnit<[u8; 8usize]> {
         let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 8usize]> = Default::default();
@@ -46833,7 +48412,11 @@ impl _D3DKMT_ENUMADAPTERS_FILTER__bindgen_ty_1 {
                 unsafe { ::std::mem::transmute(IncludeVirtualGpuOnly) };
             IncludeVirtualGpuOnly as u64
         });
-        __bindgen_bitfield_unit.set(3usize, 61u8, {
+        __bindgen_bitfield_unit.set(3usize, 1u8, {
+            let IncludeTestOnly: u64 = unsafe { ::std::mem::transmute(IncludeTestOnly) };
+            IncludeTestOnly as u64
+        });
+        __bindgen_bitfield_unit.set(4usize, 60u8, {
             let Reserved: u64 = unsafe { ::std::mem::transmute(Reserved) };
             Reserved as u64
         });
@@ -47056,6 +48639,7 @@ pub const _D3DKMT_ESCAPETYPE_D3DKMT_ESCAPE_GET_DISPLAY_CONFIGURATIONS: _D3DKMT_E
 pub const _D3DKMT_ESCAPETYPE_D3DKMT_ESCAPE_QUERY_IOMMU_STATUS: _D3DKMT_ESCAPETYPE = 37;
 pub const _D3DKMT_ESCAPETYPE_D3DKMT_ESCAPE_CCD_DATABASE: _D3DKMT_ESCAPETYPE = 38;
 pub const _D3DKMT_ESCAPETYPE_D3DKMT_ESCAPE_QUERY_DMA_REMAPPING_STATUS: _D3DKMT_ESCAPETYPE = 39;
+pub const _D3DKMT_ESCAPETYPE_D3DKMT_ESCAPE_QUERY_PHYSICAL_ADAPTER: _D3DKMT_ESCAPETYPE = 40;
 pub const _D3DKMT_ESCAPETYPE_D3DKMT_ESCAPE_WIN32K_START: _D3DKMT_ESCAPETYPE = 1024;
 pub const _D3DKMT_ESCAPETYPE_D3DKMT_ESCAPE_WIN32K_HIP_DEVICE_INFO: _D3DKMT_ESCAPETYPE = 1024;
 pub const _D3DKMT_ESCAPETYPE_D3DKMT_ESCAPE_WIN32K_QUERY_CD_ROTATION_BLOCK: _D3DKMT_ESCAPETYPE =
@@ -47131,6 +48715,9 @@ pub const _D3DKMT_VIDMMESCAPETYPE_D3DKMT_VIDMMESCAPETYPE_VALIDATE_INTEGRITY:
     _D3DKMT_VIDMMESCAPETYPE = 17;
 pub const _D3DKMT_VIDMMESCAPETYPE_D3DKMT_VIDMMESCAPETYPE_SET_EVICTION_CONFIG:
     _D3DKMT_VIDMMESCAPETYPE = 18;
+pub const _D3DKMT_VIDMMESCAPETYPE_D3DKMT_VIDMMESCAPETYPE_COPY_CONTENT: _D3DKMT_VIDMMESCAPETYPE = 19;
+pub const _D3DKMT_VIDMMESCAPETYPE_D3DKMT_VIDMMESCAPETYPE_DEBUG: _D3DKMT_VIDMMESCAPETYPE = 20;
+pub const _D3DKMT_VIDMMESCAPETYPE_D3DKMT_VIDMMESCAPETYPE_QUERYSECTION: _D3DKMT_VIDMMESCAPETYPE = 21;
 pub type _D3DKMT_VIDMMESCAPETYPE = ::std::os::raw::c_int;
 pub use self::_D3DKMT_VIDMMESCAPETYPE as D3DKMT_VIDMMESCAPETYPE;
 pub const _D3DKMT_VIDSCHESCAPETYPE_D3DKMT_VIDSCHESCAPETYPE_PREEMPTIONCONTROL:
@@ -47831,6 +49418,10 @@ impl Default for _D3DKMT_ESCAPE_VIRTUAL_REFRESH_RATE {
     }
 }
 pub type D3DKMT_ESCAPE_VIRTUAL_REFRESH_RATE = _D3DKMT_ESCAPE_VIRTUAL_REFRESH_RATE;
+pub const _D3DKMT_ESCAPE_COPY_CONTENT_DIRECTION_D3DKMT_ESCAPE_COPY_CONTENT_DIRECTION_TO_ALLOCATION : _D3DKMT_ESCAPE_COPY_CONTENT_DIRECTION = 0 ;
+pub const _D3DKMT_ESCAPE_COPY_CONTENT_DIRECTION_D3DKMT_ESCAPE_COPY_CONTENT_DIRECTION_FROM_ALLOCATION : _D3DKMT_ESCAPE_COPY_CONTENT_DIRECTION = 1 ;
+pub type _D3DKMT_ESCAPE_COPY_CONTENT_DIRECTION = ::std::os::raw::c_int;
+pub use self::_D3DKMT_ESCAPE_COPY_CONTENT_DIRECTION as D3DKMT_ESCAPE_COPY_CONTENT_DIRECTION;
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct _D3DKMT_VIDMM_ESCAPE {
@@ -47841,20 +49432,23 @@ pub struct _D3DKMT_VIDMM_ESCAPE {
 #[derive(Copy, Clone)]
 pub union _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1 {
     pub SetFault: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_1,
-    pub Evict: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2,
-    pub EvictByNtHandle: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3,
-    pub GetVads: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4,
-    pub SetBudget: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5,
-    pub SuspendProcess: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_6,
-    pub ResumeProcess: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_7,
-    pub GetBudget: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_8,
-    pub SetTrimIntervals: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9,
+    pub Debug: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2,
+    pub Evict: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3,
+    pub EvictByNtHandle: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4,
+    pub GetVads: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5,
+    pub SetBudget: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_6,
+    pub SuspendProcess: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_7,
+    pub ResumeProcess: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_8,
+    pub GetBudget: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9,
+    pub SetTrimIntervals: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10,
     pub EvictByCriteria: D3DKMT_EVICTION_CRITERIA,
-    pub Wake: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10,
-    pub Defrag: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11,
-    pub DelayExecution: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12,
-    pub VerifyIntegrity: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13,
-    pub DelayedEvictionConfig: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14,
+    pub Wake: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11,
+    pub Defrag: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12,
+    pub DelayExecution: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13,
+    pub VerifyIntegrity: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14,
+    pub DelayedEvictionConfig: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_15,
+    pub CopyContent: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16,
+    pub QuerySection: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_17,
 }
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -48547,32 +50141,147 @@ impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_1 {
     }
 }
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Copy, Clone)]
 pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2 {
-    pub ResourceHandle: D3DKMT_HANDLE,
-    pub AllocationHandle: D3DKMT_HANDLE,
-    pub hProcess: HANDLE,
+    pub __bindgen_anon_1: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1 {
+    pub __bindgen_anon_1:
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1__bindgen_ty_1,
+    pub Value: ULONG,
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1__bindgen_ty_1 {
+    pub _bitfield_align_1: [u32; 0],
+    pub _bitfield_1: __BindgenBitfieldUnit<[u8; 4usize]>,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1__bindgen_ty_1"]
+        [::std::mem::size_of::<
+            _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1__bindgen_ty_1,
+        >() - 4usize];
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1__bindgen_ty_1"]
+        [::std::mem::align_of::<
+            _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1__bindgen_ty_1,
+        >() - 4usize];
+};
+impl _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1__bindgen_ty_1 {
+    #[inline]
+    pub fn TestNativeFence(&self) -> ULONG {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(0usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_TestNativeFence(&mut self, val: ULONG) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(0usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn TestNativeFence_raw(this: *const Self) -> ULONG {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                0usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_TestNativeFence_raw(this: *mut Self, val: ULONG) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                0usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn Reserved(&self) -> ULONG {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(1usize, 31u8) as u32) }
+    }
+    #[inline]
+    pub fn set_Reserved(&mut self, val: ULONG) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(1usize, 31u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn Reserved_raw(this: *const Self) -> ULONG {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                1usize,
+                31u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_Reserved_raw(this: *mut Self, val: ULONG) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                1usize,
+                31u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn new_bitfield_1(
+        TestNativeFence: ULONG,
+        Reserved: ULONG,
+    ) -> __BindgenBitfieldUnit<[u8; 4usize]> {
+        let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 4usize]> = Default::default();
+        __bindgen_bitfield_unit.set(0usize, 1u8, {
+            let TestNativeFence: u32 = unsafe { ::std::mem::transmute(TestNativeFence) };
+            TestNativeFence as u64
+        });
+        __bindgen_bitfield_unit.set(1usize, 31u8, {
+            let Reserved: u32 = unsafe { ::std::mem::transmute(Reserved) };
+            Reserved as u64
+        });
+        __bindgen_bitfield_unit
+    }
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1"][::std::mem::size_of::<
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1,
+    >() - 4usize];
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1"]
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1>()
+            - 4usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1::Value"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1,
+        Value
+    )
+        - 0usize];
+};
+impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2__bindgen_ty_1 {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2"]
-        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2>() - 16usize];
+        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2>() - 4usize];
     ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2"]
-        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2>() - 8usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2::ResourceHandle"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2,
-        ResourceHandle
-    )
-        - 0usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2::AllocationHandle"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2,
-        AllocationHandle
-    )
-        - 4usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2::hProcess"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2,
-        hProcess
-    ) - 8usize];
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2>() - 4usize];
 };
 impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2 {
     fn default() -> Self {
@@ -48584,33 +50293,70 @@ impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_2 {
     }
 }
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3 {
-    pub NtHandle: UINT64,
+    pub ResourceHandle: D3DKMT_HANDLE,
+    pub AllocationHandle: D3DKMT_HANDLE,
+    pub hProcess: HANDLE,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3"]
-        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3>() - 8usize];
+        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3>() - 16usize];
     ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3"]
         [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3>() - 8usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3::NtHandle"][::std::mem::offset_of!(
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3::ResourceHandle"][::std::mem::offset_of!(
         _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3,
+        ResourceHandle
+    )
+        - 0usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3::AllocationHandle"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3,
+        AllocationHandle
+    )
+        - 4usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3::hProcess"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3,
+        hProcess
+    ) - 8usize];
+};
+impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_3 {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4 {
+    pub NtHandle: UINT64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4"]
+        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4>() - 8usize];
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4"]
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4>() - 8usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4::NtHandle"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4,
         NtHandle
     ) - 0usize];
 };
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4 {
-    pub __bindgen_anon_1: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1,
+pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5 {
+    pub __bindgen_anon_1: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1,
     pub Command: D3DKMT_VAD_ESCAPE_COMMAND,
     pub Status: NTSTATUS,
-    pub __bindgen_anon_2: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_2,
+    pub __bindgen_anon_2: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_2,
 }
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub union _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1 {
-    pub GetNumVads: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1__bindgen_ty_1,
+pub union _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1 {
+    pub GetNumVads: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1__bindgen_ty_1,
     pub GetVad: D3DKMT_VAD_DESC,
     pub GetVadRange: D3DKMT_VA_RANGE_DESC,
     pub GetGpuMmuCaps: D3DKMT_GET_GPUMMU_CAPS,
@@ -48619,69 +50365,69 @@ pub union _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1 {
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
-pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1__bindgen_ty_1 {
+pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1__bindgen_ty_1 {
     pub NumVads: UINT,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1__bindgen_ty_1"]
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1__bindgen_ty_1"]
         [::std::mem::size_of::<
-            _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1__bindgen_ty_1,
+            _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1__bindgen_ty_1,
         >() - 4usize];
-    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1__bindgen_ty_1"]
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1__bindgen_ty_1"]
         [::std::mem::align_of::<
-            _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1__bindgen_ty_1,
+            _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1__bindgen_ty_1,
         >() - 4usize];
     [
-        "Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1__bindgen_ty_1::NumVads",
+        "Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1__bindgen_ty_1::NumVads",
     ][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1__bindgen_ty_1,
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1__bindgen_ty_1,
         NumVads
     ) - 0usize];
 };
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1"][::std::mem::size_of::<
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1,
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1"][::std::mem::size_of::<
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1,
     >() - 1072usize];
-    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1"]
-        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1>()
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1"]
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1>()
             - 8usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1::GetNumVads"]
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1::GetNumVads"]
         [::std::mem::offset_of!(
-            _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1,
+            _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1,
             GetNumVads
         ) - 0usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1::GetVad"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1,
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1::GetVad"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1,
         GetVad
     )
         - 0usize];
     [
-        "Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1::GetVadRange",
+        "Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1::GetVadRange",
     ][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1,
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1,
         GetVadRange
     ) - 0usize];
     [
-        "Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1::GetGpuMmuCaps",
+        "Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1::GetGpuMmuCaps",
     ][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1,
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1,
         GetGpuMmuCaps
     ) - 0usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1::GetPte"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1,
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1::GetPte"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1,
         GetPte
     )
         - 0usize];
     [
-        "Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1::GetSegmentCaps",
+        "Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1::GetSegmentCaps",
     ][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1,
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1,
         GetSegmentCaps
     ) - 0usize];
 };
-impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1 {
+impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_1 {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
         unsafe {
@@ -48692,24 +50438,24 @@ impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_1 
 }
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub union _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_2 {
+pub union _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_2 {
     pub GetPteExt: D3DKMT_GET_PTE_EXT,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_2"][::std::mem::size_of::<
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_2,
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_2"][::std::mem::size_of::<
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_2,
     >() - 1024usize];
-    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_2"]
-        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_2>()
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_2"]
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_2>()
             - 8usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_2::GetPteExt"]
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_2::GetPteExt"]
         [::std::mem::offset_of!(
-            _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_2,
+            _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_2,
             GetPteExt
         ) - 0usize];
 };
-impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_2 {
+impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5__bindgen_ty_2 {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
         unsafe {
@@ -48720,20 +50466,20 @@ impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4__bindgen_ty_2 
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4"]
-        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4>() - 2104usize];
-    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4"]
-        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4>() - 8usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4::Command"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4,
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5"]
+        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5>() - 2104usize];
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5"]
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5>() - 8usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5::Command"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5,
         Command
     ) - 1072usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4::Status"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4,
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5::Status"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5,
         Status
     ) - 1076usize];
 };
-impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4 {
+impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5 {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
         unsafe {
@@ -48744,32 +50490,9 @@ impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_4 {
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
-pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5 {
+pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_6 {
     pub LocalMemoryBudget: ULONGLONG,
     pub SystemMemoryBudget: ULONGLONG,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5"]
-        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5>() - 16usize];
-    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5"]
-        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5>() - 8usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5::LocalMemoryBudget"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5,
-        LocalMemoryBudget
-    )
-        - 0usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5::SystemMemoryBudget"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_5,
-        SystemMemoryBudget
-    )
-        - 8usize];
-};
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_6 {
-    pub hProcess: HANDLE,
-    pub bAllowWakeOnSubmission: BOOL,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -48777,40 +50500,38 @@ const _: () = {
         [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_6>() - 16usize];
     ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_6"]
         [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_6>() - 8usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_6::hProcess"][::std::mem::offset_of!(
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_6::LocalMemoryBudget"][::std::mem::offset_of!(
         _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_6,
-        hProcess
-    ) - 0usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_6::bAllowWakeOnSubmission"][::std::mem::offset_of!(
+        LocalMemoryBudget
+    )
+        - 0usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_6::SystemMemoryBudget"][::std::mem::offset_of!(
         _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_6,
-        bAllowWakeOnSubmission
+        SystemMemoryBudget
     )
         - 8usize];
 };
-impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_6 {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_7 {
     pub hProcess: HANDLE,
+    pub bAllowWakeOnSubmission: BOOL,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_7"]
-        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_7>() - 8usize];
+        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_7>() - 16usize];
     ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_7"]
         [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_7>() - 8usize];
     ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_7::hProcess"][::std::mem::offset_of!(
         _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_7,
         hProcess
     ) - 0usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_7::bAllowWakeOnSubmission"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_7,
+        bAllowWakeOnSubmission
+    )
+        - 8usize];
 };
 impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_7 {
     fn default() -> Self {
@@ -48822,9 +50543,9 @@ impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_7 {
     }
 }
 #[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
+#[derive(Debug, Copy, Clone)]
 pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_8 {
-    pub NumBytesToTrim: UINT64,
+    pub hProcess: HANDLE,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -48832,102 +50553,12 @@ const _: () = {
         [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_8>() - 8usize];
     ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_8"]
         [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_8>() - 8usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_8::NumBytesToTrim"][::std::mem::offset_of!(
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_8::hProcess"][::std::mem::offset_of!(
         _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_8,
-        NumBytesToTrim
-    )
-        - 0usize];
-};
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9 {
-    pub MinTrimInterval: ULONG,
-    pub MaxTrimInterval: ULONG,
-    pub IdleTrimInterval: ULONG,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9"]
-        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9>() - 12usize];
-    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9"]
-        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9>() - 4usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9::MinTrimInterval"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9,
-        MinTrimInterval
-    )
-        - 0usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9::MaxTrimInterval"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9,
-        MaxTrimInterval
-    )
-        - 4usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9::IdleTrimInterval"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9,
-        IdleTrimInterval
-    )
-        - 8usize];
-};
-#[repr(C)]
-#[derive(Debug, Default, Copy, Clone)]
-pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10 {
-    pub bFlush: BOOL,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10"]
-        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10>() - 4usize];
-    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10"]
-        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10>() - 4usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10::bFlush"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10,
-        bFlush
+        hProcess
     ) - 0usize];
 };
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11 {
-    pub Operation: D3DKMT_DEFRAG_ESCAPE_OPERATION,
-    pub SegmentId: UINT,
-    pub TotalCommitted: ULONGLONG,
-    pub TotalFree: ULONGLONG,
-    pub LargestGapBefore: ULONGLONG,
-    pub LargestGapAfter: ULONGLONG,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11"]
-        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11>() - 40usize];
-    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11"]
-        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11>() - 8usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11::Operation"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11,
-        Operation
-    ) - 0usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11::SegmentId"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11,
-        SegmentId
-    ) - 4usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11::TotalCommitted"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11,
-        TotalCommitted
-    )
-        - 8usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11::TotalFree"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11,
-        TotalFree
-    ) - 16usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11::LargestGapBefore"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11,
-        LargestGapBefore
-    )
-        - 24usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11::LargestGapAfter"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11,
-        LargestGapAfter
-    )
-        - 32usize];
-};
-impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11 {
+impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_8 {
     fn default() -> Self {
         let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
         unsafe {
@@ -48938,7 +50569,122 @@ impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11 {
 }
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
+pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9 {
+    pub NumBytesToTrim: UINT64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9"]
+        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9>() - 8usize];
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9"]
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9>() - 8usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9::NumBytesToTrim"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_9,
+        NumBytesToTrim
+    )
+        - 0usize];
+};
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10 {
+    pub MinTrimInterval: ULONG,
+    pub MaxTrimInterval: ULONG,
+    pub IdleTrimInterval: ULONG,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10"]
+        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10>() - 12usize];
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10"]
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10>() - 4usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10::MinTrimInterval"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10,
+        MinTrimInterval
+    )
+        - 0usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10::MaxTrimInterval"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10,
+        MaxTrimInterval
+    )
+        - 4usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10::IdleTrimInterval"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_10,
+        IdleTrimInterval
+    )
+        - 8usize];
+};
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11 {
+    pub bFlush: BOOL,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11"]
+        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11>() - 4usize];
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11"]
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11>() - 4usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11::bFlush"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_11,
+        bFlush
+    ) - 0usize];
+};
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
 pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12 {
+    pub Operation: D3DKMT_DEFRAG_ESCAPE_OPERATION,
+    pub SegmentId: UINT,
+    pub TotalCommitted: ULONGLONG,
+    pub TotalFree: ULONGLONG,
+    pub LargestGapBefore: ULONGLONG,
+    pub LargestGapAfter: ULONGLONG,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12"]
+        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12>() - 40usize];
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12"]
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12>() - 8usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12::Operation"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12,
+        Operation
+    ) - 0usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12::SegmentId"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12,
+        SegmentId
+    ) - 4usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12::TotalCommitted"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12,
+        TotalCommitted
+    )
+        - 8usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12::TotalFree"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12,
+        TotalFree
+    ) - 16usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12::LargestGapBefore"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12,
+        LargestGapBefore
+    )
+        - 24usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12::LargestGapAfter"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12,
+        LargestGapAfter
+    )
+        - 32usize];
+};
+impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12 {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13 {
     pub hPagingQueue: D3DKMT_HANDLE,
     pub PhysicalAdapterIndex: UINT,
     pub Milliseconds: ULONG,
@@ -48946,69 +50692,143 @@ pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12 {
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12"]
-        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12>() - 24usize];
-    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12"]
-        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12>() - 8usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12::hPagingQueue"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12,
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13"]
+        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13>() - 24usize];
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13"]
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13>() - 8usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13::hPagingQueue"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13,
         hPagingQueue
     )
         - 0usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12::PhysicalAdapterIndex"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12,
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13::PhysicalAdapterIndex"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13,
         PhysicalAdapterIndex
     )
         - 4usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12::Milliseconds"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12,
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13::Milliseconds"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13,
         Milliseconds
     )
         - 8usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12::PagingFenceValue"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_12,
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13::PagingFenceValue"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13,
         PagingFenceValue
     )
         - 16usize];
 };
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
-pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13 {
+pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14 {
     pub PhysicalAdapterIndex: UINT16,
     pub SegmentId: UINT16,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13"]
-        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13>() - 4usize];
-    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13"]
-        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13>() - 2usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13::PhysicalAdapterIndex"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13,
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14"]
+        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14>() - 4usize];
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14"]
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14>() - 2usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14::PhysicalAdapterIndex"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14,
         PhysicalAdapterIndex
     )
         - 0usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13::SegmentId"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_13,
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14::SegmentId"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14,
         SegmentId
     ) - 2usize];
 };
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]
-pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14 {
+pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_15 {
     pub TimerValue: LONGLONG,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14"]
-        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14>() - 8usize];
-    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14"]
-        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14>() - 8usize];
-    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14::TimerValue"][::std::mem::offset_of!(
-        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_14,
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_15"]
+        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_15>() - 8usize];
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_15"]
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_15>() - 8usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_15::TimerValue"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_15,
         TimerValue
     ) - 0usize];
 };
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16 {
+    pub UserBuffer: PVOID,
+    pub Direction: D3DKMT_ESCAPE_COPY_CONTENT_DIRECTION,
+    pub hAllocation: D3DKMT_HANDLE,
+    pub Offset: UINT64,
+    pub Size: UINT64,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16"]
+        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16>() - 32usize];
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16"]
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16>() - 8usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16::UserBuffer"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16,
+        UserBuffer
+    ) - 0usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16::Direction"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16,
+        Direction
+    ) - 8usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16::hAllocation"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16,
+        hAllocation
+    )
+        - 12usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16::Offset"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16,
+        Offset
+    ) - 16usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16::Size"]
+        [::std::mem::offset_of!(_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16, Size) - 24usize];
+};
+impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_16 {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_17 {
+    pub hAllocation: D3DKMT_HANDLE,
+    pub hSection: HANDLE,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_17"]
+        [::std::mem::size_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_17>() - 16usize];
+    ["Alignment of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_17"]
+        [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_17>() - 8usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_17::hAllocation"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_17,
+        hAllocation
+    ) - 0usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_17::hSection"][::std::mem::offset_of!(
+        _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_17,
+        hSection
+    ) - 8usize];
+};
+impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1__bindgen_ty_17 {
+    fn default() -> Self {
+        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
+        unsafe {
+            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
+            s.assume_init()
+        }
+    }
+}
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1"]
@@ -49017,6 +50837,8 @@ const _: () = {
         [::std::mem::align_of::<_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1>() - 8usize];
     ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1::SetFault"]
         [::std::mem::offset_of!(_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1, SetFault) - 0usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1::Debug"]
+        [::std::mem::offset_of!(_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1, Debug) - 0usize];
     ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1::Evict"]
         [::std::mem::offset_of!(_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1, Evict) - 0usize];
     ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1::EvictByNtHandle"]
@@ -49047,6 +50869,10 @@ const _: () = {
         _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1,
         DelayedEvictionConfig
     ) - 0usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1::CopyContent"]
+        [::std::mem::offset_of!(_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1, CopyContent) - 0usize];
+    ["Offset of field: _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1::QuerySection"]
+        [::std::mem::offset_of!(_D3DKMT_VIDMM_ESCAPE__bindgen_ty_1, QuerySection) - 0usize];
 };
 impl Default for _D3DKMT_VIDMM_ESCAPE__bindgen_ty_1 {
     fn default() -> Self {
@@ -49676,14 +51502,146 @@ impl _D3DKMT_PROCESS_VERIFIER_VIDMM_FLAGS__bindgen_ty_1 {
         }
     }
     #[inline]
+    pub fn AlwaysCreateLocalAlloc(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(5usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_AlwaysCreateLocalAlloc(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(5usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn AlwaysCreateLocalAlloc_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                5usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_AlwaysCreateLocalAlloc_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                5usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn DisablePermanentUmVaUpgrade(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(6usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_DisablePermanentUmVaUpgrade(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(6usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn DisablePermanentUmVaUpgrade_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                6usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_DisablePermanentUmVaUpgrade_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                6usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn AlwaysUseSystemHeap(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(7usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_AlwaysUseSystemHeap(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(7usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn AlwaysUseSystemHeap_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                7usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_AlwaysUseSystemHeap_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                7usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn SynchronousDeferredCommands(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(8usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_SynchronousDeferredCommands(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(8usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn SynchronousDeferredCommands_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                8usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_SynchronousDeferredCommands_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                8usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
     pub fn Reserved(&self) -> UINT {
-        unsafe { ::std::mem::transmute(self._bitfield_1.get(5usize, 27u8) as u32) }
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(9usize, 23u8) as u32) }
     }
     #[inline]
     pub fn set_Reserved(&mut self, val: UINT) {
         unsafe {
             let val: u32 = ::std::mem::transmute(val);
-            self._bitfield_1.set(5usize, 27u8, val as u64)
+            self._bitfield_1.set(9usize, 23u8, val as u64)
         }
     }
     #[inline]
@@ -49691,8 +51649,8 @@ impl _D3DKMT_PROCESS_VERIFIER_VIDMM_FLAGS__bindgen_ty_1 {
         unsafe {
             ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
                 ::std::ptr::addr_of!((*this)._bitfield_1),
-                5usize,
-                27u8,
+                9usize,
+                23u8,
             ) as u32)
         }
     }
@@ -49702,8 +51660,8 @@ impl _D3DKMT_PROCESS_VERIFIER_VIDMM_FLAGS__bindgen_ty_1 {
             let val: u32 = ::std::mem::transmute(val);
             <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
                 ::std::ptr::addr_of_mut!((*this)._bitfield_1),
-                5usize,
-                27u8,
+                9usize,
+                23u8,
                 val as u64,
             )
         }
@@ -49715,6 +51673,10 @@ impl _D3DKMT_PROCESS_VERIFIER_VIDMM_FLAGS__bindgen_ty_1 {
         AlwaysFailCommitOnReclaim: UINT,
         AlwaysPlaceInDemotedLocation: UINT,
         IgnoreBudgetCap: UINT,
+        AlwaysCreateLocalAlloc: UINT,
+        DisablePermanentUmVaUpgrade: UINT,
+        AlwaysUseSystemHeap: UINT,
+        SynchronousDeferredCommands: UINT,
         Reserved: UINT,
     ) -> __BindgenBitfieldUnit<[u8; 4usize]> {
         let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 4usize]> = Default::default();
@@ -49741,7 +51703,26 @@ impl _D3DKMT_PROCESS_VERIFIER_VIDMM_FLAGS__bindgen_ty_1 {
             let IgnoreBudgetCap: u32 = unsafe { ::std::mem::transmute(IgnoreBudgetCap) };
             IgnoreBudgetCap as u64
         });
-        __bindgen_bitfield_unit.set(5usize, 27u8, {
+        __bindgen_bitfield_unit.set(5usize, 1u8, {
+            let AlwaysCreateLocalAlloc: u32 =
+                unsafe { ::std::mem::transmute(AlwaysCreateLocalAlloc) };
+            AlwaysCreateLocalAlloc as u64
+        });
+        __bindgen_bitfield_unit.set(6usize, 1u8, {
+            let DisablePermanentUmVaUpgrade: u32 =
+                unsafe { ::std::mem::transmute(DisablePermanentUmVaUpgrade) };
+            DisablePermanentUmVaUpgrade as u64
+        });
+        __bindgen_bitfield_unit.set(7usize, 1u8, {
+            let AlwaysUseSystemHeap: u32 = unsafe { ::std::mem::transmute(AlwaysUseSystemHeap) };
+            AlwaysUseSystemHeap as u64
+        });
+        __bindgen_bitfield_unit.set(8usize, 1u8, {
+            let SynchronousDeferredCommands: u32 =
+                unsafe { ::std::mem::transmute(SynchronousDeferredCommands) };
+            SynchronousDeferredCommands as u64
+        });
+        __bindgen_bitfield_unit.set(9usize, 23u8, {
             let Reserved: u32 = unsafe { ::std::mem::transmute(Reserved) };
             Reserved as u64
         });
@@ -49855,6 +51836,8 @@ pub type D3DKMT_PROCESS_VERIFIER_OPTION = _D3DKMT_PROCESS_VERIFIER_OPTION;
 pub const _D3DKMT_ADAPTER_VERIFIER_OPTION_TYPE_D3DKMT_ADAPTER_VERIFIER_OPTION_VIDMM_FLAGS:
     _D3DKMT_ADAPTER_VERIFIER_OPTION_TYPE = 1000;
 pub const _D3DKMT_ADAPTER_VERIFIER_OPTION_TYPE_D3DKMT_ADAPTER_VERIFIER_OPTION_VIDMM_TRIM_INTERVAL : _D3DKMT_ADAPTER_VERIFIER_OPTION_TYPE = 1001 ;
+pub const _D3DKMT_ADAPTER_VERIFIER_OPTION_TYPE_D3DKMT_ADAPTER_VERIFIER_OPTION_VIDMM_PAGING_INFO:
+    _D3DKMT_ADAPTER_VERIFIER_OPTION_TYPE = 1002;
 pub type _D3DKMT_ADAPTER_VERIFIER_OPTION_TYPE = ::std::os::raw::c_int;
 pub use self::_D3DKMT_ADAPTER_VERIFIER_OPTION_TYPE as D3DKMT_ADAPTER_VERIFIER_OPTION_TYPE;
 #[repr(C)]
@@ -49867,7 +51850,7 @@ pub union _D3DKMT_ADAPTER_VERIFIER_VIDMM_FLAGS {
 #[repr(align(4))]
 #[derive(Debug, Default, Copy, Clone)]
 pub struct _D3DKMT_ADAPTER_VERIFIER_VIDMM_FLAGS__bindgen_ty_1 {
-    pub _bitfield_align_1: [u16; 0],
+    pub _bitfield_align_1: [u8; 0],
     pub _bitfield_1: __BindgenBitfieldUnit<[u8; 4usize]>,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
@@ -50605,14 +52588,146 @@ impl _D3DKMT_ADAPTER_VERIFIER_VIDMM_FLAGS__bindgen_ty_1 {
         }
     }
     #[inline]
+    pub fn AlwaysUseAperture(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(22usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_AlwaysUseAperture(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(22usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn AlwaysUseAperture_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                22usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_AlwaysUseAperture_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                22usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn DisableMigration(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(23usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_DisableMigration(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(23usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn DisableMigration_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                23usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_DisableMigration_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                23usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn ForceDiscardCpuHostApertureRange(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(24usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_ForceDiscardCpuHostApertureRange(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(24usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn ForceDiscardCpuHostApertureRange_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                24usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_ForceDiscardCpuHostApertureRange_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                24usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
+    pub fn PeriodicTrimNeverIdle(&self) -> UINT {
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(25usize, 1u8) as u32) }
+    }
+    #[inline]
+    pub fn set_PeriodicTrimNeverIdle(&mut self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            self._bitfield_1.set(25usize, 1u8, val as u64)
+        }
+    }
+    #[inline]
+    pub unsafe fn PeriodicTrimNeverIdle_raw(this: *const Self) -> UINT {
+        unsafe {
+            ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
+                ::std::ptr::addr_of!((*this)._bitfield_1),
+                25usize,
+                1u8,
+            ) as u32)
+        }
+    }
+    #[inline]
+    pub unsafe fn set_PeriodicTrimNeverIdle_raw(this: *mut Self, val: UINT) {
+        unsafe {
+            let val: u32 = ::std::mem::transmute(val);
+            <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
+                ::std::ptr::addr_of_mut!((*this)._bitfield_1),
+                25usize,
+                1u8,
+                val as u64,
+            )
+        }
+    }
+    #[inline]
     pub fn Reserved(&self) -> UINT {
-        unsafe { ::std::mem::transmute(self._bitfield_1.get(22usize, 10u8) as u32) }
+        unsafe { ::std::mem::transmute(self._bitfield_1.get(26usize, 6u8) as u32) }
     }
     #[inline]
     pub fn set_Reserved(&mut self, val: UINT) {
         unsafe {
             let val: u32 = ::std::mem::transmute(val);
-            self._bitfield_1.set(22usize, 10u8, val as u64)
+            self._bitfield_1.set(26usize, 6u8, val as u64)
         }
     }
     #[inline]
@@ -50620,8 +52735,8 @@ impl _D3DKMT_ADAPTER_VERIFIER_VIDMM_FLAGS__bindgen_ty_1 {
         unsafe {
             ::std::mem::transmute(<__BindgenBitfieldUnit<[u8; 4usize]>>::raw_get(
                 ::std::ptr::addr_of!((*this)._bitfield_1),
-                22usize,
-                10u8,
+                26usize,
+                6u8,
             ) as u32)
         }
     }
@@ -50631,8 +52746,8 @@ impl _D3DKMT_ADAPTER_VERIFIER_VIDMM_FLAGS__bindgen_ty_1 {
             let val: u32 = ::std::mem::transmute(val);
             <__BindgenBitfieldUnit<[u8; 4usize]>>::raw_set(
                 ::std::ptr::addr_of_mut!((*this)._bitfield_1),
-                22usize,
-                10u8,
+                26usize,
+                6u8,
                 val as u64,
             )
         }
@@ -50661,6 +52776,10 @@ impl _D3DKMT_ADAPTER_VERIFIER_VIDMM_FLAGS__bindgen_ty_1 {
         AlwaysFailGrowVPRMoves: UINT,
         NeverFlushTemporaryResources: UINT,
         AllocateTemporaryResourcesInAperture: UINT,
+        AlwaysUseAperture: UINT,
+        DisableMigration: UINT,
+        ForceDiscardCpuHostApertureRange: UINT,
+        PeriodicTrimNeverIdle: UINT,
         Reserved: UINT,
     ) -> __BindgenBitfieldUnit<[u8; 4usize]> {
         let mut __bindgen_bitfield_unit: __BindgenBitfieldUnit<[u8; 4usize]> = Default::default();
@@ -50761,7 +52880,25 @@ impl _D3DKMT_ADAPTER_VERIFIER_VIDMM_FLAGS__bindgen_ty_1 {
                 unsafe { ::std::mem::transmute(AllocateTemporaryResourcesInAperture) };
             AllocateTemporaryResourcesInAperture as u64
         });
-        __bindgen_bitfield_unit.set(22usize, 10u8, {
+        __bindgen_bitfield_unit.set(22usize, 1u8, {
+            let AlwaysUseAperture: u32 = unsafe { ::std::mem::transmute(AlwaysUseAperture) };
+            AlwaysUseAperture as u64
+        });
+        __bindgen_bitfield_unit.set(23usize, 1u8, {
+            let DisableMigration: u32 = unsafe { ::std::mem::transmute(DisableMigration) };
+            DisableMigration as u64
+        });
+        __bindgen_bitfield_unit.set(24usize, 1u8, {
+            let ForceDiscardCpuHostApertureRange: u32 =
+                unsafe { ::std::mem::transmute(ForceDiscardCpuHostApertureRange) };
+            ForceDiscardCpuHostApertureRange as u64
+        });
+        __bindgen_bitfield_unit.set(25usize, 1u8, {
+            let PeriodicTrimNeverIdle: u32 =
+                unsafe { ::std::mem::transmute(PeriodicTrimNeverIdle) };
+            PeriodicTrimNeverIdle as u64
+        });
+        __bindgen_bitfield_unit.set(26usize, 6u8, {
             let Reserved: u32 = unsafe { ::std::mem::transmute(Reserved) };
             Reserved as u64
         });
@@ -50793,11 +52930,14 @@ pub struct _D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL {
     pub MinimumTrimInterval: UINT64,
     pub MaximumTrimInterval: UINT64,
     pub IdleTrimInterval: UINT64,
+    pub ForegroundTrimInterval: UINT64,
+    pub StartPeriodicTrimThreshold: UINT32,
+    pub CriticalPeriodicTrimThreshold: UINT32,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL"]
-        [::std::mem::size_of::<_D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL>() - 24usize];
+        [::std::mem::size_of::<_D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL>() - 40usize];
     ["Alignment of _D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL"]
         [::std::mem::align_of::<_D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL>() - 8usize];
     ["Offset of field: _D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL::MinimumTrimInterval"][::std::mem::offset_of!(
@@ -50815,24 +52955,64 @@ const _: () = {
         IdleTrimInterval
     )
         - 16usize];
+    ["Offset of field: _D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL::ForegroundTrimInterval"][::std::mem::offset_of!(
+        _D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL,
+        ForegroundTrimInterval
+    )
+        - 24usize];
+    ["Offset of field: _D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL::StartPeriodicTrimThreshold"][::std::mem::offset_of!(
+        _D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL,
+        StartPeriodicTrimThreshold
+    )
+        - 32usize];
+    [
+        "Offset of field: _D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL::CriticalPeriodicTrimThreshold",
+    ][::std::mem::offset_of!(
+        _D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL,
+        CriticalPeriodicTrimThreshold
+    ) - 36usize];
 };
 pub type D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL = _D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL;
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct _D3DKMT_ADAPTER_VERIFIER_VIDMM_PAGING_INFO {
+    pub FillPattern: UINT32,
+    pub MaxTransferChunkSize: UINT32,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_ADAPTER_VERIFIER_VIDMM_PAGING_INFO"]
+        [::std::mem::size_of::<_D3DKMT_ADAPTER_VERIFIER_VIDMM_PAGING_INFO>() - 8usize];
+    ["Alignment of _D3DKMT_ADAPTER_VERIFIER_VIDMM_PAGING_INFO"]
+        [::std::mem::align_of::<_D3DKMT_ADAPTER_VERIFIER_VIDMM_PAGING_INFO>() - 4usize];
+    ["Offset of field: _D3DKMT_ADAPTER_VERIFIER_VIDMM_PAGING_INFO::FillPattern"]
+        [::std::mem::offset_of!(_D3DKMT_ADAPTER_VERIFIER_VIDMM_PAGING_INFO, FillPattern) - 0usize];
+    ["Offset of field: _D3DKMT_ADAPTER_VERIFIER_VIDMM_PAGING_INFO::MaxTransferChunkSize"][::std::mem::offset_of!(
+        _D3DKMT_ADAPTER_VERIFIER_VIDMM_PAGING_INFO,
+        MaxTransferChunkSize
+    )
+        - 4usize];
+};
+pub type D3DKMT_ADAPTER_VERIFIER_VIDMM_PAGING_INFO = _D3DKMT_ADAPTER_VERIFIER_VIDMM_PAGING_INFO;
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub union _D3DKMT_ADAPTER_VERIFIER_OPTION_DATA {
     pub VidMmFlags: D3DKMT_ADAPTER_VERIFIER_VIDMM_FLAGS,
     pub VidMmTrimInterval: D3DKMT_ADAPTER_VERIFIER_VIDMM_TRIM_INTERVAL,
+    pub VidMmPagingInfo: D3DKMT_ADAPTER_VERIFIER_VIDMM_PAGING_INFO,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _D3DKMT_ADAPTER_VERIFIER_OPTION_DATA"]
-        [::std::mem::size_of::<_D3DKMT_ADAPTER_VERIFIER_OPTION_DATA>() - 24usize];
+        [::std::mem::size_of::<_D3DKMT_ADAPTER_VERIFIER_OPTION_DATA>() - 40usize];
     ["Alignment of _D3DKMT_ADAPTER_VERIFIER_OPTION_DATA"]
         [::std::mem::align_of::<_D3DKMT_ADAPTER_VERIFIER_OPTION_DATA>() - 8usize];
     ["Offset of field: _D3DKMT_ADAPTER_VERIFIER_OPTION_DATA::VidMmFlags"]
         [::std::mem::offset_of!(_D3DKMT_ADAPTER_VERIFIER_OPTION_DATA, VidMmFlags) - 0usize];
     ["Offset of field: _D3DKMT_ADAPTER_VERIFIER_OPTION_DATA::VidMmTrimInterval"]
         [::std::mem::offset_of!(_D3DKMT_ADAPTER_VERIFIER_OPTION_DATA, VidMmTrimInterval) - 0usize];
+    ["Offset of field: _D3DKMT_ADAPTER_VERIFIER_OPTION_DATA::VidMmPagingInfo"]
+        [::std::mem::offset_of!(_D3DKMT_ADAPTER_VERIFIER_OPTION_DATA, VidMmPagingInfo) - 0usize];
 };
 impl Default for _D3DKMT_ADAPTER_VERIFIER_OPTION_DATA {
     fn default() -> Self {
@@ -50854,7 +53034,7 @@ pub struct _D3DKMT_ADAPTER_VERIFIER_OPTION {
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _D3DKMT_ADAPTER_VERIFIER_OPTION"]
-        [::std::mem::size_of::<_D3DKMT_ADAPTER_VERIFIER_OPTION>() - 32usize];
+        [::std::mem::size_of::<_D3DKMT_ADAPTER_VERIFIER_OPTION>() - 48usize];
     ["Alignment of _D3DKMT_ADAPTER_VERIFIER_OPTION"]
         [::std::mem::align_of::<_D3DKMT_ADAPTER_VERIFIER_OPTION>() - 8usize];
     ["Offset of field: _D3DKMT_ADAPTER_VERIFIER_OPTION::Type"]
@@ -52562,6 +54742,8 @@ pub const _D3DKMT_QUERYSTATISTICS_SEGMENT_TYPE_D3DKMT_QUERYSTATISTICS_SEGMENT_TY
     _D3DKMT_QUERYSTATISTICS_SEGMENT_TYPE = 1;
 pub const _D3DKMT_QUERYSTATISTICS_SEGMENT_TYPE_D3DKMT_QUERYSTATISTICS_SEGMENT_TYPE_SYSMEM:
     _D3DKMT_QUERYSTATISTICS_SEGMENT_TYPE = 2;
+pub const _D3DKMT_QUERYSTATISTICS_SEGMENT_TYPE_D3DKMT_QUERYSTATISTICS_SEGMENT_TYPE_PARTITION:
+    _D3DKMT_QUERYSTATISTICS_SEGMENT_TYPE = 3;
 pub type _D3DKMT_QUERYSTATISTICS_SEGMENT_TYPE = ::std::os::raw::c_int;
 pub use self::_D3DKMT_QUERYSTATISTICS_SEGMENT_TYPE as D3DKMT_QUERYSTATISTICS_SEGMENT_TYPE;
 #[repr(C)]
@@ -53665,6 +55847,51 @@ impl Default for _D3DKMT_QUERYSTATISTICS {
     }
 }
 pub type D3DKMT_QUERYSTATISTICS = _D3DKMT_QUERYSTATISTICS;
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct _D3DKMT_QUERY_PHYSICAL_ADAPTER {
+    pub PhysicalAdapterIndex: UINT,
+    pub NumExecutionNodes: UINT,
+    pub PagingNodeIndex: UINT,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_QUERY_PHYSICAL_ADAPTER"]
+        [::std::mem::size_of::<_D3DKMT_QUERY_PHYSICAL_ADAPTER>() - 12usize];
+    ["Alignment of _D3DKMT_QUERY_PHYSICAL_ADAPTER"]
+        [::std::mem::align_of::<_D3DKMT_QUERY_PHYSICAL_ADAPTER>() - 4usize];
+    ["Offset of field: _D3DKMT_QUERY_PHYSICAL_ADAPTER::PhysicalAdapterIndex"]
+        [::std::mem::offset_of!(_D3DKMT_QUERY_PHYSICAL_ADAPTER, PhysicalAdapterIndex) - 0usize];
+    ["Offset of field: _D3DKMT_QUERY_PHYSICAL_ADAPTER::NumExecutionNodes"]
+        [::std::mem::offset_of!(_D3DKMT_QUERY_PHYSICAL_ADAPTER, NumExecutionNodes) - 4usize];
+    ["Offset of field: _D3DKMT_QUERY_PHYSICAL_ADAPTER::PagingNodeIndex"]
+        [::std::mem::offset_of!(_D3DKMT_QUERY_PHYSICAL_ADAPTER, PagingNodeIndex) - 8usize];
+};
+pub type D3DKMT_QUERY_PHYSICAL_ADAPTER = _D3DKMT_QUERY_PHYSICAL_ADAPTER;
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct _D3DKMT_QUERY_PHYSICAL_ADAPTER_1 {
+    pub PhysicalAdapterIndex: UINT,
+    pub NumExecutionNodes: UINT,
+    pub PagingNodeIndex: UINT,
+    pub GdiNodeIndex: UINT,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of _D3DKMT_QUERY_PHYSICAL_ADAPTER_1"]
+        [::std::mem::size_of::<_D3DKMT_QUERY_PHYSICAL_ADAPTER_1>() - 16usize];
+    ["Alignment of _D3DKMT_QUERY_PHYSICAL_ADAPTER_1"]
+        [::std::mem::align_of::<_D3DKMT_QUERY_PHYSICAL_ADAPTER_1>() - 4usize];
+    ["Offset of field: _D3DKMT_QUERY_PHYSICAL_ADAPTER_1::PhysicalAdapterIndex"]
+        [::std::mem::offset_of!(_D3DKMT_QUERY_PHYSICAL_ADAPTER_1, PhysicalAdapterIndex) - 0usize];
+    ["Offset of field: _D3DKMT_QUERY_PHYSICAL_ADAPTER_1::NumExecutionNodes"]
+        [::std::mem::offset_of!(_D3DKMT_QUERY_PHYSICAL_ADAPTER_1, NumExecutionNodes) - 4usize];
+    ["Offset of field: _D3DKMT_QUERY_PHYSICAL_ADAPTER_1::PagingNodeIndex"]
+        [::std::mem::offset_of!(_D3DKMT_QUERY_PHYSICAL_ADAPTER_1, PagingNodeIndex) - 8usize];
+    ["Offset of field: _D3DKMT_QUERY_PHYSICAL_ADAPTER_1::GdiNodeIndex"]
+        [::std::mem::offset_of!(_D3DKMT_QUERY_PHYSICAL_ADAPTER_1, GdiNodeIndex) - 12usize];
+};
+pub type D3DKMT_QUERY_PHYSICAL_ADAPTER_1 = _D3DKMT_QUERY_PHYSICAL_ADAPTER_1;
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct _D3DKMT_PRESENT_STATS_DWM2 {
@@ -59611,6 +61838,8 @@ pub const DXGI_COLOR_SPACE_TYPE_DXGI_COLOR_SPACE_YCBCR_STUDIO_G24_LEFT_P2020:
     DXGI_COLOR_SPACE_TYPE = 23;
 pub const DXGI_COLOR_SPACE_TYPE_DXGI_COLOR_SPACE_YCBCR_STUDIO_G24_TOPLEFT_P2020:
     DXGI_COLOR_SPACE_TYPE = 24;
+pub const DXGI_COLOR_SPACE_TYPE_DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P2020: DXGI_COLOR_SPACE_TYPE =
+    25;
 pub const DXGI_COLOR_SPACE_TYPE_DXGI_COLOR_SPACE_CUSTOM: DXGI_COLOR_SPACE_TYPE = -1;
 pub type DXGI_COLOR_SPACE_TYPE = ::std::os::raw::c_int;
 pub const DXGI_FORMAT_DXGI_FORMAT_UNKNOWN: DXGI_FORMAT = 0;
