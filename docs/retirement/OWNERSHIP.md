@@ -89,7 +89,7 @@ work, never per unit.
 |---|---|---|
 | `protocol` | Linux | `cd protocol && CARGO_TARGET_DIR=target/linux cargo test` — there is **no workspace root**, so `-p` from the repo root fails. |
 | `vkd3d-proton-helios` | Linux | `build-native-codex && ninja` — green, 102/102, tests included. |
-| `qemu-helios` | Linux | `build-helios && ninja qemu-system-x86_64` — green. |
+| `qemu-helios` | Linux | `build-helios && ninja qemu-system-x86_64` — green. ⛔ **The HPM1/HLM1 memory lane is PARKED — see `FINDINGS.md` F5.** The submodule is reset to its pre-retirement state; the three HPM1 commits live on branch `helios/hpm1-parked`. Do not re-open them without running their adversarial review first, and do not add a new QEMU dependency to any lane. |
 | `kmd_render`, `umd`, `umd12` | **VM only** | WDK/bindgen. Serialize: the VM is one machine. |
 | `icd/mesa` | **VM only** | `win_meson`. |
 
