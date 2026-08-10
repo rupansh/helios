@@ -324,12 +324,42 @@ PY
 )
 
 # §8 row 5 — "DxgkDdiOpenAllocation writes NO byte of the private buffer".
+#
+# ⛔ AMENDED 2026-08-11, because the obligation's PREMISE was falsified on the
+# target. §8.5 assumed the create-time write reaches the caller, so the open had
+# nothing left to publish. It does not: dxgkrnl DISCARDS a KMD write into
+# `DXGK_ALLOCATIONINFO::pPrivateDriverData` for any user-supplied buffer —
+# `tools/hwa2_writeback_probe.c` on 22.22.266.0, 7 allocations across both
+# thunks, both record types, bare and resource-associated, every one unstamped in
+# the caller's buffer AND unstamped on arrival at the open DDI (5 × `0x0C02_00E6`
+# in the diag ring) — while the same write at OPEN reaches user mode (probe H2
+# went FAIL → PASS on 22.22.267.0, `OaHvm1Stamp=1`, `TsPoolBind=1`). The WDK
+# annotates the two fields `in:` and `in/out:` respectively; the retirement read
+# the first one as the second.
+#
+# So the rule is now: the open writes no byte of an HWA2 or HOC1 buffer — the
+# no-restamp property §8.5 exists for, and the one the "two openers disagree"
+# defect actually needed — and exactly ONE licensed write of an HVM1
+# create-output, in `EXEMPT_CALLEE`, which is itself checked here rather than
+# waved through. Adding a second name to that list is a contract change and must
+# be argued in the commit that does it.
 K4_OBLIGATION5_PY=$(cat <<'PY'
 REPO = sys.argv[1]
 ROOT = REPO + '/kmd_render/src'
 PATH = ROOT + '/ddi/create_allocation.rs'
 BUF = 'pPrivateDriverData'
 DDI = 'dxgkddi_open_allocation'
+# The ONE function licensed to write the private buffer, and the record type it
+# is licensed for. Everything else in the flow stays under the original rules.
+EXEMPT_CALLEE = 'stamp_open_hvm1'
+EXEMPT_SIZE = 'HELIOS_HVM1_SIZE'
+# The write intrinsics the exempt callee is allowed to use, and nothing else.
+EXEMPT_WRITES = ('from_raw_parts_mut', 'copy_from_slice')
+# Record vocabularies the exempt callee may not touch: naming one of these is how
+# an HVM1-shaped exemption would be widened into an HWA2/HOC1 restamp.
+EXEMPT_FORBIDDEN = ('HELIOS_HWA2_BYTES', 'HELIOS_HWA2_MAGIC', 'HELIOS_HOC1_SIZE',
+                    'HELIOS_HOC1_MAGIC', 'HeliosWddmAllocationDescV2',
+                    'HeliosOuterCommandAllocationV1')
 # ── The two vocabularies, and why one is OPEN and the other is CLOSED.
 #
 # WRITE_INTRINSICS is the OPEN side: a substring net over free/path calls whose
@@ -554,6 +584,7 @@ def statements(text):
 
 ddi_text = body_from(code, m.start())
 bad = []
+exempt_seen = set()  # EXEMPT_CALLEE, if the flow actually reaches it
 followed = {}       # callee name -> (file, name, start, body, [param aliases])
 ptr_ret = set()     # followed callees that return a pointer/reference
 aliases = {BUF: -1}
@@ -603,6 +634,30 @@ while progress:
                      + ', '.join('%s:%d' % (d[0], d[1].count('\n', 0, d[2].start()) + 1) for d in defs)
                      + '. This gate resolves a callee by BARE NAME and cannot tell which one the call means, so vetting one of them would be a silent pass -- FIX THIS GATE (or rename one of them), do not delete it')
         f, c, fm = defs[0]
+        if name == EXEMPT_CALLEE:
+            # The exemption is not a pass: the callee is held to a stricter,
+            # HVM1-shaped contract than the generic rules could express.
+            exempt_seen.add(name)
+            ebody = body_from(c, fm.start())
+            ebase = c.count('\n', 0, fm.start()) + 1
+            if not re.search(r'private_size\s+as\s+usize\s*!=\s*' + EXEMPT_SIZE + r'\s+as\s+usize',
+                             ebody):
+                bad.append('EXEMPTION: `%s` no longer guards on `private_size as usize != %s as usize`, so its write is no longer bounded by the record size' % (name, EXEMPT_SIZE))
+            for est, estmt in statements(ebody):
+                for w in WRITE_INTRINSICS:
+                    if w not in estmt:
+                        continue
+                    en = ebase + ebody.count('\n', 0, est + estmt.find(w))
+                    if w not in EXEMPT_WRITES:
+                        bad.append('%s:%d: EXEMPTION: write intrinsic `%s` in `%s` is outside the licensed pair %s'
+                                   % (f, en, w, name, '/'.join(EXEMPT_WRITES)))
+                    elif w == 'from_raw_parts_mut' and EXEMPT_SIZE not in estmt:
+                        bad.append('%s:%d: EXEMPTION: `from_raw_parts_mut` in `%s` is not bounded by %s -- %s'
+                                   % (f, en, name, EXEMPT_SIZE, ' '.join(estmt.split())))
+            for banned in EXEMPT_FORBIDDEN:
+                if banned in ebody:
+                    bad.append('EXEMPTION: `%s` names `%s`. The exemption is HVM1-only; an HWA2/HOC1 restamp is exactly what §8.5 still forbids' % (name, banned))
+            continue
         hdr = fn_header(c, fm.start(), name)
         if hdr is None:
             sys.exit('cannot parse the signature of `' + name + '`, which receives the private buffer -- FIX THIS GATE, do not delete it')
@@ -677,18 +732,20 @@ for f, name, start, text, alias_at in regions:
                 bad.append('%s:%d: method `.%s()` in a statement that names the private buffer in %s, and it is not on the read-only allow-list -- %s'
                            % (f, n, mname, name, src))
 
-if refs == 0 or len(regions) < 2:
-    sys.exit('the gate found no private-buffer flow in %s (refs=%d, followed=%d). Either the DDI stopped reading private data or the gate went blind -- FIX THIS GATE, do not delete it' % (DDI, refs, len(regions) - 1))
+if refs == 0 or len(followed) < 2:
+    sys.exit('the gate found no private-buffer flow in %s (refs=%d, followed=%d). Either the DDI stopped reading private data or the gate went blind -- FIX THIS GATE, do not delete it' % (DDI, refs, len(followed)))
 if bad:
     sys.exit('OBLIGATION 5 VIOLATED -- DxgkDdiOpenAllocation writes the allocation-private buffer:\n' + '\n'.join(bad))
-print('OK: %s + %d const-only callee(s) [%s]: %d %s reference(s), %d alias(es)%s -- no write intrinsic, no *mut, no assignment (plain or compound), no method outside the read-only allow-list'
+print('OK: %s + %d const-only callee(s) [%s]: %d %s reference(s), %d alias(es)%s -- no write intrinsic, no *mut, no assignment (plain or compound), no method outside the read-only allow-list.\n    Licensed HVM1 write: %s'
       % (DDI, len(regions) - 1, ', '.join(r[1] for r in regions[1:]), refs,
          BUF, len(alias_names),
-         (' [' + ', '.join(sorted(alias_names)) + ']') if alias_names else ''))
+         (' [' + ', '.join(sorted(alias_names)) + ']') if alias_names else '',
+         ('%s, length-guarded on %s, no HWA2/HOC1 vocabulary' % (EXEMPT_CALLEE, EXEMPT_SIZE))
+         if exempt_seen else 'none in this flow'))
 PY
 )
 
-run_gate "K4 §8.5: DxgkDdiOpenAllocation writes no byte of the private buffer" \
+run_gate "K4 §8.5 (amended): open writes no byte of an HWA2/HOC1 buffer; the HVM1 stamp is the one licensed write" \
     python3 -c "$K4_RUST_MASK_PY
 $K4_OBLIGATION5_PY" "$REPO"
 

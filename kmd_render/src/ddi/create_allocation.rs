@@ -470,6 +470,20 @@ static OPEN_NO_RESOURCE_ID: AtomicU32 = AtomicU32::new(0);
 /// the OPEN as well as the create; the open is not a place to be lenient,
 /// because the receiving UMD reads the identical bytes.
 static OPEN_HWA2_REJECT: AtomicU32 = AtomicU32::new(0);
+/// HVM1 records stamped with their create-output at OPEN (`OaHvm1Stamp`), and
+/// the ones that could not be (`OaHvm1Rej`: a mint failure, or bytes that were
+/// neither a valid create-input nor an already-stamped create-output).
+///
+/// ⛔ MEASURED 2026-08-11, and the reason the stamp is here rather than at
+/// create: dxgkrnl DISCARDS a KMD write into `DXGK_ALLOCATIONINFO::
+/// pPrivateDriverData` when the buffer came from user mode. `tools/hwa2_writeback_probe.c`
+/// on 22.22.266.0 created 7 allocations across both thunks, both record types,
+/// bare and resource-associated, and every one came back unstamped in the
+/// caller's buffer *and* arrived unstamped at this DDI (5 × `0x0C02_00E6` in the
+/// diag ring). `DXGK_OPENALLOCATIONINFO::pPrivateDriverData` is the field the
+/// WDK annotates `in/out`; `DXGK_ALLOCATIONINFO::pPrivateDriverData` is `in`.
+static OPEN_HVM1_STAMPED: AtomicU32 = AtomicU32::new(0);
+static OPEN_HVM1_REJECT: AtomicU32 = AtomicU32::new(0);
 /// Presents refused because [`present_alloc_info`] answered `None` — the A3 gap
 /// reaching the DISPLAY path (`PrNoRid`).
 ///
@@ -584,7 +598,7 @@ static STANDARD_SELF_REJECT: AtomicU32 = AtomicU32::new(0);
 /// names sharing a 14-byte prefix would MERGE into one registry value — a
 /// refusal counter reading someone else's number. Same guard
 /// `diag::FaultCounter` and `native_fence.rs` use.
-const RETIREMENT_COUNTER_NAMES: [&[u8]; 26] = [
+const RETIREMENT_COUNTER_NAMES: [&[u8]; 28] = [
     b"AcOk",
     b"AcMagic",
     b"AcHwa2Rej",
@@ -617,6 +631,8 @@ const RETIREMENT_COUNTER_NAMES: [&[u8]; 26] = [
     b"AcGenEpoch",
     b"AcOptLin",
     b"OaHwa2Rej",
+    b"OaHvm1Stamp",
+    b"OaHvm1Rej",
 ];
 
 const _: () = {
@@ -3816,6 +3832,11 @@ unsafe fn admit_hvm1(
     };
 
     // The three write-back fields (§10.7:1955, :1960, :1961), and nothing else.
+    // ⚠ MEASURED 2026-08-11: dxgkrnl DISCARDS this write — no caller and no later
+    // DDI ever sees it (`tools/hwa2_writeback_probe.c`). [`stamp_open_hvm1`] is
+    // what actually publishes the create-output; this stays because the record
+    // must still be a valid create-output before the allocation is admitted, and
+    // because an OS that did propagate it would then agree with the open.
     record.object_generation = generation;
     record.segment_page_shift = HELIOS_HVM1_SEGMENT_PAGE_SHIFT;
     // §10.7:1961 — "the KMD returns the exact alignment". Every backing this
@@ -4500,15 +4521,22 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
 /// return a miniport-owned, device-specific tracking handle as required by the
 /// DDI contract.
 ///
-/// # ⛔ THIS DDI WRITES NO BYTE OF ANY PRIVATE BUFFER
+/// # ⛔ THIS DDI WRITES NO BYTE OF AN HWA2 OR HOC1 BUFFER — and exactly one of an HVM1
 ///
-/// That is the whole point of the retirement's identity model (§10.3:1033-1034,
-/// §18.1:4769, A.2 row 5694). Two `write_open_identity` restamps used to live
-/// here — one per entry, one call-level — and their existence is exactly why two
-/// openers of one allocation could disagree about what they had. There is no
-/// arm below that takes a `*mut` to `pPrivateDriverData`, and there must never
-/// be one: the create-time descriptor is `const` from the instant
+/// The no-restamp rule is the retirement's identity model (§10.3:1033-1034,
+/// §18.1:4769, A.2 row 5694): two `write_open_identity` restamps used to live
+/// here, one per entry and one call-level, and their existence is exactly why
+/// two openers of one allocation could disagree about what they had. That rule
+/// stands for HWA2 and HOC1, whose descriptors are `const` from the instant
 /// `DxgkDdiCreateAllocation` returns.
+///
+/// ⛔ It could NOT stand for the HVM1 create-output, and the premise underneath
+/// it — that a create-time write reaches the caller — was FALSIFIED on the
+/// target on 2026-08-11: dxgkrnl discards a KMD write into
+/// `DXGK_ALLOCATIONINFO::pPrivateDriverData` for any user-supplied buffer, so
+/// there was no channel left. [`stamp_open_hvm1`] is that one licensed write and
+/// carries the measurement; nothing else here may take a `*mut` to
+/// `pPrivateDriverData`.
 ///
 /// The thing the restamps were FOR — giving a UMD opener of a KMD-created
 /// standard allocation something to alias the venus resource with — is not
@@ -4584,18 +4612,20 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         let desc =
             unsafe { read_open_descriptor(info.pPrivateDriverData, info.PrivateDriverDataSize) };
 
-        // K5: bind the role-1 HVM1 reply pool to the raw device's provisional
-        // HTS1 session. This DDI is the ONLY allocation DDI that carries
-        // `hDevice` — `DXGKARG_CREATEALLOCATION` has none — so it is the only
-        // place the binding §10.4:1205-1206 requires can happen. Read-only, and
-        // a refusal never fails the open (see `bind_reply_pool`).
-        // ⛔ Role 1 ONLY. A raw device also opens role-2/role-4 allocations in
-        // bulk once A3 lands, and offering those to the binder would make
-        // `TsPoolRej` — a counter documented as an anomaly — climb on the normal
-        // path, which is worse than not counting at all.
-        if let Some((Hvm1Role::ReplyPool, byte_size, generation)) =
-            unsafe { read_open_hvm1(info.pPrivateDriverData, info.PrivateDriverDataSize) }
-        {
+        // K5: stamp the HVM1 create-output and bind the role-1 reply pool to the
+        // raw device's provisional HTS1 session. This DDI is the ONLY allocation
+        // DDI that carries `hDevice` — `DXGKARG_CREATEALLOCATION` has none — so it
+        // is the only place the binding §10.4:1205-1206 requires can happen, and
+        // (measured, see `OPEN_HVM1_STAMPED`) the only place a create-output can
+        // be published at all. A refusal never fails the open (see
+        // `bind_reply_pool`).
+        // ⛔ Role 1 ONLY for the BIND. A raw device also opens role-2/role-4
+        // allocations in bulk once A3 lands, and offering those to the binder
+        // would make `TsPoolRej` — a counter documented as an anomaly — climb on
+        // the normal path. Every role is stamped; only role 1 is bound.
+        let hvm1 =
+            unsafe { stamp_open_hvm1(info.pPrivateDriverData, info.PrivateDriverDataSize) };
+        if let Some((Hvm1Role::ReplyPool, byte_size, generation)) = hvm1 {
             if let Some(device) = unsafe { crate::device::DeviceHandleRef::from_raw(h_device) } {
                 crate::ddi::translation_session::bind_reply_pool(
                     device.session_cell(),
@@ -4735,35 +4765,79 @@ unsafe fn read_open_descriptor(
     Some(desc)
 }
 
-/// Read an allocation's create-time HVM1 record at open time, for K5's reply-pool
-/// binding. Returns `(role, byte_size, object_generation)`.
+/// Complete an HVM1 record's create-output at OPEN and publish it through the
+/// `in/out` private-data pointer. Returns `(role, byte_size, object_generation)`.
 ///
 /// `None` for a buffer that is absent, the wrong length, or not an HVM1 —
 /// `DxgkDdiOpenAllocation` is called for every allocation, and an HWA2 or HOC1
-/// legitimately is not one. The record is re-validated as a `CreateOutput`
-/// because that is the stage these bytes are at by the time the open sees them.
+/// legitimately is not one. Not counted in that case: it is a different record,
+/// not a rejected HVM1.
+///
+/// ⛔ THIS IS THE ONE WRITE THIS DDI PERFORMS, and it is here because the create
+/// path's identical write is discarded — see [`OPEN_HVM1_STAMPED`] for the
+/// measurement.
+///
+/// The "two openers disagree" defect the no-restamp rule exists for cannot reach
+/// an HVM1: §10.7:1971-1972 requires every sharing flag zero, so an HVM1 has
+/// exactly one opener by construction. Belt and braces anyway — an already
+/// stamped buffer is republished as-is rather than re-minted.
 ///
 /// # Safety
 /// `private` is dxgkrnl's per-allocation private buffer and `private_size` its
-/// authoritative length. NOTHING here writes through the pointer.
-unsafe fn read_open_hvm1(
-    private: *const c_void,
+/// authoritative length. The write is bounded by the exact-length check below.
+unsafe fn stamp_open_hvm1(
+    private: *mut c_void,
     private_size: UINT,
 ) -> Option<(Hvm1Role, u64, u64)> {
     if private.is_null() || private_size as usize != HELIOS_HVM1_SIZE as usize {
         return None;
     }
-    // SAFETY: non-null and the length is exactly the record size, checked above.
-    let bytes =
-        unsafe { core::slice::from_raw_parts(private as *const u8, HELIOS_HVM1_SIZE as usize) };
-    let record = HeliosVenusMemoryAllocationV1::from_private_data(bytes).ok()?;
+    // Scoped exactly as `admit_hwa2`'s read is: the write below forms a
+    // `&mut [u8]` over the same address range, and holding a live `&[u8]` across
+    // it is aliasing UB that borrowck cannot see through raw pointers.
+    let parsed = {
+        // SAFETY: non-null and the length is exactly the record size.
+        let bytes =
+            unsafe { core::slice::from_raw_parts(private as *const u8, HELIOS_HVM1_SIZE as usize) };
+        HeliosVenusMemoryAllocationV1::from_private_data(bytes)
+    };
+    let mut record = parsed.ok()?;
     if record.magic != HELIOS_HVM1_MAGIC {
         return None;
     }
-    let role = record
+    // Already complete: a second open, or a buffer dxgkrnl kept from a first one.
+    if let Ok(role) = record.validate(HELIOS_PACKAGE_GENERATION, Hvm1Stage::CreateOutput) {
+        return Some((role, record.byte_size, record.object_generation));
+    }
+    let Ok(role) = record.validate(HELIOS_PACKAGE_GENERATION, Hvm1Stage::CreateInput) else {
+        bump(&OPEN_HVM1_REJECT, b"OaHvm1Rej");
+        return None;
+    };
+    let Some(generation) = allocation_object::mint() else {
+        bump(&OPEN_HVM1_REJECT, b"OaHvm1Rej");
+        return None;
+    };
+    // The same three fields, and the same values, `admit_hvm1` computes
+    // (§10.7:1955, :1960, :1961). Every backing this driver creates is
+    // page-granular, so `PAGE` is the exact alignment.
+    record.object_generation = generation;
+    record.segment_page_shift = HELIOS_HVM1_SEGMENT_PAGE_SHIFT;
+    record.allocation_alignment = PAGE as u64;
+    if record
         .validate(HELIOS_PACKAGE_GENERATION, Hvm1Stage::CreateOutput)
-        .ok()?;
-    Some((role, record.byte_size, record.object_generation))
+        .is_err()
+    {
+        bump(&OPEN_HVM1_REJECT, b"OaHvm1Rej");
+        return None;
+    }
+    // SAFETY: length proven exactly `HELIOS_HVM1_SIZE` above; dxgkrnl owns a
+    // writable buffer of that length for the call's duration, and the WDK
+    // annotates this pointer `in/out` for exactly this purpose.
+    let out =
+        unsafe { core::slice::from_raw_parts_mut(private as *mut u8, HELIOS_HVM1_SIZE as usize) };
+    out.copy_from_slice(bytes_of(&record));
+    bump(&OPEN_HVM1_STAMPED, b"OaHvm1Stamp");
+    Some((role, record.byte_size, generation))
 }
 
 /// `DxgkDdiCloseAllocation` — release device-local allocation references.
