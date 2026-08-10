@@ -8,15 +8,15 @@ UNAUTHORIZED PENDING HTS1/HLM1 AND RUNTIME GATES**
 
 Static-analysis snapshot: **2026-08-09**
 
-> ⚠ **This file is frozen and is NOT rewritten in place. Target measurements
-> that revise claims below are recorded in `docs/retirement/FINDINGS.md`, and
-> where a measurement contradicts this text the measurement wins.** As of
-> 2026-08-10 that already includes the build-28000 package minimum (F1: Core DDI
-> 0116 negotiates on build 26100 — the 28000 requirement was an artifact of what
-> WDK 26100's header *declares*, not of the kernel) and the assumed Code-43
-> failure of HLM1's segment shape (F2: it starts clean and the desktop
-> composites on it). Implementation planning lives in
-> `docs/retirement/OWNERSHIP.md` and the per-lane briefs beside it.
+> ⚠ **This file is frozen and is NOT rewritten in place. Where a measurement or an
+> owner decision contradicts this text, THAT WINS.** ⛔ Before implementing ANY
+> section, read the **SUPERSEDED CLAIMS INDEX at the very end of this file** and
+> `docs/retirement/FINDINGS.md`. As of 2026-08-10 the index already retires the
+> build-28000 package minimum (F1), the assumed Code-43 failure of HLM1's segment
+> shape (F2), **the entire HPM1 host protocol and every requirement that the guest
+> negotiate it (F5 — DECLINED, not deferred)**, and §10.3's Ready/Release fence
+> import (F8). ⛔ **This file's line numbers are load-bearing and an edit here has
+> already invalidated every citation once — preserve the line count.**
 
 Target baseline: **Windows 11 26H1 (build 28000) / WDDM 3.2 / D3D12 Core
 DDI 0116 or later, traditional kernel submission**
@@ -1971,11 +1971,11 @@ data, `VidPnSourceId=D3DDDI_ID_NOTAPPLICABLE`, allocation flags zero, priority
 zero. `CreateShared`, `NtSecuritySharing`, `ExistingSysMem`,
 `ExistingKernelSysMem`, `ExistingSection`, and `PermanentSysMem` are all zero.
 
-Before `DXGKQAITYPE_QUERYSEGMENT4` can expose HLM1, `DxgkDdiStartDevice` must
-negotiate HPM1, reserve the complete prefetchable 64-bit host-visible BAR range,
-and allocate fixed nonpaged `HeliosPhysicalMemoryState`. The negotiated HPM1
-byte capacity and page shift are exactly the size and page granularity later
-reported for HLM1. The immutable segment table is exactly:
+⛔ SUPERSEDED BY F5 — HPM1 IS DECLINED. Ignore "negotiate HPM1" in this
+paragraph; the precondition dies with the protocol, and F2 measured that the
+segment needs no negotiation. `DxgkDdiStartDevice` still reserves the complete
+prefetchable 64-bit host-visible BAR range and allocates fixed nonpaged
+placement state. The immutable segment table is exactly:
 
 1. segment 1, the sole WDDM aperture segment and `PagingBufferSegmentId`; it
    remains the only nonzero `DmaBufferSegmentSet` choice for existing D3D
@@ -4399,11 +4399,11 @@ the pure virtio cache-enum conversion still used by
 Register no `DxgkDdiEscape` implementation in the WDDM-3.2 initialization
 table. Replace adapter-global Venus bring-up/ring state with one object
 namespace per HTS1/`vn_instance` session; a KMD ProcessContext may own several
-bounded sessions and no resource table. Before exposing either segment, StartDevice must
-negotiate HPM1, validate/reserve the complete QEMU host-visible linear BAR, and
-initialize fixed bounded placement/epoch state; a non-`READY` service fails
-adapter initialization rather than lazily starting on the first Vulkan
-allocation. QuerySegment4 then exposes exactly aperture id 1 for paging DMA and
+bounded sessions and no resource table. ⛔ SUPERSEDED BY F5: HPM1 IS DECLINED —
+ignore "negotiate HPM1" and the `READY` service state here. Before exposing
+either segment StartDevice still validates/reserves the complete host-visible
+linear BAR and initializes fixed bounded placement/epoch state, guest-side, with
+no host protocol. QuerySegment4 then exposes exactly aperture id 1 for paging DMA and
 HLM1 memory id 2 with the flags/base/length in section 10.7. HVM1 allocation
 creation owns a same-sized renderer view of authoritative HPM1 bytes and reports
 only those exact local/system placement constraints. Delete
@@ -5926,3 +5926,48 @@ lifetime registration, process-global lookup, polling, and a userspace fence
 manufactured after the reader already exists. Section 10.9 replaces its
 ordering responsibility inside KMD on the exact WDDM allocation; section 17
 removes every displayed reader/writer in the same activation.
+
+---
+
+# SUPERSEDED CLAIMS INDEX
+
+**Appended 2026-08-10. Read this before implementing any section above.**
+
+This file is a static-analysis snapshot written without the ability to run
+anything, so its "hard constraints" encode what its author could prove from
+headers. Several have since been measured false, and one whole protocol has been
+declined by the owner. The body above is **frozen and deliberately not edited**,
+so this index is the only correction that travels with it.
+
+⛔ **Why the index is appended rather than woven in.** Line numbers in this file
+are load-bearing: `docs/retirement/lane-*.md` and `docs/retirement/K4-CONTRACT.md`
+cite ranges into it. Inserting a 10-line banner at the top on 2026-08-10 shifted
+every line after 8 by +10 and silently invalidated **every** citation in
+`lane-kmd-core.md` §1 — discovered a session later, after an agent had already
+read ten lines of the wrong text. **Any future edit to the body must preserve the
+file's line count, or fix every citation in the same commit.** Appending here
+shifts nothing.
+
+## The index
+
+| Claim in this file | Superseded by | What is true instead |
+|---|---|---|
+| Package minimum is **Windows 11 26H1 / build 28000**, Core DDI 0116 "no fallback" (header, §2:114-115, §18.1:4639) | **F1** | Core DDI **0116 negotiates on build 26100**. The 28000 figure was an artifact of what WDK 26100's `d3d12umddi.h` *declares*, not of the kernel. Measured on the inbox runtime, both arms. |
+| HLM1's two-segment shape will fail `AddAdapter` with **Code 43** (the CLAUDE.md invariant this file inherited) | **F2** | It does **not**. `BarSegFlags=0x02` (`CpuVisible=1`, `SupportsCpuHostAperture=0`) starts `OK / CM_PROB_NONE` and `helios_paintcap` shows a fully composited live desktop. The KMD memory lane was never blocked by this. |
+| ⛔ **HPM1 exists at all**: §10.7's paging-DMA protocol, the `HPM1` rows of the C52-C64 constraint table (`:646-650`), the QEMU paging executor in §17.7, and **every requirement that `DxgkDdiStartDevice` negotiate HPM1 before `QUERYSEGMENT4` may expose HLM1** (`:1975`, `:4403`) | **F5** (owner decision) | ⛔ **HPM1 is DECLINED, not deferred.** A new protocol inside a stack we do not own (QEMU) is permanent maintenance cost — ~4,500 lines concentrated in one upstream file, versus the scanout commits which are light and cherry-pickable. **The KMD does the work instead.** C63 is satisfied guest-side by bounds-checked subtraction against the §C65 command pool's own kernel mapping (*stricter* than HPM1 on C63's own invariant); C55's late-binding benefit is unrealized because nothing evicts today. ⇒ **No lane has a QEMU dependency. Do not add one.** The negotiation *precondition* on HLM1 dies with the protocol — and F2 independently shows the segment needs no negotiation. K2 and K3 are **rescoped guest-side, not blocked.** |
+| §18.1's WDDM-3.2 slot audit is unproven | **F6** | Proven on the target in **both** halves, including the refusal path: flipping one row yields `CM_PROB_FAILED_DRIVER_ENTRY` with our own `0xC0000182`, and the breadcrumb decodes to the flipped row's index *and* direction. |
+| §10.3's WSI chain is a design proposal | **F7** (+ addenda) | The **image** half runs end to end on the target: four D3D12 committed textures import per swapchain through `CreateSharedHandle` → `vkGetMemoryWin32HandlePropertiesKHR` → dedicated import → bind → the private tag call. |
+| §10.3's **Ready/Release fences are imported from `ID3D12Fence`** (`:242`, C16 `:610`, C18 `:612`, C19 `:613`) | **F8** | ⛔ **Impossible, and not because of Helios.** An `ID3D12Fence` shared handle is refused by `D3DKMTOpenSyncObjectFromNtHandle2` on **every** adapter measured, including both Microsoft Basic Render Driver ones. The direction **reverses**: `ID3D12Device::OpenSharedHandle` *accepts* a D3DKMT monitored fence the ICD creates and exports, on Helios. So the ICD creates and exports; the D3D12 side opens. |
+| "the native-fence DDI surface is complete" as an activation gate (`OWNERSHIP.md` §3) | **F9** | Four DDI slots are registered; the `DXGKQAITYPE_NATIVE_FENCE_CAPS` arm, `DXGK_FEATURE_NATIVE_FENCE` enablement, the `VIDSCHCAPS` bits and `DXGK_INTERRUPT_NATIVE_FENCE_SIGNALED` reporting are **absent** — nine symbols with no caller. Sequencing (they belong to K8/K9), but the gate is **not met**. |
+| §10.3: the KMD "writes a versioned, immutable descriptor into the `[in/out]` buffer" — with **no statement of what a UMD may legally send** | **`K4-CONTRACT.md` §1** | HWA2 is a **two-stage** record like HVM1 and HOC1: `validate_create_input` / `validate_create_output`. The UMD supplies the geometry (which the kernel cannot invent) with `allocation_generation` and the two KMD-owned flag bits zero; the KMD validates in full and writes all 168 bytes. |
+| §10.3 offset 24: `byte_size` is "the exact backing extent" | **`K4-CONTRACT.md` §1.3** | It is the **resource's** extent, UMD-supplied and echoed — *except* for allocations the KMD authored itself (`STANDARD`), where the KMD replaces its own pre-create estimate with the host's authoritative answer. Enforcing the estimate refused every OS shared primary; the pre-retirement code overwrote it and was right to. |
+| §10.3: a host `resid` "may live solely inside the KMD allocation object" reads as a constraint already satisfied | **`K4-CONTRACT.md` §5** | It is a **mechanism change nobody has built**. HWA2 carries no host `resid` and no Vulkan memory-type index, and the ICD's import consumed both — so the import and export **refuse** until mesa unit **A3** (+K6) lands. Every consumer names A3 in its refusal. |
+| `GlobalVidMmTracker` is "folded into HWA2's tracking-kind fields" (`protocol/src/wddm_legacy.rs`, since corrected) | **`K4-CONTRACT.md` §6** | HWA2 has **no** tracking kind, cookie, global-share field or tracker bit. The mechanism has **no successor**; it dies with UMD-backing adoption. |
+
+## Standing reading rule
+
+Two of this file's load-bearing assumptions were falsified by a single cheap
+experiment each, and a third was withdrawn by the owner on maintenance grounds.
+⇒ **Run the experiment before treating a claim here as a wall**, and prefer a
+runtime check over a constant that encodes a guess about another lane's
+schedule. `FINDINGS.md` is where the answers go.
