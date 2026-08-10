@@ -88,7 +88,7 @@ work, never per unit.
 | Lane | Verifiable on | Note |
 |---|---|---|
 | `protocol` | Linux | `cd protocol && CARGO_TARGET_DIR=target/linux cargo test` — there is **no workspace root**, so `-p` from the repo root fails. |
-| `vkd3d-proton-helios` | Linux | `build-native-codex && ninja` — green, 102/102, tests included. |
+| `vkd3d-proton-helios` | Linux | `build-native-codex && ninja` — green. Tests are **545**, run by `./tests/test-runner.sh build-native-codex/tests/d3d12`, NOT by `meson test` (which reports "No tests defined"). ⚠ The old "102/102" here and the "215/215" in agent memory were both wrong and disagreed with each other. Expect **2 failures**, `test_nvx_cubin` and `test_destruction_notifier_interfaces`; both reproduce on unmodified upstream `2c7ba22c` and neither is ours — see `REVIEW-ROUND-1.md`. The second is concurrency-dependent, so its count varies with `-j` and with machine load. |
 | `qemu-helios` | Linux | `build-helios && ninja qemu-system-x86_64` — green. ⛔ **The HPM1/HLM1 memory lane is PARKED — see `FINDINGS.md` F5.** The submodule is reset to its pre-retirement state; the three HPM1 commits live on branch `helios/hpm1-parked`. Do not re-open them without running their adversarial review first, and do not add a new QEMU dependency to any lane. |
 | `kmd_render`, `umd`, `umd12` | **VM only** | WDK/bindgen. Serialize: the VM is one machine. |
 | `icd/mesa` | **VM only** | `win_meson`. |

@@ -150,9 +150,53 @@ numbers.** `OWNERSHIP.md` §6 says "green, 102/102, tests included"; the agent
 memory says "vkd3d 215/215". Neither is reproducible from `meson test`, which
 reports **"No tests defined"** — vkd3d-proton runs its suite through
 `tests/test-runner.sh` against a built `tests/d3d12` binary, outside meson's
-harness entirely. A number that two records disagree about, and that the obvious
-command contradicts, is a claim to re-derive rather than inherit (METHOD.md §3
-criterion 5).
+harness entirely. The suite actually has **545** tests. A number that two
+records disagree about, and that the obvious command contradicts, is a claim to
+re-derive rather than inherit (METHOD.md §3 criterion 5).
+
+### The two failures, attributed
+
+`./tests/test-runner.sh build-native-codex/tests/d3d12` → **2 failures**:
+`test_nvx_cubin` and `test_destruction_notifier_interfaces`. Both were run
+against **unmodified upstream `2c7ba22c`** on the same host, and **neither is a
+Helios regression**:
+
+| test | fork | upstream `2c7ba22c` |
+|---|---|---|
+| `test_nvx_cubin` | 512 failed assertions, all readbacks zero | **identical**: 512 failed |
+| `test_destruction_notifier_interfaces` | SIGSEGV in `IUnknown_AddRef` | **also SIGSEGV**, at matched build flags |
+
+`test_destruction_notifier_interfaces` is **concurrency-dependent**, and a
+single process never crashes:
+
+```
+concurrency 1: 0/1     concurrency 4: 2/4
+concurrency 2: 1/2     concurrency 8: 5/8      (12 concurrent: 24/24)
+```
+
+That it requires ≥2 concurrent processes rules out a per-process defect in the
+test's own logic and points below vkd3d — concurrent Vulkan/CUDA device creation
+on this host (RTX PRO 6000 Blackwell, driver 610.43.03). It is why the 27-way
+parallel suite run showed the failure and an isolated re-run did not.
+
+⚠ **Two hypotheses were formed and both were killed by measurement, which is the
+part worth keeping:**
+
+1. *"The embedded cubin predates Blackwell."* Refuted: the fatbin carries
+   `sm_120` as both PTX and cubin, and the host is compute 12.0.
+2. *"`tests[]` holds 13 pointers to locals and only `pipeline_library` is
+   initialised, so a failed creation is dereferenced as garbage."* The code
+   really is written that way and the backtrace fits it exactly — but an
+   interleaved A/B of NULL-initialising all 13, **24 runs per arm under
+   identical load, gave 24/24 crashes in both**. The change was reverted rather
+   than committed.
+
+⛔ **The near-miss is the lesson.** The NULL-init arm first measured 0/12
+against a 4/12 baseline and looked like a fix at p≈0.008. It was not: the
+baseline had run while the 545-test suite was still loading the machine and the
+"fix" ran after it finished. An all-A-then-all-B comparison could not separate
+the change from the load, exactly as CLAUDE.md rule 7 says. Interleaving the
+arms is what turned a confident false fix into a refutation.
 
 ---
 
