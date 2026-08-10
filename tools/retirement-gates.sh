@@ -922,6 +922,19 @@ $K4_VKD3D_FLAG_PY" "$REPO"
 run_gate "A2 HNR2 encoder validates against protocol (executed, not compared)" \
     bash "$REPO/tools/hnr2-encoder-gate.sh"
 
+# K6's half of the same corpus. The encoder gate above proves the WIRE is right,
+# with the per-context state machine hand-rolled as test locals; this one drives
+# `helios_kmd_logic::native_render::RenderContext` — the state machine
+# `kmd_render` will actually run, in the crate that only builds on the VM — and
+# adds the three checks only the KMD side can make (staging admission, the
+# one-slot-per-use patch plan, and the `WriteOperation` cross-check `protocol`
+# structurally cannot make because it never sees a `DXGK_ALLOCATIONLIST`).
+# Defeated 5 ways: dropping the open-batch store, dropping the per-entry
+# write-operation check, counting typed operands instead of uses, a no-op staging
+# retire, and a token watermark that never advances.
+run_gate "K6 HNR2 decode: the ICD encoder's corpus replayed through the KMD assembler" \
+    bash "$REPO/tools/hnr2-decode-gate.sh"
+
 run_gate "K5 HTS1/HQA1: the C mirror's records replayed through the KMD session" \
     bash "$REPO/tools/hts1-attach-gate.sh"
 
