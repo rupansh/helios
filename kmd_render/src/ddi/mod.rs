@@ -21,6 +21,7 @@ mod gpummu;
 pub(crate) mod hpd;
 pub(crate) mod interrupt;
 mod lifecycle;
+pub(crate) mod native_fence;
 pub(crate) mod present_packet;
 pub(crate) mod query_adapter_info;
 pub(crate) mod scanout_timeline;
@@ -29,6 +30,7 @@ mod scheduler;
 pub(crate) mod segment_table;
 pub(crate) mod submit_command;
 pub(crate) mod vidpn;
+pub(crate) mod wddm32_slot_audit;
 pub(crate) mod wddm_surface;
 
 pub use add_device::dxgkddi_add_device;
@@ -70,6 +72,11 @@ pub use interrupt::{dxgkddi_control_interrupt, dxgkddi_dpc_routine, dxgkddi_inte
 pub use lifecycle::{
     dxgkddi_dispatch_io_request, dxgkddi_remove_device, dxgkddi_set_power_state,
     dxgkddi_start_device, dxgkddi_stop_device,
+};
+pub use native_fence::{
+    diag_dump_native_fence_atomics, dxgkddi_close_native_fence, dxgkddi_create_native_fence,
+    dxgkddi_destroy_native_fence, dxgkddi_open_native_fence,
+    dxgkddi_update_current_values_from_cpu, dxgkddi_update_monitored_values,
 };
 pub use query_adapter_info::{dxgkddi_get_node_metadata, dxgkddi_query_adapter_info};
 pub use scheduler::{

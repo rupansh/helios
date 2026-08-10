@@ -345,6 +345,14 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // per-call breadcrumbs, so mirror the latest cross-adapter present args
         // here at PASSIVE_LEVEL.
         crate::ddi::diag_dump_present_atomics();
+        // Native-fence tracers. Every counter must read zero while the surface
+        // is `Wddm2_1GpuMmu`: dxgkrnl invokes no WDDM 3.1/3.2 native-fence
+        // callback on a 2.1 adapter, so a nonzero one means either the surface
+        // flipped or a slot is being reached by a path nobody modelled. That is
+        // the value of dumping them BEFORE the flip — the pre-flip run
+        // establishes the zero baseline that makes the post-flip numbers mean
+        // something.
+        crate::ddi::diag_dump_native_fence_atomics();
         // D4a: drop this device's scanout retirement-event registrations —
         // dereference ONLY, no signal (the process is exiting; a wake would
         // land nowhere). Its read-ledger page mapping needs nothing here: it

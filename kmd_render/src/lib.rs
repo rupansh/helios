@@ -73,6 +73,45 @@ pub unsafe extern "system" fn driver_entry(
     diag::record(0x0D00_0001);
 
     let mut init = build_ddi_table();
+
+    // ── The WDDM 3.2 slot audit, before dxgkrnl ever sees the table.
+    //
+    // `ddi::wddm32_slot_audit` classifies all 192 slots of
+    // `DRIVER_INITIALIZATION_DATA` and `verify` walks the table we just built,
+    // checking every slot against its classification. A disagreement is a
+    // driver bug in exactly the class that is otherwise invisible: a slot
+    // registered that should be NULL is reachable code nobody meant to expose,
+    // and a slot NULL that should be registered is a capability we advertise
+    // and cannot service. Neither produces a diagnosable failure at
+    // DxgkInitialize — the first shows up as a call into a stub much later, and
+    // the second as a Code 43 whose ETW reason names a slot rather than a
+    // cause.
+    //
+    // Fail closed, and fail HERE: refusing to load is loud, and it is the one
+    // point at which the table is still ours. `STATUS_DEVICE_CONFIGURATION_ERROR`
+    // is written as a literal rather than taken from the bindings because the
+    // bindgen allowlist is a build-time input this file must not depend on;
+    // 0xC000_0182 is the same code an INF/FILEVERSION mismatch produces, and it
+    // is the honest one — the driver's configuration disagrees with itself.
+    const STATUS_DEVICE_CONFIGURATION_ERROR: NTSTATUS = 0xC000_0182u32 as NTSTATUS;
+    if let Err(failure) = ddi::wddm32_slot_audit::verify(&init) {
+        kmsg(c"Helios: DDI slot audit FAILED; refusing to load\n");
+        // The ring is a u32 per record, so the offending slot travels as its
+        // index (0..192) and the direction it disagreed in. `failure.name` is
+        // in the audit table at that index; a reader resolves it there rather
+        // than trying to format a string at this IRQL.
+        diag::record(0x0D00_1000 | (failure.index as u32));
+        diag::record(if failure.registered {
+            // Registered, classified unreachable.
+            0x0D00_2001
+        } else {
+            // NULL, classified implemented.
+            0x0D00_2002
+        });
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+    diag::record(0x0D00_0003);
+
     // SAFETY: pointers are valid for the call; `init` outlives the call on this
     // stack frame, and DxgkInitialize copies what it needs.
     let status = unsafe { DxgkInitialize(driver_object, registry_path, &mut init) };
@@ -219,6 +258,25 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiCollectDbgInfo = Some(ddi::dxgkddi_collect_dbg_info);
     data.DxgkDdiControlInterrupt = Some(ddi::dxgkddi_control_interrupt);
     data.DxgkDdiQueryCurrentFence = Some(ddi::dxgkddi_query_current_fence);
+
+    // ── Core-0116 native-fence DDIs (retirement §12.1, §17.6). Registered
+    // unconditionally, and reached only when the surface flips: dxgkrnl does not
+    // invoke a WDDM 3.1/3.2 native-fence callback on a 2.1 adapter, and every
+    // advertisement inside these handlers is separately gated on
+    // `ddi::native_fence::NATIVE_FENCE_ADVERTISED`, which is false while
+    // `ddi::wddm_surface::SURFACE` is `Wddm2_1GpuMmu`.
+    //
+    // Registering now rather than at the flip is deliberate: a registered slot
+    // is visible to `ddi::wddm32_slot_audit::verify` below, so the table's shape
+    // is checked every boot from today. An unregistered one would be invisible
+    // until somebody rediscovered it at the flip — which is the one moment when
+    // a missing slot is most expensive to find.
+    data.DxgkDdiCreateNativeFence = Some(ddi::dxgkddi_create_native_fence);
+    data.DxgkDdiDestroyNativeFence = Some(ddi::dxgkddi_destroy_native_fence);
+    data.DxgkDdiOpenNativeFence = Some(ddi::dxgkddi_open_native_fence);
+    data.DxgkDdiCloseNativeFence = Some(ddi::dxgkddi_close_native_fence);
+    data.DxgkDdiUpdateMonitoredValues = Some(ddi::dxgkddi_update_monitored_values);
+    data.DxgkDdiUpdateCurrentValuesFromCpu = Some(ddi::dxgkddi_update_current_values_from_cpu);
 
     data
 }

@@ -44,6 +44,20 @@ pub(crate) enum SlotClass {
     /// Verified exactly like `Disabled` — NULL is the fail-closed state — but
     /// the reason names the owner so reclassification is a one-row TSV edit.
     Pending,
+    /// Registered **today**, and a named lane of the retirement will delete it.
+    /// The mirror of [`Self::Pending`], and it exists for the same reason: this
+    /// table describes the driver that is built, not the driver that is
+    /// intended.
+    ///
+    /// ⚠ **Without this class the audit cannot be armed at all.** Eight slots
+    /// the retirement ends up disabling are live in `build_ddi_table()` right
+    /// now, so classifying them `Disabled` — the state they will reach — makes
+    /// [`verify`] refuse a correct driver, and the only ways out are to not run
+    /// the audit or to delete eight subsystems in one commit. Verified exactly
+    /// like `Implemented` (non-NULL is the correct state today); the reason
+    /// names the lane that will flip it to `Disabled`, and that flip is one
+    /// word per row.
+    Retiring,
 }
 
 /// One audited slot of `DRIVER_INITIALIZATION_DATA`.
@@ -96,7 +110,10 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         offset: 16,
         min_version: "BASE",
         class: SlotClass::Implemented,
-        reason: "PnP: transport bring-up, HPM1 negotiation, segment/placement init.",
+        // HPM1 negotiation was part of this slot's intended job; the QEMU
+        // memory lane is parked (docs/retirement/FINDINGS.md F5), so naming it
+        // here would point a reader at code that is no longer in the tree.
+        reason: "PnP: transport bring-up, segment/placement init.",
     },
     SlotAudit {
         name: "DxgkDdiStopDevice",
@@ -319,8 +336,8 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         name: "DxgkDdiEscape",
         offset: 272,
         min_version: "BASE",
-        class: SlotClass::Disabled,
-        reason: "Section 17.6:4494 and 18.1:4667: DxgkDdiEscape is NULL and no Escape entry point is present in the selected KMD.",
+        class: SlotClass::Retiring,
+        reason: "Section 17.6:4494 and 18.1:4667 delete the Escape entry point, but escape.rs is live today (diagnostic counters, scanout timeline). RETIRING: flips to Disabled when the host/tools lane deletes escape.rs and its consumers.",
     },
     SlotAudit {
         name: "DxgkDdiCollectDbgInfo",
@@ -851,43 +868,43 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         name: "DxgkDdiCreateHwContext",
         offset: 880,
         min_version: "WDDM2_2",
-        class: SlotClass::Disabled,
-        reason: "Section 17.6:4385: HWS/HWQueue is not advertised in this generation, and DXGKQAITYPE_HWSCHEDULINGCAPS is refused, so the hardware-scheduling family is unreachable.",
+        class: SlotClass::Retiring,
+        reason: "Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.",
     },
     SlotAudit {
         name: "DxgkDdiDestroyHwContext",
         offset: 888,
         min_version: "WDDM2_2",
-        class: SlotClass::Disabled,
-        reason: "Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable.",
+        class: SlotClass::Retiring,
+        reason: "Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.",
     },
     SlotAudit {
         name: "DxgkDdiCreateHwQueue",
         offset: 896,
         min_version: "WDDM2_2",
-        class: SlotClass::Disabled,
-        reason: "Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable.",
+        class: SlotClass::Retiring,
+        reason: "Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.",
     },
     SlotAudit {
         name: "DxgkDdiDestroyHwQueue",
         offset: 904,
         min_version: "WDDM2_2",
-        class: SlotClass::Disabled,
-        reason: "Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable.",
+        class: SlotClass::Retiring,
+        reason: "Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.",
     },
     SlotAudit {
         name: "DxgkDdiSubmitCommandToHwQueue",
         offset: 912,
         min_version: "WDDM2_2",
-        class: SlotClass::Disabled,
-        reason: "Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable.",
+        class: SlotClass::Retiring,
+        reason: "Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.",
     },
     SlotAudit {
         name: "DxgkDdiSwitchToHwContextList",
         offset: 920,
         min_version: "WDDM2_2",
-        class: SlotClass::Disabled,
-        reason: "Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable.",
+        class: SlotClass::Retiring,
+        reason: "Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.",
     },
     SlotAudit {
         name: "DxgkDdiResetHwEngine",
@@ -1096,8 +1113,8 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         name: "DxgkDdiPresentToHwQueue",
         offset: 1160,
         min_version: "WDDM2_5",
-        class: SlotClass::Disabled,
-        reason: "Section 17.6:4385: HWS/HWQueue is not advertised; the hardware-scheduling family is unreachable.",
+        class: SlotClass::Retiring,
+        reason: "Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.",
     },
     SlotAudit {
         name: "DxgkDdiValidateSubmitCommand",
@@ -1657,7 +1674,10 @@ pub(crate) fn verify(data: &DRIVER_INITIALIZATION_DATA) -> Result<(), SlotAuditF
         // caller's struct alignment is not this function's to assume.
         let word = unsafe { base.add(slot.offset).cast::<usize>().read_unaligned() };
         let registered = word != 0;
-        let expected = matches!(slot.class, SlotClass::Implemented);
+        // `Retiring` is verified like `Implemented` and `Pending` like
+        // `Disabled`: the audit checks the table that is BUILT, and the two
+        // transitional classes are the two directions it is still moving in.
+        let expected = matches!(slot.class, SlotClass::Implemented | SlotClass::Retiring);
         if registered != expected {
             return Err(SlotAuditFailure {
                 index: i,
