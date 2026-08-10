@@ -56,7 +56,7 @@ labelled in its own commit message; do not assume any is active:
 
 | Component | State | Why |
 |---|---|---|
-| `icd/mesa/.../helios_present_layer.{h,cpp}` | 4269 lines, not in `meson.build` | no `.def`, no layer JSON yet. ⚠ It has therefore **never been compiled**, which is why it is not a review target: `win_meson` will find more in one command than a reading pass would |
+| `icd/mesa/.../helios_present_layer.{h,cpp}` | 4269 lines, **compiles clean now**, still not in `meson.build` | no layer JSON, no packaging. It had never been compiled; the first `clang-cl -fsyntax-only` found **17 errors** of self-drift plus one gate that would have been permanently dark (`REVIEW-ROUND-1.md` review 4). A `.def` turns out **not** to be needed — all eight loader entry points already carry `/EXPORT` directives, verified with `llvm-readobj`. Gated by `tools/mesa-layer-syntax.ps1` |
 | `wddm_surface.rs` `SURFACE` | still `Wddm2_1GpuMmu` | the single atomic activation switch, and the **last** edit of the retirement (`OWNERSHIP.md` §3) |
 
 **Phase 2 round 1 has now run** for `protocol`, `kmd_render` and

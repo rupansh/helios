@@ -215,7 +215,48 @@ Candidates this round did **not** apply:
   names trusting a zero.
 * **Engine contract** — the vkd3d fork's obligations, unreviewed here beyond the
   deletion's completeness.
-* **`icd/mesa`** — deliberately not reviewed. `helios_present_layer.{h,cpp}` is
-  4269 lines that have never been compiled, and the standing lesson is that a
-  module commented out of the build is not authored but unverified. Building it
-  via `win_meson` will find more in one command than a reading pass would.
+* **`icd/mesa`** — deliberately not read. See below: it was **compiled**
+  instead, which is the same judgement carried out.
+
+---
+
+## Review 4 — `icd/mesa`, done by compiler rather than by reading
+
+`helios_present_layer.{h,cpp}` was 4269 lines that had never been through a
+compiler. Rather than spend a reading pass on it, it got a `clang-cl
+-fsyntax-only` — no meson configure, no Mesa dependencies. **17 errors**, and
+the prediction held exactly: the file had drifted from *itself*.
+
+The dispatch tables were written against a **newer shape than the declarations
+above them**:
+
+| what | evidence |
+|---|---|
+| `HeliosEntry` missing a 4th member | every table row supplies one and `GetInstanceProcAddr` reads `e.phys` |
+| 3 gate constants used, never defined | `HELIOS_GATE_{DEVICE_GROUP_CREATION_KHR,PHYSDEV_PROPS2_KHR,BIND_MEMORY2_KHR}` — and **both gate evaluators already had `case` arms for them** |
+| `slots.resize(n)` on a non-movable type | `HeliosSlot` owns a `std::mutex`; `resize` requires MoveInsertable |
+
+⛔ **The finding a compile alone would not have finished.** The three
+`*_enabled` flags those gates read were never declared **and never set**.
+Declaring them to satisfy the compiler would have left them `false` forever,
+silently withholding `vkEnumeratePhysicalDeviceGroupsKHR`,
+`vkGetPhysicalDeviceQueueFamilyProperties2KHR` and the bind-memory2 aliases with
+no counter and no log line — a green build hiding a permanently dark path. They
+are now observed during `CreateInstance`/`CreateDevice`, and *observed* is the
+operative word: they are the app's extensions, the lower ICD implements them,
+so they still travel down in `lower_exts` untouched.
+
+**A wrong inference, caught.** clang warns
+`-Wdll-attribute-on-redeclaration` on all eight exported loader entry points,
+because the Vulkan headers declare them without `dllexport`. The natural
+reading — "the exports are being dropped, the layer needs a `.def`" — is
+**false**: `llvm-readobj --coff-directives` shows all eight `/EXPORT:`
+directives present in the object. Asserting it would have produced an
+unnecessary `.def` and a confident wrong claim in the record.
+
+Now gated by `tools/mesa-layer-syntax.ps1` (VM-only), proven in both
+directions.
+
+⚠ **"Compiles" is not "wired in."** `meson.build`, the layer JSON and packaging
+remain outstanding; nothing loads this yet. It stays in the ROADMAP's
+not-wired-in table.
