@@ -3271,10 +3271,26 @@ unsafe fn admit_hwa2(
     // `linear_blob_size`: a STANDARD allocation with a linear row layout. An
     // ordinary UMD buffer or image is not covered — the doc gives no rule for
     // those either, and inventing one would refuse legal creates.
+    // `HELIOS_HWA2_FLAG_STANDARD` is NOT in `HELIOS_HWA2_FLAG_KMD_OWNED_MASK`, so
+    // any producer can set it and authorship is unprovable here — the flag means
+    // only "claims to be an OS standard allocation". What makes the claim
+    // harmless is that a claimant must then produce the exact `byte_size` this
+    // driver would have authored, so BOTH swizzle classes are pinned to
+    // `dxgkddi_get_standard_allocation_driver_data`'s own arithmetic.
+    // `validate_stage` already refused INVALID and > MAX, so these are exhaustive.
     let plane0 = desc.planes[0];
-    if desc.has_flag(HELIOS_HWA2_FLAG_STANDARD) && desc.swizzle_class == HELIOS_HWA2_SWIZZLE_LINEAR
-    {
-        let expected = linear_blob_size(plane0.row_pitch as u64, desc.height as u64);
+    if desc.has_flag(HELIOS_HWA2_FLAG_STANDARD) {
+        let expected = if desc.swizzle_class == HELIOS_HWA2_SWIZZLE_LINEAR {
+            linear_blob_size(plane0.row_pitch as u64, desc.height as u64)
+        } else {
+            // OPAQUE_OPTIMAL GDI texture: notional pitch, sized from it so the
+            // declared plane fits.
+            round_up_page(
+                (plane0.row_pitch as u64)
+                    .saturating_mul(desc.height as u64)
+                    .max(PAGE as u64),
+            )
+        };
         if desc.byte_size != expected {
             bump(&CREATE_SIZE_REJECT, b"AcSize");
             crate::diag::record(0x0C01_00E7);
@@ -3291,14 +3307,15 @@ unsafe fn admit_hwa2(
     // arm overwrites forty lines down — comparing after the overwrite makes the
     // comparison an identity and the counter a constant.
     let authored_byte_size = desc.byte_size;
-    let kmd_authored = desc.has_flag(HELIOS_HWA2_FLAG_STANDARD);
+    // NOT "the KMD authored this" — a claim, pinned by the equality check above.
+    let claims_standard = desc.has_flag(HELIOS_HWA2_FLAG_STANDARD);
 
     // MEASURE THE GUESS (R719). `authored_byte_size` is what the authoring side
     // computed before any backing existed; `created.venus_alloc_size` is the
     // exact Vulkan requirement the host reported. Counted, never acted on — this
     // measures how far off the KMD's empirical pre-create estimate is.
     //
-    // ⛔ SCOPED to `kmd_authored`, and round 3 of the Phase-2 review is why.
+    // ⛔ SCOPED to `claims_standard`, and round 3 of the Phase-2 review is why.
     // Unscoped, it compared the host's PAGE-ROUNDED blob size against the UMD's
     // resource extent — two quantities `K4-CONTRACT.md` §1.3 requires to differ,
     // since `allocate_memory_blob` does `round_up_page(size.max(4096))`. It
@@ -3310,7 +3327,7 @@ unsafe fn admit_hwa2(
     // the host's real requirement" — only has a meaning where WE authored the
     // estimate. Both KMD-authored arms are in scope; what differs between them
     // is what the code then DOES, which is the block below.
-    if kmd_authored && created.venus_alloc_size != 0 && created.venus_alloc_size != authored_byte_size
+    if claims_standard && created.venus_alloc_size != 0 && created.venus_alloc_size != authored_byte_size
     {
         LINEAR_BLOB_SIZE_DIVERGENCE.fetch_add(1, Ordering::Relaxed);
     }
@@ -3383,7 +3400,7 @@ unsafe fn admit_hwa2(
     // exactly right for the image — this is not the Xid-31 undersize shape,
     // which is a blob smaller than the requirement for the SAME layout.
     let adopt_host_extent =
-        kmd_authored && created.blob_size.is_host_authoritative() && created.pitch != 0;
+        claims_standard && created.blob_size.is_host_authoritative() && created.pitch != 0;
     if adopt_host_extent {
         desc.byte_size = created.blob_size.bytes();
         desc.planes[0].offset = created.plane_offset;
@@ -3402,26 +3419,13 @@ unsafe fn admit_hwa2(
     // and then MMU-faults when the sampler reads the slack region (host Xid 31,
     // FAULT_PTE VIRT_READ — killed the IDD feed live 2026-07-04).
     //
-    // ⚠ The condition is `!kmd_authored`, which is Tier 2's own wording — "every
-    // descriptor this driver did NOT author" — and it is deliberately NOT
-    // `!adopt_host_extent`. The two now differ by exactly one arm, the
-    // KMD-authored OPAQUE_OPTIMAL GDI texture, and applying the guard there
-    // would re-introduce the defect the adoption gate above was narrowed to
-    // remove: it would compare the author's notional 256-aligned LINEAR estimate
-    // against the host's TILED requirement and refuse the create — the same
-    // failure as before, under a different counter. §10.3's plane bound is what
-    // makes an undersized backing dangerous, and on that arm no consumer
-    // byte-addresses the allocation at all (see the adoption block above).
-    //
-    // On the arms this DOES cover the reasoning is unchanged: a UMD's descriptor
-    // is echoed verbatim, so admitting a backing smaller than it publishes a
-    // descriptor whose planes run off the end of the real allocation.
-    //
-    // The adopting arm cannot reach this either: it has just SET `byte_size` to
-    // the backing's own size, so the comparison is an identity. Both exclusions
-    // are stated conditions rather than inferred from an identity, so removing
-    // the adoption above cannot silently turn this guard fatal.
-    if !kmd_authored && created.venus_alloc_size != 0 && created.venus_alloc_size < desc.byte_size {
+    // ⚠ The `!claims_standard` exclusion is safe ONLY because the equality check
+    // above pins `byte_size` on both STANDARD arms. Not `!adopt_host_extent`:
+    // applying this to the OPAQUE_OPTIMAL arm compares a notional LINEAR estimate
+    // against a TILED requirement and refuses legal GDI creates (round 3).
+    // Narrowing that check means widening this guard in the same commit.
+    if !claims_standard && created.venus_alloc_size != 0 && created.venus_alloc_size < desc.byte_size
+    {
         bump(&CREATE_SIZE_REJECT, b"AcSize");
         crate::diag::record(0x0C01_00E7);
         // The backing is destroyed by the caller's unwind through

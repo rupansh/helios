@@ -300,8 +300,17 @@ pub(crate) unsafe fn allocate_wddm_resource(
     // create fails.** It does NOT demand equality with `linear_blob_size` on
     // this arm; had it done so, every D3D11 create would have failed. So the
     // extent this driver can actually compute is the right thing to send.
+    // WAS `pitch * mip0.TexelHeight` — one 2D slice of mip 0 — while the
+    // descriptor declares depth, array size and mips, and the KMD sizes the venus
+    // blob FROM this number: a 64^3 shared Texture3D got 16 KiB for 1 MiB, the
+    // Xid-31 undersize shape. Over-estimates on purpose (Tier 2 admits it); the
+    // mip chain is bounded by 2x the base level. Depth 1 / array 1 / 1 mip — the
+    // shape that composites the desktop — is byte-for-byte unchanged.
+    let slices = (mip0.TexelDepth.max(1) as u64).saturating_mul(a.ArraySize.max(1) as u64);
     let size = (pitch as u64)
         .saturating_mul(mip0.TexelHeight.max(1) as u64)
+        .saturating_mul(slices)
+        .saturating_mul(if a.MipLevels > 1 { 2 } else { 1 })
         .max(4096);
 
     // pPrimaryDesc is the runtime's authoritative primary classification.

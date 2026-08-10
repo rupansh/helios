@@ -134,10 +134,10 @@ pub const CROSS_ADAPTER_PITCH_ALIGN: u32 = 256;
 /// Round `n` up to the next [`PAGE_BYTES`] multiple (saturating).
 ///
 /// Saturating on purpose: `u64::MAX` rounds to `0xFFFF_FFFF_FFFF_F000`, never to
-/// zero. (A third, non-saturating copy still lives in
-/// `kmd_render/src/virtio/venus.rs`; it is marked `DIVERGES` there and is
-/// deliberately *not* unified here, because changing a Venus allocation size is a
-/// behaviour change that needs its own before/after evidence.)
+/// zero. The third, non-saturating copy that used to live in
+/// `kmd_render/src/virtio/venus/bringup.rs` is **gone** — K4 made one of its
+/// callers reachable with a guest-supplied size, which turned the wrap into an
+/// overflow panic inside a DDI. There is now exactly one implementation.
 pub const fn round_up_page(n: u64) -> u64 {
     n.saturating_add(PAGE_BYTES - 1) & !(PAGE_BYTES - 1)
 }

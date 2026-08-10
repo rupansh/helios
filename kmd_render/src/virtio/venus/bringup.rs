@@ -8,15 +8,12 @@
 use super::ring::*;
 use super::*;
 
-// DIVERGES: non-saturating, see T4a. The two other copies of this function moved
-// to `helios_kmd_logic::round_up_page`, which saturates; this one wraps to 0 for a
-// `size` within 4095 of `u64::MAX`. Callers (`:1102`, `:4288`, `:4380`, `:4465`)
-// all pass a host-reported memory requirement, so unifying it would be a real
-// behaviour change to a Venus allocation size and needs its own before/after
-// evidence — deliberately not folded into the R101 move.
-pub(super) fn round_up_page(size: u64) -> u64 {
-    (size + 4095) & !4095
-}
+// WAS a non-saturating `(size + 4095) & !4095`, justified by "callers all pass a
+// host-reported requirement". K4 falsified that: `allocate_memory_blob` now takes
+// an HWA2 `byte_size` from a user buffer, so a size within 4095 of u64::MAX
+// panicked (dev profile) inside DxgkDdiCreateAllocation holding the venus mutex.
+// The two functions differ on no other input.
+pub(super) use helios_kmd_logic::round_up_page;
 
 /// Run the entire venus bring-up and self-allocate a 16-MiB HOST_VISIBLE|
 /// HOST_COHERENT `VkDeviceMemory`, exposed as a BAR-backed, CPU-coherent region.
