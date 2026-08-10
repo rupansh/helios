@@ -10259,3 +10259,637 @@ pub mod translation_session {
         }
     }
 }
+
+/// K6's pure half: the per-context HNR2 assembler, its bounded staging pool, and
+/// the output-patch plan.
+///
+/// The RULES live in `helios_protocol::native_render` and are not restated here;
+/// what this module owns is the per-context STATE those rules are evaluated
+/// against. That split is what makes K6 gateable on Linux: every decision below
+/// is a function of a wire record plus five scalars, and the only Windows fact
+/// it needs — whether an allocation-list entry was opened for write — arrives as
+/// a `bool`.
+///
+/// ⛔ Keyed by CONTEXT, not by session, which is why it is a separate module
+/// from [`translation_session`] rather than an extension of it: K5's types are
+/// all per-session and `OWNERSHIP.md` §1 forbids interleaving two units' state
+/// in one `pub mod` block.
+pub mod native_render {
+    use helios_protocol::native_render::{
+        admit_render_slot, validate_commit_tables, validate_use_write_operation,
+        HeliosNativeRenderPatch, HeliosNativeRenderUse, HeliosNativeRenderV2, Hnr2Accept,
+        Hnr2CapacityLimit, Hnr2CapacityRefusal, Hnr2Expect, Hnr2FragmentClass, Hnr2OpenBatch,
+        Hnr2Reject, Hnr2TableReject, HELIOS_HNR2_MAX_PATCH_RECORDS, HELIOS_HNR2_MAX_USE_RECORDS,
+    };
+
+    /// Why a K6 render-path operation was refused.
+    ///
+    /// Three arms forward `helios_protocol`'s own verdicts unchanged; the rest are
+    /// decisions only the KMD can make. Every arm is a counted refusal in
+    /// `kmd_render` and none is ever silently repaired.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RenderRefusal {
+        /// The HNR2 header was refused by `protocol`.
+        Header(Hnr2Reject),
+        /// A COMMIT's use/patch tables were refused by `protocol`.
+        Table(Hnr2TableReject),
+        /// A bounded per-context pool was exhausted.
+        Capacity(Hnr2CapacityRefusal),
+        /// The output patch plan does not fit the patch-location list dxgkrnl
+        /// returned for this Render. One WDDM slot per use record is required —
+        /// §10.7's "one real output WDDM patch/capability slot per use" — so a
+        /// short list is a refusal and never a partial plan.
+        PatchListCapacityExceeded { needed: u32, capacity: u32 },
+        /// A staging retirement named more bytes or slots than were checked out.
+        /// Unreachable by construction from `kmd_render` (every retire is paired
+        /// with its own checkout); counted so a future caller cannot make the
+        /// pool drift silently instead of failing.
+        StagingUnderflow,
+    }
+
+    impl RenderRefusal {
+        /// Stable numeric reason code for a KMD counter / ETW field.
+        ///
+        /// `protocol`'s own codes are forwarded verbatim so one registry value
+        /// reads identically on both sides of the boundary; the K6-local arms use
+        /// a range `protocol` does not (`0x06xx`) and the capacity arm a range
+        /// `protocol` declares but does not code (`0x05xx`).
+        pub const fn code(self) -> u32 {
+            match self {
+                Self::Header(reject) => reject.code(),
+                Self::Table(reject) => reject.code(),
+                Self::Capacity(refusal) => match refusal.limit {
+                    Hnr2CapacityLimit::OutstandingSubmissions => 0x0501,
+                    Hnr2CapacityLimit::SlotPoolBytes => 0x0502,
+                    Hnr2CapacityLimit::LiveSnapshots => 0x0503,
+                    Hnr2CapacityLimit::LiveSnapshotBytes => 0x0504,
+                    Hnr2CapacityLimit::SnapshotBytes => 0x0505,
+                },
+                Self::PatchListCapacityExceeded { .. } => 0x0601,
+                Self::StagingUnderflow => 0x0602,
+            }
+        }
+    }
+
+    /// The five `DXGKARG_RENDER` scalars the header rules are evaluated against.
+    ///
+    /// It exists so the caller cannot forget one: [`Hnr2Expect`] mixes these with
+    /// per-context state, and assembling it inside `kmd_render` from two sources
+    /// is how a stale `open` gets paired with a fresh `DmaSize`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RenderEnv {
+        /// The admitted atomic-package generation.
+        pub package_generation: u64,
+        /// `DXGKARG_RENDER::AllocationListSize`.
+        pub allocation_list_count: u32,
+        /// `DXGKARG_RENDER::CommandLength`, as probed and copied.
+        pub command_length: u32,
+        /// `DXGKARG_RENDER::DmaSize` — the buffer dxgkrnl actually returned.
+        pub command_buffer_bytes: u32,
+        /// `DXGKARG_RENDER::PatchLocationListInSize`.
+        pub patch_location_list_in_size: u32,
+    }
+
+    /// The bounded per-context staging pool (§10.7: 64 outstanding submissions,
+    /// 15 MiB staged).
+    ///
+    /// ⛔ Refusal, never a wait: `Hnr2CapacityRefusal`'s own doc fixes that for
+    /// the staging arms, and a wait inside a Render is a DDI that does not return.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct StagingPool {
+        outstanding: u32,
+        staged_bytes: u64,
+    }
+
+    impl StagingPool {
+        pub const fn new() -> Self {
+            Self {
+                outstanding: 0,
+                staged_bytes: 0,
+            }
+        }
+
+        pub const fn outstanding(&self) -> u32 {
+            self.outstanding
+        }
+
+        pub const fn staged_bytes(&self) -> u64 {
+            self.staged_bytes
+        }
+
+        /// Admit `bytes` of staging. The pool moves only on success.
+        pub fn checkout(&mut self, bytes: u64) -> Result<(), RenderRefusal> {
+            admit_render_slot(self.outstanding, self.staged_bytes, bytes)
+                .map_err(RenderRefusal::Capacity)?;
+            // `admit_render_slot` proved both sums fit, so neither add can wrap.
+            self.outstanding += 1;
+            self.staged_bytes += bytes;
+            Ok(())
+        }
+
+        /// Release one checked-out staging slot of `bytes`.
+        pub fn retire(&mut self, bytes: u64) -> Result<(), RenderRefusal> {
+            if self.outstanding == 0 || bytes > self.staged_bytes {
+                return Err(RenderRefusal::StagingUnderflow);
+            }
+            self.outstanding -= 1;
+            self.staged_bytes -= bytes;
+            Ok(())
+        }
+    }
+
+    /// Where a COMMIT's output patch entries go in the runtime's
+    /// `D3DDDI_PATCHLOCATIONLIST`.
+    ///
+    /// One entry per USE record, contiguous from `first_slot`. The `DriverId` of
+    /// entry *i* is the capability ordinal *i*, so the physical capability table
+    /// and the patch list are indexed by the same number and neither can be
+    /// re-derived from the other.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct PatchPlan {
+        pub first_slot: u32,
+        pub count: u32,
+    }
+
+    impl PatchPlan {
+        /// The allocation-list index and capability ordinal of plan entry `i`.
+        pub fn entry(&self, uses: &[HeliosNativeRenderUse], i: u32) -> Option<(u32, u32)> {
+            if i >= self.count {
+                return None;
+            }
+            let use_record = uses.get(i as usize)?;
+            Some((use_record.allocation_list_index, i))
+        }
+    }
+
+    /// Plan the output patch slots for a COMMIT.
+    ///
+    /// ⛔ One slot per USE record, NOT per typed-operand patch record. The two
+    /// counts differ by up to 2x at the caps (4096 uses, 8192 operands): the typed
+    /// operands are positions inside the copied Venus payload and are never WDDM
+    /// patch locations (§10.4:1288-1296), while the WDDM patch list is where the
+    /// per-allocation physical capability is written back.
+    pub fn plan_output_patch_slots(
+        uses: &[HeliosNativeRenderUse],
+        patch_list_capacity: u32,
+    ) -> Result<PatchPlan, RenderRefusal> {
+        let needed = uses.len();
+        if needed > HELIOS_HNR2_MAX_USE_RECORDS as usize {
+            return Err(RenderRefusal::Table(Hnr2TableReject::UseCountMismatch));
+        }
+        let needed = needed as u32;
+        if needed > patch_list_capacity {
+            return Err(RenderRefusal::PatchListCapacityExceeded {
+                needed,
+                capacity: patch_list_capacity,
+            });
+        }
+        Ok(PatchPlan {
+            first_slot: 0,
+            count: needed,
+        })
+    }
+
+    /// One context's HNR2 assembler.
+    ///
+    /// [`Hnr2OpenBatch`] *is* the assembler state, so there is no fragment table,
+    /// no cross-context assembler, and nothing to look an incoming fragment up in.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RenderContext {
+        open: Option<Hnr2OpenBatch>,
+        last_batch_token: u64,
+        staging: StagingPool,
+    }
+
+    impl Default for RenderContext {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl RenderContext {
+        pub const fn new() -> Self {
+            Self {
+                open: None,
+                last_batch_token: 0,
+                staging: StagingPool::new(),
+            }
+        }
+
+        pub const fn open_batch(&self) -> Option<Hnr2OpenBatch> {
+            self.open
+        }
+
+        pub const fn last_batch_token(&self) -> u64 {
+            self.last_batch_token
+        }
+
+        pub const fn staging(&self) -> &StagingPool {
+            &self.staging
+        }
+
+        pub fn staging_mut(&mut self) -> &mut StagingPool {
+            &mut self.staging
+        }
+
+        /// Abandon whatever batch is open, without advancing the token watermark.
+        ///
+        /// The watermark deliberately survives: a context that abandoned batch N
+        /// must still refuse a later fragment that names N, and resetting it would
+        /// make an abandoned token replayable.
+        pub fn abandon_open_batch(&mut self) {
+            self.open = None;
+        }
+    }
+
+    /// Admit one HNR2 fragment on this context and advance its assembler.
+    ///
+    /// ⛔ The context moves ONLY on success. A refused fragment leaves the open
+    /// batch exactly as it was, so a malformed Render cannot corrupt the batch a
+    /// well-formed one is still building — and a caller that refuses is free to
+    /// leave the context alive.
+    pub fn admit_render_fragment(
+        context: &mut RenderContext,
+        header: &HeliosNativeRenderV2,
+        env: &RenderEnv,
+    ) -> Result<Hnr2Accept, RenderRefusal> {
+        let expect = Hnr2Expect {
+            package_generation: env.package_generation,
+            allocation_list_count: env.allocation_list_count,
+            command_length: env.command_length,
+            command_buffer_bytes: env.command_buffer_bytes,
+            patch_location_list_in_size: env.patch_location_list_in_size,
+            open: context.open,
+            last_batch_token: context.last_batch_token,
+        };
+        let accept = header.validate(&expect).map_err(RenderRefusal::Header)?;
+        // The watermark advances when a batch OPENS, because that is the only
+        // place `validate` compares it (`BatchTokenNotIncreasing`); a COMMIT of an
+        // already-open batch repeats a token that is already at the watermark.
+        if accept.class.is_begin() {
+            context.last_batch_token = header.batch_token;
+        }
+        context.open = accept.next_open;
+        Ok(accept)
+    }
+
+    /// Admit a COMMIT's use and typed-patch tables, including the two checks
+    /// `protocol` cannot make.
+    ///
+    /// ⛔ `validate_commit_tables` does NOT call `validate_use_write_operation` —
+    /// it cannot, because the `WriteOperation` bit lives in a `DXGK_ALLOCATIONLIST`
+    /// entry `protocol` never sees. Dropping the per-entry loop below therefore
+    /// costs nothing at compile time and silently admits a use record that claims
+    /// WRITE on a read-only allocation.
+    pub fn admit_commit_tables(
+        header: &HeliosNativeRenderV2,
+        uses: &[HeliosNativeRenderUse],
+        patches: &[HeliosNativeRenderPatch],
+        allocation_list_count: u32,
+        list_write_operations: &[bool],
+    ) -> Result<(), RenderRefusal> {
+        if patches.len() > HELIOS_HNR2_MAX_PATCH_RECORDS as usize {
+            return Err(RenderRefusal::Table(Hnr2TableReject::PatchCountMismatch));
+        }
+        if list_write_operations.len() as u64 != allocation_list_count as u64 {
+            return Err(RenderRefusal::Table(Hnr2TableReject::UseCountMismatch));
+        }
+        validate_commit_tables(header, uses, patches, allocation_list_count)
+            .map_err(RenderRefusal::Table)?;
+        for record in uses {
+            let bit = list_write_operations
+                .get(record.allocation_list_index as usize)
+                .copied()
+                .ok_or(RenderRefusal::Table(
+                    Hnr2TableReject::AllocationIndexOutOfRange,
+                ))?;
+            validate_use_write_operation(record, bit).map_err(RenderRefusal::Table)?;
+        }
+        Ok(())
+    }
+
+    /// Which fragment shapes carry the COMMIT tables, restated as a predicate the
+    /// platform half can branch on without importing `protocol`'s enum.
+    pub const fn fragment_carries_tables(class: Hnr2FragmentClass) -> bool {
+        class.is_commit()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use helios_protocol::native_render::{
+            HELIOS_HNR2_ABI_VERSION, HELIOS_HNR2_ACCESS_READ, HELIOS_HNR2_ACCESS_WRITE,
+            HELIOS_HNR2_FLAG_BEGIN, HELIOS_HNR2_FLAG_COMMIT, HELIOS_HNR2_HEADER_SIZE,
+            HELIOS_HNR2_MAGIC, HELIOS_HNR2_MAX_OUTSTANDING_SUBMISSIONS,
+            HELIOS_HNR2_NO_REPLY_ALLOCATION_INDEX, HELIOS_HNR2_SLOT_POOL_BYTES,
+            HELIOS_HNR2_USE_RECORD_SIZE, HELIOS_HVC1_DMA_BUFFER_BYTES,
+        };
+
+        const PKG: u64 = 0x4845_4C49_0000_0001;
+
+        /// One fragment of a `fragment_count`-fragment batch, with no tables.
+        fn frag(token: u64, index: u16, count: u16, chunk: u32) -> HeliosNativeRenderV2 {
+            // Every field spelled out: `HeliosNativeRenderV2` is `Zeroable` but
+            // `bytemuck` is deliberately not nameable from this crate, and a
+            // helper that lists every field cannot be surprised by a new one.
+            let mut h = HeliosNativeRenderV2 {
+                magic: HELIOS_HNR2_MAGIC,
+                abi_version: HELIOS_HNR2_ABI_VERSION,
+                header_size: HELIOS_HNR2_HEADER_SIZE,
+                package_generation: PKG,
+                batch_token: token,
+                total_payload_bytes: chunk as u64 * count as u64,
+                fragment_payload_offset: index as u64 * chunk as u64,
+                fragment_payload_bytes: chunk,
+                fragment_index: index,
+                fragment_count: count,
+                use_record_offset: 0,
+                use_record_count: 0,
+                patch_record_offset: 0,
+                patch_record_count: 0,
+                reply_allocation_list_index: HELIOS_HNR2_NO_REPLY_ALLOCATION_INDEX,
+                flags: 0,
+                reply_offset: 0,
+                reply_capacity_bytes: 0,
+                fragment_crc64: 0,
+                full_payload_crc64: 0,
+                reply_slot_generation: 0,
+            };
+            if index == 0 {
+                h.flags |= HELIOS_HNR2_FLAG_BEGIN;
+            }
+            if index == count - 1 {
+                h.flags |= HELIOS_HNR2_FLAG_COMMIT;
+            }
+            h
+        }
+
+        /// The env for a fragment that carries no allocation list.
+        fn env(header: &HeliosNativeRenderV2) -> RenderEnv {
+            RenderEnv {
+                package_generation: PKG,
+                allocation_list_count: 0,
+                command_length: HELIOS_HNR2_HEADER_SIZE as u32 + header.fragment_payload_bytes,
+                command_buffer_bytes: HELIOS_HVC1_DMA_BUFFER_BYTES as u32,
+                patch_location_list_in_size: 0,
+            }
+        }
+
+        /// A COMMIT fragment carrying `uses` use records and no typed operands.
+        fn commit_with_uses(token: u64, uses: u32, chunk: u32) -> HeliosNativeRenderV2 {
+            let mut h = frag(token, 0, 1, chunk);
+            h.use_record_count = uses;
+            h.use_record_offset = if uses == 0 {
+                0
+            } else {
+                HELIOS_HNR2_HEADER_SIZE as u32
+            };
+            h
+        }
+
+        fn use_env(header: &HeliosNativeRenderV2) -> RenderEnv {
+            let table = header.use_record_count * HELIOS_HNR2_USE_RECORD_SIZE;
+            RenderEnv {
+                package_generation: PKG,
+                allocation_list_count: header.use_record_count,
+                command_length: HELIOS_HNR2_HEADER_SIZE as u32
+                    + table
+                    + header.fragment_payload_bytes,
+                command_buffer_bytes: HELIOS_HVC1_DMA_BUFFER_BYTES as u32,
+                patch_location_list_in_size: 0,
+            }
+        }
+
+        fn use_record(index: u32, write: bool) -> HeliosNativeRenderUse {
+            HeliosNativeRenderUse {
+                allocation_list_index: index,
+                access_flags: if write {
+                    HELIOS_HNR2_ACCESS_WRITE
+                } else {
+                    HELIOS_HNR2_ACCESS_READ
+                },
+                expected_allocation_generation: 0x1_0000_0001,
+                first_patch: 0,
+                patch_count: 0,
+            }
+        }
+
+        #[test]
+        fn one_fragment_batch_closes_and_advances_the_watermark() {
+            let mut ctx = RenderContext::new();
+            let h = frag(7, 0, 1, 64);
+            let accept = admit_render_fragment(&mut ctx, &h, &env(&h)).unwrap();
+            assert_eq!(accept.class, Hnr2FragmentClass::Complete);
+            assert!(fragment_carries_tables(accept.class));
+            assert_eq!(ctx.open_batch(), None);
+            assert_eq!(ctx.last_batch_token(), 7);
+        }
+
+        #[test]
+        fn three_fragments_assemble_in_order() {
+            let mut ctx = RenderContext::new();
+            for i in 0..3u16 {
+                let h = frag(9, i, 3, 32);
+                let accept = admit_render_fragment(&mut ctx, &h, &env(&h)).unwrap();
+                assert_eq!(accept.class.is_commit(), i == 2);
+            }
+            assert_eq!(ctx.open_batch(), None);
+            assert_eq!(ctx.last_batch_token(), 9);
+        }
+
+        #[test]
+        fn an_out_of_order_fragment_is_refused_and_leaves_the_batch_intact() {
+            let mut ctx = RenderContext::new();
+            let begin = frag(9, 0, 3, 32);
+            admit_render_fragment(&mut ctx, &begin, &env(&begin)).unwrap();
+            let before = ctx;
+
+            // Fragment 2 while fragment 1 is expected.
+            let skipped = frag(9, 2, 3, 32);
+            let err = admit_render_fragment(&mut ctx, &skipped, &env(&skipped)).unwrap_err();
+            assert_eq!(
+                err,
+                RenderRefusal::Header(Hnr2Reject::FragmentIndexOutOfOrder)
+            );
+            assert_eq!(ctx, before, "a refused fragment must not move the assembler");
+
+            // The batch is still completable.
+            for i in 1..3u16 {
+                let h = frag(9, i, 3, 32);
+                admit_render_fragment(&mut ctx, &h, &env(&h)).unwrap();
+            }
+            assert_eq!(ctx.open_batch(), None);
+        }
+
+        #[test]
+        fn a_batch_token_may_not_be_reused_or_go_backwards() {
+            let mut ctx = RenderContext::new();
+            let first = frag(5, 0, 1, 16);
+            admit_render_fragment(&mut ctx, &first, &env(&first)).unwrap();
+            for token in [5u64, 4, 1] {
+                let h = frag(token, 0, 1, 16);
+                assert_eq!(
+                    admit_render_fragment(&mut ctx, &h, &env(&h)).unwrap_err(),
+                    RenderRefusal::Header(Hnr2Reject::BatchTokenNotIncreasing)
+                );
+            }
+            let next = frag(6, 0, 1, 16);
+            admit_render_fragment(&mut ctx, &next, &env(&next)).unwrap();
+        }
+
+        #[test]
+        fn abandoning_a_batch_keeps_the_token_watermark() {
+            let mut ctx = RenderContext::new();
+            let begin = frag(12, 0, 2, 16);
+            admit_render_fragment(&mut ctx, &begin, &env(&begin)).unwrap();
+            ctx.abandon_open_batch();
+            assert_eq!(ctx.open_batch(), None);
+            // The abandoned token must not be replayable.
+            let replay = frag(12, 0, 1, 16);
+            assert_eq!(
+                admit_render_fragment(&mut ctx, &replay, &env(&replay)).unwrap_err(),
+                RenderRefusal::Header(Hnr2Reject::BatchTokenNotIncreasing)
+            );
+        }
+
+        /// ⛔ THE CHECK `protocol` CANNOT MAKE. `validate_commit_tables` accepts
+        /// this table; only the per-entry `WriteOperation` cross-check refuses it.
+        #[test]
+        fn a_write_use_on_a_read_only_allocation_list_entry_is_refused() {
+            let h = commit_with_uses(3, 1, 16);
+            let uses = [use_record(0, true)];
+            assert!(
+                validate_commit_tables(&h, &uses, &[], 1).is_ok(),
+                "protocol must accept it, or this test proves nothing"
+            );
+            assert_eq!(
+                admit_commit_tables(&h, &uses, &[], 1, &[false]).unwrap_err(),
+                RenderRefusal::Table(Hnr2TableReject::WriteOperationMismatch)
+            );
+            admit_commit_tables(&h, &uses, &[], 1, &[true]).unwrap();
+        }
+
+        #[test]
+        fn a_read_use_on_a_write_allocation_list_entry_is_refused() {
+            let h = commit_with_uses(3, 1, 16);
+            let uses = [use_record(0, false)];
+            assert_eq!(
+                admit_commit_tables(&h, &uses, &[], 1, &[true]).unwrap_err(),
+                RenderRefusal::Table(Hnr2TableReject::WriteOperationMismatch)
+            );
+            admit_commit_tables(&h, &uses, &[], 1, &[false]).unwrap();
+        }
+
+        #[test]
+        fn a_write_operation_slice_of_the_wrong_length_is_refused() {
+            let h = commit_with_uses(3, 2, 16);
+            let uses = [use_record(0, false), use_record(1, false)];
+            assert!(admit_commit_tables(&h, &uses, &[], 2, &[false]).is_err());
+            admit_commit_tables(&h, &uses, &[], 2, &[false, false]).unwrap();
+        }
+
+        #[test]
+        fn the_commit_table_admission_runs_the_whole_use_list() {
+            let h = commit_with_uses(3, 3, 16);
+            let uses = [use_record(0, false), use_record(1, false), use_record(2, true)];
+            // Only the LAST entry disagrees, so a loop that stops early passes.
+            assert_eq!(
+                admit_commit_tables(&h, &uses, &[], 3, &[false, false, false]).unwrap_err(),
+                RenderRefusal::Table(Hnr2TableReject::WriteOperationMismatch)
+            );
+        }
+
+        #[test]
+        fn the_patch_plan_is_one_slot_per_use_and_is_repeatable() {
+            let uses = [use_record(0, false), use_record(1, true), use_record(2, false)];
+            let plan = plan_output_patch_slots(&uses, 16).unwrap();
+            assert_eq!(plan.first_slot, 0);
+            assert_eq!(plan.count, 3);
+            assert_eq!(plan, plan_output_patch_slots(&uses, 16).unwrap());
+            assert_eq!(plan.entry(&uses, 0), Some((0, 0)));
+            assert_eq!(plan.entry(&uses, 2), Some((2, 2)));
+            assert_eq!(plan.entry(&uses, 3), None);
+        }
+
+        #[test]
+        fn a_short_patch_location_list_is_refused_not_truncated() {
+            let uses = [use_record(0, false), use_record(1, false)];
+            assert_eq!(
+                plan_output_patch_slots(&uses, 1).unwrap_err(),
+                RenderRefusal::PatchListCapacityExceeded {
+                    needed: 2,
+                    capacity: 1
+                }
+            );
+            plan_output_patch_slots(&uses, 2).unwrap();
+        }
+
+        #[test]
+        fn the_staging_pool_refuses_at_both_caps_and_never_waits() {
+            let mut pool = StagingPool::new();
+            for _ in 0..HELIOS_HNR2_MAX_OUTSTANDING_SUBMISSIONS {
+                pool.checkout(1).unwrap();
+            }
+            assert_eq!(
+                pool.checkout(1).unwrap_err().code(),
+                0x0501,
+                "outstanding-submission cap"
+            );
+            let mut bytes = StagingPool::new();
+            bytes.checkout(HELIOS_HNR2_SLOT_POOL_BYTES).unwrap();
+            assert_eq!(bytes.checkout(1).unwrap_err().code(), 0x0502);
+            bytes.retire(HELIOS_HNR2_SLOT_POOL_BYTES).unwrap();
+            assert_eq!(bytes.staged_bytes(), 0);
+            assert_eq!(bytes.outstanding(), 0);
+        }
+
+        #[test]
+        fn retiring_more_than_was_checked_out_is_refused() {
+            let mut pool = StagingPool::new();
+            assert_eq!(pool.retire(1).unwrap_err(), RenderRefusal::StagingUnderflow);
+            pool.checkout(8).unwrap();
+            assert_eq!(pool.retire(9).unwrap_err(), RenderRefusal::StagingUnderflow);
+            pool.retire(8).unwrap();
+        }
+
+        #[test]
+        fn a_staging_checkout_that_would_wrap_is_refused() {
+            let mut pool = StagingPool::new();
+            pool.checkout(1024).unwrap();
+            assert!(pool.checkout(u64::MAX).is_err());
+            assert_eq!(pool.staged_bytes(), 1024);
+        }
+
+        #[test]
+        fn refusal_codes_are_nonzero_and_do_not_collide() {
+            let codes = [
+                RenderRefusal::Header(Hnr2Reject::MagicMismatch).code(),
+                RenderRefusal::Table(Hnr2TableReject::UseCountMismatch).code(),
+                RenderRefusal::Capacity(Hnr2CapacityRefusal {
+                    limit: Hnr2CapacityLimit::OutstandingSubmissions,
+                    requested: 0,
+                    capacity: 0,
+                })
+                .code(),
+                RenderRefusal::Capacity(Hnr2CapacityRefusal {
+                    limit: Hnr2CapacityLimit::SlotPoolBytes,
+                    requested: 0,
+                    capacity: 0,
+                })
+                .code(),
+                RenderRefusal::PatchListCapacityExceeded {
+                    needed: 0,
+                    capacity: 0,
+                }
+                .code(),
+                RenderRefusal::StagingUnderflow.code(),
+            ];
+            for (i, a) in codes.iter().enumerate() {
+                assert_ne!(*a, 0);
+                for b in &codes[i + 1..] {
+                    assert_ne!(a, b);
+                }
+            }
+        }
+    }
+}
