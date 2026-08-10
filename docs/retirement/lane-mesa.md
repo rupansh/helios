@@ -99,7 +99,7 @@ misplaced. The four "Add" files under `src/virtio/vulkan/` and the four under
 | `vn_helios_record_submit.{c,h}` | — | **do not exist** | **ADD** |
 | `vn_helios_direct_dispatch.{c,h}` | — | **do not exist** | **ADD** |
 | `vn_helios_translation_session.{c,h}` | — | **do not exist** | **ADD** |
-| `vn_helios_native_kmt.{c,h}` | — | **do not exist** | **ADD** |
+| `vn_helios_native_kmt.{c,h}` | 1206 / 248 | **A2, landed `1b97c64`.** Pure half: CRC-64/ECMA-182, the HNR2 fragment planner and encoder. Windows half: HVC1 control/queue contexts, `D3DKMTRender` + buffer re-adoption + the resize transition, the per-context monitored progress fence, the C51 waits and the queue/device idle joins. | done |
 
 ### 2c. Capability facts the manifest's wording understates
 
@@ -145,7 +145,22 @@ record declarations are gone, `vn_helios_hwa2.h` includes `helios_wddm.h`, and
 has the measurement). **A1 is done** (`6ad43fb`,
 `vn_helios_translation_session.{c,h}`, builds clean under `win_meson`) — but it
 is *implemented and never exercised*: its INIT refuses until KMD unit **K5**
-exists, and K5 is not started. **A2 and A3 are absent.** The owner closed the
+exists, and K5 is not started. **A2 is done** (`1b97c64`) and **A3 is absent**.
+
+⭐ **A2 amendment, 2026-08-10.** A2 landed with an inverted dependency and a new
+gate, both deliberate:
+
+- **A2 does not depend on A1.** `helios_native_context_create` takes a raw
+  `D3DKMT_HANDLE` device, so *A1 depends on A2* instead. The alternative was two
+  HNR2 encoders in one ICD, and A1's — written first — was wire-invalid in three
+  ways (`UseRecordOffsetMismatch` from writing the use table after the payload,
+  `AllocationGenerationZero`, and a monitored fence with none of §10.7's three
+  flags). One encoder, one owner.
+- **§5.4 is obsolete.** A2's file splits into a platform-independent encoder half
+  and a Windows KMT half, so `tools/hnr2-encoder-gate.sh` compiles and RUNS the
+  encoder on Linux and replays every command buffer it emits through
+  `protocol/`'s `validate` + `validate_commit_tables`. The host can now make
+  behavioural assertions about this lane, not only compile-time ones. The owner closed the
 A3 scope question on 2026-08-10 in favour of **full A3 as this table scopes
 it**; `ROADMAP.md` records that the honest scope is five units — A1, A2, A3 plus
 KMD **K5** and **K6** — because A1–A3 speak HTS1 and HNR2 to a kernel that

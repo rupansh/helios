@@ -582,8 +582,11 @@ In order:
    + `icd/mesa` `33db3fd` + `vkd3d-proton-helios` `cdf1bce`. Verified: gates
    8/8, `kmd_render` check exit 0 at the 22-warning baseline, `umd` exit 0, mesa
    ICD + present layer link clean, vkd3d native build green.
-3. **A1 → A2 → A3 → K5 → K6** ← **THE CRITICAL PATH.** A1 is ✅ landed
-   (`icd/mesa` `6ad43fb`). See the scope note below: the owner chose full A3.
+3. **A1 → A2 → A3 → K5 → K6** ← **THE CRITICAL PATH.** A1 ✅ (`icd/mesa`
+   `6ad43fb`, rewritten onto A2 in `1b97c64`) and **A2 ✅** (`1b97c64`, gate
+   `c20d162`). Next is **A3** — or **K5**, if the session wants the A-lane to
+   run against a real KMD rather than against a validator. See the scope note
+   below: the owner chose full A3.
 4. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
    correction below before touching it. Not on the critical path.
 5. **K1 (demolition), K3** — and `SURFACE` last of all (`OWNERSHIP.md` §3).
@@ -661,8 +664,8 @@ does not implement either:
 
 | unit | file | size | state |
 |---|---|---|---|
-| **A1** HTS1 session | `vn_helios_translation_session.{c,h}` | L | ✅ **LANDED** `6ad43fb`, compiles, **never exercised** |
-| **A2** native KMT lane | `vn_helios_native_kmt.{c,h}` | XL | absent |
+| **A1** HTS1 session | `vn_helios_translation_session.{c,h}` | L | ✅ **LANDED** `6ad43fb`; **rewritten onto A2's encoder in `1b97c64`** — see below, its own encoder was wire-invalid in three ways |
+| **A2** native KMT lane | `vn_helios_native_kmt.{c,h}` | XL | ✅ **LANDED** `icd/mesa` `1b97c64` + gate `c20d162`. Cross-builds; its encoder half is **executed** by `tools/hnr2-encoder-gate.sh` against `protocol/`'s validator (16 batches / 83 fragments; 8 deliberate mutations caught). The KMT half is still unexercised — that needs K5/K6 |
 | **A3** renderer rewrite | `vn_renderer_helios.c` (**5261** lines at HEAD; the brief's inventory says 5304 and is stale) | XL | absent |
 | **K5** KMD HTS1 sessions | `kmd_render/src/ddi/translation_session.rs` | L | absent — **A1's INIT refuses until this exists** |
 | **K6** KMD HVC1/HNR2 render | `kmd_render/src/ddi/native_render.rs` | XL | absent |
@@ -673,9 +676,22 @@ mirrors. That is exactly the "~14.6k lines with no consumer" population
 `K4-CONTRACT.md` §10 records. **A1–A3 and K5–K6 are those consumers**, so the
 work is call sites and state machines, not new ABI.
 
-⚠ **K5 is the unit that makes A1 testable.** Nothing in the A-lane can be
-exercised before it, so a session that wants evidence rather than more ICD code
-should take K5 before A2.
+⚠ **K5 is the unit that makes the A-lane testable on the target.** Nothing in
+the A-lane reaches the KMD before it. ⭐ But "untestable" was too strong, and A2
+proved it: the **encoder** half of the lane is ordinary pure code, and running it
+against `protocol/`'s own validator found three defects in A1 that a reading
+round had already passed over (the use table written after the payload, a zeroed
+`expected_allocation_generation`, a monitored fence missing all three §10.7
+flags). Every one would have been refused on the wire the moment K5 made A1
+reachable. ⇒ **Split any remaining A-lane unit into a pure half and a KMT half,
+and gate the pure half.** The KMT half still waits for K5/K6.
+
+⭐ **The A2 encoder gate is the shape to copy** (`tools/hnr2-encoder-gate.sh`):
+the ICD source file is compiled and RUN on Linux, its output replayed through the
+Rust validator the KMD will run, and the runner fails if the corpus is too small
+to be real. It is the first ICD source file in this project executed by a test,
+and it makes `lane-mesa.md` §5.4 ("every assertion this lane can make on the host
+is a compile-time one") obsolete.
 
 ## Stage pivot, 2026-08-05
 
