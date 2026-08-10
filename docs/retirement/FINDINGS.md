@@ -224,3 +224,77 @@ one: the translator dispatch ABI is in-process guest code, the native-fence DDI
 surface and the WDDM 3.2 slot audit are guest-side, and D3D12 is guest-side.
 Reopening HPM1 means un-parking the branch **and** running its adversarial
 review first — review before reachable, not after.
+
+---
+
+## F6 — The slot audit's refusal path is proven on the target. `fa8489e` is verified in both halves.
+
+**Date** 2026-08-10 · **Grades** §18.1:4653-4656
+
+`verify()` returning `Ok` was verified earlier the same day (ring
+`S1 = 0x0DA00001`, adapter `OK`/`CM_PROB_NONE`). That half establishes almost
+nothing on its own: a `verify` that returned `Ok` unconditionally would have
+produced byte-identical evidence. The refusal path had never executed.
+
+**Measured.** One row of the classification flipped and nothing else:
+`DxgkDdiSetNativeFenceLogBuffer`, index 187 of 192, `Disabled` -> `Implemented`.
+Pre-flighted statically first — the slot is never assigned in
+`build_ddi_table()`, so it is genuinely NULL and the mismatch is real rather
+than assumed. Built as `22.22.261.0` and cold-booted. The breadcrumb ring was
+deleted to zero entries beforehand, so every value below was written by that
+boot.
+
+```
+Status  : Error
+Problem : CM_PROB_FAILED_DRIVER_ENTRY          (ProblemCode 37)
+DEVPKEY_Device_ProblemStatus : 3221225858      = 0xC0000182
+DEVPKEY_Device_DriverVersion : 22.22.261.0
+
+ring count = 3
+  S0 = 0x0D000001     DriverEntry entry
+  S1 = 0x0DA010BB     audit failed at slot index 187   (0x0DA0_1000 | 187)
+  S2 = 0x0DA02002     NULL slot classified Implemented
+```
+
+Four things this establishes that the positive did not:
+
+1. **The refusal fires.** The driver did not load.
+2. **It names the row that actually disagreed.** `0x0DA010BB` decodes to index
+   187 — the row that was flipped, not merely "some failure".
+3. **It names the direction.** `0x0DA02002` is the NULL-but-classified-
+   `Implemented` arm, which is the arm this flip should take.
+4. **`DxgkInitialize` was never called.** The ring holds exactly three records
+   and `0x0D000002` is absent, so the disagreeing table never reached dxgkrnl.
+   Refusing "at the one point at which the table is still ours" is what
+   `DriverEntry`'s comment claims, and it is what happened.
+
+The strongest single line is `ProblemStatus = 0xC0000182`: PnP propagated the
+audit's own `STATUS_DEVICE_CONFIGURATION_ERROR` verbatim, so a Code 37 in
+Device Manager is traceable to this check rather than to a coincidental load
+failure with the same symptom.
+
+**Bound.** One row, and one of the two failure arms. The mirror arm —
+registered-but-classified-unreachable, `0x0DA0_2001` — is the sibling branch of
+the same `if` and remains unexecuted. The walk was proven to reach index 187 of
+192, which rules out an early-terminating loop, but not to reach 191.
+
+**Consequence.** The audit can be relied on as a gate by the lanes that will
+reclassify rows — in particular the eight `Retiring` -> `Disabled` flips the
+KMD-core and host/tools lanes owe. Reverted to the classification of `97ad14b`
+(byte-identical, generator `--check` clean) and reinstalled as `22.22.262.0`:
+`OK`/`CM_PROB_NONE`, `S1` back to `0x0DA00001`, and `helios_paintcap` returns a
+fully composited live desktop.
+
+### A defect this found on the way in
+
+The audit file says "GENERATED — do not edit by hand" and names its regenerate
+command. Running that command **reverted the arming fix**: the `Retiring`
+class — whose own doc comment says "without this class the audit cannot be
+armed at all" — existed only in the hand-edited `.rs`, never in
+`gen_wddm32_slot_audit.py` or `wddm32_slot_classes.tsv`. Regenerating
+reclassified the eight live slots (`DxgkDdiEscape` and the seven HWS/HWQueue
+slots) back to `Disabled`, the state they will *reach* rather than the state
+they are *in*, and `verify` would then have refused to load a correct driver.
+Fixed in `97ad14b`; the generator now round-trips byte-identical and `--check`
+is clean. Check the checker against the thing it checks — the same lesson the
+audit table itself taught when it classified 8 live slots as "must be NULL".
