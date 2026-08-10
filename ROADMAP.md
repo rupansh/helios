@@ -46,10 +46,27 @@ pre-retirement symbols alive so `kmd_render`/`umd`/`umd12` still build while eac
 migrates; vkd3d's Wine-Escape and `\\.\SharedGpuResource` transports are gone;
 QEMU has HPM1 negotiation and HLM1 BAR admission.
 
-⛔ **Nothing is activated.** `wddm_surface.rs`'s `SURFACE` stays `Wddm2_1GpuMmu`
-until the MPO3 table, the native-fence surface and the cold-DWM gate are all in;
-it is the last edit of the whole retirement (`OWNERSHIP.md` §3). §18's runtime
-gates remain unexecuted.
+**Also landed:** QEMU's HPM1 paging-DMA executor; `umd12`'s bindgen regenerated
+against WDK 28000 (355 `_0112` / 346 `_0116` symbols, `HRTFENCE`,
+`pfnCreateNativeFenceCb`/`pfnOpenNativeFenceCb`).
+
+⛔ **Four components are committed but deliberately NOT wired in.** Each is
+labelled in its own commit message; do not assume any is active:
+
+| Component | State | Why |
+|---|---|---|
+| `protocol/src/translator_dispatch.rs` | commented out of `lib.rs` | two verified blockers, repair half-applied — **this is the next step**, and it gates the Mesa/DXVK/vkd3d lanes |
+| `kmd_render/src/ddi/{native_fence,wddm32_slot_audit}.rs` | orphaned, not in `ddi/mod.rs` | DDI table registration not done |
+| `icd/mesa/.../helios_present_layer.{h,cpp}` | 4269 lines, not in `meson.build` | no `.def`, no layer JSON yet |
+| `wddm_surface.rs` `SURFACE` | still `Wddm2_1GpuMmu` | the single atomic activation switch, and the **last** edit of the retirement (`OWNERSHIP.md` §3) |
+
+No lane's adversarial review completed — Phase 2 is verified-compiling, not
+reviewed. §18's runtime gates remain unexecuted.
+
+**Everything Linux-verifiable is green:** `protocol` 119 tests, `kmd_logic` 189
+tests, `tools/umd12-host-check.sh`, vkd3d ninja, QEMU ninja. Note there is no
+workspace root — build `protocol` from `protocol/`, not with `-p` from the repo
+root.
 
 ## Stage pivot, 2026-08-05
 
