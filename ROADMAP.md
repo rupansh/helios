@@ -29,8 +29,10 @@ measurement (`FINDINGS.md`), and both were blockers:**
 - **F1 — Core DDI 0116 negotiates on build 26100.** The "Windows 11 26H1 / build
   28000, no fallback" package minimum was an artefact of what WDK 26100's
   `d3d12umddi.h` *declares*. The inbox `26100.8737` runtime accepts the 0116
-  token and drives `pfnCreateDevice` with it. The remaining input is a bindgen
-  regen against WDK 28000, staged at `tmp/wdk-28000/`.
+  token and drives `pfnCreateDevice` with it. The remaining input was a bindgen
+  regen against WDK 28000 — **done 2026-08-10**, against the kit now *installed*
+  on the VM rather than a staged tree (see "The build environment moved to WDK
+  28000" below).
 - **F2 — a CpuVisible memory segment does not Code-43.** §10.7's required HLM1
   segment shape is the shape the CLAUDE.md invariant called ETW-proven fatal.
   `BarSegFlags=0x02` starts `OK/CM_PROB_NONE` and `helios_paintcap` shows a
@@ -493,20 +495,75 @@ HEAD; symbols cited rather than line numbers, because these files move.
 |---|---|---|---|---|
 | **X1** | `kmd_render/src/adapter/allocation_object.rs` (module header) | `ddi/lifecycle.rs::dxgkddi_stop_device`, `ddi/lifecycle.rs::dxgkddi_remove_device` (**K10**); `ddi/submit_command.rs::dxgkddi_reset_from_timeout` (**K9**) | call `adapter::allocation_object::invalidate_all()` beside the `ddi::native_fence::invalidate_all()` call the same units owe. Both are lock-free, allocation-free and legal at any IRQL. §14 requires the two generations be invalidated **together** (so they may not be split across two reset paths) and §18.2 fixes the order: capability invalidation precedes the device-lost wakeup | ⛔ **OPEN, and neither call site exists** — `grep -rn invalidate_all kmd_render/src/` finds no caller for *either* function. An adapter reset invalidates nothing; `AcGenEpoch` staying 0 is the evidence the request has not been honoured, and a nonzero value is the evidence it has |
 | **X2** | `umd12/src/bridge12.rs` (the deleted cxx declaration block, and again at the deleted wrapper) | `umd12/bridge/vkd3d_bridge.{h,cpp}` | delete the C++ member `HeliosVkd3dDevice::transfer_resource_ownership`. There is no adoption to transfer: HWA2 carries no host resource token (§10.3) and the KMD creates the backing rather than taking the guest's | ⛔ **OPEN.** The Rust side is gone; the C++ side is **fully intact** — declared in `vkd3d_bridge.h`, defined in `vkd3d_bridge.cpp`, and still resolving `helios_venus_memory_transfer_resource_ownership` via `GetProcAddress`, with its `g_vkd3dOwnershipTransferFailed` counter. An unused C++ member is not a build failure, which is exactly why it will rot silently |
-| **X3** | `kmd_render/src/ddi/display.rs` (display lane) | the present-side A3 refusal in `ddi/display.rs` | *(row reserved — the display-lane author is expected to file this in round 3's repair; take the request text and status from `REVIEW-ROUND-3.md` rather than guessing, and do not treat an empty row as "no request")* | ⛔ OPEN, text pending |
+| **X3** | `kmd_render/src/ddi/create_allocation.rs` (K4) | `kmd_render/src/ddi/display.rs` (display lane) | make the present-side A3 refusal distinguishable and countable. `PresentAllocInfo` is permanently `None`, so BOTH present consumers took their `else` arm on every call **through the pre-existing last-value breadcrumb `PBFlip`/`PBCpy = 0xE1`**, which in that file already means "dxgkrnl handed us a handle we could not resolve" — a handle-lifetime bug, an entirely different investigation — and a last-value write could not even say whether it fired once or per frame | ✅ **CLOSED 2026-08-10** (`01a4131`). The two sites now write **`0xEA`** and bump `create_allocation::PRESENT_NO_ALLOC_INFO` (**`PrNoRid`**), the symptom-side pair to `OaNoRid`'s cause side; `0xE1` stays reserved for its original meaning. Expected LARGE and rising until A3 — **revisit, do not merely zero** |
 | **X4** | `umd/src/forward/resource.rs` (the `global_vidmm_tracker` out-parameter, in the tex2d create path) | `umd/bridge/` — the D3D11 cxx bridge | remove the `global_vidmm_tracker` out-parameter from `get_resource_alloc_identity`. It is a **write-only sink**: `GlobalVidMmTracker` has no successor at all (K4-CONTRACT §6 — HWA2 has no tracking kind, no cookie, no global-share field, no tracker flag bit, and §10.3 forbids reintroducing it under another name). The Rust extern and the C++ declaration must change in **one** changeset or the bridge stops linking | ⛔ **OPEN.** ⚠ This request was filed as "see the K4 report" — a document that **has never existed** (`docs/retirement/` holds `FINDINGS.md`, `K4-CONTRACT.md`, `OWNERSHIP.md`, the six `lane-*.md` and the review rounds; `grep -rln 'K4 report' docs/` is empty). Round 3 caught it and the citation is being re-pointed at `K4-CONTRACT.md` §6 by the owning author. **A cross-lane request that names a nonexistent document is untrackable by construction — that is why this register exists.** The request text now lives at the site as "an open cross-lane request against `umd/bridge/`" |
 
 ⇒ **A new cross-lane request gets a row here in the same edit that writes the
 source comment.** A comment in the requesting file is a note to nobody: neither
 the lane that owes the work nor the lane that will deploy it reads that file.
 
+### ⭐ The build environment moved to WDK 28000 (2026-08-10, owner decision)
+
+Round 3's completeness critic found that **`helios_umd12.dll` could be built on
+exactly one computer**: `umd12/build.rs` `require_path`'d a `.gitignore`d
+`tmp/wdk-28000/` and `require_core_0116()` panicked without it. The same
+untracked tree silently decided whether `tools/retirement-gates.sh` ran or
+skipped its slot-audit gate — **8 PASS in one checkout and 7 PASS + 1 SKIP in
+another, at the same commit.**
+
+⇒ Kit **10.0.28000.0 is now INSTALLED on the VM** and is what `wdk-build`
+selects (highest installed kit, no override). Four NuGet packages at
+`10.0.28000.2526`, version-scoped paths only so the 26100 kit's shared `wdf`,
+`Catalogs` and legacy `bin` dirs are untouched; the result has the same
+`Include`/`Lib` shape as 26100 beside it, which is what "keep only complete
+kits" requires. **`TOOLCHAIN.md` §2.1 is the record** — recipe, all four
+SHA-256s, and what changed in the build.
+
+What a later lane needs to know:
+
+* The umd12 **WDK-vs-SDK include split is retired.** It existed only because the
+  staged package was a WDK with 11 `shared/` headers; the complete kit has 255
+  and declares the two identifiers that forced the exclusion.
+* ⚠ **The D3D12 bindings changed**: `umd12/bindgen/cached/d3d12umddi.rs`
+  6,485,166 → 6,573,255 bytes, **65 items added / 3 removed** (28000-era kernel
+  types; the removals are anonymous `__bindgen_ty_N` renumbering inside
+  `_D3DKMT_VIDMM_ESCAPE`). Inspected, not blind-copied.
+* ⭐ **`km/dispmprt.h` is VENDORED** at `kmd_render/tools/wdk-28000/km/dispmprt.h`
+  (167 KB, README with provenance). The slot-audit gate runs on **Linux**, where
+  no Windows kit exists, so installing on the VM did not help it — the gate's
+  `if [ -f tmp/… ]` wrapper is **deleted**, and all 8 gates now pass with `tmp/`
+  moved aside entirely. Regenerating against the vendored copy changed exactly
+  the recorded `AUDITED_HEADER` path: **zero `SlotClass` changes**, still 192
+  slots / 1544 bytes — checked *before* the regeneration was accepted, because
+  `FINDINGS.md` F6 records what happens when it is not.
+* ⚠ **There is no working `python3` on the VM** (App Execution Alias stub), so
+  `build.rs`'s slot-audit check is advisory there. The enforcing run is
+  `tools/retirement-gates.sh` on Linux.
+* ⚠ **CI still installs only kit 26100** and is deliberately deferred to the
+  **end** of the retirement (owner sequencing). The fix is to install 28000 on
+  the runner the same way. The LLVM pin was raised 17.0.6 → 22.1.8 in the same
+  pass, because this changeset had deleted
+  `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` while CI still passed it to the
+  DXVK half — one job stating two opposite toolchain assumptions.
+
+⭐ **Verification pattern to repeat, not just a result:** the package hash
+matched the one the docs already pinned and three headers hashed identical
+against the old tree, so the install is *provably* the same package the earlier
+measurements used; and `kmd_render` was re-checked with `wdk-sys`
+**force-cleaned first** (151.6 MiB removed) — 22 warnings, the pre-change
+baseline. A green build proves nothing about today's toolchain unless you made
+it regenerate.
+
 ### ⭐ Sequencing after round 3
 
 In order:
 
-1. **Repair what round 3 found** — `METHOD.md` §2 phase 3, by the authors, with
-   every claim's documentation changed *in the same edit* as the claim.
-2. **Round 4** — rotate at least two lenses again (§3 criterion 1 requires
+1. ~~**Repair what round 3 found**~~ — ✅ **DONE 2026-08-10** (`01a4131`), by
+   seven authors over disjoint file sets, each verifying its findings before
+   editing and each changing a claim's documentation in the same edit. One
+   round-3 finding was **refused** as false at HEAD (the gate-8 item described
+   the lens's own adversarial patch); see `REVIEW-ROUND-3.md` §3.
+2. **Round 4** ← **NEXT** — rotate at least two lenses again (§3 criterion 1 requires
    *different* compositions), keep the gate-defeat lens, and re-run the
    completeness critic. See the arithmetic above: round 4 is at best the *first*
    dry round.
