@@ -257,6 +257,30 @@ unnecessary `.def` and a confident wrong claim in the record.
 Now gated by `tools/mesa-layer-syntax.ps1` (VM-only), proven in both
 directions.
 
-⚠ **"Compiles" is not "wired in."** `meson.build`, the layer JSON and packaging
-remain outstanding; nothing loads this yet. It stays in the ROADMAP's
-not-wired-in table.
+### And then it was actually built, which found two more
+
+`-Dvulkan-layers=helios-present` now produces `VkLayer_HELIOS_present.dll` and
+its loader manifest. The real build uses **mingw-w64 g++**, a different compiler
+from the clang-cl syntax check, and it disagreed:
+
+* **`name_prefix`.** mingw emits `libVkLayer_*.dll`, which does not match the
+  manifest's `library_path`. ⚠ **Silent failure mode** — the loader simply never
+  finds the layer and nothing reports why.
+* **`-Wunused-function`** on `helios_is_layer_owned_instance_extension`, which
+  turned out to be genuinely dead: its three names are a strict subset of the
+  list that does the stripping, and the `CreateInstance` loop cannot use it
+  because it must know *which* of the three matched.
+
+⇒ **Neither compiler alone was sufficient**, which is why the clang-cl script is
+kept rather than retired now that meson builds the layer.
+
+Verified past "it links": `objdump -p` on the built DLL shows all eight loader
+entry points exported, and the generated manifest's `library_path` matches the
+filename actually produced. The layer also moved to its own directory, because
+§2 item 8's acyclicity rule and §13.2's ban on the ICD importing d3d12/dxgi are
+both violated by an arrangement that could fold these objects into
+`idep_vulkan_wsi`.
+
+⚠ **"Builds" is not "installed."** Packaging and loader registration are a
+cross-lane request against `packaging/windows/Install-Helios.ps1`
+(`OWNERSHIP.md` §1). Nothing loads this yet.
