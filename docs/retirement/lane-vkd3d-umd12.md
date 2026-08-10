@@ -3,7 +3,10 @@
 Reconnaissance brief. **No implementation code was written.** Source scope:
 `vkd3d-proton-helios/**` and `umd12/**`.
 
-Reference: `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` (5918 lines, "the doc" below).
+Reference: `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` (**5928** lines, "the doc"
+below — it was 5918 until commit `c17f17c` added a ten-line banner at `:11-20`,
+so every doc line number written in this brief before 2026-08-10 is 10 too low;
+re-grep before citing).
 Repo state read at root `d1c820a`, submodule `vkd3d-proton-helios` = `f3918d5e`
 (matches the doc's §1 provenance table, line 85).
 
@@ -31,10 +34,29 @@ Repo state read at root `d1c820a`, submodule `vkd3d-proton-helios` = `f3918d5e`
 **Companion sections that are normative for this lane but were NOT in the assigned
 ranges** — read them before touching the named file:
 
-* **§10.3, lines 1004-1180** — the `HeliosWddmAllocationDescV2` (`HWA2`) 168-byte
-  create-time descriptor. `resource12.rs` is in this lane's manifest and its
-  `pfnAllocateCb` path writes this record. §17.5:4249-4253 also makes HWA2 the
-  replacement for vkd3d's deleted Wine metadata.
+* **§10.3, lines 1014-1189** (⚠ **+10 vs. what this brief originally said** —
+  commit `c17f17c` inserted a ten-line banner at
+  `HELIOS_PRESENT_SYNC_RETIREMENT.md:11-20`, so *every* doc line number written
+  in this brief before 2026-08-10 is 10 too low; re-grep before citing. The HWA2
+  byte table is **1043-1069**) — the `HeliosWddmAllocationDescV2` (`HWA2`)
+  168-byte create-time descriptor. `resource12.rs` is in this lane's manifest
+  and its `pfnAllocateCb` path supplies this record.
+  ⛔ **Corrected 2026-08-10 per `docs/retirement/K4-CONTRACT.md` §1: the UMD does
+  not *write* HWA2 — it supplies a create-*input* HWA2 and the KMD performs the
+  write of all 168 output bytes.** The split matters at three fields the UMD
+  must leave **zero** on input or the create is refused: `allocation_generation`
+  (offset 16), `flags & DIRECT_FLIP_COMPATIBLE` and `flags &
+  D3D12_RUNTIME_PRIMARY` (offset 68). Everything else the UMD supplies is
+  validated and echoed verbatim — the KMD refuses rather than correcting a
+  field, so a `byte_size` or geometry the UMD guesses is a create failure, not a
+  silent fix-up. Validate against `Hwa2Stage::CreateInput` /
+  `HeliosWddmAllocationDescV2::validate_create_input` in `protocol/src/wddm.rs`.
+  ⛔ And HWA2 carries **no host resource id and no Vulkan memory-type index**
+  (K4-CONTRACT §5): `resource12.rs`'s current reads of the retired 48-byte
+  `HeliosWddmOpenIdentity` have no successor field, so they must fail loudly
+  with a named counter rather than be re-pointed at an HWA2 field that does not
+  exist. §17.5:4259-4263 also makes HWA2 the replacement for vkd3d's deleted
+  Wine metadata.
 * **§17.1, lines 3738-3799** — where HOB1/HOS1/HOC1/HQA1 must be *declared*
   (`protocol/`). This lane consumes those declarations; it may not author them.
 * **§18.1, lines 4636-4772** — the static/build gates, notably 4639-4642

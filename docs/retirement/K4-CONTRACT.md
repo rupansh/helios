@@ -123,14 +123,29 @@ ruling rather than stay an open item:
 ⛔ Had the KMD demanded equality, **every D3D11 create would have failed**, and
 it would have failed on the target with no Linux build able to see it.
 
-**The rule.** `byte_size` is **UMD-supplied** and means *the exact extent the
-resource requires*. The KMD:
+**The rule, in two tiers.** `byte_size` is **UMD-supplied** and means *the exact
+extent the resource requires*. The KMD **never rewrites it** (§1.1), and
+validates it differently depending on who authored it:
 
-* validates `byte_size != 0`, that every plane record is bounded inside it, and
-  that `byte_size <= ` the backing extent the KMD is about to create;
-* **refuses** the create if `byte_size` exceeds the backing — the safe
-  direction, since it can never admit an over-bind;
-* **never rewrites it**, exactly as §1.1 says of every non-KMD-owned field.
+* **Tier 1 — a `STANDARD` allocation in the `LINEAR` swizzle class:** exact
+  equality with `linear_blob_size(plane0.row_pitch, height)`. These are the
+  surfaces the KMD itself authored in
+  `dxgkddi_get_standard_allocation_driver_data`, so equality is not a demand on
+  the UMD — it is the KMD checking that its **own** bytes came back unmodified.
+  A mismatch is `AcSize` / `STATUS_INVALID_PARAMETER`.
+* **Tier 2 — every other kind:** `byte_size != 0`, every plane record bounded
+  inside it, and `byte_size <= ` the backing extent the KMD created. Exceeding
+  the backing is refused; the reverse is admitted. §10.3 gives no computation
+  rule for an ordinary UMD buffer or image, and **inventing one would refuse
+  legal creates** — which is exactly the trap the table above describes.
+
+⛔ The undersize direction is the one that must be acted on, and it is: a blob
+smaller than the image requirement binds "successfully" and then MMU-faults when
+the sampler reads the slack region (host Xid 31, `FAULT_PTE VIRT_READ`, killed
+the IDD feed live 2026-07-04). The oversize direction is only *counted*
+(`LINEAR_BLOB_SIZE_DIVERGENCE`), because it measures how far the empirical
+constants are from the host's real Vulkan requirement without acting on a number
+nobody has justified acting on.
 
 **The KMD's blob arithmetic stays KMD-private and is never exported.**
 `linear_blob_size`'s two empirical constants (`NV_LINEAR_ROW_ALIGN`,
@@ -225,12 +240,30 @@ HVM1 placement, and does not depend on that segment existing yet.** Concretely:
 * `Hvm1Role::placement()` already hardcodes `preferred_segment:
   HELIOS_SEGMENT_ID_HLM1` (`native_render.rs:1772`). K4 records it and
   validates against it.
-* Role 4 (device-local) placement is **admitted and counted, not satisfied**:
-  until K2 reports the HLM1 segment, a role-4 create returns the documented
-  failure with a named counter, never a silent substitution onto the aperture
-  segment. F2 measured that the segment *shape* is admitted by the OS
-  (`BarSegFlags=0x02` starts `OK/CM_PROB_NONE`), which is why this is a
-  sequencing gap and not a design one.
+* ⭐ **RULING, amended 2026-08-10 — check the segment, do not hardcode the
+  role.** The first draft of this clause said "role 4 is admitted and counted,
+  not satisfied", and the review found that both readings built on it are wrong:
+  the KMD refused *only* role 4 while admitting roles 1–3 onto
+  `HELIOS_SEGMENT_ID_HLM1`, and the `kmd_logic` model refused *all four*.
+  `Hvm1Role::placement()` (`native_render.rs:1763-1775`) hardcodes that segment
+  for **every** role, so a role-1..3 create is handed a `preferred_segment` the
+  segment table may not report — and is then refused **by dxgkrnl, outside the
+  driver, with no Helios counter at all**. That is precisely what "every
+  refused path gets a named counter" exists to prevent, and it is invisible in
+  exactly the way this project has been burned by before.
+
+  ⇒ The rule is neither "role 4" nor "all roles". The KMD **verifies that the
+  role's `preferred_segment` is actually present in the segment table it
+  reports**, and refuses with a named per-role counter when it is not. That is
+  correct under both K2 states, it needs no knowledge of when K2 lands, and it
+  cannot go stale — whereas a hardcoded role number is a claim about K2's
+  schedule embedded in kernel code.
+
+  ⚠ Do not assume the answer either way before running it: F2 measured that the
+  HLM1 *flag shape* is already admitted by the OS (`BarSegFlags=0x02` starts
+  `OK/CM_PROB_NONE` with a fully composited desktop), so segment id 2 may well
+  be reported **today**, which would make some roles satisfiable before K2 lands
+  at all. The check answers that at runtime; a constant cannot.
 * K4 must **not** infer "K2 done" from "the segment shape is admitted". Get
   K2's end state in writing before wiring role-4 placement for real.
 

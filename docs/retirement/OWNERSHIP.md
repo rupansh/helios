@@ -15,6 +15,7 @@ request** naming the exact edit. It does not make the edit.
 |---|---|---|
 | `kmd_render/src/lib.rs` | KMD core | One `build_ddi_table()`. The display lane needs 9 slot registrations, the native-fence lane 4; both submit their slot list to the owner as data. |
 | `kmd_render/src/ddi/mod.rs` | KMD core | One module list. |
+| `kmd_render/src/ddi/create_allocation.rs` | KMD core (**K4**) | Added 2026-08-10. It is the second most cross-lane-coupled file in the KMD after `lib.rs`, and K4 rewrites it. Measured with `rg -n 'create_allocation::' kmd_render/src/`: **`ddi/display.rs` — the display lane — imports or calls ten of its symbols**: `present_alloc_info`, `PresentAllocationStorage`, `ScanoutTarget` (`:14`), `present_alloc_diag` (`:349,350`), `scanout_allocation_for_resource` (`:866`), `allocation_resource_id` (`:1375`), `set_vidpn_primary_address` (`:1379,1635`), `scanout_alloc_info` (`:1502,2276`), `SCANOUT_ALLOC_FULL` (`:2061`), `submit_primary_scanout_copy` (`:2806`). (An eleventh name, `SCANOUT_ALLOCS` at `:862`, appears only in a comment.) Plus `ddi/build_paging_buffer.rs:60` (`paging_alloc_info`, `set_bar_placement` — K3), `ddi/cpu_host_aperture.rs:37,143,150,264` (`paging_alloc_info`, `PagingAllocInfo`, `APERTURE_MISSING_CPU_VISIBLE`, `LINEAR_BLOB_SIZE_DIVERGENCE` — K1 deletes that file, so K1 must re-home or delete those two counters), `ddi/submit_command.rs:212` (`RECLAIM_BAD_HANDLE` — K6), the six DDI re-exports at `ddi/mod.rs:54`, and a comment reference in `ddi/present_packet.rs:81`. Any rename or deletion in that set breaks another lane's file at compile time, in a build only the VM can run. |
 | `kmd_render/build.rs` | KMD core | One bindgen invocation and allowlist. |
 | `kmd_render/src/adapter/scanout.rs` | KMD display | KMD core's read-ledger deletions are a cross-lane request against it. |
 | `kmd_logic/src/lib.rs` | shared, partitioned | 5596 lines, three lanes (batch/queue, native-fence lifecycle, plane). Partition by `pub mod` block; merge by whole-module insert; never interleave. |
@@ -24,9 +25,11 @@ request** naming the exact edit. It does not make the edit.
 | `tools/**` | host/packaging | Both §17.3 and §17.7 order `tools/d3d11_kmt_shared_probe.cpp` deleted. Delete **once**, here. |
 | `protocol/**` | protocol | Every other lane is a pure consumer and must never declare a wire record locally. |
 
-## 2. The two atomic pairs
+## 2. The three atomic pairs
 
-Changes that are only correct if they land in the same commit.
+Changes that are only correct if they land in the same commit. (This section
+named two until 2026-08-10; the third was found by K4's ground-truth survey and
+is the one K4 sits on.)
 
 1. **`VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT`** — hand-mirrored across two
    repositories, `vkd3d-proton-helios/libs/vkd3d/vkd3d_private.h` and
@@ -37,6 +40,31 @@ Changes that are only correct if they land in the same commit.
 2. **`umd/bridge/bridge_icd_exports.*` resolver and the ICD-side export** —
    the D3D11 lane deletes the resolver, the Mesa lane deletes
    `helios_venus_memory_res_id`. One package, so one changeset.
+3. **The ICD's hand-declared 48-byte allocation records and the KMD's
+   create-time admission** (added 2026-08-10; K4-CONTRACT §7). Measured:
+   `icd/mesa/src/virtio/vulkan/vn_renderer_helios.c` hand-declares
+   `helios_wddm_alloc_private` (`:229-240`), `helios_wddm_alloc_meta`
+   (`:242-253`), `helios_wddm_open_identity` (`:255-265`) and
+   `helios_wddm_external_private` (`:267-270`), guarded only by
+   `_Static_assert(sizeof(...) == 48/48/48/96)` at `:345-352` — **size, not
+   offsets**. There is **no include of `protocol/include/*.h` anywhere in the
+   ICD** (`grep -rn "helios_wddm.h\|protocol/include" icd/mesa/src
+   icd/mesa/meson.build icd/win-build` → empty) and **no reference to HWA2 at
+   all** (`grep -rn 'HeliosWddmAllocationDescV2\|HELIOS_HWA2' icd/mesa/` →
+   empty), so nothing on either side can detect divergence. Live producers and
+   consumers: `:3374-3383` (TRACKING create, `kind =
+   HELIOS_WDDM_ALLOC_KIND_TRACKING` at `:3380`), `:3520-3532` (TRACKING
+   validate, `:3530`), `:3613-3626` (DEVICE_MEMORY external create, `kind` at
+   `:3623`, `adopt_resource_id` at `:3624`), `:3848-3862` (open-identity read,
+   `identity.resource_id` at `:3861`).
+   ⇒ The instant `dxgkddi_create_allocation` stops accepting a 48-byte
+   `HeliosWddmAllocPrivate`, **every venus `vkAllocateMemory` on Helios fails**.
+   The KMD-side and ICD-side edits are one change. ⚠ Unlike pair 1, this mirror
+   has **no gate**: `tools/retirement-gates.sh` checks the
+   `VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT` mirror and the protocol Rust↔C parity,
+   and neither covers the ICD's hand-written copies. Mesa unit **A0** (adopt the
+   generated C header, assert every offset) is the fix; until it lands, this
+   pair is enforced by nothing but this paragraph.
 
 ## 3. The activation switch
 
@@ -95,3 +123,49 @@ work, never per unit.
 
 The VM is a serial resource. Lanes may **write** concurrently; they **verify**
 one at a time.
+
+## 7. Orchestrator decision: allocation identity has one normative contract
+
+`docs/retirement/K4-CONTRACT.md` is **normative for the allocation identity
+subsystem** — HWA2, HVM1 and HOC1 as they cross `DxgkDdiCreateAllocation` /
+`DxgkDdiOpenAllocation`. It exists for the same reason §4 does: the frozen
+reference leaves real holes, and left to the lanes each would fill them
+differently.
+
+It settles four things no lane may re-decide on its own:
+
+- **HWA2 is a two-stage record.** The UMD supplies a create-*input* HWA2; the
+  KMD validates it in full and performs the write of all 168 output bytes. The
+  reference's "KMD writes it only on create" stays literally true. Nothing in
+  `protocol/` enforced an input contract before — `validate()` requires
+  `allocation_generation != 0`, so it can only ever check the output side, while
+  HVM1 and HOC1 both already have the pair. `Hwa2Stage::{CreateInput,
+  CreateOutput}` and the two validators belong to the **protocol lane**,
+  mirroring HOC1's naming exactly. (Measured 2026-08-10: already present in the
+  working tree — `Hwa2Stage` at `protocol/src/wddm.rs:568`, the shared
+  cross-field core at `:852`, and the `AllocationGenerationNonZeroOnInput` /
+  `KmdOwnedFlagSetOnInput` rejection variants at `:743`/`:750`.)
+- **HVM1 gains `from_private_data`.** It was the one record of the three with no
+  length-and-alignment constructor; without it a short user buffer is an
+  out-of-bounds *kernel* read. (Measured 2026-08-10: landed at
+  `protocol/src/native_render.rs:1963`.)
+- **The ICD re-point is NOT a substitution.** HWA2 deliberately carries no host
+  resource id and no Vulkan memory-type index, so the fields four consumers read
+  out of the retired 48-byte `HeliosWddmOpenIdentity` have **no successor
+  field** — the replacement is a different mechanism (the KMD patches the host
+  resid in from `HeliosNativeRenderPatch`), which is Mesa unit **A3** plus K6.
+  Any reader of a field HWA2 does not carry must fail loudly with a named
+  counter that names A3; none may fall back or fabricate. See §5 of the
+  contract.
+- **The VidMm tracker has no successor.** `GlobalVidMmTracker`,
+  `HELIOS_WDDM_ALLOC_KIND_TRACKING`, `adapter/tracking.rs` and the create-time
+  attestation die together. `protocol/src/wddm_legacy.rs`'s claim that it was
+  "folded into HWA2's own tracking-kind fields" is false — `grep -in track
+  protocol/src/wddm.rs` returns nothing — and the protocol lane corrects that
+  line. (Measured 2026-08-10: the correction is already in the working tree, and
+  `kmd_render/src/adapter/tracking.rs` has been deleted.)
+
+Where K4-CONTRACT contradicts `lane-kmd-core.md`, the contract wins and the lane
+brief is corrected in the same changeset (done 2026-08-10: §2.1, §2.2's
+`create_allocation.rs` row, §2.3's `kobj.rs`/`backing.rs`/`tracking.rs` rows,
+§3's K4 row, §4, §6 ambiguity 4).
