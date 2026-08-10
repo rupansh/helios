@@ -254,14 +254,11 @@ reading — "the exports are being dropped, the layer needs a `.def`" — is
 directives present in the object. Asserting it would have produced an
 unnecessary `.def` and a confident wrong claim in the record.
 
-Now gated by `tools/mesa-layer-syntax.ps1` (VM-only), proven in both
-directions.
-
 ### And then it was actually built, which found two more
 
 `-Dvulkan-layers=helios-present` now produces `VkLayer_HELIOS_present.dll` and
-its loader manifest. The real build uses **mingw-w64 g++**, a different compiler
-from the clang-cl syntax check, and it disagreed:
+its loader manifest. The real build uses **mingw-w64 g++**, and it found two
+things the clang-cl pass had not:
 
 * **`name_prefix`.** mingw emits `libVkLayer_*.dll`, which does not match the
   manifest's `library_path`. ⚠ **Silent failure mode** — the loader simply never
@@ -271,8 +268,35 @@ from the clang-cl syntax check, and it disagreed:
   list that does the stripping, and the `CreateInstance` loop cannot use it
   because it must know *which* of the three matched.
 
-⇒ **Neither compiler alone was sufficient**, which is why the clang-cl script is
-kept rather than retired now that meson builds the layer.
+### ⛔ Correction: the clang-cl detour was not worth what it looked like
+
+This section first claimed "neither compiler alone was sufficient" and kept a
+`tools/mesa-layer-syntax.ps1` clang-cl gate on that basis. **Both halves of the
+claim were wrong, and it was never tested before being written down.**
+
+Measured afterwards by reintroducing the same `HeliosEntry::phys` drift and
+building with mingw:
+
+```
+ninja exit=1  elapsed=2s
+  error: too many initializers for 'const HeliosEntry'   (x2)
+  error: 'const struct HeliosEntry' has no member named 'phys'
+```
+
+* **Sufficiency.** mingw catches it. All 17 original errors were hard errors —
+  undeclared identifiers, incomplete types, missing members, excess initializers
+  — that any conforming compiler rejects. clang-cl found a strict **subset** of
+  what mingw finds, not a complement.
+* **Speed.** The incremental ninja rebuild is **2 seconds**, so the "cheap
+  check" argument for a separate script was worth nothing either.
+
+And the clang-cl pass was actively the weaker instrument: it compiled against
+the **MSVC STL and Windows SDK**, which is not the standard library the shipping
+DLL uses, and with **none of Mesa's `-Werror` set** — so it could as easily have
+invented errors that do not exist in the real configuration.
+
+⇒ **Use the compiler the project is written for.** The script is deleted; the
+check is `ninja <the layer target>`.
 
 Verified past "it links": `objdump -p` on the built DLL shows all eight loader
 entry points exported, and the generated manifest's `library_path` matches the
