@@ -110,23 +110,54 @@ fi
 # obvious `grep -v '^\s*//'` patch is wrong on block comments, on trailing
 # comments, and on `//` inside a string.
 #
-# ⚠ WHAT THESE TWO GATES CAN AND CANNOT CATCH. They are textual. They read
-# `kmd_render` — which does not build on Linux at all — so they are the ONLY
-# mechanical statement about that crate available on this host, and they are
-# weaker than a compiler by construction:
+# ⚠ WHAT THESE TWO GATES CAN AND CANNOT CATCH — re-derived 2026-08-10 from what
+# the code below actually does, after a completeness critic DEFEATED the §8.5
+# gate with a four-line patch. The block it replaced claimed both halves of that
+# patch ("a callee whose signature takes the buffer as `*mut`", "a `*mut` cast of
+# the buffer") and caught neither, because the old gate matched on the LITERAL
+# field name: rebinding the pointer to a local erased every one of its rules. The
+# gates are textual; they read `kmd_render`, which does not build on Linux at
+# all, so they are the ONLY mechanical statement about that crate available on
+# this host, and they are weaker than a compiler by construction.
+#
+# §8.5 now tracks ALIASES. `pPrivateDriverData` seeds a set of names; a `let` or
+# an assignment whose initialiser mentions a live alias and applies nothing to it
+# but casts, `&`/`*` reborrows and the pointer methods in `PTR_METHODS` binds
+# ANOTHER name for the same pointer, and every rule below runs against the whole
+# set. A call is followed when ANY alias appears in its argument list, and the
+# parameter that received it becomes the alias inside the callee.
 #   * CAN: a restamp reintroduced in `DxgkDdiOpenAllocation` or in anything it
-#     hands the private pointer to; a callee whose signature takes the buffer as
-#     `*mut`; a `*mut` cast of the buffer; an assignment into it; any of the
-#     write intrinsics; a retired symbol back as a type, a call, or a string.
-#   * CANNOT: a write two calls deep (the flow is followed exactly ONE level, by
-#     name); a write through a pointer stashed in a struct at create time and
-#     dereferenced at open; a write emitted by a macro; a write in a callee
-#     defined outside `kmd_render/src`. The one-level limit is enforced rather
-#     than assumed: a callee this gate cannot find or cannot prove `*const` is a
-#     FAILURE, not a skip, so the blind spot has to be opened deliberately.
+#     hands the private pointer to, INCLUDING after the pointer is rebound to one
+#     or more locals; a callee whose signature takes any alias as `*mut`; a `*mut`
+#     cast of any alias; an assignment through any alias; any write intrinsic in
+#     the DDI or in a followed callee; a retired symbol back as a type, a call, or
+#     a string. Aliasing is deliberately over-approximate — an alias stays live to
+#     the end of its region regardless of branches and regardless of shadowing —
+#     so the errors it can make are false ALARMS, not misses.
+#   * CANNOT: a write two calls deep (the flow is followed exactly ONE level from
+#     the DDI body; aliases ARE propagated inside a followed callee, but a call it
+#     makes in turn is not followed); a pointer laundered through a struct field,
+#     a slice, a `Vec`, a tuple/destructuring `let`, or a closure capture (only
+#     plain `let x = …` / `x = …` bindings carry an alias); a write through a
+#     pointer stashed in a struct at create time and dereferenced at open; a write
+#     emitted by a macro; a write in a callee defined outside `kmd_render/src`.
+#     The one-level limit is enforced rather than assumed: a callee this gate
+#     cannot find, cannot parse, or cannot prove `*const` is a FAILURE, not a
+#     skip, so the blind spot has to be opened deliberately.
+#
+# §8.6 reads every crate that can `use helios_protocol::…`, not just the KMD.
+# The retired symbols are DECLARED in `protocol/src/wddm_legacy.rs` and re-exported
+# by `pub use wddm_legacy::*`, so a root set of `kmd_render/src` + `kmd_logic/src`
+# left `use helios_protocol::GlobalVidMmTracker;` in a UMD passing every gate in
+# the repo. The quarantine module is now the ONE file where a live occurrence is a
+# declaration rather than a resurrection; everywhere else it is a violation.
+#   * CANNOT: a resurrection under a NEW name (the list is a name list); a
+#     resurrection in C, C++, or the `.h` mirrors; a resurrection in `kmd/src`,
+#     which is archived, in no build, and deliberately out of the root set.
 #   * Each gate also fails when it stops seeing anything (no private-buffer
-#     reference in the DDI; no tombstone anywhere). A gate that passes because it
-#     went blind is the failure mode this whole file exists to prevent.
+#     reference in the DDI; no tombstone anywhere; a root that does not exist).
+#     A gate that passes because it went blind is the failure mode this whole
+#     file exists to prevent.
 
 # The shared prelude: classify every byte of a Rust file as code / comment /
 # string. Nested block comments, raw strings with any hash count, byte strings,
@@ -230,9 +261,20 @@ BUF = 'pPrivateDriverData'
 DDI = 'dxgkddi_open_allocation'
 WRITE_INTRINSICS = [
     'copy_nonoverlapping', 'write_bytes', 'write_volatile', 'write_unaligned',
-    'ptr::write', 'copy_from_slice', 'clone_from_slice', 'from_raw_parts_mut',
-    'write_open_identity',
+    'ptr::write', '.write(', 'copy_from_slice', 'clone_from_slice',
+    'from_raw_parts_mut', 'copy_to', 'write_open_identity',
 ]
+# A binding whose initialiser applies ONLY these to an alias is holding the very
+# same pointer, so it is another name for the buffer. Anything else -- notably a
+# function call -- is assumed to produce a NEW value, which is why `let desc =
+# read_open_descriptor(buf, len)` does not make `desc` an alias and does not drag
+# every later `Box::new(..desc..)` into the callee-following pass. The one
+# exception is a followed callee that RETURNS a pointer or a reference: that
+# return value can still be the buffer, so `PTR_RET` re-admits it (below).
+PTR_METHODS = set(
+    'add offset sub cast cast_mut cast_const wrapping_add wrapping_sub '
+    'wrapping_offset byte_add byte_sub byte_offset as_ptr as_mut_ptr'.split())
+NOT_CALLS = set('if while for match return unsafe fn else loop as'.split())
 
 codes = {}
 for f in rust_files(ROOT):
@@ -248,74 +290,209 @@ def body_from(text, start):
     e = text.find('\n}\n', start)
     return text[start:(len(text) - 3 if e < 0 else e) + 2]
 
-regions = [(PATH, DDI, m.start(), body_from(code, m.start()))]
-
-# Follow the buffer exactly one level: every call in the DDI body whose argument
-# list names the buffer POINTER (its length is not a buffer and is not followed).
-seen = set()
-for cm in re.finditer(r'(^|[^.\w])([A-Za-z_][A-Za-z0-9_]*)[ \t\n]*\(', regions[0][3]):
-    name = cm.group(2)
-    if name in ('if', 'while', 'for', 'match', 'return', 'unsafe', 'fn') or name in seen:
-        continue
-    region = regions[0][3]
-    d, j = 0, cm.end() - 1
-    while j < len(region):
-        if region[j] == '(':
+def paren_end(t, i):
+    d = 0
+    while i < len(t):
+        if t[i] == '(':
             d += 1
-        elif region[j] == ')':
+        elif t[i] == ')':
             d -= 1
             if d == 0:
-                break
-        j += 1
-    if BUF not in region[cm.end():j]:
-        continue
-    seen.add(name)
-    if name in WRITE_INTRINSICS:
-        sys.exit('OBLIGATION 5 VIOLATED: the open path hands the private buffer straight to `' + name + '`')
-    hit = None
-    for f, c in codes.items():
-        fm = re.search(r'^[a-z ]*fn ' + name + r'\(', c, re.M)
-        if fm:
-            hit = (f, c, fm)
-            break
-    if hit is None:
-        sys.exit('the open path hands the private buffer to `' + name + '`, whose definition this gate cannot find under kmd_render/src. It cannot vouch for a callee it cannot read -- FIX THIS GATE (or bring the callee back in-tree), do not delete it')
-    f, c, fm = hit
-    sig = c[fm.start():c.find(')', fm.end())]
-    if '*mut' in sig:
-        sys.exit('OBLIGATION 5 VIOLATED: the open path passes the private buffer to `' + name + '`, which takes it as `*mut`: ' + ' '.join(sig.split()))
-    regions.append((f, name, fm.start(), body_from(c, fm.start())))
+                return i
+        i += 1
+    return len(t)
 
+def split_args(t):
+    out, d, cur = [], 0, ''
+    for ch in t:
+        if ch in '([{':
+            d += 1
+        elif ch in ')]}':
+            d -= 1
+        if ch == ',' and d == 0:
+            out.append(cur)
+            cur = ''
+        else:
+            cur += ch
+    out.append(cur)
+    return out
+
+def named(t, aliases):
+    return [a for a in aliases if re.search(r'\b' + re.escape(a) + r'\b', t)]
+
+def calls_in(t):
+    """(is_method, name, index of its open paren) for every call in `t`."""
+    for cm in re.finditer(r'(\.\s*)?\b([A-Za-z_]\w*)\s*(?:::\s*<[^>]*>\s*)?\(', t):
+        if cm.group(2) in NOT_CALLS:
+            continue
+        yield (cm.group(1) is not None, cm.group(2), cm.end() - 1)
+
+def ptr_preserving(init, live, ptr_ret):
+    if not named(init, live):
+        return False
+    for is_method, name, _ in calls_in(init):
+        if is_method and name in PTR_METHODS:
+            continue
+        if (not is_method) and name in ptr_ret:
+            continue
+        return False
+    return True
+
+# Only plain `let x = ..;` / `let Some(x) = ..` / `x = ..;` bindings carry an
+# alias. Destructuring, struct fields and captures are the documented blind spot.
+BINDERS = [
+    re.compile(r'\blet\s+(?:mut\s+)?([A-Za-z_]\w*)\s*(?::[^=;]*?)?=\s*([^;]*);', re.S),
+    re.compile(r'\blet\s+(?:Some|Ok)\s*\(\s*(?:mut\s+)?([A-Za-z_]\w*)\s*\)\s*=\s*([^;]*?)\s*(?:;|else)', re.S),
+    re.compile(r'(?m)^\s*([A-Za-z_]\w*)\s*=[^=]([^;]*);'),
+]
+
+def grow_aliases(text, seed, ptr_ret):
+    """seed: {name: char offset from which it is live}. -1 == live everywhere."""
+    aliases = dict(seed)
+    changed = True
+    while changed:
+        changed = False
+        for rx in BINDERS:
+            for bm in rx.finditer(text):
+                nm, init = bm.group(1), bm.group(2)
+                if nm in aliases:
+                    continue
+                live = [a for a, o in aliases.items() if o <= bm.start(2)]
+                if ptr_preserving(init, live, ptr_ret):
+                    aliases[nm] = bm.start()
+                    changed = True
+    return aliases
+
+def fn_pattern(name):
+    return (r'^(?:pub(?:\s*\([^)]*\))?\s+)?(?:default\s+)?(?:const\s+)?(?:async\s+)?'
+            r'(?:unsafe\s+)?(?:extern\s+"[^"]*"\s+)?fn\s+' + re.escape(name) + r'\s*[(<]')
+
+def fn_header(c, start, name):
+    """(parameter text, return-type text) of the fn declared at `start`."""
+    i = c.find(name, start) + len(name)
+    while i < len(c) and c[i].isspace():
+        i += 1
+    if i < len(c) and c[i] == '<':          # generic parameter list
+        d = 0
+        while i < len(c):
+            if c[i] == '<':
+                d += 1
+            elif c[i] == '>':
+                d -= 1
+                if d == 0:
+                    i += 1
+                    break
+            i += 1
+        while i < len(c) and c[i].isspace():
+            i += 1
+    if i >= len(c) or c[i] != '(':
+        return None
+    close = paren_end(c, i)
+    b = c.find('{', close)
+    return c[i + 1:close], c[close + 1:b if b >= 0 else close + 1]
+
+ddi_text = body_from(code, m.start())
 bad = []
+followed = {}       # callee name -> (file, name, start, body, [param aliases])
+ptr_ret = set()     # followed callees that return a pointer/reference
+aliases = {BUF: -1}
+
+# Alias growth and one-level callee following are mutually recursive: a callee is
+# followed because an alias reached it, and its return value can mint a new alias.
+progress = True
+while progress:
+    progress = False
+    aliases = grow_aliases(ddi_text, aliases, ptr_ret)
+    for is_method, name, op in calls_in(ddi_text):
+        if is_method or name in followed:
+            continue
+        argtext = ddi_text[op + 1:paren_end(ddi_text, op)]
+        live = [a for a, o in aliases.items() if o <= op]
+        # The buffer's LENGTH is not a buffer: `PrivateDriverDataSize` does not
+        # match `\bpPrivateDriverData\b`, so a call taking only the length is not
+        # followed.
+        if not named(argtext, live):
+            continue
+        progress = True
+        followed[name] = None
+        if name in WRITE_INTRINSICS:
+            bad.append('OBLIGATION 5: the open path hands the private buffer straight to `%s`' % name)
+            continue
+        hit = None
+        for f in [PATH] + [x for x in codes if x != PATH]:
+            fm = re.search(fn_pattern(name), codes[f], re.M)
+            if fm:
+                hit = (f, codes[f], fm)
+                break
+        if hit is None:
+            sys.exit('the open path hands the private buffer to `' + name + '`, whose definition this gate cannot find under kmd_render/src. It cannot vouch for a callee it cannot read -- FIX THIS GATE (or bring the callee back in-tree), do not delete it')
+        f, c, fm = hit
+        hdr = fn_header(c, fm.start(), name)
+        if hdr is None:
+            sys.exit('cannot parse the signature of `' + name + '`, which receives the private buffer -- FIX THIS GATE, do not delete it')
+        params, ret = hdr
+        if '*mut' in params:
+            bad.append('OBLIGATION 5: the open path passes the private buffer to `%s`, which takes it as `*mut`: %s' % (name, ' '.join(params.split())))
+        # Positional match: the parameter that received an alias becomes the
+        # alias inside the callee, so the rules below apply to it under its own
+        # name there.
+        pnames, plist = [], split_args(params)
+        for idx, arg in enumerate(split_args(argtext)):
+            if named(arg, live) and idx < len(plist):
+                pm = re.match(r'\s*(?:mut\s+)?([A-Za-z_]\w*)\s*:', plist[idx])
+                if pm:
+                    pnames.append(pm.group(1))
+        if re.search(r'\*\s*(?:mut|const)|&', ret):
+            ptr_ret.add(name)
+        followed[name] = (f, name, fm.start(), body_from(c, fm.start()), pnames)
+
+regions = [(PATH, DDI, m.start(), ddi_text, aliases)]
+for v in followed.values():
+    if v:
+        body = v[3]
+        regions.append((v[0], v[1], v[2], body,
+                        grow_aliases(body, dict((p, -1) for p in v[4]), ptr_ret)))
+
 refs = 0
-for f, name, start, text in regions:
+alias_names = set()
+for f, name, start, text, alias_at in regions:
     base = codes[f].count('\n', 0, start) + 1
+    lineof = dict((a, 0 if o < 0 else base + text.count('\n', 0, o)) for a, o in alias_at.items())
+    alias_names |= set(a for a in alias_at if a != BUF)
     for off, ln in enumerate(text.split('\n')):
         n = base + off
+        live = [a for a, l in lineof.items() if l <= n]
         for w in WRITE_INTRINSICS:
             if w in ln:
                 bad.append('%s:%d: write intrinsic `%s` in %s -- %s' % (f, n, w, name, ln.strip()))
+        if re.search(r'\b' + BUF + r'\b', ln):
+            refs += 1
+        hits = named(ln, live)
         # In the DDI body `*mut` is LEGAL: DXGKARG_OPENALLOCATION's OUT fields
         # (hDeviceSpecificAllocation, Pitch, SubresourceOffset) are written
         # through one, and the DDI says so in its own SAFETY comment. So there it
-        # is banned only on a line that also names the private buffer. Inside a
-        # followed callee it is banned outright -- that callee took the buffer as
-        # `*const`, so manufacturing a `*mut` is exactly the laundering step.
-        if BUF in ln:
-            refs += 1
-        if '*mut' in ln and (name != DDI or BUF in ln):
-            bad.append('%s:%d: `*mut` reachable from the private buffer in %s -- %s' % (f, n, name, ln.strip()))
-        if BUF not in ln:
+        # is banned only on a line that also names an ALIAS of the private
+        # buffer -- which is what `let stamp = base as *mut u32;` is, and what the
+        # literal-name form of this rule missed. Inside a followed callee it is
+        # banned outright: that callee took the buffer as `*const`, so
+        # manufacturing a `*mut` is exactly the laundering step.
+        if '*mut' in ln and (name != DDI or hits):
+            bad.append('%s:%d: `*mut` reachable from the private buffer in %s (via %s) -- %s'
+                       % (f, n, name, ', '.join(hits) or 'the callee parameter', ln.strip()))
+        if not hits:
             continue
         a = re.search(r'[^=!<>+\-*/&|^]=[^=]', ln)
-        if a and BUF in ln[:a.start() + 1] and 'let ' not in ln[:a.start()]:
+        if a and named(ln[:a.start() + 1], live) and 'let ' not in ln[:a.start()]:
             bad.append('%s:%d: assignment INTO the private buffer in %s -- %s' % (f, n, name, ln.strip()))
 
 if refs == 0 or len(regions) < 2:
     sys.exit('the gate found no private-buffer flow in %s (refs=%d, followed=%d). Either the DDI stopped reading private data or the gate went blind -- FIX THIS GATE, do not delete it' % (DDI, refs, len(regions) - 1))
 if bad:
     sys.exit('OBLIGATION 5 VIOLATED -- DxgkDdiOpenAllocation writes the allocation-private buffer:\n' + '\n'.join(bad))
-print('OK: %s + %d const-only callee(s) [%s]: %d %s references, no write intrinsic, no *mut, no assignment' % (DDI, len(regions) - 1, ', '.join(r[1] for r in regions[1:]), refs, BUF))
+print('OK: %s + %d const-only callee(s) [%s]: %d %s reference(s), %d alias(es)%s -- no write intrinsic, no *mut, no assignment'
+      % (DDI, len(regions) - 1, ', '.join(r[1] for r in regions[1:]), refs,
+         BUF, len(alias_names),
+         (' [' + ', '.join(sorted(alias_names)) + ']') if alias_names else ''))
 PY
 )
 
@@ -335,11 +512,28 @@ REPO = sys.argv[1]
 RETIRED = [
     'HeliosWddmOpenIdentity', 'HeliosWddmAllocPrivate', 'HeliosWddmAllocMeta',
     'GlobalVidMmTracker', 'VidMmTrackerTable', 'AdoptedUmdResource',
-    'write_open_identity',
+    'HELIOS_WDDM_ALLOC_KIND_TRACKING', 'write_open_identity',
 ]
-ROOTS = [REPO + '/kmd_render/src', REPO + '/kmd_logic/src']
+# ⚠ EVERY crate that can `use helios_protocol::…`, not just the KMD. The retired
+# symbols are `pub` in `protocol/src/wddm_legacy.rs` and re-exported wholesale by
+# `pub use wddm_legacy::*` in `protocol/src/lib.rs`, so with the KMD-only root set
+# this gate had, `use helios_protocol::GlobalVidMmTracker;` in umd12 was invisible
+# to every gate in the repo -- it looked in the two places the symbols are NOT.
+# `kmd/src` is deliberately absent: it is the archived System-class stack, in no
+# build, and CLAUDE.md forbids resurrecting it, so a name there cannot come back.
+ROOTS = [REPO + '/' + p + '/src' for p in
+         ('protocol', 'kmd_render', 'kmd_logic', 'umd', 'umd_common', 'umd12')]
+# The quarantine module is where these symbols LIVE. Its own header says the only
+# legitimate edit is deleting a symbol once its last caller is gone, so a live
+# occurrence HERE is a declaration awaiting that deletion; a live occurrence in
+# any consumer is the resurrection this obligation forbids. That distinction is
+# the whole reason the roots can be widened at all.
+DECL = REPO + '/protocol/src/wddm_legacy.rs'
 
-live, tombstones, files = [], 0, 0
+live, tombstones, files, declared = [], 0, 0, 0
+missing = [r for r in ROOTS if not rust_files(r)]
+if missing:
+    sys.exit('these roots hold no .rs file at all: %s. A gate that reads nothing passes everything -- FIX THIS GATE, do not delete it' % ', '.join(missing))
 for root in ROOTS:
     for path in rust_files(root):
         src = open(path).read()
@@ -352,6 +546,8 @@ for root in ROOTS:
                 k = kind[mm.start()]
                 if k == 35:
                     tombstones += 1
+                elif path == DECL:
+                    declared += 1
                 else:
                     n = src.count('\n', 0, mm.start()) + 1
                     where = 'a string literal' if k == 115 else 'LIVE CODE'
@@ -361,8 +557,10 @@ for root in ROOTS:
 if tombstones == 0:
     sys.exit('not one tombstone found for any of the %d retired symbols. They were argued to survive in comments, so zero mentions means either the arguments were deleted or this gate stopped seeing the tree -- FIX THIS GATE, do not delete it' % len(RETIRED))
 if live:
-    sys.exit('OBLIGATION 6 VIOLATED -- a retired allocation-identity symbol is back:\n' + '\n'.join(live))
-print('OK: %d retired symbols, 0 live occurrences under kmd_render/src + kmd_logic/src; %d comment tombstones across %d files' % (len(RETIRED), tombstones, files))
+    sys.exit('OBLIGATION 6 VIOLATED -- a retired allocation-identity symbol is back in a consumer:\n' + '\n'.join(live))
+print('OK: %d retired symbols, 0 live occurrences across %d roots (%s); %d declaration(s) quarantined in protocol/src/wddm_legacy.rs; %d comment tombstones across %d files'
+      % (len(RETIRED), len(ROOTS), ' '.join(r.replace(REPO + '/', '') for r in ROOTS),
+         declared, tombstones, files))
 PY
 )
 

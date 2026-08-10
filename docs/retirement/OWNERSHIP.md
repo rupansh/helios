@@ -40,31 +40,50 @@ is the one K4 sits on.)
 2. **`umd/bridge/bridge_icd_exports.*` resolver and the ICD-side export** —
    the D3D11 lane deletes the resolver, the Mesa lane deletes
    `helios_venus_memory_res_id`. One package, so one changeset.
-3. **The ICD's hand-declared 48-byte allocation records and the KMD's
-   create-time admission** (added 2026-08-10; K4-CONTRACT §7). Measured:
-   `icd/mesa/src/virtio/vulkan/vn_renderer_helios.c` hand-declares
-   `helios_wddm_alloc_private` (`:229-240`), `helios_wddm_alloc_meta`
-   (`:242-253`), `helios_wddm_open_identity` (`:255-265`) and
-   `helios_wddm_external_private` (`:267-270`), guarded only by
-   `_Static_assert(sizeof(...) == 48/48/48/96)` at `:345-352` — **size, not
-   offsets**. There is **no include of `protocol/include/*.h` anywhere in the
-   ICD** (`grep -rn "helios_wddm.h\|protocol/include" icd/mesa/src
-   icd/mesa/meson.build icd/win-build` → empty) and **no reference to HWA2 at
-   all** (`grep -rn 'HeliosWddmAllocationDescV2\|HELIOS_HWA2' icd/mesa/` →
-   empty), so nothing on either side can detect divergence. Live producers and
-   consumers: `:3374-3383` (TRACKING create, `kind =
-   HELIOS_WDDM_ALLOC_KIND_TRACKING` at `:3380`), `:3520-3532` (TRACKING
-   validate, `:3530`), `:3613-3626` (DEVICE_MEMORY external create, `kind` at
-   `:3623`, `adopt_resource_id` at `:3624`), `:3848-3862` (open-identity read,
-   `identity.resource_id` at `:3861`).
-   ⇒ The instant `dxgkddi_create_allocation` stops accepting a 48-byte
-   `HeliosWddmAllocPrivate`, **every venus `vkAllocateMemory` on Helios fails**.
-   The KMD-side and ICD-side edits are one change. ⚠ Unlike pair 1, this mirror
-   has **no gate**: `tools/retirement-gates.sh` checks the
-   `VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT` mirror and the protocol Rust↔C parity,
-   and neither covers the ICD's hand-written copies. Mesa unit **A0** (adopt the
-   generated C header, assert every offset) is the fix; until it lands, this
-   pair is enforced by nothing but this paragraph.
+3. **The ICD's allocation-record declaration and the KMD's create-time
+   admission** (added 2026-08-10; K4-CONTRACT §7). ⭐ **This pair was declared
+   here while it was enforced by nothing but this paragraph. It is now enforced
+   at compile time, and the paragraph is rewritten to say what changed.**
+
+   *What it said, and why:* `vn_renderer_helios.c` hand-declared
+   `helios_wddm_alloc_private`, `helios_wddm_alloc_meta`,
+   `helios_wddm_open_identity` and `helios_wddm_external_private` in C, guarded
+   only by `_Static_assert(sizeof(...) == 48/48/48/96)` — **size, not offsets** —
+   and the ICD included nothing from `protocol/include`. A field reorder inside
+   the right number of bytes therefore passed every check on both sides.
+
+   *What now enforces it* (measured on `icd/mesa` HEAD `23ab160`, "helios: read
+   HWA2 from protocol/, delete the hand-mirrored 48-byte records"):
+
+   - All four local declarations are **gone**; `grep -rn
+     'helios_wddm_alloc_private\|helios_wddm_alloc_meta\|helios_wddm_open_identity\|helios_wddm_external_private'
+     icd/mesa/src/` returns only comment tombstones (`vn_renderer_helios.c:243-244`).
+   - `vn_helios_hwa2.h:52` does `#include "helios_wddm.h"`, so
+     `protocol/include/helios_wddm.h`'s **82 `offsetof` assertions** (of 113
+     `HELIOS_WDDM_STATIC_ASSERT`s total; 25 of them on
+     `HeliosWddmAllocationDescV2` and 3 on `HeliosWddmPlaneRecordV2`) are
+     evaluated inside the ICD's own translation units — `vn_helios_hwa2.c`,
+     `vn_renderer_helios.c` and `vn_renderer.h`. That is strictly stronger than
+     the `sizeof` guards it replaces: a reorder now fails the ICD's build.
+   - The include path is **checked, not assumed**:
+     `icd/mesa/src/virtio/vulkan/meson.build:163-171` derives
+     `<mesa source root>/../../protocol/include` and calls `error()` if
+     `helios_wddm.h` is not there, so a mesa checked out away from the parent
+     tree fails configure with a named message instead of finding a stale copy.
+
+   ⇒ Mesa unit **A0** as it was scoped here — "adopt the generated C header,
+   assert every offset" — is **done**, and this pair is no longer the
+   ungated one.
+
+   *What remains manual, and is the residual risk:* the header pins the
+   **layout**, and nothing pins the **rules**. `vn_helios_hwa2.c` transcribes
+   `HeliosWddmAllocationDescV2::from_private_data` and the two stage validators
+   from `protocol/src/wddm.rs` by hand, in the Rust's order, and its own banner
+   (`:17-20`) says so: "there is no compile-time link between the two … until
+   `tools/retirement-gates.sh` has a diff gate over these two bodies, this
+   pairing is maintained by review." The KMD-side and ICD-side edits are still
+   one change for that reason, and a rule added on one side without the other is
+   still silent.
 
 ## 3. The activation switch
 
@@ -117,7 +136,7 @@ work, never per unit.
 |---|---|---|
 | `protocol` | Linux | `cd protocol && CARGO_TARGET_DIR=target/linux cargo test` — there is **no workspace root**, so `-p` from the repo root fails. |
 | `vkd3d-proton-helios` | Linux | `build-native-codex && ninja` — green. Tests are **545**, run by `./tests/test-runner.sh build-native-codex/tests/d3d12`, NOT by `meson test` (which reports "No tests defined"). ⚠ The old "102/102" here and the "215/215" in agent memory were both wrong and disagreed with each other. Expect **2 failures**, `test_nvx_cubin` and `test_destruction_notifier_interfaces`; both reproduce on unmodified upstream `2c7ba22c` and neither is ours — see `REVIEW-ROUND-1.md`. The second is concurrency-dependent, so its count varies with `-j` and with machine load. |
-| `qemu-helios` | Linux | `build-helios && ninja qemu-system-x86_64` — green. ⛔ **The HPM1/HLM1 memory lane is PARKED — see `FINDINGS.md` F5.** The submodule is reset to its pre-retirement state; the three HPM1 commits live on branch `helios/hpm1-parked`. Do not re-open them without running their adversarial review first, and do not add a new QEMU dependency to any lane. |
+| `qemu-helios` | Linux | `build-helios && ninja qemu-system-x86_64` — green. ⛔ **The QEMU half of the HPM1/HLM1 memory lane is PARKED — see `FINDINGS.md` F5.** (The KMD-side half is not: F5's Consequence is that no lane in flight has a QEMU dependency, and `K4-CONTRACT.md` §4 records K2 as rescoped rather than blocked.) The submodule is reset to its pre-retirement state; the three HPM1 commits live on branch `helios/hpm1-parked`. Do not re-open them without running their adversarial review first, and do not add a new QEMU dependency to any lane. |
 | `kmd_render`, `umd`, `umd12` | **VM only** | WDK/bindgen. Serialize: the VM is one machine. |
 | `icd/mesa` | **VM only** | `win_meson`. |
 

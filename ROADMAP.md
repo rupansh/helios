@@ -43,11 +43,24 @@ Both are bounded in `FINDINGS.md` — read the bounds before building on them.
 HOC1, HQA1/HTS1, HVC1/HNR2/HVM1/HVR1, HPM1/HLM1, the §12.3 ETW schema) with
 compile-time offset assertions and four C mirrors; `wddm_legacy.rs` keeps the
 pre-retirement symbols alive so `kmd_render`/`umd`/`umd12` still build while each
-migrates; vkd3d's Wine-Escape and `\\.\SharedGpuResource` transports are gone;
-QEMU has HPM1 negotiation and HLM1 BAR admission.
+migrates; vkd3d's Wine-Escape and `\\.\SharedGpuResource` transports are gone.
 
-**Also landed:** QEMU's HPM1 paging-DMA executor; `umd12`'s bindgen regenerated
-against WDK 28000 (355 `_0112` / 346 `_0116` symbols, `HRTFENCE`,
+⛔ **The two QEMU rows that stood here are WITHDRAWN — "QEMU has HPM1
+negotiation and HLM1 BAR admission" and "Also landed: QEMU's HPM1 paging-DMA
+executor" are no longer true of the tree, and `FINDINGS.md` **F5** is why.**
+`qemu-helios` is reset to `d4fde50ccb` (verified: `git ls-files -s qemu-helios`),
+dropping all three retirement commits — the 726-line HPM1 C mirror, HPM1
+negotiation + HLM1 BAR admission (~970 lines), and the paging-DMA executor
+(~2,780 lines). They are preserved on branch `helios/hpm1-parked` and tag
+`helios-hpm1-parked-2026-08-10`, not deleted. The six pre-retirement scanout
+commits — the ones that make the desktop composite, and the ones CLAUDE.md names
+the fork by — stay, and `ninja qemu-system-x86_64` is green at the reset state.
+HPM1 was **declined, not deferred**: no lane in flight has a QEMU dependency
+(F5 Consequence), and reopening it means un-parking the branch *and* running its
+adversarial review first.
+
+**Also landed:** `umd12`'s bindgen regenerated against WDK 28000 (355 `_0112` /
+346 `_0116` symbols, `HRTFENCE`,
 `pfnCreateNativeFenceCb`/`pfnOpenNativeFenceCb`).
 
 ⛔ **One component is committed but deliberately NOT wired in** (was four; two
@@ -152,11 +165,25 @@ flag day, because the moment `dxgkddi_create_allocation` stops accepting the
 `METHOD.md`'s distinct third state, not "done". No deploy: round 2 of the review
 is the gate, and `OWNERSHIP.md` §3's activation conditions are not met (F9).
 
-⇒ **When it does deploy, every venus `vkAllocateMemory` fails and the desktop
-dies**, until mesa **A3** lands. That follows from §10.3 forbidding HWA2 to carry
-a host `resid` or a Vulkan memory-type index — both load-bearing in the ICD's
-import — and A3 is XL and unstarted. It is the accepted cost of the sequencing
-decision above, not a regression.
+⇒ **When it does deploy, every Win32 shared-memory import and export refuses and
+the desktop dies**, until mesa **A3** lands. That follows from §10.3 forbidding
+HWA2 to carry a host `resid` or a Vulkan memory-type index — both load-bearing
+in the ICD's import — and A3 is XL and unstarted. It is the accepted cost of the
+sequencing decision above, not a regression.
+
+⛔ **This paragraph said "every venus `vkAllocateMemory` fails" until round 2 of
+the review measured it. That is broader than the code supports** — see
+`K4-CONTRACT.md` §5.1 for the path-by-path table. Exactly two of
+`vn_AllocateMemory`'s five arms refuse: an allocation carrying
+`VkImportMemoryWin32HandleInfoKHR` (`HELIOS_A3_GAP_IMPORT_WIN32`), and one whose
+`export_handle_types` includes `..._OPAQUE_WIN32_BIT`
+(`HELIOS_A3_GAP_EXPORT_ADOPTION`, refused before `D3DKMTCreateAllocation2`).
+The plain arm, the resource-id import and the dma-buf import **still allocate**.
+The desktop still dies, because DWM's shared surfaces and the D3D interop path
+are exactly the OPAQUE_WIN32 traffic — but a plain venus render allocation
+working is *not* evidence the deploy went well, and the old wording predicted
+otherwise. ⚠ `icd/mesa`'s commit message `23ab160` carries the broad wording and
+cannot be amended; this is the correction of record.
 
 ⚠ **A toolchain blocker was found and fixed on the way**, and it was not ours:
 published `wdk-sys` 0.5.1 pins bindgen 0.71.1, which under libclang 22 emits a
@@ -196,17 +223,37 @@ ground-truth survey found the plan resting on facts the tree does not support:
   ICD's import today. What replaces them is a *mechanism* — mesa A3 plus K6 —
   so K4's obligation there is a loud named refusal, never a bridge.
 - **A third cross-repo atomic pair**, which `OWNERSHIP.md` §2 was missing: the
-  ICD hand-declares the three retired 48-byte records with `_Static_assert`s and
-  includes nothing from `protocol/include`, so the KMD-side and ICD-side edits
-  are one change. The moment create stops accepting the legacy record, every
-  venus `vkAllocateMemory` on Helios fails.
+  ICD hand-declared **four** records (three 48-byte plus one 96-byte) with
+  `sizeof`-only `_Static_assert`s and included nothing from `protocol/include`,
+  so the KMD-side and ICD-side edits are one change. ⭐ **The layout half is now
+  a compile-time gate**: all four local declarations are deleted,
+  `vn_helios_hwa2.h:52` includes `protocol/include/helios_wddm.h` so its 82
+  `offsetof` assertions fire in the ICD's own TUs, and
+  `icd/mesa/src/virtio/vulkan/meson.build:163-171` `error()`s if the header is
+  not reachable. What is still hand-mirrored, and still one change, is the
+  *rules* — `vn_helios_hwa2.c` transcribes `from_private_data` and the two stage
+  validators from `protocol/src/wddm.rs` with nothing checking the
+  transcription.
 
-⚠ K4's stated dependency K2 is itself blocked — its host counterpart is parked
-(F5) and §10.7 requires HPM1 negotiation before `QUERYSEGMENT4` can expose HLM1.
-The contract's §4 resolves it: K4 records `HELIOS_SEGMENT_ID_HLM1` in HVM1
-placement and **admits role 4 without satisfying it**, returning the documented
-failure with a named counter rather than silently substituting the aperture
-segment.
+⚠ K4's stated dependency K2 is **rescoped, not blocked**, and `K4-CONTRACT.md`
+§4 says so — HPM1 was declined rather than deferred, so K2's guest-side BAR
+admission and segment table were never waiting on anything (F5 Consequence: *"no
+lane in flight has"* a QEMU dependency).
+
+⛔ **This paragraph reproduced a WITHDRAWN draft of §4** — it said K4 "admits
+role 4 without satisfying it", and attributed that to the normative doc, which is
+what made it worth correcting rather than merely stale. §4 was amended after the
+review found *both* readings built on that draft were wrong: the KMD refused only
+role 4 while admitting roles 1–3 onto a segment the table may not report, and the
+`kmd_logic` model refused all four. **The ruling is "check the segment, do not
+hardcode the role"**: the KMD verifies the role's `preferred_segment` is actually
+in the table it reports and refuses per role with a named counter when it is not.
+The code agrees: `rg -n 'segment_is_reported|AcSegRole' kmd_render/src/` shows
+`fn segment_is_reported` with two call sites and the four counters
+`AcSegRole1`…`AcSegRole4` selected per `Hvm1Role`. (Line numbers omitted on
+purpose — `create_allocation.rs` was in flight while this was written, and a
+cite into a moving file is stale before it is read.) A hardcoded role number
+would have been a claim about K2's schedule embedded in kernel code.
 
 **Phase 2 round 1 has now run** for `protocol`, `kmd_render` and
 `vkd3d-proton-helios` — see `docs/retirement/REVIEW-ROUND-1.md` for the findings
@@ -217,10 +264,14 @@ except the WDDM 3.2 slot audit's refusal path, which is now proven on the target
 (`FINDINGS.md` F6).
 
 **Everything Linux-verifiable is green**, and it is now one command:
-`tools/retirement-gates.sh` (protocol tests, Rust↔C ABI parity, the C mirrors
-compiling, `kmd_logic` tests, slot-audit staleness, and the cross-repo
-`VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT` mirror). `protocol` 140 tests, `kmd_logic`
-189. Separately: `tools/umd12-host-check.sh`, vkd3d ninja, QEMU ninja.
+`tools/retirement-gates.sh` — now **8 gates, all PASS**: protocol tests, Rust↔C
+ABI parity, the C mirrors compiling, `kmd_logic` tests, slot-audit staleness,
+K4 §8.5 (open writes no private byte), K4 §8.6 (the retired identity symbols
+survive only as tombstones), and the cross-repo
+`VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT` mirror. **`protocol` 146 tests,
+`kmd_logic` 211** — the "140 / 189" that stood here was the pre-K4 count and
+already disagreed with the component table above it in this same file.
+Separately: `tools/umd12-host-check.sh`, vkd3d ninja, QEMU ninja.
 Note there is no
 workspace root — build `protocol` from `protocol/`, not with `-p` from the repo
 root.

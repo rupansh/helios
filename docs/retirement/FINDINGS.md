@@ -675,7 +675,7 @@ itself succeeds — the D3D12 correctness fix recorded in F7 addendum 2 stands.
 
 ---
 
-## F9 — K7's native-fence surface is four DDI slots, not a surface. Eight of its own functions are unreachable, and `OWNERSHIP.md` §3's second activation gate is not met.
+## F9 — K7's native-fence surface is four DDI slots, not a surface. Nine of its own symbols are unreachable, and `OWNERSHIP.md` §3's second activation gate is not met.
 
 Measured incidentally while taking a pre-change `cargo check` baseline of
 `kmd_render` on the VM (2026-08-10). The build is green; the finding is in its
@@ -694,9 +694,18 @@ win_cargo kmd_render check --message-format=short   -> exit 0, 22 warnings, of w
   native_fence.rs:1355 function `has_live_fences` is never used
 ```
 
+That is **nine symbols, not eight** — six functions (`ensure_feature_admitted`,
+`query_feature_support`, `fill_native_fence_caps`, `notify_routine`,
+`signal_native_fence_signaled`, `has_live_fences`), two constants
+(`FEATURE_DECLINED`, `DXGK_FEATURE_SUPPORT_STABLE_VALUE`) and one struct
+(`NotifyCtx`). The heading said "eight functions" while the block listed nine
+non-functions-included symbols; corrected in place, since the nine-symbol list
+is what the rest of this finding argues from.
+
 Each has **zero references outside `native_fence.rs`** (`grep -rn '\b<name>\b'
-kmd_render/src/ | grep -v native_fence.rs` → 0 for all nine), and rustc's
-"never used" means no reachable use inside it either.
+kmd_render/src/ | grep -v native_fence.rs` → 0 for all nine, re-verified after
+the K4 changeset), and rustc's "never used" means no reachable use inside it
+either.
 
 ### What is actually wired
 
@@ -754,9 +763,59 @@ DDI allocate_wddm_resource private mutated:
   -> post blob=0x4c2000 res_id=0 ctx=71 kind=0 vas=4988928 mti=1
 ```
 
-Three fields — `blob_id`, `adopt_resource_id` and `kind` — differ after the call
-returns. The kernel wrote them; nothing in user mode did. ⇒ **the create-time
-`[in/out]` buffer round-trips.**
+Bytes differ after the call returns. The kernel wrote them; nothing in user mode
+did. ⇒ **the create-time `[in/out]` buffer round-trips.**
+
+### ⛔ Correction — the field names above were a layout misread. The conclusion is unchanged and is now *stronger*.
+
+This finding originally read: *"Three fields — `blob_id`, `adopt_resource_id`
+and `kind` — differ after the call returns."* Those are the names the D3D11 UMD
+printed, but they are **not** the fields the kernel wrote, and stating it that
+way would send a reader looking for a KMD write to `blob_id`.
+
+What the pre-retirement KMD actually did at create was stamp a **whole
+48-byte `HeliosWddmOpenIdentity` over bytes 0..48 of the same buffer** —
+`write_open_identity` (`git show 41d13f8:kmd_render/src/ddi/create_allocation.rs`,
+definition `:1617`, create-time call site `:2481`), which the log then read back
+through the *other* record's field names. The two retired 48-byte layouts
+(`protocol/src/wddm_legacy.rs:163` and `:388`) overlay like this:
+
+| offset | read as `HeliosWddmAllocPrivate` | actually written as `HeliosWddmOpenIdentity` |
+|---|---|---|
+| 0–7 | `blob_id` | `venus_alloc_size` |
+| 8–15 | `size` | `blob_size` |
+| 16–19 | `magic` = `0x4857444D` | `magic` = `0x4849444E` |
+| 20–23 | `version` | `version` |
+| 24–27 | `blob_mem` | `resource_id` |
+| 28–31 | `blob_flags` | `memory_type_index` |
+| 32–35 | `ctx_id` | `ctx_id` — *same offset, same value* |
+| 36–39 | `map_cache` | `kind` |
+| 40–43 | `kind` | `reserved[0]` (tracker share) |
+| 44–47 | `adopt_resource_id` | `reserved[1]` (tracker cookie) |
+
+⇒ The log's three "changed fields" are the overlay: post-`blob_id` is the
+identity's `venus_alloc_size`, post-`kind` is `reserved[0]`, post-`adopt_resource_id`
+is `reserved[1]`. `ctx=71` was unchanged in both rows because `ctx_id` sits at
+the same offset in both records with the same value — not because the kernel
+skipped it.
+
+**The arithmetic proves it, and this is why the finding gets stronger rather
+than weaker.** In both logged rows the post `blob=` value equals the `vas=`
+value exactly — `0x200` = 512 = `vas=512`, and `0x4c2000` = 4988928 =
+`vas=4988928`. Nothing in user mode ever wrote the venus allocation size into
+the `blob_id` slot; that byte pattern can only have come from the kernel's
+identity write. The write-back is not merely "three fields moved", it is a
+**48-byte kernel-authored record arriving intact at a known offset**, which is
+precisely the property HWA2's two-stage contract needs.
+
+⚠ **What the misread was, since that is what this file is for:** the instrument
+was right and the field names were wrong. The UMD's pre/post comparison reads
+the buffer through the struct it *sent*, and the kernel replied in a *different*
+struct at the same address — so every name in the log line is the sender's name
+for a byte range, not the writer's. A pre/post byte comparison over a
+reinterpreted buffer proves *that* bytes changed and can never, on its own, say
+*which field* changed. Attributing per-field semantics to it required opening
+both layouts, which the original write-up did not do.
 
 ### The instrument that could NOT have answered it, recorded so it is not re-used
 
@@ -779,9 +838,16 @@ distinguish "no write" from "the write agreed with me".
 back after the kernel writes it, for the D3D11 arm at 96 bytes. It does **not**
 prove the same for 168 bytes (the size changes), nor for the D3D12
 `pfnAllocateCb` arm, nor that any particular `PrivateDriverDataSize` is accepted.
-Those remain to be measured on the deployed K4 build; the producers already
-refuse loudly (`Hwa2WriteBackAbsent`) if the generation comes back zero, so the
-failure mode is a counted refusal rather than a corrupt descriptor.
+Those remain to be measured on the deployed K4 build; both producers already
+refuse loudly if the generation comes back zero, so the failure mode is a
+counted refusal rather than a corrupt descriptor. ⚠ **The two counters have
+different names** — the D3D12 arm's is `Hwa2WriteBackAbsent`
+(`umd12/src/forward12/resource12.rs:4925`), which is the only place that name
+exists; the D3D11 arm's is `hwa2_output_invalid`
+(`umd/src/forward.rs:475`, in `DDI_REFUSAL_SET` at `:505`), and it is broader —
+it fires on a zero generation, a mutated echo, or a package-generation mismatch
+alike. Grepping the tree for `Hwa2WriteBackAbsent` alone will miss the D3D11
+half.
 
 Incidental, from the same run: `tools/d3d12_clear_probe.cpp` **passes** on the
 deployed build — 65536/65536 pixels exactly `(0,51,102,255)`, `SetEventOn-

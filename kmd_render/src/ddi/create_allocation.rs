@@ -221,8 +221,17 @@ struct AllocationContext {
     /// `format` field above is lossy (both B8G8R8A8 and R8G8B8A8 collapse to
     /// A8R8G8B8), so the scan-out format is resolved from this.
     dxgi_format: u32,
-    /// The UMD created this exact `pPrimaryDesc` allocation as a plain LINEAR
-    /// DMA_BUF and recorded the verified direct-scanout marker in its meta.
+    /// The UMD created this exact `pPrimaryDesc` allocation in the shape
+    /// `SET_SCANOUT_BLOB` binds with no intermediate copy, and said so with
+    /// `HELIOS_HWA2_FLAG_DISPLAYABLE`. See [`hwa2_is_direct_scanout_primary`],
+    /// which is the ONE derivation.
+    ///
+    /// ⛔ The old wording here — "as a plain LINEAR DMA_BUF" — described the arm
+    /// this flag is FALSE for. The direct arm is the UMD's OPAQUE_OPTIMAL export
+    /// (`umd/src/forward/alloc.rs` sets `DISPLAYABLE` and
+    /// `HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL` together on it), which the QEMU fork
+    /// reconstructs natively; the LINEAR primary is the one that gets copied
+    /// into the adapter-owned scan-out target.
     direct_scanout: bool,
     /// Byte offset of the plain-LINEAR COLOR plane within the backing allocation
     /// (from the UMD's `vkGetImageSubresourceLayout` on a direct primary).
@@ -403,6 +412,19 @@ static CREATE_CALL_SHAPE: AtomicU32 = AtomicU32::new(0);
 /// (`AcKind`): an HWA2 `PAGING_OBJECT`, or a geometry/format the kernel venus
 /// client cannot build.
 static CREATE_UNSUPPORTED_KIND: AtomicU32 = AtomicU32::new(0);
+/// Creates refused because the descriptor's KIND and its swizzle/layout class
+/// name a surface no producer in this package authors and no kernel venus
+/// constructor builds (`AcLayout`): today that is exactly a `STANDARD_SHADOW` or
+/// `STANDARD_STAGING` kind in the `OPAQUE_OPTIMAL` class.
+///
+/// ⚠ **Must read 0.** `dxgkddi_get_standard_allocation_driver_data` is the only
+/// author of those two kinds and it gives both `HELIOS_HWA2_SWIZZLE_LINEAR`
+/// unconditionally — `is_optimal_gdi_texture` can only be true on the GDI-surface
+/// arm, which carries `HELIOS_HWA2_KIND_IMAGE`. A nonzero value here therefore
+/// means the two halves of this file have drifted apart, in the direction
+/// `StdSelf` cannot see (the record is well-formed; it just describes a surface
+/// the KMD has no way to make).
+static CREATE_UNSUPPORTED_LAYOUT: AtomicU32 = AtomicU32::new(0);
 /// Creates refused because `byte_size` contradicts the KMD's own size rule, or
 /// because the backing the KMD created is SMALLER than the descriptor's
 /// `byte_size` (`AcSize`).
@@ -455,6 +477,36 @@ static OPEN_HWA2_REJECT: AtomicU32 = AtomicU32::new(0);
 /// rather than the standard ones would mean a UMD is not filling the field at
 /// all.
 static CREATE_RESOURCE_ASSOC_DIVERGENCE: AtomicU32 = AtomicU32::new(0);
+/// Ordinary tiled UMD images backed by a plain venus `VkDeviceMemory` blob
+/// instead of a real `VkImage` (`AcOptLin`). A DOWNGRADE that is counted, in the
+/// same class as [`LINEAR_BLOB_SIZE_DIVERGENCE`] and
+/// [`CREATE_RESOURCE_ASSOC_DIVERGENCE`] — not a refusal, and not a silence.
+///
+/// The population is `helios_umd12.dll`'s committed textures: `KIND_IMAGE` +
+/// `OPAQUE_OPTIMAL` with neither the `STANDARD` flag nor `PRIMARY | DISPLAYABLE`
+/// (`umd12/src/forward12/resource12.rs::hwa2_swizzle_class` maps `TL_UNDEFINED`
+/// and `TL_64KB_TILE_UNDEFINED_SWIZZLE` onto that class). The KMD's only OPTIMAL
+/// constructor is `allocate_optimal_gdi_image_blob`, which builds a
+/// 1-mip/1-layer BGRA cross-context present alias and refuses every DXGI format
+/// outside {87, 88} — the right image for the two producers named above and the
+/// WRONG image for an arbitrary D3D12 resource, whose format, mip chain, array
+/// length and sample count it cannot reproduce.
+///
+/// So the extent is honoured and the tiling is not: `byte_size` on this arm is
+/// the engine's exact `VkDeviceMemory` size (`resource12.rs` passes
+/// `id.memory_size`), so the blob is neither short (the Xid-31 class) nor a
+/// guess. ⛔ Nothing may read this allocation as an image, and nothing does —
+/// until mesa unit **A3** and K6 land, the kernel allocation is not the host
+/// object vkd3d rendered into at all and `present12` refuses by name
+/// (`K4-CONTRACT.md` §5). This counter is the measurement of that gap on the
+/// create side, exactly as [`OPEN_NO_RESOURCE_ID`] is on the open side, and it
+/// must be revisited — not merely zeroed — when A3 gives the KMD a way to name
+/// the real image.
+///
+/// ⛔ A PLAIN `fetch_add`, NOT [`bump`], for [`OPEN_NO_RESOURCE_ID`]'s reason: it
+/// fires on every SUCCESSFUL D3D12 texture create. It is mirrored from
+/// [`ALLOC_COUNTERS`].
+static CREATE_OPTIMAL_AS_LINEAR: AtomicU32 = AtomicU32::new(0);
 /// `DxgkDdiGetStandardAllocationDriverData` calls refused because the runtime's
 /// `D3DDDIFORMAT` has no DXGI peer (`StdFmt`).
 ///
@@ -478,7 +530,7 @@ static STANDARD_SELF_REJECT: AtomicU32 = AtomicU32::new(0);
 /// names sharing a 14-byte prefix would MERGE into one registry value — a
 /// refusal counter reading someone else's number. Same guard
 /// `diag::FaultCounter` and `native_fence.rs` use.
-const RETIREMENT_COUNTER_NAMES: [&[u8]; 22] = [
+const RETIREMENT_COUNTER_NAMES: [&[u8]; 24] = [
     b"AcOk",
     b"AcMagic",
     b"AcHwa2Rej",
@@ -494,11 +546,12 @@ const RETIREMENT_COUNTER_NAMES: [&[u8]; 22] = [
     b"AcSegHoc1",
     b"AcShape",
     b"AcKind",
+    b"AcLayout",
     b"AcSize",
     b"AcBackFail",
     b"AcGenExh",
     b"AcRcAssoc",
-    // The two [`ALLOC_COUNTERS`] names, published by that block rather than by
+    // The three [`ALLOC_COUNTERS`] names, published by that block rather than by
     // [`bump`] — see its own doc for why. Listed here anyway because this array
     // is the file's ONE truncation proof, and a name that skips it is a name
     // nothing checks. `AcGenEpoch` is 10 bytes; `diag::CounterBlock` has no
@@ -506,6 +559,7 @@ const RETIREMENT_COUNTER_NAMES: [&[u8]; 22] = [
     // between it and a silent merge with another value.
     b"OaNoRid",
     b"AcGenEpoch",
+    b"AcOptLin",
     b"OaHwa2Rej",
 ];
 
@@ -593,6 +647,14 @@ static ALLOC_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
             // construction, so the forced flush is bounded — unlike `OaNoRid`
             // above, which is why the two entries differ.
             failure: true,
+        },
+        crate::diag::CounterEntry {
+            name: b"AcOptLin",
+            value: crate::diag::CounterRef::U32(&CREATE_OPTIMAL_AS_LINEAR),
+            // A VALUE entry for `OaNoRid`'s reason exactly: it fires on every
+            // successful D3D12 committed-texture create, so marking it a failure
+            // would force a registry write per create on that lane's hot path.
+            failure: false,
         },
     ],
     ticks: &ALLOC_FLUSH_TICKS,
@@ -2606,15 +2668,97 @@ const fn hwa2_bind_to_ddi(bind_flags: u32) -> u32 {
     ddi
 }
 
+/// Is this descriptor the UMD's DIRECT scan-out primary — the exact allocation
+/// `SetVidPnSourceAddress` binds through `SET_SCANOUT_BLOB`, with no copy into
+/// the adapter-owned target?
+///
+/// ⭐ **ONE derivation, two readers**, and that is the point: [`classify_hwa2`]
+/// must give this shape a real cross-context OPTIMAL image, and [`admit_hwa2`]
+/// must register it in `SCANOUT_ALLOCS`. Two independent spellings is exactly the
+/// defect this closes — the derivation used to key on `swizzle_class ==
+/// HELIOS_HWA2_SWIZZLE_LINEAR`, which is TRUE precisely when the producer said
+/// "copy me": `umd/src/forward/alloc.rs` sets `DISPLAYABLE` **and**
+/// `OPAQUE_OPTIMAL` together on the direct arm and plain `LINEAR` on the copy
+/// arm. Inverted, the zero-copy primary never entered `SCANOUT_ALLOCS` and the
+/// copy-path primary always did, so `set_vidpn_source_address` took the wrong arm
+/// for both.
+///
+/// `HELIOS_HWA2_FLAG_DISPLAYABLE` is the successor of the retired
+/// `HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT` bit, which the pre-retirement code
+/// read directly (`41d13f8:create_allocation.rs:2584`). It is the producer's
+/// claim, and it is the only field that carries it.
+///
+/// ⛔ `STANDARD` excludes the KMD's OWN shared primary, which sets `PRIMARY |
+/// DISPLAYABLE` too (`dxgkddi_get_standard_allocation_driver_data`) and means
+/// something different by it: those bytes ARE the adapter's LINEAR scan-out
+/// image, which the display path reaches through `venus_image_id` /
+/// `production_linear_scanout`, never through the resid→handle bridge.
+///
+/// The swizzle class is required as well as the flag — not as the discriminator
+/// but as the layout `ScanoutTarget::from_direct_primary` and the QEMU fork's
+/// native reconstruction expect. A hypothetical `DISPLAYABLE` + `LINEAR` primary
+/// therefore takes the COPY path, which is the fail-safe direction: that is the
+/// same path the OS standard primary uses, and it is the proven desktop.
+fn hwa2_is_direct_scanout_primary(desc: &HeliosWddmAllocationDescV2) -> bool {
+    desc.has_flag(HELIOS_HWA2_FLAG_PRIMARY)
+        && desc.has_flag(HELIOS_HWA2_FLAG_DISPLAYABLE)
+        && !desc.has_flag(HELIOS_HWA2_FLAG_STANDARD)
+        && desc.swizzle_class == HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL
+}
+
+/// Is this the KMD's own `D3DKMDT_GDISURFACE_TEXTURE`?
+///
+/// §10.3 gives a GDI surface no kind of its own — it is `KIND_IMAGE` plus the
+/// `STANDARD` bit plus the exact OS enum at offset 84 — so the OS enum is what
+/// names it. The GDI surface's OTHER variants are the CPU-visible staging
+/// surfaces, which `dxgkddi_get_standard_allocation_driver_data` authors with
+/// `HELIOS_HWA2_SWIZZLE_LINEAR`; only the `GDI_SURFACE_TYPE_TEXTURE` arm sets
+/// `OPAQUE_OPTIMAL`, so the caller's layout test separates the two and this
+/// predicate does not have to.
+///
+/// The validator couples the flag and the enum in both directions
+/// (`StandardAllocationTypeWithoutStandardFlag` / `StandardAllocationTypeZero`),
+/// so testing both is redundancy rather than a second rule.
+fn hwa2_is_standard_gdi_texture(desc: &HeliosWddmAllocationDescV2) -> bool {
+    desc.has_flag(HELIOS_HWA2_FLAG_STANDARD)
+        && desc.standard_allocation_type == D3DKMDT_STANDARDALLOCATION_GDISURFACE as u32
+}
+
 /// The KMD's total reading of a validated HWA2 descriptor.
 ///
 /// `desc` MUST already have passed `validate_create_input`, which is what makes
 /// every field read below meaningful: an image kind is known to carry nonzero
 /// geometry and a known DXGI format, a non-image kind is known to carry none,
 /// and `plane_count >= 1` is guaranteed for every image.
+///
+/// # Why the swizzle class alone is NOT the discriminator
+///
+/// It was, and that was wrong in the direction that matters. §10.3 offset 88
+/// says whether a linear row layout exists; it does NOT say which of this
+/// driver's three venus constructors reproduces the surface. Keying the OPTIMAL
+/// arm on it alone sent every `helios_umd12.dll` committed texture into
+/// `allocate_optimal_gdi_image_blob` — a 1-mip, 1-layer, BGRA-only
+/// cross-context PRESENT alias — because `resource12.rs::hwa2_swizzle_class`
+/// maps `TL_UNDEFINED` and `TL_64KB_TILE_UNDEFINED_SWIZZLE` onto
+/// `OPAQUE_OPTIMAL`. That constructor then refused every DXGI format outside
+/// {87, 88} as `AcBackFail`, i.e. "the host could not build it", when the truth
+/// is that the KMD asked for the wrong image.
+///
+/// So the arms are selected by the fields that identify the PRODUCER — kind,
+/// the `STANDARD` flag with its OS enum, and `PRIMARY | DISPLAYABLE` — and the
+/// layout class is read only where it genuinely separates two shapes from the
+/// same producer (the tiled GDI texture from the CPU-visible GDI staging
+/// surface). Nothing reaches a permissive default: the one arm with no
+/// constructor is refused by name, and the one downgrade is counted by name.
 fn classify_hwa2(desc: &HeliosWddmAllocationDescV2) -> Result<Hwa2Backing, NTSTATUS> {
-    let cpu_visible = desc.has_flag(HELIOS_HWA2_FLAG_CPU_VISIBLE);
-    let shareable = desc.has_flag(HELIOS_HWA2_FLAG_SHARED);
+    // Spelled ONCE and reached from four arms, for [`CreatedBacking`]'s reason:
+    // the defect class here is arms that drift. Constructed eagerly because it
+    // has no side effects; only one arm can ever move it.
+    let linear_memory = Hwa2Backing::LinearMemory {
+        bytes: desc.byte_size,
+        mappable: desc.has_flag(HELIOS_HWA2_FLAG_CPU_VISIBLE),
+        shareable: desc.has_flag(HELIOS_HWA2_FLAG_SHARED),
+    };
     match desc.allocation_kind {
         // The scan-out primary. Its bytes must be a real LINEAR VkImage the host
         // can bind to a virtio scan-out, not a plain buffer — that is what
@@ -2625,35 +2769,48 @@ fn classify_hwa2(desc: &HeliosWddmAllocationDescV2) -> Result<Hwa2Backing, NTSTA
             width: desc.width,
             height: desc.height,
         }),
-        // Everything else with texel geometry. The SWIZZLE CLASS decides, not
-        // the kind: §10.3 offset 88 is the field that says whether a linear row
-        // layout exists, and it is the only honest carrier now that the retired
-        // trailer's `MISC_OPTIMAL_GDI_TEXTURE` bit is gone. A
-        // `D3DKMDT_STANDARDALLOCATION_GDISURFACE` has no kind of its own (it is
-        // `IMAGE` + `STANDARD` + the OS enum at offset 84), so its two variants —
-        // the tiled texture and the CPU-visible staging surface — are separated
-        // here and nowhere else.
+        // Everything else with texel geometry.
         kind if helios_hwa2_kind_is_image(kind) => {
-            if desc.swizzle_class == HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL {
-                Ok(Hwa2Backing::OptimalImage {
+            // A linear row layout exists ⇒ the surface IS its bytes, and a plain
+            // venus memory blob of exactly `byte_size` reproduces it. Every
+            // D3D11 non-primary texture, every D3D12 `TL_ROW_MAJOR` resource and
+            // the STANDARD shadow/staging/GDI-staging surfaces land here.
+            if desc.swizzle_class != HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL {
+                return Ok(linear_memory);
+            }
+            // Tiled. The KMD has exactly ONE image constructor and exactly two
+            // producers it is the right image for: the KMD's own GDI texture (a
+            // shared tiled texture DWM samples) and the UMD's direct scan-out
+            // primary (the OPTIMAL export the QEMU fork reconstructs natively).
+            // Both are BGRA cross-context present aliases, which is what
+            // `allocate_optimal_gdi_image_blob` builds.
+            if hwa2_is_standard_gdi_texture(desc) || hwa2_is_direct_scanout_primary(desc) {
+                return Ok(Hwa2Backing::OptimalImage {
                     width: desc.width,
                     height: desc.height,
                     dxgi_format: desc.dxgi_format,
                     ddi_bind_flags: hwa2_bind_to_ddi(desc.bind_flags),
-                })
-            } else {
-                Ok(Hwa2Backing::LinearMemory {
-                    bytes: desc.byte_size,
-                    mappable: cpu_visible,
-                    shareable,
-                })
+                });
             }
+            // A STANDARD shadow or staging surface in a tiled class. No producer
+            // in this package authors one and no constructor builds one, so it is
+            // refused by name rather than routed to an arm that would be wrong
+            // either way. See [`CREATE_UNSUPPORTED_LAYOUT`] for why this must
+            // read 0.
+            if kind != HELIOS_HWA2_KIND_IMAGE {
+                bump(&CREATE_UNSUPPORTED_LAYOUT, b"AcLayout");
+                crate::diag::record(0x0C01_00E8);
+                return Err(STATUS_NOT_SUPPORTED);
+            }
+            // An ordinary tiled UMD image — today, a D3D12 committed texture.
+            // Backed by its exact extent in plain device memory, with the
+            // downgrade COUNTED rather than refused: see
+            // [`CREATE_OPTIMAL_AS_LINEAR`] for the full argument, including why
+            // nothing may read it as an image before mesa unit A3.
+            CREATE_OPTIMAL_AS_LINEAR.fetch_add(1, Ordering::Relaxed);
+            Ok(linear_memory)
         }
-        HELIOS_HWA2_KIND_BUFFER => Ok(Hwa2Backing::LinearMemory {
-            bytes: desc.byte_size,
-            mappable: cpu_visible,
-            shareable,
-        }),
+        HELIOS_HWA2_KIND_BUFFER => Ok(linear_memory),
         // STUB: the C65 outer-command pool is the only paging object this
         // package defines, and it arrives as an HOC1 record on its own
         // (§10.6:1489-1494), not as an HWA2 with this kind. There is no second
@@ -2878,9 +3035,11 @@ struct AdmittedAllocation {
     /// stride is Vulkan's, not a function of width).
     plane_offset: u64,
     pitch: u32,
-    /// The allocation is a UMD-created LINEAR primary, i.e. one the display path
-    /// may bind directly through `SET_SCANOUT_BLOB` without an intermediate
-    /// copy. Derived from the descriptor, never from geometry.
+    /// The allocation is a UMD-created primary the display path may bind
+    /// directly through `SET_SCANOUT_BLOB` without an intermediate copy.
+    /// [`hwa2_is_direct_scanout_primary`] is the derivation — from the
+    /// descriptor's flags, never from geometry and never from the layout class
+    /// alone.
     direct_scanout: bool,
     bar_eligible: bool,
     size_provenance: BackingSize,
@@ -3114,6 +3273,27 @@ unsafe fn admit_hwa2(
     // though `validate` does not require it, because §10.8:2740-2748 makes the
     // display path refuse it — promoting a flip the display path will refuse is
     // a wrong claim, not a harmless one.
+    //
+    // ⭐ CONSEQUENCE, decided rather than stumbled into: a UMD **direct scan-out**
+    // primary can NEVER earn this bit, because `helios_hwa2_swizzle_is_direct_
+    // flip_capable` is LINEAR-only and that primary is `OPAQUE_OPTIMAL` by
+    // construction. That is CORRECT, and the two questions are genuinely
+    // different ones:
+    //
+    //   * `DIRECT_FLIP_COMPATIBLE` is a WIRE claim an opener reads — "dxgkrnl and
+    //     DWM may Direct-Flip this allocation" — and `protocol/src/wddm.rs` rules
+    //     on the class outright: `OPAQUE_OPTIMAL` is "legal for ordinary
+    //     rendering; never Direct-Flip eligible in this generation".
+    //   * [`AdmittedAllocation::direct_scanout`] is a KMD-PRIVATE routing
+    //     decision — "`SetVidPnSourceAddress` binds this allocation's own host
+    //     resource instead of copying into the adapter's LINEAR target" — and it
+    //     works on `OPAQUE_OPTIMAL` precisely because the QEMU fork reconstructs
+    //     that native layout (`qemu-helios`, native OPTIMAL readback).
+    //
+    // ⇒ The bit is earned by the OS standard primary, which is LINEAR + PRIMARY +
+    // DISPLAYABLE + one plane. Widening the predicate so the tiled primary could
+    // claim it would contradict the protocol's own class ruling and promote a
+    // flip `CheckMPO3` and the display backend would then refuse.
     if is_primary
         && desc.has_flag(HELIOS_HWA2_FLAG_DISPLAYABLE)
         && !desc.has_flag(HELIOS_HWA2_FLAG_PROTECTED)
@@ -3195,15 +3375,12 @@ unsafe fn admit_hwa2(
         generation,
         vidmm_size,
         placement,
-        // Derived from the DESCRIPTOR, never from geometry: a UMD-created
-        // primary with a linear row layout is exactly the shape the display path
-        // may bind directly. A KMD-authored standard primary is excluded because
-        // its bytes are the adapter's own LINEAR scan-out image, which the
-        // display path reaches through `venus_image_id`, not through the
-        // resid->handle bridge.
-        direct_scanout: is_primary
-            && desc.swizzle_class == HELIOS_HWA2_SWIZZLE_LINEAR
-            && !desc.has_flag(HELIOS_HWA2_FLAG_STANDARD),
+        // ⭐ THE SAME predicate `classify_hwa2` routed the backing with, so the
+        // allocation registered in `SCANOUT_ALLOCS` is exactly the allocation
+        // that was given a bindable OPTIMAL image. It reads the producer's
+        // `DISPLAYABLE` claim; see [`hwa2_is_direct_scanout_primary`] for what
+        // the two producers mean by it and for the inversion this replaces.
+        direct_scanout: hwa2_is_direct_scanout_primary(&desc),
         width: desc.width,
         height: desc.height,
         d3d_ddi_format: desc.d3d_ddi_format,
