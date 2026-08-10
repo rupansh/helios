@@ -554,25 +554,58 @@ measurements used; and `kmd_render` was re-checked with `wdk-sys`
 baseline. A green build proves nothing about today's toolchain unless you made
 it regenerate.
 
-### ⭐ Sequencing after round 3
+### ⭐ Sequencing after round 4 — ⛔ THE REVIEW LOOP IS CLOSED (owner, 2026-08-10)
+
+⛔⛔ **OWNER DIRECTIVE. There is no round 5, and `METHOD.md` §3's two-dry-rounds
+criterion does not govern this changeset.** Verbatim: *"the METHOD was only for
+the dx12 implementation, where it saved us a lot of time. a BSOD eats up a lot of
+time, but they are also rare, and are generally caught with a simple code review,
+a comment is not going to cause a bsod"*, and *"adversarial review is costing too
+much time"*.
+
+**The measurement behind it, so the decision is legible rather than merely
+obeyed:** round 4 produced **54 raw findings, 30 survivors — and 8 of the 30 were
+code.** The other 22 were documentation, claim-integrity, counter-grading and
+gate-wording findings. The loop had started mining this project's own prose. See
+`REVIEW-ROUND-4.md`.
+
+⇒ Review of retirement code from here is an **ordinary code review of code**.
+Keep the shape that pays (a skeptic refutes before a finding is routed; run the
+command rather than quoting a doc) and drop the rest: no lens rotation schedule,
+no claim-integrity lens, no dry-round accounting.
 
 In order:
 
-1. ~~**Repair what round 3 found**~~ — ✅ **DONE 2026-08-10** (`01a4131`), by
-   seven authors over disjoint file sets, each verifying its findings before
-   editing and each changing a claim's documentation in the same edit. One
-   round-3 finding was **refused** as false at HEAD (the gate-8 item described
-   the lens's own adversarial patch); see `REVIEW-ROUND-3.md` §3.
-2. **Round 4** ← **NEXT** — rotate at least two lenses again (§3 criterion 1 requires
-   *different* compositions), keep the gate-defeat lens, and re-run the
-   completeness critic. See the arithmetic above: round 4 is at best the *first*
-   dry round.
-3. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
-   correction below before touching it.
-4. **mesa A3 (+ K6)** — the unblocking dependency for everything the deploy
-   breaks. See the scope warning below.
-5. **K1 (demolition), K3, K5, K6** — and `SURFACE` last of all
-   (`OWNERSHIP.md` §3).
+1. ~~**Repair what round 3 found**~~ — ✅ DONE (`01a4131`).
+2. ~~**Round 4**~~ — ✅ DONE 2026-08-10. 7 lenses + a skeptic per finding + a
+   completeness critic; 54 → 30 → **8 code defects, all repaired** in `b8ea245`
+   + `icd/mesa` `33db3fd` + `vkd3d-proton-helios` `cdf1bce`. Verified: gates
+   8/8, `kmd_render` check exit 0 at the 22-warning baseline, `umd` exit 0, mesa
+   ICD + present layer link clean, vkd3d native build green.
+3. **A1 → A2 → A3 → K5 → K6** ← **THE CRITICAL PATH.** A1 is ✅ landed
+   (`icd/mesa` `6ad43fb`). See the scope note below: the owner chose full A3.
+4. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
+   correction below before touching it. Not on the critical path.
+5. **K1 (demolition), K3** — and `SURFACE` last of all (`OWNERSHIP.md` §3).
+
+#### What round 4's 8 code defects were, since they are the class worth repeating
+
+Two were kernel-side and would not have survived a deploy: `kmd_authored` was
+derived from `HELIOS_HWA2_FLAG_STANDARD`, a wire bit **any** producer may set
+(it is not in `HELIOS_HWA2_FLAG_KMD_OWNED_MASK`, and cannot be added to it —
+the KMD's own standard-allocation data re-enters through the same DDI and would
+refuse itself), so a hand-built HWA2 skipped the `AcSize` undersize guard;
+and `venus/bringup.rs`'s non-saturating `round_up_page` became reachable with a
+guest-supplied `byte_size`, which is a checked-add **panic inside
+`DxgkDdiCreateAllocation`** holding the venus mutex. Four were present-layer C++
+(a latched manual-reset event making `vkAcquireNextImageKHR` a spin loop; a
+teardown wait satisfied by a stale auto-reset signal; three failure arms that
+wedge `vkDestroySwapchainKHR` forever; a publish-before-fill race). One was the
+D3D11 `byte_size` ignoring depth/array/mips. One was a vkd3d use-after-release in
+a log line.
+
+⇒ Every one is a **runtime** defect found by **reading code**. That is the review
+worth keeping.
 
 ⛔ **`protocol/src/wddm_legacy.rs` CANNOT be deleted as a file, and its module
 header is TRUE at HEAD, not stale.** Measured: the file declares **48**
@@ -613,16 +646,36 @@ still allocate. *"Every `vkAllocateMemory` fails"* is the overstatement §5.1
 exists to correct — a plain venus render allocation working is **not** evidence
 the deploy went well.
 
-⛔ **mesa A3 as scoped in `docs/retirement/lane-mesa.md` needs a scope decision
-before anyone authors it.** A3 is an **XL** rewrite of `vn_renderer_helios.c`
-(**5261** lines measured at HEAD; the lane brief's inventory says 5304 and is
-stale) whose stated dependencies are **A1** (HTS1 translation session,
-`vn_helios_translation_session.{c,h}`, **L**) and **A2** (native KMT lane,
-`vn_helios_native_kmt.{c,h}`, **XL**) — and neither file exists. ⇒ the subset
-that actually unblocks the deploy (the C57 import carrier re-pointed at HWA2,
-plus K6's host-resid patch) is **narrower than the lane brief's A3**, and picking
-that subset is a decision, not an implementation detail. Do not start A3 by
-reading the brief's row as a work item.
+#### ⭐ The A3 scope question is CLOSED (owner, 2026-08-10): **full A3 as the lane brief scopes it**
+
+The choice was between the brief's full A3 and a narrow subset (the C57 import
+carrier re-pointed at HWA2 plus a resid patch list on the existing
+`HELIOS_ESCAPE_SUBMIT_VENUS` escape, which would have restored the desktop for
+roughly one L + one M unit). The owner chose full A3. The rejected option is
+recorded because it is the cheap path back to a live desktop if the schedule ever
+needs one.
+
+⛔ **The honest scope of "full A3" is FIVE units, four of them XL** — and the two
+KMD ones are not optional, because A1/A2/A3 speak HTS1 and HNR2 to a kernel that
+does not implement either:
+
+| unit | file | size | state |
+|---|---|---|---|
+| **A1** HTS1 session | `vn_helios_translation_session.{c,h}` | L | ✅ **LANDED** `6ad43fb`, compiles, **never exercised** |
+| **A2** native KMT lane | `vn_helios_native_kmt.{c,h}` | XL | absent |
+| **A3** renderer rewrite | `vn_renderer_helios.c` (**5261** lines at HEAD; the brief's inventory says 5304 and is stale) | XL | absent |
+| **K5** KMD HTS1 sessions | `kmd_render/src/ddi/translation_session.rs` | L | absent — **A1's INIT refuses until this exists** |
+| **K6** KMD HVC1/HNR2 render | `kmd_render/src/ddi/native_render.rs` | XL | absent |
+
+⭐ **What de-risks it:** every wire record these five need is already written and
+offset-asserted in `protocol/` — HTS1/HQA1, HVC1/HNR2/HVM1/HVR1 and their C
+mirrors. That is exactly the "~14.6k lines with no consumer" population
+`K4-CONTRACT.md` §10 records. **A1–A3 and K5–K6 are those consumers**, so the
+work is call sites and state machines, not new ABI.
+
+⚠ **K5 is the unit that makes A1 testable.** Nothing in the A-lane can be
+exercised before it, so a session that wants evidence rather than more ICD code
+should take K5 before A2.
 
 ## Stage pivot, 2026-08-05
 

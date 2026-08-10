@@ -102,6 +102,30 @@ cold boots / guest reboots; `pnputil /restart-device` re-runs AddAdapter without
    accepted measurement was taken with a value the code does not default to, the code is
    shipping something nobody measured. Flipping a default requires the evidence in the comment
    at the read site, and the opposite value must remain reachable as the A/B disable.
+9. ⛔ **COMMENT BUDGET (owner, 2026-08-10).** `protocol/`'s 12 Rust files carry **~8k comment
+   lines against ~14k of code**, and the owner named it waste. A comment earns its place by
+   saying something a reader cannot derive from the code: a measured number, a rejected
+   alternative, an invariant a future edit would silently break. Everything else — narrative,
+   restating the code in prose, re-deriving a decision already recorded in a doc, ⛔/⚠/⭐ essays
+   — does not. **Two or three lines, not twenty.** Put the argument in the commit message,
+   where it is versioned and nobody has to read past it. ⚠ Existing bloat is **sunk cost and is
+   not to be cleaned up** (owner: *"the money is already spent, now you're going to waste more
+   time on cleaning it up"*); this rule binds new writing only.
+10. ⛔ **GENERATE THE C MIRROR — never hand-mirror it again (owner, 2026-08-10).**
+   `protocol/include/*.h` is **5,013 hand-written lines** plus `protocol/tools/abi_parity.py`'s
+   **420 lines** whose whole job is to compare the two halves. The owner's verdict: *"we
+   should've been using cbindgen instead of mirroring C manually … which could've been
+   automated away"*. Every **new** shared record gets a generated header (cbindgen; the
+   precedent is already in-tree at `icd/mesa/src/nouveau/nil/cbindgen.toml`) or no C mirror at
+   all — a generated mirror cannot drift, so the entire class of defect, and the gate that
+   chases it, disappear. ⚠ Again: the existing mirrors stay. Do not open a migration.
+
+⛔ **Review scope (owner, 2026-08-10):** `docs/dx12/METHOD.md`'s adversarial-review loop is
+**scoped to the D3D12 implementation** and does **not** govern the HPS2 retirement — see its
+2026-08-10 amendment banner and `ROADMAP.md` "Sequencing after round 4". Retirement code gets an
+ordinary code review aimed at **defects that can run**. What survives everywhere: refute a
+finding before routing it, a finding without a failure scenario is a nit, and you defeat a gate
+by running the patch rather than assessing it.
 
 ## Repository Structure (active paths)
 

@@ -14,6 +14,34 @@
 > And on the target: *"Rendering triangle is useless (other than making me or you feel good) unless
 > we can render REAL DX12 apps and benchmarks."*
 
+> ⛔⛔ **AMENDED BY THE OWNER, 2026-08-10 — THIS METHOD IS SCOPED TO THE D3D12
+> IMPLEMENTATION AND DOES NOT GOVERN THE HPS2 RETIREMENT.** Verbatim: *"the
+> METHOD was only for the dx12 implementation, where it saved us alot of time. a
+> BSOD eats up alot of time, but they are also rare, and are generally caught
+> with a simple code review, a comment is not going to cause a bsod"*, and
+> *"adversarial review is costing too much time"*.
+>
+> **What this retires, for the retirement changeset:** §3's saturation test —
+> criterion 1's two consecutive dry rounds, the lens-rotation schedule, the
+> dry-round accounting. There is no HPS2 round 5.
+>
+> **What survives everywhere, because it is about evidence and not cadence:**
+> every finding goes to a separate skeptic instructed to **refute** it before it
+> is routed; a finding without a concrete failure scenario is a nit; you defeat a
+> gate by writing the patch and running it, never by assessing it; the author
+> repairs and the reviewer does not; and §5's anti-patterns.
+>
+> **The measurement that justified the amendment.** HPS2 round 4: **54 raw, 30
+> survivors, 8 of them code.** The other 22 were documentation, claim-integrity,
+> counter-grading and gate-wording findings — the loop had begun mining the
+> project's own prose rather than its code. ⇒ **Review code for defects that can
+> run.** A stale line number cannot BSOD a machine; a non-saturating
+> `round_up_page` reachable from a user buffer can, and that is what round 4's
+> code lens actually found. See `docs/retirement/REVIEW-ROUND-4.md`.
+>
+> ⚠ This amendment says nothing about D3D12 work, where §2's loop is unchanged
+> and is credited with saving time.
+
 ---
 
 ## 1. The loop that was rejected, stated so it is recognisable

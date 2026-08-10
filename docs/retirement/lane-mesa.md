@@ -139,6 +139,19 @@ touched, M ≈ 200–800, L ≈ 800–2000, XL ≈ >2000.
 
 | Id | Goal | Files it owns (exclusive) | Deps | Size |
 |---|---|---|---|---|
+⭐ **STATE 2026-08-10.** **A0 is done** (`icd/mesa` `23ab160` — the four local
+record declarations are gone, `vn_helios_hwa2.h` includes `helios_wddm.h`, and
+`meson.build` `error()`s if the header is unreachable; `OWNERSHIP.md` §2 pair 3
+has the measurement). **A1 is done** (`6ad43fb`,
+`vn_helios_translation_session.{c,h}`, builds clean under `win_meson`) — but it
+is *implemented and never exercised*: its INIT refuses until KMD unit **K5**
+exists, and K5 is not started. **A2 and A3 are absent.** The owner closed the
+A3 scope question on 2026-08-10 in favour of **full A3 as this table scopes
+it**; `ROADMAP.md` records that the honest scope is five units — A1, A2, A3 plus
+KMD **K5** and **K6** — because A1–A3 speak HTS1 and HNR2 to a kernel that
+implements neither. B1–B4 and B9 (the present layer) are also done; B5 is
+partial and F8 reverses its fence direction.
+
 | **A0** | Consume the protocol C header: one `helios_protocol.h` include point, package-generation constant, and `_Static_assert` on **every offset** of HWA2/HQA1/HVC1/HNR2/HVM1/HVR1 + the 24/16/40/48-byte records. No new struct is hand-declared in the ICD. | *(none — adds only `#include` + asserts; lands as part of A1's first commit)* | protocol lane (§17.1) | S |
 | **A1** | HTS1: raw KMT device per `vn_instance`, one HVC1 control context (both queue ordinals `UINT32_MAX`), the 64-MiB/4×16-MiB role-1 reply pool (create + residency + one `D3DKMTLock2` held to teardown), finite `INIT`, session generation/capability/endpoint-capacity capture, C51 event-backed reply, slot checkout/publication/retire state machine, HVR1 validation + bounded continuation. | `vn_helios_translation_session.{c,h}` | A0 | L |
 | **A2** | Native KMT lane: HVC1 queue contexts (`NodeOrdinal=0`, `EngineAffinity=0`, `Flags.Value=0`, `ClientHint=VULKAN`), `DXGK_CONTEXTINFO` minima validation, the HNR2 encoder/fragmenter (≤15 MiB, ≤64 fragments, COMMIT-metadata reservation), `D3DKMTRender` call shape + returned-buffer adoption + `ResizeAllocationList`/`ResizePatchLocationList` transition, CRC64-ECMA, one unshared monitored fence per context (`D3DKMTCreateSynchronizationObject2`, `NoSignalMaxValueOnTdr=1`, `NoGPUAccess=1`) + `SignalSynchronizationObjectFromGpu`/`WaitForSynchronizationObjectFromCpu` C51 waits, per-queue/device idle joins. | `vn_helios_native_kmt.{c,h}` | A1 | XL |
