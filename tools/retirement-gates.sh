@@ -40,10 +40,17 @@ run_gate() {
         # ending in zero. It read correctly at 139 and 189 and went blind at
         # 140 — a filter that is right for the counts you happen to have is
         # the same class of defect as a gate that is not an exit code.
-        [ "$QUIET" = "--quiet" ] || printf '%s\n' "$out" \
-            | grep -E 'test result:|^OK:|^all mirrors|^up to date' \
-            | grep -v 'test result: ok\. 0 passed' \
-            | sed 's/^/      /'
+        # Prefer a recognised result line; fall back to the last non-empty line
+        # so a NEW gate's summary is never silently dropped just because nobody
+        # added its pattern here. This display has already hidden two results.
+        if [ "$QUIET" != "--quiet" ]; then
+            local shown
+            shown=$(printf '%s\n' "$out" \
+                | grep -E 'test result:|^OK:|^all mirrors|^up to date' \
+                | grep -v 'test result: ok\. 0 passed')
+            [ -n "$shown" ] || shown=$(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | tail -1)
+            [ -z "$shown" ] || printf '%s\n' "$shown" | sed 's/^/      /'
+        fi
     else
         printf 'FAIL  %s  (exit %d)\n' "$name" $rc
         printf '%s\n' "$out" | sed 's/^/      /' | tail -25
@@ -89,6 +96,28 @@ else
     printf 'SKIP  WDDM 3.2 slot audit staleness (tmp/wdk-28000 headers absent)\n'
     printf '      This gate needs the staged WDK 28000 headers; see FINDINGS.md F1.\n'
 fi
+
+# ── The one constant hand-mirrored across two REPOSITORIES.
+#
+# CLAUDE.md names VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT the highest-risk
+# divergence in the vkd3d fork: a private D3D12_HEAP_FLAGS bit whose value lives
+# in vkd3d-proton-helios/libs/vkd3d/vkd3d_private.h and is re-declared by hand
+# in umd12/src/forward12/resource12.rs, because the D3D12_HEAP_FLAGS word is the
+# only channel between them and neither side can include the other's header.
+# Nothing has ever checked that the two agree except a human reading both.
+run_gate "VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT agrees across the two repos" \
+    python3 -c "
+import re, sys
+h = open('$REPO/vkd3d-proton-helios/libs/vkd3d/vkd3d_private.h').read()
+r = open('$REPO/umd12/src/forward12/resource12.rs').read()
+mh = re.search(r'#define\s+VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT\s*\(\(D3D12_HEAP_FLAGS\)\(1u?\s*<<\s*(\d+)\)\)', h)
+mr = re.search(r'const\s+HELIOS_HEAP_FLAG_VENUS_EXPORT\s*:\s*D3D12_HEAP_FLAGS\s*=\s*D3D12_HEAP_FLAGS\(1\s*<<\s*(\d+)\)', r)
+if not mh: sys.exit('vkd3d side not found — the #define shape changed; fix this gate, do not delete it')
+if not mr: sys.exit('umd12 side not found — the const shape changed; fix this gate, do not delete it')
+if mh.group(1) != mr.group(1):
+    sys.exit('MISMATCH: vkd3d 1<<%s vs umd12 1<<%s' % (mh.group(1), mr.group(1)))
+print('both sides agree: 1 << %s' % mh.group(1))
+"
 
 printf '\n'
 if [ ${#FAILED[@]} -eq 0 ]; then
