@@ -97,6 +97,28 @@ review 4).
 scheduled task at RunLevel Limited (F7). This also makes
 `tools/install-helios-icd.ps1`'s `VK_DRIVER_FILES` smoke test inert.
 
+## ⭐ Sequencing decision 2026-08-10: the KMD lane goes next, and it may break the desktop
+
+Asked to choose between finishing the Mesa WSI slice (visible progress, off the
+critical path) and starting the KMD long pole (on the critical path, breaks the
+working stack), the owner chose the KMD: *"its a dev box, i dont care if the vm
+burns to ground"*.
+
+⇒ **A working composited desktop is no longer a constraint on retirement
+work.** `OWNERSHIP.md` §3 gates the activation switch on three KMD deliverables
+— the display lane's complete MPO3/Display-Core table, a complete native-fence
+DDI surface, and the armed cold-DWM admission gate — and `lane-kmd-core.md` K1
+deletes Escape, the blob map and the CPU host aperture that the current stack
+runs on. The retirement cannot be half-landed; that is now accepted rather than
+routed around.
+
+**Order:** K4 (allocation object model — HWA2 create-time descriptor, HVM1
+roles 1–4, HOC1) is the hub. Mesa's C57 import is an HWA2 **reader**, the D3D12
+lane's adopt path is the **writer**, and K3 (paging DMA) and K6 (HNR2) both sit
+downstream of the allocation model. The D3D12 import landed on 2026-08-10
+validates the *pre-retirement* `helios_wddm_open_identity` blob and is expected
+to be re-pointed at HWA2 by K4.
+
 **Phase 2 round 1 has now run** for `protocol`, `kmd_render` and
 `vkd3d-proton-helios` — see `docs/retirement/REVIEW-ROUND-1.md` for the findings
 and their bounds. The QEMU review is moot (F5). ⛔ Round 1 is **not** saturation:
