@@ -500,9 +500,18 @@ probe_adapter(D3DKMT_HANDLE adapter, UINT index)
 
       /* The slot must be reusable afterwards. A1 takes the FIRST idle slot every
        * time, so if the refusal above left slot 0 in flight this second attempt
-       * dies with `ControlRenderSlotBusy` instead of with the same INIT refusal
-       * — and the session would be permanently dead. Same refusal twice is the
-       * pass; a DIFFERENT refusal is the finding. */
+       * dies at `ControlRenderSlotBusy` instead of reaching `session_init` — and
+       * the session would be permanently dead.
+       *
+       * ⚠ THE STATUS CANNOT TELL THE TWO APART, and pretending otherwise would
+       * be a check that passes either way: both refusals are
+       * STATUS_INVALID_PARAMETER, because `DxgkDdiRender`'s documented return
+       * set is narrow and every K6 reason lives in a counter. This assertion is
+       * therefore only the cheap half — "the second attempt still refuses rather
+       * than succeeding". THE DISCRIMINATOR IS THE COUNTER PAIR, read after the
+       * run: `TsInitRej` must have moved by 2 (both attempts reached the INIT)
+       * with `TsCtlRej` unmoved and `TsSlotStuck` 0. `TsInitRej == 1` with
+       * `TsCtlRej` naming 0x0A09 is the stuck slot. */
       h.batch_token = 2;
       h.reply_slot_generation = 2;
       memcpy(control.pCommandBuffer, &h, sizeof(h));
@@ -522,9 +531,9 @@ probe_adapter(D3DKMT_HANDLE adapter, UINT index)
       NTSTATUS sj = D3DKMTRender(&render);
       snprintf(why, sizeof(why), "first=0x%08x second=0x%08x", (unsigned)si,
                (unsigned)sj);
-      check(sj == si,
-            "J: the reply slot is reusable after a refusal (same refusal, not "
-            "ControlRenderSlotBusy)",
+      check(sj != STATUS_SUCCESS_NT,
+            "J: a second INIT still refuses (the slot discriminator is TsInitRej==2 "
+            "with TsSlotStuck==0)",
             why);
    }
 
