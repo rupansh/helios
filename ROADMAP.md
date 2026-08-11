@@ -699,13 +699,34 @@ to the same renderer payload and copies the bytes on every placement transition'
 — **and F5 declined HPM1.** `lane-kmd-core.md:139` already says the forbidden byte
 copy's replacement "was DECLINED, not deferred … so the deletion has no successor
 mechanism today and must be an explicit recorded decision". F16 is that decision
-arriving with numbers. Ranked non-Escape options, cheapest first, in F16's last
-section: (1) finish the diagnosis — an ETW `Lock`/residency slice, plus
-`VidMmVramMB=1024` because segment 2 reports **8 GiB while the KMD's VidMm
-partition is 1 GiB** and the KMD's blob allocator owns the rest of the same window
-(a latent overlap independent of this unit); (2) guest-backed storage for roles 1
-and 3, which is what upstream venus does with reply/feedback shmem; (3) un-decline
-HPM1; (4) accept the copy for feedback only. **Owner decision.**
+arriving with numbers.
+
+⭐ **ANSWERED by `FINDINGS.md` F17 (2026-08-11; 30 candidate mechanisms, 29 refuted,
+1 survivor).** The escape-free mechanism is
+`DxgkCbCreatePhysicalMemoryObject(Type = IO_SPACE, IOSpace.BaseAddress = the blob's
+window GPA, CacheType = WRITE_COMBINED)` + `DxgkCbMapPhysicalMemory(AccessMode =
+USER_MODE)` — dxgkrnl doing the mapping `escape_map_blob` does by hand — verified in
+the shipping 28000 kit at `shared/d3dkmddi.h:10118-10232`. ⛔ **And both callbacks
+live in the `DXGKRNL_INTERFACE` region gated at WDDM 2.9**
+(`km/dispmprt.h:2290-2301`) while `wddm_surface.rs:64` declares **2.1**, and no
+2.9-block callback has ever been invoked by this driver. ⇒ **K2a's CPU view is
+downstream of the version uplift this retirement already plans** — display unit
+**D3** (`ddi/mpo3.rs`, the seven MPO3 slots) then **D9** (flip `SURFACE` to
+`Wddm3_2GpuMmu`, strictly last; `doc:2854` rejects a 3.2 package with an incomplete
+MPO3/fence surface, `doc:5079` gates on DWM starting without `E_NOTIMPL`). The
+`E_NOTIMPL` that keeps us at 2.1 is exactly what D3 removes.
+
+⇒ **Next, and neither is a placement experiment:** (a) add
+`SegmentProperties.FullyCPUVisible` / `SegmentType` / `SegmentGroup` /
+`SystemMemory` to `tools/vidmm_tracking_probe.c`'s existing per-segment
+`D3DKMTQueryStatistics` printout — user-mode recompile only, and it replaces F17's
+inference about why `Lock2` copies with VidMm's own verdict; (b) in the next KMD
+build, record `DXGKRNL_INTERFACE.Size` and the two 2.9 function pointers at
+StartDevice — non-NULL at 2.1 unblocks K2a ahead of D3/D9, and either way it audits
+the `adapter/mod.rs:354` full-576-byte copy that **no code checks `.Size` before**.
+⛔ F16's guest-backed option is **STRUCK**: upstream venus rejected
+`VIRTGPU_BLOB_MEM_GUEST` for shmem over host process isolation
+(`vn_renderer_virtgpu.c:1535-1556`) — all four roles are host memory.
 4. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
    correction below before touching it. Not on the critical path.
 5. **K1 (demolition), K3** — and `SURFACE` last of all (`OWNERSHIP.md` §3).
