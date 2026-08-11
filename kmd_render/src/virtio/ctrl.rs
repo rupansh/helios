@@ -71,6 +71,7 @@ use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
 use core::sync::atomic::Ordering;
+use helios_kmd_logic::control_ownership::AbandonReason;
 use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
     VirtioGpuGetCapsetInfo, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush,
@@ -311,6 +312,28 @@ pub(crate) struct ScanoutSetTimeline {
     pub flags: u32,
 }
 
+#[must_use]
+pub(crate) enum CtrlRoundtripOutcome {
+    HostResponseCopied,
+    DefiniteNotEnqueued(VirtioError),
+    Ambiguous(AbandonReason),
+}
+
+impl CtrlRoundtripOutcome {
+    fn into_legacy_result(self) -> Result<(), VirtioError> {
+        match self {
+            Self::HostResponseCopied => Ok(()),
+            Self::DefiniteNotEnqueued(error) => Err(error),
+            Self::Ambiguous(AbandonReason::Timeout) => Err(VirtioError::Timeout),
+            Self::Ambiguous(
+                AbandonReason::NotOurs
+                | AbandonReason::TransportAborted
+                | AbandonReason::MalformedResponse,
+            ) => Err(VirtioError::DeviceError),
+        }
+    }
+}
+
 /// One synchronous control round-trip: `req` (+ optional second device-read
 /// span `extra`) → device → `resp_out`. Blocks at PASSIVE until completion or
 /// `timeout_ms`. On timeout the in-flight slot is abandoned (reaped when the
@@ -320,7 +343,7 @@ pub(crate) struct ScanoutSetTimeline {
 /// what makes the sequence agree with the control queue's FIFO order, and
 /// therefore with the order the host applies binds in. `None` for every command
 /// that is not a `SET_SCANOUT_BLOB`.
-fn ctrl_roundtrip(
+fn ctrl_roundtrip_observed(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     req: &[u8],
@@ -328,17 +351,19 @@ fn ctrl_roundtrip(
     resp_out: &mut [u8],
     timeout_ms: u64,
     bind: Option<BindMint<'_>>,
-) -> Result<(), VirtioError> {
+) -> CtrlRoundtripOutcome {
     let in0_len = req.len();
     let in1_len = extra.map_or(0, |e| e.len());
     let resp_len = resp_out.len();
     if in0_len == 0 || resp_len == 0 {
-        return Err(VirtioError::DeviceError);
+        return CtrlRoundtripOutcome::DefiniteNotEnqueued(VirtioError::DeviceError);
     }
     reap_parked(passive, adapter);
 
     let total = in0_len + in1_len + resp_len;
-    let mut meta = DmaBuffer::new(passive, total).ok_or(VirtioError::OutOfMemory)?;
+    let Some(mut meta) = DmaBuffer::new(passive, total) else {
+        return CtrlRoundtripOutcome::DefiniteNotEnqueued(VirtioError::OutOfMemory);
+    };
     {
         let m = meta.as_mut_slice();
         m[..in0_len].copy_from_slice(req);
@@ -400,17 +425,19 @@ fn ctrl_roundtrip(
                 }
             });
             match res {
-                Err(_) => return Err(VirtioError::DeviceError), // transport gone
+                Err(_) => {
+                    return CtrlRoundtripOutcome::DefiniteNotEnqueued(VirtioError::DeviceError)
+                } // transport gone
                 Ok(Ok(ticket)) => break ticket,
                 Ok(Err((m_back, VirtioError::QueueFull))) => {
                     meta = m_back;
                     if budget.charge_slice() {
-                        return Err(VirtioError::QueueFull);
+                        return CtrlRoundtripOutcome::DefiniteNotEnqueued(VirtioError::QueueFull);
                     }
                     reap_parked(passive, adapter);
                     sleep_ms(passive, RETRY_SLICE_MS);
                 }
-                Ok(Err((_m, e))) => return Err(e), // dropped here at PASSIVE
+                Ok(Err((_m, e))) => return CtrlRoundtripOutcome::DefiniteNotEnqueued(e), // dropped here at PASSIVE
             }
         };
 
@@ -434,7 +461,7 @@ fn ctrl_roundtrip(
                 Ok(SyncOutcome::AlreadyCompleted) => {}
                 Ok(SyncOutcome::Abandoned) => {
                     CTRL_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
-                    return Err(VirtioError::Timeout);
+                    return CtrlRoundtripOutcome::Ambiguous(AbandonReason::Timeout);
                 }
                 // NEW population. The token names an entry that is not this
                 // waiter's, so `resp` was never written — do NOT copy it out.
@@ -442,32 +469,45 @@ fn ctrl_roundtrip(
                 // the caller a zeroed buffer.
                 Ok(SyncOutcome::NotOurs) => {
                     crate::diag::record_named_bytes(b"CtNotOurs", u32::from(token_value));
-                    return Err(VirtioError::DeviceError);
+                    return CtrlRoundtripOutcome::Ambiguous(AbandonReason::NotOurs);
                 }
                 Err(_) => {
                     CTRL_TEARDOWN_ABANDONS.fetch_add(1, Ordering::Relaxed);
-                    return Err(VirtioError::DeviceError);
+                    return CtrlRoundtripOutcome::Ambiguous(AbandonReason::TransportAborted);
                 }
             }
         }
         // SAFETY: signal satisfaction or the locked AlreadyCompleted arm above
         // proves the terminal publisher finished touching the stack block.
         match unsafe { block.copy_host_response_after_completion(resp_out) } {
-            WaitDisposition::HostResponseCopied => Ok(()),
+            WaitDisposition::HostResponseCopied => CtrlRoundtripOutcome::HostResponseCopied,
             WaitDisposition::TransportAborted => {
                 CTRL_TEARDOWN_ABANDONS.fetch_add(1, Ordering::Relaxed);
-                Err(VirtioError::DeviceError)
+                CtrlRoundtripOutcome::Ambiguous(AbandonReason::TransportAborted)
             }
             WaitDisposition::Pending => {
                 bump_wait_refusal(&CTRL_WAIT_PENDING, b"CtDsPend");
-                Err(VirtioError::DeviceError)
+                CtrlRoundtripOutcome::Ambiguous(AbandonReason::MalformedResponse)
             }
             WaitDisposition::FenceCompleted => {
                 bump_wait_refusal(&CTRL_WAIT_FENCE_COMPLETED, b"CtDsFence");
-                Err(VirtioError::DeviceError)
+                CtrlRoundtripOutcome::Ambiguous(AbandonReason::MalformedResponse)
             }
         }
     })
+}
+
+fn ctrl_roundtrip(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    extra: Option<&[u8]>,
+    resp_out: &mut [u8],
+    timeout_ms: u64,
+    bind: Option<BindMint<'_>>,
+) -> Result<(), VirtioError> {
+    ctrl_roundtrip_observed(passive, adapter, req, extra, resp_out, timeout_ms, bind)
+        .into_legacy_result()
 }
 
 /// Round-trip expecting a bare `VirtioGpuCtrlHdr` response; checks RESP_OK.
