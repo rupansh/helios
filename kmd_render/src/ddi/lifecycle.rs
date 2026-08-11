@@ -150,6 +150,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // before anything can fail, so the gate's "verify movement, not presence"
     // rule applies to every counter below.
     crate::diag::reset_fault_counters();
+    // Same reason, for the K2a block: its atomics are fresh in a newly loaded
+    // image but its registry values are not.
+    crate::ddi::build_paging_buffer::hlm1_reset_counters();
 
     // Carried over from a previous start on this same context, if any: these
     // blocks are allocated once and freed only in Drop, and today's code gets

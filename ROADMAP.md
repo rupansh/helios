@@ -589,11 +589,60 @@ In order:
    `tools/hts1_session_probe.c` **15/15** on KMD 22.22.267.0), **K6 ✅**
    (2026-08-11 — gate `tools/hnr2-decode-gate.sh`, acceptance
    `tools/hnr2_native_probe.c` **15/15** on KMD **22.22.271.0**, with
-   `hts1_session_probe` still 15/15 beside it). **Remaining: A3**, and it is now
-   the only thing between here and a rendering desktop.
+   `hts1_session_probe` still 15/15 beside it). **Remaining: A3** — plus **K2a**,
+   which A3's memory half turns out to sit on and which was not on anyone's list.
    ⭐ The HVM1 write-back blocker is **CLOSED** (`a8527e2`, `FINDINGS.md` F11);
    the private-data window blocker K6 hit is **CLOSED** (`FINDINGS.md` F13 —
    `DxgkDdiRender` must advance `pDmaBufferPrivateData`).
+
+   ⛔ **"A3 is the only thing between here and a rendering desktop" is FALSE, and
+   `FINDINGS.md` F14 is why.** An HVM1 allocation's `D3DKMTLock2` view is ordinary
+   VidMm-backed guest RAM, disjoint from the venus blob the KMD allocated for it:
+   `ctrl::map_blob_at` is the only code that aliases the two, its one caller
+   refuses `!bar_eligible`, and `admit_hvm1` sets exactly that. So A1's landed
+   role-1 reply pool is **bound but not reachable**, and A3's roles 1-3 would ship
+   the same defect. Two units sit between A3 and a frame, and neither is A3:
+   **K2a** (below) and **K11** (the host session — `session_init` grants zero
+   endpoints today, so `helios_translation_session_create` cannot succeed at all).
+
+#### K2a — the HLM1 CPU-view binding (started 2026-08-11)
+
+Make an HVM1 allocation's Lock2 view alias its venus blob, by reporting segment 2
+as §10.7's HLM1 (`CpuVisible=1`, `CpuTranslatedAddress = BAR GPA`) and mapping the
+blob at the window offset VidMm placed it at. Owner chose this over reusing the
+proven `SupportsCpuHostAperture` path; F2 already measured the `BarSegFlags=0x02`
+flag shape booting `CM_PROB_NONE` with a live desktop.
+
+**Landed:** the pure half, `kmd_logic::hlm1_placement` (293 → 308 tests, defeated
+nine ways) — the paging-op placement classification, the window-offset bound, the
+bind state machine, and the verify vocabulary the acceptance probe and the KMD
+must share one declaration of.
+
+⭐ **Two things the shipping WDK 28000 bindings say that the tree did not.**
+`tmp/dxgk_bindings.rs` is a 2026-07-08 snapshot and the real bindings are
+regenerated per build; they disagree, and both disagreements matter:
+
+* **`TRANSFER2`/`FILL2`/`DISCARD_CONTENT2` are ordinals 23/24/25.**
+  `protocol/src/physical_memory.rs:497-504` records §10.7's TRANSFER2/FILL2 as
+  "= `VIRTUAL_TRANSFER`/`VIRTUAL_FILL`, not new ordinals". **Falsified.** `FILL2`
+  is the only operation in the whole DDI carrying a bare
+  `(SegmentId, SegmentAddress)` pair in this kit.
+* **`NOTIFY_RESIDENCY2` has no `PhysicalAddress` and no `SizeInPages`** — its
+  placement lives in a `DXGK_ADL`, and the `{PhysicalAddress | Mdl}` pointer union
+  the snapshot shows does not exist here.
+
+⚠ And the driver cannot see either: `PAGING_OP_SEEN_MASK` is masked `& 0xFFFF`
+before it reaches the diag ring, so **ops 16-25 are invisible today**. The census
+that says `TRANSFER`/`FILL` have never fired (`0x9B64`) is therefore sound about
+ops 0-15 and silent above them.
+
+**Deploy 1 is an instrument, not a fix** — which operation carries an HVM1
+placement is not knowable read-only, and `PgDi` cannot answer it (F14's
+correction). The `Hl*` counter block records, per HLM1-eligible allocation, the op
+mask, the segment mask, the last placement (segment / page / length), the
+`UPDATE_PAGE_TABLE` PTE view that is uninstrumented today, the IRQL each arrived
+at, and whether any offset would have failed the window bound. Atomics only, above
+the IRQL gate, every arm returning exactly what it returned before.
 4. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
    correction below before touching it. Not on the critical path.
 5. **K1 (demolition), K3** — and `SURFACE` last of all (`OWNERSHIP.md` §3).

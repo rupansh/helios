@@ -57,7 +57,7 @@ use wdk_sys::ntddk::{
 use wdk_sys::{_MEMORY_CACHING_TYPE, PHYSICAL_ADDRESS, PMDL};
 
 use crate::adapter::{AdapterContext, SystemBackingSnapshot};
-use crate::ddi::create_allocation::{paging_alloc_info, set_bar_placement};
+use crate::ddi::create_allocation::{paging_alloc_info, set_bar_placement, PagingAllocInfo};
 use crate::dxgk::*;
 
 /// DISPATCH-safe paging tracers (ntoseye reads these by symbol — no IRQL
@@ -267,6 +267,266 @@ const fn e64(name: &'static [u8], value: &'static AtomicU64) -> crate::diag::Cou
         value: crate::diag::CounterRef::U64Low(value),
         failure: false,
     }
+}
+
+// ── K2a: the HLM1 placement instrument ───────────────────────────────────────
+//
+// `FINDINGS.md` F14: an HVM1 allocation's Lock2 view is not its venus blob, and
+// the fix needs the window offset VidMm placed it at. WHICH operation carries
+// that offset is not knowable read-only — `PgDi` moving proves nothing, because
+// two of its four sites are the virtual content ops, which carry GPU virtual
+// addresses and no segment at all. This block answers it in one deploy.
+
+/// `1 << operation` for every paging op naming an HLM1-eligible allocation.
+static HLM1_OP_MASK: AtomicU32 = AtomicU32::new(0);
+/// `1 << segment` for every segment such an op named.
+static HLM1_SEG_MASK: AtomicU32 = AtomicU32::new(0);
+/// Allocations admitted with a CPU view in HLM1. The denominator: without it,
+/// an all-zero block cannot distinguish "no producer ran" from "no hook fired".
+static HLM1_ELIGIBLE: AtomicU32 = AtomicU32::new(0);
+/// Observations that carried BOTH a segment id and an offset within it.
+static HLM1_PLACEMENTS: AtomicU32 = AtomicU32::new(0);
+static HLM1_LAST_SEG: AtomicU32 = AtomicU32::new(0);
+/// Offsets and lengths are reported in PAGES: a 32-bit byte offset cannot hold
+/// an 8 GiB window. Same convention as `ChMo`.
+static HLM1_LAST_PAGE: AtomicU32 = AtomicU32::new(0);
+static HLM1_LAST_PAGES: AtomicU32 = AtomicU32::new(0);
+/// `UPDATE_PAGE_TABLE` leaf PTE[0] for such an allocation — the arm that is
+/// completely uninstrumented today (its `!bar_eligible` return is a bare
+/// `return`, not a counted one).
+static HLM1_PT_SEG: AtomicU32 = AtomicU32::new(0);
+static HLM1_PT_PAGE: AtomicU32 = AtomicU32::new(0);
+/// Last `NOTIFY_RESIDENCY2.Adl.PageCount` for such an allocation. The ADL is
+/// where this kit puts the placement; the count says whether decoding one would
+/// describe the whole allocation or a fragment.
+static HLM1_NR2_MDL: AtomicU32 = AtomicU32::new(0);
+/// The operation that produced the last placement triple. ⛔ Without it the
+/// triple is unattributable: `UPDATE_PAGE_TABLE`, `NOTIFY_RESIDENCY` and
+/// `MAP_APERTURE_SEGMENT` are all live on this target and all write it.
+static HLM1_LAST_OP: AtomicU32 = AtomicU32::new(0);
+/// Observations arriving above PASSIVE. A VALUE, not a failure: a "yes" is this
+/// deploy's expected positive result, and a failure entry would force a 13-write
+/// registry flush on every one — reinstating the storm `diag.rs` records removing.
+static HLM1_ERR_IRQL: AtomicU32 = AtomicU32::new(0);
+/// A placement outside the window range the KMD can fixed-map (`bar.size`).
+///
+/// ⚠ NOT "VidMm misbehaved". The segment REPORTED to VidMm is
+/// `vidmm_vram_size.unwrap_or(bar.size)` — the whole host-visible window — while
+/// the KMD's fixed-map partition is `bar.size`. A nonzero value here says those
+/// two must be tied together before any bind is safe, which is a K2a deploy-2
+/// prerequisite, not a fault.
+static HLM1_ERR_WINDOW: AtomicU32 = AtomicU32::new(0);
+/// The observation named a segment this allocation is not bound to, or an
+/// operation that cannot carry a placement. Ordinary — `hvm1_placement` keeps
+/// the aperture in the supported set — and counted apart from the range refusal
+/// so one cannot be read as the other.
+static HLM1_FOREIGN: AtomicU32 = AtomicU32::new(0);
+/// `NOTIFY_RESIDENCY`/`_2` saying the allocation was EVICTED. Recorded and NOT
+/// treated as a placement: the eviction is the last notification a destroyed
+/// allocation gets, so publishing its (zeroed) address would overwrite the
+/// residency answer with its inverse.
+static HLM1_EVICT: AtomicU32 = AtomicU32::new(0);
+/// `UPDATE_PAGE_TABLE` leaf whose base arithmetic was rejected (PFN out of
+/// range, or an allocation offset past the PTE's own address). The sibling
+/// counts this as `PgEc`; without it the arm looks like it carried no placement.
+static HLM1_PT_ERR: AtomicU32 = AtomicU32::new(0);
+/// An HLM1-eligible allocation was destroyed having never been bound.
+pub(crate) static HLM1_ERR_NEVER_BOUND: AtomicU32 = AtomicU32::new(0);
+
+static HLM1_FLUSH_TICKS: AtomicU32 = AtomicU32::new(0);
+static HLM1_FLUSH_FAILURES: AtomicU32 = AtomicU32::new(0);
+
+static HLM1_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
+    entries: &[
+        e(b"HlOpMs", &HLM1_OP_MASK),
+        e(b"HlSgMs", &HLM1_SEG_MASK),
+        e(b"HlElig", &HLM1_ELIGIBLE),
+        e(b"HlPlN", &HLM1_PLACEMENTS),
+        e(b"HlPlSg", &HLM1_LAST_SEG),
+        e(b"HlPlPg", &HLM1_LAST_PAGE),
+        e(b"HlPlLn", &HLM1_LAST_PAGES),
+        e(b"HlPtSg", &HLM1_PT_SEG),
+        e(b"HlPtPg", &HLM1_PT_PAGE),
+        e(b"HlNr2M", &HLM1_NR2_MDL),
+        e(b"HlPlOp", &HLM1_LAST_OP),
+        e(b"HlEirq", &HLM1_ERR_IRQL),
+        e(b"HlEwin", &HLM1_ERR_WINDOW),
+        e(b"HlFrgn", &HLM1_FOREIGN),
+        e(b"HlEvic", &HLM1_EVICT),
+        e(b"HlPtEr", &HLM1_PT_ERR),
+        f(b"HlEnb", &HLM1_ERR_NEVER_BOUND),
+    ],
+    ticks: &HLM1_FLUSH_TICKS,
+    failures: &HLM1_FLUSH_FAILURES,
+    policy: crate::diag::FlushPolicy::EveryNth(64),
+};
+
+/// Publish the block. PASSIVE_LEVEL only — it writes the registry.
+pub(crate) fn hlm1_dump_counters() {
+    HLM1_COUNTERS.flush();
+}
+
+/// Zero the block, atomics and registry both, so every value read afterwards is
+/// attributable to THIS device start.
+///
+/// ⛔ NOT `flush()`. A `pnputil /restart-device` re-runs StartDevice with the
+/// image still loaded, where `flush`'s own throttle (`n == 1 || n % 64 == 0 ||
+/// the failure sum moved`) writes NOTHING and leaves the previous instance's
+/// counts in place. `diag::reset_fault_counters` beside it writes literal zeros
+/// unconditionally; so does this.
+pub(crate) fn hlm1_reset_counters() {
+    let mut i = 0;
+    while i < HLM1_COUNTERS.entries.len() {
+        match HLM1_COUNTERS.entries[i].value {
+            crate::diag::CounterRef::U32(a) => a.store(0, Ordering::Relaxed),
+            crate::diag::CounterRef::U64Low(a) => a.store(0, Ordering::Relaxed),
+        }
+        crate::diag::record_named_bytes(HLM1_COUNTERS.entries[i].name, 0);
+        i += 1;
+    }
+    HLM1_FLUSH_TICKS.store(0, Ordering::Relaxed);
+    HLM1_FLUSH_FAILURES.store(0, Ordering::Relaxed);
+}
+
+/// One admitted HLM1-eligible allocation. Called from `DxgkDdiCreateAllocation`.
+pub(crate) fn hlm1_note_eligible() {
+    HLM1_ELIGIBLE.fetch_add(1, Ordering::Relaxed);
+}
+
+// The operation ordinals `kmd_logic` classifies against are dxgkrnl's. That
+// crate cannot see the generated enum, so the link is asserted here.
+const _: () = {
+    use crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION as Op;
+    use helios_kmd_logic::hlm1_placement::op;
+    assert!(Op::DXGK_OPERATION_TRANSFER as u32 == op::TRANSFER);
+    assert!(Op::DXGK_OPERATION_FILL as u32 == op::FILL);
+    assert!(Op::DXGK_OPERATION_DISCARD_CONTENT as u32 == op::DISCARD_CONTENT);
+    assert!(Op::DXGK_OPERATION_MAP_APERTURE_SEGMENT as u32 == op::MAP_APERTURE_SEGMENT);
+    assert!(Op::DXGK_OPERATION_VIRTUAL_TRANSFER as u32 == op::VIRTUAL_TRANSFER);
+    assert!(Op::DXGK_OPERATION_VIRTUAL_FILL as u32 == op::VIRTUAL_FILL);
+    assert!(Op::DXGK_OPERATION_UPDATE_PAGE_TABLE as u32 == op::UPDATE_PAGE_TABLE);
+    assert!(Op::DXGK_OPERATION_NOTIFY_RESIDENCY as u32 == op::NOTIFY_RESIDENCY);
+    assert!(Op::DXGK_OPERATION_MAP_APERTURE_SEGMENT2 as u32 == op::MAP_APERTURE_SEGMENT2);
+    assert!(Op::DXGK_OPERATION_NOTIFY_RESIDENCY2 as u32 == op::NOTIFY_RESIDENCY2);
+    assert!(Op::DXGK_OPERATION_TRANSFER2 as u32 == op::TRANSFER2);
+    assert!(Op::DXGK_OPERATION_FILL2 as u32 == op::FILL2);
+    assert!(Op::DXGK_OPERATION_DISCARD_CONTENT2 as u32 == op::DISCARD_CONTENT2);
+};
+
+/// Record one paging observation about an HLM1-eligible allocation.
+///
+/// ⛔ ATOMIC STORES ONLY, and that is a hard requirement rather than a style
+/// choice: half the call sites are ABOVE this DDI's IRQL gate. A registry write
+/// here is exactly the defect the tombstone at the gate records being removed.
+///
+/// `reserve` is `bar.size`, the window partition the KMD's fixed map may use
+/// (`bar_segment.rs:138,150`). ⚠ It is NOT the size of the segment VidMm places
+/// into — that is `vidmm_vram_size.unwrap_or(bar.size)` (`:206`), the whole
+/// host-visible window. `HlEwin` measures the gap.
+fn hlm1_observe(
+    operation: u32,
+    alloc: &PagingAllocInfo,
+    segment: Option<u32>,
+    byte_offset: Option<u64>,
+    length_bytes: Option<u64>,
+    reserve: u64,
+) {
+    if !alloc.hlm1_eligible {
+        return;
+    }
+    if operation < 32 {
+        HLM1_OP_MASK.fetch_or(1u32 << operation, Ordering::Relaxed);
+    }
+    if let Some(seg) = segment {
+        if seg < 32 {
+            HLM1_SEG_MASK.fetch_or(1u32 << seg, Ordering::Relaxed);
+        }
+    }
+    // ⛔ ABOVE the let-else below. The arms that pass no offset — the residency
+    // notifications and TRANSFER2 — are exactly the ones whose IRQL nobody has
+    // measured and which the bind would have to issue a host round-trip from.
+    // SAFETY: KeGetCurrentIrql is callable at any IRQL.
+    if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
+        HLM1_ERR_IRQL.fetch_add(1, Ordering::Relaxed);
+    }
+    let (Some(seg), Some(offset), Some(len)) = (segment, byte_offset, length_bytes) else {
+        return;
+    };
+    HLM1_PLACEMENTS.fetch_add(1, Ordering::Relaxed);
+    HLM1_LAST_OP.store(operation, Ordering::Relaxed);
+    HLM1_LAST_SEG.store(seg, Ordering::Relaxed);
+    HLM1_LAST_PAGE.store((offset >> 12) as u32, Ordering::Relaxed);
+    HLM1_LAST_PAGES.store((len >> 12) as u32, Ordering::Relaxed);
+    use helios_kmd_logic::hlm1_placement::{admit, Observation, PlacementRefusal};
+    match admit(
+        Observation {
+            operation,
+            segment_id: seg,
+            byte_offset: offset,
+            length_bytes: len,
+        },
+        reserve,
+    ) {
+        Ok(_) => {}
+        Err(PlacementRefusal::ForeignSegment { .. })
+        | Err(PlacementRefusal::NotPlacementBearing { .. }) => {
+            HLM1_FOREIGN.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(_) => {
+            HLM1_ERR_WINDOW.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The `UPDATE_PAGE_TABLE` half, kept separate from [`bar_harvest_page_table`]
+/// because that function's `bar_placed` comparison is `PgUn`'s definition and
+/// re-basing it would silently change what `PgUn` counts.
+///
+/// # Safety
+/// As [`bar_harvest_page_table`].
+unsafe fn hlm1_harvest_page_table(reserve: u64, u: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE) {
+    if u.PageTableLevel != 0 || u.pPageTableEntries.is_null() || u.NumPageTableEntries == 0 {
+        return;
+    }
+    let Some(alloc) = (unsafe { paging_alloc_info(u.hAllocation) }) else {
+        return;
+    };
+    if !alloc.hlm1_eligible {
+        return;
+    }
+    // SAFETY: pPageTableEntries holds NumPageTableEntries DXGK_PTEs for the call.
+    let pte0 = unsafe { core::ptr::read_unaligned(u.pPageTableEntries) };
+    if unsafe { pte0.__bindgen_anon_1.__bindgen_anon_1 }.Valid() == 0 {
+        hlm1_observe(
+            crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_UPDATE_PAGE_TABLE as u32,
+            &alloc,
+            None,
+            None,
+            None,
+            reserve,
+        );
+        return;
+    }
+    let seg = unsafe { pte0.__bindgen_anon_1.__bindgen_anon_1 }.Segment() as u32;
+    let page0 = unsafe { pte0.__bindgen_anon_2.PageAddress };
+    HLM1_PT_SEG.store(seg, Ordering::Relaxed);
+    HLM1_PT_PAGE.store(page0 as u32, Ordering::Relaxed);
+    // The same base arithmetic `bar_harvest_page_table` uses: an unchecked
+    // `page0 << 12` wraps, and the PTE addresses the allocation's own offset.
+    let base = helios_kmd_logic::Pfn(page0)
+        .physical_address()
+        .and_then(|address| address.checked_sub(u.AllocationOffsetInBytes));
+    if base.is_none() {
+        HLM1_PT_ERR.fetch_add(1, Ordering::Relaxed);
+    }
+    hlm1_observe(
+        crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_UPDATE_PAGE_TABLE as u32,
+        &alloc,
+        Some(seg),
+        base,
+        base.map(|_| (u.NumPageTableEntries as u64) << 12),
+        reserve,
+    );
 }
 
 /// Mirror the paging counter block into the registry.
@@ -810,6 +1070,7 @@ pub(crate) unsafe fn mirror_present_system_backing(
 unsafe fn bar_virtual_transfer(
     passive: PassiveLevel,
     adapter: &AdapterContext,
+    reserve: u64,
     transfer: &DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL,
 ) -> bool {
     let Some(alloc) = (unsafe { paging_alloc_info(transfer.hAllocation) }) else {
@@ -821,6 +1082,17 @@ unsafe fn bar_virtual_transfer(
         // This preserves the existing host-owned-content behavior; the software
         // content engine applies only to allocations KMD made blob-linear.
         BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
+        // No segment and no offset: TRANSFERVIRTUAL carries GPU virtual
+        // addresses only. Recorded so `HlOpMs` can say this fired without
+        // `HlPlN` claiming a placement arrived.
+        hlm1_observe(
+            crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_VIRTUAL_TRANSFER as u32,
+            &alloc,
+            None,
+            None,
+            None,
+            reserve,
+        );
         return true;
     }
 
@@ -912,6 +1184,7 @@ unsafe fn bar_transfer(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     bar_id: u32,
+    reserve: u64,
     t: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_1,
 ) -> PagingOpOutcome {
     let src_seg = t.Source.SegmentId;
@@ -931,6 +1204,28 @@ unsafe fn bar_transfer(
         // VidMm placement bookkeeping is decorative for this host-owned memory;
         // never issue RESOURCE_MAP_BLOB for it.
         BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
+        // The BAR end of the transfer is the one carrying an offset.
+        let (seg, address) = if dst_seg == bar_id {
+            // SAFETY: `SegmentId != 0` selects the SegmentAddress arm of the
+            // union `TransferEnd` discriminates on — established by the
+            // `src_seg != bar_id && dst_seg != bar_id` return above, since
+            // `bar_id` is the memory segment id and is never 0.
+            (dst_seg, unsafe {
+                *t.Destination.__bindgen_anon_1.SegmentAddress.as_ref()
+            })
+        } else {
+            // SAFETY: as above, for the source end.
+            (src_seg, unsafe { *t.Source.__bindgen_anon_1.SegmentAddress.as_ref() })
+        };
+        hlm1_observe(
+            crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_TRANSFER as u32,
+            &alloc,
+            Some(seg),
+            // SAFETY: LARGE_INTEGER's QuadPart arm is the whole value.
+            Some(unsafe { address.QuadPart } as u64),
+            Some(t.TransferSize as u64),
+            reserve,
+        );
         return PagingOpOutcome::NotOurs;
     }
     let flags = unsafe { t.Flags.__bindgen_anon_1.Value };
@@ -1058,6 +1353,7 @@ unsafe fn bar_fill(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     bar_id: u32,
+    reserve: u64,
     f: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_2,
 ) -> PagingOpOutcome {
     if f.Destination.SegmentId != bar_id {
@@ -1071,6 +1367,16 @@ unsafe fn bar_fill(
     };
     if !alloc.bar_eligible {
         BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
+        hlm1_observe(
+            crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_FILL as u32,
+            &alloc,
+            Some(f.Destination.SegmentId),
+            // SAFETY: classic FILL's `Destination.SegmentAddress` is a plain
+            // PHYSICAL_ADDRESS, not a union; QuadPart is its whole value.
+            Some(unsafe { f.Destination.SegmentAddress.QuadPart } as u64),
+            Some(f.FillSize as u64),
+            reserve,
+        );
         return PagingOpOutcome::NotOurs;
     }
     let fill_len = f.FillSize as u64;
@@ -1193,6 +1499,15 @@ enum PagingOperation<'a> {
     DiscardContent(&'a _DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_3),
     VirtualFill(&'a DXGK_BUILDPAGINGBUFFER_FILLVIRTUAL),
     VirtualTransfer(&'a DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL),
+    /// K2a instrument arms. Parsed for their placement only; they are NOT
+    /// content ops and still answer `STATUS_SUCCESS`, exactly as they did while
+    /// falling through to [`Self::Other`].
+    NotifyResidency(&'a DXGK_BUILDPAGINGBUFFER_NOTIFYRESIDENCY),
+    NotifyResidency2(&'a DXGK_BUILDPAGINGBUFFER_NOTIFYRESIDENCY2),
+    Transfer2(&'a DXGK_BUILDPAGINGBUFFER_TRANSFER2),
+    Fill2(&'a DXGK_BUILDPAGINGBUFFER_FILL2),
+    MapApertureSegment(&'a _DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_6),
+    MapApertureSegment2(&'a _DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_10),
     /// Any operation this driver does not service — the null engine.
     Other,
 }
@@ -1225,6 +1540,22 @@ impl<'a> PagingOperation<'a> {
                 }
                 PagingOp::DXGK_OPERATION_VIRTUAL_TRANSFER => {
                     Self::VirtualTransfer(args.__bindgen_anon_1.TransferVirtual.as_ref())
+                }
+                PagingOp::DXGK_OPERATION_NOTIFY_RESIDENCY => {
+                    Self::NotifyResidency(args.__bindgen_anon_1.NotifyResidency.as_ref())
+                }
+                PagingOp::DXGK_OPERATION_NOTIFY_RESIDENCY2 => {
+                    Self::NotifyResidency2(args.__bindgen_anon_1.NotifyResidency2.as_ref())
+                }
+                PagingOp::DXGK_OPERATION_TRANSFER2 => {
+                    Self::Transfer2(args.__bindgen_anon_1.Transfer2.as_ref())
+                }
+                PagingOp::DXGK_OPERATION_FILL2 => Self::Fill2(args.__bindgen_anon_1.Fill2.as_ref()),
+                PagingOp::DXGK_OPERATION_MAP_APERTURE_SEGMENT => {
+                    Self::MapApertureSegment(args.__bindgen_anon_1.MapApertureSegment.as_ref())
+                }
+                PagingOp::DXGK_OPERATION_MAP_APERTURE_SEGMENT2 => {
+                    Self::MapApertureSegment2(args.__bindgen_anon_1.MapApertureSegment2.as_ref())
                 }
                 _ => Self::Other,
             }
@@ -1363,7 +1694,124 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         unsafe { bar_harvest_page_table(bar.seg_id, bar.size, update) };
+        // SAFETY: the same live `update` the harvest above just read.
+        unsafe { hlm1_harvest_page_table(bar.size, update) };
         return STATUS_SUCCESS;
+    }
+
+    // K2a instrument. Above the IRQL gate on purpose — atomics only — because
+    // the residency notifications are the arms most likely to carry an HLM1
+    // placement and are the ones whose IRQL nobody has measured.
+    match operation {
+        PagingOperation::NotifyResidency(n) => {
+            // SAFETY: non-null per the DDI contract; `PhysicalAddress` is a plain
+            // field here, not a union — unlike NOTIFY_RESIDENCY2's.
+            if let Some(alloc) = unsafe { paging_alloc_info(n.hAllocation) } {
+                // An eviction is the LAST notification a destroyed allocation
+                // gets, and its address is stale or zero. Publishing it would
+                // overwrite the residency answer with its inverse.
+                if n.__bindgen_anon_1.Resident() == 0 {
+                    if alloc.hlm1_eligible {
+                        HLM1_EVICT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    hlm1_observe(args.Operation as u32, &alloc, None, None, None, bar.size);
+                    return STATUS_SUCCESS;
+                }
+                hlm1_observe(
+                    args.Operation as u32,
+                    &alloc,
+                    Some(n.PhysicalAddress.SegmentId),
+                    Some(n.PhysicalAddress.SegmentOffset),
+                    Some(alloc.size),
+                    bar.size,
+                );
+            }
+            return STATUS_SUCCESS;
+        }
+        PagingOperation::NotifyResidency2(n) => {
+            // ⚠ In WDK 28000 this carries NO `PhysicalAddress` and no size — the
+            // placement is inside its `Adl`, and the 2026-07-08 binding snapshot
+            // that showed a `{PhysicalAddress | Mdl}` union describes a different
+            // kit. Segment only, until deploy 1 says this is the hook worth
+            // decoding an ADL for.
+            // SAFETY: non-null per the DDI contract.
+            if let Some(alloc) = unsafe { paging_alloc_info(n.hAllocation) } {
+                if alloc.hlm1_eligible {
+                    HLM1_NR2_MDL.store(n.Adl.PageCount, Ordering::Relaxed);
+                    if n.__bindgen_anon_1.Resident() == 0 {
+                        HLM1_EVICT.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                hlm1_observe(
+                    args.Operation as u32,
+                    &alloc,
+                    Some(n.SegmentId as u32),
+                    None,
+                    None,
+                    bar.size,
+                );
+            }
+            return STATUS_SUCCESS;
+        }
+        PagingOperation::Transfer2(t) => {
+            // Both ends are `{SegmentId, Adl}`. Segment only for the same reason
+            // as NOTIFY_RESIDENCY2.
+            // SAFETY: non-null per the DDI contract.
+            if let Some(alloc) = unsafe { paging_alloc_info(t.hAllocation) } {
+                let seg = if t.Destination.SegmentId != 0 {
+                    t.Destination.SegmentId
+                } else {
+                    t.Source.SegmentId
+                };
+                hlm1_observe(args.Operation as u32, &alloc, Some(seg), None, None, bar.size);
+            }
+            return STATUS_SUCCESS;
+        }
+        PagingOperation::Fill2(f) => {
+            // ⭐ The only operation in the whole DDI carrying a bare
+            // (SegmentId, SegmentAddress) pair in this kit.
+            // SAFETY: non-null per the DDI contract.
+            if let Some(alloc) = unsafe { paging_alloc_info(f.hAllocation) } {
+                hlm1_observe(
+                    args.Operation as u32,
+                    &alloc,
+                    Some(f.SegmentId),
+                    Some(f.SegmentAddress),
+                    Some((f.SizeInPages as u64) << 12),
+                    bar.size,
+                );
+            }
+            return STATUS_SUCCESS;
+        }
+        PagingOperation::MapApertureSegment(m) => {
+            // SAFETY: non-null per the DDI contract.
+            if let Some(alloc) = unsafe { paging_alloc_info(m.hAllocation) } {
+                hlm1_observe(
+                    args.Operation as u32,
+                    &alloc,
+                    Some(m.SegmentId),
+                    Some((m.OffsetInPages as u64) << 12),
+                    Some((m.NumberOfPages as u64) << 12),
+                    bar.size,
+                );
+            }
+            return STATUS_SUCCESS;
+        }
+        PagingOperation::MapApertureSegment2(m) => {
+            // SAFETY: as above.
+            if let Some(alloc) = unsafe { paging_alloc_info(m.hAllocation) } {
+                hlm1_observe(
+                    args.Operation as u32,
+                    &alloc,
+                    Some(m.SegmentId),
+                    Some((m.OffsetInPages as u64) << 12),
+                    Some((m.NumberOfPages as u64) << 12),
+                    bar.size,
+                );
+            }
+            return STATUS_SUCCESS;
+        }
+        _ => {}
     }
 
     // The content-op set is a method on the parsed value, so it cannot drift
@@ -1399,8 +1847,10 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     // driver's answer: `Failed` is the only variant that reaches VidMm as a
     // status, and every arm that produces one routes through `paging_failure()`.
     let outcome = match operation {
-        PagingOperation::Transfer(t) => unsafe { bar_transfer(passive, adapter, bar.seg_id, t) },
-        PagingOperation::Fill(f) => unsafe { bar_fill(passive, adapter, bar.seg_id, f) },
+        PagingOperation::Transfer(t) => unsafe {
+            bar_transfer(passive, adapter, bar.seg_id, bar.size, t)
+        },
+        PagingOperation::Fill(f) => unsafe { bar_fill(passive, adapter, bar.seg_id, bar.size, f) },
         PagingOperation::DiscardContent(d) => {
             if let Some(alloc) = unsafe { paging_alloc_info(d.hAllocation) } {
                 adapter.system_backings.remove(alloc.resource_id);
@@ -1421,6 +1871,16 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                 }
                 Some(alloc) if !alloc.bar_eligible => {
                     BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
+                    // FILLVIRTUAL carries a GPU virtual address and no segment.
+                    hlm1_observe(
+                        crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_VIRTUAL_FILL
+                            as u32,
+                        &alloc,
+                        None,
+                        None,
+                        None,
+                        bar.size,
+                    );
                     PagingOpOutcome::NotOurs
                 }
                 Some(alloc) => {
@@ -1455,7 +1915,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
             }
         }
         PagingOperation::VirtualTransfer(tv) => {
-            if unsafe { bar_virtual_transfer(passive, adapter, tv) } {
+            if unsafe { bar_virtual_transfer(passive, adapter, bar.size, tv) } {
                 PagingOpOutcome::Executed
             } else {
                 // Was STATUS_UNSUCCESSFUL — the crate's last use of a status two
@@ -1467,9 +1927,17 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         // Exhaustive: `is_content_op` already returned for these, so reaching
         // them here is impossible. Named rather than wildcarded so a new variant
         // is a compile error in BOTH places at once.
-        PagingOperation::UpdatePageTable(_) | PagingOperation::Other => PagingOpOutcome::NotOurs,
+        PagingOperation::UpdatePageTable(_)
+        | PagingOperation::NotifyResidency(_)
+        | PagingOperation::NotifyResidency2(_)
+        | PagingOperation::Transfer2(_)
+        | PagingOperation::Fill2(_)
+        | PagingOperation::MapApertureSegment(_)
+        | PagingOperation::MapApertureSegment2(_)
+        | PagingOperation::Other => PagingOpOutcome::NotOurs,
     };
     dump_bar_counters(passive);
+    hlm1_dump_counters();
     match outcome {
         PagingOpOutcome::Failed(reason) => reason,
         PagingOpOutcome::Executed | PagingOpOutcome::NotOurs => STATUS_SUCCESS,

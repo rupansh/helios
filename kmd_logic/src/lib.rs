@@ -11771,6 +11771,14 @@ pub mod hlm1_placement {
         pub const NOTIFY_RESIDENCY: u32 = 15;
         pub const MAP_APERTURE_SEGMENT2: u32 = 17;
         pub const NOTIFY_RESIDENCY2: u32 = 21;
+        /// ⛔ 23/24/25 exist in WDK 28000 and are NOT the virtual content ops.
+        /// `protocol/src/physical_memory.rs` records §10.7's TRANSFER2/FILL2 as
+        /// "= VIRTUAL_TRANSFER/VIRTUAL_FILL, not new ordinals"; the shipping kit
+        /// falsifies that, and FILL2 is the only op in the set carrying a bare
+        /// (SegmentId, SegmentAddress) pair.
+        pub const TRANSFER2: u32 = 23;
+        pub const FILL2: u32 = 24;
+        pub const DISCARD_CONTENT2: u32 = 25;
     }
 
     /// Whether this operation's descriptor names a segment AND an offset within
@@ -11787,6 +11795,8 @@ pub mod hlm1_placement {
                 | op::NOTIFY_RESIDENCY2
                 | op::MAP_APERTURE_SEGMENT
                 | op::MAP_APERTURE_SEGMENT2
+                | op::TRANSFER2
+                | op::FILL2
         )
     }
 
@@ -12053,11 +12063,16 @@ mod hlm1_placement_tests {
         assert!(carries_placement(op::UPDATE_PAGE_TABLE));
         assert!(carries_placement(op::NOTIFY_RESIDENCY));
         assert!(carries_placement(op::NOTIFY_RESIDENCY2));
+        assert!(carries_placement(op::TRANSFER2));
+        assert!(carries_placement(op::FILL2));
+        // DISCARD_CONTENT2 names a segment but describes bytes going away, not
+        // a placement to bind to.
+        assert!(!carries_placement(op::DISCARD_CONTENT2));
     }
 
     #[test]
     fn unknown_operation_is_not_placement_bearing() {
-        for operation in [3u32, 4, 6, 7, 10, 12, 13, 14, 16, 18, 19, 20, 22, 9999] {
+        for operation in [3u32, 4, 6, 7, 10, 12, 13, 14, 16, 18, 19, 20, 22, 25, 9999] {
             assert!(!carries_placement(operation), "operation {operation}");
         }
     }

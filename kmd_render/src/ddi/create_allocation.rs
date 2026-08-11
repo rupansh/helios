@@ -262,6 +262,17 @@ struct AllocationContext {
     /// re-basing that comparison would silently change what `PgUn` means, which
     /// is why T6/R915 kept it while deleting its write-only neighbours.
     bar_placed: core::sync::atomic::AtomicU64,
+    /// K2a: this allocation's contract gives it a CPU view in HLM1, so its blob
+    /// must be fixed-mapped at whatever window offset VidMm places it at.
+    /// Const — the role and its placement are decided once, at admit.
+    hlm1_eligible: bool,
+    /// The window offset this allocation's blob is currently fixed-mapped at, or
+    /// [`BAR_UNPLACED`].
+    ///
+    /// ⛔ NOT `bar_placed`. That one is a placement-change detector whose only
+    /// consumer is `PgUn`'s count; re-basing it would silently change what `PgUn`
+    /// means. This one decides whether a host round-trip is issued.
+    hlm1_bound: core::sync::atomic::AtomicU64,
     /// This allocation was reported to VidMm as BAR-segment-only (KMD-backed
     /// standard allocation with a mappable venus blob, BAR segment active).
     bar_eligible: bool,
@@ -1236,6 +1247,13 @@ pub(crate) struct PagingAllocInfo {
     pub bar_eligible: bool,
     /// Current placement ([`BAR_UNPLACED`] if none).
     pub bar_placed: u64,
+    /// K2a. See [`AllocationContext::hlm1_eligible`].
+    pub hlm1_eligible: bool,
+    /// K2a. See [`AllocationContext::hlm1_bound`]. Read by the bind, which is
+    /// the next deploy; carried now so the instrument and the bind read one
+    /// snapshot shape rather than two.
+    #[allow(dead_code)]
+    pub hlm1_bound: u64,
 }
 
 /// Allocation handles refused because they were null or failed the magic check
@@ -1339,6 +1357,8 @@ pub(crate) unsafe fn paging_alloc_info(h: HANDLE) -> Option<PagingAllocInfo> {
         size_provenance: ctx.size_provenance,
         bar_eligible: ctx.bar_eligible,
         bar_placed: ctx.bar_placed.load(Ordering::Acquire),
+        hlm1_eligible: ctx.hlm1_eligible,
+        hlm1_bound: ctx.hlm1_bound.load(Ordering::Acquire),
     })
 }
 
@@ -2021,6 +2041,23 @@ pub(crate) unsafe fn set_bar_placement(h: HANDLE, offset: u64) {
     }
 }
 
+/// Record the window offset an HLM1 allocation's blob is now fixed-mapped at
+/// (or [`BAR_UNPLACED`] to clear). SAFETY: as [`set_bar_placement`].
+///
+/// ⛔ Called only with an offset `map_blob_at` actually returned `Ok` for. A
+/// store on the failure path would make the next observation report
+/// `Action::None` and skip the retry — see `hlm1_placement::BindingState`.
+#[allow(dead_code)]
+pub(crate) unsafe fn set_hlm1_binding(h: HANDLE, offset: u64) {
+    if h.is_null() {
+        return;
+    }
+    let ctx = unsafe { &*(h as *const AllocationContext) };
+    if ctx.magic == ALLOCATION_CTX_MAGIC {
+        ctx.hlm1_bound.store(offset, Ordering::Release);
+    }
+}
+
 /// Direct-scan-out allocations, keyed by venus resource id.
 ///
 /// WHY IT EXISTS. `DxgkDdiPresent` receives only `hDeviceSpecificAllocation`
@@ -2537,6 +2574,15 @@ unsafe fn destroy_allocation_ctx(
     ctx: Box<AllocationContext>,
 ) {
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
+    // K2a: an HLM1 allocation that lived and died without ever being bound had
+    // a CPU view backed by nothing this driver owns. There is no Lock-time
+    // callback to refuse it at, so this post-hoc count is the only signal.
+    if ctx.hlm1_eligible && ctx.hlm1_bound.load(Ordering::Acquire) == BAR_UNPLACED {
+        crate::ddi::build_paging_buffer::HLM1_ERR_NEVER_BOUND.fetch_add(1, Ordering::Relaxed);
+        // Publish here or not at all: the only other flush site is the paging
+        // content tail, and destroy runs after this allocation's last paging op.
+        crate::ddi::build_paging_buffer::hlm1_dump_counters();
+    }
     // Withdraw the DMA-flip lookup FIRST: after this no Present can resolve
     // this resource id to a handle whose Box is about to be dropped.
     unregister_scanout_allocation(ctx.resource_id);
@@ -3705,10 +3751,10 @@ unsafe fn admit_hwa2(
 /// hardcode the role") is written as though role-1..3 creates arrive and are
 /// refused; none can arrive.
 ///
-/// This is METHOD.md §3 criterion 6's fourth state, and it is stronger than
-/// "implemented but never exercised": nothing in this package **can** exercise
-/// it. It is deliberate sequencing — the KMD consumer is authored before its
-/// producer so A3 has a contract to write against — not an oversight.
+/// ⛔ STALE AS OF 2026-08-11. `tools/hts1_session_probe.c:292-297` builds an
+/// HVM1 role-1 record and `TsPoolBind` moved 2 -> 3 on the target across one run
+/// of it (`FINDINGS.md` F14), so this arm IS exercised. What remains true is that
+/// no SHIPPING component produces one — the producer is a probe.
 ///
 /// # SAFETY
 /// As [`admit_hwa2`].
@@ -4162,6 +4208,20 @@ unsafe fn create_one(
         false,
     );
 
+    // Derived from the placement that was admitted, not from the record kind: the
+    // predicate that decided this allocation has a CPU view is the one that
+    // decides its blob must be mapped where VidMm puts it.
+    //
+    // ⛔ `!bar_eligible` is load-bearing, not a tidy-up. `vidmm_placement` gives
+    // every BAR-eligible D3D11 surface `cpu_visible` on this same segment, and
+    // those already HAVE a CPU view — through `MapCpuHostAperture`. Without this
+    // term the counters below would be dominated by DWM's textures and could not
+    // attribute anything to an HVM1 allocation. What is left is exactly F14's
+    // population: promised a CPU view in HLM1, with no mechanism delivering one.
+    let hlm1_eligible = admitted.placement.cpu_visible
+        && admitted.placement.preferred_segment == HELIOS_SEGMENT_ID_HLM1
+        && !admitted.bar_eligible;
+
     let ctx = Box::new(AllocationContext {
         magic: ALLOCATION_CTX_MAGIC,
         ctx_id: adapter.venus_ctx_id(),
@@ -4204,9 +4264,15 @@ unsafe fn create_one(
         venus_alloc_size: backing.map_or(0, |b| b.venus_alloc_size),
         memory_type_index: backing.map_or(0, |b| b.memory_type_index),
         bar_placed: core::sync::atomic::AtomicU64::new(BAR_UNPLACED),
+        hlm1_eligible,
+        hlm1_bound: core::sync::atomic::AtomicU64::new(BAR_UNPLACED),
         bar_eligible: admitted.bar_eligible,
         size_provenance: admitted.size_provenance,
     });
+
+    if hlm1_eligible {
+        crate::ddi::build_paging_buffer::hlm1_note_eligible();
+    }
 
     // ── VidMm metadata: segment placement + CPU visibility ──────────────────
     let is_direct_scanout = ctx.direct_scanout;
