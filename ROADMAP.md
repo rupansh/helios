@@ -586,10 +586,14 @@ In order:
 3. **A1 → A2 → A3 → K5 → K6** ← **THE CRITICAL PATH.** A1 ✅ (`icd/mesa`
    `6ad43fb`, rewritten onto A2 in `1b97c64`), **A2 ✅** (`1b97c64`, gate
    `c20d162`), **K5 ✅** (gate `tools/hts1-attach-gate.sh`, acceptance
-   `tools/hts1_session_probe.c` **15/15** on KMD 22.22.267.0). Remaining: **A3**
-   and **K6**. ⭐ The HVM1 write-back blocker is **CLOSED** (`a8527e2`,
-   `FINDINGS.md` F11) — see "The write-back blocker is CLOSED" below; A1 can
-   create its reply pool, and `win_build_kmd` works again.
+   `tools/hts1_session_probe.c` **15/15** on KMD 22.22.267.0), **K6 ✅**
+   (2026-08-11 — gate `tools/hnr2-decode-gate.sh`, acceptance
+   `tools/hnr2_native_probe.c` **15/15** on KMD **22.22.271.0**, with
+   `hts1_session_probe` still 15/15 beside it). **Remaining: A3**, and it is now
+   the only thing between here and a rendering desktop.
+   ⭐ The HVM1 write-back blocker is **CLOSED** (`a8527e2`, `FINDINGS.md` F11);
+   the private-data window blocker K6 hit is **CLOSED** (`FINDINGS.md` F13 —
+   `DxgkDdiRender` must advance `pDmaBufferPrivateData`).
 4. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
    correction below before touching it. Not on the critical path.
 5. **K1 (demolition), K3** — and `SURFACE` last of all (`OWNERSHIP.md` §3).
@@ -671,7 +675,7 @@ does not implement either:
 | **A2** native KMT lane | `vn_helios_native_kmt.{c,h}` | XL | ✅ **LANDED** `icd/mesa` `1b97c64`, reviewed and repaired in `f235ca4`, gate `c20d162`/`c90e5a8`. Cross-builds; its encoder half is **executed** by `tools/hnr2-encoder-gate.sh` against `protocol/`'s validator (18 batches / 86 fragments; 10 deliberate mutations caught). ⚠ The KMT half is **compile-verified only** — nothing executes it until K5 |
 | **A3** renderer rewrite | `vn_renderer_helios.c` (**5261** lines at HEAD; the brief's inventory says 5304 and is stale) | XL | absent |
 | **K5** KMD HTS1 sessions | `kmd_render/src/ddi/translation_session.rs` | L | ✅ **LANDED.** Pure half in `kmd_logic::translation_session` (263 tests, was 211), platform half in `ddi/translation_session.rs` + `device.rs`, gate `tools/hts1-attach-gate.sh`. `cargo check` exit 0 at the **22-warning baseline**. ⚠ Its INIT arm is **implemented and unreachable** — see below |
-| **K6** KMD HVC1/HNR2 render | `kmd_render/src/ddi/native_render.rs` | XL | absent |
+| **K6** KMD HVC1/HNR2 render | `kmd_render/src/ddi/native_render.rs` | XL | ✅ **LANDED AND EXERCISED ON THE TARGET.** Pure half in `kmd_logic::native_render` (293 tests, was 265), platform half in `ddi/native_render.rs` + the Render/Patch/SubmitCommand arms, gates `tools/hnr2-decode-gate.sh` (A2's real corpus) and `tools/hnr2_native_probe.c` (**15/15**, KMD 22.22.271.0). ⚠ It stops at the **host handoff** by design and every stop is a named counter — `Nr2NoHost`, `Nr2NoSchema`, `Nr2NoResid`, `Nr2NoReply`, `Nr2NoStage`, `Nr2NoEpoch`, `Nr2Hos1NoX`. `session_init` has a caller now and **still refuses**: it grants zero endpoints until K11, so `TsInitOk` stays 0 and `TsInitRej` is what moves (measured: 2) |
 
 ⭐ **What de-risks it:** every wire record these five need is already written and
 offset-asserted in `protocol/` — HTS1/HQA1, HVC1/HNR2/HVM1/HVR1 and their C

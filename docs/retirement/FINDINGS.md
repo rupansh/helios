@@ -1065,3 +1065,68 @@ not K6's and is not scheduled.
 measurement.** The probe raises on a *kernel* address as readily as on an
 unmapped one, so if dxgkrnl ever hands those paths a kernel alias the probe
 converts a working driver into one that refuses every Render.
+
+---
+
+## F13 — `DxgkDdiRender` must advance `pDmaBufferPrivateData`, or dxgkrnl reports an EMPTY private-data submission window. No Helios code has ever advanced it.
+
+**Measured 2026-08-11 on KMD 22.22.270.0 → 22.22.271.0**, both arms, with
+`tools/hnr2_native_probe.c` as the workload.
+
+K6's `DxgkDdiSubmitCommand` arm read its 64-byte `Hnr2KmdDmaPrivateV1` out of
+`pDmaBufferPrivateData + DmaBufferPrivateDataSubmissionStartOffset`, bounded by
+`…EndOffset` — the shape `decode_legacy_present_fence` already uses. It refused
+every record. The staging pool showed it as `Nr2Slot = 3` checkouts against
+`Nr2SlotRet = 0` retirements with `Nr2SlotUnd = 0`, i.e. `retire()` was never
+even called.
+
+Rather than guess between "the window is empty", "the total is short" and "the
+offsets are elsewhere", 22.22.270.0 reported the numbers:
+
+```
+DmaBufferPrivateDataSize                    = 64      ← the buffer is there
+DmaBufferPrivateDataSubmissionStartOffset   = 0
+DmaBufferPrivateDataSubmissionEndOffset     = 0       ← and describes nothing
+```
+
+`publish_dma_record` had already SUCCEEDED at Render (it returns before
+`Nr2Commit`, which read 3), so the buffer existed and was exactly one record
+long. It is the **window** that was empty.
+
+### The experiment, and the answer
+
+22.22.271.0 advances `args.pDmaBufferPrivateData` past the record at the end of
+`DxgkDdiRender` — the way `pDmaBuffer` has always been advanced — on the
+hypothesis that the field is `in/out` and that the advance is how a driver tells
+dxgkrnl how much private data it produced. The same build kept an offset-0
+fallback behind `Nr2WinFB`, gated on `DmaBufferPrivateDataSize == 64` so it can
+only fire for a buffer holding exactly one record (which cannot be two batched
+Renders). One run separates the hypotheses:
+
+```
+Submit window : total=64  start=0  end=64
+Nr2WinFB      = 0
+Nr2Slot=3  Nr2SlotRet=3  Nr2SlotUnd=0  Nr2SubNoRec=0
+```
+
+⇒ **`DXGKARG_RENDER::pDmaBufferPrivateData` is an `in/out` pointer.** The
+advance populated the window, the fallback never fired, and the staging pairs
+exactly. The WDK header carries no annotation on the field
+(`d3dkmddi.h:136-153`), which is why this had to be measured.
+
+### ⚠ The consequence for the LEGACY path is a hypothesis, not a measurement
+
+**No code in this driver has ever advanced that pointer** — not
+`dxgkddi_render`'s D3D12/present arms, not `render_km`, not `render_gdi`. That
+is very likely why `decode_present_fence` (`submit_command.rs:838-864`) carries
+an **offset-0 fallback** after trying `start..end`, and why `PmSta`/`PmEnd` have
+never had anything to say. If so, every present and every D3D12 ECL boundary on
+this driver has been decoded through that fallback since the path was written.
+
+⛔ **Not acted on, and deliberately.** Making the legacy Render arms advance the
+pointer would change the DDI DWM composites the entire desktop through, on a
+hunch, as a side effect of an unrelated unit. What would settle it: read
+`PmSta`/`PmEnd`/`PmOff` on a boot with a live desktop — `PmOff` is
+`PRESENT_MARKER_LAST_OFFSET` and already records which arm won. On the boot this
+was found, every `Pm*` read 0, so the instrument could not answer; it needs a
+run where the present path is actually exercised.
