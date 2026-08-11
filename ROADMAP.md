@@ -727,6 +727,27 @@ the `adapter/mod.rs:354` full-576-byte copy that **no code checks `.Size` before
 ⛔ F16's guest-backed option is **STRUCK**: upstream venus rejected
 `VIRTGPU_BLOB_MEM_GUEST` for shmem over host process isolation
 (`vn_renderer_virtgpu.c:1535-1556`) — all four roles are host memory.
+#### ⭐ THE CRITICAL PATH IS NOW THE DISPLAY LANE — decided 2026-08-11 by the owner
+
+*"no probing or hacks, we go the proper way, i dont care if I dont see the desktop
+immediately."* K2a's CPU view is reached by earning the WDDM 3.2 surface, not by
+another placement experiment or an instrument (`FINDINGS.md` F17). The sequence is
+`lane-kmd-display.md`'s own dependency graph, and it ends where K2a resumes:
+
+| # | Unit | Why it is on THIS path | State |
+|---|---|---|---|
+| 1 | **D0** ETW substrate (`ddi/diag_etw.rs`, ADD) | D1/D2/D3 all emit through it | protocol half **LANDED** (`protocol/src/diagnostics.rs`, 1447 l: GUID, 12 event IDs, descriptors, keywords, the 72-byte payload, `gate_event`, `validate_*`, reject codes). Platform half ABSENT. Bindings **already available** — §6 item 11. |
+| 2 | **D2** `direct_scanout.rs` (ADD) | D3 depends on it | ABSENT. ⛔ Read §6 items 6 and 8 FIRST — item 8 is "the single most load-bearing display ambiguity; confirm before D2 is written", and item 6 is a QEMU cross-lane dependency whose conservative interim never releases a binding. |
+| 3 | **D3** `mpo3.rs` (ADD) — the seven MPO3 slots | `doc:2854` rejects a 3.2 package without a complete MPO3 surface | ABSENT. Contract item 4 **RESOLVED** against the 28000 header; the other §2.5 shapes confirm at point of use (§6 item 3). |
+| 4 | **D4** then **D5** (`display.rs`, `present_packet.rs`) | D5 is part of the MPO3 surface D9 gates on; D5 serializes after D4 (same file) | D4 is XL. |
+| 5 | **native fences (K7)** | `doc:2854` rejects 3.2 on an incomplete FENCE surface too | `ddi/native_fence.rs` exists (1446 l) but is **authored-and-unwired** — `FINDINGS.md` F9, and `cargo check` reports 9 of its symbols dead. |
+| 6 | **D9** the slot audit + `SURFACE` → `Wddm3_2GpuMmu` | the flip itself | ⛔ needs the owner decision in §6 item 2 (where the 193-slot audit artifact lives) before it starts. |
+| 7 | **K2a resumes** | at 3.2 the WDDM **2.9** `DXGKRNL_INTERFACE` block is legitimately in scope | `DxgkCbCreatePhysicalMemoryObject(IO_SPACE)` + `DxgkCbMapPhysicalMemory(USER_MODE)` — F17. |
+
+⚠ **The desktop stays dark for most of this**, by the owner's explicit acceptance.
+`E_NOTIMPL` at 3.2 is not a wall — it is what D3 removes (`wddm_surface.rs:25-28`
+against `doc:5079`).
+
 4. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
    correction below before touching it. Not on the critical path.
 5. **K1 (demolition), K3** — and `SURFACE` last of all (`OWNERSHIP.md` §3).

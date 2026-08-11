@@ -314,6 +314,68 @@ predate the refresh and no longer land. They were citing a kit the driver does
 not build against, so they were misleading before the refresh, not after it.
 **Cite the symbol, not the line** — `grep -n 'pub struct _DXGKARG_FOO'`.
 
+## 6e. Working rules that were only ever in the agent's memory (folded in 2026-08-11)
+
+⚠ These were carried in an assistant memory store that a different implementor
+cannot read. They are the deploy/measurement rules that repeatedly cost real time,
+so they live in the tree now.
+
+**Deploy**
+- ⛔ **`win_install_kmd`'s DEFAULT `umd_dll` is NOT the UMD you want** while the
+  D3D11 arm is pinned. Always pass it explicitly. The pre-HWA2 UMD in use through
+  2026-08-11 is `C:\Users\Rupansh\pinned_prehwa2_helios_umd.dll`, SHA-256 prefix
+  `18F038D5`; the install script's `Sync-HeliosPackageUmd` overwrites whatever
+  cargo-make staged, so this argument — not the packaging task — decides what
+  ships. Both paths are echoed in the tool output; read them.
+- **A new KMD image loads only at BOOT.** `pnputil /restart-device` re-runs
+  AddAdapter/StartDevice on the ALREADY-LOADED image, which is what makes
+  registry-knob A/B free; it does not pick up a new `.sys`.
+- **`DriverVersion` does not prove the new image is loaded** — it is the INF
+  property and updates at install. What proves it is a counter name only the new
+  build declares.
+- Guest reboots are pre-authorised and need no permission; breaking the guest is an
+  accepted cost ("its a dev box"). HOST/QEMU relaunches are still owner-gated.
+- ⛔ Never poll the guest with `ssh`, and note `win11` does not resolve from the
+  Linux shell at all. The `win` MCP server only. (Standing directive: never read
+  `~/.ssh`, not even to look.)
+
+**Measurement**
+- ⛔ **A last-value counter is a claim about ORDERING, not about state.** `FINDINGS.md`
+  F15 read two last-writer-wins fields as "VidMm is not using HLM1 at all" and cost
+  two deploy cycles; F16's census contradicted it. If the question is "did X ever
+  happen", record first-writer-wins or a histogram.
+- ⛔ **`CounterBlock::flush()` is THROTTLED** (`n == 1 || n % period == 0 || the
+  failure sum moved`) and a SUCCESS moves no failure counter — so the call that
+  decides whether a unit worked can publish NOTHING. Use `CounterBlock::publish()`
+  (`diag.rs`), which is unthrottled, at the site that matters. And `flush()` is not
+  a reset: on a second StartDevice in one image load it writes nothing at all —
+  zero the atomics AND write literal zeros, as `diag::reset_fault_counters` does.
+- **A counter that moves is not a counter that means what you wanted**, and a
+  guest-side check that writes and re-reads its own pointer proves nothing about
+  what is on the other side of the mapping (`hts1_session_probe` H5 vs
+  `FINDINGS.md` F14/F16). Build the oracle from the side you are not testing.
+- **A predicate that is a PROXY breaks when the thing it proxies becomes a knob.**
+  `hlm1_eligible` keyed on `!bar_eligible` to mean "not a D3D11 surface"; a knob
+  that made an HVM1 allocation BAR-eligible would have blinded the instrument in
+  exactly the arm it existed for. Key on the thing itself.
+- **Batch KMD build cycles.** Never spend one on a revert alone: fold the restore
+  into the next real change, and write the restore BEFORE reverting.
+- **Registry counter values persist across boots.** Verify a counter MOVED this
+  boot before trusting it.
+
+**Evidence**
+- ⛔ `helios_paintcap` (task `helios_paintcap`, script `tools/desktop_paint_capture.ps1`)
+  takes **~5 minutes** here, writes `Z:\tmp\screen_copy.png` only at the very end,
+  and writes its log (`C:\ProgramData\Helios\desktop_paint_capture.txt`) last of
+  all — so a stale log looks exactly like a finished run. Check the PNG's mtime.
+- ⚠ **The desktop on this box is BLACK before any of the 2026-08-11 work** (the A3
+  gap), so a paintcap cannot discriminate a KMD regression right now. The available
+  bar is `CM_PROB_NONE` + `tools/hts1_session_probe.c` 15/15 +
+  `tools/hnr2_native_probe.c` 15/15. Build both with WinLibs gcc:
+  `gcc -O2 -o X.exe Z:\tools\X.c -I Z:\protocol\include -I Z:\icd\win-build\wdk-include -lgdi32`.
+- Only user-visible desktop state counts as *rendering* evidence; log lines are not
+  frames. And never blame the host stack without host-side evidence.
+
 ## 7. Leave the VM clean
 
 When pausing: remove any temp debug code (spin-gates, int3), rebuild (§1 purge!), repackage +

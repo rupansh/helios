@@ -321,6 +321,19 @@ F15 records what that cost. **Re-confirm §2.5's shapes against the new copy
 before D2/D3 start.** → **CROSS-LANE REQUEST** to core (`build.rs` /
 toolchain).
 
+⭐ **PARTIALLY DISCHARGED 2026-08-11.** The two load-bearing MPO3 shapes are now
+confirmed directly against `Include\10.0.28000.0\shared\d3dkmddi.h` — see item 4:
+`DXGK_MULTIPLANE_OVERLAY_PLANE3` (`:6623`) and
+`DXGK_PLANE_SPECIFIC_INPUT_FLAGS` (`:6410`) are unchanged from the 26100 reading
+except for the version-gated `FlipImmediateNoTearing` bit. ⚠ The REMAINING §2.5
+shapes — `DXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT3`,
+`DXGKARG_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY3`,
+`DXGK_MULTIPLANE_OVERLAY_ATTRIBUTES3`, the two caps args,
+`DXGKARG_POSTMULTIPLANEOVERLAYPRESENT`,
+`DXGKARG_VALIDATEUPDATEALLOCATIONPROPERTY`, `DXGKARG_CONTROLMODEBEHAVIOR` — are
+still 26100 truth. Confirm each **at the point of use** as D3 is written, not in a
+bulk pass; that is what keeps the citation next to the code that depends on it.
+
 **4. `DXGK_MULTIPLANE_OVERLAY_PLANE3` has no `Enabled` field, and the doc
 assumes one.**
 `doc:2779-2782` requires, "For an **enabled** plane … `PlaneCount=1`,
@@ -333,8 +346,24 @@ which has one. The enable signal must come from a
 `DXGK_PLANE_SPECIFIC_INPUT_FLAGS` bit or from `PlaneCount == 0`; the doc names
 neither. *Conservative reading:* `PlaneCount == 0` ⇒ unbind that source;
 `PlaneCount == 1` ⇒ require the WDK's `Enabled` input-flag bit set and **reject
-every unknown input-flag bit** with `Supported=FALSE` / a counted refusal. Must
-be confirmed against the 28000 header.
+every unknown input-flag bit** with `Supported=FALSE` / a counted refusal.
+
+⭐ **RESOLVED 2026-08-11 against the shipping 28000 header — the conservative
+reading is correct and now has a citation.**
+`Include\10.0.28000.0\shared\d3dkmddi.h:6623` — `DXGK_MULTIPLANE_OVERLAY_PLANE3`
+is `{LayerIndex, PresentId, InputFlags, OutputFlags, MaxImmediateFlipLine,
+ContextCount, ppContextData, DriverPrivateDataSize, pDriverPrivateData,
+PlaneAttributes}`, **no `Enabled`** — the 26100-derived shape in §2.5 holds at
+28000. The enable signal is an INPUT-FLAG bit: `:6410`
+`DXGK_PLANE_SPECIFIC_INPUT_FLAGS` = `Enabled:1 (0x1)`, `FlipImmediate:1 (0x2)`,
+`FlipOnNextVSync:1 (0x4)`, `SharedPrimaryTransition:1 (0x8)`,
+`IndependentFlipExclusive:1 (0x10)`, then **version-gated**
+`FlipImmediateNoTearing:1 (0x20)` with `Reserved:26` at
+`>= DXGKDDI_INTERFACE_VERSION_WDDM2_6`, else `Reserved:27`.
+⇒ D3 must pin the legal mask as **`0x3F`** at our compile level (we build against
+the 28000 default, i.e. the 2_6+ layout) with a `const _: () = assert!` tying it to
+the bindgen bitfield, and refuse any bit outside it. ⛔ Do NOT hardcode `0x1F`: it
+is the pre-2_6 mask and would refuse a legal `FlipImmediateNoTearing`.
 
 **5. `CheckMPO3` on an allocation that is not (yet) a live primary.**
 `doc:2768-2777` says `Supported=TRUE` only for "one layer-0, same-source,
@@ -484,3 +513,23 @@ which **is** this lane's file. Treat both as DELETE.
 ---
 
 *Section 6 contains 17 items.*
+
+**11. ⭐ RESOLVED before D0 starts — the ETW kernel API is already bound, by
+`wdk-sys`, not by this crate's bindgen.**
+`kmd_render/build.rs:468-476` allowlists only `DXGK.*` / `Dxgk.*` / `D3DKMT_.*` /
+`D3DDDI_.*` / `D3DKMDT_.*` / `KMT_.*`, so **nothing named `Etw*` is in
+`crate::dxgk`** — the vendored `tmp/dxgk_bindings.rs` has zero matches, which reads
+at first like a `build.rs` cross-lane request. It is not one. `wdk-sys`'s own
+generated bindings already export everything D0 needs (verified on the VM in
+`target/debug/build/wdk-sys-*/out/`):
+
+* `ntddk.rs` — `EtwRegister`, `EtwUnregister`, `EtwProviderEnabled`,
+  `EtwEventEnabled`, `EtwWrite`, `EtwWriteEx`, `EtwSetInformation`,
+  `EtwActivityIdControl`.
+* `types.rs` — `REGHANDLE` (`:31537`), `_EVENT_DATA_DESCRIPTOR` (`:31541`),
+  `_EVENT_DESCRIPTOR` (`:31633`) and their aliases.
+
+⇒ `diag_etw.rs` imports from `wdk_sys` / `wdk_sys::ntddk`, **not** from
+`crate::dxgk`, and **D0 needs no `build.rs` edit and no cross-lane request** for
+its bindings. (It still needs the §4 `ddi/mod.rs` + `lib.rs` wiring and item 1's
+`base.rs` forwarders.)
