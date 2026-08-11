@@ -15,8 +15,8 @@ use crate::dxgk::*;
 /// DriverEntry. All devices have been removed by now, so release the cached BAR
 /// MMIO mappings that `WdkHal` reused across stop/start cycles.
 pub unsafe extern "C" fn dxgkddi_unload() {
-    crate::kmsg(c"Helios: Unload\n");
-    crate::virtio::hal::WdkHal::unmap_all();
+    // SAFETY: Dxgkrnl enters Unload only after device callbacks are drained.
+    unsafe { crate::ddi::diag_etw::driver_unload() }
 }
 
 /// `DxgkDdiQueryInterface` — export a driver-defined interface. We expose none.
@@ -39,13 +39,13 @@ pub unsafe extern "C" fn dxgkddi_query_interface(
     STATUS_NOT_SUPPORTED
 }
 
-/// `DxgkDdiControlEtwLogging` — enable/disable the driver's ETW logging. We emit
-/// none, so this is a no-op.
+/// `DxgkDdiControlEtwLogging` — enable/disable the driver's ETW logging.
 pub unsafe extern "C" fn dxgkddi_control_etw_logging(
-    _enable: IN_BOOLEAN,
-    _flags: IN_ULONG,
-    _level: IN_UCHAR,
+    enable: IN_BOOLEAN,
+    flags: IN_ULONG,
+    level: IN_UCHAR,
 ) {
+    crate::ddi::diag_etw::control_etw_logging(enable, flags, level)
 }
 
 /// `DxgkDdiResetDevice` — reset the device to a known state (e.g. before a crash

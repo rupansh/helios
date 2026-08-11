@@ -2017,9 +2017,10 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
         adapter.completed_fence()
     };
-    let report: [u32; 38] = [
+    let etw_registration = crate::ddi::diag_etw::registration_snapshot();
+    let report: [u32; 42] = [
         0x4844_4247, // 'HDBG'
-        6,           // report version (6: + FENCE_WAIT_TABLE_FULL at index 37)
+        7,           // report version (7: + D0 provider lifetime at indices 38..41)
         args.Reason,
         SUBMIT_COUNT.load(Ordering::Relaxed),
         SUBMIT_LAST_FENCE.load(Ordering::Relaxed),
@@ -2073,8 +2074,13 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         // word is appended — never renumbered — and the version word above moves
         // with the array in the same commit.
         crate::virtio::gpu::FENCE_WAIT_TABLE_FULL.load(Ordering::Relaxed),
+        // v7: D0 provider registration, appended so every older word retains its index.
+        etw_registration.attempts,
+        etw_registration.failures,
+        etw_registration.last_status as u32,
+        etw_registration.registered,
     ];
-    let report_bytes = size_of::<[u32; 38]>();
+    let report_bytes = size_of::<[u32; 42]>();
     let copy_len = core::cmp::min(report_bytes, buf_len);
     // SAFETY: copy_len <= BufferSize (writable, checked above) and
     // copy_len <= size_of report (readable local array).

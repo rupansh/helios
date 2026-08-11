@@ -372,6 +372,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         }));
     }
 
+    // Adapter-owned builders may run only after the complete generation is
+    // published; StopDevice closes and drains the same gate before teardown.
+    crate::ddi::diag_etw::adapter_start(adapter);
+
     if knobs.display_half {
         crate::diag::record_named_bytes(b"DspMd", adapter.display_mode_packed());
 
@@ -413,6 +417,9 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // tearing down.
         // SAFETY: our adapter context, handed back from AddDevice.
         let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
+        // Hold teardown behind every admitted event builder and write that may
+        // still read this adapter generation.
+        crate::ddi::diag_etw::adapter_stop(adapter);
         // Stop the ISR from touching the (about-to-be-reset) device first.
         //
         // ⚠ ASYMMETRY, recorded rather than changed (k-ctrlsubmit-12): this
@@ -494,6 +501,7 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
     if !miniport_device_context.is_null() {
         // SAFETY: our adapter context; only read here.
         let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
+        crate::ddi::diag_etw::adapter_stop(adapter);
         if adapter.hpd_worker_may_be_running() {
             // stop_hpd could not prove the worker exited, and the worker
             // dereferences this context. Leak it deliberately: a permanent

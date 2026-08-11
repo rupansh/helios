@@ -15,6 +15,7 @@ mod build_paging_buffer;
 mod child;
 pub(crate) mod cpu_host_aperture;
 pub(crate) mod create_allocation;
+pub(crate) mod diag_etw;
 pub(crate) mod display;
 mod escape;
 mod gpummu;

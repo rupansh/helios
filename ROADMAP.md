@@ -736,7 +736,7 @@ another placement experiment or an instrument (`FINDINGS.md` F17). The sequence 
 
 | # | Unit | Why it is on THIS path | State |
 |---|---|---|---|
-| 1 | **D0** ETW substrate (`ddi/diag_etw.rs`, ADD) | D1/D2/D3 all emit through it | protocol half **LANDED** (`protocol/src/diagnostics.rs`, 1447 l: GUID, 12 event IDs, descriptors, keywords, the 72-byte payload, `gate_event`, `validate_*`, reject codes). Platform half ABSENT. Bindings **already available** — §6 item 11. |
+| 1 | **D0** ETW substrate (`ddi/diag_etw.rs`, ADD) | D1/D2/D3 all emit through it | ✅ **LANDED AND EXERCISED ON THE TARGET.** Platform half uses the existing `wdk_sys` bindings, per-adapter epoch-tagged rundown plus a driver-wide provider-handle rundown, and the v7 `CollectDbgInfo` registration snapshot. KMD **22.22.277.0** cold-boots `CM_PROB_NONE`; `EnumerateTraceGuidsEx(TraceGuidQueryInfo)` sees the task GUID registered, and both standing probes remain **15/15**. |
 | 2 | **D2** `direct_scanout.rs` (ADD) | D3 depends on it | ABSENT. ⛔ Read §6 items 6 and 8 FIRST — item 8 is "the single most load-bearing display ambiguity; confirm before D2 is written", and item 6 is a QEMU cross-lane dependency whose conservative interim never releases a binding. |
 | 3 | **D3** `mpo3.rs` (ADD) — the seven MPO3 slots | `doc:2854` rejects a 3.2 package without a complete MPO3 surface | ABSENT. Contract item 4 **RESOLVED** against the 28000 header; the other §2.5 shapes confirm at point of use (§6 item 3). |
 | 4 | **D4** then **D5** (`display.rs`, `present_packet.rs`) | D5 is part of the MPO3 surface D9 gates on; D5 serializes after D4 (same file) | D4 is XL. |

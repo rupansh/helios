@@ -472,6 +472,9 @@ pub struct AdapterContext {
     /// table with no `isr_status` guard at all and used to rest on statement
     /// order plus a comment.
     started_published: AtomicU32,
+    /// Per-adapter ETW admission; its epoch survives stop/start so a stale
+    /// pre-stop CAS cannot enter the replacement transport generation.
+    pub(crate) etw_rundown: crate::ddi::diag_etw::EtwAdapterRundown,
     /// Last fence completed by the bring-up scheduler path.
     last_completed_fence: AtomicU32,
     /// Serializes DMA_COMPLETED notification and its monotonic fence update.
@@ -1085,6 +1088,7 @@ impl AdapterContext {
             ),
             started: UnsafeCell::new(None),
             started_published: AtomicU32::new(0),
+            etw_rundown: crate::ddi::diag_etw::EtwAdapterRundown::new(),
             last_completed_fence: AtomicU32::new(0),
             wddm_notify_lock: UnsafeCell::new(0),
             isr_status: AtomicUsize::new(0),
@@ -1628,6 +1632,7 @@ impl AdapterContext {
 
 impl Drop for AdapterContext {
     fn drop(&mut self) {
+        crate::ddi::diag_etw::adapter_stop(self);
         // Cancel + drain the VSync heartbeat and join the HPD worker before this
         // context's memory (which embeds the KTIMER/KDPC/KEVENT the worker touches)
         // is freed, in case StopDevice was skipped. No-ops if never started.

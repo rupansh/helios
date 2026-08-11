@@ -120,9 +120,16 @@ pub unsafe extern "system" fn driver_entry(
     // Audit passed on the built table.
     diag::record(0x0DA0_0001);
 
+    // SAFETY: DriverEntry runs at PASSIVE_LEVEL and provider registration is
+    // unwound below if DxgkInitialize does not retain the DDI table.
+    unsafe { ddi::diag_etw::register() };
+
     // SAFETY: pointers are valid for the call; `init` outlives the call on this
     // stack frame, and DxgkInitialize copies what it needs.
     let status = unsafe { DxgkInitialize(driver_object, registry_path, &mut init) };
+    if status < 0 {
+        ddi::diag_etw::unregister();
+    }
     diag::record(0x0D00_0002);
     diag::record(status as u32);
     status
