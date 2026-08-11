@@ -13,6 +13,7 @@ mod base;
 mod blob_map;
 mod build_paging_buffer;
 mod child;
+pub(crate) mod committed_mode;
 pub(crate) mod cpu_host_aperture;
 pub(crate) mod create_allocation;
 pub(crate) mod diag_etw;
