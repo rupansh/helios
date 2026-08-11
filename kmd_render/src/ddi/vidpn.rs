@@ -10,10 +10,16 @@
 //! panic in any VidPn DDI is a silent graphics deadlock, so every path returns
 //! a legal NTSTATUS and no `unwrap`/`panic!` is used.
 
-use core::ptr::{null, null_mut};
+use core::{
+    ptr::{null, null_mut},
+    sync::atomic::{AtomicU32, Ordering},
+};
+
+use helios_kmd_logic::committed_mode::ModeCommitFacts;
 
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
+use crate::irql::PassiveLevel;
 
 // ── Fixed topology / mode constants ─────────────────────────────────────────
 /// One video-present source, one child (video output) — reported at StartDevice.
@@ -29,6 +35,9 @@ pub const CHILD_UID: u32 = 0;
 pub const DEFAULT_MODE_WIDTH: u32 = 1920;
 pub const DEFAULT_MODE_HEIGHT: u32 = 1080;
 const REFRESH_HZ: u32 = 60;
+const COMMITTED_SOURCE_ID: u32 = 0;
+const COMMITTED_TARGET_ID: u32 = 0;
+const D3DDDI_ID_ALL_VALUE: u32 = u32::MAX;
 
 /// Build a valid EDID 1.4 (checksum `sum % 256 == 0`) whose preferred detailed
 /// timing (DTD1) is exactly `w × h @ ~60 Hz`. `DxgkDdiQueryDeviceDescriptor` serves
@@ -117,7 +126,6 @@ pub const HELIOS_MONITOR_CONTAINER_ID: GUID = GUID {
 // values are negative (error), 0x4... are informational (NT_SUCCESS true).
 pub const STATUS_GRAPHICS_NO_RECOMMENDED_FUNCTIONAL_VIDPN: NTSTATUS = 0xC01E0323u32 as NTSTATUS;
 pub const STATUS_GRAPHICS_MODE_ALREADY_IN_MODESET: NTSTATUS = 0xC01E0314u32 as NTSTATUS;
-pub const STATUS_GRAPHICS_NO_MORE_ELEMENTS_IN_DATASET: NTSTATUS = 0x401E034Cu32 as NTSTATUS;
 pub const STATUS_GRAPHICS_INVALID_VIDPN: NTSTATUS = 0xC01E0303u32 as NTSTATUS;
 /// The requested EDID descriptor offset is past the end of our block (the OS reads
 /// the EDID in chunks and stops on this). WDK ntstatus.h 0xC01E0501.
@@ -156,6 +164,141 @@ pub(crate) fn legalize_vidpn(s: NTSTATUS) -> NTSTATUS {
         return s;
     }
     STATUS_GRAPHICS_INVALID_VIDPN
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum CommittedVidPnStage {
+    QueryVidPnInterface,
+    GetTopology,
+    AcquireFirstPath,
+    AcquireNextPath,
+    ReleasePath,
+    AcquireSourceModeSet,
+    AcquireSourcePinnedMode,
+    ReleaseSourcePinnedMode,
+    ReleaseSourceModeSet,
+    AcquireTargetModeSet,
+    AcquireTargetPinnedMode,
+    ReleaseTargetPinnedMode,
+    ReleaseTargetModeSet,
+}
+
+impl CommittedVidPnStage {
+    const COUNT: usize = 13;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub(crate) enum CommittedVidPnOutputStage {
+    QueryVidPnInterface,
+    GetTopology,
+    AcquireFirstPath,
+    AcquireNextPath,
+    AcquireSourceModeSet,
+    AcquireTargetModeSet,
+}
+
+impl CommittedVidPnOutputStage {
+    const COUNT: usize = 6;
+
+    const fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommittedVidPnRefusal {
+    NullArgument,
+    NullFunctionalVidPn,
+    InvalidAffectedSource {
+        found: u32,
+    },
+    ReservedFlags {
+        found: u32,
+    },
+    MissingCallback {
+        stage: CommittedVidPnStage,
+    },
+    CallbackFailed {
+        stage: CommittedVidPnStage,
+        raw_status: NTSTATUS,
+    },
+    UnexpectedCallbackStatus {
+        stage: CommittedVidPnStage,
+        raw_status: NTSTATUS,
+    },
+    InvalidOutput {
+        stage: CommittedVidPnOutputStage,
+    },
+    MultiplePaths,
+    PathIdentity {
+        source_id: u32,
+        target_id: u32,
+    },
+    PathTransformation,
+    SourcePinnedModeMissing,
+    TargetPinnedModeMissing,
+    SourceModeNotGraphics,
+    SourceExtentZero,
+    TargetExtentZero,
+}
+
+pub(crate) const COMMITTED_VIDPN_REFUSAL_COUNT: usize =
+    4 + CommittedVidPnStage::COUNT * 3 + CommittedVidPnOutputStage::COUNT + 8;
+
+pub(crate) static COMMITTED_VIDPN_REFUSALS: [AtomicU32; COMMITTED_VIDPN_REFUSAL_COUNT] =
+    [const { AtomicU32::new(0) }; COMMITTED_VIDPN_REFUSAL_COUNT];
+
+const fn committed_vidpn_refusal_index(refusal: CommittedVidPnRefusal) -> usize {
+    const MISSING_BASE: usize = 4;
+    const FAILED_BASE: usize = MISSING_BASE + CommittedVidPnStage::COUNT;
+    const UNEXPECTED_BASE: usize = FAILED_BASE + CommittedVidPnStage::COUNT;
+    const OUTPUT_BASE: usize = UNEXPECTED_BASE + CommittedVidPnStage::COUNT;
+    const SEMANTIC_BASE: usize = OUTPUT_BASE + CommittedVidPnOutputStage::COUNT;
+
+    match refusal {
+        CommittedVidPnRefusal::NullArgument => 0,
+        CommittedVidPnRefusal::NullFunctionalVidPn => 1,
+        CommittedVidPnRefusal::InvalidAffectedSource { .. } => 2,
+        CommittedVidPnRefusal::ReservedFlags { .. } => 3,
+        CommittedVidPnRefusal::MissingCallback { stage } => MISSING_BASE + stage.index(),
+        CommittedVidPnRefusal::CallbackFailed { stage, .. } => FAILED_BASE + stage.index(),
+        CommittedVidPnRefusal::UnexpectedCallbackStatus { stage, .. } => {
+            UNEXPECTED_BASE + stage.index()
+        }
+        CommittedVidPnRefusal::InvalidOutput { stage } => OUTPUT_BASE + stage.index(),
+        CommittedVidPnRefusal::MultiplePaths => SEMANTIC_BASE,
+        CommittedVidPnRefusal::PathIdentity { .. } => SEMANTIC_BASE + 1,
+        CommittedVidPnRefusal::PathTransformation => SEMANTIC_BASE + 2,
+        CommittedVidPnRefusal::SourcePinnedModeMissing => SEMANTIC_BASE + 3,
+        CommittedVidPnRefusal::TargetPinnedModeMissing => SEMANTIC_BASE + 4,
+        CommittedVidPnRefusal::SourceModeNotGraphics => SEMANTIC_BASE + 5,
+        CommittedVidPnRefusal::SourceExtentZero => SEMANTIC_BASE + 6,
+        CommittedVidPnRefusal::TargetExtentZero => SEMANTIC_BASE + 7,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommittedVidPnFacts {
+    Empty { source_id: u32 },
+    Active(ModeCommitFacts),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CommittedVidPnInspectionError {
+    pub(crate) status: NTSTATUS,
+    pub(crate) refusal: CommittedVidPnRefusal,
+}
+
+#[derive(Clone, Copy)]
+struct CommittedVidPnFailure {
+    raw_status: NTSTATUS,
+    refusal: CommittedVidPnRefusal,
 }
 
 /// The OS VidPn interface for one `h_vidpn`, borrowed for a bounded window.
@@ -1087,6 +1230,539 @@ pub unsafe fn enum_cofunc_modality(
     }
     rec(b"VpECr", status as u32 & 0xFFFF);
     status
+}
+
+fn bump_committed_vidpn_refusal(refusal: CommittedVidPnRefusal) {
+    COMMITTED_VIDPN_REFUSALS[committed_vidpn_refusal_index(refusal)]
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+fn committed_vidpn_logical(refusal: CommittedVidPnRefusal) -> CommittedVidPnFailure {
+    bump_committed_vidpn_refusal(refusal);
+    CommittedVidPnFailure {
+        raw_status: STATUS_GRAPHICS_INVALID_VIDPN,
+        refusal,
+    }
+}
+
+fn committed_vidpn_missing(stage: CommittedVidPnStage) -> CommittedVidPnFailure {
+    committed_vidpn_logical(CommittedVidPnRefusal::MissingCallback { stage })
+}
+
+fn committed_vidpn_failed(
+    stage: CommittedVidPnStage,
+    raw_status: NTSTATUS,
+) -> CommittedVidPnFailure {
+    let refusal = CommittedVidPnRefusal::CallbackFailed { stage, raw_status };
+    bump_committed_vidpn_refusal(refusal);
+    CommittedVidPnFailure {
+        raw_status,
+        refusal,
+    }
+}
+
+fn committed_vidpn_unexpected_status(
+    stage: CommittedVidPnStage,
+    raw_status: NTSTATUS,
+) -> CommittedVidPnFailure {
+    let refusal = CommittedVidPnRefusal::UnexpectedCallbackStatus { stage, raw_status };
+    bump_committed_vidpn_refusal(refusal);
+    CommittedVidPnFailure {
+        raw_status: STATUS_GRAPHICS_INVALID_VIDPN,
+        refusal,
+    }
+}
+
+fn committed_vidpn_non_success(
+    stage: CommittedVidPnStage,
+    raw_status: NTSTATUS,
+) -> CommittedVidPnFailure {
+    if raw_status < 0 {
+        committed_vidpn_failed(stage, raw_status)
+    } else {
+        committed_vidpn_unexpected_status(stage, raw_status)
+    }
+}
+
+fn committed_vidpn_invalid_output(stage: CommittedVidPnOutputStage) -> CommittedVidPnFailure {
+    committed_vidpn_logical(CommittedVidPnRefusal::InvalidOutput { stage })
+}
+
+fn remember_committed_cleanup(
+    cleanup: &mut Option<CommittedVidPnFailure>,
+    result: Result<(), CommittedVidPnFailure>,
+) {
+    if cleanup.is_none() {
+        if let Err(failure) = result {
+            *cleanup = Some(failure);
+        }
+    }
+}
+
+fn finish_committed_cleanup<T>(
+    result: Result<T, CommittedVidPnFailure>,
+    cleanup: Option<CommittedVidPnFailure>,
+) -> Result<T, CommittedVidPnFailure> {
+    match cleanup {
+        Some(failure) => Err(failure),
+        None => result,
+    }
+}
+
+unsafe fn release_committed_path(
+    topology: &DXGK_VIDPNTOPOLOGY_INTERFACE,
+    h_topology: D3DKMDT_HVIDPNTOPOLOGY,
+    path: *const D3DKMDT_VIDPN_PRESENT_PATH,
+) -> Result<(), CommittedVidPnFailure> {
+    let stage = CommittedVidPnStage::ReleasePath;
+    let release = topology
+        .pfnReleasePathInfo
+        .ok_or_else(|| committed_vidpn_missing(stage))?;
+    let status = unsafe { release(h_topology, path) };
+    if status == STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(committed_vidpn_non_success(stage, status))
+    }
+}
+
+unsafe fn release_committed_source_set(
+    vidpn: &DXGK_VIDPN_INTERFACE,
+    h_vidpn: D3DKMDT_HVIDPN,
+    h_set: D3DKMDT_HVIDPNSOURCEMODESET,
+) -> Result<(), CommittedVidPnFailure> {
+    let stage = CommittedVidPnStage::ReleaseSourceModeSet;
+    let release = vidpn
+        .pfnReleaseSourceModeSet
+        .ok_or_else(|| committed_vidpn_missing(stage))?;
+    let status = unsafe { release(h_vidpn, h_set) };
+    if status == STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(committed_vidpn_non_success(stage, status))
+    }
+}
+
+unsafe fn release_committed_source_mode(
+    set: &DXGK_VIDPNSOURCEMODESET_INTERFACE,
+    h_set: D3DKMDT_HVIDPNSOURCEMODESET,
+    mode: *const D3DKMDT_VIDPN_SOURCE_MODE,
+) -> Result<(), CommittedVidPnFailure> {
+    let stage = CommittedVidPnStage::ReleaseSourcePinnedMode;
+    let release = set
+        .pfnReleaseModeInfo
+        .ok_or_else(|| committed_vidpn_missing(stage))?;
+    let status = unsafe { release(h_set, mode) };
+    if status == STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(committed_vidpn_non_success(stage, status))
+    }
+}
+
+unsafe fn release_committed_target_set(
+    vidpn: &DXGK_VIDPN_INTERFACE,
+    h_vidpn: D3DKMDT_HVIDPN,
+    h_set: D3DKMDT_HVIDPNTARGETMODESET,
+) -> Result<(), CommittedVidPnFailure> {
+    let stage = CommittedVidPnStage::ReleaseTargetModeSet;
+    let release = vidpn
+        .pfnReleaseTargetModeSet
+        .ok_or_else(|| committed_vidpn_missing(stage))?;
+    let status = unsafe { release(h_vidpn, h_set) };
+    if status == STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(committed_vidpn_non_success(stage, status))
+    }
+}
+
+unsafe fn release_committed_target_mode(
+    set: &DXGK_VIDPNTARGETMODESET_INTERFACE,
+    h_set: D3DKMDT_HVIDPNTARGETMODESET,
+    mode: *const D3DKMDT_VIDPN_TARGET_MODE,
+) -> Result<(), CommittedVidPnFailure> {
+    let stage = CommittedVidPnStage::ReleaseTargetPinnedMode;
+    let release = set
+        .pfnReleaseModeInfo
+        .ok_or_else(|| committed_vidpn_missing(stage))?;
+    let status = unsafe { release(h_set, mode) };
+    if status == STATUS_SUCCESS {
+        Ok(())
+    } else {
+        Err(committed_vidpn_non_success(stage, status))
+    }
+}
+
+unsafe fn inspect_committed_path(
+    vidpn: &DXGK_VIDPN_INTERFACE,
+    h_vidpn: D3DKMDT_HVIDPN,
+) -> Result<Option<D3DKMDT_VIDPN_PRESENT_PATH>, CommittedVidPnFailure> {
+    let stage = CommittedVidPnStage::GetTopology;
+    let get_topology = vidpn
+        .pfnGetTopology
+        .ok_or_else(|| committed_vidpn_missing(stage))?;
+    let mut h_topology: D3DKMDT_HVIDPNTOPOLOGY = null_mut();
+    let mut topology: *const DXGK_VIDPNTOPOLOGY_INTERFACE = null();
+    let status = unsafe { get_topology(h_vidpn, &mut h_topology, &mut topology) };
+    if status != STATUS_SUCCESS {
+        return Err(committed_vidpn_non_success(stage, status));
+    }
+    if h_topology.is_null() || topology.is_null() {
+        return Err(committed_vidpn_invalid_output(
+            CommittedVidPnOutputStage::GetTopology,
+        ));
+    }
+    let topology = unsafe { &*topology };
+    let first_stage = CommittedVidPnStage::AcquireFirstPath;
+    let next_stage = CommittedVidPnStage::AcquireNextPath;
+    let acquire_first = topology
+        .pfnAcquireFirstPathInfo
+        .ok_or_else(|| committed_vidpn_missing(first_stage))?;
+    let acquire_next = topology
+        .pfnAcquireNextPathInfo
+        .ok_or_else(|| committed_vidpn_missing(next_stage))?;
+    topology
+        .pfnReleasePathInfo
+        .ok_or_else(|| committed_vidpn_missing(CommittedVidPnStage::ReleasePath))?;
+
+    let mut first = null();
+    let status = unsafe { acquire_first(h_topology, &mut first) };
+    if status == STATUS_GRAPHICS_DATASET_IS_EMPTY {
+        return if first.is_null() {
+            Ok(None)
+        } else {
+            Err(committed_vidpn_invalid_output(
+                CommittedVidPnOutputStage::AcquireFirstPath,
+            ))
+        };
+    }
+    if status != STATUS_SUCCESS {
+        return Err(committed_vidpn_non_success(first_stage, status));
+    }
+    if first.is_null() {
+        return Err(committed_vidpn_invalid_output(
+            CommittedVidPnOutputStage::AcquireFirstPath,
+        ));
+    }
+
+    let path = unsafe { *first };
+    let mut second = null();
+    let status = unsafe { acquire_next(h_topology, first, &mut second) };
+    let result = if status == STATUS_GRAPHICS_NO_MORE_ELEMENTS_IN_DATASET {
+        if second.is_null() {
+            Ok(path)
+        } else {
+            Err(committed_vidpn_invalid_output(
+                CommittedVidPnOutputStage::AcquireNextPath,
+            ))
+        }
+    } else if status != STATUS_SUCCESS {
+        Err(committed_vidpn_non_success(next_stage, status))
+    } else if second.is_null() {
+        Err(committed_vidpn_invalid_output(
+            CommittedVidPnOutputStage::AcquireNextPath,
+        ))
+    } else {
+        Err(committed_vidpn_logical(
+            CommittedVidPnRefusal::MultiplePaths,
+        ))
+    };
+
+    let mut cleanup = None;
+    remember_committed_cleanup(&mut cleanup, unsafe {
+        release_committed_path(topology, h_topology, first)
+    });
+    if status == STATUS_SUCCESS && !second.is_null() {
+        remember_committed_cleanup(&mut cleanup, unsafe {
+            release_committed_path(topology, h_topology, second)
+        });
+    }
+    finish_committed_cleanup(result.map(Some), cleanup)
+}
+
+unsafe fn inspect_committed_source_extent(
+    vidpn: &DXGK_VIDPN_INTERFACE,
+    h_vidpn: D3DKMDT_HVIDPN,
+    source_id: u32,
+) -> Result<(u32, u32), CommittedVidPnFailure> {
+    let acquire_stage = CommittedVidPnStage::AcquireSourceModeSet;
+    let acquire = vidpn
+        .pfnAcquireSourceModeSet
+        .ok_or_else(|| committed_vidpn_missing(acquire_stage))?;
+    vidpn
+        .pfnReleaseSourceModeSet
+        .ok_or_else(|| committed_vidpn_missing(CommittedVidPnStage::ReleaseSourceModeSet))?;
+    let mut h_set: D3DKMDT_HVIDPNSOURCEMODESET = null_mut();
+    let mut set: *const DXGK_VIDPNSOURCEMODESET_INTERFACE = null();
+    let status = unsafe { acquire(h_vidpn, source_id, &mut h_set, &mut set) };
+    if status != STATUS_SUCCESS {
+        return Err(committed_vidpn_non_success(acquire_stage, status));
+    }
+    if h_set.is_null() {
+        return Err(committed_vidpn_invalid_output(
+            CommittedVidPnOutputStage::AcquireSourceModeSet,
+        ));
+    }
+    if set.is_null() {
+        return finish_committed_cleanup(
+            Err(committed_vidpn_invalid_output(
+                CommittedVidPnOutputStage::AcquireSourceModeSet,
+            )),
+            unsafe { release_committed_source_set(vidpn, h_vidpn, h_set) }.err(),
+        );
+    }
+    let set = unsafe { &*set };
+    let pinned_stage = CommittedVidPnStage::AcquireSourcePinnedMode;
+    let acquire_pinned = match set.pfnAcquirePinnedModeInfo {
+        Some(callback) => callback,
+        None => {
+            return finish_committed_cleanup(
+                Err(committed_vidpn_missing(pinned_stage)),
+                unsafe { release_committed_source_set(vidpn, h_vidpn, h_set) }.err(),
+            );
+        }
+    };
+    if set.pfnReleaseModeInfo.is_none() {
+        return finish_committed_cleanup(
+            Err(committed_vidpn_missing(
+                CommittedVidPnStage::ReleaseSourcePinnedMode,
+            )),
+            unsafe { release_committed_source_set(vidpn, h_vidpn, h_set) }.err(),
+        );
+    }
+
+    let mut mode = null();
+    let status = unsafe { acquire_pinned(h_set, &mut mode) };
+    let result = if status != STATUS_SUCCESS {
+        Err(committed_vidpn_non_success(pinned_stage, status))
+    } else if mode.is_null() {
+        Err(committed_vidpn_logical(
+            CommittedVidPnRefusal::SourcePinnedModeMissing,
+        ))
+    } else if unsafe { (*mode).Type } != _D3DKMDT_VIDPN_SOURCE_MODE_TYPE::D3DKMDT_RMT_GRAPHICS {
+        Err(committed_vidpn_logical(
+            CommittedVidPnRefusal::SourceModeNotGraphics,
+        ))
+    } else {
+        let graphics = unsafe { (*mode).Format.Graphics };
+        if graphics.PrimSurfSize.cx == 0 || graphics.PrimSurfSize.cy == 0 {
+            Err(committed_vidpn_logical(
+                CommittedVidPnRefusal::SourceExtentZero,
+            ))
+        } else {
+            Ok((graphics.PrimSurfSize.cx, graphics.PrimSurfSize.cy))
+        }
+    };
+
+    let mut cleanup = None;
+    if status == STATUS_SUCCESS && !mode.is_null() {
+        remember_committed_cleanup(&mut cleanup, unsafe {
+            release_committed_source_mode(set, h_set, mode)
+        });
+    }
+    remember_committed_cleanup(&mut cleanup, unsafe {
+        release_committed_source_set(vidpn, h_vidpn, h_set)
+    });
+    finish_committed_cleanup(result, cleanup)
+}
+
+unsafe fn inspect_committed_target_extent(
+    vidpn: &DXGK_VIDPN_INTERFACE,
+    h_vidpn: D3DKMDT_HVIDPN,
+    target_id: u32,
+) -> Result<(u32, u32), CommittedVidPnFailure> {
+    let acquire_stage = CommittedVidPnStage::AcquireTargetModeSet;
+    let acquire = vidpn
+        .pfnAcquireTargetModeSet
+        .ok_or_else(|| committed_vidpn_missing(acquire_stage))?;
+    vidpn
+        .pfnReleaseTargetModeSet
+        .ok_or_else(|| committed_vidpn_missing(CommittedVidPnStage::ReleaseTargetModeSet))?;
+    let mut h_set: D3DKMDT_HVIDPNTARGETMODESET = null_mut();
+    let mut set: *const DXGK_VIDPNTARGETMODESET_INTERFACE = null();
+    let status = unsafe { acquire(h_vidpn, target_id, &mut h_set, &mut set) };
+    if status != STATUS_SUCCESS {
+        return Err(committed_vidpn_non_success(acquire_stage, status));
+    }
+    if h_set.is_null() {
+        return Err(committed_vidpn_invalid_output(
+            CommittedVidPnOutputStage::AcquireTargetModeSet,
+        ));
+    }
+    if set.is_null() {
+        return finish_committed_cleanup(
+            Err(committed_vidpn_invalid_output(
+                CommittedVidPnOutputStage::AcquireTargetModeSet,
+            )),
+            unsafe { release_committed_target_set(vidpn, h_vidpn, h_set) }.err(),
+        );
+    }
+    let set = unsafe { &*set };
+    let pinned_stage = CommittedVidPnStage::AcquireTargetPinnedMode;
+    let acquire_pinned = match set.pfnAcquirePinnedModeInfo {
+        Some(callback) => callback,
+        None => {
+            return finish_committed_cleanup(
+                Err(committed_vidpn_missing(pinned_stage)),
+                unsafe { release_committed_target_set(vidpn, h_vidpn, h_set) }.err(),
+            );
+        }
+    };
+    if set.pfnReleaseModeInfo.is_none() {
+        return finish_committed_cleanup(
+            Err(committed_vidpn_missing(
+                CommittedVidPnStage::ReleaseTargetPinnedMode,
+            )),
+            unsafe { release_committed_target_set(vidpn, h_vidpn, h_set) }.err(),
+        );
+    }
+
+    let mut mode = null();
+    let status = unsafe { acquire_pinned(h_set, &mut mode) };
+    let result = if status != STATUS_SUCCESS {
+        Err(committed_vidpn_non_success(pinned_stage, status))
+    } else if mode.is_null() {
+        Err(committed_vidpn_logical(
+            CommittedVidPnRefusal::TargetPinnedModeMissing,
+        ))
+    } else {
+        let active = unsafe { (*mode).VideoSignalInfo.ActiveSize };
+        if active.cx == 0 || active.cy == 0 {
+            Err(committed_vidpn_logical(
+                CommittedVidPnRefusal::TargetExtentZero,
+            ))
+        } else {
+            Ok((active.cx, active.cy))
+        }
+    };
+
+    let mut cleanup = None;
+    if status == STATUS_SUCCESS && !mode.is_null() {
+        remember_committed_cleanup(&mut cleanup, unsafe {
+            release_committed_target_mode(set, h_set, mode)
+        });
+    }
+    remember_committed_cleanup(&mut cleanup, unsafe {
+        release_committed_target_set(vidpn, h_vidpn, h_set)
+    });
+    finish_committed_cleanup(result, cleanup)
+}
+
+unsafe fn inspect_committed_vidpn_inner(
+    adapter: &AdapterContext,
+    arg: *const DXGKARG_COMMITVIDPN,
+) -> Result<CommittedVidPnFacts, CommittedVidPnFailure> {
+    if arg.is_null() {
+        return Err(committed_vidpn_logical(CommittedVidPnRefusal::NullArgument));
+    }
+    let arg = unsafe { &*arg };
+    if arg.hFunctionalVidPn.is_null() {
+        return Err(committed_vidpn_logical(
+            CommittedVidPnRefusal::NullFunctionalVidPn,
+        ));
+    }
+    if arg.AffectedVidPnSourceId != COMMITTED_SOURCE_ID
+        && arg.AffectedVidPnSourceId != D3DDDI_ID_ALL_VALUE
+    {
+        return Err(committed_vidpn_logical(
+            CommittedVidPnRefusal::InvalidAffectedSource {
+                found: arg.AffectedVidPnSourceId,
+            },
+        ));
+    }
+    let reserved = arg.Flags.Reserved();
+    if reserved != 0 {
+        return Err(committed_vidpn_logical(
+            CommittedVidPnRefusal::ReservedFlags { found: reserved },
+        ));
+    }
+    let path_powered = arg.Flags.PathPoweredOff() == 0;
+    let query_stage = CommittedVidPnStage::QueryVidPnInterface;
+    let dxgkrnl = adapter
+        .dxgkrnl_opt()
+        .ok_or_else(|| committed_vidpn_missing(query_stage))?;
+    let query = dxgkrnl
+        .DxgkCbQueryVidPnInterface
+        .ok_or_else(|| committed_vidpn_missing(query_stage))?;
+    let mut vidpn: *const DXGK_VIDPN_INTERFACE = null();
+    let status = unsafe {
+        query(
+            arg.hFunctionalVidPn,
+            _DXGK_VIDPN_INTERFACE_VERSION::DXGK_VIDPN_INTERFACE_VERSION_V1,
+            &mut vidpn,
+        )
+    };
+    if status != STATUS_SUCCESS {
+        return Err(committed_vidpn_non_success(query_stage, status));
+    }
+    if vidpn.is_null() {
+        return Err(committed_vidpn_invalid_output(
+            CommittedVidPnOutputStage::QueryVidPnInterface,
+        ));
+    }
+    let vidpn = unsafe { &*vidpn };
+    let path = match unsafe { inspect_committed_path(vidpn, arg.hFunctionalVidPn) }? {
+        Some(path) => path,
+        None => {
+            return Ok(CommittedVidPnFacts::Empty {
+                source_id: COMMITTED_SOURCE_ID,
+            });
+        }
+    };
+    if path.VidPnSourceId != COMMITTED_SOURCE_ID || path.VidPnTargetId != COMMITTED_TARGET_ID {
+        return Err(committed_vidpn_logical(
+            CommittedVidPnRefusal::PathIdentity {
+                source_id: path.VidPnSourceId,
+                target_id: path.VidPnTargetId,
+            },
+        ));
+    }
+    if path.ContentTransformation.Scaling
+        != _D3DKMDT_VIDPN_PRESENT_PATH_SCALING::D3DKMDT_VPPS_IDENTITY
+        || path.ContentTransformation.Rotation
+            != _D3DKMDT_VIDPN_PRESENT_PATH_ROTATION::D3DKMDT_VPPR_IDENTITY
+    {
+        return Err(committed_vidpn_logical(
+            CommittedVidPnRefusal::PathTransformation,
+        ));
+    }
+    let (source_width, source_height) = unsafe {
+        inspect_committed_source_extent(vidpn, arg.hFunctionalVidPn, path.VidPnSourceId)
+    }?;
+    let (target_width, target_height) = unsafe {
+        inspect_committed_target_extent(vidpn, arg.hFunctionalVidPn, path.VidPnTargetId)
+    }?;
+    Ok(CommittedVidPnFacts::Active(ModeCommitFacts {
+        source_id: path.VidPnSourceId,
+        target_id: path.VidPnTargetId,
+        source_width,
+        source_height,
+        target_width,
+        target_height,
+        path_powered,
+    }))
+}
+
+/// PASSIVE-only full inspection of the DDI-owned committed VidPn.
+/// All acquired references are released successfully before by-value facts escape.
+/// `arg` must be the live `CommitVidPn` argument for this call.
+#[allow(
+    dead_code,
+    reason = "D2 inspection remains unwired until commit publication integration"
+)]
+pub(crate) unsafe fn inspect_committed_vidpn(
+    adapter: &AdapterContext,
+    _passive: PassiveLevel,
+    arg: *const DXGKARG_COMMITVIDPN,
+) -> Result<CommittedVidPnFacts, CommittedVidPnInspectionError> {
+    match unsafe { inspect_committed_vidpn_inner(adapter, arg) } {
+        Ok(facts) => Ok(facts),
+        Err(failure) => Err(CommittedVidPnInspectionError {
+            status: legalize_vidpn(failure.raw_status),
+            refusal: failure.refusal,
+        }),
+    }
 }
 
 /// Return the number of present paths in `h_vidpn`'s topology, or `u32::MAX` if it
