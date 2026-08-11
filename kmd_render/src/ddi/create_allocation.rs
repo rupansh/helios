@@ -3996,11 +3996,20 @@ unsafe fn admit_hvm1(
         plane_offset: 0,
         pitch: 0,
         direct_scanout: false,
-        // ⛔ NOT BAR-eligible. An HVM1 object's placement is HLM1 plus the
-        // ordinary aperture (§10.7:1999-2002); the CpuHostAperture BAR path is
+        // ⛔ NOT BAR-eligible by default. An HVM1 object's placement is HLM1 plus
+        // the ordinary aperture (§10.7:1999-2002); the CpuHostAperture BAR path is
         // the mechanism §17.6 deletes, and routing native-Vulkan memory through
         // it would re-create exactly what the retirement removes.
-        bar_eligible: false,
+        //
+        // ⚠ `Hlm1Bar` opens it anyway, because F16 measured that no HLM1
+        // configuration produces an aliased CPU view and this is the one path on
+        // this driver that demonstrably does. Same three terms as the D3D11
+        // predicate: a host-authoritative blob, a CPU view, and a reported BAR
+        // segment (the last is implied by the `segment_is_reported` check above,
+        // which already returned for a table without HLM1).
+        bar_eligible: knobs.hlm1_bar
+            && created.blob_size.is_host_authoritative()
+            && placement_rules.cpu_visible,
         size_provenance: created.blob_size,
         backing: Some(created),
     })
@@ -4252,15 +4261,19 @@ unsafe fn create_one(
     // predicate that decided this allocation has a CPU view is the one that
     // decides its blob must be mapped where VidMm puts it.
     //
-    // ⛔ `!bar_eligible` is load-bearing, not a tidy-up. `vidmm_placement` gives
-    // every BAR-eligible D3D11 surface `cpu_visible` on this same segment, and
-    // those already HAVE a CPU view — through `MapCpuHostAperture`. Without this
-    // term the counters below would be dominated by DWM's textures and could not
-    // attribute anything to an HVM1 allocation. What is left is exactly F14's
-    // population: promised a CPU view in HLM1, with no mechanism delivering one.
+    // The excluded population is DWM's D3D11 textures: `vidmm_placement` gives
+    // every BAR-eligible one `cpu_visible` on this same segment, and without a
+    // term for it the counters are dominated by them and attribute nothing to an
+    // HVM1 allocation.
+    //
+    // ⛔ That term used to be `!bar_eligible`, which was a PROXY for "not a D3D11
+    // surface" and stopped being one the moment `Hlm1Bar` could make an HVM1
+    // allocation BAR-eligible — the instrument would have gone dark in exactly the
+    // arm it was built to measure. The allocation KIND says the same thing
+    // directly and cannot be turned off by a knob.
     let hlm1_eligible = admitted.placement.cpu_visible
         && admitted.placement.preferred_segment == HELIOS_SEGMENT_ID_HLM1
-        && !admitted.bar_eligible;
+        && matches!(admitted.kind, ALLOC_KIND_HVM1 | ALLOC_KIND_HOC1);
 
     let ctx = Box::new(AllocationContext {
         magic: ALLOCATION_CTX_MAGIC,

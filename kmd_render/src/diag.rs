@@ -593,6 +593,19 @@ pub mod knobs {
     /// H3 still passing. Read at AddAdapter, so `pnputil /restart-device`
     /// applies it with no rebuild.
     pub const HLM1_ONLY: KnobName = KnobName::new(b"Hlm1Only");
+    /// `Hlm1Bar` (default 0 = §17.6's model: HVM1 is NOT BAR-eligible). 1 routes
+    /// an HVM1 allocation's CPU view through the `CpuHostAperture` path instead —
+    /// the mechanism the retirement deletes, and the ONLY one on this driver that
+    /// has ever produced a CPU view aliased to a venus blob (every D3D11
+    /// CpuVisible surface uses it).
+    ///
+    /// The experiment F16 leaves: with the aperture bit dropped, kept, the
+    /// segment's flag word at 0x1C/0x02/0x06, and `AccessedPhysically` on or off,
+    /// `HlRdbk` never stops reading the KMD's own stamp — VidMm gives the guest
+    /// the allocation's SYSTEM backing and expects paging transfers to move
+    /// content, which is a copy and §10.7:1940 forbids one. This knob asks whether
+    /// the path §17.6 deletes is the only one that works.
+    pub const HLM1_BAR: KnobName = KnobName::new(b"Hlm1Bar");
     /// `Hlm1FlagsOff` (default 0 = §10.7's flag set exactly). A MASK of
     /// `Hvm1Placement` bits to CLEAR, because each is a candidate explanation for
     /// VidMm ending the allocation in the aperture rather than HLM1
