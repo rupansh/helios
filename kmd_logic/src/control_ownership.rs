@@ -27,6 +27,11 @@ impl TransportDomainId {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) const fn test_from_raw(raw: u64) -> Result<Self, TransportDomainRefusal> {
+        Self::from_raw(raw)
+    }
+
     pub const fn get(self) -> u64 {
         self.0.get()
     }
@@ -79,6 +84,14 @@ impl TransportEpoch {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) const fn test_from_raw(
+        domain: TransportDomainId,
+        raw: u64,
+    ) -> Result<Self, EpochRefusal> {
+        Self::from_raw(domain, raw)
+    }
+
     pub const fn domain(self) -> TransportDomainId {
         self.domain
     }
@@ -92,6 +105,8 @@ impl TransportEpoch {
 pub struct TransportGeneration {
     epoch: TransportEpoch,
     resource_high_water: u32,
+    context_high_water: u32,
+    attachment_high_water: u64,
 }
 
 impl TransportGeneration {
@@ -99,20 +114,26 @@ impl TransportGeneration {
         Self {
             epoch: TransportEpoch::initial(root.id),
             resource_high_water: 0,
+            context_high_water: 0,
+            attachment_high_water: 0,
         }
     }
 
-    /// Safety: `resource_high_water` covers every ID ever issued in this root's restored
-    /// epoch, and no colliding reservation or lifecycle remains.
+    /// Safety: all high-water values cover every ID issued in this restored epoch,
+    /// and no colliding reservation or lifecycle remains.
     pub const unsafe fn restore(
         root: TransportDomainRoot,
         epoch: u64,
         resource_high_water: u32,
+        context_high_water: u32,
+        attachment_high_water: u64,
     ) -> Result<Self, RefusedTransportRestore> {
         match TransportEpoch::from_raw(root.id, epoch) {
             Ok(epoch) => Ok(Self {
                 epoch,
                 resource_high_water,
+                context_high_water,
+                attachment_high_water,
             }),
             Err(reason) => Err(RefusedTransportRestore { reason, root }),
         }
@@ -124,6 +145,14 @@ impl TransportGeneration {
 
     pub const fn resource_high_water(&self) -> u32 {
         self.resource_high_water
+    }
+
+    pub const fn context_high_water(&self) -> u32 {
+        self.context_high_water
+    }
+
+    pub const fn attachment_high_water(&self) -> u64 {
+        self.attachment_high_water
     }
 
     pub fn allocate_resource(self) -> Result<ResourceAllocation, RefusedResourceAllocation> {
@@ -147,12 +176,117 @@ impl TransportGeneration {
             generation: Self {
                 epoch: self.epoch,
                 resource_high_water: raw,
+                context_high_water: self.context_high_water,
+                attachment_high_water: self.attachment_high_water,
             },
             reservation: ResourceReservation { resource },
         })
     }
 
-    /// Safety: the retired device generation must be torn down and unable to DMA.
+    pub fn allocate_context(self) -> Result<ContextAllocation, RefusedContextAllocation> {
+        let Some(raw) = self.context_high_water.checked_add(1) else {
+            return Err(RefusedContextAllocation {
+                reason: ContextAllocationRefusal::Exhausted,
+                generation: self,
+            });
+        };
+        let Some(id) = NonZeroU32::new(raw) else {
+            return Err(RefusedContextAllocation {
+                reason: ContextAllocationRefusal::Exhausted,
+                generation: self,
+            });
+        };
+        let context = TransportContext {
+            epoch: self.epoch,
+            id,
+        };
+        Ok(ContextAllocation {
+            generation: Self {
+                epoch: self.epoch,
+                resource_high_water: self.resource_high_water,
+                context_high_water: raw,
+                attachment_high_water: self.attachment_high_water,
+            },
+            reservation: ContextReservation { context },
+        })
+    }
+
+    /// Safety: the caller's pointer-bound canonical table proves this pair absent
+    /// and its exact context live, then retains that context, resource association
+    /// custody, and pair uniqueness until the attachment reaches terminal.
+    pub unsafe fn allocate_attachment(
+        self,
+        resource: TransportResource,
+        context: TransportContext,
+    ) -> Result<AttachmentAllocation, RefusedAttachmentAllocation> {
+        if resource.epoch().domain() != self.epoch.domain() {
+            return Err(RefusedAttachmentAllocation {
+                reason: AttachmentAllocationRefusal::ResourceDomainMismatch {
+                    expected: self.epoch.domain(),
+                    found: resource.epoch().domain(),
+                },
+                generation: self,
+            });
+        }
+        if context.epoch().domain() != self.epoch.domain() {
+            return Err(RefusedAttachmentAllocation {
+                reason: AttachmentAllocationRefusal::ContextDomainMismatch {
+                    expected: self.epoch.domain(),
+                    found: context.epoch().domain(),
+                },
+                generation: self,
+            });
+        }
+        if resource.epoch() != self.epoch {
+            return Err(RefusedAttachmentAllocation {
+                reason: AttachmentAllocationRefusal::ResourceEpochMismatch {
+                    expected: self.epoch,
+                    found: resource.epoch(),
+                },
+                generation: self,
+            });
+        }
+        if context.epoch() != self.epoch {
+            return Err(RefusedAttachmentAllocation {
+                reason: AttachmentAllocationRefusal::ContextEpochMismatch {
+                    expected: self.epoch,
+                    found: context.epoch(),
+                },
+                generation: self,
+            });
+        }
+        let Some(raw) = self.attachment_high_water.checked_add(1) else {
+            return Err(RefusedAttachmentAllocation {
+                reason: AttachmentAllocationRefusal::Exhausted,
+                generation: self,
+            });
+        };
+        let Some(instance) = NonZeroU64::new(raw) else {
+            return Err(RefusedAttachmentAllocation {
+                reason: AttachmentAllocationRefusal::Exhausted,
+                generation: self,
+            });
+        };
+        let attachment = TransportAttachment {
+            epoch: resource.epoch,
+            resource_id: resource.id,
+            context_id: context.id,
+            instance,
+        };
+        Ok(AttachmentAllocation {
+            generation: Self {
+                epoch: self.epoch,
+                resource_high_water: self.resource_high_water,
+                context_high_water: self.context_high_water,
+                attachment_high_water: raw,
+            },
+            reservation: AttachmentReservation { attachment },
+        })
+    }
+
+    /// Safety: old-epoch submission admission is irreversibly closed and drained,
+    /// no retained `PreparedControl` can enqueue after this reset is minted, and
+    /// the device cannot DMA.
     pub unsafe fn advance(self) -> Result<TransportAdvance, RefusedTransportAdvance> {
         let Some(raw) = self.epoch.get().checked_add(1) else {
             return Err(RefusedTransportAdvance {
@@ -173,6 +307,8 @@ impl TransportGeneration {
                     generation: epoch,
                 },
                 resource_high_water: 0,
+                context_high_water: 0,
+                attachment_high_water: 0,
             },
             reset: TransportReset {
                 retired: self.epoch,
@@ -246,6 +382,11 @@ impl TransportReset {
     pub const fn retired_epoch(&self) -> TransportEpoch {
         self.retired
     }
+
+    #[cfg(test)]
+    pub(crate) const fn test_for_epoch(retired: TransportEpoch) -> Self {
+        Self { retired }
+    }
 }
 
 #[cfg(test)]
@@ -262,7 +403,10 @@ pub struct TransportResource {
 
 impl TransportResource {
     #[cfg(test)]
-    const fn from_raw(epoch: TransportEpoch, id: u32) -> Result<Self, ResourceIdentityRefusal> {
+    pub(crate) const fn from_raw(
+        epoch: TransportEpoch,
+        id: u32,
+    ) -> Result<Self, ResourceIdentityRefusal> {
         match NonZeroU32::new(id) {
             Some(id) => Ok(Self { epoch, id }),
             None => Err(ResourceIdentityRefusal::Zero),
@@ -330,6 +474,239 @@ pub struct ResourceReservation {
 impl ResourceReservation {
     pub const fn resource(&self) -> TransportResource {
         self.resource
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextIdentityRefusal {
+    Zero,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransportContext {
+    epoch: TransportEpoch,
+    id: NonZeroU32,
+}
+
+impl TransportContext {
+    #[cfg(test)]
+    pub(crate) const fn from_raw(
+        epoch: TransportEpoch,
+        id: u32,
+    ) -> Result<Self, ContextIdentityRefusal> {
+        match NonZeroU32::new(id) {
+            Some(id) => Ok(Self { epoch, id }),
+            None => Err(ContextIdentityRefusal::Zero),
+        }
+    }
+
+    pub const fn epoch(self) -> TransportEpoch {
+        self.epoch
+    }
+
+    pub const fn id(self) -> u32 {
+        self.id.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContextAllocationRefusal {
+    Exhausted,
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct RefusedContextAllocation {
+    reason: ContextAllocationRefusal,
+    generation: TransportGeneration,
+}
+
+impl RefusedContextAllocation {
+    pub const fn reason(&self) -> ContextAllocationRefusal {
+        self.reason
+    }
+
+    pub const fn generation(&self) -> &TransportGeneration {
+        &self.generation
+    }
+
+    pub fn into_generation(self) -> TransportGeneration {
+        self.generation
+    }
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct ContextAllocation {
+    generation: TransportGeneration,
+    reservation: ContextReservation,
+}
+
+impl ContextAllocation {
+    pub const fn context(&self) -> TransportContext {
+        self.reservation.context
+    }
+
+    pub fn into_parts(self) -> (TransportGeneration, ContextReservation) {
+        (self.generation, self.reservation)
+    }
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct ContextReservation {
+    context: TransportContext,
+}
+
+impl ContextReservation {
+    pub const fn context(&self) -> TransportContext {
+        self.context
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AttachmentAllocationRefusal {
+    ResourceDomainMismatch {
+        expected: TransportDomainId,
+        found: TransportDomainId,
+    },
+    ContextDomainMismatch {
+        expected: TransportDomainId,
+        found: TransportDomainId,
+    },
+    ResourceEpochMismatch {
+        expected: TransportEpoch,
+        found: TransportEpoch,
+    },
+    ContextEpochMismatch {
+        expected: TransportEpoch,
+        found: TransportEpoch,
+    },
+    Exhausted,
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct RefusedAttachmentAllocation {
+    reason: AttachmentAllocationRefusal,
+    generation: TransportGeneration,
+}
+
+impl RefusedAttachmentAllocation {
+    pub const fn reason(&self) -> AttachmentAllocationRefusal {
+        self.reason
+    }
+
+    pub const fn generation(&self) -> &TransportGeneration {
+        &self.generation
+    }
+
+    pub fn into_generation(self) -> TransportGeneration {
+        self.generation
+    }
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct AttachmentAllocation {
+    generation: TransportGeneration,
+    reservation: AttachmentReservation,
+}
+
+impl AttachmentAllocation {
+    pub const fn attachment(&self) -> TransportAttachment {
+        self.reservation.attachment
+    }
+
+    pub fn into_parts(self) -> (TransportGeneration, AttachmentReservation) {
+        (self.generation, self.reservation)
+    }
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct AttachmentReservation {
+    attachment: TransportAttachment,
+}
+
+impl AttachmentReservation {
+    pub const fn attachment(&self) -> TransportAttachment {
+        self.attachment
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn test_for_attachment(attachment: TransportAttachment) -> Self {
+        Self { attachment }
+    }
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct AttachmentsClosed {
+    resource: TransportResource,
+}
+
+impl AttachmentsClosed {
+    /// Safety: canonical admission is closed, every creator and secondary pair
+    /// for `resource` is absent, and admission stays closed until resource terminal.
+    pub const unsafe fn new(resource: TransportResource) -> Self {
+        Self { resource }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn test_for_resource(resource: TransportResource) -> Self {
+        Self { resource }
+    }
+
+    pub const fn resource(&self) -> TransportResource {
+        self.resource
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TransportAttachment {
+    epoch: TransportEpoch,
+    resource_id: NonZeroU32,
+    context_id: NonZeroU32,
+    instance: NonZeroU64,
+}
+
+impl TransportAttachment {
+    #[cfg(test)]
+    pub(crate) const fn from_raw(
+        resource: TransportResource,
+        context: TransportContext,
+        instance: NonZeroU64,
+    ) -> Self {
+        Self {
+            epoch: resource.epoch,
+            resource_id: resource.id,
+            context_id: context.id,
+            instance,
+        }
+    }
+
+    pub const fn resource(self) -> TransportResource {
+        TransportResource {
+            epoch: self.epoch,
+            id: self.resource_id,
+        }
+    }
+
+    pub const fn context(self) -> TransportContext {
+        TransportContext {
+            epoch: self.epoch,
+            id: self.context_id,
+        }
+    }
+
+    pub const fn epoch(self) -> TransportEpoch {
+        self.epoch
+    }
+
+    pub const fn instance(self) -> u64 {
+        self.instance.get()
     }
 }
 
@@ -458,6 +835,7 @@ pub enum ControlVerb {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlSubject {
     Resource(TransportResource),
+    Attachment(TransportAttachment),
     Window(TransportWindow),
 }
 
@@ -465,6 +843,7 @@ impl ControlSubject {
     pub const fn epoch(self) -> TransportEpoch {
         match self {
             Self::Resource(resource) => resource.epoch(),
+            Self::Attachment(attachment) => attachment.epoch(),
             Self::Window(window) => window.epoch(),
         }
     }
@@ -484,6 +863,20 @@ pub struct PreparedControl {
 }
 
 impl PreparedControl {
+    pub(crate) const fn from_parts(
+        verb: ControlVerb,
+        subject: ControlSubject,
+        sequence: NonZeroU64,
+    ) -> Self {
+        Self {
+            key: ControlKey {
+                verb,
+                subject,
+                sequence,
+            },
+        }
+    }
+
     pub const fn verb(&self) -> ControlVerb {
         self.key.verb
     }
@@ -651,6 +1044,14 @@ pub enum ResourceRefusal {
         expected: u32,
         found: u32,
     },
+    ContextMismatch {
+        expected: u32,
+        found: u32,
+    },
+    AttachmentInstanceMismatch {
+        expected: u64,
+        found: u64,
+    },
     ResetEpochMismatch {
         expected: TransportEpoch,
         found: TransportEpoch,
@@ -675,6 +1076,10 @@ pub enum ResourceRefusal {
         found: u64,
     },
     ControlSequenceExhausted,
+    MissingAttachment,
+    AttachmentMayBeLive,
+    AttachmentsAlreadyClosed,
+    AttachmentsNotClosed,
     AlreadyTerminal,
     TerminalAuthorityMismatch,
 }
@@ -692,6 +1097,40 @@ pub enum ResourceBeginEffect {
 pub struct ResourceBegin {
     effect: ResourceBeginEffect,
     request: PreparedControl,
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct RefusedResourceAttachBegin {
+    reason: ResourceRefusal,
+    reservation: AttachmentReservation,
+}
+
+impl RefusedResourceAttachBegin {
+    pub const fn reason(&self) -> ResourceRefusal {
+        self.reason
+    }
+
+    pub fn into_reservation(self) -> AttachmentReservation {
+        self.reservation
+    }
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct RefusedAttachmentsClosed {
+    reason: ResourceRefusal,
+    witness: AttachmentsClosed,
+}
+
+impl RefusedAttachmentsClosed {
+    pub const fn reason(&self) -> ResourceRefusal {
+        self.reason
+    }
+
+    pub fn into_witness(self) -> AttachmentsClosed {
+        self.witness
+    }
 }
 
 impl ResourceBegin {
@@ -795,6 +1234,9 @@ impl<T, E> RefusedResourceOutcome<T, E> {
 #[derive(Debug, Eq, PartialEq)]
 pub struct ResourceLifecycle<B> {
     resource: TransportResource,
+    attachment: Option<AttachmentReservation>,
+    attachment_may_be_live: bool,
+    attachments_closed: Option<AttachmentsClosed>,
     phase: ResourcePhase,
     uncertain: bool,
     control_high_water: u64,
@@ -807,6 +1249,9 @@ impl<B> ResourceLifecycle<B> {
     pub const fn new(reservation: ResourceReservation, backing: B) -> Self {
         Self {
             resource: reservation.resource,
+            attachment: None,
+            attachment_may_be_live: false,
+            attachments_closed: None,
             phase: ResourcePhase::Reserved,
             uncertain: false,
             control_high_water: 0,
@@ -818,6 +1263,21 @@ impl<B> ResourceLifecycle<B> {
 
     pub const fn resource(&self) -> TransportResource {
         self.resource
+    }
+
+    pub const fn attachment(&self) -> Option<TransportAttachment> {
+        match self.attachment.as_ref() {
+            Some(reservation) => Some(reservation.attachment),
+            None => None,
+        }
+    }
+
+    pub const fn attachment_may_be_live(&self) -> bool {
+        self.attachment_may_be_live
+    }
+
+    pub const fn attachments_are_closed(&self) -> bool {
+        self.attachments_closed.is_some()
     }
 
     pub const fn phase(&self) -> ResourcePhase {
@@ -837,7 +1297,8 @@ impl<B> ResourceLifecycle<B> {
         resource: TransportResource,
     ) -> Result<ResourceBegin, ResourceRefusal> {
         self.check_begin(resource, ResourceOperation::Create, ResourcePhase::Reserved)?;
-        let request = self.mint_control(ControlVerb::Create)?;
+        let request =
+            self.mint_control(ControlVerb::Create, ControlSubject::Resource(self.resource))?;
         self.phase = ResourcePhase::CreatePending;
         Ok(ResourceBegin {
             effect: ResourceBeginEffect::CreateStarted,
@@ -893,10 +1354,48 @@ impl<B> ResourceLifecycle<B> {
 
     pub fn begin_attach(
         &mut self,
-        resource: TransportResource,
-    ) -> Result<ResourceBegin, ResourceRefusal> {
-        self.check_begin(resource, ResourceOperation::Attach, ResourcePhase::Created)?;
-        let request = self.mint_control(ControlVerb::Attach)?;
+        reservation: AttachmentReservation,
+    ) -> Result<ResourceBegin, RefusedResourceAttachBegin> {
+        let attachment = reservation.attachment;
+        if let Err(reason) = self.check_resource(attachment.resource()) {
+            return Err(RefusedResourceAttachBegin {
+                reason,
+                reservation,
+            });
+        }
+        if self.phase == ResourcePhase::Terminal {
+            return Err(RefusedResourceAttachBegin {
+                reason: ResourceRefusal::AlreadyTerminal,
+                reservation,
+            });
+        }
+        if self.attachments_closed.is_some() {
+            return Err(RefusedResourceAttachBegin {
+                reason: ResourceRefusal::AttachmentsAlreadyClosed,
+                reservation,
+            });
+        }
+        if self.phase != ResourcePhase::Created {
+            return Err(RefusedResourceAttachBegin {
+                reason: ResourceRefusal::WrongPhase {
+                    operation: ResourceOperation::Attach,
+                    phase: self.phase,
+                },
+                reservation,
+            });
+        }
+        let request =
+            match self.mint_control(ControlVerb::Attach, ControlSubject::Attachment(attachment)) {
+                Ok(request) => request,
+                Err(reason) => {
+                    return Err(RefusedResourceAttachBegin {
+                        reason,
+                        reservation,
+                    });
+                }
+            };
+        self.attachment = Some(reservation);
+        self.attachment_may_be_live = true;
         self.phase = ResourcePhase::AttachPending;
         Ok(ResourceBegin {
             effect: ResourceBeginEffect::AttachStarted,
@@ -920,6 +1419,7 @@ impl<B> ResourceLifecycle<B> {
 
         let effect = match completion.outcome {
             ControlOutcome::DefiniteNotEnqueued(error) => {
+                self.attachment_may_be_live = false;
                 ResourceFinishEffect::AttachDefiniteNotEnqueued(error)
             }
             ControlOutcome::Completed(Ok(())) => {
@@ -930,6 +1430,7 @@ impl<B> ResourceLifecycle<B> {
                 });
             }
             ControlOutcome::Completed(Err(status)) => {
+                self.attachment_may_be_live = false;
                 ResourceFinishEffect::AttachHostRejected(status)
             }
             ControlOutcome::Ambiguous(abandoned) => {
@@ -946,10 +1447,30 @@ impl<B> ResourceLifecycle<B> {
 
     pub fn begin_detach(
         &mut self,
-        resource: TransportResource,
+        attachment: TransportAttachment,
     ) -> Result<ResourceBegin, ResourceRefusal> {
-        self.check_begin(resource, ResourceOperation::Detach, ResourcePhase::Live)?;
-        let request = self.mint_control(ControlVerb::Detach)?;
+        self.check_resource(attachment.resource())?;
+        if self.phase == ResourcePhase::Terminal {
+            return Err(ResourceRefusal::AlreadyTerminal);
+        }
+        if !matches!(
+            self.phase,
+            ResourcePhase::Live | ResourcePhase::RetirementRequired
+        ) {
+            return Err(ResourceRefusal::WrongPhase {
+                operation: ResourceOperation::Detach,
+                phase: self.phase,
+            });
+        }
+        self.check_attachment(attachment)?;
+        if !self.attachment_may_be_live {
+            return Err(ResourceRefusal::WrongPhase {
+                operation: ResourceOperation::Detach,
+                phase: self.phase,
+            });
+        }
+        let request =
+            self.mint_control(ControlVerb::Detach, ControlSubject::Attachment(attachment))?;
         self.phase = ResourcePhase::DetachPending;
         Ok(ResourceBegin {
             effect: ResourceBeginEffect::DetachStarted,
@@ -976,6 +1497,7 @@ impl<B> ResourceLifecycle<B> {
                 ResourceFinishEffect::DetachDefiniteNotEnqueued(error)
             }
             ControlOutcome::Completed(Ok(())) => {
+                self.attachment_may_be_live = false;
                 self.phase = ResourcePhase::Detached;
                 return Ok(ResourceFinish {
                     effect: ResourceFinishEffect::DetachCompleted,
@@ -1005,6 +1527,12 @@ impl<B> ResourceLifecycle<B> {
         if self.phase == ResourcePhase::Terminal {
             return Err(ResourceRefusal::AlreadyTerminal);
         }
+        if self.attachment_may_be_live {
+            return Err(ResourceRefusal::AttachmentMayBeLive);
+        }
+        if self.attachments_closed.is_none() {
+            return Err(ResourceRefusal::AttachmentsNotClosed);
+        }
         if !matches!(
             self.phase,
             ResourcePhase::Created
@@ -1017,12 +1545,39 @@ impl<B> ResourceLifecycle<B> {
                 phase: self.phase,
             });
         }
-        let request = self.mint_control(ControlVerb::Unref)?;
+        let request =
+            self.mint_control(ControlVerb::Unref, ControlSubject::Resource(self.resource))?;
         self.phase = ResourcePhase::UnrefPending;
         Ok(ResourceBegin {
             effect: ResourceBeginEffect::UnrefStarted,
             request,
         })
+    }
+
+    pub fn install_attachments_closed(
+        &mut self,
+        witness: AttachmentsClosed,
+    ) -> Result<(), RefusedAttachmentsClosed> {
+        let reason = self
+            .check_resource(witness.resource)
+            .and_then(|()| {
+                if self.phase == ResourcePhase::Terminal {
+                    Err(ResourceRefusal::AlreadyTerminal)
+                } else if self.attachment_may_be_live {
+                    Err(ResourceRefusal::AttachmentMayBeLive)
+                } else if self.attachments_closed.is_some() {
+                    Err(ResourceRefusal::AttachmentsAlreadyClosed)
+                } else {
+                    Ok(())
+                }
+            })
+            .err();
+        if let Some(reason) = reason {
+            return Err(RefusedAttachmentsClosed { reason, witness });
+        }
+        self.attachment = None;
+        self.attachments_closed = Some(witness);
+        Ok(())
     }
 
     pub fn finish_unref<E>(
@@ -1193,9 +1748,7 @@ impl<B> ResourceLifecycle<B> {
                 found: found_epoch,
             });
         }
-        if completion.key.subject != pending.subject {
-            return Err(ResourceRefusal::ControlSubjectMismatch);
-        }
+        self.check_control_subject(pending.subject, completion.key.subject)?;
         if completion.key.verb != pending.verb {
             return Err(ResourceRefusal::ControlVerbMismatch {
                 expected: pending.verb,
@@ -1211,7 +1764,11 @@ impl<B> ResourceLifecycle<B> {
         Ok(())
     }
 
-    fn mint_control(&mut self, verb: ControlVerb) -> Result<PreparedControl, ResourceRefusal> {
+    fn mint_control(
+        &mut self,
+        verb: ControlVerb,
+        subject: ControlSubject,
+    ) -> Result<PreparedControl, ResourceRefusal> {
         if self.pending.is_some() {
             return Err(ResourceRefusal::ControlAlreadyPending);
         }
@@ -1223,7 +1780,7 @@ impl<B> ResourceLifecycle<B> {
         };
         let key = ControlKey {
             verb,
-            subject: ControlSubject::Resource(self.resource),
+            subject,
             sequence,
         };
         self.control_high_water = raw;
@@ -1253,8 +1810,64 @@ impl<B> ResourceLifecycle<B> {
         Ok(())
     }
 
+    fn check_attachment(&self, attachment: TransportAttachment) -> Result<(), ResourceRefusal> {
+        self.check_resource(attachment.resource())?;
+        let Some(expected) = self.attachment.as_ref() else {
+            return Err(ResourceRefusal::MissingAttachment);
+        };
+        let expected = expected.attachment;
+        if attachment.context().id() != expected.context().id() {
+            return Err(ResourceRefusal::ContextMismatch {
+                expected: expected.context().id(),
+                found: attachment.context().id(),
+            });
+        }
+        if attachment.instance() != expected.instance() {
+            return Err(ResourceRefusal::AttachmentInstanceMismatch {
+                expected: expected.instance(),
+                found: attachment.instance(),
+            });
+        }
+        Ok(())
+    }
+
+    fn check_control_subject(
+        &self,
+        expected: ControlSubject,
+        found: ControlSubject,
+    ) -> Result<(), ResourceRefusal> {
+        match (expected, found) {
+            (ControlSubject::Attachment(expected), ControlSubject::Attachment(found)) => {
+                self.check_resource(found.resource())?;
+                if found.resource().id() != expected.resource().id() {
+                    return Err(ResourceRefusal::ResourceMismatch {
+                        expected: expected.resource().id(),
+                        found: found.resource().id(),
+                    });
+                }
+                if found.context().id() != expected.context().id() {
+                    return Err(ResourceRefusal::ContextMismatch {
+                        expected: expected.context().id(),
+                        found: found.context().id(),
+                    });
+                }
+                if found.instance() != expected.instance() {
+                    return Err(ResourceRefusal::AttachmentInstanceMismatch {
+                        expected: expected.instance(),
+                        found: found.instance(),
+                    });
+                }
+                Ok(())
+            }
+            _ if expected == found => Ok(()),
+            _ => Err(ResourceRefusal::ControlSubjectMismatch),
+        }
+    }
+
     fn terminalize(&mut self, authority: DestroyAuthorityKind) {
         self.phase = ResourcePhase::Terminal;
+        self.attachment_may_be_live = false;
+        self.attachments_closed = None;
         self.pending = None;
         self.terminal_authority = Some(authority);
     }
@@ -1921,6 +2534,33 @@ mod tests {
         TransportResource::from_raw(epoch, id).unwrap()
     }
 
+    fn context(epoch: TransportEpoch, id: u32) -> TransportContext {
+        TransportContext::from_raw(epoch, id).unwrap()
+    }
+
+    fn attachment(resource: TransportResource, context_id: u32) -> TransportAttachment {
+        attachment_with_instance(resource, context_id, 1)
+    }
+
+    fn attachment_with_instance(
+        resource: TransportResource,
+        context_id: u32,
+        instance: u64,
+    ) -> TransportAttachment {
+        TransportAttachment::from_raw(
+            resource,
+            context(resource.epoch(), context_id),
+            NonZeroU64::new(instance).unwrap(),
+        )
+    }
+
+    fn attachment_reservation(
+        resource: TransportResource,
+        context_id: u32,
+    ) -> AttachmentReservation {
+        AttachmentReservation::test_for_attachment(attachment(resource, context_id))
+    }
+
     fn window(resource: TransportResource, offset: u64) -> TransportWindow {
         TransportWindow::new(resource, offset, 0x1000).unwrap()
     }
@@ -1933,11 +2573,19 @@ mod tests {
         TransportGeneration {
             epoch: self::epoch(epoch),
             resource_high_water: high_water,
+            context_high_water: 0,
+            attachment_high_water: 0,
         }
     }
 
     fn resource_lifecycle<B>(resource: TransportResource, backing: B) -> ResourceLifecycle<B> {
         ResourceLifecycle::new(ResourceReservation { resource }, backing)
+    }
+
+    fn close_attachments<B>(lifecycle: &mut ResourceLifecycle<B>, resource: TransportResource) {
+        // SAFETY: each call site owns the full test table and has no live pair.
+        let witness = unsafe { AttachmentsClosed::new(resource) };
+        lifecycle.install_attachments_closed(witness).unwrap();
     }
 
     fn window_admission<R>(
@@ -1948,9 +2596,7 @@ mod tests {
     }
 
     fn reset_authority(retired: TransportEpoch) -> TransportReset {
-        let generation = generation(retired.get(), 0);
-        let (_, reset) = unsafe { generation.advance().unwrap() }.into_parts();
-        reset
+        TransportReset::test_for_epoch(retired)
     }
 
     fn outcome(
@@ -2014,7 +2660,9 @@ mod tests {
 
     fn live(resource: TransportResource) -> ResourceLifecycle<()> {
         let mut lifecycle = created(resource);
-        let begin = lifecycle.begin_attach(resource).unwrap();
+        let begin = lifecycle
+            .begin_attach(attachment_reservation(resource, 1))
+            .unwrap();
         assert_eq!(begin.effect(), ResourceBeginEffect::AttachStarted);
         let finish = lifecycle
             .finish_attach(completed_ok::<u8>(begin.into_request()))
@@ -2058,12 +2706,14 @@ mod tests {
         assert_eq!(next.reset().retired_epoch().get(), 2);
         assert_eq!(next.generation().epoch().domain(), domain(ROOT_DOMAIN));
 
-        let refusal = unsafe { TransportGeneration::restore(root(0x101), 0, 7).unwrap_err() };
+        let refusal = unsafe { TransportGeneration::restore(root(0x101), 0, 7, 8, 9).unwrap_err() };
         assert_eq!(refusal.reason(), EpochRefusal::Zero);
         assert_eq!(refusal.into_root().id().get(), 0x101);
-        let restored = unsafe { TransportGeneration::restore(root(0x102), 9, 7).unwrap() };
+        let restored = unsafe { TransportGeneration::restore(root(0x102), 9, 7, 8, 9).unwrap() };
         assert_eq!(restored.epoch(), epoch_in_domain(0x102, 9));
         assert_eq!(restored.resource_high_water(), 7);
+        assert_eq!(restored.context_high_water(), 8);
+        assert_eq!(restored.attachment_high_water(), 9);
         let exhausted = generation(u64::MAX, 7);
         let refusal = unsafe { exhausted.advance().unwrap_err() };
         assert_eq!(refusal.reason(), EpochRefusal::Exhausted);
@@ -2091,6 +2741,117 @@ mod tests {
         assert_eq!(refusal.reason(), ResourceAllocationRefusal::Exhausted);
         assert_eq!(refusal.generation().resource_high_water(), u32::MAX);
         assert_eq!(refusal.into_generation().epoch(), epoch(9));
+
+        assert_eq!(
+            TransportContext::from_raw(epoch(9), 0),
+            Err(ContextIdentityRefusal::Zero)
+        );
+        let allocation = generation(9, 7).allocate_context().unwrap();
+        assert_eq!(allocation.context().id(), 1);
+        let (active_generation, _) = allocation.into_parts();
+        assert_eq!(active_generation.resource_high_water(), 7);
+        assert_eq!(active_generation.context_high_water(), 1);
+        let exhausted = TransportGeneration {
+            epoch: epoch(9),
+            resource_high_water: 7,
+            context_high_water: u32::MAX - 1,
+            attachment_high_water: 11,
+        };
+        let allocation = exhausted.allocate_context().unwrap();
+        assert_eq!(allocation.context().id(), u32::MAX);
+        let (exhausted, _) = allocation.into_parts();
+        let refusal = exhausted.allocate_context().unwrap_err();
+        assert_eq!(refusal.reason(), ContextAllocationRefusal::Exhausted);
+        assert_eq!(refusal.generation().context_high_water(), u32::MAX);
+        assert_eq!(refusal.into_generation().attachment_high_water(), 11);
+
+        let allocation = generation(10, 0).allocate_resource().unwrap();
+        let current_resource = allocation.resource();
+        let (active_generation, _) = allocation.into_parts();
+        let allocation = active_generation.allocate_context().unwrap();
+        let current_context = allocation.context();
+        let (active_generation, _) = allocation.into_parts();
+        // SAFETY: this test owns the empty canonical table and retains the context.
+        let allocation =
+            unsafe { active_generation.allocate_attachment(current_resource, current_context) }
+                .unwrap();
+        let first = allocation.attachment();
+        let (active_generation, first_reservation) = allocation.into_parts();
+        let allocation = active_generation.allocate_resource().unwrap();
+        let second_resource = allocation.resource();
+        let (active_generation, _) = allocation.into_parts();
+        // SAFETY: this distinct pair is absent and the same live context is retained.
+        let allocation =
+            unsafe { active_generation.allocate_attachment(second_resource, current_context) }
+                .unwrap();
+        let second = allocation.attachment();
+        let (active_generation, second_reservation) = allocation.into_parts();
+        assert_ne!(first.resource(), second.resource());
+        assert_eq!(first.context(), second.context());
+        assert_eq!(first.instance(), 1);
+        assert_eq!(second.instance(), 2);
+
+        let foreign_resource = resource(epoch_in_domain(TEST_DOMAIN + 1, 10), 1);
+        // SAFETY: domain validation rejects this before canonical admission.
+        let refusal =
+            unsafe { active_generation.allocate_attachment(foreign_resource, current_context) }
+                .unwrap_err();
+        assert_eq!(
+            refusal.reason(),
+            AttachmentAllocationRefusal::ResourceDomainMismatch {
+                expected: current_resource.epoch().domain(),
+                found: foreign_resource.epoch().domain(),
+            }
+        );
+        let active_generation = refusal.into_generation();
+        assert_eq!(active_generation.attachment_high_water(), 2);
+        let stale_context = context(epoch(11), 1);
+        // SAFETY: epoch validation rejects this before canonical admission.
+        let refusal =
+            unsafe { active_generation.allocate_attachment(current_resource, stale_context) }
+                .unwrap_err();
+        assert_eq!(
+            refusal.reason(),
+            AttachmentAllocationRefusal::ContextEpochMismatch {
+                expected: current_resource.epoch(),
+                found: stale_context.epoch(),
+            }
+        );
+
+        let max_resource = resource(current_resource.epoch(), 3);
+        let next_resource = resource(current_resource.epoch(), 4);
+        let max_context = context(current_resource.epoch(), 2);
+        let exhausted = TransportGeneration {
+            epoch: current_resource.epoch(),
+            resource_high_water: 4,
+            context_high_water: 2,
+            attachment_high_water: u64::MAX - 1,
+        };
+        // SAFETY: this distinct pair is absent and its test context stays retained.
+        let allocation =
+            unsafe { exhausted.allocate_attachment(max_resource, max_context) }.unwrap();
+        assert_eq!(allocation.attachment().instance(), u64::MAX);
+        let (exhausted, max_reservation) = allocation.into_parts();
+        // SAFETY: this other pair is absent; issuance fails before creating its row.
+        let refusal =
+            unsafe { exhausted.allocate_attachment(next_resource, max_context) }.unwrap_err();
+        assert_eq!(refusal.reason(), AttachmentAllocationRefusal::Exhausted);
+        assert_eq!(refusal.generation().attachment_high_water(), u64::MAX);
+        let _exhausted = refusal.into_generation();
+        let retired = TransportGeneration {
+            epoch: current_resource.epoch(),
+            resource_high_water: 4,
+            context_high_water: 2,
+            attachment_high_water: u64::MAX,
+        };
+        // SAFETY: this synthetic old epoch is admission-closed, drained, and DMA-dead.
+        let advance = unsafe { retired.advance().unwrap() };
+        assert_eq!(advance.generation().resource_high_water(), 0);
+        assert_eq!(advance.generation().context_high_water(), 0);
+        assert_eq!(advance.generation().attachment_high_water(), 0);
+        drop(first_reservation);
+        drop(second_reservation);
+        drop(max_reservation);
     }
 
     #[test]
@@ -2209,7 +2970,10 @@ mod tests {
         let resource = resource(epoch, 2);
         for case in OUTCOMES {
             let mut lifecycle = created(resource);
-            let request = lifecycle.begin_attach(resource).unwrap().into_request();
+            let request = lifecycle
+                .begin_attach(attachment_reservation(resource, 1))
+                .unwrap()
+                .into_request();
             let finish = lifecycle
                 .finish_attach(outcome(case, request, epoch))
                 .unwrap();
@@ -2239,12 +3003,74 @@ mod tests {
     }
 
     #[test]
+    fn creator_attachment_provenance_rejects_foreign_pair_instances_recoverably() {
+        let epoch = epoch(121);
+        let other_resource = resource(epoch, 3);
+        let resource = resource(epoch, 2);
+        let mut lifecycle = created(resource);
+
+        let wrong_reservation =
+            AttachmentReservation::test_for_attachment(attachment(other_resource, 1));
+        let refusal = lifecycle.begin_attach(wrong_reservation).unwrap_err();
+        assert_eq!(
+            refusal.reason(),
+            ResourceRefusal::ResourceMismatch {
+                expected: resource.id(),
+                found: other_resource.id(),
+            }
+        );
+        assert_eq!(
+            refusal.into_reservation().attachment().resource(),
+            other_resource
+        );
+
+        let creator = attachment_with_instance(resource, 1, 1);
+        let foreign_instance = attachment_with_instance(resource, 1, 2);
+        let reservation = AttachmentReservation::test_for_attachment(creator);
+        let request = lifecycle.begin_attach(reservation).unwrap().into_request();
+        let foreign = PreparedControl::from_parts(
+            ControlVerb::Attach,
+            ControlSubject::Attachment(foreign_instance),
+            NonZeroU64::new(request.sequence()).unwrap(),
+        );
+        let refusal = lifecycle
+            .finish_attach(completed_ok::<u8>(foreign))
+            .unwrap_err();
+        assert_eq!(
+            refusal.reason(),
+            ResourceRefusal::AttachmentInstanceMismatch {
+                expected: creator.instance(),
+                found: foreign_instance.instance(),
+            }
+        );
+        drop(refusal.into_completion());
+        assert_eq!(lifecycle.phase(), ResourcePhase::AttachPending);
+        let _ = lifecycle
+            .finish_attach(completed_ok::<u8>(request))
+            .unwrap();
+
+        assert_eq!(
+            lifecycle.begin_detach(foreign_instance),
+            Err(ResourceRefusal::AttachmentInstanceMismatch {
+                expected: creator.instance(),
+                found: foreign_instance.instance(),
+            })
+        );
+        let detach = lifecycle.begin_detach(creator).unwrap().into_request();
+        let _ = lifecycle.finish_detach(completed_ok::<u8>(detach)).unwrap();
+        assert!(!lifecycle.attachment_may_be_live());
+    }
+
+    #[test]
     fn detach_outcome_matrix_never_authorizes_backing_destruction() {
         let epoch = epoch(13);
         let resource = resource(epoch, 3);
         for case in OUTCOMES {
             let mut lifecycle = live(resource);
-            let request = lifecycle.begin_detach(resource).unwrap().into_request();
+            let request = lifecycle
+                .begin_detach(attachment(resource, 1))
+                .unwrap()
+                .into_request();
             let finish = lifecycle
                 .finish_detach(outcome(case, request, epoch))
                 .unwrap();
@@ -2279,6 +3105,7 @@ mod tests {
         let resource = resource(epoch, 4);
         for case in OUTCOMES {
             let mut lifecycle = created(resource);
+            close_attachments(&mut lifecycle, resource);
             let request = lifecycle.begin_unref(resource).unwrap().into_request();
             let finish = lifecycle
                 .finish_unref(outcome(case, request, epoch))
@@ -2312,17 +3139,118 @@ mod tests {
     }
 
     #[test]
-    fn live_resource_can_retire_directly_through_completed_unref() {
+    fn attachments_closed_is_required_resource_bound_and_closes_admission() {
+        let epoch = epoch(140);
+        let foreign_resource = resource(epoch, 2);
+        let resource = resource(epoch, 1);
+        let mut lifecycle = created(resource);
+
+        assert_eq!(
+            lifecycle.begin_unref(resource),
+            Err(ResourceRefusal::AttachmentsNotClosed)
+        );
+
+        let foreign = AttachmentsClosed::test_for_resource(foreign_resource);
+        let refusal = lifecycle.install_attachments_closed(foreign).unwrap_err();
+        assert_eq!(
+            refusal.reason(),
+            ResourceRefusal::ResourceMismatch {
+                expected: resource.id(),
+                found: foreign_resource.id(),
+            }
+        );
+        assert_eq!(refusal.into_witness().resource(), foreign_resource);
+
+        // SAFETY: this test has closed admission and its canonical pair table is empty.
+        let witness = unsafe { AttachmentsClosed::new(resource) };
+        lifecycle.install_attachments_closed(witness).unwrap();
+        assert!(lifecycle.attachments_are_closed());
+
+        let duplicate = AttachmentsClosed::test_for_resource(resource);
+        let refusal = lifecycle.install_attachments_closed(duplicate).unwrap_err();
+        assert_eq!(refusal.reason(), ResourceRefusal::AttachmentsAlreadyClosed);
+        assert_eq!(refusal.into_witness().resource(), resource);
+
+        let reservation = attachment_reservation(resource, 1);
+        let attachment = reservation.attachment();
+        let refusal = lifecycle.begin_attach(reservation).unwrap_err();
+        assert_eq!(refusal.reason(), ResourceRefusal::AttachmentsAlreadyClosed);
+        assert_eq!(refusal.into_reservation().attachment(), attachment);
+
+        let request = lifecycle.begin_unref(resource).unwrap().into_request();
+        let finish = lifecycle.finish_unref(completed_ok::<u8>(request)).unwrap();
+        let (_, Some(authority)) = finish.into_parts() else {
+            panic!("completed UNREF must authorize destruction");
+        };
+        assert_eq!(lifecycle.consume_terminal(authority), Ok(()));
+    }
+
+    #[test]
+    fn creator_may_live_refuses_close_and_unref_retry_retains_witness() {
+        let epoch = epoch(142);
+        let resource = resource(epoch, 1);
+        let mut lifecycle = live(resource);
+
+        let forged = AttachmentsClosed::test_for_resource(resource);
+        let refusal = lifecycle.install_attachments_closed(forged).unwrap_err();
+        assert_eq!(refusal.reason(), ResourceRefusal::AttachmentMayBeLive);
+        assert_eq!(refusal.into_witness().resource(), resource);
+        assert_eq!(
+            lifecycle.begin_unref(resource),
+            Err(ResourceRefusal::AttachmentMayBeLive)
+        );
+
+        let request = lifecycle
+            .begin_detach(attachment(resource, 1))
+            .unwrap()
+            .into_request();
+        let _ = lifecycle
+            .finish_detach(completed_ok::<u8>(request))
+            .unwrap();
+        // SAFETY: exact DETACH removed the only row after test admission closed.
+        let witness = unsafe { AttachmentsClosed::new(resource) };
+        lifecycle.install_attachments_closed(witness).unwrap();
+
+        let request = lifecycle.begin_unref(resource).unwrap().into_request();
+        let finish = lifecycle
+            .finish_unref(ambiguous::<u8>(request, epoch, AbandonReason::Timeout))
+            .unwrap();
+        assert_eq!(
+            finish.effect(),
+            &ResourceFinishEffect::UnrefAmbiguous(AbandonReason::Timeout)
+        );
+        assert!(lifecycle.attachments_are_closed());
+
+        let request = lifecycle.begin_unref(resource).unwrap().into_request();
+        let finish = lifecycle.finish_unref(completed_ok::<u8>(request)).unwrap();
+        let (_, Some(authority)) = finish.into_parts() else {
+            panic!("exact UNREF retry must authorize destruction");
+        };
+        assert_eq!(lifecycle.consume_terminal(authority), Ok(()));
+    }
+
+    #[test]
+    fn live_resource_requires_exact_detach_before_unref() {
         let epoch = epoch(141);
         let resource = resource(epoch, 1);
         let mut lifecycle = live(resource);
+        assert_eq!(
+            lifecycle.begin_unref(resource),
+            Err(ResourceRefusal::AttachmentMayBeLive)
+        );
+        let detach = lifecycle
+            .begin_detach(attachment(resource, 1))
+            .unwrap()
+            .into_request();
+        let _ = lifecycle.finish_detach(completed_ok::<u8>(detach)).unwrap();
+        close_attachments(&mut lifecycle, resource);
         let begin = lifecycle.begin_unref(resource).unwrap();
         assert_eq!(begin.effect(), ResourceBeginEffect::UnrefStarted);
         let finish = lifecycle
             .finish_unref(completed_ok::<u8>(begin.into_request()))
             .unwrap();
         let (_, Some(authority)) = finish.into_parts() else {
-            panic!("completed UNREF must authorize destruction from Live");
+            panic!("completed UNREF must authorize destruction after DETACH");
         };
         assert_eq!(authority.authority(), DestroyAuthorityKind::UnrefCompleted);
         assert_eq!(lifecycle.consume_terminal(authority), Ok(()));
@@ -2337,7 +3265,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_unref_terminalizes_after_every_prior_ambiguity() {
+    fn attachment_ambiguity_requires_exact_detach_before_unref() {
         let epoch = epoch(15);
         for (index, prior) in [
             PriorAmbiguity::Create,
@@ -2360,7 +3288,10 @@ mod tests {
                 }
                 PriorAmbiguity::Attach => {
                     let mut state = created(resource);
-                    let request = state.begin_attach(resource).unwrap().into_request();
+                    let request = state
+                        .begin_attach(attachment_reservation(resource, 1))
+                        .unwrap()
+                        .into_request();
                     let _ = state
                         .finish_attach(ambiguous::<u8>(request, epoch, AbandonReason::NotOurs))
                         .unwrap();
@@ -2368,7 +3299,10 @@ mod tests {
                 }
                 PriorAmbiguity::Detach => {
                     let mut state = live(resource);
-                    let request = state.begin_detach(resource).unwrap().into_request();
+                    let request = state
+                        .begin_detach(attachment(resource, 1))
+                        .unwrap()
+                        .into_request();
                     let _ = state
                         .finish_detach(ambiguous::<u8>(
                             request,
@@ -2380,6 +3314,7 @@ mod tests {
                 }
                 PriorAmbiguity::Unref => {
                     let mut state = created(resource);
+                    close_attachments(&mut state, resource);
                     let request = state.begin_unref(resource).unwrap().into_request();
                     let _ = state
                         .finish_unref(ambiguous::<u8>(request, epoch, AbandonReason::Timeout))
@@ -2388,6 +3323,21 @@ mod tests {
                 }
             };
             assert!(lifecycle.is_uncertain());
+            if matches!(prior, PriorAmbiguity::Attach | PriorAmbiguity::Detach) {
+                assert!(lifecycle.attachment_may_be_live());
+                assert_eq!(
+                    lifecycle.begin_unref(resource),
+                    Err(ResourceRefusal::AttachmentMayBeLive)
+                );
+                let detach = lifecycle
+                    .begin_detach(attachment(resource, 1))
+                    .unwrap()
+                    .into_request();
+                let _ = lifecycle.finish_detach(completed_ok::<u8>(detach)).unwrap();
+            }
+            if !lifecycle.attachments_are_closed() {
+                close_attachments(&mut lifecycle, resource);
+            }
             let request = lifecycle.begin_unref(resource).unwrap().into_request();
             let finish = lifecycle.finish_unref(completed_ok::<u8>(request)).unwrap();
             let (_, Some(authority)) = finish.into_parts() else {
@@ -2411,16 +3361,21 @@ mod tests {
             ResourcePhase::Created => return created(resource),
             ResourcePhase::AttachPending => {
                 lifecycle = created(resource);
-                let _pending = lifecycle.begin_attach(resource).unwrap();
+                let _pending = lifecycle
+                    .begin_attach(attachment_reservation(resource, 1))
+                    .unwrap();
             }
             ResourcePhase::Live => return live(resource),
             ResourcePhase::DetachPending => {
                 lifecycle = live(resource);
-                let _pending = lifecycle.begin_detach(resource).unwrap();
+                let _pending = lifecycle.begin_detach(attachment(resource, 1)).unwrap();
             }
             ResourcePhase::Detached => {
                 lifecycle = live(resource);
-                let request = lifecycle.begin_detach(resource).unwrap().into_request();
+                let request = lifecycle
+                    .begin_detach(attachment(resource, 1))
+                    .unwrap()
+                    .into_request();
                 let _ = lifecycle
                     .finish_detach(completed_ok::<u8>(request))
                     .unwrap();
@@ -2437,6 +3392,7 @@ mod tests {
             }
             ResourcePhase::UnrefPending => {
                 lifecycle = created(resource);
+                close_attachments(&mut lifecycle, resource);
                 let _pending = lifecycle.begin_unref(resource).unwrap();
             }
             ResourcePhase::Terminal => panic!("terminal is tested as reset replay"),
@@ -2596,7 +3552,10 @@ mod tests {
         let _ = lifecycle
             .finish_create(completed_ok::<u8>(request))
             .unwrap();
-        let request = lifecycle.begin_attach(resource).unwrap().into_request();
+        let request = lifecycle
+            .begin_attach(attachment_reservation(resource, 1))
+            .unwrap()
+            .into_request();
         let _ = lifecycle
             .finish_attach(ambiguous::<u8>(
                 request,
@@ -2605,6 +3564,20 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(drops.get(), 0);
+
+        assert_eq!(
+            lifecycle.begin_unref(resource),
+            Err(ResourceRefusal::AttachmentMayBeLive)
+        );
+        let request = lifecycle
+            .begin_detach(attachment(resource, 1))
+            .unwrap()
+            .into_request();
+        let _ = lifecycle
+            .finish_detach(completed_ok::<u8>(request))
+            .unwrap();
+
+        close_attachments(&mut lifecycle, resource);
 
         let request = lifecycle.begin_unref(resource).unwrap().into_request();
         let _ = lifecycle
@@ -3039,8 +4012,10 @@ mod tests {
         let _ = a.finish_create(completion_a).unwrap();
         let _ = b.finish_create(completed_ok::<u8>(request_b)).unwrap();
 
-        let (_, reset_a) = unsafe { generation_a.advance().unwrap() }.into_parts();
-        let (_, reset_b) = unsafe { generation_b.advance().unwrap() }.into_parts();
+        drop(generation_a);
+        drop(generation_b);
+        let reset_a = TransportReset::test_for_epoch(resource_a.epoch());
+        let reset_b = TransportReset::test_for_epoch(resource_b.epoch());
         assert_eq!(
             b.transport_reset(resource_b, &reset_a),
             Err(ResourceRefusal::ResetDomainMismatch {
