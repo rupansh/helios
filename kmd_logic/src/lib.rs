@@ -25,6 +25,7 @@
 
 #![no_std]
 
+pub mod committed_mode;
 pub mod direct_scanout_admission;
 pub mod direct_scanout_lifetime;
 
