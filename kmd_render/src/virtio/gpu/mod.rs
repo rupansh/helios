@@ -38,7 +38,7 @@
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -455,15 +455,36 @@ const NOTIFICATION_EVENT: i32 = 0;
 /// `IO_NO_INCREMENT` priority boost for `KeSetEvent`.
 const IO_NO_INCREMENT: i32 = 0;
 
+/// Exact terminal cause published to one synchronous or fence waiter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum WaitDisposition {
+    Pending = 0,
+    HostResponseCopied = 1,
+    FenceCompleted = 2,
+    TransportAborted = 3,
+}
+
+impl WaitDisposition {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            0 => Self::Pending,
+            1 => Self::HostResponseCopied,
+            2 => Self::FenceCompleted,
+            3 => Self::TransportAborted,
+            _ => Self::TransportAborted,
+        }
+    }
+}
+
 /// A PASSIVE waiter's completion block. Lives on the waiter's stack; the
 /// registered pointer stays valid because the waiter ALWAYS deregisters (or
 /// observes completion) under the device spinlock before returning.
 pub struct SyncWaitBlock {
     /// Signaled (under the device spinlock) when the entry completes.
     pub event: KEVENT,
-    /// Set (Release) before the event is signaled; the waiter reads it
-    /// (Acquire) after the wait / under the lock.
-    done: AtomicBool,
+    /// First terminal disposition, Release-published before signaling.
+    disposition: AtomicU8,
     /// The device-written response bytes, copied out of the entry's DMA buffer
     /// by `drain_used` before the event is signaled.
     resp: UnsafeCell<[u8; SYNC_RESP_MAX]>,
@@ -743,7 +764,7 @@ impl SyncWaitBlock {
     /// A zeroed block. Private: reachable only through [`Self::with`], which is
     /// what makes "registered but never initialised" unrepresentable.
     fn new_zeroed() -> Self {
-        // SAFETY: a zeroed KEVENT/AtomicBool/byte-array is a valid *inert*
+        // SAFETY: a zeroed KEVENT/AtomicU8/byte-array is a valid *inert*
         // value; `init` initializes the dispatcher header before any use.
         unsafe { core::mem::zeroed() }
     }
@@ -755,39 +776,45 @@ impl SyncWaitBlock {
     unsafe fn init(&mut self) {
         // SAFETY: valid, stable KEVENT storage per the fn contract.
         unsafe { KeInitializeEvent(&mut self.event, NOTIFICATION_EVENT, 0) };
-        self.done.store(false, Ordering::Relaxed);
+        self.disposition
+            .store(WaitDisposition::Pending as u8, Ordering::Relaxed);
     }
 
-    /// Copy the response bytes out.
-    ///
-    /// ⚠ There is deliberately no `is_done` accessor to call first. Reading
-    /// `done` never authorized a copy safely — it authorized RESUMING, one
-    /// instruction before the drain's `KeSetEvent`, which is the 22.22.218.0
-    /// `0xA` (ROADMAP defect 0ab-C, and `ctrl::wait_block`'s doc has the whole
-    /// argument). The caller reaches this only after its wait was SATISFIED, so
-    /// the drain has finished with the block entirely.
-    ///
-    /// `done` still carries the release/acquire edge that makes `resp` visible:
-    /// it is stored (Release) after the copy and before the signal, and the
-    /// wait's own satisfaction is the acquire.
-    fn copy_resp(&self, out: &mut [u8]) {
+    fn disposition(&self) -> WaitDisposition {
+        WaitDisposition::from_raw(self.disposition.load(Ordering::Acquire))
+    }
+
+    fn publish_terminal(&self, terminal: WaitDisposition) -> bool {
+        if terminal == WaitDisposition::Pending {
+            return false;
+        }
+        self.disposition
+            .compare_exchange(
+                WaitDisposition::Pending as u8,
+                terminal as u8,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn copy_host_response(&self, out: &mut [u8]) -> WaitDisposition {
+        let disposition = self.disposition();
+        if disposition != WaitDisposition::HostResponseCopied {
+            return disposition;
+        }
         let n = out.len().min(SYNC_RESP_MAX);
-        // SAFETY: `resp` is only written by the drain BEFORE `done` is set
-        // (Release) and the event is signaled; this runs after that signal
-        // satisfied our wait.
+        // SAFETY: the Acquire disposition observes the response copy that
+        // preceded its Release publication.
         let src = unsafe { &*self.resp.get() };
         out[..n].copy_from_slice(&src[..n]);
+        disposition
     }
 }
 
 /// The only handle a [`SyncWaitBlock::with`] closure gets: a pointer to hand
 /// the transport, plus the one read the waiter needs. Borrows the block, so it
 /// cannot outlive the frame the block lives on.
-///
-/// The `is_done` wrapper that used to sit here went with the completion-side
-/// poll it existed for (22.22.219.0): exposing "has the drain started writing
-/// this block?" to the waiter is what let the waiter leave while the drain was
-/// still writing it.
 pub struct WaitBlockRef<'a> {
     ptr: NonNull<SyncWaitBlock>,
     _frame: PhantomData<&'a SyncWaitBlock>,
@@ -799,9 +826,20 @@ impl WaitBlockRef<'_> {
         self.ptr
     }
 
-    pub fn copy_resp(&self, out: &mut [u8]) {
-        // SAFETY: as above; `copy_resp`'s own contract covers the ordering.
-        unsafe { self.ptr.as_ref() }.copy_resp(out);
+    /// # Safety
+    /// The signal must have completed, or deregistration under `virtio_lock`
+    /// must have proved that the terminal publisher finished with this block.
+    pub unsafe fn copy_host_response_after_completion(&self, out: &mut [u8]) -> WaitDisposition {
+        // SAFETY: the caller contract proves the raw target is no longer touched.
+        unsafe { self.ptr.as_ref() }.copy_host_response(out)
+    }
+
+    /// # Safety
+    /// Same terminal signal/deregistration proof as
+    /// [`Self::copy_host_response_after_completion`].
+    pub unsafe fn classify_fence_after_completion(&self) -> WaitDisposition {
+        // SAFETY: the caller contract proves the raw target is no longer touched.
+        unsafe { self.ptr.as_ref() }.disposition()
     }
 }
 
@@ -1410,7 +1448,7 @@ impl SyncTicket {
 /// This replaces a bool whose fall-through returned `true` — "already
 /// completed, treat as success" — for EVERY case that was not an exact
 /// (token, Sync, same-waiter) match, including a token now owned by a different
-/// command and a kind mismatch. The caller then ran `copy_resp` on a block that
+/// command and a kind mismatch. The caller then ran `copy_host_response` on a block that
 /// may never have been written. That was safe only because (a) a token cannot
 /// be re-issued until its chain is popped, which implies the old waiter was
 /// signalled, and (b) `new_zeroed` leaves `resp` all-zero and 0 is not a
@@ -1419,8 +1457,8 @@ impl SyncTicket {
 /// stated at that function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncOutcome {
-    /// No in-flight entry holds this token: the drain already completed and
-    /// signalled it. The response bytes are valid.
+    /// No in-flight entry holds this token: completion or transport abort
+    /// already signalled it, and the wait block names which terminal occurred.
     AlreadyCompleted,
     /// The waiter was deregistered before completion. The response bytes were
     /// never written.
@@ -3857,9 +3895,8 @@ impl VirtioGpu {
             match entry.kind {
                 InFlightKind::Sync { waiter, .. } => {
                     if let Some(block) = waiter {
-                        // No response is copied on purpose: `SyncWaitBlock::new_zeroed`
-                        // zeroes `resp`, and `resp_is_ok(0)` is false, so every
-                        // waiter observes failure rather than a stale success.
+                        // No response is copied: TransportAborted is the exact
+                        // terminal state and readers never decode `resp` for it.
                         //
                         // SAFETY: identical to the success path's Sync arm in
                         // `drain_used`, and audited with it for the 22.22.218.0
@@ -3871,15 +3908,14 @@ impl VirtioGpu {
                         // `abandon_sync` runs under THIS lock and therefore
                         // either cleared `waiter` before us (it is still `Some`,
                         // so it did not) or runs after this arm completes. No
-                        // lock-free `done` poll can authorize an exit any more —
+                        // lock-free disposition poll can authorize an exit any more —
                         // that fast path is what made this pattern unsound.
-                        // `done` (Release) BEFORE KeSetEvent, both inside the
-                        // critical section, for the second exit's half of that
-                        // argument.
+                        // TransportAborted is Release-published before KeSetEvent.
                         unsafe {
                             let b = block.as_ptr();
-                            (*b).done.store(true, Ordering::Release);
-                            KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                            if (*b).publish_terminal(WaitDisposition::TransportAborted) {
+                                KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                            }
                         }
                     }
                 }
@@ -3981,8 +4017,9 @@ impl VirtioGpu {
             // happens under this same lock.
             unsafe {
                 let b = w.block.as_ptr();
-                (*b).done.store(true, Ordering::Release);
-                KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                if (*b).publish_terminal(WaitDisposition::TransportAborted) {
+                    KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                }
             }
         }
         // A failed transport cannot satisfy an outstanding stream boundary.
@@ -4113,10 +4150,10 @@ impl VirtioGpu {
                     if let Some(block) = waiter {
                         // THE WRITE SITE THE 22.22.218.0 `0xA` RACED, and the
                         // ordering below is now correct only because
-                        // `ctrl::wait_block` no longer has a lock-free `done`
-                        // fast path. Keep it that way: `done` is stored one
-                        // instruction before the signal, so any exit authorized
-                        // by `done` lets the waiter pop the frame these three
+                        // `ctrl::wait_block` has no lock-free disposition fast
+                        // path. Keep it that way: the terminal state is published
+                        // immediately before the signal, so an exit authorized
+                        // by that state lets the waiter pop the frame these three
                         // accesses are still writing (ROADMAP defect 0ab-C).
                         //
                         // SAFETY: the block outlives every access here, and the
@@ -4132,20 +4169,23 @@ impl VirtioGpu {
                         //     (`waiter` is still `Some`, so it did not) or runs
                         //     after the whole arm and reports AlreadyCompleted;
                         //     its own frame is alive across that call.
-                        // Response copied BEFORE the Release store on `done`;
+                        // Response copied BEFORE the Release terminal publish;
                         // KeSetEvent is DISPATCH-safe (Wait=FALSE). All three
                         // stay inside the critical section for the second exit's
                         // half of the argument.
                         unsafe {
                             let b = block.as_ptr();
-                            let n = resp_len.min(SYNC_RESP_MAX);
-                            core::ptr::copy_nonoverlapping(
-                                resp_base,
-                                (*b).resp.get() as *mut u8,
-                                n,
-                            );
-                            (*b).done.store(true, Ordering::Release);
-                            KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                            if (*b).disposition() == WaitDisposition::Pending {
+                                let n = resp_len.min(SYNC_RESP_MAX);
+                                core::ptr::copy_nonoverlapping(
+                                    resp_base,
+                                    (*b).resp.get() as *mut u8,
+                                    n,
+                                );
+                                if (*b).publish_terminal(WaitDisposition::HostResponseCopied) {
+                                    KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                                }
+                            }
                         }
                     }
                 }
@@ -4394,8 +4434,9 @@ impl VirtioGpu {
                             // them from this list under the same lock.
                             unsafe {
                                 let b = w.block.as_ptr();
-                                (*b).done.store(true, Ordering::Release);
-                                KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                                if (*b).publish_terminal(WaitDisposition::FenceCompleted) {
+                                    KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                                }
                             }
                         } else {
                             j += 1;
@@ -4595,8 +4636,8 @@ impl VirtioGpu {
 
     /// Abandon a timed-out synchronous entry: detach its waiter so the eventual
     /// completion signals nobody (the entry itself is reaped when it completes).
-    /// Returns `true` if the entry had ALREADY completed — the wait raced the
-    /// drain and the caller should treat it as success.
+    /// Returns `AlreadyCompleted` if the entry already reached either terminal;
+    /// the wait block distinguishes a copied host response from transport abort.
     pub fn abandon_sync(
         &mut self,
         ticket: SyncTicket,
@@ -4658,6 +4699,13 @@ impl VirtioGpu {
             _ => false,
         });
         if !in_flight {
+            // SAFETY: `block` is the initialized, frame-borrowed waiter supplied
+            // by the caller, and this lock excludes every terminal publisher.
+            unsafe {
+                let _ = block
+                    .as_ref()
+                    .publish_terminal(WaitDisposition::FenceCompleted);
+            }
             return FenceWaitPrep::Complete;
         }
         if self.fence_waiters.len() >= MAX_FENCE_WAITERS {
@@ -4668,8 +4716,8 @@ impl VirtioGpu {
         FenceWaitPrep::Registered
     }
 
-    /// Deregister a timed-out fence waiter. Returns `true` if the fence had
-    /// ALREADY completed (the drain signaled + removed the waiter first).
+    /// Deregister a timed-out fence waiter. Returns `true` if completion or
+    /// transport abort signaled and removed it first; disposition distinguishes them.
     pub fn fence_wait_cancel(&mut self, block: NonNull<SyncWaitBlock>) -> bool {
         if let Some(i) = self.fence_waiters.iter().position(|w| w.block == block) {
             self.fence_waiters.swap_remove(i);

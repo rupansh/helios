@@ -62,9 +62,9 @@ use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::gpu::{
     BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner, FenceWaitPrep,
-    OwnerFilter, SyncOutcome, SyncTicket, SyncWaitBlock, WaitBlockRef, CTRL_TEARDOWN_ABANDONS,
-    CTRL_TIMEOUT_COUNT, ESCAPE_SUBMIT_COUNT, ESCAPE_SUBMIT_RING_COUNT, FENCE_WAIT_TABLE_FULL,
-    FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
+    OwnerFilter, SyncOutcome, SyncTicket, SyncWaitBlock, WaitBlockRef, WaitDisposition,
+    CTRL_TEARDOWN_ABANDONS, CTRL_TIMEOUT_COUNT, ESCAPE_SUBMIT_COUNT, ESCAPE_SUBMIT_RING_COUNT,
+    FENCE_WAIT_TABLE_FULL, FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
@@ -87,6 +87,18 @@ use helios_protocol::{
 const KERNEL_MODE: i8 = 0;
 /// `Executive` (`KWAIT_REASON`).
 const EXECUTIVE: i32 = 0;
+
+static CTRL_WAIT_PENDING: AtomicU32 = AtomicU32::new(0);
+static CTRL_WAIT_FENCE_COMPLETED: AtomicU32 = AtomicU32::new(0);
+static FENCE_WAIT_PENDING: AtomicU32 = AtomicU32::new(0);
+static FENCE_WAIT_HOST_RESPONSE: AtomicU32 = AtomicU32::new(0);
+
+fn bump_wait_refusal(counter: &AtomicU32, name: &[u8]) {
+    let n = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    if n == 1 || n % 64 == 0 {
+        crate::diag::record_named_bytes(name, n);
+    }
+}
 
 /// Default PASSIVE wait budget for one synchronous control round-trip. Sized
 /// for a validate-slow host whose ctrl queue is momentarily blocked behind a
@@ -181,9 +193,9 @@ pub(crate) fn sleep_ms(_passive: PassiveLevel, ms: u64) {
 ///     timed-out waiter's frame is alive across its own abandon call, so the
 ///     block outlives every access on that side too.
 ///
-/// A LOCK-FREE `done` POLL PROVIDES NEITHER, and this loop used to open with
-/// one. `done` is stored one instruction BEFORE `KeSetEvent` in the drain's
-/// Sync arm (`gpu/mod.rs`, the `InFlightKind::Sync` write site), so a waiter
+/// A LOCK-FREE terminal-state POLL PROVIDES NEITHER, and this loop used to open
+/// with one. The terminal state is published immediately before `KeSetEvent`
+/// in the drain's Sync arm, so a waiter
 /// polling it could return, pop its frame, and leave the drain to memcpy and
 /// signal a dead stack frame — one ISR or KVM vm-exit inside that one-
 /// instruction window is all it takes. That is the 22.22.218.0 `0xA` bugcheck,
@@ -417,7 +429,8 @@ fn ctrl_roundtrip(
                 v.drain_used();
                 v.abandon_sync(token, block.as_ptr())
             }) {
-                // The drain already signalled us; the response bytes are valid.
+                // The drain or failure latch already signalled us; disposition
+                // below distinguishes copied response from transport abort.
                 Ok(SyncOutcome::AlreadyCompleted) => {}
                 Ok(SyncOutcome::Abandoned) => {
                     CTRL_TIMEOUT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -437,8 +450,23 @@ fn ctrl_roundtrip(
                 }
             }
         }
-        block.copy_resp(resp_out);
-        Ok(())
+        // SAFETY: signal satisfaction or the locked AlreadyCompleted arm above
+        // proves the terminal publisher finished touching the stack block.
+        match unsafe { block.copy_host_response_after_completion(resp_out) } {
+            WaitDisposition::HostResponseCopied => Ok(()),
+            WaitDisposition::TransportAborted => {
+                CTRL_TEARDOWN_ABANDONS.fetch_add(1, Ordering::Relaxed);
+                Err(VirtioError::DeviceError)
+            }
+            WaitDisposition::Pending => {
+                bump_wait_refusal(&CTRL_WAIT_PENDING, b"CtDsPend");
+                Err(VirtioError::DeviceError)
+            }
+            WaitDisposition::FenceCompleted => {
+                bump_wait_refusal(&CTRL_WAIT_FENCE_COMPLETED, b"CtDsFence");
+                Err(VirtioError::DeviceError)
+            }
+        }
     })
 }
 
@@ -1626,6 +1654,26 @@ pub enum WaitFenceOutcome {
     Invalid,
 }
 
+fn completed_fence_outcome(block: &WaitBlockRef<'_>) -> WaitFenceOutcome {
+    // SAFETY: callers reach this only after exact pre-completion publication,
+    // a satisfied signal, or locked cancellation proving the signal arm won.
+    match unsafe { block.classify_fence_after_completion() } {
+        WaitDisposition::FenceCompleted => WaitFenceOutcome::Complete,
+        WaitDisposition::TransportAborted => {
+            TRANSPORT_GONE_AT_WAIT.fetch_add(1, Ordering::Relaxed);
+            WaitFenceOutcome::Invalid
+        }
+        WaitDisposition::Pending => {
+            bump_wait_refusal(&FENCE_WAIT_PENDING, b"FwDsPend");
+            WaitFenceOutcome::Invalid
+        }
+        WaitDisposition::HostResponseCopied => {
+            bump_wait_refusal(&FENCE_WAIT_HOST_RESPONSE, b"FwDsHost");
+            WaitFenceOutcome::Invalid
+        }
+    }
+}
+
 /// Wait (PASSIVE, KEVENT) until wire fence `fence_id` completes or
 /// `timeout_ns` elapses. `timeout_ns == 0` is a poll.
 pub fn wait_fence(
@@ -1648,7 +1696,7 @@ pub fn wait_fence(
             });
             match prep {
                 Err(_) => return WaitFenceOutcome::Invalid, // transport gone
-                Ok(FenceWaitPrep::Complete) => return WaitFenceOutcome::Complete,
+                Ok(FenceWaitPrep::Complete) => return completed_fence_outcome(block),
                 Ok(FenceWaitPrep::Invalid) => return WaitFenceOutcome::Invalid,
                 Ok(FenceWaitPrep::TableFull) => {
                     full_retries += 1;
@@ -1672,7 +1720,7 @@ pub fn wait_fence(
         if timeout_ns == 0 {
             // Poll: deregister immediately; completion may still have raced in.
             return match adapter.with_virtio(|v| v.fence_wait_cancel(block.as_ptr())) {
-                Ok(true) => WaitFenceOutcome::Complete,
+                Ok(true) => completed_fence_outcome(block),
                 Ok(false) => WaitFenceOutcome::TimedOut,
                 // Transport gone: the fence did NOT retire. Reporting Complete here
                 // made escape_wait_fence write out_completed = 1 and return
@@ -1689,13 +1737,13 @@ pub fn wait_fence(
 
         let total_ms = (timeout_ns / 1_000_000).max(1).min(WAIT_FENCE_MAX_MS);
         if wait_block(passive, adapter, block, total_ms) {
-            return WaitFenceOutcome::Complete;
+            return completed_fence_outcome(block);
         }
         match adapter.with_virtio(|v| {
             v.drain_used();
             v.fence_wait_cancel(block.as_ptr())
         }) {
-            Ok(true) => WaitFenceOutcome::Complete,
+            Ok(true) => completed_fence_outcome(block),
             Ok(false) => {
                 FENCE_WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
                 WaitFenceOutcome::TimedOut
