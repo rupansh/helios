@@ -817,11 +817,22 @@ impl<'a> PathInfo<'a> {
         let mut path = null();
         // SAFETY: valid out-pointer; per the fn contract.
         let st = unsafe { acquire_first(h_topo, &mut path) };
-        if st == STATUS_GRAPHICS_NO_MORE_ELEMENTS_IN_DATASET {
-            return Ok(None);
+        if st == STATUS_GRAPHICS_DATASET_IS_EMPTY {
+            return if path.is_null() {
+                Ok(None)
+            } else {
+                Err(STATUS_GRAPHICS_INVALID_VIDPN)
+            };
         }
-        if !ok(st) {
-            return Err(st);
+        if st != STATUS_SUCCESS {
+            return Err(if st < 0 {
+                st
+            } else {
+                STATUS_GRAPHICS_INVALID_VIDPN
+            });
+        }
+        if path.is_null() {
+            return Err(STATUS_GRAPHICS_INVALID_VIDPN);
         }
         Ok(Some(Self { topo, h_topo, path }))
     }
@@ -851,10 +862,21 @@ impl<'a> PathInfo<'a> {
         // SAFETY: live handles for the duration of the DDI call.
         let st = unsafe { acquire_next(self.h_topo, self.path, &mut next) };
         if st == STATUS_GRAPHICS_NO_MORE_ELEMENTS_IN_DATASET {
-            return Ok(None);
+            return if next.is_null() {
+                Ok(None)
+            } else {
+                Err(STATUS_GRAPHICS_INVALID_VIDPN)
+            };
         }
-        if !ok(st) {
-            return Err(st);
+        if st != STATUS_SUCCESS {
+            return Err(if st < 0 {
+                st
+            } else {
+                STATUS_GRAPHICS_INVALID_VIDPN
+            });
+        }
+        if next.is_null() {
+            return Err(STATUS_GRAPHICS_INVALID_VIDPN);
         }
         Ok(Some(Self {
             topo: self.topo,
