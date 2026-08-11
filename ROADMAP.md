@@ -687,13 +687,25 @@ KMD **22.22.276.0**, nine configurations, `hts1_session_probe` 15/15 and
   and hands the CPU the system backing. §10.7:1940 forbids a private copy, and a
   host-written reply pool cannot be one.
 
-⇒ **The next unit is not another placement experiment.** `HELIOS_ESCAPE_MAP_BLOB`
-(`escape.rs:1377`) already returns a **live aliased user-mode view** of a blob's
-window pages and is production-proven — the D3D11 ICD and DXVK use it. A1's reply
-pool should take its CPU view from there. The gap is identity: the escape resolves
-`resource_id` + owner while the ICD holds an HVM1 `object_generation`, so an
-HVM1-scoped admission is the unit, sized like K5. Owner decision, because it
-contradicts §10.7's stated model.
+⛔ **NOT via an Escape.** `HELIOS_ESCAPE_MAP_BLOB` (`escape.rs:1377`) does return a
+live aliased user-mode view and is production-proven — and §3:370-371 forbids
+`D3DKMTEscape` outright, §18.1 gates on *absent Escape objects*, and **K1 deletes
+`escape.rs` and `blob_map.rs`, where `map_io_pages_to_user` lives**. An earlier
+draft of F16 recommended it; withdrawn.
+
+⭐ **What §10.7 actually specifies is HPM1** — ":1939-1941: HLM1 is the segment and
+'HPM1 is the actual paging/device protocol that binds each current VidMm placement
+to the same renderer payload and copies the bytes on every placement transition'"
+— **and F5 declined HPM1.** `lane-kmd-core.md:139` already says the forbidden byte
+copy's replacement "was DECLINED, not deferred … so the deletion has no successor
+mechanism today and must be an explicit recorded decision". F16 is that decision
+arriving with numbers. Ranked non-Escape options, cheapest first, in F16's last
+section: (1) finish the diagnosis — an ETW `Lock`/residency slice, plus
+`VidMmVramMB=1024` because segment 2 reports **8 GiB while the KMD's VidMm
+partition is 1 GiB** and the KMD's blob allocator owns the rest of the same window
+(a latent overlap independent of this unit); (2) guest-backed storage for roles 1
+and 3, which is what upstream venus does with reply/feedback shmem; (3) un-decline
+HPM1; (4) accept the copy for feedback only. **Owner decision.**
 4. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
    correction below before touching it. Not on the critical path.
 5. **K1 (demolition), K3** — and `SURFACE` last of all (`OWNERSHIP.md` §3).

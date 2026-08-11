@@ -1453,21 +1453,66 @@ not admissible either: §10.7:1940 says an HVM1 allocation's "bytes are never an
 independent private copy", and a reply pool the host writes asynchronously cannot
 be a snapshot taken at Unlock.
 
-### ⭐ The channel that does work already exists
+### ⛔ The channel that works is FORBIDDEN, and the design's own answer was declined
 
-`HELIOS_ESCAPE_MAP_BLOB` (`escape.rs:1377`, `escape_map_blob`) runs
-`map_blob_prepare` and then `map_io_pages_to_user` in the caller's process,
-returning `out_user_va` — a **live, aliased** user-mode view of the blob's window
-pages, tagged with the owning device handle and torn down at
-`DxgkDdiDestroyDevice`. It is production-proven: it is how the D3D11 ICD and DXVK
-already reach blob bytes.
+`HELIOS_ESCAPE_MAP_BLOB` (`escape.rs:1377`, `escape_map_blob`) does deliver exactly
+this: `map_blob_prepare` + `map_io_pages_to_user` in the caller's process, returning
+`out_user_va`, a **live aliased** user-mode view of the blob's window pages, torn
+down at `DxgkDdiDestroyDevice`, production-proven by the D3D11 ICD and DXVK.
 
-⇒ Recommendation, for the owner: **A1's reply pool should take its CPU view from
-the escape, not from `D3DKMTLock2`.** The gap to close is identity — the escape
-resolves a blob by `resource_id` + owner, and the ICD holds an HVM1
-`object_generation` — so an HVM1-scoped admission (allocation handle or
-generation → resource id) is the unit. That is a KMD+ICD change of the same size
-as K5, and it does not need VidMm to place anything anywhere.
+⛔ **It is not available and must not be proposed.** §3:370-371 is a hard
+constraint — "No `D3DKMTEscape` for transport, discovery, metadata,
+synchronization, completion, lifetime, diagnostics, or fallback" — §18.1's static
+gate is *absent Escape objects* with `DxgkDdiEscape` left NULL (:4494), and **K1
+deletes `escape.rs`, `blob_map.rs` (which is where `map_io_pages_to_user` lives),
+`cpu_host_aperture.rs` and `MappingTable`** (`lane-kmd-core.md:111-112,150,200`).
+An earlier draft of this finding recommended the escape; that recommendation is
+**withdrawn** — it contradicted §3.
+
+⭐ **What the design actually specifies, and why nothing implements it.**
+§10.7:1939-1941, in full: "HLM1 is the package's fully CPU-visible linear
+local-memory segment; **HPM1 is the actual paging/device protocol that binds each
+current VidMm placement to the same renderer payload and copies the bytes on every
+placement transition**." So §10.7 never claimed a permanently aliased window — it
+claimed a paging protocol that keeps the placement and the payload in sync across
+transitions, which is precisely the copy-on-transition behaviour measured above.
+
+⇒ **The mechanism this finding shows missing is HPM1, and F5 DECLINED HPM1.**
+`lane-kmd-core.md:139` already records the consequence in terms: the forbidden
+byte copy's "named replacement — 'HPM1 is the actual paging/device protocol' — was
+**DECLINED, not deferred** … so the deletion has no successor mechanism today and
+must be an explicit recorded decision, not a side effect." F16 is that decision
+arriving with numbers attached. It is not a new gap; it is F5's gap, measured.
+
+### The non-Escape options, ranked by cost
+
+1. **Finish the diagnosis before changing the channel** (no rebuild). Two things
+   are untested. (a) An ETW `Microsoft-Windows-DxgKrnl` all-keywords slice around
+   ONE probe run — the same instrument that answered "what is dxgkrnl doing to my
+   thread" for WS2 — read for `Lock`/`AllocationResidency`/`PagingQueue`: does
+   dxgkrnl evict to system memory *at the lock*, and does it ever consider the
+   allocation resident in segment 2 at that moment? (b) `VidMmVramMB=1024`:
+   **segment 2 currently reports 8 GiB while the KMD's VidMm partition is
+   `bar.size` = 1 GiB** (`BAR_SEGMENT_MAX_BYTES`), and the KMD's own blob
+   allocator owns `[1 GiB, 8 GiB)` of the same window — two allocators in one
+   range, which §10.7:2013-2015's "`BaseAddress`, `Size`, `CommitLimit` … match
+   the one negotiated local physical range" forbids and which is a latent host
+   subregion overlap regardless of this unit. Registry-only, graded by `HlRdbk`.
+2. **Guest-backed storage for roles 1 and 3.** Upstream venus keeps reply and
+   feedback storage in GUEST shmem (`vn_renderer_shmem`), not host memory: the
+   host writes into pages the guest owns. Attaching the WDDM allocation's own
+   resident pages to the renderer resource (core virtio-gpu
+   `RESOURCE_ATTACH_BACKING`, not a QEMU-fork feature) inverts the problem — the
+   system-memory view dxgkrnl already hands out **becomes** the payload, and no
+   alias is needed. Roles 2 and 4 are real `VkDeviceMemory` and still need host
+   memory. ⚠ Needs re-attach on placement transition, which is HPM1's job under
+   another name, but entirely inside the guest.
+3. **Un-decline HPM1** (F5). The design's own mechanism, blocked on the parked
+   QEMU memory lane.
+4. **Accept the paging-transfer copy for roles 1 and 3.** Closer to §10.7 than it
+   looks, since §10.7:1940 is what HPM1's copy-on-transition sentence qualifies —
+   but a host-written reply pool needs live visibility, not a snapshot taken at
+   `Unlock2`, so this is a fallback for feedback storage at best.
 
 ### Bound — what this does NOT say
 
