@@ -913,7 +913,9 @@ pub(crate) fn admit_control_render(
         Ok(admission) => Ok(admission),
         Err(refusal) => {
             bump_with_code(&TS_CONTROL_RENDER_REJECT, control_render_code(refusal));
-            Err(STATUS_INVALID_DEVICE_REQUEST)
+            // `DxgkDdiRender`'s documented return set is narrow; the reason is in
+            // `TsCtlRej`, not in the NTSTATUS.
+            Err(STATUS_INVALID_PARAMETER)
         }
     }
 }

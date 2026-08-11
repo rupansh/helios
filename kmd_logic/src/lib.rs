@@ -10570,14 +10570,18 @@ pub mod native_render {
         }
     }
 
-    /// Admit one HNR2 fragment on this context and advance its assembler.
+    /// Decide whether one HNR2 fragment is legal on this context, WITHOUT
+    /// moving the assembler.
     ///
-    /// ⛔ The context moves ONLY on success. A refused fragment leaves the open
-    /// batch exactly as it was, so a malformed Render cannot corrupt the batch a
-    /// well-formed one is still building — and a caller that refuses is free to
-    /// leave the context alive.
-    pub fn admit_render_fragment(
-        context: &mut RenderContext,
+    /// ⛔ The split from [`apply_render_fragment`] is load-bearing, not
+    /// stylistic. `DxgkDdiRender` may legally answer `STATUS_BUFFER_TOO_SMALL`,
+    /// and dxgkrnl's documented response is to grow the buffer and CALL THE
+    /// DRIVER AGAIN with the same command — so a caller that advanced the
+    /// assembler before discovering a short buffer would refuse its own replay
+    /// with `BatchTokenNotIncreasing` and lose the context. Validate, do every
+    /// fallible thing, then apply.
+    pub fn validate_render_fragment(
+        context: &RenderContext,
         header: &HeliosNativeRenderV2,
         env: &RenderEnv,
     ) -> Result<Hnr2Accept, RenderRefusal> {
@@ -10590,7 +10594,18 @@ pub mod native_render {
             open: context.open,
             last_batch_token: context.last_batch_token,
         };
-        let accept = header.validate(&expect).map_err(RenderRefusal::Header)?;
+        header.validate(&expect).map_err(RenderRefusal::Header)
+    }
+
+    /// Move the assembler over a fragment [`validate_render_fragment`] admitted.
+    ///
+    /// The caller owes it the SAME `header`/`accept` pair, on a context nothing
+    /// else has touched in between.
+    pub fn apply_render_fragment(
+        context: &mut RenderContext,
+        header: &HeliosNativeRenderV2,
+        accept: &Hnr2Accept,
+    ) {
         // The watermark advances when a batch OPENS, because that is the only
         // place `validate` compares it (`BatchTokenNotIncreasing`); a COMMIT of an
         // already-open batch repeats a token that is already at the watermark.
@@ -10598,6 +10613,21 @@ pub mod native_render {
             context.last_batch_token = header.batch_token;
         }
         context.open = accept.next_open;
+    }
+
+    /// Admit one HNR2 fragment on this context and advance its assembler.
+    ///
+    /// ⛔ The context moves ONLY on success. A refused fragment leaves the open
+    /// batch exactly as it was, so a malformed Render cannot corrupt the batch a
+    /// well-formed one is still building — and a caller that refuses is free to
+    /// leave the context alive.
+    pub fn admit_render_fragment(
+        context: &mut RenderContext,
+        header: &HeliosNativeRenderV2,
+        env: &RenderEnv,
+    ) -> Result<Hnr2Accept, RenderRefusal> {
+        let accept = validate_render_fragment(context, header, env)?;
+        apply_render_fragment(context, header, &accept);
         Ok(accept)
     }
 
@@ -11026,6 +11056,29 @@ pub mod native_render {
             }
             let next = frag(6, 0, 1, 16);
             admit_render_fragment(&mut ctx, &next, &env(&next)).unwrap();
+        }
+
+        /// ⛔ THE REPLAY CASE. `DxgkDdiRender` may answer STATUS_BUFFER_TOO_SMALL
+        /// and dxgkrnl then calls it again with the SAME command. A caller that
+        /// advanced the assembler before discovering the short buffer refuses its
+        /// own replay; validating without applying is what makes the retry work.
+        #[test]
+        fn validating_without_applying_leaves_a_replay_admissible() {
+            let mut ctx = RenderContext::new();
+            let h = frag(7, 0, 1, 64);
+            let before = ctx;
+            let accept = validate_render_fragment(&ctx, &h, &env(&h)).unwrap();
+            assert_eq!(ctx, before, "validation must not move the assembler");
+            // The same fragment again — this is the replay, and it must be legal.
+            let accept2 = validate_render_fragment(&ctx, &h, &env(&h)).unwrap();
+            assert_eq!(accept, accept2);
+            apply_render_fragment(&mut ctx, &h, &accept2);
+            assert_eq!(ctx.last_batch_token(), 7);
+            // And once applied, the replay is refused, exactly as before.
+            assert_eq!(
+                validate_render_fragment(&ctx, &h, &env(&h)).unwrap_err(),
+                RenderRefusal::Header(Hnr2Reject::BatchTokenNotIncreasing)
+            );
         }
 
         #[test]

@@ -23,9 +23,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use alloc::vec::Vec;
 
 use helios_kmd_logic::native_render::{
-    admit_commit_tables, admit_hos1, admit_render_fragment, apply_placement, build_capability,
-    plan_capability_table, plan_output_patch_slots, CapabilityTablePlan, OuterSubmitContext,
-    RenderContext, RenderEnv, RenderRefusal,
+    admit_commit_tables, admit_hos1, apply_placement, apply_render_fragment, build_capability,
+    plan_capability_table, plan_output_patch_slots, validate_render_fragment, CapabilityTablePlan,
+    OuterSubmitContext, RenderContext, RenderEnv, RenderRefusal,
 };
 use helios_protocol::native_render::kernel_dma::{Hnr2DmaReject, Hnr2KmdDmaPrivateV1,
     Hnr2PhysicalCapability};
@@ -672,7 +672,10 @@ pub(crate) unsafe fn render(
     }
 
     let Some(mut claim) = native.claim() else {
-        return STATUS_DEVICE_BUSY;
+        // Counted as `Nr2Reent`; the status is the generic refusal because
+        // `DxgkDdiRender`'s documented return set is narrow and every reason
+        // this arm has lives in a counter, not in the NTSTATUS.
+        return STATUS_INVALID_PARAMETER;
     };
 
     // ── the header ──────────────────────────────────────────────────────────
@@ -687,7 +690,7 @@ pub(crate) unsafe fn render(
     // SAFETY: `raw` is exactly the header size; `pCommand` is untrusted and is
     // read only inside the shim's exception frame.
     if !unsafe { copy_from_command(raw.as_mut_ptr(), args.pCommand as *const u8, header_bytes) } {
-        return STATUS_INVALID_USER_BUFFER;
+        return STATUS_INVALID_PARAMETER;
     }
     let Ok(header) = bytemuck::try_pod_read_unaligned::<HeliosNativeRenderV2>(&raw) else {
         return refuse(
@@ -704,12 +707,19 @@ pub(crate) unsafe fn render(
         patch_location_list_in_size: args.PatchLocationListInSize,
     };
 
-    // The §10.7:2041 short lock: the admission decision only. Everything after
-    // it — the user copy, the capability table, the reply-slot checkout — runs
-    // outside it, and `claim` is what makes that safe.
+    // ⛔ VALIDATE, DO EVERY FALLIBLE THING, THEN APPLY — never admit-then-work.
+    // This DDI may answer `STATUS_BUFFER_TOO_SMALL`, and dxgkrnl's documented
+    // response is to grow the buffer and CALL IT AGAIN with the same command.
+    // An assembler advanced before that discovery would refuse its own replay
+    // with `BatchTokenNotIncreasing` and lose the context.
+    //
+    // The §10.7:2041 short lock covers the decision only; everything after it —
+    // the user copy, the capability table, the reply-slot checkout — runs
+    // outside it, and `claim` is what makes that safe: only a Render touches the
+    // assembler, and `busy` admits one Render per context.
     let accept = {
-        let mut state = native.state.lock();
-        match admit_render_fragment(&mut state, &header, &env) {
+        let state = native.state.lock();
+        match validate_render_fragment(&state, &header, &env) {
             Ok(accept) => accept,
             Err(refusal) => {
                 drop(state);
@@ -727,6 +737,7 @@ pub(crate) unsafe fn render(
         args.pDmaBuffer = unsafe { (args.pDmaBuffer as *mut u8).add(header_bytes) as *mut c_void };
         args.PatchLocationListOutSize = 0;
         args.MultipassOffset = 0;
+        apply_render_fragment(&mut native.state.lock(), &header, &accept);
         NR2_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
         NR2_COUNTERS.flush();
         return STATUS_SUCCESS;
@@ -781,7 +792,7 @@ fn commit(
             )
         };
         if !ok {
-            return STATUS_INVALID_USER_BUFFER;
+            return STATUS_INVALID_PARAMETER;
         }
     }
     if patch_count != 0 {
@@ -795,7 +806,7 @@ fn commit(
             )
         };
         if !ok {
-            return STATUS_INVALID_USER_BUFFER;
+            return STATUS_INVALID_PARAMETER;
         }
     }
 
@@ -932,10 +943,7 @@ fn commit(
         }
     } else if accept.has_reply {
         // Only the control context owns the session's reply pool (§10.4:1205).
-        return refuse(
-            RenderRefusal::ReplyOnQueueContext,
-            STATUS_INVALID_DEVICE_REQUEST,
-        );
+        return refuse(RenderRefusal::ReplyOnQueueContext, STATUS_INVALID_PARAMETER);
     }
 
     // ── the §10.7 staging admission ─────────────────────────────────────────
@@ -943,7 +951,7 @@ fn commit(
         let mut state = native.state.lock();
         if let Err(refusal) = state.staging_mut().checkout(header.total_payload_bytes) {
             drop(state);
-            return refuse(refusal, STATUS_INSUFFICIENT_RESOURCES);
+            return refuse(refusal, STATUS_NO_MEMORY);
         }
     }
     NR2_SLOT_TAKEN.fetch_add(1, Ordering::Relaxed);
@@ -987,6 +995,8 @@ fn commit(
             unsafe { args.pPatchLocationListOut.add(plan.count as usize) };
     }
     args.MultipassOffset = 0;
+    // The assembler moves HERE, after the last thing that could have refused.
+    apply_render_fragment(&mut native.state.lock(), header, accept);
     NR2_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
     NR2_COMMITS.fetch_add(1, Ordering::Relaxed);
     NR2_PATCH_SLOTS.fetch_add(plan.count, Ordering::Relaxed);
@@ -1096,7 +1106,7 @@ fn run_control_payload(
         // generated opcode schema on this side to classify it against — so it is
         // refused rather than admitted unclassified onto ring 0.
         NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
-        return STATUS_NOT_SUPPORTED;
+        return STATUS_INVALID_PARAMETER;
     }
     let mut raw = [0u8; INIT_BYTES];
     // SAFETY: `payload_offset`/`payload_bytes` were validated against
@@ -1110,7 +1120,7 @@ fn run_control_payload(
         )
     };
     if !ok {
-        return STATUS_INVALID_USER_BUFFER;
+        return STATUS_INVALID_PARAMETER;
     }
     match crate::ddi::translation_session::session_init(session, &raw) {
         // ⛔ UNREACHABLE BY DESIGN, and it must stay that way until K11.
@@ -1123,9 +1133,13 @@ fn run_control_payload(
             // mapping the guest's reply-pool allocation and building an HVR1
             // header, and no HVR1 producer exists in any repo.
             NR2_NO_REPLY.fetch_add(1, Ordering::Relaxed);
-            STATUS_NOT_SUPPORTED
+            STATUS_INVALID_PARAMETER
         }
-        Err(status) => status,
+        // ⛔ NORMALISED. `session_init` answers STATUS_DEVICE_NOT_READY /
+        // STATUS_INSUFFICIENT_RESOURCES, and neither is in `DxgkDdiRender`'s
+        // documented return set — an illegal NTSTATUS out of a DDI is itself
+        // logged by dxgkrnl as a driver bug. The real reason is in `TsInitRej`.
+        Err(_status) => STATUS_INVALID_PARAMETER,
     }
 }
 
