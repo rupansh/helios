@@ -29,6 +29,7 @@ pub mod committed_mode;
 pub mod committed_mode_lifecycle;
 pub mod context_attachment;
 pub mod context_lifecycle;
+pub mod control_owner_slots;
 pub mod control_ownership;
 pub mod direct_scanout_admission;
 pub mod direct_scanout_lifetime;
