@@ -25,6 +25,7 @@
 
 #![no_std]
 
+pub mod direct_scanout_admission;
 pub mod direct_scanout_lifetime;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
