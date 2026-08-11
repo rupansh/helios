@@ -206,17 +206,23 @@ probe_adapter(D3DKMT_HANDLE adapter, UINT index)
          destroy_context(ctx.hContext);
    }
 
-   /* ── D. an HVC1 queue context: K6's arm, refused until it exists ────── */
+   /* ── D. an HVC1 queue context ────────────────────────────────────────
+    *
+    * ⛔ THIS EXPECTATION FLIPPED WITH K6. It read "refused (K6 owns it)" and
+    * passed on `STATUS_NOT_SUPPORTED`; K6 landed `ddi/native_render.rs` and the
+    * refusal is gone, so leaving the old assertion would have turned K6's
+    * arrival into a 14/15 and read as a K5 regression. The deep coverage lives
+    * in `tools/hnr2_native_probe.c`; this one only proves the arm exists. */
    {
       HeliosVulkanContextV1 queue = hvc1_control();
       queue.queue_family = 0;
       queue.queue_index = 0;
       D3DKMT_CREATECONTEXT ctx;
       NTSTATUS s4 = create_context(device, &queue, sizeof(queue), &ctx);
-      snprintf(why, sizeof(why), "status=0x%08x (expected a refusal)",
+      snprintf(why, sizeof(why), "status=0x%08x (expected SUCCESS since K6)",
                (unsigned)s4);
-      check(s4 != STATUS_SUCCESS_NT,
-            "D: an HVC1 QUEUE context is refused (K6 owns it)", why);
+      check(s4 == STATUS_SUCCESS_NT,
+            "D: an HVC1 QUEUE context is admitted (K6)", why);
       if (s4 == STATUS_SUCCESS_NT)
          destroy_context(ctx.hContext);
    }

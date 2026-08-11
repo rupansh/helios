@@ -197,7 +197,16 @@ const COUNTER_NAMES: [&[u8]; 27] = [
 /// The boundary counters that did not fit [`COUNTER_NAMES`]'s block, mirrored
 /// alongside it. Split only because a `CounterBlock` writes one registry value
 /// per entry and 27 is already the largest block in this driver.
-const BOUNDARY_NAMES: [&[u8]; 3] = [b"Nr2NoStage", b"Nr2NoEpoch", b"Nr2Hos1NoX"];
+const BOUNDARY_NAMES: [&[u8]; 4] = [
+    b"Nr2NoStage",
+    b"Nr2NoEpoch",
+    b"Nr2Hos1NoX",
+    // Not a K6 counter by subject, but K6 is what made the hazard reachable:
+    // `DxgkDdiPatch`/`DxgkDdiSubmitCommand` deliver the context through a
+    // `hDevice`/`hContext` union. It is mirrored here because this block already
+    // has both a PASSIVE flush site and a teardown one.
+    b"CtxBadH",
+];
 
 /// Compile-time proof that no counter name can be truncated into another's.
 /// `diag::record_named_bytes` clamps silently at `MAX_CONFIG_NAME`, so two names
@@ -273,6 +282,7 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(BOUNDARY_NAMES[0], &NR2_NO_STAGE),
         e(BOUNDARY_NAMES[1], &NR2_NO_EPOCH),
         e(BOUNDARY_NAMES[2], &NR2_HOS1_NOT_EXECUTED),
+        f(BOUNDARY_NAMES[3], &crate::device::CONTEXT_HANDLE_REFUSED),
     ],
     ticks: &NR2_FLUSH_TICKS,
     failures: &NR2_FLUSH_FAILURES,
@@ -617,8 +627,15 @@ unsafe fn read_dma_record(
 }
 
 /// Refuse this Render, naming the rule.
+///
+/// The flush is here rather than only on the success paths because `Nr2Rej` is a
+/// FAILURE entry: `CounterBlock` surfaces a changed failure sum immediately, but
+/// only when something calls `flush()`, and a workload that only ever refuses
+/// would otherwise show nothing in the registry until `DxgkDdiDestroyDevice`.
+/// Every caller is on the PASSIVE Render path.
 fn refuse(refusal: RenderRefusal, status: NTSTATUS) -> NTSTATUS {
     bump_with_code(&NR2_REJECT, refusal.code());
+    NR2_COUNTERS.flush();
     status
 }
 
@@ -1165,6 +1182,41 @@ pub(crate) unsafe fn patch(args: &DXGKARG_PATCH) {
         NR2_PATCH_DIFF.fetch_add(1, Ordering::Relaxed);
         return;
     };
+
+    // ⛔ THE ASSUMPTION THIS TURNS INTO A CHECK. Render wrote every offset
+    // relative to ITS `pDmaBuffer`, which dxgkrnl had advanced to that Render's
+    // start; here they are re-based on `DmaBufferSubmissionStartOffset`. The two
+    // agree only if one Render is one submission — and dxgkrnl is free to batch
+    // several into one, which is precisely why the offset pair exists. If it
+    // ever does, `submission_start` is a DIFFERENT Render's start and every
+    // write below would land at an arbitrary place in the DMA buffer.
+    //
+    // The 112-byte header copy Render puts at its own offset 0 is the witness:
+    // if the batch token there matches the private record's, this submission
+    // starts where that Render did. Anything else counts and patches nothing.
+    if (submission_end - submission_start) < size_of::<HeliosNativeRenderV2>() {
+        NR2_PATCH_DIFF.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let mut witness = [0u8; size_of::<HeliosNativeRenderV2>()];
+    // SAFETY: the window was bounded against `DmaBufferSize` above, and it holds
+    // at least the header.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            (args.pDmaBuffer as *const u8).add(submission_start),
+            witness.as_mut_ptr(),
+            size_of::<HeliosNativeRenderV2>(),
+        )
+    };
+    match bytemuck::try_pod_read_unaligned::<HeliosNativeRenderV2>(&witness) {
+        Ok(header)
+            if header.magic == helios_protocol::native_render::HELIOS_HNR2_MAGIC
+                && header.batch_token == record.batch_token => {}
+        _ => {
+            NR2_PATCH_DIFF.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
     if args.pPatchLocationList.is_null() {
         return;
     }

@@ -42,8 +42,26 @@ pub struct DeviceContext {
     session: crate::sync::SpinLock<Option<core::ptr::NonNull<TranslationSessionObject>>>,
 }
 
+/// Tag proving a `HANDLE` really is a [`ContextContext`] — must be the FIRST
+/// field, like `AllocationContext`'s.
+const CONTEXT_CTX_MAGIC: u32 = 0x4843_5458; // "HCTX"
+
+/// Non-null context handles that failed the magic check.
+///
+/// ⛔ MUST READ 0, and it exists because `DXGKARG_PATCH` and
+/// `DXGKARG_SUBMITCOMMAND` deliver the context through a
+/// `union { hDevice; hContext; }`. The header says the `hContext` arm is the one
+/// a `SCHEDULINGCAPS_MULTI_ENGINE_AWARE` driver gets — this driver reports that
+/// bit — but "the union is always the arm I expect" is exactly the assumption
+/// [`ContextHandleRef`] was created to stop being an assumption, and reading a
+/// `DeviceContext` as a `ContextContext` would find `helios` at the wrong offset
+/// and dispatch on garbage. A nonzero value here is that hypothesis confirmed.
+pub static CONTEXT_HANDLE_REFUSED: AtomicU32 = AtomicU32::new(0);
+
 /// State for one scheduler context opened on a D3D device.
 pub struct ContextContext {
+    /// [`CONTEXT_CTX_MAGIC`] — must be the FIRST field.
+    magic: u32,
     /// Back-pointer to the owning device (valid for the context's lifetime).
     /// PRIVATE, for the same reason as [`DeviceContext::adapter`].
     device: *mut DeviceContext,
@@ -167,10 +185,34 @@ pub struct ContextHandleRef<'a> {
 
 impl<'a> ContextHandleRef<'a> {
     /// # Safety
-    /// `handle` must be a live hContext returned by [`dxgkddi_create_context`].
+    /// `handle` is either null, a live hContext returned by
+    /// [`dxgkddi_create_context`], or — from the DDIs whose argument struct
+    /// carries the `hDevice`/`hContext` union — something else entirely. The
+    /// magic check below is what makes the third case a counted refusal instead
+    /// of a dispatch on a misread struct; that a magic-matching pointer really
+    /// is live is dxgkrnl's contract and is not encodable.
     pub unsafe fn from_raw(handle: HANDLE) -> Option<Self> {
-        let context = unsafe { (handle as *const ContextContext).as_ref() }?;
-        Some(Self { context })
+        if handle.is_null() {
+            return None;
+        }
+        let p = handle as *const ContextContext;
+        if !p.is_aligned() {
+            CONTEXT_HANDLE_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        // SAFETY: non-null and aligned. Reading ONLY the magic through
+        // `addr_of!` + `read_unaligned` asserts nothing about the rest of the
+        // referent, which is the property a `&*` cast would assert with no
+        // evidence — the `open_allocation_context` shape, same reason.
+        let magic = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!((*p).magic)) };
+        if magic != CONTEXT_CTX_MAGIC {
+            CONTEXT_HANDLE_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        // SAFETY: the magic matched, so this is one of our contexts.
+        Some(Self {
+            context: unsafe { &*p },
+        })
     }
 
     pub fn adapter(&self) -> Option<&'a AdapterContext> {
@@ -628,6 +670,7 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     };
 
     let ctx = Box::new(ContextContext {
+        magic: CONTEXT_CTX_MAGIC,
         device: h_device as *mut DeviceContext,
         snap_resid: AtomicU32::new(0),
         snap_width: AtomicU32::new(0),
@@ -720,7 +763,11 @@ pub unsafe extern "C" fn dxgkddi_destroy_context(h_context: *mut c_void) -> NTST
     crate::diag::record(0x0800_0002);
     if !h_context.is_null() {
         // SAFETY: produced by Box::into_raw in create_context; destroyed once.
-        let ctx = unsafe { Box::from_raw(h_context as *mut ContextContext) };
+        let mut ctx = unsafe { Box::from_raw(h_context as *mut ContextContext) };
+        // Poison the tag BEFORE the box dies: a stale handle arriving on the
+        // Patch/SubmitCommand union then reads as a refusal rather than as a
+        // live context, for whatever the allocator has since put there.
+        ctx.magic = 0;
         match ctx.helios {
             HeliosContextRole::Legacy => {}
             HeliosContextRole::Queue { session, .. } => {
