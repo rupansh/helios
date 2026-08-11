@@ -333,6 +333,33 @@ static HLM1_PT_ERR: AtomicU32 = AtomicU32::new(0);
 /// An HLM1-eligible allocation was destroyed having never been bound.
 pub(crate) static HLM1_ERR_NEVER_BOUND: AtomicU32 = AtomicU32::new(0);
 
+// ── K2a deploy 2: the bind (behind `Hlm1Bind`) ───────────────────────────────
+
+/// `map_blob_at` calls that succeeded — the blob is now mapped at the window
+/// offset VidMm placed the allocation at, which is what makes the Lock2 view and
+/// the venus blob one set of bytes.
+static HLM1_BINDS: AtomicU32 = AtomicU32::new(0);
+/// Window page the last successful bind used. Compare against `HlPlPg`.
+static HLM1_BIND_PAGE: AtomicU32 = AtomicU32::new(0);
+/// `map_blob_at` refused the placement. A failure entry: it means an admitted
+/// HLM1 placement could not be honoured, which is not a normal state.
+static HLM1_BIND_FAIL: AtomicU32 = AtomicU32::new(0);
+/// An admitted placement arrived above PASSIVE, so the host round-trip could not
+/// be issued. A VALUE, not a failure: F15 measured `HlEirq = 0`, and a
+/// per-observation registry flush is the storm `diag.rs` records removing.
+static HLM1_BIND_IRQL: AtomicU32 = AtomicU32::new(0);
+/// Stamps written (`Hlm1Bind = 2`), and the nonce + digest of the last one. The
+/// guest reads the stamped bytes through its OWN Lock2 pointer, so a match
+/// cannot be satisfied by the guest's own writes — which is exactly what the
+/// `hts1_session_probe` H5 self-round-trip could not distinguish.
+static HLM1_STAMPS: AtomicU32 = AtomicU32::new(0);
+static HLM1_STAMP_FAIL: AtomicU32 = AtomicU32::new(0);
+static HLM1_NONCE: AtomicU32 = AtomicU32::new(0);
+static HLM1_DIGEST: AtomicU32 = AtomicU32::new(0);
+
+/// `Hlm1Bind` value that additionally stamps the sampled bytes.
+const HLM1_BIND_MODE_STAMP: u32 = 2;
+
 static HLM1_FLUSH_TICKS: AtomicU32 = AtomicU32::new(0);
 static HLM1_FLUSH_FAILURES: AtomicU32 = AtomicU32::new(0);
 
@@ -355,6 +382,14 @@ static HLM1_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(b"HlEvic", &HLM1_EVICT),
         e(b"HlPtEr", &HLM1_PT_ERR),
         f(b"HlEnb", &HLM1_ERR_NEVER_BOUND),
+        e(b"HlBndN", &HLM1_BINDS),
+        e(b"HlBndPg", &HLM1_BIND_PAGE),
+        f(b"HlBndE", &HLM1_BIND_FAIL),
+        e(b"HlBndQ", &HLM1_BIND_IRQL),
+        e(b"HlStmp", &HLM1_STAMPS),
+        f(b"HlStmpE", &HLM1_STAMP_FAIL),
+        e(b"HlNnce", &HLM1_NONCE),
+        e(b"HlDgst", &HLM1_DIGEST),
     ],
     ticks: &HLM1_FLUSH_TICKS,
     failures: &HLM1_FLUSH_FAILURES,
@@ -364,6 +399,15 @@ static HLM1_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
 /// Publish the block. PASSIVE_LEVEL only — it writes the registry.
 pub(crate) fn hlm1_dump_counters() {
     HLM1_COUNTERS.flush();
+}
+
+/// Publish the block with no throttle. PASSIVE_LEVEL only.
+///
+/// ⛔ The bind and the destroy tail must use THIS, not [`hlm1_dump_counters`]: a
+/// successful bind moves no failure counter, so `flush`'s throttle would publish
+/// the pre-bind reading on the one call that decides whether the unit worked.
+pub(crate) fn hlm1_publish_counters() {
+    HLM1_COUNTERS.publish();
 }
 
 /// Zero the block, atomics and registry both, so every value read afterwards is
@@ -476,6 +520,167 @@ fn hlm1_observe(
             HLM1_ERR_WINDOW.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Alias an HLM1 allocation's CPU view onto its venus blob, at the exact window
+/// offset VidMm placed the allocation at (K2a deploy 2, behind `Hlm1Bind`).
+///
+/// This is the whole of F14's fix: dxgkrnl derives the Lock2 VA from the
+/// segment's `CpuTranslatedAddress` plus the allocation's segment offset, so
+/// mapping the blob at that same offset makes the guest's CPU view and the host's
+/// blob one set of bytes. Without it the view is unrelated guest RAM.
+///
+/// ⛔ Its own IRQL gate and its own token mint. F15 measured every observation at
+/// PASSIVE (`HlEirq = 0`), but this arm sits ABOVE the DDI's content-op gate and
+/// `map_blob_at` is a host round-trip, so the check is made here rather than
+/// inherited from an annotation.
+///
+/// # Safety
+/// `h` must be the live allocation handle `alloc` was resolved from.
+unsafe fn hlm1_maybe_bind(
+    adapter: &AdapterContext,
+    h: HANDLE,
+    alloc: &PagingAllocInfo,
+    operation: u32,
+    segment_id: u32,
+    byte_offset: u64,
+    reserve: u64,
+) {
+    use helios_kmd_logic::hlm1_placement::{admit, Action, BindingState, Observation};
+    let mode = adapter.knobs().hlm1_bind;
+    if mode == 0 || !alloc.hlm1_eligible {
+        return;
+    }
+    // Refusals are already counted by `hlm1_observe` for this same observation
+    // (`HlFrgn` for a non-HLM1 segment, `HlEwin` for a range the KMD's fixed-map
+    // partition cannot hold), so this arm must not count them a second time.
+    let Ok(placement) = admit(
+        Observation {
+            operation,
+            segment_id,
+            byte_offset,
+            length_bytes: alloc.size,
+        },
+        reserve,
+    ) else {
+        return;
+    };
+    // `alloc.hlm1_bound` is a snapshot, so two notifications for one allocation
+    // can both decide to bind. Benign, and deliberately not locked: `map_blob_at`
+    // is idempotent at the same offset (`blob_remap_begin` answers `Mapped`), and
+    // both then store the same value.
+    if matches!(
+        BindingState(alloc.hlm1_bound).observe(placement),
+        Action::None
+    ) {
+        return;
+    }
+    // SAFETY: KeGetCurrentIrql is callable at any IRQL.
+    if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
+        HLM1_BIND_IRQL.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    // SAFETY: downstream of the runtime check immediately above, not of the
+    // documented annotation — the same discipline as the content-op mint below.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    match crate::virtio::ctrl::map_blob_at(
+        passive,
+        adapter,
+        alloc.resource_id,
+        placement.byte_offset,
+    ) {
+        Ok(_) => {
+            // ⛔ Only on the Ok path. A store after a failed map would make the
+            // next observation report `Action::None` and skip the retry.
+            // SAFETY: the handle this arm resolved, per the fn contract.
+            unsafe {
+                crate::ddi::create_allocation::set_hlm1_binding(h, placement.byte_offset)
+            };
+            HLM1_BINDS.fetch_add(1, Ordering::Relaxed);
+            HLM1_BIND_PAGE.store((placement.byte_offset >> 12) as u32, Ordering::Relaxed);
+            if mode >= HLM1_BIND_MODE_STAMP {
+                // SAFETY: PASSIVE (token above); the blob is mapped at
+                // `placement.byte_offset` by the call that just succeeded.
+                unsafe { hlm1_stamp(passive, adapter, alloc.resource_id, placement.length_bytes) };
+            }
+        }
+        Err(_) => {
+            HLM1_BIND_FAIL.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    // Bounded: at most one publication per bind or rebind of one allocation, and
+    // `Action::None` returns above before reaching here. The allocation can die
+    // without another paging op, so waiting for the content tail is waiting for a
+    // call that may never come.
+    hlm1_publish_counters();
+}
+
+/// Write the shared verify vocabulary's stamp bytes into the freshly bound blob
+/// and publish the nonce + digest.
+///
+/// The direction is deliberate: the KMD writes and the GUEST reads. A guest that
+/// writes and re-reads its own pointer passes identically on a private buffer,
+/// which is precisely why `hts1_session_probe` H5 could never see F14.
+/// `stamp_byte` is `!verify_byte`, so a guest that finds these bytes cannot have
+/// produced them itself for any nonce.
+///
+/// # Safety
+/// PASSIVE_LEVEL, and `resource_id` must name a live blob.
+unsafe fn hlm1_stamp(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    length_bytes: u64,
+) {
+    use helios_kmd_logic::hlm1_placement::{digest, sample_offsets, stamp_byte, MAX_SAMPLES};
+    // The bind ordinal, so a stale stamp from an earlier bind cannot satisfy a
+    // later one. Published as `HlNnce`, which is what a reader needs to
+    // reconstruct the expected bytes.
+    let nonce = u64::from(HLM1_BINDS.load(Ordering::Relaxed));
+    let mut offsets = [0u64; MAX_SAMPLES];
+    let n = sample_offsets(length_bytes, &mut offsets);
+    let mut samples = [(0u64, 0u8); MAX_SAMPLES];
+    let mut i = 0;
+    while i < n {
+        samples[i] = (offsets[i], stamp_byte(nonce, offsets[i]));
+        i += 1;
+    }
+    let mut wrote_all = false;
+    // SAFETY: PASSIVE per the fn contract; the closure writes only inside the
+    // mapping `with_blob_bytes` proves the length of.
+    let mapped = unsafe {
+        with_blob_bytes(passive, adapter, resource_id, |blob, len| {
+            // A blob shorter than the placement would leave some samples
+            // unwritten while the digest still covered them, which reads as a
+            // readback mismatch rather than as the short mapping it is.
+            if len < length_bytes {
+                return;
+            }
+            let mut i = 0;
+            while i < n {
+                let (offset, byte) = samples[i];
+                // SAFETY (inside the caller's `unsafe` block, so no nested one):
+                // `offset < length_bytes <= len` and `blob` maps `len` bytes.
+                // Volatile — the reader of these bytes is another mapping of the
+                // same pages, which the compiler cannot see.
+                blob.add(offset as usize).write_volatile(byte);
+                i += 1;
+            }
+            wrote_all = true;
+        })
+    };
+    if !mapped || !wrote_all {
+        HLM1_STAMP_FAIL.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    // The mapping is WC (`Cached = 0` for every HVM1 role), so the stores may sit
+    // in the write-combining buffers until something drains them. The guest reads
+    // these bytes from another mapping of the same pages.
+    // SAFETY: SFENCE is unprivileged and valid at any IRQL.
+    unsafe { core::arch::x86_64::_mm_sfence() };
+    HLM1_NONCE.store(nonce as u32, Ordering::Relaxed);
+    HLM1_DIGEST.store(digest(nonce, &samples[..n]) as u32, Ordering::Relaxed);
+    HLM1_STAMPS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// The `UPDATE_PAGE_TABLE` half, kept separate from [`bar_harvest_page_table`]
@@ -1725,6 +1930,19 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                     Some(alloc.size),
                     bar.size,
                 );
+                // SAFETY: `n.hAllocation` is the handle `paging_alloc_info` just
+                // resolved `alloc` from, live for this call.
+                unsafe {
+                    hlm1_maybe_bind(
+                        adapter,
+                        n.hAllocation,
+                        &alloc,
+                        args.Operation as u32,
+                        n.PhysicalAddress.SegmentId,
+                        n.PhysicalAddress.SegmentOffset,
+                        bar.size,
+                    )
+                };
             }
             return STATUS_SUCCESS;
         }

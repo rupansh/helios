@@ -456,6 +456,16 @@ impl CounterBlock {
         if !(due || fail_sum != previous || level() >= 1) {
             return;
         }
+        self.publish();
+    }
+
+    /// Mirror the block into the registry UNCONDITIONALLY. PASSIVE_LEVEL only.
+    ///
+    /// For the call that MATTERS, not for a steady state. [`Self::flush`]'s
+    /// throttle can write nothing at all, and a success does not move a failure
+    /// counter — so an event whose only evidence is a value counter that moved has
+    /// to publish through this or risk being graded on the pre-event reading.
+    pub fn publish(&self) {
         let mut i = 0;
         while i < self.entries.len() {
             record_named_bytes(self.entries[i].name, self.entries[i].value.load());
@@ -571,6 +581,26 @@ pub mod knobs {
     pub const BAR_SEG_FLAGS: KnobName = KnobName::new(b"BarSegFlags");
     /// BAR descriptor `BaseAddress` in MiB (default 0).
     pub const BAR_SEG_BASE_MB: KnobName = KnobName::new(b"BarSegBaseMB");
+    /// `Hlm1Only` (default 0 = the shape F15 measured). Drop the aperture
+    /// segment from an HVM1 role's `SupportedWriteSegmentSet`, so VidMm must
+    /// place the allocation in HLM1 or fail residency loudly.
+    ///
+    /// F15: out of `{HLM1, aperture}` VidMm chose the APERTURE (`HlPlSg = 1`),
+    /// which is legal — `preferred_segment` is only a hint — and leaves the Lock2
+    /// view as guest RAM disjoint from the venus blob (F14). 0 remains the
+    /// default because a hard `MakeResident` failure would block A3 entirely;
+    /// grade the `1` arm by `HlPlSg` (must read 2) and by `hts1_session_probe`
+    /// H3 still passing. Read at AddAdapter, so `pnputil /restart-device`
+    /// applies it with no rebuild.
+    pub const HLM1_ONLY: KnobName = KnobName::new(b"Hlm1Only");
+    /// `Hlm1Bind` (default 0 = OFF). Alias an HVM1 allocation's CPU view onto
+    /// its venus blob: `map_blob_at` the blob at the window offset VidMm placed
+    /// the allocation at, from the `NOTIFY_RESIDENCY` arm F15 named as the hook.
+    ///   0 = off, 1 = bind, 2 = bind and stamp the sampled bytes so a guest
+    ///       readback can prove the alias (`HlNnce` / `HlDgst`).
+    /// Inert unless the observed placement IS HLM1's, so it does nothing at
+    /// `Hlm1Only=0` on today's measurement.
+    pub const HLM1_BIND: KnobName = KnobName::new(b"Hlm1Bind");
     /// Reported device-memory capacity in MiB. 0 (default) preserves the proven
     /// one-GiB capacity of the existing aperture+BAR topology.
     pub const VIDMM_VRAM_MB: KnobName = KnobName::new(b"VidMmVramMB");

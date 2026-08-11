@@ -1249,10 +1249,8 @@ pub(crate) struct PagingAllocInfo {
     pub bar_placed: u64,
     /// K2a. See [`AllocationContext::hlm1_eligible`].
     pub hlm1_eligible: bool,
-    /// K2a. See [`AllocationContext::hlm1_bound`]. Read by the bind, which is
-    /// the next deploy; carried now so the instrument and the bind read one
-    /// snapshot shape rather than two.
-    #[allow(dead_code)]
+    /// K2a. See [`AllocationContext::hlm1_bound`]. Read by the bind, which
+    /// decides `Bind`/`Rebind`/`None` from this one snapshot.
     pub hlm1_bound: u64,
 }
 
@@ -2047,7 +2045,6 @@ pub(crate) unsafe fn set_bar_placement(h: HANDLE, offset: u64) {
 /// ⛔ Called only with an offset `map_blob_at` actually returned `Ok` for. A
 /// store on the failure path would make the next observation report
 /// `Action::None` and skip the retry — see `hlm1_placement::BindingState`.
-#[allow(dead_code)]
 pub(crate) unsafe fn set_hlm1_binding(h: HANDLE, offset: u64) {
     if h.is_null() {
         return;
@@ -2495,16 +2492,28 @@ fn vidmm_placement(
 /// (§4 as amended 2026-08-10). The placement is unchanged; only who refuses it,
 /// and whether anyone can see that, changed.
 ///
-/// The aperture bit IS in the supported set, because §10.7:2001-2002 names "the
+/// The aperture bit is in the supported set because §10.7:2001-2002 names "the
 /// package's ordinary aperture as the documented system-residency
-/// physical-address domain" — that is the eviction/system-residency domain, not
-/// an alternative preference.
-fn hvm1_placement(role: Hvm1Role) -> VidMmPlacement {
+/// physical-address domain" — the eviction/system-residency domain, not an
+/// alternative preference.
+///
+/// ⛔ **VidMm read it as an alternative preference anyway** (`FINDINGS.md` F15):
+/// it placed the role-1 pool in the aperture, `HlPlSg = 1`, with the GPU page
+/// table agreeing — so the Lock2 view was guest RAM and F14's defect stood. It is
+/// entitled to: `preferred_segment` is a hint. `Hlm1Only` removes the
+/// alternative, and defaults OFF because a hard `MakeResident` failure would
+/// block A3 entirely (CLAUDE.md rule 8: the measured value is the default, and
+/// the other arm stays reachable).
+fn hvm1_placement(role: Hvm1Role, hlm1_only: bool) -> VidMmPlacement {
     let contract = role.placement();
+    let aperture = if hlm1_only {
+        0
+    } else {
+        segment_bit(crate::ddi::gpummu::APERTURE_SEGMENT_ID)
+    };
     VidMmPlacement {
         preferred_segment: contract.preferred_segment,
-        supported_segments: segment_bit(contract.preferred_segment)
-            | segment_bit(crate::ddi::gpummu::APERTURE_SEGMENT_ID),
+        supported_segments: segment_bit(contract.preferred_segment) | aperture,
         cpu_visible: contract.cpu_visible,
         // §10.7:2003-2005 — `Cached = 0` for every role, and the CPU publication
         // ordering proof depends on it: a `HOST_CACHED` mapping would break the
@@ -2577,11 +2586,17 @@ unsafe fn destroy_allocation_ctx(
     // K2a: an HLM1 allocation that lived and died without ever being bound had
     // a CPU view backed by nothing this driver owns. There is no Lock-time
     // callback to refuse it at, so this post-hoc count is the only signal.
-    if ctx.hlm1_eligible && ctx.hlm1_bound.load(Ordering::Acquire) == BAR_UNPLACED {
-        crate::ddi::build_paging_buffer::HLM1_ERR_NEVER_BOUND.fetch_add(1, Ordering::Relaxed);
+    if ctx.hlm1_eligible {
+        if ctx.hlm1_bound.load(Ordering::Acquire) == BAR_UNPLACED {
+            crate::ddi::build_paging_buffer::HLM1_ERR_NEVER_BOUND.fetch_add(1, Ordering::Relaxed);
+        }
         // Publish here or not at all: the only other flush site is the paging
         // content tail, and destroy runs after this allocation's last paging op.
-        crate::ddi::build_paging_buffer::hlm1_dump_counters();
+        // ⛔ Unconditional on eligibility, not on the never-bound arm it used to
+        // sit inside — a SUCCESSFUL bind is exactly the case whose counters no
+        // other site publishes — and unthrottled, because a bind moves no failure
+        // counter and `flush` would then write nothing here.
+        crate::ddi::build_paging_buffer::hlm1_publish_counters();
     }
     // Withdraw the DMA-flip lookup FIRST: after this no Present can resolve
     // this resource id to a handle whose Box is about to be dropped.
@@ -3827,7 +3842,7 @@ unsafe fn admit_hvm1(
     // :2049-2050).
     //
     // Checked BEFORE `build_backing` so a refusal has no host resource to orphan.
-    let placement = hvm1_placement(role);
+    let placement = hvm1_placement(role, adapter.knobs().hlm1_only);
     if !segment_is_reported(adapter, placement.preferred_segment) {
         let (counter, name) = role_segment_absent_counter(role);
         bump(counter, name);
