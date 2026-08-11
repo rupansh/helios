@@ -344,6 +344,12 @@ static HLM1_BIND_PAGE: AtomicU32 = AtomicU32::new(0);
 /// `map_blob_at` refused the placement. A failure entry: it means an admitted
 /// HLM1 placement could not be honoured, which is not a normal state.
 static HLM1_BIND_FAIL: AtomicU32 = AtomicU32::new(0);
+/// Binds that MOVED an existing mapping. Expected small: the page-table arm
+/// fires ~99 times per pool life, and every batch that agrees with the current
+/// binding short-circuits on `Action::None` rather than re-issuing the host
+/// round-trip. A large value means the placement is not stable and the bind is
+/// churning host mappings inside a paging op.
+static HLM1_REBINDS: AtomicU32 = AtomicU32::new(0);
 /// An admitted placement arrived above PASSIVE, so the host round-trip could not
 /// be issued. A VALUE, not a failure: F15 measured `HlEirq = 0`, and a
 /// per-observation registry flush is the storm `diag.rs` records removing.
@@ -408,6 +414,7 @@ static HLM1_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(b"HlBndPg", &HLM1_BIND_PAGE),
         f(b"HlBndE", &HLM1_BIND_FAIL),
         e(b"HlBndQ", &HLM1_BIND_IRQL),
+        e(b"HlBndR", &HLM1_REBINDS),
         e(b"HlStmp", &HLM1_STAMPS),
         f(b"HlStmpE", &HLM1_STAMP_FAIL),
         e(b"HlNnce", &HLM1_NONCE),
@@ -617,10 +624,8 @@ unsafe fn hlm1_maybe_bind(
     // can both decide to bind. Benign, and deliberately not locked: `map_blob_at`
     // is idempotent at the same offset (`blob_remap_begin` answers `Mapped`), and
     // both then store the same value.
-    if matches!(
-        BindingState(alloc.hlm1_bound).observe(placement),
-        Action::None
-    ) {
+    let action = BindingState(alloc.hlm1_bound).observe(placement);
+    if matches!(action, Action::None) {
         return;
     }
     // SAFETY: KeGetCurrentIrql is callable at any IRQL.
@@ -645,6 +650,9 @@ unsafe fn hlm1_maybe_bind(
                 crate::ddi::create_allocation::set_hlm1_binding(h, placement.byte_offset)
             };
             HLM1_BINDS.fetch_add(1, Ordering::Relaxed);
+            if matches!(action, Action::Rebind { .. }) {
+                HLM1_REBINDS.fetch_add(1, Ordering::Relaxed);
+            }
             HLM1_BIND_PAGE.store((placement.byte_offset >> 12) as u32, Ordering::Relaxed);
             if mode >= HLM1_BIND_MODE_STAMP {
                 // SAFETY: PASSIVE (token above); the blob is mapped at
@@ -791,7 +799,11 @@ pub(crate) unsafe fn hlm1_readback(
 ///
 /// # Safety
 /// As [`bar_harvest_page_table`].
-unsafe fn hlm1_harvest_page_table(reserve: u64, u: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE) {
+unsafe fn hlm1_harvest_page_table(
+    adapter: &AdapterContext,
+    reserve: u64,
+    u: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE,
+) {
     if u.PageTableLevel != 0 || u.pPageTableEntries.is_null() || u.NumPageTableEntries == 0 {
         return;
     }
@@ -839,6 +851,41 @@ unsafe fn hlm1_harvest_page_table(reserve: u64, u: &DXGK_BUILDPAGINGBUFFER_UPDAT
         base.map(|_| (u.NumPageTableEntries as u64) << 12),
         reserve,
     );
+    // ⭐ THE PAGE TABLE IS ALSO A BIND HOOK, and with `AccessedPhysically` cleared
+    // it is the ONLY one: `NOTIFY_RESIDENCY` stops firing entirely in that
+    // configuration (`HlOpMs` 0x8B20 → 0xB00) while this arm still reports the
+    // pool in segment 2 (`HlPt2 = 66`). The offset arithmetic is
+    // `bar_harvest_page_table`'s, which is the PROVEN one — it is what
+    // `MapCpuHostAperture` compares its own placement against for every D3D11
+    // BAR surface — and the two arms AGREE where both fire (`HlAd1Pg` =
+    // `HlBndPg` = 4108 on the default configuration).
+    let Some(base) = base else { return };
+    // The bind maps the WHOLE blob, so the window bound must be checked against
+    // the allocation's size, not this batch's PTE count.
+    // ⚠ A discontiguous run cannot be one window range. `bar_harvest_page_table`
+    // refuses it into `PgEd`; refuse it here too rather than binding a range the
+    // page table contradicts.
+    let n = u.NumPageTableEntries as u64;
+    if n >= 2 && u.Flags.Repeat() == 0 {
+        // SAFETY: pPageTableEntries holds NumPageTableEntries entries.
+        let last = unsafe { core::ptr::read_unaligned(u.pPageTableEntries.add((n - 1) as usize)) };
+        let last_valid = unsafe { last.__bindgen_anon_1.__bindgen_anon_1 }.Valid() != 0;
+        if last_valid && unsafe { last.__bindgen_anon_2.PageAddress } != page0 + (n - 1) {
+            return;
+        }
+    }
+    // SAFETY: the live paging-op allocation handle `alloc` was resolved from.
+    unsafe {
+        hlm1_maybe_bind(
+            adapter,
+            u.hAllocation,
+            &alloc,
+            crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_UPDATE_PAGE_TABLE as u32,
+            seg,
+            base,
+            reserve,
+        )
+    };
 }
 
 /// Mirror the paging counter block into the registry.
@@ -2007,7 +2054,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         }
         unsafe { bar_harvest_page_table(bar.seg_id, bar.size, update) };
         // SAFETY: the same live `update` the harvest above just read.
-        unsafe { hlm1_harvest_page_table(bar.size, update) };
+        unsafe { hlm1_harvest_page_table(adapter, bar.size, update) };
         return STATUS_SUCCESS;
     }
 
