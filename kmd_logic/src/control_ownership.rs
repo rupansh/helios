@@ -14,7 +14,6 @@ use helios_protocol::virtio_gpu::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EpochRefusal {
     Zero,
-    Exhausted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -285,36 +284,32 @@ impl TransportGeneration {
         })
     }
 
-    /// Safety: old-epoch submission admission is irreversibly closed and drained,
-    /// no retained `PreparedControl` can enqueue after this reset is minted, and
-    /// the device cannot DMA.
-    pub unsafe fn advance(self) -> Result<TransportAdvance, RefusedTransportAdvance> {
-        let Some(raw) = self.epoch.get().checked_add(1) else {
-            return Err(RefusedTransportAdvance {
-                reason: EpochRefusal::Exhausted,
-                generation: self,
-            });
-        };
-        let Some(epoch) = NonZeroU64::new(raw) else {
-            return Err(RefusedTransportAdvance {
-                reason: EpochRefusal::Exhausted,
-                generation: self,
-            });
-        };
-        Ok(TransportAdvance {
-            generation: Self {
+    /// Safety: old-epoch submission admission is irreversibly closed and drained;
+    /// no retained `PreparedControl` can enqueue, and the physical transport has
+    /// exact raw status byte zero and cannot DMA.
+    pub unsafe fn advance(self) -> TransportRetirement {
+        let retired = self.epoch;
+        let successor = match retired.get().checked_add(1).and_then(NonZeroU64::new) {
+            Some(generation) => TransportSuccessor::Next(Self {
                 epoch: TransportEpoch {
-                    domain: self.epoch.domain(),
-                    generation: epoch,
+                    domain: retired.domain(),
+                    generation,
                 },
                 resource_high_water: 0,
                 context_high_water: 0,
                 attachment_high_water: 0,
-            },
-            reset: TransportReset {
-                retired: self.epoch,
-            },
-        })
+            }),
+            None => TransportSuccessor::EpochExhausted(ExhaustedTransportGeneration {
+                retired,
+                resource_high_water: self.resource_high_water,
+                context_high_water: self.context_high_water,
+                attachment_high_water: self.attachment_high_water,
+            }),
+        };
+        TransportRetirement {
+            successor,
+            reset: TransportReset { retired },
+        }
     }
 }
 
@@ -337,39 +332,79 @@ impl RefusedTransportRestore {
 
 #[must_use]
 #[derive(Debug, Eq, PartialEq)]
-pub struct TransportAdvance {
-    generation: TransportGeneration,
+pub struct TransportRetirement {
+    successor: TransportSuccessor,
     reset: TransportReset,
 }
 
-impl TransportAdvance {
-    pub const fn generation(&self) -> &TransportGeneration {
-        &self.generation
+impl TransportRetirement {
+    pub const fn successor(&self) -> &TransportSuccessor {
+        &self.successor
+    }
+
+    pub const fn next_generation(&self) -> Option<&TransportGeneration> {
+        match &self.successor {
+            TransportSuccessor::Next(generation) => Some(generation),
+            TransportSuccessor::EpochExhausted(_) => None,
+        }
     }
 
     pub const fn reset(&self) -> &TransportReset {
         &self.reset
     }
 
-    pub fn into_parts(self) -> (TransportGeneration, TransportReset) {
-        (self.generation, self.reset)
+    pub fn into_parts(self) -> (TransportSuccessor, TransportReset) {
+        (self.successor, self.reset)
     }
 }
 
 #[must_use]
 #[derive(Debug, Eq, PartialEq)]
-pub struct RefusedTransportAdvance {
-    reason: EpochRefusal,
-    generation: TransportGeneration,
+pub enum TransportSuccessor {
+    Next(TransportGeneration),
+    EpochExhausted(ExhaustedTransportGeneration),
 }
 
-impl RefusedTransportAdvance {
-    pub const fn reason(&self) -> EpochRefusal {
-        self.reason
+impl TransportSuccessor {
+    pub const fn next_generation(&self) -> Option<&TransportGeneration> {
+        match self {
+            Self::Next(generation) => Some(generation),
+            Self::EpochExhausted(_) => None,
+        }
     }
 
-    pub fn into_generation(self) -> TransportGeneration {
-        self.generation
+    pub const fn exhausted(&self) -> Option<&ExhaustedTransportGeneration> {
+        match self {
+            Self::Next(_) => None,
+            Self::EpochExhausted(exhausted) => Some(exhausted),
+        }
+    }
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct ExhaustedTransportGeneration {
+    retired: TransportEpoch,
+    resource_high_water: u32,
+    context_high_water: u32,
+    attachment_high_water: u64,
+}
+
+impl ExhaustedTransportGeneration {
+    pub const fn retired_epoch(&self) -> TransportEpoch {
+        self.retired
+    }
+
+    pub const fn resource_high_water(&self) -> u32 {
+        self.resource_high_water
+    }
+
+    pub const fn context_high_water(&self) -> u32 {
+        self.context_high_water
+    }
+
+    pub const fn attachment_high_water(&self) -> u64 {
+        self.attachment_high_water
     }
 }
 
@@ -2837,17 +2872,22 @@ mod tests {
         let active_generation = TransportGeneration::bootstrap(domain_root);
         assert_eq!(active_generation.epoch().get(), 1);
         assert_eq!(active_generation.epoch().domain(), domain(ROOT_DOMAIN));
-        let advance = unsafe { active_generation.advance().unwrap() };
-        assert_eq!(advance.generation().epoch().get(), 2);
+        let advance = unsafe { active_generation.advance() };
+        assert_eq!(advance.next_generation().unwrap().epoch().get(), 2);
         assert_eq!(
             advance.reset().retired_epoch(),
             epoch_in_domain(ROOT_DOMAIN, 1)
         );
-        let (active_generation, _) = advance.into_parts();
-        let next = unsafe { active_generation.advance().unwrap() };
-        assert_eq!(next.generation().epoch().get(), 3);
+        let (TransportSuccessor::Next(active_generation), _) = advance.into_parts() else {
+            panic!("epoch two must remain allocatable");
+        };
+        let next = unsafe { active_generation.advance() };
+        assert_eq!(next.next_generation().unwrap().epoch().get(), 3);
         assert_eq!(next.reset().retired_epoch().get(), 2);
-        assert_eq!(next.generation().epoch().domain(), domain(ROOT_DOMAIN));
+        assert_eq!(
+            next.next_generation().unwrap().epoch().domain(),
+            domain(ROOT_DOMAIN)
+        );
 
         let refusal = unsafe { TransportGeneration::restore(root(0x101), 0, 7, 8, 9).unwrap_err() };
         assert_eq!(refusal.reason(), EpochRefusal::Zero);
@@ -2858,11 +2898,16 @@ mod tests {
         assert_eq!(restored.context_high_water(), 8);
         assert_eq!(restored.attachment_high_water(), 9);
         let exhausted = generation(u64::MAX, 7);
-        let refusal = unsafe { exhausted.advance().unwrap_err() };
-        assert_eq!(refusal.reason(), EpochRefusal::Exhausted);
-        let exhausted = refusal.into_generation();
-        assert_eq!(exhausted.epoch(), epoch(u64::MAX));
+        let retirement = unsafe { exhausted.advance() };
+        assert_eq!(retirement.reset().retired_epoch(), epoch(u64::MAX));
+        assert_eq!(retirement.next_generation(), None);
+        let (TransportSuccessor::EpochExhausted(exhausted), _) = retirement.into_parts() else {
+            panic!("maximum epoch must be terminal");
+        };
+        assert_eq!(exhausted.retired_epoch(), epoch(u64::MAX));
         assert_eq!(exhausted.resource_high_water(), 7);
+        assert_eq!(exhausted.context_high_water(), 0);
+        assert_eq!(exhausted.attachment_high_water(), 0);
         assert_eq!(
             TransportResource::from_raw(epoch(1), 0),
             Err(ResourceIdentityRefusal::Zero)
@@ -2988,10 +3033,11 @@ mod tests {
             attachment_high_water: u64::MAX,
         };
         // SAFETY: this synthetic old epoch is admission-closed, drained, and DMA-dead.
-        let advance = unsafe { retired.advance().unwrap() };
-        assert_eq!(advance.generation().resource_high_water(), 0);
-        assert_eq!(advance.generation().context_high_water(), 0);
-        assert_eq!(advance.generation().attachment_high_water(), 0);
+        let advance = unsafe { retired.advance() };
+        let next = advance.next_generation().unwrap();
+        assert_eq!(next.resource_high_water(), 0);
+        assert_eq!(next.context_high_water(), 0);
+        assert_eq!(next.attachment_high_water(), 0);
         drop(first_reservation);
         drop(second_reservation);
         drop(max_reservation);
@@ -4217,7 +4263,7 @@ mod tests {
         let _ = a.finish_create(completion_a).unwrap();
         let _ = b.finish_create(completed_ok::<u8>(request_b)).unwrap();
 
-        let advance = unsafe { generation.advance().unwrap() };
+        let advance = unsafe { generation.advance() };
         let (_, reset) = advance.into_parts();
         let (authority_a, release_a) = a.transport_reset(resource_a, &reset).unwrap().into_parts();
         let (authority_b, release_b) = b.transport_reset(resource_b, &reset).unwrap().into_parts();
@@ -4231,6 +4277,58 @@ mod tests {
         let (a, authority_b) = refusal.into_parts();
         assert_eq!(a.consume_terminal(authority_a), Ok(()));
         assert_eq!(b.consume_terminal(authority_b), Ok(()));
+    }
+
+    #[test]
+    fn maximum_epoch_still_yields_exact_cleanup_authority_and_no_successor() {
+        let generation =
+            unsafe { TransportGeneration::restore(root(0x10a), u64::MAX, 0, 0, 9).unwrap() };
+        let allocation = generation.allocate_resource().unwrap();
+        let resource = allocation.resource();
+        let (generation, reservation) = allocation.into_parts();
+        let allocation = generation.allocate_context().unwrap();
+        let context = allocation.context();
+        let (generation, context_reservation) = allocation.into_parts();
+
+        let mut resource_lifecycle = ResourceLifecycle::new(reservation, 0x31_u8);
+        let mut context_lifecycle = TransportContextLifecycle::new(context_reservation, 0x32_u8);
+        let window = window(resource, 0);
+        let (mut window_lifecycle, never_exposed) = window_admission(window, 0x33_u8);
+        drop(never_exposed);
+
+        let retirement = unsafe { generation.advance() };
+        assert_eq!(retirement.reset().retired_epoch(), resource.epoch());
+        assert!(retirement.next_generation().is_none());
+
+        let resource_reset = resource_lifecycle
+            .transport_reset(resource, retirement.reset())
+            .unwrap();
+        let (destroy, attachment_release) = resource_reset.into_parts();
+        assert!(attachment_release.is_none());
+        assert_eq!(resource_lifecycle.consume_terminal(destroy).unwrap(), 0x31);
+
+        let release = context_lifecycle
+            .transport_reset(context, retirement.reset())
+            .unwrap();
+        let released = context_lifecycle.consume_terminal(release).unwrap();
+        assert_eq!(released.into_parts().1, 0x32);
+
+        let release = window_lifecycle
+            .transport_reset(window, retirement.reset())
+            .unwrap();
+        assert_eq!(window_lifecycle.consume_unmapped(release).unwrap(), 0x33);
+
+        let (successor, reset) = retirement.into_parts();
+        let TransportSuccessor::EpochExhausted(exhausted) = successor else {
+            panic!("maximum epoch must not reopen");
+        };
+        assert_eq!(exhausted.retired_epoch(), reset.retired_epoch());
+        assert_eq!(exhausted.retired_epoch().domain(), domain(0x10a));
+        assert_eq!(exhausted.resource_high_water(), 1);
+        assert_eq!(exhausted.context_high_water(), 1);
+        assert_eq!(exhausted.attachment_high_water(), 9);
+        drop(reset);
+        drop(exhausted);
     }
 
     #[test]
