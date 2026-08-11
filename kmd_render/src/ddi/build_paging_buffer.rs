@@ -360,6 +360,28 @@ static HLM1_DIGEST: AtomicU32 = AtomicU32::new(0);
 /// `Hlm1Bind` value that additionally stamps the sampled bytes.
 const HLM1_BIND_MODE_STAMP: u32 = 2;
 
+/// The three bytes the BLOB holds at destroy, at the three offsets
+/// `hts1_session_probe` H5 writes — packed `(first << 16) | (slot_end << 8) |
+/// last`. See [`hlm1_readback`]; `HlRdEr` counts a mapping that could not be
+/// read at all, which is the difference between "not the blob" and "no answer".
+static HLM1_READBACK: AtomicU32 = AtomicU32::new(0);
+static HLM1_READBACK_FAIL: AtomicU32 = AtomicU32::new(0);
+/// `1 << operation` for every op that produced an ADMITTED HLM1 placement, and
+/// the FIRST such (op, page).
+///
+/// ⛔ The instrument's placement triple is last-writer-wins, and F15 read its
+/// aperture value as "VidMm is not using HLM1 at all". That was wrong — the pool
+/// visits segment 2 and the aperture is merely LAST — so the admitted set is
+/// recorded separately and cannot be overwritten by a later foreign placement.
+static HLM1_ADMIT_MASK: AtomicU32 = AtomicU32::new(0);
+static HLM1_ADMIT_FIRST_OP: AtomicU32 = AtomicU32::new(0);
+static HLM1_ADMIT_FIRST_PAGE: AtomicU32 = AtomicU32::new(0);
+/// `UPDATE_PAGE_TABLE` PTE[0] observations by segment: HLM1 vs system memory.
+/// `HlPtSg` alone cannot distinguish "the page table never named HLM1" from "the
+/// last batch happened to be system memory".
+static HLM1_PT_HLM1: AtomicU32 = AtomicU32::new(0);
+static HLM1_PT_SYSTEM: AtomicU32 = AtomicU32::new(0);
+
 static HLM1_FLUSH_TICKS: AtomicU32 = AtomicU32::new(0);
 static HLM1_FLUSH_FAILURES: AtomicU32 = AtomicU32::new(0);
 
@@ -390,6 +412,13 @@ static HLM1_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         f(b"HlStmpE", &HLM1_STAMP_FAIL),
         e(b"HlNnce", &HLM1_NONCE),
         e(b"HlDgst", &HLM1_DIGEST),
+        e(b"HlRdbk", &HLM1_READBACK),
+        f(b"HlRdEr", &HLM1_READBACK_FAIL),
+        e(b"HlAdMs", &HLM1_ADMIT_MASK),
+        e(b"HlAd1Op", &HLM1_ADMIT_FIRST_OP),
+        e(b"HlAd1Pg", &HLM1_ADMIT_FIRST_PAGE),
+        e(b"HlPt2", &HLM1_PT_HLM1),
+        e(b"HlPt0", &HLM1_PT_SYSTEM),
     ],
     ticks: &HLM1_FLUSH_TICKS,
     failures: &HLM1_FLUSH_FAILURES,
@@ -511,7 +540,26 @@ fn hlm1_observe(
         },
         reserve,
     ) {
-        Ok(_) => {}
+        Ok(placement) => {
+            if operation < 32 {
+                HLM1_ADMIT_MASK.fetch_or(1u32 << operation, Ordering::Relaxed);
+            }
+            // FIRST, not last: the aperture placement that overwrites `HlPlSg`
+            // arrives after this one, and F15 read that overwrite as the whole
+            // story. `compare_exchange` on the page keeps the pair consistent —
+            // both fields describe the same observation or neither is written.
+            if HLM1_ADMIT_FIRST_PAGE
+                .compare_exchange(
+                    0,
+                    (placement.byte_offset >> 12) as u32,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                HLM1_ADMIT_FIRST_OP.store(operation, Ordering::Relaxed);
+            }
+        }
         Err(PlacementRefusal::ForeignSegment { .. })
         | Err(PlacementRefusal::NotPlacementBearing { .. }) => {
             HLM1_FOREIGN.fetch_add(1, Ordering::Relaxed);
@@ -683,6 +731,60 @@ unsafe fn hlm1_stamp(
     HLM1_STAMPS.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Read the BLOB's bytes at the three offsets `hts1_session_probe` H5 writes and
+/// publish them raw (`HlRdbk`).
+///
+/// ⭐ The one acceptance check that cannot pass on a private buffer. H5 writes
+/// three bytes through `lk.pData` and reads them back through the SAME pointer,
+/// so it passes identically whether or not that pointer is the venus blob
+/// (`FINDINGS.md` F14). This reads the OTHER side of the alias, from kernel space,
+/// through `map_blob_prepare` + `MmMapIoSpace`.
+///
+/// It publishes bytes, not a verdict: the KMD is told neither H5's constants nor
+/// the stamp's, so `0xA55AC3` (H5's writes reached the blob) and the K2a stamp
+/// bytes (the mapping reads fine and the guest wrote elsewhere) are both readings
+/// a human makes, and neither can be manufactured here.
+///
+/// # Safety
+/// PASSIVE_LEVEL, and `resource_id` must still be live.
+pub(crate) unsafe fn hlm1_readback(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    byte_size: u64,
+) {
+    // H5's offsets, from the protocol constants rather than from literals.
+    let slot_end = helios_protocol::HELIOS_HVM1_REPLY_SLOT_BYTES.saturating_sub(1);
+    let last = byte_size.saturating_sub(1);
+    if byte_size == 0 || slot_end >= byte_size {
+        return;
+    }
+    let mut packed = 0u32;
+    let mut read = false;
+    // SAFETY: PASSIVE per the fn contract; the closure reads only inside the
+    // mapping whose length `with_blob_bytes` supplies.
+    let mapped = unsafe {
+        with_blob_bytes(passive, adapter, resource_id, |blob, len| {
+            if len <= last {
+                return;
+            }
+            // SAFETY (inside the caller's `unsafe` block): every offset is
+            // `< byte_size <= len` and `blob` maps `len` bytes. Volatile because
+            // the writer is another mapping of the same pages.
+            let b0 = blob.read_volatile();
+            let b1 = blob.add(slot_end as usize).read_volatile();
+            let b2 = blob.add(last as usize).read_volatile();
+            packed = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+            read = true;
+        })
+    };
+    if mapped && read {
+        HLM1_READBACK.store(packed, Ordering::Relaxed);
+    } else {
+        HLM1_READBACK_FAIL.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// The `UPDATE_PAGE_TABLE` half, kept separate from [`bar_harvest_page_table`]
 /// because that function's `bar_placed` comparison is `PgUn`'s definition and
 /// re-basing it would silently change what `PgUn` counts.
@@ -714,6 +816,11 @@ unsafe fn hlm1_harvest_page_table(reserve: u64, u: &DXGK_BUILDPAGINGBUFFER_UPDAT
     }
     let seg = unsafe { pte0.__bindgen_anon_1.__bindgen_anon_1 }.Segment() as u32;
     let page0 = unsafe { pte0.__bindgen_anon_2.PageAddress };
+    if seg == helios_protocol::HELIOS_SEGMENT_ID_HLM1 {
+        HLM1_PT_HLM1.fetch_add(1, Ordering::Relaxed);
+    } else if seg == 0 {
+        HLM1_PT_SYSTEM.fetch_add(1, Ordering::Relaxed);
+    }
     HLM1_PT_SEG.store(seg, Ordering::Relaxed);
     HLM1_PT_PAGE.store(page0 as u32, Ordering::Relaxed);
     // The same base arithmetic `bar_harvest_page_table` uses: an unchecked

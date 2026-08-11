@@ -2504,13 +2504,17 @@ fn vidmm_placement(
 /// alternative, and defaults OFF because a hard `MakeResident` failure would
 /// block A3 entirely (CLAUDE.md rule 8: the measured value is the default, and
 /// the other arm stays reachable).
-fn hvm1_placement(role: Hvm1Role, hlm1_only: bool) -> VidMmPlacement {
+fn hvm1_placement(role: Hvm1Role, hlm1_only: bool, flags_off: u32) -> VidMmPlacement {
     let contract = role.placement();
     let aperture = if hlm1_only {
         0
     } else {
         segment_bit(crate::ddi::gpummu::APERTURE_SEGMENT_ID)
     };
+    // `Hlm1FlagsOff` — see `diag::knobs::HLM1_FLAGS_OFF`. Each cleared bit is a
+    // candidate explanation for VidMm ending the allocation in the aperture;
+    // 0 (the default) states §10.7 exactly.
+    let keep = |bit: u32, contract_value: bool| contract_value && flags_off & bit == 0;
     VidMmPlacement {
         preferred_segment: contract.preferred_segment,
         supported_segments: segment_bit(contract.preferred_segment) | aperture,
@@ -2526,10 +2530,12 @@ fn hvm1_placement(role: Hvm1Role, hlm1_only: bool) -> VidMmPlacement {
         // segment/physical-address capability patched from the allocation list.
         // ⚠ If K6's Render/Patch path ever stops dereferencing it, this bit
         // becomes a lie even though it is set exactly as specified.
-        accessed_physically: contract.accessed_physically,
+        accessed_physically: keep(1, contract.accessed_physically),
+        // NOT maskable: this bit is what delivers `NOTIFY_RESIDENCY`, which is
+        // the arm the bind runs on (F15).
         explicit_residency_notification: contract.explicit_residency_notification,
-        disable_partial_residency: contract.disable_partial_residency,
-        restricted_to_single_segment: contract.restricted_to_single_segment,
+        disable_partial_residency: keep(2, contract.disable_partial_residency),
+        restricted_to_single_segment: keep(4, contract.restricted_to_single_segment),
     }
 }
 
@@ -2590,6 +2596,24 @@ unsafe fn destroy_allocation_ctx(
         if ctx.hlm1_bound.load(Ordering::Acquire) == BAR_UNPLACED {
             crate::ddi::build_paging_buffer::HLM1_ERR_NEVER_BOUND.fetch_add(1, Ordering::Relaxed);
         }
+        // ⭐ THE ACCEPTANCE ORACLE, and the only one that does not round-trip
+        // through the same pointer it is testing (`hts1_session_probe` H5's
+        // defect, `FINDINGS.md` F14). Read the BLOB's bytes at the three offsets
+        // that probe writes and report them raw: `0xA55AC3` means the guest's
+        // Lock2 view IS the blob; the K2a stamp bytes mean the mapping is being
+        // read correctly and the guest wrote somewhere else. The KMD knows
+        // neither expectation, which is what makes the reading evidence.
+        //
+        // Before any teardown below: the blob must still exist to be read.
+        // SAFETY: PASSIVE (this DDI), and `resource_id` is still live here.
+        unsafe {
+            crate::ddi::build_paging_buffer::hlm1_readback(
+                passive,
+                adapter,
+                ctx.resource_id,
+                ctx.size as u64,
+            )
+        };
         // Publish here or not at all: the only other flush site is the paging
         // content tail, and destroy runs after this allocation's last paging op.
         // ⛔ Unconditional on eligibility, not on the never-bound arm it used to
@@ -3842,7 +3866,8 @@ unsafe fn admit_hvm1(
     // :2049-2050).
     //
     // Checked BEFORE `build_backing` so a refusal has no host resource to orphan.
-    let placement = hvm1_placement(role, adapter.knobs().hlm1_only);
+    let knobs = adapter.knobs();
+    let placement = hvm1_placement(role, knobs.hlm1_only, knobs.hlm1_flags_off);
     if !segment_is_reported(adapter, placement.preferred_segment) {
         let (counter, name) = role_segment_absent_counter(role);
         bump(counter, name);

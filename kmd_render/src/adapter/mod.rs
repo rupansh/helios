@@ -188,6 +188,10 @@ pub(crate) struct AdapterKnobs {
     /// role's supported segment set to HLM1 alone. See
     /// `crate::diag::knobs::HLM1_ONLY`; mirrored to `HlOnly`.
     pub hlm1_only: bool,
+    /// `Hlm1FlagsOff` (default 0). Mask of §10.7 placement bits to clear on an
+    /// HVM1 role. See `crate::diag::knobs::HLM1_FLAGS_OFF`; mirrored to
+    /// `HlFlgOff`.
+    pub hlm1_flags_off: u32,
     /// `Hlm1Bind` (default 0 = OFF). 1 binds an HVM1 allocation's venus blob at
     /// the window offset VidMm placed it at; 2 additionally stamps it. Kept raw
     /// because the value selects the mode. See `crate::diag::knobs::HLM1_BIND`;
@@ -240,6 +244,7 @@ impl AdapterKnobs {
         bar_seg_base_mb: 0,
         bar_seg_mode: 10,
         hlm1_only: false,
+        hlm1_flags_off: 0,
         hlm1_bind: 0,
         vidmm_vram_mb: VIDMM_VRAM_MB_AUTO,
     };
@@ -266,6 +271,7 @@ impl AdapterKnobs {
             bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),
             bar_seg_mode: read_config_dword(knobs::BAR_SEG_MODE, 10),
             hlm1_only: read_config_dword(knobs::HLM1_ONLY, 0) != 0,
+            hlm1_flags_off: read_config_dword(knobs::HLM1_FLAGS_OFF, 0),
             hlm1_bind: read_config_dword(knobs::HLM1_BIND, 0),
             vidmm_vram_mb: read_config_dword(knobs::VIDMM_VRAM_MB, VIDMM_VRAM_MB_AUTO),
         }
@@ -291,6 +297,7 @@ impl AdapterKnobs {
         // because it was reset is indistinguishable from one that never took.
         crate::diag::record_named_bytes(b"HlOnly", knobs.hlm1_only as u32);
         crate::diag::record_named_bytes(b"HlBind", knobs.hlm1_bind);
+        crate::diag::record_named_bytes(b"HlFlgOff", knobs.hlm1_flags_off);
         // VidVram is recorded after StartDevice resolves the absent-value
         // sentinel from the virtio host-visible capability.
         crate::diag::record_named_bytes(b"VidVBad", 0);

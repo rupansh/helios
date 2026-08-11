@@ -593,6 +593,17 @@ pub mod knobs {
     /// H3 still passing. Read at AddAdapter, so `pnputil /restart-device`
     /// applies it with no rebuild.
     pub const HLM1_ONLY: KnobName = KnobName::new(b"Hlm1Only");
+    /// `Hlm1FlagsOff` (default 0 = §10.7's flag set exactly). A MASK of
+    /// `Hvm1Placement` bits to CLEAR, because each is a candidate explanation for
+    /// VidMm ending the allocation in the aperture rather than HLM1
+    /// (`FINDINGS.md` F16):
+    ///   bit0 `AccessedPhysically`  bit1 `DisablePartialResidency`
+    ///   bit2 `RestrictedToSingleSegment`
+    /// `AccessedPhysically` is the prime suspect: in the GpuMmu model it says the
+    /// allocation is dereferenced by PHYSICAL address, and the aperture is how a
+    /// system-backed allocation gets one. A mask rather than three knobs so the
+    /// eight arms cost registry writes instead of rebuilds.
+    pub const HLM1_FLAGS_OFF: KnobName = KnobName::new(b"Hlm1FlagsOff");
     /// `Hlm1Bind` (default 0 = OFF). Alias an HVM1 allocation's CPU view onto
     /// its venus blob: `map_blob_at` the blob at the window offset VidMm placed
     /// the allocation at, from the `NOTIFY_RESIDENCY` arm F15 named as the hook.
