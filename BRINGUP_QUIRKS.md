@@ -54,6 +54,23 @@ signtool sign /s WDRTestCertStore /n WDRLocalTestCert /fd SHA256  package\helios
 - Signing adds ~1.4 KB (a 66560-byte `.dll` → 68000-byte signed `.sys`).
 - Cert: `WDRLocalTestCert`, thumbprint `BB44916FAFF199C0B9659CDB319394F6DF3D671E`, in
   `WDRTestCertStore`. Test-signing mode must be on (it is — the baseline driver loads).
+- ⛔ **THE CURRENT-USER KEY STORE STOPPED SERVING PRIVATE KEYS (2026-08-11), and every KMD
+  build died at `signtool-sign`** with "No certificates were found that met all the given
+  criteria". That message names the wrong thing: `signtool sign /debug` prints "After EKU
+  filter, 1 … After Subject Name filter, 1 … **After Private Key filter, 0** certs were left",
+  i.e. the cert is there and its key is not. `certutil -user -store WDRTestCertStore` says
+  **"Missing stored keyset"**, and deleting the cert so the build can remake one only moves the
+  failure earlier: `makecert` → "Can't create the key of the subject",
+  `New-SelfSignedCertificate` → `NTE_PERM`. Nothing in this user's store can be created or
+  opened, `%APPDATA%\Microsoft\Crypto\RSA` and `…\Keys` notwithstanding.
+  **Fixed in-tree, not by hand:** `kmd_render/Cargo.make.toml` now overrides upstream's
+  `generate-certificate` and `signtool-sign` to use the **LocalMachine\My** cert that
+  `tools/install-helios-kmd.ps1` already creates, trusts (Root + TrustedPublisher) and re-signs
+  with at install — `/sm /s My /n WDRLocalTestCert`, thumbprint
+  `E251CEEDAD2600F74838AB63177BA3E2EC64AB6D`. Machine keys live in a different store and still
+  work. ⚠ The failure cut the `package-driver` flow off **before `verify-no-panics`,
+  `inf2cat` and `infverif`**, so a "build failed at signing" is not a cosmetic failure — the
+  gates did not run.
 - **Re-running `inf2cat` over a package that already has a SIGNED `.cat` produces a CORRUPT
   `.cat`** (`CryptCATOpen` → `0x0000000D ERROR_INVALID_DATA`; the driver then fails to load with
   `0xC000026C STATUS_DRIVER_UNABLE_TO_LOAD` → **Code 39**, and the diag ring is EMPTY because

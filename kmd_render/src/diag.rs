@@ -585,13 +585,17 @@ pub mod knobs {
     /// segment from an HVM1 role's `SupportedWriteSegmentSet`, so VidMm must
     /// place the allocation in HLM1 or fail residency loudly.
     ///
-    /// F15: out of `{HLM1, aperture}` VidMm chose the APERTURE (`HlPlSg = 1`),
-    /// which is legal — `preferred_segment` is only a hint — and leaves the Lock2
-    /// view as guest RAM disjoint from the venus blob (F14). 0 remains the
-    /// default because a hard `MakeResident` failure would block A3 entirely;
-    /// grade the `1` arm by `HlPlSg` (must read 2) and by `hts1_session_probe`
-    /// H3 still passing. Read at AddAdapter, so `pnputil /restart-device`
-    /// applies it with no rebuild.
+    /// ⛔⛔ **MEASURED, AND 1 BREAKS THE DRIVER — do not flip this** (`FINDINGS.md`
+    /// F16). It does not redirect the placement, it breaks the page-in:
+    /// `MakeResident` still succeeds, then `D3DKMTLock2` returns
+    /// `STATUS_UNSUCCESSFUL` and dxgkrnl's ETW says "WORKER_THREAD: Unrecoverable
+    /// page in failure" with no Helios paging counter moving. Both segment flag
+    /// shapes, both arms. §10.7:2001-2002's aperture bit is load-bearing.
+    ///
+    /// Kept reachable because a falsified hypothesis with a knob behind it is
+    /// cheaper to re-check than to re-argue, and because rule 8 requires the
+    /// opposite value of a measured default to stay reachable. Read at
+    /// AddAdapter, so `pnputil /restart-device` applies it with no rebuild.
     pub const HLM1_ONLY: KnobName = KnobName::new(b"Hlm1Only");
     /// `Hlm1Bar` (default 0 = §17.6's model: HVM1 is NOT BAR-eligible). 1 routes
     /// an HVM1 allocation's CPU view through the `CpuHostAperture` path instead —

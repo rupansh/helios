@@ -1356,3 +1356,125 @@ construction), and the pool died unbound because nothing binds yet.
   `CounterBlock::flush()`, whose own throttle writes nothing in that case; the
   repaired `hlm1_reset_counters` writes literal zeros. Validated on the target,
   not argued.
+
+## F16 — An HVM1 allocation's `D3DKMTLock2` view is VidMm's SYSTEM backing, and no HLM1 configuration changes that. F15's "VidMm is not using HLM1 at all" is FALSIFIED. The channel that does alias a blob already exists, and it is an escape.
+
+**Measured 2026-08-11 on KMD 22.22.273.0 → 22.22.276.0**, nine configurations,
+`hts1_session_probe.exe` per arm, counters zeroed at each StartDevice,
+`CM_PROB_NONE` and **15/15** in every arm except where noted.
+
+### The oracle this finding rests on
+
+`hlm1_readback` (`HlRdbk`) reads the **blob's** bytes at the three offsets
+`hts1_session_probe` H5 writes, from kernel space through `map_blob_prepare` +
+`MmMapIoSpace`, and publishes them raw. H5 writes three bytes through `lk.pData`
+and reads them back through the SAME pointer, so it passes identically on a
+private buffer — that is why F14 was invisible to it. This reads the other side of
+the alias, and the KMD is told neither H5's constants nor the stamp's, so the
+verdict is a human's.
+
+`Hlm1Bind=2` additionally stamps the blob with `kmd_logic::hlm1_placement`'s
+vocabulary, which turns the oracle into its own positive control:
+
+```
+HlRdbk = 0x5500F7 = { 0x55 at offset 0, 0x00 at 16 MiB-1, 0xF7 at 64 MiB-1 }
+stamp_byte(1, 0)          = 0x55   ← a stamped sample offset
+stamp_byte(1, 64 MiB - 1) = 0xF7   ← the last stamped sample
+                            0x00   ← 16 MiB-1 is not a sample: untouched host memory
+HlDgst = 0x4CAB8D42 = digest(1, the whole sample set), computed independently
+```
+
+⇒ the readback reads the venus blob, correctly, and **the blob still holds the
+KMD's stamp. H5's `0xA5`/`0x5A`/`0xC3` are nowhere in it.** F14 is now proven by
+bytes rather than by reading code.
+
+### The matrix
+
+| # | `BarSegFlags` | `Hlm1Only` | `Hlm1FlagsOff` | `Hlm1Bind` | probe | `HlRdbk` | bind |
+|---|---|---|---|---|---|---|---|
+| 1 | 0x1C | 0 | 0 | 0 | 15/15 | — | — |
+| 2 | 0x1C | **1** | 0 | 0 | **13/15, H4 `0xc0000001`** | — | — |
+| 3 | 0x02 | **1** | 0 | 0 | **13/15, H4 `0xc0000001`** | — | — |
+| 4 | 0x1C | 0 | 0 | **2** | 15/15 | `0x5500F7` | op 15, pg 1932 |
+| 5 | 0x02 | 0 | 0 | **2** | 15/15 | `0x5500F7` | op 15, pg 4108 |
+| 6 | 0x02 | 0 | **1** | **2** | 15/15 | `0x5500F7` | op 11, pg 4108 |
+| 7 | 0x06 | 0 | **1** | **2** | 15/15 | `0x5500F7` | op 11, pg 1932 |
+| 8 | 0x02 | 0 | **7** | **2** | 15/15 | `0x5500F7` | op 11, pg 1932 |
+| 9 | 0x1C | 0 | 0 | 0 + **`Hlm1Bar=1`** | 15/15 | `0x000000` | — |
+
+In every arm where a bind ran it ran **once** (`HlBndN=1`, `HlBndR=0`,
+`HlBndE=0`, `HlBndQ=0`, `HlEwin=0`): the placement is stable, in window range, at
+PASSIVE, and the host honoured the fixed map. The bind is not the problem.
+
+### Four things the matrix settles
+
+1. ⛔ **`Hlm1Only=1` does not make VidMm choose HLM1 — it breaks the page-in.**
+   `MakeResident` still succeeds, then `D3DKMTLock2` returns `0xc0000001` and
+   dxgkrnl's own ETW says why: **"WORKER_THREAD: Unrecoverable page in failure"**
+   (`Microsoft-Windows-DxgKrnl`, all keywords, `AzureTriage`). No paging error
+   counter of ours moves — `PgEb`/`PgEm`/`PgEx`/`PgEc` all 0 — so the refusal is
+   dxgkrnl's, not the miniport's. The aperture bit in `supported_segments` is
+   load-bearing exactly as §10.7:2001-2002 describes it. **The knob's default
+   stays 0 and it must not be flipped.**
+2. ⛔ **F15's headline was its own caveat coming true.** F15 read `HlPlSg=1` /
+   `HlPtSg=0` as "VidMm places the pool in the APERTURE, not HLM1". Both are
+   last-writer-wins fields. With the census added: **`HlPt2 = 66…99` of the
+   page-table batches map the pool out of segment 2** against 33 out of system
+   memory, `HlAdMs` shows BOTH op 11 and op 15 producing admitted segment-2
+   placements, and on the two-pool run at defaults the last values are
+   `HlPlSg = 2` and `HlPtSg = 2`. The pool lives in HLM1. F15's ⛔ bullets 3 and 4
+   are withdrawn; its `NOTIFY_RESIDENCY`/`HlEirq` findings stand.
+3. ⭐ **`AccessedPhysically` is what brings the aperture in, and clearing it takes
+   `NOTIFY_RESIDENCY` away.** At `Hlm1FlagsOff=1`: `HlSgMs` 0x7 → 0x5 (no segment
+   1 ever named), `HlOpMs` 0x8B20 → 0xB00 (no `MAP_APERTURE_SEGMENT`, and **no
+   `NOTIFY_RESIDENCY` at all**), `HlEvic` 2 → 0. So the residency notification is
+   a service for physically-accessed allocations, and a bind that hooks only it
+   dies in that configuration — which is why `UPDATE_PAGE_TABLE` is now a hook
+   too. `DisablePartialResidency` and `RestrictedToSingleSegment` change nothing.
+4. ⛔ **Neither the flag word nor BAR eligibility produces an aliased view.**
+   `CpuVisible` with `CpuTranslatedAddress = BAR GPA` (0x02), with
+   `CacheCoherent` added (0x06), and `SupportsCpuHostAperture` (0x1C) all read
+   `0x5500F7`; and making the allocation BAR-eligible so the proven
+   `MapCpuHostAperture` path could serve it (arm 9) reads `0x000000` — the blob
+   untouched, no `Ch*` counter moved.
+
+### What the mechanism actually is
+
+The 32-PTE page-table batches are the paging process's scratch windows around
+`VIRTUAL_TRANSFER`/`VIRTUAL_FILL` — two thirds addressing the pool in segment 2
+and one third in system memory, with `PgVs`/`PgVd`/`PgVp` nonzero. That is VidMm
+treating HLM1 as ordinary video memory whose content it **moves by paging
+transfer**, and handing the CPU the allocation's system backing for the lock.
+`D3DKMTLock2` on this build is a copy protocol for such an allocation, not a
+window onto it.
+
+⇒ **§10.7's HLM1 CPU-view model does not hold on build 26100.8875.** A copy is
+not admissible either: §10.7:1940 says an HVM1 allocation's "bytes are never an
+independent private copy", and a reply pool the host writes asynchronously cannot
+be a snapshot taken at Unlock.
+
+### ⭐ The channel that does work already exists
+
+`HELIOS_ESCAPE_MAP_BLOB` (`escape.rs:1377`, `escape_map_blob`) runs
+`map_blob_prepare` and then `map_io_pages_to_user` in the caller's process,
+returning `out_user_va` — a **live, aliased** user-mode view of the blob's window
+pages, tagged with the owning device handle and torn down at
+`DxgkDdiDestroyDevice`. It is production-proven: it is how the D3D11 ICD and DXVK
+already reach blob bytes.
+
+⇒ Recommendation, for the owner: **A1's reply pool should take its CPU view from
+the escape, not from `D3DKMTLock2`.** The gap to close is identity — the escape
+resolves a blob by `resource_id` + owner, and the ICD holds an HVM1
+`object_generation` — so an HVM1-scoped admission (allocation handle or
+generation → resource id) is the unit. That is a KMD+ICD change of the same size
+as K5, and it does not need VidMm to place anything anywhere.
+
+### Bound — what this does NOT say
+
+It does not say a CPU-visible memory segment cannot alias a blob in principle; it
+says that on this build, for an allocation with §10.7's flag set, dxgkrnl never
+built the CPU VA from `CpuTranslatedAddress + SegmentAddress` in any of the nine
+configurations tried. Arm 9's `MapCpuHostAperture` route is refuted only in the
+weak sense: the DDI was never called, and the `Ch*` block is flushed on refusals
+and mode sets, so "never called" is inference from `ChEa = 0` (a failure entry,
+whose increment forces a flush) rather than from a positive trace.

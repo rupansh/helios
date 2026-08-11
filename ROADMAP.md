@@ -647,26 +647,53 @@ uninstrumented today, the IRQL each arrived at, and whether any offset would hav
 failed the window bound. Atomics only, above the IRQL gate, every arm returning
 exactly what it returned before.
 
-⭐ **DEPLOYED AND MEASURED — KMD 22.22.272.0, `FINDINGS.md` F15.** Four answers:
+⭐ **DEPLOYED AND MEASURED — KMD 22.22.272.0, `FINDINGS.md` F15.** Two answers of
+its four survive:
 
 * **`NOTIFY_RESIDENCY` (15) is the hook**, and `NOTIFY_RESIDENCY2`/`TRANSFER2`/
   `FILL2` — the three the design ranked most likely — **never fire**.
 * **`HlEirq = 0`**: every observation arrives at PASSIVE, so the bind may issue
   its host round-trip from that arm. That was deploy 2's open safety question.
-* ⛔ **VidMm places the pool in the APERTURE, not HLM1** (`HlPlSg = 1`, and the
-  page table maps it from system memory, `HlPtSg = 0`). `preferred_segment` is a
-  hint; the aperture is in `hvm1_placement`'s supported set and VidMm takes it.
-* ⛔ **`BarSegFlags = 0x02` does not change that.** Measured, both arms,
-  `CM_PROB_NONE`, probe 15/15 in each: the reading is identical. The hypothesis
-  that a `CpuVisible = 0` segment 2 was forcing the aperture is **falsified**, at
-  the cost of one `pnputil /restart-device` and no rebuild — which is what rule 8
-  keeping the opposite value reachable buys.
+* ⛔⛔ Its other two — "VidMm places the pool in the APERTURE, not HLM1" and the
+  `BarSegFlags` corollary — are **WITHDRAWN by F16**. Both rested on `HlPlSg` and
+  `HlPtSg`, which are last-writer-wins fields, and F15 said so itself in its own
+  "Bound" section. The census F16 added reads `HlPt2 = 66…99` page-table batches
+  in segment 2 against 33 in system memory, and on a two-pool run at defaults the
+  final values are `HlPlSg = 2`, `HlPtSg = 2`. **The pool lives in HLM1.**
 
-⇒ **Deploy 2's first move is neither the bind nor the flag.** It is dropping
-`HELIOS_SEGMENT_ID_APERTURE` from `hvm1_placement`'s supported set so VidMm has
-to choose HLM1 or fail residency loudly — behind a knob defaulting to today's
-measured behaviour, because a hard `MakeResident` failure would block A3 entirely.
-Only then are the flag flip and the `map_blob_at` bind worth landing.
+#### K2a deploys 2-5 — MEASURED, and the design's premise does not hold (`FINDINGS.md` F16)
+
+KMD **22.22.276.0**, nine configurations, `hts1_session_probe` 15/15 and
+`CM_PROB_NONE` in every arm but the two that break the page-in.
+
+* ⭐ **The bind WORKS and is not the problem.** `Hlm1Bind` maps the blob at the
+  window offset VidMm placed the allocation at, from `NOTIFY_RESIDENCY` and (since
+  deploy 4) from `UPDATE_PAGE_TABLE`. Every arm: one bind, `HlBndR = 0` (the
+  placement never moves), `HlBndE = HlBndQ = HlEwin = 0`, and the two arms agree
+  on the offset where both fire.
+* ⛔ **`Hlm1Only=1` breaks the page-in**, it does not redirect it: `MakeResident`
+  succeeds, `D3DKMTLock2` returns `0xc0000001`, and dxgkrnl's ETW says
+  "WORKER_THREAD: Unrecoverable page in failure" with no Helios paging counter
+  moving. **Default stays 0. Do not flip it.**
+* ⛔ **The guest's Lock2 view is never the blob.** The acceptance oracle
+  (`HlRdbk` — the KMD reading the blob's own bytes at the offsets H5 writes)
+  reads the K2a stamp, not H5's bytes, in all seven arms that could produce a
+  view: `BarSegFlags` 0x1C / 0x02 / 0x06, `AccessedPhysically` on or off,
+  `Hlm1FlagsOff=7`, and `Hlm1Bar=1` (BAR-eligible, so `MapCpuHostAperture` could
+  serve it). `0x55`/`0xF7` are `stamp_byte(1, ·)` computed independently, so the
+  oracle is proven to read the right memory.
+* ⇒ **`D3DKMTLock2` is a copy protocol here**: VidMm moves HLM1 content by paging
+  transfer (the 32-PTE scratch windows around `VIRTUAL_TRANSFER`/`VIRTUAL_FILL`)
+  and hands the CPU the system backing. §10.7:1940 forbids a private copy, and a
+  host-written reply pool cannot be one.
+
+⇒ **The next unit is not another placement experiment.** `HELIOS_ESCAPE_MAP_BLOB`
+(`escape.rs:1377`) already returns a **live aliased user-mode view** of a blob's
+window pages and is production-proven — the D3D11 ICD and DXVK use it. A1's reply
+pool should take its CPU view from there. The gap is identity: the escape resolves
+`resource_id` + owner while the ICD holds an HVM1 `object_generation`, so an
+HVM1-scoped admission is the unit, sized like K5. Owner decision, because it
+contradicts §10.7's stated model.
 4. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
    correction below before touching it. Not on the critical path.
 5. **K1 (demolition), K3** — and `SURFACE` last of all (`OWNERSHIP.md` §3).
