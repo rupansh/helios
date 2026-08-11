@@ -107,6 +107,19 @@ pub static NR2_PATCH_RELOCATED: AtomicU32 = AtomicU32::new(0);
 /// `Nr2SlotRet` staying equal the whole time and the documented pair-grading
 /// reporting health.
 pub static NR2_SUBMIT_RESUBMISSION: AtomicU32 = AtomicU32::new(0);
+/// Private-record reads that took the offset-0 fallback because dxgkrnl
+/// reported an EMPTY submission window over a buffer holding exactly one record.
+///
+/// ⚠ GRADED AS A PAIR WITH `Nr2SubWin`, and it is an experiment as much as a
+/// counter. This build also advances `pDmaBufferPrivateData` at the end of
+/// Render, on the hypothesis that the field is `in/out` like `pDmaBuffer` and
+/// that not advancing it is WHY the window is empty. So: if `Nr2SubWin` now
+/// reads `start=0 end=64` and this stays 0, the pointer was the answer and the
+/// window is real. If this keeps climbing, the window is simply not populated on
+/// this path and the fallback is what carries it — which is the same conclusion
+/// `decode_present_fence` reached before K6 existed.
+pub static NR2_WINDOW_FALLBACK: AtomicU32 = AtomicU32::new(0);
+
 /// Submissions whose private record could not be read at all — the window did
 /// not describe 64 readable bytes.
 ///
@@ -220,7 +233,7 @@ pub static NR2_HOS1_NOT_EXECUTED: AtomicU32 = AtomicU32::new(0);
 
 /// The counter names, as one list, so the collision proof and the writer cannot
 /// drift apart.
-const COUNTER_NAMES: [&[u8]; 35] = [
+const COUNTER_NAMES: [&[u8]; 36] = [
     b"Nr2QCtx",
     b"Nr2QCtxRej",
     b"Nr2Scratch",
@@ -256,6 +269,7 @@ const COUNTER_NAMES: [&[u8]; 35] = [
     b"Nr2PchWin",
     b"Nr2PchTot",
     b"Nr2SubNoRec",
+    b"Nr2WinFB",
 ];
 
 /// The boundary counters that did not fit [`COUNTER_NAMES`]'s block, mirrored
@@ -351,6 +365,7 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(COUNTER_NAMES[32], &NR2_PATCH_WINDOW),
         e(COUNTER_NAMES[33], &NR2_PATCH_WINDOW_TOTAL),
         f(COUNTER_NAMES[34], &NR2_SUBMIT_NO_RECORD),
+        e(COUNTER_NAMES[35], &NR2_WINDOW_FALLBACK),
         e(BOUNDARY_NAMES[0], &NR2_NO_STAGE),
         e(BOUNDARY_NAMES[1], &NR2_NO_EPOCH),
         e(BOUNDARY_NAMES[2], &NR2_HOS1_NOT_EXECUTED),
@@ -664,6 +679,30 @@ unsafe fn publish_dma_record(
     true
 }
 
+/// Advance `pDmaBufferPrivateData` past the record Render just wrote.
+///
+/// ⚠ AN EXPERIMENT WITH A COUNTER, not a known contract. The WDK header carries
+/// no annotation on this field, and nothing in this driver has ever advanced it
+/// — which is exactly consistent with the measured `start = end = 0` window, if
+/// the field is `in/out` like `pDmaBuffer` and the advance is how a driver tells
+/// dxgkrnl how much private data it produced. If it is NOT in/out, dxgkrnl
+/// ignores the write and nothing changes; `Nr2WinFB` distinguishes the two on
+/// the next run.
+///
+/// # Safety
+/// The caller must already have written the record, i.e. `publish_dma_record`
+/// returned true, which proves the buffer is at least that long.
+unsafe fn advance_private_data(args: &mut DXGKARG_RENDER) {
+    let bytes = size_of::<Hnr2KmdDmaPrivateV1>();
+    if args.pDmaBufferPrivateData.is_null() || (args.DmaBufferPrivateDataSize as usize) < bytes {
+        return;
+    }
+    // SAFETY: the buffer holds at least `bytes`, checked here and proven by the
+    // write that preceded this call.
+    args.pDmaBufferPrivateData =
+        unsafe { (args.pDmaBufferPrivateData as *mut u8).add(bytes) as *mut c_void };
+}
+
 /// Read back the record [`publish_dma_record`] wrote.
 ///
 /// ⛔ `DxgkDdiRender`'s `pDmaBufferPrivateData` POINTS AT THIS SUBMISSION'S
@@ -685,8 +724,27 @@ unsafe fn read_dma_record(
     end: u32,
 ) -> Option<Hnr2KmdDmaPrivateV1> {
     let bytes = size_of::<Hnr2KmdDmaPrivateV1>();
-    let (start, end, total) = (start as usize, end as usize, total as usize);
-    if base.is_null() || start > end || end > total || end - start < bytes {
+    let (mut start, mut end, total) = (start as usize, end as usize, total as usize);
+    if base.is_null() {
+        return None;
+    }
+    // ⛔ MEASURED, NOT ASSUMED: on 22.22.270.0 `DxgkDdiSubmitCommand` reports
+    // `DmaBufferPrivateDataSize = 64` — exactly one record — with the submission
+    // window `start = end = 0`. So the buffer is there and the WINDOW is empty,
+    // which is why the first deployment took 3 staging checkouts and 0
+    // retirements. The shipping present path already copes with the same thing:
+    // `decode_present_fence` tries the window and then falls back to offset 0.
+    //
+    // The fallback is gated on `total == bytes` and that gate is the whole
+    // safety argument: a buffer holding exactly ONE record cannot be two
+    // batched Renders, so there is no other submission for offset 0 to belong
+    // to. A bigger buffer with an empty window stays refused.
+    if end <= start && total == bytes {
+        NR2_WINDOW_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        start = 0;
+        end = bytes;
+    }
+    if start > end || end > total || end - start < bytes {
         return None;
     }
     let mut raw = [0u8; size_of::<Hnr2KmdDmaPrivateV1>()];
@@ -812,6 +870,7 @@ pub(crate) unsafe fn render(
             return STATUS_INVALID_PARAMETER;
         }
         args.pDmaBuffer = unsafe { (args.pDmaBuffer as *mut u8).add(header_bytes) as *mut c_void };
+        unsafe { advance_private_data(args) };
         args.PatchLocationListOutSize = 0;
         args.MultipassOffset = 0;
         apply_render_fragment(&mut native.state.lock(), &header, &accept);
@@ -1066,6 +1125,8 @@ fn commit(
         (args.pDmaBuffer as *mut u8).add(CAPABILITY_TABLE_OFFSET as usize + table.bytes as usize)
             as *mut c_void
     };
+    // SAFETY: `publish_dma_record` returned true, so the buffer held the record.
+    unsafe { advance_private_data(args) };
     args.PatchLocationListOutSize = plan.count;
     if !args.pPatchLocationListOut.is_null() {
         args.pPatchLocationListOut =
