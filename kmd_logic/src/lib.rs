@@ -10822,6 +10822,45 @@ pub mod native_render {
         Ok(true)
     }
 
+    /// Snapshot the allocation's CURRENT placement into a capability,
+    /// overwriting whatever is there. Returns whether the record changed.
+    ///
+    /// ⛔ THIS, NOT [`apply_placement`], IS WHAT `DxgkDdiPatch` OWES. §10.7 has
+    /// Patch "snapshot the exact allocation-list placement" on every call —
+    /// *idempotent* there means "no irreversible side effect", not "refuses a
+    /// new value". Between Render and Patch, VidMm may evict and re-page the
+    /// allocation, which is the single event Patch exists for; treating the new
+    /// address as a disagreement would keep the stale one. A repeat call with an
+    /// unmoved allocation still returns `false` and writes nothing, which is the
+    /// §18.2 double-Patch case.
+    ///
+    /// An allocation that is NOT resident at Patch time snapshots as unplaced —
+    /// zeroing the placement fields, because `validate_at_render` requires them
+    /// zero when `segment_id == 0` and a half-cleared record is not a state.
+    pub fn snapshot_placement(
+        capability: &mut Hnr2PhysicalCapability,
+        segment_id: u32,
+        physical_address: u64,
+        allocation_bytes: u64,
+    ) -> Result<bool, RenderRefusal> {
+        let (segment_id, physical_address) = if segment_id == 0 {
+            (0, 0)
+        } else {
+            (segment_id, physical_address)
+        };
+        if capability.segment_id == segment_id && capability.physical_address == physical_address {
+            return Ok(false);
+        }
+        let mut candidate = *capability;
+        candidate.segment_id = segment_id;
+        candidate.physical_address = physical_address;
+        candidate
+            .validate_at_render(allocation_bytes)
+            .map_err(RenderRefusal::Dma)?;
+        *capability = candidate;
+        Ok(true)
+    }
+
     // ── HOS1, the D3D12 virtual-submit descriptor ────────────────────────────
 
     /// The per-context state a HOS1 descriptor is validated against.
@@ -11332,6 +11371,47 @@ pub mod native_render {
                 RenderRefusal::PlacementNotRepeatable
             );
             assert_eq!(cap, after_first, "a refused placement must not write");
+        }
+
+        /// ⛔ THE EVENT `DxgkDdiPatch` EXISTS FOR. VidMm evicts and re-pages
+        /// between Render and Patch; the snapshot must take the NEW address.
+        /// `apply_placement` calls that a disagreement — correct for Render,
+        /// which never re-places — so Patch needs its own operation, and a test
+        /// that would fail if Patch were pointed at the wrong one.
+        #[test]
+        fn a_patch_snapshot_takes_the_new_placement_and_repeats_are_no_ops() {
+            let (record, bytes) = placed_env();
+            let mut cap = build_capability(&record, 7, bytes).unwrap();
+            assert_eq!(snapshot_placement(&mut cap, 1, 0x1000, bytes), Ok(true));
+            assert_eq!(cap.physical_address, 0x1000);
+            // The §18.2 second Patch, nothing moved: writes nothing.
+            assert_eq!(snapshot_placement(&mut cap, 1, 0x1000, bytes), Ok(false));
+            // Relocated: the new address wins, and `apply_placement` would have
+            // refused exactly this.
+            assert_eq!(snapshot_placement(&mut cap, 2, 0x5000, bytes), Ok(true));
+            assert_eq!(cap.segment_id, 2);
+            assert_eq!(cap.physical_address, 0x5000);
+            assert_eq!(
+                apply_placement(&mut cap, 2, 0x9000, bytes).unwrap_err(),
+                RenderRefusal::PlacementNotRepeatable
+            );
+            // Evicted: snapshots as unplaced, with the placement fields zeroed
+            // together — `validate_at_render` forbids a half-cleared record.
+            assert_eq!(snapshot_placement(&mut cap, 0, 0x5000, bytes), Ok(true));
+            assert!(!cap.is_placed());
+            assert_eq!(cap.physical_address, 0);
+            cap.validate_at_render(bytes).unwrap();
+        }
+
+        #[test]
+        fn a_patch_snapshot_refuses_an_unknown_segment_without_writing() {
+            let (record, bytes) = placed_env();
+            let mut cap = build_capability(&record, 7, bytes).unwrap();
+            assert_eq!(
+                snapshot_placement(&mut cap, 9, 0x1000, bytes).unwrap_err(),
+                RenderRefusal::Dma(Hnr2DmaReject::SegmentUnknown)
+            );
+            assert!(!cap.is_placed());
         }
 
         #[test]

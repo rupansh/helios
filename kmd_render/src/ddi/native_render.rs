@@ -24,8 +24,8 @@ use alloc::vec::Vec;
 
 use helios_kmd_logic::native_render::{
     admit_commit_tables, admit_hos1, apply_placement, apply_render_fragment, build_capability,
-    plan_capability_table, plan_output_patch_slots, validate_render_fragment, CapabilityTablePlan,
-    OuterSubmitContext, RenderContext, RenderEnv, RenderRefusal,
+    plan_capability_table, plan_output_patch_slots, snapshot_placement, validate_render_fragment,
+    CapabilityTablePlan, OuterSubmitContext, RenderContext, RenderEnv, RenderRefusal,
 };
 use helios_protocol::native_render::kernel_dma::{Hnr2DmaReject, Hnr2KmdDmaPrivateV1,
     Hnr2PhysicalCapability};
@@ -83,11 +83,36 @@ pub static NR2_PATCH_SLOTS: AtomicU32 = AtomicU32::new(0);
 pub static NR2_PATCH_CALLS: AtomicU32 = AtomicU32::new(0);
 /// Capability records whose placement Patch snapshotted in.
 pub static NR2_PATCH_SNAPS: AtomicU32 = AtomicU32::new(0);
-/// A second Patch that produced a DIFFERENT record, or a patch-location entry
-/// that does not name a capability slot. **Must read 0**: §18.2 invokes Patch
-/// twice on one DMA buffer and the second must be a no-op, and every entry Patch
-/// sees was written by this driver's own Render.
+/// A patch-location entry that does not name a capability slot, or a submission
+/// whose header witness does not match its private record. **Must read 0**:
+/// every entry Patch sees was written by this driver's own Render.
+///
+/// ⚠ IT DOES NOT COUNT A RELOCATION. An allocation that moved between Render and
+/// Patch is the single event `DxgkDdiPatch` exists for; it lands in
+/// [`NR2_PATCH_RELOCATED`] and is expected to move.
 pub static NR2_PATCH_DIFF: AtomicU32 = AtomicU32::new(0);
+/// Capability records whose placement CHANGED at Patch — VidMm evicted and
+/// re-paged the allocation between Render and Patch. Expected nonzero under
+/// memory pressure; it is information, not a fault.
+pub static NR2_PATCH_RELOCATED: AtomicU32 = AtomicU32::new(0);
+/// `DxgkDdiSubmitCommand` calls carrying `DXGK_SUBMITCOMMANDFLAGS::Resubmission`
+/// — dxgkrnl re-running a packet it preempted.
+///
+/// ⛔ THE STAGING RETIREMENT IS SKIPPED FOR THESE, and that is the whole reason
+/// the bit is read. §10.7:1886 is "a COMMIT transitions once from staged to
+/// submitted": the private record is per-DMA-buffer state dxgkrnl does not
+/// change, so a resubmission re-reads the same `payload_bytes` and a second
+/// `retire()` would consume a DIFFERENT live submission's accounting — leaking
+/// the pool upward until legitimate COMMITs are refused, with `Nr2Slot` and
+/// `Nr2SlotRet` staying equal the whole time and the documented pair-grading
+/// reporting health.
+pub static NR2_SUBMIT_RESUBMISSION: AtomicU32 = AtomicU32::new(0);
+/// Staging retirements refused — the pure half's `StagingUnderflow`.
+///
+/// **Must read 0.** It was discarded with `.is_ok()` and no counter, which is
+/// the one thing that could make the pool drift invisibly; `Nr2Slot`/`Nr2SlotRet`
+/// cannot show it, because a failed retire bumps neither.
+pub static NR2_SLOT_UNDERFLOW: AtomicU32 = AtomicU32::new(0);
 /// Staging admissions (COMMITs whose reassembled size the §10.7 pool accepted).
 pub static NR2_SLOT_TAKEN: AtomicU32 = AtomicU32::new(0);
 /// Staging retirements at SubmitCommand.
@@ -164,7 +189,7 @@ pub static NR2_HOS1_NOT_EXECUTED: AtomicU32 = AtomicU32::new(0);
 
 /// The counter names, as one list, so the collision proof and the writer cannot
 /// drift apart.
-const COUNTER_NAMES: [&[u8]; 27] = [
+const COUNTER_NAMES: [&[u8]; 30] = [
     b"Nr2QCtx",
     b"Nr2QCtxRej",
     b"Nr2Scratch",
@@ -192,6 +217,9 @@ const COUNTER_NAMES: [&[u8]; 27] = [
     b"Nr2NoResid",
     b"Nr2NoReply",
     b"Nr2NoHost",
+    b"Nr2Reloc",
+    b"Nr2SubDup",
+    b"Nr2SlotUnd",
 ];
 
 /// The boundary counters that did not fit [`COUNTER_NAMES`]'s block, mirrored
@@ -279,6 +307,9 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(COUNTER_NAMES[24], &NR2_NO_RESID),
         e(COUNTER_NAMES[25], &NR2_NO_REPLY),
         e(COUNTER_NAMES[26], &NR2_NO_HOST),
+        e(COUNTER_NAMES[27], &NR2_PATCH_RELOCATED),
+        e(COUNTER_NAMES[28], &NR2_SUBMIT_RESUBMISSION),
+        f(COUNTER_NAMES[29], &NR2_SLOT_UNDERFLOW),
         e(BOUNDARY_NAMES[0], &NR2_NO_STAGE),
         e(BOUNDARY_NAMES[1], &NR2_NO_EPOCH),
         e(BOUNDARY_NAMES[2], &NR2_HOS1_NOT_EXECUTED),
@@ -628,14 +659,19 @@ unsafe fn read_dma_record(
 
 /// Refuse this Render, naming the rule.
 ///
-/// The flush is here rather than only on the success paths because `Nr2Rej` is a
-/// FAILURE entry: `CounterBlock` surfaces a changed failure sum immediately, but
-/// only when something calls `flush()`, and a workload that only ever refuses
-/// would otherwise show nothing in the registry until `DxgkDdiDestroyDevice`.
-/// Every caller is on the PASSIVE Render path.
+/// ⛔ ONE registry write, not a block flush. `Nr2Rej` is a FAILURE entry, and
+/// `CounterBlock::flush` writes EVERY entry whenever the failure sum changed —
+/// which it does on every refusal — so flushing here cost 31 synchronous
+/// `RtlWriteRegistryValue` calls per refused Render, inside the DDI, reachable
+/// by any process that can call `D3DKMTRender`. That is exactly the regression
+/// `CounterBlock` was written to remove (`diag.rs`: the paging block's 24 writes
+/// per op). A refusal only needs its own value published; the rest of the block
+/// rides the existing PASSIVE cadences.
+///
+/// PASSIVE-only, which every caller is: they are all on the Render path.
 fn refuse(refusal: RenderRefusal, status: NTSTATUS) -> NTSTATUS {
     bump_with_code(&NR2_REJECT, refusal.code());
-    NR2_COUNTERS.flush();
+    crate::diag::record_named_bytes(COUNTER_NAMES[6], NR2_REJECT.load(Ordering::Relaxed));
     status
 }
 
@@ -1270,11 +1306,11 @@ pub(crate) unsafe fn patch(args: &DXGKARG_PATCH) {
         }
         // SAFETY: `index < AllocationListSize` and the list is non-null.
         let allocation = unsafe { &*args.pAllocationList.add(index) };
+        // ⚠ NOT SKIPPED WHEN ZERO. A snapshot of "not resident" is a real
+        // snapshot: if Render placed the record and the allocation has since
+        // been evicted, keeping the old physical address would be the stale
+        // value this whole path exists to avoid.
         let segment = allocation.__bindgen_anon_1.SegmentId();
-        if segment == 0 {
-            // Still not resident. Legal: the record stays legally unplaced.
-            continue;
-        }
         // SAFETY: `entry_at_offset` proved `PatchOffset` names a whole slot
         // inside the submission window, and the window is inside `DmaBufferSize`.
         let slot = unsafe {
@@ -1292,12 +1328,21 @@ pub(crate) unsafe fn patch(args: &DXGKARG_PATCH) {
         // `DXGK_ALLOCATIONLIST` carries no length, so this is the only bound
         // available here and re-deriving it would be a second source.
         let allocation_bytes = capability.byte_length;
-        match apply_placement(&mut capability, segment, physical, allocation_bytes) {
+        // ⛔ SNAPSHOT, NOT `apply_placement`. §10.7 has Patch take "the exact
+        // allocation-list placement" on EVERY call; VidMm evicting and re-paging
+        // between Render and Patch is the single event this DDI exists for, and
+        // `apply_placement` — correct for Render, which never re-places — calls
+        // a moved allocation a disagreement and would keep the stale address.
+        let placed_before = capability.is_placed();
+        match snapshot_placement(&mut capability, segment, physical, allocation_bytes) {
             Ok(true) => {
                 // SAFETY: as the read above.
                 unsafe { core::ptr::write_unaligned(slot, capability) };
                 NR2_PATCH_SNAPS.fetch_add(1, Ordering::Relaxed);
                 NR2_NO_EPOCH.fetch_add(1, Ordering::Relaxed);
+                if placed_before {
+                    NR2_PATCH_RELOCATED.fetch_add(1, Ordering::Relaxed);
+                }
             }
             // §18.2 invokes Patch twice: the second call finding the record
             // already correct is the contract, not an anomaly.
@@ -1323,6 +1368,21 @@ pub(crate) unsafe fn patch(args: &DXGKARG_PATCH) {
 /// context.
 pub(crate) unsafe fn submit(native: &NativeContext, submit: &DXGKARG_SUBMITCOMMAND) {
     NR2_SUBMITS.fetch_add(1, Ordering::Relaxed);
+    // ⛔ A RESUBMITTED PACKET MUST NOT RETIRE AGAIN. This driver advertises
+    // DMA-buffer-boundary preemption and acks `DMA_PREEMPTED`
+    // (`query_adapter_info.rs:395`, `dxgkddi_preempt_command`), and this file's
+    // own `abandon_pending_submissions` records that "dxgkrnl resubmits the same
+    // private record after it re-establishes residency". The record is state
+    // dxgkrnl does not change, so the second arrival reads the same
+    // `payload_bytes`; `StagingPool::retire` keys on nothing but that number, so
+    // it would consume a DIFFERENT live submission's accounting and leak the
+    // pool upward until legitimate COMMITs are refused — invisibly, because
+    // `Nr2Slot` and `Nr2SlotRet` stay equal throughout.
+    //
+    // The WDK supplies the discriminator rather than us inventing one:
+    // `DXGK_SUBMITCOMMANDFLAGS::Resubmission` (`d3dkmddi.h:4426`, bit 7).
+    // SAFETY: `Value` is a plain UINT view of the (valid) flags union.
+    let resubmission = (unsafe { submit.Flags.__bindgen_anon_1.Value } & (1 << 7)) != 0;
     // SAFETY: per this function's contract.
     let Some(record) = (unsafe {
         read_dma_record(
@@ -1334,15 +1394,21 @@ pub(crate) unsafe fn submit(native: &NativeContext, submit: &DXGKARG_SUBMITCOMMA
     }) else {
         return;
     };
-    if record.payload_bytes != 0 {
+    if resubmission {
+        NR2_SUBMIT_RESUBMISSION.fetch_add(1, Ordering::Relaxed);
+    } else if record.payload_bytes != 0 {
         let mut state = native.state.lock();
-        if state
-            .staging_mut()
-            .retire(record.payload_bytes as u64)
-            .is_ok()
-        {
-            drop(state);
-            NR2_SLOT_RETIRED.fetch_add(1, Ordering::Relaxed);
+        let retired = state.staging_mut().retire(record.payload_bytes as u64);
+        drop(state);
+        match retired {
+            Ok(()) => {
+                NR2_SLOT_RETIRED.fetch_add(1, Ordering::Relaxed);
+            }
+            // The pure half declared `StagingUnderflow` precisely so the pool
+            // cannot drift silently; discarding it was the drift.
+            Err(_) => {
+                NR2_SLOT_UNDERFLOW.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
     // The host handoff, and the end of K6. There is no ring to dispatch on: an

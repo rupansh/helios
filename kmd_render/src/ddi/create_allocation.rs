@@ -106,6 +106,10 @@ pub(crate) const BAR_UNPLACED: u64 = u64::MAX;
 
 /// Per-allocation KMD state: the venus context + virtio resource backing it, plus
 /// the host-visible window mapping (filled in Stage 2b by BuildPagingBuffer).
+/// ⛔ `#[repr(C)]` for the reason `ContextContext` carries it: the magic is
+/// probed on handles that may not be ours, and Rust's default repr may put a
+/// lone `u32` anywhere — including past the end of a smaller foreign object.
+#[repr(C)]
 struct AllocationContext {
     /// [`ALLOCATION_CTX_MAGIC`] — must be the FIRST field (paging-DDI cast check).
     magic: u32,
@@ -769,6 +773,9 @@ const OPEN_ALLOCATION_CTX_MAGIC: u32 = 0x484F_504E; // "HOPN"
 /// stable across kits, and the bit position is.
 const DXGK_OPENALLOCATION_FLAG_CREATE: u32 = 0x0000_0001;
 
+/// `#[repr(C)]` for [`AllocationContext`]'s reason: `open_allocation_context`
+/// probes `magic` on a handle it has no other evidence about.
+#[repr(C)]
 struct OpenAllocationContext {
     magic: u32,
     /// Validated immutable view captured from open-time private data. Present

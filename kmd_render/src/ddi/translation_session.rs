@@ -601,14 +601,27 @@ fn admit_hvc1(
         // (`vn_helios_translation_session.h:71`), so the device's session cell is
         // where its session comes from — there is no lookup, and a queue context
         // on a device with no control context has nothing to belong to.
-        let Some(session) = *device_session.lock() else {
+        // ⛔ THE CELL LOCK IS HELD ACROSS THE DEREFERENCE AND THE ACQUIRE, and
+        // the first version of this arm copied the pointer out and dropped the
+        // guard first. `dxgkddi_destroy_context` for this device's control
+        // context clears the cell under this same lock and then releases the
+        // last reference, freeing the object — so a queue create racing it would
+        // have taken a spinlock inside, and incremented a refcount inside, freed
+        // nonpaged pool. `ProcessSessionList::acquire_by_key` in this file is the
+        // correct shape and says why: acquire "so it cannot be freed between the
+        // lookup and the attach".
+        let cell = device_session.lock();
+        let Some(session) = *cell else {
+            drop(cell);
             crate::ddi::native_render::NR2_QUEUE_CTX_REJECT.fetch_add(1, Ordering::Relaxed);
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         };
-        // SAFETY: the device holds a reference for as long as the cell is set,
-        // and this call happens under that cell's lock having just read it.
+        // SAFETY: the device's own reference keeps the object alive for as long
+        // as the cell is set, and the cell's lock is held for this whole block —
+        // so the release path cannot be between the clear and the free here.
         let obj = unsafe { session.as_ref() };
         if obj.model.lock().phase() == model::SessionPhase::Draining {
+            drop(cell);
             crate::ddi::native_render::NR2_QUEUE_CTX_REJECT.fetch_add(1, Ordering::Relaxed);
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
@@ -618,6 +631,7 @@ fn admit_hvc1(
         // refuse every queue context this package can ever create. It carries
         // ring 0 and refuses at the host handoff instead (`Nr2NoHost`).
         obj.acquire();
+        drop(cell);
         crate::ddi::native_render::NR2_QUEUE_CTX.fetch_add(1, Ordering::Relaxed);
         return Ok(ContextRequest::HeliosQueue { session });
     }

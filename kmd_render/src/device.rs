@@ -59,6 +59,15 @@ const CONTEXT_CTX_MAGIC: u32 = 0x4843_5458; // "HCTX"
 pub static CONTEXT_HANDLE_REFUSED: AtomicU32 = AtomicU32::new(0);
 
 /// State for one scheduler context opened on a D3D device.
+///
+/// ⛔ `#[repr(C)]` IS LOAD-BEARING, not decoration. [`ContextHandleRef::from_raw`]
+/// reads `magic` through `addr_of!` on a handle that may not be one of ours at
+/// all — that is the whole point of the check — and Rust's default repr is free
+/// to place a lone `u32` among these pointers at ANY offset. At a high offset,
+/// the probe meant to reject a foreign object would read past the end of it
+/// first. `repr(C)` is what puts `magic` at offset 0, where the comment below
+/// has always claimed it was.
+#[repr(C)]
 pub struct ContextContext {
     /// [`CONTEXT_CTX_MAGIC`] — must be the FIRST field.
     magic: u32,
