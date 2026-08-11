@@ -1203,21 +1203,63 @@ PgDi       : 3 -> 5     +2  BAR_DEVICE_OP_SKIPS — two paging ops for that pool
 ChMn ChMc ChEa : 0 -> 0 (unchanged)  MapCpuHostAperture was never called at all
 ```
 
-Two things follow, and the second is the useful one:
+What follows is the skip, and only the skip: **+2 `PgDi` per pool**, with no
+other `Pg*` counter moving — both operations returned at a `!alloc.bar_eligible`
+early-return before any other site could count them. `ChMn`/`ChMc`/`ChEa` flat at
+zero closes the one alternative worth ruling out: `ChEa` is a **failure** entry,
+which forces an immediate flush, so an HVM1 reaching `MapCpuHostAperture` would
+have moved it.
 
-1. The skip is real and it is this allocation's: **+2 `PgDi` per pool**, with no
-   other `Pg*` counter moving — both operations returned at a
-   `!alloc.bar_eligible` early-return before any other site could count them.
-2. ⭐ **VidMm does issue placement-bearing paging operations for an HVM1
-   allocation.** That was the open design question — a `CpuVisible` memory
-   segment needs no CpuHostAperture callback, so it was not obvious the KMD would
-   ever be told which segment offset VidMm chose. It is: twice per pool. The
-   binding therefore has a hook to hang on, and it does not need K11.
+### ⛔ Correction — this measurement does NOT establish that a hook exists
 
-⚠ Which two operations, and whether each carries a `SegmentAddress`, is not yet
-known — `PgDi` is bumped from five sites (`build_paging_buffer.rs:819`, `:929`,
-`:1072`, `:1131`, `:1422`) and none of them records the op kind. That is the
-first thing the binding unit instruments.
+The first version of this section read `PgDi +2` as *"VidMm does issue
+placement-bearing paging operations for an HVM1 allocation, so the binding has a
+hook."* **That does not follow, and the error is worth keeping visible**, because
+it is the same shape as the H5 self-round-trip it was written to expose: a number
+that moves is not a number that means what you wanted.
+
+`PgDi` has **four** increment sites, not the five stated above
+(`build_paging_buffer.rs:823`, `:933`, `:1073`, `:1423`; the `!bar_eligible`
+return inside `bar_harvest_page_table` at `:1131` is a bare `return` and is
+**completely uninstrumented**). They split on whether a segment was ever proven:
+
+| site | operation | segment-gated before the skip? | descriptor carries SegmentId + SegmentAddress? |
+|---|---|---|---|
+| `:933` | `TRANSFER` | yes (`:917-920`) | **yes** |
+| `:1073` | `FILL` | yes (`:1063-1065`) | **yes** |
+| `:823` | `VIRTUAL_TRANSFER` | ⛔ no gate | ⛔ **no** — GPU virtual addresses only |
+| `:1423` | `VIRTUAL_FILL` | ⛔ no gate | ⛔ **no** — `DestinationVirtualAddress` only |
+
+⇒ `PgDi +2` is fully consistent with two segment-blind virtual ops on an
+allocation VidMm placed in the **aperture**, in which case no placement ever
+reached the KMD at all.
+
+And the driver's own op census says the two are exactly that. `PAGING_OP_SEEN_MASK`,
+read out of the diag S-ring (tag `0x0F01`) on the same boot, is **0x9B64**:
+
+```
+seen:     DISCARD_CONTENT(2) MAP_APERTURE_SEGMENT(5) UNMAP_APERTURE_SEGMENT(6)
+          VIRTUAL_TRANSFER(8) VIRTUAL_FILL(9) UPDATE_PAGE_TABLE(11)
+          FLUSH_TLB(12) NOTIFY_RESIDENCY(15)
+NOT seen: TRANSFER(0) FILL(1) ...
+```
+
+⭐ **`TRANSFER` and `FILL` have never fired on this driver.** It declares
+`Wddm2_1GpuMmu`, so VidMm uses the *virtual* content operations — which carry no
+segment address — and reports placement through `UPDATE_PAGE_TABLE` and the
+residency notifications instead. `bar_transfer` and `bar_fill`, the two arms that
+do carry a `SegmentAddress`, are dead code on this target.
+
+⚠ Bound on the census itself: `diag_dump_gpummu_atomics` masks the value `& 0xFFFF`,
+so ops 16-22 are **not** observable this way. `NOTIFY_RESIDENCY2` (21) — which
+carries `hAllocation`, an outer `SegmentId` and a `D3DGPU_PHYSICAL_ADDRESS`, and
+which every HVM1 role already opts into via `explicit_residency_notification`
+(`protocol/src/native_render.rs:1838`) — is therefore neither confirmed nor ruled
+out. It is the strongest candidate hook and it currently falls through
+`PagingOperation::parse`'s wildcard to `STATUS_SUCCESS`, uncounted.
+
+⇒ **Which operation carries an HVM1 placement is not knowable read-only.** The
+binding unit's first deploy is an instrument, not a fix.
 
 ### Bound, and what would falsify it
 
