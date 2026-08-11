@@ -1130,3 +1130,111 @@ hunch, as a side effect of an unrelated unit. What would settle it: read
 `PRESENT_MARKER_LAST_OFFSET` and already records which arm won. On the boot this
 was found, every `Pm*` read 0, so the instrument could not answer; it needs a
 run where the present path is actually exercised.
+
+---
+
+## F14 — An HVM1 allocation's `D3DKMTLock2` CPU view is guest system RAM, not the venus blob the KMD allocated for it. A3's whole memory half is blocked on a KMD unit, and A1's landed reply pool is already in this state.
+
+**Established 2026-08-11 by static reachability over `kmd_render/`, not by a
+target run.** Stated that way deliberately: the conclusion follows from *which
+code exists*, and the one instrument that could have caught it cannot.
+
+### What `admit_hvm1` builds
+
+`create_allocation.rs:3848-3856` gives every admitted HVM1 role a real host
+venus blob (`build_backing` → `Hwa2Backing::LinearMemory{ mappable }`). So the
+KMD does own renderer-side bytes per allocation, exactly as §10.7:1936-1940
+requires.
+
+### Why the guest CPU never reaches them
+
+`ctrl::map_blob_at` is the **only** mechanism in this driver that makes guest CPU
+pages alias venus blob bytes. It has exactly one caller — `cpu_host_aperture.rs:407`,
+inside `DxgkDdiMapCpuHostAperture` — and that path returns `STATUS_NO_MEMORY`
+before reaching it whenever `!alloc.bar_eligible` (`:387`, counter `ChEa`).
+
+`admit_hvm1` sets `bar_eligible: false` (`create_allocation.rs:3917`), on purpose:
+*"An HVM1 object's placement is HLM1 plus the ordinary aperture (§10.7:1999-2002);
+the CpuHostAperture BAR path is the mechanism §17.6 deletes."*
+
+The second candidate route is closed the same way: every paging operation on a
+non-eligible allocation is a **counted no-op reported as success** —
+`build_paging_buffer.rs:819` (virtual transfer), `:929` (transfer), `:1072` (fill),
+`:1131`, `:1422` (VirtualFill) → `PagingOpOutcome::NotOurs`, counter `PgDi`.
+
+⇒ VidMm backs the allocation, Lock2 maps *that* backing, and no code copies
+between it and the blob in either direction.
+
+### The mechanical cause is one flag word
+
+§10.7:1983-1986 specifies HLM1 as `Aperture=0, CpuVisible=1, CacheCoherent=0,
+SupportsCpuHostAperture=0` with `CpuTranslatedAddress = BAR guest-physical base`
+— i.e. VidMm maps the BAR directly and needs no CpuHostAperture DDI at all. At
+the shipping default `BarSegFlags = 0x1C` (`adapter/mod.rs:230,254`),
+`from_bar_flags` (`query_adapter_info.rs:787-833`) yields `cpu_visible=false`,
+`cache_coherent=true`, `supports_cpu_host_aperture=true`,
+`cpu_access = CpuAccess::HostAperture`. **Neither reported segment is
+`CpuVisible=1`.** The HLM1 shape is `BarSegFlags = 0x02`, and **F2 already
+measured that value booting `CM_PROB_NONE` with a live composited desktop** — so
+the shape is admissible; it is simply not what is reported, and nothing places an
+HVM1 allocation's blob at the VidMm-assigned offset inside that window.
+
+### ⛔ The consequence for what has already landed
+
+`tools/hts1_session_probe.c` **cannot detect this**, and its H5 check is where
+the false confidence lives: it writes three bytes through `lk.pData` and reads
+them back *through the same pointer* (`:371-382`). A private buffer passes that
+check identically. `TsPoolBind=1` therefore proves the KMD bound a pool object —
+not that the pool is a channel the host can write a reply into.
+
+⇒ **A1's role-1 HVM1 reply pool is not yet a reply channel.** HVR1 replies would
+be read out of guest RAM the host never wrote. That has not caused a failure
+because `session_init` grants zero endpoints until K11 (`translation_session.rs:879`)
+and no HVR1 has ever been produced.
+
+### ⭐ Measured on the target, and it also settles the design question
+
+Counter diff across one `hts1_session_probe.exe` run on the deployed
+**22.22.271.0**, `BarF = 28` (0x1C):
+
+```
+TsPoolBind : 2 -> 3     one role-1 HVM1 pool created, resident, Lock2-mapped
+PgDi       : 3 -> 5     +2  BAR_DEVICE_OP_SKIPS — two paging ops for that pool
+ChMn ChMc ChEa : 0 -> 0 (unchanged)  MapCpuHostAperture was never called at all
+```
+
+Two things follow, and the second is the useful one:
+
+1. The skip is real and it is this allocation's: **+2 `PgDi` per pool**, with no
+   other `Pg*` counter moving — both operations returned at a
+   `!alloc.bar_eligible` early-return before any other site could count them.
+2. ⭐ **VidMm does issue placement-bearing paging operations for an HVM1
+   allocation.** That was the open design question — a `CpuVisible` memory
+   segment needs no CpuHostAperture callback, so it was not obvious the KMD would
+   ever be told which segment offset VidMm chose. It is: twice per pool. The
+   binding therefore has a hook to hang on, and it does not need K11.
+
+⚠ Which two operations, and whether each carries a `SegmentAddress`, is not yet
+known — `PgDi` is bumped from five sites (`build_paging_buffer.rs:819`, `:929`,
+`:1072`, `:1131`, `:1422`) and none of them records the op kind. That is the
+first thing the binding unit instruments.
+
+### Bound, and what would falsify it
+
+The disjointness itself is still a reachability argument, not a byte-level
+measurement: no run has yet shown a host-originated write failing to appear
+through an HVM1 Lock2 VA, because no host producer exists (K11). It is falsified
+by any run in which one does appear. ⭐ The oracle that can settle it **without**
+K11 already exists: `with_blob_bytes` (`build_paging_buffer.rs:548-586`) maps the
+blob's real pages into kernel space via `map_blob_prepare` + `MmMapIoSpace`, so
+the KMD can read back what the guest wrote through Lock2 and compare. That is the
+acceptance check the binding unit owes.
+
+### What it costs mesa A3
+
+A3's HVM1 allocator, its role vocabulary, its create/close shapes and its
+validator are all still correct to write — the contract does not move. What A3
+**cannot** deliver until a KMD unit binds the CPU view is *bytes*: role 1/2/3
+memory whose contents the host and guest agree on. Two candidate mechanisms, both
+KMD-side and both small, are recorded in ROADMAP under "the HVM1 CPU-view
+binding".
