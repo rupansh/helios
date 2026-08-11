@@ -1019,3 +1019,49 @@ and Patch resolve in anyway); have the producer supply the generation and the
 KMD record it (the guest→kernel direction is the one channel that provably
 carries, since the create-input bytes reach the open intact); or return
 identities through the HNR2 reply channel. It is an owner decision.
+
+---
+
+## F12 — Every `DxgkDdiRender` on this driver copies a user-mode buffer with no probe and no exception frame. K6 fixed its own arm and deliberately left the other three.
+
+**Read 2026-08-11 while writing K6's Render arm; not measured, because the
+failure it describes is a bugcheck and provoking it is not a free experiment.**
+
+`DXGKARG_RENDER::pCommand` is the context's command buffer. It is mapped, and
+**writable**, in the submitting process for the whole call — that is the whole
+point of it: the UMD writes commands there and passes `CommandOffset`. Three
+DDIs read it with a bare `copy_nonoverlapping`:
+
+| site | buffer | guard |
+|---|---|---|
+| `submit_command.rs` `dxgkddi_render` tail | `pCommand` → `pDmaBuffer` | none |
+| `dxgkddi_render`'s `HeliosPresentRefreshCmd` / `HeliosPresentRenderCmd` decodes | `pCommand` → a local | none |
+| `dxgkddi_render_km` | `pCommand` → `pDmaBuffer` | none |
+| `dxgkddi_render_gdi` | `pCommand` → `pDmaBuffer` | none |
+
+Failure scenario, and it needs no malice: a process issues `D3DKMTRender`, and
+a second thread in that process unmaps or shrinks the command-buffer range
+before `DxgkDdiRender` reaches the copy. The read raises, the raise unwinds out
+of a `panic = abort` no_std DDI, and the machine bugchecks. `seh_shim.c` exists
+in this driver for the *same class* of trap on a different pointer, and its
+header comment names the reachable-from-any-process property as the reason.
+
+⚠ **This is not new with K6 and K6 did not fix it.** `src/render_user_copy.c`
+guards the HNR2 arm only. The other three are on the path DWM composites the
+entire desktop through, and swapping their copy for a probed one is a change to
+the hottest code in the driver whose failure mode — `ProbeForRead` refusing a
+legitimate buffer — is a dead desktop. Doing it as part of K6 would have been an
+unforced risk on an unrelated unit.
+
+**What would settle it cheaply.** `render_user_copy.c` returns distinct codes
+for a probe raise and a copy raise. Route ONE of the three legacy sites through
+it behind a registry knob, default off, and read `Nr2ProbeFlt` on a desktop +
+Fire Strike run: a nonzero probe-fault count means `pCommand` is not a plain
+user mapping on that path and the conversion is unsafe as written; zero across a
+real workload is the evidence needed to convert all three. That experiment is
+not K6's and is not scheduled.
+
+⛔ **Do not "fix" this by adding `ProbeForRead` to the legacy sites without that
+measurement.** The probe raises on a *kernel* address as readily as on an
+unmapped one, so if dxgkrnl ever hands those paths a kernel alias the probe
+converts a working driver into one that refuses every Render.
