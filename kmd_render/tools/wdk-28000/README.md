@@ -5,9 +5,10 @@ One file, checked in on purpose: `km/dispmprt.h`.
 ## Why it is here
 
 `gen_wddm32_slot_audit.py` parses `DRIVER_INITIALIZATION_DATA` out of this header
-to generate `kmd_render/src/ddi/wddm32_slot_audit.rs`, and
+to generate `kmd_render/src/ddi/wddm32_slot_audit.rs` plus the human review
+artifact `docs/retirement/d9-wddm32-slot-audit.md`, and
 `tools/retirement-gates.sh` re-runs the generator with `--check` to prove the
-committed `.rs` is not stale. That gate is the only thing standing between this
+committed outputs are not stale. That gate is the only thing standing between this
 driver and the failure `docs/retirement/FINDINGS.md` F6 records: the audit file
 says *"GENERATED — do not edit by hand"*, and following its own regenerate
 instruction once reverted the arming fix and would have shipped a driver that

@@ -737,11 +737,11 @@ another placement experiment or an instrument (`FINDINGS.md` F17). The sequence 
 | # | Unit | Why it is on THIS path | State |
 |---|---|---|---|
 | 1 | **D0** ETW substrate (`ddi/diag_etw.rs`, ADD) | D1/D2/D3 all emit through it | ✅ **LANDED AND EXERCISED ON THE TARGET.** Platform half uses the existing `wdk_sys` bindings, per-adapter epoch-tagged rundown plus a driver-wide provider-handle rundown, and the v7 `CollectDbgInfo` registration snapshot. KMD **22.22.277.0** cold-boots `CM_PROB_NONE`; `EnumerateTraceGuidsEx(TraceGuidQueryInfo)` sees the task GUID registered, and both standing probes remain **15/15**. |
-| 2 | **D2** `direct_scanout.rs` (ADD) | D3 depends on it | ABSENT. ⛔ Read §6 items 6 and 8 FIRST — item 8 is "the single most load-bearing display ambiguity; confirm before D2 is written", and item 6 is a QEMU cross-lane dependency whose conservative interim never releases a binding. |
+| 2 | **D2** `direct_scanout.rs` (ADD) | D3 depends on it | ABSENT. ⭐ §6 items 6 and 8 are **RESOLVED**: `qemu-helios` is immutable; an exact successful fenced nonzero `SET_SCANOUT_BLOB` completion latches the candidate and releases the prior KMD-owned backing. Explicit unbind first replaces with the permanent KMD parking/black blob, then may send `SET(0)` while retaining parking until a later nonzero replacement or transport reset. |
 | 3 | **D3** `mpo3.rs` (ADD) — the seven MPO3 slots | `doc:2854` rejects a 3.2 package without a complete MPO3 surface | ABSENT. Contract item 4 **RESOLVED** against the 28000 header; the other §2.5 shapes confirm at point of use (§6 item 3). |
 | 4 | **D4** then **D5** (`display.rs`, `present_packet.rs`) | D5 is part of the MPO3 surface D9 gates on; D5 serializes after D4 (same file) | D4 is XL. |
 | 5 | **native fences (K7)** | `doc:2854` rejects 3.2 on an incomplete FENCE surface too | `ddi/native_fence.rs` exists (1446 l) but is **authored-and-unwired** — `FINDINGS.md` F9, and `cargo check` reports 9 of its symbols dead. |
-| 6 | **D9** the slot audit + `SURFACE` → `Wddm3_2GpuMmu` | the flip itself | ⛔ needs the owner decision in §6 item 2 (where the 193-slot audit artifact lives) before it starts. |
+| 6 | **D9** the slot audit + `SURFACE` → `Wddm3_2GpuMmu` | the flip itself | ⭐ §6 item 2 is **RESOLVED**: the checked-in generated human artifact is `docs/retirement/d9-wddm32-slot-audit.md` (192 callback slots plus `Version`, 193 fields total). D9 still runs strictly last. |
 | 7 | **K2a resumes** | at 3.2 the WDDM **2.9** `DXGKRNL_INTERFACE` block is legitimately in scope | `DxgkCbCreatePhysicalMemoryObject(IO_SPACE)` + `DxgkCbMapPhysicalMemory(USER_MODE)` — F17. |
 
 ⚠ **The desktop stays dark for most of this**, by the owner's explicit acceptance.

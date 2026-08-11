@@ -78,13 +78,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Fail the build if `src/ddi/wddm32_slot_audit.rs` has drifted from the
-/// generator and classification table that produce it.
+/// Fail the build if either generated slot-audit output — the machine-readable
+/// `src/ddi/wddm32_slot_audit.rs` or human-readable
+/// `../docs/retirement/d9-wddm32-slot-audit.md` — has drifted from its inputs.
 ///
 /// # Why this exists
 ///
-/// The audit file's own header says "GENERATED — do not edit by hand" and names
-/// the command to regenerate it. On 2026-08-10 that command **reverted the fix
+/// Both audit outputs say "GENERATED — do not edit by hand" and name the command
+/// that regenerates them. On 2026-08-10 that command **reverted the fix
 /// that made the audit armable**: the `Retiring` class lived only in the
 /// hand-edited `.rs`, so regenerating reclassified eight live slots to
 /// `Disabled` and `verify()` would then have refused to load a correct driver
@@ -151,6 +152,7 @@ fn verify_slot_audit_not_stale() {
     println!("cargo:rerun-if-changed=tools/gen_wddm32_slot_audit.py");
     println!("cargo:rerun-if-changed=tools/wddm32_slot_classes.tsv");
     println!("cargo:rerun-if-changed=src/ddi/wddm32_slot_audit.rs");
+    println!("cargo:rerun-if-changed=../docs/retirement/d9-wddm32-slot-audit.md");
     println!("cargo:rerun-if-env-changed=HELIOS_WDK_KM_INCLUDE");
 
     let header = [
@@ -217,11 +219,12 @@ fn verify_slot_audit_not_stale() {
             let stderr = String::from_utf8_lossy(&out.stderr);
             if stderr.contains(marker_stale) {
                 panic!(
-                    "kmd_render/src/ddi/wddm32_slot_audit.rs is STALE with respect to \
+                    "the generated slot-audit outputs are STALE with respect to \
                      gen_wddm32_slot_audit.py + wddm32_slot_classes.tsv.\n\
-                     Regenerate it (python3 kmd_render/tools/gen_wddm32_slot_audit.py) \
-                     and review the diff — a class that exists only in the .rs will be \
-                     silently reverted, and the audit then refuses to load the driver.\n\
+                     Regenerate both (python3 kmd_render/tools/gen_wddm32_slot_audit.py) \
+                     and review both diffs — a class that exists only in one generated \
+                     output will be silently reverted, and the machine audit can then \
+                     refuse to load the driver.\n\
                      --- generator output ---\n{stdout}{stderr}"
                 );
             }

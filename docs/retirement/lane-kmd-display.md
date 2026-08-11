@@ -183,21 +183,21 @@ writing `diag_etw.rs` (unit D0 step 0).
 
 Dependency shorthand: **P** = protocol lane (§17.1), **C** = KMD-core lane
 (`ddi/mod.rs`, `lib.rs`, `build.rs`, `create_allocation.rs`, `query_adapter_info.rs`,
-`interrupt.rs`, `lifecycle.rs`, `virtio/*`, `device.rs`), **Q** = QEMU/host lane
-(§17.7), **U** = D3D11 UMD lane (§17.4).
+`interrupt.rs`, `lifecycle.rs`, `virtio/*`, `device.rs`), **U** = D3D11 UMD
+lane (§17.4). `qemu-helios` is read-only for this retirement (§6 item 6).
 
 | Id | Goal | Files owned | Depends on | Size |
 |---|---|---|---|---|
 | **D0** | ETW substrate: `EtwRegister` at PASSIVE `DriverEntry`, retained `REGHANDLE`, atomic enabled-bit/level pair, `EtwProviderEnabled`-gated emit for all 12 event IDs, one 72-byte non-paged data descriptor per `EtwWrite`, bounded event-site rundown, one `EtwUnregister` at unload, and a failed-registration record for the next diagnostic snapshot. | `ddi/diag_etw.rs` (ADD) | **P**: `protocol/src/diagnostics.rs` (GUID, descriptors, 72-byte payload, flags, keywords). **C**: `ddi/mod.rs` + `lib.rs` (see §4). Also needs the `base.rs` ETW-callback retarget (§6 item 1). | M |
 | **D1** | Retire the private timeline ring; every surviving causal boundary becomes an ETW event. | `ddi/scanout_timeline.rs` (REWRITE) | D0; **C** must have deleted `ddi/escape.rs` (its only reader). Touches 33 `note()` call sites across 7 files → see §4. | M |
-| **D2** | The one bounded, non-pageable `validate_direct_scanout_binding` routine + the candidate/current/backend-release plane object graph, one object per VidPn source/plane. Consumes only the OS-supplied allocation, VidPn source, committed target mode, operation flags, and actual plane attributes. | `ddi/direct_scanout.rs` (ADD) | **P**: HWA2 descriptor. **C**: `create_allocation.rs` must expose an HWA2 read for an `hAllocation`. **Q**: the two backend acks (§6 item 6). D0 for events 7/8/9. | L |
+| **D2** | The one bounded, non-pageable `validate_direct_scanout_binding` routine + the candidate/current/fenced-release plane object graph, one object per VidPn source/plane. Consumes only the OS-supplied allocation, VidPn source, committed target mode, operation flags, and actual plane attributes. A permanent KMD-owned black parking blob is the explicit-unbind replacement, never a presentation fallback. | `ddi/direct_scanout.rs` (ADD) | **P**: HWA2 descriptor. **C**: `create_allocation.rs` must expose an HWA2 read for an `hAllocation`; `virtio/ctrl.rs` + `virtio/gpu/mod.rs` must mint and exactly validate standard fenced nonzero `SET_SCANOUT_BLOB` completions (§6 item 6). D0 for events 7/8/9. **No QEMU edit.** | L |
 | **D3** | `DxgkDdiCheckMultiPlaneOverlaySupport3`, `DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3`, `DxgkDdiGetMultiPlaneOverlayCaps`, `DxgkDdiGetPostCompositionCaps`, `DxgkDdiPostMultiPlaneOverlayPresent`, `DxgkDdiValidateUpdateAllocationProperty`, `DxgkDdiControlModeBehavior`. | `ddi/mpo3.rs` (ADD) | D2, D0. **C** for the `lib.rs` slot registrations. | L |
 | **D4** | Classic `DxgkDdiSetVidPnSourceAddress` and the DMA-flip arm rebuilt on D2; delete the LINEAR fallback, the fast-bind accelerator, the retry budget, the snapshot substitution, and the single-slot coalescer. | `ddi/display.rs` (all ranges in §2.3 except the Present arm) | D2, D0. | XL |
 | **D5** | The `FlipWithMultiPlaneOverlay` Present union arm: bounded `PlaneListCount`, validate every `hDeviceSpecificAllocation`, never read `pAllocationList`, emit the ordinary exact-allocation packet, claim no lease. | `ddi/present_packet.rs`, `ddi/display.rs::dxgkddi_present_inner` | **Serialized after D4** — shares `display.rs`. | M |
-| **D6** | `adapter/scanout.rs` becomes the plane lifetime owner: delete ledger issue/retire, delete the snapshot/windowed-BLT/present-marker refresh routes, install latch-once / release-after-backend-ack. | `adapter/scanout.rs` | D2. Touches `AdapterContext` fields in `adapter/mod.rs` (**C**). | L |
+| **D6** | `adapter/scanout.rs` becomes the plane lifetime owner: delete ledger issue/retire, delete the snapshot/windowed-BLT/present-marker refresh routes, install latch-once / release at the exact fenced nonzero replacement boundary, including the two-step parking unbind. | `adapter/scanout.rs` | D2. Touches `AdapterContext` fields in `adapter/mod.rs` (**C**). | L |
 | **D7** | Delete the read ledger and every call site. | `adapter/read_ledger.rs` (DELETE) | D6. Call sites outside this lane: `adapter/mod.rs:27,34-36,492,1058,1266-1269,1622-1626`, `adapter/locks.rs:8-9`, `device.rs:352`, `ddi/lifecycle.rs:169`, `virtio/ctrl.rs:1177-1182,1236-1242`, `virtio/gpu/mod.rs:47,602,5421,5538,5584,5640,5750`, `ddi/escape.rs` (deleted by **C**). | M |
 | **D8** | Shrink `scanout_trace.rs` to the counters whose mechanism survives; delete the read-ledger census and every retired-value name. | `ddi/scanout_trace.rs` | **Serialized after D4, D6, D7** — it is the publication point for their counters. | M |
-| **D9** | The WDDM 3.2 slot-and-cap audit: classify all 193 `DRIVER_INITIALIZATION_DATA` slots, prove every cap-disabled family unreachable, prove `DxgkDdiEscape == NULL`, prove no `PostPresentNeeded`/Hsync/HW-flip-queue flag is ever set, and flip `SURFACE` to `Wddm3_2GpuMmu`. | audit artifact (location unresolved — §6 item 2); `ddi/wddm_surface.rs` is **C**-owned | D3, D5, **and the native-fence lane**. Strictly LAST: `doc:2854` rejects a 3.2 package whose MPO3 or fence surface is incomplete. | M |
+| **D9** | The WDDM 3.2 slot-and-cap audit: classify all 192 callback slots plus `Version` (193 fields total), prove every cap-disabled family unreachable, prove `DxgkDdiEscape == NULL`, prove no `PostPresentNeeded`/Hsync/HW-flip-queue flag is ever set, and flip `SURFACE` to `Wddm3_2GpuMmu`. | generated human artifact `docs/retirement/d9-wddm32-slot-audit.md`; machine audit `ddi/wddm32_slot_audit.rs`; `ddi/wddm_surface.rs` is **C**-owned | D3, D5, **and the native-fence lane**. Strictly LAST: `doc:2854` rejects a 3.2 package whose MPO3 or fence surface is incomplete. | M |
 | **D10** | `kmd_logic` model: delete `scanout_read_ledger` + its tests; add a host-tested plane candidate/current/backend-release/reset/mode-transition model. | `kmd_logic/src/lib.rs` (SHARED — §4) | D2 (contract), D7. | M |
 
 **Same-file constraints, stated explicitly:** D4 and D5 both write
@@ -221,7 +221,7 @@ a cross-lane rendezvous, not a private edit.
 | `kmd_render/src/ddi/interrupt.rs`, `submit_command.rs` | **Core**. | `signal_crtc_vsync` (`submit_command.rs:663-681`) must gain a `DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY3` sibling for MPO3 flip retirement; both files also call `scanout_timeline::note` (D1). |
 | `kmd_render/src/adapter/mod.rs`, `adapter/locks.rs` | **Core** (§17.6 Modify). | Field removals for D6/D7: `read_ledger`, `pending_vidpn_allocation`, the lease/refresh/fast-bind atomics, and the ledger's leaf lock in the lock-order comment. |
 | `kmd_render/src/adapter/kobj.rs` | Nobody — **not in the manifest**. | VSync DPC; calls `scanout_timeline::note` and reads `last_primary_address`. |
-| `kmd_render/src/virtio/ctrl.rs`, `virtio/gpu/mod.rs` | **Core** + host lane. | `ScanoutFlushToken`, `stage_scanout_bind`, `begin_scanout_resource_retire`, `cancel_publication_exact`, and 5 `scanout_timeline::note` sites. The two new backend acks (§6 item 6) land here. |
+| `kmd_render/src/virtio/ctrl.rs`, `virtio/gpu/mod.rs` | **Core** + this lane. | `ScanoutFlushToken`, `stage_scanout_bind`, `begin_scanout_resource_retire`, `cancel_publication_exact`, and 5 `scanout_timeline::note` sites. Standard fence minting plus exact response flag/id validation for `SET_SCANOUT_BLOB` lands here; there is no QEMU callback or wire extension (§6 item 6). |
 | `kmd_logic/src/lib.rs` | **Core** (batch/queue models) + **native-fence lane** (Core-0116 lifecycle model) + this lane (plane model). | One file (**8144** lines at HEAD — `wc -l`, do not trust an older figure; this row said 5596), four lanes now that `allocation_identity` is in it. Partition by `pub mod` block and merge by whole-module insert; do not interleave edits. Delete `scanout_read_ledger` (**`:4035-4290`**) and `scanout_read_ledger_tests` (**`:4291-4519`**) as one contiguous excision — re-derive both bounds from the neighbouring `mod` starts before cutting, because this row's earlier `:4079-4334` / `:4335-4563` were wrong at both ends. |
 | `protocol/src/diagnostics.rs` | **Protocol lane** (§17.1). | D0 hard-blocks on it. |
 
@@ -267,7 +267,7 @@ win_install_kmd   # re-sign + DriverStore publish + reboot (a new KMD image load
   stale/duplicate backend-callback cases.
 - ETW: `tools/helios_etw_capture.ps1` (added by the tools lane, `doc:4539`).
   Until it exists there is no decode path for the provider.
-- `doc:4653-4656` the generated slot audit — form and location unresolved (§6 item 2).
+- `doc:4653-4656` the generated slot audit: machine half in `ddi/wddm32_slot_audit.rs`, human half in `docs/retirement/d9-wddm32-slot-audit.md` (§6 item 2 resolved).
 
 **Standing measurement trap (CLAUDE.md rule 6):** service-key counters persist
 across boots. Any counter this lane keeps must be proven to *move this boot*
@@ -288,8 +288,8 @@ Delete/Modify/Add lists** (`doc:4267-4315`). Same for `dxgkddi_unload`
 only two one-line forwarders. That is still an edit to a file this lane does not
 own → **CROSS-LANE REQUEST** to core.
 
-**2. The "generated `DRIVER_INITIALIZATION_DATA` slot audit" is not
-implementable as written, and the doc never says where it lives.**
+**2. ⭐ RESOLVED 2026-08-11 — the generated `DRIVER_INITIALIZATION_DATA` audit
+has one machine home and one in-tree human-review home.**
 `doc:4460-4463` demands "Generate the full WDK-28000 `DRIVER_INITIALIZATION_DATA`
 layout and classify every slot"; `doc:4499` demands "The generated table/flag
 test enforces that invariant"; `doc:4653-4656` grades the audit. But
@@ -297,11 +297,12 @@ test enforces that invariant"; `doc:4653-4656` grades the audit. But
 harness** (CLAUDE.md key invariant, `kmd_render/Cargo.toml` comment), and
 `kmd_logic` is deliberately dependency-free with **no `wdk-sys`/bindgen edge**,
 so it cannot see `DRIVER_INITIALIZATION_DATA` at all. There is no third home.
-*Conservative reading:* the audit becomes (a) `const _: () = assert!(…)` blocks
+*Owner decision:* the audit is (a) `const _: () = assert!(…)` blocks
 inside `kmd_render` over `offset_of!`/`size_of!` and a `const` table value —
 these are compile-time and legal in `no_std` — plus (b) a checked-in generated
-markdown/CSV classification of all 193 slots regenerated by a host-side script
-in `tools/`. **Owner decision required** before D9 starts.
+Markdown classification of all 192 callback slots plus `Version` (193 fields)
+at `docs/retirement/d9-wddm32-slot-audit.md`, regenerated by
+`kmd_render/tools/gen_wddm32_slot_audit.py`. D9 is no longer blocked on location.
 
 **3. WDK version mismatch (blocker for every struct shape in this lane).**
 The doc's baseline is WDK **28000.2526** (`doc:97`, `doc:4649-4652`,
@@ -378,21 +379,26 @@ NTSTATUS, because a failing NTSTATUS from this DDI is not in the doc's stated
 return set. Note the tension: CLAUDE.md wants loud failure, the doc wants
 `Supported=FALSE`; the counter is the reconciliation.
 
-**6. The "separate backend old-reader-release acknowledgement" does not exist in
-the transport, and this lane cannot create it.**
-`doc:2826-2828` and `doc:5107-5108` require the prior binding to be released
-"only after a distinct backend old-reader-release acknowledgement", separate
-from the latch ack. Today the transport has **one** terminal response per
-`SET_SCANOUT_BLOB`/`RESOURCE_FLUSH` (`ScanoutFlushToken`,
-`begin_scanout_resource_retire`, `cancel_publication_exact` in
-`adapter/scanout.rs:1032-1046,1174-1200` and `virtio/gpu/mod.rs`). §17.7
-(`doc:4558-4560`) assigns the two events to QEMU. **D2/D6 cannot satisfy
-`doc:5108` until the QEMU and virtio lanes land them.** → **CROSS-LANE
-REQUEST**: QEMU must emit distinct plane-latch and old-binding-release
-acknowledgements; `virtio/ctrl.rs`/`virtio/gpu/mod.rs` must surface both.
-*Conservative interim:* the plane object holds its reference and refuses to
-release until a release ack arrives; with no ack source it never releases —
-loud (a growing named counter), never a fake release.
+**6. ⭐ RESOLVED 2026-08-11 — no custom QEMU acknowledgement and no QEMU edit.**
+`qemu-helios` is immutable for this retirement. Every real replacement sends a
+nonzero `SET_SCANOUT_BLOB` with `VIRTIO_GPU_FLAG_FENCE` and a unique nonzero
+`fence_id`. Only a successful response carrying the fence flag and the exact
+ID is the transaction boundary: it atomically latches the candidate and permits
+release of the prior KMD-owned backing. ETW still emits logically distinct latch
+and reader-release events keyed to that same binding sequence/fence; neither is
+reconstructed from Present timing. Error, timeout, missing flag, mismatched ID,
+duplicate, or stale completion cannot alter a newer binding and retains every
+backing whose ownership is uncertain, with a named refusal counter.
+
+Explicit unbind is deliberately two-step because pinned QEMU's `SET(0)` arm
+neither frees `g->dmabuf.primary[scanout]` nor calls `dpy_gl_release_dmabuf`.
+First fenced-replace the real current binding with one permanent, zero-filled,
+KMD-owned parking/black blob. The exact success of that **nonzero replacement**
+releases the real prior backing and completes the logical unbind. A fenced
+`SET(0)` may then disable scanout, but its completion never releases parking;
+parking remains strongly retained until a later successful nonzero replacement
+or transport reset. The parking blob is bounded adapter state, not the deleted
+LINEAR presentation fallback, not an OS allocation guess, and not user-visible.
 
 **7. The classic DDI's "nonblocking backend enqueue at interrupt level" is not
 satisfiable with the current virtio locking.**
@@ -417,12 +423,12 @@ refuse `DxgkDdiDestroyAllocation`, and the doc never states what happens when
 dxgkrnl destroys an allocation that is still the current plane binding. The
 current code handles this by cancelling the pending bind from
 `retire_scanout_allocation_locked` (`adapter/scanout.rs:1114-1200`) — the exact
-shortcut `doc:5700` says to replace. *Conservative reading:* the retained
+shortcut `doc:5700` says to replace. *Owner decision:* the retained
 reference is to the **KMD-owned host backing object** (which §17.6 `doc:4381-4383`
 says the KMD continues to own), not to the dxgkrnl handle: destroy unbinds the
-plane synchronously and defers the host `RESOURCE_UNREF` until the backend
-release ack. **This is the single most load-bearing display ambiguity; confirm
-before D2 is written.**
+plane through item 6's fenced parking replacement and defers the real backing's
+`RESOURCE_UNREF` until that exact nonzero completion. The permanent parking
+backing itself remains retained until a later nonzero replacement or reset.
 
 **9. 27 timeline kinds must fit 12 ETW event IDs, and the doc supplies no
 mapping.**

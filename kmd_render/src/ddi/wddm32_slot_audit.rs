@@ -6,7 +6,7 @@
 //!
 //! Regenerate with `python3 kmd_render/tools/gen_wddm32_slot_audit.py`; the
 //! classification lives in `kmd_render/tools/wddm32_slot_classes.tsv` and the
-//! human-readable rendering in `kmd_render/tools/WDDM32_SLOT_AUDIT.md`.
+//! human-readable rendering in `docs/retirement/d9-wddm32-slot-audit.md`.
 //!
 //! # What this file proves, and how
 //!

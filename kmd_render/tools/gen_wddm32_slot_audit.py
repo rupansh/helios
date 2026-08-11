@@ -32,7 +32,7 @@ Inputs
 Outputs
 -------
   kmd_render/src/ddi/wddm32_slot_audit.rs   generated Rust (checked in)
-  kmd_render/tools/WDDM32_SLOT_AUDIT.md     generated human-readable table
+  docs/retirement/d9-wddm32-slot-audit.md   generated human-readable table
 
 Failure modes, all hard errors (never a silent partial table):
   * a slot in the header with no classification row;
@@ -76,7 +76,7 @@ DEFAULT_HEADER = os.path.join(
 )
 DEFAULT_CLASSES = os.path.join(REPO, "kmd_render", "tools", "wddm32_slot_classes.tsv")
 DEFAULT_RS = os.path.join(REPO, "kmd_render", "src", "ddi", "wddm32_slot_audit.rs")
-DEFAULT_MD = os.path.join(REPO, "kmd_render", "tools", "WDDM32_SLOT_AUDIT.md")
+DEFAULT_MD = os.path.join(REPO, "docs", "retirement", "d9-wddm32-slot-audit.md")
 
 # The four classes the verifier understands.  Two are terminal and two are
 # transitional, and the transitional pair is what makes the audit armable at
@@ -200,7 +200,7 @@ RS_HEADER = '''//! GENERATED — do not edit by hand.
 //!
 //! Regenerate with `python3 kmd_render/tools/gen_wddm32_slot_audit.py`; the
 //! classification lives in `kmd_render/tools/wddm32_slot_classes.tsv` and the
-//! human-readable rendering in `kmd_render/tools/WDDM32_SLOT_AUDIT.md`.
+//! human-readable rendering in `docs/retirement/d9-wddm32-slot-audit.md`.
 //!
 //! # What this file proves, and how
 //!

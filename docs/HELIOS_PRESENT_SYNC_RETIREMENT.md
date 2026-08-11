@@ -8,15 +8,15 @@ UNAUTHORIZED PENDING HTS1/HLM1 AND RUNTIME GATES**
 
 Static-analysis snapshot: **2026-08-09**
 
-> ⚠ **This file is frozen and is NOT rewritten in place. Where a measurement or an
-> owner decision contradicts this text, THAT WINS.** ⛔ Before implementing ANY
-> section, read the **SUPERSEDED CLAIMS INDEX at the very end of this file** and
-> `docs/retirement/FINDINGS.md`. As of 2026-08-10 the index already retires the
-> build-28000 package minimum (F1), the assumed Code-43 failure of HLM1's segment
-> shape (F2), **the entire HPM1 host protocol and every requirement that the guest
-> negotiate it (F5 — DECLINED, not deferred)**, and §10.3's Ready/Release fence
-> import (F8). ⛔ **This file's line numbers are load-bearing and an edit here has
-> already invalidated every citation once — preserve the line count.**
+> ⚠ **This file is frozen. Where a measurement or owner decision contradicts it,
+> THAT WINS.** Before implementation read the **SUPERSEDED CLAIMS INDEX** and
+> `docs/retirement/FINDINGS.md`; they retire F1/F2/F5/F8 assumptions in the body.
+> ⛔ **OWNER AMENDMENT 2026-08-11:** `qemu-helios` is immutable for retirement;
+> every custom QEMU plane latch/release callback, record, and work unit is withdrawn.
+> One exact successful fenced nonzero `SET_SCANOUT_BLOB` response is the latch and
+> prior-release boundary. Explicit unbind first fenced-replaces with a permanent
+> KMD parking/black blob, then may `SET(0)` while retaining parking through the
+> next nonzero replacement/reset. Line numbers are load-bearing; preserve count.
 
 Target baseline: **Windows 11 26H1 (build 28000) / WDDM 3.2 / D3D12 Core
 DDI 0116 or later, traditional kernel submission**
@@ -2819,25 +2819,25 @@ Direct/independent mode:
 - DXGI/dxgkrnl reaches the ordinary flip/MPO/SetVidPnSourceAddress DDI only
   after the actual render-context dependency;
 - classic SetVidPn and MPO3 independently run the shared exact-allocation,
-  actual-source/current-mode/profile validator; KMD then retains that exact
-  allocation/backing plus a display-backend lease before accepting a new
-  plane binding;
-- the backend acknowledges actual latch separately from eventual old-reader
-  release; KMD atomically installs the new current binding at latch;
-- the prior binding is released only after it has been replaced/unbound **and**
-  QEMU/display has acknowledged that no reader uses it;
-- the newly current allocation remains referenced until another accepted bind
-  replaces it or the plane/source is disabled. Swapchain reuse remains an
-  OS/DXGI decision, never an inference from a PID, PresentId, or timeout.
+  actual-source/current-mode/profile validator; KMD retains that exact backing
+  before accepting a new plane binding;
+- every ordinary replacement is a nonzero `SET_SCANOUT_BLOB` carrying
+  `VIRTIO_GPU_FLAG_FENCE` and a unique nonzero fence id; only a successful reply
+  echoing the exact flag/id is the latch-plus-prior-release boundary;
+- KMD installs the new current and releases the prior backing at that boundary,
+  while emitting logically distinct latch/release ETW events for the same fence;
+- explicit unbind first fenced-replaces with a permanent KMD parking/black blob,
+  then may `SET(0)` but retains parking until a later nonzero replacement/reset;
+- a real current remains referenced until replacement; reuse is an OS/DXGI choice.
 
 Transition/cancel:
 
 - composition promotion/demotion uses ordinary DXGI state;
 - a candidate canceled before latch releases only its candidate reference and
   never displaces the current plane;
-- mode changes, source invisibility, power transitions, reset, DWM restart,
-  and teardown cancel pending candidates and explicitly unbind/release every
-  affected current plane after backend release (C31);
+- mode changes, source invisibility, power transitions, DWM restart, and teardown
+  cancel candidates and run fenced parking replacement; uncertain completion
+  retains the real backing, while transport reset is the terminal boundary (C31);
 - the former `read_ledger`, Escape mapping, 65-slot page, event registration,
   10 ms signaler, DXVK scans, and snapshot fallback are deleted.
 
@@ -3119,7 +3119,7 @@ sequenceDiagram
 | HLM1/HPM1 local-memory service | KMD/QEMU negotiate the complete linear BAR and paging engine before QuerySegment4 exposes `[aperture id1,CpuVisible memory id2]`; each exact KMD allocation owns one renderer view, never an independent byte copy | BuildPagingBuffer emits actual DMA; mandatory paging Patch is side-effect-free/no-size-change; Submit only enqueues the exact allocation generation, segment/ADL runs, range, and next epoch | device/QEMU copies/fills/maps/binds, retains old placement and host refs, then publishes epoch and completes the paging SubmissionFenceId; HNR accepts only a current patched placement | reset/stop cancel transactions, drain address-space/host refs, revoke bindings, invalidate epochs, then destroy HPM/BAR state; no HAP, UMD ID, lookup scan, or CPU-synchronous paging mutation |
 | Native Vulkan HVM1 storage | every ordinary non-import `VkDeviceMemory` creates one unshared allocation with `pSystemMem=NULL`, physical access, an exact device-local or host-visible role, and one KMD renderer view bound by HPM1 | device-local role has no CPU map; host-visible role uses `D3DKMTLock2` for the direct HLM1 BAR VA or VidMm's byte-identical system VA; no custom handle/ID/map callback | bound image/buffer records carry the exact allocation/range into HNR2; HPM1 paging preserves bytes; C51 orders host-visible CPU ownership and finite replies | unlock host-visible maps, retire HPM/host/GPU refs, destroy WDDM allocation/renderer view; no user MDL, name, file, HAP, or raw ID |
 | Native Vulkan progress fence | ICD creates one unshared `D3DDDI_MONITORED_FENCE` for every HNR2-executing context, including control and every real lower queue | none; local KMT object/mappings stay in that ICD device | optional same-context FromGpu signal after the relevant Render; control value means only decode/reply completion, nonzero queue value means that queue's GPU completion; FromCPU event/block wait only when requested | join all required queue values for device idle/teardown, then drain control; destroy after armed waits/context work; reset/removal is failure and recreates it |
-| Current display-plane binding | KMD/QEMU; one exact object per active VidPn source/MPO plane | exact allocation from OS flip/MPO/SetVidPnSourceAddress or MPO3 `ppContextData[].hAllocation`, plus held KMD backing | new binding retained before acceptance; latch replaces prior; backend reports old-reader release | prior releases after replacement+backend release; current releases after unbind+backend release |
+| Current display-plane binding | KMD; one exact object per active VidPn source/MPO plane | exact allocation from OS flip/MPO/SetVidPnSourceAddress or MPO3 `ppContextData[].hAllocation`, plus held KMD backing | new binding retained before acceptance; exact fenced nonzero replacement completion latches new and releases prior | explicit unbind first replaces with permanent parking, which survives optional `SET(0)` until later replacement/reset |
 | WSI shared texture `S[i]` | layer D3D12 device; DEFAULT committed BGRA8 resource, SHARED heap only, ALLOW_RENDER_TARGET, initial COMMON | one retained `CreateSharedHandle(...,NULL,GENERIC_ALL,NULL)`; the lower ICD obtains the exact local allocation through C57's query/zeroed-array/open carrier on its own KMT device, so canonical and C45 alias Vulkan imports are available | Vulkan external release; D3D copy; external acquire | canonical image/memory live with `S[i]`; after every alias and GPU ref drains, `D3DKMTDestroyAllocation2{hResource,phAllocationList=NULL,AllocationCount=0,Flags=0}` closes the whole import, then `H[i]` closes |
 | WSI alias image | app `vkCreateImage` with exact non-null still-valid layer swapchain; layer creates a real lower external VkImage | on bind, exact `imageIndex` selects `S[i]`; query `H[i]` memory types, make a distinct dedicated `D3D12_RESOURCE_BIT` VkDeviceMemory, bind at zero; null-swapchain forms instead forward as ordinary image/bind | identical-image alias layout/write semantics plus the same explicit swapchain/external ownership rules; Present still identifies original swapchain/index | old-swapchain retirement preserves use; parent destruction drains/reacquires external payload and removes only WSI/canonical handles; alias remains normal Vulkan image until its GPU refs and `vkDestroyImage` retire |
 | WSI per-slot recording objects | layer; one D3D12 allocator/list and one lower-Vulkan resettable pool with acquire/release barrier buffers per `S[i]` | none | record/execute only for that slot/epoch | reset/re-record only after exact `Release[i]=e` completes; destroy after slot work cancels/retires |
@@ -4515,9 +4515,9 @@ Modify:
   Helios vendor-protocol header for the negotiated HPM1 paging DMA and HLM1 BAR
   admission fields/opcodes
 - `qemu-helios/hw/display/trace-events`
-- `qemu-helios/ui/egl-headless.c`, `qemu-helios/ui/trace-events`, and the
-  display-listener headers that carry exact plane latch, replacement, and
-  release
+- `qemu-helios` is read-only for retirement; no display-listener callback,
+  vendor plane record, trace event, or custom acknowledgement is added; KMD uses
+  standard fenced `SET_SCANOUT_BLOB` plus its permanent parking/black blob
 - `packaging/windows/Install-Helios.ps1`
 - `packaging/windows/Install-Helios.cmd`
 - `tools/read_ledger_dump.c` — delete
@@ -4555,9 +4555,9 @@ Modify:
   evidence, not live behavior. Archive material remains immutable and is
   labelled historical rather than searched as live behavior.
 
-QEMU must execute the actual outer batch and return exact batch completion plus
-separate exact plane-latch and old-binding-release events; neither event is
-reconstructed from Present timing. For D3D12 virtual submits it consumes only
+QEMU remains unmodified. KMD requests standard fenced nonzero scanout replacement;
+one exact successful response is both latch and prior-release boundary, with the
+two ETW events emitted guest-side. For D3D12 virtual submits it consumes only
 the KMD-originated process/address-space generation plus GPUVA/size descriptor,
 walks C64's current HPM1 root/PTE/TLB state, reads complete HOB1, validates all
 ranges/generations/typed operands, and substitutes renderer IDs only in a
@@ -5104,12 +5104,12 @@ Core-0116/context/fence causal tests pass.
   display paths resolve the exact OS-supplied allocation, never a `resid`;
 - KMD retains each candidate before accepting it; cancellation before latch
   releases only the candidate and leaves the current binding;
-- replacement installs the new current binding once, and releases the prior
-  binding only after a distinct backend old-reader-release acknowledgement;
-- fullscreen/mode/power/reset/DWM-restart/adapter-stop transitions cancel
-  candidates, unbind every affected current plane, and drain backend leases;
-- delayed/duplicated/stale QEMU latch and release callbacks cannot replace or
-  release a newer binding;
+- every real replacement uses a unique nonzero fenced `SET_SCANOUT_BLOB`, and
+  only a successful response echoing the exact flag/id is terminal;
+- that boundary installs the new current and releases the prior backing once;
+- transitions unbind via fenced replacement with permanent parking, then may `SET(0)`;
+  `SET(0)` never releases parking, retained until later replacement/reset;
+- errors, timeouts, duplicate/stale/mismatched replies cannot affect a newer bind;
 - no `read_ledger` page, event, polling thread, or Escape is created.
 
 ### 18.5 Performance and deployment gates
@@ -5178,7 +5178,7 @@ hashes, counters, and device status.
 | 21 | WDK 26100/Core 0110 still had no native open association in D3D12 | fatal | raised OS/runtime floor to released WDK/build 28000 Core 0116 |
 | 22 | Core 0116 mapped `HFENCE` to native object, but queue ordering still needed an exact context operation | fatal until proved | verified D3D12 `pKTCallbacks`, virtual `hContext`, and documented all-type FromGpu wait/signal callbacks; selected explicit callback lowering |
 | 23 | legacy `MONITORED` and optional non-monitored fence branches remain unmapped | fatal if advertised | do not advertise non-monitored fences; reject any supported create/open not `NATIVE`/`OPENED_NATIVE` |
-| 24 | hardware-flip PresentId completion is visibility, not external-reader release | fatal | PresentId removed from lifetime proof; QEMU/display sends distinct old-reader release for exact plane binding |
+| 24 | hardware-flip PresentId completion is visibility, not external-reader release | fatal | PresentId removed from lifetime proof; exact fenced nonzero replacement completes latch+prior release, and unbind first replaces with permanent parking |
 | 25 | direct ICD KMT Present cannot mint/open the DWM logical-surface/history state or own direct-flip transitions | fatal | rejected direct KMT WSI; selected layer-owned real DXGI swapchain plus actual D3D copy |
 | 26 | system D3D11On12 selection is reserved/system-only and not guaranteed for DWM | fatal | rejected as DWM replacement; preserve normal D3D11 actual-context path |
 | 27 | native WSI specified `D3DKMTSignalSynchronizationObjectFromGpu2`, whose public contract is monitored-fence-specific, for a DEFAULT native fence | fatal until corrected | use non-2 `D3DKMTSignalSynchronizationObjectFromGpu` with the exact ICD KMT context, one local object, and `MonitoredFenceValueArray[0]=e`, matching Microsoft's native kernel-queue scenario |
@@ -5963,7 +5963,7 @@ shifts nothing.
 | §10.3 offset 24: `byte_size` is "the exact backing extent" | **`K4-CONTRACT.md` §1.3** | It is the **resource's** extent, UMD-supplied and echoed — *except* for allocations the KMD authored itself (`STANDARD`), where the KMD replaces its own pre-create estimate with the host's authoritative answer. Enforcing the estimate refused every OS shared primary; the pre-retirement code overwrote it and was right to. |
 | §10.3: a host `resid` "may live solely inside the KMD allocation object" reads as a constraint already satisfied | **`K4-CONTRACT.md` §5** | It is a **mechanism change nobody has built**. HWA2 carries no host `resid` and no Vulkan memory-type index, and the ICD's import consumed both — so the import and export **refuse** until mesa unit **A3** (+K6) lands. Every consumer names A3 in its refusal. |
 | `GlobalVidMmTracker` is "folded into HWA2's tracking-kind fields" (`protocol/src/wddm_legacy.rs`, since corrected) | **`K4-CONTRACT.md` §6** | HWA2 has **no** tracking kind, cookie, global-share field or tracker bit. The mechanism has **no successor**; it dies with UMD-backing adoption. |
-
+| Residual display-lifetime phrases saying KMD/QEMU retain a plane lease until replacement/unbind plus backend release | **2026-08-11 owner amendment, lines 14-19** | QEMU is immutable and supplies no custom callback or acknowledgement. KMD owns candidate/current backing references; one exact successful standard fenced nonzero `SET_SCANOUT_BLOB` response latches the candidate and releases the prior backing. Explicit unbind first replaces with permanent KMD black parking; optional `SET(0)` does not release parking, which remains until later nonzero replacement or reset. |
 ## Standing reading rule
 
 Two of this file's load-bearing assumptions were falsified by a single cheap
