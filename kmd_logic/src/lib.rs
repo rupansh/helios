@@ -9103,6 +9103,18 @@ pub mod translation_session {
             })
         }
 
+        /// The generation of the role-1 reply-pool allocation bound to this
+        /// session, or `None` when nothing is bound.
+        ///
+        /// K6's control Render needs it to decide `names_reply_pool` — "is the
+        /// one listed allocation THIS session's pool" — from the kernel object
+        /// it resolved, which is a different question from the wire's
+        /// `expected_allocation_generation` that [`Self::admit_control_render`]
+        /// checks.
+        pub fn reply_pool_generation(&self) -> Option<u64> {
+            self.pool.map(|pool| pool.allocation_generation)
+        }
+
         /// The host published this slot's reply and its C51 value is known.
         pub fn publish_slot(
             &mut self,
@@ -10318,6 +10330,12 @@ pub mod native_render {
         PlacementNotRepeatable,
         /// The capability table does not fit the DMA buffer dxgkrnl returned.
         CapabilityTableTooLarge { needed: u64, capacity: u32 },
+        /// A COMMIT on a **queue** context set `HAS_REPLY`. Only the one control
+        /// context owns the session's reply pool (§10.4:1205), so there is no
+        /// slot to check out and `admit_control_render` would refuse it one
+        /// layer later with a session-shaped reason rather than a render-shaped
+        /// one.
+        ReplyOnQueueContext,
         /// A HOS1 descriptor was refused by `protocol`.
         OuterSubmit(HeliosOuterSubmitRejection),
     }
@@ -10346,6 +10364,7 @@ pub mod native_render {
                 Self::StagingUnderflow => 0x0702,
                 Self::PlacementNotRepeatable => 0x0703,
                 Self::CapabilityTableTooLarge { .. } => 0x0704,
+                Self::ReplyOnQueueContext => 0x0705,
                 Self::OuterSubmit(reject) => outer_submit_code(reject),
             }
         }
@@ -10673,13 +10692,14 @@ pub mod native_render {
         }
     }
 
-    /// Place a COMMIT's capability table at offset 0 of the DMA buffer.
+    /// Place a COMMIT's capability table at `offset` in the DMA buffer.
     ///
-    /// ⛔ The HNR2 command itself is NOT copied into the DMA buffer, so offset 0
-    /// is free: the worst case is 4096 uses × 48 = 192 KiB of a 256-KiB buffer,
-    /// while command + table together (229 KiB + 192 KiB) would not fit. The
-    /// command's bytes were consumed by the assembler at Render.
+    /// ⛔ The COMMIT's own tables and Venus payload are NOT copied into the DMA
+    /// buffer, which is what leaves room: 112 (the header copy) + 4096 × 48 =
+    /// 192 KiB of a 256-KiB buffer, while command + table together (229 KiB +
+    /// 192 KiB) would not fit at all.
     pub fn plan_capability_table(
+        offset: u32,
         count: u32,
         dma_buffer_bytes: u32,
     ) -> Result<CapabilityTablePlan, RenderRefusal> {
@@ -10689,16 +10709,17 @@ pub mod native_render {
             ));
         }
         let bytes = count as u64 * CAPABILITY_RECORD_BYTES as u64;
-        if bytes > dma_buffer_bytes as u64 {
+        let end = bytes + offset as u64;
+        if end > dma_buffer_bytes as u64 {
             return Err(RenderRefusal::CapabilityTableTooLarge {
-                needed: bytes,
+                needed: end,
                 capacity: dma_buffer_bytes,
             });
         }
         Ok(CapabilityTablePlan {
-            offset: 0,
+            offset,
             count,
-            // `bytes <= dma_buffer_bytes: u32` above, so the cast cannot truncate.
+            // `end <= dma_buffer_bytes: u32` above, so the cast cannot truncate.
             bytes: bytes as u32,
         })
     }
@@ -11157,13 +11178,14 @@ pub mod native_render {
                     capacity: 0,
                 }
                 .code(),
+                RenderRefusal::ReplyOnQueueContext.code(),
                 cap(Hnr2CapacityLimit::OutstandingSubmissions),
                 cap(Hnr2CapacityLimit::SlotPoolBytes),
                 cap(Hnr2CapacityLimit::LiveSnapshots),
                 cap(Hnr2CapacityLimit::LiveSnapshotBytes),
                 cap(Hnr2CapacityLimit::SnapshotBytes),
             ];
-            const TOTAL: usize = 9
+            const TOTAL: usize = 10
                 + EVERY_HEADER_REJECT.len()
                 + EVERY_TABLE_REJECT.len()
                 + EVERY_DMA_REJECT.len()
@@ -11270,20 +11292,39 @@ pub mod native_render {
             assert!(!cap.is_placed(), "a refused segment must not write");
         }
 
+        /// The base is the 112-byte header copy the HNR2 arm puts at DMA offset
+        /// 0, so every entry offset is header-relative and never zero.
+        const TABLE_BASE: u32 = helios_protocol::native_render::HELIOS_HNR2_HEADER_SIZE as u32;
+
         #[test]
         fn the_capability_table_is_addressed_by_offset_in_both_directions() {
-            let plan = plan_capability_table(3, HELIOS_HVC1_DMA_BUFFER_BYTES).unwrap();
-            assert_eq!(plan.offset, 0);
+            let plan =
+                plan_capability_table(TABLE_BASE, 3, HELIOS_HVC1_DMA_BUFFER_BYTES).unwrap();
+            assert_eq!(plan.offset, TABLE_BASE);
             assert_eq!(plan.bytes, 3 * CAPABILITY_RECORD_BYTES);
-            assert_eq!(plan.entry_offset(0), Some(0));
-            assert_eq!(plan.entry_offset(2), Some(2 * CAPABILITY_RECORD_BYTES));
+            assert_eq!(plan.entry_offset(0), Some(TABLE_BASE));
+            assert_eq!(
+                plan.entry_offset(2),
+                Some(TABLE_BASE + 2 * CAPABILITY_RECORD_BYTES)
+            );
             assert_eq!(plan.entry_offset(3), None);
-            assert_eq!(plan.entry_at_offset(0), Some(0));
-            assert_eq!(plan.entry_at_offset(2 * CAPABILITY_RECORD_BYTES), Some(2));
-            // Not on a record boundary, and past the end: both `None`, never a
-            // rounded-down index into the middle of a record.
-            assert_eq!(plan.entry_at_offset(CAPABILITY_RECORD_BYTES - 1), None);
-            assert_eq!(plan.entry_at_offset(3 * CAPABILITY_RECORD_BYTES), None);
+            assert_eq!(plan.entry_at_offset(TABLE_BASE), Some(0));
+            assert_eq!(
+                plan.entry_at_offset(TABLE_BASE + 2 * CAPABILITY_RECORD_BYTES),
+                Some(2)
+            );
+            // Below the base, not on a record boundary, and past the end: all
+            // `None`, never a rounded index into the middle of a record.
+            assert_eq!(plan.entry_at_offset(TABLE_BASE - 1), None);
+            assert_eq!(plan.entry_at_offset(0), None);
+            assert_eq!(
+                plan.entry_at_offset(TABLE_BASE + CAPABILITY_RECORD_BYTES - 1),
+                None
+            );
+            assert_eq!(
+                plan.entry_at_offset(TABLE_BASE + 3 * CAPABILITY_RECORD_BYTES),
+                None
+            );
         }
 
         #[test]
@@ -11292,18 +11333,21 @@ pub mod native_render {
             // the HNR2 arm put the table at offset 0 instead of after the
             // command, and it must fail the test rather than the target.
             let plan = plan_capability_table(
+                TABLE_BASE,
                 HELIOS_HNR2_MAX_USE_RECORDS,
                 HELIOS_HVC1_DMA_BUFFER_BYTES,
             )
             .unwrap();
             assert_eq!(plan.bytes, HELIOS_HNR2_MAX_USE_RECORDS * 48);
-            assert!(plan.bytes <= HELIOS_HVC1_DMA_BUFFER_BYTES);
-            // A buffer one byte short is a refusal, not a truncated table.
+            assert!(TABLE_BASE + plan.bytes <= HELIOS_HVC1_DMA_BUFFER_BYTES);
+            // A buffer one byte short is a refusal, not a truncated table, and
+            // the base counts toward the end.
             assert_eq!(
-                plan_capability_table(2, 2 * CAPABILITY_RECORD_BYTES - 1).unwrap_err(),
+                plan_capability_table(TABLE_BASE, 2, TABLE_BASE + 2 * CAPABILITY_RECORD_BYTES - 1)
+                    .unwrap_err(),
                 RenderRefusal::CapabilityTableTooLarge {
-                    needed: 2 * CAPABILITY_RECORD_BYTES as u64,
-                    capacity: 2 * CAPABILITY_RECORD_BYTES - 1,
+                    needed: TABLE_BASE as u64 + 2 * CAPABILITY_RECORD_BYTES as u64,
+                    capacity: TABLE_BASE + 2 * CAPABILITY_RECORD_BYTES - 1,
                 }
             );
         }

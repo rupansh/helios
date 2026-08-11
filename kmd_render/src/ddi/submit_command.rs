@@ -1075,6 +1075,18 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
         SUBMIT_PAGING_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
+    // K6: HOS1 on the D3D12-virtual HQA1 arm. It is VALIDATED and never
+    // enqueued, and it does not take the packet over — an outer context is an
+    // ordinary D3D runtime context whose presents still need the legacy decode
+    // below, and HOS1's magic is disjoint from both present magics.
+    if !submit.hContext.is_null() {
+        let context = unsafe { crate::device::ContextHandleRef::from_raw(submit.hContext) };
+        if let Some(outer) = context.as_ref().and_then(|c| c.outer_submit()) {
+            // SAFETY: the private-data pair for this submission.
+            unsafe { crate::ddi::native_render::submit_virtual(outer, submit) };
+        }
+    }
+
     let present_fence = unsafe { decode_virtual_present_fence(submit) };
     // Before the completion bookkeeping: a flip carried in this buffer must be
     // armed while its fence is still outstanding, which is the whole point of
@@ -1117,6 +1129,25 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
     let is_paging = (unsafe { submit.Flags.__bindgen_anon_1.Value } & 1) != 0;
     if is_paging {
         SUBMIT_PAGING_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // ── K6: the HNR2 arm, and it must come BEFORE the two legacy decodes ────
+    //
+    // ⛔ THIS IS WHAT MAKES THE 64-BYTE HVC1 PRIVATE BUFFER SAFE. Both decodes
+    // below are keyed only on a magic at offset 0 of `pDmaBufferPrivateData`,
+    // and `Hnr2KmdDmaPrivateV1`'s first u32 is the low half of a guest-supplied
+    // `batch_token` — so a token whose low word happened to be 'HPBL' or 'HD12'
+    // would be read as a present record. The role gate makes that unreachable
+    // rather than unlikely.
+    let h_context = unsafe { submit.__bindgen_anon_1.hContext };
+    if !h_context.is_null() {
+        let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
+        if let Some((native, _session)) = context.as_ref().and_then(|c| c.native()) {
+            // SAFETY: the private-data pair for this submission.
+            unsafe { crate::ddi::native_render::submit(native, submit) };
+            let SubmitAck::Accepted = note_and_maybe_signal(adapter, fence, is_paging, None);
+            return STATUS_SUCCESS;
+        }
     }
 
     let present_fence = unsafe { decode_legacy_present_fence(submit) };
@@ -1343,6 +1374,27 @@ pub unsafe extern "C" fn dxgkddi_render(
     if cmd_len > dma_cap {
         // Buffer too small for the recorded command: ask the runtime to grow it.
         return STATUS_BUFFER_TOO_SMALL;
+    }
+
+    // ── K6: the HVC1 native-render arm ──────────────────────────────────────
+    //
+    // ⛔ BRANCH ON THE CONTEXT ROLE, NEVER ON A FOURTH COMMAND MAGIC. The three
+    // arms below are magic-disjoint by construction; a magic-keyed HNR2 arm
+    // would let a legacy DWM/CDD Render take the HNR2 path, and an HNR2 Render
+    // would still fall through `invalidate_d3d12` and the tail memcpy. This
+    // returns before all of them.
+    //
+    // ⚠ `h_context` IS NULL-CHECKED HERE and was not checked anywhere in this
+    // function before: the HERF/HEPR arms below reach it only through
+    // `ContextHandleRef::from_raw`, which checks. A role lookup added without
+    // one dereferences null in a DDI, which is a silent graphics deadlock.
+    if !h_context.is_null() {
+        let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
+        if let Some((native, session)) = context.as_ref().and_then(|c| c.native()) {
+            // SAFETY: `args` is dxgkrnl's live argument struct, and `native` /
+            // `session` belong to the context handle it just passed.
+            return unsafe { crate::ddi::native_render::render(native, session, args) };
+        }
     }
 
     // ── The D3D12 ECL arm (`HeliosD3D12SubmitCmd`, 16 B) ────────────────────
@@ -1881,6 +1933,24 @@ pub unsafe extern "C" fn dxgkddi_patch(
     PATCH_COUNT.fetch_add(1, Ordering::Relaxed);
     if patch.is_null() {
         return STATUS_INVALID_PARAMETER;
+    }
+    // K6: an HNR2 submission's capability records take their placement snapshot
+    // here. Reading the `hDevice`/`hContext` union as a context is legal because
+    // this driver reports `SCHEDULINGCAPS_MULTI_ENGINE_AWARE`
+    // (`query_adapter_info.rs:395`); a paging patch carries a null context.
+    //
+    // ⛔ NOTHING BELOW CAN FAIL THIS DDI. An error return from `DxgkDdiPatch`
+    // bugchecks Windows outright (§10.7:1872), which is why every fallible step
+    // — the tables, the plan, the generations — was done at Render.
+    let args = unsafe { &*patch };
+    let h_context = unsafe { args.__bindgen_anon_1.hContext };
+    if !h_context.is_null() {
+        let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
+        if context.as_ref().and_then(|c| c.native()).is_some() {
+            // SAFETY: `args` is dxgkrnl's live argument struct for a submission
+            // on a context this driver resolved as HVC1.
+            unsafe { crate::ddi::native_render::patch(args) };
+        }
     }
     STATUS_SUCCESS
 }

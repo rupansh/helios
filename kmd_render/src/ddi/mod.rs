@@ -22,6 +22,7 @@ pub(crate) mod hpd;
 pub(crate) mod interrupt;
 mod lifecycle;
 pub(crate) mod native_fence;
+pub(crate) mod native_render;
 pub(crate) mod present_packet;
 pub(crate) mod query_adapter_info;
 pub(crate) mod scanout_timeline;
@@ -93,6 +94,7 @@ pub(crate) use submit_command::{
     abandon_pending_submissions, record_present_handoff_telemetry, AbandonOutcome,
     ABANDONED_FENCES, DMA_STALE_SKIP_COUNT,
 };
+pub use native_render::diag_dump_native_render_atomics;
 pub use translation_session::diag_dump_translation_session_atomics;
 pub use submit_command::{
     diag_dump_engine_atomics, dxgkddi_collect_dbg_info, dxgkddi_patch, dxgkddi_preempt_command,

@@ -271,7 +271,7 @@ struct AllocationContext {
 /// Chosen above [`helios_protocol::HELIOS_HWA2_KIND_MAX`] and asserted distinct
 /// from every real kind below, so a reader can never confuse one with an HWA2
 /// value that happens to collide.
-const ALLOC_KIND_HVM1: u32 = 0x8000_0001;
+pub(crate) const ALLOC_KIND_HVM1: u32 = 0x8000_0001;
 /// See [`ALLOC_KIND_HVM1`].
 const ALLOC_KIND_HOC1: u32 = 0x8000_0002;
 
@@ -778,16 +778,32 @@ struct OpenAllocationContext {
     present: Option<PresentAllocInfo>,
     /// Trace-only companion; never read by a decision path.
     present_diag: Option<PresentAllocDiag>,
-    /// `(generation, kind)` exactly as PUBLISHED to the guest in this open's
-    /// private buffer, for K6's Render/Patch staleness check
-    /// ([`open_allocation_identity`]).
+    /// Exactly what this open PUBLISHED to the guest, for K6's Render/Patch
+    /// staleness check and its capability records ([`open_allocation_identity`]).
     ///
     /// ⛔ It lives here and not on [`AllocationContext`] because
     /// `DXGK_ALLOCATIONLIST::hDeviceSpecificAllocation` — the handle Render and
     /// Patch resolve — is THIS object, and the create-time handle never appears
     /// in an allocation list at all. Storing what the guest was told, rather
     /// than re-deriving it, is what makes the two sides unable to disagree.
-    identity: Option<(u64, u32)>,
+    identity: Option<OpenIdentity>,
+}
+
+/// What an open published, as K6's Render and Patch read it back.
+#[derive(Clone, Copy)]
+pub(crate) struct OpenIdentity {
+    /// The allocation generation in the bytes this open handed the guest.
+    pub generation: u64,
+    /// [`ALLOC_KIND_HVM1`] / [`ALLOC_KIND_HOC1`], or the `HELIOS_HWA2_KIND_*`
+    /// the descriptor carried.
+    pub kind: u32,
+    /// The allocation's own size, from the same bytes.
+    ///
+    /// ⛔ It has to come from here. `DXGK_ALLOCATIONLIST` carries a handle, a
+    /// `WriteOperation` bit, a `SegmentId` and an address — no length — so a
+    /// capability record's `byte_length` (§10.7's 48-byte
+    /// `Hnr2PhysicalCapability`) has no other source that is not a guess.
+    pub byte_size: u64,
 }
 
 /// Surface identity + geometry for a Present allocation-list entry, resolved from
@@ -4655,8 +4671,16 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         // HWA2's generation comes from the descriptor for the same reason: it is
         // the value the opener reads out of the identical bytes.
         let open_identity = match (hvm1, desc) {
-            (Some((_, _, generation)), _) => Some((generation, ALLOC_KIND_HVM1)),
-            (None, Some(d)) => Some((d.allocation_generation, d.allocation_kind)),
+            (Some((_, byte_size, generation)), _) => Some(OpenIdentity {
+                generation,
+                kind: ALLOC_KIND_HVM1,
+                byte_size,
+            }),
+            (None, Some(d)) => Some(OpenIdentity {
+                generation: d.allocation_generation,
+                kind: d.allocation_kind,
+                byte_size: d.byte_size,
+            }),
             (None, None) => None,
         };
         if let Some((Hvm1Role::ReplyPool, byte_size, generation)) = hvm1 {
@@ -4841,8 +4865,7 @@ unsafe fn read_open_hvm1(
 /// # Safety
 /// `h` is either null or an `hDeviceSpecificAllocation` this driver returned
 /// from `DxgkDdiOpenAllocation`, round-tripped unmodified.
-#[allow(dead_code)] // reader is K6 (`ddi/native_render.rs`).
-pub(crate) unsafe fn open_allocation_identity(h: HANDLE) -> Option<(u64, u32)> {
+pub(crate) unsafe fn open_allocation_identity(h: HANDLE) -> Option<OpenIdentity> {
     // SAFETY: validated by `open_allocation_context`, which checks the magic.
     let open = unsafe { open_allocation_context(h)? };
     open.identity

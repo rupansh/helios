@@ -49,9 +49,20 @@ pub static TS_SESSION_FREED: AtomicU32 = AtomicU32::new(0);
 pub static TS_HVC1_REJECT: AtomicU32 = AtomicU32::new(0);
 /// `DXGK_CREATECONTEXTFLAGS` carried a bit HVC1 does not admit.
 pub static TS_HVC1_FLAGS_REJECT: AtomicU32 = AtomicU32::new(0);
-/// HVC1 **queue** contexts refused because K6 does not exist. Expected NONZERO
-/// only once the ICD's normal-loader path (mesa A3) creates them; zero today.
+/// ⛔ RETIRED BY K6 AND PERMANENTLY 0. It counted HVC1 **queue** contexts
+/// refused because `ddi/native_render.rs` did not exist; it does now, and the
+/// arm that wrote this counter is gone. The name stays because registry values
+/// persist across boots and a reader comparing two boots must not see it
+/// disappear — grade queue contexts by `Nr2QCtx` / `Nr2QCtxRej` instead.
 pub static TS_QUEUE_CTX_UNIMPL: AtomicU32 = AtomicU32::new(0);
+/// Control Renders refused, packed `(count << 16) | control_render_code()`.
+pub static TS_CONTROL_RENDER_REJECT: AtomicU32 = AtomicU32::new(0);
+/// Reply slots checked out and given back.
+pub static TS_SLOT_RELEASED: AtomicU32 = AtomicU32::new(0);
+/// Reply slots that could NOT be given back. **Must read 0**: one stuck slot 0
+/// makes every later control Render on the session fail `ControlRenderSlotBusy`,
+/// because A1 takes the first idle slot every time.
+pub static TS_SLOT_STUCK: AtomicU32 = AtomicU32::new(0);
 /// A second control context, or a second session, on one raw KMT device.
 pub static TS_SECOND_CONTROL_CTX: AtomicU32 = AtomicU32::new(0);
 /// The ProcessContext's bounded session list was full.
@@ -112,7 +123,7 @@ pub static TS_NO_CSPRNG: AtomicU32 = AtomicU32::new(0);
 
 /// The counter names, as one list, so the collision proof and the writer cannot
 /// drift apart.
-const COUNTER_NAMES: [&[u8]; 20] = [
+const COUNTER_NAMES: [&[u8]; 23] = [
     b"TsSessNew",
     b"TsSessFree",
     b"TsHvc1Rej",
@@ -133,6 +144,9 @@ const COUNTER_NAMES: [&[u8]; 20] = [
     b"TsDrained",
     b"TsInitOk",
     b"TsInitRej",
+    b"TsCtlRej",
+    b"TsSlotRel",
+    b"TsSlotStuck",
 ];
 
 /// Compile-time proof that no counter name can be truncated into another's.
@@ -151,7 +165,7 @@ const _: () = {
 
 /// Mirror the counters into the service key. PASSIVE only.
 pub fn diag_dump_translation_session_atomics() {
-    let values: [u32; 20] = [
+    let values: [u32; 23] = [
         TS_SESSION_CREATED.load(Ordering::Relaxed),
         TS_SESSION_FREED.load(Ordering::Relaxed),
         TS_HVC1_REJECT.load(Ordering::Relaxed),
@@ -172,6 +186,9 @@ pub fn diag_dump_translation_session_atomics() {
         TS_DRAINED.load(Ordering::Relaxed),
         TS_INIT_OK.load(Ordering::Relaxed),
         TS_INIT_REJECT.load(Ordering::Relaxed),
+        TS_CONTROL_RENDER_REJECT.load(Ordering::Relaxed),
+        TS_SLOT_RELEASED.load(Ordering::Relaxed),
+        TS_SLOT_STUCK.load(Ordering::Relaxed),
     ];
     let mut i = 0;
     while i < COUNTER_NAMES.len() {
@@ -476,11 +493,20 @@ pub(crate) enum ContextRequest {
     Legacy,
     /// The one HVC1 control context of a raw KMT device: a provisional session.
     HeliosControl,
+    /// An HVC1 queue context on the same raw device, holding its own reference
+    /// to that device's session.
+    HeliosQueue { session: NonNull<SessionObject> },
     /// An HQA1 outer-context attach onto an existing session.
     HeliosAttach {
         session: NonNull<SessionObject>,
+        /// The live session generation, for K6's HOS1 gate. Read here, under the
+        /// same lock that admitted the attach, so the context cannot be built
+        /// against a generation the session no longer has.
+        session_generation: u64,
         context_generation: u64,
         endpoint_id: u32,
+        /// Which HQA1 arm — HOS1 exists only on the D3D12 virtual one.
+        kind: helios_protocol::translation_session::HeliosOuterContextKind,
     },
 }
 
@@ -570,11 +596,30 @@ fn admit_hvc1(
         return Err(STATUS_NOT_SUPPORTED);
     }
     if class == Hvc1ContextClass::Queue {
-        // CROSS-LANE: K6 (`ddi/native_render.rs`) owns the queue context, its
-        // ring and its slot pool. Refusing is correct until then — a record-only
-        // translator creates none, so this arm is unreachable from mesa A1/A2.
-        TS_QUEUE_CTX_UNIMPL.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_NOT_SUPPORTED);
+        // K6 (`ddi/native_render.rs`) owns the queue context. It is created on
+        // the SAME raw KMT device as the control context
+        // (`vn_helios_translation_session.h:71`), so the device's session cell is
+        // where its session comes from — there is no lookup, and a queue context
+        // on a device with no control context has nothing to belong to.
+        let Some(session) = *device_session.lock() else {
+            crate::ddi::native_render::NR2_QUEUE_CTX_REJECT.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        // SAFETY: the device holds a reference for as long as the cell is set,
+        // and this call happens under that cell's lock having just read it.
+        let obj = unsafe { session.as_ref() };
+        if obj.model.lock().phase() == model::SessionPhase::Draining {
+            crate::ddi::native_render::NR2_QUEUE_CTX_REJECT.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        // ⚠ A PROVISIONAL SESSION IS ADMITTED, and that is not an oversight.
+        // A queue context's ring index comes from an endpoint, endpoints come
+        // from INIT, and INIT grants none until K11 — so requiring `Live` would
+        // refuse every queue context this package can ever create. It carries
+        // ring 0 and refuses at the host handoff instead (`Nr2NoHost`).
+        obj.acquire();
+        crate::ddi::native_render::NR2_QUEUE_CTX.fetch_add(1, Ordering::Relaxed);
+        return Ok(ContextRequest::HeliosQueue { session });
     }
 
     let Some(list) = process_list else {
@@ -656,8 +701,10 @@ fn admit_hqa1(
             TS_ATTACH_OK.fetch_add(1, Ordering::Relaxed);
             Ok(ContextRequest::HeliosAttach {
                 session,
+                session_generation: obj.model.lock().session_generation(),
                 context_generation: admission.context_generation,
                 endpoint_id: admission.endpoint_id,
+                kind: admission.kind,
             })
         }
         Err(_) => {
@@ -689,6 +736,19 @@ pub(crate) unsafe fn release_device_session(
         list.remove(session);
     }
     // SAFETY: releasing the device's own reference.
+    unsafe { SessionObject::release(session.as_ptr()) };
+}
+
+/// An HVC1 queue context went away: release the reference it took at create.
+///
+/// It never registered anything — the session's list entry and the device's
+/// reference belong to the control context — so this is a bare release.
+///
+/// # Safety
+/// `session` must be a pointer this module minted and the caller must own the
+/// context reference it is releasing.
+pub(crate) unsafe fn release_queue_context(session: NonNull<SessionObject>) {
+    // SAFETY: per this function's contract the caller still holds a reference.
     unsafe { SessionObject::release(session.as_ptr()) };
 }
 
@@ -765,7 +825,6 @@ pub(crate) fn bind_reply_pool(
 /// therefore refused rather than faked: a session that reports a generation
 /// without a host context behind it would make every later HQA1 admit onto
 /// nothing.
-#[allow(dead_code)] // CROSS-LANE: the caller is K6's `ddi/native_render.rs`.
 pub(crate) fn session_init(
     session: NonNull<SessionObject>,
     request: &[u8],
@@ -819,5 +878,91 @@ pub(crate) fn session_init(
             TS_INIT_REJECT.fetch_add(1, Ordering::Relaxed);
             Err(STATUS_DEVICE_NOT_READY)
         }
+    }
+}
+
+// ── K6's window onto the session ─────────────────────────────────────────────
+//
+// `SessionObject` stays private to this file: K6 holds a `NonNull` and reaches
+// the model only through these three, so the session lock's discipline
+// (§10.7:2041 — checkout and publication only, never held across a Render, a
+// host completion, a decode, or a wait) has exactly one owner.
+
+/// The generation of the role-1 reply pool bound to this session, for K6's
+/// "does the one listed allocation belong to THIS session" test.
+///
+/// # Safety
+/// `session` must be live for the call — K6 holds it through the context object
+/// that took a reference at create.
+pub(crate) fn reply_pool_generation(session: NonNull<SessionObject>) -> Option<u64> {
+    // SAFETY: per the contract above.
+    let obj = unsafe { session.as_ref() };
+    let generation = obj.model.lock().reply_pool_generation();
+    generation
+}
+
+/// Admit one HNR2 control Render and check out its reply slot.
+pub(crate) fn admit_control_render(
+    session: NonNull<SessionObject>,
+    request: &model::ControlRenderRequest,
+) -> Result<model::ControlRenderAdmission, NTSTATUS> {
+    // SAFETY: as above.
+    let obj = unsafe { session.as_ref() };
+    let admitted = obj.model.lock().admit_control_render(request);
+    match admitted {
+        Ok(admission) => Ok(admission),
+        Err(refusal) => {
+            bump_with_code(&TS_CONTROL_RENDER_REJECT, control_render_code(refusal));
+            Err(STATUS_INVALID_DEVICE_REQUEST)
+        }
+    }
+}
+
+/// Give a checked-out reply slot back.
+///
+/// ⛔ PUBLISH THEN RETIRE, and both on the refusal path. `retire_slot` requires
+/// `Published`, and a slot left `InFlight` is permanent: A1 takes the FIRST idle
+/// slot for every serial transaction, so one abandoned slot 0 makes every later
+/// control Render on the session fail `ControlRenderSlotBusy`.
+pub(crate) fn release_control_slot(
+    session: NonNull<SessionObject>,
+    slot_index: usize,
+    slot_generation: u64,
+) {
+    // SAFETY: as above.
+    let obj = unsafe { session.as_ref() };
+    let mut model = obj.model.lock();
+    // A zero C51 value is honest: no host job ever ran for this slot.
+    if model.publish_slot(slot_index, slot_generation, 0).is_ok()
+        && model.retire_slot(slot_index, slot_generation).is_ok()
+    {
+        drop(model);
+        TS_SLOT_RELEASED.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    drop(model);
+    TS_SLOT_STUCK.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A stable code for the control-Render refusals, so `TsCtlRej` names which
+/// rule rather than just how often. `SessionRefusal` carries no `code()`; the
+/// arms a control Render can actually reach are the ones enumerated here and
+/// everything else collapses to `0x0A00`.
+fn control_render_code(refusal: model::SessionRefusal) -> u32 {
+    use model::SessionRefusal as R;
+    match refusal {
+        R::SessionDraining => 0x0A01,
+        R::ControlRenderNotOnControlContext => 0x0A02,
+        R::ControlRenderAllocationWithoutReply { .. } => 0x0A03,
+        R::ReplyPoolNotBound => 0x0A04,
+        R::ControlRenderAllocationCountNotOne { .. } => 0x0A05,
+        R::ControlRenderForeignAllocation => 0x0A06,
+        R::ControlRenderPoolGenerationStale { .. } => 0x0A07,
+        R::ControlRenderAccessNotWrite { .. } => 0x0A08,
+        R::ControlRenderSlotBusy { .. } => 0x0A09,
+        R::ControlRenderSlotGenerationStale { .. } => 0x0A0A,
+        R::ControlRenderSlotIndexOutOfRange { .. } => 0x0A0B,
+        R::ControlRenderSlotGenerationUnknown { .. } => 0x0A0C,
+        _ => 0x0A00,
     }
 }

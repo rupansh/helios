@@ -14,6 +14,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use helios_kmd_logic::snapshot_bind::SnapshotDescriptor;
 
 use crate::adapter::AdapterContext;
+use crate::ddi::native_render::{NativeClass, NativeContext};
 use crate::ddi::translation_session::{
     self as hts1, ProcessSessionList, SessionObject as TranslationSessionObject,
 };
@@ -103,20 +104,37 @@ pub struct ContextContext {
     helios: HeliosContextRole,
 }
 
-/// What a context is to K5. `Legacy` is every D3D-runtime and CDD context and
-/// holds nothing.
+/// What a context is to K5 and K6. `Legacy` is every D3D-runtime and CDD context
+/// and holds nothing.
 enum HeliosContextRole {
     Legacy,
-    /// The one HVC1 control context of a raw KMT device.
-    Control(core::ptr::NonNull<TranslationSessionObject>),
+    /// The one HVC1 control context of a raw KMT device: host ring 0, the HTS1
+    /// session, and the only class that may carry an HNR2 reply.
+    Control {
+        session: core::ptr::NonNull<TranslationSessionObject>,
+        native: alloc::boxed::Box<NativeContext>,
+    },
+    /// An HVC1 queue context on the same raw device. It holds its own strong
+    /// session reference — the control context's belongs to the device — so the
+    /// session cannot be freed under a queue context that outlives it.
+    Queue {
+        session: core::ptr::NonNull<TranslationSessionObject>,
+        native: alloc::boxed::Box<NativeContext>,
+    },
     /// An HQA1-attached outer context, with the generation it was admitted under.
     Attached {
         session: core::ptr::NonNull<TranslationSessionObject>,
         context_generation: u64,
-        /// CROSS-LANE: the reader is K6 — `DxgkDdiSubmitCommand` assigns this
+        /// CROSS-LANE: the reader is K11 — `DxgkDdiSubmitCommand` assigns this
         /// endpoint's next arrival-order host-dispatch serial (§10.4:1255-1258).
+        /// K6 validates HOS1 but dispatches nothing, so it does not read it.
         #[allow(dead_code)]
         endpoint_id: u32,
+        /// K6: the HOS1 gate `DxgkDdiSubmitCommandVirtual` validates against.
+        /// Present on both arms because the arm itself is one of the things
+        /// HOS1 checks — a D3D11-physical context must refuse a HOS1, and it can
+        /// only do that if it carries its arm.
+        outer: crate::sync::SpinLock<helios_kmd_logic::native_render::OuterSubmitContext>,
     },
 }
 
@@ -229,6 +247,38 @@ impl<'a> ContextHandleRef<'a> {
     /// one following Present just like the snapshot descriptor.
     pub fn take_present_stream_marker_stash(&self) -> Option<(u32, u32, u64)> {
         self.context.present_stream_marker.lock().take()
+    }
+
+    /// K6's native-render state and the session it belongs to, or `None` for
+    /// every context that is not an HVC1 one.
+    ///
+    /// ⛔ THIS IS THE BRANCH `dxgkddi_render` MUST TAKE, and it must branch on
+    /// the ROLE and not on a fourth command magic. The three existing arms in
+    /// that function are magic-disjoint by construction; a magic-keyed HNR2 arm
+    /// would let a legacy DWM Render take the HNR2 path and then still hit the
+    /// tail memcpy.
+    pub(crate) fn native(
+        &self,
+    ) -> Option<(
+        &'a NativeContext,
+        core::ptr::NonNull<TranslationSessionObject>,
+    )> {
+        match &self.context.helios {
+            HeliosContextRole::Control { session, native }
+            | HeliosContextRole::Queue { session, native } => Some((native, *session)),
+            HeliosContextRole::Legacy | HeliosContextRole::Attached { .. } => None,
+        }
+    }
+
+    /// The HOS1 gate of an HQA1-attached outer context.
+    pub(crate) fn outer_submit(
+        &self,
+    ) -> Option<&'a crate::sync::SpinLock<helios_kmd_logic::native_render::OuterSubmitContext>>
+    {
+        match &self.context.helios {
+            HeliosContextRole::Attached { outer, .. } => Some(outer),
+            _ => None,
+        }
     }
 }
 
@@ -422,6 +472,7 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // something.
         crate::ddi::diag_dump_native_fence_atomics();
         crate::ddi::diag_dump_translation_session_atomics();
+        crate::ddi::diag_dump_native_render_atomics();
         // D4a: drop this device's scanout retirement-event registrations —
         // dereference ONLY, no signal (the process is exiting; a wake would
         // land nowhere). Its read-ledger page mapping needs nothing here: it
@@ -516,25 +567,63 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         hts1::ContextRequest::Legacy => (HeliosContextRole::Legacy, ContextInfoProfile::Legacy),
         hts1::ContextRequest::HeliosControl => {
             // `classify_context` published the session into `device.session`.
-            match *device.session.lock() {
-                Some(session) => (HeliosContextRole::Control(session), ContextInfoProfile::Hvc1),
-                None => return STATUS_INVALID_DEVICE_REQUEST,
-            }
+            let Some(session) = *device.session.lock() else {
+                return STATUS_INVALID_DEVICE_REQUEST;
+            };
+            // ⛔ The scratch is allocated HERE, at PASSIVE, and its failure fails
+            // the context — never on the Render path, where 228 KiB of nonpaged
+            // pool would be a per-batch allocation inside a DDI.
+            let Some(native) = NativeContext::new(NativeClass::Control) else {
+                return STATUS_NO_MEMORY;
+            };
+            (
+                HeliosContextRole::Control {
+                    session,
+                    native: alloc::boxed::Box::new(native),
+                },
+                ContextInfoProfile::Hvc1,
+            )
+        }
+        hts1::ContextRequest::HeliosQueue { session } => {
+            let Some(native) = NativeContext::new(NativeClass::Queue) else {
+                // SAFETY: `classify_context` took a reference for this context
+                // and nothing else owns it yet.
+                unsafe { hts1::release_queue_context(session) };
+                return STATUS_NO_MEMORY;
+            };
+            (
+                HeliosContextRole::Queue {
+                    session,
+                    native: alloc::boxed::Box::new(native),
+                },
+                ContextInfoProfile::Hvc1,
+            )
         }
         hts1::ContextRequest::HeliosAttach {
             session,
+            session_generation,
             context_generation,
             endpoint_id,
+            kind,
         } => (
             HeliosContextRole::Attached {
                 session,
                 context_generation,
                 endpoint_id,
+                outer: crate::sync::SpinLock::new(
+                    helios_kmd_logic::native_render::OuterSubmitContext::new(
+                        helios_protocol::HELIOS_PACKAGE_GENERATION,
+                        session_generation,
+                        context_generation,
+                        endpoint_id,
+                        kind.wire(),
+                    ),
+                ),
             },
-            // An HQA1 outer context is an ordinary D3D runtime context; its
-            // `DmaBufferPrivateDataSize` sizing for the 64-byte HOS1 prefix is
-            // K6's (§10.4:1332-1335), so it keeps today's profile until then.
-            ContextInfoProfile::Legacy,
+            // An HQA1 outer context is an ordinary D3D runtime context in every
+            // respect but one: the D3D12 virtual arm's `pDmaBufferPrivateData`
+            // must hold a 64-byte HOS1 prefix (§10.4:1332-1335).
+            ContextInfoProfile::Hqa1Outer,
         ),
     };
 
@@ -568,11 +657,28 @@ pub unsafe extern "C" fn dxgkddi_create_context(
 enum ContextInfoProfile {
     Legacy,
     Hvc1,
+    /// An HQA1-attached outer context: Legacy in every field, declared
+    /// separately so the 64-byte HOS1 requirement is stated at the site that
+    /// satisfies it instead of being inherited by luck.
+    Hqa1Outer,
 }
+
+/// `DXGKARG_SUBMITCOMMANDVIRTUAL` reads a `HeliosOuterSubmitV1` out of the front
+/// of an outer context's DMA private data, so the advertised size must hold one.
+/// It does — 88 >= 64 — and this assert is what keeps that true if either
+/// number moves.
+const _: () = assert!(
+    crate::ddi::present_packet::PRESENT_DMA_PRIVATE_DATA_BYTES
+        >= helios_protocol::wddm::HELIOS_HOS1_BYTES as u32
+);
 
 fn write_context_info(info: &mut DXGK_CONTEXTINFO, profile: ContextInfoProfile) {
     match profile {
-        ContextInfoProfile::Legacy => {
+        // ⛔ IDENTICAL TO `Legacy`, INCLUDING `DmaBufferSegmentSet = 1`. A zero
+        // segment set null-derefs dxgmms2 in `VidMmInitDmaPool` for a runtime
+        // context (measured, see the profile enum), and an HQA1 outer context IS
+        // a runtime context — only HVC1 selects zero.
+        ContextInfoProfile::Hqa1Outer | ContextInfoProfile::Legacy => {
             // Use the paging aperture for DMA buffers. With the decorative GpuMmu
             // model, dxgkrnl's CDD context creates a privileged DMA pool with
             // GPU-VA mapping enabled; if this is 0, dxgmms2 uses contiguous system
@@ -617,7 +723,14 @@ pub unsafe extern "C" fn dxgkddi_destroy_context(h_context: *mut c_void) -> NTST
         let ctx = unsafe { Box::from_raw(h_context as *mut ContextContext) };
         match ctx.helios {
             HeliosContextRole::Legacy => {}
-            HeliosContextRole::Control(session) => {
+            HeliosContextRole::Queue { session, .. } => {
+                // A queue context holds only its own reference: the session's
+                // registration and the device's reference belong to the control
+                // context, which `DxgkDdiDestroyDevice` settles.
+                // SAFETY: the reference `classify_context` took for it.
+                unsafe { hts1::release_queue_context(session) };
+            }
+            HeliosContextRole::Control { session, .. } => {
                 // ⛔ CLEAR THE CELL FIRST. `release_device_session` may drop the
                 // last reference and free the object; a `DxgkDdiOpenAllocation`
                 // on this device between the free and the clear would read a

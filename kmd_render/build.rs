@@ -65,6 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     generate_dxgk_bindings()?;
     compile_version_resource()?;
     compile_seh_shim();
+    compile_render_user_copy();
 
     // Emit the link configuration for a WDK binary (resolves ntoskrnl, etc.).
     Config::from_env_auto()?.configure_binary_build()?;
@@ -251,6 +252,21 @@ fn compile_seh_shim() {
         .flag("/GS-")
         .compile("helios_seh_shim");
     println!("cargo:rerun-if-changed=src/seh_shim.c");
+}
+
+/// Compile K6's SEH-guarded probe+copy of `DxgkDdiRender`'s user command
+/// buffer. A SECOND `cc::Build`, not another `.file()` on the first: each
+/// `compile()` emits its own `$OUT_DIR/<name>.lib` and its own
+/// `rustc-link-lib=static=<name>`, and rustc links both. The two flags are
+/// repeated because `cc::Build::new()` shares no state with the shim's — a
+/// missing `/Zl` embeds `/DEFAULTLIB:LIBCMT` directives into the object.
+fn compile_render_user_copy() {
+    cc::Build::new()
+        .file("src/render_user_copy.c")
+        .flag("/Zl")
+        .flag("/GS-")
+        .compile("helios_render_user_copy");
+    println!("cargo:rerun-if-changed=src/render_user_copy.c");
 }
 
 /// Single source of truth for the driver version, relative to the package root
