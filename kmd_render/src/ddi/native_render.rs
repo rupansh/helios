@@ -107,6 +107,37 @@ pub static NR2_PATCH_RELOCATED: AtomicU32 = AtomicU32::new(0);
 /// `Nr2SlotRet` staying equal the whole time and the documented pair-grading
 /// reporting health.
 pub static NR2_SUBMIT_RESUBMISSION: AtomicU32 = AtomicU32::new(0);
+/// Submissions whose private record could not be read at all — the window did
+/// not describe 64 readable bytes.
+///
+/// ⛔ IT EXISTS BECAUSE THE FIRST PROBE RUN COULD ONLY INFER IT. `submit()`
+/// returned silently on a refused read, so the only evidence was `Nr2Slot`
+/// moving while `Nr2SlotRet` did not — a difference the counter's own doc says
+/// means the OPPOSITE thing (that dxgkrnl never called SubmitCommand). A refusal
+/// with no counter is the rule this driver does not get to break.
+pub static NR2_SUBMIT_NO_RECORD: AtomicU32 = AtomicU32::new(0);
+
+/// The private-data SUBMISSION WINDOW `DxgkDdiSubmitCommand` reported, packed
+/// `(start << 16) | end`, last-value.
+///
+/// ⛔ MEASURED BECAUSE THE FIRST PROBE RUN SAID SOMETHING WAS WRONG AND NOT WHAT.
+/// On KMD 22.22.269.0 the K6 probe took 3 staging checkouts (`Nr2Slot=3`) and
+/// **0** retirements, with `Nr2SlotUnd=0` — so `retire()` was never called at
+/// all, which can only mean `read_dma_record` refused the window on every one of
+/// the 5 submissions. `publish_dma_record` had already SUCCEEDED at Render (a
+/// failure there returns before `Nr2Commit`, which read 3), so the 64-byte
+/// buffer exists; it is the window that does not describe it. These two report
+/// the numbers instead of guessing which of "the window is empty", "the total is
+/// short" or "the offsets are elsewhere" it is.
+pub static NR2_SUBMIT_WINDOW: AtomicU32 = AtomicU32::new(0);
+/// `DXGKARG_SUBMITCOMMAND::DmaBufferPrivateDataSize` as reported, last-value.
+pub static NR2_SUBMIT_WINDOW_TOTAL: AtomicU32 = AtomicU32::new(0);
+/// The same pair for `DxgkDdiPatch`, whose one call this boot also refused the
+/// record (`Nr2PatchDiff=1`, `Nr2PatchCall=1`).
+pub static NR2_PATCH_WINDOW: AtomicU32 = AtomicU32::new(0);
+/// `DXGKARG_PATCH::DmaBufferPrivateDataSize` as reported, last-value.
+pub static NR2_PATCH_WINDOW_TOTAL: AtomicU32 = AtomicU32::new(0);
+
 /// Staging retirements refused — the pure half's `StagingUnderflow`.
 ///
 /// **Must read 0.** It was discarded with `.is_ok()` and no counter, which is
@@ -189,7 +220,7 @@ pub static NR2_HOS1_NOT_EXECUTED: AtomicU32 = AtomicU32::new(0);
 
 /// The counter names, as one list, so the collision proof and the writer cannot
 /// drift apart.
-const COUNTER_NAMES: [&[u8]; 30] = [
+const COUNTER_NAMES: [&[u8]; 35] = [
     b"Nr2QCtx",
     b"Nr2QCtxRej",
     b"Nr2Scratch",
@@ -220,6 +251,11 @@ const COUNTER_NAMES: [&[u8]; 30] = [
     b"Nr2Reloc",
     b"Nr2SubDup",
     b"Nr2SlotUnd",
+    b"Nr2SubWin",
+    b"Nr2SubTot",
+    b"Nr2PchWin",
+    b"Nr2PchTot",
+    b"Nr2SubNoRec",
 ];
 
 /// The boundary counters that did not fit [`COUNTER_NAMES`]'s block, mirrored
@@ -310,6 +346,11 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(COUNTER_NAMES[27], &NR2_PATCH_RELOCATED),
         e(COUNTER_NAMES[28], &NR2_SUBMIT_RESUBMISSION),
         f(COUNTER_NAMES[29], &NR2_SLOT_UNDERFLOW),
+        e(COUNTER_NAMES[30], &NR2_SUBMIT_WINDOW),
+        e(COUNTER_NAMES[31], &NR2_SUBMIT_WINDOW_TOTAL),
+        e(COUNTER_NAMES[32], &NR2_PATCH_WINDOW),
+        e(COUNTER_NAMES[33], &NR2_PATCH_WINDOW_TOTAL),
+        f(COUNTER_NAMES[34], &NR2_SUBMIT_NO_RECORD),
         e(BOUNDARY_NAMES[0], &NR2_NO_STAGE),
         e(BOUNDARY_NAMES[1], &NR2_NO_EPOCH),
         e(BOUNDARY_NAMES[2], &NR2_HOS1_NOT_EXECUTED),
@@ -1193,6 +1234,12 @@ fn run_control_payload(
 /// `args` is dxgkrnl's live `DXGKARG_PATCH` for a submission on an HVC1 context.
 pub(crate) unsafe fn patch(args: &DXGKARG_PATCH) {
     NR2_PATCH_CALLS.fetch_add(1, Ordering::Relaxed);
+    NR2_PATCH_WINDOW.store(
+        (args.DmaBufferPrivateDataSubmissionStartOffset << 16)
+            | (args.DmaBufferPrivateDataSubmissionEndOffset & 0xFFFF),
+        Ordering::Relaxed,
+    );
+    NR2_PATCH_WINDOW_TOTAL.store(args.DmaBufferPrivateDataSize, Ordering::Relaxed);
     // SAFETY: the private-data pair and window dxgkrnl supplied for this
     // submission.
     let Some(record) = (unsafe {
@@ -1383,6 +1430,13 @@ pub(crate) unsafe fn submit(native: &NativeContext, submit: &DXGKARG_SUBMITCOMMA
     // `DXGK_SUBMITCOMMANDFLAGS::Resubmission` (`d3dkmddi.h:4426`, bit 7).
     // SAFETY: `Value` is a plain UINT view of the (valid) flags union.
     let resubmission = (unsafe { submit.Flags.__bindgen_anon_1.Value } & (1 << 7)) != 0;
+    // Recorded BEFORE the read, so a refused window still reports its shape.
+    NR2_SUBMIT_WINDOW.store(
+        (submit.DmaBufferPrivateDataSubmissionStartOffset << 16)
+            | (submit.DmaBufferPrivateDataSubmissionEndOffset & 0xFFFF),
+        Ordering::Relaxed,
+    );
+    NR2_SUBMIT_WINDOW_TOTAL.store(submit.DmaBufferPrivateDataSize, Ordering::Relaxed);
     // SAFETY: per this function's contract.
     let Some(record) = (unsafe {
         read_dma_record(
@@ -1392,6 +1446,7 @@ pub(crate) unsafe fn submit(native: &NativeContext, submit: &DXGKARG_SUBMITCOMMA
             submit.DmaBufferPrivateDataSubmissionEndOffset,
         )
     }) else {
+        NR2_SUBMIT_NO_RECORD.fetch_add(1, Ordering::Relaxed);
         return;
     };
     if resubmission {
