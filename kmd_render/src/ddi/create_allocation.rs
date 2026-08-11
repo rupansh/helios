@@ -158,6 +158,7 @@ struct AllocationContext {
     /// anything.
     scanout_copy_last_fence: core::sync::atomic::AtomicU64,
     scanout_copy_owns_source_alias: AtomicU32,
+    scanout_copy_orphaned: AtomicU32,
     /// Exact segment-relative address supplied by Windows in
     /// `DXGKARG_SETVIDPNSOURCEADDRESS` for this allocation. Keeping it on the
     /// allocation makes the raised-IRQL callback's deferred handle and address
@@ -605,6 +606,9 @@ static STANDARD_FORMAT_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// value means this driver produces a record the create path will reject, i.e.
 /// the two halves of one file disagree.
 static STANDARD_SELF_REJECT: AtomicU32 = AtomicU32::new(0);
+static PRIMARY_COPY_ORPHAN_REFUSED: AtomicU32 = AtomicU32::new(0);
+static PRIMARY_COPY_ORPHAN_TRANSITION_FAILED: AtomicU32 = AtomicU32::new(0);
+static PRIMARY_COPY_ORPHAN_RETAINED: AtomicU32 = AtomicU32::new(0);
 
 /// Every registry name the counters above publish, so the compile-time
 /// no-truncation proof below has one list to check.
@@ -613,7 +617,7 @@ static STANDARD_SELF_REJECT: AtomicU32 = AtomicU32::new(0);
 /// names sharing a 14-byte prefix would MERGE into one registry value — a
 /// refusal counter reading someone else's number. Same guard
 /// `diag::FaultCounter` and `native_fence.rs` use.
-const RETIREMENT_COUNTER_NAMES: [&[u8]; 28] = [
+const RETIREMENT_COUNTER_NAMES: [&[u8]; 31] = [
     b"AcOk",
     b"AcMagic",
     b"AcHwa2Rej",
@@ -648,6 +652,9 @@ const RETIREMENT_COUNTER_NAMES: [&[u8]; 28] = [
     b"OaHwa2Rej",
     b"OaHvm1Stamp",
     b"OaHvm1Rej",
+    b"CpOrRef",
+    b"CpOrFail",
+    b"CpOrKeep",
 ];
 
 const _: () = {
@@ -1908,6 +1915,14 @@ fn clear_prepared_copy(ctx: &AllocationContext) {
         .store(0, Ordering::Release);
 }
 
+fn orphaned_copy_requires_backing_retain(ctx: &AllocationContext) -> bool {
+    let orphaned = ctx.scanout_copy_orphaned.load(Ordering::Acquire) != 0;
+    if orphaned {
+        bump(&PRIMARY_COPY_ORPHAN_RETAINED, b"CpOrKeep");
+    }
+    orphaned
+}
+
 /// Submit a GPU copy from the exact allocation selected by
 /// `SetVidPnSourceAddress` into the durable adapter-owned LINEAR scanout image.
 /// Setup (external-memory import + command recording) happens once per WDDM
@@ -1949,9 +1964,16 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
         crate::diag::record_named_bytes(b"CpCpy", 0xE2);
         return Err(STATUS_NOT_SUPPORTED);
     }
+    if ctx.scanout_copy_orphaned.load(Ordering::Acquire) != 0 {
+        bump(&PRIMARY_COPY_ORPHAN_REFUSED, b"CpOrRef");
+        crate::diag::record_named_bytes(b"CpCpy", 0xE3);
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
 
     // Through the scanout token: the second of the two Venus acquisitions that
     // run under `scanout_mutex` (see `ScanoutGuard`).
+    let mut orphan_refused = false;
+    let mut orphan_transition_failed = false;
     let result = lock.with_venus_client(|client| {
         // Retarget: a cached copy baked against a *different* destination image
         // is destroyed and rebuilt. Matching on the option directly replaces a
@@ -1964,9 +1986,27 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
                 if Some(old.target_image_id)
                     != crate::virtio::venus::VkImageId::from_raw(target_image_id) =>
             {
-                client.destroy_prepared_image_copy(adapter, old)?;
+                if ctx
+                    .scanout_copy_orphaned
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    orphan_refused = true;
+                    return Err(crate::virtio::VirtioError::DeviceError);
+                }
+                // Poison before withdrawing: a partial destructor cannot be retried,
+                // and DestroyAllocation must retain its backing for context teardown.
                 clear_prepared_copy(ctx);
-                None
+                match client.destroy_prepared_image_copy(adapter, old) {
+                    Ok(()) => {
+                        ctx.scanout_copy_orphaned.store(0, Ordering::Release);
+                        None
+                    }
+                    Err(e) => {
+                        orphan_transition_failed = true;
+                        return Err(e);
+                    }
+                }
             }
             other => other,
         };
@@ -2003,6 +2043,13 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
         ctx.scanout_copy_last_fence.store(fence, Ordering::Release);
         Ok::<u64, crate::virtio::VirtioError>(fence)
     });
+
+    if orphan_refused {
+        bump(&PRIMARY_COPY_ORPHAN_REFUSED, b"CpOrRef");
+    }
+    if orphan_transition_failed {
+        bump(&PRIMARY_COPY_ORPHAN_TRANSITION_FAILED, b"CpOrFail");
+    }
 
     match result {
         Ok(Ok(fence)) => {
@@ -2646,6 +2693,7 @@ unsafe fn destroy_allocation_ctx(
     // confirm resource_id=0 scanout disable, retain every host object until
     // device teardown rather than leave scanout 0 pointing at an unref'd blob.
     if !adapter.retire_scanout_allocation(passive, allocation_handle, ctx.resource_id) {
+        let _ = orphaned_copy_requires_backing_retain(&ctx);
         drop(ctx);
         return;
     }
@@ -2668,11 +2716,16 @@ unsafe fn destroy_allocation_ctx(
             .unwrap_or(false);
         if !drained {
             crate::diag::record_named_bytes(b"CpDrn", 0xE);
+            let _ = orphaned_copy_requires_backing_retain(&ctx);
             drop(ctx);
             return;
         }
         clear_prepared_copy(&ctx);
         crate::diag::record_named_bytes(b"CpDrn", 1);
+    }
+    if orphaned_copy_requires_backing_retain(&ctx) {
+        drop(ctx);
+        return;
     }
 
     // Present BLT command buffers bake imported aliases of ordinary WDDM
@@ -4293,6 +4346,7 @@ unsafe fn create_one(
         scanout_copy_target_image_id: core::sync::atomic::AtomicU64::new(0),
         scanout_copy_last_fence: core::sync::atomic::AtomicU64::new(0),
         scanout_copy_owns_source_alias: AtomicU32::new(0),
+        scanout_copy_orphaned: AtomicU32::new(0),
         vidpn_primary_address: AtomicU64::new(0),
         vidpn_primary_segment: AtomicU32::new(0),
         vidpn_primary_flags: AtomicU32::new(0),
