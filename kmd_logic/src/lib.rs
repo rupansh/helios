@@ -29,6 +29,7 @@ pub mod committed_mode;
 pub mod committed_mode_lifecycle;
 pub mod direct_scanout_admission;
 pub mod direct_scanout_lifetime;
+pub mod display_backing_lifetime;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///
