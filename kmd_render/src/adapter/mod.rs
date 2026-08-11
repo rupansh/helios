@@ -18,7 +18,7 @@ use wdk_sys::{KDPC, KEVENT, KSPIN_LOCK, KTIMER};
 
 use crate::dxgk::*;
 use crate::error::NotStarted;
-use crate::virtio::VirtioGpu;
+use crate::virtio::{TransportDomainExhausted, TransportOwner, VirtioGpu};
 use helios_kmd_logic::DisplayMode;
 
 pub(crate) mod allocation_object;
@@ -503,6 +503,7 @@ pub struct AdapterContext {
     /// boot-stack budget; see `VirtioGpu::init`.
     /// Guarded by `virtio_lock`; `None` until StartDevice (and after StopDevice).
     virtio: UnsafeCell<Option<Box<VirtioGpu>>>,
+    transport_owner: TransportOwner,
     /// PASSIVE-level serialization for scanout selection versus allocation
     /// destruction. A Windows primary can be replaced while an asynchronous
     /// SET_SCANOUT_BLOB/RESOURCE_FLUSH is outstanding; destruction must first
@@ -1052,30 +1053,32 @@ impl AdapterContext {
     /// used as the guarantee; `!Unpin` affects only the `Pin` APIs and would not
     /// stop `Box::new(ctx)` or `*Box::from_raw(raw)` from compiling.
     ///
-    /// Infallible on purpose. `new` was `Result` but had no fallible operation,
-    /// so its `Err` arm was dead code; `Box::new` is not fallible today, and an
-    /// `Option` here would imply an allocation-failure path that does not exist.
-    /// If one is wanted later that is a `Box::try_new` change, not a signature
-    /// change now.
+    /// Domain exhaustion is refused before allocation or dispatcher-object
+    /// initialization; it is the constructor's only fallible operation.
     ///
     /// Takes no PDO. AddAdapter is handed one, and this context used to store
     /// it in a `pub pdo` field that NOTHING ever read -- every path to the OS
     /// goes through the `DXGKRNL_INTERFACE` callback table saved at
     /// StartDevice, not through the device object. T6/R917.
-    pub(crate) fn create() -> NonNull<AdapterContext> {
-        let raw = Box::into_raw(Box::new(Self::new()));
+    pub(crate) fn create() -> Result<NonNull<AdapterContext>, TransportDomainExhausted> {
+        let transport_owner = TransportOwner::unbound()?;
+        let raw = Box::into_raw(Box::new(Self::new(transport_owner)));
+        // SAFETY: `Box::into_raw` never returns null.
+        let context = unsafe { NonNull::new_unchecked(raw) };
+        // SAFETY: `context` is this owner's final heap address, freshly allocated,
+        // and no other thread can see it yet.
+        unsafe { (*raw).bind_transport_owner(context) };
         // Kernel dispatcher objects must be initialized at the context's FINAL
         // address — a KEVENT's header is self-referential.
         // SAFETY: `raw` is the final heap address, freshly allocated, and no
         // other thread can see it yet.
         unsafe { (*raw).init_kernel_events() };
-        // SAFETY: `Box::into_raw` never returns null.
-        unsafe { NonNull::new_unchecked(raw) }
+        Ok(context)
     }
 
     /// Private: an `AdapterContext` by value is only ever a transient inside
     /// [`Self::create`], before the in-place dispatcher init runs.
-    fn new() -> Self {
+    fn new(transport_owner: TransportOwner) -> Self {
         Self {
             // PASSIVE_LEVEL: `create` is called from AddAdapter. Read here so the
             // AddAdapter-time caps/segment queries — which run BEFORE
@@ -1094,6 +1097,7 @@ impl AdapterContext {
             isr_status: AtomicUsize::new(0),
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
+            transport_owner,
             // Zeroed placeholder — initialized in place by init_kernel_events.
             scanout_mutex: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             mappings: crate::mapping::MappingTable::new(),
@@ -1185,6 +1189,12 @@ impl AdapterContext {
             config_change_pending: AtomicU32::new(0),
             start_complete: AtomicU32::new(0),
         }
+    }
+
+    unsafe fn bind_transport_owner(&self, address: NonNull<Self>) {
+        // SAFETY: forwarded only by `create` before dispatcher initialization or
+        // publication, at the final `Box` address.
+        unsafe { self.transport_owner.bind_adapter_once(address) };
     }
 
     /// Publish "StartDevice has returned" and wake the HPD worker.

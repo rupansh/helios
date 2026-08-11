@@ -32,7 +32,13 @@ pub unsafe extern "C" fn dxgkddi_add_device(
     // cannot move the context afterwards. The context is leaked to a raw
     // pointer; Dxgkrnl returns it to us on every DDI and we reclaim it in
     // DxgkDdiRemoveDevice.
-    let raw = AdapterContext::create();
+    let raw = match AdapterContext::create() {
+        Ok(raw) => raw,
+        Err(crate::virtio::TransportDomainExhausted) => {
+            crate::kmsg(c"Helios: AddDevice transport domain exhausted\n");
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    };
     // SAFETY: miniport_device_context is a valid out-pointer per the DDI contract.
     unsafe { *miniport_device_context = raw.as_ptr() as *mut c_void };
 

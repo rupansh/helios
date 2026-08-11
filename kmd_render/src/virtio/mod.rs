@@ -14,12 +14,15 @@
 //! M5 MSI-X ISR/DPC → M6 teardown.
 
 pub mod config;
+mod control_owner;
 pub mod counters;
 pub mod ctrl;
 pub mod gpu;
 pub mod hal;
 pub mod pci_caps;
 pub mod venus;
+
+pub(crate) use control_owner::{TransportDomainExhausted, TransportOwner};
 
 // `gpu::CompletedBind` is deliberately NOT re-exported: its only consumer names
 // it through inference (`take_completed_bind`), and an unused re-export is a
