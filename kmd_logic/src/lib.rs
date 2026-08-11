@@ -25,6 +25,8 @@
 
 #![no_std]
 
+pub mod direct_scanout_lifetime;
+
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///
 /// `DXGK_VIDPN_SOURCE_MODE` advertises 60/1 Hz, so a 16 ms recurring timer is
