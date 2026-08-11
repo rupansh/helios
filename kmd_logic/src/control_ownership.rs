@@ -1,6 +1,6 @@
 //! Pure ownership rules for epoch-qualified host control operations.
 //! Embedded tokens use `ManuallyDrop`: dropping uncertain state quarantines it;
-//! unsafe seams expose, not prove, singleton/device facts and stay pointer-bound.
+//! unsafe seams expose, not prove, unique-domain/device facts and stay pointer-bound.
 
 use core::mem::ManuallyDrop;
 use core::num::{NonZeroU32, NonZeroU64};
@@ -17,20 +17,74 @@ pub enum EpochRefusal {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct TransportEpoch(NonZeroU64);
+pub struct TransportDomainId(NonZeroU64);
 
-impl TransportEpoch {
-    pub const INITIAL: Self = Self(NonZeroU64::MIN);
-
-    const fn from_raw(raw: u64) -> Result<Self, EpochRefusal> {
+impl TransportDomainId {
+    const fn from_raw(raw: u64) -> Result<Self, TransportDomainRefusal> {
         match NonZeroU64::new(raw) {
-            Some(epoch) => Ok(Self(epoch)),
-            None => Err(EpochRefusal::Zero),
+            Some(id) => Ok(Self(id)),
+            None => Err(TransportDomainRefusal::Zero),
         }
     }
 
     pub const fn get(self) -> u64 {
         self.0.get()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TransportDomainRefusal {
+    Zero,
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct TransportDomainRoot {
+    id: TransportDomainId,
+}
+
+impl TransportDomainRoot {
+    /// Safety: `raw` is globally unique and is not reused until every request,
+    /// completion, reset witness, and other descendant of this root is gone.
+    pub const unsafe fn new(raw: u64) -> Result<Self, TransportDomainRefusal> {
+        match TransportDomainId::from_raw(raw) {
+            Ok(id) => Ok(Self { id }),
+            Err(reason) => Err(reason),
+        }
+    }
+
+    pub const fn id(&self) -> TransportDomainId {
+        self.id
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct TransportEpoch {
+    domain: TransportDomainId,
+    generation: NonZeroU64,
+}
+
+impl TransportEpoch {
+    const fn initial(domain: TransportDomainId) -> Self {
+        Self {
+            domain,
+            generation: NonZeroU64::MIN,
+        }
+    }
+
+    const fn from_raw(domain: TransportDomainId, raw: u64) -> Result<Self, EpochRefusal> {
+        match NonZeroU64::new(raw) {
+            Some(generation) => Ok(Self { domain, generation }),
+            None => Err(EpochRefusal::Zero),
+        }
+    }
+
+    pub const fn domain(self) -> TransportDomainId {
+        self.domain
+    }
+
+    pub const fn get(self) -> u64 {
+        self.generation.get()
     }
 }
 
@@ -41,26 +95,26 @@ pub struct TransportGeneration {
 }
 
 impl TransportGeneration {
-    /// Safety: the caller must establish the sole root owner of this transport domain.
-    pub const unsafe fn bootstrap() -> Self {
+    pub const fn bootstrap(root: TransportDomainRoot) -> Self {
         Self {
-            epoch: TransportEpoch::INITIAL,
+            epoch: TransportEpoch::initial(root.id),
             resource_high_water: 0,
         }
     }
 
-    /// Safety: this is the sole restored domain owner; `resource_high_water` covers every ID
-    /// ever issued in `epoch`, and no colliding reservation or lifecycle remains.
+    /// Safety: `resource_high_water` covers every ID ever issued in this root's restored
+    /// epoch, and no colliding reservation or lifecycle remains.
     pub const unsafe fn restore(
+        root: TransportDomainRoot,
         epoch: u64,
         resource_high_water: u32,
-    ) -> Result<Self, EpochRefusal> {
-        match TransportEpoch::from_raw(epoch) {
+    ) -> Result<Self, RefusedTransportRestore> {
+        match TransportEpoch::from_raw(root.id, epoch) {
             Ok(epoch) => Ok(Self {
                 epoch,
                 resource_high_water,
             }),
-            Err(reason) => Err(reason),
+            Err(reason) => Err(RefusedTransportRestore { reason, root }),
         }
     }
 
@@ -114,13 +168,33 @@ impl TransportGeneration {
         };
         Ok(TransportAdvance {
             generation: Self {
-                epoch: TransportEpoch(epoch),
+                epoch: TransportEpoch {
+                    domain: self.epoch.domain(),
+                    generation: epoch,
+                },
                 resource_high_water: 0,
             },
             reset: TransportReset {
                 retired: self.epoch,
             },
         })
+    }
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct RefusedTransportRestore {
+    reason: EpochRefusal,
+    root: TransportDomainRoot,
+}
+
+impl RefusedTransportRestore {
+    pub const fn reason(&self) -> EpochRefusal {
+        self.reason
+    }
+
+    pub fn into_root(self) -> TransportDomainRoot {
+        self.root
     }
 }
 
@@ -454,10 +528,20 @@ impl PreparedControl {
         epoch: TransportEpoch,
         reason: AbandonReason,
     ) -> Result<ClassifiedControl<(), E>, RefusedControlClassification> {
-        if epoch != self.key.subject.epoch() {
+        let expected = self.key.subject.epoch();
+        if epoch.domain() != expected.domain() {
+            return Err(RefusedControlClassification {
+                reason: ControlClassificationRefusal::DomainMismatch {
+                    expected: expected.domain(),
+                    found: epoch.domain(),
+                },
+                request: self,
+            });
+        }
+        if epoch != expected {
             return Err(RefusedControlClassification {
                 reason: ControlClassificationRefusal::EpochMismatch {
-                    expected: self.key.subject.epoch(),
+                    expected,
                     found: epoch,
                 },
                 request: self,
@@ -472,6 +556,10 @@ impl PreparedControl {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlClassificationRefusal {
+    DomainMismatch {
+        expected: TransportDomainId,
+        found: TransportDomainId,
+    },
     EpochMismatch {
         expected: TransportEpoch,
         found: TransportEpoch,
@@ -551,6 +639,10 @@ pub enum ResourceOperation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ResourceRefusal {
+    DomainMismatch {
+        expected: TransportDomainId,
+        found: TransportDomainId,
+    },
     EpochMismatch {
         expected: TransportEpoch,
         found: TransportEpoch,
@@ -562,6 +654,10 @@ pub enum ResourceRefusal {
     ResetEpochMismatch {
         expected: TransportEpoch,
         found: TransportEpoch,
+    },
+    ResetDomainMismatch {
+        expected: TransportDomainId,
+        found: TransportDomainId,
     },
     WrongPhase {
         operation: ResourceOperation,
@@ -990,6 +1086,12 @@ impl<B> ResourceLifecycle<B> {
         reset: &TransportReset,
     ) -> Result<DestroyBacking, ResourceRefusal> {
         self.check_resource(resource)?;
+        if reset.retired_epoch().domain() != self.resource.epoch().domain() {
+            return Err(ResourceRefusal::ResetDomainMismatch {
+                expected: self.resource.epoch().domain(),
+                found: reset.retired_epoch().domain(),
+            });
+        }
         if reset.retired_epoch() != self.resource.epoch() {
             return Err(ResourceRefusal::ResetEpochMismatch {
                 expected: self.resource.epoch(),
@@ -1077,6 +1179,20 @@ impl<B> ResourceLifecycle<B> {
                 found: pending.verb,
             });
         }
+        let expected_epoch = pending.subject.epoch();
+        let found_epoch = completion.key.subject.epoch();
+        if found_epoch.domain() != expected_epoch.domain() {
+            return Err(ResourceRefusal::DomainMismatch {
+                expected: expected_epoch.domain(),
+                found: found_epoch.domain(),
+            });
+        }
+        if found_epoch != expected_epoch {
+            return Err(ResourceRefusal::EpochMismatch {
+                expected: expected_epoch,
+                found: found_epoch,
+            });
+        }
         if completion.key.subject != pending.subject {
             return Err(ResourceRefusal::ControlSubjectMismatch);
         }
@@ -1116,6 +1232,12 @@ impl<B> ResourceLifecycle<B> {
     }
 
     fn check_resource(&self, resource: TransportResource) -> Result<(), ResourceRefusal> {
+        if resource.epoch().domain() != self.resource.epoch().domain() {
+            return Err(ResourceRefusal::DomainMismatch {
+                expected: self.resource.epoch().domain(),
+                found: resource.epoch().domain(),
+            });
+        }
         if resource.epoch() != self.resource.epoch() {
             return Err(ResourceRefusal::EpochMismatch {
                 expected: self.resource.epoch(),
@@ -1183,6 +1305,10 @@ pub enum WindowOperation {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WindowRefusal {
+    DomainMismatch {
+        expected: TransportDomainId,
+        found: TransportDomainId,
+    },
     EpochMismatch {
         expected: TransportEpoch,
         found: TransportEpoch,
@@ -1200,6 +1326,10 @@ pub enum WindowRefusal {
     ResetEpochMismatch {
         expected: TransportEpoch,
         found: TransportEpoch,
+    },
+    ResetDomainMismatch {
+        expected: TransportDomainId,
+        found: TransportDomainId,
     },
     WrongPhase {
         operation: WindowOperation,
@@ -1525,6 +1655,12 @@ impl<R> WindowLifecycle<R> {
         reset: &TransportReset,
     ) -> Result<ReleaseWindow, WindowRefusal> {
         self.check_window(window)?;
+        if reset.retired_epoch().domain() != self.window.epoch().domain() {
+            return Err(WindowRefusal::ResetDomainMismatch {
+                expected: self.window.epoch().domain(),
+                found: reset.retired_epoch().domain(),
+            });
+        }
         if reset.retired_epoch() != self.window.epoch() {
             return Err(WindowRefusal::ResetEpochMismatch {
                 expected: self.window.epoch(),
@@ -1598,6 +1734,20 @@ impl<R> WindowLifecycle<R> {
                 found: pending.verb,
             });
         }
+        let expected_epoch = pending.subject.epoch();
+        let found_epoch = completion.key.subject.epoch();
+        if found_epoch.domain() != expected_epoch.domain() {
+            return Err(WindowRefusal::DomainMismatch {
+                expected: expected_epoch.domain(),
+                found: found_epoch.domain(),
+            });
+        }
+        if found_epoch != expected_epoch {
+            return Err(WindowRefusal::EpochMismatch {
+                expected: expected_epoch,
+                found: found_epoch,
+            });
+        }
         if completion.key.subject != pending.subject {
             return Err(WindowRefusal::ControlSubjectMismatch);
         }
@@ -1637,6 +1787,12 @@ impl<R> WindowLifecycle<R> {
     }
 
     fn check_window(&self, window: TransportWindow) -> Result<(), WindowRefusal> {
+        if window.epoch().domain() != self.window.epoch().domain() {
+            return Err(WindowRefusal::DomainMismatch {
+                expected: self.window.epoch().domain(),
+                found: window.epoch().domain(),
+            });
+        }
         if window.epoch() != self.window.epoch() {
             return Err(WindowRefusal::EpochMismatch {
                 expected: self.window.epoch(),
@@ -1703,6 +1859,7 @@ mod tests {
 
     const HOST_ERROR: u32 = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
     const DEFINITE_ERROR: u8 = 0x5a;
+    const TEST_DOMAIN: u64 = 1;
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum OutcomeCase {
@@ -1744,8 +1901,20 @@ mod tests {
         }
     }
 
+    fn domain(raw: u64) -> TransportDomainId {
+        TransportDomainId::from_raw(raw).unwrap()
+    }
+
+    fn root(raw: u64) -> TransportDomainRoot {
+        unsafe { TransportDomainRoot::new(raw).unwrap() }
+    }
+
+    fn epoch_in_domain(domain_raw: u64, raw: u64) -> TransportEpoch {
+        TransportEpoch::from_raw(domain(domain_raw), raw).unwrap()
+    }
+
     fn epoch(raw: u64) -> TransportEpoch {
-        TransportEpoch::from_raw(raw).unwrap()
+        epoch_in_domain(TEST_DOMAIN, raw)
     }
 
     fn resource(epoch: TransportEpoch, id: u32) -> TransportResource {
@@ -1761,7 +1930,10 @@ mod tests {
     }
 
     fn generation(epoch: u64, high_water: u32) -> TransportGeneration {
-        unsafe { TransportGeneration::restore(epoch, high_water).unwrap() }
+        TransportGeneration {
+            epoch: self::epoch(epoch),
+            resource_high_water: high_water,
+        }
     }
 
     fn resource_lifecycle<B>(resource: TransportResource, backing: B) -> ResourceLifecycle<B> {
@@ -1860,16 +2032,38 @@ mod tests {
 
     #[test]
     fn identities_are_nonzero_epoch_qualified_and_exhaust_without_wrap() {
-        assert_eq!(TransportEpoch::from_raw(0), Err(EpochRefusal::Zero));
-        assert_eq!(TransportEpoch::INITIAL.get(), 1);
-        let active_generation = unsafe { TransportGeneration::bootstrap() };
+        const ROOT_DOMAIN: u64 = 0x100;
+        assert_eq!(
+            TransportDomainId::from_raw(0),
+            Err(TransportDomainRefusal::Zero)
+        );
+        let domain_root = root(ROOT_DOMAIN);
+        assert_eq!(domain_root.id().get(), ROOT_DOMAIN);
+        assert_eq!(
+            TransportEpoch::from_raw(domain(TEST_DOMAIN), 0),
+            Err(EpochRefusal::Zero)
+        );
+        let active_generation = TransportGeneration::bootstrap(domain_root);
+        assert_eq!(active_generation.epoch().get(), 1);
+        assert_eq!(active_generation.epoch().domain(), domain(ROOT_DOMAIN));
         let advance = unsafe { active_generation.advance().unwrap() };
         assert_eq!(advance.generation().epoch().get(), 2);
-        assert_eq!(advance.reset().retired_epoch(), TransportEpoch::INITIAL);
+        assert_eq!(
+            advance.reset().retired_epoch(),
+            epoch_in_domain(ROOT_DOMAIN, 1)
+        );
         let (active_generation, _) = advance.into_parts();
         let next = unsafe { active_generation.advance().unwrap() };
         assert_eq!(next.generation().epoch().get(), 3);
         assert_eq!(next.reset().retired_epoch().get(), 2);
+        assert_eq!(next.generation().epoch().domain(), domain(ROOT_DOMAIN));
+
+        let refusal = unsafe { TransportGeneration::restore(root(0x101), 0, 7).unwrap_err() };
+        assert_eq!(refusal.reason(), EpochRefusal::Zero);
+        assert_eq!(refusal.into_root().id().get(), 0x101);
+        let restored = unsafe { TransportGeneration::restore(root(0x102), 9, 7).unwrap() };
+        assert_eq!(restored.epoch(), epoch_in_domain(0x102, 9));
+        assert_eq!(restored.resource_high_water(), 7);
         let exhausted = generation(u64::MAX, 7);
         let refusal = unsafe { exhausted.advance().unwrap_err() };
         assert_eq!(refusal.reason(), EpochRefusal::Exhausted);
@@ -2327,7 +2521,13 @@ mod tests {
                 DropToken::new(&Rc::new(Cell::new(0))),
             ))
             .unwrap_err();
-        assert_eq!(refusal.reason(), ResourceRefusal::ControlSubjectMismatch);
+        assert_eq!(
+            refusal.reason(),
+            ResourceRefusal::EpochMismatch {
+                expected: current_epoch,
+                found: stale_epoch,
+            }
+        );
         assert!(matches!(
             refusal.into_completion().into_outcome(),
             ControlOutcome::DefiniteNotEnqueued(_)
@@ -2629,7 +2829,17 @@ mod tests {
         let stale_reset = reset_authority(stale_epoch);
         let (mut lifecycle, request) = window_admission(current_window, ());
 
-        for found in [stale_window, wrong_resource_window, wrong_range] {
+        for (found, expected) in [
+            (
+                stale_window,
+                WindowRefusal::EpochMismatch {
+                    expected: current_epoch,
+                    found: stale_epoch,
+                },
+            ),
+            (wrong_resource_window, WindowRefusal::ControlSubjectMismatch),
+            (wrong_range, WindowRefusal::ControlSubjectMismatch),
+        ] {
             let wrong_request = PreparedControl {
                 key: ControlKey {
                     verb: ControlVerb::Map,
@@ -2640,7 +2850,7 @@ mod tests {
             let refusal = lifecycle
                 .finish_map(definite_not_enqueued(wrong_request, DEFINITE_ERROR))
                 .unwrap_err();
-            assert_eq!(refusal.reason(), WindowRefusal::ControlSubjectMismatch);
+            assert_eq!(refusal.reason(), expected);
             assert_eq!(
                 refusal.into_completion().into_outcome(),
                 ControlOutcome::DefiniteNotEnqueued(DEFINITE_ERROR)
@@ -2752,7 +2962,7 @@ mod tests {
 
     #[test]
     fn one_generation_mints_unique_reservations_and_one_borrowable_reset() {
-        let generation = unsafe { TransportGeneration::bootstrap() };
+        let generation = TransportGeneration::bootstrap(root(0x103));
         let allocation = generation.allocate_resource().unwrap();
         let resource_a = allocation.resource();
         let (generation, reservation_a) = allocation.into_parts();
@@ -2783,6 +2993,95 @@ mod tests {
         let (a, authority_b) = refusal.into_parts();
         assert_eq!(a.consume_terminal(authority_a), Ok(()));
         assert_eq!(b.consume_terminal(authority_b), Ok(()));
+    }
+
+    #[test]
+    fn domain_brand_blocks_same_value_cross_device_completions_and_resets() {
+        let allocation_a = TransportGeneration::bootstrap(root(0x104))
+            .allocate_resource()
+            .unwrap();
+        let resource_a = allocation_a.resource();
+        let (generation_a, reservation_a) = allocation_a.into_parts();
+        let allocation_b = TransportGeneration::bootstrap(root(0x105))
+            .allocate_resource()
+            .unwrap();
+        let resource_b = allocation_b.resource();
+        let (generation_b, reservation_b) = allocation_b.into_parts();
+        assert_eq!(resource_a.epoch().get(), resource_b.epoch().get());
+        assert_eq!(resource_a.id(), resource_b.id());
+        assert_ne!(resource_a.epoch().domain(), resource_b.epoch().domain());
+
+        let mut a = ResourceLifecycle::new(reservation_a, ());
+        let mut b = ResourceLifecycle::new(reservation_b, ());
+        let request_a = a.begin_create(resource_a).unwrap().into_request();
+        let request_b = b.begin_create(resource_b).unwrap().into_request();
+        assert_eq!(request_a.sequence(), request_b.sequence());
+        let refusal = request_a
+            .ambiguous::<u8>(resource_b.epoch(), AbandonReason::Timeout)
+            .unwrap_err();
+        assert_eq!(
+            refusal.reason(),
+            ControlClassificationRefusal::DomainMismatch {
+                expected: resource_a.epoch().domain(),
+                found: resource_b.epoch().domain(),
+            }
+        );
+        let request_a = refusal.into_request();
+        let refusal = b.finish_create(completed_ok::<u8>(request_a)).unwrap_err();
+        assert_eq!(
+            refusal.reason(),
+            ResourceRefusal::DomainMismatch {
+                expected: resource_b.epoch().domain(),
+                found: resource_a.epoch().domain(),
+            }
+        );
+        let completion_a = refusal.into_completion();
+        let _ = a.finish_create(completion_a).unwrap();
+        let _ = b.finish_create(completed_ok::<u8>(request_b)).unwrap();
+
+        let (_, reset_a) = unsafe { generation_a.advance().unwrap() }.into_parts();
+        let (_, reset_b) = unsafe { generation_b.advance().unwrap() }.into_parts();
+        assert_eq!(
+            b.transport_reset(resource_b, &reset_a),
+            Err(ResourceRefusal::ResetDomainMismatch {
+                expected: resource_b.epoch().domain(),
+                found: resource_a.epoch().domain(),
+            })
+        );
+        assert_eq!(b.phase(), ResourcePhase::Created);
+        let authority_b = b.transport_reset(resource_b, &reset_b).unwrap();
+        let authority_a = a.transport_reset(resource_a, &reset_a).unwrap();
+        assert_eq!(b.consume_terminal(authority_b), Ok(()));
+        assert_eq!(a.consume_terminal(authority_a), Ok(()));
+
+        let window_a = window(resource_a, 0xc000);
+        let window_b = window(resource_b, 0xc000);
+        let (mut a, request_a) = window_admission(window_a, ());
+        let (mut b, request_b) = window_admission(window_b, ());
+        assert_eq!(request_a.sequence(), request_b.sequence());
+        let refusal = b.finish_map(completed_ok::<u8>(request_a)).unwrap_err();
+        assert_eq!(
+            refusal.reason(),
+            WindowRefusal::DomainMismatch {
+                expected: window_b.epoch().domain(),
+                found: window_a.epoch().domain(),
+            }
+        );
+        let completion_a = refusal.into_completion();
+        let _ = a.finish_map(completion_a).unwrap();
+        let _ = b.finish_map(completed_ok::<u8>(request_b)).unwrap();
+        assert_eq!(
+            b.transport_reset(window_b, &reset_a),
+            Err(WindowRefusal::ResetDomainMismatch {
+                expected: window_b.epoch().domain(),
+                found: window_a.epoch().domain(),
+            })
+        );
+        assert_eq!(b.phase(), WindowPhase::Mapped);
+        let authority_b = b.transport_reset(window_b, &reset_b).unwrap();
+        let authority_a = a.transport_reset(window_a, &reset_a).unwrap();
+        assert_eq!(b.consume_unmapped(authority_b), Ok(()));
+        assert_eq!(a.consume_unmapped(authority_a), Ok(()));
     }
 
     #[test]
