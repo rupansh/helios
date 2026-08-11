@@ -1,10 +1,13 @@
 use core::mem::ManuallyDrop;
 use core::num::NonZeroU64;
 
+use crate::context_lifecycle::{
+    ContextLease, LeasedAttachmentReservation, ReleasedAttachmentLease,
+    ReleasedAttachmentReservation,
+};
 use crate::control_ownership::{
-    AbandonReason, AttachmentReservation, ClassifiedControl, ControlOutcome, ControlSubject,
-    ControlVerb, HostRejection, PreparedControl, TransportAttachment, TransportDomainId,
-    TransportEpoch, TransportReset,
+    AbandonReason, ClassifiedControl, ControlOutcome, ControlSubject, ControlVerb, HostRejection,
+    PreparedControl, TransportAttachment, TransportDomainId, TransportEpoch, TransportReset,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,6 +74,7 @@ pub enum AttachmentRefusal {
         found: u64,
     },
     ControlSequenceExhausted,
+    ContextLeaseAttachmentMismatch,
     AlreadyReleased,
     ReleaseAuthorityMismatch,
 }
@@ -197,6 +201,24 @@ impl<R> AttachmentAdmission<R> {
     }
 }
 
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct RefusedAttachmentAdmission<R> {
+    reason: AttachmentRefusal,
+    leased: LeasedAttachmentReservation,
+    association_lease: R,
+}
+
+impl<R> RefusedAttachmentAdmission<R> {
+    pub const fn reason(&self) -> AttachmentRefusal {
+        self.reason
+    }
+
+    pub fn into_parts(self) -> (LeasedAttachmentReservation, R) {
+        (self.leased, self.association_lease)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PendingControl {
     verb: ControlVerb,
@@ -205,7 +227,7 @@ struct PendingControl {
 
 #[derive(Debug, Eq, PartialEq)]
 pub struct ContextAttachmentLifecycle<R> {
-    reservation: ManuallyDrop<AttachmentReservation>,
+    leased: ManuallyDrop<LeasedAttachmentReservation>,
     phase: AttachmentPhase,
     uncertain: bool,
     control_high_water: u64,
@@ -215,18 +237,25 @@ pub struct ContextAttachmentLifecycle<R> {
 }
 
 impl<R> ContextAttachmentLifecycle<R> {
-    pub const fn reserve(
-        reservation: AttachmentReservation,
+    pub fn reserve(
+        leased: LeasedAttachmentReservation,
         association_lease: R,
-    ) -> AttachmentAdmission<R> {
-        let attachment = reservation.attachment();
+    ) -> Result<AttachmentAdmission<R>, RefusedAttachmentAdmission<R>> {
+        if !leased.is_exact() {
+            return Err(RefusedAttachmentAdmission {
+                reason: AttachmentRefusal::ContextLeaseAttachmentMismatch,
+                leased,
+                association_lease,
+            });
+        }
+        let attachment = leased.attachment();
         let pending = PendingControl {
             verb: ControlVerb::Attach,
             sequence: NonZeroU64::MIN,
         };
-        AttachmentAdmission {
+        Ok(AttachmentAdmission {
             lifecycle: Self {
-                reservation: ManuallyDrop::new(reservation),
+                leased: ManuallyDrop::new(leased),
                 phase: AttachmentPhase::AttachPending,
                 uncertain: false,
                 control_high_water: 1,
@@ -239,11 +268,11 @@ impl<R> ContextAttachmentLifecycle<R> {
                 ControlSubject::Attachment(attachment),
                 pending.sequence,
             ),
-        }
+        })
     }
 
     pub fn attachment(&self) -> TransportAttachment {
-        self.reservation.attachment()
+        self.leased.attachment()
     }
 
     pub const fn phase(&self) -> AttachmentPhase {
@@ -420,11 +449,10 @@ impl<R> ContextAttachmentLifecycle<R> {
                 authority,
             });
         }
-        let reservation = ManuallyDrop::into_inner(self.reservation);
+        // SAFETY: the matching release authority above proves this row terminal.
+        let attachment_lease = unsafe { ManuallyDrop::into_inner(self.leased).into_released() };
         Ok(ReleasedAttachment {
-            reservation: ReleasedAttachmentReservation {
-                attachment: reservation.attachment(),
-            },
+            attachment_lease,
             association_lease: ManuallyDrop::into_inner(self.association_lease),
         })
     }
@@ -552,34 +580,26 @@ impl<R> ContextAttachmentLifecycle<R> {
 
 #[must_use]
 #[derive(Debug, Eq, PartialEq)]
-pub struct ReleasedAttachmentReservation {
-    attachment: TransportAttachment,
-}
-
-impl ReleasedAttachmentReservation {
-    pub const fn attachment(&self) -> TransportAttachment {
-        self.attachment
-    }
-}
-
-#[must_use]
-#[derive(Debug, Eq, PartialEq)]
 pub struct ReleasedAttachment<R> {
-    reservation: ReleasedAttachmentReservation,
+    attachment_lease: ReleasedAttachmentLease,
     association_lease: R,
 }
 
 impl<R> ReleasedAttachment<R> {
     pub const fn reservation(&self) -> &ReleasedAttachmentReservation {
-        &self.reservation
+        self.attachment_lease.reservation()
+    }
+
+    pub const fn context_lease(&self) -> &ContextLease {
+        self.attachment_lease.context_lease()
     }
 
     pub const fn association_lease(&self) -> &R {
         &self.association_lease
     }
 
-    pub fn into_parts(self) -> (ReleasedAttachmentReservation, R) {
-        (self.reservation, self.association_lease)
+    pub fn into_parts(self) -> (ReleasedAttachmentLease, R) {
+        (self.attachment_lease, self.association_lease)
     }
 }
 
@@ -610,10 +630,13 @@ mod tests {
     use core::num::NonZeroU64;
 
     use super::*;
+    use crate::context_lifecycle::{
+        ContextFinishEffect, ContextRefusal, TransportContextLifecycle,
+    };
     use crate::control_ownership::{
-        AttachmentsClosed, ResourceFinishEffect, ResourceLifecycle, TransportContext,
-        TransportDomainId, TransportDomainRoot, TransportEpoch, TransportGeneration,
-        TransportResource,
+        AttachmentReservation, AttachmentsClosed, ContextReservation, ResourceFinishEffect,
+        ResourceLifecycle, TransportContext, TransportDomainId, TransportDomainRoot,
+        TransportEpoch, TransportGeneration, TransportResource,
     };
     use helios_protocol::virtio_gpu::VIRTIO_GPU_RESP_ERR_INVALID_CONTEXT_ID;
 
@@ -698,17 +721,30 @@ mod tests {
         attachment: TransportAttachment,
         lease: R,
     ) -> (ContextAttachmentLifecycle<R>, PreparedControl) {
+        let Ok(admission) =
+            ContextAttachmentLifecycle::reserve(leased_attachment(attachment, 1), lease)
+        else {
+            panic!("matching test lease must admit");
+        };
+        admission.into_parts()
+    }
+
+    fn leased_attachment(
+        attachment: TransportAttachment,
+        lease_id: u64,
+    ) -> LeasedAttachmentReservation {
         let reservation = AttachmentReservation::test_for_attachment(attachment);
-        ContextAttachmentLifecycle::reserve(reservation, lease).into_parts()
+        let context_lease =
+            ContextLease::test_for_attachment(attachment, NonZeroU64::new(lease_id).unwrap());
+        LeasedAttachmentReservation::test_for_parts(reservation, context_lease)
     }
 
     fn consume_unit(
         lifecycle: ContextAttachmentLifecycle<()>,
         authority: ReleaseAttachment,
-    ) -> ReleasedAttachmentReservation {
+    ) -> ReleasedAttachmentLease {
         let released = lifecycle.consume_released(authority).unwrap();
-        let (reservation, ()) = released.into_parts();
-        reservation
+        released.into_parts().0
     }
 
     fn attached<R>(attachment: TransportAttachment, lease: R) -> ContextAttachmentLifecycle<R> {
@@ -760,6 +796,29 @@ mod tests {
         let request =
             PreparedControl::from_parts(verb, subject, NonZeroU64::new(sequence).unwrap());
         unsafe { request.completed_ok() }
+    }
+
+    #[test]
+    fn admission_refuses_mismatched_context_lease_and_recovers_both_inputs() {
+        let reserved = attachment_with_instance(1, 6, 9, 11, 1);
+        let leased_for = attachment_with_instance(1, 6, 9, 11, 2);
+        let leased = LeasedAttachmentReservation::test_for_parts(
+            AttachmentReservation::test_for_attachment(reserved),
+            ContextLease::test_for_attachment(leased_for, NonZeroU64::MIN),
+        );
+        let drops = Rc::new(Cell::new(0));
+        let refusal =
+            ContextAttachmentLifecycle::reserve(leased, DropToken::new(&drops)).unwrap_err();
+        assert_eq!(
+            refusal.reason(),
+            AttachmentRefusal::ContextLeaseAttachmentMismatch
+        );
+        let (leased, association_lease) = refusal.into_parts();
+        assert_eq!(leased.attachment(), reserved);
+        assert_eq!(leased.context_lease().attachment(), leased_for);
+        assert_eq!(drops.get(), 0);
+        drop(association_lease);
+        assert_eq!(drops.get(), 1);
     }
 
     #[test]
@@ -1145,13 +1204,24 @@ mod tests {
         let allocation = generation.allocate_context().unwrap();
         let context = allocation.context();
         let (generation, context_reservation) = allocation.into_parts();
+        let mut context_lifecycle = TransportContextLifecycle::new(context_reservation, ());
+        let create = context_lifecycle
+            .begin_create(context)
+            .unwrap()
+            .into_request();
+        let finish = context_lifecycle
+            .finish_create(unsafe { create.completed_nodata::<u8>() })
+            .unwrap();
+        assert_eq!(finish.effect(), &ContextFinishEffect::CreateCompleted);
         // SAFETY: the empty test table retains this exact context and resource
         // custody, and keeps the pair canonical until the terminal DETACH below.
         let allocation = unsafe { generation.allocate_attachment(resource, context) }.unwrap();
         let attachment = allocation.attachment();
         let (_generation, reservation) = allocation.into_parts();
-        let (mut attachment_lifecycle, attach) =
-            ContextAttachmentLifecycle::reserve(reservation, context_reservation).into_parts();
+        let leased = context_lifecycle.lease_attachment(reservation).unwrap();
+        let (mut attachment_lifecycle, attach) = ContextAttachmentLifecycle::reserve(leased, ())
+            .unwrap()
+            .into_parts();
         let finish = attachment_lifecycle
             .finish_attach(unsafe { attach.completed_ok::<u8>() })
             .unwrap();
@@ -1168,9 +1238,13 @@ mod tests {
         };
         let released = attachment_lifecycle.consume_released(authority).unwrap();
         assert_eq!(released.reservation().attachment(), attachment);
-        let (canonical_row, association_lease) = released.into_parts();
-        drop(canonical_row);
-        drop(association_lease);
+        let (attachment_release, association_lease) = released.into_parts();
+        let _ = association_lease;
+        assert_eq!(context_lifecycle.lease_census(), 1);
+        let canonical_row = context_lifecycle
+            .return_attachment(attachment_release)
+            .unwrap();
+        assert_eq!(canonical_row.attachment(), attachment);
 
         // SAFETY: admission is now closed and the returned canonical row was removed.
         let witness = unsafe { AttachmentsClosed::new(resource) };
@@ -1201,22 +1275,81 @@ mod tests {
         let finish = resource_lifecycle
             .finish_unref(unsafe { retry.completed_ok::<u8>() })
             .unwrap();
-        let (_, Some(authority)) = finish.into_parts() else {
+        let (_, Some(authority), _) = finish.into_parts() else {
             panic!("exact UNREF retry must authorize destruction");
         };
         assert_eq!(resource_lifecycle.consume_terminal(authority), Ok(()));
+
+        let destroy = context_lifecycle
+            .begin_destroy(context)
+            .unwrap()
+            .into_request();
+        let finish = context_lifecycle
+            .finish_destroy(unsafe { destroy.completed_nodata::<u8>() })
+            .unwrap();
+        let (_, Some(authority)) = finish.into_parts() else {
+            panic!("exact context destroy must authorize release");
+        };
+        let released = context_lifecycle.consume_terminal(authority).unwrap();
+        let (context_row, ()) = released.into_parts();
+        assert_eq!(context_row.context(), context);
+    }
+
+    #[test]
+    fn secondary_reset_returns_the_combined_row_before_context_reset() {
+        let attachment = attachment(7, 36, 18, 20);
+        let context = attachment.context();
+        let mut context_lifecycle =
+            TransportContextLifecycle::new(ContextReservation::test_for_context(context), ());
+        let create = context_lifecycle
+            .begin_create(context)
+            .unwrap()
+            .into_request();
+        let _ = context_lifecycle
+            .finish_create(unsafe { create.completed_nodata::<u8>() })
+            .unwrap();
+        let leased = context_lifecycle
+            .lease_attachment(AttachmentReservation::test_for_attachment(attachment))
+            .unwrap();
+        let (mut attachment_lifecycle, attach) = ContextAttachmentLifecycle::reserve(leased, ())
+            .unwrap()
+            .into_parts();
+        let _ = attachment_lifecycle
+            .finish_attach(unsafe { attach.completed_ok::<u8>() })
+            .unwrap();
+
+        let reset = reset(7, 36);
+        let authority = attachment_lifecycle
+            .transport_reset(attachment, &reset)
+            .unwrap();
+        let released = attachment_lifecycle.consume_released(authority).unwrap();
+        let (attachment_release, ()) = released.into_parts();
+        assert_eq!(context_lifecycle.lease_census(), 1);
+        assert_eq!(
+            context_lifecycle.transport_reset(context, &reset),
+            Err(ContextRefusal::AttachmentsOutstanding { count: 1 })
+        );
+        let tombstone = context_lifecycle
+            .return_attachment(attachment_release)
+            .unwrap();
+        assert_eq!(tombstone.attachment(), attachment);
+        assert_eq!(context_lifecycle.lease_census(), 0);
+        let authority = context_lifecycle.transport_reset(context, &reset).unwrap();
+        drop(context_lifecycle.consume_terminal(authority).unwrap());
     }
 
     #[test]
     fn forged_same_pair_instances_have_noninterchangeable_provenance() {
         let first_attachment = attachment_with_instance(9, 45, 24, 26, 1);
         let second_attachment = attachment_with_instance(9, 45, 24, 26, 2);
-        let first_reservation = AttachmentReservation::test_for_attachment(first_attachment);
-        let second_reservation = AttachmentReservation::test_for_attachment(second_attachment);
         let (mut first, first_request) =
-            ContextAttachmentLifecycle::reserve(first_reservation, ()).into_parts();
+            ContextAttachmentLifecycle::reserve(leased_attachment(first_attachment, 1), ())
+                .unwrap()
+                .into_parts();
         let (mut second, second_request) =
-            ContextAttachmentLifecycle::reserve(second_reservation, ()).into_parts();
+            ContextAttachmentLifecycle::reserve(leased_attachment(second_attachment, 2), ())
+                .unwrap()
+                .into_parts();
         assert_eq!(first_request.sequence(), second_request.sequence());
         assert_eq!(first_attachment.resource(), second_attachment.resource());
         assert_eq!(first_attachment.context(), second_attachment.context());
@@ -1304,10 +1437,10 @@ mod tests {
             .unwrap();
         let released = lifecycle.consume_released(authority).unwrap();
         assert_eq!(released.reservation().attachment(), attachment);
-        let (reservation, lease) = released.into_parts();
+        let (attachment_release, association_lease) = released.into_parts();
         assert_eq!(drops.get(), 0);
-        drop(reservation);
-        drop(lease);
+        drop(attachment_release);
+        drop(association_lease);
         assert_eq!(drops.get(), 1);
     }
 }

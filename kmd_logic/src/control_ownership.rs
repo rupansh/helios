@@ -2,6 +2,7 @@
 //! Embedded tokens use `ManuallyDrop`: dropping uncertain state quarantines it;
 //! unsafe seams expose, not prove, unique-domain/device facts and stay pointer-bound.
 
+use crate::context_lifecycle::{LeasedAttachmentReservation, ReleasedAttachmentLease};
 use core::mem::ManuallyDrop;
 use core::num::{NonZeroU32, NonZeroU64};
 use helios_protocol::virtio_gpu::{
@@ -211,9 +212,9 @@ impl TransportGeneration {
         })
     }
 
-    /// Safety: the caller's pointer-bound canonical table proves this pair absent
-    /// and its exact context live, then retains that context, resource association
-    /// custody, and pair uniqueness until the attachment reaches terminal.
+    /// Safety: under the caller's pointer-bound owner lock, this canonical pair is
+    /// absent and its exact context live; success is coupled to both context and
+    /// resource-association leases, and all three stay retained through terminal.
     pub unsafe fn allocate_attachment(
         self,
         resource: TransportResource,
@@ -563,6 +564,11 @@ impl ContextReservation {
     pub const fn context(&self) -> TransportContext {
         self.context
     }
+
+    #[cfg(test)]
+    pub(crate) const fn test_for_context(context: TransportContext) -> Self {
+        Self { context }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -830,6 +836,8 @@ pub enum ControlVerb {
     Unref,
     Map,
     Unmap,
+    ContextCreate,
+    ContextDestroy,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -837,6 +845,7 @@ pub enum ControlSubject {
     Resource(TransportResource),
     Attachment(TransportAttachment),
     Window(TransportWindow),
+    Context(TransportContext),
 }
 
 impl ControlSubject {
@@ -845,6 +854,7 @@ impl ControlSubject {
             Self::Resource(resource) => resource.epoch(),
             Self::Attachment(attachment) => attachment.epoch(),
             Self::Window(window) => window.epoch(),
+            Self::Context(context) => context.epoch(),
         }
     }
 }
@@ -861,6 +871,9 @@ struct ControlKey {
 pub struct PreparedControl {
     key: ControlKey,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExactNoData(());
 
 impl PreparedControl {
     pub(crate) const fn from_parts(
@@ -916,11 +929,71 @@ impl PreparedControl {
         }
     }
 
+    /// Safety: the transport proves this exact request was never accepted or enqueued.
+    pub unsafe fn nodata_definite_not_enqueued<E>(
+        self,
+        error: E,
+    ) -> ClassifiedControl<ExactNoData, E> {
+        ClassifiedControl {
+            key: self.key,
+            outcome: ControlOutcome::DefiniteNotEnqueued(error),
+        }
+    }
+
+    /// Safety: this exact request must have received `VIRTIO_GPU_RESP_OK_NODATA`.
+    pub unsafe fn completed_nodata<E>(self) -> ClassifiedControl<ExactNoData, E> {
+        ClassifiedControl {
+            key: self.key,
+            outcome: ControlOutcome::Completed(Ok(ExactNoData(()))),
+        }
+    }
+
+    /// Safety: a device response for this exact request must carry this rejection.
+    pub unsafe fn completed_nodata_rejection<E>(
+        self,
+        rejection: HostRejection,
+    ) -> ClassifiedControl<ExactNoData, E> {
+        ClassifiedControl {
+            key: self.key,
+            outcome: ControlOutcome::Completed(Err(rejection)),
+        }
+    }
+
     pub fn ambiguous<E>(
         self,
         epoch: TransportEpoch,
         reason: AbandonReason,
     ) -> Result<ClassifiedControl<(), E>, RefusedControlClassification> {
+        let expected = self.key.subject.epoch();
+        if epoch.domain() != expected.domain() {
+            return Err(RefusedControlClassification {
+                reason: ControlClassificationRefusal::DomainMismatch {
+                    expected: expected.domain(),
+                    found: epoch.domain(),
+                },
+                request: self,
+            });
+        }
+        if epoch != expected {
+            return Err(RefusedControlClassification {
+                reason: ControlClassificationRefusal::EpochMismatch {
+                    expected,
+                    found: epoch,
+                },
+                request: self,
+            });
+        }
+        Ok(ClassifiedControl {
+            key: self.key,
+            outcome: ControlOutcome::Ambiguous(AbandonedControl::new(epoch, reason)),
+        })
+    }
+
+    pub fn ambiguous_nodata<E>(
+        self,
+        epoch: TransportEpoch,
+        reason: AbandonReason,
+    ) -> Result<ClassifiedControl<ExactNoData, E>, RefusedControlClassification> {
         let expected = self.key.subject.epoch();
         if epoch.domain() != expected.domain() {
             return Err(RefusedControlClassification {
@@ -1076,8 +1149,10 @@ pub enum ResourceRefusal {
         found: u64,
     },
     ControlSequenceExhausted,
+    ContextLeaseAttachmentMismatch,
     MissingAttachment,
     AttachmentMayBeLive,
+    AttachmentLeaseOutstanding,
     AttachmentsAlreadyClosed,
     AttachmentsNotClosed,
     AlreadyTerminal,
@@ -1103,7 +1178,7 @@ pub struct ResourceBegin {
 #[derive(Debug, Eq, PartialEq)]
 pub struct RefusedResourceAttachBegin {
     reason: ResourceRefusal,
-    reservation: AttachmentReservation,
+    leased: LeasedAttachmentReservation,
 }
 
 impl RefusedResourceAttachBegin {
@@ -1111,8 +1186,8 @@ impl RefusedResourceAttachBegin {
         self.reason
     }
 
-    pub fn into_reservation(self) -> AttachmentReservation {
-        self.reservation
+    pub fn into_leased(self) -> LeasedAttachmentReservation {
+        self.leased
     }
 }
 
@@ -1198,6 +1273,7 @@ impl DestroyBacking {
 pub struct ResourceFinish<E> {
     effect: ResourceFinishEffect<E>,
     destroy: Option<DestroyBacking>,
+    attachment_release: Option<ReleasedAttachmentLease>,
 }
 
 impl<E> ResourceFinish<E> {
@@ -1209,8 +1285,39 @@ impl<E> ResourceFinish<E> {
         self.destroy.as_ref()
     }
 
-    pub fn into_parts(self) -> (ResourceFinishEffect<E>, Option<DestroyBacking>) {
-        (self.effect, self.destroy)
+    pub const fn attachment_release(&self) -> Option<&ReleasedAttachmentLease> {
+        self.attachment_release.as_ref()
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ResourceFinishEffect<E>,
+        Option<DestroyBacking>,
+        Option<ReleasedAttachmentLease>,
+    ) {
+        (self.effect, self.destroy, self.attachment_release)
+    }
+}
+
+#[must_use]
+#[derive(Debug, Eq, PartialEq)]
+pub struct ResourceReset {
+    destroy: DestroyBacking,
+    attachment_release: Option<ReleasedAttachmentLease>,
+}
+
+impl ResourceReset {
+    pub const fn destroy_authority(&self) -> &DestroyBacking {
+        &self.destroy
+    }
+
+    pub const fn attachment_release(&self) -> Option<&ReleasedAttachmentLease> {
+        self.attachment_release.as_ref()
+    }
+
+    pub fn into_parts(self) -> (DestroyBacking, Option<ReleasedAttachmentLease>) {
+        (self.destroy, self.attachment_release)
     }
 }
 
@@ -1234,7 +1341,7 @@ impl<T, E> RefusedResourceOutcome<T, E> {
 #[derive(Debug, Eq, PartialEq)]
 pub struct ResourceLifecycle<B> {
     resource: TransportResource,
-    attachment: Option<AttachmentReservation>,
+    attachment: Option<ManuallyDrop<LeasedAttachmentReservation>>,
     attachment_may_be_live: bool,
     attachments_closed: Option<AttachmentsClosed>,
     phase: ResourcePhase,
@@ -1265,9 +1372,9 @@ impl<B> ResourceLifecycle<B> {
         self.resource
     }
 
-    pub const fn attachment(&self) -> Option<TransportAttachment> {
+    pub fn attachment(&self) -> Option<TransportAttachment> {
         match self.attachment.as_ref() {
-            Some(reservation) => Some(reservation.attachment),
+            Some(leased) => Some(leased.attachment()),
             None => None,
         }
     }
@@ -1330,6 +1437,7 @@ impl<B> ResourceLifecycle<B> {
                 return Ok(ResourceFinish {
                     effect: ResourceFinishEffect::CreateCompleted,
                     destroy: None,
+                    attachment_release: None,
                 });
             }
             ControlOutcome::Completed(Err(status)) => (
@@ -1342,6 +1450,7 @@ impl<B> ResourceLifecycle<B> {
                 return Ok(ResourceFinish {
                     effect: ResourceFinishEffect::CreateAmbiguous(abandoned.reason()),
                     destroy: None,
+                    attachment_release: None,
                 });
             }
         };
@@ -1349,30 +1458,34 @@ impl<B> ResourceLifecycle<B> {
         Ok(ResourceFinish {
             effect,
             destroy: Some(self.destroy_token(authority)),
+            attachment_release: None,
         })
     }
 
     pub fn begin_attach(
         &mut self,
-        reservation: AttachmentReservation,
+        leased: LeasedAttachmentReservation,
     ) -> Result<ResourceBegin, RefusedResourceAttachBegin> {
-        let attachment = reservation.attachment;
-        if let Err(reason) = self.check_resource(attachment.resource()) {
+        if !leased.is_exact() {
             return Err(RefusedResourceAttachBegin {
-                reason,
-                reservation,
+                reason: ResourceRefusal::ContextLeaseAttachmentMismatch,
+                leased,
             });
+        }
+        let attachment = leased.attachment();
+        if let Err(reason) = self.check_resource(attachment.resource()) {
+            return Err(RefusedResourceAttachBegin { reason, leased });
         }
         if self.phase == ResourcePhase::Terminal {
             return Err(RefusedResourceAttachBegin {
                 reason: ResourceRefusal::AlreadyTerminal,
-                reservation,
+                leased,
             });
         }
         if self.attachments_closed.is_some() {
             return Err(RefusedResourceAttachBegin {
                 reason: ResourceRefusal::AttachmentsAlreadyClosed,
-                reservation,
+                leased,
             });
         }
         if self.phase != ResourcePhase::Created {
@@ -1381,20 +1494,17 @@ impl<B> ResourceLifecycle<B> {
                     operation: ResourceOperation::Attach,
                     phase: self.phase,
                 },
-                reservation,
+                leased,
             });
         }
         let request =
             match self.mint_control(ControlVerb::Attach, ControlSubject::Attachment(attachment)) {
                 Ok(request) => request,
                 Err(reason) => {
-                    return Err(RefusedResourceAttachBegin {
-                        reason,
-                        reservation,
-                    });
+                    return Err(RefusedResourceAttachBegin { reason, leased });
                 }
             };
-        self.attachment = Some(reservation);
+        self.attachment = Some(ManuallyDrop::new(leased));
         self.attachment_may_be_live = true;
         self.phase = ResourcePhase::AttachPending;
         Ok(ResourceBegin {
@@ -1417,31 +1527,42 @@ impl<B> ResourceLifecycle<B> {
         }
         self.pending = None;
 
-        let effect = match completion.outcome {
+        let (effect, attachment_release) = match completion.outcome {
             ControlOutcome::DefiniteNotEnqueued(error) => {
                 self.attachment_may_be_live = false;
-                ResourceFinishEffect::AttachDefiniteNotEnqueued(error)
+                (
+                    ResourceFinishEffect::AttachDefiniteNotEnqueued(error),
+                    self.release_attachment(),
+                )
             }
             ControlOutcome::Completed(Ok(())) => {
                 self.phase = ResourcePhase::Live;
                 return Ok(ResourceFinish {
                     effect: ResourceFinishEffect::AttachCompleted,
                     destroy: None,
+                    attachment_release: None,
                 });
             }
             ControlOutcome::Completed(Err(status)) => {
                 self.attachment_may_be_live = false;
-                ResourceFinishEffect::AttachHostRejected(status)
+                (
+                    ResourceFinishEffect::AttachHostRejected(status),
+                    self.release_attachment(),
+                )
             }
             ControlOutcome::Ambiguous(abandoned) => {
                 self.uncertain = true;
-                ResourceFinishEffect::AttachAmbiguous(abandoned.reason())
+                (
+                    ResourceFinishEffect::AttachAmbiguous(abandoned.reason()),
+                    None,
+                )
             }
         };
         self.phase = ResourcePhase::RetirementRequired;
         Ok(ResourceFinish {
             effect,
             destroy: None,
+            attachment_release,
         })
     }
 
@@ -1502,6 +1623,7 @@ impl<B> ResourceLifecycle<B> {
                 return Ok(ResourceFinish {
                     effect: ResourceFinishEffect::DetachCompleted,
                     destroy: None,
+                    attachment_release: self.release_attachment(),
                 });
             }
             ControlOutcome::Completed(Err(status)) => {
@@ -1516,6 +1638,7 @@ impl<B> ResourceLifecycle<B> {
         Ok(ResourceFinish {
             effect,
             destroy: None,
+            attachment_release: None,
         })
     }
 
@@ -1565,6 +1688,8 @@ impl<B> ResourceLifecycle<B> {
                     Err(ResourceRefusal::AlreadyTerminal)
                 } else if self.attachment_may_be_live {
                     Err(ResourceRefusal::AttachmentMayBeLive)
+                } else if self.attachment.is_some() {
+                    Err(ResourceRefusal::AttachmentLeaseOutstanding)
                 } else if self.attachments_closed.is_some() {
                     Err(ResourceRefusal::AttachmentsAlreadyClosed)
                 } else {
@@ -1575,7 +1700,6 @@ impl<B> ResourceLifecycle<B> {
         if let Some(reason) = reason {
             return Err(RefusedAttachmentsClosed { reason, witness });
         }
-        self.attachment = None;
         self.attachments_closed = Some(witness);
         Ok(())
     }
@@ -1604,6 +1728,7 @@ impl<B> ResourceLifecycle<B> {
                 return Ok(ResourceFinish {
                     effect: ResourceFinishEffect::UnrefCompleted,
                     destroy: Some(self.destroy_token(authority)),
+                    attachment_release: None,
                 });
             }
             ControlOutcome::Completed(Err(status)) => {
@@ -1618,6 +1743,7 @@ impl<B> ResourceLifecycle<B> {
         Ok(ResourceFinish {
             effect,
             destroy: None,
+            attachment_release: None,
         })
     }
 
@@ -1639,7 +1765,7 @@ impl<B> ResourceLifecycle<B> {
         &mut self,
         resource: TransportResource,
         reset: &TransportReset,
-    ) -> Result<DestroyBacking, ResourceRefusal> {
+    ) -> Result<ResourceReset, ResourceRefusal> {
         self.check_resource(resource)?;
         if reset.retired_epoch().domain() != self.resource.epoch().domain() {
             return Err(ResourceRefusal::ResetDomainMismatch {
@@ -1656,9 +1782,13 @@ impl<B> ResourceLifecycle<B> {
         if self.phase == ResourcePhase::Terminal {
             return Err(ResourceRefusal::AlreadyTerminal);
         }
+        let attachment_release = self.release_attachment();
         let authority = DestroyAuthorityKind::TransportReset(reset.retired_epoch());
         self.terminalize(authority);
-        Ok(self.destroy_token(authority))
+        Ok(ResourceReset {
+            destroy: self.destroy_token(authority),
+            attachment_release,
+        })
     }
 
     pub fn consume_terminal(
@@ -1815,7 +1945,7 @@ impl<B> ResourceLifecycle<B> {
         let Some(expected) = self.attachment.as_ref() else {
             return Err(ResourceRefusal::MissingAttachment);
         };
-        let expected = expected.attachment;
+        let expected = expected.attachment();
         if attachment.context().id() != expected.context().id() {
             return Err(ResourceRefusal::ContextMismatch {
                 expected: expected.context().id(),
@@ -1870,6 +2000,14 @@ impl<B> ResourceLifecycle<B> {
         self.attachments_closed = None;
         self.pending = None;
         self.terminal_authority = Some(authority);
+    }
+
+    fn release_attachment(&mut self) -> Option<ReleasedAttachmentLease> {
+        self.attachment_may_be_live = false;
+        // SAFETY: callers have exact ATTACH absence, DETACH, or reset authority.
+        self.attachment
+            .take()
+            .map(|leased| unsafe { ManuallyDrop::into_inner(leased).into_released() })
     }
 
     const fn destroy_token(&self, authority: DestroyAuthorityKind) -> DestroyBacking {
@@ -2469,6 +2607,7 @@ mod tests {
     use self::std::cell::Cell;
     use self::std::rc::Rc;
     use super::*;
+    use crate::context_lifecycle::{ContextLease, ContextRefusal, TransportContextLifecycle};
 
     const HOST_ERROR: u32 = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
     const DEFINITE_ERROR: u8 = 0x5a;
@@ -2557,8 +2696,12 @@ mod tests {
     fn attachment_reservation(
         resource: TransportResource,
         context_id: u32,
-    ) -> AttachmentReservation {
-        AttachmentReservation::test_for_attachment(attachment(resource, context_id))
+    ) -> LeasedAttachmentReservation {
+        let attachment = attachment(resource, context_id);
+        LeasedAttachmentReservation::test_for_parts(
+            AttachmentReservation::test_for_attachment(attachment),
+            ContextLease::test_for_attachment(attachment, NonZeroU64::MIN),
+        )
     }
 
     fn window(resource: TransportResource, offset: u64) -> TransportWindow {
@@ -2978,6 +3121,13 @@ mod tests {
                 .finish_attach(outcome(case, request, epoch))
                 .unwrap();
             assert!(finish.destroy_authority().is_none());
+            assert_eq!(
+                finish.attachment_release().is_some(),
+                matches!(
+                    case,
+                    OutcomeCase::DefiniteNotEnqueued | OutcomeCase::HostRejected
+                )
+            );
             match case {
                 OutcomeCase::DefiniteNotEnqueued => assert_eq!(
                     finish.effect(),
@@ -3009,9 +3159,24 @@ mod tests {
         let resource = resource(epoch, 2);
         let mut lifecycle = created(resource);
 
-        let wrong_reservation =
-            AttachmentReservation::test_for_attachment(attachment(other_resource, 1));
-        let refusal = lifecycle.begin_attach(wrong_reservation).unwrap_err();
+        let reserved = attachment_with_instance(resource, 1, 10);
+        let leased_for = attachment_with_instance(resource, 1, 11);
+        let mismatched = LeasedAttachmentReservation::test_for_parts(
+            AttachmentReservation::test_for_attachment(reserved),
+            ContextLease::test_for_attachment(leased_for, NonZeroU64::MIN),
+        );
+        let refusal = lifecycle.begin_attach(mismatched).unwrap_err();
+        assert_eq!(
+            refusal.reason(),
+            ResourceRefusal::ContextLeaseAttachmentMismatch
+        );
+        let leased = refusal.into_leased();
+        assert_eq!(leased.attachment(), reserved);
+        assert_eq!(leased.context_lease().attachment(), leased_for);
+        assert_eq!(lifecycle.phase(), ResourcePhase::Created);
+
+        let wrong_leased = attachment_reservation(other_resource, 1);
+        let refusal = lifecycle.begin_attach(wrong_leased).unwrap_err();
         assert_eq!(
             refusal.reason(),
             ResourceRefusal::ResourceMismatch {
@@ -3020,14 +3185,17 @@ mod tests {
             }
         );
         assert_eq!(
-            refusal.into_reservation().attachment().resource(),
+            refusal.into_leased().attachment().resource(),
             other_resource
         );
 
         let creator = attachment_with_instance(resource, 1, 1);
         let foreign_instance = attachment_with_instance(resource, 1, 2);
-        let reservation = AttachmentReservation::test_for_attachment(creator);
-        let request = lifecycle.begin_attach(reservation).unwrap().into_request();
+        let leased = LeasedAttachmentReservation::test_for_parts(
+            AttachmentReservation::test_for_attachment(creator),
+            ContextLease::test_for_attachment(creator, NonZeroU64::MIN),
+        );
+        let request = lifecycle.begin_attach(leased).unwrap().into_request();
         let foreign = PreparedControl::from_parts(
             ControlVerb::Attach,
             ControlSubject::Attachment(foreign_instance),
@@ -3062,6 +3230,95 @@ mod tests {
     }
 
     #[test]
+    fn creator_attachment_keeps_context_census_until_exact_detach_release() {
+        let epoch = epoch(122);
+        let resource = resource(epoch, 4);
+        let context = context(epoch, 7);
+        let attachment = TransportAttachment::from_raw(resource, context, NonZeroU64::MIN);
+        let mut context_lifecycle =
+            TransportContextLifecycle::new(ContextReservation::test_for_context(context), ());
+        let request = context_lifecycle
+            .begin_create(context)
+            .unwrap()
+            .into_request();
+        let _ = context_lifecycle
+            .finish_create(unsafe { request.completed_nodata::<u8>() })
+            .unwrap();
+
+        let mut resource_lifecycle = created(resource);
+        let leased = context_lifecycle
+            .lease_attachment(AttachmentReservation::test_for_attachment(attachment))
+            .unwrap();
+        let request = resource_lifecycle
+            .begin_attach(leased)
+            .unwrap()
+            .into_request();
+        let finish = resource_lifecycle
+            .finish_attach(completed_ok::<u8>(request))
+            .unwrap();
+        assert!(finish.attachment_release().is_none());
+        assert_eq!(context_lifecycle.lease_census(), 1);
+        assert_eq!(
+            context_lifecycle.begin_destroy(context),
+            Err(ContextRefusal::AttachmentsOutstanding { count: 1 })
+        );
+        assert_eq!(
+            resource_lifecycle.begin_unref(resource),
+            Err(ResourceRefusal::AttachmentMayBeLive)
+        );
+        let witness = AttachmentsClosed::test_for_resource(resource);
+        let refusal = resource_lifecycle
+            .install_attachments_closed(witness)
+            .unwrap_err();
+        assert_eq!(refusal.reason(), ResourceRefusal::AttachmentMayBeLive);
+        let witness = refusal.into_witness();
+
+        let request = resource_lifecycle
+            .begin_detach(attachment)
+            .unwrap()
+            .into_request();
+        let finish = resource_lifecycle
+            .finish_detach(completed_ok::<u8>(request))
+            .unwrap();
+        let (_, None, Some(released)) = finish.into_parts() else {
+            panic!("exact creator DETACH must return its canonical row and context lease");
+        };
+        assert_eq!(context_lifecycle.lease_census(), 1);
+        assert_eq!(released.reservation().attachment(), attachment);
+        assert_eq!(released.context_lease().attachment(), attachment);
+        let row = context_lifecycle.return_attachment(released).unwrap();
+        assert_eq!(row.attachment(), attachment);
+        assert_eq!(context_lifecycle.lease_census(), 0);
+
+        resource_lifecycle
+            .install_attachments_closed(witness)
+            .unwrap();
+        let request = resource_lifecycle
+            .begin_unref(resource)
+            .unwrap()
+            .into_request();
+        let finish = resource_lifecycle
+            .finish_unref(completed_ok::<u8>(request))
+            .unwrap();
+        let (_, Some(authority), None) = finish.into_parts() else {
+            panic!("exact UNREF must authorize backing release");
+        };
+        assert_eq!(resource_lifecycle.consume_terminal(authority), Ok(()));
+
+        let request = context_lifecycle
+            .begin_destroy(context)
+            .unwrap()
+            .into_request();
+        let finish = context_lifecycle
+            .finish_destroy(unsafe { request.completed_nodata::<u8>() })
+            .unwrap();
+        let (_, Some(authority)) = finish.into_parts() else {
+            panic!("exact context destroy must release its row");
+        };
+        drop(context_lifecycle.consume_terminal(authority).unwrap());
+    }
+
+    #[test]
     fn detach_outcome_matrix_never_authorizes_backing_destruction() {
         let epoch = epoch(13);
         let resource = resource(epoch, 3);
@@ -3075,6 +3332,10 @@ mod tests {
                 .finish_detach(outcome(case, request, epoch))
                 .unwrap();
             assert!(finish.destroy_authority().is_none());
+            assert_eq!(
+                finish.attachment_release().is_some(),
+                case == OutcomeCase::Completed
+            );
             match case {
                 OutcomeCase::DefiniteNotEnqueued => assert_eq!(
                     finish.effect(),
@@ -3175,11 +3436,11 @@ mod tests {
         let attachment = reservation.attachment();
         let refusal = lifecycle.begin_attach(reservation).unwrap_err();
         assert_eq!(refusal.reason(), ResourceRefusal::AttachmentsAlreadyClosed);
-        assert_eq!(refusal.into_reservation().attachment(), attachment);
+        assert_eq!(refusal.into_leased().attachment(), attachment);
 
         let request = lifecycle.begin_unref(resource).unwrap().into_request();
         let finish = lifecycle.finish_unref(completed_ok::<u8>(request)).unwrap();
-        let (_, Some(authority)) = finish.into_parts() else {
+        let (_, Some(authority), _) = finish.into_parts() else {
             panic!("completed UNREF must authorize destruction");
         };
         assert_eq!(lifecycle.consume_terminal(authority), Ok(()));
@@ -3223,7 +3484,7 @@ mod tests {
 
         let request = lifecycle.begin_unref(resource).unwrap().into_request();
         let finish = lifecycle.finish_unref(completed_ok::<u8>(request)).unwrap();
-        let (_, Some(authority)) = finish.into_parts() else {
+        let (_, Some(authority), _) = finish.into_parts() else {
             panic!("exact UNREF retry must authorize destruction");
         };
         assert_eq!(lifecycle.consume_terminal(authority), Ok(()));
@@ -3249,7 +3510,7 @@ mod tests {
         let finish = lifecycle
             .finish_unref(completed_ok::<u8>(begin.into_request()))
             .unwrap();
-        let (_, Some(authority)) = finish.into_parts() else {
+        let (_, Some(authority), _) = finish.into_parts() else {
             panic!("completed UNREF must authorize destruction after DETACH");
         };
         assert_eq!(authority.authority(), DestroyAuthorityKind::UnrefCompleted);
@@ -3340,7 +3601,7 @@ mod tests {
             }
             let request = lifecycle.begin_unref(resource).unwrap().into_request();
             let finish = lifecycle.finish_unref(completed_ok::<u8>(request)).unwrap();
-            let (_, Some(authority)) = finish.into_parts() else {
+            let (_, Some(authority), _) = finish.into_parts() else {
                 panic!("completed UNREF must produce terminal authority");
             };
             assert_eq!(authority.authority(), DestroyAuthorityKind::UnrefCompleted);
@@ -3419,12 +3680,14 @@ mod tests {
         for (index, phase) in phases.into_iter().enumerate() {
             let resource = resource(epoch, index as u32 + 1);
             let mut lifecycle = resource_at_phase(resource, phase);
-            let authority = lifecycle.transport_reset(resource, &reset).unwrap();
+            let reset_result = lifecycle.transport_reset(resource, &reset).unwrap();
             assert_eq!(lifecycle.phase(), ResourcePhase::Terminal);
             assert_eq!(
-                authority.authority(),
+                reset_result.destroy_authority().authority(),
                 DestroyAuthorityKind::TransportReset(epoch)
             );
+            let (authority, attachment_release) = reset_result.into_parts();
+            drop(attachment_release);
             assert_eq!(
                 lifecycle.transport_reset(resource, &reset),
                 Err(ResourceRefusal::AlreadyTerminal)
@@ -3586,7 +3849,7 @@ mod tests {
         assert_eq!(drops.get(), 0);
         let request = lifecycle.begin_unref(resource).unwrap().into_request();
         let finish = lifecycle.finish_unref(completed_ok::<u8>(request)).unwrap();
-        let (_, Some(authority)) = finish.into_parts() else {
+        let (_, Some(authority), _) = finish.into_parts() else {
             panic!("completed UNREF must authorize destruction");
         };
         assert_eq!(drops.get(), 0);
@@ -3956,8 +4219,10 @@ mod tests {
 
         let advance = unsafe { generation.advance().unwrap() };
         let (_, reset) = advance.into_parts();
-        let authority_a = a.transport_reset(resource_a, &reset).unwrap();
-        let authority_b = b.transport_reset(resource_b, &reset).unwrap();
+        let (authority_a, release_a) = a.transport_reset(resource_a, &reset).unwrap().into_parts();
+        let (authority_b, release_b) = b.transport_reset(resource_b, &reset).unwrap().into_parts();
+        drop(release_a);
+        drop(release_b);
         let refusal = a.consume_terminal(authority_b).unwrap_err();
         assert!(matches!(
             refusal.reason(),
@@ -4024,8 +4289,16 @@ mod tests {
             })
         );
         assert_eq!(b.phase(), ResourcePhase::Created);
-        let authority_b = b.transport_reset(resource_b, &reset_b).unwrap();
-        let authority_a = a.transport_reset(resource_a, &reset_a).unwrap();
+        let (authority_b, release_b) = b
+            .transport_reset(resource_b, &reset_b)
+            .unwrap()
+            .into_parts();
+        let (authority_a, release_a) = a
+            .transport_reset(resource_a, &reset_a)
+            .unwrap()
+            .into_parts();
+        drop(release_a);
+        drop(release_b);
         assert_eq!(b.consume_terminal(authority_b), Ok(()));
         assert_eq!(a.consume_terminal(authority_a), Ok(()));
 
