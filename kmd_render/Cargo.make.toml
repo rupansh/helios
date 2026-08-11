@@ -267,3 +267,48 @@ args = [
   "/os:${WDK_BUILD_INF2CAT_OS}",
   "/uselocaltime",
 ]
+
+# ── Signing: the MACHINE cert, not the current-user one ──────────────────────
+#
+# Upstream (`wdk-build`'s rust-driver-makefile.toml) makecerts a cert into the
+# CURRENT-USER `WDRTestCertStore` and signs with `/s WDRTestCertStore /n
+# WDRLocalTestCert`. On this box the user key store stopped serving private keys
+# on 2026-08-11 — `certutil -user -store` reports "Missing stored keyset" for the
+# existing cert, `makecert` fails with "Can't create the key of the subject", and
+# `New-SelfSignedCertificate` fails with `NTE_PERM` — so every KMD build died at
+# `signtool-sign` with "No certificates were found that met all the given
+# criteria" (signtool's own `/debug` output: "After Private Key filter, 0 certs
+# were left").
+#
+# `tools/install-helios-kmd.ps1` already creates, signs with and TRUSTS a
+# LocalMachine\My cert of the same subject (it imports it into Root +
+# TrustedPublisher), and machine keys live in a different store that still works.
+# So both tasks below use that certificate — the one the deployed image ends up
+# signed with anyway, since the install script re-signs.
+[tasks.generate-certificate]
+private = true
+command = "powershell"
+args = [
+  "-NoProfile",
+  "-Command",
+  "$c = Get-ChildItem Cert:\\LocalMachine\\My | Where-Object { $_.Subject -eq 'CN=WDRLocalTestCert' -and $_.HasPrivateKey } | Select-Object -First 1; if (-not $c) { throw 'no CN=WDRLocalTestCert with a private key in LocalMachine\\My - run tools\\install-helios-kmd.ps1 once, it creates and trusts one' }; [IO.File]::WriteAllBytes('${WDK_BUILD_OUTPUT_DIRECTORY}/WDRLocalTestCert.cer', $c.RawData); Write-Host \"cargo-make: signing with machine cert $($c.Thumbprint)\"",
+]
+
+[tasks.signtool-sign]
+private = true
+dependencies = ["generate-certificate"]
+command = "signtool"
+# `/sm` selects the machine store; no `/t`, because test signing does not need a
+# timestamp and the timestamp server is one more thing that can be unreachable.
+args = [
+  "sign",
+  "/v",
+  "/fd",
+  "SHA256",
+  "/sm",
+  "/s",
+  "My",
+  "/n",
+  "WDRLocalTestCert",
+  "${WDK_BUILD_SIGNTOOL_SIGN_INPUT_FILE}",
+]
