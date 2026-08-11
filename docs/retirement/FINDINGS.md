@@ -1280,3 +1280,79 @@ validator are all still correct to write — the contract does not move. What A3
 memory whose contents the host and guest agree on. Two candidate mechanisms, both
 KMD-side and both small, are recorded in ROADMAP under "the HVM1 CPU-view
 binding".
+
+---
+
+## F15 — VidMm places the role-1 HVM1 pool in the **aperture**, not HLM1, and the segment flag shape does not change that. `NOTIFY_RESIDENCY` is the hook; every observation arrives at PASSIVE.
+
+**Measured 2026-08-11 on KMD 22.22.272.0**, the K2a deploy-1 instrument, one
+`hts1_session_probe.exe` run per arm, counters zeroed at each StartDevice.
+
+### The reading
+
+```
+HlElig=1   HlPlN=102  HlPlOp=15  HlPlSg=1  HlPlPg=640  HlPlLn=16384
+HlOpMs=0x8B20  HlSgMs=0x7  HlPtSg=0  HlPtPg=6466528
+HlEirq=0   HlEwin=0   HlFrgn=35  HlEvic=2  HlEnb=1
+```
+
+`HlOpMs = 0x8B20` names every paging operation that touched the pool:
+**MAP_APERTURE_SEGMENT(5), VIRTUAL_TRANSFER(8), VIRTUAL_FILL(9),
+UPDATE_PAGE_TABLE(11), NOTIFY_RESIDENCY(15)** — and nothing else. In particular
+**no `NOTIFY_RESIDENCY2`(21), no `TRANSFER2`(23), no `FILL2`(24)**, the three the
+design ranked most likely.
+
+### Four answers, each of which changes the next unit
+
+1. ⭐ **`NOTIFY_RESIDENCY` (15) is the hook.** It fires for the pool, it carries
+   `hAllocation` + a `D3DGPU_PHYSICAL_ADDRESS`, and `HlPlOp = 15` says it wrote
+   the last placement. `HlPlLn = 16384` pages = exactly the 64 MiB pool, so the
+   descriptor describes the whole allocation.
+2. ⭐ **`HlEirq = 0` — every observation arrived at PASSIVE_LEVEL.** This is the
+   safety answer deploy 2 needed: `map_blob_at` needs a host round-trip, and the
+   arm that carries the placement can legally issue one. Had this read nonzero the
+   binding would have needed a deferral design.
+3. ⛔ **The placement is segment 1, the APERTURE — not HLM1.** `HlPlSg = 1`, and
+   the GPU page table agrees: `HlPtSg = 0`, i.e. PTE[0] maps the pool out of
+   **system memory**. `hvm1_placement` keeps the aperture in
+   `supported_segments` (§10.7:2001-2002's "system-residency physical-address
+   domain") and VidMm takes it. `preferred_segment = HLM1` is a hint, not a
+   choice. This is exactly the C5 hazard the design flagged and deferred.
+4. ⛔ **The flag flip does not fix it.** Re-run at `BarSegFlags = 0x02` — HLM1's
+   exact shape, `BarF` moved 28 → 2, `SegRule = 0`, `CM_PROB_NONE`, probe still
+   15/15 — reproduces the reading **identically**: `HlPlSg = 1`, `HlPtSg = 0`,
+   same op mask, same counts, only VidMm's chosen offset differs (640 → 128
+   pages). The hypothesis that segment 2 being `CpuVisible = 0` was what forced
+   the aperture is **falsified**. One `pnputil /restart-device`, no rebuild —
+   which is the whole reason rule 8 requires the opposite value to stay reachable.
+
+⇒ **Deploy 2's first move is not the bind and not the flag.** It is making VidMm
+place the allocation in HLM1 at all, and the only remaining lever is the one the
+plan deferred: drop `HELIOS_SEGMENT_ID_APERTURE` from `hvm1_placement`'s
+supported set. That risks a hard `MakeResident` failure, so it belongs behind a
+knob defaulting to today's measured behaviour.
+
+### Bound — what this does NOT establish
+
+`HlSgMs = 0x7` says the pool was named on segments **0, 1 and 2** across its life,
+so something did name segment 2; the placement triple is last-writer-wins and only
+records that the LAST placement-bearing observation was the aperture. A per-(op,
+segment) histogram would be needed to say the pool was never in HLM1. What is not
+in doubt is the page table: `HlPtSg = 0` is where the GPU was told to find it.
+
+⚠ `HlFrgn = 35` and `HlEnb = 1` are both expected, not faults: 35 observations
+named a segment this allocation is not bound to (the aperture maps, by
+construction), and the pool died unbound because nothing binds yet.
+
+### Two things the instrument proved about itself
+
+* `HlEvic = 2` — `NOTIFY_RESIDENCY` fires in **both** directions and the eviction
+  is the last notification a destroyed allocation gets. Without the `Resident()`
+  check the review added, those two would have overwritten the residency answer
+  with a zeroed address and this finding would have read
+  "NOTIFY_RESIDENCY carries no placement" — the exact inverse.
+* Every `Hl*` value read **0** after a `pnputil /restart-device`, which is the
+  second StartDevice in one image load. The first version called
+  `CounterBlock::flush()`, whose own throttle writes nothing in that case; the
+  repaired `hlm1_reset_counters` writes literal zeros. Validated on the target,
+  not argued.

@@ -639,10 +639,32 @@ ops 0-15 and silent above them.
 **Deploy 1 is an instrument, not a fix** — which operation carries an HVM1
 placement is not knowable read-only, and `PgDi` cannot answer it (F14's
 correction). The `Hl*` counter block records, per HLM1-eligible allocation, the op
-mask, the segment mask, the last placement (segment / page / length), the
-`UPDATE_PAGE_TABLE` PTE view that is uninstrumented today, the IRQL each arrived
-at, and whether any offset would have failed the window bound. Atomics only, above
-the IRQL gate, every arm returning exactly what it returned before.
+mask, the segment mask, the last placement (segment / page / length) **with the
+operation that produced it**, the `UPDATE_PAGE_TABLE` PTE view that is
+uninstrumented today, the IRQL each arrived at, and whether any offset would have
+failed the window bound. Atomics only, above the IRQL gate, every arm returning
+exactly what it returned before.
+
+⭐ **DEPLOYED AND MEASURED — KMD 22.22.272.0, `FINDINGS.md` F15.** Four answers:
+
+* **`NOTIFY_RESIDENCY` (15) is the hook**, and `NOTIFY_RESIDENCY2`/`TRANSFER2`/
+  `FILL2` — the three the design ranked most likely — **never fire**.
+* **`HlEirq = 0`**: every observation arrives at PASSIVE, so the bind may issue
+  its host round-trip from that arm. That was deploy 2's open safety question.
+* ⛔ **VidMm places the pool in the APERTURE, not HLM1** (`HlPlSg = 1`, and the
+  page table maps it from system memory, `HlPtSg = 0`). `preferred_segment` is a
+  hint; the aperture is in `hvm1_placement`'s supported set and VidMm takes it.
+* ⛔ **`BarSegFlags = 0x02` does not change that.** Measured, both arms,
+  `CM_PROB_NONE`, probe 15/15 in each: the reading is identical. The hypothesis
+  that a `CpuVisible = 0` segment 2 was forcing the aperture is **falsified**, at
+  the cost of one `pnputil /restart-device` and no rebuild — which is what rule 8
+  keeping the opposite value reachable buys.
+
+⇒ **Deploy 2's first move is neither the bind nor the flag.** It is dropping
+`HELIOS_SEGMENT_ID_APERTURE` from `hvm1_placement`'s supported set so VidMm has
+to choose HLM1 or fail residency loudly — behind a knob defaulting to today's
+measured behaviour, because a hard `MakeResident` failure would block A3 entirely.
+Only then are the flag flip and the `map_blob_at` bind worth landing.
 4. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
    correction below before touching it. Not on the critical path.
 5. **K1 (demolition), K3** — and `SURFACE` last of all (`OWNERSHIP.md` §3).
