@@ -10275,12 +10275,16 @@ pub mod translation_session {
 /// all per-session and `OWNERSHIP.md` §1 forbids interleaving two units' state
 /// in one `pub mod` block.
 pub mod native_render {
+    use helios_protocol::native_render::kernel_dma::{
+        Hnr2DmaReject, Hnr2PhysicalCapability, HELIOS_HNR2_MAX_OUTPUT_PATCHES,
+    };
     use helios_protocol::native_render::{
         admit_render_slot, validate_commit_tables, validate_use_write_operation,
         HeliosNativeRenderPatch, HeliosNativeRenderUse, HeliosNativeRenderV2, Hnr2Accept,
         Hnr2CapacityLimit, Hnr2CapacityRefusal, Hnr2Expect, Hnr2FragmentClass, Hnr2OpenBatch,
         Hnr2Reject, Hnr2TableReject, HELIOS_HNR2_MAX_PATCH_RECORDS, HELIOS_HNR2_MAX_USE_RECORDS,
     };
+    use helios_protocol::wddm::{HeliosOuterSubmitRejection, HeliosOuterSubmitV1};
 
     /// Why a K6 render-path operation was refused.
     ///
@@ -10305,29 +10309,74 @@ pub mod native_render {
         /// with its own checkout); counted so a future caller cannot make the
         /// pool drift silently instead of failing.
         StagingUnderflow,
+        /// A DMA-local physical capability was refused by `protocol`.
+        Dma(Hnr2DmaReject),
+        /// A second [`apply_placement`] produced a different record. §18.2 has
+        /// `DxgkDdiPatch` invoked twice on one DMA buffer, and the second call
+        /// must be a no-op — a disagreement is a defect in the snapshot source,
+        /// never something to overwrite.
+        PlacementNotRepeatable,
+        /// The capability table does not fit the DMA buffer dxgkrnl returned.
+        CapabilityTableTooLarge { needed: u64, capacity: u32 },
+        /// A HOS1 descriptor was refused by `protocol`.
+        OuterSubmit(HeliosOuterSubmitRejection),
     }
 
     impl RenderRefusal {
         /// Stable numeric reason code for a KMD counter / ETW field.
         ///
-        /// `protocol`'s own codes are forwarded verbatim so one registry value
-        /// reads identically on both sides of the boundary; the K6-local arms use
-        /// a range `protocol` does not (`0x06xx`) and the capacity arm a range
-        /// `protocol` declares but does not code (`0x05xx`).
+        /// ⛔ The K6-assigned arms are `0x07xx` (local) and `0x08xx`/`0x09xx`
+        /// (limits `protocol` declares but does not code). They were `0x06xx`
+        /// and `0x05xx`, which are `Hnr2DmaReject`'s and `Hvr1Reject`'s — a
+        /// registry value would have read as two different refusals. Every
+        /// range here is checked pairwise by `refusal_codes_are_nonzero_and_do_not_collide`.
         pub const fn code(self) -> u32 {
             match self {
                 Self::Header(reject) => reject.code(),
                 Self::Table(reject) => reject.code(),
+                Self::Dma(reject) => reject.code(),
                 Self::Capacity(refusal) => match refusal.limit {
-                    Hnr2CapacityLimit::OutstandingSubmissions => 0x0501,
-                    Hnr2CapacityLimit::SlotPoolBytes => 0x0502,
-                    Hnr2CapacityLimit::LiveSnapshots => 0x0503,
-                    Hnr2CapacityLimit::LiveSnapshotBytes => 0x0504,
-                    Hnr2CapacityLimit::SnapshotBytes => 0x0505,
+                    Hnr2CapacityLimit::OutstandingSubmissions => 0x0801,
+                    Hnr2CapacityLimit::SlotPoolBytes => 0x0802,
+                    Hnr2CapacityLimit::LiveSnapshots => 0x0803,
+                    Hnr2CapacityLimit::LiveSnapshotBytes => 0x0804,
+                    Hnr2CapacityLimit::SnapshotBytes => 0x0805,
                 },
-                Self::PatchListCapacityExceeded { .. } => 0x0601,
-                Self::StagingUnderflow => 0x0602,
+                Self::PatchListCapacityExceeded { .. } => 0x0701,
+                Self::StagingUnderflow => 0x0702,
+                Self::PlacementNotRepeatable => 0x0703,
+                Self::CapabilityTableTooLarge { .. } => 0x0704,
+                Self::OuterSubmit(reject) => outer_submit_code(reject),
             }
+        }
+    }
+
+    /// A stable code for a HOS1 rejection. `protocol` gives
+    /// [`HeliosOuterSubmitRejection`] no `code()` — it is the one refusal enum in
+    /// this path that does not carry one — so K6 assigns `0x09xx` here rather
+    /// than letting the counter report a bare "refused".
+    pub const fn outer_submit_code(reject: HeliosOuterSubmitRejection) -> u32 {
+        use HeliosOuterSubmitRejection as R;
+        match reject {
+            R::Magic { .. } => 0x0901,
+            R::AbiVersion { .. } => 0x0902,
+            R::StructSize { .. } => 0x0903,
+            R::PrivateDataSize { .. } => 0x0904,
+            R::PackageGeneration { .. } => 0x0905,
+            R::SessionGeneration { .. } => 0x0906,
+            R::ContextGeneration { .. } => 0x0907,
+            R::EndpointId { .. } => 0x0908,
+            R::NotD3D12VirtualContext { .. } => 0x0909,
+            R::BatchIdZero => 0x090A,
+            R::BatchIdNotIncreasing { .. } => 0x090B,
+            R::Hob1BytesZero => 0x090C,
+            R::Hob1BytesBelowHeader { .. } => 0x090D,
+            R::Hob1BytesAboveLimit { .. } => 0x090E,
+            R::Hob1BytesMismatch { .. } => 0x090F,
+            R::ReservedNonZero { .. } => 0x0910,
+            R::Hob1BatchIdMismatch { .. } => 0x0911,
+            R::Hob1CrcMismatch { .. } => 0x0912,
+            R::Hob1TotalBytesMismatch { .. } => 0x0913,
         }
     }
 
@@ -10572,6 +10621,227 @@ pub mod native_render {
     /// platform half can branch on without importing `protocol`'s enum.
     pub const fn fragment_carries_tables(class: Hnr2FragmentClass) -> bool {
         class.is_commit()
+    }
+
+    // ── the DMA-local capability table ───────────────────────────────────────
+
+    /// One [`Hnr2PhysicalCapability`], as an offset stride.
+    pub const CAPABILITY_RECORD_BYTES: u32 = 48;
+    const _: () = assert!(
+        CAPABILITY_RECORD_BYTES as usize == core::mem::size_of::<Hnr2PhysicalCapability>()
+    );
+
+    /// Where a COMMIT's capability table lives in the DMA buffer dxgkrnl
+    /// returned for that Render.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct CapabilityTablePlan {
+        pub offset: u32,
+        pub count: u32,
+        pub bytes: u32,
+    }
+
+    impl CapabilityTablePlan {
+        /// Byte offset of entry `i`, or `None` past the end.
+        pub const fn entry_offset(&self, i: u32) -> Option<u32> {
+            if i >= self.count {
+                return None;
+            }
+            match i.checked_mul(CAPABILITY_RECORD_BYTES) {
+                Some(delta) => self.offset.checked_add(delta),
+                None => None,
+            }
+        }
+
+        /// Which entry a patch-location `PatchOffset` names, or `None` when the
+        /// offset is outside the table or not on a record boundary.
+        ///
+        /// `DxgkDdiPatch` is handed offsets it must treat as untrusted even
+        /// though this driver wrote them: dxgkrnl owns the buffer in between.
+        pub const fn entry_at_offset(&self, offset: u32) -> Option<u32> {
+            if offset < self.offset {
+                return None;
+            }
+            let delta = offset - self.offset;
+            if delta % CAPABILITY_RECORD_BYTES != 0 {
+                return None;
+            }
+            let index = delta / CAPABILITY_RECORD_BYTES;
+            if index >= self.count {
+                return None;
+            }
+            Some(index)
+        }
+    }
+
+    /// Place a COMMIT's capability table at offset 0 of the DMA buffer.
+    ///
+    /// ⛔ The HNR2 command itself is NOT copied into the DMA buffer, so offset 0
+    /// is free: the worst case is 4096 uses × 48 = 192 KiB of a 256-KiB buffer,
+    /// while command + table together (229 KiB + 192 KiB) would not fit. The
+    /// command's bytes were consumed by the assembler at Render.
+    pub fn plan_capability_table(
+        count: u32,
+        dma_buffer_bytes: u32,
+    ) -> Result<CapabilityTablePlan, RenderRefusal> {
+        if count > HELIOS_HNR2_MAX_OUTPUT_PATCHES {
+            return Err(RenderRefusal::Dma(
+                Hnr2DmaReject::OutputPatchCountTooLarge,
+            ));
+        }
+        let bytes = count as u64 * CAPABILITY_RECORD_BYTES as u64;
+        if bytes > dma_buffer_bytes as u64 {
+            return Err(RenderRefusal::CapabilityTableTooLarge {
+                needed: bytes,
+                capacity: dma_buffer_bytes,
+            });
+        }
+        Ok(CapabilityTablePlan {
+            offset: 0,
+            count,
+            // `bytes <= dma_buffer_bytes: u32` above, so the cast cannot truncate.
+            bytes: bytes as u32,
+        })
+    }
+
+    /// Build one unplaced capability from a use record and the allocation's own
+    /// size, and shape-check it exactly as `protocol` requires at Render.
+    ///
+    /// `allocation_generation` and `allocation_bytes` come from the KMD
+    /// allocation object the OPEN handle resolves to — never from the wire. The
+    /// wire's `expected_allocation_generation` is compared against it by the
+    /// caller, which is what makes a stale batch a refusal instead of a patch.
+    pub fn build_capability(
+        use_record: &HeliosNativeRenderUse,
+        allocation_generation: u64,
+        allocation_bytes: u64,
+    ) -> Result<Hnr2PhysicalCapability, RenderRefusal> {
+        let capability = Hnr2PhysicalCapability {
+            allocation_generation,
+            segment_id: 0,
+            access_flags: use_record.access_flags,
+            physical_address: 0,
+            allocation_offset: 0,
+            byte_length: allocation_bytes,
+            hpm_epoch: 0,
+        };
+        capability
+            .validate_at_render(allocation_bytes)
+            .map_err(RenderRefusal::Dma)?;
+        Ok(capability)
+    }
+
+    /// Snapshot a placement into a capability, idempotently.
+    ///
+    /// Returns whether the record changed. §18.2 invokes `DxgkDdiPatch` twice on
+    /// one DMA buffer, so the second call must find the record already correct
+    /// and write nothing; a *different* placement is [`RenderRefusal::
+    /// PlacementNotRepeatable`] rather than an overwrite, because the source of
+    /// the disagreement is the thing that is broken.
+    ///
+    /// ⚠ `hpm_epoch` stays 0: the KMD placement epoch is K2/K3's and has no
+    /// producer, so `validate_at_submit` cannot run yet. The caller counts that
+    /// (`Nr2NoEpoch`) at the site where the epoch would be read.
+    pub fn apply_placement(
+        capability: &mut Hnr2PhysicalCapability,
+        segment_id: u32,
+        physical_address: u64,
+        allocation_bytes: u64,
+    ) -> Result<bool, RenderRefusal> {
+        if capability.is_placed() {
+            let same = capability.segment_id == segment_id
+                && capability.physical_address == physical_address;
+            return if same {
+                Ok(false)
+            } else {
+                Err(RenderRefusal::PlacementNotRepeatable)
+            };
+        }
+        if segment_id == 0 {
+            // Still unresident. Not a refusal: `DxgkDdiPatch` may legally run
+            // before residency completes, and the record stays legally unplaced.
+            return Ok(false);
+        }
+        let mut candidate = *capability;
+        candidate.segment_id = segment_id;
+        candidate.physical_address = physical_address;
+        candidate
+            .validate_at_render(allocation_bytes)
+            .map_err(RenderRefusal::Dma)?;
+        *capability = candidate;
+        Ok(true)
+    }
+
+    // ── HOS1, the D3D12 virtual-submit descriptor ────────────────────────────
+
+    /// The per-context state a HOS1 descriptor is validated against.
+    ///
+    /// Every field is live KMD state taken from the context object HQA1 attach
+    /// created; none of it is a lookup key and none of it comes from the wire.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct OuterSubmitContext {
+        pub package_generation: u64,
+        pub session_generation: u64,
+        pub context_generation: u64,
+        pub endpoint_id: u32,
+        /// The context's HQA1 arm — `HELIOS_HQA1_FLAG_D3D12_VIRTUAL` for the
+        /// only arm HOS1 exists on.
+        pub arm_flags: u32,
+        last_batch_id: u64,
+    }
+
+    impl OuterSubmitContext {
+        pub const fn new(
+            package_generation: u64,
+            session_generation: u64,
+            context_generation: u64,
+            endpoint_id: u32,
+            arm_flags: u32,
+        ) -> Self {
+            Self {
+                package_generation,
+                session_generation,
+                context_generation,
+                endpoint_id,
+                arm_flags,
+                last_batch_id: 0,
+            }
+        }
+
+        pub const fn last_batch_id(&self) -> u64 {
+            self.last_batch_id
+        }
+    }
+
+    /// Admit one HOS1 descriptor on this context and advance its batch-id
+    /// watermark.
+    ///
+    /// ⛔ [`HeliosOuterSubmitV1::cross_check`] is deliberately NOT called: it
+    /// reads the HOB1 at the submitted GPUVA and §10.4 forbids the KMD from
+    /// dereferencing that address at all. The watermark moves only on success,
+    /// so a refused descriptor cannot burn a batch id.
+    pub fn admit_hos1(
+        context: &mut OuterSubmitContext,
+        record: &HeliosOuterSubmitV1,
+        command_length: u64,
+    ) -> Result<(), RenderRefusal> {
+        let expect = helios_protocol::wddm::HeliosOuterBatchExpectation {
+            package_generation: context.package_generation,
+            session_generation: context.session_generation,
+            context_generation: context.context_generation,
+            endpoint_id: context.endpoint_id,
+            flags: context.arm_flags,
+            // `validate` reads neither of these; they are supplied exactly so a
+            // future rule that does read them finds the live values rather than
+            // a placeholder. The D3D12 virtual arm has no allocation list.
+            max_command_bytes: command_length,
+            last_batch_id: context.last_batch_id,
+            allocation_list_count: 0,
+        };
+        record
+            .validate(&expect, command_length)
+            .map_err(RenderRefusal::OuterSubmit)?;
+        context.last_batch_id = record.batch_id;
+        Ok(())
     }
 
     #[cfg(test)]
@@ -10832,12 +11102,12 @@ pub mod native_render {
             }
             assert_eq!(
                 pool.checkout(1).unwrap_err().code(),
-                0x0501,
+                0x0801,
                 "outstanding-submission cap"
             );
             let mut bytes = StagingPool::new();
             bytes.checkout(HELIOS_HNR2_SLOT_POOL_BYTES).unwrap();
-            assert_eq!(bytes.checkout(1).unwrap_err().code(), 0x0502);
+            assert_eq!(bytes.checkout(1).unwrap_err().code(), 0x0802);
             bytes.retire(HELIOS_HNR2_SLOT_POOL_BYTES).unwrap();
             assert_eq!(bytes.staged_bytes(), 0);
             assert_eq!(bytes.outstanding(), 0);
@@ -10860,36 +11130,434 @@ pub mod native_render {
             assert_eq!(pool.staged_bytes(), 1024);
         }
 
+        /// ⛔ EVERY arm, not a sample. The two K6-assigned ranges used to sit on
+        /// `Hnr2DmaReject`'s `0x06xx` and `Hvr1Reject`'s `0x05xx`, so a registry
+        /// value read as two different refusals; a sampled test could not see it
+        /// because the colliding arms were in different enums.
         #[test]
         fn refusal_codes_are_nonzero_and_do_not_collide() {
-            let codes = [
-                RenderRefusal::Header(Hnr2Reject::MagicMismatch).code(),
-                RenderRefusal::Table(Hnr2TableReject::UseCountMismatch).code(),
+            let cap = |limit| {
                 RenderRefusal::Capacity(Hnr2CapacityRefusal {
-                    limit: Hnr2CapacityLimit::OutstandingSubmissions,
+                    limit,
                     requested: 0,
                     capacity: 0,
                 })
-                .code(),
-                RenderRefusal::Capacity(Hnr2CapacityRefusal {
-                    limit: Hnr2CapacityLimit::SlotPoolBytes,
-                    requested: 0,
-                    capacity: 0,
-                })
-                .code(),
+                .code()
+            };
+            let local = [
                 RenderRefusal::PatchListCapacityExceeded {
                     needed: 0,
                     capacity: 0,
                 }
                 .code(),
                 RenderRefusal::StagingUnderflow.code(),
+                RenderRefusal::PlacementNotRepeatable.code(),
+                RenderRefusal::CapabilityTableTooLarge {
+                    needed: 0,
+                    capacity: 0,
+                }
+                .code(),
+                cap(Hnr2CapacityLimit::OutstandingSubmissions),
+                cap(Hnr2CapacityLimit::SlotPoolBytes),
+                cap(Hnr2CapacityLimit::LiveSnapshots),
+                cap(Hnr2CapacityLimit::LiveSnapshotBytes),
+                cap(Hnr2CapacityLimit::SnapshotBytes),
             ];
+            const TOTAL: usize = 9
+                + EVERY_HEADER_REJECT.len()
+                + EVERY_TABLE_REJECT.len()
+                + EVERY_DMA_REJECT.len()
+                + OUTER_SUBMIT_REJECT_COUNT;
+            let mut codes = [0u32; TOTAL];
+            let mut n = 0;
+            let mut push = |slot: &mut [u32; TOTAL], at: &mut usize, code: u32| {
+                slot[*at] = code;
+                *at += 1;
+            };
+            for code in local {
+                push(&mut codes, &mut n, code);
+            }
+            for reject in EVERY_HEADER_REJECT {
+                push(&mut codes, &mut n, RenderRefusal::Header(reject).code());
+            }
+            for reject in EVERY_TABLE_REJECT {
+                push(&mut codes, &mut n, RenderRefusal::Table(reject).code());
+            }
+            for reject in EVERY_DMA_REJECT {
+                push(&mut codes, &mut n, RenderRefusal::Dma(reject).code());
+            }
+            for reject in every_outer_submit_reject() {
+                push(
+                    &mut codes,
+                    &mut n,
+                    RenderRefusal::OuterSubmit(reject).code(),
+                );
+            }
+            assert_eq!(n, TOTAL, "every refusal arm must be in the collision proof");
             for (i, a) in codes.iter().enumerate() {
-                assert_ne!(*a, 0);
-                for b in &codes[i + 1..] {
-                    assert_ne!(a, b);
+                assert_ne!(*a, 0, "index {i}");
+                for (j, b) in codes.iter().enumerate().skip(i + 1) {
+                    assert_ne!(a, b, "codes {i} and {j} collide at {a:#06x}");
                 }
             }
         }
+
+        // ── the capability table ─────────────────────────────────────────────
+
+        fn placed_env() -> (HeliosNativeRenderUse, u64) {
+            (use_record(0, true), 8192)
+        }
+
+        #[test]
+        fn a_capability_starts_unplaced_and_spans_the_whole_allocation() {
+            let (record, bytes) = placed_env();
+            let cap = build_capability(&record, 0x1_0000_0001, bytes).unwrap();
+            assert!(!cap.is_placed());
+            assert_eq!(cap.allocation_offset, 0);
+            assert_eq!(cap.byte_length, bytes);
+            assert_eq!(cap.hpm_epoch, 0);
+            assert_eq!(cap.physical_address, 0);
+            assert_eq!(cap.access_flags, HELIOS_HNR2_ACCESS_WRITE);
+        }
+
+        #[test]
+        fn a_capability_on_a_zero_byte_or_generationless_allocation_is_refused() {
+            let (record, bytes) = placed_env();
+            assert_eq!(
+                build_capability(&record, 0x1_0000_0001, 0).unwrap_err(),
+                RenderRefusal::Dma(Hnr2DmaReject::ByteLengthZero)
+            );
+            assert_eq!(
+                build_capability(&record, 0, bytes).unwrap_err(),
+                RenderRefusal::Dma(Hnr2DmaReject::AllocationGenerationZero)
+            );
+        }
+
+        #[test]
+        fn placement_is_idempotent_and_a_disagreement_is_refused() {
+            let (record, bytes) = placed_env();
+            let mut cap = build_capability(&record, 7, bytes).unwrap();
+            // Not resident yet: legal, and a no-op rather than a refusal.
+            assert_eq!(apply_placement(&mut cap, 0, 0, bytes), Ok(false));
+            assert!(!cap.is_placed());
+
+            assert_eq!(apply_placement(&mut cap, 1, 0x1000, bytes), Ok(true));
+            assert!(cap.is_placed());
+            let after_first = cap;
+            // §18.2 invokes Patch twice; the second must write nothing.
+            assert_eq!(apply_placement(&mut cap, 1, 0x1000, bytes), Ok(false));
+            assert_eq!(cap, after_first);
+
+            assert_eq!(
+                apply_placement(&mut cap, 2, 0x1000, bytes).unwrap_err(),
+                RenderRefusal::PlacementNotRepeatable
+            );
+            assert_eq!(
+                apply_placement(&mut cap, 1, 0x2000, bytes).unwrap_err(),
+                RenderRefusal::PlacementNotRepeatable
+            );
+            assert_eq!(cap, after_first, "a refused placement must not write");
+        }
+
+        #[test]
+        fn an_unknown_segment_is_refused_rather_than_recorded() {
+            let (record, bytes) = placed_env();
+            let mut cap = build_capability(&record, 7, bytes).unwrap();
+            assert_eq!(
+                apply_placement(&mut cap, 9, 0x1000, bytes).unwrap_err(),
+                RenderRefusal::Dma(Hnr2DmaReject::SegmentUnknown)
+            );
+            assert!(!cap.is_placed(), "a refused segment must not write");
+        }
+
+        #[test]
+        fn the_capability_table_is_addressed_by_offset_in_both_directions() {
+            let plan = plan_capability_table(3, HELIOS_HVC1_DMA_BUFFER_BYTES).unwrap();
+            assert_eq!(plan.offset, 0);
+            assert_eq!(plan.bytes, 3 * CAPABILITY_RECORD_BYTES);
+            assert_eq!(plan.entry_offset(0), Some(0));
+            assert_eq!(plan.entry_offset(2), Some(2 * CAPABILITY_RECORD_BYTES));
+            assert_eq!(plan.entry_offset(3), None);
+            assert_eq!(plan.entry_at_offset(0), Some(0));
+            assert_eq!(plan.entry_at_offset(2 * CAPABILITY_RECORD_BYTES), Some(2));
+            // Not on a record boundary, and past the end: both `None`, never a
+            // rounded-down index into the middle of a record.
+            assert_eq!(plan.entry_at_offset(CAPABILITY_RECORD_BYTES - 1), None);
+            assert_eq!(plan.entry_at_offset(3 * CAPABILITY_RECORD_BYTES), None);
+        }
+
+        #[test]
+        fn the_worst_case_capability_table_fits_the_advertised_dma_buffer() {
+            // 4096 * 48 = 196,608 <= 262,144. This is the arithmetic that lets
+            // the HNR2 arm put the table at offset 0 instead of after the
+            // command, and it must fail the test rather than the target.
+            let plan = plan_capability_table(
+                HELIOS_HNR2_MAX_USE_RECORDS,
+                HELIOS_HVC1_DMA_BUFFER_BYTES,
+            )
+            .unwrap();
+            assert_eq!(plan.bytes, HELIOS_HNR2_MAX_USE_RECORDS * 48);
+            assert!(plan.bytes <= HELIOS_HVC1_DMA_BUFFER_BYTES);
+            // A buffer one byte short is a refusal, not a truncated table.
+            assert_eq!(
+                plan_capability_table(2, 2 * CAPABILITY_RECORD_BYTES - 1).unwrap_err(),
+                RenderRefusal::CapabilityTableTooLarge {
+                    needed: 2 * CAPABILITY_RECORD_BYTES as u64,
+                    capacity: 2 * CAPABILITY_RECORD_BYTES - 1,
+                }
+            );
+        }
+
+        // ── HOS1 ─────────────────────────────────────────────────────────────
+
+        const D3D12_VIRTUAL: u32 = helios_protocol::wddm::HELIOS_HOB1_FLAG_D3D12_VIRTUAL;
+        const D3D11_PHYSICAL: u32 = helios_protocol::wddm::HELIOS_HOB1_FLAG_D3D11_PHYSICAL;
+        const HOB1_HEADER: u32 = helios_protocol::wddm::HELIOS_HOB1_HEADER_BYTES as u32;
+
+        fn hos1(ctx: &OuterSubmitContext, batch_id: u64, hob1_bytes: u32) -> HeliosOuterSubmitV1 {
+            HeliosOuterSubmitV1 {
+                magic: helios_protocol::wddm::HELIOS_HOS1_MAGIC,
+                abi_version: helios_protocol::wddm::HELIOS_HOS1_ABI_VERSION,
+                struct_size: helios_protocol::wddm::HELIOS_HOS1_BYTES,
+                package_generation: ctx.package_generation,
+                session_generation: ctx.session_generation,
+                context_generation: ctx.context_generation,
+                endpoint_id: ctx.endpoint_id,
+                hob1_bytes,
+                batch_id,
+                hob1_crc64: 0,
+                reserved: 0,
+            }
+        }
+
+        fn outer_ctx(arm: u32) -> OuterSubmitContext {
+            OuterSubmitContext::new(PKG, 0x5100, 0x0C7, 3, arm)
+        }
+
+        #[test]
+        fn a_hos1_batch_id_watermark_advances_only_on_success() {
+            let mut ctx = outer_ctx(D3D12_VIRTUAL);
+            let good = hos1(&ctx, 5, HOB1_HEADER);
+            admit_hos1(&mut ctx, &good, HOB1_HEADER as u64).unwrap();
+            assert_eq!(ctx.last_batch_id(), 5);
+
+            for replay in [5u64, 4, 1] {
+                let stale = hos1(&ctx, replay, HOB1_HEADER);
+                assert_eq!(
+                    admit_hos1(&mut ctx, &stale, HOB1_HEADER as u64).unwrap_err(),
+                    RenderRefusal::OuterSubmit(HeliosOuterSubmitRejection::BatchIdNotIncreasing {
+                        found: replay,
+                        last: 5,
+                    })
+                );
+                assert_eq!(ctx.last_batch_id(), 5, "a refusal must not burn a batch id");
+            }
+            let next = hos1(&ctx, 6, HOB1_HEADER);
+            admit_hos1(&mut ctx, &next, HOB1_HEADER as u64).unwrap();
+            assert_eq!(ctx.last_batch_id(), 6);
+        }
+
+        #[test]
+        fn hos1_is_refused_on_the_d3d11_physical_arm() {
+            let mut ctx = outer_ctx(D3D11_PHYSICAL);
+            let record = hos1(&ctx, 1, HOB1_HEADER);
+            assert_eq!(
+                admit_hos1(&mut ctx, &record, HOB1_HEADER as u64).unwrap_err(),
+                RenderRefusal::OuterSubmit(
+                    HeliosOuterSubmitRejection::NotD3D12VirtualContext {
+                        context_flags: D3D11_PHYSICAL
+                    }
+                )
+            );
+        }
+
+        #[test]
+        fn a_hos1_whose_hob1_length_disagrees_with_the_runtime_is_refused() {
+            let mut ctx = outer_ctx(D3D12_VIRTUAL);
+            let record = hos1(&ctx, 1, HOB1_HEADER);
+            assert_eq!(
+                admit_hos1(&mut ctx, &record, HOB1_HEADER as u64 + 8).unwrap_err(),
+                RenderRefusal::OuterSubmit(HeliosOuterSubmitRejection::Hob1BytesMismatch {
+                    found: HOB1_HEADER,
+                    command_length: HOB1_HEADER as u64 + 8,
+                })
+            );
+            let short = hos1(&ctx, 1, HOB1_HEADER - 1);
+            assert_eq!(
+                admit_hos1(&mut ctx, &short, HOB1_HEADER as u64 - 1).unwrap_err(),
+                RenderRefusal::OuterSubmit(HeliosOuterSubmitRejection::Hob1BytesBelowHeader {
+                    found: HOB1_HEADER - 1,
+                    header_bytes: helios_protocol::wddm::HELIOS_HOB1_HEADER_BYTES,
+                })
+            );
+        }
+
+        #[test]
+        fn a_hos1_naming_another_context_is_refused_on_every_identity_field() {
+            let mut ctx = outer_ctx(D3D12_VIRTUAL);
+            let base = hos1(&ctx, 1, HOB1_HEADER);
+            let mut wrong_session = base;
+            wrong_session.session_generation ^= 1;
+            let mut wrong_context = base;
+            wrong_context.context_generation ^= 1;
+            let mut wrong_endpoint = base;
+            wrong_endpoint.endpoint_id ^= 1;
+            let mut wrong_package = base;
+            wrong_package.package_generation ^= 1;
+            for record in [wrong_session, wrong_context, wrong_endpoint, wrong_package] {
+                assert!(admit_hos1(&mut ctx, &record, HOB1_HEADER as u64).is_err());
+                assert_eq!(ctx.last_batch_id(), 0);
+            }
+            admit_hos1(&mut ctx, &base, HOB1_HEADER as u64).unwrap();
+        }
+    }
+
+    /// Every [`Hnr2Reject`], for the code-collision proof. A `match`-free list
+    /// cannot be checked exhaustively by the compiler, so the count is asserted
+    /// against `protocol`'s own highest code instead.
+    #[cfg(test)]
+    const EVERY_HEADER_REJECT: [Hnr2Reject; 53] = [
+        Hnr2Reject::MagicMismatch,
+        Hnr2Reject::AbiVersionMismatch,
+        Hnr2Reject::HeaderSizeMismatch,
+        Hnr2Reject::PackageGenerationUnset,
+        Hnr2Reject::PackageGenerationMismatch,
+        Hnr2Reject::FlagBitsUnknown,
+        Hnr2Reject::BatchTokenZero,
+        Hnr2Reject::BatchTokenNotIncreasing,
+        Hnr2Reject::BatchTokenMismatch,
+        Hnr2Reject::BatchAlreadyOpen,
+        Hnr2Reject::NoOpenBatch,
+        Hnr2Reject::FragmentCountZero,
+        Hnr2Reject::FragmentCountTooLarge,
+        Hnr2Reject::FragmentCountChanged,
+        Hnr2Reject::FragmentIndexOutOfRange,
+        Hnr2Reject::FragmentIndexOutOfOrder,
+        Hnr2Reject::BeginFlagMisplaced,
+        Hnr2Reject::CommitFlagMisplaced,
+        Hnr2Reject::TotalPayloadZero,
+        Hnr2Reject::TotalPayloadTooLarge,
+        Hnr2Reject::TotalPayloadChanged,
+        Hnr2Reject::FragmentPayloadZero,
+        Hnr2Reject::FragmentOffsetMismatch,
+        Hnr2Reject::FragmentPayloadOverrun,
+        Hnr2Reject::NonFinalFragmentExhaustsPayload,
+        Hnr2Reject::FinalFragmentShort,
+        Hnr2Reject::UseRecordsBeforeCommit,
+        Hnr2Reject::PatchRecordsBeforeCommit,
+        Hnr2Reject::FullPayloadCrcBeforeCommit,
+        Hnr2Reject::AllocationListNotEmpty,
+        Hnr2Reject::UseRecordCountTooLarge,
+        Hnr2Reject::PatchRecordCountTooLarge,
+        Hnr2Reject::UseRecordCountMismatch,
+        Hnr2Reject::PatchWithoutUse,
+        Hnr2Reject::UseRecordOffsetMismatch,
+        Hnr2Reject::PatchRecordOffsetMismatch,
+        Hnr2Reject::CommandLengthOverflow,
+        Hnr2Reject::CommandLengthMismatch,
+        Hnr2Reject::ReplyFlagOutsideCommit,
+        Hnr2Reject::ReplyIndexNotSentinel,
+        Hnr2Reject::ReplyOffsetNotZero,
+        Hnr2Reject::ReplyCapacityNotZero,
+        Hnr2Reject::ReplySlotGenerationNotZero,
+        Hnr2Reject::ReplyIndexOutOfRange,
+        Hnr2Reject::ReplySlotGenerationZero,
+        Hnr2Reject::ReplyCapacityTooSmall,
+        Hnr2Reject::ReplyCapacityTooLarge,
+        Hnr2Reject::ReplyOffsetMisaligned,
+        Hnr2Reject::ReplySlotIndexOutOfRange,
+        Hnr2Reject::ReplyRangeCrossesSlot,
+        Hnr2Reject::CommandLengthAboveDmaBuffer,
+        Hnr2Reject::CommandBufferBelowAdvertisedMinimum,
+        Hnr2Reject::PatchLocationListInNotEmpty,
+    ];
+
+    #[cfg(test)]
+    const EVERY_TABLE_REJECT: [Hnr2TableReject; 20] = [
+        Hnr2TableReject::UseCountMismatch,
+        Hnr2TableReject::PatchCountMismatch,
+        Hnr2TableReject::AllocationListTooLarge,
+        Hnr2TableReject::AccessFlagsUnknownBits,
+        Hnr2TableReject::AccessFlagsZero,
+        Hnr2TableReject::AllocationGenerationZero,
+        Hnr2TableReject::AllocationIndexOutOfRange,
+        Hnr2TableReject::AllocationUsedTwice,
+        Hnr2TableReject::PatchRunNotContiguous,
+        Hnr2TableReject::PatchRunOutOfRange,
+        Hnr2TableReject::PatchRunLeavesGap,
+        Hnr2TableReject::PatchAllocationMismatch,
+        Hnr2TableReject::PatchOperandKindUnknown,
+        Hnr2TableReject::PatchOperandWidthMismatch,
+        Hnr2TableReject::PatchOffsetMisaligned,
+        Hnr2TableReject::PatchOffsetOutOfPayload,
+        Hnr2TableReject::PatchReservedNonZero,
+        Hnr2TableReject::WriteOperationMismatch,
+        Hnr2TableReject::ReplyIndexNotWritable,
+        Hnr2TableReject::ReplyIndexHasNoUseRecord,
+    ];
+
+    #[cfg(test)]
+    const EVERY_DMA_REJECT: [Hnr2DmaReject; 13] = [
+        Hnr2DmaReject::OutputPatchCountNotUseCount,
+        Hnr2DmaReject::OutputPatchCountTooLarge,
+        Hnr2DmaReject::AllocationGenerationZero,
+        Hnr2DmaReject::AccessFlagsInvalid,
+        Hnr2DmaReject::ByteLengthZero,
+        Hnr2DmaReject::RangeOutOfAllocation,
+        Hnr2DmaReject::UnplacedCapabilityNotZeroed,
+        Hnr2DmaReject::SegmentUnknown,
+        Hnr2DmaReject::CapabilityUnplacedAtSubmit,
+        Hnr2DmaReject::AllocationGenerationStale,
+        Hnr2DmaReject::PlacementEpochStale,
+        Hnr2DmaReject::SegmentNotCurrent,
+        Hnr2DmaReject::PhysicalAddressMisaligned,
+    ];
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    const OUTER_SUBMIT_REJECT_COUNT: usize = 19;
+
+    #[cfg(test)]
+    fn every_outer_submit_reject() -> [HeliosOuterSubmitRejection; OUTER_SUBMIT_REJECT_COUNT] {
+        use HeliosOuterSubmitRejection as R;
+        [
+            R::Magic { found: 0 },
+            R::AbiVersion { found: 0 },
+            R::StructSize { found: 0 },
+            R::PrivateDataSize { found: 0 },
+            R::PackageGeneration {
+                found: 0,
+                expected: 0,
+            },
+            R::SessionGeneration {
+                found: 0,
+                expected: 0,
+            },
+            R::ContextGeneration {
+                found: 0,
+                expected: 0,
+            },
+            R::EndpointId {
+                found: 0,
+                expected: 0,
+            },
+            R::NotD3D12VirtualContext { context_flags: 0 },
+            R::BatchIdZero,
+            R::BatchIdNotIncreasing { found: 0, last: 0 },
+            R::Hob1BytesZero,
+            R::Hob1BytesBelowHeader {
+                found: 0,
+                header_bytes: 0,
+            },
+            R::Hob1BytesAboveLimit { found: 0, limit: 0 },
+            R::Hob1BytesMismatch {
+                found: 0,
+                command_length: 0,
+            },
+            R::ReservedNonZero { found: 0 },
+            R::Hob1BatchIdMismatch { hos1: 0, hob1: 0 },
+            R::Hob1CrcMismatch { hos1: 0, hob1: 0 },
+            R::Hob1TotalBytesMismatch { hos1: 0, hob1: 0 },
+        ]
     }
 }
