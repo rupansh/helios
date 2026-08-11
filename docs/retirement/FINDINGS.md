@@ -1498,15 +1498,22 @@ arriving with numbers attached. It is not a new gap; it is F5's gap, measured.
    range, which §10.7:2013-2015's "`BaseAddress`, `Size`, `CommitLimit` … match
    the one negotiated local physical range" forbids and which is a latent host
    subregion overlap regardless of this unit. Registry-only, graded by `HlRdbk`.
-2. **Guest-backed storage for roles 1 and 3.** Upstream venus keeps reply and
-   feedback storage in GUEST shmem (`vn_renderer_shmem`), not host memory: the
-   host writes into pages the guest owns. Attaching the WDDM allocation's own
-   resident pages to the renderer resource (core virtio-gpu
-   `RESOURCE_ATTACH_BACKING`, not a QEMU-fork feature) inverts the problem — the
-   system-memory view dxgkrnl already hands out **becomes** the payload, and no
-   alias is needed. Roles 2 and 4 are real `VkDeviceMemory` and still need host
-   memory. ⚠ Needs re-attach on placement transition, which is HPM1's job under
-   another name, but entirely inside the guest.
+2. ⛔ ~~**Guest-backed storage for roles 1 and 3.**~~ **FALSIFIED 2026-08-11 from
+   the ICD's own source — this option is dead and the claim behind it was wrong.**
+   Upstream venus does NOT keep reply/feedback storage in guest shmem; it
+   explicitly REJECTED that, for Helios' exact reason.
+   `icd/mesa/src/virtio/vulkan/vn_renderer_virtgpu.c:1535-1556`,
+   `virtgpu_init_shmem_blob_mem`: "VIRTGPU_BLOB_MEM_GUEST allocates from the guest
+   system memory. They are logically contiguous in the guest but are sglists
+   (iovecs) in the host. That makes them slower to process in the host. **With host
+   process isolation, it also becomes impossible for the host to access sglists
+   directly.**" … `gpu->shmem_blob_mem = VIRTGPU_BLOB_MEM_HOST3D;`. Helios' own
+   backend does the same and says why (`vn_renderer_helios.c:4180-4187`: "The
+   command-stream ring + cs/reply pools need genuinely host-coherent, mappable
+   memory the renderer can both read and write"), and host process isolation is
+   unconditional here — `qemu-helios/hw/display/virtio-gpu-virgl.c:1546-1548` sets
+   `VIRGL_RENDERER_VENUS | VIRGL_RENDERER_RENDER_SERVER` for any venus device.
+   ⇒ **All four roles are host memory. The problem does not invert.**
 3. **Un-decline HPM1** (F5). The design's own mechanism, blocked on the parked
    QEMU memory lane.
 4. **Accept the paging-transfer copy for roles 1 and 3.** Closer to §10.7 than it
@@ -1523,3 +1530,109 @@ configurations tried. Arm 9's `MapCpuHostAperture` route is refuted only in the
 weak sense: the DDI was never called, and the `Ch*` block is flushed on refusals
 and mode sets, so "never called" is inference from `ChEa = 0` (a failure entry,
 whose increment forces a flush) rather than from a positive trace.
+
+## F17 — The escape-free CPU view is a WDDM **2.9** callback pair, and the driver declares **2.1**. K2a is not a memory-model problem; it is downstream of the version uplift the retirement already plans.
+
+**Researched 2026-08-11** (30 candidate mechanisms across six corpora, 29 refuted,
+1 survivor; the shipping-kit and ICD citations below re-verified by hand). This
+finding supersedes F16's recommendation section.
+
+### The survivor
+
+`DXGKCB_CREATEPHYSICALMEMORYOBJECT` + `DXGKCB_MAPPHYSICALMEMORY`. Verified in the
+shipping WDK **28000** kit on the target:
+
+```
+Include\10.0.28000.0\shared\d3dkmddi.h:10118  DXGK_PHYSICAL_MEMORY_TYPE
+                                      :10123    DXGK_PHYSICAL_MEMORY_TYPE_IO_SPACE
+                                      :10129    DXGK_ACCESS_MODE_USER_MODE
+                                      :10183  DXGKCB_CREATEPHYSICALMEMORYOBJECT
+                                      :10219  DXGKCB_MAPPHYSICALMEMORY
+```
+
+`Type = IO_SPACE` with `IOSpace.BaseAddress` = the blob's window guest-physical
+address, `CacheType = WRITE_COMBINED`, then `AccessMode = USER_MODE` — dxgkrnl does
+the mapping the Escape does by hand today, and Microsoft states that intent in
+terms: "the ability to map CPU virtual addresses from the physical memory in both
+user mode and kernel mode, with a specified cache type" and "The ability to express
+IO space ranges is also required"
+(`windows-driver-docs-research-only/…/display/iommu-dma-remapping.md:137,141`).
+
+### ⛔ And it is gated above the level this driver reports
+
+```
+Include\10.0.28000.0\km\dispmprt.h:2290  #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_9)
+                                  :2292    DXGKCB_CREATEPHYSICALMEMORYOBJECT DxgkCbCreatePhysicalMemoryObject;
+                                  :2294    DXGKCB_MAPPHYSICALMEMORY          DxgkCbMapPhysicalMemory;
+                                  :2301  #endif
+```
+
+`kmd_render/src/ddi/wddm_surface.rs:64` declares `WddmSurface::Wddm2_1GpuMmu`, i.e.
+`DXGKDDI_INTERFACE_VERSION_WDDM2_1` (`:75`). **No callback in the 2.9 block has
+ever been invoked by this driver.** So the mechanism sits above what we report and
+below the WDDM 3.2 the retirement is already heading to — `lane-kmd-display.md`
+unit **D3** adds `ddi/mpo3.rs` with the seven MPO3 slots, unit **D9** flips
+`SURFACE` to `Wddm3_2GpuMmu` *strictly last*, `doc:2854` rejects a 3.2 package
+whose MPO3/fence surface is incomplete (no 2.1 fallback), and `doc:5079` gates on
+"DWM starts on the 3.2 surface without `CDDisplaySwapChain`/`E_NOTIMPL`". The
+`E_NOTIMPL` recorded at `wddm_surface.rs:25-28` is exactly what D3 removes.
+
+⇒ **K2a's CPU view is downstream of D3 → D9, not a new detour**, unless dxgkrnl
+populates the 2.9 block for a 2.1-declaring driver anyway.
+
+### The ~10-line instrument that sizes the work — and audits a latent over-read
+
+`adapter/mod.rs:354` does `dxgkrnl: unsafe { *dxgkrnl }`, a full copy of the
+`DXGKRNL_INTERFACE` **as bindgen shapes it against the 28000 headers** (576 bytes),
+and **nothing in the driver reads `DXGKRNL_INTERFACE.Size`**. Two things follow, and
+one StartDevice instrument answers both: record `.Size` and the two 2.9 function
+pointers.
+
+* If the pointers are non-NULL at 2.1, K2a unblocks NOW, ahead of D3/D9.
+* If they are NULL, K2a sequences behind the uplift — a real dependency, but a
+  planned one.
+* Either way: if `.Size` < 576 we have been copying past the end of a structure the
+  OS sized for the version we declared. Unaudited since bring-up.
+
+### Two claims this research falsified — both were written earlier the same day
+
+1. ⛔ **Guest-backed storage for roles 1/3 is dead**, and F16's option 2 is struck
+   above: upstream venus explicitly rejected `VIRTGPU_BLOB_MEM_GUEST` for shmem
+   because "with host process isolation, it also becomes impossible for the host to
+   access sglists directly" (`vn_renderer_virtgpu.c:1535-1556`). All four roles are
+   host memory.
+2. ⛔ **Helios' D3D11 desktop does NOT composite through
+   `DxgkDdiMapCpuHostAperture`** — it composites through `HELIOS_ESCAPE_MAP_BLOB`.
+   `CPU_HOST_MAP_COUNT` increments unconditionally at `cpu_host_aperture.rs:304`
+   *before* any segment or eligibility filter and reads **0** on a live composited
+   desktop, and all seven `ChE*` refusal counters are `failure: true` entries whose
+   change forces an immediate flush regardless of the throttle (`diag.rs:444-459`),
+   so `ChEa = 0` is not a flush artifact. F16's arm-9 bound is therefore stronger
+   than F16 claimed, and the "proven aliasing path" this session cited for the
+   aperture was the Escape all along.
+
+⇒ **§17.6's deletion of the CPU host aperture is CORRECT — it serves nothing.**
+`cpu-host-aperature.md:10` scopes the feature to "32bit OS discrete GPUs, which
+don't support resizable BAR", which is not this device. Land the deletion coupled
+with clearing `SupportsCpuHostAperture` from the segment descriptor, and *after* a
+replacement CPU-view channel is chosen — §17.6's stated successor is HPM1, and F5
+declined HPM1.
+
+### Why `Lock2` copies, now with the documented condition
+
+`allocation-usage-tracking.md:36`: "all CPU-accessible allocations in
+non-CPU-accessible memory segments must contain an aperture segment in their
+supported segment set. **This requirement guarantees that VidMm is able to place
+the allocation within system memory and provide a virtual address**", and `:41`
+"CPU-accessible allocations are backed by **section objects** that can't point
+directly to the GPUs frame buffer." F16's arms 1/4/9 are that guarantee being
+honoured; arms 2/3 (`Hlm1Only=1` → unrecoverable page-in) are its other half. The
+one unconditional promise of a direct pointer, `:35`, is scoped to "a fully
+CPU-accessible memory segment **(resized using the resizable BAR)**" — and
+virtio-gpu exposes no PCIe Resizable BAR capability. ⚠ INFERENCE, not yet measured:
+the field that records VidMm's own verdict is
+`D3DKMT_QUERYSTATISTICS_SEGMENT_INFORMATION::SegmentProperties.FullyCPUVisible`
+(`shared/d3dkmthk.h:4119`, inside the 3.2 gate at `:4117`). `tools/vidmm_tracking_probe.c:275-292`
+already issues the query per segment id; adding four fields to its printout is the
+cheapest open measurement in this finding — user-mode recompile only, no KMD build,
+no registry write, no reboot.
