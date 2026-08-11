@@ -110,8 +110,13 @@ These are named plainly because the manifest is wrong, not because the work is o
 
 ### 2.5 WDK binding facts verified offline
 
-`tmp/dxgk_bindings.rs` (100741 lines, generated from the **26100** WDK) is the
-offline struct-shape oracle. Confirmed shapes the implementer will need:
+`tmp/dxgk_bindings.rs` is the offline struct-shape oracle. ⚠ **REFRESHED
+2026-08-11**: it is now 106,125 lines generated from **10.0.28000.0**, the kit the
+driver actually builds against; the copy that produced §2.5's shapes below was
+2026-07-08 / **26100** and three claims derived from it were falsified (see
+blocker 3 and `tmp/dxgk_bindings.README.md`). The shapes below were confirmed
+against the old copy and have NOT been re-confirmed. Confirmed shapes the
+implementer will need:
 
 ```
 DXGKARG_CHECKMULTIPLANEOVERLAYSUPPORT3 {
@@ -302,12 +307,18 @@ in `tools/`. **Owner decision required** before D9 starts.
 The doc's baseline is WDK **28000.2526** (`doc:97`, `doc:4649-4652`,
 `doc:4461`). `kmd_render/build.rs` binds against whatever WDK
 `Config::from_env_auto()` finds, and the checked-in `tmp/dxgk_bindings.rs` was
-generated from **26100** (its comment at `build.rs:28-34` says so; the file's
-`DXGKDDI_INTERFACE_VERSION = 69639` is 26100's WDDM-3.2 maximum). Every MPO3
-struct shape quoted in §2.5 is therefore *26100* truth. If the VM's WDK is not
-28000, the audit cannot "cover every field through WDDM 3.2" for the mandated
-layout, and any 28000-only field is invisible. **Verify the installed WDK on the
-VM before D2/D3 start.** → **CROSS-LANE REQUEST** to core (`build.rs` /
+generated from **26100**. Every MPO3 struct shape quoted in §2.5 is therefore
+*26100* truth.
+
+⭐ **RESOLVED 2026-08-11, and it was a real blocker, not a theoretical one.** The
+VM has kits 22621 / 26100 / **28000** installed and `wdk-build` selects 28000
+(`TOOLCHAIN.md` §2.1). `tmp/dxgk_bindings.rs` has been regenerated from that kit
+and its provenance recorded in `tmp/dxgk_bindings.README.md`. The 26100 copy was
+not merely older — it disagreed: `DXGK_OPERATION_TRANSFER2`/`FILL2`/
+`DISCARD_CONTENT2` (23/24/25) do not exist in it, and
+`DXGK_BUILDPAGINGBUFFER_NOTIFYRESIDENCY2` has a different shape. `FINDINGS.md`
+F15 records what that cost. **Re-confirm §2.5's shapes against the new copy
+before D2/D3 start.** → **CROSS-LANE REQUEST** to core (`build.rs` /
 toolchain).
 
 **4. `DXGK_MULTIPLANE_OVERLAY_PLANE3` has no `Enabled` field, and the doc

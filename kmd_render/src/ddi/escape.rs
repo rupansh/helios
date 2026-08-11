@@ -181,7 +181,7 @@ fn escape_device_gone(de: crate::error::NotStarted) -> NTSTATUS {
 }
 
 /// `D3DDDI_ESCAPEFLAGS` bit positions, verified against the generated bitfield
-/// order in `tmp/dxgk_bindings.rs:14066-14103`. `__bindgen_anon_1.Value` is the
+/// order (grep `_D3DDDI_ESCAPEFLAGS`). `__bindgen_anon_1.Value` is the
 /// union's `UINT` view, so a named mask against `.Value` is the stable,
 /// layout-independent way to test a documented bit — the same convention
 /// `query_driver_caps` uses for the cap unions.

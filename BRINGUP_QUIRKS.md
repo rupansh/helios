@@ -266,6 +266,37 @@ When changing the VM launch / device set, STOP and let the user drive it (CLAUDE
   commands, so allocation destroy owns the detach/unref. This targets host log noise like
   `virgl_cmd_resource_unref: resource does not exist` / `ctrl 0x102 error 0x1203`.
 
+## 6d. `tmp/dxgk_bindings.rs` is a COPY, and it went stale for a month (2026-08-11)
+
+The DDI struct-shape oracle everyone reads on the Linux side is a hand-copied
+snapshot of bindgen output. `tmp/` is `.gitignore`d, so it is invisible to review,
+survives no clone, and nothing detects that it has diverged from the kit
+`kmd_render/build.rs` actually binds against.
+
+It diverged. The copy was generated **2026-07-08 from WDK 26100** and sat there
+while the build moved to **28000** (`TOOLCHAIN.md` §2.1). Three claims derived
+from it were wrong:
+
+* `DXGK_OPERATION_TRANSFER2` / `FILL2` / `DISCARD_CONTENT2` are ordinals
+  **23/24/25** in the shipping kit and are absent from 26100.
+  `protocol/src/physical_memory.rs` recorded §10.7's TRANSFER2/FILL2 as "=
+  `VIRTUAL_TRANSFER`/`VIRTUAL_FILL`, not new ordinals" — falsified.
+* `DXGK_BUILDPAGINGBUFFER_NOTIFYRESIDENCY2` has **no `PhysicalAddress` and no
+  `SizeInPages`** in 28000; the old copy's `{PhysicalAddress | Mdl}` pointer union
+  does not exist, and a whole wild-pointer-safety argument was written about it.
+* Code written against the old shapes **failed to compile** on the first VM
+  build. That is the only reason any of it was caught.
+
+⇒ **A struct shape read from that file is a hypothesis until the VM compiles
+against it.** Provenance, the refresh command and a hash-based staleness check
+now live beside it in `tmp/dxgk_bindings.README.md` — which is itself untracked,
+so this section is the tracked pointer to it.
+
+⚠ Line-number citations of the form `tmp/dxgk_bindings.rs:NNNNN` across the tree
+predate the refresh and no longer land. They were citing a kit the driver does
+not build against, so they were misleading before the refresh, not after it.
+**Cite the symbol, not the line** — `grep -n 'pub struct _DXGKARG_FOO'`.
+
 ## 7. Leave the VM clean
 
 When pausing: remove any temp debug code (spin-gates, int3), rebuild (§1 purge!), repackage +

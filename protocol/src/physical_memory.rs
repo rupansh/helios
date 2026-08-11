@@ -494,13 +494,25 @@ pub const HELIOS_HPM1_FLAG_COMMON_MASK: u32 =
 pub enum HpmOperation {
     /// `DXGK_OPERATION_TRANSFER` (0) — classic segment/MDL allocation copy.
     Transfer = 1,
-    /// `DXGK_OPERATION_VIRTUAL_TRANSFER` (8) — the GPUVA-addressed transfer
-    /// §10.7 calls `TRANSFER2`. The device resolves both virtual addresses
-    /// through its own current page tables, so the packet carries no runs.
+    /// `DXGK_OPERATION_VIRTUAL_TRANSFER` (8) — the GPUVA-addressed transfer. The
+    /// device resolves both virtual addresses through its own current page
+    /// tables, so the packet carries no runs.
+    ///
+    /// ⛔ **This is NOT `DXGK_OPERATION_TRANSFER2`, and the name here is only
+    /// §10.7's.** Measured 2026-08-11 against the shipping WDK 28000 bindings:
+    /// `TRANSFER2 = 23` and `FILL2 = 24` are distinct ordinals with their own
+    /// descriptors (`FILL2` is the only operation in the DDI carrying a bare
+    /// `(SegmentId, SegmentAddress)` pair). The earlier claim that §10.7's
+    /// TRANSFER2/FILL2 "are" the virtual ops rather than new ordinals is
+    /// falsified; `FINDINGS.md` F15 has the census. The wire values below are
+    /// unchanged — HPM1 is declined (F5) and this enum has no consumer — but a
+    /// lane reading the old line would have mapped two different operations onto
+    /// one arm.
     Transfer2 = 2,
     /// `DXGK_OPERATION_FILL` (1).
     Fill = 3,
-    /// `DXGK_OPERATION_VIRTUAL_FILL` (9) — §10.7's `FILL2`.
+    /// `DXGK_OPERATION_VIRTUAL_FILL` (9). Not `DXGK_OPERATION_FILL2` (24) — see
+    /// [`HpmOperation::Transfer2`].
     Fill2 = 4,
     /// `DXGK_OPERATION_DISCARD_CONTENT` (2).
     DiscardContent = 5,

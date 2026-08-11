@@ -619,8 +619,10 @@ bind state machine, and the verify vocabulary the acceptance probe and the KMD
 must share one declaration of.
 
 ⭐ **Two things the shipping WDK 28000 bindings say that the tree did not.**
-`tmp/dxgk_bindings.rs` is a 2026-07-08 snapshot and the real bindings are
-regenerated per build; they disagree, and both disagreements matter:
+`tmp/dxgk_bindings.rs` **was** a 2026-07-08 snapshot while the real bindings are
+regenerated per build; they disagreed, and both disagreements mattered. ⭐ The
+snapshot is now **refreshed from the shipping 28000 kit** with its provenance and
+a staleness check in `tmp/dxgk_bindings.README.md`:
 
 * **`TRANSFER2`/`FILL2`/`DISCARD_CONTENT2` are ordinals 23/24/25.**
   `protocol/src/physical_memory.rs:497-504` records §10.7's TRANSFER2/FILL2 as

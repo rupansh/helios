@@ -807,7 +807,7 @@ const PATCH_SLOT_SOURCE: u32 = DXGK_PRESENT_SOURCE_INDEX;
 /// Which arm of `DXGKARG_PRESENT.__bindgen_anon_1` this present carries.
 ///
 /// The union has three arms — `pAllocationList`, `pAllocationInfo` and
-/// `pPresentMultiPlaneOverlayInfo` (`tmp/dxgk_bindings.rs:37178-37182`) — and
+/// `pPresentMultiPlaneOverlayInfo` (grep `_DXGKARG_PRESENT__bindgen_ty_1`) — and
 /// both call sites used to pick `pAllocationList` implicitly, while
 /// `from_allocation_list`'s SAFETY paragraph asserted the array shape without
 /// ever having seen the present flags. Decoding the arm ONCE, from

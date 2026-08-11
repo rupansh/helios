@@ -3802,7 +3802,7 @@ unsafe fn admit_hvm1(
     // `D3DKMT_CREATEALLOCATION` property that dxgkrnl consumes and does NOT
     // surface to the miniport: `DXGKARG_CREATEALLOCATION` carries only
     // `Flags{Resource, Reserved}`, `NumAllocations`, `hResource`, and the two
-    // private-data pairs (`tmp/dxgk_bindings.rs:64212-64219`). So this check
+    // private-data pairs (grep `_DXGKARG_CREATEALLOCATION`). So this check
     // covers the four properties the KMD can see and CANNOT cover the other
     // seven — recorded here rather than implied, because §18.1:4750-4751 asks
     // for a proof this DDI cannot supply.
