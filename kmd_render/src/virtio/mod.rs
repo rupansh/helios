@@ -22,7 +22,7 @@ pub mod hal;
 pub mod pci_caps;
 pub mod venus;
 
-pub(crate) use control_owner::{TransportOwner, TransportOwnerCreateError};
+pub(crate) use control_owner::{TransportOwner, TransportOwnerCreateError, KMD_D2_OWNER_ENABLED};
 
 // `gpu::CompletedBind` is deliberately NOT re-exported: its only consumer names
 // it through inference (`take_completed_bind`), and an unused re-export is a

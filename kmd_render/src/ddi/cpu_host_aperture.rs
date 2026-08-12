@@ -232,7 +232,7 @@ fn note_size_provenance(adapter: &AdapterContext, alloc: &PagingAllocInfo) {
     if alloc.bar_eligible && !alloc.size_provenance.is_host_authoritative() {
         BAR_AP_SIZE_PROVENANCE.fetch_add(1, Ordering::Relaxed);
     }
-    let Ok(Some((_, tracked, _))) = adapter.with_virtio(|v| v.blob_lookup(alloc.resource_id))
+    let Ok(Some((_, tracked, _))) = adapter.canonical_blob_lookup(alloc.resource_id)
     else {
         return;
     };
@@ -357,7 +357,7 @@ pub unsafe extern "C" fn dxgkddi_map_cpu_host_aperture(
             })
             .map(|(a, range)| {
                 adapter
-                    .with_virtio(|v| v.blob_resid_at_offset(range.offset))
+                    .canonical_mapped_resource_at_offset(range.offset)
                     .ok()
                     .flatten()
                     == Some(a.resource_id)
@@ -468,12 +468,14 @@ pub unsafe extern "C" fn dxgkddi_unmap_cpu_host_aperture(
     // (self-healed by the next `map_blob_at`) and holds no token.
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
     let resid = adapter
-        .with_virtio(|v| v.blob_resid_at_offset(offset))
+        .canonical_mapped_resource_at_offset(offset)
         .unwrap_or(None);
     match resid {
         Some(res) => {
             let _ = crate::virtio::ctrl::resource_unmap_blob(passive, adapter, res);
-            let _ = adapter.with_virtio(|v| v.blob_note_unmapped(res));
+            if !crate::virtio::KMD_D2_OWNER_ENABLED {
+                let _ = adapter.with_virtio(|v| v.blob_note_unmapped(res));
+            }
             BAR_AP_UNMAPS.fetch_add(1, Ordering::Relaxed);
         }
         None => {

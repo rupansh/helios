@@ -87,7 +87,7 @@ fn production_linear_scanout(
         && image_id != 0
         && wh == (((width as u64) << 32) | height as u64)
         && adapter
-            .with_virtio(|v| v.resource_is_live(resource_id))
+            .canonical_resource_is_live(resource_id)
             .unwrap_or(false);
     if live {
         let layout = adapter.primary_scanout_layout.load(Ordering::Relaxed);
@@ -385,7 +385,7 @@ unsafe fn dxgkddi_present_inner(
                     crate::diag::record_named_bytes(b"PBsRPS", dg.resource_private_size);
                 }
                 let lk = adapter
-                    .and_then(|adapter| adapter.with_virtio(|v| v.blob_lookup(s.resource_id)).ok());
+                    .and_then(|adapter| adapter.canonical_blob_lookup(s.resource_id).ok());
                 // 0=untracked, else 0x1_0000 | (mapped<<8) | (size in 4KiB pages, low byte)
                 let code = match lk {
                     Some(Some((_owner, size, mapped))) => {
@@ -421,7 +421,7 @@ unsafe fn dxgkddi_present_inner(
                     crate::diag::record_named_bytes(b"PBdRPS", dg.resource_private_size);
                 }
                 let lk = adapter
-                    .and_then(|adapter| adapter.with_virtio(|v| v.blob_lookup(d.resource_id)).ok());
+                    .and_then(|adapter| adapter.canonical_blob_lookup(d.resource_id).ok());
                 let code = match lk {
                     Some(Some((_owner, size, mapped))) => {
                         0x0001_0000 | ((mapped as u32) << 8) | ((size / 4096) as u32 & 0xFF)
@@ -2457,7 +2457,9 @@ unsafe fn program_vidpn_source_inner(
             // the same resource. The exact carried boundary is required before
             // either host selection or Windows flip retirement can proceed.
             let worker = adapter
-                .with_virtio(|v| v.stage_worker_scanout_bind(request, !already_bound))
+                .with_virtio(|v| {
+                    v.stage_worker_scanout_bind(adapter, request, !already_bound)
+                })
                 .unwrap_or(crate::virtio::WorkerBindDispatch::Abandoned);
             let worker_flags = (if already_bound {
                 crate::ddi::scanout_timeline::flag::ALREADY_BOUND

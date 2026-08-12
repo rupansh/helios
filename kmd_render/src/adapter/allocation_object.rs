@@ -47,29 +47,13 @@
 //!    epoch; every generation minted before it fails [`is_current`] from that
 //!    instant, with no enumeration and nothing to scan.
 //!
-//! ⚠ **NOT WIRED YET, AND THIS IS THE EXACT CROSS-LANE REQUEST.** Rule 4's
-//! caller does not exist, so [`invalidate_all`] has no call site today, the epoch
-//! is permanently 1, and [`GENERATION_EPOCH_BUMPS`] can never move. K4 does not
-//! wire it because every candidate call site is in a file K4 does not own
-//! (`docs/retirement/OWNERSHIP.md`), and inventing a back channel to reach one
-//! would be worse than the gap. Concretely, the request is:
-//!
-//! > **K10** — in `ddi/lifecycle.rs::dxgkddi_stop_device` and
-//! > `ddi/lifecycle.rs::dxgkddi_remove_device`, and **K9** — in
-//! > `ddi/submit_command.rs::dxgkddi_reset_from_timeout`, call
-//! > `crate::adapter::allocation_object::invalidate_all()` immediately beside the
-//! > existing `crate::ddi::native_fence::invalidate_all()` call the same units
-//! > are already asked to add (`native_fence.rs`'s own CROSS-LANE note). Both are
-//! > lock-free, allocation-free and callable at any IRQL, so neither constrains
-//! > where in those DDIs the call lands — except that §14:3430 requires the
-//! > generations to be invalidated **together**, so they must not be split across
-//! > two different reset paths, and §18.2:4896-4898 fixes the order: capability
-//! > invalidation precedes the device-lost wakeup.
-//!
-//! ⇒ Until that lands, obligation 4's *reset* half is **implemented but never
-//! exercised** in `K4-CONTRACT.md` §8's third state, not "done". The proof that
-//! the request was honoured is `AcGenEpoch` reading nonzero after a device
-//! restart — and, per CLAUDE.md's evidence rule, moving *this boot*.
+//! Rule 4 is wired at the three adapter-epoch boundaries: StopDevice and
+//! RemoveDevice in `ddi/lifecycle.rs`, plus ResetFromTimeout in
+//! `ddi/submit_command.rs`. Each call is immediately beside
+//! `native_fence::invalidate_all()` and precedes device-lost publication, so
+//! allocation and native-fence generations change as one capability epoch.
+//! Runtime proof still requires `AcGenEpoch` to move on the target; this source
+//! wiring alone is not a runtime-correctness claim.
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -105,9 +89,8 @@ static ALLOCATION_ORDINAL: AtomicU32 = AtomicU32::new(0);
 /// ntoseye/TDR symbol read finds in the module that owns the rule.
 pub(crate) static GENERATION_EXHAUSTED: AtomicU32 = AtomicU32::new(0);
 
-/// Adapter-reset epoch bumps (`AcGenEpoch`). See the NOT-WIRED note above: this
-/// must stay 0 until K9/K10 call [`invalidate_all`], and a nonzero value is
-/// therefore the evidence that the cross-lane request there was honoured.
+/// Adapter-reset epoch bumps (`AcGenEpoch`). A nonzero value is target evidence
+/// that one of the wired Stop/Remove/TDR epoch boundaries executed.
 ///
 /// Published by `ddi/create_allocation.rs::ALLOC_COUNTERS`, a K4-owned PASSIVE
 /// dump site, as a FAILURE entry — so the first create after a reset mirrors it.
@@ -194,16 +177,8 @@ pub(crate) fn is_current(generation: u64) -> bool {
 /// state that is wrong but *loudly* wrong (`GENERATION_EPOCH_BUMPS` stops
 /// moving), unlike a wrap, which is quietly wrong.
 ///
-/// ⚠ Has no caller today, and the module note states the exact cross-lane
-/// request that gives it one (K9's `dxgkddi_reset_from_timeout`, K10's
-/// `dxgkddi_stop_device`/`dxgkddi_remove_device`). Deliberately NOT called from
-/// anywhere K4 owns: `ddi/create_allocation.rs` has no reset path, and inventing
-/// one there would invalidate every generation on an event that is not an adapter
-/// reset.
-#[allow(
-    dead_code,
-    reason = "cross-lane seam: the reset/stop/remove paths (units K9/K10) call this, exactly as native_fence::invalidate_all"
-)]
+/// Called only from the Stop/Remove/TDR adapter-epoch boundaries documented in
+/// the module header; create/open paths must never invalidate the epoch.
 pub(crate) fn invalidate_all() {
     let mut current = ALLOCATION_EPOCH.load(Ordering::Relaxed);
     loop {

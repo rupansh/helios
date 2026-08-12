@@ -2958,6 +2958,51 @@ impl VirtioGpu {
         self.scanout_transport_instance
     }
 
+    pub(crate) fn physical_reset_and_abort(
+        &mut self,
+        expected_instance: u64,
+    ) -> Result<u32, VirtioError> {
+        if expected_instance == 0 || expected_instance != self.scanout_transport_instance {
+            return Err(VirtioError::DeviceError);
+        }
+        self.transport.set_status(DeviceStatus::empty());
+        let mut spins = 0u32;
+        let mut status = self.transport.get_status();
+        while !status.is_empty() && spins < 100_000 {
+            spins += 1;
+            core::hint::spin_loop();
+            status = self.transport.get_status();
+        }
+        if !self.failed {
+            self.latch_failed_and_fail_inflight();
+        }
+        self.abort_windowed_blt_for_terminal_transport();
+        self.purge_all_present_streams();
+        if !status.is_empty() {
+            crate::diag::fault(crate::diag::FaultCounter::StVioR, spins);
+        }
+        Ok(status.bits())
+    }
+
+    /// Reset a fully initialized transport candidate that was never published.
+    /// Any externally published ISR pointer into the candidate must already be
+    /// cleared before this consumes it.
+    /// A candidate whose raw status cannot be proven zero is deliberately leaked:
+    /// its queue/storage allocations must remain valid for any device DMA that
+    /// the failed reset did not stop.
+    pub(crate) fn reset_unpublished_or_retain(
+        mut candidate: Box<Self>,
+    ) -> Result<(), VirtioError> {
+        let instance = candidate.scanout_transport_instance();
+        match candidate.physical_reset_and_abort(instance) {
+            Ok(0) => Ok(()),
+            Ok(_) | Err(_) => {
+                core::mem::forget(candidate);
+                Err(VirtioError::DeviceError)
+            }
+        }
+    }
+
     /// Enqueue a control command without a blocking waiter.  Completion still
     /// consumes and validates the device response in [`Self::drain_used`], owns
     /// `meta` until then, clears the adapter-owned `completion` gate, and wakes
@@ -3888,6 +3933,18 @@ impl VirtioGpu {
             self.fast_bind.selection_ambiguity.observe_malformed(seq);
     }
 
+    fn canonical_resource_is_live(
+        &self,
+        adapter: &crate::adapter::AdapterContext,
+        resource_id: u32,
+    ) -> bool {
+        if crate::virtio::KMD_D2_OWNER_ENABLED {
+            adapter.control_owner().resource_is_live(resource_id)
+        } else {
+            self.resource_is_live(resource_id)
+        }
+    }
+
     /// Gate the PASSIVE worker's synchronous fallback on the same exact
     /// producer boundary as the fast path. The worker retains the WDDM handle
     /// and is woken by the completion DPC; this state holds values only.
@@ -3898,12 +3955,13 @@ impl VirtioGpu {
     /// caller will deliberately not issue.
     pub fn stage_worker_scanout_bind(
         &mut self,
+        adapter: &crate::adapter::AdapterContext,
         request: ScanoutBindRequest,
         reserve_sync_set: bool,
     ) -> WorkerBindDispatch {
         if self.fast_bind.retire_barrier
             || request.resource_id == self.fast_bind.retiring_resource
-            || !self.resource_is_live(request.resource_id)
+            || !self.canonical_resource_is_live(adapter, request.resource_id)
         {
             if self.fast_bind.deferred_worker == Some(request) {
                 self.fast_bind.deferred_worker = None;
@@ -3958,7 +4016,10 @@ impl VirtioGpu {
 
     /// True once the retained PASSIVE fallback can be retried without binding
     /// ahead of its producer.  Consumed by the DPC, which wakes the worker.
-    pub fn take_ready_worker_scanout_bind(&mut self) -> bool {
+    pub fn take_ready_worker_scanout_bind(
+        &mut self,
+        adapter: &crate::adapter::AdapterContext,
+    ) -> bool {
         let Some(request) = self.fast_bind.deferred_worker else {
             return false;
         };
@@ -3982,7 +4043,7 @@ impl VirtioGpu {
             return true;
         }
         if request.resource_id == self.fast_bind.retiring_resource
-            || !self.resource_is_live(request.resource_id)
+            || !self.canonical_resource_is_live(adapter, request.resource_id)
             || !self.scanout_bind_boundary_live(request.carried_watermark)
         {
             self.fast_bind.deferred_worker = None;
@@ -4060,7 +4121,7 @@ impl VirtioGpu {
         &mut self,
         adapter: &crate::adapter::AdapterContext,
     ) -> bool {
-        if !self.take_ready_worker_scanout_bind() {
+        if !self.take_ready_worker_scanout_bind(adapter) {
             return false;
         }
         adapter.signal_hpd();
@@ -4133,7 +4194,7 @@ impl VirtioGpu {
         }
         if self.fast_bind.retire_barrier
             || request.resource_id == self.fast_bind.retiring_resource
-            || !self.resource_is_live(request.resource_id)
+            || !self.canonical_resource_is_live(adapter, request.resource_id)
         {
             return FastBindDispatch::Failed;
         }

@@ -169,6 +169,11 @@ impl VenusClient {
         if self.owned_memory_blobs.len() >= MAX_OWNED_MEMORY_BLOBS {
             return Err(VirtioError::OutOfMemory);
         }
+        if crate::virtio::KMD_D2_OWNER_ENABLED
+            && !adapter.control_owner().backing_creation_open()
+        {
+            return Err(VirtioError::DeviceError);
+        }
         let size = round_up_page(size.max(4096));
         let memory_id = self.new_memory_id();
         {
@@ -203,29 +208,48 @@ impl VenusClient {
         if shareable {
             flags |= VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
         }
-        let res_id = match ctrl::resource_create_blob(
-            self.passive(),
-            adapter,
-            self.ctx_id(),
-            VIRTIO_GPU_BLOB_MEM_HOST3D,
-            flags,
-            // The VkDeviceMemory handle IS the virtio blob_id for a
-            // KMD-created blob. That coupling is deliberate, so the raw value
-            // crosses the transport boundary here.
-            memory_id.get(),
-            size,
-        ) {
+        // The VkDeviceMemory handle IS the virtio blob_id for a KMD-created
+        // blob. Under dormant KMD D2, transfer its finalizer into the canonical
+        // resource row before CREATE can become ambiguous. The callback uses
+        // this already-held Venus client, so it neither recurses into the mutex
+        // nor runs under the owner spinlock.
+        let created = if crate::virtio::KMD_D2_OWNER_ENABLED {
+            ctrl::resource_create_blob_with_finalizer(
+                self.passive(),
+                adapter,
+                self.ctx_id(),
+                VIRTIO_GPU_BLOB_MEM_HOST3D,
+                flags,
+                memory_id.get(),
+                size,
+                crate::virtio::control_owner::ResourceBackingFinalizer::memory(memory_id.get()),
+                |finalizer| ctrl::finalize_resource_backing_with_client(self, adapter, finalizer),
+            )
+        } else {
+            ctrl::resource_create_blob(
+                self.passive(),
+                adapter,
+                self.ctx_id(),
+                VIRTIO_GPU_BLOB_MEM_HOST3D,
+                flags,
+                memory_id.get(),
+                size,
+            )
+        };
+        let res_id = match created {
             Ok(resource_id) => resource_id,
             Err(e) => {
-                // The Vulkan allocation exists but never became an owned blob.
-                // Reclaim it through the raw object path; registry-aware
-                // `free_memory_blob` is reserved for successfully published
-                // allocation identities.
-                let _ = self.free_memory_object(adapter, memory_id);
+                if !crate::virtio::KMD_D2_OWNER_ENABLED {
+                    // Legacy custody never entered OwnerTable, so the caller
+                    // still owns this definite-failure cleanup.
+                    let _ = self.free_memory_object(adapter, memory_id);
+                }
                 return Err(e);
             }
         };
-        let _ = adapter.with_virtio(|v| v.note_blob_size(res_id, size));
+        if !crate::virtio::KMD_D2_OWNER_ENABLED {
+            let _ = adapter.with_virtio(|v| v.note_blob_size(res_id, size));
+        }
         // Capacity was reserved above, so push cannot allocate. Publish the
         // identity only after both Vulkan allocation and resource creation
         // succeeded.

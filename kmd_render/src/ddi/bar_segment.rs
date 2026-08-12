@@ -117,7 +117,7 @@ impl TryFrom<u32> for BarSegTopology {
 /// Takes the knob snapshot rather than reading the registry: StartDevice has
 /// already read `BarSegMode` once and mirrored it to `BarM`.
 pub(super) fn setup_bar_segment(
-    adapter: &crate::adapter::AdapterContext,
+    gpu: &mut crate::virtio::VirtioGpu,
     knobs: &crate::adapter::AdapterKnobs,
 ) -> Option<crate::adapter::BarSegment> {
     let topo = match BarSegTopology::try_from(knobs.bar_seg_mode) {
@@ -134,7 +134,7 @@ pub(super) fn setup_bar_segment(
     if topo == BarSegTopology::Disabled {
         return None;
     }
-    let window = adapter.with_virtio(|v| v.host_visible()).ok().flatten()?;
+    let window = gpu.host_visible()?;
     let size = (window.len / 2).min(BAR_SEGMENT_MAX_BYTES) & !4095;
     if size < (16 << 20) || size > window.len {
         crate::diag::record(0x0B00_00E8);
@@ -147,7 +147,10 @@ pub(super) fn setup_bar_segment(
     // moving the VidMm partition out from under live mappings would strand
     // every offset below the new mark with no way to recycle it. Nothing has
     // been mapped at this point in StartDevice; a false here is a real defect.
-    let _ = adapter.with_virtio(|v| v.configure_window_reserve(size));
+    if !gpu.configure_window_reserve(size) {
+        crate::diag::fault(crate::diag::FaultCounter::StBar, u32::MAX);
+        return None;
+    }
     crate::diag::record(0x0B00_0008);
     crate::diag::record(((size >> 20) & 0xFFFF_FFFF) as u32);
     Some(crate::adapter::BarSegment {

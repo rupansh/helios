@@ -452,7 +452,7 @@ fn escape_query_scanout(
     let live = if resource_id == 0 {
         false
     } else {
-        match adapter.with_virtio(|v| v.resource_is_live(resource_id)) {
+        match adapter.canonical_resource_is_live(resource_id) {
             Ok(live) => live,
             Err(de) => return escape_device_gone(de),
         }

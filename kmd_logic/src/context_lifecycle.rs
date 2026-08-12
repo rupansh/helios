@@ -386,6 +386,20 @@ impl<B> TransportContextLifecycle<B> {
         self.reservation.context()
     }
 
+    pub fn owner(&self) -> &B {
+        &self.owner
+    }
+
+    /// Safety: this lifecycle must be the exact `Reserved` lifecycle returned
+    /// by a failed publication attempt. No control request or lease may have
+    /// escaped.
+    pub(crate) unsafe fn assume_unpublished_cancelled(self) -> B {
+        debug_assert_eq!(self.phase, ContextPhase::Reserved);
+        debug_assert!(self.pending.is_none());
+        debug_assert_eq!(self.lease_census, 0);
+        ManuallyDrop::into_inner(self.owner)
+    }
+
     pub const fn phase(&self) -> ContextPhase {
         self.phase
     }

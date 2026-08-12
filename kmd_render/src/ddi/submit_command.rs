@@ -1295,14 +1295,20 @@ pub unsafe extern "C" fn dxgkddi_preempt_command(
     .1
 }
 
-/// `DxgkDdiResetFromTimeout` — TDR recovery. There is no hardware engine state
-/// to reset (the host owns the GPU); drop every pending WDDM fence so dxgkrnl's
-/// post-reset accounting starts clean (it discards outstanding submissions).
+/// `DxgkDdiResetFromTimeout` — TDR recovery. The legacy path preserves its
+/// scheduler-only reset. Dormant KMD D2 additionally closes canonical control
+/// admission, proves runner/finalizer rundown, performs an exact virtio device
+/// reset, and drains ambiguous custody before the old transport can be dropped.
 pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> NTSTATUS {
     if h_adapter.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    // Close capability/object generations before any device-lost wakeup or
+    // transport producer can observe the reset boundary. Both invalidations
+    // are lock-free and define one indivisible adapter epoch transition.
+    crate::ddi::native_fence::invalidate_all();
+    crate::adapter::allocation_object::invalidate_all();
     // Prevent a DPC from taking a fence out of the pending FIFO while reset is
     // discarding that same scheduler epoch.  Dxgkrnl owns the post-reset fence
     // state; no completion from the abandoned epoch may escape concurrently.
@@ -1326,6 +1332,35 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
             crate::diag::fault(crate::diag::FaultCounter::StRing, bad);
         }
     }
+    if crate::virtio::KMD_D2_OWNER_ENABLED {
+        // ResetFromTimeout is a PASSIVE_LEVEL DDI. First cancel/join display
+        // producers, then removing the Venus client joins its mutex-protected
+        // producers and makes later callers fail closed before canonical owner
+        // admission is sealed.
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        adapter.stop_vsync();
+        adapter.stop_hpd();
+        if adapter.hpd_worker_may_be_running() {
+            return STATUS_DEVICE_NOT_READY;
+        }
+        adapter.set_venus_client(None);
+        adapter
+            .isr_status
+            .store(0, core::sync::atomic::Ordering::Release);
+        if let Err(error) = adapter
+            .close_control_owner_transport()
+            .and_then(|()| adapter.retire_control_owner_transport(passive))
+        {
+            let status: NTSTATUS = error.into();
+            crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
+            return status;
+        }
+        let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
+        adapter.reset_display_publication_state();
+        // SAFETY: the reset DDI owns the transport transition; the replacement
+        // context is not published until RestartFromTimeout initializes it.
+        let _ = unsafe { adapter.set_reset_venus_context(0) };
+    }
     STATUS_SUCCESS
 }
 
@@ -1337,6 +1372,90 @@ static RING_FAIL_REPORTED: AtomicU32 = AtomicU32::new(u32::MAX);
 pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) -> NTSTATUS {
     if h_adapter.is_null() {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if crate::virtio::KMD_D2_OWNER_ENABLED {
+        let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        adapter
+            .start_complete
+            .store(0, core::sync::atomic::Ordering::Release);
+        let dxgkrnl = match adapter.dxgkrnl() {
+            Ok(interface) => interface,
+            Err(_) => return STATUS_DEVICE_NOT_READY,
+        };
+        let reserve = adapter.bar_segment().map_or(0, |bar| bar.size);
+        let absent = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
+        let mut gpu = match crate::virtio::VirtioGpu::init(passive, dxgkrnl) {
+            Ok(gpu) => gpu,
+            Err(error) => {
+                let status: NTSTATUS = error.into();
+                crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
+                return status;
+            }
+        };
+        if reserve != 0 {
+            let exact_window = gpu
+                .host_visible()
+                .is_some_and(|window| adapter.bar_segment().is_some_and(|bar| window.base == bar.gpa));
+            if !exact_window || !gpu.configure_window_reserve(reserve) {
+                crate::diag::fault(crate::diag::FaultCounter::StVioR, u32::MAX);
+                return match crate::virtio::VirtioGpu::reset_unpublished_or_retain(gpu) {
+                    Ok(()) => STATUS_DEVICE_NOT_READY,
+                    Err(error) => error.into(),
+                };
+            }
+        }
+        adapter
+            .isr_status
+            .store(gpu.isr_status_addr(), core::sync::atomic::Ordering::Release);
+        if let Err(error) = unsafe { adapter.install_virtio(passive, absent, gpu) } {
+            adapter
+                .isr_status
+                .store(0, core::sync::atomic::Ordering::Release);
+            let status: NTSTATUS = error.into();
+            crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
+            return status;
+        }
+        let venus_context = super::lifecycle::bring_up_venus(passive, adapter);
+        if venus_context == 0 {
+            adapter
+                .isr_status
+                .store(0, core::sync::atomic::Ordering::Release);
+            let cleanup = adapter
+                .close_control_owner_transport()
+                .and_then(|()| adapter.retire_control_owner_transport(passive));
+            if cleanup.is_ok() {
+                let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
+                adapter.reset_display_publication_state();
+            }
+            let status = cleanup
+                .err()
+                .map_or(STATUS_DEVICE_NOT_READY, |error| error.into());
+            crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
+            return status;
+        }
+        if !unsafe { adapter.set_reset_venus_context(venus_context) } {
+            crate::diag::fault(crate::diag::FaultCounter::StVioR, u32::MAX - 1);
+            adapter
+                .isr_status
+                .store(0, core::sync::atomic::Ordering::Release);
+            let cleanup = adapter
+                .close_control_owner_transport()
+                .and_then(|()| adapter.retire_control_owner_transport(passive));
+            if cleanup.is_ok() {
+                let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
+                adapter.reset_display_publication_state();
+            }
+            return cleanup
+                .err()
+                .map_or(STATUS_DEVICE_NOT_READY, |error| error.into());
+        }
+        if adapter.display_half() {
+            unsafe { adapter.start_vsync() };
+            unsafe { adapter.init_hpd() };
+            adapter.signal_start_complete();
+        }
     }
 
     STATUS_SUCCESS

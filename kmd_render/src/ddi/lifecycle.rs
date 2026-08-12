@@ -60,7 +60,7 @@ fn zero_linear_scanout_breadcrumbs() {
 /// `VirtioGpu::init` — is what keeps the nested peak inside the budget. See
 /// `StartedState::boxed` for the boot failure this class of growth caused.
 #[inline(never)]
-fn bring_up_venus(passive: crate::irql::PassiveLevel, adapter: &AdapterContext) -> u32 {
+pub(super) fn bring_up_venus(passive: crate::irql::PassiveLevel, adapter: &AdapterContext) -> u32 {
     // Persistent venus context for the device lifetime (owner 0: KMD-internal,
     // destroyed explicitly in StopDevice).
     let venus_result = crate::virtio::ctrl::ctx_create(
@@ -90,6 +90,39 @@ fn bring_up_venus(passive: crate::irql::PassiveLevel, adapter: &AdapterContext) 
             0
         }
     }
+}
+
+/// Reconcile a transport that survived a missing StopDevice before a new
+/// StartDevice builds anything. Every producer is stopped before canonical
+/// owner rundown and the exact physical reset; a worker that cannot be joined
+/// leaves the old transport and owner graph intact and fails the new start.
+fn retire_skipped_stop_transport(
+    passive: crate::irql::PassiveLevel,
+    adapter: &AdapterContext,
+) -> Result<(), crate::virtio::VirtioError> {
+    if !crate::virtio::KMD_D2_OWNER_ENABLED || adapter.with_virtio(|_| ()).is_err() {
+        return Ok(());
+    }
+    crate::ddi::native_fence::invalidate_all();
+    crate::adapter::allocation_object::invalidate_all();
+    adapter
+        .isr_status
+        .store(0, core::sync::atomic::Ordering::Release);
+    adapter.stop_vsync();
+    adapter.stop_hpd();
+    if adapter.hpd_worker_may_be_running() {
+        return Err(crate::virtio::VirtioError::DeviceError);
+    }
+    adapter.reset_display_publication_state();
+    adapter.set_venus_client(None);
+    adapter.close_control_owner_transport()?;
+    adapter.retire_control_owner_transport(passive)?;
+    let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
+    // SAFETY: StartDevice owns the serialized generation transition. Leaving
+    // the old BAR/context tuple published after its transport was retired would
+    // let pre-publication queries observe a dead generation.
+    unsafe { adapter.set_transport_generation(None) };
+    Ok(())
 }
 
 /// `DxgkDdiStartDevice` — bring the adapter online.
@@ -154,6 +187,23 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // image but its registry values are not.
     crate::ddi::build_paging_buffer::hlm1_reset_counters();
 
+    // Reconcile a prior generation before taking any persistent StartedState
+    // storage. This is the skipped-Stop path: when the dormant KMD D2 gate is
+    // later enabled, failure to prove a physical reset leaves the old transport
+    // installed and fails this Start rather than dropping its owner graph.
+    // SAFETY: StartDevice is PASSIVE_LEVEL.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    adapter.reset_dormant_owner_transition_diagnostics(passive);
+    if let Err(error) = retire_skipped_stop_transport(passive, adapter) {
+        let status: NTSTATUS = error.into();
+        crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
+        unsafe {
+            *number_of_video_present_sources = 0;
+            *number_of_children = 0;
+        }
+        return status;
+    }
+
     // Carried over from a previous start on this same context, if any: these
     // blocks are allocated once and freed only in Drop, and today's code gets
     // that by leaving the fields untouched across StopDevice. Publish-once would
@@ -184,11 +234,6 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // Drop resets the device and frees its rings/scratch. Doing it *before*
     // init keeps the ordering safe — otherwise assigning the new transport would
     // drop the old one (resetting the device) right after init configured it.
-    // SAFETY: `DxgkDdiStartDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
-    // DXGKDDI_START_DEVICE). The token also keeps dormant-owner diagnostics out
-    // of any above-PASSIVE caller.
-    let passive = unsafe { crate::irql::PassiveLevel::assume() };
-    adapter.reset_dormant_owner_transition_diagnostics(passive);
     let transport_absent = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
     adapter.reset_display_publication_state();
     // Non-zero only if init below fails, so the display-half demotion can report
@@ -205,10 +250,18 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // -> `VenusRing::bring_up`, which is why it is a by-value ZST and not a
     // reference: see `crate::irql` and tools/kmd-frame-sizes.ps1.
     match crate::virtio::VirtioGpu::init(passive, unsafe { &*dxgkrnl_interface }) {
-        Ok(gpu) => {
+        Ok(mut gpu) => {
             crate::kmsg(c"Helios: virtio-gpu transport up\n");
             crate::diag::record(0x0B00_0003);
             let host_visible_bytes = gpu.host_visible().map(|window| window.len);
+
+            // Resolve and install the immutable VidMm prefix while the
+            // transport is still a StartDevice-local value. OwnerTable sees
+            // this exact final geometry at construction, before any control
+            // operation or window offset can escape.
+            super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, host_visible_bytes);
+            bar_segment = setup_bar_segment(&mut gpu, &knobs);
+
             // Publish the ISR-status register VA for the DIRQL ISR before the
             // transport goes live (capture before `gpu` is moved into set_virtio).
             adapter
@@ -217,30 +270,57 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             // SAFETY: dxgkrnl serializes StartDevice. `transport_absent` came
             // from this adapter's immediately preceding removal, and no other
             // installer is reachable before this call.
-            unsafe { adapter.install_virtio(passive, transport_absent, gpu) };
-
-            // An explicit VidMmVramMB registry value remains authoritative.
-            // When it is absent, use the exact virtio shared-memory capability
-            // length rather than a compiled 4-GiB default or the padded PCI BAR.
-            super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, host_visible_bytes);
-
-            // ── BAR memory segment / CPU host aperture ──────────────────────
-            // Reserve the window head BEFORE any blob map can allocate a
-            // window offset, and before dxgkrnl queries segments.
-            // Two-memory-split fix (Option A).
-            bar_segment = setup_bar_segment(adapter, &knobs);
-
-            // ── Venus-backed page-table memory (best-effort) ─────────────────
-            // Self-allocate a 16-MiB HOST_VISIBLE|HOST_COHERENT VkDeviceMemory over
-            // venus and expose it as a BAR-backed, CPU-coherent region VidMm can
-            // register as the page-table segment (VidMm drops a system-RAM segment;
-            // it accepts device-BAR memory backed by real host memory). PASSIVE
-            // inside StartDevice; the flows ride `virtio::ctrl` (locked enqueues +
-            // PASSIVE waits), so they coexist with the interrupt DPC, which may
-            // already be live. On any failure we record diag and leave the
-            // venus context id 0 — never fail StartDevice (Gate 1 stays
-            // start-safe). See virtio::venus.
-            venus_ctx_id = bring_up_venus(passive, adapter);
+            match unsafe { adapter.install_virtio(passive, transport_absent, gpu) } {
+                Ok(()) => {
+                    // ── Venus-backed page-table memory (best-effort) ─────────
+                    // Self-allocate a 16-MiB HOST_VISIBLE|HOST_COHERENT
+                    // VkDeviceMemory over venus and expose it as a BAR-backed,
+                    // CPU-coherent region VidMm can register as the page-table
+                    // segment. The owner table is already canonical before any
+                    // of these control operations can run.
+                    venus_ctx_id = bring_up_venus(passive, adapter);
+                    if crate::virtio::KMD_D2_OWNER_ENABLED && venus_ctx_id == 0 {
+                        adapter
+                            .isr_status
+                            .store(0, core::sync::atomic::Ordering::Release);
+                        let status = match adapter
+                            .close_control_owner_transport()
+                            .and_then(|()| adapter.retire_control_owner_transport(passive))
+                        {
+                            Ok(()) => {
+                                let _ = adapter
+                                    .remove_virtio_and_reset_scanout_bind_generation(passive);
+                                STATUS_DEVICE_NOT_READY
+                            }
+                            Err(error) => error.into(),
+                        };
+                        unsafe {
+                            *number_of_video_present_sources = 0;
+                            *number_of_children = 0;
+                        }
+                        return status;
+                    }
+                }
+                Err(error) => {
+                    let status: NTSTATUS = error.into();
+                    crate::diag::record(0x0B00_00E0);
+                    crate::diag::record(status as u32);
+                    crate::diag::fault(crate::diag::FaultCounter::StVio, status as u32);
+                    transport_fail_status = status as u32;
+                    adapter
+                        .isr_status
+                        .store(0, core::sync::atomic::Ordering::Release);
+                    bar_segment = None;
+                    super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None);
+                    if crate::virtio::KMD_D2_OWNER_ENABLED {
+                        unsafe {
+                            *number_of_video_present_sources = 0;
+                            *number_of_children = 0;
+                        }
+                        return status;
+                    }
+                }
+            }
         }
         Err(e) => {
             crate::kmsg(c"Helios: virtio-gpu init FAILED\n");
@@ -254,6 +334,13 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 .store(0, core::sync::atomic::Ordering::Release);
             let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
             super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None);
+            if crate::virtio::KMD_D2_OWNER_ENABLED {
+                unsafe {
+                    *number_of_video_present_sources = 0;
+                    *number_of_children = 0;
+                }
+                return status;
+            }
         }
     }
 
@@ -427,6 +514,8 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // Hold teardown behind every admitted event builder and write that may
         // still read this adapter generation.
         crate::ddi::diag_etw::adapter_stop(adapter);
+        crate::ddi::native_fence::invalidate_all();
+        crate::adapter::allocation_object::invalidate_all();
         // Stop the ISR from touching the (about-to-be-reset) device first.
         //
         // ⚠ ASYMMETRY, recorded rather than changed (k-ctrlsubmit-12): this
@@ -451,6 +540,12 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // the (about-to-be-torn-down) context.
         adapter.stop_vsync();
         adapter.stop_hpd();
+        if crate::virtio::KMD_D2_OWNER_ENABLED && adapter.hpd_worker_may_be_running() {
+            // The worker can still own a Venus/control effect. Retain the exact
+            // transport and owner arena; resetting or dropping either here would
+            // turn a bounded join failure into a use-after-free.
+            return STATUS_DEVICE_NOT_READY;
+        }
         // AFTER stop_hpd, so the worker can no longer re-publish into the state
         // we are about to clear. Every scanout identity below belongs to the
         // transport generation being torn down; carrying it into the next
@@ -462,6 +557,12 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // DXGKDDI_STOP_DEVICE); the teardown below unrefs blobs and destroys the
         // venus context, both control round-trips against the still-live device.
         let passive_stop = unsafe { crate::irql::PassiveLevel::assume() };
+
+        if let Err(error) = adapter.close_control_owner_transport() {
+            let status: NTSTATUS = error.into();
+            crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
+            return status;
+        }
 
         // Tear down the venus client + page-table blob + context BEFORE dropping
         // the transport (the unref/detach/destroy commands need the live device).
@@ -479,6 +580,16 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // Free any parked completed entries at PASSIVE before the transport
         // (and the buffers still in flight inside it) is dropped.
         crate::virtio::ctrl::reap_parked(passive_stop, adapter);
+
+        // Canonical-owner reset is the final teardown barrier. It waits for all
+        // dispatched control runners and out-of-lock payload finalizers, resets
+        // the exact producing transport, verifies raw device status zero, and
+        // only then releases ambiguous rows through the reset cursor.
+        if let Err(error) = adapter.retire_control_owner_transport(passive_stop) {
+            let status: NTSTATUS = error.into();
+            crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
+            return status;
+        }
 
         // Tear down the virtio transport: VirtioGpu::drop resets the device and
         // frees its rings (plus any in-flight/parked entry buffers). A later
@@ -514,6 +625,39 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
         // SAFETY: our adapter context; only read here.
         let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
         crate::ddi::diag_etw::adapter_stop(adapter);
+        // Remove may legally skip StopDevice. Repeating these after an orderly
+        // Stop is harmless; omitting them here would let that skipped-Stop path
+        // carry stale allocation/native-fence authority into freed storage.
+        crate::ddi::native_fence::invalidate_all();
+        crate::adapter::allocation_object::invalidate_all();
+        if crate::virtio::KMD_D2_OWNER_ENABLED {
+            // RemoveDevice may follow a failed Start or skip StopDevice. Close
+            // every callback-producing edge before touching the exact transport;
+            // if HPD cannot join, the existing leak policy below keeps both the
+            // adapter and its owner arena alive.
+            adapter
+                .isr_status
+                .store(0, core::sync::atomic::Ordering::Release);
+            adapter.stop_vsync();
+            adapter.stop_hpd();
+            adapter.reset_display_publication_state();
+            if !adapter.hpd_worker_may_be_running() {
+                let passive_remove = unsafe { crate::irql::PassiveLevel::assume() };
+                adapter.set_venus_client(None);
+                if let Err(error) = adapter
+                    .close_control_owner_transport()
+                    .and_then(|()| adapter.retire_control_owner_transport(passive_remove))
+                {
+                    let status: NTSTATUS = error.into();
+                    crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
+                    // Preserve the complete adapter allocation: freeing it would
+                    // drop an unverified transport and its canonical custody.
+                    return status;
+                }
+                let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive_remove);
+                unsafe { adapter.set_transport_generation(None) };
+            }
+        }
         if adapter.hpd_worker_may_be_running() {
             // stop_hpd could not prove the worker exited, and the worker
             // dereferences this context. Leak it deliberately: a permanent

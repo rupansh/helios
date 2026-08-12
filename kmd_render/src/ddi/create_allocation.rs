@@ -114,10 +114,10 @@ struct AllocationContext {
     /// [`ALLOCATION_CTX_MAGIC`] — must be the FIRST field (paging-DDI cast check).
     magic: u32,
     ctx_id: u32,
-    /// The host resource id. §10.3:1087-1093 — "a host `resid` may live
-    /// **solely** inside the KMD allocation object"; this field is that sole
-    /// home. It is never written into any private buffer, protocol message, or
-    /// log-visible descriptor, and there is no path from a UMD/ICD value to it.
+    /// The exact host-resource observation used to address this allocation's
+    /// canonical row. With KMD D2 enabled, `OwnerTable` is the sole owner and
+    /// this immutable value grants no release authority. It is never written
+    /// into private data or recovered from geometry.
     resource_id: u32,
     /// The allocation generation minted once at create
     /// (`crate::adapter::allocation_object::mint`), stamped into the descriptor
@@ -133,12 +133,14 @@ struct AllocationContext {
     /// later decision that used to sniff geometry or memory visibility now names
     /// this instead.
     kind: u32,
-    /// Nonzero for KMD-backed standard allocations: the kernel venus client's
-    /// `VkDeviceMemory` object id behind the blob, freed (`vkFreeMemory`) at
-    /// DestroyAllocation after the resource unref.
+    /// Nonzero observation for KMD-backed standard allocations: the kernel
+    /// Venus `VkDeviceMemory` behind the blob. The compiled KMD D2 arm transfers
+    /// its only destruction authority into `ResourceBackingFinalizer` before
+    /// CREATE; this copy remains usable for non-destructive renderer work.
     venus_memory_id: u64,
-    /// Nonzero when the standard allocation's memory is bound to a kernel-created
-    /// Venus `VkImage` (the shared-primary scanout path).
+    /// Nonzero observation when the standard allocation's memory is bound to a
+    /// kernel-created Venus `VkImage`. As above, enabled teardown authority is
+    /// held only by the canonical resource row.
     venus_image_id: u64,
     /// Lazily-created kernel-Venus alias of an adopted UMD OPTIMAL image. The
     /// alias imports `resource_id` memory and exists solely so the KMD can copy
@@ -2795,31 +2797,49 @@ unsafe fn destroy_allocation_ctx(
         // adopted arm unref'd unconditionally, which double-freed resources
         // another path had already reclaimed — QEMU's "virgl_cmd_resource_unref:
         // resource does not exist ×9" at the 2026-07-03 boot-#3 dwm teardown.
-        let first_teardown = adapter
-            .with_virtio(|v| v.take_live_resource(ctx.resource_id))
-            .unwrap_or(false);
-        if first_teardown {
-            let _ = crate::virtio::ctrl::ctx_detach_resource(
+        if crate::virtio::KMD_D2_OWNER_ENABLED {
+            // OwnerTable is the sole resource/backing owner in this arm. The
+            // allocation wrapper carries only immutable observation fields;
+            // terminal UNREF extracts and runs the exact image/memory finalizer
+            // outside the owner lock. An ambiguous detach or unref retains the
+            // row and its backing until verified physical reset.
+            if crate::virtio::ctrl::ctx_detach_resource(
                 passive,
                 adapter,
                 ctx.ctx_id,
                 ctx.resource_id,
-            );
-            let _ = crate::virtio::ctrl::resource_unref(passive, adapter, ctx.resource_id);
-        }
-        if ctx.venus_image_id != 0 {
-            let _ = adapter
-                .with_venus_client(passive, |c| c.destroy_image(adapter, ctx.venus_image_id));
-        }
-        if ctx.venus_memory_id != 0 {
-            // KMD-backed standard allocation: after the RESOURCE teardown above
-            // (the host blob holds a reference into the memory object),
-            // vkFreeMemory the venus memory. Best-effort: if the venus client
-            // is already gone (device teardown), the host context destruction
-            // reclaims everything anyway.
-            let _ = adapter.with_venus_client(passive, |c| {
-                c.free_memory_blob(adapter, ctx.venus_memory_id)
-            });
+            )
+            .is_ok()
+            {
+                let _ = crate::virtio::ctrl::resource_unref(passive, adapter, ctx.resource_id);
+            }
+        } else {
+            let first_teardown = adapter
+                .with_virtio(|v| v.take_live_resource(ctx.resource_id))
+                .unwrap_or(false);
+            if first_teardown {
+                let _ = crate::virtio::ctrl::ctx_detach_resource(
+                    passive,
+                    adapter,
+                    ctx.ctx_id,
+                    ctx.resource_id,
+                );
+                let _ = crate::virtio::ctrl::resource_unref(passive, adapter, ctx.resource_id);
+            }
+            if ctx.venus_image_id != 0 {
+                let _ = adapter
+                    .with_venus_client(passive, |c| c.destroy_image(adapter, ctx.venus_image_id));
+            }
+            if ctx.venus_memory_id != 0 {
+                // KMD-backed standard allocation: after the RESOURCE teardown above
+                // (the host blob holds a reference into the memory object),
+                // vkFreeMemory the venus memory. Best-effort: if the venus client
+                // is already gone (device teardown), the host context destruction
+                // reclaims everything anyway.
+                let _ = adapter.with_venus_client(passive, |c| {
+                    c.free_memory_blob(adapter, ctx.venus_memory_id)
+                });
+            }
         }
     } else if adapter_owned_scanout {
         crate::diag::record_named_bytes(b"CpKeep", ctx.resource_id);
@@ -4195,6 +4215,19 @@ fn release_orphan_backing(
         return;
     }
     let _ = crate::virtio::ctrl::forget_allocation_blob(passive, adapter, created.resource_id);
+    if crate::virtio::KMD_D2_OWNER_ENABLED {
+        if crate::virtio::ctrl::ctx_detach_resource(
+            passive,
+            adapter,
+            adapter.venus_ctx_id(),
+            created.resource_id,
+        )
+        .is_ok()
+        {
+            let _ = crate::virtio::ctrl::resource_unref(passive, adapter, created.resource_id);
+        }
+        return;
+    }
     let first_teardown = adapter
         .with_virtio(|v| v.take_live_resource(created.resource_id))
         .unwrap_or(false);

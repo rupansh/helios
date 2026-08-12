@@ -275,7 +275,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
                 // Re-validate liveness by resource id before touching it; the
                 // record deliberately carries the id, never a raw pointer.
                 let live = adapter
-                    .with_virtio(|v| v.resource_is_live(destination.resource_id()))
+                    .canonical_resource_is_live(destination.resource_id())
                     .unwrap_or(false);
                 if live {
                     crate::virtio::venus::VenusClient::probe_present_destination(

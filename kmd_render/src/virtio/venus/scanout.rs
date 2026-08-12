@@ -559,6 +559,11 @@ impl VenusClient {
         if width == 0 || height == 0 || !matches!(dxgi_format, 87 | 88) {
             return Err(VirtioError::DeviceError);
         }
+        if crate::virtio::KMD_D2_OWNER_ENABLED
+            && !adapter.control_owner().backing_creation_open()
+        {
+            return Err(VirtioError::DeviceError);
+        }
 
         let image_id = self.create_optimal_present_image_alias(
             adapter,
@@ -603,23 +608,45 @@ impl VenusClient {
         }
 
         let blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE | VIRTIO_GPU_BLOB_FLAG_USE_CROSS_DEVICE;
-        let resource_id = match ctrl::resource_create_blob(
-            self.passive(),
-            adapter,
-            self.ctx_id(),
-            VIRTIO_GPU_BLOB_MEM_HOST3D,
-            blob_flags,
-            memory_id.get(),
-            allocation_size,
-        ) {
+        let created = if crate::virtio::KMD_D2_OWNER_ENABLED {
+            ctrl::resource_create_blob_with_finalizer(
+                self.passive(),
+                adapter,
+                self.ctx_id(),
+                VIRTIO_GPU_BLOB_MEM_HOST3D,
+                blob_flags,
+                memory_id.get(),
+                allocation_size,
+                crate::virtio::control_owner::ResourceBackingFinalizer::image_memory(
+                    image_id.get(),
+                    memory_id.get(),
+                ),
+                |finalizer| ctrl::finalize_resource_backing_with_client(self, adapter, finalizer),
+            )
+        } else {
+            ctrl::resource_create_blob(
+                self.passive(),
+                adapter,
+                self.ctx_id(),
+                VIRTIO_GPU_BLOB_MEM_HOST3D,
+                blob_flags,
+                memory_id.get(),
+                allocation_size,
+            )
+        };
+        let resource_id = match created {
             Ok(id) => id,
             Err(error) => {
-                let _ = self.destroy_image(adapter, image_id.get());
-                let _ = self.free_memory_blob(adapter, memory_id.get());
+                if !crate::virtio::KMD_D2_OWNER_ENABLED {
+                    let _ = self.destroy_image(adapter, image_id.get());
+                    let _ = self.free_memory_blob(adapter, memory_id.get());
+                }
                 return Err(error);
             }
         };
-        let _ = adapter.with_virtio(|v| v.note_blob_size(resource_id, allocation_size));
+        if !crate::virtio::KMD_D2_OWNER_ENABLED {
+            let _ = adapter.with_virtio(|v| v.note_blob_size(resource_id, allocation_size));
+        }
 
         Ok(OptimalImageBlob {
             blob: HostVisibleBlob {
@@ -642,6 +669,11 @@ impl VenusClient {
         width: u32,
         height: u32,
     ) -> Result<ScanoutImageBlob, VirtioError> {
+        if crate::virtio::KMD_D2_OWNER_ENABLED
+            && !adapter.control_owner().backing_creation_open()
+        {
+            return Err(VirtioError::DeviceError);
+        }
         // Stage breadcrumb: `SdgLStg` holds the stage last ENTERED. On an early
         // `?` return it names the exact Venus call that rejected the CachyOS
         // shared-primary shape (mode 16 / real primary), turning the opaque
@@ -655,16 +687,25 @@ impl VenusClient {
         let image_id = self.create_linear_scanout_image(adapter, width, height)?;
 
         crate::diag::record_named_bytes(b"SdgLStg", 2);
-        let (req_size, memory_type_bits) = self.image_memory_requirements(adapter, image_id)?;
+        let (req_size, memory_type_bits) = match self.image_memory_requirements(adapter, image_id) {
+            Ok(requirements) => requirements,
+            Err(error) => {
+                let _ = self.destroy_image(adapter, image_id.get());
+                return Err(error);
+            }
+        };
         crate::diag::record_named_bytes(b"SdgLReq", req_size as u32);
         crate::diag::record_named_bytes(b"SdgLBit", memory_type_bits);
         crate::diag::record_named_bytes(b"SdgLTyc", self.memory_type_count);
 
         crate::diag::record_named_bytes(b"SdgLStg", 3);
-        let memory_type_index = Self::accept_memory_type(
-            self.choose_host_visible_memory_type(memory_type_bits)
-                .ok_or(VirtioError::DeviceError)?,
-        );
+        let memory_type_index = match self.choose_host_visible_memory_type(memory_type_bits) {
+            Some(choice) => Self::accept_memory_type(choice),
+            None => {
+                let _ = self.destroy_image(adapter, image_id.get());
+                return Err(VirtioError::DeviceError);
+            }
+        };
         crate::diag::record_named_bytes(b"SdgMt", memory_type_index);
         crate::diag::record_named_bytes(
             b"SdgMf",
@@ -674,36 +715,80 @@ impl VenusClient {
 
         crate::diag::record_named_bytes(b"SdgLStg", 4);
         let memory_id =
-            self.allocate_export_image_memory(adapter, alloc_size, memory_type_index)?;
+            match self.allocate_export_image_memory(adapter, alloc_size, memory_type_index) {
+                Ok(memory_id) => memory_id,
+                Err(error) => {
+                    let _ = self.destroy_image(adapter, image_id.get());
+                    return Err(error);
+                }
+            };
 
         crate::diag::record_named_bytes(b"SdgLStg", 5);
-        self.bind_image_memory(adapter, image_id, memory_id)?;
+        if let Err(error) = self.bind_image_memory(adapter, image_id, memory_id) {
+            let _ = self.destroy_image(adapter, image_id.get());
+            let _ = self.free_memory_blob(adapter, memory_id.get());
+            return Err(error);
+        }
 
         crate::diag::record_named_bytes(b"SdgLStg", 6);
         let (offset, row_pitch) =
-            self.image_subresource_layout(adapter, image_id, IMAGE_ASPECT_COLOR)?;
+            match self.image_subresource_layout(adapter, image_id, IMAGE_ASPECT_COLOR) {
+                Ok(layout) => layout,
+                Err(error) => {
+                    let _ = self.destroy_image(adapter, image_id.get());
+                    let _ = self.free_memory_blob(adapter, memory_id.get());
+                    return Err(error);
+                }
+            };
         crate::diag::record_named_bytes(b"SdgLPch", row_pitch as u32);
         crate::diag::record_named_bytes(b"SdgLOff", offset as u32);
 
         crate::diag::record_named_bytes(b"SdgLStg", 7);
         if row_pitch == 0 || row_pitch > u32::MAX as u64 || offset > u32::MAX as u64 {
             diag(0x0125);
+            let _ = self.destroy_image(adapter, image_id.get());
+            let _ = self.free_memory_blob(adapter, memory_id.get());
             return Err(VirtioError::DeviceError);
         }
 
         let blob_flags = VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE | VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
         crate::diag::record_named_bytes(b"SdgBFl", blob_flags);
         crate::diag::record_named_bytes(b"SdgLStg", 8);
-        let res_id = ctrl::resource_create_blob(
-            self.passive(),
-            adapter,
-            self.ctx_id(),
-            VIRTIO_GPU_BLOB_MEM_HOST3D,
-            blob_flags,
-            memory_id.get(),
-            alloc_size,
-        )?;
-        let _ = adapter.with_virtio(|v| v.note_blob_size(res_id, alloc_size));
+        let res_id = if crate::virtio::KMD_D2_OWNER_ENABLED {
+            ctrl::resource_create_blob_with_finalizer(
+                self.passive(),
+                adapter,
+                self.ctx_id(),
+                VIRTIO_GPU_BLOB_MEM_HOST3D,
+                blob_flags,
+                memory_id.get(),
+                alloc_size,
+                crate::virtio::control_owner::ResourceBackingFinalizer::image_memory(
+                    image_id.get(),
+                    memory_id.get(),
+                ),
+                |finalizer| ctrl::finalize_resource_backing_with_client(self, adapter, finalizer),
+            )?
+        } else {
+            let resource_id = match ctrl::resource_create_blob(
+                self.passive(),
+                adapter,
+                self.ctx_id(),
+                VIRTIO_GPU_BLOB_MEM_HOST3D,
+                blob_flags,
+                memory_id.get(),
+                alloc_size,
+            ) {
+                Ok(resource_id) => resource_id,
+                Err(error) => {
+                    let _ = self.destroy_image(adapter, image_id.get());
+                    let _ = self.free_memory_blob(adapter, memory_id.get());
+                    return Err(error);
+                }
+            };
+            let _ = adapter.with_virtio(|v| v.note_blob_size(resource_id, alloc_size));
+            resource_id
+        };
         crate::diag::record_named_bytes(b"SdgLStg", 0x10);
         Ok(ScanoutImageBlob {
             blob: HostVisibleBlob {

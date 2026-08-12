@@ -60,6 +60,7 @@ use bytemuck::{bytes_of, Zeroable};
 use wdk_sys::ntddk::{KeDelayExecutionThread, KeWaitForSingleObject};
 use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
+use super::control_owner::ResourceBackingFinalizer;
 use super::gpu::{
     BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner, FenceWaitPrep,
     OwnerFilter, SyncOutcome, SyncTicket, SyncWaitBlock, WaitBlockRef, WaitDisposition,
@@ -71,7 +72,13 @@ use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
 use core::sync::atomic::Ordering;
-use helios_kmd_logic::control_ownership::{AbandonReason, HostRejection};
+use helios_kmd_logic::context_attachment::AttachmentFinishEffect;
+use helios_kmd_logic::context_lifecycle::ContextFinishEffect;
+use helios_kmd_logic::control_owner_table::{DispatchWork, ObservedOwnerWork, PairKind};
+use helios_kmd_logic::control_owner_tickets::RunnerOutcome;
+use helios_kmd_logic::control_ownership::{
+    AbandonReason, ControlVerb, HostRejection, ResourceFinishEffect, WindowFinishEffect,
+};
 use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
     VirtioGpuGetCapsetInfo, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush,
@@ -94,6 +101,59 @@ static CTRL_WAIT_FENCE_COMPLETED: AtomicU32 = AtomicU32::new(0);
 static CTRL_RESPONSE_MALFORMED: AtomicU32 = AtomicU32::new(0);
 static FENCE_WAIT_PENDING: AtomicU32 = AtomicU32::new(0);
 static FENCE_WAIT_HOST_RESPONSE: AtomicU32 = AtomicU32::new(0);
+
+fn retain_resource_finalizer(
+    finalizer: ResourceBackingFinalizer,
+) -> Result<(), ResourceBackingFinalizer> {
+    Err(finalizer)
+}
+
+/// Execute an orderly backing finalizer through an already-held Venus client.
+/// Each successful stage is cleared before a later stage can fail, so a returned
+/// token names only work that remains ambiguous.
+pub(crate) fn finalize_resource_backing_with_client(
+    client: &mut super::venus::VenusClient,
+    adapter: &AdapterContext,
+    mut finalizer: ResourceBackingFinalizer,
+) -> Result<(), ResourceBackingFinalizer> {
+    if finalizer.image_id != 0 {
+        if client.destroy_image(adapter, finalizer.image_id).is_err() {
+            return Err(finalizer);
+        }
+        finalizer.image_id = 0;
+    }
+    if finalizer.memory_id != 0 {
+        if client
+            .free_memory_blob(adapter, finalizer.memory_id)
+            .is_err()
+        {
+            return Err(finalizer);
+        }
+    }
+    Ok(())
+}
+
+fn finalize_resource_backing(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    finalizer: ResourceBackingFinalizer,
+) -> Result<(), ResourceBackingFinalizer> {
+    if finalizer.is_empty() {
+        return Ok(());
+    }
+    let mut pending = Some(finalizer);
+    match adapter.with_venus_client(passive, |client| {
+        let finalizer = pending
+            .take()
+            .expect("Venus finalizer closure executes at most once");
+        finalize_resource_backing_with_client(client, adapter, finalizer)
+    }) {
+        Ok(result) => result,
+        Err(_) => Err(pending
+            .take()
+            .expect("missing Venus client cannot consume finalizer custody")),
+    }
+}
 
 fn bump_wait_refusal(counter: &AtomicU32, name: &[u8]) {
     let n = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
@@ -551,6 +611,75 @@ fn ctrl_roundtrip_observed(
     })
 }
 
+fn owner_response_word(response: &[u8], written_length: u32, offset: usize) -> u32 {
+    if written_length as usize >= offset.saturating_add(size_of::<u32>())
+        && response.len() >= offset.saturating_add(size_of::<u32>())
+    {
+        u32::from_le_bytes([
+            response[offset],
+            response[offset + 1],
+            response[offset + 2],
+            response[offset + 3],
+        ])
+    } else {
+        0
+    }
+}
+
+fn run_owner_work<K>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    work: DispatchWork<K>,
+    verb: ControlVerb,
+    request: &[u8],
+    response: &mut [u8],
+) -> ObservedOwnerWork<VirtioError, K> {
+    // SAFETY: this closure performs exactly one synchronous publish attempt,
+    // returns the transport's exact copied length, and retains no wire key.
+    unsafe {
+        work.run_once(|key| {
+            if key.verb() != verb {
+                return RunnerOutcome::Ambiguous(AbandonReason::NotOurs);
+            }
+            match ctrl_roundtrip_observed(
+                passive,
+                adapter,
+                request,
+                None,
+                response,
+                SYNC_ROUNDTRIP_TIMEOUT_MS,
+                None,
+                None,
+            ) {
+                CtrlRoundtripOutcome::HostResponseCopied { written_length } => {
+                    RunnerOutcome::HostResponse {
+                        response_type: owner_response_word(response, written_length, 0),
+                        written_length: written_length as usize,
+                        map_info: owner_response_word(
+                            response,
+                            written_length,
+                            size_of::<VirtioGpuCtrlHdr>(),
+                        ),
+                    }
+                }
+                CtrlRoundtripOutcome::DefiniteNotEnqueued(error) => {
+                    RunnerOutcome::DefiniteNotEnqueued(error)
+                }
+                CtrlRoundtripOutcome::Ambiguous(reason) => RunnerOutcome::Ambiguous(reason),
+            }
+        })
+    }
+}
+
+fn owner_abandon_error(reason: AbandonReason) -> VirtioError {
+    match reason {
+        AbandonReason::Timeout => VirtioError::Timeout,
+        AbandonReason::NotOurs
+        | AbandonReason::TransportAborted
+        | AbandonReason::MalformedResponse => VirtioError::DeviceError,
+    }
+}
+
 fn ctrl_roundtrip(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -673,6 +802,39 @@ pub fn ctx_create(
     capset_id: u32,
     owner: Option<DeviceOwner>,
 ) -> Result<u32, VirtioError> {
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        let (ctx_id, work) = adapter.control_owner().begin_context_create(owner)?;
+        let mut cmd = VirtioGpuCtxCreate::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_CREATE;
+        cmd.hdr.ctx_id = ctx_id;
+        cmd.context_init = capset_id;
+        const NAME: &[u8] = b"helios";
+        cmd.nlen = NAME.len() as u32;
+        cmd.debug_name[..NAME.len()].copy_from_slice(NAME);
+        crate::diag::record(0x0D20_0000 | (ctx_id & 0xFFFF));
+        let mut response = [0u8; size_of::<VirtioGpuCtrlHdr>()];
+        let observed = run_owner_work(
+            passive,
+            adapter,
+            work,
+            ControlVerb::ContextCreate,
+            bytes_of(&cmd),
+            &mut response,
+        );
+        return match adapter.control_owner().finish_context(observed)? {
+            ContextFinishEffect::CreateCompleted => {
+                crate::diag::record(0x0D21_0000 | (ctx_id & 0xFFFF));
+                Ok(ctx_id)
+            }
+            ContextFinishEffect::CreateDefiniteNotEnqueued(error) => Err(error),
+            ContextFinishEffect::CreateAmbiguous(reason) => Err(owner_abandon_error(reason)),
+            ContextFinishEffect::CreateHostRejected(_)
+            | ContextFinishEffect::DestroyDefiniteNotEnqueued(_)
+            | ContextFinishEffect::DestroyCompleted
+            | ContextFinishEffect::DestroyHostRejected(_)
+            | ContextFinishEffect::DestroyAmbiguous(_) => Err(VirtioError::DeviceError),
+        };
+    }
     let ctx_id = adapter
         .with_virtio(|v| v.alloc_ctx_id())
         .map_err(|_| VirtioError::DeviceError)?;
@@ -718,6 +880,37 @@ pub fn ctx_destroy(
     owner: Option<DeviceOwner>,
     ctx_id: u32,
 ) -> Result<(), VirtioError> {
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        let work = adapter
+            .control_owner()
+            .begin_context_destroy(owner, ctx_id)?;
+        let _ = adapter.with_wddm_notify_lock(|guard| {
+            guard.with_virtio(|order, v| v.purge_present_streams_for_context(order, owner, ctx_id))
+        });
+        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+        let mut cmd = VirtioGpuCtxDestroy::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
+        cmd.hdr.ctx_id = ctx_id;
+        let mut response = [0u8; size_of::<VirtioGpuCtrlHdr>()];
+        let observed = run_owner_work(
+            passive,
+            adapter,
+            work,
+            ControlVerb::ContextDestroy,
+            bytes_of(&cmd),
+            &mut response,
+        );
+        return match adapter.control_owner().finish_context(observed)? {
+            ContextFinishEffect::DestroyCompleted => Ok(()),
+            ContextFinishEffect::DestroyDefiniteNotEnqueued(error) => Err(error),
+            ContextFinishEffect::DestroyAmbiguous(reason) => Err(owner_abandon_error(reason)),
+            ContextFinishEffect::DestroyHostRejected(_)
+            | ContextFinishEffect::CreateDefiniteNotEnqueued(_)
+            | ContextFinishEffect::CreateCompleted
+            | ContextFinishEffect::CreateHostRejected(_)
+            | ContextFinishEffect::CreateAmbiguous(_) => Err(VirtioError::DeviceError),
+        };
+    }
     let owned = adapter
         .with_wddm_notify_lock(|guard| {
             guard.with_virtio(|order, v| {
@@ -759,6 +952,16 @@ pub fn destroy_contexts_for_owner(
     adapter: &AdapterContext,
     owner: Option<DeviceOwner>,
 ) -> u32 {
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        let mut destroyed = 0u32;
+        while let Some(ctx_id) = adapter.control_owner().first_context_for_owner(owner) {
+            if ctx_destroy(passive, adapter, owner, ctx_id).is_err() {
+                break;
+            }
+            destroyed = destroyed.saturating_add(1);
+        }
+        return destroyed;
+    }
     let mut destroyed = 0u32;
     loop {
         let taken = adapter.with_wddm_notify_lock(|guard| {
@@ -796,6 +999,34 @@ pub fn ctx_attach_resource(
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        let work = adapter
+            .control_owner()
+            .begin_secondary_attach(resource_id, ctx_id)?;
+        let mut cmd = VirtioGpuCtxResource::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+        cmd.hdr.ctx_id = ctx_id;
+        cmd.resource_id = resource_id;
+        let mut response = [0u8; size_of::<VirtioGpuCtrlHdr>()];
+        let observed = run_owner_work(
+            passive,
+            adapter,
+            work,
+            ControlVerb::Attach,
+            bytes_of(&cmd),
+            &mut response,
+        );
+        return match adapter.control_owner().finish_pair(observed)? {
+            AttachmentFinishEffect::AttachCompleted => Ok(()),
+            AttachmentFinishEffect::AttachDefiniteNotEnqueued(error) => Err(error),
+            AttachmentFinishEffect::AttachAmbiguous(reason) => Err(owner_abandon_error(reason)),
+            AttachmentFinishEffect::AttachHostRejected(_)
+            | AttachmentFinishEffect::DetachDefiniteNotEnqueued(_)
+            | AttachmentFinishEffect::DetachCompleted
+            | AttachmentFinishEffect::DetachHostRejected(_)
+            | AttachmentFinishEffect::DetachAmbiguous(_) => Err(VirtioError::DeviceError),
+        };
+    }
     let mut cmd = VirtioGpuCtxResource::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
     cmd.hdr.ctx_id = ctx_id;
@@ -810,6 +1041,58 @@ pub fn ctx_detach_resource(
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        let mut cmd = VirtioGpuCtxResource::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
+        cmd.hdr.ctx_id = ctx_id;
+        cmd.resource_id = resource_id;
+        let mut response = [0u8; size_of::<VirtioGpuCtrlHdr>()];
+        return match adapter.control_owner().pair_kind(resource_id, ctx_id)? {
+            PairKind::Creator => {
+                let work = adapter.control_owner().begin_creator_detach(resource_id)?;
+                let observed = run_owner_work(
+                    passive,
+                    adapter,
+                    work,
+                    ControlVerb::Detach,
+                    bytes_of(&cmd),
+                    &mut response,
+                );
+                match adapter
+                    .control_owner()
+                    .finish_resource(observed, retain_resource_finalizer)?
+                {
+                    ResourceFinishEffect::DetachCompleted => Ok(()),
+                    ResourceFinishEffect::DetachDefiniteNotEnqueued(error) => Err(error),
+                    ResourceFinishEffect::DetachAmbiguous(reason) => {
+                        Err(owner_abandon_error(reason))
+                    }
+                    _ => Err(VirtioError::DeviceError),
+                }
+            }
+            PairKind::Secondary => {
+                let work = adapter
+                    .control_owner()
+                    .begin_secondary_detach(resource_id, ctx_id)?;
+                let observed = run_owner_work(
+                    passive,
+                    adapter,
+                    work,
+                    ControlVerb::Detach,
+                    bytes_of(&cmd),
+                    &mut response,
+                );
+                match adapter.control_owner().finish_pair(observed)? {
+                    AttachmentFinishEffect::DetachCompleted => Ok(()),
+                    AttachmentFinishEffect::DetachDefiniteNotEnqueued(error) => Err(error),
+                    AttachmentFinishEffect::DetachAmbiguous(reason) => {
+                        Err(owner_abandon_error(reason))
+                    }
+                    _ => Err(VirtioError::DeviceError),
+                }
+            }
+        };
+    }
     let mut cmd = VirtioGpuCtxResource::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
     cmd.hdr.ctx_id = ctx_id;
@@ -1024,6 +1307,43 @@ pub fn resource_unref(
     adapter: &AdapterContext,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    let mut finalize = |finalizer| finalize_resource_backing(passive, adapter, finalizer);
+    resource_unref_with_finalizer(passive, adapter, resource_id, &mut finalize)
+}
+
+fn resource_unref_with_finalizer<F>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    finalize: &mut F,
+) -> Result<(), VirtioError>
+where
+    F: FnMut(ResourceBackingFinalizer) -> Result<(), ResourceBackingFinalizer>,
+{
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        let work = adapter.control_owner().begin_resource_unref(resource_id)?;
+        let mut cmd = VirtioGpuResourceUnref::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+        cmd.resource_id = resource_id;
+        let mut response = [0u8; size_of::<VirtioGpuCtrlHdr>()];
+        let observed = run_owner_work(
+            passive,
+            adapter,
+            work,
+            ControlVerb::Unref,
+            bytes_of(&cmd),
+            &mut response,
+        );
+        return match adapter
+            .control_owner()
+            .finish_resource(observed, |finalizer| finalize(finalizer))?
+        {
+            ResourceFinishEffect::UnrefCompleted => Ok(()),
+            ResourceFinishEffect::UnrefDefiniteNotEnqueued(error) => Err(error),
+            ResourceFinishEffect::UnrefAmbiguous(reason) => Err(owner_abandon_error(reason)),
+            _ => Err(VirtioError::DeviceError),
+        };
+    }
     let mut cmd = VirtioGpuResourceUnref::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNREF;
     cmd.resource_id = resource_id;
@@ -1041,6 +1361,13 @@ pub fn attach_resource_checked(
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        if !adapter.control_owner().resource_is_live(resource_id) {
+            crate::diag::record(0x0E09_0000 | (resource_id & 0xFFFF));
+            return Err(VirtioError::DeviceError);
+        }
+        return ctx_attach_resource(passive, adapter, ctx_id, resource_id);
+    }
     let live = adapter
         .with_virtio(|v| v.resource_is_live(resource_id))
         .map_err(|_| VirtioError::DeviceError)?;
@@ -1066,6 +1393,157 @@ pub fn resource_create_blob(
     blob_id: u64,
     size: u64,
 ) -> Result<u32, VirtioError> {
+    let mut finalize = retain_resource_finalizer;
+    resource_create_blob_owned(
+        passive,
+        adapter,
+        ctx_id,
+        blob_mem,
+        blob_flags,
+        blob_id,
+        size,
+        None,
+        ResourceBackingFinalizer::none(),
+        &mut finalize,
+    )
+}
+
+/// Transfer one KMD-created Venus backing into canonical resource custody
+/// before CREATE reaches the wire. `finalize` runs outside the owner lock and
+/// returns the exact unfinished tail on ambiguity.
+pub(crate) fn resource_create_blob_with_finalizer<F>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    finalizer: ResourceBackingFinalizer,
+    mut finalize: F,
+) -> Result<u32, VirtioError>
+where
+    F: FnMut(ResourceBackingFinalizer) -> Result<(), ResourceBackingFinalizer>,
+{
+    resource_create_blob_owned(
+        passive,
+        adapter,
+        ctx_id,
+        blob_mem,
+        blob_flags,
+        blob_id,
+        size,
+        None,
+        finalizer,
+        &mut finalize,
+    )
+}
+
+fn resource_create_blob_owned<F>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    owner: Option<DeviceOwner>,
+    finalizer: ResourceBackingFinalizer,
+    finalize: &mut F,
+) -> Result<u32, VirtioError>
+where
+    F: FnMut(ResourceBackingFinalizer) -> Result<(), ResourceBackingFinalizer>,
+{
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        let (resource_id, work) = match adapter
+            .control_owner()
+            .begin_resource_create(size, owner, ctx_id, finalizer)
+        {
+            Ok(started) => started,
+            Err(refused) => {
+                let (error, returned) = refused.into_parts();
+                if let Some(finalizer) = returned {
+                    if let Err(remaining) = finalize(finalizer) {
+                        adapter
+                            .control_owner()
+                            .quarantine_resource_finalizer(remaining);
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let mut cmd = VirtioGpuResourceCreateBlob::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+        cmd.hdr.ctx_id = ctx_id;
+        cmd.resource_id = resource_id;
+        cmd.blob_mem = blob_mem;
+        cmd.blob_flags = blob_flags;
+        cmd.nr_entries = 0;
+        cmd.blob_id = blob_id;
+        cmd.size = size;
+        let mut response = [0u8; size_of::<VirtioGpuCtrlHdr>()];
+        let observed = run_owner_work(
+            passive,
+            adapter,
+            work,
+            ControlVerb::Create,
+            bytes_of(&cmd),
+            &mut response,
+        );
+        match adapter
+            .control_owner()
+            .finish_resource(observed, |finalizer| finalize(finalizer))?
+        {
+            ResourceFinishEffect::CreateCompleted => {}
+            ResourceFinishEffect::CreateDefiniteNotEnqueued(error) => return Err(error),
+            ResourceFinishEffect::CreateAmbiguous(reason) => {
+                return Err(owner_abandon_error(reason));
+            }
+            ResourceFinishEffect::CreateHostRejected(_) | _ => {
+                return Err(VirtioError::DeviceError);
+            }
+        }
+
+        let work = match adapter
+            .control_owner()
+            .begin_creator_attach(resource_id, ctx_id)
+        {
+            Ok(work) => work,
+            Err(error) => {
+                let _ = resource_unref_with_finalizer(passive, adapter, resource_id, finalize);
+                return Err(error);
+            }
+        };
+        let mut attach = VirtioGpuCtxResource::zeroed();
+        attach.hdr.type_ = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+        attach.hdr.ctx_id = ctx_id;
+        attach.resource_id = resource_id;
+        response.fill(0);
+        let observed = run_owner_work(
+            passive,
+            adapter,
+            work,
+            ControlVerb::Attach,
+            bytes_of(&attach),
+            &mut response,
+        );
+        return match adapter
+            .control_owner()
+            .finish_resource(observed, |finalizer| finalize(finalizer))?
+        {
+            ResourceFinishEffect::AttachCompleted => Ok(resource_id),
+            ResourceFinishEffect::AttachDefiniteNotEnqueued(error) => {
+                let _ = resource_unref_with_finalizer(passive, adapter, resource_id, finalize);
+                Err(error)
+            }
+            ResourceFinishEffect::AttachHostRejected(_) => {
+                let _ = resource_unref_with_finalizer(passive, adapter, resource_id, finalize);
+                Err(VirtioError::DeviceError)
+            }
+            ResourceFinishEffect::AttachAmbiguous(reason) => Err(owner_abandon_error(reason)),
+            _ => Err(VirtioError::DeviceError),
+        };
+    }
     let reserved = adapter
         .with_virtio(|v| v.reserve_resource_slot())
         .map_err(|_| VirtioError::DeviceError)?;
@@ -1118,6 +1596,21 @@ pub fn alloc_blob(
     if size == 0 {
         return Err(VirtioError::DeviceError);
     }
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        let mut finalize = retain_resource_finalizer;
+        return resource_create_blob_owned(
+            passive,
+            adapter,
+            ctx_id,
+            blob_mem,
+            blob_flags,
+            blob_id,
+            size,
+            owner,
+            ResourceBackingFinalizer::none(),
+            &mut finalize,
+        );
+    }
     let reserved = adapter
         .with_virtio(|v| v.reserve_blob_slot())
         .map_err(|_| VirtioError::DeviceError)?;
@@ -1138,6 +1631,38 @@ pub fn alloc_blob(
     }
 }
 
+fn resource_map_blob_owner_work(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    offset: u64,
+    work: DispatchWork<helios_kmd_logic::control_owner_slots::WindowSlotKind>,
+) -> Result<u32, VirtioError> {
+    let mut cmd = VirtioGpuResourceMapBlob::zeroed();
+    cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    cmd.resource_id = resource_id;
+    cmd.offset = offset;
+    let mut response = [0u8; size_of::<VirtioGpuRespMapInfo>()];
+    let observed = run_owner_work(
+        passive,
+        adapter,
+        work,
+        ControlVerb::Map,
+        bytes_of(&cmd),
+        &mut response,
+    );
+    match adapter.control_owner().finish_window(observed)? {
+        WindowFinishEffect::MapCompleted => adapter
+            .control_owner()
+            .mapped_blob(resource_id)?
+            .map(|mapped| mapped.map_cache & VIRTIO_GPU_MAP_CACHE_MASK)
+            .ok_or(VirtioError::DeviceError),
+        WindowFinishEffect::MapDefiniteNotEnqueued(error) => Err(error),
+        WindowFinishEffect::MapAmbiguous(reason) => Err(owner_abandon_error(reason)),
+        _ => Err(VirtioError::DeviceError),
+    }
+}
+
 /// `RESOURCE_MAP_BLOB` round-trip; returns the host caching nibble.
 fn resource_map_blob_roundtrip(
     passive: PassiveLevel,
@@ -1145,6 +1670,12 @@ fn resource_map_blob_roundtrip(
     resource_id: u32,
     offset: u64,
 ) -> Result<u32, VirtioError> {
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        let work = adapter
+            .control_owner()
+            .begin_window_map(resource_id, offset)?;
+        return resource_map_blob_owner_work(passive, adapter, resource_id, offset, work);
+    }
     let mut cmd = VirtioGpuResourceMapBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
     cmd.resource_id = resource_id;
@@ -1178,6 +1709,27 @@ pub fn resource_unmap_blob(
     adapter: &AdapterContext,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        let work = adapter.control_owner().begin_window_unmap(resource_id)?;
+        let mut cmd = VirtioGpuResourceUnmapBlob::zeroed();
+        cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
+        cmd.resource_id = resource_id;
+        let mut response = [0u8; size_of::<VirtioGpuCtrlHdr>()];
+        let observed = run_owner_work(
+            passive,
+            adapter,
+            work,
+            ControlVerb::Unmap,
+            bytes_of(&cmd),
+            &mut response,
+        );
+        return match adapter.control_owner().finish_window(observed)? {
+            WindowFinishEffect::UnmapCompleted => Ok(()),
+            WindowFinishEffect::UnmapDefiniteNotEnqueued(error) => Err(error),
+            WindowFinishEffect::UnmapAmbiguous(reason) => Err(owner_abandon_error(reason)),
+            _ => Err(VirtioError::DeviceError),
+        };
+    }
     let mut cmd = VirtioGpuResourceUnmapBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
     cmd.resource_id = resource_id;
@@ -1193,6 +1745,25 @@ pub fn map_blob_prepare(
     owner: OwnerFilter,
     resource_id: u32,
 ) -> Result<BlobMapPrep, VirtioError> {
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        if !adapter
+            .control_owner()
+            .resource_matches_filter(owner, resource_id)
+        {
+            return Err(VirtioError::NotOwned);
+        }
+        if let Some(mapped) = adapter.control_owner().mapped_blob(resource_id)? {
+            return Ok(mapped);
+        }
+        let (offset, work) = adapter
+            .control_owner()
+            .begin_window_map_first_fit(resource_id)?;
+        let _ = resource_map_blob_owner_work(passive, adapter, resource_id, offset, work)?;
+        return adapter
+            .control_owner()
+            .mapped_blob(resource_id)?
+            .ok_or(VirtioError::DeviceError);
+    }
     let mut busy = Budget::new(MAP_BUSY_MAX_MS);
     loop {
         let begin = adapter
@@ -1248,6 +1819,31 @@ pub fn map_blob_at(
     resource_id: u32,
     window_offset: u64,
 ) -> Result<BlobMapPrep, VirtioError> {
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        let size = adapter.control_owner().resource_size(resource_id)?;
+        let map_len = helios_kmd_logic::round_up_page(size);
+        if let Some(current) = adapter.control_owner().mapped_blob_offset(resource_id)? {
+            if current == window_offset {
+                return adapter
+                    .control_owner()
+                    .mapped_blob(resource_id)?
+                    .ok_or(VirtioError::DeviceError);
+            }
+            resource_unmap_blob(passive, adapter, resource_id)?;
+        }
+        while let Some(stale) = adapter.control_owner().first_overlapping_window_resource(
+            resource_id,
+            window_offset,
+            map_len,
+        )? {
+            resource_unmap_blob(passive, adapter, stale)?;
+        }
+        let _ = resource_map_blob_roundtrip(passive, adapter, resource_id, window_offset)?;
+        return adapter
+            .control_owner()
+            .mapped_blob(resource_id)?
+            .ok_or(VirtioError::DeviceError);
+    }
     // Evict stale overlapping placements before reserving our own slot.
     let (_, blob_size, _) = adapter
         .with_virtio(|v| v.blob_lookup(resource_id))
@@ -1315,6 +1911,44 @@ pub fn map_blob_at(
     }
 }
 
+fn release_owner_resource(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    resource_id: u32,
+) -> Result<(), VirtioError> {
+    let terminal = adapter.with_scanout_lifecycle(passive, |lock| -> Result<(), VirtioError> {
+        lock.with_venus_client(|client| {
+            let _ =
+                adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, resource_id));
+            client.release_present_blits_for_resource(adapter, resource_id)
+        })
+        .map_err(|_| VirtioError::DeviceError)??;
+        if adapter
+            .with_virtio(|v| v.finish_windowed_blt_teardown_for_resource(adapter, resource_id))
+            .unwrap_or(false)
+        {
+            Ok(())
+        } else {
+            Err(VirtioError::DeviceError)
+        }
+    });
+    terminal?;
+    if adapter
+        .control_owner()
+        .mapped_blob_offset(resource_id)?
+        .is_some()
+    {
+        resource_unmap_blob(passive, adapter, resource_id)?;
+    }
+    ctx_detach_resource(passive, adapter, ctx_id, resource_id)?;
+    resource_unref(passive, adapter, resource_id)?;
+    adapter.with_scanout_lifecycle(passive, |_lock| {
+        adapter.read_ledger.note_alloc_retired(resource_id);
+    });
+    Ok(())
+}
+
 /// `HELIOS_ESCAPE_RELEASE_BLOB` — unmap (if mapped) + detach + unref a blob and
 /// drop its tracking slot, returning its window range to the free list.
 pub fn release_blob_for_owner(
@@ -1324,6 +1958,15 @@ pub fn release_blob_for_owner(
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        if !adapter
+            .control_owner()
+            .resource_owned_by(Some(owner), ctx_id, resource_id)
+        {
+            return Ok(());
+        }
+        return release_owner_resource(passive, adapter, ctx_id, resource_id);
+    }
     let taken = adapter
         .with_virtio(|v| v.take_blob_matching(owner, ctx_id, resource_id))
         .map_err(|_| VirtioError::DeviceError)?;
@@ -1388,6 +2031,16 @@ pub fn release_blobs_for_owner(
     adapter: &AdapterContext,
     owner: Option<DeviceOwner>,
 ) -> u32 {
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        let mut reclaimed = 0u32;
+        while let Some((ctx_id, resource_id)) = adapter.control_owner().resource_for_owner(owner) {
+            if release_owner_resource(passive, adapter, ctx_id, resource_id).is_err() {
+                break;
+            }
+            reclaimed = reclaimed.saturating_add(1);
+        }
+        return reclaimed;
+    }
     let mut reclaimed = 0u32;
     loop {
         let taken = adapter
@@ -1449,6 +2102,15 @@ pub fn forget_allocation_blob(
     adapter: &AdapterContext,
     resource_id: u32,
 ) -> bool {
+    if super::control_owner::KMD_D2_OWNER_ENABLED {
+        let Ok(mapped) = adapter.control_owner().mapped_blob_offset(resource_id) else {
+            return false;
+        };
+        if mapped.is_some() {
+            return resource_unmap_blob(passive, adapter, resource_id).is_ok();
+        }
+        return false;
+    }
     let taken = adapter
         .with_virtio(|v| v.forget_allocation_blob(resource_id))
         .unwrap_or(None);

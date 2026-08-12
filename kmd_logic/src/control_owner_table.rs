@@ -144,11 +144,12 @@ mod tests {
                 pair_tickets: &mut pair_tickets,
                 window_tickets: &mut window_tickets,
             };
-            let mut $name =
-                match unsafe { OwnerTable::new(slot_root, $generation, config, storage) } {
-                    Ok(table) => table,
-                    Err(_) => panic!("fresh owner table refused"),
-                };
+            let mut $name = match unsafe {
+                OwnerTable::new(slot_root, $generation, NonZeroU64::MIN, config, storage)
+            } {
+                Ok(table) => table,
+                Err(_) => panic!("fresh owner table refused"),
+            };
         };
     }
 
@@ -270,7 +271,9 @@ mod tests {
             Ok(preparation) => preparation,
             Err(_) => panic!("reset preparation refused"),
         };
-        let preparation = match unsafe { preparation.verify_raw_zero(1) } {
+        // Exercise a bit above the legacy u8 status width: every raw transport
+        // status bit must participate in the physical-reset proof.
+        let preparation = match unsafe { preparation.verify_raw_zero(0x100) } {
             Ok(_) => panic!("nonzero status accepted"),
             Err(refused) => refused.into_preparation(),
         };
@@ -316,12 +319,28 @@ mod tests {
         table!(table, generation(0x7101, 1), 0x8101, 2);
         let resource = create_resource(&mut table, &drops);
         let context = create_context(&mut table, &drops);
+        assert_eq!(
+            table.resource_handle_by_id(table.resource(resource).must().id()),
+            Ok(resource)
+        );
+        assert_eq!(
+            table.context_handle_by_id(table.context(context).must().id()),
+            Ok(context)
+        );
         let admission = table
             .begin_secondary_attach(resource, context, Token::new(&drops))
             .must();
         let (pair, prepared) = admission.into_parts();
         let pending = finish_pair(&mut table, prepared, nodata());
         table.ack_pair_completion(pending).must();
+        assert_eq!(
+            table.pair_handle_by_ids(
+                table.resource(resource).must().id(),
+                table.context(context).must().id(),
+                PairKind::Secondary,
+            ),
+            Ok(pair)
+        );
         let identity = table.resource(resource).must();
         let window_identity = TransportWindow::new(identity, 0x2000, 0x1000).must();
         let admission = table
@@ -330,7 +349,20 @@ mod tests {
         let (window, prepared) = admission.into_parts();
         let pending = finish_window(&mut table, prepared, map_info(0));
         table.ack_window_completion(pending).must();
+        assert_eq!(
+            table.window_handle_by_resource_id(table.resource(resource).must().id()),
+            Ok(window)
+        );
         assert_eq!(table.mapped_window_info(window), Ok(0));
+        assert_eq!(
+            table.mapped_resource_at_offset(0x2000),
+            Ok(Some(table.resource(resource).must().id()))
+        );
+        assert_eq!(
+            table.mapped_resource_at_offset(0x2fff),
+            Ok(Some(table.resource(resource).must().id()))
+        );
+        assert_eq!(table.mapped_resource_at_offset(0x3000), Ok(None));
 
         let pair_use = table.borrow_pair_use(resource, context).must();
         let window_use = table.borrow_window_use(window).must();
@@ -408,15 +440,28 @@ mod tests {
         assert!(table.next_reset_action().must().is_none());
         assert_eq!(table.phase(), OwnerPhase::Ready);
         let request = table.request_next_transport().must();
-        let mut ready = unsafe { request.assume_ready(NonZeroU64::MIN) };
+        let successor_config = OwnerConfig::new(0, 0x40_000, 0x1000).must();
+        let mut ready =
+            unsafe { request.assume_ready(NonZeroU64::new(2).must(), successor_config) };
         let exact_table = ready.request.table;
         ready.request.table = unsafe { SlotTableRoot::new(0x81ff) }.must().id();
         let refusal = table.reopen(ready).must_err();
         assert_eq!(refusal.reason(), OwnerTableRefusal::NextTransportMismatch);
         let mut ready = refusal.into_ready();
         ready.request.table = exact_table;
+        table.cancel_next_transport(ready).must();
+        let request = table.request_next_transport().must();
+        let stale = unsafe {
+            request.assume_ready(table.physical_instance(), successor_config)
+        };
+        let refused = table.reopen(stale).must_err();
+        assert_eq!(refused.reason(), OwnerTableRefusal::NextTransportMismatch);
+        table.cancel_next_transport(refused.into_ready()).must();
+        let request = table.request_next_transport().must();
+        let ready = unsafe { request.assume_ready(NonZeroU64::new(2).must(), successor_config) };
         table.reopen(ready).must();
         assert_eq!(table.phase(), OwnerPhase::Open);
+        assert_eq!(table.config(), successor_config);
         assert_eq!(
             table.resource(resource),
             Err(OwnerTableRefusal::ResourceNotFound)
@@ -962,6 +1007,61 @@ mod tests {
     }
 
     #[test]
+    fn first_fit_respects_prefix_and_every_window_state_remains_exact() {
+        let drops = Rc::new(Cell::new(0));
+        table!(table, generation(0x710b, 1), 0x810b, 3);
+        table.config = table.config.with_first_fit_base(0x5000).must();
+
+        let prefix_resource = create_resource(&mut table, &drops);
+        let prefix_identity = TransportWindow::new(
+            table.resource(prefix_resource).must(),
+            0x1000,
+            0x1000,
+        )
+        .must();
+        let prefix = table
+            .begin_window_map(prefix_resource, prefix_identity, Token::new(&drops))
+            .must();
+        let (_, prefix_control) = prefix.into_parts();
+        let pending = finish_window(&mut table, prefix_control, map_info(3));
+        table.ack_window_completion(pending).must();
+        assert_eq!(table.first_available_window_offset(0x1000), Ok(0x5000));
+
+        let first_fit_resource = create_resource(&mut table, &drops);
+        let first_fit_id = table.resource(first_fit_resource).must().id();
+        let first_fit_identity = TransportWindow::new(
+            table.resource(first_fit_resource).must(),
+            0x5000,
+            0x1000,
+        )
+        .must();
+        let admission = table
+            .begin_window_map(
+                first_fit_resource,
+                first_fit_identity,
+                Token::new(&drops),
+            )
+            .must();
+        let (_, prepared) = admission.into_parts();
+
+        // Initializing rows reserve their exact range but do not claim that its
+        // bytes are mapped until the matching host observation lands.
+        assert_eq!(table.first_available_window_offset(0x1000), Ok(0x6000));
+        assert_eq!(table.mapped_resource_at_offset(0x5000), Ok(None));
+        assert_eq!(
+            table.first_overlapping_window_resource(0, 0x5800, 0x100),
+            Ok(Some(first_fit_id))
+        );
+
+        let pending = finish_window(&mut table, prepared, map_info(7));
+        table.ack_window_completion(pending).must();
+        assert_eq!(
+            table.mapped_resource_at_offset(0x5fff),
+            Ok(Some(first_fit_id))
+        );
+    }
+
+    #[test]
     fn orderly_closing_drains_secondary_window_resource_and_context() {
         let drops = Rc::new(Cell::new(0));
         table!(table, generation(0x7110, 1), 0x8110, 2);
@@ -1452,6 +1552,99 @@ mod tests {
             }
         );
     }
+
+    #[test]
+    fn dormant_seed_activates_only_its_exact_observed_transport() {
+        let mut seed = dormant_seed(0x7129);
+        let instance = NonZeroU64::new(61).must();
+        let config = OwnerConfig::new(0, 0x10_0000, 0x1000).must();
+        seed.observe_transport(unsafe {
+            DormantTransportObservation::assume_ready(seed.table(), seed.epoch(), instance, config)
+        })
+        .must();
+
+        let mut resources =
+            core::array::from_fn::<_, 2, _>(|_| ResourceOwnerSlot::<Token>::vacant());
+        let mut contexts = core::array::from_fn::<_, 2, _>(|_| ContextOwnerSlot::<Token>::vacant());
+        let mut pairs = core::array::from_fn::<_, 2, _>(|_| PairOwnerSlot::<Token>::vacant());
+        let mut windows = core::array::from_fn::<_, 2, _>(|_| WindowOwnerSlot::<Token>::vacant());
+        let mut resource_tickets =
+            core::array::from_fn::<_, 2, _>(|_| ResourceOwnerTicket::<u8>::empty());
+        let mut context_tickets =
+            core::array::from_fn::<_, 2, _>(|_| ContextOwnerTicket::<u8>::empty());
+        let mut pair_tickets = core::array::from_fn::<_, 2, _>(|_| PairOwnerTicket::<u8>::empty());
+        let mut window_tickets =
+            core::array::from_fn::<_, 2, _>(|_| WindowOwnerTicket::<u8>::empty());
+        let storage = OwnerStorage {
+            resources: &mut resources,
+            contexts: &mut contexts,
+            pairs: &mut pairs,
+            windows: &mut windows,
+            resource_tickets: &mut resource_tickets,
+            context_tickets: &mut context_tickets,
+            pair_tickets: &mut pair_tickets,
+            window_tickets: &mut window_tickets,
+        };
+
+        let table = seed.activate(instance, storage).must();
+        assert_eq!(table.phase(), OwnerPhase::Open);
+        assert_eq!(table.physical_instance(), instance);
+        assert_eq!(table.epoch().must().get(), 1);
+    }
+
+    #[test]
+    fn dormant_activation_refuses_foreign_instance_without_losing_custody() {
+        let mut seed = dormant_seed(0x7130);
+        let instance = NonZeroU64::new(71).must();
+        let foreign = NonZeroU64::new(72).must();
+        let config = OwnerConfig::new(0, 0x10_0000, 0x1000).must();
+        seed.observe_transport(unsafe {
+            DormantTransportObservation::assume_ready(seed.table(), seed.epoch(), instance, config)
+        })
+        .must();
+
+        let mut resources =
+            core::array::from_fn::<_, 1, _>(|_| ResourceOwnerSlot::<Token>::vacant());
+        let mut contexts = core::array::from_fn::<_, 1, _>(|_| ContextOwnerSlot::<Token>::vacant());
+        let mut pairs = core::array::from_fn::<_, 1, _>(|_| PairOwnerSlot::<Token>::vacant());
+        let mut windows = core::array::from_fn::<_, 1, _>(|_| WindowOwnerSlot::<Token>::vacant());
+        let mut resource_tickets =
+            core::array::from_fn::<_, 1, _>(|_| ResourceOwnerTicket::<u8>::empty());
+        let mut context_tickets =
+            core::array::from_fn::<_, 1, _>(|_| ContextOwnerTicket::<u8>::empty());
+        let mut pair_tickets = core::array::from_fn::<_, 1, _>(|_| PairOwnerTicket::<u8>::empty());
+        let mut window_tickets =
+            core::array::from_fn::<_, 1, _>(|_| WindowOwnerTicket::<u8>::empty());
+        let storage = OwnerStorage {
+            resources: &mut resources,
+            contexts: &mut contexts,
+            pairs: &mut pairs,
+            windows: &mut windows,
+            resource_tickets: &mut resource_tickets,
+            context_tickets: &mut context_tickets,
+            pair_tickets: &mut pair_tickets,
+            window_tickets: &mut window_tickets,
+        };
+
+        let refused = seed.activate(foreign, storage).must_err();
+        assert_eq!(
+            refused.reason(),
+            DormantOwnerActivationRefusal::PhysicalInstanceMismatch {
+                expected: instance,
+                found: foreign,
+            }
+        );
+        let (seed, storage) = refused.into_parts();
+        assert_eq!(
+            seed.state(),
+            DormantOwnerState::Ready {
+                physical_instance: instance,
+                config,
+            }
+        );
+        assert_eq!(storage.resources.len(), 1);
+        assert!(storage.resource_tickets[0].is_fresh());
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1465,6 +1658,7 @@ pub struct OwnerConfig {
     window_base: u64,
     window_length: u64,
     window_alignment: u64,
+    first_fit_base: u64,
 }
 
 impl OwnerConfig {
@@ -1484,7 +1678,28 @@ impl OwnerConfig {
             window_base,
             window_length,
             window_alignment,
+            first_fit_base: window_base,
         })
+    }
+
+    /// Reserve a prefix for a different exact allocator while retaining the
+    /// complete transport window for fixed placements. The first-fit cursor may
+    /// begin only at an aligned address inside the configured bounds.
+    pub const fn with_first_fit_base(
+        mut self,
+        first_fit_base: u64,
+    ) -> Result<Self, OwnerTableRefusal> {
+        let Some(window_end) = self.window_base.checked_add(self.window_length) else {
+            return Err(OwnerTableRefusal::WindowBoundsInvalid);
+        };
+        if first_fit_base < self.window_base
+            || first_fit_base > window_end
+            || first_fit_base & (self.window_alignment - 1) != 0
+        {
+            return Err(OwnerTableRefusal::WindowBoundsInvalid);
+        }
+        self.first_fit_base = first_fit_base;
+        Ok(self)
     }
 }
 
@@ -1871,6 +2086,109 @@ pub struct OwnerStorage<'a, B, C, A, W, E> {
     pub context_tickets: &'a mut [ContextOwnerTicket<E>],
     pub pair_tickets: &'a mut [PairOwnerTicket<E>],
     pub window_tickets: &'a mut [WindowOwnerTicket<E>],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DormantOwnerActivationRefusal {
+    NoTransportObserved,
+    TransportUnavailable(DormantTransportUnavailable),
+    PhysicalInstanceMismatch {
+        expected: NonZeroU64,
+        found: NonZeroU64,
+    },
+    OwnerTable(OwnerTableRefusal),
+}
+
+#[must_use]
+pub struct RefusedDormantOwnerActivation<'a, B, C, A, W, E> {
+    reason: DormantOwnerActivationRefusal,
+    seed: DormantOwnerSeed,
+    storage: OwnerStorage<'a, B, C, A, W, E>,
+}
+
+impl<'a, B, C, A, W, E> RefusedDormantOwnerActivation<'a, B, C, A, W, E> {
+    pub const fn reason(&self) -> DormantOwnerActivationRefusal {
+        self.reason
+    }
+
+    pub fn into_parts(self) -> (DormantOwnerSeed, OwnerStorage<'a, B, C, A, W, E>) {
+        (self.seed, self.storage)
+    }
+}
+
+impl DormantOwnerSeed {
+    pub fn activate<'a, B, C, A, W, E>(
+        self,
+        physical_instance: NonZeroU64,
+        storage: OwnerStorage<'a, B, C, A, W, E>,
+    ) -> Result<OwnerTable<'a, B, C, A, W, E>, RefusedDormantOwnerActivation<'a, B, C, A, W, E>>
+    {
+        let config = match self.state {
+            DormantOwnerState::NoTransport => {
+                return Err(RefusedDormantOwnerActivation {
+                    reason: DormantOwnerActivationRefusal::NoTransportObserved,
+                    seed: self,
+                    storage,
+                });
+            }
+            DormantOwnerState::Unavailable { reason, .. } => {
+                return Err(RefusedDormantOwnerActivation {
+                    reason: DormantOwnerActivationRefusal::TransportUnavailable(reason),
+                    seed: self,
+                    storage,
+                });
+            }
+            DormantOwnerState::Ready {
+                physical_instance: expected,
+                config,
+            } => {
+                if expected != physical_instance {
+                    return Err(RefusedDormantOwnerActivation {
+                        reason: DormantOwnerActivationRefusal::PhysicalInstanceMismatch {
+                            expected,
+                            found: physical_instance,
+                        },
+                        seed: self,
+                        storage,
+                    });
+                }
+                config
+            }
+        };
+
+        if let Some(reason) = OwnerTable::<B, C, A, W, E>::validate_storage(&storage) {
+            return Err(RefusedDormantOwnerActivation {
+                reason: DormantOwnerActivationRefusal::OwnerTable(reason),
+                seed: self,
+                storage,
+            });
+        }
+
+        let DormantOwnerSeed {
+            root,
+            generation,
+            physical_instance_high_water,
+            state,
+        } = self;
+        match unsafe { OwnerTable::new(root, generation, physical_instance, config, storage) } {
+            Ok(table) => Ok(table),
+            Err(refused) => {
+                let (root, generation, _, storage) = refused.into_parts();
+                Err(RefusedDormantOwnerActivation {
+                    reason: DormantOwnerActivationRefusal::OwnerTable(
+                        OwnerTableRefusal::InvariantLost,
+                    ),
+                    seed: DormantOwnerSeed {
+                        root,
+                        generation,
+                        physical_instance_high_water,
+                        state,
+                    },
+                    storage,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2383,6 +2701,7 @@ impl<T> RefusedWork<T> {
 pub struct ResetPreparation {
     table: crate::control_owner_slots::SlotTableId,
     epoch: TransportEpoch,
+    physical_instance: NonZeroU64,
 }
 
 #[must_use]
@@ -2429,12 +2748,16 @@ pub struct VerifiedPhysicalReset {
 }
 
 impl ResetPreparation {
+    pub const fn physical_instance(&self) -> NonZeroU64 {
+        self.physical_instance
+    }
+
     /// Safety: `raw_status` came from a volatile read of this exact transport;
     /// every runner, pair/window user, and external effect is drained, and no
     /// old work can publish or retain backend custody.
     pub unsafe fn verify_raw_zero(
         self,
-        raw_status: u8,
+        raw_status: u32,
     ) -> Result<VerifiedPhysicalReset, RefusedPhysicalReset> {
         if raw_status != 0 {
             return Err(RefusedPhysicalReset {
@@ -2645,6 +2968,7 @@ pub struct NextTransportRequest {
 pub struct NextTransportReady {
     request: NextTransportRequest,
     physical_instance: NonZeroU64,
+    config: OwnerConfig,
 }
 
 #[must_use]
@@ -2666,10 +2990,15 @@ impl RefusedNextTransportReady {
 impl NextTransportRequest {
     /// Safety: the exact successor transport is initialized and published,
     /// with no old transport authority retained at this physical instance.
-    pub unsafe fn assume_ready(self, physical_instance: NonZeroU64) -> NextTransportReady {
+    pub unsafe fn assume_ready(
+        self,
+        physical_instance: NonZeroU64,
+        config: OwnerConfig,
+    ) -> NextTransportReady {
         NextTransportReady {
             request: self,
             physical_instance,
+            config,
         }
     }
 }
@@ -2677,6 +3006,8 @@ impl NextTransportRequest {
 pub struct OwnerTable<'a, B, C, A, W, E> {
     root: SlotTableRoot,
     generation: Option<TransportGeneration>,
+    physical_instance: NonZeroU64,
+    physical_instance_high_water: u64,
     config: OwnerConfig,
     phase: OwnerPhase,
     rundown_high_water: u64,
@@ -2708,6 +3039,7 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
     pub unsafe fn new(
         root: SlotTableRoot,
         generation: TransportGeneration,
+        physical_instance: NonZeroU64,
         config: OwnerConfig,
         storage: OwnerStorage<'a, B, C, A, W, E>,
     ) -> Result<Self, RefusedOwnerTableNew<'a, B, C, A, W, E>> {
@@ -2736,6 +3068,8 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
         Ok(Self {
             root,
             generation: Some(generation),
+            physical_instance,
+            physical_instance_high_water: physical_instance.get(),
             config,
             phase: OwnerPhase::Open,
             rundown_high_water: 0,
@@ -2772,6 +3106,14 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
 
     pub fn epoch(&self) -> Option<crate::control_ownership::TransportEpoch> {
         self.generation.as_ref().map(TransportGeneration::epoch)
+    }
+
+    pub const fn physical_instance(&self) -> NonZeroU64 {
+        self.physical_instance
+    }
+
+    pub const fn config(&self) -> OwnerConfig {
+        self.config
     }
 
     pub const fn active_runs(&self) -> u64 {
@@ -2848,6 +3190,7 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
         Ok(ResetPreparation {
             table: self.root.id(),
             epoch,
+            physical_instance: self.physical_instance,
         })
     }
 
@@ -2859,6 +3202,7 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
         let exact = self.phase == OwnerPhase::ResetPrepared
             && preparation.table == self.root.id()
             && Some(preparation.epoch) == self.epoch()
+            && preparation.physical_instance == self.physical_instance
             && self.active_runs == 0
             && self.local_uses_drained()
             && !self.has_release_pending_or_extracted();
@@ -3044,8 +3388,9 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
             && ready.request.table == self.root.id()
             && self.reset.as_ref().map(TransportReset::retired_epoch)
                 == Some(ready.request.retired)
-            && expected_successor == Some(ready.request.successor);
-        if !exact || ready.physical_instance.get() == 0 {
+            && expected_successor == Some(ready.request.successor)
+            && ready.physical_instance.get() > self.physical_instance_high_water;
+        if !exact {
             return Err(RefusedNextTransportReady {
                 reason: OwnerTableRefusal::NextTransportMismatch,
                 ready,
@@ -3067,12 +3412,40 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
         let epoch = next.epoch();
         unsafe { self.apply_successor_rebind(epoch) };
         self.generation = Some(next);
+        self.physical_instance = ready.physical_instance;
+        self.physical_instance_high_water = ready.physical_instance.get();
+        self.config = ready.config;
         self.reset = None;
         self.reset_exhausted = false;
         self.reset_stage = ResetStage::Windows;
         self.reset_index = 0;
         self.next_request_issued = false;
         self.phase = OwnerPhase::Open;
+        Ok(())
+    }
+
+    /// Return an exact rejected install candidate without spending the sealed
+    /// successor. This is the StartDevice failure edge: the physical candidate
+    /// is reset and discarded, then a later candidate may request the same
+    /// successor epoch.
+    pub fn cancel_next_transport(
+        &mut self,
+        ready: NextTransportReady,
+    ) -> Result<(), RefusedNextTransportReady> {
+        let exact = self.phase == OwnerPhase::Ready
+            && self.next_request_issued
+            && ready.request.table == self.root.id()
+            && self.reset.as_ref().map(TransportReset::retired_epoch)
+                == Some(ready.request.retired)
+            && self.sealed_next.as_ref().map(TransportGeneration::epoch)
+                == Some(ready.request.successor);
+        if !exact {
+            return Err(RefusedNextTransportReady {
+                reason: OwnerTableRefusal::NextTransportMismatch,
+                ready,
+            });
+        }
+        self.next_request_issued = false;
         Ok(())
     }
 
@@ -3106,6 +3479,101 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
             .map_err(|_| OwnerTableRefusal::ContextNotFound)
     }
 
+    pub fn resource_handle_by_id(&self, id: u32) -> Result<ResourceHandle, OwnerTableRefusal> {
+        self.resources
+            .find_unique_occupied_handle(|row| {
+                row.lifecycle
+                    .as_ref()
+                    .is_some_and(|lifecycle| lifecycle.resource().id() == id)
+            })
+            .map_err(|()| OwnerTableRefusal::InvariantLost)?
+            .ok_or(OwnerTableRefusal::ResourceNotFound)
+    }
+
+    pub fn context_handle_by_id(&self, id: u32) -> Result<ContextHandle, OwnerTableRefusal> {
+        self.contexts
+            .find_unique_occupied_handle(|row| {
+                row.lifecycle
+                    .as_ref()
+                    .is_some_and(|lifecycle| lifecycle.context().id() == id)
+            })
+            .map_err(|()| OwnerTableRefusal::InvariantLost)?
+            .ok_or(OwnerTableRefusal::ContextNotFound)
+    }
+
+    pub fn pair_handle_by_ids(
+        &self,
+        resource_id: u32,
+        context_id: u32,
+        kind: PairKind,
+    ) -> Result<PairHandle, OwnerTableRefusal> {
+        let resource = self.resource_handle_by_id(resource_id)?;
+        let context = self.context_handle_by_id(context_id)?;
+        self.pairs
+            .find_unique_occupied_handle(|row| {
+                row.resource == resource && row.context == context && row.kind == kind
+            })
+            .map_err(|()| OwnerTableRefusal::InvariantLost)?
+            .ok_or(OwnerTableRefusal::PairNotFound)
+    }
+
+    pub fn window_handle_by_resource_id(
+        &self,
+        resource_id: u32,
+    ) -> Result<WindowHandle, OwnerTableRefusal> {
+        let resource = self.resource_handle_by_id(resource_id)?;
+        self.windows
+            .find_unique_occupied_handle(|row| row.resource == resource)
+            .map_err(|()| OwnerTableRefusal::InvariantLost)?
+            .ok_or(OwnerTableRefusal::WindowNotFound)
+    }
+
+    pub fn resource_backing(&self, handle: ResourceHandle) -> Result<&B, OwnerTableRefusal> {
+        self.resources
+            .get(handle)
+            .ok()
+            .and_then(|row| row.lifecycle.as_ref())
+            .map(ResourceLifecycle::backing)
+            .ok_or(OwnerTableRefusal::ResourceNotFound)
+    }
+
+    pub fn first_resource_handle_where<F>(
+        &self,
+        mut predicate: F,
+    ) -> Result<Option<ResourceHandle>, OwnerTableRefusal>
+    where
+        F: FnMut(&B) -> bool,
+    {
+        Ok(self.resources.find_occupied_handle(|row| {
+            row.lifecycle
+                .as_ref()
+                .is_some_and(|lifecycle| predicate(lifecycle.backing()))
+        }))
+    }
+
+    pub fn context_owner(&self, handle: ContextHandle) -> Result<&C, OwnerTableRefusal> {
+        self.contexts
+            .get(handle)
+            .ok()
+            .and_then(|row| row.lifecycle.as_ref())
+            .map(TransportContextLifecycle::owner)
+            .ok_or(OwnerTableRefusal::ContextNotFound)
+    }
+
+    pub fn first_context_handle_by_owner(
+        &self,
+        owner: &C,
+    ) -> Result<Option<ContextHandle>, OwnerTableRefusal>
+    where
+        C: PartialEq,
+    {
+        Ok(self.contexts.find_occupied_handle(|row| {
+            row.lifecycle
+                .as_ref()
+                .is_some_and(|lifecycle| lifecycle.owner() == owner)
+        }))
+    }
+
     pub fn mapped_window_info(&self, handle: WindowHandle) -> Result<u32, OwnerTableRefusal> {
         if !matches!(self.phase, OwnerPhase::Open | OwnerPhase::Closing) {
             return Err(OwnerTableRefusal::WrongPhase { found: self.phase });
@@ -3123,10 +3591,144 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
         row.map_info.ok_or(OwnerTableRefusal::InvariantLost)
     }
 
+    pub fn mapped_window(
+        &self,
+        handle: WindowHandle,
+    ) -> Result<TransportWindow, OwnerTableRefusal> {
+        if !matches!(self.phase, OwnerPhase::Open | OwnerPhase::Closing) {
+            return Err(OwnerTableRefusal::WrongPhase { found: self.phase });
+        }
+        let row = self
+            .windows
+            .get(handle)
+            .map_err(|_| OwnerTableRefusal::WindowNotFound)?;
+        let WindowRowState::Live(lifecycle) = &row.state else {
+            return Err(OwnerTableRefusal::WindowNotFound);
+        };
+        if lifecycle.phase() != crate::control_ownership::WindowPhase::Mapped {
+            return Err(OwnerTableRefusal::WindowNotFound);
+        }
+        Ok(lifecycle.window())
+    }
+
+    /// Exact mapped resource whose live window contains `offset`. Initializing,
+    /// unmapping, release-pending, and quarantined rows deliberately do not
+    /// answer: none proves bytes are currently addressable at that offset.
+    pub fn mapped_resource_at_offset(
+        &self,
+        offset: u64,
+    ) -> Result<Option<u32>, OwnerTableRefusal> {
+        if !matches!(self.phase, OwnerPhase::Open | OwnerPhase::Closing) {
+            return Err(OwnerTableRefusal::WrongPhase { found: self.phase });
+        }
+        for index in 0..self.windows.capacity() {
+            let Some(handle) = self.windows.occupied_handle_at(index) else {
+                continue;
+            };
+            let row = self
+                .windows
+                .get(handle)
+                .map_err(|_| OwnerTableRefusal::InvariantLost)?;
+            let WindowRowState::Live(lifecycle) = &row.state else {
+                continue;
+            };
+            if lifecycle.phase() != crate::control_ownership::WindowPhase::Mapped {
+                continue;
+            }
+            let window = lifecycle.window();
+            let end = window
+                .offset()
+                .checked_add(window.length())
+                .ok_or(OwnerTableRefusal::InvariantLost)?;
+            if window.offset() <= offset && offset < end {
+                return self.resource(row.resource).map(|resource| Some(resource.id()));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn first_available_window_offset(&self, length: u64) -> Result<u64, OwnerTableRefusal> {
+        if length == 0 || length & (self.config.window_alignment - 1) != 0 {
+            return Err(OwnerTableRefusal::WindowMisaligned);
+        }
+        let bounds_end = self
+            .config
+            .window_base
+            .checked_add(self.config.window_length)
+            .ok_or(OwnerTableRefusal::WindowBoundsInvalid)?;
+        let mut candidate = self.config.first_fit_base;
+        for _ in 0..=self.windows.capacity() {
+            let end = candidate
+                .checked_add(length)
+                .ok_or(OwnerTableRefusal::WindowOutOfBounds)?;
+            if end > bounds_end {
+                return Err(OwnerTableRefusal::WindowOutOfBounds);
+            }
+            let mut next = None;
+            for index in 0..self.windows.capacity() {
+                let Some(handle) = self.windows.occupied_handle_at(index) else {
+                    continue;
+                };
+                let row = self
+                    .windows
+                    .get(handle)
+                    .map_err(|_| OwnerTableRefusal::InvariantLost)?;
+                let row_end = row
+                    .window
+                    .offset()
+                    .checked_add(row.window.length())
+                    .ok_or(OwnerTableRefusal::InvariantLost)?;
+                if candidate < row_end && row.window.offset() < end {
+                    next = Some(next.map_or(row_end, |found: u64| found.max(row_end)));
+                }
+            }
+            match next {
+                None => return Ok(candidate),
+                Some(found) => {
+                    candidate = found
+                        .checked_add(self.config.window_alignment - 1)
+                        .map(|value| value & !(self.config.window_alignment - 1))
+                        .ok_or(OwnerTableRefusal::WindowOutOfBounds)?;
+                }
+            }
+        }
+        Err(OwnerTableRefusal::InvariantLost)
+    }
+
+    pub fn first_overlapping_window_resource(
+        &self,
+        except_resource_id: u32,
+        offset: u64,
+        length: u64,
+    ) -> Result<Option<u32>, OwnerTableRefusal> {
+        let end = offset
+            .checked_add(length)
+            .ok_or(OwnerTableRefusal::WindowOutOfBounds)?;
+        for index in 0..self.windows.capacity() {
+            let Some(handle) = self.windows.occupied_handle_at(index) else {
+                continue;
+            };
+            let row = self
+                .windows
+                .get(handle)
+                .map_err(|_| OwnerTableRefusal::InvariantLost)?;
+            let resource = self.resource(row.resource)?.id();
+            let row_end = row
+                .window
+                .offset()
+                .checked_add(row.window.length())
+                .ok_or(OwnerTableRefusal::InvariantLost)?;
+            if resource != except_resource_id && offset < row_end && row.window.offset() < end {
+                return Ok(Some(resource));
+            }
+        }
+        Ok(None)
+    }
+
     pub fn reserve_resource(
         &mut self,
         backing: B,
-    ) -> Result<ResourceHandle, RefusedAdmission<B, ResourceRow<B>>> {
+    ) -> Result<ResourceHandle, RefusedAdmission<B>> {
         if self.phase != OwnerPhase::Open {
             return Err(RefusedAdmission {
                 reason: OwnerTableRefusal::WrongPhase { found: self.phase },
@@ -3167,17 +3769,26 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
         };
         match self.resources.insert(row) {
             Ok(handle) => Ok(handle),
-            Err(refused) => Err(RefusedAdmission {
-                reason: OwnerTableRefusal::InvariantLost,
-                custody: RefusedCustody::Quarantined(ManuallyDrop::new(refused.into_payload())),
-            }),
+            Err(refused) => {
+                let mut row = refused.into_payload();
+                // SAFETY: `row` was constructed immediately above and the sole
+                // intervening operation failed to publish it. No ticket, wire
+                // request, attachment, window, or lookup handle escaped, so its
+                // lifecycle is still the `Some(Reserved)` installed above.
+                let lifecycle = unsafe { row.lifecycle.take().unwrap_unchecked() };
+                let backing = unsafe { lifecycle.assume_unpublished_cancelled() };
+                Err(RefusedAdmission {
+                    reason: OwnerTableRefusal::InvariantLost,
+                    custody: RefusedCustody::Input(ManuallyDrop::new(backing)),
+                })
+            }
         }
     }
 
     pub fn reserve_context(
         &mut self,
         owner: C,
-    ) -> Result<ContextHandle, RefusedAdmission<C, ContextRow<C>>> {
+    ) -> Result<ContextHandle, RefusedAdmission<C>> {
         if self.phase != OwnerPhase::Open {
             return Err(RefusedAdmission {
                 reason: OwnerTableRefusal::WrongPhase { found: self.phase },
@@ -3214,10 +3825,19 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
         };
         match self.contexts.insert(row) {
             Ok(handle) => Ok(handle),
-            Err(refused) => Err(RefusedAdmission {
-                reason: OwnerTableRefusal::InvariantLost,
-                custody: RefusedCustody::Quarantined(ManuallyDrop::new(refused.into_payload())),
-            }),
+            Err(refused) => {
+                let mut row = refused.into_payload();
+                // SAFETY: `row` was constructed immediately above and the sole
+                // intervening operation failed to publish it. No ticket, wire
+                // request, lease, or lookup handle escaped, so its lifecycle is
+                // still the `Some(Reserved)` installed above.
+                let lifecycle = unsafe { row.lifecycle.take().unwrap_unchecked() };
+                let owner = unsafe { lifecycle.assume_unpublished_cancelled() };
+                Err(RefusedAdmission {
+                    reason: OwnerTableRefusal::InvariantLost,
+                    custody: RefusedCustody::Input(ManuallyDrop::new(owner)),
+                })
+            }
         }
     }
 

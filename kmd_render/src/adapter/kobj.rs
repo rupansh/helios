@@ -14,7 +14,7 @@
 use core::ffi::c_void;
 use core::sync::atomic::AtomicU64;
 
-use wdk_sys::ntddk::{KeInitializeEvent, KeSetEvent, KeWaitForSingleObject};
+use wdk_sys::ntddk::{KeInitializeEvent, KeResetEvent, KeSetEvent, KeWaitForSingleObject};
 use wdk_sys::PVOID;
 
 use crate::dxgk::*;
@@ -75,6 +75,11 @@ impl AdapterContext {
         if self.hpd_thread.load(Ordering::Acquire) != 0 {
             return;
         }
+        // NotificationEvent remains signalled after the previous worker exits.
+        // Reset it before publishing a successor thread handle, otherwise a
+        // later stop can mistake the predecessor's terminal signal for this
+        // worker's rundown proof.
+        unsafe { KeResetEvent(self.hpd_exited.get()) };
         self.hpd_stop.store(0, Ordering::Release);
         self.scanout_refresh_pending.store(0, Ordering::Release);
         self.scanout_flush_inflight.store(0, Ordering::Release);

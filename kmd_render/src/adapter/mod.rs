@@ -1453,10 +1453,10 @@ impl AdapterContext {
     /// Take the contiguous RAM blocks out of a PREVIOUS start's state so the
     /// next one can carry them forward.
     ///
-    /// These blocks are allocated once and freed only in `Drop`; a stop/start
-    /// cycle on the same context must reuse them, not leak them and allocate
-    /// again. Today's code gets this by leaving the fields untouched across
-    /// StopDevice, which publish-once would otherwise lose.
+    /// These blocks are normally reused across a stop/start cycle and released
+    /// by their owning `PagingRam` on failed Start or final adapter destruction.
+    /// Leaving them inside StartedState across StopDevice is what lets this take
+    /// move them into the successor publication without a leak.
     ///
     /// # Safety
     /// PASSIVE_LEVEL, from `DxgkDdiStartDevice` only, which dxgkrnl serializes.
@@ -1588,6 +1588,24 @@ impl AdapterContext {
         unsafe { *state.transport.get() = generation };
     }
 
+    /// Replace only the reset-local Venus context after a verified TDR reset.
+    /// The PCI BAR and reported segment table survive that reset unchanged.
+    ///
+    /// # Safety
+    /// ResetFromTimeout/RestartFromTimeout serialize this write with transport
+    /// teardown and no control producer may run until the replacement context
+    /// has been published.
+    pub(crate) unsafe fn set_reset_venus_context(&self, context_id: u32) -> bool {
+        let Some(state) = self.started() else {
+            return false;
+        };
+        let Some(generation) = (unsafe { &mut *state.transport.get() }).as_mut() else {
+            return false;
+        };
+        generation.venus_ctx_id = context_id;
+        true
+    }
+
     /// The venus 3D context id for this transport generation, or 0.
     pub fn venus_ctx_id(&self) -> u32 {
         self.transport_generation().map_or(0, |t| t.venus_ctx_id)
@@ -1597,6 +1615,101 @@ impl AdapterContext {
     pub(crate) fn bar_segment(&self) -> Option<&BarSegment> {
         self.transport_generation()
             .and_then(|t| t.bar_segment.as_ref())
+    }
+
+    pub(crate) fn control_owner(&self) -> &TransportOwner {
+        &self.transport_owner
+    }
+
+    /// One read gateway for host-resource liveness. The disabled tranche reads
+    /// legacy transport storage exactly as before; the compiled KMD D2 arm reads
+    /// only the canonical owner table and never mirrors a row into that storage.
+    pub(crate) fn canonical_resource_is_live(
+        &self,
+        resource_id: u32,
+    ) -> Result<bool, crate::error::NotStarted> {
+        if crate::virtio::KMD_D2_OWNER_ENABLED {
+            // Preserve the legacy gateway's transport-absent distinction
+            // without consulting any legacy ownership row.
+            self.with_virtio(|_| ())?;
+            Ok(self.transport_owner.resource_is_live(resource_id))
+        } else {
+            self.with_virtio(|gpu| gpu.resource_is_live(resource_id))
+        }
+    }
+
+    pub(crate) fn canonical_blob_lookup(
+        &self,
+        resource_id: u32,
+    ) -> Result<
+        Option<(Option<crate::virtio::gpu::DeviceOwner>, u64, bool)>,
+        crate::virtio::VirtioError,
+    > {
+        if crate::virtio::KMD_D2_OWNER_ENABLED {
+            self.transport_owner.blob_lookup(resource_id)
+        } else {
+            self.with_virtio(|gpu| gpu.blob_lookup(resource_id))
+                .map_err(|_| crate::virtio::VirtioError::DeviceError)
+        }
+    }
+
+    pub(crate) fn canonical_mapped_resource_at_offset(
+        &self,
+        offset: u64,
+    ) -> Result<Option<u32>, crate::virtio::VirtioError> {
+        if crate::virtio::KMD_D2_OWNER_ENABLED {
+            self.transport_owner.mapped_resource_at_offset(offset)
+        } else {
+            self.with_virtio(|gpu| gpu.blob_resid_at_offset(offset))
+                .map_err(|_| crate::virtio::VirtioError::DeviceError)
+        }
+    }
+
+    pub(crate) fn reset_virtio_physical(
+        &self,
+        expected_instance: u64,
+    ) -> Result<u32, crate::virtio::VirtioError> {
+        self.with_virtio(|gpu| gpu.physical_reset_and_abort(expected_instance))
+            .map_err(|_| crate::virtio::VirtioError::DeviceError)?
+    }
+
+    /// Seal new canonical owner admissions while leaving the live transport
+    /// available for orderly DETACH/UNREF/CTX_DESTROY cleanup.
+    pub(crate) fn close_control_owner_transport(&self) -> Result<(), crate::virtio::VirtioError> {
+        if !crate::virtio::KMD_D2_OWNER_ENABLED {
+            return Ok(());
+        }
+        let expected_instance = match self.with_virtio(|gpu| gpu.scanout_transport_instance()) {
+            Ok(instance) => instance,
+            Err(_) => return Ok(()),
+        };
+        self.transport_owner
+            .close_for_transport_reset(expected_instance)
+    }
+
+    /// Close the disabled owner generation, drain every external runner and
+    /// finalizer, verify a real device-status reset, then retire its rows. An
+    /// empty transport slot is already quiescent; the dormant owner seed stays
+    /// untouched. All waits and MMIO execute outside the owner spinlock.
+    pub(crate) fn retire_control_owner_transport(
+        &self,
+        passive: crate::irql::PassiveLevel,
+    ) -> Result<(), crate::virtio::VirtioError> {
+        if !crate::virtio::KMD_D2_OWNER_ENABLED {
+            return Ok(());
+        }
+        let expected_instance = match self.with_virtio(|gpu| gpu.scanout_transport_instance()) {
+            Ok(instance) => instance,
+            Err(_) => return Ok(()),
+        };
+        self.transport_owner
+            .close_for_transport_reset(expected_instance)?;
+        let prepared_instance = self.transport_owner.prepare_physical_reset(passive)?;
+        if prepared_instance != expected_instance {
+            return Err(crate::virtio::VirtioError::DeviceError);
+        }
+        let raw_status = self.reset_virtio_physical(expected_instance)?;
+        self.transport_owner.finish_physical_reset(raw_status)
     }
 
     /// Lock-free observation for query/diagnostic paths. Mutation is exposed
@@ -1619,15 +1732,28 @@ impl AdapterContext {
         passive: crate::irql::PassiveLevel,
         absent: TransportAbsent,
         new: Box<VirtioGpu>,
-    ) {
+    ) -> Result<(), crate::virtio::VirtioError> {
         debug_assert_eq!(absent.adapter, self as *const Self as usize);
         // SAFETY: this method's contract binds `new` to this exact adapter and
-        // serialized install transition. The observation remains inert; it
-        // constructs no OwnerTable and borrows no backing storage.
-        unsafe {
+        // serialized install transition. The observer either remains dormant or
+        // constructs/reopens the canonical table from this fully configured
+        // local candidate before publication.
+        let observation = unsafe {
             self.transport_owner
                 .observe_initialized_transport(passive, NonNull::from(self), &new)
         };
+        if crate::virtio::KMD_D2_OWNER_ENABLED {
+            if let Err(error) = observation {
+                // Start/Restart published only this local candidate's ISR byte
+                // before entering the install transition. Make the interrupt
+                // path inert before a verified reset is allowed to drop it.
+                self.isr_status.store(0, Ordering::Release);
+                return match VirtioGpu::reset_unpublished_or_retain(new) {
+                    Ok(()) => Err(error),
+                    Err(reset_error) => Err(reset_error),
+                };
+            }
+        }
         // SAFETY: `virtio_lock` is a valid KSPIN_LOCK; the critical section only
         // installs the already-owned Box (no allocation, no device I/O).
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };
@@ -1635,6 +1761,7 @@ impl AdapterContext {
         debug_assert!(slot.is_none());
         *slot = Some(new);
         unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
+        Ok(())
     }
 
     /// Remove the old transport and begin one fresh scanout-bind namespace.
@@ -1716,11 +1843,7 @@ impl Drop for AdapterContext {
         // VSync timer is cancelled and the HPD worker joined, so no other agent
         // holds a reference into this context.
         if let Some(state) = unsafe { (*self.started.get()).as_deref_mut() } {
-            if let Some(pr) = state.paging_ram.take() {
-                // SAFETY: `va` came from MmAllocateContiguousMemory in
-                // `alloc_paging_ram` and is freed exactly once here.
-                unsafe { MmFreeContiguousMemory(pr.va.as_ptr() as *mut _) };
-            }
+            drop(state.paging_ram.take());
         }
         // D4a read-ledger page: allocated once at the first StartDevice, kept
         // across stop/start cycles (user mappings of it may outlive a stop),

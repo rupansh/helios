@@ -90,7 +90,9 @@ impl VenusRing {
             RING_SHMEM_SIZE,
         )?;
         // Track the ring blob (owner 0) so the map below can size the mapping.
-        let _ = adapter.with_virtio(|v| v.note_blob_size(ring_res_id, RING_SHMEM_SIZE));
+        if !crate::virtio::KMD_D2_OWNER_ENABLED {
+            let _ = adapter.with_virtio(|v| v.note_blob_size(ring_res_id, RING_SHMEM_SIZE));
+        }
         let ring_prep = ctrl::map_blob_prepare(
             passive,
             adapter,
@@ -112,7 +114,9 @@ impl VenusRing {
             0,
             REPLY_SHMEM_SIZE,
         )?;
-        let _ = adapter.with_virtio(|v| v.note_blob_size(reply_res_id, REPLY_SHMEM_SIZE));
+        if !crate::virtio::KMD_D2_OWNER_ENABLED {
+            let _ = adapter.with_virtio(|v| v.note_blob_size(reply_res_id, REPLY_SHMEM_SIZE));
+        }
         let reply_prep = ctrl::map_blob_prepare(
             passive,
             adapter,

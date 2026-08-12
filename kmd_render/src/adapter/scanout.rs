@@ -1000,7 +1000,7 @@ impl AdapterContext {
             return ScanoutRefreshQueue::Unavailable;
         }
         let live = self
-            .with_virtio(|v| v.resource_is_live(resource_id))
+            .canonical_resource_is_live(resource_id)
             .unwrap_or(false);
         if !live {
             // The resource is gone, so no read of it exists or can be issued.

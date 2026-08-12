@@ -393,13 +393,24 @@ impl VirtioGpu {
     ///
     /// Returns whether the reserve was installed.
     pub fn configure_window_reserve(&mut self, len: u64) -> bool {
-        if !self.window.is_pristine() {
+        if len > self.window.window_len
+            || len & (super::BLOB_PAGE - 1) != 0
+            || !self.window.is_pristine()
+        {
             WINDOW_RECONFIG_REFUSED.fetch_add(1, Ordering::Relaxed);
             return false;
         }
         self.window.reserve = len;
         self.window.next_offset = len;
         true
+    }
+
+    /// Exact host-window bounds after StartDevice has installed the immutable
+    /// VidMm prefix. Fixed mappings may use the complete range; canonical
+    /// first-fit mappings begin at `reserve`.
+    pub(crate) fn owner_window_geometry(&self) -> Option<(u64, u64, u64)> {
+        self.host_visible
+            .map(|window| (window.base, window.len, self.window.reserve))
     }
 
     /// Begin a fixed-offset (re)map of a blob at the VidMm-assigned window

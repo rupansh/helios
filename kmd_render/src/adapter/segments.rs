@@ -7,7 +7,7 @@
 
 use core::ptr::NonNull;
 
-use wdk_sys::ntddk::{MmAllocateContiguousMemory, MmGetPhysicalAddress};
+use wdk_sys::ntddk::{MmAllocateContiguousMemory, MmFreeContiguousMemory, MmGetPhysicalAddress};
 use wdk_sys::PHYSICAL_ADDRESS;
 
 use super::AdapterContext;
@@ -31,6 +31,15 @@ pub struct PagingRam {
     pub phys: u64,
     /// Region length in bytes (== reported segment Size/CommitLimit).
     pub size: u64,
+}
+
+impl Drop for PagingRam {
+    fn drop(&mut self) {
+        // PASSIVE lifecycle custody only: normal Start moves this allocation
+        // into the successor StartedState, while failed Start and final adapter
+        // destruction release it here exactly once.
+        unsafe { MmFreeContiguousMemory(self.va.as_ptr() as *mut _) };
+    }
 }
 
 /// The BAR memory segment: the head of the host-visible venus

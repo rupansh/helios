@@ -1443,6 +1443,20 @@ impl<B> ResourceLifecycle<B> {
         self.resource
     }
 
+    pub fn backing(&self) -> &B {
+        &self.backing
+    }
+
+    /// Safety: this lifecycle must be the exact `Reserved` lifecycle returned
+    /// by a failed publication attempt. No control request may have escaped.
+    pub(crate) unsafe fn assume_unpublished_cancelled(self) -> B {
+        debug_assert_eq!(self.phase, ResourcePhase::Reserved);
+        debug_assert!(self.pending.is_none());
+        debug_assert!(self.attachment.is_none());
+        debug_assert!(!self.attachment_may_be_live);
+        ManuallyDrop::into_inner(self.backing)
+    }
+
     pub fn attachment(&self) -> Option<TransportAttachment> {
         match self.attachment.as_ref() {
             Some(leased) => Some(leased.attachment()),
