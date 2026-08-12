@@ -184,7 +184,12 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // Drop resets the device and frees its rings/scratch. Doing it *before*
     // init keeps the ordering safe — otherwise assigning the new transport would
     // drop the old one (resetting the device) right after init configured it.
-    let transport_absent = adapter.remove_virtio_and_reset_scanout_bind_generation();
+    // SAFETY: `DxgkDdiStartDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
+    // DXGKDDI_START_DEVICE). The token also keeps dormant-owner diagnostics out
+    // of any above-PASSIVE caller.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    adapter.reset_dormant_owner_transition_diagnostics(passive);
+    let transport_absent = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
     adapter.reset_display_publication_state();
     // Non-zero only if init below fails, so the display-half demotion can report
     // the status that actually killed the transport rather than a bare flag.
@@ -199,7 +204,6 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // token threads down through `bring_up_venus` -> `allocate_host_visible_blob`
     // -> `VenusRing::bring_up`, which is why it is a by-value ZST and not a
     // reference: see `crate::irql` and tools/kmd-frame-sizes.ps1.
-    let passive = unsafe { crate::irql::PassiveLevel::assume() };
     match crate::virtio::VirtioGpu::init(passive, unsafe { &*dxgkrnl_interface }) {
         Ok(gpu) => {
             crate::kmsg(c"Helios: virtio-gpu transport up\n");
@@ -213,7 +217,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             // SAFETY: dxgkrnl serializes StartDevice. `transport_absent` came
             // from this adapter's immediately preceding removal, and no other
             // installer is reachable before this call.
-            unsafe { adapter.install_virtio(transport_absent, gpu) };
+            unsafe { adapter.install_virtio(passive, transport_absent, gpu) };
 
             // An explicit VidMmVramMB registry value remains authoritative.
             // When it is absent, use the exact virtio shared-memory capability
@@ -248,7 +252,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             adapter
                 .isr_status
                 .store(0, core::sync::atomic::Ordering::Release);
-            let _ = adapter.remove_virtio_and_reset_scanout_bind_generation();
+            let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
             super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None);
         }
     }
@@ -479,7 +483,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // Tear down the virtio transport: VirtioGpu::drop resets the device and
         // frees its rings (plus any in-flight/parked entry buffers). A later
         // StartDevice re-initializes.
-        let _ = adapter.remove_virtio_and_reset_scanout_bind_generation();
+        let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive_stop);
         // A DPC may have won notify -> virtio after the earlier pre-teardown
         // display reset but before removal. Removal now makes every late DPC
         // inert; repeat the idempotent reset at that exact transport-absent edge

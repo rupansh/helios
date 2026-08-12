@@ -1177,6 +1177,281 @@ mod tests {
         assert_eq!(table.phase(), OwnerPhase::Ready);
         assert_eq!(drops.get(), 9);
     }
+
+    fn dormant_seed(raw: u64) -> DormantOwnerSeed {
+        let domain = unsafe { TransportDomainRoot::new(raw) }.must();
+        let generation = TransportGeneration::bootstrap(domain);
+        let root = unsafe { SlotTableRoot::new(raw) }.must();
+        unsafe { DormantOwnerSeed::new(root, generation) }
+    }
+
+    #[test]
+    fn dormant_seed_observes_and_exactly_removes_one_transport() {
+        let mut seed = dormant_seed(0x7120);
+        let instance = NonZeroU64::new(7).must();
+        let config = OwnerConfig::new(0, 0x20_0000, 0x1000).must();
+        let observation = unsafe {
+            DormantTransportObservation::assume_ready(seed.table(), seed.epoch(), instance, config)
+        };
+
+        seed.observe_transport(observation).must();
+        assert_eq!(
+            seed.state(),
+            DormantOwnerState::Ready {
+                physical_instance: instance,
+                config,
+            }
+        );
+
+        let removal = unsafe {
+            DormantTransportRemoval::assume_removed(seed.table(), seed.epoch(), instance)
+        };
+        seed.observe_transport_removed(removal).must();
+        assert_eq!(seed.state(), DormantOwnerState::NoTransport);
+        assert_eq!(seed.epoch().get(), 1);
+    }
+
+    #[test]
+    fn dormant_seed_refuses_duplicate_foreign_and_replayed_inputs_losslessly() {
+        let mut seed = dormant_seed(0x7121);
+        let current = NonZeroU64::new(11).must();
+        let foreign = NonZeroU64::new(12).must();
+        let config = OwnerConfig::new(0, 0x10_0000, 0x1000).must();
+        seed.observe_transport(unsafe {
+            DormantTransportObservation::assume_ready(seed.table(), seed.epoch(), current, config)
+        })
+        .must();
+
+        let refused = seed
+            .observe_transport(unsafe {
+                DormantTransportObservation::assume_ready(
+                    seed.table(),
+                    seed.epoch(),
+                    foreign,
+                    config,
+                )
+            })
+            .must_err();
+        assert_eq!(
+            refused.reason(),
+            DormantOwnerRefusal::TransportAlreadyObserved { current }
+        );
+        assert_eq!(refused.into_input().physical_instance(), foreign);
+
+        let refused = seed
+            .observe_transport_removed(unsafe {
+                DormantTransportRemoval::assume_removed(seed.table(), seed.epoch(), foreign)
+            })
+            .must_err();
+        assert_eq!(
+            refused.reason(),
+            DormantOwnerRefusal::PhysicalInstanceMismatch {
+                expected: current,
+                found: foreign,
+            }
+        );
+        assert_eq!(refused.into_input().physical_instance(), foreign);
+        assert_eq!(
+            seed.state(),
+            DormantOwnerState::Ready {
+                physical_instance: current,
+                config,
+            }
+        );
+
+        seed.observe_transport_removed(unsafe {
+            DormantTransportRemoval::assume_removed(seed.table(), seed.epoch(), current)
+        })
+        .must();
+        let replay = seed
+            .observe_transport_removed(unsafe {
+                DormantTransportRemoval::assume_removed(seed.table(), seed.epoch(), current)
+            })
+            .must_err();
+        assert_eq!(replay.reason(), DormantOwnerRefusal::NoTransportObserved);
+        assert_eq!(replay.into_input().physical_instance(), current);
+    }
+
+    #[test]
+    fn dormant_seed_records_unavailable_geometry_without_minting_a_table() {
+        for (raw, instance, reason) in [
+            (
+                0x7122,
+                NonZeroU64::new(21).must(),
+                DormantTransportUnavailable::NoWindow,
+            ),
+            (
+                0x7123,
+                NonZeroU64::new(22).must(),
+                DormantTransportUnavailable::InvalidBounds,
+            ),
+        ] {
+            let mut seed = dormant_seed(raw);
+            seed.observe_transport(unsafe {
+                DormantTransportObservation::assume_unavailable(
+                    seed.table(),
+                    seed.epoch(),
+                    instance,
+                    reason,
+                )
+            })
+            .must();
+            assert_eq!(
+                seed.state(),
+                DormantOwnerState::Unavailable {
+                    physical_instance: instance,
+                    reason,
+                }
+            );
+            seed.observe_transport_removed(unsafe {
+                DormantTransportRemoval::assume_removed(seed.table(), seed.epoch(), instance)
+            })
+            .must();
+            assert_eq!(seed.state(), DormantOwnerState::NoTransport);
+
+            let next = NonZeroU64::new(instance.get() + 1).must();
+            let config = OwnerConfig::new(0, 0x20_0000, 0x1000).must();
+            seed.observe_transport(unsafe {
+                DormantTransportObservation::assume_ready(seed.table(), seed.epoch(), next, config)
+            })
+            .must();
+            assert_eq!(
+                seed.state(),
+                DormantOwnerState::Ready {
+                    physical_instance: next,
+                    config,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn dormant_seed_rejects_a_foreign_table_observation_losslessly() {
+        let mut target = dormant_seed(0x7124);
+        let foreign = dormant_seed(0x7125);
+        let instance = NonZeroU64::new(31).must();
+        let config = OwnerConfig::new(0, 0x10_0000, 0x1000).must();
+        let observation = unsafe {
+            DormantTransportObservation::assume_ready(
+                foreign.table(),
+                foreign.epoch(),
+                instance,
+                config,
+            )
+        };
+
+        let refused = target.observe_transport(observation).must_err();
+        assert_eq!(refused.reason(), DormantOwnerRefusal::TableMismatch);
+        assert_eq!(refused.into_input().physical_instance(), instance);
+        assert_eq!(target.state(), DormantOwnerState::NoTransport);
+    }
+
+    #[test]
+    fn dormant_seed_never_reaccepts_a_removed_physical_instance() {
+        let mut seed = dormant_seed(0x7126);
+        let instance = NonZeroU64::new(41).must();
+        let config = OwnerConfig::new(0, 0x10_0000, 0x1000).must();
+        seed.observe_transport(unsafe {
+            DormantTransportObservation::assume_ready(seed.table(), seed.epoch(), instance, config)
+        })
+        .must();
+        seed.observe_transport_removed(unsafe {
+            DormantTransportRemoval::assume_removed(seed.table(), seed.epoch(), instance)
+        })
+        .must();
+
+        let stale = seed
+            .observe_transport(unsafe {
+                DormantTransportObservation::assume_ready(
+                    seed.table(),
+                    seed.epoch(),
+                    instance,
+                    config,
+                )
+            })
+            .must_err();
+        assert_eq!(
+            stale.reason(),
+            DormantOwnerRefusal::PhysicalInstanceNotNewer {
+                high_water: instance.get(),
+                found: instance,
+            }
+        );
+        assert_eq!(stale.into_input().physical_instance(), instance);
+        assert_eq!(seed.state(), DormantOwnerState::NoTransport);
+
+        let next = NonZeroU64::new(instance.get() + 1).must();
+        seed.observe_transport(unsafe {
+            DormantTransportObservation::assume_ready(seed.table(), seed.epoch(), next, config)
+        })
+        .must();
+        assert_eq!(
+            seed.state(),
+            DormantOwnerState::Ready {
+                physical_instance: next,
+                config,
+            }
+        );
+
+        let stale_removal = seed
+            .observe_transport_removed(unsafe {
+                DormantTransportRemoval::assume_removed(seed.table(), seed.epoch(), instance)
+            })
+            .must_err();
+        assert_eq!(
+            stale_removal.reason(),
+            DormantOwnerRefusal::PhysicalInstanceMismatch {
+                expected: next,
+                found: instance,
+            }
+        );
+        assert_eq!(
+            seed.state(),
+            DormantOwnerState::Ready {
+                physical_instance: next,
+                config,
+            }
+        );
+    }
+
+    #[test]
+    fn dormant_seed_refuses_foreign_epoch_and_removal_authority() {
+        let mut seed = dormant_seed(0x7127);
+        let foreign = dormant_seed(0x7128);
+        let instance = NonZeroU64::new(51).must();
+        let config = OwnerConfig::new(0, 0x10_0000, 0x1000).must();
+        let wrong_epoch = TransportEpoch::test_from_raw(seed.epoch().domain(), 2).must();
+        let wrong_epoch_observation = unsafe {
+            DormantTransportObservation::assume_ready(seed.table(), wrong_epoch, instance, config)
+        };
+        let refused = seed.observe_transport(wrong_epoch_observation).must_err();
+        assert_eq!(
+            refused.reason(),
+            DormantOwnerRefusal::EpochMismatch {
+                expected: seed.epoch(),
+                found: wrong_epoch,
+            }
+        );
+        assert_eq!(refused.into_input().physical_instance(), instance);
+
+        seed.observe_transport(unsafe {
+            DormantTransportObservation::assume_ready(seed.table(), seed.epoch(), instance, config)
+        })
+        .must();
+        let foreign_removal = unsafe {
+            DormantTransportRemoval::assume_removed(foreign.table(), foreign.epoch(), instance)
+        };
+        let refused = seed.observe_transport_removed(foreign_removal).must_err();
+        assert_eq!(refused.reason(), DormantOwnerRefusal::TableMismatch);
+        assert_eq!(refused.into_input().physical_instance(), instance);
+        assert_eq!(
+            seed.state(),
+            DormantOwnerState::Ready {
+                physical_instance: instance,
+                config,
+            }
+        );
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1210,6 +1485,283 @@ impl OwnerConfig {
             window_length,
             window_alignment,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DormantTransportUnavailable {
+    NoWindow,
+    InvalidBounds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DormantOwnerState {
+    NoTransport,
+    Ready {
+        physical_instance: NonZeroU64,
+        config: OwnerConfig,
+    },
+    Unavailable {
+        physical_instance: NonZeroU64,
+        reason: DormantTransportUnavailable,
+    },
+}
+
+#[must_use]
+pub struct DormantTransportObservation {
+    table: crate::control_owner_slots::SlotTableId,
+    epoch: TransportEpoch,
+    physical_instance: NonZeroU64,
+    config: Result<OwnerConfig, DormantTransportUnavailable>,
+}
+
+impl DormantTransportObservation {
+    /// Safety: `table`/`epoch` identify the exact dormant seed owning this one
+    /// observation; no observation for this install has been minted before;
+    /// and `physical_instance` names its current successfully initialized local
+    /// install candidate and cannot be reused by another transport.
+    pub const unsafe fn assume_ready(
+        table: crate::control_owner_slots::SlotTableId,
+        epoch: TransportEpoch,
+        physical_instance: NonZeroU64,
+        config: OwnerConfig,
+    ) -> Self {
+        Self {
+            table,
+            epoch,
+            physical_instance,
+            config: Ok(config),
+        }
+    }
+
+    /// Safety: `table`/`epoch` identify the exact dormant seed owning this one
+    /// observation; no observation for this install has been minted before;
+    /// and `physical_instance` names its current successfully initialized local
+    /// install candidate whose owner geometry was unavailable and cannot be
+    /// reused by another transport.
+    pub const unsafe fn assume_unavailable(
+        table: crate::control_owner_slots::SlotTableId,
+        epoch: TransportEpoch,
+        physical_instance: NonZeroU64,
+        reason: DormantTransportUnavailable,
+    ) -> Self {
+        Self {
+            table,
+            epoch,
+            physical_instance,
+            config: Err(reason),
+        }
+    }
+
+    pub const fn physical_instance(&self) -> NonZeroU64 {
+        self.physical_instance
+    }
+}
+
+#[must_use]
+pub struct DormantTransportRemoval {
+    table: crate::control_owner_slots::SlotTableId,
+    epoch: TransportEpoch,
+    physical_instance: NonZeroU64,
+}
+
+impl DormantTransportRemoval {
+    /// Safety: `table`/`epoch` identify the exact dormant seed, and its exact
+    /// transport named by `physical_instance` is no longer installed and cannot
+    /// publish more work or observations into it.
+    pub const unsafe fn assume_removed(
+        table: crate::control_owner_slots::SlotTableId,
+        epoch: TransportEpoch,
+        physical_instance: NonZeroU64,
+    ) -> Self {
+        Self {
+            table,
+            epoch,
+            physical_instance,
+        }
+    }
+
+    pub const fn physical_instance(&self) -> NonZeroU64 {
+        self.physical_instance
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DormantOwnerRefusal {
+    TableMismatch,
+    EpochMismatch {
+        expected: TransportEpoch,
+        found: TransportEpoch,
+    },
+    TransportAlreadyObserved {
+        current: NonZeroU64,
+    },
+    NoTransportObserved,
+    PhysicalInstanceMismatch {
+        expected: NonZeroU64,
+        found: NonZeroU64,
+    },
+    PhysicalInstanceNotNewer {
+        high_water: u64,
+        found: NonZeroU64,
+    },
+}
+
+#[must_use]
+pub struct RefusedDormantTransition<T> {
+    reason: DormantOwnerRefusal,
+    input: T,
+}
+
+impl<T> RefusedDormantTransition<T> {
+    pub const fn reason(&self) -> DormantOwnerRefusal {
+        self.reason
+    }
+
+    pub fn into_input(self) -> T {
+        self.input
+    }
+}
+
+/// Move-only custody for a canonical owner identity before an operational
+/// owner table exists.
+///
+/// This type deliberately owns no storage projection and exposes no activate,
+/// reserve, dispatch, close, reset, or reopen transition. Observing a transport
+/// records only inert provenance for a later atomic activation checkpoint.
+#[must_use]
+pub struct DormantOwnerSeed {
+    root: SlotTableRoot,
+    generation: TransportGeneration,
+    physical_instance_high_water: u64,
+    state: DormantOwnerState,
+}
+
+impl DormantOwnerSeed {
+    /// Safety: `root` and `generation` descend from the same globally unique
+    /// transport domain, and neither has any live descendant.
+    pub const unsafe fn new(root: SlotTableRoot, generation: TransportGeneration) -> Self {
+        Self {
+            root,
+            generation,
+            physical_instance_high_water: 0,
+            state: DormantOwnerState::NoTransport,
+        }
+    }
+
+    pub const fn table(&self) -> crate::control_owner_slots::SlotTableId {
+        self.root.id()
+    }
+
+    pub const fn epoch(&self) -> TransportEpoch {
+        self.generation.epoch()
+    }
+
+    pub const fn state(&self) -> DormantOwnerState {
+        self.state
+    }
+
+    pub fn observe_transport(
+        &mut self,
+        observation: DormantTransportObservation,
+    ) -> Result<(), RefusedDormantTransition<DormantTransportObservation>> {
+        if observation.table != self.root.id() {
+            return Err(RefusedDormantTransition {
+                reason: DormantOwnerRefusal::TableMismatch,
+                input: observation,
+            });
+        }
+        if observation.epoch != self.generation.epoch() {
+            return Err(RefusedDormantTransition {
+                reason: DormantOwnerRefusal::EpochMismatch {
+                    expected: self.generation.epoch(),
+                    found: observation.epoch,
+                },
+                input: observation,
+            });
+        }
+        if observation.physical_instance.get() <= self.physical_instance_high_water {
+            return Err(RefusedDormantTransition {
+                reason: DormantOwnerRefusal::PhysicalInstanceNotNewer {
+                    high_water: self.physical_instance_high_water,
+                    found: observation.physical_instance,
+                },
+                input: observation,
+            });
+        }
+        let current = match self.state {
+            DormantOwnerState::NoTransport => None,
+            DormantOwnerState::Ready {
+                physical_instance, ..
+            }
+            | DormantOwnerState::Unavailable {
+                physical_instance, ..
+            } => Some(physical_instance),
+        };
+        if let Some(current) = current {
+            return Err(RefusedDormantTransition {
+                reason: DormantOwnerRefusal::TransportAlreadyObserved { current },
+                input: observation,
+            });
+        }
+        self.state = match observation.config {
+            Ok(config) => DormantOwnerState::Ready {
+                physical_instance: observation.physical_instance,
+                config,
+            },
+            Err(reason) => DormantOwnerState::Unavailable {
+                physical_instance: observation.physical_instance,
+                reason,
+            },
+        };
+        self.physical_instance_high_water = observation.physical_instance.get();
+        Ok(())
+    }
+
+    pub fn observe_transport_removed(
+        &mut self,
+        removal: DormantTransportRemoval,
+    ) -> Result<(), RefusedDormantTransition<DormantTransportRemoval>> {
+        if removal.table != self.root.id() {
+            return Err(RefusedDormantTransition {
+                reason: DormantOwnerRefusal::TableMismatch,
+                input: removal,
+            });
+        }
+        if removal.epoch != self.generation.epoch() {
+            return Err(RefusedDormantTransition {
+                reason: DormantOwnerRefusal::EpochMismatch {
+                    expected: self.generation.epoch(),
+                    found: removal.epoch,
+                },
+                input: removal,
+            });
+        }
+        let expected = match self.state {
+            DormantOwnerState::NoTransport => {
+                return Err(RefusedDormantTransition {
+                    reason: DormantOwnerRefusal::NoTransportObserved,
+                    input: removal,
+                });
+            }
+            DormantOwnerState::Ready {
+                physical_instance, ..
+            }
+            | DormantOwnerState::Unavailable {
+                physical_instance, ..
+            } => physical_instance,
+        };
+        if expected != removal.physical_instance {
+            return Err(RefusedDormantTransition {
+                reason: DormantOwnerRefusal::PhysicalInstanceMismatch {
+                    expected,
+                    found: removal.physical_instance,
+                },
+                input: removal,
+            });
+        }
+        self.state = DormantOwnerState::NoTransport;
+        Ok(())
     }
 }
 

@@ -1206,6 +1206,13 @@ impl AdapterContext {
         unsafe { self.transport_owner.bind_adapter_once(address) };
     }
 
+    pub(crate) fn reset_dormant_owner_transition_diagnostics(
+        &self,
+        passive: crate::irql::PassiveLevel,
+    ) {
+        self.transport_owner.reset_transition_diagnostics(passive);
+    }
+
     /// Publish "StartDevice has returned" and wake the HPD worker.
     ///
     /// The last thing `DxgkDdiStartDevice` does. Before this, the worker's
@@ -1606,9 +1613,21 @@ impl AdapterContext {
     /// `absent` must have been minted by the most recent removal on this exact
     /// adapter, and serialized StartDevice ownership must prove the slot stayed
     /// empty. Violating either condition could replace/drop a live device while
-    /// the spinlock is held.
-    pub(crate) unsafe fn install_virtio(&self, absent: TransportAbsent, new: Box<VirtioGpu>) {
+    /// the spinlock is held or bind foreign dormant-owner provenance.
+    pub(crate) unsafe fn install_virtio(
+        &self,
+        passive: crate::irql::PassiveLevel,
+        absent: TransportAbsent,
+        new: Box<VirtioGpu>,
+    ) {
         debug_assert_eq!(absent.adapter, self as *const Self as usize);
+        // SAFETY: this method's contract binds `new` to this exact adapter and
+        // serialized install transition. The observation remains inert; it
+        // constructs no OwnerTable and borrows no backing storage.
+        unsafe {
+            self.transport_owner
+                .observe_initialized_transport(passive, NonNull::from(self), &new)
+        };
         // SAFETY: `virtio_lock` is a valid KSPIN_LOCK; the critical section only
         // installs the already-owned Box (no allocation, no device I/O).
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };
@@ -1625,7 +1644,10 @@ impl AdapterContext {
     /// a later producer observes `None`. Keeping this as one transition prevents
     /// a late old-generation SET from aliasing sequence 1 in the successor.
     #[must_use]
-    pub(crate) fn remove_virtio_and_reset_scanout_bind_generation(&self) -> TransportAbsent {
+    pub(crate) fn remove_virtio_and_reset_scanout_bind_generation(
+        &self,
+        passive: crate::irql::PassiveLevel,
+    ) -> TransportAbsent {
         // SAFETY: `virtio_lock` excludes every producer and the DPC's composite
         // bind apply. Replacing with None before the tuple reset makes any later
         // DPC inert; a DPC already applying drains before this acquire returns.
@@ -1636,8 +1658,19 @@ impl AdapterContext {
         self.scanout_bind_applied_seq.store(0, Ordering::Relaxed);
         self.scanout_bind_wire_resource.store(0, Ordering::Relaxed);
         unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
+        let old_owner_instance = old.as_ref().map(|gpu| gpu.scanout_transport_instance());
         // Dropped here, at PASSIVE_LEVEL, outside the lock.
         drop(old);
+        if let Some(physical_instance) = old_owner_instance {
+            self.transport_owner.observe_removed_transport(
+                passive,
+                NonNull::from(self),
+                physical_instance,
+            );
+        } else {
+            self.transport_owner
+                .observe_transport_slot_absent(passive, NonNull::from(self));
+        }
         TransportAbsent {
             adapter: self as *const Self as usize,
         }

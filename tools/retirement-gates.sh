@@ -940,6 +940,40 @@ run_gate "K6 HNR2 decode: the ICD encoder's corpus replayed through the KMD asse
 run_gate "K5 HTS1/HQA1: the C mirror's records replayed through the KMD session" \
     bash "$REPO/tools/hts1-attach-gate.sh"
 
+# The control-owner arena is deliberately only dormant backing plus an inert
+# identity/config seed. An operational table cannot be constructed piecemeal:
+# doing so would create a second authority beside the still-live legacy tables
+# before Stop/reset/finalizer rundown exists. Comments may carry the future DAG,
+# so inspect only live Rust tokens. This gate is expected to be deliberately
+# replaced by the atomic activation change, never relaxed one symbol at a time.
+DORMANT_OWNER_GATE_PY=$(cat <<'PY'
+REPO = sys.argv[1]
+ROOT = REPO + '/kmd_render/src'
+FORBIDDEN = (
+    'OwnerTable', 'OwnerStorage', 'PreparedOwnerControl', 'DispatchWork',
+    'ObservedOwnerWork', 'VerifiedPhysicalReset', 'OwnerResetAction',
+    'NextTransportRequest', 'NextTransportReady', 'StableSlots',
+    'ControlTickets',
+)
+hits = []
+for path in rust_files(ROOT):
+    src = open(path, encoding='utf-8').read()
+    kind = rust_kinds(src)
+    live = ''.join(ch if kind[i] == 0 else ' ' for i, ch in enumerate(src))
+    for symbol in FORBIDDEN:
+        for match in re.finditer(r'\b' + re.escape(symbol) + r'\b', live):
+            line = src.count('\n', 0, match.start()) + 1
+            hits.append('%s:%d: live %s' % (path.replace(REPO + '/', ''), line, symbol))
+if hits:
+    sys.exit('dormant control-owner boundary violated:\n' + '\n'.join(hits))
+print('OK: KMD contains no live operational control-owner table/action token')
+PY
+)
+
+run_gate "dormant control-owner storage has no operational KMD authority" \
+    python3 -c "$K4_RUST_MASK_PY
+$DORMANT_OWNER_GATE_PY" "$REPO"
+
 printf '\n'
 if [ ${#FAILED[@]} -eq 0 ]; then
     if [ ${#SKIPPED[@]} -eq 0 ]; then

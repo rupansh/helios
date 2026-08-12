@@ -4,14 +4,16 @@
 
 use alloc::vec::Vec;
 use core::mem::size_of;
-use core::num::NonZeroUsize;
+use core::num::{NonZeroU64, NonZeroUsize};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use helios_kmd_logic::control_owner_slots::SlotTableRoot;
 use helios_kmd_logic::control_owner_table::{
-    ContextOwnerSlot, ContextOwnerTicket, PairOwnerSlot, PairOwnerTicket, ResourceOwnerSlot,
-    ResourceOwnerTicket, WindowOwnerSlot, WindowOwnerTicket,
+    ContextOwnerSlot, ContextOwnerTicket, DormantOwnerSeed, DormantOwnerState,
+    DormantTransportObservation, DormantTransportRemoval, DormantTransportUnavailable, OwnerConfig,
+    PairOwnerSlot, PairOwnerTicket, ResourceOwnerSlot, ResourceOwnerTicket, WindowOwnerSlot,
+    WindowOwnerTicket,
 };
 use helios_kmd_logic::control_ownership::{
     TransportDomainRoot, TransportGeneration as OwnershipGeneration,
@@ -23,7 +25,15 @@ use crate::sync::SpinLock;
 static TRANSPORT_DOMAIN_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TRANSPORT_DOMAIN_EXHAUSTED: AtomicU32 = AtomicU32::new(0);
 static TRANSPORT_OWNER_REBIND_REFUSED: AtomicU32 = AtomicU32::new(0);
+static TRANSPORT_OWNER_OBSERVE_REFUSED: AtomicU32 = AtomicU32::new(0);
+static TRANSPORT_OWNER_REMOVE_REFUSED: AtomicU32 = AtomicU32::new(0);
+static TRANSPORT_OWNER_INSTANCE_INVALID: AtomicU32 = AtomicU32::new(0);
+static TRANSPORT_OWNER_WINDOW_UNAVAILABLE: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
 static TRANSPORT_STORAGE_EXHAUSTED: [AtomicU32; 9] = [const { AtomicU32::new(0) }; 9];
+
+const STORAGE_DIAG_BASE: u32 = 0x0A00_00E6;
+const TRANSITION_DIAG_BASE: u32 = 0x0A00_00F0;
+const _: () = assert!(TRANSITION_DIAG_BASE > STORAGE_DIAG_BASE + 8);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TransportOwnerCreateError {
@@ -129,8 +139,7 @@ enum StorageClass {
 }
 
 struct OwnerStorageArena {
-    _slot_root: SlotTableRoot,
-    _generation: OwnershipGeneration,
+    seed: DormantOwnerSeed,
     _resources: Vec<ResourceSlot>,
     _contexts: Vec<ContextSlot>,
     _pairs: Vec<PairSlot>,
@@ -146,9 +155,11 @@ impl OwnerStorageArena {
         slot_root: SlotTableRoot,
         generation: OwnershipGeneration,
     ) -> Result<Self, TransportOwnerCreateError> {
+        // SAFETY: both values descend from the one freshly minted `domain`
+        // inside `TransportOwner::unbound`; neither has descendants yet.
+        let seed = unsafe { DormantOwnerSeed::new(slot_root, generation) };
         let arena = Self {
-            _slot_root: slot_root,
-            _generation: generation,
+            seed,
             _resources: allocate_exact(
                 RESOURCE_CAPACITY,
                 StorageClass::ResourceRows,
@@ -269,6 +280,163 @@ impl TransportOwner {
             crate::diag::record(0x0A00_00E5);
         }
     }
+
+    /// Begin one StartDevice diagnostic interval. Reset only the inert
+    /// transition facts that the following probe/install attempt can republish;
+    /// domain/storage construction evidence remains lifetime-cumulative.
+    pub(crate) fn reset_transition_diagnostics(&self, _passive: crate::irql::PassiveLevel) {
+        TRANSPORT_OWNER_OBSERVE_REFUSED.store(0, Ordering::Relaxed);
+        TRANSPORT_OWNER_REMOVE_REFUSED.store(0, Ordering::Relaxed);
+        TRANSPORT_OWNER_INSTANCE_INVALID.store(0, Ordering::Relaxed);
+        crate::diag::record_named_bytes(b"CtObsRef", 0);
+        crate::diag::record_named_bytes(b"CtRemRef", 0);
+        crate::diag::record_named_bytes(b"CtInst0", 0);
+        publish_window_availability(None);
+    }
+
+    /// Record inert geometry/provenance for one successfully initialized local
+    /// transport. This creates no operational owner table or storage view.
+    ///
+    /// # Safety
+    /// `adapter` is this owner's bound adapter and `gpu` is the exact local
+    /// transport candidate consumed by its serialized install transition.
+    pub(crate) unsafe fn observe_initialized_transport(
+        &self,
+        _passive: crate::irql::PassiveLevel,
+        adapter: NonNull<AdapterContext>,
+        gpu: &super::VirtioGpu,
+    ) {
+        let Some(physical_instance) = NonZeroU64::new(gpu.scanout_transport_instance()) else {
+            record_transition_refusal(
+                &TRANSPORT_OWNER_INSTANCE_INVALID,
+                b"CtInst0",
+                TRANSITION_DIAG_BASE,
+            );
+            return;
+        };
+        let (geometry, unavailable) = match gpu.host_visible() {
+            None => (
+                Err(DormantTransportUnavailable::NoWindow),
+                Some(DormantTransportUnavailable::NoWindow),
+            ),
+            Some(window) => match OwnerConfig::new(0, window.len, super::gpu::BLOB_PAGE) {
+                Ok(config) => (Ok(config), None),
+                Err(_) => (
+                    Err(DormantTransportUnavailable::InvalidBounds),
+                    Some(DormantTransportUnavailable::InvalidBounds),
+                ),
+            },
+        };
+        let refused = {
+            let mut state = self.state.lock();
+            if state.construction_address != adapter.as_ptr() as usize {
+                true
+            } else {
+                let table = state._storage.seed.table();
+                let epoch = state._storage.seed.epoch();
+                // SAFETY: `gpu` is the exact successfully initialized local
+                // transport for this adapter, its instance allocator never
+                // wraps or reuses, and `table`/`epoch` come from the consuming
+                // seed while its owner lock is held.
+                let observation = unsafe {
+                    match geometry {
+                        Ok(config) => DormantTransportObservation::assume_ready(
+                            table,
+                            epoch,
+                            physical_instance,
+                            config,
+                        ),
+                        Err(reason) => DormantTransportObservation::assume_unavailable(
+                            table,
+                            epoch,
+                            physical_instance,
+                            reason,
+                        ),
+                    }
+                };
+                state._storage.seed.observe_transport(observation).is_err()
+            }
+        };
+        if refused {
+            record_transition_refusal(
+                &TRANSPORT_OWNER_OBSERVE_REFUSED,
+                b"CtObsRef",
+                TRANSITION_DIAG_BASE + 1,
+            );
+            return;
+        }
+        publish_window_availability(unavailable);
+    }
+
+    /// Clear only the observation belonging to the exact transport removed
+    /// from this adapter's slot. Foreign/replayed identities remain inert.
+    pub(crate) fn observe_removed_transport(
+        &self,
+        _passive: crate::irql::PassiveLevel,
+        adapter: NonNull<AdapterContext>,
+        physical_instance: u64,
+    ) {
+        let Some(physical_instance) = NonZeroU64::new(physical_instance) else {
+            record_transition_refusal(
+                &TRANSPORT_OWNER_INSTANCE_INVALID,
+                b"CtInst0",
+                TRANSITION_DIAG_BASE,
+            );
+            return;
+        };
+        let refused = {
+            let mut state = self.state.lock();
+            if state.construction_address != adapter.as_ptr() as usize {
+                true
+            } else {
+                let table = state._storage.seed.table();
+                let epoch = state._storage.seed.epoch();
+                // SAFETY: the caller extracted the exact transport from this
+                // adapter's slot under `virtio_lock`; no later producer can
+                // reach it. The seed supplies its own exact identity here.
+                let removal = unsafe {
+                    DormantTransportRemoval::assume_removed(table, epoch, physical_instance)
+                };
+                state
+                    ._storage
+                    .seed
+                    .observe_transport_removed(removal)
+                    .is_err()
+            }
+        };
+        if refused {
+            record_transition_refusal(
+                &TRANSPORT_OWNER_REMOVE_REFUSED,
+                b"CtRemRef",
+                TRANSITION_DIAG_BASE + 4,
+            );
+        } else {
+            publish_window_availability(None);
+        }
+    }
+
+    /// Reconcile an already-empty transport slot. This clears per-instance
+    /// availability telemetry but never clears a seed that still observes an
+    /// exact transport; that mismatch remains a named fail-closed refusal.
+    pub(crate) fn observe_transport_slot_absent(
+        &self,
+        _passive: crate::irql::PassiveLevel,
+        adapter: NonNull<AdapterContext>,
+    ) {
+        let refused = {
+            let state = self.state.lock();
+            state.construction_address != adapter.as_ptr() as usize
+                || state._storage.seed.state() != DormantOwnerState::NoTransport
+        };
+        if refused {
+            record_transition_refusal(
+                &TRANSPORT_OWNER_REMOVE_REFUSED,
+                b"CtRemRef",
+                TRANSITION_DIAG_BASE + 4,
+            );
+        }
+        publish_window_availability(None);
+    }
 }
 
 const _: () = {
@@ -333,6 +501,41 @@ fn record_storage_exhaustion(class: StorageClass) -> TransportOwnerCreateError {
     };
     let count = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     crate::diag::record_named_bytes(name, count);
-    crate::diag::record(0x0A00_00E6 + class as u32);
+    crate::diag::record(STORAGE_DIAG_BASE + class as u32);
     TransportOwnerCreateError::StorageExhausted
+}
+
+fn record_transition_refusal(counter: &AtomicU32, name: &[u8], code: u32) {
+    let count = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    crate::diag::record_named_bytes(name, count);
+    crate::diag::record(code);
+}
+
+fn publish_window_availability(unavailable: Option<DormantTransportUnavailable>) {
+    match unavailable {
+        Some(DormantTransportUnavailable::NoWindow) => {
+            TRANSPORT_OWNER_WINDOW_UNAVAILABLE[1].store(0, Ordering::Relaxed);
+            crate::diag::record_named_bytes(b"CtBadWnd", 0);
+            record_transition_refusal(
+                &TRANSPORT_OWNER_WINDOW_UNAVAILABLE[0],
+                b"CtNoWnd",
+                TRANSITION_DIAG_BASE + 2,
+            );
+        }
+        Some(DormantTransportUnavailable::InvalidBounds) => {
+            TRANSPORT_OWNER_WINDOW_UNAVAILABLE[0].store(0, Ordering::Relaxed);
+            crate::diag::record_named_bytes(b"CtNoWnd", 0);
+            record_transition_refusal(
+                &TRANSPORT_OWNER_WINDOW_UNAVAILABLE[1],
+                b"CtBadWnd",
+                TRANSITION_DIAG_BASE + 3,
+            );
+        }
+        None => {
+            TRANSPORT_OWNER_WINDOW_UNAVAILABLE[0].store(0, Ordering::Relaxed);
+            TRANSPORT_OWNER_WINDOW_UNAVAILABLE[1].store(0, Ordering::Relaxed);
+            crate::diag::record_named_bytes(b"CtNoWnd", 0);
+            crate::diag::record_named_bytes(b"CtBadWnd", 0);
+        }
+    }
 }

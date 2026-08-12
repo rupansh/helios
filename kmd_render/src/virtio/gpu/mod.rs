@@ -111,7 +111,7 @@ const _: () = {
 // model (no WDDM memory segment / GpuMmu; see GATE5_STAGE2_ALLOC_DESIGN.md).
 
 /// Page granularity for blob window offsets/sizes.
-const BLOB_PAGE: u64 = 4096;
+pub(super) const BLOB_PAGE: u64 = 4096;
 /// Max concurrently-tracked blobs.
 ///
 /// SIZING (2026-07-03 exhaustion incident): a live desktop legitimately holds
