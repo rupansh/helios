@@ -1239,6 +1239,9 @@ $DORMANT_OWNER_GATE_PY" "$REPO"
 run_gate "D4 classic/DMA DIRQL enqueue is capability-restricted and fixed-storage" \
     python3 "$REPO/tools/d4-dirql-gate.py" "$REPO"
 
+run_gate "D5 MPO Present is bounded, exact-allocation, ordinary-packet, and lease-free" \
+    python3 "$REPO/tools/d5-present-mpo-gate.py" "$REPO"
+
 printf '\n'
 if [ ${#FAILED[@]} -eq 0 ]; then
     if [ ${#SKIPPED[@]} -eq 0 ]; then

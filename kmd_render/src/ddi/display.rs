@@ -14,8 +14,8 @@ use helios_protocol::{HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KI
 use crate::adapter::{AdapterContext, ScanoutGuard};
 use crate::ddi::create_allocation::{present_alloc_info, PresentAllocationStorage, ScanoutTarget};
 use crate::ddi::present_packet::{
-    PatchCapacity, PresentAllocations, PresentPayload, PresentSubmissionPrivate,
-    STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
+    MpoPresentRefusal, PatchCapacity, PresentAllocations, PresentMpoPayload, PresentPayload,
+    PresentSubmissionPrivate, STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
 };
 use crate::device::ContextHandleRef;
 use crate::dxgk::*;
@@ -60,6 +60,103 @@ pub static PRESENT_LAST_DST_OPEN_LOW: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_FLAGS: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_STATUS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static VIDPN_SOURCE_ADDRESS_COUNT: AtomicU32 = AtomicU32::new(0);
+
+static D5_DISABLED_OWNER_REFUSALS: AtomicU32 = AtomicU32::new(0);
+static D5_MPO_INFO_POINTER_REFUSALS: AtomicU32 = AtomicU32::new(0);
+static D5_PLANE_LIST_COUNT_REFUSALS: AtomicU32 = AtomicU32::new(0);
+static D5_PLANE_LIST_POINTER_REFUSALS: AtomicU32 = AtomicU32::new(0);
+static D5_SOURCE_OR_LAYER_REFUSALS: AtomicU32 = AtomicU32::new(0);
+static D5_DISABLED_OR_MALFORMED_PLANE_REFUSALS: AtomicU32 = AtomicU32::new(0);
+static D5_RESERVED_BITS_REFUSALS: AtomicU32 = AtomicU32::new(0);
+static D5_OPEN_ALLOCATION_REFUSALS: AtomicU32 = AtomicU32::new(0);
+static D5_ALLOCATION_PROFILE_REFUSALS: AtomicU32 = AtomicU32::new(0);
+static D5_OUTPUT_CAPACITY_REFUSALS: AtomicU32 = AtomicU32::new(0);
+static D5_PACKET_CONSTRUCTION_REFUSALS: AtomicU32 = AtomicU32::new(0);
+
+fn refuse_mpo_present(refusal: MpoPresentRefusal) -> NTSTATUS {
+    let (counter, name, status) = match refusal {
+        MpoPresentRefusal::DisabledOwnerBoundary => (
+            &D5_DISABLED_OWNER_REFUSALS,
+            b"D5Disabled".as_slice(),
+            STATUS_NOT_SUPPORTED,
+        ),
+        MpoPresentRefusal::MpoInfoPointer => (
+            &D5_MPO_INFO_POINTER_REFUSALS,
+            b"D5InfoPtr".as_slice(),
+            STATUS_INVALID_PARAMETER,
+        ),
+        MpoPresentRefusal::PlaneListCount => (
+            &D5_PLANE_LIST_COUNT_REFUSALS,
+            b"D5PlaneCnt".as_slice(),
+            STATUS_INVALID_PARAMETER,
+        ),
+        MpoPresentRefusal::PlaneListPointer => (
+            &D5_PLANE_LIST_POINTER_REFUSALS,
+            b"D5PlanePtr".as_slice(),
+            STATUS_INVALID_PARAMETER,
+        ),
+        MpoPresentRefusal::SourceOrLayer => (
+            &D5_SOURCE_OR_LAYER_REFUSALS,
+            b"D5SrcLayer".as_slice(),
+            STATUS_INVALID_PARAMETER,
+        ),
+        MpoPresentRefusal::DisabledOrMalformedPlane => (
+            &D5_DISABLED_OR_MALFORMED_PLANE_REFUSALS,
+            b"D5PlaneBad".as_slice(),
+            STATUS_INVALID_PARAMETER,
+        ),
+        MpoPresentRefusal::ReservedBits => (
+            &D5_RESERVED_BITS_REFUSALS,
+            b"D5Reserved".as_slice(),
+            STATUS_INVALID_PARAMETER,
+        ),
+        MpoPresentRefusal::OpenAllocation => (
+            &D5_OPEN_ALLOCATION_REFUSALS,
+            b"D5OpenBad".as_slice(),
+            STATUS_INVALID_HANDLE,
+        ),
+        MpoPresentRefusal::AllocationIdentityOrProfile => (
+            &D5_ALLOCATION_PROFILE_REFUSALS,
+            b"D5Profile".as_slice(),
+            STATUS_INVALID_PARAMETER,
+        ),
+        MpoPresentRefusal::OutputCapacity => (
+            &D5_OUTPUT_CAPACITY_REFUSALS,
+            b"D5Capacity".as_slice(),
+            STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
+        ),
+        MpoPresentRefusal::PacketConstruction => (
+            &D5_PACKET_CONSTRUCTION_REFUSALS,
+            b"D5Packet".as_slice(),
+            STATUS_INVALID_PARAMETER,
+        ),
+    };
+    let count = counter.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    crate::diag::record_named_bytes(name, count);
+    PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+    status
+}
+
+unsafe fn present_mpo_d5(args: &mut DXGKARG_PRESENT, payload: PresentMpoPayload) -> NTSTATUS {
+    // This is the real D5 authority boundary. While false, the raw MPO pointer
+    // carried by `payload` is not dereferenced and no allocation is resolved.
+    if !crate::virtio::KMD_D2_OWNER_ENABLED {
+        return refuse_mpo_present(MpoPresentRefusal::DisabledOwnerBoundary);
+    }
+
+    // SAFETY: the selected union arm came from this live Present;
+    // `prepare_mpo_present` checks every pointer before reference formation
+    // and performs no writes.
+    let plan = match unsafe { payload.prepare_mpo_present(args) } {
+        Ok(plan) => plan,
+        Err(refusal) => return refuse_mpo_present(refusal),
+    };
+    // SAFETY: `plan` proves every output capacity for this same argument and
+    // leaves no fallible work after the first output byte is changed.
+    unsafe { plan.emit_mpo_present(args) };
+    PRESENT_LAST_STATUS.store(STATUS_SUCCESS as u32, Ordering::Relaxed);
+    STATUS_SUCCESS
+}
 
 /// Non-cloneable capability proving that the classic SetVidPn callback is
 /// currently executing above DISPATCH_LEVEL in the classic WDK callback.
@@ -299,18 +396,16 @@ unsafe fn dxgkddi_present_inner(
     // SAFETY: `args` is dxgkrnl's present struct; the arm its flags name is the
     // one it initialised.
     let payload = unsafe { PresentPayload::decode(args) };
-    let Some(allocation_list) = payload.allocation_list() else {
-        // FlipWithMultiPlaneOverlay: unreachable, because the driver does not
-        // register the MPO3 KMD interface. Refuse rather than reinterpret an MPO
-        // struct as an allocation array.
-        crate::diag::record_named_bytes(b"PBmpo", 1);
-        PRESENT_LAST_STATUS.store(STATUS_NOT_SUPPORTED as u32, Ordering::Relaxed);
-        return STATUS_NOT_SUPPORTED;
+    let allocation_list = match payload {
+        PresentPayload::AllocationList(list) => list,
+        PresentPayload::MultiPlaneOverlay(mpo) => {
+            return unsafe { present_mpo_d5(args, mpo) };
+        }
     };
     let payload_has_list = allocation_list.is_present();
     // SAFETY: `allocation_list` came from `PresentPayload::decode`, so it is the
     // fixed present allocation array.
-    let present_allocations = unsafe { PresentAllocations::from_allocation_list(allocation_list) };
+    let present_allocations = unsafe { PresentAllocations::from_allocation_list(&allocation_list) };
 
     // The patch-capacity proof, acquired before any host GPU work on the BLT
     // path and consumed by the single write below.

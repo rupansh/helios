@@ -10,6 +10,15 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use helios_protocol::{
+    D3DDDIFMT_A8R8G8B8, D3DDDI_ID_UNINITIALIZED, DXGI_FORMAT_B8G8R8A8_UNORM,
+    HELIOS_HWA2_FLAG_CROSS_ADAPTER, HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY,
+    HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE, HELIOS_HWA2_FLAG_DISPLAYABLE,
+    HELIOS_HWA2_FLAG_PRIMARY, HELIOS_HWA2_FLAG_PROTECTED, HELIOS_HWA2_FLAG_STANDARD,
+    HELIOS_HWA2_FLAG_STEREO, HELIOS_HWA2_KIND_IMAGE, HELIOS_HWA2_KIND_STANDARD_PRIMARY,
+    HELIOS_PACKAGE_GENERATION,
+};
+
 use crate::dxgk::*;
 
 // Legal retry status for DxgkDdiPresent when either the DMA or patch buffer
@@ -765,14 +774,9 @@ pub(crate) enum PresentPayload<'a> {
     /// The fixed source/destination allocation array. Every present this driver
     /// services today.
     AllocationList(PresentAllocationList<'a>),
-    /// `FlipWithMultiPlaneOverlay` — the `pPresentMultiPlaneOverlayInfo` arm.
-    ///
-    /// Unreachable: the driver does not register the MPO3 KMD interface
-    /// (`query_adapter_info.rs`'s cap surface), so dxgkrnl never sets this. It
-    /// is a named variant rather than an assumption so that if it ever arrives,
-    /// the code refuses instead of reinterpreting an MPO struct as an
-    /// allocation array.
-    MultiPlaneOverlay,
+    /// `FlipWithMultiPlaneOverlay` — the `pPresentMultiPlaneOverlayInfo` arm,
+    /// retained with the exact flag/reserved provenance that selected it.
+    MultiPlaneOverlay(PresentMpoPayload),
 }
 
 impl<'a> PresentPayload<'a> {
@@ -790,7 +794,15 @@ impl<'a> PresentPayload<'a> {
         // `Value`; reading the `Value` view is a read of initialized memory.
         let flags = unsafe { args.Flags.__bindgen_anon_1.Value };
         if flags & Self::FLAG_FLIP_WITH_MPO != 0 {
-            return Self::MultiPlaneOverlay;
+            // SAFETY: the MPO flag selected this union arm. Merely carrying the
+            // pointer does not dereference it; the disabled owner boundary in
+            // `display.rs` dominates every validation read below.
+            let info = unsafe { args.__bindgen_anon_1.pPresentMultiPlaneOverlayInfo };
+            return Self::MultiPlaneOverlay(PresentMpoPayload {
+                info,
+                present_flags: flags,
+                _present: core::marker::PhantomData,
+            });
         }
         // SAFETY: not an MPO present, so the allocation-list arm is live.
         let list = unsafe { args.__bindgen_anon_1.pAllocationList };
@@ -799,13 +811,252 @@ impl<'a> PresentPayload<'a> {
             _present: core::marker::PhantomData,
         })
     }
+}
 
-    /// The allocation list, or `None` for an arm that has none.
-    pub(crate) fn allocation_list(&self) -> Option<&PresentAllocationList<'a>> {
-        match self {
-            Self::AllocationList(list) => Some(list),
-            Self::MultiPlaneOverlay => None,
+/// Closed, counted refusal vocabulary for the bounded D5 Present arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MpoPresentRefusal {
+    DisabledOwnerBoundary,
+    MpoInfoPointer,
+    PlaneListCount,
+    PlaneListPointer,
+    SourceOrLayer,
+    DisabledOrMalformedPlane,
+    ReservedBits,
+    OpenAllocation,
+    AllocationIdentityOrProfile,
+    OutputCapacity,
+    PacketConstruction,
+}
+
+/// The selected MPO union arm before validation. It owns no allocation or
+/// display lifetime; it only carries the exact OS pointer and selector fields.
+pub(crate) struct PresentMpoPayload {
+    info: *mut DXGK_PRESENTMULTIPLANEOVERLAYINFO,
+    present_flags: u32,
+    _present: core::marker::PhantomData<*const DXGKARG_PRESENT>,
+}
+
+#[derive(Clone, Copy)]
+struct PresentMpoAllocation {
+    open_handle: NonNull<c_void>,
+    segment_id: u32,
+    physical_address: u64,
+}
+
+/// Non-cloneable proof that the complete MPO input and every output capacity
+/// were accepted before any output pointer or byte was changed.
+pub(crate) struct MpoPresentPacketPlan {
+    dma: *mut c_void,
+    next_dma: *mut c_void,
+    command: helios_protocol::HeliosPresentRefreshCmd,
+    plane: PresentMpoAllocation,
+}
+
+const MPO_MAX_PLANES: u32 = 1;
+const MPO_PRIVATE_BYTES: usize = 0;
+const MPO_PATCH_REFERENCES: usize = 0;
+const MPO_PRESENT_RESERVED_FLAGS: u32 = 0xFFFF_C000;
+const SHARED_PRIMARY_STANDARD_ALLOCATION_TYPE: u32 = 1;
+
+#[inline]
+fn output_capacity<T>(pointer: *mut T, available: usize, required: usize) -> bool {
+    required == 0 || (!pointer.is_null() && available >= required)
+}
+
+fn exact_mpo_primary_profile(
+    facts: &crate::ddi::create_allocation::DirectScanoutAllocationFacts,
+    identity: crate::ddi::create_allocation::OpenIdentity,
+    source_id: u32,
+) -> bool {
+    let allocation = &facts.final_hwa2;
+    if allocation
+        .validate_create_output(HELIOS_PACKAGE_GENERATION)
+        .is_err()
+        || identity.generation != facts.allocation_generation
+        || identity.generation != allocation.allocation_generation
+        || identity.kind != allocation.allocation_kind
+        || identity.byte_size != allocation.byte_size
+        || facts.backing_size < allocation.byte_size
+    {
+        return false;
+    }
+
+    let exact_kind = match allocation.allocation_kind {
+        HELIOS_HWA2_KIND_IMAGE => {
+            allocation.flags & HELIOS_HWA2_FLAG_STANDARD == 0
+                && allocation.standard_allocation_type == 0
         }
+        HELIOS_HWA2_KIND_STANDARD_PRIMARY => {
+            allocation.flags & HELIOS_HWA2_FLAG_STANDARD != 0
+                && allocation.standard_allocation_type == SHARED_PRIMARY_STANDARD_ALLOCATION_TYPE
+        }
+        _ => false,
+    };
+    let required_flags = HELIOS_HWA2_FLAG_PRIMARY
+        | HELIOS_HWA2_FLAG_DISPLAYABLE
+        | HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE;
+    let forbidden_flags =
+        HELIOS_HWA2_FLAG_STEREO | HELIOS_HWA2_FLAG_PROTECTED | HELIOS_HWA2_FLAG_CROSS_ADAPTER;
+    let exact_source = if allocation.flags & HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY != 0 {
+        allocation.vidpn_source == D3DDDI_ID_UNINITIALIZED
+    } else {
+        allocation.vidpn_source == source_id
+    };
+
+    exact_kind
+        && allocation.flags & required_flags == required_flags
+        && allocation.flags & forbidden_flags == 0
+        && allocation.dxgi_format == DXGI_FORMAT_B8G8R8A8_UNORM
+        && allocation.d3d_ddi_format == D3DDDIFMT_A8R8G8B8
+        && allocation.depth_or_array_size == 1
+        && allocation.mip_levels == 1
+        && allocation.sample_count == 1
+        && allocation.sample_quality == 0
+        && allocation.plane_count == MPO_MAX_PLANES
+        && exact_source
+}
+
+impl PresentMpoPayload {
+    /// Validate the exact one-primary WDK 28000 payload and all output capacity.
+    /// The owner boundary must be checked before calling this routine.
+    ///
+    /// # Safety
+    /// The payload came from the active MPO arm of a live `DXGKARG_PRESENT`.
+    pub(crate) unsafe fn prepare_mpo_present(
+        self,
+        args: &DXGKARG_PRESENT,
+    ) -> Result<MpoPresentPacketPlan, MpoPresentRefusal> {
+        if self.info.is_null() || !self.info.is_aligned() {
+            return Err(MpoPresentRefusal::MpoInfoPointer);
+        }
+        // SAFETY: null/alignment were checked before forming this reference;
+        // dxgkrnl owns the input for the duration of the DDI.
+        let info = unsafe { &*self.info };
+        if info.PlaneListCount != MPO_MAX_PLANES {
+            return Err(MpoPresentRefusal::PlaneListCount);
+        }
+        if info.VidPnSourceId != 0 {
+            return Err(MpoPresentRefusal::SourceOrLayer);
+        }
+        if self.present_flags & MPO_PRESENT_RESERVED_FLAGS != 0 {
+            return Err(MpoPresentRefusal::ReservedBits);
+        }
+        if self.present_flags != PresentPayload::FLAG_FLIP_WITH_MPO {
+            return Err(MpoPresentRefusal::DisabledOrMalformedPlane);
+        }
+        let plane_pointer = info.pPlaneList;
+        if plane_pointer.is_null() || !plane_pointer.is_aligned() {
+            return Err(MpoPresentRefusal::PlaneListPointer);
+        }
+        // `PlaneListCount == 1` was established before this reference. No slice
+        // or pointer arithmetic is needed for the frozen one-plane profile.
+        let plane = unsafe { &*plane_pointer };
+        if plane.LayerIndex != 0 {
+            return Err(MpoPresentRefusal::SourceOrLayer);
+        }
+        if plane.Enabled != 1 {
+            return Err(MpoPresentRefusal::DisabledOrMalformedPlane);
+        }
+        if plane.__bindgen_anon_1.Reserved() != 0 {
+            return Err(MpoPresentRefusal::ReservedBits);
+        }
+
+        let open_handle = plane.hDeviceSpecificAllocation;
+        let Some((_allocation_handle, facts)) = (unsafe {
+            crate::ddi::create_allocation::open_direct_scanout_allocation_facts(open_handle)
+        }) else {
+            return Err(MpoPresentRefusal::OpenAllocation);
+        };
+        let Some(identity) =
+            (unsafe { crate::ddi::create_allocation::open_allocation_identity(open_handle) })
+        else {
+            return Err(MpoPresentRefusal::OpenAllocation);
+        };
+        if !crate::adapter::allocation_object::is_current(identity.generation) {
+            return Err(MpoPresentRefusal::OpenAllocation);
+        }
+        if !exact_mpo_primary_profile(&facts, identity, info.VidPnSourceId) {
+            return Err(MpoPresentRefusal::AllocationIdentityOrProfile);
+        }
+        let Some(open_handle) = NonNull::new(open_handle) else {
+            return Err(MpoPresentRefusal::OpenAllocation);
+        };
+        let plane = PresentMpoAllocation {
+            open_handle,
+            segment_id: plane.__bindgen_anon_1.SegmentId(),
+            // SAFETY: PhysicalAddress is the selected address view in this WDK
+            // record; keep it paired with the handle and segment above.
+            physical_address: unsafe { plane.PhysicalAddress.QuadPart as u64 },
+        };
+
+        let dma_bytes = core::mem::size_of::<helios_protocol::HeliosPresentRefreshCmd>();
+        if !output_capacity(args.pDmaBuffer, args.DmaSize as usize, dma_bytes)
+            || !output_capacity(
+                args.pDmaBufferPrivateData,
+                args.DmaBufferPrivateDataSize as usize,
+                MPO_PRIVATE_BYTES,
+            )
+            || !output_capacity(
+                args.pPatchLocationListOut,
+                args.PatchLocationListOutSize as usize,
+                MPO_PATCH_REFERENCES,
+            )
+        {
+            return Err(MpoPresentRefusal::OutputCapacity);
+        }
+        let Some(next_dma_address) = (args.pDmaBuffer as usize).checked_add(dma_bytes) else {
+            return Err(MpoPresentRefusal::PacketConstruction);
+        };
+        let command = helios_protocol::HeliosPresentRefreshCmd {
+            magic: helios_protocol::HELIOS_PRESENT_REFRESH_MAGIC,
+            version: helios_protocol::HELIOS_PRESENT_REFRESH_VERSION,
+            // WDK 28000 says the Win7+ patch-list fields are unused, and the
+            // MPO plane list has no allocation-list index mapping. Do not force
+            // the classic source/destination indices onto this packet.
+            source_index: 0,
+            destination_index: 0,
+            present_ctx_id: 0,
+            present_value: 0,
+            present_cookie: 0,
+        };
+        if !command.is_valid() {
+            return Err(MpoPresentRefusal::PacketConstruction);
+        }
+        Ok(MpoPresentPacketPlan {
+            dma: args.pDmaBuffer,
+            next_dma: next_dma_address as *mut c_void,
+            command,
+            plane,
+        })
+    }
+}
+
+impl MpoPresentPacketPlan {
+    /// Emit the already planned ordinary Present command. No failure remains
+    /// after this point, so a refusal cannot leave a partial packet or cursor.
+    ///
+    /// # Safety
+    /// `prepare_mpo_present` proved the DMA pointer and size for this same
+    /// `args` object.
+    pub(crate) unsafe fn emit_mpo_present(self, args: &mut DXGKARG_PRESENT) {
+        // Consume the exact handle/segment/address tuple as one value. HERF has
+        // no identity fields: the WDK MPO list itself is dxgkrnl's allocation
+        // and placement contract, and inventing an allocation-list index here
+        // would be a different packet ABI.
+        let _exact_os_plane = (
+            self.plane.open_handle.as_ptr(),
+            self.plane.segment_id,
+            self.plane.physical_address,
+        );
+        unsafe {
+            core::ptr::write_unaligned(
+                self.dma.cast::<helios_protocol::HeliosPresentRefreshCmd>(),
+                self.command,
+            );
+        }
+        args.pDmaBuffer = self.next_dma;
+        args.MultipassOffset = 0;
     }
 }
 
