@@ -5,6 +5,7 @@
 //! `MiniportDeviceContext` in every subsequent DDI call.
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
@@ -498,6 +499,8 @@ pub struct AdapterContext {
     /// One stable source-0/plane-0 D2 lifetime owner. The production display
     /// path cannot reach it while `KMD_D2_OWNER_ENABLED` is false.
     pub(crate) direct_scanout: crate::ddi::direct_scanout::DirectScanoutRuntime,
+    /// Per-adapter native-fence identity, admission, epoch, and population.
+    pub(crate) native_fence: Arc<crate::ddi::native_fence::NativeFenceAdapterState>,
     /// Last fence completed by the bring-up scheduler path.
     last_completed_fence: AtomicU32,
     /// Serializes DMA_COMPLETED notification and its monotonic fence update.
@@ -1135,6 +1138,7 @@ impl AdapterContext {
             etw_rundown: crate::ddi::diag_etw::EtwAdapterRundown::new(),
             committed_mode: crate::ddi::committed_mode::CommittedModeStorage::new(),
             direct_scanout: crate::ddi::direct_scanout::DirectScanoutRuntime::new(),
+            native_fence: Arc::new(crate::ddi::native_fence::NativeFenceAdapterState::new()),
             last_completed_fence: AtomicU32::new(0),
             wddm_notify_lock: UnsafeCell::new(0),
             isr_status: AtomicUsize::new(0),

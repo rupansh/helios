@@ -170,6 +170,7 @@ HAL = "kmd_render/src/virtio/hal.rs"
 CTRL = "kmd_render/src/virtio/ctrl.rs"
 PACKET = "kmd_render/src/ddi/present_packet.rs"
 COMMITTED = "kmd_render/src/ddi/committed_mode.rs"
+SUBMIT = "kmd_render/src/ddi/submit_command.rs"
 LOGIC_ADMISSION = "kmd_logic/src/direct_scanout_admission.rs"
 LOGIC_LIFETIME = "kmd_logic/src/direct_scanout_lifetime.rs"
 LOGIC_COMMITTED = "kmd_logic/src/committed_mode.rs"
@@ -232,6 +233,21 @@ DIRQL_CALL_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
     (DISPLAY, "mint"): frozenset({"KeGetCurrentIrql", "then_some"}),
     (DISPLAY, "authorizes"): frozenset({"KeGetCurrentIrql", "eq"}),
     (DISPLAY, "d4_queue_status"): frozenset(),
+    (SUBMIT, "signal_dma_completed"): frozenset(
+        {
+            "as_mut",
+            "completed_fence",
+            "fence_is_forward",
+            "fetch_add",
+            "notify_at_dirql",
+            "set_completed_fence",
+            "zeroed",
+        }
+    ),
+    (SUBMIT, "notify_at_dirql"): frozenset({"is_none", "store", "sync"}),
+    (SUBMIT, "notify_at_dirql_routine"): frozenset(
+        {"fetch_add", "is_null", "notify_interrupt", "queue_dpc"}
+    ),
     (DIRECT, "validate_direct_scanout_binding"): frozenset(
         {
             "Present",
@@ -511,6 +527,9 @@ DIRQL_QUALIFIED_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
         {"RemovedTerminalError::Lifecycle", "RemovedTerminalError::StoredState"}
     ),
     (DISPLAY, "authorizes"): frozenset({"core::ptr::eq"}),
+    (SUBMIT, "signal_dma_completed"): frozenset(
+        {"core::mem::zeroed", "helios_kmd_logic::scanout_lease::fence_is_forward"}
+    ),
     (ADAPTER, "enqueue_d4_scanout_dirql"): frozenset({"NonNull::new"}),
     (ADAPTER_SCANOUT, "reserve_scanout_bind_seq"): frozenset(
         {"helios_kmd_logic::scanout_retire::next_bind_sequence"}
@@ -540,6 +559,16 @@ DIRQL_MACRO_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
     (PROTOCOL_WDDM, "HeliosWddmAllocationDescV2::validate_stage"): frozenset({"matches"}),
     (PROTOCOL_WDDM, "helios_hwa2_kind_is_image"): frozenset({"matches"}),
     (PROTOCOL_WDDM, "helios_hwa2_kind_is_standard"): frozenset({"matches"}),
+}
+
+# The shared notifier is the reviewed implementation of these two kernel
+# callbacks, so their field names are expected only inside that narrow helper.
+# Every other DIRQL-audited body retains the blanket callback prohibition.
+DIRQL_FORBIDDEN_ALLOWLIST: dict[tuple[str, str], frozenset[str]] = {
+    (SUBMIT, "notify_at_dirql"): frozenset(
+        {"DxgkCbQueueDpc", "DxgkCbSynchronizeExecution"}
+    ),
+    (SUBMIT, "notify_at_dirql_routine"): frozenset({"DxgkCbQueueDpc"}),
 }
 
 
@@ -793,6 +822,9 @@ def check_sources(sources: dict[str, str]) -> list[str]:
         (DISPLAY, "set_vidpn_source_address_d4"),
         (DISPLAY, "mint"),
         (DISPLAY, "d4_queue_status"),
+        (SUBMIT, "signal_dma_completed"),
+        (SUBMIT, "notify_at_dirql"),
+        (SUBMIT, "notify_at_dirql_routine"),
         (DIRECT, "validate_direct_scanout_binding"),
         (DIRECT, "record_refusal"),
         (DIRECT, "active_transport_instance"),
@@ -884,10 +916,11 @@ def check_sources(sources: dict[str, str]) -> list[str]:
             continue
         body = found[1]
         audited = body.replace("super::ctrl::fill_set_scanout_blob", "fill_set_scanout_blob")
-        match = common_forbidden.search(audited)
-        if match:
-            errors.append(f"{path}: {name} reaches DIRQL-forbidden {match.group(0)!r}")
         key = (path, name)
+        allowed_forbidden = DIRQL_FORBIDDEN_ALLOWLIST.get(key, frozenset())
+        for match in common_forbidden.finditer(audited):
+            if match.group(0) not in allowed_forbidden:
+                errors.append(f"{path}: {name} reaches DIRQL-forbidden {match.group(0)!r}")
         found_calls = call_names(body)
         expected_calls = DIRQL_CALL_MANIFEST[key]
         if found_calls != expected_calls:

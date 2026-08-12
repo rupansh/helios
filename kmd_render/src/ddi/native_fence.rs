@@ -41,7 +41,7 @@
 //!
 //! `kmd_render` is a `panic = "abort"` `no_std` cdylib and cannot run a test, so
 //! every decision with a right and a wrong answer — PDD validation, population
-//! bounds, the Live/Draining/Dead transitions, epoch validity, admission — is a
+//! bounds, handle-refusal transitions, epoch validity, and admission — is a
 //! pure function in `helios_kmd_logic::native_fence_lifecycle` with host tests.
 //! This file does the pointer work and the atomics.
 //!
@@ -50,80 +50,21 @@
 //! Every advertisement here is gated on [`NATIVE_FENCE_ADVERTISED`], which is
 //! false while `ddi::wddm_surface::SURFACE` is `Wddm2_1GpuMmu`. That flip is the
 //! single atomic activation switch for the whole retirement and is its last edit
-//! (`docs/retirement/OWNERSHIP.md` §3), so this code is complete and unreachable
-//! rather than half-advertised. The DDI slots are registered regardless:
+//! (`docs/retirement/OWNERSHIP.md` §3), so this dormant source tranche is
+//! internally coherent and unreachable rather than half-advertised. That is not
+//! an activation-readiness or runtime-correctness claim. The DDI slots are
+//! registered regardless:
 //! dxgkrnl does not invoke a WDDM 3.1/3.2 native-fence callback on a 2.1
 //! adapter, and a registered-but-unreached slot is visible in the slot audit
 //! while an unregistered one would have to be rediscovered later.
 //!
-//! # ⛔ The one unclosed window — `NF-UAF-1`
+//! # Handle lifetime (`NF-UAF-1`)
 //!
-//! **`DxgkDdiOpenNativeFence` racing `DxgkDdiDestroyNativeFence` on the same
-//! global object is a use-after-free.** Found by the Phase-2 adversarial review
-//! (2026-08-10), not yet fixed, and unreachable today because
-//! [`NATIVE_FENCE_ADVERTISED`] is false — it becomes reachable at the single
-//! atomic activation switch, which is precisely when a kernel UAF is most
-//! expensive to discover by running.
-//!
-//! ```text
-//!   A: open    model_of()             reads state = LIVE, refs = 0  -> Ok
-//!   B: destroy model_of()             reads refs = 0                -> Ok
-//!   B: destroy CAS(LIVE -> DEAD)      succeeds
-//!   B: destroy free_global()          the object is FREED
-//!   A: open    local_refs.fetch_add() writes freed memory, and hands dxgkrnl a
-//!              LocalFenceObject whose `global` pointer dangles
-//! ```
-//!
-//! The cause is structural rather than local: every decision here is taken from
-//! a [`model_of`] snapshot and published by a *separate* atomic operation, so
-//! any rule that reads both `state` and `local_refs` has a window between
-//! deciding and acting. The sibling window on the teardown side — destroy
-//! parking the object in `DRAINING` just after the last close already gave up
-//! its own free attempt — was closed by [`finish_teardown_if_drained`], which
-//! works only because both parties converge *after* `DRAINING` is published.
-//! No such convergence point exists for open-versus-free.
-//!
-//! ## ⛔ The fix is NOT the obvious one, and the reason decides the design
-//!
-//! The obvious repair is to pack `state` and `local_refs` into one `AtomicU64`
-//! so the rule and the transition become a single compare-exchange. **That was
-//! designed and rejected**, because it fixes the wrong half. It closes the
-//! *decision* TOCTOU — open can no longer take a reference against a `LIVE` it
-//! read a moment ago — but it does nothing about **object lifetime**: destroy
-//! frees the allocation *after* its exchange succeeds, while open is still
-//! holding the `&GlobalFenceObject` it resolved from the handle and may be
-//! re-reading the word in its retry loop. The dereference moves; it does not
-//! go away. Shipping it would convert a visible hole into a hidden one.
-//!
-//! A lock does not rescue it either. Any lock is acquired *through* the object,
-//! and [`global_from_handle`] must already dereference the pointer to check its
-//! magic before there is anything to lock. The only structure that would make a
-//! handle safe against a concurrent free is an adapter-wide registry to
-//! validate against — and §10.1 invariant 10 plus §17.6:4328-4333 forbid
-//! exactly that ("no hash table, scan, name, or process-global discovery
-//! registry"). ⇒ **Within the normative design, no purely guest-side mechanism
-//! closes this.**
-//!
-//! ## Therefore the real question is a premise, not a patch
-//!
-//! This module is only sound if **dxgkrnl serialises lifetime operations on one
-//! global native-fence object** — i.e. never calls `DxgkDdiOpenNativeFence` and
-//! `DxgkDdiDestroyNativeFence` concurrently for the same `hGlobalNativeFence`.
-//! That assumption is load-bearing and was nowhere written down, which is the
-//! actual defect this review found.
-//!
-//! * If dxgkrnl **does** serialise them, `NF-UAF-1` is unreachable, and the
-//!   `DRAINING` machinery below is defence in depth rather than necessity.
-//! * If it does **not**, the handle-only design cannot be made safe and the
-//!   normative constraint has to be revisited with the owner.
-//!
-//! ⚠ `docs/dx12/METHOD.md` §3 names dxgkrnl's internal behaviour as something
-//! static analysis provably cannot settle, and says such questions need **one
-//! deliberate experiment**, not another reading round. So this stays recorded
-//! and unfixed on purpose: the experiment (hammer open/destroy on one shared
-//! fence from two processes once the surface flips, with the population
-//! counters and a poisoned freed-object magic as the instrument) is the next
-//! step, and any repair chosen before it would be guessing.
+//! Microsoft's native-fence contract says dxgkrnl retains the global handle
+//! while any local reference exists and calls Close for the final local before
+//! Destroy. An in-progress open locates that same kernel object before this DDI,
+//! so the OS-owned reference keeps this handle allocation live. See
+//! <https://learn.microsoft.com/windows-hardware/drivers/display/native-gpu-fence-objects>.
 //!
 //! # What is deliberately NOT here
 //!
@@ -141,6 +82,7 @@ use core::mem::{align_of, offset_of, size_of};
 use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 
 use helios_kmd_logic::native_fence_lifecycle as nf;
 
@@ -187,23 +129,29 @@ pub(crate) const VIDSCHCAPS_NO_64BIT_ATOMICS: u32 = 1 << 5;
 /// generation (§17.6:4385).
 pub(crate) const VIDSCHCAPS_OPTIMIZED_NATIVE_FENCE_INTERRUPT: u32 = 1 << 12;
 
+/// Exact GPUVA range in which this GpuMmu implementation can address the two
+/// 64-bit native-fence values.
+pub(crate) const NATIVE_FENCE_MINIMUM_ADDRESS: u64 = 0;
+pub(crate) const NATIVE_FENCE_MAXIMUM_ADDRESS: u64 =
+    (1u64 << crate::ddi::gpummu::VIRTUAL_ADDRESS_BIT_COUNT) - 1;
+
+fn fence_gpuva_is_supported(address: u64) -> bool {
+    address != 0
+        && address % align_of::<u64>() as u64 == 0
+        && address
+            .checked_add(size_of::<u64>() as u64 - 1)
+            .is_some_and(|last| last <= NATIVE_FENCE_MAXIMUM_ADDRESS)
+}
+
 /// The `DXGK_VIDSCHCAPS` bits this module contributes, as one value.
 ///
 /// Zero while the surface is not advertised, so the caps word cannot claim a
 /// native-fence capability the reported WDDM level does not support.
-pub(crate) const fn vidschcaps_native_fence_bits() -> u32 {
-    if NATIVE_FENCE_ADVERTISED {
-        VIDSCHCAPS_NATIVE_GPU_FENCE
-    } else {
-        0
-    }
-}
-
-/// Compile-time proof of the two zero-valued halves of §10.2:994.
+/// Compile-time proof that the only contributed bit cannot imply either
+/// unsupported scheduler capability.
 const _: () = assert!(
-    vidschcaps_native_fence_bits()
-        & (VIDSCHCAPS_NO_64BIT_ATOMICS | VIDSCHCAPS_OPTIMIZED_NATIVE_FENCE_INTERRUPT)
-        == 0,
+    VIDSCHCAPS_NATIVE_GPU_FENCE
+        & (VIDSCHCAPS_NO_64BIT_ATOMICS | VIDSCHCAPS_OPTIMIZED_NATIVE_FENCE_INTERRUPT) == 0,
     "section 10.2 requires No64BitAtomics=0, and this generation advertises no HWQueue \
      native-fence log, so OptimizedNativeFenceSignaledInterrupt must stay 0"
 );
@@ -235,6 +183,14 @@ const _: () = assert!(offset_of!(DXGK_NATIVE_FENCE_CAPS, MapToGpuSystemProcess) 
 const _: () = assert!(offset_of!(DXGK_NATIVE_FENCE_CAPS, MinimumAddress) == 8);
 const _: () = assert!(offset_of!(DXGK_NATIVE_FENCE_CAPS, MaximumAddress) == 16);
 const _: () = assert!(offset_of!(DXGK_NATIVE_FENCE_CAPS, Reserved) == 24);
+const _: () = assert!(
+    nf::NATIVE_FENCE_TYPE_DEFAULT
+        == crate::dxgk::_D3DDDI_NATIVEFENCE_TYPE::D3DDDI_NATIVEFENCE_TYPE_DEFAULT as u32
+);
+const _: () = assert!(
+    nf::NATIVE_FENCE_TYPE_INTRA_GPU
+        == crate::dxgk::_D3DDDI_NATIVEFENCE_TYPE::D3DDDI_NATIVEFENCE_TYPE_INTRA_GPU as u32
+);
 
 // ── Named counters ───────────────────────────────────────────────────────────
 //
@@ -289,31 +245,108 @@ pub static NF_INT_SIGNALED: AtomicU32 = AtomicU32::new(0);
 pub static NF_INT_FAILED: AtomicU32 = AtomicU32::new(0);
 /// Adapter epoch bumps (reset / removal).
 pub static NF_EPOCH_BUMPS: AtomicU32 = AtomicU32::new(0);
+pub static NF_FEATURE_REJ: AtomicU32 = AtomicU32::new(0);
+pub static NF_BUFFER_REJ: AtomicU32 = AtomicU32::new(0);
+pub static NF_CAPS_SIZE_REJ: AtomicU32 = AtomicU32::new(0);
+pub static NF_MISSING_LUID: AtomicU32 = AtomicU32::new(0);
+pub static NF_FOREIGN_ADAPTER: AtomicU32 = AtomicU32::new(0);
+pub static NF_BAD_HANDLE: AtomicU32 = AtomicU32::new(0);
+pub static NF_STALE_GENERATION: AtomicU32 = AtomicU32::new(0);
+pub static NF_FLAGS_REJ: AtomicU32 = AtomicU32::new(0);
+pub static NF_COUNT_OVERFLOW: AtomicU32 = AtomicU32::new(0);
+pub static NF_PREFLIGHT_REJ: AtomicU32 = AtomicU32::new(0);
+pub static NF_LIFECYCLE_REJ: AtomicU32 = AtomicU32::new(0);
+pub static NF_EPOCH_EXHAUSTED: AtomicU32 = AtomicU32::new(0);
+pub static NF_OBJECT_GENERATION_EXHAUSTED: AtomicU32 = AtomicU32::new(0);
+pub static NF_INT_NO_EDGE: AtomicU32 = AtomicU32::new(0);
 
-/// Live global (created) objects.
-static LIVE_GLOBAL: AtomicU32 = AtomicU32::new(0);
-/// Live local (opened) objects.
-static LIVE_LOCAL: AtomicU32 = AtomicU32::new(0);
-/// The adapter-wide validity epoch. Bumped by [`invalidate_all`].
-static NATIVE_FENCE_EPOCH: AtomicU32 = AtomicU32::new(0);
-/// Source of the KMD-assigned nonzero object generation (§12.1 line 3142).
-static OBJECT_GENERATION: AtomicU64 = AtomicU64::new(0);
+const FEATURE_BITS: u32 = 3;
+const FEATURE_STATE_MASK: u64 = (1 << FEATURE_BITS) - 1;
+const FEATURE_STOPPED: u64 = 0;
+const FEATURE_UNKNOWN: u64 = 1;
+const FEATURE_QUERYING: u64 = 2;
+const FEATURE_ENABLED: u64 = 3;
+const FEATURE_DECLINED: u64 = 4;
+const FEATURE_POISONED: u64 = 5;
+const MAX_ADAPTER_GENERATION: u64 = u64::MAX >> FEATURE_BITS;
 
-/// `i64::MIN` is the "LUID not yet published" sentinel rather than 0, because 0
-/// is a legal (if unlikely) LUID and treating it as unknown would leave a real
-/// adapter permanently unadmitted.
-const LUID_UNKNOWN: i64 = i64::MIN;
-/// The exact creating adapter LUID, written into HNF1 offset 32.
-static ADAPTER_LUID: AtomicI64 = AtomicI64::new(LUID_UNKNOWN);
+const LIFECYCLE_STOPPED: u32 = 0;
+const LIFECYCLE_ACTIVE: u32 = 1;
+const LIFECYCLE_RESETTING: u32 = 2;
+const LIFECYCLE_POISONED: u32 = 3;
 
-/// The OS's answer to `DXGK_FEATURE_NATIVE_FENCE`, queried exactly once.
-static FEATURE_STATE: AtomicU32 = AtomicU32::new(FEATURE_UNKNOWN);
-/// Not asked yet.
-const FEATURE_UNKNOWN: u32 = 0;
-/// The OS returned `Enabled=TRUE`.
-const FEATURE_ENABLED: u32 = 1;
-/// The OS returned `Enabled=FALSE`, or there is no callback to ask.
-const FEATURE_DECLINED: u32 = 2;
+const fn feature_word(generation: u64, state: u64) -> u64 {
+    (generation << FEATURE_BITS) | state
+}
+
+const fn feature_generation(word: u64) -> u64 {
+    word >> FEATURE_BITS
+}
+
+const fn feature_state(word: u64) -> u64 {
+    word & FEATURE_STATE_MASK
+}
+
+/// Stable native-fence authority owned by one `AdapterContext`.
+pub(crate) struct NativeFenceAdapterState {
+    feature: AtomicU64,
+    luid: AtomicI64,
+    lifecycle: AtomicU32,
+    epoch: AtomicU64,
+    object_generation: AtomicU64,
+    live_global: AtomicU32,
+    live_local: AtomicU32,
+    active_monitored: AtomicU32,
+}
+
+impl NativeFenceAdapterState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            feature: AtomicU64::new(feature_word(0, FEATURE_STOPPED)),
+            luid: AtomicI64::new(0),
+            lifecycle: AtomicU32::new(LIFECYCLE_STOPPED),
+            epoch: AtomicU64::new(1),
+            object_generation: AtomicU64::new(0),
+            live_global: AtomicU32::new(0),
+            live_local: AtomicU32::new(0),
+            active_monitored: AtomicU32::new(0),
+        }
+    }
+
+    fn current_generation(&self) -> u64 {
+        feature_generation(self.feature.load(Ordering::Acquire))
+    }
+
+    fn feature_enabled(&self) -> bool {
+        feature_state(self.feature.load(Ordering::Acquire)) == FEATURE_ENABLED
+    }
+
+    fn lifecycle_active(&self) -> bool {
+        self.lifecycle.load(Ordering::Acquire) == LIFECYCLE_ACTIVE
+    }
+
+    fn reserve_object_generation(&self) -> Option<u64> {
+        self.object_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+                nf::next_object_generation(previous)
+            })
+            .ok()
+            .and_then(nf::next_object_generation)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum NativeFenceInvalidation {
+    Reset,
+    StopOrRemove,
+}
+
+#[derive(Clone, Copy)]
+struct AdapterIdentity {
+    generation: u64,
+    epoch: u64,
+    luid: i64,
+}
 
 /// `DXGK_FEATURE_SUPPORT_STABLE` (`d3dkmdt.h:2159`, `((UINT)2)`), the driver
 /// support level reported to `DxgkCbQueryFeatureSupport`.
@@ -334,22 +367,47 @@ const DXGK_FEATURE_SUPPORT_STABLE_VALUE: u32 = 2;
 /// is false and every create/open refuses with `NfNotAdmit` rather than writing
 /// a fabricated LUID.
 ///
-/// CROSS-LANE: `ddi/lifecycle.rs::dxgkddi_start_device` must call
-/// `crate::ddi::native_fence::publish_adapter_luid(<DXGK_START_INFO>.AdapterLuid)`.
-#[allow(
-    dead_code,
-    reason = "cross-lane seam: lifecycle.rs (unit K10) supplies the LUID"
-)]
-pub(crate) fn publish_adapter_luid(luid: i64) {
-    ADAPTER_LUID.store(luid, Ordering::Release);
+/// `ddi/lifecycle.rs::dxgkddi_start_device` is the sole publisher.
+pub(crate) fn publish_adapter_luid(adapter: &AdapterContext, luid: LUID) {
+    let state = adapter.native_fence.as_ref();
+    state.lifecycle.store(LIFECYCLE_STOPPED, Ordering::Release);
+    let generation = feature_generation(state.feature.load(Ordering::Acquire));
+    let Some(next) = nf::next_epoch(generation, MAX_ADAPTER_GENERATION) else {
+        state.feature.store(feature_word(generation, FEATURE_POISONED), Ordering::Release);
+        state.lifecycle.store(LIFECYCLE_POISONED, Ordering::Release);
+        NF_EPOCH_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let exact = ((luid.HighPart as i64) << 32) | luid.LowPart as i64;
+    state.luid.store(exact, Ordering::Release);
+    state.feature.store(feature_word(next, FEATURE_UNKNOWN), Ordering::Release);
+    state.lifecycle.store(LIFECYCLE_ACTIVE, Ordering::Release);
 }
 
-/// The published adapter LUID, or `None` while StartDevice has not supplied one.
-fn adapter_luid() -> Option<i64> {
-    match ADAPTER_LUID.load(Ordering::Acquire) {
-        LUID_UNKNOWN => None,
-        luid => Some(luid),
+fn admitted_identity(state: &NativeFenceAdapterState) -> Option<AdapterIdentity> {
+    if !state.lifecycle_active() {
+        NF_LIFECYCLE_REJ.fetch_add(1, Ordering::Relaxed);
+        return None;
     }
+    let before = state.feature.load(Ordering::Acquire);
+    let generation = feature_generation(before);
+    if generation == 0 {
+        NF_MISSING_LUID.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    if feature_state(before) != FEATURE_ENABLED {
+        return None;
+    }
+    let identity = AdapterIdentity {
+        generation,
+        epoch: state.epoch.load(Ordering::Acquire),
+        luid: state.luid.load(Ordering::Acquire),
+    };
+    if state.feature.load(Ordering::Acquire) != before || !state.lifecycle_active() {
+        NF_STALE_GENERATION.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    Some(identity)
 }
 
 /// Invalidate every native-fence object on this adapter.
@@ -362,16 +420,39 @@ fn adapter_luid() -> Option<i64> {
 /// Callable at any IRQL. Intended for reset-from-timeout, stop-device and
 /// remove-device.
 ///
-/// CROSS-LANE: `ddi/submit_command.rs::dxgkddi_reset_from_timeout` and
-/// `ddi/lifecycle.rs::{dxgkddi_stop_device,dxgkddi_remove_device}` should call
-/// this.
-#[allow(
-    dead_code,
-    reason = "cross-lane seam: the reset/stop/remove paths (units K9/K10) call this"
-)]
-pub(crate) fn invalidate_all() {
-    NATIVE_FENCE_EPOCH.fetch_add(1, Ordering::AcqRel);
-    NF_EPOCH_BUMPS.fetch_add(1, Ordering::Relaxed);
+/// Reset, stop, remove, and skipped-stop teardown all call this before the
+/// paired allocation invalidation and before device-lost/transport wakeup.
+pub(crate) fn invalidate_all(adapter: &AdapterContext, boundary: NativeFenceInvalidation) {
+    let state = adapter.native_fence.as_ref();
+    state.lifecycle.store(
+        match boundary {
+            NativeFenceInvalidation::Reset => LIFECYCLE_RESETTING,
+            NativeFenceInvalidation::StopOrRemove => LIFECYCLE_STOPPED,
+        },
+        Ordering::Release,
+    );
+    let advanced = state
+        .epoch
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+            nf::next_epoch(previous, u64::MAX)
+        })
+        .is_ok();
+    if advanced {
+        state.active_monitored.store(0, Ordering::Release);
+        NF_EPOCH_BUMPS.fetch_add(1, Ordering::Relaxed);
+    } else {
+        state.lifecycle.store(LIFECYCLE_POISONED, Ordering::Release);
+        NF_EPOCH_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn resume_after_reset(adapter: &AdapterContext) {
+    let _ = adapter.native_fence.lifecycle.compare_exchange(
+        LIFECYCLE_RESETTING,
+        LIFECYCLE_ACTIVE,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
 }
 
 /// Ask the OS whether `DXGK_FEATURE_NATIVE_FENCE` may be enabled, once.
@@ -389,28 +470,53 @@ pub(crate) fn invalidate_all() {
 /// `_IRQL_requires_(PASSIVE_LEVEL)`), and `adapter` must be a live adapter whose
 /// `DxgkDdiStartDevice` has returned.
 pub(crate) unsafe fn ensure_feature_admitted(adapter: &AdapterContext) -> bool {
-    if !NATIVE_FENCE_ADVERTISED {
+    if !NATIVE_FENCE_ADVERTISED
+        || !crate::virtio::KMD_D2_OWNER_ENABLED
+        || !adapter.native_fence.lifecycle_active()
+    {
         return false;
     }
-    match FEATURE_STATE.load(Ordering::Acquire) {
+    let state = adapter.native_fence.as_ref();
+    let observed = state.feature.load(Ordering::Acquire);
+    match feature_state(observed) {
         FEATURE_ENABLED => return true,
-        FEATURE_DECLINED => return false,
+        FEATURE_DECLINED | FEATURE_STOPPED | FEATURE_POISONED => return false,
+        FEATURE_QUERYING => {
+            let _ = state.feature.compare_exchange(
+                observed,
+                feature_word(feature_generation(observed), FEATURE_DECLINED),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            NF_FEATURE_REJ.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
         _ => {}
     }
-
-    // SAFETY: forwarded from this function's PASSIVE_LEVEL contract.
+    let querying = feature_word(feature_generation(observed), FEATURE_QUERYING);
+    if state
+        .feature
+        .compare_exchange(observed, querying, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        NF_FEATURE_REJ.fetch_add(1, Ordering::Relaxed);
+        return false;
+    }
     let enabled = unsafe { query_feature_support(adapter) };
-    // Two concurrent caps queries would store the same answer twice; the OS's
-    // answer does not change within a device lifetime.
-    FEATURE_STATE.store(
-        if enabled {
-            FEATURE_ENABLED
-        } else {
-            FEATURE_DECLINED
-        },
-        Ordering::Release,
-    );
-    enabled
+    let final_state = if enabled { FEATURE_ENABLED } else { FEATURE_DECLINED };
+    let published = state
+        .feature
+        .compare_exchange(
+            querying,
+            feature_word(feature_generation(observed), final_state),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok();
+    if !enabled || !published {
+        NF_FEATURE_REJ.fetch_add(1, Ordering::Relaxed);
+    }
+    enabled && published
 }
 
 /// The one `DxgkCbQueryFeatureSupport` round trip behind
@@ -437,17 +543,32 @@ unsafe fn query_feature_support(adapter: &AdapterContext) -> bool {
     // SAFETY: PASSIVE_LEVEL per this function's contract; `args` is fully
     // initialized and lives across the synchronous call.
     let status = unsafe { query(&mut args) };
-    status == STATUS_SUCCESS && args.Enabled != 0
+    status == STATUS_SUCCESS
+        && args.DeviceHandle == dxgkrnl.DeviceHandle
+        && args.FeatureId as u32 == _DXGK_FEATURE_ID::DXGK_FEATURE_NATIVE_FENCE as u32
+        && args.DriverSupportState == DXGK_FEATURE_SUPPORT_STABLE_VALUE
+        && args.Enabled == 1
 }
 
 /// Whether the whole §10.2 native-fence admission conjunction holds.
-fn native_fence_admitted() -> bool {
+fn native_fence_admitted(state: &NativeFenceAdapterState) -> bool {
     nf::surface_is_admitted(
         NATIVE_FENCE_ADVERTISED,
-        FEATURE_STATE.load(Ordering::Acquire) == FEATURE_ENABLED,
-        adapter_luid().is_some(),
-        vidschcaps_native_fence_bits() & VIDSCHCAPS_NATIVE_GPU_FENCE != 0,
+        crate::virtio::KMD_D2_OWNER_ENABLED,
+        state.feature_enabled(),
+        state.current_generation() != 0,
+        state.lifecycle_active(),
     )
+}
+
+pub(crate) unsafe fn vidschcaps_native_fence_bits(adapter: &AdapterContext) -> u32 {
+    if unsafe { ensure_feature_admitted(adapter) }
+        && native_fence_admitted(adapter.native_fence.as_ref())
+    {
+        VIDSCHCAPS_NATIVE_GPU_FENCE
+    } else {
+        0
+    }
 }
 
 /// The registry-visible code for a PDD refusal. Stable numbering: append only.
@@ -484,8 +605,6 @@ const LOCAL_MAGIC: u32 = 0x4c46_4e48; // "HNFL"
 
 /// Lifecycle state, as stored in [`GlobalFenceObject::state`].
 const STATE_LIVE: u32 = 0;
-/// Destroy ran while local references were still outstanding.
-const STATE_DRAINING: u32 = 1;
 /// Freed, or claimed for freeing by exactly one thread.
 const STATE_DEAD: u32 = 2;
 
@@ -495,8 +614,14 @@ const STATE_DEAD: u32 = 2;
 struct GlobalFenceObject {
     /// [`GLOBAL_MAGIC`]. First field so a mistyped handle is caught by one read.
     magic: u32,
+    /// Strong reference to the exact adapter authority captured at create.
+    /// It can outlive `AdapterContext` after RemoveDevice, so late OS-owned
+    /// handle teardown never dereferences freed adapter storage.
+    authority: Arc<NativeFenceAdapterState>,
+    adapter_generation: u64,
+    adapter_luid: i64,
     /// The adapter epoch this object was minted under.
-    epoch: u32,
+    epoch: u64,
     /// The KMD-assigned nonzero object generation written back into HNF1.
     object_generation: u64,
     /// The dxgkrnl handle the OS created the object with. Kept for diagnostics
@@ -508,15 +633,16 @@ struct GlobalFenceObject {
     flags: u32,
     /// Opened local objects still pointing here.
     local_refs: AtomicU32,
-    /// `STATE_LIVE` / `STATE_DRAINING` / `STATE_DEAD`. Atomic because close and
-    /// destroy can run on different threads, and the Live/Draining -> Dead
-    /// compare-exchange is what makes the free happen exactly once.
+    /// `STATE_LIVE` / `STATE_DEAD`. The compare-exchange into Dead is the
+    /// exactly-once claim on freeing the object.
     state: AtomicU32,
     /// Last value published through `DxgkDdiUpdateCurrentValuesFromCpu`, for the
     /// forward-progress diagnostic only.
     last_current_value: AtomicU64,
     /// Last value published through `DxgkDdiUpdateMonitoredValues`, likewise.
     last_monitored_value: AtomicU64,
+    /// Whether this object currently contributes to `active_monitored`.
+    monitored_active: AtomicU32,
 }
 
 /// One opened native-fence object. Its own address is the driver's
@@ -525,8 +651,9 @@ struct GlobalFenceObject {
 struct LocalFenceObject {
     /// [`LOCAL_MAGIC`].
     magic: u32,
-    /// The adapter epoch this object was minted under.
-    epoch: u32,
+    adapter_generation: u64,
+    object_generation: u64,
+    epoch: u64,
     /// The global object this local view refers to — a direct strong reference
     /// (§17.6:4331), not a key into anything.
     global: *mut GlobalFenceObject,
@@ -557,14 +684,15 @@ unsafe fn global_from_handle<'a>(handle: HANDLE) -> Option<&'a GlobalFenceObject
 /// # Safety
 /// `handle` must be a value this driver returned from
 /// `DxgkDdiOpenNativeFence` and has not yet freed.
-unsafe fn local_is_ours(handle: HANDLE) -> bool {
+unsafe fn local_from_handle<'a>(handle: HANDLE) -> Option<&'a LocalFenceObject> {
     let p = handle as *const LocalFenceObject;
     if p.is_null() || (p as usize) % align_of::<LocalFenceObject>() != 0 {
-        return false;
+        return None;
     }
     // SAFETY: per this function's contract the pointer is one we allocated and
     // have not yet freed.
-    unsafe { (*p).magic == LOCAL_MAGIC }
+    let local = unsafe { &*p };
+    (local.magic == LOCAL_MAGIC).then_some(local)
 }
 
 /// Snapshot a global object into the `kmd_logic` model so the pure rules can
@@ -573,7 +701,6 @@ fn model_of(global: &GlobalFenceObject) -> nf::GlobalFence {
     nf::GlobalFence {
         state: match global.state.load(Ordering::Acquire) {
             STATE_LIVE => nf::FenceState::Live,
-            STATE_DRAINING => nf::FenceState::Draining,
             _ => nf::FenceState::Dead,
         },
         local_refs: global.local_refs.load(Ordering::Acquire),
@@ -613,6 +740,47 @@ fn retire(counter: &AtomicU32) -> bool {
     }
 }
 
+fn all_zero(bytes: &[u8]) -> bool {
+    bytes.iter().all(|byte| *byte == 0)
+}
+
+fn note_bad_handle() {
+    NF_BAD_HANDLE.fetch_add(1, Ordering::Relaxed);
+}
+
+fn validate_global_for_use(
+    global: &GlobalFenceObject,
+    expected_authority: Option<&NativeFenceAdapterState>,
+) -> Result<AdapterIdentity, NTSTATUS> {
+    let authority = global.authority.as_ref();
+    if let Some(expected) = expected_authority {
+        if !core::ptr::eq(authority, expected) {
+            NF_FOREIGN_ADAPTER.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_HANDLE);
+        }
+    }
+    if !native_fence_admitted(authority) {
+        NF_NOT_ADMITTED.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    let Some(identity) = admitted_identity(authority) else {
+        return Err(STATUS_DEVICE_NOT_READY);
+    };
+    if global.adapter_generation != identity.generation || global.adapter_luid != identity.luid {
+        NF_STALE_GENERATION.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_DEVICE_REMOVED);
+    }
+    if !nf::epoch_is_current(global.epoch, identity.epoch) {
+        NF_STALE_EPOCH.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_DEVICE_REMOVED);
+    }
+    if global.state.load(Ordering::Acquire) != STATE_LIVE {
+        note_bad_handle();
+        return Err(STATUS_INVALID_HANDLE);
+    }
+    Ok(identity)
+}
+
 // ── The DDIs ─────────────────────────────────────────────────────────────────
 
 /// `DxgkDdiCreateNativeFence` — §12.1 item 1. PASSIVE_LEVEL.
@@ -629,11 +797,17 @@ pub unsafe extern "C" fn dxgkddi_create_native_fence(
     h_adapter: IN_CONST_HANDLE,
     p_create: *mut DXGKARG_CREATENATIVEFENCE,
 ) -> NTSTATUS {
-    if h_adapter.is_null() || p_create.is_null() {
+    if h_adapter.is_null()
+        || !(h_adapter as *const AdapterContext).is_aligned()
+        || p_create.is_null()
+        || !p_create.is_aligned()
+    {
         NF_CREATE_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_BUFFER_REJ.fetch_add(1, Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
-    let Some(luid) = admitted_luid(&NF_CREATE_REJ) else {
+    let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    let Some(identity) = admitted_identity_for_ddi(adapter, &NF_CREATE_REJ) else {
         return STATUS_NOT_SUPPORTED;
     };
 
@@ -648,7 +822,7 @@ pub unsafe extern "C" fn dxgkddi_create_native_fence(
     let parsed = match nf::validate_create(
         &pdd,
         helios_protocol::HELIOS_PACKAGE_GENERATION,
-        luid,
+        identity.luid,
         native_type,
     ) {
         Ok(parsed) => parsed,
@@ -664,20 +838,35 @@ pub unsafe extern "C" fn dxgkddi_create_native_fence(
     // SAFETY: `Flags` is a C union whose `Value` member is its UINT view.
     if unsafe { args.Flags.__bindgen_anon_1.Value } != 0 {
         NF_CREATE_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_FLAGS_REJ.fetch_add(1, Ordering::Relaxed);
         return STATUS_NOT_SUPPORTED;
     }
+    if args.hGlobalNativeFence.is_null()
+        || !all_zero(&args.Reserved)
+        || args.CurrentValueSystemProcessGpuVa != 0
+        || args.MonitoredValueSystemProcessGpuVa != 0
+    {
+        NF_CREATE_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_BUFFER_REJ.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    }
 
-    if !admit(&LIVE_GLOBAL, nf::MAX_LIVE_GLOBAL) {
+    let Some(object_generation) = adapter.native_fence.reserve_object_generation() else {
+        NF_CREATE_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_OBJECT_GENERATION_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INTEGER_OVERFLOW;
+    };
+    if !admit(&adapter.native_fence.live_global, nf::MAX_LIVE_GLOBAL) {
         NF_CREATE_REJ.fetch_add(1, Ordering::Relaxed);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    let object_generation =
-        nf::next_object_generation(OBJECT_GENERATION.fetch_add(1, Ordering::Relaxed));
-    let epoch = NATIVE_FENCE_EPOCH.load(Ordering::Acquire);
     let object = Box::new(GlobalFenceObject {
         magic: GLOBAL_MAGIC,
-        epoch,
+        authority: Arc::clone(&adapter.native_fence),
+        adapter_generation: identity.generation,
+        adapter_luid: identity.luid,
+        epoch: identity.epoch,
         object_generation,
         os_handle: args.hGlobalNativeFence,
         native_type,
@@ -685,8 +874,15 @@ pub unsafe extern "C" fn dxgkddi_create_native_fence(
         local_refs: AtomicU32::new(0),
         state: AtomicU32::new(STATE_LIVE),
         last_current_value: AtomicU64::new(0),
-        last_monitored_value: AtomicU64::new(0),
+        last_monitored_value: AtomicU64::new(u64::MAX),
+        monitored_active: AtomicU32::new(0),
     });
+
+    if let Err(status) = validate_global_for_use(&object, Some(adapter.native_fence.as_ref())) {
+        let _ = retire(&adapter.native_fence.live_global);
+        NF_CREATE_REJ.fetch_add(1, Ordering::Relaxed);
+        return status;
+    }
 
     // The driver handle IS the object address: §12.1:3148-3150 makes identity
     // the OS-delivered handle pair, and the KMD half of that pair is this
@@ -697,7 +893,7 @@ pub unsafe extern "C" fn dxgkddi_create_native_fence(
         object_generation,
         native_type,
         parsed.flags,
-        luid,
+        identity.luid,
     );
     NF_CREATE_OK.fetch_add(1, Ordering::Relaxed);
     STATUS_SUCCESS
@@ -707,23 +903,22 @@ pub unsafe extern "C" fn dxgkddi_create_native_fence(
 ///
 /// Increments `rejection_counter` and `NfNotAdmit` on refusal so the caller's
 /// error return is the only thing left to choose.
-fn admitted_luid(rejection_counter: &AtomicU32) -> Option<i64> {
-    if !native_fence_admitted() {
+fn admitted_identity_for_ddi(
+    adapter: &AdapterContext,
+    rejection_counter: &AtomicU32,
+) -> Option<AdapterIdentity> {
+    let state = adapter.native_fence.as_ref();
+    if !native_fence_admitted(state) {
         rejection_counter.fetch_add(1, Ordering::Relaxed);
         NF_NOT_ADMITTED.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    match adapter_luid() {
-        Some(luid) => Some(luid),
-        None => {
-            // Unreachable while `native_fence_admitted` includes the LUID gate;
-            // kept because the two are separate facts and a future edit to one
-            // must not silently fabricate the other.
-            rejection_counter.fetch_add(1, Ordering::Relaxed);
-            NF_NOT_ADMITTED.fetch_add(1, Ordering::Relaxed);
-            None
-        }
+    let identity = admitted_identity(state);
+    if identity.is_none() {
+        rejection_counter.fetch_add(1, Ordering::Relaxed);
+        NF_NOT_ADMITTED.fetch_add(1, Ordering::Relaxed);
     }
+    identity
 }
 
 /// `DxgkDdiOpenNativeFence` — §12.1 item 2. PASSIVE_LEVEL.
@@ -739,13 +934,19 @@ pub unsafe extern "C" fn dxgkddi_open_native_fence(
     h_adapter: IN_CONST_HANDLE,
     p_open: *mut DXGKARG_OPENNATIVEFENCE,
 ) -> NTSTATUS {
-    if h_adapter.is_null() || p_open.is_null() {
+    if h_adapter.is_null()
+        || !(h_adapter as *const AdapterContext).is_aligned()
+        || p_open.is_null()
+        || !p_open.is_aligned()
+    {
         NF_OPEN_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_BUFFER_REJ.fetch_add(1, Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
-    let Some(luid) = admitted_luid(&NF_OPEN_REJ) else {
+    let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    if admitted_identity_for_ddi(adapter, &NF_OPEN_REJ).is_none() {
         return STATUS_NOT_SUPPORTED;
-    };
+    }
     // SAFETY: non-null per the check above.
     let args = unsafe { &mut *p_open };
 
@@ -753,11 +954,26 @@ pub unsafe extern "C" fn dxgkddi_open_native_fence(
     // not freed.
     let Some(global) = (unsafe { global_from_handle(args.hGlobalNativeFence) }) else {
         NF_OPEN_REJ.fetch_add(1, Ordering::Relaxed);
+        note_bad_handle();
         return STATUS_INVALID_HANDLE;
     };
 
+    let identity = match validate_global_for_use(global, Some(adapter.native_fence.as_ref())) {
+        Ok(identity) => identity,
+        Err(status) => {
+            NF_OPEN_REJ.fetch_add(1, Ordering::Relaxed);
+            return status;
+        }
+    };
+
     let pdd: [u8; nf::HNF1_SIZE] = args.pPrivateDriverData;
-    if let Err(reject) = nf::validate_open(&pdd, helios_protocol::HELIOS_PACKAGE_GENERATION) {
+    if let Err(reject) = nf::validate_open(
+        &pdd,
+        helios_protocol::HELIOS_PACKAGE_GENERATION,
+        global.adapter_luid,
+        global.native_type,
+        global.flags,
+    ) {
         NF_OPEN_REJ.fetch_add(1, Ordering::Relaxed);
         note_pdd_reject(reject);
         return STATUS_INVALID_PARAMETER;
@@ -766,7 +982,28 @@ pub unsafe extern "C" fn dxgkddi_open_native_fence(
     // bit is reserved in this revision.
     if unsafe { args.Flags.__bindgen_anon_1.Value } != 0 {
         NF_OPEN_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_FLAGS_REJ.fetch_add(1, Ordering::Relaxed);
         return STATUS_NOT_SUPPORTED;
+    }
+    let device_adapter = unsafe { crate::device::DeviceHandleRef::from_raw(args.hDevice) }
+        .and_then(|device| device.adapter());
+    if device_adapter.is_none_or(|device_adapter| !core::ptr::eq(device_adapter, adapter)) {
+        NF_OPEN_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_FOREIGN_ADAPTER.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_HANDLE;
+    }
+    if args.hLocalNativeFence.is_null() || !all_zero(&args.Reserved) {
+        NF_OPEN_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_BUFFER_REJ.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    }
+    if !fence_gpuva_is_supported(args.CurrentValueGpuVa)
+        || !fence_gpuva_is_supported(args.MonitoredValueGpuVa)
+        || args.CurrentValueGpuVa == args.MonitoredValueGpuVa
+    {
+        NF_OPEN_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_BUFFER_REJ.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
     }
     // A non-shared object has no legal opener. §12.1 item 7 additionally
     // rejects LDA and cross-adapter, which is why HNF1 has no cross-adapter bit
@@ -776,8 +1013,7 @@ pub unsafe extern "C" fn dxgkddi_open_native_fence(
         return STATUS_ACCESS_DENIED;
     }
 
-    let epoch = NATIVE_FENCE_EPOCH.load(Ordering::Acquire);
-    match nf::open_local(model_of(global), epoch) {
+    match nf::open_local(model_of(global), identity.epoch) {
         Ok(_) => {}
         Err(nf::Refusal::StaleEpoch) => {
             NF_OPEN_REJ.fetch_add(1, Ordering::Relaxed);
@@ -790,28 +1026,26 @@ pub unsafe extern "C" fn dxgkddi_open_native_fence(
         }
     }
 
-    if !admit(&LIVE_LOCAL, nf::MAX_LIVE_LOCAL) {
+    if !admit(&adapter.native_fence.live_local, nf::MAX_LIVE_LOCAL) {
         NF_OPEN_REJ.fetch_add(1, Ordering::Relaxed);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
-    // ⛔ KNOWN DEFECT — `NF-UAF-1`, open racing destroy. See the module header's
-    // "The one unclosed window" section. Do not read the increment below as
-    // safe: `nf::open_local` decided against the `model_of` snapshot taken
-    // above, and a concurrent `DxgkDdiDestroyNativeFence` that sampled
-    // `local_refs == 0` in its own snapshot frees this object between that
-    // decision and this line. Closing it needs `state` and `local_refs` packed
-    // into one atomic word so the rule and the transition are a single
-    // compare-exchange; a re-read after the increment only narrows the window
-    // and would be a stopgap. Unreachable today: `NATIVE_FENCE_ADVERTISED` is
-    // false, so dxgkrnl never calls this DDI.
-    global.local_refs.fetch_add(1, Ordering::AcqRel);
-
     let local = Box::new(LocalFenceObject {
         magic: LOCAL_MAGIC,
+        adapter_generation: global.adapter_generation,
+        object_generation: global.object_generation,
         epoch: global.epoch,
         global: global as *const GlobalFenceObject as *mut GlobalFenceObject,
         os_handle: args.hLocalNativeFence,
     });
+    if let Err(status) = validate_global_for_use(global, Some(adapter.native_fence.as_ref())) {
+        let _ = retire(&adapter.native_fence.live_local);
+        NF_OPEN_REJ.fetch_add(1, Ordering::Relaxed);
+        return status;
+    }
+    // Dxgkrnl keeps the global object referenced across this callback and calls
+    // Destroy only after the final local Close (Microsoft native-fence contract).
+    global.local_refs.fetch_add(1, Ordering::AcqRel);
     args.hLocalNativeFence = Box::into_raw(local) as HANDLE;
     // §12.1 item 2: the KMD writes the record back and the opening UMD is the
     // party that validates package/LUID/type against it.
@@ -820,7 +1054,7 @@ pub unsafe extern "C" fn dxgkddi_open_native_fence(
         global.object_generation,
         global.native_type,
         global.flags,
-        luid,
+        identity.luid,
     );
     NF_OPEN_OK.fetch_add(1, Ordering::Relaxed);
     STATUS_SUCCESS
@@ -840,17 +1074,49 @@ pub unsafe extern "C" fn dxgkddi_close_native_fence(
     h_adapter: IN_CONST_HANDLE,
     p_close: *mut DXGKARG_CLOSENATIVEFENCE,
 ) -> NTSTATUS {
-    let _ = h_adapter;
-    if p_close.is_null() {
+    if h_adapter.is_null()
+        || !(h_adapter as *const AdapterContext).is_aligned()
+        || p_close.is_null()
+        || !p_close.is_aligned()
+    {
         NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_BUFFER_REJ.fetch_add(1, Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
+    let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     // SAFETY: non-null per the check above.
     let args = unsafe { &mut *p_close };
+    if unsafe { args.Flags.__bindgen_anon_1.Value } != 0 || !all_zero(&args.Reserved) {
+        NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_FLAGS_REJ.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    }
     let handle = args.hLocalNativeFence;
     // SAFETY: dxgkrnl returns only driver handles this module assigned.
-    if !unsafe { local_is_ours(handle) } {
+    let Some(local_ref) = (unsafe { local_from_handle(handle) }) else {
         NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
+        note_bad_handle();
+        return STATUS_INVALID_HANDLE;
+    };
+    let Some(global_ref) = (unsafe { global_from_handle(local_ref.global.cast()) }) else {
+        NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
+        note_bad_handle();
+        return STATUS_INVALID_HANDLE;
+    };
+    if !core::ptr::eq(
+        global_ref.authority.as_ref(),
+        adapter.native_fence.as_ref(),
+    ) {
+        NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_FOREIGN_ADAPTER.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_HANDLE;
+    }
+    if global_ref.adapter_generation != local_ref.adapter_generation
+        || global_ref.object_generation != local_ref.object_generation
+        || global_ref.epoch != local_ref.epoch
+    {
+        NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_STALE_GENERATION.fetch_add(1, Ordering::Relaxed);
         return STATUS_INVALID_HANDLE;
     }
     // SAFETY: validated above as our own `LocalFenceObject`, produced by
@@ -877,12 +1143,8 @@ pub unsafe extern "C" fn dxgkddi_close_native_fence(
         drop(local);
         return STATUS_INVALID_DEVICE_REQUEST;
     }
-    let _ = retire(&LIVE_LOCAL);
-    let global_ptr = local.global;
+    let _ = retire(&adapter.native_fence.live_local);
     drop(local);
-
-    // The last close of an object whose destroy already ran owns the free.
-    finish_teardown_if_drained(global, global_ptr);
     NF_CLOSE_OK.fetch_add(1, Ordering::Relaxed);
     STATUS_SUCCESS
 }
@@ -891,10 +1153,10 @@ pub unsafe extern "C" fn dxgkddi_close_native_fence(
 ///
 /// Note the WDK signature: it takes **no** `hAdapter`.
 ///
-/// If a local object still points at the global one, freeing here would dangle
-/// it, so the object moves to `DRAINING`, `NfTeardnRej` moves, and the last
-/// [`dxgkddi_close_native_fence`] frees it instead. Leaking a bounded object is
-/// the fail-closed choice against a use-after-free inside a DDI.
+/// Dxgkrnl's documented native-fence reference contract calls this only after
+/// the final local Close. If that invariant is violated, the driver refuses and
+/// deliberately leaks the bounded object rather than free storage a local may
+/// still name.
 ///
 /// # Safety
 /// Called by dxgkrnl with a `hGlobalNativeFence` this module returned from
@@ -902,18 +1164,30 @@ pub unsafe extern "C" fn dxgkddi_close_native_fence(
 pub unsafe extern "C" fn dxgkddi_destroy_native_fence(
     p_destroy: *mut DXGKARG_DESTROYNATIVEFENCE,
 ) -> NTSTATUS {
-    if p_destroy.is_null() {
+    if p_destroy.is_null() || !p_destroy.is_aligned() {
         NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_BUFFER_REJ.fetch_add(1, Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
     // SAFETY: non-null per the check above.
     let args = unsafe { &mut *p_destroy };
+    if unsafe { args.Flags.__bindgen_anon_1.Value } != 0 || !all_zero(&args.Reserved) {
+        NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_FLAGS_REJ.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    }
     let handle = args.hGlobalNativeFence;
     // SAFETY: dxgkrnl returns only driver handles this module assigned.
     let Some(global) = (unsafe { global_from_handle(handle) }) else {
         NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
+        note_bad_handle();
         return STATUS_INVALID_HANDLE;
     };
+    if global.adapter_generation == 0 || global.object_generation == 0 {
+        NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_STALE_GENERATION.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_HANDLE;
+    }
 
     match nf::destroy_global(model_of(global)) {
         Ok(_) => {
@@ -923,13 +1197,6 @@ pub unsafe extern "C" fn dxgkddi_destroy_native_fence(
                 .compare_exchange(STATE_LIVE, STATE_DEAD, Ordering::AcqRel, Ordering::Acquire)
                 .is_err()
             {
-                // The rule said Ok, so references are drained — but the state
-                // was not LIVE, which means an earlier destroy already parked
-                // this object in DRAINING. Nobody else will come: the closes
-                // are done and this is the destroy. Reclaim it here rather
-                // than refusing and leaking the object plus its LIVE_GLOBAL
-                // slot.
-                finish_teardown_if_drained(global, handle as *mut GlobalFenceObject);
                 NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
                 return STATUS_INVALID_DEVICE_REQUEST;
             }
@@ -939,20 +1206,9 @@ pub unsafe extern "C" fn dxgkddi_destroy_native_fence(
             STATUS_SUCCESS
         }
         Err(nf::Refusal::LocalReferencesOutstanding) => {
-            // Do NOT free here: locals hold a raw pointer to this object. Hand
-            // the free to whichever close drops the last reference.
-            let _ = global.state.compare_exchange(
-                STATE_LIVE,
-                STATE_DRAINING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-            // ⚠ The last close may have landed between `model_of` above and the
-            // compare-exchange just now, in which case its own DRAINING -> DEAD
-            // attempt failed against a state that was still LIVE and nobody
-            // owns the free. Re-check now that DRAINING is published; see
-            // `finish_teardown_if_drained` for the full interleaving.
-            finish_teardown_if_drained(global, handle as *mut GlobalFenceObject);
+            // This contradicts dxgkrnl's ordering. Leave the global live and
+            // leak it if necessary; freeing or parking it would make a still-
+            // owned local handle unsafe.
             NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
             STATUS_INVALID_DEVICE_REQUEST
         }
@@ -960,48 +1216,6 @@ pub unsafe extern "C" fn dxgkddi_destroy_native_fence(
             NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
             STATUS_INVALID_DEVICE_REQUEST
         }
-    }
-}
-
-/// The one place a `DRAINING` object is reclaimed, and the only exactly-once
-/// claim on that transition.
-///
-/// # Why this must be called from three places and not one
-///
-/// A destroy that finds local references outstanding parks the object in
-/// `DRAINING` and hands the free to "whichever close drops the last reference".
-/// That is correct only if every party that can *observe* the reference count
-/// reach zero also re-checks, because the count and the state are two separate
-/// atomics and the decision to park is taken from a snapshot of both.
-///
-/// Concretely, the interleaving this closes (`local_refs == 1`, destroy on
-/// thread A, the last close on thread B):
-///
-/// ```text
-///   A: model_of()          reads local_refs = 1  -> LocalReferencesOutstanding
-///   B: retire(local_refs)  1 -> 0
-///   B: CAS(DRAINING->DEAD) FAILS, state is still LIVE  -> B does not free
-///   A: CAS(LIVE->DRAINING) succeeds                    -> A does not free
-///   =>  state = DRAINING, local_refs = 0, and no further close will ever
-///       arrive, so the object and its LIVE_GLOBAL slot leak forever.
-/// ```
-///
-/// Re-checking here, *after* `DRAINING` is published, makes the two orderings
-/// converge: whichever party observes zero last performs the free, and the
-/// compare-exchange makes sure only one of them does.
-fn finish_teardown_if_drained(global: &GlobalFenceObject, p: *mut GlobalFenceObject) {
-    if global.local_refs.load(Ordering::Acquire) == 0
-        && global
-            .state
-            .compare_exchange(
-                STATE_DRAINING,
-                STATE_DEAD,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
-    {
-        free_global(p);
     }
 }
 
@@ -1015,14 +1229,21 @@ fn free_global(p: *mut GlobalFenceObject) {
     }
     // SAFETY: `p` was produced by `Box::into_raw` in
     // `dxgkddi_create_native_fence`; the caller won the single
-    // `LIVE|DRAINING -> DEAD` transition and no local reference remains, so this
+    // `LIVE -> DEAD` transition and no local reference remains, so this
     // runs exactly once and no other reference to the object is live.
-    drop(unsafe { Box::from_raw(p) });
-    let _ = retire(&LIVE_GLOBAL);
+    let object = unsafe { Box::from_raw(p) };
+    let authority = Arc::clone(&object.authority);
+    if object.monitored_active.swap(0, Ordering::AcqRel) != 0
+        && nf::epoch_is_current(object.epoch, authority.epoch.load(Ordering::Acquire))
+    {
+        let _ = retire(&authority.active_monitored);
+    }
+    drop(object);
+    let _ = retire(&authority.live_global);
     // Teardown is the bounded, naturally rare moment to publish. Publishing per
     // operation would turn a fence-heavy frame into a registry write storm.
-    if LIVE_GLOBAL.load(Ordering::Acquire) == 0 {
-        diag_dump_native_fence_atomics();
+    if authority.live_global.load(Ordering::Acquire) == 0 {
+        diag_dump_native_fence_atomics(authority.as_ref());
     }
 }
 
@@ -1038,16 +1259,18 @@ fn free_global(p: *mut GlobalFenceObject) {
 pub unsafe extern "C" fn dxgkddi_update_monitored_values(
     p_args: *const DXGKARG_UPDATEMONITOREDVALUES,
 ) -> NTSTATUS {
-    if p_args.is_null() {
+    if p_args.is_null() || !p_args.is_aligned() {
         NF_UPD_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_BUFFER_REJ.fetch_add(1, Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
     // SAFETY: non-null per the check above; the struct is read-only for us.
     let args = unsafe { &*p_args };
     // SAFETY: `Flags` is a C union whose `Value` member is its UINT view; every
     // bit is reserved in this revision.
-    if unsafe { args.Flags.__bindgen_anon_1.Value } != 0 {
+    if unsafe { args.Flags.__bindgen_anon_1.Value } != 0 || !all_zero(&args.Reserved) {
         NF_UPD_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_FLAGS_REJ.fetch_add(1, Ordering::Relaxed);
         return STATUS_NOT_SUPPORTED;
     }
     // SAFETY: the three arrays are `_Field_size_(NumFences)`; `update_values`
@@ -1079,8 +1302,9 @@ pub unsafe extern "C" fn dxgkddi_update_monitored_values(
 pub unsafe extern "C" fn dxgkddi_update_current_values_from_cpu(
     p_args: *const DXGKARG_UPDATECURRENTVALUESFROMCPU,
 ) -> NTSTATUS {
-    if p_args.is_null() {
+    if p_args.is_null() || !p_args.is_aligned() {
         NF_UPD_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_BUFFER_REJ.fetch_add(1, Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
     // SAFETY: non-null per the check above.
@@ -1091,8 +1315,9 @@ pub unsafe extern "C" fn dxgkddi_update_current_values_from_cpu(
     const ALWAYS_SIGNALED: u32 = 1 << 0;
     /// `DXGK_UPDATECURRENTVALUESFROMCPU_FLAGS::NotificationOnly`, bit 1.
     const NOTIFICATION_ONLY: u32 = 1 << 1;
-    if flags & !(ALWAYS_SIGNALED | NOTIFICATION_ONLY) != 0 {
+    if flags & !(ALWAYS_SIGNALED | NOTIFICATION_ONLY) != 0 || !all_zero(&args.Reserved) {
         NF_UPD_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_FLAGS_REJ.fetch_add(1, Ordering::Relaxed);
         return STATUS_NOT_SUPPORTED;
     }
     // SAFETY: as for `dxgkddi_update_monitored_values`.
@@ -1125,18 +1350,42 @@ unsafe fn update_values(
     write_storage: bool,
     monitored: bool,
 ) -> NTSTATUS {
+    if !nf::update_count_is_bounded(count) {
+        NF_UPD_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_COUNT_OVERFLOW.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    }
     if count == 0 {
         return STATUS_SUCCESS;
     }
-    if handles.is_null() || values.is_null() || storage.is_null() {
+    let count = count as usize;
+    let extents_fit = count
+        .checked_mul(size_of::<HANDLE>())
+        .is_some_and(|bytes| bytes <= isize::MAX as usize)
+        && count
+            .checked_mul(size_of::<u64>())
+            .is_some_and(|bytes| bytes <= isize::MAX as usize)
+        && count
+            .checked_mul(size_of::<*mut c_void>())
+            .is_some_and(|bytes| bytes <= isize::MAX as usize);
+    if !extents_fit
+        || handles.is_null()
+        || !handles.is_aligned()
+        || values.is_null()
+        || !values.is_aligned()
+        || storage.is_null()
+        || !storage.is_aligned()
+    {
         NF_UPD_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_BUFFER_REJ.fetch_add(1, Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
-    let epoch = NATIVE_FENCE_EPOCH.load(Ordering::Acquire);
+
+    // Pass one validates the complete batch; pass two is the only mutation pass.
     let mut i = 0usize;
-    while i < count as usize {
+    while i < count {
         // SAFETY: `i < count` and all three arrays hold `count` entries.
-        let (handle, value, slot) = unsafe {
+        let (handle, _, slot) = unsafe {
             (
                 handles.add(i).read(),
                 values.add(i).read(),
@@ -1146,41 +1395,72 @@ unsafe fn update_values(
         // SAFETY: dxgkrnl returns only driver handles this module assigned.
         let Some(global) = (unsafe { global_from_handle(handle) }) else {
             NF_UPD_REJ.fetch_add(1, Ordering::Relaxed);
+            NF_PREFLIGHT_REJ.fetch_add(1, Ordering::Relaxed);
+            note_bad_handle();
             return STATUS_INVALID_HANDLE;
         };
-        if !nf::epoch_is_current(global.epoch, epoch) {
+        if let Err(status) = validate_global_for_use(global, None) {
             NF_UPD_REJ.fetch_add(1, Ordering::Relaxed);
-            NF_STALE_EPOCH.fetch_add(1, Ordering::Relaxed);
-            return STATUS_DEVICE_REMOVED;
+            NF_PREFLIGHT_REJ.fetch_add(1, Ordering::Relaxed);
+            return status;
         }
+        if global.object_generation == 0
+            || !nf::native_type_is_documented(global.native_type)
+            || global.flags & nf::HNF1_FLAGS_RESERVED_MASK != 0
+            || slot.is_null()
+            || !slot.cast::<u64>().is_aligned()
+        {
+            NF_UPD_REJ.fetch_add(1, Ordering::Relaxed);
+            NF_PREFLIGHT_REJ.fetch_add(1, Ordering::Relaxed);
+            NF_BUFFER_REJ.fetch_add(1, Ordering::Relaxed);
+            return STATUS_INVALID_PARAMETER;
+        }
+        i += 1;
+    }
 
+    i = 0;
+    while i < count {
+        let (handle, value, slot) = unsafe {
+            (
+                handles.add(i).read(),
+                values.add(i).read(),
+                storage.add(i).read(),
+            )
+        };
+        let global = unsafe { &*(handle as *const GlobalFenceObject) };
         let last = if monitored {
             &global.last_monitored_value
         } else {
             &global.last_current_value
         };
+        // The OS-owned mapping is the authoritative fence value. Publish it
+        // before the diagnostic/population mirrors can make this update visible
+        // to the completion path.
+        if write_storage {
+            unsafe { slot.cast::<u64>().write_volatile(value) };
+        }
         let previous = last.swap(value, Ordering::AcqRel);
         if !nf::value_update_is_forward(previous, value) {
-            // Recorded, never refused: the OS owns these values and refusing a
-            // backwards update would wedge the runtime's fence.
             NF_UPD_BACKWARD.fetch_add(1, Ordering::Relaxed);
         }
-
-        if write_storage {
-            if slot.is_null() {
-                NF_UPD_REJ.fetch_add(1, Ordering::Relaxed);
-                return STATUS_INVALID_PARAMETER;
+        if monitored {
+            let active = u32::from(value != u64::MAX);
+            let was_active = global.monitored_active.swap(active, Ordering::AcqRel);
+            if was_active == 0 && active != 0 {
+                let _ = admit(
+                    &global.authority.active_monitored,
+                    nf::MAX_LIVE_GLOBAL,
+                );
+            } else if was_active != 0 && active == 0 {
+                let _ = retire(&global.authority.active_monitored);
             }
-            // SAFETY: `slot` is the OS-supplied read/write kernel CPU VA of this
-            // fence's 8-byte value storage, valid for the duration of the call.
-            unsafe { slot.cast::<u64>().write_volatile(value) };
         }
         i += 1;
     }
     if monitored {
-        NF_MON_UPD.fetch_add(count, Ordering::Relaxed);
+        NF_MON_UPD.fetch_add(count as u32, Ordering::Relaxed);
     } else {
-        NF_CUR_UPD.fetch_add(count, Ordering::Relaxed);
+        NF_CUR_UPD.fetch_add(count as u32, Ordering::Relaxed);
     }
     STATUS_SUCCESS
 }
@@ -1216,72 +1496,42 @@ pub(crate) unsafe fn fill_native_fence_caps(
     adapter: &AdapterContext,
     args: &DXGKARG_QUERYADAPTERINFO,
 ) -> NTSTATUS {
+    if args.pOutputData.is_null()
+        || !(args.pOutputData as *mut DXGK_NATIVE_FENCE_CAPS).is_aligned()
+    {
+        NF_CAPS_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_BUFFER_REJ.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    }
+    if args.OutputDataSize as usize != size_of::<DXGK_NATIVE_FENCE_CAPS>() {
+        NF_CAPS_REJ.fetch_add(1, Ordering::Relaxed);
+        NF_CAPS_SIZE_REJ.fetch_add(1, Ordering::Relaxed);
+        return if (args.OutputDataSize as usize) < size_of::<DXGK_NATIVE_FENCE_CAPS>() {
+            STATUS_BUFFER_TOO_SMALL
+        } else {
+            STATUS_INVALID_PARAMETER
+        };
+    }
     // SAFETY: DxgkDdiQueryAdapterInfo is documented PASSIVE_LEVEL, which is what
     // DxgkCbQueryFeatureSupport requires.
-    let admitted = unsafe { ensure_feature_admitted(adapter) } && native_fence_admitted();
+    let admitted = unsafe { ensure_feature_admitted(adapter) }
+        && native_fence_admitted(adapter.native_fence.as_ref());
     if !admitted {
         NF_CAPS_REJ.fetch_add(1, Ordering::Relaxed);
         NF_NOT_ADMITTED.fetch_add(1, Ordering::Relaxed);
         return STATUS_NOT_SUPPORTED;
     }
-    if (args.OutputDataSize as usize) < size_of::<DXGK_NATIVE_FENCE_CAPS>() {
-        NF_CAPS_REJ.fetch_add(1, Ordering::Relaxed);
-        return STATUS_BUFFER_TOO_SMALL;
-    }
-    // Zero the whole declared buffer first, through the raw pointer, before any
-    // other pointer into it exists — the same discipline `query_driver_caps`
-    // uses. This is also what writes the leading stride/padding UINT.
-    // SAFETY: dxgkrnl gives us `OutputDataSize` writable bytes at `pOutputData`.
-    unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize) };
-    // SAFETY: the size gate above proves the buffer holds a whole
-    // DXGK_NATIVE_FENCE_CAPS, and no other pointer into it is live.
-    let caps = unsafe { &mut *(args.pOutputData as *mut DXGK_NATIVE_FENCE_CAPS) };
+    let mut caps = unsafe { core::mem::zeroed::<DXGK_NATIVE_FENCE_CAPS>() };
+    caps.MonitoredValuePadding = 0;
     caps.MapToGpuSystemProcess = 0;
-    caps.MinimumAddress = 0;
-    // Inclusive maximum of the advertised GpuMmu virtual-address range.
-    caps.MaximumAddress = (1u64 << crate::ddi::gpummu::VIRTUAL_ADDRESS_BIT_COUNT) - 1;
+    caps.MinimumAddress = NATIVE_FENCE_MINIMUM_ADDRESS;
+    caps.MaximumAddress = NATIVE_FENCE_MAXIMUM_ADDRESS;
+    unsafe { (args.pOutputData as *mut DXGK_NATIVE_FENCE_CAPS).write(caps) };
     NF_CAPS_OK.fetch_add(1, Ordering::Relaxed);
     STATUS_SUCCESS
 }
 
 // ── DXGK_INTERRUPT_NATIVE_FENCE_SIGNALED ─────────────────────────────────────
-
-/// Context handed across the `DxgkCbSynchronizeExecution` boundary.
-struct NotifyCtx {
-    /// The adapter's callback table.
-    dxgkrnl: *const DXGKRNL_INTERFACE,
-    /// The prepared interrupt packet.
-    interrupt: *mut DXGKARGCB_NOTIFY_INTERRUPT_DATA,
-}
-
-/// Runs at the device's DIRQL, synchronized with the ISR — the only level at
-/// which `DxgkCbNotifyInterrupt` may be called.
-///
-/// Duplicates `submit_command.rs::notify_dma_completed_routine`, which is
-/// private to that module. CROSS-LANE: when unit K6/K9 lands, promote
-/// `submit_command::notify_at_dirql` to `pub(crate)` and delete this pair.
-unsafe extern "C" fn notify_routine(context: *mut c_void) -> BOOLEAN {
-    if context.is_null() {
-        return 0;
-    }
-    // SAFETY: `context` is the `NotifyCtx` passed to DxgkCbSynchronizeExecution,
-    // valid for the duration of that synchronous call.
-    let ctx = unsafe { &*(context as *const NotifyCtx) };
-    // SAFETY: same lifetime as `ctx`.
-    let dxgkrnl = unsafe { &*ctx.dxgkrnl };
-    if let Some(notify) = dxgkrnl.DxgkCbNotifyInterrupt {
-        // SAFETY: at DIRQL (raised by DxgkCbSynchronizeExecution); `interrupt`
-        // is a fully-initialized packet live for this call.
-        unsafe { notify(dxgkrnl.DeviceHandle, ctx.interrupt) };
-    }
-    if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
-        // Same notify+DPC pairing the DMA-completed path uses, so dxgkrnl sees
-        // one interrupt-completion event.
-        // SAFETY: callable at DIRQL with a live DeviceHandle.
-        unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
-    }
-    1
-}
 
 /// Report `DXGK_INTERRUPT_NATIVE_FENCE_SIGNALED` (= 19) for node 0 / engine 0.
 ///
@@ -1300,7 +1550,14 @@ unsafe extern "C" fn notify_routine(context: *mut c_void) -> BOOLEAN {
 ///
 /// # Safety
 /// `dxgkrnl` must be the live callback table of the adapter being reported on.
-pub(crate) unsafe fn signal_native_fence_signaled(dxgkrnl: &DXGKRNL_INTERFACE) -> NTSTATUS {
+pub(crate) unsafe fn signal_native_fence_signaled(
+    adapter: &AdapterContext,
+    dxgkrnl: &DXGKRNL_INTERFACE,
+) -> NTSTATUS {
+    if !has_possible_progress_edge(adapter) {
+        NF_INT_NO_EDGE.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
     // SAFETY: an all-zero DXGKARGCB_NOTIFY_INTERRUPT_DATA is a valid packet; the
     // type and its arm are written before it is handed over.
     let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
@@ -1314,33 +1571,12 @@ pub(crate) unsafe fn signal_native_fence_signaled(dxgkrnl: &DXGKRNL_INTERFACE) -
     arm.pSignaledNativeFenceArray = core::ptr::null_mut();
     arm.hHWQueue = core::ptr::null_mut();
 
-    let ctx = NotifyCtx {
-        dxgkrnl: dxgkrnl as *const DXGKRNL_INTERFACE,
-        interrupt: &mut interrupt as *mut DXGKARGCB_NOTIFY_INTERRUPT_DATA,
-    };
-    let Some(sync) = dxgkrnl.DxgkCbSynchronizeExecution else {
-        NF_INT_FAILED.fetch_add(1, Ordering::Relaxed);
-        return STATUS_DEVICE_NOT_READY;
-    };
-    let mut ret: BOOLEAN = 0;
-    // SAFETY: live DeviceHandle; the routine and its context outlive the
-    // synchronous call.
     let status = unsafe {
-        sync(
-            dxgkrnl.DeviceHandle,
-            Some(notify_routine),
-            &ctx as *const _ as *mut c_void,
-            0,
-            &mut ret,
-        )
+        super::submit_command::notify_at_dirql(dxgkrnl, &mut interrupt, false)
     };
     if status != STATUS_SUCCESS {
         NF_INT_FAILED.fetch_add(1, Ordering::Relaxed);
         return status;
-    }
-    if ret == 0 {
-        NF_INT_FAILED.fetch_add(1, Ordering::Relaxed);
-        return STATUS_DEVICE_NOT_READY;
     }
     NF_INT_SIGNALED.fetch_add(1, Ordering::Relaxed);
     STATUS_SUCCESS
@@ -1352,13 +1588,16 @@ pub(crate) unsafe fn signal_native_fence_signaled(dxgkrnl: &DXGKRNL_INTERFACE) -
 /// The DPC calls this before spending a `DxgkCbSynchronizeExecution` round trip.
 /// While the surface is unadvertised this is always false, so the interrupt path
 /// costs one relaxed load.
-pub(crate) fn has_live_fences() -> bool {
-    LIVE_GLOBAL.load(Ordering::Acquire) != 0
+pub(crate) fn has_possible_progress_edge(adapter: &AdapterContext) -> bool {
+    let state = adapter.native_fence.as_ref();
+    native_fence_admitted(state)
+        && state.live_global.load(Ordering::Acquire) != 0
+        && state.active_monitored.load(Ordering::Acquire) != 0
 }
 
 /// The counter names, as one list, so the collision proof and the writer cannot
 /// drift apart.
-const COUNTER_NAMES: [&[u8]; 21] = [
+const COUNTER_NAMES: [&[u8]; 35] = [
     b"NfCreateOk",
     b"NfCreateRej",
     b"NfOpenOk",
@@ -1378,6 +1617,20 @@ const COUNTER_NAMES: [&[u8]; 21] = [
     b"NfIntSig",
     b"NfIntFail",
     b"NfEpochBump",
+    b"NfFeatRej",
+    b"NfBufRej",
+    b"NfCapsSize",
+    b"NfNoLuid",
+    b"NfForeign",
+    b"NfBadHandle",
+    b"NfStaleGen",
+    b"NfFlagRej",
+    b"NfCountOvf",
+    b"NfPreflight",
+    b"NfLifecycle",
+    b"NfEpochExh",
+    b"NfObjGenExh",
+    b"NfIntNoEdge",
     b"NfLiveGlobal",
     b"NfLiveLocal",
 ];
@@ -1398,8 +1651,8 @@ const COUNTER_NAMES: [&[u8]; 21] = [
 /// 2. [`free_global`] publishes when the last fence on the adapter goes away.
 ///    Bounded (one burst per population drain) rather than per operation, and
 ///    reachable only once the surface actually carries native fences.
-pub fn diag_dump_native_fence_atomics() {
-    let values: [u32; 21] = [
+pub fn diag_dump_native_fence_atomics(state: &NativeFenceAdapterState) {
+    let values: [u32; 35] = [
         NF_CREATE_OK.load(Ordering::Relaxed),
         NF_CREATE_REJ.load(Ordering::Relaxed),
         NF_OPEN_OK.load(Ordering::Relaxed),
@@ -1419,8 +1672,22 @@ pub fn diag_dump_native_fence_atomics() {
         NF_INT_SIGNALED.load(Ordering::Relaxed),
         NF_INT_FAILED.load(Ordering::Relaxed),
         NF_EPOCH_BUMPS.load(Ordering::Relaxed),
-        LIVE_GLOBAL.load(Ordering::Relaxed),
-        LIVE_LOCAL.load(Ordering::Relaxed),
+        NF_FEATURE_REJ.load(Ordering::Relaxed),
+        NF_BUFFER_REJ.load(Ordering::Relaxed),
+        NF_CAPS_SIZE_REJ.load(Ordering::Relaxed),
+        NF_MISSING_LUID.load(Ordering::Relaxed),
+        NF_FOREIGN_ADAPTER.load(Ordering::Relaxed),
+        NF_BAD_HANDLE.load(Ordering::Relaxed),
+        NF_STALE_GENERATION.load(Ordering::Relaxed),
+        NF_FLAGS_REJ.load(Ordering::Relaxed),
+        NF_COUNT_OVERFLOW.load(Ordering::Relaxed),
+        NF_PREFLIGHT_REJ.load(Ordering::Relaxed),
+        NF_LIFECYCLE_REJ.load(Ordering::Relaxed),
+        NF_EPOCH_EXHAUSTED.load(Ordering::Relaxed),
+        NF_OBJECT_GENERATION_EXHAUSTED.load(Ordering::Relaxed),
+        NF_INT_NO_EDGE.load(Ordering::Relaxed),
+        state.live_global.load(Ordering::Relaxed),
+        state.live_local.load(Ordering::Relaxed),
     ];
     let mut i = 0;
     while i < COUNTER_NAMES.len() {

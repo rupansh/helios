@@ -1242,6 +1242,14 @@ run_gate "D4 classic/DMA DIRQL enqueue is capability-restricted and fixed-storag
 run_gate "D5 MPO Present is bounded, exact-allocation, ordinary-packet, and lease-free" \
     python3 "$REPO/tools/d5-present-mpo-gate.py" "$REPO"
 
+run_gate "K7 dormant native-fence surface is conjunctive, per-adapter, bounded, and lifecycle-closed" \
+    python3 "$REPO/tools/k7-native-fence-gate.py" "$REPO"
+
+# Each K7 mutation is written into a temporary source tree and that tree is
+# passed back through the same gate executable used above.
+run_gate "K7 native-fence executable mutation suite" \
+    python3 "$REPO/tools/k7-native-fence-gate.py" "$REPO" --mutations
+
 printf '\n'
 if [ ${#FAILED[@]} -eq 0 ]; then
     if [ ${#SKIPPED[@]} -eq 0 ]; then

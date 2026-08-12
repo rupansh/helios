@@ -693,7 +693,7 @@ itself succeeds — the D3D12 correctness fix recorded in F7 addendum 2 stands.
 
 ---
 
-## F9 — K7's native-fence surface is four DDI slots, not a surface. Nine of its own symbols are unreachable, and `OWNERSHIP.md` §3's second activation gate is not met.
+## F9 — RESOLVED AS A DORMANT SOURCE TRANCHE (2026-08-13). K7 had four DDI slots, not a complete surface.
 
 Measured incidentally while taking a pre-change `cargo check` baseline of
 `kmd_render` on the VM (2026-08-10). The build is green; the finding is in its
@@ -731,29 +731,53 @@ either.
 |---|---|
 | `DxgkDdiCreateNativeFence` / `Destroy` / `Open` / `Close` | **registered** — `lib.rs:282-285` |
 | `DxgkDdiSetNativeFenceLogBuffer`, `UpdateNativeFenceLogs` | not registered — classified Disabled, consistent with F6 |
-| `DXGKQAITYPE_NATIVE_FENCE_CAPS` (=37) arm | ⛔ **absent** — `grep -n 'NATIVE_FENCE_CAPS' kmd_render/src/ddi/query_adapter_info.rs` is empty; `fill_native_fence_caps` has no caller |
-| `DXGK_FEATURE_NATIVE_FENCE` enablement | ⛔ **absent** — `query_feature_support` / `ensure_feature_admitted` have no caller |
-| `DXGK_VIDSCHCAPS::NativeGpuFence=1`, `No64BitAtomics=0` | ⛔ not written |
-| `DXGK_INTERRUPT_NATIVE_FENCE_SIGNALED` (=19) reporting | ⛔ **absent** — `signal_native_fence_signaled` / `notify_routine` have no caller |
+| `DXGKQAITYPE_NATIVE_FENCE_CAPS` (=37) arm | ✅ **dormant and wired** — exact size/alignment validation precedes a local zeroed result; padding, mapping, range, and reserved bytes are fixed |
+| `DXGK_FEATURE_NATIVE_FENCE` enablement | ✅ **dormant and wired** — the exact PASSIVE callback is cached per adapter/StartDevice generation and every absence, failure, unstable answer, or decline fails closed |
+| `DXGK_VIDSCHCAPS::NativeGpuFence=1`, `No64BitAtomics=0` | ✅ **dormant and conjunctive** — `NativeGpuFence` is conditional; `No64BitAtomics` and optimized interrupts stay zero |
+| `DXGK_INTERRUPT_NATIVE_FENCE_SIGNALED` (=19) reporting | ✅ **dormant and wired** — a completed WDDM submission plus a current monitored population is required, and the empty-rescan packet uses the shared audited DIRQL notifier |
 
-### Why this is a sequencing fact and not a defect
+### Dormant K7 resolution
 
-The caps arm belongs to **K8** (`query_adapter_info.rs` end state) and the
-interrupt to **K9** (`interrupt.rs`); both are unstarted, and both files are
-owned by units other than K7. Writing the helper next to its subject and leaving
-the call site to its owning unit is a legitimate choice. ⇒ Nothing here needs
-fixing. What needs fixing is the **claim**.
+K7 now owns the narrow query/capability, interrupt, and lifecycle seams that the
+old numerical K8/K9/K10 decomposition had left unwired. That does **not** start
+those broader units: their physical-memory caps, ordered-engine completion, and
+full adapter teardown work remain separate.
 
-⛔ **`OWNERSHIP.md` §3 gates the `SURFACE` flip on "the native-fence DDI surface
-is complete".** It is not, and the phrase "the `kmd_render` native-fence surface
-is WIRED IN" — true of the four slots and the slot audit — reads as though it
-is. Whoever flips `SURFACE` must check the six rows above, not the sentence.
+Authority is now one ref-counted `NativeFenceAdapterState` per adapter. It
+caches the exact StartDevice LUID and feature answer for that generation and
+owns the lifecycle, nonwrapping epoch/object generations, and bounded live and
+monitored populations. Driver handles still directly reference bounded objects;
+there is no registry, name, scan, raw ID, Escape, or ticket. HNF1 input requires
+generation zero and successful output assigns a nonzero generation. Update DDIs
+bound all counts and validate the complete batch before any storage write.
 
-**Bound.** This says which symbols have no caller. It does not say the four
-registered slots are wrong, and it does not re-open F6, which proved the slot
-audit's refusal path on the target in both index and direction. The 22-warning
-baseline was taken on a clean tree at `fb9b09a` and is the control arm for the
-K4 changeset's own build.
+`NF-UAF-1` is resolved without inventing serialization: Microsoft's native-fence
+reference contract says the global handle remains while any process-local
+reference exists, and the final process teardown calls Close before Destroy.
+The renderer additionally refuses and retains the bounded global object if an
+unexpected Destroy arrives with local references, rather than freeing named
+storage. See [Microsoft's global/local handle lifetime](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/native-gpu-fence-objects#global-and-local-handles-for-shared-fences).
+
+The one bounded ordinary review repaired three concrete issues before the
+checkpoint: Open's HNF1 direction is input-zero/output-nonzero; OS-owned value
+storage is written before diagnostic/population mirrors; and the K7 gate now
+rejects undeclared global authority plus explicit `No64BitAtomics` and hardware-
+queue mutations.
+
+**Verification bound.** Windows `cargo check` is green at 13 warnings: exactly
+the nine warnings listed above disappeared, with no new warning category. All
+511 `kmd_logic` unit tests pass. The normal retirement suite includes a K7 gate
+whose 35 mutations each alter a temporary source tree and invoke the real gate;
+the existing D4 and D5 proofs remain green. The generated callback audit remains
+89 Implemented / 91 Disabled / 4 Pending / 8 Retiring. The VM-generated and
+offline WDK-28000 bindings remain 3,834,340 bytes with SHA-256
+`148b75db41e093dc6783be4f5bb3ea84b2c7c39ef316fe711b3f2a5a0668bea2`.
+
+`SURFACE=Wddm2_1GpuMmu` and `KMD_D2_OWNER_ENABLED=false` remain unchanged.
+Therefore all native-fence feature/cap/interrupt authority remains unreachable
+in production. This resolves F9 only as a dormant source-composition finding;
+it is not an activation, deployment, runtime-correctness, or WDDM-3.2-flip
+claim.
 
 ---
 

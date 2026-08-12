@@ -103,7 +103,10 @@ fn retire_skipped_stop_transport(
     if !crate::virtio::KMD_D2_OWNER_ENABLED || adapter.with_virtio(|_| ()).is_err() {
         return Ok(());
     }
-    crate::ddi::native_fence::invalidate_all();
+    crate::ddi::native_fence::invalidate_all(
+        adapter,
+        crate::ddi::native_fence::NativeFenceInvalidation::StopOrRemove,
+    );
     crate::adapter::allocation_object::invalidate_all();
     adapter
         .isr_status
@@ -138,7 +141,7 @@ fn retire_skipped_stop_transport(
 /// `DxgkDdiStartDevice` — bring the adapter online.
 pub unsafe extern "C" fn dxgkddi_start_device(
     miniport_device_context: *mut c_void,
-    _dxgk_start_info: *mut DXGK_START_INFO,
+    dxgk_start_info: *mut DXGK_START_INFO,
     dxgkrnl_interface: *mut DXGKRNL_INTERFACE,
     number_of_video_present_sources: *mut u32,
     number_of_children: *mut u32,
@@ -147,6 +150,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     crate::diag::record(0x0B00_0001);
 
     if miniport_device_context.is_null()
+        || dxgk_start_info.is_null()
         || dxgkrnl_interface.is_null()
         || number_of_video_present_sources.is_null()
         || number_of_children.is_null()
@@ -518,6 +522,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             venus_ctx_id,
         }));
     }
+    // The LUID is copied only from this StartDevice generation's exact input.
+    crate::ddi::native_fence::publish_adapter_luid(adapter, unsafe {
+        (*dxgk_start_info).AdapterLuid
+    });
 
     // Adapter-owned builders may run only after the complete generation is
     // published; StopDevice closes and drains the same gate before teardown.
@@ -591,7 +599,10 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         if !d2_had_transport {
             crate::ddi::diag_etw::adapter_stop(adapter);
         }
-        crate::ddi::native_fence::invalidate_all();
+        crate::ddi::native_fence::invalidate_all(
+            adapter,
+            crate::ddi::native_fence::NativeFenceInvalidation::StopOrRemove,
+        );
         crate::adapter::allocation_object::invalidate_all();
         // Stop the ISR from touching the (about-to-be-reset) device first.
         //
@@ -711,7 +722,10 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
         // Remove may legally skip StopDevice. Repeating these after an orderly
         // Stop is harmless; omitting them here would let that skipped-Stop path
         // carry stale allocation/native-fence authority into freed storage.
-        crate::ddi::native_fence::invalidate_all();
+        crate::ddi::native_fence::invalidate_all(
+            adapter,
+            crate::ddi::native_fence::NativeFenceInvalidation::StopOrRemove,
+        );
         crate::adapter::allocation_object::invalidate_all();
         if crate::virtio::KMD_D2_OWNER_ENABLED {
             // RemoveDevice may follow a failed Start or skip StopDevice. Close

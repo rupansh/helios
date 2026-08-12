@@ -50,7 +50,7 @@
 //! Rule 4 is wired at the three adapter-epoch boundaries: StopDevice and
 //! RemoveDevice in `ddi/lifecycle.rs`, plus ResetFromTimeout in
 //! `ddi/submit_command.rs`. Each call is immediately beside
-//! `native_fence::invalidate_all()` and precedes device-lost publication, so
+//! `native_fence::invalidate_all(adapter, boundary)` and precedes device-lost publication, so
 //! allocation and native-fence generations change as one capability epoch.
 //! Runtime proof still requires `AcGenEpoch` to move on the target; this source
 //! wiring alone is not a runtime-correctness claim.

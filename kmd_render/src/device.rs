@@ -521,7 +521,7 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // the value of dumping them BEFORE the flip — the pre-flip run
         // establishes the zero baseline that makes the post-flip numbers mean
         // something.
-        crate::ddi::diag_dump_native_fence_atomics();
+        crate::ddi::diag_dump_native_fence_atomics(adapter.native_fence.as_ref());
         crate::ddi::diag_dump_translation_session_atomics();
         crate::ddi::diag_dump_native_render_atomics();
         // D4a: drop this device's scanout retirement-event registrations —

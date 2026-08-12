@@ -14,9 +14,9 @@ use crate::dxgk::_DXGK_QUERYADAPTERINFOTYPE::{
     DXGKQAITYPE_64BITONLYCAPS, DXGKQAITYPE_ADAPTERPERFDATA_CAPS, DXGKQAITYPE_DIRTYBITTRACKINGCAPS,
     DXGKQAITYPE_DRIVERCAPS, DXGKQAITYPE_GPUMMUCAPS, DXGKQAITYPE_GPUVERSION,
     DXGKQAITYPE_HARDWARERESERVEDRANGES2, DXGKQAITYPE_HISTORYBUFFERPRECISION,
-    DXGKQAITYPE_IOMMU_CAPS, DXGKQAITYPE_PAGETABLELEVELDESC, DXGKQAITYPE_PHYSICAL_MEMORY_CAPS,
-    DXGKQAITYPE_QUERYSEGMENT, DXGKQAITYPE_QUERYSEGMENT3, DXGKQAITYPE_QUERYSEGMENT4,
-    DXGKQAITYPE_WDDMDEVICECAPS,
+    DXGKQAITYPE_IOMMU_CAPS, DXGKQAITYPE_NATIVE_FENCE_CAPS, DXGKQAITYPE_PAGETABLELEVELDESC,
+    DXGKQAITYPE_PHYSICAL_MEMORY_CAPS, DXGKQAITYPE_QUERYSEGMENT, DXGKQAITYPE_QUERYSEGMENT3,
+    DXGKQAITYPE_QUERYSEGMENT4, DXGKQAITYPE_WDDMDEVICECAPS,
 };
 use crate::dxgk::*;
 
@@ -54,6 +54,9 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
         DXGKQAITYPE_QUERYSEGMENT3 => unsafe { query_segments3(adapter, args) },
         DXGKQAITYPE_QUERYSEGMENT4 => unsafe { query_segments(adapter, args) },
         DXGKQAITYPE_GPUMMUCAPS => unsafe { gpummu::fill_gpummu_caps(args) },
+        DXGKQAITYPE_NATIVE_FENCE_CAPS => unsafe {
+            crate::ddi::native_fence::fill_native_fence_caps(adapter, args)
+        },
         DXGKQAITYPE_PAGETABLELEVELDESC => unsafe { gpummu::fill_page_table_level_desc(args) },
         DXGKQAITYPE_WDDMDEVICECAPS => unsafe { query_wddm_device_caps(args) },
         DXGKQAITYPE_PHYSICAL_MEMORY_CAPS => unsafe { query_physical_memory_caps(args) },
@@ -392,7 +395,9 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
         0 => FLIPCAPS_DEFAULT,
         override_word => override_word,
     };
-    let scheduling_caps: UINT = SCHEDULINGCAPS_MULTI_ENGINE_AWARE | SCHEDULINGCAPS_PREEMPTION_AWARE;
+    let scheduling_caps: UINT = SCHEDULINGCAPS_MULTI_ENGINE_AWARE
+        | SCHEDULINGCAPS_PREEMPTION_AWARE
+        | unsafe { crate::ddi::native_fence::vidschcaps_native_fence_bits(adapter) };
     out.set(caps_offset!(PresentationCaps), presentation_caps);
     out.set(caps_offset!(FlipCaps), flip_caps);
     // What was actually advertised, so a knob that silently read as its default

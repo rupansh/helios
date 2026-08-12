@@ -5781,7 +5781,8 @@ pub mod native_fence_lifecycle {
         /// Offset 16 was nonzero on the way in. The object generation is
         /// KMD-assigned; a caller-supplied value is a forged identity attempt.
         ObjectGenerationNotZero,
-        /// Offset 24 is not a documented `D3DDDI_NATIVEFENCE_TYPE`.
+        /// Offset 24 is not the documented native-fence type this package
+        /// supports.
         NativeType,
         /// Offset 24 disagrees with the type the OS passed in the DDI argument.
         NativeTypeMismatch,
@@ -5841,9 +5842,8 @@ pub mod native_fence_lifecycle {
         }
     }
 
-    /// The header checks both create and open share: magic, ABI version,
-    /// structure size, package generation, a zero object generation, a flag
-    /// word with no undefined bit, and a zero reserved tail.
+    /// Validate the fields shared by create and open before either stage applies
+    /// its object-specific identity rules.
     fn validate_header(
         bytes: &[u8; HNF1_SIZE],
         package_generation: u64,
@@ -5907,25 +5907,39 @@ pub mod native_fence_lifecycle {
         Ok(parsed)
     }
 
-    /// Validate a `DxgkDdiOpenNativeFence` PDD.
-    ///
-    /// Deliberately weaker than [`validate_create`] on type and LUID: section
-    /// 12.1 item 2 puts that comparison on the *opening UMD* ("UMD validates
-    /// HNF1/package/LUID/type and stores only the returned local state"), and
-    /// the KMD overwrites both fields from the global object before returning.
-    /// Requiring the opener to pre-state them would invent a contract the
-    /// reference does not have.
+    /// Validate an open request against the exact global object selected by
+    /// dxgkrnl. The UMD input generation remains zero; the KMD writes the
+    /// object's nonzero generation only on successful return.
     pub fn validate_open(
         bytes: &[u8; HNF1_SIZE],
         package_generation: u64,
+        adapter_luid: i64,
+        native_type: u32,
+        flags: u32,
     ) -> Result<Hnf1, PddReject> {
-        validate_header(bytes, package_generation)
+        let parsed = validate_header(bytes, package_generation)?;
+        if !native_type_is_documented(parsed.native_type) {
+            return Err(PddReject::NativeType);
+        }
+        if parsed.native_type != native_type {
+            return Err(PddReject::NativeTypeMismatch);
+        }
+        if parsed.flags != flags {
+            return Err(PddReject::Flags);
+        }
+        if parsed.adapter_luid != adapter_luid {
+            return Err(PddReject::AdapterLuid);
+        }
+        Ok(parsed)
     }
 
-    /// Whether `native_type` is one of the documented `D3DDDI_NATIVEFENCE_TYPE`
-    /// values (section 12.1 line 3143).
+    /// Whether `native_type` is the one type this package implements.
+    ///
+    /// `INTRA_GPU` requires the separate native-fence storage-allocation path,
+    /// which this traditional-queue package does not advertise. Merely being a
+    /// documented enum value is not enough to accept it.
     pub fn native_type_is_documented(native_type: u32) -> bool {
-        native_type == NATIVE_FENCE_TYPE_DEFAULT || native_type == NATIVE_FENCE_TYPE_INTRA_GPU
+        native_type == NATIVE_FENCE_TYPE_DEFAULT
     }
 
     /// Render the KMD's answer: the same header, the assigned nonzero object
@@ -5978,7 +5992,7 @@ pub mod native_fence_lifecycle {
         /// A close was issued against a global object with no outstanding local
         /// reference — an OS ordering violation, or our own accounting bug.
         NoLocalReference,
-        /// The object is already draining or dead.
+        /// The object is already in a non-live defensive state.
         NotLive,
     }
 
@@ -5987,7 +6001,9 @@ pub mod native_fence_lifecycle {
     pub enum FenceState {
         /// Created and usable.
         Live,
-        /// Destroy has been requested but local references remain.
+        /// Defensive model state for an early destroy. The renderer leaves the
+        /// object live and refuses instead, relying on dxgkrnl's documented
+        /// final-Close-before-Destroy lifetime order.
         Draining,
         /// Freed. No further operation is legal.
         Dead,
@@ -6055,14 +6071,14 @@ pub mod native_fence_lifecycle {
         /// Opened local objects that still point at this global object.
         pub local_refs: u32,
         /// The adapter epoch this object was minted under.
-        pub epoch: u32,
+        pub epoch: u64,
         /// The KMD-assigned nonzero diagnostic/stale-validation generation.
         pub object_generation: u64,
     }
 
     impl GlobalFence {
         /// A freshly created object.
-        pub fn new(epoch: u32, object_generation: u64) -> Self {
+        pub fn new(epoch: u64, object_generation: u64) -> Self {
             Self {
                 state: FenceState::Live,
                 local_refs: 0,
@@ -6076,12 +6092,12 @@ pub mod native_fence_lifecycle {
     ///
     /// A single adapter-wide epoch is what lets reset invalidate every object
     /// at once with no enumeration and no discovery table.
-    pub fn epoch_is_current(object_epoch: u32, adapter_epoch: u32) -> bool {
+    pub fn epoch_is_current(object_epoch: u64, adapter_epoch: u64) -> bool {
         object_epoch == adapter_epoch
     }
 
     /// Take a local reference on a global object (`DxgkDdiOpenNativeFence`).
-    pub fn open_local(fence: GlobalFence, adapter_epoch: u32) -> Result<GlobalFence, Refusal> {
+    pub fn open_local(fence: GlobalFence, adapter_epoch: u64) -> Result<GlobalFence, Refusal> {
         if fence.state != FenceState::Live {
             return Err(Refusal::NotLive);
         }
@@ -6125,9 +6141,9 @@ pub mod native_fence_lifecycle {
     /// Destroy the global object (`DxgkDdiDestroyNativeFence`).
     ///
     /// Freeing while a local object still points here would dangle it, so an
-    /// early destroy moves to [`FenceState::Draining`] and is refused with
-    /// [`Refusal::LocalReferencesOutstanding`]. Leaking a bounded object is the
-    /// fail-closed choice against a use-after-free in a DDI.
+    /// early destroy is refused with [`Refusal::LocalReferencesOutstanding`].
+    /// The renderer keeps that bounded object live rather than publishing a
+    /// partial teardown state or risking a use-after-free.
     pub fn destroy_global(fence: GlobalFence) -> Result<GlobalFence, Refusal> {
         match fence.state {
             FenceState::Dead => Err(Refusal::NotLive),
@@ -6143,10 +6159,24 @@ pub mod native_fence_lifecycle {
     ///
     /// Section 12.1 line 3142 requires it nonzero on return, and line 3148
     /// forbids treating it as an object key — it exists for stale-validation and
-    /// diagnostics. Saturating rather than wrapping: reaching `u64::MAX` would
-    /// otherwise wrap to 0, which is the "UMD supplied it" sentinel.
-    pub fn next_object_generation(previous: u64) -> u64 {
-        previous.saturating_add(1).max(1)
+    /// diagnostics. Exhaustion returns `None`: reaching `u64::MAX` must never
+    /// wrap to 0, which is the "UMD supplied it" sentinel.
+    pub fn next_object_generation(previous: u64) -> Option<u64> {
+        previous.checked_add(1).filter(|next| *next != 0)
+    }
+
+    /// Reserve a strictly newer epoch without wrapping or reusing the terminal
+    /// value. `maximum` lets the renderer share the epoch with packed metadata.
+    pub fn next_epoch(previous: u64, maximum: u64) -> Option<u64> {
+        previous.checked_add(1).filter(|next| *next <= maximum)
+    }
+
+    /// Maximum number of entries accepted by either native-fence update DDI.
+    pub const MAX_UPDATE_FENCES: u32 = MAX_LIVE_GLOBAL;
+
+    /// Reject the count before any array offset is formed.
+    pub fn update_count_is_bounded(count: u32) -> bool {
+        count <= MAX_UPDATE_FENCES
     }
 
     /// Whether a monitored/current value update moves forward.
@@ -6160,15 +6190,20 @@ pub mod native_fence_lifecycle {
     }
 
     /// Whether every native-fence admission gate in section 10.2's table is
-    /// satisfied. All four are conjunctive; a single false makes the whole
+    /// satisfied. All five are conjunctive; a single false makes the whole
     /// surface refuse rather than partially advertise.
     pub fn surface_is_admitted(
         wddm_3_2_reported: bool,
+        display_owner_enabled: bool,
         os_enabled_feature: bool,
         adapter_luid_known: bool,
-        native_gpu_fence_cap: bool,
+        lifecycle_active: bool,
     ) -> bool {
-        wddm_3_2_reported && os_enabled_feature && adapter_luid_known && native_gpu_fence_cap
+        wddm_3_2_reported
+            && display_owner_enabled
+            && os_enabled_feature
+            && adapter_luid_known
+            && lifecycle_active
     }
 }
 
@@ -6290,6 +6325,13 @@ mod native_fence_lifecycle_tests {
             Err(PddReject::NativeType),
             "an undocumented type must not be admitted just because the OS echoed it"
         );
+
+        let b = encode(PKG, 0, NATIVE_FENCE_TYPE_INTRA_GPU, 0, 0);
+        assert_eq!(
+            validate_create(&b, PKG, LUID, NATIVE_FENCE_TYPE_INTRA_GPU),
+            Err(PddReject::NativeType),
+            "INTRA_GPU requires a fence-storage allocation path this package does not expose"
+        );
     }
 
     #[test]
@@ -6319,12 +6361,43 @@ mod native_fence_lifecycle_tests {
     }
 
     #[test]
-    fn open_validates_the_header_but_not_type_or_luid() {
-        // Section 12.1 item 2 puts type/LUID validation on the opening UMD,
-        // after the KMD writes them back from the global object.
-        let b = encode(PKG, 0, 999, 0, LUID ^ 1);
-        assert!(validate_open(&b, PKG).is_ok());
-        assert_eq!(validate_open(&b, PKG ^ 1), Err(PddReject::PackageGeneration));
+    fn open_requires_the_exact_global_identity() {
+        let b = encode(PKG, 0, NATIVE_FENCE_TYPE_DEFAULT, HNF1_FLAG_SHARED, LUID);
+        assert!(validate_open(
+            &b,
+            PKG,
+            LUID,
+            NATIVE_FENCE_TYPE_DEFAULT,
+            HNF1_FLAG_SHARED,
+        )
+        .is_ok());
+        assert_eq!(
+            validate_open(
+                &b,
+                PKG,
+                LUID ^ 1,
+                NATIVE_FENCE_TYPE_DEFAULT,
+                HNF1_FLAG_SHARED,
+            ),
+            Err(PddReject::AdapterLuid)
+        );
+        let nonzero_generation = encode(
+            PKG,
+            7,
+            NATIVE_FENCE_TYPE_DEFAULT,
+            HNF1_FLAG_SHARED,
+            LUID,
+        );
+        assert_eq!(
+            validate_open(
+                &nonzero_generation,
+                PKG,
+                LUID,
+                NATIVE_FENCE_TYPE_DEFAULT,
+                HNF1_FLAG_SHARED,
+            ),
+            Err(PddReject::ObjectGenerationNotZero)
+        );
     }
 
     #[test]
@@ -6401,12 +6474,18 @@ mod native_fence_lifecycle_tests {
 
     #[test]
     fn the_object_generation_is_never_zero_and_never_wraps_to_zero() {
-        assert_eq!(next_object_generation(0), 1);
-        assert_eq!(next_object_generation(1), 2);
-        // Saturation, not wrap: 0 is the "supplied by the UMD" sentinel and must
-        // never be handed back as an assigned generation.
-        assert_eq!(next_object_generation(u64::MAX), u64::MAX);
-        assert_ne!(next_object_generation(u64::MAX), 0);
+        assert_eq!(next_object_generation(0), Some(1));
+        assert_eq!(next_object_generation(1), Some(2));
+        assert_eq!(next_object_generation(u64::MAX), None);
+        assert_eq!(next_epoch(6, 7), Some(7));
+        assert_eq!(next_epoch(7, 7), None);
+    }
+
+    #[test]
+    fn update_count_is_rejected_before_the_bound_is_exceeded() {
+        assert!(update_count_is_bounded(0));
+        assert!(update_count_is_bounded(MAX_UPDATE_FENCES));
+        assert!(!update_count_is_bounded(MAX_UPDATE_FENCES + 1));
     }
 
     #[test]
@@ -6419,11 +6498,11 @@ mod native_fence_lifecycle_tests {
 
     #[test]
     fn admission_is_conjunctive() {
-        assert!(surface_is_admitted(true, true, true, true));
-        for i in 0..4 {
+        assert!(surface_is_admitted(true, true, true, true, true));
+        for i in 0..5 {
             let g = |n: usize| n != i;
             assert!(
-                !surface_is_admitted(g(0), g(1), g(2), g(3)),
+                !surface_is_admitted(g(0), g(1), g(2), g(3), g(4)),
                 "gate {i} alone must be able to refuse the whole surface"
             );
         }

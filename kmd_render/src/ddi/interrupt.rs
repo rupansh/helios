@@ -94,6 +94,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
     // publication, cancellation and worker release inside that exact transport
     // lock prevents StopDevice from removing/resetting the generation between
     // handoff and effects.
+    let mut completed_wddm_submission = false;
     adapter.with_wddm_notify_lock(|guard| {
         // `drain_used` runs under only `virtio_lock`, so a rejected tagged
         // submit can only invalidate its stream there.  Discharge the stale
@@ -189,6 +190,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
                 super::submit_command::signal_dma_completed(guard, dxgkrnl, ready.fence())
             };
             if status == STATUS_SUCCESS {
+                completed_wddm_submission = true;
                 let terminal_prefix = ready.terminal_prefix();
                 ready.delivered();
                 if let Some(prefix) = terminal_prefix {
@@ -214,6 +216,16 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             break;
         }
     });
+    // A native rescan requires both a completed WDDM submission (the only
+    // traditional-queue edge that can carry a GPU fence signal) and a monitored
+    // waiter observed in this adapter epoch. Used-ring traffic alone is not one.
+    if completed_wddm_submission && super::native_fence::has_possible_progress_edge(adapter) {
+        if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
+            let _ = unsafe {
+                super::native_fence::signal_native_fence_signaled(adapter, dxgkrnl)
+            };
+        }
+    }
 }
 
 /// `DxgkDdiInterruptRoutine` — runs at the device's DIRQL; returns TRUE if the

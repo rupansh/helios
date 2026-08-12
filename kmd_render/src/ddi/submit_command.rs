@@ -540,36 +540,41 @@ pub fn diag_dump_engine_atomics() {
     );
 }
 
-/// Context handed to [`notify_dma_completed_routine`] across the
+/// Context handed to [`notify_at_dirql_routine`] across the
 /// `DxgkCbSynchronizeExecution` boundary (it runs at the device's DIRQL).
-struct NotifyDmaCompletedCtx {
+struct NotifyAtDirqlCtx {
     dxgkrnl: *const DXGKRNL_INTERFACE,
     interrupt: *mut DXGKARGCB_NOTIFY_INTERRUPT_DATA,
+    account_legacy: bool,
 }
 
 /// Runs at the device's interrupt IRQL (DIRQL), synchronized with the ISR — the
 /// only level at which `DxgkCbNotifyInterrupt` may be called. Mirrors viogpu3d's
 /// `NotifyRoutine` (`viogpu_adapter.cpp:50-72`).
-unsafe extern "C" fn notify_dma_completed_routine(context: *mut c_void) -> BOOLEAN {
+unsafe extern "C" fn notify_at_dirql_routine(context: *mut c_void) -> BOOLEAN {
     if context.is_null() {
         return 0;
     }
-    // SAFETY: `context` is the `NotifyDmaCompletedCtx` we passed to
+    // SAFETY: `context` is the `NotifyAtDirqlCtx` we passed to
     // DxgkCbSynchronizeExecution; valid for the duration of that synchronous call.
-    let ctx = unsafe { &*(context as *const NotifyDmaCompletedCtx) };
+    let ctx = unsafe { &*(context as *const NotifyAtDirqlCtx) };
     let dxgkrnl = unsafe { &*ctx.dxgkrnl };
     if let Some(notify_interrupt) = dxgkrnl.DxgkCbNotifyInterrupt {
         // SAFETY: at DIRQL (raised by DxgkCbSynchronizeExecution); `interrupt`
         // points to a fully-initialized DMA_COMPLETED packet, live for this call.
         unsafe { notify_interrupt(dxgkrnl.DeviceHandle, ctx.interrupt) };
-        DMA_NOTIFY_COUNT.fetch_add(1, Ordering::Relaxed);
+        if ctx.account_legacy {
+            DMA_NOTIFY_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
     }
     if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
         // viogpu3d queues the DPC from the synchronized interrupt routine, while
         // still at the device DIRQL. Keep that ordering so dxgkrnl sees the
         // notify+DPC pair as one interrupt-completion event.
         unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
-        DMA_QUEUE_DPC_COUNT.fetch_add(1, Ordering::Relaxed);
+        if ctx.account_legacy {
+            DMA_QUEUE_DPC_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
     }
     1 // TRUE
 }
@@ -578,13 +583,18 @@ unsafe extern "C" fn notify_dma_completed_routine(context: *mut c_void) -> BOOLE
 /// IRQL: hand it to `DxgkCbNotifyInterrupt` from inside a
 /// `DxgkCbSynchronizeExecution` callback (which raises to the device's DIRQL),
 /// then `DxgkCbQueueDpc` so dxgkrnl drains the packet. Callable at <= DIRQL.
-unsafe fn notify_at_dirql(
+pub(crate) unsafe fn notify_at_dirql(
     dxgkrnl: &DXGKRNL_INTERFACE,
     interrupt: &mut DXGKARGCB_NOTIFY_INTERRUPT_DATA,
+    account_legacy: bool,
 ) -> NTSTATUS {
-    let ctx = NotifyDmaCompletedCtx {
+    if dxgkrnl.DxgkCbNotifyInterrupt.is_none() || dxgkrnl.DxgkCbQueueDpc.is_none() {
+        return STATUS_DEVICE_NOT_READY;
+    }
+    let ctx = NotifyAtDirqlCtx {
         dxgkrnl: dxgkrnl as *const DXGKRNL_INTERFACE,
         interrupt: interrupt as *mut DXGKARGCB_NOTIFY_INTERRUPT_DATA,
+        account_legacy,
     };
 
     if let Some(sync) = dxgkrnl.DxgkCbSynchronizeExecution {
@@ -593,7 +603,7 @@ unsafe fn notify_at_dirql(
         let status = unsafe {
             sync(
                 dxgkrnl.DeviceHandle,
-                Some(notify_dma_completed_routine),
+                Some(notify_at_dirql_routine),
                 &ctx as *const _ as *mut c_void,
                 0,
                 &mut ret,
@@ -653,7 +663,7 @@ pub(crate) unsafe fn signal_dma_completed(
     completed.NodeOrdinal = 0;
     completed.EngineOrdinal = 0;
     // SAFETY: fully-initialized packet, live for the call.
-    let status = unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) };
+    let status = unsafe { notify_at_dirql(dxgkrnl, &mut interrupt, true) };
     if status == STATUS_SUCCESS {
         guard.set_completed_fence(fence);
     }
@@ -677,7 +687,7 @@ pub(crate) unsafe fn signal_crtc_vsync(
     vsync.VidPnTargetId = target_id;
     vsync.PhysicalAddress.QuadPart = physical_address;
     // SAFETY: fully-initialized packet, live for the call.
-    unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
+    unsafe { notify_at_dirql(dxgkrnl, &mut interrupt, true) }
 }
 
 /// Signal `DXGK_INTERRUPT_DMA_PREEMPTED` (see [`notify_at_dirql`]): the node's
@@ -697,7 +707,7 @@ unsafe fn signal_dma_preempted_locked(
     preempted.NodeOrdinal = 0;
     preempted.EngineOrdinal = 0;
     // SAFETY: fully-initialized packet, live for the call.
-    unsafe { notify_at_dirql(dxgkrnl, &mut interrupt) }
+    unsafe { notify_at_dirql(dxgkrnl, &mut interrupt, true) }
 }
 
 /// Common submission handling (C3/M3.4): record the WDDM fence behind the venus
@@ -1312,7 +1322,10 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
     // Close capability/object generations before any device-lost wakeup or
     // transport producer can observe the reset boundary. Both invalidations
     // are lock-free and define one indivisible adapter epoch transition.
-    crate::ddi::native_fence::invalidate_all();
+    crate::ddi::native_fence::invalidate_all(
+        adapter,
+        crate::ddi::native_fence::NativeFenceInvalidation::Reset,
+    );
     crate::adapter::allocation_object::invalidate_all();
     // Prevent a DPC from taking a fence out of the pending FIFO while reset is
     // discarding that same scheduler epoch.  Dxgkrnl owns the post-reset fence
@@ -1390,8 +1403,8 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
         return STATUS_INVALID_PARAMETER;
     }
 
+    let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     if crate::virtio::KMD_D2_OWNER_ENABLED {
-        let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
         let passive = unsafe { crate::irql::PassiveLevel::assume() };
         adapter
             .start_complete
@@ -1509,6 +1522,7 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
         }
     }
 
+    crate::ddi::native_fence::resume_after_reset(adapter);
     STATUS_SUCCESS
 }
 
