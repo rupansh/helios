@@ -10,6 +10,12 @@
   WDDM 3.2 string is supporting evidence only. The final admission predicate
   also requires the owner to attest that the current desktop is visibly live.
 
+  WDK 28000 is the compile-time header/binding authority, not a guest-OS
+  package minimum. FINDINGS.md F1 measured Core DDI 0116 negotiation on build
+  26100. The caller therefore supplies the exact authorized target OS build;
+  this harness records and checks it without restoring the superseded 28000
+  minimum.
+
   Run this only after deployment and a cold boot have been separately authorized.
 
 .EXAMPLE
@@ -19,6 +25,7 @@
     -InstalledInfPath C:\Windows\System32\DriverStore\FileRepository\<package>\helios.inf `
     -ExpectedInfSha256 <64-hex-sha256> `
     -ExpectedDriverVersion 22.22.184.0 `
+    -ExpectedOsBuild 26100 `
     -MinimumBootUtc 2026-08-13T10:00:00Z `
     -OwnerColdBootConfirmation COLD_BOOT_POWER_CYCLE `
     -OwnerVisibleDesktopConfirmation VISIBLE_DWM_DESKTOP `
@@ -42,6 +49,10 @@ param(
 
     [Parameter(Mandatory = $true)]
     [string] $ExpectedDriverVersion,
+
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9]+$')]
+    [string] $ExpectedOsBuild,
 
     [Parameter(Mandatory = $true)]
     [datetime] $MinimumBootUtc,
@@ -100,12 +111,13 @@ $minimumUtc = $MinimumBootUtc.ToUniversalTime()
 $checks.boot_utc = $bootUtc.ToString('o')
 $checks.minimum_boot_utc = $minimumUtc.ToString('o')
 $checks.os_build = [string]$os.BuildNumber
+$checks.expected_os_build = $ExpectedOsBuild
 $checks.owner_cold_boot_confirmation = $OwnerColdBootConfirmation
 if ($bootUtc -lt $minimumUtc) {
     Add-D9Failure('the running Windows instance predates the authorized cold-boot boundary')
 }
-if ([string]$os.BuildNumber -ne '28000') {
-    Add-D9Failure("Windows build '$($os.BuildNumber)' is not exact build 28000")
+if ([string]$os.BuildNumber -ne $ExpectedOsBuild) {
+    Add-D9Failure("Windows build '$($os.BuildNumber)' is not the authorized target build '$ExpectedOsBuild'")
 }
 if ($OwnerColdBootConfirmation -ne 'COLD_BOOT_POWER_CYCLE') {
     Add-D9Failure('owner did not attest that this boot followed a cold power cycle')

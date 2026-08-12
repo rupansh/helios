@@ -548,12 +548,13 @@ def check_cold_gate(sources: dict[str, str], errors: list[str]) -> None:
         "$InstalledInfPath",
         "$ExpectedInfSha256",
         "$ExpectedDriverVersion",
+        "$ExpectedOsBuild",
         "$MinimumBootUtc",
         "COLD_BOOT_POWER_CYCLE",
         "VISIBLE_DWM_DESKTOP",
         "$OwnerVisibleDescription",
         "LastBootUpTime.ToUniversalTime()",
-        "[string]$os.BuildNumber -ne '28000'",
+        "[string]$os.BuildNumber -ne $ExpectedOsBuild",
         "DEVPKEY_Device_ProblemCode",
         "DEVPKEY_Device_DriverVersion",
         "Driver Model:\\s*(?<model>",
@@ -565,6 +566,11 @@ def check_cold_gate(sources: dict[str, str], errors: list[str]) -> None:
     ):
         if fragment not in script:
             errors.append(f"{COLD_GATE}: cold-DWM admission marker missing: {fragment}")
+    if "BuildNumber -ne '28000'" in script or "exact build 28000" in script:
+        errors.append(
+            f"{COLD_GATE}: superseded build-28000 guest minimum was restored; "
+            "WDK 28000 is the binding authority and FINDINGS.md F1 governs the target OS"
+        )
     for forbidden in (
         "Restart-Computer",
         "pnputil.exe",
@@ -875,10 +881,16 @@ def mutation_cases() -> tuple[Mutation, ...]:
             "if ($false) {",
         ),
         Mutation(
-            "ignore build-28000 boundary",
+            "ignore exact target-OS build check",
             COLD_GATE,
-            "if ([string]$os.BuildNumber -ne '28000') {",
+            "if ([string]$os.BuildNumber -ne $ExpectedOsBuild) {",
             "if ($false) {",
+        ),
+        Mutation(
+            "restore superseded build-28000 guest minimum",
+            COLD_GATE,
+            "if ([string]$os.BuildNumber -ne $ExpectedOsBuild) {",
+            "if ([string]$os.BuildNumber -ne '28000') {",
         ),
         Mutation(
             "claim warm boot as cold",
