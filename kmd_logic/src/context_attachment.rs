@@ -161,6 +161,13 @@ impl<E> AttachmentFinish<E> {
     pub fn into_parts(self) -> (AttachmentFinishEffect<E>, Option<ReleaseAttachment>) {
         (self.effect, self.release)
     }
+
+    pub(crate) const fn from_parts(
+        effect: AttachmentFinishEffect<E>,
+        release: Option<ReleaseAttachment>,
+    ) -> Self {
+        Self { effect, release }
+    }
 }
 
 #[must_use]
@@ -421,6 +428,34 @@ impl<R> ContextAttachmentLifecycle<R> {
         let authority = AttachmentReleaseAuthorityKind::TransportReset(reset.retired_epoch());
         self.release(authority);
         Ok(self.release_token(authority))
+    }
+
+    pub(crate) fn can_reset(
+        &self,
+        attachment: TransportAttachment,
+        reset: &TransportReset,
+    ) -> bool {
+        self.check_attachment(attachment).is_ok()
+            && reset.retired_epoch() == self.attachment().epoch()
+            && self.phase != AttachmentPhase::Released
+    }
+
+    pub(crate) fn reset_consume(
+        mut self,
+        attachment: TransportAttachment,
+        reset: &TransportReset,
+    ) -> Result<ReleasedAttachment<R>, Self> {
+        let authority = match self.transport_reset(attachment, reset) {
+            Ok(authority) => authority,
+            Err(_) => return Err(self),
+        };
+        match self.consume_released(authority) {
+            Ok(released) => Ok(released),
+            Err(refused) => {
+                let (lifecycle, _) = refused.into_parts();
+                Err(lifecycle)
+            }
+        }
     }
 
     pub fn consume_released(

@@ -226,6 +226,12 @@ pub enum TicketTableRefusal {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct TicketEpochRebindRefusal {
+    pub index: u32,
+    pub state: TicketState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControlWireKey {
     verb: ControlVerb,
     subject: ControlSubject,
@@ -518,6 +524,16 @@ impl<R, E, K> ControlTicketSlot<R, E, K> {
 
     pub const fn state(&self) -> TicketState {
         self.storage.state()
+    }
+
+    pub(crate) const fn is_fresh(&self) -> bool {
+        matches!(
+            self.storage,
+            TicketStorage::Empty(EmptyState {
+                row_incarnation_high_water: 0,
+                sequence_high_water: 0,
+            })
+        )
     }
 }
 
@@ -988,8 +1004,58 @@ impl<'a, R, E, K: TicketRowKind> ControlTickets<'a, R, E, K> {
         })
     }
 
+    /// Safety: the caller established every `new` precondition and validated
+    /// that `slots.len()` is representable as `u32`.
+    pub(crate) unsafe fn new_canonical(
+        table: SlotTableId,
+        epoch: TransportEpoch,
+        slots: &'a mut [ControlTicketSlot<R, E, K>],
+    ) -> Self {
+        Self {
+            table,
+            epoch,
+            slots,
+            kind: PhantomData,
+        }
+    }
+
     pub fn state_at(&self, index: u32) -> Option<TicketState> {
         self.slots.get(index as usize).map(ControlTicketSlot::state)
+    }
+
+    pub(crate) fn validate_epoch_rebind(&self) -> Result<(), TicketEpochRebindRefusal> {
+        for (index, slot) in self.slots.iter().enumerate() {
+            let state = slot.state();
+            if !matches!(state, TicketState::Empty | TicketState::Retired) {
+                return Err(TicketEpochRebindRefusal {
+                    index: index as u32,
+                    state,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Safety: all canonical arrays passed read-only rebind validation, every
+    /// old authority/rundown is drained, and `epoch` is the exact successor.
+    pub(crate) unsafe fn apply_epoch_rebind(
+        &mut self,
+        epoch: TransportEpoch,
+        mut stable_slot_is_vacant: impl FnMut(u32) -> bool,
+    ) {
+        for (index, slot) in self.slots.iter_mut().enumerate() {
+            if stable_slot_is_vacant(index as u32) {
+                if matches!(slot.storage, TicketStorage::Retired) {
+                    slot.storage = TicketStorage::Empty(EmptyState {
+                        row_incarnation_high_water: 0,
+                        sequence_high_water: 0,
+                    });
+                }
+            } else {
+                slot.storage = TicketStorage::Retired;
+            }
+        }
+        self.epoch = epoch;
     }
 
     /// # Safety
@@ -1213,6 +1279,14 @@ impl<'a, R, E, K: TicketRowKind> ControlTickets<'a, R, E, K> {
         }
     }
 
+    pub(crate) fn prepared_verb(
+        &self,
+        ticket: &PreparedTicket<K>,
+    ) -> Result<ControlVerb, TicketRefusal> {
+        self.checked_key(ticket.key, TicketState::Prepared)
+            .map(|(_, identity)| identity.verb)
+    }
+
     pub fn cancel_reservation(
         &mut self,
         reservation: TicketReservation<K>,
@@ -1264,6 +1338,61 @@ impl<'a, R, E, K: TicketRowKind> ControlTickets<'a, R, E, K> {
                 })
             }
         }
+    }
+
+    pub(crate) fn validate_reservation(
+        &self,
+        reservation: &TicketReservation<K>,
+    ) -> Result<(), TicketRefusal> {
+        let row = reservation.row;
+        let index = self.checked_row(row)?;
+        match &self.slots[index].storage {
+            TicketStorage::Reserved(found) if found.row == row => Ok(()),
+            TicketStorage::Reserved(found) => Err(TicketRefusal::RowIncarnationMismatch {
+                expected: found.row.incarnation,
+                found: row.incarnation,
+            }),
+            storage => Err(TicketRefusal::WrongState {
+                expected: TicketState::Reserved,
+                found: storage.state(),
+            }),
+        }
+    }
+
+    pub(crate) fn can_commit_empty(&self, row: SlotHandle<K>) -> bool {
+        let row = RowIdentity::from_handle(row);
+        let Ok(index) = self.checked_row(row) else {
+            return false;
+        };
+        matches!(
+            &self.slots[index].storage,
+            TicketStorage::Empty(empty)
+                if row.incarnation >= empty.row_incarnation_high_water
+        )
+    }
+
+    /// Safety: `reservation` passed exact validation, its lifecycle never
+    /// began, and its rundown is fully finalized by the sole table owner.
+    pub(crate) unsafe fn cancel_reservation_validated(
+        &mut self,
+        reservation: TicketReservation<K>,
+    ) -> Option<R> {
+        let row = reservation.row;
+        let index = row.index as usize;
+        let old = replace(&mut self.slots[index].storage, TicketStorage::Retired);
+        let TicketStorage::Reserved(reserved) = old else {
+            self.slots[index].storage = old;
+            return None;
+        };
+        if reserved.row != row {
+            self.slots[index].storage = TicketStorage::Reserved(reserved);
+            return None;
+        }
+        self.slots[index].storage = TicketStorage::Empty(EmptyState {
+            row_incarnation_high_water: reserved.row.incarnation,
+            sequence_high_water: reserved.sequence_high_water,
+        });
+        Some(ManuallyDrop::into_inner(reserved.rundown))
     }
 
     pub fn cancel_prepared(
@@ -1538,6 +1667,92 @@ impl<'a, R, E, K: TicketRowKind> ControlTickets<'a, R, E, K> {
         Ok(())
     }
 
+    pub(crate) fn consume_rundown_release(
+        &mut self,
+        release: RundownRelease<R, K>,
+    ) -> Result<R, RefusedAction<RundownRelease<R, K>>> {
+        let expected = release.release;
+        let index = match self.checked_row(expected.row) {
+            Ok(index) => index,
+            Err(reason) => {
+                return Err(RefusedAction {
+                    reason,
+                    action: release,
+                })
+            }
+        };
+        match &self.slots[index].storage {
+            TicketStorage::ReleasePending(found) if *found == expected => {}
+            TicketStorage::ReleasePending(found) => {
+                return Err(RefusedAction {
+                    reason: TicketRefusal::ControlSequenceMismatch {
+                        expected: found.sequence_high_water,
+                        found: expected.sequence_high_water,
+                    },
+                    action: release,
+                })
+            }
+            storage => {
+                return Err(RefusedAction {
+                    reason: TicketRefusal::WrongState {
+                        expected: TicketState::ReleasePending,
+                        found: storage.state(),
+                    },
+                    action: release,
+                })
+            }
+        }
+        let RundownRelease { rundown, .. } = release;
+        self.slots[index].storage = TicketStorage::Empty(EmptyState {
+            row_incarnation_high_water: expected.row.incarnation,
+            sequence_high_water: expected.sequence_high_water,
+        });
+        Ok(ManuallyDrop::into_inner(rundown))
+    }
+
+    pub(crate) fn validate_rundown_release(
+        &self,
+        release: &RundownRelease<R, K>,
+    ) -> Result<(), TicketRefusal> {
+        let expected = release.release;
+        let index = self.checked_row(expected.row)?;
+        match &self.slots[index].storage {
+            TicketStorage::ReleasePending(found) if *found == expected => Ok(()),
+            TicketStorage::ReleasePending(found) => Err(TicketRefusal::ControlSequenceMismatch {
+                expected: found.sequence_high_water,
+                found: expected.sequence_high_water,
+            }),
+            storage => Err(TicketRefusal::WrongState {
+                expected: TicketState::ReleasePending,
+                found: storage.state(),
+            }),
+        }
+    }
+
+    /// Safety: `release` passed exact validation and every owner-side effect
+    /// is committed; this is the final, infallible mutation for that control.
+    pub(crate) unsafe fn consume_rundown_release_validated(
+        &mut self,
+        release: RundownRelease<R, K>,
+    ) -> R {
+        let expected = release.release;
+        let index = expected.row.index as usize;
+        let old = replace(&mut self.slots[index].storage, TicketStorage::Retired);
+        let found = match old {
+            TicketStorage::ReleasePending(found) if found == expected => found,
+            storage => {
+                self.slots[index].storage = storage;
+                return ManuallyDrop::into_inner(release.rundown);
+            }
+        };
+        let empty = EmptyState {
+            row_incarnation_high_water: found.row.incarnation,
+            sequence_high_water: found.sequence_high_water,
+        };
+        self.slots[index].storage = TicketStorage::Empty(empty);
+        ManuallyDrop::into_inner(release.rundown)
+    }
+
     /// # Safety
     ///
     /// Old-epoch submission admission is closed and producer/effect rundown is
@@ -1626,6 +1841,44 @@ impl<'a, R, E, K: TicketRowKind> ControlTickets<'a, R, E, K> {
             rundown,
             kind: PhantomData,
         })
+    }
+
+    pub(crate) fn can_reset_pending(&self, row: SlotHandle<K>, reset: &TransportReset) -> bool {
+        let row = RowIdentity::from_handle(row);
+        let Ok(index) = self.checked_row(row) else {
+            return false;
+        };
+        if reset.retired_epoch() != self.epoch {
+            return false;
+        }
+        match &self.slots[index].storage {
+            TicketStorage::Reserved(found) => found.row == row,
+            TicketStorage::Prepared(found) | TicketStorage::MayHaveSubmitted(found) => {
+                found.row == row
+            }
+            TicketStorage::LifecyclePending(found) => found.row == row,
+            TicketStorage::LifecycleApplying(found) => found.row == row,
+            TicketStorage::Empty(_)
+            | TicketStorage::ReleasePending(_)
+            | TicketStorage::ResetPending(_)
+            | TicketStorage::Retired => false,
+        }
+    }
+
+    pub(crate) fn can_ack_reset(&self, ack: &PendingResetAck<K>) -> bool {
+        let Ok(index) = self.checked_row(ack.row) else {
+            return false;
+        };
+        matches!(
+            self.slots[index].storage,
+            TicketStorage::ResetPending(found) if found == ack.row
+        )
+    }
+
+    /// Safety: `can_ack_reset` passed under the sole owner borrow and all
+    /// reset payload and rundown finalization effects are complete.
+    pub(crate) unsafe fn ack_reset_validated(&mut self, ack: PendingResetAck<K>) {
+        self.slots[ack.row.index as usize].storage = TicketStorage::Retired;
     }
 
     pub fn ack_reset(

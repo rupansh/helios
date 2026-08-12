@@ -169,6 +169,13 @@ impl<E> ContextFinish<E> {
     pub fn into_parts(self) -> (ContextFinishEffect<E>, Option<ReleaseContext>) {
         (self.effect, self.release)
     }
+
+    pub(crate) const fn from_parts(
+        effect: ContextFinishEffect<E>,
+        release: Option<ReleaseContext>,
+    ) -> Self {
+        Self { effect, release }
+    }
 }
 
 #[must_use]
@@ -536,6 +543,25 @@ impl<B> TransportContextLifecycle<B> {
         })
     }
 
+    pub(crate) fn can_cancel_attachment(&self, leased: &LeasedAttachmentReservation) -> bool {
+        leased.is_exact()
+            && self
+                .check_attachment_return(leased.context_lease(), ContextOperation::CancelAttachment)
+                .is_ok()
+    }
+
+    /// Safety: `can_cancel_attachment` passed under the sole owner borrow and
+    /// the canonical pair row is being removed in this same transition.
+    pub(crate) unsafe fn cancel_attachment_validated(
+        &mut self,
+        leased: LeasedAttachmentReservation,
+    ) -> ReleasedAttachmentReservation {
+        self.lease_census = self.lease_census.wrapping_sub(1);
+        ReleasedAttachmentReservation {
+            attachment: leased.attachment(),
+        }
+    }
+
     pub fn return_attachment(
         &mut self,
         released: ReleasedAttachmentLease,
@@ -554,6 +580,26 @@ impl<B> TransportContextLifecycle<B> {
         }
         self.lease_census -= 1;
         Ok(released.reservation)
+    }
+
+    pub(crate) fn can_return_attachment(&self, released: &ReleasedAttachmentLease) -> bool {
+        released.is_exact()
+            && self
+                .check_attachment_return(
+                    released.context_lease(),
+                    ContextOperation::ReturnAttachment,
+                )
+                .is_ok()
+    }
+
+    /// Safety: `can_return_attachment` passed under the sole owner borrow and
+    /// the canonical pair row is being removed in this same transition.
+    pub(crate) unsafe fn return_attachment_validated(
+        &mut self,
+        released: ReleasedAttachmentLease,
+    ) -> ReleasedAttachmentReservation {
+        self.lease_census = self.lease_census.wrapping_sub(1);
+        released.reservation
     }
 
     pub fn begin_destroy(
@@ -672,6 +718,31 @@ impl<B> TransportContextLifecycle<B> {
         let authority = ContextTerminalAuthorityKind::TransportReset(reset.retired_epoch());
         self.terminalize(authority);
         Ok(self.release_token(authority))
+    }
+
+    pub(crate) fn can_reset(&self, context: TransportContext, reset: &TransportReset) -> bool {
+        self.check_context(context).is_ok()
+            && reset.retired_epoch() == self.context().epoch()
+            && self.phase != ContextPhase::Terminal
+            && self.lease_census == 0
+    }
+
+    pub(crate) fn reset_consume(
+        mut self,
+        context: TransportContext,
+        reset: &TransportReset,
+    ) -> Result<ReleasedContext<B>, Self> {
+        let authority = match self.transport_reset(context, reset) {
+            Ok(authority) => authority,
+            Err(_) => return Err(self),
+        };
+        match self.consume_terminal(authority) {
+            Ok(released) => Ok(released),
+            Err(refused) => {
+                let (lifecycle, _) = refused.into_parts();
+                Err(lifecycle)
+            }
+        }
     }
 
     pub fn consume_terminal(

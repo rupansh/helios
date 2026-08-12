@@ -173,6 +173,12 @@ pub enum SlotTableRefusal {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SlotEpochRebindRefusal {
+    pub index: u32,
+    pub state: SlotState,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InsertRefusal {
     CapacityExhausted,
     IncarnationExhausted { retired_slots: u32 },
@@ -410,6 +416,21 @@ impl<'a, T, K> StableSlots<'a, T, K> {
         })
     }
 
+    /// Safety: the caller established every `new` precondition and validated
+    /// that `slots.len()` is representable as `u32`.
+    pub(crate) unsafe fn new_canonical(
+        table: SlotTableId,
+        epoch: TransportEpoch,
+        slots: &'a mut [StableSlot<T>],
+    ) -> Self {
+        Self {
+            table,
+            epoch,
+            slots,
+            kind: PhantomData,
+        }
+    }
+
     pub const fn epoch(&self) -> TransportEpoch {
         self.epoch
     }
@@ -426,10 +447,98 @@ impl<'a, T, K> StableSlots<'a, T, K> {
         self.slots.get(index as usize).map(StableSlot::state)
     }
 
+    pub(crate) fn occupied_handle_at(&self, index: u32) -> Option<SlotHandle<K>> {
+        let slot = self.slots.get(index as usize)?;
+        let SlotStorage::Occupied { incarnation, .. } = slot.storage else {
+            return None;
+        };
+        Some(SlotHandle {
+            table: self.table,
+            epoch: self.epoch,
+            index,
+            incarnation,
+            kind: PhantomData,
+        })
+    }
+
+    pub(crate) fn can_mark_terminal(&self, handle: SlotHandle<K>) -> bool {
+        let Ok(index) = self.checked_index(handle) else {
+            return false;
+        };
+        self.check_incarnation(index, handle.incarnation.get())
+            .is_ok()
+            && self.slots[index].state() == SlotState::Occupied
+    }
+
+    /// Safety: exact terminal payload cleanup is complete, the canonical row
+    /// is Occupied, and no descendant can observe its payload after this call.
+    pub(crate) unsafe fn finalize_occupied(
+        &mut self,
+        handle: SlotHandle<K>,
+    ) -> Result<(), SlotRefusal> {
+        let index = self.checked_index(handle)?;
+        self.check_incarnation(index, handle.incarnation.get())?;
+        let old = replace(&mut self.slots[index].storage, SlotStorage::Retired);
+        let (incarnation, payload) = match old {
+            SlotStorage::Occupied {
+                incarnation,
+                payload,
+            } => (incarnation, payload),
+            storage => {
+                let found = storage.state();
+                self.slots[index].storage = storage;
+                return Err(SlotRefusal::WrongState {
+                    expected: SlotState::Occupied,
+                    found,
+                });
+            }
+        };
+        let _payload = payload;
+        self.slots[index].storage = if incarnation.get() == u64::MAX {
+            SlotStorage::Retired
+        } else {
+            SlotStorage::Vacant {
+                high_water: incarnation.get(),
+            }
+        };
+        Ok(())
+    }
+
+    /// Safety: `can_mark_terminal` passed under this sole mutable owner borrow,
+    /// and the payload has been fully finalized or irreversibly quarantined.
+    pub(crate) unsafe fn finalize_occupied_validated(&mut self, handle: SlotHandle<K>) {
+        let index = handle.index as usize;
+        let old = replace(&mut self.slots[index].storage, SlotStorage::Retired);
+        let (incarnation, payload) = match old {
+            SlotStorage::Occupied {
+                incarnation,
+                payload,
+            } if incarnation == handle.incarnation => (incarnation, payload),
+            _ => unsafe { core::hint::unreachable_unchecked() },
+        };
+        let _payload = payload;
+        self.slots[index].storage = if incarnation.get() == u64::MAX {
+            SlotStorage::Retired
+        } else {
+            SlotStorage::Vacant {
+                high_water: incarnation.get(),
+            }
+        };
+    }
+
     pub fn incarnation_high_water_at(&self, index: u32) -> Option<u64> {
         self.slots
             .get(index as usize)
             .map(StableSlot::incarnation_high_water)
+    }
+
+    pub(crate) fn has_insert_capacity(&self) -> bool {
+        self.slots.iter().any(|slot| {
+            matches!(
+                slot.storage,
+                SlotStorage::Vacant { high_water } if high_water != u64::MAX
+            )
+        })
     }
 
     pub fn insert(&mut self, payload: T) -> Result<SlotHandle<K>, RefusedInsert<T>> {
@@ -485,6 +594,142 @@ impl<'a, T, K> StableSlots<'a, T, K> {
                 found: storage.state(),
             }),
         }
+    }
+
+    pub(crate) fn find_occupied_handle(
+        &self,
+        mut predicate: impl FnMut(&T) -> bool,
+    ) -> Option<SlotHandle<K>> {
+        for (index, slot) in self.slots.iter().enumerate() {
+            let SlotStorage::Occupied {
+                incarnation,
+                payload,
+            } = &slot.storage
+            else {
+                continue;
+            };
+            if predicate(payload) {
+                return Some(SlotHandle {
+                    table: self.table,
+                    epoch: self.epoch,
+                    index: index as u32,
+                    incarnation: *incarnation,
+                    kind: PhantomData,
+                });
+            }
+        }
+        None
+    }
+
+    pub(crate) fn find_unique_occupied_handle(
+        &self,
+        mut predicate: impl FnMut(&T) -> bool,
+    ) -> Result<Option<SlotHandle<K>>, ()> {
+        let mut found = None;
+        for (index, slot) in self.slots.iter().enumerate() {
+            let SlotStorage::Occupied {
+                incarnation,
+                payload,
+            } = &slot.storage
+            else {
+                continue;
+            };
+            if !predicate(payload) {
+                continue;
+            }
+            if found.is_some() {
+                return Err(());
+            }
+            found = Some(SlotHandle {
+                table: self.table,
+                epoch: self.epoch,
+                index: index as u32,
+                incarnation: *incarnation,
+                kind: PhantomData,
+            });
+        }
+        Ok(found)
+    }
+
+    /// Safety: `apply` is owner-table code, does not move, replace, or drop the
+    /// payload, and performs no wait, reentry, or borrow escape.
+    pub(crate) unsafe fn with_occupied_mut<R>(
+        &mut self,
+        handle: SlotHandle<K>,
+        apply: impl FnOnce(&mut T) -> R,
+    ) -> Result<R, SlotRefusal> {
+        let index = self.checked_index(handle)?;
+        self.check_incarnation(index, handle.incarnation.get())?;
+        match &mut self.slots[index].storage {
+            SlotStorage::Occupied { payload, .. } => Ok(apply(payload)),
+            storage => Err(SlotRefusal::WrongState {
+                expected: SlotState::Occupied,
+                found: storage.state(),
+            }),
+        }
+    }
+
+    /// Safety: the exact handle passed `get` or `can_mark_terminal` and no row
+    /// mutation occurs between that prevalidation and this sole-owner call.
+    pub(crate) unsafe fn with_occupied_mut_validated<R>(
+        &mut self,
+        handle: SlotHandle<K>,
+        apply: impl FnOnce(&mut T) -> R,
+    ) -> R {
+        let index = handle.index as usize;
+        match &mut self.slots[index].storage {
+            SlotStorage::Occupied {
+                incarnation,
+                payload,
+            } if *incarnation == handle.incarnation => apply(payload),
+            _ => unsafe { core::hint::unreachable_unchecked() },
+        }
+    }
+
+    /// Safety: `apply` obeys `with_occupied_mut` and returns `input` unchanged
+    /// on every refused payload transition.
+    pub(crate) unsafe fn with_occupied_mut_input<I, R>(
+        &mut self,
+        handle: SlotHandle<K>,
+        input: I,
+        apply: impl FnOnce(&mut T, I) -> R,
+    ) -> Result<R, (SlotRefusal, I)> {
+        let index = match self.checked_index(handle) {
+            Ok(index) => index,
+            Err(reason) => return Err((reason, input)),
+        };
+        if let Err(reason) = self.check_incarnation(index, handle.incarnation.get()) {
+            return Err((reason, input));
+        }
+        match &mut self.slots[index].storage {
+            SlotStorage::Occupied { payload, .. } => Ok(apply(payload, input)),
+            storage => Err((
+                SlotRefusal::WrongState {
+                    expected: SlotState::Occupied,
+                    found: storage.state(),
+                },
+                input,
+            )),
+        }
+    }
+
+    pub(crate) fn validate_epoch_rebind(&self) -> Result<(), SlotEpochRebindRefusal> {
+        for (index, slot) in self.slots.iter().enumerate() {
+            let state = slot.state();
+            if !matches!(state, SlotState::Vacant | SlotState::Retired) {
+                return Err(SlotEpochRebindRefusal {
+                    index: index as u32,
+                    state,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Safety: all canonical arrays passed read-only rebind validation, every
+    /// old authority is drained, and `epoch` is their exact sealed successor.
+    pub(crate) unsafe fn apply_epoch_rebind(&mut self, epoch: TransportEpoch) {
+        self.epoch = epoch;
     }
 
     pub fn mark_tombstone(

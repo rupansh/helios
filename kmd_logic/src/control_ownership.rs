@@ -1357,6 +1357,18 @@ impl<E> ResourceFinish<E> {
     ) {
         (self.effect, self.destroy, self.attachment_release)
     }
+
+    pub(crate) const fn from_parts(
+        effect: ResourceFinishEffect<E>,
+        destroy: Option<DestroyBacking>,
+        attachment_release: Option<ReleasedAttachmentLease>,
+    ) -> Self {
+        Self {
+            effect,
+            destroy,
+            attachment_release,
+        }
+    }
 }
 
 #[must_use]
@@ -1850,6 +1862,31 @@ impl<B> ResourceLifecycle<B> {
         })
     }
 
+    pub(crate) fn can_reset(&self, resource: TransportResource, reset: &TransportReset) -> bool {
+        self.check_resource(resource).is_ok()
+            && reset.retired_epoch() == self.resource.epoch()
+            && self.phase != ResourcePhase::Terminal
+    }
+
+    pub(crate) fn reset_consume(
+        mut self,
+        resource: TransportResource,
+        reset: &TransportReset,
+    ) -> Result<(B, Option<ReleasedAttachmentLease>), (Self, Option<ReleasedAttachmentLease>)> {
+        let reset_result = match self.transport_reset(resource, reset) {
+            Ok(reset_result) => reset_result,
+            Err(_) => return Err((self, None)),
+        };
+        let (authority, release) = reset_result.into_parts();
+        match self.consume_terminal(authority) {
+            Ok(backing) => Ok((backing, release)),
+            Err(refused) => {
+                let (lifecycle, _) = refused.into_parts();
+                Err((lifecycle, release))
+            }
+        }
+    }
+
     pub fn consume_terminal(
         self,
         authority: DestroyBacking,
@@ -2245,6 +2282,13 @@ impl<E> WindowFinish<E> {
     pub fn into_parts(self) -> (WindowFinishEffect<E>, Option<ReleaseWindow>) {
         (self.effect, self.release)
     }
+
+    pub(crate) const fn from_parts(
+        effect: WindowFinishEffect<E>,
+        release: Option<ReleaseWindow>,
+    ) -> Self {
+        Self { effect, release }
+    }
 }
 
 #[must_use]
@@ -2483,6 +2527,30 @@ impl<R> WindowLifecycle<R> {
         let authority = WindowReleaseAuthorityKind::TransportReset(reset.retired_epoch());
         self.release(authority);
         Ok(self.release_token(authority))
+    }
+
+    pub(crate) fn can_reset(&self, window: TransportWindow, reset: &TransportReset) -> bool {
+        self.check_window(window).is_ok()
+            && reset.retired_epoch() == self.window.epoch()
+            && self.phase != WindowPhase::Unmapped
+    }
+
+    pub(crate) fn reset_consume(
+        mut self,
+        window: TransportWindow,
+        reset: &TransportReset,
+    ) -> Result<R, Self> {
+        let authority = match self.transport_reset(window, reset) {
+            Ok(authority) => authority,
+            Err(_) => return Err(self),
+        };
+        match self.consume_unmapped(authority) {
+            Ok(reservation) => Ok(reservation),
+            Err(refused) => {
+                let (lifecycle, _) = refused.into_parts();
+                Err(lifecycle)
+            }
+        }
     }
 
     pub fn consume_unmapped(self, authority: ReleaseWindow) -> Result<R, RefusedReleaseWindow<R>> {
