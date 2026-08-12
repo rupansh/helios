@@ -10,8 +10,6 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use helios_kmd_logic::snapshot_bind::SnapshotDescriptor;
-
 use crate::dxgk::*;
 
 // Legal retry status for DxgkDdiPresent when either the DMA or patch buffer
@@ -40,14 +38,12 @@ const D3D12_SUBMISSION_MAGIC: u32 = 0x4844_3132; // "HD12"
 pub(crate) const PRESENT_FLIP_PRIVATE_OFFSET: usize = 32;
 
 /// `DmaBufferPrivateDataSize` this driver requests per context (`device.rs`'s
-/// CreateContext reads it from here). 40 bytes until D4b; the snapshot
-/// descriptor grew [`PresentFlipPrivate`] by 32 bytes, and this is the OTHER
-/// half of the "deliberate change to BOTH sites" the compile-time proof below
-/// demands.
-pub(crate) const PRESENT_DMA_PRIVATE_DATA_BYTES: u32 = 88;
+/// CreateContext reads it from here). The D4 record is exactly 32 bytes and
+/// carries only the OS allocation/address/segment/operation pairing.
+pub(crate) const PRESENT_DMA_PRIVATE_DATA_BYTES: u32 = 64;
 
 const PRESENT_FLIP_MAGIC: u32 = 0x4850_464C; // "HPFL"
-const PRESENT_FLIP_VERSION: u32 = 1;
+const PRESENT_FLIP_VERSION: u32 = 2;
 
 /// KMD-private flip record for the DMA-BUFFER FLIP contract.
 ///
@@ -77,30 +73,18 @@ const PRESENT_FLIP_VERSION: u32 = 1;
 pub(crate) struct PresentFlipPrivate {
     magic: u32,
     version: u32,
-    /// `hDeviceSpecificAllocation` of the flip source — the exact identity
-    /// `create_allocation::scanout_alloc_info` resolves, same as the handle
-    /// `SetVidPnSourceAddress` supplies on the MMIO path.
+    /// `hDeviceSpecificAllocation` of the flip source. Its immutable per-open
+    /// association resolves the same exact allocation identity supplied by
+    /// `SetVidPnSourceAddress` on the MMIO path.
     allocation: u64,
     /// `DXGK_ALLOCATIONLIST::PhysicalAddress` of that allocation. This is what
     /// a later CRTC_VSYNC must carry for dxgkrnl to retire the flip.
     physical_address: u64,
-    /// D4b snapshot BIND-TARGET substitution, carried BY VALUE (never a
-    /// pointer, never an allocation handle): the venus resource the KMD binds
-    /// and flushes INSTEAD of `allocation`'s own, already validated at the
-    /// Present DDI (`helios_kmd_logic::snapshot_bind::validate`). 0 = no
-    /// substitution — every pre-snapshot flip. The FLIP bookkeeping (epoch
-    /// stamp, `physical_address`, CRTC_VSYNC retirement) stays entirely on
-    /// `allocation` regardless.
-    snap_resid: u32,
-    snap_width: u32,
-    snap_height: u32,
-    snap_pitch: u32,
-    snap_dxgi_format: u32,
-    /// Validated `<= u32::MAX` at Present, so the wire's u64 narrows honestly.
-    snap_plane_offset: u32,
-    /// The undersize guard's right-hand side, meaningful only with
-    /// `snap_resid != 0`.
-    snap_alloc_size: u64,
+    /// Exact allocation-list segment paired with `physical_address`.
+    primary_segment: u32,
+    /// Exact operation flags for this handoff (zero for the current DMA flip
+    /// packet; classic SetVidPn carries its WDK flags directly).
+    operation_flags: u32,
 }
 
 impl PresentFlipPrivate {
@@ -115,7 +99,8 @@ impl PresentFlipPrivate {
         private_size: u32,
         allocation: HANDLE,
         physical_address: u64,
-        snapshot: Option<SnapshotDescriptor>,
+        primary_segment: u32,
+        operation_flags: u32,
     ) -> Result<(), NTSTATUS> {
         if private_data.is_null()
             || (private_size as usize)
@@ -123,32 +108,13 @@ impl PresentFlipPrivate {
         {
             return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
         }
-        // A `None` writes an all-zero descriptor: `snap_resid == 0` is the one
-        // no-substitution sentinel, so a recycled buffer's stale descriptor
-        // bytes can never be mistaken for a carried one.
-        let snap = snapshot.unwrap_or(SnapshotDescriptor {
-            resource_id: 0,
-            width: 0,
-            height: 0,
-            pitch: 0,
-            dxgi_format: 0,
-            plane_offset: 0,
-            venus_alloc_size: 0,
-            memory_type_index: 0,
-            purpose: 0,
-        });
         let record = PresentFlipPrivate {
             magic: PRESENT_FLIP_MAGIC,
             version: PRESENT_FLIP_VERSION,
             allocation: allocation as usize as u64,
             physical_address,
-            snap_resid: snap.resource_id,
-            snap_width: snap.width,
-            snap_height: snap.height,
-            snap_pitch: snap.pitch,
-            snap_dxgi_format: snap.dxgi_format,
-            snap_plane_offset: snap.plane_offset as u32,
-            snap_alloc_size: snap.venus_alloc_size,
+            primary_segment,
+            operation_flags,
         };
         // SAFETY: the size check above proves the record fits at its offset;
         // unaligned because dxgkrnl makes no alignment promise about the
@@ -170,17 +136,13 @@ impl PresentFlipPrivate {
     /// or BLT-only private buffer cannot be mistaken for a flip, and the read
     /// CONSUMES the record so a recycled buffer cannot replay it.
     ///
-    /// The third tuple element is the D4b snapshot descriptor the Present DDI
-    /// validated and carried, or `None` (`snap_resid == 0`) for an ordinary
-    /// flip.
-    ///
     /// # Safety
     /// `private_data` points to `private_size` writable bytes from the DMA
     /// submission dxgkrnl is handing back.
     pub(crate) unsafe fn take(
         private_data: *mut c_void,
         private_size: u32,
-    ) -> Option<(HANDLE, u64, Option<SnapshotDescriptor>)> {
+    ) -> Option<(HANDLE, u64, u32, u32)> {
         if private_data.is_null()
             || (private_size as usize)
                 < PRESENT_FLIP_PRIVATE_OFFSET + core::mem::size_of::<PresentFlipPrivate>()
@@ -211,25 +173,11 @@ impl PresentFlipPrivate {
         //
         // SAFETY: same slot, same size check; only the magic word is written.
         unsafe { core::ptr::write_unaligned(slot.cast::<u32>(), 0) };
-        let snapshot = if record.snap_resid != 0 {
-            Some(SnapshotDescriptor {
-                resource_id: record.snap_resid,
-                width: record.snap_width,
-                height: record.snap_height,
-                pitch: record.snap_pitch,
-                dxgi_format: record.snap_dxgi_format,
-                plane_offset: record.snap_plane_offset as u64,
-                venus_alloc_size: record.snap_alloc_size,
-                memory_type_index: 0,
-                purpose: 0,
-            })
-        } else {
-            None
-        };
         Some((
             record.allocation as usize as HANDLE,
             record.physical_address,
-            snapshot,
+            record.primary_segment,
+            record.operation_flags,
         ))
     }
 }

@@ -41,6 +41,13 @@ pub(crate) use segments::{BarSegment, PagingRam};
 /// Move-only proof that this exact adapter has no installed transport.
 pub(crate) struct TransportAbsent {
     adapter: usize,
+    installable: bool,
+}
+
+impl TransportAbsent {
+    pub(crate) const fn installable(&self) -> bool {
+        self.installable
+    }
 }
 
 /// Everything `DxgkDdiStartDevice` establishes, as one value published once.
@@ -519,6 +526,21 @@ pub struct AdapterContext {
     /// boot-stack budget; see `VirtioGpu::init`.
     /// Guarded by `virtio_lock`; `None` until StartDevice (and after StopDevice).
     virtio: UnsafeCell<Option<Box<VirtioGpu>>>,
+    /// Read-only DIRQL publication of the fixed interrupt-synchronized D4
+    /// queue. Zero outside a fully installed owner-enabled transport.
+    ///
+    /// The pointee is the separately boxed `InterruptQueue` owned by the
+    /// heap-backed `VirtioGpu`. Installation publishes it only after the GPU Box
+    /// is in `virtio`; removal withdraws it before taking that owner Box out.
+    d4_dirql_queue: AtomicUsize,
+    /// Sequence-consistent hazard count for the raw D4 queue publication.
+    /// The DIRQL publisher and PASSIVE physical reset both increment before
+    /// rechecking the pointer; teardown first clears the pointer and may free
+    /// the Box only after observing zero.
+    d4_dirql_readers: AtomicU32,
+    /// Sticky fail-closed latch. If teardown catches a live DIRQL reader it
+    /// retains the transport and prevents both replacement and adapter free.
+    d4_dirql_transport_retained: AtomicU32,
     transport_owner: TransportOwner,
     /// PASSIVE-level serialization for scanout selection versus allocation
     /// destruction. A Windows primary can be replaced while an asynchronous
@@ -1118,6 +1140,9 @@ impl AdapterContext {
             isr_status: AtomicUsize::new(0),
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
+            d4_dirql_queue: AtomicUsize::new(0),
+            d4_dirql_readers: AtomicU32::new(0),
+            d4_dirql_transport_retained: AtomicU32::new(0),
             transport_owner,
             // Zeroed placeholder — initialized in place by init_kernel_events.
             scanout_mutex: UnsafeCell::new(unsafe { core::mem::zeroed() }),
@@ -1683,10 +1708,35 @@ impl AdapterContext {
 
     pub(crate) fn reset_virtio_physical(
         &self,
+        passive: crate::irql::PassiveLevel,
         expected_instance: u64,
     ) -> Result<u32, crate::virtio::VirtioError> {
-        self.with_virtio(|gpu| gpu.physical_reset_and_abort(expected_instance))
-            .map_err(|_| crate::virtio::VirtioError::DeviceError)?
+        if !crate::virtio::KMD_D2_OWNER_ENABLED {
+            return Err(crate::virtio::VirtioError::DeviceError);
+        }
+        let raw = self.d4_dirql_queue.load(Ordering::SeqCst);
+        let Some(queue) = NonNull::new(raw as *mut crate::virtio::gpu::InterruptQueue) else {
+            return Err(crate::virtio::VirtioError::DeviceError);
+        };
+        self.d4_dirql_readers.fetch_add(1, Ordering::SeqCst);
+        if self.d4_dirql_queue.load(Ordering::SeqCst) != raw {
+            self.d4_dirql_readers.fetch_sub(1, Ordering::SeqCst);
+            return Err(crate::virtio::VirtioError::DeviceError);
+        }
+        // SAFETY: the same increment-recheck hazard used by the DIRQL publisher
+        // pins the separately boxed queue. Unlike that publisher, this phase
+        // retains the caller's real PASSIVE_LEVEL and may therefore perform PCI
+        // configuration status access without holding `virtio_lock`.
+        let reset = unsafe { queue.as_ref().reset_status_and_poll(passive, expected_instance) };
+        self.d4_dirql_readers.fetch_sub(1, Ordering::SeqCst);
+        let (status, spins) = reset?;
+        // The device is now reset. Re-enter the ordinary transport lock only to
+        // retire value/DMA-buffer bookkeeping; no PCI callback or wait occurs
+        // in this phase.
+        self.with_virtio(|gpu| {
+            gpu.finish_physical_reset_and_abort(expected_instance, status, spins)
+        })
+        .map_err(|_| crate::virtio::VirtioError::DeviceError)?
     }
 
     /// Seal new canonical owner admissions while leaving the live transport
@@ -1724,7 +1774,7 @@ impl AdapterContext {
         if prepared_instance != expected_instance {
             return Err(crate::virtio::VirtioError::DeviceError);
         }
-        let raw_status = self.reset_virtio_physical(expected_instance)?;
+        let raw_status = self.reset_virtio_physical(passive, expected_instance)?;
         self.transport_owner.finish_physical_reset(raw_status)
     }
 
@@ -1750,6 +1800,18 @@ impl AdapterContext {
         new: Box<VirtioGpu>,
     ) -> Result<(), crate::virtio::VirtioError> {
         debug_assert_eq!(absent.adapter, self as *const Self as usize);
+        if !absent.installable
+            || self.d4_dirql_transport_retained.load(Ordering::Acquire) != 0
+            || self.d4_dirql_readers.load(Ordering::SeqCst) != 0
+        {
+            return match VirtioGpu::reset_unpublished_or_retain(passive, new) {
+                Ok(()) => Err(crate::virtio::VirtioError::DeviceError),
+                Err(error) => Err(error),
+            };
+        }
+        let d4_queue = crate::virtio::KMD_D2_OWNER_ENABLED
+            .then(|| new.interrupt_queue() as *const crate::virtio::gpu::InterruptQueue as usize)
+            .unwrap_or(0);
         // SAFETY: this method's contract binds `new` to this exact adapter and
         // serialized install transition. The observer either remains dormant or
         // constructs/reopens the canonical table from this fully configured
@@ -1764,7 +1826,7 @@ impl AdapterContext {
                 // before entering the install transition. Make the interrupt
                 // path inert before a verified reset is allowed to drop it.
                 self.isr_status.store(0, Ordering::Release);
-                return match VirtioGpu::reset_unpublished_or_retain(new) {
+                return match VirtioGpu::reset_unpublished_or_retain(passive, new) {
                     Ok(()) => Err(error),
                     Err(reset_error) => Err(reset_error),
                 };
@@ -1774,10 +1836,92 @@ impl AdapterContext {
         // installs the already-owned Box (no allocation, no device I/O).
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };
         let slot = unsafe { &mut *self.virtio.get() };
-        debug_assert!(slot.is_none());
+        if !slot.is_none()
+            || self.d4_dirql_transport_retained.load(Ordering::Acquire) != 0
+            || self.d4_dirql_readers.load(Ordering::SeqCst) != 0
+        {
+            unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
+            self.isr_status.store(0, Ordering::Release);
+            return match VirtioGpu::reset_unpublished_or_retain(passive, new) {
+                Ok(()) => Err(crate::virtio::VirtioError::DeviceError),
+                Err(error) => Err(error),
+            };
+        }
         *slot = Some(new);
+        // Publish while the owning Box is already installed and before the
+        // transport lock opens a teardown window. Publishing after unlock
+        // would let StopDevice remove/drop the Box and then leave this raw
+        // pointer dangling.
+        self.d4_dirql_queue.store(d4_queue, Ordering::SeqCst);
         unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
         Ok(())
+    }
+
+    /// Publish one exact D4 SET from the classic DDI's above-DISPATCH arm.
+    ///
+    /// The raw pointer never escapes this narrow operation. Its lifetime is
+    /// paired with `install_virtio` publication and a sequence-consistent hazard
+    /// around the withdrawal in
+    /// `remove_virtio_and_reset_scanout_bind_generation`.
+    pub(crate) unsafe fn enqueue_d4_scanout_dirql(
+        &self,
+        proof: &crate::ddi::display::SetVidPnDirql<'_>,
+        work: crate::ddi::direct_scanout::QueuedDirectScanoutBinding,
+    ) -> Result<(), crate::virtio::VirtioError> {
+        if !crate::virtio::KMD_D2_OWNER_ENABLED {
+            return Err(crate::virtio::VirtioError::DeviceError);
+        }
+        let raw = self.d4_dirql_queue.load(Ordering::SeqCst);
+        let Some(queue) = NonNull::new(raw as *mut crate::virtio::gpu::InterruptQueue) else {
+            return Err(crate::virtio::VirtioError::DeviceError);
+        };
+        self.d4_dirql_readers.fetch_add(1, Ordering::SeqCst);
+        if self.d4_dirql_queue.load(Ordering::SeqCst) != raw {
+            self.d4_dirql_readers.fetch_sub(1, Ordering::SeqCst);
+            return Err(crate::virtio::VirtioError::DeviceError);
+        }
+        // SAFETY: the hazard increment plus pointer recheck prevents teardown
+        // from dropping this Box until the matching decrement below. Queue-core
+        // exclusion is enforced independently inside `InterruptQueue`.
+        let result = unsafe { queue.as_ref().enqueue_direct_at_dirql(proof, self, work) };
+        self.d4_dirql_readers.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+
+    pub(crate) fn enqueue_d4_scanout_dispatch(
+        &self,
+        work: crate::ddi::direct_scanout::QueuedDirectScanoutBinding,
+    ) -> Result<(), crate::virtio::VirtioError> {
+        if !crate::virtio::KMD_D2_OWNER_ENABLED {
+            return Err(crate::virtio::VirtioError::DeviceError);
+        }
+        self.with_virtio(move |gpu| gpu.enqueue_direct_scanout_dispatch(self, work))
+            .map_err(|_| crate::virtio::VirtioError::DeviceError)?
+    }
+
+    pub(crate) fn d4_queue_holds_allocation(
+        &self,
+        handle: usize,
+        generation: u64,
+        resource_id: u32,
+    ) -> bool {
+        if self.d4_dirql_transport_retained.load(Ordering::Acquire) != 0 {
+            return true;
+        }
+        match self.with_virtio(|gpu| {
+            gpu.direct_queue_holds_allocation(handle, generation, resource_id)
+        }) {
+            Ok(Ok(holds)) => holds,
+            // A live transport whose queue cannot be observed is ambiguous;
+            // retain the backing. No transport means no fixed descriptor can
+            // still reference it.
+            Ok(Err(_)) => true,
+            Err(_) => self.d4_dirql_transport_retained.load(Ordering::Acquire) != 0,
+        }
+    }
+
+    pub(crate) fn d4_dirql_transport_retained(&self) -> bool {
+        self.d4_dirql_transport_retained.load(Ordering::Acquire) != 0
     }
 
     /// Remove the old transport and begin one fresh scanout-bind namespace.
@@ -1791,31 +1935,62 @@ impl AdapterContext {
         &self,
         passive: crate::irql::PassiveLevel,
     ) -> TransportAbsent {
+        self.d4_dirql_queue.store(0, Ordering::SeqCst);
         // SAFETY: `virtio_lock` excludes every producer and the DPC's composite
         // bind apply. Replacing with None before the tuple reset makes any later
         // DPC inert; a DPC already applying drains before this acquire returns.
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };
+        // Repeat withdrawal under the owner lock. The first store blocks new
+        // readers promptly; this one also defeats any concurrent install that
+        // published while teardown was waiting to acquire the lock.
+        self.d4_dirql_queue.store(0, Ordering::SeqCst);
+        // The reader decision belongs under this lock. Installation publishes
+        // its pointer before releasing the same lock, so withdrawal cannot
+        // observe zero readers and then race a newly published old-generation
+        // pointer into existence.
+        let d4_quiescent = self.d4_dirql_transport_retained.load(Ordering::Acquire) == 0
+            && (!crate::virtio::KMD_D2_OWNER_ENABLED
+                || self.d4_dirql_readers.load(Ordering::SeqCst) == 0);
         let old = core::mem::replace(unsafe { &mut *self.virtio.get() }, None);
-        self.scanout_bind_next_seq.store(0, Ordering::Relaxed);
-        self.scanout_bind_wire_seq.store(0, Ordering::Relaxed);
-        self.scanout_bind_applied_seq.store(0, Ordering::Relaxed);
-        self.scanout_bind_wire_resource.store(0, Ordering::Relaxed);
+        if d4_quiescent {
+            self.scanout_bind_next_seq.store(0, Ordering::Relaxed);
+            self.scanout_bind_wire_seq.store(0, Ordering::Relaxed);
+            self.scanout_bind_applied_seq.store(0, Ordering::Relaxed);
+            self.scanout_bind_wire_resource.store(0, Ordering::Relaxed);
+        }
+        if !d4_quiescent && old.is_some() {
+            // Publish the permanent-retain decision before releasing the outer
+            // transport lock. A concurrent DestroyAllocation that then observes
+            // `virtio=None` must still retain its canonical backing row.
+            self.d4_dirql_transport_retained.store(1, Ordering::Release);
+        }
         unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
         let old_owner_instance = old.as_ref().map(|gpu| gpu.scanout_transport_instance());
-        // Dropped here, at PASSIVE_LEVEL, outside the lock.
-        drop(old);
-        if let Some(physical_instance) = old_owner_instance {
-            self.transport_owner.observe_removed_transport(
-                passive,
-                NonNull::from(self),
-                physical_instance,
-            );
+        if !d4_quiescent && old.is_some() {
+            // A reader that crossed withdrawal still owns a reference to the
+            // queue. Retain the complete transport and fail all later install /
+            // adapter-free attempts rather than race its pointer or custody.
+            crate::diag::record_named_bytes(b"D4QRetain", 1);
+            core::mem::forget(old);
         } else {
-            self.transport_owner
-                .observe_transport_slot_absent(passive, NonNull::from(self));
+            // Dropped here, at PASSIVE_LEVEL, outside the lock.
+            drop(old);
+        }
+        if d4_quiescent {
+            if let Some(physical_instance) = old_owner_instance {
+                self.transport_owner.observe_removed_transport(
+                    passive,
+                    NonNull::from(self),
+                    physical_instance,
+                );
+            } else {
+                self.transport_owner
+                    .observe_transport_slot_absent(passive, NonNull::from(self));
+            }
         }
         TransportAbsent {
             adapter: self as *const Self as usize,
+            installable: d4_quiescent,
         }
     }
 

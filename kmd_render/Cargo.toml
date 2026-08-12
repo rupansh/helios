@@ -38,7 +38,10 @@ bytemuck = { version = "1", default-features = false, features = ["derive"] }
 # value and constructor return slot. Besides shrinking the hot queue object,
 # this is a kernel boot-stack requirement: StartDevice nests `VirtioGpu::init`
 # and `VirtQueue::new`, so each unused inline table is paid again on that path.
-virtio-drivers = { version = "0.13", default-features = false }
+# D4 also audits `VirtQueue::add` as part of its device-DIRQL call graph. Pin the
+# exact reviewed source and keep `alloc` disabled so that operation can only use
+# the crate's fixed direct-descriptor path.
+virtio-drivers = { version = "=0.13.0", default-features = false }
 
 [build-dependencies]
 wdk-build = "0.5"

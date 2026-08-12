@@ -245,6 +245,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // init keeps the ordering safe — otherwise assigning the new transport would
     // drop the old one (resetting the device) right after init configured it.
     let transport_absent = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
+    if !transport_absent.installable() {
+        return STATUS_DEVICE_NOT_READY;
+    }
     adapter.reset_display_publication_state();
     // Non-zero only if init below fails, so the display-half demotion can report
     // the status that actually killed the transport rather than a bare flag.
@@ -750,11 +753,11 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
             }
             crate::ddi::diag_etw::adapter_stop(adapter);
         }
-        if adapter.hpd_worker_may_be_running() {
-            // stop_hpd could not prove the worker exited, and the worker
-            // dereferences this context. Leak it deliberately: a permanent
-            // allocation leak is strictly better than freeing memory a live
-            // PASSIVE thread is still touching. StHpdX already recorded why.
+        if adapter.hpd_worker_may_be_running() || adapter.d4_dirql_transport_retained() {
+            // Either stop_hpd could not prove its worker exited, or D4 teardown
+            // caught an above-DISPATCH reader across queue withdrawal. Both can
+            // still dereference this context. Leak it deliberately: a permanent
+            // allocation leak is strictly better than freeing live memory.
             crate::diag::record(0x0C00_00E1);
         } else {
             // SAFETY: this pointer came from Box::into_raw in AddDevice; freed once.

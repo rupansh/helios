@@ -311,7 +311,10 @@ unsafe impl Hal for WdkHal {
         // nothing outside that module can reach `add` at all.
         //
         // SAFETY: `buffer` points to valid kernel memory for the duration, and
-        // by the above it is contiguous across `buffer.len()`.
+        // by the above it is contiguous across `buffer.len()`. WDK 28000 marks
+        // MmGetPhysicalAddress callable at any IRQL for a valid virtual address;
+        // the D4 source gate pins this as the only HAL call reached by the
+        // fixed device-DIRQL descriptor publication.
         let phys = unsafe { MmGetPhysicalAddress(buffer.as_ptr() as *mut _).QuadPart };
         phys as PhysAddr
     }

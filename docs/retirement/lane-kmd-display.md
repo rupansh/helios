@@ -400,20 +400,35 @@ parking remains strongly retained until a later successful nonzero replacement
 or transport reset. The parking blob is bounded adapter state, not the deleted
 LINEAR presentation fallback, not an OS allocation guess, and not user-visible.
 
-**7. The classic DDI's "nonblocking backend enqueue at interrupt level" is not
-satisfiable with the current virtio locking.**
+**7. The classic DDI's "nonblocking backend enqueue at interrupt level" is
+satisfied by dormant D4's fixed interrupt queue.**
 `doc:2785-2789` requires SetMPO3 to do "bounded validation/reference-taking and
 nonblocking backend enqueue" at interrupt level, and `doc:5093-5094` requires
 classic `SetVidPnSourceAddress` to be "entirely nonpageable and DIRQL-safe when
-MMIO flip is advertised". The existing nonblocking enqueue
-(`stage_scanout_bind`) takes the virtio DISPATCH spinlock, and `display.rs`
-records the reason it is unreachable from the DIRQL arm: "device DIRQL cannot
-take a DISPATCH spinlock" (`display.rs:1468-1473`). So either (a) MMIO flip is
-not advertised and the DDI is never entered at DIRQL, or (b) the virtio lane
-supplies a genuinely lock-free DIRQL-safe enqueue slot. **The doc does not
-choose.** *Conservative reading:* the DIRQL half does validation + candidate
-reference-taking with lock-free atomics **only**; the backend enqueue happens at
-the first ≤DISPATCH continuation. Do not claim a DIRQL enqueue we cannot do.
+MMIO flip is advertised". The legacy `stage_scanout_bind` still takes the
+virtio DISPATCH spinlock and is not used by D4. Owner-enabled StartDevice instead
+reserves four DMA buffers and separately boxes one interrupt queue. The classic
+callback performs only the reviewed immutable/atomic validation graph, moves
+the exact candidate into a fixed slot, and tries one nonblocking atomic
+exclusion gate shared with every normal queue mutator. It then publishes one
+direct descriptor and MMIO-notifies the device without allocation, wait,
+cleanup, diagnostics I/O, or a PASSIVE/DISPATCH lock. Contention refuses; it
+never spins. The raised-half capability is private, non-cloneable, !Send/!Sync,
+adapter-bound, rechecks current IRQL, and has one mint in the classic DDI. A
+source gate maintains an exact call/macro allowlist (including the pinned
+allocator-disabled virtio queue), audits the raised and synchronized transitive
+bodies, and mutation-tests hidden helpers/macros, dependency drift, forged
+capabilities, guard bypasses, pointer-lifetime ordering, and forbidden calls.
+The gate also keeps PCI transport status access out of the synchronized callback:
+`DxgkCbSynchronizeExecution` may be entered from `<= DISPATCH_LEVEL`, whereas
+`DxgkCbReadDeviceSpace`/`DxgkCbWriteDeviceSpace` are PASSIVE-only. Physical
+reset therefore has a separate `PassiveLevel`-typed, raw-queue-lifetime-pinned
+phase that finishes before re-entering `virtio_lock`; a mutation that raises it
+under that lock or into the DIRQL callback fails.
+Completion and D0 events occur in the ordinary DPC continuation after exact
+token/response provenance validation. This remains disabled while
+`KMD_D2_OWNER_ENABLED == false`; it is source proof, not runtime validation or
+activation approval.
 
 **8. `DestroyAllocation` versus "retain the exact allocation reference until
 replacement".**

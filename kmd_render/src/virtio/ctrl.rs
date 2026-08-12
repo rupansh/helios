@@ -303,7 +303,7 @@ fn wait_block(
         waited += this_slice;
         slice = (slice * 2).min(1_000);
         // Interrupt-loss tolerance: drain whatever completed.
-        let _ = adapter.with_virtio(|v| v.drain_used());
+        let _ = adapter.with_virtio(|v| v.drain_used(adapter));
     }
 }
 
@@ -530,7 +530,7 @@ fn ctrl_roundtrip_observed(
         let mut budget = Budget::new(ENQUEUE_RETRY_MAX_MS);
         let token: SyncTicket = loop {
             let res = adapter.with_virtio(move |v| {
-                v.drain_used();
+                v.drain_used(adapter);
                 let queued = if expected_instance
                     .is_some_and(|expected| expected != v.scanout_transport_instance())
                 {
@@ -610,7 +610,7 @@ fn ctrl_roundtrip_observed(
             // error class. Callers validate the exact returned response shape,
             // but the missing evidence was real.
             match adapter.with_virtio(|v| {
-                v.drain_used();
+                v.drain_used(adapter);
                 v.abandon_sync(token, block.as_ptr())
             }) {
                 // The drain or failure latch already signalled us; disposition
@@ -1458,7 +1458,7 @@ pub fn resource_flush_async(
     meta.as_mut_slice()[..request.len()].copy_from_slice(request);
 
     let queued = adapter.with_virtio(move |v| {
-        v.drain_used();
+        v.drain_used(adapter);
         v.enqueue_async_control(
             meta,
             request.len(),
@@ -2455,7 +2455,7 @@ fn submit_venus_async_inner(
     let mut budget = Budget::new(ENQUEUE_RETRY_MAX_MS);
     loop {
         let res = adapter.with_virtio(move |v| {
-            v.drain_used();
+            v.drain_used(adapter);
             match present_stream {
                 Some((stream_owner, cookie, value)) => v.enqueue_async_submit_present_stream(
                     stream_owner,
@@ -2584,7 +2584,7 @@ pub fn submit_venus_async_scanout(
     let notify = adapter.scanout_notify(primary_address, ticket);
 
     display_submit_outcome(adapter.with_virtio(move |v| {
-        v.drain_used();
+        v.drain_used(adapter);
         v.enqueue_scanout_submit(ctx_id, meta, venus, venus_len, notify)
     }))
 }
@@ -2607,7 +2607,7 @@ pub fn submit_venus_async_present(
     // ordinary app/DWM BLT must not mark the physical scanout dirty or wake the
     // display refresh worker.
     display_submit_outcome(adapter.with_virtio(move |v| {
-        v.drain_used();
+        v.drain_used(adapter);
         v.enqueue_async_submit(
             ctx_id,
             crate::virtio::gpu::SCANOUT_RING_IDX,
@@ -2631,7 +2631,7 @@ pub fn submit_venus_async_windowed_blt(
 ) -> Result<u64, VirtioError> {
     let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
     display_submit_outcome(adapter.with_virtio(move |v| {
-        v.drain_used();
+        v.drain_used(adapter);
         v.enqueue_async_submit_windowed_blt(
             adapter,
             ctx_id,
@@ -2704,7 +2704,7 @@ pub fn wait_fence(
         let mut full_retries = 0u32;
         loop {
             let prep = adapter.with_virtio(|v| {
-                v.drain_used();
+                v.drain_used(adapter);
                 v.fence_wait_prepare(fence_id, block.as_ptr())
             });
             match prep {
@@ -2753,7 +2753,7 @@ pub fn wait_fence(
             return completed_fence_outcome(block);
         }
         match adapter.with_virtio(|v| {
-            v.drain_used();
+            v.drain_used(adapter);
             v.fence_wait_cancel(block.as_ptr())
         }) {
             Ok(true) => completed_fence_outcome(block),

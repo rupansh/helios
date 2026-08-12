@@ -38,13 +38,13 @@
 //! token, `resid`, PID, process handle, …" paragraph on
 //! `protocol::wddm::HeliosWddmAllocationDescV2` — cite the SYMBOL: that block
 //! has moved twice and the `:355-361` this line used to carry now lands inside
-//! `HeliosWddmPlaneRecordV2`), and `DXGK_OPENALLOCATIONINFO::hAllocation` is dxgkrnl's runtime
-//! token, not this driver's `AllocationContext*` — so **the open path cannot
-//! resolve a host resource id at all**, and no adapter-global table may be added
-//! to bridge it (§3:373-379, §13.3:3398-3406). The replacement is a different
-//! mechanism, not a different field: the ICD stops naming host resources and the
-//! KMD patches the host resid in from `HeliosNativeRenderPatch`. That is mesa
-//! lane unit **A3** plus K6.
+//! `HeliosWddmPlaneRecordV2`). `DXGK_OPENALLOCATIONINFO::hAllocation` is
+//! dxgkrnl's runtime token, but WDK supplies `DxgkCbGetHandleData` at PASSIVE
+//! OpenAllocation time. D4 uses that documented callback to associate the
+//! resulting device-specific open object with this driver's exact
+//! `AllocationContext`; no adapter-global table or reverse lookup is involved.
+//! The guest still receives no host resource id: K6 patches host operands from
+//! the canonical allocation owner.
 //!
 //! ⇒ [`dxgkddi_open_allocation`] therefore publishes **no** [`PresentAllocInfo`]
 //! and counts every such open in `OaNoRid`. `present_alloc_info` answers `None`,
@@ -61,6 +61,7 @@
 //! checked per-arm, not against a max-union.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -628,7 +629,7 @@ static PRIMARY_COPY_ORPHAN_RETAINED: AtomicU32 = AtomicU32::new(0);
 /// names sharing a 14-byte prefix would MERGE into one registry value — a
 /// refusal counter reading someone else's number. Same guard
 /// `diag::FaultCounter` and `native_fence.rs` use.
-const RETIREMENT_COUNTER_NAMES: [&[u8]; 31] = [
+const RETIREMENT_COUNTER_NAMES: [&[u8]; 32] = [
     b"AcOk",
     b"AcMagic",
     b"AcHwa2Rej",
@@ -657,6 +658,7 @@ const RETIREMENT_COUNTER_NAMES: [&[u8]; 31] = [
     // truncation assert of its own, so this list is the only thing standing
     // between it and a silent merge with another value.
     b"OaNoRid",
+    b"OaBadH",
     b"PrNoRid",
     b"AcGenEpoch",
     b"AcOptLin",
@@ -770,6 +772,11 @@ static ALLOC_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
             // would force a registry write per create on that lane's hot path.
             failure: false,
         },
+        crate::diag::CounterEntry {
+            name: b"OaBadH",
+            value: crate::diag::CounterRef::U32(&OPEN_ALLOC_BAD_HANDLE),
+            failure: true,
+        },
     ],
     ticks: &ALLOC_FLUSH_TICKS,
     failures: &ALLOC_FLUSH_FAILURES,
@@ -807,6 +814,13 @@ const DXGK_OPENALLOCATION_FLAG_CREATE: u32 = 0x0000_0001;
 #[repr(C)]
 struct OpenAllocationContext {
     magic: u32,
+    /// Exact KMD allocation object resolved from dxgkrnl's per-device runtime
+    /// handle by `DxgkCbGetHandleData` while OpenAllocation is at PASSIVE_LEVEL.
+    ///
+    /// This is the documented open-object association, not a resource-id reverse
+    /// lookup.  The value is immutable for the open's lifetime and is read later
+    /// only while dxgkrnl keeps this device-specific open handle live.
+    allocation: usize,
     /// Validated immutable view captured from open-time private data. Present
     /// receives only this device-specific open handle, so it must use this
     /// snapshot rather than trying to reinterpret dxgkrnl's runtime token as an
@@ -1231,14 +1245,13 @@ unsafe fn open_allocation_context<'a>(h: HANDLE) -> Option<&'a OpenAllocationCon
 /// the present allocation list, or a handle outlived its CloseAllocation.
 static OPEN_ALLOC_BAD_HANDLE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-/// Count a refused handle, mirroring on a bounded cadence — this is the Present
-/// path, so an unthrottled `record_named_bytes` would be a per-frame registry
-/// write.
+/// Count a refused handle without doing any diagnostics I/O.
+///
+/// D4 also resolves this object from the DMA-flip arm at DISPATCH_LEVEL, so the
+/// resolver's complete transitive body must remain atomics-only.  The existing
+/// PASSIVE allocation-counter dump mirrors the value instead.
 fn refuse_open_allocation_handle() {
-    let n = OPEN_ALLOC_BAD_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
-    if n == 1 || n % 64 == 0 {
-        crate::diag::record_named_bytes(b"OaBadH", n);
-    }
+    OPEN_ALLOC_BAD_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Trace-only identity for a Present allocation-list entry. Call ONLY from
@@ -1313,6 +1326,10 @@ pub(crate) struct DirectScanoutAllocationFacts {
     pub resource_id: u32,
     pub allocation_generation: u64,
     pub transport_instance: u64,
+    /// Exact host backing extent captured by the allocation object at create.
+    /// Keeping it in this immutable projection lets DIRQL admission prove the
+    /// HWA2 byte range without taking the canonical-owner DISPATCH spinlock.
+    pub backing_size: u64,
 }
 
 /// Resolve the exact OS-supplied `hAllocation` to its final HWA2 facts.
@@ -1341,7 +1358,29 @@ pub(crate) unsafe fn direct_scanout_allocation_facts(
         resource_id: ctx.resource_id,
         allocation_generation: ctx.generation,
         transport_instance: ctx.transport_instance,
+        backing_size: ctx.venus_alloc_size,
     })
+}
+
+/// Resolve a live device-specific open handle to the exact KMD allocation that
+/// dxgkrnl associated with it at OpenAllocation.
+///
+/// There is deliberately no resource-id, dimension, list-order, or current-
+/// scanout fallback.  A missing association is a typed refusal.
+///
+/// # Safety
+/// `h` must be an `hDeviceSpecificAllocation` supplied by dxgkrnl for the
+/// duration of a DDI that keeps the open object live.
+pub(crate) unsafe fn open_direct_scanout_allocation_facts(
+    h: HANDLE,
+) -> Option<(HANDLE, DirectScanoutAllocationFacts)> {
+    let open = unsafe { open_allocation_context(h) }?;
+    if open.allocation == 0 {
+        return None;
+    }
+    let allocation = open.allocation as HANDLE;
+    let facts = unsafe { direct_scanout_allocation_facts(allocation) }?;
+    Some((allocation, facts))
 }
 
 /// Geometry `DxgkDdiDescribeAllocation` reports, from a magic-checked handle.
@@ -2157,105 +2196,6 @@ pub(crate) unsafe fn set_hlm1_binding(h: HANDLE, offset: u64) {
     }
 }
 
-/// Direct-scan-out allocations, keyed by venus resource id.
-///
-/// WHY IT EXISTS. `DxgkDdiPresent` receives only `hDeviceSpecificAllocation`
-/// (an `OpenAllocationContext*`), while the scan-out path keys on the GLOBAL
-/// allocation handle (`AllocationContext*`) that `DxgkDdiSetVidPnSourceAddress`
-/// supplies. On the MMIO flip path that DDI hands the global handle over; on
-/// the DMA-BUFFER FLIP path it is never called, so Present has to bridge the
-/// two itself. There is no back-pointer to bridge with — `DXGK_OPENALLOCATIONINFO`
-/// carries a `D3DKMT_HANDLE`, dxgkrnl's runtime token, NOT this driver's
-/// pointer — and the create-time private data is UMD-visible, so smuggling a
-/// kernel pointer through it would be both a leak and forgeable. The venus
-/// resource id is the one identity both sides already hold honestly.
-///
-/// Only DIRECT-SCAN-OUT allocations are registered, which is what keeps a fixed
-/// table adequate: DWM rotates 3 and an app's flip chain 2-4, so the live set is
-/// under ten even across a fullscreen transition.
-const SCANOUT_ALLOC_SLOTS: usize = 32;
-
-struct ScanoutAllocSlot {
-    resource_id: AtomicU32,
-    /// `AllocationContext*` as a `usize`. Written under the same
-    /// create/destroy discipline as the Box itself: published here after the
-    /// Box is leaked into `info.hAllocation`, and cleared in
-    /// `destroy_allocation_ctx` BEFORE the Box is dropped.
-    allocation: core::sync::atomic::AtomicUsize,
-}
-
-impl ScanoutAllocSlot {
-    const NEW: Self = Self {
-        resource_id: AtomicU32::new(0),
-        allocation: core::sync::atomic::AtomicUsize::new(0),
-    };
-}
-
-static SCANOUT_ALLOCS: [ScanoutAllocSlot; SCANOUT_ALLOC_SLOTS] =
-    [ScanoutAllocSlot::NEW; SCANOUT_ALLOC_SLOTS];
-
-/// Registrations refused because every slot was taken (diag `ScAlcFul`). Each
-/// one is a direct primary the DMA-flip path cannot resolve, so it must read 0.
-pub(crate) static SCANOUT_ALLOC_FULL: AtomicU32 = AtomicU32::new(0);
-
-/// Publish `allocation` as the global handle for `resource_id`.
-fn register_scanout_allocation(resource_id: u32, allocation: usize) {
-    if resource_id == 0 || allocation == 0 {
-        return;
-    }
-    for slot in SCANOUT_ALLOCS.iter() {
-        // Claim by resource id. Venus resource ids are monotonic and never
-        // recycled (`virtio/gpu.rs`), so a successful CAS from 0 can never be
-        // confused with a stale entry for a different surface.
-        if slot
-            .resource_id
-            .compare_exchange(0, resource_id, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            slot.allocation.store(allocation, Ordering::Release);
-            return;
-        }
-    }
-    SCANOUT_ALLOC_FULL.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Withdraw `resource_id`'s registration. Called before the allocation's Box is
-/// dropped, so no lookup can return a dangling pointer afterwards.
-fn unregister_scanout_allocation(resource_id: u32) {
-    if resource_id == 0 {
-        return;
-    }
-    for slot in SCANOUT_ALLOCS.iter() {
-        if slot.resource_id.load(Ordering::Acquire) == resource_id {
-            // Pointer first: a reader that still sees the id must not then read
-            // a stale pointer.
-            slot.allocation.store(0, Ordering::Release);
-            slot.resource_id.store(0, Ordering::Release);
-            return;
-        }
-    }
-}
-
-/// The global allocation handle for `resource_id`, or `None`.
-///
-/// PASSIVE-level callers only, and only while the allocation cannot be
-/// destroyed concurrently — `DxgkDdiPresent` qualifies: dxgkrnl holds the
-/// present's allocations resident for the duration of the call.
-pub(crate) fn scanout_allocation_for_resource(resource_id: u32) -> Option<HANDLE> {
-    if resource_id == 0 {
-        return None;
-    }
-    for slot in SCANOUT_ALLOCS.iter() {
-        if slot.resource_id.load(Ordering::Acquire) == resource_id {
-            let allocation = slot.allocation.load(Ordering::Acquire);
-            if allocation != 0 {
-                return Some(allocation as HANDLE);
-            }
-        }
-    }
-    None
-}
-
 const PAGE: SIZE_T = 4096;
 const D3DDDI_ALLOCATIONPRIORITY_NORMAL: UINT = 0x7800_0000;
 
@@ -2724,9 +2664,6 @@ unsafe fn destroy_allocation_ctx(
         // counter and `flush` would then write nothing here.
         crate::ddi::build_paging_buffer::hlm1_publish_counters();
     }
-    // Withdraw the DMA-flip lookup FIRST: after this no Present can resolve
-    // this resource id to a handle whose Box is about to be dropped.
-    unregister_scanout_allocation(ctx.resource_id);
     // ⛔ `adapter.system_backings.remove(ctx.resource_id)` was here.
     //
     // `adapter/backing.rs` is the private byte mirror §10.7:1940 forbids ("its
@@ -3073,14 +3010,14 @@ const fn hwa2_bind_to_ddi(bind_flags: u32) -> u32 {
 ///
 /// ⭐ **ONE derivation, two readers**, and that is the point: [`classify_hwa2`]
 /// must give this shape a real cross-context OPTIMAL image, and [`admit_hwa2`]
-/// must register it in `SCANOUT_ALLOCS`. Two independent spellings is exactly the
-/// defect this closes — the derivation used to key on `swizzle_class ==
+/// must stamp the same direct-scanout fact. Two independent spellings is exactly
+/// the defect this closes — the derivation used to key on `swizzle_class ==
 /// HELIOS_HWA2_SWIZZLE_LINEAR`, which is TRUE precisely when the producer said
 /// "copy me": `umd/src/forward/alloc.rs` sets `DISPLAYABLE` **and**
 /// `OPAQUE_OPTIMAL` together on the direct arm and plain `LINEAR` on the copy
-/// arm. Inverted, the zero-copy primary never entered `SCANOUT_ALLOCS` and the
-/// copy-path primary always did, so `set_vidpn_source_address` took the wrong arm
-/// for both.
+/// arm. Inverted, the zero-copy primary never received the direct-scanout fact
+/// and the copy-path primary did, so `set_vidpn_source_address` took the wrong
+/// arm for both.
 ///
 /// `HELIOS_HWA2_FLAG_DISPLAYABLE` is the successor of the retired
 /// `HELIOS_WDDM_ALLOC_MISC_DIRECT_SCANOUT` bit, which the pre-retirement code
@@ -3090,8 +3027,7 @@ const fn hwa2_bind_to_ddi(bind_flags: u32) -> u32 {
 /// ⛔ `STANDARD` excludes the KMD's OWN shared primary, which sets `PRIMARY |
 /// DISPLAYABLE` too (`dxgkddi_get_standard_allocation_driver_data`) and means
 /// something different by it: those bytes ARE the adapter's LINEAR scan-out
-/// image, which the display path reaches through `venus_image_id` /
-/// `production_linear_scanout`, never through the resid→handle bridge.
+/// image; it is not an ordinary direct-scanout primary.
 ///
 /// The swizzle class is required as well as the flag — not as the discriminator
 /// but as the layout `ScanoutTarget::from_direct_primary` and the QEMU fork's
@@ -3889,8 +3825,8 @@ unsafe fn admit_hwa2(
         vidmm_size,
         placement,
         // ⭐ THE SAME predicate `classify_hwa2` routed the backing with, so the
-        // allocation registered in `SCANOUT_ALLOCS` is exactly the allocation
-        // that was given a bindable OPTIMAL image. It reads the producer's
+        // direct-scanout fact names exactly the allocation that was given a
+        // bindable OPTIMAL image. It reads the producer's
         // `DISPLAYABLE` claim; see [`hwa2_is_direct_scanout_primary`] for what
         // the two producers mean by it and for the inversion this replaces.
         direct_scanout: hwa2_is_direct_scanout_primary(&desc),
@@ -4493,14 +4429,7 @@ unsafe fn create_one(
     }
 
     // ── VidMm metadata: segment placement + CPU visibility ──────────────────
-    let is_direct_scanout = ctx.direct_scanout;
-    let ctx_resource_id = ctx.resource_id;
     info.hAllocation = Box::into_raw(ctx) as HANDLE;
-    // Register AFTER the Box is leaked, so the pointer published here is the
-    // one dxgkrnl will hand back.
-    if is_direct_scanout {
-        register_scanout_allocation(ctx_resource_id, info.hAllocation as usize);
-    }
     info.Size = admitted.vidmm_size;
     info.PitchAlignedSize = admitted.vidmm_size;
     let placement = &admitted.placement;
@@ -4867,17 +4796,36 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
 /// written once at create and dxgkrnl carries the identical bytes to
 /// `OpenResource`.
 ///
-/// # ⚠ And the identity it cannot rebuild: the A3 gap
+/// # The canonical open/allocation association
 ///
-/// See the module doc. HWA2 carries no host resource id, and
-/// `DXGK_OPENALLOCATIONINFO::hAllocation` is dxgkrnl's runtime `D3DKMT_HANDLE`,
-/// not this driver's `AllocationContext*`, so there is nothing here to resolve
-/// one *from* — and §3:373-379 forbids adding an adapter-global table to bridge
-/// it. So this DDI publishes a device-specific handle whose
-/// [`PresentAllocInfo`] is `None`, counts `OaNoRid`, and lets the Present path
-/// refuse at its own gates. It does NOT fabricate a zero resid into a
-/// present-looking record; a `PresentAllocInfo { resource_id: 0, .. }` would be
-/// acted on by `ddi/display.rs` and is the one outcome worse than refusing.
+/// HWA2 still carries no host resource id.  D4 nevertheless needs the exact
+/// allocation behind a DMA Present's `hDeviceSpecificAllocation`, and WDK 28000
+/// provides that association directly: at PASSIVE OpenAllocation,
+/// `DxgkCbGetHandleData(DXGK_HANDLE_ALLOCATION)` resolves the runtime
+/// `D3DKMT_HANDLE` to the KMD allocation private data.  We capture that pointer
+/// in the per-open object and never search by resource id, geometry, current
+/// scanout, or list position.  [`PresentAllocInfo`] remains `None` until its own
+/// A3 producer composes; the D4 display path reads only the canonical allocation
+/// projection.
+unsafe fn canonical_open_allocation(
+    adapter: &AdapterContext,
+    runtime_handle: u32,
+) -> Option<usize> {
+    let dxgkrnl = adapter.dxgkrnl_opt()?;
+    let get = dxgkrnl.DxgkCbGetHandleData?;
+    let mut args = unsafe { core::mem::zeroed::<DXGKARGCB_GETHANDLEDATA>() };
+    args.hObject = runtime_handle;
+    args.Type = _DXGK_HANDLE_TYPE::DXGK_HANDLE_ALLOCATION;
+    args.Flags.__bindgen_anon_1.Value = 0;
+    // SAFETY: OpenAllocation is PASSIVE_LEVEL; `runtime_handle` is the exact
+    // live hAllocation from this DXGK_OPENALLOCATIONINFO entry and `args` lives
+    // for the synchronous callback.
+    let allocation = unsafe { get(&args) } as HANDLE;
+    // Validate the returned KMD private pointer before retaining it.  This also
+    // rejects a callback mode that returned some other class of private data.
+    unsafe { resolve_alloc(allocation) }.map(|_| allocation as usize)
+}
+
 pub unsafe extern "C" fn dxgkddi_open_allocation(
     h_device: IN_CONST_HANDLE,
     open_allocation: IN_CONST_PDXGKARG_OPENALLOCATION,
@@ -4892,7 +4840,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
     // This site used to dereference the back-pointer in ONE expression with no
     // null check at all, unlike its two siblings in scheduler.rs and
     // submit_command.rs. The checked traversal is now the only route.
-    let Some(_adapter) =
+    let Some(adapter) =
         (unsafe { crate::device::DeviceHandleRef::from_raw(h_device) }).and_then(|d| d.adapter())
     else {
         return STATUS_INVALID_PARAMETER;
@@ -4909,6 +4857,26 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
     if args.NumAllocations != 0 && args.pOpenAllocation.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    // D4 pre-resolves every runtime allocation before publishing the first
+    // device-specific handle. A refusal therefore has no partially-open prefix
+    // to unwind. The exact association is useful to the still-reachable legacy
+    // DMA worker as well as the dormant owner path, replacing its deleted
+    // resource-id reverse lookup without exposing D4 authority.
+    let mut canonical_allocations = Vec::new();
+    if canonical_allocations
+        .try_reserve_exact(args.NumAllocations as usize)
+        .is_err()
+    {
+        return STATUS_NO_MEMORY;
+    }
+    for i in 0..args.NumAllocations as usize {
+        let info = unsafe { &*args.pOpenAllocation.add(i) };
+        let Some(allocation) = (unsafe { canonical_open_allocation(adapter, info.hAllocation) })
+        else {
+            return STATUS_INVALID_HANDLE;
+        };
+        canonical_allocations.push(allocation);
+    }
     // Which entry the call-level OUT fields describe. SubresourceIndex exists in
     // the binding and was never read; entry 0 is the fallback, which reproduces
     // today's value exactly for the single-entry opens this tree produces
@@ -4922,7 +4890,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         }
     }
     let mut subresource_desc: Option<HeliosWddmAllocationDescV2> = None;
-    for i in 0..args.NumAllocations as usize {
+    for (i, canonical_allocation) in canonical_allocations.into_iter().enumerate() {
         let info = unsafe { &mut *args.pOpenAllocation.add(i) };
         crate::diag::record(0x0C21_0000 | ((info.PrivateDriverDataSize as u32).min(0xFFFF)));
         crate::diag::record(0x0C35_0000 | ((info.hAllocation as usize as u32) & 0xFFFF));
@@ -5026,6 +4994,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         });
         let open = Box::new(OpenAllocationContext {
             magic: OPEN_ALLOCATION_CTX_MAGIC,
+            allocation: canonical_allocation,
             present: None,
             present_diag,
             identity: open_identity,

@@ -36,6 +36,7 @@
 //! survive a lost interrupt with only slice-granularity latency.
 
 use core::cell::UnsafeCell;
+use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
@@ -74,7 +75,7 @@ use super::pci_caps::{HostVisibleWindow, map_isr_status_register, scan_host_visi
 // the re-export is a follow-up, not part of the move.
 use super::VirtioError;
 pub use super::counters::*;
-use crate::dxgk::DXGKRNL_INTERFACE;
+use crate::dxgk::{BOOLEAN, DXGKCB_SYNCHRONIZE_EXECUTION, DXGKRNL_INTERFACE, HANDLE, STATUS_SUCCESS};
 use crate::virtio::venus::{
     OptimalPresentImageDesc, PreparedPresentBltSubmission, PresentDestinationDesc,
 };
@@ -450,6 +451,753 @@ pub const BIND_CMD_BYTES: usize =
 /// the capacity reserved at PASSIVE and therefore never reallocates under the
 /// device spinlock.
 const BIND_CMD_POOL: usize = 4;
+
+/// The D4 half of each transport generation uses the upper half of the ordinary
+/// per-instance fence range. This keeps fixed DIRQL SETs disjoint from legacy
+/// user/control fence ids without creating a second unbounded namespace.
+const D4_FENCE_OFFSET: u64 = WIRE_FENCE_INSTANCE_STRIDE / 2;
+
+#[derive(Clone, Copy)]
+struct DirectQueueIdentity {
+    instance: u64,
+    fence_id: u64,
+    sequence: u64,
+    resource_id: u32,
+}
+
+/// One preallocated descriptor owner for an exact D4 classic/DMA binding.
+struct DirectQueueSlot {
+    buffer: DmaBuffer,
+    token: Option<u16>,
+    work: Option<crate::ddi::direct_scanout::QueuedDirectScanoutBinding>,
+    identity: Option<DirectQueueIdentity>,
+}
+
+/// Result moved out of one fixed slot only after `pop_used` has retired its
+/// exact descriptor chain.
+pub(crate) struct DirectQueueCompletion {
+    pub(crate) work: crate::ddi::direct_scanout::QueuedDirectScanoutBinding,
+    pub(crate) instance: u64,
+    pub(crate) fence_id: u64,
+    pub(crate) sequence: u64,
+    pub(crate) resource_id: u32,
+    pub(crate) written_length: u32,
+    pub(crate) response: [u8; core::mem::size_of::<VirtioGpuCtrlHdr>()],
+}
+
+struct InterruptQueueCore {
+    transport: PciTransport,
+    control: VirtQueue<WdkHal, CTRL_QUEUE_SIZE>,
+    direct_slots: Box<[DirectQueueSlot]>,
+    next_direct_fence: u64,
+    direct_fence_limit: u64,
+    transport_instance: u64,
+}
+
+/// The one mutable control-queue core. Every mutator takes the same bounded
+/// atomic exclusion gate; lower-IRQL callers additionally enter through
+/// dxgkrnl's interrupt synchronization callback.
+///
+/// `enqueue_direct_at_dirql` never assumes that being called at DIRQL also owns
+/// dxgkrnl's interrupt lock. Its private proof only grants a one-shot attempt at
+/// this nonblocking gate. Contention refuses the flip without spinning.
+pub(crate) struct InterruptQueue {
+    core: UnsafeCell<InterruptQueueCore>,
+    synchronize: DXGKCB_SYNCHRONIZE_EXECUTION,
+    device_handle: HANDLE,
+    failed: AtomicU32,
+    access: AtomicU32,
+    notify_pending: AtomicU32,
+}
+
+// SAFETY: every access to `core` is serialized by `access`. The DIRQL entry can
+// only try that gate with its non-forgeable capability; every other entry is
+// hidden behind `DxgkCbSynchronizeExecution` and then takes the same gate.
+unsafe impl Sync for InterruptQueue {}
+
+struct InterruptQueueAccess<'a> {
+    queue: &'a InterruptQueue,
+}
+
+impl InterruptQueueAccess<'_> {
+    fn release(self) {
+        self.queue.release_access();
+    }
+
+    fn release_after_reset(self) {
+        // A physical reset invalidates every queued notification. Unlike the
+        // ordinary release path, this must not ring a reset device.
+        self.queue.notify_pending.store(0, Ordering::Release);
+        self.queue.access.store(0, Ordering::Release);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum QueueCallResult {
+    Pending,
+    Added { token: u16, sequence: u64 },
+    QueueFull,
+    SequenceExhausted,
+    Failed,
+    Peek(Option<u16>),
+    Popped(u32),
+    Direct(bool),
+    Holds(bool),
+    Notified,
+}
+
+enum QueueOperation {
+    Add {
+        core: *mut InterruptQueueCore,
+        reads: [DmaSpan; 2],
+        count: usize,
+        response: DmaSpan,
+        sequence_adapter: *const crate::adapter::AdapterContext,
+        sequence_resource: u32,
+        result: *mut QueueCallResult,
+    },
+    Peek {
+        core: *mut InterruptQueueCore,
+        result: *mut QueueCallResult,
+    },
+    Pop {
+        core: *mut InterruptQueueCore,
+        token: u16,
+        reads: [DmaSpan; 2],
+        count: usize,
+        response: DmaSpan,
+        result: *mut QueueCallResult,
+    },
+    PopDirect {
+        core: *mut InterruptQueueCore,
+        token: u16,
+        output: *mut Option<DirectQueueCompletion>,
+        result: *mut QueueCallResult,
+    },
+    EnqueueDirect {
+        queue: *const InterruptQueue,
+        adapter: *const crate::adapter::AdapterContext,
+        work: *mut Option<crate::ddi::direct_scanout::QueuedDirectScanoutBinding>,
+        result: *mut QueueCallResult,
+    },
+    DirectHolds {
+        core: *mut InterruptQueueCore,
+        handle: usize,
+        generation: u64,
+        resource_id: u32,
+        result: *mut QueueCallResult,
+    },
+    Notify {
+        result: *mut QueueCallResult,
+    },
+}
+
+struct QueueInvocation {
+    queue: *const InterruptQueue,
+    operation: *mut QueueOperation,
+}
+
+unsafe extern "C" fn interrupt_queue_operation(context: *mut c_void) -> BOOLEAN {
+    if context.is_null() {
+        return 0;
+    }
+    // SAFETY: every invocation is stack-owned by `InterruptQueue::synchronize`
+    // and both pointees remain live for this synchronous callback.
+    let invocation = unsafe { &mut *(context as *mut QueueInvocation) };
+    let Some(queue) = (unsafe { invocation.queue.as_ref() }) else {
+        return 0;
+    };
+    let Some(operation) = (unsafe { invocation.operation.as_mut() }) else {
+        return 0;
+    };
+    let Some(access) = queue.try_access() else {
+        let result = match operation {
+            QueueOperation::Add { result, .. }
+            | QueueOperation::Peek { result, .. }
+            | QueueOperation::Pop { result, .. }
+            | QueueOperation::PopDirect { result, .. }
+            | QueueOperation::EnqueueDirect { result, .. }
+            | QueueOperation::DirectHolds { result, .. }
+            | QueueOperation::Notify { result, .. } => result,
+        };
+        unsafe { **result = QueueCallResult::QueueFull };
+        return 1;
+    };
+    let handled = (|| {
+        match operation {
+        QueueOperation::Add {
+            core,
+            reads,
+            count,
+            response,
+            sequence_adapter,
+            sequence_resource,
+            result,
+        } => {
+            let sequence = if sequence_adapter.is_null() {
+                0
+            } else {
+                let Some(sequence) = (unsafe { &**sequence_adapter }).reserve_scanout_bind_seq()
+                else {
+                    unsafe { **result = QueueCallResult::SequenceExhausted };
+                    return 1;
+                };
+                sequence
+            };
+            let read_slices = unsafe { [reads[0].as_slice(), reads[1].as_slice()] };
+            let added = unsafe {
+                (**core)
+                    .control
+                    .add(&read_slices[..*count], &mut [response.as_mut_slice()])
+            };
+            unsafe {
+                **result = match added {
+                    Ok(token) => {
+                        if !sequence_adapter.is_null() {
+                            (&**sequence_adapter)
+                                .commit_scanout_bind_seq(sequence, *sequence_resource);
+                        }
+                        QueueCallResult::Added { token, sequence }
+                    }
+                    Err(virtio_drivers::Error::QueueFull) => QueueCallResult::QueueFull,
+                    Err(_) => QueueCallResult::Failed,
+                }
+            };
+        }
+        QueueOperation::Peek { core, result } => unsafe {
+            **result = QueueCallResult::Peek((**core).control.peek_used());
+        },
+        QueueOperation::Pop {
+            core,
+            token,
+            reads,
+            count,
+            response,
+            result,
+        } => {
+            let read_slices = unsafe { [reads[0].as_slice(), reads[1].as_slice()] };
+            let popped = unsafe {
+                (**core).control.pop_used(
+                    *token,
+                    &read_slices[..*count],
+                    &mut [response.as_mut_slice()],
+                )
+            };
+            unsafe {
+                **result = match popped {
+                    Ok(length) => QueueCallResult::Popped(length),
+                    Err(_) => QueueCallResult::Failed,
+                }
+            };
+        }
+        QueueOperation::PopDirect {
+            core,
+            token,
+            output,
+            result,
+        } => unsafe {
+            let core = &mut **core;
+            let Some(index) = core
+                .direct_slots
+                .iter()
+                .position(|slot| slot.token == Some(*token))
+            else {
+                **result = QueueCallResult::Direct(false);
+                return 1;
+            };
+            let slot = &mut core.direct_slots[index];
+            let in0_len = core::mem::size_of::<VirtioGpuSetScanoutBlob>();
+            let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
+            let Some(read) = slot.buffer.span(0, in0_len) else {
+                **result = QueueCallResult::Failed;
+                return 1;
+            };
+            let Some(response_span) = slot.buffer.span(in0_len, resp_len) else {
+                **result = QueueCallResult::Failed;
+                return 1;
+            };
+            let reads = [read.as_slice(), DmaSpan::EMPTY.as_slice()];
+            let popped = core
+                .control
+                .pop_used(*token, &reads[..1], &mut [response_span.as_mut_slice()]);
+            let Ok(written_length) = popped else {
+                **result = QueueCallResult::Failed;
+                return 1;
+            };
+            if written_length as usize > resp_len {
+                **result = QueueCallResult::Failed;
+                return 1;
+            }
+            let Some(work) = slot.work.take() else {
+                **result = QueueCallResult::Failed;
+                return 1;
+            };
+            let Some(identity) = slot.identity.take() else {
+                // Preserve ambiguous custody rather than drop the candidate when
+                // its queue identity is corrupt.
+                slot.work = Some(work);
+                **result = QueueCallResult::Failed;
+                return 1;
+            };
+            let mut response = [0u8; core::mem::size_of::<VirtioGpuCtrlHdr>()];
+            response[..written_length as usize].copy_from_slice(
+                &slot.buffer.as_slice()[in0_len..in0_len + written_length as usize],
+            );
+            slot.token = None;
+            **output = Some(DirectQueueCompletion {
+                work,
+                instance: identity.instance,
+                fence_id: identity.fence_id,
+                sequence: identity.sequence,
+                resource_id: identity.resource_id,
+                written_length,
+                response,
+            });
+            **result = QueueCallResult::Direct(true);
+        },
+        QueueOperation::EnqueueDirect {
+            queue,
+            adapter,
+            work,
+            result,
+        } => unsafe {
+            let Some(work) = (&mut **work).take() else {
+                **result = QueueCallResult::Failed;
+                return 1;
+            };
+            **result = match (&**queue).enqueue_direct_locked(&**adapter, work) {
+                Ok(()) => QueueCallResult::Direct(true),
+                Err(VirtioError::QueueFull) => QueueCallResult::QueueFull,
+                Err(VirtioError::BindSequenceExhausted) => {
+                    QueueCallResult::SequenceExhausted
+                }
+                Err(_) => QueueCallResult::Failed,
+            };
+        },
+        QueueOperation::DirectHolds {
+            core,
+            handle,
+            generation,
+            resource_id,
+            result,
+        } => unsafe {
+            **result = QueueCallResult::Holds((**core).direct_slots.iter().any(|slot| {
+                slot.work.as_ref().is_some_and(|work| {
+                    work.matches_exact_allocation(*handle, *generation, *resource_id)
+                })
+            }));
+        },
+        QueueOperation::Notify { result, .. } => unsafe {
+            **result = QueueCallResult::Notified;
+        },
+        }
+        1
+    })();
+    access.release();
+    handled
+}
+
+impl InterruptQueue {
+    fn new(
+        transport: PciTransport,
+        control: VirtQueue<WdkHal, CTRL_QUEUE_SIZE>,
+        synchronize: DXGKCB_SYNCHRONIZE_EXECUTION,
+        device_handle: HANDLE,
+        transport_instance: u64,
+        direct_buffers: Vec<DmaBuffer>,
+        wire_fence_base: u64,
+    ) -> Result<Self, VirtioError> {
+        let Some(next_direct_fence) = wire_fence_base.checked_add(D4_FENCE_OFFSET) else {
+            return Err(VirtioError::WireFenceNamespaceExhausted);
+        };
+        let Some(direct_fence_limit) = wire_fence_base.checked_add(WIRE_FENCE_INSTANCE_STRIDE)
+        else {
+            return Err(VirtioError::WireFenceNamespaceExhausted);
+        };
+        let direct_slots = direct_buffers
+            .into_iter()
+            .map(|buffer| DirectQueueSlot {
+                buffer,
+                token: None,
+                work: None,
+                identity: None,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Ok(Self {
+            core: UnsafeCell::new(InterruptQueueCore {
+                transport,
+                control,
+                direct_slots,
+                next_direct_fence,
+                direct_fence_limit,
+                transport_instance,
+            }),
+            synchronize,
+            device_handle,
+            failed: AtomicU32::new(0),
+            access: AtomicU32::new(0),
+            notify_pending: AtomicU32::new(0),
+        })
+    }
+
+    fn try_access(&self) -> Option<InterruptQueueAccess<'_>> {
+        self.access
+            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+            .ok()
+            .map(|_| InterruptQueueAccess { queue: self })
+    }
+
+    fn release_access(&self) {
+        // SAFETY: the caller's guard uniquely owns `access`, so it is the only
+        // code that may touch the queue core. A notification deferred by a
+        // contending lower-IRQL caller is folded into this exact section.
+        let core = unsafe { &mut *self.core.get() };
+        if self.notify_pending.swap(0, Ordering::AcqRel) != 0
+            && core.control.should_notify()
+        {
+            core.transport.notify(CTRL_QUEUE);
+        }
+        self.access.store(0, Ordering::Release);
+    }
+
+    fn synchronize(&self, operation: &mut QueueOperation) -> Result<QueueCallResult, VirtioError> {
+        let Some(synchronize) = self.synchronize else {
+            return Err(VirtioError::DeviceError);
+        };
+        let mut returned: BOOLEAN = 0;
+        let mut invocation = QueueInvocation {
+            queue: self,
+            operation,
+        };
+        let status = unsafe {
+            synchronize(
+                self.device_handle,
+                Some(interrupt_queue_operation),
+                &mut invocation as *mut QueueInvocation as *mut c_void,
+                0,
+                &mut returned,
+            )
+        };
+        if status != STATUS_SUCCESS || returned == 0 {
+            return Err(VirtioError::DeviceError);
+        }
+        let result = match operation {
+            QueueOperation::Add { result, .. }
+            | QueueOperation::Peek { result, .. }
+            | QueueOperation::Pop { result, .. }
+            | QueueOperation::PopDirect { result, .. }
+            | QueueOperation::EnqueueDirect { result, .. }
+            | QueueOperation::DirectHolds { result, .. }
+            | QueueOperation::Notify { result, .. } => unsafe { **result },
+        };
+        Ok(result)
+    }
+
+    fn add(
+        &self,
+        reads: [DmaSpan; 2],
+        count: usize,
+        response: DmaSpan,
+        sequence: Option<(&crate::adapter::AdapterContext, u32)>,
+    ) -> Result<(u16, Option<u64>), VirtioError> {
+        let mut result = QueueCallResult::Pending;
+        let (sequence_adapter, sequence_resource) = sequence
+            .map_or((core::ptr::null(), 0), |(adapter, resource)| {
+                (adapter as *const _, resource)
+            });
+        let mut operation = QueueOperation::Add {
+            core: self.core.get(),
+            reads,
+            count,
+            response,
+            sequence_adapter,
+            sequence_resource,
+            result: &mut result,
+        };
+        match self.synchronize(&mut operation)? {
+            QueueCallResult::Added { token, sequence } => {
+                Ok((token, (sequence != 0).then_some(sequence)))
+            }
+            QueueCallResult::QueueFull => Err(VirtioError::QueueFull),
+            QueueCallResult::SequenceExhausted => Err(VirtioError::BindSequenceExhausted),
+            _ => Err(VirtioError::DeviceError),
+        }
+    }
+
+    fn notify(&self) -> Result<(), VirtioError> {
+        self.notify_pending.store(1, Ordering::Release);
+        let mut result = QueueCallResult::Pending;
+        let mut operation = QueueOperation::Notify {
+            result: &mut result,
+        };
+        match self.synchronize(&mut operation)? {
+            // QueueFull means another CPU owned the queue after this caller set
+            // `notify_pending`. That owner normally folds the notification into
+            // its release, but there is a boundary race where it may already have
+            // sampled the bit. Never report success from that ambiguous edge.
+            QueueCallResult::Notified => Ok(()),
+            QueueCallResult::QueueFull => Err(VirtioError::QueueFull),
+            _ => Err(VirtioError::DeviceError),
+        }
+    }
+
+    fn peek_used(&self) -> Result<Option<u16>, VirtioError> {
+        let mut result = QueueCallResult::Pending;
+        let mut operation = QueueOperation::Peek {
+            core: self.core.get(),
+            result: &mut result,
+        };
+        match self.synchronize(&mut operation)? {
+            QueueCallResult::Peek(token) => Ok(token),
+            QueueCallResult::QueueFull => Err(VirtioError::QueueFull),
+            _ => Err(VirtioError::DeviceError),
+        }
+    }
+
+    fn pop_used(
+        &self,
+        token: u16,
+        reads: [DmaSpan; 2],
+        count: usize,
+        response: DmaSpan,
+    ) -> Result<u32, VirtioError> {
+        let mut result = QueueCallResult::Pending;
+        let mut operation = QueueOperation::Pop {
+            core: self.core.get(),
+            token,
+            reads,
+            count,
+            response,
+            result: &mut result,
+        };
+        match self.synchronize(&mut operation)? {
+            QueueCallResult::Popped(length) => Ok(length),
+            QueueCallResult::QueueFull => Err(VirtioError::QueueFull),
+            _ => Err(VirtioError::DeviceError),
+        }
+    }
+
+    pub(crate) fn reset_status_and_poll(
+        &self,
+        _passive: crate::irql::PassiveLevel,
+        expected_instance: u64,
+    ) -> Result<(u32, u32), VirtioError> {
+        let Some(access) = self.try_access() else {
+            return Err(VirtioError::QueueFull);
+        };
+        // PCI transport status reads/writes may reach DxgkCb{Read,Write}DeviceSpace.
+        // They therefore stay at the caller's proven PASSIVE_LEVEL and are
+        // deliberately absent from `interrupt_queue_operation`. The same
+        // nonblocking gate still excludes a crossed direct queue publisher.
+        let core = unsafe { &mut *self.core.get() };
+        if expected_instance == 0 || core.transport_instance != expected_instance {
+            access.release();
+            return Err(VirtioError::DeviceError);
+        }
+        core.transport.set_status(DeviceStatus::empty());
+        let mut spins = 0u32;
+        let mut status = core.transport.get_status();
+        while !status.is_empty() && spins < 100_000 {
+            spins += 1;
+            core::hint::spin_loop();
+            status = core.transport.get_status();
+        }
+        // Seal every producer before releasing exclusion. Even if lifecycle
+        // serialization were violated, no command may enter the reset device
+        // between this PASSIVE phase and under-lock bookkeeping retirement.
+        self.mark_failed();
+        // Reset invalidates every pending notification. Do not route release
+        // through `release_access`, which could ring a queue after device reset.
+        access.release_after_reset();
+        Ok((status.bits(), spins))
+    }
+
+    fn mark_failed(&self) {
+        self.failed.store(1, Ordering::Release);
+    }
+
+    fn is_failed(&self) -> bool {
+        self.failed.load(Ordering::Acquire) != 0
+    }
+
+    pub(crate) unsafe fn enqueue_direct_at_dirql(
+        &self,
+        proof: &crate::ddi::display::SetVidPnDirql<'_>,
+        adapter: &crate::adapter::AdapterContext,
+        work: crate::ddi::direct_scanout::QueuedDirectScanoutBinding,
+    ) -> Result<(), VirtioError> {
+        if !proof.authorizes(adapter) || self.is_failed() {
+            return Err(VirtioError::DeviceError);
+        }
+        let Some(access) = self.try_access() else {
+            return Err(VirtioError::QueueFull);
+        };
+        // SAFETY: the private proof confines this call to the classic DDI's
+        // above-DISPATCH arm; `access` independently excludes every queue
+        // mutator without waiting or assuming an implicit interrupt lock.
+        let result = unsafe { self.enqueue_direct_locked(adapter, work) };
+        access.release();
+        result
+    }
+
+    fn enqueue_direct_at_dispatch(
+        &self,
+        adapter: &crate::adapter::AdapterContext,
+        work: crate::ddi::direct_scanout::QueuedDirectScanoutBinding,
+    ) -> Result<(), VirtioError> {
+        if self.is_failed() {
+            return Err(VirtioError::DeviceError);
+        }
+        let mut result = QueueCallResult::Pending;
+        let mut work = Some(work);
+        let mut operation = QueueOperation::EnqueueDirect {
+            queue: self,
+            adapter,
+            work: &mut work,
+            result: &mut result,
+        };
+        match self.synchronize(&mut operation)? {
+            QueueCallResult::Direct(true) => Ok(()),
+            QueueCallResult::QueueFull => Err(VirtioError::QueueFull),
+            QueueCallResult::SequenceExhausted => Err(VirtioError::BindSequenceExhausted),
+            _ => Err(VirtioError::DeviceError),
+        }
+    }
+
+    unsafe fn enqueue_direct_locked(
+        &self,
+        adapter: &crate::adapter::AdapterContext,
+        work: crate::ddi::direct_scanout::QueuedDirectScanoutBinding,
+    ) -> Result<(), VirtioError> {
+        let core = unsafe { &mut *self.core.get() };
+        if work.transport_instance() != core.transport_instance
+            || core.next_direct_fence >= core.direct_fence_limit
+        {
+            return Err(VirtioError::DeviceError);
+        }
+        let Some(slot) = core
+            .direct_slots
+            .iter_mut()
+            .find(|slot| slot.token.is_none() && slot.work.is_none())
+        else {
+            return Err(VirtioError::QueueFull);
+        };
+        let resource_id = work.resource_id();
+        let in0_len = core::mem::size_of::<VirtioGpuSetScanoutBlob>();
+        let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
+        if !slot.buffer.reset(in0_len + resp_len) {
+            return Err(VirtioError::DeviceError);
+        }
+        // SAFETY: every DmaBuffer begins at a page-aligned contiguous-memory
+        // address, this command starts at offset zero, and reset above proved
+        // the complete command fits. Avoid a dependency helper in the audited
+        // DIRQL path: this is exactly one aligned typed view of those bytes.
+        let command = unsafe {
+            &mut *slot
+                .buffer
+                .as_mut_slice()
+                .as_mut_ptr()
+                .cast::<VirtioGpuSetScanoutBlob>()
+        };
+        super::ctrl::fill_set_scanout_blob(
+            command,
+            resource_id,
+            work.width(),
+            work.height(),
+            work.format(),
+            work.stride(),
+            work.offset(),
+        );
+        command.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+        command.hdr.fence_id = core.next_direct_fence;
+        let Some(sequence) = adapter.reserve_scanout_bind_seq() else {
+            return Err(VirtioError::BindSequenceExhausted);
+        };
+        let fence_id = core.next_direct_fence;
+        let reads = [
+            slot.buffer
+                .span(0, in0_len)
+                .ok_or(VirtioError::DeviceError)?,
+            DmaSpan::EMPTY,
+        ];
+        let response = slot
+            .buffer
+            .span(in0_len, resp_len)
+            .ok_or(VirtioError::DeviceError)?;
+        // Retain the move-only candidate before publishing avail.idx. A refused
+        // add takes it back below; an accepted descriptor can therefore never
+        // exist without exact candidate custody.
+        slot.work = Some(work);
+        let read_slices = unsafe { [reads[0].as_slice(), reads[1].as_slice()] };
+        let added = unsafe {
+            core.control
+                .add(&read_slices[..1], &mut [response.as_mut_slice()])
+        };
+        let token = match added {
+            Ok(token) => token,
+            Err(virtio_drivers::Error::QueueFull) => {
+                let _ = slot.work.take();
+                return Err(VirtioError::QueueFull);
+            }
+            Err(_) => {
+                let _ = slot.work.take();
+                self.mark_failed();
+                return Err(VirtioError::DeviceError);
+            }
+        };
+        adapter.commit_scanout_bind_seq(sequence, resource_id);
+        slot.token = Some(token);
+        slot.identity = Some(DirectQueueIdentity {
+            instance: core.transport_instance,
+            fence_id,
+            sequence,
+            resource_id,
+        });
+        core.next_direct_fence += 1;
+        self.notify_pending.store(1, Ordering::Release);
+        Ok(())
+    }
+
+    fn take_direct_completion(
+        &self,
+        token: u16,
+    ) -> Result<Option<DirectQueueCompletion>, VirtioError> {
+        let mut result = QueueCallResult::Pending;
+        let mut output = None;
+        let mut operation = QueueOperation::PopDirect {
+            core: self.core.get(),
+            token,
+            output: &mut output,
+            result: &mut result,
+        };
+        match self.synchronize(&mut operation)? {
+            QueueCallResult::Direct(_) => Ok(output),
+            QueueCallResult::QueueFull => Err(VirtioError::QueueFull),
+            _ => Err(VirtioError::DeviceError),
+        }
+    }
+
+    fn direct_holds_allocation(
+        &self,
+        handle: usize,
+        generation: u64,
+        resource_id: u32,
+    ) -> Result<bool, VirtioError> {
+        let mut result = QueueCallResult::Pending;
+        let mut operation = QueueOperation::DirectHolds {
+            core: self.core.get(),
+            handle,
+            generation,
+            resource_id,
+            result: &mut result,
+        };
+        match self.synchronize(&mut operation)? {
+            QueueCallResult::Holds(holds) => Ok(holds),
+            _ => Err(VirtioError::DeviceError),
+        }
+    }
+}
 
 /// `NotificationEvent` (`EVENT_TYPE` value 0): stays signaled until cleared —
 /// the right semantics for one-shot completion events.
@@ -2170,10 +2918,15 @@ pub enum BlobMapFinish {
 
 /// An initialized virtio-gpu transport.
 pub struct VirtioGpu {
-    /// The virtio-modern PCI transport (owns the mapped cfg-region VAs).
-    transport: PciTransport,
-    /// Control virtqueue (queue 0) — all GPU commands ride this.
-    control: VirtQueue<WdkHal, CTRL_QUEUE_SIZE>,
+    /// Control transport + virtqueue under the device interrupt's single
+    /// synchronization domain. Normal producers enter through dxgkrnl; the D4
+    /// classic callback can reach only its narrow proof-gated fixed-slot method.
+    // Separate allocation is load-bearing: the DIRQL publication points to this
+    // object while lower-IRQL code may hold `&mut VirtioGpu` under `virtio_lock`.
+    // Keeping the queue inline would let that outer unique borrow overlap the
+    // raw interrupt-level queue reference even though `access` serialized every
+    // actual queue-core mutation.
+    queue: Box<InterruptQueue>,
     /// Next virtio-gpu 3D context id to hand out (guest-assigned; 0 is the
     /// reserved global context, so we start at 1). Phase 3.
     next_ctx_id: u32,
@@ -2372,6 +3125,12 @@ impl VirtioGpu {
         passive: crate::irql::PassiveLevel,
         dxgkrnl: &DXGKRNL_INTERFACE,
     ) -> Result<Box<Self>, VirtioError> {
+        // Queue mutation below depends on dxgkrnl's synchronous interrupt
+        // serialization. Prove the callback before touching PCI or DRIVER_OK so
+        // its absence cannot drop an already-live queue generation.
+        let Some(synchronize) = dxgkrnl.DxgkCbSynchronizeExecution else {
+            return Err(VirtioError::DeviceError);
+        };
         // Reserve both nonwrapping transport namespaces before touching PCI or
         // DRIVER_OK. Later initialization failures deliberately burn them; a
         // late reservation refusal must never ordinary-drop a live device.
@@ -2481,6 +3240,9 @@ impl VirtioGpu {
             };
             bind_cmd_pool.push(buf);
         }
+        if crate::virtio::KMD_D2_OWNER_ENABLED && bind_cmd_pool.len() != BIND_CMD_POOL {
+            return Err(VirtioError::OutOfMemory);
+        }
 
         let mut scratch = DmaBuffer::new(passive, SCRATCH_BYTES).ok_or(VirtioError::OutOfMemory)?;
         let buf = scratch.as_mut_slice();
@@ -2581,9 +3343,22 @@ impl VirtioGpu {
         // `VirtioGpu` contains the control virtqueue and many ownership tables.
         // Return it heap-owned so StartDevice never reserves a second by-value
         // copy of this large state while `init`'s own frame is live.
-        let gpu = Box::new(Self {
+        let direct_buffers = if crate::virtio::KMD_D2_OWNER_ENABLED {
+            core::mem::take(&mut bind_cmd_pool)
+        } else {
+            Vec::new()
+        };
+        let queue = Box::new(InterruptQueue::new(
             transport,
             control,
+            Some(synchronize),
+            dxgkrnl.DeviceHandle,
+            scanout_transport_instance,
+            direct_buffers,
+            wire_fence_base,
+        )?);
+        let gpu = Box::new(Self {
+            queue,
             next_ctx_id: 1,
             next_resource_id: 1,
             host_visible,
@@ -2701,7 +3476,7 @@ impl VirtioGpu {
 
     /// Ring-corruption latch (a wedged-slow host does NOT set this).
     pub fn transport_failed(&self) -> bool {
-        self.failed
+        self.failed || self.queue.is_failed()
     }
 
     /// Enqueue a synchronous control command. `meta` = `[in0 | in1? | resp]`
@@ -2736,8 +3511,9 @@ impl VirtioGpu {
         meta: &DmaBuffer,
         venus: Option<&DmaBuffer>,
         resp_len: usize,
-    ) -> Result<u16, VirtioError> {
-        if self.failed {
+        sequence: Option<(&crate::adapter::AdapterContext, u32)>,
+    ) -> Result<(u16, Option<u64>), VirtioError> {
+        if self.failed || self.queue.is_failed() {
             return Err(VirtioError::DeviceError);
         }
         if self.inflight.len() >= MAX_INFLIGHT || self.parked.len() >= PARKED_ENQUEUE_GATE {
@@ -2747,15 +3523,9 @@ impl VirtioGpu {
         let Some((reads, count, resp)) = chain.spans(meta, venus, resp_len) else {
             return Err(VirtioError::DeviceError);
         };
-        // SAFETY: see the function's Safety note.
-        let added = unsafe {
-            let reads = [reads[0].as_slice(), reads[1].as_slice()];
-            self.control
-                .add(&reads[..count], &mut [resp.as_mut_slice()])
-        };
-        match added {
-            Ok(token) => Ok(token),
-            Err(virtio_drivers::Error::QueueFull) => {
+        match self.queue.add(reads, count, resp, sequence) {
+            Ok(added) => Ok(added),
+            Err(VirtioError::QueueFull) => {
                 QUEUE_FULL_RETRIES.fetch_add(1, Ordering::Relaxed);
                 Err(VirtioError::QueueFull)
             }
@@ -2787,8 +3557,8 @@ impl VirtioGpu {
     fn publish_then_notify(&mut self, entry: InFlight) {
         self.inflight.push(entry);
         bump_high_water(&INFLIGHT_HIGH_WATER, self.inflight.len());
-        if self.control.should_notify() {
-            self.transport.notify(CTRL_QUEUE);
+        if self.queue.notify().is_err() {
+            self.latch_failed_and_fail_inflight();
         }
     }
 
@@ -2860,22 +3630,11 @@ impl VirtioGpu {
             self.release_sync_claim_for_refusal(scanout_bind);
             return Err((meta, VirtioError::PublicationBusy));
         }
-        let reserved_sequence = match scanout_bind {
-            Some(_) => match adapter.reserve_scanout_bind_seq() {
-                Some(sequence) => Some(sequence),
-                None => {
-                    SCANOUT_BIND_SEQUENCE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-                    self.release_sync_claim_for_refusal(scanout_bind);
-                    return Err((meta, VirtioError::BindSequenceExhausted));
-                }
-            },
-            None => None,
-        };
         let fenced_scanout = scanout_bind.is_some_and(|(_, _, fenced)| fenced);
         let reserved_fence = if fenced_scanout {
             let Some(wire_fence_limit) = self
                 .wire_fence_base
-                .checked_add(WIRE_FENCE_INSTANCE_STRIDE)
+                .checked_add(D4_FENCE_OFFSET)
             else {
                 WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
                 self.release_sync_claim_for_refusal(scanout_bind);
@@ -2923,8 +3682,15 @@ impl VirtioGpu {
         } else {
             None
         };
-        let token = match self.enqueue_core(chain, &meta, None, resp_len) {
-            Ok(token) => token,
+        let sequence_request = scanout_bind.map(|(resource_id, _, _)| (adapter, resource_id));
+        let (token, reserved_sequence) = match self.enqueue_core(
+            chain,
+            &meta,
+            None,
+            resp_len,
+            sequence_request,
+        ) {
+            Ok(accepted) => accepted,
             Err(e) => {
                 if reserved_fence.is_some() {
                     // SAFETY: this is the header patched above and the DMA
@@ -2966,7 +3732,6 @@ impl VirtioGpu {
             scanout_bind
                 .zip(reserved_sequence)
                 .map(|((resource_id, request, _), sequence)| {
-                    adapter.commit_scanout_bind_seq(sequence, resource_id);
                     SyncScanoutBind {
                         seq: sequence,
                         resource_id,
@@ -3046,30 +3811,46 @@ impl VirtioGpu {
         self.scanout_transport_instance
     }
 
-    pub(crate) fn physical_reset_and_abort(
+    pub(crate) fn interrupt_queue(&self) -> &InterruptQueue {
+        &self.queue
+    }
+
+    pub(crate) fn enqueue_direct_scanout_dispatch(
+        &self,
+        adapter: &crate::adapter::AdapterContext,
+        work: crate::ddi::direct_scanout::QueuedDirectScanoutBinding,
+    ) -> Result<(), VirtioError> {
+        self.queue.enqueue_direct_at_dispatch(adapter, work)
+    }
+
+    pub(crate) fn direct_queue_holds_allocation(
+        &self,
+        handle: usize,
+        generation: u64,
+        resource_id: u32,
+    ) -> Result<bool, VirtioError> {
+        self.queue
+            .direct_holds_allocation(handle, generation, resource_id)
+    }
+
+    pub(crate) fn finish_physical_reset_and_abort(
         &mut self,
         expected_instance: u64,
+        status: u32,
+        spins: u32,
     ) -> Result<u32, VirtioError> {
         if expected_instance == 0 || expected_instance != self.scanout_transport_instance {
             return Err(VirtioError::DeviceError);
-        }
-        self.transport.set_status(DeviceStatus::empty());
-        let mut spins = 0u32;
-        let mut status = self.transport.get_status();
-        while !status.is_empty() && spins < 100_000 {
-            spins += 1;
-            core::hint::spin_loop();
-            status = self.transport.get_status();
         }
         if !self.failed {
             self.latch_failed_and_fail_inflight();
         }
         self.abort_windowed_blt_for_terminal_transport();
         self.purge_all_present_streams();
-        if !status.is_empty() {
+        if status != 0 {
             crate::diag::fault(crate::diag::FaultCounter::StVioR, spins);
         }
-        Ok(status.bits())
+        Ok(status)
     }
 
     /// Reset a fully initialized transport candidate that was never published.
@@ -3079,10 +3860,14 @@ impl VirtioGpu {
     /// its queue/storage allocations must remain valid for any device DMA that
     /// the failed reset did not stop.
     pub(crate) fn reset_unpublished_or_retain(
+        passive: crate::irql::PassiveLevel,
         mut candidate: Box<Self>,
     ) -> Result<(), VirtioError> {
         let instance = candidate.scanout_transport_instance();
-        match candidate.physical_reset_and_abort(instance) {
+        let reset = candidate.queue.reset_status_and_poll(passive, instance);
+        match reset.and_then(|(status, spins)| {
+            candidate.finish_physical_reset_and_abort(instance, status, spins)
+        }) {
             Ok(0) => Ok(()),
             Ok(_) | Err(_) => {
                 core::mem::forget(candidate);
@@ -3147,8 +3932,9 @@ impl VirtioGpu {
                 return Err((meta, VirtioError::DeviceError));
             }
         }
-        let token = match self.enqueue_core(chain, &meta, None, resp_len) {
-            Ok(token) => token,
+        let token = match self.enqueue_core(chain, &meta, None, resp_len, None) {
+            Ok((token, None)) => token,
+            Ok((_, Some(_))) => return Err((meta, VirtioError::DeviceError)),
             Err(e) => {
                 if let Some((resource_id, present_epoch)) = armed_publication {
                     let rolled_back = self.rollback_publication_flush(resource_id, present_epoch);
@@ -3265,22 +4051,23 @@ impl VirtioGpu {
             );
         }
         let chain = Chain::Meta1 { in0_len };
-        let Some(seq) = adapter.reserve_scanout_bind_seq() else {
-            SCANOUT_BIND_SEQUENCE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-            self.return_bind_cmd_buffer(buf);
-            return Err(FastBindRefusal::Failed);
-        };
-        let token = match self.enqueue_core(chain, &buf, None, resp_len) {
-            Ok(token) => token,
+        let (token, seq) = match self.enqueue_core(
+            chain,
+            &buf,
+            None,
+            resp_len,
+            Some((adapter, req.resource_id)),
+        ) {
+            Ok((token, Some(sequence))) => (token, sequence),
             Err(_) => {
                 self.return_bind_cmd_buffer(buf);
                 return Err(FastBindRefusal::Failed);
             }
+            Ok((_, None)) => {
+                self.return_bind_cmd_buffer(buf);
+                return Err(FastBindRefusal::Failed);
+            }
         };
-        // `VirtQueue::add` has published avail.idx. Commit the exact wire view
-        // now, before releasing this virtio-lock hold; an add refusal above may
-        // burn `seq` but never publishes a resource that was not accepted.
-        adapter.commit_scanout_bind_seq(seq, req.resource_id);
         // `enqueue_core` accepted this descriptor while this lock stayed held,
         // so no other producer can claim the fixed transaction slot between the
         // readiness check above and this publication. Keep the full request —
@@ -4469,7 +5256,7 @@ impl VirtioGpu {
         if self.failed {
             return Err((meta, venus, VirtioError::DeviceError));
         }
-        let Some(wire_fence_limit) = self.wire_fence_base.checked_add(WIRE_FENCE_INSTANCE_STRIDE)
+        let Some(wire_fence_limit) = self.wire_fence_base.checked_add(D4_FENCE_OFFSET)
         else {
             WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
             return Err((meta, venus, VirtioError::WireFenceNamespaceExhausted));
@@ -4498,8 +5285,9 @@ impl VirtioGpu {
         meta.as_mut_slice()[..hdr_len].copy_from_slice(bytemuck::bytes_of(&cmd));
 
         let chain = Chain::MetaPlusVenus { hdr_len, venus_len };
-        let token = match self.enqueue_core(chain, &meta, Some(&venus), resp_len) {
-            Ok(token) => token,
+        let token = match self.enqueue_core(chain, &meta, Some(&venus), resp_len, None) {
+            Ok((token, None)) => token,
+            Ok((_, Some(_))) => return Err((meta, venus, VirtioError::DeviceError)),
             Err(e) => return Err((meta, venus, e)),
         };
         if let Some(retire) = present_stream {
@@ -4552,6 +5340,7 @@ impl VirtioGpu {
     /// mistake in the Sync-waiter sequence is a use-after-free of a stack block.
     fn latch_failed_and_fail_inflight(&mut self) {
         self.failed = true;
+        self.queue.mark_failed();
         // A transport failure is not proof that a published persistent SET had
         // no host side effect. Permanently seal this generation's ordinary SET
         // admission and resource retirement until the transport is replaced.
@@ -4774,13 +5563,38 @@ impl VirtioGpu {
         }
     }
 
-    pub fn drain_used(&mut self) {
+    pub fn drain_used(&mut self, adapter: &crate::adapter::AdapterContext) {
         if self.failed {
             return;
         }
+        if self.queue.is_failed() {
+            // A structural failure observed by the DIRQL-only publisher must
+            // retire ordinary waiters and seal persistent SET custody too. A
+            // bare early return would strand both indefinitely.
+            self.latch_failed_and_fail_inflight();
+            return;
+        }
         loop {
-            let Some(token) = self.control.peek_used() else {
-                return;
+            let token = match self.queue.peek_used() {
+                Ok(Some(token)) => token,
+                Ok(None) => return,
+                Err(VirtioError::QueueFull) => return,
+                Err(_) => {
+                    self.latch_failed_and_fail_inflight();
+                    return;
+                }
+            };
+            match self.queue.take_direct_completion(token) {
+                Ok(Some(completion)) => {
+                    crate::ddi::direct_scanout::complete_queued(adapter, completion);
+                    continue;
+                }
+                Ok(None) => {}
+                Err(VirtioError::QueueFull) => return,
+                Err(_) => {
+                    self.latch_failed_and_fail_inflight();
+                    return;
+                }
             };
             let Some(idx) = self.inflight.iter().position(|e| e.token == token) else {
                 // A completion we do not track: the ring state is corrupt.
@@ -4790,7 +5604,7 @@ impl VirtioGpu {
             };
             // Rebuild the spans through the SAME producer `add` used, so the
             // two lists cannot drift. The result is copied out so no borrow of
-            // `self.inflight` is held across the `self.control` call.
+            // `self.inflight` is held across the interrupt-synchronized queue call.
             let (spans, resp_len) = {
                 let e = &self.inflight[idx];
                 (
@@ -4806,15 +5620,9 @@ impl VirtioGpu {
                 self.latch_failed_and_fail_inflight();
                 return;
             };
-            // SAFETY: exactly the spans `add` was called with; the entry still
-            // owns both buffers.
-            let popped = unsafe {
-                let read_slices = [reads[0].as_slice(), reads[1].as_slice()];
-                self.control
-                    .pop_used(token, &read_slices[..count], &mut [resp.as_mut_slice()])
-            };
-            let written_length = match popped {
+            let written_length = match self.queue.pop_used(token, reads, count, resp) {
                 Ok(length) => length,
+                Err(VirtioError::QueueFull) => return,
                 Err(_) => {
                     self.latch_failed_and_fail_inflight();
                     return;
@@ -7462,7 +8270,12 @@ impl Drop for VirtioGpu {
         // Quiesce the device before ending reader leases: unlike ordinary
         // scheduler reset, transport Drop is terminal and no host DMA may
         // retain a snapshot once this reset returns.
-        self.transport.set_status(DeviceStatus::empty());
+        // SAFETY: every VirtioGpu owner drops at the documented PASSIVE
+        // lifecycle/reap edge; DmaBuffer teardown below has the same contract.
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        let _ = self
+            .queue
+            .reset_status_and_poll(passive, self.scanout_transport_instance);
         self.abort_windowed_blt_for_terminal_transport();
         // Stop/StartDevice destroys this transport generation.  Clear stream
         // registrations before resource ids or device owner tokens can be

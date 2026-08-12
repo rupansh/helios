@@ -55,7 +55,7 @@ pub(crate) fn request_wddm_completion_dpc(adapter: &AdapterContext) {
 /// The bind application lives HERE rather than in `drain_used` because of the
 /// lock order — see the comment on it below.
 pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
-    let _ = adapter.with_virtio(|v| v.drain_used());
+    let _ = adapter.with_virtio(|v| v.drain_used(adapter));
 
     // A producer completion may have made the one deferred fast bind safe.
     // Promotion and sequence minting share this virtio-lock hold, so the host

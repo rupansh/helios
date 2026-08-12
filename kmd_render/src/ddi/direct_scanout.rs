@@ -11,6 +11,7 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use helios_kmd_logic::committed_mode::PowerSubject;
+use helios_kmd_logic::control_ownership::HostRejection;
 use helios_kmd_logic::direct_scanout_admission::{
     validate_direct_scanout_binding as validate_binding_model, OperationFacts, PlaneFacts,
 };
@@ -20,7 +21,8 @@ use helios_kmd_logic::direct_scanout_lifetime::{
 };
 use helios_protocol::diagnostics::HeliosGraphicsEtwPayloadV1;
 use helios_protocol::{
-    HeliosAdapterMatch, HELIOS_PACKAGE_GENERATION, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
+    HeliosAdapterMatch, HELIOS_PACKAGE_GENERATION, VIRTIO_GPU_FLAG_FENCE,
+    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, VIRTIO_GPU_RESP_OK_NODATA, VirtioGpuCtrlHdr,
 };
 use wdk_sys::{HANDLE, NTSTATUS, STATUS_DEVICE_NOT_READY, STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
 
@@ -46,15 +48,54 @@ const QUARANTINE_SLOTS: usize = 4;
 
 const _: () = assert!(super::vidpn::NUM_VIDPN_SOURCES == 1);
 
-static ADMISSION_REFUSALS: AtomicU32 = AtomicU32::new(0);
-static MAILBOX_REFUSALS: AtomicU32 = AtomicU32::new(0);
-static PLANE_REFUSALS: AtomicU32 = AtomicU32::new(0);
-static RESET_REFUSALS: AtomicU32 = AtomicU32::new(0);
+struct RefusalCounter {
+    count: AtomicU32,
+    last_reason: AtomicU32,
+}
 
-fn record_refusal(counter: &AtomicU32, name: &'static [u8], code: u32) {
-    let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    if count == 1 || count % 64 == 0 {
-        crate::diag::record_named_bytes(name, (code << 24) | count.min(0x00ff_ffff));
+impl RefusalCounter {
+    const fn new() -> Self {
+        Self {
+            count: AtomicU32::new(0),
+            last_reason: AtomicU32::new(0),
+        }
+    }
+}
+
+static ADMISSION_REFUSALS: RefusalCounter = RefusalCounter::new();
+static MAILBOX_REFUSALS: RefusalCounter = RefusalCounter::new();
+static PLANE_REFUSALS: RefusalCounter = RefusalCounter::new();
+static RESET_REFUSALS: RefusalCounter = RefusalCounter::new();
+
+fn record_refusal(counter: &RefusalCounter, _name: &'static [u8], code: u32) {
+    // Admission is shared by MPO3 and classic SetVidPn, whose latter entry may
+    // run at device DIRQL. Keep the entire transitive refusal path atomics-only;
+    // the PASSIVE diagnostics snapshot below owns registry publication.
+    counter.last_reason.store(code, Ordering::Relaxed);
+    counter.count.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_refusal_counters() {
+    for (name, reason_name, counter) in [
+        (b"D2AdmRef".as_slice(), b"D2AdmWhy".as_slice(), &ADMISSION_REFUSALS),
+        (b"D2MbxRef".as_slice(), b"D2MbxWhy".as_slice(), &MAILBOX_REFUSALS),
+        (b"D2PlnRef".as_slice(), b"D2PlnWhy".as_slice(), &PLANE_REFUSALS),
+        (b"D2RstRef".as_slice(), b"D2RstWhy".as_slice(), &RESET_REFUSALS),
+    ] {
+        crate::diag::record_named_bytes(name, counter.count.load(Ordering::Relaxed));
+        crate::diag::record_named_bytes(reason_name, counter.last_reason.load(Ordering::Relaxed));
+    }
+}
+
+pub(crate) fn reset_refusal_counters() {
+    for counter in [
+        &ADMISSION_REFUSALS,
+        &MAILBOX_REFUSALS,
+        &PLANE_REFUSALS,
+        &RESET_REFUSALS,
+    ] {
+        counter.count.store(0, Ordering::Relaxed);
+        counter.last_reason.store(0, Ordering::Relaxed);
     }
 }
 
@@ -90,6 +131,98 @@ impl DisplayBacking {
 pub(crate) struct ValidatedDirectScanoutBinding {
     binding: Binding<DisplayBacking>,
     mode_generation: u64,
+    transport_instance: u64,
+}
+
+/// Exact classic/DMA source switch retained by the fixed interrupt queue before
+/// the DDI acknowledges it.  This is move-only because the embedded `Binding`
+/// is the candidate-custody token.
+pub(crate) struct QueuedDirectScanoutBinding {
+    candidate: ValidatedDirectScanoutBinding,
+    source_id: u32,
+    primary_segment: u32,
+    primary_address: u64,
+    operation_flags: u32,
+}
+
+impl QueuedDirectScanoutBinding {
+    pub(crate) fn from_exact_os_transition(
+        candidate: ValidatedDirectScanoutBinding,
+        source_id: u32,
+        primary_segment: u32,
+        primary_address: u64,
+        operation_flags: u32,
+    ) -> Self {
+        Self {
+            candidate,
+            source_id,
+            primary_segment,
+            primary_address,
+            operation_flags,
+        }
+    }
+
+    pub(crate) fn resource_id(&self) -> u32 {
+        self.candidate.binding.token().resource_id
+    }
+
+    pub(crate) fn width(&self) -> u32 {
+        self.candidate.binding.token().width
+    }
+
+    pub(crate) fn height(&self) -> u32 {
+        self.candidate.binding.token().height
+    }
+
+    pub(crate) fn format(&self) -> u32 {
+        self.candidate.binding.token().format
+    }
+
+    pub(crate) fn stride(&self) -> u32 {
+        self.candidate.binding.token().stride
+    }
+
+    pub(crate) fn offset(&self) -> u32 {
+        self.candidate.binding.token().offset
+    }
+
+    pub(crate) fn transport_instance(&self) -> u64 {
+        self.candidate.transport_instance
+    }
+
+    pub(crate) fn matches_exact_allocation(
+        &self,
+        handle: usize,
+        generation: u64,
+        resource_id: u32,
+    ) -> bool {
+        self.candidate
+            .binding
+            .token()
+            .matches_allocation(handle, generation, resource_id)
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        Binding<DisplayBacking>,
+        u64,
+        u64,
+        u32,
+        u32,
+        u64,
+        u32,
+    ) {
+        (
+            self.candidate.binding,
+            self.candidate.mode_generation,
+            self.candidate.transport_instance,
+            self.source_id,
+            self.primary_segment,
+            self.primary_address,
+            self.operation_flags,
+        )
+    }
 }
 
 struct CandidateMailbox {
@@ -237,6 +370,10 @@ pub(crate) struct DirectScanoutRuntime {
     mailbox: CandidateMailbox,
     state: SpinLock<RuntimeState>,
     next_plane_generation: AtomicU64,
+    /// Zero closes admission. A nonzero value is the exact live transport epoch
+    /// published only after parking and PlaneState are fully initialized. DIRQL
+    /// validation reads this atomically instead of taking `virtio_lock`.
+    active_transport_instance: AtomicU64,
 }
 
 impl DirectScanoutRuntime {
@@ -245,6 +382,7 @@ impl DirectScanoutRuntime {
             mailbox: CandidateMailbox::new(),
             state: SpinLock::new(RuntimeState::new()),
             next_plane_generation: AtomicU64::new(1),
+            active_transport_instance: AtomicU64::new(0),
         }
     }
 
@@ -255,13 +393,18 @@ impl DirectScanoutRuntime {
             })
             .ok()
     }
+
+    pub(crate) fn active_transport_instance(&self) -> u64 {
+        self.active_transport_instance.load(Ordering::Acquire)
+    }
 }
 
 /// Bounded, nonpageable D2 admission over the exact OS `hAllocation`.
 ///
 /// This routine performs only handle/object reads, atomics, fixed comparisons,
-/// and a short canonical-owner observation. It neither allocates nor waits and
-/// grants no plane authority until its result is retained in the mailbox.
+/// and immutable canonical-allocation observations. It neither allocates nor
+/// waits and grants no plane authority until its result is retained in the
+/// mailbox or the D4 fixed queue.
 pub(crate) unsafe fn validate_direct_scanout_binding(
     adapter: &AdapterContext,
     h_allocation: HANDLE,
@@ -286,21 +429,16 @@ pub(crate) unsafe fn validate_direct_scanout_binding(
         resource_id,
         allocation_generation,
         transport_instance,
+        backing_size,
     }) = (unsafe { super::create_allocation::direct_scanout_allocation_facts(h_allocation) })
     else {
         record_refusal(&ADMISSION_REFUSALS, b"D2AdmRef", 2);
         return Err(STATUS_INVALID_PARAMETER);
     };
-    let current_transport = adapter
-        .with_virtio(|gpu| gpu.scanout_transport_instance())
-        .unwrap_or(0);
-    let owner = adapter.control_owner();
-    if transport_instance != current_transport
-        || !owner.resource_is_live(resource_id)
-        || owner
-            .resource_size(resource_id)
-            .ok()
-            .is_none_or(|size| size < final_hwa2.byte_size)
+    let current_transport = adapter.direct_scanout.active_transport_instance();
+    if current_transport == 0
+        || transport_instance != current_transport
+        || backing_size < final_hwa2.byte_size
     {
         record_refusal(&ADMISSION_REFUSALS, b"D2AdmRef", 3);
         return Err(STATUS_DEVICE_NOT_READY);
@@ -334,6 +472,7 @@ pub(crate) unsafe fn validate_direct_scanout_binding(
             allocation_generation,
         ),
         mode_generation: mode.generation,
+        transport_instance,
     })
 }
 
@@ -365,6 +504,137 @@ pub(crate) fn retain_candidate(
     }
     adapter.signal_hpd();
     STATUS_SUCCESS
+}
+
+/// DPC continuation for one fixed DIRQL/DISPATCH D4 descriptor.
+///
+/// Queue removal already proved the exact descriptor token. This routine
+/// validates the complete response provenance, moves the pre-retained backing
+/// into the ordinary D2 PlaneState, and performs no allocation, wait, control
+/// request, or cleanup callback. An ambiguous response quarantines the real
+/// backing and poisons the plane generation instead of guessing whether QEMU
+/// changed its persistent reader.
+pub(crate) fn complete_queued(
+    adapter: &AdapterContext,
+    completion: crate::virtio::gpu::DirectQueueCompletion,
+) {
+    let resource_id = completion.work.resource_id();
+    let work_instance = completion.work.transport_instance();
+    let response = (completion.written_length as usize
+        == core::mem::size_of::<VirtioGpuCtrlHdr>())
+    .then(|| {
+        // SAFETY: the fixed byte array contains exactly one complete response
+        // when the used length matches; the array has no alignment promise.
+        unsafe {
+            core::ptr::read_unaligned(completion.response.as_ptr().cast::<VirtioGpuCtrlHdr>())
+        }
+    });
+    let exact_fence = response.is_some_and(|header| {
+        header.flags == VIRTIO_GPU_FLAG_FENCE
+            && header.fence_id == completion.fence_id
+            && header.ctx_id == 0
+            && header.ring_idx == 0
+            && header.padding == [0; 3]
+    });
+    let accepted = exact_fence
+        && response.is_some_and(|header| header.type_ == VIRTIO_GPU_RESP_OK_NODATA);
+    let rejected = exact_fence
+        && response.is_some_and(|header| HostRejection::from_response_type(header.type_).is_ok());
+    let (
+        binding,
+        mode_generation,
+        candidate_instance,
+        source_id,
+        _primary_segment,
+        primary_address,
+        _operation_flags,
+    ) = completion.work.into_parts();
+
+    let current_mode_generation = match adapter.committed_mode.read() {
+        Ok(CommittedModeRead::Present(observation)) => observation.mode().generation,
+        _ => 0,
+    };
+    let provenance_exact = accepted || rejected;
+    let identity_exact = completion.instance != 0
+        && completion.instance == work_instance
+        && completion.instance == candidate_instance
+        && completion.sequence != 0
+        && completion.fence_id != 0
+        && completion.resource_id == resource_id
+        && source_id == SOURCE_ID
+        && current_mode_generation != 0
+        && current_mode_generation == mode_generation;
+    if !provenance_exact || !identity_exact {
+        let mut state = adapter.direct_scanout.state.lock();
+        state.quarantine(BackendBinding::Real(binding));
+        state.poisoned = true;
+        drop(state);
+        record_refusal(&PLANE_REFUSALS, b"D2PlnRef", 0xf0);
+        return;
+    }
+
+    let key = CompletionKey::new(
+        completion.instance,
+        completion.fence_id,
+        completion.sequence,
+    );
+    let mut transitions: [Option<Transition<DisplayBacking>>; 3] = [None, None, None];
+    let terminal = {
+        let mut state = adapter.direct_scanout.state.lock();
+        if state.poisoned {
+            state.quarantine(BackendBinding::Real(binding));
+            false
+        } else if state.plane.as_ref().is_none_or(|plane| {
+            plane.lifecycle() != Lifecycle::Active
+                || plane.pending_phase() != PendingPhase::None
+                || plane.transport_epoch() != completion.instance
+        }) {
+            state.quarantine(BackendBinding::Real(binding));
+            state.poisoned = true;
+            false
+        } else {
+            let plane = state.plane.as_mut().expect("plane checked above");
+            let mut retained = plane.retain_real_candidate(binding, completion.sequence);
+            if retained.effect != Effect::CandidateRetained {
+                if let Some(candidate) = retained.release_candidate.take() {
+                    state.quarantine(candidate);
+                }
+                state.poisoned = true;
+                transitions[0] = Some(retained);
+                false
+            } else {
+                transitions[0] = Some(retained);
+                let submitted = plane.submit_candidate(key);
+                let submitted_ok = submitted.effect == Effect::CandidateSubmitted;
+                transitions[1] = Some(submitted);
+                if !submitted_ok {
+                    state.poisoned = true;
+                    false
+                } else {
+                    let completed = plane.complete_replacement(key, accepted);
+                    let terminal = (accepted && completed.effect == Effect::ReplacementLatched)
+                        || (!accepted && completed.effect == Effect::ReplacementFailed);
+                    if !terminal {
+                        state.poisoned = true;
+                    }
+                    transitions[2] = Some(completed);
+                    terminal
+                }
+            }
+        }
+    };
+    for transition in transitions.into_iter().flatten() {
+        finish_transition(adapter, transition);
+    }
+    if !terminal {
+        record_refusal(&PLANE_REFUSALS, b"D2PlnRef", 0xf1);
+        return;
+    }
+    if accepted {
+        adapter
+            .last_primary_address
+            .store(primary_address, Ordering::Release);
+    }
 }
 
 /// Replace the current reader with parking for an OS-requested zero-plane
@@ -927,6 +1197,14 @@ pub(crate) fn start(
         return Ok(());
     }
     adapter.with_scanout_lifecycle(passive, |guard| {
+        // Admission must remain closed while parking/PlaneState construction
+        // performs PASSIVE control work. Clear a stale generation before any
+        // fallible step so a failed restart cannot leave D4 accepting against
+        // an earlier plane.
+        adapter
+            .direct_scanout
+            .active_transport_instance
+            .store(0, Ordering::Release);
         let expected_instance = adapter
             .with_virtio(|gpu| gpu.scanout_transport_instance())
             .map_err(|_| VirtioError::DeviceError)?;
@@ -975,6 +1253,11 @@ pub(crate) fn start(
         state.plane = Some(plane);
         state.parking_reserve = Some(parking);
         state.poisoned = false;
+        drop(state);
+        adapter
+            .direct_scanout
+            .active_transport_instance
+            .store(expected_instance, Ordering::Release);
         Ok(())
     })
 }
@@ -987,6 +1270,10 @@ pub(crate) fn prepare_reset(
     if !crate::virtio::KMD_D2_OWNER_ENABLED {
         return;
     }
+    adapter
+        .direct_scanout
+        .active_transport_instance
+        .store(0, Ordering::Release);
     adapter.with_scanout_lifecycle(passive, |_guard| {
         let _ = unbind_locked(passive, adapter, reason, true);
         if adapter.committed_mode.crash_reset_close().is_err() {
@@ -999,6 +1286,10 @@ pub(crate) fn complete_verified_reset(passive: PassiveLevel, adapter: &AdapterCo
     if !crate::virtio::KMD_D2_OWNER_ENABLED {
         return;
     }
+    adapter
+        .direct_scanout
+        .active_transport_instance
+        .store(0, Ordering::Release);
     adapter.with_scanout_lifecycle(passive, |_guard| {
         if adapter.direct_scanout.mailbox.take().is_none()
             && adapter.direct_scanout.mailbox.busy()
@@ -1035,6 +1326,10 @@ pub(crate) fn complete_removal(passive: PassiveLevel, adapter: &AdapterContext) 
     if !crate::virtio::KMD_D2_OWNER_ENABLED {
         return;
     }
+    adapter
+        .direct_scanout
+        .active_transport_instance
+        .store(0, Ordering::Release);
     adapter.with_scanout_lifecycle(passive, |_guard| {
         let transition = {
             let mut state = adapter.direct_scanout.state.lock();
@@ -1098,6 +1393,13 @@ pub(crate) fn retire_allocation(
 ) -> bool {
     if !crate::virtio::KMD_D2_OWNER_ENABLED {
         return true;
+    }
+    if adapter.d4_queue_holds_allocation(
+        h_allocation as usize,
+        generation,
+        resource_id,
+    ) {
+        return false;
     }
     adapter.with_scanout_lifecycle(passive, |_guard| {
         match adapter.direct_scanout.mailbox.take_matching(

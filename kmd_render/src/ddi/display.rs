@@ -6,6 +6,7 @@
 //! exportable.
 
 use core::ffi::c_void;
+use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use helios_protocol::{HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD};
@@ -59,6 +60,42 @@ pub static PRESENT_LAST_DST_OPEN_LOW: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_FLAGS: AtomicU32 = AtomicU32::new(0);
 pub static PRESENT_LAST_STATUS: AtomicU32 = AtomicU32::new(0);
 pub(crate) static VIDPN_SOURCE_ADDRESS_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Non-cloneable capability proving that the classic SetVidPn callback is
+/// currently executing above DISPATCH_LEVEL in the classic WDK callback.
+///
+/// Its constructor is private to this module and is called only by the classic
+/// DDI. The sole consumer is the fixed D4 queue operation; no general transport
+/// borrow, allocator, waiter, spinlock guard, or cleanup API accepts it. DIRQL
+/// does not itself prove ownership of dxgkrnl's interrupt lock; the queue takes
+/// its own bounded, nonblocking exclusion gate.
+pub(crate) struct SetVidPnDirql<'a> {
+    adapter: *const AdapterContext,
+    _scope: PhantomData<&'a AdapterContext>,
+    _not_send: PhantomData<*mut ()>,
+}
+
+impl<'a> SetVidPnDirql<'a> {
+    const DISPATCH_LEVEL_IRQL: u8 = 2;
+
+    fn mint(adapter: &'a AdapterContext) -> Option<Self> {
+        // SAFETY: KeGetCurrentIrql is callable at every IRQL.
+        (unsafe { KeGetCurrentIrql() } > Self::DISPATCH_LEVEL_IRQL).then_some(Self {
+            adapter,
+            _scope: PhantomData,
+            _not_send: PhantomData,
+        })
+    }
+
+    pub(crate) fn authorizes(&self, adapter: &AdapterContext) -> bool {
+        core::ptr::eq(self.adapter, adapter)
+            // SAFETY: KeGetCurrentIrql is callable at every IRQL. This second
+            // check catches a proof illicitly retained past the callback even
+            // though the lifetime and !Send marker already prevent safe code
+            // from doing so.
+            && unsafe { KeGetCurrentIrql() } > Self::DISPATCH_LEVEL_IRQL
+    }
+}
 
 /// Pin `kmd_logic`'s hand-written virtio values to the wire constants.
 ///
@@ -824,7 +861,7 @@ unsafe fn dxgkddi_present_inner(
             PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
             return STATUS_INVALID_PARAMETER;
         };
-        let Some(dxgi_format) = source.resolved_dxgi_format() else {
+        let Some(_dxgi_format) = source.resolved_dxgi_format() else {
             crate::diag::record_named_bytes(b"PBFlip", 0xE2);
             PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
             return STATUS_INVALID_PARAMETER;
@@ -844,11 +881,9 @@ unsafe fn dxgkddi_present_inner(
         }
 
         // The FLIP itself (epoch stamp, VidMm physical address, CRTC_VSYNC
-        // retirement) always belongs to the allocation-list source; the ONLY
-        // per-present override is the D4b snapshot BIND-TARGET descriptor
-        // taken from the Render-command stash above, after per-arm validation.
-        // (The old `PBIdOk` cross-check against the PresentCb private payload
-        // is retired with the channel — see the note at the top of this file.)
+        // retirement) always belongs to the allocation-list source. D4 removes
+        // the former snapshot bind-target override; the Render-command stash is
+        // still consumed only by the unrelated legacy BLT arm above.
 
         // It must not program scanout here: dxgkrnl subsequently names the
         // allocation that actually reached the VidPn source through
@@ -894,54 +929,19 @@ unsafe fn dxgkddi_present_inner(
                 return STATUS_INVALID_PARAMETER;
             }
         };
-        // The allocation list carries the DEVICE-SPECIFIC open handle; the
-        // scan-out path keys on the GLOBAL one. Bridge them through the venus
-        // resource id, which is the only identity both sides hold honestly —
-        // see `create_allocation::SCANOUT_ALLOCS`. Measured before this
-        // existed: `VpDmaF=165, VpDmaA=0, VpPrF=165`, i.e. every DMA flip
-        // failed to pair because the open handle is not an `AllocationContext*`.
-        let Some(flip_allocation) =
-            crate::ddi::create_allocation::scanout_allocation_for_resource(source.resource_id)
-        else {
-            crate::diag::record_named_bytes(b"PBFlip", 0xE6);
-            PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
-            return STATUS_INVALID_PARAMETER;
-        };
-        // D4b SNAPSHOT SUBSTITUTION, decided HERE and carried by value. The
-        // candidate arrived through the RENDER command's per-context stash
-        // (taken above) — NOT through `pPrivateDriverData`, which dxgkrnl does
-        // not forward to this DDI on flip presents (`PBIdOk` = "no payload"
-        // across three driver generations). Every field the stash claims is
-        // validated per-arm against the ALLOCATION-LIST source (extent) and
-        // the direct-scan-out layout rules including the undersize guard
-        // (`helios_kmd_logic::snapshot_bind`). Any failure falls back to
-        // binding the flipped allocation exactly as today, counted `SnFbk`; a
-        // validated descriptor counts `SnSub` ONCE per flip, at this single
-        // decision site.
-        let snapshot = stashed_snapshot.and_then(|candidate| {
-            if candidate.purpose != 0 {
-                crate::ddi::scanout_trace::note_snapshot_fallback();
-                return None;
-            }
-            match helios_kmd_logic::snapshot_bind::validate(&candidate, source.width, source.height)
-            {
-                Ok(()) => {
-                    crate::ddi::scanout_trace::note_snapshot_substituted();
-                    Some(candidate)
-                }
-                Err(_) => {
-                    crate::ddi::scanout_trace::note_snapshot_fallback();
-                    None
-                }
-            }
-        });
+        // Preserve the exact device-specific open handle supplied in this
+        // allocation-list slot. The DISPATCH flip arm resolves it through the
+        // per-open canonical allocation association; no resource-id reverse
+        // lookup, current-primary shortcut, or snapshot substitution remains.
+        let flip_allocation = flip_source.handle();
         if let Err(status) = unsafe {
             crate::ddi::present_packet::PresentFlipPrivate::write(
                 args.pDmaBufferPrivateData,
                 args.DmaBufferPrivateDataSize,
                 flip_allocation,
                 flip_source.physical_address(),
-                snapshot,
+                flip_source.segment_id(),
+                0,
             )
         } {
             crate::diag::record_named_bytes(b"PBFlip", 0xE5);
@@ -1326,6 +1326,9 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
         return STATUS_NOT_SUPPORTED;
     }
     let adapter = unsafe { &*p };
+    if crate::virtio::KMD_D2_OWNER_ENABLED {
+        return unsafe { set_vidpn_source_address_d4(adapter, address) };
+    }
     // Unsampled, atomics-only, and FIRST — before any refusal below can hide the
     // fact that dxgkrnl called at all. `VpEnt` not moving during a workload is
     // itself the answer to "why is the bind pinned"; every sampled `Sc*` value
@@ -1398,6 +1401,99 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
     unsafe { apply_vidpn_source_address(passive, adapter, h_alloc) }
 }
 
+const CLASSIC_MODE_CHANGE: u32 = 0x0000_0001;
+const CLASSIC_FLIP_IMMEDIATE: u32 = 0x0000_0002;
+const CLASSIC_FLIP_ON_NEXT_VSYNC: u32 = 0x0000_0004;
+const CLASSIC_STEREO_MASK: u32 = 0x0000_0038;
+const CLASSIC_SHARED_PRIMARY_TRANSITION: u32 = 0x0000_0040;
+const CLASSIC_INDEPENDENT_FLIP_EXCLUSIVE: u32 = 0x0000_0080;
+const CLASSIC_SUPPORTED_FLAG_MASK: u32 = CLASSIC_MODE_CHANGE
+    | CLASSIC_FLIP_IMMEDIATE
+    | CLASSIC_FLIP_ON_NEXT_VSYNC
+    | CLASSIC_STEREO_MASK
+    | CLASSIC_SHARED_PRIMARY_TRANSITION
+    | CLASSIC_INDEPENDENT_FLIP_EXCLUSIVE;
+const _: () = assert!(CLASSIC_SUPPORTED_FLAG_MASK == 0x0000_00ff);
+
+static D4_CLASSIC_ACCEPTS: AtomicU32 = AtomicU32::new(0);
+static D4_CLASSIC_REFUSALS: AtomicU32 = AtomicU32::new(0);
+
+fn d4_queue_status(error: crate::virtio::VirtioError) -> NTSTATUS {
+    match error {
+        crate::virtio::VirtioError::QueueFull
+        | crate::virtio::VirtioError::BindSequenceExhausted => STATUS_DEVICE_BUSY,
+        _ => STATUS_IO_DEVICE_ERROR,
+    }
+}
+
+/// Owner-enabled classic source switch. Its above-DISPATCH arm has one bounded
+/// call graph: exact immutable validation -> move-only candidate -> fixed queue
+/// publication. No PASSIVE token or general transport/adapter lock is
+/// nameable from that arm.
+unsafe fn set_vidpn_source_address_d4(
+    adapter: &AdapterContext,
+    address: IN_CONST_PDXGKARG_SETVIDPNSOURCEADDRESS,
+) -> NTSTATUS {
+    if !crate::virtio::KMD_D2_OWNER_ENABLED {
+        return STATUS_NOT_SUPPORTED;
+    }
+    if address.is_null()
+        || !(address as *const DXGKARG_SETVIDPNSOURCEADDRESS).is_aligned()
+    {
+        D4_CLASSIC_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    }
+    let args = unsafe { &*address };
+    let flags = unsafe { args.Flags.__bindgen_anon_1.Value };
+    let operation = crate::ddi::direct_scanout::DirectScanoutOperation {
+        immediate_flip: flags & CLASSIC_FLIP_IMMEDIATE != 0,
+        stereo: flags & CLASSIC_STEREO_MASK != 0,
+        shared_primary_transition: flags & CLASSIC_SHARED_PRIMARY_TRANSITION != 0,
+        independent_flip_exclusive: flags & CLASSIC_INDEPENDENT_FLIP_EXCLUSIVE != 0,
+        unsupported_or_reserved_flags: flags & !CLASSIC_SUPPORTED_FLAG_MASK,
+    };
+    let candidate = match unsafe {
+        crate::ddi::direct_scanout::validate_direct_scanout_binding(
+            adapter,
+            args.hAllocation,
+            args.VidPnSourceId,
+            operation,
+            helios_kmd_logic::direct_scanout_admission::PlaneFacts::Classic,
+        )
+    } {
+        Ok(candidate) => candidate,
+        Err(status) => {
+            D4_CLASSIC_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            return status;
+        }
+    };
+    let work = crate::ddi::direct_scanout::QueuedDirectScanoutBinding::from_exact_os_transition(
+        candidate,
+        args.VidPnSourceId,
+        args.PrimarySegment,
+        args.PrimaryAddress.QuadPart as u64,
+        flags,
+    );
+    let queued = if let Some(proof) = SetVidPnDirql::mint(adapter) {
+        // SAFETY: this is the sole proof mint and it is nested directly in the
+        // WDK classic callback. The proof grants only the nonblocking fixed-slot
+        // gateway; it does not claim an implicit dxgkrnl interrupt lock.
+        unsafe { adapter.enqueue_d4_scanout_dirql(&proof, work) }
+    } else {
+        adapter.enqueue_d4_scanout_dispatch(work)
+    };
+    match queued {
+        Ok(()) => {
+            D4_CLASSIC_ACCEPTS.fetch_add(1, Ordering::Relaxed);
+            STATUS_SUCCESS
+        }
+        Err(error) => {
+            D4_CLASSIC_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            d4_queue_status(error)
+        }
+    }
+}
+
 /// Arm the deferred scan-out programming for the DMA-BUFFER FLIP contract.
 ///
 /// The MMIO path reaches the same state through
@@ -1415,19 +1511,38 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
 /// NOT raised.
 ///
 /// # Safety
-/// `h_alloc` is the allocation handle dxgkrnl placed in the present allocation
-/// list and this driver copied into the kernel-only DMA private data.
+/// `h_alloc` is the device-specific open handle dxgkrnl placed in the present
+/// allocation list and this driver copied into kernel-only DMA private data.
 pub(crate) unsafe fn arm_dma_flip_programming(
     adapter: &AdapterContext,
     h_alloc: HANDLE,
+    primary_segment: u32,
     primary_address: u64,
+    operation_flags: u32,
     present_epoch: u64,
-    snapshot: Option<SnapshotDescriptor>,
 ) -> bool {
-    // Segment and flags are the MMIO path's `DXGKARG_SETVIDPNSOURCEADDRESS`
-    // fields, which this contract has no equivalent of. The segment is only
-    // ever echoed back in diagnostics, and the flags word carries no bit this
-    // driver reads, so pairing 0 for both is honest rather than invented.
+    if crate::virtio::KMD_D2_OWNER_ENABLED {
+        return unsafe {
+            arm_dma_flip_d4(
+                adapter,
+                h_alloc,
+                primary_segment,
+                primary_address,
+                operation_flags,
+            )
+        };
+    }
+    let Some((h_alloc, _facts)) = (unsafe {
+        crate::ddi::create_allocation::open_direct_scanout_allocation_facts(h_alloc)
+    }) else {
+        crate::ddi::scanout_trace::note_ddi_pair_failed();
+        return false;
+    };
+    let snapshot: Option<SnapshotDescriptor> = None;
+    // The DMA packet carries the exact allocation-list segment and its exact
+    // operation word (currently zero because ordinary Present supplies no
+    // classic SetVidPn flags). They stay paired with this open allocation and
+    // physical address all the way into the legacy production continuation.
     //
     // `present_epoch` rides on the allocation for a load-bearing reason:
     // `pending_vidpn_allocation` is a single slot that coalesces (`VpCoal`), so
@@ -1452,9 +1567,9 @@ pub(crate) unsafe fn arm_dma_flip_programming(
     if !unsafe {
         crate::ddi::create_allocation::set_vidpn_primary_address(
             h_alloc,
-            0,
+            primary_segment,
             primary_address,
-            0,
+            operation_flags,
             present_epoch,
             frame_watermark,
             snapshot,
@@ -1517,6 +1632,63 @@ pub(crate) unsafe fn arm_dma_flip_programming(
     // fast completion rather than race a duplicate synchronous SET.
     adapter.signal_hpd();
     true
+}
+
+unsafe fn arm_dma_flip_d4(
+    adapter: &AdapterContext,
+    h_open_allocation: HANDLE,
+    primary_segment: u32,
+    primary_address: u64,
+    operation_flags: u32,
+) -> bool {
+    if !crate::virtio::KMD_D2_OWNER_ENABLED {
+        return false;
+    }
+    let Some((allocation, _facts)) = (unsafe {
+        crate::ddi::create_allocation::open_direct_scanout_allocation_facts(h_open_allocation)
+    }) else {
+        D4_CLASSIC_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        return false;
+    };
+    let operation = crate::ddi::direct_scanout::DirectScanoutOperation {
+        immediate_flip: operation_flags & CLASSIC_FLIP_IMMEDIATE != 0,
+        stereo: operation_flags & CLASSIC_STEREO_MASK != 0,
+        shared_primary_transition: operation_flags & CLASSIC_SHARED_PRIMARY_TRANSITION != 0,
+        independent_flip_exclusive: operation_flags & CLASSIC_INDEPENDENT_FLIP_EXCLUSIVE != 0,
+        unsupported_or_reserved_flags: operation_flags & !CLASSIC_SUPPORTED_FLAG_MASK,
+    };
+    let candidate = match unsafe {
+        crate::ddi::direct_scanout::validate_direct_scanout_binding(
+            adapter,
+            allocation,
+            0,
+            operation,
+            helios_kmd_logic::direct_scanout_admission::PlaneFacts::Classic,
+        )
+    } {
+        Ok(candidate) => candidate,
+        Err(_) => {
+            D4_CLASSIC_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+    };
+    let work = crate::ddi::direct_scanout::QueuedDirectScanoutBinding::from_exact_os_transition(
+        candidate,
+        0,
+        primary_segment,
+        primary_address,
+        operation_flags,
+    );
+    match adapter.enqueue_d4_scanout_dispatch(work) {
+        Ok(()) => {
+            D4_CLASSIC_ACCEPTS.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+        Err(_) => {
+            D4_CLASSIC_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+    }
 }
 
 /// Enqueue this flip's `SET_SCANOUT_BLOB` NOW, from the flip arm, instead of
@@ -2128,10 +2300,8 @@ pub(crate) fn record_scanout_reject_counters() {
     crate::diag::record_named_bytes(b"ScNoTgt", SC_NO_TARGET.load(Relaxed));
     crate::diag::record_named_bytes(b"ScCpyErr", SC_COPY_ERR.load(Relaxed));
     crate::diag::record_named_bytes(b"ScUnav", SC_UNAVAILABLE.load(Relaxed));
-    crate::diag::record_named_bytes(
-        b"ScAlcFul",
-        crate::ddi::create_allocation::SCANOUT_ALLOC_FULL.load(Relaxed),
-    );
+    crate::diag::record_named_bytes(b"D4ClsOk", D4_CLASSIC_ACCEPTS.load(Relaxed));
+    crate::diag::record_named_bytes(b"D4ClsRef", D4_CLASSIC_REFUSALS.load(Relaxed));
     crate::diag::record_named_bytes(b"ScRetry", SC_RETRY.load(Relaxed));
     crate::diag::record_named_bytes(b"ScGaveUp", SC_GAVE_UP.load(Relaxed));
     // R509: gate-generation health. Both must read 0 on a normal boot.
@@ -2140,6 +2310,7 @@ pub(crate) fn record_scanout_reject_counters() {
         b"ScGateCx",
         crate::adapter::GATE_RAISE_CAS_GIVEUPS.load(Relaxed),
     );
+    crate::ddi::direct_scanout::record_refusal_counters();
 }
 
 /// Zero every refusal counter. StartDevice only.
@@ -2149,6 +2320,9 @@ pub(crate) fn record_scanout_reject_counters() {
 /// readable fact.
 pub(crate) fn reset_scanout_reject_counters() {
     use core::sync::atomic::Ordering::Relaxed;
+    D4_CLASSIC_ACCEPTS.store(0, Relaxed);
+    D4_CLASSIC_REFUSALS.store(0, Relaxed);
+    crate::ddi::direct_scanout::reset_refusal_counters();
     for c in [
         &SC_BAD_ALLOC,
         &SC_BAD_EXTENT,

@@ -137,7 +137,7 @@ pub static D3D12_SUBMIT_ZERO_FENCE: AtomicU32 = AtomicU32::new(0);
 /// the 32-byte record).
 ///
 /// Must stay 0: `DxgkDdiCreateContext` reports
-/// `PRESENT_DMA_PRIVATE_DATA_BYTES = 88` for EVERY context (`device.rs:425`), so
+/// `PRESENT_DMA_PRIVATE_DATA_BYTES = 64` for EVERY context, so
 /// a nonzero value means a context this driver did not size, i.e. the packet was
 /// submitted with no boundary and the D3D12 fence is reporting decode.
 pub static D3D12_SUBMIT_MERGE_FAILS: AtomicU32 = AtomicU32::new(0);
@@ -905,9 +905,9 @@ unsafe fn note_present_private_shape(
 /// This is the DMA-flip contract's equivalent of `SetVidPnSourceAddress`: for
 /// an IMMEDIATE flip dxgkrnl never calls that DDI, so unless the driver
 /// programs the display from HERE the scan-out never follows the flip at all
-/// (ROADMAP defect 0aa). Runs at DISPATCH; the programming itself is deferred
-/// to the PASSIVE display worker exactly as the MMIO path defers it, but with
-/// this flip's DMA fence still outstanding while it happens.
+/// (ROADMAP defect 0aa). Runs at DISPATCH. The dormant D4 arm publishes its
+/// fixed descriptor synchronously through interrupt serialization; the legacy
+/// production arm still defers to the PASSIVE display worker.
 ///
 /// Mints this flip's PRESENTATION EPOCH before the handle is published to the
 /// display worker, so the worker can never bind a presentation whose epoch does
@@ -920,7 +920,7 @@ unsafe fn note_present_private_shape(
 /// `base`/`total` describe the kernel-only DMA private-data buffer dxgkrnl
 /// supplied for this submission.
 unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) {
-    let Some((h_alloc, primary_address, snapshot)) =
+    let Some((h_alloc, primary_address, primary_segment, operation_flags)) =
         (unsafe { crate::ddi::present_packet::PresentFlipPrivate::take(base, total) })
     else {
         return;
@@ -933,20 +933,23 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
     // The boundary is captured at the present marker instead; see
     // `arm_scanout_refresh_after_current_venus`.
     //
-    // The epoch this flip presents under. It used to gate the flip's own DMA
+    // The epoch this legacy flip presents under. It used to gate the flip's own DMA
     // fence and the CRTC_VSYNC address; both halves were measured inert against
     // the black frames (the 2×2 factorial, 46 681 frames) because the app's
     // clear never travels in a WDDM DMA buffer and therefore waits on no
     // completion this driver controls. It is minted here regardless, because the
-    // flush executor's ownership gate decides with it.
-    let epoch = adapter.mint_present_epoch();
+    // flush executor's ownership gate decides with it. D4 has its own exact
+    // PlaneState lifetime and must not mint an unconsumed legacy lease.
+    let legacy_epoch = (!crate::virtio::KMD_D2_OWNER_ENABLED)
+        .then(|| adapter.mint_present_epoch());
     if unsafe {
         crate::ddi::display::arm_dma_flip_programming(
             adapter,
             h_alloc,
+            primary_segment,
             primary_address,
-            epoch,
-            snapshot,
+            operation_flags,
+            legacy_epoch.unwrap_or(0),
         )
     } {
         crate::ddi::scanout_trace::note_dma_flip_armed();
@@ -957,7 +960,9 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
     // ahead of `bound_epoch` and the ownership gate reads a presentation that
     // can never arrive as one that is still coming (`VpPrF` counts the pairing
     // failure itself).
-    adapter.end_scanout_leases_through(epoch, crate::ddi::scanout_trace::LeaseEnd::Cancelled);
+    if let Some(epoch) = legacy_epoch {
+        adapter.end_scanout_leases_through(epoch, crate::ddi::scanout_trace::LeaseEnd::Cancelled);
+    }
 }
 
 unsafe fn decode_virtual_present_fence(
@@ -1397,6 +1402,9 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
         };
         let reserve = adapter.bar_segment().map_or(0, |bar| bar.size);
         let absent = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
+        if !absent.installable() {
+            return STATUS_DEVICE_NOT_READY;
+        }
         let mut gpu = match crate::virtio::VirtioGpu::init(passive, dxgkrnl) {
             Ok(gpu) => gpu,
             Err(error) => {
@@ -1411,7 +1419,7 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
                 .is_some_and(|window| adapter.bar_segment().is_some_and(|bar| window.base == bar.gpa));
             if !exact_window || !gpu.configure_window_reserve(reserve) {
                 crate::diag::fault(crate::diag::FaultCounter::StVioR, u32::MAX);
-                return match crate::virtio::VirtioGpu::reset_unpublished_or_retain(gpu) {
+                return match crate::virtio::VirtioGpu::reset_unpublished_or_retain(passive, gpu) {
                     Ok(()) => STATUS_DEVICE_NOT_READY,
                     Err(error) => error.into(),
                 };

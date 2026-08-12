@@ -1236,6 +1236,9 @@ run_gate "disabled KMD D2/D3 authority has one atomic activation boundary" \
     python3 -c "$K4_RUST_MASK_PY
 $DORMANT_OWNER_GATE_PY" "$REPO"
 
+run_gate "D4 classic/DMA DIRQL enqueue is capability-restricted and fixed-storage" \
+    python3 "$REPO/tools/d4-dirql-gate.py" "$REPO"
+
 printf '\n'
 if [ ${#FAILED[@]} -eq 0 ]; then
     if [ ${#SKIPPED[@]} -eq 0 ]; then
