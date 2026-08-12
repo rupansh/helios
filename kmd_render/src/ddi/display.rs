@@ -1623,9 +1623,7 @@ unsafe fn fast_bind_from_flip(
         // command is consumed before then. This applies to snapshots as well:
         // the exact carried boundary protects both host selection and the
         // response-side RESOURCE_FLUSH read.
-        v.stage_scanout_bind(request, |resource_id| {
-            adapter.mint_scanout_bind_seq(resource_id)
-        })
+        v.stage_scanout_bind(request, adapter)
     });
     match outcome {
         Ok(crate::virtio::FastBindDispatch::Queued) => {
@@ -2555,58 +2553,44 @@ unsafe fn program_vidpn_source_inner(
             target.pitch(),
             target.plane_offset(),
             sync_timeline,
+            None,
         );
-        let bind_seq = match set {
-            Ok(bind_seq) => bind_seq,
-            Err(crate::virtio::VirtioError::PresentationSuperseded) => {
+        let bind_identity = match set {
+            crate::virtio::ctrl::ScanoutSetOutcome::Accepted(bind_identity) => bind_identity,
+            crate::virtio::ctrl::ScanoutSetOutcome::DefiniteNotEnqueued {
+                error: crate::virtio::VirtioError::PresentationSuperseded,
+                instance,
+            } => {
                 // The descriptor floor rejected this request after worker
-                // staging. It never reached the host; clear only this exact
-                // reservation and consume the WDDM handle terminally instead
-                // of retrying an epoch that can only move scanout backward.
+                // staging. The producing transport cleared only this exact
+                // reservation before returning the refusal.
                 if let Some(request) = worker_request {
-                    let _ = adapter.with_virtio(|v| v.release_failed_sync_worker_bind(request));
+                    let _ = adapter
+                        .with_virtio(|v| v.release_sync_claim_if_instance(instance, request));
                 }
                 return Ok(ScanoutOutcome::Superseded);
             }
-            Err(crate::virtio::VirtioError::PublicationBusy) => {
-                // The enqueue-side backstop observed a transaction claimed
-                // after worker staging (or after the fallback preflight).  No
-                // descriptor reached the wire, so drop only this worker's
-                // reservation and hand the exact hAllocation back to the
-                // Deferred wrapper.  In particular, do not let ctrl_roundtrip
-                // sleep/retry while holding scanout_mutex: the older
-                // transaction's HPD worker needs this mutex to flush.
-                if let Some(request) = worker_request {
-                    let _ = adapter.with_virtio(|v| v.release_failed_sync_worker_bind(request));
-                }
-                return Ok(ScanoutOutcome::Deferred);
-            }
-            Err(crate::virtio::VirtioError::Timeout) => {
-                // The stack waiter detached, not the host descriptor. Its full
-                // request remains in the in-flight transaction so a late OK
-                // response can be applied/flush-armed by the DPC. Retain the
-                // exact pending handle and programming gate through the normal
-                // Deferred wrapper; releasing either here would allow a newer
-                // SET to overtake an unknown host selection.
-                return Ok(ScanoutOutcome::Deferred);
-            }
-            Err(_) => {
-                // Pre-wire/enqueue refusal has no host-visible SET, while a
-                // host-error response already cleared its exact transaction in
-                // the used-ring drain. Both may release only this worker's
-                // reservation and let the normal recovery path retry.
-                if let Some(request) = worker_request {
-                    let _ = adapter.with_virtio(|v| v.release_failed_sync_worker_bind(request));
-                }
+            crate::virtio::ctrl::ScanoutSetOutcome::Rejected => {
+                // The producing drain reconciled the exact request and worker
+                // claim before publishing this documented host rejection.
                 return Err(ScanoutReject::SetFailed);
             }
+            crate::virtio::ctrl::ScanoutSetOutcome::DefiniteNotEnqueued { error: _, instance } => {
+                if let Some(request) = worker_request {
+                    let _ = adapter
+                        .with_virtio(|v| v.release_sync_claim_if_instance(instance, request));
+                }
+                return Ok(ScanoutOutcome::Deferred);
+            }
+            crate::virtio::ctrl::ScanoutSetOutcome::Ambiguous => {
+                // No current-transport lookup is allowed here. On ambiguity the
+                // producing transport retains the request; on a pre-wire refusal
+                // it either cleared the exact claim under its own lock or left it
+                // conservatively reserved (for example final QueueFull).
+                return Ok(ScanoutOutcome::Deferred);
+            }
         };
-        // Persist the host-visible selection before any later bookkeeping.
-        // DestroyAllocation consults this under virtio_lock so it can disable a
-        // resource even if a DPC/worker handoff has not yet published it.
-        let _ = adapter
-            .with_virtio(|v| v.note_host_accepted_scanout_bind(bind_seq, target.resource_id()));
-        trace.flags |= flags::BOUND;
+        let bind_sequence = bind_identity.sequence();
         // THE WIRE-ORDER GUARD. This bookkeeping runs at PASSIVE after the
         // round-trip returned, so it can chronologically FOLLOW the application
         // of a bind that was enqueued after it — the ordinary case at a
@@ -2615,82 +2599,64 @@ unsafe fn program_vidpn_source_inner(
         // this older one would leave `host_bound_scanout_resource` naming a
         // buffer the host is no longer reading, which the flush executor's
         // `RfUnb` arm then refuses for the rest of the binding's life.
-        let adopted = adapter.with_wddm_notify_lock(|guard| {
-            let adopted = adapter.adopt_scanout_bind_seq(bind_seq);
-            if adopted {
-                // Sample BEFORE `remember_scanout_blob` overwrites it. Only a
-                // RESOURCE change supersedes an older presentation's lease; a
-                // same-resource rebind can still be read by a later flush.
-                let previous = adapter.host_bound_scanout_resource.load(Ordering::Acquire);
-                // Keep the adapter-owned fallback cache separate from a rotating
-                // DWM direct primary.  All identity publication is serialized
-                // with the DPC's fast-bind transition.
-                if !source.direct_scanout {
-                    adapter.remember_primary_scanout(
+        let apply = adapter.with_wddm_notify_lock(|guard| {
+            guard
+                .with_virtio(|order, v| {
+                    v.apply_sync_scanout_bind(
+                        order,
+                        adapter,
+                        bind_identity,
                         target.resource_id(),
                         target.width(),
                         target.height(),
-                        target.pitch(),
-                        target.plane_offset(),
-                        target.venus_alloc_size(),
-                        target.memory_type_index(),
-                        target.dxgi_format(),
-                    );
-                }
-                adapter.remember_scanout_blob(
-                    target.resource_id(),
-                    target.width(),
-                    target.height(),
-                );
+                        worker_request,
+                        (!source.direct_scanout).then_some((
+                            target.resource_id(),
+                            target.width(),
+                            target.height(),
+                            target.pitch(),
+                            target.plane_offset(),
+                            target.venus_alloc_size(),
+                            target.memory_type_index(),
+                            target.dxgi_format(),
+                        )),
+                        source.direct_scanout.then_some((
+                            source.present_epoch,
+                            source.primary_address,
+                            source.frame_watermark,
+                        )),
+                    )
+                })
+                .unwrap_or(crate::virtio::gpu::SyncBindApply::Foreign)
+        });
+        match apply {
+            crate::virtio::gpu::SyncBindApply::Applied { ready, carried } => {
+                // Persist the host-visible selection only after the exact
+                // producing transport accepted and applied this move-only
+                // identity.
+                trace.flags |= flags::BOUND;
                 if source.direct_scanout {
-                    let superseded = previous != 0 && previous != target.resource_id();
-                    adapter.publish_bound_epoch(source.present_epoch, superseded);
-                    adapter.publish_bound_primary(source.primary_address);
                     crate::ddi::scanout_timeline::note(
                         crate::ddi::scanout_timeline::kind::BIND_APPLY,
                         crate::ddi::scanout_timeline::flag::SUCCESS,
                         source.present_epoch,
                         source.frame_watermark,
-                        bind_seq,
+                        bind_sequence,
                         target.resource_id(),
-                        previous,
+                        0,
                     );
-
-                    let refresh = if adapter.knobs().bind_flush_immediate {
-                        adapter.request_scanout_refresh_for_locked(guard, target.resource_id());
-                        (true, false)
-                    } else {
-                        let refresh = adapter.arm_bind_refresh_locked(
-                            guard,
-                            target.resource_id(),
-                            source.frame_watermark,
-                        );
-                        if refresh.0 {
-                            adapter.request_scanout_refresh_for_locked(guard, target.resource_id());
-                        }
-                        refresh
-                    };
-                    bind_refresh = Some(refresh);
+                    bind_refresh = Some((ready, carried));
                 }
+                crate::diag::record_named_bytes(b"ScPub", target.resource_id());
             }
-            adopted
-        });
-        if adopted {
-            // Registry diagnostics are PASSIVE-only. The notify closure above
-            // runs at DISPATCH_LEVEL and must remain atomics/event/transport
-            // state only.
-            crate::diag::record_named_bytes(b"ScPub", target.resource_id());
-        } else {
-            crate::ddi::scanout_trace::note_fast_bind_late();
-            // The host accepted this direct SET, but a newer wire sequence has
-            // already won the bookkeeping race.  This worker can no longer
-            // arm a refresh for its request, so terminate only its exact
-            // publication transaction; retaining it would permanently fence
-            // every successor behind a host read that will never be queued.
-            if let Some(request) = worker_request {
-                let _ = adapter.with_virtio(|v| {
-                    v.cancel_publication_exact(request.resource_id, request.present_epoch)
-                });
+            crate::virtio::gpu::SyncBindApply::Stale => {
+                crate::ddi::scanout_trace::note_fast_bind_late();
+                return Ok(ScanoutOutcome::Superseded);
+            }
+            crate::virtio::gpu::SyncBindApply::Foreign
+            | crate::virtio::gpu::SyncBindApply::Inconsistent => {
+                crate::diag::record_named_bytes(b"ScBindQ", target.resource_id());
+                return Ok(ScanoutOutcome::Deferred);
             }
         }
     }

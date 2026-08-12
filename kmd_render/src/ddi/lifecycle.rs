@@ -114,7 +114,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // SHARED borrow only. The context pointer has been public to dxgkrnl since
     // AddDevice, and before this function returns the DIRQL ISR, the VSync timer
     // DPC and the HPD worker all build `&AdapterContext` from the same address —
-    // `set_virtio(Some(gpu))` below enables the device mid-function, and
+    // `install_virtio(gpu)` below enables the device mid-function, and
     // `start_vsync`/`init_hpd` at the end start the other two. A unique `&mut`
     // spanning that was an unambiguous Stacked-Borrows violation.
     //
@@ -184,7 +184,8 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // Drop resets the device and frees its rings/scratch. Doing it *before*
     // init keeps the ordering safe — otherwise assigning the new transport would
     // drop the old one (resetting the device) right after init configured it.
-    adapter.set_virtio(None);
+    let transport_absent = adapter.remove_virtio_and_reset_scanout_bind_generation();
+    adapter.reset_display_publication_state();
     // Non-zero only if init below fails, so the display-half demotion can report
     // the status that actually killed the transport rather than a bare flag.
     let mut transport_fail_status: u32 = 0;
@@ -209,7 +210,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             adapter
                 .isr_status
                 .store(gpu.isr_status_addr(), core::sync::atomic::Ordering::Release);
-            adapter.set_virtio(Some(gpu));
+            // SAFETY: dxgkrnl serializes StartDevice. `transport_absent` came
+            // from this adapter's immediately preceding removal, and no other
+            // installer is reachable before this call.
+            unsafe { adapter.install_virtio(transport_absent, gpu) };
 
             // An explicit VidMmVramMB registry value remains authoritative.
             // When it is absent, use the exact virtio shared-memory capability
@@ -244,7 +248,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             adapter
                 .isr_status
                 .store(0, core::sync::atomic::Ordering::Release);
-            adapter.set_virtio(None);
+            let _ = adapter.remove_virtio_and_reset_scanout_bind_generation();
             super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None);
         }
     }
@@ -288,10 +292,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         }
     }
 
-    // Defensive: a StopDevice on this same context should already have done
-    // this, but a start that inherits a latched gate or a stale resource id from
-    // a previous transport generation is unrecoverable, so pay for it twice.
-    adapter.reset_display_publication_state();
+    // The publication reset ran at the transport-absent edge before init. It
+    // must not run after installation, where a queued successor DPC could have
+    // already published generation-local state.
     // R505: zero the deferred-programming refusal counters and write the zeros
     // through. Registry counter values persist across boots, so without this a
     // reader cannot tell a counter that is merely PRESENT from one that moved
@@ -430,8 +433,8 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // forward through it) and unexamined on another: a DPC already queued
         // when this runs can still resolve `started()` for a stopped device.
         // The DPC's actual work all goes through `with_virtio`, which is
-        // `Err(DeviceNotFound)` once `set_virtio(None)` runs below, so the
-        // window is currently harmless. Clearing the publication properly needs
+        // `Err(DeviceNotFound)` once the transport-removal transition below
+        // runs, so the window is currently harmless. Clearing the publication properly needs
         // the take-and-republish dance `take_paging_ram` already performs, and
         // that is a lifecycle change with its own reboot-level gate — not a
         // T4a minor item.
@@ -476,7 +479,12 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // Tear down the virtio transport: VirtioGpu::drop resets the device and
         // frees its rings (plus any in-flight/parked entry buffers). A later
         // StartDevice re-initializes.
-        adapter.set_virtio(None);
+        let _ = adapter.remove_virtio_and_reset_scanout_bind_generation();
+        // A DPC may have won notify -> virtio after the earlier pre-teardown
+        // display reset but before removal. Removal now makes every late DPC
+        // inert; repeat the idempotent reset at that exact transport-absent edge
+        // so the winner ordering always leaves publication state empty.
+        adapter.reset_display_publication_state();
 
         // Drop the whole transport generation in one store — `bar_segment` and
         // `venus_ctx_id` together, since both are meaningless in the next

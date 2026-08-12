@@ -171,9 +171,9 @@ pub enum FaultCounter {
     /// is 0. Previously reported only through the DiagLevel-gated `diag(0x0136)`,
     /// so a default boot saw nothing but `ScCpy=0xE` / `CpCpy=0xE3`.
     CpTgtE,
-    /// The virtio control ring latched its corruption failure — value is
-    /// `DRAIN_BAD_TOKEN`. Reported from `ResetFromTimeout`, on change only, so a
-    /// TDR storm cannot become a registry write storm.
+    /// The virtio control ring latched its corruption failure. Value packs the
+    /// saturated overlength-completion count in the high half and unmatched-
+    /// token count in the low half.
     StRing,
     /// `stop_hpd` could not prove the HPD worker exited — value is the
     /// `ObReferenceObjectByHandle` status (STATUS_SUCCESS means the bounded join

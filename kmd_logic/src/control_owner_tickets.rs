@@ -2320,8 +2320,24 @@ mod tests {
         };
         let drops = Rc::new(Cell::new(0));
         let malformed = [
+            (
+                VIRTIO_GPU_RESP_OK_MAP_INFO,
+                size_of::<VirtioGpuCtrlHdr>() - 1,
+            ),
             (VIRTIO_GPU_RESP_OK_NODATA, size_of::<VirtioGpuCtrlHdr>()),
             (VIRTIO_GPU_RESP_OK_MAP_INFO, size_of::<VirtioGpuCtrlHdr>()),
+            (
+                VIRTIO_GPU_RESP_OK_MAP_INFO,
+                size_of::<VirtioGpuRespMapInfo>() - 1,
+            ),
+            (
+                VIRTIO_GPU_RESP_OK_MAP_INFO,
+                size_of::<VirtioGpuRespMapInfo>() + 1,
+            ),
+            (
+                VIRTIO_GPU_RESP_ERR_UNSPEC,
+                size_of::<VirtioGpuRespMapInfo>(),
+            ),
             (0xdead_beef, size_of::<VirtioGpuRespMapInfo>()),
         ];
         for (at, (response_type, written_length)) in malformed.into_iter().enumerate() {
@@ -2357,7 +2373,7 @@ mod tests {
                 row,
                 epoch,
                 ControlVerb::Map,
-                at as u64 + 4,
+                at as u64 + malformed.len() as u64 + 1,
                 &drops,
             );
             let permit = tickets.begin_dispatch(prepared).unwrap();
@@ -2376,7 +2392,10 @@ mod tests {
             ));
             finish(&mut tickets, action);
         }
-        assert_eq!(drops.get(), 9);
+        assert_eq!(
+            drops.get(),
+            (malformed.len() + documented_errors.len()) as u32
+        );
     }
 
     #[test]

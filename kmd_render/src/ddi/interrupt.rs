@@ -61,9 +61,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
     // Promotion and sequence minting share this virtio-lock hold, so the host
     // sees `SET_SCANOUT_BLOB` only after the exact carried boundary retired and
     // its bookkeeping sequence still equals control-FIFO order.
-    let deferred_fast_bind = adapter.with_virtio(|v| {
-        v.service_deferred_scanout_bind(|resource_id| adapter.mint_scanout_bind_seq(resource_id))
-    });
+    let deferred_fast_bind = adapter.with_virtio(|v| v.service_deferred_scanout_bind(adapter));
     match deferred_fast_bind {
         Ok(Some(crate::virtio::FastBindDispatch::Queued)) => {
             crate::ddi::scanout_trace::note_fast_bind_enqueued()
@@ -81,40 +79,21 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
         | Err(_) => {}
     }
 
-    if let Some(request) = adapter
-        .with_virtio(|v| v.take_fast_failure_wake())
-        .ok()
-        .flatten()
-    {
-        // A worker held behind this fast request is the ordinary synchronous
-        // recovery path. Release only the exact waiter and wake it on failure.
-        let _ = adapter.with_virtio(|v| v.release_fast_owned_worker(request));
-        adapter.signal_hpd();
-    }
+    // Consume + release + wake under the producing transport lock, so removal
+    // cannot turn an old-generation effect into a successor wake.
+    let _ = adapter.with_virtio(|v| v.take_fast_failure_wake_and_release(adapter));
 
     // The synchronous VidPN worker uses the identical producer boundary.  Its
     // handle remains in the existing pending slot; waking it only after this
     // exact boundary retires prevents `set_scanout_blob` from racing Venus.
-    if adapter
-        .with_virtio(|v| v.take_ready_worker_scanout_bind())
-        .unwrap_or(false)
-    {
-        adapter.signal_hpd();
-    }
+    let _ = adapter.with_virtio(|v| v.wake_ready_worker_scanout_bind(adapter));
 
     // ── The DISPATCH fast bind's application (ROADMAP defect 0ab-C, D1(ii)) ──
     //
-    // A SECOND, short `with_virtio`, and the separation is the point: the drain
-    // above holds `virtio_lock`, while applying a bind ends in a flush arm that
-    // needs `wddm_notify_lock` — the driver's order is notify → virtio (see
-    // `adapter/locks.rs` and `end_scanout_leases_through`), and inverting it is
-    // a DIRQL deadlock with no attributable bugcheck. So the drain stashes
-    // VALUES and this frame, holding no transport lock, applies them.
-    let fast_bind = adapter
-        .with_virtio(|v| v.take_completed_bind())
-        .ok()
-        .flatten();
-    let fast_terminal_request = fast_bind.map(crate::virtio::gpu::completed_request);
+    // Apply only under notify → virtio ordering. Keeping take, validation,
+    // publication, cancellation and worker release inside that exact transport
+    // lock prevents StopDevice from removing/resetting the generation between
+    // handoff and effects.
     adapter.with_wddm_notify_lock(|guard| {
         // `drain_used` runs under only `virtio_lock`, so a rejected tagged
         // submit can only invalidate its stream there.  Discharge the stale
@@ -148,60 +127,7 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
         // resource that died between the bind and now self-heals exactly as
         // today's stale states do — and host-side FIFO means our bind always
         // precedes any unref of the same resource.
-        if let Some(bind) = fast_bind {
-            if adapter.adopt_scanout_bind_seq(bind.seq) {
-                // The wire-order guard belongs inside the same notify-ordered
-                // transition as every identity/epoch publication.
-                // Sampled under the same ordering scope as the active-identity
-                // publication and boundary insertion.  A rebind to a DIFFERENT
-                // resource ends every older epoch's lease — the control queue is
-                // FIFO, so a returned SET_SCANOUT_BLOB proves every earlier flush
-                // completed.
-                let previous = adapter.host_bound_scanout_resource.load(Ordering::Acquire);
-                let superseded = previous != 0 && previous != bind.resource_id;
-                adapter.remember_scanout_blob(
-                    bind.resource_id,
-                    (bind.wh >> 32) as u32,
-                    bind.wh as u32,
-                );
-                adapter.publish_bound_epoch(bind.present_epoch, superseded);
-                adapter.publish_bound_primary(bind.primary_address);
-                crate::ddi::scanout_timeline::note(
-                    crate::ddi::scanout_timeline::kind::BIND_APPLY,
-                    crate::ddi::scanout_timeline::flag::SUCCESS,
-                    bind.present_epoch,
-                    bind.carried_watermark,
-                    bind.seq,
-                    bind.resource_id,
-                    previous,
-                );
-                crate::ddi::scanout_trace::note_fast_bind_applied();
-
-                let (ready, carried) = adapter.arm_bind_refresh_locked(
-                    guard,
-                    bind.resource_id,
-                    bind.carried_watermark,
-                );
-                if carried {
-                    crate::ddi::scanout_trace::note_bind_watermark_carried();
-                } else {
-                    crate::ddi::scanout_trace::note_bind_watermark_sampled();
-                }
-                crate::ddi::scanout_trace::note_bind_refresh(ready);
-                if ready {
-                    adapter.request_scanout_refresh_for_locked(guard, bind.resource_id);
-                }
-            } else {
-                // The host accepted this SET, but a later bind's bookkeeping
-                // already owns the displayed identity. It cannot arm a flush
-                // for a resource the host has moved on from; resolve only this
-                // full request's transaction, never a resource-wide guess.
-                crate::ddi::scanout_trace::note_fast_bind_late();
-                let _ = guard.with_virtio(|_, v| {
-                    v.cancel_publication_exact(bind.resource_id, bind.present_epoch)
-                });
-            }
-        }
+        adapter.apply_completed_bind_locked(guard);
 
         // Carries the armed resource through: the refresh must flush the frame
         // its marker belonged to, not whatever is bound when the worker runs.
@@ -288,13 +214,6 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             break;
         }
     });
-    if let Some(request) = fast_terminal_request {
-        // A worker deliberately held behind this accepted fast bind can now
-        // rerun/re-evaluate after either an applied or stale terminal outcome.
-        // A stale accepted bind must not leave its exact waiter pinned forever.
-        let _ = adapter.with_virtio(|v| v.release_fast_owned_worker(request));
-        adapter.signal_hpd();
-    }
 }
 
 /// `DxgkDdiInterruptRoutine` — runs at the device's DIRQL; returns TRUE if the

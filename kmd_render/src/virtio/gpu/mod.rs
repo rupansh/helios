@@ -44,13 +44,14 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use bytemuck::Zeroable;
+use helios_kmd_logic::control_ownership::HostRejection;
 use helios_kmd_logic::scanout_read_ledger::LedgerTicket;
 use helios_kmd_logic::scanout_refresh::{Marker as ScanoutRefreshMarker, State as RefreshState};
 use helios_protocol::{
     HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
     VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
-    VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuRespDisplayInfo, VirtioGpuSetScanoutBlob,
-    resp_is_ok,
+    VIRTIO_GPU_RESP_OK_DISPLAY_INFO, VIRTIO_GPU_RESP_OK_NODATA, VirtioGpuCmdSubmit,
+    VirtioGpuCtrlHdr, VirtioGpuRespDisplayInfo, VirtioGpuSetScanoutBlob,
 };
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::pci::PciTransport;
@@ -458,22 +459,40 @@ const IO_NO_INCREMENT: i32 = 0;
 /// Exact terminal cause published to one synchronous or fence waiter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum WaitDisposition {
+pub(crate) enum WaitDisposition {
     Pending = 0,
-    HostResponseCopied = 1,
+    HostResponseAvailable = 1,
     FenceCompleted = 2,
     TransportAborted = 3,
+    MalformedResponse = 4,
 }
 
 impl WaitDisposition {
     fn from_raw(raw: u8) -> Self {
         match raw {
             0 => Self::Pending,
-            1 => Self::HostResponseCopied,
+            1 => Self::HostResponseAvailable,
             2 => Self::FenceCompleted,
             3 => Self::TransportAborted,
+            4 => Self::MalformedResponse,
             _ => Self::TransportAborted,
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SyncResponseObservation {
+    disposition: WaitDisposition,
+    written_length: u32,
+}
+
+impl SyncResponseObservation {
+    pub(crate) const fn disposition(self) -> WaitDisposition {
+        self.disposition
+    }
+
+    pub(crate) const fn written_length(self) -> u32 {
+        self.written_length
     }
 }
 
@@ -485,6 +504,8 @@ pub struct SyncWaitBlock {
     pub event: KEVENT,
     /// First terminal disposition, Release-published before signaling.
     disposition: AtomicU8,
+    /// Exact used-ring length for this response descriptor.
+    response_written: AtomicU32,
     /// The device-written response bytes, copied out of the entry's DMA buffer
     /// by `drain_used` before the event is signaled.
     resp: UnsafeCell<[u8; SYNC_RESP_MAX]>,
@@ -507,7 +528,7 @@ pub struct SyncWaitBlock {
 /// pending Windows primary and its programming ownership indefinitely.
 ///
 /// The four `NonNull`s' validity rests on the adapter outliving the transport,
-/// which StopDevice enforces by ordering (`set_virtio(None)` after cancel/join),
+/// which StopDevice enforces by ordering (transport removal after cancel/join),
 /// and on `init_kernel_events` having run before any `KeSetEvent` on `hpd_event`.
 /// Neither is encodable — the self-referential lifetime (`VirtioGpu` lives inside
 /// the `AdapterContext` it points back into) is what defeats it — so both are
@@ -555,7 +576,7 @@ pub struct ScanoutNotify {
 /// `ScanoutNotify`'s four-pointer doc paragraph was written about.
 ///
 /// Validity rests on the same fact `ScanoutNotify` documents: the adapter
-/// outlives the transport, enforced by ordering in StopDevice (`set_virtio(None)`
+/// outlives the transport, enforced by ordering in StopDevice (transport removal
 /// after cancel/join), and every field this touches is an atomic on the shared
 /// `&AdapterContext` that every DDI, ISR and DPC already holds — no `&mut` to it
 /// exists anywhere in the driver.
@@ -691,7 +712,7 @@ impl Drop for ScanoutFlushToken {
     /// TYPE: a token dropped without `complete` — the enqueue-failure arm
     /// (`resource_flush_async` / `enqueue_async_control` error paths, some at
     /// DISPATCH under `virtio_lock`) and the in-flight table dying with its
-    /// `VirtioGpu` (PASSIVE, `set_virtio(None)`) — still retires its ledger
+    /// `VirtioGpu` (PASSIVE, transport removal) — still retires its ledger
     /// issue, counted `RdDrp`.
     ///
     /// Deliberately NOT the lease-end site: the enqueue-failure caller ends
@@ -778,6 +799,7 @@ impl SyncWaitBlock {
         unsafe { KeInitializeEvent(&mut self.event, NOTIFICATION_EVENT, 0) };
         self.disposition
             .store(WaitDisposition::Pending as u8, Ordering::Relaxed);
+        self.response_written.store(0, Ordering::Relaxed);
     }
 
     fn disposition(&self) -> WaitDisposition {
@@ -798,17 +820,30 @@ impl SyncWaitBlock {
             .is_ok()
     }
 
-    fn copy_host_response(&self, out: &mut [u8]) -> WaitDisposition {
+    fn copy_host_response(&self, out: &mut [u8]) -> SyncResponseObservation {
         let disposition = self.disposition();
-        if disposition != WaitDisposition::HostResponseCopied {
-            return disposition;
+        let written_length = self.response_written.load(Ordering::Acquire);
+        if disposition != WaitDisposition::HostResponseAvailable {
+            return SyncResponseObservation {
+                disposition,
+                written_length,
+            };
         }
-        let n = out.len().min(SYNC_RESP_MAX);
+        let n = written_length as usize;
+        if n > out.len() || n > SYNC_RESP_MAX {
+            return SyncResponseObservation {
+                disposition: WaitDisposition::MalformedResponse,
+                written_length,
+            };
+        }
         // SAFETY: the Acquire disposition observes the response copy that
         // preceded its Release publication.
         let src = unsafe { &*self.resp.get() };
         out[..n].copy_from_slice(&src[..n]);
-        disposition
+        SyncResponseObservation {
+            disposition,
+            written_length,
+        }
     }
 }
 
@@ -829,7 +864,10 @@ impl WaitBlockRef<'_> {
     /// # Safety
     /// The signal must have completed, or deregistration under `virtio_lock`
     /// must have proved that the terminal publisher finished with this block.
-    pub unsafe fn copy_host_response_after_completion(&self, out: &mut [u8]) -> WaitDisposition {
+    pub(crate) unsafe fn copy_host_response_after_completion(
+        &self,
+        out: &mut [u8],
+    ) -> SyncResponseObservation {
         // SAFETY: the caller contract proves the raw target is no longer touched.
         unsafe { self.ptr.as_ref() }.copy_host_response(out)
     }
@@ -1189,6 +1227,46 @@ pub struct CompletedBind {
     pub offset: u32,
 }
 
+pub(crate) enum SyncBindApply {
+    Applied { ready: bool, carried: bool },
+    Stale,
+    Foreign,
+    Inconsistent,
+}
+
+/// Move-only proof that one exact transport instance has sealed fast-bind
+/// admission while `resource_id` is being retired.
+pub(crate) struct ScanoutRetireToken {
+    transport_instance: u64,
+    resource_id: u32,
+    wire_sequence: u64,
+    accepted_sequence: u64,
+    host_resource: u32,
+    selection_ambiguous: bool,
+}
+
+impl ScanoutRetireToken {
+    pub(crate) const fn transport_instance(&self) -> u64 {
+        self.transport_instance
+    }
+
+    pub(crate) const fn wire_sequence(&self) -> u64 {
+        self.wire_sequence
+    }
+
+    pub(crate) const fn accepted_sequence(&self) -> u64 {
+        self.accepted_sequence
+    }
+
+    pub(crate) const fn host_resource(&self) -> u32 {
+        self.host_resource
+    }
+
+    pub(crate) const fn selection_ambiguous(&self) -> bool {
+        self.selection_ambiguous
+    }
+}
+
 #[inline]
 pub fn completed_request(bind: CompletedBind) -> ScanoutBindRequest {
     ScanoutBindRequest {
@@ -1216,6 +1294,11 @@ struct FastBindState {
     /// state: it never extends a Windows allocation lifetime or allocates under
     /// `virtio_lock`.
     publication_request: Option<ScanoutBindRequest>,
+    /// Exact direct SET accepted by the queue when the supposedly-free
+    /// publication slot could not be claimed. This is invariant quarantine,
+    /// not a retry source; a strictly later accepted SET(0) or physical
+    /// transport replacement is the only release proof.
+    orphaned_set: Option<SyncScanoutBind>,
     publication: helios_kmd_logic::scanout_publish_txn::State,
     /// Highest direct presentation epoch whose SET descriptor was accepted by
     /// the control queue. Unlike the host-reader transaction this is never
@@ -1237,6 +1320,7 @@ struct FastBindState {
     host_accepted_resource: u32,
     host_accepted_fast: bool,
     host_accepted_fast_request: Option<ScanoutBindRequest>,
+    selection_ambiguity: helios_kmd_logic::scanout_retire::SelectionAmbiguity,
     /// DestroyAllocation sets this while it is establishing its disable
     /// barrier.  A later DISPATCH flip for the same resource is refused before
     /// it can place a new SET behind that barrier.
@@ -1260,6 +1344,7 @@ fn allocate_fast_bind_state() -> Box<FastBindState> {
     Box::new(FastBindState {
         completed: None,
         publication_request: None,
+        orphaned_set: None,
         publication: helios_kmd_logic::scanout_publish_txn::State::new(),
         presentation_epoch_floor: 0,
         deferred_earliest: None,
@@ -1268,6 +1353,7 @@ fn allocate_fast_bind_state() -> Box<FastBindState> {
         host_accepted_resource: 0,
         host_accepted_fast: false,
         host_accepted_fast_request: None,
+        selection_ambiguity: helios_kmd_logic::scanout_retire::SelectionAmbiguity::new(),
         retiring_resource: 0,
         retire_barrier: false,
         sync_worker_owned: None,
@@ -1507,6 +1593,39 @@ pub enum FenceEventReg {
 /// Driver-global and monotonic across StartDevice/StopDevice cycles. Starts at
 /// 1 because 0 is the "no fence" sentinel every predicate tests for.
 static NEXT_WIRE_FENCE_BASE: AtomicU64 = AtomicU64::new(1);
+static NEXT_SCANOUT_TRANSPORT_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
+fn reserve_wire_fence_base() -> Option<u64> {
+    let mut current = NEXT_WIRE_FENCE_BASE.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(WIRE_FENCE_INSTANCE_STRIDE)?;
+        match NEXT_WIRE_FENCE_BASE.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn reserve_scanout_transport_instance() -> Option<u64> {
+    let mut current = NEXT_SCANOUT_TRANSPORT_INSTANCE.load(Ordering::Relaxed);
+    loop {
+        let next = current.checked_add(1)?;
+        match NEXT_SCANOUT_TRANSPORT_INSTANCE.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return Some(current),
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 /// WDDM submissions whose fence was gated on their exact live present stream
 /// boundary instead of the whole `next_wire_fence` backlog (`PresentWmk=1`).
@@ -2176,6 +2295,10 @@ pub struct VirtioGpu {
     /// intended behaviour for a client which survived a device restart. The WDDM
     /// arm is different in kind because dxgkrnl schedules the whole desktop on it.
     wire_fence_base: u64,
+    /// Nonwrapping driver-global identity for synchronous persistent SET
+    /// completions. Separate from the wire-fence range so neither namespace's
+    /// exhaustion or reset semantics can authorize the other.
+    scanout_transport_instance: u64,
     /// WDDM submissions pending on venus completion, FIFO (capacity
     /// MAX_WDDM_PENDING, reserved at init).
     wddm_pending: VecDeque<WddmPending>,
@@ -2245,6 +2368,19 @@ impl VirtioGpu {
         passive: crate::irql::PassiveLevel,
         dxgkrnl: &DXGKRNL_INTERFACE,
     ) -> Result<Box<Self>, VirtioError> {
+        // Reserve both nonwrapping transport namespaces before touching PCI or
+        // DRIVER_OK. Later initialization failures deliberately burn them; a
+        // late reservation refusal must never ordinary-drop a live device.
+        let wire_fence_base = reserve_wire_fence_base().ok_or_else(|| {
+            WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+            crate::diag::record_named_bytes(b"WfNsEx", 1);
+            VirtioError::WireFenceNamespaceExhausted
+        })?;
+        let scanout_transport_instance = reserve_scanout_transport_instance().ok_or_else(|| {
+            SCANOUT_TRANSPORT_INSTANCE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+            crate::diag::record_named_bytes(b"ScTiEx", 1);
+            VirtioError::ScanoutTransportInstanceExhausted
+        })?;
         // ── M1: discover the device + map BARs through Dxgkrnl ──────────────
         // A miniport doesn't own the bus, so config space is reached via the
         // Dxgkrnl callbacks; the DeviceFunction is a formality (DxgkConfigAccess
@@ -2375,14 +2511,25 @@ impl VirtioGpu {
                 core::hint::spin_loop();
             }
             // SAFETY: same buffers as `add`, still valid; `can_pop()` was true.
-            unsafe { control.pop_used(token, inputs, outputs) }
-                .map_err(|_| VirtioError::DeviceError)?;
+            let written_length = unsafe { control.pop_used(token, inputs, outputs) }
+                .map_err(|_| VirtioError::DeviceError)? as usize;
+            if written_length < hdr_len || written_length > resp_len {
+                crate::diag::record_named_bytes(b"DpRsLen", written_length as u32);
+                return Err(VirtioError::DeviceError);
+            }
+            let response_type =
+                u32::from_le_bytes([resp_buf[0], resp_buf[1], resp_buf[2], resp_buf[3]]);
+            if written_length == hdr_len && HostRejection::from_response_type(response_type).is_ok()
+            {
+                return Err(VirtioError::DeviceError);
+            }
+            if written_length != resp_len || response_type != VIRTIO_GPU_RESP_OK_DISPLAY_INFO {
+                crate::diag::record_named_bytes(b"DpRsShp", response_type);
+                return Err(VirtioError::DeviceError);
+            }
         }
 
         let resp: &VirtioGpuRespDisplayInfo = bytemuck::from_bytes(&resp_buf[..resp_len]);
-        if !resp_is_ok(resp.hdr.type_) {
-            return Err(VirtioError::DeviceError);
-        }
         crate::kmsg(c"Helios: virtio-gpu GET_DISPLAY_INFO OK\n");
         // Remember scanout 0's host-preferred size for the display half's VidPn
         // mode + generated EDID. QEMU reports it in `pmodes[0].r` even before a
@@ -2426,13 +2573,6 @@ impl VirtioGpu {
         if mmio_fails != 0 {
             crate::diag::fault(crate::diag::FaultCounter::StIsr, mmio_fails);
         }
-
-        // This transport generation's wire-fence range, claimed ONCE and stored in
-        // two fields: `next_wire_fence` moves, `wire_fence_base` does not. Both
-        // must come from the same `fetch_add`, so it happens here rather than
-        // inside the struct literal below.
-        let wire_fence_base =
-            NEXT_WIRE_FENCE_BASE.fetch_add(WIRE_FENCE_INSTANCE_STRIDE, Ordering::Relaxed);
 
         // `VirtioGpu` contains the control virtqueue and many ownership tables.
         // Return it heap-owned so StartDevice never reserves a second by-value
@@ -2488,6 +2628,7 @@ impl VirtioGpu {
             // against `wire_fence_base`, which is why that field exists (A6).
             next_wire_fence: wire_fence_base,
             wire_fence_base,
+            scanout_transport_instance,
             wddm_pending: VecDeque::with_capacity(MAX_WDDM_PENDING),
             windowed_blt: WindowedBltState::new(),
             // Snapshotted at transport init like every other knob, so
@@ -2647,7 +2788,7 @@ impl VirtioGpu {
         }
     }
 
-    pub fn enqueue_sync<F>(
+    pub fn enqueue_sync(
         &mut self,
         meta: DmaBuffer,
         in0_len: usize,
@@ -2655,11 +2796,8 @@ impl VirtioGpu {
         resp_len: usize,
         waiter: NonNull<SyncWaitBlock>,
         scanout_bind: Option<(u32, Option<ScanoutBindRequest>)>,
-        mint_sequence: F,
-    ) -> Result<(SyncTicket, Option<u64>), (DmaBuffer, VirtioError)>
-    where
-        F: FnOnce(u32) -> u64,
-    {
+        adapter: &crate::adapter::AdapterContext,
+    ) -> Result<(SyncTicket, Option<(u64, u64)>), (DmaBuffer, VirtioError)> {
         // The shape is decided ONCE, here, and carried on the entry; the drain
         // no longer re-derives it from `in1_len > 0`.
         let chain = if in1_len > 0 {
@@ -2673,7 +2811,20 @@ impl VirtioGpu {
         // this replaces now lives in DmaBuffer::span, per span rather than on
         // the sum. `enqueue_core` re-checks `failed` first, as this path did.
         if in0_len == 0 || resp_len == 0 || resp_len > SYNC_RESP_MAX {
+            self.release_sync_claim_for_refusal(scanout_bind);
             return Err((meta, VirtioError::DeviceError));
+        }
+        if let Some(request) = scanout_bind.and_then(|(_, request)| request) {
+            // QueueFull retry burns no descriptor authority. Reclaim this exact
+            // worker slot only if nothing else acquired it while PASSIVE slept;
+            // otherwise defer behind the winner rather than enqueueing without
+            // a row-bound owner.
+            if self.fast_bind.sync_worker_owned.is_none() {
+                self.fast_bind.sync_worker_owned = Some(request);
+            }
+            if self.fast_bind.sync_worker_owned != Some(request) {
+                return Err((meta, VirtioError::PublicationBusy));
+            }
         }
         // A synchronous worker reserves its request before reaching this point.
         // Enforce the monotonic descriptor floor BEFORE the transaction-busy
@@ -2682,7 +2833,14 @@ impl VirtioGpu {
         if scanout_bind.is_some_and(|(_, request)| {
             request.is_some_and(|request| self.presentation_epoch_is_superseded(request))
         }) {
+            self.release_sync_claim_for_refusal(scanout_bind);
             return Err((meta, VirtioError::PresentationSuperseded));
+        }
+        if scanout_bind.is_some_and(|(resource_id, _)| resource_id != 0)
+            && self.fast_bind.selection_ambiguity.blocks_admission()
+        {
+            self.release_sync_claim_for_refusal(scanout_bind);
+            return Err((meta, VirtioError::PublicationBusy));
         }
         // This second check is the reader-lifecycle wire invariant. Refuse
         // before descriptor add so a pre-wire error clears only the worker
@@ -2695,32 +2853,65 @@ impl VirtioGpu {
         if scanout_bind.is_some_and(|(resource_id, _)| resource_id != 0)
             && self.publication_active()
         {
+            self.release_sync_claim_for_refusal(scanout_bind);
             return Err((meta, VirtioError::PublicationBusy));
         }
+        let reserved_sequence = match scanout_bind {
+            Some(_) => match adapter.reserve_scanout_bind_seq() {
+                Some(sequence) => Some(sequence),
+                None => {
+                    SCANOUT_BIND_SEQUENCE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+                    self.release_sync_claim_for_refusal(scanout_bind);
+                    return Err((meta, VirtioError::BindSequenceExhausted));
+                }
+            },
+            None => None,
+        };
         let token = match self.enqueue_core(chain, &meta, None, resp_len) {
             Ok(token) => token,
-            Err(e) => return Err((meta, e)),
+            Err(e) => {
+                self.release_sync_claim_for_refusal(scanout_bind);
+                return Err((meta, e));
+            }
         };
         // ⚠ This path used to notify BEFORE pushing; it now publishes first,
         // like the other two. Unobservable -- both happen inside one hold of
         // `virtio_lock`, which `drain_used` also takes -- and deliberate.
-        // The tag is assembled after `enqueue_core` accepted the descriptor but
-        // before publication/notification, under this same virtio-lock hold.
-        // Therefore no sequence is minted for a refused command and no late
-        // completion can observe an untagged accepted SET.
-        let scanout_bind = scanout_bind.map(|(resource_id, request)| SyncScanoutBind {
-            seq: mint_sequence(resource_id),
-            resource_id,
-            request,
-        });
+        // `VirtQueue::add` publishes avail.idx, so the reservation above must
+        // happen before `enqueue_core`; a refused add may burn the id but cannot
+        // publish a false wire identity. The accepted identity and in-flight tag
+        // are committed under this same virtio-lock hold before it is released.
+        let scanout_bind =
+            scanout_bind
+                .zip(reserved_sequence)
+                .map(|((resource_id, request), sequence)| {
+                    adapter.commit_scanout_bind_seq(sequence, resource_id);
+                    SyncScanoutBind {
+                        seq: sequence,
+                        resource_id,
+                        request,
+                    }
+                });
         if let Some(bind) = scanout_bind {
             if let Some(request) = bind.request {
                 let claimed = self.claim_publication(request, bind.seq);
-                debug_assert!(claimed, "accepted sync SET without publication transaction");
-                self.note_presentation_set_accepted(request);
+                if !claimed {
+                    // The descriptor is already host-visible. Do not publish an
+                    // untracked request in release builds; retain its exact
+                    // in-flight tag and fail closed for this transport.
+                    self.fast_bind.selection_ambiguity = self
+                        .fast_bind
+                        .selection_ambiguity
+                        .observe_malformed(bind.seq);
+                    self.fast_bind.orphaned_set = Some(bind);
+                    SCANOUT_PUBLICATION_CLAIM_LOST.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.note_presentation_set_accepted(request);
+                }
             }
         }
-        let scanout_bind_seq = scanout_bind.map(|bind| bind.seq);
+        let scanout_bind_identity =
+            scanout_bind.map(|bind| (self.scanout_transport_instance, bind.seq));
         self.publish_then_notify(InFlight {
             token,
             kind: InFlightKind::Sync {
@@ -2732,7 +2923,39 @@ impl VirtioGpu {
             resp_len,
             venus: None,
         });
-        Ok((SyncTicket { token }, scanout_bind_seq))
+        Ok((SyncTicket { token }, scanout_bind_identity))
+    }
+
+    fn release_sync_claim_for_refusal(
+        &mut self,
+        scanout_bind: Option<(u32, Option<ScanoutBindRequest>)>,
+    ) {
+        let request = scanout_bind.and_then(|(_, request)| request);
+        if request.is_some() && self.fast_bind.sync_worker_owned == request {
+            self.fast_bind.sync_worker_owned = None;
+        }
+    }
+
+    pub(crate) fn release_sync_claim_if_instance(
+        &mut self,
+        instance: u64,
+        request: ScanoutBindRequest,
+    ) -> bool {
+        if instance == 0 || instance != self.scanout_transport_instance {
+            return false;
+        }
+        if self.fast_bind.sync_worker_owned == Some(request)
+            && self.fast_bind.publication_request != Some(request)
+        {
+            self.fast_bind.sync_worker_owned = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) const fn scanout_transport_instance(&self) -> u64 {
+        self.scanout_transport_instance
     }
 
     /// Enqueue a control command without a blocking waiter.  Completion still
@@ -2848,9 +3071,8 @@ impl VirtioGpu {
     /// waits, or writes the registry: the command buffer is the preallocated
     /// singleton, and the wire command is written straight into it.
     ///
-    /// `seq` must have been minted under THIS lock hold (see
-    /// `AdapterContext::mint_scanout_bind_seq`), which is what makes sequence
-    /// order equal control-queue order.
+    /// Sequence reserve/add/commit all happen under THIS lock hold, which makes
+    /// the nonwrapping sequence order equal control-queue publication order.
     ///
     /// On any refusal the buffer goes back in its slot, so a failure costs
     /// nothing but the counter: the PASSIVE worker's own bind is still armed and
@@ -2859,7 +3081,7 @@ impl VirtioGpu {
         &mut self,
         mut buf: DmaBuffer,
         req: &ScanoutBindRequest,
-        mint_sequence: impl FnOnce(u32) -> u64,
+        adapter: &crate::adapter::AdapterContext,
     ) -> Result<(), FastBindRefusal> {
         // Enforce the monotonic descriptor floor at the wire boundary too:
         // ready/immediate and deferred promotions share this function, and a
@@ -2872,6 +3094,10 @@ impl VirtioGpu {
         // the wire publication too: no second descriptor may be accepted while
         // the first SET still owns its exact host-reader transaction.
         if self.publication_active() {
+            self.return_bind_cmd_buffer(buf);
+            return Err(FastBindRefusal::Busy);
+        }
+        if self.fast_bind.selection_ambiguity.blocks_admission() {
             self.return_bind_cmd_buffer(buf);
             return Err(FastBindRefusal::Busy);
         }
@@ -2906,6 +3132,11 @@ impl VirtioGpu {
             );
         }
         let chain = Chain::Meta1 { in0_len };
+        let Some(seq) = adapter.reserve_scanout_bind_seq() else {
+            SCANOUT_BIND_SEQUENCE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+            self.return_bind_cmd_buffer(buf);
+            return Err(FastBindRefusal::Failed);
+        };
         let token = match self.enqueue_core(chain, &buf, None, resp_len) {
             Ok(token) => token,
             Err(_) => {
@@ -2913,19 +3144,31 @@ impl VirtioGpu {
                 return Err(FastBindRefusal::Failed);
             }
         };
-        // `enqueue_core` has now accepted the descriptor but it is still not
-        // visible to the device. Mint/publish the wire identity immediately
-        // before `publish_then_notify`, so an enqueue failure cannot leave a
-        // false resource identity that suppresses the PASSIVE fallback.
-        let seq = mint_sequence(req.resource_id);
+        // `VirtQueue::add` has published avail.idx. Commit the exact wire view
+        // now, before releasing this virtio-lock hold; an add refusal above may
+        // burn `seq` but never publishes a resource that was not accepted.
+        adapter.commit_scanout_bind_seq(seq, req.resource_id);
         // `enqueue_core` accepted this descriptor while this lock stayed held,
         // so no other producer can claim the fixed transaction slot between the
         // readiness check above and this publication. Keep the full request —
         // resource plus epoch alone is not enough to reconstruct a late worker
         // bind's geometry/address safely.
         let claimed = self.claim_publication(*req, seq);
-        debug_assert!(claimed, "accepted fast SET without publication transaction");
-        self.note_presentation_set_accepted(*req);
+        if !claimed {
+            // `add` has published this persistent SET, so rollback is no longer
+            // possible. Latch ambiguity before publishing the in-flight owner;
+            // retirement and further SET admission now fail closed.
+            self.fast_bind.selection_ambiguity =
+                self.fast_bind.selection_ambiguity.observe_malformed(seq);
+            self.fast_bind.orphaned_set = Some(SyncScanoutBind {
+                seq,
+                resource_id: req.resource_id,
+                request: Some(*req),
+            });
+            SCANOUT_PUBLICATION_CLAIM_LOST.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.note_presentation_set_accepted(*req);
+        }
         self.publish_then_notify(InFlight {
             token,
             kind: InFlightKind::AsyncScanoutBind {
@@ -3070,10 +3313,17 @@ impl VirtioGpu {
             resource_id,
             present_epoch,
         };
+        let request = self
+            .fast_bind
+            .publication_request
+            .filter(|request| Self::publication_key(*request) == key);
         if !self.fast_bind.publication.complete_flush(key) {
             return false;
         }
         self.fast_bind.publication_request = None;
+        if request.is_some() && self.fast_bind.sync_worker_owned == request {
+            self.fast_bind.sync_worker_owned = None;
+        }
         true
     }
 
@@ -3084,10 +3334,17 @@ impl VirtioGpu {
             resource_id,
             present_epoch,
         };
+        let request = self
+            .fast_bind
+            .publication_request
+            .filter(|request| Self::publication_key(*request) == key);
         if !self.fast_bind.publication.cancel_exact(key) {
             return false;
         }
         self.fast_bind.publication_request = None;
+        if request.is_some() && self.fast_bind.sync_worker_owned == request {
+            self.fast_bind.sync_worker_owned = None;
+        }
         true
     }
 
@@ -3137,6 +3394,18 @@ impl VirtioGpu {
         self.cancel_publication_exact(request.resource_id, request.present_epoch)
     }
 
+    fn cancel_publication_superseded_by(&mut self, sequence: u64) -> bool {
+        let request = self.fast_bind.publication_request;
+        if !self.fast_bind.publication.cancel_if_superseded_by(sequence) {
+            return false;
+        }
+        self.fast_bind.publication_request = None;
+        if request.is_some() && self.fast_bind.sync_worker_owned == request {
+            self.fast_bind.sync_worker_owned = None;
+        }
+        true
+    }
+
     /// Stage a fast bind behind its exact producer boundary, or enqueue it now
     /// when that boundary is already retired. This includes a validated D4b
     /// snapshot: keeping SET publication producer-ordered prevents a successor
@@ -3144,14 +3413,11 @@ impl VirtioGpu {
     /// decisions and the eventual descriptor publication run under
     /// `virtio_lock`; the stored request is values only, so it does not extend a
     /// WDDM allocation lifetime.
-    pub fn stage_scanout_bind<F>(
+    pub fn stage_scanout_bind(
         &mut self,
         request: ScanoutBindRequest,
-        mint_sequence: F,
-    ) -> FastBindDispatch
-    where
-        F: FnOnce(u32) -> u64,
-    {
+        adapter: &crate::adapter::AdapterContext,
+    ) -> FastBindDispatch {
         // An exact synchronous worker owner has already claimed the same
         // descriptor path. Preserve that ownership even though its accepted
         // epoch now equals the floor: it is not a second SET attempt and must
@@ -3178,7 +3444,10 @@ impl VirtioGpu {
             // the recovery path and will apply its own cancellation contract.
             return FastBindDispatch::Failed;
         }
-        if self.publication_active() || !self.scanout_boundary_ready(request.carried_watermark) {
+        if self.publication_active()
+            || self.fast_bind.selection_ambiguity.blocks_admission()
+            || !self.scanout_boundary_ready(request.carried_watermark)
+        {
             // A ready successor must not overtake a SET whose exact host-reader
             // transaction is still live. Retain the bounded oldest+latest
             // frontier exactly as for a producer-unready request; completion of
@@ -3203,17 +3472,17 @@ impl VirtioGpu {
             }
             return FastBindDispatch::Deferred;
         }
-        self.enqueue_ready_scanout_bind(request, mint_sequence)
+        self.enqueue_ready_scanout_bind(request, adapter)
     }
 
     /// Re-evaluate the bounded earliest+latest frontier after a used-ring
     /// retirement.
     /// Called by the completion DPC after `drain_used`, so a ready producer
     /// binds before any exact refresh is armed from the bind response.
-    pub fn service_deferred_scanout_bind<F>(&mut self, mint_sequence: F) -> Option<FastBindDispatch>
-    where
-        F: FnOnce(u32) -> u64,
-    {
+    pub fn service_deferred_scanout_bind(
+        &mut self,
+        adapter: &crate::adapter::AdapterContext,
+    ) -> Option<FastBindDispatch> {
         // The floor moves when a SET descriptor is accepted, while these two
         // slots may have been retained much earlier for producer completion.
         // Prune before the transaction-active return so a 1055-style stale
@@ -3222,7 +3491,7 @@ impl VirtioGpu {
         if self.fast_bind.retire_barrier {
             return superseded.then_some(FastBindDispatch::Superseded);
         }
-        if self.publication_active() {
+        if self.publication_active() || self.fast_bind.selection_ambiguity.blocks_admission() {
             return superseded.then_some(FastBindDispatch::Superseded);
         }
         let discarded = self.discard_invalid_fast_bind_frontier();
@@ -3251,7 +3520,7 @@ impl VirtioGpu {
         if self.fast_bind.sync_worker_owned == Some(request) {
             return Some(FastBindDispatch::Handled);
         }
-        let dispatched = self.enqueue_ready_scanout_bind(request, mint_sequence);
+        let dispatched = self.enqueue_ready_scanout_bind(request, adapter);
         if matches!(
             dispatched,
             FastBindDispatch::Busy | FastBindDispatch::Failed
@@ -3264,11 +3533,14 @@ impl VirtioGpu {
         Some(dispatched)
     }
 
-    /// Freeze all new fast SETs while one exact resource is retired, and cancel
-    /// pre-wire requests. Returns the newest host-accepted bind sequence and
-    /// resource; a control-FIFO barrier lets the caller turn that into the final
-    /// host selection before deciding whether scanout-disable is necessary.
-    pub fn begin_scanout_resource_retire(&mut self, resource_id: u32) -> (u64, u32) {
+    /// Freeze all new fast SETs while one exact resource is retired, and return
+    /// one move-only token bound to this transport instance. Every later
+    /// barrier/snapshot/disable/finish step revalidates that same instance.
+    pub(crate) fn begin_scanout_resource_retire(
+        &mut self,
+        adapter: &crate::adapter::AdapterContext,
+        resource_id: u32,
+    ) -> ScanoutRetireToken {
         self.fast_bind.retiring_resource = resource_id;
         self.fast_bind.retire_barrier = true;
         if self
@@ -3298,26 +3570,102 @@ impl VirtioGpu {
         {
             self.fast_bind.fast_failure_wake = None;
         }
-        (
-            self.fast_bind.host_accepted_seq,
-            self.fast_bind.host_accepted_resource,
-        )
+        ScanoutRetireToken {
+            transport_instance: self.scanout_transport_instance,
+            resource_id,
+            wire_sequence: adapter.scanout_bind_wire_seq.load(Ordering::Acquire),
+            accepted_sequence: self.fast_bind.host_accepted_seq,
+            host_resource: self.fast_bind.host_accepted_resource,
+            selection_ambiguous: self.fast_bind.selection_ambiguity.blocks_admission(),
+        }
     }
 
-    /// Snapshot the host selection established by successful bind responses.
-    /// Call after a successful control-FIFO barrier when an issued bind was not
-    /// yet represented by the snapshot from `begin_scanout_resource_retire`.
-    pub fn host_accepted_scanout_bind(&self) -> (u64, u32) {
-        (
-            self.fast_bind.host_accepted_seq,
-            self.fast_bind.host_accepted_resource,
-        )
+    /// Refresh the final host-selection fields in one exact-instance lock hold.
+    pub(crate) fn refresh_scanout_retire(&self, token: &mut ScanoutRetireToken) -> bool {
+        if token.transport_instance != self.scanout_transport_instance
+            || token.resource_id != self.fast_bind.retiring_resource
+            || !self.fast_bind.retire_barrier
+        {
+            return false;
+        }
+        token.accepted_sequence = self.fast_bind.host_accepted_seq;
+        token.host_resource = self.fast_bind.host_accepted_resource;
+        token.selection_ambiguous = self.fast_bind.selection_ambiguity.blocks_admission();
+        true
     }
 
-    /// Re-open the DISPATCH fast path after retirement has either established a
-    /// safe final selection or conservatively retained the host resource.
-    pub fn finish_scanout_resource_retire(&mut self) {
+    pub(crate) fn complete_scanout_retire_without_disable(
+        &mut self,
+        adapter: &crate::adapter::AdapterContext,
+        token: &ScanoutRetireToken,
+    ) -> bool {
+        if token.transport_instance != self.scanout_transport_instance
+            || token.resource_id != self.fast_bind.retiring_resource
+            || !self.fast_bind.retire_barrier
+            || token.accepted_sequence != self.fast_bind.host_accepted_seq
+            || token.host_resource != self.fast_bind.host_accepted_resource
+            || token.selection_ambiguous != self.fast_bind.selection_ambiguity.blocks_admission()
+            || token.selection_ambiguous
+            || helios_kmd_logic::scanout_retire::needs_disable(
+                token.resource_id,
+                token.host_resource,
+            )
+        {
+            return false;
+        }
+        let resource_id = token.resource_id;
+        let host_was_resource = adapter
+            .host_bound_scanout_resource
+            .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        let active_was_resource = adapter
+            .active_scanout_resource
+            .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if active_was_resource {
+            adapter.active_scanout_wh.store(0, Ordering::Release);
+        }
+        if adapter
+            .pending_refresh_resource
+            .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            adapter.scanout_refresh_pending.store(0, Ordering::Release);
+        }
+        if host_was_resource || active_was_resource {
+            let reason = if token.host_resource == 0 {
+                crate::ddi::scanout_trace::LeaseEnd::Cancelled
+            } else {
+                crate::ddi::scanout_trace::LeaseEnd::Superseded
+            };
+            if token.host_resource == 0 {
+                adapter.scanout_epoch_tracked.store(0, Ordering::Release);
+            }
+            let _ = adapter.end_scanout_leases_through(
+                adapter.scanout_bound_epoch.load(Ordering::Acquire),
+                reason,
+            );
+        }
+        let _ = self.cancel_publication_for_retirement(resource_id);
         self.fast_bind.retire_barrier = false;
+        self.fast_bind.retiring_resource = 0;
+        true
+    }
+
+    /// Re-open the exact producing transport's DISPATCH fast path.
+    pub(crate) fn finish_scanout_resource_retire(
+        &mut self,
+        token: ScanoutRetireToken,
+    ) -> Result<(), ScanoutRetireToken> {
+        if token.transport_instance != self.scanout_transport_instance
+            || token.resource_id != self.fast_bind.retiring_resource
+            || !self.fast_bind.retire_barrier
+        {
+            return Err(token);
+        }
+        self.fast_bind.retire_barrier = false;
+        self.fast_bind.retiring_resource = 0;
+        Ok(())
     }
 
     /// Remove the oldest frontier and promote the sole coalesced successor.
@@ -3405,6 +3753,112 @@ impl VirtioGpu {
             self.fast_bind.host_accepted_fast = false;
             self.fast_bind.host_accepted_fast_request = None;
         }
+        if self.fast_bind.completed.is_some_and(|bind| {
+            helios_kmd_logic::scanout_retire::completion_superseded(bind.seq, seq)
+        }) {
+            self.fast_bind.completed = None;
+        }
+        if self.fast_bind.orphaned_set.is_some_and(|orphan| {
+            helios_kmd_logic::scanout_retire::completion_superseded(orphan.seq, seq)
+        }) {
+            self.fast_bind.orphaned_set = None;
+        }
+        self.fast_bind.selection_ambiguity =
+            self.fast_bind.selection_ambiguity.observe_success(seq);
+        let _ = self.cancel_publication_superseded_by(seq);
+    }
+
+    /// Apply a synchronous SET completion only to the exact transport that
+    /// enqueued it. The caller holds notify order; this method runs under that
+    /// transport's lock and performs every guest-side effect before returning.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn apply_sync_scanout_bind(
+        &mut self,
+        order: &crate::adapter::NotifyOrdered<'_>,
+        adapter: &crate::adapter::AdapterContext,
+        identity: super::ctrl::ScanoutBindIdentity,
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        exact_request: Option<ScanoutBindRequest>,
+        fallback_primary: Option<(u32, u32, u32, u32, u32, u64, u32, u32)>,
+        direct_epoch: Option<(u64, u64, u64)>,
+    ) -> SyncBindApply {
+        if identity.instance() != self.scanout_transport_instance {
+            return SyncBindApply::Foreign;
+        }
+        if self.fast_bind.selection_ambiguity.blocks_admission()
+            || self.fast_bind.host_accepted_seq < identity.sequence()
+            || (self.fast_bind.host_accepted_seq == identity.sequence()
+                && self.fast_bind.host_accepted_resource != resource_id)
+        {
+            return SyncBindApply::Inconsistent;
+        }
+        if self.fast_bind.host_accepted_seq > identity.sequence() {
+            return SyncBindApply::Stale;
+        }
+        if let Some(request) = exact_request {
+            let transaction = self.fast_bind.publication.active();
+            if self.fast_bind.sync_worker_owned != Some(request)
+                || self.fast_bind.publication_request != Some(request)
+                || transaction.is_none_or(|transaction| {
+                    transaction.key != Self::publication_key(request)
+                        || transaction.seq != identity.sequence()
+                        || transaction.phase
+                            != helios_kmd_logic::scanout_publish_txn::Phase::SetSucceeded
+                })
+            {
+                return SyncBindApply::Inconsistent;
+            }
+        }
+        if !adapter.adopt_scanout_bind_seq(identity.sequence()) {
+            return SyncBindApply::Stale;
+        }
+        let previous = adapter.host_bound_scanout_resource.load(Ordering::Acquire);
+        if let Some((id, w, h, pitch, plane, alloc_size, memory_type, format)) = fallback_primary {
+            adapter.remember_primary_scanout(
+                id,
+                w,
+                h,
+                pitch,
+                plane,
+                alloc_size,
+                memory_type,
+                format,
+            );
+        }
+        adapter.remember_scanout_blob(resource_id, width, height);
+        if let Some((epoch, primary_address, frame_watermark)) = direct_epoch {
+            adapter.publish_bound_epoch(epoch, previous != 0 && previous != resource_id);
+            adapter.publish_bound_primary(primary_address);
+            if adapter.knobs().bind_flush_immediate {
+                adapter.request_scanout_refresh_for(resource_id);
+                return SyncBindApply::Applied {
+                    ready: true,
+                    carried: false,
+                };
+            }
+            let table = adapter.take_frame_watermark(resource_id);
+            let carried = frame_watermark != 0 || table.is_some();
+            let watermark = if frame_watermark != 0 {
+                crate::ddi::scanout_trace::note_bind_watermark_allocation();
+                frame_watermark
+            } else {
+                table.unwrap_or_else(|| self.wire_fence_watermark())
+            };
+            let watermark = self
+                .rebase_dead_present_stream_boundary(watermark)
+                .unwrap_or(watermark);
+            let ready = self.note_scanout_refresh_at(order, resource_id, watermark);
+            if ready {
+                adapter.request_scanout_refresh_for(resource_id);
+            }
+            return SyncBindApply::Applied { ready, carried };
+        }
+        SyncBindApply::Applied {
+            ready: false,
+            carried: false,
+        }
     }
 
     fn note_host_accepted_fast_scanout_bind(&mut self, seq: u64, request: ScanoutBindRequest) {
@@ -3414,6 +3868,24 @@ impl VirtioGpu {
             self.fast_bind.host_accepted_fast = true;
             self.fast_bind.host_accepted_fast_request = Some(request);
         }
+        if self.fast_bind.completed.is_some_and(|bind| {
+            helios_kmd_logic::scanout_retire::completion_superseded(bind.seq, seq)
+        }) {
+            self.fast_bind.completed = None;
+        }
+        if self.fast_bind.orphaned_set.is_some_and(|orphan| {
+            helios_kmd_logic::scanout_retire::completion_superseded(orphan.seq, seq)
+        }) {
+            self.fast_bind.orphaned_set = None;
+        }
+        self.fast_bind.selection_ambiguity =
+            self.fast_bind.selection_ambiguity.observe_success(seq);
+        let _ = self.cancel_publication_superseded_by(seq);
+    }
+
+    fn note_ambiguous_scanout_bind(&mut self, seq: u64) {
+        self.fast_bind.selection_ambiguity =
+            self.fast_bind.selection_ambiguity.observe_malformed(seq);
     }
 
     /// Gate the PASSIVE worker's synchronous fallback on the same exact
@@ -3459,6 +3931,7 @@ impl VirtioGpu {
         // own producer is ready; otherwise it could publish a later SET before
         // the host has read the first binding.
         if self.publication_active()
+            || self.fast_bind.selection_ambiguity.blocks_admission()
             || self.fast_bind.sync_worker_owned == Some(request)
             || self.fast_owns_request(request)
         {
@@ -3492,7 +3965,10 @@ impl VirtioGpu {
         // `service_deferred_scanout_bind` may have published the fast command
         // earlier in this same DPC. Re-check here so the worker never wakes to
         // place a synchronous SET behind that exact command.
-        if self.publication_active() || self.fast_owns_request(request) {
+        if self.publication_active()
+            || self.fast_bind.selection_ambiguity.blocks_admission()
+            || self.fast_owns_request(request)
+        {
             return false;
         }
         if self.presentation_epoch_is_superseded(request) {
@@ -3519,6 +3995,40 @@ impl VirtioGpu {
         true
     }
 
+    pub(crate) fn apply_sync_scanout_disable(
+        &mut self,
+        adapter: &crate::adapter::AdapterContext,
+        identity: super::ctrl::ScanoutBindIdentity,
+        token: &ScanoutRetireToken,
+    ) -> bool {
+        if identity.instance() != self.scanout_transport_instance
+            || token.transport_instance != self.scanout_transport_instance
+            || token.resource_id != self.fast_bind.retiring_resource
+            || !self.fast_bind.retire_barrier
+            || self.fast_bind.host_accepted_seq != identity.sequence()
+            || self.fast_bind.host_accepted_resource != 0
+            || self.fast_bind.selection_ambiguity.blocks_admission()
+            || !adapter.adopt_scanout_bind_seq(identity.sequence())
+        {
+            return false;
+        }
+        adapter
+            .host_bound_scanout_resource
+            .store(0, Ordering::Release);
+        adapter.active_scanout_resource.store(0, Ordering::Release);
+        adapter.active_scanout_wh.store(0, Ordering::Release);
+        adapter.scanout_epoch_tracked.store(0, Ordering::Release);
+        let _ = adapter.end_scanout_leases_through(
+            adapter.scanout_bound_epoch.load(Ordering::Acquire),
+            crate::ddi::scanout_trace::LeaseEnd::Cancelled,
+        );
+        adapter.scanout_refresh_pending.store(0, Ordering::Release);
+        adapter.pending_refresh_resource.store(0, Ordering::Release);
+        self.fast_bind.retire_barrier = false;
+        self.fast_bind.retiring_resource = 0;
+        true
+    }
+
     pub fn release_fast_owned_worker(&mut self, request: ScanoutBindRequest) {
         if self.fast_bind.host_accepted_fast_request == Some(request) {
             // Keep the host resource/sequence for DestroyAllocation's lifetime
@@ -3532,17 +4042,29 @@ impl VirtioGpu {
         }
     }
 
-    /// A synchronous SET failed before it could become the terminal owner of
-    /// this exact request. Successful requests intentionally stay cached in
-    /// `sync_worker_owned` until the next distinct worker claim.
-    pub fn release_failed_sync_worker_bind(&mut self, request: ScanoutBindRequest) {
-        if self.fast_bind.sync_worker_owned == Some(request) {
-            self.fast_bind.sync_worker_owned = None;
-        }
+    /// Consume one failure wake and release only its exact worker suppression
+    /// while the producing transport remains locked.
+    pub fn take_fast_failure_wake_and_release(
+        &mut self,
+        adapter: &crate::adapter::AdapterContext,
+    ) -> bool {
+        let Some(request) = self.fast_bind.fast_failure_wake.take() else {
+            return false;
+        };
+        self.release_fast_owned_worker(request);
+        adapter.signal_hpd();
+        true
     }
 
-    pub fn take_fast_failure_wake(&mut self) -> Option<ScanoutBindRequest> {
-        self.fast_bind.fast_failure_wake.take()
+    pub fn wake_ready_worker_scanout_bind(
+        &mut self,
+        adapter: &crate::adapter::AdapterContext,
+    ) -> bool {
+        if !self.take_ready_worker_scanout_bind() {
+            return false;
+        }
+        adapter.signal_hpd();
+        true
     }
 
     fn fast_owns_request(&self, request: ScanoutBindRequest) -> bool {
@@ -3553,6 +4075,10 @@ impl VirtioGpu {
                 .is_some_and(|bind| completed_request(bind) == request)
             || (self.fast_bind.host_accepted_fast
                 && self.fast_bind.host_accepted_fast_request == Some(request))
+            || self
+                .fast_bind
+                .orphaned_set
+                .is_some_and(|orphan| orphan.request == Some(request))
             || self.inflight.iter().any(|entry| match entry.kind {
                 InFlightKind::AsyncScanoutBind {
                     resource_id,
@@ -3581,14 +4107,11 @@ impl VirtioGpu {
             })
     }
 
-    fn enqueue_ready_scanout_bind<F>(
+    fn enqueue_ready_scanout_bind(
         &mut self,
         request: ScanoutBindRequest,
-        mint_sequence: F,
-    ) -> FastBindDispatch
-    where
-        F: FnOnce(u32) -> u64,
-    {
+        adapter: &crate::adapter::AdapterContext,
+    ) -> FastBindDispatch {
         // See `stage_scanout_bind`: this exact owner is a previously accepted
         // synchronous descriptor, not a deferred attempt to publish another
         // SET at the now-equal floor.
@@ -3605,7 +4128,7 @@ impl VirtioGpu {
             self.note_fast_bind_epoch_superseded(request);
             return FastBindDispatch::Superseded;
         }
-        if self.publication_active() {
+        if self.publication_active() || self.fast_bind.selection_ambiguity.blocks_admission() {
             return FastBindDispatch::Deferred;
         }
         if self.fast_bind.retire_barrier
@@ -3617,7 +4140,7 @@ impl VirtioGpu {
         let Some(buffer) = self.take_bind_cmd_buffer() else {
             return FastBindDispatch::Busy;
         };
-        match self.enqueue_scanout_bind_async(buffer, &request, mint_sequence) {
+        match self.enqueue_scanout_bind_async(buffer, &request, adapter) {
             Ok(()) => FastBindDispatch::Queued,
             Err(FastBindRefusal::Busy) => FastBindDispatch::Busy,
             Err(FastBindRefusal::Superseded) => {
@@ -3796,6 +4319,15 @@ impl VirtioGpu {
         if self.failed {
             return Err((meta, venus, VirtioError::DeviceError));
         }
+        let Some(wire_fence_limit) = self.wire_fence_base.checked_add(WIRE_FENCE_INSTANCE_STRIDE)
+        else {
+            WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+            return Err((meta, venus, VirtioError::WireFenceNamespaceExhausted));
+        };
+        if self.next_wire_fence >= wire_fence_limit {
+            WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+            return Err((meta, venus, VirtioError::WireFenceNamespaceExhausted));
+        }
         if venus_len == 0
             || venus_len > venus.as_slice().len()
             || hdr_len + resp_len > meta.as_slice().len()
@@ -3825,6 +4357,7 @@ impl VirtioGpu {
         }
         // Stays BETWEEN a successful `add` and the publish: the wire fence id
         // is only spent once the device has actually taken the descriptor.
+        // Proven strictly below the checked transport limit above.
         self.next_wire_fence += 1;
         let ring = cmd.hdr.ring_idx;
         ASYNC_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -3869,6 +4402,13 @@ impl VirtioGpu {
     /// mistake in the Sync-waiter sequence is a use-after-free of a stack block.
     fn latch_failed_and_fail_inflight(&mut self) {
         self.failed = true;
+        // A transport failure is not proof that a published persistent SET had
+        // no host side effect. Permanently seal this generation's ordinary SET
+        // admission and resource retirement until the transport is replaced.
+        self.fast_bind.selection_ambiguity = self
+            .fast_bind
+            .selection_ambiguity
+            .observe_malformed(u64::MAX);
         // Neither a host-accepted completion nor a deferred producer boundary
         // survives a terminal transport failure. Clear both value-only slots so
         // no later DPC can publish bookkeeping from this generation.
@@ -3945,10 +4485,10 @@ impl VirtioGpu {
                     }
                 }
                 InFlightKind::AsyncScanoutBind { .. } => {
-                    // The transport is dead, so this bind never reached the
-                    // host: apply NO bookkeeping (that would publish an identity
-                    // the host does not have) and stash nothing. Counted as an
-                    // error like every other way a fast bind can fail to land.
+                    // Transport failure cannot distinguish an unapplied SET
+                    // from a persistent host selection. Apply no success
+                    // bookkeeping; the generation-wide ambiguity marker above
+                    // now blocks every retirement until transport replacement.
                     //
                     // The preallocated command buffer parks with the entry
                     // below, and the slot stays empty for the rest of this
@@ -4083,7 +4623,15 @@ impl VirtioGpu {
                 self.control
                     .pop_used(token, &read_slices[..count], &mut [resp.as_mut_slice()])
             };
-            if popped.is_err() {
+            let written_length = match popped {
+                Ok(length) => length,
+                Err(_) => {
+                    self.latch_failed_and_fail_inflight();
+                    return;
+                }
+            };
+            if written_length as usize > resp_len {
+                DRAIN_BAD_USED_LENGTH.fetch_add(1, Ordering::Relaxed);
                 self.latch_failed_and_fail_inflight();
                 return;
             }
@@ -4096,15 +4644,23 @@ impl VirtioGpu {
                 // SAFETY: the resp span is within the entry-owned meta buffer.
                 unsafe { resp.as_slice() }.as_ptr()
             };
-            // First u32 of the device-written response = VIRTIO_GPU_RESP_*.
-            // SAFETY: as above; unaligned because the offset is command-shaped.
-            let resp_type = unsafe { core::ptr::read_unaligned(resp_base as *const u32) };
+            let response_in_bounds = written_length as usize >= size_of::<VirtioGpuCtrlHdr>();
+            let resp_type = response_in_bounds.then(|| {
+                // SAFETY: an in-bounds used length proves the full response
+                // header is device-written; the offset may be unaligned.
+                unsafe { core::ptr::read_unaligned(resp_base as *const u32) }
+            });
             match entry.kind {
                 InFlightKind::Sync {
                     waiter,
                     scanout_bind,
                 } => {
-                    let response_ok = resp_is_ok(resp_type);
+                    let response_ok = written_length as usize == size_of::<VirtioGpuCtrlHdr>()
+                        && resp_type == Some(VIRTIO_GPU_RESP_OK_NODATA);
+                    let response_rejected = written_length as usize
+                        == size_of::<VirtioGpuCtrlHdr>()
+                        && resp_type
+                            .is_some_and(|raw| HostRejection::from_response_type(raw).is_ok());
                     let waiter_abandoned = waiter.is_none();
                     if let Some(bind) = terminal_sync_scanout_bind(response_ok, scanout_bind) {
                         // This runs even after `abandon_sync` detached the
@@ -4137,15 +4693,26 @@ impl VirtioGpu {
                                 });
                             }
                         }
-                    } else if let Some(bind) = scanout_bind {
-                        // A direct presentation host-error is terminal for its
-                        // exact transaction. Wake the retained worker recovery
-                        // path; it may re-stage only after this clear.
-                        if let Some(request) = bind.request {
-                            let terminal = self.complete_publication_set(request, bind.seq, false);
-                            debug_assert!(terminal, "sync SET error mismatched transaction");
-                            self.fast_bind.fast_failure_wake = Some(request);
+                    } else if response_rejected {
+                        if let Some(bind) = scanout_bind {
+                            // A direct presentation host-error is terminal for its
+                            // exact transaction. Wake the retained worker recovery
+                            // path; it may re-stage only after this clear.
+                            if let Some(request) = bind.request {
+                                let terminal =
+                                    self.complete_publication_set(request, bind.seq, false);
+                                debug_assert!(terminal, "sync SET error mismatched transaction");
+                                if terminal {
+                                    if self.fast_bind.sync_worker_owned == Some(request) {
+                                        self.fast_bind.sync_worker_owned = None;
+                                    }
+                                    self.fast_bind.fast_failure_wake = Some(request);
+                                }
+                            }
                         }
+                    } else if let Some(bind) = scanout_bind {
+                        SCANOUT_BIND_AMBIGUOUS_RESPONSES.fetch_add(1, Ordering::Relaxed);
+                        self.note_ambiguous_scanout_bind(bind.seq);
                     }
                     if let Some(block) = waiter {
                         // THE WRITE SITE THE 22.22.218.0 `0xA` RACED, and the
@@ -4176,13 +4743,20 @@ impl VirtioGpu {
                         unsafe {
                             let b = block.as_ptr();
                             if (*b).disposition() == WaitDisposition::Pending {
-                                let n = resp_len.min(SYNC_RESP_MAX);
+                                (*b).response_written
+                                    .store(written_length, Ordering::Relaxed);
+                                // Every in-capacity completion is published
+                                // losslessly, including a short prefix. SET and
+                                // future OwnerTable normalization consume the
+                                // exact length; legacy persistent callers retain
+                                // their old zero-tail response-type behavior.
                                 core::ptr::copy_nonoverlapping(
                                     resp_base,
                                     (*b).resp.get() as *mut u8,
-                                    n,
+                                    written_length as usize,
                                 );
-                                if (*b).publish_terminal(WaitDisposition::HostResponseCopied) {
+                                let terminal = WaitDisposition::HostResponseAvailable;
+                                if (*b).publish_terminal(terminal) {
                                     KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
                                 }
                             }
@@ -4207,7 +4781,11 @@ impl VirtioGpu {
                     // a DIRQL deadlock, not a lock-contention slowdown. Stash
                     // the values; `drain_used_and_complete` applies them one
                     // frame up, with no transport lock held.
-                    let set_ok = resp_is_ok(resp_type);
+                    let set_ok = written_length as usize == size_of::<VirtioGpuCtrlHdr>()
+                        && resp_type == Some(VIRTIO_GPU_RESP_OK_NODATA);
+                    let set_rejected = written_length as usize == size_of::<VirtioGpuCtrlHdr>()
+                        && resp_type
+                            .is_some_and(|raw| HostRejection::from_response_type(raw).is_ok());
                     crate::ddi::scanout_timeline::note(
                         crate::ddi::scanout_timeline::kind::FAST_SET_COMPLETE,
                         if set_ok {
@@ -4219,7 +4797,7 @@ impl VirtioGpu {
                         carried_watermark,
                         seq,
                         resource_id,
-                        resp_type,
+                        resp_type.unwrap_or(0),
                     );
                     if set_ok {
                         let request = ScanoutBindRequest {
@@ -4238,8 +4816,18 @@ impl VirtioGpu {
                             terminal,
                             "fast SET terminal response mismatched transaction"
                         );
-                        self.note_host_accepted_fast_scanout_bind(seq, request);
-                        if self.fast_bind.completed.is_some() {
+                        if terminal {
+                            self.note_host_accepted_fast_scanout_bind(seq, request);
+                        } else {
+                            // The host did accept this selection, so retain the
+                            // conservative host ledger, but never publish guest
+                            // primary/refresh effects without the exact reader
+                            // transaction. Ambiguity remains latched.
+                            self.note_host_accepted_scanout_bind(seq, resource_id);
+                            self.fast_bind.selection_ambiguity =
+                                self.fast_bind.selection_ambiguity.observe_malformed(seq);
+                        }
+                        if terminal && self.fast_bind.completed.is_some() {
                             // Two binds completed in one drain pass. The newest
                             // is the identity the host is left with, so it wins
                             // — the same coalescing the pending-flip slot does,
@@ -4247,18 +4835,20 @@ impl VirtioGpu {
                             // slot's; this is `FpCoal`).
                             crate::ddi::scanout_trace::note_fast_bind_coalesced();
                         }
-                        self.fast_bind.completed = Some(CompletedBind {
-                            seq,
-                            resource_id,
-                            wh,
-                            present_epoch,
-                            primary_address,
-                            carried_watermark,
-                            format,
-                            stride,
-                            offset,
-                        });
-                    } else {
+                        if terminal {
+                            self.fast_bind.completed = Some(CompletedBind {
+                                seq,
+                                resource_id,
+                                wh,
+                                present_epoch,
+                                primary_address,
+                                carried_watermark,
+                                format,
+                                stride,
+                                offset,
+                            });
+                        }
+                    } else if set_rejected {
                         // The host refused the bind. Nothing is bound to this
                         // resource, so nothing may be remembered or published;
                         // the PASSIVE worker's own validate/retry ladder is the
@@ -4277,7 +4867,12 @@ impl VirtioGpu {
                         };
                         let terminal = self.complete_publication_set(request, seq, false);
                         debug_assert!(terminal, "fast SET error mismatched transaction");
-                        self.fast_bind.fast_failure_wake = Some(request);
+                        if terminal {
+                            self.fast_bind.fast_failure_wake = Some(request);
+                        }
+                    } else {
+                        SCANOUT_BIND_AMBIGUOUS_RESPONSES.fetch_add(1, Ordering::Relaxed);
+                        self.note_ambiguous_scanout_bind(seq);
                     }
                 }
                 InFlightKind::AsyncControl {
@@ -4289,7 +4884,8 @@ impl VirtioGpu {
                     ..
                 } => {
                     ASYNC_CTRL_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
-                    let response_ok = resp_is_ok(resp_type);
+                    let response_ok = written_length as usize == size_of::<VirtioGpuCtrlHdr>()
+                        && resp_type == Some(VIRTIO_GPU_RESP_OK_NODATA);
                     // THE CONSUMER EDGE (ROADMAP defect 0ab-B). QEMU's
                     // `RESOURCE_FLUSH` handler is synchronous — the Vulkan
                     // readback submits, waits on its fence, copies the staging
@@ -4358,7 +4954,8 @@ impl VirtioGpu {
                     if ring_idx != 0 {
                         RING_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
                     }
-                    let response_ok = resp_is_ok(resp_type);
+                    let response_ok = written_length as usize == size_of::<VirtioGpuCtrlHdr>()
+                        && resp_type == Some(VIRTIO_GPU_RESP_OK_NODATA);
                     if !response_ok {
                         ASYNC_RESP_ERRORS.fetch_add(1, Ordering::Relaxed);
                     }

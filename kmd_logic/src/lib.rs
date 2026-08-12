@@ -2039,11 +2039,61 @@ pub mod scanout_retire {
     pub const fn needs_disable(retiring_resource: u32, final_host_resource: u32) -> bool {
         retiring_resource != 0 && retiring_resource == final_host_resource
     }
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct SelectionAmbiguity {
+        malformed_sequence: u64,
+        success_sequence: u64,
+    }
+
+    impl SelectionAmbiguity {
+        pub const fn new() -> Self {
+            Self {
+                malformed_sequence: 0,
+                success_sequence: 0,
+            }
+        }
+
+        pub const fn blocks_admission(self) -> bool {
+            self.malformed_sequence != 0 && self.success_sequence <= self.malformed_sequence
+        }
+
+        pub const fn observe_malformed(mut self, sequence: u64) -> Self {
+            if sequence > self.malformed_sequence {
+                self.malformed_sequence = sequence;
+            }
+            self
+        }
+
+        pub const fn observe_success(mut self, sequence: u64) -> Self {
+            if sequence > self.success_sequence {
+                self.success_sequence = sequence;
+            }
+            self
+        }
+    }
+
+    pub const fn next_bind_sequence(high_water: u64) -> Option<u64> {
+        if high_water == u64::MAX {
+            None
+        } else {
+            Some(high_water + 1)
+        }
+    }
+
+    /// A later exact SET response makes an older deferred bookkeeping handoff
+    /// stale. Equality is the handoff for that same response and remains live.
+    pub const fn completion_superseded(completion_sequence: u64, success_sequence: u64) -> bool {
+        completion_sequence < success_sequence
+    }
 }
 
 #[cfg(test)]
 mod scanout_retire_tests {
-    use super::scanout_retire::{needs_disable, needs_fifo_barrier};
+    use super::scanout_retire::{
+        completion_superseded, needs_disable, needs_fifo_barrier, next_bind_sequence,
+        SelectionAmbiguity,
+    };
 
     #[test]
     fn issued_newer_bind_requires_a_terminal_fifo_response() {
@@ -2063,6 +2113,52 @@ mod scanout_retire_tests {
         let retiring_a = 0x121;
         assert!(needs_disable(retiring_a, retiring_a));
         assert!(!needs_disable(retiring_a, 0));
+    }
+
+    #[test]
+    fn selection_ambiguity_is_fifo_ordered_and_seals_admission() {
+        let ambiguous = SelectionAmbiguity::new().observe_malformed(7);
+        assert!(ambiguous.blocks_admission());
+        assert!(ambiguous.observe_success(6).blocks_admission());
+        assert!(ambiguous.observe_success(7).blocks_admission());
+        let newer_malformed = ambiguous.observe_malformed(9);
+        assert!(newer_malformed.observe_success(8).blocks_admission());
+        assert!(!newer_malformed.observe_success(10).blocks_admission());
+    }
+
+    #[test]
+    fn rejection_is_inert_and_a_successful_disable_resolves_ambiguity() {
+        let ambiguous = SelectionAmbiguity::new().observe_malformed(3);
+        let rejected = ambiguous;
+        assert_eq!(rejected, ambiguous);
+        assert!(!rejected.observe_success(4).blocks_admission());
+    }
+
+    #[test]
+    fn stale_malformed_completion_cannot_reopen_a_resolved_selection() {
+        let resolved = SelectionAmbiguity::new()
+            .observe_malformed(4)
+            .observe_success(6);
+        assert!(!resolved.blocks_admission());
+        assert!(!resolved.observe_malformed(4).blocks_admission());
+    }
+
+    #[test]
+    fn later_disable_discards_only_older_bookkeeping_handoffs() {
+        assert!(completion_superseded(5, 7));
+        assert!(!completion_superseded(7, 7));
+        assert!(!completion_superseded(8, 7));
+    }
+
+    #[test]
+    fn bind_sequence_exhaustion_never_wraps() {
+        assert_eq!(next_bind_sequence(0), Some(1));
+        assert_eq!(next_bind_sequence(u64::MAX - 1), Some(u64::MAX));
+        assert_eq!(next_bind_sequence(u64::MAX), None);
+        assert!(SelectionAmbiguity::new()
+            .observe_malformed(u64::MAX)
+            .observe_success(u64::MAX)
+            .blocks_admission());
     }
 }
 
@@ -2906,6 +3002,20 @@ pub mod scanout_publish_txn {
                 false
             }
         }
+
+        /// A later successful SET proves this older selection is no longer the
+        /// host reader, including a retained malformed-response transaction.
+        pub fn cancel_if_superseded_by(&mut self, later_sequence: u64) -> bool {
+            if self
+                .active
+                .is_some_and(|transaction| transaction.seq < later_sequence)
+            {
+                self.active = None;
+                true
+            } else {
+                false
+            }
+        }
     }
 }
 
@@ -3406,6 +3516,15 @@ mod scanout_publish_txn_tests {
         assert!(!state.rollback_flush(A));
         assert!(state.arm_flush(A));
         assert!(state.complete_flush(A));
+    }
+
+    #[test]
+    fn later_disable_supersedes_a_retained_foreign_resource_transaction() {
+        let mut state = State::new();
+        assert!(state.claim(B, 7));
+        assert!(!state.cancel_if_superseded_by(7));
+        assert!(state.cancel_if_superseded_by(8));
+        assert_eq!(state.active(), None);
     }
 }
 

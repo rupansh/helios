@@ -59,6 +59,16 @@ pub enum VirtioError {
     /// loop would sleep while holding scanout_mutex and block the worker that
     /// must issue the exact terminal flush.
     PublicationBusy,
+    /// The transport-generation SET_SCANOUT_BLOB sequence namespace reached
+    /// `u64::MAX`. No further persistent selection may be published or retried
+    /// until transport replacement.
+    BindSequenceExhausted,
+    /// The driver-global scanout transport-instance namespace is exhausted.
+    /// Reusing an instance would let a late SET completion mutate a successor.
+    ScanoutTransportInstanceExhausted,
+    /// The driver-global wire-fence namespace cannot reserve another disjoint
+    /// transport range without wrapping.
+    WireFenceNamespaceExhausted,
     /// A direct presentation SET is at or below the monotonic epoch floor of
     /// descriptors already accepted by the control queue. This is terminal for
     /// that exact worker request, never a retryable queue-pressure condition.
@@ -83,6 +93,9 @@ impl From<VirtioError> for NTSTATUS {
             }
             VirtioError::QueueFull
             | VirtioError::PublicationBusy
+            | VirtioError::BindSequenceExhausted
+            | VirtioError::ScanoutTransportInstanceExhausted
+            | VirtioError::WireFenceNamespaceExhausted
             | VirtioError::PresentationSuperseded => STATUS_DEVICE_BUSY,
             VirtioError::Timeout => STATUS_IO_TIMEOUT,
             VirtioError::NotImplemented => STATUS_NOT_IMPLEMENTED,

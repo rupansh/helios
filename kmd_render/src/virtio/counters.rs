@@ -52,6 +52,26 @@ pub static TRANSPORT_GONE_AT_WAIT: AtomicU32 = AtomicU32::new(0);
 /// Used-ring completions whose token matched no in-flight entry (ring state
 /// corrupt → transport latches failed).
 pub static DRAIN_BAD_TOKEN: AtomicU32 = AtomicU32::new(0);
+/// Used-ring completions whose reported output length exceeded the exact
+/// response descriptor capacity (ring state corrupt -> transport latches).
+pub static DRAIN_BAD_USED_LENGTH: AtomicU32 = AtomicU32::new(0);
+/// `SET_SCANOUT_BLOB` completions whose shape cannot prove success or a
+/// documented rejection; their publication ownership stays quarantined.
+pub static SCANOUT_BIND_AMBIGUOUS_RESPONSES: AtomicU32 = AtomicU32::new(0);
+/// `SET_SCANOUT_BLOB` commands refused before queue publication because their
+/// transport-generation sequence high-water reached `u64::MAX`.
+pub static SCANOUT_BIND_SEQUENCE_EXHAUSTED: AtomicU32 = AtomicU32::new(0);
+/// `VirtioGpu::init` attempts refused before PCI/device mutation because the
+/// driver-global scanout transport-instance namespace cannot advance.
+pub static SCANOUT_TRANSPORT_INSTANCE_EXHAUSTED: AtomicU32 = AtomicU32::new(0);
+/// `VirtioGpu::init` attempts refused before PCI/device mutation because no
+/// disjoint wire-fence range remains.
+pub static WIRE_FENCE_NAMESPACE_EXHAUSTED: AtomicU32 = AtomicU32::new(0);
+/// Persistent SET descriptors accepted by the queue when the supposedly-free
+/// publication transaction refused its exact claim. The request is retained
+/// and the generation is ambiguity-sealed; nonzero is an internal invariant
+/// failure, not host rejection.
+pub static SCANOUT_PUBLICATION_CLAIM_LOST: AtomicU32 = AtomicU32::new(0);
 /// Enqueue attempts refused because the queue/parked tables were full.
 pub static QUEUE_FULL_RETRIES: AtomicU32 = AtomicU32::new(0);
 /// WDDM pending-fence FIFO overflows (degraded to immediate completion).

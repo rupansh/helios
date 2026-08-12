@@ -38,6 +38,11 @@ pub(crate) use read_ledger::{
 pub(crate) use scanout::{PresentStreamMarker, ScanoutRefreshQueue};
 pub(crate) use segments::{BarSegment, PagingRam};
 
+/// Move-only proof that this exact adapter has no installed transport.
+pub(crate) struct TransportAbsent {
+    adapter: usize,
+}
+
 /// Everything `DxgkDdiStartDevice` establishes, as one value published once.
 ///
 /// StartDevice used to take a unique `&mut AdapterContext` that stayed live for
@@ -47,7 +52,7 @@ pub(crate) use segments::{BarSegment, PagingRam};
 /// fixed-phase one-shot
 /// timer and `init_hpd` starts a thread that both immediately take `&self` from
 /// the same address while the outer `&mut` is still in scope, and
-/// `set_virtio(Some(gpu))` enables the device so the DIRQL ISR can fire
+/// `install_virtio(gpu)` enables the device so the DIRQL ISR can fire
 /// mid-function. That is an unambiguous Stacked-Borrows violation.
 ///
 /// Split by LIFETIME, not by topic:
@@ -687,6 +692,9 @@ pub struct AdapterContext {
     /// 210 fps, where a flip arms mid-round-trip) and stomp the newer identity
     /// with an older one.
     pub scanout_bind_wire_seq: AtomicU64,
+    /// Nonwrapping reservation high-water; committed wire history advances only
+    /// after the matching descriptor was accepted by the queue.
+    pub scanout_bind_next_seq: AtomicU64,
     /// The highest bind sequence whose bookkeeping has been applied. Advanced by
     /// whichever application runs; one whose sequence does not advance it is
     /// STALE and applies nothing (`FpLate`).
@@ -1177,6 +1185,7 @@ impl AdapterContext {
             scanout_epoch_tracked: AtomicU32::new(0),
             scanout_retire_wanted: AtomicU32::new(0),
             scanout_bind_wire_seq: AtomicU64::new(0),
+            scanout_bind_next_seq: AtomicU64::new(0),
             scanout_bind_applied_seq: AtomicU64::new(0),
             scanout_bind_wire_resource: AtomicU32::new(0),
             vidpn_programming: AtomicU64::new(0),
@@ -1294,18 +1303,6 @@ impl AdapterContext {
         // stays off until a DMA-flip presentation publishes one again.
         self.scanout_epoch_tracked.store(0, Ordering::Release);
         self.scanout_retire_wanted.store(0, Ordering::Release);
-        // The bind sequence is meaningful only within one transport generation:
-        // it orders enqueues on a control queue that is about to be destroyed.
-        // Both halves are zeroed together, so the next generation's first bind
-        // (sequence 1) adopts rather than reading as stale behind an inherited
-        // watermark.
-        self.scanout_bind_wire_seq.store(0, Ordering::Release);
-        self.scanout_bind_applied_seq.store(0, Ordering::Release);
-        // With it, the resource the last generation's newest enqueue named: a
-        // resource id from a dead transport means nothing, and leaving it set
-        // would make the next generation's first flip of that recycled id look
-        // already bound.
-        self.scanout_bind_wire_resource.store(0, Ordering::Release);
         // Consumers that cache a primary identity compare generations, so bump
         // it rather than zeroing it: a wrapped-to-equal generation would let a
         // stale cache look current.
@@ -1602,21 +1599,48 @@ impl AdapterContext {
         self.last_completed_fence.load(Ordering::Acquire)
     }
 
-    /// Install (or clear) the virtio transport under the lock.
+    /// Install one fully initialized transport by consuming the exact proof
+    /// minted when this adapter's previous transport was removed.
     ///
-    /// The previous transport, if any, is dropped *after* the lock is released:
-    /// `VirtioGpu::drop` resets the device and frees contiguous memory, both of
-    /// which are PASSIVE_LEVEL-only — they must not run at the DISPATCH_LEVEL the
-    /// spinlock raises to. MUST be called at PASSIVE_LEVEL (StartDevice /
-    /// StopDevice, which Dxgkrnl serializes).
-    pub fn set_virtio(&self, new: Option<Box<VirtioGpu>>) {
+    /// # Safety
+    /// `absent` must have been minted by the most recent removal on this exact
+    /// adapter, and serialized StartDevice ownership must prove the slot stayed
+    /// empty. Violating either condition could replace/drop a live device while
+    /// the spinlock is held.
+    pub(crate) unsafe fn install_virtio(&self, absent: TransportAbsent, new: Box<VirtioGpu>) {
+        debug_assert_eq!(absent.adapter, self as *const Self as usize);
         // SAFETY: `virtio_lock` is a valid KSPIN_LOCK; the critical section only
-        // swaps the Option in/out of the cell (no allocation, no device I/O).
+        // installs the already-owned Box (no allocation, no device I/O).
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };
-        let old = core::mem::replace(unsafe { &mut *self.virtio.get() }, new);
+        let slot = unsafe { &mut *self.virtio.get() };
+        debug_assert!(slot.is_none());
+        *slot = Some(new);
+        unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
+    }
+
+    /// Remove the old transport and begin one fresh scanout-bind namespace.
+    ///
+    /// The four sequence/resource fields are reset while `virtio_lock` proves
+    /// the transport absent. A producer that already held the lock drains first;
+    /// a later producer observes `None`. Keeping this as one transition prevents
+    /// a late old-generation SET from aliasing sequence 1 in the successor.
+    #[must_use]
+    pub(crate) fn remove_virtio_and_reset_scanout_bind_generation(&self) -> TransportAbsent {
+        // SAFETY: `virtio_lock` excludes every producer and the DPC's composite
+        // bind apply. Replacing with None before the tuple reset makes any later
+        // DPC inert; a DPC already applying drains before this acquire returns.
+        let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };
+        let old = core::mem::replace(unsafe { &mut *self.virtio.get() }, None);
+        self.scanout_bind_next_seq.store(0, Ordering::Relaxed);
+        self.scanout_bind_wire_seq.store(0, Ordering::Relaxed);
+        self.scanout_bind_applied_seq.store(0, Ordering::Relaxed);
+        self.scanout_bind_wire_resource.store(0, Ordering::Relaxed);
         unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
         // Dropped here, at PASSIVE_LEVEL, outside the lock.
         drop(old);
+        TransportAbsent {
+            adapter: self as *const Self as usize,
+        }
     }
 
     /// The real-RAM paging/page-table segment backing, if it was allocated.

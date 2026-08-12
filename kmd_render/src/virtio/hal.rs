@@ -104,7 +104,7 @@ impl DmaBuffer {
 
     /// Prepare a completed buffer for a new command. Returns false when the new
     /// logical length does not fit. Callers overwrite every device-read byte;
-    /// the device overwrites every response byte, so no clearing is required.
+    /// response consumers use only the used-ring-reported prefix.
     pub fn reset(&mut self, len: usize) -> bool {
         if len == 0 || len > self.capacity() {
             return false;

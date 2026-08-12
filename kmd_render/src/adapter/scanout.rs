@@ -428,6 +428,110 @@ impl AdapterContext {
             .unwrap_or((false, false))
     }
 
+    /// Apply at most one accepted fast bind while the notify guard and the
+    /// producing transport are both locked. StopDevice removal takes the same
+    /// transport lock, so no completion can escape across removal/reset/reuse.
+    pub(crate) fn apply_completed_bind_locked(&self, guard: &super::WddmNotifyGuard<'_>) {
+        let applied = guard
+            .with_virtio(|order, v| {
+                let Some(bind) = v.take_completed_bind() else {
+                    return None;
+                };
+                let terminal_request = crate::virtio::gpu::completed_request(bind);
+                if !self.adopt_scanout_bind_seq(bind.seq) {
+                    let _ = v.cancel_publication_exact(bind.resource_id, bind.present_epoch);
+                    v.release_fast_owned_worker(terminal_request);
+                    self.signal_hpd();
+                    return Some((bind, false, false, 0, 0));
+                }
+
+                let previous = self.host_bound_scanout_resource.load(Ordering::Acquire);
+                let superseded = previous != 0 && previous != bind.resource_id;
+                self.remember_scanout_blob(
+                    bind.resource_id,
+                    (bind.wh >> 32) as u32,
+                    bind.wh as u32,
+                );
+                self.publish_bound_epoch(bind.present_epoch, superseded);
+                self.publish_bound_primary(bind.primary_address);
+
+                let table = self.take_frame_watermark(bind.resource_id);
+                let watermark = if bind.carried_watermark != 0 {
+                    crate::ddi::scanout_trace::note_bind_watermark_allocation();
+                    if table.is_some_and(|t| t != bind.carried_watermark) {
+                        crate::ddi::scanout_trace::note_bind_watermark_overwritten();
+                    }
+                    bind.carried_watermark
+                } else {
+                    table.unwrap_or_else(|| v.wire_fence_watermark())
+                };
+                let watermark = v
+                    .rebase_dead_present_stream_boundary(watermark)
+                    .unwrap_or(watermark);
+                let ready = v.note_scanout_refresh_at(order, bind.resource_id, watermark);
+                if !ready {
+                    let (count, ring) = v.outstanding_below(watermark);
+                    crate::ddi::scanout_trace::note_bind_wait(count, ring);
+                }
+                crate::ddi::scanout_timeline::note(
+                    crate::ddi::scanout_timeline::kind::BIND_REFRESH_ARM,
+                    if ready {
+                        crate::ddi::scanout_timeline::flag::READY
+                    } else {
+                        crate::ddi::scanout_timeline::flag::WAITING
+                    },
+                    self.scanout_bound_epoch.load(Ordering::Acquire),
+                    watermark,
+                    0,
+                    bind.resource_id,
+                    u32::from(bind.carried_watermark != 0 || table.is_some()),
+                );
+                if ready {
+                    self.request_scanout_refresh_for_locked(guard, bind.resource_id);
+                }
+                // Release only this completed fast request while its producing
+                // transport is still locked. Publication state still gates a
+                // retry until the exact flush terminal; that terminal wakes the
+                // worker again. StopDevice cannot redirect either effect into a
+                // successor transport.
+                v.release_fast_owned_worker(terminal_request);
+                self.signal_hpd();
+                Some((
+                    bind,
+                    true,
+                    ready,
+                    u32::from(bind.carried_watermark != 0 || table.is_some()),
+                    previous,
+                ))
+            })
+            .ok()
+            .flatten();
+
+        let Some((bind, adopted, ready, carried, previous)) = applied else {
+            return;
+        };
+        if !adopted {
+            crate::ddi::scanout_trace::note_fast_bind_late();
+            return;
+        }
+        crate::ddi::scanout_timeline::note(
+            crate::ddi::scanout_timeline::kind::BIND_APPLY,
+            crate::ddi::scanout_timeline::flag::SUCCESS,
+            bind.present_epoch,
+            bind.carried_watermark,
+            bind.seq,
+            bind.resource_id,
+            previous,
+        );
+        crate::ddi::scanout_trace::note_fast_bind_applied();
+        if carried != 0 {
+            crate::ddi::scanout_trace::note_bind_watermark_carried();
+        } else {
+            crate::ddi::scanout_trace::note_bind_watermark_sampled();
+        }
+        crate::ddi::scanout_trace::note_bind_refresh(ready);
+    }
+
     /// Remember `watermark` as `resource_id`'s frame boundary, replacing any
     /// older one for the same buffer (a re-present of the same buffer is a
     /// newer frame, and it is the newer frame the display will show).
@@ -473,7 +577,7 @@ impl AdapterContext {
     /// flush, which is defect 0ab-A.
     ///
     /// Caller must hold `wddm_notify_lock`.
-    fn take_frame_watermark(&self, resource_id: u32) -> Option<u64> {
+    pub(crate) fn take_frame_watermark(&self, resource_id: u32) -> Option<u64> {
         if resource_id == 0 {
             return None;
         }
@@ -489,32 +593,34 @@ impl AdapterContext {
 
     // ── Wire-order guard for bind bookkeeping (ROADMAP defect 0ab-C, D1(ii)) ──
 
-    /// Mint the next `SET_SCANOUT_BLOB` wire-order sequence.
+    /// Reserve the next `SET_SCANOUT_BLOB` wire-order sequence.
     ///
     /// MUST be called inside the same `with_virtio` critical section as the
     /// enqueue it names — that is the whole guarantee: the control queue is
-    /// FIFO, so minting under the lock that publishes the descriptor makes
+    /// FIFO, so reserving under the lock that publishes the descriptor makes
     /// sequence order equal wire order, and therefore equal the order the host
-    /// applies the binds in. Minting outside the lock would order the two
+    /// applies the binds in. Reserving outside the lock would order the two
     /// enqueue sites by nothing at all.
     ///
     /// Never returns 0: 0 is "this application named no wire bind" at the guard
     /// (an already-bound re-present, which issues no command and must keep
     /// today's unguarded behaviour).
     ///
-    /// `resource_id` is the resource the command being enqueued names (0 for the
-    /// scan-out disable) and is published with the sequence, in the same lock
-    /// hold, as [`AdapterContext::scanout_bind_wire_resource`] — the WIRE view
-    /// of "what is bound", which is what the flip arm's skip test needs.
-    pub(crate) fn mint_scanout_bind_seq(&self, resource_id: u32) -> u64 {
-        // Stored BEFORE the sequence is handed out, so the two are published
-        // together under one `virtio_lock` hold; see the field doc for why
-        // Relaxed is the right ordering here.
+    /// A refused queue add may burn a reservation, but cannot publish a false
+    /// wire identity. [`Self::commit_scanout_bind_seq`] publishes the accepted
+    /// sequence and resource immediately after `VirtQueue::add` succeeds.
+    pub(crate) fn reserve_scanout_bind_seq(&self) -> Option<u64> {
+        let high_water = self.scanout_bind_next_seq.load(Ordering::Relaxed);
+        let next = helios_kmd_logic::scanout_retire::next_bind_sequence(high_water)?;
+        self.scanout_bind_next_seq.store(next, Ordering::Relaxed);
+        Some(next)
+    }
+
+    pub(crate) fn commit_scanout_bind_seq(&self, sequence: u64, resource_id: u32) {
         self.scanout_bind_wire_resource
             .store(resource_id, Ordering::Relaxed);
         self.scanout_bind_wire_seq
-            .fetch_add(1, Ordering::AcqRel)
-            .wrapping_add(1)
+            .store(sequence, Ordering::Release);
     }
 
     /// Claim the right to apply the bookkeeping for bind `seq`.
@@ -1173,11 +1279,10 @@ impl AdapterContext {
         // Any SET issued before this point is ahead of the pure-query FIFO
         // barrier below; no SET can be inserted between that proof and a
         // necessary scanout-disable.
-        let begin = self.with_virtio(|v| v.begin_scanout_resource_retire(resource_id));
-        let Ok((accepted_before, host_before)) = begin else {
+        let begin = self.with_virtio(|v| v.begin_scanout_resource_retire(self, resource_id));
+        let Ok(mut retire_token) = begin else {
             return false;
         };
-        let wire_before = self.scanout_bind_wire_seq.load(Ordering::Acquire);
         // D4a (FIX-DESIGN-d4a.md §3.1): the ledger slot dies with its backing
         // allocation — reclaimed now if no read is in flight, else pinned
         // (retire-wanted) until the in-flight token's retirement equalizes the
@@ -1186,105 +1291,106 @@ impl AdapterContext {
         // never recycled, so an unreclaimed slot is a leak of one of eight.
         self.read_ledger.note_alloc_retired(resource_id);
 
+        let mut retire_finished = false;
         let retired = (|| {
             // A successful pure-query response proves every earlier async SET
             // reached a terminal host response. Successful SETs advanced the
             // host-accepted selection in `drain_used`; failed SETs deliberately
             // leave that selection unchanged. This is the missing distinction
             // between "A was once accepted" and "A is still final".
-            let final_host = if needs_fifo_barrier(wire_before, accepted_before) {
-                if crate::virtio::ctrl::ctrl_fifo_barrier(lock.passive(), self).is_err() {
+            if needs_fifo_barrier(
+                retire_token.wire_sequence(),
+                retire_token.accepted_sequence(),
+            ) || retire_token.selection_ambiguous()
+            {
+                if crate::virtio::ctrl::ctrl_fifo_barrier_for_instance(
+                    lock.passive(),
+                    self,
+                    retire_token.transport_instance(),
+                )
+                .is_err()
+                {
                     crate::diag::record_named_bytes(b"ScRet", 0xB);
                     crate::diag::record_named_bytes(b"ScDead", resource_id);
                     return false;
                 }
-                self.with_virtio(|v| v.host_accepted_scanout_bind())
-                    .map(|(_, resource)| resource)
-                    .unwrap_or(host_before)
-            } else {
-                host_before
-            };
+                if !self
+                    .with_virtio(|v| v.refresh_scanout_retire(&mut retire_token))
+                    .unwrap_or(false)
+                {
+                    crate::diag::record_named_bytes(b"ScRet", 0x10);
+                    crate::diag::record_named_bytes(b"ScDead", resource_id);
+                    return false;
+                }
+            }
+            let final_host = retire_token.host_resource();
+            let selection_ambiguous = retire_token.selection_ambiguous();
 
-            if !needs_disable(resource_id, final_host) {
+            if !selection_ambiguous && !needs_disable(resource_id, final_host) {
                 // A newer successful bind (or an earlier disable) is the lifetime
                 // barrier. Sending SET(0) here would instead queue it BEHIND that
                 // newer bind and permanently blank scanout. Clear only guest views
                 // that still name A; a B application wholly before this closure is
                 // preserved, and one after it republishes B.
-                self.with_wddm_notify_lock(|_| {
-                    let host_was_a = self
-                        .host_bound_scanout_resource
-                        .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok();
-                    let active_was_a = self
-                        .active_scanout_resource
-                        .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok();
-                    if active_was_a {
-                        self.active_scanout_wh.store(0, Ordering::Release);
-                    }
-                    if self
-                        .pending_refresh_resource
-                        .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        self.scanout_refresh_pending.store(0, Ordering::Release);
-                    }
-                    if host_was_a || active_was_a {
-                        let reason = if final_host == 0 {
-                            LeaseEnd::Cancelled
-                        } else {
-                            LeaseEnd::Superseded
-                        };
-                        if final_host == 0 {
-                            self.scanout_epoch_tracked.store(0, Ordering::Release);
-                        }
-                        let _ = self.end_scanout_leases_through(
-                            self.scanout_bound_epoch.load(Ordering::Acquire),
-                            reason,
-                        );
-                    }
+                let completed = self.with_wddm_notify_lock(|guard| {
+                    guard
+                        .with_virtio(|_, v| {
+                            v.complete_scanout_retire_without_disable(self, &retire_token)
+                        })
+                        .unwrap_or(false)
                 });
-                // The FIFO barrier proved a later host selection (or prior
-                // disable) terminal. It is the exact no-read terminal for a
-                // still-recorded transaction on this retiring allocation.
-                let _ = self.with_virtio(|v| v.cancel_publication_for_retirement(resource_id));
+                if !completed {
+                    crate::diag::record_named_bytes(b"ScRet", 0x11);
+                    crate::diag::record_named_bytes(b"ScDead", resource_id);
+                    return false;
+                }
+                retire_finished = true;
                 crate::diag::record_named_bytes(b"ScRet", resource_id);
                 return true;
             }
 
-            // A is still the final host selection, so disable scanout while the
-            // global fast-bind gate is held. Its response is both the host-reader
-            // lifetime barrier and the newest bind sequence; no newer B can be
-            // trapped in FIFO order A -> B -> 0.
-            let unbound =
-                crate::virtio::ctrl::set_scanout_blob(lock.passive(), self, 0, 0, 0, 0, 0, 0, None);
-            let Ok(unbind_seq) = unbound else {
-                crate::diag::record_named_bytes(b"ScRet", 0xE);
+            // A is still the final host selection, or an earlier malformed SET
+            // left the final selection ambiguous. Disable scanout while the
+            // global fast-bind gate is held. Only this FIFO-later exact success
+            // proves that no host selection still names retained backing.
+            let unbind_identity = match crate::virtio::ctrl::set_scanout_blob(
+                lock.passive(),
+                self,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                None,
+                Some(retire_token.transport_instance()),
+            ) {
+                crate::virtio::ctrl::ScanoutSetOutcome::Accepted(identity) => identity,
+                crate::virtio::ctrl::ScanoutSetOutcome::Rejected
+                | crate::virtio::ctrl::ScanoutSetOutcome::DefiniteNotEnqueued { .. }
+                | crate::virtio::ctrl::ScanoutSetOutcome::Ambiguous => {
+                    crate::diag::record_named_bytes(b"ScRet", 0xE);
+                    crate::diag::record_named_bytes(b"ScDead", resource_id);
+                    return false;
+                }
+            };
+            // The successful SET(0) response globally superseded and cancelled
+            // every older retained publication transaction, even when this
+            // retirement was triggered by a different allocation.
+
+            let applied = self.with_wddm_notify_lock(|guard| {
+                guard
+                    .with_virtio(|_, v| {
+                        v.apply_sync_scanout_disable(self, unbind_identity, &retire_token)
+                    })
+                    .unwrap_or(false)
+            });
+            if !applied {
+                crate::diag::record_named_bytes(b"ScRet", 0xF);
                 crate::diag::record_named_bytes(b"ScDead", resource_id);
                 return false;
-            };
-            let _ = self.with_virtio(|v| v.note_host_accepted_scanout_bind(unbind_seq, 0));
-            // SET(0) returned successfully behind the retirement barrier: no
-            // later host read of this exact allocation can exist. This is the
-            // explicit no-flush terminal path for a publication whose resource
-            // is being destroyed.
-            let _ = self.with_virtio(|v| v.cancel_publication_for_retirement(resource_id));
-
-            self.with_wddm_notify_lock(|_| {
-                if self.adopt_scanout_bind_seq(unbind_seq) {
-                    self.host_bound_scanout_resource.store(0, Ordering::Release);
-                    self.active_scanout_resource.store(0, Ordering::Release);
-                    self.active_scanout_wh.store(0, Ordering::Release);
-                    self.scanout_epoch_tracked.store(0, Ordering::Release);
-                    let _ = self.end_scanout_leases_through(
-                        self.scanout_bound_epoch.load(Ordering::Acquire),
-                        LeaseEnd::Cancelled,
-                    );
-                    self.scanout_refresh_pending.store(0, Ordering::Release);
-                    self.pending_refresh_resource.store(0, Ordering::Release);
-                }
-            });
+            }
+            retire_finished = true;
             crate::diag::record_named_bytes(b"ScRet", resource_id);
             true
         })();
@@ -1293,7 +1399,9 @@ impl AdapterContext {
         // from the decision closure reaches this epilogue. Wake the retained
         // newest WDDM handle so the normal worker can bind it after the lifecycle
         // mutex is released.
-        let _ = self.with_virtio(|v| v.finish_scanout_resource_retire());
+        if !retire_finished {
+            let _ = self.with_virtio(|v| v.finish_scanout_resource_retire(retire_token));
+        }
         self.signal_hpd();
         retired
     }

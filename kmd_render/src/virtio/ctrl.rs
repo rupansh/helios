@@ -71,7 +71,7 @@ use super::VirtioError;
 use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
 use core::sync::atomic::Ordering;
-use helios_kmd_logic::control_ownership::AbandonReason;
+use helios_kmd_logic::control_ownership::{AbandonReason, HostRejection};
 use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
     VirtioGpuGetCapsetInfo, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush,
@@ -91,6 +91,7 @@ const EXECUTIVE: i32 = 0;
 
 static CTRL_WAIT_PENDING: AtomicU32 = AtomicU32::new(0);
 static CTRL_WAIT_FENCE_COMPLETED: AtomicU32 = AtomicU32::new(0);
+static CTRL_RESPONSE_MALFORMED: AtomicU32 = AtomicU32::new(0);
 static FENCE_WAIT_PENDING: AtomicU32 = AtomicU32::new(0);
 static FENCE_WAIT_HOST_RESPONSE: AtomicU32 = AtomicU32::new(0);
 
@@ -291,6 +292,7 @@ pub fn reap_parked(_passive: PassiveLevel, adapter: &AdapterContext) {
 #[derive(Clone, Copy)]
 struct BindMint<'a> {
     seq_out: &'a Cell<u64>,
+    instance_out: &'a Cell<u64>,
     /// The `SET_SCANOUT_BLOB`'s own `resource_id`; 0 is the scan-out disable.
     resource_id: u32,
     /// The full presentation identity carried by a direct synchronous SET. It
@@ -312,17 +314,46 @@ pub(crate) struct ScanoutSetTimeline {
     pub flags: u32,
 }
 
+pub(crate) struct ScanoutBindIdentity {
+    instance: u64,
+    sequence: u64,
+}
+
+impl ScanoutBindIdentity {
+    pub(crate) const fn instance(&self) -> u64 {
+        self.instance
+    }
+
+    pub(crate) const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+}
+
+/// Terminal classification for one synchronous persistent scanout SET.
+///
+/// Only `Accepted` carries the move-only producing-transport identity needed
+/// for guest bookkeeping. `Ambiguous` deliberately carries no retry authority:
+/// the exact request remains owned by the producing transport until a later
+/// FIFO SET resolves it or that transport is physically reset.
+#[must_use]
+pub(crate) enum ScanoutSetOutcome {
+    Accepted(ScanoutBindIdentity),
+    Rejected,
+    DefiniteNotEnqueued { error: VirtioError, instance: u64 },
+    Ambiguous,
+}
+
 #[must_use]
 pub(crate) enum CtrlRoundtripOutcome {
-    HostResponseCopied,
+    HostResponseCopied { written_length: u32 },
     DefiniteNotEnqueued(VirtioError),
     Ambiguous(AbandonReason),
 }
 
 impl CtrlRoundtripOutcome {
-    fn into_legacy_result(self) -> Result<(), VirtioError> {
+    fn into_legacy_result(self) -> Result<usize, VirtioError> {
         match self {
-            Self::HostResponseCopied => Ok(()),
+            Self::HostResponseCopied { written_length } => Ok(written_length as usize),
             Self::DefiniteNotEnqueued(error) => Err(error),
             Self::Ambiguous(AbandonReason::Timeout) => Err(VirtioError::Timeout),
             Self::Ambiguous(
@@ -351,7 +382,17 @@ fn ctrl_roundtrip_observed(
     resp_out: &mut [u8],
     timeout_ms: u64,
     bind: Option<BindMint<'_>>,
+    expected_instance: Option<u64>,
 ) -> CtrlRoundtripOutcome {
+    // Bind DNE reconciliation needs the exact producing transport even when
+    // allocation or argument validation fails before enqueue. Snapshot only
+    // this non-secret scalar; later cleanup still revalidates it under the live
+    // transport lock and is inert after replacement.
+    if let Some(bind) = bind {
+        if let Ok(instance) = adapter.with_virtio(|v| v.scanout_transport_instance()) {
+            bind.instance_out.set(instance);
+        }
+    }
     let in0_len = req.len();
     let in1_len = extra.map_or(0, |e| e.len());
     let resp_len = resp_out.len();
@@ -389,23 +430,30 @@ fn ctrl_roundtrip_observed(
         let token: SyncTicket = loop {
             let res = adapter.with_virtio(move |v| {
                 v.drain_used();
-                let queued = v.enqueue_sync(
-                    meta,
-                    in0_len,
-                    in1_len,
-                    resp_len,
-                    block.as_ptr(),
-                    bind.map(|bind| (bind.resource_id, bind.request)),
-                    |resource_id| adapter.mint_scanout_bind_seq(resource_id),
-                );
-                // The sequence is minted by `enqueue_sync` after its descriptor
-                // was accepted and before it is published to the device.  Keep
+                let queued = if expected_instance
+                    .is_some_and(|expected| expected != v.scanout_transport_instance())
+                {
+                    Err((meta, VirtioError::DeviceError))
+                } else {
+                    v.enqueue_sync(
+                        meta,
+                        in0_len,
+                        in1_len,
+                        resp_len,
+                        block.as_ptr(),
+                        bind.map(|bind| (bind.resource_id, bind.request)),
+                        adapter,
+                    )
+                };
+                // The sequence is reserved before the queue add and committed
+                // by `enqueue_sync` only after the descriptor is accepted. Keep
                 // the caller's value in lockstep with the in-flight lifecycle
                 // tag, so a late response after waiter abandonment can still
                 // update the host-selection ledger.
                 match queued {
-                    Ok((ticket, seq)) => {
-                        if let (Some(bind), Some(seq)) = (bind, seq) {
+                    Ok((ticket, identity)) => {
+                        if let (Some(bind), Some((instance, seq))) = (bind, identity) {
+                            bind.instance_out.set(instance);
                             bind.seq_out.set(seq);
                             if let Some(timeline) = bind.timeline {
                                 crate::ddi::scanout_timeline::note(
@@ -449,9 +497,8 @@ fn ctrl_roundtrip_observed(
             // Three outcomes, not two. `unwrap_or(true)` folded Err(DeviceNotFound)
             // - the transport was torn down under us - into "already completed
             // successfully", which skipped the timeout counter and picked the wrong
-            // error class. The fake-success half is masked here because all three
-            // callers re-validate resp_is_ok on the returned bytes and a zeroed
-            // response fails that, but the missing evidence was real.
+            // error class. Callers validate the exact returned response shape,
+            // but the missing evidence was real.
             match adapter.with_virtio(|v| {
                 v.drain_used();
                 v.abandon_sync(token, block.as_ptr())
@@ -479,11 +526,18 @@ fn ctrl_roundtrip_observed(
         }
         // SAFETY: signal satisfaction or the locked AlreadyCompleted arm above
         // proves the terminal publisher finished touching the stack block.
-        match unsafe { block.copy_host_response_after_completion(resp_out) } {
-            WaitDisposition::HostResponseCopied => CtrlRoundtripOutcome::HostResponseCopied,
+        let observation = unsafe { block.copy_host_response_after_completion(resp_out) };
+        match observation.disposition() {
+            WaitDisposition::HostResponseAvailable => CtrlRoundtripOutcome::HostResponseCopied {
+                written_length: observation.written_length(),
+            },
             WaitDisposition::TransportAborted => {
                 CTRL_TEARDOWN_ABANDONS.fetch_add(1, Ordering::Relaxed);
                 CtrlRoundtripOutcome::Ambiguous(AbandonReason::TransportAborted)
+            }
+            WaitDisposition::MalformedResponse => {
+                bump_wait_refusal(&CTRL_RESPONSE_MALFORMED, b"CtRsLen");
+                CtrlRoundtripOutcome::Ambiguous(AbandonReason::MalformedResponse)
             }
             WaitDisposition::Pending => {
                 bump_wait_refusal(&CTRL_WAIT_PENDING, b"CtDsPend");
@@ -505,9 +559,19 @@ fn ctrl_roundtrip(
     resp_out: &mut [u8],
     timeout_ms: u64,
     bind: Option<BindMint<'_>>,
-) -> Result<(), VirtioError> {
-    ctrl_roundtrip_observed(passive, adapter, req, extra, resp_out, timeout_ms, bind)
-        .into_legacy_result()
+    expected_instance: Option<u64>,
+) -> Result<usize, VirtioError> {
+    ctrl_roundtrip_observed(
+        passive,
+        adapter,
+        req,
+        extra,
+        resp_out,
+        timeout_ms,
+        bind,
+        expected_instance,
+    )
+    .into_legacy_result()
 }
 
 /// Round-trip expecting a bare `VirtioGpuCtrlHdr` response; checks RESP_OK.
@@ -520,9 +584,6 @@ fn ctrl_roundtrip_ok(
     ctrl_roundtrip_ok_seq(passive, adapter, req, extra, None)
 }
 
-/// [`ctrl_roundtrip_ok`] plus the scan-out bind mint. Only the
-/// `SET_SCANOUT_BLOB` caller passes one; every other command's semantics are
-/// unchanged, because `None` skips the mint entirely.
 fn ctrl_roundtrip_ok_seq(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -531,7 +592,7 @@ fn ctrl_roundtrip_ok_seq(
     bind: Option<BindMint<'_>>,
 ) -> Result<(), VirtioError> {
     let mut resp = [0u8; size_of::<VirtioGpuCtrlHdr>()];
-    ctrl_roundtrip(
+    let outcome = ctrl_roundtrip_observed(
         passive,
         adapter,
         req,
@@ -539,8 +600,29 @@ fn ctrl_roundtrip_ok_seq(
         &mut resp,
         SYNC_ROUNDTRIP_TIMEOUT_MS,
         bind,
-    )?;
+        None,
+    );
+    match outcome {
+        CtrlRoundtripOutcome::HostResponseCopied { .. } => {}
+        CtrlRoundtripOutcome::DefiniteNotEnqueued(error) => return Err(error),
+        CtrlRoundtripOutcome::Ambiguous(AbandonReason::Timeout) => {
+            return Err(VirtioError::Timeout)
+        }
+        CtrlRoundtripOutcome::Ambiguous(
+            AbandonReason::NotOurs
+            | AbandonReason::TransportAborted
+            | AbandonReason::MalformedResponse,
+        ) => return Err(VirtioError::DeviceError),
+    }
+    // `resp` starts zeroed and only the reported prefix was copied. Reading the
+    // full word preserves legacy non-SET behavior for short responses while the
+    // exact length remains available to strict SET/future OwnerTable callers.
     let resp_type = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+    debug_assert!(bind.is_none());
+    // Keep the legacy response-type decision until OwnerTable activation can
+    // retain request/backing custody on a malformed persistent response. The
+    // exact written length is still propagated and is consumed by SET-specific
+    // ambiguity handling and future table normalization.
     if resp_is_ok(resp_type) {
         Ok(())
     } else {
@@ -558,9 +640,10 @@ fn ctrl_roundtrip_ok_seq(
 /// proof exists. The small fixed request/response keep this barrier off the
 /// already-constrained display-init stack.
 #[inline(never)]
-pub fn ctrl_fifo_barrier(
+pub(crate) fn ctrl_fifo_barrier_for_instance(
     passive: PassiveLevel,
     adapter: &AdapterContext,
+    expected_instance: u64,
 ) -> Result<(), VirtioError> {
     let mut cmd = VirtioGpuGetCapsetInfo::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
@@ -574,7 +657,9 @@ pub fn ctrl_fifo_barrier(
         &mut response,
         SYNC_ROUNDTRIP_TIMEOUT_MS,
         None,
+        Some(expected_instance),
     )
+    .map(|_| ())
 }
 
 // ── Context lifecycle ────────────────────────────────────────────────────────
@@ -745,7 +830,7 @@ pub fn ctx_detach_resource(
 /// 0ab-C): the caller's post-response bookkeeping is only allowed to run if no
 /// LATER bind has already applied its own — see
 /// `AdapterContext::adopt_scanout_bind_seq`.
-pub fn set_scanout_blob(
+pub(crate) fn set_scanout_blob(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     resource_id: u32,
@@ -755,26 +840,67 @@ pub fn set_scanout_blob(
     stride: u32,
     offset: u32,
     timeline: Option<ScanoutSetTimeline>,
-) -> Result<u64, VirtioError> {
+    expected_instance: Option<u64>,
+) -> ScanoutSetOutcome {
     let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
     fill_set_scanout_blob(&mut cmd, resource_id, width, height, format, stride, offset);
     let seq = Cell::new(0u64);
+    let instance = Cell::new(0u64);
     // `resource_id` rides down to the mint: it is 0 for the scan-out DISABLE the
     // retire path sends, which is exactly what must land in the wire-resource
     // word — after a disable nothing is bound, so nothing may be skipped as
     // already bound.
     let bind = BindMint {
         seq_out: &seq,
+        instance_out: &instance,
         resource_id,
         request: timeline.map(|timeline| timeline.request),
         timeline,
     };
-    let result = ctrl_roundtrip_ok_seq(passive, adapter, bytes_of(&cmd), None, Some(bind));
+    let mut response = [0u8; size_of::<VirtioGpuCtrlHdr>()];
+    let observed = ctrl_roundtrip_observed(
+        passive,
+        adapter,
+        bytes_of(&cmd),
+        None,
+        &mut response,
+        SYNC_ROUNDTRIP_TIMEOUT_MS,
+        Some(bind),
+        expected_instance,
+    );
+    let outcome = match observed {
+        CtrlRoundtripOutcome::HostResponseCopied { written_length }
+            if written_length as usize == response.len() =>
+        {
+            let response_type =
+                u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
+            if response_type == helios_protocol::VIRTIO_GPU_RESP_OK_NODATA {
+                debug_assert!(instance.get() != 0 && seq.get() != 0);
+                ScanoutSetOutcome::Accepted(ScanoutBindIdentity {
+                    instance: instance.get(),
+                    sequence: seq.get(),
+                })
+            } else if HostRejection::from_response_type(response_type).is_ok() {
+                ScanoutSetOutcome::Rejected
+            } else {
+                ScanoutSetOutcome::Ambiguous
+            }
+        }
+        CtrlRoundtripOutcome::HostResponseCopied { .. } | CtrlRoundtripOutcome::Ambiguous(_) => {
+            ScanoutSetOutcome::Ambiguous
+        }
+        CtrlRoundtripOutcome::DefiniteNotEnqueued(error) => {
+            ScanoutSetOutcome::DefiniteNotEnqueued {
+                error,
+                instance: instance.get(),
+            }
+        }
+    };
     if let Some(timeline) = timeline {
         crate::ddi::scanout_timeline::note(
             crate::ddi::scanout_timeline::kind::SYNC_SET_RETURN,
             timeline.flags
-                | if result.is_ok() {
+                | if matches!(&outcome, ScanoutSetOutcome::Accepted(_)) {
                     crate::ddi::scanout_timeline::flag::SUCCESS
                 } else {
                     0
@@ -786,8 +912,7 @@ pub fn set_scanout_blob(
             0,
         );
     }
-    result?;
-    Ok(seq.get())
+    outcome
 }
 
 /// Encode one `SET_SCANOUT_BLOB` into `cmd`, whoever owns the storage.
@@ -1025,7 +1150,7 @@ fn resource_map_blob_roundtrip(
     cmd.resource_id = resource_id;
     cmd.offset = offset;
     let mut resp = [0u8; size_of::<VirtioGpuRespMapInfo>()];
-    ctrl_roundtrip(
+    let _written_length = ctrl_roundtrip(
         passive,
         adapter,
         bytes_of(&cmd),
@@ -1033,8 +1158,11 @@ fn resource_map_blob_roundtrip(
         &mut resp,
         SYNC_ROUNDTRIP_TIMEOUT_MS,
         None,
+        None,
     )?;
     let resp_type = u32::from_le_bytes([resp[0], resp[1], resp[2], resp[3]]);
+    // As above, MAP keeps its legacy broad-OK classification until its exact
+    // WindowLifecycle can quarantine the reserved range on malformed success.
     if !resp_is_ok(resp_type) {
         return Err(VirtioError::DeviceError);
     }
@@ -1707,7 +1835,7 @@ fn completed_fence_outcome(block: &WaitBlockRef<'_>) -> WaitFenceOutcome {
             bump_wait_refusal(&FENCE_WAIT_PENDING, b"FwDsPend");
             WaitFenceOutcome::Invalid
         }
-        WaitDisposition::HostResponseCopied => {
+        WaitDisposition::HostResponseAvailable | WaitDisposition::MalformedResponse => {
             bump_wait_refusal(&FENCE_WAIT_HOST_RESPONSE, b"FwDsHost");
             WaitFenceOutcome::Invalid
         }

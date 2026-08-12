@@ -1319,7 +1319,9 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
         .with_virtio(|v| v.transport_failed())
         .unwrap_or(false);
     if failed {
-        let bad = crate::virtio::gpu::DRAIN_BAD_TOKEN.load(Ordering::Relaxed);
+        let bad_token = crate::virtio::gpu::DRAIN_BAD_TOKEN.load(Ordering::Relaxed);
+        let bad_length = crate::virtio::gpu::DRAIN_BAD_USED_LENGTH.load(Ordering::Relaxed);
+        let bad = bad_token.min(u16::MAX as u32) | (bad_length.min(u16::MAX as u32) << 16);
         if RING_FAIL_REPORTED.swap(bad, Ordering::Relaxed) != bad {
             crate::diag::fault(crate::diag::FaultCounter::StRing, bad);
         }
@@ -1327,8 +1329,8 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
     STATUS_SUCCESS
 }
 
-/// Last `DRAIN_BAD_TOKEN` value reported through `StRing`, so the ring-failure
-/// report is written on change rather than on every TDR.
+/// Last packed `(overlength count, unmatched-token count)` reported through
+/// `StRing`.
 static RING_FAIL_REPORTED: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// `DxgkDdiRestartFromTimeout` — resume after TDR.
@@ -2018,9 +2020,9 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         adapter.completed_fence()
     };
     let etw_registration = crate::ddi::diag_etw::registration_snapshot();
-    let report: [u32; 42] = [
+    let report: [u32; 47] = [
         0x4844_4247, // 'HDBG'
-        7,           // report version (7: + D0 provider lifetime at indices 38..41)
+        8,           // report version (8: + persistent SET namespaces at 42..46)
         args.Reason,
         SUBMIT_COUNT.load(Ordering::Relaxed),
         SUBMIT_LAST_FENCE.load(Ordering::Relaxed),
@@ -2079,8 +2081,15 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         etw_registration.failures,
         etw_registration.last_status as u32,
         etw_registration.registered,
+        // v8: nonwrapping persistent-SET namespaces and conservative response
+        // quarantine. These are occurrence counters, never raw identities.
+        crate::virtio::gpu::SCANOUT_BIND_SEQUENCE_EXHAUSTED.load(Ordering::Relaxed),
+        crate::virtio::gpu::SCANOUT_TRANSPORT_INSTANCE_EXHAUSTED.load(Ordering::Relaxed),
+        crate::virtio::gpu::WIRE_FENCE_NAMESPACE_EXHAUSTED.load(Ordering::Relaxed),
+        crate::virtio::gpu::SCANOUT_BIND_AMBIGUOUS_RESPONSES.load(Ordering::Relaxed),
+        crate::virtio::gpu::SCANOUT_PUBLICATION_CLAIM_LOST.load(Ordering::Relaxed),
     ];
-    let report_bytes = size_of::<[u32; 42]>();
+    let report_bytes = size_of::<[u32; 47]>();
     let copy_len = core::cmp::min(report_bytes, buf_len);
     // SAFETY: copy_len <= BufferSize (writable, checked above) and
     // copy_len <= size_of report (readable local array).
