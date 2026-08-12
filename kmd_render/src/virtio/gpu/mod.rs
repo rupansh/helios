@@ -130,7 +130,7 @@ pub(crate) const MAX_BLOBS: usize = 8192;
 /// be ≥ MAX_BLOBS (every blob is a live resource; non-blob resources add more).
 pub(super) const MAX_RESOURCES: usize = 16384;
 /// Max concurrently-tracked virtio-gpu contexts (one per live device, generous).
-const MAX_CONTEXTS: usize = 1024;
+pub(super) const MAX_CONTEXTS: usize = 1024;
 /// Max coalescing free ranges in the window allocator's free list. Overflow
 /// drops the freed range (leaks window offset space) — counted in
 /// `WINDOW_RANGE_DROPS`.

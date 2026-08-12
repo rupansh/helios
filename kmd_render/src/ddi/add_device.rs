@@ -34,8 +34,12 @@ pub unsafe extern "C" fn dxgkddi_add_device(
     // DxgkDdiRemoveDevice.
     let raw = match AdapterContext::create() {
         Ok(raw) => raw,
-        Err(crate::virtio::TransportDomainExhausted) => {
+        Err(crate::virtio::TransportOwnerCreateError::DomainExhausted) => {
             crate::kmsg(c"Helios: AddDevice transport domain exhausted\n");
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        Err(crate::virtio::TransportOwnerCreateError::StorageExhausted) => {
+            crate::kmsg(c"Helios: AddDevice control-owner storage exhausted\n");
             return STATUS_INSUFFICIENT_RESOURCES;
         }
     };

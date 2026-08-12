@@ -18,7 +18,7 @@ use wdk_sys::{KDPC, KEVENT, KSPIN_LOCK, KTIMER};
 
 use crate::dxgk::*;
 use crate::error::NotStarted;
-use crate::virtio::{TransportDomainExhausted, TransportOwner, VirtioGpu};
+use crate::virtio::{TransportOwner, TransportOwnerCreateError, VirtioGpu};
 use helios_kmd_logic::DisplayMode;
 
 pub(crate) mod allocation_object;
@@ -1053,14 +1053,14 @@ impl AdapterContext {
     /// used as the guarantee; `!Unpin` affects only the `Pin` APIs and would not
     /// stop `Box::new(ctx)` or `*Box::from_raw(raw)` from compiling.
     ///
-    /// Domain exhaustion is refused before allocation or dispatcher-object
-    /// initialization; it is the constructor's only fallible operation.
+    /// Domain or fixed owner-storage exhaustion is refused before allocating
+    /// this context or initializing any dispatcher object.
     ///
     /// Takes no PDO. AddAdapter is handed one, and this context used to store
     /// it in a `pub pdo` field that NOTHING ever read -- every path to the OS
     /// goes through the `DXGKRNL_INTERFACE` callback table saved at
     /// StartDevice, not through the device object. T6/R917.
-    pub(crate) fn create() -> Result<NonNull<AdapterContext>, TransportDomainExhausted> {
+    pub(crate) fn create() -> Result<NonNull<AdapterContext>, TransportOwnerCreateError> {
         let transport_owner = TransportOwner::unbound()?;
         let raw = Box::into_raw(Box::new(Self::new(transport_owner)));
         // SAFETY: `Box::into_raw` never returns null.
