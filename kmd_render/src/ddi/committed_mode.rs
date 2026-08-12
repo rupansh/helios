@@ -101,6 +101,12 @@ pub(crate) struct CommittedModeObservation {
     reason: PublicationReason,
 }
 
+impl CommittedModeObservation {
+    pub(crate) const fn mode(&self) -> CommittedMode {
+        self.mode
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum CommittedModeRead {
     Present(CommittedModeObservation),

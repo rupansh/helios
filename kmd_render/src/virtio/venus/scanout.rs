@@ -7,6 +7,40 @@
 use super::ring::*;
 use super::*;
 
+/// Zero one complete KMD-owned mappable blob through its exact canonical map.
+///
+/// D2 uses this once when constructing the permanent parking image. The map,
+/// byte stores, and unmap all run at PASSIVE with no plane/owner spinlock held;
+/// an uncertain unmap is left to OwnerTable's verified-reset custody.
+pub(crate) fn zero_host_visible_blob(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    minimum_size: u64,
+) -> Result<(), VirtioError> {
+    if !crate::virtio::KMD_D2_OWNER_ENABLED || resource_id == 0 || minimum_size == 0 {
+        return Err(VirtioError::DeviceError);
+    }
+    let prep = ctrl::map_blob_prepare(
+        passive,
+        adapter,
+        crate::virtio::gpu::OwnerFilter::Exactly(None),
+        resource_id,
+    )?;
+    if prep.size < minimum_size {
+        let _ = ctrl::resource_unmap_blob(passive, adapter, resource_id);
+        return Err(VirtioError::DeviceError);
+    }
+    let Some(map) = KernelMap::new(prep.gpa, prep.size, prep.map_cache) else {
+        let _ = ctrl::resource_unmap_blob(passive, adapter, resource_id);
+        return Err(VirtioError::OutOfMemory);
+    };
+    map.zero();
+    core::sync::atomic::fence(Ordering::SeqCst);
+    drop(map);
+    ctrl::resource_unmap_blob(passive, adapter, resource_id)
+}
+
 impl VenusClient {
     /// Put the persistent KMD LINEAR image into GENERAL layout and external
     /// ownership exactly once. The setup submission is nonblocking and its

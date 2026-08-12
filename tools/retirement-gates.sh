@@ -940,37 +940,190 @@ run_gate "K6 HNR2 decode: the ICD encoder's corpus replayed through the KMD asse
 run_gate "K5 HTS1/HQA1: the C mirror's records replayed through the KMD session" \
     bash "$REPO/tools/hts1-attach-gate.sh"
 
-# The control-owner arena is deliberately only dormant backing plus an inert
-# identity/config seed. An operational table cannot be constructed piecemeal:
-# doing so would create a second authority beside the still-live legacy tables
-# before Stop/reset/finalizer rundown exists. Comments may carry the future DAG,
-# so inspect only live Rust tokens. This gate is expected to be deliberately
-# replaced by the atomic activation change, never relaxed one symbol at a time.
+# D2 now deliberately contains a complete operational OwnerTable vertical.  Its
+# safety boundary is therefore reachability, not the absence of owner symbols:
+# one compile-time-false constant, one refusing AdapterContext gateway, and no
+# operational access that bypasses either.  The later activation change must
+# replace this gate while removing the legacy owner/write paths atomically; a
+# boolean-only flip remains a hard failure.
 DORMANT_OWNER_GATE_PY=$(cat <<'PY'
 REPO = sys.argv[1]
 ROOT = REPO + '/kmd_render/src'
-FORBIDDEN = (
-    'OwnerTable', 'OwnerStorage', 'PreparedOwnerControl', 'DispatchWork',
-    'ObservedOwnerWork', 'VerifiedPhysicalReset', 'OwnerResetAction',
-    'NextTransportRequest', 'NextTransportReady', 'StableSlots',
-    'ControlTickets',
-)
-hits = []
-for path in rust_files(ROOT):
-    src = open(path, encoding='utf-8').read()
+BOUNDARY = 'KMD_D2_OWNER_ENABLED'
+
+def live_rust(src):
     kind = rust_kinds(src)
-    live = ''.join(ch if kind[i] == 0 else ' ' for i, ch in enumerate(src))
-    for symbol in FORBIDDEN:
-        for match in re.finditer(r'\b' + re.escape(symbol) + r'\b', live):
-            line = src.count('\n', 0, match.start()) + 1
-            hits.append('%s:%d: live %s' % (path.replace(REPO + '/', ''), line, symbol))
-if hits:
-    sys.exit('dormant control-owner boundary violated:\n' + '\n'.join(hits))
-print('OK: KMD contains no live operational control-owner table/action token')
+    return ''.join(ch if kind[i] == ord('c') else ' ' for i, ch in enumerate(src))
+
+def line_at(src, offset):
+    return src.count('\n', 0, offset) + 1
+
+def function_ranges(live):
+    pattern = re.compile(
+        r'(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?fn\s+(\w+)'
+        r'(?:\s*<[^>{}]*>)?\s*\('
+    )
+    ranges = []
+    for match in pattern.finditer(live):
+        brace = live.find('{', match.end())
+        if brace < 0:
+            continue
+        depth = 0
+        end = None
+        for index in range(brace, len(live)):
+            if live[index] == '{':
+                depth += 1
+            elif live[index] == '}':
+                depth -= 1
+                if depth == 0:
+                    end = index + 1
+                    break
+        if end is not None:
+            ranges.append((match.group(1), match.start(), brace, end))
+    return ranges
+
+def enclosing_function(ranges, offset):
+    found = [item for item in ranges if item[2] <= offset < item[3]]
+    return min(found, key=lambda item: item[3] - item[2]) if found else None
+
+def has_boundary_branch(body):
+    return re.search(
+        r'\bif\s*!?\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*' + BOUNDARY + r'\b',
+        body,
+    ) is not None
+
+def check_sources(sources):
+    errors = []
+    live_sources = {path: live_rust(src) for path, src in sources.items()}
+    definitions = []
+    definition_pattern = re.compile(
+        r'\b(?:pub\s*\(\s*crate\s*\)\s+)?const\s+' + BOUNDARY
+        + r'\s*:\s*bool\s*=\s*(true|false)\s*;'
+    )
+    for path, live in live_sources.items():
+        for match in definition_pattern.finditer(live):
+            definitions.append((path, match, match.group(1)))
+    if len(definitions) != 1:
+        errors.append('expected exactly one live compile-time %s definition, found %d' % (
+            BOUNDARY, len(definitions)))
+    elif definitions[0][2] != 'false':
+        path, match, value = definitions[0]
+        errors.append('%s:%d: %s must remain compile-time false, found %s' % (
+            path, line_at(sources[path], match.start()), BOUNDARY, value))
+    else:
+        path, match, _ = definitions[0]
+        prefix = live_sources[path][max(0, match.start() - 256):match.start()]
+        if re.search(r'#\s*\[\s*cfg(?:_attr)?\b', prefix):
+            errors.append('%s:%d: the D2 boundary definition may not be cfg/feature selected' % (
+                path, line_at(sources[path], match.start())))
+
+    # A second conditional definition, static, generated alias, or macro binding
+    # must not evade the exact-const count above.
+    for path, live in live_sources.items():
+        for match in re.finditer(
+            r'\b(?:static|let|type)\s+(?:mut\s+)?' + BOUNDARY + r'\b'
+            r'|\bas\s+' + BOUNDARY + r'\b',
+            live,
+        ):
+            errors.append('%s:%d: alternate D2 boundary binding is forbidden' % (
+                path, line_at(sources[path], match.start())))
+
+    adapter_path = 'kmd_render/src/adapter/mod.rs'
+    adapter_live = live_sources.get(adapter_path, '')
+    adapter_ranges = function_ranges(adapter_live)
+    gateway = next((item for item in adapter_ranges if item[0] == 'control_owner'), None)
+    if gateway is None:
+        errors.append('%s: missing canonical control_owner gateway' % adapter_path)
+    else:
+        body = adapter_live[gateway[2]:gateway[3]]
+        if not re.search(
+            r'\bif\s*!\s*crate::virtio::' + BOUNDARY
+            + r'\s*\{\s*unreachable!\s*\(',
+            body,
+        ):
+            errors.append('%s:%d: control_owner gateway does not refuse before returning authority' % (
+                adapter_path, line_at(sources[adapter_path], gateway[1])))
+
+    # Every cross-module use of the gateway must retain an explicit local branch.
+    # This intentionally rejects a newly added helper that relies only on a
+    # distant caller's guard: future call-graph growth cannot silently expose it.
+    for path, live in live_sources.items():
+        ranges = function_ranges(live)
+        for match in re.finditer(r'\.control_owner\s*\(\s*\)', live):
+            owner = enclosing_function(ranges, match.start())
+            if owner is None:
+                errors.append('%s:%d: control_owner access is outside a function' % (
+                    path, line_at(sources[path], match.start())))
+                continue
+            body = live[owner[2]:owner[3]]
+            if not has_boundary_branch(body):
+                errors.append('%s:%d: %s reaches control_owner without a local D2 boundary' % (
+                    path, line_at(sources[path], match.start()), owner[0]))
+
+    # AdapterContext owns the sole TransportOwner value.  Dormant construction,
+    # observation and removal are allowed while false; all other direct method
+    # calls must sit in a locally guarded adapter method.
+    allowed_dormant_methods = {
+        'bind_adapter_once',
+        'reset_transition_diagnostics',
+        'observe_initialized_transport',
+        'observe_removed_transport',
+        'observe_transport_slot_absent',
+    }
+    for match in re.finditer(r'\bself\s*\.\s*transport_owner\s*\.\s*(\w+)\s*\(', adapter_live):
+        method = match.group(1)
+        owner = enclosing_function(adapter_ranges, match.start())
+        if method in allowed_dormant_methods:
+            continue
+        if owner is None or not has_boundary_branch(adapter_live[owner[2]:owner[3]]):
+            errors.append('%s:%d: direct operational transport_owner.%s bypasses the D2 boundary' % (
+                adapter_path, line_at(sources[adapter_path], match.start()), method))
+
+    for path, live in live_sources.items():
+        if path in ('kmd_render/src/adapter/mod.rs',
+                    'kmd_render/src/virtio/control_owner.rs'):
+            continue
+        for match in re.finditer(r'\bTransportOwner\s*::', live):
+            errors.append('%s:%d: TransportOwner construction/use bypasses AdapterContext' % (
+                path, line_at(sources[path], match.start())))
+    return errors
+
+sources = {}
+for path in rust_files(ROOT):
+    rel = path.replace(REPO + '/', '')
+    sources[rel] = open(path, encoding='utf-8').read()
+
+errors = check_sources(sources)
+if errors:
+    sys.exit('dormant D2 control-owner boundary violated:\n' + '\n'.join(errors))
+
+# Executed mutation checks: these must be caught by the same checker that just
+# accepted the tree, not by a parallel grep with a subtly different grammar.
+constant_path = 'kmd_render/src/virtio/control_owner.rs'
+enabled = dict(sources)
+enabled[constant_path], changed = re.subn(
+    r'(const\s+' + BOUNDARY + r'\s*:\s*bool\s*=\s*)false(\s*;)',
+    r'\1true\2',
+    enabled[constant_path],
+    count=1,
+)
+if changed != 1 or not check_sources(enabled):
+    sys.exit('D2 boundary mutation self-test failed: an enabled constant was accepted')
+
+unguarded = dict(sources)
+unguarded['kmd_render/src/ddi/__d2_gate_mutation.rs'] = '''
+fn deliberately_unguarded(adapter: &crate::adapter::AdapterContext) -> bool {
+    adapter.control_owner().resource_is_live(1)
+}
+'''
+if not check_sources(unguarded):
+    sys.exit('D2 boundary mutation self-test failed: an unguarded owner entry was accepted')
+
+print('OK: one compile-time-false D2 boundary; canonical authority is guarded; mutations rejected')
 PY
 )
 
-run_gate "dormant control-owner storage has no operational KMD authority" \
+run_gate "disabled KMD D2 control-owner authority has one atomic activation boundary" \
     python3 -c "$K4_RUST_MASK_PY
 $DORMANT_OWNER_GATE_PY" "$REPO"
 

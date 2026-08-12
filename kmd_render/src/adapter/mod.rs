@@ -412,6 +412,10 @@ impl ScanoutMode {
     pub(crate) fn edid(&self) -> &[u8; 128] {
         &self.edid
     }
+
+    pub(crate) fn extent(&self) -> (u32, u32) {
+        (self.mode.width(), self.mode.height())
+    }
 }
 
 /// The 1920×1080 fallback as an already-validated value, so nothing on the
@@ -480,6 +484,13 @@ pub struct AdapterContext {
     /// Per-adapter ETW admission; its epoch survives stop/start so a stale
     /// pre-stop CAS cannot enter the replacement transport generation.
     pub(crate) etw_rundown: crate::ddi::diag_etw::EtwAdapterRundown,
+    /// Atomic committed-mode publication read by dormant D2 admission. It is
+    /// adapter-stable across transport replacement and is reset/removed only at
+    /// the explicit lifecycle barriers.
+    pub(crate) committed_mode: crate::ddi::committed_mode::CommittedModeStorage,
+    /// One stable source-0/plane-0 D2 lifetime owner. The production display
+    /// path cannot reach it while `KMD_D2_OWNER_ENABLED` is false.
+    pub(crate) direct_scanout: crate::ddi::direct_scanout::DirectScanoutRuntime,
     /// Last fence completed by the bring-up scheduler path.
     last_completed_fence: AtomicU32,
     /// Serializes DMA_COMPLETED notification and its monotonic fence update.
@@ -1100,6 +1111,8 @@ impl AdapterContext {
             started: UnsafeCell::new(None),
             started_published: AtomicU32::new(0),
             etw_rundown: crate::ddi::diag_etw::EtwAdapterRundown::new(),
+            committed_mode: crate::ddi::committed_mode::CommittedModeStorage::new(),
+            direct_scanout: crate::ddi::direct_scanout::DirectScanoutRuntime::new(),
             last_completed_fence: AtomicU32::new(0),
             wddm_notify_lock: UnsafeCell::new(0),
             isr_status: AtomicUsize::new(0),
@@ -1618,6 +1631,9 @@ impl AdapterContext {
     }
 
     pub(crate) fn control_owner(&self) -> &TransportOwner {
+        if !crate::virtio::KMD_D2_OWNER_ENABLED {
+            unreachable!("the canonical control owner is behind the dormant KMD D2 boundary");
+        }
         &self.transport_owner
     }
 

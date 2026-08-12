@@ -225,6 +225,11 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             indicate_child_status(adapter, true);
         }
 
+        // Dormant D2 candidates are published by bounded display DDIs and have
+        // exactly one PASSIVE continuation. The false owner boundary keeps this
+        // call inert in the production legacy branch.
+        crate::ddi::direct_scanout::service_pending(passive, adapter);
+
         // Consume only the allocation identity supplied by Windows through
         // SetVidPnSourceAddress. The DDI can be called at DIRQL, where neither
         // Venus waits nor registry diagnostics are legal; this worker is the

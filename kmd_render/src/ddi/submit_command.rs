@@ -1338,10 +1338,18 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
         // producers and makes later callers fail closed before canonical owner
         // admission is sealed.
         let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        let had_transport = adapter.with_virtio(|_| ()).is_ok();
         adapter.stop_vsync();
         adapter.stop_hpd();
         if adapter.hpd_worker_may_be_running() {
             return STATUS_DEVICE_NOT_READY;
+        }
+        if had_transport {
+            crate::ddi::direct_scanout::prepare_reset(
+                passive,
+                adapter,
+                helios_kmd_logic::direct_scanout_lifetime::DrainReason::DwmRestart,
+            );
         }
         adapter.set_venus_client(None);
         adapter
@@ -1354,6 +1362,9 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
             let status: NTSTATUS = error.into();
             crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
             return status;
+        }
+        if had_transport {
+            crate::ddi::direct_scanout::complete_verified_reset(passive, adapter);
         }
         let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
         adapter.reset_display_publication_state();
@@ -1426,6 +1437,7 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
                 .close_control_owner_transport()
                 .and_then(|()| adapter.retire_control_owner_transport(passive));
             if cleanup.is_ok() {
+                crate::ddi::direct_scanout::complete_verified_reset(passive, adapter);
                 let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
                 adapter.reset_display_publication_state();
             }
@@ -1444,6 +1456,7 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
                 .close_control_owner_transport()
                 .and_then(|()| adapter.retire_control_owner_transport(passive));
             if cleanup.is_ok() {
+                crate::ddi::direct_scanout::complete_verified_reset(passive, adapter);
                 let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
                 adapter.reset_display_publication_state();
             }
@@ -1452,6 +1465,36 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
                 .map_or(STATUS_DEVICE_NOT_READY, |error| error.into());
         }
         if adapter.display_half() {
+            let (width, height) = adapter.display_mode();
+            if let Err(start_error) =
+                crate::ddi::direct_scanout::start(passive, adapter, width, height)
+            {
+                crate::ddi::direct_scanout::prepare_reset(
+                    passive,
+                    adapter,
+                    helios_kmd_logic::direct_scanout_lifetime::DrainReason::DwmRestart,
+                );
+                adapter
+                    .isr_status
+                    .store(0, core::sync::atomic::Ordering::Release);
+                adapter.set_venus_client(None);
+                let cleanup = adapter
+                    .close_control_owner_transport()
+                    .and_then(|()| adapter.retire_control_owner_transport(passive));
+                let status = match cleanup {
+                    Ok(()) => {
+                        crate::ddi::direct_scanout::complete_verified_reset(passive, adapter);
+                        let _ =
+                            adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
+                        adapter.reset_display_publication_state();
+                        let _ = unsafe { adapter.set_reset_venus_context(0) };
+                        start_error.into()
+                    }
+                    Err(error) => error.into(),
+                };
+                crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
+                return status;
+            }
             unsafe { adapter.start_vsync() };
             unsafe { adapter.init_hpd() };
             adapter.signal_start_complete();

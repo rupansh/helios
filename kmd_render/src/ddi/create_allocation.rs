@@ -119,6 +119,10 @@ struct AllocationContext {
     /// this immutable value grants no release authority. It is never written
     /// into private data or recovered from geometry.
     resource_id: u32,
+    /// Exact virtio transport generation that created `resource_id`. Resource
+    /// numbers restart in a replacement transport, so D2 must reject an old
+    /// allocation object even when a new row happens to reuse the same scalar.
+    transport_instance: u64,
     /// The allocation generation minted once at create
     /// (`crate::adapter::allocation_object::mint`), stamped into the descriptor
     /// this create wrote back, and `const` for the object's whole life.
@@ -133,6 +137,11 @@ struct AllocationContext {
     /// later decision that used to sniff geometry or memory visibility now names
     /// this instead.
     kind: u32,
+    /// The final create-output HWA2 record for this exact allocation object.
+    /// `None` for HVM1/HOC1.  Display admission reaches this only through the
+    /// OS-supplied `hAllocation`; it is never reconstructed from the resource
+    /// id, dimensions, a scanout cache, or list position.
+    final_hwa2: Option<HeliosWddmAllocationDescV2>,
     /// Nonzero observation for KMD-backed standard allocations: the kernel
     /// Venus `VkDeviceMemory` behind the blob. The compiled KMD D2 arm transfers
     /// its only destruction authority into `ResourceBackingFinalizer` before
@@ -1289,6 +1298,50 @@ unsafe fn resolve_alloc(h: HANDLE) -> Option<&'static AllocationContext> {
     // trusted, and the caller guarantees the handle's provenance.
     let ctx = unsafe { &*(h as *const AllocationContext) };
     (ctx.magic == ALLOCATION_CTX_MAGIC).then_some(ctx)
+}
+
+/// Exact immutable facts the dormant D2 display plane may read from one live
+/// Windows allocation object.
+///
+/// The descriptor is the final create-output record, including the generation
+/// this KMD stamped after constructing the backing.  `resource_id` is merely
+/// the address of that same allocation's canonical OwnerTable row; callers get
+/// no lookup or release authority from the scalar itself.
+#[derive(Clone, Copy)]
+pub(crate) struct DirectScanoutAllocationFacts {
+    pub final_hwa2: HeliosWddmAllocationDescV2,
+    pub resource_id: u32,
+    pub allocation_generation: u64,
+    pub transport_instance: u64,
+}
+
+/// Resolve the exact OS-supplied `hAllocation` to its final HWA2 facts.
+///
+/// Returns `None` for a null, foreign, stale, HVM1, HOC1, or backing-less
+/// allocation.  There is intentionally no resource-id-to-allocation reverse
+/// lookup: the Windows handle is the identity and the allocation object is the
+/// sole source of the descriptor/backing association.
+///
+/// # Safety
+/// `h` must be an allocation handle supplied by dxgkrnl for the duration of a
+/// DDI that keeps the allocation live.
+pub(crate) unsafe fn direct_scanout_allocation_facts(
+    h: HANDLE,
+) -> Option<DirectScanoutAllocationFacts> {
+    let ctx = unsafe { resolve_alloc(h) }?;
+    let final_hwa2 = ctx.final_hwa2?;
+    if ctx.resource_id == 0
+        || ctx.transport_instance == 0
+        || final_hwa2.allocation_generation != ctx.generation
+    {
+        return None;
+    }
+    Some(DirectScanoutAllocationFacts {
+        final_hwa2,
+        resource_id: ctx.resource_id,
+        allocation_generation: ctx.generation,
+        transport_instance: ctx.transport_instance,
+    })
 }
 
 /// Geometry `DxgkDdiDescribeAllocation` reports, from a magic-checked handle.
@@ -2694,7 +2747,18 @@ unsafe fn destroy_allocation_ctx(
     // resource, Venus image, or cached copy can be torn down. If QEMU cannot
     // confirm resource_id=0 scanout disable, retain every host object until
     // device teardown rather than leave scanout 0 pointing at an unref'd blob.
-    if !adapter.retire_scanout_allocation(passive, allocation_handle, ctx.resource_id) {
+    let scanout_retired = if crate::virtio::KMD_D2_OWNER_ENABLED {
+        super::direct_scanout::retire_allocation(
+            passive,
+            adapter,
+            allocation_handle as HANDLE,
+            ctx.generation,
+            ctx.resource_id,
+        )
+    } else {
+        adapter.retire_scanout_allocation(passive, allocation_handle, ctx.resource_id)
+    };
+    if !scanout_retired {
         let _ = orphaned_copy_requires_backing_retain(&ctx);
         drop(ctx);
         return;
@@ -3353,6 +3417,9 @@ impl CreateCallShape {
 struct AdmittedAllocation {
     kind: u32,
     generation: u64,
+    /// Final HWA2 create-output bytes for the exact allocation object. HVM1
+    /// and HOC1 use distinct records and therefore carry `None`.
+    final_hwa2: Option<HeliosWddmAllocationDescV2>,
     /// The exact extent charged to VidMm, page-rounded.
     vidmm_size: SIZE_T,
     placement: VidMmPlacement,
@@ -3818,6 +3885,7 @@ unsafe fn admit_hwa2(
     Ok(AdmittedAllocation {
         kind: desc.allocation_kind,
         generation,
+        final_hwa2: Some(desc),
         vidmm_size,
         placement,
         // ⭐ THE SAME predicate `classify_hwa2` routed the backing with, so the
@@ -4057,6 +4125,7 @@ unsafe fn admit_hvm1(
     Ok(AdmittedAllocation {
         kind: ALLOC_KIND_HVM1,
         generation,
+        final_hwa2: None,
         vidmm_size: round_up_page(created.blob_size.bytes().max(record.byte_size) as SIZE_T),
         // The same value the segment check above interrogated — computed once so
         // the placement that was validated is the placement that ships.
@@ -4175,6 +4244,7 @@ unsafe fn admit_hoc1(
     Ok(AdmittedAllocation {
         kind: ALLOC_KIND_HOC1,
         generation,
+        final_hwa2: None,
         vidmm_size: round_up_page(record.byte_size as SIZE_T),
         // Validated by the segment check above; computed once so the placement
         // that was validated is the placement that ships.
@@ -4365,8 +4435,16 @@ unsafe fn create_one(
         magic: ALLOCATION_CTX_MAGIC,
         ctx_id: adapter.venus_ctx_id(),
         resource_id,
+        transport_instance: if crate::virtio::KMD_D2_OWNER_ENABLED {
+            adapter
+                .with_virtio(|gpu| gpu.scanout_transport_instance())
+                .unwrap_or(0)
+        } else {
+            0
+        },
         generation: admitted.generation,
         kind: admitted.kind,
+        final_hwa2: admitted.final_hwa2,
         venus_memory_id: backing.map_or(0, |b| b.venus_memory_id),
         venus_image_id: backing.map_or(0, |b| b.venus_image_id),
         scanout_copy_image_id: core::sync::atomic::AtomicU64::new(0),

@@ -88,7 +88,8 @@ use helios_protocol::{
     VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE, VIRTIO_GPU_CMD_GET_CAPSET_INFO,
     VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_FLUSH,
     VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
-    VIRTIO_GPU_CMD_RESOURCE_UNREF, VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_MAP_CACHE_MASK,
+    VIRTIO_GPU_CMD_RESOURCE_UNREF, VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_FLAG_FENCE,
+    VIRTIO_GPU_MAP_CACHE_MASK,
 };
 
 /// `KernelMode` (`KPROCESSOR_MODE`).
@@ -353,8 +354,17 @@ pub fn reap_parked(_passive: PassiveLevel, adapter: &AdapterContext) {
 struct BindMint<'a> {
     seq_out: &'a Cell<u64>,
     instance_out: &'a Cell<u64>,
+    fence_out: &'a Cell<u64>,
     /// The `SET_SCANOUT_BLOB`'s own `resource_id`; 0 is the scan-out disable.
     resource_id: u32,
+    /// Request one standard virtio-gpu fence. False is the byte-identical
+    /// production legacy command; true is reachable only through dormant D2.
+    fenced: bool,
+    /// Dormant D2's no-wait publication edge. Called after the descriptor and
+    /// its exact mint are in the transport's in-flight table but before this
+    /// `virtio_lock` hold can drain a completion. It may perform bounded plane
+    /// state transitions only; no allocation, wait, cleanup, or ETW write.
+    publish: Option<&'a dyn Fn(FencedScanoutPublish)>,
     /// The full presentation identity carried by a direct synchronous SET. It
     /// survives waiter abandonment in the in-flight tag so a late success can
     /// be applied and arm this request's exact flush from the DPC.
@@ -377,6 +387,8 @@ pub(crate) struct ScanoutSetTimeline {
 pub(crate) struct ScanoutBindIdentity {
     instance: u64,
     sequence: u64,
+    fence_id: u64,
+    resource_id: u32,
 }
 
 impl ScanoutBindIdentity {
@@ -386,6 +398,14 @@ impl ScanoutBindIdentity {
 
     pub(crate) const fn sequence(&self) -> u64 {
         self.sequence
+    }
+
+    pub(crate) const fn fence_id(&self) -> u64 {
+        self.fence_id
+    }
+
+    pub(crate) const fn resource_id(&self) -> u32 {
+        self.resource_id
     }
 }
 
@@ -401,6 +421,27 @@ pub(crate) enum ScanoutSetOutcome {
     Rejected,
     DefiniteNotEnqueued { error: VirtioError, instance: u64 },
     Ambiguous,
+}
+
+/// Terminal classification for the dormant D2 fenced SET path.
+///
+/// Every outcome after descriptor acceptance carries the exact mint. An
+/// ambiguous response therefore preserves a completion key instead of losing
+/// the identity needed to retain the plane candidate through physical reset.
+#[must_use]
+pub(crate) enum FencedScanoutSetOutcome {
+    Accepted(ScanoutBindIdentity),
+    Rejected(ScanoutBindIdentity),
+    DefiniteNotEnqueued { error: VirtioError, instance: u64 },
+    Ambiguous(Option<ScanoutBindIdentity>),
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct FencedScanoutPublish {
+    pub instance: u64,
+    pub sequence: u64,
+    pub fence_id: u64,
+    pub resource_id: u32,
 }
 
 #[must_use]
@@ -501,7 +542,7 @@ fn ctrl_roundtrip_observed(
                         in1_len,
                         resp_len,
                         block.as_ptr(),
-                        bind.map(|bind| (bind.resource_id, bind.request)),
+                        bind.map(|bind| (bind.resource_id, bind.request, bind.fenced)),
                         adapter,
                     )
                 };
@@ -512,9 +553,18 @@ fn ctrl_roundtrip_observed(
                 // update the host-selection ledger.
                 match queued {
                     Ok((ticket, identity)) => {
-                        if let (Some(bind), Some((instance, seq))) = (bind, identity) {
+                        if let (Some(bind), Some((instance, seq, fence_id))) = (bind, identity) {
                             bind.instance_out.set(instance);
                             bind.seq_out.set(seq);
+                            bind.fence_out.set(fence_id);
+                            if let Some(publish) = bind.publish {
+                                publish(FencedScanoutPublish {
+                                    instance,
+                                    sequence: seq,
+                                    fence_id,
+                                    resource_id: bind.resource_id,
+                                });
+                            }
                             if let Some(timeline) = bind.timeline {
                                 crate::ddi::scanout_timeline::note(
                                     crate::ddi::scanout_timeline::kind::SYNC_SET_PUBLISH,
@@ -1129,6 +1179,7 @@ pub(crate) fn set_scanout_blob(
     fill_set_scanout_blob(&mut cmd, resource_id, width, height, format, stride, offset);
     let seq = Cell::new(0u64);
     let instance = Cell::new(0u64);
+    let fence_id = Cell::new(0u64);
     // `resource_id` rides down to the mint: it is 0 for the scan-out DISABLE the
     // retire path sends, which is exactly what must land in the wire-resource
     // word — after a disable nothing is bound, so nothing may be skipped as
@@ -1136,7 +1187,10 @@ pub(crate) fn set_scanout_blob(
     let bind = BindMint {
         seq_out: &seq,
         instance_out: &instance,
+        fence_out: &fence_id,
         resource_id,
+        fenced: false,
+        publish: None,
         request: timeline.map(|timeline| timeline.request),
         timeline,
     };
@@ -1162,6 +1216,8 @@ pub(crate) fn set_scanout_blob(
                 ScanoutSetOutcome::Accepted(ScanoutBindIdentity {
                     instance: instance.get(),
                     sequence: seq.get(),
+                    fence_id: 0,
+                    resource_id,
                 })
             } else if HostRejection::from_response_type(response_type).is_ok() {
                 ScanoutSetOutcome::Rejected
@@ -1196,6 +1252,127 @@ pub(crate) fn set_scanout_blob(
         );
     }
     outcome
+}
+
+static FENCED_SCANOUT_RESPONSE_REFUSALS: AtomicU32 = AtomicU32::new(0);
+
+fn record_fenced_scanout_response_refusal(code: u32) {
+    let count = FENCED_SCANOUT_RESPONSE_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 1 || count % 64 == 0 {
+        crate::diag::record_named_bytes(b"D2SetRef", (code << 24) | count.min(0x00ff_ffff));
+    }
+}
+
+/// Issue one standard fenced `SET_SCANOUT_BLOB` for the dormant D2 plane.
+///
+/// The transport mints both values only after accepting this command's exact
+/// descriptor: a globally unique nonzero wire fence and the FIFO binding
+/// sequence. A response is terminal only when the used-ring ticket selected
+/// this entry, the exact header length was written, and the standard fence
+/// flag/id plus global-command zero fields all echo this mint. The resource is
+/// request-bound in the in-flight tag (virtio-gpu replies do not echo it).
+pub(crate) fn set_scanout_blob_fenced(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    width: u32,
+    height: u32,
+    format: u32,
+    stride: u32,
+    offset: u32,
+    expected_instance: u64,
+    on_publish: &dyn Fn(FencedScanoutPublish),
+) -> FencedScanoutSetOutcome {
+    if !super::control_owner::KMD_D2_OWNER_ENABLED {
+        return FencedScanoutSetOutcome::DefiniteNotEnqueued {
+            error: VirtioError::DeviceError,
+            instance: 0,
+        };
+    }
+    let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
+    fill_set_scanout_blob(&mut cmd, resource_id, width, height, format, stride, offset);
+    let seq = Cell::new(0u64);
+    let instance = Cell::new(0u64);
+    let fence_id = Cell::new(0u64);
+    let bind = BindMint {
+        seq_out: &seq,
+        instance_out: &instance,
+        fence_out: &fence_id,
+        resource_id,
+        fenced: true,
+        publish: Some(on_publish),
+        request: None,
+        timeline: None,
+    };
+    let mut response = [0u8; size_of::<VirtioGpuCtrlHdr>()];
+    let observed = ctrl_roundtrip_observed(
+        passive,
+        adapter,
+        bytes_of(&cmd),
+        None,
+        &mut response,
+        SYNC_ROUNDTRIP_TIMEOUT_MS,
+        Some(bind),
+        Some(expected_instance),
+    );
+    let identity = || {
+        (instance.get() != 0 && seq.get() != 0 && fence_id.get() != 0).then_some(
+            ScanoutBindIdentity {
+                instance: instance.get(),
+                sequence: seq.get(),
+                fence_id: fence_id.get(),
+                resource_id,
+            },
+        )
+    };
+    match observed {
+        CtrlRoundtripOutcome::DefiniteNotEnqueued(error) => {
+            FencedScanoutSetOutcome::DefiniteNotEnqueued {
+                error,
+                instance: instance.get(),
+            }
+        }
+        CtrlRoundtripOutcome::Ambiguous(_) => {
+            record_fenced_scanout_response_refusal(1);
+            FencedScanoutSetOutcome::Ambiguous(identity())
+        }
+        CtrlRoundtripOutcome::HostResponseCopied { written_length }
+            if written_length as usize == response.len() =>
+        {
+            // SAFETY: the exact observed length covers the complete response
+            // array; the byte array itself carries no alignment guarantee.
+            let header = unsafe {
+                core::ptr::read_unaligned(response.as_ptr().cast::<VirtioGpuCtrlHdr>())
+            };
+            let Some(identity) = identity() else {
+                record_fenced_scanout_response_refusal(2);
+                return FencedScanoutSetOutcome::Ambiguous(None);
+            };
+            let exact = header.flags == VIRTIO_GPU_FLAG_FENCE
+                && header.fence_id == identity.fence_id()
+                && header.ctx_id == 0
+                && header.ring_idx == 0
+                && header.padding == [0; 3]
+                && identity.instance() == expected_instance
+                && identity.resource_id() == resource_id;
+            if !exact {
+                record_fenced_scanout_response_refusal(3);
+                return FencedScanoutSetOutcome::Ambiguous(Some(identity));
+            }
+            if header.type_ == helios_protocol::VIRTIO_GPU_RESP_OK_NODATA {
+                FencedScanoutSetOutcome::Accepted(identity)
+            } else if HostRejection::from_response_type(header.type_).is_ok() {
+                FencedScanoutSetOutcome::Rejected(identity)
+            } else {
+                record_fenced_scanout_response_refusal(4);
+                FencedScanoutSetOutcome::Ambiguous(Some(identity))
+            }
+        }
+        CtrlRoundtripOutcome::HostResponseCopied { .. } => {
+            record_fenced_scanout_response_refusal(5);
+            FencedScanoutSetOutcome::Ambiguous(identity())
+        }
+    }
 }
 
 /// Encode one `SET_SCANOUT_BLOB` into `cmd`, whoever owns the storage.
@@ -1638,6 +1815,9 @@ fn resource_map_blob_owner_work(
     offset: u64,
     work: DispatchWork<helios_kmd_logic::control_owner_slots::WindowSlotKind>,
 ) -> Result<u32, VirtioError> {
+    if !super::control_owner::KMD_D2_OWNER_ENABLED {
+        return Err(VirtioError::DeviceError);
+    }
     let mut cmd = VirtioGpuResourceMapBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
     cmd.resource_id = resource_id;
@@ -1917,6 +2097,9 @@ fn release_owner_resource(
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    if !super::control_owner::KMD_D2_OWNER_ENABLED {
+        return Err(VirtioError::DeviceError);
+    }
     let terminal = adapter.with_scanout_lifecycle(passive, |lock| -> Result<(), VirtioError> {
         lock.with_venus_client(|client| {
             let _ =

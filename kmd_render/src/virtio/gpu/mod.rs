@@ -49,9 +49,10 @@ use helios_kmd_logic::scanout_read_ledger::LedgerTicket;
 use helios_kmd_logic::scanout_refresh::{Marker as ScanoutRefreshMarker, State as RefreshState};
 use helios_protocol::{
     HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
-    VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
-    VIRTIO_GPU_RESP_OK_DISPLAY_INFO, VIRTIO_GPU_RESP_OK_NODATA, VirtioGpuCmdSubmit,
-    VirtioGpuCtrlHdr, VirtioGpuRespDisplayInfo, VirtioGpuSetScanoutBlob,
+    VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE,
+    VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_RESP_OK_DISPLAY_INFO,
+    VIRTIO_GPU_RESP_OK_NODATA, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr,
+    VirtioGpuRespDisplayInfo, VirtioGpuSetScanoutBlob,
 };
 use virtio_drivers::queue::VirtQueue;
 use virtio_drivers::transport::pci::PciTransport;
@@ -972,6 +973,9 @@ struct WindowedBltRetire {
 struct SyncScanoutBind {
     seq: u64,
     resource_id: u32,
+    /// Unique standard virtio-gpu fence carried by this SET. Zero preserves
+    /// the production legacy SET shape; only dormant D2 requests a fence.
+    fence_id: u64,
     /// Present only for a direct-primary worker SET. Disable/fallback SETs
     /// still carry their resource/sequence into the host-selection ledger but
     /// do not begin a presentation publication transaction.
@@ -2790,14 +2794,14 @@ impl VirtioGpu {
 
     pub fn enqueue_sync(
         &mut self,
-        meta: DmaBuffer,
+        mut meta: DmaBuffer,
         in0_len: usize,
         in1_len: usize,
         resp_len: usize,
         waiter: NonNull<SyncWaitBlock>,
-        scanout_bind: Option<(u32, Option<ScanoutBindRequest>)>,
+        scanout_bind: Option<(u32, Option<ScanoutBindRequest>, bool)>,
         adapter: &crate::adapter::AdapterContext,
-    ) -> Result<(SyncTicket, Option<(u64, u64)>), (DmaBuffer, VirtioError)> {
+    ) -> Result<(SyncTicket, Option<(u64, u64, u64)>), (DmaBuffer, VirtioError)> {
         // The shape is decided ONCE, here, and carried on the entry; the drain
         // no longer re-derives it from `in1_len > 0`.
         let chain = if in1_len > 0 {
@@ -2814,7 +2818,7 @@ impl VirtioGpu {
             self.release_sync_claim_for_refusal(scanout_bind);
             return Err((meta, VirtioError::DeviceError));
         }
-        if let Some(request) = scanout_bind.and_then(|(_, request)| request) {
+        if let Some(request) = scanout_bind.and_then(|(_, request, _)| request) {
             // QueueFull retry burns no descriptor authority. Reclaim this exact
             // worker slot only if nothing else acquired it while PASSIVE slept;
             // otherwise defer behind the winner rather than enqueueing without
@@ -2830,13 +2834,13 @@ impl VirtioGpu {
         // Enforce the monotonic descriptor floor BEFORE the transaction-busy
         // gate, so an old request is terminally superseded rather than sleeping
         // and retrying until the current host-reader transaction ends.
-        if scanout_bind.is_some_and(|(_, request)| {
+        if scanout_bind.is_some_and(|(_, request, _)| {
             request.is_some_and(|request| self.presentation_epoch_is_superseded(request))
         }) {
             self.release_sync_claim_for_refusal(scanout_bind);
             return Err((meta, VirtioError::PresentationSuperseded));
         }
-        if scanout_bind.is_some_and(|(resource_id, _)| resource_id != 0)
+        if scanout_bind.is_some_and(|(resource_id, _, _)| resource_id != 0)
             && self.fast_bind.selection_ambiguity.blocks_admission()
         {
             self.release_sync_claim_for_refusal(scanout_bind);
@@ -2850,7 +2854,7 @@ impl VirtioGpu {
         // presentation does.  SET(0) is the one deliberate exception; its
         // caller has already proved FIFO retirement for the named allocation
         // and it is the explicit terminal unbind for this transaction.
-        if scanout_bind.is_some_and(|(resource_id, _)| resource_id != 0)
+        if scanout_bind.is_some_and(|(resource_id, _, _)| resource_id != 0)
             && self.publication_active()
         {
             self.release_sync_claim_for_refusal(scanout_bind);
@@ -2867,13 +2871,90 @@ impl VirtioGpu {
             },
             None => None,
         };
+        let fenced_scanout = scanout_bind.is_some_and(|(_, _, fenced)| fenced);
+        let reserved_fence = if fenced_scanout {
+            let Some(wire_fence_limit) = self
+                .wire_fence_base
+                .checked_add(WIRE_FENCE_INSTANCE_STRIDE)
+            else {
+                WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+                self.release_sync_claim_for_refusal(scanout_bind);
+                return Err((meta, VirtioError::WireFenceNamespaceExhausted));
+            };
+            if self.next_wire_fence >= wire_fence_limit {
+                WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+                self.release_sync_claim_for_refusal(scanout_bind);
+                return Err((meta, VirtioError::WireFenceNamespaceExhausted));
+            }
+            if in0_len < core::mem::size_of::<VirtioGpuCtrlHdr>() {
+                self.release_sync_claim_for_refusal(scanout_bind);
+                return Err((meta, VirtioError::DeviceError));
+            }
+            // The caller staged an unfenced global SET. Patch only its header,
+            // under the same transport lock that owns the wire-fence allocator.
+            // A refused descriptor add restores the zero header before the DMA
+            // buffer is handed back for a retry.
+            // SAFETY: `in0_len` covers a complete header in the DMA buffer;
+            // the command span has no Rust alignment promise.
+            let mut header = unsafe {
+                core::ptr::read_unaligned(meta.as_slice().as_ptr().cast::<VirtioGpuCtrlHdr>())
+            };
+            if header.type_ != VIRTIO_GPU_CMD_SET_SCANOUT_BLOB
+                || header.flags != 0
+                || header.fence_id != 0
+                || header.ctx_id != 0
+                || header.ring_idx != 0
+                || header.padding != [0; 3]
+            {
+                self.release_sync_claim_for_refusal(scanout_bind);
+                return Err((meta, VirtioError::DeviceError));
+            }
+            header.flags = VIRTIO_GPU_FLAG_FENCE;
+            header.fence_id = self.next_wire_fence;
+            // SAFETY: the same complete in-buffer header proven above; an
+            // unaligned write preserves the remainder of the staged command.
+            unsafe {
+                core::ptr::write_unaligned(
+                    meta.as_mut_slice().as_mut_ptr().cast::<VirtioGpuCtrlHdr>(),
+                    header,
+                );
+            }
+            Some(self.next_wire_fence)
+        } else {
+            None
+        };
         let token = match self.enqueue_core(chain, &meta, None, resp_len) {
             Ok(token) => token,
             Err(e) => {
+                if reserved_fence.is_some() {
+                    // SAFETY: this is the header patched above and the DMA
+                    // buffer was returned intact after a refused queue add.
+                    let mut header = unsafe {
+                        core::ptr::read_unaligned(
+                            meta.as_slice().as_ptr().cast::<VirtioGpuCtrlHdr>(),
+                        )
+                    };
+                    header.flags = 0;
+                    header.fence_id = 0;
+                    // SAFETY: same in-buffer header; restoring it makes a
+                    // later retry mint from the then-current fence namespace.
+                    unsafe {
+                        core::ptr::write_unaligned(
+                            meta.as_mut_slice().as_mut_ptr().cast::<VirtioGpuCtrlHdr>(),
+                            header,
+                        );
+                    }
+                }
                 self.release_sync_claim_for_refusal(scanout_bind);
                 return Err((meta, e));
             }
         };
+        if reserved_fence.is_some() {
+            // Spend the id only after `add` accepted the descriptor, exactly as
+            // the async Venus path does. The checked instance limit above makes
+            // this increment nonwrapping.
+            self.next_wire_fence += 1;
+        }
         // ⚠ This path used to notify BEFORE pushing; it now publishes first,
         // like the other two. Unobservable -- both happen inside one hold of
         // `virtio_lock`, which `drain_used` also takes -- and deliberate.
@@ -2884,11 +2965,12 @@ impl VirtioGpu {
         let scanout_bind =
             scanout_bind
                 .zip(reserved_sequence)
-                .map(|((resource_id, request), sequence)| {
+                .map(|((resource_id, request, _), sequence)| {
                     adapter.commit_scanout_bind_seq(sequence, resource_id);
                     SyncScanoutBind {
                         seq: sequence,
                         resource_id,
+                        fence_id: reserved_fence.unwrap_or(0),
                         request,
                     }
                 });
@@ -2911,7 +2993,13 @@ impl VirtioGpu {
             }
         }
         let scanout_bind_identity =
-            scanout_bind.map(|bind| (self.scanout_transport_instance, bind.seq));
+            scanout_bind.map(|bind| {
+                (
+                    self.scanout_transport_instance,
+                    bind.seq,
+                    bind.fence_id,
+                )
+            });
         self.publish_then_notify(InFlight {
             token,
             kind: InFlightKind::Sync {
@@ -2928,9 +3016,9 @@ impl VirtioGpu {
 
     fn release_sync_claim_for_refusal(
         &mut self,
-        scanout_bind: Option<(u32, Option<ScanoutBindRequest>)>,
+        scanout_bind: Option<(u32, Option<ScanoutBindRequest>, bool)>,
     ) {
-        let request = scanout_bind.and_then(|(_, request)| request);
+        let request = scanout_bind.and_then(|(_, request, _)| request);
         if request.is_some() && self.fast_bind.sync_worker_owned == request {
             self.fast_bind.sync_worker_owned = None;
         }
@@ -3208,6 +3296,7 @@ impl VirtioGpu {
             self.fast_bind.orphaned_set = Some(SyncScanoutBind {
                 seq,
                 resource_id: req.resource_id,
+                fence_id: 0,
                 request: Some(*req),
             });
             SCANOUT_PUBLICATION_CLAIM_LOST.fetch_add(1, Ordering::Relaxed);
@@ -4645,6 +4734,46 @@ impl VirtioGpu {
     /// (token-matched), signal sync/fence waiters, and park the entry for a
     /// PASSIVE reap. The ONLY used-ring consumer (interrupt DPC + opportunistic
     /// callers under the same spinlock).
+    /// Retire one assigned wire fence from the two optional notification
+    /// tables. The in-flight entry has already been removed, so the ordinal
+    /// predicate used by WAIT_FENCE agrees with these explicit wakeups.
+    fn retire_wire_fence_notifications(&mut self, fence_id: u64) {
+        if fence_id == 0 {
+            return;
+        }
+        let mut j = 0;
+        while j < self.fence_waiters.len() {
+            if self.fence_waiters[j].fence_id == fence_id {
+                let w = self.fence_waiters.swap_remove(j);
+                // SAFETY: registered blocks stay valid until deregistration
+                // removes them under this same transport lock.
+                unsafe {
+                    let b = w.block.as_ptr();
+                    if (*b).publish_terminal(WaitDisposition::FenceCompleted) {
+                        KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                    }
+                }
+            } else {
+                j += 1;
+            }
+        }
+        let mut j = 0;
+        while j < self.fence_events.len() {
+            if self.fence_events[j].fence_id == fence_id {
+                let e = self.fence_events.swap_remove(j);
+                // SAFETY: the table owns an object reference until this exact
+                // removal. Deferred dereference is required at DISPATCH.
+                unsafe {
+                    KeSetEvent(e.event.as_ptr(), IO_NO_INCREMENT, 0);
+                    ObDereferenceObjectDeferDelete(e.event.as_ptr() as PVOID);
+                }
+                FENCE_EVENT_SIGNALS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                j += 1;
+            }
+        }
+    }
+
     pub fn drain_used(&mut self) {
         if self.failed {
             return;
@@ -4716,12 +4845,36 @@ impl VirtioGpu {
                     waiter,
                     scanout_bind,
                 } => {
-                    let response_ok = written_length as usize == size_of::<VirtioGpuCtrlHdr>()
-                        && resp_type == Some(VIRTIO_GPU_RESP_OK_NODATA);
+                    let response_header = if written_length as usize
+                        == size_of::<VirtioGpuCtrlHdr>()
+                    {
+                        // SAFETY: the exact written length covers one complete
+                        // header in the entry-owned response span; alignment is
+                        // not promised by the virtqueue layout.
+                        Some(unsafe {
+                            core::ptr::read_unaligned(resp_base.cast::<VirtioGpuCtrlHdr>())
+                        })
+                    } else {
+                        None
+                    };
+                    let exact_fence = scanout_bind.is_none_or(|bind| {
+                        bind.fence_id == 0
+                            || response_header.is_some_and(|header| {
+                                header.flags == VIRTIO_GPU_FLAG_FENCE
+                                    && header.fence_id == bind.fence_id
+                                    && header.ctx_id == 0
+                                    && header.ring_idx == 0
+                                    && header.padding == [0; 3]
+                            })
+                    });
+                    let response_ok = response_header
+                        .is_some_and(|header| header.type_ == VIRTIO_GPU_RESP_OK_NODATA)
+                        && exact_fence;
                     let response_rejected = written_length as usize
                         == size_of::<VirtioGpuCtrlHdr>()
                         && resp_type
-                            .is_some_and(|raw| HostRejection::from_response_type(raw).is_ok());
+                            .is_some_and(|raw| HostRejection::from_response_type(raw).is_ok())
+                        && exact_fence;
                     let waiter_abandoned = waiter.is_none();
                     if let Some(bind) = terminal_sync_scanout_bind(response_ok, scanout_bind) {
                         // This runs even after `abandon_sync` detached the
@@ -4774,6 +4927,9 @@ impl VirtioGpu {
                     } else if let Some(bind) = scanout_bind {
                         SCANOUT_BIND_AMBIGUOUS_RESPONSES.fetch_add(1, Ordering::Relaxed);
                         self.note_ambiguous_scanout_bind(bind.seq);
+                    }
+                    if let Some(bind) = scanout_bind {
+                        self.retire_wire_fence_notifications(bind.fence_id);
                     }
                     if let Some(block) = waiter {
                         // THE WRITE SITE THE 22.22.218.0 `0xA` RACED, and the
@@ -5082,47 +5238,7 @@ impl VirtioGpu {
                             }
                         }
                     }
-                    // Wake every waiter registered on this wire fence.
-                    let mut j = 0;
-                    while j < self.fence_waiters.len() {
-                        if self.fence_waiters[j].fence_id == fence_id {
-                            let w = self.fence_waiters.swap_remove(j);
-                            // SAFETY: registered blocks stay valid until
-                            // deregistration (`fence_wait_cancel`), which removes
-                            // them from this list under the same lock.
-                            unsafe {
-                                let b = w.block.as_ptr();
-                                if (*b).publish_terminal(WaitDisposition::FenceCompleted) {
-                                    KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
-                                }
-                            }
-                        } else {
-                            j += 1;
-                        }
-                    }
-                    // Signal + consume every usermode fence-event registration
-                    // on this wire fence (one-shot). Runs at DISPATCH under the
-                    // device spinlock: KeSetEvent (Wait=FALSE) is legal, and the
-                    // deref MUST be ObDereferenceObjectDeferDelete — dropping
-                    // the LAST reference with a plain deref at DISPATCH would
-                    // run the object's PASSIVE-only deletion (the registering
-                    // process may have exited and closed its handle).
-                    let mut j = 0;
-                    while j < self.fence_events.len() {
-                        if self.fence_events[j].fence_id == fence_id {
-                            let e = self.fence_events.swap_remove(j);
-                            // SAFETY: the entry holds an object reference taken
-                            // by the escape handler, so `event` is a live KEVENT
-                            // regardless of the registering process's fate.
-                            unsafe {
-                                KeSetEvent(e.event.as_ptr(), IO_NO_INCREMENT, 0);
-                                ObDereferenceObjectDeferDelete(e.event.as_ptr() as PVOID);
-                            }
-                            FENCE_EVENT_SIGNALS.fetch_add(1, Ordering::Relaxed);
-                        } else {
-                            j += 1;
-                        }
-                    }
+                    self.retire_wire_fence_notifications(fence_id);
                 }
             }
             // The fast bind's buffer is RETAINED, not parked: it is one of the
@@ -5354,6 +5470,10 @@ impl VirtioGpu {
         }
         let in_flight = self.inflight.iter().any(|e| match e.kind {
             InFlightKind::AsyncVenus { fence_id: f, .. } => f == fence_id,
+            InFlightKind::Sync {
+                scanout_bind: Some(bind),
+                ..
+            } => bind.fence_id == fence_id,
             _ => false,
         });
         if !in_flight {
@@ -5410,6 +5530,10 @@ impl VirtioGpu {
         }
         let in_flight = self.inflight.iter().any(|e| match e.kind {
             InFlightKind::AsyncVenus { fence_id: f, .. } => f == fence_id,
+            InFlightKind::Sync {
+                scanout_bind: Some(bind),
+                ..
+            } => bind.fence_id == fence_id,
             _ => false,
         });
         if !in_flight {

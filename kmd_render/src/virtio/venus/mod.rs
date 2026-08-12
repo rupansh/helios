@@ -59,6 +59,7 @@ pub(crate) use bringup::*;
 use commands::*;
 pub(crate) use present::*;
 pub(crate) use protocol::*;
+pub(crate) use scanout::zero_host_visible_blob;
 use ring::*;
 
 /// Declare one handle newtype per Vulkan object class.

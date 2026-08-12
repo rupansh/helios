@@ -1223,12 +1223,27 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_visibility(
     if !visibility.is_null() {
         crate::diag::record(0x1314_0000 | unsafe { (*visibility).VidPnSourceId & 0xFFFF });
     }
-    // No scanout: visibility is a no-op we simply accept.
-    if unsafe { display_half_on(_adapter) } {
-        STATUS_SUCCESS
-    } else {
-        STATUS_NOT_SUPPORTED
+    let p = _adapter as *const AdapterContext;
+    if p.is_null() || !unsafe { (*p).display_half() } {
+        return STATUS_NOT_SUPPORTED;
     }
+    if crate::virtio::KMD_D2_OWNER_ENABLED {
+        if visibility.is_null() {
+            return STATUS_INVALID_PARAMETER;
+        }
+        // SAFETY: this DDI is PASSIVE_LEVEL and dxgkrnl owns the argument for
+        // the call. D2 consumes the exact source and visibility bit only.
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        let visibility = unsafe { &*visibility };
+        return crate::ddi::direct_scanout::transition_visibility(
+            passive,
+            unsafe { &*p },
+            visibility.VidPnSourceId,
+            visibility.Visible != 0,
+        );
+    }
+    // Legacy production behavior remains the accepted no-op.
+    STATUS_SUCCESS
 }
 
 pub unsafe extern "C" fn dxgkddi_commit_vidpn(
@@ -1256,6 +1271,27 @@ pub unsafe extern "C" fn dxgkddi_commit_vidpn(
     // `return SUCCESS` that never checks the pin is exactly viogpu3d's "commit but
     // light nothing" failure). Scanout itself is issued from SetVidPnSourceAddress.
     let adapter = unsafe { &*p };
+    if crate::virtio::KMD_D2_OWNER_ENABLED {
+        // SAFETY: CommitVidPn is PASSIVE and `commit` remains live for this call.
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        let facts = match unsafe {
+            crate::ddi::vidpn::inspect_committed_vidpn(
+                adapter,
+                passive,
+                commit as *const DXGKARG_COMMITVIDPN,
+            )
+        } {
+            Ok(facts) => facts,
+            Err(error) => return error.status,
+        };
+        let status = crate::ddi::vidpn::legalize_vidpn(unsafe {
+            crate::ddi::vidpn::commit_vidpn(adapter, commit as *const DXGKARG_COMMITVIDPN)
+        });
+        if status != STATUS_SUCCESS {
+            return status;
+        }
+        return crate::ddi::direct_scanout::commit_mode(passive, adapter, facts);
+    }
     crate::ddi::vidpn::legalize_vidpn(unsafe {
         crate::ddi::vidpn::commit_vidpn(adapter, commit as *const DXGKARG_COMMITVIDPN)
     })

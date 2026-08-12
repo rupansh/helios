@@ -1769,10 +1769,6 @@ unsafe fn inspect_committed_vidpn_inner(
 /// PASSIVE-only full inspection of the DDI-owned committed VidPn.
 /// All acquired references are released successfully before by-value facts escape.
 /// `arg` must be the live `CommitVidPn` argument for this call.
-#[allow(
-    dead_code,
-    reason = "D2 inspection remains unwired until commit publication integration"
-)]
 pub(crate) unsafe fn inspect_committed_vidpn(
     adapter: &AdapterContext,
     _passive: PassiveLevel,

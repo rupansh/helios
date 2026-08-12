@@ -113,10 +113,20 @@ fn retire_skipped_stop_transport(
     if adapter.hpd_worker_may_be_running() {
         return Err(crate::virtio::VirtioError::DeviceError);
     }
+    crate::ddi::direct_scanout::prepare_reset(
+        passive,
+        adapter,
+        helios_kmd_logic::direct_scanout_lifetime::DrainReason::AdapterStop,
+    );
     adapter.reset_display_publication_state();
     adapter.set_venus_client(None);
     adapter.close_control_owner_transport()?;
     adapter.retire_control_owner_transport(passive)?;
+    crate::ddi::direct_scanout::complete_verified_reset(passive, adapter);
+    // The skipped Stop left the prior ETW adapter epoch open. Keep it admitted
+    // through the verified-reset plane edge above, then close it before the
+    // successor StartDevice calls `adapter_start` for a new epoch.
+    crate::ddi::diag_etw::adapter_stop(adapter);
     let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
     // SAFETY: StartDevice owns the serialized generation transition. Leaving
     // the old BAR/context tuple published after its transport was retired would
@@ -432,6 +442,46 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         crate::adapter::ScanoutMode::render_only()
     };
 
+    // D2's permanent black parking object belongs to the exact transport and
+    // final host mode, so construct it before publishing any successful start.
+    // The compile-time false owner boundary leaves production byte-for-byte on
+    // the legacy path. A failed dormant construction physically resets its
+    // producing transport and exposes no partial started package.
+    if crate::virtio::KMD_D2_OWNER_ENABLED && knobs.display_half {
+        let (width, height) = scanout_mode.extent();
+        if let Err(start_error) =
+            crate::ddi::direct_scanout::start(passive, adapter, width, height)
+        {
+            crate::ddi::direct_scanout::prepare_reset(
+                passive,
+                adapter,
+                helios_kmd_logic::direct_scanout_lifetime::DrainReason::AdapterStop,
+            );
+            adapter
+                .isr_status
+                .store(0, core::sync::atomic::Ordering::Release);
+            adapter.set_venus_client(None);
+            let cleanup = adapter
+                .close_control_owner_transport()
+                .and_then(|()| adapter.retire_control_owner_transport(passive));
+            let status = match cleanup {
+                Ok(()) => {
+                    crate::ddi::direct_scanout::complete_verified_reset(passive, adapter);
+                    let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
+                    unsafe { adapter.set_transport_generation(None) };
+                    start_error.into()
+                }
+                Err(error) => error.into(),
+            };
+            crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
+            unsafe {
+                *number_of_video_present_sources = 0;
+                *number_of_children = 0;
+            }
+            return status;
+        }
+    }
+
     // ── The reported segment table, built ONCE from the same locals every other
     // consumer will read. `query_segments` renders this; it no longer re-derives
     // a table of its own from live adapter state, which is what let the reported
@@ -511,9 +561,33 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // tearing down.
         // SAFETY: our adapter context, handed back from AddDevice.
         let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
-        // Hold teardown behind every admitted event builder and write that may
-        // still read this adapter generation.
-        crate::ddi::diag_etw::adapter_stop(adapter);
+        let d2_had_transport = crate::virtio::KMD_D2_OWNER_ENABLED
+            && adapter.with_virtio(|_| ()).is_ok();
+        if d2_had_transport {
+            // Close every asynchronous display producer before the D2 plane
+            // enters its causal drain. ETW remains admitted until those plane
+            // candidate/latch/release edges have been emitted.
+            adapter
+                .isr_status
+                .store(0, core::sync::atomic::Ordering::Release);
+            adapter.stop_vsync();
+            adapter.stop_hpd();
+            if adapter.hpd_worker_may_be_running() {
+                return STATUS_DEVICE_NOT_READY;
+            }
+            let passive = unsafe { crate::irql::PassiveLevel::assume() };
+            crate::ddi::direct_scanout::prepare_reset(
+                passive,
+                adapter,
+                helios_kmd_logic::direct_scanout_lifetime::DrainReason::AdapterStop,
+            );
+        }
+        // Legacy retains its original rundown edge. D2 defers this until after
+        // the verified reset barrier so event 10 and every preceding plane edge
+        // are emitted while the adapter generation is still admitted.
+        if !d2_had_transport {
+            crate::ddi::diag_etw::adapter_stop(adapter);
+        }
         crate::ddi::native_fence::invalidate_all();
         crate::adapter::allocation_object::invalidate_all();
         // Stop the ISR from touching the (about-to-be-reset) device first.
@@ -569,7 +643,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // Drop the client first to unmap its ring/reply BAR kernel mappings.
         let venus_ctx = adapter.venus_ctx_id();
         adapter.set_venus_client(None); // Drop → MmUnmapIoSpace ring + reply mappings.
-        if venus_ctx != 0 {
+        if venus_ctx != 0 && !crate::virtio::KMD_D2_OWNER_ENABLED {
             // Best-effort: unref every KMD-internal blob (owner 0) and destroy the
             // venus context (PASSIVE flows through virtio::ctrl).
             // The KMD-owned sweep — `None` here means exactly the KMD's own blobs, not
@@ -589,6 +663,10 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
             let status: NTSTATUS = error.into();
             crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
             return status;
+        }
+        if d2_had_transport {
+            crate::ddi::direct_scanout::complete_verified_reset(passive_stop, adapter);
+            crate::ddi::diag_etw::adapter_stop(adapter);
         }
 
         // Tear down the virtio transport: VirtioGpu::drop resets the device and
@@ -624,7 +702,9 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
     if !miniport_device_context.is_null() {
         // SAFETY: our adapter context; only read here.
         let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
-        crate::ddi::diag_etw::adapter_stop(adapter);
+        if !crate::virtio::KMD_D2_OWNER_ENABLED {
+            crate::ddi::diag_etw::adapter_stop(adapter);
+        }
         // Remove may legally skip StopDevice. Repeating these after an orderly
         // Stop is harmless; omitting them here would let that skipped-Stop path
         // carry stale allocation/native-fence authority into freed storage.
@@ -643,20 +723,32 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
             adapter.reset_display_publication_state();
             if !adapter.hpd_worker_may_be_running() {
                 let passive_remove = unsafe { crate::irql::PassiveLevel::assume() };
-                adapter.set_venus_client(None);
-                if let Err(error) = adapter
-                    .close_control_owner_transport()
-                    .and_then(|()| adapter.retire_control_owner_transport(passive_remove))
-                {
-                    let status: NTSTATUS = error.into();
-                    crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
-                    // Preserve the complete adapter allocation: freeing it would
-                    // drop an unverified transport and its canonical custody.
-                    return status;
+                let had_transport = adapter.with_virtio(|_| ()).is_ok();
+                if had_transport {
+                    crate::ddi::direct_scanout::prepare_reset(
+                        passive_remove,
+                        adapter,
+                        helios_kmd_logic::direct_scanout_lifetime::DrainReason::AdapterStop,
+                    );
+                    adapter.set_venus_client(None);
+                    if let Err(error) = adapter
+                        .close_control_owner_transport()
+                        .and_then(|()| adapter.retire_control_owner_transport(passive_remove))
+                    {
+                        let status: NTSTATUS = error.into();
+                        crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
+                        // Preserve the complete adapter allocation: freeing it would
+                        // drop an unverified transport and its canonical custody.
+                        return status;
+                    }
+                    crate::ddi::direct_scanout::complete_verified_reset(passive_remove, adapter);
+                    let _ =
+                        adapter.remove_virtio_and_reset_scanout_bind_generation(passive_remove);
+                    unsafe { adapter.set_transport_generation(None) };
                 }
-                let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive_remove);
-                unsafe { adapter.set_transport_generation(None) };
+                crate::ddi::direct_scanout::complete_removal(passive_remove, adapter);
             }
+            crate::ddi::diag_etw::adapter_stop(adapter);
         }
         if adapter.hpd_worker_may_be_running() {
             // stop_hpd could not prove the worker exited, and the worker
@@ -728,6 +820,30 @@ pub unsafe extern "C" fn dxgkddi_set_power_state(
     }
     // SAFETY: our adapter context, handed back from AddDevice.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
+
+    if crate::virtio::KMD_D2_OWNER_ENABLED {
+        const DISPLAY_ADAPTER_HW_ID: u32 = u32::MAX;
+        let subject = if device_uid == DISPLAY_ADAPTER_HW_ID {
+            helios_kmd_logic::committed_mode::PowerSubject::Adapter
+        } else if device_uid == crate::ddi::vidpn::CHILD_UID {
+            helios_kmd_logic::committed_mode::PowerSubject::Target {
+                target_id: device_uid,
+            }
+        } else {
+            return STATUS_INVALID_PARAMETER;
+        };
+        // SAFETY: DxgkDdiSetPowerState is a PASSIVE_LEVEL callback.
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        let status = crate::ddi::direct_scanout::transition_power(
+            passive,
+            adapter,
+            subject,
+            device_power_state == _DEVICE_POWER_STATE::PowerDeviceD0,
+        );
+        if status != STATUS_SUCCESS {
+            return status;
+        }
+    }
 
     // Before this, a D3 transition was accepted with no action at all, so the
     // ~16 ms KTIMER kept synthesising CRTC_VSYNC through DxgkCbNotifyInterrupt
