@@ -24,6 +24,7 @@ mod gpummu;
 pub(crate) mod hpd;
 pub(crate) mod interrupt;
 mod lifecycle;
+pub(crate) mod mpo3;
 pub(crate) mod native_fence;
 pub(crate) mod native_render;
 pub(crate) mod present_packet;
@@ -77,6 +78,13 @@ pub use interrupt::{dxgkddi_control_interrupt, dxgkddi_dpc_routine, dxgkddi_inte
 pub use lifecycle::{
     dxgkddi_dispatch_io_request, dxgkddi_remove_device, dxgkddi_set_power_state,
     dxgkddi_start_device, dxgkddi_stop_device,
+};
+pub use mpo3::{
+    dxgkddi_check_multi_plane_overlay_support3, dxgkddi_control_mode_behavior,
+    dxgkddi_get_multi_plane_overlay_caps, dxgkddi_get_post_composition_caps,
+    dxgkddi_post_multi_plane_overlay_present,
+    dxgkddi_set_vidpn_source_address_with_multi_plane_overlay3,
+    dxgkddi_validate_update_allocation_property,
 };
 pub use native_fence::{
     diag_dump_native_fence_atomics, dxgkddi_close_native_fence, dxgkddi_create_native_fence,

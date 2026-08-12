@@ -255,6 +255,20 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiUpdateMonitorLinkInfo = Some(ddi::dxgkddi_update_monitor_link_info);
     data.DxgkDdiExchangePreStartInfo = Some(ddi::dxgkddi_exchange_pre_start_info);
 
+    // ── Dormant HPS2 D3 one-primary MPO3 table. The capability and D2 owner
+    // boundary remain false until the later atomic display-package activation.
+    data.DxgkDdiCheckMultiPlaneOverlaySupport3 =
+        Some(ddi::dxgkddi_check_multi_plane_overlay_support3);
+    data.DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3 =
+        Some(ddi::dxgkddi_set_vidpn_source_address_with_multi_plane_overlay3);
+    data.DxgkDdiGetMultiPlaneOverlayCaps = Some(ddi::dxgkddi_get_multi_plane_overlay_caps);
+    data.DxgkDdiGetPostCompositionCaps = Some(ddi::dxgkddi_get_post_composition_caps);
+    data.DxgkDdiPostMultiPlaneOverlayPresent =
+        Some(ddi::dxgkddi_post_multi_plane_overlay_present);
+    data.DxgkDdiValidateUpdateAllocationProperty =
+        Some(ddi::dxgkddi_validate_update_allocation_property);
+    data.DxgkDdiControlModeBehavior = Some(ddi::dxgkddi_control_mode_behavior);
+
     // ── Render-path & GPU-VA DDIs. They are registered so the table shape is
     // explicit, but return unsupported until the corresponding capability is
     // implemented and advertised.

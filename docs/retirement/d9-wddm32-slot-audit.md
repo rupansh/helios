@@ -8,9 +8,9 @@ Audited header: `kmd_render/tools/wdk-28000/km/dispmprt.h`
 
 Slots: **192** (plus `Version`), struct size **1544** bytes.
 
-* `Implemented` — 82
+* `Implemented` — 89
 * `Disabled` — 91 (unreachable behind a truthful zero capability)
-* `Pending` — 11 (a named retirement lane will register it; NULL until then)
+* `Pending` — 4 (a named retirement lane will register it; NULL until then)
 * `Retiring` — 8 (registered today; a named retirement lane will unregister it)
 
 The machine-checked half of this table lives in
@@ -123,11 +123,11 @@ refuses to load if any slot disagrees with its class here.
 | 100 | 808 | `DxgkDdiPowerRuntimeSetDeviceHandle` | WDDM2_0 | Implemented | Runtime power device handle. |
 | 101 | 816 | `DxgkDdiSetStablePowerState` | WDDM2_0 | Implemented | Stable power state for profiling tools. |
 | 102 | 824 | `DxgkDdiSetVideoProtectedRegion` | WDDM2_0 | Disabled | No protected-content surface is advertised (no OPM/PVP capability). |
-| 103 | 832 | `DxgkDdiCheckMultiPlaneOverlaySupport3` | WDDM2_1 | Pending | KMD display lane unit D3 (section 17.6:4465). NULL until the one-primary MPO3 validator lands. |
-| 104 | 840 | `DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3` | WDDM2_1 | Pending | KMD display lane unit D3 (section 17.6:4466). NULL until the one-primary MPO3 binder lands. |
-| 105 | 848 | `DxgkDdiPostMultiPlaneOverlayPresent` | WDDM2_1 | Pending | KMD display lane unit D3 (section 17.6:4497), an always-success bounded diagnostic callback with a named hit counter. |
-| 106 | 856 | `DxgkDdiValidateUpdateAllocationProperty` | WDDM2_1 | Pending | KMD display lane unit D3 (section 17.6:4475). |
-| 107 | 864 | `DxgkDdiControlModeBehavior` | WDDM2_1 | Pending | KMD display lane unit D3 (section 17.6:4478). |
+| 103 | 832 | `DxgkDdiCheckMultiPlaneOverlaySupport3` | WDDM2_1 | Implemented | Dormant D3 exact-allocation one-primary validator; SupportMultiPlaneOverlay and KMD_D2_OWNER_ENABLED remain false. |
+| 104 | 840 | `DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3` | WDDM2_1 | Implemented | Dormant D3 PASSIVE-retry binder over the D2 candidate/parking state; both activation gates remain false. |
+| 105 | 848 | `DxgkDdiPostMultiPlaneOverlayPresent` | WDDM2_1 | Implemented | Bounded always-success D3 diagnostic callback; no output path requests PostPresentNeeded. |
+| 106 | 856 | `DxgkDdiValidateUpdateAllocationProperty` | WDDM2_1 | Implemented | Dormant D3 exact-allocation validation; all property mutations are rejected. |
+| 107 | 864 | `DxgkDdiControlModeBehavior` | WDDM2_1 | Implemented | D3 reports every requested unsupported mode behavior in NotSatisfied. |
 | 108 | 872 | `DxgkDdiUpdateMonitorLinkInfo` | WDDM2_1 | Implemented | Mandatory once a monitor target is advertised; revalidated under the 3.2 table. |
 | 109 | 880 | `DxgkDdiCreateHwContext` | WDDM2_2 | Retiring | Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family. |
 | 110 | 888 | `DxgkDdiDestroyHwContext` | WDDM2_2 | Retiring | Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family. |
@@ -146,8 +146,8 @@ refuses to load if any slot disagrees with its class here.
 | 123 | 992 | `DxgkDdiDisplayDetectControl` | WDDM2_2 | Disabled | The single child is indicated statically from the virtio-gpu config-change event; there is no detection engine to gate. |
 | 124 | 1000 | `DxgkDdiQueryConnectionChange` | WDDM2_2 | Disabled | No DisplayPort topology/connection-change surface is exposed. |
 | 125 | 1008 | `DxgkDdiExchangePreStartInfo` | WDDM2_2 | Implemented | Pre-start info exchange. |
-| 126 | 1016 | `DxgkDdiGetMultiPlaneOverlayCaps` | WDDM2_2 | Pending | KMD display lane unit D3 (section 17.6:4473). NULL until the one-plane cap values land. |
-| 127 | 1024 | `DxgkDdiGetPostCompositionCaps` | WDDM2_2 | Pending | KMD display lane unit D3 (section 17.6:4474). NULL until the no-post-transform cap values land. |
+| 126 | 1016 | `DxgkDdiGetMultiPlaneOverlayCaps` | WDDM2_2 | Implemented | Dormant D3 exact one-RGB-plane caps, refused while KMD_D2_OWNER_ENABLED is false. |
+| 127 | 1024 | `DxgkDdiGetPostCompositionCaps` | WDDM2_2 | Implemented | Dormant D3 unity-only post-composition caps, refused while KMD_D2_OWNER_ENABLED is false. |
 | 128 | 1032 | `DxgkDdiUpdateHwContextState` | WDDM2_3 | Disabled | HWS-only; the hardware-scheduling family is unreachable. |
 | 129 | 1040 | `DxgkDdiCreateProtectedSession` | WDDM2_3 | Disabled | No protected-content session surface is advertised. |
 | 130 | 1048 | `DxgkDdiDestroyProtectedSession` | WDDM2_3 | Disabled | No protected-content session surface is advertised. |

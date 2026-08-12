@@ -367,6 +367,23 @@ pub(crate) fn retain_candidate(
     STATUS_SUCCESS
 }
 
+/// Replace the current reader with parking for an OS-requested zero-plane
+/// binding, then reopen the plane for a later exact replacement.
+pub(crate) fn explicit_unbind(passive: PassiveLevel, adapter: &AdapterContext) -> NTSTATUS {
+    if !crate::virtio::KMD_D2_OWNER_ENABLED {
+        return STATUS_DEVICE_NOT_READY;
+    }
+    adapter.with_scanout_lifecycle(passive, |_guard| {
+        if !unbind_locked(passive, adapter, DrainReason::ExplicitUnbind, true)
+            || !resume_plane(adapter)
+        {
+            STATUS_DEVICE_NOT_READY
+        } else {
+            STATUS_SUCCESS
+        }
+    })
+}
+
 struct PublishCapture {
     candidate: UnsafeCell<Option<Binding<DisplayBacking>>>,
     transitions: UnsafeCell<[Option<Transition<DisplayBacking>>; 2]>,

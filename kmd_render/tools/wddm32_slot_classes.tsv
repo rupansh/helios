@@ -122,11 +122,11 @@ Reserved2	Disabled	Reserved by the WDK; must stay NULL.
 DxgkDdiPowerRuntimeSetDeviceHandle	Implemented	Runtime power device handle.
 DxgkDdiSetStablePowerState	Implemented	Stable power state for profiling tools.
 DxgkDdiSetVideoProtectedRegion	Disabled	No protected-content surface is advertised (no OPM/PVP capability).
-DxgkDdiCheckMultiPlaneOverlaySupport3	Pending	KMD display lane unit D3 (section 17.6:4465). NULL until the one-primary MPO3 validator lands.
-DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3	Pending	KMD display lane unit D3 (section 17.6:4466). NULL until the one-primary MPO3 binder lands.
-DxgkDdiPostMultiPlaneOverlayPresent	Pending	KMD display lane unit D3 (section 17.6:4497), an always-success bounded diagnostic callback with a named hit counter.
-DxgkDdiValidateUpdateAllocationProperty	Pending	KMD display lane unit D3 (section 17.6:4475).
-DxgkDdiControlModeBehavior	Pending	KMD display lane unit D3 (section 17.6:4478).
+DxgkDdiCheckMultiPlaneOverlaySupport3	Implemented	Dormant D3 exact-allocation one-primary validator; SupportMultiPlaneOverlay and KMD_D2_OWNER_ENABLED remain false.
+DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3	Implemented	Dormant D3 PASSIVE-retry binder over the D2 candidate/parking state; both activation gates remain false.
+DxgkDdiPostMultiPlaneOverlayPresent	Implemented	Bounded always-success D3 diagnostic callback; no output path requests PostPresentNeeded.
+DxgkDdiValidateUpdateAllocationProperty	Implemented	Dormant D3 exact-allocation validation; all property mutations are rejected.
+DxgkDdiControlModeBehavior	Implemented	D3 reports every requested unsupported mode behavior in NotSatisfied.
 DxgkDdiUpdateMonitorLinkInfo	Implemented	Mandatory once a monitor target is advertised; revalidated under the 3.2 table.
 DxgkDdiCreateHwContext	Retiring	Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.
 DxgkDdiDestroyHwContext	Retiring	Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.
@@ -145,8 +145,8 @@ DxgkDdiSetTargetAdjustedColorimetry	Disabled	No per-target colorimetry adjustmen
 DxgkDdiDisplayDetectControl	Disabled	The single child is indicated statically from the virtio-gpu config-change event; there is no detection engine to gate.
 DxgkDdiQueryConnectionChange	Disabled	No DisplayPort topology/connection-change surface is exposed.
 DxgkDdiExchangePreStartInfo	Implemented	Pre-start info exchange.
-DxgkDdiGetMultiPlaneOverlayCaps	Pending	KMD display lane unit D3 (section 17.6:4473). NULL until the one-plane cap values land.
-DxgkDdiGetPostCompositionCaps	Pending	KMD display lane unit D3 (section 17.6:4474). NULL until the no-post-transform cap values land.
+DxgkDdiGetMultiPlaneOverlayCaps	Implemented	Dormant D3 exact one-RGB-plane caps, refused while KMD_D2_OWNER_ENABLED is false.
+DxgkDdiGetPostCompositionCaps	Implemented	Dormant D3 unity-only post-composition caps, refused while KMD_D2_OWNER_ENABLED is false.
 DxgkDdiUpdateHwContextState	Disabled	HWS-only; the hardware-scheduling family is unreachable.
 DxgkDdiCreateProtectedSession	Disabled	No protected-content session surface is advertised.
 DxgkDdiDestroyProtectedSession	Disabled	No protected-content session surface is advertised.

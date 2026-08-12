@@ -959,8 +959,13 @@ def line_at(src, offset):
     return src.count('\n', 0, offset) + 1
 
 def function_ranges(live):
+    # rust_kinds deliberately blanks the ABI string together with every other
+    # literal, so `extern "C" fn` reaches this parser as `extern     fn`.
+    # Match the code-bearing `extern` token and its whitespace, not the masked
+    # spelling of the ABI literal.
     pattern = re.compile(
-        r'(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?fn\s+(\w+)'
+        r'(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?'
+        r'(?:extern\s+)?fn\s+(\w+)'
         r'(?:\s*<[^>{}]*>)?\s*\('
     )
     ranges = []
@@ -990,6 +995,14 @@ def has_boundary_branch(body):
     return re.search(
         r'\bif\s*!?\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*' + BOUNDARY + r'\b',
         body,
+    ) is not None
+
+def has_fail_closed_boundary(body, before=None):
+    prefix = body if before is None else body[:before]
+    return re.search(
+        r'\bif\s*!\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*' + BOUNDARY
+        + r'\b\s*\{[^{}]*\breturn\b[^{}]*;\s*\}',
+        prefix,
     ) is not None
 
 def check_sources(sources):
@@ -1086,6 +1099,65 @@ def check_sources(sources):
         for match in re.finditer(r'\bTransportOwner\s*::', live):
             errors.append('%s:%d: TransportOwner construction/use bypasses AdapterContext' % (
                 path, line_at(sources[path], match.start())))
+
+    # D3 registers its final MPO3 slots while dormant.  Every callback that can
+    # advertise or reach D2 plane authority must therefore carry the boundary
+    # locally; relying on the current WDDM version or a distant caller is not an
+    # activation boundary.
+    mpo_path = 'kmd_render/src/ddi/mpo3.rs'
+    mpo_live = live_sources.get(mpo_path, '')
+    mpo_ranges = function_ranges(mpo_live)
+    guarded_callbacks = {
+        'dxgkddi_check_multi_plane_overlay_support3',
+        'dxgkddi_set_vidpn_source_address_with_multi_plane_overlay3',
+        'dxgkddi_get_multi_plane_overlay_caps',
+        'dxgkddi_get_post_composition_caps',
+        'dxgkddi_validate_update_allocation_property',
+    }
+    for callback in guarded_callbacks:
+        owner = next((item for item in mpo_ranges if item[0] == callback), None)
+        if owner is None:
+            errors.append('%s: missing required dormant D3 callback %s' % (mpo_path, callback))
+        elif not has_fail_closed_boundary(mpo_live[owner[2]:owner[3]]):
+            errors.append('%s:%d: %s lacks a fail-closed local D2 boundary' % (
+                mpo_path, line_at(sources[mpo_path], owner[1]), callback))
+
+    plane_entries = (
+        'validate_direct_scanout_binding',
+        'retain_candidate',
+        'explicit_unbind',
+    )
+    entry_pattern = re.compile(r'\b(' + '|'.join(plane_entries) + r')\s*\(')
+    for path, live in live_sources.items():
+        ranges = function_ranges(live)
+        for match in entry_pattern.finditer(live):
+            prefix = live[max(0, match.start() - 48):match.start()]
+            if re.search(r'\bfn\s+$', prefix):
+                continue
+            owner = enclosing_function(ranges, match.start())
+            body = live[owner[2]:owner[3]] if owner is not None else ''
+            before = match.start() - owner[2] if owner is not None else None
+            if owner is None or not has_fail_closed_boundary(body, before):
+                errors.append('%s:%d: %s reaches D2 plane authority without a dominating fail-closed boundary' % (
+                    path, line_at(sources[path], match.start()),
+                    owner[0] if owner is not None else '<outside function>'))
+
+    caps_path = 'kmd_render/src/ddi/query_adapter_info.rs'
+    caps_live = live_sources.get(caps_path, '')
+    for match in re.finditer(r'\bSupportMultiPlaneOverlay\b', caps_live):
+        errors.append('%s:%d: dormant D3 must not advertise SupportMultiPlaneOverlay' % (
+            caps_path, line_at(sources[caps_path], match.start())))
+
+    surface_path = 'kmd_render/src/ddi/wddm_surface.rs'
+    surface_live = live_sources.get(surface_path, '')
+    surface_defs = re.findall(
+        r'\bpub\s*\(\s*crate\s*\)\s+const\s+SURFACE\s*:\s*WddmSurface\s*=\s*'
+        r'WddmSurface::(\w+)\s*;',
+        surface_live,
+    )
+    if surface_defs != ['Wddm2_1GpuMmu']:
+        errors.append('%s: dormant D3 requires exactly one Wddm2_1GpuMmu SURFACE, found %r' % (
+            surface_path, surface_defs))
     return errors
 
 sources = {}
@@ -1119,11 +1191,48 @@ fn deliberately_unguarded(adapter: &crate::adapter::AdapterContext) -> bool {
 if not check_sources(unguarded):
     sys.exit('D2 boundary mutation self-test failed: an unguarded owner entry was accepted')
 
-print('OK: one compile-time-false D2 boundary; canonical authority is guarded; mutations rejected')
+unguarded_plane = dict(sources)
+unguarded_plane['kmd_render/src/ddi/__d3_gate_mutation.rs'] = '''
+fn deliberately_unguarded_plane(adapter: &crate::adapter::AdapterContext, candidate: Candidate) {
+    retain_candidate(adapter, candidate);
+}
+'''
+if not check_sources(unguarded_plane):
+    sys.exit('D3 boundary mutation self-test failed: an unguarded plane entry was accepted')
+
+decoy_guard = dict(sources)
+decoy_guard['kmd_render/src/ddi/__d3_gate_decoy_mutation.rs'] = '''
+fn deliberately_non_dominating_plane(adapter: &crate::adapter::AdapterContext, candidate: Candidate) {
+    if !crate::virtio::KMD_D2_OWNER_ENABLED { let _ = false; }
+    retain_candidate(adapter, candidate);
+}
+'''
+if not check_sources(decoy_guard):
+    sys.exit('D3 boundary mutation self-test failed: a non-dominating decoy guard was accepted')
+
+advertised = dict(sources)
+advertised['kmd_render/src/ddi/query_adapter_info.rs'] += '''
+fn deliberately_advertised_mpo_cap() { let _ = SupportMultiPlaneOverlay; }
+'''
+if not check_sources(advertised):
+    sys.exit('D3 boundary mutation self-test failed: an advertised MPO cap was accepted')
+
+raised_surface = dict(sources)
+surface_path = 'kmd_render/src/ddi/wddm_surface.rs'
+raised_surface[surface_path], changed = re.subn(
+    r'(const\s+SURFACE\s*:\s*WddmSurface\s*=\s*WddmSurface::)Wddm2_1GpuMmu(\s*;)',
+    r'\1Wddm3_2GpuMmu\2',
+    raised_surface[surface_path],
+    count=1,
+)
+if changed != 1 or not check_sources(raised_surface):
+    sys.exit('D3 boundary mutation self-test failed: a raised WDDM surface was accepted')
+
+print('OK: dormant D2/D3 authority, MPO capability, and surface are atomic; mutations rejected')
 PY
 )
 
-run_gate "disabled KMD D2 control-owner authority has one atomic activation boundary" \
+run_gate "disabled KMD D2/D3 authority has one atomic activation boundary" \
     python3 -c "$K4_RUST_MASK_PY
 $DORMANT_OWNER_GATE_PY" "$REPO"
 
