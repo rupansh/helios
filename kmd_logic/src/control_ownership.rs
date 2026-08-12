@@ -511,6 +511,11 @@ impl ResourceReservation {
     pub const fn resource(&self) -> TransportResource {
         self.resource
     }
+
+    #[cfg(test)]
+    pub(crate) const fn test_for_resource(resource: TransportResource) -> Self {
+        Self { resource }
+    }
 }
 
 #[cfg(test)]
@@ -1052,6 +1057,25 @@ impl PreparedControl {
             key: self.key,
             outcome: ControlOutcome::Ambiguous(AbandonedControl::new(epoch, reason)),
         })
+    }
+
+    pub(crate) fn ambiguous_exact<E>(self, reason: AbandonReason) -> ClassifiedControl<(), E> {
+        let epoch = self.key.subject.epoch();
+        ClassifiedControl {
+            key: self.key,
+            outcome: ControlOutcome::Ambiguous(AbandonedControl::new(epoch, reason)),
+        }
+    }
+
+    pub(crate) fn ambiguous_nodata_exact<E>(
+        self,
+        reason: AbandonReason,
+    ) -> ClassifiedControl<ExactNoData, E> {
+        let epoch = self.key.subject.epoch();
+        ClassifiedControl {
+            key: self.key,
+            outcome: ControlOutcome::Ambiguous(AbandonedControl::new(epoch, reason)),
+        }
     }
 }
 
