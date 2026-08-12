@@ -915,9 +915,9 @@ unsafe fn note_present_private_shape(
 /// This is the DMA-flip contract's equivalent of `SetVidPnSourceAddress`: for
 /// an IMMEDIATE flip dxgkrnl never calls that DDI, so unless the driver
 /// programs the display from HERE the scan-out never follows the flip at all
-/// (ROADMAP defect 0aa). Runs at DISPATCH. The dormant D4 arm publishes its
-/// fixed descriptor synchronously through interrupt serialization; the legacy
-/// production arm still defers to the PASSIVE display worker.
+/// (ROADMAP defect 0aa). Runs at DISPATCH. The D4 arm publishes its fixed
+/// descriptor synchronously through interrupt serialization; the legacy arm is
+/// unreachable while the SURFACE-derived D2 owner is active.
 ///
 /// Mints this flip's PRESENTATION EPOCH before the handle is published to the
 /// display worker, so the worker can never bind a presentation whose epoch does
@@ -1038,6 +1038,9 @@ fn arm_scanout_refresh_after_current_venus(
     stream_marker: Option<crate::adapter::PresentStreamMarker>,
     snapshot_submission: bool,
 ) {
+    if crate::virtio::KMD_D2_OWNER_ENABLED {
+        return;
+    }
     // Unsampled: what the app PRESENTED, against `Vs*` (what Windows asked us
     // to bind) and `Ff*` (what we told the host to re-read). Atomics only, so
     // it is legal on this DISPATCH-level path.
@@ -1311,7 +1314,7 @@ pub unsafe extern "C" fn dxgkddi_preempt_command(
 }
 
 /// `DxgkDdiResetFromTimeout` — TDR recovery. The legacy path preserves its
-/// scheduler-only reset. Dormant KMD D2 additionally closes canonical control
+/// scheduler-only reset. Active KMD D2 additionally closes canonical control
 /// admission, proves runner/finalizer rundown, performs an exact virtio device
 /// reset, and drains ambiguous custody before the old transport can be dropped.
 pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> NTSTATUS {

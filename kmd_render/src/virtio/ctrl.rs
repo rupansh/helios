@@ -357,10 +357,10 @@ struct BindMint<'a> {
     fence_out: &'a Cell<u64>,
     /// The `SET_SCANOUT_BLOB`'s own `resource_id`; 0 is the scan-out disable.
     resource_id: u32,
-    /// Request one standard virtio-gpu fence. False is the byte-identical
-    /// production legacy command; true is reachable only through dormant D2.
+    /// Request one standard virtio-gpu fence. False is the legacy command;
+    /// true is reachable only through the SURFACE-derived D2 owner.
     fenced: bool,
-    /// Dormant D2's no-wait publication edge. Called after the descriptor and
+    /// D2's no-wait publication edge. Called after the descriptor and
     /// its exact mint are in the transport's in-flight table but before this
     /// `virtio_lock` hold can drain a completion. It may perform bounded plane
     /// state transitions only; no allocation, wait, cleanup, or ETW write.
@@ -423,7 +423,7 @@ pub(crate) enum ScanoutSetOutcome {
     Ambiguous,
 }
 
-/// Terminal classification for the dormant D2 fenced SET path.
+/// Terminal classification for the D2 fenced SET path.
 ///
 /// Every outcome after descriptor acceptance carries the exact mint. An
 /// ambiguous response therefore preserves a completion key instead of losing
@@ -1263,7 +1263,7 @@ fn record_fenced_scanout_response_refusal(code: u32) {
     }
 }
 
-/// Issue one standard fenced `SET_SCANOUT_BLOB` for the dormant D2 plane.
+/// Issue one standard fenced `SET_SCANOUT_BLOB` for the D2 plane.
 ///
 /// The transport mints both values only after accepting this command's exact
 /// descriptor: a globally unique nonzero wire fence and the FIFO binding

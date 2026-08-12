@@ -4,15 +4,14 @@
 # ('classify every slot through 3.2 as implemented or disabled behind a
 # truthful zero capability') and section 18.1:4653-4656.
 #
-# Format: <slot name>\t<Implemented|Disabled|Pending>\t<reason>
+# Format: <slot name>\t<Implemented|Disabled|Pending|Retiring>\t<reason>
 # Rows MUST be in WDK declaration order; the generator hard-fails otherwise.
 #
 #   Implemented - registered by build_ddi_table(); must be non-NULL.
 #   Disabled    - must be NULL; the reason names the zero capability that
 #                 makes the slot unreachable.
-#   Pending     - must be NULL today; the reason names the retirement lane
-#                 that will register it. Reclassify in the SAME changeset
-#                 that registers the slot, or DriverEntry refuses to load.
+#   Pending/Retiring are generator-supported pre-D9 transition classes. The D9
+#                 activation gate requires both counts to be zero.
 #
 # Regenerate the outputs with:
 #   python3 kmd_render/tools/gen_wddm32_slot_audit.py
@@ -52,7 +51,7 @@ DxgkDdiSetPointerPosition	Implemented	Hardware pointer position.
 DxgkDdiSetPointerShape	Implemented	Hardware pointer shape.
 DxgkDdiResetFromTimeout	Implemented	TDR reset.
 DxgkDdiRestartFromTimeout	Implemented	TDR restart.
-DxgkDdiEscape	Retiring	Section 17.6:4494 and 18.1:4667 delete the Escape entry point, but escape.rs is live today (diagnostic counters, scanout timeline). RETIRING: flips to Disabled when the host/tools lane deletes escape.rs and its consumers.
+DxgkDdiEscape	Disabled	D9 leaves the WDDM 3.2 initialization slot NULL. No replacement Escape, IOCTL, registry, mapped-page, ticket, name, or discovery channel is advertised; wider K1 source demolition remains a later all-or-nothing retirement gate.
 DxgkDdiCollectDbgInfo	Implemented	OS-requested bounded debug snapshot.
 DxgkDdiQueryCurrentFence	Implemented	Last completed submission fence for a node.
 DxgkDdiIsSupportedVidPn	Implemented	VidPn validation.
@@ -122,18 +121,18 @@ Reserved2	Disabled	Reserved by the WDK; must stay NULL.
 DxgkDdiPowerRuntimeSetDeviceHandle	Implemented	Runtime power device handle.
 DxgkDdiSetStablePowerState	Implemented	Stable power state for profiling tools.
 DxgkDdiSetVideoProtectedRegion	Disabled	No protected-content surface is advertised (no OPM/PVP capability).
-DxgkDdiCheckMultiPlaneOverlaySupport3	Implemented	Dormant D3 exact-allocation one-primary validator; SupportMultiPlaneOverlay and KMD_D2_OWNER_ENABLED remain false.
-DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3	Implemented	Dormant D3 PASSIVE-retry binder over the D2 candidate/parking state; both activation gates remain false.
+DxgkDdiCheckMultiPlaneOverlaySupport3	Implemented	Active D3 exact-allocation one-primary validator; unsupported shapes return a reserved-clean false result.
+DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3	Implemented	Active D3 PASSIVE-retry binder over the D2 candidate and parking state; the D2 predicate derives solely from SURFACE.
 DxgkDdiPostMultiPlaneOverlayPresent	Implemented	Bounded always-success D3 diagnostic callback; no output path requests PostPresentNeeded.
-DxgkDdiValidateUpdateAllocationProperty	Implemented	Dormant D3 exact-allocation validation; all property mutations are rejected.
+DxgkDdiValidateUpdateAllocationProperty	Implemented	Active D3 exact-allocation validation; all property mutations are rejected.
 DxgkDdiControlModeBehavior	Implemented	D3 reports every requested unsupported mode behavior in NotSatisfied.
 DxgkDdiUpdateMonitorLinkInfo	Implemented	Mandatory once a monitor target is advertised; revalidated under the 3.2 table.
-DxgkDdiCreateHwContext	Retiring	Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.
-DxgkDdiDestroyHwContext	Retiring	Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.
-DxgkDdiCreateHwQueue	Retiring	Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.
-DxgkDdiDestroyHwQueue	Retiring	Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.
-DxgkDdiSubmitCommandToHwQueue	Retiring	Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.
-DxgkDdiSwitchToHwContextList	Retiring	Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.
+DxgkDdiCreateHwContext	Disabled	D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero.
+DxgkDdiDestroyHwContext	Disabled	D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero.
+DxgkDdiCreateHwQueue	Disabled	D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero.
+DxgkDdiDestroyHwQueue	Disabled	D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero.
+DxgkDdiSubmitCommandToHwQueue	Disabled	D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero.
+DxgkDdiSwitchToHwContextList	Disabled	D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero.
 DxgkDdiResetHwEngine	Disabled	HWS-only engine reset; per-engine TDR uses DxgkDdiResetEngine instead.
 DxgkDdiCreatePeriodicFrameNotification	Disabled	No periodic frame notification is advertised.
 DxgkDdiDestroyPeriodicFrameNotification	Disabled	No periodic frame notification is advertised.
@@ -145,8 +144,8 @@ DxgkDdiSetTargetAdjustedColorimetry	Disabled	No per-target colorimetry adjustmen
 DxgkDdiDisplayDetectControl	Disabled	The single child is indicated statically from the virtio-gpu config-change event; there is no detection engine to gate.
 DxgkDdiQueryConnectionChange	Disabled	No DisplayPort topology/connection-change surface is exposed.
 DxgkDdiExchangePreStartInfo	Implemented	Pre-start info exchange.
-DxgkDdiGetMultiPlaneOverlayCaps	Implemented	Dormant D3 exact one-RGB-plane caps, refused while KMD_D2_OWNER_ENABLED is false.
-DxgkDdiGetPostCompositionCaps	Implemented	Dormant D3 unity-only post-composition caps, refused while KMD_D2_OWNER_ENABLED is false.
+DxgkDdiGetMultiPlaneOverlayCaps	Implemented	Active D3 exact one-RGB-plane caps; all YUV, transform, scaling, and additional-plane authority remains zero.
+DxgkDdiGetPostCompositionCaps	Implemented	Active D3 unity-only post-composition caps; no post-composition transform or scaling authority is advertised.
 DxgkDdiUpdateHwContextState	Disabled	HWS-only; the hardware-scheduling family is unreachable.
 DxgkDdiCreateProtectedSession	Disabled	No protected-content session surface is advertised.
 DxgkDdiDestroyProtectedSession	Disabled	No protected-content session surface is advertised.
@@ -159,17 +158,17 @@ DxgkDdiResumeContext	Disabled	Context suspend/resume is HWS-scoped; HWS is not a
 DxgkDdiSetVirtualMachineData	Implemented	VM data hand-off.
 DxgkDdiBeginExclusiveAccess	Disabled	No GPU-P exclusive-access surface is advertised.
 DxgkDdiEndExclusiveAccess	Disabled	No GPU-P exclusive-access surface is advertised.
-DxgkDdiQueryDiagnosticTypesSupport	Pending	KMD ETW/diagnostics lane. Display brief section 6 item 11: if CollectDiagnosticInfo proves unreachable without this slot, it must be implemented and the evidence recorded.
-DxgkDdiControlDiagnosticReporting	Pending	KMD ETW/diagnostics lane. Sibling of QueryDiagnosticTypesSupport; classified explicitly per display brief section 6 item 11.
+DxgkDdiQueryDiagnosticTypesSupport	Disabled	The WDK 28000 WDDM 2.4 contract covers only PSR notification and SyncLock progression types. Helios supports neither category and leaves this slot NULL; black-screen collection is the independent CollectDiagnosticInfo contract.
+DxgkDdiControlDiagnosticReporting	Disabled	The WDK 28000 WDDM 2.4 contract controls only the PSR and SyncLock diagnostic types that Helios truthfully reports unsupported, so this slot remains NULL.
 DxgkDdiResumeHwEngine	Disabled	HWS-only engine resume; the hardware-scheduling family is unreachable.
 DxgkDdiSignalMonitoredFence	Disabled	HWQueue-scoped monitored-fence signalling; HWS/HWQueue is not advertised, and native fences use the Core-0116 slots instead.
-DxgkDdiPresentToHwQueue	Retiring	Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.
+DxgkDdiPresentToHwQueue	Disabled	D9 unregisters the complete hardware-context and hardware-queue family; hardware flip queues and every HwQueuePacketCap bit remain zero.
 DxgkDdiValidateSubmitCommand	Disabled	Not advertised; SubmitCommand validates its own packet inline.
 DxgkDdiSetTargetAdjustedColorimetry2	Disabled	No per-target colorimetry adjustment hardware; only SDR RGB is advertised.
 DxgkDdiSetTrackedWorkloadPowerLevel	Disabled	No tracked workloads are advertised.
 DxgkDdiSaveMemoryForHotUpdate	Disabled	Driver hot-update is not supported by this package.
 DxgkDdiRestoreMemoryForHotUpdate	Disabled	Driver hot-update is not supported by this package.
-DxgkDdiCollectDiagnosticInfo	Pending	KMD ETW/diagnostics lane (section 17.6:4483); C42 requires the WDDM 2.7+ black-screen diagnostic type.
+DxgkDdiCollectDiagnosticInfo	Implemented	C42 bounded PASSIVE snapshot callback with optional AddDevice adapter context and required WDDM 2.7 black-screen support; validates the WDK 28000 input before publishing strings, size, or bytes.
 Reserved3	Disabled	Reserved by the WDK; must stay NULL.
 DxgkDdiControlInterrupt3	Disabled	The driver services exactly one interrupt class (CRTC_VSYNC) and registers ControlInterrupt; revisions 2 and 3 only add classes it never raises.
 DxgkDdiSetFlipQueueLogBuffer	Disabled	Section 17.6:4497 forbids the hardware-flip-queue flags; no HW flip queue is advertised.
@@ -208,6 +207,6 @@ DxgkDdiOpenNativeFence	Implemented	Cross-process open; returns the driver local 
 DxgkDdiCloseNativeFence	Implemented	Per-process local close.
 DxgkDdiSetNativeFenceLogBuffer	Disabled	Native-fence log buffers are HWQueue-scoped (DXGKARG_SETNATIVEFENCELOGBUFFER::hHwQueue) and DXGK_VIDSCHCAPS::OptimizedNativeFenceSignaledInterrupt=0, so dxgkrnl rescans waiters instead of reading a log.
 DxgkDdiUpdateNativeFenceLogs	Disabled	Native-fence log buffers are HWQueue-scoped and OptimizedNativeFenceSignaledInterrupt=0; see SetNativeFenceLogBuffer.
-DxgkDdiCollectDbgInfo2	Pending	KMD ETW/diagnostics lane (section 17.6:4483).
+DxgkDdiCollectDbgInfo2	Implemented	C42 WDDM 3.2 TDR callback validates reason, TDR enum, optional versioned payload, pointer-size coherence, alignment, and IRQL before publishing a bounded snapshot or extension output.
 DxgkDdiNotifyContextPriorityChange	Disabled	Context priority-change notification is not requested by this driver.
 DxgkDdiResetDisplayEngine	Disabled	There is no guest-side display engine to reset; scanout is a host SET_SCANOUT_BLOB. Display lane to revisit if the cold-DWM admission gate demands it.

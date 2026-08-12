@@ -1313,7 +1313,7 @@ unsafe fn resolve_alloc(h: HANDLE) -> Option<&'static AllocationContext> {
     (ctx.magic == ALLOCATION_CTX_MAGIC).then_some(ctx)
 }
 
-/// Exact immutable facts the dormant D2 display plane may read from one live
+/// Exact immutable facts the D2 display plane may read from one live
 /// Windows allocation object.
 ///
 /// The descriptor is the final create-output record, including the generation
@@ -4860,7 +4860,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
     // D4 pre-resolves every runtime allocation before publishing the first
     // device-specific handle. A refusal therefore has no partially-open prefix
     // to unwind. The exact association is useful to the still-reachable legacy
-    // DMA worker as well as the dormant owner path, replacing its deleted
+    // DMA worker as well as the D2 owner path, replacing its deleted
     // resource-id reverse lookup without exposing D4 authority.
     let mut canonical_allocations = Vec::new();
     if canonical_allocations

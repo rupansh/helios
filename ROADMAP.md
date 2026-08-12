@@ -65,13 +65,17 @@ adversarial review first.
 346 `_0116` symbols, `HRTFENCE`,
 `pfnCreateNativeFenceCb`/`pfnOpenNativeFenceCb`).
 
-⛔ **One component is committed but deliberately NOT wired in** (was four; two
-were wired in on 2026-08-10 by `b4b613c` and `fa8489e`, and the Mesa present
-layer now loads and runs — F7). Do not assume it is active:
+⭐ **The final KMD source activation boundary is crossed locally, but the
+package is deliberately NOT deployed or runtime-admitted.** Do not infer a live
+WDDM 3.2 adapter from the source state:
 
 | Component | State | Why |
 |---|---|---|
-| `wddm_surface.rs` `SURFACE` | still `Wddm2_1GpuMmu` | the single atomic activation switch, and the **last** edit of the retirement (`OWNERSHIP.md` §3) |
+| `wddm_surface.rs` `SURFACE` | local source is `Wddm3_2GpuMmu`; `KMD_D2_OWNER_ENABLED` is derived solely from it | D9 composes the terminal callback audit, retired Escape/HWQueue registrations, diagnostics, MPO capability, D2-D5 authority, and native fences as one source package. The build-28000 cold-DWM admission harness is armed but has not run. |
+
+**THE LOCAL WDDM 3.2/D2/NATIVE-FENCE ACTIVATION PACKAGE LANDED BUT REMAINS
+UNDEPLOYED AND RUNTIME-UNADMITTED; HPS2 RETIREMENT AND PRODUCTION CORRECTNESS ARE
+NOT ESTABLISHED.**
 
 **`VK_LAYER_HELIOS_present` LOADS, RUNS, and now BUILDS A WSI DEVICE**
 (`FINDINGS.md` F7 + its two addenda). Staged by
@@ -383,34 +387,29 @@ it is off and the desktop still runs.
   loads only through `tools/install-helios-present-layer.ps1` +
   `tools/run-helios-layer-app.ps1`.
 
-#### D. Unreachable by construction at this surface (METHOD state: *unreachable*)
+#### D. D9 local-source state (runtime admission still absent)
 
 * **All six native-fence DDIs** — `Create` / `Destroy` / `Open` / `Close` /
-  `UpdateMonitoredValues` / `UpdateCurrentValuesFromCpu`, registered
-  unconditionally in `build_ddi_table()` **so the slot audit can see them**, and
-  gated inside on `NATIVE_FENCE_ADVERTISED = matches!(SURFACE, Wddm3_2GpuMmu)` —
-  **false**, because `ddi/wddm_surface.rs` declares `Wddm2_1GpuMmu`. Their **21**
-  counters (`NfCreateOk` … `NfLiveLocal`) therefore cannot move. ⚠ F9 is the
-  other half of this row: nine symbols in that file have no caller at all, and
-  `OWNERSHIP.md` §3's "the native-fence DDI surface is complete" activation gate
-  is **NOT met** — four registered slots is not the surface.
+  `UpdateMonitoredValues` / `UpdateCurrentValuesFromCpu` are registered, and
+  `NATIVE_FENCE_ADVERTISED = matches!(SURFACE, Wddm3_2GpuMmu)` is now **true in
+  the local source package**. K7 closes F9 with the complete six-slot table,
+  per-adapter feature/LUID/lifecycle admission, HNF1 validation, correlated
+  interrupt edge, and teardown ordering. The installed driver has not changed,
+  so movement of the 21 counters (`NfCreateOk` … `NfLiveLocal`) is not claimed.
 * **The three residency / `Flags2` union writes** —
   `set_ExplicitResidencyNotification` (on the **WDDM2_0** flags word, *not* on
   `Flags2`, so grepping `Flags2` will not find it), `set_DisablePartialResidency`
-  and `set_RestrictedToSingleSegment`. Doubly unreachable: they sit on the HVM1
-  placement arm, which has no producer (state F), and `Flags2` is a WDDM 3.2 field
-  that is **inert** at `Wddm2_1GpuMmu`. K4-CONTRACT §8 obligation 8 says treat as
-  unexercised until measured on the target; an unchanged residency trace is *not*
-  evidence the writes are missing.
-* **`adapter::allocation_object::invalidate_all()` has no call site at all** —
-  `grep -rn invalidate_all kmd_render/src/` returns the definition, doc
-  references, and nothing else. `ALLOCATION_EPOCH` starts at 1 and stays 1;
-  `GENERATION_EPOCH_BUMPS` (registry `AcGenEpoch`) can never move. ⛔ This is not
-  cosmetic: §14 requires the allocation generation and the native-fence generation
-  to be invalidated **together**, and **neither call exists** —
-  `ddi::native_fence::invalidate_all` has no call site either. **An adapter reset
-  invalidates nothing today, so the anti-stale mechanism is defeated.** This is
-  cross-lane request **X1** below.
+  and `set_RestrictedToSingleSegment`. The 3.2 source surface no longer makes
+  `Flags2` inert, but these writes remain producer-unreachable because the HVM1
+  placement arm still has no producer (state F). K4-CONTRACT §8 obligation 8
+  therefore remains unexercised until measured on the target; an unchanged
+  residency trace is *not* evidence that the writes are missing.
+* **Allocation/native-fence generation invalidation is now paired.** TDR,
+  Stop/Remove, failed/skipped Start and reset boundaries call
+  `ddi::native_fence::invalidate_all` before
+  `adapter::allocation_object::invalidate_all`, ahead of device-lost
+  publication. This closes source request X1, but the ordering remains
+  runtime-unadmitted with the rest of D9.
 
 #### E. Refused loudly with a named counter (METHOD state: *refused*) — this part genuinely works
 
@@ -494,7 +493,7 @@ HEAD; symbols cited rather than line numbers, because these files move.
 
 | # | filed in | against | request | status |
 |---|---|---|---|---|
-| **X1** | `kmd_render/src/adapter/allocation_object.rs` (module header) | `ddi/lifecycle.rs::dxgkddi_stop_device`, `ddi/lifecycle.rs::dxgkddi_remove_device` (**K10**); `ddi/submit_command.rs::dxgkddi_reset_from_timeout` (**K9**) | call `adapter::allocation_object::invalidate_all()` beside the `ddi::native_fence::invalidate_all()` call the same units owe. Both are lock-free, allocation-free and legal at any IRQL. §14 requires the two generations be invalidated **together** (so they may not be split across two reset paths) and §18.2 fixes the order: capability invalidation precedes the device-lost wakeup | ⛔ **OPEN, and neither call site exists** — `grep -rn invalidate_all kmd_render/src/` finds no caller for *either* function. An adapter reset invalidates nothing; `AcGenEpoch` staying 0 is the evidence the request has not been honoured, and a nonzero value is the evidence it has |
+| **X1** | `kmd_render/src/adapter/allocation_object.rs` (module header) | `ddi/lifecycle.rs::dxgkddi_stop_device`, `ddi/lifecycle.rs::dxgkddi_remove_device` (**K10**); `ddi/submit_command.rs::dxgkddi_reset_from_timeout` (**K9**) | call `adapter::allocation_object::invalidate_all()` beside the `ddi::native_fence::invalidate_all()` call the same units owe. Both are lock-free, allocation-free and legal at any IRQL. §14 requires the two generations be invalidated **together** (so they may not be split across two reset paths) and §18.2 fixes the order: capability invalidation precedes the device-lost wakeup | ✅ **CLOSED IN SOURCE BY K7; RUNTIME-UNADMITTED.** TDR, Stop/Remove, failed/skipped Start and reset boundaries now invoke `ddi::native_fence::invalidate_all` before `adapter::allocation_object::invalidate_all`, ahead of device-lost publication. D9/K7 gates preserve the order; no deployed counter movement is claimed. |
 | **X2** | `umd12/src/bridge12.rs` (the deleted cxx declaration block, and again at the deleted wrapper) | `umd12/bridge/vkd3d_bridge.{h,cpp}` | delete the C++ member `HeliosVkd3dDevice::transfer_resource_ownership`. There is no adoption to transfer: HWA2 carries no host resource token (§10.3) and the KMD creates the backing rather than taking the guest's | ⛔ **OPEN.** The Rust side is gone; the C++ side is **fully intact** — declared in `vkd3d_bridge.h`, defined in `vkd3d_bridge.cpp`, and still resolving `helios_venus_memory_transfer_resource_ownership` via `GetProcAddress`, with its `g_vkd3dOwnershipTransferFailed` counter. An unused C++ member is not a build failure, which is exactly why it will rot silently |
 | **X3** | `kmd_render/src/ddi/create_allocation.rs` (K4) | `kmd_render/src/ddi/display.rs` (display lane) | make the present-side A3 refusal distinguishable and countable. `PresentAllocInfo` is permanently `None`, so BOTH present consumers took their `else` arm on every call **through the pre-existing last-value breadcrumb `PBFlip`/`PBCpy = 0xE1`**, which in that file already means "dxgkrnl handed us a handle we could not resolve" — a handle-lifetime bug, an entirely different investigation — and a last-value write could not even say whether it fired once or per frame | ✅ **CLOSED 2026-08-10** (`01a4131`). The two sites now write **`0xEA`** and bump `create_allocation::PRESENT_NO_ALLOC_INFO` (**`PrNoRid`**), the symptom-side pair to `OaNoRid`'s cause side; `0xE1` stays reserved for its original meaning. Expected LARGE and rising until A3 — **revisit, do not merely zero** |
 | **X4** | `umd/src/forward/resource.rs` (the `global_vidmm_tracker` out-parameter, in the tex2d create path) | `umd/bridge/` — the D3D11 cxx bridge | remove the `global_vidmm_tracker` out-parameter from `get_resource_alloc_identity`. It is a **write-only sink**: `GlobalVidMmTracker` has no successor at all (K4-CONTRACT §6 — HWA2 has no tracking kind, no cookie, no global-share field, no tracker flag bit, and §10.3 forbids reintroducing it under another name). The Rust extern and the C++ declaration must change in **one** changeset or the bridge stops linking | ⛔ **OPEN.** ⚠ This request was filed as "see the K4 report" — a document that **has never existed** (`docs/retirement/` holds `FINDINGS.md`, `K4-CONTRACT.md`, `OWNERSHIP.md`, the six `lane-*.md` and the review rounds; `grep -rln 'K4 report' docs/` is empty). Round 3 caught it and the citation is being re-pointed at `K4-CONTRACT.md` §6 by the owning author. **A cross-lane request that names a nonexistent document is untrackable by construction — that is why this register exists.** The request text now lives at the site as "an open cross-lane request against `umd/bridge/`" |
@@ -735,6 +734,10 @@ immediately."* K2a's CPU view is reached by earning the WDDM 3.2 surface, not by
 another placement experiment or an instrument (`FINDINGS.md` F17). The sequence is
 `lane-kmd-display.md`'s own dependency graph, and it ends where K2a resumes:
 
+Rows 1-5 preserve the evidence at each precursor checkpoint. Row 6 is the
+authoritative current source state and supersedes their dormant/false-boundary
+statements; no runtime state changed with that source activation.
+
 | # | Unit | Why it is on THIS path | State |
 |---|---|---|---|
 | 1 | **D0** ETW substrate (`ddi/diag_etw.rs`, ADD) | D1/D2/D3 all emit through it | ✅ **LANDED AND EXERCISED ON THE TARGET.** Platform half uses the existing `wdk_sys` bindings, per-adapter epoch-tagged rundown plus a driver-wide provider-handle rundown, and the v7 `CollectDbgInfo` registration snapshot. KMD **22.22.277.0** cold-boots `CM_PROB_NONE`; `EnumerateTraceGuidsEx(TraceGuidQueryInfo)` sees the task GUID registered, and both standing probes remain **15/15**. |
@@ -742,13 +745,14 @@ another placement experiment or an instrument (`FINDINGS.md` F17). The sequence 
 | 3 | **D3** `mpo3.rs` (ADD) — the seven MPO3 slots | `doc:2854` rejects a 3.2 package without a complete MPO3 surface | **DISABLED KMD D3 MPO3 TABLE LANDED; PRODUCTION KMD D3 REMAINS ABSENT.** All seven WDK-28000 callbacks are registered and ABI-pinned. CheckMPO3 returns reserved-clean false unless the false D2 boundary is crossed, then admits only the exact one-primary HWA2/source/mode/attribute profile. SetMPO3 touches only its retry output and atomics above PASSIVE, uses the documented `STATUS_RETRY`/`PrePresentNeeded` continuation, and at PASSIVE revalidates the exact OS context allocation, context owner, nonzero GPUVA, operation flags, default refresh duration, and actual plane attributes before retaining the D2 candidate. Zero-plane input uses parking-first explicit unbind; no special output, PostPresent, Hsync, or HW-flip-queue flag is set. The cap callbacks expose only one RGB plane and unity transforms after activation; ValidateUpdate resolves the exact live open-allocation object and rejects every mutation; ControlMode marks every request unsatisfied; PostMPO is an always-success counted tripwire. The generated 192-slot audit now classifies all seven as implemented (89 implemented / 91 disabled / 4 pending / 8 retiring). The atomic-boundary gate covers the false owner switch, absent MPO capability, 2.1 surface, guarded authority, and deliberate enabled, unguarded, decoy-guarded, advertised-cap, and raised-surface mutations. Windows `cargo check` remains green at exactly 22 warnings; all 510 `kmd_logic` tests and every Linux retirement gate pass. `KMD_D2_OWNER_ENABLED=false` and `SURFACE=Wddm2_1GpuMmu` are unchanged: no legacy removal/migration, activation, deployment, adapter restart, reboot, or runtime-correctness claim occurred. |
 | 4 | **D4** then **D5** (`display.rs`, `present_packet.rs`) | D5 is part of the MPO3 surface D9 gates on; D5 serializes after D4 (same file) | **DISABLED KMD D2/D3/D4/D5 DISPLAY AUTHORITY LANDED; PRODUCTION KMD D2/D3/D4/D5 REMAIN ABSENT.** D4: classic SetVidPn consumes the exact OS allocation/source/address/segment/flags through D2 admission; the DMA arm carries the exact device-specific open handle through an immutable canonical open/allocation association. Both retain a move-only candidate before accepting one exact fenced SET. Device-DIRQL uses four preallocated slots, a private adapter-bound non-cloneable capability, a bounded no-spin gate shared by every queue mutator, an exact-pinned allocator-disabled virtqueue, and a separately boxed queue with fail-closed teardown custody. The D4 source gate audits the full raised/synchronized call, macro, and indirect-call surface and mutation-rejects hidden helpers/macros, waits, allocation, signals, locks, PCI status access at raised IRQL, queue bypasses, dependency drift, forged proofs, publication/lifetime races, unguarded authority, legacy D4 mechanisms, and boolean-only activation. PASSIVE-only PCI reset is token-typed, raw-queue-lifetime-pinned, and completes before the transport spinlock is re-entered. The dormant D4 branch has no heuristic resource lookup, snapshot substitution, coalescer, fast bind, LINEAR fallback, or retry polling; D0 transitions occur at the first legal exact-completion DPC edge. D5: Present selects the `FlipWithMultiPlaneOverlay` union arm once and the false owner boundary returns counted `STATUS_NOT_SUPPORTED` before dereferencing it. The dormant arm admits exactly one enabled source-0/layer-0 plane after null/alignment/count/reserved-bit checks, validates its device-specific handle through both canonical live `OpenAllocation` projections and the current immutable HWA2 primary profile, and preserves the exact handle/segment/physical-address tuple. WDK 28000 marks the Win7+ patch output unused, so D5 emits the existing ordinary HERF packet with no invented allocation-list index, patch entry, private HPS record, or display lease; SetMPO3 remains the first display-custody transition. The D5 gate fixes the complete call surface and mutation-rejects guard/decoy/boolean-only activation, union reinterpretation, zero/disabled/multiple planes, pointer/count/profile/provenance/capacity weakening, heuristic identity, private tickets, display-lifetime/control work, PresentToHwQueue union reads, and D4 layout/DIRQL regressions. Windows `cargo check` remains green at exactly 22 warnings; all 510 `kmd_logic` tests, the unchanged D4 proof, and every Linux retirement gate pass. The false branch remains the only production authority, and activation is rejected while legacy authority/host-write paths exist. `KMD_D2_OWNER_ENABLED=false` and `SURFACE=Wddm2_1GpuMmu` remain unchanged; no deployment, reboot, adapter restart, runtime-correctness claim, HPS2 removal, legacy demolition, or activation occurred. |
 | 5 | **native fences (K7)** | `doc:2854` rejects 3.2 on an incomplete FENCE surface too | **DORMANT NATIVE-FENCE SURFACE LANDED; PRODUCTION NATIVE-FENCE AUTHORITY REMAINS ABSENT.** StartDevice now publishes its exact `AdapterLuid`; stable per-adapter state owns feature admission, LUID, lifecycle, nonwrapping epochs/generations, and bounded populations. QueryAdapterInfo supplies the exact validated native-caps arm and publishes `NativeGpuFence` only through the full surface/D2-owner/LUID/feature/lifecycle conjunction. Six callback slots remain registered, both native-log slots remain NULL/Disabled, hardware queues remain unsupported, and `No64BitAtomics` plus optimized native interrupts remain zero. HNF1 stays 64-byte/pointer-free with input generation zero and successful output generation nonzero; create/open/update/teardown reject foreign, stale, malformed, overflowing, or partially valid input before mutation. A real completed WDDM submission plus a current monitored population is the only native-rescan edge, delivered through D4's audited DIRQL helper. Reset, stop, remove, and skipped-stop invalidation ordering is preserved. NF-UAF-1 is closed by dxgkrnl's documented global/local reference order, with a bounded refuse-and-retain fallback if Destroy ever arrives with locals outstanding. The K7 gate imports the unchanged D4/D5 source proofs and rejects 35 temporary-tree mutations through the real gate. Windows `cargo check` is green at 13 warnings—the prior nine F9 dead-symbol warnings are gone and no new category appeared; all 511 `kmd_logic` unit tests and every Linux retirement gate pass; the callback audit remains 89 implemented / 91 disabled / 4 pending / 8 retiring; WDK-28000 bindings remain byte-identical at SHA-256 `148b75db41e093dc6783be4f5bb3ea84b2c7c39ef316fe711b3f2a5a0668bea2`. `SURFACE=Wddm2_1GpuMmu` and `KMD_D2_OWNER_ENABLED=false` are unchanged, so no callback or cap is reachable in production and no activation, deployment, legacy removal, runtime-correctness, or flip-readiness claim is made. |
-| 6 | **D9** the slot audit + `SURFACE` → `Wddm3_2GpuMmu` | the flip itself | ⭐ §6 item 2 is **RESOLVED**: the checked-in generated human artifact is `docs/retirement/d9-wddm32-slot-audit.md` (192 callback slots plus `Version`, 193 fields total). D9 still runs strictly last. |
-| 7 | **K2a resumes** | at 3.2 the WDDM **2.9** `DXGKRNL_INTERFACE` block is legitimately in scope | `DxgkCbCreatePhysicalMemoryObject(IO_SPACE)` + `DxgkCbMapPhysicalMemory(USER_MODE)` — F17. |
+| 6 | **D9** the slot audit + `SURFACE` → `Wddm3_2GpuMmu` | the flip itself | **THE LOCAL WDDM 3.2/D2/NATIVE-FENCE ACTIVATION PACKAGE LANDED BUT REMAINS UNDEPLOYED AND RUNTIME-UNADMITTED; HPS2 RETIREMENT AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.** The 192 callback slots are terminal at 91 Implemented / 101 Disabled / 0 Pending / 0 Retiring. Escape and all seven HW-context/HW-queue-family registrations are absent; hardware queues, native-fence logs, `No64BitAtomics`, optimized native interrupts, Hsync/HW-flip/post-composition authority remain unsupported. The two exact WDK-28000 diagnostic callbacks validate IRQL, pointer/range/alignment, enum/type, payload/profile, and aliasing before publishing bounded local output. `SupportMultiPlaneOverlay` is emitted only by the exact SURFACE-derived D2 package, with the one-primary/RGB/unity profile. The generated human/machine audits are fresh; `tools/d9-wddm32-activation-gate.py` rejects 41 temporary-tree mutations, including mixed/decoy activation, stale audit, unsafe diagnostics, reopened legacy display continuations, and false cold-admission claims. The build-28000 cold-DWM harness is armed but was not run. Windows `cargo check` passes at exactly 13 warnings; all 511 `kmd_logic` unit tests, both integration suites, D4/D5/K7 safety proofs, all 35 K7 mutations, and every Linux retirement gate pass. VM-generated and offline WDK bindings agree at 3,834,340 bytes / SHA-256 `148b75db41e093dc6783be4f5bb3ea84b2c7c39ef316fe711b3f2a5a0668bea2`. No deployment, adapter restart, reboot, cold-DWM admission, push, K2a work, wider K1/D6/D7/D8 demolition, full HPS2 retirement, or runtime/visible-desktop correctness claim occurred. CpuHostAperture and other §18 legacy retirement mechanisms remain live. |
+| 7 | **K2a resumes only after D9 runtime admission** | the WDDM **2.9** `DXGKRNL_INTERFACE` block is legitimately in scope only after the build-28000 cold-DWM gate passes | `DxgkCbCreatePhysicalMemoryObject(IO_SPACE)` + `DxgkCbMapPhysicalMemory(USER_MODE)` — F17. Not started. |
 
 ⚠ **The desktop stays dark for most of this**, by the owner's explicit acceptance.
-`E_NOTIMPL` at 3.2 is not a wall, but it is not removed in production yet: D3
-now supplies the dormant table and D9 later crosses the atomic activation
-boundary (`wddm_surface.rs:25-28` against `doc:5079`).
+D9 has crossed the local source boundary, but that package remains undeployed
+and runtime-unadmitted. Only a permitted build-28000 cold boot whose DWM starts
+visibly without the former `CDDisplaySwapChain`/`E_NOTIMPL` failure can admit the
+surface; a build, callback count, Code 0, counter, or log cannot.
 
 4. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
    correction below before touching it. Not on the critical path.

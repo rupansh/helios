@@ -1,9 +1,9 @@
-//! Dormant HPS2 D2 platform plane: exact HWA2 admission, fenced replacement,
-//! and reset-bounded backing custody for source 0 / plane 0.
+//! HPS2 D2 platform plane: exact HWA2 admission, fenced replacement, and
+//! reset-bounded backing custody for source 0 / plane 0.
 
 #![allow(
     dead_code,
-    reason = "D2 is deliberately dormant until the later atomic D3/D4/D9 activation"
+    reason = "the active D2 path retains audited helpers for refusal and reset edges"
 )]
 
 use core::cell::UnsafeCell;

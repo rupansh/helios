@@ -101,14 +101,14 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
 ///
 /// That is the whole reason this type exists. `query_driver_caps`'s size gate
 /// deliberately admits `OutputDataSize` values below `size_of::<DXGK_DRIVERCAPS>()`
-/// (592 on the bindgen'd 26100 headers) — a caps buffer is versioned, and 540 is
-/// all this driver's surface needs. Forming `&mut *(pOutputData as *mut
-/// DXGK_DRIVERCAPS)` over such a buffer is undefined behaviour *independent of
-/// which fields are touched*: a reference must be dereferenceable for its whole
-/// referent type. The old code did exactly that, and then wrote through
-/// `args.pOutputData` — a second, separately-derived raw pointer — while that
-/// reference was still live and used afterwards, which is additionally a
-/// Stacked-Borrows aliasing violation.
+/// (592 on the WDK-28000 bindings) — a caps buffer is versioned, and the byte
+/// through `SupportMultiPlaneOverlay` is all this package needs. Forming `&mut
+/// *(pOutputData as *mut DXGK_DRIVERCAPS)` over such a buffer is undefined
+/// behaviour *independent of which fields are touched*: a reference must be
+/// dereferenceable for its whole referent type. The old code did exactly that,
+/// and then wrote through `args.pOutputData` — a second, separately-derived raw
+/// pointer — while that reference was still live and used afterwards, which is
+/// additionally a Stacked-Borrows aliasing violation.
 ///
 /// So: **`VersionedOut` never exposes the referent type by reference.** A wrapper
 /// that still handed out `&mut T` internally would relocate the defect, not remove
@@ -188,13 +188,12 @@ macro_rules! caps_offset {
 /// caps it reports and the segment flags reported alongside them cannot disagree.
 unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     let knobs = adapter.knobs();
-    // The MINIMUM this DDI insists on, unchanged at 540 so the
-    // STATUS_BUFFER_TOO_SMALL threshold and the 0x02CF record keep their values.
-    // It is no longer load-bearing for memory safety — every write below is
-    // individually bounded — but it still states the smallest surface worth
-    // reporting.
+    // The minimum includes the last field D9 writes. Every individual write is
+    // still bounds-checked by `VersionedOut`, but accepting a shorter buffer and
+    // silently omitting the active package's MPO capability would expose an
+    // internally inconsistent 3.2 surface during AddAdapter.
     const REQUIRED_DRIVER_CAPS_SIZE: usize =
-        offset_of!(DXGK_DRIVERCAPS, SupportDirectFlip) + size_of::<BOOLEAN>();
+        offset_of!(DXGK_DRIVERCAPS, SupportMultiPlaneOverlay) + size_of::<BOOLEAN>();
 
     crate::diag::record(0x01CF_0000 | (args.OutputDataSize & 0xFFFF));
     if (args.OutputDataSize as usize) < REQUIRED_DRIVER_CAPS_SIZE {
@@ -256,7 +255,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     out.set(caps_offset!(SupportPerEngineTDR), support_per_engine_tdr);
 
     // Required WDDM 1.2+ render-only caps. Bit positions verified field-by-field
-    // against WDK 10.0.26100 `shared/d3dkmddi.h` (2026-06-18). `__bindgen_anon_1`
+    // against WDK 10.0.28000 `shared/d3dkmddi.h`. `__bindgen_anon_1`
     // is the cap union; `.Value` is its UINT view of the bitfield struct, so a
     // named mask written to `.Value` is the stable, layout-independent way to set
     // a single documented bit.
@@ -458,6 +457,22 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // reg add + devcon restart; value lands in the 0x01D7 diag record bit 2.
     let support_direct_flip: BOOLEAN = if knobs.direct_flip { 1 } else { 0 };
     out.set(caps_offset!(SupportDirectFlip), support_direct_flip);
+    // D9 publishes MPO only as part of the one atomic 3.2/D2 package. The
+    // callback table itself remains the exact one-primary, RGB-only,
+    // unity-transform D3 profile; no independent capability switch exists.
+    const SUPPORT_MULTI_PLANE_OVERLAY: BOOLEAN = if matches!(
+        SURFACE,
+        crate::ddi::wddm_surface::WddmSurface::Wddm3_2GpuMmu
+    ) && crate::virtio::KMD_D2_OWNER_ENABLED
+    {
+        1
+    } else {
+        0
+    };
+    out.set(
+        caps_offset!(SupportMultiPlaneOverlay),
+        SUPPORT_MULTI_PLANE_OVERLAY,
+    );
     let nb_asymetric_processing_nodes: UINT = 1;
     out.set(
         caps_offset!(

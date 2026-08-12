@@ -3,7 +3,10 @@
     reason = "D0 precedes the D1-D3 event sites and D9 diagnostic snapshot consumer"
 )]
 
+use core::ffi::c_void;
 use core::hint::spin_loop;
+use core::mem::{align_of, size_of};
+use core::ptr;
 use core::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use helios_protocol::diagnostics::{
@@ -13,10 +16,27 @@ use helios_protocol::diagnostics::{
     HELIOS_ETW_EVENT_DESCRIPTORS, HELIOS_ETW_PAYLOAD_V1_SIZE, HELIOS_ETW_PROVIDER_GUID,
     HELIOS_ETW_REJECT_CODE_MAX,
 };
-use wdk_sys::ntddk::{EtwProviderEnabled, EtwRegister, EtwUnregister, EtwWrite};
+use wdk_sys::ntddk::{EtwProviderEnabled, EtwRegister, EtwUnregister, EtwWrite, KeGetCurrentIrql};
 use wdk_sys::{BOOLEAN, EVENT_DATA_DESCRIPTOR, EVENT_DESCRIPTOR, GUID, REGHANDLE, UCHAR, ULONG};
 
 use crate::adapter::AdapterContext;
+use crate::dxgk::_DXGK_DIAGNOSTICINFO_TYPE::{
+    DXGK_DI_ADDDEVICE, DXGK_DI_BLACKSCREEN, DXGK_DI_STARTDEVICE,
+};
+use crate::dxgk::_DXGK_TDR_TYPE::{
+    DXGK_TDR_TYPE_DISPLAY_ENGINE_FAULT, DXGK_TDR_TYPE_DOD_PRESENT_FORCED,
+    DXGK_TDR_TYPE_DOD_PRESENT_TIMEOUT, DXGK_TDR_TYPE_DOD_VSYNC_FORCED,
+    DXGK_TDR_TYPE_DOD_VSYNC_TIMEOUT, DXGK_TDR_TYPE_ENGINE_PAGE_FAULT, DXGK_TDR_TYPE_ENGINE_TIMEOUT,
+    DXGK_TDR_TYPE_ENGINE_TIMEOUT_PROMOTED, DXGK_TDR_TYPE_FORCED, DXGK_TDR_TYPE_INVALID_FENCE,
+    DXGK_TDR_TYPE_PAGE_FAULT, DXGK_TDR_TYPE_PREEMPT_TIMEOUT, DXGK_TDR_TYPE_UNKNOWN,
+    DXGK_TDR_TYPE_VSYNC_TIMEOUT,
+};
+use crate::dxgk::{
+    CHAR, DXGKARG_COLLECTDBGINFO2, DXGKARG_COLLECTDBGINFO_EXT, DXGKARG_COLLECTDIAGNOSTICINFO,
+    DXGK_TDR_PAYLOAD_ENGINE_TIMEOUT, DXGK_TDR_PAYLOAD_VSYNC_TIMEOUT,
+    INOUT_PDXGKARG_COLLECTDBGINFO2, INOUT_PDXGKARG_COLLECTDIAGNOSTICINFO, IN_CONST_HANDLE,
+    IN_CONST_PDEVICE_OBJECT, NTSTATUS, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
+};
 
 const CONTROL_LEVEL_MASK: u32 = 0xff;
 const CONTROL_ENABLED: u32 = 1 << 8;
@@ -62,6 +82,10 @@ static REJECT_INDEX_REFUSED: AtomicU32 = AtomicU32::new(0);
 static WRITE_SUCCESSES: AtomicU32 = AtomicU32::new(0);
 static WRITE_FAILURES: AtomicU32 = AtomicU32::new(0);
 static LAST_WRITE_STATUS: AtomicI32 = AtomicI32::new(0);
+static COLLECT_DIAGNOSTIC_CALLS: AtomicU32 = AtomicU32::new(0);
+static COLLECT_DIAGNOSTIC_REFUSALS: AtomicU32 = AtomicU32::new(0);
+static COLLECT_DBG_INFO2_CALLS: AtomicU32 = AtomicU32::new(0);
+static COLLECT_DBG_INFO2_REFUSALS: AtomicU32 = AtomicU32::new(0);
 static REJECTION_COUNTS: [AtomicU32; HELIOS_ETW_REJECTION_COUNTER_COUNT] =
     [const { AtomicU32::new(0) }; HELIOS_ETW_REJECTION_COUNTER_COUNT];
 
@@ -106,6 +130,479 @@ pub struct HeliosEtwRegistrationSnapshot {
     pub failures: u32,
     pub last_status: i32,
     pub registered: u32,
+}
+
+/// Pointer-free, bounded payload shared by the OS-owned C42 diagnostic DDIs.
+/// It contains only package/adapter state and counters; never a handle, pointer,
+/// raw resource identity, process identity, or discovery token.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct HeliosOsDiagnosticReportV1 {
+    magic: u32,
+    version: u16,
+    size: u16,
+    request_kind: u32,
+    reason: u32,
+    package_generation: u64,
+    surface_interface_version: u32,
+    completed_fence: u32,
+    etw_registered: u32,
+    etw_last_register_status: i32,
+    etw_control_enabled: u32,
+    etw_control_level: u32,
+    adapter_epoch: u64,
+    adapter_rundown_active: u32,
+    adapter_rundown_closed: u32,
+}
+
+const HELIOS_OS_DIAGNOSTIC_MAGIC: u32 = 0x3144_4F48; // HOD1
+const VIDEO_TDR_TIMEOUT_DETECTED: u32 = 0x117;
+const VIDEO_ENGINE_TIMEOUT_DETECTED: u32 = 0x141;
+const _: () = {
+    assert!(size_of::<HeliosOsDiagnosticReportV1>() == 64);
+    assert!(align_of::<HeliosOsDiagnosticReportV1>() == 8);
+    assert!(size_of::<DXGKARG_COLLECTDIAGNOSTICINFO>() == 232);
+    assert!(align_of::<DXGKARG_COLLECTDIAGNOSTICINFO>() == 8);
+    assert!(size_of::<DXGKARG_COLLECTDBGINFO2>() == 48);
+    assert!(align_of::<DXGKARG_COLLECTDBGINFO2>() == 8);
+    assert!(size_of::<DXGKARG_COLLECTDBGINFO_EXT>() == 32);
+    assert!(align_of::<DXGKARG_COLLECTDBGINFO_EXT>() == 4);
+    assert!(size_of::<DXGK_TDR_PAYLOAD_ENGINE_TIMEOUT>() == 40);
+    assert!(align_of::<DXGK_TDR_PAYLOAD_ENGINE_TIMEOUT>() == 8);
+    assert!(size_of::<DXGK_TDR_PAYLOAD_VSYNC_TIMEOUT>() == 16);
+    assert!(align_of::<DXGK_TDR_PAYLOAD_VSYNC_TIMEOUT>() == 8);
+};
+
+fn refuse_os_diagnostic(counter: &AtomicU32, code: u32) -> NTSTATUS {
+    counter.fetch_add(1, Ordering::Relaxed);
+    crate::diag::record(0x0D90_0000 | (code & 0xffff));
+    STATUS_INVALID_PARAMETER
+}
+
+fn checked_range(raw: *const c_void, len: usize) -> Option<(usize, usize)> {
+    if len == 0 {
+        let at = raw as usize;
+        return Some((at, at));
+    }
+    if raw.is_null() {
+        return None;
+    }
+    let start = raw as usize;
+    Some((start, start.checked_add(len)?))
+}
+
+fn ranges_overlap(
+    left: *const c_void,
+    left_len: usize,
+    right: *const c_void,
+    right_len: usize,
+) -> bool {
+    let Some((left_start, left_end)) = checked_range(left, left_len) else {
+        return true;
+    };
+    let Some((right_start, right_end)) = checked_range(right, right_len) else {
+        return true;
+    };
+    left_start < right_end && right_start < left_end
+}
+
+fn copy_ascii<const N: usize>(destination: &mut [CHAR; N], source: &[u8]) {
+    let count = core::cmp::min(source.len(), N.saturating_sub(1));
+    for (out, byte) in destination.iter_mut().zip(source.iter()).take(count) {
+        *out = *byte as CHAR;
+    }
+}
+
+fn os_diagnostic_report(
+    adapter: Option<&AdapterContext>,
+    request_kind: u32,
+    reason: u32,
+) -> HeliosOsDiagnosticReportV1 {
+    let registration = registration_snapshot();
+    let control = CONTROL_STATE.load(Ordering::Acquire);
+    let (completed_fence, rundown) = match adapter {
+        Some(adapter) => (adapter.completed_fence(), adapter_rundown_snapshot(adapter)),
+        None => (
+            0,
+            HeliosEtwAdapterRundownSnapshot {
+                epoch: 0,
+                active: 0,
+                closed: 1,
+            },
+        ),
+    };
+    HeliosOsDiagnosticReportV1 {
+        magic: HELIOS_OS_DIAGNOSTIC_MAGIC,
+        version: 1,
+        size: size_of::<HeliosOsDiagnosticReportV1>() as u16,
+        request_kind,
+        reason,
+        package_generation: helios_protocol::HELIOS_PACKAGE_GENERATION,
+        surface_interface_version: crate::ddi::wddm_surface::SURFACE.ddi_interface_version(),
+        completed_fence,
+        etw_registered: registration.registered,
+        etw_last_register_status: registration.last_status,
+        etw_control_enabled: u32::from(control & CONTROL_ENABLED != 0),
+        etw_control_level: control & CONTROL_LEVEL_MASK,
+        adapter_epoch: rundown.epoch,
+        adapter_rundown_active: rundown.active,
+        adapter_rundown_closed: rundown.closed,
+    }
+}
+
+fn valid_diagnostic_info_type(kind: i32) -> bool {
+    matches!(
+        kind,
+        DXGK_DI_ADDDEVICE | DXGK_DI_STARTDEVICE | DXGK_DI_BLACKSCREEN
+    )
+}
+
+fn valid_tdr_type(kind: i32) -> bool {
+    matches!(
+        kind,
+        DXGK_TDR_TYPE_UNKNOWN
+            | DXGK_TDR_TYPE_FORCED
+            | DXGK_TDR_TYPE_PREEMPT_TIMEOUT
+            | DXGK_TDR_TYPE_VSYNC_TIMEOUT
+            | DXGK_TDR_TYPE_DOD_PRESENT_FORCED
+            | DXGK_TDR_TYPE_DOD_PRESENT_TIMEOUT
+            | DXGK_TDR_TYPE_ENGINE_TIMEOUT
+            | DXGK_TDR_TYPE_DOD_VSYNC_FORCED
+            | DXGK_TDR_TYPE_DOD_VSYNC_TIMEOUT
+            | DXGK_TDR_TYPE_ENGINE_TIMEOUT_PROMOTED
+            | DXGK_TDR_TYPE_PAGE_FAULT
+            | DXGK_TDR_TYPE_INVALID_FENCE
+            | DXGK_TDR_TYPE_ENGINE_PAGE_FAULT
+            | DXGK_TDR_TYPE_DISPLAY_ENGINE_FAULT
+    )
+}
+
+/// `DxgkDdiCollectDiagnosticInfo` — bounded WDDM 2.6+ black-box collection.
+///
+/// WDK 28000 makes `hAdapter` optional because AddDevice can fail before the
+/// miniport publishes one. WDDM 2.7+ nevertheless requires BLACKSCREEN support,
+/// so all three defined request types receive the same pointer-free snapshot.
+pub unsafe extern "C" fn dxgkddi_collect_diagnostic_info(
+    physical_device_object: IN_CONST_PDEVICE_OBJECT,
+    collect_diagnostic_info: INOUT_PDXGKARG_COLLECTDIAGNOSTICINFO,
+) -> NTSTATUS {
+    COLLECT_DIAGNOSTIC_CALLS.fetch_add(1, Ordering::Relaxed);
+    // WDK 28000 declares PASSIVE_LEVEL. Check it before reading caller memory.
+    if unsafe { KeGetCurrentIrql() } != crate::ddi::PASSIVE_LEVEL_IRQL {
+        return refuse_os_diagnostic(&COLLECT_DIAGNOSTIC_REFUSALS, 1);
+    }
+    if physical_device_object.is_null()
+        || !physical_device_object.is_aligned()
+        || collect_diagnostic_info.is_null()
+        || !collect_diagnostic_info.is_aligned()
+    {
+        return refuse_os_diagnostic(&COLLECT_DIAGNOSTIC_REFUSALS, 2);
+    }
+
+    // SAFETY: null/alignment were checked above; dxgkrnl owns this 232-byte
+    // argument for the call. Copying it creates no reference and performs no
+    // output mutation.
+    let input = unsafe { ptr::read(collect_diagnostic_info) };
+    if !valid_diagnostic_info_type(input.Type) {
+        return refuse_os_diagnostic(&COLLECT_DIAGNOSTIC_REFUSALS, 3);
+    }
+    if input.BufferSizeIn != 0 && input.pBuffer.is_null() {
+        return refuse_os_diagnostic(&COLLECT_DIAGNOSTIC_REFUSALS, 4);
+    }
+    let copy_len = core::cmp::min(
+        input.BufferSizeIn as usize,
+        size_of::<HeliosOsDiagnosticReportV1>(),
+    );
+    if checked_range(input.pBuffer.cast_const(), copy_len).is_none()
+        || ranges_overlap(
+            input.pBuffer.cast_const(),
+            copy_len,
+            collect_diagnostic_info.cast(),
+            size_of::<DXGKARG_COLLECTDIAGNOSTICINFO>(),
+        )
+    {
+        return refuse_os_diagnostic(&COLLECT_DIAGNOSTIC_REFUSALS, 5);
+    }
+
+    let adapter = if input.hAdapter.is_null() {
+        None
+    } else {
+        let adapter_ptr = input.hAdapter as *const AdapterContext;
+        if !adapter_ptr.is_aligned()
+            || ranges_overlap(
+                collect_diagnostic_info.cast(),
+                size_of::<DXGKARG_COLLECTDIAGNOSTICINFO>(),
+                adapter_ptr.cast(),
+                size_of::<AdapterContext>(),
+            )
+            || ranges_overlap(
+                input.pBuffer.cast_const(),
+                copy_len,
+                adapter_ptr.cast(),
+                size_of::<AdapterContext>(),
+            )
+        {
+            return refuse_os_diagnostic(&COLLECT_DIAGNOSTIC_REFUSALS, 6);
+        }
+        // SAFETY: this is the optional adapter handle dxgkrnl received from
+        // AddDevice; alignment was checked before reference formation.
+        Some(unsafe { &*adapter_ptr })
+    };
+
+    let report = os_diagnostic_report(adapter, input.Type as u32, 0);
+    let mut output = input;
+    output.BucketingString = [0; 64];
+    output.DescriptionString = [0; 128];
+    let (bucket, description): (&[u8], &[u8]) = if input.Type == DXGK_DI_ADDDEVICE {
+        (b"Helios_AddDevice", b"Helios_WDDM32_AddDevice_diagnostic")
+    } else if input.Type == DXGK_DI_STARTDEVICE {
+        (
+            b"Helios_StartDevice",
+            b"Helios_WDDM32_StartDevice_diagnostic",
+        )
+    } else if input.Type == DXGK_DI_BLACKSCREEN {
+        (
+            b"Helios_BlackScreen",
+            b"Helios_WDDM32_BlackScreen_diagnostic",
+        )
+    } else {
+        return refuse_os_diagnostic(&COLLECT_DIAGNOSTIC_REFUSALS, 7);
+    };
+    copy_ascii(&mut output.BucketingString, bucket);
+    copy_ascii(&mut output.DescriptionString, description);
+    output.__bindgen_anon_1.pReserved = ptr::null_mut();
+    output.BufferSizeOut = copy_len as u32;
+
+    // All validation and local construction are complete. Publish the bounded
+    // bytes first, then the one argument result as a single struct write.
+    if copy_len != 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(
+                (&report as *const HeliosOsDiagnosticReportV1).cast::<u8>(),
+                input.pBuffer.cast::<u8>(),
+                copy_len,
+            )
+        };
+    }
+    unsafe { ptr::write(collect_diagnostic_info, output) };
+    STATUS_SUCCESS
+}
+
+/// `DxgkDdiCollectDbgInfo2` — WDDM 3.2 TDR-aware bounded snapshot.
+pub unsafe extern "C" fn dxgkddi_collect_dbg_info2(
+    h_adapter: IN_CONST_HANDLE,
+    collect_dbg_info2: INOUT_PDXGKARG_COLLECTDBGINFO2,
+) -> NTSTATUS {
+    COLLECT_DBG_INFO2_CALLS.fetch_add(1, Ordering::Relaxed);
+    if unsafe { KeGetCurrentIrql() } != crate::ddi::PASSIVE_LEVEL_IRQL {
+        return refuse_os_diagnostic(&COLLECT_DBG_INFO2_REFUSALS, 0x101);
+    }
+    let adapter_ptr = h_adapter as *const AdapterContext;
+    if adapter_ptr.is_null()
+        || !adapter_ptr.is_aligned()
+        || collect_dbg_info2.is_null()
+        || !collect_dbg_info2.is_aligned()
+    {
+        return refuse_os_diagnostic(&COLLECT_DBG_INFO2_REFUSALS, 0x102);
+    }
+    if ranges_overlap(
+        collect_dbg_info2.cast(),
+        size_of::<DXGKARG_COLLECTDBGINFO2>(),
+        adapter_ptr.cast(),
+        size_of::<AdapterContext>(),
+    ) {
+        return refuse_os_diagnostic(&COLLECT_DBG_INFO2_REFUSALS, 0x102);
+    }
+
+    // SAFETY: validated 48-byte WDK argument; copy before forming references or
+    // touching any output.
+    let input = unsafe { ptr::read(collect_dbg_info2) };
+    if !matches!(
+        input.Reason,
+        VIDEO_TDR_TIMEOUT_DETECTED | VIDEO_ENGINE_TIMEOUT_DETECTED
+    ) || !valid_tdr_type(input.TdrType)
+    {
+        return refuse_os_diagnostic(&COLLECT_DBG_INFO2_REFUSALS, 0x103);
+    }
+    if input.BufferSize != 0 && input.pBuffer.is_null() {
+        return refuse_os_diagnostic(&COLLECT_DBG_INFO2_REFUSALS, 0x104);
+    }
+    let Ok(buffer_size) = usize::try_from(input.BufferSize) else {
+        return refuse_os_diagnostic(&COLLECT_DBG_INFO2_REFUSALS, 0x105);
+    };
+    let copy_len = core::cmp::min(buffer_size, size_of::<HeliosOsDiagnosticReportV1>());
+    if checked_range(input.pBuffer.cast_const(), copy_len).is_none()
+        || ranges_overlap(
+            input.pBuffer.cast_const(),
+            copy_len,
+            collect_dbg_info2.cast(),
+            size_of::<DXGKARG_COLLECTDBGINFO2>(),
+        )
+        || ranges_overlap(
+            input.pBuffer.cast_const(),
+            copy_len,
+            adapter_ptr.cast(),
+            size_of::<AdapterContext>(),
+        )
+    {
+        return refuse_os_diagnostic(&COLLECT_DBG_INFO2_REFUSALS, 0x105);
+    }
+
+    if !input.pExtension.is_null()
+        && (!input.pExtension.is_aligned()
+            || checked_range(
+                input.pExtension.cast(),
+                size_of::<DXGKARG_COLLECTDBGINFO_EXT>(),
+            )
+            .is_none()
+            || ranges_overlap(
+                input.pExtension.cast(),
+                size_of::<DXGKARG_COLLECTDBGINFO_EXT>(),
+                collect_dbg_info2.cast(),
+                size_of::<DXGKARG_COLLECTDBGINFO2>(),
+            )
+            || ranges_overlap(
+                input.pExtension.cast(),
+                size_of::<DXGKARG_COLLECTDBGINFO_EXT>(),
+                input.pBuffer.cast_const(),
+                copy_len,
+            )
+            || ranges_overlap(
+                input.pExtension.cast(),
+                size_of::<DXGKARG_COLLECTDBGINFO_EXT>(),
+                adapter_ptr.cast(),
+                size_of::<AdapterContext>(),
+            ))
+    {
+        return refuse_os_diagnostic(&COLLECT_DBG_INFO2_REFUSALS, 0x106);
+    }
+
+    let mut engine_payload = None;
+    if input.TdrPayload.is_null() {
+        if input.TdrPayloadSize != 0 {
+            return refuse_os_diagnostic(&COLLECT_DBG_INFO2_REFUSALS, 0x107);
+        }
+    } else {
+        match input.TdrType {
+            DXGK_TDR_TYPE_ENGINE_TIMEOUT => {
+                let payload_ptr = input.TdrPayload.cast::<DXGK_TDR_PAYLOAD_ENGINE_TIMEOUT>();
+                if input.TdrPayloadSize < size_of::<DXGK_TDR_PAYLOAD_ENGINE_TIMEOUT>() as u32
+                    || !payload_ptr.is_aligned()
+                    || checked_range(
+                        input.TdrPayload.cast_const(),
+                        size_of::<DXGK_TDR_PAYLOAD_ENGINE_TIMEOUT>(),
+                    )
+                    .is_none()
+                    || ranges_overlap(
+                        input.TdrPayload.cast_const(),
+                        size_of::<DXGK_TDR_PAYLOAD_ENGINE_TIMEOUT>(),
+                        collect_dbg_info2.cast(),
+                        size_of::<DXGKARG_COLLECTDBGINFO2>(),
+                    )
+                    || ranges_overlap(
+                        input.TdrPayload.cast_const(),
+                        size_of::<DXGK_TDR_PAYLOAD_ENGINE_TIMEOUT>(),
+                        input.pBuffer.cast_const(),
+                        copy_len,
+                    )
+                    || (!input.pExtension.is_null()
+                        && ranges_overlap(
+                            input.TdrPayload.cast_const(),
+                            size_of::<DXGK_TDR_PAYLOAD_ENGINE_TIMEOUT>(),
+                            input.pExtension.cast(),
+                            size_of::<DXGKARG_COLLECTDBGINFO_EXT>(),
+                        ))
+                    || ranges_overlap(
+                        input.TdrPayload.cast_const(),
+                        size_of::<DXGK_TDR_PAYLOAD_ENGINE_TIMEOUT>(),
+                        adapter_ptr.cast(),
+                        size_of::<AdapterContext>(),
+                    )
+                {
+                    return refuse_os_diagnostic(&COLLECT_DBG_INFO2_REFUSALS, 0x108);
+                }
+                // WDK permits later structures to append fields; read only the
+                // validated 28000 prefix and preserve the input values locally.
+                let mut payload = unsafe { ptr::read(payload_ptr) };
+                if payload.NodeOrdinal != 0
+                    || payload.EngineOrdinal != 0
+                    || payload.NumberOfPendingSuspendRequests != 0
+                    || payload.NumberOfReadyInteractiveHwQueues != 0
+                {
+                    return refuse_os_diagnostic(&COLLECT_DBG_INFO2_REFUSALS, 0x109);
+                }
+                payload.hContext = ptr::null_mut();
+                engine_payload = Some((payload_ptr, payload));
+            }
+            DXGK_TDR_TYPE_VSYNC_TIMEOUT => {
+                let payload_ptr = input.TdrPayload.cast::<DXGK_TDR_PAYLOAD_VSYNC_TIMEOUT>();
+                if input.TdrPayloadSize < size_of::<DXGK_TDR_PAYLOAD_VSYNC_TIMEOUT>() as u32
+                    || !payload_ptr.is_aligned()
+                    || checked_range(
+                        input.TdrPayload.cast_const(),
+                        size_of::<DXGK_TDR_PAYLOAD_VSYNC_TIMEOUT>(),
+                    )
+                    .is_none()
+                    || ranges_overlap(
+                        input.TdrPayload.cast_const(),
+                        size_of::<DXGK_TDR_PAYLOAD_VSYNC_TIMEOUT>(),
+                        collect_dbg_info2.cast(),
+                        size_of::<DXGKARG_COLLECTDBGINFO2>(),
+                    )
+                    || ranges_overlap(
+                        input.TdrPayload.cast_const(),
+                        size_of::<DXGK_TDR_PAYLOAD_VSYNC_TIMEOUT>(),
+                        input.pBuffer.cast_const(),
+                        copy_len,
+                    )
+                    || (!input.pExtension.is_null()
+                        && ranges_overlap(
+                            input.TdrPayload.cast_const(),
+                            size_of::<DXGK_TDR_PAYLOAD_VSYNC_TIMEOUT>(),
+                            input.pExtension.cast(),
+                            size_of::<DXGKARG_COLLECTDBGINFO_EXT>(),
+                        ))
+                    || ranges_overlap(
+                        input.TdrPayload.cast_const(),
+                        size_of::<DXGK_TDR_PAYLOAD_VSYNC_TIMEOUT>(),
+                        adapter_ptr.cast(),
+                        size_of::<AdapterContext>(),
+                    )
+                {
+                    return refuse_os_diagnostic(&COLLECT_DBG_INFO2_REFUSALS, 0x10a);
+                }
+                let payload = unsafe { ptr::read(payload_ptr) };
+                if payload.VidPnSourceId != 0 || payload.LayerIndex != 0 {
+                    return refuse_os_diagnostic(&COLLECT_DBG_INFO2_REFUSALS, 0x10b);
+                }
+            }
+            _ => return refuse_os_diagnostic(&COLLECT_DBG_INFO2_REFUSALS, 0x10c),
+        }
+    }
+
+    // SAFETY: dxgkrnl's adapter handle was checked before forming the reference.
+    let adapter = unsafe { &*adapter_ptr };
+    let report = os_diagnostic_report(Some(adapter), input.TdrType as u32, input.Reason);
+    let extension = DXGKARG_COLLECTDBGINFO_EXT::default();
+
+    // There is no fallible work below this point. Publish only the fully built
+    // local values, leaving every reserved extension field zero.
+    if copy_len != 0 {
+        unsafe {
+            ptr::copy_nonoverlapping(
+                (&report as *const HeliosOsDiagnosticReportV1).cast::<u8>(),
+                input.pBuffer.cast::<u8>(),
+                copy_len,
+            )
+        };
+    }
+    if !input.pExtension.is_null() {
+        unsafe { ptr::write(input.pExtension, extension) };
+    }
+    if let Some((destination, payload)) = engine_payload {
+        unsafe { ptr::write(destination, payload) };
+    }
+    STATUS_SUCCESS
 }
 
 pub(crate) struct EtwAdapterRundown {

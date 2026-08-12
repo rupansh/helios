@@ -492,12 +492,12 @@ pub struct AdapterContext {
     /// Per-adapter ETW admission; its epoch survives stop/start so a stale
     /// pre-stop CAS cannot enter the replacement transport generation.
     pub(crate) etw_rundown: crate::ddi::diag_etw::EtwAdapterRundown,
-    /// Atomic committed-mode publication read by dormant D2 admission. It is
+    /// Atomic committed-mode publication read by D2 admission. It is
     /// adapter-stable across transport replacement and is reset/removed only at
     /// the explicit lifecycle barriers.
     pub(crate) committed_mode: crate::ddi::committed_mode::CommittedModeStorage,
-    /// One stable source-0/plane-0 D2 lifetime owner. The production display
-    /// path cannot reach it while `KMD_D2_OWNER_ENABLED` is false.
+    /// One stable source-0/plane-0 D2 lifetime owner. The display path reaches
+    /// it only through the SURFACE-derived `KMD_D2_OWNER_ENABLED` predicate.
     pub(crate) direct_scanout: crate::ddi::direct_scanout::DirectScanoutRuntime,
     /// Per-adapter native-fence identity, admission, epoch, and population.
     pub(crate) native_fence: Arc<crate::ddi::native_fence::NativeFenceAdapterState>,
@@ -1661,14 +1661,14 @@ impl AdapterContext {
 
     pub(crate) fn control_owner(&self) -> &TransportOwner {
         if !crate::virtio::KMD_D2_OWNER_ENABLED {
-            unreachable!("the canonical control owner is behind the dormant KMD D2 boundary");
+            unreachable!("the canonical control owner requires the WDDM 3.2 D2 package");
         }
         &self.transport_owner
     }
 
-    /// One read gateway for host-resource liveness. The disabled tranche reads
-    /// legacy transport storage exactly as before; the compiled KMD D2 arm reads
-    /// only the canonical owner table and never mirrors a row into that storage.
+    /// One read gateway for host-resource liveness. The active KMD D2 arm reads
+    /// only the canonical owner table and never mirrors a row into legacy
+    /// transport storage.
     pub(crate) fn canonical_resource_is_live(
         &self,
         resource_id: u32,

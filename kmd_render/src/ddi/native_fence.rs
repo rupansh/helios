@@ -45,18 +45,13 @@
 //! pure function in `helios_kmd_logic::native_fence_lifecycle` with host tests.
 //! This file does the pointer work and the atomics.
 //!
-//! # Disabled until the surface flips
+//! # Activated only by the WDDM surface
 //!
-//! Every advertisement here is gated on [`NATIVE_FENCE_ADVERTISED`], which is
-//! false while `ddi::wddm_surface::SURFACE` is `Wddm2_1GpuMmu`. That flip is the
-//! single atomic activation switch for the whole retirement and is its last edit
-//! (`docs/retirement/OWNERSHIP.md` §3), so this dormant source tranche is
-//! internally coherent and unreachable rather than half-advertised. That is not
-//! an activation-readiness or runtime-correctness claim. The DDI slots are
-//! registered regardless:
-//! dxgkrnl does not invoke a WDDM 3.1/3.2 native-fence callback on a 2.1
-//! adapter, and a registered-but-unreached slot is visible in the slot audit
-//! while an unregistered one would have to be rediscovered later.
+//! Every advertisement here is gated on [`NATIVE_FENCE_ADVERTISED`], derived
+//! solely from `ddi::wddm_surface::SURFACE`. The local WDDM 3.2 package therefore
+//! advertises the six registered callbacks atomically with D2 ownership; there
+//! is no independent native-fence activation switch. This source activation is
+//! not deployment, cold-DWM admission, or runtime-correctness evidence.
 //!
 //! # Handle lifetime (`NF-UAF-1`)
 //!

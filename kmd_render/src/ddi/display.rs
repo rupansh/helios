@@ -138,8 +138,9 @@ fn refuse_mpo_present(refusal: MpoPresentRefusal) -> NTSTATUS {
 }
 
 unsafe fn present_mpo_d5(args: &mut DXGKARG_PRESENT, payload: PresentMpoPayload) -> NTSTATUS {
-    // This is the real D5 authority boundary. While false, the raw MPO pointer
-    // carried by `payload` is not dereferenced and no allocation is resolved.
+    // This is the real D5 authority boundary. Outside the exact WDDM 3.2/D2
+    // package, the raw MPO pointer carried by `payload` is not dereferenced and
+    // no allocation is resolved.
     if !crate::virtio::KMD_D2_OWNER_ENABLED {
         return refuse_mpo_present(MpoPresentRefusal::DisabledOwnerBoundary);
     }
@@ -1124,6 +1125,9 @@ unsafe fn dxgkddi_present_inner(
 /// only when both that admission and the producer stream boundary are ready.
 /// There is no timer or producer poll: every promotion/completion signals HPD.
 pub(crate) fn service_windowed_blt(passive: PassiveLevel, adapter: &AdapterContext) {
+    if crate::virtio::KMD_D2_OWNER_ENABLED {
+        return;
+    }
     adapter.with_scanout_lifecycle(passive, |lock| {
         let submit = lock.with_venus_client(|client| {
             let request = adapter
@@ -2014,6 +2018,9 @@ pub(crate) fn process_deferred_vidpn_source_address(
     passive: PassiveLevel,
     adapter: &AdapterContext,
 ) {
+    if crate::virtio::KMD_D2_OWNER_ENABLED {
+        return;
+    }
     let status = adapter.with_scanout_lifecycle(passive, |lock| {
         let raw = adapter.pending_vidpn_allocation.swap(0, Ordering::AcqRel);
         if raw == 0 {

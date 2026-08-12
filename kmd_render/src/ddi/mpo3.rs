@@ -1,10 +1,10 @@
-//! Dormant HPS2 D3 one-primary MPO3 table.
+//! Active HPS2 D3 one-primary MPO3 table for the local D9 source package.
 //! WDK 10.0.28000 ABI; every authority-bearing path is fenced by the D2
-//! compile-time boundary and reaches the exact allocation-object interface.
+//! SURFACE-derived predicate and reaches the exact allocation-object interface.
 
 #![allow(
     dead_code,
-    reason = "D3 remains dormant until the later atomic display-package activation"
+    reason = "D3 keeps bounded diagnostic counters outside the callback surface"
 )]
 
 use core::mem::{align_of, offset_of, size_of};
@@ -442,9 +442,8 @@ pub unsafe extern "C" fn dxgkddi_get_post_composition_caps(
     STATUS_SUCCESS
 }
 
-/// STUB: registered by the frozen §17.6 mandate; unreachable while no
-/// notification flag is set. The profile never requests PostPresentNeeded;
-/// this remains an always-success, counted tripwire if the OS invokes it.
+/// The profile never requests `PostPresentNeeded`, so this notification owns no
+/// mutation. It remains an always-success, counted tripwire if the OS invokes it.
 pub unsafe extern "C" fn dxgkddi_post_multi_plane_overlay_present(
     _h_adapter: IN_CONST_HANDLE,
     p_post: IN_CONST_PDXGKARG_POSTMULTIPLANEOVERLAYPRESENT,

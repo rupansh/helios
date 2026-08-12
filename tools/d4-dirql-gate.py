@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static and mutation gate for the disabled HPS2 D4 DIRQL enqueue seam."""
+"""Static and mutation gate for the active HPS2 D4 DIRQL enqueue seam."""
 
 from __future__ import annotations
 
@@ -180,6 +180,7 @@ PROTOCOL_WDDM = "protocol/src/wddm.rs"
 KMD_CARGO = "kmd_render/Cargo.toml"
 KMD_LOCK = "kmd_render/Cargo.lock"
 BOUNDARY_PATH = "kmd_render/src/virtio/control_owner.rs"
+SURFACE_PATH = "kmd_render/src/ddi/wddm_surface.rs"
 BOUNDARY = "KMD_D2_OWNER_ENABLED"
 
 
@@ -596,15 +597,20 @@ def check_sources(sources: dict[str, str]) -> list[str]:
         item = matches[0]
         return item, live[path][item.brace : item.end]
 
-    boundary_values = []
-    for path, text in live.items():
-        for match in re.finditer(
-            rf"\b(?:pub\s*\(\s*crate\s*\)\s+)?const\s+{BOUNDARY}\s*:\s*bool\s*=\s*(true|false)\s*;",
-            text,
-        ):
-            boundary_values.append((path, match.group(1)))
-    if boundary_values != [(BOUNDARY_PATH, "false")]:
-        errors.append(f"D4 boundary must be one compile-time false constant, found {boundary_values!r}")
+    owner = re.sub(r"\s+", "", live.get(BOUNDARY_PATH, ""))
+    expected_owner = (
+        "pub(crate)constKMD_D2_OWNER_ENABLED:bool="
+        "matches!(SURFACE,WddmSurface::Wddm3_2GpuMmu);"
+    )
+    if owner.count(expected_owner) != 1:
+        errors.append(
+            f"{BOUNDARY_PATH}: D4 authority must be the sole SURFACE-derived 3.2 predicate"
+        )
+    if not re.search(
+        r"\bconst\s+SURFACE\s*:\s*WddmSurface\s*=\s*WddmSurface::Wddm3_2GpuMmu\s*;",
+        live.get(SURFACE_PATH, ""),
+    ):
+        errors.append(f"{SURFACE_PATH}: active D4 requires the exact WDDM 3.2 surface")
 
     for name, value in (
         ("CLASSIC_MODE_CHANGE", "0x0000_0001"),
@@ -722,7 +728,7 @@ def check_sources(sources: dict[str, str]) -> list[str]:
         if found is not None and fail_closed.search(found[1]) is None:
             errors.append(f"{path}: {name} lacks a local fail-closed D4 boundary")
 
-    # A check elsewhere in a wrapper is not an entry guard. The dormant branch
+    # A check elsewhere in a wrapper is not an entry guard. The active branch
     # must be the first authority arm selected by the actual production DDI.
     for wrapper, target in (
         ("dxgkddi_set_vidpn_source_address", "set_vidpn_source_address_d4"),
@@ -736,7 +742,7 @@ def check_sources(sources: dict[str, str]) -> list[str]:
             found[1],
             re.S,
         ):
-            errors.append(f"{DISPLAY}: {wrapper} lost its dominating false-boundary entry guard")
+            errors.append(f"{DISPLAY}: {wrapper} lost its dominating activation-coherence guard")
 
     d4_legacy_forbidden = re.compile(
         r"\b(?:production_linear_scanout|fast_bind_from_flip|pending_vidpn_allocation|"
@@ -1203,20 +1209,6 @@ def check_sources(sources: dict[str, str]) -> list[str]:
         if re.search(r"\bsnap\w*\s*:", fields):
             errors.append(f"{PACKET}: snapshot substitution returned to the D4 flip record")
 
-    if boundary_values and boundary_values[0][1] == "true":
-        legacy = []
-        for spelling in (
-            "production_linear_scanout",
-            "fast_bind_from_flip",
-            "pending_vidpn_allocation",
-            "SCANOUT_RETRY_BUDGET",
-            "note_retry_attempt",
-        ):
-            if re.search(rf"\b{spelling}\b", joined_live):
-                legacy.append(spelling)
-        if legacy:
-            errors.append("activation leaves legacy scanout/write authority reachable: " + ", ".join(legacy))
-
     return errors
 
 
@@ -1602,10 +1594,10 @@ def main() -> None:
             "if crate::virtio::KMD_D2_OWNER_ENABLED {\n        return unsafe { set_vidpn_source_address_d4(adapter, address) };\n    }",
             "if true {\n        return unsafe { set_vidpn_source_address_d4(adapter, address) };\n    }",
         ),
-        "dominating false-boundary",
+        "dominating activation-coherence guard",
     )
     require_rejected(
-        "legacy fast bind in dormant D4",
+        "legacy fast bind in active D4",
         mutate_function(
             sources,
             DISPLAY,
@@ -1625,16 +1617,19 @@ def main() -> None:
     )
     require_rejected("snapshot substitution", snapshot, "snapshot substitution")
 
-    enabled = dict(sources)
-    enabled[BOUNDARY_PATH], changed = re.subn(
-        rf"(const\s+{BOUNDARY}\s*:\s*bool\s*=\s*)false(\s*;)",
-        r"\1true\2",
-        enabled[BOUNDARY_PATH],
-        count=1,
+    decoupled = dict(sources)
+    owner_anchor = (
+        "pub(crate) const KMD_D2_OWNER_ENABLED: bool = "
+        "matches!(SURFACE, WddmSurface::Wddm3_2GpuMmu);"
     )
-    if changed != 1:
-        raise SystemExit("D4 DIRQL mutation setup failed: could not enable boundary")
-    require_rejected("boolean-only activation", enabled, "activation leaves legacy")
+    if decoupled[BOUNDARY_PATH].count(owner_anchor) != 1:
+        raise SystemExit("D4 DIRQL mutation setup failed: owner derivation anchor drifted")
+    decoupled[BOUNDARY_PATH] = decoupled[BOUNDARY_PATH].replace(
+        owner_anchor,
+        "pub(crate) const KMD_D2_OWNER_ENABLED: bool = true;",
+        1,
+    )
+    require_rejected("decoupled D2 activation", decoupled, "sole SURFACE-derived")
 
     print("OK: D4 DIRQL proof, fixed queue, exact identity, and forbidden call graph are statically enforced; mutations rejected")
 

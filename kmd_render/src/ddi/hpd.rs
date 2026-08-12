@@ -225,9 +225,9 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             indicate_child_status(adapter, true);
         }
 
-        // Dormant D2 candidates are published by bounded display DDIs and have
-        // exactly one PASSIVE continuation. The false owner boundary keeps this
-        // call inert in the production legacy branch.
+        // D2 candidates are published by bounded display DDIs and have exactly
+        // one PASSIVE continuation. The following legacy continuations refuse
+        // locally while the SURFACE-derived D2 owner is active.
         crate::ddi::direct_scanout::service_pending(passive, adapter);
 
         // Consume only the allocation identity supplied by Windows through

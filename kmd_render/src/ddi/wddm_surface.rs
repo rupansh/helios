@@ -19,18 +19,16 @@
 //!   as a named level because it is the documented recovery shape, but on Windows
 //!   11 24H2 it commits the enumerated monitor as a zero-path/powered-off VidPn,
 //!   so it is not deployable with the display half active.
-//! - **2.1 + GpuMmu** — **the production level**. Modern GPU-virtual-addressing /
-//!   GpuMmu memory model (which is what enables the monitored-fence path
-//!   `D3DDDI_MONITORED_FENCE` needs), but below the MPO3 requirement boundary.
-//! - **3.2 + GpuMmu** — DWM treats a WDDM 2.2+ display adapter as a
-//!   Display-Core/MPO3 presentation device. Helios does not register the MPO3 KMD
-//!   interface, so at 3.2 DWM calls `CDDisplaySwapChain`'s unimplemented legacy
-//!   present slot and fails fast with `E_NOTIMPL`.
+//! - **2.1 + GpuMmu** — the historical production and current recovery level.
+//!   It provides the GPU-virtual-addressing / GpuMmu memory model needed by
+//!   `D3DDDI_MONITORED_FENCE`, but stays below the MPO3 requirement boundary.
+//! - **3.2 + GpuMmu** — the D9 source package. It is selected only with the
+//!   complete D2-D5 display table, truthful MPO capability, terminal slot audit,
+//!   and native-fence table. Runtime cold-DWM admission remains a separate gate.
 //!
 //! ⚠ The 2.1 level is why `RAISE_WDDM_3_2_GPUMMU` was a misleading name: with both
-//! old bools `true` the adapter advertised `DXGKDDI_WDDMv2_1`, not 3.2. CLAUDE.md's
-//! "WDDM 3.2 miniport" describes the DDI table's ABI shape (the bindgen structs are
-//! the 26100/3.2 ones), not the level this reports.
+//! old bools `true` the adapter advertised `DXGKDDI_WDDMv2_1`, not 3.2. The
+//! binding and generated audit now use the exact WDK 28000 table shape.
 
 use crate::dxgk::_DXGK_WDDMVERSION::{DXGKDDI_WDDMv1_3, DXGKDDI_WDDMv2_1, DXGKDDI_WDDMv3_2};
 use crate::dxgk::{
@@ -50,7 +48,7 @@ use crate::dxgk::{
 pub(crate) enum WddmSurface {
     /// Bring-up / recovery: WDDM 1.3, no explicit memory model.
     Wddm1_3,
-    /// Production: WDDM 2.1 with the GpuMmu (GPU virtual addressing) memory model.
+    /// Historical production / recovery: WDDM 2.1 with the GpuMmu memory model.
     Wddm2_1GpuMmu,
     /// WDDM 3.2 + GpuMmu. Crosses the MPO3 boundary — see the module docs.
     Wddm3_2GpuMmu,
@@ -59,9 +57,11 @@ pub(crate) enum WddmSurface {
 /// **The** surface level. Changing this line changes all five sites at once, which
 /// is the entire point of the type.
 ///
-/// Kept at 2.1 + GpuMmu: the `DisplayHalf` activation commit was proven on this
-/// modern memory model, and 3.2 fails DWM at `E_NOTIMPL` (module docs).
-pub(crate) const SURFACE: WddmSurface = WddmSurface::Wddm2_1GpuMmu;
+/// D9 selects 3.2 only together with the complete D2/D3/D4/D5 table, native
+/// fences, terminal slot audit, truthful MPO capability, and the cold-DWM
+/// admission harness. This source package is deliberately not a 2.1 fallback;
+/// runtime admission remains a separate deployment gate.
+pub(crate) const SURFACE: WddmSurface = WddmSurface::Wddm3_2GpuMmu;
 
 impl WddmSurface {
     /// `DRIVER_INITIALIZATION_DATA.Version` — the PRIMARY lever. The OS infers the

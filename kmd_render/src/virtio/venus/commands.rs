@@ -209,7 +209,7 @@ impl VenusClient {
             flags |= VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE;
         }
         // The VkDeviceMemory handle IS the virtio blob_id for a KMD-created
-        // blob. Under dormant KMD D2, transfer its finalizer into the canonical
+        // blob. Under active KMD D2, transfer its finalizer into the canonical
         // resource row before CREATE can become ambiguous. The callback uses
         // this already-held Venus client, so it neither recurses into the mutex
         // nor runs under the owner spinlock.

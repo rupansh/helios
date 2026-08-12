@@ -16,8 +16,9 @@
 //!    from the audited one is a build failure rather than a short struct handed
 //!    to a longer-expecting dxgkrnl (`STATUS_REVISION_MISMATCH`).
 //! 2. **Classification.** [`SLOTS`] carries every slot through WDDM 3.2 as
-//!    `Implemented`/`Retiring` (registered today), or `Disabled`/`Pending`
-//!    (NULL today) with the truthful zero capability that makes it unreachable.
+//!    terminal `Implemented` or `Disabled`. The generator retains the two
+//!    pre-D9 transition classes, but the D9 activation gate requires zero rows
+//!    of either class.
 //! 3. **Agreement.** [`verify`] walks the table `build_ddi_table()` actually
 //!    produced and checks each slot's pointer word against its class. A
 //!    disagreement fails `DriverEntry` — a registered slot that the audit calls
@@ -33,6 +34,10 @@ use core::mem::{offset_of, size_of};
 use crate::dxgk::DRIVER_INITIALIZATION_DATA;
 
 /// How a slot is expected to appear in the built table.
+#[allow(
+    dead_code,
+    reason = "generator supports pre-D9 transition tables; the D9 gate requires zero rows"
+)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SlotClass {
     /// Registered and backed by a real implementation. Must be non-NULL.
@@ -40,23 +45,9 @@ pub(crate) enum SlotClass {
     /// Deliberately unregistered, and unreachable because the capability that
     /// would reach it is reported as zero/absent. Must be NULL.
     Disabled,
-    /// Unregistered **today**; a named lane of the retirement will register it.
-    /// Verified exactly like `Disabled` — NULL is the fail-closed state — but
-    /// the reason names the owner so reclassification is a one-row TSV edit.
+    /// Pre-D9 transition: unregistered and verified like [`Self::Disabled`].
     Pending,
-    /// Registered **today**, and a named lane of the retirement will delete it.
-    /// The mirror of [`Self::Pending`], and it exists for the same reason: this
-    /// table describes the driver that is built, not the driver that is
-    /// intended.
-    ///
-    /// ⚠ **Without this class the audit cannot be armed at all.** Eight slots
-    /// the retirement ends up disabling are live in `build_ddi_table()` right
-    /// now, so classifying them `Disabled` — the state they will reach — makes
-    /// [`verify`] refuse a correct driver, and the only ways out are to not run
-    /// the audit or to delete eight subsystems in one commit. Verified exactly
-    /// like `Implemented` (non-NULL is the correct state today); the reason
-    /// names the lane that will flip it to `Disabled`, and that flip is one
-    /// word per row.
+    /// Pre-D9 transition: registered and verified like [`Self::Implemented`].
     Retiring,
 }
 
@@ -333,8 +324,8 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         name: "DxgkDdiEscape",
         offset: 272,
         min_version: "BASE",
-        class: SlotClass::Retiring,
-        reason: "Section 17.6:4494 and 18.1:4667 delete the Escape entry point, but escape.rs is live today (diagnostic counters, scanout timeline). RETIRING: flips to Disabled when the host/tools lane deletes escape.rs and its consumers.",
+        class: SlotClass::Disabled,
+        reason: "D9 leaves the WDDM 3.2 initialization slot NULL. No replacement Escape, IOCTL, registry, mapped-page, ticket, name, or discovery channel is advertised; wider K1 source demolition remains a later all-or-nothing retirement gate.",
     },
     SlotAudit {
         name: "DxgkDdiCollectDbgInfo",
@@ -824,14 +815,14 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         offset: 832,
         min_version: "WDDM2_1",
         class: SlotClass::Implemented,
-        reason: "Dormant D3 exact-allocation one-primary validator; SupportMultiPlaneOverlay and KMD_D2_OWNER_ENABLED remain false.",
+        reason: "Active D3 exact-allocation one-primary validator; unsupported shapes return a reserved-clean false result.",
     },
     SlotAudit {
         name: "DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3",
         offset: 840,
         min_version: "WDDM2_1",
         class: SlotClass::Implemented,
-        reason: "Dormant D3 PASSIVE-retry binder over the D2 candidate/parking state; both activation gates remain false.",
+        reason: "Active D3 PASSIVE-retry binder over the D2 candidate and parking state; the D2 predicate derives solely from SURFACE.",
     },
     SlotAudit {
         name: "DxgkDdiPostMultiPlaneOverlayPresent",
@@ -845,7 +836,7 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         offset: 856,
         min_version: "WDDM2_1",
         class: SlotClass::Implemented,
-        reason: "Dormant D3 exact-allocation validation; all property mutations are rejected.",
+        reason: "Active D3 exact-allocation validation; all property mutations are rejected.",
     },
     SlotAudit {
         name: "DxgkDdiControlModeBehavior",
@@ -865,43 +856,43 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         name: "DxgkDdiCreateHwContext",
         offset: 880,
         min_version: "WDDM2_2",
-        class: SlotClass::Retiring,
-        reason: "Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.",
+        class: SlotClass::Disabled,
+        reason: "D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero.",
     },
     SlotAudit {
         name: "DxgkDdiDestroyHwContext",
         offset: 888,
         min_version: "WDDM2_2",
-        class: SlotClass::Retiring,
-        reason: "Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.",
+        class: SlotClass::Disabled,
+        reason: "D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero.",
     },
     SlotAudit {
         name: "DxgkDdiCreateHwQueue",
         offset: 896,
         min_version: "WDDM2_2",
-        class: SlotClass::Retiring,
-        reason: "Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.",
+        class: SlotClass::Disabled,
+        reason: "D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero.",
     },
     SlotAudit {
         name: "DxgkDdiDestroyHwQueue",
         offset: 904,
         min_version: "WDDM2_2",
-        class: SlotClass::Retiring,
-        reason: "Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.",
+        class: SlotClass::Disabled,
+        reason: "D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero.",
     },
     SlotAudit {
         name: "DxgkDdiSubmitCommandToHwQueue",
         offset: 912,
         min_version: "WDDM2_2",
-        class: SlotClass::Retiring,
-        reason: "Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.",
+        class: SlotClass::Disabled,
+        reason: "D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero.",
     },
     SlotAudit {
         name: "DxgkDdiSwitchToHwContextList",
         offset: 920,
         min_version: "WDDM2_2",
-        class: SlotClass::Retiring,
-        reason: "Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.",
+        class: SlotClass::Disabled,
+        reason: "D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero.",
     },
     SlotAudit {
         name: "DxgkDdiResetHwEngine",
@@ -985,14 +976,14 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         offset: 1016,
         min_version: "WDDM2_2",
         class: SlotClass::Implemented,
-        reason: "Dormant D3 exact one-RGB-plane caps, refused while KMD_D2_OWNER_ENABLED is false.",
+        reason: "Active D3 exact one-RGB-plane caps; all YUV, transform, scaling, and additional-plane authority remains zero.",
     },
     SlotAudit {
         name: "DxgkDdiGetPostCompositionCaps",
         offset: 1024,
         min_version: "WDDM2_2",
         class: SlotClass::Implemented,
-        reason: "Dormant D3 unity-only post-composition caps, refused while KMD_D2_OWNER_ENABLED is false.",
+        reason: "Active D3 unity-only post-composition caps; no post-composition transform or scaling authority is advertised.",
     },
     SlotAudit {
         name: "DxgkDdiUpdateHwContextState",
@@ -1082,15 +1073,15 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         name: "DxgkDdiQueryDiagnosticTypesSupport",
         offset: 1128,
         min_version: "WDDM2_4",
-        class: SlotClass::Pending,
-        reason: "KMD ETW/diagnostics lane. Display brief section 6 item 11: if CollectDiagnosticInfo proves unreachable without this slot, it must be implemented and the evidence recorded.",
+        class: SlotClass::Disabled,
+        reason: "The WDK 28000 WDDM 2.4 contract covers only PSR notification and SyncLock progression types. Helios supports neither category and leaves this slot NULL; black-screen collection is the independent CollectDiagnosticInfo contract.",
     },
     SlotAudit {
         name: "DxgkDdiControlDiagnosticReporting",
         offset: 1136,
         min_version: "WDDM2_4",
-        class: SlotClass::Pending,
-        reason: "KMD ETW/diagnostics lane. Sibling of QueryDiagnosticTypesSupport; classified explicitly per display brief section 6 item 11.",
+        class: SlotClass::Disabled,
+        reason: "The WDK 28000 WDDM 2.4 contract controls only the PSR and SyncLock diagnostic types that Helios truthfully reports unsupported, so this slot remains NULL.",
     },
     SlotAudit {
         name: "DxgkDdiResumeHwEngine",
@@ -1110,8 +1101,8 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         name: "DxgkDdiPresentToHwQueue",
         offset: 1160,
         min_version: "WDDM2_5",
-        class: SlotClass::Retiring,
-        reason: "Section 17.6:4385: HWS/HWQueue is not advertised, so the family is unreachable — but the slot is registered today. RETIRING: flips to Disabled when the KMD-core lane unregisters the hardware-scheduling family.",
+        class: SlotClass::Disabled,
+        reason: "D9 unregisters the complete hardware-context and hardware-queue family; hardware flip queues and every HwQueuePacketCap bit remain zero.",
     },
     SlotAudit {
         name: "DxgkDdiValidateSubmitCommand",
@@ -1152,8 +1143,8 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         name: "DxgkDdiCollectDiagnosticInfo",
         offset: 1208,
         min_version: "WDDM2_6",
-        class: SlotClass::Pending,
-        reason: "KMD ETW/diagnostics lane (section 17.6:4483); C42 requires the WDDM 2.7+ black-screen diagnostic type.",
+        class: SlotClass::Implemented,
+        reason: "C42 bounded PASSIVE snapshot callback with optional AddDevice adapter context and required WDDM 2.7 black-screen support; validates the WDK 28000 input before publishing strings, size, or bytes.",
     },
     SlotAudit {
         name: "Reserved3",
@@ -1425,8 +1416,8 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         name: "DxgkDdiCollectDbgInfo2",
         offset: 1520,
         min_version: "WDDM3_2",
-        class: SlotClass::Pending,
-        reason: "KMD ETW/diagnostics lane (section 17.6:4483).",
+        class: SlotClass::Implemented,
+        reason: "C42 WDDM 3.2 TDR callback validates reason, TDR enum, optional versioned payload, pointer-size coherence, alignment, and IRQL before publishing a bounded snapshot or extension output.",
     },
     SlotAudit {
         name: "DxgkDdiNotifyContextPriorityChange",

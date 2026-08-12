@@ -1722,7 +1722,7 @@ struct SyncScanoutBind {
     seq: u64,
     resource_id: u32,
     /// Unique standard virtio-gpu fence carried by this SET. Zero preserves
-    /// the production legacy SET shape; only dormant D2 requests a fence.
+    /// the legacy SET shape; only the SURFACE-derived D2 owner requests a fence.
     fence_id: u64,
     /// Present only for a direct-primary worker SET. Disable/fallback SETs
     /// still carry their resource/sequence into the host-selection ledger but

@@ -735,6 +735,9 @@ impl AdapterContext {
         &self,
         passive: PassiveLevel,
     ) -> ScanoutRefreshQueue {
+        if crate::virtio::KMD_D2_OWNER_ENABLED {
+            return ScanoutRefreshQueue::Dropped;
+        }
         let outcome = self.with_scanout_lifecycle(passive, |lock| {
             self.queue_active_scanout_refresh_locked(lock)
         });

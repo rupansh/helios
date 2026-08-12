@@ -62,6 +62,7 @@ pub use create_allocation::{
     dxgkddi_destroy_allocation, dxgkddi_get_standard_allocation_driver_data,
     dxgkddi_open_allocation,
 };
+pub use diag_etw::{dxgkddi_collect_dbg_info2, dxgkddi_collect_diagnostic_info};
 pub(crate) use display::VIDPN_SOURCE_ADDRESS_COUNT;
 pub use display::{
     diag_dump_present_atomics, dxgkddi_commit_vidpn, dxgkddi_enum_vidpn_cofunc_modality,
@@ -73,7 +74,6 @@ pub use display::{
     dxgkddi_system_display_write, dxgkddi_update_active_vidpn_present_path,
     dxgkddi_update_monitor_link_info,
 };
-pub use escape::dxgkddi_escape;
 pub use interrupt::{dxgkddi_control_interrupt, dxgkddi_dpc_routine, dxgkddi_interrupt_routine};
 pub use lifecycle::{
     dxgkddi_dispatch_io_request, dxgkddi_remove_device, dxgkddi_set_power_state,
@@ -93,14 +93,29 @@ pub use native_fence::{
 };
 pub use query_adapter_info::{dxgkddi_get_node_metadata, dxgkddi_query_adapter_info};
 pub use scheduler::{
-    dxgkddi_calibrate_gpu_clock, dxgkddi_cancel_command, dxgkddi_create_hw_context,
-    dxgkddi_create_hw_queue, dxgkddi_destroy_hw_context, dxgkddi_destroy_hw_queue,
-    dxgkddi_format_history_buffer, dxgkddi_power_runtime_control_request,
-    dxgkddi_power_runtime_set_device_handle, dxgkddi_present_to_hw_queue,
+    dxgkddi_calibrate_gpu_clock, dxgkddi_cancel_command, dxgkddi_format_history_buffer,
+    dxgkddi_power_runtime_control_request, dxgkddi_power_runtime_set_device_handle,
     dxgkddi_query_dependent_engine_group, dxgkddi_query_engine_status, dxgkddi_reset_engine,
     dxgkddi_set_stable_power_state, dxgkddi_set_virtual_machine_data,
-    dxgkddi_submit_command_to_hw_queue, dxgkddi_switch_to_hw_context_list,
 };
+// D9 unregisters Escape and the complete HW-context/HW-queue family while the
+// wider K1/D6-D8 source demolition remains a later tranche. Referencing each
+// function item here keeps that unreachable source type-checked without
+// exporting it or making it a DRIVER_INITIALIZATION_DATA entry.
+#[allow(
+    dead_code,
+    reason = "D9 table-disabled legacy source retained for later demolition"
+)]
+fn typecheck_d9_disabled_legacy_callbacks() {
+    let _ = escape::dxgkddi_escape;
+    let _ = scheduler::dxgkddi_create_hw_context;
+    let _ = scheduler::dxgkddi_destroy_hw_context;
+    let _ = scheduler::dxgkddi_create_hw_queue;
+    let _ = scheduler::dxgkddi_destroy_hw_queue;
+    let _ = scheduler::dxgkddi_submit_command_to_hw_queue;
+    let _ = scheduler::dxgkddi_switch_to_hw_context_list;
+    let _ = scheduler::dxgkddi_present_to_hw_queue;
+}
 pub(crate) use submit_command::{
     abandon_pending_submissions, record_present_handoff_telemetry, AbandonOutcome,
     ABANDONED_FENCES, DMA_STALE_SKIP_COUNT,

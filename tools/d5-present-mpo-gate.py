@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static and mutation gate for the disabled HPS2 D5 MPO Present arm."""
+"""Static and mutation gate for the active HPS2 D5 MPO Present arm."""
 
 from __future__ import annotations
 
@@ -141,34 +141,20 @@ def check_sources(sources: dict[str, str]) -> list[str]:
     live = {path: live_rust(source) for path, source in sources.items()}
     joined_live = "\n".join(live.values())
 
-    boundary_values = re.findall(
-        rf"\bconst\s+{BOUNDARY}\s*:\s*bool\s*=\s*(true|false)\s*;",
-        live.get(BOUNDARY_PATH, ""),
+    owner = compact(live.get(BOUNDARY_PATH, ""))
+    expected_owner = (
+        "pub(crate)constKMD_D2_OWNER_ENABLED:bool="
+        "matches!(SURFACE,WddmSurface::Wddm3_2GpuMmu);"
     )
-    if boundary_values != ["false"]:
-        errors.append(f"{BOUNDARY_PATH}: D5 requires one false {BOUNDARY}")
+    if owner.count(expected_owner) != 1:
+        errors.append(
+            f"{BOUNDARY_PATH}: D5 authority must be the sole SURFACE-derived 3.2 predicate"
+        )
     if not re.search(
-        r"\bconst\s+SURFACE\s*:\s*WddmSurface\s*=\s*WddmSurface::Wddm2_1GpuMmu\s*;",
+        r"\bconst\s+SURFACE\s*:\s*WddmSurface\s*=\s*WddmSurface::Wddm3_2GpuMmu\s*;",
         live.get(SURFACE_PATH, ""),
     ):
-        errors.append(f"{SURFACE_PATH}: D5 must not raise the WDDM surface")
-    if boundary_values == ["true"]:
-        legacy = [
-            name
-            for name in (
-                "production_linear_scanout",
-                "fast_bind_from_flip",
-                "service_windowed_blt",
-                "queue_active_scanout_refresh",
-                "arm_scanout_refresh_after_current_venus",
-            )
-            if re.search(rf"\b{re.escape(name)}\b", joined_live)
-        ]
-        if legacy:
-            errors.append(
-                "D5 boolean-only activation leaves legacy display/host-write authority reachable: "
-                + ", ".join(legacy)
-            )
+        errors.append(f"{SURFACE_PATH}: active D5 requires the exact WDDM 3.2 surface")
 
     bodies: dict[tuple[str, str], tuple[str, str]] = {}
     for key in CALL_MANIFEST:
@@ -188,7 +174,7 @@ def check_sources(sources: dict[str, str]) -> list[str]:
         prepare_at = handler_compact.find("payload.prepare_mpo_present(args)")
         emit_at = handler_compact.find("plan.emit_mpo_present(args)")
         if guard_at < 0 or prepare_at < 0 or not (guard_at < prepare_at):
-            errors.append(f"{DISPLAY}: D5 entry lost its dominating false-owner guard")
+            errors.append(f"{DISPLAY}: D5 entry lost its dominating activation-coherence guard")
         if not (0 <= prepare_at < emit_at):
             errors.append(f"{DISPLAY}: D5 packet emission is not dominated by complete prepare")
         prefix = handler_compact[: max(guard_at, 0)]
@@ -540,16 +526,19 @@ def main() -> None:
     if errors:
         raise SystemExit("D5 MPO Present boundary violated:\n" + "\n".join(errors))
 
-    enabled = dict(sources)
-    enabled[BOUNDARY_PATH], changed = re.subn(
-        rf"(const\s+{BOUNDARY}\s*:\s*bool\s*=\s*)false(\s*;)",
-        r"\1true\2",
-        enabled[BOUNDARY_PATH],
-        count=1,
+    decoupled = dict(sources)
+    owner_anchor = (
+        "pub(crate) const KMD_D2_OWNER_ENABLED: bool = "
+        "matches!(SURFACE, WddmSurface::Wddm3_2GpuMmu);"
     )
-    if changed != 1:
-        raise SystemExit("D5 MPO mutation setup failed: could not enable owner boundary")
-    require_rejected("boolean-only activation", enabled, "boolean-only activation")
+    if decoupled[BOUNDARY_PATH].count(owner_anchor) != 1:
+        raise SystemExit("D5 MPO mutation setup failed: owner derivation anchor drifted")
+    decoupled[BOUNDARY_PATH] = decoupled[BOUNDARY_PATH].replace(
+        owner_anchor,
+        "pub(crate) const KMD_D2_OWNER_ENABLED: bool = true;",
+        1,
+    )
+    require_rejected("decoupled D2 activation", decoupled, "sole SURFACE-derived")
 
     guard = (
         "if !crate::virtio::KMD_D2_OWNER_ENABLED {\n"
@@ -559,7 +548,7 @@ def main() -> None:
     require_rejected(
         "entry guard removal",
         replace_in_function(sources, DISPLAY, "present_mpo_d5", guard, "if false { return STATUS_NOT_SUPPORTED; }"),
-        "dominating false-owner guard",
+        "dominating activation-coherence guard",
     )
     require_rejected(
         "non-dominating decoy guard",
@@ -570,7 +559,7 @@ def main() -> None:
             guard,
             "if !crate::virtio::KMD_D2_OWNER_ENABLED { let _ = false; }",
         ),
-        "dominating false-owner guard",
+        "dominating activation-coherence guard",
     )
     require_rejected(
         "MPO pAllocationList direct read",
@@ -899,7 +888,7 @@ def main() -> None:
     )
 
     print(
-        "OK: disabled D5 MPO Present guard, exact one-plane allocation provenance, "
+        "OK: active D5 MPO Present guard, exact one-plane allocation provenance, "
         "ordinary packet, no-lease closure, D4 proof, and mutations are enforced"
     )
 

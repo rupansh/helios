@@ -1,4 +1,4 @@
-//! Disabled KMD runtime for the pure control-owner model.
+//! KMD runtime for the pure control-owner model.
 //! Identity descends from the unique transport domain; the adapter address is
 //! only a one-shot construction guard and grants no authority.
 
@@ -30,6 +30,7 @@ use helios_kmd_logic::control_ownership::{
 };
 
 use crate::adapter::AdapterContext;
+use crate::ddi::wddm_surface::{WddmSurface, SURFACE};
 use crate::sync::SpinLock;
 
 static TRANSPORT_DOMAIN_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
@@ -46,10 +47,11 @@ const STORAGE_DIAG_BASE: u32 = 0x0A00_00E6;
 const TRANSITION_DIAG_BASE: u32 = 0x0A00_00F0;
 const _: () = assert!(TRANSITION_DIAG_BASE > STORAGE_DIAG_BASE + 8);
 
-/// The later atomic activation boundary changes this one value and removes the
-/// legacy tables in the same change. Until then the complete owner path is
-/// compiled but no production command can enter it.
-pub(crate) const KMD_D2_OWNER_ENABLED: bool = false;
+/// Compatibility name for the D2 authority predicate used throughout the
+/// already-reviewed D2-D5 call graph. It is intentionally not a second switch:
+/// D9 leaves [`SURFACE`] as the sole durable activation authority, making a
+/// mixed WDDM/D2 state unconstructible.
+pub(crate) const KMD_D2_OWNER_ENABLED: bool = matches!(SURFACE, WddmSurface::Wddm3_2GpuMmu);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TransportOwnerCreateError {

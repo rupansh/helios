@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static and executable-mutation gate for the dormant K7 native-fence surface."""
+"""Static and executable-mutation gate for the active K7 native-fence surface."""
 
 from __future__ import annotations
 
@@ -134,17 +134,18 @@ def check_sources(sources: dict[str, str]) -> list[str]:
     errors.extend(f"D4: {error}" for error in d4_check_sources(sources))
     errors.extend(f"D5: {error}" for error in d5_check_sources(sources))
 
-    owner_defs = re.findall(
-        r"\bconst\s+KMD_D2_OWNER_ENABLED\s*:\s*bool\s*=\s*(true|false)\s*;",
-        live.get(OWNER, ""),
+    owner = compact_live.get(OWNER, "")
+    expected_owner = (
+        "pub(crate)constKMD_D2_OWNER_ENABLED:bool="
+        "matches!(SURFACE,WddmSurface::Wddm3_2GpuMmu);"
     )
-    if owner_defs != ["false"]:
-        errors.append(f"{OWNER}: K7 requires exactly one false KMD_D2_OWNER_ENABLED")
+    if owner.count(expected_owner) != 1:
+        errors.append(f"{OWNER}: K7 authority must be the sole SURFACE-derived 3.2 predicate")
     if not re.search(
-        r"\bconst\s+SURFACE\s*:\s*WddmSurface\s*=\s*WddmSurface::Wddm2_1GpuMmu\s*;",
+        r"\bconst\s+SURFACE\s*:\s*WddmSurface\s*=\s*WddmSurface::Wddm3_2GpuMmu\s*;",
         live.get(SURFACE, ""),
     ):
-        errors.append(f"{SURFACE}: K7 must retain Wddm2_1GpuMmu")
+        errors.append(f"{SURFACE}: active K7 requires the exact WDDM 3.2 surface")
 
     native = compact_live.get(NATIVE, "")
     advertised = (
@@ -715,8 +716,13 @@ class Mutation:
 
 def mutation_cases() -> tuple[Mutation, ...]:
     return (
-        Mutation("raise SURFACE", SURFACE, "WddmSurface::Wddm2_1GpuMmu", "WddmSurface::Wddm3_2GpuMmu"),
-        Mutation("enable D2 owner", OWNER, "KMD_D2_OWNER_ENABLED: bool = false", "KMD_D2_OWNER_ENABLED: bool = true"),
+        Mutation("lower SURFACE", SURFACE, "WddmSurface::Wddm3_2GpuMmu;", "WddmSurface::Wddm2_1GpuMmu;"),
+        Mutation(
+            "decouple D2 owner",
+            OWNER,
+            "pub(crate) const KMD_D2_OWNER_ENABLED: bool = matches!(SURFACE, WddmSurface::Wddm3_2GpuMmu);",
+            "pub(crate) const KMD_D2_OWNER_ENABLED: bool = true;",
+        ),
         Mutation("decoy activation switch", NATIVE, "pub(crate) const NATIVE_FENCE_ADVERTISED", "const NATIVE_FENCE_ENABLED: bool = true;\npub(crate) const NATIVE_FENCE_ADVERTISED"),
         Mutation("bypass caps admission", NATIVE, "    let admitted = unsafe { ensure_feature_admitted(adapter) }\n        && native_fence_admitted(adapter.native_fence.as_ref());", "    let admitted = true;"),
         Mutation("unaligned caps output", NATIVE, "        || !(args.pOutputData as *mut DXGK_NATIVE_FENCE_CAPS).is_aligned()\n", ""),
@@ -795,12 +801,12 @@ def main() -> None:
     sources = load_sources(repo)
     errors = check_sources(sources)
     if errors:
-        raise SystemExit("dormant K7 native-fence gate violated:\n" + "\n".join(errors))
+        raise SystemExit("active K7 native-fence gate violated:\n" + "\n".join(errors))
     if mutations:
         run_mutations(sources)
     else:
         print(
-            "OK: dormant K7 admission, caps, handle lifetime, updates, interrupts, "
+            "OK: active K7 admission, caps, handle lifetime, updates, interrupts, "
             "lifecycle, and D4/D5 closure are statically enforced"
         )
 

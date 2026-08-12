@@ -142,7 +142,7 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     let mut data: DRIVER_INITIALIZATION_DATA = unsafe { core::mem::zeroed() };
 
     // Advertise the interface level that matches the implemented table. The WDK
-    // 10.0.26100 `DXGKDDI_INTERFACE_VERSION` macro is WDDM 3.2; exposing that
+    // WDK 10.0.28000 `DXGKDDI_INTERFACE_VERSION` macro is WDDM 3.2; exposing that
     // while most WDDM 2.x/3.x-only callback blocks are null can pass
     // DxgkInitialize and still fail the adapter bring-up path before StartDevice.
     //
@@ -153,7 +153,7 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     // agree with `DXGK_DRIVERCAPS.WDDMVersion`, the GpuMmu `MemoryManagementCaps`
     // bits and `GetNodeMetadata.GpuMmuSupported` in `query_adapter_info.rs` — which
     // is why all four now read the one `SURFACE` value. The struct ABI we bindgen is
-    // the 26100/WDDM-3.2 shape regardless of the level reported here.
+    // the WDK-28000/WDDM-3.2 shape regardless of the level reported here.
     data.Version = crate::ddi::wddm_surface::SURFACE.ddi_interface_version();
 
     // ── PnP / power lifecycle (Phase 1, real) ──────────────────────────────
@@ -217,13 +217,6 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiQueryDependentEngineGroup = Some(ddi::dxgkddi_query_dependent_engine_group);
     data.DxgkDdiQueryEngineStatus = Some(ddi::dxgkddi_query_engine_status);
     data.DxgkDdiResetEngine = Some(ddi::dxgkddi_reset_engine);
-    data.DxgkDdiCreateHwContext = Some(ddi::dxgkddi_create_hw_context);
-    data.DxgkDdiDestroyHwContext = Some(ddi::dxgkddi_destroy_hw_context);
-    data.DxgkDdiCreateHwQueue = Some(ddi::dxgkddi_create_hw_queue);
-    data.DxgkDdiDestroyHwQueue = Some(ddi::dxgkddi_destroy_hw_queue);
-    data.DxgkDdiSubmitCommandToHwQueue = Some(ddi::dxgkddi_submit_command_to_hw_queue);
-    data.DxgkDdiSwitchToHwContextList = Some(ddi::dxgkddi_switch_to_hw_context_list);
-    data.DxgkDdiPresentToHwQueue = Some(ddi::dxgkddi_present_to_hw_queue);
     data.DxgkDdiCancelCommand = Some(ddi::dxgkddi_cancel_command);
     data.DxgkDdiCalibrateGpuClock = Some(ddi::dxgkddi_calibrate_gpu_clock);
     data.DxgkDdiFormatHistoryBuffer = Some(ddi::dxgkddi_format_history_buffer);
@@ -231,9 +224,6 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiPowerRuntimeSetDeviceHandle = Some(ddi::dxgkddi_power_runtime_set_device_handle);
     data.DxgkDdiSetStablePowerState = Some(ddi::dxgkddi_set_stable_power_state);
     data.DxgkDdiSetVirtualMachineData = Some(ddi::dxgkddi_set_virtual_machine_data);
-
-    // ── Private diagnostics/control only; not the render ABI ────────────────
-    data.DxgkDdiEscape = Some(ddi::dxgkddi_escape);
 
     // ── Display/VidPn paths. Registered explicitly, but all return unsupported
     // while StartDevice reports zero sources and children.
@@ -255,8 +245,8 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiUpdateMonitorLinkInfo = Some(ddi::dxgkddi_update_monitor_link_info);
     data.DxgkDdiExchangePreStartInfo = Some(ddi::dxgkddi_exchange_pre_start_info);
 
-    // ── Dormant HPS2 D3 one-primary MPO3 table. The capability and D2 owner
-    // boundary remain false until the later atomic display-package activation.
+    // ── Active HPS2 D3 one-primary MPO3 table. D9 publishes its capability
+    // through the same SURFACE value that derives the D2 authority predicate.
     data.DxgkDdiCheckMultiPlaneOverlaySupport3 =
         Some(ddi::dxgkddi_check_multi_plane_overlay_support3);
     data.DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3 =
@@ -285,6 +275,8 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiSetRootPageTable = Some(ddi::dxgkddi_set_root_page_table);
     data.DxgkDdiGetRootPageTableSize = Some(ddi::dxgkddi_get_root_page_table_size);
     data.DxgkDdiCollectDbgInfo = Some(ddi::dxgkddi_collect_dbg_info);
+    data.DxgkDdiCollectDiagnosticInfo = Some(ddi::dxgkddi_collect_diagnostic_info);
+    data.DxgkDdiCollectDbgInfo2 = Some(ddi::dxgkddi_collect_dbg_info2);
     data.DxgkDdiControlInterrupt = Some(ddi::dxgkddi_control_interrupt);
     data.DxgkDdiQueryCurrentFence = Some(ddi::dxgkddi_query_current_fence);
 

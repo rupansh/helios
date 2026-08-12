@@ -202,9 +202,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     crate::ddi::build_paging_buffer::hlm1_reset_counters();
 
     // Reconcile a prior generation before taking any persistent StartedState
-    // storage. This is the skipped-Stop path: when the dormant KMD D2 gate is
-    // later enabled, failure to prove a physical reset leaves the old transport
-    // installed and fails this Start rather than dropping its owner graph.
+    // storage. This is the skipped-Stop path: with KMD D2 active, failure to
+    // prove a physical reset leaves the old transport installed and fails this
+    // Start rather than dropping its owner graph.
     // SAFETY: StartDevice is PASSIVE_LEVEL.
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
     adapter.reset_dormant_owner_transition_diagnostics(passive);
@@ -451,9 +451,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
 
     // D2's permanent black parking object belongs to the exact transport and
     // final host mode, so construct it before publishing any successful start.
-    // The compile-time false owner boundary leaves production byte-for-byte on
-    // the legacy path. A failed dormant construction physically resets its
-    // producing transport and exposes no partial started package.
+    // The owner boundary is derived from the WDDM surface. A failed D2
+    // construction physically resets its producing transport and exposes no
+    // partial started package.
     if crate::virtio::KMD_D2_OWNER_ENABLED && knobs.display_half {
         let (width, height) = scanout_mode.extent();
         if let Err(start_error) =
