@@ -2,7 +2,7 @@
 
 Working plan for the HPS2 retirement lane that owns `kmd_render/` (minus the
 display DDIs) and `kmd_logic/`. Everything normative here is traceable to
-`docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` (5973 lines, "the doc" below) at the
+`docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` (5976 lines, "the doc" below) at the
 line ranges in §1. Where the doc is silent or self-contradictory that is said
 plainly in §6 — do not invent a reading; take the fail-closed one and record it.
 
@@ -13,13 +13,20 @@ plainly in §6 — do not invent a reading; take the fail-closed one and record 
 `ddi/diag_etw.rs`. It *does* own `adapter/scanout.rs` by the letter of the
 source scope, which is a hazard — see §4.
 
-**2026-08-13 K7 checkpoint.** The full dormant native-fence tranche now
-composes, including only its required `query_adapter_info.rs`, `interrupt.rs`,
-`lifecycle.rs`, and shared DIRQL-notifier seams. `SURFACE` remains
-`Wddm2_1GpuMmu` and `KMD_D2_OWNER_ENABLED` remains false, so this is
-implemented-and-never-exercised source work, not activation. The older
-2026-08-10 inventory below is retained as historical input where useful; the K7
-rows are superseded by the current status in §3 and `FINDINGS.md` F9.
+**2026-08-13 K2a checkpoint.** D9 has raised `SURFACE` to
+`Wddm3_2GpuMmu`; KMD 22.22.288.0 now carries the escape-free
+`ShareBackingStoreWithKmd` CPU view. StartDevice bounds its
+`DXGKRNL_INTERFACE` copy by the OS `Size`, requires callback coverage through
+`DxgkCbQueryFeatureSupport`, and admits the feature explicitly. Roles 1–3 use
+shared system backing supplied through `DxgkDdiSetAllocationBackingStore`; role
+4 refuses. The exact pages become one guest-backed Venus resource through the
+scoped upstream-rebased QEMU support, with renderer unref preceding MDL unlock.
+The 4 MiB role-1 pool is four 1 MiB slots. Final-source target exercise passed
+52/52 lifetime/provenance checks and an exact bidirectional boundary-byte alias
+test. Escape and HWQueues remain NULL; K11 and Mesa A3/A4 remain, and the display
+is runtime-unadmitted. See `FINDINGS.md` F18. The older 2026-08-10 inventory
+below is retained as historical input and is superseded wherever it conflicts
+with this checkpoint, D9, K7, or F18.
 
 ---
 
@@ -45,8 +52,9 @@ on 2026-08-10 and would have been shifted twice; they are recorded in those
 files' headers. ⛔ So the sentence above is now history, not an outstanding
 defect — but the *method* stands: re-grep, never add 10.
 
-**The file is 5973 lines** (`wc -l`), not 5928: commit `afebe66` **appended** the
-SUPERSEDED CLAIMS INDEX at `:5932`. An append shifts nothing, so the §1 ranges
+**The file is 5976 lines** (`wc -l`): commit `afebe66` brought it to 5973 by
+**appending** the SUPERSEDED CLAIMS INDEX at `:5932`; later append-only index
+corrections added three lines. An append shifts nothing, so the §1 ranges
 below are unaffected — do not "correct" them because `wc -l` disagrees with an
 older figure. ⛔ **Read that index before treating any doc line as a
 requirement**: HPM1 is DECLINED (`FINDINGS.md` F5), build 28000 is not a package
@@ -549,15 +557,14 @@ removed from `Helios_DeviceSettings`, and (b) nothing that looks like a feature
 override may be added.** Do not invent an `AddReg` for the package generation
 without checking whether the installer (§17.7) owns it instead.
 
-**14. Reply-pool geometry: 64 MiB pool / four 16 MiB slots / 15 MiB per
-transaction / 64 MiB per snapshot / four snapshots / 256 MiB per session.**
-§10.4:1203–1204 and §10.7:2037–2046 give the pool; §10.7:2135–2141 gives the
-snapshot bounds. Note the asymmetry, which is easy to misread: a *slot* is
-16 MiB and one HNR2 transaction publishes at most 15 MiB into it, but a
-*logical snapshot* may be up to 64 MiB and is drained by multiple 15-MiB
-continuation chunks. The `reply capacity bytes` field (HNR2 offset 80) is
-`80 + maxChunkBytes`, i.e. it includes the HVR1 header. Consistent, but three
-different numbers named "the reply size".
+**14. Reply-pool geometry was amended by K2a: 4 MiB pool / four 1 MiB slots /
+1,048,496-byte HVR1 chunk / 64 MiB logical snapshot.** F18 supersedes the frozen
+reference's 64 MiB pool and four 16 MiB slots. The HVR1 header is 80 bytes, so
+one 1 MiB slot publishes at most `1,048,576 - 80 = 1,048,496` payload bytes. A
+logical snapshot remains bounded at 64 MiB and drains through exact-next-offset
+continuations (up to 65 transactions in the worst alignment). HNR2 is a
+different buffer and retains its 15 MiB command-payload bound. Do not conflate
+the HVR1 slot/chunk geometry with HNR2 or shrink the snapshot semantic limit.
 
 **15. `dxgkddi_create_context` is a stub and must become the single
 admission point for three different context kinds.**

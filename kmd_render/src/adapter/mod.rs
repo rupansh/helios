@@ -78,7 +78,10 @@ pub(crate) struct StartedState {
     /// Dxgkrnl callback interface, copied out of dxgkrnl's buffer at
     /// StartDevice. Read lock-free by the ISR and both DPCs; publishing it as
     /// part of this struct is what makes that visibility structural.
-    pub dxgkrnl: DXGKRNL_INTERFACE,
+    pub dxgkrnl: Box<DXGKRNL_INTERFACE>,
+    /// The WDDM 3.1+ shared-backing feature was explicitly admitted by dxgkrnl
+    /// for this StartDevice generation.
+    pub share_backing_store_with_kmd: bool,
     /// Every service-key knob, snapshotted once at StartDevice. See
     /// [`AdapterKnobs`].
     pub knobs: AdapterKnobs,
@@ -313,15 +316,43 @@ impl AdapterKnobs {
 }
 
 impl StartedState {
+    /// Copy only the callback bytes dxgkrnl says are present. The minimum ends
+    /// immediately after `DxgkCbQueryFeatureSupport`, the last callback this
+    /// package reads; a smaller table cannot support the advertised surface.
+    #[inline(never)]
+    pub(crate) unsafe fn copy_dxgkrnl_interface(
+        source: *const DXGKRNL_INTERFACE,
+    ) -> Option<Box<DXGKRNL_INTERFACE>> {
+        const REQUIRED: usize = core::mem::offset_of!(
+            DXGKRNL_INTERFACE,
+            DxgkCbQueryFeatureSupport
+        ) + core::mem::size_of::<DXGKCB_QUERYFEATURESUPPORT>();
+
+        // SAFETY: StartDevice supplies at least the interface prefix containing
+        // Size. No other field is read until Size proves its coverage.
+        let supplied = unsafe { (*source).Size as usize };
+        if supplied < REQUIRED {
+            return None;
+        }
+        let mut copy = Box::<DXGKRNL_INTERFACE>::new_uninit();
+        let bytes = supplied.min(core::mem::size_of::<DXGKRNL_INTERFACE>());
+        // SAFETY: zeroing the complete heap destination makes absent future
+        // fields NULL; the source copy is bounded by both Size and our layout.
+        unsafe {
+            core::ptr::write_bytes(copy.as_mut_ptr() as *mut u8, 0, core::mem::size_of::<DXGKRNL_INTERFACE>());
+            core::ptr::copy_nonoverlapping(source as *const u8, copy.as_mut_ptr() as *mut u8, bytes);
+            Some(copy.assume_init())
+        }
+    }
+
     /// Build the sticky half DIRECTLY ON THE HEAP.
     ///
     /// ⚠ STACK BUDGET — this is not a style preference. `DxgkDdiStartDevice`
     /// calls `VirtioGpu::init`, whose frame is 3.0 KB even after the queue/error
-    /// reductions, and the x64 kernel stack is 24 KB total. Building this
-    /// 832-byte struct (which embeds a 576-byte `DXGKRNL_INTERFACE`) in
-    /// StartDevice's frame — and passing it
-    /// there by value, which an unoptimised build materialises several times —
-    /// took StartDevice from 8824 to 9688 bytes and the nested pair to ~18.8 KB.
+    /// reductions, and the x64 kernel stack is 24 KB total. The historical
+    /// embedded 576-byte interface copy took the nested boot chain to ~18.8 KB
+    /// and caused the measured `0xc0000001` cold-boot failure. Both the bounded
+    /// interface copy and this state are therefore constructed on the heap.
     /// That overflowed the kernel stack during boot, where dxgkrnl's own frames
     /// above us are deeper than on a live `devcon` restart: an early double
     /// fault with no dump, presenting as `0xc0000001` at the recovery screen.
@@ -330,28 +361,24 @@ impl StartedState {
     /// frame, which is transient and does not overlap `VirtioGpu::init`.
     /// Callers must never bind the value — only the `Box`.
     ///
-    /// The dxgkrnl interface is taken as a POINTER and dereferenced here, so the
-    /// 576-byte copy goes straight into the heap allocation instead of living in
-    /// StartDevice for the whole call.
-    ///
     /// The transport half always starts empty and is installed separately by
     /// [`AdapterContext::set_transport_generation`], so "a state published with a
     /// stale transport generation" is unrepresentable.
     ///
     /// # Safety
-    /// `dxgkrnl` must point to the live `DXGKRNL_INTERFACE` dxgkrnl passed to
-    /// `DxgkDdiStartDevice`, valid for this call.
+    /// StartDevice must remain the serialized publisher for this generation.
     #[inline(never)]
     pub(crate) unsafe fn boxed(
-        dxgkrnl: *const DXGKRNL_INTERFACE,
+        dxgkrnl: Box<DXGKRNL_INTERFACE>,
+        share_backing_store_with_kmd: bool,
         knobs: AdapterKnobs,
         scanout_mode: ScanoutMode,
         paging_ram: Option<PagingRam>,
         segment_table: crate::ddi::segment_table::SegmentTable,
     ) -> Box<Self> {
         Box::new(Self {
-            // SAFETY: per the fn contract; a plain POD copy of dxgkrnl's buffer.
-            dxgkrnl: unsafe { *dxgkrnl },
+            dxgkrnl,
+            share_backing_store_with_kmd,
             knobs,
             scanout_mode,
             paging_ram,
@@ -1523,7 +1550,12 @@ impl AdapterContext {
     /// safe to read is the Acquire in [`Self::started`] rather than statement
     /// order plus a comment.
     pub fn dxgkrnl_opt(&self) -> Option<&DXGKRNL_INTERFACE> {
-        self.started().map(|s| &s.dxgkrnl)
+        self.started().map(|s| s.dxgkrnl.as_ref())
+    }
+
+    pub(crate) fn share_backing_store_with_kmd(&self) -> bool {
+        self.started()
+            .is_some_and(|s| s.share_backing_store_with_kmd)
     }
 
     /// The service-key knob snapshot, or [`AdapterKnobs::DEFAULTS`] before
@@ -1766,7 +1798,8 @@ impl AdapterContext {
             return Err(crate::virtio::VirtioError::DeviceError);
         }
         let raw_status = self.reset_virtio_physical(passive, expected_instance)?;
-        self.transport_owner.finish_physical_reset(raw_status)
+        self.transport_owner
+            .finish_physical_reset(passive, raw_status)
     }
 
     /// Lock-free observation for query/diagnostic paths. Mutation is exposed

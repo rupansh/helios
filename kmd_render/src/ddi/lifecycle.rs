@@ -14,6 +14,28 @@ use crate::dxgk::*;
 
 use super::bar_segment::{build_segment_table, setup_bar_segment};
 
+const DXGK_FEATURE_SUPPORT_STABLE_VALUE: u32 = 2;
+
+/// Query the exact feature before any transport or allocation state is made
+/// reachable. There is deliberately no fallback path.
+unsafe fn share_backing_store_admitted(dxgkrnl: &DXGKRNL_INTERFACE) -> bool {
+    let Some(query) = dxgkrnl.DxgkCbQueryFeatureSupport else {
+        return false;
+    };
+    let mut args: DXGKARGCB_QUERYFEATURESUPPORT = unsafe { core::mem::zeroed() };
+    args.DeviceHandle = dxgkrnl.DeviceHandle;
+    args.FeatureId = _DXGK_FEATURE_ID::DXGK_FEATURE_SHARE_BACKING_STORE_WITH_KMD;
+    args.DriverSupportState = DXGK_FEATURE_SUPPORT_STABLE_VALUE;
+    args.Enabled = 0;
+    let status = unsafe { query(&mut args) };
+    status == STATUS_SUCCESS
+        && args.DeviceHandle == dxgkrnl.DeviceHandle
+        && args.FeatureId as u32
+            == _DXGK_FEATURE_ID::DXGK_FEATURE_SHARE_BACKING_STORE_WITH_KMD as u32
+        && args.DriverSupportState == DXGK_FEATURE_SUPPORT_STABLE_VALUE
+        && args.Enabled == 1
+}
+
 /// Same-boot zeroing for the PRODUCTION LINEAR-scanout ladder (T6/R901).
 ///
 /// These eight names are written by `venus::create_linear_scanout_image` /
@@ -180,10 +202,28 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         .start_complete
         .store(0, core::sync::atomic::Ordering::Release);
 
-    // NOT copied here. `dxgkrnl_interface` is 576 bytes and this function's
-    // stack frame is shared with `VirtioGpu::init`'s 3.0 KB one on a 24 KB
-    // kernel stack — see `StartedState::boxed`. The pointer is carried to the
-    // publication site and dereferenced straight into the heap allocation.
+    // Copy only the OS-supplied byte range, directly to the heap. Requiring the
+    // feature-query callback here also makes every later callback read covered
+    // by the validated Size.
+    let Some(dxgkrnl) = (unsafe {
+        crate::adapter::StartedState::copy_dxgkrnl_interface(dxgkrnl_interface)
+    }) else {
+        unsafe {
+            *number_of_video_present_sources = 0;
+            *number_of_children = 0;
+        }
+        return STATUS_NOT_SUPPORTED;
+    };
+    let share_backing_store_with_kmd = unsafe { share_backing_store_admitted(&dxgkrnl) };
+    crate::diag::record_named_bytes(b"DxgkSz", dxgkrnl.Size);
+    crate::diag::record_named_bytes(b"ShBkFeat", u32::from(share_backing_store_with_kmd));
+    if !share_backing_store_with_kmd {
+        unsafe {
+            *number_of_video_present_sources = 0;
+            *number_of_children = 0;
+        }
+        return STATUS_NOT_SUPPORTED;
+    }
     crate::diag::record(0x0B00_0002);
 
     // EVERY service-key knob, read once per StartDevice (`reg add` + `devcon
@@ -266,7 +306,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // token threads down through `bring_up_venus` -> `allocate_host_visible_blob`
     // -> `VenusRing::bring_up`, which is why it is a by-value ZST and not a
     // reference: see `crate::irql` and tools/kmd-frame-sizes.ps1.
-    match crate::virtio::VirtioGpu::init(passive, unsafe { &*dxgkrnl_interface }) {
+    match crate::virtio::VirtioGpu::init(passive, dxgkrnl.as_ref()) {
         Ok(mut gpu) => {
             crate::kmsg(c"Helios: virtio-gpu transport up\n");
             crate::diag::record(0x0B00_0003);
@@ -507,11 +547,11 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // ── Publish. Everything above was a local; from here the adapter answers. ──
     // SAFETY: StartDevice, PASSIVE_LEVEL, serialized by dxgkrnl; published once
     // per start, and every reader reaches it through the Acquire in `started()`.
-    // `boxed` builds on the HEAP in its own (transient) frame — never bind its
-    // value here, only the Box, or the 832-byte temporary comes back.
+    // `boxed` builds on the HEAP in its own transient frame; bind only the Box.
     unsafe {
         adapter.publish_started(crate::adapter::StartedState::boxed(
-            dxgkrnl_interface,
+            dxgkrnl,
+            share_backing_store_with_kmd,
             knobs,
             scanout_mode,
             paging_ram,

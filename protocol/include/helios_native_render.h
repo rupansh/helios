@@ -102,13 +102,13 @@ extern "C" {
  */
 #ifndef HELIOS_PACKAGE_GENERATION
 #define HELIOS_PACKAGE_GENERATION_TAG     0x48454C49u
-#define HELIOS_PACKAGE_GENERATION_ORDINAL 1u
+#define HELIOS_PACKAGE_GENERATION_ORDINAL 2u
 #define HELIOS_PACKAGE_GENERATION \
     ((((uint64_t)HELIOS_PACKAGE_GENERATION_TAG) << 32) | \
      (uint64_t)HELIOS_PACKAGE_GENERATION_ORDINAL)
 #endif
 
-HELIOS_NR_STATIC_ASSERT(HELIOS_PACKAGE_GENERATION == UINT64_C(0x48454C4900000001),
+HELIOS_NR_STATIC_ASSERT(HELIOS_PACKAGE_GENERATION == UINT64_C(0x48454C4900000002),
                         "package generation must equal protocol/src/lib.rs "
                         "HELIOS_PACKAGE_GENERATION");
 
@@ -521,7 +521,7 @@ HELIOS_NR_STATIC_ASSERT(HELIOS_HNR2_ACCESS_MASK == (HELIOS_HNR2_ACCESS_READ |
 
 /*
  * The four exact storage roles — a CLOSED vocabulary, not an extension point.
- *   1  the HTS1 session's one reply/feedback pool: 64 MiB in four fixed 16-MiB
+ *   1  the HTS1 session's one reply/feedback pool: 4 MiB in four fixed 1-MiB
  *      slots, Lock2-mapped once after create and residency and held to teardown;
  *   2  an ordinary application `VkDeviceMemory` from the
  *      DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT type: Lock2 at the Vulkan map
@@ -552,9 +552,9 @@ HELIOS_NR_STATIC_ASSERT(HELIOS_HNR2_ACCESS_MASK == (HELIOS_HNR2_ACCESS_READ |
 /* The segment page shift the KMD returns in this generation. */
 #define HELIOS_HVM1_SEGMENT_PAGE_SHIFT 12u
 
-/* The role-1 pool: 64 MiB as exactly four 16-MiB slots. */
-#define HELIOS_HVM1_REPLY_POOL_BYTES UINT64_C(67108864)
-#define HELIOS_HVM1_REPLY_SLOT_BYTES UINT64_C(16777216)
+/* The role-1 pool: 4 MiB as exactly four 1-MiB slots. */
+#define HELIOS_HVM1_REPLY_POOL_BYTES UINT64_C(4194304)
+#define HELIOS_HVM1_REPLY_SLOT_BYTES UINT64_C(1048576)
 #define HELIOS_HVM1_REPLY_SLOT_COUNT 4u
 
 /*
@@ -562,10 +562,10 @@ HELIOS_NR_STATIC_ASSERT(HELIOS_HNR2_ACCESS_MASK == (HELIOS_HNR2_ACCESS_READ |
  *
  * It is the ONLY per-allocation private data on a `D3DKMTCreateAllocation2` in
  * this lane, which is zeroed and issued with `hResource=0`, one allocation,
- * `pSystemMem=NULL`, outer flags zero, priority NORMAL,
- * `VidPnSourceId=D3DDDI_ID_NOTAPPLICABLE`, and `CreateShared`,
- * `NtSecuritySharing`, `ExistingSysMem`, `ExistingKernelSysMem`,
- * `ExistingSection` and `PermanentSysMem` all zero.
+ * `pSystemMem=NULL`, priority NORMAL, `VidPnSourceId=D3DDDI_ID_NOTAPPLICABLE`,
+ * and `CreateResource=1`, `CreateShared=1`, `NtSecuritySharing=1`.
+ * `ExistingSysMem`, `ExistingKernelSysMem`, `ExistingSection`, and
+ * `PermanentSysMem` remain zero.
  *
  * ⛔ THREE FIELDS ARE WRITE-BACK: `object_generation`, `segment_page_shift` and
  * `allocation_alignment` are ZERO on input and filled by the KMD. Validate as
@@ -635,8 +635,8 @@ HELIOS_NR_STATIC_ASSERT(HELIOS_HVM1_REPLY_SLOT_BYTES * (uint64_t)HELIOS_HVM1_REP
 /*
  * Reply storage is FIXED AND BOUNDED, with no growth and no spill path: at most
  * 64 MiB per immutable snapshot, at most four snapshots and 256 MiB of snapshot
- * bytes live per HTS1 session, and at most 15 MiB published by one HNR2
- * transaction into one 16-MiB slot behind exactly one HVR1 header. The fifth
+ * bytes live per HTS1 session, and at most 1 MiB minus the HVR1 header published
+ * by one HNR2 transaction into one 1-MiB slot. The fifth
  * caller drops the slot/snapshot lock and event-waits for the oldest exact C51
  * owner — it never grows the pool. A result with no bounded rule is not
  * advertised at all, rather than truncated or streamed.
@@ -644,7 +644,7 @@ HELIOS_NR_STATIC_ASSERT(HELIOS_HVM1_REPLY_SLOT_BYTES * (uint64_t)HELIOS_HVM1_REP
 #define HELIOS_HVR1_MAX_SNAPSHOT_BYTES      UINT64_C(67108864)
 #define HELIOS_HVR1_MAX_LIVE_SNAPSHOTS      4u
 #define HELIOS_HVR1_MAX_LIVE_SNAPSHOT_BYTES UINT64_C(268435456)
-#define HELIOS_HVR1_MAX_CHUNK_BYTES         UINT64_C(15728640)
+#define HELIOS_HVR1_MAX_CHUNK_BYTES         UINT64_C(1048496)
 
 /* "exactly one of MORE=1 or FINAL=2". */
 #define HELIOS_HVR1_FLAG_MORE  1u
@@ -739,10 +739,9 @@ HELIOS_NR_STATIC_ASSERT(HELIOS_HVR1_MAX_SNAPSHOT_BYTES *
                                 (uint64_t)HELIOS_HVR1_MAX_LIVE_SNAPSHOTS ==
                             HELIOS_HVR1_MAX_LIVE_SNAPSHOT_BYTES,
                         "the live-snapshot byte cap must be four whole snapshots");
-/* One transaction: one header plus at most 15 MiB, never more than one HNR2
- * batch's worth of Venus payload, and always inside one 16-MiB slot. */
-HELIOS_NR_STATIC_ASSERT(HELIOS_HVR1_MAX_CHUNK_BYTES == HELIOS_HNR2_MAX_PAYLOAD_BYTES, "");
-HELIOS_NR_STATIC_ASSERT((uint64_t)HELIOS_HVR1_HEADER_SIZE + HELIOS_HVR1_MAX_CHUNK_BYTES <=
+/* Reply capacity is independent of the 15-MiB HNR2 command-input bound. */
+HELIOS_NR_STATIC_ASSERT(HELIOS_HVR1_MAX_CHUNK_BYTES < HELIOS_HNR2_MAX_PAYLOAD_BYTES, "");
+HELIOS_NR_STATIC_ASSERT((uint64_t)HELIOS_HVR1_HEADER_SIZE + HELIOS_HVR1_MAX_CHUNK_BYTES ==
                             HELIOS_HVM1_REPLY_SLOT_BYTES,
                         "an HVR1 header plus its maximum chunk must fit one slot");
 

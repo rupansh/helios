@@ -88,15 +88,21 @@ is the one K4 sits on.)
 ## 3. The activation switch
 
 `kmd_render/src/ddi/wddm_surface.rs`'s `SURFACE` constant is the single atomic
-activation switch for the entire retirement, and **it is the last edit**. It
-stays `Wddm2_1GpuMmu` until:
+activation switch for the D2/native-fence package. **D9 crossed that boundary on
+2026-08-13**: it is now `Wddm3_2GpuMmu`, with `KMD_D2_OWNER_ENABLED` and native-
+fence advertisement derived solely from `SURFACE`. The terminal callback table,
+MPO3/Display-Core surface, and native-fence surface landed together before the
+flip.
 
-- the display lane's complete MPO3/Display-Core table is registered, **and**
-- the native-fence DDI surface is complete, **and**
-- the cold-DWM admission gate is armed.
+That source/boot activation is **not** the activation of the whole HPS2
+retirement. KMD 22.22.288.0 now also carries K2a's documented shared-backing CPU
+view, but the display remains runtime-unadmitted. K11's per-session host
+transport and Mesa A3/A4's escape-free consumer cutover still precede the
+cold-DWM visible-admission retry and every HPS2 demolition step.
 
-A premature flip reproduces the `E_NOTIMPL` DWM failure the module's own docs
-record at `wddm_surface.rs:25-28`. Whoever flips it cites both lanes.
+Do not infer display admission from the raised surface, callback counts, Code 0,
+WDDM 3.2, K2a mapping, counters, or hashes. Escape and the HWQueue family remain
+NULL; no later lane may add a second activation switch or fallback carrier.
 
 ## 4. Orchestrator decision: the private direct-dispatch ABI has one home
 
@@ -136,7 +142,7 @@ work, never per unit.
 |---|---|---|
 | `protocol` | Linux | `cd protocol && CARGO_TARGET_DIR=target/linux cargo test` — there is **no workspace root**, so `-p` from the repo root fails. |
 | `vkd3d-proton-helios` | Linux | `build-native-codex && ninja` — green. Tests are **545**, run by `./tests/test-runner.sh build-native-codex/tests/d3d12`, NOT by `meson test` (which reports "No tests defined"). ⚠ The old "102/102" here and the "215/215" in agent memory were both wrong and disagreed with each other. Expect **2 failures**, `test_nvx_cubin` and `test_destruction_notifier_interfaces`; both reproduce on unmodified upstream `2c7ba22c` and neither is ours — see `REVIEW-ROUND-1.md`. The second is concurrency-dependent, so its count varies with `-j` and with machine load. |
-| `qemu-helios` | Linux | `build-helios && ninja qemu-system-x86_64` — green. ⛔ **The QEMU half of the HPM1/HLM1 memory lane is PARKED — see `FINDINGS.md` F5.** (The KMD-side half is not: F5's Consequence is that no lane in flight has a QEMU dependency, and `K4-CONTRACT.md` §4 records K2 as rescoped rather than blocked.) The submodule is reset to its pre-retirement state; the three HPM1 commits live on branch `helios/hpm1-parked`. Do not re-open them without running their adversarial review first, and do not add a new QEMU dependency to any lane. |
+| `qemu-helios` | Linux | `build-helios && ninja qemu-system-x86_64` — green. ⛔ **The QEMU HPM1 lane remains PARKED — see F5.** The owner made one scoped K2a exception on 2026-08-13: rebase the existing Helios scanout commits onto upstream and import WDDM `ShareBackingStoreWithKmd` guest pages into Venus through stock udmabuf. Five commits, 143 additions / 32 deletions, no HPM1 negotiation/paging protocol and no virglrenderer change. This exception does not authorize a new QEMU dependency for K11 or later lanes. |
 | `kmd_render`, `umd`, `umd12` | **VM only** | WDK/bindgen. Serialize: the VM is one machine. |
 | `icd/mesa` | **VM only** | `win_meson`. |
 

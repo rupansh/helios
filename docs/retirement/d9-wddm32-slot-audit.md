@@ -8,8 +8,8 @@ Audited header: `kmd_render/tools/wdk-28000/km/dispmprt.h`
 
 Slots: **192** (plus `Version`), struct size **1544** bytes.
 
-* `Implemented` — 91
-* `Disabled` — 101 (unreachable behind a truthful zero capability)
+* `Implemented` — 92
+* `Disabled` — 100 (unreachable behind a truthful zero capability)
 * `Pending` — 0 (pre-D9 only; D9 requires zero)
 * `Retiring` — 0 (pre-D9 only; D9 requires zero)
 
@@ -177,7 +177,7 @@ refuses to load if any slot disagrees with its class here.
 | 154 | 1240 | `DxgkDdiUpdateFlipQueueLog` | WDDM2_9 | Disabled | Section 17.6:4497 forbids the hardware-flip-queue flags; no HW flip queue is advertised. |
 | 155 | 1248 | `DxgkDdiCancelQueuedFlips` | WDDM2_9 | Disabled | Section 17.6:4497 forbids the hardware-flip-queue flags; no HW flip queue is advertised. |
 | 156 | 1256 | `DxgkDdiSetInterruptTargetPresentId` | WDDM2_9 | Disabled | Requires the HW flip queue / target PresentId interrupt, neither of which is advertised. |
-| 157 | 1264 | `DxgkDdiSetAllocationBackingStore` | WDDM3_0 | Disabled | DXGK_FEATURE_SHARE_BACKING_STORE_WITH_KMD is not enabled (section 9 rejects it as a Venus transport). |
+| 157 | 1264 | `DxgkDdiSetAllocationBackingStore` | WDDM3_0 | Implemented | WDDM 3.1+ shared backing: pins the exact HVM1 section and imports its PFNs as a guest-memory Venus blob. |
 | 158 | 1272 | `DxgkDdiCreateCpuEvent` | WDDM3_0 | Disabled | DXGK_FEATURE_KMD_SIGNAL_CPU_EVENT is not enabled. |
 | 159 | 1280 | `DxgkDdiDestroyCpuEvent` | WDDM3_0 | Disabled | DXGK_FEATURE_KMD_SIGNAL_CPU_EVENT is not enabled. |
 | 160 | 1288 | `DxgkDdiCancelFlips` | WDDM3_0 | Disabled | No HW flip queue is advertised, so there is no queued flip to cancel. |

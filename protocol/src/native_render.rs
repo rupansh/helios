@@ -627,8 +627,7 @@ pub struct HeliosNativeRenderV2 {
     /// COMMIT.
     pub reply_offset: u64,
     /// Zero without a reply; with `HAS_REPLY`, exactly
-    /// `HVR1 header + maxChunkBytes`, at most `HVR1 header + 15 MiB`, wholly
-    /// inside one 16-MiB slot.
+    /// one complete 1-MiB reply slot, wholly inside that slot.
     pub reply_capacity_bytes: u64,
     /// CRC64-ECMA of this fragment. **Corruption diagnostic, never validation
     /// authority** — no validator here reads it.
@@ -1042,11 +1041,11 @@ pub enum Hnr2Reject {
     ReplySlotGenerationZero,
     /// `reply_capacity_bytes` is below one HVR1 header.
     ReplyCapacityTooSmall,
-    /// `reply_capacity_bytes` exceeds one HVR1 header plus 15 MiB.
+    /// `reply_capacity_bytes` exceeds one 1-MiB HVR1 slot.
     ReplyCapacityTooLarge,
     /// `reply_offset` is not [`HELIOS_HNR2_REPLY_OFFSET_ALIGN`]-aligned.
     ReplyOffsetMisaligned,
-    /// `reply_offset` does not fall in one of the four 16-MiB slots.
+    /// `reply_offset` does not fall in one of the four 1-MiB slots.
     ReplySlotIndexOutOfRange,
     /// The reply range is not wholly inside the one slot it starts in.
     ReplyRangeCrossesSlot,
@@ -1663,8 +1662,8 @@ pub const HELIOS_HVM1_ABI_VERSION: u16 = 1;
 /// HVM1 structure size (section 10.7 table, offset 6).
 pub const HELIOS_HVM1_SIZE: u16 = 64;
 
-/// Role 1 — the HTS1 session's one reply/feedback pool: a 64-MiB allocation
-/// divided into four fixed 16-MiB slots, Lock2-mapped once after create and
+/// Role 1 — the HTS1 session's one reply/feedback pool: a 4-MiB allocation
+/// divided into four fixed 1-MiB slots, Lock2-mapped once after create and
 /// residency and retained until pool teardown.
 pub const HELIOS_HVM1_ROLE_REPLY_POOL: u32 = 1;
 /// Role 2 — an ordinary application `VkDeviceMemory` from the
@@ -1705,9 +1704,9 @@ pub const HELIOS_HVM1_CACHE_WRITE_COMBINED: u32 = 1;
 pub const HELIOS_HVM1_SEGMENT_PAGE_SHIFT: u32 = 12;
 
 /// The role-1 pool's exact byte size.
-pub const HELIOS_HVM1_REPLY_POOL_BYTES: u64 = 64 * 1024 * 1024;
+pub const HELIOS_HVM1_REPLY_POOL_BYTES: u64 = 4 * 1024 * 1024;
 /// One reply slot's byte size.
-pub const HELIOS_HVM1_REPLY_SLOT_BYTES: u64 = 16 * 1024 * 1024;
+pub const HELIOS_HVM1_REPLY_SLOT_BYTES: u64 = 1024 * 1024;
 /// Slots per role-1 pool.
 pub const HELIOS_HVM1_REPLY_SLOT_COUNT: u32 = 4;
 
@@ -1749,7 +1748,8 @@ pub struct Hvm1Placement {
     /// residency in one segment at a time; **not** a claim that an offset is
     /// pinned.
     pub restricted_to_single_segment: bool,
-    /// Preferred read/write segment: HLM1 ([`HELIOS_SEGMENT_ID_HLM1`]).
+    /// Preferred read/write segment: the WDDM aperture. Shared-backing
+    /// allocations must reside only in an aperture segment.
     pub preferred_segment: u32,
     /// The exact [`HeliosVenusMemoryAllocationV1::cache_policy`] for this role.
     pub cache_policy: u32,
@@ -1838,7 +1838,7 @@ impl Hvm1Role {
             explicit_residency_notification: true,
             disable_partial_residency: true,
             restricted_to_single_segment: true,
-            preferred_segment: HELIOS_SEGMENT_ID_HLM1,
+            preferred_segment: HELIOS_SEGMENT_ID_APERTURE,
             cache_policy: self.cache_policy(),
             lockable: cpu_visible,
         }
@@ -1850,10 +1850,11 @@ impl Hvm1Role {
 ///
 /// It is the **only** per-allocation private data on a
 /// `D3DKMTCreateAllocation2` in this lane, which is zeroed and issued with
-/// `hResource=0`, one allocation, `pSystemMem=NULL`, outer flags zero, priority
-/// `NORMAL`, `VidPnSourceId=D3DDDI_ID_NOTAPPLICABLE`, and `CreateShared`,
-/// `NtSecuritySharing`, `ExistingSysMem`, `ExistingKernelSysMem`,
-/// `ExistingSection`, and `PermanentSysMem` all zero.
+/// `hResource=0`, one allocation, `pSystemMem=NULL`, priority `NORMAL`,
+/// `VidPnSourceId=D3DDDI_ID_NOTAPPLICABLE`, and the resource flags
+/// `CreateResource=1`, `CreateShared=1`, and `NtSecuritySharing=1`.
+/// `ExistingSysMem`, `ExistingKernelSysMem`, `ExistingSection`, and
+/// `PermanentSysMem` remain zero.
 ///
 /// Three fields are **write-back**: `object_generation`, `segment_page_shift`,
 /// and `allocation_alignment` are zero on input and filled by the KMD. Validate
@@ -1925,7 +1926,7 @@ pub enum Hvm1Reject {
     RoleUnknown,
     /// `byte_size` is zero.
     ByteSizeZero,
-    /// `byte_size` is not the exact size the role fixes (role 1: 64 MiB).
+    /// `byte_size` is not the exact size the role fixes (role 1: 4 MiB).
     ByteSizeNotExactForRole,
     /// `access` carries a bit outside [`HELIOS_HVM1_ACCESS_MASK`].
     AccessUnknownBits,
@@ -1998,7 +1999,7 @@ impl HeliosVenusMemoryAllocationV1 {
         }
     }
 
-    /// The session's one role-1 reply/feedback pool: exactly 64 MiB, four 16-MiB
+    /// The session's one role-1 reply/feedback pool: exactly 4 MiB, four 1-MiB
     /// slots, host-written and CPU-read.
     pub const fn new_reply_pool(package_generation: u64) -> Self {
         Self::new(
@@ -2134,11 +2135,10 @@ const _: () = {
         HELIOS_HVM1_REPLY_SLOT_BYTES * HELIOS_HVM1_REPLY_SLOT_COUNT as u64
             == HELIOS_HVM1_REPLY_POOL_BYTES
     );
-    // One transaction publishes at most 15 MiB into a 16-MiB slot, so an HVR1
-    // header plus its maximum chunk always fits one slot.
+    // The header and maximum reply chunk consume one complete slot.
     assert!(
         HELIOS_HVR1_HEADER_SIZE as u64 + HELIOS_HVR1_MAX_CHUNK_BYTES
-            <= HELIOS_HVM1_REPLY_SLOT_BYTES
+            == HELIOS_HVM1_REPLY_SLOT_BYTES
     );
 };
 
@@ -2160,9 +2160,9 @@ pub const HELIOS_HVR1_MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 pub const HELIOS_HVR1_MAX_LIVE_SNAPSHOTS: u32 = 4;
 /// Maximum live snapshot bytes per HTS1 session: 256 MiB.
 pub const HELIOS_HVR1_MAX_LIVE_SNAPSHOT_BYTES: u64 = 256 * 1024 * 1024;
-/// Maximum bytes one HNR2 transaction may publish: 15 MiB, into one 16-MiB slot,
-/// behind exactly one HVR1 header.
-pub const HELIOS_HVR1_MAX_CHUNK_BYTES: u64 = 15 * 1024 * 1024;
+/// Maximum bytes one HNR2 transaction may publish behind one HVR1 header.
+pub const HELIOS_HVR1_MAX_CHUNK_BYTES: u64 =
+    HELIOS_HVM1_REPLY_SLOT_BYTES - HELIOS_HVR1_HEADER_SIZE as u64;
 
 // ── Capacity admission for the two native-side bounded pools ───────────────
 //
@@ -2298,7 +2298,7 @@ pub const HELIOS_HVR1_FLAG_MASK: u32 = HELIOS_HVR1_FLAG_MORE | HELIOS_HVR1_FLAG_
 ///     event-waits for the oldest exact owner — it never grows the pool;
 ///   * one HNR2 transaction publishes at most one header plus
 ///     [`HELIOS_HVR1_MAX_CHUNK_BYTES`] into one of the four
-///     [`HELIOS_HVM1_REPLY_SLOT_BYTES`] slots of the one 64-MiB role-1 pool; and
+///     [`HELIOS_HVM1_REPLY_SLOT_BYTES`] slots of the one 4-MiB role-1 pool; and
 ///   * a continuation ([`HeliosVenusReplyContinuationV1`]) copies **the exact
 ///     next bytes** of the frozen snapshot. It never re-runs the operation and
 ///     never changes [`Self::status`]. A result with no bounded rule is not
@@ -2730,9 +2730,11 @@ const _: () = {
         HELIOS_HVR1_MAX_SNAPSHOT_BYTES * HELIOS_HVR1_MAX_LIVE_SNAPSHOTS as u64
             == HELIOS_HVR1_MAX_LIVE_SNAPSHOT_BYTES
     );
-    // One transaction: one header plus at most 15 MiB, and never more than one
-    // HNR2 batch's worth of Venus payload.
-    assert!(HELIOS_HVR1_MAX_CHUNK_BYTES == HELIOS_HNR2_MAX_PAYLOAD_BYTES);
+    assert!(HELIOS_HVR1_MAX_CHUNK_BYTES < HELIOS_HNR2_MAX_PAYLOAD_BYTES);
+    assert!(
+        HELIOS_HVR1_HEADER_SIZE as u64 + HELIOS_HVR1_MAX_CHUNK_BYTES
+            == HELIOS_HVM1_REPLY_SLOT_BYTES
+    );
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3297,7 +3299,7 @@ mod tests {
             past_end.validate(&expect(None, 1, command_length)),
             Err(Hnr2Reject::ReplySlotIndexOutOfRange)
         );
-        // Above one header + 15 MiB is refused.
+        // Above one complete reply slot is refused.
         let mut too_big = header;
         too_big.reply_capacity_bytes =
             HELIOS_HVR1_HEADER_SIZE as u64 + HELIOS_HVR1_MAX_CHUNK_BYTES + 1;
@@ -3579,7 +3581,7 @@ mod tests {
     // ── HVM1 ─────────────────────────────────────────────────────────────────
 
     #[test]
-    fn hvm1_reply_pool_is_exactly_sixty_four_mib() {
+    fn hvm1_reply_pool_is_exactly_four_mib() {
         let pool = HeliosVenusMemoryAllocationV1::new_reply_pool(PKG);
         assert_eq!(
             pool.validate(PKG, Hvm1Stage::CreateInput),
@@ -3931,7 +3933,7 @@ mod tests {
     #[test]
     fn c_mirror_carries_these_exact_constants() {
         // protocol/include/helios_native_render.h
-        assert_eq!(crate::HELIOS_PACKAGE_GENERATION, 0x4845_4C49_0000_0001);
+        assert_eq!(crate::HELIOS_PACKAGE_GENERATION, 0x4845_4C49_0000_0002);
         assert_eq!(HELIOS_NATIVE_RENDER_CAPSET, 4);
 
         assert_eq!(HELIOS_HVC1_MAGIC, 0x3143_5648);
@@ -3992,8 +3994,8 @@ mod tests {
         assert_eq!(HELIOS_HVM1_CACHE_NOT_CPU_VISIBLE, 0);
         assert_eq!(HELIOS_HVM1_CACHE_WRITE_COMBINED, 1);
         assert_eq!(HELIOS_HVM1_SEGMENT_PAGE_SHIFT, 12);
-        assert_eq!(HELIOS_HVM1_REPLY_POOL_BYTES, 67_108_864);
-        assert_eq!(HELIOS_HVM1_REPLY_SLOT_BYTES, 16_777_216);
+        assert_eq!(HELIOS_HVM1_REPLY_POOL_BYTES, 4_194_304);
+        assert_eq!(HELIOS_HVM1_REPLY_SLOT_BYTES, 1_048_576);
         assert_eq!(HELIOS_HVM1_REPLY_SLOT_COUNT, 4);
 
         assert_eq!(HELIOS_HVR1_MAGIC, 0x3152_5648);
@@ -4002,7 +4004,8 @@ mod tests {
         assert_eq!(HELIOS_HVR1_MAX_SNAPSHOT_BYTES, 67_108_864);
         assert_eq!(HELIOS_HVR1_MAX_LIVE_SNAPSHOTS, 4);
         assert_eq!(HELIOS_HVR1_MAX_LIVE_SNAPSHOT_BYTES, 268_435_456);
-        assert_eq!(HELIOS_HVR1_MAX_CHUNK_BYTES, 15_728_640);
+        assert_eq!(HELIOS_HVR1_MAX_CHUNK_BYTES, 1_048_496);
+        assert_eq!(HELIOS_HNR2_MAX_PAYLOAD_BYTES, 15_728_640);
         assert_eq!(HELIOS_HVR1_FLAG_MORE, 1);
         assert_eq!(HELIOS_HVR1_FLAG_FINAL, 2);
         assert_eq!(HELIOS_HVR1_FLAG_MASK, 3);

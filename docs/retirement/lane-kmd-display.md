@@ -6,10 +6,11 @@ is `doc:NNNN`. Repository line counts and struct shapes were read on 2026-08-09
 at root commit `d1c820a` (branch `wddm-dx12`).
 
 ⛔ **Doc line numbers here were swept +10 on 2026-08-10 and mechanically
-verified.** The doc is **5973 lines** (`wc -l`) — 5918 when this brief was
+verified.** The doc is **5976 lines** (`wc -l`) — 5918 when this brief was
 written, 5928 after commit `c17f17c` inserted a ten-line banner at `:11-20`, and
 5973 after `afebe66` **appended** the SUPERSEDED CLAIMS INDEX at `:5932`. Only
-the banner moved anything: it shifted every body line after 8 by +10, so every
+later append-only index corrections raised the total to 5976; none moved a body
+line. Only the banner moved anything: it shifted every body line after 8 by +10, so every
 `doc:` citation written here before 2026-08-10 was 10 too low. All of them have
 now been shifted, and the sweep was checked by requiring each `§N.M`-anchored
 cite to land inside §N.M's own heading-to-heading range — not by adding 10 on

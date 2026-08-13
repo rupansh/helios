@@ -358,6 +358,7 @@ probe_adapter(D3DKMT_HANDLE adapter, UINT index)
    }
 
    /* ── H. the role-1 reply pool, exactly as A1 creates it ──────────────── */
+   D3DKMT_HANDLE pool_resource = 0;
    D3DKMT_HANDLE pool = 0;
    D3DKMT_HANDLE paging_queue = 0;
    uint64_t pool_generation = 0;
@@ -375,6 +376,7 @@ probe_adapter(D3DKMT_HANDLE adapter, UINT index)
 
       D3DDDI_ALLOCATIONINFO2 info;
       memset(&info, 0, sizeof(info));
+      info.pSystemMem = NULL;
       info.pPrivateDriverData = &hvm1;
       info.PrivateDriverDataSize = sizeof(hvm1);
 
@@ -383,12 +385,16 @@ probe_adapter(D3DKMT_HANDLE adapter, UINT index)
       ca.hDevice = device;
       ca.NumAllocations = 1;
       ca.pAllocationInfo2 = &info;
+      ca.Flags.CreateResource = 1;
+      ca.Flags.CreateShared = 1;
+      ca.Flags.NtSecuritySharing = 1;
       NTSTATUS sh1 = D3DKMTCreateAllocation2(&ca);
       /* ⛔ The generation comes back from the OPEN, not the create: dxgkrnl
        * discards a create-time KMD write into `pPrivateDriverData` entirely
        * (`FINDINGS.md` F11). It is the number `open_allocation_identity`
        * publishes, so it is exactly what the use record must repeat. */
       if (sh1 == STATUS_SUCCESS_NT) {
+         pool_resource = ca.hResource;
          pool = info.hAllocation;
          pool_generation = hvm1.object_generation;
       }
@@ -538,12 +544,11 @@ probe_adapter(D3DKMT_HANDLE adapter, UINT index)
    }
 
    /* ── teardown, in A1's order ─────────────────────────────────────────── */
-   if (pool) {
+   if (pool_resource) {
       D3DKMT_DESTROYALLOCATION2 da;
       memset(&da, 0, sizeof(da));
       da.hDevice = device;
-      da.phAllocationList = &pool;
-      da.AllocationCount = 1;
+      da.hResource = pool_resource;
       IGNORE_STATUS(D3DKMTDestroyAllocation2(&da));
    }
    if (paging_queue) {

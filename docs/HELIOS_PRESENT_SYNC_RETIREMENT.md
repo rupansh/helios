@@ -11,12 +11,12 @@ Static-analysis snapshot: **2026-08-09**
 > ⚠ **This file is frozen. Where a measurement or owner decision contradicts it,
 > THAT WINS.** Before implementation read the **SUPERSEDED CLAIMS INDEX** and
 > `docs/retirement/FINDINGS.md`; they retire F1/F2/F5/F8 assumptions in the body.
-> ⛔ **OWNER AMENDMENT 2026-08-11:** `qemu-helios` is immutable for retirement;
-> every custom QEMU plane latch/release callback, record, and work unit is withdrawn.
-> One exact successful fenced nonzero `SET_SCANOUT_BLOB` response is the latch and
-> prior-release boundary. Explicit unbind first fenced-replaces with a permanent
-> KMD parking/black blob, then may `SET(0)` while retaining parking through the
-> next nonzero replacement/reset. Line numbers are load-bearing; preserve count.
+> ⛔ **OWNER AMENDMENT 2026-08-13:** F5's HPM1 branch remains parked; K2a
+> alone may use the scoped upstream-rebased QEMU guest-backing import. It maps
+> WDDM `ShareBackingStoreWithKmd` pages as a Venus guest blob; no HPM1 or
+> virglrenderer change exists. Plane latch/release remains one exact fenced
+> nonzero `SET_SCANOUT_BLOB`, with parking-first unbind as previously amended.
+> Line numbers are load-bearing; preserve count.
 
 Target baseline: **Windows 11 26H1 (build 28000) / WDDM 3.2 / D3D12 Core
 DDI 0116 or later, traditional kernel submission**
@@ -5965,7 +5965,8 @@ shifts nothing.
 | §10.3 offset 24: `byte_size` is "the exact backing extent" | **`K4-CONTRACT.md` §1.3** | It is the **resource's** extent, UMD-supplied and echoed — *except* for allocations the KMD authored itself (`STANDARD`), where the KMD replaces its own pre-create estimate with the host's authoritative answer. Enforcing the estimate refused every OS shared primary; the pre-retirement code overwrote it and was right to. |
 | §10.3: a host `resid` "may live solely inside the KMD allocation object" reads as a constraint already satisfied | **`K4-CONTRACT.md` §5** | It is a **mechanism change nobody has built**. HWA2 carries no host `resid` and no Vulkan memory-type index, and the ICD's import consumed both — so the import and export **refuse** until mesa unit **A3** (+K6) lands. Every consumer names A3 in its refusal. |
 | `GlobalVidMmTracker` is "folded into HWA2's tracking-kind fields" (`protocol/src/wddm_legacy.rs`, since corrected) | **`K4-CONTRACT.md` §6** | HWA2 has **no** tracking kind, cookie, global-share field or tracker bit. The mechanism has **no successor**; it dies with UMD-backing adoption. |
-| Residual display-lifetime phrases saying KMD/QEMU retain a plane lease until replacement/unbind plus backend release | **2026-08-11 owner amendment, lines 14-19** | QEMU is immutable and supplies no custom callback or acknowledgement. KMD owns candidate/current backing references; one exact successful standard fenced nonzero `SET_SCANOUT_BLOB` response latches the candidate and releases the prior backing. Explicit unbind first replaces with permanent KMD black parking; optional `SET(0)` does not release parking, which remains until later nonzero replacement or reset. |
+| Residual display-lifetime phrases saying KMD/QEMU retain a plane lease until replacement/unbind plus backend release | **2026-08-13 owner amendment, lines 14-19** | QEMU supplies no custom plane callback or acknowledgement; K2a's scoped backing import does not alter this boundary. KMD owns candidate/current backing references; one exact successful standard fenced nonzero `SET_SCANOUT_BLOB` response latches the candidate and releases the prior backing. Explicit unbind first replaces with permanent KMD black parking; optional `SET(0)` does not release parking, which remains until later nonzero replacement or reset. |
+| F17 selects `DxgkCbCreatePhysicalMemoryObject`/`MapPhysicalMemory` and says guest-backed HVM1 storage is dead | **F18** | K2a uses the documented WDDM `ShareBackingStoreWithKmd` flow: dxgkrnl gives KMD the exact shared system backing while the creating process gets its ordinary Lock2 VA. A scoped upstream-rebased QEMU change imports those pages as a guest-backed Venus blob through stock udmabuf; HPM1 remains parked and virglrenderer is unchanged. |
 ## Standing reading rule
 
 Two of this file's load-bearing assumptions were falsified by a single cheap

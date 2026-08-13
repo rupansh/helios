@@ -16,9 +16,12 @@ render server; a **D3D11 UMD** (`umd/`, Rust d3d10umddi frontend bridged via cxx
 `egl-headless` + VNC. IddCx/Looking Glass and the older System-class KMDF + DeviceIoControl
 driver (`kmd/`) remain historical/reference paths, not the active display.
 
-⚠ The driver declares `WddmSurface::Wddm2_1GpuMmu`, not 3.2 — see
-`kmd_render/src/ddi/wddm_surface.rs`, which records that 3.2 fails DWM at `E_NOTIMPL`. Older
-docs and comments that say "WDDM 3.2" are describing the intent, not the surface.
+⚠ The driver now declares `WddmSurface::Wddm3_2GpuMmu`. D9 cold-loaded the
+complete callback/capability package on Windows build 26100; K2a subsequently
+landed the documented shared-backing CPU view. The display is still
+runtime-unadmitted: DWM loads WARP, DisplayConfig has zero paths, and no visible
+desktop may be inferred from Code 0, WDDM 3.2, a successful map, counters, or
+hashes. Escape and HWQueue registrations remain NULL.
 
 ## Stage: Correctness and D3D12 — since 2026-08-05
 

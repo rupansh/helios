@@ -204,6 +204,7 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     // ── Memory management (registered, but fails honestly until implemented) ─
     data.DxgkDdiCreateAllocation = Some(ddi::dxgkddi_create_allocation);
     data.DxgkDdiDestroyAllocation = Some(ddi::dxgkddi_destroy_allocation);
+    data.DxgkDdiSetAllocationBackingStore = Some(ddi::dxgkddi_set_allocation_backing_store);
     data.DxgkDdiBuildPagingBuffer = Some(ddi::dxgkddi_build_paging_buffer);
     data.DxgkDdiMapCpuHostAperture = Some(ddi::dxgkddi_map_cpu_host_aperture);
     data.DxgkDdiUnmapCpuHostAperture = Some(ddi::dxgkddi_unmap_cpu_host_aperture);

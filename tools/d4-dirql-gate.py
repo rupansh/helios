@@ -274,7 +274,7 @@ DIRQL_CALL_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
     (DIRECT, "transport_instance"): frozenset(),
     (DIRECT, "matches_exact_allocation"): frozenset({"matches_allocation", "token"}),
     (DIRECT, "matches_allocation"): frozenset(),
-    (ALLOC, "direct_scanout_allocation_facts"): frozenset({"resolve_alloc"}),
+    (ALLOC, "direct_scanout_allocation_facts"): frozenset({"load", "resolve_alloc"}),
     (ALLOC, "resolve_alloc"): frozenset({"is_null", "then_some"}),
     (ALLOC, "open_direct_scanout_allocation_facts"): frozenset(
         {"direct_scanout_allocation_facts", "open_allocation_context"}

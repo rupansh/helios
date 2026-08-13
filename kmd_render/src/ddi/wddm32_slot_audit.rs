@@ -1192,8 +1192,8 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         name: "DxgkDdiSetAllocationBackingStore",
         offset: 1264,
         min_version: "WDDM3_0",
-        class: SlotClass::Disabled,
-        reason: "DXGK_FEATURE_SHARE_BACKING_STORE_WITH_KMD is not enabled (section 9 rejects it as a Venus transport).",
+        class: SlotClass::Implemented,
+        reason: "WDDM 3.1+ shared backing: pins the exact HVM1 section and imports its PFNs as a guest-memory Venus blob.",
     },
     SlotAudit {
         name: "DxgkDdiCreateCpuEvent",

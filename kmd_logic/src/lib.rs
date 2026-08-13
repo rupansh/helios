@@ -6557,7 +6557,7 @@ pub mod allocation_identity {
         Hvm1Role, Hvm1Stage, HELIOS_HOC1_ABI_VERSION, HELIOS_HOC1_BYTES, HELIOS_HOC1_MAGIC,
         HELIOS_HVM1_ABI_VERSION, HELIOS_HVM1_MAGIC, HELIOS_HVM1_SEGMENT_PAGE_SHIFT,
         HELIOS_HVM1_SIZE, HELIOS_HWA2_ABI_VERSION, HELIOS_HWA2_BYTES,
-        HELIOS_HWA2_FLAG_KMD_OWNED_MASK, HELIOS_HWA2_MAGIC, HELIOS_SEGMENT_ID_HLM1,
+        HELIOS_HWA2_FLAG_KMD_OWNED_MASK, HELIOS_HWA2_MAGIC, HELIOS_SEGMENT_ID_APERTURE,
     };
 
     // ── The exact HWA2 flag bits the KMD owns, per `K4-CONTRACT.md` §1.1.
@@ -6653,12 +6653,9 @@ pub mod allocation_identity {
         /// wire (`wddm.rs:1652`, `native_render.rs:1517`); accepting it here
         /// would turn "I did not fill this in" into "matches anything".
         ExpectedGenerationZero,
-        /// HVM1 placement names [`HELIOS_SEGMENT_ID_HLM1`] for every role and
-        /// the segment is not exposed yet (K2 is blocked; `FINDINGS.md` F5
-        /// parked the QEMU/HPM1 half). Refused and counted per role — never
-        /// substituted onto the aperture segment, which `K4-CONTRACT.md` §4
-        /// forbids outright.
-        Hlm1SegmentNotExposed {
+        /// HVM1 shared backing requires the WDDM aperture segment, and that
+        /// segment is not exposed. Refused and counted per role.
+        ApertureSegmentNotExposed {
             /// `HELIOS_HVM1_ROLE_*` of the refused create.
             role: u32,
         },
@@ -6975,28 +6972,17 @@ pub mod allocation_identity {
         Ok(output)
     }
 
-    /// The role's placement, or a counted refusal while HLM1 does not exist.
-    ///
-    /// `Hvm1Role::placement()` names [`HELIOS_SEGMENT_ID_HLM1`] as the
-    /// preferred read/write segment for **every** role, and §10.7 makes HLM1's
-    /// exposure conditional on `DxgkDdiStartDevice` negotiating HPM1 first.
-    /// `FINDINGS.md` F5 parked the host half of that negotiation, so the
-    /// condition cannot be satisfied today.
-    ///
-    /// ⚠ `K4-CONTRACT.md` §4 states the rule for role 4 — "admitted and
-    /// counted, not satisfied … never a silent substitution onto the aperture
-    /// segment". This model applies it to all four roles, because the
-    /// substitution it forbids is a property of the placement record and not of
-    /// role 4: every role's `preferred_segment` is HLM1, so satisfying any of
-    /// them without HLM1 means substituting. The counter carries the role, so
-    /// the role-4 case the contract names stays separable in telemetry.
+    /// The role's exact shared-backing placement, or a counted refusal while
+    /// the WDDM aperture segment is unavailable.
     pub fn hvm1_admit_placement(
         role: Hvm1Role,
-        hlm1_segment_exposed: bool,
+        aperture_segment_exposed: bool,
     ) -> Result<Hvm1Placement, IdentityRefusal> {
         let placement = role.placement();
-        if placement.preferred_segment == HELIOS_SEGMENT_ID_HLM1 && !hlm1_segment_exposed {
-            return Err(IdentityRefusal::Hlm1SegmentNotExposed {
+        if placement.preferred_segment == HELIOS_SEGMENT_ID_APERTURE
+            && !aperture_segment_exposed
+        {
+            return Err(IdentityRefusal::ApertureSegmentNotExposed {
                 role: role.to_u32(),
             });
         }
@@ -7858,7 +7844,7 @@ mod allocation_identity_tests {
     fn hvm1_reply_pool_size_is_fixed_at_the_kmd_entry_point() {
         let pool = HeliosVenusMemoryAllocationV1::new_reply_pool(PKG);
         assert_eq!(pool.byte_size, HELIOS_HVM1_REPLY_POOL_BYTES);
-        assert_eq!(HELIOS_HVM1_REPLY_POOL_BYTES, 64 * 1024 * 1024);
+        assert_eq!(HELIOS_HVM1_REPLY_POOL_BYTES, 4 * 1024 * 1024);
         let (_, role) = hvm1_admit_create_input(&encode_hvm1(&pool), PKG).expect("admit");
         assert_eq!(role, Hvm1Role::ReplyPool);
 
@@ -7918,11 +7904,9 @@ mod allocation_identity_tests {
         );
     }
 
-    /// Placement is refused, per role and by name, until HLM1 exists. K2 is
-    /// blocked (`FINDINGS.md` F5), and `K4-CONTRACT.md` §4 forbids substituting
-    /// the aperture segment: the create fails loudly instead.
+    /// Placement is refused, per role and by name, until the aperture exists.
     #[test]
-    fn hvm1_placement_is_refused_until_the_hlm1_segment_exists() {
+    fn hvm1_placement_is_refused_until_the_aperture_segment_exists() {
         for role in [
             Hvm1Role::ReplyPool,
             Hvm1Role::VulkanHostVisible,
@@ -7931,15 +7915,14 @@ mod allocation_identity_tests {
         ] {
             assert_eq!(
                 hvm1_admit_placement(role, false),
-                Err(IdentityRefusal::Hlm1SegmentNotExposed {
+                Err(IdentityRefusal::ApertureSegmentNotExposed {
                     role: role.to_u32()
                 }),
-                "role {} must be counted, not substituted",
+                "role {} must be counted without an aperture",
                 role.to_u32()
             );
-            let placement = hvm1_admit_placement(role, true).expect("HLM1 present");
-            assert_eq!(placement.preferred_segment, HELIOS_SEGMENT_ID_HLM1);
-            assert_ne!(HELIOS_SEGMENT_ID_HLM1, HELIOS_SEGMENT_ID_APERTURE);
+            let placement = hvm1_admit_placement(role, true).expect("aperture present");
+            assert_eq!(placement.preferred_segment, HELIOS_SEGMENT_ID_APERTURE);
         }
     }
 
@@ -7992,10 +7975,10 @@ mod allocation_identity_tests {
                     field: PlacementField::CpuVisible
                 })
             );
-            let mut aperture = faithful;
-            aperture.preferred_segment = HELIOS_SEGMENT_ID_APERTURE;
+            let mut foreign = faithful;
+            foreign.preferred_segment = u32::MAX;
             assert_eq!(
-                hvm1_written_flags_match(&placement, &aperture),
+                hvm1_written_flags_match(&placement, &foreign),
                 Err(IdentityRefusal::PlacementMismatch {
                     field: PlacementField::PreferredSegment
                 })
@@ -8444,7 +8427,7 @@ pub mod translation_session {
         ReplyPoolNotBound,
         /// The allocation offered as a reply pool is not role 1.
         ReplyPoolRoleMismatch { found: u32 },
-        /// The allocation offered as a reply pool is not exactly 64 MiB.
+        /// The allocation offered as a reply pool is not exactly 4 MiB.
         /// Unreachable while `protocol`'s HVM1 validator enforces the role's exact
         /// size at create; kept because the pool's slot arithmetic is derived from
         /// this number and an unchecked assumption here is a range error later.
@@ -11155,7 +11138,7 @@ pub mod native_render {
             HELIOS_HNR2_USE_RECORD_SIZE, HELIOS_HVC1_DMA_BUFFER_BYTES,
         };
 
-        const PKG: u64 = 0x4845_4C49_0000_0001;
+        const PKG: u64 = 0x4845_4C49_0000_0002;
 
         /// One fragment of a `fragment_count`-fragment batch, with no tables.
         fn frag(token: u64, index: u16, count: u16, chunk: u32) -> HeliosNativeRenderV2 {
@@ -12204,8 +12187,8 @@ pub mod hlm1_placement {
     /// byte.
     ///
     /// Bounded rather than exhaustive because the HLM1 view is `Cached=0`: WC/UC
-    /// kernel reads were measured at ~157 MB/s, so digesting a 64 MiB pool would
-    /// be a ~400 ms PASSIVE escape.
+    /// kernel reads were measured at ~157 MB/s, so the former 64 MiB pool took
+    /// roughly 400 ms in one PASSIVE callback.
     pub fn sample_offsets(length_bytes: u64, out: &mut [u64; MAX_SAMPLES]) -> usize {
         if length_bytes == 0 {
             return 0;
@@ -12249,9 +12232,12 @@ pub mod hlm1_placement {
 #[cfg(test)]
 mod hlm1_placement_tests {
     use super::hlm1_placement::*;
+    use helios_protocol::native_render::{
+        HELIOS_HVM1_REPLY_POOL_BYTES, HELIOS_HVM1_REPLY_SLOT_BYTES,
+    };
 
     const RESERVE: u64 = 1 << 30;
-    const POOL: u64 = 64 * 1024 * 1024;
+    const POOL: u64 = HELIOS_HVM1_REPLY_POOL_BYTES;
 
     fn obs(operation: u32, segment_id: u32, byte_offset: u64, length_bytes: u64) -> Observation {
         Observation {
@@ -12425,9 +12411,9 @@ mod hlm1_placement_tests {
         assert_eq!(n, MAX_SAMPLES);
         assert_eq!(out[0], 0);
         assert_eq!(out[n - 1], POOL - 1);
-        // The 16 MiB reply-slot boundaries are in the set.
+        // Every reply-slot boundary is in the set.
         for slot in 1..4u64 {
-            let boundary = slot * 16 * 1024 * 1024;
+            let boundary = slot * HELIOS_HVM1_REPLY_SLOT_BYTES;
             assert!(out[..n].contains(&boundary), "missing slot {slot}");
         }
         assert!(out[..n].windows(2).all(|w| w[0] < w[1]));

@@ -215,7 +215,7 @@ def check_audit(sources: dict[str, str], errors: list[str]) -> None:
         errors.append(
             f"{CLASSES}: every D9 slot must be terminal; non-terminal rows={transitional + unknown!r}"
         )
-    if counts != collections.Counter({"Disabled": 101, "Implemented": 91}):
+    if counts != collections.Counter({"Disabled": 100, "Implemented": 92}):
         errors.append(f"{CLASSES}: terminal count drifted: {dict(counts)!r}")
 
     rs = sources.get(AUDIT_RS, "")
@@ -229,8 +229,8 @@ def check_audit(sources: dict[str, str], errors: list[str]) -> None:
             errors.append(f"{AUDIT_RS}: generated layout proof missing: {fragment}")
     for fragment in (
         "Slots: **192** (plus `Version`), struct size **1544** bytes.",
-        "* `Implemented` — 91",
-        "* `Disabled` — 101",
+        "* `Implemented` — 92",
+        "* `Disabled` — 100",
         "* `Pending` — 0",
         "* `Retiring` — 0",
     ):

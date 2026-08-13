@@ -89,6 +89,9 @@ struct ResourceCustody {
 pub(crate) struct ResourceBackingFinalizer {
     pub(crate) image_id: u64,
     pub(crate) memory_id: u64,
+    /// Locked MDL whose PFNs back a guest-memory blob. Released only after
+    /// host UNREF or a verified physical reset.
+    pub(crate) guest_mdl: usize,
 }
 
 impl ResourceBackingFinalizer {
@@ -96,6 +99,7 @@ impl ResourceBackingFinalizer {
         Self {
             image_id: 0,
             memory_id: 0,
+            guest_mdl: 0,
         }
     }
 
@@ -103,6 +107,7 @@ impl ResourceBackingFinalizer {
         Self {
             image_id: 0,
             memory_id,
+            guest_mdl: 0,
         }
     }
 
@@ -110,11 +115,20 @@ impl ResourceBackingFinalizer {
         Self {
             image_id,
             memory_id,
+            guest_mdl: 0,
+        }
+    }
+
+    pub(crate) const fn guest_pages(mdl: usize) -> Self {
+        Self {
+            image_id: 0,
+            memory_id: 0,
+            guest_mdl: mdl,
         }
     }
 
     pub(crate) const fn is_empty(&self) -> bool {
-        self.image_id == 0 && self.memory_id == 0
+        self.image_id == 0 && self.memory_id == 0 && self.guest_mdl == 0
     }
 }
 
@@ -202,7 +216,7 @@ const OWNER_STORAGE_BYTES: usize = match checked_storage_bytes() {
     None => 0,
 };
 
-const _: () = assert!(OWNER_STORAGE_BYTES == 19_030_016);
+const _: () = assert!(OWNER_STORAGE_BYTES == 19_161_088);
 const _: () = assert!(PAIR_CAPACITY == RESOURCE_CAPACITY);
 const _: () = assert!(WINDOW_CAPACITY == super::gpu::MAX_BLOBS);
 
@@ -1399,7 +1413,11 @@ impl TransportOwner {
         }
     }
 
-    pub(crate) fn finish_physical_reset(&self, raw_status: u32) -> Result<(), super::VirtioError> {
+    pub(crate) fn finish_physical_reset(
+        &self,
+        passive: crate::irql::PassiveLevel,
+        raw_status: u32,
+    ) -> Result<(), super::VirtioError> {
         let preparation = {
             let mut state = self.state.lock();
             state.reset_preparation.take()
@@ -1473,9 +1491,17 @@ impl TransportOwner {
                     pending
                 }
                 OwnerResetAction::Resource(action) => {
-                    let (backing, association, pending) = action.into_parts();
+                    let (mut backing, association, pending) = action.into_parts();
+                    let finalizer = core::mem::replace(
+                        &mut backing.finalizer,
+                        ResourceBackingFinalizer::none(),
+                    );
                     drop(backing);
                     drop(association);
+                    crate::virtio::ctrl::finalize_resource_backing_after_reset(
+                        passive,
+                        finalizer,
+                    );
                     pending
                 }
                 OwnerResetAction::Context(action) => {
@@ -1508,7 +1534,9 @@ impl TransportOwner {
             let mut state = self.state.lock();
             core::mem::take(&mut state.finalizer_quarantine)
         };
-        quarantine.clear();
+        for finalizer in quarantine.drain(..) {
+            crate::virtio::ctrl::finalize_resource_backing_after_reset(passive, finalizer);
+        }
         let mut state = self.state.lock();
         debug_assert!(state.finalizer_quarantine.is_empty());
         state.finalizer_quarantine = quarantine;

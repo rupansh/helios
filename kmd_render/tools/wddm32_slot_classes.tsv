@@ -175,7 +175,7 @@ DxgkDdiSetFlipQueueLogBuffer	Disabled	Section 17.6:4497 forbids the hardware-fli
 DxgkDdiUpdateFlipQueueLog	Disabled	Section 17.6:4497 forbids the hardware-flip-queue flags; no HW flip queue is advertised.
 DxgkDdiCancelQueuedFlips	Disabled	Section 17.6:4497 forbids the hardware-flip-queue flags; no HW flip queue is advertised.
 DxgkDdiSetInterruptTargetPresentId	Disabled	Requires the HW flip queue / target PresentId interrupt, neither of which is advertised.
-DxgkDdiSetAllocationBackingStore	Disabled	DXGK_FEATURE_SHARE_BACKING_STORE_WITH_KMD is not enabled (section 9 rejects it as a Venus transport).
+DxgkDdiSetAllocationBackingStore	Implemented	WDDM 3.1+ shared backing: pins the exact HVM1 section and imports its PFNs as a guest-memory Venus blob.
 DxgkDdiCreateCpuEvent	Disabled	DXGK_FEATURE_KMD_SIGNAL_CPU_EVENT is not enabled.
 DxgkDdiDestroyCpuEvent	Disabled	DXGK_FEATURE_KMD_SIGNAL_CPU_EVENT is not enabled.
 DxgkDdiCancelFlips	Disabled	No HW flip queue is advertised, so there is no queued flip to cancel.

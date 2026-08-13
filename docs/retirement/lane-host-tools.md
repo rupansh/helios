@@ -7,29 +7,30 @@ reference is silent or self-contradictory, in which case the fail-closed reading
 named here is the working rule until the owner rules otherwise.
 
 ⛔ **Doc line numbers here were swept +10 on 2026-08-10 and mechanically
-verified.** The doc is **5973 lines** (`wc -l`) — 5918 when this brief was
+verified.** The doc is **5976 lines** (`wc -l`) — 5918 when this brief was
 written, 5928 after commit `c17f17c` inserted a ten-line banner at `:11-20`, and
-5973 after `afebe66` **appended** the SUPERSEDED CLAIMS INDEX at `:5932`. Only
-the banner moved anything: it shifted every body line after 8 by +10, so every
+5973 after `afebe66` **appended** the SUPERSEDED CLAIMS INDEX at `:5932`; later
+append-only index corrections raised the total to 5976 without moving a body
+line. Only the banner moved anything: it shifted every body line after 8 by +10, so every
 citation written here before 2026-08-10 was 10 too low. All of them have now
 been shifted, and the sweep was checked by requiring each `§N.M`-anchored cite
 to land inside §N.M's own heading-to-heading range — not by adding 10 on faith. ⚠ **Source-file line numbers were deliberately NOT touched** — `foo.rs:123`, `virtio-gpu-virgl.c` function ranges and the like are cites into the tree, not into the doc, and the banner never moved them. If a number here is not a doc line, it was correct before this sweep and is correct now.
 Re-grep the cited text before relying on any number below.
 
-⛔ **OWNER AMENDMENT 2026-08-11: `qemu-helios` is immutable for this retirement.**
-No custom protocol, plane callback, listener op, acknowledgement, or tracepoint
-may be added. All **H0-H9** QEMU implementation rows below are retained only as
-historical reconnaissance and are non-actionable; **P1/P2/T1/T2** keep their
-separate guest/package/tool ownership. F5 already declined HPM1, and the display
-lane now uses exact standard fenced nonzero `SET_SCANOUT_BLOB` completion plus a
-permanent KMD parking/black blob for explicit unbind. Pinned QEMU `SET(0)` is not
-an old-reader-release boundary. Do not read any later `MODIFY` verdict as
-authorization to touch the submodule.
+⛔ **OWNER AMENDMENT 2026-08-13: F5's HPM1 QEMU lane stays parked.** The one
+scoped exception is landed K2a: rebase the existing Helios scanout series onto
+upstream and import WDDM `ShareBackingStoreWithKmd` guest pages as Venus guest
+blobs through stock udmabuf. Its five commits total 143 additions / 32 deletions;
+there is no HPM1 protocol or virglrenderer change. All **H0-H9** rows below remain
+historical/non-actionable, and K2a does not authorize further host expansion.
+The display plane still uses exact standard fenced nonzero `SET_SCANOUT_BLOB`
+completion plus permanent KMD parking for unbind; pinned `SET(0)` is not an
+old-reader-release boundary.
 
-Provenance checked at write time: `qemu-helios` is a **git submodule** pinned at
-`d4fde50ccb5ec51a635003fda441d0ea4bbb2818` (detached HEAD, worktree clean) —
-matching §1's table (doc line 86). Every QEMU line number below is exact for that
-commit.
+Current provenance: `qemu-helios` branch `helios-upstream` is clean at
+`415a5ef078`, with upstream base `d49f87606a`; the parked HPM1 branch remains
+separate. Every older QEMU line number below is historical for `d4fde50ccb`, not
+for the rebased tree.
 
 ---
 

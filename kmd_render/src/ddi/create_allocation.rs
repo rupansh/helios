@@ -86,7 +86,11 @@ use helios_protocol::{
     HELIOS_HWA2_KIND_STANDARD_STAGING, HELIOS_HWA2_MAGIC, HELIOS_HWA2_MEMORY_CPU_VISIBLE,
     HELIOS_HWA2_MEMORY_DEVICE_LOCAL, HELIOS_HWA2_MISC_GDI_COMPATIBLE, HELIOS_HWA2_SWIZZLE_LINEAR,
     HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL, HELIOS_PACKAGE_GENERATION, HELIOS_SEGMENT_ID_HLM1,
+    VirtioGpuMemEntry, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+    VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
 };
+use wdk_sys::ntddk::{IoAllocateMdl, IoFreeMdl, KeGetCurrentIrql};
+use wdk_sys::PMDL;
 
 use crate::adapter::allocation_object;
 use crate::adapter::{AdapterContext, ScanoutGuard};
@@ -105,6 +109,15 @@ use helios_kmd_logic::ScanoutFormat;
 /// (a garbage dereference in BuildPagingBuffer is a bugcheck).
 const ALLOCATION_CTX_MAGIC: u32 = 0x4841_4C43; // "HALC"
 
+const BACKING_STORE_UNBOUND: u32 = 0;
+const BACKING_STORE_BINDING: u32 = 1;
+const BACKING_STORE_BOUND: u32 = 2;
+
+extern "C" {
+    fn helios_mm_probe_and_lock_pages_seh(mdl: PMDL) -> i32;
+    fn helios_mm_get_mdl_pfn_array(mdl: PMDL) -> *const u64;
+}
+
 /// Sentinel for [`AllocationContext::bar_placed`]: not placed in the BAR segment.
 pub(crate) const BAR_UNPLACED: u64 = u64::MAX;
 
@@ -122,7 +135,10 @@ struct AllocationContext {
     /// canonical row. With KMD D2 enabled, `OwnerTable` is the sole owner and
     /// this immutable value grants no release authority. It is never written
     /// into private data or recovered from geometry.
-    resource_id: u32,
+    resource_id: AtomicU32,
+    /// One-shot SetAllocationBackingStore state. The OS-owned address is used
+    /// only while locking its pages and is never retained as identity.
+    backing_store_state: AtomicU32,
     /// Exact virtio transport generation that created `resource_id`. Resource
     /// numbers restart in a replacement transport, so D2 must reject an old
     /// allocation object even when a new row happens to reuse the same scalar.
@@ -141,6 +157,8 @@ struct AllocationContext {
     /// later decision that used to sniff geometry or memory visibility now names
     /// this instead.
     kind: u32,
+    /// Exact HVM1 wire role, or zero for every other allocation kind.
+    hvm1_role: u32,
     /// The final create-output HWA2 record for this exact allocation object.
     /// `None` for HVM1/HOC1.  Display admission reaches this only through the
     /// OS-supplied `hAllocation`; it is never reconstructed from the resource
@@ -294,6 +312,12 @@ struct AllocationContext {
     bar_eligible: bool,
     /// Provenance of `size`. See [`BackingSize`].
     size_provenance: BackingSize,
+}
+
+impl AllocationContext {
+    fn resource_id(&self) -> u32 {
+        self.resource_id.load(Ordering::Acquire)
+    }
 }
 
 /// Pseudo-kinds for the two records that are not HWA2, so
@@ -1352,7 +1376,8 @@ pub(crate) unsafe fn direct_scanout_allocation_facts(
 ) -> Option<DirectScanoutAllocationFacts> {
     let ctx = unsafe { resolve_alloc(h) }?;
     let final_hwa2 = ctx.final_hwa2?;
-    if ctx.resource_id == 0
+    let resource_id = ctx.resource_id.load(Ordering::Acquire);
+    if resource_id == 0
         || ctx.transport_instance == 0
         || final_hwa2.allocation_generation != ctx.generation
     {
@@ -1360,7 +1385,7 @@ pub(crate) unsafe fn direct_scanout_allocation_facts(
     }
     Some(DirectScanoutAllocationFacts {
         final_hwa2,
-        resource_id: ctx.resource_id,
+        resource_id,
         allocation_generation: ctx.generation,
         transport_instance: ctx.transport_instance,
         backing_size: ctx.venus_alloc_size,
@@ -1456,7 +1481,7 @@ unsafe fn describe_alloc_info(h: HANDLE) -> Option<DescribeInfo> {
 pub(crate) unsafe fn paging_alloc_info(h: HANDLE) -> Option<PagingAllocInfo> {
     let ctx = unsafe { resolve_alloc(h) }?;
     Some(PagingAllocInfo {
-        resource_id: ctx.resource_id,
+        resource_id: ctx.resource_id(),
         size: ctx.size as u64,
         size_provenance: ctx.size_provenance,
         bar_eligible: ctx.bar_eligible,
@@ -1808,7 +1833,7 @@ pub(crate) unsafe fn allocation_resource_id(h: HANDLE) -> u32 {
     if ctx.magic != ALLOCATION_CTX_MAGIC {
         return 0;
     }
-    ctx.resource_id
+    ctx.resource_id()
 }
 
 /// The allocation generation and record kind held by one KMD allocation object.
@@ -1858,7 +1883,7 @@ pub(crate) unsafe fn scanout_alloc_info(h: HANDLE) -> Option<WindowsPrimary> {
         return None;
     }
     let ctx = unsafe { &*(h as *const AllocationContext) };
-    if ctx.magic != ALLOCATION_CTX_MAGIC || ctx.resource_id == 0 {
+    if ctx.magic != ALLOCATION_CTX_MAGIC || ctx.resource_id() == 0 {
         return None;
     }
     // Acquire on the address pairs with the Release in
@@ -1883,7 +1908,7 @@ pub(crate) unsafe fn scanout_alloc_info(h: HANDLE) -> Option<WindowsPrimary> {
         None
     };
     Some(WindowsPrimary {
-        resource_id: ctx.resource_id,
+        resource_id: ctx.resource_id(),
         width: ctx.width,
         height: ctx.height,
         pitch: ctx.pitch,
@@ -1929,7 +1954,7 @@ fn cached_prepared_copy(
     Some(crate::virtio::venus::PreparedImageCopy {
         owns_source_alias,
         source_resource_id: if owns_source_alias {
-            ctx.resource_id
+            ctx.resource_id()
         } else {
             0
         },
@@ -2051,7 +2076,7 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
     }
     let ctx = unsafe { &*(h as *const AllocationContext) };
     if ctx.magic != ALLOCATION_CTX_MAGIC
-        || ctx.resource_id == 0
+        || ctx.resource_id() == 0
         || ctx.width != width
         || ctx.height != height
     {
@@ -2124,7 +2149,7 @@ pub(crate) unsafe fn submit_primary_scanout_copy(
                 } else {
                     client.prepare_optimal_scanout_copy(
                         adapter,
-                        ctx.resource_id,
+                        ctx.resource_id(),
                         ctx.venus_alloc_size,
                         ctx.memory_type_index,
                         width,
@@ -2522,49 +2547,16 @@ fn vidmm_placement(
 /// word and the `AllocCached` interaction, neither of which the protocol can
 /// know.
 ///
-/// ⛔ **`preferred_segment` is `HELIOS_SEGMENT_ID_HLM1`, which the segment table
-/// may not report.** `K4-CONTRACT.md` §4 is explicit that K4 records the constant
-/// and does not depend on the segment existing: K2 (the two-segment table) is
-/// unstarted and its host half is parked (`FINDINGS.md` F5). Substituting the
-/// aperture segment here would produce a create that "works" while placing
-/// native-Vulkan memory somewhere §10.7 forbids, so this function keeps stating
-/// the contract exactly.
-///
-/// ⭐ What it does NOT do any more is let that placement leave the driver
-/// unchecked. This doc used to end "so an HVM1 create is refused by dxgkrnl,
-/// loudly" — and a refusal by dxgkrnl is a refusal with NO HELIOS COUNTER, which
-/// is the opposite of loud from inside the guest. [`admit_hvm1`] now asks
-/// [`segment_is_reported`] whether this exact `preferred_segment` is in the table
-/// this driver reported, and refuses per role with a named counter when it is not
-/// (§4 as amended 2026-08-10). The placement is unchanged; only who refuses it,
-/// and whether anyone can see that, changed.
-///
-/// The aperture bit is in the supported set because §10.7:2001-2002 names "the
-/// package's ordinary aperture as the documented system-residency
-/// physical-address domain" — the eviction/system-residency domain, not an
-/// alternative preference.
-///
-/// ⛔ **VidMm read it as an alternative preference anyway** (`FINDINGS.md` F15):
-/// it placed the role-1 pool in the aperture, `HlPlSg = 1`, with the GPU page
-/// table agreeing — so the Lock2 view was guest RAM and F14's defect stood. It is
-/// entitled to: `preferred_segment` is a hint. `Hlm1Only` removes the
-/// alternative, and defaults OFF because a hard `MakeResident` failure would
-/// block A3 entirely (CLAUDE.md rule 8: the measured value is the default, and
-/// the other arm stays reachable).
-fn hvm1_placement(role: Hvm1Role, hlm1_only: bool, flags_off: u32) -> VidMmPlacement {
+/// `ShareBackingStoreWithKmd` requires system-memory-only placement. The role
+/// table therefore names the reported aperture as both preferred and solely
+/// supported; no BAR/HLM1 alternative can silently take custody of these bytes.
+/// [`admit_hvm1`] verifies that exact segment before publishing an allocation.
+fn hvm1_placement(role: Hvm1Role) -> VidMmPlacement {
     let contract = role.placement();
-    let aperture = if hlm1_only {
-        0
-    } else {
-        segment_bit(crate::ddi::gpummu::APERTURE_SEGMENT_ID)
-    };
-    // `Hlm1FlagsOff` — see `diag::knobs::HLM1_FLAGS_OFF`. Each cleared bit is a
-    // candidate explanation for VidMm ending the allocation in the aperture;
-    // 0 (the default) states §10.7 exactly.
-    let keep = |bit: u32, contract_value: bool| contract_value && flags_off & bit == 0;
+    let preferred = contract.preferred_segment;
     VidMmPlacement {
-        preferred_segment: contract.preferred_segment,
-        supported_segments: segment_bit(contract.preferred_segment) | aperture,
+        preferred_segment: preferred,
+        supported_segments: segment_bit(preferred),
         cpu_visible: contract.cpu_visible,
         // §10.7:2003-2005 — `Cached = 0` for every role, and the CPU publication
         // ordering proof depends on it: a `HOST_CACHED` mapping would break the
@@ -2577,12 +2569,12 @@ fn hvm1_placement(role: Hvm1Role, hlm1_only: bool, flags_off: u32) -> VidMmPlace
         // segment/physical-address capability patched from the allocation list.
         // ⚠ If K6's Render/Patch path ever stops dereferencing it, this bit
         // becomes a lie even though it is set exactly as specified.
-        accessed_physically: keep(1, contract.accessed_physically),
+        accessed_physically: contract.accessed_physically,
         // NOT maskable: this bit is what delivers `NOTIFY_RESIDENCY`, which is
         // the arm the bind runs on (F15).
         explicit_residency_notification: contract.explicit_residency_notification,
-        disable_partial_residency: keep(2, contract.disable_partial_residency),
-        restricted_to_single_segment: keep(4, contract.restricted_to_single_segment),
+        disable_partial_residency: contract.disable_partial_residency,
+        restricted_to_single_segment: contract.restricted_to_single_segment,
     }
 }
 
@@ -2657,7 +2649,7 @@ unsafe fn destroy_allocation_ctx(
             crate::ddi::build_paging_buffer::hlm1_readback(
                 passive,
                 adapter,
-                ctx.resource_id,
+                ctx.resource_id(),
                 ctx.size as u64,
             )
         };
@@ -2695,10 +2687,10 @@ unsafe fn destroy_allocation_ctx(
             adapter,
             allocation_handle as HANDLE,
             ctx.generation,
-            ctx.resource_id,
+            ctx.resource_id(),
         )
     } else {
-        adapter.retire_scanout_allocation(passive, allocation_handle, ctx.resource_id)
+        adapter.retire_scanout_allocation(passive, allocation_handle, ctx.resource_id())
     };
     if !scanout_retired {
         let _ = orphaned_copy_requires_backing_retain(&ctx);
@@ -2748,8 +2740,8 @@ unsafe fn destroy_allocation_ctx(
                 // exact ring response; cache release below drains that fence
                 // before the backing can be destroyed.
                 let _ = adapter
-                    .with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, ctx.resource_id));
-                client.release_present_blits_for_resource(adapter, ctx.resource_id)
+                    .with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, ctx.resource_id()));
+                client.release_present_blits_for_resource(adapter, ctx.resource_id())
             })
             .map(|result| result.is_ok())
             .unwrap_or(false);
@@ -2764,7 +2756,7 @@ unsafe fn destroy_allocation_ctx(
         // `with_venus_client` has returned before this virtio step, so the
         // established scanout -> Venus ordering is not extended.
         adapter
-            .with_virtio(|v| v.finish_windowed_blt_teardown_for_resource(adapter, ctx.resource_id))
+            .with_virtio(|v| v.finish_windowed_blt_teardown_for_resource(adapter, ctx.resource_id()))
             .unwrap_or(false)
     });
     if !windowed_terminal {
@@ -2779,17 +2771,17 @@ unsafe fn destroy_allocation_ctx(
     // WDDM AllocationContext carrying the same resource id.  That allocation
     // is only an importer: destroying it must not clear, detach, unref, or
     // destroy the adapter-owned scanout image/memory.
-    let adapter_owned_scanout = ctx.resource_id != 0
-        && adapter.dedicated_scanout_resource.load(Ordering::Acquire) == ctx.resource_id;
-    if ctx.resource_id != 0 && !adapter_owned_scanout {
-        adapter.forget_primary_scanout(ctx.resource_id);
+    let adapter_owned_scanout = ctx.resource_id() != 0
+        && adapter.dedicated_scanout_resource.load(Ordering::Acquire) == ctx.resource_id();
+    if ctx.resource_id() != 0 && !adapter_owned_scanout {
+        adapter.forget_primary_scanout(ctx.resource_id());
     }
     // `ctx.owns_resource` used to gate this arm. It is GONE: it was false only
     // for a non-owning `AdoptedUmdResource`, and with adoption deleted the KMD
     // creates every backing it names, so the field was a constant `true` for
     // every reachable arm. `resource_id != 0` is the surviving, honest test —
     // an HOC1 pool and a failed backing both have none.
-    if ctx.resource_id != 0 && !adapter_owned_scanout {
+    if ctx.resource_id() != 0 && !adapter_owned_scanout {
         // Drop the owner-0 tracking slot (registered at CreateAllocation, or
         // re-owned to the allocation at adopt), unmapping the GDI executor's
         // host-visible mapping if one is live.
@@ -2798,7 +2790,7 @@ unsafe fn destroy_allocation_ctx(
         // claimed "true once RESOURCE_MAP_BLOB has succeeded" -- but its only
         // writer set it `false`, so the branch never ran and the doc described
         // a state the field could not reach. T6/R915.
-        let _ = crate::virtio::ctrl::forget_allocation_blob(passive, adapter, ctx.resource_id);
+        let _ = crate::virtio::ctrl::forget_allocation_blob(passive, adapter, ctx.resource_id());
         // One guarded teardown path for created AND adopted resources. The old
         // adopted arm unref'd unconditionally, which double-freed resources
         // another path had already reclaimed — QEMU's "virgl_cmd_resource_unref:
@@ -2813,24 +2805,24 @@ unsafe fn destroy_allocation_ctx(
                 passive,
                 adapter,
                 ctx.ctx_id,
-                ctx.resource_id,
+                ctx.resource_id(),
             )
             .is_ok()
             {
-                let _ = crate::virtio::ctrl::resource_unref(passive, adapter, ctx.resource_id);
+                let _ = crate::virtio::ctrl::resource_unref(passive, adapter, ctx.resource_id());
             }
         } else {
             let first_teardown = adapter
-                .with_virtio(|v| v.take_live_resource(ctx.resource_id))
+                .with_virtio(|v| v.take_live_resource(ctx.resource_id()))
                 .unwrap_or(false);
             if first_teardown {
                 let _ = crate::virtio::ctrl::ctx_detach_resource(
                     passive,
                     adapter,
                     ctx.ctx_id,
-                    ctx.resource_id,
+                    ctx.resource_id(),
                 );
-                let _ = crate::virtio::ctrl::resource_unref(passive, adapter, ctx.resource_id);
+                let _ = crate::virtio::ctrl::resource_unref(passive, adapter, ctx.resource_id());
             }
             if ctx.venus_image_id != 0 {
                 let _ = adapter
@@ -2848,7 +2840,7 @@ unsafe fn destroy_allocation_ctx(
             }
         }
     } else if adapter_owned_scanout {
-        crate::diag::record_named_bytes(b"CpKeep", ctx.resource_id);
+        crate::diag::record_named_bytes(b"CpKeep", ctx.resource_id());
     }
     drop(ctx);
 }
@@ -2887,12 +2879,17 @@ pub(crate) enum BackingSize {
     HostAuthoritative(u64),
     /// The size is valid for accounting, but not authoritative for BAR mapping.
     NonHostAuthoritative(u64),
+    /// Exact OS-owned section extent shared with KMD through the WDDM 3.1+
+    /// backing-store callback. It is neither a BAR nor Venus allocation size.
+    SharedBackingStore(u64),
 }
 
 impl BackingSize {
     pub(crate) fn bytes(self) -> u64 {
         match self {
-            Self::HostAuthoritative(n) | Self::NonHostAuthoritative(n) => n,
+            Self::HostAuthoritative(n)
+            | Self::NonHostAuthoritative(n)
+            | Self::SharedBackingStore(n) => n,
         }
     }
 
@@ -3323,12 +3320,10 @@ fn build_backing(
 /// (CLAUDE.md: validate every runtime-supplied value before acting on it).
 #[derive(Clone, Copy)]
 struct CreateCallShape {
-    /// `DXGK_CREATEALLOCATIONFLAGS::Value` — "outer flags zero" for HVM1/HOC1.
-    /// The binding defines exactly one named bit (`Resource`) plus `Reserved`,
-    /// so this is the whole word.
+    /// `DXGK_CREATEALLOCATIONFLAGS::Value`. The binding defines exactly one
+    /// named bit (`Resource`) plus `Reserved`, so this is the whole word.
     flags: u32,
-    /// Whether `DXGKARG_CREATEALLOCATION::hResource` is non-null — i.e. whether
-    /// a runtime resource handle exists at all. Both records require none.
+    /// Whether `DXGKARG_CREATEALLOCATION::hResource` was non-null on entry.
     has_resource_handle: bool,
     /// `DXGKARG_CREATEALLOCATION::NumAllocations`.
     num_allocations: u32,
@@ -3338,11 +3333,19 @@ struct CreateCallShape {
 }
 
 impl CreateCallShape {
-    /// The exact shape §10.7:1964-1972 / §10.6:1489-1494 require: no resource
-    /// handle, no resource-level private bytes, exactly one allocation, outer
-    /// flags zero.
+    /// The exact unshared HOC1 shape.
     fn is_bare_single_allocation(self) -> bool {
         self.flags == 0
+            && !self.has_resource_handle
+            && self.num_allocations == 1
+            && self.resource_private_size == 0
+    }
+
+    /// `CreateShared` requires `CreateResource`. Dxgkrnl exposes the latter as
+    /// the KMD `Resource` bit and supplies a null input handle for a new
+    /// one-allocation resource.
+    fn is_shared_single_resource_allocation(self) -> bool {
+        self.flags == DXGK_CREATEALLOCATION_FLAG_RESOURCE
             && !self.has_resource_handle
             && self.num_allocations == 1
             && self.resource_private_size == 0
@@ -3357,6 +3360,8 @@ impl CreateCallShape {
 /// write-out and drifting apart.
 struct AdmittedAllocation {
     kind: u32,
+    hvm1_role: u32,
+    share_backing_store: bool,
     generation: u64,
     /// Final HWA2 create-output bytes for the exact allocation object. HVM1
     /// and HOC1 use distinct records and therefore carry `None`.
@@ -3825,6 +3830,8 @@ unsafe fn admit_hwa2(
 
     Ok(AdmittedAllocation {
         kind: desc.allocation_kind,
+        hvm1_role: 0,
+        share_backing_store: false,
         generation,
         final_hwa2: Some(desc),
         vidmm_size,
@@ -3848,39 +3855,16 @@ unsafe fn admit_hwa2(
     })
 }
 
-/// Admit one HVM1 create-input record (§10.7), create its renderer-view backing,
-/// and stamp the three write-back fields.
-///
-/// # ⚠⚠ NO PRODUCER EXISTS — this function has never been called and cannot be
-///
-/// Measured 2026-08-10 (round 3 of the Phase-2 review, re-verified here):
-/// `HELIOS_HVM1_MAGIC` and `HeliosVenusMemoryAllocationV1` appear outside
-/// `protocol/` in exactly two places — this file, the consumer, and
-/// `kmd_logic`, the model. **No UMD, no ICD and no tool ever builds one.** The
-/// ICD's only mentions are prose comments in `vn_renderer_helios.c` saying the
-/// KMD *will* own the venus allocation after mesa unit **A3**; that unit is the
-/// producer, and it does not exist. `create_one`'s magic dispatch therefore
-/// never reaches here.
-///
-/// ⛔ **What that means for the counters, which is the trap:** `AcHvm1Rej`,
-/// `AcHvm1Mem`, `AcHvm1Out`, `AcSegRole1`..`AcSegRole4` and (for the sibling)
-/// `AcHoc1Rej`, `AcHoc1Out`, `AcSegHoc1` are all **absent** from the service
-/// key, and their absence is evidence of **nothing**. In particular it is not
-/// evidence that `HELIOS_SEGMENT_ID_HLM1` is in the reported segment table —
-/// the natural reading of "no role was refused for a missing segment". Nothing
-/// asked. `K4-CONTRACT.md` §4's amended ruling ("check the segment, do not
-/// hardcode the role") is written as though role-1..3 creates arrive and are
-/// refused; none can arrive.
-///
-/// ⛔ STALE AS OF 2026-08-11. `tools/hts1_session_probe.c:292-297` builds an
-/// HVM1 role-1 record and `TsPoolBind` moved 2 -> 3 on the target across one run
-/// of it (`FINDINGS.md` F14), so this arm IS exercised. What remains true is that
-/// no SHIPPING component produces one — the producer is a probe.
+/// Admit one HVM1 create-input record (§10.7) and request an OS-owned shared
+/// backing store. `DxgkDdiSetAllocationBackingStore` creates the renderer view
+/// later in the same allocation transaction, after dxgkrnl supplies its exact
+/// system-space address. A1 and the probes exercise roles 1-3; the wider A3
+/// renderer cutover remains a later unit.
 ///
 /// # SAFETY
 /// As [`admit_hwa2`].
 unsafe fn admit_hvm1(
-    passive: PassiveLevel,
+    _passive: PassiveLevel,
     adapter: &AdapterContext,
     private: *mut u8,
     private_size: usize,
@@ -3912,10 +3896,9 @@ unsafe fn admit_hvm1(
         }
     };
 
-    // §10.7:1964-1972 — the KMT create-call shape is fixed and the KMD enforces
-    // it. The doc states it as what the ICD does; §18.1:4750-4751 tests that the
-    // properties hold, and a guest-supplied shape checked only by the guest is
-    // not checked.
+    // A shared allocation must create a resource. The KMD sees that ordinary
+    // resource association as DXGK_CREATEALLOCATIONFLAGS::Resource; the UMD
+    // retains the returned process-local resource handle only for teardown.
     //
     // ⚠ The `pSystemMem = NULL` / `ExistingSysMem` / `CreateShared` /
     // `NtSecuritySharing` / `ExistingKernelSysMem` / `ExistingSection` /
@@ -3925,77 +3908,18 @@ unsafe fn admit_hvm1(
     // `Flags{Resource, Reserved}`, `NumAllocations`, `hResource`, and the two
     // private-data pairs (grep `_DXGKARG_CREATEALLOCATION`). So this check
     // covers the four properties the KMD can see and CANNOT cover the other
-    // seven — recorded here rather than implied, because §18.1:4750-4751 asks
-    // for a proof this DDI cannot supply.
-    if !shape.is_bare_single_allocation() {
+    // seven — recorded here rather than implied. `CreateResource` is the one
+    // outer property represented in the KMD call and is required exactly once.
+    if !shape.is_shared_single_resource_allocation() {
         bump(&CREATE_CALL_SHAPE, b"AcShape");
         return Err(STATUS_INVALID_PARAMETER);
     }
 
-    // ⛔ THE ROLE'S PREFERRED SEGMENT MUST BE ONE THIS DRIVER ACTUALLY REPORTS
-    // (`K4-CONTRACT.md` §4, as AMENDED 2026-08-10 — the amendment overrides the
-    // role-4-only refusal that stood here).
-    //
-    // `Hvm1Role::placement()` prefers `HELIOS_SEGMENT_ID_HLM1` for EVERY role, so
-    // the refusal that keyed on role 4 caught the one create it could name and
-    // let roles 1-3 through onto the same unreportable segment — where dxgkrnl
-    // refuses them outside this driver, with nothing here counting it. The check
-    // is the segment, not the role: it is correct whether or not K2 has landed,
-    // it needs no knowledge of K2's schedule, and it cannot go stale. See
-    // [`CREATE_ROLE1_SEGMENT_ABSENT`] for the full argument and for why no
-    // substitute placement is admissible (role 4 in particular has
-    // `CpuVisible = 0`, no CPU VA, and may never reach Lock2 — §10.7:2004-2005,
-    // :2049-2050).
-    //
-    // Checked BEFORE `build_backing` so a refusal has no host resource to orphan.
-    let knobs = adapter.knobs();
-    let placement = hvm1_placement(role, knobs.hlm1_only, knobs.hlm1_flags_off);
-    if !segment_is_reported(adapter, placement.preferred_segment) {
-        let (counter, name) = role_segment_absent_counter(role);
-        bump(counter, name);
-        // `STATUS_NOT_SUPPORTED`, unchanged from the role-4 refusal this
-        // replaces: the record is well-formed and legal, and it is this adapter's
-        // current segment topology that cannot host it. `STATUS_INVALID_PARAMETER`
-        // would blame the caller for a KMD/host sequencing state.
+    if !adapter.share_backing_store_with_kmd() {
+        bump_with_code(&CREATE_HVM1_MEMORY_CLASS_REFUSED, b"AcHvm1Mem", role.to_u32());
         return Err(STATUS_NOT_SUPPORTED);
     }
-
-    // ⛔ THE KMD CANNOT ALLOCATE DEVICE-LOCAL MEMORY, so a role that asks for it
-    // is REFUSED rather than quietly given host-visible memory.
-    //
-    // Found by round 3 of the Phase-2 review as "a validated-then-discarded
-    // field". `Hvm1Role::VulkanDeviceLocal` (role 4) validates with
-    // `cache_policy = HELIOS_HVM1_CACHE_NOT_CPU_VISIBLE` and its
-    // `placement()` publishes `cpu_visible = false, lockable = false`; its own
-    // doc says "**Rejects map and has no CPU VA**". But `allocate_memory_blob`
-    // allocates from `self.memory_type_index` unconditionally — the ONE
-    // host-visible/host-coherent type chosen at bring-up — because a plain
-    // memory blob has no `vkGet*MemoryRequirements` query to feed
-    // `choose_device_local_memory_type`, which is the only way this client picks
-    // a type (the scan-out image path is the one caller that has such a query).
-    // So role 4 would have been backed by mappable host-visible memory while
-    // dxgkrnl was told the allocation has no CPU view: the record's `role`,
-    // `cache_policy` and `access` validated and then contradicted by the only
-    // code that acts on them. That is fake success, which CLAUDE.md rule 2
-    // forbids ahead of a loud failure.
-    //
-    // ⚠ This is a CAPABILITY statement, not a schedule claim, and it must not be
-    // confused with the segment check above: `K4-CONTRACT.md` §4 forbids
-    // hardcoding a role number as a stand-in for "K2 has not landed", and rightly
-    // — that check is `segment_is_reported`, evaluated at runtime. This one says
-    // something the code can state truthfully today and that no other lane's
-    // schedule can change: this venus client has no way to request a device-local
-    // Vulkan memory type. Giving it one is mesa unit A3 plus K6 work; when it
-    // lands, delete this arm rather than widening it.
-    //
-    // Costs nothing today — nothing in this package produces an HVM1 record at
-    // all (see this function's banner) — which is precisely why it is written
-    // before the first producer exists rather than after.
-    let placement_rules = role.placement();
-    if !placement_rules.cpu_visible {
-        // `to_u32`, not `as u32`: the counter's low word must be the WIRE role
-        // number a reader can look up in §10.7, not this enum's declaration
-        // order, which is one lower.
+    if !role.placement().cpu_visible {
         bump_with_code(
             &CREATE_HVM1_MEMORY_CLASS_REFUSED,
             b"AcHvm1Mem",
@@ -4003,34 +3927,22 @@ unsafe fn admit_hvm1(
         );
         return Err(STATUS_NOT_SUPPORTED);
     }
-
-    // §10.7:1936-1940 — one ordinary, nonprimary, unshared WDDM allocation and
-    // one KMD-owned renderer resource descriptor of the same page-rounded size.
-    // The blob is MAPPABLE exactly when the role's own placement says the
-    // allocation has a CPU view — derived, not asserted, so the blob flag and
-    // the WDDM `CpuVisible` flag can never disagree. (With the refusal above
-    // that is every admitted role, i.e. 1-3; it is written as a derivation so
-    // that widening the refusal cannot silently leave a non-CPU-visible role
-    // with a `USE_MAPPABLE` blob.) It is never SHAREABLE, because
-    // §10.7:1971-1972 requires every sharing flag zero.
-    let created = build_backing(
-        passive,
-        adapter,
-        Hwa2Backing::LinearMemory {
-            bytes: record.byte_size,
-            mappable: placement_rules.cpu_visible,
-            shareable: false,
-        },
-    )?;
-    if created.venus_alloc_size != 0 && created.venus_alloc_size < record.byte_size {
+    if record.byte_size == 0
+        || record.byte_size & (PAGE as u64 - 1) != 0
+        || record.byte_size > u32::MAX as u64
+    {
         bump(&CREATE_SIZE_REJECT, b"AcSize");
-        release_orphan_backing(passive, adapter, &created);
         return Err(STATUS_INVALID_PARAMETER);
+    }
+    let placement = hvm1_placement(role);
+    if !segment_is_reported(adapter, placement.preferred_segment) {
+        let (counter, name) = role_segment_absent_counter(role);
+        bump(counter, name);
+        return Err(STATUS_NOT_SUPPORTED);
     }
 
     let Some(generation) = allocation_object::mint() else {
         bump(&CREATE_GENERATION_EXHAUSTED, b"AcGenExh");
-        release_orphan_backing(passive, adapter, &created);
         // `STATUS_NO_MEMORY`, not `STATUS_INSUFFICIENT_RESOURCES`: the former is
         // in this DDI's documented return set and the latter is not, and
         // dxgkrnl logs an illegal NTSTATUS as a driver bug ("Driver returned an
@@ -4055,7 +3967,6 @@ unsafe fn admit_hvm1(
         .is_err()
     {
         bump(&CREATE_HVM1_OUTPUT_REJECT, b"AcHvm1Out");
-        release_orphan_backing(passive, adapter, &created);
         return Err(STATUS_INVALID_PARAMETER);
     }
     // SAFETY: length proven exactly `HELIOS_HVM1_SIZE` above; the runtime owns a
@@ -4065,9 +3976,11 @@ unsafe fn admit_hvm1(
 
     Ok(AdmittedAllocation {
         kind: ALLOC_KIND_HVM1,
+        hvm1_role: role.to_u32(),
+        share_backing_store: true,
         generation,
         final_hwa2: None,
-        vidmm_size: round_up_page(created.blob_size.bytes().max(record.byte_size) as SIZE_T),
+        vidmm_size: record.byte_size as SIZE_T,
         // The same value the segment check above interrogated — computed once so
         // the placement that was validated is the placement that ships.
         placement,
@@ -4079,22 +3992,10 @@ unsafe fn admit_hvm1(
         plane_offset: 0,
         pitch: 0,
         direct_scanout: false,
-        // ⛔ NOT BAR-eligible by default. An HVM1 object's placement is HLM1 plus
-        // the ordinary aperture (§10.7:1999-2002); the CpuHostAperture BAR path is
-        // the mechanism §17.6 deletes, and routing native-Vulkan memory through
-        // it would re-create exactly what the retirement removes.
-        //
-        // ⚠ `Hlm1Bar` opens it anyway, because F16 measured that no HLM1
-        // configuration produces an aliased CPU view and this is the one path on
-        // this driver that demonstrably does. Same three terms as the D3D11
-        // predicate: a host-authoritative blob, a CPU view, and a reported BAR
-        // segment (the last is implied by the `segment_is_reported` check above,
-        // which already returned for a table without HLM1).
-        bar_eligible: knobs.hlm1_bar
-            && created.blob_size.is_host_authoritative()
-            && placement_rules.cpu_visible,
-        size_provenance: created.blob_size,
-        backing: Some(created),
+        // Shared-backing HVM1 never enters the legacy CpuHostAperture path.
+        bar_eligible: false,
+        size_provenance: BackingSize::SharedBackingStore(record.byte_size),
+        backing: None,
     })
 }
 
@@ -4184,6 +4085,8 @@ unsafe fn admit_hoc1(
 
     Ok(AdmittedAllocation {
         kind: ALLOC_KIND_HOC1,
+        hvm1_role: 0,
+        share_backing_store: false,
         generation,
         final_hwa2: None,
         vidmm_size: round_up_page(record.byte_size as SIZE_T),
@@ -4375,7 +4278,8 @@ unsafe fn create_one(
     let ctx = Box::new(AllocationContext {
         magic: ALLOCATION_CTX_MAGIC,
         ctx_id: adapter.venus_ctx_id(),
-        resource_id,
+        resource_id: AtomicU32::new(resource_id),
+        backing_store_state: AtomicU32::new(BACKING_STORE_UNBOUND),
         transport_instance: if crate::virtio::KMD_D2_OWNER_ENABLED {
             adapter
                 .with_virtio(|gpu| gpu.scanout_transport_instance())
@@ -4385,6 +4289,7 @@ unsafe fn create_one(
         },
         generation: admitted.generation,
         kind: admitted.kind,
+        hvm1_role: admitted.hvm1_role,
         final_hwa2: admitted.final_hwa2,
         venus_memory_id: backing.map_or(0, |b| b.venus_memory_id),
         venus_image_id: backing.map_or(0, |b| b.venus_image_id),
@@ -4472,30 +4377,8 @@ unsafe fn create_one(
                 .__bindgen_anon_1
                 .set_AccessedPhysically(1);
         }
-        // ⚠ FIRST-TIME FIELD WRITE, and reported as such: `grep -rn
-        // ExplicitResidencyNotification kmd_render/src/` was empty before this
-        // change. §10.7:2002-2003 requires it on every HVM1 role and
-        // §18.1:4751-4753 gates it. It is set only where the doc requires it —
-        // `vidmm_placement` leaves it false — so the proven D3D11 surface is
-        // byte-identical and the new bit rides only on the HVM1 path.
-        //
-        // ⛔ CORRECTED after round 3: this comment used to attribute the bit's
-        // unreachability to `admit_hvm1`'s segment check, "for as long as the
-        // reported table lacks the role's preferred segment" — a condition that
-        // would LIFT, and which implies HVM1 creates arrive and are refused.
-        // They do not arrive at all: **nothing in this package produces an HVM1
-        // record**, so `admit_hvm1` has never been called (its banner has the
-        // measurement). Two consequences a reader needs: the bit is unreachable
-        // for a reason no other lane's schedule changes, and it stays unreachable
-        // after K2 lands — the producer is mesa unit A3, not K2. And the segment
-        // check is *additionally* wrong to lean on here: measured at HEAD,
-        // `HELIOS_SEGMENT_ID_HLM1` is the constant 2 and `SegmentTable::iter`
-        // numbers positionally from 1, so the production `[Aperture, Bar]` table
-        // **already reports id 2** and `segment_is_reported` returns true.
-        //
-        // The A/B disable is `hvm1_placement`'s
-        // `explicit_residency_notification` field (CLAUDE.md rule 8: the
-        // opposite value stays reachable).
+        // HVM1 alone requests explicit residency notification; ordinary D3D11
+        // placement remains byte-identical.
         if placement.explicit_residency_notification {
             info.__bindgen_anon_4
                 .FlagsWddm2
@@ -4517,27 +4400,8 @@ unsafe fn create_one(
                 .__bindgen_anon_1
                 .set_Cached(1);
         }
-        // ⚠ TWO MORE FIRST-TIME FIELD WRITES, into a union member this driver
-        // has never touched: `grep -rn Flags2 kmd_render/src/` was empty.
-        // §10.7:2005-2007 requires both on every HVM1 role; §18.1:4752-4753
-        // gates them. `Flags2` is a WDDM-3.2 field and
-        // `ddi/wddm_surface.rs` still declares `Wddm2_1GpuMmu`, so these bits
-        // are INERT until the single activation commit that flips the surface
-        // (`docs/retirement/OWNERSHIP.md` §3 makes that the last edit of the
-        // whole retirement). That is correct, not a bug to "fix" — do not
-        // conclude from an unchanged `PgUn`/residency trace that the writes are
-        // not happening.
-        //
-        // ⛔ AND THERE IS A SECOND, STRONGER REASON, added after round 3, because
-        // the paragraph above names only a condition that will lift and so reads
-        // as "these go live at the SURFACE flip". They do not. Both bits ride on
-        // `placement`, which on this path is `hvm1_placement`'s — and **nothing
-        // in this package produces an HVM1 record**, so `admit_hvm1` has never
-        // run (see its banner). Flipping `SURFACE` alone will not exercise these
-        // writes; the producer is mesa unit A3. `K4-CONTRACT.md` §8 obligation 8
-        // says "treat as unexercised until measured on the target" — it is
-        // stronger than that: it cannot be measured on the target at all until
-        // A3 lands, and that is what the acceptance table must say.
+        // These two residency constraints remain HVM1-only. The adjacent
+        // shared-backing bit is additionally gated by the admitted OS feature.
         if placement.disable_partial_residency {
             info.Flags2
                 .__bindgen_anon_1
@@ -4549,6 +4413,12 @@ unsafe fn create_one(
                 .__bindgen_anon_1
                 .__bindgen_anon_1
                 .set_RestrictedToSingleSegment(1);
+        }
+        if admitted.share_backing_store {
+            info.Flags2
+                .__bindgen_anon_1
+                .__bindgen_anon_1
+                .set_ShareBackingStoreWithKmd(1);
         }
     }
     // Allocation creation is not a scanout-selection event. Modern DWM creates
@@ -4657,10 +4527,9 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
 
     // The OUTER call's shape, captured once and passed to every allocation.
     // `hResource` is read BEFORE the mint above could have replaced it — hence
-    // `input_resource`, not `args.hResource`: HVM1/HOC1 require "no runtime
-    // resource handle", and a handle this DDI minted itself is not one the
-    // caller supplied. Reading the post-mint value would make the check answer
-    // the wrong question.
+    // `input_resource`, not `args.hResource`: a newly created HVM1 resource and
+    // bare HOC1 both require a null input handle. A handle this DDI minted is
+    // output state, so reading it here would answer the wrong question.
     let shape = CreateCallShape {
         flags: create_flags,
         has_resource_handle: input_resource != 0,
@@ -4703,6 +4572,169 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
     // are cumulative atomics, so skipping it there costs mirror latency and never
     // a wrong number.
     dump_alloc_counters();
+    STATUS_SUCCESS
+}
+
+/// Bind the OS-owned shared section to the exact HVM1 allocation and import its
+/// locked PFNs as a guest-memory Venus blob. No user VA or process identity is
+/// carried: Lock2 maps the same section in the exact calling process by the
+/// ordinary WDDM allocation lifetime.
+pub unsafe extern "C" fn dxgkddi_set_allocation_backing_store(
+    h_adapter: IN_CONST_HANDLE,
+    set_backing: IN_CONST_PDXGKARG_SETALLOCATIONBACKINGSTORE,
+) -> NTSTATUS {
+    if h_adapter.is_null() || set_backing.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if unsafe { KeGetCurrentIrql() } != crate::irql::PASSIVE_LEVEL_IRQL {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+    let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    if !adapter.share_backing_store_with_kmd() {
+        return STATUS_NOT_SUPPORTED;
+    }
+    let args = unsafe { &*set_backing };
+    if args.pBackingStore.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some(ctx) = (unsafe { resolve_alloc(args.hDriverAllocation) }) else {
+        return STATUS_INVALID_HANDLE;
+    };
+    let Some(role) = Hvm1Role::from_u32(ctx.hvm1_role) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    let current_transport = adapter
+        .with_virtio(|gpu| gpu.scanout_transport_instance())
+        .ok();
+    if ctx.kind != ALLOC_KIND_HVM1
+        || !role.placement().cpu_visible
+        || ctx.resource_id() != 0
+        || !allocation_object::is_current(ctx.generation)
+        || ctx.ctx_id == 0
+        || ctx.ctx_id != adapter.venus_ctx_id()
+        || current_transport != Some(ctx.transport_instance)
+    {
+        return STATUS_NOT_SUPPORTED;
+    }
+    let bytes = ctx.size as u64;
+    if !matches!(ctx.size_provenance, BackingSize::SharedBackingStore(n) if n == bytes)
+        || bytes == 0
+        || bytes > (u32::MAX as u64 - (PAGE as u64 - 1))
+        || bytes & (PAGE as u64 - 1) != 0
+        || (args.pBackingStore as usize) & (PAGE as usize - 1) != 0
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let page_count = (bytes >> HELIOS_HVM1_SEGMENT_PAGE_SHIFT) as usize;
+    let mut entries = Vec::<VirtioGpuMemEntry>::new();
+    if entries.try_reserve_exact(page_count).is_err() {
+        return STATUS_NO_MEMORY;
+    }
+    if ctx
+        .backing_store_state
+        .compare_exchange(
+            BACKING_STORE_UNBOUND,
+            BACKING_STORE_BINDING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
+
+    let mdl = unsafe {
+        IoAllocateMdl(
+            args.pBackingStore,
+            bytes as u32,
+            0,
+            0,
+            core::ptr::null_mut(),
+        )
+    };
+    if mdl.is_null() {
+        ctx.backing_store_state
+            .store(BACKING_STORE_UNBOUND, Ordering::Release);
+        return STATUS_NO_MEMORY;
+    }
+    if unsafe { helios_mm_probe_and_lock_pages_seh(mdl) } == 0 {
+        unsafe { IoFreeMdl(mdl) };
+        ctx.backing_store_state
+            .store(BACKING_STORE_UNBOUND, Ordering::Release);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let pfns = unsafe { helios_mm_get_mdl_pfn_array(mdl) };
+    let mut valid = !pfns.is_null();
+    for index in 0..page_count {
+        let pfn = unsafe { *pfns.add(index) };
+        if pfn > (u64::MAX >> HELIOS_HVM1_SEGMENT_PAGE_SHIFT) {
+            valid = false;
+            break;
+        }
+        let address = pfn << HELIOS_HVM1_SEGMENT_PAGE_SHIFT;
+        if let Some(last) = entries.last_mut() {
+            let end = last.addr.checked_add(last.length as u64);
+            if end == Some(address) && last.length <= u32::MAX - PAGE as u32 {
+                last.length += PAGE as u32;
+                continue;
+            }
+        }
+        entries.push(VirtioGpuMemEntry {
+            addr: address,
+            length: PAGE as u32,
+            padding: 0,
+        });
+    }
+    let exported = entries
+        .iter()
+        .try_fold(0u64, |sum, entry| sum.checked_add(entry.length as u64));
+    if !valid || exported != Some(bytes) {
+        unsafe {
+            wdk_sys::ntddk::MmUnlockPages(mdl);
+            IoFreeMdl(mdl);
+        }
+        ctx.backing_store_state
+            .store(BACKING_STORE_UNBOUND, Ordering::Release);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let blob_flags = match role {
+        Hvm1Role::ReplyPool | Hvm1Role::Feedback => VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+        Hvm1Role::VulkanHostVisible => {
+            VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE | VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE
+        }
+        Hvm1Role::VulkanDeviceLocal => {
+            unsafe {
+                wdk_sys::ntddk::MmUnlockPages(mdl);
+                IoFreeMdl(mdl);
+            }
+            ctx.backing_store_state
+                .store(BACKING_STORE_UNBOUND, Ordering::Release);
+            return STATUS_NOT_SUPPORTED;
+        }
+    };
+    let passive = unsafe { PassiveLevel::assume() };
+    let resource_id = match crate::virtio::ctrl::resource_create_guest_blob(
+        passive,
+        adapter,
+        ctx.ctx_id,
+        blob_flags,
+        bytes,
+        &entries,
+        mdl as usize,
+    ) {
+        Ok(resource_id) => resource_id,
+        Err(error) => {
+            return error.into();
+        }
+    };
+
+    ctx.backing_store_state
+        .store(BACKING_STORE_BOUND, Ordering::Relaxed);
+    ctx.resource_id.store(resource_id, Ordering::Release);
+    crate::diag::record_named_bytes(b"ShBkOk", resource_id);
     STATUS_SUCCESS
 }
 
@@ -4946,9 +4978,21 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         // An ordinary open reads the record the creating open already published.
         let open_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
         let hvm1 = if open_flags & DXGK_OPENALLOCATION_FLAG_CREATE != 0 {
-            unsafe { stamp_open_hvm1(info.pPrivateDriverData, info.PrivateDriverDataSize) }
+            unsafe {
+                stamp_open_hvm1(
+                    info.pPrivateDriverData,
+                    info.PrivateDriverDataSize,
+                    canonical_allocation,
+                )
+            }
         } else {
-            unsafe { read_open_hvm1(info.pPrivateDriverData, info.PrivateDriverDataSize) }
+            unsafe {
+                read_open_hvm1(
+                    info.pPrivateDriverData,
+                    info.PrivateDriverDataSize,
+                    canonical_allocation,
+                )
+            }
         };
         // What the guest was TOLD, for K6 to check its use records against.
         // HWA2's generation comes from the descriptor for the same reason: it is
@@ -5120,6 +5164,7 @@ unsafe fn read_open_descriptor(
 unsafe fn read_open_hvm1(
     private: *const c_void,
     private_size: UINT,
+    canonical_allocation: usize,
 ) -> Option<(Hvm1Role, u64, u64)> {
     if private.is_null() || private_size as usize != HELIOS_HVM1_SIZE as usize {
         return None;
@@ -5134,6 +5179,14 @@ unsafe fn read_open_hvm1(
     let role = record
         .validate(HELIOS_PACKAGE_GENERATION, Hvm1Stage::CreateOutput)
         .ok()?;
+    let ctx = unsafe { resolve_alloc(canonical_allocation as HANDLE) }?;
+    if ctx.kind != ALLOC_KIND_HVM1
+        || ctx.hvm1_role != role.to_u32()
+        || ctx.size as u64 != record.byte_size
+        || ctx.generation != record.object_generation
+    {
+        return None;
+    }
     Some((role, record.byte_size, record.object_generation))
 }
 
@@ -5167,10 +5220,9 @@ pub(crate) unsafe fn open_allocation_identity(h: HANDLE) -> Option<OpenIdentity>
 /// path's identical write is discarded — see [`OPEN_HVM1_STAMPED`] for the
 /// measurement.
 ///
-/// The "two openers disagree" defect the no-restamp rule exists for cannot reach
-/// an HVM1: §10.7:1971-1972 requires every sharing flag zero, so an HVM1 has
-/// exactly one opener by construction. Belt and braces anyway — an already
-/// stamped buffer is republished as-is rather than re-minted.
+/// An already stamped buffer is republished as-is rather than re-minted, so
+/// every ordinary or shared-resource open observes the canonical allocation's
+/// one generation.
 ///
 /// # Safety
 /// `private` is dxgkrnl's per-allocation private buffer and `private_size` its
@@ -5178,6 +5230,7 @@ pub(crate) unsafe fn open_allocation_identity(h: HANDLE) -> Option<OpenIdentity>
 unsafe fn stamp_open_hvm1(
     private: *mut c_void,
     private_size: UINT,
+    canonical_allocation: usize,
 ) -> Option<(Hvm1Role, u64, u64)> {
     if private.is_null() || private_size as usize != HELIOS_HVM1_SIZE as usize {
         return None;
@@ -5195,18 +5248,26 @@ unsafe fn stamp_open_hvm1(
     if record.magic != HELIOS_HVM1_MAGIC {
         return None;
     }
+    let ctx = unsafe { resolve_alloc(canonical_allocation as HANDLE) }?;
+    if ctx.kind != ALLOC_KIND_HVM1 {
+        return None;
+    }
     // Already complete: a second open, or a buffer dxgkrnl kept from a first one.
     if let Ok(role) = record.validate(HELIOS_PACKAGE_GENERATION, Hvm1Stage::CreateOutput) {
-        return Some((role, record.byte_size, record.object_generation));
+        return (ctx.hvm1_role == role.to_u32()
+            && ctx.size as u64 == record.byte_size
+            && ctx.generation == record.object_generation)
+            .then_some((role, record.byte_size, record.object_generation));
     }
     let Ok(role) = record.validate(HELIOS_PACKAGE_GENERATION, Hvm1Stage::CreateInput) else {
         bump(&OPEN_HVM1_REJECT, b"OaHvm1Rej");
         return None;
     };
-    let Some(generation) = allocation_object::mint() else {
+    if ctx.hvm1_role != role.to_u32() || ctx.size as u64 != record.byte_size {
         bump(&OPEN_HVM1_REJECT, b"OaHvm1Rej");
         return None;
-    };
+    }
+    let generation = ctx.generation;
     // The same three fields, and the same values, `admit_hvm1` computes
     // (§10.7:1955, :1960, :1961). Every backing this driver creates is
     // page-granular, so `PAGE` is the exact alignment.

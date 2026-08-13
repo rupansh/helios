@@ -179,6 +179,16 @@ pub struct VirtioGpuResourceCreateBlob {
     pub size: u64,
 }
 
+/// One guest-physical range following `VirtioGpuResourceCreateBlob` when
+/// `blob_mem == VIRTIO_GPU_BLOB_MEM_GUEST`. 16 bytes.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct VirtioGpuMemEntry {
+    pub addr: u64,
+    pub length: u32,
+    pub padding: u32,
+}
+
 /// `VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB`. 40 bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Pod, Zeroable)]
@@ -578,6 +588,7 @@ mod virtio_bindings_pin {
             VirtioGpuResourceCreateBlob,
             vb::virtio_gpu_resource_create_blob
         );
+        pin_layout!(VirtioGpuMemEntry, vb::virtio_gpu_mem_entry);
         pin_layout!(VirtioGpuResourceMapBlob, vb::virtio_gpu_resource_map_blob);
         pin_layout!(
             VirtioGpuResourceUnmapBlob,

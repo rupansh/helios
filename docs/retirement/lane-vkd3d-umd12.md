@@ -3,7 +3,7 @@
 Reconnaissance brief. **No implementation code was written.** Source scope:
 `vkd3d-proton-helios/**` and `umd12/**`.
 
-Reference: `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` (**5973** lines, "the doc"
+Reference: `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` (**5976** lines, "the doc"
 below).
 
 ⛔ **Doc line numbers here were swept +10 on 2026-08-10 and mechanically
@@ -12,7 +12,9 @@ verified.** The doc was 5918 when this brief was written, 5928 after commit
 **appended** the SUPERSEDED CLAIMS INDEX at `:5932`. Only the banner moved
 anything: it shifted every body line after 8 by +10, so every citation written
 here before 2026-08-10 was 10 too low. All of them have now been shifted, and
-the sweep was checked by requiring each `§N.M`-anchored cite to land inside
+later append-only index corrections bring the current file to 5976 without
+moving any cited body line. The sweep was checked by requiring each
+`§N.M`-anchored cite to land inside
 §N.M's own heading-to-heading range — not by adding 10 on faith. ⚠ **Source-file line numbers were deliberately NOT touched** — `foo.rs:123`, `virtio-gpu-virgl.c` function ranges and the like are cites into the tree, not into the doc, and the banner never moved them. If a number here is not a doc line, it was correct before this sweep and is correct now. ⚠ The §10.3
 bullet in §1 and its `§17.5:4259-4263` cite were already corrected on 2026-08-10
 and were **not** shifted again. Re-grep the cited text before relying on any

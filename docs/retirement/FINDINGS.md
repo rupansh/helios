@@ -1557,6 +1557,9 @@ whose increment forces a flush) rather than from a positive trace.
 
 ## F17 — The escape-free CPU view is a WDDM **2.9** callback pair, and the driver declares **2.1**. K2a is not a memory-model problem; it is downstream of the version uplift the retirement already plans.
 
+⛔ **HISTORICAL; superseded by F18.** D9 raised the driver to WDDM 3.2 and
+K2a selected `ShareBackingStoreWithKmd`, not the physical-memory-object pair.
+
 **Researched 2026-08-11** (30 candidate mechanisms across six corpora, 29 refuted,
 1 survivor; the shipping-kit and ICD citations below re-verified by hand). This
 finding supersedes F16's recommendation section.
@@ -1660,3 +1663,92 @@ the field that records VidMm's own verdict is
 already issues the query per segment id; adding four fields to its printout is the
 cheapest open measurement in this finding — user-mode recompile only, no KMD build,
 no registry write, no reboot.
+
+---
+
+## F18 — K2a uses WDDM shared allocation backing, not F17's physical-memory-object route. The exact guest pages now back both Lock2 and the renderer blob.
+
+**Implemented and measured 2026-08-13.** This finding supersedes F17's selected
+mechanism and its statement that the driver still declares WDDM 2.1. F17 remains
+the historical record of why ordinary HLM1 placement and Lock2 did not alias the
+renderer blob.
+
+### The documented contract that closes the handoff
+
+Microsoft's [Sharing the backing store with KMD](https://learn.microsoft.com/en-us/windows-hardware/drivers/display/sharing-backing-store-with-kmd)
+contract is available to WDDM 3.1+ drivers. KMD must query
+`DXGK_FEATURE_SHARE_BACKING_STORE_WITH_KMD`, set
+`DXGK_ALLOCATIONINFOFLAGS2::ShareBackingStoreWithKmd` only when enabled, and
+receive the backing through `DXGKDDI_SETALLOCATIONBACKINGSTORE`; the allocation
+must be shared, CPU-visible, system-memory-only, and must not use supplied
+existing system memory. UMD then obtains its process-local address through the
+ordinary `D3DKMTLock2` path.
+
+That contract resolves F17's unanswered user-mode handoff without putting a
+pointer, handle, PID, renderer resource ID, or reusable lookup token in HVM1 or
+HNR2. The creating/opening process receives and retains its own Lock2 VA through
+normal WDDM lifetime objects; KMD receives the same backing-store pages through
+the new DDI. The physical-memory Create/Map/Unmap/Destroy callback family is not
+used by K2a.
+
+### Landed shape
+
+* D9 already raised `SURFACE` to `Wddm3_2GpuMmu`. StartDevice now copies only
+  `min(DXGKRNL_INTERFACE.Size, sizeof(DXGKRNL_INTERFACE))`, after requiring Size
+  coverage through the last callback it reads,
+  `DxgkCbQueryFeatureSupport`. Missing coverage or a disabled feature fails
+  StartDevice; there is no partial-callback or fallback arm.
+* HVM1 roles 1–3 are shared system-memory allocations with
+  `ShareBackingStoreWithKmd=1`. Role 4 refuses before backing mutation.
+  `DxgkDdiSetAllocationBackingStore` is PASSIVE-only, accepts the exact live
+  allocation object once, locks the supplied MDL, coalesces its PFNs with
+  checked size/range arithmetic, and creates an exact-size
+  `VIRTIO_GPU_BLOB_MEM_GUEST` Venus resource. Its three-state
+  UNBOUND/BINDING/BOUND publication is fail-closed: pre-dispatch failures return
+  to UNBOUND; an ambiguous post-dispatch failure remains BINDING and cannot be
+  retried as a second identity.
+* Normal teardown prevents new use, unrefs the renderer resource, observes the
+  fenced host response, and only then unlocks the backing MDL. Failed create
+  unwinds only completed steps in reverse order. The exact allocation/open/
+  process/session provenance and HVM1 generation remain the authority.
+* Role 1 is 4 MiB split into four 1 MiB slots. HVR1's 80-byte header leaves
+  1,048,496 bytes per reply chunk. A logical snapshot remains bounded at
+  64 MiB and uses continuation chunks; HNR2's independent 15 MiB command-payload
+  limit is unchanged. Package generation is 2.
+* `qemu-helios` was rebased onto upstream base `d49f87606a`; the five scoped K2a
+  commits end at `415a5ef078` and total 143 additions / 32 deletions. QEMU creates
+  one udmabuf from the exact guest ranges, imports it into the renderer, maps it
+  bidirectionally, and revokes it after renderer unref. virglrenderer is
+  unchanged; the HPM1 branch remains parked.
+
+The Linux host retained the stock udmabuf `list_limit=1024`. A 64 MiB trial
+needed 3,543 coalesced ranges and was correctly rejected. Measured 4 MiB
+allocations used 143–853 ranges, and even the page-by-page worst case is exactly
+1024, so the four 1 MiB role-1 slots need no kernel parameter change. This does
+**not** prove that a future arbitrarily large role-2/role-3 allocation fits:
+Mesa A3 must preserve an explicit size/fragmentation bound or fail loudly rather
+than assuming coalescing. K2a neither hides nor solves that future consumer
+policy.
+
+### Final-source target evidence
+
+KMD **22.22.288.0** loaded after the authorized guest reboot as `oem120.inf` on
+Windows build 26100. The deployed, re-signed SYS is **849,144 bytes**, SHA-256
+`df5903586a067b3c2e4047713278f92b38e7573e695fcd12bdd63d25d2556b86`.
+PnP is `CM_PROB_NONE`, dxdiag reports WDDM 3.2, and the KMD recorded
+`DXGKRNL_INTERFACE.Size=576` plus feature-enabled = 1. These are necessary only.
+
+`tools/k2a_shared_backing_probe.c` passed **52/52**: roles 1–3, explicit role-4
+refusal, eight create/map/unmap/destroy repetitions, teardown of an unclosed
+mapped allocation at process exit, fresh allocation after teardown,
+wrong-process raw-handle rejection, and stale-handle rejection. The stronger
+alias run correlated QEMU renderer resource `0x1f`, exact size 4 MiB, 430 guest
+ranges, first GPA `0x133c75000`, and last byte GPA `0x46055dff8`. Windows read
+the host's first/last sentinels; held host mappings then read Windows' replacement
+sentinels. Both sides exited successfully, and QEMU returned to its identical
+227-total-FD baseline: one `/dev/udmabuf` and two `/dmabuf:` descriptors.
+
+The display is still **runtime-unadmitted**: current DWM loads WARP and
+DisplayConfig reports zero paths. K11 and Mesa A3/A4 remain; Escape stays NULL.
+A successful map, Code 0, WDDM 3.2 string, counter, hash, or frozen frame is not
+visible-desktop evidence.

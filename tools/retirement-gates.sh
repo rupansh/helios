@@ -949,6 +949,12 @@ run_gate "D9 WDDM 3.2 activation package is coherent and mutation-closed" \
 run_gate "D9 WDDM 3.2 executable mutation suite" \
     python3 "$REPO/tools/d9-wddm32-activation-gate.py" "$REPO" --mutations
 
+run_gate "K2a shared-backing CPU view is exact and lifetime-closed" \
+    python3 "$REPO/tools/k2a-share-backing-store-gate.py" "$REPO"
+
+run_gate "K2a shared-backing executable mutation suite" \
+    python3 "$REPO/tools/k2a-share-backing-store-gate.py" "$REPO" --mutations
+
 run_gate "D4 classic/DMA DIRQL enqueue is capability-restricted and fixed-storage" \
     python3 "$REPO/tools/d4-dirql-gate.py" "$REPO"
 

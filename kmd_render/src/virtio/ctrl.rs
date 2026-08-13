@@ -51,13 +51,14 @@
 //! (`VirtioGpu::enqueue_scanout_bind_async`, ROADMAP defect 0ab-C) and the
 //! PASSIVE round-trip below cannot encode the same command differently.
 
+use alloc::vec::Vec;
 use core::cell::Cell;
 use core::mem::size_of;
 use core::ptr::NonNull;
 use core::sync::atomic::AtomicU32;
 
-use bytemuck::{bytes_of, Zeroable};
-use wdk_sys::ntddk::{KeDelayExecutionThread, KeWaitForSingleObject};
+use bytemuck::{bytes_of, cast_slice, Zeroable};
+use wdk_sys::ntddk::{IoFreeMdl, KeDelayExecutionThread, KeWaitForSingleObject, MmUnlockPages};
 use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::control_owner::ResourceBackingFinalizer;
@@ -82,14 +83,14 @@ use helios_kmd_logic::control_ownership::{
 use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
     VirtioGpuGetCapsetInfo, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush,
-    VirtioGpuResourceMapBlob, VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref,
+    VirtioGpuMemEntry, VirtioGpuResourceMapBlob, VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref,
     VirtioGpuRespCapsetInfo, VirtioGpuRespMapInfo, VirtioGpuSetScanoutBlob,
     VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY,
     VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE, VIRTIO_GPU_CMD_GET_CAPSET_INFO,
     VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_FLUSH,
     VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
     VIRTIO_GPU_CMD_RESOURCE_UNREF, VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_FLAG_FENCE,
-    VIRTIO_GPU_MAP_CACHE_MASK,
+    VIRTIO_GPU_MAP_CACHE_MASK, VIRTIO_GPU_BLOB_MEM_GUEST,
 };
 
 /// `KernelMode` (`KPROCESSOR_MODE`).
@@ -131,8 +132,35 @@ pub(crate) fn finalize_resource_backing_with_client(
         {
             return Err(finalizer);
         }
+        finalizer.memory_id = 0;
     }
+    release_guest_pages(&mut finalizer);
     Ok(())
+}
+
+fn release_guest_pages(finalizer: &mut ResourceBackingFinalizer) {
+    if finalizer.guest_mdl == 0 {
+        return;
+    }
+    let mdl = finalizer.guest_mdl as wdk_sys::PMDL;
+    finalizer.guest_mdl = 0;
+    // SAFETY: the SetAllocationBackingStore path owns a successfully probed and
+    // locked MDL. This finalizer is its sole release authority.
+    unsafe {
+        MmUnlockPages(mdl);
+        IoFreeMdl(mdl);
+    }
+}
+
+/// Physical reset has already made every host identity in the token inert.
+/// Venus ids need no command; guest pages still require their local unlock.
+pub(crate) fn finalize_resource_backing_after_reset(
+    _passive: PassiveLevel,
+    mut finalizer: ResourceBackingFinalizer,
+) {
+    finalizer.image_id = 0;
+    finalizer.memory_id = 0;
+    release_guest_pages(&mut finalizer);
 }
 
 fn finalize_resource_backing(
@@ -141,6 +169,11 @@ fn finalize_resource_backing(
     finalizer: ResourceBackingFinalizer,
 ) -> Result<(), ResourceBackingFinalizer> {
     if finalizer.is_empty() {
+        return Ok(());
+    }
+    if finalizer.image_id == 0 && finalizer.memory_id == 0 {
+        let mut finalizer = finalizer;
+        release_guest_pages(&mut finalizer);
         return Ok(());
     }
     let mut pending = Some(finalizer);
@@ -1592,6 +1625,7 @@ pub fn resource_create_blob(
         blob_flags,
         blob_id,
         size,
+        &[],
         None,
         ResourceBackingFinalizer::none(),
         &mut finalize,
@@ -1623,10 +1657,91 @@ where
         blob_flags,
         blob_id,
         size,
+        &[],
         None,
         finalizer,
         &mut finalize,
     )
+}
+
+/// Create and attach a blob whose exact backing is the supplied guest PFN
+/// ranges. The locked MDL is transferred into canonical owner custody before
+/// CREATE can reach the host.
+pub(crate) fn resource_create_guest_blob(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    blob_flags: u32,
+    size: u64,
+    entries: &[VirtioGpuMemEntry],
+    mdl: usize,
+) -> Result<u32, VirtioError> {
+    if mdl == 0 {
+        return Err(VirtioError::DeviceError);
+    }
+    if !super::control_owner::KMD_D2_OWNER_ENABLED {
+        let _ = finalize_resource_backing(
+            passive,
+            adapter,
+            ResourceBackingFinalizer::guest_pages(mdl),
+        );
+        return Err(VirtioError::DeviceError);
+    }
+    let mut finalize = |finalizer| finalize_resource_backing(passive, adapter, finalizer);
+    resource_create_blob_owned(
+        passive,
+        adapter,
+        ctx_id,
+        VIRTIO_GPU_BLOB_MEM_GUEST,
+        blob_flags,
+        0,
+        size,
+        entries,
+        None,
+        ResourceBackingFinalizer::guest_pages(mdl),
+        &mut finalize,
+    )
+}
+
+fn create_blob_request(
+    mut cmd: VirtioGpuResourceCreateBlob,
+    entries: &[VirtioGpuMemEntry],
+) -> Result<Vec<u8>, VirtioError> {
+    if cmd.blob_mem == VIRTIO_GPU_BLOB_MEM_GUEST {
+        if entries.is_empty() || entries.len() > u32::MAX as usize {
+            return Err(VirtioError::DeviceError);
+        }
+        let mut total = 0u64;
+        for entry in entries {
+            if entry.addr & 0xFFF != 0
+                || entry.length == 0
+                || entry.length & 0xFFF != 0
+                || entry.padding != 0
+            {
+                return Err(VirtioError::DeviceError);
+            }
+            total = total
+                .checked_add(entry.length as u64)
+                .ok_or(VirtioError::DeviceError)?;
+        }
+        if total != cmd.size {
+            return Err(VirtioError::DeviceError);
+        }
+    } else if !entries.is_empty() {
+        return Err(VirtioError::DeviceError);
+    }
+    cmd.nr_entries = entries.len() as u32;
+    let entry_bytes = cast_slice(entries);
+    let capacity = size_of::<VirtioGpuResourceCreateBlob>()
+        .checked_add(entry_bytes.len())
+        .ok_or(VirtioError::OutOfMemory)?;
+    let mut request = Vec::new();
+    request
+        .try_reserve_exact(capacity)
+        .map_err(|_| VirtioError::OutOfMemory)?;
+    request.extend_from_slice(bytes_of(&cmd));
+    request.extend_from_slice(entry_bytes);
+    Ok(request)
 }
 
 fn resource_create_blob_owned<F>(
@@ -1637,6 +1752,7 @@ fn resource_create_blob_owned<F>(
     blob_flags: u32,
     blob_id: u64,
     size: u64,
+    entries: &[VirtioGpuMemEntry],
     owner: Option<DeviceOwner>,
     finalizer: ResourceBackingFinalizer,
     finalize: &mut F,
@@ -1644,6 +1760,26 @@ fn resource_create_blob_owned<F>(
 where
     F: FnMut(ResourceBackingFinalizer) -> Result<(), ResourceBackingFinalizer>,
 {
+    let mut cmd = VirtioGpuResourceCreateBlob::zeroed();
+    cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    cmd.hdr.ctx_id = ctx_id;
+    cmd.blob_mem = blob_mem;
+    cmd.blob_flags = blob_flags;
+    cmd.blob_id = blob_id;
+    cmd.size = size;
+    let request = match create_blob_request(cmd, entries) {
+        Ok(request) => request,
+        Err(error) => {
+            if let Err(remaining) = finalize(finalizer) {
+                if super::control_owner::KMD_D2_OWNER_ENABLED {
+                    adapter
+                        .control_owner()
+                        .quarantine_resource_finalizer(remaining);
+                }
+            }
+            return Err(error);
+        }
+    };
     if super::control_owner::KMD_D2_OWNER_ENABLED {
         let (resource_id, work) = match adapter
             .control_owner()
@@ -1662,22 +1798,17 @@ where
                 return Err(error);
             }
         };
-        let mut cmd = VirtioGpuResourceCreateBlob::zeroed();
-        cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
-        cmd.hdr.ctx_id = ctx_id;
-        cmd.resource_id = resource_id;
-        cmd.blob_mem = blob_mem;
-        cmd.blob_flags = blob_flags;
-        cmd.nr_entries = 0;
-        cmd.blob_id = blob_id;
-        cmd.size = size;
+        let mut request = request;
+        let resource_offset = core::mem::offset_of!(VirtioGpuResourceCreateBlob, resource_id);
+        request[resource_offset..resource_offset + size_of::<u32>()]
+            .copy_from_slice(&resource_id.to_le_bytes());
         let mut response = [0u8; size_of::<VirtioGpuCtrlHdr>()];
         let observed = run_owner_work(
             passive,
             adapter,
             work,
             ControlVerb::Create,
-            bytes_of(&cmd),
+            &request,
             &mut response,
         );
         match adapter
@@ -1747,16 +1878,11 @@ where
             return Err(VirtioError::DeviceError);
         }
     };
-    let mut cmd = VirtioGpuResourceCreateBlob::zeroed();
-    cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
-    cmd.hdr.ctx_id = ctx_id;
-    cmd.resource_id = resource_id;
-    cmd.blob_mem = blob_mem;
-    cmd.blob_flags = blob_flags;
-    cmd.nr_entries = 0;
-    cmd.blob_id = blob_id;
-    cmd.size = size;
-    if let Err(e) = ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None) {
+    let mut request = request;
+    let resource_offset = core::mem::offset_of!(VirtioGpuResourceCreateBlob, resource_id);
+    request[resource_offset..resource_offset + size_of::<u32>()]
+        .copy_from_slice(&resource_id.to_le_bytes());
+    if let Err(e) = ctrl_roundtrip_ok(passive, adapter, &request, None) {
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
@@ -1796,6 +1922,7 @@ pub fn alloc_blob(
             blob_flags,
             blob_id,
             size,
+            &[],
             owner,
             ResourceBackingFinalizer::none(),
             &mut finalize,

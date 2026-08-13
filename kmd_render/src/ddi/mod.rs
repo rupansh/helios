@@ -60,7 +60,7 @@ pub use cpu_host_aperture::{
 pub use create_allocation::{
     dxgkddi_close_allocation, dxgkddi_create_allocation, dxgkddi_describe_allocation,
     dxgkddi_destroy_allocation, dxgkddi_get_standard_allocation_driver_data,
-    dxgkddi_open_allocation,
+    dxgkddi_open_allocation, dxgkddi_set_allocation_backing_store,
 };
 pub use diag_etw::{dxgkddi_collect_dbg_info2, dxgkddi_collect_diagnostic_info};
 pub(crate) use display::VIDPN_SOURCE_ADDRESS_COUNT;

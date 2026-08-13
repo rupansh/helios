@@ -284,6 +284,7 @@ probe_adapter(D3DKMT_HANDLE adapter, UINT index)
    }
 
    /* ── H. the role-1 HVM1 reply pool, exactly as A1 creates it ────────── */
+   D3DKMT_HANDLE pool_resource = 0;
    D3DKMT_HANDLE pool = 0;
    D3DKMT_HANDLE paging_queue = 0;
    {
@@ -309,11 +310,15 @@ probe_adapter(D3DKMT_HANDLE adapter, UINT index)
       ca.hDevice = device;
       ca.NumAllocations = 1;
       ca.pAllocationInfo2 = &info;
+      ca.Flags.CreateResource = 1;
+      ca.Flags.CreateShared = 1;
+      ca.Flags.NtSecuritySharing = 1;
       NTSTATUS s8 = D3DKMTCreateAllocation2(&ca);
       snprintf(why, sizeof(why), "status=0x%08x", (unsigned)s8);
       check(s8 == STATUS_SUCCESS_NT,
-            "H1: the 64-MiB role-1 HVM1 reply pool is created", why);
+            "H1: the 4-MiB role-1 HVM1 reply pool is created", why);
       if (s8 == STATUS_SUCCESS_NT) {
+         pool_resource = ca.hResource;
          pool = info.hAllocation;
          snprintf(why, sizeof(why),
                   "object_generation=%llu segment_page_shift=%u alignment=%llu",
@@ -394,12 +399,11 @@ probe_adapter(D3DKMT_HANDLE adapter, UINT index)
    }
 
    /* ── teardown, in A1's order ────────────────────────────────────────── */
-   if (pool) {
+   if (pool_resource) {
       D3DKMT_DESTROYALLOCATION2 da;
       memset(&da, 0, sizeof(da));
       da.hDevice = device;
-      da.phAllocationList = &pool;
-      da.AllocationCount = 1;
+      da.hResource = pool_resource;
       IGNORE_STATUS(D3DKMTDestroyAllocation2(&da));
    }
    if (paging_queue) {

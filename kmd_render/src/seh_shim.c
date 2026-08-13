@@ -15,7 +15,17 @@
  */
 
 typedef void *PVOID;
-typedef struct _MDL *PMDL;
+typedef struct _MDL {
+    struct _MDL *Next;
+    short Size;
+    short MdlFlags;
+    PVOID Process;
+    PVOID MappedSystemVa;
+    PVOID StartVa;
+    unsigned long ByteCount;
+    unsigned long ByteOffset;
+} MDL, *PMDL;
+typedef char helios_mdl_size_must_be_48[(sizeof(MDL) == 48) ? 1 : -1];
 
 PVOID
 MmMapLockedPagesSpecifyCache(
@@ -25,6 +35,11 @@ MmMapLockedPagesSpecifyCache(
     PVOID RequestedAddress,
     unsigned long BugCheckOnFailure,
     unsigned long Priority);
+
+void
+MmProbeAndLockPages(PMDL MemoryDescriptorList,
+                    signed char AccessMode,
+                    int Operation);
 
 #define EXCEPTION_EXECUTE_HANDLER 1
 
@@ -42,4 +57,21 @@ helios_mm_map_locked_pages_user_seh(
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return (PVOID)0;
     }
+}
+
+int
+helios_mm_probe_and_lock_pages_seh(PMDL Mdl)
+{
+    __try {
+        MmProbeAndLockPages(Mdl, /*KernelMode*/ 0, /*IoModifyAccess*/ 2);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+unsigned long long *
+helios_mm_get_mdl_pfn_array(PMDL Mdl)
+{
+    return (unsigned long long *)(Mdl + 1);
 }
