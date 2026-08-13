@@ -1914,7 +1914,7 @@ pub(crate) static RESIDENCY_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(crate) static MPO_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(crate) static PRESENT1_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(crate) static DXGI13_RESERVED_LOG_COUNT: LogThrottle = LogThrottle::new();
-pub(crate) const DXGI_MPO_MAX_PLANES: u32 = 16;
+pub(crate) const DXGI_MPO_MAX_PLANES: u32 = 1;
 
 pub(crate) unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32 {
     if arg.is_null() {
@@ -2118,66 +2118,53 @@ pub(crate) unsafe extern "C" fn dxgi_reclaim_resources(
     0
 }
 
-// ---------------------------------------------------------------------------
-// R830 (OWNER DECISION): name the literals, DO NOT change the values.
-// ---------------------------------------------------------------------------
-//
-// Helios advertises MaxPlanes = 16, 16x stretch and shrink, and BILINEAR
-// filtering, while the KMD deliberately does not register the MPO3 interface
-// (query_adapter_info.rs pins the display surface to WDDM 2.1) and dxgi_blt1
-// rejects any stretch with DXGI_ERROR_UNSUPPORTED. So these are caps with no
-// kernel overlay path behind them.
-//
-// The review's own correction stands and is worth keeping visible: the plane
-// count IS already a named constant (DXGI_MPO_MAX_PLANES), and
-// `dxgi_present_mpo` forwarding only (allocation, subresource) is CORRECT --
-// DXGIDDICB_PRESENT_MULTIPLANE_OVERLAY has no geometry fields at all. Plane
-// attributes reach the kernel through dxgkrnl's MPO VidPn DDIs, which is
-// exactly where Helios has nothing. The unjustified literals were the two 16.0
-// factors, BILINEAR and NumCapabilityGroups: 1 -- named below.
-//
-// Reducing the advertised caps is behaviour-affecting: DWM picks its
-// composition strategy from them, and the direct-primary scanout path is this
-// tranche's frozen baseline. DEFERRED pending same-boot evidence on whether DWM
-// queries MPO at all (zero GetMultiplaneOverlayCaps / MPO-plane lines appear in
-// any UMD log on this box, but those logs predate the tranche by three weeks --
-// re-sample at the gate). See the ROADMAP T5 entry.
-/// The four MPO feature-cap bits Helios advertises. Hoisted to module scope by
-/// R830 so `HELIOS_MPO_OVERLAY_CAPS` below can be the single composition.
+// D9 publishes one atomic UMD/KMD display profile. This is DWM's primary
+// plane, not a claim of extra overlay hardware: one RGB plane, no scale,
+// sharing, immediate flip, transform, stereo, YUV, or post-composition.
 pub(crate) const RGB: u32 =
     ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_RGB
         as u32;
-pub(crate) const BILINEAR: u32 = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_BILINEAR_FILTER
-    as u32;
-pub(crate) const SHARED: u32 =
-    ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_SHARED
-        as u32;
-pub(crate) const IMMEDIATE: u32 =
-    ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_IMMEDIATE
-        as u32;
-
-/// Maximum stretch the caps advertise. NOT implemented: `dxgi_blt1` refuses any
-/// stretch with DXGI_ERROR_UNSUPPORTED.
-pub(crate) const HELIOS_MPO_MAX_STRETCH: f32 = 16.0;
-/// Maximum shrink the caps advertise. Same caveat as the stretch factor.
-pub(crate) const HELIOS_MPO_MAX_SHRINK: f32 = 16.0;
-/// One capability group, covering all planes.
+pub(crate) const HELIOS_MPO_MAX_STRETCH: f32 = 1.0;
+pub(crate) const HELIOS_MPO_MAX_SHRINK: f32 = 1.0;
 pub(crate) const HELIOS_MPO_GROUPS: u32 = 1;
-/// The advertised overlay feature caps. BILINEAR is the questionable member --
-/// there is no filter path behind it.
-pub(crate) const HELIOS_MPO_OVERLAY_CAPS: u32 = RGB | BILINEAR | SHARED | IMMEDIATE;
+pub(crate) const HELIOS_MPO_OVERLAY_CAPS: u32 = RGB;
+
+const MPO_PRESENT_FLIP_FLAG: u32 = 0x2;
+
+fn same_mpo_rect(left: &ddi::RECT, right: &ddi::RECT) -> bool {
+    left.left == right.left
+        && left.top == right.top
+        && left.right == right.right
+        && left.bottom == right.bottom
+}
+
+fn full_resource_mpo_rect(rect: &ddi::RECT, width: u32, height: u32) -> bool {
+    let (Ok(width), Ok(height)) = (i32::try_from(width), i32::try_from(height)) else {
+        return false;
+    };
+    rect.left == 0
+        && rect.top == 0
+        && rect.right == width
+        && rect.bottom == height
+        && width != 0
+        && height != 0
+}
 
 pub(crate) unsafe extern "C" fn dxgi_get_mpo_caps(
     arg: *mut ddi::DXGI_DDI_ARG_GETMULTIPLANEOVERLAYCAPS,
 ) -> i32 {
-    if arg.is_null() {
-        return 0;
+    if arg.is_null() || !arg.is_aligned() {
+        return E_INVALIDARG;
     }
-    let a = &mut *arg;
-    a.MultiplaneOverlayCaps = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_CAPS {
+    let vidpn_source_id = core::ptr::addr_of!((*arg).VidPnSourceId).read();
+    if vidpn_source_id != 0 {
+        return E_INVALIDARG;
+    }
+    let caps = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_CAPS {
         MaxPlanes: DXGI_MPO_MAX_PLANES,
         NumCapabilityGroups: HELIOS_MPO_GROUPS,
     };
+    core::ptr::addr_of_mut!((*arg).MultiplaneOverlayCaps).write(caps);
     if MPO_LOG_COUNT.first_n(16).is_some() {
         log_error!(
             "DXGI GetMultiplaneOverlayCaps: MaxPlanes={} groups=1",
@@ -2190,27 +2177,28 @@ pub(crate) unsafe extern "C" fn dxgi_get_mpo_caps(
 pub(crate) unsafe extern "C" fn dxgi_get_mpo_group_caps(
     arg: *mut ddi::DXGI_DDI_ARG_GETMULTIPLANEOVERLAYGROUPCAPS,
 ) -> i32 {
-    if arg.is_null() {
-        return 0;
+    if arg.is_null() || !arg.is_aligned() {
+        return E_INVALIDARG;
     }
-    let a = &mut *arg;
-    a.MultiplaneOverlayGroupCaps = if a.GroupIndex == 0 {
-        ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS {
-            NumPlanes: DXGI_MPO_MAX_PLANES,
-            MaxStretchFactor: HELIOS_MPO_MAX_STRETCH,
-            MaxShrinkFactor: HELIOS_MPO_MAX_SHRINK,
-            OverlayCaps: HELIOS_MPO_OVERLAY_CAPS,
-            StereoCaps: 0,
-        }
-    } else {
-        ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS::default()
+    let vidpn_source_id = core::ptr::addr_of!((*arg).VidPnSourceId).read();
+    let group_index = core::ptr::addr_of!((*arg).GroupIndex).read();
+    if vidpn_source_id != 0 || group_index != 0 {
+        return E_INVALIDARG;
+    }
+    let caps = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS {
+        NumPlanes: DXGI_MPO_MAX_PLANES,
+        MaxStretchFactor: HELIOS_MPO_MAX_STRETCH,
+        MaxShrinkFactor: HELIOS_MPO_MAX_SHRINK,
+        OverlayCaps: HELIOS_MPO_OVERLAY_CAPS,
+        StereoCaps: 0,
     };
+    core::ptr::addr_of_mut!((*arg).MultiplaneOverlayGroupCaps).write(caps);
     if MPO_LOG_COUNT.first_n(16).is_some() {
         log_error!(
             "DXGI GetMultiplaneOverlayGroupCaps: group={} planes={} caps=0x{:x}",
-            a.GroupIndex,
-            a.MultiplaneOverlayGroupCaps.NumPlanes,
-            a.MultiplaneOverlayGroupCaps.OverlayCaps
+            group_index,
+            caps.NumPlanes,
+            caps.OverlayCaps
         );
     }
     0
@@ -2220,23 +2208,119 @@ pub(crate) unsafe extern "C" fn dxgi_present_mpo(
     arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPLANEOVERLAY,
 ) -> i32 {
     probe_entry_attempt(PresentBoundaryEntry::Mpo);
-    if arg.is_null() {
-        probe_early_refusal(PresentBoundaryEntry::Mpo, "null MPO argument");
+    if arg.is_null() || !arg.is_aligned() {
+        probe_early_refusal(PresentBoundaryEntry::Mpo, "null or misaligned MPO argument");
         return E_INVALIDARG;
     }
-    let a = &*arg;
-    if a.PresentPlaneCount == 0 || a.pPresentPlanes.is_null() {
-        probe_early_refusal(PresentBoundaryEntry::Mpo, "no MPO planes");
-        log_error!("DXGI PresentMultiplaneOverlay: no present planes");
-        return E_INVALIDARG;
-    }
-    if a.PresentPlaneCount > DXGI_MPO_MAX_PLANES {
-        probe_early_refusal(PresentBoundaryEntry::Mpo, "too many MPO planes");
+    let a = core::ptr::read(arg);
+    if a.PresentPlaneCount != DXGI_MPO_MAX_PLANES {
+        probe_early_refusal(
+            PresentBoundaryEntry::Mpo,
+            "MPO plane count is not exactly one",
+        );
         log_error!(
-            "DXGI PresentMultiplaneOverlay: too many planes {}",
+            "DXGI PresentMultiplaneOverlay: expected one plane, got {}",
             a.PresentPlaneCount
         );
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    if a.pPresentPlanes.is_null() || !a.pPresentPlanes.is_aligned() {
+        probe_early_refusal(PresentBoundaryEntry::Mpo, "null or misaligned MPO plane");
         return E_INVALIDARG;
+    }
+    if a.Reserved != 0 {
+        probe_early_refusal(PresentBoundaryEntry::Mpo, "nonzero MPO reserved field");
+        return E_INVALIDARG;
+    }
+    if a.VidPnSourceId != 0 {
+        probe_early_refusal(PresentBoundaryEntry::Mpo, "MPO source is not source zero");
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    let present_flags =
+        core::ptr::read((&a.Flags as *const ddi::DXGI_DDI_PRESENT_FLAGS).cast::<u32>());
+    if present_flags != MPO_PRESENT_FLIP_FLAG {
+        probe_early_refusal(PresentBoundaryEntry::Mpo, "unsupported MPO present flags");
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    if !(ddi::DXGI_DDI_FLIP_INTERVAL_TYPE_DXGI_DDI_FLIP_INTERVAL_ONE
+        ..=ddi::DXGI_DDI_FLIP_INTERVAL_TYPE_DXGI_DDI_FLIP_INTERVAL_FOUR)
+        .contains(&a.FlipInterval)
+    {
+        probe_early_refusal(
+            PresentBoundaryEntry::Mpo,
+            "immediate or invalid MPO interval",
+        );
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+
+    let plane = core::ptr::read(a.pPresentPlanes);
+    let attrs = plane.PlaneAttributes;
+    if plane.LayerIndex != 0 || plane.Enabled != 1 || plane.hResource == 0 {
+        probe_early_refusal(
+            PresentBoundaryEntry::Mpo,
+            "MPO plane is not enabled layer zero",
+        );
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+    if plane.SubResourceIndex != 0
+        || attrs.Flags != 0
+        || attrs.Rotation
+            != ddi::DXGI_DDI_MODE_ROTATION_DXGI_DDI_MODE_ROTATION_IDENTITY
+        || attrs.Blend
+            != ddi::DXGI_DDI_MULTIPLANE_OVERLAY_BLEND_DXGI_DDI_MULTIPLANE_OVERLAY_BLEND_OPAQUE
+        || attrs.VideoFrameFormat
+            != ddi::DXGI_DDI_MULTIPLANE_OVERLAY_VIDEO_FRAME_FORMAT_DXGI_DDI_MULIIPLANE_OVERLAY_VIDEO_FRAME_FORMAT_PROGRESSIVE
+        || attrs.YCbCrFlags != 0
+        || attrs.StereoFormat
+            != ddi::DXGI_DDI_MULTIPLANE_OVERLAY_STEREO_FORMAT_DXGI_DDI_MULTIPLANE_OVERLAY_STEREO_FORMAT_MONO
+        || attrs.StereoLeftViewFrame0 != 0
+        || attrs.StereoBaseViewFrame0 != 0
+        || attrs.StereoFlipMode
+            != ddi::DXGI_DDI_MULTIPLANE_OVERLAY_STEREO_FLIP_MODE_DXGI_DDI_MULTIPLANE_OVERLAY_STEREO_FLIP_NONE
+        || attrs.StretchQuality != 0
+        || !same_mpo_rect(&attrs.SrcRect, &attrs.DstRect)
+        || !same_mpo_rect(&attrs.SrcRect, &attrs.ClipRect)
+    {
+        probe_early_refusal(PresentBoundaryEntry::Mpo, "unsupported MPO plane attributes");
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+
+    let resource = dxgi_resource_handle(plane.hResource);
+    let Some(resource_object) = load_resource(resource) else {
+        probe_early_refusal(PresentBoundaryEntry::Mpo, "MPO resource is not live");
+        return E_INVALIDARG;
+    };
+    let Ok(texture) = (*resource_object).cast::<ID3D11Texture2D>() else {
+        probe_early_refusal(
+            PresentBoundaryEntry::Mpo,
+            "MPO resource is not a 2D texture",
+        );
+        return DXGI_ERROR_UNSUPPORTED;
+    };
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    texture.GetDesc(&mut desc);
+    if desc.MipLevels != 1
+        || desc.ArraySize != 1
+        || desc.SampleDesc.Count != 1
+        || desc.SampleDesc.Quality != 0
+        || desc.Format != windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM
+        || !full_resource_mpo_rect(&attrs.SrcRect, desc.Width, desc.Height)
+    {
+        probe_early_refusal(
+            PresentBoundaryEntry::Mpo,
+            "MPO resource profile is unsupported",
+        );
+        log_error!(
+            "DXGI PresentMultiplaneOverlay: unsupported resource {}x{} fmt={} mips={} array={} sample={}x{}",
+            desc.Width,
+            desc.Height,
+            desc.Format.0,
+            desc.MipLevels,
+            desc.ArraySize,
+            desc.SampleDesc.Count,
+            desc.SampleDesc.Quality
+        );
+        return DXGI_ERROR_UNSUPPORTED;
     }
 
     let h = dxgi_device_handle(a.hDevice);
@@ -2269,84 +2353,36 @@ pub(crate) unsafe extern "C" fn dxgi_present_mpo(
     cb.pDXGIContext = a.pDXGIContext;
     cb.hContext = ctx.handle.as_ptr();
     cb.BroadcastContextCount = 0;
-
-    for i in 0..a.PresentPlaneCount as usize {
-        let plane = &*a.pPresentPlanes.add(i);
-        let attrs = &plane.PlaneAttributes;
-        if MPO_LOG_COUNT.first_n(128).is_some() {
-            trace_line!(
-                "DXGI MPO plane {}: enabled={} hRes=0x{:x} sub={} flags=0x{:x} \
-                 src=({},{}-{}, {}) dst=({},{}-{}, {}) clip=({},{}-{}, {}) rot={} blend={} \
-                 dirty={} ycbcr=0x{:x} stretch={}",
-                i,
-                plane.Enabled,
-                plane.hResource,
-                plane.SubResourceIndex,
-                attrs.Flags,
-                attrs.SrcRect.left,
-                attrs.SrcRect.top,
-                attrs.SrcRect.right,
-                attrs.SrcRect.bottom,
-                attrs.DstRect.left,
-                attrs.DstRect.top,
-                attrs.DstRect.right,
-                attrs.DstRect.bottom,
-                attrs.ClipRect.left,
-                attrs.ClipRect.top,
-                attrs.ClipRect.right,
-                attrs.ClipRect.bottom,
-                attrs.Rotation,
-                attrs.Blend,
-                attrs.DirtyRectCount,
-                attrs.YCbCrFlags,
-                attrs.StretchQuality
-            );
-        }
-        if plane.Enabled == 0 {
-            continue;
-        }
-        if cb.AllocationInfoCount as usize >= cb.AllocationInfo.len() {
-            probe_early_refusal(
-                PresentBoundaryEntry::Mpo,
-                "MPO allocation list capacity exceeded",
-            );
-            return E_INVALIDARG;
-        }
-        let resource = dxgi_resource_handle(plane.hResource);
-        let alloc = resource_allocation(resource);
-        if alloc == 0 {
-            probe_early_refusal(
-                PresentBoundaryEntry::Mpo,
-                "MPO plane source allocation missing",
-            );
-            log_error!(
-                "DXGI PresentMultiplaneOverlay: plane {} has no allocation hResource=0x{:x}",
-                i,
-                plane.hResource
-            );
-            return E_INVALIDARG;
-        }
-        let slot = cb.AllocationInfoCount as usize;
-        cb.AllocationInfo[slot].PresentAllocation = alloc;
-        cb.AllocationInfo[slot].SubResourceIndex = plane.SubResourceIndex;
-        if MPO_LOG_COUNT.first_n(128).is_some() {
-            trace_line!(
-                "DXGI MPO plane {} -> allocation=0x{:x} slot={}",
-                i,
-                alloc,
-                slot
-            );
-        }
-        cb.AllocationInfoCount += 1;
-    }
-
-    if cb.AllocationInfoCount == 0 {
-        probe_early_refusal(PresentBoundaryEntry::Mpo, "no enabled MPO planes");
-        log_error!("DXGI PresentMultiplaneOverlay: no enabled planes");
+    let alloc = resource_allocation(resource);
+    if alloc == 0 {
+        probe_early_refusal(
+            PresentBoundaryEntry::Mpo,
+            "MPO plane source allocation missing",
+        );
+        log_error!(
+            "DXGI PresentMultiplaneOverlay: layer zero has no allocation hResource=0x{:x}",
+            plane.hResource
+        );
         return E_INVALIDARG;
     }
+    cb.AllocationInfo[0].PresentAllocation = alloc;
+    cb.AllocationInfo[0].SubResourceIndex = 0;
+    cb.AllocationInfoCount = 1;
 
-    probe_mpo_entry(a, &cb);
+    if MPO_LOG_COUNT.first_n(128).is_some() {
+        trace_line!(
+            "DXGI MPO primary: hRes=0x{:x} allocation=0x{:x} {}x{} flags=0x{:x} interval={} dirty={}",
+            plane.hResource,
+            alloc,
+            desc.Width,
+            desc.Height,
+            present_flags,
+            a.FlipInterval,
+            attrs.DirtyRectCount
+        );
+    }
+
+    probe_mpo_entry(&a, &cb);
 
     if let Some(context) = d3d11_context(h) {
         context.Flush();

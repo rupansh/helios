@@ -572,8 +572,6 @@ pub mod knobs {
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");
-    /// Restore the legacy `SupportDirectFlip` advertisement (default 0 = deny).
-    pub const DIRECT_FLIP_CAPS: KnobName = KnobName::new(b"DirectFlipCaps");
     /// Advertise `DXGK_VIDMMCAPS.CrossAdapterResource` (default 0).
     /// Exactly [`super::MAX_CONFIG_NAME`] bytes — the assert's live subject.
     pub const CROSS_ADAPT_CAPS: KnobName = KnobName::new(b"CrossAdaptCaps");

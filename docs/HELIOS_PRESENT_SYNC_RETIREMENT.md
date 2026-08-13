@@ -4475,8 +4475,10 @@ zero capability. The selected active-display surface registers and implements:
 - `DxgkDdiValidateUpdateAllocationProperty`, which validates the supplied
   live allocation and either performs only an implemented legal update or
   rejects it without mutating display identity;
-- `DxgkDdiControlModeBehavior`, which marks every unsupported requested mode
-  behavior `NotSatisfied` and never claims a hidden transform; and
+- `DxgkDdiControlModeBehavior`, which leaves every unsupported requested mode
+  behavior clear in both `Satisfied` and `NotSatisfied` (the latter means a
+  behavior the adapter supports but failed to apply) and never claims a hidden
+  transform; and
 - the existing `DxgkDdiUpdateMonitorLinkInfo`, revalidated under the 3.2 table.
 
 The same generated table registers `DxgkDdiControlEtwLogging`,

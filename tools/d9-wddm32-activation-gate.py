@@ -30,6 +30,8 @@ MOD = "kmd_render/src/ddi/mod.rs"
 QUERY = "kmd_render/src/ddi/query_adapter_info.rs"
 MPO = "kmd_render/src/ddi/mpo3.rs"
 DIAG = "kmd_render/src/ddi/diag_etw.rs"
+ADAPTER = "kmd_render/src/adapter/mod.rs"
+CORE_DIAG = "kmd_render/src/diag.rs"
 DISPLAY = "kmd_render/src/ddi/display.rs"
 ADAPTER_SCANOUT = "kmd_render/src/adapter/scanout.rs"
 SUBMIT = "kmd_render/src/ddi/submit_command.rs"
@@ -41,6 +43,7 @@ HEADER = "kmd_render/tools/wdk-28000/km/dispmprt.h"
 COLD_GATE = "tools/d9-cold-dwm-admission.ps1"
 RETIREMENT_GATES = "tools/retirement-gates.sh"
 GENERATOR = "kmd_render/tools/gen_wddm32_slot_audit.py"
+UMD_PRESENT = "umd/src/forward/present.rs"
 
 EXTRA_SOURCES = (
     CLASSES,
@@ -48,6 +51,7 @@ EXTRA_SOURCES = (
     HEADER,
     COLD_GATE,
     RETIREMENT_GATES,
+    UMD_PRESENT,
 )
 
 DISABLED_D9_SLOTS = (
@@ -396,21 +400,33 @@ def check_caps_and_mpo(sources: dict[str, str], errors: list[str]) -> None:
         body_compact = compact(body)
         minimum = (
             "constREQUIRED_DRIVER_CAPS_SIZE:usize="
-            "offset_of!(DXGK_DRIVERCAPS,SupportMultiPlaneOverlay)+size_of::<BOOLEAN>();"
+            "offset_of!(DXGK_DRIVERCAPS,MaxOverlayPlanes)+size_of::<UINT>();"
         )
         if body_compact.count(minimum) != 1:
-            errors.append(f"{QUERY}: caps minimum must include the full MPO byte")
+            errors.append(f"{QUERY}: caps minimum must include the full MPO plane count")
+        direct_flip = (
+            "letsupport_direct_flip:BOOLEAN="
+            "crate::virtio::KMD_D2_OWNER_ENABLEDasBOOLEAN;"
+        )
+        if body_compact.count(direct_flip) != 1:
+            errors.append(f"{QUERY}: Direct Flip capability is not derived from D2 authority")
         support = (
-            "constSUPPORT_MULTI_PLANE_OVERLAY:BOOLEAN=ifmatches!(SURFACE,"
-            "crate::ddi::wddm_surface::WddmSurface::Wddm3_2GpuMmu)"
-            "&&crate::virtio::KMD_D2_OWNER_ENABLED{1}else{0};"
+            "constSUPPORT_MULTI_PLANE_OVERLAY:BOOLEAN="
+            "crate::virtio::KMD_D2_OWNER_ENABLEDasBOOLEAN;"
         )
         if body_compact.count(support) != 1:
-            errors.append(f"{QUERY}: MPO capability is not the exact active 3.2/D2 conjunction")
+            errors.append(f"{QUERY}: MPO capability is not derived from D2 authority")
         if body_compact.count(
             "out.set(caps_offset!(SupportMultiPlaneOverlay),SUPPORT_MULTI_PLANE_OVERLAY,);"
         ) != 1:
             errors.append(f"{QUERY}: active package does not publish SupportMultiPlaneOverlay once")
+        if body_compact.count(
+            "letmax_overlay_planes:UINT=SUPPORT_MULTI_PLANE_OVERLAYasUINT;"
+            "out.set(caps_offset!(MaxOverlayPlanes),max_overlay_planes);"
+        ) != 1:
+            errors.append(
+                f"{QUERY}: active package does not publish the exact one-primary MPO plane count"
+            )
 
         writes = re.findall(
             r"\bout\s*\.\s*set(?:\s*::\s*<[^>]+>)?\s*\(\s*"
@@ -433,6 +449,7 @@ def check_caps_and_mpo(sources: dict[str, str], errors: list[str]) -> None:
                 "MaxQueuedFlipOnVSync": 1,
                 "SupportDirectFlip": 1,
                 "SupportMultiPlaneOverlay": 1,
+                "MaxOverlayPlanes": 1,
                 "GpuEngineTopology": 1,
             }
         )
@@ -440,6 +457,33 @@ def check_caps_and_mpo(sources: dict[str, str], errors: list[str]) -> None:
             errors.append(
                 f"{QUERY}: versioned caps write set drifted beyond the reviewed bound: {writes!r}"
             )
+
+    # Direct Flip is a required part of the admitted MPO package, not a legacy
+    # registry A/B. Its DRIVERCAPS bit and every segment bit must move with the
+    # same SURFACE-derived D2 predicate or dxgkrnl rejects AddAdapter.
+    for path in (ADAPTER, CORE_DIAG, QUERY):
+        if "DirectFlipCaps" in live_rust(sources.get(path, "")):
+            errors.append(f"{path}: retired DirectFlipCaps activation knob restored")
+
+    query_live = compact(live_rust(sources.get(QUERY, "")))
+    aperture_authority = (
+        "SegmentDescriptorSpec::aperture("
+        "crate::virtio::KMD_D2_OWNER_ENABLED)"
+    )
+    if query_live.count(aperture_authority) != 3:
+        errors.append(
+            f"{QUERY}: all three aperture generations must derive DirectFlip from D2 authority"
+        )
+    bar_authority = (
+        "constDIRECT_FLIP_FLAG:u32=0x20;"
+        "letbar_flags=(knobs.bar_seg_flags&!DIRECT_FLIP_FLAG)|"
+        "ifcrate::virtio::KMD_D2_OWNER_ENABLED{DIRECT_FLIP_FLAG}else{0};"
+        "letspec=SegmentDescriptorSpec::from_bar_flags(bar_flags,"
+    )
+    if query_live.count(bar_authority) != 1:
+        errors.append(
+            f"{QUERY}: BAR DirectFlip must mask the knob bit and derive from D2 authority"
+        )
 
     mpo = compact(live_rust(sources.get(MPO, "")))
     for fragment in (
@@ -470,6 +514,31 @@ def check_caps_and_mpo(sources: dict[str, str], errors: list[str]) -> None:
         if forbidden in mpo:
             errors.append(f"{MPO}: unsupported MPO output authority enabled: {forbidden}")
 
+    mode_behavior = unique_function(
+        sources, MPO, "dxgkddi_control_mode_behavior", errors
+    )
+    if mode_behavior is not None:
+        body = compact(mode_behavior[1])
+        for fragment in (
+            "letrequest=unsafe{control.Request.Value};",
+            "control.Satisfied=Default::default();",
+            "control.NotSatisfied=Default::default();",
+        ):
+            if body.count(compact(fragment)) != 1:
+                errors.append(
+                    f"{MPO}: ControlModeBehavior must publish exact unsupported outputs: "
+                    f"{fragment}"
+                )
+        for forbidden in (
+            "control.Satisfied.Value=request",
+            "control.NotSatisfied.Value=request",
+        ):
+            if compact(forbidden) in body:
+                errors.append(
+                    f"{MPO}: ControlModeBehavior falsely claims support for an "
+                    f"unsupported request: {forbidden}"
+                )
+
     validator = unique_function(sources, LOGIC_ADMISSION, "validate_mpo_plane", errors)
     if validator is not None:
         require_fragments(
@@ -488,6 +557,242 @@ def check_caps_and_mpo(sources: dict[str, str], errors: list[str]) -> None:
             ),
             errors,
         )
+
+
+def check_physical_adapter_caps(sources: dict[str, str], errors: list[str]) -> None:
+    source = live_rust(sources.get(QUERY, ""))
+    dispatcher = (
+        "DXGKQAITYPE_PHYSICALADAPTERCAPS=>unsafe{"
+        "query_physical_adapter_caps(adapter,args)}"
+    )
+    if compact(source).count(dispatcher) != 1:
+        errors.append(
+            f"{QUERY}: WDDM 3.2 physical-adapter caps must be dispatched exactly once"
+        )
+
+    query = unique_function(sources, QUERY, "query_physical_adapter_caps", errors)
+    if query is None:
+        return
+    body = query[1]
+    require_order(
+        QUERY,
+        "query_physical_adapter_caps",
+        body,
+        (
+            "let input_ptr = args.pInputData.cast::<DXGK_QUERYPHYSICALADAPTERCAPSIN>()",
+            "args.InputDataSize as usize != size_of::<DXGK_QUERYPHYSICALADAPTERCAPSIN>()",
+            "input_ptr.is_null()",
+            "!input_ptr.is_aligned()",
+            "let output_ptr = args.pOutputData.cast::<DXGK_PHYSICALADAPTERCAPS>()",
+            "(args.OutputDataSize as usize) < size_of::<DXGK_PHYSICALADAPTERCAPS>()",
+            "output_ptr.is_null()",
+            "!output_ptr.is_aligned()",
+            "core::ptr::read(input_ptr)",
+            "input.PhysicalAdapterIndex != 0",
+            "adapter.dxgkrnl()",
+            "let mut caps = DXGK_PHYSICALADAPTERCAPS::default()",
+            "caps.NumExecutionNodes = 1",
+            "caps.PagingNodeIndex = 0",
+            "caps.DxgkPhysicalAdapterHandle = dxgkrnl.DeviceHandle",
+            "caps.Flags.__bindgen_anon_1.Value = physical_adapter_flags",
+            "core::ptr::write(output_ptr, caps)",
+        ),
+        errors,
+    )
+    require_fragments(
+        QUERY,
+        "query_physical_adapter_caps",
+        body,
+        (
+            "Err(_) => return STATUS_DEVICE_NOT_READY",
+            "const PHYSICAL_ADAPTER_GPU_MMU_SUPPORTED: UINT = 1 << 1",
+            "let physical_adapter_flags = if SURFACE.gpu_mmu()",
+            "PHYSICAL_ADAPTER_GPU_MMU_SUPPORTED",
+            "else { 0 }",
+        ),
+        errors,
+    )
+    assignments = collections.Counter(
+        re.findall(r"\bcaps\.(\w+)(?:\.[A-Za-z0-9_]+)*\s*=", body)
+    )
+    expected_assignments = collections.Counter(
+        {
+            "NumExecutionNodes": 1,
+            "PagingNodeIndex": 1,
+            "DxgkPhysicalAdapterHandle": 1,
+            "Flags": 1,
+        }
+    )
+    if assignments != expected_assignments:
+        errors.append(
+            f"{QUERY}: physical-adapter caps output authority drifted: "
+            f"{dict(assignments)!r}"
+        )
+    for forbidden in (
+        "write_bytes",
+        "NumExecutionNodes = 0",
+        "DxgkPhysicalAdapterHandle = core::ptr::null_mut()",
+        "VPRPagingNode =",
+        "VirtualCopyNodeIndex =",
+    ):
+        if forbidden in body:
+            errors.append(
+                f"{QUERY}:query_physical_adapter_caps: unsafe/unsupported output restored: "
+                f"{forbidden}"
+            )
+
+
+def check_umd_mpo(sources: dict[str, str], errors: list[str]) -> None:
+    source = live_rust(sources.get(UMD_PRESENT, ""))
+    source_compact = compact(source)
+    for fragment in (
+        "pub(crate) const DXGI_MPO_MAX_PLANES: u32 = 1;",
+        "pub(crate) const RGB: u32 = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_RGB as u32;",
+        "pub(crate) const HELIOS_MPO_MAX_STRETCH: f32 = 1.0;",
+        "pub(crate) const HELIOS_MPO_MAX_SHRINK: f32 = 1.0;",
+        "pub(crate) const HELIOS_MPO_GROUPS: u32 = 1;",
+        "pub(crate) const HELIOS_MPO_OVERLAY_CAPS: u32 = RGB;",
+        "const MPO_PRESENT_FLIP_FLAG: u32 = 0x2;",
+    ):
+        if compact(fragment) not in source_compact:
+            errors.append(f"{UMD_PRESENT}: exact one-primary UMD MPO cap missing: {fragment}")
+    for forbidden in (
+        "pub(crate) const BILINEAR:",
+        "pub(crate) const SHARED:",
+        "pub(crate) const IMMEDIATE:",
+    ):
+        if compact(forbidden) in source_compact:
+            errors.append(f"{UMD_PRESENT}: unsupported UMD MPO capability restored: {forbidden}")
+
+    same_rect = unique_function(sources, UMD_PRESENT, "same_mpo_rect", errors)
+    if same_rect is not None:
+        require_fragments(
+            UMD_PRESENT,
+            "same_mpo_rect",
+            same_rect[1],
+            (
+                "left.left == right.left",
+                "left.top == right.top",
+                "left.right == right.right",
+                "left.bottom == right.bottom",
+            ),
+            errors,
+        )
+    full_rect = unique_function(sources, UMD_PRESENT, "full_resource_mpo_rect", errors)
+    if full_rect is not None:
+        require_fragments(
+            UMD_PRESENT,
+            "full_resource_mpo_rect",
+            full_rect[1],
+            (
+                "i32::try_from(width)",
+                "i32::try_from(height)",
+                "rect.left == 0",
+                "rect.top == 0",
+                "rect.right == width",
+                "rect.bottom == height",
+                "width != 0",
+                "height != 0",
+            ),
+            errors,
+        )
+
+    caps = unique_function(sources, UMD_PRESENT, "dxgi_get_mpo_caps", errors)
+    if caps is not None:
+        require_order(
+            UMD_PRESENT,
+            "dxgi_get_mpo_caps",
+            caps[1],
+            (
+                "arg.is_null() || !arg.is_aligned()",
+                "let vidpn_source_id = core::ptr::addr_of!((*arg).VidPnSourceId).read()",
+                "vidpn_source_id != 0",
+                "let caps = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_CAPS",
+                "core::ptr::addr_of_mut!((*arg).MultiplaneOverlayCaps).write(caps)",
+            ),
+            errors,
+        )
+
+    group = unique_function(sources, UMD_PRESENT, "dxgi_get_mpo_group_caps", errors)
+    if group is not None:
+        require_order(
+            UMD_PRESENT,
+            "dxgi_get_mpo_group_caps",
+            group[1],
+            (
+                "arg.is_null() || !arg.is_aligned()",
+                "let vidpn_source_id = core::ptr::addr_of!((*arg).VidPnSourceId).read()",
+                "let group_index = core::ptr::addr_of!((*arg).GroupIndex).read()",
+                "vidpn_source_id != 0 || group_index != 0",
+                "let caps = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_GROUP_CAPS",
+                "core::ptr::addr_of_mut!((*arg).MultiplaneOverlayGroupCaps).write(caps)",
+            ),
+            errors,
+        )
+        require_fragments(
+            UMD_PRESENT,
+            "dxgi_get_mpo_group_caps",
+            group[1],
+            (
+                "NumPlanes: DXGI_MPO_MAX_PLANES",
+                "MaxStretchFactor: HELIOS_MPO_MAX_STRETCH",
+                "MaxShrinkFactor: HELIOS_MPO_MAX_SHRINK",
+                "OverlayCaps: HELIOS_MPO_OVERLAY_CAPS",
+                "StereoCaps: 0",
+            ),
+            errors,
+        )
+
+    present = unique_function(sources, UMD_PRESENT, "dxgi_present_mpo", errors)
+    if present is not None:
+        body = present[1]
+        require_order(
+            UMD_PRESENT,
+            "dxgi_present_mpo",
+            body,
+            (
+                "arg.is_null() || !arg.is_aligned()",
+                "let a = core::ptr::read(arg)",
+                "a.PresentPlaneCount != DXGI_MPO_MAX_PLANES",
+                "a.pPresentPlanes.is_null() || !a.pPresentPlanes.is_aligned()",
+                "a.Reserved != 0",
+                "a.VidPnSourceId != 0",
+                "present_flags != MPO_PRESENT_FLIP_FLAG",
+                "DXGI_DDI_FLIP_INTERVAL_TYPE_DXGI_DDI_FLIP_INTERVAL_ONE",
+                "DXGI_DDI_FLIP_INTERVAL_TYPE_DXGI_DDI_FLIP_INTERVAL_FOUR",
+                "let plane = core::ptr::read(a.pPresentPlanes)",
+                "plane.LayerIndex != 0 || plane.Enabled != 1 || plane.hResource == 0",
+                "plane.SubResourceIndex != 0",
+                "attrs.Flags != 0",
+                "DXGI_DDI_MODE_ROTATION_DXGI_DDI_MODE_ROTATION_IDENTITY",
+                "DXGI_DDI_MULTIPLANE_OVERLAY_BLEND_DXGI_DDI_MULTIPLANE_OVERLAY_BLEND_OPAQUE",
+                "DXGI_DDI_MULTIPLANE_OVERLAY_VIDEO_FRAME_FORMAT_DXGI_DDI_MULIIPLANE_OVERLAY_VIDEO_FRAME_FORMAT_PROGRESSIVE",
+                "attrs.YCbCrFlags != 0",
+                "DXGI_DDI_MULTIPLANE_OVERLAY_STEREO_FORMAT_DXGI_DDI_MULTIPLANE_OVERLAY_STEREO_FORMAT_MONO",
+                "attrs.StereoLeftViewFrame0 != 0",
+                "attrs.StereoBaseViewFrame0 != 0",
+                "DXGI_DDI_MULTIPLANE_OVERLAY_STEREO_FLIP_MODE_DXGI_DDI_MULTIPLANE_OVERLAY_STEREO_FLIP_NONE",
+                "attrs.StretchQuality != 0",
+                "same_mpo_rect(&attrs.SrcRect, &attrs.DstRect)",
+                "same_mpo_rect(&attrs.SrcRect, &attrs.ClipRect)",
+                "let resource = dxgi_resource_handle(plane.hResource)",
+                "load_resource(resource)",
+                "cast::<ID3D11Texture2D>()",
+                "desc.MipLevels != 1",
+                "desc.ArraySize != 1",
+                "desc.SampleDesc.Count != 1",
+                "desc.SampleDesc.Quality != 0",
+                "DXGI_FORMAT_B8G8R8A8_UNORM",
+                "full_resource_mpo_rect(&attrs.SrcRect, desc.Width, desc.Height)",
+                "let alloc = resource_allocation(resource)",
+                "cb.AllocationInfo[0].PresentAllocation = alloc",
+                "cb.AllocationInfo[0].SubResourceIndex = 0",
+                "cb.AllocationInfoCount = 1",
+            ),
+            errors,
+        )
+        if re.search(r"\bfor\s+\w+\s+in\s+0\s*\.\.", body):
+            errors.append(f"{UMD_PRESENT}:dxgi_present_mpo: multi-plane forwarding loop restored")
 
 
 def check_legacy_authority_closure(sources: dict[str, str], errors: list[str]) -> None:
@@ -614,6 +919,8 @@ def check_sources(sources: dict[str, str]) -> list[str]:
     check_table(live, errors)
     check_diagnostics(sources, errors)
     check_caps_and_mpo(sources, errors)
+    check_physical_adapter_caps(sources, errors)
+    check_umd_mpo(sources, errors)
     check_legacy_authority_closure(sources, errors)
     check_cold_gate(sources, errors)
     return errors
@@ -757,10 +1064,116 @@ def mutation_cases() -> tuple[Mutation, ...]:
             "",
         ),
         Mutation(
+            "decouple Direct Flip capability from D2 authority",
+            QUERY,
+            "    let support_direct_flip: BOOLEAN = crate::virtio::KMD_D2_OWNER_ENABLED as BOOLEAN;",
+            "    let support_direct_flip: BOOLEAN = 0;",
+        ),
+        Mutation(
+            "decouple MPO capability from D2 authority",
+            QUERY,
+            "    const SUPPORT_MULTI_PLANE_OVERLAY: BOOLEAN =\n"
+            "        crate::virtio::KMD_D2_OWNER_ENABLED as BOOLEAN;",
+            "    const SUPPORT_MULTI_PLANE_OVERLAY: BOOLEAN = 1;",
+        ),
+        Mutation(
+            "decouple aperture Direct Flip from D2 authority",
+            QUERY,
+            "unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4) {\n"
+            "    unsafe {\n"
+            "        SegmentDescriptorSpec::aperture(crate::virtio::KMD_D2_OWNER_ENABLED).write_into_v4(seg)\n"
+            "    };\n"
+            "}",
+            "unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4) {\n"
+            "    unsafe { SegmentDescriptorSpec::aperture(false).write_into_v4(seg) };\n"
+            "}",
+        ),
+        Mutation(
+            "restore BAR Direct Flip knob authority",
+            QUERY,
+            "    let spec = SegmentDescriptorSpec::from_bar_flags(\n"
+            "        bar_flags,",
+            "    let spec = SegmentDescriptorSpec::from_bar_flags(\n"
+            "        knobs.bar_seg_flags,",
+        ),
+        Mutation(
+            "restore DirectFlipCaps activation knob",
+            CORE_DIAG,
+            "    pub const CROSS_ADAPT_CAPS: KnobName = KnobName::new(b\"CrossAdaptCaps\");",
+            "    pub const DIRECT_FLIP_CAPS: KnobName = KnobName::new(b\"DirectFlipCaps\");\n"
+            "    pub const CROSS_ADAPT_CAPS: KnobName = KnobName::new(b\"CrossAdaptCaps\");",
+        ),
+        Mutation(
             "shorten caps bound",
             QUERY,
+            "offset_of!(DXGK_DRIVERCAPS, MaxOverlayPlanes) + size_of::<UINT>();",
             "offset_of!(DXGK_DRIVERCAPS, SupportMultiPlaneOverlay) + size_of::<BOOLEAN>();",
-            "offset_of!(DXGK_DRIVERCAPS, SupportDirectFlip) + size_of::<BOOLEAN>();",
+        ),
+        Mutation(
+            "omit active MPO plane count",
+            QUERY,
+            "    out.set(caps_offset!(MaxOverlayPlanes), max_overlay_planes);\n",
+            "",
+        ),
+        Mutation(
+            "zero active MPO plane count",
+            QUERY,
+            "    let max_overlay_planes: UINT = SUPPORT_MULTI_PLANE_OVERLAY as UINT;",
+            "    let max_overlay_planes: UINT = 0;",
+        ),
+        Mutation(
+            "widen active MPO plane count",
+            QUERY,
+            "    let max_overlay_planes: UINT = SUPPORT_MULTI_PLANE_OVERLAY as UINT;",
+            "    let max_overlay_planes: UINT = 2;",
+        ),
+        Mutation(
+            "remove physical-adapter caps dispatch",
+            QUERY,
+            "        DXGKQAITYPE_PHYSICALADAPTERCAPS => unsafe { query_physical_adapter_caps(adapter, args) },\n",
+            "",
+        ),
+        Mutation(
+            "accept nonzero physical-adapter index",
+            QUERY,
+            "    if input.PhysicalAdapterIndex != 0 {",
+            "    if false {",
+        ),
+        Mutation(
+            "restore zero execution-node placeholder",
+            QUERY,
+            "    caps.NumExecutionNodes = 1;",
+            "    caps.NumExecutionNodes = 0;",
+        ),
+        Mutation(
+            "misidentify physical-adapter paging node",
+            QUERY,
+            "    caps.PagingNodeIndex = 0;",
+            "    caps.PagingNodeIndex = 1;",
+        ),
+        Mutation(
+            "drop dxgkrnl physical-adapter handle",
+            QUERY,
+            "    caps.DxgkPhysicalAdapterHandle = dxgkrnl.DeviceHandle;",
+            "    caps.DxgkPhysicalAdapterHandle = core::ptr::null_mut();",
+        ),
+        Mutation(
+            "advertise physical-adapter virtual copy engine",
+            QUERY,
+            "    const PHYSICAL_ADAPTER_GPU_MMU_SUPPORTED: UINT = 1 << 1;",
+            "    const PHYSICAL_ADAPTER_GPU_MMU_SUPPORTED: UINT = (1 << 1) | (1 << 5);",
+        ),
+        Mutation(
+            "skip physical-adapter input alignment validation",
+            QUERY,
+            "        || !input_ptr.is_aligned()\n",
+            "",
+        ),
+        Mutation(
+            "weaken physical-adapter output size validation",
+            QUERY,
+            "    if (args.OutputDataSize as usize) < size_of::<DXGK_PHYSICALADAPTERCAPS>() {",
+            "    if args.OutputDataSize == 0 {",
         ),
         Mutation(
             "advertise YUV plane",
@@ -776,6 +1189,106 @@ def mutation_cases() -> tuple[Mutation, ...]:
             "    args.ReturnInfo = Default::default();\n"
             "    args.ReturnInfo.__bindgen_anon_1.set_PostPresentNeeded(1);\n"
             "    record_passive(&CHECK_REFUSALS, b\"MpoChkRef\", code);",
+        ),
+        Mutation(
+            "misreport unsupported mode behavior as failed",
+            MPO,
+            "    control.NotSatisfied = Default::default();\n",
+            "    control.NotSatisfied = Default::default();\n"
+            "    control.NotSatisfied.Value = request;\n",
+        ),
+        Mutation(
+            "widen UMD MPO plane count",
+            UMD_PRESENT,
+            "pub(crate) const DXGI_MPO_MAX_PLANES: u32 = 1;",
+            "pub(crate) const DXGI_MPO_MAX_PLANES: u32 = 16;",
+        ),
+        Mutation(
+            "advertise UMD MPO stretch",
+            UMD_PRESENT,
+            "pub(crate) const HELIOS_MPO_MAX_STRETCH: f32 = 1.0;",
+            "pub(crate) const HELIOS_MPO_MAX_STRETCH: f32 = 16.0;",
+        ),
+        Mutation(
+            "advertise UMD MPO shrink",
+            UMD_PRESENT,
+            "pub(crate) const HELIOS_MPO_MAX_SHRINK: f32 = 1.0;",
+            "pub(crate) const HELIOS_MPO_MAX_SHRINK: f32 = 16.0;",
+        ),
+        Mutation(
+            "advertise unsupported UMD MPO feature",
+            UMD_PRESENT,
+            "pub(crate) const HELIOS_MPO_OVERLAY_CAPS: u32 = RGB;",
+            "pub(crate) const HELIOS_MPO_OVERLAY_CAPS: u32 = RGB | 0x80;",
+        ),
+        Mutation(
+            "mislabel unsupported UMD MPO bit as RGB",
+            UMD_PRESENT,
+            "DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_RGB",
+            "DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_DXGI_DDI_MULTIPLANE_OVERLAY_FEATURE_CAPS_BILINEAR_FILTER",
+        ),
+        Mutation(
+            "widen UMD MPO present flag mask",
+            UMD_PRESENT,
+            "const MPO_PRESENT_FLIP_FLAG: u32 = 0x2;",
+            "const MPO_PRESENT_FLIP_FLAG: u32 = 0xffff_ffff;",
+        ),
+        Mutation(
+            "publish UMD MPO caps for another source",
+            UMD_PRESENT,
+            "    if vidpn_source_id != 0 {\n"
+            "        return E_INVALIDARG;\n"
+            "    }\n"
+            "    let caps = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_CAPS {",
+            "    if false {\n"
+            "        return E_INVALIDARG;\n"
+            "    }\n"
+            "    let caps = ddi::DXGI_DDI_MULTIPLANE_OVERLAY_CAPS {",
+        ),
+        Mutation(
+            "admit multiple UMD MPO present planes",
+            UMD_PRESENT,
+            "    if a.PresentPlaneCount != DXGI_MPO_MAX_PLANES {",
+            "    if a.PresentPlaneCount > DXGI_MPO_MAX_PLANES {",
+        ),
+        Mutation(
+            "admit unsupported UMD MPO present flags",
+            UMD_PRESENT,
+            "    if present_flags != MPO_PRESENT_FLIP_FLAG {",
+            "    if false {",
+        ),
+        Mutation(
+            "admit immediate UMD MPO present",
+            UMD_PRESENT,
+            "    if !(ddi::DXGI_DDI_FLIP_INTERVAL_TYPE_DXGI_DDI_FLIP_INTERVAL_ONE\n"
+            "        ..=ddi::DXGI_DDI_FLIP_INTERVAL_TYPE_DXGI_DDI_FLIP_INTERVAL_FOUR)\n"
+            "        .contains(&a.FlipInterval)\n"
+            "    {",
+            "    if false {",
+        ),
+        Mutation(
+            "admit UMD MPO transforms",
+            UMD_PRESENT,
+            "        || attrs.Flags != 0\n",
+            "        || false\n",
+        ),
+        Mutation(
+            "admit UMD MPO stretch quality",
+            UMD_PRESENT,
+            "        || attrs.StretchQuality != 0\n",
+            "        || false\n",
+        ),
+        Mutation(
+            "weaken UMD MPO rectangle equality",
+            UMD_PRESENT,
+            "        && left.bottom == right.bottom\n",
+            "        && true\n",
+        ),
+        Mutation(
+            "forward multiple UMD MPO allocations",
+            UMD_PRESENT,
+            "    cb.AllocationInfoCount = 1;",
+            "    cb.AllocationInfoCount = 2;",
         ),
         Mutation(
             "admit immediate MPO",

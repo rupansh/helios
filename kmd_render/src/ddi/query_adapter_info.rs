@@ -15,8 +15,8 @@ use crate::dxgk::_DXGK_QUERYADAPTERINFOTYPE::{
     DXGKQAITYPE_DRIVERCAPS, DXGKQAITYPE_GPUMMUCAPS, DXGKQAITYPE_GPUVERSION,
     DXGKQAITYPE_HARDWARERESERVEDRANGES2, DXGKQAITYPE_HISTORYBUFFERPRECISION,
     DXGKQAITYPE_IOMMU_CAPS, DXGKQAITYPE_NATIVE_FENCE_CAPS, DXGKQAITYPE_PAGETABLELEVELDESC,
-    DXGKQAITYPE_PHYSICAL_MEMORY_CAPS, DXGKQAITYPE_QUERYSEGMENT, DXGKQAITYPE_QUERYSEGMENT3,
-    DXGKQAITYPE_QUERYSEGMENT4, DXGKQAITYPE_WDDMDEVICECAPS,
+    DXGKQAITYPE_PHYSICALADAPTERCAPS, DXGKQAITYPE_PHYSICAL_MEMORY_CAPS, DXGKQAITYPE_QUERYSEGMENT,
+    DXGKQAITYPE_QUERYSEGMENT3, DXGKQAITYPE_QUERYSEGMENT4, DXGKQAITYPE_WDDMDEVICECAPS,
 };
 use crate::dxgk::*;
 
@@ -58,6 +58,7 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
             crate::ddi::native_fence::fill_native_fence_caps(adapter, args)
         },
         DXGKQAITYPE_PAGETABLELEVELDESC => unsafe { gpummu::fill_page_table_level_desc(args) },
+        DXGKQAITYPE_PHYSICALADAPTERCAPS => unsafe { query_physical_adapter_caps(adapter, args) },
         DXGKQAITYPE_WDDMDEVICECAPS => unsafe { query_wddm_device_caps(args) },
         DXGKQAITYPE_PHYSICAL_MEMORY_CAPS => unsafe { query_physical_memory_caps(args) },
         DXGKQAITYPE_IOMMU_CAPS => unsafe { query_zeroed::<DXGK_IOMMU_CAPS>(args) },
@@ -78,13 +79,6 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
         // steady-state-polls NODEPERFDATA (0x18) and ADAPTERPERFDATA (0x19) to
         // feed the Task Manager GPU tab; virtio-gpu exposes no such telemetry, so
         // NOT_SUPPORTED is the honest answer here — an expected poll, not a gap.
-        // PHYSICALADAPTERCAPS (0x0F) stays rejected: answering it (2026-06-22 test)
-        // pulls dxgmms2 into per-physical-adapter / per-execution-node setup that
-        // dereferences a null node structure our null engine never provides
-        // (bugcheck 0x3B SYSTEM_SERVICE_EXCEPTION, AV on null-base+0x210 in
-        // dxgmms2+0x9775d). viogpu3d also leaves it unimplemented. So its contract
-        // remains undefined for us until we have real execution nodes; D3D11's
-        // device-create rejection is NOT this query (DXGI tolerates the rejection).
         other => {
             // DIAG: which type we rejected (suspect if AddAdapter dies right after).
             // Same perf-poll gate as the entry log — 0x18/0x19 flood the ring.
@@ -102,7 +96,7 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
 /// That is the whole reason this type exists. `query_driver_caps`'s size gate
 /// deliberately admits `OutputDataSize` values below `size_of::<DXGK_DRIVERCAPS>()`
 /// (592 on the WDK-28000 bindings) — a caps buffer is versioned, and the byte
-/// through `SupportMultiPlaneOverlay` is all this package needs. Forming `&mut
+/// through `MaxOverlayPlanes` is all this package needs. Forming `&mut
 /// *(pOutputData as *mut DXGK_DRIVERCAPS)` over such a buffer is undefined
 /// behaviour *independent of which fields are touched*: a reference must be
 /// dereferenceable for its whole referent type. The old code did exactly that,
@@ -193,7 +187,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // silently omitting the active package's MPO capability would expose an
     // internally inconsistent 3.2 surface during AddAdapter.
     const REQUIRED_DRIVER_CAPS_SIZE: usize =
-        offset_of!(DXGK_DRIVERCAPS, SupportMultiPlaneOverlay) + size_of::<BOOLEAN>();
+        offset_of!(DXGK_DRIVERCAPS, MaxOverlayPlanes) + size_of::<UINT>();
 
     crate::diag::record(0x01CF_0000 | (args.OutputDataSize & 0xFFFF));
     if (args.OutputDataSize as usize) < REQUIRED_DRIVER_CAPS_SIZE {
@@ -440,39 +434,29 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // Same reason as `FlipCapV`: what was ADVERTISED, so a knob that read as its
     // default cannot be mistaken for a knob that had no effect.
     crate::diag::record_named_bytes(b"FlipQueV", max_queued_flip_on_vsync);
-    // DIRECT-FLIP DENIAL (27th session, 2026-07-07): SupportDirectFlip=1 was an
-    // unbacked bring-up advertisement (no bisect ever showed it load-mandatory —
-    // the STEP-0 bisect above proved only FlipOnVSyncMmIo). On this adapter it is
-    // a LIE: Helios has zero scanout (all VidPn DDIs NOT_SUPPORTED; the display
-    // is an IddCx driver capturing dwm's COMPOSED output), so a dwm direct/
-    // independent-flip promotion of an eligible visual (flip-model + IGNORE-alpha
-    // + unoccluded — exactly the dcomp vehicle chain) makes dwm STOP COMPOSING it
-    // while every fence stays green: the owner-reproduced two-stale-frame
-    // alternation + old-frames-flashing stutter, cured by any dirty-region
-    // recompose (the taskbar clock's minute repaint = the hands-off ~60 s
-    // recovery). The UMD already denies CheckDirectFlipSupport unconditionally;
-    // this makes the KMD agree. Display-less-adapter guidance
-    // (mcdm-implementation-guidelines.md) requires 0 here. `DirectFlipCaps`
-    // service knob (default 0) restores the legacy advertisement for A/B via
-    // reg add + devcon restart; value lands in the 0x01D7 diag record bit 2.
-    let support_direct_flip: BOOLEAN = if knobs.direct_flip { 1 } else { 0 };
+    // D9's MPO capability is accepted by dxgkrnl only as part of a Direct-Flip
+    // display package. This is no longer the old display-less/IddCx surface:
+    // D3-D5 provide exact per-allocation scanout validation, retention, and the
+    // MPO3 table. Both caps therefore derive from the same SURFACE-owned D2
+    // predicate; the retired DirectFlipCaps registry knob cannot split them.
+    let support_direct_flip: BOOLEAN = crate::virtio::KMD_D2_OWNER_ENABLED as BOOLEAN;
     out.set(caps_offset!(SupportDirectFlip), support_direct_flip);
     // D9 publishes MPO only as part of the one atomic 3.2/D2 package. The
     // callback table itself remains the exact one-primary, RGB-only,
     // unity-transform D3 profile; no independent capability switch exists.
-    const SUPPORT_MULTI_PLANE_OVERLAY: BOOLEAN = if matches!(
-        SURFACE,
-        crate::ddi::wddm_surface::WddmSurface::Wddm3_2GpuMmu
-    ) && crate::virtio::KMD_D2_OWNER_ENABLED
-    {
-        1
-    } else {
-        0
-    };
+    const SUPPORT_MULTI_PLANE_OVERLAY: BOOLEAN =
+        crate::virtio::KMD_D2_OWNER_ENABLED as BOOLEAN;
     out.set(
         caps_offset!(SupportMultiPlaneOverlay),
         SUPPORT_MULTI_PLANE_OVERLAY,
     );
+    // SupportMultiPlaneOverlay and MaxOverlayPlanes are one capability contract:
+    // the latter counts all simultaneously displayed inputs, including the
+    // primary surface. Helios admits exactly that one primary and no additional
+    // overlay plane. Leaving this zero while setting the support byte makes
+    // dxgkrnl reject AddAdapter before the MPO DDIs can be queried.
+    let max_overlay_planes: UINT = SUPPORT_MULTI_PLANE_OVERLAY as UINT;
+    out.set(caps_offset!(MaxOverlayPlanes), max_overlay_planes);
     let nb_asymetric_processing_nodes: UINT = 1;
     out.set(
         caps_offset!(
@@ -511,6 +495,73 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // query rather than the last one that happened to truncate.
     crate::diag::fault(crate::diag::FaultCounter::CapTrunc, out.skipped);
 
+    STATUS_SUCCESS
+}
+
+/// Describe the single physical adapter and the single execution node already
+/// published through `DXGK_DRIVERCAPS::GpuEngineTopology` and
+/// `DxgkDdiGetNodeMetadata`.
+///
+/// This query used to stay rejected because an early experiment answered it
+/// with a zero-node placeholder. That made dxgmms2 enter physical-adapter setup
+/// and then dereference an absent node (bugcheck 0x3B at null-base+0x210). WDDM
+/// 3.2 makes rejecting the query fatal during AddAdapter, and the driver no
+/// longer has a null engine: node ordinal 0 is the symmetric 3D/GpuMmu node.
+/// Answer the exact WDK contract instead of reviving the unsafe placeholder.
+unsafe fn query_physical_adapter_caps(
+    adapter: &AdapterContext,
+    args: &DXGKARG_QUERYADAPTERINFO,
+) -> NTSTATUS {
+    let input_ptr = args.pInputData.cast::<DXGK_QUERYPHYSICALADAPTERCAPSIN>();
+    if args.InputDataSize as usize != size_of::<DXGK_QUERYPHYSICALADAPTERCAPSIN>()
+        || input_ptr.is_null()
+        || !input_ptr.is_aligned()
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let output_ptr = args.pOutputData.cast::<DXGK_PHYSICALADAPTERCAPS>();
+    if (args.OutputDataSize as usize) < size_of::<DXGK_PHYSICALADAPTERCAPS>() {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    if output_ptr.is_null() || !output_ptr.is_aligned() {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // SAFETY: size, non-nullness and alignment were validated above. Read the
+    // complete input by value before deriving or mutating the output.
+    let input = unsafe { core::ptr::read(input_ptr) };
+    if input.PhysicalAdapterIndex != 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let dxgkrnl = match adapter.dxgkrnl() {
+        Ok(dxgkrnl) => dxgkrnl,
+        Err(_) => return STATUS_DEVICE_NOT_READY,
+    };
+
+    const PHYSICAL_ADAPTER_GPU_MMU_SUPPORTED: UINT = 1 << 1;
+    let physical_adapter_flags = if SURFACE.gpu_mmu() {
+        PHYSICAL_ADAPTER_GPU_MMU_SUPPORTED
+    } else {
+        0
+    };
+    let mut caps = DXGK_PHYSICALADAPTERCAPS::default();
+    caps.NumExecutionNodes = 1;
+    caps.PagingNodeIndex = 0;
+    caps.DxgkPhysicalAdapterHandle = dxgkrnl.DeviceHandle;
+    // `Value` is the UINT view of the WDK flags union. The local was
+    // zero-initialized, and this is the only union arm written, so IoMmu,
+    // MovePaging, VPR, virtual-copy, GPU-VA/IOMMU and every reserved bit remain
+    // zero. GpuMmuSupported is the sole advertised bit.
+    caps.Flags.__bindgen_anon_1.Value = physical_adapter_flags;
+    // VPRPagingNode and VirtualCopyNodeIndex remain zero because their
+    // corresponding capability bits are zero.
+
+    // Publish only after the complete request and complete local result have
+    // been validated. Do not zero or partially mutate dxgkrnl's buffer first.
+    unsafe { core::ptr::write(output_ptr, caps) };
+    crate::diag::record(0x01DA_0000 | (physical_adapter_flags & 0xFFFF));
     STATUS_SUCCESS
 }
 
@@ -966,21 +1017,28 @@ impl SegmentDescriptorSpec {
 
 /// Write the viogpu3d-style linear aperture descriptor (paging-buffer host).
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
-unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, knobs: &AdapterKnobs) {
-    unsafe { SegmentDescriptorSpec::aperture(knobs.direct_flip).write_into_v4(seg) };
+unsafe fn write_aperture_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4) {
+    unsafe {
+        SegmentDescriptorSpec::aperture(crate::virtio::KMD_D2_OWNER_ENABLED).write_into_v4(seg)
+    };
 }
 
 /// The same aperture, for WDDM 1.2/1.3 `DXGK_QUERYSEGMENTOUT3`.
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR3`.
-unsafe fn write_aperture_descriptor3(seg: *mut DXGK_SEGMENTDESCRIPTOR3, knobs: &AdapterKnobs) {
-    unsafe { SegmentDescriptorSpec::aperture(knobs.direct_flip).write_into_v3(seg) };
+unsafe fn write_aperture_descriptor3(seg: *mut DXGK_SEGMENTDESCRIPTOR3) {
+    unsafe {
+        SegmentDescriptorSpec::aperture(crate::virtio::KMD_D2_OWNER_ENABLED).write_into_v3(seg)
+    };
 }
 
 /// The same aperture again, for the legacy `DXGK_QUERYSEGMENTOUT` dxgkrnl falls
 /// back to from QUERYSEGMENT3.
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR`.
-unsafe fn write_aperture_descriptor_legacy(seg: *mut DXGK_SEGMENTDESCRIPTOR, knobs: &AdapterKnobs) {
-    unsafe { SegmentDescriptorSpec::aperture(knobs.direct_flip).write_into_legacy(seg) };
+unsafe fn write_aperture_descriptor_legacy(seg: *mut DXGK_SEGMENTDESCRIPTOR) {
+    unsafe {
+        SegmentDescriptorSpec::aperture(crate::virtio::KMD_D2_OWNER_ENABLED)
+            .write_into_legacy(seg)
+    };
 }
 
 /// Write a MEMORY descriptor (`Aperture=0`, holds bits) whose backing lives at
@@ -990,7 +1048,7 @@ unsafe fn write_cpu_host_memory_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, ba
     unsafe { SegmentDescriptorSpec::cpu_host_memory(base, len).write_into_v4(seg) };
 }
 
-/// BAR descriptor, FULLY KNOB-DRIVEN (AddAdapter shape bisect: both the
+/// BAR descriptor, with topology/cache properties knob-driven (AddAdapter shape bisect: both the
 /// classic-CpuVisible and CpuHostAperture shapes were rejected identically, as
 /// were 64 MiB and RAM-backed variants -- the remaining hypotheses are flag
 /// combinations and GPU-physical BaseAddress overlap with segment 2, and each
@@ -1004,6 +1062,9 @@ unsafe fn write_cpu_host_memory_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, ba
 ///     non-overlap base above the paging aperture.
 ///
 /// The bit ladder itself lives on [`SegmentDescriptorSpec::from_bar_flags`].
+/// Bit 5 is not a knob any more: D9 clears the caller's value and derives the
+/// DirectFlip segment capability from the same SURFACE-owned D2 predicate as
+/// `DXGK_DRIVERCAPS.SupportDirectFlip` and `SupportMultiPlaneOverlay`.
 ///
 /// Pure: the flag word and base come from the [`AdapterKnobs`] snapshot, and the
 /// `BarF`/`BarB` breadcrumbs are written once in `AdapterKnobs::read_at_start`.
@@ -1019,8 +1080,15 @@ unsafe fn write_bar_knob_descriptor(
     cpu_aperture_len: u64,
     knobs: &AdapterKnobs,
 ) {
+    const DIRECT_FLIP_FLAG: u32 = 0x20;
+    let bar_flags = (knobs.bar_seg_flags & !DIRECT_FLIP_FLAG)
+        | if crate::virtio::KMD_D2_OWNER_ENABLED {
+            DIRECT_FLIP_FLAG
+        } else {
+            0
+        };
     let spec = SegmentDescriptorSpec::from_bar_flags(
-        knobs.bar_seg_flags,
+        bar_flags,
         gpu_base,
         gpa,
         len,
@@ -1125,7 +1193,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
             };
             match spec {
                 crate::ddi::segment_table::SegmentSpec::Aperture => unsafe {
-                    write_aperture_descriptor(d, &knobs)
+                    write_aperture_descriptor(d)
                 },
                 crate::ddi::segment_table::SegmentSpec::RamCpuHost { base, size } => {
                     crate::diag::record(0x0903_0000 | (((base >> 12) as u32) & 0xFFFF));
@@ -1191,7 +1259,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
 /// `diag::record`, i.e. DiagLevel-gated, and DiagLevel is cached at driver
 /// load, so answering it needs a DiagLevel=1 boot. Recorded as owed rather
 /// than assumed either way.
-unsafe fn query_segments3(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+unsafe fn query_segments3(_adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     if (args.OutputDataSize as usize) < size_of::<DXGK_QUERYSEGMENTOUT3>() {
         return STATUS_BUFFER_TOO_SMALL;
     }
@@ -1225,13 +1293,13 @@ unsafe fn query_segments3(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERI
     out.PagingBufferSize = PAGING_BUFFER_BYTES_LEGACY;
     out.PagingBufferPrivateDataSize = 0;
 
-    unsafe { write_aperture_descriptor3(descriptors, &adapter.knobs()) };
+    unsafe { write_aperture_descriptor3(descriptors) };
 
     STATUS_SUCCESS
 }
 
 unsafe fn query_segments_legacy(
-    adapter: &AdapterContext,
+    _adapter: &AdapterContext,
     args: &DXGKARG_QUERYADAPTERINFO,
 ) -> NTSTATUS {
     if (args.OutputDataSize as usize) < size_of::<DXGK_QUERYSEGMENTOUT>() {
@@ -1266,7 +1334,7 @@ unsafe fn query_segments_legacy(
     out.PagingBufferSize = PAGING_BUFFER_BYTES_LEGACY;
     out.PagingBufferPrivateDataSize = 0;
 
-    unsafe { write_aperture_descriptor_legacy(descriptors, &adapter.knobs()) };
+    unsafe { write_aperture_descriptor_legacy(descriptors) };
 
     STATUS_SUCCESS
 }

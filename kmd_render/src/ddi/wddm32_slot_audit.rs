@@ -843,7 +843,7 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         offset: 864,
         min_version: "WDDM2_1",
         class: SlotClass::Implemented,
-        reason: "D3 reports every requested unsupported mode behavior in NotSatisfied.",
+        reason: "D3 leaves unsupported requested behaviors clear in both Satisfied and NotSatisfied, per the WDK contract.",
     },
     SlotAudit {
         name: "DxgkDdiUpdateMonitorLinkInfo",

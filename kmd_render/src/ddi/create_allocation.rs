@@ -39,10 +39,13 @@
 //! `protocol::wddm::HeliosWddmAllocationDescV2` — cite the SYMBOL: that block
 //! has moved twice and the `:355-361` this line used to carry now lands inside
 //! `HeliosWddmPlaneRecordV2`). `DXGK_OPENALLOCATIONINFO::hAllocation` is
-//! dxgkrnl's runtime token, but WDK supplies `DxgkCbGetHandleData` at PASSIVE
-//! OpenAllocation time. D4 uses that documented callback to associate the
-//! resulting device-specific open object with this driver's exact
-//! `AllocationContext`; no adapter-global table or reverse lookup is involved.
+//! dxgkrnl's runtime token, but WDDM 2.0 supplies the paired
+//! `DxgkCbAcquireHandleData` / `DxgkCbReleaseHandleData` callbacks at PASSIVE
+//! OpenAllocation time. D4 uses that documented, scoped reference to associate
+//! the resulting device-specific open object with this driver's exact
+//! `AllocationContext`, then releases it before OpenAllocation returns. The
+//! Open/Close contract keeps the allocation live until every binding closes;
+//! no adapter-global table or reverse lookup is involved.
 //! The guest still receives no host resource id: K6 patches host operands from
 //! the canonical allocation owner.
 //!
@@ -814,12 +817,14 @@ const DXGK_OPENALLOCATION_FLAG_CREATE: u32 = 0x0000_0001;
 #[repr(C)]
 struct OpenAllocationContext {
     magic: u32,
-    /// Exact KMD allocation object resolved from dxgkrnl's per-device runtime
-    /// handle by `DxgkCbGetHandleData` while OpenAllocation is at PASSIVE_LEVEL.
+    /// Exact KMD allocation object resolved from the per-device runtime handle
+    /// by a scoped `DxgkCbAcquireHandleData` call while OpenAllocation is at
+    /// PASSIVE_LEVEL.
     ///
     /// This is the documented open-object association, not a resource-id reverse
-    /// lookup.  The value is immutable for the open's lifetime and is read later
-    /// only while dxgkrnl keeps this device-specific open handle live.
+    /// lookup. The acquire reference has already been released; the value stays
+    /// live because dxgkrnl closes every device-specific binding before calling
+    /// DestroyAllocation. It is read only while that open handle remains live.
     allocation: usize,
     /// Validated immutable view captured from open-time private data. Present
     /// receives only this device-specific open handle, so it must use this
@@ -4799,31 +4804,50 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
 /// # The canonical open/allocation association
 ///
 /// HWA2 still carries no host resource id.  D4 nevertheless needs the exact
-/// allocation behind a DMA Present's `hDeviceSpecificAllocation`, and WDK 28000
+/// allocation behind a DMA Present's `hDeviceSpecificAllocation`, and WDDM 2.0
 /// provides that association directly: at PASSIVE OpenAllocation,
-/// `DxgkCbGetHandleData(DXGK_HANDLE_ALLOCATION)` resolves the runtime
-/// `D3DKMT_HANDLE` to the KMD allocation private data.  We capture that pointer
-/// in the per-open object and never search by resource id, geometry, current
-/// scanout, or list position.  [`PresentAllocInfo`] remains `None` until its own
-/// A3 producer composes; the D4 display path reads only the canonical allocation
-/// projection.
+/// `DxgkCbAcquireHandleData(DXGK_HANDLE_ALLOCATION)` resolves the runtime
+/// `D3DKMT_HANDLE` to the KMD allocation private data and returns the paired
+/// release token. The Microsoft WDDM-2 compute sample releases that token inside
+/// OpenAllocation after copying the KMD pointer; holding it until CloseAllocation
+/// instead can pin dxgkrnl's own open/destroy transition. We follow that scoped
+/// pattern and rely on the separate documented ordering that CloseAllocation is
+/// called for every binding before DestroyAllocation. We never search by resource
+/// id, geometry, current scanout, or list position. [`PresentAllocInfo`] remains
+/// `None` until its own A3 producer composes; the D4 display path reads only the
+/// canonical allocation projection.
 unsafe fn canonical_open_allocation(
     adapter: &AdapterContext,
     runtime_handle: u32,
 ) -> Option<usize> {
     let dxgkrnl = adapter.dxgkrnl_opt()?;
-    let get = dxgkrnl.DxgkCbGetHandleData?;
+    let acquire = dxgkrnl.DxgkCbAcquireHandleData?;
+    let release = dxgkrnl.DxgkCbReleaseHandleData?;
     let mut args = unsafe { core::mem::zeroed::<DXGKARGCB_GETHANDLEDATA>() };
     args.hObject = runtime_handle;
     args.Type = _DXGK_HANDLE_TYPE::DXGK_HANDLE_ALLOCATION;
     args.Flags.__bindgen_anon_1.Value = 0;
+    let mut release_handle: DXGKARG_RELEASE_HANDLE = core::ptr::null_mut();
     // SAFETY: OpenAllocation is PASSIVE_LEVEL; `runtime_handle` is the exact
-    // live hAllocation from this DXGK_OPENALLOCATIONINFO entry and `args` lives
-    // for the synchronous callback.
-    let allocation = unsafe { get(&args) } as HANDLE;
-    // Validate the returned KMD private pointer before retaining it.  This also
-    // rejects a callback mode that returned some other class of private data.
-    unsafe { resolve_alloc(allocation) }.map(|_| allocation as usize)
+    // live hAllocation from this DXGK_OPENALLOCATIONINFO entry and both argument
+    // objects live for the synchronous callback.
+    let allocation = unsafe { acquire(&args, &mut release_handle) } as HANDLE;
+    if allocation.is_null() {
+        return None;
+    }
+    // Validate the returned KMD private pointer while the scoped reference is
+    // held. Keep only the boolean across the release: no Rust reference may
+    // outlive the dxgkrnl reference that made this dereference legal.
+    let valid = unsafe { resolve_alloc(allocation) }.is_some();
+    let release_args = DXGKARGCB_RELEASEHANDLEDATA {
+        ReleaseHandle: release_handle,
+        Type: _DXGK_HANDLE_TYPE::DXGK_HANDLE_ALLOCATION,
+    };
+    // SAFETY: this is the exact token and type paired with the successful
+    // acquire above. It is released before the pointer is published into the
+    // per-open object, matching Microsoft's WDDM-2 sample ordering.
+    unsafe { release(release_args) };
+    valid.then_some(allocation as usize)
 }
 
 pub unsafe extern "C" fn dxgkddi_open_allocation(

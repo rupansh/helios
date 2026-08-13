@@ -127,7 +127,7 @@ refuses to load if any slot disagrees with its class here.
 | 104 | 840 | `DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3` | WDDM2_1 | Implemented | Active D3 PASSIVE-retry binder over the D2 candidate and parking state; the D2 predicate derives solely from SURFACE. |
 | 105 | 848 | `DxgkDdiPostMultiPlaneOverlayPresent` | WDDM2_1 | Implemented | Bounded always-success D3 diagnostic callback; no output path requests PostPresentNeeded. |
 | 106 | 856 | `DxgkDdiValidateUpdateAllocationProperty` | WDDM2_1 | Implemented | Active D3 exact-allocation validation; all property mutations are rejected. |
-| 107 | 864 | `DxgkDdiControlModeBehavior` | WDDM2_1 | Implemented | D3 reports every requested unsupported mode behavior in NotSatisfied. |
+| 107 | 864 | `DxgkDdiControlModeBehavior` | WDDM2_1 | Implemented | D3 leaves unsupported requested behaviors clear in both Satisfied and NotSatisfied, per the WDK contract. |
 | 108 | 872 | `DxgkDdiUpdateMonitorLinkInfo` | WDDM2_1 | Implemented | Mandatory once a monitor target is advertised; revalidated under the 3.2 table. |
 | 109 | 880 | `DxgkDdiCreateHwContext` | WDDM2_2 | Disabled | D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero. |
 | 110 | 888 | `DxgkDdiDestroyHwContext` | WDDM2_2 | Disabled | D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero. |

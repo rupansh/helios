@@ -106,21 +106,17 @@ pub(crate) struct StartedState {
 ///
 /// One concept, one mechanism. Before this existed there were three:
 /// `AllocCached`/`PresentProbe`/`ScForceReject`/`DisplayHalf` were snapshotted
-/// here at StartDevice; `DirectFlipCaps` was re-read from the registry FOUR
-/// times per AddAdapter (the caps path plus once inside each of the three
-/// aperture descriptor writers); and `BarSegFlags`/`BarSegBaseMB` were read
+/// here at StartDevice, while `BarSegFlags`/`BarSegBaseMB` were read
 /// *inside* `write_bar_knob_descriptor`, which also performed two synchronous
 /// registry WRITES on every descriptor write — ungated by `DiagLevel`, because
 /// `record_named` has no such gate. A function named "write this descriptor"
 /// did blocking registry I/O in both directions.
 ///
 /// Passing `&AdapterKnobs` to the descriptor writers removes their ability to do
-/// I/O at all: they become pure functions of their arguments. It also closes a
-/// real (if test-VM-only) inconsistency — `reg add ... /v DirectFlipCaps /d 1`
-/// executed BETWEEN the DRIVERCAPS query and the segment query of a
-/// `pnputil /restart-device` produced `SupportDirectFlip = 0` in the caps surface
-/// while the aperture descriptor set the DirectFlip segment flag, an internally
-/// inconsistent surface no diag record could explain because `0x01D7` bit 2 read 0.
+/// I/O at all: they become pure functions of their arguments. D9 also removes
+/// `DirectFlipCaps` entirely: Direct Flip, MPO, and the segment capability now
+/// derive from the SURFACE-owned D2 package, so a registry value cannot create a
+/// mixed activation state during AddAdapter.
 ///
 /// Every field name here corresponds to a [`crate::diag::knobs`] entry, which is
 /// where the ≤14-byte lookup-buffer rule is enforced at compile time.
@@ -175,11 +171,6 @@ pub(crate) struct AdapterKnobs {
     /// half became unconditional production). Demoted to 0 before publication
     /// if the transport never came up. Mirrored to `DspH`.
     pub display_half: bool,
-    /// `DirectFlipCaps` (default 0 = deny direct flip everywhere — the truthful
-    /// surface; see the `SupportDirectFlip` comment in `query_driver_caps`).
-    /// Nonzero restores the legacy bring-up advertisement, in BOTH the adapter
-    /// cap and the aperture segment flags, which is the point of reading it once.
-    pub direct_flip: bool,
     /// `CrossAdaptCaps` (default 0). Nonzero advertises
     /// `DXGK_VIDMMCAPS.CrossAdapterResource` (tier-1 cross-adapter copy support).
     /// The compile-time `DECLARE_CROSS_ADAPTER_RESOURCE` this used to be OR'd
@@ -255,7 +246,6 @@ impl AdapterKnobs {
         dispatch_bind: true,
         present_probe: false,
         display_half: true,
-        direct_flip: false,
         cross_adapter: false,
         bar_seg_flags: 0x1C,
         bar_seg_base_mb: 0,
@@ -270,9 +260,7 @@ impl AdapterKnobs {
     /// Read every knob once. PASSIVE_LEVEL.
     ///
     /// Called twice per device lifetime: at AddAdapter (so the AddAdapter-time
-    /// caps and segment queries answer from real registry values — a
-    /// `DirectFlipCaps=1` A/B must still take effect before StartDevice runs,
-    /// exactly as it did when each writer read the registry itself) and again in
+    /// caps and segment queries answer from one immutable snapshot) and again in
     /// StartDevice through [`Self::read_at_start`], so `reg add` +
     /// `pnputil /restart-device` still picks up a change with no reboot.
     pub fn read() -> Self {
@@ -283,7 +271,6 @@ impl AdapterKnobs {
             dispatch_bind: read_config_dword(knobs::DISPATCH_BIND, 1) != 0,
             present_probe: read_config_dword(knobs::PRESENT_PROBE, 0) != 0,
             display_half: read_config_dword(knobs::DISPLAY_HALF, 1) != 0,
-            direct_flip: read_config_dword(knobs::DIRECT_FLIP_CAPS, 0) != 0,
             cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
             bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
             bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),

@@ -500,7 +500,11 @@ pub unsafe extern "C" fn dxgkddi_control_mode_behavior(
     let request = unsafe { control.Request.Value };
     control.Satisfied = Default::default();
     control.NotSatisfied = Default::default();
-    control.NotSatisfied.Value = request;
+    // WDK contract: NotSatisfied is only for a behavior this adapter SUPPORTS
+    // but failed to apply. Helios supports neither PrioritizeHDR nor
+    // ColorimetricControl, so every requested unsupported bit stays clear in
+    // both result fields. Echoing Request into NotSatisfied falsely tells
+    // dxgkrnl that a supported mode-control operation failed.
     if request != 0 {
         record_passive(&MODE_REQUESTS, b"MpoModeRq", request & 0xff);
     }

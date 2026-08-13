@@ -592,8 +592,7 @@ pub(crate) fn complete_queued(
             state.quarantine(BackendBinding::Real(binding));
             state.poisoned = true;
             false
-        } else {
-            let plane = state.plane.as_mut().expect("plane checked above");
+        } else if let Some(plane) = state.plane.as_mut() {
             let mut retained = plane.retain_real_candidate(binding, completion.sequence);
             if retained.effect != Effect::CandidateRetained {
                 if let Some(candidate) = retained.release_candidate.take() {
@@ -621,6 +620,14 @@ pub(crate) fn complete_queued(
                     terminal
                 }
             }
+        } else {
+            // The predicate above already classifies `None` as a poisoned
+            // completion. Keep this arm explicit anyway: a future predicate
+            // refactor must quarantine custody instead of turning an internal
+            // mismatch into a kernel panic.
+            state.quarantine(BackendBinding::Real(binding));
+            state.poisoned = true;
+            false
         }
     };
     for transition in transitions.into_iter().flatten() {

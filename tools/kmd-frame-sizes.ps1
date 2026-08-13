@@ -46,6 +46,9 @@ param(
     # functions whose sum is the budget, then the venus bring-up chain they
     # call, which R608 split into per-stage frames.
     [string[]] $Symbols = @(
+        '10add_device18dxgkddi_add_device',
+        '14AdapterContext6create',
+        '14TransportOwner7unbound',
         '9lifecycle20dxgkddi_start_device',
         '9VirtioGpu4init',
         # Unique across crate-hash changes: const queue size 0x40 followed by
@@ -65,6 +68,7 @@ param(
     # declared rather than inferred. Each entry is a comma-separated list of
     # $Symbols entries, outermost first.
     [string[]] $Chains = @(
+        '10add_device18dxgkddi_add_device,14AdapterContext6create,14TransportOwner7unbound',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,Kj40_E3newNtNtNtB5_9transport3pci12PciTransport',
         '9lifecycle20dxgkddi_start_device,9VirtioGpu4init,24allocate_present_streams',
@@ -99,13 +103,46 @@ for ($i = 0; $i -lt $dis.Count; $i++) {
 
 $frames = @{}
 foreach ($sym in $Symbols) {
-    $hit = Select-String -Path $map -Pattern ([regex]::Escape($sym)) -SimpleMatch |
-           Select-Object -First 1
-    if (-not $hit) { Write-Host ("{0,-40} SYMBOL NOT IN .map" -f $sym); continue }
+    # Match only the symbol column. A plain Select-String -First 1 is unsafe:
+    # Rust monomorphizations embed their caller/closure names, so the first hit
+    # for dxgkddi_start_device used to be a 56-byte with_virtio closure rather
+    # than the 872-byte DDI itself. Prefer a terminal match (the exact Rust
+    # function), otherwise require the shortest matching symbol to identify one
+    # address. Ambiguity fails closed instead of silently understating a chain.
+    $candidates = @(
+        Select-String -Path $map -Pattern $sym -SimpleMatch | ForEach-Object {
+            $parts = $_.Line.Trim() -split '\s+'
+            if ($parts.Count -ge 4 -and
+                $parts[0] -match '^[0-9a-fA-F]+:[0-9a-fA-F]+$' -and
+                $parts[1].Contains($sym) -and
+                $parts[2] -match '^[0-9a-fA-F]{16}$' -and
+                $parts[3] -eq 'f') {
+                [pscustomobject]@{ Name = $parts[1]; Va = $parts[2] }
+            }
+        }
+    )
+    if ($candidates.Count -eq 0) {
+        Write-Host ("{0,-40} SYMBOL NOT IN .map" -f $sym)
+        continue
+    }
+    $terminal = @($candidates | Where-Object { $_.Name.EndsWith($sym) })
+    if ($terminal.Count -eq 1) {
+        $hit = $terminal[0]
+    } elseif ($terminal.Count -gt 1) {
+        throw "ambiguous terminal map symbols for '$sym': $($terminal.Name -join ', ')"
+    } else {
+        $ordered = @($candidates | Sort-Object @{ Expression = { $_.Name.Length } }, Name)
+        $shortestLength = $ordered[0].Name.Length
+        $shortest = @($ordered | Where-Object { $_.Name.Length -eq $shortestLength })
+        $addresses = @($shortest.Va | Sort-Object -Unique)
+        if ($addresses.Count -ne 1) {
+            throw "ambiguous shortest map symbols for '$sym': $($shortest.Name -join ', ')"
+        }
+        $hit = $shortest[0]
+    }
 
     # map line: "0001:0000d340  <mangled>  000000018000e340 f  <obj>"
-    $va = ($hit.Line -split '\s+' | Where-Object { $_ -match '^[0-9a-fA-F]{16}$' } | Select-Object -First 1)
-    if (-not $va) { Write-Host ("{0,-40} NO VA IN MAP LINE" -f $sym); continue }
+    $va = $hit.Va
 
     $key = ($va.TrimStart('0')).ToLower()
     if (-not $index.ContainsKey($key)) { Write-Host ("{0,-40} VA {1} NOT IN DISASSEMBLY" -f $sym, $va); continue }

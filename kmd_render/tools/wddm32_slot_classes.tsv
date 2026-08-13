@@ -125,7 +125,7 @@ DxgkDdiCheckMultiPlaneOverlaySupport3	Implemented	Active D3 exact-allocation one
 DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3	Implemented	Active D3 PASSIVE-retry binder over the D2 candidate and parking state; the D2 predicate derives solely from SURFACE.
 DxgkDdiPostMultiPlaneOverlayPresent	Implemented	Bounded always-success D3 diagnostic callback; no output path requests PostPresentNeeded.
 DxgkDdiValidateUpdateAllocationProperty	Implemented	Active D3 exact-allocation validation; all property mutations are rejected.
-DxgkDdiControlModeBehavior	Implemented	D3 reports every requested unsupported mode behavior in NotSatisfied.
+DxgkDdiControlModeBehavior	Implemented	D3 leaves unsupported requested behaviors clear in both Satisfied and NotSatisfied, per the WDK contract.
 DxgkDdiUpdateMonitorLinkInfo	Implemented	Mandatory once a monitor target is advertised; revalidated under the 3.2 table.
 DxgkDdiCreateHwContext	Disabled	D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero.
 DxgkDdiDestroyHwContext	Disabled	D9 unregisters the complete hardware-context and hardware-queue family; SchedulingCaps keeps every HwQueuePacketCap bit zero.

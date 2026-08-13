@@ -612,6 +612,60 @@ def check_sources(sources: dict[str, str]) -> list[str]:
     ):
         errors.append(f"{SURFACE_PATH}: active D4 requires the exact WDDM 3.2 surface")
 
+    # D4's exact allocation association is one scoped WDDM-2 reference, not
+    # the WDDM-1.x non-retaining query and not a reference retained across the
+    # device-specific open. Target dxgkrnl rejects DxgkCbGetHandleData from a
+    # WDDM-2+ driver. Microsoft's WDDM-2 compute sample acquires, copies the KMD
+    # pointer, and releases inside OpenAllocation; CloseAllocation-before-
+    # DestroyAllocation is the separate lifetime guarantee for the copied
+    # pointer. Escaping the release token pins/re-enters dxgkrnl teardown.
+    alloc_live = live.get(ALLOC, "")
+    alloc_src = sources.get(ALLOC, "")
+    if re.search(r"\bDxgkCbGetHandleData\b", alloc_live):
+        errors.append(f"{ALLOC}: WDDM-1.x DxgkCbGetHandleData returned to active D4")
+    if re.search(r"\bAcquiredAllocation\b", alloc_live):
+        errors.append(f"{ALLOC}: allocation acquire reference escaped scoped OpenAllocation resolution")
+    canonical = one(ALLOC, "canonical_open_allocation")
+    if canonical is not None:
+        item, body = canonical
+        source_body = alloc_src[item.brace : item.end]
+        acquire_cb_at = source_body.find("let acquire = dxgkrnl.DxgkCbAcquireHandleData?;")
+        release_cb_at = source_body.find("let release = dxgkrnl.DxgkCbReleaseHandleData?;")
+        acquire_at = source_body.find("acquire(&args, &mut release_handle)")
+        validate_at = source_body.find(
+            "let valid = unsafe { resolve_alloc(allocation) }.is_some();"
+        )
+        release_args_at = source_body.find("let release_args = DXGKARGCB_RELEASEHANDLEDATA {")
+        release_type_at = source_body.find(
+            "Type: _DXGK_HANDLE_TYPE::DXGK_HANDLE_ALLOCATION,"
+        )
+        release_at = source_body.find("unsafe { release(release_args) };")
+        publish_at = source_body.find("valid.then_some(allocation as usize)")
+        if not (
+            0
+            <= acquire_cb_at
+            < release_cb_at
+            < acquire_at
+            < validate_at
+            < release_args_at
+            < release_type_at
+            < release_at
+            < publish_at
+        ):
+            errors.append(
+                f"{ALLOC}: canonical open must acquire, validate, release, then publish one scoped WDDM-2 association"
+            )
+    open_context = re.search(r"struct\s+OpenAllocationContext\s*\{([^}]*)\}", alloc_live, re.S)
+    if open_context is None or not re.search(
+        r"\ballocation\s*:\s*usize\s*,", open_context.group(1)
+    ):
+        errors.append(f"{ALLOC}: device-specific open lost its exact copied allocation pointer")
+    elif re.search(r"release_handle|DXGKARG_RELEASE_HANDLE", open_context.group(1)):
+        errors.append(f"{ALLOC}: allocation acquire token escaped into the device-specific open")
+    close = one(ALLOC, "dxgkddi_close_allocation")
+    if close is not None and "let _ = unsafe { take_open_ctx(handle) };" not in alloc_src[close[0].brace : close[0].end]:
+        errors.append(f"{ALLOC}: CloseAllocation no longer drops the device-specific open object")
+
     for name, value in (
         ("CLASSIC_MODE_CHANGE", "0x0000_0001"),
         ("CLASSIC_FLIP_IMMEDIATE", "0x0000_0002"),
@@ -1605,6 +1659,83 @@ def main() -> None:
             " fast_bind_from_flip(adapter, h_open_allocation, 0, 0, 0, None); ",
         ),
         "retired D4 mechanism",
+    )
+
+    require_rejected(
+        "WDDM-1.x allocation query",
+        replace_in_function(
+            sources,
+            ALLOC,
+            "canonical_open_allocation",
+            "let acquire = dxgkrnl.DxgkCbAcquireHandleData?;",
+            "let acquire = dxgkrnl.DxgkCbGetHandleData?;",
+        ),
+        "WDDM-1.x DxgkCbGetHandleData",
+    )
+    require_rejected(
+        "missing paired allocation release",
+        replace_in_function(
+            sources,
+            ALLOC,
+            "canonical_open_allocation",
+            "unsafe { release(release_args) };",
+            "let _ = release_args;",
+        ),
+        "acquire, validate, release, then publish",
+    )
+    require_rejected(
+        "wrong paired allocation release type",
+        replace_in_function(
+            sources,
+            ALLOC,
+            "canonical_open_allocation",
+            "Type: _DXGK_HANDLE_TYPE::DXGK_HANDLE_ALLOCATION,",
+            "Type: _DXGK_HANDLE_TYPE::DXGK_HANDLE_RESOURCE,",
+        ),
+        "acquire, validate, release, then publish",
+    )
+    require_rejected(
+        "allocation pointer published before paired release",
+        replace_in_function(
+            sources,
+            ALLOC,
+            "canonical_open_allocation",
+            "unsafe { release(release_args) };\n    valid.then_some(allocation as usize)",
+            "let published = valid.then_some(allocation as usize);\n    unsafe { release(release_args) };\n    published",
+        ),
+        "acquire, validate, release, then publish",
+    )
+    require_rejected(
+        "allocation pointer accepted without magic validation",
+        replace_in_function(
+            sources,
+            ALLOC,
+            "canonical_open_allocation",
+            "let valid = unsafe { resolve_alloc(allocation) }.is_some();",
+            "let valid = true;",
+        ),
+        "acquire, validate, release, then publish",
+    )
+    require_rejected(
+        "CloseAllocation open-object leak",
+        replace_in_function(
+            sources,
+            ALLOC,
+            "dxgkddi_close_allocation",
+            "let _ = unsafe { take_open_ctx(handle) };",
+            "let _ = handle;",
+        ),
+        "CloseAllocation no longer drops the device-specific open object",
+    )
+    require_rejected(
+        "long-lived allocation acquire token",
+        replace_once(
+            sources,
+            ALLOC,
+            "    allocation: usize,",
+            "    allocation: usize,\n    release_handle: DXGKARG_RELEASE_HANDLE,",
+        ),
+        "allocation acquire token escaped",
     )
 
     heuristic = dict(sources)

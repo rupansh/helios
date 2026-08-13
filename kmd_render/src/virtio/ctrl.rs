@@ -102,6 +102,7 @@ static CTRL_WAIT_FENCE_COMPLETED: AtomicU32 = AtomicU32::new(0);
 static CTRL_RESPONSE_MALFORMED: AtomicU32 = AtomicU32::new(0);
 static FENCE_WAIT_PENDING: AtomicU32 = AtomicU32::new(0);
 static FENCE_WAIT_HOST_RESPONSE: AtomicU32 = AtomicU32::new(0);
+static FINALIZER_CUSTODY_INVARIANT: AtomicU32 = AtomicU32::new(0);
 
 fn retain_resource_finalizer(
     finalizer: ResourceBackingFinalizer,
@@ -144,15 +145,27 @@ fn finalize_resource_backing(
     }
     let mut pending = Some(finalizer);
     match adapter.with_venus_client(passive, |client| {
-        let finalizer = pending
-            .take()
-            .expect("Venus finalizer closure executes at most once");
+        let Some(finalizer) = pending.take() else {
+            // `with_venus_client` accepts `FnOnce`, so this arm is
+            // structurally unreachable. If that contract is ever weakened,
+            // preserve safety by doing no second finalization and count the
+            // invariant loss instead of bugchecking the machine.
+            bump_wait_refusal(&FINALIZER_CUSTODY_INVARIANT, b"FnCust");
+            return Ok(());
+        };
         finalize_resource_backing_with_client(client, adapter, finalizer)
     }) {
         Ok(result) => result,
-        Err(_) => Err(pending
-            .take()
-            .expect("missing Venus client cannot consume finalizer custody")),
+        Err(_) => match pending.take() {
+            Some(finalizer) => Err(finalizer),
+            None => {
+                // Today `with_venus_client` returns `Err` only without calling
+                // the closure, which leaves `pending` populated. If that
+                // contract drifts, never synthesize or double-run custody.
+                bump_wait_refusal(&FINALIZER_CUSTODY_INVARIANT, b"FnCust");
+                Ok(())
+            }
+        },
     }
 }
 
