@@ -538,6 +538,7 @@ pub fn diag_dump_engine_atomics() {
     crate::diag::record(
         0x0F17_0000 | (crate::virtio::gpu::CTRL_TIMEOUT_COUNT.load(Ordering::Relaxed) & 0xFFFF),
     );
+    crate::adapter::dump_ordered_engine_atomics();
 }
 
 /// Context handed to [`notify_at_dirql_routine`] across the
@@ -651,7 +652,7 @@ pub(crate) unsafe fn signal_dma_completed(
     let forward = helios_kmd_logic::scanout_lease::fence_is_forward(last, fence);
     if !forward {
         DMA_STALE_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
-        return STATUS_SUCCESS;
+        return STATUS_INVALID_PARAMETER;
     }
 
     let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
@@ -710,12 +711,12 @@ unsafe fn signal_dma_preempted_locked(
     unsafe { notify_at_dirql(dxgkrnl, &mut interrupt, true) }
 }
 
-/// Common submission handling (C3/M3.4): record the WDDM fence behind the venus
-/// work outstanding at submit time. Signals `DMA_COMPLETED` immediately only
-/// when nothing gates it (no async venus in flight, FIFO empty — e.g. paging
-/// during bring-up) or the transport is down; otherwise the interrupt DPC
-/// completes it once every async venus submission queued before it has retired
-/// (the real venus-driven WDDM fence — WDDM_FAKE_VIDMM_RESEARCH §C).
+/// Common submission handling (C3/M3.4): admit the exact WDDM fence into K9,
+/// then record its private ticket behind the Venus work outstanding at submit
+/// time. An already-terminal boundary is marked through the same frontier;
+/// otherwise the interrupt DPC marks it after the exact producer retires.
+/// Transport loss or bounded-owner exhaustion fails the generation closed and
+/// never authorizes `DMA_COMPLETED`.
 /// The only thing `note_and_maybe_signal` can tell a SubmitCommand DDI.
 ///
 /// This type exists so a transport or notification status physically cannot
@@ -736,28 +737,15 @@ enum SubmitAck {
 /// were already terminal before the scheduler delivered SubmitCommand.
 ///
 /// This is deliberately not routed through `note_wddm_submission`: K11 owns no
-/// adapter-global boundary entry and creates no independent timeline.  The
-/// exact OS-supplied fence was admitted by the HVC1 context-local watermark and
-/// is passed unchanged to the audited DIRQL notification helper. A failed
-/// notification remains a named failure; inventing a later completion or
-/// putting this fence on the legacy queue would destroy the causal proof.
+/// compatibility Venus boundary and creates no independent timeline. K9 owns
+/// the one adapter/engine scheduler frontier; K11 merely marks its exact direct
+/// ticket terminal after the HVC1 context-local watermark and actual host reply
+/// both validate.
 fn complete_k11_host_submission(
-    guard: &WddmNotifyGuard<'_>,
     adapter: &AdapterContext,
-    exact_fence: u32,
+    ticket: crate::adapter::OrderedEngineTicket,
 ) {
-    let Ok(dxgkrnl) = adapter.dxgkrnl() else {
-        DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
-    // SAFETY: the notification lock is held, the interface is live, and
-    // `exact_fence` is the unmodified fence admitted by this context only after
-    // its actual host reply was validated and published. The session and
-    // canonical-pair rundown guards also remain live through this call.
-    let status = unsafe { signal_dma_completed(guard, dxgkrnl, exact_fence) };
-    if status != STATUS_SUCCESS {
-        DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
-    }
+    let _ = super::interrupt::complete_ordered_engine_submission(adapter, ticket);
 }
 
 fn note_and_maybe_signal(
@@ -765,17 +753,16 @@ fn note_and_maybe_signal(
     fence: u32,
     is_paging: bool,
     present_submission: Option<PresentSubmissionBoundary>,
+    preadmitted: Option<crate::adapter::OrderedEngineTicket>,
 ) -> SubmitAck {
-    let Ok(dxgkrnl) = adapter.dxgkrnl() else {
-        // Effectively unreachable: dxgkrnl is set at StartDevice and never
-        // cleared, and SubmitCommand cannot precede it. The submission stays in
-        // the FIFO for the DPC either way.
-        DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
-        return SubmitAck::Accepted;
-    };
     let overflows_before = crate::virtio::VirtioGpu::wddm_pending_overflows();
-    adapter.with_wddm_notify_lock(|guard| {
-        let signal_now = guard
+    let complete_now = adapter.with_wddm_notify_lock(|guard| {
+        let ticket = match preadmitted {
+            Some(ticket) if guard.ordered_engine_ticket_is_live(ticket) => ticket,
+            Some(_) => return None,
+            None => guard.admit_ordered_engine_submission(fence)?,
+        };
+        let admission = guard
             .with_virtio(|o, v| {
                 let gpu_completion_fence = present_submission.and_then(|present| {
                     (present.gpu_fence_id != 0).then_some(present.gpu_fence_id)
@@ -806,7 +793,7 @@ fn note_and_maybe_signal(
                 let d3d12 = present_submission.is_some_and(|present| present.d3d12);
                 v.note_wddm_submission(
                     o,
-                    fence,
+                    ticket,
                     is_paging,
                     gpu_completion_fence,
                     stream_boundary,
@@ -814,23 +801,20 @@ fn note_and_maybe_signal(
                     d3d12,
                 )
             })
-            // Transport down (bring-up / teardown): no venus work can gate it.
-            .unwrap_or(true);
-        if signal_now {
-            // SAFETY: the notification lock is held and dxgkrnl is live.
-            let status = unsafe { signal_dma_completed(guard, dxgkrnl, fence) };
-            if status != STATUS_SUCCESS {
-                // Same handling as the DPC path in R209: count it and leave the
-                // retirement to a later DPC rather than failing the submission.
-                DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
-                if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
-                    // SAFETY: callable at <= DIRQL with a valid DeviceHandle;
-                    // it does not take the notify lock we hold.
-                    unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
-                }
+            // Transport down is a failed boundary, never proof of completion.
+            .unwrap_or(crate::virtio::gpu::WddmAdmission::Failed);
+        match admission {
+            crate::virtio::gpu::WddmAdmission::HostTerminal => Some(ticket),
+            crate::virtio::gpu::WddmAdmission::Pending => None,
+            crate::virtio::gpu::WddmAdmission::Failed => {
+                let _ = guard.fail_ordered_engine_submission(ticket);
+                None
             }
         }
     });
+    if let Some(ticket) = complete_now {
+        let _ = super::interrupt::complete_ordered_engine_submission(adapter, ticket);
+    }
     if present_submission.is_some_and(|present| present.blt_token != 0) {
         // SubmitCommand is the residency-admission edge. Publish the worker
         // cause before its wake: the exact producer may have terminalized
@@ -838,11 +822,11 @@ fn note_and_maybe_signal(
         adapter.scanout_retire_wanted.store(1, Ordering::Release);
         adapter.signal_hpd();
     }
-    // The pending FIFO overflowed and degraded to the immediate model, dropping
-    // every queued entry. Those entries were the only waiters on their scan-out
-    // leases, so release them now — outside the notify lock, because the lease
-    // state lives on the adapter and its release wakes the display worker.
-    // Loud (`LsTear` moves) and exact; not a timeout.
+    // The compatibility FIFO overflowed and K9 failed the scheduler generation
+    // closed, dropping its private rows without reporting a fence. Those rows
+    // were the only waiters on their scan-out leases, so release them now —
+    // outside the notify lock, because the lease state lives on the adapter and
+    // its release wakes the display worker. Loud (`LsTear` moves) and exact.
     if crate::virtio::VirtioGpu::wddm_pending_overflows() != overflows_before {
         adapter.release_all_scanout_leases(crate::ddi::scanout_trace::LeaseEnd::Teardown);
     }
@@ -1147,7 +1131,8 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
     };
     // The submission is accepted regardless of how the notification went; a
     // non-SUCCESS return here bugchecks dxgmms2 with 0x119 Arg1=2.
-    let SubmitAck::Accepted = note_and_maybe_signal(adapter, fence, is_paging, present_fence);
+    let SubmitAck::Accepted =
+        note_and_maybe_signal(adapter, fence, is_paging, present_fence, None);
     STATUS_SUCCESS
 }
 
@@ -1193,7 +1178,16 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
             // validation, context-local fence admission, and exact completion.
             // Reset closes and joins this guard before abandoning its scheduler
             // epoch; ordinary session teardown does not wait on it.
-            let disposition = adapter.with_k11_completion(|| {
+            let disposition = adapter
+                .with_k11_completion(|| {
+                // K9 admission happens before any native submit transition.
+                // Preemption/reset therefore either sees and invalidates this
+                // exact ticket or happens wholly before the new generation's
+                // admission; a late host result cannot discover a successor by
+                // fence value.
+                let ticket = adapter.with_wddm_notify_lock(|guard| {
+                    guard.admit_ordered_engine_submission(fence)
+                })?;
                 // SAFETY: the private-data pair for this submission.
                 let disposition = unsafe {
                     crate::ddi::native_render::submit(native, session, submit)
@@ -1202,29 +1196,46 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
                     exact_fence,
                 ) = disposition
                 {
-                    // Host-resource rundown has ended. Take the ordinary WDDM
-                    // notification lock only for delivery, so finite session
-                    // cleanup may use that lock before this OS callback if a
-                    // same-context Render is already tearing the session down.
-                    adapter.with_wddm_notify_lock(|guard| {
-                        complete_k11_host_submission(guard, adapter, exact_fence)
-                    });
+                    if exact_fence == fence {
+                        // Host-resource rundown has ended. K9 retains an early
+                        // cross-context completion and notifies only when this
+                        // ticket reaches the one-engine head.
+                        complete_k11_host_submission(adapter, ticket);
+                    } else {
+                        // The direct context admitted a different scheduler
+                        // fence than the callback supplied. Fail this generation
+                        // closed; never substitute either scalar.
+                        let _ = super::interrupt::fail_ordered_engine_submission(
+                            adapter, ticket,
+                        );
+                    }
+                } else if matches!(
+                    disposition,
+                    crate::ddi::native_render::NativeSubmitDisposition::Revoked
+                ) {
+                    let _ =
+                        super::interrupt::fail_ordered_engine_submission(adapter, ticket);
                 }
-                disposition
-            });
+                Some((disposition, ticket))
+            })
+                .flatten();
             let SubmitAck::Accepted = match disposition {
-                Some(crate::ddi::native_render::NativeSubmitDisposition::HostCompleted(_)) => {
+                Some((
+                    crate::ddi::native_render::NativeSubmitDisposition::HostCompleted(_),
+                    _,
+                )) => {
                     SubmitAck::Accepted
                 }
-                Some(crate::ddi::native_render::NativeSubmitDisposition::Revoked) | None => {
+                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, _))
+                | None => {
                     // The host-completed marker belonged to a session whose
                     // exact transport/fence authority was revoked before this
                     // callback, or reset already closed the adapter completion
                     // epoch. Do not forge completion through the legacy queue.
                     SubmitAck::Accepted
                 }
-                Some(crate::ddi::native_render::NativeSubmitDisposition::Refused) => {
-                    note_and_maybe_signal(adapter, fence, is_paging, None)
+                Some((crate::ddi::native_render::NativeSubmitDisposition::Refused, ticket)) => {
+                    note_and_maybe_signal(adapter, fence, is_paging, None, Some(ticket))
                 }
             };
             return STATUS_SUCCESS;
@@ -1240,7 +1251,8 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
         )
     };
     // As above: accepted regardless of the notification outcome.
-    let SubmitAck::Accepted = note_and_maybe_signal(adapter, fence, is_paging, present_fence);
+    let SubmitAck::Accepted =
+        note_and_maybe_signal(adapter, fence, is_paging, present_fence, None);
     STATUS_SUCCESS
 }
 
@@ -1308,6 +1320,10 @@ pub(crate) fn abandon_pending_submissions(
     // or retained only through an already-dispatched host response.
     let retain_for_resubmit = matches!(&outcome, AbandonOutcome::Preempted { .. });
     adapter.with_wddm_notify_lock(|guard| {
+        // K9 invalidates the exact frontier generation in the same critical
+        // section that abandons the compatibility FIFO. A host callback that
+        // arrives later carries only its old direct ticket and is inert.
+        guard.invalidate_ordered_engine();
         let dropped = guard
             .with_virtio(|o, v| {
                 if retain_for_resubmit {
@@ -1337,6 +1353,12 @@ pub(crate) fn abandon_pending_submissions(
                 STATUS_SUCCESS
             }
         };
+        // Successful preemption is the one abandonment that permits replay in
+        // the same physical transport. Reopen only after the PREEMPTED packet
+        // was accepted; failure leaves the engine closed for removal/TDR.
+        if retain_for_resubmit && status == STATUS_SUCCESS {
+            let _ = guard.reopen_ordered_engine();
+        }
         (dropped, status)
     })
 }

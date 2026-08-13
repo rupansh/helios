@@ -316,7 +316,13 @@ const PRESENT_STREAM_GENERATION_MAX: u32 = helios_kmd_logic::present_stream::GEN
 /// Bit 63 distinguishes this from the legacy exclusive wire-fence namespace.
 pub const PRESENT_STREAM_BOUNDARY_TAG: u64 = helios_kmd_logic::present_stream::BOUNDARY_TAG;
 /// Max WDDM submissions pending on venus completion.
-const MAX_WDDM_PENDING: usize = 256;
+const MAX_WDDM_PENDING: usize =
+    helios_kmd_logic::ordered_engine::MAX_ORDERED_ENGINE_SUBMISSIONS;
+const _: () = assert!(
+    MAX_WDDM_PENDING
+        == helios_protocol::translation_session::HELIOS_HTS1_MAX_HOST_DISPATCH_FIFO_DEPTH
+            as usize
+);
 /// Ceiling the `WddmHoldMs` knob is clamped to, IN CODE.
 ///
 /// The hold delays the head of an adapter-global, strictly head-of-line FIFO, so
@@ -2647,7 +2653,10 @@ enum WireBoundary {
 /// only question a WDDM completion can answer, and it is the one asked here
 /// again. The epochs live on, deciding the flush executor's ownership gate.
 struct WddmPending {
-    fence: u32,
+    /// Direct slot/generation authority in K9's adapter-owned ordered engine
+    /// frontier. This is scheduler-private lifetime state; it never crosses a
+    /// wire or renderer ABI and is not looked up by a resource identity.
+    engine_ticket: crate::adapter::OrderedEngineTicket,
     /// Legacy normal-wire producer boundary (possibly the KMD scanout-copy
     /// ring-1 fence).  This namespace is intentionally separate from
     /// `stream_boundary` below.
@@ -2846,9 +2855,21 @@ pub enum WddmTake {
     Ready(WddmReady),
 }
 
+/// Compatibility Venus admission beneath K9's authoritative engine frontier.
+#[must_use = "a failed compatibility boundary must poison, never complete, its K9 ticket"]
+pub enum WddmAdmission {
+    /// No producer remains; the caller may mark the exact K9 ticket terminal.
+    HostTerminal,
+    /// The entry and its direct K9 ticket are both retained for the DPC.
+    Pending,
+    /// Transport failure or bounded FIFO exhaustion. The current K9 generation
+    /// must fail closed; this outcome never authorizes DMA completion.
+    Failed,
+}
+
 impl WddmReady {
-    pub fn fence(&self) -> u32 {
-        self.pending.fence
+    pub(crate) fn engine_ticket(&self) -> crate::adapter::OrderedEngineTicket {
+        self.pending.engine_ticket
     }
 
     pub(crate) fn terminal_prefix(&self) -> Option<WindowedBltTerminalPrefix> {
@@ -7504,37 +7525,31 @@ impl VirtioGpu {
         self.windowed_blt.consume_terminal_prefix(prefix);
     }
 
-    /// Record a WDDM submission (`SubmissionFenceId = fence`). Returns `true`
-    /// if the caller should signal DMA_COMPLETED immediately (no venus work
-    /// outstanding, nothing queued ahead); otherwise the interrupt DPC
-    /// completes it via [`Self::take_ready_wddm`] once every async submission
-    /// queued before it has retired. Paging buffers carry no venus work
-    /// (watermark 0) but still queue FIFO behind earlier render submissions —
-    /// SubmissionFenceIds are watermarks to dxgkrnl and must complete
-    /// monotonically.
+    /// Record the compatibility Venus boundary for K9's already-admitted exact
+    /// WDDM submission ticket. The returned state never reports or reconstructs
+    /// a scheduler fence. Paging buffers carry no Venus work (watermark 0) but
+    /// still queue FIFO behind earlier render submissions.
     pub fn note_wddm_submission(
         &mut self,
         _order: &crate::adapter::NotifyOrdered<'_>,
-        fence: u32,
+        engine_ticket: crate::adapter::OrderedEngineTicket,
         paging: bool,
         gpu_completion_fence: Option<u64>,
         stream_boundary: Option<u64>,
         blt_token: Option<u64>,
         d3d12: bool,
-    ) -> bool {
+    ) -> WddmAdmission {
         if self.failed {
-            // Nothing will ever retire, so queueing this fence guarantees a TDR.
-            // Signal it now - and clear the FIFO in the SAME critical section:
-            // dxgkrnl requires monotonic SubmissionFenceId completion, so
-            // signalling the newest fence while older ones stay queued would
-            // break the invariant.
+            // Nothing will ever retire. Clear compatibility owners, but never
+            // convert transport loss into completion: K9 poisons the exact
+            // scheduler generation and lets reset/removal own the outcome.
             WDDM_SIGNAL_AFTER_FAILURE.fetch_add(1, Ordering::Relaxed);
             self.wddm_pending.clear();
             // A failure latch aborted every WindowedBlt reader before this
             // path can be reached. Clear any stale membership defensively: no
             // WDDM FIFO entry remains that could consume it.
             self.windowed_blt.terminal.clear();
-            return true;
+            return WddmAdmission::Failed;
         }
         // A non-paging DMA fence must mean "the GPU is finished", because that
         // is what dxgkrnl schedules on. Retiring it at DECODE reports completion
@@ -7798,12 +7813,13 @@ impl VirtioGpu {
             // the exact terminal prefix.
             && blt_token.is_none()
         {
-            return true;
+            return WddmAdmission::HostTerminal;
         }
         if self.wddm_pending.len() >= MAX_WDDM_PENDING {
-            // Degrade to the old immediate model for this fence — signaling the
-            // newest (monotonically largest) fence implicitly completes the
-            // queued older ones, so drop them too. Loud and counted.
+            // The compatibility FIFO cannot represent another owner. Drop its
+            // private rows, but K9 keeps this a terminal generation failure;
+            // signaling the newest fence would falsely complete every older
+            // scheduler entry.
             //
             // ⚠ THE "PRACTICALLY UNREACHABLE (VidSch queues far fewer than 256)"
             // LINE THAT USED TO BE HERE IS RETIRED (A5, 2026-08-06). It was an
@@ -7818,7 +7834,7 @@ impl VirtioGpu {
             // say whether the host stopped retiring or the bound was disabled.
             //
             // ⚠ The caller still releases every outstanding scan-out lease when
-            // this returns true after an overflow. The leases no longer gate a
+            // this returns `Failed` after an overflow. The leases no longer gate a
             // retirement, but they DO decide the flush executor's ownership
             // gate, and an epoch whose presentation was just dropped on the
             // floor must not read as one that is still coming.
@@ -7831,10 +7847,10 @@ impl VirtioGpu {
                 _ => None,
             };
             self.overflow_wddm_pending(current);
-            return true;
+            return WddmAdmission::Failed;
         }
         self.wddm_pending.push_back(WddmPending {
-            fence,
+            engine_ticket,
             watermark,
             wire_boundary,
             domain,
@@ -7845,7 +7861,7 @@ impl VirtioGpu {
             head_deadline_100ns: 0,
             rebased: false,
         });
-        false
+        WddmAdmission::Pending
     }
 
     /// The interrupt-time deadline a held D3D12 packet may not complete before,
@@ -8114,8 +8130,8 @@ impl VirtioGpu {
     ///
     /// Only the tagged namespaces. The wire arm is not rebasable (see the WIRE arm
     /// in [`Self::take_one_ready_wddm`]), the hold arm is not a dependency, and the
-    /// entry's `fence` and FIFO position are untouched — dxgkrnl requires monotonic
-    /// `SubmissionFenceId` completion and this must never become a bypass.
+    /// entry's direct K9 ticket and FIFO position are untouched — dxgkrnl requires
+    /// monotonic `SubmissionFenceId` completion and this must never become a bypass.
     ///
     /// # `arm` — why the caller has to say
     ///

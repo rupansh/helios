@@ -958,6 +958,9 @@ run_gate "K2a shared-backing executable mutation suite" \
 run_gate "K11 per-session stock-Venus transport is finite, lifetime-closed, and mutation-checked" \
     python3 "$REPO/tools/k11-session-transport-gate.py" "$REPO" --mutations
 
+run_gate "K9 one-engine completion frontier is ordered, host-terminal, reset-closed, and mutation-checked" \
+    python3 "$REPO/tools/k9-ordered-engine-gate.py" "$REPO" --mutations
+
 run_gate "D4 classic/DMA DIRQL enqueue is capability-restricted and fixed-storage" \
     python3 "$REPO/tools/d4-dirql-gate.py" "$REPO"
 

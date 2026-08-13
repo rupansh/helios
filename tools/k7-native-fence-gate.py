@@ -230,7 +230,9 @@ def check_local_sources(sources: dict[str, str]) -> list[str]:
         (LIFECYCLE, "retire_skipped_stop_transport"),
         (LIFECYCLE, "dxgkddi_stop_device"),
         (LIFECYCLE, "dxgkddi_remove_device"),
+        (INTERRUPT, "drain_ordered_engine_locked"),
         (INTERRUPT, "drain_used_and_complete"),
+        (INTERRUPT, "service_native_fence_rescans"),
         (SUBMIT, "notify_at_dirql"),
         (SUBMIT, "dxgkddi_reset_from_timeout"),
         (SUBMIT, "dxgkddi_restart_from_timeout"),
@@ -631,11 +633,37 @@ def check_local_sources(sources: dict[str, str]) -> list[str]:
         "drain_used_and_complete",
         drain,
         (
-            "let mut completed_wddm_submission = false;",
-            "if status == STATUS_SUCCESS {",
-            "completed_wddm_submission = true;",
-            "if completed_wddm_submission && super::native_fence::has_possible_progress_edge(adapter)",
+            "adapter.with_wddm_notify_lock",
+            "drain_ordered_engine_locked(adapter, guard)",
+            "service_native_fence_rescans(adapter, guard);",
+        ),
+        errors,
+    )
+    ordered_drain = body(INTERRUPT, "drain_ordered_engine_locked")
+    require_order(
+        INTERRUPT,
+        "drain_ordered_engine_locked",
+        ordered_drain,
+        (
+            "delivered = delivered.saturating_add(1)",
+            "guard.note_ordered_engine_native_rescan(delivered)",
+        ),
+        errors,
+    )
+    rescan = body(INTERRUPT, "service_native_fence_rescans")
+    require_order(
+        INTERRUPT,
+        "service_native_fence_rescans",
+        rescan,
+        (
+            "guard.ordered_engine_native_rescans()",
+            "if pending == 0",
+            "if !super::native_fence::has_possible_progress_edge(adapter)",
+            "adapter.dxgkrnl_opt()",
             "super::native_fence::signal_native_fence_signaled(adapter, dxgkrnl)",
+            "if status != STATUS_SUCCESS",
+            "request_wddm_completion_dpc(adapter)",
+            "guard.retire_ordered_engine_native_rescans(pending)",
         ),
         errors,
     )
@@ -748,7 +776,7 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("remove update bound", NATIVE, "    if !nf::update_count_is_bounded(count) {", "    if false {"),
         Mutation("mutate during update preflight", NATIVE, "        // SAFETY: dxgkrnl returns only driver handles this module assigned.\n        let Some(global)", "        unsafe { slot.cast::<u64>().write_volatile(0) };\n        // SAFETY: dxgkrnl returns only driver handles this module assigned.\n        let Some(global)"),
         Mutation("wrap object generation", LOGIC, "previous.checked_add(1).filter(|next| *next != 0)", "Some(previous.wrapping_add(1))"),
-        Mutation("interrupt every completion", INTERRUPT, "if completed_wddm_submission && super::native_fence::has_possible_progress_edge(adapter)", "if super::native_fence::has_possible_progress_edge(adapter)"),
+        Mutation("interrupt every completion", INTERRUPT, "guard.note_ordered_engine_native_rescan(delivered);", "guard.note_ordered_engine_native_rescan(1);"),
         Mutation("name unsafe interrupt subset", NATIVE, "    arm.SignaledNativeFenceCount = 0;", "    arm.SignaledNativeFenceCount = 1;"),
         Mutation("set hardware queue on interrupt", NATIVE, "    arm.hHWQueue = core::ptr::null_mut();", "    arm.hHWQueue = 1usize as HANDLE;"),
         Mutation("bypass shared DIRQL helper", NATIVE, "        super::submit_command::notify_at_dirql(dxgkrnl, &mut interrupt, false)", "        dxgkrnl.DxgkCbNotifyInterrupt.unwrap()(dxgkrnl.DeviceHandle, &mut interrupt); STATUS_SUCCESS"),

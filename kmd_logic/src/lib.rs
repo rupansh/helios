@@ -36,6 +36,7 @@ pub mod control_ownership;
 pub mod direct_scanout_admission;
 pub mod direct_scanout_lifetime;
 pub mod display_backing_lifetime;
+pub mod ordered_engine;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///

@@ -6,8 +6,8 @@
 //! ISR-status register. The ISR reads that register (deasserting the line),
 //! claims the interrupt, and queues the DPC via `DxgkCbQueueDpc`; the DPC
 //! drains the used ring under the device spinlock (`VirtioGpu::drain_used` —
-//! signaling sync/fence KEVENT waiters) and then completes every WDDM
-//! submission whose venus watermark has been reached
+//! signaling sync/fence KEVENT waiters), marks exact K9 frontier tickets
+//! host-terminal, and reports only the contiguous one-engine scheduler frontier
 //! (`DXGK_INTERRUPT_DMA_COMPLETED` at DIRQL via `signal_dma_completed`).
 //!
 //! IRQL: the ISR runs at the device's DIRQL — no allocations, no spinlocks, no
@@ -17,7 +17,9 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::adapter::AdapterContext;
+use helios_kmd_logic::ordered_engine::{CompletionDisposition, FailureDisposition};
+
+use crate::adapter::{AdapterContext, OrderedEngineTicket, WddmNotifyGuard};
 use crate::dxgk::*;
 
 // ── DIRQL/DISPATCH-safe instrumentation ──────────────────────────────────────
@@ -43,6 +45,136 @@ pub(crate) fn request_wddm_completion_dpc(adapter: &AdapterContext) {
     // SAFETY: the callback table belongs to this live adapter, and QueueDpc is
     // callable at PASSIVE/DISPATCH/DIRQL. It does not take wddm_notify_lock.
     unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
+}
+
+#[derive(Clone, Copy, Default)]
+struct OrderedDrain {
+    delivered: u32,
+}
+
+/// Report every contiguous host-terminal K9 entry while the one notification
+/// lock is held. An early completion remains in its exact slot; a failed
+/// callback leaves the same head ready and queues one ordinary DPC retry.
+fn drain_ordered_engine_locked(
+    adapter: &AdapterContext,
+    guard: &WddmNotifyGuard<'_>,
+) -> OrderedDrain {
+    let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
+        return OrderedDrain::default();
+    };
+    let mut delivered = 0u32;
+    loop {
+        let Some(ready) = guard.ordered_engine_ready() else {
+            break;
+        };
+        if !helios_kmd_logic::scanout_lease::fence_is_forward(
+            guard.completed_fence(),
+            ready.fence(),
+        ) {
+            // Admission already enforces the same half-range order. Reaching
+            // this arm means the frontier and published watermark diverged;
+            // poison the exact generation instead of treating an unreported
+            // stale value as a successful DMA completion.
+            super::submit_command::DMA_STALE_SKIP_COUNT.fetch_add(1, Ordering::Relaxed);
+            let _ = guard.fail_ordered_engine_submission(ready.ticket());
+            break;
+        }
+        // SAFETY: the WDDM notification lock is held; `ready.fence()` is the
+        // exact OS fence admitted at SubmitCommand arrival and is currently the
+        // ordered engine head.
+        let status = unsafe {
+            super::submit_command::signal_dma_completed(guard, dxgkrnl, ready.fence())
+        };
+        if status != STATUS_SUCCESS {
+            super::submit_command::DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
+            guard.note_ordered_engine_notify_retry();
+            if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
+                // SAFETY: callable at <= DIRQL for this live adapter. QueueDpc
+                // does not acquire `wddm_notify_lock`.
+                unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
+            }
+            break;
+        }
+        if !guard.retire_ordered_engine_ready(ready) {
+            break;
+        }
+        delivered = delivered.saturating_add(1);
+    }
+    // Publish the delivered edge while the same notification guard still
+    // excludes reset invalidation. Reset can therefore either clear this old
+    // generation's edge or run wholly before it; an old DPC cannot republish a
+    // native-fence rescan after the successor engine has opened.
+    guard.note_ordered_engine_native_rescan(delivered);
+    OrderedDrain { delivered }
+}
+
+/// Retry the K7 empty-array native-fence rescan only downstream of a
+/// successfully delivered DMA frontier edge. The count remains published until
+/// dxgkrnl accepts the callback; success subtracts only the observed prefix.
+fn service_native_fence_rescans(
+    adapter: &AdapterContext,
+    guard: &WddmNotifyGuard<'_>,
+) {
+    // Keep pending nonzero until dxgkrnl accepts the edge. The guard serializes
+    // DPCs and reset; exchange-before-callback would instead require restoring
+    // credit after failure and risks carrying an old edge into a successor.
+    let pending = guard.ordered_engine_native_rescans();
+    if pending == 0 {
+        return;
+    }
+    if !super::native_fence::has_possible_progress_edge(adapter) {
+        return;
+    }
+    let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
+        return;
+    };
+    let status = unsafe { super::native_fence::signal_native_fence_signaled(adapter, dxgkrnl) };
+    if status != STATUS_SUCCESS {
+        request_wddm_completion_dpc(adapter);
+    } else {
+        guard.retire_ordered_engine_native_rescans(pending);
+    }
+}
+
+/// Complete one exact direct host callback ticket. This is the K9 seam used by
+/// K11's already-terminal control submission and by the later nonzero-endpoint
+/// executor: neither source can notify VidSch except through this frontier.
+pub(crate) fn complete_ordered_engine_submission(
+    adapter: &AdapterContext,
+    ticket: OrderedEngineTicket,
+) -> CompletionDisposition {
+    let (disposition, delivered) = adapter.with_wddm_notify_lock(|guard| {
+        let disposition = guard.mark_ordered_engine_host_completed(ticket);
+        let delivered = match disposition {
+            CompletionDisposition::Marked { .. }
+            | CompletionDisposition::AlreadyCompleted => {
+                drain_ordered_engine_locked(adapter, guard).delivered
+            }
+            CompletionDisposition::StaleEpoch
+            | CompletionDisposition::StaleTicket
+            | CompletionDisposition::Poisoned => 0,
+        };
+        service_native_fence_rescans(adapter, guard);
+        (disposition, delivered)
+    });
+    if delivered != 0 {
+        // A direct completion can retire a later compatibility ticket that an
+        // earlier DPC already found host-terminal and requeued behind this
+        // ticket.  Prompt the ordinary DPC to discharge that FIFO's separate
+        // ownership token; no new virtio interrupt is guaranteed after the
+        // direct head closes.
+        request_wddm_completion_dpc(adapter);
+    }
+    disposition
+}
+
+/// Poison only the current ticket's engine generation. A callback carrying an
+/// old reset generation is inert and cannot poison its successor.
+pub(crate) fn fail_ordered_engine_submission(
+    adapter: &AdapterContext,
+    ticket: OrderedEngineTicket,
+) -> FailureDisposition {
+    adapter.with_wddm_notify_lock(|guard| guard.fail_ordered_engine_submission(ticket))
 }
 
 /// Drain used control-queue entries, apply any completed DISPATCH-level scan-out
@@ -94,7 +226,6 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
     // publication, cancellation and worker release inside that exact transport
     // lock prevents StopDevice from removing/resetting the generation between
     // handoff and effects.
-    let mut completed_wddm_submission = false;
     adapter.with_wddm_notify_lock(|guard| {
         // `drain_used` runs under only `virtio_lock`, so a rejected tagged
         // submit can only invalidate its stream there.  Discharge the stale
@@ -149,15 +280,10 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             adapter.request_scanout_refresh_for_locked(guard, marker.resource_id());
         }
 
-        // One at a time, so a failed notification can put its fence back. The
-        // old batch popped up to eight entries BEFORE attempting any delivery
-        // and then discarded every status with `let _ =`. A failed
-        // DxgkCbSynchronizeExecution therefore left the fence in no queue at
-        // all, with the completed watermark still below it and no counter
-        // recording the loss (DMA_SYNC_STATUS_LOW/DMA_SYNC_RET are
-        // last-value-wins, so a later successful notify erased the only trace).
-        // On an idle desktop VidSch then never sees that fence retire and
-        // escalates to TDR.
+        // One compatibility Venus entry at a time. Its direct K9 ticket was
+        // admitted in SubmitCommand order; readiness marks that ticket only.
+        // The frontier may retain it behind an earlier context and a failed
+        // notification leaves both owners intact for a later DPC.
         loop {
             // No lease watermark is read here any more. Until 22.22.217.0 a
             // submission also waited for the host to READ the buffer it
@@ -179,18 +305,19 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
                     break;
                 }
             };
-            let Some(dxgkrnl) = adapter.dxgkrnl_opt() else {
-                // No callback table: we cannot deliver and must not drop it.
-                let _ = guard.with_virtio(|o, v| v.requeue_wddm_front(o, ready));
-                break;
-            };
-            // SAFETY: the WDDM notification lock is held; the helper
-            // raises to DIRQL for the callback without re-locking.
-            let status = unsafe {
-                super::submit_command::signal_dma_completed(guard, dxgkrnl, ready.fence())
-            };
-            if status == STATUS_SUCCESS {
-                completed_wddm_submission = true;
+            let ticket = ready.engine_ticket();
+            let disposition = guard.mark_ordered_engine_host_completed(ticket);
+            let mark_owned = matches!(
+                disposition,
+                CompletionDisposition::Marked { .. }
+                    | CompletionDisposition::AlreadyCompleted
+            );
+            if mark_owned {
+                let _ = drain_ordered_engine_locked(adapter, guard);
+            }
+            if mark_owned && !guard.ordered_engine_ticket_is_live(ticket) {
+                // The notification succeeded in this drain (or an earlier
+                // drain retired it before this separate FIFO owner was popped).
                 let terminal_prefix = ready.terminal_prefix();
                 ready.delivered();
                 if let Some(prefix) = terminal_prefix {
@@ -204,28 +331,35 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
                 }
                 continue;
             }
-            super::submit_command::DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
-            let _ = guard.with_virtio(|o, v| v.requeue_wddm_front(o, ready));
-            // Retry on the next DPC rather than spinning here: the failure is a
-            // stop/rebalance window, so give dxgkrnl a chance to make progress.
-            if let Some(queue_dpc) = dxgkrnl.DxgkCbQueueDpc {
-                // SAFETY: DxgkCbQueueDpc is callable at <= DIRQL with a valid
-                // DeviceHandle; we hold the notify lock, which it does not take.
-                unsafe { queue_dpc(dxgkrnl.DeviceHandle) };
+
+            if matches!(disposition, CompletionDisposition::StaleTicket)
+                && guard.ordered_engine_ticket_was_retired(ticket)
+            {
+                // A direct completion source drained this scheduler entry and
+                // queued the DPC before the compatibility FIFO discharged its
+                // separate WindowedBlt ownership token.
+                let terminal_prefix = ready.terminal_prefix();
+                ready.delivered();
+                if let Some(prefix) = terminal_prefix {
+                    let _ = guard.with_virtio(|_o, v| {
+                        v.consume_windowed_blt_terminal_prefix(prefix)
+                    });
+                }
+                continue;
             }
+
+            // Early, failed, poisoned, or stale-reset entry: no DMA completion
+            // was delivered for this token. Put the exact owner back and stop;
+            // bypassing it would violate both FIFO and engine order.
+            let _ = guard.with_virtio(|o, v| v.requeue_wddm_front(o, ready));
             break;
         }
+
+        // Also retries an already-terminal direct ticket whose prior DIRQL
+        // notification failed; no fresh used-ring edge is required.
+        let _ = drain_ordered_engine_locked(adapter, guard);
+        service_native_fence_rescans(adapter, guard);
     });
-    // A native rescan requires both a completed WDDM submission (the only
-    // traditional-queue edge that can carry a GPU fence signal) and a monitored
-    // waiter observed in this adapter epoch. Used-ring traffic alone is not one.
-    if completed_wddm_submission && super::native_fence::has_possible_progress_edge(adapter) {
-        if let Some(dxgkrnl) = adapter.dxgkrnl_opt() {
-            let _ = unsafe {
-                super::native_fence::signal_native_fence_signaled(adapter, dxgkrnl)
-            };
-        }
-    }
 }
 
 /// `DxgkDdiInterruptRoutine` — runs at the device's DIRQL; returns TRUE if the

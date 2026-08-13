@@ -14,9 +14,14 @@
 //! accessor here because `crate::sync::SpinLock`'s guard is their whole
 //! discipline.
 
+use alloc::boxed::Box;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use helios_kmd_logic::ordered_engine::{
+    AdmissionRefusal, CompletionDisposition, FailureDisposition, OrderedEngine,
+    RetirementRefusal, MAX_ORDERED_ENGINE_SUBMISSIONS,
+};
 use wdk_sys::ntddk::{
     KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock, KeSetEvent, KeWaitForSingleObject,
 };
@@ -37,6 +42,71 @@ use super::AdapterContext;
 /// call was made with was not the one it woke up with. Mirrored from
 /// `pacing_snapshot`, a PASSIVE site, because this one runs at DISPATCH.
 pub(crate) static WITH_VIRTIO_TORN: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) use helios_kmd_logic::ordered_engine::{
+    ReadySubmission as OrderedEngineReady, SubmissionTicket as OrderedEngineTicket,
+};
+
+/// The concrete K9 frontier stored once per adapter.
+pub(super) type OrderedEngineFrontier =
+    OrderedEngine<{ MAX_ORDERED_ENGINE_SUBMISSIONS }>;
+
+/// Allocate K9's multi-KiB frontier directly on the heap.
+///
+/// `AdapterContext::new` itself is part of the measured boot-stack chain. A
+/// by-value `[slot; 256]` temporary here would repeat the historical
+/// present-stream double-fault, so initialize the boxed storage element by
+/// element and never materialize the array in this frame.
+#[inline(never)]
+pub(super) fn allocate_ordered_engine_frontier() -> Box<OrderedEngineFrontier> {
+    let mut frontier = Box::<OrderedEngineFrontier>::new_uninit();
+    // SAFETY: `frontier` is aligned writable storage for exactly one model;
+    // initialize_at writes every field before assume_init exposes it.
+    unsafe {
+        OrderedEngineFrontier::initialize_at(frontier.as_mut_ptr());
+        frontier.assume_init()
+    }
+}
+
+// K9 instrumentation. Every mutation happens at DISPATCH under the adapter's
+// WDDM notification lock, so these are atomics and are mirrored only later from
+// the existing PASSIVE engine diagnostic dump.
+pub(crate) static ORDERED_ENGINE_ADMITTED: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ORDERED_ENGINE_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ORDERED_ENGINE_HOST_COMPLETED: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ORDERED_ENGINE_EARLY_RETAINED: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ORDERED_ENGINE_RETIRED: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ORDERED_ENGINE_NOTIFY_RETRY: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ORDERED_ENGINE_STALE_CALLBACK: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ORDERED_ENGINE_ORDER_REJECT: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ORDERED_ENGINE_CAPACITY_REJECT: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ORDERED_ENGINE_CLOSED_REJECT: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ORDERED_ENGINE_POISONED: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ORDERED_ENGINE_EPOCH_INVALIDATED: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ORDERED_ENGINE_ABORTED: AtomicU32 = AtomicU32::new(0);
+pub(crate) static ORDERED_ENGINE_REOPEN_REJECT: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn dump_ordered_engine_atomics() {
+    const COUNTERS: [(&[u8], &AtomicU32); 14] = [
+        (b"K9Adm", &ORDERED_ENGINE_ADMITTED),
+        (b"K9Hi", &ORDERED_ENGINE_HIGH_WATER),
+        (b"K9Host", &ORDERED_ENGINE_HOST_COMPLETED),
+        (b"K9Early", &ORDERED_ENGINE_EARLY_RETAINED),
+        (b"K9Ret", &ORDERED_ENGINE_RETIRED),
+        (b"K9Retry", &ORDERED_ENGINE_NOTIFY_RETRY),
+        (b"K9Stale", &ORDERED_ENGINE_STALE_CALLBACK),
+        (b"K9Order", &ORDERED_ENGINE_ORDER_REJECT),
+        (b"K9Full", &ORDERED_ENGINE_CAPACITY_REJECT),
+        (b"K9Closed", &ORDERED_ENGINE_CLOSED_REJECT),
+        (b"K9Poison", &ORDERED_ENGINE_POISONED),
+        (b"K9Epoch", &ORDERED_ENGINE_EPOCH_INVALIDATED),
+        (b"K9Abort", &ORDERED_ENGINE_ABORTED),
+        (b"K9ReopR", &ORDERED_ENGINE_REOPEN_REJECT),
+    ];
+    for (name, counter) in COUNTERS {
+        crate::diag::record_named_bytes(name, counter.load(Ordering::Relaxed));
+    }
+}
 
 /// Proof that this adapter's WDDM notification spinlock is currently held.
 ///
@@ -86,6 +156,183 @@ impl WddmNotifyGuard<'_> {
         self.adapter
             .last_completed_fence
             .store(fence, Ordering::Release);
+    }
+
+    /// Exclusive access to the one-engine frontier. The proof is the guard:
+    /// there is no accessor that does not already hold this adapter's
+    /// `wddm_notify_lock`.
+    fn ordered_engine_mut(&self) -> &mut OrderedEngineFrontier {
+        // SAFETY: the pointee is allocated once with the adapter and every
+        // mutable access is reachable only through this non-forgeable guard.
+        unsafe { &mut *self.adapter.ordered_engine.get() }
+    }
+
+    pub(crate) fn admit_ordered_engine_submission(
+        &self,
+        fence: u32,
+    ) -> Option<OrderedEngineTicket> {
+        let engine = self.ordered_engine_mut();
+        match engine.admit(fence) {
+            Ok(ticket) => {
+                ORDERED_ENGINE_ADMITTED.fetch_add(1, Ordering::Relaxed);
+                ORDERED_ENGINE_HIGH_WATER.fetch_max(engine.len() as u32, Ordering::Relaxed);
+                Some(ticket)
+            }
+            Err(AdmissionRefusal::Capacity) => {
+                ORDERED_ENGINE_CAPACITY_REJECT.fetch_add(1, Ordering::Relaxed);
+                ORDERED_ENGINE_POISONED.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            Err(AdmissionRefusal::NotForward { .. }) => {
+                ORDERED_ENGINE_ORDER_REJECT.fetch_add(1, Ordering::Relaxed);
+                ORDERED_ENGINE_POISONED.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            Err(AdmissionRefusal::Closed) => {
+                ORDERED_ENGINE_CLOSED_REJECT.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            Err(AdmissionRefusal::Poisoned) => {
+                ORDERED_ENGINE_POISONED.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            Err(
+                AdmissionRefusal::SerialExhausted
+                | AdmissionRefusal::SlotIndexExhausted
+                | AdmissionRefusal::CorruptOccupiedSlot,
+            ) => {
+                ORDERED_ENGINE_POISONED.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn mark_ordered_engine_host_completed(
+        &self,
+        ticket: OrderedEngineTicket,
+    ) -> CompletionDisposition {
+        let disposition = self.ordered_engine_mut().mark_host_completed(ticket);
+        match disposition {
+            CompletionDisposition::Marked { retained_early } => {
+                ORDERED_ENGINE_HOST_COMPLETED.fetch_add(1, Ordering::Relaxed);
+                if retained_early {
+                    ORDERED_ENGINE_EARLY_RETAINED.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            CompletionDisposition::StaleEpoch | CompletionDisposition::StaleTicket => {
+                ORDERED_ENGINE_STALE_CALLBACK.fetch_add(1, Ordering::Relaxed);
+            }
+            CompletionDisposition::Poisoned => {
+                ORDERED_ENGINE_POISONED.fetch_add(1, Ordering::Relaxed);
+            }
+            CompletionDisposition::AlreadyCompleted => {}
+        }
+        disposition
+    }
+
+    pub(crate) fn fail_ordered_engine_submission(
+        &self,
+        ticket: OrderedEngineTicket,
+    ) -> FailureDisposition {
+        let disposition = self.ordered_engine_mut().fail_submission(ticket);
+        match disposition {
+            FailureDisposition::Poisoned => {
+                ORDERED_ENGINE_POISONED.fetch_add(1, Ordering::Relaxed);
+            }
+            FailureDisposition::StaleEpoch | FailureDisposition::StaleTicket => {
+                ORDERED_ENGINE_STALE_CALLBACK.fetch_add(1, Ordering::Relaxed);
+            }
+            FailureDisposition::AlreadyPoisoned => {}
+        }
+        disposition
+    }
+
+    pub(crate) fn ordered_engine_ready(&self) -> Option<OrderedEngineReady> {
+        self.ordered_engine_mut().peek_ready()
+    }
+
+    pub(crate) fn retire_ordered_engine_ready(&self, ready: OrderedEngineReady) -> bool {
+        match self.ordered_engine_mut().retire_ready(ready) {
+            Ok(_) => {
+                ORDERED_ENGINE_RETIRED.fetch_add(1, Ordering::Relaxed);
+                true
+            }
+            Err(
+                RetirementRefusal::NotReady
+                | RetirementRefusal::WrongHead
+                | RetirementRefusal::Poisoned,
+            ) => {
+                ORDERED_ENGINE_POISONED.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+
+    pub(crate) fn ordered_engine_ticket_is_live(&self, ticket: OrderedEngineTicket) -> bool {
+        self.ordered_engine_mut().ticket_is_live(ticket)
+    }
+
+    pub(crate) fn ordered_engine_ticket_was_retired(&self, ticket: OrderedEngineTicket) -> bool {
+        self.ordered_engine_mut().ticket_was_retired(ticket)
+    }
+
+    /// End this scheduler generation. A stale host callback retains only its
+    /// own old ticket and cannot publish into the successor.
+    pub(crate) fn invalidate_ordered_engine(&self) {
+        let invalidation = self.ordered_engine_mut().invalidate();
+        if invalidation.epoch_advanced {
+            ORDERED_ENGINE_EPOCH_INVALIDATED.fetch_add(1, Ordering::Relaxed);
+        }
+        if invalidation.dropped != 0 {
+            ORDERED_ENGINE_ABORTED.fetch_add(invalidation.dropped as u32, Ordering::Relaxed);
+        }
+        self.adapter
+            .ordered_engine_native_rescans
+            .store(0, Ordering::Release);
+    }
+
+    pub(crate) fn reopen_ordered_engine(&self) -> bool {
+        let completed = self.completed_fence();
+        let reopened = self.ordered_engine_mut().reopen(completed);
+        if !reopened {
+            ORDERED_ENGINE_REOPEN_REJECT.fetch_add(1, Ordering::Relaxed);
+        }
+        reopened
+    }
+
+    pub(crate) fn note_ordered_engine_notify_retry(&self) {
+        ORDERED_ENGINE_NOTIFY_RETRY.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record successfully delivered DMA frontier edges while reset is excluded
+    /// by this exact adapter's notification guard.
+    pub(crate) fn note_ordered_engine_native_rescan(&self, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let _ = self
+            .adapter
+            .ordered_engine_native_rescans
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                Some(pending.saturating_add(count))
+            });
+    }
+
+    pub(crate) fn ordered_engine_native_rescans(&self) -> u32 {
+        self.adapter
+            .ordered_engine_native_rescans
+            .load(Ordering::Acquire)
+    }
+
+    /// Discharge only the prefix one accepted K7 rescan observed. The guard
+    /// prevents reset from clearing an old epoch between callback and update.
+    pub(crate) fn retire_ordered_engine_native_rescans(&self, observed: u32) {
+        let _ = self
+            .adapter
+            .ordered_engine_native_rescans
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(observed))
+            });
     }
 
     /// Run `f` against this adapter's transport with the notify lock already

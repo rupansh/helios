@@ -31,7 +31,10 @@ mod scanout;
 mod segments;
 
 pub(crate) use backing::{SystemBackingSnapshot, SystemBackingTable};
-pub(crate) use locks::{NotifyOrdered, ScanoutGuard, WddmNotifyGuard, WITH_VIRTIO_TORN};
+pub(crate) use locks::{
+    dump_ordered_engine_atomics, NotifyOrdered, OrderedEngineTicket, ScanoutGuard,
+    WddmNotifyGuard, WITH_VIRTIO_TORN,
+};
 pub(crate) use read_ledger::{
     dump_counters as read_ledger_dump_counters, reset_counters as read_ledger_reset_counters,
     ReadLedger, ScanoutEventReg, AQ_REGISTER_REFUSED, RD_MAP_REFUSED,
@@ -520,14 +523,20 @@ pub struct AdapterContext {
     /// already own an exact host-terminal fence before retiring the scheduler
     /// or transport epoch.
     pub(crate) k11_completion: crate::ddi::session_transport::K11CompletionRundown,
-    /// Last fence completed by the bring-up scheduler path.
+    /// Last one-engine scheduler frontier reported to dxgkrnl.
     last_completed_fence: AtomicU32,
-    /// Serializes DMA_COMPLETED notification and its monotonic fence update.
-    /// A DPC can take an older ready fence out of the virtio FIFO while a new
-    /// SubmitCommand concurrently takes the immediate-completion path; without
-    /// this lock the newer fence can reach VidSch first and the delayed older
-    /// notify bugchecks 0x119/1 (invalid fence id).
+    /// Serializes K9 frontier admission/retirement, DMA_COMPLETED notification,
+    /// and the monotonic completed watermark.
     wddm_notify_lock: UnsafeCell<KSPIN_LOCK>,
+    /// K9's fixed one-node/one-engine scheduler-order frontier. The 256 slots
+    /// live in a separate heap allocation so AdapterContext construction does
+    /// not materialize a multi-KiB array on the kernel boot stack. Mutation is
+    /// reachable only through `WddmNotifyGuard`.
+    ordered_engine: UnsafeCell<Box<locks::OrderedEngineFrontier>>,
+    /// Successfully delivered DMA frontier edges still owed one K7 empty-array
+    /// native-fence rescan. A saturating count preserves every delivered edge
+    /// across a failed callback; the notification guard owns every mutation.
+    ordered_engine_native_rescans: AtomicU32,
     /// Mapped kernel VA of the virtio ISR-status register (read-to-clear), or 0
     /// until StartDevice wires it. `DxgkDdiInterruptRoutine` reads this at DIRQL to
     /// acknowledge the level-triggered INTx line (the device is `MSISupported=0`);
@@ -1162,6 +1171,8 @@ impl AdapterContext {
                 crate::ddi::session_transport::K11CompletionRundown::new(),
             last_completed_fence: AtomicU32::new(0),
             wddm_notify_lock: UnsafeCell::new(0),
+            ordered_engine: UnsafeCell::new(locks::allocate_ordered_engine_frontier()),
+            ordered_engine_native_rescans: AtomicU32::new(0),
             isr_status: AtomicUsize::new(0),
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
@@ -1294,10 +1305,19 @@ impl AdapterContext {
 
     pub(crate) fn close_k11_completions_and_wait(&self, passive: crate::irql::PassiveLevel) {
         self.k11_completion.close_completion_and_wait(passive);
+        // Every current K9 callback source is inside this rundown. Once joined,
+        // close and generation-invalidate the scheduler frontier under the one
+        // notification lock before reset/stop can abandon transport state.
+        self.with_wddm_notify_lock(|guard| guard.invalidate_ordered_engine());
     }
 
     pub(crate) fn reopen_k11_completions(&self) {
-        self.k11_completion.reopen();
+        // Publish the empty successor engine generation before admitting a
+        // callback that could try to complete into it.
+        let engine_open = self.with_wddm_notify_lock(|guard| guard.reopen_ordered_engine());
+        if engine_open {
+            self.k11_completion.reopen();
+        }
     }
 
     /// Drop every piece of display publication state that is only meaningful

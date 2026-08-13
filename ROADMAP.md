@@ -840,6 +840,38 @@ This admits K11 only. DWM still loads WARP and DisplayConfig still reports zero
 active paths after the reset. Mesa A3/A4 is the next handoff; no visible or
 cold-DWM admission, HPS2 retirement, or production-correctness claim follows.
 
+#### ⭐ K9 source/build checkpoint — ordered one-engine host completion (2026-08-14)
+
+A4 pre-edit reconciliation found that normal-mode submissions may complete on
+distinct nonzero host contexts, while WDDM exposes one render node/engine. The
+old compatibility FIFO and K11's direct callback could therefore report a
+later context before an earlier one. K9 now owns one fixed 256-entry
+one-node/one-engine frontier per adapter:
+
+* every SubmitCommand arrival admits its exact OS fence and receives a private
+  epoch/serial/slot ticket before host work can become terminal;
+* direct K11 and compatibility Venus completions mark only that exact ticket;
+  the frontier retains early cross-context completions and reports only its
+  contiguous ready head through `DXGK_INTERRUPT_DMA_COMPLETED`;
+* notification failure keeps the same head and requests an ordinary DPC retry;
+  transport failure, bounded-FIFO exhaustion, duplicate/backward admission, or
+  an exact host refusal poison the generation instead of forging completion;
+* reset/Stop/Remove join the current callback rundown before invalidating the
+  frontier generation. Successful preemption reopens only after dxgkrnl accepts
+  `DXGK_INTERRUPT_DMA_PREEMPTED`, and stale callback tickets cannot address a
+  successor generation;
+* K7's empty native-fence rescan remains downstream of a successfully delivered
+  DMA edge and retains its pending edge across callback failure.
+
+The pure model adds 11 focused tests. The inherited K7 and K11 mutation gates
+remain green, and K9's own in-process/in-memory semantic gate rejects **42/42**
+mutations.
+The Windows KMD check remains green at the exact 13-warning baseline. This is a
+source/build checkpoint only: K9 has not been deployed or exercised on the
+target. Mesa A3/A4 remain unimplemented, the installed KMD remains
+22.22.296.0, and no display admission, visible desktop, HPS2 retirement, or
+production-correctness result follows.
+
 #### ⭐ THE CRITICAL PATH IS NOW THE DISPLAY LANE — decided 2026-08-11 by the owner
 
 *"no probing or hacks, we go the proper way, i dont care if I dont see the desktop

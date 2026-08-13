@@ -948,20 +948,25 @@ def check_allowlist_and_completion(sources: dict[str, str], errors: list[str]) -
         "dxgkddi_submit_command",
         submit_ddi,
         (
-            "let disposition = adapter.with_k11_completion",
+            "let disposition = adapter.with_k11_completion(||",
+            "guard.admit_ordered_engine_submission(fence)",
             "native_render::submit(native, session, submit)",
             "NativeSubmitDisposition::HostCompleted(",
-            "adapter.with_wddm_notify_lock",
-            "complete_k11_host_submission(guard, adapter, exact_fence)",
-            "Some(crate::ddi::native_render::NativeSubmitDisposition::HostCompleted(_)) => { SubmitAck::Accepted",
-            "Some(crate::ddi::native_render::NativeSubmitDisposition::Revoked) | None",
-            "Some(crate::ddi::native_render::NativeSubmitDisposition::Refused)",
-            "note_and_maybe_signal(adapter, fence, is_paging, None)",
+            "if exact_fence == fence",
+            "complete_k11_host_submission(adapter, ticket)",
+            "fail_ordered_engine_submission(",
+            "NativeSubmitDisposition::Revoked",
+            "Some((disposition, ticket))",
+            "NativeSubmitDisposition::HostCompleted(_)",
+            "NativeSubmitDisposition::Revoked, _",
+            "NativeSubmitDisposition::Refused, ticket",
+            "note_and_maybe_signal(adapter, fence, is_paging, None, Some(ticket))",
         ),
         errors,
     )
     revoked = re.search(
-        r"Some\([^\n]*NativeSubmitDisposition::Revoked\)\s*\|\s*None\s*=>\s*\{(?P<body>.*?)\n\s*\}",
+        r"Some\(\(\s*[^\n]*NativeSubmitDisposition::Revoked\s*,\s*_\s*\)\)"
+        r"\s*\|\s*None\s*=>\s*\{(?P<body>.*?)\n\s*\}",
         live_rust(submit_ddi),
         re.S,
     )
@@ -978,32 +983,32 @@ def check_allowlist_and_completion(sources: dict[str, str], errors: list[str]) -
             f"{SUBMIT}:dxgkddi_submit_command: revoked K11 work gained a completion fallback"
         )
     complete = body(sources, SUBMIT, "complete_k11_host_submission", errors)
-    require_order(
+    require_fragments(
         SUBMIT,
         "complete_k11_host_submission",
         complete,
         (
-            "adapter.dxgkrnl()",
-            "signal_dma_completed(guard, dxgkrnl, exact_fence)",
+            "super::interrupt::complete_ordered_engine_submission(adapter, ticket)",
         ),
         errors,
     )
     complete_live = live_rust(complete)
-    complete_source_live = live_rust(sources.get(SUBMIT, ""))
-    if "guard: &WddmNotifyGuard<'_>" not in complete_source_live:
+    if compact(
+        "fn complete_k11_host_submission(adapter: &AdapterContext, ticket: crate::adapter::OrderedEngineTicket,"
+    ) not in compact(live_rust(sources.get(SUBMIT, ""))):
         errors.append(
-            f"{SUBMIT}:complete_k11_host_submission: exact completion lacks the caller-held notification guard"
+            f"{SUBMIT}:complete_k11_host_submission: exact K9 ticket parameter missing"
         )
     if "with_wddm_notify_lock" in complete_live:
         errors.append(
             f"{SUBMIT}:complete_k11_host_submission: exact completion reacquired the notification lock"
         )
     if re.search(
-        r"\b(?:note_wddm_submission|note_and_maybe_signal|wddm_pending|sleep\w*|poll\w*|timer\w*|rebase\w*)\b",
+        r"\b(?:signal_dma_completed|note_wddm_submission|note_and_maybe_signal|wddm_pending|sleep\w*|poll\w*|timer\w*|rebase\w*)\b",
         live_rust(complete),
         re.I,
     ):
-        errors.append(f"{SUBMIT}:complete_k11_host_submission: K11 completion gained a queue, poll, timer, or synthetic fallback")
+        errors.append(f"{SUBMIT}:complete_k11_host_submission: K11 completion bypassed K9 or gained a queue, poll, timer, or synthetic fallback")
 
     completion_admit = body(sources, TRANSPORT, "with_admitted", errors)
     require_order(
@@ -1496,12 +1501,12 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("drop K11 context timeline identity", CTRL, "    cmd.hdr.flags = VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX;\n", "    cmd.hdr.flags = VIRTIO_GPU_FLAG_FENCE;\n"),
         Mutation("move K11 pure control off ring zero", CTRL, "    cmd.hdr.ring_idx = 0;\n", "    cmd.hdr.ring_idx = 1;\n"),
         Mutation("forge K11 control fence from WDDM", CTRL, "    cmd.hdr.fence_id = control_fence_id;\n", "    cmd.hdr.fence_id = SubmissionFenceId as u64;\n"),
-        Mutation("route K11 through adapter boundary queue", SUBMIT, "                        complete_k11_host_submission(guard, adapter, exact_fence)\n", "                        let _ = note_and_maybe_signal(adapter, exact_fence, false, None);\n"),
-        Mutation("forge a later K11 SubmissionFenceId", SUBMIT, "                        complete_k11_host_submission(guard, adapter, exact_fence)\n", "                        complete_k11_host_submission(guard, adapter, exact_fence.wrapping_add(1))\n"),
-        Mutation("complete revoked K11 work through legacy queue", SUBMIT, "                Some(crate::ddi::native_render::NativeSubmitDisposition::Revoked) | None => {\n                    // The host-completed marker belonged to a session whose\n                    // exact transport/fence authority was revoked before this\n                    // callback, or reset already closed the adapter completion\n                    // epoch. Do not forge completion through the legacy queue.\n                    SubmitAck::Accepted\n                }\n", "                Some(crate::ddi::native_render::NativeSubmitDisposition::Revoked) | None => {\n                    note_and_maybe_signal(adapter, fence, is_paging, None)\n                }\n"),
+        Mutation("route K11 through adapter boundary queue", SUBMIT, "                        complete_k11_host_submission(adapter, ticket);\n", "                        let _ = note_and_maybe_signal(adapter, exact_fence, false, None, Some(ticket));\n"),
+        Mutation("forge a later K11 SubmissionFenceId", SUBMIT, "                let ticket = adapter.with_wddm_notify_lock(|guard| {\n                    guard.admit_ordered_engine_submission(fence)\n                })?;\n", "                let ticket = adapter.with_wddm_notify_lock(|guard| {\n                    guard.admit_ordered_engine_submission(fence.wrapping_add(1))\n                })?;\n"),
+        Mutation("complete revoked K11 work through legacy queue", SUBMIT, "                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, _))\n                | None => {\n                    // The host-completed marker belonged to a session whose\n                    // exact transport/fence authority was revoked before this\n                    // callback, or reset already closed the adapter completion\n                    // epoch. Do not forge completion through the legacy queue.\n                    SubmitAck::Accepted\n                }\n", "                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, ticket))\n                | None => {\n                    note_and_maybe_signal(adapter, fence, is_paging, None, Some(ticket))\n                }\n"),
         Mutation("skip current session generation at submit", NATIVE, "    let disposition = crate::ddi::translation_session::with_current_host_submission(\n", "    let disposition = Some(\n"),
-        Mutation("drop adapter completion rundown", SUBMIT, "            let disposition = adapter.with_k11_completion(|| {\n", "            let disposition = Some({\n"),
-        Mutation("drop exact K11 completion after admission", SUBMIT, "                        complete_k11_host_submission(guard, adapter, exact_fence)\n", "                        let _ = exact_fence;\n"),
+        Mutation("drop adapter completion rundown", SUBMIT, "                .with_k11_completion(|| {\n", "                .with_k11_completion_unchecked(|| {\n"),
+        Mutation("drop exact K11 completion after admission", SUBMIT, "                        complete_k11_host_submission(adapter, ticket);\n", "                        let _ = (exact_fence, ticket);\n"),
         Mutation("make completion rundown unbounded", TRANSPORT, "    state: SpinLock<CompletionRundownState>,\n", "    state: SpinLock<Vec<CompletionRundownState>>,\n"),
         Mutation("skip TDR completion drain", SUBMIT, "    adapter.close_k11_completions_and_wait(passive);\n", "    let _ = passive;\n"),
         Mutation("skip StopDevice completion drain", LIFECYCLE, "        adapter.close_k11_completions_and_wait(passive_stop);\n", "        let _ = passive_stop;\n"),
