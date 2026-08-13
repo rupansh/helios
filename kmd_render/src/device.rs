@@ -16,7 +16,8 @@ use helios_kmd_logic::snapshot_bind::SnapshotDescriptor;
 use crate::adapter::AdapterContext;
 use crate::ddi::native_render::{NativeClass, NativeContext};
 use crate::ddi::translation_session::{
-    self as hts1, ProcessSessionList, SessionObject as TranslationSessionObject,
+    self as hts1, ProcessSessionList, SessionEndpointObject,
+    SessionObject as TranslationSessionObject,
 };
 use crate::dxgk::*;
 
@@ -152,11 +153,12 @@ enum HeliosContextRole {
     Attached {
         session: core::ptr::NonNull<TranslationSessionObject>,
         context_generation: u64,
-        /// CROSS-LANE: the reader is K11 — `DxgkDdiSubmitCommand` assigns this
-        /// endpoint's next arrival-order host-dispatch serial (§10.4:1255-1258).
-        /// K6 validates HOS1 but dispatches nothing, so it does not read it.
+        /// Direct fixed endpoint ownership established at HQA1 admission. K11
+        /// retains this strong edge but executes only pure INIT; a later
+        /// allocation/GPU unit may read its ring and dispatch serial without
+        /// rediscovering the session at submit time (§10.4:1255-1258).
         #[allow(dead_code)]
-        endpoint_id: u32,
+        endpoint: core::ptr::NonNull<SessionEndpointObject>,
         /// K6: the HOS1 gate `DxgkDdiSubmitCommandVirtual` validates against.
         /// Present on both arms because the arm itself is one of the things
         /// HOS1 checks — a D3D11-physical context must refuse a HOS1, and it can
@@ -542,6 +544,20 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         if purged_streams != 0 {
             crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
         }
+        // Revoke/drain/destroy the session namespace before the generic owner
+        // sweep can release the reply pool or context custody underneath it.
+        let stale = { unsafe { (h_device as *const DeviceContext).as_ref() } }
+            .and_then(|d| d.session.lock().take());
+        if let Some(session) = stale {
+            let list = unsafe { (h_device as *const DeviceContext).as_ref() }
+                .and_then(|d| d.process_sessions());
+            unsafe { crate::ddi::translation_session::release_device_session(session, list) };
+        }
+        // Unlike the older counter groups, K11 context teardown may be the
+        // stale-device fallback immediately above. Publish its final census
+        // only after that namespace is terminal so abrupt exit cannot leave
+        // K11CtxNew visible without the matching K11CtxDel.
+        crate::ddi::session_transport::diag_dump();
         let before = adapter.with_virtio(|v| v.blob_count() as u32).unwrap_or(0);
         let blobs = crate::virtio::ctrl::release_blobs_for_owner(passive, adapter, device_owner);
         let contexts =
@@ -552,20 +568,6 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         crate::diag::record(0x0E02_0000 | before.min(0xFFFF));
         // 0x0E03_RRCC = reclaimed blobs (RR) + contexts (CC).
         crate::diag::record(0x0E03_0000 | ((blobs.min(0xFF) << 8) | contexts.min(0xFF)));
-        // A raw KMT device whose control context was already destroyed has
-        // `session == None`; a nonempty one means dxgkrnl tore the device down
-        // without the context, so release it here rather than leak the session.
-        // `take()` under the cell's spinlock is what makes this single-release:
-        // whichever of this and `dxgkddi_destroy_context` runs first gets the
-        // pointer and the other sees `None`, so the "two owners" are one.
-        let stale = { unsafe { (h_device as *const DeviceContext).as_ref() } }
-            .and_then(|d| d.session.lock().take());
-        if let Some(session) = stale {
-            let list = unsafe { (h_device as *const DeviceContext).as_ref() }
-                .and_then(|d| d.process_sessions());
-            // SAFETY: the device's own reference, released exactly once.
-            unsafe { crate::ddi::translation_session::release_device_session(session, list) };
-        }
         // SAFETY: produced by Box::into_raw in create_device; destroyed exactly once.
         drop(unsafe { Box::from_raw(h_device as *mut DeviceContext) });
     }
@@ -606,6 +608,7 @@ pub unsafe extern "C" fn dxgkddi_create_context(
             context_flags,
             device.creator_process,
             device.adapter as *const AdapterContext,
+            h_device as usize,
             &device.session,
             process_list,
         )
@@ -654,28 +657,33 @@ pub unsafe extern "C" fn dxgkddi_create_context(
             session,
             session_generation,
             context_generation,
-            endpoint_id,
+            endpoint,
             kind,
-        } => (
-            HeliosContextRole::Attached {
-                session,
-                context_generation,
-                endpoint_id,
-                outer: crate::sync::SpinLock::new(
-                    helios_kmd_logic::native_render::OuterSubmitContext::new(
-                        helios_protocol::HELIOS_PACKAGE_GENERATION,
-                        session_generation,
-                        context_generation,
-                        endpoint_id,
-                        kind.wire(),
+        } => {
+            // SAFETY: `classify_context` returned the endpoint together with a
+            // strong session reference, so the fixed endpoint array is live.
+            let endpoint_id = unsafe { endpoint.as_ref().endpoint_id() };
+            (
+                HeliosContextRole::Attached {
+                    session,
+                    context_generation,
+                    endpoint,
+                    outer: crate::sync::SpinLock::new(
+                        helios_kmd_logic::native_render::OuterSubmitContext::new(
+                            helios_protocol::HELIOS_PACKAGE_GENERATION,
+                            session_generation,
+                            context_generation,
+                            endpoint_id,
+                            kind.wire(),
+                        ),
                     ),
-                ),
-            },
-            // An HQA1 outer context is an ordinary D3D runtime context in every
-            // respect but one: the D3D12 virtual arm's `pDmaBufferPrivateData`
-            // must hold a 64-byte HOS1 prefix (§10.4:1332-1335).
-            ContextInfoProfile::Hqa1Outer,
-        ),
+                },
+                // An HQA1 outer context is an ordinary D3D runtime context in every
+                // respect but one: the D3D12 virtual arm's `pDmaBufferPrivateData`
+                // must hold a 64-byte HOS1 prefix (§10.4:1332-1335).
+                ContextInfoProfile::Hqa1Outer,
+            )
+        }
     };
 
     let ctx = Box::new(ContextContext {

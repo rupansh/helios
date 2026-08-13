@@ -515,6 +515,11 @@ pub struct AdapterContext {
     pub(crate) direct_scanout: crate::ddi::direct_scanout::DirectScanoutRuntime,
     /// Per-adapter native-fence identity, admission, epoch, and population.
     pub(crate) native_fence: Arc<crate::ddi::native_fence::NativeFenceAdapterState>,
+    /// K11's fixed completion rundown. It carries no session identity, queue,
+    /// or timeline; reset/stop use it only to join SubmitCommand callbacks that
+    /// already own an exact host-terminal fence before retiring the scheduler
+    /// or transport epoch.
+    pub(crate) k11_completion: crate::ddi::session_transport::K11CompletionRundown,
     /// Last fence completed by the bring-up scheduler path.
     last_completed_fence: AtomicU32,
     /// Serializes DMA_COMPLETED notification and its monotonic fence update.
@@ -1153,6 +1158,8 @@ impl AdapterContext {
             committed_mode: crate::ddi::committed_mode::CommittedModeStorage::new(),
             direct_scanout: crate::ddi::direct_scanout::DirectScanoutRuntime::new(),
             native_fence: Arc::new(crate::ddi::native_fence::NativeFenceAdapterState::new()),
+            k11_completion:
+                crate::ddi::session_transport::K11CompletionRundown::new(),
             last_completed_fence: AtomicU32::new(0),
             wddm_notify_lock: UnsafeCell::new(0),
             isr_status: AtomicUsize::new(0),
@@ -1279,6 +1286,18 @@ impl AdapterContext {
         // SAFETY: hpd_event was initialized in place by init_kernel_events;
         // KeSetEvent(Wait=FALSE) is legal through DISPATCH_LEVEL.
         unsafe { KeSetEvent(self.hpd_event.get(), 0, 0) };
+    }
+
+    pub(crate) fn with_k11_completion<R>(&self, operation: impl FnOnce() -> R) -> Option<R> {
+        self.k11_completion.with_admitted(operation)
+    }
+
+    pub(crate) fn close_k11_completions_and_wait(&self, passive: crate::irql::PassiveLevel) {
+        self.k11_completion.close_completion_and_wait(passive);
+    }
+
+    pub(crate) fn reopen_k11_completions(&self) {
+        self.k11_completion.reopen();
     }
 
     /// Drop every piece of display publication state that is only meaningful

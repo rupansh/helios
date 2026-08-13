@@ -6,9 +6,7 @@ from __future__ import annotations
 import os
 import re
 import runpy
-import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from typing import Callable
 
@@ -124,15 +122,10 @@ def function_bodies(
     return out
 
 
-def check_sources(sources: dict[str, str]) -> list[str]:
+def check_local_sources(sources: dict[str, str]) -> list[str]:
     errors: list[str] = []
     live = {path: live_rust(source) for path, source in sources.items()}
     compact_live = {path: compact(source) for path, source in live.items()}
-
-    # K7 is additive to D4/D5. Import their real source checkers so a K7 change
-    # cannot make either earlier proof weaker and still pass this gate.
-    errors.extend(f"D4: {error}" for error in d4_check_sources(sources))
-    errors.extend(f"D5: {error}" for error in d5_check_sources(sources))
 
     owner = compact_live.get(OWNER, "")
     expected_owner = (
@@ -706,6 +699,15 @@ def check_sources(sources: dict[str, str]) -> list[str]:
     return errors
 
 
+def check_sources(sources: dict[str, str]) -> list[str]:
+    # K7 is additive to D4/D5. Import their real source checkers so a K7 change
+    # cannot make either earlier proof weaker and still pass this gate.
+    errors = [f"D4: {error}" for error in d4_check_sources(sources)]
+    errors.extend(f"D5: {error}" for error in d5_check_sources(sources))
+    errors.extend(check_local_sources(sources))
+    return errors
+
+
 @dataclass(frozen=True)
 class Mutation:
     name: str
@@ -751,20 +753,12 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("set hardware queue on interrupt", NATIVE, "    arm.hHWQueue = core::ptr::null_mut();", "    arm.hHWQueue = 1usize as HANDLE;"),
         Mutation("bypass shared DIRQL helper", NATIVE, "        super::submit_command::notify_at_dirql(dxgkrnl, &mut interrupt, false)", "        dxgkrnl.DxgkCbNotifyInterrupt.unwrap()(dxgkrnl.DeviceHandle, &mut interrupt); STATUS_SUCCESS"),
         Mutation("reorder reset invalidation", SUBMIT, "    crate::ddi::native_fence::invalidate_all(\n        adapter,\n        crate::ddi::native_fence::NativeFenceInvalidation::Reset,\n    );\n    crate::adapter::allocation_object::invalidate_all();", "    crate::adapter::allocation_object::invalidate_all();\n    crate::ddi::native_fence::invalidate_all(\n        adapter,\n        crate::ddi::native_fence::NativeFenceInvalidation::Reset,\n    );"),
-        Mutation("remove skipped-stop invalidation", LIFECYCLE, "    crate::ddi::native_fence::invalidate_all(\n        adapter,\n        crate::ddi::native_fence::NativeFenceInvalidation::StopOrRemove,\n    );\n    crate::adapter::allocation_object::invalidate_all();\n    adapter\n        .isr_status", "    crate::adapter::allocation_object::invalidate_all();\n    adapter\n        .isr_status"),
-        Mutation("remove StopDevice invalidation", LIFECYCLE, "        crate::ddi::native_fence::invalidate_all(\n            adapter,\n            crate::ddi::native_fence::NativeFenceInvalidation::StopOrRemove,\n        );\n        crate::adapter::allocation_object::invalidate_all();\n        // Stop the ISR", "        crate::adapter::allocation_object::invalidate_all();\n        // Stop the ISR"),
-        Mutation("remove RemoveDevice invalidation", LIFECYCLE, "        crate::ddi::native_fence::invalidate_all(\n            adapter,\n            crate::ddi::native_fence::NativeFenceInvalidation::StopOrRemove,\n        );\n        crate::adapter::allocation_object::invalidate_all();\n        if crate::virtio::KMD_D2_OWNER_ENABLED", "        crate::adapter::allocation_object::invalidate_all();\n        if crate::virtio::KMD_D2_OWNER_ENABLED"),
+        Mutation("remove skipped-stop invalidation", LIFECYCLE, "    crate::ddi::native_fence::invalidate_all(\n        adapter,\n        crate::ddi::native_fence::NativeFenceInvalidation::StopOrRemove,\n    );\n    crate::adapter::allocation_object::invalidate_all();\n    adapter.close_k11_completions_and_wait(passive);\n    adapter\n        .isr_status", "    crate::adapter::allocation_object::invalidate_all();\n    adapter.close_k11_completions_and_wait(passive);\n    adapter\n        .isr_status"),
+        Mutation("remove StopDevice invalidation", LIFECYCLE, "        crate::ddi::native_fence::invalidate_all(\n            adapter,\n            crate::ddi::native_fence::NativeFenceInvalidation::StopOrRemove,\n        );\n        crate::adapter::allocation_object::invalidate_all();\n        adapter.close_k11_completions_and_wait(passive_stop);\n        // Stop the ISR", "        crate::adapter::allocation_object::invalidate_all();\n        adapter.close_k11_completions_and_wait(passive_stop);\n        // Stop the ISR"),
+        Mutation("remove RemoveDevice invalidation", LIFECYCLE, "        crate::ddi::native_fence::invalidate_all(\n            adapter,\n            crate::ddi::native_fence::NativeFenceInvalidation::StopOrRemove,\n        );\n        crate::adapter::allocation_object::invalidate_all();\n        adapter.close_k11_completions_and_wait(passive_remove);\n        if crate::virtio::KMD_D2_OWNER_ENABLED", "        crate::adapter::allocation_object::invalidate_all();\n        adapter.close_k11_completions_and_wait(passive_remove);\n        if crate::virtio::KMD_D2_OWNER_ENABLED"),
         Mutation("weaken D4 layout", PRESENT_PACKET, "pub(crate) const PRESENT_FLIP_PRIVATE_OFFSET: usize = 32;", "pub(crate) const PRESENT_FLIP_PRIVATE_OFFSET: usize = 16;"),
         Mutation("weaken D5 plane bound", PRESENT_PACKET, "const MPO_MAX_PLANES: u32 = 1;", "const MPO_MAX_PLANES: u32 = 2;"),
     )
-
-
-def write_source_tree(root: str, sources: dict[str, str]) -> None:
-    for relative, source in sources.items():
-        path = os.path.join(root, relative)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as stream:
-            stream.write(source)
 
 
 def run_mutations(sources: dict[str, str]) -> None:
@@ -775,18 +769,13 @@ def run_mutations(sources: dict[str, str]) -> None:
             )
         mutated = dict(sources)
         mutated[case.path] = mutated[case.path].replace(case.old, case.new, 1)
-        with tempfile.TemporaryDirectory(prefix="helios-k7-gate-") as temp:
-            write_source_tree(temp, mutated)
-            result = subprocess.run(
-                [sys.executable, os.path.abspath(__file__), temp],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-            if result.returncode == 0:
-                raise SystemExit(f"K7 mutation was accepted by the real gate: {case.name}")
-    print(f"OK: {len(mutation_cases())} K7 temporary-tree mutations rejected by the real gate")
+        errors = check_local_sources(mutated)
+        if not errors:
+            errors.extend(f"D4: {error}" for error in d4_check_sources(mutated))
+            errors.extend(f"D5: {error}" for error in d5_check_sources(mutated))
+        if not errors:
+            raise SystemExit(f"K7 mutation was accepted by the real gate: {case.name}")
+    print(f"OK: {len(mutation_cases())} in-memory K7 mutations rejected by the real gate")
 
 
 def main() -> None:

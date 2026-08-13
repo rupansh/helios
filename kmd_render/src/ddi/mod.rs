@@ -33,6 +33,7 @@ pub(crate) mod scanout_timeline;
 pub(crate) mod scanout_trace;
 mod scheduler;
 pub(crate) mod segment_table;
+pub(crate) mod session_transport;
 pub(crate) mod submit_command;
 pub(crate) mod translation_session;
 pub(crate) mod vidpn;

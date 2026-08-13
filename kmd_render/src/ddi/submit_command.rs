@@ -732,6 +732,34 @@ enum SubmitAck {
     Accepted,
 }
 
+/// Retire one K11 DMA whose exact finite host operation and HVR1 publication
+/// were already terminal before the scheduler delivered SubmitCommand.
+///
+/// This is deliberately not routed through `note_wddm_submission`: K11 owns no
+/// adapter-global boundary entry and creates no independent timeline.  The
+/// exact OS-supplied fence was admitted by the HVC1 context-local watermark and
+/// is passed unchanged to the audited DIRQL notification helper. A failed
+/// notification remains a named failure; inventing a later completion or
+/// putting this fence on the legacy queue would destroy the causal proof.
+fn complete_k11_host_submission(
+    guard: &WddmNotifyGuard<'_>,
+    adapter: &AdapterContext,
+    exact_fence: u32,
+) {
+    let Ok(dxgkrnl) = adapter.dxgkrnl() else {
+        DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    // SAFETY: the notification lock is held, the interface is live, and
+    // `exact_fence` is the unmodified fence admitted by this context only after
+    // its actual host reply was validated and published. The session and
+    // canonical-pair rundown guards also remain live through this call.
+    let status = unsafe { signal_dma_completed(guard, dxgkrnl, exact_fence) };
+    if status != STATUS_SUCCESS {
+        DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 fn note_and_maybe_signal(
     adapter: &AdapterContext,
     fence: u32,
@@ -1160,10 +1188,45 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
     let h_context = unsafe { submit.__bindgen_anon_1.hContext };
     if !h_context.is_null() {
         let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
-        if let Some((native, _session)) = context.as_ref().and_then(|c| c.native()) {
-            // SAFETY: the private-data pair for this submission.
-            unsafe { crate::ddi::native_render::submit(native, submit) };
-            let SubmitAck::Accepted = note_and_maybe_signal(adapter, fence, is_paging, None);
+        if let Some((native, session)) = context.as_ref().and_then(|c| c.native()) {
+            // One fixed adapter rundown guard spans K11's current-generation
+            // validation, context-local fence admission, and exact completion.
+            // Reset closes and joins this guard before abandoning its scheduler
+            // epoch; ordinary session teardown does not wait on it.
+            let disposition = adapter.with_k11_completion(|| {
+                // SAFETY: the private-data pair for this submission.
+                let disposition = unsafe {
+                    crate::ddi::native_render::submit(native, session, submit)
+                };
+                if let crate::ddi::native_render::NativeSubmitDisposition::HostCompleted(
+                    exact_fence,
+                ) = disposition
+                {
+                    // Host-resource rundown has ended. Take the ordinary WDDM
+                    // notification lock only for delivery, so finite session
+                    // cleanup may use that lock before this OS callback if a
+                    // same-context Render is already tearing the session down.
+                    adapter.with_wddm_notify_lock(|guard| {
+                        complete_k11_host_submission(guard, adapter, exact_fence)
+                    });
+                }
+                disposition
+            });
+            let SubmitAck::Accepted = match disposition {
+                Some(crate::ddi::native_render::NativeSubmitDisposition::HostCompleted(_)) => {
+                    SubmitAck::Accepted
+                }
+                Some(crate::ddi::native_render::NativeSubmitDisposition::Revoked) | None => {
+                    // The host-completed marker belonged to a session whose
+                    // exact transport/fence authority was revoked before this
+                    // callback, or reset already closed the adapter completion
+                    // epoch. Do not forge completion through the legacy queue.
+                    SubmitAck::Accepted
+                }
+                Some(crate::ddi::native_render::NativeSubmitDisposition::Refused) => {
+                    note_and_maybe_signal(adapter, fence, is_paging, None)
+                }
+            };
             return STATUS_SUCCESS;
         }
     }
@@ -1322,6 +1385,7 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
         return STATUS_INVALID_PARAMETER;
     }
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
     // Close capability/object generations before any device-lost wakeup or
     // transport producer can observe the reset boundary. Both invalidations
     // are lock-free and define one indivisible adapter epoch transition.
@@ -1330,6 +1394,10 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
         crate::ddi::native_fence::NativeFenceInvalidation::Reset,
     );
     crate::adapter::allocation_object::invalidate_all();
+    // Close new K11 completions and join every callback that already owns the
+    // old scheduler epoch before its fences are abandoned. The guard spans no
+    // host work and waits by one event, never by polling.
+    adapter.close_k11_completions_and_wait(passive);
     // Prevent a DPC from taking a fence out of the pending FIFO while reset is
     // discarding that same scheduler epoch.  Dxgkrnl owns the post-reset fence
     // state; no completion from the abandoned epoch may escape concurrently.
@@ -1358,7 +1426,6 @@ pub unsafe extern "C" fn dxgkddi_reset_from_timeout(h_adapter: *mut c_void) -> N
         // producers, then removing the Venus client joins its mutex-protected
         // producers and makes later callers fail closed before canonical owner
         // admission is sealed.
-        let passive = unsafe { crate::irql::PassiveLevel::assume() };
         let had_transport = adapter.with_virtio(|_| ()).is_ok();
         adapter.stop_vsync();
         adapter.stop_hpd();
@@ -1525,6 +1592,7 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
         }
     }
 
+    adapter.reopen_k11_completions();
     crate::ddi::native_fence::resume_after_reset(adapter);
     STATUS_SUCCESS
 }

@@ -7,14 +7,12 @@
 // caller in the shipping ICD until mesa A3, so nothing else on this machine can
 // reach the kernel's HNR2 path.
 //
-// ⛔ WHAT IT MUST NOT ASSERT, because K11 is absent by design:
-//   - that `session_init` succeeds. It grants zero endpoints (there is no host
-//     Venus context), `complete_init` refuses a zero grant, and the INIT Render
-//     is therefore EXPECTED to be refused. `TsInitOk` stays 0; `TsInitRej` is
-//     what moves. Grading it the other way reads a designed refusal as a K6
-//     regression.
-//   - that any HVR1 reply appears, that a SUBMIT_3D reached the host, or that
-//     real GPU work ran. K6 stops at the host handoff.
+// K11 changes exactly one expectation in this otherwise-K6 probe: the first
+// finite pure-control HTS1 INIT now succeeds after a real host VkInstance is
+// created, while a second INIT on that one-shot session still refuses. Exact
+// HVR1 bytes, distinct host namespaces, abrupt exit, and reset teardown belong
+// to `k11_session_transport_probe.c`; allocation-backed and GPU work remain
+// outside this probe and must still refuse.
 //
 // State-neutral: every object it creates it destroys, and it renders no pixels.
 // Exit code 0 means every expectation held; 1 means at least one did not; 2 that
@@ -433,14 +431,13 @@ probe_adapter(D3DKMT_HANDLE adapter, UINT index)
       }
    }
 
-   /* ── I. the finite HTS1 INIT — ⛔ EXPECTED TO BE REFUSED ──────────────
+   /* ── I. the finite HTS1 INIT ────────────────────────────────────────────
     *
-    * This is the whole reply-slot lifecycle in one call: HAS_REPLY checks out
-    * slot 0, `session_init` runs, and it REFUSES because it grants zero
-    * endpoints — the host Venus context is K11's and does not exist. A SUCCESS
-    * here would mean a session went Live with nothing behind it, which is the
-    * finding, not the pass. What proves the arm ran is `TsInitRej` and
-    * `TsSlotRel` moving while `TsInitOk` and `TsSlotStuck` stay 0. */
+    * HAS_REPLY checks out slot 0, K11 creates the session's distinct stock-
+    * Venus context and VkInstance, and Render returns only after the real host
+    * reply has been validated and published through role-1 HVR1. The dedicated
+    * K11 probe validates those bytes; this K6-shaped probe protects the handoff
+    * by requiring the formerly-refused INIT to succeed. */
    if (pool && pool_generation) {
       HeliosTranslationSessionInitV1 init;
       memset(&init, 0, sizeof(init));
@@ -496,28 +493,13 @@ probe_adapter(D3DKMT_HANDLE adapter, UINT index)
          control.pAllocationList = render.pNewAllocationList;
       if (render.pNewPatchLocationList)
          control.pPatchLocationList = render.pNewPatchLocationList;
-      snprintf(why, sizeof(why),
-               "status=0x%08x -- SUCCESS would mean a session went Live with no host "
-               "context behind it",
-               (unsigned)si);
-      check(si != STATUS_SUCCESS_NT,
-            "I: the HTS1 INIT control Render is REFUSED (K11 grants no endpoints)",
-            why);
+      snprintf(why, sizeof(why), "status=0x%08x", (unsigned)si);
+      check(si == STATUS_SUCCESS_NT,
+            "I: the finite HTS1 INIT reaches K11 and succeeds", why);
 
-      /* The slot must be reusable afterwards. A1 takes the FIRST idle slot every
-       * time, so if the refusal above left slot 0 in flight this second attempt
-       * dies at `ControlRenderSlotBusy` instead of reaching `session_init` — and
-       * the session would be permanently dead.
-       *
-       * ⚠ THE STATUS CANNOT TELL THE TWO APART, and pretending otherwise would
-       * be a check that passes either way: both refusals are
-       * STATUS_INVALID_PARAMETER, because `DxgkDdiRender`'s documented return
-       * set is narrow and every K6 reason lives in a counter. This assertion is
-       * therefore only the cheap half — "the second attempt still refuses rather
-       * than succeeding". THE DISCRIMINATOR IS THE COUNTER PAIR, read after the
-       * run: `TsInitRej` must have moved by 2 (both attempts reached the INIT)
-       * with `TsCtlRej` unmoved and `TsSlotStuck` 0. `TsInitRej == 1` with
-       * `TsCtlRej` naming 0x0A09 is the stuck slot. */
+      /* INIT is one-shot. Reusing the same live session must refuse rather than
+       * minting a second host namespace or replacing the published capability.
+       * Fresh INIT/teardown reuse is covered by the dedicated K11 probe. */
       h.batch_token = 2;
       h.reply_slot_generation = 2;
       memcpy(control.pCommandBuffer, &h, sizeof(h));
@@ -538,9 +520,7 @@ probe_adapter(D3DKMT_HANDLE adapter, UINT index)
       snprintf(why, sizeof(why), "first=0x%08x second=0x%08x", (unsigned)si,
                (unsigned)sj);
       check(sj != STATUS_SUCCESS_NT,
-            "J: a second INIT still refuses (the slot discriminator is TsInitRej==2 "
-            "with TsSlotStuck==0)",
-            why);
+            "J: a second INIT on the one-shot live session is refused", why);
    }
 
    /* ── teardown, in A1's order ─────────────────────────────────────────── */
@@ -569,6 +549,9 @@ probe_adapter(D3DKMT_HANDLE adapter, UINT index)
 int
 main(void)
 {
+   /* Keep bounded wrappers diagnostic if a kernel DDI blocks: every completed
+    * check reaches the capture file immediately instead of only at exit. */
+   setvbuf(stdout, NULL, _IONBF, 0);
    D3DKMT_ENUMADAPTERS2 ea;
    memset(&ea, 0, sizeof(ea));
    NTSTATUS st = D3DKMTEnumAdapters2(&ea);

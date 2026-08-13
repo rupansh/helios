@@ -5974,3 +5974,46 @@ experiment each, and a third was withdrawn by the owner on maintenance grounds.
 ⇒ **Run the experiment before treating a claim here as a wall**, and prefer a
 runtime check over a constant that encodes a guess about another lane's
 schedule. `FINDINGS.md` is where the answers go.
+
+## 2026-08-14 append-only K11 amendment
+
+F5, F18, and F19 override the frozen K11/HPM1/QEMU assumptions without changing
+any load-bearing line number above:
+
+* **§10.4 / §10.7:** K11 now gives each exact live HTS1 session one distinct
+  stock Venus context/object namespace, one private 4 KiB host-reply target,
+  and one `VkInstance`. The actual 24-byte host CREATE reply is validated before
+  generation, capability, or bounded nonzero endpoint capacity is published.
+  The role-1 HVM1 carrier is 4 MiB split into four 1 MiB slots, not the frozen
+  64 MiB / four 16 MiB geometry. The logical HVR1 snapshot ceiling remains
+  64 MiB through exact continuation chunks. Ring zero executes only the finite
+  allocation-free INIT; allocation-backed and GPU-dependent work still refuses.
+* **§17.3:** Mesa A1/A2 remain the read-only KMT/session producer used by the
+  target probes. A3's renderer rewrite and A4's mode-dispatched record/normal
+  submission are the next handoff and were not started by K11.
+* **§17.6:** the landed K11 implementation is
+  `ddi/session_transport.rs` plus narrow direct-lifetime seams in K5/K6 and the
+  existing virtio control owner. It uses no HPM1 packet, new QEMU operation,
+  global/PID/name discovery, adapter-global completion queue, polling, sleep,
+  synthetic completion, or ABI identity token. Teardown closes admission,
+  drains exact in-flight ownership, destroys the host instance/resource/context,
+  and only then permits session/K2a backing release. Failed/repeated INIT aborts
+  its exact slot before draining. The review-found reset/notification race is
+  closed by one fixed per-adapter completion rundown spanning final validation
+  through the exact WDDM notification; it owns no queue, timeline, session
+  identity, or host namespace, and session guards end before the OS callback.
+* **§18.1:** `tools/k11-session-transport-gate.py` is integrated once into the
+  serial retirement gate and rejects 62 semantic mutations. KMD 22.22.296.0
+  produced an actual correlated finite host INIT reply; K11 passed 14/14, HTS1
+  15/15, updated HNR2 15/15, and K2a 52/52. Distinct same-process sessions,
+  another-process isolation, repeated/abrupt teardown, and held-capability
+  adapter restart passed with balanced host-context counts and
+  `TsSlotStuck=0`.
+* **§18.4:** none of that admits the display. After reset DWM still loads WARP
+  and DisplayConfig reports zero active paths. Escape and HWQueues remain NULL.
+  Mesa A3/A4, the cold-DWM gate, HPS2 retirement, and production correctness
+  remain outstanding.
+
+**THE ESCAPE-FREE K11 PER-SESSION HOST TRANSPORT LANDED AND WAS EXERCISED ON
+THE TARGET, WHILE THE WDDM 3.2 DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED;
+MESA A3/A4, HPS2 RETIREMENT, AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**

@@ -425,6 +425,9 @@ impl AdapterContext {
         // consumed by the first waiter and a second stop_hpd would block.
         // SAFETY: per the fn contract; stable in-place KEVENT storage.
         unsafe { KeInitializeEvent(self.hpd_exited.get(), 0, 0) };
+        // K11 completion rundown: NotificationEvent, initially signaled while
+        // the gate is closed and has no active SubmitCommand callback.
+        unsafe { self.k11_completion.init_event() };
         // VSync objects are dispatcher objects too. Initialize them at the
         // final adapter address before the context is published; StartDevice
         // and power callbacks only arm/cancel this already-valid pair.

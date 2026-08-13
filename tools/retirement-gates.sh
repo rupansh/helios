@@ -941,8 +941,8 @@ run_gate "K5 HTS1/HQA1: the C mirror's records replayed through the KMD session"
     bash "$REPO/tools/hts1-attach-gate.sh"
 
 # D9 replaces the dormant D2/D3 refusal gate with one package-level
-# activation-coherence proof. The executable mutation pass feeds altered
-# temporary trees back through the same gate used for the real source.
+# activation-coherence proof. The executable mutation pass feeds in-memory
+# source overlays through the same gate checkers used for the real source.
 run_gate "D9 WDDM 3.2 activation package is coherent and mutation-closed" \
     python3 "$REPO/tools/d9-wddm32-activation-gate.py" "$REPO"
 
@@ -955,6 +955,9 @@ run_gate "K2a shared-backing CPU view is exact and lifetime-closed" \
 run_gate "K2a shared-backing executable mutation suite" \
     python3 "$REPO/tools/k2a-share-backing-store-gate.py" "$REPO" --mutations
 
+run_gate "K11 per-session stock-Venus transport is finite, lifetime-closed, and mutation-checked" \
+    python3 "$REPO/tools/k11-session-transport-gate.py" "$REPO" --mutations
+
 run_gate "D4 classic/DMA DIRQL enqueue is capability-restricted and fixed-storage" \
     python3 "$REPO/tools/d4-dirql-gate.py" "$REPO"
 
@@ -964,8 +967,8 @@ run_gate "D5 MPO Present is bounded, exact-allocation, ordinary-packet, and leas
 run_gate "K7 active native-fence surface is conjunctive, per-adapter, bounded, and lifecycle-closed" \
     python3 "$REPO/tools/k7-native-fence-gate.py" "$REPO"
 
-# Each K7 mutation is written into a temporary source tree and that tree is
-# passed back through the same gate executable used above.
+# Each K7 mutation is an in-memory source overlay passed through the same gate
+# checkers used above; unchanged D4/D5 ancestry is not re-parsed per case.
 run_gate "K7 native-fence executable mutation suite" \
     python3 "$REPO/tools/k7-native-fence-gate.py" "$REPO" --mutations
 

@@ -108,6 +108,12 @@ pub unsafe extern "C" fn dxgkddi_reset_engine(
     }
 
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
+    // ResetEngine is PASSIVE_LEVEL in the WDK contract. Temporarily close and
+    // join K11's exact completion intervals before abandoning this scheduler
+    // epoch, then reopen because this callback does not replace the physical
+    // transport or its live sessions.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    adapter.close_k11_completions_and_wait(passive);
     // Engine reset aborts the node's outstanding submissions: drop the pending
     // venus-gated WDDM fences (dxgkrnl resubmits what it still wants done).
     // The queue mutation requires the notification-lock proof token, so no DMA
@@ -121,6 +127,7 @@ pub unsafe extern "C" fn dxgkddi_reset_engine(
     adapter.with_wddm_notify_lock(|guard| {
         let _ = guard.with_virtio(|order, v| v.purge_all_present_streams_ordered(order));
     });
+    adapter.reopen_k11_completions();
     STATUS_SUCCESS
 }
 

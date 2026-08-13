@@ -130,6 +130,7 @@ fn retire_skipped_stop_transport(
         crate::ddi::native_fence::NativeFenceInvalidation::StopOrRemove,
     );
     crate::adapter::allocation_object::invalidate_all();
+    adapter.close_k11_completions_and_wait(passive);
     adapter
         .isr_status
         .store(0, core::sync::atomic::Ordering::Release);
@@ -570,6 +571,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // Adapter-owned builders may run only after the complete generation is
     // published; StopDevice closes and drains the same gate before teardown.
     crate::ddi::diag_etw::adapter_start(adapter);
+    // Open the short K11 SubmitCommand completion epoch only after the complete
+    // transport/owner generation is published. A skipped Stop or failed start
+    // therefore cannot carry admission into this generation.
+    adapter.reopen_k11_completions();
 
     if knobs.display_half {
         crate::diag::record_named_bytes(b"DspMd", adapter.display_mode_packed());
@@ -612,6 +617,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // tearing down.
         // SAFETY: our adapter context, handed back from AddDevice.
         let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
+        let passive_stop = unsafe { crate::irql::PassiveLevel::assume() };
         let d2_had_transport = crate::virtio::KMD_D2_OWNER_ENABLED
             && adapter.with_virtio(|_| ()).is_ok();
         if d2_had_transport {
@@ -644,6 +650,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
             crate::ddi::native_fence::NativeFenceInvalidation::StopOrRemove,
         );
         crate::adapter::allocation_object::invalidate_all();
+        adapter.close_k11_completions_and_wait(passive_stop);
         // Stop the ISR from touching the (about-to-be-reset) device first.
         //
         // ⚠ ASYMMETRY, recorded rather than changed (k-ctrlsubmit-12): this
@@ -684,8 +691,6 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // SAFETY: `DxgkDdiStopDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
         // DXGKDDI_STOP_DEVICE); the teardown below unrefs blobs and destroys the
         // venus context, both control round-trips against the still-live device.
-        let passive_stop = unsafe { crate::irql::PassiveLevel::assume() };
-
         if let Err(error) = adapter.close_control_owner_transport() {
             let status: NTSTATUS = error.into();
             crate::diag::fault(crate::diag::FaultCounter::StVioR, status as u32);
@@ -756,6 +761,7 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
     if !miniport_device_context.is_null() {
         // SAFETY: our adapter context; only read here.
         let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
+        let passive_remove = unsafe { crate::irql::PassiveLevel::assume() };
         if !crate::virtio::KMD_D2_OWNER_ENABLED {
             crate::ddi::diag_etw::adapter_stop(adapter);
         }
@@ -767,6 +773,7 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
             crate::ddi::native_fence::NativeFenceInvalidation::StopOrRemove,
         );
         crate::adapter::allocation_object::invalidate_all();
+        adapter.close_k11_completions_and_wait(passive_remove);
         if crate::virtio::KMD_D2_OWNER_ENABLED {
             // RemoveDevice may follow a failed Start or skip StopDevice. Close
             // every callback-producing edge before touching the exact transport;
@@ -779,7 +786,6 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
             adapter.stop_hpd();
             adapter.reset_display_publication_state();
             if !adapter.hpd_worker_may_be_running() {
-                let passive_remove = unsafe { crate::irql::PassiveLevel::assume() };
                 let had_transport = adapter.with_virtio(|_| ()).is_ok();
                 if had_transport {
                     crate::ddi::direct_scanout::prepare_reset(

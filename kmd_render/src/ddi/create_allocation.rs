@@ -67,7 +67,7 @@ use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use bytemuck::bytes_of;
 use helios_protocol::{
@@ -89,7 +89,7 @@ use helios_protocol::{
     VirtioGpuMemEntry, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
     VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
 };
-use wdk_sys::ntddk::{IoAllocateMdl, IoFreeMdl, KeGetCurrentIrql};
+use wdk_sys::ntddk::{IoAllocateMdl, IoFreeMdl, KeGetCurrentIrql, MmMapLockedPagesSpecifyCache};
 use wdk_sys::PMDL;
 
 use crate::adapter::allocation_object;
@@ -139,6 +139,15 @@ struct AllocationContext {
     /// One-shot SetAllocationBackingStore state. The OS-owned address is used
     /// only while locking its pages and is never retained as identity.
     backing_store_state: AtomicU32,
+    /// Stable kernel mapping of the locked K2a MDL.  Internal byte access only:
+    /// never an ABI field, lookup key, user mapping, or allocation identity.
+    /// The canonical resource finalizer keeps the MDL locked until host UNREF
+    /// or verified physical reset, which is exactly this mapping's lifetime.
+    backing_store_va: AtomicUsize,
+    /// Exact live HTS1 session that owns this role-1 reply pool, or zero.
+    /// Internal direct-object edge only: never serialized, searched, logged, or
+    /// accepted from a caller. The owning OpenAllocation holds the strong ref.
+    k11_session_binding: AtomicUsize,
     /// Exact virtio transport generation that created `resource_id`. Resource
     /// numbers restart in a replacement transport, so D2 must reject an old
     /// allocation object even when a new row happens to reuse the same scalar.
@@ -866,6 +875,10 @@ struct OpenAllocationContext {
     /// in an allocation list at all. Storing what the guest was told, rather
     /// than re-deriving it, is what makes the two sides unable to disagree.
     identity: Option<OpenIdentity>,
+    /// Strong HTS1 reference owned by this exact role-1 device-specific open.
+    /// CloseAllocation revokes/drains/destroys K11 before dropping it, while
+    /// `allocation` and the K2a MDL are still canonically live.
+    reply_pool_session: Option<core::ptr::NonNull<crate::ddi::translation_session::SessionObject>>,
 }
 
 /// What an open published, as K6's Render and Patch read it back.
@@ -1359,6 +1372,103 @@ pub(crate) struct DirectScanoutAllocationFacts {
     /// Keeping it in this immutable projection lets DIRQL admission prove the
     /// HWA2 byte range without taking the canonical-owner DISPATCH spinlock.
     pub backing_size: u64,
+}
+
+/// Exact K2a role-1 backing used by one HTS1 session transport.
+///
+/// The canonical allocation pointer comes from the device-specific ordinary
+/// WDDM open retained by that session.  This projection never searches by
+/// resource id, generation, name, process, geometry, or pool offset.
+#[derive(Clone, Copy)]
+pub(crate) struct K11ReplyPoolFacts {
+    pub allocation_generation: u64,
+    pub resource_id: u32,
+    pub transport_instance: u64,
+    pub kernel_va: core::ptr::NonNull<u8>,
+    pub byte_size: u64,
+}
+
+/// Resolve K11's exact retained role-1 allocation to its completed K2a view.
+///
+/// # Safety
+/// `allocation` must be the canonical allocation pointer captured by a live
+/// `OpenAllocationContext`; CloseAllocation keeps it live for this call.
+pub(crate) unsafe fn k11_reply_pool_facts(allocation: usize) -> Option<K11ReplyPoolFacts> {
+    let ctx = unsafe { resolve_alloc(allocation as HANDLE) }?;
+    // BOUND is the one release-published alias state.  Acquire it before
+    // reading either member so a successful projection cannot combine a new
+    // state word with stale resource/mapping fields.
+    if ctx.backing_store_state.load(Ordering::Acquire) != BACKING_STORE_BOUND {
+        return None;
+    }
+    let resource_id = ctx.resource_id.load(Ordering::Relaxed);
+    let kernel_va =
+        core::ptr::NonNull::new(ctx.backing_store_va.load(Ordering::Relaxed) as *mut u8)?;
+    let byte_size = ctx.size as u64;
+    if ctx.kind != ALLOC_KIND_HVM1
+        || ctx.hvm1_role != Hvm1Role::ReplyPool.to_u32()
+        || resource_id == 0
+        || ctx.transport_instance == 0
+        || !allocation_object::is_current(ctx.generation)
+        || byte_size != helios_protocol::native_render::HELIOS_HVM1_REPLY_POOL_BYTES
+        || !matches!(ctx.size_provenance, BackingSize::SharedBackingStore(n) if n == byte_size)
+    {
+        return None;
+    }
+    Some(K11ReplyPoolFacts {
+        allocation_generation: ctx.generation,
+        resource_id,
+        transport_instance: ctx.transport_instance,
+        kernel_va,
+        byte_size,
+    })
+}
+
+/// Claim one canonical role-1 allocation for one exact live SessionObject.
+/// This prevents two sessions from attaching distinct host contexts to a shared
+/// reply carrier even if a caller deliberately re-opens the shared WDDM
+/// resource on another raw device.
+pub(crate) unsafe fn claim_k11_reply_pool_session(
+    allocation: usize,
+    session: core::ptr::NonNull<crate::ddi::translation_session::SessionObject>,
+) -> bool {
+    let Some(ctx) = (unsafe { resolve_alloc(allocation as HANDLE) }) else {
+        return false;
+    };
+    if ctx.kind != ALLOC_KIND_HVM1
+        || ctx.hvm1_role != Hvm1Role::ReplyPool.to_u32()
+        || !allocation_object::is_current(ctx.generation)
+    {
+        return false;
+    }
+    ctx.k11_session_binding
+        .compare_exchange(
+            0,
+            session.as_ptr() as usize,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+/// Release the exact direct-object claim after host work has been revoked and
+/// the session context destroyed. A mismatch is an ownership failure; no other
+/// session is guessed or recovered.
+pub(crate) unsafe fn release_k11_reply_pool_session(
+    allocation: usize,
+    session: core::ptr::NonNull<crate::ddi::translation_session::SessionObject>,
+) -> bool {
+    let Some(ctx) = (unsafe { resolve_alloc(allocation as HANDLE) }) else {
+        return false;
+    };
+    ctx.k11_session_binding
+        .compare_exchange(
+            session.as_ptr() as usize,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
 }
 
 /// Resolve the exact OS-supplied `hAllocation` to its final HWA2 facts.
@@ -4280,6 +4390,8 @@ unsafe fn create_one(
         ctx_id: adapter.venus_ctx_id(),
         resource_id: AtomicU32::new(resource_id),
         backing_store_state: AtomicU32::new(BACKING_STORE_UNBOUND),
+        backing_store_va: AtomicUsize::new(0),
+        k11_session_binding: AtomicUsize::new(0),
         transport_instance: if crate::virtio::KMD_D2_OWNER_ENABLED {
             adapter
                 .with_virtio(|gpu| gpu.scanout_transport_instance())
@@ -4579,6 +4691,33 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
 /// locked PFNs as a guest-memory Venus blob. No user VA or process identity is
 /// carried: Lock2 maps the same section in the exact calling process by the
 /// ordinary WDDM allocation lifetime.
+const K2A_MDL_MAP_PRIORITY: u32 = 16 | 0x4000_0000; // NormalPagePriority | NX
+const K2A_MDL_HAS_SYSTEM_VA: i16 = 0x0001 | 0x0004;
+
+/// Build/reuse the stable kernel view of a successfully locked K2a MDL.
+/// `MmUnlockPages` in the canonical resource finalizer releases a system mapping
+/// made by this `MmGetSystemAddressForMdlSafe`-equivalent pattern.
+unsafe fn k2a_mdl_system_va(mdl: PMDL, expected_bytes: u64) -> Option<usize> {
+    if mdl.is_null() || u64::from(unsafe { (*mdl).ByteCount }) != expected_bytes {
+        return None;
+    }
+    if unsafe { (*mdl).MdlFlags } & K2A_MDL_HAS_SYSTEM_VA != 0 {
+        return core::ptr::NonNull::new(unsafe { (*mdl).MappedSystemVa } as *mut u8)
+            .map(|va| va.as_ptr() as usize);
+    }
+    let va = unsafe {
+        MmMapLockedPagesSpecifyCache(
+            mdl,
+            0, // KernelMode
+            _MEMORY_CACHING_TYPE::MmCached,
+            core::ptr::null_mut(),
+            0, // BugCheckOnFailure = FALSE
+            K2A_MDL_MAP_PRIORITY,
+        )
+    };
+    core::ptr::NonNull::new(va as *mut u8).map(|va| va.as_ptr() as usize)
+}
+
 pub unsafe extern "C" fn dxgkddi_set_allocation_backing_store(
     h_adapter: IN_CONST_HANDLE,
     set_backing: IN_CONST_PDXGKARG_SETALLOCATIONBACKINGSTORE,
@@ -4665,6 +4804,24 @@ pub unsafe extern "C" fn dxgkddi_set_allocation_backing_store(
         return STATUS_INVALID_PARAMETER;
     }
 
+    // K11 alone needs a stable CPU alias, and only for the fixed 4-MiB role-1
+    // pool. Mapping every future role-2/role-3 allocation here would consume an
+    // unbounded number of system PTEs merely because shared backing exists.
+    let kernel_va = if role == Hvm1Role::ReplyPool {
+        let Some(kernel_va) = (unsafe { k2a_mdl_system_va(mdl, bytes) }) else {
+            unsafe {
+                wdk_sys::ntddk::MmUnlockPages(mdl);
+                IoFreeMdl(mdl);
+            }
+            ctx.backing_store_state
+                .store(BACKING_STORE_UNBOUND, Ordering::Release);
+            return STATUS_NO_MEMORY;
+        };
+        kernel_va
+    } else {
+        0
+    };
+
     let pfns = unsafe { helios_mm_get_mdl_pfn_array(mdl) };
     let mut valid = !pfns.is_null();
     for index in 0..page_count {
@@ -4731,9 +4888,15 @@ pub unsafe extern "C" fn dxgkddi_set_allocation_backing_store(
         }
     };
 
-    ctx.backing_store_state
-        .store(BACKING_STORE_BOUND, Ordering::Relaxed);
+    // Retain the pre-K11 scalar publication edge for existing resource readers;
+    // BOUND below additionally publishes resource + role-1 alias as one tuple.
     ctx.resource_id.store(resource_id, Ordering::Release);
+    ctx.backing_store_va.store(kernel_va, Ordering::Relaxed);
+    // Publish the complete alias as one state transition.  A K11 reader that
+    // observes BOUND must also observe both the canonical resource and kernel
+    // mapping above.
+    ctx.backing_store_state
+        .store(BACKING_STORE_BOUND, Ordering::Release);
     crate::diag::record_named_bytes(b"ShBkOk", resource_id);
     STATUS_SUCCESS
 }
@@ -5010,13 +5173,15 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
             }),
             (None, None) => None,
         };
+        let mut reply_pool_session = None;
         if let Some((Hvm1Role::ReplyPool, byte_size, generation)) = hvm1 {
             if let Some(device) = unsafe { crate::device::DeviceHandleRef::from_raw(h_device) } {
-                crate::ddi::translation_session::bind_reply_pool(
+                reply_pool_session = crate::ddi::translation_session::bind_reply_pool(
                     device.session_cell(),
                     Hvm1Role::ReplyPool,
                     byte_size,
                     generation,
+                    canonical_allocation,
                 );
             }
         }
@@ -5066,6 +5231,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
             present: None,
             present_diag,
             identity: open_identity,
+            reply_pool_session,
         });
         record_alloc_event(
             0,
@@ -5307,8 +5473,21 @@ pub unsafe extern "C" fn dxgkddi_close_allocation(
         let handle = unsafe { *args.pOpenHandleList.add(i) };
         if !handle.is_null() {
             crate::diag::record(0x0C37_0000 | ((handle as usize as u32) & 0xFFFF));
-            // Taking the context frees it; nothing in it was ever read.
-            let _ = unsafe { take_open_ctx(handle) };
+            if let Some(mut open) = unsafe { take_open_ctx(handle) } {
+                if let Some(session) = open.reply_pool_session.take() {
+                    // SAFETY: this is the strong reference the exact open took
+                    // in `bind_reply_pool`; its canonical allocation remains
+                    // live until after CloseAllocation returns.
+                    unsafe {
+                        crate::ddi::translation_session::close_reply_pool_binding(
+                            session,
+                            open.allocation,
+                        )
+                    };
+                }
+                // Box drops only after K11 has revoked/drained/destroyed.
+                drop(open);
+            }
         }
     }
     STATUS_SUCCESS

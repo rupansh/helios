@@ -95,14 +95,30 @@ MPO3/Display-Core surface, and native-fence surface landed together before the
 flip.
 
 That source/boot activation is **not** the activation of the whole HPS2
-retirement. KMD 22.22.288.0 now also carries K2a's documented shared-backing CPU
-view, but the display remains runtime-unadmitted. K11's per-session host
-transport and Mesa A3/A4's escape-free consumer cutover still precede the
+retirement. KMD 22.22.296.0 now also carries K2a's documented shared-backing CPU
+view and K11's per-session stock-Venus host transport, but the display remains
+runtime-unadmitted. Mesa A3/A4's escape-free consumer cutover still precedes the
 cold-DWM visible-admission retry and every HPS2 demolition step.
 
 Do not infer display admission from the raised surface, callback counts, Code 0,
 WDDM 3.2, K2a mapping, counters, or hashes. Escape and the HWQueue family remain
 NULL; no later lane may add a second activation switch or fallback carrier.
+
+K11 has one ownership root: the ordinary HVC1-created, heap-pinned
+`SessionObject` reached through the exact raw KMD device. That object owns one
+distinct stock Venus context/object namespace and private host reply target;
+the canonical role-1 allocation/open object supplies a direct strong binding,
+and HQA1 outer contexts retain direct session/endpoint references. Neither INIT
+nor submit may discover that graph by PID, global/name lookup, renderer resource
+id, or heuristic. A fixed per-adapter completion rundown spans only the final
+current-generation admission through the exact WDDM notification; it owns no
+session identity, host namespace, queue, or lookup, and reset/Stop/Remove close
+and join it before host teardown. Teardown closes session admission, drains
+exact host operations,
+destroys the host instance/resource/context, and only then releases the session
+and K2a backing references. This boundary landed and was reset-exercised on
+22.22.296.0; it grants no ownership of Mesa A3/A4, K1 demolition, or later
+allocation/GPU work.
 
 ## 4. Orchestrator decision: the private direct-dispatch ABI has one home
 
@@ -142,7 +158,7 @@ work, never per unit.
 |---|---|---|
 | `protocol` | Linux | `cd protocol && CARGO_TARGET_DIR=target/linux cargo test` — there is **no workspace root**, so `-p` from the repo root fails. |
 | `vkd3d-proton-helios` | Linux | `build-native-codex && ninja` — green. Tests are **545**, run by `./tests/test-runner.sh build-native-codex/tests/d3d12`, NOT by `meson test` (which reports "No tests defined"). ⚠ The old "102/102" here and the "215/215" in agent memory were both wrong and disagreed with each other. Expect **2 failures**, `test_nvx_cubin` and `test_destruction_notifier_interfaces`; both reproduce on unmodified upstream `2c7ba22c` and neither is ours — see `REVIEW-ROUND-1.md`. The second is concurrency-dependent, so its count varies with `-j` and with machine load. |
-| `qemu-helios` | Linux | `build-helios && ninja qemu-system-x86_64` — green. ⛔ **The QEMU HPM1 lane remains PARKED — see F5.** The owner made one scoped K2a exception on 2026-08-13: rebase the existing Helios scanout commits onto upstream and import WDDM `ShareBackingStoreWithKmd` guest pages into Venus through stock udmabuf. Five commits, 143 additions / 32 deletions, no HPM1 negotiation/paging protocol and no virglrenderer change. This exception does not authorize a new QEMU dependency for K11 or later lanes. |
+| `qemu-helios` | Linux | `build-helios && ninja qemu-system-x86_64` — green. ⛔ **The QEMU HPM1 lane remains PARKED — see F5.** The owner made one scoped K2a exception on 2026-08-13: rebase the existing Helios scanout commits onto upstream and import WDDM `ShareBackingStoreWithKmd` guest pages into Venus through stock udmabuf. Five commits, 143 additions / 32 deletions, no HPM1 negotiation/paging protocol and no virglrenderer change. K11 landed through existing stock virtio-gpu/Venus operations with this repository frozen at `415a5ef`; it creates no QEMU, virglrenderer, HPM1, or kernel-parameter dependency for later lanes. |
 | `kmd_render`, `umd`, `umd12` | **VM only** | WDK/bindgen. Serialize: the VM is one machine. |
 | `icd/mesa` | **VM only** | `win_meson`. |
 

@@ -5,16 +5,16 @@
 //! pointer work, the CSPRNG, the locking and the counters. `helios_protocol`
 //! owns the wire records — nothing here re-declares one.
 //!
-//! # The seam with K6
+//! # The seam with K6 and K11
 //!
 //! K5 owns `DxgkDdiCreateContext`'s private-data dispatch, the provisional
 //! session the HVC1 **control** context creates, the reply-pool binding, HQA1
 //! attach, and the session state every later unit compares against. K6 owns the
 //! HVC1 **queue** context, `DxgkDdiRender`'s HNR2 decode, Patch, SubmitCommand
-//! and the context-local slot pool. Because the finite HTS1 INIT *is* an HNR2
-//! Render (§10.4:1206-1211, §17.6:4360-4368), [`session_init`] has no caller
-//! until K6 exists and is the third state `K4-CONTRACT.md` §8 names: implemented,
-//! never exercised.
+//! and the context-local slot pool. K11 now executes only the finite HTS1 INIT
+//! HNR2 Render (§10.4:1206-1211, §17.6:4360-4368) through one private stock-
+//! Venus namespace and role-1 HVR1 reply. Queue and allocation-backed execution
+//! remain outside this tranche, and source reachability is not target evidence.
 
 use alloc::boxed::Box;
 use core::ptr::NonNull;
@@ -32,8 +32,10 @@ use helios_protocol::translation_session::{
 use helios_protocol::HELIOS_PACKAGE_GENERATION;
 
 use crate::adapter::AdapterContext;
+use crate::ddi::session_transport::SessionTransport;
 use crate::dxgk::*;
 use crate::sync::SpinLock;
+use crate::virtio::gpu::DeviceOwner;
 
 // ── Named counters ───────────────────────────────────────────────────────────
 //
@@ -91,11 +93,10 @@ pub static TS_ATTACH_REJECT: AtomicU32 = AtomicU32::new(0);
 /// HQA1 named a (session generation, capability) pair no live session in this
 /// ProcessContext holds.
 pub static TS_ATTACH_NO_SESSION: AtomicU32 = AtomicU32::new(0);
-/// Outer contexts detached at `DxgkDdiDestroyContext`. Unreachable until K6, for
-/// [`TS_ATTACH_OK`]'s reason — nothing attaches, so nothing detaches.
+/// Outer contexts detached at `DxgkDdiDestroyContext` after an exact HQA1
+/// admission.
 pub static TS_DETACH_OK: AtomicU32 = AtomicU32::new(0);
-/// Detach refusals — our own accounting bug. **Must read 0**, and unreachable
-/// until K6.
+/// Detach refusals — our own accounting bug. **Must read 0**.
 pub static TS_DETACH_REJECT: AtomicU32 = AtomicU32::new(0);
 /// Role-1 reply pools bound to a provisional session at open time.
 pub static TS_POOL_BOUND: AtomicU32 = AtomicU32::new(0);
@@ -109,11 +110,8 @@ pub static TS_POOL_REJECT: AtomicU32 = AtomicU32::new(0);
 pub static TS_PDD_UNKNOWN: AtomicU32 = AtomicU32::new(0);
 /// Sessions moved to `Draining` by reset, removal, or device teardown.
 pub static TS_DRAINED: AtomicU32 = AtomicU32::new(0);
-/// INIT round trips completed. **Unreachable in this package, twice over**:
-/// [`session_init`] has no caller until K6, and when K6 supplies one it still
-/// refuses, because the host Venus context K11 owns does not exist and
-/// [`session_init`] therefore grants zero endpoints. Expect 0; expect
-/// `TS_INIT_REJECT` to be what moves once K6 lands.
+/// INIT round trips whose stock-Venus context creation, exact host reply,
+/// capability publication, and HVR1 publication all completed.
 pub static TS_INIT_OK: AtomicU32 = AtomicU32::new(0);
 /// INIT refusals, all causes.
 pub static TS_INIT_REJECT: AtomicU32 = AtomicU32::new(0);
@@ -304,12 +302,42 @@ pub(crate) struct SessionObject {
     /// adapter object — "a mandatory observed target gate rather than an
     /// inference from a PID" — so attach compares both.
     adapter: *const AdapterContext,
+    /// Exact raw KMT device that owns the host context in the canonical owner
+    /// table. Never serialized, logged, or used for discovery.
+    owner: DeviceOwner,
+    /// Stable fixed endpoint objects.  Every HQA1 context stores one direct
+    /// pointer into this array while its strong session ref keeps the array
+    /// alive; Submit never re-discovers an endpoint by generation/capability.
+    endpoints: [SessionEndpointObject; model::ENDPOINT_SLOTS],
+    /// K11's one host context/object namespace and exact rundown edge.
+    transport: SessionTransport,
+    /// Monotonic, session-local HVR1 snapshot source.
+    snapshot_generations: SpinLock<model::SessionGenerationSource>,
     refs: AtomicU32,
+}
+
+/// One direct fixed endpoint reference retained by an HQA1 context.
+pub(crate) struct SessionEndpointObject {
+    endpoint_id: u32,
+    /// Private `INFO_RING_IDX` reserved with this endpoint before INIT can
+    /// publish its capacity. Ring zero remains the session's control timeline.
+    ring_index: u32,
+}
+
+impl SessionEndpointObject {
+    pub(crate) const fn endpoint_id(&self) -> u32 {
+        self.endpoint_id
+    }
+
+    pub(crate) const fn ring_index(&self) -> u32 {
+        self.ring_index
+    }
 }
 
 // SAFETY: `model` is reachable only through the `SpinLock`, and every other field
 // is written once at construction and read-only afterwards. `process`/`adapter`
-// are compared for identity and never dereferenced by this module.
+// are compared for identity; adapter is dereferenced only by PASSIVE teardown
+// while the owning WDDM adapter is still live.
 unsafe impl Send for SessionObject {}
 // SAFETY: as above.
 unsafe impl Sync for SessionObject {}
@@ -333,6 +361,24 @@ impl SessionObject {
             // SAFETY: the count reached zero, so no other owner can observe it.
             drop(unsafe { Box::from_raw(session) });
         }
+    }
+
+    fn begin_draining_once(&self) {
+        let mut session = self.model.lock();
+        if session.phase() != model::SessionPhase::Draining {
+            session.begin_draining();
+            TS_DRAINED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn teardown(&self, passive: crate::irql::PassiveLevel) {
+        self.begin_draining_once();
+        // SAFETY: the adapter outlives every WDDM device/context/allocation
+        // object associated with it. All callers are PASSIVE lifetime DDIs.
+        let Some(adapter) = (unsafe { self.adapter.as_ref() }) else {
+            return;
+        };
+        self.transport.teardown(passive, adapter, self.owner);
     }
 }
 
@@ -423,6 +469,7 @@ impl ProcessSessionList {
             return None;
         }
         let slots = self.slots.lock();
+        let mut found = None;
         let mut i = 0;
         while i < SESSION_SLOTS {
             if let Some(ptr) = slots.get(i).copied().flatten() {
@@ -447,29 +494,40 @@ impl ProcessSessionList {
                     drop(model);
                     if matches {
                         obj.acquire();
-                        return Some(ptr);
+                        found = Some(ptr);
+                        break;
                     }
                 }
             }
             i += 1;
         }
-        None
+        drop(slots);
+        found
     }
 
     /// Move every live session to `Draining`. Reset, removal, and process
     /// teardown all land here; §14 requires capability invalidation to precede
     /// the device-lost wakeup, which is what `begin_draining` does first.
     pub(crate) fn drain_all(&self) {
+        // Take temporary refs into fixed stack storage, then drop the
+        // ProcessContext list lock before any host roundtrip or event wait.
+        let mut pending = [None; SESSION_SLOTS];
         let slots = self.slots.lock();
         let mut i = 0;
         while i < SESSION_SLOTS {
             if let Some(ptr) = slots.get(i).copied().flatten() {
-                // SAFETY: as in `acquire_by_key`.
-                let obj = unsafe { ptr.as_ref() };
-                obj.model.lock().begin_draining();
-                TS_DRAINED.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: the device/list reference is live under this lock.
+                unsafe { ptr.as_ref() }.acquire();
+                pending[i] = Some(ptr);
             }
             i += 1;
+        }
+        drop(slots);
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        for ptr in pending.into_iter().flatten() {
+            let obj = unsafe { ptr.as_ref() };
+            obj.teardown(passive);
+            unsafe { SessionObject::release(ptr.as_ptr()) };
         }
     }
 }
@@ -504,7 +562,7 @@ pub(crate) enum ContextRequest {
         /// against a generation the session no longer has.
         session_generation: u64,
         context_generation: u64,
-        endpoint_id: u32,
+        endpoint: NonNull<SessionEndpointObject>,
         /// Which HQA1 arm — HOS1 exists only on the D3D12 virtual one.
         kind: helios_protocol::translation_session::HeliosOuterContextKind,
     },
@@ -522,6 +580,7 @@ pub(crate) unsafe fn classify_context(
     context_flags: u32,
     process: usize,
     adapter: *const AdapterContext,
+    raw_device: usize,
     device_session: &SpinLock<Option<NonNull<SessionObject>>>,
     process_list: Option<&ProcessSessionList>,
 ) -> Result<ContextRequest, NTSTATUS> {
@@ -546,6 +605,7 @@ pub(crate) unsafe fn classify_context(
                 context_flags,
                 process,
                 adapter,
+                raw_device,
                 device_session,
                 process_list,
             );
@@ -574,6 +634,7 @@ fn admit_hvc1(
     context_flags: u32,
     process: usize,
     adapter: *const AdapterContext,
+    raw_device: usize,
     device_session: &SpinLock<Option<NonNull<SessionObject>>>,
     process_list: Option<&ProcessSessionList>,
 ) -> Result<ContextRequest, NTSTATUS> {
@@ -625,11 +686,11 @@ fn admit_hvc1(
             crate::ddi::native_render::NR2_QUEUE_CTX_REJECT.fetch_add(1, Ordering::Relaxed);
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
-        // ⚠ A PROVISIONAL SESSION IS ADMITTED, and that is not an oversight.
-        // A queue context's ring index comes from an endpoint, endpoints come
-        // from INIT, and INIT grants none until K11 — so requiring `Live` would
-        // refuse every queue context this package can ever create. It carries
-        // ring 0 and refuses at the host handoff instead (`Nr2NoHost`).
+        // ⚠ A PROVISIONAL SESSION IS ADMITTED, and that remains deliberate.
+        // Mesa may create its K6 legacy queue-shaped contexts before INIT. K11
+        // does not turn those contexts into host queues: only the raw control
+        // context's exact finite HTS1 payload may reach the session transport;
+        // allocation-backed and queue work still refuses in native_render.
         obj.acquire();
         drop(cell);
         crate::ddi::native_render::NR2_QUEUE_CTX.fetch_add(1, Ordering::Relaxed);
@@ -647,7 +708,7 @@ fn admit_hvc1(
         return Err(STATUS_INVALID_DEVICE_REQUEST);
     }
 
-    let Some(session) = new_session(process, adapter) else {
+    let Some(session) = new_session(process, adapter, raw_device) else {
         TS_ALLOC_FAILED.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_NO_MEMORY);
     };
@@ -669,17 +730,33 @@ fn admit_hvc1(
 /// lesson (`adapter/mod.rs:283-312`) is that a multi-KiB value built inline on a
 /// DDI frame is how this driver overflowed a 24-KiB kernel stack twice.
 #[inline(never)]
-fn new_session(process: usize, adapter: *const AdapterContext) -> Option<NonNull<SessionObject>> {
+fn new_session(
+    process: usize,
+    adapter: *const AdapterContext,
+    raw_device: usize,
+) -> Option<NonNull<SessionObject>> {
+    let owner = DeviceOwner::new(raw_device)?;
     let obj = Box::new(SessionObject {
-            model: SpinLock::new(model::TranslationSession::new_provisional(
+        model: SpinLock::new(model::TranslationSession::new_provisional(
             HELIOS_PACKAGE_GENERATION,
             HELIOS_NATIVE_RENDER_CAPSET,
         )),
         process,
         adapter,
+        owner,
+        endpoints: core::array::from_fn(|index| SessionEndpointObject {
+            endpoint_id: index as u32 + 1,
+            ring_index: index as u32 + 1,
+        }),
+        transport: SessionTransport::new(),
+        snapshot_generations: SpinLock::new(model::SessionGenerationSource::new()),
         refs: AtomicU32::new(1),
     });
-    NonNull::new(Box::into_raw(obj))
+    let ptr = NonNull::new(Box::into_raw(obj))?;
+    // SAFETY: the Box has reached its final address and is not published until
+    // this function returns it to the device/session list.
+    unsafe { ptr.as_ref().transport.init_event() };
+    Some(ptr)
 }
 
 fn admit_hqa1(
@@ -701,23 +778,61 @@ fn admit_hqa1(
     };
     // The one permitted search, and it is keyed on the unpredictable capability:
     // a wrong pair finds nothing rather than finding the wrong session.
-    let Some(session) =
-        list.acquire_by_key(process, adapter, packet.session_generation, packet.capability())
-    else {
+    let Some(session) = list.acquire_by_key(
+        process,
+        adapter,
+        packet.session_generation,
+        packet.capability(),
+    ) else {
         TS_ATTACH_NO_SESSION.fetch_add(1, Ordering::Relaxed);
         return Err(STATUS_INVALID_DEVICE_REQUEST);
     };
     // SAFETY: `acquire_by_key` returned it with a reference held, so it is live.
     let obj = unsafe { session.as_ref() };
-    let admission = obj.model.lock().attach(&packet);
+    // A capability from a physically retired transport cannot attach to a
+    // successor merely because its CSPRNG bytes still match. The K11 rundown
+    // and canonical pair-use guards stay held through the model attach, closing
+    // the reset race without turning the process list into a host-operation
+    // lock or adding submit-time discovery.
+    let Some(adapter_ref) = (unsafe { adapter.as_ref() }) else {
+        unsafe { SessionObject::release(session.as_ptr()) };
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    };
+    let Some(admission) =
+        obj.transport
+            .with_live_on_current_transport(adapter_ref, obj.owner, || {
+                obj.model.lock().attach(&packet)
+            })
+    else {
+        crate::ddi::session_transport::K11_STALE_TRANSPORT.fetch_add(1, Ordering::Relaxed);
+        obj.teardown(unsafe { crate::irql::PassiveLevel::assume() });
+        unsafe { SessionObject::release(session.as_ptr()) };
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    };
     match admission {
         Ok(admission) => {
+            let endpoint_index = (admission.endpoint_id - 1) as usize;
+            let Some(endpoint) = obj.endpoints.get(endpoint_index) else {
+                TS_ATTACH_REJECT.fetch_add(1, Ordering::Relaxed);
+                unsafe { SessionObject::release(session.as_ptr()) };
+                return Err(STATUS_INVALID_DEVICE_REQUEST);
+            };
+            // The pure session reserves the complete endpoint/ring namespace
+            // before it becomes Live. The direct platform endpoint must project
+            // that exact private mapping; neither numeric value is returned in
+            // HQA1 or rediscovered when a later Submit arrives.
+            if obj.model.lock().ring_index(admission.endpoint_id) != Ok(endpoint.ring_index()) {
+                let _ = obj.model.lock().detach(admission.context_generation);
+                TS_ATTACH_REJECT.fetch_add(1, Ordering::Relaxed);
+                unsafe { SessionObject::release(session.as_ptr()) };
+                return Err(STATUS_INVALID_DEVICE_REQUEST);
+            }
             TS_ATTACH_OK.fetch_add(1, Ordering::Relaxed);
             Ok(ContextRequest::HeliosAttach {
                 session,
                 session_generation: obj.model.lock().session_generation(),
                 context_generation: admission.context_generation,
-                endpoint_id: admission.endpoint_id,
+                endpoint: NonNull::from(endpoint),
                 kind: admission.kind,
             })
         }
@@ -744,12 +859,38 @@ pub(crate) unsafe fn release_device_session(
 ) {
     // SAFETY: per this function's contract the caller still holds a reference.
     let obj = unsafe { session.as_ref() };
-    obj.model.lock().begin_draining();
-    TS_DRAINED.fetch_add(1, Ordering::Relaxed);
+    // DestroyContext/DestroyDevice are PASSIVE lifetime DDIs. Revoke host work
+    // and destroy the namespace before releasing either the device's or the
+    // role-1 open's strong reference.
+    obj.teardown(unsafe { crate::irql::PassiveLevel::assume() });
     if let Some(list) = process_list {
         list.remove(session);
     }
     // SAFETY: releasing the device's own reference.
+    unsafe { SessionObject::release(session.as_ptr()) };
+}
+
+/// The exact role-1 device-specific open is closing.  Revoke/drain/destroy the
+/// host namespace while its canonical allocation and K2a MDL are still live,
+/// then release the strong reference that open took at bind time.
+///
+/// # Safety
+/// `session` is the reference returned by `bind_reply_pool`; `allocation` is
+/// the same open object's canonical allocation pointer.
+pub(crate) unsafe fn close_reply_pool_binding(session: NonNull<SessionObject>, allocation: usize) {
+    let obj = unsafe { session.as_ref() };
+    if !obj.transport.binding_matches(allocation) {
+        TS_POOL_REJECT.fetch_add(1, Ordering::Relaxed);
+    }
+    // Even an impossible binding mismatch must revoke the exact session before
+    // this open releases its pool reference; mismatch is diagnostic, never an
+    // excuse to invert teardown order.
+    obj.teardown(unsafe { crate::irql::PassiveLevel::assume() });
+    if !(unsafe {
+        crate::ddi::create_allocation::release_k11_reply_pool_session(allocation, session)
+    }) {
+        TS_POOL_REJECT.fetch_add(1, Ordering::Relaxed);
+    }
     unsafe { SessionObject::release(session.as_ptr()) };
 }
 
@@ -807,90 +948,183 @@ pub(crate) fn bind_reply_pool(
     role: Hvm1Role,
     byte_size: u64,
     object_generation: u64,
-) {
-    let Some(session) = *device_session.lock() else {
+    canonical_allocation: usize,
+) -> Option<NonNull<SessionObject>> {
+    let cell = device_session.lock();
+    let Some(session) = *cell else {
         // Not a raw KMT device: every ordinary D3D device's HVM1 allocations land
         // here and are simply not this session's pool. Not counted.
-        return;
+        return None;
     };
     // SAFETY: the device holds a reference for as long as the field is set.
     let obj = unsafe { session.as_ref() };
-    match obj
+    // The canonical allocation admits one exact SessionObject, not merely one
+    // context id. This closes the cross-session shared-pool case before either
+    // the model or host-transport binding mutates.
+    if !(unsafe {
+        crate::ddi::create_allocation::claim_k11_reply_pool_session(canonical_allocation, session)
+    }) {
+        drop(cell);
+        TS_POOL_REJECT.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    let transport_bound = obj.transport.bind_reply_pool(canonical_allocation);
+    let model_bound = obj
         .model
         .lock()
         .bind_reply_pool(role, byte_size, object_generation)
-    {
-        Ok(()) => TS_POOL_BOUND.fetch_add(1, Ordering::Relaxed),
-        Err(_) => TS_POOL_REJECT.fetch_add(1, Ordering::Relaxed),
+        .is_ok();
+    if transport_bound && model_bound {
+        // The device-specific role-1 open owns this reference until
+        // CloseAllocation, which is the exact backing lifetime K11 needs.
+        obj.acquire();
+        drop(cell);
+        TS_POOL_BOUND.fetch_add(1, Ordering::Relaxed);
+        return Some(session);
+    }
+    // Give the canonical allocation claim back. The two state machines should
+    // either both advance or neither; an asymmetric advance cannot be rolled
+    // back and therefore drains this exact session.
+    let _ = unsafe {
+        crate::ddi::create_allocation::release_k11_reply_pool_session(canonical_allocation, session)
     };
+    if transport_bound != model_bound {
+        obj.begin_draining_once();
+    }
+    drop(cell);
+    TS_POOL_REJECT.fetch_add(1, Ordering::Relaxed);
+    None
 }
 
 // ── The INIT seam ────────────────────────────────────────────────────────────
 
 /// Complete the finite HTS1 `INIT` and produce the reply bytes.
 ///
-/// ⚠ CROSS-LANE SEAM, and this unit's stated unreachable surface: INIT arrives as
-/// an HNR2 control Render, and `DxgkDdiRender`'s HNR2 decode is **K6**
-/// (`ddi/native_render.rs`, absent). K6 calls this with the 32 INIT bytes it
-/// copied and writes the returned 56 bytes into the checked-out reply slot.
-///
-/// ⛔ The one thing this cannot yet do is create the host Venus context and
-/// `VkInstance` (§10.4:1207-1208) — that is K11's transport rewrite. It is
-/// therefore refused rather than faked: a session that reports a generation
-/// without a host context behind it would make every later HQA1 admit onto
-/// nothing.
+/// INIT arrives through K6's HNR2 control Render as exactly 32 copied HTS1
+/// bytes. K11 creates a private stock-Venus context and `VkInstance`, validates
+/// the real finite host reply, then this function publishes the 56-byte HTS1
+/// reply behind an HVR1 header in the exact checked-out role-1 slot. No
+/// generation, capability, or endpoint capacity becomes live before that host
+/// initialization and publication sequence succeeds.
+fn reject_session_init(
+    obj: &SessionObject,
+    status: NTSTATUS,
+) -> Result<[u8; HTS1_REPLY_BYTES], NTSTATUS> {
+    // A classified INIT is one-shot: close model admission immediately so no
+    // later packet can reuse a half-failed session. The Render caller still
+    // owns one checked-out reply slot, so it aborts that exact ownership before
+    // `finish_failed_session_init` drains and destroys the host namespace.
+    obj.begin_draining_once();
+    TS_INIT_REJECT.fetch_add(1, Ordering::Relaxed);
+    Err(status)
+}
+
 pub(crate) fn session_init(
     session: NonNull<SessionObject>,
     request: &[u8],
+    reply_offset: u64,
+    reply_capacity_bytes: u64,
+    slot_generation: u64,
+    batch_token: u64,
 ) -> Result<[u8; HTS1_REPLY_BYTES], NTSTATUS> {
     use helios_protocol::translation_session::HeliosTranslationSessionInitV1;
 
     // SAFETY: the caller holds a reference to the session for this call.
     let obj = unsafe { session.as_ref() };
     if request.len() != core::mem::size_of::<HeliosTranslationSessionInitV1>() {
-        TS_INIT_REJECT.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
+        return reject_session_init(obj, STATUS_INVALID_PARAMETER);
     }
     let Ok(record) = bytemuck::try_pod_read_unaligned::<HeliosTranslationSessionInitV1>(request)
     else {
-        TS_INIT_REJECT.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
+        return reject_session_init(obj, STATUS_INVALID_PARAMETER);
     };
-    let requested = match obj.model.lock().admit_init(&record) {
+    // End the short model guard before any rejection tears the session down.
+    // A match directly on `obj.model.lock()` could retain its temporary guard
+    // through the error arm and deadlock `begin_draining_once`.
+    let init_admission = { obj.model.lock().admit_init(&record) };
+    let requested = match init_admission {
         Ok(requested) => requested,
         Err(_) => {
-            TS_INIT_REJECT.fetch_add(1, Ordering::Relaxed);
-            return Err(STATUS_INVALID_PARAMETER);
+            return reject_session_init(obj, STATUS_INVALID_PARAMETER);
         }
     };
-    let Some(capability) = mint_capability() else {
-        TS_NO_CSPRNG.fetch_add(1, Ordering::Relaxed);
-        TS_INIT_REJECT.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_DEVICE_NOT_READY);
+    let pool_generation = { obj.model.lock().reply_pool_generation() };
+    let Some(expected_pool_generation) = pool_generation else {
+        return reject_session_init(obj, STATUS_DEVICE_NOT_READY);
     };
-    let Ok(generation) = SESSION_GENERATION.lock().mint() else {
-        TS_INIT_REJECT.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    let Some(adapter) = (unsafe { obj.adapter.as_ref() }) else {
+        return reject_session_init(obj, STATUS_DEVICE_NOT_READY);
     };
-    // ⛔ The host Venus context/`VkInstance` this INIT is supposed to create is
-    // K11's. Until it exists the granted endpoint capacity is zero, which
-    // `complete_init` refuses — loudly, rather than admitting a session with no
-    // host object behind it.
-    let granted = 0u32;
-    match obj
-        .model
-        .lock()
-        .complete_init(requested, granted, generation, capability)
-    {
-        Ok(reply) => {
-            TS_INIT_OK.fetch_add(1, Ordering::Relaxed);
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    let initialized = obj.transport.initialize(
+        passive,
+        adapter,
+        obj.owner,
+        reply_offset,
+        reply_capacity_bytes,
+        expected_pool_generation,
+        HTS1_REPLY_BYTES as u64,
+        |facts, host| {
+            let Some(capability) = mint_capability() else {
+                TS_NO_CSPRNG.fetch_add(1, Ordering::Relaxed);
+                return Err(STATUS_DEVICE_NOT_READY);
+            };
+            let generation = SESSION_GENERATION
+                .lock()
+                .mint()
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+            let snapshot_generation = obj
+                .snapshot_generations
+                .lock()
+                .mint()
+                .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+            // K11 grants the finite model-admitted capacity only after the
+            // distinct host context, fixed private SHM reply target, and real
+            // host vkCreateInstance reply have all completed. K2a has not been
+            // attached to the renderer; it is only the HVR1 publication below.
+            let reply = obj
+                .model
+                .lock()
+                .complete_init(requested, requested, generation, capability)
+                .map_err(|_| STATUS_DEVICE_NOT_READY)?;
+            let hvr1 = helios_protocol::native_render::HeliosVenusReplyV1 {
+                magic: helios_protocol::native_render::HELIOS_HVR1_MAGIC,
+                version: helios_protocol::native_render::HELIOS_HVR1_VERSION,
+                header_size: helios_protocol::native_render::HELIOS_HVR1_HEADER_SIZE,
+                package_generation: HELIOS_PACKAGE_GENERATION,
+                session_generation: generation,
+                slot_generation,
+                batch_token,
+                snapshot_generation,
+                opcode: host.opcode,
+                status: host.status,
+                total_bytes: HTS1_REPLY_BYTES as u64,
+                chunk_offset: 0,
+                chunk_bytes: HTS1_REPLY_BYTES as u32,
+                flags: helios_protocol::native_render::HELIOS_HVR1_FLAG_FINAL,
+            };
             let mut out = [0u8; HTS1_REPLY_BYTES];
             out.copy_from_slice(bytemuck::bytes_of(&reply));
+            crate::ddi::session_transport::SessionTransport::publish_hvr1(
+                facts,
+                reply_offset,
+                reply_capacity_bytes,
+                &hvr1,
+                &out,
+            )?;
             Ok(out)
+        },
+    );
+    match initialized {
+        Ok(reply) => {
+            TS_INIT_OK.fetch_add(1, Ordering::Relaxed);
+            Ok(reply)
         }
-        Err(_) => {
-            TS_INIT_REJECT.fetch_add(1, Ordering::Relaxed);
-            Err(STATUS_DEVICE_NOT_READY)
+        Err(status) => {
+            // No retry may reuse a session whose host initialization began.
+            // This also invalidates a model capability if a publication
+            // invariant ever failed after `complete_init`.
+            reject_session_init(obj, status)
         }
     }
 }
@@ -915,6 +1149,46 @@ pub(crate) fn reply_pool_generation(session: NonNull<SessionObject>) -> Option<u
     generation
 }
 
+/// Run one already-host-completed HVC1 admission while this exact session and
+/// canonical transport pair remain current.
+///
+/// This is the SubmitCommand edge, so it performs no discovery and starts no
+/// host work. The context supplies its direct strong session reference; the
+/// embedded transport retains both rundown guards through `operation`, which
+/// admits the exact context-local fence but performs no OS callback. The caller
+/// owns the adapter's fixed K11 completion-rundown guard across this operation
+/// and the later exact notification, so reset closes and joins the complete
+/// interval before abandoning its scheduler epoch. The transport guards end
+/// before `DxgkCbSynchronizeExecution`: a same-context Render may be tearing
+/// down this already-terminal host session while the OS callback waits for that
+/// Render to return. Everything here is a bounded spinlock/atomic projection
+/// legal at DISPATCH_LEVEL.
+pub(crate) fn with_current_host_submission<R>(
+    session: NonNull<SessionObject>,
+    operation: impl FnOnce() -> R,
+) -> Option<R> {
+    // SAFETY: the HVC1 context owns a strong reference for this call.
+    let obj = unsafe { session.as_ref() };
+    // SAFETY: the adapter outlives every context on it. No pointer or identity
+    // leaves this direct-reference validation edge.
+    let Some(adapter) = (unsafe { obj.adapter.as_ref() }) else {
+        return None;
+    };
+    obj.transport
+        .with_live_on_current_transport(adapter, obj.owner, || {
+            // Check the model only after both rundown guards are held. If
+            // teardown already published Draining this work is new and must be
+            // refused; if teardown begins after this check it waits for the
+            // operation guard and therefore follows the exact completion.
+            if obj.model.lock().phase() != model::SessionPhase::Live {
+                None
+            } else {
+                Some(operation())
+            }
+        })
+        .flatten()
+}
+
 /// Admit one HNR2 control Render and check out its reply slot.
 pub(crate) fn admit_control_render(
     session: NonNull<SessionObject>,
@@ -934,12 +1208,11 @@ pub(crate) fn admit_control_render(
     }
 }
 
-/// Give a checked-out reply slot back.
+/// Retire a checked-out slot after its real HVR1 reply was published.
 ///
-/// ⛔ PUBLISH THEN RETIRE, and both on the refusal path. `retire_slot` requires
-/// `Published`, and a slot left `InFlight` is permanent: A1 takes the FIRST idle
-/// slot for every serial transaction, so one abandoned slot 0 makes every later
-/// control Render on the session fail `ControlRenderSlotBusy`.
+/// ⛔ PUBLISH THEN RETIRE. `retire_slot` requires `Published`, and this path is
+/// used only after K11 returned success with actual host/HVR1 bytes. A refusal
+/// uses [`abort_control_slot`] and therefore never fabricates publication.
 pub(crate) fn release_control_slot(
     session: NonNull<SessionObject>,
     slot_index: usize,
@@ -948,7 +1221,9 @@ pub(crate) fn release_control_slot(
     // SAFETY: as above.
     let obj = unsafe { session.as_ref() };
     let mut model = obj.model.lock();
-    // A zero C51 value is honest: no host job ever ran for this slot.
+    // The K11 host operation is already terminal before publication.  C51 is
+    // the ordinary user-visible ordering edge and is not a KMD-owned timeline,
+    // so no SubmissionFenceId value is forged into this model slot.
     if model.publish_slot(slot_index, slot_generation, 0).is_ok()
         && model.retire_slot(slot_index, slot_generation).is_ok()
     {
@@ -958,6 +1233,37 @@ pub(crate) fn release_control_slot(
     }
     drop(model);
     TS_SLOT_STUCK.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Give a refused control Render's exact slot back without marking a reply
+/// published. This remains legal after failed INIT closed session admission.
+pub(crate) fn abort_control_slot(
+    session: NonNull<SessionObject>,
+    slot_index: usize,
+    slot_generation: u64,
+) {
+    // SAFETY: the HVC1 context owns a strong reference for this call.
+    let obj = unsafe { session.as_ref() };
+    if obj
+        .model
+        .lock()
+        .abort_slot(slot_index, slot_generation)
+        .is_ok()
+    {
+        TS_SLOT_RELEASED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        TS_SLOT_STUCK.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Finish a failed INIT after its reply-slot ownership has been cancelled.
+/// Admission was already closed by [`reject_session_init`]; this PASSIVE edge
+/// drains exact host work and destroys the namespace while the role-1 backing
+/// reference is still retained by its ordinary open.
+pub(crate) fn finish_failed_session_init(session: NonNull<SessionObject>) {
+    // SAFETY: the HVC1 context owns a strong reference for this call.
+    let obj = unsafe { session.as_ref() };
+    obj.teardown(unsafe { crate::irql::PassiveLevel::assume() });
 }
 
 /// A stable code for the control-Render refusals, so `TsCtlRej` names which

@@ -615,6 +615,369 @@ impl Writer {
     }
 }
 
+// ── K11 finite per-session host transport ───────────────────────────────────
+
+/// Pure, fixed-capacity pieces of K11's one allowed host operation.  The WDK
+/// half owns context/resource lifetimes and the actual control roundtrip; this
+/// module pins the byte stream, reply range, and raw host evidence on Linux.
+pub mod session_transport {
+    use super::{scanout_lease::fence_is_forward, Writer, CMD_FLAG_GENERATE_REPLY};
+
+    pub const CMD_CREATE_INSTANCE: u32 = 0;
+    pub const CMD_DESTROY_INSTANCE: u32 = 1;
+    pub const CMD_SET_REPLY_COMMAND_STREAM_MESA: u32 = 178;
+    pub const ST_INSTANCE_CREATE_INFO: i32 = 1;
+    pub const HOST_CREATE_INSTANCE_REPLY_BYTES: u64 = 24;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ReplyRange {
+        pub payload_offset: u64,
+        pub final_end: u64,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ReplyRangeRefusal {
+        ZeroCapacity,
+        SlotMisaligned,
+        CapacityExceedsSlot,
+        ArithmeticOverflow,
+        RangeExceedsPool,
+        FinalReplyExceedsRange,
+    }
+
+    /// Admit the one physical K2a slot range used for the fixed HVR1 header and
+    /// final HTS1 payload.  The raw renderer reply belongs to K11's private SHM
+    /// resource and is deliberately absent from this user-visible range model.
+    pub fn admit_reply_range(
+        pool_bytes: u64,
+        slot_bytes: u64,
+        reply_offset: u64,
+        reply_capacity: u64,
+        hvr1_header_bytes: u64,
+        final_payload_bytes: u64,
+    ) -> Result<ReplyRange, ReplyRangeRefusal> {
+        if reply_capacity == 0 {
+            return Err(ReplyRangeRefusal::ZeroCapacity);
+        }
+        if slot_bytes == 0 || reply_offset % slot_bytes != 0 {
+            return Err(ReplyRangeRefusal::SlotMisaligned);
+        }
+        if reply_capacity > slot_bytes {
+            return Err(ReplyRangeRefusal::CapacityExceedsSlot);
+        }
+        let reply_end = reply_offset
+            .checked_add(reply_capacity)
+            .ok_or(ReplyRangeRefusal::ArithmeticOverflow)?;
+        if reply_end > pool_bytes {
+            return Err(ReplyRangeRefusal::RangeExceedsPool);
+        }
+        let payload_offset = reply_offset
+            .checked_add(hvr1_header_bytes)
+            .ok_or(ReplyRangeRefusal::ArithmeticOverflow)?;
+        let final_end = payload_offset
+            .checked_add(final_payload_bytes)
+            .ok_or(ReplyRangeRefusal::ArithmeticOverflow)?;
+        if final_end > reply_end {
+            return Err(ReplyRangeRefusal::FinalReplyExceedsRange);
+        }
+        Ok(ReplyRange {
+            payload_offset,
+            final_end,
+        })
+    }
+
+    /// Select the one fixed KMD-private SHM reply target.  This is a standalone
+    /// direct submit, matching Mesa's canonical Venus setup sequence: the
+    /// renderer must finish installing the target before a reply-generating
+    /// command is decoded.
+    pub fn encode_set_reply_command_stream(
+        reply_resource_id: u32,
+        reply_offset: u64,
+        reply_bytes: u64,
+    ) -> Writer {
+        let mut stream = Writer::new();
+        stream.header(CMD_SET_REPLY_COMMAND_STREAM_MESA, 0);
+        stream.count(true);
+        stream.u32(reply_resource_id);
+        stream.u64(reply_offset);
+        stream.u64(reply_bytes);
+        stream
+    }
+
+    /// Encode K11's one allowlisted reply-generating host operation.  Reply
+    /// target setup is intentionally not repeated or combined with this stream.
+    pub fn encode_create_instance(instance_handle: u64) -> Writer {
+        let mut stream = Writer::new();
+        stream.header(CMD_CREATE_INSTANCE, CMD_FLAG_GENERATE_REPLY);
+        stream.count(true);
+        stream.i32(ST_INSTANCE_CREATE_INFO);
+        stream.u64(0); // pNext
+        stream.u32(0); // flags
+        stream.count(false); // pApplicationInfo
+        stream.u32(0); // enabledLayerCount
+        stream.count(false); // ppEnabledLayerNames
+        stream.u32(0); // enabledExtensionCount
+        stream.count(false); // ppEnabledExtensionNames
+        stream.count(false); // pAllocator
+        stream.count(true); // pInstance
+        stream.u64(instance_handle);
+        stream
+    }
+
+    pub fn encode_destroy_instance(instance_handle: u64) -> Writer {
+        let mut stream = Writer::new();
+        stream.header(CMD_DESTROY_INSTANCE, 0);
+        stream.u64(instance_handle);
+        stream.count(false); // pAllocator
+        stream
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct HostInitEvidence {
+        pub opcode: u32,
+        pub status: i32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HostReplyRefusal {
+        Opcode { found: u32 },
+        Status { found: i32 },
+        PointerCount { found: u64 },
+        Instance { found: u64 },
+    }
+
+    /// Fixed per-HVC1-context record of the exact WDDM submissions whose K11
+    /// host operation had already reached a terminal reply before
+    /// `DxgkDdiSubmitCommand` arrived.  This is one scalar state machine, never
+    /// an adapter queue or a reusable lookup token.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct HostSubmissionState {
+        observed: bool,
+        last_fence: u32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HostSubmissionRefusal {
+        Duplicate { fence: u32 },
+        WentBackward { last: u32, found: u32 },
+    }
+
+    impl HostSubmissionState {
+        pub const fn new() -> Self {
+            Self {
+                observed: false,
+                last_fence: 0,
+            }
+        }
+
+        pub const fn last_fence(&self) -> Option<u32> {
+            if self.observed {
+                Some(self.last_fence)
+            } else {
+                None
+            }
+        }
+
+        /// Admit only a first, forward, or exact scheduler-marked resubmission.
+        /// The first value may legitimately be zero after WDDM's u32 wrap, so
+        /// presence is represented separately rather than by a sentinel.
+        pub fn admit_host_completion(
+            &mut self,
+            fence: u32,
+            resubmission: bool,
+        ) -> Result<(), HostSubmissionRefusal> {
+            if !self.observed {
+                self.observed = true;
+                self.last_fence = fence;
+                return Ok(());
+            }
+            if fence == self.last_fence {
+                return if resubmission {
+                    Ok(())
+                } else {
+                    Err(HostSubmissionRefusal::Duplicate { fence })
+                };
+            }
+            if !fence_is_forward(self.last_fence, fence) {
+                return Err(HostSubmissionRefusal::WentBackward {
+                    last: self.last_fence,
+                    found: fence,
+                });
+            }
+            self.last_fence = fence;
+            Ok(())
+        }
+    }
+
+    pub fn validate_create_instance_reply(
+        raw: &[u8; HOST_CREATE_INSTANCE_REPLY_BYTES as usize],
+        expected_instance: u64,
+    ) -> Result<HostInitEvidence, HostReplyRefusal> {
+        let opcode = u32::from_le_bytes(raw[0..4].try_into().unwrap());
+        if opcode != CMD_CREATE_INSTANCE {
+            return Err(HostReplyRefusal::Opcode { found: opcode });
+        }
+        let status = i32::from_le_bytes(raw[4..8].try_into().unwrap());
+        if status != 0 {
+            return Err(HostReplyRefusal::Status { found: status });
+        }
+        let pointer_count = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+        if pointer_count != 1 {
+            return Err(HostReplyRefusal::PointerCount {
+                found: pointer_count,
+            });
+        }
+        let instance = u64::from_le_bytes(raw[16..24].try_into().unwrap());
+        if instance != expected_instance {
+            return Err(HostReplyRefusal::Instance { found: instance });
+        }
+        Ok(HostInitEvidence { opcode, status })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const POOL: u64 = 4 * 1024 * 1024;
+        const SLOT: u64 = 1024 * 1024;
+        const HVR1: u64 = 80;
+
+        #[test]
+        fn reply_target_and_create_are_two_bounded_direct_streams() {
+            let target = encode_set_reply_command_stream(
+                0x1122_3344,
+                0x0102_0304_0506_0708,
+                HOST_CREATE_INSTANCE_REPLY_BYTES,
+            );
+            let bytes = target.finished().unwrap();
+            assert_eq!(bytes.len(), 36);
+            assert_eq!(&bytes[0..8], &[178, 0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(&bytes[8..16], &1u64.to_le_bytes());
+            assert_eq!(&bytes[16..20], &0x1122_3344u32.to_le_bytes());
+            assert_eq!(&bytes[20..28], &0x0102_0304_0506_0708u64.to_le_bytes());
+            assert_eq!(&bytes[28..36], &24u64.to_le_bytes());
+
+            let stream = encode_create_instance(0x8877_6655_4433_2211);
+            let bytes = stream.finished().unwrap();
+            assert_eq!(bytes.len(), 88);
+            assert_eq!(&bytes[0..8], &[0, 0, 0, 0, 1, 0, 0, 0]);
+            assert_eq!(&bytes[80..88], &0x8877_6655_4433_2211u64.to_le_bytes());
+        }
+
+        #[test]
+        fn destroy_stream_is_exact_and_replyless() {
+            let stream = encode_destroy_instance(0x8877_6655_4433_2211);
+            let bytes = stream.finished().unwrap();
+            assert_eq!(bytes.len(), 24);
+            assert_eq!(&bytes[0..8], &[1, 0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(&bytes[8..16], &0x8877_6655_4433_2211u64.to_le_bytes());
+            assert_eq!(&bytes[16..24], &0u64.to_le_bytes());
+        }
+
+        #[test]
+        fn all_four_physical_slots_admit_the_exact_finite_reply() {
+            for slot in 0..4u64 {
+                let offset = slot * SLOT;
+                let range = admit_reply_range(POOL, SLOT, offset, HVR1 + 4096, HVR1, 56)
+                    .expect("one exact slot");
+                assert_eq!(range.payload_offset, offset + HVR1);
+                assert_eq!(range.final_end, offset + HVR1 + 56);
+            }
+        }
+
+        #[test]
+        fn range_refuses_zero_unaligned_oversize_overflow_and_short_capacity() {
+            assert_eq!(
+                admit_reply_range(POOL, SLOT, 0, 0, HVR1, 56),
+                Err(ReplyRangeRefusal::ZeroCapacity)
+            );
+            assert_eq!(
+                admit_reply_range(POOL, SLOT, 1, HVR1 + 56, HVR1, 56),
+                Err(ReplyRangeRefusal::SlotMisaligned)
+            );
+            assert_eq!(
+                admit_reply_range(POOL, SLOT, 0, SLOT + 1, HVR1, 56),
+                Err(ReplyRangeRefusal::CapacityExceedsSlot)
+            );
+            assert_eq!(
+                admit_reply_range(POOL, SLOT, u64::MAX - SLOT + 1, SLOT, HVR1, 56),
+                Err(ReplyRangeRefusal::ArithmeticOverflow)
+            );
+            assert_eq!(
+                admit_reply_range(POOL, SLOT, POOL, HVR1 + 56, HVR1, 56),
+                Err(ReplyRangeRefusal::RangeExceedsPool)
+            );
+            assert_eq!(
+                admit_reply_range(POOL, SLOT, 0, HVR1 + 24, HVR1, 56),
+                Err(ReplyRangeRefusal::FinalReplyExceedsRange)
+            );
+        }
+
+        fn reply(opcode: u32, status: i32, pointer_count: u64, instance: u64) -> [u8; 24] {
+            let mut raw = [0u8; 24];
+            raw[0..4].copy_from_slice(&opcode.to_le_bytes());
+            raw[4..8].copy_from_slice(&status.to_le_bytes());
+            raw[8..16].copy_from_slice(&pointer_count.to_le_bytes());
+            raw[16..24].copy_from_slice(&instance.to_le_bytes());
+            raw
+        }
+
+        #[test]
+        fn only_the_exact_host_create_reply_is_evidence() {
+            let expected = 0x51;
+            assert_eq!(
+                validate_create_instance_reply(&reply(0, 0, 1, expected), expected),
+                Ok(HostInitEvidence {
+                    opcode: 0,
+                    status: 0
+                })
+            );
+            assert!(matches!(
+                validate_create_instance_reply(&reply(2, 0, 1, expected), expected),
+                Err(HostReplyRefusal::Opcode { .. })
+            ));
+            assert!(matches!(
+                validate_create_instance_reply(&reply(0, -4, 1, expected), expected),
+                Err(HostReplyRefusal::Status { .. })
+            ));
+            assert!(matches!(
+                validate_create_instance_reply(&reply(0, 0, 0, expected), expected),
+                Err(HostReplyRefusal::PointerCount { .. })
+            ));
+            assert!(matches!(
+                validate_create_instance_reply(&reply(0, 0, 1, expected + 1), expected),
+                Err(HostReplyRefusal::Instance { .. })
+            ));
+        }
+
+        #[test]
+        fn host_submission_state_is_one_context_local_forward_watermark() {
+            let mut state = HostSubmissionState::new();
+            assert_eq!(state.last_fence(), None);
+            assert_eq!(state.admit_host_completion(0, false), Ok(()));
+            assert_eq!(state.last_fence(), Some(0));
+            assert_eq!(
+                state.admit_host_completion(0, false),
+                Err(HostSubmissionRefusal::Duplicate { fence: 0 })
+            );
+            assert_eq!(state.admit_host_completion(0, true), Ok(()));
+            assert_eq!(state.admit_host_completion(7, false), Ok(()));
+            assert_eq!(
+                state.admit_host_completion(6, true),
+                Err(HostSubmissionRefusal::WentBackward { last: 7, found: 6 })
+            );
+        }
+
+        #[test]
+        fn host_submission_state_accepts_wrap_without_a_zero_sentinel() {
+            let mut state = HostSubmissionState::new();
+            assert_eq!(state.admit_host_completion(u32::MAX, false), Ok(()));
+            assert_eq!(state.admit_host_completion(0, false), Ok(()));
+            assert_eq!(state.last_fence(), Some(0));
+        }
+    }
+}
+
 // ── Venus VkImageCreateInfo / VkMemoryAllocateInfo encoding ───────────────────
 //
 // R1002. Three image encoders and five memory encoders each re-emitted the whole
@@ -8355,8 +8718,8 @@ pub mod translation_session {
         admit_snapshot, Hnr2CapacityRefusal, HELIOS_HVR1_MAX_SNAPSHOT_BYTES,
     };
     use helios_protocol::translation_session::{
-        admit_host_dispatch_enqueue, admit_new_session, admit_ring_index, check_generation_match,
-        AttachRefusal, CapabilityRefusal, GenerationField, GenerationRefusal, HeliosAttachAdmission,
+        admit_host_dispatch_enqueue, admit_new_session, check_generation_match, AttachRefusal,
+        CapabilityRefusal, GenerationField, GenerationRefusal, HeliosAttachAdmission,
         HeliosAttachExpectation, HeliosCapacityLimit, HeliosCapacityRefusal, HeliosEngineClass,
         HeliosQueueAttachV1, HeliosSessionAdmission, HeliosSessionCapability,
         HeliosTranslationEndpointV1, HeliosTranslationSessionInitV1,
@@ -8440,12 +8803,9 @@ pub mod translation_session {
 
         /// An endpoint ordinal outside `1..=endpoint_capacity`.
         EndpointOutOfRange { found: u32, capacity: u32 },
-        /// An endpoint was reached before a host ring index was bound to it. The
-        /// binder is K6/K11 — see [`TranslationSession::bind_ring`].
+        /// An endpoint was reached before INIT reserved its fixed host ring.
+        /// K11 reserves every admitted nonzero ring before publishing capacity.
         EndpointRingUnassigned { endpoint_id: u32 },
-        /// A host ring index is already bound, to this endpoint or another one.
-        /// Invariant 12 forbids recycling a ring while any job or reference lives.
-        EndpointRingAlreadyTaken { ring_index: u32 },
         /// The endpoint's host-dispatch FIFO has nothing to retire — an
         /// accounting bug, refused rather than wrapped.
         HostDispatchFifoUnderflow { endpoint_id: u32 },
@@ -8707,6 +9067,12 @@ pub mod translation_session {
         /// `None` for a reply-less control Render.
         pub slot_index: Option<usize>,
         pub slot_generation: u64,
+        /// Exact range this admitted slot owns. Re-exported from the model so
+        /// the K11 producer never re-reads or re-derives wire offsets after
+        /// admission.
+        pub reply_offset: u64,
+        pub reply_capacity_bytes: u64,
+        pub batch_token: u64,
     }
 
     // ── the session ───────────────────────────────────────────────────────────
@@ -8901,15 +9267,23 @@ pub mod translation_session {
                 )
                 .map_err(SessionRefusal::Init)?;
 
-            // ⛔ No ring index is minted here. An endpoint ordinal is not a ring
-            // (`translation_session.rs:632-635`), and line 1727 gives the ring to a
-            // *queue context* bound to a real VkQueue — which a record-only session
-            // never creates. Minting one per granted ordinal would burn the 255-entry
-            // wire ceiling on endpoints that never materialise. [`Self::bind_ring`]
-            // is the seam.
+            // K11 reserves the complete bounded endpoint/ring namespace before
+            // publishing a nonzero capacity. Ring zero remains the control
+            // timeline; each granted endpoint owns the matching nonzero ring in
+            // this private host context. The same numeric indices may appear in
+            // another session because that session owns a distinct host context.
+            // Descriptors remain undeclared until the exact HQA1 attach supplies
+            // the physical queue topology, and K11 still executes no queue work.
+            let mut endpoints = [SessionEndpoint::UNASSIGNED; ENDPOINT_SLOTS];
+            let mut i = 0usize;
+            while i < admission.endpoint_capacity as usize {
+                endpoints[i].ring_index = i as u32 + 1;
+                i += 1;
+            }
             self.session_generation = admission.session_generation;
             self.capability = admission.capability;
             self.endpoint_capacity = admission.endpoint_capacity;
+            self.endpoints = endpoints;
             self.phase = SessionPhase::Live;
             Ok(reply)
         }
@@ -8939,57 +9313,6 @@ pub mod translation_session {
                 return Err(SessionRefusal::EndpointRingUnassigned { endpoint_id });
             }
             Ok(endpoint.ring_index)
-        }
-
-        /// Bind the unique nonzero host `INFO_RING_IDX` for `endpoint_id`, once.
-        ///
-        /// CROSS-LANE SEAM: the caller is whichever of K6/K11 creates the real
-        /// host queue — line 1727 gives the ring to a queue context bound to a
-        /// real VkQueue, and nothing in K5 creates one. Rebinding is refused
-        /// because invariant 12 forbids recycling a ring before every endpoint
-        /// job and context reference retires.
-        pub fn bind_ring(&mut self, endpoint_id: u32, ring_index: u32) -> Result<(), SessionRefusal> {
-            if self.phase == SessionPhase::Draining {
-                return Err(SessionRefusal::SessionDraining);
-            }
-            admit_ring_index(ring_index).map_err(SessionRefusal::Capacity)?;
-            if ring_index == 0 {
-                // Ring 0 is the CPU/decode-only control ring; no endpoint owns it.
-                return Err(SessionRefusal::EndpointRingUnassigned { endpoint_id });
-            }
-            let capacity = self.endpoint_capacity;
-            if endpoint_id == 0 || endpoint_id > capacity {
-                return Err(SessionRefusal::EndpointOutOfRange {
-                    found: endpoint_id,
-                    capacity,
-                });
-            }
-            let mut taken = false;
-            let mut i = 0usize;
-            while i < ENDPOINT_SLOTS {
-                if let Some(other) = self.endpoints.get(i) {
-                    if other.ring_index == ring_index && i != (endpoint_id - 1) as usize {
-                        taken = true;
-                    }
-                }
-                i += 1;
-            }
-            if taken {
-                return Err(SessionRefusal::EndpointRingAlreadyTaken { ring_index });
-            }
-            let Some(endpoint) = self.endpoints.get_mut((endpoint_id - 1) as usize) else {
-                return Err(SessionRefusal::EndpointOutOfRange {
-                    found: endpoint_id,
-                    capacity,
-                });
-            };
-            if endpoint.ring_index != 0 {
-                return Err(SessionRefusal::EndpointRingAlreadyTaken {
-                    ring_index: endpoint.ring_index,
-                });
-            }
-            endpoint.ring_index = ring_index;
-            Ok(())
         }
 
         /// Assign the next arrival-order host-dispatch serial on `endpoint_id`.
@@ -9234,6 +9557,9 @@ pub mod translation_session {
                 return Ok(ControlRenderAdmission {
                     slot_index: None,
                     slot_generation: 0,
+                    reply_offset: 0,
+                    reply_capacity_bytes: 0,
+                    batch_token: request.batch_token,
                 });
             }
 
@@ -9293,6 +9619,9 @@ pub mod translation_session {
             Ok(ControlRenderAdmission {
                 slot_index: Some(index),
                 slot_generation: request.reply_slot_generation,
+                reply_offset: request.reply_offset,
+                reply_capacity_bytes: request.reply_capacity_bytes,
+                batch_token: request.batch_token,
             })
         }
 
@@ -9332,6 +9661,36 @@ pub mod translation_session {
             if slot.state != SlotState::Published {
                 return Err(SessionRefusal::ControlRenderSlotBusy {
                     in_flight: slot.generation,
+                });
+            }
+            *slot = ReplySlot {
+                retired_generation: slot_generation,
+                ..ReplySlot::IDLE
+            };
+            Ok(())
+        }
+
+        /// Cancel an admitted reply without ever publishing a completion.
+        ///
+        /// Unlike [`Self::publish_slot`] and [`Self::retire_slot`], this release
+        /// remains legal after [`Self::begin_draining`]: a failed INIT first
+        /// closes admission, then must give back the exact slot it already owns
+        /// before the platform destroys the host namespace.  The generation is
+        /// still retired so a non-terminal refusal cannot replay it.
+        pub fn abort_slot(
+            &mut self,
+            slot_index: usize,
+            slot_generation: u64,
+        ) -> Result<(), SessionRefusal> {
+            let Some(pool) = self.pool.as_mut() else {
+                return Err(SessionRefusal::ReplyPoolNotBound);
+            };
+            let Some(slot) = pool.slots.get_mut(slot_index) else {
+                return Err(SessionRefusal::ControlRenderSlotIndexOutOfRange { found: slot_index });
+            };
+            if slot.state != SlotState::InFlight || slot.generation != slot_generation {
+                return Err(SessionRefusal::ControlRenderSlotGenerationUnknown {
+                    found: slot_generation,
                 });
             }
             *slot = ReplySlot {
@@ -9910,7 +10269,6 @@ pub mod translation_session {
             // `detach` for attached contexts AFTER the control context has already
             // begun draining, and dxgkrnl does not order the two.
             let mut s = live_session(4);
-            s.bind_ring(1, 1).unwrap();
             s.attach(&attach_packet(1, 10)).unwrap();
             s.enqueue_host_dispatch(1).unwrap();
             s.admit_snapshot_bytes(64).unwrap();
@@ -9948,7 +10306,7 @@ pub mod translation_session {
         }
 
         #[test]
-        fn draining_never_marks_a_reply_complete() {
+        fn draining_never_marks_a_reply_complete_but_exact_abort_still_releases_ownership() {
             let mut s = live_session(4);
             let admitted = s.admit_control_render(&reply_request(0, 1)).unwrap();
             s.begin_draining();
@@ -9959,6 +10317,12 @@ pub mod translation_session {
                 s.publish_slot(0, 1, 5),
                 Err(SessionRefusal::SessionDraining)
             );
+            s.abort_slot(0, 1)
+                .expect("draining cancels the exact in-flight slot");
+            let slot = s.pool().unwrap().slots[admitted.slot_index.unwrap()];
+            assert_eq!(slot.state, SlotState::Idle);
+            assert_eq!(slot.retired_generation, 1);
+            assert_eq!(slot.c51_value, 0);
         }
 
         // ── the control-context Render ────────────────────────────────────
@@ -10014,7 +10378,10 @@ pub mod translation_session {
                 s.admit_control_render(&bare),
                 Ok(ControlRenderAdmission {
                     slot_index: None,
-                    slot_generation: 0
+                    slot_generation: 0,
+                    reply_offset: 0,
+                    reply_capacity_bytes: 0,
+                    batch_token: 1,
                 })
             );
         }
@@ -10091,6 +10458,27 @@ pub mod translation_session {
             }
             s.admit_control_render(&reply_request(0, 6))
                 .expect("strictly greater");
+        }
+
+        #[test]
+        fn an_aborted_reply_retires_without_a_published_completion() {
+            let mut s = live_session(4);
+            s.admit_control_render(&reply_request(0, 5)).unwrap();
+            s.abort_slot(0, 5).expect("exact refusal releases its slot");
+            let slot = s.pool().unwrap().slots[0];
+            assert_eq!(slot.state, SlotState::Idle);
+            assert_eq!(slot.generation, 0);
+            assert_eq!(slot.retired_generation, 5);
+            assert_eq!(slot.c51_value, 0);
+            assert_eq!(
+                s.admit_control_render(&reply_request(0, 5)),
+                Err(SessionRefusal::ControlRenderSlotGenerationStale {
+                    found: 5,
+                    watermark: 5,
+                })
+            );
+            s.admit_control_render(&reply_request(0, 6))
+                .expect("a later generation remains usable");
         }
 
         #[test]
@@ -10250,50 +10638,21 @@ pub mod translation_session {
         // ── endpoints, rings, and the host-dispatch FIFO ──────────────────
 
         #[test]
-        fn init_mints_no_ring_at_all() {
-            // An endpoint ordinal is not a ring. Rings belong to queue contexts
-            // bound to a real VkQueue, which a record-only session never creates.
+        fn init_reserves_one_private_ring_for_every_granted_endpoint() {
             let s = live_session(4);
             for id in 1..=4u32 {
-                assert_eq!(
-                    s.ring_index(id),
-                    Err(SessionRefusal::EndpointRingUnassigned { endpoint_id: id })
-                );
+                assert_eq!(s.ring_index(id), Ok(id));
             }
         }
 
         #[test]
-        fn a_ring_binds_once_and_is_never_shared_or_recycled() {
-            let mut s = live_session(4);
-            s.bind_ring(1, 7).expect("first bind");
-            assert_eq!(s.ring_index(1), Ok(7));
-            assert_eq!(
-                s.bind_ring(1, 8),
-                Err(SessionRefusal::EndpointRingAlreadyTaken { ring_index: 7 })
-            );
-            assert_eq!(
-                s.bind_ring(2, 7),
-                Err(SessionRefusal::EndpointRingAlreadyTaken { ring_index: 7 })
-            );
-            s.bind_ring(2, 8).expect("its own ring");
-            assert_eq!(
-                s.bind_ring(3, 0),
-                Err(SessionRefusal::EndpointRingUnassigned { endpoint_id: 3 })
-            );
-            assert!(matches!(
-                s.bind_ring(3, u32::MAX),
-                Err(SessionRefusal::Capacity(HeliosCapacityRefusal {
-                    limit: HeliosCapacityLimit::RingIndex,
-                    ..
-                }))
-            ));
-        }
-
-        #[test]
-        fn a_draining_session_binds_no_ring() {
-            let mut s = live_session(4);
-            s.begin_draining();
-            assert_eq!(s.bind_ring(1, 7), Err(SessionRefusal::SessionDraining));
+        fn two_sessions_have_distinct_namespaces_even_when_ring_ordinals_match() {
+            let a = live_session(4);
+            let b = live_session(2);
+            assert_eq!(a.ring_index(1), Ok(1));
+            assert_eq!(b.ring_index(1), Ok(1));
+            assert_eq!(a.endpoint_capacity(), 4);
+            assert_eq!(b.endpoint_capacity(), 2);
         }
 
         #[test]
@@ -10302,7 +10661,7 @@ pub mod translation_session {
             s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN)
                 .unwrap();
             assert_eq!(
-                s.bind_ring(1, 1),
+                s.ring_index(1),
                 Err(SessionRefusal::EndpointOutOfRange {
                     found: 1,
                     capacity: 0
@@ -10311,15 +10670,15 @@ pub mod translation_session {
         }
 
         #[test]
-        fn only_the_granted_endpoints_may_take_a_ring() {
+        fn only_the_granted_endpoints_own_a_ring() {
             let mut s = TranslationSession::new_provisional(PKG, CAPSET);
             s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES, POOL_GEN)
                 .unwrap();
             s.complete_init(8, 2, 7, CAP).unwrap();
-            s.bind_ring(1, 1).expect("granted");
-            s.bind_ring(2, 2).expect("granted");
+            assert_eq!(s.ring_index(1), Ok(1));
+            assert_eq!(s.ring_index(2), Ok(2));
             assert_eq!(
-                s.bind_ring(3, 3),
+                s.ring_index(3),
                 Err(SessionRefusal::EndpointOutOfRange {
                     found: 3,
                     capacity: 2
@@ -10330,8 +10689,6 @@ pub mod translation_session {
         #[test]
         fn host_dispatch_serials_are_arrival_order_and_per_endpoint() {
             let mut s = live_session(4);
-            s.bind_ring(1, 1).unwrap();
-            s.bind_ring(2, 2).unwrap();
             let a1 = s.enqueue_host_dispatch(1).unwrap();
             let a2 = s.enqueue_host_dispatch(1).unwrap();
             let b1 = s.enqueue_host_dispatch(2).unwrap();
@@ -10342,8 +10699,6 @@ pub mod translation_session {
         #[test]
         fn the_host_dispatch_fifo_refuses_at_its_bound_and_never_waits() {
             let mut s = live_session(4);
-            s.bind_ring(1, 1).unwrap();
-            s.bind_ring(2, 2).unwrap();
             let depth = HELIOS_HTS1_MAX_HOST_DISPATCH_FIFO_DEPTH;
             for _ in 0..depth {
                 s.enqueue_host_dispatch(1).expect("under the bound");
@@ -10363,18 +10718,20 @@ pub mod translation_session {
         }
 
         #[test]
-        fn host_dispatch_refuses_an_endpoint_with_no_ring_bound() {
-            let mut s = live_session(4);
+        fn host_dispatch_refuses_an_ungranted_endpoint() {
+            let mut s = live_session(1);
             assert_eq!(
-                s.enqueue_host_dispatch(1),
-                Err(SessionRefusal::EndpointRingUnassigned { endpoint_id: 1 })
+                s.enqueue_host_dispatch(2),
+                Err(SessionRefusal::EndpointOutOfRange {
+                    found: 2,
+                    capacity: 1
+                })
             );
         }
 
         #[test]
         fn retiring_an_empty_fifo_is_a_refusal_not_a_wrap() {
             let mut s = live_session(4);
-            s.bind_ring(1, 1).unwrap();
             assert_eq!(
                 s.retire_host_dispatch(1),
                 Err(SessionRefusal::HostDispatchFifoUnderflow { endpoint_id: 1 })
@@ -10384,7 +10741,6 @@ pub mod translation_session {
         #[test]
         fn a_draining_session_enqueues_nothing() {
             let mut s = live_session(4);
-            s.bind_ring(1, 1).unwrap();
             s.begin_draining();
             assert_eq!(
                 s.enqueue_host_dispatch(1),

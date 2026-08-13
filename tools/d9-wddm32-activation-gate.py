@@ -907,13 +907,12 @@ def check_cold_gate(sources: dict[str, str], errors: list[str]) -> None:
         errors.append(f"{RETIREMENT_GATES}: D9 mutation gate is not integrated exactly once")
 
 
-def check_sources(sources: dict[str, str]) -> list[str]:
+def check_local_sources(sources: dict[str, str]) -> list[str]:
     errors: list[str] = []
     live = {
         path: live_rust(source) if path.endswith(".rs") else source
         for path, source in sources.items()
     }
-    errors.extend(f"K7: {error}" for error in k7_check_sources(sources))
     check_activation(sources, live, errors)
     check_audit(sources, errors)
     check_table(live, errors)
@@ -923,6 +922,12 @@ def check_sources(sources: dict[str, str]) -> list[str]:
     check_umd_mpo(sources, errors)
     check_legacy_authority_closure(sources, errors)
     check_cold_gate(sources, errors)
+    return errors
+
+
+def check_sources(sources: dict[str, str]) -> list[str]:
+    errors = [f"K7: {error}" for error in k7_check_sources(sources)]
+    errors.extend(check_local_sources(sources))
     return errors
 
 
@@ -1458,18 +1463,21 @@ def run_mutations(sources: dict[str, str]) -> None:
             )
         mutated = dict(sources)
         mutated[case.path] = mutated[case.path].replace(case.old, case.new, 1)
-        with tempfile.TemporaryDirectory(prefix="helios-d9-gate-") as temp:
-            write_source_tree(temp, mutated)
-            result = subprocess.run(
-                [sys.executable, os.path.abspath(__file__), temp],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-            if result.returncode == 0:
-                raise SystemExit(f"D9 mutation was accepted by the real gate: {case.name}")
-    print(f"OK: {len(mutation_cases())} D9 temporary-tree mutations rejected by the real gate")
+        # Every D9 mutation is intended to be rejected by the D9-owned portion
+        # of the real checker.  Run that first; only consult the unchanged K7
+        # ancestry when a mutation escapes it.  The last-resort generated-file
+        # check retains exact main-program semantics without creating a source
+        # tree and Python process for every case.
+        errors = check_local_sources(mutated)
+        if not errors:
+            errors.extend(f"K7: {error}" for error in k7_check_sources(mutated))
+        if not errors:
+            with tempfile.TemporaryDirectory(prefix="helios-d9-gate-") as temp:
+                write_source_tree(temp, mutated)
+                errors.extend(check_generated(temp))
+        if not errors:
+            raise SystemExit(f"D9 mutation was accepted by the real gate: {case.name}")
+    print(f"OK: {len(mutation_cases())} in-memory D9 mutations rejected by the real gate")
 
 
 def main() -> None:

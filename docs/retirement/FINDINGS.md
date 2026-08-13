@@ -1752,3 +1752,110 @@ The display is still **runtime-unadmitted**: current DWM loads WARP and
 DisplayConfig reports zero paths. K11 and Mesa A3/A4 remain; Escape stays NULL.
 A successful map, Code 0, WDDM 3.2 string, counter, hash, or frozen frame is not
 visible-desktop evidence.
+
+---
+
+## F19 — Stock virtio-gpu/Venus is sufficient for one exact per-HTS1 host namespace; K11 needs no HPM1 or new QEMU protocol.
+
+**Implemented and measured 2026-08-14.** This finding supersedes the historical
+K11 inventory in `lane-kmd-core.md` where it names HPM1 packets, a new QEMU lane,
+or a wholesale shared-ring rewrite. F5 remains in force, and K2a's QEMU exception
+remains frozen at `415a5ef078`.
+
+### The re-derived K5/K6 handoff
+
+K5 already provides the exact ordinary WDDM ownership graph: dxgkrnl's
+`ProcessContext`, raw `DeviceContext`, HVC1 control `NativeContext`, heap-pinned
+`SessionObject`, canonical role-1 allocation/open object, and direct HQA1 outer
+context references. K6 already provides bounded HNR2 fragment decoding, the
+context-local slot claim, Patch/SubmitCommand records, and the finite-control
+call site. Its missing boundary was narrower than the old lane row: no distinct
+host Venus context, no actual host reply producer, and therefore no truthful
+nonzero INIT endpoint publication.
+
+K11 attaches host state only to that exact `SessionObject`. It does not put a
+PID, name, renderer resource id, pointer, KMT handle, host context id, or lookup
+token into HTS1/HVC1/HQA1/HNR2/HVM1/HVR1 and does not add submit-time discovery.
+Multiple sessions in one process therefore remain distinct by construction:
+each raw device/control context owns a different session object and each session
+creates a different stock Venus context/object namespace.
+
+### Landed stock-Venus shape
+
+* INIT first projects the exact live K2a role-1 allocation and transport
+  generation. It creates a stock Venus context plus one private 4096-byte
+  HOST3D/MAPPABLE reply resource, maps only that private resource in KMD, and
+  borrows the canonical `(owner, context, resource)` pair directly.
+* Ring zero submits a finite `vkSetReplyCommandStreamMESA` at fence 1 and
+  `vkCreateInstance` at fence 2. The second used-ring response is terminal for
+  decode and reply write. KMD then reads exactly 24 private bytes and validates
+  opcode, zero status, pointer count, and the expected instance handle. Mere
+  command acceptance or a counter is not INIT evidence.
+* Only after that validation does KMD generate the nonzero HTS1 generation and
+  CSPRNG capability, reserve the complete fixed endpoint/ring namespace, copy
+  the exact final reply into the checked-out K2a role-1 slot as HVR1, and make
+  the session externally live. The capacity is nonzero, no larger than the
+  request, and bounded by 64; ring zero remains control-only and every granted
+  endpoint has its nonzero ring reserved before publication.
+* K11 executes only that finite allocation-free INIT. Allocation-backed,
+  queue, GPU-dependent, general-schema, residency, and epoch operations retain
+  K6's named refusals. The four 1 MiB HVR1 slots, 1,048,496-byte per-chunk
+  payload, and 64 MiB logical snapshot ceiling are unchanged.
+* Each HVC1 context has one local WDDM `SubmissionFenceId` watermark admitted
+  only after the host reply and HVR1 publication. No adapter-global boundary
+  queue, shared timeline, forged completion, polling, sleep, or synthetic
+  completion exists.
+
+Teardown closes new admission and drains the exact operation rundown before
+issuing the optional fenced `vkDestroyInstance` at fence 3. It then unmaps and
+detaches the private reply resource, unrefs it, destroys the host context, and
+only afterward permits session and K2a backing references to fall. Ambiguous
+cleanup quarantines the owner/context until reset instead of releasing backing
+out of order. Failed or repeated INIT aborts the exact in-flight slot before
+session draining; this ordering was found by the updated HNR2 probe and modeled
+explicitly so refusal cannot strand a reply slot or fabricate C51 publication.
+
+The bounded ordinary review found a second ordering edge: keeping either the
+per-session owner rundown or the WDDM notification lock held across
+`DxgkCbSynchronizeExecution` lets a concurrent failed-INIT Render teardown wait
+on the SubmitCommand whose callback is waiting on that Render. The final source
+uses a fixed per-adapter completion rundown from current-generation admission
+through the exact notification, releases session/resource guards before the OS
+callback, and closes/joins the adapter rundown only for reset, Stop, and Remove.
+It carries no session identity, host context, queue, timeline, or lookup.
+
+### Final-source target evidence
+
+KMD **22.22.296.0** loaded as `oem128.inf` on Windows build 26100 with
+`CM_PROB_NONE`. The active DriverStore SYS is **880,376 bytes**, SHA-256
+`b12a1c914eb1a126c7170ad00974a5310f3828df65ed4d835bf09592c538167e`, with a
+valid WDR test signature.
+
+`tools/k11_session_transport_probe.c` passed **14/14**. Two simultaneous
+sessions in one process requested endpoint capacities four and two and received
+distinct nonzero generations/capabilities. Both carried actual correlated final
+HVR1 bytes for their own host `vkCreateInstance`; a crossed capability attach
+failed. A child process could not attach the inherited key, abrupt child exit
+drained, four repeated INIT/teardown cycles succeeded, and a fresh session
+succeeded afterward. The standing HTS1 probe passed **15/15**, the updated HNR2
+probe passed **15/15** including deliberate same-session repeated-INIT refusal,
+and the unchanged K2a probe passed **52/52**. HNR2 was deliberately run first
+against the final image and completed promptly rather than reproducing the two
+review-build deadlocks.
+
+A held-capability run reached READY, an exact PnP adapter restart succeeded, the
+old capability drained, and the process exited cleanly. The adapter returned
+Code 0; a fresh K11 run passed 14/14 with `K11CtxNew=K11CtxDel=8`, every K11
+failure counter zero, `K11CmpOpenRej=0`, and `TsSlotRel=8` / `TsSlotStuck=0`.
+No transient per-session host process remained. The source/mutation gate
+rejected 62 semantic mutations, including
+shared namespaces, discovery, early/zero capacity, forbidden work, polling or
+synthetic completion, unbounded storage, reply-pool early release, ABI identity
+tokens, alternate carriers, new host dependencies, weakened prerequisite gates,
+and false visible-desktop claims.
+
+The display is still **runtime-unadmitted** after reset: DWM loads WARP and
+DisplayConfig reports zero active paths. Mesa A3/A4 remain the next handoff;
+Escape and HWQueues stay NULL. INIT, Code 0, hashes, counters, or a clean reset
+are not visible or cold-DWM admission and do not establish HPS2 retirement or
+production correctness.

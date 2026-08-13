@@ -90,7 +90,8 @@ use helios_protocol::{
     VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_FLUSH,
     VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
     VIRTIO_GPU_CMD_RESOURCE_UNREF, VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_FLAG_FENCE,
-    VIRTIO_GPU_MAP_CACHE_MASK, VIRTIO_GPU_BLOB_MEM_GUEST,
+    VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+    VIRTIO_GPU_BLOB_MEM_GUEST, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_MASK,
 };
 
 /// `KernelMode` (`KPROCESSOR_MODE`).
@@ -353,6 +354,27 @@ fn wait_block(
     }
 }
 
+/// One finite event wait, with no periodic used-ring drain.
+///
+/// K11 has no interrupt-loss polling fallback and no queue-full sleep/retry:
+/// either its one descriptor is accepted and the transport interrupt signals
+/// this event, or the bounded wait is abandoned as one ambiguous operation.
+fn wait_block_once(_passive: PassiveLevel, block: &WaitBlockRef<'_>, total_ms: u64) -> bool {
+    let mut timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
+    timeout.QuadPart = -((total_ms.max(1) as i64) * 10_000);
+    // SAFETY: the KEVENT was initialized by SyncWaitBlock::init at this address,
+    // outlives this single PASSIVE_LEVEL wait, and no code samples its state.
+    unsafe {
+        KeWaitForSingleObject(
+            core::ptr::addr_of_mut!((*block.as_ptr().as_ptr()).event) as PVOID,
+            EXECUTIVE,
+            KERNEL_MODE,
+            0,
+            &mut timeout,
+        ) == STATUS_SUCCESS
+    }
+}
+
 /// Reap completed entries at PASSIVE and retain their DMA buffers for reuse.
 /// `MmAllocateContiguousMemory` per tiny Venus submission dominated DWM's
 /// command rate; recycling page-backed buffers removes that steady-state cost.
@@ -497,6 +519,16 @@ pub(crate) enum CtrlRoundtripOutcome {
     Ambiguous(AbandonReason),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CtrlRoundtripMode {
+    /// Existing control users retain their bounded queue-full retry and
+    /// adaptive interrupt-loss drain behavior.
+    LegacyRetry,
+    /// K11: one enqueue attempt followed by one event wait.  No periodic drain,
+    /// sleep, retry, or independent virtio fence timeline is permitted.
+    FiniteEvent,
+}
+
 impl CtrlRoundtripOutcome {
     fn into_legacy_result(self) -> Result<usize, VirtioError> {
         match self {
@@ -530,6 +562,7 @@ fn ctrl_roundtrip_observed(
     timeout_ms: u64,
     bind: Option<BindMint<'_>>,
     expected_instance: Option<u64>,
+    mode: CtrlRoundtripMode,
 ) -> CtrlRoundtripOutcome {
     // Bind DNE reconciliation needs the exact producing transport even when
     // allocation or argument validation fails before enqueue. Snapshot only
@@ -576,7 +609,13 @@ fn ctrl_roundtrip_observed(
         let mut budget = Budget::new(ENQUEUE_RETRY_MAX_MS);
         let token: SyncTicket = loop {
             let res = adapter.with_virtio(move |v| {
-                v.drain_used(adapter);
+                // Existing users retain the opportunistic interrupt-loss
+                // drain. K11's finite mode is event-driven only: if prior
+                // completions have not freed a descriptor, its one enqueue
+                // attempt reports QueueFull instead of sampling the used ring.
+                if mode == CtrlRoundtripMode::LegacyRetry {
+                    v.drain_used(adapter);
+                }
                 let queued = if expected_instance
                     .is_some_and(|expected| expected != v.scanout_transport_instance())
                 {
@@ -635,6 +674,9 @@ fn ctrl_roundtrip_observed(
                 Ok(Ok(ticket)) => break ticket,
                 Ok(Err((m_back, VirtioError::QueueFull))) => {
                     meta = m_back;
+                    if mode == CtrlRoundtripMode::FiniteEvent {
+                        return CtrlRoundtripOutcome::DefiniteNotEnqueued(VirtioError::QueueFull);
+                    }
                     if budget.charge_slice() {
                         return CtrlRoundtripOutcome::DefiniteNotEnqueued(VirtioError::QueueFull);
                     }
@@ -648,17 +690,31 @@ fn ctrl_roundtrip_observed(
         // Kept for the refusal breadcrumb: SyncTicket is move-only, so it is
         // consumed by abandon_sync and cannot be read afterwards.
         let token_value = token.raw();
-        if !wait_block(passive, adapter, block, timeout_ms) {
+        let completed = match mode {
+            CtrlRoundtripMode::LegacyRetry => wait_block(passive, adapter, block, timeout_ms),
+            CtrlRoundtripMode::FiniteEvent => wait_block_once(passive, block, timeout_ms),
+        };
+        if !completed {
             // Final race check + abandonment under the lock.
             // Three outcomes, not two. `unwrap_or(true)` folded Err(DeviceNotFound)
             // - the transport was torn down under us - into "already completed
             // successfully", which skipped the timeout counter and picked the wrong
             // error class. Callers validate the exact returned response shape,
             // but the missing evidence was real.
-            match adapter.with_virtio(|v| {
-                v.drain_used(adapter);
-                v.abandon_sync(token, block.as_ptr())
-            }) {
+            let reconciled = match mode {
+                CtrlRoundtripMode::LegacyRetry => adapter.with_virtio(|v| {
+                    v.drain_used(adapter);
+                    v.abandon_sync(token, block.as_ptr())
+                }),
+                // No final poll for K11. `abandon_sync` is the exact locked
+                // ownership transition: it still observes a completion that an
+                // interrupt handler already published while the timeout raced,
+                // but it never drives completion by sampling the used ring.
+                CtrlRoundtripMode::FiniteEvent => {
+                    adapter.with_virtio(|v| v.abandon_sync(token, block.as_ptr()))
+                }
+            };
+            match reconciled {
                 // The drain or failure latch already signalled us; disposition
                 // below distinguishes copied response from transport abort.
                 Ok(SyncOutcome::AlreadyCompleted) => {}
@@ -729,6 +785,7 @@ fn run_owner_work<K>(
     verb: ControlVerb,
     request: &[u8],
     response: &mut [u8],
+    mode: CtrlRoundtripMode,
 ) -> ObservedOwnerWork<VirtioError, K> {
     // SAFETY: this closure performs exactly one synchronous publish attempt,
     // returns the transport's exact copied length, and retains no wire key.
@@ -746,6 +803,7 @@ fn run_owner_work<K>(
                 SYNC_ROUNDTRIP_TIMEOUT_MS,
                 None,
                 None,
+                mode,
             ) {
                 CtrlRoundtripOutcome::HostResponseCopied { written_length } => {
                     RunnerOutcome::HostResponse {
@@ -795,6 +853,7 @@ fn ctrl_roundtrip(
         timeout_ms,
         bind,
         expected_instance,
+        CtrlRoundtripMode::LegacyRetry,
     )
     .into_legacy_result()
 }
@@ -816,6 +875,40 @@ fn ctrl_roundtrip_ok_seq(
     extra: Option<&[u8]>,
     bind: Option<BindMint<'_>>,
 ) -> Result<(), VirtioError> {
+    ctrl_roundtrip_ok_mode(
+        passive,
+        adapter,
+        req,
+        extra,
+        bind,
+        CtrlRoundtripMode::LegacyRetry,
+    )
+}
+
+fn ctrl_roundtrip_ok_finite(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    extra: Option<&[u8]>,
+) -> Result<(), VirtioError> {
+    ctrl_roundtrip_ok_mode(
+        passive,
+        adapter,
+        req,
+        extra,
+        None,
+        CtrlRoundtripMode::FiniteEvent,
+    )
+}
+
+fn ctrl_roundtrip_ok_mode(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    req: &[u8],
+    extra: Option<&[u8]>,
+    bind: Option<BindMint<'_>>,
+    mode: CtrlRoundtripMode,
+) -> Result<(), VirtioError> {
     let mut resp = [0u8; size_of::<VirtioGpuCtrlHdr>()];
     let outcome = ctrl_roundtrip_observed(
         passive,
@@ -826,6 +919,7 @@ fn ctrl_roundtrip_ok_seq(
         SYNC_ROUNDTRIP_TIMEOUT_MS,
         bind,
         None,
+        mode,
     );
     match outcome {
         CtrlRoundtripOutcome::HostResponseCopied { .. } => {}
@@ -898,6 +992,37 @@ pub fn ctx_create(
     capset_id: u32,
     owner: Option<DeviceOwner>,
 ) -> Result<u32, VirtioError> {
+    ctx_create_mode(
+        passive,
+        adapter,
+        capset_id,
+        owner,
+        CtrlRoundtripMode::LegacyRetry,
+    )
+}
+
+pub(crate) fn ctx_create_session(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    capset_id: u32,
+    owner: DeviceOwner,
+) -> Result<u32, VirtioError> {
+    ctx_create_mode(
+        passive,
+        adapter,
+        capset_id,
+        Some(owner),
+        CtrlRoundtripMode::FiniteEvent,
+    )
+}
+
+fn ctx_create_mode(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    capset_id: u32,
+    owner: Option<DeviceOwner>,
+    mode: CtrlRoundtripMode,
+) -> Result<u32, VirtioError> {
     if super::control_owner::KMD_D2_OWNER_ENABLED {
         let (ctx_id, work) = adapter.control_owner().begin_context_create(owner)?;
         let mut cmd = VirtioGpuCtxCreate::zeroed();
@@ -916,6 +1041,7 @@ pub fn ctx_create(
             ControlVerb::ContextCreate,
             bytes_of(&cmd),
             &mut response,
+            mode,
         );
         return match adapter.control_owner().finish_context(observed)? {
             ContextFinishEffect::CreateCompleted => {
@@ -952,7 +1078,7 @@ pub fn ctx_create(
     cmd.nlen = NAME.len() as u32;
     cmd.debug_name[..NAME.len()].copy_from_slice(NAME);
     crate::diag::record(0x0D20_0000 | (ctx_id & 0xFFFF));
-    if let Err(e) = ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None) {
+    if let Err(e) = ctrl_roundtrip_ok_mode(passive, adapter, bytes_of(&cmd), None, None, mode) {
         let _ = adapter.with_virtio(|v| v.cancel_context_reservation());
         return Err(e);
     }
@@ -976,6 +1102,37 @@ pub fn ctx_destroy(
     owner: Option<DeviceOwner>,
     ctx_id: u32,
 ) -> Result<(), VirtioError> {
+    ctx_destroy_mode(
+        passive,
+        adapter,
+        owner,
+        ctx_id,
+        CtrlRoundtripMode::LegacyRetry,
+    )
+}
+
+pub(crate) fn ctx_destroy_session(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    ctx_id: u32,
+) -> Result<(), VirtioError> {
+    ctx_destroy_mode(
+        passive,
+        adapter,
+        Some(owner),
+        ctx_id,
+        CtrlRoundtripMode::FiniteEvent,
+    )
+}
+
+fn ctx_destroy_mode(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: Option<DeviceOwner>,
+    ctx_id: u32,
+    mode: CtrlRoundtripMode,
+) -> Result<(), VirtioError> {
     if super::control_owner::KMD_D2_OWNER_ENABLED {
         let work = adapter
             .control_owner()
@@ -995,6 +1152,7 @@ pub fn ctx_destroy(
             ControlVerb::ContextDestroy,
             bytes_of(&cmd),
             &mut response,
+            mode,
         );
         return match adapter.control_owner().finish_context(observed)? {
             ContextFinishEffect::DestroyCompleted => Ok(()),
@@ -1028,7 +1186,7 @@ pub fn ctx_destroy(
     let mut cmd = VirtioGpuCtxDestroy::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
     cmd.hdr.ctx_id = ctx_id;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok_mode(passive, adapter, bytes_of(&cmd), None, None, mode)
 }
 
 /// Untracked teardown of a context this driver created for itself (the
@@ -1095,6 +1253,22 @@ pub fn ctx_attach_resource(
     ctx_id: u32,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    ctx_attach_resource_mode(
+        passive,
+        adapter,
+        ctx_id,
+        resource_id,
+        CtrlRoundtripMode::LegacyRetry,
+    )
+}
+
+fn ctx_attach_resource_mode(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    resource_id: u32,
+    mode: CtrlRoundtripMode,
+) -> Result<(), VirtioError> {
     if super::control_owner::KMD_D2_OWNER_ENABLED {
         let work = adapter
             .control_owner()
@@ -1111,6 +1285,7 @@ pub fn ctx_attach_resource(
             ControlVerb::Attach,
             bytes_of(&cmd),
             &mut response,
+            mode,
         );
         return match adapter.control_owner().finish_pair(observed)? {
             AttachmentFinishEffect::AttachCompleted => Ok(()),
@@ -1127,7 +1302,7 @@ pub fn ctx_attach_resource(
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
     cmd.hdr.ctx_id = ctx_id;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok_mode(passive, adapter, bytes_of(&cmd), None, None, mode)
 }
 
 /// Detach a resource from a 3D context.
@@ -1136,6 +1311,37 @@ pub fn ctx_detach_resource(
     adapter: &AdapterContext,
     ctx_id: u32,
     resource_id: u32,
+) -> Result<(), VirtioError> {
+    ctx_detach_resource_mode(
+        passive,
+        adapter,
+        ctx_id,
+        resource_id,
+        CtrlRoundtripMode::LegacyRetry,
+    )
+}
+
+pub(crate) fn ctx_detach_session_resource(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    resource_id: u32,
+) -> Result<(), VirtioError> {
+    ctx_detach_resource_mode(
+        passive,
+        adapter,
+        ctx_id,
+        resource_id,
+        CtrlRoundtripMode::FiniteEvent,
+    )
+}
+
+fn ctx_detach_resource_mode(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    resource_id: u32,
+    mode: CtrlRoundtripMode,
 ) -> Result<(), VirtioError> {
     if super::control_owner::KMD_D2_OWNER_ENABLED {
         let mut cmd = VirtioGpuCtxResource::zeroed();
@@ -1153,6 +1359,7 @@ pub fn ctx_detach_resource(
                     ControlVerb::Detach,
                     bytes_of(&cmd),
                     &mut response,
+                    mode,
                 );
                 match adapter
                     .control_owner()
@@ -1177,6 +1384,7 @@ pub fn ctx_detach_resource(
                     ControlVerb::Detach,
                     bytes_of(&cmd),
                     &mut response,
+                    mode,
                 );
                 match adapter.control_owner().finish_pair(observed)? {
                     AttachmentFinishEffect::DetachCompleted => Ok(()),
@@ -1193,7 +1401,7 @@ pub fn ctx_detach_resource(
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
     cmd.hdr.ctx_id = ctx_id;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok_mode(passive, adapter, bytes_of(&cmd), None, None, mode)
 }
 
 /// Bind a venus blob `resource_id` to scanout 0 (the QEMU gtk/sdl display) via
@@ -1250,6 +1458,7 @@ pub(crate) fn set_scanout_blob(
         SYNC_ROUNDTRIP_TIMEOUT_MS,
         Some(bind),
         expected_instance,
+        CtrlRoundtripMode::LegacyRetry,
     );
     let outcome = match observed {
         CtrlRoundtripOutcome::HostResponseCopied { written_length }
@@ -1360,6 +1569,7 @@ pub(crate) fn set_scanout_blob_fenced(
         SYNC_ROUNDTRIP_TIMEOUT_MS,
         Some(bind),
         Some(expected_instance),
+        CtrlRoundtripMode::LegacyRetry,
     );
     let identity = || {
         (instance.get() != 0 && seq.get() != 0 && fence_id.get() != 0).then_some(
@@ -1543,6 +1753,25 @@ fn resource_unref_with_finalizer<F>(
 where
     F: FnMut(ResourceBackingFinalizer) -> Result<(), ResourceBackingFinalizer>,
 {
+    resource_unref_with_finalizer_mode(
+        passive,
+        adapter,
+        resource_id,
+        finalize,
+        CtrlRoundtripMode::LegacyRetry,
+    )
+}
+
+fn resource_unref_with_finalizer_mode<F>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    finalize: &mut F,
+    mode: CtrlRoundtripMode,
+) -> Result<(), VirtioError>
+where
+    F: FnMut(ResourceBackingFinalizer) -> Result<(), ResourceBackingFinalizer>,
+{
     if super::control_owner::KMD_D2_OWNER_ENABLED {
         let work = adapter.control_owner().begin_resource_unref(resource_id)?;
         let mut cmd = VirtioGpuResourceUnref::zeroed();
@@ -1556,6 +1785,7 @@ where
             ControlVerb::Unref,
             bytes_of(&cmd),
             &mut response,
+            mode,
         );
         return match adapter
             .control_owner()
@@ -1570,7 +1800,34 @@ where
     let mut cmd = VirtioGpuResourceUnref::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNREF;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok_mode(passive, adapter, bytes_of(&cmd), None, None, mode)
+}
+
+/// Release K11's exact private reply resource with the finite-event lifecycle.
+/// The owner/context tuple is checked in the canonical table before UNREF; a
+/// scalar resource id alone is never authority for session teardown.
+pub(crate) fn resource_unref_session_reply(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    context_id: u32,
+    resource_id: u32,
+) -> Result<(), VirtioError> {
+    if !super::control_owner::KMD_D2_OWNER_ENABLED
+        || !adapter
+            .control_owner()
+            .resource_owned_by(Some(owner), context_id, resource_id)
+    {
+        return Err(VirtioError::NotOwned);
+    }
+    let mut finalize = retain_resource_finalizer;
+    resource_unref_with_finalizer_mode(
+        passive,
+        adapter,
+        resource_id,
+        &mut finalize,
+        CtrlRoundtripMode::FiniteEvent,
+    )
 }
 
 /// Attach an EXISTING live resource id to a context without taking ownership
@@ -1760,6 +2017,39 @@ fn resource_create_blob_owned<F>(
 where
     F: FnMut(ResourceBackingFinalizer) -> Result<(), ResourceBackingFinalizer>,
 {
+    resource_create_blob_owned_mode(
+        passive,
+        adapter,
+        ctx_id,
+        blob_mem,
+        blob_flags,
+        blob_id,
+        size,
+        entries,
+        owner,
+        finalizer,
+        finalize,
+        CtrlRoundtripMode::LegacyRetry,
+    )
+}
+
+fn resource_create_blob_owned_mode<F>(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    blob_mem: u32,
+    blob_flags: u32,
+    blob_id: u64,
+    size: u64,
+    entries: &[VirtioGpuMemEntry],
+    owner: Option<DeviceOwner>,
+    finalizer: ResourceBackingFinalizer,
+    finalize: &mut F,
+    mode: CtrlRoundtripMode,
+) -> Result<u32, VirtioError>
+where
+    F: FnMut(ResourceBackingFinalizer) -> Result<(), ResourceBackingFinalizer>,
+{
     let mut cmd = VirtioGpuResourceCreateBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
     cmd.hdr.ctx_id = ctx_id;
@@ -1810,6 +2100,7 @@ where
             ControlVerb::Create,
             &request,
             &mut response,
+            mode,
         );
         match adapter
             .control_owner()
@@ -1831,7 +2122,13 @@ where
         {
             Ok(work) => work,
             Err(error) => {
-                let _ = resource_unref_with_finalizer(passive, adapter, resource_id, finalize);
+                let _ = resource_unref_with_finalizer_mode(
+                    passive,
+                    adapter,
+                    resource_id,
+                    finalize,
+                    mode,
+                );
                 return Err(error);
             }
         };
@@ -1847,6 +2144,7 @@ where
             ControlVerb::Attach,
             bytes_of(&attach),
             &mut response,
+            mode,
         );
         return match adapter
             .control_owner()
@@ -1854,11 +2152,23 @@ where
         {
             ResourceFinishEffect::AttachCompleted => Ok(resource_id),
             ResourceFinishEffect::AttachDefiniteNotEnqueued(error) => {
-                let _ = resource_unref_with_finalizer(passive, adapter, resource_id, finalize);
+                let _ = resource_unref_with_finalizer_mode(
+                    passive,
+                    adapter,
+                    resource_id,
+                    finalize,
+                    mode,
+                );
                 Err(error)
             }
             ResourceFinishEffect::AttachHostRejected(_) => {
-                let _ = resource_unref_with_finalizer(passive, adapter, resource_id, finalize);
+                let _ = resource_unref_with_finalizer_mode(
+                    passive,
+                    adapter,
+                    resource_id,
+                    finalize,
+                    mode,
+                );
                 Err(VirtioError::DeviceError)
             }
             ResourceFinishEffect::AttachAmbiguous(reason) => Err(owner_abandon_error(reason)),
@@ -1882,19 +2192,58 @@ where
     let resource_offset = core::mem::offset_of!(VirtioGpuResourceCreateBlob, resource_id);
     request[resource_offset..resource_offset + size_of::<u32>()]
         .copy_from_slice(&resource_id.to_le_bytes());
-    if let Err(e) = ctrl_roundtrip_ok(passive, adapter, &request, None) {
+    if let Err(e) = ctrl_roundtrip_ok_mode(passive, adapter, &request, None, None, mode) {
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
-    if let Err(e) = ctx_attach_resource(passive, adapter, ctx_id, resource_id) {
+    if let Err(e) =
+        ctx_attach_resource_mode(passive, adapter, ctx_id, resource_id, mode)
+    {
         // The resource exists host-side but could not attach: drop it so it
         // does not leak untracked.
-        let _ = resource_unref(passive, adapter, resource_id);
+        let mut finalize = retain_resource_finalizer;
+        let _ = resource_unref_with_finalizer_mode(
+            passive,
+            adapter,
+            resource_id,
+            &mut finalize,
+            mode,
+        );
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
     let _ = adapter.with_virtio(|v| v.commit_resource(resource_id));
     Ok(resource_id)
+}
+
+/// Create K11's sole private reply target in the exact session context.
+/// HOST3D plus MAPPABLE is the stock virtio-gpu/Venus SHM resource shape; it is
+/// never shared, exported, returned through an ABI, or used as a UMD carrier.
+pub(crate) fn resource_create_session_reply_blob(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    context_id: u32,
+    owner: DeviceOwner,
+    size: u64,
+) -> Result<u32, VirtioError> {
+    if !super::control_owner::KMD_D2_OWNER_ENABLED || size == 0 {
+        return Err(VirtioError::DeviceError);
+    }
+    let mut finalize = retain_resource_finalizer;
+    resource_create_blob_owned_mode(
+        passive,
+        adapter,
+        context_id,
+        VIRTIO_GPU_BLOB_MEM_HOST3D,
+        VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+        0,
+        size,
+        &[],
+        Some(owner),
+        ResourceBackingFinalizer::none(),
+        &mut finalize,
+        CtrlRoundtripMode::FiniteEvent,
+    )
 }
 
 /// `HELIOS_ESCAPE_ALLOC_BLOB` — create a HOST3D blob (create + attach) and
@@ -1954,6 +2303,7 @@ fn resource_map_blob_owner_work(
     resource_id: u32,
     offset: u64,
     work: DispatchWork<helios_kmd_logic::control_owner_slots::WindowSlotKind>,
+    mode: CtrlRoundtripMode,
 ) -> Result<u32, VirtioError> {
     if !super::control_owner::KMD_D2_OWNER_ENABLED {
         return Err(VirtioError::DeviceError);
@@ -1970,6 +2320,7 @@ fn resource_map_blob_owner_work(
         ControlVerb::Map,
         bytes_of(&cmd),
         &mut response,
+        mode,
     );
     match adapter.control_owner().finish_window(observed)? {
         WindowFinishEffect::MapCompleted => adapter
@@ -1994,7 +2345,14 @@ fn resource_map_blob_roundtrip(
         let work = adapter
             .control_owner()
             .begin_window_map(resource_id, offset)?;
-        return resource_map_blob_owner_work(passive, adapter, resource_id, offset, work);
+        return resource_map_blob_owner_work(
+            passive,
+            adapter,
+            resource_id,
+            offset,
+            work,
+            CtrlRoundtripMode::LegacyRetry,
+        );
     }
     let mut cmd = VirtioGpuResourceMapBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
@@ -2029,6 +2387,20 @@ pub fn resource_unmap_blob(
     adapter: &AdapterContext,
     resource_id: u32,
 ) -> Result<(), VirtioError> {
+    resource_unmap_blob_mode(
+        passive,
+        adapter,
+        resource_id,
+        CtrlRoundtripMode::LegacyRetry,
+    )
+}
+
+fn resource_unmap_blob_mode(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    mode: CtrlRoundtripMode,
+) -> Result<(), VirtioError> {
     if super::control_owner::KMD_D2_OWNER_ENABLED {
         let work = adapter.control_owner().begin_window_unmap(resource_id)?;
         let mut cmd = VirtioGpuResourceUnmapBlob::zeroed();
@@ -2042,6 +2414,7 @@ pub fn resource_unmap_blob(
             ControlVerb::Unmap,
             bytes_of(&cmd),
             &mut response,
+            mode,
         );
         return match adapter.control_owner().finish_window(observed)? {
             WindowFinishEffect::UnmapCompleted => Ok(()),
@@ -2053,7 +2426,7 @@ pub fn resource_unmap_blob(
     let mut cmd = VirtioGpuResourceUnmapBlob::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
     cmd.resource_id = resource_id;
-    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
+    ctrl_roundtrip_ok_mode(passive, adapter, bytes_of(&cmd), None, None, mode)
 }
 
 /// Map a blob into the host-visible window (idempotent — returns the existing
@@ -2078,7 +2451,14 @@ pub fn map_blob_prepare(
         let (offset, work) = adapter
             .control_owner()
             .begin_window_map_first_fit(resource_id)?;
-        let _ = resource_map_blob_owner_work(passive, adapter, resource_id, offset, work)?;
+        let _ = resource_map_blob_owner_work(
+            passive,
+            adapter,
+            resource_id,
+            offset,
+            work,
+            CtrlRoundtripMode::LegacyRetry,
+        )?;
         return adapter
             .control_owner()
             .mapped_blob(resource_id)?
@@ -2120,6 +2500,66 @@ pub fn map_blob_prepare(
             }
         }
     }
+}
+
+/// Map the exact K11 private reply blob once with no retry, polling, or owner
+/// discovery.  A pre-existing mapping is rejected because INIT must establish
+/// one fresh, bounded resource/map pair before it can publish capacity.
+pub(crate) fn map_session_reply_blob(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    context_id: u32,
+    resource_id: u32,
+) -> Result<BlobMapPrep, VirtioError> {
+    if !super::control_owner::KMD_D2_OWNER_ENABLED
+        || !adapter
+            .control_owner()
+            .resource_owned_by(Some(owner), context_id, resource_id)
+    {
+        return Err(VirtioError::NotOwned);
+    }
+    if adapter.control_owner().mapped_blob(resource_id)?.is_some() {
+        return Err(VirtioError::DeviceError);
+    }
+    let (offset, work) = adapter
+        .control_owner()
+        .begin_window_map_first_fit(resource_id)?;
+    let _ = resource_map_blob_owner_work(
+        passive,
+        adapter,
+        resource_id,
+        offset,
+        work,
+        CtrlRoundtripMode::FiniteEvent,
+    )?;
+    adapter
+        .control_owner()
+        .mapped_blob(resource_id)?
+        .ok_or(VirtioError::DeviceError)
+}
+
+/// Unmap K11's exact private reply blob after session rundown has closed.
+pub(crate) fn unmap_session_reply_blob(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    owner: DeviceOwner,
+    context_id: u32,
+    resource_id: u32,
+) -> Result<(), VirtioError> {
+    if !super::control_owner::KMD_D2_OWNER_ENABLED
+        || !adapter
+            .control_owner()
+            .resource_owned_by(Some(owner), context_id, resource_id)
+    {
+        return Err(VirtioError::NotOwned);
+    }
+    resource_unmap_blob_mode(
+        passive,
+        adapter,
+        resource_id,
+        CtrlRoundtripMode::FiniteEvent,
+    )
 }
 
 /// Map a blob at the FIXED window offset VidMm assigned (the CPU-visible BAR
@@ -2481,6 +2921,67 @@ pub fn submit_venus_sync(
     stream: &[u8],
 ) -> Result<(), VirtioError> {
     submit_3d_sync(passive, adapter, ctx_id, stream)
+}
+
+/// Exact canonical owner-table lease retained across K11's host response read
+/// and HVR1 publication. The ids are private diagnostics for the submit helper;
+/// callers cannot substitute another pair after admission.
+pub(crate) struct VenusSessionGuard<'a> {
+    _pair: super::control_owner::PairUseGuard<'a>,
+    context_id: u32,
+}
+
+pub(crate) fn borrow_venus_session_pair<'a>(
+    adapter: &'a AdapterContext,
+    owner: super::gpu::DeviceOwner,
+    context_id: u32,
+    reply_resource_id: u32,
+) -> Result<VenusSessionGuard<'a>, VirtioError> {
+    let pair = adapter
+        .control_owner()
+        .borrow_session_pair(owner, reply_resource_id, context_id)?;
+    Ok(VenusSessionGuard {
+        _pair: pair,
+        context_id,
+    })
+}
+
+/// K11's finite session-local direct submit.
+///
+/// The ordinary direct helper predates canonical owner rundown and is suitable
+/// only for the adapter Venus client, whose mutex/lifecycle is stopped by its
+/// own owner.  A live HTS1 session instead borrows the exact role-1
+/// resource/context association.  Stop/reset closes that admission and cannot
+/// authorize physical reset until this guard returns, so a host decoder can
+/// never retain K2a pages past their owner-table lifetime.
+pub(crate) fn submit_venus_session_sync(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    session: &VenusSessionGuard<'_>,
+    control_fence_id: u64,
+    stream: &[u8],
+) -> Result<(), VirtioError> {
+    if control_fence_id == 0 || stream.is_empty() {
+        return Err(VirtioError::DeviceError);
+    }
+    let Ok(size) = u32::try_from(stream.len()) else {
+        return Err(VirtioError::DeviceError);
+    };
+    let mut cmd = helios_protocol::VirtioGpuCmdSubmit::zeroed();
+    cmd.hdr.type_ = helios_protocol::VIRTIO_GPU_CMD_SUBMIT_3D;
+    // A bare SUBMIT_3D response proves only that the renderer accepted the
+    // bytes for decode.  K11 needs the reply write itself to be terminal, so
+    // each of its fixed CPU-control submissions carries a stock per-context
+    // fence on ring zero.  This is neither the adapter-global wire timeline nor
+    // a WDDM SubmissionFenceId: the newly created Venus context is the fence
+    // namespace, ring zero is its decoder/pure-control timeline, and the
+    // caller supplies one of that session's finite ordered constants.
+    cmd.hdr.flags = VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX;
+    cmd.hdr.ctx_id = session.context_id;
+    cmd.hdr.fence_id = control_fence_id;
+    cmd.hdr.ring_idx = 0;
+    cmd.size = size;
+    ctrl_roundtrip_ok_finite(passive, adapter, bytes_of(&cmd), Some(stream))
 }
 
 /// ASYNC venus SUBMIT_3D (the ICD escape path): stage the stream into DMA

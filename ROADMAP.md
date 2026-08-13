@@ -63,18 +63,20 @@ general license to move retirement work into QEMU.
 346 `_0116` symbols, `HRTFENCE`,
 `pfnCreateNativeFenceCb`/`pfnOpenNativeFenceCb`).
 
-⭐ **The WDDM 3.2 source/boot boundary and K2a's shared-backing CPU-view
-boundary are crossed, but the package remains runtime-unadmitted.** Do not infer
-a working display from the package state or the successful K2a map:
+⭐ **The WDDM 3.2 source/boot boundary, K2a's shared-backing CPU view, and K11's
+per-session host-transport boundary are crossed, but the package remains
+runtime-unadmitted.** Do not infer a working display from package state or the
+successful K2a/K11 target exercises:
 
 | Component | State | Why |
 |---|---|---|
 | `wddm_surface.rs` `SURFACE` | `Wddm3_2GpuMmu`; `KMD_D2_OWNER_ENABLED` and native-fence advertisement derive solely from it | D9's terminal callback/capability package cold-loads on build 26100. WDK 28000 remains only the compile-time binding authority. |
 | K2a CPU view | WDDM `ShareBackingStoreWithKmd` + system-memory shared allocation + `DxgkDdiSetAllocationBackingStore`; roles 1–3 only | KMD 22.22.288.0 / `oem120.inf` exercised the exact 4 MiB renderer alias in both directions and passed role, repetition, wrong-process, stale-handle, and process-teardown probes. This does not admit DWM. |
+| K11 session transport | One stock Venus context/object namespace and one private 4 KiB host-reply target per exact live HTS1 session; role-1 HVM1 remains the sole HVR1 carrier | KMD 22.22.296.0 / `oem128.inf` returned actual finite host INIT replies, kept simultaneous same-process sessions distinct, isolated another process, drained normal/abrupt/reset teardown, and left `TsSlotStuck=0`. Allocation-backed and GPU-dependent work still refuses. This does not admit DWM. |
 
-**THE ESCAPE-FREE K2A SHARED-BACKING CPU VIEW LANDED AND WAS EXERCISED ON THE
-TARGET, WHILE THE WDDM 3.2 DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED; HPS2
-RETIREMENT AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**
+**THE ESCAPE-FREE K11 PER-SESSION HOST TRANSPORT LANDED AND WAS EXERCISED ON
+THE TARGET, WHILE THE WDDM 3.2 DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED;
+MESA A3/A4, HPS2 RETIREMENT, AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**
 
 **`VK_LAYER_HELIOS_present` LOADS, RUNS, and now BUILDS A WSI DEVICE**
 (`FINDINGS.md` F7 + its two addenda). Staged by
@@ -581,14 +583,16 @@ In order:
    + `icd/mesa` `33db3fd` + `vkd3d-proton-helios` `cdf1bce`. Verified: gates
    8/8, `kmd_render` check exit 0 at the 22-warning baseline, `umd` exit 0, mesa
    ICD + present layer link clean, vkd3d native build green.
-3. **A1 → A2 → A3 → K5 → K6** ← **THE CRITICAL PATH.** A1 ✅ (`icd/mesa`
+3. **A1 → A2 → K5 → K6 → K2a → K11 → A3/A4** ← **THE CRITICAL PATH.** A1 ✅ (`icd/mesa`
    `6ad43fb`, rewritten onto A2 in `1b97c64`), **A2 ✅** (`1b97c64`, gate
    `c20d162`), **K5 ✅** (gate `tools/hts1-attach-gate.sh`, acceptance
    `tools/hts1_session_probe.c` **15/15** on KMD 22.22.267.0), **K6 ✅**
    (2026-08-11 — gate `tools/hnr2-decode-gate.sh`, acceptance
    `tools/hnr2_native_probe.c` **15/15** on KMD **22.22.271.0**, with
-   `hts1_session_probe` still 15/15 beside it). **Remaining: A3** — plus **K2a**,
-   which A3's memory half turns out to sit on and which was not on anyone's list.
+   `hts1_session_probe` still 15/15 beside it), **K2a ✅** (KMD 22.22.288.0,
+   52/52 plus an exact bidirectional 4 MiB alias), and **K11 ✅** (KMD
+   22.22.296.0, actual host INIT replies plus per-session/process/reset teardown
+   evidence). **Remaining: Mesa A3/A4.**
    ⭐ The HVM1 write-back blocker is **CLOSED** (`a8527e2`, `FINDINGS.md` F11);
    the private-data window blocker K6 hit is **CLOSED** (`FINDINGS.md` F13 —
    `DxgkDdiRender` must advance `pDmaBufferPrivateData`).
@@ -598,10 +602,11 @@ In order:
    VidMm-backed guest RAM, disjoint from the venus blob the KMD allocated for it:
    `ctrl::map_blob_at` is the only code that aliases the two, its one caller
    refuses `!bar_eligible`, and `admit_hvm1` sets exactly that. So A1's landed
-   role-1 reply pool is **bound but not reachable**, and A3's roles 1-3 would ship
-   the same defect. Two units sit between A3 and a frame, and neither is A3:
-   **K2a** (below) and **K11** (the host session — `session_init` grants zero
-   endpoints today, so `helios_translation_session_create` cannot succeed at all).
+   role-1 reply pool was **bound but not reachable**, and A3's roles 1-3 would
+   have shipped the same defect. That checkpoint identified two prerequisites:
+   **K2a** (below) and **K11**. Both have since crossed their exact target gates;
+   `session_init` now publishes a nonzero bounded endpoint capacity only after
+   the distinct stock Venus context and actual finite host INIT reply exist.
 
 #### K2a — the HLM1 CPU-view binding (started 2026-08-11)
 
@@ -758,7 +763,82 @@ back. QEMU returned to the identical 227-FD baseline: one `/dev/udmabuf` and
 two `/dmabuf:` descriptors.
 
 This admits K2a only. The current DWM still loads WARP and DisplayConfig reports
-zero paths; K11 and Mesa A3/A4 remain required before cold-DWM admission.
+zero paths; at this checkpoint K11 and Mesa A3/A4 remained required before
+cold-DWM admission.
+
+#### ⭐ K11 final design and target exercise — one stock Venus namespace per HTS1 session (2026-08-14)
+
+K11 closes K5/K6's exact host-handoff boundary without starting Mesa A3/A4 or
+the later allocation/GPU execution units:
+
+* The ordinary HVC1 control-context path creates one heap-pinned `SessionObject`.
+  Its exact raw KMD device owns one distinct stock Venus context, one 4 KiB
+  HOST3D/MAPPABLE reply target, and one `VkInstance`. The canonical role-1
+  allocation/open object binds directly to that session and supplies the sole
+  user-visible HVR1 carrier; no PID, name, global lookup, resource identity, or
+  host token is accepted from user mode.
+* INIT submits `vkSetReplyCommandStreamMESA` and `vkCreateInstance` as two
+  fenced ring-zero operations. KMD validates the actual 24-byte host reply's
+  opcode, status, pointer count, and instance identity before publishing a
+  fresh nonzero generation, CSPRNG capability, or endpoint capacity. The
+  endpoint/ring table is fixed at 64 entries maximum and reserves each granted
+  nonzero ring before publication. Ring zero remains decode/pure-control only.
+* The finite allowlist contains only this allocation-free synchronous INIT.
+  Allocation-backed, queue, GPU-dependent, and general Venus work continue to
+  refuse at named K6 boundaries until their owning later units land. An actual
+  host reply is copied into the exact checked-out K2a role-1 slot as HVR1; four
+  1 MiB slots and the 64 MiB logical snapshot ceiling remain unchanged.
+* Outer HQA1 contexts retain direct strong session/endpoint references and
+  revalidate the exact allocation and transport generation; SubmitCommand does
+  no session discovery. Host-completed records use one context-local monotonic
+  WDDM `SubmissionFenceId` watermark. There is no adapter-global boundary
+  queue, independent shared timeline, polling, sleep, or synthetic completion.
+* Teardown first closes admission, drains the exact in-flight rundown, destroys
+  the host `VkInstance`, unrefs the private reply resource, destroys the Venus
+  context, and only then permits session/K2a references to fall. Failed or
+  repeated INIT aborts the exact checked-out slot before draining, so no reply
+  slot is stranded. Reset, StopDevice, RemoveDevice, process/device/context
+  destruction, and abrupt exit use the same revocation boundary.
+* The bounded code-review pass found that carrying a per-session rundown or the
+  WDDM notification lock through `DxgkCbSynchronizeExecution` can deadlock a
+  concurrent failed-INIT teardown. The final source instead admits completion
+  through one fixed per-adapter rundown spanning current-generation validation
+  through the exact OS notification, while session/resource guards end before
+  that callback. Reset/Stop/Remove close and join this rundown before host
+  teardown; ordinary session destruction never waits on the callback it caused.
+* HTS1/HVC1/HQA1/HNR2/HVM1/HVR1 remain fixed and pointer-free. No host context
+  id, renderer resource id, pointer, handle, PID, or reusable lookup token was
+  added. Escape and all HWQueue-family registrations remain NULL. QEMU and
+  virglrenderer are unchanged from frozen K2a head `415a5ef`; HPM1 and kernel
+  parameters remain untouched.
+
+**Final-source runtime evidence.** KMD **22.22.296.0** loaded as `oem128.inf`
+on build 26100 with `CM_PROB_NONE`. The active DriverStore SYS is 880,376 bytes,
+SHA-256 `b12a1c914eb1a126c7170ad00974a5310f3828df65ed4d835bf09592c538167e`,
+and carries a valid WDR test signature. The K11 probe passed **14/14**: two
+simultaneous sessions in one process requested capacities four and two, received
+distinct nonzero generations/capabilities, produced correlated final HVR1
+bytes for the exact host `vkCreateInstance`, rejected a crossed session attach,
+isolated an abrupt child process, repeated four INIT/teardown cycles, and created
+a fresh session afterward. The standing HTS1, updated HNR2, and K2a probes
+passed **15/15**, **15/15**, and **52/52** respectively. The HNR2 regression
+case completed first rather than hanging while it deliberately refused a second
+INIT on the same live session.
+
+The held-reset arm reached READY, survived an exact PnP adapter restart, observed
+the old capability drain, and exited cleanly. The adapter returned Code 0 and a
+fresh K11 run passed 14/14 with `K11CtxNew=K11CtxDel=8`, all K11 failure
+counters zero, `K11CmpOpenRej=0`, and `TsSlotRel=8` / `TsSlotStuck=0`; the host returned to its two-process
+virgl-render-server baseline with no transient per-session server left. The K11
+semantic gate rejects 62 in-memory
+mutations covering namespace sharing/discovery, early or zero-capacity success,
+forbidden work, polling/synthetic completion, unbounded storage, teardown
+ordering, ABI tokens, alternate carriers, host-maintenance dependencies, and
+false display claims.
+
+This admits K11 only. DWM still loads WARP and DisplayConfig still reports zero
+active paths after the reset. Mesa A3/A4 is the next handoff; no visible or
+cold-DWM admission, HPS2 retirement, or production-correctness claim follows.
 
 #### ⭐ THE CRITICAL PATH IS NOW THE DISPLAY LANE — decided 2026-08-11 by the owner
 
@@ -767,7 +847,7 @@ immediately."* K2a's CPU view is reached by earning the WDDM 3.2 surface, not by
 another placement experiment or an instrument (`FINDINGS.md` F17). The sequence is
 `lane-kmd-display.md`'s own dependency graph, and it ends where K2a resumes:
 
-Rows 1-6 preserve the evidence at each precursor checkpoint. Row 7 is the
+Rows 1-7 preserve the evidence at each precursor checkpoint. Row 8 is the
 authoritative current state and supersedes their dormant/false-boundary
 statements without changing the display-admission result.
 
@@ -777,17 +857,18 @@ statements without changing the display-admission result.
 | 2 | **D2** `direct_scanout.rs` (ADD) | D3 depends on it | **DISABLED KMD PLATFORM D2 VERTICAL LANDED; PRODUCTION KMD D2 REMAINS ABSENT.** `kmd_logic` models the exact final-HWA2/source/committed-mode/plane predicate, move-only real/parking lifetime, atomic display-backing references, domain/epoch-qualified resource-window outcomes, canonical `(context, resource)` associations, and attachment-bound context lease/census. Behind the compile-time-false `KMD_D2_OWNER_ENABLED` boundary, StartDevice constructs the sole canonical control owner from its exact initialized transport and final host-window geometry; the new platform half then consumes only canonical allocation-object facts (including transport instance), committed mode, exact source/plane attributes, and operation flags. One stable `PlaneState` owns candidate/current/backend/reset/mode-transition custody; a retained candidate is submitted by a unique nonzero fenced `SET_SCANOUT_BLOB`, accepted only with exact response flag/resource/ticket provenance, and ambiguous outcomes remain quarantined until verified physical reset. Explicit unbind replaces current with a permanent KMD-owned black parking blob before optional `SET(0)`; Stop/Remove/failed-Start/skipped-Stop/TDR and power/mode transitions compose without early release, and D0 plane events 7/8/9/10 are emitted at their causal transitions. The atomic-boundary gate now checks the exact false definition, guarded canonical authority, direct transport entry paths, and deliberate enabled/unguarded mutations. Windows `cargo check` is green at the exact 22-warning baseline, all 510 `kmd_logic` tests and the Linux retirement gates pass. This is source verification only: the legacy branch remains the sole production behavior; no activation, legacy removal, migration, deployment, or runtime-correctness claim occurred. The normative LINEAR producer profile remains intentionally unwired while today's OPAQUE producer disagrees. §6 items 6 and 8 remain resolved with immutable `qemu-helios` and parking-first unbind. |
 | 3 | **D3** `mpo3.rs` (ADD) — the seven MPO3 slots | `doc:2854` rejects a 3.2 package without a complete MPO3 surface | **DISABLED KMD D3 MPO3 TABLE LANDED; PRODUCTION KMD D3 REMAINS ABSENT.** All seven WDK-28000 callbacks are registered and ABI-pinned. CheckMPO3 returns reserved-clean false unless the false D2 boundary is crossed, then admits only the exact one-primary HWA2/source/mode/attribute profile. SetMPO3 touches only its retry output and atomics above PASSIVE, uses the documented `STATUS_RETRY`/`PrePresentNeeded` continuation, and at PASSIVE revalidates the exact OS context allocation, context owner, nonzero GPUVA, operation flags, default refresh duration, and actual plane attributes before retaining the D2 candidate. Zero-plane input uses parking-first explicit unbind; no special output, PostPresent, Hsync, or HW-flip-queue flag is set. The cap callbacks expose only one RGB plane and unity transforms after activation; ValidateUpdate resolves the exact live open-allocation object and rejects every mutation; ControlMode marks every request unsatisfied; PostMPO is an always-success counted tripwire. The generated 192-slot audit now classifies all seven as implemented (89 implemented / 91 disabled / 4 pending / 8 retiring). The atomic-boundary gate covers the false owner switch, absent MPO capability, 2.1 surface, guarded authority, and deliberate enabled, unguarded, decoy-guarded, advertised-cap, and raised-surface mutations. Windows `cargo check` remains green at exactly 22 warnings; all 510 `kmd_logic` tests and every Linux retirement gate pass. `KMD_D2_OWNER_ENABLED=false` and `SURFACE=Wddm2_1GpuMmu` are unchanged: no legacy removal/migration, activation, deployment, adapter restart, reboot, or runtime-correctness claim occurred. |
 | 4 | **D4** then **D5** (`display.rs`, `present_packet.rs`) | D5 is part of the MPO3 surface D9 gates on; D5 serializes after D4 (same file) | **DISABLED KMD D2/D3/D4/D5 DISPLAY AUTHORITY LANDED; PRODUCTION KMD D2/D3/D4/D5 REMAIN ABSENT.** D4: classic SetVidPn consumes the exact OS allocation/source/address/segment/flags through D2 admission; the DMA arm carries the exact device-specific open handle through an immutable canonical open/allocation association. Both retain a move-only candidate before accepting one exact fenced SET. Device-DIRQL uses four preallocated slots, a private adapter-bound non-cloneable capability, a bounded no-spin gate shared by every queue mutator, an exact-pinned allocator-disabled virtqueue, and a separately boxed queue with fail-closed teardown custody. The D4 source gate audits the full raised/synchronized call, macro, and indirect-call surface and mutation-rejects hidden helpers/macros, waits, allocation, signals, locks, PCI status access at raised IRQL, queue bypasses, dependency drift, forged proofs, publication/lifetime races, unguarded authority, legacy D4 mechanisms, and boolean-only activation. PASSIVE-only PCI reset is token-typed, raw-queue-lifetime-pinned, and completes before the transport spinlock is re-entered. The dormant D4 branch has no heuristic resource lookup, snapshot substitution, coalescer, fast bind, LINEAR fallback, or retry polling; D0 transitions occur at the first legal exact-completion DPC edge. D5: Present selects the `FlipWithMultiPlaneOverlay` union arm once and the false owner boundary returns counted `STATUS_NOT_SUPPORTED` before dereferencing it. The dormant arm admits exactly one enabled source-0/layer-0 plane after null/alignment/count/reserved-bit checks, validates its device-specific handle through both canonical live `OpenAllocation` projections and the current immutable HWA2 primary profile, and preserves the exact handle/segment/physical-address tuple. WDK 28000 marks the Win7+ patch output unused, so D5 emits the existing ordinary HERF packet with no invented allocation-list index, patch entry, private HPS record, or display lease; SetMPO3 remains the first display-custody transition. The D5 gate fixes the complete call surface and mutation-rejects guard/decoy/boolean-only activation, union reinterpretation, zero/disabled/multiple planes, pointer/count/profile/provenance/capacity weakening, heuristic identity, private tickets, display-lifetime/control work, PresentToHwQueue union reads, and D4 layout/DIRQL regressions. Windows `cargo check` remains green at exactly 22 warnings; all 510 `kmd_logic` tests, the unchanged D4 proof, and every Linux retirement gate pass. The false branch remains the only production authority, and activation is rejected while legacy authority/host-write paths exist. `KMD_D2_OWNER_ENABLED=false` and `SURFACE=Wddm2_1GpuMmu` remain unchanged; no deployment, reboot, adapter restart, runtime-correctness claim, HPS2 removal, legacy demolition, or activation occurred. |
-| 5 | **native fences (K7)** | `doc:2854` rejects 3.2 on an incomplete FENCE surface too | **DORMANT NATIVE-FENCE SURFACE LANDED; PRODUCTION NATIVE-FENCE AUTHORITY REMAINS ABSENT.** StartDevice now publishes its exact `AdapterLuid`; stable per-adapter state owns feature admission, LUID, lifecycle, nonwrapping epochs/generations, and bounded populations. QueryAdapterInfo supplies the exact validated native-caps arm and publishes `NativeGpuFence` only through the full surface/D2-owner/LUID/feature/lifecycle conjunction. Six callback slots remain registered, both native-log slots remain NULL/Disabled, hardware queues remain unsupported, and `No64BitAtomics` plus optimized native interrupts remain zero. HNF1 stays 64-byte/pointer-free with input generation zero and successful output generation nonzero; create/open/update/teardown reject foreign, stale, malformed, overflowing, or partially valid input before mutation. A real completed WDDM submission plus a current monitored population is the only native-rescan edge, delivered through D4's audited DIRQL helper. Reset, stop, remove, and skipped-stop invalidation ordering is preserved. NF-UAF-1 is closed by dxgkrnl's documented global/local reference order, with a bounded refuse-and-retain fallback if Destroy ever arrives with locals outstanding. The K7 gate imports the unchanged D4/D5 source proofs and rejects 35 temporary-tree mutations through the real gate. Windows `cargo check` is green at 13 warnings—the prior nine F9 dead-symbol warnings are gone and no new category appeared; all 511 `kmd_logic` unit tests and every Linux retirement gate pass; the callback audit remains 89 implemented / 91 disabled / 4 pending / 8 retiring; WDK-28000 bindings remain byte-identical at SHA-256 `148b75db41e093dc6783be4f5bb3ea84b2c7c39ef316fe711b3f2a5a0668bea2`. `SURFACE=Wddm2_1GpuMmu` and `KMD_D2_OWNER_ENABLED=false` are unchanged, so no callback or cap is reachable in production and no activation, deployment, legacy removal, runtime-correctness, or flip-readiness claim is made. |
-| 6 | **D9** the slot audit + `SURFACE` → `Wddm3_2GpuMmu` | the flip itself | **THE LOCAL WDDM 3.2/D2/NATIVE-FENCE ACTIVATION PACKAGE IS DEPLOYED AS KMD 22.22.284.0 BUT REMAINS RUNTIME-UNADMITTED; HPS2 RETIREMENT AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.** The 192 callback slots are terminal at 91 Implemented / 101 Disabled / 0 Pending / 0 Retiring. Escape and all seven HW-context/HW-queue-family registrations are absent; hardware queues, native-fence logs, `No64BitAtomics`, optimized native interrupts, Hsync/HW-flip/post-composition authority remain unsupported. The two exact WDK-28000 diagnostic callbacks validate IRQL, pointer/range/alignment, enum/type, payload/profile, and aliasing before publishing bounded local output. `SupportMultiPlaneOverlay`, `MaxOverlayPlanes=1`, Direct Flip, and every segment Direct-Flip bit now derive from the exact SURFACE-owned D2 package, with the one-primary/RGB/unity profile. The generated human/machine audits are fresh; `tools/d9-wddm32-activation-gate.py` rejects 73 temporary-tree mutations, including mixed/decoy activation, stale audit, unsafe diagnostics, reopened legacy display continuations, UMD/KMD MPO drift, physical-adapter-cap drift, the superseded build-28000 guest minimum, and false cold-admission claims. Windows `cargo check` passes at exactly 13 warnings; all 511 `kmd_logic` unit tests, both integration suites, D4/D5/K7 safety proofs, all 35 K7 mutations, and every Linux retirement gate pass. VM-generated and offline WDK bindings agree at 3,834,340 bytes / SHA-256 `148b75db41e093dc6783be4f5bb3ea84b2c7c39ef316fe711b3f2a5a0668bea2`. The exact `.284` SYS is 838,904 bytes / SHA-256 `873767b730ec269e5b535829d80da650b321900f5fa38769776e98fcc4ad5ef2`, staged as `oem116.inf`, and cold-loaded on build 26100 with Code 0 and dxdiag reporting WDDM 3.2. DWM starts after boot, but there are zero active DisplayConfig paths and no KMD `SET_SCANOUT_BLOB`: DWM loads WARP rather than `helios_umd.dll`, and a direct Helios `D3D11CreateDevice` fails `0x80004005` after the selected Mesa ICD's legacy Gate-5a `D3DKMTEscape` receives `STATUS_NOT_SUPPORTED`. The owner explicitly rejects restoring Escape and accepts a dark display while the escape-free Mesa/KMD-core replacement advances. No cold-DWM admission, push, K2a work, wider K1/D6/D7/D8 demolition, full HPS2 retirement, or runtime/visible-desktop correctness claim occurred. CpuHostAperture and other §18 legacy retirement mechanisms remain live. |
+| 5 | **native fences (K7)** | `doc:2854` rejects 3.2 on an incomplete FENCE surface too | **DORMANT NATIVE-FENCE SURFACE LANDED; PRODUCTION NATIVE-FENCE AUTHORITY REMAINS ABSENT.** StartDevice now publishes its exact `AdapterLuid`; stable per-adapter state owns feature admission, LUID, lifecycle, nonwrapping epochs/generations, and bounded populations. QueryAdapterInfo supplies the exact validated native-caps arm and publishes `NativeGpuFence` only through the full surface/D2-owner/LUID/feature/lifecycle conjunction. Six callback slots remain registered, both native-log slots remain NULL/Disabled, hardware queues remain unsupported, and `No64BitAtomics` plus optimized native interrupts remain zero. HNF1 stays 64-byte/pointer-free with input generation zero and successful output generation nonzero; create/open/update/teardown reject foreign, stale, malformed, overflowing, or partially valid input before mutation. A real completed WDDM submission plus a current monitored population is the only native-rescan edge, delivered through D4's audited DIRQL helper. Reset, stop, remove, and skipped-stop invalidation ordering is preserved. NF-UAF-1 is closed by dxgkrnl's documented global/local reference order, with a bounded refuse-and-retain fallback if Destroy ever arrives with locals outstanding. The K7 gate imports the unchanged D4/D5 source proofs and rejects 35 in-memory mutations through the real gate. Windows `cargo check` is green at 13 warnings—the prior nine F9 dead-symbol warnings are gone and no new category appeared; all 518 `kmd_logic` unit tests plus both integration suites and every Linux retirement gate pass; the callback audit remains 89 implemented / 91 disabled / 4 pending / 8 retiring; WDK-28000 bindings remain byte-identical at SHA-256 `148b75db41e093dc6783be4f5bb3ea84b2c7c39ef316fe711b3f2a5a0668bea2`. `SURFACE=Wddm2_1GpuMmu` and `KMD_D2_OWNER_ENABLED=false` are unchanged, so no callback or cap is reachable in production and no activation, deployment, legacy removal, runtime-correctness, or flip-readiness claim is made. |
+| 6 | **D9** the slot audit + `SURFACE` → `Wddm3_2GpuMmu` | the flip itself | **THE LOCAL WDDM 3.2/D2/NATIVE-FENCE ACTIVATION PACKAGE IS DEPLOYED AS KMD 22.22.284.0 BUT REMAINS RUNTIME-UNADMITTED; HPS2 RETIREMENT AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.** The 192 callback slots are terminal at 91 Implemented / 101 Disabled / 0 Pending / 0 Retiring. Escape and all seven HW-context/HW-queue-family registrations are absent; hardware queues, native-fence logs, `No64BitAtomics`, optimized native interrupts, Hsync/HW-flip/post-composition authority remain unsupported. The two exact WDK-28000 diagnostic callbacks validate IRQL, pointer/range/alignment, enum/type, payload/profile, and aliasing before publishing bounded local output. `SupportMultiPlaneOverlay`, `MaxOverlayPlanes=1`, Direct Flip, and every segment Direct-Flip bit now derive from the exact SURFACE-owned D2 package, with the one-primary/RGB/unity profile. The generated human/machine audits are fresh; `tools/d9-wddm32-activation-gate.py` rejects 73 in-memory mutations, including mixed/decoy activation, stale audit, unsafe diagnostics, reopened legacy display continuations, UMD/KMD MPO drift, physical-adapter-cap drift, the superseded build-28000 guest minimum, and false cold-admission claims. Windows `cargo check` passes at exactly 13 warnings; all 518 `kmd_logic` unit tests plus both integration suites, both integration suites, D4/D5/K7 safety proofs, all 35 K7 mutations, and every Linux retirement gate pass. VM-generated and offline WDK bindings agree at 3,834,340 bytes / SHA-256 `148b75db41e093dc6783be4f5bb3ea84b2c7c39ef316fe711b3f2a5a0668bea2`. The exact `.284` SYS is 838,904 bytes / SHA-256 `873767b730ec269e5b535829d80da650b321900f5fa38769776e98fcc4ad5ef2`, staged as `oem116.inf`, and cold-loaded on build 26100 with Code 0 and dxdiag reporting WDDM 3.2. DWM starts after boot, but there are zero active DisplayConfig paths and no KMD `SET_SCANOUT_BLOB`: DWM loads WARP rather than `helios_umd.dll`, and a direct Helios `D3D11CreateDevice` fails `0x80004005` after the selected Mesa ICD's legacy Gate-5a `D3DKMTEscape` receives `STATUS_NOT_SUPPORTED`. The owner explicitly rejects restoring Escape and accepts a dark display while the escape-free Mesa/KMD-core replacement advances. No cold-DWM admission, push, K2a work, wider K1/D6/D7/D8 demolition, full HPS2 retirement, or runtime/visible-desktop correctness claim occurred. CpuHostAperture and other §18 legacy retirement mechanisms remain live. |
 | 7 | **K2a shared-backing CPU view** | D9 makes the WDDM 3.1+ `ShareBackingStoreWithKmd` contract available. K2a uses the exact WDDM allocation and OS-supplied backing-store MDL; Mesa retains the creating process's ordinary `D3DKMTLock2` VA. A scoped upstream-rebased QEMU change imports the exact guest pages into Venus without HPM1 or virglrenderer changes. | **LANDED AND EXERCISED ON THE TARGET.** Four 1 MiB reply slots; roles 1–3 only; role 4 refused. KMD 22.22.288.0 / `oem120.inf`, deployed SYS 849,144 bytes / SHA-256 `df5903586a067b3c2e4047713278f92b38e7573e695fcd12bdd63d25d2556b86`; interface size 576, feature enabled; lifecycle probe 52/52; exact 4 MiB renderer alias passed correlated boundary-byte tests in both directions; QEMU returned to 227 total FDs (one `/dev/udmabuf`, two `/dmabuf:`). Escape and HWQueue registrations remain NULL. K11 and Mesa A3/A4 are not started by this tranche; no visible/cold-DWM admission is claimed. |
+| 8 | **K11 per-session host Venus transport** | K5/K6 already own exact WDDM process/device/context/session lifetimes and finite HNR2 admission. K11 binds one distinct stock Venus context/object namespace to each exact session, gets the real finite INIT reply through a private host target, and publishes it only through the K2a role-1 HVR1 pool. | **LANDED AND EXERCISED ON THE TARGET.** KMD 22.22.296.0 / `oem128.inf`; actual host INIT reply; K11 14/14, HTS1 15/15, updated HNR2 15/15, and K2a 52/52. Same-process sessions were distinct, another process was isolated, repeated and abrupt teardown left no stale session, and a held-capability adapter restart drained cleanly before a fresh 14/14. Four 1 MiB slots and the 64 MiB logical ceiling are unchanged; allocation/GPU work still refuses; QEMU/virglrenderer/HPM1/kernel parameters are unchanged. Escape and HWQueues remain NULL. Mesa A3/A4, visible admission, HPS2 retirement, and production correctness remain outstanding. |
 
 ⚠ **The desktop stays dark for most of this**, by the owner's explicit acceptance.
-D9 and K2a have crossed their source and exact-target runtime boundaries, but
+D9, K2a, and K11 have crossed their source and exact-target runtime boundaries, but
 the display remains runtime-unadmitted. The measured blocker is no longer the former
 `CDDisplaySwapChain`/`E_NOTIMPL` WDDM-version boundary: the selected Mesa ICD
 still requires the now-retired Escape carrier during D3D11 device creation, so
 DWM falls back to WARP before a primary is programmed. Escape must not be
-restored. Continue with K11 and Mesa A3/A4, then return to the
+restored. Continue with Mesa A3/A4, then return to the
 cold-DWM gate. Only visible DWM startup on WDDM 3.2 admits the surface; a build,
 callback count, Code 0, counter, map result, or log cannot. F1 permits the measured
 build-26100 target; WDK 28000 remains the compile-time header/binding authority.
@@ -872,8 +953,8 @@ does not implement either:
 | **A1** HTS1 session | `vn_helios_translation_session.{c,h}` | L | ✅ **LANDED** `6ad43fb`; **rewritten onto A2's encoder in `1b97c64`** — see below, its own encoder was wire-invalid in three ways |
 | **A2** native KMT lane | `vn_helios_native_kmt.{c,h}` | XL | ✅ **LANDED** `icd/mesa` `1b97c64`, reviewed and repaired in `f235ca4`, gate `c20d162`/`c90e5a8`. Cross-builds; its encoder half is **executed** by `tools/hnr2-encoder-gate.sh` against `protocol/`'s validator (18 batches / 86 fragments; 10 deliberate mutations caught). ⚠ The KMT half is **compile-verified only** — nothing executes it until K5 |
 | **A3** renderer rewrite | `vn_renderer_helios.c` (**5261** lines at HEAD; the brief's inventory says 5304 and is stale) | XL | absent |
-| **K5** KMD HTS1 sessions | `kmd_render/src/ddi/translation_session.rs` | L | ✅ **LANDED.** Pure half in `kmd_logic::translation_session` (263 tests, was 211), platform half in `ddi/translation_session.rs` + `device.rs`, gate `tools/hts1-attach-gate.sh`. `cargo check` exit 0 at the **22-warning baseline**. ⚠ Its INIT arm is **implemented and unreachable** — see below |
-| **K6** KMD HVC1/HNR2 render | `kmd_render/src/ddi/native_render.rs` | XL | ✅ **LANDED AND EXERCISED ON THE TARGET.** Pure half in `kmd_logic::native_render` (293 tests, was 265), platform half in `ddi/native_render.rs` + the Render/Patch/SubmitCommand arms, gates `tools/hnr2-decode-gate.sh` (A2's real corpus) and `tools/hnr2_native_probe.c` (**15/15**, KMD 22.22.271.0). ⚠ It stops at the **host handoff** by design and every stop is a named counter — `Nr2NoHost`, `Nr2NoSchema`, `Nr2NoResid`, `Nr2NoReply`, `Nr2NoStage`, `Nr2NoEpoch`, `Nr2Hos1NoX`. `session_init` has a caller now and **still refuses**: it grants zero endpoints until K11, so `TsInitOk` stays 0 and `TsInitRej` is what moves (measured: 2) |
+| **K5** KMD HTS1 sessions | `kmd_render/src/ddi/translation_session.rs` | L | ✅ **LANDED AND NOW HOST-REACHABLE THROUGH K11.** The K5 session/slot/attach lifetime remains the authority; K11 supplies the distinct host namespace only after the exact role-1 allocation binds. HTS1 remains **15/15** on KMD 22.22.296.0. See the historical checkpoint below and the K11 final section above. |
+| **K6** KMD HVC1/HNR2 render | `kmd_render/src/ddi/native_render.rs` | XL | ✅ **LANDED AND EXERCISED ON THE TARGET; K11 CLOSES ONLY ITS PURE INIT HOST HANDOFF.** The existing Render/Patch/SubmitCommand decoder and context-local slot ownership now execute one finite allocation-free `vkCreateInstance` INIT, validate its actual host reply, publish HVR1, and admit the exact host-completed WDDM record. Allocation-backed, queue, general-schema, residency, staging, and epoch work still stop at the named K6 counters. The updated HNR2 probe passes **15/15** on KMD 22.22.296.0 and verifies a second INIT on the same live session refuses without stranding its slot. |
 
 ⭐ **What de-risks it:** every wire record these five need is already written and
 offset-asserted in `protocol/` — HTS1/HQA1, HVC1/HNR2/HVM1/HVR1 and their C
@@ -944,16 +1025,14 @@ context gets a zero segment set; §10.7:1981 keeps segment 1 as "the only nonzer
 choice for existing D3D runtime contexts, while HVC1 selects zero". Both arms now
 exist and the probe checks both. A global flip is a boot-killing regression.
 
-⚠ **What K5 does not do, and the boundary is exact.** The finite INIT *is* an HNR2
-control Render (§10.4:1206-1211), so `session_init` has **no caller until K6** —
-and when K6 supplies one it will still refuse, because the host Venus context is
-**K11**'s and `session_init` therefore grants zero endpoints rather than reporting
-a session with nothing behind it. Consequently no session ever reaches `Live`, so
-the whole HQA1 attach arm is unreachable too: `TsAttachOk` / `TsAttachRej` /
-`TsDetachOk` / `TsDetachRej` are graded **unreachable-until-K6** at their
-declarations, and the probe's forged-HQA1 case passes through `TsNoSess`, not
-through packet validation. That is `K4-CONTRACT.md` §8's third state, stated
-rather than implied.
+⚠ **Historical K5 boundary, now closed only for finite INIT by K6/K11.** At the
+K5 checkpoint the finite INIT had no HNR2 caller; after K6 it still refused
+because no host Venus context existed. K11 now creates that context, validates
+the actual finite host reply, reserves the bounded endpoint/ring namespace, and
+only then lets `session_init` reach `Live`, so HQA1 validation is reachable.
+This does not erase the boundary around allocation-backed or GPU-dependent
+operations: those still refuse at the named K6 seams until their later owners
+land. `K4-CONTRACT.md` §8 remains the historical three-state record.
 
 #### ⭐ The write-back blocker is CLOSED (2026-08-11, KMD 22.22.267.0) — and it was neither of the two candidates
 

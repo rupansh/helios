@@ -10,10 +10,11 @@
 //!
 //! K5 owns `DxgkDdiCreateContext`'s private-data dispatch and the HTS1 session
 //! state; K6 owns the HVC1 **queue** context, the per-context HNR2 assembler,
-//! and the Render/Patch/SubmitCommand arms. ⛔ K6 stops at the host handoff:
-//! there is no Venus opcode schema, no resid substitution, no HVR1 producer and
-//! no host ring, so every one of those is a named refusal here rather than a
-//! silent gap. K11 supplies them.
+//! and the Render/Patch/SubmitCommand arms. K11 advances exactly one boundary:
+//! the fixed pure-control HTS1 INIT gets a private stock-Venus context and a
+//! host-derived HVR1 reply. There is still no general Venus opcode schema,
+//! allocation resid substitution, or GPU queue executor, so every other host
+//! handoff remains a named refusal rather than a silent gap.
 
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
@@ -27,8 +28,11 @@ use helios_kmd_logic::native_render::{
     plan_capability_table, plan_output_patch_slots, snapshot_placement, validate_render_fragment,
     CapabilityTablePlan, OuterSubmitContext, RenderContext, RenderEnv, RenderRefusal,
 };
-use helios_protocol::native_render::kernel_dma::{Hnr2DmaReject, Hnr2KmdDmaPrivateV1,
-    Hnr2PhysicalCapability};
+use helios_kmd_logic::session_transport::{HostSubmissionRefusal, HostSubmissionState};
+use helios_protocol::native_render::kernel_dma::{
+    Hnr2DmaReject, Hnr2KmdDmaPrivateV1, Hnr2PhysicalCapability,
+    HELIOS_HNR2_KMD_DMA_FLAG_HOST_COMPLETED,
+};
 use helios_protocol::native_render::{
     HeliosNativeRenderPatch, HeliosNativeRenderUse, HeliosNativeRenderV2, Hnr2Accept, Hnr2Reject,
     Hnr2TableReject, HELIOS_HNR2_HEADER_SIZE, HELIOS_HNR2_MAX_PATCH_RECORDS,
@@ -168,6 +172,14 @@ pub static NR2_SLOT_TAKEN: AtomicU32 = AtomicU32::new(0);
 pub static NR2_SLOT_RETIRED: AtomicU32 = AtomicU32::new(0);
 /// HNR2 `DxgkDdiSubmitCommand` calls.
 pub static NR2_SUBMITS: AtomicU32 = AtomicU32::new(0);
+/// Exact K11 host-completed DMA records admitted onto their context-local WDDM
+/// submission watermark.  Each increment is downstream of the validated host
+/// reply and HVR1 publication, never merely a decoded/enqueued command.
+pub static NR2_HOST_SUBMIT_OK: AtomicU32 = AtomicU32::new(0);
+/// Host-completed records refused at SubmitCommand, packed as
+/// `(count << 16) | reason`: 1 = session/transport generation is no longer
+/// current, 2 = an unmarked duplicate fence, 3 = a backward fence.
+pub static NR2_HOST_SUBMIT_REJECT: AtomicU32 = AtomicU32::new(0);
 /// A user-buffer read whose `ProbeForRead` raised — the range was not user
 /// space. **Must read 0**; a nonzero value means `pCommand` is not the
 /// user-mapped command buffer this arm assumes.
@@ -212,17 +224,17 @@ pub static NR2_HOS1_REJECT: AtomicU32 = AtomicU32::new(0);
 pub static NR2_NO_SCHEMA: AtomicU32 = AtomicU32::new(0);
 /// COMMITs whose typed operands were left as the encoder wrote them (zero).
 /// The capability ordinal and the output patch entry ARE written; the resid
-/// rewrite rides with K11.
+/// rewrite belongs to the later allocation/GPU execution units.
 pub static NR2_NO_RESID: AtomicU32 = AtomicU32::new(0);
-/// Control Renders whose HVR1 reply was not produced. There is no HVR1
-/// constructor in any repo — `protocol` has a validator and no producer.
+/// Control Renders refused because K11's finite allowlist requires an actual
+/// role-1 HVR1 reply carrier.
 pub static NR2_NO_REPLY: AtomicU32 = AtomicU32::new(0);
-/// Submissions not dispatched to a host ring. No endpoint is ever granted (see
-/// `translation_session::session_init`), so there is no ring to dispatch on.
+/// Submissions not dispatched to a host ring. K11 completes only the exact
+/// pure-control INIT; allocation-backed and queue work remains refused.
 pub static NR2_NO_HOST: AtomicU32 = AtomicU32::new(0);
 /// COMMITs whose reassembled payload was accounted against the §10.7 pool but
-/// not retained. Nothing consumes it until K11, so 15 MiB per context of
-/// nonpaged staging would buy nothing.
+/// not retained. This applies to operations outside K11's synchronous finite
+/// INIT; retaining up to 15 MiB per context would provide no executor.
 pub static NR2_NO_STAGE: AtomicU32 = AtomicU32::new(0);
 /// Capability records left with `hpm_epoch == 0` because the KMD placement
 /// epoch is K2/K3's and has no producer — which is why `validate_at_submit` is
@@ -233,7 +245,7 @@ pub static NR2_HOS1_NOT_EXECUTED: AtomicU32 = AtomicU32::new(0);
 
 /// The counter names, as one list, so the collision proof and the writer cannot
 /// drift apart.
-const COUNTER_NAMES: [&[u8]; 36] = [
+const COUNTER_NAMES: [&[u8]; 38] = [
     b"Nr2QCtx",
     b"Nr2QCtxRej",
     b"Nr2Scratch",
@@ -270,6 +282,8 @@ const COUNTER_NAMES: [&[u8]; 36] = [
     b"Nr2PchTot",
     b"Nr2SubNoRec",
     b"Nr2WinFB",
+    b"Nr2HostOk",
+    b"Nr2HostRej",
 ];
 
 /// The boundary counters that did not fit [`COUNTER_NAMES`]'s block, mirrored
@@ -366,6 +380,8 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(COUNTER_NAMES[33], &NR2_PATCH_WINDOW_TOTAL),
         f(COUNTER_NAMES[34], &NR2_SUBMIT_NO_RECORD),
         e(COUNTER_NAMES[35], &NR2_WINDOW_FALLBACK),
+        e(COUNTER_NAMES[36], &NR2_HOST_SUBMIT_OK),
+        f(COUNTER_NAMES[37], &NR2_HOST_SUBMIT_REJECT),
         e(BOUNDARY_NAMES[0], &NR2_NO_STAGE),
         e(BOUNDARY_NAMES[1], &NR2_NO_EPOCH),
         e(BOUNDARY_NAMES[2], &NR2_HOS1_NOT_EXECUTED),
@@ -471,13 +487,14 @@ pub(crate) struct NativeContext {
     class: NativeClass,
     /// The host ring this context's submissions execute on.
     ///
-    /// ⛔ Always 0 today, for both classes: §10.7 gives a queue context a unique
-    /// nonzero ring, but rings are bound through `TranslationSession::bind_ring`
-    /// on an endpoint, endpoints exist only after INIT, and INIT grants none
-    /// until K11 creates the host Venus context. A queue context therefore
-    /// carries the control ring index and refuses at the host handoff rather
-    /// than inventing one.
+    /// ⛔ Always 0 today, for both classes. K11 reserves fixed nonzero endpoint
+    /// rings before publishing INIT capacity, but no queue operation executes
+    /// in this tranche; a queue context therefore retains ring zero only as a
+    /// refusal value and never submits through it.
     ring_index: u32,
+    /// One exact WDDM SubmissionFenceId watermark for this HVC1 context.  It is
+    /// neither an adapter-wide boundary queue nor a host/shared timeline.
+    host_submissions: SpinLock<HostSubmissionState>,
     /// The HNR2 assembler and its staging accounting. The §10.7:2041 short lock:
     /// taken for the admission decision only, never held across the user copy,
     /// a host call, or a wait.
@@ -495,10 +512,11 @@ pub(crate) struct NativeContext {
     scratch: UnsafeCell<Hnr2Scratch>,
 }
 
-// SAFETY: `state` is reachable only through its `SpinLock`; `class`/`ring_index`
-// are written once at construction and read-only afterwards; `scratch` is
-// reachable only through [`NativeContext::claim`], which hands out at most one
-// reference at a time via `busy`.
+// SAFETY: `state` and `host_submissions` are reachable only through their
+// `SpinLock`s; `class`/`ring_index` are written once at construction and
+// read-only afterwards; `scratch` is reachable only through
+// [`NativeContext::claim`], which hands out at most one reference at a time via
+// `busy`.
 unsafe impl Send for NativeContext {}
 // SAFETY: as above.
 unsafe impl Sync for NativeContext {}
@@ -514,6 +532,7 @@ impl NativeContext {
         Some(Self {
             class,
             ring_index: helios_protocol::native_render::HELIOS_HVC1_CONTROL_RING_INDEX,
+            host_submissions: SpinLock::new(HostSubmissionState::new()),
             state: SpinLock::new(RenderContext::new()),
             busy: AtomicU32::new(0),
             scratch: UnsafeCell::new(scratch),
@@ -658,7 +677,7 @@ unsafe fn publish_dma_record(
         capability_count: plan.map_or(0, |p| p.count),
         ring_index,
         slot_index: 0,
-        reserved: 0,
+        flags: 0,
     };
     let private_bytes = size_of::<Hnr2KmdDmaPrivateV1>();
     if args.pDmaBufferPrivateData.is_null()
@@ -677,6 +696,28 @@ unsafe fn publish_dma_record(
         );
     }
     true
+}
+
+/// Mark the exact DMA-private record whose finite host operation has already
+/// completed. `publish_dma_record` proved this pointer and extent immediately
+/// before the host call; this fixed offset write is therefore infallible local
+/// publication, not a context-global token that can be overwritten by a later
+/// pipelined Render.
+///
+/// # Safety
+/// The caller must have successfully published this submission's record into
+/// `args` and must not yet have advanced `pDmaBufferPrivateData`.
+unsafe fn mark_dma_host_completed(args: &DXGKARG_RENDER, batch_token: u64) {
+    let base = args.pDmaBufferPrivateData as *mut u8;
+    debug_assert!(!base.is_null());
+    debug_assert!((args.DmaBufferPrivateDataSize as usize) >= size_of::<Hnr2KmdDmaPrivateV1>());
+    let found = unsafe { core::ptr::read_unaligned(base.cast::<u64>()) };
+    debug_assert_eq!(found, batch_token);
+    let flags = unsafe {
+        base.add(core::mem::offset_of!(Hnr2KmdDmaPrivateV1, flags))
+            .cast::<u32>()
+    };
+    unsafe { core::ptr::write_unaligned(flags, HELIOS_HNR2_KMD_DMA_FLAG_HOST_COMPLETED) };
 }
 
 /// Advance `pDmaBufferPrivateData` past the record Render just wrote.
@@ -1071,18 +1112,33 @@ fn commit(
         out.SplitOffset = 0;
     }
 
-    // ── the control-context reply slot, and the finite INIT ─────────────────
-    if native.class == NativeClass::Control {
-        let status = control_render(session, args, header, accept, uses, list_count);
-        if status != STATUS_SUCCESS {
-            return status;
-        }
-    } else if accept.has_reply {
-        // Only the control context owns the session's reply pool (§10.4:1205).
+    // Only the control context owns the session's reply pool (§10.4:1205).
+    if native.class != NativeClass::Control && accept.has_reply {
         return refuse(RenderRefusal::ReplyOnQueueContext, STATUS_INVALID_PARAMETER);
     }
 
+    // K11 executes only this finite, copied one-fragment INIT allowlist.  The
+    // reply carrier is mandatory; reply-less control streams and every queue
+    // payload remain at the K6 refusal boundary.
+    let k11_init = native.class == NativeClass::Control
+        && accept.has_reply
+        && header.fragment_count == 1
+        && header.total_payload_bytes
+            == size_of::<helios_protocol::translation_session::HeliosTranslationSessionInitV1>()
+                as u64;
+    if native.class == NativeClass::Control && !accept.has_reply {
+        NR2_NO_REPLY.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    }
+    if native.class == NativeClass::Control && !k11_init {
+        NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    }
+
     // ── the §10.7 staging admission ─────────────────────────────────────────
+    // This and the private-record publication are deliberately before the host
+    // operation. Once the real host INIT succeeds, every remaining action in
+    // this Render is infallible local publication/accounting.
     {
         let mut state = native.state.lock();
         if let Err(refusal) = state.staging_mut().checkout(header.total_payload_bytes) {
@@ -1091,33 +1147,56 @@ fn commit(
         }
     }
     NR2_SLOT_TAKEN.fetch_add(1, Ordering::Relaxed);
-    // ⛔ ACCOUNTED, NOT RETAINED. Nothing consumes the reassembled Venus payload
-    // until K11 dispatches it, so 15 MiB per context of nonpaged staging would
-    // buy exactly nothing. The two caps are still enforced.
-    NR2_NO_STAGE.fetch_add(1, Ordering::Relaxed);
-    // The typed operands stay as the encoder wrote them: zero. The capability
-    // ordinal and the output patch entry above ARE written; only the host resid
-    // substitution is missing, and it has no source until K11.
-    if patch_count != 0 {
-        NR2_NO_RESID.fetch_add(1, Ordering::Relaxed);
-    }
-    // The payload was never classified against a generated opcode schema,
-    // because none exists on this side. K6 does not execute it either.
-    NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
 
     let payload_bytes = header.total_payload_bytes.min(u32::MAX as u64) as u32;
     // SAFETY: `args` is dxgkrnl's live argument struct.
     if !unsafe { publish_dma_record(args, header, Some(&table), native.ring_index, payload_bytes) }
     {
-        // Undo the admission: the submission will never reach SubmitCommand to
-        // retire it, and a leaked slot makes every later COMMIT on this context
-        // refuse once 64 have leaked.
         let _ = native
             .state
             .lock()
             .staging_mut()
             .retire(header.total_payload_bytes);
         return STATUS_INVALID_PARAMETER;
+    }
+
+    // ── the control-context reply slot, and the finite host INIT ─────────────
+    if native.class == NativeClass::Control {
+        let status = control_render(session, args, header, accept, uses, list_count);
+        if status != STATUS_SUCCESS {
+            // No SubmitCommand follows a failed Render, so give back the exact
+            // staging admission here. `control_render` likewise gives back its
+            // exact reply slot on every outcome.
+            let _ = native
+                .state
+                .lock()
+                .staging_mut()
+                .retire(header.total_payload_bytes);
+            return status;
+        }
+        debug_assert!(k11_init);
+        // SAFETY: `publish_dma_record` succeeded above and the private-data
+        // pointer is not advanced until after this exact marker is written.
+        unsafe { mark_dma_host_completed(args, header.batch_token) };
+    }
+
+    // The finite INIT needs no retained host staging: by this point the host
+    // operation and HVR1 publication are terminal. Every other payload remains
+    // deliberately unimplemented and retains K6's boundary counters.
+    if !k11_init {
+        NR2_NO_STAGE.fetch_add(1, Ordering::Relaxed);
+    }
+    // Outside pure INIT, typed operands stay as the encoder wrote them: zero.
+    // K11 resolves INIT's reply pool through the retained session allocation,
+    // so its reply-target patch is not a missing-resid event. General resid
+    // substitution belongs to the later allocation/GPU execution units.
+    if patch_count != 0 && !k11_init {
+        NR2_NO_RESID.fetch_add(1, Ordering::Relaxed);
+    }
+    // The payload was never classified against a generated opcode schema,
+    // because none exists on this side. K6 does not execute it either.
+    if !k11_init {
+        NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
     }
 
     // SAFETY: `plan_capability_table` proved the whole table is inside `DmaSize`.
@@ -1140,6 +1219,28 @@ fn commit(
     NR2_PATCH_SLOTS.fetch_add(plan.count, Ordering::Relaxed);
     NR2_COUNTERS.flush();
     STATUS_SUCCESS
+}
+
+/// Whether one classified control payload produced real reply bytes or only an
+/// exact ownership cancellation.
+#[derive(Clone, Copy)]
+enum ControlPayloadOutcome {
+    /// A real host reply and HVR1 payload were published.
+    Published,
+    /// The payload was refused before any host reply existed.
+    Refused,
+    /// INIT failed after closing this session's admission; finish teardown only
+    /// after the caller aborts its exact checked-out slot.
+    InitFailed,
+}
+
+impl ControlPayloadOutcome {
+    const fn status(self) -> NTSTATUS {
+        match self {
+            Self::Published => STATUS_SUCCESS,
+            Self::Refused | Self::InitFailed => STATUS_INVALID_PARAMETER,
+        }
+    }
 }
 
 /// The control context's half of a COMMIT: check out the reply slot, run the
@@ -1217,14 +1318,31 @@ fn control_render(
     };
     NR2_CONTROL_RENDERS.fetch_add(1, Ordering::Relaxed);
     let Some(slot_index) = admission.slot_index else {
-        // A reply-less control Render: nothing is waiting on a slot.
-        return STATUS_SUCCESS;
+        // K11's finite allowlist contains only INIT, and INIT has an actual
+        // host reply.  A reply-less control stream has no classified operation
+        // behind it and is refused before SubmitCommand.
+        NR2_NO_REPLY.fetch_add(1, Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
     };
 
-    // Everything below refuses, and every arm releases the slot first.
-    let status = run_control_payload(session, args, header, accept);
-    hts1::release_control_slot(session, slot_index, admission.slot_generation);
-    status
+    // The finite operation and HVR1 publication are synchronous. Success
+    // retires a genuinely-published reply; refusal cancels ownership without a
+    // synthetic completion. Failed INIT has already closed admission, and only
+    // after that exact cancellation may teardown destroy the host namespace.
+    let outcome = run_control_payload(session, args, header, accept, &admission);
+    match outcome {
+        ControlPayloadOutcome::Published => {
+            hts1::release_control_slot(session, slot_index, admission.slot_generation)
+        }
+        ControlPayloadOutcome::Refused => {
+            hts1::abort_control_slot(session, slot_index, admission.slot_generation)
+        }
+        ControlPayloadOutcome::InitFailed => {
+            hts1::abort_control_slot(session, slot_index, admission.slot_generation);
+            hts1::finish_failed_session_init(session);
+        }
+    }
+    outcome.status()
 }
 
 /// What the control payload is, and what K6 can do about it.
@@ -1233,7 +1351,8 @@ fn run_control_payload(
     args: &DXGKARG_RENDER,
     header: &HeliosNativeRenderV2,
     accept: &Hnr2Accept,
-) -> NTSTATUS {
+    admission: &helios_kmd_logic::translation_session::ControlRenderAdmission,
+) -> ControlPayloadOutcome {
     use helios_protocol::translation_session::HeliosTranslationSessionInitV1;
     const INIT_BYTES: usize = size_of::<HeliosTranslationSessionInitV1>();
 
@@ -1244,7 +1363,7 @@ fn run_control_payload(
         // generated opcode schema on this side to classify it against — so it is
         // refused rather than admitted unclassified onto ring 0.
         NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
-        return STATUS_INVALID_PARAMETER;
+        return ControlPayloadOutcome::Refused;
     }
     let mut raw = [0u8; INIT_BYTES];
     // SAFETY: `payload_offset`/`payload_bytes` were validated against
@@ -1258,26 +1377,26 @@ fn run_control_payload(
         )
     };
     if !ok {
-        return STATUS_INVALID_PARAMETER;
+        return ControlPayloadOutcome::Refused;
     }
-    match crate::ddi::translation_session::session_init(session, &raw) {
-        // ⛔ UNREACHABLE BY DESIGN, and it must stay that way until K11.
-        // `session_init` grants zero endpoints because the host Venus context
-        // does not exist, and `complete_init` refuses a zero grant. Reading a
-        // nonzero `TsInitOk` as K6's success criterion would grade a designed
-        // refusal as a regression.
-        Ok(_reply) => {
-            // A reply exists but there is nowhere to put it: writing it means
-            // mapping the guest's reply-pool allocation and building an HVR1
-            // header, and no HVR1 producer exists in any repo.
-            NR2_NO_REPLY.fetch_add(1, Ordering::Relaxed);
-            STATUS_INVALID_PARAMETER
-        }
+    match crate::ddi::translation_session::session_init(
+        session,
+        &raw,
+        admission.reply_offset,
+        admission.reply_capacity_bytes,
+        admission.slot_generation,
+        admission.batch_token,
+    ) {
+        // K11 synchronously validated the actual host reply and release-
+        // published HVR1/HTS1 into the admitted role-1 slot. The ordinary C51
+        // signal submitted immediately after Render remains the user-visible
+        // completion edge; no synthetic SubmissionFenceId is created here.
+        Ok(_reply) => ControlPayloadOutcome::Published,
         // ⛔ NORMALISED. `session_init` answers STATUS_DEVICE_NOT_READY /
         // STATUS_INSUFFICIENT_RESOURCES, and neither is in `DxgkDdiRender`'s
         // documented return set — an illegal NTSTATUS out of a DDI is itself
         // logged by dxgkrnl as a driver bug. The real reason is in `TsInitRej`.
-        Err(_status) => STATUS_INVALID_PARAMETER,
+        Err(_status) => ControlPayloadOutcome::InitFailed,
     }
 }
 
@@ -1464,9 +1583,29 @@ pub(crate) unsafe fn patch(args: &DXGKARG_PATCH) {
 
 // ── `DxgkDdiSubmitCommand`, the HNR2 arm ─────────────────────────────────────
 
-/// Retire one HNR2 submission's staging admission and refuse the host handoff.
+/// What the scheduler-facing DDI may do after retiring one HNR2 record.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeSubmitDisposition {
+    /// This exact WDDM fence belongs to a still-current session whose finite
+    /// host operation and HVR1 reply were already terminal before SubmitCommand.
+    HostCompleted(u32),
+    /// This packet never crossed K11's finite host boundary. Preserve K6's
+    /// existing scheduler retirement behavior without claiming host execution.
+    Refused,
+    /// Render crossed K11's finite host boundary, but teardown/reset or an
+    /// invalid context-local fence transition revoked completion authority
+    /// before SubmitCommand. The DDI must accept the callback without routing
+    /// this packet through any legacy/global completion path; reset owns the
+    /// abandoned scheduler epoch.
+    Revoked,
+}
+
+/// Retire one HNR2 submission's staging admission. K11's exact INIT token has
+/// already completed its finite host operation synchronously in Render; every
+/// other packet remains a counted K6 host-handoff refusal.
 ///
-/// ⛔ RETURNS NOTHING. A non-SUCCESS return from `DxgkDdiSubmitCommand`
+/// ⛔ RETURNS A LOCAL DISPOSITION, NOT AN NTSTATUS. A non-SUCCESS return from
+/// `DxgkDdiSubmitCommand`
 /// bugchecks `dxgmms2!VidSchiSendToExecutionQueue` 0x119 Arg1=2, so the refusal
 /// is a counter and the packet is still accepted. Runs at DISPATCH_LEVEL
 /// (`d3dkmddi.h:4491`): atomics and the leaf spinlock only, no registry write.
@@ -1474,7 +1613,11 @@ pub(crate) unsafe fn patch(args: &DXGKARG_PATCH) {
 /// # Safety
 /// `submit` is dxgkrnl's live argument struct for a submission on an HVC1
 /// context.
-pub(crate) unsafe fn submit(native: &NativeContext, submit: &DXGKARG_SUBMITCOMMAND) {
+pub(crate) unsafe fn submit(
+    native: &NativeContext,
+    session: core::ptr::NonNull<crate::ddi::translation_session::SessionObject>,
+    submit: &DXGKARG_SUBMITCOMMAND,
+) -> NativeSubmitDisposition {
     NR2_SUBMITS.fetch_add(1, Ordering::Relaxed);
     // ⛔ A RESUBMITTED PACKET MUST NOT RETIRE AGAIN. This driver advertises
     // DMA-buffer-boundary preemption and acks `DMA_PREEMPTED`
@@ -1508,7 +1651,7 @@ pub(crate) unsafe fn submit(native: &NativeContext, submit: &DXGKARG_SUBMITCOMMA
         )
     }) else {
         NR2_SUBMIT_NO_RECORD.fetch_add(1, Ordering::Relaxed);
-        return;
+        return NativeSubmitDisposition::Refused;
     };
     if resubmission {
         NR2_SUBMIT_RESUBMISSION.fetch_add(1, Ordering::Relaxed);
@@ -1527,11 +1670,47 @@ pub(crate) unsafe fn submit(native: &NativeContext, submit: &DXGKARG_SUBMITCOMMA
             }
         }
     }
-    // The host handoff, and the end of K6. There is no ring to dispatch on: an
-    // endpoint's ring index comes from `TranslationSession::bind_ring`, endpoints
-    // exist only after INIT, and INIT grants none until K11 creates the host
-    // Venus context.
-    NR2_NO_HOST.fetch_add(1, Ordering::Relaxed);
+    if record.flags != HELIOS_HNR2_KMD_DMA_FLAG_HOST_COMPLETED {
+        // The host handoff, and the end of K6 for every operation outside K11's
+        // finite INIT allowlist. There is still no allocation-backed or GPU
+        // queue executor in this tranche.
+        NR2_NO_HOST.fetch_add(1, Ordering::Relaxed);
+        return NativeSubmitDisposition::Refused;
+    }
+
+    // A reset/Stop or ordinary session teardown can occur after Render's host
+    // reply and before SubmitCommand. The caller already owns the adapter's
+    // fixed K11 completion-rundown guard. Revalidate through the context's
+    // direct strong session edge, keep both exact host-resource guards through
+    // context-local fence admission, and never rediscover by a scalar identity.
+    // Those session guards end on return; the caller retains only the adapter
+    // completion guard through notification. Reset joins it, while ordinary
+    // session teardown never waits on an OS callback that may itself be waiting
+    // for a same-context Render to return.
+    let disposition = crate::ddi::translation_session::with_current_host_submission(
+        session,
+        || {
+            let fence = submit.SubmissionFenceId;
+            let admission = native
+                .host_submissions
+                .lock()
+                .admit_host_completion(fence, resubmission);
+            if let Err(refusal) = admission {
+                let code = match refusal {
+                    HostSubmissionRefusal::Duplicate { .. } => 2,
+                    HostSubmissionRefusal::WentBackward { .. } => 3,
+                };
+                bump_with_code(&NR2_HOST_SUBMIT_REJECT, code);
+                return NativeSubmitDisposition::Revoked;
+            }
+            NR2_HOST_SUBMIT_OK.fetch_add(1, Ordering::Relaxed);
+            NativeSubmitDisposition::HostCompleted(fence)
+        },
+    );
+    disposition.unwrap_or_else(|| {
+        bump_with_code(&NR2_HOST_SUBMIT_REJECT, 1);
+        NativeSubmitDisposition::Revoked
+    })
 }
 
 // ── `DxgkDdiSubmitCommandVirtual`, the HOS1 arm ──────────────────────────────
@@ -1597,7 +1776,8 @@ pub(crate) unsafe fn submit_virtual(
             drop(context);
             NR2_HOS1_OK.fetch_add(1, Ordering::Relaxed);
             // The boundary: a validated descriptor that names a GPUVA nobody
-            // reads. K7/K8 own the HOB1; K11 owns the host dispatch.
+            // reads. K7/K8 own the HOB1; allocation/GPU dispatch remains a
+            // later execution unit and is not part of K11's pure INIT.
             NR2_HOS1_NOT_EXECUTED.fetch_add(1, Ordering::Relaxed);
         }
         Err(refusal) => {

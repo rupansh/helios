@@ -7,6 +7,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from functools import lru_cache
 
 
 def rust_kinds(src: str) -> bytearray:
@@ -78,6 +79,7 @@ def rust_kinds(src: str) -> bytearray:
     return kind
 
 
+@lru_cache(maxsize=None)
 def live_rust(src: str) -> str:
     kinds = rust_kinds(src)
     return "".join(ch if kinds[i] == ord("c") else " " for i, ch in enumerate(src))
@@ -103,6 +105,7 @@ def braced_end(live: str, brace: int) -> int | None:
     return None
 
 
+@lru_cache(maxsize=None)
 def functions(live: str) -> list[Function]:
     pattern = re.compile(
         r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const\s+)?(?:unsafe\s+)?"
@@ -663,8 +666,22 @@ def check_sources(sources: dict[str, str]) -> list[str]:
     elif re.search(r"release_handle|DXGKARG_RELEASE_HANDLE", open_context.group(1)):
         errors.append(f"{ALLOC}: allocation acquire token escaped into the device-specific open")
     close = one(ALLOC, "dxgkddi_close_allocation")
-    if close is not None and "let _ = unsafe { take_open_ctx(handle) };" not in alloc_src[close[0].brace : close[0].end]:
-        errors.append(f"{ALLOC}: CloseAllocation no longer drops the device-specific open object")
+    if close is not None:
+        close_body = alloc_src[close[0].brace : close[0].end]
+        take_at = close_body.find("take_open_ctx(handle)")
+        take_session_at = close_body.find("open.reply_pool_session.take()", take_at)
+        revoke_at = close_body.find("close_reply_pool_binding(", take_session_at)
+        drop_at = close_body.find("drop(open)")
+        if (
+            close_body.count("take_open_ctx(handle)") != 1
+            or close_body.count("drop(open)") != 1
+            or not (
+                0 <= take_at < take_session_at < revoke_at < drop_at
+            )
+        ):
+            errors.append(
+                f"{ALLOC}: CloseAllocation must take one device-specific open, revoke its reply-pool binding, then drop it"
+            )
 
     for name, value in (
         ("CLASSIC_MODE_CHANGE", "0x0000_0001"),
@@ -1722,18 +1739,29 @@ def main() -> None:
             sources,
             ALLOC,
             "dxgkddi_close_allocation",
-            "let _ = unsafe { take_open_ctx(handle) };",
-            "let _ = handle;",
+            "if let Some(mut open) = unsafe { take_open_ctx(handle) } {",
+            "if false {",
         ),
-        "CloseAllocation no longer drops the device-specific open object",
+        "CloseAllocation must take one device-specific open",
+    )
+    require_rejected(
+        "CloseAllocation drops before reply-pool revocation",
+        replace_in_function(
+            sources,
+            ALLOC,
+            "dxgkddi_close_allocation",
+            "if let Some(session) = open.reply_pool_session.take() {",
+            "drop(open);\n                if let Some(session) = None {",
+        ),
+        "revoke its reply-pool binding, then drop it",
     )
     require_rejected(
         "long-lived allocation acquire token",
         replace_once(
             sources,
             ALLOC,
-            "    allocation: usize,",
-            "    allocation: usize,\n    release_handle: DXGKARG_RELEASE_HANDLE,",
+            "struct OpenAllocationContext {\n    magic: u32,",
+            "struct OpenAllocationContext {\n    magic: u32,\n    release_handle: DXGKARG_RELEASE_HANDLE,",
         ),
         "allocation acquire token escaped",
     )

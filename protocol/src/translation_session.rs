@@ -23,40 +23,18 @@
 //! Present, allocation-open, or display callback may attach a session or
 //! reinterpret HQA1 (section 10.4, lines 1327-1333).
 //!
-//! # ⛔ Producer status: DECLARED, NOT WIRED — neither boundary is crossed today
+//! # Producer status
 //!
-//! **Measured 2026-08-10.** Of this module's 54 top-level exported symbols,
-//! **zero** are referenced outside `protocol/`:
+//! **Re-measured 2026-08-13.** Mesa A1/A2 produce HTS1/HVC1/HNR2 through
+//! ordinary KMT calls. KMD K5/K6 consume those records, and K11 now owns the
+//! per-session stock-Venus context plus the finite role-1 HVR1 reply. The K11
+//! source and mutation gates do not by themselves establish target execution;
+//! that requires the correlated multi-session runtime probe.
 //!
-//! ```text
-//! grep -rn -E 'HELIOS_HTS1|HELIOS_HQA1|HeliosTranslationSession|HeliosQueueAttachV1|HeliosTranslationEndpointV1|HeliosSessionCapability|HELIOS_ENGINE_CLASS' \
-//!   kmd_render/src kmd_logic/src umd/src umd12/src umd_common/src \
-//!   dxvk-helios/src icd/mesa/src vkd3d-proton-helios/libs tools packaging
-//! → (no output)
-//! ```
-//!
-//! The C mirror `protocol/include/helios_translation_session.h` has exactly one
-//! reader, `tools/retirement-gates.sh:77`, which `#include`s it so `gcc
-//! -fsyntax-only` evaluates its `_Static_assert`s. Neither boundary in the
-//! section above is crossed by anything:
-//!
-//! * **HTS1 INIT/reply** — the producer is mesa lane unit **A1**
-//!   (`vn_helios_translation_session.{c,h}` per `docs/retirement/lane-mesa.md`),
-//!   which does not exist; `ls icd/mesa/src/virtio/vulkan/` shows only
-//!   `vn_helios_hwa2.{c,h}` and `vn_renderer_helios.c`. The KMD-side consumer
-//!   is the HVC1 control-Render path, which is likewise unbuilt (see
-//!   [`crate::native_render`]'s producer-status table).
-//! * **HQA1** — the producers are the D3D11 and D3D12 UMDs at
-//!   `pfnCreateContextCb` / `pfnCreateContextVirtualCb`, and the consumer is
-//!   `DxgkDdiCreateContext`. Neither UMD builds an HQA1 and the KMD does not
-//!   parse one.
-//!
-//! ⚠ **Compiling here, passing this file's tests, and satisfying
-//! `abi_parity.py` is evidence about this file — not evidence that a producer
-//! or consumer exists.** That is METHOD.md §3 criterion 6's fourth state,
-//! *implemented but never exercised*; the changeset's report must not count it
-//! as implemented. Every rule below is a binding contract on a future
-//! implementer, not behaviour anything exhibits. Nothing here has ever run.
+//! KMD also parses HQA1 once at context creation and retains direct strong
+//! session/endpoint references. The probe exercises that consumer, but the D3D
+//! producers remain Mesa A3/A4 work: no ordinary outer submission is admitted
+//! merely because HTS1 INIT succeeds.
 //!
 //! # What supersedes what
 //!

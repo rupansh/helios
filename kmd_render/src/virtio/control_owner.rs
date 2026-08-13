@@ -20,7 +20,7 @@ use helios_kmd_logic::control_owner_table::{
     DormantOwnerSeed, DormantOwnerState, DormantTransportObservation, DormantTransportRemoval,
     DormantTransportUnavailable, ExternalRunnerRundown, FinalizedResetPayload, ObservedOwnerWork,
     OwnerConfig, OwnerFinalizationRefusal, OwnerPhase, OwnerResetAction, OwnerStorage, OwnerTable,
-    OwnerTableRefusal, PairKind, PairOwnerSlot, PairOwnerTicket, PairPayloadAction,
+    OwnerTableRefusal, PairKind, PairOwnerSlot, PairOwnerTicket, PairPayloadAction, PairUseLease,
     ResetPreparation, ResourceOwnerSlot, ResourceOwnerTicket, ResourcePayloadAction,
     ReturnedCustody, WindowOwnerSlot, WindowOwnerTicket, WindowPayloadAction,
 };
@@ -149,6 +149,42 @@ impl ResourceCreateBeginRefusal {
 #[derive(PartialEq, Eq)]
 struct ContextCustody {
     owner: Option<super::gpu::DeviceOwner>,
+}
+
+/// One exact live resource/context association borrowed for renderer work.
+///
+/// K11's finite direct `SUBMIT_3D` is not a virtio-gpu lifecycle control, so it
+/// has no `DispatchWork` ticket.  The canonical pair's use lease is the proper
+/// owner-table edge instead: close refuses new leases, reset waits for every
+/// returned lease, and detach/context destruction cannot pass a live one.
+pub(crate) struct PairUseGuard<'a> {
+    owner: &'a TransportOwner,
+    lease: Option<PairUseLease>,
+}
+
+impl Drop for PairUseGuard<'_> {
+    fn drop(&mut self) {
+        let Some(lease) = self.lease.take() else {
+            return;
+        };
+        let mut state = self.owner.state.lock();
+        let returned = match state.table_mut() {
+            Ok(table) => table.return_pair_use(lease).is_ok(),
+            Err(_) => {
+                // Preserve move-only custody when the arena itself vanished.
+                // A legitimate reset cannot reach this arm: it first closes
+                // admission and proves the pair-use census is zero.
+                core::mem::forget(lease);
+                false
+            }
+        };
+        if !returned {
+            // Losing a move-only lease would let reset pass a live renderer
+            // access. `RefusedAdmission` retains the failed-return custody;
+            // record the invariant loss rather than fabricating a return.
+            crate::diag::record(TRANSITION_DIAG_BASE + 8);
+        }
+    }
 }
 
 struct AssociationCustody {
@@ -560,6 +596,14 @@ impl TransportOwner {
         if table.context_owner(row).map_err(owner_refusal)?.owner != owner {
             return Err(super::VirtioError::NotOwned);
         }
+        // Close attachment admission in the same owner-table critical section
+        // that begins destruction.  Context creation opens this gate after its
+        // host completion; without the close, even an otherwise empty context
+        // is correctly refused as non-terminal and K11 can never retire its
+        // per-session host namespace.
+        table
+            .close_context_admission(row)
+            .map_err(owner_refusal)?;
         let prepared = table.begin_context_destroy(row).map_err(owner_refusal)?;
         table.dispatch_context(prepared).map_err(|refused| {
             let error = owner_refusal(refused.reason());
@@ -577,6 +621,38 @@ impl TransportOwner {
         let custody = ContextCustody { owner };
         let row = table.first_context_handle_by_owner(&custody).ok()??;
         table.context(row).ok().map(|context| context.id())
+    }
+
+    /// Borrow the exact attached resource/context pair for one finite renderer
+    /// dispatch.  No scalar is accepted as authority: both ids are resolved in
+    /// the canonical owner table, the context owner must be the raw KMT device
+    /// that owns this HTS1 session, and the pair must still be attached.
+    pub(crate) fn borrow_session_pair(
+        &self,
+        owner: super::gpu::DeviceOwner,
+        resource_id: u32,
+        context_id: u32,
+    ) -> Result<PairUseGuard<'_>, super::VirtioError> {
+        let lease = {
+            let mut state = self.state.lock();
+            let table = state.table_mut()?;
+            let context = table
+                .context_handle_by_id(context_id)
+                .map_err(owner_refusal)?;
+            if table.context_owner(context).map_err(owner_refusal)?.owner != Some(owner) {
+                return Err(super::VirtioError::NotOwned);
+            }
+            let resource = table
+                .resource_handle_by_id(resource_id)
+                .map_err(owner_refusal)?;
+            table
+                .borrow_pair_use(resource, context)
+                .map_err(owner_refusal)?
+        };
+        Ok(PairUseGuard {
+            owner: self,
+            lease: Some(lease),
+        })
     }
 
     pub(crate) fn begin_resource_create(
@@ -1236,6 +1312,26 @@ impl TransportOwner {
         table
             .resource_backing(row)
             .is_ok_and(|backing| backing.owner == owner && backing.creator_context == context_id)
+    }
+
+    /// Fail closed after K11 loses terminal proof for one exact private
+    /// context. The direct context id and its DeviceOwner are both validated
+    /// before the adapter table is quarantined; a stale session therefore
+    /// cannot seal a successor transport by replaying an old scalar id.
+    pub(crate) fn quarantine_session_context(
+        &self,
+        owner: super::gpu::DeviceOwner,
+        context_id: u32,
+    ) -> Result<(), super::VirtioError> {
+        let mut state = self.state.lock();
+        let table = state.table_mut()?;
+        let context = table
+            .context_handle_by_id(context_id)
+            .map_err(owner_refusal)?;
+        if table.context_owner(context).map_err(owner_refusal)?.owner != Some(owner) {
+            return Err(super::VirtioError::NotOwned);
+        }
+        table.quarantine().map_err(owner_refusal)
     }
 
     pub(crate) fn resource_matches_filter(

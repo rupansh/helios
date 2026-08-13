@@ -581,7 +581,8 @@ mod tests {
         let resource_prepared = table.begin_resource_create(resource).must();
         let context_prepared = table.begin_context_create(context).must();
         let work = table.dispatch_resource(resource_prepared).must();
-        table.enter_quarantined();
+        table.quarantine().must();
+        table.quarantine().must();
         let refusal = table.dispatch_context(context_prepared).must_err();
         assert_eq!(
             refusal.reason(),
@@ -3126,6 +3127,21 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
         }
         self.phase = OwnerPhase::Closing;
         Ok(())
+    }
+
+    /// Seal ordinary lifecycle dispatch after an exact owner has lost proof of
+    /// teardown. Existing dispatched work may still finish, but only verified
+    /// physical reset may release the retained rows. This is idempotent so two
+    /// subordinate objects can report the same cleanup failure without
+    /// reopening or advancing the table.
+    pub fn quarantine(&mut self) -> Result<(), OwnerTableRefusal> {
+        match self.phase {
+            OwnerPhase::Open | OwnerPhase::Closing | OwnerPhase::Quarantined => {
+                self.enter_quarantined();
+                Ok(())
+            }
+            found => Err(OwnerTableRefusal::WrongPhase { found }),
+        }
     }
 
     /// Safety: every dispatch runner has returned or is irreversibly revoked;

@@ -6,9 +6,7 @@ from __future__ import annotations
 import os
 import re
 import runpy
-import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 
 
@@ -255,6 +253,8 @@ def check_allocation(sources: dict[str, str], errors: list[str]) -> None:
         (
             "AtomicU32::new(resource_id)",
             "AtomicU32::new(BACKING_STORE_UNBOUND)",
+            "backing_store_va: AtomicUsize::new(0)",
+            "k11_session_binding: AtomicUsize::new(0)",
             "set_ShareBackingStoreWithKmd(1)",
             "info.SupportedWriteSegmentSet = placement.supported_segments",
             "SupportedReadSegmentSet = placement.supported_segments",
@@ -284,6 +284,8 @@ def check_allocation(sources: dict[str, str], errors: list[str]) -> None:
             "compare_exchange(BACKING_STORE_UNBOUND, BACKING_STORE_BINDING",
             "IoAllocateMdl",
             "helios_mm_probe_and_lock_pages_seh(mdl)",
+            "role == Hvm1Role::ReplyPool",
+            "k2a_mdl_system_va(mdl, bytes)",
             "helios_mm_get_mdl_pfn_array(mdl)",
             "pfn > (u64::MAX >> HELIOS_HVM1_SEGMENT_PAGE_SHIFT)",
             "let end = last.addr.checked_add(last.length as u64)",
@@ -293,8 +295,9 @@ def check_allocation(sources: dict[str, str], errors: list[str]) -> None:
             "VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE | VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE",
             "Hvm1Role::VulkanDeviceLocal",
             "resource_create_guest_blob",
-            "ctx.backing_store_state.store(BACKING_STORE_BOUND, Ordering::Relaxed)",
             "ctx.resource_id.store(resource_id, Ordering::Release)",
+            "ctx.backing_store_va.store(kernel_va, Ordering::Relaxed)",
+            "ctx.backing_store_state.store(BACKING_STORE_BOUND, Ordering::Release)",
         ),
         errors,
     )
@@ -318,6 +321,42 @@ def check_allocation(sources: dict[str, str], errors: list[str]) -> None:
         errors.append(
             f"{ALLOC}:SetAllocationBackingStore: resource identity must publish exactly once after CREATE"
         )
+    if compact(callback).count("ctx.backing_store_va.store(") != 1:
+        errors.append(
+            f"{ALLOC}:SetAllocationBackingStore: stable K2a CPU view must publish exactly once after CREATE"
+        )
+    if compact(callback).count(
+        "ctx.backing_store_state.store(BACKING_STORE_BOUND,Ordering::Release)"
+    ) != 1:
+        errors.append(
+            f"{ALLOC}:SetAllocationBackingStore: BOUND must release-publish the complete resource and CPU alias"
+        )
+
+    system_va = body(sources, ALLOC, "k2a_mdl_system_va", errors)
+    require_order(
+        ALLOC,
+        "k2a_mdl_system_va",
+        system_va,
+        (
+            "mdl.is_null()",
+            "(*mdl).ByteCount",
+            "(*mdl).MdlFlags",
+            "(*mdl).MappedSystemVa",
+            "MmMapLockedPagesSpecifyCache",
+            "_MEMORY_CACHING_TYPE::MmCached",
+            "K2A_MDL_MAP_PRIORITY",
+        ),
+        errors,
+    )
+    require_fragments(
+        ALLOC,
+        "k2a_mdl_system_va",
+        system_va,
+        (
+            "MmMapLockedPagesSpecifyCache(mdl, 0, _MEMORY_CACHING_TYPE::MmCached, core::ptr::null_mut(), 0, K2A_MDL_MAP_PRIORITY,)",
+        ),
+        errors,
+    )
     callback_live = compact(callback).lower()
     for forbidden in (
         "escape",
@@ -639,8 +678,8 @@ def check_gate_integration(sources: dict[str, str], errors: list[str]) -> None:
         errors.append(f"{RETIREMENT_GATES}: K2a mutation gate is not integrated exactly once")
 
 
-def check_sources(sources: dict[str, str]) -> list[str]:
-    errors = [f"D9: {error}" for error in d9_check_sources(sources)]
+def check_local_sources(sources: dict[str, str]) -> list[str]:
+    errors: list[str] = []
     check_interface(sources, errors)
     check_allocation(sources, errors)
     check_mdl_and_owner(sources, errors)
@@ -648,6 +687,12 @@ def check_sources(sources: dict[str, str]) -> list[str]:
     check_registration(sources, errors)
     check_qemu(sources, errors)
     check_gate_integration(sources, errors)
+    return errors
+
+
+def check_sources(sources: dict[str, str]) -> list[str]:
+    errors = [f"D9: {error}" for error in d9_check_sources(sources)]
+    errors.extend(check_local_sources(sources))
     return errors
 
 
@@ -672,10 +717,15 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("accept unaligned size", ALLOC, "|| record.byte_size & (PAGE as u64 - 1) != 0", "|| false"),
         Mutation("omit shared backing bit", ALLOC, ".set_ShareBackingStoreWithKmd(1);", ".set_ShareBackingStoreWithKmd(0);"),
         Mutation("publish before guest create", ALLOC, "let resource_id = match crate::virtio::ctrl::resource_create_guest_blob(", "ctx.resource_id.store(1, Ordering::Release);\n    let resource_id = match crate::virtio::ctrl::resource_create_guest_blob("),
+        Mutation("omit stable kernel alias", ALLOC, "ctx.backing_store_va.store(kernel_va, Ordering::Relaxed);", "let _ = kernel_va;"),
+        Mutation("publish incomplete alias", ALLOC, "ctx.resource_id.store(resource_id, Ordering::Release);", "ctx.backing_store_state.store(BACKING_STORE_BOUND, Ordering::Release);\n    ctx.resource_id.store(resource_id, Ordering::Release);"),
+        Mutation("weaken complete alias publication", ALLOC, "ctx.backing_store_state\n        .store(BACKING_STORE_BOUND, Ordering::Release);", "ctx.backing_store_state\n        .store(BACKING_STORE_BOUND, Ordering::Relaxed);"),
+        Mutation("map wrong MDL extent", ALLOC, "k2a_mdl_system_va(mdl, bytes)", "k2a_mdl_system_va(mdl, bytes - 1)"),
+        Mutation("map K2a alias noncached", ALLOC, "_MEMORY_CACHING_TYPE::MmCached", "_MEMORY_CACHING_TYPE::MmNonCached"),
         Mutation("retry ambiguous create", ALLOC, "Err(error) => {\n            return error.into();", "Err(error) => {\n            ctx.backing_store_state.store(BACKING_STORE_UNBOUND, Ordering::Release);\n            return error.into();"),
         Mutation("skip PASSIVE check", ALLOC, "if unsafe { KeGetCurrentIrql() } != crate::irql::PASSIVE_LEVEL_IRQL {", "if false {"),
         Mutation("skip exact allocation provenance", ALLOC, "if ctx.kind != ALLOC_KIND_HVM1\n        || !role.placement().cpu_visible", "if false\n        || !role.placement().cpu_visible"),
-        Mutation("accept stale allocation generation", ALLOC, "|| !allocation_object::is_current(ctx.generation)", "|| false"),
+        Mutation("accept stale allocation generation", ALLOC, "|| ctx.resource_id() != 0\n        || !allocation_object::is_current(ctx.generation)", "|| ctx.resource_id() != 0\n        || false"),
         Mutation("accept stale transport generation", ALLOC, "|| current_transport != Some(ctx.transport_instance)", "|| false"),
         Mutation("skip exact shared size", ALLOC, "if !matches!(ctx.size_provenance, BackingSize::SharedBackingStore(n) if n == bytes)", "if false"),
         Mutation("overflow PFN address", ALLOC, "if pfn > (u64::MAX >> HELIOS_HVM1_SEGMENT_PAGE_SHIFT) {", "if false {"),
@@ -728,14 +778,6 @@ def mutation_cases() -> tuple[Mutation, ...]:
     )
 
 
-def write_source_tree(root: str, sources: dict[str, str]) -> None:
-    for relative, source in sources.items():
-        path = os.path.join(root, relative)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as stream:
-            stream.write(source)
-
-
 def run_mutations(sources: dict[str, str]) -> None:
     for case in mutation_cases():
         count = sources.get(case.path, "").count(case.old)
@@ -746,18 +788,12 @@ def run_mutations(sources: dict[str, str]) -> None:
             )
         mutated = dict(sources)
         mutated[case.path] = mutated[case.path].replace(case.old, case.new, 1)
-        with tempfile.TemporaryDirectory(prefix="helios-k2a-gate-") as temp:
-            write_source_tree(temp, mutated)
-            result = subprocess.run(
-                [sys.executable, os.path.abspath(__file__), temp],
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                check=False,
-            )
-            if result.returncode == 0:
-                raise SystemExit(f"K2a mutation was accepted by the real gate: {case.name}")
-    print(f"OK: {len(mutation_cases())} K2a temporary-tree mutations rejected by the real gate")
+        errors = check_local_sources(mutated)
+        if not errors:
+            errors.extend(f"D9: {error}" for error in d9_check_sources(mutated))
+        if not errors:
+            raise SystemExit(f"K2a mutation was accepted by the real gate: {case.name}")
+    print(f"OK: {len(mutation_cases())} in-memory K2a mutations rejected by the real gate")
 
 
 def main() -> None:

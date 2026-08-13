@@ -130,21 +130,20 @@
 //! KMD, QEMU, and installer. Generation mismatch is fatal."). Zero is never a
 //! wildcard on either side of the comparison.
 //!
-//! # ⚠ Producer status — this file is only *partly* wired (METHOD.md §3 crit. 6)
+//! # ⚠ Producer status — source reachability is not runtime admission
 //!
-//! Measured 2026-08-10 by grepping each record family's constants across
-//! `kmd_render/src kmd_logic/src umd/src umd12/src icd/mesa/src tools`:
+//! Re-measured 2026-08-13 across `kmd_render`, `kmd_logic`, Mesa, and the
+//! runtime probes:
 //!
 //! | family | status |
 //! |---|---|
-//! | **HVM1** ([`HeliosVenusMemoryAllocationV1`], [`Hvm1Stage`], [`Hvm1Role`], [`Hvm1Placement`]) | **WIRED.** `kmd_render/src/ddi/create_allocation.rs` reads and writes it; `kmd_logic` tests its rules. |
-//! | **HVC1**, **HNR2**, **HVR1** (`HELIOS_HVC1_*`, `HELIOS_HNR2_*`, `HELIOS_HVR1_*` and their structs) | **DECLARED, NOT WIRED.** Zero references outside `protocol/`. The producer is mesa lane units **A1** (HTS1 session + role-1 reply pool), **A2** (the HNR2 encoder/fragmenter and HVC1 queue contexts) and **A4** (submit), per `docs/retirement/lane-mesa.md`; the KMD-side consumer is `DxgkDdiRender`/`DxgkDdiSubmitCommand`, which do not parse HNR2 today. |
-//! | [`kernel_dma`] | **DECLARED, NOT WIRED.** Zero references outside `protocol/`, including from the KMD that is nominally its only author. See that module's own banner. |
+//! | **HVM1** ([`HeliosVenusMemoryAllocationV1`], [`Hvm1Stage`], [`Hvm1Role`], [`Hvm1Placement`]) | **WIRED.** K4/K2a create and bind the exact WDDM allocation; role 1 has four 1-MiB slots in a 4-MiB shared backing. Roles 2/3 remain later Mesa storage work. |
+//! | **HVC1**, **HNR2**, **HVR1** (`HELIOS_HVC1_*`, `HELIOS_HNR2_*`, `HELIOS_HVR1_*` and their structs) | **PARTLY WIRED.** Mesa A1/A2 and KMD K5/K6 provide the finite carrier. K11 executes only the exact pure-control HTS1 INIT allowlist and publishes a host-derived HVR1 reply. Allocation-backed and GPU/queue work still refuses until Mesa A3/A4 and their owning KMD units exist. |
+//! | [`kernel_dma`] | **PARTLY WIRED, KERNEL-PRIVATE.** K6 writes the fixed DMA-private/capability records, Patch snapshots placements, and Submit retires them. K11 uses one private flag only for its already-terminal pure INIT. Allocation-backed validation and GPU execution remain later work. |
 //!
-//! Compiling here and passing this file's own tests is **not** evidence that a
-//! producer or consumer exists — it is evidence about this file. Everything in
-//! the second and third rows is METHOD.md §3 criterion 6's fourth state,
-//! *implemented but never exercised*, and must not be reported as done.
+//! Compiling or passing source gates is not evidence of a host-produced reply,
+//! display admission, or ordinary Vulkan execution. Those claims require their
+//! own correlated target evidence.
 
 use bytemuck::{Pod, Zeroable};
 
@@ -626,8 +625,9 @@ pub struct HeliosNativeRenderV2 {
     /// Zero without a reply; an exact aligned range inside one reply slot on
     /// COMMIT.
     pub reply_offset: u64,
-    /// Zero without a reply; with `HAS_REPLY`, exactly
-    /// one complete 1-MiB reply slot, wholly inside that slot.
+    /// Zero without a reply; with `HAS_REPLY`, a nonzero bounded capacity no
+    /// larger than one 1-MiB slot and wholly inside that slot. It must contain
+    /// the HVR1 header plus the exact operation's finite payload.
     pub reply_capacity_bytes: u64,
     /// CRC64-ECMA of this fragment. **Corruption diagnostic, never validation
     /// authority** — no validator here reads it.
@@ -2745,7 +2745,7 @@ const _: () = {
 /// returned to user mode.**
 ///
 /// Everything in this module is written by `DxgkDdiRender`, refined by
-/// `DxgkDdiPatch`, and consumed by `DxgkDdiSubmitCommand` and QEMU. No byte of
+/// `DxgkDdiPatch`, and consumed only by KMD SubmitCommand paths. No byte of
 /// it is ever copied back into an ICD buffer, an Escape output, a Lock2 view, or
 /// a reply slot, and no user-mode caller may construct one. The module is
 /// separate so that "is this record user-visible?" is answered by a path segment
@@ -2760,10 +2760,10 @@ const _: () = {
 ///     [`HELIOS_HVC1_DMA_PRIVATE_DATA_BYTES`] and this struct is exactly that.
 ///
 /// The pointer-free rule still holds inside the kernel: no pointer, handle, PID,
-/// **host resource ID**, or name enters DMA. The KMD resolves each capability
-/// against its own allocation objects and substitutes the host resource id
-/// guest-side as it builds the `SUBMIT_3D` (`K4-CONTRACT.md` §5; mesa unit
-/// **A3** plus K6).
+/// **host resource ID**, or name enters DMA. K6 resolves each capability against
+/// its exact WDDM allocation object and snapshots placement, but does not
+/// substitute a host resource id or execute an allocation-backed `SUBMIT_3D` in
+/// the current package.
 ///
 /// ⛔ **SUPERSEDED BY `docs/retirement/FINDINGS.md` F5.** The two paragraphs
 /// above previously read "an HPM1 placement epoch" and "QEMU resolves each
@@ -2773,27 +2773,24 @@ const _: () = {
 /// so there is no host-side resolver and no host-only copy. See the file
 /// banner's "⛔⛔ no resid may appear" block for the property that trades away.
 ///
-/// # ⚠ Producer status: this whole module is DECLARED, NOT WIRED
+/// # Producer status
 ///
-/// Measured 2026-08-10: `grep -rn 'Hnr2PhysicalCapability\|Hnr2KmdDmaPrivateV1\|
-/// Hnr2CapabilityExpect\|Hnr2DmaReject\|kernel_dma' kmd_render/src kmd_logic/src
-/// umd/src umd12/src icd/mesa/src tools` returns **nothing**. The KMD is
-/// nominally this module's only author and it does not reference it: no
-/// `DxgkDdiRender` emits a capability table, no `DxgkDdiPatch` snapshots a
-/// placement into one, and no `DxgkDdiSubmitCommand` calls
-/// [`kernel_dma::Hnr2PhysicalCapability::validate_at_submit`]. The producer is
-/// the KMD's native-Render path, which arrives with mesa units **A2**/**A4**
-/// (the HNR2 encoder and submit) plus the KMD-side Render/Submit work — none of
-/// which exists at HEAD.
+/// Re-measured 2026-08-13: K6 emits the capability table and DMA-private record,
+/// Patch snapshots the exact allocation-list placement, and Submit consumes the
+/// private record for staging retirement. K11 marks only an exact synchronous
+/// pure-control INIT after its host reply and HVR1 publication are terminal.
+/// [`kernel_dma::Hnr2PhysicalCapability::validate_at_submit`] and the general
+/// allocation/GPU executor remain deliberately unreachable until their owning
+/// later units exist.
 ///
 /// The `hpm_epoch` field and [`kernel_dma::Hnr2DmaReject::PlacementEpochStale`]
 /// keep their names because this file is the wire ABI and a rename is a layout
 /// event with C mirrors and `_Static_assert` twins; their *meaning* is now "the
-/// KMD's own placement epoch", not HPM1's. Whoever wires this module renames
-/// them in the same change that gives them a producer.
+/// KMD's own placement epoch", not HPM1's. A later allocation executor must
+/// preserve that meaning rather than reviving a host page-owner dependency.
 ///
-/// Passing this file's unit tests is evidence about this file. It is not
-/// evidence that a producer exists — METHOD.md §3 criterion 6's fourth state.
+/// Passing this file's unit tests or a source gate is not evidence that general
+/// host execution exists.
 pub mod kernel_dma {
     use super::{
         HELIOS_HNR2_ACCESS_MASK, HELIOS_HNR2_MAX_USE_RECORDS, HELIOS_HVC1_DMA_PRIVATE_DATA_BYTES,
@@ -2843,6 +2840,12 @@ pub mod kernel_dma {
         pub hpm_epoch: u64,
     }
 
+    /// This exact submission's finite K11 host operation completed in Render.
+    /// The bit lives in KMD-private DMA data, never HNR2/HVR1 or user memory.
+    pub const HELIOS_HNR2_KMD_DMA_FLAG_HOST_COMPLETED: u32 = 1;
+    pub const HELIOS_HNR2_KMD_DMA_FLAG_MASK: u32 =
+        HELIOS_HNR2_KMD_DMA_FLAG_HOST_COMPLETED;
+
     /// 64-byte KMD-only DMA private record for one HNR2 submission.
     ///
     /// ⚠ Section 10.7 fixes the size ("A 64-byte pointer-free KMD DMA-private
@@ -2877,8 +2880,9 @@ pub mod kernel_dma {
         pub ring_index: u32,
         /// Index of the staging slot within the context-local pool.
         pub slot_index: u32,
-        /// Reserved; zero.
-        pub reserved: u32,
+        /// KMD-private per-submission flags. Only
+        /// [`HELIOS_HNR2_KMD_DMA_FLAG_HOST_COMPLETED`] exists.
+        pub flags: u32,
     }
 
     /// Why a kernel DMA record was refused. Codes are stable and append-only.
@@ -3069,7 +3073,8 @@ pub mod kernel_dma {
         assert!(core::mem::offset_of!(Hnr2KmdDmaPrivateV1, capability_count) == 48);
         assert!(core::mem::offset_of!(Hnr2KmdDmaPrivateV1, ring_index) == 52);
         assert!(core::mem::offset_of!(Hnr2KmdDmaPrivateV1, slot_index) == 56);
-        assert!(core::mem::offset_of!(Hnr2KmdDmaPrivateV1, reserved) == 60);
+        assert!(core::mem::offset_of!(Hnr2KmdDmaPrivateV1, flags) == 60);
+        assert!(HELIOS_HNR2_KMD_DMA_FLAG_MASK == 1);
     };
 }
 
