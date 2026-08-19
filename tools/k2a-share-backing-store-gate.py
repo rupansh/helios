@@ -232,16 +232,27 @@ def check_allocation(sources: dict[str, str], errors: list[str]) -> None:
         "admit_hvm1",
         admit,
         (
-            "if !adapter.share_backing_store_with_kmd()",
-            "if !role.placement().cpu_visible",
+            "let cpu_visible = role.placement().cpu_visible",
+            "if cpu_visible && !adapter.share_backing_store_with_kmd()",
             "if record.byte_size == 0",
             "record.byte_size & (PAGE as u64 - 1) != 0",
             "record.byte_size > u32::MAX as u64",
+            "if cpu_visible && record.byte_size > HVM1_CPU_VISIBLE_MAX_BYTES",
             "let placement = hvm1_placement(role)",
             "allocation_object::mint()",
-            "share_backing_store: true",
+            "share_backing_store: cpu_visible",
             "BackingSize::SharedBackingStore(record.byte_size)",
-            "backing: None",
+        ),
+        errors,
+    )
+    require_fragments(
+        ALLOC,
+        "admit_hvm1",
+        admit,
+        (
+            "const HVM1_CPU_VISIBLE_MAX_BYTES: u64 = 1024 * PAGE as u64",
+            "if matches!(role, Hvm1Role::VulkanDeviceLocal)",
+            "allocate_device_local_memory_blob(adapter, record.byte_size)",
         ),
         errors,
     )

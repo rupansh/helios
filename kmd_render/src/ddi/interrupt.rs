@@ -188,6 +188,7 @@ pub(crate) fn fail_ordered_engine_submission(
 /// lock order — see the comment on it below.
 pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
     let _ = adapter.with_virtio(|v| v.drain_used(adapter));
+    crate::ddi::native_render::drain_host_terminals(adapter);
 
     // A producer completion may have made the one deferred fast bind safe.
     // Promotion and sequence minting share this virtio-lock hold, so the host

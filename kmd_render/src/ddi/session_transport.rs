@@ -117,18 +117,25 @@ impl K11CompletionRundown {
     }
 
     pub(crate) fn with_admitted<R>(&self, operation: impl FnOnce() -> R) -> Option<R> {
-        let _operation = {
-            let mut state = self.state.lock();
-            if !state.open || state.active == u32::MAX {
-                return None;
-            }
-            if state.active == 0 {
-                unsafe { KeClearEvent(self.drained.get()) };
-            }
-            state.active += 1;
-            K11CompletionOperation { owner: self }
-        };
+        let _operation = self.acquire_owned()?;
         Some(operation())
+    }
+
+    /// Hold reset/Stop completion rundown beyond the caller's stack frame.
+    /// The adapter is heap-pinned and close waits for every returned token, so
+    /// the raw pointer cannot outlive its owner.
+    pub(crate) fn acquire_owned(&self) -> Option<K11CompletionOperation> {
+        let mut state = self.state.lock();
+        if !state.open || state.active == u32::MAX {
+            return None;
+        }
+        if state.active == 0 {
+            unsafe { KeClearEvent(self.drained.get()) };
+        }
+        state.active += 1;
+        Some(K11CompletionOperation {
+            owner: NonNull::from(self),
+        })
     }
 
     pub(crate) fn close_completion_and_wait(&self, _passive: PassiveLevel) {
@@ -160,22 +167,44 @@ impl K11CompletionRundown {
     }
 }
 
-struct K11CompletionOperation<'a> {
-    owner: &'a K11CompletionRundown,
+pub(crate) struct K11CompletionOperation {
+    owner: NonNull<K11CompletionRundown>,
 }
 
-impl Drop for K11CompletionOperation<'_> {
+// SAFETY: the token touches only the owner's nonpaged spinlock/event and the
+// owner is joined before its adapter can be freed.
+unsafe impl Send for K11CompletionOperation {}
+
+impl Drop for K11CompletionOperation {
     fn drop(&mut self) {
+        let owner = unsafe { self.owner.as_ref() };
         let signal = {
-            let mut state = self.owner.state.lock();
+            let mut state = owner.state.lock();
             debug_assert!(state.active != 0);
             state.active = state.active.saturating_sub(1);
             state.active == 0
         };
         if signal {
-            unsafe { KeSetEvent(self.owner.drained.get(), 0, 0) };
+            unsafe { KeSetEvent(owner.drained.get(), 0, 0) };
         }
     }
+}
+
+const MAX_SESSION_ATTACHMENTS: usize =
+    helios_protocol::native_render::HELIOS_HNR2_MAX_USE_RECORDS as usize;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttachmentState {
+    Attaching,
+    Attached,
+    Detaching,
+}
+
+#[derive(Clone, Copy)]
+struct SessionAttachment {
+    resource_id: u32,
+    references: u32,
+    state: AttachmentState,
 }
 
 struct LiveHost {
@@ -293,6 +322,15 @@ pub(crate) struct SessionTransport {
     state: SpinLock<HostState>,
     rundown: SpinLock<RundownState>,
     drained: UnsafeCell<KEVENT>,
+    /// Notification event for the finite attachment ledger.  A duplicate open
+    /// that finds the same resource in `Attaching` waits on this event and then
+    /// re-checks the ledger under its lock; no caller guesses whether the first
+    /// host attach succeeded.
+    attachments_changed: UnsafeCell<KEVENT>,
+    /// Exact resources secondarily attached to this session's one Venus
+    /// context.  The vector is fully reserved before publication, never grows
+    /// past the HNR2 use bound, and is drained in reverse attachment order.
+    attachments: SpinLock<alloc::vec::Vec<SessionAttachment>>,
 }
 
 // SAFETY: mutable state is reachable only through the two spinlocks.  `drained`
@@ -302,8 +340,10 @@ unsafe impl Send for SessionTransport {}
 unsafe impl Sync for SessionTransport {}
 
 impl SessionTransport {
-    pub(crate) fn new() -> Self {
-        Self {
+    pub(crate) fn new() -> Option<Self> {
+        let mut attachments = alloc::vec::Vec::new();
+        attachments.try_reserve_exact(MAX_SESSION_ATTACHMENTS).ok()?;
+        Some(Self {
             state: SpinLock::new(HostState::Provisional { allocation: 0 }),
             rundown: SpinLock::new(RundownState {
                 open: true,
@@ -311,7 +351,9 @@ impl SessionTransport {
             }),
             // Initialized in place by `init_event` before publication.
             drained: UnsafeCell::new(unsafe { core::mem::zeroed() }),
-        }
+            attachments_changed: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+            attachments: SpinLock::new(attachments),
+        })
     }
 
     /// Initialize the embedded notification event after heap pinning.
@@ -321,6 +363,10 @@ impl SessionTransport {
     pub(crate) unsafe fn init_event(&self) {
         // NotificationEvent, initially signaled because active == 0.
         unsafe { KeInitializeEvent(self.drained.get(), 0, 1) };
+        // NotificationEvent.  There is no transition to observe before the
+        // first ledger entry is published, so the initial signaled state lets a
+        // spurious waiter simply re-check.
+        unsafe { KeInitializeEvent(self.attachments_changed.get(), 0, 1) };
     }
 
     /// Bind the exact role-1 canonical allocation once.  The caller retains a
@@ -350,7 +396,7 @@ impl SessionTransport {
         }
     }
 
-    fn acquire(&self) -> Option<SessionOperation<'_>> {
+    fn acquire(&self) -> Option<SessionOperation> {
         let mut rundown = self.rundown.lock();
         if !rundown.open || rundown.active == u32::MAX {
             return None;
@@ -362,7 +408,183 @@ impl SessionTransport {
             unsafe { KeClearEvent(self.drained.get()) };
         }
         rundown.active += 1;
-        Some(SessionOperation { owner: self })
+        Some(SessionOperation {
+            owner: NonNull::from(self),
+        })
+    }
+
+    /// Acquire the session's exact live host namespace for an asynchronous
+    /// executor submission.  The returned operation owns rundown until the
+    /// terminal host result, and carries only the already-bound context id.
+    pub(crate) fn acquire_execution(
+        &self,
+        adapter: &AdapterContext,
+        owner: DeviceOwner,
+    ) -> Option<SessionExecutionOperation> {
+        let operation = self.acquire()?;
+        let host = match &*self.state.lock() {
+            HostState::Live(host) => host.identity(),
+            _ => return None,
+        };
+        if Self::current_transport(adapter) != Some(host.transport_instance) {
+            return None;
+        }
+        let pair = crate::virtio::ctrl::borrow_venus_session_pair(
+            adapter,
+            owner,
+            host.context_id,
+            host.reply_resource_id,
+        )
+        .ok()?;
+        let facts = unsafe { k11_reply_pool_facts(host.allocation) }?;
+        if facts.resource_id != host.k2a_resource_id
+            || facts.transport_instance != host.transport_instance
+        {
+            return None;
+        }
+        drop(pair);
+        Some(SessionExecutionOperation {
+            _operation: operation,
+            context_id: host.context_id,
+            transport_instance: host.transport_instance,
+        })
+    }
+
+    /// Attach one exact allocation resource to this session namespace.  A
+    /// duplicate direct open increments a session-local reference rather than
+    /// issuing a second host attach; no adapter-global reverse lookup exists.
+    pub(crate) fn attach_execution_resource(
+        &self,
+        passive: PassiveLevel,
+        adapter: &AdapterContext,
+        owner: DeviceOwner,
+        resource_id: u32,
+        transport_instance: u64,
+    ) -> Result<u32, NTSTATUS> {
+        if resource_id == 0 {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let execution = self
+            .acquire_execution(adapter, owner)
+            .ok_or(STATUS_DEVICE_NOT_READY)?;
+        if execution.transport_instance != transport_instance {
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
+        loop {
+            let mut attachments = self.attachments.lock();
+            if let Some(entry) = attachments
+                .iter_mut()
+                .find(|entry| entry.resource_id == resource_id)
+            {
+                match entry.state {
+                    AttachmentState::Attached if entry.references != u32::MAX => {
+                        entry.references += 1;
+                        return Ok(execution.context_id);
+                    }
+                    AttachmentState::Attaching => {
+                        // Clear while holding the ledger lock.  The publisher
+                        // takes the same lock before signaling, so completion
+                        // cannot be lost between this observation and the wait.
+                        unsafe { KeClearEvent(self.attachments_changed.get()) };
+                        drop(attachments);
+                        let _ = unsafe {
+                            KeWaitForSingleObject(
+                                self.attachments_changed.get() as PVOID,
+                                0,
+                                0,
+                                0,
+                                core::ptr::null_mut(),
+                            )
+                        };
+                        continue;
+                    }
+                    // A failed host detach is deliberately retained for final
+                    // reverse teardown.  Re-attaching through that ambiguous
+                    // state would create two host references with one ledger
+                    // entry, so it remains a named refusal.
+                    AttachmentState::Detaching | AttachmentState::Attached => {
+                        return Err(STATUS_DEVICE_NOT_READY);
+                    }
+                }
+            }
+            if attachments.len() == attachments.capacity()
+                || attachments.len() >= MAX_SESSION_ATTACHMENTS
+            {
+                return Err(crate::dxgk::STATUS_NO_MEMORY);
+            }
+            attachments.push(SessionAttachment {
+                resource_id,
+                references: 1,
+                state: AttachmentState::Attaching,
+            });
+            break;
+        }
+        if crate::virtio::ctrl::ctx_attach_resource(
+            passive,
+            adapter,
+            execution.context_id,
+            resource_id,
+        )
+        .is_err()
+        {
+            self.attachments
+                .lock()
+                .retain(|entry| entry.resource_id != resource_id);
+            unsafe { KeSetEvent(self.attachments_changed.get(), 0, 0) };
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
+        let mut attachments = self.attachments.lock();
+        let Some(entry) = attachments
+            .iter_mut()
+            .find(|entry| entry.resource_id == resource_id)
+        else {
+            return Err(STATUS_DEVICE_NOT_READY);
+        };
+        entry.state = AttachmentState::Attached;
+        drop(attachments);
+        unsafe { KeSetEvent(self.attachments_changed.get(), 0, 0) };
+        Ok(execution.context_id)
+    }
+
+    pub(crate) fn detach_execution_resource(
+        &self,
+        passive: PassiveLevel,
+        adapter: &AdapterContext,
+        resource_id: u32,
+    ) {
+        let context_id = match &*self.state.lock() {
+            HostState::Live(host) => host.context_id,
+            _ => return,
+        };
+        {
+            let mut attachments = self.attachments.lock();
+            let Some(entry) = attachments
+                .iter_mut()
+                .find(|entry| entry.resource_id == resource_id)
+            else {
+                return;
+            };
+            if entry.state != AttachmentState::Attached {
+                return;
+            }
+            if entry.references > 1 {
+                entry.references -= 1;
+                return;
+            }
+            entry.state = AttachmentState::Detaching;
+        }
+        if crate::virtio::ctrl::ctx_detach_session_resource(
+            passive,
+            adapter,
+            context_id,
+            resource_id,
+        )
+        .is_ok()
+        {
+            self.attachments
+                .lock()
+                .retain(|entry| entry.resource_id != resource_id);
+        }
     }
 
     fn close_and_wait(&self, _passive: PassiveLevel) {
@@ -751,6 +973,27 @@ impl SessionTransport {
             drop(reply_map);
             return;
         }
+        // Allocation-backed resources were attached after the reply target and
+        // are revoked first, in reverse attachment order. Rundown is already
+        // closed, so no executor can acquire or retain one while this drains.
+        loop {
+            let resource_id = self.attachments.lock().pop().map(|entry| entry.resource_id);
+            let Some(resource_id) = resource_id else {
+                break;
+            };
+            if crate::virtio::ctrl::ctx_detach_session_resource(
+                passive,
+                adapter,
+                context_id,
+                resource_id,
+            )
+            .is_err()
+            {
+                self.quarantine_failed_cleanup(adapter, owner, context_id);
+                drop(reply_map);
+                return;
+            }
+        }
         if let Ok(pair) = crate::virtio::ctrl::borrow_venus_session_pair(
             adapter,
             owner,
@@ -933,22 +1176,80 @@ impl SessionTransport {
         K11_REPLY_PUBLISHED.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
+
+    /// Publish an HVR1 header over reply bytes the host has already DMA-written
+    /// into the exact role-1 K2a range.  This is the nonzero-ring executor seam:
+    /// the raw generated reply starts immediately after the header and is never
+    /// copied through a second buffer.  Magic remains zero until every header
+    /// field is present, so a stale slot can never look published while Venus is
+    /// still writing it.
+    pub(crate) fn publish_hvr1_existing_payload(
+        facts: K11ReplyPoolFacts,
+        reply_offset: u64,
+        reply_capacity: u64,
+        header: &helios_protocol::native_render::HeliosVenusReplyV1,
+        payload_bytes: u64,
+    ) -> Result<(), NTSTATUS> {
+        use helios_protocol::native_render::{HELIOS_HVM1_REPLY_SLOT_BYTES, HELIOS_HVR1_MAGIC};
+        let header_bytes = core::mem::size_of_val(header) as u64;
+        let needed = header_bytes
+            .checked_add(payload_bytes)
+            .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        let end = reply_offset
+            .checked_add(needed)
+            .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        if reply_offset % HELIOS_HVM1_REPLY_SLOT_BYTES != 0
+            || reply_capacity < needed
+            || reply_capacity > HELIOS_HVM1_REPLY_SLOT_BYTES
+            || end > facts.byte_size
+            || header.magic != HELIOS_HVR1_MAGIC
+        {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let dst = unsafe { facts.kernel_va.as_ptr().add(reply_offset as usize) };
+        unsafe {
+            core::ptr::write_unaligned(dst.cast::<u32>(), 0);
+            let mut unpublished = *header;
+            unpublished.magic = 0;
+            core::ptr::copy_nonoverlapping(
+                bytemuck::bytes_of(&unpublished).as_ptr(),
+                dst,
+                header_bytes as usize,
+            );
+        }
+        let magic = unsafe { &*dst.cast::<AtomicU32>() };
+        magic.store(HELIOS_HVR1_MAGIC.to_le(), Ordering::Release);
+        K11_REPLY_PUBLISHED.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
 }
 
-struct SessionOperation<'a> {
-    owner: &'a SessionTransport,
+pub(crate) struct SessionExecutionOperation {
+    _operation: SessionOperation,
+    pub(crate) context_id: u32,
+    pub(crate) transport_instance: u64,
 }
 
-impl Drop for SessionOperation<'_> {
+struct SessionOperation {
+    owner: NonNull<SessionTransport>,
+}
+
+// SAFETY: SessionTransport is heap-pinned inside SessionObject and teardown
+// joins its rundown before that object can be released.
+unsafe impl Send for SessionOperation {}
+unsafe impl Send for SessionExecutionOperation {}
+
+impl Drop for SessionOperation {
     fn drop(&mut self) {
+        let owner = unsafe { self.owner.as_ref() };
         let signal = {
-            let mut rundown = self.owner.rundown.lock();
+            let mut rundown = owner.rundown.lock();
             debug_assert!(rundown.active != 0);
             rundown.active = rundown.active.saturating_sub(1);
             rundown.active == 0
         };
         if signal {
-            unsafe { KeSetEvent(self.owner.drained.get(), 0, 0) };
+            unsafe { KeSetEvent(owner.drained.get(), 0, 0) };
         }
     }
 }

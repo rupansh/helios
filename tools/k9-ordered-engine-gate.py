@@ -426,7 +426,10 @@ def check_adapter_ownership(sources: dict[str, str], errors: list[str]) -> None:
     if "fence:u32" in pending:
         errors.append(f"{GPU}: WddmPending resurrected a scalar scheduler identity")
 
-    allowed_ticket_paths = {ADAPTER, LOCKS, INTERRUPT, SUBMIT, GPU}
+    # The authorized post-K9 executor retains the direct K9 tickets alongside
+    # its immutable context-local batch until the exact stock-Venus terminal.
+    # It is the only extension of K9's private ticket lifetime surface.
+    allowed_ticket_paths = {ADAPTER, LOCKS, INTERRUPT, SUBMIT, GPU, "kmd_render/src/ddi/native_render.rs"}
     unexpected = sorted(
         path
         for path, source in sources.items()

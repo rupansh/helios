@@ -1,0 +1,897 @@
+//! Generated-Venus command admission for the bounded HNR2 executor.
+//!
+//! This is intentionally not a general Venus decoder.  It recognizes only the
+//! command and typed-resource subset needed by Mesa A3/A4, consumes every byte,
+//! and reports the exact resource operands the KMD must cross-check against the
+//! HNR2 typed-patch table.  The numeric constants are checked against Mesa's
+//! pinned generated headers by `tools/venus-executor-schema-gate.py`.
+
+use helios_protocol::native_render::HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32;
+
+// Generated command opcodes (`vn_protocol_driver_defines.h`).
+pub const OP_QUEUE_SUBMIT: u32 = 18;
+pub const OP_ALLOCATE_MEMORY: u32 = 21;
+pub const OP_FREE_MEMORY: u32 = 22;
+pub const OP_QUEUE_BIND_SPARSE: u32 = 34;
+pub const OP_SET_REPLY: u32 = 178;
+pub const OP_QUEUE_SUBMIT2: u32 = 206;
+
+// Generated structure tags (`vulkan_core.h` and the Venus generated define).
+const ST_SUBMIT_INFO: u32 = 4;
+const ST_MEMORY_ALLOCATE_INFO: u32 = 5;
+const ST_BIND_SPARSE_INFO: u32 = 7;
+const ST_MEMORY_ALLOCATE_FLAGS_INFO: u32 = 1_000_060_000;
+const ST_DEVICE_GROUP_SUBMIT_INFO: u32 = 1_000_060_005;
+const ST_DEVICE_GROUP_BIND_SPARSE_INFO: u32 = 1_000_060_006;
+const ST_EXPORT_MEMORY_ALLOCATE_INFO: u32 = 1_000_072_002;
+const ST_MEMORY_DEDICATED_ALLOCATE_INFO: u32 = 1_000_127_001;
+const ST_PROTECTED_SUBMIT_INFO: u32 = 1_000_145_000;
+const ST_TIMELINE_SEMAPHORE_SUBMIT_INFO: u32 = 1_000_207_003;
+const ST_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO: u32 = 1_000_257_003;
+const ST_SUBMIT_INFO2: u32 = 1_000_314_004;
+const ST_SEMAPHORE_SUBMIT_INFO: u32 = 1_000_314_005;
+const ST_COMMAND_BUFFER_SUBMIT_INFO: u32 = 1_000_314_006;
+const ST_IMPORT_MEMORY_RESOURCE_INFO_MESA: u32 = 1_000_384_002;
+
+const COMMAND_GENERATE_REPLY: u32 = 1;
+const MAX_NESTING: u32 = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VenusCommandClass {
+    AllocateMemory,
+    FreeMemory,
+    QueueSubmit,
+    QueueSubmit2,
+    QueueBindSparse,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VenusOperand {
+    pub payload_offset: u32,
+    pub operand_kind: u16,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VenusAdmission {
+    pub class: VenusCommandClass,
+    pub operand_count: u32,
+    /// Exact raw Venus reply range encoded by SetReply. Zero for reply-less
+    /// classes; the KMD cross-checks these against HNR2 before patching.
+    pub reply_offset: u64,
+    pub reply_size: u64,
+    /// Exact `VkMemoryAllocateInfo` fields for the sole allocation class.
+    /// Zero for every other class.
+    pub allocation_size: u64,
+    pub memory_type_index: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VenusReject {
+    Truncated,
+    TrailingBytes,
+    UnknownOpcode,
+    BadFlags,
+    BadPointer,
+    BadArrayCount,
+    BadStructureType,
+    UnsupportedChain,
+    MissingImport,
+    DuplicateImport,
+    NonZeroResourceOperand,
+    OperandCapacity,
+    CountOverflow,
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn offset_u32(&self) -> Result<u32, VenusReject> {
+        u32::try_from(self.offset).map_err(|_| VenusReject::CountOverflow)
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], VenusReject> {
+        let end = self
+            .offset
+            .checked_add(n)
+            .ok_or(VenusReject::CountOverflow)?;
+        let out = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(VenusReject::Truncated)?;
+        self.offset = end;
+        Ok(out)
+    }
+
+    fn u32(&mut self) -> Result<u32, VenusReject> {
+        let b = self.take(4)?;
+        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn u64(&mut self) -> Result<u64, VenusReject> {
+        let b = self.take(8)?;
+        Ok(u64::from_le_bytes([
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        ]))
+    }
+
+    fn skip(&mut self, n: usize) -> Result<(), VenusReject> {
+        self.take(n).map(|_| ())
+    }
+
+    fn pointer(&mut self) -> Result<bool, VenusReject> {
+        match self.u64()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(VenusReject::BadPointer),
+        }
+    }
+
+    fn array(&mut self, expected: u32) -> Result<bool, VenusReject> {
+        match self.u64()? {
+            0 if expected == 0 => Ok(false),
+            0 => Ok(false),
+            n if n == expected as u64 => Ok(true),
+            _ => Err(VenusReject::BadArrayCount),
+        }
+    }
+
+    fn repeat_skip(&mut self, count: u32, stride: usize) -> Result<(), VenusReject> {
+        let bytes = (count as usize)
+            .checked_mul(stride)
+            .ok_or(VenusReject::CountOverflow)?;
+        self.skip(bytes)
+    }
+
+    fn bounded_count(&mut self) -> Result<u32, VenusReject> {
+        let count = self.u32()?;
+        // Every generated array element consumes at least four bytes.  This
+        // precludes attacker-controlled billion-iteration loops even before a
+        // shape-specific stride check runs.
+        if count as usize > self.bytes.len().saturating_sub(self.offset) / 4 + 1 {
+            return Err(VenusReject::BadArrayCount);
+        }
+        Ok(count)
+    }
+}
+
+struct OperandWriter<'a> {
+    out: &'a mut [VenusOperand],
+    count: usize,
+}
+
+impl OperandWriter<'_> {
+    fn push(&mut self, offset: u32, kind: u16) -> Result<(), VenusReject> {
+        let slot = self
+            .out
+            .get_mut(self.count)
+            .ok_or(VenusReject::OperandCapacity)?;
+        *slot = VenusOperand {
+            payload_offset: offset,
+            operand_kind: kind,
+        };
+        self.count += 1;
+        Ok(())
+    }
+}
+
+fn command_header(c: &mut Cursor<'_>) -> Result<(u32, u32), VenusReject> {
+    Ok((c.u32()?, c.u32()?))
+}
+
+fn expect_stype(c: &mut Cursor<'_>, expected: u32) -> Result<(), VenusReject> {
+    if c.u32()? != expected {
+        return Err(VenusReject::BadStructureType);
+    }
+    Ok(())
+}
+
+fn parse_leaf_pnext(c: &mut Cursor<'_>) -> Result<(), VenusReject> {
+    if c.pointer()? {
+        return Err(VenusReject::UnsupportedChain);
+    }
+    Ok(())
+}
+
+fn parse_timeline_body(c: &mut Cursor<'_>) -> Result<(), VenusReject> {
+    let waits = c.bounded_count()?;
+    if c.array(waits)? {
+        c.repeat_skip(waits, 8)?;
+    } else if waits != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+    let signals = c.bounded_count()?;
+    if c.array(signals)? {
+        c.repeat_skip(signals, 8)?;
+    } else if signals != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+    Ok(())
+}
+
+fn parse_submit_pnext(c: &mut Cursor<'_>, depth: u32) -> Result<(), VenusReject> {
+    if depth >= MAX_NESTING {
+        return Err(VenusReject::UnsupportedChain);
+    }
+    if !c.pointer()? {
+        return Ok(());
+    }
+    match c.u32()? {
+        ST_DEVICE_GROUP_SUBMIT_INFO => {
+            parse_submit_pnext(c, depth + 1)?;
+            for stride in [4usize, 4, 4] {
+                let count = c.bounded_count()?;
+                if c.array(count)? {
+                    c.repeat_skip(count, stride)?;
+                } else if count != 0 {
+                    return Err(VenusReject::BadArrayCount);
+                }
+            }
+            Ok(())
+        }
+        ST_PROTECTED_SUBMIT_INFO => {
+            parse_submit_pnext(c, depth + 1)?;
+            c.skip(4)
+        }
+        ST_TIMELINE_SEMAPHORE_SUBMIT_INFO => {
+            parse_submit_pnext(c, depth + 1)?;
+            parse_timeline_body(c)
+        }
+        _ => Err(VenusReject::UnsupportedChain),
+    }
+}
+
+fn parse_submit_info(c: &mut Cursor<'_>) -> Result<(), VenusReject> {
+    expect_stype(c, ST_SUBMIT_INFO)?;
+    parse_submit_pnext(c, 0)?;
+
+    let waits = c.bounded_count()?;
+    if c.array(waits)? {
+        c.repeat_skip(waits, 8)?;
+    } else if waits != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+    if c.array(waits)? {
+        c.repeat_skip(waits, 4)?;
+    } else if waits != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+
+    let commands = c.bounded_count()?;
+    if c.array(commands)? {
+        c.repeat_skip(commands, 8)?;
+    } else if commands != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+
+    let signals = c.bounded_count()?;
+    if c.array(signals)? {
+        c.repeat_skip(signals, 8)?;
+    } else if signals != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+    Ok(())
+}
+
+fn parse_semaphore_submit_info(c: &mut Cursor<'_>) -> Result<(), VenusReject> {
+    expect_stype(c, ST_SEMAPHORE_SUBMIT_INFO)?;
+    parse_leaf_pnext(c)?;
+    c.skip(8 + 8 + 8 + 4)
+}
+
+fn parse_command_buffer_submit_info(c: &mut Cursor<'_>) -> Result<(), VenusReject> {
+    expect_stype(c, ST_COMMAND_BUFFER_SUBMIT_INFO)?;
+    parse_leaf_pnext(c)?;
+    c.skip(8 + 4)
+}
+
+fn parse_submit_info2(c: &mut Cursor<'_>) -> Result<(), VenusReject> {
+    expect_stype(c, ST_SUBMIT_INFO2)?;
+    parse_leaf_pnext(c)?;
+    c.skip(4)?; // flags
+
+    let waits = c.bounded_count()?;
+    if c.array(waits)? {
+        for _ in 0..waits {
+            parse_semaphore_submit_info(c)?;
+        }
+    } else if waits != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+
+    let commands = c.bounded_count()?;
+    if c.array(commands)? {
+        for _ in 0..commands {
+            parse_command_buffer_submit_info(c)?;
+        }
+    } else if commands != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+
+    let signals = c.bounded_count()?;
+    if c.array(signals)? {
+        for _ in 0..signals {
+            parse_semaphore_submit_info(c)?;
+        }
+    } else if signals != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+    Ok(())
+}
+
+fn parse_bind_pnext(c: &mut Cursor<'_>, depth: u32) -> Result<(), VenusReject> {
+    if depth >= MAX_NESTING {
+        return Err(VenusReject::UnsupportedChain);
+    }
+    if !c.pointer()? {
+        return Ok(());
+    }
+    match c.u32()? {
+        ST_DEVICE_GROUP_BIND_SPARSE_INFO => {
+            parse_bind_pnext(c, depth + 1)?;
+            c.skip(8)
+        }
+        ST_TIMELINE_SEMAPHORE_SUBMIT_INFO => {
+            parse_bind_pnext(c, depth + 1)?;
+            parse_timeline_body(c)
+        }
+        _ => Err(VenusReject::UnsupportedChain),
+    }
+}
+
+fn parse_sparse_memory_binds(c: &mut Cursor<'_>, objects: u32) -> Result<(), VenusReject> {
+    for _ in 0..objects {
+        c.skip(8)?; // buffer/image handle
+        let binds = c.bounded_count()?;
+        if c.array(binds)? {
+            c.repeat_skip(binds, 36)?;
+        } else if binds != 0 {
+            return Err(VenusReject::BadArrayCount);
+        }
+    }
+    Ok(())
+}
+
+fn parse_sparse_image_binds(c: &mut Cursor<'_>, objects: u32) -> Result<(), VenusReject> {
+    for _ in 0..objects {
+        c.skip(8)?;
+        let binds = c.bounded_count()?;
+        if c.array(binds)? {
+            c.repeat_skip(binds, 56)?;
+        } else if binds != 0 {
+            return Err(VenusReject::BadArrayCount);
+        }
+    }
+    Ok(())
+}
+
+fn parse_bind_sparse_info(c: &mut Cursor<'_>) -> Result<(), VenusReject> {
+    expect_stype(c, ST_BIND_SPARSE_INFO)?;
+    parse_bind_pnext(c, 0)?;
+
+    let waits = c.bounded_count()?;
+    if c.array(waits)? {
+        c.repeat_skip(waits, 8)?;
+    } else if waits != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+
+    let buffers = c.bounded_count()?;
+    if c.array(buffers)? {
+        parse_sparse_memory_binds(c, buffers)?;
+    } else if buffers != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+
+    let opaque_images = c.bounded_count()?;
+    if c.array(opaque_images)? {
+        parse_sparse_memory_binds(c, opaque_images)?;
+    } else if opaque_images != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+
+    let images = c.bounded_count()?;
+    if c.array(images)? {
+        parse_sparse_image_binds(c, images)?;
+    } else if images != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+
+    let signals = c.bounded_count()?;
+    if c.array(signals)? {
+        c.repeat_skip(signals, 8)?;
+    } else if signals != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+    Ok(())
+}
+
+fn parse_queue(c: &mut Cursor<'_>, opcode: u32) -> Result<VenusCommandClass, VenusReject> {
+    c.skip(8)?; // queue
+    let count = c.bounded_count()?;
+    let present = c.array(count)?;
+    if !present && count != 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+    if present {
+        for _ in 0..count {
+            match opcode {
+                OP_QUEUE_SUBMIT => parse_submit_info(c)?,
+                OP_QUEUE_SUBMIT2 => parse_submit_info2(c)?,
+                OP_QUEUE_BIND_SPARSE => parse_bind_sparse_info(c)?,
+                _ => return Err(VenusReject::UnknownOpcode),
+            }
+        }
+    }
+    c.skip(8)?; // fence
+    Ok(match opcode {
+        OP_QUEUE_SUBMIT => VenusCommandClass::QueueSubmit,
+        OP_QUEUE_SUBMIT2 => VenusCommandClass::QueueSubmit2,
+        OP_QUEUE_BIND_SPARSE => VenusCommandClass::QueueBindSparse,
+        _ => return Err(VenusReject::UnknownOpcode),
+    })
+}
+
+fn parse_memory_pnext(
+    c: &mut Cursor<'_>,
+    operands: &mut OperandWriter<'_>,
+    depth: u32,
+    imports: &mut u32,
+) -> Result<(), VenusReject> {
+    if depth >= MAX_NESTING {
+        return Err(VenusReject::UnsupportedChain);
+    }
+    if !c.pointer()? {
+        return Ok(());
+    }
+    let stype = c.u32()?;
+    parse_memory_pnext(c, operands, depth + 1, imports)?;
+    match stype {
+        ST_EXPORT_MEMORY_ALLOCATE_INFO => c.skip(4),
+        ST_MEMORY_ALLOCATE_FLAGS_INFO => c.skip(8),
+        ST_MEMORY_DEDICATED_ALLOCATE_INFO => c.skip(16),
+        ST_MEMORY_OPAQUE_CAPTURE_ADDRESS_ALLOCATE_INFO => c.skip(8),
+        ST_IMPORT_MEMORY_RESOURCE_INFO_MESA => {
+            if *imports != 0 {
+                return Err(VenusReject::DuplicateImport);
+            }
+            *imports = 1;
+            let offset = c.offset_u32()?;
+            if c.u32()? != 0 {
+                return Err(VenusReject::NonZeroResourceOperand);
+            }
+            operands.push(offset, HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32)
+        }
+        _ => Err(VenusReject::UnsupportedChain),
+    }
+}
+
+fn parse_allocate(
+    c: &mut Cursor<'_>,
+    operands: &mut OperandWriter<'_>,
+) -> Result<(VenusCommandClass, u64, u32), VenusReject> {
+    c.skip(8)?; // device
+    if !c.pointer()? {
+        return Err(VenusReject::BadPointer);
+    }
+    expect_stype(c, ST_MEMORY_ALLOCATE_INFO)?;
+    let mut imports = 0;
+    parse_memory_pnext(c, operands, 0, &mut imports)?;
+    let allocation_size = c.u64()?;
+    let memory_type_index = c.u32()?;
+    if allocation_size == 0 {
+        return Err(VenusReject::BadArrayCount);
+    }
+    if c.pointer()? {
+        return Err(VenusReject::BadPointer); // pAllocator unsupported by generator
+    }
+    if !c.pointer()? {
+        return Err(VenusReject::BadPointer);
+    }
+    c.skip(8)?; // output VkDeviceMemory object id
+    if imports != 1 {
+        return Err(VenusReject::MissingImport);
+    }
+    Ok((
+        VenusCommandClass::AllocateMemory,
+        allocation_size,
+        memory_type_index,
+    ))
+}
+
+/// Validate one complete A3/A4 Venus stream and return its generated resource
+/// operands in payload order.  Every reported operand is required to contain
+/// zero; only the caller's host-private copy may later be patched.
+pub fn validate_venus_stream(
+    bytes: &[u8],
+    operand_storage: &mut [VenusOperand],
+) -> Result<VenusAdmission, VenusReject> {
+    let mut c = Cursor::new(bytes);
+    let mut operands = OperandWriter {
+        out: operand_storage,
+        count: 0,
+    };
+    let (opcode, flags) = command_header(&mut c)?;
+    let mut reply_offset = 0;
+    let mut reply_size = 0;
+    let mut allocation_size = 0;
+    let mut memory_type_index = 0;
+    let class = match opcode {
+        OP_SET_REPLY => {
+            if flags != 0 || !c.pointer()? {
+                return Err(VenusReject::BadFlags);
+            }
+            let offset = c.offset_u32()?;
+            if c.u32()? != 0 {
+                return Err(VenusReject::NonZeroResourceOperand);
+            }
+            operands.push(offset, HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32)?;
+            reply_offset = c.u64()?;
+            reply_size = c.u64()?;
+            if reply_size == 0 {
+                return Err(VenusReject::BadArrayCount);
+            }
+            let (next, next_flags) = command_header(&mut c)?;
+            if next != OP_ALLOCATE_MEMORY || next_flags != COMMAND_GENERATE_REPLY {
+                return Err(VenusReject::BadFlags);
+            }
+            let parsed = parse_allocate(&mut c, &mut operands)?;
+            allocation_size = parsed.1;
+            memory_type_index = parsed.2;
+            parsed.0
+        }
+        OP_FREE_MEMORY => {
+            if flags != 0 {
+                return Err(VenusReject::BadFlags);
+            }
+            c.skip(8 + 8)?;
+            if c.pointer()? {
+                return Err(VenusReject::BadPointer);
+            }
+            VenusCommandClass::FreeMemory
+        }
+        OP_QUEUE_SUBMIT | OP_QUEUE_SUBMIT2 | OP_QUEUE_BIND_SPARSE => {
+            if flags != 0 {
+                return Err(VenusReject::BadFlags);
+            }
+            parse_queue(&mut c, opcode)?
+        }
+        _ => return Err(VenusReject::UnknownOpcode),
+    };
+    if c.offset != bytes.len() {
+        return Err(VenusReject::TrailingBytes);
+    }
+    Ok(VenusAdmission {
+        class,
+        operand_count: operands.count as u32,
+        reply_offset,
+        reply_size,
+        allocation_size,
+        memory_type_index,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use std::vec::Vec;
+
+    fn put32(out: &mut Vec<u8>, n: u32) {
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+    fn put64(out: &mut Vec<u8>, n: u64) {
+        out.extend_from_slice(&n.to_le_bytes());
+    }
+
+    fn zeros(out: &mut Vec<u8>, n: usize) {
+        out.resize(out.len() + n, 0);
+    }
+
+    fn queue_prefix(opcode: u32, count: u32) -> Vec<u8> {
+        let mut b = Vec::new();
+        put32(&mut b, opcode);
+        put32(&mut b, 0);
+        put64(&mut b, 0x101); // queue
+        put32(&mut b, count);
+        put64(&mut b, count as u64);
+        b
+    }
+
+    fn allocation_stream() -> Vec<u8> {
+        let mut b = Vec::new();
+        put32(&mut b, OP_SET_REPLY);
+        put32(&mut b, 0);
+        put64(&mut b, 1);
+        put32(&mut b, 0);
+        put64(&mut b, 0);
+        put64(&mut b, 24);
+        put32(&mut b, OP_ALLOCATE_MEMORY);
+        put32(&mut b, COMMAND_GENERATE_REPLY);
+        put64(&mut b, 7); // device
+        put64(&mut b, 1); // pAllocateInfo
+        put32(&mut b, ST_MEMORY_ALLOCATE_INFO);
+        put64(&mut b, 1); // pNext
+        put32(&mut b, ST_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+        put64(&mut b, 0); // pNext
+        put32(&mut b, 0); // resourceId
+        put64(&mut b, 4096);
+        put32(&mut b, 0);
+        put64(&mut b, 0); // pAllocator
+        put64(&mut b, 1); // pMemory
+        put64(&mut b, 99);
+        b
+    }
+
+    #[test]
+    fn admits_exact_allocate_and_reports_both_zero_operands() {
+        let b = allocation_stream();
+        let mut out = [VenusOperand::default(); 2];
+        let admitted = validate_venus_stream(&b, &mut out).unwrap();
+        assert_eq!(admitted.class, VenusCommandClass::AllocateMemory);
+        assert_eq!(admitted.operand_count, 2);
+        assert_eq!(out[0].payload_offset, 16);
+        assert_eq!(out[1].payload_offset, 84);
+        assert_eq!(
+            out[0].operand_kind,
+            HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32
+        );
+    }
+
+    #[test]
+    fn refuses_nonzero_resource_operand_and_trailing_command() {
+        let mut b = allocation_stream();
+        b[16] = 1;
+        assert_eq!(
+            validate_venus_stream(&b, &mut [VenusOperand::default(); 2]),
+            Err(VenusReject::NonZeroResourceOperand)
+        );
+        let mut b = allocation_stream();
+        put32(&mut b, OP_FREE_MEMORY);
+        assert_eq!(
+            validate_venus_stream(&b, &mut [VenusOperand::default(); 2]),
+            Err(VenusReject::TrailingBytes)
+        );
+    }
+
+    #[test]
+    fn admits_empty_queue_commands_and_free() {
+        for opcode in [OP_QUEUE_SUBMIT, OP_QUEUE_SUBMIT2, OP_QUEUE_BIND_SPARSE] {
+            let mut b = Vec::new();
+            put32(&mut b, opcode);
+            put32(&mut b, 0);
+            put64(&mut b, 1); // queue
+            put32(&mut b, 0);
+            put64(&mut b, 0); // null array
+            put64(&mut b, 0); // fence
+            let admitted = validate_venus_stream(&b, &mut []).unwrap();
+            assert_eq!(admitted.operand_count, 0);
+        }
+
+        let mut b = Vec::new();
+        put32(&mut b, OP_FREE_MEMORY);
+        put32(&mut b, 0);
+        put64(&mut b, 1);
+        put64(&mut b, 2);
+        put64(&mut b, 0);
+        assert_eq!(
+            validate_venus_stream(&b, &mut []).unwrap().class,
+            VenusCommandClass::FreeMemory
+        );
+    }
+
+    #[test]
+    fn admits_generated_submit_with_the_complete_supported_chain() {
+        let mut b = queue_prefix(OP_QUEUE_SUBMIT, 1);
+        put32(&mut b, ST_SUBMIT_INFO);
+        // VkDeviceGroupSubmitInfo -> VkProtectedSubmitInfo ->
+        // VkTimelineSemaphoreSubmitInfo.  The generator writes the recursive
+        // pNext body before each containing structure's self fields.
+        put64(&mut b, 1);
+        put32(&mut b, ST_DEVICE_GROUP_SUBMIT_INFO);
+        put64(&mut b, 1);
+        put32(&mut b, ST_PROTECTED_SUBMIT_INFO);
+        put64(&mut b, 1);
+        put32(&mut b, ST_TIMELINE_SEMAPHORE_SUBMIT_INFO);
+        put64(&mut b, 0);
+        put32(&mut b, 1);
+        put64(&mut b, 1);
+        put64(&mut b, 9);
+        put32(&mut b, 1);
+        put64(&mut b, 1);
+        put64(&mut b, 10);
+        put32(&mut b, 1); // protectedSubmit
+        for count in [1u32, 1, 1] {
+            put32(&mut b, count);
+            put64(&mut b, count as u64);
+            put32(&mut b, 0);
+        }
+        // VkSubmitInfo self: one wait + stage, one command, one signal.
+        put32(&mut b, 1);
+        put64(&mut b, 1);
+        put64(&mut b, 0x201);
+        put64(&mut b, 1);
+        put32(&mut b, 0x10);
+        put32(&mut b, 1);
+        put64(&mut b, 1);
+        put64(&mut b, 0x301);
+        put32(&mut b, 1);
+        put64(&mut b, 1);
+        put64(&mut b, 0x401);
+        put64(&mut b, 0x501); // fence
+
+        assert_eq!(
+            validate_venus_stream(&b, &mut []).unwrap().class,
+            VenusCommandClass::QueueSubmit
+        );
+    }
+
+    fn semaphore_submit(out: &mut Vec<u8>, semaphore: u64) {
+        put32(out, ST_SEMAPHORE_SUBMIT_INFO);
+        put64(out, 0);
+        put64(out, semaphore);
+        put64(out, 7);
+        put64(out, 0x100);
+        put32(out, 0);
+    }
+
+    #[test]
+    fn admits_generated_submit2_with_wait_command_and_signal_records() {
+        let mut b = queue_prefix(OP_QUEUE_SUBMIT2, 1);
+        put32(&mut b, ST_SUBMIT_INFO2);
+        put64(&mut b, 0);
+        put32(&mut b, 0); // flags
+        put32(&mut b, 1);
+        put64(&mut b, 1);
+        semaphore_submit(&mut b, 0x601);
+        put32(&mut b, 1);
+        put64(&mut b, 1);
+        put32(&mut b, ST_COMMAND_BUFFER_SUBMIT_INFO);
+        put64(&mut b, 0);
+        put64(&mut b, 0x701);
+        put32(&mut b, 1);
+        put32(&mut b, 1);
+        put64(&mut b, 1);
+        semaphore_submit(&mut b, 0x801);
+        put64(&mut b, 0x901); // fence
+
+        assert_eq!(
+            validate_venus_stream(&b, &mut []).unwrap().class,
+            VenusCommandClass::QueueSubmit2
+        );
+    }
+
+    fn sparse_object(out: &mut Vec<u8>, stride: usize) {
+        put64(out, 0xA01);
+        put32(out, 1);
+        put64(out, 1);
+        zeros(out, stride);
+    }
+
+    #[test]
+    fn admits_generated_bind_sparse_with_all_three_binding_classes() {
+        let mut b = queue_prefix(OP_QUEUE_BIND_SPARSE, 1);
+        put32(&mut b, ST_BIND_SPARSE_INFO);
+        put64(&mut b, 1);
+        put32(&mut b, ST_DEVICE_GROUP_BIND_SPARSE_INFO);
+        put64(&mut b, 1);
+        put32(&mut b, ST_TIMELINE_SEMAPHORE_SUBMIT_INFO);
+        put64(&mut b, 0);
+        put32(&mut b, 1);
+        put64(&mut b, 1);
+        put64(&mut b, 11);
+        put32(&mut b, 1);
+        put64(&mut b, 1);
+        put64(&mut b, 12);
+        put32(&mut b, 0); // resourceDeviceIndex
+        put32(&mut b, 0); // memoryDeviceIndex
+        put32(&mut b, 1);
+        put64(&mut b, 1);
+        put64(&mut b, 0xB01);
+        for stride in [36usize, 36, 56] {
+            put32(&mut b, 1);
+            put64(&mut b, 1);
+            sparse_object(&mut b, stride);
+        }
+        put32(&mut b, 1);
+        put64(&mut b, 1);
+        put64(&mut b, 0xC01);
+        put64(&mut b, 0xD01); // fence
+
+        assert_eq!(
+            validate_venus_stream(&b, &mut []).unwrap().class,
+            VenusCommandClass::QueueBindSparse
+        );
+    }
+
+    #[test]
+    fn allocation_chain_is_recursive_and_requires_one_zero_import() {
+        let mut b = allocation_stream();
+        // Replace Import's pNext=NULL with a second import.  The generated
+        // recursive chain shape is valid bytes but must be rejected as
+        // ambiguous resource ownership.
+        b[76..84].copy_from_slice(&1u64.to_le_bytes());
+        b.splice(84..84, {
+            let mut nested = Vec::new();
+            put32(&mut nested, ST_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+            put64(&mut nested, 0);
+            put32(&mut nested, 0);
+            nested
+        });
+        assert_eq!(
+            validate_venus_stream(&b, &mut [VenusOperand::default(); 3]),
+            Err(VenusReject::DuplicateImport)
+        );
+
+        let mut missing = allocation_stream();
+        // A null top-level chain removes the only import and the stream is
+        // then re-laid out exactly as the generated VkMemoryAllocateInfo body.
+        missing[64..72].copy_from_slice(&0u64.to_le_bytes());
+        missing.drain(72..88);
+        assert_eq!(
+            validate_venus_stream(&missing, &mut [VenusOperand::default(); 2]),
+            Err(VenusReject::MissingImport)
+        );
+    }
+
+    #[test]
+    fn every_nested_shape_refuses_a_truncated_tail() {
+        let mut streams = Vec::new();
+
+        let mut submit2 = queue_prefix(OP_QUEUE_SUBMIT2, 1);
+        put32(&mut submit2, ST_SUBMIT_INFO2);
+        put64(&mut submit2, 0);
+        put32(&mut submit2, 0);
+        put32(&mut submit2, 1);
+        put64(&mut submit2, 1);
+        semaphore_submit(&mut submit2, 1);
+        streams.push(submit2);
+
+        let mut sparse = queue_prefix(OP_QUEUE_BIND_SPARSE, 1);
+        put32(&mut sparse, ST_BIND_SPARSE_INFO);
+        put64(&mut sparse, 0);
+        put32(&mut sparse, 0);
+        put64(&mut sparse, 0);
+        put32(&mut sparse, 1);
+        put64(&mut sparse, 1);
+        sparse_object(&mut sparse, 36);
+        streams.push(sparse);
+
+        for mut stream in streams {
+            stream.pop();
+            assert_eq!(
+                validate_venus_stream(&stream, &mut []),
+                Err(VenusReject::Truncated)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_count_driven_truncation_without_long_loop() {
+        let mut b = Vec::new();
+        put32(&mut b, OP_QUEUE_SUBMIT);
+        put32(&mut b, 0);
+        put64(&mut b, 1);
+        put32(&mut b, u32::MAX);
+        put64(&mut b, u32::MAX as u64);
+        assert_eq!(
+            validate_venus_stream(&b, &mut []),
+            Err(VenusReject::BadArrayCount)
+        );
+    }
+
+    #[test]
+    fn resource_id64_kind_remains_schema_reserved_but_width_known() {
+        assert_eq!(
+            helios_protocol::native_render::HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID64,
+            2
+        );
+    }
+}

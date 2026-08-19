@@ -267,6 +267,106 @@ impl VenusClient {
         })
     }
 
+    /// Allocate a shareable HOST3D blob from a pure DEVICE_LOCAL memory type.
+    ///
+    /// This is the sole backing constructor for HVM1 role 4.  It intentionally
+    /// omits `USE_MAPPABLE`, refuses BAR/ReBAR memory even when it is also
+    /// DEVICE_LOCAL, and has no fallback tier.  The resource is nevertheless
+    /// shareable so the exact session Venus context can import the same stock
+    /// virtio-gpu resource after its direct WDDM open is admitted.
+    pub fn allocate_device_local_memory_blob(
+        &mut self,
+        adapter: &AdapterContext,
+        size: u64,
+    ) -> Result<super::DeviceLocalBlob, VirtioError> {
+        if self.owned_memory_blobs.len() >= MAX_OWNED_MEMORY_BLOBS {
+            return Err(VirtioError::OutOfMemory);
+        }
+        if crate::virtio::KMD_D2_OWNER_ENABLED
+            && !adapter.control_owner().backing_creation_open()
+        {
+            return Err(VirtioError::DeviceError);
+        }
+        let Some(choice) = helios_kmd_logic::choose_strict_device_local_memory_type(
+            &self.memory_type_flags,
+            self.memory_type_count,
+            u32::MAX,
+        ) else {
+            return Err(VirtioError::DeviceError);
+        };
+        let memory_type_index = choice.index();
+        let size = round_up_page(size.max(4096));
+        let memory_id = self.new_memory_id();
+        {
+            let w = encode_memory_allocate(
+                self.device_id.into(),
+                memory_id.into(),
+                &MemoryAllocateSpec {
+                    pnext: MemoryPNext::Export {
+                        handle_type: EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF,
+                    },
+                    size,
+                    memory_type_index,
+                },
+            );
+            self.ring_command_expect(
+                adapter,
+                w.as_slice()?,
+                ReplyCheck::new(CMD_ALLOCATE_MEMORY)
+                    .mismatch(0x01F6)
+                    .refuse_result(0x01F7),
+            )?;
+        }
+
+        let created = if crate::virtio::KMD_D2_OWNER_ENABLED {
+            ctrl::resource_create_blob_with_finalizer(
+                self.passive(),
+                adapter,
+                self.ctx_id(),
+                VIRTIO_GPU_BLOB_MEM_HOST3D,
+                VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
+                memory_id.get(),
+                size,
+                crate::virtio::control_owner::ResourceBackingFinalizer::memory(memory_id.get()),
+                |finalizer| ctrl::finalize_resource_backing_with_client(self, adapter, finalizer),
+            )
+        } else {
+            ctrl::resource_create_blob(
+                self.passive(),
+                adapter,
+                self.ctx_id(),
+                VIRTIO_GPU_BLOB_MEM_HOST3D,
+                VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
+                memory_id.get(),
+                size,
+            )
+        };
+        let res_id = match created {
+            Ok(resource_id) => resource_id,
+            Err(e) => {
+                if !crate::virtio::KMD_D2_OWNER_ENABLED {
+                    let _ = self.free_memory_object(adapter, memory_id);
+                }
+                return Err(e);
+            }
+        };
+        if !crate::virtio::KMD_D2_OWNER_ENABLED {
+            let _ = adapter.with_virtio(|v| v.note_blob_size(res_id, size));
+        }
+        self.owned_memory_blobs.push(OwnedMemoryBlob {
+            resource_id: res_id,
+            memory_id,
+            allocation_size: size,
+            memory_type_index,
+        });
+        Ok(super::DeviceLocalBlob {
+            blob_id: memory_id.get(),
+            res_id,
+            size,
+            memory_type_index,
+        })
+    }
+
     /// See [`helios_kmd_logic::choose_host_visible_memory_type`] — the rule is a
     /// pure function of `memory_type_flags`/`memory_type_count`, so it lives
     /// where it can be host-tested.

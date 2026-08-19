@@ -34,6 +34,7 @@ use helios_protocol::HELIOS_PACKAGE_GENERATION;
 use crate::adapter::AdapterContext;
 use crate::ddi::session_transport::SessionTransport;
 use crate::dxgk::*;
+use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
 use crate::virtio::gpu::DeviceOwner;
 
@@ -309,6 +310,10 @@ pub(crate) struct SessionObject {
     /// pointer into this array while its strong session ref keeps the array
     /// alive; Submit never re-discovers an endpoint by generation/capability.
     endpoints: [SessionEndpointObject; model::ENDPOINT_SLOTS],
+    /// Next endpoint assigned to an HVC1 queue context.  Endpoints are never
+    /// recycled within a session: a late host fence can therefore never name a
+    /// newly-created queue merely because its numeric ring was reused.
+    next_queue_endpoint: AtomicU32,
     /// K11's one host context/object namespace and exact rundown edge.
     transport: SessionTransport,
     /// Monotonic, session-local HVR1 snapshot source.
@@ -553,7 +558,12 @@ pub(crate) enum ContextRequest {
     HeliosControl,
     /// An HVC1 queue context on the same raw device, holding its own reference
     /// to that device's session.
-    HeliosQueue { session: NonNull<SessionObject> },
+    HeliosQueue {
+        session: NonNull<SessionObject>,
+        /// Direct fixed endpoint selected once at context creation.  The queue
+        /// family/index in HVC1 remain diagnostics and are never looked up.
+        endpoint: NonNull<SessionEndpointObject>,
+    },
     /// An HQA1 outer-context attach onto an existing session.
     HeliosAttach {
         session: NonNull<SessionObject>,
@@ -681,20 +691,45 @@ fn admit_hvc1(
         // as the cell is set, and the cell's lock is held for this whole block —
         // so the release path cannot be between the clear and the free here.
         let obj = unsafe { session.as_ref() };
-        if obj.model.lock().phase() == model::SessionPhase::Draining {
-            drop(cell);
+        let endpoint_capacity = {
+            let model = obj.model.lock();
+            if model.phase() != model::SessionPhase::Live {
+                drop(model);
+                drop(cell);
+                crate::ddi::native_render::NR2_QUEUE_CTX_REJECT
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(STATUS_INVALID_DEVICE_REQUEST);
+            }
+            model.endpoint_capacity()
+        };
+        // Queue endpoints exist only after the real K11 INIT published their
+        // exact capacity.  The bounded update never wraps and never consumes a
+        // slot on refusal; endpoint ordinals are not recycled in this session.
+        let endpoint_index = match obj.next_queue_endpoint.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |next| (next < endpoint_capacity).then_some(next + 1),
+        ) {
+            Ok(index) => index as usize,
+            Err(_) => {
+                crate::ddi::native_render::NR2_QUEUE_CTX_REJECT
+                    .fetch_add(1, Ordering::Relaxed);
+                drop(cell);
+                return Err(STATUS_NOT_SUPPORTED);
+            }
+        };
+        let Some(endpoint) = obj.endpoints.get(endpoint_index) else {
             crate::ddi::native_render::NR2_QUEUE_CTX_REJECT.fetch_add(1, Ordering::Relaxed);
-            return Err(STATUS_INVALID_DEVICE_REQUEST);
-        }
-        // ⚠ A PROVISIONAL SESSION IS ADMITTED, and that remains deliberate.
-        // Mesa may create its K6 legacy queue-shaped contexts before INIT. K11
-        // does not turn those contexts into host queues: only the raw control
-        // context's exact finite HTS1 payload may reach the session transport;
-        // allocation-backed and queue work still refuses in native_render.
+            drop(cell);
+            return Err(STATUS_NOT_SUPPORTED);
+        };
         obj.acquire();
         drop(cell);
         crate::ddi::native_render::NR2_QUEUE_CTX.fetch_add(1, Ordering::Relaxed);
-        return Ok(ContextRequest::HeliosQueue { session });
+        return Ok(ContextRequest::HeliosQueue {
+            session,
+            endpoint: NonNull::from(endpoint),
+        });
     }
 
     let Some(list) = process_list else {
@@ -748,7 +783,8 @@ fn new_session(
             endpoint_id: index as u32 + 1,
             ring_index: index as u32 + 1,
         }),
-        transport: SessionTransport::new(),
+        next_queue_endpoint: AtomicU32::new(0),
+        transport: SessionTransport::new()?,
         snapshot_generations: SpinLock::new(model::SessionGenerationSource::new()),
         refs: AtomicU32::new(1),
     });
@@ -1149,6 +1185,97 @@ pub(crate) fn reply_pool_generation(session: NonNull<SessionObject>) -> Option<u
     generation
 }
 
+/// Exact live HTS1 generation carried by a direct context/session edge.
+pub(crate) fn execution_session_generation(session: NonNull<SessionObject>) -> Option<u64> {
+    let obj = unsafe { session.as_ref() };
+    let model = obj.model.lock();
+    (model.phase() == model::SessionPhase::Live)
+        .then(|| model.session_generation())
+        .filter(|generation| *generation != 0)
+}
+
+/// Mint the one session-local snapshot generation used to publish a bounded
+/// generated reply from the nonzero-ring executor.  The caller already owns a
+/// direct session rundown operation; this function performs no discovery and
+/// refuses a non-live session or exhausted generation space.
+pub(crate) fn mint_execution_snapshot_generation(
+    session: NonNull<SessionObject>,
+) -> Option<u64> {
+    let obj = unsafe { session.as_ref() };
+    if obj.model.lock().phase() != model::SessionPhase::Live {
+        return None;
+    }
+    obj.snapshot_generations.lock().mint().ok()
+}
+
+/// Retain the raw device's exact live session for one roles 2-4 HVM1 ordinary
+/// open.  The device cell is the only source; there is no process/global
+/// search, and a provisional or draining session is not an execution owner.
+pub(crate) fn retain_execution_session(
+    device_session: &SpinLock<Option<NonNull<SessionObject>>>,
+) -> Option<NonNull<SessionObject>> {
+    let cell = device_session.lock();
+    let session = (*cell)?;
+    let obj = unsafe { session.as_ref() };
+    if obj.model.lock().phase() != model::SessionPhase::Live {
+        return None;
+    }
+    obj.acquire();
+    Some(session)
+}
+
+/// Release the strong reference returned by [`retain_execution_session`].
+///
+/// # Safety
+/// The caller must own exactly that reference.
+pub(crate) unsafe fn release_execution_session(session: NonNull<SessionObject>) {
+    unsafe { SessionObject::release(session.as_ptr()) };
+}
+
+pub(crate) fn attach_execution_resource(
+    session: NonNull<SessionObject>,
+    passive: PassiveLevel,
+    resource_id: u32,
+    transport_instance: u64,
+) -> Result<u32, NTSTATUS> {
+    let obj = unsafe { session.as_ref() };
+    if obj.model.lock().phase() != model::SessionPhase::Live {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let adapter = unsafe { obj.adapter.as_ref() }.ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    obj.transport.attach_execution_resource(
+        passive,
+        adapter,
+        obj.owner,
+        resource_id,
+        transport_instance,
+    )
+}
+
+pub(crate) fn detach_execution_resource(
+    session: NonNull<SessionObject>,
+    passive: PassiveLevel,
+    resource_id: u32,
+) {
+    let obj = unsafe { session.as_ref() };
+    if let Some(adapter) = unsafe { obj.adapter.as_ref() } {
+        obj.transport
+            .detach_execution_resource(passive, adapter, resource_id);
+    }
+}
+
+/// Acquire the direct session/context rundown carried by an async host submit.
+pub(crate) fn acquire_execution_operation(
+    session: NonNull<SessionObject>,
+) -> Option<crate::ddi::session_transport::SessionExecutionOperation> {
+    let obj = unsafe { session.as_ref() };
+    if obj.model.lock().phase() != model::SessionPhase::Live {
+        return None;
+    }
+    let adapter = unsafe { obj.adapter.as_ref() }?;
+    obj.transport.acquire_execution(adapter, obj.owner)
+}
+
 /// Run one already-host-completed HVC1 admission while this exact session and
 /// canonical transport pair remain current.
 ///
@@ -1206,6 +1333,24 @@ pub(crate) fn admit_control_render(
             Err(STATUS_INVALID_PARAMETER)
         }
     }
+}
+
+/// Check out one role-1 reply slot for an exact generated allocation command
+/// executing on this session's nonzero endpoint.  The caller has already
+/// resolved the reply-pool allocation through the Render allocation list; the
+/// session model owns the monotone slot-generation transition.
+pub(crate) fn admit_execution_reply(
+    session: NonNull<SessionObject>,
+    request: &model::ExecutionReplyRequest,
+) -> Result<model::ControlRenderAdmission, NTSTATUS> {
+    let obj = unsafe { session.as_ref() };
+    obj.model
+        .lock()
+        .admit_execution_reply(request)
+        .map_err(|refusal| {
+            bump_with_code(&TS_CONTROL_RENDER_REJECT, control_render_code(refusal));
+            STATUS_INVALID_PARAMETER
+        })
 }
 
 /// Retire a checked-out slot after its real HVR1 reply was published.

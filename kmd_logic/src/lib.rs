@@ -37,6 +37,7 @@ pub mod direct_scanout_admission;
 pub mod direct_scanout_lifetime;
 pub mod display_backing_lifetime;
 pub mod ordered_engine;
+pub mod venus_executor;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///
@@ -1305,6 +1306,40 @@ pub fn choose_device_local_memory_type(
     fallback.map(MemoryTypeChoice::Downgraded)
 }
 
+/// Pick a strictly non-host-visible DEVICE_LOCAL memory type.
+///
+/// HVM1 role 4 promises that no CPU mapping exists.  The ordinary device-local
+/// selector above deliberately accepts a BAR/ReBAR type as an exact answer and
+/// eventually accepts an arbitrary allowed type as a named downgrade.  Neither
+/// answer is legal for role 4: a HOST_VISIBLE type would make the allocation
+/// Lock-capable in fact even though its fixed HVM1 contract says otherwise, and
+/// a non-device-local fallback would simply be a different memory class.
+///
+/// There is therefore no tier or downgrade here.  `None` is the only truthful
+/// result when the host does not expose an allowed pure-VRAM type.
+pub fn choose_strict_device_local_memory_type(
+    memory_type_flags: &[u32],
+    memory_type_count: u32,
+    memory_type_bits: u32,
+) -> Option<MemoryTypeChoice> {
+    let limit = |i: u32| {
+        i < memory_type_count && i < VK_MAX_MEMORY_TYPES && (i as usize) < memory_type_flags.len()
+    };
+    let mut i = 0;
+    while limit(i) {
+        if (memory_type_bits & (1u32 << i)) != 0 {
+            let flags = memory_type_flags[i as usize];
+            if (flags & MEMORY_PROPERTY_DEVICE_LOCAL) != 0
+                && (flags & MEMORY_PROPERTY_HOST_VISIBLE) == 0
+            {
+                return Some(MemoryTypeChoice::Exact(i));
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
 
@@ -2102,6 +2137,28 @@ mod tests {
         assert_eq!(
             choose_device_local_memory_type(&NVIDIA_SHAPED, 3, 0b101),
             Some(MemoryTypeChoice::Exact(0))
+        );
+    }
+
+    /// Role 4 has no BAR tier and no property downgrade.  The first pure-VRAM
+    /// type wins; a host-visible DEVICE_LOCAL type is not an alternate answer.
+    #[test]
+    fn strict_device_local_never_selects_host_visible_or_fallback_memory() {
+        assert_eq!(
+            choose_strict_device_local_memory_type(&NVIDIA_SHAPED, 3, 0b111),
+            Some(MemoryTypeChoice::Exact(0))
+        );
+        assert_eq!(
+            choose_strict_device_local_memory_type(&NVIDIA_SHAPED, 3, 0b110),
+            None
+        );
+        assert_eq!(
+            choose_strict_device_local_memory_type(&NVIDIA_SHAPED, 3, 0b010),
+            None
+        );
+        assert_eq!(
+            choose_strict_device_local_memory_type(&NVIDIA_SHAPED, 3, 0),
+            None
         );
     }
 
@@ -9076,6 +9133,22 @@ pub mod translation_session {
         pub batch_token: u64,
     }
 
+    /// One nonzero-endpoint executor reply checkout.  The platform half has
+    /// already proved that the reply use names this session's exact role-1
+    /// allocation and that the complete outer allocation closure is present;
+    /// this model owns only the four-slot generation/lifetime transition.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct ExecutionReplyRequest {
+        pub names_reply_pool: bool,
+        pub expected_allocation_generation: u64,
+        pub access_flags: u32,
+        pub reply_offset: u64,
+        pub reply_capacity_bytes: u64,
+        pub reply_slot_generation: u64,
+        pub batch_token: u64,
+        pub owner_context_generation: u64,
+    }
+
     // ── the session ───────────────────────────────────────────────────────────
 
     /// The KMD-side HTS1 session: everything `DxgkDdiCreateContext`,
@@ -9590,16 +9663,78 @@ pub mod translation_session {
                 });
             }
 
-            let index = Self::slot_index(request.reply_offset)?;
+            self.checkout_reply_slot(
+                request.reply_offset,
+                request.reply_capacity_bytes,
+                request.reply_slot_generation,
+                request.batch_token,
+                request.owner_context_generation,
+            )
+        }
+
+        /// Admit the exact role-1 reply range of one already-classified
+        /// nonzero-ring allocation command.  Unlike the control carrier, this
+        /// operation is legal only after INIT and does not require the complete
+        /// allocation list to contain only the reply pool.
+        pub fn admit_execution_reply(
+            &mut self,
+            request: &ExecutionReplyRequest,
+        ) -> Result<ControlRenderAdmission, SessionRefusal> {
+            match self.phase {
+                SessionPhase::Provisional => return Err(SessionRefusal::SessionProvisional),
+                SessionPhase::Draining => return Err(SessionRefusal::SessionDraining),
+                SessionPhase::Live => {}
+            }
+            let Some(pool) = self.pool else {
+                return Err(SessionRefusal::ReplyPoolNotBound);
+            };
+            if !request.names_reply_pool {
+                return Err(SessionRefusal::ControlRenderForeignAllocation);
+            }
+            if request.expected_allocation_generation != pool.allocation_generation {
+                return Err(SessionRefusal::ControlRenderPoolGenerationStale {
+                    found: request.expected_allocation_generation,
+                    expected: pool.allocation_generation,
+                });
+            }
+            if request.access_flags != HELIOS_HNR2_ACCESS_WRITE {
+                return Err(SessionRefusal::ControlRenderAccessNotWrite {
+                    found: request.access_flags,
+                });
+            }
+            if request.owner_context_generation == 0 {
+                return Err(SessionRefusal::ControlRenderSlotGenerationUnknown { found: 0 });
+            }
+            self.checkout_reply_slot(
+                request.reply_offset,
+                request.reply_capacity_bytes,
+                request.reply_slot_generation,
+                request.batch_token,
+                request.owner_context_generation,
+            )
+        }
+
+        fn checkout_reply_slot(
+            &mut self,
+            reply_offset: u64,
+            reply_capacity_bytes: u64,
+            reply_slot_generation: u64,
+            batch_token: u64,
+            owner_context_generation: u64,
+        ) -> Result<ControlRenderAdmission, SessionRefusal> {
+            let index = Self::slot_index(reply_offset)?;
+            let Some(pool) = self.pool else {
+                return Err(SessionRefusal::ReplyPoolNotBound);
+            };
             let slot = pool.slots[index];
             if slot.state != SlotState::Idle {
                 return Err(SessionRefusal::ControlRenderSlotBusy {
                     in_flight: slot.generation,
                 });
             }
-            if request.reply_slot_generation <= slot.retired_generation {
+            if reply_slot_generation <= slot.retired_generation {
                 return Err(SessionRefusal::ControlRenderSlotGenerationStale {
-                    found: request.reply_slot_generation,
+                    found: reply_slot_generation,
                     watermark: slot.retired_generation,
                 });
             }
@@ -9609,20 +9744,20 @@ pub mod translation_session {
             };
             pool_mut.slots[index] = ReplySlot {
                 state: SlotState::InFlight,
-                generation: request.reply_slot_generation,
+                generation: reply_slot_generation,
                 retired_generation: slot.retired_generation,
-                owner_context_generation: request.owner_context_generation,
-                batch_token: request.batch_token,
-                reply_offset: request.reply_offset,
-                reply_capacity_bytes: request.reply_capacity_bytes,
+                owner_context_generation,
+                batch_token,
+                reply_offset,
+                reply_capacity_bytes,
                 c51_value: 0,
             };
             Ok(ControlRenderAdmission {
                 slot_index: Some(index),
-                slot_generation: request.reply_slot_generation,
-                reply_offset: request.reply_offset,
-                reply_capacity_bytes: request.reply_capacity_bytes,
-                batch_token: request.batch_token,
+                slot_generation: reply_slot_generation,
+                reply_offset,
+                reply_capacity_bytes,
+                batch_token,
             })
         }
 
@@ -9819,6 +9954,22 @@ pub mod translation_session {
                 reply_slot_generation: slot_generation,
                 batch_token: 1,
                 owner_context_generation: 0,
+            }
+        }
+
+        fn execution_reply_request(
+            slot: usize,
+            slot_generation: u64,
+        ) -> ExecutionReplyRequest {
+            ExecutionReplyRequest {
+                names_reply_pool: true,
+                expected_allocation_generation: POOL_GEN,
+                access_flags: HELIOS_HNR2_ACCESS_WRITE,
+                reply_offset: slot as u64 * HELIOS_HVM1_REPLY_SLOT_BYTES,
+                reply_capacity_bytes: 80 + 24,
+                reply_slot_generation: slot_generation,
+                batch_token: 9,
+                owner_context_generation: 0xA11,
             }
         }
 
@@ -10327,6 +10478,77 @@ pub mod translation_session {
         }
 
         // ── the control-context Render ────────────────────────────────────
+
+        #[test]
+        fn a_nonzero_endpoint_allocation_reply_uses_the_same_exact_slot_lifetime() {
+            let mut s = live_session(4);
+            let admitted = s
+                .admit_execution_reply(&execution_reply_request(2, 7))
+                .unwrap();
+            assert_eq!(admitted.slot_index, Some(2));
+            assert_eq!(admitted.slot_generation, 7);
+            assert_eq!(admitted.batch_token, 9);
+            assert_eq!(s.pool().unwrap().slots[2].owner_context_generation, 0xA11);
+
+            assert_eq!(
+                s.admit_execution_reply(&execution_reply_request(2, 8)),
+                Err(SessionRefusal::ControlRenderSlotBusy { in_flight: 7 })
+            );
+            s.publish_slot(2, 7, 0).unwrap();
+            s.retire_slot(2, 7).unwrap();
+            s.admit_execution_reply(&execution_reply_request(2, 8))
+                .expect("a later executor reply reuses the retired slot");
+        }
+
+        #[test]
+        fn an_execution_reply_requires_the_exact_pool_role_generation_and_context() {
+            let mut s = live_session(4);
+            let mut request = execution_reply_request(0, 1);
+            request.names_reply_pool = false;
+            assert_eq!(
+                s.admit_execution_reply(&request),
+                Err(SessionRefusal::ControlRenderForeignAllocation)
+            );
+
+            let mut request = execution_reply_request(0, 1);
+            request.expected_allocation_generation -= 1;
+            assert_eq!(
+                s.admit_execution_reply(&request),
+                Err(SessionRefusal::ControlRenderPoolGenerationStale {
+                    found: POOL_GEN - 1,
+                    expected: POOL_GEN,
+                })
+            );
+
+            for access in [0, HELIOS_HNR2_ACCESS_READ] {
+                let mut request = execution_reply_request(0, 1);
+                request.access_flags = access;
+                assert_eq!(
+                    s.admit_execution_reply(&request),
+                    Err(SessionRefusal::ControlRenderAccessNotWrite { found: access })
+                );
+            }
+
+            let mut request = execution_reply_request(0, 1);
+            request.owner_context_generation = 0;
+            assert!(s.admit_execution_reply(&request).is_err());
+        }
+
+        #[test]
+        fn provisional_and_draining_sessions_never_admit_an_execution_reply() {
+            let mut provisional = TranslationSession::new_provisional(PKG, CAPSET);
+            assert_eq!(
+                provisional.admit_execution_reply(&execution_reply_request(0, 1)),
+                Err(SessionRefusal::SessionProvisional)
+            );
+
+            let mut draining = live_session(4);
+            draining.begin_draining();
+            assert_eq!(
+                draining.admit_execution_reply(&execution_reply_request(0, 1)),
+                Err(SessionRefusal::SessionDraining)
+            );
+        }
 
         #[test]
         fn a_control_render_must_arrive_on_the_control_context() {

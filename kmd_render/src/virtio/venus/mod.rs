@@ -164,6 +164,16 @@ pub struct HostVisibleBlob {
     pub size: u64,
 }
 
+/// A HOST3D blob backed by a pure DEVICE_LOCAL, non-HOST_VISIBLE Vulkan
+/// allocation.  Unlike [`HostVisibleBlob`], this object is deliberately not
+/// mappable and carries no guest physical address.
+pub struct DeviceLocalBlob {
+    pub blob_id: u64,
+    pub res_id: u32,
+    pub size: u64,
+    pub memory_type_index: u32,
+}
+
 pub struct ScanoutImageBlob {
     pub blob: HostVisibleBlob,
     pub image_id: VkImageId,

@@ -19,6 +19,7 @@
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::mem::size_of;
+use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use alloc::vec::Vec;
@@ -36,12 +37,20 @@ use helios_protocol::native_render::kernel_dma::{
 use helios_protocol::native_render::{
     HeliosNativeRenderPatch, HeliosNativeRenderUse, HeliosNativeRenderV2, Hnr2Accept, Hnr2Reject,
     Hnr2TableReject, HELIOS_HNR2_HEADER_SIZE, HELIOS_HNR2_MAX_PATCH_RECORDS,
-    HELIOS_HVC1_ALLOCATION_LIST_ENTRIES,
+    HELIOS_HNR2_MAX_FRAGMENTS, HELIOS_HNR2_MAX_OUTSTANDING_SUBMISSIONS,
+    HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32,
+    HELIOS_HVC1_ALLOCATION_LIST_ENTRIES, HELIOS_HVM1_ROLE_REPLY_POOL,
+    HELIOS_HVM1_ROLE_VULKAN_DEVICE_LOCAL,
+    HELIOS_HVR1_FLAG_FINAL, HELIOS_HVR1_HEADER_SIZE, HELIOS_HVR1_MAGIC, HELIOS_HVR1_VERSION,
 };
 use helios_protocol::wddm::HeliosOuterSubmitV1;
 
 use crate::dxgk::*;
+use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
+use crate::virtio::hal::DmaBuffer;
+use crate::virtio::gpu::SUBMIT_META_BYTES;
+use wdk_sys::ntddk::{KeClearEvent, KeInitializeEvent, KeSetEvent, KeWaitForSingleObject};
 
 // ── Named counters ───────────────────────────────────────────────────────────
 //
@@ -429,6 +438,16 @@ struct Hnr2Scratch {
     /// the single Windows fact `admit_commit_tables` needs, reduced to a
     /// primitive at the boundary.
     write_bits: Vec<bool>,
+    /// Generated-schema operands, and allocation-list-index to use-ordinal
+    /// mapping. Both are fixed at context creation; COMMIT never allocates
+    /// parser scratch from attacker-controlled counts.
+    expected_operands: Vec<helios_kmd_logic::venus_executor::VenusOperand>,
+    patch_order: Vec<u32>,
+    use_ordinals: Vec<u32>,
+    /// The one incomplete batch permitted by HNR2. Its payload is copied into
+    /// KMD-owned DMA memory fragment by fragment and becomes immutable at
+    /// COMMIT.
+    building: Option<BuildingBatch>,
 }
 
 impl Hnr2Scratch {
@@ -460,11 +479,387 @@ impl Hnr2Scratch {
             .try_reserve_exact(HELIOS_HVC1_ALLOCATION_LIST_ENTRIES as usize)
             .ok()?;
         write_bits.resize(HELIOS_HVC1_ALLOCATION_LIST_ENTRIES as usize, false);
+        let mut expected_operands = Vec::new();
+        expected_operands
+            .try_reserve_exact(HELIOS_HNR2_MAX_PATCH_RECORDS as usize)
+            .ok()?;
+        expected_operands.resize(
+            HELIOS_HNR2_MAX_PATCH_RECORDS as usize,
+            helios_kmd_logic::venus_executor::VenusOperand::default(),
+        );
+        let mut patch_order = Vec::new();
+        patch_order
+            .try_reserve_exact(HELIOS_HNR2_MAX_PATCH_RECORDS as usize)
+            .ok()?;
+        patch_order.resize(HELIOS_HNR2_MAX_PATCH_RECORDS as usize, 0);
+        let mut use_ordinals = Vec::new();
+        use_ordinals
+            .try_reserve_exact(HELIOS_HVC1_ALLOCATION_LIST_ENTRIES as usize)
+            .ok()?;
+        use_ordinals.resize(HELIOS_HVC1_ALLOCATION_LIST_ENTRIES as usize, u32::MAX);
         Some(Self {
             uses,
             patches,
             write_bits,
+            expected_operands,
+            patch_order,
+            use_ordinals,
+            building: None,
         })
+    }
+}
+
+const EXECUTOR_SLOTS: usize = HELIOS_HNR2_MAX_OUTSTANDING_SUBMISSIONS as usize;
+const BATCH_TICKETS: usize = HELIOS_HNR2_MAX_FRAGMENTS as usize;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BatchIdentity {
+    batch_token: u64,
+    slot_generation: u64,
+    payload_bytes: u32,
+    full_payload_crc64: u64,
+    fragment_count: u16,
+    session_generation: u64,
+    context_generation: u64,
+    ring_index: u32,
+}
+
+#[derive(Clone, Copy)]
+struct BatchTickets {
+    entries: [Option<crate::adapter::OrderedEngineTicket>; BATCH_TICKETS],
+    count: u16,
+    resubmit_count: u16,
+    /// Exactly one DMA record carries the COMMIT payload length.  Host work
+    /// may start only when VidSch submits that record: earlier fragment
+    /// callbacks have no allocation list/residency authority for the batch.
+    commit_seen: bool,
+}
+
+impl BatchTickets {
+    const fn new() -> Self {
+        Self {
+            entries: [None; BATCH_TICKETS],
+            count: 0,
+            resubmit_count: 0,
+            commit_seen: false,
+        }
+    }
+
+    fn append(
+        &mut self,
+        ticket: crate::adapter::OrderedEngineTicket,
+        resubmission: bool,
+        fragment_count: u16,
+        commit_record: bool,
+        ticket_is_live: impl Fn(crate::adapter::OrderedEngineTicket) -> bool,
+    ) -> bool {
+        if resubmission {
+            // Reset/preempt invalidates the entire prior K9 epoch.  Detect that
+            // transition from the tickets themselves on EVERY resubmission
+            // cycle: one batch may legitimately be preempted more than once.
+            // Within one cycle later fragments share the replacement ticket
+            // epoch and append even if an already-terminal batch retired the
+            // preceding fragment immediately.
+            let prior_epoch = self.entries[..self.count as usize]
+                .iter()
+                .flatten()
+                .next()
+                .map(|old| old.epoch());
+            let new_epoch = prior_epoch.is_none_or(|epoch| epoch != ticket.epoch());
+            let any_live = self.entries[..self.count as usize]
+                .iter()
+                .flatten()
+                .any(|old| ticket_is_live(*old));
+            if new_epoch {
+                if any_live {
+                    return false;
+                }
+                self.entries = [None; BATCH_TICKETS];
+                self.count = 0;
+                self.commit_seen = false;
+            }
+            self.resubmit_count = self.resubmit_count.saturating_add(1);
+        }
+        if commit_record && self.commit_seen {
+            return false;
+        }
+        let Some(next_count) = self.count.checked_add(1) else {
+            return false;
+        };
+        if next_count > fragment_count || commit_record != (next_count == fragment_count) {
+            return false;
+        }
+        let index = self.count as usize;
+        let Some(slot) = self.entries.get_mut(index) else {
+            return false;
+        };
+        *slot = Some(ticket);
+        self.count = next_count;
+        self.commit_seen |= commit_record;
+        true
+    }
+}
+
+struct NativeContextOperation {
+    owner: NonNull<NativeContext>,
+}
+
+unsafe impl Send for NativeContextOperation {}
+
+impl Drop for NativeContextOperation {
+    fn drop(&mut self) {
+        let owner = unsafe { self.owner.as_ref() };
+        let signal = {
+            let mut rundown = owner.rundown.lock();
+            debug_assert!(rundown.active != 0);
+            rundown.active = rundown.active.saturating_sub(1);
+            rundown.active == 0
+        };
+        if signal {
+            unsafe { KeSetEvent(owner.drained.get(), 0, 0) };
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NativeContextRundown {
+    open: bool,
+    active: u32,
+}
+
+struct NativeCustody {
+    _staging: StagingCustody,
+    _session: crate::ddi::session_transport::SessionExecutionOperation,
+    _allocations: Vec<crate::ddi::create_allocation::OpenExecutionUse>,
+    reply: Option<ExecutionReply>,
+}
+
+impl NativeCustody {
+    fn host_context_id(&self) -> u32 {
+        self._session.context_id
+    }
+
+    fn transport_instance(&self) -> u64 {
+        self._session.transport_instance
+    }
+}
+
+/// Move-only ownership carried by the existing virtio-gpu in-flight entry.
+/// The stock used-ring response is the only normal producer of a terminal;
+/// transport reset may produce a failed terminal only after device status is
+/// proven zero.
+pub(crate) struct NativeHostCompletion {
+    context: NonNull<NativeContext>,
+    identity: BatchIdentity,
+    slot_index: u32,
+    custody: Option<NativeCustody>,
+}
+
+// SAFETY: the context/session/allocation operation guards touch only pinned
+// nonpaged objects and their leaf locks/events. Their rundown joins before the
+// owning objects are freed.
+unsafe impl Send for NativeHostCompletion {}
+
+pub(crate) struct NativeHostTerminal {
+    completion: NativeHostCompletion,
+    host_ok: bool,
+}
+
+impl NativeHostCompletion {
+    pub(crate) fn terminal(self, host_ok: bool) -> NativeHostTerminal {
+        NativeHostTerminal {
+            completion: self,
+            host_ok,
+        }
+    }
+}
+
+struct ExecutionReply {
+    session: NonNull<crate::ddi::translation_session::SessionObject>,
+    facts: crate::ddi::create_allocation::K11ReplyPoolFacts,
+    slot_index: usize,
+    slot_generation: u64,
+    batch_token: u64,
+    snapshot_generation: u64,
+    session_generation: u64,
+    reply_offset: u64,
+    reply_capacity: u64,
+    finished: bool,
+}
+
+unsafe impl Send for ExecutionReply {}
+
+impl ExecutionReply {
+    const RAW_ALLOCATE_REPLY_BYTES: u64 = 24;
+
+    fn finish(mut self, host_ok: bool) -> bool {
+        let mut published = false;
+        if host_ok
+            && crate::ddi::translation_session::execution_session_generation(self.session)
+                == Some(self.session_generation)
+        {
+            let payload = unsafe {
+                self.facts
+                    .kernel_va
+                    .as_ptr()
+                    .add(self.reply_offset as usize + HELIOS_HVR1_HEADER_SIZE as usize)
+            };
+            let opcode = unsafe { core::ptr::read_unaligned(payload.cast::<u32>()) };
+            let status = unsafe { core::ptr::read_unaligned(payload.add(4).cast::<i32>()) };
+            let output_present = unsafe { core::ptr::read_unaligned(payload.add(8).cast::<u64>()) };
+            if opcode == helios_kmd_logic::venus_executor::OP_ALLOCATE_MEMORY
+                && output_present == 1
+            {
+                let header = helios_protocol::native_render::HeliosVenusReplyV1 {
+                    magic: HELIOS_HVR1_MAGIC,
+                    version: HELIOS_HVR1_VERSION,
+                    header_size: HELIOS_HVR1_HEADER_SIZE as u16,
+                    package_generation: helios_protocol::HELIOS_PACKAGE_GENERATION,
+                    session_generation: self.session_generation,
+                    slot_generation: self.slot_generation,
+                    batch_token: self.batch_token,
+                    snapshot_generation: self.snapshot_generation,
+                    opcode,
+                    status,
+                    total_bytes: Self::RAW_ALLOCATE_REPLY_BYTES,
+                    chunk_offset: 0,
+                    chunk_bytes: Self::RAW_ALLOCATE_REPLY_BYTES as u32,
+                    flags: HELIOS_HVR1_FLAG_FINAL,
+                };
+                published = crate::ddi::session_transport::SessionTransport::publish_hvr1_existing_payload(
+                    self.facts,
+                    self.reply_offset,
+                    self.reply_capacity,
+                    &header,
+                    Self::RAW_ALLOCATE_REPLY_BYTES,
+                )
+                .is_ok();
+            }
+        }
+        if published {
+            crate::ddi::translation_session::release_control_slot(
+                self.session,
+                self.slot_index,
+                self.slot_generation,
+            );
+        } else {
+            crate::ddi::translation_session::abort_control_slot(
+                self.session,
+                self.slot_index,
+                self.slot_generation,
+            );
+        }
+        self.finished = true;
+        published
+    }
+}
+
+impl Drop for ExecutionReply {
+    fn drop(&mut self) {
+        if !self.finished {
+            crate::ddi::translation_session::abort_control_slot(
+                self.session,
+                self.slot_index,
+                self.slot_generation,
+            );
+            self.finished = true;
+        }
+    }
+}
+
+struct ReadyBatch {
+    payload: DmaBuffer,
+    meta: DmaBuffer,
+    custody: NativeCustody,
+}
+
+struct BuildingBatch {
+    identity: BatchIdentity,
+    slot_index: u32,
+    payload: DmaBuffer,
+    meta: DmaBuffer,
+    staging: StagingCustody,
+    session: crate::ddi::session_transport::SessionExecutionOperation,
+}
+
+/// One exact checkout from the existing per-context HNR2 staging model.
+/// Queue payload bytes remain charged from BEGIN until the real host terminal
+/// (or an earlier explicit refusal) releases the immutable DMA copy.
+struct StagingCustody {
+    context: NativeContextOperation,
+    bytes: u64,
+}
+
+impl Drop for StagingCustody {
+    fn drop(&mut self) {
+        let native = unsafe { self.context.owner.as_ref() };
+        match native.state.lock().staging_mut().retire(self.bytes) {
+            Ok(()) => {
+                NR2_SLOT_RETIRED.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {
+                NR2_SLOT_UNDERFLOW.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+enum SubmissionSlot {
+    Free,
+    Collecting {
+        identity: BatchIdentity,
+        tickets: BatchTickets,
+    },
+    Ready {
+        identity: BatchIdentity,
+        tickets: BatchTickets,
+        batch: Option<ReadyBatch>,
+    },
+    InFlight {
+        identity: BatchIdentity,
+        tickets: BatchTickets,
+    },
+    Terminal {
+        identity: BatchIdentity,
+        tickets: BatchTickets,
+        success: bool,
+        /// Only enqueue failure leaves DMA buffers here. Host-owned buffers
+        /// park in VirtioGpu and are reaped at PASSIVE by the existing pool.
+        cleanup: Option<(DmaBuffer, DmaBuffer)>,
+    },
+}
+
+enum CloseSlotWork {
+    None,
+    Fail(BatchTickets),
+    DropReady(BatchTickets, ReadyBatch),
+}
+
+struct ExecutorState {
+    slots: Vec<SubmissionSlot>,
+    next_slot_generation: u64,
+}
+
+impl ExecutorState {
+    fn new() -> Option<Self> {
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(EXECUTOR_SLOTS).ok()?;
+        for _ in 0..EXECUTOR_SLOTS {
+            slots.push(SubmissionSlot::Free);
+        }
+        Some(Self {
+            slots,
+            next_slot_generation: 1,
+        })
+    }
+
+    fn mint_slot_generation(&mut self) -> Option<u64> {
+        let generation = self.next_slot_generation;
+        if generation == 0 {
+            return None;
+        }
+        self.next_slot_generation = generation.checked_add(1)?;
+        Some(generation)
     }
 }
 
@@ -484,14 +879,18 @@ pub(crate) enum NativeClass {
 /// One HVC1 context's K6 state, allocated at `DxgkDdiCreateContext` and owned by
 /// [`crate::device::ContextContext`]'s role.
 pub(crate) struct NativeContext {
+    adapter: NonNull<crate::adapter::AdapterContext>,
     class: NativeClass,
     /// The host ring this context's submissions execute on.
     ///
-    /// ⛔ Always 0 today, for both classes. K11 reserves fixed nonzero endpoint
-    /// rings before publishing INIT capacity, but no queue operation executes
-    /// in this tranche; a queue context therefore retains ring zero only as a
-    /// refusal value and never submits through it.
+    /// Control is ring zero.  A queue context owns one direct, nonzero,
+    /// non-recycled endpoint selected by its session at context creation.
     ring_index: u32,
+    /// Exact session and context-local generations written into every private
+    /// DMA record and rechecked by the context slot. For queue contexts the
+    /// non-recycled endpoint ordinal is also the context generation.
+    session_generation: u64,
+    context_generation: u64,
     /// One exact WDDM SubmissionFenceId watermark for this HVC1 context.  It is
     /// neither an adapter-wide boundary queue nor a host/shared timeline.
     host_submissions: SpinLock<HostSubmissionState>,
@@ -499,6 +898,9 @@ pub(crate) struct NativeContext {
     /// taken for the admission decision only, never held across the user copy,
     /// a host call, or a wait.
     state: SpinLock<RenderContext>,
+    executor: SpinLock<ExecutorState>,
+    rundown: SpinLock<NativeContextRundown>,
+    drained: UnsafeCell<KEVENT>,
     /// Claimed for the whole of one `DxgkDdiRender`, so [`Self::scratch`] has
     /// exactly one writer.
     ///
@@ -524,19 +926,45 @@ unsafe impl Sync for NativeContext {}
 impl NativeContext {
     /// `None` when the COMMIT scratch cannot be allocated; the caller must then
     /// fail `DxgkDdiCreateContext`.
-    pub(crate) fn new(class: NativeClass) -> Option<Self> {
+    pub(crate) fn new(
+        adapter: NonNull<crate::adapter::AdapterContext>,
+        class: NativeClass,
+        ring_index: u32,
+        session_generation: u64,
+        context_generation: u64,
+    ) -> Option<alloc::boxed::Box<Self>> {
+        if (class == NativeClass::Control) != (ring_index == 0) {
+            return None;
+        }
+        if class == NativeClass::Queue
+            && (session_generation == 0 || context_generation == 0)
+        {
+            return None;
+        }
         let Some(scratch) = Hnr2Scratch::new() else {
             NR2_SCRATCH_ALLOC_FAILED.fetch_add(1, Ordering::Relaxed);
             return None;
         };
-        Some(Self {
+        let executor = ExecutorState::new()?;
+        let native = alloc::boxed::Box::new(Self {
+            adapter,
             class,
-            ring_index: helios_protocol::native_render::HELIOS_HVC1_CONTROL_RING_INDEX,
+            ring_index,
+            session_generation,
+            context_generation,
             host_submissions: SpinLock::new(HostSubmissionState::new()),
             state: SpinLock::new(RenderContext::new()),
+            executor: SpinLock::new(executor),
+            rundown: SpinLock::new(NativeContextRundown {
+                open: true,
+                active: 0,
+            }),
+            drained: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             busy: AtomicU32::new(0),
             scratch: UnsafeCell::new(scratch),
-        })
+        });
+        unsafe { KeInitializeEvent(native.drained.get(), 0, 1) };
+        Some(native)
     }
 
     /// Take exclusive use of [`Self::scratch`] for one `DxgkDdiRender`, or
@@ -552,6 +980,279 @@ impl NativeContext {
         }
         Some(NativeClaim { owner: self })
     }
+
+    fn acquire_operation(&self) -> Option<NativeContextOperation> {
+        let mut rundown = self.rundown.lock();
+        if !rundown.open || rundown.active == u32::MAX {
+            return None;
+        }
+        if rundown.active == 0 {
+            unsafe { KeClearEvent(self.drained.get()) };
+        }
+        rundown.active += 1;
+        Some(NativeContextOperation {
+            owner: NonNull::from(self),
+        })
+    }
+
+    /// Stop new Render/Submit admissions, fail every batch that never reached
+    /// the stock transport, and join exact in-flight host custody. No transport
+    /// polling or synthetic completion is involved: an InFlight slot can release
+    /// its rundown only from a used-ring response or a proven physical reset.
+    pub(crate) fn close(&self, passive: PassiveLevel) {
+        {
+            let mut rundown = self.rundown.lock();
+            rundown.open = false;
+            if rundown.active == 0 {
+                unsafe { KeSetEvent(self.drained.get(), 0, 0) };
+            }
+        }
+
+        // DestroyContext is serialized with Render for this handle. Give back a
+        // partially assembled batch before walking its corresponding slot.
+        let building = unsafe { &mut *self.scratch.get() }.building.take();
+
+        let adapter = unsafe { self.adapter.as_ref() };
+        for index in 0..EXECUTOR_SLOTS {
+            let work = {
+                let mut executor = self.executor.lock();
+                let Some(slot) = executor.slots.get_mut(index) else {
+                    continue;
+                };
+                let old = core::mem::replace(slot, SubmissionSlot::Free);
+                match old {
+                    SubmissionSlot::Collecting { identity, tickets } => {
+                        *slot = SubmissionSlot::Terminal {
+                            identity,
+                            tickets,
+                            success: false,
+                            cleanup: None,
+                        };
+                        CloseSlotWork::Fail(tickets)
+                    }
+                    SubmissionSlot::Ready {
+                        identity,
+                        tickets,
+                        batch,
+                    } => {
+                        *slot = SubmissionSlot::Terminal {
+                            identity,
+                            tickets,
+                            success: false,
+                            cleanup: None,
+                        };
+                        match batch {
+                            Some(batch) => CloseSlotWork::DropReady(tickets, batch),
+                            None => CloseSlotWork::Fail(tickets),
+                        }
+                    }
+                    other => {
+                        *slot = other;
+                        CloseSlotWork::None
+                    }
+                }
+            };
+            match work {
+                CloseSlotWork::None => {}
+                CloseSlotWork::Fail(tickets) => {
+                    settle_batch_tickets(adapter, tickets, false);
+                }
+                CloseSlotWork::DropReady(tickets, mut batch) => {
+                    if let Some(reply) = batch.custody.reply.take() {
+                        let _ = reply.finish(false);
+                    }
+                    settle_batch_tickets(adapter, tickets, false);
+                    drop(batch);
+                }
+            }
+        }
+        // A partial batch can already own BEGIN/DATA K9 tickets. Keep its
+        // session/context/staging custody until every such ticket has taken the
+        // explicit failure transition above.
+        drop(building);
+
+        drain_host_terminals(adapter);
+        let _ = unsafe {
+            KeWaitForSingleObject(
+                self.drained.get() as wdk_sys::PVOID,
+                0,
+                0,
+                0,
+                core::ptr::null_mut(),
+            )
+        };
+        // A reset path may have queued failed terminals immediately before the
+        // final rundown release. Discharge them and free only PASSIVE-owned
+        // enqueue-failure buffers before the context box disappears.
+        drain_host_terminals(adapter);
+        reap_terminal_slots(self, passive);
+    }
+}
+
+fn settle_batch_tickets(
+    adapter: &crate::adapter::AdapterContext,
+    tickets: BatchTickets,
+    success: bool,
+) {
+    for ticket in tickets.entries[..tickets.count as usize].iter().flatten() {
+        if success {
+            let _ = crate::ddi::interrupt::complete_ordered_engine_submission(adapter, *ticket);
+        } else {
+            let _ = crate::ddi::interrupt::fail_ordered_engine_submission(adapter, *ticket);
+        }
+    }
+}
+
+fn fail_inflight_without_completion(
+    native: &NativeContext,
+    adapter: &crate::adapter::AdapterContext,
+    identity: BatchIdentity,
+    slot_index: u32,
+) {
+    let tickets = {
+        let mut executor = native.executor.lock();
+        let Some(slot) = executor.slots.get_mut(slot_index as usize) else {
+            return;
+        };
+        let old = core::mem::replace(slot, SubmissionSlot::Free);
+        match old {
+            SubmissionSlot::InFlight {
+                identity: found,
+                tickets,
+            } if found == identity => {
+                *slot = SubmissionSlot::Terminal {
+                    identity: found,
+                    tickets,
+                    success: false,
+                    cleanup: None,
+                };
+                Some(tickets)
+            }
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    };
+    if let Some(tickets) = tickets {
+        settle_batch_tickets(adapter, tickets, false);
+    }
+}
+
+impl NativeHostCompletion {
+    fn finish_with_cleanup(
+        mut self,
+        adapter: &crate::adapter::AdapterContext,
+        host_ok: bool,
+        cleanup: Option<(DmaBuffer, DmaBuffer)>,
+    ) {
+        let native = unsafe { self.context.as_ref() };
+        let exact_adapter = core::ptr::eq(unsafe { native.adapter.as_ref() }, adapter);
+        // Prove the terminal still belongs to this exact parked slot before a
+        // reply byte is published.  Context close leaves InFlight untouched
+        // and joins this custody, so no legitimate owner can change it here.
+        let exact_slot = {
+            let executor = native.executor.lock();
+            matches!(
+                executor.slots.get(self.slot_index as usize),
+                Some(SubmissionSlot::InFlight { identity, .. })
+                    if *identity == self.identity
+            )
+        };
+        let mut success = host_ok && exact_adapter && exact_slot;
+        let mut custody = self.custody.take();
+        if let Some(reply) = custody.as_mut().and_then(|custody| custody.reply.take()) {
+            success &= reply.finish(success);
+        }
+
+        let mut cleanup = cleanup;
+        let tickets = {
+            let mut executor = native.executor.lock();
+            if let Some(slot) = executor.slots.get_mut(self.slot_index as usize) {
+                let old = core::mem::replace(slot, SubmissionSlot::Free);
+                match old {
+                    SubmissionSlot::InFlight { identity, tickets }
+                        if identity == self.identity =>
+                    {
+                        *slot = SubmissionSlot::Terminal {
+                            identity,
+                            tickets,
+                            success,
+                            cleanup: cleanup.take(),
+                        };
+                        Some(tickets)
+                    }
+                    other => {
+                        *slot = other;
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
+        // The operation guards may be released at DISPATCH, but contiguous DMA
+        // buffers may not. An identity mismatch is an invariant failure; leak
+        // those two buffers rather than freeing them at the wrong IRQL.
+        if let Some((meta, payload)) = cleanup.take() {
+            core::mem::forget(meta);
+            core::mem::forget(payload);
+        }
+        if let Some(tickets) = tickets {
+            settle_batch_tickets(adapter, tickets, success);
+        }
+        // Keep the exact context/session/allocation/staging custody through the
+        // K9 terminal transition.  Only actual host completion may make the
+        // WDDM tickets retire, and no referenced object may disappear between
+        // that transition and its notification path.
+        drop(custody);
+    }
+}
+
+impl NativeHostTerminal {
+    fn finish(self, adapter: &crate::adapter::AdapterContext) {
+        self.completion
+            .finish_with_cleanup(adapter, self.host_ok, None);
+    }
+}
+
+/// Discharge host terminals after leaving `virtio_lock`. This is called by the
+/// ordinary DPC and synchronously after a physical reset, so every K9 mutation
+/// preserves the existing notification-lock ordering.
+pub(crate) fn drain_host_terminals(adapter: &crate::adapter::AdapterContext) {
+    // At most MAX_INFLIGHT native entries can exist.  Recheck after returning
+    // the spare vector so a response appended while the prior batch was being
+    // settled cannot depend on a later unrelated interrupt.  This is a finite
+    // drain of already-terminal used-ring results, not host polling.
+    for _ in 0..crate::virtio::gpu::MAX_INFLIGHT {
+        let work = adapter.with_virtio(|gpu| gpu.begin_native_terminal_drain());
+        let Ok(Some(mut terminals)) = work else {
+            return;
+        };
+        while let Some(terminal) = terminals.pop() {
+            terminal.finish(adapter);
+        }
+        let mut pending = Some(terminals);
+        let returned = adapter.with_virtio(|gpu| {
+            if let Some(terminals) = pending.take() {
+                gpu.finish_native_terminal_drain(terminals);
+            }
+        });
+        if returned.is_err() {
+            // The vector is empty, but freeing its allocation at DISPATCH is
+            // still outside the allocator contract. Transport removal normally
+            // joins the DPC; retain it if that lifecycle invariant is violated.
+            if let Some(terminals) = pending.take() {
+                core::mem::forget(terminals);
+            }
+            return;
+        }
+    }
+    // A continuously completing producer exhausted this bounded service pass.
+    // Preserve forward progress without spinning here: schedule the same
+    // ordinary completion DPC to resume the exact terminal queue.
+    crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
 }
 
 /// Release is a `Drop` obligation, for the reason `crate::sync`'s guard exists:
@@ -572,6 +1273,576 @@ impl NativeClaim<'_> {
         // SAFETY: the claim holds `busy`, and `busy` is the only route to this
         // cell, so no other reference to the scratch exists.
         unsafe { &mut *self.owner.scratch.get() }
+    }
+}
+
+fn reap_terminal_slots(native: &NativeContext, _passive: PassiveLevel) {
+    let adapter = unsafe { native.adapter.as_ref() };
+    for index in 0..EXECUTOR_SLOTS {
+        let snapshot = {
+            let executor = native.executor.lock();
+            match executor.slots.get(index) {
+                Some(SubmissionSlot::Terminal {
+                    identity, tickets, ..
+                }) => Some((*identity, *tickets)),
+                _ => None,
+            }
+        };
+        let Some((identity, tickets)) = snapshot else {
+            continue;
+        };
+        let retired = adapter.with_wddm_notify_lock(|guard| {
+            tickets.entries[..tickets.count as usize]
+                .iter()
+                .flatten()
+                .all(|ticket| guard.ordered_engine_ticket_was_retired(*ticket))
+        });
+        if !retired {
+            continue;
+        }
+        let cleanup = {
+            let mut executor = native.executor.lock();
+            let Some(slot) = executor.slots.get_mut(index) else {
+                continue;
+            };
+            match slot {
+                SubmissionSlot::Terminal {
+                    identity: found,
+                    tickets: found_tickets,
+                    cleanup,
+                    ..
+                } if *found == identity && found_tickets.count == tickets.count => {
+                    let cleanup = cleanup.take();
+                    *slot = SubmissionSlot::Free;
+                    cleanup
+                }
+                _ => None,
+            }
+        };
+        // PASSIVE_LEVEL: this is the only slot path that may destroy returned
+        // contiguous DMA buffers.
+        drop(cleanup);
+    }
+}
+
+fn abandon_unsubmitted_building(scratch: &mut Hnr2Scratch, native: &NativeContext) -> bool {
+    let Some(building) = scratch.building.as_ref() else {
+        return true;
+    };
+    let mut executor = native.executor.lock();
+    let Some(slot) = executor.slots.get_mut(building.slot_index as usize) else {
+        return false;
+    };
+    if matches!(
+        slot,
+        SubmissionSlot::Collecting { identity, tickets }
+            if *identity == building.identity && tickets.count == 0
+    ) {
+        *slot = SubmissionSlot::Free;
+    } else {
+        return false;
+    }
+    drop(executor);
+    // Render is PASSIVE; the two DMA buffers may be freed here.
+    drop(scratch.building.take());
+    true
+}
+
+fn begin_executor_batch(
+    scratch: &mut Hnr2Scratch,
+    native: &NativeContext,
+    session: NonNull<crate::ddi::translation_session::SessionObject>,
+    header: &HeliosNativeRenderV2,
+    passive: PassiveLevel,
+) -> Result<(), NTSTATUS> {
+    if let Some(building) = scratch.building.as_ref() {
+        if building.identity.batch_token == header.batch_token
+            && building.identity.payload_bytes as u64 == header.total_payload_bytes
+            && building.identity.fragment_count == header.fragment_count
+            && building.identity.full_payload_crc64 == header.full_payload_crc64
+        {
+            return Ok(());
+        }
+        // A prior BEGIN whose Render never succeeded has no scheduler packet
+        // and may be replaced. A published collecting slot with any ticket is
+        // never silently recycled.
+        if !abandon_unsubmitted_building(scratch, native) {
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
+    }
+
+    reap_terminal_slots(native, passive);
+    crate::virtio::ctrl::reap_parked(passive, unsafe { native.adapter.as_ref() });
+
+    let context = native.acquire_operation().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    {
+        let mut state = native.state.lock();
+        if let Err(refusal) = state.staging_mut().checkout(header.total_payload_bytes) {
+            drop(state);
+            return Err(refuse(refusal, STATUS_NO_MEMORY));
+        }
+    }
+    NR2_SLOT_TAKEN.fetch_add(1, Ordering::Relaxed);
+    let staging = StagingCustody {
+        context,
+        bytes: header.total_payload_bytes,
+    };
+    let session_operation = crate::ddi::translation_session::acquire_execution_operation(session)
+        .ok_or(STATUS_DEVICE_NOT_READY)?;
+    if session_operation.transport_instance == 0 {
+        return Err(STATUS_DEVICE_NOT_READY);
+    }
+    let payload_len = usize::try_from(header.total_payload_bytes)
+        .map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let adapter = unsafe { native.adapter.as_ref() };
+    let payload = adapter
+        .with_virtio(|v| v.take_dma_buffer(payload_len))
+        .ok()
+        .flatten()
+        .or_else(|| DmaBuffer::new(passive, payload_len))
+        .ok_or(STATUS_NO_MEMORY)?;
+    let meta = adapter
+        .with_virtio(|v| v.take_dma_buffer(SUBMIT_META_BYTES))
+        .ok()
+        .flatten()
+        .or_else(|| DmaBuffer::new(passive, SUBMIT_META_BYTES))
+        .ok_or(STATUS_NO_MEMORY)?;
+
+    let (slot_index, slot_generation) = {
+        let mut executor = native.executor.lock();
+        let Some(slot_index) = executor
+            .slots
+            .iter()
+            .position(|slot| matches!(slot, SubmissionSlot::Free))
+        else {
+            return Err(STATUS_NO_MEMORY);
+        };
+        let Some(slot_generation) = executor.mint_slot_generation() else {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        (slot_index as u32, slot_generation)
+    };
+    let identity = BatchIdentity {
+        batch_token: header.batch_token,
+        slot_generation,
+        payload_bytes: header.total_payload_bytes as u32,
+        full_payload_crc64: header.full_payload_crc64,
+        fragment_count: header.fragment_count,
+        session_generation: native.session_generation,
+        context_generation: native.context_generation,
+        ring_index: native.ring_index,
+    };
+    {
+        let mut executor = native.executor.lock();
+        let Some(slot) = executor.slots.get_mut(slot_index as usize) else {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        };
+        if !matches!(slot, SubmissionSlot::Free) {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        *slot = SubmissionSlot::Collecting {
+            identity,
+            tickets: BatchTickets::new(),
+        };
+    }
+    scratch.building = Some(BuildingBatch {
+        identity,
+        slot_index,
+        payload,
+        meta,
+        staging,
+        session: session_operation,
+    });
+    Ok(())
+}
+
+fn copy_executor_fragment(
+    scratch: &mut Hnr2Scratch,
+    args: &DXGKARG_RENDER,
+    header: &HeliosNativeRenderV2,
+    accept: &Hnr2Accept,
+) -> Result<(u64, u32), NTSTATUS> {
+    let Some(building) = scratch.building.as_mut() else {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    };
+    if building.identity.batch_token != header.batch_token
+        || building.identity.payload_bytes as u64 != header.total_payload_bytes
+        || building.identity.fragment_count != header.fragment_count
+        || building.identity.full_payload_crc64 != header.full_payload_crc64
+    {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let dst_offset = usize::try_from(header.fragment_payload_offset)
+        .map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let bytes = header.fragment_payload_bytes as usize;
+    let end = dst_offset
+        .checked_add(bytes)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let dst = building
+        .payload
+        .as_mut_slice()
+        .get_mut(dst_offset..end)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let source = unsafe {
+        (args.pCommand as *const u8).add(accept.layout.payload_offset as usize)
+    };
+    if !unsafe { copy_from_command(dst.as_mut_ptr(), source, bytes) } {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok((building.identity.slot_generation, building.slot_index))
+}
+
+struct PreparedExecutorCommit {
+    identity: BatchIdentity,
+    slot_index: u32,
+    allocations: Vec<crate::ddi::create_allocation::OpenExecutionUse>,
+    reply: Option<ExecutionReply>,
+}
+
+fn prepare_executor_commit(
+    scratch: &mut Hnr2Scratch,
+    native: &NativeContext,
+    session: NonNull<crate::ddi::translation_session::SessionObject>,
+    args: &DXGKARG_RENDER,
+    header: &HeliosNativeRenderV2,
+    accept: &Hnr2Accept,
+    use_count: usize,
+    patch_count: usize,
+) -> Result<PreparedExecutorCommit, NTSTATUS> {
+    let Hnr2Scratch {
+        uses,
+        patches,
+        expected_operands,
+        patch_order,
+        use_ordinals,
+        building,
+        ..
+    } = scratch;
+    let uses = &uses[..use_count];
+    let patches = &patches[..patch_count];
+    let Some(building_ref) = building.as_ref() else {
+        NR2_NO_STAGE.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    };
+    if building_ref.identity.batch_token != header.batch_token
+        || building_ref.identity.slot_generation == 0
+        || building_ref.identity.session_generation != native.session_generation
+        || building_ref.identity.context_generation != native.context_generation
+        || building_ref.identity.ring_index == 0
+        || building_ref.identity.ring_index != native.ring_index
+        || building_ref.session.transport_instance == 0
+    {
+        NR2_NO_STAGE.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+
+    let actual_crc = helios_protocol::wddm::crc64_ecma(building_ref.payload.as_slice());
+    if actual_crc != header.full_payload_crc64
+        || building_ref.identity.full_payload_crc64 != header.full_payload_crc64
+    {
+        NR2_NO_STAGE.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    let admission = match helios_kmd_logic::venus_executor::validate_venus_stream(
+        building_ref.payload.as_slice(),
+        expected_operands,
+    ) {
+        Ok(admission) => admission,
+        Err(_) => {
+            NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+    };
+    if admission.operand_count as usize != patches.len() {
+        NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+
+    let order = &mut patch_order[..patches.len()];
+    for (i, ordinal) in order.iter_mut().enumerate() {
+        *ordinal = i as u32;
+    }
+    order.sort_unstable_by_key(|ordinal| patches[*ordinal as usize].payload_offset);
+    for (operand_index, patch_index) in order.iter().copied().enumerate() {
+        let expected = scratch.expected_operands[operand_index];
+        let patch = patches[patch_index as usize];
+        if patch.payload_offset != expected.payload_offset
+            || patch.operand_kind != expected.operand_kind
+            || helios_protocol::native_render::hnr2_operand_width(patch.operand_kind)
+                != Some(patch.encoded_width)
+            || patch.operand_kind != HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32
+        {
+            NR2_NO_RESID.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+    }
+
+    let list_count = args.AllocationListSize as usize;
+    use_ordinals[..list_count].fill(u32::MAX);
+    for (ordinal, use_record) in uses.iter().enumerate() {
+        let index = use_record.allocation_list_index as usize;
+        let Some(slot) = use_ordinals.get_mut(index) else {
+            NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        if *slot != u32::MAX {
+            NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        *slot = ordinal as u32;
+    }
+
+    let mut allocations = Vec::new();
+    allocations
+        .try_reserve_exact(uses.len())
+        .map_err(|_| STATUS_NO_MEMORY)?;
+    let passive = unsafe { PassiveLevel::assume() };
+    for use_record in uses {
+        let index = use_record.allocation_list_index as usize;
+        if index >= list_count || args.pAllocationList.is_null() {
+            NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        let handle = unsafe { (*args.pAllocationList.add(index)).hDeviceSpecificAllocation };
+        let Some(guard) = (unsafe {
+            crate::ddi::create_allocation::open_allocation_execution_use(
+                handle,
+                session,
+                use_record.expected_allocation_generation,
+                passive,
+            )
+        }) else {
+            NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        if guard.transport_instance != building_ref.session.transport_instance
+            || guard.allocation_generation != use_record.expected_allocation_generation
+            || guard.resource_id == 0
+            || guard.byte_size == 0
+        {
+            NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_INVALID_PARAMETER);
+        }
+        allocations.push(guard);
+    }
+
+    let guard_for_patch = |patch: HeliosNativeRenderPatch| -> Option<&crate::ddi::create_allocation::OpenExecutionUse> {
+        let use_ordinal = *use_ordinals.get(patch.allocation_list_index as usize)?;
+        allocations.get(use_ordinal as usize)
+    };
+
+    let mut reply = None;
+    match admission.class {
+        helios_kmd_logic::venus_executor::VenusCommandClass::AllocateMemory => {
+            if !accept.has_reply
+                || uses.len() != 2
+                || patches.len() != 2
+                || admission.reply_size != ExecutionReply::RAW_ALLOCATE_REPLY_BYTES
+                || admission.reply_offset
+                    != header
+                        .reply_offset
+                        .checked_add(HELIOS_HVR1_HEADER_SIZE as u64)
+                        .ok_or(STATUS_INVALID_PARAMETER)?
+            {
+                NR2_NO_REPLY.fetch_add(1, Ordering::Relaxed);
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            let set_reply_patch = patches[order[0] as usize];
+            let import_patch = patches[order[1] as usize];
+            let Some(reply_guard) = guard_for_patch(set_reply_patch) else {
+                NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+                return Err(STATUS_INVALID_PARAMETER);
+            };
+            let Some(import_guard) = guard_for_patch(import_patch) else {
+                NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+                return Err(STATUS_INVALID_PARAMETER);
+            };
+            // Roles 1-3 are OS-owned K2a pages: no host VkDeviceMemory existed
+            // at allocation creation, so their canonical object truthfully has
+            // no Vulkan memory-type identity to compare.  The submitted
+            // memoryTypeIndex is consumed exactly by host vkAllocateMemory and
+            // a host rejection remains the terminal result.  Role 4 and C57
+            // already own a KMD-created host allocation, so re-importing those
+            // resources must name its exact memory type.
+            let exact_host_memory_type = matches!(
+                import_guard.hvm1_role,
+                0 | HELIOS_HVM1_ROLE_VULKAN_DEVICE_LOCAL
+            );
+            if set_reply_patch.allocation_list_index != header.reply_allocation_list_index
+                || reply_guard.hvm1_role != HELIOS_HVM1_ROLE_REPLY_POOL
+                || reply_guard.kernel_va.is_none()
+                || import_guard.hvm1_role == HELIOS_HVM1_ROLE_REPLY_POOL
+                || import_guard.resource_id == reply_guard.resource_id
+                || import_guard.byte_size != admission.allocation_size
+                || (exact_host_memory_type
+                    && import_guard.memory_type_index != admission.memory_type_index)
+            {
+                NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            let reply_end = header
+                .reply_offset
+                .checked_add(HELIOS_HVR1_HEADER_SIZE as u64)
+                .and_then(|offset| offset.checked_add(ExecutionReply::RAW_ALLOCATE_REPLY_BYTES))
+                .ok_or(STATUS_INVALID_PARAMETER)?;
+            if reply_end > reply_guard.byte_size
+                || header.reply_capacity_bytes
+                    < HELIOS_HVR1_HEADER_SIZE as u64 + ExecutionReply::RAW_ALLOCATE_REPLY_BYTES
+            {
+                NR2_NO_REPLY.fetch_add(1, Ordering::Relaxed);
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+            let snapshot_generation =
+                crate::ddi::translation_session::mint_execution_snapshot_generation(session)
+                    .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+            let reply_use_ordinal =
+                use_ordinals[set_reply_patch.allocation_list_index as usize] as usize;
+            let reply_use = uses[reply_use_ordinal];
+            let request = helios_kmd_logic::translation_session::ExecutionReplyRequest {
+                names_reply_pool: true,
+                expected_allocation_generation: reply_use.expected_allocation_generation,
+                access_flags: reply_use.access_flags,
+                reply_offset: header.reply_offset,
+                reply_capacity_bytes: header.reply_capacity_bytes,
+                reply_slot_generation: header.reply_slot_generation,
+                batch_token: header.batch_token,
+                owner_context_generation: native.context_generation,
+            };
+            let slot = crate::ddi::translation_session::admit_execution_reply(session, &request)?;
+            let slot_index = slot.slot_index.ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+            let facts = crate::ddi::create_allocation::K11ReplyPoolFacts {
+                allocation_generation: reply_guard.allocation_generation,
+                resource_id: reply_guard.resource_id,
+                transport_instance: reply_guard.transport_instance,
+                kernel_va: reply_guard.kernel_va.ok_or(STATUS_INVALID_DEVICE_REQUEST)?,
+                byte_size: reply_guard.byte_size,
+            };
+            unsafe {
+                core::ptr::write_bytes(
+                    facts.kernel_va.as_ptr().add(header.reply_offset as usize),
+                    0,
+                    (HELIOS_HVR1_HEADER_SIZE as u64
+                        + ExecutionReply::RAW_ALLOCATE_REPLY_BYTES) as usize,
+                )
+            };
+            reply = Some(ExecutionReply {
+                session,
+                facts,
+                slot_index,
+                slot_generation: slot.slot_generation,
+                batch_token: slot.batch_token,
+                snapshot_generation,
+                session_generation: native.session_generation,
+                reply_offset: slot.reply_offset,
+                reply_capacity: slot.reply_capacity_bytes,
+                finished: false,
+            });
+        }
+        helios_kmd_logic::venus_executor::VenusCommandClass::FreeMemory => {
+            if accept.has_reply
+                || !patches.is_empty()
+                || uses.len() != 1
+                || allocations[0].hvm1_role == HELIOS_HVM1_ROLE_REPLY_POOL
+            {
+                NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+        }
+        helios_kmd_logic::venus_executor::VenusCommandClass::QueueSubmit
+        | helios_kmd_logic::venus_executor::VenusCommandClass::QueueSubmit2
+        | helios_kmd_logic::venus_executor::VenusCommandClass::QueueBindSparse => {
+            if accept.has_reply
+                || !patches.is_empty()
+                || allocations
+                    .iter()
+                    .any(|guard| guard.hvm1_role == HELIOS_HVM1_ROLE_REPLY_POOL)
+            {
+                NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+                return Err(STATUS_INVALID_PARAMETER);
+            }
+        }
+    }
+
+    // This is the only mutation of host-resource operands. `validate_venus_stream`
+    // proved every destination is the exact generated zero placeholder in the
+    // KMD-owned copy; user memory remains untouched.
+    let Some(building) = building.as_mut() else {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    };
+    for patch in patches {
+        let Some(guard) = guard_for_patch(*patch) else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        let start = patch.payload_offset as usize;
+        let end = start
+            .checked_add(patch.encoded_width as usize)
+            .ok_or(STATUS_INVALID_PARAMETER)?;
+        let Some(dst) = building.payload.as_mut_slice().get_mut(start..end) else {
+            return Err(STATUS_INVALID_PARAMETER);
+        };
+        dst.copy_from_slice(&guard.resource_id.to_le_bytes());
+    }
+
+    Ok(PreparedExecutorCommit {
+        identity: building.identity,
+        slot_index: building.slot_index,
+        allocations,
+        reply,
+    })
+}
+
+fn finalize_executor_commit(
+    scratch: &mut Hnr2Scratch,
+    native: &NativeContext,
+    prepared: PreparedExecutorCommit,
+) -> Result<(), NTSTATUS> {
+    let Some(building) = scratch.building.take() else {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    };
+    if building.slot_index != prepared.slot_index
+        || building.identity.batch_token != prepared.identity.batch_token
+        || building.identity.slot_generation != prepared.identity.slot_generation
+    {
+        drop(building);
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let batch = ReadyBatch {
+        payload: building.payload,
+        meta: building.meta,
+        custody: NativeCustody {
+            _staging: building.staging,
+            _session: building.session,
+            _allocations: prepared.allocations,
+            reply: prepared.reply,
+        },
+    };
+    let mut executor = native.executor.lock();
+    let Some(slot) = executor.slots.get_mut(prepared.slot_index as usize) else {
+        drop(executor);
+        drop(batch);
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    };
+    let old = core::mem::replace(slot, SubmissionSlot::Free);
+    match old {
+        SubmissionSlot::Collecting {
+            identity,
+            tickets,
+        } if identity.batch_token == prepared.identity.batch_token
+            && identity.slot_generation == prepared.identity.slot_generation =>
+        {
+            *slot = SubmissionSlot::Ready {
+                identity: prepared.identity,
+                tickets,
+                batch: Some(batch),
+            };
+            Ok(())
+        }
+        other => {
+            *slot = other;
+            drop(executor);
+            drop(batch);
+            Err(STATUS_INVALID_DEVICE_REQUEST)
+        }
     }
 }
 
@@ -646,6 +1917,11 @@ unsafe fn publish_dma_record(
     plan: Option<&CapabilityTablePlan>,
     ring_index: u32,
     payload_bytes: u32,
+    session_generation: u64,
+    context_generation: u64,
+    slot_generation: u64,
+    slot_index: u32,
+    full_payload_crc64: u64,
 ) -> bool {
     let header_bytes = size_of::<HeliosNativeRenderV2>();
     if (args.DmaSize as usize) < header_bytes || args.pDmaBuffer.is_null() {
@@ -662,21 +1938,17 @@ unsafe fn publish_dma_record(
     }
     let record = Hnr2KmdDmaPrivateV1 {
         batch_token: header.batch_token,
-        // K6 mints neither: the KMD device object carries no generation, and an
-        // HVC1 context is identified by its own object rather than a number
-        // (§10.4:1250 — "the live context object is the identity").
-        device_generation: 0,
-        context_generation: 0,
-        // ⛔ NOT a pool slot index: K6's staging pool is accounting only (see
-        // `Nr2NoStage`), so the batch token is the submission's identity and the
-        // slot index is always 0.
-        slot_generation: header.batch_token,
-        full_payload_crc64: header.full_payload_crc64,
+        // The raw KMT device's exact session generation and the queue
+        // context-local generation. Control INIT predates both and keeps zero.
+        device_generation: session_generation,
+        context_generation,
+        slot_generation,
+        full_payload_crc64,
         payload_bytes,
         capability_offset: plan.map_or(0, |p| p.offset),
         capability_count: plan.map_or(0, |p| p.count),
         ring_index,
-        slot_index: 0,
+        slot_index,
         flags: 0,
     };
     let private_bytes = size_of::<Hnr2KmdDmaPrivateV1>();
@@ -904,10 +2176,44 @@ pub(crate) unsafe fn render(
         }
     };
 
+    let executor_slot = if native.class == NativeClass::Queue {
+        let passive = unsafe { PassiveLevel::assume() };
+        let scratch = claim.scratch();
+        if accept.class.is_begin() {
+            if let Err(status) = begin_executor_batch(scratch, native, session, &header, passive) {
+                NR2_NO_STAGE.fetch_add(1, Ordering::Relaxed);
+                return status;
+            }
+        }
+        match copy_executor_fragment(scratch, args, &header, &accept) {
+            Ok(slot) => Some(slot),
+            Err(status) => {
+                NR2_NO_STAGE.fetch_add(1, Ordering::Relaxed);
+                return status;
+            }
+        }
+    } else {
+        None
+    };
+
     if !accept.class.is_commit() {
         // An interior fragment carries no tables, no allocations and no reply.
         // SAFETY: `args` is dxgkrnl's live argument struct.
-        if !unsafe { publish_dma_record(args, &header, None, native.ring_index, 0) } {
+        let (slot_generation, slot_index) = executor_slot.unwrap_or((header.batch_token, 0));
+        if !unsafe {
+            publish_dma_record(
+                args,
+                &header,
+                None,
+                native.ring_index,
+                0,
+                native.session_generation,
+                native.context_generation,
+                slot_generation,
+                slot_index,
+                header.full_payload_crc64,
+            )
+        } {
             return STATUS_INVALID_PARAMETER;
         }
         args.pDmaBuffer = unsafe { (args.pDmaBuffer as *mut u8).add(header_bytes) as *mut c_void };
@@ -1112,14 +2418,9 @@ fn commit(
         out.SplitOffset = 0;
     }
 
-    // Only the control context owns the session's reply pool (§10.4:1205).
-    if native.class != NativeClass::Control && accept.has_reply {
-        return refuse(RenderRefusal::ReplyOnQueueContext, STATUS_INVALID_PARAMETER);
-    }
-
-    // K11 executes only this finite, copied one-fragment INIT allowlist.  The
-    // reply carrier is mandatory; reply-less control streams and every queue
-    // payload remain at the K6 refusal boundary.
+    // K11 executes only this finite, copied one-fragment INIT allowlist on ring
+    // zero. The bounded executor below separately classifies the exact queue
+    // reply class (SetReply + vkAllocateMemory) on the nonzero endpoint.
     let k11_init = native.class == NativeClass::Control
         && accept.has_reply
         && header.fragment_count == 1
@@ -1135,34 +2436,96 @@ fn commit(
         return STATUS_INVALID_PARAMETER;
     }
 
-    // ── the §10.7 staging admission ─────────────────────────────────────────
-    // This and the private-record publication are deliberately before the host
-    // operation. Once the real host INIT succeeds, every remaining action in
-    // this Render is infallible local publication/accounting.
-    {
+    // Queue bytes were charged at BEGIN and remain charged with their move-only
+    // DMA custody until the actual host terminal.  The one-fragment control
+    // INIT has no such building object, so it retains the original checkout at
+    // COMMIT and retirement in SubmitCommand.
+    if native.class == NativeClass::Control {
         let mut state = native.state.lock();
         if let Err(refusal) = state.staging_mut().checkout(header.total_payload_bytes) {
             drop(state);
             return refuse(refusal, STATUS_NO_MEMORY);
         }
+        NR2_SLOT_TAKEN.fetch_add(1, Ordering::Relaxed);
     }
-    NR2_SLOT_TAKEN.fetch_add(1, Ordering::Relaxed);
+
+    // Executor validation below may patch only its KMD-owned payload copy.
+    // Prove the final DMA-private publication cannot refuse before that
+    // mutation, so a BUFFER_TOO_SMALL replay always revalidates the original
+    // CRC-zeroed wire bytes rather than a half-prepared host copy.
+    if native.class == NativeClass::Queue
+        && (args.pDmaBufferPrivateData.is_null()
+            || (args.DmaBufferPrivateDataSize as usize)
+                < size_of::<Hnr2KmdDmaPrivateV1>())
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    let prepared_executor = if native.class == NativeClass::Queue {
+        match prepare_executor_commit(
+            scratch,
+            native,
+            session,
+            args,
+            header,
+            accept,
+            use_count,
+            patch_count,
+        ) {
+            Ok(prepared) => Some(prepared),
+            Err(status) => return status,
+        }
+    } else {
+        None
+    };
 
     let payload_bytes = header.total_payload_bytes.min(u32::MAX as u64) as u32;
+    let (slot_generation, slot_index, full_payload_crc64) = prepared_executor
+        .as_ref()
+        .map(|prepared| {
+            (
+                prepared.identity.slot_generation,
+                prepared.slot_index,
+                prepared.identity.full_payload_crc64,
+            )
+        })
+        .unwrap_or((header.batch_token, 0, header.full_payload_crc64));
     // SAFETY: `args` is dxgkrnl's live argument struct.
-    if !unsafe { publish_dma_record(args, header, Some(&table), native.ring_index, payload_bytes) }
+    if !unsafe {
+        publish_dma_record(
+            args,
+            header,
+            Some(&table),
+            native.ring_index,
+            payload_bytes,
+            native.session_generation,
+            native.context_generation,
+            slot_generation,
+            slot_index,
+            full_payload_crc64,
+        )
+    }
     {
-        let _ = native
-            .state
-            .lock()
-            .staging_mut()
-            .retire(header.total_payload_bytes);
+        if native.class == NativeClass::Control {
+            let _ = native
+                .state
+                .lock()
+                .staging_mut()
+                .retire(header.total_payload_bytes);
+        }
         return STATUS_INVALID_PARAMETER;
     }
 
     // ── the control-context reply slot, and the finite host INIT ─────────────
     if native.class == NativeClass::Control {
-        let status = control_render(session, args, header, accept, uses, list_count);
+        let status = control_render(
+            session,
+            args,
+            header,
+            accept,
+            &scratch.uses[..use_count],
+            list_count,
+        );
         if status != STATUS_SUCCESS {
             // No SubmitCommand follows a failed Render, so give back the exact
             // staging admission here. `control_render` likewise gives back its
@@ -1178,26 +2541,15 @@ fn commit(
         // SAFETY: `publish_dma_record` succeeded above and the private-data
         // pointer is not advanced until after this exact marker is written.
         unsafe { mark_dma_host_completed(args, header.batch_token) };
+    } else if let Some(prepared) = prepared_executor {
+        if let Err(status) = finalize_executor_commit(scratch, native, prepared) {
+            return status;
+        }
     }
 
-    // The finite INIT needs no retained host staging: by this point the host
-    // operation and HVR1 publication are terminal. Every other payload remains
-    // deliberately unimplemented and retains K6's boundary counters.
-    if !k11_init {
-        NR2_NO_STAGE.fetch_add(1, Ordering::Relaxed);
-    }
-    // Outside pure INIT, typed operands stay as the encoder wrote them: zero.
-    // K11 resolves INIT's reply pool through the retained session allocation,
-    // so its reply-target patch is not a missing-resid event. General resid
-    // substitution belongs to the later allocation/GPU execution units.
-    if patch_count != 0 && !k11_init {
-        NR2_NO_RESID.fetch_add(1, Ordering::Relaxed);
-    }
-    // The payload was never classified against a generated opcode schema,
-    // because none exists on this side. K6 does not execute it either.
-    if !k11_init {
-        NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
-    }
+    // Control INIT is already terminal here. Queue payloads are now immutable
+    // in their context-local slot and remain owned until SubmitCommand attaches
+    // the exact K9 ticket and the stock nonzero-ring response terminates.
 
     // SAFETY: `plan_capability_table` proved the whole table is inside `DmaSize`.
     args.pDmaBuffer = unsafe {
@@ -1589,6 +2941,10 @@ pub(crate) enum NativeSubmitDisposition {
     /// This exact WDDM fence belongs to a still-current session whose finite
     /// host operation and HVR1 reply were already terminal before SubmitCommand.
     HostCompleted(u32),
+    /// A queue packet's exact K9 ticket is now owned by the context-local
+    /// executor. It is either waiting for the stock host response or was
+    /// terminalized explicitly; the compatibility FIFO must not see it.
+    Pending,
     /// This packet never crossed K11's finite host boundary. Preserve K6's
     /// existing scheduler retirement behavior without claiming host execution.
     Refused,
@@ -1598,6 +2954,55 @@ pub(crate) enum NativeSubmitDisposition {
     /// this packet through any legacy/global completion path; reset owns the
     /// abandoned scheduler epoch.
     Revoked,
+}
+
+enum QueueSubmitAction {
+    Pending,
+    Enqueue {
+        identity: BatchIdentity,
+        slot_index: u32,
+        batch: ReadyBatch,
+    },
+    AlreadyTerminal {
+        success: bool,
+    },
+}
+
+fn queue_record_matches(
+    native: &NativeContext,
+    record: &Hnr2KmdDmaPrivateV1,
+    identity: BatchIdentity,
+    slot_index: usize,
+) -> bool {
+    record.batch_token == identity.batch_token
+        && record.device_generation == identity.session_generation
+        && record.context_generation == identity.context_generation
+        && record.slot_generation == identity.slot_generation
+        && record.slot_index as usize == slot_index
+        && record.ring_index == identity.ring_index
+        && record.full_payload_crc64 == identity.full_payload_crc64
+        && (record.payload_bytes == 0 || record.payload_bytes == identity.payload_bytes)
+        && identity.session_generation == native.session_generation
+        && identity.context_generation == native.context_generation
+        && identity.ring_index == native.ring_index
+        && identity.ring_index != 0
+}
+
+fn append_queue_ticket(
+    adapter: &crate::adapter::AdapterContext,
+    tickets: &mut BatchTickets,
+    identity: BatchIdentity,
+    ticket: crate::adapter::OrderedEngineTicket,
+    resubmission: bool,
+    commit_record: bool,
+) -> bool {
+    tickets.append(
+        ticket,
+        resubmission,
+        identity.fragment_count,
+        commit_record,
+        |old| adapter.with_wddm_notify_lock(|guard| guard.ordered_engine_ticket_is_live(old)),
+    )
 }
 
 /// Retire one HNR2 submission's staging admission. K11's exact INIT token has
@@ -1617,8 +3022,12 @@ pub(crate) unsafe fn submit(
     native: &NativeContext,
     session: core::ptr::NonNull<crate::ddi::translation_session::SessionObject>,
     submit: &DXGKARG_SUBMITCOMMAND,
+    ticket: crate::adapter::OrderedEngineTicket,
 ) -> NativeSubmitDisposition {
     NR2_SUBMITS.fetch_add(1, Ordering::Relaxed);
+    let Some(_submit_operation) = native.acquire_operation() else {
+        return NativeSubmitDisposition::Revoked;
+    };
     // ⛔ A RESUBMITTED PACKET MUST NOT RETIRE AGAIN. This driver advertises
     // DMA-buffer-boundary preemption and acks `DMA_PREEMPTED`
     // (`query_adapter_info.rs:395`, `dxgkddi_preempt_command`), and this file's
@@ -1651,11 +3060,15 @@ pub(crate) unsafe fn submit(
         )
     }) else {
         NR2_SUBMIT_NO_RECORD.fetch_add(1, Ordering::Relaxed);
-        return NativeSubmitDisposition::Refused;
+        return if native.class == NativeClass::Queue {
+            NativeSubmitDisposition::Revoked
+        } else {
+            NativeSubmitDisposition::Refused
+        };
     };
     if resubmission {
         NR2_SUBMIT_RESUBMISSION.fetch_add(1, Ordering::Relaxed);
-    } else if record.payload_bytes != 0 {
+    } else if native.class == NativeClass::Control && record.payload_bytes != 0 {
         let mut state = native.state.lock();
         let retired = state.staging_mut().retire(record.payload_bytes as u64);
         drop(state);
@@ -1669,6 +3082,265 @@ pub(crate) unsafe fn submit(
                 NR2_SLOT_UNDERFLOW.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+    if native.class == NativeClass::Queue {
+        if record.flags != 0
+            || record.device_generation != native.session_generation
+            || record.context_generation != native.context_generation
+            || record.ring_index != native.ring_index
+            || record.ring_index == 0
+            || crate::ddi::translation_session::execution_session_generation(session)
+                != Some(native.session_generation)
+        {
+            bump_with_code(&NR2_HOST_SUBMIT_REJECT, 1);
+            return NativeSubmitDisposition::Revoked;
+        }
+
+        let fence = submit.SubmissionFenceId;
+        if let Err(refusal) = native
+            .host_submissions
+            .lock()
+            .admit_host_completion(fence, resubmission)
+        {
+            let code = match refusal {
+                HostSubmissionRefusal::Duplicate { .. } => 2,
+                HostSubmissionRefusal::WentBackward { .. } => 3,
+            };
+            bump_with_code(&NR2_HOST_SUBMIT_REJECT, code);
+            return NativeSubmitDisposition::Revoked;
+        }
+
+        let adapter = unsafe { native.adapter.as_ref() };
+        let commit_record = record.payload_bytes != 0;
+        let action = {
+            let mut executor = native.executor.lock();
+            let Some(slot) = executor.slots.get_mut(record.slot_index as usize) else {
+                drop(executor);
+                bump_with_code(&NR2_HOST_SUBMIT_REJECT, 4);
+                return NativeSubmitDisposition::Revoked;
+            };
+            let old = core::mem::replace(slot, SubmissionSlot::Free);
+            match old {
+                SubmissionSlot::Collecting {
+                    identity,
+                    mut tickets,
+                } => {
+                    if queue_record_matches(native, &record, identity, record.slot_index as usize)
+                        && append_queue_ticket(
+                            adapter,
+                            &mut tickets,
+                            identity,
+                            ticket,
+                            resubmission,
+                            commit_record,
+                        )
+                    {
+                        *slot = SubmissionSlot::Collecting { identity, tickets };
+                        Some(QueueSubmitAction::Pending)
+                    } else {
+                        *slot = SubmissionSlot::Collecting { identity, tickets };
+                        None
+                    }
+                }
+                SubmissionSlot::Ready {
+                    identity,
+                    mut tickets,
+                    mut batch,
+                } => {
+                    if queue_record_matches(native, &record, identity, record.slot_index as usize)
+                        && append_queue_ticket(
+                            adapter,
+                            &mut tickets,
+                            identity,
+                            ticket,
+                            resubmission,
+                            commit_record,
+                        )
+                    {
+                        if commit_record {
+                            if let Some(batch) = batch.take() {
+                                *slot = SubmissionSlot::InFlight { identity, tickets };
+                                Some(QueueSubmitAction::Enqueue {
+                                    identity,
+                                    slot_index: record.slot_index,
+                                    batch,
+                                })
+                            } else {
+                                *slot = SubmissionSlot::Ready {
+                                    identity,
+                                    tickets,
+                                    batch,
+                                };
+                                None
+                            }
+                        } else {
+                            *slot = SubmissionSlot::Ready {
+                                identity,
+                                tickets,
+                                batch,
+                            };
+                            Some(QueueSubmitAction::Pending)
+                        }
+                    } else {
+                        *slot = SubmissionSlot::Ready {
+                            identity,
+                            tickets,
+                            batch,
+                        };
+                        None
+                    }
+                }
+                SubmissionSlot::InFlight {
+                    identity,
+                    mut tickets,
+                } => {
+                    if queue_record_matches(native, &record, identity, record.slot_index as usize)
+                        && append_queue_ticket(
+                            adapter,
+                            &mut tickets,
+                            identity,
+                            ticket,
+                            resubmission,
+                            commit_record,
+                        )
+                    {
+                        *slot = SubmissionSlot::InFlight { identity, tickets };
+                        Some(QueueSubmitAction::Pending)
+                    } else {
+                        *slot = SubmissionSlot::InFlight { identity, tickets };
+                        None
+                    }
+                }
+                SubmissionSlot::Terminal {
+                    identity,
+                    mut tickets,
+                    success,
+                    cleanup,
+                } => {
+                    if queue_record_matches(native, &record, identity, record.slot_index as usize)
+                        && append_queue_ticket(
+                            adapter,
+                            &mut tickets,
+                            identity,
+                            ticket,
+                            resubmission,
+                            commit_record,
+                        )
+                    {
+                        *slot = SubmissionSlot::Terminal {
+                            identity,
+                            tickets,
+                            success,
+                            cleanup,
+                        };
+                        Some(QueueSubmitAction::AlreadyTerminal { success })
+                    } else {
+                        *slot = SubmissionSlot::Terminal {
+                            identity,
+                            tickets,
+                            success,
+                            cleanup,
+                        };
+                        None
+                    }
+                }
+                SubmissionSlot::Free => {
+                    *slot = SubmissionSlot::Free;
+                    None
+                }
+            }
+        };
+        let Some(action) = action else {
+            bump_with_code(&NR2_HOST_SUBMIT_REJECT, 4);
+            return NativeSubmitDisposition::Revoked;
+        };
+        NR2_HOST_SUBMIT_OK.fetch_add(1, Ordering::Relaxed);
+
+        return match action {
+            QueueSubmitAction::Pending => NativeSubmitDisposition::Pending,
+            QueueSubmitAction::AlreadyTerminal { success } => {
+                if success {
+                    let _ = crate::ddi::interrupt::complete_ordered_engine_submission(
+                        adapter, ticket,
+                    );
+                } else {
+                    let _ = crate::ddi::interrupt::fail_ordered_engine_submission(
+                        adapter, ticket,
+                    );
+                }
+                NativeSubmitDisposition::Pending
+            }
+            QueueSubmitAction::Enqueue {
+                identity,
+                slot_index,
+                batch,
+            } => {
+                let host_context_id = batch.custody.host_context_id();
+                let transport_instance = batch.custody.transport_instance();
+                let completion = NativeHostCompletion {
+                    context: NonNull::from(native),
+                    identity,
+                    slot_index,
+                    custody: Some(batch.custody),
+                };
+                let mut pending = Some((batch.meta, batch.payload, completion));
+                let queued = adapter.with_virtio(|gpu| {
+                    if gpu.scanout_transport_instance() != transport_instance {
+                        return None;
+                    }
+                    pending.take().map(|(meta, payload, completion)| {
+                        gpu.enqueue_native_submit(
+                            host_context_id,
+                            native.ring_index,
+                            meta,
+                            payload,
+                            identity.payload_bytes as usize,
+                            completion,
+                        )
+                    })
+                });
+                match queued {
+                    Ok(Some(Ok(_))) => NativeSubmitDisposition::Pending,
+                    Ok(Some(Err((meta, payload, Some(completion), _)))) => {
+                        completion.finish_with_cleanup(
+                            adapter,
+                            false,
+                            Some((meta, payload)),
+                        );
+                        NativeSubmitDisposition::Pending
+                    }
+                    Ok(Some(Err((meta, payload, None, _)))) => {
+                        // The inner enqueue is required to return native
+                        // custody on every refusal. Preserve the DMA buffers at
+                        // DISPATCH and fail the exact K9 batch if that invariant
+                        // is ever violated.
+                        core::mem::forget(meta);
+                        core::mem::forget(payload);
+                        bump_with_code(&NR2_HOST_SUBMIT_REJECT, 5);
+                        fail_inflight_without_completion(
+                            native,
+                            adapter,
+                            identity,
+                            slot_index,
+                        );
+                        NativeSubmitDisposition::Pending
+                    }
+                    Ok(None) | Err(_) => {
+                        if let Some((meta, payload, completion)) = pending.take() {
+                            completion.finish_with_cleanup(
+                                adapter,
+                                false,
+                                Some((meta, payload)),
+                            );
+                            NativeSubmitDisposition::Pending
+                        } else {
+                            bump_with_code(&NR2_HOST_SUBMIT_REJECT, 5);
+                            NativeSubmitDisposition::Revoked
+                        }
+                    }
+                }
+            }
+        };
     }
     if record.flags != HELIOS_HNR2_KMD_DMA_FLAG_HOST_COMPLETED {
         // The host handoff, and the end of K6 for every operation outside K11's

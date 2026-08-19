@@ -1795,10 +1795,14 @@ impl AdapterContext {
         // The device is now reset. Re-enter the ordinary transport lock only to
         // retire value/DMA-buffer bookkeeping; no PCI callback or wait occurs
         // in this phase.
-        self.with_virtio(|gpu| {
+        let finished = self.with_virtio(|gpu| {
             gpu.finish_physical_reset_and_abort(expected_instance, status, spins)
         })
-        .map_err(|_| crate::virtio::VirtioError::DeviceError)?
+        .map_err(|_| crate::virtio::VirtioError::DeviceError)??;
+        if finished == 0 {
+            crate::ddi::native_render::drain_host_terminals(self);
+        }
+        Ok(finished)
     }
 
     /// Seal new canonical owner admissions while leaving the live transport

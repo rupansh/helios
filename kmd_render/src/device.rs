@@ -627,19 +627,48 @@ pub unsafe extern "C" fn dxgkddi_create_context(
             // ⛔ The scratch is allocated HERE, at PASSIVE, and its failure fails
             // the context — never on the Render path, where 228 KiB of nonpaged
             // pool would be a per-batch allocation inside a DDI.
-            let Some(native) = NativeContext::new(NativeClass::Control) else {
+            let Some(adapter) = core::ptr::NonNull::new(device.adapter) else {
+                return STATUS_INVALID_DEVICE_REQUEST;
+            };
+            let Some(native) = NativeContext::new(
+                adapter,
+                NativeClass::Control,
+                helios_protocol::native_render::HELIOS_HVC1_CONTROL_RING_INDEX,
+                0,
+                0,
+            ) else {
                 return STATUS_NO_MEMORY;
             };
             (
                 HeliosContextRole::Control {
                     session,
-                    native: alloc::boxed::Box::new(native),
+                    native,
                 },
                 ContextInfoProfile::Hvc1,
             )
         }
-        hts1::ContextRequest::HeliosQueue { session } => {
-            let Some(native) = NativeContext::new(NativeClass::Queue) else {
+        hts1::ContextRequest::HeliosQueue { session, endpoint } => {
+            // SAFETY: classify_context returned the endpoint together with the
+            // strong session reference that keeps the fixed array live.
+            let ring_index = unsafe { endpoint.as_ref().ring_index() };
+            let context_generation = unsafe { endpoint.as_ref().endpoint_id() } as u64;
+            let Some(session_generation) =
+                hts1::execution_session_generation(session)
+            else {
+                unsafe { hts1::release_queue_context(session) };
+                return STATUS_INVALID_DEVICE_REQUEST;
+            };
+            let Some(adapter) = core::ptr::NonNull::new(device.adapter) else {
+                unsafe { hts1::release_queue_context(session) };
+                return STATUS_INVALID_DEVICE_REQUEST;
+            };
+            let Some(native) = NativeContext::new(
+                adapter,
+                NativeClass::Queue,
+                ring_index,
+                session_generation,
+                context_generation,
+            ) else {
                 // SAFETY: `classify_context` took a reference for this context
                 // and nothing else owns it yet.
                 unsafe { hts1::release_queue_context(session) };
@@ -648,7 +677,7 @@ pub unsafe extern "C" fn dxgkddi_create_context(
             (
                 HeliosContextRole::Queue {
                     session,
-                    native: alloc::boxed::Box::new(native),
+                    native,
                 },
                 ContextInfoProfile::Hvc1,
             )
@@ -785,16 +814,21 @@ pub unsafe extern "C" fn dxgkddi_destroy_context(h_context: *mut c_void) -> NTST
         // Patch/SubmitCommand union then reads as a refusal rather than as a
         // live context, for whatever the allocator has since put there.
         ctx.magic = 0;
+        let passive = unsafe { crate::irql::PassiveLevel::assume() };
         match ctx.helios {
             HeliosContextRole::Legacy => {}
-            HeliosContextRole::Queue { session, .. } => {
+            HeliosContextRole::Queue { session, native } => {
                 // A queue context holds only its own reference: the session's
                 // registration and the device's reference belong to the control
                 // context, which `DxgkDdiDestroyDevice` settles.
+                native.close(passive);
+                drop(native);
                 // SAFETY: the reference `classify_context` took for it.
                 unsafe { hts1::release_queue_context(session) };
             }
-            HeliosContextRole::Control { session, .. } => {
+            HeliosContextRole::Control { session, native } => {
+                native.close(passive);
+                drop(native);
                 // ⛔ CLEAR THE CELL FIRST. `release_device_session` may drop the
                 // last reference and free the object; a `DxgkDdiOpenAllocation`
                 // on this device between the free and the clear would read a

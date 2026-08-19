@@ -1655,6 +1655,10 @@ enum InFlightKind {
     AsyncVenus {
         fence_id: u64,
         ring_idx: u8,
+        /// Exact HNR2 context/session/allocation custody. Only the bounded
+        /// nonzero-endpoint executor sets this; compatibility submissions keep
+        /// it absent.
+        native_completion: Option<crate::ddi::native_render::NativeHostCompletion>,
         scanout_notify: Option<ScanoutNotify>,
         /// Registered present-stream value this normal wire-fence submission
         /// retires.  The stream handle carries its generation, so a stale
@@ -1939,6 +1943,28 @@ fn take_scanout_flush_token(kind: &mut InFlightKind) -> Option<ScanoutFlushToken
         InFlightKind::AsyncControl { scanout_flush, .. } => scanout_flush.take(),
         _ => None,
     }
+}
+
+fn take_native_completion(
+    kind: &mut InFlightKind,
+) -> Option<crate::ddi::native_render::NativeHostCompletion> {
+    match kind {
+        InFlightKind::AsyncVenus {
+            native_completion,
+            ..
+        } => native_completion.take(),
+        _ => None,
+    }
+}
+
+fn has_native_completion(kind: &InFlightKind) -> bool {
+    matches!(
+        kind,
+        InFlightKind::AsyncVenus {
+            native_completion: Some(_),
+            ..
+        }
+    )
 }
 
 /// What one DISPATCH-level fast bind asks for: the wire command's geometry plus
@@ -2999,6 +3025,12 @@ pub struct VirtioGpu {
     parked_spare: Vec<InFlight>,
     reap_buffers_spare: Vec<DmaBuffer>,
     reap_in_progress: bool,
+    /// Exact native completions extracted under `virtio_lock` and processed
+    /// only after that lock is released. Both vectors reserve MAX_INFLIGHT at
+    /// init, so used-ring and reset paths never allocate.
+    native_terminals: Vec<crate::ddi::native_render::NativeHostTerminal>,
+    native_terminals_spare: Vec<crate::ddi::native_render::NativeHostTerminal>,
+    native_terminal_drain_in_progress: bool,
     /// PASSIVE-reaped DMA buffers ready for another command. Accessed under the
     /// existing virtio spinlock, but allocation/free never occurs there.
     dma_pool: Vec<DmaBuffer>,
@@ -3396,6 +3428,9 @@ impl VirtioGpu {
             parked_spare: Vec::with_capacity(MAX_PARKED),
             reap_buffers_spare: Vec::with_capacity(2 * MAX_PARKED),
             reap_in_progress: false,
+            native_terminals: Vec::with_capacity(MAX_INFLIGHT),
+            native_terminals_spare: Vec::with_capacity(MAX_INFLIGHT),
+            native_terminal_drain_in_progress: false,
             dma_pool: Vec::with_capacity(MAX_DMA_POOL),
             dma_pool_bytes: 0,
             bind_cmd_pool,
@@ -3866,12 +3901,35 @@ impl VirtioGpu {
         if !self.failed {
             self.latch_failed_and_fail_inflight();
         }
+        if status == 0 {
+            self.terminalize_native_after_physical_reset();
+        }
         self.abort_windowed_blt_for_terminal_transport();
         self.purge_all_present_streams();
         if status != 0 {
             crate::diag::fault(crate::diag::FaultCounter::StVioR, spins);
         }
         Ok(status)
+    }
+
+    /// A failed transport parks in-flight buffers because a ring latch alone
+    /// does not prove the device stopped DMA. Only a successful physical reset
+    /// may detach native custody from those parked entries and turn it into an
+    /// explicit failed terminal.
+    fn terminalize_native_after_physical_reset(&mut self) {
+        for entry in &mut self.parked {
+            let Some(completion) = take_native_completion(&mut entry.kind) else {
+                continue;
+            };
+            if self.native_terminals.len() < MAX_INFLIGHT
+                && self.native_terminals.len() < self.native_terminals.capacity()
+            {
+                self.native_terminals.push(completion.terminal(false));
+            } else {
+                PARKED_LEAKS.fetch_add(1, Ordering::Relaxed);
+                core::mem::forget(completion);
+            }
+        }
     }
 
     /// Reset a fully initialized transport candidate that was never published.
@@ -5155,7 +5213,55 @@ impl VirtioGpu {
         venus: DmaBuffer,
         venus_len: usize,
     ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
-        self.enqueue_submit_inner(ctx_id, ring_idx, meta, venus, venus_len, None, None, None)
+        self.enqueue_submit_inner(
+            ctx_id, ring_idx, meta, venus, venus_len, None, None, None, None,
+        )
+        .map_err(|(meta, venus, native, error)| {
+            debug_assert!(native.is_none());
+            (meta, venus, error)
+        })
+    }
+
+    /// Enqueue one already-validated HNR2 batch on its exact nonzero session
+    /// endpoint. The move-only completion token returns intact on every refusal
+    /// and is published into the ordinary in-flight entry only after `add`
+    /// accepts the descriptor chain.
+    pub(crate) fn enqueue_native_submit(
+        &mut self,
+        ctx_id: u32,
+        ring_idx: u32,
+        meta: DmaBuffer,
+        venus: DmaBuffer,
+        venus_len: usize,
+        completion: crate::ddi::native_render::NativeHostCompletion,
+    ) -> Result<
+        u64,
+        (
+            DmaBuffer,
+            DmaBuffer,
+            Option<crate::ddi::native_render::NativeHostCompletion>,
+            VirtioError,
+        ),
+    > {
+        if ctx_id == 0 || ring_idx == 0 {
+            return Err((
+                meta,
+                venus,
+                Some(completion),
+                VirtioError::DeviceError,
+            ));
+        }
+        self.enqueue_submit_inner(
+            ctx_id,
+            ring_idx,
+            meta,
+            venus,
+            venus_len,
+            None,
+            None,
+            None,
+            Some(completion),
+        )
     }
 
     /// Ring-1 submission belonging to an already admitted WindowedBlt FIFO
@@ -5193,7 +5299,12 @@ impl VirtioGpu {
                 token,
                 stream_boundary,
             }),
+            None,
         )
+        .map_err(|(meta, venus, native, error)| {
+            debug_assert!(native.is_none());
+            (meta, venus, error)
+        })
     }
 
     /// Enqueue a tagged ICD submit.  Validation and the descriptor add happen
@@ -5223,7 +5334,12 @@ impl VirtioGpu {
             None,
             Some(retire),
             None,
+            None,
         )
+        .map_err(|(meta, venus, native, error)| {
+            debug_assert!(native.is_none());
+            (meta, venus, error)
+        })
     }
 
     /// Enqueue the scan-out copy: an ASYNC fenced SUBMIT_3D on ring 1 carrying
@@ -5256,7 +5372,12 @@ impl VirtioGpu {
             Some(notify),
             None,
             None,
+            None,
         )
+        .map_err(|(meta, venus, native, error)| {
+            debug_assert!(native.is_none());
+            (meta, venus, error)
+        })
     }
 
     /// Shared body of the two entry points above. Private: the notify/ring
@@ -5271,26 +5392,55 @@ impl VirtioGpu {
         scanout_notify: Option<ScanoutNotify>,
         present_stream: Option<PresentStreamRetire>,
         windowed_blt: Option<WindowedBltRetire>,
-    ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
+        mut native_completion: Option<crate::ddi::native_render::NativeHostCompletion>,
+    ) -> Result<
+        u64,
+        (
+            DmaBuffer,
+            DmaBuffer,
+            Option<crate::ddi::native_render::NativeHostCompletion>,
+            VirtioError,
+        ),
+    > {
         let hdr_len = core::mem::size_of::<VirtioGpuCmdSubmit>();
         let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
         if self.failed {
-            return Err((meta, venus, VirtioError::DeviceError));
+            return Err((meta, venus, native_completion, VirtioError::DeviceError));
+        }
+        if native_completion.is_some()
+            && (self.native_terminals.capacity() < MAX_INFLIGHT
+                || self
+                    .inflight
+                    .len()
+                    .saturating_add(self.native_terminals.len())
+                    >= MAX_INFLIGHT)
+        {
+            return Err((meta, venus, native_completion, VirtioError::QueueFull));
         }
         let Some(wire_fence_limit) = self.wire_fence_base.checked_add(D4_FENCE_OFFSET)
         else {
             WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-            return Err((meta, venus, VirtioError::WireFenceNamespaceExhausted));
+            return Err((
+                meta,
+                venus,
+                native_completion,
+                VirtioError::WireFenceNamespaceExhausted,
+            ));
         };
         if self.next_wire_fence >= wire_fence_limit {
             WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-            return Err((meta, venus, VirtioError::WireFenceNamespaceExhausted));
+            return Err((
+                meta,
+                venus,
+                native_completion,
+                VirtioError::WireFenceNamespaceExhausted,
+            ));
         }
         if venus_len == 0
             || venus_len > venus.as_slice().len()
             || hdr_len + resp_len > meta.as_slice().len()
         {
-            return Err((meta, venus, VirtioError::DeviceError));
+            return Err((meta, venus, native_completion, VirtioError::DeviceError));
         }
         let fence_id = self.next_wire_fence;
         let mut cmd = VirtioGpuCmdSubmit::zeroed();
@@ -5308,8 +5458,10 @@ impl VirtioGpu {
         let chain = Chain::MetaPlusVenus { hdr_len, venus_len };
         let token = match self.enqueue_core(chain, &meta, Some(&venus), resp_len, None) {
             Ok((token, None)) => token,
-            Ok((_, Some(_))) => return Err((meta, venus, VirtioError::DeviceError)),
-            Err(e) => return Err((meta, venus, e)),
+            Ok((_, Some(_))) => {
+                return Err((meta, venus, native_completion, VirtioError::DeviceError))
+            }
+            Err(e) => return Err((meta, venus, native_completion, e)),
         };
         if let Some(retire) = present_stream {
             self.commit_present_stream_tag(retire, ring_idx);
@@ -5328,6 +5480,7 @@ impl VirtioGpu {
             kind: InFlightKind::AsyncVenus {
                 fence_id,
                 ring_idx: ring,
+                native_completion: native_completion.take(),
                 scanout_notify,
                 present_stream,
                 windowed_blt,
@@ -5659,6 +5812,7 @@ impl VirtioGpu {
             // out before the `match entry.kind` moves the other fields, so the
             // entry stays whole for the park below.
             let scanout_flush = take_scanout_flush_token(&mut entry.kind);
+            let native_completion = take_native_completion(&mut entry.kind);
             let resp_base = {
                 // SAFETY: the resp span is within the entry-owned meta buffer.
                 unsafe { resp.as_slice() }.as_ptr()
@@ -5992,6 +6146,7 @@ impl VirtioGpu {
                 InFlightKind::AsyncVenus {
                     fence_id,
                     ring_idx,
+                    native_completion: _,
                     scanout_notify,
                     present_stream,
                     windowed_blt,
@@ -6068,6 +6223,24 @@ impl VirtioGpu {
                         }
                     }
                     self.retire_wire_fence_notifications(fence_id);
+                    if let Some(completion) = native_completion {
+                        if self.native_terminals.len() < MAX_INFLIGHT
+                            && self.native_terminals.len() < self.native_terminals.capacity()
+                        {
+                            self.native_terminals
+                                .push(completion.terminal(response_ok));
+                            // This response may have been consumed by a
+                            // PASSIVE opportunistic drain. Queue the ordinary
+                            // DPC so K9 is serviced outside `virtio_lock`.
+                            crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+                        } else {
+                            // The native enqueue gate proves this unreachable.
+                            // Never destroy custody or its heap storage under
+                            // the transport spinlock if the invariant is lost.
+                            PARKED_LEAKS.fetch_add(1, Ordering::Relaxed);
+                            core::mem::forget(completion);
+                        }
+                    }
                 }
             }
             // The fast bind's buffer is RETAINED, not parked: it is one of the
@@ -6123,11 +6296,48 @@ impl VirtioGpu {
         self.parked.len()
     }
 
+    /// Swap out exact native terminals for processing after `virtio_lock` is
+    /// released. A second drain leaves the first owner undisturbed.
+    pub(crate) fn begin_native_terminal_drain(
+        &mut self,
+    ) -> Option<alloc::vec::Vec<crate::ddi::native_render::NativeHostTerminal>> {
+        if self.native_terminal_drain_in_progress || self.native_terminals.is_empty() {
+            return None;
+        }
+        self.native_terminal_drain_in_progress = true;
+        let fresh = core::mem::take(&mut self.native_terminals_spare);
+        debug_assert!(fresh.capacity() >= MAX_INFLIGHT);
+        Some(core::mem::replace(&mut self.native_terminals, fresh))
+    }
+
+    /// Return the empty, pre-reserved terminal vector after every move-only
+    /// completion token was discharged outside the transport lock.
+    pub(crate) fn finish_native_terminal_drain(
+        &mut self,
+        mut terminals: alloc::vec::Vec<crate::ddi::native_render::NativeHostTerminal>,
+    ) {
+        terminals.clear();
+        if terminals.capacity() < MAX_INFLIGHT {
+            // Capacity never shrinks in any owner path. If that invariant is
+            // lost, retain the short vector without allocating at DISPATCH;
+            // later pushes take their explicit capacity refusal.
+            PARKED_LEAKS.fetch_add(1, Ordering::Relaxed);
+        }
+        self.native_terminals_spare = terminals;
+        self.native_terminal_drain_in_progress = false;
+    }
+
     /// Begin one PASSIVE reap by swapping in the empty pre-reserved parked
     /// vector and lending the pre-reserved DMA-buffer scratch vector. A second
     /// caller returns None and leaves the active reaper to finish.
     pub fn begin_parked_reap(&mut self) -> Option<(Vec<InFlight>, Vec<DmaBuffer>)> {
-        if self.reap_in_progress || self.parked.is_empty() {
+        if self.reap_in_progress
+            || self.parked.is_empty()
+            || self
+                .parked
+                .iter()
+                .any(|entry| has_native_completion(&entry.kind))
+        {
             return None;
         }
         self.reap_in_progress = true;

@@ -318,9 +318,24 @@ def check_fixed_ownership(sources: dict[str, str], errors: list[str]) -> None:
     )
     if foreign_static:
         errors.append(f"{TRANSPORT}: adapter/global host namespace storage appeared: {foreign_static!r}")
-    for unbounded in ("Vec<", "HashMap<", "BTreeMap<", "LinkedList<", ".push(", ".insert("):
+    # The post-K9 continuation adds one session-owned attachment ledger.  It is
+    # a Vec only so reverse teardown can pop in attachment order; construction
+    # reserves the complete protocol maximum before publication and every push
+    # is preceded by both capacity and semantic-bound checks below.  No other
+    # dynamic namespace container is admitted.
+    for unbounded in ("HashMap<", "BTreeMap<", "LinkedList<", ".insert("):
         if compact(unbounded) in compact(transport_live):
             errors.append(f"{TRANSPORT}: host transport storage is not fixed: {unbounded}")
+    for fragment in (
+        "constMAX_SESSION_ATTACHMENTS:usize=helios_protocol::native_render::HELIOS_HNR2_MAX_USE_RECORDSasusize;",
+        "attachments.try_reserve_exact(MAX_SESSION_ATTACHMENTS).ok()?;",
+        "attachments.len()==attachments.capacity()||attachments.len()>=MAX_SESSION_ATTACHMENTS",
+        "attachments.push(SessionAttachment{resource_id,references:1,state:AttachmentState::Attaching,});",
+    ):
+        if compact(fragment) not in compact(transport_live):
+            errors.append(f"{TRANSPORT}: bounded session attachment ledger missing: {fragment}")
+    if compact(transport_live).count("Vec<") != 1 or compact(transport_live).count(".push(") != 1:
+        errors.append(f"{TRANSPORT}: attachment ledger gained another dynamic storage path")
 
     new_session = body(sources, SESSION, "new_session", errors)
     require_order(
@@ -710,15 +725,15 @@ def check_allowlist_and_completion(sources: dict[str, str], errors: list[str]) -
         "commit",
         commit,
         (
-            "native.class != NativeClass::Control && accept.has_reply",
             "let k11_init = native.class == NativeClass::Control",
             "header.fragment_count == 1",
             "HeliosTranslationSessionInitV1",
             "native.class == NativeClass::Control && !accept.has_reply",
             "native.class == NativeClass::Control && !k11_init",
-            "staging_mut().checkout",
+            "staging_mut().checkout(header.total_payload_bytes)",
+            "let prepared_executor = if native.class == NativeClass::Queue",
             "publish_dma_record",
-            "control_render(session",
+            "let status = control_render",
             "mark_dma_host_completed(args, header.batch_token)",
         ),
         errors,
@@ -768,10 +783,14 @@ def check_allowlist_and_completion(sources: dict[str, str], errors: list[str]) -
         errors,
     )
     submit = body(sources, NATIVE, "submit", errors)
+    control_marker = submit.find(
+        "if record.flags != HELIOS_HNR2_KMD_DMA_FLAG_HOST_COMPLETED"
+    )
+    control_submit = submit[control_marker:] if control_marker >= 0 else ""
     require_order(
         NATIVE,
         "submit",
-        submit,
+        control_submit,
         (
             "record.flags != HELIOS_HNR2_KMD_DMA_FLAG_HOST_COMPLETED",
             "NR2_NO_HOST.fetch_add(1, Ordering::Relaxed)",
@@ -950,7 +969,7 @@ def check_allowlist_and_completion(sources: dict[str, str], errors: list[str]) -
         (
             "let disposition = adapter.with_k11_completion(||",
             "guard.admit_ordered_engine_submission(fence)",
-            "native_render::submit(native, session, submit)",
+            "native_render::submit(native, session, submit, ticket)",
             "NativeSubmitDisposition::HostCompleted(",
             "if exact_fence == fence",
             "complete_k11_host_submission(adapter, ticket)",
@@ -958,6 +977,7 @@ def check_allowlist_and_completion(sources: dict[str, str], errors: list[str]) -
             "NativeSubmitDisposition::Revoked",
             "Some((disposition, ticket))",
             "NativeSubmitDisposition::HostCompleted(_)",
+            "NativeSubmitDisposition::Pending, _",
             "NativeSubmitDisposition::Revoked, _",
             "NativeSubmitDisposition::Refused, ticket",
             "note_and_maybe_signal(adapter, fence, is_paging, None, Some(ticket))",
@@ -1010,18 +1030,18 @@ def check_allowlist_and_completion(sources: dict[str, str], errors: list[str]) -
     ):
         errors.append(f"{SUBMIT}:complete_k11_host_submission: K11 completion bypassed K9 or gained a queue, poll, timer, or synthetic fallback")
 
-    completion_admit = body(sources, TRANSPORT, "with_admitted", errors)
+    completion_admit = body(sources, TRANSPORT, "acquire_owned", errors)
     require_order(
         TRANSPORT,
-        "with_admitted",
+        "acquire_owned",
         completion_admit,
         (
             "!state.open || state.active == u32::MAX",
             "state.active == 0",
             "KeClearEvent(self.drained.get())",
             "state.active += 1",
-            "K11CompletionOperation { owner: self }",
-            "Some(operation())",
+            "K11CompletionOperation",
+            "owner: NonNull::from(self)",
         ),
         errors,
     )
@@ -1048,9 +1068,9 @@ def check_allowlist_and_completion(sources: dict[str, str], errors: list[str]) -
     transport_live = compact(live_rust(sources.get(TRANSPORT, "")))
     for fragment in (
         "pub(crate)structK11CompletionRundown{state:SpinLock<CompletionRundownState>,drained:UnsafeCell<KEVENT>,}",
-        "implDropforK11CompletionOperation<'_>",
+        "implDropforK11CompletionOperation",
         "state.active=state.active.saturating_sub(1);",
-        "KeSetEvent(self.owner.drained.get(),0,0)",
+        "KeSetEvent(owner.drained.get(),0,0)",
     ):
         if compact(fragment) not in transport_live:
             errors.append(f"{TRANSPORT}: fixed adapter completion rundown missing: {fragment}")
@@ -1491,7 +1511,27 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("allow arbitrary control payload", NATIVE, "if native.class == NativeClass::Control && !k11_init {", "if false {"),
         Mutation("run queue payload as control", NATIVE, "if native.class == NativeClass::Control {\n        let status = control_render", "if true {\n        let status = control_render"),
         Mutation("poll host reply", TRANSPORT, "core::sync::atomic::fence(Ordering::Acquire);", "poll_host_reply();\n        core::sync::atomic::fence(Ordering::Acquire);"),
-        Mutation("mark host completion before host call", NATIVE, "let status = control_render(session, args, header, accept, uses, list_count);", "unsafe { mark_dma_host_completed(args, header.batch_token) };\n        let status = control_render(session, args, header, accept, uses, list_count);"),
+        Mutation(
+            "mark host completion before host call",
+            NATIVE,
+            "        let status = control_render(\n"
+            "            session,\n"
+            "            args,\n"
+            "            header,\n"
+            "            accept,\n"
+            "            &scratch.uses[..use_count],\n"
+            "            list_count,\n"
+            "        );",
+            "        unsafe { mark_dma_host_completed(args, header.batch_token) };\n"
+            "        let status = control_render(\n"
+            "            session,\n"
+            "            args,\n"
+            "            header,\n"
+            "            accept,\n"
+            "            &scratch.uses[..use_count],\n"
+            "            list_count,\n"
+            "        );",
+        ),
         Mutation("retry a full K11 control queue", CTRL, "        None,\n        CtrlRoundtripMode::FiniteEvent,\n", "        None,\n        CtrlRoundtripMode::LegacyRetry,\n"),
         Mutation("retry K11 context lifecycle", CTRL, "        Some(owner),\n        CtrlRoundtripMode::FiniteEvent,\n    )\n}\n\nfn ctx_create_mode", "        Some(owner),\n        CtrlRoundtripMode::LegacyRetry,\n    )\n}\n\nfn ctx_create_mode"),
         Mutation("poll K11 with adaptive drains", CTRL, "            CtrlRoundtripMode::FiniteEvent => wait_block_once(passive, block, timeout_ms),\n", "            CtrlRoundtripMode::FiniteEvent => wait_block(passive, adapter, block, timeout_ms),\n"),
@@ -1502,7 +1542,16 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("move K11 pure control off ring zero", CTRL, "    cmd.hdr.ring_idx = 0;\n", "    cmd.hdr.ring_idx = 1;\n"),
         Mutation("forge K11 control fence from WDDM", CTRL, "    cmd.hdr.fence_id = control_fence_id;\n", "    cmd.hdr.fence_id = SubmissionFenceId as u64;\n"),
         Mutation("route K11 through adapter boundary queue", SUBMIT, "                        complete_k11_host_submission(adapter, ticket);\n", "                        let _ = note_and_maybe_signal(adapter, exact_fence, false, None, Some(ticket));\n"),
-        Mutation("forge a later K11 SubmissionFenceId", SUBMIT, "                let ticket = adapter.with_wddm_notify_lock(|guard| {\n                    guard.admit_ordered_engine_submission(fence)\n                })?;\n", "                let ticket = adapter.with_wddm_notify_lock(|guard| {\n                    guard.admit_ordered_engine_submission(fence.wrapping_add(1))\n                })?;\n"),
+        Mutation(
+            "forge a later K11 SubmissionFenceId",
+            SUBMIT,
+            "                    let ticket = adapter.with_wddm_notify_lock(|guard| {\n"
+            "                        guard.admit_ordered_engine_submission(fence)\n"
+            "                    })?;\n",
+            "                    let ticket = adapter.with_wddm_notify_lock(|guard| {\n"
+            "                        guard.admit_ordered_engine_submission(fence.wrapping_add(1))\n"
+            "                    })?;\n",
+        ),
         Mutation("complete revoked K11 work through legacy queue", SUBMIT, "                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, _))\n                | None => {\n                    // The host-completed marker belonged to a session whose\n                    // exact transport/fence authority was revoked before this\n                    // callback, or reset already closed the adapter completion\n                    // epoch. Do not forge completion through the legacy queue.\n                    SubmitAck::Accepted\n                }\n", "                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, ticket))\n                | None => {\n                    note_and_maybe_signal(adapter, fence, is_paging, None, Some(ticket))\n                }\n"),
         Mutation("skip current session generation at submit", NATIVE, "    let disposition = crate::ddi::translation_session::with_current_host_submission(\n", "    let disposition = Some(\n"),
         Mutation("drop adapter completion rundown", SUBMIT, "                .with_k11_completion(|| {\n", "                .with_k11_completion_unchecked(|| {\n"),
@@ -1522,7 +1571,44 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("add HPM1 dependency", TRANSPORT, "const VENUS_CAPSET_ID: u32 = 4;", "const HPM1_REQUIRED: bool = true;\nconst VENUS_CAPSET_ID: u32 = 4;"),
         Mutation("add QEMU dependency", TRANSPORT, "const VENUS_CAPSET_ID: u32 = 4;", "const QEMU_PATCH_REQUIRED: bool = true;\nconst VENUS_CAPSET_ID: u32 = 4;"),
         Mutation("weaken K2a alias publication", ALLOC, "ctx.backing_store_state\n        .store(BACKING_STORE_BOUND, Ordering::Release);", "ctx.backing_store_state\n        .store(BACKING_STORE_BOUND, Ordering::Relaxed);"),
-        Mutation("weaken HVR1 release publication", TRANSPORT, "magic.store(HELIOS_HVR1_MAGIC.to_le(), Ordering::Release);", "magic.store(HELIOS_HVR1_MAGIC.to_le(), Ordering::Relaxed);"),
+        Mutation(
+            "weaken HVR1 release publication",
+            TRANSPORT,
+            "                payload.as_ptr(),\n"
+            "                dst.add(header_bytes as usize),\n"
+            "                payload.len(),\n"
+            "            );\n"
+            "            let mut unpublished = *header;\n"
+            "            unpublished.magic = 0;\n"
+            "            core::ptr::copy_nonoverlapping(\n"
+            "                bytemuck::bytes_of(&unpublished).as_ptr(),\n"
+            "                dst,\n"
+            "                header_bytes as usize,\n"
+            "            );\n"
+            "        }\n"
+            "        // K2a mappings and 1-MiB slot offsets are page aligned, so the magic\n"
+            "        // word satisfies AtomicU32's alignment. This release store is the exact\n"
+            "        // publication edge for every header/payload byte copied above.\n"
+            "        let magic = unsafe { &*dst.cast::<AtomicU32>() };\n"
+            "        magic.store(HELIOS_HVR1_MAGIC.to_le(), Ordering::Release);",
+            "                payload.as_ptr(),\n"
+            "                dst.add(header_bytes as usize),\n"
+            "                payload.len(),\n"
+            "            );\n"
+            "            let mut unpublished = *header;\n"
+            "            unpublished.magic = 0;\n"
+            "            core::ptr::copy_nonoverlapping(\n"
+            "                bytemuck::bytes_of(&unpublished).as_ptr(),\n"
+            "                dst,\n"
+            "                header_bytes as usize,\n"
+            "            );\n"
+            "        }\n"
+            "        // K2a mappings and 1-MiB slot offsets are page aligned, so the magic\n"
+            "        // word satisfies AtomicU32's alignment. This release store is the exact\n"
+            "        // publication edge for every header/payload byte copied above.\n"
+            "        let magic = unsafe { &*dst.cast::<AtomicU32>() };\n"
+            "        magic.store(HELIOS_HVR1_MAGIC.to_le(), Ordering::Relaxed);",
+        ),
         Mutation("forge host reply opcode", SESSION, "opcode: host.opcode,", "opcode: 0,"),
         Mutation("bypass renderer reply validation", TRANSPORT, "pure::validate_create_instance_reply(\n            &raw_reply,\n            SESSION_INSTANCE_HANDLE,\n        )", "Ok(pure::HostInitEvidence { opcode: 0, status: 0 })"),
         Mutation("drop pair-use rundown", CTRL, "let pair = adapter\n        .control_owner()\n        .borrow_session_pair(owner, reply_resource_id, context_id)?;", "let pair = ();"),

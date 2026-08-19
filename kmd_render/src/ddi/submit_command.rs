@@ -1174,56 +1174,58 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
     if !h_context.is_null() {
         let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
         if let Some((native, session)) = context.as_ref().and_then(|c| c.native()) {
-            // One fixed adapter rundown guard spans K11's current-generation
-            // validation, context-local fence admission, and exact completion.
-            // Reset closes and joins this guard before abandoning its scheduler
-            // epoch; ordinary session teardown does not wait on it.
+            // One fixed adapter rundown guard spans scheduler admission and the
+            // synchronous K11-control completion path.  Queue work moves its
+            // own session/context/allocation custody into the async host entry;
+            // retaining this adapter guard there would deadlock TDR, whose
+            // physical reset is what makes an unresponsive host entry terminal.
             let disposition = adapter
                 .with_k11_completion(|| {
-                // K9 admission happens before any native submit transition.
-                // Preemption/reset therefore either sees and invalidates this
-                // exact ticket or happens wholly before the new generation's
-                // admission; a late host result cannot discover a successor by
-                // fence value.
-                let ticket = adapter.with_wddm_notify_lock(|guard| {
-                    guard.admit_ordered_engine_submission(fence)
-                })?;
-                // SAFETY: the private-data pair for this submission.
-                let disposition = unsafe {
-                    crate::ddi::native_render::submit(native, session, submit)
-                };
-                if let crate::ddi::native_render::NativeSubmitDisposition::HostCompleted(
-                    exact_fence,
-                ) = disposition
-                {
-                    if exact_fence == fence {
-                        // Host-resource rundown has ended. K9 retains an early
-                        // cross-context completion and notifies only when this
-                        // ticket reaches the one-engine head.
-                        complete_k11_host_submission(adapter, ticket);
-                    } else {
-                        // The direct context admitted a different scheduler
-                        // fence than the callback supplied. Fail this generation
-                        // closed; never substitute either scalar.
-                        let _ = super::interrupt::fail_ordered_engine_submission(
-                            adapter, ticket,
-                        );
+                    // K9 admission happens before any native submit transition.
+                    // Preemption/reset therefore either sees and invalidates this
+                    // exact ticket or happens wholly before the new generation's
+                    // admission; a late host result cannot discover a successor by
+                    // fence value.
+                    let ticket = adapter.with_wddm_notify_lock(|guard| {
+                        guard.admit_ordered_engine_submission(fence)
+                    })?;
+                    // SAFETY: the private-data pair for this submission.
+                    let disposition = unsafe {
+                        crate::ddi::native_render::submit(native, session, submit, ticket)
+                    };
+                    if let crate::ddi::native_render::NativeSubmitDisposition::HostCompleted(
+                        exact_fence,
+                    ) = disposition
+                    {
+                        if exact_fence == fence {
+                            // Host-resource rundown has ended. K9 retains an early
+                            // cross-context completion and notifies only when this
+                            // ticket reaches the one-engine head.
+                            complete_k11_host_submission(adapter, ticket);
+                        } else {
+                            // The direct context admitted a different scheduler
+                            // fence than the callback supplied. Fail this generation
+                            // closed; never substitute either scalar.
+                            let _ = super::interrupt::fail_ordered_engine_submission(
+                                adapter, ticket,
+                            );
+                        }
+                    } else if matches!(
+                        disposition,
+                        crate::ddi::native_render::NativeSubmitDisposition::Revoked
+                    ) {
+                        let _ =
+                            super::interrupt::fail_ordered_engine_submission(adapter, ticket);
                     }
-                } else if matches!(
-                    disposition,
-                    crate::ddi::native_render::NativeSubmitDisposition::Revoked
-                ) {
-                    let _ =
-                        super::interrupt::fail_ordered_engine_submission(adapter, ticket);
-                }
-                Some((disposition, ticket))
-            })
+                    Some((disposition, ticket))
+                })
                 .flatten();
             let SubmitAck::Accepted = match disposition {
                 Some((
                     crate::ddi::native_render::NativeSubmitDisposition::HostCompleted(_),
                     _,
-                )) => {
+                ))
+                | Some((crate::ddi::native_render::NativeSubmitDisposition::Pending, _)) => {
                     SubmitAck::Accepted
                 }
                 Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, _))
