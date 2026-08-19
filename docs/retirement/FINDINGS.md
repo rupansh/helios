@@ -1948,3 +1948,38 @@ cold-DWM retry. If truthful role 4 or the exact executor cannot be completed
 inside these limits with existing stock virtio-gpu/Venus operations, the next
 implementation must stop with exact symbols, call flow, and runtime evidence
 instead of widening the maintenance surface.
+
+### Implementation checkpoint (2026-08-19)
+
+The bounded continuation described above landed at root `e8819c1`. It uses the
+existing stock virtio-gpu/Venus operations and fixed ABIs: role 4 selects a
+truthful non-host-visible memory class and has no CPU mapping; general admitted
+HNR2 custody is fixed-size and tied to the exact session, endpoint, context,
+allocation generations, and rundown; only the generated A3/A4 Venus subset is
+accepted; host resource operands remain zero on the wire and are patched only
+in a host-private copy from current allocation objects; and only the terminal
+host result reaches K9. Context/session/reset/Stop/Remove paths revoke new work,
+join callbacks, and release custody in reverse order. Refusal never enters the
+compatibility completion arm as an A4 success.
+
+Mesa A3 landed at `2c2763b8b1a` and A4 at `5cbc0254f43`. The Windows renderer
+owns exactly one direct A1/K11 session per `vn_instance`; roles 1–3 keep their
+exact K2a Lock2 views, role 4 never locks, C57 imports only the exact
+`D3D12_RESOURCE_BIT` handle, and HNF1 opens only the exact `D3D12_FENCE_BIT`
+handle on that KMT device. A4 owns submission mode per instance, requires a live
+exact scope in record-only mode, seals bounded immutable batches synchronously,
+and performs no KMT work or completion there. Normal mode emits zero host
+resource operands and brackets HNR2 work with imported waits/signals and C51 on
+the same context. Sparse submissions carry exact allocation closure;
+command-buffer submissions remain a named refusal until A7 provides their
+complete use and typed-operand tables.
+
+A3 did not require A8. The only shared lifecycle change is the smallest Windows
+seam that skips duplicate host-instance/ring creation and assigns nonzero queue
+endpoints after the dedicated bootstrap endpoint; generic ring demolition stays
+A8. A5-A9 and the present-layer lane were not started. The new KMD and ICD pass
+source/mutation gates and Windows builds but were not installed, restarted, or
+exercised on the target. The installed KMD remains 22.22.296.0 / `oem128.inf`;
+DWM/WARP and zero active DisplayConfig paths remain the last measured runtime
+state. This checkpoint establishes neither display admission, HPS2 retirement,
+nor production correctness.

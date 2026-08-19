@@ -37,6 +37,28 @@ truthful role-4 continuation defined by F20 before A3/A4. This is not authority
 for A5-A9, the present layer, a new host protocol, or a fallback. No A3/A4 Mesa
 source has changed at this checkpoint.
 
+**2026-08-19 A3/A4 implementation checkpoint.** The prerequisite landed at
+root `e8819c1`; A3 landed in Mesa `2c2763b8b1a` and A4 in `5cbc0254f43`.
+The selected Windows backend is now `vn_renderer_helios_hvm.c`: it has no
+Escape/IOCTL/private-blob/present-stream/named-fence/raw-resource-ID path,
+owns one exact A1/K11 session per `vn_instance`, retains K2a Lock2 views only
+for roles 1–3, leaves role 4 unmapped, and implements exact C57/HNF1 imports.
+The A4 owner dispatches `QueueSubmit`, `QueueSubmit2`, and `QueueBindSparse` by
+per-instance mode. Record-only mode requires a live exact scope and returns a
+bounded immutable batch without KMT submission or completion; normal mode uses
+the exact nonzero HVC1 context, zero wire host-resource operands, KMD-private
+patching, same-context imported-fence ordering, and C51 joins. Command-buffer
+closure remains a named refusal pending A7; sparse closure is exact.
+
+A3 and A8 were not codependent. The Windows lifecycle skips duplicate host
+instance/ring creation and reserves only the dedicated bootstrap endpoint;
+generic `vn_ring` retirement remains A8. A5-A9 and sub-lane (b) were not
+started. Source/mutation gates and the Windows ICD build pass, but neither the
+new KMD nor ICD was installed or target-exercised, so no display-admission,
+HPS2-retirement, or production-correctness claim follows. This checkpoint
+overrides the pre-implementation inventory below where it says A3/A4 files are
+absent.
+
 Reconnaissance brief. No implementation code was written. Every line/symbol
 reference below was re-verified against the working tree at
 `icd/mesa` commit `8559b66299a8f91fcde30edfdd23310195cc7ca6` — the same commit
@@ -120,7 +142,7 @@ misplaced. The four "Add" files under `src/virtio/vulkan/` and the four under
 | `vn_wsi.c` / `.h` | 1112 / 107 | `vn_wsi_get_helios_resource_identity` (`:132-163`), `vn_wsi_init` forcing `sw_device=true` on Windows (`:165-246`), `vn_CreateSwapchainKHR` (`:904`), `vn_AcquireNextImage2KHR` (`:966`), `vn_QueuePresentKHR` (`:1098`), extension gating (`:625`, `:648`). | **MODIFY** — delete `vn_wsi_get_helios_resource_identity` and the `win32.get_helios_resource_identity` hook; on Windows the swapchain/present entry points become unreachable (see ambiguity **A5**). |
 | `vn_icd.c` / `.h` | 26 / 31 | `vk_icdGetInstanceProcAddr` + `vn_icd_supports_api_version`. | **MODIFY** — §17.3 lists it but no prose says why. Conservative reading: this is where the **one** exported private direct-dispatch entry point is declared/exported alongside the loader entry points, and where the loader-vs-direct provenance check lives. See ambiguity **A2**. |
 | `meson.build` | 174 | `libvn_files` (`:56-79`), Windows arm adding `vn_renderer_helios.c` + `setupapi` + `gdi32` + the WDK include (`:120-135`), `vn_wsi.c` gate (`:137-142`), `libvulkan_virtio` shared library (`:157-174`). | **MODIFY** — add the four new `vn_helios_*.c` files; drop `setupapi` (its only user is the dead IOCTL residue). |
-| `vn_helios_record_submit.{c,h}` | — | **do not exist** | **ADD** |
+| `vn_helios_record_submit.{c,h}` | landed at `5cbc0254f43` | Per-instance record/normal submission owner, exact live-scope recording, bounded immutable batch sealing, normal HNR2 dispatch, imported-fence ordering, and C51 joins. | **A4 DONE; SOURCE/BUILD-VALIDATED ONLY** |
 | `vn_helios_direct_dispatch.{c,h}` | — | **do not exist** | **ADD** |
 | `vn_helios_translation_session.{c,h}` | — | **do not exist** | **ADD** |
 | `vn_helios_native_kmt.{c,h}` | 1206 / 248 | **A2, landed `1b97c64`.** Pure half: CRC-64/ECMA-182, the HNR2 fragment planner and encoder. Windows half: HVC1 control/queue contexts, `D3DKMTRender` + buffer re-adoption + the resize transition, the per-context monitored progress fence, the C51 waits and the queue/device idle joins. | done |
@@ -168,8 +190,10 @@ record declarations are gone, `vn_helios_hwa2.h` includes `helios_wddm.h`, and
 `meson.build` `error()`s if the header is unreachable; `OWNERSHIP.md` §2 pair 3
 has the measurement). **A1 is done** (`6ad43fb`,
 `vn_helios_translation_session.{c,h}`, builds clean under `win_meson`) — but it
-is *implemented and never exercised*: its INIT refuses until KMD unit **K5**
-exists, and K5 is not started. **A2 is done** (`1b97c64`) and **A3 is absent**.
+was *implemented and never exercised* at that checkpoint: its INIT refused until
+KMD unit **K5** existed. K5 and K11 have since landed and been target-exercised;
+**A2 is done** (`1b97c64`), **A3 is done** (`2c2763b8b1a`), and **A4 is done**
+(`5cbc0254f43`). The new KMD executor and Mesa A3/A4 remain source/build-only.
 
 ⭐ **A2 amendment, 2026-08-10.** A2 landed with an inverted dependency and a new
 gate, both deliberate:
@@ -194,8 +218,8 @@ partial and F8 reverses its fence direction.
 | **A0** | Consume the protocol C header: one `helios_protocol.h` include point, package-generation constant, and `_Static_assert` on **every offset** of HWA2/HQA1/HVC1/HNR2/HVM1/HVR1 + the 24/16/40/48-byte records. No new struct is hand-declared in the ICD. | *(none — adds only `#include` + asserts; lands as part of A1's first commit)* | protocol lane (§17.1) | S |
 | **A1** | HTS1: raw KMT device per `vn_instance`, one HVC1 control context (both queue ordinals `UINT32_MAX`), the **4 MiB / 4×1 MiB** role-1 reply pool (create + residency + one process-local `D3DKMTLock2` held to teardown), finite `INIT`, session generation/capability/endpoint-capacity capture, C51 event-backed reply, slot checkout/publication/retire state machine, HVR1 validation + exact-next-offset continuation for logical snapshots up to 64 MiB. | `vn_helios_translation_session.{c,h}` | A0, K2a | L |
 | **A2** | Native KMT lane: HVC1 queue contexts (`NodeOrdinal=0`, `EngineAffinity=0`, `Flags.Value=0`, `ClientHint=VULKAN`), `DXGK_CONTEXTINFO` minima validation, the HNR2 encoder/fragmenter (≤15 MiB, ≤64 fragments, COMMIT-metadata reservation), `D3DKMTRender` call shape + returned-buffer adoption + `ResizeAllocationList`/`ResizePatchLocationList` transition, CRC64-ECMA, one unshared monitored fence per context (`D3DKMTCreateSynchronizationObject2`, `NoSignalMaxValueOnTdr=1`, `NoGPUAccess=1`) + `SignalSynchronizationObjectFromGpu`/`WaitForSynchronizationObjectFromCpu` C51 waits, per-queue/device idle joins. | `vn_helios_native_kmt.{c,h}` | A1 | XL |
-| **A3** | Renderer rewrite: delete Escape/IOCTL/blob/present-stream/named-fence/raw-`res_id`-export machinery; HVM1 allocation create/free (`D3DKMTCreateAllocation2`, `pSystemMem=NULL`, shared CPU-visible roles 1–3, role 4 non-CPU-visible); retain the exact allocation/process Lock2 view supplied by K2a and `Unlock2` it at the matching lifetime boundary; shmem/BO identity becomes an opaque HVM1 capability+generation, never a mapping token; make any size/range shape beyond the proven udmabuf bound a named hard failure; C57 import carrier (`D3D12_RESOURCE_BIT` only, arrays sized from the query, zeroed allocation array = hard failure, HWA2 validated, `D3DKMTDestroyAllocation2{hResource,NULL,0,0}` close); `D3DKMTOpenNativeFenceFromNtHandle` per §12.2. | `vn_renderer_helios.c`, `vn_renderer.h`, `vn_renderer_internal.{c,h}` | A1, A2, K2a, F20's authorized KMD continuation | XL |
-| **A4** | Record-only submit + normal submit: `vn_QueueSubmit`/`_2`/`vn_QueueBindSparse` become mode-dispatched; record-only seals an immutable batch (version, session/endpoint/context generations, context-local batch id, length, CRC, complete use table) and returns it synchronously — **no** KMT queue-work call; normal mode drives A2's HNR2 path and places imported-native-fence wait/signal around it; queue entry points without a live outer scope are refused; `vn_QueueWaitIdle`/`vkDeviceWaitIdle`/teardown use the C51 joins. | `vn_helios_record_submit.{c,h}`, `vn_queue.c`, `vn_queue.h` | A2, A3, K9, F20's authorized KMD continuation | XL |
+| **A3 ✅** | Renderer rewrite: delete Escape/IOCTL/blob/present-stream/named-fence/raw-`res_id`-export machinery; HVM1 allocation create/free (`D3DKMTCreateAllocation2`, `pSystemMem=NULL`, shared CPU-visible roles 1–3, role 4 non-CPU-visible); retain the exact allocation/process Lock2 view supplied by K2a and `Unlock2` it at the matching lifetime boundary; shmem/BO identity becomes an opaque HVM1 capability+generation, never a mapping token; make any size/range shape beyond the proven udmabuf bound a named hard failure; C57 import carrier (`D3D12_RESOURCE_BIT` only, arrays sized from the query, zeroed allocation array = hard failure, HWA2 validated, `D3DKMTDestroyAllocation2{hResource,NULL,0,0}` close); `D3DKMTOpenNativeFenceFromNtHandle` per §12.2. | `vn_renderer_helios_hvm.c`, `vn_renderer.h`, `vn_renderer_internal.{c,h}` | A1, A2, K2a, F20's authorized KMD continuation | XL; landed `2c2763b8b1a` |
+| **A4 ✅** | Record-only submit + normal submit: `vn_QueueSubmit`/`_2`/`vn_QueueBindSparse` become mode-dispatched; record-only seals an immutable batch (version, session/endpoint/context generations, context-local batch id, length, CRC, complete use table) and returns it synchronously — **no** KMT queue-work call; normal mode drives A2's HNR2 path and places imported-native-fence wait/signal around it; queue entry points without a live outer scope are refused; `vn_QueueWaitIdle`/`vkDeviceWaitIdle`/teardown use the C51 joins. | `vn_helios_record_submit.{c,h}`, `vn_queue.c`, `vn_queue.h` | A2, A3, K9, F20's authorized KMD continuation | XL; landed `5cbc0254f43` |
 | **A5** | Private direct dispatch: the single exported entry point that hands DXVK/vkd3d a versioned function table (package-generation-checked); the non-forgeable record-only instance tag; provenance rejection of any proc whose owning module is the loader or the layer; endpoint descriptor export for HQA1. | `vn_helios_direct_dispatch.{c,h}`, `vn_icd.c`, `vn_icd.h` | A1, A4 | M |
 | **A6** | Physical-device / instance profile: stop advertising `KHR_win32_surface` + `KHR_swapchain*` on Windows; advertise `D3D12_RESOURCE_BIT`/`D3D12_FENCE_BIT` with IMPORTABLE + DEDICATED_ONLY answers; two memory types over one HLM1 heap; normal-loader limit clamps (≤4096 closure / ≤8192 operands); leave `emulate_second_queue` unused. | `vn_physical_device.{c,h}`, `vn_instance.{c,h}`, `vn_wsi.{c,h}` | A3 | L |
 | **A7** | C60 classifier across the object files: pure-control calls on HVC1, allocation-backed calls become deferred records consumed by the first outer batch that names the allocation, GPU-dependent calls do the HQC1 join first. Includes the presentable-image tag call + `PRESENT_SRC_KHR`/`QUEUE_FAMILY_EXTERNAL` validation for tagged images. | `vn_device.{c,h}`, `vn_buffer.{c,h}`, `vn_image.{c,h}`, `vn_pipeline.{c,h}`, `vn_query_pool.{c,h}` | A1, A4 | L |

@@ -250,6 +250,24 @@ rundown/teardown. Everything outside that list remains a named refusal. If any
 part needs QEMU/virglrenderer/HPM1, a new wire/DDI carrier, an independent
 timeline, or A7's whole-object classifier, stop rather than expanding the unit.
 
+**2026-08-19 bounded continuation implementation checkpoint.** The exact unit
+above landed at root `e8819c1` and is source/build-validated only. Role 4 uses a
+stock non-host-visible Venus memory type and is never CPU-mapped. General
+admitted HNR2 work now has fixed-size immutable custody bound to the direct live
+session/endpoint/context/allocation graph, generated validation for only the
+A3/A4 Venus subset, private-copy patching from exact current allocation objects,
+same-endpoint stock-Venus submission, same-context imported-fence ordering, and
+terminal host completion into K9. Refusal cannot reach the compatibility arm as
+host completion. Session/context/reset/Stop/Remove revoke and drain in reverse
+order. No DDI, wire ABI, host protocol, QEMU/virglrenderer/HPM1 dependency,
+global lookup/queue, independent timeline, polling, or fallback was added.
+
+The installed target still runs KMD 22.22.296.0 / `oem128.inf`; this source was
+not installed, adapter-restarted, rebooted, or exercised. K11's prior 14/14,
+HTS1/HNR2 15/15, and K2a 52/52 evidence therefore does not validate this
+executor. Mesa A3/A4 subsequently landed source/build-only; A5-A9 and the
+present layer are the stop-boundary handoff.
+
 **Serialization notes.**
 
 * K0 and K1 both touch `src/ddi/mod.rs` and `src/lib.rs` — K0 first, then K1

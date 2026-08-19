@@ -964,6 +964,12 @@ run_gate "K9 one-engine completion frontier is ordered, host-terminal, reset-clo
 run_gate "Post-K9 HVM1/Venus executor is bounded, direct-owned, host-terminal, and mutation-checked" \
     python3 "$REPO/tools/post-k9-executor-gate.py" "$REPO" --mutations
 
+run_gate "Mesa A3 HVM1 renderer is escape-free, role-4-unmapped, exact-import, and mutation-checked" \
+    python3 "$REPO/tools/mesa-a3-hvm-gate.py" "$REPO" --mutations
+
+run_gate "Mesa A4 submit is mode-owned, bounded, exact-closure, same-context ordered, and mutation-checked" \
+    python3 "$REPO/tools/mesa-a4-submit-gate.py" "$REPO" --mutations
+
 run_gate "D4 classic/DMA DIRQL enqueue is capability-restricted and fixed-storage" \
     python3 "$REPO/tools/d4-dirql-gate.py" "$REPO"
 
