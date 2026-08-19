@@ -1859,3 +1859,92 @@ DisplayConfig reports zero active paths. Mesa A3/A4 remain the next handoff;
 Escape and HWQueues stay NULL. INIT, Code 0, hashes, counters, or a clean reset
 are not visible or cold-DWM admission and do not establish HPS2 retirement or
 production correctness.
+
+---
+
+## F20 — K9 orders real completions but does not execute A4; the bounded KMD executor/bootstrap continuation is explicitly authorized.
+
+**Reconciled and authorized 2026-08-19.** This finding records the pre-edit
+answer after root commit `a4db0ad` landed K9. It does not claim that the
+continuation, Mesa A3, or Mesa A4 has been implemented. K9 is source/build
+validated only; the installed target KMD remains 22.22.296.0, whose K11/HTS1/
+HNR2/K2a probes passed 14/14, 15/15, 15/15, and 52/52 respectively. DWM still
+uses WARP and DisplayConfig still reports zero active paths.
+
+### The exact remaining call flow
+
+The shipping Mesa path in `vn_CreateInstance` calls
+`vn_instance_init_renderer`, initializes both shmem pools, calls
+`vn_instance_init_ring`, reads renderer versions, and finally issues
+`vn_call_vkCreateInstance`. The Windows ring still publishes
+`ring->shmem->res_id` in `VkRingCreateInfoMESA`. In contrast, K11's exact HTS1
+session already owns one stock-Venus context and one `VkInstance` with its
+fixed private host handle. A3 must connect the renderer lifetime directly to
+that exact A1/K11 session and bypass the duplicate instance/ring construction
+on this backend without changing generic non-Windows Venus or starting A8's
+whole generic-ring retirement. Two `vn_instance` objects remain distinct
+because each owns its own raw KMT device, HVC1 control context, heap-pinned
+`SessionObject`, K11 host context/object namespace, generation, capability, and
+teardown; no PID, TLS, name, global lookup, or heuristic participates.
+
+K11 deliberately executes only the finite, copied, one-fragment,
+reply-bearing INIT. For every other record, `native_render.rs` currently:
+
+* validates the bounded HNR2 fragment/use/patch layout but does not retain a
+  host payload (`NR2_NO_STAGE`);
+* leaves typed host-resource operands zero because no exact allocation
+  substitution exists (`NR2_NO_RESID`);
+* has no generated opcode/operand executor schema (`NR2_NO_SCHEMA`); and
+* returns `NativeSubmitDisposition::Refused` at SubmitCommand because there was
+  no actual host completion (`NR2_NO_HOST`).
+
+`submit_command.rs` routes that refused disposition to the legacy
+`note_and_maybe_signal` compatibility arm. A4 may not reinterpret that arm as a
+host result: doing so would create the synthetic WDDM completion the contract
+forbids. K9 accepts an exact scheduler fence ticket, retains early results from
+different contexts, and exposes only the contiguous one-engine prefix. It can
+order a real completion; it cannot manufacture or execute one. Therefore the
+K9 ordered frontier is necessary for multi-context A4, but it is not the
+missing executor.
+
+The allocation half has one independent hard boundary. `admit_hvm1` rejects
+role 4 (`VulkanDeviceLocal`) at `CREATE_HVM1_MEMORY_CLASS_REFUSED` / `AcHvm1Mem`
+because the current Venus client selects a single host-visible/coherent memory
+type and cannot truthfully express the requested non-CPU-visible class.
+Role 4 may never be Lock2-mapped, and host-visible substitution is not an
+implementation. Roles 1–3 remain governed by F18: the retained exact Lock2
+view must use K2a backing, and CPU-visible success must obey the proven stock
+udmabuf bound. A worst-case 4 MiB allocation is exactly 1024 pages; anything
+larger needs a proven range bound or a named failure.
+
+### Authorized continuation and its stop boundary
+
+The owner authorizes the minimum KMD work required for correct A3/A4 execution:
+
+* truthful role-4 HVM1 allocation using existing stock Venus facilities, with
+  no Lock2 view;
+* bounded immutable HNR2 payload custody tied directly to the current session,
+  nonzero endpoint, context, allocation generations, and teardown rundown;
+* validation of only the exact A3/A4 opcode and typed-operand subset, leaving
+  every other class at a named refusal rather than absorbing A7's whole-object
+  classifier;
+* KMD-only patching of a host-private command copy from the exact current WDDM
+  allocation references, while the wire and Mesa copy keep host-resource
+  operands zero;
+* stock-Venus submission on the exact nonzero K11 endpoint, with imported
+  native-fence wait/signal ordering on that same context;
+* actual terminal host completion delivered through K9 before the exact WDDM
+  fence, and reverse-order revocation/drain across session destruction, reset,
+  Stop, and Remove; and
+* the smallest Mesa instance/ring lifecycle seams needed to consume that path,
+  without implementing A5 or performing A8's generic-ring demolition.
+
+This authorization does **not** permit a new DDI, wire record, host protocol,
+QEMU or virglrenderer change, HPM1, kernel-parameter change, resource-ID token,
+lookup table, adapter-global work queue, independent timeline, polling, sleep,
+forged completion, or compatibility fallback. It does not start K1, K8, K10,
+A5-A9, the present-layer lane, DXVK/vkd3d cutover, packaging activation, or a
+cold-DWM retry. If truthful role 4 or the exact executor cannot be completed
+inside these limits with existing stock virtio-gpu/Venus operations, the next
+implementation must stop with exact symbols, call flow, and runtime evidence
+instead of widening the maintenance surface.

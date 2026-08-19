@@ -78,6 +78,19 @@ successful K2a/K11 target exercises:
 THE TARGET, WHILE THE WDDM 3.2 DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED;
 MESA A3/A4, HPS2 RETIREMENT, AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**
 
+**NEXT AUTHORIZED TRANCHE (owner, 2026-08-19).** K9's ordered one-engine
+completion frontier is now landed at root commit `a4db0ad`, source/build
+validated, and still target-unexercised. The post-K9 reconciliation in
+`FINDINGS.md` F20 proves that K9 is necessary but not sufficient for A4:
+current K6/K11 accepts only the finite host-completed INIT, while general HNR2
+payload retention, schema validation, exact-allocation patching, stock-Venus
+execution on a nonzero session endpoint, and the resulting real host-completion
+edge remain absent. The owner authorizes the minimum KMD continuation required
+to close those exact A3/A4 boundaries, including truthful role-4 HVM1 support.
+This does not authorize a new DDI or host protocol, QEMU/virglrenderer/HPM1
+work, a global queue or independent timeline, K1 demolition, K8/K10, A5-A9,
+the present-layer lane, packaging activation, or a cold-DWM retry.
+
 **`VK_LAYER_HELIOS_present` LOADS, RUNS, and now BUILDS A WSI DEVICE**
 (`FINDINGS.md` F7 + its two addenda). Staged by
 `tools/install-helios-present-layer.ps1`, driven by
@@ -583,7 +596,8 @@ In order:
    + `icd/mesa` `33db3fd` + `vkd3d-proton-helios` `cdf1bce`. Verified: gates
    8/8, `kmd_render` check exit 0 at the 22-warning baseline, `umd` exit 0, mesa
    ICD + present layer link clean, vkd3d native build green.
-3. **A1 → A2 → K5 → K6 → K2a → K11 → A3/A4** ← **THE CRITICAL PATH.** A1 ✅ (`icd/mesa`
+3. **A1 → A2 → K5 → K6 → K2a → K11 → K9 → bounded post-K9 KMD
+   executor/bootstrap → A3 → A4** ← **THE CRITICAL PATH.** A1 ✅ (`icd/mesa`
    `6ad43fb`, rewritten onto A2 in `1b97c64`), **A2 ✅** (`1b97c64`, gate
    `c20d162`), **K5 ✅** (gate `tools/hts1-attach-gate.sh`, acceptance
    `tools/hts1_session_probe.c` **15/15** on KMD 22.22.267.0), **K6 ✅**
@@ -592,7 +606,9 @@ In order:
    `hts1_session_probe` still 15/15 beside it), **K2a ✅** (KMD 22.22.288.0,
    52/52 plus an exact bidirectional 4 MiB alias), and **K11 ✅** (KMD
    22.22.296.0, actual host INIT replies plus per-session/process/reset teardown
-   evidence). **Remaining: Mesa A3/A4.**
+   evidence), and **K9 ✅ in source/build only** (`a4db0ad`; target runtime
+   unexercised). **Remaining: the owner-authorized bounded KMD continuation,
+   then Mesa A3 and A4.** See F20; do not treat K9 as a host executor.
    ⭐ The HVM1 write-back blocker is **CLOSED** (`a8527e2`, `FINDINGS.md` F11);
    the private-data window blocker K6 hit is **CLOSED** (`FINDINGS.md` F13 —
    `DxgkDdiRender` must advance `pDmaBufferPrivateData`).
@@ -871,6 +887,41 @@ source/build checkpoint only: K9 has not been deployed or exercised on the
 target. Mesa A3/A4 remain unimplemented, the installed KMD remains
 22.22.296.0, and no display admission, visible desktop, HPS2 retirement, or
 production-correctness result follows.
+
+#### ⭐ Post-K9 A3/A4 reconciliation and bounded KMD authorization (2026-08-19)
+
+The next pre-edit pass proved that K9 answers only A4's one-engine ordering
+question. It does not execute a batch. The current source still has four exact
+boundaries:
+
+* `admit_hvm1` refuses role 4 (`VulkanDeviceLocal`) through `AcHvm1Mem` because
+  the current Venus client cannot yet select a truthful non-host-visible memory
+  type; substituting host-visible memory is forbidden;
+* `native_render.rs` executes only K11's one-fragment, reply-bearing INIT.
+  Other payloads reach `NR2_NO_STAGE`, `NR2_NO_RESID`, and `NR2_NO_SCHEMA`, and
+  SubmitCommand reaches `NR2_NO_HOST` rather than an actual host result;
+* the refused disposition still enters `submit_command.rs`'s compatibility
+  `note_and_maybe_signal` arm. That arm is not A4 completion and may not be used
+  to synthesize success;
+* normal Mesa instance construction still creates the renderer and raw-`res_id`
+  ring before issuing `vn_call_vkCreateInstance`, while K11 already owns the one
+  stock-Venus instance in the exact HTS1 namespace. A3/A4 need an explicit
+  per-instance lifecycle transition, not a second instance, global discovery,
+  or an A8-sized generic-ring demolition.
+
+The owner authorizes the minimum continuation of the existing exact
+`SessionObject`/endpoint/context/allocation graph needed by A3/A4: bounded
+immutable payload custody; validation of only the exact admitted opcode and
+typed-operand subset; KMD-only patching of a host-private copy from current
+WDDM allocation ownership; stock Venus submission on the exact nonzero session
+endpoint; actual host completion fed into K9 before WDDM completion; matching
+fence ordering; and reverse-order reset/Stop/Remove/session teardown. It also
+authorizes the minimum truthful role-4 allocation path. If role 4 or execution
+cannot be implemented with existing stock virtio-gpu/Venus operations and the
+fixed protocol ABIs, stop and report the exact dependency. The authorization
+does not permit a new carrier/protocol, `NR2_NO_HOST` fallback, fabricated
+identity, A7's whole-object classifier, or any later lane. See F20 for the
+source trace and acceptance boundary.
 
 #### ⭐ THE CRITICAL PATH IS NOW THE DISPLAY LANE — decided 2026-08-11 by the owner
 

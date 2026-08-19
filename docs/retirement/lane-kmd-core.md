@@ -236,6 +236,20 @@ Units sharing a file are called out explicitly.
 | **K13** | `kmd_logic` model rewrite: delete `scanout_read_ledger*` + `present_stream*`; add HNR2 fragment-assembly, use/operand closure, slot-pool, endpoint-FIFO arrival order, one-engine ordered retirement, native-fence lifecycle, and HPM1 epoch models with tests. | `kmd_logic/src/lib.rs`, `kmd_logic/Cargo.toml` | K6, K7 conceptually; **can start early** — it is pure logic and is the only part testable on Linux | L | **PARTIAL.** ✅ `pub mod native_fence_lifecycle` added at `kmd_logic/src/lib.rs:5625` (tests `:6089`). ❌ `scanout_read_ledger` still `:4079` (tests `:4335`) and `present_stream` still `:5346` (tests `:5476`, `:5530`). |
 | **K14** | Packaging: INF changes, driver version bump, package-generation stamping. **Activation commit only.** | `helios_kmd_render.inx`, `driver-version.env` | everything | S | **FULL RETIREMENT ACTIVATION NOT STARTED.** The version advanced to 22.22.296.0 solely to identify the measured K11 package; no new package-generation stamp, HPS2 demolition, or retirement activation follows. |
 
+**2026-08-19 owner-authorized post-K9 A3/A4 continuation.** This is deliberately
+not assigned a new K-number: it is the minimum continuation of the exact
+K6/K11 session/endpoint/context/allocation graph through K9, not authorization
+to absorb K8, K10, or another host protocol. F20 records the live refusal seams:
+role 4 at `AcHvm1Mem`; general HNR2 at `NR2_NO_STAGE`, `NR2_NO_RESID`, and
+`NR2_NO_SCHEMA`; and SubmitCommand at `NR2_NO_HOST` before the compatibility
+arm. The owner authorizes truthful role-4 support, bounded immutable payload
+custody, exact admitted-schema validation, KMD-only host-private allocation
+patching, stock-Venus execution on the exact nonzero session endpoint, native-
+fence ordering on that context, actual host completion into K9, and matching
+rundown/teardown. Everything outside that list remains a named refusal. If any
+part needs QEMU/virglrenderer/HPM1, a new wire/DDI carrier, an independent
+timeline, or A7's whole-object classifier, stop rather than expanding the unit.
+
 **Serialization notes.**
 
 * K0 and K1 both touch `src/ddi/mod.rs` and `src/lib.rs` — K0 first, then K1

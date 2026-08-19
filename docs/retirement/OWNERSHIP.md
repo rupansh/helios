@@ -120,6 +120,19 @@ and K2a backing references. This boundary landed and was reset-exercised on
 22.22.296.0; it grants no ownership of Mesa A3/A4, K1 demolition, or later
 allocation/GPU work.
 
+**Owner authorization, 2026-08-19.** The minimum post-K9 KMD continuation
+required by Mesa A3/A4 is now authorized, with `FINDINGS.md` F20 as its exact
+scope. KMD core retains exclusive ownership of `create_allocation.rs`,
+`native_render.rs`, `submit_command.rs`, the existing session transport/control
+owner, and the K9 completion seams. Mesa owns its renderer/instance/ring and
+queue call sites. Any shared opcode/typed-operand declaration remains
+protocol-owned and must land dependency-first; neither side may hand-declare a
+private mirror. The KMD continuation must preserve direct
+`SessionObject`/endpoint/context/allocation references, patch only a host-private
+copy, send only through the current nonzero endpoint, and feed actual completion
+through K9. This authorization creates no ownership for QEMU, virglrenderer,
+HPM1, a new DDI/protocol, A5-A9, the present layer, or K1/K8/K10.
+
 ## 4. Orchestrator decision: the private direct-dispatch ABI has one home
 
 Three lanes independently reported this as unspecified (mesa A3, dxvk 6.14,
