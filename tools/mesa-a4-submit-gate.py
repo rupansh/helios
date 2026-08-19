@@ -139,10 +139,10 @@ def check_sources(sources: dict[str, str]) -> list[str]:
     if re.search(r"getenv|os_get_option|GetEnvironmentVariable", init):
         errors.append(f"{A4}: submission mode is environment-selected")
 
-    instance_create = function(sources[INSTANCE], "vn_CreateInstance")
+    instance_create = function(sources[INSTANCE], "vn_create_instance_internal")
     require_order(
         INSTANCE,
-        "vn_CreateInstance",
+        "vn_create_instance_internal",
         instance_create,
         ("vn_instance_init_renderer(instance)", "vn_helios_submit_instance_init(instance)", "vn_instance_init_ring(instance)"),
         errors,
@@ -165,7 +165,9 @@ def check_sources(sources: dict[str, str]) -> list[str]:
             "owner->live_queue_count++",
             "if (owner->queue_admission_failed)",
             "const enum vn_helios_submission_mode mode = owner->mode",
-            "if (mode == VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) return VK_SUCCESS",
+            "if (mode == VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)",
+            "vn_helios_direct_register_queue",
+            "return result",
             "queue->helios_native_context = shared_queue->helios_native_context",
             "queue->helios_native_context_owner = false",
             "helios_native_context_create(device, HELIOS_NATIVE_CONTEXT_QUEUE, queue_family, queue_index",
@@ -209,7 +211,7 @@ def check_sources(sources: dict[str, str]) -> list[str]:
     )
     require(
         INSTANCE,
-        "vn_CreateInstance",
+        "vn_create_instance_internal",
         instance_create,
         ("instance->helios_next_ring_idx = 2",),
         errors,
@@ -506,7 +508,7 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("default record-only", A4, "owner->mode = VN_HELIOS_SUBMISSION_MODE_NORMAL;", "owner->mode = VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY;"),
         Mutation("drop session generation", A4, "vn_renderer_helios_session_generation(instance->renderer);", "1;"),
         Mutation("remove TLS scope", A4, "tss_create(&owner->scope_key, NULL)", "false"),
-        Mutation("create record queue context", A4, "if (mode == VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY)\n      return VK_SUCCESS;", "if (false)\n      return VK_SUCCESS;"),
+        Mutation("create record queue context", A4, "if (mode == VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY) {\n      if (queue_family >= dev->physical_device->queue_family_count)", "if (false) {\n      if (queue_family >= dev->physical_device->queue_family_count)"),
         Mutation("duplicate emulated context", A4, "queue->helios_native_context = shared_queue->helios_native_context;", "queue->helios_native_context = NULL;"),
         Mutation("retry ambiguous endpoint", A4, "if (owner->queue_admission_failed) {", "if (false) {"),
         Mutation("allow mismatched record endpoint", A4, "endpoint_id != queue->ring_idx", "false"),

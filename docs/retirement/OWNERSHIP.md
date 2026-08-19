@@ -133,6 +133,22 @@ copy, send only through the current nonzero endpoint, and feed actual completion
 through K9. This authorization creates no ownership for QEMU, virglrenderer,
 HPM1, a new DDI/protocol, A5-A9, the present layer, or K1/K8/K10.
 
+**Owner authorization and stop, 2026-08-20.** The owner authorized Mesa lower-
+ICD A5-A9 in dependency order plus only a minimum generated KMD admission entry
+if A7 proved one necessary over the existing fixed HNR2 ABI. A5 and fail-closed
+A6 landed at Mesa `4ea18b3512f` and `d07d1d13687`; bounded review fix
+`478c71a0fff` aligned the handle-properties query with the exact image-only
+import class. A7 then reached an ownership boundary rather than a missing KMD
+opcode: the opaque
+`HeliosSealedResourceUseV1.outer_allocation_token` is assigned by the outer UMD
+and enters the ICD on the DXVK/vkd3d plus UMD resource-creation path. The A5
+direct table intentionally has no identity or allocation-registration slot, and
+no current consumer supplies that token. Mesa's direct HVM1 handle/generation
+cannot stand in for it. The authorized alternatives explicitly excluded the
+consumer/UMD cutover, a new ABI or compatibility carrier, and heuristic/global
+identity, so A7 stopped without a KMD/schema change and A8/A9 were not started.
+The present-layer B lane remains unowned by this tranche.
+
 ## 4. Orchestrator decision: the private direct-dispatch ABI has one home
 
 Three lanes independently reported this as unspecified (mesa A3, dxvk 6.14,

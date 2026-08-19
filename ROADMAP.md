@@ -75,23 +75,33 @@ successful K2a/K11 target exercises:
 | K11 session transport | One stock Venus context/object namespace and one private 4 KiB host-reply target per exact live HTS1 session; role-1 HVM1 remains the sole HVR1 carrier | KMD 22.22.296.0 / `oem128.inf` returned actual finite host INIT replies, kept simultaneous same-process sessions distinct, isolated another process, drained normal/abrupt/reset teardown, and left `TsSlotStuck=0`. Allocation-backed and GPU-dependent work still refuses. This does not admit DWM. |
 | Bounded post-K9 executor | The current session owns bounded immutable HNR2 custody, generated A3/A4 schema validation, exact allocation-use closure, private-copy host-resource patching, nonzero-endpoint stock-Venus execution, same-context imported-fence ordering, and terminal completion through K9 | Root `e8819c1`; source/build validated only. The installed KMD was not replaced, restarted, or exercised, so the prior K11 target evidence does not validate this executor. |
 | Mesa A3/A4 | One direct A1/K11 session per Windows `vn_instance`; escape-free HVM1/C57/HNF1 renderer and mode-owned record/normal HNR2 queue path | Mesa `2c2763b8b1a` + `5cbc0254f43`; Windows ICD builds and source/mutation gates pass. Command-buffer closure remains a named refusal pending A7. No ICD was installed or exercised. |
+| Mesa A5 | One versioned private export returns the package-checked 112-byte direct table from the exact record-only `vn_instance`; module provenance, endpoint/HQA1 ownership, context attachment, scopes, and teardown stay on that direct object graph | Mesa `4ea18b3512f`; Windows ICD build and the 20-case A5 mutation gate pass. DXVK/vkd3d/UMD consumers were not cut over. No ICD was installed or exercised. |
+| Mesa A6 / A7 boundary | The Windows lower ICD has no Win32 WSI advertisement, exposes exactly two guest memory types over one HLM1 heap, clamps normal closure, and implements strict D3D12 resource/fence import validation without exposing it before A7 | Mesa `d07d1d13687` + review fix `478c71a0fff`; Windows ICD build and the 31-case A6 mutation gate pass. D3D12 import capability remains deliberately unadvertised. A7 is blocked because no exact outer-allocation token enters the current direct object graph; A8/A9 remain unstarted. |
 
-**THE ESCAPE-FREE MESA A3/A4 HVM1 RENDERER AND MODE-DISPATCHED HNR2 SUBMIT
-PATH LANDED AND PASSED SOURCE/BUILD VALIDATION ONLY; IT WAS NOT INSTALLED OR
-EXERCISED ON THE TARGET, THE WDDM 3.2 DISPLAY PACKAGE REMAINS
-RUNTIME-UNADMITTED, AND MESA A5-A9, THE PRESENT-LAYER CUTOVER, HPS2 RETIREMENT,
-AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**
+**MESA A5 AND THE FAIL-CLOSED A6 LOWER PROFILE LANDED AND PASSED SOURCE/BUILD
+VALIDATION ONLY; THEY WERE NOT INSTALLED OR EXERCISED ON THE TARGET, A7 IS
+BLOCKED AT THE ABSENT OUTER-ALLOCATION TOKEN ON THE CURRENT DIRECT GRAPH, A8/A9
+WERE NOT STARTED, THE WDDM 3.2 DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED, AND
+THE PRESENT-LAYER CUTOVER, HPS2 RETIREMENT, AND PRODUCTION CORRECTNESS ARE NOT
+ESTABLISHED.**
 
-**COMPLETED AUTHORIZED TRANCHE / STOP BOUNDARY (2026-08-19).** The bounded KMD
-continuation landed at root `e8819c1`; Mesa A3 and A4 landed at `2c2763b8b1a`
-and `5cbc0254f43`. A3 and A8 were not codependent: the Windows instance path
-uses K11's sole host instance and a narrow monotonic nonzero-endpoint seam,
-while generic `vn_ring` demolition remains A8. A4 deliberately refuses
-command-buffer submissions until A7 can provide their complete allocation and
-typed-operand closure. No deployment authority was exercised. Stop here with
-A5-A9, the present-layer lane, DXVK/vkd3d cutover, K1 demolition, K8/K10,
-packaging activation, D6/D7/D8, HPS2 deletion, and cold-DWM admission all
-unstarted by this tranche.
+**AUTHORIZED A5-A9 CONTINUATION STOPPED AT A7 (2026-08-20).** A5 landed at
+`4ea18b3512f`, fail-closed A6 at `d07d1d13687`, and its exact-image query review
+fix at `478c71a0fff`. A7 cannot be completed from the existing direct session/
+context/allocation graph and fixed HNR2/direct ABI:
+the required `HeliosSealedResourceUseV1.outer_allocation_token` is assigned by
+the outer UMD and reaches the ICD on the DXVK/vkd3d/UMD resource-creation path,
+which has not been cut over and is outside this tranche. The 112-byte A5 table
+has exactly its fixed eleven slots and no allocation-registration carrier. The
+current `helios_submit1_deferred_use_gate` /
+`helios_submit2_deferred_use_gate` therefore keep command buffers at
+`HELIOS_RECORD_REFUSE_DEFERRED_USE`, and record-only
+`helios_dispatch_payload` refuses every nonempty allocation closure. An HVM1
+KMT handle/generation is not the outer token and was not substituted. Completing
+A7 would require either the unauthorized consumer/UMD cutover or a forbidden
+new carrier. Dependency order therefore leaves A8/A9 unstarted. No deployment
+authority was exercised; the present layer and every later retirement unit stay
+outside this checkpoint.
 
 **`VK_LAYER_HELIOS_present` LOADS, RUNS, and now BUILDS A WSI DEVICE**
 (`FINDINGS.md` F7 + its two addenda). Staged by
@@ -959,6 +969,65 @@ be attributed to this source. DWM/WARP and zero active DisplayConfig paths remai
 the last measured runtime state; no display-admission or HPS2-retirement claim
 follows.
 
+#### ⭐ Mesa A5/A6 source/build checkpoint and A7 stop (2026-08-20)
+
+Mesa A5 landed at `4ea18b3512f`. The sole private export,
+`helios_icd_create_translator_v1`, creates a direct-owned record-only instance
+and returns the fixed package-generation-checked table. The table reaches only
+the existing per-instance session, monotonic endpoint/HQA1, exact context, live
+scope, refusal-counter, and teardown objects. Loader/layer procedure provenance
+is rejected by owning module. No registry, PID/name lookup, global table, TLS
+identity substitute, second session, or consumer cutover was added.
+
+Fail-closed A6 landed at `d07d1d13687`, followed by the bounded review fix
+`478c71a0fff` that makes the Win32 handle-properties query reject every HWA2
+class the actual dedicated-image import rejects. The Windows lower ICD no longer
+advertises or initializes Win32 WSI, presents exactly two guest memory types over
+one queried HLM1 heap, remaps renderer memory indices and requirements exactly,
+clamps the normal-loader closure to 4096 allocation uses / 8192 typed operands,
+keeps sparse and second-queue emulation disabled, and implements strict
+`D3D12_RESOURCE_BIT` dedicated-image and timeline `D3D12_FENCE_BIT` import
+validation. Those import capabilities remain unadvertised because A7 has not
+closed the allocation/operand path; no partial profile is exposed.
+
+The final reviewed Windows ICD is 50,889,646 bytes with SHA-256
+`82F99330AEBAAB7683F76AE939F7821246A7D69CC3D487F5D31EF17F73B8ACD8`.
+Its PE import table and embedded strings contain no DXGI, D3D11, D3D12, DComp,
+or `vulkan-1.dll`; its exports are exactly the three Vulkan loader entry points
+plus `helios_icd_create_translator_v1`. The compiled `LoadLibraryA` and
+`GetProcAddress` references remain confined to the three pre-existing Mesa
+utility objects (`u_debug_stack.c`, `u_debug_symbol.c`, and `u_dl.c`), while the
+selected Helios backend has no dynamic-loader fallback. The final serial
+retirement run passed protocol 146 unit + 1 integration, kmd_logic 543 unit + 2
+integrations, HNR2 encode/decode, and every standing mutation suite including
+A5 20/20 and A6 31/31.
+
+A7 stopped at the fixed identity boundary. The complete sealed-use table must
+contain the opaque, nonzero UMD-assigned
+`HeliosSealedResourceUseV1.outer_allocation_token`. The protocol explicitly
+places its ingress on the DXVK/vkd3d plus UMD resource-creation path. No such
+token appears in the current Mesa, DXVK, vkd3d, UMD, or UMD12 integration, and
+the fixed 112-byte/eleven-slot `HeliosTranslatorDispatchV1` has no registration
+slot by design. The live call flow is:
+
+`vn_helios_queue_submit{,2}` →
+`helios_submit{1,2}_deferred_use_gate` →
+`HELIOS_RECORD_REFUSE_DEFERRED_USE`; independently, record-only
+`helios_dispatch_payload(..., allocation_count > 0, ...)` returns
+`VK_ERROR_FEATURE_NOT_PRESENT` before sealing. `vn_helios_record_scope_seal`
+can validate/copy uses only after their exact outer token exists, while the
+outer bridge is the owner that converts that token into an allocation-list
+index or GPUVA. Mesa's local HVM1 allocation handle and generation are a
+different identity and cannot be fabricated into that field.
+
+Thus A7 requires either the explicitly out-of-scope DXVK/vkd3d and UMD cutover
+or a new ABI/private carrier that this authorization forbids. No KMD validator
+or schema extension can create the missing producer-side identity, so none was
+made. A8 and A9 were not started because the requested dependency order stops at
+A7. The present-layer B lane remains the next handoff only after an owner
+authorizes the necessary consumer/UMD resource-creation integration. No source
+in that lane, deployment, adapter restart, reboot, or target probe occurred.
+
 #### ⭐ THE CRITICAL PATH IS NOW THE DISPLAY LANE — decided 2026-08-11 by the owner
 
 *"no probing or hacks, we go the proper way, i dont care if I dont see the desktop
@@ -982,15 +1051,17 @@ statements without changing the display-admission result.
 | 8 | **K11 per-session host Venus transport** | K5/K6 already own exact WDDM process/device/context/session lifetimes and finite HNR2 admission. K11 binds one distinct stock Venus context/object namespace to each exact session, gets the real finite INIT reply through a private host target, and publishes it only through the K2a role-1 HVR1 pool. | **LANDED AND EXERCISED ON THE TARGET.** KMD 22.22.296.0 / `oem128.inf`; actual host INIT reply; K11 14/14, HTS1 15/15, updated HNR2 15/15, and K2a 52/52. Same-process sessions were distinct, another process was isolated, repeated and abrupt teardown left no stale session, and a held-capability adapter restart drained cleanly before a fresh 14/14. Four 1 MiB slots and the 64 MiB logical ceiling are unchanged; allocation/GPU work still refuses; QEMU/virglrenderer/HPM1/kernel parameters are unchanged. Escape and HWQueues remain NULL. Mesa A3/A4, visible admission, HPS2 retirement, and production correctness remain outstanding. |
 | 9 | **bounded post-K9 KMD executor/bootstrap** | K9 orders terminal results but cannot retain, validate, patch, or execute general HNR2 work. | **LANDED; SOURCE/BUILD-VALIDATED ONLY** at root `e8819c1`. Truthful role 4, bounded session-owned custody, generated A3/A4 schema validation, exact private-copy patching, same-endpoint stock-Venus execution, same-context native-fence ordering, terminal completion into K9, and reverse drain are present. The installed target remains the older K11 KMD; no new runtime evidence exists. |
 | 10 | **Mesa A3/A4** | Consume the exact session/executor without Escape, duplicate host instance, raw resource ID, or synthetic completion. | **LANDED; SOURCE/BUILD-VALIDATED ONLY** at Mesa `2c2763b8b1a` + `5cbc0254f43`. The escape-free HVM1 renderer and mode-dispatched HNR2 submit path build on Windows and pass their mutation gates. A7-dependent command-buffer closure stays refused, and A5-A9 plus the present layer remain the handoff. No ICD installation or target exercise occurred. |
+| 11 | **Mesa A5/A6; A7 decision** | Expose only the fixed direct record-only interface and prepare the exact lower profile before closing all allocation use/operand identity. | **A5 AND FAIL-CLOSED A6 LANDED; SOURCE/BUILD-VALIDATED ONLY** at Mesa `4ea18b3512f` + `d07d1d13687` + review fix `478c71a0fff`. A7 is blocked because its required outer-allocation token is produced only by the not-yet-cut-over DXVK/vkd3d/UMD resource-creation path and cannot be replaced by Mesa's HVM1 identity. A8/A9 and the present layer were not started. |
 
 ⚠ **The desktop stays dark for most of this**, by the owner's explicit acceptance.
 D9, K2a, and K11 have crossed their source and exact-target runtime boundaries;
-the post-K9 executor and Mesa A3/A4 have crossed source/build only. The display
+the post-K9 executor and Mesa A3-A6 have crossed source/build only. The display
 therefore remains runtime-unadmitted. The last measured target still selected
 the old installed ICD path, fell back to WARP before a primary was programmed,
 and reported zero active paths. Escape must not be restored. This tranche stops
-before A5-A9 and the present-layer cutover; a later explicitly authorized target
-exercise must rediscover the blocker rather than infer it from the new source.
+at A7 before A8/A9 and the present-layer cutover; a later explicitly authorized
+consumer/UMD tranche must close the missing token ingress before any target
+exercise can evaluate this path.
 Only visible DWM startup on WDDM 3.2 admits the surface; a build, callback count,
 Code 0, counter, map result, or log cannot. F1 permits the measured build-26100
 target; WDK 28000 remains the compile-time header/binding authority.

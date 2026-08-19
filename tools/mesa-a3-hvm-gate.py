@@ -312,8 +312,8 @@ def check_sources(sources: dict[str, str], repo: str) -> list[str]:
 
     require(
         INSTANCE,
-        "vn_CreateInstance",
-        function(sources[INSTANCE], "vn_CreateInstance"),
+        "vn_create_instance_internal",
+        function(sources[INSTANCE], "vn_create_instance_internal"),
         ("vn_object_set_id(instance, 1, VK_OBJECT_TYPE_INSTANCE)", "result = VK_SUCCESS"),
         errors,
     )

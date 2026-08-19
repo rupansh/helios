@@ -970,6 +970,12 @@ run_gate "Mesa A3 HVM1 renderer is escape-free, role-4-unmapped, exact-import, a
 run_gate "Mesa A4 submit is mode-owned, bounded, exact-closure, same-context ordered, and mutation-checked" \
     python3 "$REPO/tools/mesa-a4-submit-gate.py" "$REPO" --mutations
 
+run_gate "Mesa A5 direct dispatch is versioned, direct-owned, provenance-checked, endpoint-exact, and mutation-checked" \
+    python3 "$REPO/tools/mesa-a5-direct-gate.py" "$REPO" --mutations
+
+run_gate "Mesa A6 profile is two-type, no-WSI, bounded, exact-import, A7-withheld, and mutation-checked" \
+    python3 "$REPO/tools/mesa-a6-profile-gate.py" "$REPO" --mutations
+
 run_gate "D4 classic/DMA DIRQL enqueue is capability-restricted and fixed-storage" \
     python3 "$REPO/tools/d4-dirql-gate.py" "$REPO"
 

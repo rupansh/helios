@@ -1983,3 +1983,53 @@ exercised on the target. The installed KMD remains 22.22.296.0 / `oem128.inf`;
 DWM/WARP and zero active DisplayConfig paths remain the last measured runtime
 state. This checkpoint establishes neither display admission, HPS2 retirement,
 nor production correctness.
+
+## F21 — A7 has no outer-allocation-token ingress in the authorized lower-ICD graph.
+
+**Reconciled and stopped 2026-08-20.** Mesa A5 landed at `4ea18b3512f`,
+fail-closed A6 at `d07d1d13687`, and the ordinary review's exact-image handle-
+query fix at `478c71a0fff`. They are source/build validated only. The
+installed ICD and KMD were not replaced or exercised, so the last runtime state
+remains KMD 22.22.296.0 / `oem128.inf`, DWM on WARP, and zero active
+DisplayConfig paths.
+
+The fixed protocol makes the A7 identity boundary explicit.
+`HeliosSealedResourceUseV1.outer_allocation_token` is an opaque nonzero scalar
+assigned by the outer UMD. The ICD may echo and deduplicate it but may not infer
+or interpret it. `protocol/include/helios_translator_dispatch.h` and
+`protocol/src/translator_dispatch.rs` state that it reaches the ICD on the
+DXVK/vkd3d and UMD resource-creation path alongside the deferred frontend
+handles. `HeliosTranslatorDispatchV1` is fixed at 112 bytes: a 24-byte header
+and exactly eleven down-call slots. Those slots cover proc lookup, endpoint/HQA1
+selection, direct context attachment, scope open/seal/copy/close, refusal
+counters, and destruction; none registers an allocation identity.
+
+No current DXVK, vkd3d, UMD, UMD12, or Mesa resource-creation path consumes A5
+and attaches that outer token to a Mesa object. Mesa owns only the exact local
+HVM1 allocation handle and generation. They identify the KMD allocation behind
+the lower ICD; they are not the UMD-assigned outer allocation token, allocation-
+list index, or GPUVA required by the sealed-use and HOB1 contracts.
+
+The live fail-closed call flow is exact:
+
+1. `vn_helios_queue_submit` / `vn_helios_queue_submit2` call
+   `helios_submit1_deferred_use_gate` /
+   `helios_submit2_deferred_use_gate`.
+2. Any command buffer increments `HELIOS_RECORD_REFUSE_DEFERRED_USE` and returns
+   `VK_ERROR_FEATURE_NOT_PRESENT`, because its complete allocation-use and
+   typed-operand closure cannot be named.
+3. Independently, record-only `helios_dispatch_payload` refuses any nonzero
+   `allocation_count`; it explicitly forbids leaking an HVM1 handle or
+   fabricating a token.
+4. `vn_helios_record_scope_seal` can validate and expose immutable uses only
+   after their exact tokens exist. The outer bridge—not Mesa—must resolve each
+   token to the current outer allocation-list index/GPUVA and generation before
+   HOB1 submission.
+
+A generated KMD validator/schema entry cannot create this missing producer-side
+association. Completing A7 therefore requires either the DXVK/vkd3d plus UMD
+resource-creation cutover that this tranche explicitly excluded or a new
+identity carrier/ABI that it explicitly forbade. No KMD/schema change was made.
+Dependency order stops A8/A9 as well. The present-layer B lane, DXVK/vkd3d
+cutover, K1 demolition, HPS2 deletion, packaging/deployment, and target probing
+remain unstarted.
