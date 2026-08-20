@@ -23,6 +23,28 @@ any doc line as a requirement.
 Repo state read at root `d1c820a`, submodule `vkd3d-proton-helios` = `f3918d5e`
 (matches the doc's §1 provenance table, line 85).
 
+**2026-08-21 F21 selected-path implementation checkpoint.** The live consumer/
+submission statements below are superseded for the authorized U3-U11 path.
+vkd3d `9a2716c0` consumes the sole explicit package-owned A5 instance/direct
+GIPA in `helios_entry.c`, preserves generic non-Helios loading, propagates HRA1
+through exact heap/resource allocation, seals command work on its physical
+endpoint, and has no selected-path `vulkan-1` search or second `VkInstance`.
+Root `0fe5677` replaces bridge discovery/drain/sample ownership with direct
+package-checked dispatch; moves the former process-global identity state onto
+the exact UMD12 device/resource graph; assigns bounded monotonic nonreused
+tokens; resolves them to current GPUVA plus checked offset/HWA2 generation;
+owns the bounded C65 pool, HQA1/HQC1 virtual contexts, Core-0116 fence state,
+complete HOB1 and exact 64-byte HOS1; and submits synchronously through the
+owning ECL `pfnSubmitCommandCb` before closing the direct scope from its actual
+result.
+
+The present/HWS removal unit U12 and broad legacy demolition are not part of
+this checkpoint. The selected source/mutation, native, cross, and Windows build
+checks pass; the broader native vkd3d test run encountered the separately
+reported host Vulkan device-loss/hang boundary and is not runtime evidence. No
+UMD/ICD/KMD was installed or target-exercised, and the present-layer B lane
+remains unstarted.
+
 ---
 
 ## 1. Normative sources

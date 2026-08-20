@@ -318,15 +318,40 @@ def check_sources(sources: dict[str, str], repo: str) -> list[str]:
         errors,
     )
     ring_create = function(sources[RING], "vn_ring_create")
-    require(RING, "vn_ring_create", ring_create, (".resourceId = 0", "(void)info"), errors)
-    if "vn_renderer_submit_simple(instance->renderer" in compact(ring_create).split("#else")[-1]:
+    require(
+        RING,
+        "vn_ring_create",
+        ring_create,
+        (
+            "#if DETECT_OS_WINDOWS",
+            "mtx_init(&ring->mutex, mtx_plain)",
+            "(void)layout",
+            "return ring",
+            "#else",
+            "vn_encode_vkCreateRingMESA",
+        ),
+        errors,
+    )
+    windows_ring_create = compact(ring_create).split("#else", 1)[0]
+    if "vn_renderer_submit_simple(instance->renderer" in windows_ring_create:
         errors.append(f"{RING}: Windows local ring seam submits a second CreateRing")
 
-    physical = compact(sources[PHYSICAL])
-    if "external_memory.win32_renderer_handle_type=0" not in physical:
-        errors.append(f"{PHYSICAL}: A3 must not advertise A6 external-memory support")
-    if "external_binary_semaphore_handles=0" not in physical or "external_timeline_semaphore_handles=0" not in physical:
-        errors.append(f"{PHYSICAL}: A3 must not advertise A6 semaphore support")
+    require(
+        PHYSICAL,
+        "normal-loader-only A6 activation",
+        sources[PHYSICAL],
+        (
+            "physical_dev->external_memory.win32_renderer_handle_type =\n"
+            "      vn_physical_device_is_helios_normal_loader(physical_dev)",
+            "physical_dev->external_memory.supported_handle_types =\n"
+            "      vn_physical_device_is_helios_normal_loader(physical_dev)",
+            "physical_dev->external_binary_semaphore_handles = 0",
+            "physical_dev->external_timeline_semaphore_handles = 0",
+            "if (vn_physical_device_is_helios_normal_loader(physical_dev))\n"
+            "      physical_dev->external_timeline_semaphore_handles =",
+        ),
+        errors,
+    )
 
     gate_line = 'python3 "$REPO/tools/mesa-a3-hvm-gate.py" "$REPO" --mutations'
     if sources[RETIREMENT].count(gate_line) != 1:
@@ -366,15 +391,15 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("skip native mapping reserved", MESA, "i < sizeof(open.NativeFenceMapping.Reserved)", "i < 0"),
         Mutation("skip native mapping alignment", MESA, "(current_cpu & (sizeof(uint64_t) - 1))", "false"),
         Mutation("skip fence generation", MESA, "!generation || helios_load_u32", "false || helios_load_u32"),
-        Mutation("accept foreign D3D12 fence", QUEUE, "sem->base.vk.device != &dev->base.vk", "false"),
+        Mutation("accept foreign D3D12 fence", QUEUE, "struct vn_renderer_sync *sync = NULL;\n   if (!sem || sem->base.vk.device != &dev->base.vk", "struct vn_renderer_sync *sync = NULL;\n   if (!sem || false"),
         Mutation("accept binary D3D12 fence", QUEUE, "sem->base.vk.device != &dev->base.vk ||\n       sem->type != VK_SEMAPHORE_TYPE_TIMELINE", "sem->base.vk.device != &dev->base.vk ||\n       false"),
         Mutation("accept temporary D3D12 fence", QUEUE, "pImportSemaphoreWin32HandleInfo->flags != 0", "false"),
         Mutation("store D3D12 fence temporarily", QUEUE, "sem->permanent.win32_sync = sync;\n   sem->payload = &sem->permanent;", "sem->permanent.win32_sync = sync;\n   sem->payload = &sem->temporary;"),
         Mutation("wire raw resource id", MESA, ".pNext = alloc_info->pNext,\n      .resourceId = 0,", ".pNext = alloc_info->pNext,\n      .resourceId = 7,"),
         Mutation("create second host instance", INSTANCE, "result = VK_SUCCESS;\n#else", "result = vn_call_vkCreateInstance(instance->ring.ring, pCreateInfo, NULL, &instance_handle);\n#else"),
-        Mutation("create Windows generic ring", RING, "/* K11 already owns the session namespace.", "vn_renderer_submit_simple(instance->renderer, NULL, 0);\n   /* K11 already owns the session namespace."),
+        Mutation("create Windows generic ring", RING, "(void)is_tls_ring;\n   return ring;\n#else", "(void)is_tls_ring;\n   vn_renderer_submit_simple(instance->renderer, NULL, 0);\n   return ring;\n#else"),
         Mutation("destroy session before bootstrap", MESA, "if (helios->bootstrap) {\n         helios_native_context_destroy(helios->bootstrap);", "if (helios->bootstrap) {\n         helios_translation_session_destroy(helios->session);\n         helios_native_context_destroy(helios->bootstrap);"),
-        Mutation("advertise A6 memory", PHYSICAL, "physical_dev->external_memory.win32_renderer_handle_type = 0;", "physical_dev->external_memory.win32_renderer_handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;"),
+        Mutation("advertise A6 memory to record-only", PHYSICAL, "physical_dev->external_memory.win32_renderer_handle_type =\n      vn_physical_device_is_helios_normal_loader(physical_dev)", "physical_dev->external_memory.win32_renderer_handle_type =\n      true"),
     )
 
 

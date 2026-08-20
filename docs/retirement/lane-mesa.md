@@ -85,6 +85,27 @@ scope consumer/UMD cutover or a forbidden new carrier, so dependency order left
 A8/A9 unstarted. No KMD/schema change, present-layer work, deployment, or target
 exercise occurred. See `FINDINGS.md` F21.
 
+**2026-08-21 bounded F21 unblock and A7-A9 implementation checkpoint.** The
+owner authorized the exact direct DXVK/vkd3d plus UMD creation/submission graph
+that the prior checkpoint correctly identified as missing. Protocol HRA1 now
+carries the opaque token as an immutable package-generation-3 creation/bind
+record without changing the fixed A5 table. DXVK `1cf7e631`, vkd3d `9a2716c0`,
+and root UMD/KMD commits `0fe5677` / `eccfd19` supply and resolve the exact
+identity and actual outer submission before Mesa consumes it.
+
+A7 landed at `ae9c9f4c89d`: control, deferred allocation-backed, and GPU-
+dependent calls have explicit dispositions; command buffers produce complete,
+bounded exact-token use and typed-operand tables; host-resource bytes stay zero
+on the wire; lifetime, device, generation, bounds, completeness, and opcode
+failures remain named refusals. The presentable-image tag and exact
+`PRESENT_SRC_KHR` / `QUEUE_FAMILY_EXTERNAL` validation are complete without
+wiring the layer. A8/A9 landed at `fa61439bfd7`: selected Windows generic-ring
+operations, shared head/tail state, and watchdogs are unreachable; reply work is
+encoded in exact HNR2 COMMIT; non-Windows Venus remains generic; and the Windows
+lower ICD uses WSI headers without linking/compiling the full WSI backend. The
+present-layer B lane is the stop-boundary handoff. This is source/build evidence
+only: no ICD/KMD was installed or target-exercised.
+
 Reconnaissance brief. No implementation code was written. Every line/symbol
 reference below was re-verified against the working tree at
 `icd/mesa` commit `8559b66299a8f91fcde30edfdd23310195cc7ca6` — the same commit
@@ -250,9 +271,9 @@ partial and F8 reverses its fence direction.
 | **A4 ✅** | Record-only submit + normal submit: `vn_QueueSubmit`/`_2`/`vn_QueueBindSparse` become mode-dispatched; record-only seals an immutable batch (version, session/endpoint/context generations, context-local batch id, length, CRC, complete use table) and returns it synchronously — **no** KMT queue-work call; normal mode drives A2's HNR2 path and places imported-native-fence wait/signal around it; queue entry points without a live outer scope are refused; `vn_QueueWaitIdle`/`vkDeviceWaitIdle`/teardown use the C51 joins. | `vn_helios_record_submit.{c,h}`, `vn_queue.c`, `vn_queue.h` | A2, A3, K9, F20's authorized KMD continuation | XL; landed `5cbc0254f43` |
 | **A5 ✅** | Private direct dispatch: the single exported entry point that hands DXVK/vkd3d a versioned function table (package-generation-checked); the non-forgeable record-only instance tag; provenance rejection of any proc whose owning module is the loader or the layer; endpoint descriptor export for HQA1. | `vn_helios_direct_dispatch.{c,h}`, `vn_icd.c`, `vn_icd.h` | A1, A4 | M; landed `4ea18b3512f` |
 | **A6 ✅ (capability withheld)** | Physical-device / instance profile: stop advertising `KHR_win32_surface` + `KHR_swapchain*` on Windows; implement exact `D3D12_RESOURCE_BIT`/`D3D12_FENCE_BIT` IMPORTABLE + DEDICATED_ONLY answers but leave them unadvertised until A7; two memory types over one HLM1 heap; normal-loader limit clamps (≤4096 closure / ≤8192 operands); leave `emulate_second_queue` unused. | `vn_physical_device.{c,h}`, `vn_instance.{c,h}`, `vn_wsi.{c,h}` | A3 | L; landed `d07d1d13687`, review fix `478c71a0fff` |
-| **A7 ⛔ F21** | C60 classifier across the object files: pure-control calls on HVC1, allocation-backed calls become deferred records consumed by the first outer batch that names the allocation, GPU-dependent calls do the HQC1 join first. Includes the presentable-image tag call + `PRESENT_SRC_KHR`/`QUEUE_FAMILY_EXTERNAL` validation for tagged images. | `vn_device.{c,h}`, `vn_buffer.{c,h}`, `vn_image.{c,h}`, `vn_pipeline.{c,h}`, `vn_query_pool.{c,h}` | A1, A4, and the not-yet-authorized DXVK/vkd3d/UMD outer-token ingress | Blocked; not started |
-| **A8** | Ring retirement: remove `vkCreateRingMESA`/`vkNotifyRingMESA`/`vkWaitRingSeqnoMESA`/`vkWaitVirtqueueSeqnoMESA`/shared head-tail/spin-sleep watchdogs from the Windows path; `SetReplyCommandStreamMESA` + `GENERATE_REPLY` move into HNR2 COMMIT. | `vn_ring.c`, `vn_ring.h` | A1, A2 | M |
-| **A9** | Build wiring for sub-lane (a): add the four `vn_helios_*.c`, drop `setupapi`. | `src/virtio/vulkan/meson.build` | A1–A8 | S |
+| **A7 ✅** | C60 classifier across the object files: pure-control calls on HVC1, allocation-backed calls become deferred records consumed by the first outer batch that names the allocation, GPU-dependent calls do the HQC1 join first. Includes the presentable-image tag call + `PRESENT_SRC_KHR`/`QUEUE_FAMILY_EXTERNAL` validation for tagged images. | `vn_device.{c,h}`, `vn_buffer.{c,h}`, `vn_image.{c,h}`, `vn_command_buffer.{c,h}`, `vn_descriptor_set.{c,h}`, `vn_query_pool.{c,h}`, `vn_device_memory.{c,h}`, `vn_helios_record_submit.{c,h}` | A1, A4, and the landed DXVK/vkd3d/UMD HRA1 outer-token graph | XL; landed `ae9c9f4c89d`, source/build only |
+| **A8 ✅** | Ring retirement: make `vkCreateRingMESA`/`vkNotifyRingMESA`/`vkWaitRingSeqnoMESA`/`vkWaitVirtqueueSeqnoMESA`/shared head-tail/spin-sleep watchdogs unreachable from the Windows path; move `SetReplyCommandStreamMESA` + `GENERATE_REPLY` into exact HNR2 COMMIT while preserving generic non-Windows Venus. | `vn_ring.c`, `vn_ring.h`, `vn_helios_translation_session.{c,h}` | A1, A2 | M; landed `fa61439bfd7`, source/build only |
+| **A9 ✅** | Lower-ICD build wiring: retain WSI declarations through the header-only dependency on Windows, omit `vn_wsi.c` and the full WSI archive there, and do not wire the present layer. | `src/virtio/vulkan/meson.build` | A1–A8 | S; landed `fa61439bfd7`, source/build only |
 
 **Serialization notes for (a).** `vn_renderer_helios.c` (A3) and `vn_queue.c`
 (A4) are each single-owner by construction — do not let A2 edit either; A2

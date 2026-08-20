@@ -1984,9 +1984,9 @@ DWM/WARP and zero active DisplayConfig paths remain the last measured runtime
 state. This checkpoint establishes neither display admission, HPS2 retirement,
 nor production correctness.
 
-## F21 — A7 has no outer-allocation-token ingress in the authorized lower-ICD graph.
+## F21 — The lower-ICD A7 stop was the missing direct outer-token producer graph; the bounded graph is now landed.
 
-**Reconciled and stopped 2026-08-20.** Mesa A5 landed at `4ea18b3512f`,
+**Original reconciliation and stop, 2026-08-20.** Mesa A5 landed at `4ea18b3512f`,
 fail-closed A6 at `d07d1d13687`, and the ordinary review's exact-image handle-
 query fix at `478c71a0fff`. They are source/build validated only. The
 installed ICD and KMD were not replaced or exercised, so the last runtime state
@@ -2033,3 +2033,100 @@ identity carrier/ABI that it explicitly forbade. No KMD/schema change was made.
 Dependency order stops A8/A9 as well. The present-layer B lane, DXVK/vkd3d
 cutover, K1 demolition, HPS2 deletion, packaging/deployment, and target probing
 remain unstarted.
+
+**Resolved in source under bounded owner authorization, 2026-08-21.** The
+producer-side identity was not a KMD-schema problem, and it was not repaired by
+substituting Mesa's HVM1 identity. Protocol commit `eec9564` advances package
+generation to 3 and declares HRA1 once in Rust plus its C mirror: a 72-byte,
+immutable, process-local resource creation/bind association containing the
+direct device generation, opaque nonzero outer token, allocation byte bound,
+and optional direct CPU-view fact. It contains no host resid, WDDM handle,
+allocation-list index, GPUVA, allocation generation, session capability,
+resource ID, PID/name, or pointer used as identity. The A5 dispatch ABI remains
+112 bytes with exactly eleven slots and no registration function.
+
+DXVK `1cf7e631` and vkd3d `9a2716c0` now accept the exact package-owned module/
+table construction edge, consume the sole A5 instance and direct GIPA, and carry
+HRA1 through each resource allocation to the exact Mesa memory object. Generic
+non-Helios construction retains its normal loader path; the selected Helios
+paths do not enumerate modules, search `vulkan-1`, or create a second instance.
+Mesa rejects missing, zero, duplicate, foreign-device, stale-generation,
+overflowing, or out-of-range associations and removes each association before
+allocation storage is reusable.
+
+Root `0fe5677` owns the other half. Each D3D11/D3D12 device assigns monotonically
+increasing, nonreused tokens in a bounded device-owned allocation set and tears
+the reverse association down directly. D3D11 resolves each sealed token to the
+exact allocation-list entry selected for that Render window, writes the current
+HWA2 allocation generation, and refuses nonzero `byte_offset`. D3D12 resolves
+the token to the exact current allocation GPUVA plus checked byte offset and
+current HWA2 generation. Its old process-global `OnceLock`/`HashMap` identity
+owner is gone. Neither side uses an engine pointer, KMT/NT handle, local HVM1
+handle, Vulkan memory object, host resource ID, or fallback key as the token.
+
+The same root commit consumes the A5 endpoint descriptors, creates HQA1 before
+the runtime context callback, preserves bootstrap endpoint 1 and monotonic
+nonreused real endpoints, and owns direct HQC1 scope lifetime. D3D11 assembles
+complete HOB1 in the runtime-approved Render command/allocation windows. D3D12
+uses its bounded GPUVA allocation state, emits complete HOB1 plus exactly 64
+HOS1 bytes, and calls the owning ECL `pfnSubmitCommandCb` synchronously. Both
+write `address_or_index`, `expected_allocation_generation`, and `identity_kind`
+field by field; wire host-resource operand bytes remain zero. A scope becomes
+COMMITTED only after the actual runtime callback accepts the batch and the
+exact-context signal value is known. Failure closes it abandoned.
+
+After that complete consumer closure existed, the generated payload inventory
+proved a minimum KMD admission update was required. Root `eccfd19` generates and
+validates only the needed A7 Venus opcode/typed-operand subset over existing
+HNR2, retains immutable bounded custody on the exact session/endpoint/context,
+patches only a KMD-private copy from live allocation objects, and feeds only the
+actual terminal host result through K9. It introduces no new executor class,
+wire field, host/QEMU/virglrenderer operation, compatibility carrier, synthetic
+completion, polling, or independent timeline.
+
+The corrective aggregate gate pass then exposed one real K4 defect in the first
+HOC1 integration: OpenAllocation had attempted to repair an input generation.
+Root `d75f649` removes that write. HOC1 obtains its exact KMD command-pool
+snapshot only through the already-admitted WDDM 3.2 shared-backing callback,
+retains a write-combined alias on the exact allocation object, and keeps
+OpenAllocation const-only. The shared pointer is never an identity or lookup
+key.
+
+Mesa A7 `ae9c9f4c89d` completes the C60 classifier. Pure control uses the owned
+HVC1 path; allocation-backed calls become immutable deferred records consumed
+by the first exact outer batch naming all allocations; GPU-dependent calls join
+the exact context first. Command buffers now produce bounded complete sealed-use
+and typed-operand tables, including descriptor, buffer, image, query, and memory
+lifetime/range closure. Unsupported opcode, incomplete closure, overflow,
+foreign device, stale generation, and unclassified object remain named
+refusals. The presentable-image tag and exact `PRESENT_SRC_KHR` /
+`QUEUE_FAMILY_EXTERNAL` checks are complete, but the present layer remains
+unwired.
+
+Mesa A8/A9 `fa61439bfd7` makes `vkCreateRingMESA`, `vkNotifyRingMESA`, the ring/
+virtqueue wait operations, shared head/tail state, and spin/sleep watchdogs
+unreachable in the selected Windows backend. Reply stream setup and generation
+are part of exact HNR2 COMMIT; ring zero remains finite and control-only; generic
+non-Windows Venus is unchanged. The lower-ICD build is wired once and dependencies
+used only by the retired Windows backend are removed. No present-layer source is
+wired or activated.
+
+Protocol/parity, KMD logic/integration, generated schema, direct-consumer,
+token/lifetime, A7 classifier, A8/A9 ring-unreachability, source/mutation,
+native, cross, and Windows compilation checks are source/build evidence only.
+The corrective serial retirement suite passed completely. Windows KMD
+compilation retained the exact 13-warning baseline and WDK binding SHA-256
+`148B75DB41E093DC6783BE4F5BB3EA84B2C7C39EF316FE711B3F2A5A0668BEA2`;
+the final Windows lower ICD was 49,244,922 bytes with SHA-256
+`5AA0C1F43691B56D82CEC0B703B7D557054A71BF33C96746FE1DE9F72466F885`,
+exactly four exports, and no forbidden loader or D3D/DXGI/DComp dependency.
+Neither new KMD nor ICD was installed, no adapter was restarted, and no target
+runtime probe was run. The last measured target therefore remains KMD
+22.22.296.0 / `oem128.inf`, DWM on WARP, and zero active DisplayConfig paths.
+The present-layer B lane is the exact handoff; broad HPS2 demolition and every
+later unit remain outside this tranche.
+
+**THE ESCAPE-FREE MESA A5-A9 LOWER-ICD CUTOVER LANDED AND PASSED SOURCE/BUILD
+VALIDATION ONLY; IT WAS NOT INSTALLED OR EXERCISED ON THE TARGET, THE WDDM 3.2
+DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED, AND THE PRESENT-LAYER CUTOVER, HPS2
+RETIREMENT, AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**

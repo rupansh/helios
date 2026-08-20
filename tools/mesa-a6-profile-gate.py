@@ -324,13 +324,49 @@ def check_sources(sources: dict[str, str]) -> list[str]:
     )
 
     external_memory_init = function(physical, "vn_physical_device_init_external_memory")
-    require(PHYSICAL, "A7 memory activation boundary", external_memory_init, ("physical_dev->external_memory.supported_handle_types = 0",), errors)
-    if "supported_handle_types=VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT" in compact(external_memory_init):
-        errors.append(f"{PHYSICAL}: A6 memory capability activated before A7 closure")
+    require(
+        PHYSICAL,
+        "A7 memory activation boundary",
+        external_memory_init,
+        (
+            "physical_dev->external_memory.win32_renderer_handle_type =\n"
+            "      vn_physical_device_is_helios_normal_loader(physical_dev)\n"
+            "         ? physical_dev->external_memory.renderer_handle_type\n"
+            "         : 0",
+            "physical_dev->external_memory.supported_handle_types =\n"
+            "      vn_physical_device_is_helios_normal_loader(physical_dev)\n"
+            "         ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT\n"
+            "         : 0",
+        ),
+        errors,
+    )
     external_semaphore_init = function(physical, "vn_physical_device_init_external_semaphore_handles")
-    require(PHYSICAL, "A7 semaphore activation boundary", external_semaphore_init, ("physical_dev->external_timeline_semaphore_handles = 0",), errors)
-    if "external_timeline_semaphore_handles=VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT" in compact(external_semaphore_init):
-        errors.append(f"{PHYSICAL}: A6 semaphore capability activated before A7 closure")
+    require_order(
+        PHYSICAL,
+        "A7 semaphore activation boundary",
+        external_semaphore_init,
+        (
+            "physical_dev->external_timeline_semaphore_handles = 0",
+            "if (vn_physical_device_is_helios_normal_loader(physical_dev))",
+            "physical_dev->external_timeline_semaphore_handles =\n"
+            "         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT",
+        ),
+        errors,
+    )
+    require(
+        PHYSICAL,
+        "normal-loader native capability publication",
+        native_exts,
+        (
+            "exts->KHR_external_memory_win32 =\n"
+            "      physical_dev->external_memory.supported_handle_types ==\n"
+            "      VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT",
+            "exts->KHR_external_semaphore_win32 =\n"
+            "      physical_dev->external_timeline_semaphore_handles ==\n"
+            "      VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT",
+        ),
+        errors,
+    )
 
     feature_profile = function(physical, "vn_physical_device_apply_helios_normal_feature_profile")
     require(
@@ -399,8 +435,10 @@ def mutation_cases() -> tuple[Mutation, ...]:
     return (
         Mutation("restore win32 surface", INSTANCE, ".EXT_headless_surface = true,", ".KHR_win32_surface = true,"),
         Mutation("restore Windows WSI init", PHYSICAL, "#if DETECT_OS_WINDOWS\n   /* A6 removes the lower Windows present path.", "#if 0\n   /* A6 removes the lower Windows present path."),
-        Mutation("activate D3D memory early", PHYSICAL, "physical_dev->external_memory.supported_handle_types = 0;", "physical_dev->external_memory.supported_handle_types = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;"),
-        Mutation("activate D3D fence early", PHYSICAL, "/* The exact HNF1 D3D12_FENCE import is implemented, but is part of the same\n    * A7 activation boundary as D3D12_RESOURCE.  Do not expose a partial lower\n    * profile merely because the renderer supports timeline semaphores. */\n   physical_dev->external_timeline_semaphore_handles = 0;", "physical_dev->external_timeline_semaphore_handles = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;"),
+        Mutation("expose D3D memory to record-only", PHYSICAL, "vn_physical_device_is_helios_normal_loader(physical_dev)\n         ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT", "true\n         ? VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT"),
+        Mutation("expose renderer handle to record-only", PHYSICAL, "vn_physical_device_is_helios_normal_loader(physical_dev)\n         ? physical_dev->external_memory.renderer_handle_type", "true\n         ? physical_dev->external_memory.renderer_handle_type"),
+        Mutation("expose D3D fence to record-only", PHYSICAL, "if (vn_physical_device_is_helios_normal_loader(physical_dev))\n      physical_dev->external_timeline_semaphore_handles", "if (true)\n      physical_dev->external_timeline_semaphore_handles"),
+        Mutation("weaken native memory publication", PHYSICAL, "supported_handle_types ==\n      VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT", "supported_handle_types != 0"),
         Mutation("add third memory type", PHYSICAL_H, "VN_HELIOS_MEMORY_TYPE_COUNT        2u", "VN_HELIOS_MEMORY_TYPE_COUNT        3u"),
         Mutation("cache guest host memory", PHYSICAL, "VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,", "VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,"),
         Mutation("replace HLM1 size query", SESSION, "query.Type = KMTQAITYPE_GETSEGMENTGROUPSIZE;", "query.Type = KMTQAITYPE_GETSEGMENTSIZE;"),
@@ -452,7 +490,7 @@ def main() -> None:
         raise SystemExit("Mesa A6 profile gate violated:\n" + "\n".join(errors))
     if "--mutations" in sys.argv[1:]:
         run_mutations(sources)
-    print("OK: Mesa A6 is two-type, no-WSI, bounded, exact-import, and A7-withheld")
+    print("OK: Mesa A6 is two-type, no-WSI, bounded, exact-import, and A7-activated only for the normal loader")
 
 
 if __name__ == "__main__":

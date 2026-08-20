@@ -259,9 +259,13 @@ def check_sources(sources: dict[str, str]) -> list[str]:
             "scope->context->owner != owner || scope->context->queue != queue",
             "if (scope->payload_bytes)",
             "HELIOS_TRANSLATOR_STATUS_BATCH_BOUND_EXCEEDED",
-            "HELIOS_HOB1_HEADER_BYTES + scope->payload_bytes + payload_bytes",
-            "HELIOS_HOB1_MAX_BYTES",
-            "memcpy(scope->payload + scope->payload_bytes",
+            "HELIOS_HOB1_HEADER_BYTES + total_payload",
+            "if (assembled > HELIOS_HOB1_MAX_BYTES",
+            "helios_scope_reserve_payload(scope, total_payload)",
+            "memcpy(scope->payload + write_offset, record->payload",
+            "memcpy(scope->payload + write_offset, buffer->base",
+            "memcpy(scope->payload + write_offset, payload",
+            "scope->payload_bytes = total_payload",
         ),
         errors,
     )
@@ -310,10 +314,9 @@ def check_sources(sources: dict[str, str]) -> list[str]:
         ("owner->mode != VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY", "helios_current_scope(owner)", "helios_scope_on_calling_thread(scope)", "scope->context->queue != queue"),
         errors,
     )
-    deferred1 = function(a4, "helios_submit1_deferred_use_gate")
-    deferred2 = function(a4, "helios_submit2_deferred_use_gate")
-    require(A4, "helios_submit1_deferred_use_gate", deferred1, ("commandBufferCount", "HELIOS_RECORD_REFUSE_DEFERRED_USE", "VK_ERROR_FEATURE_NOT_PRESENT"), errors)
-    require(A4, "helios_submit2_deferred_use_gate", deferred2, ("commandBufferInfoCount", "HELIOS_RECORD_REFUSE_DEFERRED_USE", "VK_ERROR_FEATURE_NOT_PRESENT"), errors)
+    if "helios_submit1_deferred_use_gate" in a4 or \
+       "helios_submit2_deferred_use_gate" in a4:
+        errors.append(f"{A4}: the pre-A7 command-buffer refusal remains live")
 
     sparse = function(a4, "helios_sparse_add_memory")
     require(
@@ -374,7 +377,6 @@ def check_sources(sources: dict[str, str]) -> list[str]:
     for public, refusal, sizeof_call in (
         ("vn_helios_queue_submit", "HELIOS_RECORD_REFUSE_QUEUE_SUBMIT", "vn_sizeof_vkQueueSubmit"),
         ("vn_helios_queue_submit2", "HELIOS_RECORD_REFUSE_QUEUE_SUBMIT2", "vn_sizeof_vkQueueSubmit2"),
-        ("vn_helios_queue_bind_sparse", "HELIOS_RECORD_REFUSE_QUEUE_BIND_SPARSE", "vn_sizeof_vkQueueBindSparse"),
     ):
         body = function(a4, public)
         require(
@@ -396,6 +398,25 @@ def check_sources(sources: dict[str, str]) -> list[str]:
             ),
             errors,
         )
+    require(
+        A4,
+        "vn_helios_queue_bind_sparse",
+        function(a4, "vn_helios_queue_bind_sparse"),
+        (
+            "helios_record_entry_gate",
+            "HELIOS_RECORD_REFUSE_QUEUE_BIND_SPARSE",
+            "vn_sizeof_vkQueueBindSparse",
+            "bounded_payload",
+            "HELIOS_HNR2_MAX_PAYLOAD_BYTES",
+            "VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY",
+            "HELIOS_RECORD_REFUSE_DEFERRED_USE",
+            "VK_ERROR_FEATURE_NOT_PRESENT",
+            "VN_HELIOS_SUBMISSION_MODE_NORMAL",
+            "total_payload_bytes",
+            "helios_dispatch_payload",
+        ),
+        errors,
+    )
 
     native_submit = function(sources[NATIVE], "helios_native_context_submit_ordered")
     require(
@@ -525,15 +546,13 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("reuse batch ID", A4, "scope->batch_id = ++context->next_batch_id;", "scope->batch_id = 1;"),
         Mutation("wrap batch ID", A4, "if (context->next_batch_id == UINT64_MAX) {", "if (false) {"),
         Mutation("free TLS-live scope", A4, "if (tss_set(owner->scope_key, NULL) != thrd_success)", "if (false)"),
-        Mutation("drop command-buffer refusal", A4, "if (submits[i].commandBufferCount) {", "if (false) {"),
-        Mutation("drop submit2 command-buffer refusal", A4, "if (submits[i].commandBufferInfoCount) {", "if (false) {"),
         Mutation("drop sparse generation", A4, ".expected_generation = mem->base_bo->allocation_generation,", ".expected_generation = 1,"),
         Mutation("allow foreign sparse memory", A4, "helios_object_owned(&mem->base.vk.base, dev)", "true"),
-        Mutation("allow foreign semaphore", A4, "helios_object_owned(&sem->base.vk, dev)", "true"),
-        Mutation("allow foreign fence", A4, "helios_object_owned(&fence->base.vk, dev)", "true"),
+        Mutation("allow foreign semaphore", A4, "struct vn_semaphore *sem = vn_semaphore_from_handle(handle);\n   if (!sem || !helios_object_owned(&sem->base.vk, dev))", "struct vn_semaphore *sem = vn_semaphore_from_handle(handle);\n   if (!sem || !true)"),
+        Mutation("allow foreign fence", A4, "if (fence && helios_object_owned(&fence->base.vk, dev))", "if (fence && true)"),
         Mutation("truncate sparse uses", A4, "copy->allocation_count >= HELIOS_HNR2_MAX_USE_RECORDS", "false"),
         Mutation("invent patch table", A4, ".patches = NULL,", ".patches = (void *)payload,"),
-        Mutation("submit record-only through KMT", A4, "return helios_record_append(queue, refusal, payload, payload_bytes);", "return helios_native_context_submit_ordered(queue->helios_native_context, NULL, 0, NULL, NULL, 0, false, NULL, NULL);"),
+        Mutation("submit record-only through KMT", A4, "return helios_record_append(queue, refusal, payload, payload_bytes,\n                                  NULL, 0, NULL, false);", "return helios_native_context_submit_ordered(queue->helios_native_context, NULL, 0, NULL, NULL, 0, false, NULL, NULL);"),
         Mutation("drop outstanding bound", NATIVE, "c->enqueued - c->completed >=\n             HELIOS_HNR2_MAX_OUTSTANDING_SUBMISSIONS", "false"),
         Mutation("wrap HNR2 batch token", NATIVE, "if (c->next_batch_token == UINT64_MAX) {", "if (false) {"),
         Mutation("wrap progress value", NATIVE, "if (c->enqueued == UINT64_MAX)", "if (false)"),

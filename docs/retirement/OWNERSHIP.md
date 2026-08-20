@@ -149,6 +149,35 @@ consumer/UMD cutover, a new ABI or compatibility carrier, and heuristic/global
 identity, so A7 stopped without a KMD/schema change and A8/A9 were not started.
 The present-layer B lane remains unowned by this tranche.
 
+**Bounded F21 unblock authorization and landed ownership, 2026-08-21.** The
+owner explicitly superseded only the lower-ICD boundary above and authorized
+the exact DXVK/vkd3d plus UMD11/UMD12 consumer graph needed to produce, carry,
+and resolve the outer allocation token, followed by Mesa A7-A9. Protocol remains
+the sole owner of the shared ABI: root `eec9564` advances package generation to
+3 and declares the immutable 72-byte HRA1 creation/bind record once with its C
+mirror, while `ccd2891` centralizes HNF1 and the UMD adapter query record. The
+fixed 112-byte/eleven-slot A5 table does not change.
+
+DXVK commit `1cf7e631` and vkd3d commit `9a2716c0` own only their explicit direct
+construction and exact resource-propagation seams. Root `0fe5677` owns the
+package/module publication, device-bounded monotonic token sets, exact WDDM
+resource association and reverse teardown, token-to-allocation-list/GPUVA
+resolution, HQA1/HQC1 outer-context lifetime, and actual HOB1/HOS1 runtime
+submission. Mesa owns only HRA1 validation/storage on the exact lower allocation,
+C60 closure/classification, Windows ring retirement, and lower-ICD build wiring
+at `ae9c9f4c89d` and `fa61439bfd7`. KMD core owns only the generated A7 schema
+admission, private-copy patching, existing-endpoint execution, K9 terminal
+handoff at root `eccfd19`, and the K4 const-open/shared-backing correction at
+`d75f649`.
+
+No owner in that graph may substitute a pointer, HVM1/KMT/NT handle, GPUVA,
+resource ID, PID/name, or process-global table for the token. HRA1 is an
+immutable part of direct creation/bind, not a callable registration service or
+compatibility carrier. Reverse teardown remains with the exact device/resource
+owner. The present-layer B lane, K1/K8/K10, broad HPS2 demolition, packaging,
+deployment, and target runtime work remain unowned by this tranche. Its stop
+boundary is the present-layer handoff after A9.
+
 ## 4. Orchestrator decision: the private direct-dispatch ABI has one home
 
 Three lanes independently reported this as unspecified (mesa A3, dxvk 6.14,
@@ -169,9 +198,11 @@ the standing directive that shared private data has one declaration there:
 - `protocol/include/helios_translator_dispatch.h` — its mechanical C mirror,
   with `_Static_assert` twins, for Mesa, DXVK and vkd3d.
 
-Mesa **implements** it; DXVK, vkd3d, `umd/bridge` and `umd12/bridge`
-**consume** it. No consumer may declare its own copy of the table, the entry
-point name, or the mode constant.
+Mesa **implements** it. The explicit package-owned UMD construction edge obtains
+the exact module/table once and supplies it to DXVK or vkd3d; those engines
+consume it without loader/module search or a second `VkInstance`. The removed
+bridge-anchor discovery surface is not an alternative owner. No consumer may
+declare its own copy of the table, entry-point name, mode constant, or HRA1.
 
 ## 5. Submodule pointer bumps
 

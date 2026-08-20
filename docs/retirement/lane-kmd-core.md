@@ -268,6 +268,34 @@ HTS1/HNR2 15/15, and K2a 52/52 evidence therefore does not validate this
 executor. Mesa A3/A4 subsequently landed source/build-only; A5-A9 and the
 present layer are the stop-boundary handoff.
 
+**2026-08-21 minimum generated A7 admission checkpoint.** Only after the
+authorized direct consumer/UMD graph supplied exact outer tokens and complete
+payload/operand closure did the generated inventory prove additional admission
+necessary. Root `eccfd19` extends the existing K6/K11/post-K9 owner rather than
+creating a new executor: the generator emits the exact A7 Venus opcode and
+typed-operand subset; immutable custody remains bounded by the direct session,
+endpoint, context, allocation generations, and rundown; HOB1/HOS1 physical
+submission uses the existing WDDM callback path; all wire host-resource operand
+bytes remain zero; and only a KMD-private copy receives live allocation-object
+patches before actual stock-Venus execution and terminal K9 completion.
+
+The change adds no DDI, HNR2/HOB1/HOS1 field, host protocol, QEMU/
+virglrenderer operation, HPM1 dependency, allocation registry, independent
+timeline, polling, synthetic completion, or resource-ID fallback. It is not K8
+or K10 and does not broaden K1 demolition. KMD logic/integration, generated
+schema/mutation, HNR2, binding-lock, and Windows baseline checks are source/build
+evidence only. The installed target remains 22.22.296.0 / `oem128.inf`; no
+installation, restart, reboot, or runtime probe occurred. Mesa A7-A9 subsequently
+landed source/build-only, and the present layer is now the exact handoff.
+
+Corrective aggregate review landed root `d75f649`: HOC1's exact command-pool
+snapshot now uses the existing WDDM 3.2 shared-backing callback and a
+cache-consistent write-combined KMD alias, while OpenAllocation remains a pure
+read as required by K4 §8.5. The alias is stored only on the exact allocation
+object and is never identity. The serial retirement suite, 545 KMD logic tests
+plus both integrations, exact 13-warning Windows KMD build, and byte-identical
+WDK binding hash pass; this remains source/build evidence only.
+
 **Serialization notes.**
 
 * K0 and K1 both touch `src/ddi/mod.rs` and `src/lib.rs` — K0 first, then K1

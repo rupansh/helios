@@ -20,6 +20,26 @@ before treating any doc line as a requirement.
 Scope: `dxvk-helios/src/**` (sub-lane A) and `umd/**` + `umd_common/**`
 (sub-lane B). No implementation code was written for this brief.
 
+**2026-08-21 F21 selected-path implementation checkpoint.** This reconnaissance
+inventory remains useful history, but its live-path statements are superseded
+for the authorized A3-A6/B2-B6 consumer subset. DXVK `1cf7e631` consumes the
+sole explicit package-owned A5 instance/direct GIPA without module enumeration,
+`vulkan-1` search, or a second `VkInstance`; preserves generic non-Helios loader
+construction; propagates protocol HRA1 through exact buffer/image allocation;
+seals record-only queue work; and returns exact allocation closure to the outer
+bridge. Root `0fe5677` removes the loaded-module/export anchor from that selected
+path, owns a bounded per-device monotonic token set and reverse teardown, maps
+each sealed token to the exact current Render allocation-list entry and HWA2
+generation, rejects nonzero byte offsets, builds HQA1 before context creation,
+and writes complete HOB1 into the runtime-approved Render windows before closing
+the direct scope from the actual callback result.
+
+This checkpoint does not declare the whole lane complete: D3D11On12 A7, the
+MPO/Direct-Flip B7/B8 work, unrelated legacy demolition, and the present layer
+remain outside the F21 tranche. The selected source/mutation and Windows builds
+pass, but no UMD/ICD/KMD was installed or target-exercised; no display-admission
+or production-correctness claim follows.
+
 All line numbers below were re-derived from the working tree on 2026-08-09 at
 root commit `d1c820a` / dxvk-helios `0c71456`, i.e. the commits section 1 of the
 reference pins. Where the reference and the tree disagree, that is called out in

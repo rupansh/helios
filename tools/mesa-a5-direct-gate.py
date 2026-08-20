@@ -338,7 +338,7 @@ def check_sources(sources: dict[str, str]) -> list[str]:
         "helios_direct_destroy_instance",
         destroy,
         (
-            "if (direct->contexts || direct->context_count || direct->endpoint_count)",
+            "if (direct->context_count || direct->endpoint_count)",
             "direct->destroying = true",
             "instance->helios_direct = NULL",
             "direct->instance = NULL",
@@ -409,7 +409,7 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("select normal direct mode", INSTANCE, "vn_helios_submit_instance_set_record_only(instance)", "VK_SUCCESS"),
         Mutation("publish normal mode", DIRECT, "out_instance->submission_mode = HELIOS_TRANSLATOR_SUBMISSION_MODE_RECORD_ONLY;", "out_instance->submission_mode = HELIOS_TRANSLATOR_SUBMISSION_MODE_NORMAL;"),
         Mutation("drop final dispatch validation", DIRECT, "checked = helios_translator_check_dispatch(\n         out_instance->dispatch, HELIOS_PACKAGE_GENERATION);", "checked = HELIOS_TRANSLATOR_STATUS_OK;"),
-        Mutation("destroy live contexts", DIRECT, "if (direct->contexts || direct->context_count || direct->endpoint_count)", "if (false)"),
+        Mutation("destroy live contexts", DIRECT, "if (direct->context_count || direct->endpoint_count)", "if (false)"),
         Mutation("skip queue registration", RECORD, "vn_helios_direct_register_queue(", "helios_skip_queue_registration("),
         Mutation("skip queue unregister", RECORD, "vn_helios_direct_unregister_queue(dev->instance, queue);", "(void)queue;"),
     )
