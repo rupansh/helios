@@ -98,11 +98,15 @@ run_gate "protocol C mirrors compile (all _Static_asserts evaluated)" \
     bash -c 'printf "%s\n" \
         "#include \"helios_diagnostics.h\"" \
         "#include \"helios_native_render.h\"" \
+        "#include \"helios_resource_association.h\"" \
         "#include \"helios_translation_session.h\"" \
         "#include \"helios_translator_dispatch.h\"" \
         "#include \"helios_wddm.h\"" \
         "int main(void){return 0;}" \
       | gcc -I '"$REPO"'/protocol/include -fsyntax-only -x c - && echo "all mirrors compile"'
+
+run_gate "HRA1 resource association is immutable, package-versioned, and mutation-closed" \
+    python3 "$REPO/tools/resource-association-gate.py" "$REPO" --mutations
 
 # ── kmd_render: the KMD's testable pure logic (kmd_render itself is a
 # panic=abort no_std cdylib and cannot host a libtest harness).

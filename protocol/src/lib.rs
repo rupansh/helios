@@ -88,6 +88,7 @@ pub mod features;
 pub mod ioctl;
 pub mod native_render;
 pub mod physical_memory;
+pub mod resource_association;
 pub mod translation_session;
 pub mod translator_dispatch;
 pub mod virtio_gpu;
@@ -100,6 +101,7 @@ pub use features::*;
 pub use ioctl::*;
 pub use native_render::*;
 pub use physical_memory::*;
+pub use resource_association::*;
 pub use translation_session::*;
 pub use translator_dispatch::*;
 pub use virtio_gpu::*;
@@ -152,9 +154,9 @@ pub const HELIOS_PACKAGE_GENERATION_TAG: u32 = 0x4845_4C49;
 /// The monotonically increasing ordinal in the low 32 bits of
 /// [`HELIOS_PACKAGE_GENERATION`].
 ///
-/// `1` was the first HPS2-retirement generation. `2` retains that contract but
-/// changes the role-1 reply pool from 64 MiB to 4 MiB, split into four 1-MiB
-/// slots. These are the generations in which
+/// `1` was the first HPS2-retirement generation. `2` changed the role-1 reply
+/// pool to four 1-MiB slots. `3` adds the immutable, process-local allocation
+/// association used by the direct translator creation graph. These are the
 /// `helios_present_sync_v2.bin` is neither published nor read, HWA2/HOB1/HOS1/
 /// HOC1/HQA1/HTS1/HVC1/HNR2/HVM1/HVR1 are the complete guest ABI, and the
 /// `escape`/`ioctl` verbs are retired. Bump it for **any** change to any record
@@ -182,7 +184,7 @@ pub const HELIOS_PACKAGE_GENERATION_TAG: u32 = 0x4845_4C49;
 /// For everything after the first two bullets, this constant appearing in a
 /// header is a contract binding a future implementer, not traffic anybody
 /// sends. Each module's banner names the unit that will produce it.
-pub const HELIOS_PACKAGE_GENERATION_ORDINAL: u32 = 2;
+pub const HELIOS_PACKAGE_GENERATION_ORDINAL: u32 = 3;
 
 /// The exact atomic package generation.
 ///
@@ -301,6 +303,6 @@ mod package_generation_tests {
         // ⛔ `qemu-helios/include/hw/virtio/helios_physical_memory.h` used to be
         // listed here. F5 declined HPM1 and reset the submodule; that header is
         // on branch `helios/hpm1-parked` only and is NOT a site to keep in sync.
-        assert_eq!(HELIOS_PACKAGE_GENERATION, 0x4845_4C49_0000_0002);
+        assert_eq!(HELIOS_PACKAGE_GENERATION, 0x4845_4C49_0000_0003);
     }
 }

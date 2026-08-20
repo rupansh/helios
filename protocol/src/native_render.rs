@@ -3938,7 +3938,7 @@ mod tests {
     #[test]
     fn c_mirror_carries_these_exact_constants() {
         // protocol/include/helios_native_render.h
-        assert_eq!(crate::HELIOS_PACKAGE_GENERATION, 0x4845_4C49_0000_0002);
+        assert_eq!(crate::HELIOS_PACKAGE_GENERATION, 0x4845_4C49_0000_0003);
         assert_eq!(HELIOS_NATIVE_RENDER_CAPSET, 4);
 
         assert_eq!(HELIOS_HVC1_MAGIC, 0x3143_5648);

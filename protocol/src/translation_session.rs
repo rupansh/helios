@@ -2166,7 +2166,7 @@ mod tests {
     #[test]
     fn c_mirror_carries_these_exact_constants() {
         // protocol/include/helios_translation_session.h
-        assert_eq!(crate::HELIOS_PACKAGE_GENERATION, 0x4845_4C49_0000_0002);
+        assert_eq!(crate::HELIOS_PACKAGE_GENERATION, 0x4845_4C49_0000_0003);
 
         assert_eq!(HELIOS_HQA1_MAGIC, 0x3141_5148);
         assert_eq!(HELIOS_HQA1_ABI_VERSION, 1);
