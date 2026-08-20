@@ -1077,8 +1077,7 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation(
             "decouple MPO capability from D2 authority",
             QUERY,
-            "    const SUPPORT_MULTI_PLANE_OVERLAY: BOOLEAN =\n"
-            "        crate::virtio::KMD_D2_OWNER_ENABLED as BOOLEAN;",
+            "    const SUPPORT_MULTI_PLANE_OVERLAY: BOOLEAN = crate::virtio::KMD_D2_OWNER_ENABLED as BOOLEAN;",
             "    const SUPPORT_MULTI_PLANE_OVERLAY: BOOLEAN = 1;",
         ),
         Mutation(
@@ -1334,9 +1333,9 @@ def mutation_cases() -> tuple[Mutation, ...]:
         ),
         Mutation(
             "weaken HNF1",
-            "kmd_logic/src/lib.rs",
-            "pub const HNF1_SIZE: usize = 64;",
-            "pub const HNF1_SIZE: usize = 63;",
+            "protocol/src/native_fence.rs",
+            "pub const HELIOS_HNF1_SIZE: usize = 64;",
+            "pub const HELIOS_HNF1_SIZE: usize = 63;",
         ),
         Mutation(
             "weaken D4",

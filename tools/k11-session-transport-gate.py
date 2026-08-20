@@ -393,7 +393,8 @@ def check_host_init(sources: dict[str, str], errors: list[str]) -> None:
         "const SESSION_REPLY_BYTES: u64 = 4096;",
         "const SESSION_SET_REPLY_FENCE: u64 = 1;",
         "const SESSION_CREATE_INSTANCE_FENCE: u64 = 2;",
-        "const SESSION_DESTROY_INSTANCE_FENCE: u64 = 3;",
+        "const SESSION_CONTROL_FENCE: u64 = 3;",
+        "const SESSION_DESTROY_INSTANCE_FENCE: u64 = 4;",
         "struct LiveHost",
         "k2a_resource_id: u32",
         "reply_resource_id: u32",
@@ -572,13 +573,40 @@ def check_host_init(sources: dict[str, str], errors: list[str]) -> None:
         ),
         errors,
     )
+    generated_reply = body(sources, TRANSPORT, "execute_generated_control", errors)
+    generated_no_reply = body(sources, TRANSPORT, "execute_control_no_reply", errors)
+    cleanup = body(sources, TRANSPORT, "cleanup_live_host", errors)
+    direct_surfaces = (
+        ("create_instance", create, 2),
+        ("execute_generated_control", generated_reply, 1),
+        ("execute_control_no_reply", generated_no_reply, 1),
+        ("cleanup_live_host", cleanup, 1),
+    )
+    for name, surface, expected in direct_surfaces:
+        found = compact(surface).count(compact("submit_venus_session_sync("))
+        if found != expected:
+            errors.append(
+                f"{TRANSPORT}:{name}: finite direct-submit count drifted: "
+                f"found {found}, expected {expected}"
+            )
+    for name, surface in (
+        ("execute_generated_control", generated_reply),
+        ("execute_control_no_reply", generated_no_reply),
+    ):
+        require_fragments(
+            TRANSPORT,
+            name,
+            surface,
+            ("SESSION_CONTROL_FENCE",),
+            errors,
+        )
     calls = sum(
         live_rust(source).count("submit_venus_session_sync(")
         for path, source in sources.items()
         if path.endswith(".rs")
     )
-    if calls != 4:  # one definition, SET_REPLY, CREATE, DESTROY
-        errors.append(f"K11 finite direct-submit call surface drifted: found {calls}, expected 4")
+    if calls != 6:  # definition; SET_REPLY; CREATE; two HVC1 arms; DESTROY
+        errors.append(f"K11 finite direct-submit call surface drifted: found {calls}, expected 6")
 
 
 def check_capacity_and_publish(sources: dict[str, str], errors: list[str]) -> None:
@@ -720,47 +748,80 @@ def check_capacity_and_publish(sources: dict[str, str], errors: list[str]) -> No
 
 def check_allowlist_and_completion(sources: dict[str, str], errors: list[str]) -> None:
     commit = body(sources, NATIVE, "commit", errors)
+    classification_start = commit.find("let control_generated =")
+    classified_commit = commit[classification_start:] if classification_start >= 0 else ""
+    if classification_start < 0:
+        errors.append(f"{NATIVE}:commit: generated-control classification missing")
     require_order(
         NATIVE,
         "commit",
-        commit,
+        classified_commit,
         (
+            "let control_generated = native.class == NativeClass::Control",
             "let k11_init = native.class == NativeClass::Control",
-            "header.fragment_count == 1",
-            "HeliosTranslationSessionInitV1",
-            "native.class == NativeClass::Control && !accept.has_reply",
-            "native.class == NativeClass::Control && !k11_init",
-            "staging_mut().checkout(header.total_payload_bytes)",
+            "native.class == NativeClass::Control && !k11_init && !control_generated",
+            "native.class == NativeClass::Control && k11_init",
             "let prepared_executor = if native.class == NativeClass::Queue",
             "publish_dma_record",
-            "let status = control_render",
+        ),
+        errors,
+    )
+    published_at = classified_commit.find("publish_dma_record")
+    published_commit = classified_commit[published_at:] if published_at >= 0 else ""
+    require_order(
+        NATIVE,
+        "commit after DMA publication",
+        published_commit,
+        (
+            "publish_dma_record",
+            "if native.class == NativeClass::Control",
+            "let status = control_render(",
             "mark_dma_host_completed(args, header.batch_token)",
+            "finalize_executor_commit",
+            "apply_render_fragment",
         ),
         errors,
     )
     require_fragments(
         NATIVE,
         "commit",
-        commit,
+        classified_commit,
         (
-            "if native.class == NativeClass::Control { let status = control_render",
+            "scratch.control_building.take()",
+            "staging_mut().checkout(header.total_payload_bytes)",
+            "if native.class == NativeClass::Control { let mut init_payload",
+            "if status != STATUS_SUCCESS",
+            "staging_mut().retire(header.total_payload_bytes)",
         ),
         errors,
     )
     control = body(sources, NATIVE, "control_render", errors)
+    generic_refusal = control.find("(_, Some(slot_index))")
+    control_specific = control[:generic_refusal] if generic_refusal >= 0 else control
+    control_fallback = control[generic_refusal:] if generic_refusal >= 0 else ""
     require_order(
         NATIVE,
         "control_render",
-        control,
+        control_specific,
         (
             "let outcome = run_control_payload",
-            "ControlPayloadOutcome::Published",
+            "match (outcome, admission.slot_index)",
+            "(ControlPayloadOutcome::Published, Some(slot_index))",
             "release_control_slot",
-            "ControlPayloadOutcome::Refused",
-            "abort_control_slot",
-            "ControlPayloadOutcome::InitFailed",
+            "(ControlPayloadOutcome::Completed, None)",
+            "(ControlPayloadOutcome::InitFailed, Some(slot_index))",
             "abort_control_slot(session, slot_index, admission.slot_generation);",
             "finish_failed_session_init",
+        ),
+        errors,
+    )
+    require_order(
+        NATIVE,
+        "control_render fallback",
+        control_fallback,
+        (
+            "(_, Some(slot_index))",
+            "abort_control_slot(session, slot_index, admission.slot_generation)",
             "outcome.status()",
         ),
         errors,
@@ -771,14 +832,35 @@ def check_allowlist_and_completion(sources: dict[str, str], errors: list[str]) -
         "run_control_payload",
         payload,
         (
-            "header.fragment_count != 1",
-            "header.total_payload_bytes != INIT_BYTES as u64",
-            "copy_from_command",
+            "header.fragment_count == 1",
+            "header.total_payload_bytes == INIT_BYTES as u64",
+            "HELIOS_HTS1_INIT_MAGIC",
+            "!accept.has_reply || !patches.is_empty() || uses.len() != 1",
             "translation_session::session_init",
             "admission.reply_offset",
             "admission.reply_capacity_bytes",
             "admission.slot_generation",
             "admission.batch_token",
+            "validate_venus_control_stream",
+            "generated.operand_count as usize != patches.len()",
+        ),
+        errors,
+    )
+    generated_at = payload.find("if generated.operand_count as usize != patches.len()")
+    generated_payload = payload[generated_at:] if generated_at >= 0 else ""
+    require_order(
+        NATIVE,
+        "run_control_payload generated",
+        generated_payload,
+        (
+            "generated.operand_count as usize != patches.len()",
+            "if !accept.has_reply",
+            "execute_control_no_reply(session, payload)",
+            "uses.len() != 1 || patches.len() != 1 || admission.slot_index.is_none()",
+            "HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32",
+            "open_allocation_execution_use",
+            "dst.copy_from_slice(&guard.resource_id.to_le_bytes())",
+            "execute_generated_control",
         ),
         errors,
     )
@@ -962,12 +1044,42 @@ def check_allowlist_and_completion(sources: dict[str, str], errors: list[str]) -
             errors.append(f"{NATIVE}: context-local SubmissionFenceId state missing: {fragment}")
 
     submit_ddi = body(sources, SUBMIT, "dxgkddi_submit_command", errors)
+    outer_start = submit_ddi.find("if let Some((native, session, _device, _outer))")
+    native_start = submit_ddi.find("if let Some((native, session))")
+    legacy_start = submit_ddi.find("let present_fence =", native_start)
+    if (
+        outer_start < 0
+        or native_start < 0
+        or legacy_start < 0
+        or outer_start >= native_start
+        or native_start >= legacy_start
+    ):
+        errors.append(f"{SUBMIT}:dxgkddi_submit_command: outer/native/legacy split drifted")
+        outer_submit = ""
+        native_submit = submit_ddi
+    else:
+        outer_submit = submit_ddi[outer_start:native_start]
+        native_submit = submit_ddi[native_start:legacy_start]
+    require_order(
+        SUBMIT,
+        "dxgkddi_submit_command outer",
+        outer_submit,
+        (
+            "with_k11_completion",
+            "admit_ordered_engine_submission(fence)",
+            "submit_outer_physical",
+            "NativeSubmitDisposition::Pending",
+            "fail_ordered_engine_submission(adapter, ticket)",
+        ),
+        errors,
+    )
     require_order(
         SUBMIT,
         "dxgkddi_submit_command",
-        submit_ddi,
+        native_submit,
         (
-            "let disposition = adapter.with_k11_completion(||",
+            "let disposition = adapter",
+            ".with_k11_completion(||",
             "guard.admit_ordered_engine_submission(fence)",
             "native_render::submit(native, session, submit, ticket)",
             "NativeSubmitDisposition::HostCompleted(",
@@ -987,7 +1099,7 @@ def check_allowlist_and_completion(sources: dict[str, str], errors: list[str]) -
     revoked = re.search(
         r"Some\(\(\s*[^\n]*NativeSubmitDisposition::Revoked\s*,\s*_\s*\)\)"
         r"\s*\|\s*None\s*=>\s*\{(?P<body>.*?)\n\s*\}",
-        live_rust(submit_ddi),
+        live_rust(native_submit),
         re.S,
     )
     revoked_body = revoked.group("body") if revoked else ""
@@ -1484,18 +1596,18 @@ def mutation_cases() -> tuple[Mutation, ...]:
     return (
         Mutation("share one transport globally", SESSION, "transport: SessionTransport,", "transport: &'static SessionTransport,"),
         Mutation("remove exact reply-pool claim", ALLOC, "compare_exchange(\n            0,\n            session.as_ptr() as usize,", "compare_exchange(\n            ctx.k11_session_binding.load(Ordering::Relaxed),\n            session.as_ptr() as usize,"),
-        Mutation("reuse adapter Venus context", TRANSPORT, "let context_id = match crate::virtio::ctrl::ctx_create_session(", "let context_id = match Ok(adapter.venus_ctx_id()) /* no ctx_create */ .and_then(|id| Ok(id)) {"),
+        Mutation("reuse adapter Venus context", TRANSPORT, "crate::virtio::ctrl::ctx_create_session(passive, adapter, VENUS_CAPSET_ID, owner)", "Ok(adapter.venus_ctx_id()) /* no ctx_create */"),
         Mutation("skip private SHM reply creation", TRANSPORT, "let reply_resource_id = match crate::virtio::ctrl::resource_create_session_reply_blob(", "let reply_resource_id = match Ok(facts.resource_id) /* K2a is not a renderer reply target */ .and_then(|id| Ok(id)) {"),
         Mutation("make private reply resource shareable", CTRL, "VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,\n        0,", "VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE | helios_protocol::VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,\n        0,"),
         Mutation("select K2a as SET_REPLY target", TRANSPORT, "pure::encode_set_reply_command_stream(\n            reply_resource_id,\n            SESSION_REPLY_OFFSET,", "pure::encode_set_reply_command_stream(\n            self.k2a_resource_id,\n            SESSION_REPLY_OFFSET,"),
         Mutation("combine SET_REPLY with CREATE", LOGIC, "pub fn encode_create_instance(instance_handle: u64) -> Writer {\n        let mut stream = Writer::new();", "pub fn encode_create_instance(instance_handle: u64) -> Writer {\n        let mut stream = Writer::new();\n        stream.header(CMD_SET_REPLY_COMMAND_STREAM_MESA, 0);"),
-        Mutation("add PID discovery", TRANSPORT, "let _operation = self.acquire()", "let process_id = 1u32;\n        let _operation = self.acquire()"),
+        Mutation("add PID discovery", TRANSPORT, "expected_opcode: u32,\n    ) -> Result<(), NTSTATUS> {\n        let _operation = self.acquire().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;", "expected_opcode: u32,\n    ) -> Result<(), NTSTATUS> {\n        let process_id = 1u32;\n        let _operation = self.acquire().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;"),
         Mutation("add global namespace", TRANSPORT, "const VENUS_CAPSET_ID: u32 = 4;", "static GLOBAL_SESSION_CONTEXT: AtomicU32 = AtomicU32::new(0);\nconst VENUS_CAPSET_ID: u32 = 4;"),
         Mutation("zero-capacity success", LOGIC, "if reply_capacity == 0 {", "if false {"),
         Mutation("publish endpoint capacity zero", SESSION, ".complete_init(requested, requested, generation, capability)", ".complete_init(requested, 0, generation, capability)"),
         Mutation("publish capacity before ring ownership", LOGIC, "self.endpoint_capacity = admission.endpoint_capacity;\n            self.endpoints = endpoints;", "self.endpoints = endpoints;\n            self.endpoint_capacity = admission.endpoint_capacity;"),
         Mutation("assign control ring to endpoint", LOGIC, "endpoints[i].ring_index = i as u32 + 1;", "endpoints[i].ring_index = i as u32;"),
-        Mutation("publish model before host create", TRANSPORT, "let evidence = match self.create_instance(", "*self.state.lock() = HostState::Live(LiveHost { allocation, resource_id: facts.resource_id, transport_instance: facts.transport_instance, context_id, instance_handle: SESSION_INSTANCE_HANDLE });\n        let evidence = match self.create_instance("),
+        Mutation("publish model before host create", TRANSPORT, "let evidence =\n            match self.create_instance(", "*self.state.lock() = HostState::Live(live);\n        let evidence =\n            match self.create_instance("),
         Mutation(
             "leave a failed INIT reusable",
             SESSION,
@@ -1508,9 +1620,9 @@ def mutation_cases() -> tuple[Mutation, ...]:
             "hts1::abort_control_slot(session, slot_index, admission.slot_generation);\n            hts1::finish_failed_session_init(session);",
             "hts1::finish_failed_session_init(session);\n            hts1::abort_control_slot(session, slot_index, admission.slot_generation);",
         ),
-        Mutation("allow arbitrary control payload", NATIVE, "if native.class == NativeClass::Control && !k11_init {", "if false {"),
-        Mutation("run queue payload as control", NATIVE, "if native.class == NativeClass::Control {\n        let status = control_render", "if true {\n        let status = control_render"),
-        Mutation("poll host reply", TRANSPORT, "core::sync::atomic::fence(Ordering::Acquire);", "poll_host_reply();\n        core::sync::atomic::fence(Ordering::Acquire);"),
+        Mutation("allow arbitrary control payload", NATIVE, "if native.class == NativeClass::Control && !k11_init && !control_generated {", "if false {"),
+        Mutation("run queue payload as control", NATIVE, "if native.class == NativeClass::Control {\n        let mut init_payload", "if true {\n        let mut init_payload"),
+        Mutation("poll host reply", TRANSPORT, ".map_err(|_| STATUS_DEVICE_NOT_READY)?;\n        core::sync::atomic::fence(Ordering::Acquire);\n        let opcode", ".map_err(|_| STATUS_DEVICE_NOT_READY)?;\n        poll_host_reply();\n        core::sync::atomic::fence(Ordering::Acquire);\n        let opcode"),
         Mutation(
             "mark host completion before host call",
             NATIVE,
@@ -1520,7 +1632,11 @@ def mutation_cases() -> tuple[Mutation, ...]:
             "            header,\n"
             "            accept,\n"
             "            &scratch.uses[..use_count],\n"
+            "            &scratch.patches[..patch_count],\n"
             "            list_count,\n"
+            "            payload,\n"
+            "            &mut scratch.expected_operands,\n"
+            "            &mut scratch.schema_counts,\n"
             "        );",
             "        unsafe { mark_dma_host_completed(args, header.batch_token) };\n"
             "        let status = control_render(\n"
@@ -1529,7 +1645,11 @@ def mutation_cases() -> tuple[Mutation, ...]:
             "            header,\n"
             "            accept,\n"
             "            &scratch.uses[..use_count],\n"
+            "            &scratch.patches[..patch_count],\n"
             "            list_count,\n"
+            "            payload,\n"
+            "            &mut scratch.expected_operands,\n"
+            "            &mut scratch.schema_counts,\n"
             "        );",
         ),
         Mutation("retry a full K11 control queue", CTRL, "        None,\n        CtrlRoundtripMode::FiniteEvent,\n", "        None,\n        CtrlRoundtripMode::LegacyRetry,\n"),
@@ -1552,8 +1672,8 @@ def mutation_cases() -> tuple[Mutation, ...]:
             "                        guard.admit_ordered_engine_submission(fence.wrapping_add(1))\n"
             "                    })?;\n",
         ),
-        Mutation("complete revoked K11 work through legacy queue", SUBMIT, "                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, _))\n                | None => {\n                    // The host-completed marker belonged to a session whose\n                    // exact transport/fence authority was revoked before this\n                    // callback, or reset already closed the adapter completion\n                    // epoch. Do not forge completion through the legacy queue.\n                    SubmitAck::Accepted\n                }\n", "                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, ticket))\n                | None => {\n                    note_and_maybe_signal(adapter, fence, is_paging, None, Some(ticket))\n                }\n"),
-        Mutation("skip current session generation at submit", NATIVE, "    let disposition = crate::ddi::translation_session::with_current_host_submission(\n", "    let disposition = Some(\n"),
+        Mutation("complete revoked K11 work through legacy queue", SUBMIT, "                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, _)) | None => {\n                    // The host-completed marker belonged to a session whose\n                    // exact transport/fence authority was revoked before this\n                    // callback, or reset already closed the adapter completion\n                    // epoch. Do not forge completion through the legacy queue.\n                    SubmitAck::Accepted\n                }\n", "                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, ticket)) | None => {\n                    note_and_maybe_signal(adapter, fence, is_paging, None, Some(ticket))\n                }\n"),
+        Mutation("skip current session generation at submit", NATIVE, "    let disposition =\n        crate::ddi::translation_session::with_current_host_submission(session, || {\n", "    let disposition = Some({\n"),
         Mutation("drop adapter completion rundown", SUBMIT, "                .with_k11_completion(|| {\n", "                .with_k11_completion_unchecked(|| {\n"),
         Mutation("drop exact K11 completion after admission", SUBMIT, "                        complete_k11_host_submission(adapter, ticket);\n", "                        let _ = (exact_fence, ticket);\n"),
         Mutation("make completion rundown unbounded", TRANSPORT, "    state: SpinLock<CompletionRundownState>,\n", "    state: SpinLock<Vec<CompletionRundownState>>,\n"),
@@ -1567,7 +1687,7 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("leave failed K11 cleanup open to legacy sweep", TRANSPORT, ".quarantine_session_context(owner, context_id);", ".resource_is_live(context_id);"),
         Mutation("add ABI host context id", PROTO_SESSION, "pub reserved: u64,\n}\n\n/// Why an HTS1 INIT", "pub reserved: u64,\n    pub host_context_id: u64,\n}\n\n/// Why an HTS1 INIT"),
         Mutation("restore Escape", LIB, "data.DxgkDdiSetAllocationBackingStore = Some(ddi::dxgkddi_set_allocation_backing_store);", "data.DxgkDdiSetAllocationBackingStore = Some(ddi::dxgkddi_set_allocation_backing_store);\n    data.DxgkDdiEscape = Some(ddi::dxgkddi_escape);"),
-        Mutation("add IOCTL fallback", TRANSPORT, "let _operation = self.acquire()", "let ioctl = 1u32;\n        let _operation = self.acquire()"),
+        Mutation("add IOCTL fallback", TRANSPORT, "pub(crate) fn execute_control_no_reply(\n        &self,\n        passive: PassiveLevel,\n        adapter: &AdapterContext,\n        owner: DeviceOwner,\n        payload: &[u8],\n    ) -> Result<(), NTSTATUS> {\n        let _operation = self.acquire().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;", "pub(crate) fn execute_control_no_reply(\n        &self,\n        passive: PassiveLevel,\n        adapter: &AdapterContext,\n        owner: DeviceOwner,\n        payload: &[u8],\n    ) -> Result<(), NTSTATUS> {\n        let ioctl = 1u32;\n        let _operation = self.acquire().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;"),
         Mutation("add HPM1 dependency", TRANSPORT, "const VENUS_CAPSET_ID: u32 = 4;", "const HPM1_REQUIRED: bool = true;\nconst VENUS_CAPSET_ID: u32 = 4;"),
         Mutation("add QEMU dependency", TRANSPORT, "const VENUS_CAPSET_ID: u32 = 4;", "const QEMU_PATCH_REQUIRED: bool = true;\nconst VENUS_CAPSET_ID: u32 = 4;"),
         Mutation("weaken K2a alias publication", ALLOC, "ctx.backing_store_state\n        .store(BACKING_STORE_BOUND, Ordering::Release);", "ctx.backing_store_state\n        .store(BACKING_STORE_BOUND, Ordering::Relaxed);"),
@@ -1610,7 +1730,7 @@ def mutation_cases() -> tuple[Mutation, ...]:
             "        magic.store(HELIOS_HVR1_MAGIC.to_le(), Ordering::Relaxed);",
         ),
         Mutation("forge host reply opcode", SESSION, "opcode: host.opcode,", "opcode: 0,"),
-        Mutation("bypass renderer reply validation", TRANSPORT, "pure::validate_create_instance_reply(\n            &raw_reply,\n            SESSION_INSTANCE_HANDLE,\n        )", "Ok(pure::HostInitEvidence { opcode: 0, status: 0 })"),
+        Mutation("bypass renderer reply validation", TRANSPORT, "pure::validate_create_instance_reply(&raw_reply, SESSION_INSTANCE_HANDLE)", "Ok(pure::HostInitEvidence { opcode: 0, status: 0 })"),
         Mutation("drop pair-use rundown", CTRL, "let pair = adapter\n        .control_owner()\n        .borrow_session_pair(owner, reply_resource_id, context_id)?;", "let pair = ();"),
         Mutation("release pair before HVR1 publication", TRANSPORT, "let result = match publish(facts, &evidence) {", "drop(pair);\n        let result = match publish(facts, &evidence) {"),
         Mutation("destroy context before host instance", TRANSPORT, "let destroy = pure::encode_destroy_instance(instance_handle);", "let _ = crate::virtio::ctrl::ctx_destroy_session(passive, adapter, owner, context_id);\n            let destroy = pure::encode_destroy_instance(instance_handle);"),

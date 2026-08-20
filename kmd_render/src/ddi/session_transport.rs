@@ -34,9 +34,11 @@ const SESSION_INSTANCE_HANDLE: u64 = 1;
 const HOST_REPLY_POISON: u32 = u32::MAX;
 const SESSION_REPLY_BYTES: u64 = 4096;
 const SESSION_REPLY_OFFSET: u64 = 0;
-// Reused only across distinct Venus contexts.  Within one session/context
-// these are the complete ordered ring-zero fence namespace: target, CREATE,
-// then the optional terminal DESTROY during teardown.
+// Reused only across distinct Venus contexts.  Within one session/context,
+// 1/2 name the two finite initialization submits, 3 is the fixed label for a
+// generated HVC1 operation and is reused only after that synchronous operation
+// reached its exact terminal, and 4 names the optional terminal DESTROY.  The
+// control label is deliberately not an independently advancing timeline.
 const SESSION_SET_REPLY_FENCE: u64 = 1;
 const SESSION_CREATE_INSTANCE_FENCE: u64 = 2;
 const SESSION_CONTROL_FENCE: u64 = 3;

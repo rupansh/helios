@@ -404,9 +404,11 @@ def check_bounded_executor(sources: dict[str, str], errors: list[str]) -> None:
         "NativeContext::new",
         native,
         (
-            "(class == NativeClass::Control) != (ring_index == 0)",
-            "class == NativeClass::Queue",
+            "NativeClass::Control => ring_index != 0 || endpoint_id != 0",
+            "NativeClass::Queue | NativeClass::Outer => ring_index == 0 || endpoint_id == 0",
+            "matches!(class, NativeClass::Queue | NativeClass::Outer)",
             "session_generation == 0 || context_generation == 0",
+            "outer_worker = if class == NativeClass::Outer",
         ),
         errors,
     )
@@ -623,7 +625,11 @@ def check_terminal_and_teardown(sources: dict[str, str], errors: list[str]) -> N
         close,
         (
             "rundown.open = false",
-            "scratch.get() }.building.take()",
+            "if let Some(worker) = self.outer_worker.as_ref()",
+            "worker.close_and_wait()",
+            "let scratch = unsafe { &mut *self.scratch.get() }",
+            "let building = scratch.building.take()",
+            "abandon_control_building(scratch, self)",
             "settle_batch_tickets(adapter, tickets, false)",
             "drop(building)",
             "drain_host_terminals(adapter)",
@@ -717,8 +723,8 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("allow early commit", NATIVE, "if commit_record && self.commit_seen {", "if false {"),
         Mutation("reuse only the first resubmission epoch", NATIVE, "let new_epoch = prior_epoch.is_none_or(|epoch| epoch != ticket.epoch());", "let new_epoch = self.resubmit_count == 0;"),
         Mutation("ignore commit position", NATIVE, "if next_count > fragment_count || commit_record != (next_count == fragment_count) {", "if next_count > fragment_count {"),
-        Mutation("defer staging charge to commit", NATIVE, "let context = native.acquire_operation().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;\n    {\n        let mut state = native.state.lock();\n        if let Err(refusal) = state.staging_mut().checkout(header.total_payload_bytes)", "let context = native.acquire_operation().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;\n    {\n        let mut state = native.state.lock();\n        if let Err(refusal) = state.staging_mut().checkout(0)"),
-        Mutation("permit ring zero executor", NATIVE, "if (class == NativeClass::Control) != (ring_index == 0) {", "if false {"),
+        Mutation("defer staging charge to commit", NATIVE, "let context = native\n        .acquire_operation()\n        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;\n    {\n        let mut state = native.state.lock();\n        if let Err(refusal) = state.staging_mut().checkout(header.total_payload_bytes)", "let context = native\n        .acquire_operation()\n        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;\n    {\n        let mut state = native.state.lock();\n        if let Err(refusal) = state.staging_mut().checkout(0)"),
+        Mutation("permit ring zero executor", NATIVE, "NativeClass::Queue | NativeClass::Outer => ring_index == 0 || endpoint_id == 0,", "NativeClass::Queue | NativeClass::Outer => false,"),
         Mutation("drop fragment crc identity", NATIVE, "|| building.identity.full_payload_crc64 != header.full_payload_crc64", "|| false"),
         Mutation("skip full payload crc", NATIVE, "if actual_crc != header.full_payload_crc64", "if false"),
         Mutation("skip generated validation", NATIVE, "validate_venus_stream(\n        building_ref.payload.as_slice(),", "validate_venus_stream(\n        &[],"),
@@ -727,20 +733,19 @@ def mutation_cases() -> tuple[Mutation, ...]:
             NATIVE,
             "    if native.class == NativeClass::Queue\n"
             "        && (args.pDmaBufferPrivateData.is_null()\n"
-            "            || (args.DmaBufferPrivateDataSize as usize)\n"
-            "                < size_of::<Hnr2KmdDmaPrivateV1>())\n"
+            "            || (args.DmaBufferPrivateDataSize as usize) < size_of::<Hnr2KmdDmaPrivateV1>())\n"
             "    {",
             "    if false {",
         ),
         Mutation("allow operand count drift", NATIVE, "if admission.operand_count as usize != patches.len() {", "if false {"),
-        Mutation("allow non-resource patch kind", NATIVE, "|| patch.operand_kind != HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32", "|| false"),
+        Mutation("allow non-resource patch kind", NATIVE, "|| helios_protocol::native_render::hnr2_operand_width(patch.operand_kind)\n                != Some(patch.encoded_width)\n            || patch.operand_kind != HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32", "|| helios_protocol::native_render::hnr2_operand_width(patch.operand_kind)\n                != Some(patch.encoded_width)\n            || false"),
         Mutation("patch user source", NATIVE, "building.payload.as_mut_slice().get_mut(start..end)", "unsafe { core::slice::from_raw_parts_mut(args.pCommand.cast(), end) }.get_mut(start..end)"),
         Mutation("accept stale transport allocation", NATIVE, "if guard.transport_instance != building_ref.session.transport_instance", "if false"),
         Mutation("drop exact host-backed memory type", NATIVE, "|| (exact_host_memory_type\n                    && import_guard.memory_type_index != admission.memory_type_index)", "|| false"),
-        Mutation("forge host resource constant", NATIVE, "dst.copy_from_slice(&guard.resource_id.to_le_bytes());", "dst.copy_from_slice(&1u32.to_le_bytes());"),
+        Mutation("forge host resource constant", NATIVE, "let Some(dst) = building.payload.as_mut_slice().get_mut(start..end) else {\n            return Err(STATUS_INVALID_PARAMETER);\n        };\n        dst.copy_from_slice(&guard.resource_id.to_le_bytes());", "let Some(dst) = building.payload.as_mut_slice().get_mut(start..end) else {\n            return Err(STATUS_INVALID_PARAMETER);\n        };\n        dst.copy_from_slice(&1u32.to_le_bytes());"),
         Mutation("enqueue on fragment", NATIVE, "if commit_record {\n                            if let Some(batch)", "if true {\n                            if let Some(batch)"),
         Mutation("allow zero endpoint submit", NATIVE, "|| record.ring_index == 0", "|| false"),
-        Mutation("bypass exact transport", NATIVE, "if gpu.scanout_transport_instance() != transport_instance {", "if false {"),
+        Mutation("bypass exact transport", NATIVE, "if gpu.scanout_transport_instance() != transport_instance {\n                        return None;\n                    }\n                    pending.take().map(|(meta, payload, completion)| {\n                        gpu.enqueue_native_submit(\n                            host_context_id,\n                            native.ring_index,", "if false {\n                        return None;\n                    }\n                    pending.take().map(|(meta, payload, completion)| {\n                        gpu.enqueue_native_submit(\n                            host_context_id,\n                            native.ring_index,"),
         Mutation("return completed before host", NATIVE, "Ok(Some(Ok(_))) => NativeSubmitDisposition::Pending,", "Ok(Some(Ok(_))) => NativeSubmitDisposition::HostCompleted(submit.SubmissionFenceId),"),
         Mutation("settle after custody release", NATIVE, "settle_batch_tickets(adapter, tickets, success);\n        }\n        // Keep the exact context/session/allocation/staging custody", "drop(custody);\n            settle_batch_tickets(adapter, tickets, success);\n        }\n        // Keep the exact context/session/allocation/staging custody"),
         Mutation("compat complete pending", SUBMIT, "| Some((crate::ddi::native_render::NativeSubmitDisposition::Pending, _)) => {", "| Some((crate::ddi::native_render::NativeSubmitDisposition::Refused, _)) => {"),
@@ -754,7 +759,7 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("drift queue submit opcode", EXECUTOR, "pub const OP_QUEUE_SUBMIT: u32 = 18;", "pub const OP_QUEUE_SUBMIT: u32 = 19;"),
         Mutation("drift allocate opcode", EXECUTOR, "pub const OP_ALLOCATE_MEMORY: u32 = 21;", "pub const OP_ALLOCATE_MEMORY: u32 = 20;"),
         Mutation("admit unknown opcode", EXECUTOR, "OP_QUEUE_SUBMIT | OP_QUEUE_SUBMIT2 | OP_QUEUE_BIND_SPARSE => {\n            if flags != 0 {\n                return Err(VenusReject::BadFlags);\n            }\n            parse_queue(&mut c, opcode)?\n        }\n        _ => return Err(VenusReject::UnknownOpcode),", "OP_QUEUE_SUBMIT | OP_QUEUE_SUBMIT2 | OP_QUEUE_BIND_SPARSE => {\n            if flags != 0 {\n                return Err(VenusReject::BadFlags);\n            }\n            parse_queue(&mut c, opcode)?\n        }\n        _ => VenusCommandClass::QueueSubmit,"),
-        Mutation("allow trailing bytes", EXECUTOR, "if c.offset != bytes.len() {\n        return Err(VenusReject::TrailingBytes);", "if false {\n        return Err(VenusReject::TrailingBytes);"),
+        Mutation("allow trailing bytes", EXECUTOR, "_ => return Err(VenusReject::UnknownOpcode),\n    };\n    if c.offset != bytes.len() {\n        return Err(VenusReject::TrailingBytes);", "_ => return Err(VenusReject::UnknownOpcode),\n    };\n    if false {\n        return Err(VenusReject::TrailingBytes);"),
     )
 
 

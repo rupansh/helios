@@ -4404,6 +4404,10 @@ impl CreateCallShape {
 struct AdmittedAllocation {
     kind: u32,
     hvm1_role: u32,
+    /// Ask dxgkrnl for the exact OS-owned CPU backing after create. HVM1 uses
+    /// it to construct the stock Venus guest-memory view; HOC1 uses the same
+    /// callback only to retain a KMD read view of the immutable command pool.
+    /// Neither use turns the backing pointer into identity.
     share_backing_store: bool,
     generation: u64,
     /// Final HWA2 create-output bytes for the exact allocation object. HVM1
@@ -5152,6 +5156,14 @@ unsafe fn admit_hoc1(
         bump(&CREATE_CALL_SHAPE, b"AcShape");
         return Err(STATUS_INVALID_PARAMETER);
     }
+    // F5 declined HPM1, so the existing WDDM 3.2 shared-backing callback is the
+    // only authorized CPU view from which KMD can snapshot a sealed HOC1 extent.
+    // This is not an HVM1 renderer view: no virtio/Venus resource is created,
+    // and the pointer is retained only on this exact allocation object.
+    if !adapter.share_backing_store_with_kmd() {
+        bump(&CREATE_HOC1_REJECT, b"AcHoc1Rej");
+        return Err(STATUS_NOT_SUPPORTED);
+    }
     // The same segment check `admit_hvm1` performs, for the same reason: this
     // placement also prefers `HELIOS_SEGMENT_ID_HLM1`, so without it an HOC1
     // create is refused by dxgkrnl with nothing in the guest naming why. See
@@ -5185,7 +5197,7 @@ unsafe fn admit_hoc1(
     Ok(AdmittedAllocation {
         kind: ALLOC_KIND_HOC1,
         hvm1_role: 0,
-        share_backing_store: false,
+        share_backing_store: true,
         generation,
         final_hwa2: None,
         vidmm_size: round_up_page(record.byte_size as SIZE_T),
@@ -5721,7 +5733,9 @@ unsafe fn hoc1_mdl_system_va(mdl: PMDL, expected_bytes: u64) -> Option<usize> {
         MmMapLockedPagesSpecifyCache(
             mdl,
             0,
-            _MEMORY_CACHING_TYPE::MmNonCached,
+            // HOC1 is declared WRITE_COMBINED. Preserve that cache type for
+            // the KMD alias rather than creating a conflicting UC mapping.
+            _MEMORY_CACHING_TYPE::MmWriteCombined,
             core::ptr::null_mut(),
             0,
             K2A_MDL_MAP_PRIORITY,
@@ -6224,22 +6238,15 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 )
             }
         };
-        let hoc1 = if open_flags & DXGK_OPENALLOCATION_FLAG_CREATE != 0 {
-            unsafe {
-                stamp_open_hoc1(
-                    info.pPrivateDriverData,
-                    info.PrivateDriverDataSize,
-                    canonical_allocation,
-                )
-            }
-        } else {
-            unsafe {
-                read_open_hoc1(
-                    info.pPrivateDriverData,
-                    info.PrivateDriverDataSize,
-                    canonical_allocation,
-                )
-            }
+        // HOC1 follows K4's const-open rule. Unlike the one measured HVM1
+        // exception above, its create-output must already be present in the
+        // runtime-owned buffer; a create-input generation is not repaired here.
+        let hoc1 = unsafe {
+            read_open_hoc1(
+                info.pPrivateDriverData,
+                info.PrivateDriverDataSize,
+                canonical_allocation,
+            )
         };
         // What the guest was TOLD, for K6 to check its use records against.
         // HWA2's generation comes from the descriptor for the same reason: it is
@@ -6514,54 +6521,6 @@ unsafe fn read_open_hoc1(
         && ctx.size as u64 == record.byte_size
         && ctx.generation == record.allocation_generation)
         .then_some((record.byte_size, record.allocation_generation))
-}
-
-unsafe fn stamp_open_hoc1(
-    private: *mut c_void,
-    private_size: UINT,
-    canonical_allocation: usize,
-) -> Option<(u64, u64)> {
-    if private.is_null() || private_size as usize != HELIOS_HOC1_BYTES as usize {
-        return None;
-    }
-    let parsed = {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(private as *const u8, HELIOS_HOC1_BYTES as usize)
-        };
-        HeliosOuterCommandAllocationV1::from_private_data(bytes).ok()?
-    };
-    let mut record = parsed;
-    if record.magic != HELIOS_HOC1_MAGIC {
-        return None;
-    }
-    let ctx = unsafe { resolve_alloc(canonical_allocation as HANDLE) }?;
-    if ctx.kind != ALLOC_KIND_HOC1 || ctx.size as u64 != record.byte_size {
-        return None;
-    }
-    if record
-        .validate_create_output(HELIOS_PACKAGE_GENERATION)
-        .is_ok()
-    {
-        return (record.allocation_generation == ctx.generation)
-            .then_some((record.byte_size, record.allocation_generation));
-    }
-    if record
-        .validate_create_input(HELIOS_PACKAGE_GENERATION)
-        .is_err()
-    {
-        return None;
-    }
-    record.allocation_generation = ctx.generation;
-    if record
-        .validate_create_output(HELIOS_PACKAGE_GENERATION)
-        .is_err()
-    {
-        return None;
-    }
-    let out =
-        unsafe { core::slice::from_raw_parts_mut(private as *mut u8, HELIOS_HOC1_BYTES as usize) };
-    out.copy_from_slice(bytes_of(&record));
-    Some((record.byte_size, record.allocation_generation))
 }
 
 /// Read an already-published HVM1 create-output. The ORDINARY-open half of

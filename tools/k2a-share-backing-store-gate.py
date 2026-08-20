@@ -274,14 +274,72 @@ def check_allocation(sources: dict[str, str], errors: list[str]) -> None:
     )
 
     callback = body(sources, ALLOC, "dxgkddi_set_allocation_backing_store", errors)
+    hoc1_start = callback.find("if ctx.kind == ALLOC_KIND_HOC1")
+    hvm1_start = callback.find("let Some(role) = Hvm1Role::from_u32(ctx.hvm1_role)")
+    if hoc1_start < 0 or hvm1_start < 0 or hoc1_start >= hvm1_start:
+        errors.append(f"{ALLOC}:SetAllocationBackingStore: HOC1/HVM1 ownership split drifted")
+        hoc1_callback = ""
+        hvm1_callback = callback
+    else:
+        hoc1_callback = callback[hoc1_start:hvm1_start]
+        hvm1_callback = callback[hvm1_start:]
+
     require_order(
         ALLOC,
-        "dxgkddi_set_allocation_backing_store",
+        "SetAllocationBackingStore dispatch",
         callback,
         (
             "KeGetCurrentIrql()",
             "share_backing_store_with_kmd()",
             "resolve_alloc(args.hDriverAllocation)",
+            "if ctx.kind == ALLOC_KIND_HOC1",
+            "Hvm1Role::from_u32(ctx.hvm1_role)",
+        ),
+        errors,
+    )
+
+    hoc1 = body(sources, ALLOC, "admit_hoc1", errors)
+    require_order(
+        ALLOC,
+        "admit_hoc1",
+        hoc1,
+        (
+            "validate_create_input(HELIOS_PACKAGE_GENERATION)",
+            "shape.is_bare_single_allocation()",
+            "adapter.share_backing_store_with_kmd()",
+            "allocation_object::mint()",
+            "share_backing_store: true",
+            "backing: None",
+        ),
+        errors,
+    )
+    require_order(
+        ALLOC,
+        "SetAllocationBackingStore HOC1",
+        hoc1_callback,
+        (
+            "ctx.kind == ALLOC_KIND_HOC1",
+            "bytes != HELIOS_HOC1_POOL_BYTES",
+            "allocation_object::is_current(ctx.generation)",
+            "ctx.resource_id() != 0",
+            "(args.pBackingStore as usize) & (PAGE as usize - 1) != 0",
+            "compare_exchange(BACKING_STORE_UNBOUND, BACKING_STORE_BINDING",
+            "IoAllocateMdl",
+            "helios_mm_probe_and_lock_pages_seh(mdl)",
+            "hoc1_mdl_system_va(mdl, bytes)",
+            "ctx.backing_store_mdl.store(mdl as usize, Ordering::Relaxed)",
+            "ctx.backing_store_va.store(kernel_va, Ordering::Relaxed)",
+            "ctx.backing_store_state.store(BACKING_STORE_BOUND, Ordering::Release)",
+        ),
+        errors,
+    )
+    if "resource_create_guest_blob" in hoc1_callback:
+        errors.append(f"{ALLOC}: HOC1 shared backing acquired a forbidden renderer resource")
+    require_order(
+        ALLOC,
+        "dxgkddi_set_allocation_backing_store",
+        hvm1_callback,
+        (
             "Hvm1Role::from_u32(ctx.hvm1_role)",
             "ctx.kind != ALLOC_KIND_HVM1",
             "!role.placement().cpu_visible",
@@ -324,19 +382,19 @@ def check_allocation(sources: dict[str, str], errors: list[str]) -> None:
         ),
         errors,
     )
-    if "Err(error)=>{returnerror.into();}" not in compact(callback):
+    if "Err(error)=>{returnerror.into();}" not in compact(hvm1_callback):
         errors.append(
             f"{ALLOC}:SetAllocationBackingStore: post-dispatch failure must remain terminal"
         )
-    if compact(callback).count("ctx.resource_id.store(") != 1:
+    if compact(hvm1_callback).count("ctx.resource_id.store(") != 1:
         errors.append(
             f"{ALLOC}:SetAllocationBackingStore: resource identity must publish exactly once after CREATE"
         )
-    if compact(callback).count("ctx.backing_store_va.store(") != 1:
+    if compact(hvm1_callback).count("ctx.backing_store_va.store(") != 1:
         errors.append(
             f"{ALLOC}:SetAllocationBackingStore: stable K2a CPU view must publish exactly once after CREATE"
         )
-    if compact(callback).count(
+    if compact(hvm1_callback).count(
         "ctx.backing_store_state.store(BACKING_STORE_BOUND,Ordering::Release)"
     ) != 1:
         errors.append(
@@ -365,6 +423,22 @@ def check_allocation(sources: dict[str, str], errors: list[str]) -> None:
         system_va,
         (
             "MmMapLockedPagesSpecifyCache(mdl, 0, _MEMORY_CACHING_TYPE::MmCached, core::ptr::null_mut(), 0, K2A_MDL_MAP_PRIORITY,)",
+        ),
+        errors,
+    )
+    hoc1_system_va = body(sources, ALLOC, "hoc1_mdl_system_va", errors)
+    require_order(
+        ALLOC,
+        "hoc1_mdl_system_va",
+        hoc1_system_va,
+        (
+            "mdl.is_null()",
+            "(*mdl).ByteCount",
+            "(*mdl).MdlFlags",
+            "(*mdl).MappedSystemVa",
+            "MmMapLockedPagesSpecifyCache",
+            "_MEMORY_CACHING_TYPE::MmWriteCombined",
+            "K2A_MDL_MAP_PRIORITY",
         ),
         errors,
     )
@@ -727,10 +801,13 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("map role 4", ALLOC, "|| !role.placement().cpu_visible", "|| false"),
         Mutation("accept unaligned size", ALLOC, "|| record.byte_size & (PAGE as u64 - 1) != 0", "|| false"),
         Mutation("omit shared backing bit", ALLOC, ".set_ShareBackingStoreWithKmd(1);", ".set_ShareBackingStoreWithKmd(0);"),
+        Mutation("omit HOC1 shared backing", ALLOC, "share_backing_store: true,\n        generation,\n        final_hwa2: None,", "share_backing_store: false,\n        generation,\n        final_hwa2: None,"),
+        Mutation("map HOC1 alias uncached", ALLOC, "_MEMORY_CACHING_TYPE::MmWriteCombined", "_MEMORY_CACHING_TYPE::MmNonCached"),
+        Mutation("publish HOC1 before alias", ALLOC, "ctx.backing_store_mdl.store(mdl as usize, Ordering::Relaxed);\n        ctx.backing_store_va.store(kernel_va, Ordering::Relaxed);", "ctx.backing_store_mdl.store(mdl as usize, Ordering::Relaxed);\n        ctx.backing_store_state.store(BACKING_STORE_BOUND, Ordering::Release);\n        ctx.backing_store_va.store(kernel_va, Ordering::Relaxed);"),
         Mutation("publish before guest create", ALLOC, "let resource_id = match crate::virtio::ctrl::resource_create_guest_blob(", "ctx.resource_id.store(1, Ordering::Release);\n    let resource_id = match crate::virtio::ctrl::resource_create_guest_blob("),
-        Mutation("omit stable kernel alias", ALLOC, "ctx.backing_store_va.store(kernel_va, Ordering::Relaxed);", "let _ = kernel_va;"),
+        Mutation("omit stable kernel alias", ALLOC, "ctx.resource_id.store(resource_id, Ordering::Release);\n    ctx.backing_store_va.store(kernel_va, Ordering::Relaxed);", "ctx.resource_id.store(resource_id, Ordering::Release);\n    let _ = kernel_va;"),
         Mutation("publish incomplete alias", ALLOC, "ctx.resource_id.store(resource_id, Ordering::Release);", "ctx.backing_store_state.store(BACKING_STORE_BOUND, Ordering::Release);\n    ctx.resource_id.store(resource_id, Ordering::Release);"),
-        Mutation("weaken complete alias publication", ALLOC, "ctx.backing_store_state\n        .store(BACKING_STORE_BOUND, Ordering::Release);", "ctx.backing_store_state\n        .store(BACKING_STORE_BOUND, Ordering::Relaxed);"),
+        Mutation("weaken complete alias publication", ALLOC, "// Publish the complete alias as one state transition.  A K11 reader that\n    // observes BOUND must also observe both the canonical resource and kernel\n    // mapping above.\n    ctx.backing_store_state\n        .store(BACKING_STORE_BOUND, Ordering::Release);", "// Publish the complete alias as one state transition.  A K11 reader that\n    // observes BOUND must also observe both the canonical resource and kernel\n    // mapping above.\n    ctx.backing_store_state\n        .store(BACKING_STORE_BOUND, Ordering::Relaxed);"),
         Mutation("map wrong MDL extent", ALLOC, "k2a_mdl_system_va(mdl, bytes)", "k2a_mdl_system_va(mdl, bytes - 1)"),
         Mutation("map K2a alias noncached", ALLOC, "_MEMORY_CACHING_TYPE::MmCached", "_MEMORY_CACHING_TYPE::MmNonCached"),
         Mutation("retry ambiguous create", ALLOC, "Err(error) => {\n            return error.into();", "Err(error) => {\n            ctx.backing_store_state.store(BACKING_STORE_UNBOUND, Ordering::Release);\n            return error.into();"),

@@ -33,6 +33,7 @@ DEVICE = "kmd_render/src/device.rs"
 LIB = "kmd_render/src/lib.rs"
 SLOT_AUDIT = "kmd_render/src/ddi/wddm32_slot_audit.rs"
 LOGIC = "kmd_logic/src/lib.rs"
+PROTO_HNF = "protocol/src/native_fence.rs"
 SURFACE = "kmd_render/src/ddi/wddm_surface.rs"
 OWNER = "kmd_render/src/virtio/control_owner.rs"
 PRESENT_PACKET = "kmd_render/src/ddi/present_packet.rs"
@@ -405,42 +406,62 @@ def check_local_sources(sources: dict[str, str]) -> list[str]:
         if not re.search(pattern, slot_audit):
             errors.append(f"{SLOT_AUDIT}: {callback} must remain classified Disabled")
 
+    protocol_hnf = compact_live.get(PROTO_HNF, "")
+    hnf1_protocol_fragments = (
+        "pubconstHELIOS_HNF1_MAGIC:u32=0x3146_4e48",
+        "pubconstHELIOS_HNF1_ABI_VERSION:u16=1",
+        "pubconstHELIOS_HNF1_SIZE:usize=64",
+        "pubstructHeliosNativeFencePddV1{pubmagic:u32,pubabi_version:u16,pubstruct_size:u16,pubpackage_generation:u64,pubobject_generation:u64,pubnative_type:u32,pubflags:u32,pubadapter_luid:i64,pubreserved:[u8;24]",
+        "offset_of!(HeliosNativeFencePddV1,magic)==0",
+        "offset_of!(HeliosNativeFencePddV1,abi_version)==4",
+        "offset_of!(HeliosNativeFencePddV1,struct_size)==6",
+        "offset_of!(HeliosNativeFencePddV1,package_generation)==8",
+        "offset_of!(HeliosNativeFencePddV1,object_generation)==16",
+        "offset_of!(HeliosNativeFencePddV1,native_type)==24",
+        "offset_of!(HeliosNativeFencePddV1,flags)==28",
+        "offset_of!(HeliosNativeFencePddV1,adapter_luid)==32",
+        "offset_of!(HeliosNativeFencePddV1,reserved)==40",
+        "self.magic!=HELIOS_HNF1_MAGIC",
+        "self.abi_version!=HELIOS_HNF1_ABI_VERSION",
+        "self.struct_sizeasusize!=HELIOS_HNF1_SIZE",
+        "package_generation==0||self.package_generation!=package_generation",
+        "self.flags&HELIOS_HNF1_FLAGS_RESERVED_MASK!=0",
+        "self.reserved!=[0;24]",
+        "self.object_generation!=0",
+        "self.native_type!=ddi_native_type",
+        "self.adapter_luid!=0&&self.adapter_luid!=adapter_luid",
+        "self.object_generation==0",
+        "self.flags!=flags",
+        "self.adapter_luid!=adapter_luid",
+        "bytemuck::cast(self)",
+        "bytemuck::pod_read_unaligned(bytes)",
+        "native_type==HELIOS_NATIVE_FENCE_TYPE_DEFAULT",
+    )
+    for fragment in hnf1_protocol_fragments:
+        if fragment not in protocol_hnf:
+            errors.append(f"{PROTO_HNF}: protocol-owned HNF1 invariant missing: {fragment}")
+
     logic = compact_live.get(LOGIC, "")
-    hnf1_fragments = (
-        "pubconstHNF1_MAGIC:u32=0x3146_4e48",
-        "pubconstHNF1_ABI_VERSION:u16=1",
-        "pubconstHNF1_SIZE:usize=64",
-        "pubconstOFF_MAGIC:usize=0",
-        "pubconstOFF_ABI_VERSION:usize=4",
-        "pubconstOFF_STRUCT_SIZE:usize=6",
-        "pubconstOFF_PACKAGE_GENERATION:usize=8",
-        "pubconstOFF_OBJECT_GENERATION:usize=16",
-        "pubconstOFF_NATIVE_TYPE:usize=24",
-        "pubconstOFF_FLAGS:usize=28",
-        "pubconstOFF_ADAPTER_LUID:usize=32",
-        "pubconstOFF_RESERVED:usize=40",
-        "pubconstRESERVED_LEN:usize=24",
-        "rd_u32(bytes,OFF_MAGIC)!=HNF1_MAGIC",
-        "rd_u16(bytes,OFF_ABI_VERSION)!=HNF1_ABI_VERSION",
-        "rd_u16(bytes,OFF_STRUCT_SIZE)asusize!=HNF1_SIZE",
-        "parsed.package_generation!=package_generation",
-        "parsed.flags&HNF1_FLAGS_RESERVED_MASK!=0",
-        "parsed.object_generation!=0",
-        "bytes[OFF_RESERVED+i]!=0",
-        "parsed.native_type!=native_type",
+    hnf1_logic_fragments = (
+        "usehelios_protocol::HeliosNativeFencePddV1",
+        "pubconstHNF1_MAGIC:u32=helios_protocol::HELIOS_HNF1_MAGIC",
+        "pubconstHNF1_ABI_VERSION:u16=helios_protocol::HELIOS_HNF1_ABI_VERSION",
+        "pubconstHNF1_SIZE:usize=helios_protocol::HELIOS_HNF1_SIZE",
+        "pubtypeHnf1=HeliosNativeFencePddV1",
+        "HeliosNativeFencePddV1::from_bytes(bytes)",
+        "parsed.validate_create_input(package_generation,adapter_luid,ddi_native_type)",
+        "parsed.validate_create_input(package_generation,adapter_luid,native_type)",
         "parsed.flags!=flags",
         "parsed.adapter_luid!=adapter_luid",
-        "letmutout=[0u8;HNF1_SIZE]",
-        "native_type==NATIVE_FENCE_TYPE_DEFAULT",
         "previous.checked_add(1).filter(|next|*next!=0)",
         "previous.checked_add(1).filter(|next|*next<=maximum)",
     )
-    for fragment in hnf1_fragments:
+    for fragment in hnf1_logic_fragments:
         if fragment not in logic:
-            errors.append(f"{LOGIC}: HNF1/generation invariant missing: {fragment}")
-    type_body = unique_function(sources, LOGIC, "native_type_is_documented", errors)
-    if type_body is not None and "NATIVE_FENCE_TYPE_INTRA_GPU" in type_body[1]:
-        errors.append(f"{LOGIC}: INTRA_GPU accepted without a fence-storage allocation path")
+            errors.append(f"{LOGIC}: HNF1 delegation/generation invariant missing: {fragment}")
+    type_body = unique_function(sources, PROTO_HNF, "native_type_is_admitted", errors)
+    if type_body is not None and "HELIOS_NATIVE_FENCE_TYPE_INTRA_GPU" in type_body[1]:
+        errors.append(f"{PROTO_HNF}: INTRA_GPU accepted without a fence-storage allocation path")
     for fragment in (
         "offset_of!(DXGKARG_CREATENATIVEFENCE,Flags)-offset_of!(DXGKARG_CREATENATIVEFENCE,pPrivateDriverData)==nf::HNF1_SIZE",
         "offset_of!(DXGKARG_OPENNATIVEFENCE,Reserved)-offset_of!(DXGKARG_OPENNATIVEFENCE,pPrivateDriverData)==nf::HNF1_SIZE",
@@ -518,7 +539,7 @@ def check_local_sources(sources: dict[str, str]) -> list[str]:
         (
             "args.Flags.__bindgen_anon_1.Value",
             "all_zero(&args.Reserved)",
-            "core::ptr::eq(global_ref.authority.as_ref(), adapter.native_fence.as_ref(),",
+            "core::ptr::eq(global_ref.authority.as_ref(), adapter.native_fence.as_ref())",
             "global_ref.adapter_generation != local_ref.adapter_generation",
             "global_ref.object_generation != local_ref.object_generation",
             "global_ref.epoch != local_ref.epoch",
@@ -755,7 +776,7 @@ def mutation_cases() -> tuple[Mutation, ...]:
         ),
         Mutation("decoy activation switch", NATIVE, "pub(crate) const NATIVE_FENCE_ADVERTISED", "const NATIVE_FENCE_ENABLED: bool = true;\npub(crate) const NATIVE_FENCE_ADVERTISED"),
         Mutation("bypass caps admission", NATIVE, "    let admitted = unsafe { ensure_feature_admitted(adapter) }\n        && native_fence_admitted(adapter.native_fence.as_ref());", "    let admitted = true;"),
-        Mutation("unaligned caps output", NATIVE, "        || !(args.pOutputData as *mut DXGK_NATIVE_FENCE_CAPS).is_aligned()\n", ""),
+        Mutation("unaligned caps output", NATIVE, "if args.pOutputData.is_null() || !(args.pOutputData as *mut DXGK_NATIVE_FENCE_CAPS).is_aligned()", "if args.pOutputData.is_null()"),
         Mutation("nonzero caps reserved", NATIVE, "    caps.MonitoredValuePadding = 0;", "    caps.Reserved[0] = 1;\n    caps.MonitoredValuePadding = 0;"),
         Mutation("unsupported caps mapping", NATIVE, "    caps.MapToGpuSystemProcess = 0;", "    caps.MapToGpuSystemProcess = 1;"),
         Mutation("unsupported caps range", NATIVE, "pub(crate) const NATIVE_FENCE_MINIMUM_ADDRESS: u64 = 0;", "pub(crate) const NATIVE_FENCE_MINIMUM_ADDRESS: u64 = 8;"),
@@ -766,12 +787,12 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("register native log callback", LIB, "    data.DxgkDdiUpdateCurrentValuesFromCpu = Some(ddi::dxgkddi_update_current_values_from_cpu);", "    data.DxgkDdiUpdateCurrentValuesFromCpu = Some(ddi::dxgkddi_update_current_values_from_cpu);\n    data.DxgkDdiSetNativeFenceLogBuffer = Some(ddi::dxgkddi_set_native_fence_log_buffer);"),
         Mutation("fabricate AdapterLuid", LIFECYCLE, "        (*dxgk_start_info).AdapterLuid", "        LUID { LowPart: 1, HighPart: 0 }"),
         Mutation("module-global authority", NATIVE, "pub static NF_CREATE_OK", "static NF_EPOCH_AUTHORITY: AtomicU64 = AtomicU64::new(1);\npub static NF_CREATE_OK"),
-        Mutation("weaken HNF1 layout", LOGIC, "pub const HNF1_SIZE: usize = 64;", "pub const HNF1_SIZE: usize = 63;"),
-        Mutation("weaken HNF1 package generation", LOGIC, "if parsed.package_generation != package_generation {", "if false {"),
-        Mutation("weaken HNF1 object generation", LOGIC, "if parsed.object_generation != 0 {", "if false {"),
-        Mutation("weaken HNF1 type", LOGIC, "native_type == NATIVE_FENCE_TYPE_DEFAULT", "true"),
-        Mutation("weaken HNF1 flags", LOGIC, "if parsed.flags & HNF1_FLAGS_RESERVED_MASK != 0 {", "if false {"),
-        Mutation("weaken HNF1 reserved tail", LOGIC, "if bytes[OFF_RESERVED + i] != 0 {", "if false {"),
+        Mutation("weaken HNF1 layout", PROTO_HNF, "pub const HELIOS_HNF1_SIZE: usize = 64;", "pub const HELIOS_HNF1_SIZE: usize = 63;"),
+        Mutation("weaken HNF1 package generation", PROTO_HNF, "if package_generation == 0 || self.package_generation != package_generation {", "if false {"),
+        Mutation("weaken HNF1 object generation", PROTO_HNF, "if self.object_generation != 0 {", "if false {"),
+        Mutation("weaken HNF1 type", PROTO_HNF, "native_type == HELIOS_NATIVE_FENCE_TYPE_DEFAULT", "true"),
+        Mutation("weaken HNF1 flags", PROTO_HNF, "if self.flags & HELIOS_HNF1_FLAGS_RESERVED_MASK != 0 {", "if false {"),
+        Mutation("weaken HNF1 reserved tail", PROTO_HNF, "if self.reserved != [0; 24] {", "if false {"),
         Mutation("add handle registry", NATIVE, "const GLOBAL_MAGIC", "static FENCE_TABLE: AtomicU64 = AtomicU64::new(0);\nfn lookup(handle: u64) -> u64 { handle }\nconst GLOBAL_MAGIC"),
         Mutation("remove update bound", NATIVE, "    if !nf::update_count_is_bounded(count) {", "    if false {"),
         Mutation("mutate during update preflight", NATIVE, "        // SAFETY: dxgkrnl returns only driver handles this module assigned.\n        let Some(global)", "        unsafe { slot.cast::<u64>().write_volatile(0) };\n        // SAFETY: dxgkrnl returns only driver handles this module assigned.\n        let Some(global)"),
@@ -779,7 +800,7 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("interrupt every completion", INTERRUPT, "guard.note_ordered_engine_native_rescan(delivered);", "guard.note_ordered_engine_native_rescan(1);"),
         Mutation("name unsafe interrupt subset", NATIVE, "    arm.SignaledNativeFenceCount = 0;", "    arm.SignaledNativeFenceCount = 1;"),
         Mutation("set hardware queue on interrupt", NATIVE, "    arm.hHWQueue = core::ptr::null_mut();", "    arm.hHWQueue = 1usize as HANDLE;"),
-        Mutation("bypass shared DIRQL helper", NATIVE, "        super::submit_command::notify_at_dirql(dxgkrnl, &mut interrupt, false)", "        dxgkrnl.DxgkCbNotifyInterrupt.unwrap()(dxgkrnl.DeviceHandle, &mut interrupt); STATUS_SUCCESS"),
+        Mutation("bypass shared DIRQL helper", NATIVE, "let status = unsafe { super::submit_command::notify_at_dirql(dxgkrnl, &mut interrupt, false) };", "let status = unsafe { dxgkrnl.DxgkCbNotifyInterrupt.unwrap()(dxgkrnl.DeviceHandle, &mut interrupt) };"),
         Mutation("reorder reset invalidation", SUBMIT, "    crate::ddi::native_fence::invalidate_all(\n        adapter,\n        crate::ddi::native_fence::NativeFenceInvalidation::Reset,\n    );\n    crate::adapter::allocation_object::invalidate_all();", "    crate::adapter::allocation_object::invalidate_all();\n    crate::ddi::native_fence::invalidate_all(\n        adapter,\n        crate::ddi::native_fence::NativeFenceInvalidation::Reset,\n    );"),
         Mutation("remove skipped-stop invalidation", LIFECYCLE, "    crate::ddi::native_fence::invalidate_all(\n        adapter,\n        crate::ddi::native_fence::NativeFenceInvalidation::StopOrRemove,\n    );\n    crate::adapter::allocation_object::invalidate_all();\n    adapter.close_k11_completions_and_wait(passive);\n    adapter\n        .isr_status", "    crate::adapter::allocation_object::invalidate_all();\n    adapter.close_k11_completions_and_wait(passive);\n    adapter\n        .isr_status"),
         Mutation("remove StopDevice invalidation", LIFECYCLE, "        crate::ddi::native_fence::invalidate_all(\n            adapter,\n            crate::ddi::native_fence::NativeFenceInvalidation::StopOrRemove,\n        );\n        crate::adapter::allocation_object::invalidate_all();\n        adapter.close_k11_completions_and_wait(passive_stop);\n        // Stop the ISR", "        crate::adapter::allocation_object::invalidate_all();\n        adapter.close_k11_completions_and_wait(passive_stop);\n        // Stop the ISR"),
