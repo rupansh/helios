@@ -988,6 +988,9 @@ run_gate "Mesa A5 direct dispatch is versioned, direct-owned, provenance-checked
 run_gate "Mesa A6 profile is two-type, no-WSI, bounded, exact-import, A7-withheld, and mutation-checked" \
     python3 "$REPO/tools/mesa-a6-profile-gate.py" "$REPO" --mutations
 
+run_gate "F21 direct consumers and exact outer-allocation ownership are mutation-closed" \
+    python3 "$REPO/tools/f21-consumer-token-gate.py" "$REPO" --mutations
+
 run_gate "D4 classic/DMA DIRQL enqueue is capability-restricted and fixed-storage" \
     python3 "$REPO/tools/d4-dirql-gate.py" "$REPO"
 

@@ -692,7 +692,9 @@ pub(crate) unsafe extern "C" fn ia_set_index_buffer(
             buf.as_ref().map(|b| b.as_raw() as usize).unwrap_or(0),
             Ordering::Relaxed,
         );
-        bindings.current_ib_format.store(format as u32, Ordering::Relaxed);
+        bindings
+            .current_ib_format
+            .store(format as u32, Ordering::Relaxed);
         bindings.current_ib_offset.store(offset, Ordering::Relaxed);
     }
     if IA_BIND_LOG_COUNT.first_n(128).is_some() {

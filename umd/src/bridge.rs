@@ -40,7 +40,50 @@ mod ffi {
         /// the owning ref; wrap on the Rust side without taking ownership.
         fn d3d11_device_ptr(self: &HeliosDxvkDevice) -> usize;
         fn d3d11_context_ptr(self: &HeliosDxvkDevice) -> usize;
-        fn venus_context_id(self: &HeliosDxvkDevice) -> u32;
+        unsafe fn create_associated_buffer(
+            self: &HeliosDxvkDevice,
+            desc_ptr: usize,
+            initial_data_ptr: usize,
+            package_generation: u64,
+            device_generation: u64,
+            outer_allocation_token: u64,
+            outer_allocation_bytes: u64,
+            cpu_mapping: usize,
+            association_flags: u32,
+        ) -> usize;
+        unsafe fn create_associated_texture1d(
+            self: &HeliosDxvkDevice,
+            desc_ptr: usize,
+            initial_data_ptr: usize,
+            package_generation: u64,
+            device_generation: u64,
+            outer_allocation_token: u64,
+            outer_allocation_bytes: u64,
+            cpu_mapping: usize,
+            association_flags: u32,
+        ) -> usize;
+        unsafe fn create_associated_texture2d(
+            self: &HeliosDxvkDevice,
+            desc_ptr: usize,
+            initial_data_ptr: usize,
+            package_generation: u64,
+            device_generation: u64,
+            outer_allocation_token: u64,
+            outer_allocation_bytes: u64,
+            cpu_mapping: usize,
+            association_flags: u32,
+        ) -> usize;
+        unsafe fn create_associated_texture3d(
+            self: &HeliosDxvkDevice,
+            desc_ptr: usize,
+            initial_data_ptr: usize,
+            package_generation: u64,
+            device_generation: u64,
+            outer_allocation_token: u64,
+            outer_allocation_bytes: u64,
+            cpu_mapping: usize,
+            association_flags: u32,
+        ) -> usize;
         fn feed_trace_timestamp_ns(self: &HeliosDxvkDevice) -> u64;
         fn feed_trace_render_callback(self: &HeliosDxvkDevice, duration_ns: u64);
         fn feed_trace_present_callback(self: &HeliosDxvkDevice, duration_ns: u64);
@@ -176,6 +219,9 @@ mod ffi {
         /// IddCx consumer never copies a buffer whose writes are in flight.
         /// Returns false on timeout (caller proceeds — bounded by design).
         fn present_frame_gate(self: &HeliosDxvkDevice, timeout_us: u32, order_mode: u32) -> bool;
+        /// Flush and wait only through the actual vkQueueSubmit edge. Used by
+        /// WDDM 2.1 ReleaseResource; never waits for GPU completion.
+        fn flush_submitted(self: &HeliosDxvkDevice) -> bool;
 
         /// # Safety
         /// The three output pointers are live writable u32/u32/u64 storage for
@@ -242,11 +288,23 @@ mod ffi {
 
         /// Create a DXVK instance and logical device on the Helios venus adapter.
         ///
-        /// `luid_low`/`luid_high` identify the WDDM adapter to match; pass `(0, 0)`
-        /// to take the first enumerated adapter. Returns a null `UniquePtr` on
-        /// failure (no adapter, device creation threw, etc.). Never panics across
-        /// the FFI boundary — the C++ side catches all exceptions.
-        fn helios_dxvk_create_device(luid_low: u32, luid_high: i32) -> UniquePtr<HeliosDxvkDevice>;
+        /// The instance, GIPA and module are the exact A5-owned construction
+        /// edge. The bridge never asks a Vulkan loader for another instance.
+        /// The nonzero LUID must match one physical device exactly.
+        fn helios_dxvk_create_device(
+            vk_instance: usize,
+            get_instance_proc_addr: usize,
+            icd_module_base: usize,
+            luid_low: u32,
+            luid_high: i32,
+            outer_context: usize,
+            outer_begin: usize,
+            outer_finish: usize,
+            outer_join: usize,
+            outer_allocate: usize,
+            outer_teardown_begin: usize,
+            outer_retire: usize,
+        ) -> UniquePtr<HeliosDxvkDevice>;
     }
 }
 
@@ -275,7 +333,10 @@ use core::ffi::c_void;
 use core::mem::ManuallyDrop;
 
 use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D11::{ID3D11Device, ID3D11DeviceContext, ID3D11Resource};
+use windows::Win32::Graphics::Direct3D11::{
+    ID3D11Buffer, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture1D,
+    ID3D11Texture2D, ID3D11Texture3D,
+};
 
 /// Adopt an owned COM pointer the bridge returned, or `None` for its 0-failure
 /// sentinel. The single `from_raw` for every owning bridge entry point.
@@ -459,14 +520,48 @@ impl BridgeDevice {
     /// `None` when the bridge returned a null device (no adapter, creation
     /// threw, ...) -- folding the old `is_null()` check into construction so a
     /// `BridgeDevice` that exists is always usable.
-    pub fn create(luid_low: u32, luid_high: i32) -> Option<Self> {
-        let inner = ffi::helios_dxvk_create_device(luid_low, luid_high);
+    pub fn create(
+        vk_instance: usize,
+        get_instance_proc_addr: usize,
+        icd_module_base: usize,
+        luid_low: u32,
+        luid_high: i32,
+        outer_context: usize,
+        outer_begin: usize,
+        outer_finish: usize,
+        outer_join: usize,
+        outer_allocate: usize,
+        outer_teardown_begin: usize,
+        outer_retire: usize,
+    ) -> Option<Self> {
+        let inner = ffi::helios_dxvk_create_device(
+            vk_instance,
+            get_instance_proc_addr,
+            icd_module_base,
+            luid_low,
+            luid_high,
+            outer_context,
+            outer_begin,
+            outer_finish,
+            outer_join,
+            outer_allocate,
+            outer_teardown_begin,
+            outer_retire,
+        );
         (!inner.is_null()).then_some(Self { inner })
     }
 
     /// The only path from the newtype to the sealed type, and it is private.
     fn get(&self) -> Option<&ffi::HeliosDxvkDevice> {
         self.inner.as_ref()
+    }
+
+    /// Drop the complete DXVK/D3D11 engine while the boxed A5 outer context is
+    /// still attached. Its destructor may flush/wait and therefore must run
+    /// before HQC1, HQA1, or the sole VkInstance are torn down.
+    pub(crate) fn shutdown(&mut self) {
+        let inner = core::mem::replace(&mut self.inner, cxx::UniquePtr::null());
+        drop(inner);
     }
 
     // -- borrowed COM ------------------------------------------------------
@@ -477,6 +572,97 @@ impl BridgeDevice {
 
     pub(crate) fn d3d11_context(&self) -> Option<ManuallyDrop<ID3D11DeviceContext>> {
         self.get()?.d3d11_context()
+    }
+
+    /// Create one resource through the immutable HRA1 construction edge.
+    /// `kind` is the closed D3D11 resource dimension set: 0 buffer, 1 texture
+    /// 1D, 2 texture 2D, 3 texture 3D. The returned pointer is the owning
+    /// interface for that exact kind and is converted to ID3D11Resource here.
+    pub(crate) unsafe fn create_associated_resource(
+        &self,
+        kind: u32,
+        desc_ptr: usize,
+        initial_data_ptr: usize,
+        association: &helios_protocol::HeliosResourceAssociationV1,
+    ) -> Option<ID3D11Resource> {
+        let d = self.get()?;
+        let raw = match kind {
+            0 => unsafe {
+                d.create_associated_buffer(
+                    desc_ptr,
+                    initial_data_ptr,
+                    association.package_generation,
+                    association.device_generation,
+                    association.outer_allocation_token,
+                    association.outer_allocation_bytes,
+                    association.cpu_mapping as usize,
+                    association.association_flags,
+                )
+            },
+            1 => unsafe {
+                d.create_associated_texture1d(
+                    desc_ptr,
+                    initial_data_ptr,
+                    association.package_generation,
+                    association.device_generation,
+                    association.outer_allocation_token,
+                    association.outer_allocation_bytes,
+                    association.cpu_mapping as usize,
+                    association.association_flags,
+                )
+            },
+            2 => unsafe {
+                d.create_associated_texture2d(
+                    desc_ptr,
+                    initial_data_ptr,
+                    association.package_generation,
+                    association.device_generation,
+                    association.outer_allocation_token,
+                    association.outer_allocation_bytes,
+                    association.cpu_mapping as usize,
+                    association.association_flags,
+                )
+            },
+            3 => unsafe {
+                d.create_associated_texture3d(
+                    desc_ptr,
+                    initial_data_ptr,
+                    association.package_generation,
+                    association.device_generation,
+                    association.outer_allocation_token,
+                    association.outer_allocation_bytes,
+                    association.cpu_mapping as usize,
+                    association.association_flags,
+                )
+            },
+            _ => 0,
+        };
+        if raw == 0 {
+            return None;
+        }
+        match kind {
+            0 => Some(
+                ID3D11Buffer::from_raw(raw as *mut core::ffi::c_void)
+                    .cast::<ID3D11Resource>()
+                    .ok()?,
+            ),
+            1 => Some(
+                ID3D11Texture1D::from_raw(raw as *mut core::ffi::c_void)
+                    .cast::<ID3D11Resource>()
+                    .ok()?,
+            ),
+            2 => Some(
+                ID3D11Texture2D::from_raw(raw as *mut core::ffi::c_void)
+                    .cast::<ID3D11Resource>()
+                    .ok()?,
+            ),
+            3 => Some(
+                ID3D11Texture3D::from_raw(raw as *mut core::ffi::c_void)
+                    .cast::<ID3D11Resource>()
+                    .ok()?,
+            ),
+            _ => None,
+        }
     }
 
     /// # Safety
@@ -566,10 +752,6 @@ impl BridgeDevice {
 
     // -- scalar passthroughs ----------------------------------------------
 
-    pub(crate) fn venus_context_id(&self) -> u32 {
-        self.get().map_or(0, |d| d.venus_context_id())
-    }
-
     pub(crate) fn feed_trace_timestamp_ns(&self) -> u64 {
         self.get().map_or(0, |d| d.feed_trace_timestamp_ns())
     }
@@ -589,6 +771,10 @@ impl BridgeDevice {
     pub(crate) fn present_frame_gate(&self, timeout_us: u32, order_mode: u32) -> bool {
         self.get()
             .is_some_and(|d| d.present_frame_gate(timeout_us, order_mode))
+    }
+
+    pub(crate) fn flush_submitted(&self) -> bool {
+        self.get().is_some_and(|d| d.flush_submitted())
     }
 
     /// Publish this present on the device's named timeline so a consumer can

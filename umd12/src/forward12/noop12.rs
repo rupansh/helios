@@ -138,20 +138,19 @@ macro_rules! ddi_noop_table {
     };
 }
 
-
-// ── The three driver-side DDI tables, 206 slots ────────────────────────────
+// ── The three driver-side DDI tables, 210 slots ────────────────────────────
 //
 // ⭐ The slot lists below were EXTRACTED from `umd12/bindgen/cached/d3d12umddi.rs`
 // by parsing the struct bodies, and the `const _` assertions inside the macro
 // re-check that extraction on every build: a misspelled name does not compile,
 // and a duplicated, reordered, missing or extra name fails the order proof.
 //
-// 124 + 75 + 7 = 206, plus the 8 adapter slots `adapter12` fills = **214**
+// 128 + 75 + 7 = 210, plus the 8 adapter slots `adapter12` fills = **218**
 // (`DECISIONS.md` §4.1, the canonical count table).
 
 ddi_noop_table! {
-    /// `D3D12DDI_DEVICE_FUNCS_CORE_0109` — **124** slots.
-    device_core, ddi12::D3D12DDI_DEVICE_FUNCS_CORE_0109, TABLE_DEVICE_CORE, [
+    /// `D3D12DDI_DEVICE_FUNCS_CORE_0116` — **128** slots.
+    device_core, ddi12::D3D12DDI_DEVICE_FUNCS_CORE_0116, TABLE_DEVICE_CORE, [
         pfnCheckFormatSupport, pfnCheckMultisampleQualityLevels, pfnGetMipPacking,
         pfnCalcPrivateElementLayoutSize, pfnCreateElementLayout, pfnDestroyElementLayout,
         pfnCalcPrivateBlendStateSize, pfnCreateBlendState, pfnDestroyBlendState,
@@ -199,12 +198,15 @@ ddi_noop_table! {
         pfnCreateSamplerFeedbackUnorderedAccessView, pfnCreateAmplificationShader,
         pfnCreateMeshShader, pfnCalcPrivateMeshShaderSize, pfnImplicitShaderCacheControl,
         pfnGetProgramIdentifier, pfnGetWorkGraphMemoryRequirements,
+        pfnGetTextureLayouts, pfnGetApplicationSpecificDriverState,
+        pfnGetApplicationSpecificDriverBlobStatus,
+        pfnGetApplicationSpecificDriverStateBlobSize,
     ]
 }
 
 ddi_noop_table! {
-    /// `D3D12DDI_COMMAND_LIST_FUNCS_3D_0108` — **75** slots.
-    command_list, ddi12::D3D12DDI_COMMAND_LIST_FUNCS_3D_0108, TABLE_COMMAND_LIST, [
+    /// `D3D12DDI_COMMAND_LIST_FUNCS_3D_0114` — **75** slots.
+    command_list, ddi12::D3D12DDI_COMMAND_LIST_FUNCS_3D_0114, TABLE_COMMAND_LIST, [
         pfnCloseCommandList, pfnResetCommandList, pfnDrawInstanced, pfnDrawIndexedInstanced,
         pfnDispatch, pfnClearUnorderedAccessViewUint, pfnClearUnorderedAccessViewFloat,
         pfnClearRenderTargetView, pfnClearDepthStencilView, pfnDiscardResource,
@@ -250,24 +252,24 @@ ddi_noop_table! {
 const DEVICE_CORE_BASE: usize = 0;
 const COMMAND_LIST_BASE: usize = DEVICE_CORE_BASE + device_core::NAMES.len();
 const COMMAND_QUEUE_BASE: usize = COMMAND_LIST_BASE + command_list::NAMES.len();
-/// 124 + 75 + 7. Derived, then checked against the canonical count table.
+/// 128 + 75 + 7. Derived, then checked against the released table shapes.
 pub(crate) const TOTAL_SLOTS: usize = COMMAND_QUEUE_BASE + command_queue::NAMES.len();
 
 // `DECISIONS.md` §4.1 is the only trustworthy count table in this directory, and
 // it says 8 + 124 + 75 + 7 = 214. The 8 are `adapter12`'s. If this ever fails,
 // the SDK header moved and §4.1 is what has to be re-derived — not this line.
-const _: () = assert!(TOTAL_SLOTS == 206);
+const _: () = assert!(TOTAL_SLOTS == 210);
 
 static HITS: [AtomicU32; TOTAL_SLOTS] = [const { AtomicU32::new(0) }; TOTAL_SLOTS];
 
 static TABLES: [TableInfo; TABLE_COUNT] = [
     TableInfo {
-        name: "DEVICE_FUNCS_CORE_0109",
+        name: "DEVICE_FUNCS_CORE_0116",
         base: DEVICE_CORE_BASE,
         slots: device_core::NAMES,
     },
     TableInfo {
-        name: "COMMAND_LIST_FUNCS_3D_0108",
+        name: "COMMAND_LIST_FUNCS_3D_0114",
         base: COMMAND_LIST_BASE,
         slots: command_list::NAMES,
     },

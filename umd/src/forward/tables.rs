@@ -62,12 +62,16 @@ pub struct Filled11_0(());
 #[must_use]
 pub struct Filled11_1(());
 
-/// Proof that [`install_wddm1_3`] has run. Terminal: nothing consumes it, and
-/// it exists so the chain reads as one pipeline rather than two links and a
-/// loose call. T6/R918 deleted the WDDM2.1 level above it -- the runtime could
-/// never negotiate that interface, so there is no `upgrade_wddm2_1`.
+/// Proof that [`install_wddm1_3`] has run. Consumed by the package-mandatory
+/// WDDM 2.1 ABI upgrade so the newer descriptor signatures cannot be installed
+/// ahead of their shared prefix.
 #[must_use]
 pub struct FilledWddm1_3(());
+
+/// Proof that every WDDM 2.0 signature change and the WDDM 2.1 sync-token tail
+/// has been installed with an exactly typed handler.
+#[must_use]
+pub struct FilledWddm2_1(());
 
 pub unsafe fn install(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) -> Filled11_0 {
     let f = &mut *funcs;
@@ -304,4 +308,35 @@ pub unsafe fn install_wddm1_3(
     f.pfnSetMarker = Some(set_marker);
     f.pfnSetMarkerMode = Some(set_marker_mode);
     FilledWddm1_3(())
+}
+
+pub unsafe fn install_wddm2_1(
+    level_1_3: FilledWddm1_3,
+    funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS,
+) -> FilledWddm2_1 {
+    let FilledWddm1_3(()) = level_1_3;
+    let f = &mut *funcs;
+
+    // WDDM 2.0 changes these signatures even though their table indices stay
+    // fixed.  Install through the real types; never leave an older pointer-
+    // argument handler hidden behind a layout cast.
+    f.pfnFlush = Some(flush_wddm2);
+    f.pfnCalcPrivateShaderResourceViewSize = Some(calc_size_srv_wddm2);
+    f.pfnCreateShaderResourceView = Some(create_srv_wddm2);
+    f.pfnCalcPrivateRenderTargetViewSize = Some(calc_size_rtv_wddm2);
+    f.pfnCreateRenderTargetView = Some(create_rtv_wddm2);
+    f.pfnCalcPrivateRasterizerStateSize = Some(calc_size_raster_wddm2);
+    f.pfnCreateRasterizerState = Some(create_raster_wddm2);
+    f.pfnCalcPrivateQuerySize = Some(calc_size_query_wddm2);
+    f.pfnCreateQuery = Some(create_query_wddm2);
+    f.pfnCalcPrivateUnorderedAccessViewSize = Some(calc_size_uav_wddm2);
+    f.pfnCreateUnorderedAccessView = Some(create_uav_wddm2);
+
+    f.pfnSetHardwareProtection = Some(set_hardware_protection_wddm2);
+    f.pfnGetResourceLayout = Some(get_resource_layout_wddm2);
+    f.pfnRetrieveShaderComment = Some(retrieve_shader_comment_wddm2);
+    f.pfnSetHardwareProtectionState = Some(set_hardware_protection_state_wddm2);
+    f.pfnAcquireResource = Some(acquire_resource_wddm2_1);
+    f.pfnReleaseResource = Some(release_resource_wddm2_1);
+    FilledWddm2_1(())
 }

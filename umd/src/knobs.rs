@@ -179,7 +179,8 @@ pub(crate) static UMD_COMMAND_LISTS: BoolKnob = BoolKnob::new(c"UmdCommandLists"
 /// turns instrumentation into a contended cache line in the benchmarked path.
 /// Keep the evidence available for an explicit diagnostic run, but absent =
 /// OFF means a timed run does no diagnostic atomic RMW at all.
-pub(crate) static UMD_DEFERRED_DIAGNOSTICS: BoolKnob = BoolKnob::new(c"UmdDeferredDiagnostics", false);
+pub(crate) static UMD_DEFERRED_DIAGNOSTICS: BoolKnob =
+    BoolKnob::new(c"UmdDeferredDiagnostics", false);
 
 /// The knob inventory, so the set is enumerable instead of grep-discoverable.
 ///
@@ -205,10 +206,16 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 10] {
         ("ScanoutAcquire", SCANOUT_ACQUIRE.get() as u32),
         ("ScanoutSnapshot", SCANOUT_SNAPSHOT.get() as u32),
         ("UmdPresentBatchFold", UMD_PRESENT_BATCH_FOLD.get() as u32),
-        ("UmdAsyncPresentStream", UMD_ASYNC_PRESENT_STREAM.get() as u32),
+        (
+            "UmdAsyncPresentStream",
+            UMD_ASYNC_PRESENT_STREAM.get() as u32,
+        ),
         ("UmdFreeThreaded", UMD_FREE_THREADED.get() as u32),
         ("UmdCommandLists", UMD_COMMAND_LISTS.get() as u32),
-        ("UmdDeferredDiagnostics", UMD_DEFERRED_DIAGNOSTICS.get() as u32),
+        (
+            "UmdDeferredDiagnostics",
+            UMD_DEFERRED_DIAGNOSTICS.get() as u32,
+        ),
     ]
 }
 

@@ -1,0 +1,530 @@
+//! WDDM 2.0/2.1 ABI-specific D3D11 entry points.
+//!
+//! WDDM 2.0 changes the signatures of six existing table slots and appends
+//! four device operations; WDDM 2.1 appends AcquireResource/ReleaseResource.
+//! The older prefix handlers cannot simply be left behind a cast: the runtime
+//! passes the newer descriptor layouts (including PlaneSlice/ContextType).
+
+use super::*;
+
+static WDDM2_REFUSAL_LOG: LogThrottle = LogThrottle::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wddm2Refusal {
+    NullArgument,
+    PlaneSlice,
+    ConservativeRasterization,
+    ForcedSampleCount,
+    UnsupportedHardwareProtection,
+    UnsupportedResourceLayout,
+    UnsupportedShaderComment,
+    MissingResource,
+    MissingAssociation,
+    ForeignDevice,
+    StaleGeneration,
+    ZeroSyncToken,
+    MissingPhysicalContext,
+    MissingRuntimeCallback,
+    SubmitFailed,
+    RuntimeCallback(i32),
+}
+
+unsafe fn refuse_void(h: Hdevice, site: &str, reason: Wddm2Refusal, hr: i32) {
+    if WDDM2_REFUSAL_LOG.first_n_then_every(32, 1024).is_some() {
+        log_error!("WDDM2.1 {site} refused: {reason:?} hr=0x{:08x}", hr as u32);
+    }
+    set_runtime_error(h, hr);
+}
+
+pub(crate) unsafe extern "C" fn flush_wddm2(
+    h: Hdevice,
+    _context_type: u32,
+    _flush_flags: u32,
+) -> ddi::BOOL {
+    // Helios exposes one physical graphics endpoint for this D3D11 device.
+    // Flushing it is a safe superset of any requested context-type subset.
+    flush(h);
+    1
+}
+
+pub(crate) unsafe extern "C" fn calc_size_srv_wddm2(
+    _h: Hdevice,
+    _arg: *const ddi::D3DWDDM2_0DDIARG_CREATESHADERRESOURCEVIEW,
+) -> u64 {
+    8
+}
+
+pub(crate) unsafe extern "C" fn create_srv_wddm2(
+    h: Hdevice,
+    arg: *const ddi::D3DWDDM2_0DDIARG_CREATESHADERRESOURCEVIEW,
+    h_srv: ddi::D3D10DDI_HSHADERRESOURCEVIEW,
+    h_rt: ddi::D3D10DDI_HRTSHADERRESOURCEVIEW,
+) {
+    clear_handle(h_srv);
+    let Some(a) = arg.as_ref() else {
+        refuse_void(
+            h,
+            "CreateShaderResourceView",
+            Wddm2Refusal::NullArgument,
+            E_INVALIDARG,
+        );
+        return;
+    };
+    let mut old = ddi::D3D11DDIARG_CREATESHADERRESOURCEVIEW::default();
+    old.hDrvResource = a.hDrvResource;
+    old.Format = a.Format;
+    old.ResourceDimension = a.ResourceDimension;
+    match a.ResourceDimension {
+        RES_BUFFER => old.__bindgen_anon_1.Buffer = a.__bindgen_anon_1.Buffer,
+        RES_BUFFEREX => old.__bindgen_anon_1.BufferEx = a.__bindgen_anon_1.BufferEx,
+        RES_TEX1D => old.__bindgen_anon_1.Tex1D = a.__bindgen_anon_1.Tex1D,
+        RES_TEX2D => {
+            let tex = a.__bindgen_anon_1.Tex2D;
+            if tex.PlaneSlice != 0 {
+                refuse_void(
+                    h,
+                    "CreateShaderResourceView",
+                    Wddm2Refusal::PlaneSlice,
+                    E_NOTIMPL,
+                );
+                return;
+            }
+            old.__bindgen_anon_1.Tex2D = ddi::D3D10DDIARG_TEX2D_SHADERRESOURCEVIEW {
+                MostDetailedMip: tex.MostDetailedMip,
+                FirstArraySlice: tex.FirstArraySlice,
+                MipLevels: tex.MipLevels,
+                ArraySize: tex.ArraySize,
+            };
+        }
+        RES_TEX3D => old.__bindgen_anon_1.Tex3D = a.__bindgen_anon_1.Tex3D,
+        RES_TEXCUBE => old.__bindgen_anon_1.TexCube = a.__bindgen_anon_1.TexCube,
+        _ => {
+            refuse_void(
+                h,
+                "CreateShaderResourceView",
+                Wddm2Refusal::MissingResource,
+                E_INVALIDARG,
+            );
+            return;
+        }
+    }
+    create_srv(h, &old, h_srv, h_rt);
+}
+
+pub(crate) unsafe extern "C" fn calc_size_rtv_wddm2(
+    _h: Hdevice,
+    _arg: *const ddi::D3DWDDM2_0DDIARG_CREATERENDERTARGETVIEW,
+) -> u64 {
+    8
+}
+
+pub(crate) unsafe extern "C" fn create_rtv_wddm2(
+    h: Hdevice,
+    arg: *const ddi::D3DWDDM2_0DDIARG_CREATERENDERTARGETVIEW,
+    h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW,
+    h_rt: ddi::D3D10DDI_HRTRENDERTARGETVIEW,
+) {
+    clear_handle(h_rtv);
+    let Some(a) = arg.as_ref() else {
+        refuse_void(
+            h,
+            "CreateRenderTargetView",
+            Wddm2Refusal::NullArgument,
+            E_INVALIDARG,
+        );
+        return;
+    };
+    let mut old = ddi::D3D10DDIARG_CREATERENDERTARGETVIEW::default();
+    old.hDrvResource = a.hDrvResource;
+    old.Format = a.Format;
+    old.ResourceDimension = a.ResourceDimension;
+    match a.ResourceDimension {
+        RES_BUFFER | RES_BUFFEREX => old.__bindgen_anon_1.Buffer = a.__bindgen_anon_1.Buffer,
+        RES_TEX1D => old.__bindgen_anon_1.Tex1D = a.__bindgen_anon_1.Tex1D,
+        RES_TEX2D => {
+            let tex = a.__bindgen_anon_1.Tex2D;
+            if tex.PlaneSlice != 0 {
+                refuse_void(
+                    h,
+                    "CreateRenderTargetView",
+                    Wddm2Refusal::PlaneSlice,
+                    E_NOTIMPL,
+                );
+                return;
+            }
+            old.__bindgen_anon_1.Tex2D = ddi::D3D10DDIARG_TEX2D_RENDERTARGETVIEW {
+                MipSlice: tex.MipSlice,
+                FirstArraySlice: tex.FirstArraySlice,
+                ArraySize: tex.ArraySize,
+            };
+        }
+        RES_TEX3D => old.__bindgen_anon_1.Tex3D = a.__bindgen_anon_1.Tex3D,
+        RES_TEXCUBE => old.__bindgen_anon_1.TexCube = a.__bindgen_anon_1.TexCube,
+        _ => {
+            refuse_void(
+                h,
+                "CreateRenderTargetView",
+                Wddm2Refusal::MissingResource,
+                E_INVALIDARG,
+            );
+            return;
+        }
+    }
+    create_rtv(h, &old, h_rtv, h_rt);
+}
+
+pub(crate) unsafe extern "C" fn calc_size_uav_wddm2(
+    _h: Hdevice,
+    _arg: *const ddi::D3DWDDM2_0DDIARG_CREATEUNORDEREDACCESSVIEW,
+) -> u64 {
+    8
+}
+
+pub(crate) unsafe extern "C" fn create_uav_wddm2(
+    h: Hdevice,
+    arg: *const ddi::D3DWDDM2_0DDIARG_CREATEUNORDEREDACCESSVIEW,
+    h_uav: ddi::D3D11DDI_HUNORDEREDACCESSVIEW,
+    h_rt: ddi::D3D11DDI_HRTUNORDEREDACCESSVIEW,
+) {
+    clear_handle(h_uav);
+    let Some(a) = arg.as_ref() else {
+        refuse_void(
+            h,
+            "CreateUnorderedAccessView",
+            Wddm2Refusal::NullArgument,
+            E_INVALIDARG,
+        );
+        return;
+    };
+    let mut old = ddi::D3D11DDIARG_CREATEUNORDEREDACCESSVIEW::default();
+    old.hDrvResource = a.hDrvResource;
+    old.Format = a.Format;
+    old.ResourceDimension = a.ResourceDimension;
+    match a.ResourceDimension {
+        RES_BUFFER | RES_BUFFEREX => old.__bindgen_anon_1.Buffer = a.__bindgen_anon_1.Buffer,
+        RES_TEX1D => old.__bindgen_anon_1.Tex1D = a.__bindgen_anon_1.Tex1D,
+        RES_TEX2D => {
+            let tex = a.__bindgen_anon_1.Tex2D;
+            if tex.PlaneSlice != 0 {
+                refuse_void(
+                    h,
+                    "CreateUnorderedAccessView",
+                    Wddm2Refusal::PlaneSlice,
+                    E_NOTIMPL,
+                );
+                return;
+            }
+            old.__bindgen_anon_1.Tex2D = ddi::D3D11DDIARG_TEX2D_UNORDEREDACCESSVIEW {
+                MipSlice: tex.MipSlice,
+                FirstArraySlice: tex.FirstArraySlice,
+                ArraySize: tex.ArraySize,
+            };
+        }
+        RES_TEX3D => old.__bindgen_anon_1.Tex3D = a.__bindgen_anon_1.Tex3D,
+        _ => {
+            refuse_void(
+                h,
+                "CreateUnorderedAccessView",
+                Wddm2Refusal::MissingResource,
+                E_INVALIDARG,
+            );
+            return;
+        }
+    }
+    create_uav(h, &old, h_uav, h_rt);
+}
+
+pub(crate) unsafe extern "C" fn calc_size_raster_wddm2(
+    _h: Hdevice,
+    _desc: *const ddi::D3DWDDM2_0DDI_RASTERIZER_DESC,
+) -> u64 {
+    8
+}
+
+pub(crate) unsafe extern "C" fn create_raster_wddm2(
+    h: Hdevice,
+    desc: *const ddi::D3DWDDM2_0DDI_RASTERIZER_DESC,
+    h_rs: ddi::D3D10DDI_HRASTERIZERSTATE,
+    h_rt: ddi::D3D10DDI_HRTRASTERIZERSTATE,
+) {
+    clear_handle(h_rs);
+    let Some(d) = desc.as_ref() else {
+        refuse_void(
+            h,
+            "CreateRasterizerState",
+            Wddm2Refusal::NullArgument,
+            E_INVALIDARG,
+        );
+        return;
+    };
+    if d.ConservativeRasterizationMode
+        != ddi::D3DWDDM2_0DDI_CONSERVATIVE_RASTERIZATION_MODE_D3DWDDM2_0DDI_CONSERVATIVE_RASTERIZATION_OFF
+    {
+        refuse_void(h, "CreateRasterizerState", Wddm2Refusal::ConservativeRasterization, E_NOTIMPL);
+        return;
+    }
+    if d.ForcedSampleCount != 0 {
+        refuse_void(
+            h,
+            "CreateRasterizerState",
+            Wddm2Refusal::ForcedSampleCount,
+            E_NOTIMPL,
+        );
+        return;
+    }
+    let old = ddi::D3D10_DDI_RASTERIZER_DESC {
+        FillMode: d.FillMode,
+        CullMode: d.CullMode,
+        FrontCounterClockwise: d.FrontCounterClockwise,
+        DepthBias: d.DepthBias,
+        DepthBiasClamp: d.DepthBiasClamp,
+        SlopeScaledDepthBias: d.SlopeScaledDepthBias,
+        DepthClipEnable: d.DepthClipEnable,
+        ScissorEnable: d.ScissorEnable,
+        MultisampleEnable: d.MultisampleEnable,
+        AntialiasedLineEnable: d.AntialiasedLineEnable,
+    };
+    create_rasterizer_state(h, &old, h_rs, h_rt);
+}
+
+pub(crate) unsafe extern "C" fn calc_size_query_wddm2(
+    _h: Hdevice,
+    _arg: *const ddi::D3DWDDM2_0DDIARG_CREATEQUERY,
+) -> u64 {
+    8
+}
+
+pub(crate) unsafe extern "C" fn create_query_wddm2(
+    h: Hdevice,
+    arg: *const ddi::D3DWDDM2_0DDIARG_CREATEQUERY,
+    h_query: ddi::D3D10DDI_HQUERY,
+    h_rt: ddi::D3D10DDI_HRTQUERY,
+) {
+    clear_handle(h_query);
+    let Some(a) = arg.as_ref() else {
+        refuse_void(h, "CreateQuery", Wddm2Refusal::NullArgument, E_INVALIDARG);
+        return;
+    };
+    // The selected D3D11 device owns one physical graphics context; every
+    // D3D11 query is therefore created on that context irrespective of the
+    // runtime's subset hint.
+    let old = ddi::D3D10DDIARG_CREATEQUERY {
+        Query: a.Query,
+        MiscFlags: a.MiscFlags,
+    };
+    create_query(h, &old, h_query, h_rt);
+}
+
+pub(crate) unsafe extern "C" fn set_hardware_protection_wddm2(
+    h: Hdevice,
+    _resource: ddi::D3D10DDI_HRESOURCE,
+    _protected: ddi::BOOL,
+) {
+    refuse_void(
+        h,
+        "SetHardwareProtection",
+        Wddm2Refusal::UnsupportedHardwareProtection,
+        E_NOTIMPL,
+    );
+}
+
+pub(crate) unsafe extern "C" fn get_resource_layout_wddm2(
+    h: Hdevice,
+    _resource: ddi::D3D10DDI_HRESOURCE,
+    _subresource_count: u32,
+    _allocations: *mut ddi::D3DKMT_HANDLE,
+    _layout: *mut ddi::D3DWDDM2_0DDI_TEXTURE_LAYOUT,
+    _mip_transition: *mut u32,
+    _subresources: *mut ddi::D3DWDDM2_0DDI_SUBRESOURCE_LAYOUT,
+) {
+    refuse_void(
+        h,
+        "GetResourceLayout",
+        Wddm2Refusal::UnsupportedResourceLayout,
+        E_NOTIMPL,
+    );
+}
+
+pub(crate) unsafe extern "C" fn retrieve_shader_comment_wddm2(
+    _h: Hdevice,
+    _shader: ddi::D3D10DDI_HSHADER,
+    _buffer: *mut ddi::WCHAR,
+    _characters: *mut ddi::SIZE_T,
+) -> i32 {
+    if WDDM2_REFUSAL_LOG.first_n_then_every(32, 1024).is_some() {
+        log_error!(
+            "WDDM2.1 RetrieveShaderComment refused: {:?}",
+            Wddm2Refusal::UnsupportedShaderComment
+        );
+    }
+    E_NOTIMPL
+}
+
+pub(crate) unsafe extern "C" fn set_hardware_protection_state_wddm2(
+    h: Hdevice,
+    _enabled: ddi::BOOL,
+) {
+    refuse_void(
+        h,
+        "SetHardwareProtectionState",
+        Wddm2Refusal::UnsupportedHardwareProtection,
+        E_NOTIMPL,
+    );
+}
+
+unsafe fn exact_sync_token_context(
+    h: Hdevice,
+    resource: ddi::D3D10DDI_HRESOURCE,
+    sync_token: ddi::HANDLE,
+) -> Result<(&'static HeliosDevice, ddi::D3DDDICB_SYNCTOKEN), Wddm2Refusal> {
+    if sync_token.is_null() {
+        return Err(Wddm2Refusal::ZeroSyncToken);
+    }
+    let dev = helios_device(h).ok_or(Wddm2Refusal::ForeignDevice)?;
+    let state = resource_state(resource).ok_or(Wddm2Refusal::MissingResource)?;
+    let identity = state
+        .outer_allocation
+        .ok_or(Wddm2Refusal::MissingAssociation)?;
+    let device_generation = dev.outer.translator.session_generation();
+    if device_generation == 0 || identity.device_generation != device_generation {
+        return Err(Wddm2Refusal::ForeignDevice);
+    }
+    let resident = state
+        .allocation
+        .as_ref()
+        .ok_or(Wddm2Refusal::MissingAssociation)?;
+    let allocations = lock_ignore_poison(&dev.outer.allocations);
+    let Some(current) = allocations
+        .entries
+        .iter()
+        .find(|entry| entry.token == identity.token)
+    else {
+        return Err(Wddm2Refusal::StaleGeneration);
+    };
+    if current.allocation != resident.handle()
+        || current.allocation_generation != identity.allocation_generation
+        || current.bytes != identity.bytes
+    {
+        return Err(Wddm2Refusal::StaleGeneration);
+    }
+    drop(allocations);
+    let _context = dev
+        .outer
+        .context
+        .as_ref()
+        .ok_or(Wddm2Refusal::MissingPhysicalContext)?;
+    // The pointer is consumed synchronously by the callback. The caller keeps
+    // the local handle word live across that call and replaces this temporary
+    // pointer immediately before invoking it.
+    Ok((
+        dev,
+        ddi::D3DDDICB_SYNCTOKEN {
+            hSyncToken: sync_token,
+            BroadcastContextCount: 1,
+            BroadcastContextArray: core::ptr::null(),
+        },
+    ))
+}
+
+unsafe fn run_sync_token(
+    h: Hdevice,
+    resource: ddi::D3D10DDI_HRESOURCE,
+    sync_token: ddi::HANDLE,
+    release: bool,
+) {
+    let (dev, mut arg) = match exact_sync_token_context(h, resource, sync_token) {
+        Ok(value) => value,
+        Err(reason) => {
+            refuse_void(
+                h,
+                if release {
+                    "ReleaseResource"
+                } else {
+                    "AcquireResource"
+                },
+                reason,
+                E_INVALIDARG,
+            );
+            return;
+        }
+    };
+    let Some(context) = dev.outer.context.as_ref() else {
+        refuse_void(
+            h,
+            if release {
+                "ReleaseResource"
+            } else {
+                "AcquireResource"
+            },
+            Wddm2Refusal::MissingPhysicalContext,
+            E_FAIL,
+        );
+        return;
+    };
+    let context_handle = context.handle.as_ptr();
+    arg.BroadcastContextArray = &context_handle;
+    if release && !dev.dxvk.flush_submitted() {
+        refuse_void(h, "ReleaseResource", Wddm2Refusal::SubmitFailed, E_FAIL);
+        return;
+    }
+    if dev.kt_callbacks.is_null() {
+        refuse_void(
+            h,
+            if release {
+                "ReleaseResource"
+            } else {
+                "AcquireResource"
+            },
+            Wddm2Refusal::MissingRuntimeCallback,
+            E_FAIL,
+        );
+        return;
+    }
+    let callback = if release {
+        (*dev.kt_callbacks).pfnReleaseResourceCb
+    } else {
+        (*dev.kt_callbacks).pfnAcquireResourceCb
+    };
+    let Some(callback) = callback else {
+        refuse_void(
+            h,
+            if release {
+                "ReleaseResource"
+            } else {
+                "AcquireResource"
+            },
+            Wddm2Refusal::MissingRuntimeCallback,
+            E_FAIL,
+        );
+        return;
+    };
+    let hr = callback(dev.h_rt_device, &arg);
+    if hr != 0 {
+        refuse_void(
+            h,
+            if release {
+                "ReleaseResource"
+            } else {
+                "AcquireResource"
+            },
+            Wddm2Refusal::RuntimeCallback(hr),
+            hr,
+        );
+    }
+}
+
+pub(crate) unsafe extern "C" fn acquire_resource_wddm2_1(
+    h: Hdevice,
+    resource: ddi::D3D10DDI_HRESOURCE,
+    sync_token: ddi::HANDLE,
+) {
+    run_sync_token(h, resource, sync_token, false);
+}
+
+pub(crate) unsafe extern "C" fn release_resource_wddm2_1(
+    h: Hdevice,
+    resource: ddi::D3D10DDI_HRESOURCE,
+    sync_token: ddi::HANDLE,
+) {
+    run_sync_token(h, resource, sync_token, true);
+}

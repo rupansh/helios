@@ -1811,6 +1811,106 @@ unsafe extern "C" fn discard_resource(
 // Install
 // ---------------------------------------------------------------------------
 
+macro_rules! bypass_list_wrapper {
+    ($wrapper:ident => $target:ident ( $( $arg:ident : $ty:ty ),* $(,)? )) => {
+        unsafe extern "C" fn $wrapper(
+            h_list: ddi12::D3D12DDI_API_HCOMMANDLIST,
+            $( $arg: $ty ),*
+        ) {
+            // SAFETY: Core-0114 supplies the runtime-bypass header for this
+            // application handle for the duration of the call.
+            let Some(h_list) = (unsafe { queue::command_list_from_api(h_list) }) else {
+                return;
+            };
+            unsafe { $target(h_list, $( $arg ),*) }
+        }
+    };
+}
+
+unsafe extern "C" fn set_compute_root_signature_0114(
+    h_list: ddi12::D3D12DDI_API_HCOMMANDLIST,
+    h_rs: ddi12::D3D12DDI_API_HROOTSIGNATURE,
+) {
+    // SAFETY: both values are application handles supplied for this Core-0114
+    // call; null root signatures remain null driver handles.
+    let Some(h_list) = (unsafe { queue::command_list_from_api(h_list) }) else {
+        return;
+    };
+    let Some(h_rs) = (unsafe { queue::root_signature_from_api(h_rs) }) else {
+        return;
+    };
+    unsafe { set_compute_root_signature(h_list, h_rs) }
+}
+
+unsafe extern "C" fn set_graphics_root_signature_0114(
+    h_list: ddi12::D3D12DDI_API_HCOMMANDLIST,
+    h_rs: ddi12::D3D12DDI_API_HROOTSIGNATURE,
+) {
+    // SAFETY: as `set_compute_root_signature_0114`.
+    let Some(h_list) = (unsafe { queue::command_list_from_api(h_list) }) else {
+        return;
+    };
+    let Some(h_rs) = (unsafe { queue::root_signature_from_api(h_rs) }) else {
+        return;
+    };
+    unsafe { set_graphics_root_signature(h_list, h_rs) }
+}
+
+bypass_list_wrapper!(set_compute_root_descriptor_table_0114 => set_compute_root_descriptor_table(
+    root_parameter_index: ddi12::UINT,
+    base: ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE,
+));
+bypass_list_wrapper!(set_graphics_root_descriptor_table_0114 => set_graphics_root_descriptor_table(
+    root_parameter_index: ddi12::UINT,
+    base: ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE,
+));
+bypass_list_wrapper!(set_compute_root_32bit_constant_0114 => set_compute_root_32bit_constant(
+    root_parameter_index: ddi12::UINT,
+    src_data: ddi12::UINT,
+    dest_offset_in_32bit_values: ddi12::UINT,
+));
+bypass_list_wrapper!(set_graphics_root_32bit_constant_0114 => set_graphics_root_32bit_constant(
+    root_parameter_index: ddi12::UINT,
+    src_data: ddi12::UINT,
+    dest_offset_in_32bit_values: ddi12::UINT,
+));
+bypass_list_wrapper!(set_compute_root_32bit_constants_0114 => set_compute_root_32bit_constants(
+    root_parameter_index: ddi12::UINT,
+    num_32bit_values_to_set: ddi12::UINT,
+    p_src_data: *const core::ffi::c_void,
+    dest_offset_in_32bit_values: ddi12::UINT,
+));
+bypass_list_wrapper!(set_graphics_root_32bit_constants_0114 => set_graphics_root_32bit_constants(
+    root_parameter_index: ddi12::UINT,
+    num_32bit_values_to_set: ddi12::UINT,
+    p_src_data: *const core::ffi::c_void,
+    dest_offset_in_32bit_values: ddi12::UINT,
+));
+bypass_list_wrapper!(set_compute_root_constant_buffer_view_0114 => set_compute_root_constant_buffer_view(
+    root_parameter_index: ddi12::UINT,
+    buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
+));
+bypass_list_wrapper!(set_graphics_root_constant_buffer_view_0114 => set_graphics_root_constant_buffer_view(
+    root_parameter_index: ddi12::UINT,
+    buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
+));
+bypass_list_wrapper!(set_compute_root_shader_resource_view_0114 => set_compute_root_shader_resource_view(
+    root_parameter_index: ddi12::UINT,
+    buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
+));
+bypass_list_wrapper!(set_graphics_root_shader_resource_view_0114 => set_graphics_root_shader_resource_view(
+    root_parameter_index: ddi12::UINT,
+    buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
+));
+bypass_list_wrapper!(set_compute_root_unordered_access_view_0114 => set_compute_root_unordered_access_view(
+    root_parameter_index: ddi12::UINT,
+    buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
+));
+bypass_list_wrapper!(set_graphics_root_unordered_access_view_0114 => set_graphics_root_unordered_access_view(
+    root_parameter_index: ddi12::UINT,
+    buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
+));
+
 /// Install L3b's 21 command-list slots.
 ///
 /// Chain position: `RecordSlots` -> `RootArgSlots` on the command-list table.
@@ -1820,20 +1920,21 @@ pub(crate) fn install(
     let table = filling.table();
     // root arguments — 16
     table.pfnSetDescriptorHeaps = Some(set_descriptor_heaps);
-    table.pfnSetComputeRootSignature = Some(set_compute_root_signature);
-    table.pfnSetGraphicsRootSignature = Some(set_graphics_root_signature);
-    table.pfnSetComputeRootDescriptorTable = Some(set_compute_root_descriptor_table);
-    table.pfnSetGraphicsRootDescriptorTable = Some(set_graphics_root_descriptor_table);
-    table.pfnSetComputeRoot32BitConstant = Some(set_compute_root_32bit_constant);
-    table.pfnSetGraphicsRoot32BitConstant = Some(set_graphics_root_32bit_constant);
-    table.pfnSetComputeRoot32BitConstants = Some(set_compute_root_32bit_constants);
-    table.pfnSetGraphicsRoot32BitConstants = Some(set_graphics_root_32bit_constants);
-    table.pfnSetComputeRootConstantBufferView = Some(set_compute_root_constant_buffer_view);
-    table.pfnSetGraphicsRootConstantBufferView = Some(set_graphics_root_constant_buffer_view);
-    table.pfnSetComputeRootShaderResourceView = Some(set_compute_root_shader_resource_view);
-    table.pfnSetGraphicsRootShaderResourceView = Some(set_graphics_root_shader_resource_view);
-    table.pfnSetComputeRootUnorderedAccessView = Some(set_compute_root_unordered_access_view);
-    table.pfnSetGraphicsRootUnorderedAccessView = Some(set_graphics_root_unordered_access_view);
+    table.pfnSetComputeRootSignature = Some(set_compute_root_signature_0114);
+    table.pfnSetGraphicsRootSignature = Some(set_graphics_root_signature_0114);
+    table.pfnSetComputeRootDescriptorTable = Some(set_compute_root_descriptor_table_0114);
+    table.pfnSetGraphicsRootDescriptorTable = Some(set_graphics_root_descriptor_table_0114);
+    table.pfnSetComputeRoot32BitConstant = Some(set_compute_root_32bit_constant_0114);
+    table.pfnSetGraphicsRoot32BitConstant = Some(set_graphics_root_32bit_constant_0114);
+    table.pfnSetComputeRoot32BitConstants = Some(set_compute_root_32bit_constants_0114);
+    table.pfnSetGraphicsRoot32BitConstants = Some(set_graphics_root_32bit_constants_0114);
+    table.pfnSetComputeRootConstantBufferView = Some(set_compute_root_constant_buffer_view_0114);
+    table.pfnSetGraphicsRootConstantBufferView = Some(set_graphics_root_constant_buffer_view_0114);
+    table.pfnSetComputeRootShaderResourceView = Some(set_compute_root_shader_resource_view_0114);
+    table.pfnSetGraphicsRootShaderResourceView = Some(set_graphics_root_shader_resource_view_0114);
+    table.pfnSetComputeRootUnorderedAccessView = Some(set_compute_root_unordered_access_view_0114);
+    table.pfnSetGraphicsRootUnorderedAccessView =
+        Some(set_graphics_root_unordered_access_view_0114);
     table.pfnClearRootArguments = Some(clear_root_arguments);
     // clears and discard — 5
     table.pfnClearUnorderedAccessViewUint = Some(clear_unordered_access_view_uint);

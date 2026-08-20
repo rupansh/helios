@@ -257,6 +257,7 @@ dependencies = [
 name = "helios_umd_common"
 version = "0.1.0"
 dependencies = [
+ "helios_protocol",
  "windows",
 ]
 

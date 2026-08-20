@@ -73,6 +73,7 @@
 
 #![deny(deprecated)]
 
+pub mod cpu_backing;
 pub mod format;
 pub mod hr;
 pub mod refusals;
@@ -84,6 +85,8 @@ pub mod window;
 // or the `windows` crate, so it is gated. ⚠ Keep the gate: without it a plain
 // `cargo build` on the Linux host fails and takes `tools/format-table-check.rs`
 // — the only test of the DXGI format table that runs anywhere — with it.
+#[cfg(windows)]
+pub mod direct_translator;
 #[cfg(windows)]
 pub mod knobs;
 #[cfg(windows)]

@@ -154,6 +154,7 @@ fn main() {
 
     let dxvk_src = def("HELIOS_DXVK_SRC", r"C:\Users\Rupansh\dxvk-helios");
     let dxvk_build = def("HELIOS_DXVK_BUILD", r"C:\Users\Rupansh\dxvk-build");
+    let mesa_build = def("HELIOS_MESA_BUILD", r"C:\Users\Rupansh\helios-mesa-build");
     let clang_cl = def("HELIOS_CLANG_CL", r"C:\Program Files\LLVM\bin\clang-cl.exe");
     let archiver = def("HELIOS_MSVC_LIB", r"C:\Program Files\LLVM\bin\llvm-lib.exe");
 
@@ -176,6 +177,7 @@ fn main() {
 
     require_path("HELIOS_DXVK_SRC", &dxvk_src, true);
     require_path("HELIOS_DXVK_BUILD", &dxvk_build, true);
+    require_path("HELIOS_MESA_BUILD", &mesa_build, true);
     require_path("HELIOS_CLANG_CL", &clang_cl, false);
     require_path("HELIOS_MSVC_LIB", &archiver, false);
 
@@ -188,13 +190,6 @@ fn main() {
         // T8/R1105: extra TUs inherit every include and define from this same
         // cc::Build, so there is no flag duplication to drift.
         .file("bridge/bridge_dxbc.cpp")
-        .file("bridge/bridge_icd_exports.cpp")
-        // S4b: the process-global venus-ICD anchor (`ARCHITECTURE.md` §6.4).
-        // ⛔ ONE source compiled into BOTH cdylibs — that is the mechanism, not
-        // duplication: each copy exports `helios_icd_anchor_v1`, and the copy in
-        // whichever module the loader enumerated first becomes the single
-        // publisher for the process. `umd12/build.rs` lists the identical line.
-        .file("../umd_common/bridge/bridge_icd_anchor.cpp")
         .compiler(&clang_cl)
         .archiver(&archiver)
         .static_crt(true)
@@ -209,6 +204,7 @@ fn main() {
         // same-named header in this crate must win, so a future D3D11-only
         // override is possible without editing `umd_common`.
         .include("../umd_common/bridge")
+        .include("../protocol/include")
         .include(format!(r"{dxvk_src}\src"))
         .include(format!(r"{dxvk_src}\src\dxvk"))
         .include(format!(r"{dxvk_src}\src\d3d11"))
@@ -257,6 +253,14 @@ fn main() {
         println!("cargo:rerun-if-changed={p}");
     }
 
+    // A5 is an ordinary package-owned import from the lower ICD. This import
+    // library is the explicit construction edge; the UMD never searches loaded
+    // modules, the registry, a manifest, or vulkan-1.dll for the entry point.
+    let mesa_import = format!(r"{mesa_build}\src\virtio\vulkan\vulkan_virtio.dll.a");
+    require_path("HELIOS_MESA_BUILD", &mesa_import, false);
+    println!("cargo:rustc-link-arg-cdylib={mesa_import}");
+    println!("cargo:rerun-if-changed={mesa_import}");
+
     // System libraries DXVK's engine/WSI depend on.
     // NOTE: deliberately NOT linking system dxgi. A WDDM UMD sits below DXGI and
     // implements the DXGI DDI; it must not depend on dxgi.dll. DXVK's only
@@ -278,13 +282,9 @@ fn main() {
         // `helios_dxvk_bridge.lib` linked into the DLL.
         "../umd_common/bridge/bridge_common.h",
         "../umd_common/bridge/bridge_guard.h",
-        "../umd_common/bridge/bridge_icd_anchor.cpp",
-        "../umd_common/bridge/bridge_icd_anchor.h",
         "../umd_common/bridge/bridge_util.h",
         "bridge/bridge_dxbc.cpp",
         "bridge/bridge_dxbc.h",
-        "bridge/bridge_icd_exports.cpp",
-        "bridge/bridge_icd_exports.h",
         "bridge/dxvk_bridge.cpp",
         "bridge/dxvk_bridge.h",
         "src/bridge.rs",
@@ -293,4 +293,5 @@ fn main() {
     }
     println!("cargo:rerun-if-env-changed=HELIOS_DXVK_SRC");
     println!("cargo:rerun-if-env-changed=HELIOS_DXVK_BUILD");
+    println!("cargo:rerun-if-env-changed=HELIOS_MESA_BUILD");
 }

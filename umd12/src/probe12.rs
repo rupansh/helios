@@ -29,6 +29,7 @@
 
 use core::ffi::c_void;
 
+use helios_umd_common::direct_translator::DirectTranslator;
 use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, S_OK};
 use windows::core::Interface;
 
@@ -37,6 +38,63 @@ use crate::{ddi12, forward12, init_once, note_refusal, UMD12_REFUSALS};
 
 // The one cast in this file, made checkable instead of trusted.
 const _: () = assert!(core::mem::size_of::<usize>() == core::mem::size_of::<ddi12::SIZE_T>());
+
+struct ProbeDevice12 {
+    _bridge: BridgeDevice12,
+    _translator: DirectTranslator,
+    _outer_context: Box<ProbeOuterContext12>,
+}
+
+struct ProbeOuterContext12;
+
+extern "C" fn probe_outer_create(
+    _context: *mut c_void,
+    _bytes: u64,
+    _cpu_visible: u32,
+    _device_local: u32,
+    association_out: *mut helios_protocol::HeliosResourceAssociationV1,
+) -> i32 {
+    if !association_out.is_null() {
+        unsafe { association_out.write(core::mem::zeroed()) };
+    }
+    // A probe has no runtime device callbacks and therefore cannot fabricate
+    // the exact WDDM allocation required by record-only vkd3d.
+    E_FAIL
+}
+
+extern "C" fn probe_outer_teardown_begin(
+    _context: *mut c_void,
+    _device_generation: u64,
+    _outer_allocation_token: u64,
+) -> i32 {
+    E_FAIL
+}
+
+extern "C" fn probe_outer_begin(
+    _context: *mut c_void,
+    _device_generation: u64,
+    _outer_allocation_token: u64,
+    _out_scope: *mut *mut c_void,
+) -> i32 {
+    E_FAIL
+}
+
+extern "C" fn probe_outer_finish(
+    _context: *mut c_void,
+    _scope: *mut c_void,
+    _lower_result: i32,
+) -> i32 {
+    E_FAIL
+}
+
+extern "C" fn probe_outer_retire(
+    _context: *mut c_void,
+    _device_generation: u64,
+    _outer_allocation_token: u64,
+    _teardown_result: i32,
+) -> i32 {
+    E_FAIL
+}
 
 /// Drive `pfnFillDDITable` directly, without a device.
 ///
@@ -177,7 +235,33 @@ pub unsafe extern "C" fn helios_umd12_probe_create_device_v1(
         *out_device = core::ptr::null_mut();
     }
 
-    let Some(bridge) = BridgeDevice12::create(luid_low, luid_high) else {
+    let luid = ((luid_high as u32 as u64) << 32) | luid_low as u64;
+    let translator = match DirectTranslator::create(
+        luid as i64,
+        helios_protocol::HELIOS_HTS1_MAX_ENDPOINTS_PER_SESSION,
+        Some(crate::device12::translator_sync_progress_join),
+        Some(crate::device12::translator_sync_progress_query),
+    ) {
+        Ok(translator) => translator,
+        Err(_) => {
+            note_refusal(&UMD12_REFUSALS.probe12_create_failed);
+            return E_FAIL;
+        }
+    };
+    let mut outer_context = Box::new(ProbeOuterContext12);
+    let Some(bridge) = BridgeDevice12::create(
+        translator.vk_instance() as usize,
+        translator.get_instance_proc_addr() as usize,
+        translator.module_base() as usize,
+        luid_low,
+        luid_high,
+        core::ptr::from_mut(outer_context.as_mut()) as usize,
+        probe_outer_create as *const () as usize,
+        probe_outer_teardown_begin as *const () as usize,
+        probe_outer_begin as *const () as usize,
+        probe_outer_finish as *const () as usize,
+        probe_outer_retire as *const () as usize,
+    ) else {
         // The C++ side has already logged the engine's HRESULT into
         // `umd12-<pid>.log`; this is the countable half of the same event.
         note_refusal(&UMD12_REFUSALS.probe12_create_failed);
@@ -200,7 +284,12 @@ pub unsafe extern "C" fn helios_umd12_probe_create_device_v1(
 
     // Ownership of the bridge transfers to the caller here and nowhere earlier,
     // so every path above this line drops it.
-    let handle = Box::into_raw(Box::new(bridge)).cast::<c_void>();
+    let handle = Box::into_raw(Box::new(ProbeDevice12 {
+        _bridge: bridge,
+        _translator: translator,
+        _outer_context: outer_context,
+    }))
+    .cast::<c_void>();
     // SAFETY: as above — both out-params are non-null, writable and unaliased.
     // `handle` is a fresh `Box::into_raw` and `device_raw` is the bridge's live
     // device, which `handle` keeps alive.
@@ -209,48 +298,6 @@ pub unsafe extern "C" fn helios_umd12_probe_create_device_v1(
         *out_device = device_raw;
     }
     S_OK
-}
-
-/// The venus context id this bridge's `ID3D12Device` belongs to (S4b), or 0.
-///
-/// ⛔ **NOT an equality check, and `ARCHITECTURE.md` §6.4 is wrong to ask for
-/// one.** §6.4 states S4b's criterion as *"both venus context ids non-zero and
-/// equal"*. Measured twice, in both load orders
-/// (`tmp/dx12/gates/S4b/RESULT.md`):
-///
-/// | order | this value | the ICD's process-global |
-/// |---|---:|---:|
-/// | D3D11 then D3D12 | 23, 33 | 23, 33 — equal |
-/// | D3D12 then D3D11 | 25, 35 | 27, 37 — **different** |
-///
-/// Each engine builds its **own** `VkInstance` and the ICD mints a venus context
-/// **per instance**, so two engines in one process are *expected* to hold two
-/// different ids; the process-global export is last-writer-wins, so it merely
-/// names whichever engine created its instance last. Equality is an artifact of
-/// ordering, not an invariant.
-///
-/// ⭐ The invariant the anchor actually provides — and what
-/// `tools/icd_anchor_probe.cpp` asserts — is **one venus ICD MODULE per
-/// process**. This value is *reported* beside it, never asserted equal.
-///
-/// ⚠ 0 is a *degraded read* (no ICD loaded, or one too old to export the ctx
-/// id), NOT an anchor failure: a genuine anchor mismatch refuses device
-/// creation outright, so there is no bridge left to ask.
-///
-/// # Safety
-/// `bridge` must be null, or a live handle from
-/// [`helios_umd12_probe_create_device_v1`] that has not been destroyed.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn helios_umd12_probe_venus_context_id_v1(bridge: *mut c_void) -> u32 {
-    if bridge.is_null() {
-        return 0;
-    }
-    // SAFETY: the caller guarantees a live handle produced by
-    // `Box::into_raw(Box::new(BridgeDevice12))`, so the pointee type and
-    // alignment match. Borrowed for the call only — ⛔ NOT `Box::from_raw`,
-    // which would free the caller's still-owned bridge on every read.
-    let bridge = unsafe { &*bridge.cast::<BridgeDevice12>() };
-    bridge.venus_context_id()
 }
 
 /// Drop the bridge and its engine reference. Null-tolerant.
@@ -278,7 +325,7 @@ pub unsafe extern "C" fn helios_umd12_probe_destroy_device_v1(bridge: *mut c_voi
     // allocator and the alignment all match. Dropping the box drops the
     // `cxx::UniquePtr`, which runs the out-of-line C++ destructor and releases
     // the engine's `ID3D12Device`.
-    drop(unsafe { Box::from_raw(bridge.cast::<BridgeDevice12>()) });
+    drop(unsafe { Box::from_raw(bridge.cast::<ProbeDevice12>()) });
 }
 
 /// Serialize a root signature through the engine. Stateless — no bridge handle
@@ -319,7 +366,8 @@ pub unsafe extern "C" fn helios_umd12_probe_serialize_root_signature_v1(
     // SAFETY: `desc` is live per the caller's guarantee above; `blob` and `err`
     // are stack locals borrowed only for this call. The C++ side zeroes both
     // outs before forwarding and writes them only on success.
-    let hr = unsafe { bridge12::serialize_root_signature(desc as usize, version, &mut blob, &mut err) };
+    let hr =
+        unsafe { bridge12::serialize_root_signature(desc as usize, version, &mut blob, &mut err) };
 
     // SAFETY: `blob_out` was null-checked above. This write transfers the
     // engine's owned `ID3DBlob*` reference to the caller.

@@ -63,13 +63,42 @@ impl ResourceDimension {
     }
 }
 
+fn resource_needs_cpu_mapping(
+    a: &ddi::D3D11DDIARG_CREATERESOURCE,
+    dimension: ResourceDimension,
+) -> bool {
+    const DDI_MISC_TILED: u32 = 0x0000_4000;
+    const DDI_MISC_TILE_POOL: u32 = 0x0000_8000;
+    const DDI_CPU_ACCESS_MASK: u32 = ddi::D3D10_DDI_CPU_ACCESS_D3D10_DDI_CPU_ACCESS_MASK as u32;
+    const DDI_USAGE_DYNAMIC: u32 = ddi::D3D10_DDI_RESOURCE_USAGE_D3D10_DDI_USAGE_DYNAMIC as u32;
+    const DDI_USAGE_STAGING: u32 = ddi::D3D10_DDI_RESOURCE_USAGE_D3D10_DDI_USAGE_STAGING as u32;
+    const DDI_BIND_CONSTANT_BUFFER: u32 =
+        ddi::D3D10_DDI_RESOURCE_BIND_FLAG_D3D10_DDI_BIND_CONSTANT_BUFFER as u32;
+
+    if a.MiscFlags & (DDI_MISC_TILED | DDI_MISC_TILE_POOL) != 0 {
+        return false;
+    }
+    const fn cpu_access_requested(map_flags: u32) -> bool {
+        map_flags & DDI_CPU_ACCESS_MASK != 0
+    }
+    match dimension {
+        ResourceDimension::Buffer => {
+            cpu_access_requested(a.MapFlags)
+                || a.Usage == DDI_USAGE_DYNAMIC
+                || a.Usage == DDI_USAGE_STAGING
+                || a.BindFlags & DDI_BIND_CONSTANT_BUFFER != 0
+        }
+        _ => cpu_access_requested(a.MapFlags),
+    }
+}
+
 /// Add one allocation to the WDDM 2.x device residency list.
 ///
 /// E_PENDING is completed with a blocking monitored-fence wait through the
 /// runtime callback. No command referencing the allocation may be submitted
 /// before that fence reaches `PagingFenceValue`.
 pub(crate) unsafe fn make_resident(
-    dev: &crate::device_funcs::HeliosDevice,
+    outer: &crate::device_funcs::OuterDevice,
     handle: ddi::D3DKMT_HANDLE,
 ) -> Result<ResidentAllocation, i32> {
     const E_PENDING: i32 = 0x8000_000Au32 as i32;
@@ -78,19 +107,19 @@ pub(crate) unsafe fn make_resident(
         log_error!("WDDM residency: zero allocation handle");
         return Err(E_INVALIDARG);
     };
-    let Some(queue) = dev.paging_queue else {
+    let Some(queue) = outer.paging_queue else {
         log_error!("WDDM residency: device has no paging queue");
         return Err(E_FAIL);
     };
-    if dev.kt_callbacks.is_null() {
+    if outer.kt_callbacks.is_null() {
         log_error!("WDDM residency: no runtime callbacks");
         return Err(E_FAIL);
     }
-    let Some(make_resident_cb) = (*dev.kt_callbacks).pfnMakeResidentCb else {
+    let Some(make_resident_cb) = (*outer.kt_callbacks).pfnMakeResidentCb else {
         log_error!("WDDM residency: pfnMakeResidentCb missing");
         return Err(E_FAIL);
     };
-    let Some(evict_cb) = (*dev.kt_callbacks).pfnEvictCb else {
+    let Some(evict_cb) = (*outer.kt_callbacks).pfnEvictCb else {
         // Do not acquire a residency reference that cannot be balanced.
         log_error!("WDDM residency: pfnEvictCb missing");
         return Err(E_FAIL);
@@ -101,7 +130,7 @@ pub(crate) unsafe fn make_resident(
     arg.hPagingQueue = queue.handle.get();
     arg.NumAllocations = 1;
     arg.AllocationList = &allocation;
-    let hr = make_resident_cb(dev.h_rt_device, &mut arg);
+    let hr = make_resident_cb(outer.h_rt_device, &mut arg);
     trace_line!(
         "WDDM residency: MakeResident alloc=0x{:x} hr=0x{:08x} fence={} trim={}",
         allocation,
@@ -121,11 +150,11 @@ pub(crate) unsafe fn make_resident(
 
     let resident = ResidentAllocation {
         handle,
-        h_rt_device: dev.h_rt_device,
+        h_rt_device: outer.h_rt_device,
         evict_cb,
     };
     if hr == E_PENDING {
-        let Some(wait_cb) = (*dev.kt_callbacks).pfnWaitForSynchronizationObjectFromCpuCb else {
+        let Some(wait_cb) = (*outer.kt_callbacks).pfnWaitForSynchronizationObjectFromCpuCb else {
             log_error!("WDDM residency: E_PENDING but CPU fence-wait callback is missing");
             drop(resident);
             return Err(E_FAIL);
@@ -137,7 +166,7 @@ pub(crate) unsafe fn make_resident(
         wait.ObjectHandleArray = &sync_object;
         wait.FenceValueArray = &fence_value;
         // hAsyncEvent == NULL selects the blocking, non-polling form.
-        let wait_hr = wait_cb(dev.h_rt_device, &wait);
+        let wait_hr = wait_cb(outer.h_rt_device, &wait);
         trace_line!(
             "WDDM residency: wait alloc=0x{:x} fence={} observed={} hr=0x{:08x}",
             allocation,
@@ -161,14 +190,17 @@ pub(crate) unsafe fn make_resident(
 }
 
 pub(crate) unsafe fn deallocate_standalone(
-    dev: &crate::device_funcs::HeliosDevice,
+    outer: &crate::device_funcs::OuterDevice,
     allocation: ddi::D3DKMT_HANDLE,
-) {
-    if dev.kt_callbacks.is_null() {
-        return;
+) -> bool {
+    if allocation == 0 {
+        return true;
     }
-    let Some(deallocate_cb) = (*dev.kt_callbacks).pfnDeallocateCb else {
-        return;
+    if outer.kt_callbacks.is_null() {
+        return false;
+    }
+    let Some(deallocate_cb) = (*outer.kt_callbacks).pfnDeallocateCb else {
+        return false;
     };
     let mut allocation = allocation;
     let mut arg = ddi::D3DDDICB_DEALLOCATE {
@@ -176,12 +208,224 @@ pub(crate) unsafe fn deallocate_standalone(
         NumAllocations: 1,
         HandleList: &mut allocation,
     };
-    let hr = deallocate_cb(dev.h_rt_device, &mut arg);
+    let hr = deallocate_cb(outer.h_rt_device, &mut arg);
     log_error!(
         "DDI allocate rollback: alloc=0x{:x} hr=0x{:08x}",
         allocation,
         hr as u32
     );
+    hr == 0
+}
+
+fn finish_cpu_backing_rollback(
+    cpu_backing: Option<helios_umd_common::cpu_backing::CpuBacking>,
+    deallocated: bool,
+) {
+    if !deallocated {
+        if let Some(backing) = cpu_backing {
+            backing.leak();
+        }
+    }
+}
+
+pub(crate) struct CreatedWddmAllocation {
+    resident: Option<ResidentAllocation>,
+    km_resource: ddi::D3DKMT_HANDLE,
+    identity: OuterAllocationIdentity,
+    association: HeliosResourceAssociationV1,
+    cpu_backing: Option<helios_umd_common::cpu_backing::CpuBacking>,
+}
+
+impl CreatedWddmAllocation {
+    fn allocation_handle(&self) -> ddi::D3DKMT_HANDLE {
+        self.resident
+            .as_ref()
+            .map(ResidentAllocation::handle)
+            .unwrap_or(0)
+    }
+
+    fn association(&self) -> &HeliosResourceAssociationV1 {
+        &self.association
+    }
+
+    unsafe fn rollback(mut self, dev: &crate::device_funcs::HeliosDevice) {
+        let allocation = self.allocation_handle();
+        let cpu_backing = self.cpu_backing.take();
+        remove_outer_allocation(&dev.outer, self.identity);
+        drop(self.resident.take());
+        let deallocated = deallocate_standalone(&dev.outer, allocation);
+        finish_cpu_backing_rollback(cpu_backing, deallocated);
+    }
+
+    fn into_state(
+        mut self,
+    ) -> (
+        Option<ResidentAllocation>,
+        ddi::D3DKMT_HANDLE,
+        Option<OuterAllocationIdentity>,
+        Option<helios_umd_common::cpu_backing::CpuBacking>,
+    ) {
+        (
+            self.resident.take(),
+            self.km_resource,
+            Some(self.identity),
+            self.cpu_backing.take(),
+        )
+    }
+}
+
+/// Create the exact standalone WDDM allocation that backs one DXVK-internal
+/// VkDeviceMemory, then retain its residency and ownership on this device.
+/// The returned HRA1 value is consumed synchronously by that same
+/// vkAllocateMemory call. No handle crosses into Mesa; an optional CPU data
+/// view does, but is never used as identity or as a lookup key.
+pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
+    outer: &crate::device_funcs::OuterDevice,
+    bytes: u64,
+    cpu_visible: bool,
+    device_local: bool,
+) -> Result<HeliosResourceAssociationV1, i32> {
+    use helios_protocol::{
+        HELIOS_HWA2_FLAG_CPU_VISIBLE, HELIOS_HWA2_FLAG_KMD_OWNED_MASK, HELIOS_HWA2_KIND_BUFFER,
+        HELIOS_HWA2_MEMORY_CPU_VISIBLE, HELIOS_HWA2_MEMORY_DEVICE_LOCAL, HELIOS_HWA2_MEMORY_SHARED,
+        HELIOS_HWA2_SWIZZLE_LINEAR,
+    };
+
+    if bytes == 0 || outer.kt_callbacks.is_null() {
+        return Err(E_INVALIDARG);
+    }
+    let Some(allocate_cb) = (*outer.kt_callbacks).pfnAllocateCb else {
+        return Err(E_FAIL);
+    };
+
+    let mut desc = HeliosWddmAllocationDescV2::header(HELIOS_PACKAGE_GENERATION, 0);
+    desc.byte_size = bytes;
+    desc.allocation_kind = HELIOS_HWA2_KIND_BUFFER;
+    desc.swizzle_class = HELIOS_HWA2_SWIZZLE_LINEAR;
+    if cpu_visible {
+        desc.flags = HELIOS_HWA2_FLAG_CPU_VISIBLE;
+        desc.memory_class = HELIOS_HWA2_MEMORY_CPU_VISIBLE;
+    } else if device_local {
+        desc.memory_class = HELIOS_HWA2_MEMORY_DEVICE_LOCAL;
+    } else {
+        desc.memory_class = HELIOS_HWA2_MEMORY_SHARED;
+    }
+    if let Err(refusal) = desc.validate_create_input(HELIOS_PACKAGE_GENERATION) {
+        log_error!(
+            "DXVK internal allocation REFUSED: invalid HWA2 input {:?} bytes={} cpu_visible={} device_local={}",
+            refusal,
+            bytes,
+            cpu_visible,
+            device_local
+        );
+        return Err(E_INVALIDARG);
+    }
+
+    let mut cpu_backing = if cpu_visible {
+        Some(helios_umd_common::cpu_backing::CpuBacking::new(bytes).ok_or(E_OUTOFMEMORY)?)
+    } else {
+        None
+    };
+    let cpu_mapping = cpu_backing
+        .as_ref()
+        .map_or(core::ptr::null_mut(), |backing| backing.as_ptr());
+
+    let sent = desc;
+    let private_ptr = (&mut desc as *mut HeliosWddmAllocationDescV2).cast();
+    let private_size = u32::from(HELIOS_HWA2_BYTES);
+    let mut allocation_info = ddi::D3DDDI_ALLOCATIONINFO2::default();
+    allocation_info.pPrivateDriverData = private_ptr;
+    allocation_info.PrivateDriverDataSize = private_size;
+    allocation_info.__bindgen_anon_1.pSystemMem = cpu_mapping.cast_const();
+    let mut alloc = ddi::D3DDDICB_ALLOCATE::default();
+    alloc.pPrivateDriverData = private_ptr;
+    alloc.PrivateDriverDataSize = private_size;
+    alloc.hResource = core::ptr::null_mut();
+    alloc.NumAllocations = 1;
+    alloc.__bindgen_anon_1.pAllocationInfo2 = &mut allocation_info;
+
+    let hr = allocate_cb(outer.h_rt_device, &mut alloc);
+    let h_allocation = allocation_info.hAllocation;
+    if hr != 0 || h_allocation == 0 {
+        log_error!(
+            "DXVK internal pfnAllocateCb REFUSED: hr=0x{:08x} alloc=0x{:x} bytes={}",
+            hr as u32,
+            h_allocation,
+            bytes
+        );
+        let deallocated = h_allocation == 0 || deallocate_standalone(outer, h_allocation);
+        finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
+        return Err(if hr != 0 { hr } else { E_OUTOFMEMORY });
+    }
+
+    if let Err(refusal) = desc.validate_create_output(HELIOS_PACKAGE_GENERATION) {
+        log_error!(
+            "DXVK internal allocation REFUSED: invalid HWA2 output {:?} alloc=0x{:x}",
+            refusal,
+            h_allocation
+        );
+        let deallocated = deallocate_standalone(outer, h_allocation);
+        finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
+        return Err(E_OUTOFMEMORY);
+    }
+    let echoed = HeliosWddmAllocationDescV2 {
+        allocation_generation: sent.allocation_generation,
+        flags: desc.flags & !HELIOS_HWA2_FLAG_KMD_OWNED_MASK,
+        ..desc
+    };
+    if echoed != sent {
+        log_error!(
+            "DXVK internal allocation REFUSED: KMD changed non-owned HWA2 fields alloc=0x{:x}",
+            h_allocation
+        );
+        let deallocated = deallocate_standalone(outer, h_allocation);
+        finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
+        return Err(E_OUTOFMEMORY);
+    }
+
+    let resident = match make_resident(outer, h_allocation) {
+        Ok(resident) => resident,
+        Err(resident_hr) => {
+            let deallocated = deallocate_standalone(outer, h_allocation);
+            finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
+            return Err(resident_hr);
+        }
+    };
+    let (identity, association) = match assign_outer_allocation(
+        outer,
+        h_allocation,
+        desc.allocation_generation,
+        desc.byte_size,
+        cpu_mapping,
+    ) {
+        Ok(assigned) => assigned,
+        Err(refusal) => {
+            log_error!(
+                "DXVK internal allocation REFUSED: token assignment {:?} alloc=0x{:x}",
+                refusal,
+                h_allocation
+            );
+            drop(resident);
+            let deallocated = deallocate_standalone(outer, h_allocation);
+            finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
+            return Err(E_OUTOFMEMORY);
+        }
+    };
+    if let Err((refusal, resident, cpu_backing)) =
+        retain_internal_outer_allocation(outer, identity, resident, cpu_backing.take())
+    {
+        log_error!(
+            "DXVK internal allocation REFUSED: ownership retention {:?} alloc=0x{:x}",
+            refusal,
+            h_allocation
+        );
+        remove_outer_allocation(outer, identity);
+        drop(resident);
+        let deallocated = deallocate_standalone(outer, h_allocation);
+        finish_cpu_backing_rollback(cpu_backing, deallocated);
+        return Err(E_OUTOFMEMORY);
+    }
+    Ok(association)
 }
 
 pub(crate) unsafe fn allocate_wddm_resource(
@@ -199,13 +443,8 @@ pub(crate) unsafe fn allocate_wddm_resource(
     // direct OPTIMAL uses a logical scanout stride while QEMU validates the
     // opaque allocation with its exact Vulkan allocation size.
     scanout: Option<ScanoutGeometry>,
-) -> Result<(Option<ResidentAllocation>, ddi::D3DKMT_HANDLE), i32> {
+) -> Result<CreatedWddmAllocation, i32> {
     const DDI_BIND_PRESENT: u32 = 0x0000_0080;
-
-    let needs_allocation = needs_wddm_texture_allocation(a);
-    if !needs_allocation {
-        return Ok((None, 0));
-    }
 
     let Some(dev) = helios_device(h) else {
         return Err(E_FAIL);
@@ -335,6 +574,7 @@ pub(crate) unsafe fn allocate_wddm_resource(
         );
         return Err(E_INVALIDARG);
     };
+    let needs_cpu_mapping = resource_needs_cpu_mapping(a, dimension);
 
     let input = Hwa2CreateInput {
         dimension,
@@ -457,6 +697,15 @@ pub(crate) unsafe fn allocate_wddm_resource(
     // AFTER the callback has returned.
     let sent = desc;
 
+    let mut cpu_backing = if needs_cpu_mapping {
+        Some(helios_umd_common::cpu_backing::CpuBacking::new(desc.byte_size).ok_or(E_OUTOFMEMORY)?)
+    } else {
+        None
+    };
+    let cpu_mapping = cpu_backing
+        .as_ref()
+        .map_or(core::ptr::null_mut(), |backing| backing.as_ptr());
+
     let mut allocation_info = ddi::D3DDDI_ALLOCATIONINFO2::default();
     let private_ptr = (&mut desc as *mut HeliosWddmAllocationDescV2).cast();
     // ⛔ Exactly `HELIOS_HWA2_BYTES`. `from_private_data` requires the length to
@@ -465,6 +714,7 @@ pub(crate) unsafe fn allocate_wddm_resource(
     let private_size = u32::from(HELIOS_HWA2_BYTES);
     allocation_info.pPrivateDriverData = private_ptr;
     allocation_info.PrivateDriverDataSize = private_size;
+    allocation_info.__bindgen_anon_1.pSystemMem = cpu_mapping.cast_const();
     let is_present = (a.BindFlags & DDI_BIND_PRESENT) != 0;
     let is_primary_allocation = !a.pPrimaryDesc.is_null();
     allocation_info.VidPnSourceId = if !a.pPrimaryDesc.is_null() {
@@ -516,6 +766,9 @@ pub(crate) unsafe fn allocate_wddm_resource(
         );
     }
     if hr != 0 {
+        let deallocated =
+            h_allocation == 0 || unsafe { deallocate_standalone(&dev.outer, h_allocation) };
+        finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
         return Err(hr);
     }
 
@@ -572,7 +825,8 @@ pub(crate) unsafe fn allocate_wddm_resource(
             desc.width,
             desc.height
         );
-        unsafe { deallocate_standalone(dev, h_allocation) };
+        let deallocated = unsafe { deallocate_standalone(&dev.outer, h_allocation) };
+        finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
         return Err(E_OUTOFMEMORY);
     }
 
@@ -641,18 +895,50 @@ pub(crate) unsafe fn allocate_wddm_resource(
         }
     }
 
-    match unsafe { make_resident(dev, h_allocation) } {
-        Ok(resident) => Ok((Some(resident), alloc.hKMResource)),
+    match unsafe { make_resident(&dev.outer, h_allocation) } {
+        Ok(resident) => match assign_outer_allocation(
+            &dev.outer,
+            h_allocation,
+            desc.allocation_generation,
+            desc.byte_size,
+            cpu_mapping,
+        ) {
+            Ok((identity, association)) => Ok(CreatedWddmAllocation {
+                resident: Some(resident),
+                km_resource: alloc.hKMResource,
+                identity,
+                association,
+                cpu_backing,
+            }),
+            Err(refusal) => {
+                log_error!(
+                    "DDI allocate_wddm_resource REFUSED: outer association {:?} alloc=0x{:x} generation={} bytes={}",
+                    refusal,
+                    h_allocation,
+                    desc.allocation_generation,
+                    desc.byte_size
+                );
+                drop(resident);
+                let deallocated = unsafe { deallocate_standalone(&dev.outer, h_allocation) };
+                finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
+                Err(E_OUTOFMEMORY)
+            }
+        },
         Err(resident_hr) => {
             // pfnAllocateCb succeeded, so this UMD owns the allocation even
             // though residency failed. Roll it back before surfacing the
             // failure; no partially initialized ResourceState is created.
-            unsafe { deallocate_standalone(dev, h_allocation) };
+            let deallocated = unsafe { deallocate_standalone(&dev.outer, h_allocation) };
+            finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
             Err(resident_hr)
         }
     }
 }
 
+#[cfg(any())]
+/// Retired A7 predecessor retained out of the compiled path while the focused
+/// removal gate is landed with A8. The live path below allocates WDDM first and
+/// supplies HRA1 during exact DXVK/Vulkan resource creation.
 /// Common tail for a freshly created 2D texture resource (normal or scan-out
 /// primary): record the venus backing identity, make the paired WDDM/KMD
 /// allocation (carrying the scan-out row pitch + plane offset for a primary),
@@ -853,6 +1139,8 @@ pub(crate) unsafe fn finish_wddm_tex2d(
         h_resource,
         res,
         allocation,
+        None,
+        None,
         km_resource,
         h_rt.handle,
         AllocationOwnership::CreatedByUmd, // via pfnAllocateCb above
@@ -862,6 +1150,49 @@ pub(crate) unsafe fn finish_wddm_tex2d(
     if present_private.is_valid() {
         unsafe { remember_direct_scanout_allocation(h, allocation_handle, present_private) };
     }
+}
+
+unsafe fn create_and_store_associated_resource(
+    h: Hdevice,
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+    h_rt: ddi::D3D10DDI_HRTRESOURCE,
+    kind: u32,
+    desc_ptr: usize,
+    initial_data_ptr: usize,
+    allocation: CreatedWddmAllocation,
+) -> Result<(), i32> {
+    let Some(dev) = helios_device(h) else {
+        return Err(E_FAIL);
+    };
+    let allocation_handle = allocation.allocation_handle();
+    let association = *allocation.association();
+    let Some(resource) =
+        dev.dxvk
+            .create_associated_resource(kind, desc_ptr, initial_data_ptr, &association)
+    else {
+        allocation.rollback(dev);
+        log_error!(
+            "DDI associated create REFUSED: kind={} token={} allocation=0x{:x}",
+            kind,
+            association.outer_allocation_token,
+            allocation_handle
+        );
+        return Err(E_OUTOFMEMORY);
+    };
+    let (resident, km_resource, outer_allocation, cpu_backing) = allocation.into_state();
+    store_resource(
+        h_resource,
+        resource,
+        resident,
+        outer_allocation,
+        cpu_backing,
+        km_resource,
+        h_rt.handle,
+        AllocationOwnership::CreatedByUmd,
+        empty_present_private(),
+        None,
+    );
+    Ok(())
 }
 
 pub(crate) unsafe extern "C" fn create_resource(
@@ -876,7 +1207,7 @@ pub(crate) unsafe extern "C" fn create_resource(
         set_runtime_error(h, E_INVALIDARG);
         return;
     }
-    let Some(device) = d3d11_device(h) else {
+    let Some(_device) = d3d11_device(h) else {
         return;
     };
     let a = &*arg;
@@ -1026,86 +1357,27 @@ pub(crate) unsafe extern "C" fn create_resource(
                 MiscFlags: misc,
                 StructureByteStride: a.ByteStride,
             };
-            let (allocation, km_resource) =
-                match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
-                    Ok(allocation) => allocation,
-                    Err(hr) => {
-                        log_error!(
+            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
+                Ok(allocation) => allocation,
+                Err(hr) => {
+                    log_error!(
                         "DDI create_resource(buffer): WDDM allocation/residency failed hr=0x{:08x}",
                         hr as u32
                     );
-                        set_runtime_error(h, hr);
-                        return;
-                    }
-                };
-            let allocation_handle = allocation
-                .as_ref()
-                .map(ResidentAllocation::handle)
-                .unwrap_or(0);
-            let mut buf: Option<ID3D11Buffer> = None;
-            let created = device.CreateBuffer(&desc, init_ptr, Some(&mut buf));
-            if let Err(ref e) = created {
-                log_error!("DDI create_resource(buffer) failed: {e:?}");
-            }
-            let res = match buf {
-                Some(b) => match b.cast::<ID3D11Resource>() {
-                    Ok(r) => Some(r),
-                    Err(e) => {
-                        log_error!(
-                            "DDI create_resource(buffer): cast to ID3D11Resource failed: {e:?}"
-                        );
-                        None
-                    }
-                },
-                None => {
-                    if created.is_ok() {
-                        log_error!(
-                            "DDI create_resource(buffer): DXVK CreateBuffer returned no buffer"
-                        );
-                    }
-                    None
+                    set_runtime_error(h, hr);
+                    return;
                 }
             };
-            let mut stored = false;
-            finish_create(h, created, res, |res| {
-                stored = true;
-                stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
-                if RESOURCE_LOG_COUNT.first_n(128).is_some() {
-                    log_error!(
-                        "DDI create_resource(buffer) ok: bytes={} fmt={} usage={} bind=0x{:x} misc=0x{:x}",
-                        mip0.TexelWidth, a.Format, a.Usage, bind, misc
-                    );
-                }
-                store_resource(
-                    h_resource,
-                    res,
-                    allocation,
-                    km_resource,
-                    h_rt.handle,
-                    AllocationOwnership::CreatedByUmd, // via pfnAllocateCb above
-                    empty_present_private(),
-                    None,
-                );
-            });
-            if !stored && allocation_handle != 0 {
-                // The buffer arm allocates first and creates second, so a failed
-                // CreateBuffer (or a missing object, or a failed cast) leaves a
-                // kernel allocation nobody can reach: the closure's
-                // `Option<ResidentAllocation>` has been dropped by now — evicting
-                // the residency reference — but pfnDeallocateCb was never called,
-                // and `release_resource` cannot recover it later because
-                // `clear_handle` already nulled pDrvPrivate at DDI entry, so
-                // DestroyResource reads a null state pointer and returns. The
-                // handle would stay associated with the runtime resource until
-                // device teardown.
-                //
-                // Evict-then-deallocate is the order `release_resource`
-                // documents, and dropping the closure above already did the
-                // evict half. Same call `allocate_wddm_resource` makes for its
-                // own rollback.
-                if let Some(dev) = helios_device(h) {
-                    deallocate_standalone(dev, allocation_handle);
-                }
+            if let Err(hr) = create_and_store_associated_resource(
+                h,
+                h_resource,
+                h_rt,
+                0,
+                (&desc as *const D3D11_BUFFER_DESC) as usize,
+                init_ptr.map_or(0, |ptr| ptr as usize),
+                allocation,
+            ) {
+                set_runtime_error(h, hr);
             }
         }
         ResourceDimension::Texture2D => {
@@ -1156,71 +1428,85 @@ pub(crate) unsafe extern "C" fn create_resource(
                 CPUAccessFlags: cpu,
                 MiscFlags: misc,
             };
-            // Windows' pPrimaryDesc is the authoritative, non-heuristic marker
-            // for a scan-out primary. The supported 32-bit Windows primary
-            // formats become dedicated OPTIMAL DMA_BUF exports.
-            let is_scanout = !a.pPrimaryDesc.is_null() && matches!(a.Format as u32, 28 | 87 | 88);
-            let mut handled = false;
-            if is_scanout {
-                // The QEMU fork reconstructs this exact same-driver OPTIMAL
-                // DMA_BUF with the original blob allocation size. This avoids a
-                // guest copy and any virtio protocol field or global modifier
-                // extension. The host display backend currently reads it back.
-                // The wrapper adopts the reference and returns the metadata
-                // with it, so `rp`/`off` cannot be read on the failure path.
-                // R813.
-                let created = helios_device(h).and_then(|dev| {
-                    dev.dxvk.create_scanout_texture2d(
-                        mip0.TexelWidth,
-                        mip0.TexelHeight,
-                        a.Format as u32,
-                        bind,
-                        misc,
-                        false,
-                    )
-                });
-                let (rp, off) = created.as_ref().map_or((0, 0), |(_, p, o)| (*p, *o));
-                // BEHAVIOUR CHANGE (R806 sub-commit 2): a zero row pitch is a
-                // failed scan-out-primary create, not a primary with no
-                // geometry. Previously only `raw != 0` was checked, so a
-                // non-zero resource with `rp == 0` would stamp
-                // HELIOS_WDDM_ALLOC_MISC_PRIMARY | MISC_DIRECT_SCANOUT into the
-                // KMD meta while finish_wddm_tex2d's present_private gate
-                // failed -- a direct scan-out primary in the kernel that the
-                // UMD never registered in direct_scanout_allocations and could
-                // never identify through PresentCb private data. Nothing
-                // detected that split state.
-                //
-                // Not reachable through today's bridge: create_ddi_scanout_
-                // texture2d returns 0 for a zero width/height and otherwise
-                // computes a non-zero pitch, so raw != 0 implies rp != 0. This
-                // closes the cross-FFI contract dependency rather than a live
-                // bug, which is why the counter is expected to stay 0.
-                let geometry = ScanoutGeometry::new(rp as u32, off);
-                // One match over the pair, so the created resource is moved
-                // into exactly one arm and the refusal arm still owns it (and
-                // therefore still releases it).
-                match (created, geometry) {
-                    (Some((res, _, _)), Some(geometry)) => {
-                        log_error!(
+            #[cfg(any())]
+            {
+                // Retired direct-scanout/generic DXVK create predecessor. The A7
+                // path below names the WDDM allocation before Vulkan allocation.
+                // Windows' pPrimaryDesc is the authoritative, non-heuristic marker
+                // for a scan-out primary. The supported 32-bit Windows primary
+                // formats become dedicated OPTIMAL DMA_BUF exports.
+                let is_scanout =
+                    !a.pPrimaryDesc.is_null() && matches!(a.Format as u32, 28 | 87 | 88);
+                let mut handled = false;
+                if is_scanout {
+                    // The QEMU fork reconstructs this exact same-driver OPTIMAL
+                    // DMA_BUF with the original blob allocation size. This avoids a
+                    // guest copy and any virtio protocol field or global modifier
+                    // extension. The host display backend currently reads it back.
+                    // The wrapper adopts the reference and returns the metadata
+                    // with it, so `rp`/`off` cannot be read on the failure path.
+                    // R813.
+                    let created = helios_device(h).and_then(|dev| {
+                        dev.dxvk.create_scanout_texture2d(
+                            mip0.TexelWidth,
+                            mip0.TexelHeight,
+                            a.Format as u32,
+                            bind,
+                            misc,
+                            false,
+                        )
+                    });
+                    let (rp, off) = created.as_ref().map_or((0, 0), |(_, p, o)| (*p, *o));
+                    // BEHAVIOUR CHANGE (R806 sub-commit 2): a zero row pitch is a
+                    // failed scan-out-primary create, not a primary with no
+                    // geometry. Previously only `raw != 0` was checked, so a
+                    // non-zero resource with `rp == 0` would stamp
+                    // HELIOS_WDDM_ALLOC_MISC_PRIMARY | MISC_DIRECT_SCANOUT into the
+                    // KMD meta while finish_wddm_tex2d's present_private gate
+                    // failed -- a direct scan-out primary in the kernel that the
+                    // UMD never registered in direct_scanout_allocations and could
+                    // never identify through PresentCb private data. Nothing
+                    // detected that split state.
+                    //
+                    // Not reachable through today's bridge: create_ddi_scanout_
+                    // texture2d returns 0 for a zero width/height and otherwise
+                    // computes a non-zero pitch, so raw != 0 implies rp != 0. This
+                    // closes the cross-FFI contract dependency rather than a live
+                    // bug, which is why the counter is expected to stay 0.
+                    let geometry = ScanoutGeometry::new(rp as u32, off);
+                    // One match over the pair, so the created resource is moved
+                    // into exactly one arm and the refusal arm still owns it (and
+                    // therefore still releases it).
+                    match (created, geometry) {
+                        (Some((res, _, _)), Some(geometry)) => {
+                            log_error!(
                         "DDI create_resource(tex2d): direct scan-out primary {}x{} fmt={} logicalPitch={} offset={} (OPTIMAL DMA_BUF)",
                         mip0.TexelWidth, mip0.TexelHeight, a.Format, rp, off
                     );
-                        finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, true, Some(geometry));
-                    }
-                    (created, _) => {
-                        // Loud failure over fake success: do NOT fall back to a plain
-                        // primary — that reintroduces the black scan-out as a "working"
-                        // desktop. A failure here is a real direct-scanout regression.
-                        if let Some((res, _, _)) = created {
-                            // The new arm: the bridge handed back a resource but no
-                            // usable stride. Dropping the adopted wrapper releases
-                            // it -- nothing else will. R813 removed the manual
-                            // IUnknown::from_raw this used to need.
-                            SCANOUT_PRIMARY_ZERO_PITCH.fetch_add(1, Ordering::Relaxed);
-                            let raw = res.as_raw() as usize;
-                            drop(res);
-                            log_error!(
+                            finish_wddm_tex2d(
+                                h,
+                                a,
+                                &mip0,
+                                h_rt,
+                                h_resource,
+                                res,
+                                true,
+                                Some(geometry),
+                            );
+                        }
+                        (created, _) => {
+                            // Loud failure over fake success: do NOT fall back to a plain
+                            // primary — that reintroduces the black scan-out as a "working"
+                            // desktop. A failure here is a real direct-scanout regression.
+                            if let Some((res, _, _)) = created {
+                                // The new arm: the bridge handed back a resource but no
+                                // usable stride. Dropping the adopted wrapper releases
+                                // it -- nothing else will. R813 removed the manual
+                                // IUnknown::from_raw this used to need.
+                                SCANOUT_PRIMARY_ZERO_PITCH.fetch_add(1, Ordering::Relaxed);
+                                let raw = res.as_raw() as usize;
+                                drop(res);
+                                log_error!(
                             "DDI create_resource(tex2d): SCAN-OUT PRIMARY ZERO PITCH {}x{} fmt={} raw=0x{:x} offset={} -> refused (zero_pitch={})",
                             mip0.TexelWidth,
                             mip0.TexelHeight,
@@ -1229,29 +1515,29 @@ pub(crate) unsafe extern "C" fn create_resource(
                             off,
                             SCANOUT_PRIMARY_ZERO_PITCH.load(Ordering::Relaxed)
                         );
-                        }
-                        log_error!(
+                            }
+                            log_error!(
                         "DDI create_resource(tex2d): SCAN-OUT PRIMARY CREATE FAILED {}x{} fmt={} bind=0x{:x} -> no primary (optimal/dmabuf rejected?)",
                         mip0.TexelWidth, mip0.TexelHeight, a.Format, bind
                     );
-                        // The loudness has to reach the runtime, not stop at the log
-                        // file: this DDI returns void, so pfnSetErrorCb is the only
-                        // way CreateTexture2D fails instead of handing the caller
-                        // S_OK with a null driver resource. E_OUTOFMEMORY is in
-                        // CreateTexture2D's documented return set; the bridge
-                        // returns 0 with no HRESULT to map through.
-                        set_runtime_error(h, E_OUTOFMEMORY);
+                            // The loudness has to reach the runtime, not stop at the log
+                            // file: this DDI returns void, so pfnSetErrorCb is the only
+                            // way CreateTexture2D fails instead of handing the caller
+                            // S_OK with a null driver resource. E_OUTOFMEMORY is in
+                            // CreateTexture2D's documented return set; the bridge
+                            // returns 0 with no HRESULT to map through.
+                            set_runtime_error(h, E_OUTOFMEMORY);
+                        }
                     }
+                    handled = true;
                 }
-                handled = true;
-            }
-            if !handled {
-                let mut tex: Option<ID3D11Texture2D> = None;
-                // The five existing tex2d trace gates are the same predicate;
-                // name it once so the restructured arm cannot drift between them.
-                let big = mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0;
-                if big {
-                    log_error!(
+                if !handled {
+                    let mut tex: Option<ID3D11Texture2D> = None;
+                    // The five existing tex2d trace gates are the same predicate;
+                    // name it once so the restructured arm cannot drift between them.
+                    let big = mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0;
+                    if big {
+                        log_error!(
                         "DDI create_resource(tex2d): calling DXVK CreateTexture2D {}x{} fmt={} bind=0x{:x} misc=0x{:x} init={} hrt={:p} mips={} array={} usage={} cpu=0x{:x} sample={}x{}",
                         mip0.TexelWidth,
                         mip0.TexelHeight,
@@ -1267,48 +1553,73 @@ pub(crate) unsafe extern "C" fn create_resource(
                         a.SampleDesc.Count,
                         a.SampleDesc.Quality
                     );
-                }
-                let created = device.CreateTexture2D(&desc, init_ptr, Some(&mut tex));
-                match created {
-                    Ok(()) => {
-                        if big {
-                            log_error!(
+                    }
+                    let created = device.CreateTexture2D(&desc, init_ptr, Some(&mut tex));
+                    match created {
+                        Ok(()) => {
+                            if big {
+                                log_error!(
                                 "DDI create_resource(tex2d): DXVK CreateTexture2D returned S_OK tex_present={}",
                                 tex.is_some()
                             );
-                        }
-                    }
-                    Err(ref e) => log_error!("DDI create_resource(tex2d) failed: {e:?}"),
-                }
-                let res = match tex {
-                    Some(t) => match t.cast::<ID3D11Resource>() {
-                        Ok(r) => {
-                            if big {
-                                log_error!("DDI create_resource(tex2d): cast to ID3D11Resource OK");
                             }
-                            Some(r)
                         }
-                        Err(_) => {
-                            if big {
+                        Err(ref e) => log_error!("DDI create_resource(tex2d) failed: {e:?}"),
+                    }
+                    let res = match tex {
+                        Some(t) => match t.cast::<ID3D11Resource>() {
+                            Ok(r) => {
+                                if big {
+                                    log_error!(
+                                        "DDI create_resource(tex2d): cast to ID3D11Resource OK"
+                                    );
+                                }
+                                Some(r)
+                            }
+                            Err(_) => {
+                                if big {
+                                    log_error!(
+                                        "DDI create_resource(tex2d): cast to ID3D11Resource failed"
+                                    );
+                                }
+                                None
+                            }
+                        },
+                        None => {
+                            if big && created.is_ok() {
                                 log_error!(
-                                    "DDI create_resource(tex2d): cast to ID3D11Resource failed"
-                                );
+                                "DDI create_resource(tex2d): DXVK CreateTexture2D returned no texture"
+                            );
                             }
                             None
                         }
-                    },
-                    None => {
-                        if big && created.is_ok() {
-                            log_error!(
-                                "DDI create_resource(tex2d): DXVK CreateTexture2D returned no texture"
-                            );
-                        }
-                        None
-                    }
-                };
-                finish_create(h, created, res, |res| {
-                    finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, false, None);
-                });
+                    };
+                    finish_create(h, created, res, |res| {
+                        finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, false, None);
+                    });
+                }
+            }
+            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
+                Ok(allocation) => allocation,
+                Err(hr) => {
+                    log_error!(
+                        "DDI create_resource(tex2d): WDDM allocation/residency failed hr=0x{:08x}",
+                        hr as u32
+                    );
+                    set_runtime_error(h, hr);
+                    return;
+                }
+            };
+            if let Err(hr) = create_and_store_associated_resource(
+                h,
+                h_resource,
+                h_rt,
+                2,
+                (&desc as *const D3D11_TEXTURE2D_DESC) as usize,
+                init_ptr.map_or(0, |ptr| ptr as usize),
+                allocation,
+            ) {
+                set_runtime_error(h, hr);
             }
         }
         ResourceDimension::Texture1D => {
@@ -1343,65 +1654,28 @@ pub(crate) unsafe extern "C" fn create_resource(
                 CPUAccessFlags: cpu,
                 MiscFlags: misc,
             };
-            let mut tex: Option<ID3D11Texture1D> = None;
-            let created = device.CreateTexture1D(&desc, init_ptr, Some(&mut tex));
-            if let Err(ref e) = created {
-                log_error!("DDI create_resource(tex1d) failed: {e:?}");
-            }
-            let res = match tex {
-                Some(t) => match t.cast::<ID3D11Resource>() {
-                    Ok(r) => Some(r),
-                    Err(_) => {
-                        log_error!("DDI create_resource(tex1d): cast to ID3D11Resource failed");
-                        None
-                    }
-                },
-                None => {
-                    if created.is_ok() {
-                        log_error!(
-                            "DDI create_resource(tex1d): DXVK CreateTexture1D returned no texture"
-                        );
-                    }
-                    None
+            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
+                Ok(allocation) => allocation,
+                Err(hr) => {
+                    log_error!(
+                        "DDI create_resource(tex1d): WDDM allocation/residency failed hr=0x{:08x}",
+                        hr as u32
+                    );
+                    set_runtime_error(h, hr);
+                    return;
                 }
             };
-            finish_create(h, created, res, |res| {
-                let (allocation, km_resource) = match allocate_wddm_resource(
-                    h, a, &mip0, h_rt, None, false, None,
-                ) {
-                    Ok(allocation) => allocation,
-                    Err(hr) => {
-                        log_error!(
-                                "DDI create_resource(tex1d): WDDM allocation/residency failed hr=0x{:08x}",
-                                hr as u32
-                            );
-                        set_runtime_error(h, hr);
-                        return;
-                    }
-                };
-                let allocation_handle = allocation
-                    .as_ref()
-                    .map(ResidentAllocation::handle)
-                    .unwrap_or(0);
-                stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
-                log_error!(
-                    "DDI create_resource(tex1d) ok: {} fmt={} bind=0x{:x} misc=0x{:x}",
-                    mip0.TexelWidth,
-                    a.Format,
-                    bind,
-                    misc
-                );
-                store_resource(
-                    h_resource,
-                    res,
-                    allocation,
-                    km_resource,
-                    h_rt.handle,
-                    AllocationOwnership::CreatedByUmd,
-                    empty_present_private(),
-                    None,
-                );
-            });
+            if let Err(hr) = create_and_store_associated_resource(
+                h,
+                h_resource,
+                h_rt,
+                1,
+                (&desc as *const D3D11_TEXTURE1D_DESC) as usize,
+                init_ptr.map_or(0, |ptr| ptr as usize),
+                allocation,
+            ) {
+                set_runtime_error(h, hr);
+            }
         }
         ResourceDimension::Texture3D => {
             let bind = api_bind_flags(a.BindFlags);
@@ -1431,71 +1705,28 @@ pub(crate) unsafe extern "C" fn create_resource(
                 CPUAccessFlags: cpu,
                 MiscFlags: misc,
             };
-            let mut tex: Option<ID3D11Texture3D> = None;
-            let created = device.CreateTexture3D(&desc, init_ptr, Some(&mut tex));
-            if let Err(ref e) = created {
-                log_error!("DDI create_resource(tex3d) failed: {e:?}");
-            }
-            let res = match tex {
-                Some(t) => match t.cast::<ID3D11Resource>() {
-                    Ok(r) => Some(r),
-                    Err(_) => {
-                        log_error!("DDI create_resource(tex3d): cast to ID3D11Resource failed");
-                        None
-                    }
-                },
-                None => {
-                    if created.is_ok() {
-                        log_error!(
-                            "DDI create_resource(tex3d): DXVK CreateTexture3D returned no texture"
-                        );
-                    }
-                    None
+            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
+                Ok(allocation) => allocation,
+                Err(hr) => {
+                    log_error!(
+                        "DDI create_resource(tex3d): WDDM allocation/residency failed hr=0x{:08x}",
+                        hr as u32
+                    );
+                    set_runtime_error(h, hr);
+                    return;
                 }
             };
-            finish_create(h, created, res, |res| {
-                // The allocation-failure arm below already reported through
-                // set_runtime_error; `return` leaves the closure, and this is
-                // the last statement of create_resource, so that is the same
-                // exit it was before.
-                let (allocation, km_resource) = match allocate_wddm_resource(
-                    h, a, &mip0, h_rt, None, false, None,
-                ) {
-                    Ok(allocation) => allocation,
-                    Err(hr) => {
-                        log_error!(
-                                "DDI create_resource(tex3d): WDDM allocation/residency failed hr=0x{:08x}",
-                                hr as u32
-                            );
-                        set_runtime_error(h, hr);
-                        return;
-                    }
-                };
-                let allocation_handle = allocation
-                    .as_ref()
-                    .map(ResidentAllocation::handle)
-                    .unwrap_or(0);
-                stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
-                log_error!(
-                    "DDI create_resource(tex3d) ok: {}x{}x{} fmt={} bind=0x{:x} misc=0x{:x}",
-                    mip0.TexelWidth,
-                    mip0.TexelHeight,
-                    mip0.TexelDepth,
-                    a.Format,
-                    bind,
-                    misc
-                );
-                store_resource(
-                    h_resource,
-                    res,
-                    allocation,
-                    km_resource,
-                    h_rt.handle,
-                    AllocationOwnership::CreatedByUmd,
-                    empty_present_private(),
-                    None,
-                );
-            });
+            if let Err(hr) = create_and_store_associated_resource(
+                h,
+                h_resource,
+                h_rt,
+                3,
+                (&desc as *const D3D11_TEXTURE3D_DESC) as usize,
+                init_ptr.map_or(0, |ptr| ptr as usize),
+                allocation,
+            ) {
+                set_runtime_error(h, hr);
+            }
         }
     }
 }

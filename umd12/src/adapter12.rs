@@ -71,10 +71,13 @@
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use helios_umd_common::hr::{Hresult, DXGI_ERROR_UNSUPPORTED, E_INVALIDARG, E_OUTOFMEMORY, S_OK};
+use helios_protocol::{HeliosUmdAdapterInfoV1, HELIOS_PACKAGE_GENERATION};
+use helios_umd_common::hr::{
+    Hresult, DXGI_ERROR_UNSUPPORTED, E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, S_OK,
+};
 
-use crate::ddi12;
 use crate::caps12;
+use crate::ddi12;
 use crate::device12;
 use crate::forward12;
 use crate::knobs12;
@@ -270,10 +273,10 @@ impl Ddi12Interface {
                 if n <= LOG_BUDGET {
                     log_error!(
                         "Umd12CoreDdi={other} names no Core DDI build this driver can advertise \
-                         (110 or 116) -- falling back to 110 (x{n})",
+                         (110 or 116) -- falling back to 116 (x{n})",
                     );
                 }
-                Self::R8_0110
+                Self::R8_0116
             }
         }
     }
@@ -465,13 +468,15 @@ const _: () = {
     //    ⚠ It asks the question through `arm_for_build`, the same function
     //    `selected()` uses, so it cannot pass by checking a mapping the driver
     //    does not actually perform.
-    assert!(match Ddi12Interface::arm_for_build(knobs12::UMD12_CORE_DDI_DEFAULT) {
-        Some(arm) => arm.tables_implemented(),
-        // A default the knob cannot even name would fall back to `R8_0110` with
-        // a counted refusal on every adapter open. That is a build defect, not
-        // a configuration.
-        None => false,
-    });
+    assert!(
+        match Ddi12Interface::arm_for_build(knobs12::UMD12_CORE_DDI_DEFAULT) {
+            Some(arm) => arm.tables_implemented(),
+            // A default the knob cannot even name would fall back to `R8_0110` with
+            // a counted refusal on every adapter open. That is a build defect, not
+            // a configuration.
+            None => false,
+        }
+    );
 };
 
 /// The Core DDI **build** number this process actually advertises, for
@@ -565,25 +570,22 @@ const _: () = {
 };
 
 // ---------------------------------------------------------------------------
-// The adapter identity token
+// The adapter identity
 // ---------------------------------------------------------------------------
 
-/// The value handed back as this adapter's `pDrvPrivate`.
-///
-/// A zero-sized type, address-taken — `umd/src/adapter.rs:120-121` (R821) and
-/// the same reasoning: a ZST says *"this pointer is not dereferenceable state"*
-/// in a way a `usize` carrying a magic number does not.
-///
-/// ⚠ D3D12 has no per-adapter driver state to keep here. Every adapter-scoped
-/// answer is a constant of the build (the version set, the caps policy), and
-/// `hRTAdapter` is not stashed because nothing in this driver needs it: the
-/// D3D11 side stashes it for `pfnEscapeCb` through the scan-out acquire path
-/// (`umd/src/adapter.rs:225`), which is a D3D11 present-vehicle mechanism this
-/// DLL deliberately does not have (`probe12`'s module doc: a D3D12 export in the
-/// `helios_umd_*` family would steal the D3D11 vehicle). The first D3D12 caller
-/// that needs it adds a field here and says why.
-struct AdapterToken;
-static ADAPTER_TOKEN: AdapterToken = AdapterToken;
+const ADAPTER_STATE_MAGIC: u64 = 0x3141_3231_534F_494C;
+
+#[derive(Clone, Copy)]
+pub(crate) struct AdapterIdentity {
+    pub(crate) generation: u64,
+    pub(crate) luid: i64,
+}
+
+/// Per-open state owned directly by the D3D12 driver handle.
+struct AdapterState {
+    magic: u64,
+    identity: AdapterIdentity,
+}
 
 /// Validate an adapter handle against the token we handed out. **Reports only.**
 ///
@@ -591,21 +593,60 @@ static ADAPTER_TOKEN: AdapterToken = AdapterToken;
 /// counter has to be observed at zero on a real boot before any DDI starts
 /// rejecting on it. Returning `bool` rather than nothing keeps that decision at
 /// the call site if it ever changes.
-fn adapter_ok(h: ddi12::D3D12DDI_HADAPTER) -> bool {
-    let expected = core::ptr::addr_of!(ADAPTER_TOKEN) as *const c_void;
-    if core::ptr::eq(h.pDrvPrivate as *const c_void, expected) {
-        return true;
+unsafe fn adapter_state(h: ddi12::D3D12DDI_HADAPTER) -> Option<*mut AdapterState> {
+    let state = h.pDrvPrivate.cast::<AdapterState>();
+    if !state.is_null()
+        && state.is_aligned()
+        // SAFETY: WDDM only returns handles previously supplied by this UMD.
+        && unsafe { (*state).magic == ADAPTER_STATE_MAGIC }
+    {
+        return Some(state);
     }
     UMD12_REFUSALS.adapter_unrecognised.bump();
     let n = UMD12_REFUSALS.adapter_unrecognised.get();
     if n <= LOG_BUDGET {
         log_error!(
-            "adapter handle not ours: pDrvPrivate={:p} expected={:p} (x{n}) -- counted only",
+            "adapter handle not ours: pDrvPrivate={:p} (x{n}) -- counted only",
             h.pDrvPrivate,
-            expected,
         );
     }
-    false
+    None
+}
+
+unsafe fn query_adapter_state(
+    open: &ddi12::D3D12DDIARG_OPENADAPTER,
+) -> Result<Box<AdapterState>, Hresult> {
+    if open.pAdapterCallbacks.is_null() {
+        log_error!("OpenAdapter12: null pAdapterCallbacks");
+        return Err(E_FAIL);
+    }
+    // SAFETY: the runtime owns this typed callback table through OpenAdapter.
+    let Some(query) = (unsafe { &*open.pAdapterCallbacks }).pfnQueryAdapterInfoCb else {
+        log_error!("OpenAdapter12: null pfnQueryAdapterInfoCb");
+        return Err(E_FAIL);
+    };
+    let mut info = HeliosUmdAdapterInfoV1::query(HELIOS_PACKAGE_GENERATION);
+    let args = ddi12::D3DDDICB_QUERYADAPTERINFO {
+        pPrivateDriverData: core::ptr::addr_of_mut!(info).cast(),
+        PrivateDriverDataSize: core::mem::size_of_val(&info) as u32,
+    };
+    // SAFETY: the handle and callback come from the same OpenAdapter record;
+    // the fixed record remains live across this synchronous call.
+    let hr = unsafe { query(open.hRTAdapter.handle, &args) };
+    if hr < 0 || info.validate_reply(HELIOS_PACKAGE_GENERATION).is_err() {
+        log_error!(
+            "OpenAdapter12: private adapter identity query failed hr=0x{:08x}",
+            hr as u32
+        );
+        return Err(E_FAIL);
+    }
+    Ok(Box::new(AdapterState {
+        magic: ADAPTER_STATE_MAGIC,
+        identity: AdapterIdentity {
+            generation: info.adapter_generation,
+            luid: info.adapter_luid,
+        },
+    }))
 }
 
 /// How many times a bounded, per-site evidence line may repeat.
@@ -704,6 +745,11 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut c_void) -> Hresult {
         return E_INVALIDARG;
     }
 
+    let adapter = match unsafe { query_adapter_state(open) } {
+        Ok(adapter) => adapter,
+        Err(hr) => return hr,
+    };
+
     let selected = Ddi12Interface::selected();
     log_error!(
         "OpenAdapter12: knob ON, hRTAdapter={:p} pAdapterCallbacks={:p} advertising {} \
@@ -720,7 +766,7 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut c_void) -> Hresult {
     );
 
     // ── 4. The driver's adapter handle ──────────────────────────────────────
-    open.hAdapter.pDrvPrivate = core::ptr::addr_of!(ADAPTER_TOKEN) as *mut c_void;
+    open.hAdapter.pDrvPrivate = Box::into_raw(adapter).cast();
 
     // ── 5. All eight slots ──────────────────────────────────────────────────
     // Built as a value and written once, rather than eight field stores through
@@ -776,7 +822,7 @@ unsafe extern "C" fn get_supported_versions(
     entries: *mut ddi12::UINT32,
     supported_versions: *mut ddi12::UINT64,
 ) -> ddi12::HRESULT {
-    let _ = adapter_ok(h_adapter);
+    let _ = unsafe { adapter_state(h_adapter) };
 
     if entries.is_null() {
         note_refusal(&UMD12_REFUSALS.get_supported_versions_bad_arg);
@@ -841,7 +887,7 @@ unsafe extern "C" fn get_caps(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     arg: *const ddi12::D3D12DDIARG_GETCAPS,
 ) -> ddi12::HRESULT {
-    let _ = adapter_ok(h_adapter);
+    let _ = unsafe { adapter_state(h_adapter) };
     // SAFETY: forwarded unchanged; the DDI declares `arg` `_In_ CONST`, and
     // `caps12` null-checks both it and its `pData` rather than trusting them.
     unsafe { caps12::get_caps(arg) }
@@ -860,7 +906,7 @@ unsafe extern "C" fn get_optional_ddi_tables(
     entries: *mut ddi12::UINT32,
     requests: *mut ddi12::D3D12DDI_TABLE_REQUEST,
 ) -> ddi12::HRESULT {
-    let _ = adapter_ok(h_adapter);
+    let _ = unsafe { adapter_state(h_adapter) };
 
     if entries.is_null() {
         note_refusal(&UMD12_REFUSALS.get_optional_ddi_tables_bad_arg);
@@ -905,7 +951,7 @@ unsafe extern "C" fn fill_ddi_table(
     index: ddi12::UINT,
     h_rt_table: ddi12::D3D12DDI_HRTTABLE,
 ) -> ddi12::HRESULT {
-    let _ = adapter_ok(h_adapter);
+    let _ = unsafe { adapter_state(h_adapter) };
 
     FILL_DDI_TABLE_CALLS.fetch_add(1, Ordering::Relaxed);
     let n = FILL_DDI_TABLE_CALLS.load(Ordering::Relaxed);
@@ -944,7 +990,7 @@ unsafe extern "C" fn calc_private_device_size(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     arg: *const ddi12::D3D12DDIARG_CALCPRIVATEDEVICESIZE,
 ) -> ddi12::SIZE_T {
-    let _ = adapter_ok(h_adapter);
+    let _ = unsafe { adapter_state(h_adapter) };
     // SAFETY: forwarded unchanged; the DDI declares `arg` `_In_ CONST`, and
     // `device12` null-checks it rather than trusting that.
     let size = unsafe { device12::calc_private_device_size(arg) };
@@ -963,11 +1009,16 @@ unsafe extern "C" fn create_device(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     arg: *const ddi12::D3D12DDIARG_CREATEDEVICE_0109,
 ) -> ddi12::HRESULT {
-    let _ = adapter_ok(h_adapter);
+    let Some(adapter) = (unsafe { adapter_state(h_adapter) }) else {
+        return E_INVALIDARG;
+    };
+    // SAFETY: hAdapter owns this state until CloseAdapter, after every device
+    // created from it has been destroyed.
+    let identity = unsafe { (*adapter).identity };
     // SAFETY: forwarded unchanged; `device12::create_device` validates every
     // runtime-supplied pointer before constructing anything, which is the
     // ordering `DeviceUnderConstruction`'s docstring exists to record.
-    unsafe { device12::create_device(arg) }
+    unsafe { device12::create_device(arg, identity) }
 }
 
 /// `pfnDestroyDevice` — the DDI slot; [`device12`] owns the teardown.
@@ -990,7 +1041,15 @@ unsafe extern "C" fn destroy_device(h_device: ddi12::D3D12DDI_HDEVICE) {
 /// run in which only those fired would leave the set unprinted. T5's lesson,
 /// restated: *an instrument nothing can read is not an instrument.*
 unsafe extern "C" fn close_adapter(h_adapter: ddi12::D3D12DDI_HADAPTER) -> ddi12::HRESULT {
-    let _ = adapter_ok(h_adapter);
+    let Some(state) = (unsafe { adapter_state(h_adapter) }) else {
+        return E_INVALIDARG;
+    };
+    // SAFETY: CloseAdapter consumes the driver handle exactly once. Invalidate
+    // before freeing so recycled storage cannot retain a live association.
+    unsafe {
+        (*state).magic = 0;
+        drop(Box::from_raw(state));
+    }
     log_error!("CloseAdapter");
     log_refusal_summary();
     // ⭐ And the other instrument, for the same reason: the per-slot noop hit

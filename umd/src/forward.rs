@@ -34,6 +34,7 @@ mod tiles;
 mod transfer;
 mod vehicle;
 mod views;
+mod wddm2;
 
 pub(super) use crate::bridge::{DstRes, PresentStreamCorrelation, SrcRes};
 pub(super) use alloc::{Hwa2CreateInput, Hwa2InputRefusal, ScanoutGeometry, VenusBacking};
@@ -55,6 +56,7 @@ pub(crate) use tiles::*;
 pub(crate) use transfer::*;
 pub(crate) use vehicle::*;
 pub(crate) use views::*;
+pub(crate) use wddm2::*;
 // NOT re-exported: `boxed_slot` is `pub(super)` in `handles` and its
 // `BoxedHandle` bound names types (`ResourceState`, `RtvState`, `LayoutData`)
 // that are private to this subtree, so a `pub(super)` re-export would leak
@@ -93,13 +95,16 @@ pub(super) use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE
 // tickets, §10.5) with its own retirement unit; K4 does not touch it.
 pub(super) use helios_protocol::{
     HeliosAllocDescRejection, HeliosPresentPrivateData, HeliosPresentRefreshCmd,
-    HeliosPresentRenderCmd, HeliosWddmAllocationDescV2, HELIOS_HWA2_BYTES,
-    HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY, HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE,
-    HELIOS_PACKAGE_GENERATION, HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT,
-    HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT, HELIOS_PRESENT_PRIVATE_FLAG_WINDOWED_BLT_SNAPSHOT,
-    HELIOS_PRESENT_PRIVATE_MAGIC, HELIOS_PRESENT_PRIVATE_VERSION, HELIOS_PRESENT_REFRESH_MAGIC,
-    HELIOS_PRESENT_REFRESH_VERSION, HELIOS_PRESENT_RENDER_MAGIC, HELIOS_PRESENT_RENDER_VERSION,
+    HeliosPresentRenderCmd, HeliosResourceAssociationV1, HeliosWddmAllocationDescV2,
+    HELIOS_HWA2_BYTES, HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY,
+    HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE, HELIOS_PACKAGE_GENERATION,
+    HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT, HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT,
+    HELIOS_PRESENT_PRIVATE_FLAG_WINDOWED_BLT_SNAPSHOT, HELIOS_PRESENT_PRIVATE_MAGIC,
+    HELIOS_PRESENT_PRIVATE_VERSION, HELIOS_PRESENT_REFRESH_MAGIC, HELIOS_PRESENT_REFRESH_VERSION,
+    HELIOS_PRESENT_RENDER_MAGIC, HELIOS_PRESENT_RENDER_VERSION,
     HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE, HELIOS_PRESENT_SNAPSHOT_PURPOSE_WINDOWED_BLT,
+    HELIOS_RESOURCE_ASSOCIATION_ABI_VERSION, HELIOS_RESOURCE_ASSOCIATION_BYTES,
+    HELIOS_RESOURCE_ASSOCIATION_STRUCTURE_TYPE,
 };
 
 pub(super) use crate::ddi;
@@ -240,7 +245,9 @@ fn dxgi_integer_typed_format(fmt: u32) -> bool {
     format::integer_typed(fmt)
 }
 
-pub(super) use crate::hr::{DXGI_ERROR_UNSUPPORTED, E_FAIL, E_INVALIDARG, E_OUTOFMEMORY};
+pub(super) use crate::hr::{
+    DXGI_ERROR_UNSUPPORTED, E_FAIL, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY,
+};
 /// Live `HeliosDevice` private blocks.
 ///
 /// `wait_last_present` dereferences a device pointer recorded by an earlier
@@ -604,7 +611,7 @@ unsafe fn present_prerequisites(
         PRESENT_SKIP_NO_CALLBACKS.fetch_add(1, Ordering::Relaxed);
         return Err(PresentSkip::NoDxgiCallbacks);
     }
-    let Some(h_context) = dev.context.as_ref().map(|c| c.handle) else {
+    let Some(h_context) = dev.outer.context.as_ref().map(|c| c.handle) else {
         PRESENT_SKIP_NO_CONTEXT.fetch_add(1, Ordering::Relaxed);
         return Err(PresentSkip::NoContext);
     };

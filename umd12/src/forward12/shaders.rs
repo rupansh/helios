@@ -477,18 +477,66 @@ fn encode_entry(is_patch_part: bool, system_value: u32, register: u32, mask: u8)
     // `…TRI_EDGE…` 13, `…TRI_INSIDE…` 14, `…LINE_DETAIL…` 15,
     // `…LINE_DENSITY…` 16.
     match system_value {
-        11 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 0, system_value: 11 },
-        12 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 1, system_value: 11 },
-        13 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 2, system_value: 11 },
-        14 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 3, system_value: 11 },
-        15 => EncodedEntry { name: NAME_INSIDE_TESS_FACTOR, semantic_index: 0, system_value: 12 },
-        16 => EncodedEntry { name: NAME_INSIDE_TESS_FACTOR, semantic_index: 1, system_value: 12 },
-        17 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 0, system_value: 13 },
-        18 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 1, system_value: 13 },
-        19 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 2, system_value: 13 },
-        20 => EncodedEntry { name: NAME_INSIDE_TESS_FACTOR, semantic_index: 0, system_value: 14 },
-        21 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 0, system_value: 15 },
-        22 => EncodedEntry { name: NAME_INSIDE_TESS_FACTOR, semantic_index: 0, system_value: 16 },
+        11 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 0,
+            system_value: 11,
+        },
+        12 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 1,
+            system_value: 11,
+        },
+        13 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 2,
+            system_value: 11,
+        },
+        14 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 3,
+            system_value: 11,
+        },
+        15 => EncodedEntry {
+            name: NAME_INSIDE_TESS_FACTOR,
+            semantic_index: 0,
+            system_value: 12,
+        },
+        16 => EncodedEntry {
+            name: NAME_INSIDE_TESS_FACTOR,
+            semantic_index: 1,
+            system_value: 12,
+        },
+        17 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 0,
+            system_value: 13,
+        },
+        18 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 1,
+            system_value: 13,
+        },
+        19 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 2,
+            system_value: 13,
+        },
+        20 => EncodedEntry {
+            name: NAME_INSIDE_TESS_FACTOR,
+            semantic_index: 0,
+            system_value: 14,
+        },
+        21 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 0,
+            system_value: 15,
+        },
+        22 => EncodedEntry {
+            name: NAME_INSIDE_TESS_FACTOR,
+            semantic_index: 0,
+            system_value: 16,
+        },
         _ => passthrough,
     }
 }
@@ -699,17 +747,28 @@ unsafe fn signature_parts<'a>(
             // SAFETY: non-null per the check, live per the caller.
             let s = unsafe { &*p };
             // SAFETY: every arm of these two unions is a pointer at offset 0.
-            let (inputs, outputs) = unsafe { (s.__bindgen_anon_1.pInputSignature, s.__bindgen_anon_2.pOutputSignature) };
+            let (inputs, outputs) = unsafe {
+                (
+                    s.__bindgen_anon_1.pInputSignature,
+                    s.__bindgen_anon_2.pOutputSignature,
+                )
+            };
             // SAFETY: the runtime owns both arrays for this call and states
             // their lengths in the same struct.
             let input = unsafe { signature_slice(inputs, s.NumInputSignatureEntries) };
             // SAFETY: as above.
             let output = unsafe { signature_slice(outputs, s.NumOutputSignatureEntries) };
             if !input.is_empty() {
-                parts.push(SignaturePart { tag: b"ISG1", entries: input });
+                parts.push(SignaturePart {
+                    tag: b"ISG1",
+                    entries: input,
+                });
             }
             if !output.is_empty() {
-                parts.push(SignaturePart { tag: b"OSG1", entries: output });
+                parts.push(SignaturePart {
+                    tag: b"OSG1",
+                    entries: output,
+                });
             }
         }
         IoArm::Tessellation => {
@@ -736,13 +795,22 @@ unsafe fn signature_parts<'a>(
             // SAFETY: as above.
             let pc = unsafe { signature_slice(patch, s.NumPatchConstantSignatureEntries) };
             if !input.is_empty() {
-                parts.push(SignaturePart { tag: b"ISG1", entries: input });
+                parts.push(SignaturePart {
+                    tag: b"ISG1",
+                    entries: input,
+                });
             }
             if !output.is_empty() {
-                parts.push(SignaturePart { tag: b"OSG1", entries: output });
+                parts.push(SignaturePart {
+                    tag: b"OSG1",
+                    entries: output,
+                });
             }
             if !pc.is_empty() {
-                parts.push(SignaturePart { tag: b"PSG1", entries: pc });
+                parts.push(SignaturePart {
+                    tag: b"PSG1",
+                    entries: pc,
+                });
             }
         }
         IoArm::Mesh => {
@@ -767,7 +835,10 @@ unsafe fn signature_parts<'a>(
                 note_refusal(&L6_REFUSALS.mesh_primitive_signature_dropped);
             }
             if !vertex.is_empty() {
-                parts.push(SignaturePart { tag: b"OSG1", entries: vertex });
+                parts.push(SignaturePart {
+                    tag: b"OSG1",
+                    entries: vertex,
+                });
             }
         }
     }

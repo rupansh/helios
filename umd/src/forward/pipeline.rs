@@ -220,7 +220,9 @@ pub(crate) unsafe extern "C" fn ia_set_topology(
     topo: ddi::D3D10_DDI_PRIMITIVE_TOPOLOGY,
 ) {
     if let Some(bindings) = ctx_bindings(h) {
-        bindings.current_topology.store(topo as u32, Ordering::Relaxed);
+        bindings
+            .current_topology
+            .store(topo as u32, Ordering::Relaxed);
     }
     if IA_BIND_LOG_COUNT.first_n(64).is_some() {
         trace_line!("DDI IASetTopology topo={}", topo as u32);

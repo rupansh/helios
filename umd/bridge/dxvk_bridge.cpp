@@ -15,9 +15,9 @@
 #include <cstdlib>
 #include <exception>
 #include <share.h>
-#include <tlhelp32.h>
 
 #include "dxvk_bridge.h"
+#include "helios_resource_association.h"
 
 // ⚠ These two resolve to `umd_common/bridge/`, not to this directory —
 // `build.rs` adds it to the include path (`DECISIONS.md` D3b: one copy of the
@@ -63,10 +63,6 @@
 #include "d3d11_context_imm.h"
 #include "dxvk_helios_feed_trace.h"
 #include "dxvk_helios_present_sync.h"
-
-// After the DXVK headers: see the include-order note in this header.
-#include "bridge_icd_anchor.h"
-#include "bridge_icd_exports.h"
 
 // ── the shared bridge_guard, with this bridge's one engine-specific arm ──────
 //
@@ -303,6 +299,76 @@ struct HeliosDxvkDeviceImpl {
 
 namespace {
 
+  // A5 removed the old name-resolved private ICD export surface.  The
+  // remaining callers below belong to the pre-cutover snapshot/present path,
+  // which stays present in source until the B lane but must fail closed rather
+  // than rediscover an ICD module or reinterpret a Vulkan handle.  Keeping the
+  // refusal local also makes it impossible for the record-only construction
+  // edge above to acquire a loader/registry/module-enumeration fallback.
+  std::uint64_t retired_venus_memory_id(VkDeviceMemory) {
+    return 0;
+  }
+
+  std::uint32_t retired_venus_memory_resource_id(VkDeviceMemory) {
+    return 0;
+  }
+
+  bool retired_venus_memory_alloc_info(VkDeviceMemory,
+                                       std::uint64_t*,
+                                       std::uint32_t*) {
+    return false;
+  }
+
+  std::uint64_t retired_venus_memory_vidmm_identity(VkDeviceMemory) {
+    return 0;
+  }
+
+  std::uint32_t retired_venus_transfer_resource_ownership(VkDeviceMemory) {
+    return 0;
+  }
+
+  bool retired_venus_open_vidmm_tracker(VkDeviceMemory, std::uint64_t) {
+    return false;
+  }
+
+  bool retired_venus_register_present_stream(VkDevice,
+                                              VkSemaphore,
+                                              std::uint64_t*) {
+    return false;
+  }
+
+  std::optional<HeliosResourceAssociationV1> make_resource_association(
+      std::uint64_t package_generation,
+      std::uint64_t device_generation,
+      std::uint64_t outer_allocation_token,
+      std::uint64_t outer_allocation_bytes,
+      std::size_t cpu_mapping,
+      std::uint32_t association_flags) {
+    if (package_generation != HELIOS_PACKAGE_GENERATION
+     || !device_generation
+     || !outer_allocation_token
+     || !outer_allocation_bytes
+     || (association_flags & ~HELIOS_RESOURCE_ASSOCIATION_FLAG_MASK)
+     || (!!cpu_mapping != !!(association_flags
+          & HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING)))
+      return std::nullopt;
+
+    HeliosResourceAssociationV1 association = { };
+    association.s_type = HELIOS_RESOURCE_ASSOCIATION_STRUCTURE_TYPE;
+    association.struct_bytes = HELIOS_RESOURCE_ASSOCIATION_BYTES;
+    association.p_next = nullptr;
+    association.abi_version = HELIOS_RESOURCE_ASSOCIATION_ABI_VERSION;
+    association.reserved = 0;
+    association.package_generation = package_generation;
+    association.device_generation = device_generation;
+    association.outer_allocation_token = outer_allocation_token;
+    association.outer_allocation_bytes = outer_allocation_bytes;
+    association.cpu_mapping = reinterpret_cast<void*>(cpu_mapping);
+    association.association_flags = association_flags;
+    association.reserved1 = 0;
+    return association;
+  }
+
   // The body every plain `create_*_shader` forwarder shares.
   //
   // Six bodies were identical apart from one COM interface type, one
@@ -354,8 +420,106 @@ std::size_t HeliosDxvkDevice::d3d11_context_ptr() const {
   return impl ? reinterpret_cast<std::size_t>(impl->context) : 0;
 }
 
-std::uint32_t HeliosDxvkDevice::venus_context_id() const {
-  return impl ? impl->venus_ctx_id : 0;
+std::size_t HeliosDxvkDevice::create_associated_buffer(
+    std::size_t desc_ptr,
+    std::size_t initial_data_ptr,
+    std::uint64_t package_generation,
+    std::uint64_t device_generation,
+    std::uint64_t outer_allocation_token,
+    std::uint64_t outer_allocation_bytes,
+    std::size_t cpu_mapping,
+    std::uint32_t association_flags) const {
+  return bridge_guard("create_associated_buffer", std::size_t(0), [&]() {
+    auto association = make_resource_association(package_generation,
+      device_generation, outer_allocation_token, outer_allocation_bytes,
+      cpu_mapping, association_flags);
+    if (!impl || !impl->d3d11 || !desc_ptr || !association)
+      return std::size_t(0);
+    ID3D11Buffer* resource = nullptr;
+    HRESULT hr = static_cast<dxvk::D3D11Device*>(impl->d3d11)->CreateBufferHelios(
+      reinterpret_cast<const D3D11_BUFFER_DESC*>(desc_ptr),
+      reinterpret_cast<const D3D11_SUBRESOURCE_DATA*>(initial_data_ptr),
+      &*association, &resource);
+    return SUCCEEDED(hr) ? reinterpret_cast<std::size_t>(resource) : 0;
+  });
+}
+
+std::size_t HeliosDxvkDevice::create_associated_texture1d(
+    std::size_t desc_ptr,
+    std::size_t initial_data_ptr,
+    std::uint64_t package_generation,
+    std::uint64_t device_generation,
+    std::uint64_t outer_allocation_token,
+    std::uint64_t outer_allocation_bytes,
+    std::size_t cpu_mapping,
+    std::uint32_t association_flags) const {
+  return bridge_guard("create_associated_texture1d", std::size_t(0), [&]() {
+    auto association = make_resource_association(package_generation,
+      device_generation, outer_allocation_token, outer_allocation_bytes,
+      cpu_mapping, association_flags);
+    if (!impl || !impl->d3d11 || !desc_ptr || !association)
+      return std::size_t(0);
+    dxvk::D3D11_HELIOS_CREATE_INFO create = { };
+    create.ResourceAssociation = &*association;
+    ID3D11Texture1D* resource = nullptr;
+    HRESULT hr = static_cast<dxvk::D3D11Device*>(impl->d3d11)->CreateTexture1DHelios(
+      reinterpret_cast<const D3D11_TEXTURE1D_DESC*>(desc_ptr),
+      reinterpret_cast<const D3D11_SUBRESOURCE_DATA*>(initial_data_ptr),
+      &create, &resource);
+    return SUCCEEDED(hr) ? reinterpret_cast<std::size_t>(resource) : 0;
+  });
+}
+
+std::size_t HeliosDxvkDevice::create_associated_texture2d(
+    std::size_t desc_ptr,
+    std::size_t initial_data_ptr,
+    std::uint64_t package_generation,
+    std::uint64_t device_generation,
+    std::uint64_t outer_allocation_token,
+    std::uint64_t outer_allocation_bytes,
+    std::size_t cpu_mapping,
+    std::uint32_t association_flags) const {
+  return bridge_guard("create_associated_texture2d", std::size_t(0), [&]() {
+    auto association = make_resource_association(package_generation,
+      device_generation, outer_allocation_token, outer_allocation_bytes,
+      cpu_mapping, association_flags);
+    if (!impl || !impl->d3d11 || !desc_ptr || !association)
+      return std::size_t(0);
+    dxvk::D3D11_HELIOS_CREATE_INFO create = { };
+    create.ResourceAssociation = &*association;
+    ID3D11Texture2D* resource = nullptr;
+    HRESULT hr = static_cast<dxvk::D3D11Device*>(impl->d3d11)->CreateTexture2DHelios(
+      reinterpret_cast<const D3D11_TEXTURE2D_DESC*>(desc_ptr),
+      reinterpret_cast<const D3D11_SUBRESOURCE_DATA*>(initial_data_ptr),
+      &create, &resource);
+    return SUCCEEDED(hr) ? reinterpret_cast<std::size_t>(resource) : 0;
+  });
+}
+
+std::size_t HeliosDxvkDevice::create_associated_texture3d(
+    std::size_t desc_ptr,
+    std::size_t initial_data_ptr,
+    std::uint64_t package_generation,
+    std::uint64_t device_generation,
+    std::uint64_t outer_allocation_token,
+    std::uint64_t outer_allocation_bytes,
+    std::size_t cpu_mapping,
+    std::uint32_t association_flags) const {
+  return bridge_guard("create_associated_texture3d", std::size_t(0), [&]() {
+    auto association = make_resource_association(package_generation,
+      device_generation, outer_allocation_token, outer_allocation_bytes,
+      cpu_mapping, association_flags);
+    if (!impl || !impl->d3d11 || !desc_ptr || !association)
+      return std::size_t(0);
+    dxvk::D3D11_HELIOS_CREATE_INFO create = { };
+    create.ResourceAssociation = &*association;
+    ID3D11Texture3D* resource = nullptr;
+    HRESULT hr = static_cast<dxvk::D3D11Device*>(impl->d3d11)->CreateTexture3DHelios(
+      reinterpret_cast<const D3D11_TEXTURE3D_DESC*>(desc_ptr),
+      reinterpret_cast<const D3D11_SUBRESOURCE_DATA*>(initial_data_ptr),
+      &create, &resource);
+    return SUCCEEDED(hr) ? reinterpret_cast<std::size_t>(resource) : 0;
+  });
 }
 
 std::uint64_t HeliosDxvkDevice::feed_trace_timestamp_ns() const noexcept {
@@ -460,8 +624,8 @@ bool HeliosDxvkDevice::get_resource_memory_info(
 
     auto info = texture->GetImage()->storage()->getMemoryInfo();
     const auto rawMemory = reinterpret_cast<std::uintptr_t>(info.memory);
-    const auto venusId = venus_memory_id_from_handle(info.memory);
-    const auto resourceId = venus_memory_resource_id_from_handle(info.memory);
+    const auto venusId = retired_venus_memory_id(info.memory);
+    const auto resourceId = retired_venus_memory_resource_id(info.memory);
     if (memory)
       *memory = venusId;
     if (size)
@@ -510,11 +674,11 @@ bool HeliosDxvkDevice::get_resource_alloc_identity(
       return false;
 
     auto info = texture->GetImage()->storage()->getMemoryInfo();
-    const bool valid = venus_memory_alloc_info_from_handle(
+    const bool valid = retired_venus_memory_alloc_info(
       info.memory, venus_alloc_size, memory_type_index);
     if (valid && global_vidmm_tracker) {
       *global_vidmm_tracker =
-        venus_memory_vidmm_global_identity_from_handle(info.memory);
+        retired_venus_memory_vidmm_identity(info.memory);
     }
     return valid;
   });
@@ -532,7 +696,7 @@ bool HeliosDxvkDevice::transfer_resource_ownership(
       return false;
 
     auto info = texture->GetImage()->storage()->getMemoryInfo();
-    const auto resourceId = venus_memory_transfer_resource_ownership(info.memory);
+    const auto resourceId = retired_venus_transfer_resource_ownership(info.memory);
 
     static std::atomic<std::uint32_t> s_xferOwnLogs{0};
     if (bridge_log_budget(s_xferOwnLogs, 64, 512)) {
@@ -646,7 +810,7 @@ std::size_t HeliosDxvkDevice::open_ddi_texture2d(
       if (global_vidmm_tracker) {
         auto* common = dxvk::GetCommonTexture(resource);
         const bool retained = common && common->GetImage() &&
-          common->GetImage()->storage() && venus_memory_open_vidmm_tracker(
+          common->GetImage()->storage() && retired_venus_open_vidmm_tracker(
             common->GetImage()->storage()->getMemoryInfo().memory,
             global_vidmm_tracker);
         if (!retained) {
@@ -1154,7 +1318,7 @@ bool HeliosDxvkDevice::publish_present_order(std::size_t d3d11_resource_ptr,
     // D3D wrappers can rotate backing storages while this Venus resource lives.
     auto storage = texture->GetImage()->storage();
     const auto info = storage->getMemoryInfo();
-    const std::uint32_t resid = venus_memory_resource_id_from_handle(info.memory);
+    const std::uint32_t resid = retired_venus_memory_resource_id(info.memory);
 
     if (!resid) {
       const auto n = s_publishNoResource.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1236,7 +1400,7 @@ bool HeliosDxvkDevice::publish_present_order(std::size_t d3d11_resource_ptr,
         // admissible registration identity.  An old ICD missing this private
         // DLL export stays a zero-correlation fallback without changing
         // ordinary present publication.
-        if (venus_register_present_stream(
+        if (retired_venus_register_present_stream(
               impl->device->vkd()->device(), fence->handle(), &cookie)) {
           const auto n = s_presentStreamRegistered.fetch_add(
               1, std::memory_order_relaxed) + 1;
@@ -1453,6 +1617,16 @@ bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us,
   return *outcome;
 }
 
+bool HeliosDxvkDevice::flush_submitted() const {
+  if (!impl || !impl->context)
+    return false;
+  return bridge_guard("flush_submitted", false, [&]() -> bool {
+    auto* immediateContext = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
+    immediateContext->HeliosWaitFrameSubmitted();
+    return true;
+  });
+}
+
 std::int32_t HeliosDxvkDevice::present_vehicle_copy(
     std::size_t dst_resource_ptr,
     std::size_t src_resource_ptr) const {
@@ -1601,8 +1775,18 @@ std::size_t HeliosDxvkDevice::create_compute_shader(const std::uint8_t* code, st
 }
 
 std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
+    std::size_t   vk_instance,
+    std::size_t   get_instance_proc_addr,
+    std::size_t   icd_module_base,
     std::uint32_t luid_low,
-    std::int32_t  luid_high) {
+    std::int32_t  luid_high,
+    std::size_t   outer_context,
+    std::size_t   outer_begin,
+    std::size_t   outer_finish,
+    std::size_t   outer_join,
+    std::size_t   outer_allocate,
+    std::size_t   outer_teardown_begin,
+    std::size_t   outer_retire) {
   // R824: configuration delivered as a process-global side effect, whose
   // correctness used to be statement position -- these writes happened on EVERY
   // CreateDevice DDI, and one process (dwm) creates several D3D11 devices, so
@@ -1651,53 +1835,46 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
       out->impl = std::make_unique<HeliosDxvkDeviceImpl>();
       auto& d = *out->impl;
 
-      d.instance = new dxvk::DxvkInstance(dxvk::DxvkInstanceFlags());
-
-      if (luid_low != 0 || luid_high != 0) {
-        LUID luid;
-        luid.LowPart  = luid_low;
-        luid.HighPart = luid_high;
-        d.adapter = d.instance->findAdapterByLuid(&luid);
-        if (d.adapter == nullptr)
-          umd_log("findAdapterByLuid found nothing; falling back to adapter 0");
-      }
-
-      if (d.adapter == nullptr)
-        d.adapter = d.instance->enumAdapters(0);
-
-      if (d.adapter == nullptr) {
-        umd_log("no Vulkan adapter enumerated (venus ICD not present?)");
+      if (!vk_instance || !get_instance_proc_addr || !icd_module_base ||
+          !outer_context || !outer_begin || !outer_finish || !outer_join ||
+          !outer_allocate || !outer_teardown_begin || !outer_retire ||
+          (!luid_low && !luid_high)) {
+        umd_log("REFUSING DXVK device: incomplete A5/provenance/LUID/outer edge");
         return nullptr;
       }
 
-      d.device = d.adapter->createDevice();
+      dxvk::DxvkInstanceImportInfo import_info;
+      import_info.loaderProc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(
+          get_instance_proc_addr);
+      import_info.instance = reinterpret_cast<VkInstance>(vk_instance);
+      import_info.recordOnlyDirect = true;
+      import_info.expectedModule = reinterpret_cast<HMODULE>(icd_module_base);
+      d.instance = new dxvk::DxvkInstance(import_info, dxvk::DxvkInstanceFlags());
+
+      LUID luid;
+      luid.LowPart  = luid_low;
+      luid.HighPart = luid_high;
+      d.adapter = d.instance->findAdapterByLuid(&luid);
+
+      if (d.adapter == nullptr) {
+        umd_log("REFUSING DXVK device: A5 instance has no exact LUID match");
+        return nullptr;
+      }
+
+      dxvk::DxvkHeliosOuterOps outer_ops = { };
+      outer_ops.context = reinterpret_cast<void*>(outer_context);
+      outer_ops.begin = reinterpret_cast<dxvk::DxvkHeliosOuterBeginProc>(outer_begin);
+      outer_ops.finish = reinterpret_cast<dxvk::DxvkHeliosOuterFinishProc>(outer_finish);
+      outer_ops.join = reinterpret_cast<dxvk::DxvkHeliosOuterJoinProc>(outer_join);
+      outer_ops.allocate = reinterpret_cast<dxvk::DxvkHeliosOuterAllocateProc>(outer_allocate);
+      outer_ops.teardownBegin = reinterpret_cast<dxvk::DxvkHeliosOuterTeardownBeginProc>(outer_teardown_begin);
+      outer_ops.retire = reinterpret_cast<dxvk::DxvkHeliosOuterRetireProc>(outer_retire);
+      d.device = d.adapter->createDevice(outer_ops);
       if (d.device == nullptr) {
         umd_log("DxvkAdapter::createDevice returned null");
         return nullptr;
       }
-      d.venus_ctx_id = read_instance_venus_context_id(d.instance->handle());
-      // ⛔ S4b (`ARCHITECTURE.md` §6.4). The read above is the first thing that
-      // forces `resolve_helios_icd_module`, which now reconciles against the
-      // process-global anchor. If it refused, a SECOND venus ICD module is live
-      // in this process — `helios_umd12.dll` selected a different one — and
-      // every `VkDeviceMemory`/`VkInstance` identity this device would go on to
-      // stamp is derived from the wrong one.
-      //
-      // ⚠ This is the one place S4b can change SHIPPING D3D11 behaviour, so be
-      // exact about when: `icd_anchor_poisoned()` is false unless two distinct
-      // modules both exported `helios_venus_memory_alloc_info` and the two UMDs
-      // disagreed. In every process on this box today — one UMD, one ICD — it
-      // cannot fire. Degrading instead would be fake success: the device comes
-      // up, renders, and writes cross-process allocation identities nobody can
-      // resolve.
-      if (helios_bridge::icd_anchor_poisoned()) {
-        umd_log("REFUSING DXVK device: venus ICD anchor mismatch "
-                "(two ICD modules live in this process)");
-        return nullptr;
-      }
-      if (!d.venus_ctx_id)
-        umd_log("DXVK device created but Venus context export returned 0");
-      umd_log("DxvkDevice created on venus adapter OK");
+      umd_log("DxvkDevice created from exact A5 record-only instance");
 
       // Instantiate DXVK's full D3D11 COM device from the DxvkDevice. The DDI
       // device-funcs forward to this ID3D11Device / its immediate context.

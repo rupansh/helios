@@ -129,7 +129,10 @@ pub(crate) fn note_deferred_context_destroyed() {
     }
     let n = DC_DESTROYED.fetch_add(1, Ordering::Relaxed);
     if n < 16 {
-        log_error!("DDI DestroyDevice(DC): deferred context destroyed (x{})", n + 1);
+        log_error!(
+            "DDI DestroyDevice(DC): deferred context destroyed (x{})",
+            n + 1
+        );
     }
 }
 
@@ -249,7 +252,10 @@ pub(crate) unsafe extern "C" fn calc_private_command_list_size(
 /// `set_runtime_error`'s tag dispatch.
 unsafe fn report_dc_error(core_layer: *mut c_void, um_callbacks: *const c_void, hr: i32) {
     if um_callbacks.is_null() {
-        log_error!("CreateDeferredContext: no DC corelayer callbacks to report hr=0x{:08x}", hr as u32);
+        log_error!(
+            "CreateDeferredContext: no DC corelayer callbacks to report hr=0x{:08x}",
+            hr as u32
+        );
         return;
     }
     let cb = &*(um_callbacks as *const ddi::D3D11DDI_CORELAYER_DEVICECALLBACKS);
@@ -309,7 +315,10 @@ pub(crate) unsafe extern "C" fn create_deferred_context(
             return;
         }
     };
-    if !dev.dxvk.enable_deferred_context_ddi_logical_reset(ctx.as_raw() as usize) {
+    if !dev
+        .dxvk
+        .enable_deferred_context_ddi_logical_reset(ctx.as_raw() as usize)
+    {
         log_error!("DDI CreateDeferredContext: failed to mark DXVK DC fast-reset eligible");
         report_dc_error(dc_core_layer, dc_um_callbacks, E_OUTOFMEMORY);
         return;
@@ -496,14 +505,14 @@ pub(crate) unsafe extern "C" fn recycle_destroy_command_list(
 /// context's shadow resets. The target may be the immediate context or
 /// (nested execution) another DC — `d3d11_context`/`ctx_bindings` dispatch by
 /// tag.
-pub(crate) unsafe extern "C" fn command_list_execute(
-    h: Hdevice,
-    h_cl: ddi::D3D11DDI_HCOMMANDLIST,
-) {
+pub(crate) unsafe extern "C" fn command_list_execute(h: Hdevice, h_cl: ddi::D3D11DDI_HCOMMANDLIST) {
     let Some(cl) = load_com::<ID3D11CommandList>(h_cl) else {
         let n = CL_EXECUTE_EMPTY.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
-            log_error!("DDI CommandListExecute: empty command-list slot (x{}) — refused", n + 1);
+            log_error!(
+                "DDI CommandListExecute: empty command-list slot (x{}) — refused",
+                n + 1
+            );
         }
         return;
     };
@@ -553,10 +562,7 @@ pub(crate) unsafe extern "C" fn abandon_command_list(h: Hdevice) {
 /// normal empty no-op, then give the live object only to its originating DXVK
 /// deferred context. The owned raw reference transfers directly into an
 /// admitted DXVK cache entry; a rejection reconstructs and drops it here.
-pub(crate) unsafe extern "C" fn recycle_command_list(
-    h: Hdevice,
-    h_cl: ddi::D3D11DDI_HCOMMANDLIST,
-) {
+pub(crate) unsafe extern "C" fn recycle_command_list(h: Hdevice, h_cl: ddi::D3D11DDI_HCOMMANDLIST) {
     let Some(command_list) = take_com::<ID3D11CommandList>(h_cl) else {
         if crate::umd_deferred_diagnostics() {
             CL_RECYCLE_EMPTY.fetch_add(1, Ordering::Relaxed);
@@ -580,10 +586,9 @@ pub(crate) unsafe extern "C" fn recycle_command_list(
     // result means DXVK attached that exact reference to its bounded cache;
     // false means ownership remained here and must be reconstructed/dropped.
     let raw_command_list = command_list.into_raw() as usize;
-    let cached = (*dc.parent).dxvk.recycle_deferred_command_list(
-        dc_context.as_raw() as usize,
-        raw_command_list,
-    );
+    let cached = (*dc.parent)
+        .dxvk
+        .recycle_deferred_command_list(dc_context.as_raw() as usize, raw_command_list);
     if !cached {
         drop(ID3D11CommandList::from_raw(
             raw_command_list as *mut core::ffi::c_void,
@@ -629,7 +634,10 @@ unsafe extern "C" fn dc_open_handle(
     if word == 0 {
         let n = DC_OPEN_EMPTY.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
-            log_error!("DC open: empty IC identity word ic_priv=0x{ic_priv:x} (x{})", n + 1);
+            log_error!(
+                "DC open: empty IC identity word ic_priv=0x{ic_priv:x} (x{})",
+                n + 1
+            );
         }
     }
     *(h_priv as *mut usize) = word;
@@ -797,14 +805,14 @@ static DC_RELOCATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 fn dc_relocate_log(tag: &str) {
     let n = DC_RELOCATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 8 || n % 65536 == 0 {
-        log_error!("DDI RelocateDeviceFuncs(DC {tag}) (x{}) — noted, table untouched", n + 1);
+        log_error!(
+            "DDI RelocateDeviceFuncs(DC {tag}) (x{}) — noted, table untouched",
+            n + 1
+        );
     }
 }
 
-unsafe extern "C" fn dc_relocate_11_0(
-    _h_device: Hdevice,
-    _funcs: *mut ddi::D3D11DDI_DEVICEFUNCS,
-) {
+unsafe extern "C" fn dc_relocate_11_0(_h_device: Hdevice, _funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
     dc_relocate_log("11.0");
 }
 
@@ -820,6 +828,13 @@ unsafe extern "C" fn dc_relocate_wddm1_3(
     _funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
 ) {
     dc_relocate_log("WDDM1.3");
+}
+
+unsafe extern "C" fn dc_relocate_wddm2_1(
+    _h_device: Hdevice,
+    _funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS,
+) {
+    dc_relocate_log("WDDM2.1");
 }
 
 pub(crate) unsafe fn fill_dc_11_0(funcs: *mut ddi::D3D11DDI_DEVICEFUNCS) {
@@ -858,6 +873,20 @@ pub(crate) unsafe fn fill_dc_wddm1_3(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS)
     (*funcs).pfnRelocateDeviceFuncs = Some(dc_relocate_wddm1_3);
 }
 
+pub(crate) unsafe fn fill_dc_wddm2_1(funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS) {
+    if funcs.is_null() {
+        log_error!("DC fill: null WDDM2.1 funcs table");
+        return;
+    }
+    let f = &mut *stub_fill_dc_table(funcs);
+    let base = install(f);
+    let l1 = install_11_1(base, funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS);
+    let l13 = install_wddm1_3(l1, funcs as *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS);
+    let _l21 = install_wddm2_1(l13, funcs);
+    apply_dc_overrides(f);
+    (*funcs).pfnRelocateDeviceFuncs = Some(dc_relocate_wddm2_1);
+}
+
 /// Fill the DC's context-funcs table through the union member matching the
 /// parent device's negotiated level — the same member/fill/level triple
 /// discipline as `create_device`'s step 3 (R802).
@@ -866,6 +895,7 @@ unsafe fn fill_dc_funcs(
     funcs: &ddi::D3D11DDIARG_CREATEDEFERREDCONTEXT__bindgen_ty_1,
 ) {
     match negotiated {
+        NegotiatedInterface::Wddm2_1 => fill_dc_wddm2_1(funcs.pWDDM2_1ContextFuncs),
         NegotiatedInterface::Wddm1_3 => fill_dc_wddm1_3(funcs.pWDDM1_3ContextFuncs),
         NegotiatedInterface::D3D11_1 => fill_dc_11_1(funcs.p11_1ContextFuncs),
         NegotiatedInterface::D3D11_0 => fill_dc_11_0(funcs.p11ContextFuncs),

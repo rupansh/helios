@@ -47,6 +47,7 @@ pub(crate) mod noop12;
 pub(crate) mod tables12;
 
 pub(crate) mod cmdlist;
+pub(crate) mod command_pool12;
 pub(crate) mod copy;
 pub(crate) mod descriptors;
 pub(crate) mod fence;

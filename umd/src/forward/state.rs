@@ -37,6 +37,15 @@ pub struct ResourceState {
     /// device-residency reference. Dropping the guard removes exactly that
     /// reference before the allocation is deallocated.
     pub(crate) allocation: Option<ResidentAllocation>,
+    /// Package-owned identity of that same WDDM allocation. It is copied into
+    /// DXVK/Mesa only during resource creation and resolved back to the current
+    /// allocation list entry during Render; neither handle nor pointer is used
+    /// as the token.
+    pub(crate) outer_allocation: Option<OuterAllocationIdentity>,
+    /// Optional CPU view that dxgkrnl uses as pSystemMem for this exact WDDM
+    /// allocation. The pointer is data access only and never participates in
+    /// token resolution.
+    pub(crate) cpu_backing: Option<helios_umd_common::cpu_backing::CpuBacking>,
     pub(crate) km_resource: ddi::D3DKMT_HANDLE,
     pub(crate) rt_resource: ddi::HANDLE,
     /// True when this UMD allocated `allocation` itself (pfnAllocateCb in
@@ -53,6 +62,472 @@ pub struct ResourceState {
     /// resources, so no validity test can turn this source into a scanout
     /// selector.
     pub(crate) snapshot_source: Option<SnapshotSourceDesc>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OuterAllocationIdentity {
+    /// Exact A5/HTS1 generation of the owning device.  Tokens are monotone
+    /// only within one device generation, so this field is what makes a
+    /// same-process foreign resource distinguishable even when both devices
+    /// have assigned token 1.
+    pub(crate) device_generation: u64,
+    pub(crate) token: u64,
+    pub(crate) allocation_generation: u64,
+    pub(crate) bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OuterAllocationRefusal {
+    ZeroAllocation,
+    ZeroGeneration,
+    ZeroBytes,
+    DuplicateAllocation,
+    LiveSetFull,
+    TokenOverflow,
+    ForeignDeviceGeneration,
+    MissingToken,
+    TeardownAlreadyPending,
+    TeardownNotPending,
+}
+
+/// WDDM ownership held after the DDI handle has been invalidated but before
+/// DXVK destroys the exact associated VkDeviceMemory.  This record lives in
+/// the owning device's bounded allocation set; the token remains resolvable
+/// until Mesa has accepted the terminal outer batch.
+pub(crate) struct PendingOuterAllocationTeardown {
+    identity: OuterAllocationIdentity,
+    resident: Option<ResidentAllocation>,
+    km_resource: ddi::D3DKMT_HANDLE,
+    rt_resource: ddi::HANDLE,
+    ownership: AllocationOwnership,
+    cpu_backing: Option<helios_umd_common::cpu_backing::CpuBacking>,
+}
+
+/// WDDM storage created directly for a DXVK-internal VkDeviceMemory. It stays
+/// on the exact owning device until DXVK begins destruction of that exact HRA1
+/// allocation; no process-global lookup or pointer identity is involved.
+pub(crate) struct InternalOuterAllocation {
+    identity: OuterAllocationIdentity,
+    resident: ResidentAllocation,
+    cpu_backing: Option<helios_umd_common::cpu_backing::CpuBacking>,
+}
+
+pub(crate) fn assign_outer_allocation(
+    outer: &crate::device_funcs::OuterDevice,
+    allocation: ddi::D3DKMT_HANDLE,
+    allocation_generation: u64,
+    bytes: u64,
+    cpu_mapping: *mut c_void,
+) -> Result<(OuterAllocationIdentity, HeliosResourceAssociationV1), OuterAllocationRefusal> {
+    use OuterAllocationRefusal as R;
+
+    if allocation == 0 {
+        return Err(R::ZeroAllocation);
+    }
+    if allocation_generation == 0 {
+        return Err(R::ZeroGeneration);
+    }
+    if bytes == 0 {
+        return Err(R::ZeroBytes);
+    }
+    let device_generation = outer.translator.session_generation();
+    if device_generation == 0 {
+        return Err(R::ForeignDeviceGeneration);
+    }
+    let mut set = lock_ignore_poison(&outer.allocations);
+    if set.entries.len() >= crate::device_funcs::HELIOS_MAX_LIVE_OUTER_ALLOCATIONS {
+        return Err(R::LiveSetFull);
+    }
+    if set
+        .entries
+        .iter()
+        .any(|entry| entry.allocation == allocation)
+    {
+        return Err(R::DuplicateAllocation);
+    }
+    let token = set.next_token;
+    if token == 0 || token == u64::MAX {
+        return Err(R::TokenOverflow);
+    }
+    set.next_token = token + 1;
+    set.entries.push(crate::device_funcs::OuterAllocationState {
+        token,
+        allocation,
+        allocation_generation,
+        bytes,
+    });
+    drop(set);
+
+    let identity = OuterAllocationIdentity {
+        device_generation,
+        token,
+        allocation_generation,
+        bytes,
+    };
+    let association = HeliosResourceAssociationV1 {
+        s_type: HELIOS_RESOURCE_ASSOCIATION_STRUCTURE_TYPE,
+        struct_bytes: HELIOS_RESOURCE_ASSOCIATION_BYTES,
+        p_next: core::ptr::null(),
+        abi_version: HELIOS_RESOURCE_ASSOCIATION_ABI_VERSION,
+        reserved: 0,
+        package_generation: HELIOS_PACKAGE_GENERATION,
+        device_generation,
+        outer_allocation_token: token,
+        outer_allocation_bytes: bytes,
+        cpu_mapping,
+        association_flags: if cpu_mapping.is_null() {
+            0
+        } else {
+            helios_protocol::HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING
+        },
+        reserved1: 0,
+    };
+    association
+        .validate(HELIOS_PACKAGE_GENERATION, device_generation)
+        .map_err(|_| R::ForeignDeviceGeneration)?;
+    Ok((identity, association))
+}
+
+pub(crate) fn retain_internal_outer_allocation(
+    outer: &crate::device_funcs::OuterDevice,
+    identity: OuterAllocationIdentity,
+    resident: ResidentAllocation,
+    cpu_backing: Option<helios_umd_common::cpu_backing::CpuBacking>,
+) -> Result<
+    (),
+    (
+        OuterAllocationRefusal,
+        ResidentAllocation,
+        Option<helios_umd_common::cpu_backing::CpuBacking>,
+    ),
+> {
+    use OuterAllocationRefusal as R;
+
+    if identity.device_generation == 0
+        || identity.device_generation != outer.translator.session_generation()
+    {
+        return Err((R::ForeignDeviceGeneration, resident, cpu_backing));
+    }
+    let mut set = lock_ignore_poison(&outer.allocations);
+    let exact_live = set.entries.iter().any(|entry| {
+        entry.token == identity.token
+            && entry.allocation == resident.handle()
+            && entry.allocation_generation == identity.allocation_generation
+            && entry.bytes == identity.bytes
+    });
+    if !exact_live {
+        return Err((R::MissingToken, resident, cpu_backing));
+    }
+    if set.internal_owned.iter().any(|owned| {
+        owned.identity.device_generation == identity.device_generation
+            && owned.identity.token == identity.token
+    }) {
+        return Err((R::DuplicateAllocation, resident, cpu_backing));
+    }
+    set.internal_owned.push(InternalOuterAllocation {
+        identity,
+        resident,
+        cpu_backing,
+    });
+    Ok(())
+}
+
+/// Move either the UMD-owned internal allocation, or an already-armed DDI
+/// resource allocation, into the one terminal-batch teardown state.
+pub(crate) fn arm_dxvk_outer_allocation_teardown(
+    outer: &crate::device_funcs::OuterDevice,
+    device_generation: u64,
+    token: u64,
+) -> Result<(), OuterAllocationRefusal> {
+    use OuterAllocationRefusal as R;
+
+    if device_generation == 0 || device_generation != outer.translator.session_generation() {
+        return Err(R::ForeignDeviceGeneration);
+    }
+    if token == 0 {
+        return Err(R::MissingToken);
+    }
+
+    let mut set = lock_ignore_poison(&outer.allocations);
+    if set.pending_teardown.iter().any(|pending| {
+        pending.identity.device_generation == device_generation && pending.identity.token == token
+    }) {
+        return Ok(());
+    }
+    if set.pending_teardown.len() >= crate::device_funcs::HELIOS_MAX_LIVE_OUTER_ALLOCATIONS {
+        return Err(R::LiveSetFull);
+    }
+    let Some(owned_index) = set.internal_owned.iter().position(|owned| {
+        owned.identity.device_generation == device_generation && owned.identity.token == token
+    }) else {
+        return Err(R::TeardownNotPending);
+    };
+    let owned = set.internal_owned.swap_remove(owned_index);
+    let allocation = owned.resident.handle();
+    let exact_live = set.entries.iter().any(|entry| {
+        entry.token == owned.identity.token
+            && entry.allocation == allocation
+            && entry.allocation_generation == owned.identity.allocation_generation
+            && entry.bytes == owned.identity.bytes
+    });
+    if !exact_live {
+        set.internal_owned.push(owned);
+        return Err(R::MissingToken);
+    }
+    set.pending_teardown.push(PendingOuterAllocationTeardown {
+        identity: owned.identity,
+        resident: Some(owned.resident),
+        km_resource: 0,
+        rt_resource: core::ptr::null_mut(),
+        ownership: AllocationOwnership::CreatedByUmd,
+        cpu_backing: owned.cpu_backing,
+    });
+    Ok(())
+}
+
+pub(crate) fn remove_outer_allocation(
+    outer: &crate::device_funcs::OuterDevice,
+    identity: OuterAllocationIdentity,
+) -> bool {
+    if identity.device_generation == 0
+        || identity.device_generation != outer.translator.session_generation()
+    {
+        return false;
+    }
+    let mut set = lock_ignore_poison(&outer.allocations);
+    if set.pending_teardown.iter().any(|pending| {
+        pending.identity.token == identity.token
+            && pending.identity.allocation_generation == identity.allocation_generation
+    }) {
+        return false;
+    }
+    let before = set.entries.len();
+    set.entries.retain(|entry| {
+        !(entry.token == identity.token
+            && entry.allocation_generation == identity.allocation_generation)
+    });
+    before != set.entries.len()
+}
+
+pub(crate) fn arm_outer_allocation_teardown(
+    dev: &crate::device_funcs::HeliosDevice,
+    identity: OuterAllocationIdentity,
+    resident: Option<ResidentAllocation>,
+    km_resource: ddi::D3DKMT_HANDLE,
+    rt_resource: ddi::HANDLE,
+    ownership: AllocationOwnership,
+    cpu_backing: Option<helios_umd_common::cpu_backing::CpuBacking>,
+) -> Result<
+    (),
+    (
+        OuterAllocationRefusal,
+        Option<ResidentAllocation>,
+        Option<helios_umd_common::cpu_backing::CpuBacking>,
+    ),
+> {
+    use OuterAllocationRefusal as R;
+
+    if identity.device_generation == 0
+        || identity.device_generation != dev.outer.translator.session_generation()
+    {
+        return Err((R::ForeignDeviceGeneration, resident, cpu_backing));
+    }
+    let mut set = lock_ignore_poison(&dev.outer.allocations);
+    let exact_live = set.entries.iter().any(|entry| {
+        entry.token == identity.token
+            && entry.allocation
+                == resident
+                    .as_ref()
+                    .map(ResidentAllocation::handle)
+                    .unwrap_or(0)
+            && entry.allocation_generation == identity.allocation_generation
+            && entry.bytes == identity.bytes
+    });
+    if !exact_live {
+        return Err((R::MissingToken, resident, cpu_backing));
+    }
+    if set.pending_teardown.iter().any(|pending| {
+        pending.identity.token == identity.token
+            && pending.identity.allocation_generation == identity.allocation_generation
+    }) {
+        return Err((R::TeardownAlreadyPending, resident, cpu_backing));
+    }
+    if set.pending_teardown.len() >= crate::device_funcs::HELIOS_MAX_LIVE_OUTER_ALLOCATIONS {
+        return Err((R::LiveSetFull, resident, cpu_backing));
+    }
+    set.pending_teardown.push(PendingOuterAllocationTeardown {
+        identity,
+        resident,
+        km_resource,
+        rt_resource,
+        ownership,
+        cpu_backing,
+    });
+    Ok(())
+}
+
+pub(crate) unsafe fn retire_outer_allocation(
+    outer: &crate::device_funcs::OuterDevice,
+    device_generation: u64,
+    token: u64,
+) -> Result<(), OuterAllocationRefusal> {
+    use OuterAllocationRefusal as R;
+
+    if device_generation == 0 || device_generation != outer.translator.session_generation() {
+        return Err(R::ForeignDeviceGeneration);
+    }
+    if token == 0 {
+        return Err(R::MissingToken);
+    }
+
+    let pending = {
+        let mut set = lock_ignore_poison(&outer.allocations);
+        let pending_index = set
+            .pending_teardown
+            .iter()
+            .position(|pending| {
+                pending.identity.device_generation == device_generation
+                    && pending.identity.token == token
+            })
+            .ok_or(R::TeardownNotPending)?;
+        let entry_index = set
+            .entries
+            .iter()
+            .position(|entry| {
+                entry.token == token
+                    && entry.allocation_generation
+                        == set.pending_teardown[pending_index]
+                            .identity
+                            .allocation_generation
+            })
+            .ok_or(R::MissingToken)?;
+        let pending = set.pending_teardown.swap_remove(pending_index);
+        set.entries.swap_remove(entry_index);
+        pending
+    };
+
+    complete_pending_outer_allocation(outer, pending)
+}
+
+unsafe fn complete_pending_outer_allocation(
+    outer: &crate::device_funcs::OuterDevice,
+    pending: PendingOuterAllocationTeardown,
+) -> Result<(), OuterAllocationRefusal> {
+    use OuterAllocationRefusal as R;
+
+    let token = pending.identity.token;
+    let mut cpu_backing = pending.cpu_backing;
+    let allocation = pending
+        .resident
+        .as_ref()
+        .map(ResidentAllocation::handle)
+        .unwrap_or(0);
+    drop(pending.resident);
+
+    let needs_deallocate = allocation != 0 || !pending.rt_resource.is_null();
+    if needs_deallocate
+        && (outer.kt_callbacks.is_null() || (*outer.kt_callbacks).pfnDeallocateCb.is_none())
+    {
+        log_error!(
+            "DDI outer allocation retire missing pfnDeallocateCb: token={} alloc=0x{:x} rt={:p}",
+            token,
+            allocation,
+            pending.rt_resource
+        );
+        if let Some(backing) = cpu_backing.take() {
+            backing.leak();
+        }
+        return Err(R::TeardownNotPending);
+    }
+
+    if needs_deallocate {
+        if let Some(deallocate_cb) = (*outer.kt_callbacks).pfnDeallocateCb {
+            let mut allocation = allocation;
+            let form = DeallocateForm::select(pending.rt_resource, pending.ownership, allocation);
+            let mut dealloc = match form {
+                DeallocateForm::ByResource(h_resource) => ddi::D3DDDICB_DEALLOCATE {
+                    hResource: h_resource,
+                    NumAllocations: 0,
+                    HandleList: core::ptr::null_mut(),
+                },
+                DeallocateForm::ByHandleList(handle) => {
+                    allocation = handle.get();
+                    ddi::D3DDDICB_DEALLOCATE {
+                        hResource: core::ptr::null_mut(),
+                        NumAllocations: 1,
+                        HandleList: &mut allocation,
+                    }
+                }
+                DeallocateForm::Nothing { reason } => {
+                    log_error!(
+                        "DDI outer allocation retire skip: {} token={} alloc=0x{:x} km=0x{:x}",
+                        reason,
+                        token,
+                        allocation,
+                        pending.km_resource
+                    );
+                    ddi::D3DDDICB_DEALLOCATE {
+                        hResource: core::ptr::null_mut(),
+                        NumAllocations: 0,
+                        HandleList: core::ptr::null_mut(),
+                    }
+                }
+            };
+            if !matches!(form, DeallocateForm::Nothing { .. }) {
+                let hr = deallocate_cb(outer.h_rt_device, &mut dealloc);
+                log_error!(
+                    "DDI outer allocation retired: token={} hr=0x{:08x} alloc=0x{:x} km=0x{:x} rt={:p} owned={}",
+                    token,
+                    hr as u32,
+                    allocation,
+                    pending.km_resource,
+                    pending.rt_resource,
+                    pending.ownership.owns()
+                );
+                if hr != 0 {
+                    if let Some(backing) = cpu_backing.take() {
+                        backing.leak();
+                    }
+                    return Err(R::TeardownNotPending);
+                }
+            }
+        }
+    }
+    drop(cpu_backing);
+    Ok(())
+}
+
+/// Last-resort device rundown after the DXVK bridge has been destroyed.  A
+/// nonzero result is a named invariant failure: every pending record should
+/// have been consumed by the exact allocation destructor callback first.
+pub(crate) unsafe fn drain_outer_allocation_teardown(
+    outer: &crate::device_funcs::OuterDevice,
+) -> (usize, usize) {
+    let (mut pending, internal, live) = {
+        let mut set = lock_ignore_poison(&outer.allocations);
+        let pending = core::mem::take(&mut set.pending_teardown);
+        let internal = core::mem::take(&mut set.internal_owned);
+        let live = set.entries.len();
+        set.entries.clear();
+        (pending, internal, live)
+    };
+    for owned in internal {
+        pending.push(PendingOuterAllocationTeardown {
+            identity: owned.identity,
+            resident: Some(owned.resident),
+            km_resource: 0,
+            rt_resource: core::ptr::null_mut(),
+            ownership: AllocationOwnership::CreatedByUmd,
+            cpu_backing: owned.cpu_backing,
+        });
+    }
+    let pending_count = pending.len();
+    for teardown in pending {
+        if let Err(refusal) = complete_pending_outer_allocation(outer, teardown) {
+            log_error!("DDI outer allocation forced rundown REFUSED: {refusal:?}");
+        }
+    }
+    (pending_count, live)
 }
 
 #[derive(Clone, Copy)]
@@ -553,6 +1028,8 @@ pub(crate) unsafe fn store_resource(
     h_res: ddi::D3D10DDI_HRESOURCE,
     obj: ID3D11Resource,
     allocation: Option<ResidentAllocation>,
+    outer_allocation: Option<OuterAllocationIdentity>,
+    cpu_backing: Option<helios_umd_common::cpu_backing::CpuBacking>,
     km_resource: ddi::D3DKMT_HANDLE,
     rt_resource: ddi::HANDLE,
     ownership: AllocationOwnership,
@@ -573,6 +1050,8 @@ pub(crate) unsafe fn store_resource(
         com_raw: obj.into_raw() as usize,
         buffer_raw,
         allocation,
+        outer_allocation,
+        cpu_backing,
         km_resource,
         rt_resource,
         ownership,
@@ -1021,6 +1500,7 @@ pub(crate) unsafe fn release_resource(h: Hdevice, h_res: ddi::D3D10DDI_HRESOURCE
     // what frees it -- the explicit `Box::from_raw` is gone.
     if let Some(mut state) = slot.take() {
         let state = &mut *state;
+        let outer_identity = state.outer_allocation.take();
         let allocation = (*state)
             .allocation
             .as_ref()
@@ -1037,6 +1517,67 @@ pub(crate) unsafe fn release_resource(h: Hdevice, h_res: ddi::D3D10DDI_HRESOURCE
                 "DDI scanout registry: dropped {removed} entry alloc=0x{allocation:x} remaining={remaining}"
             );
         }
+
+        /* An associated resource cannot retire its WDDM identity at the DDI
+         * handle edge: DXVK may still own internal references, and Mesa's
+         * DestroyBuffer/DestroyImage/FreeMemory records must all land in one
+         * exact outer batch.  Move WDDM ownership into the bounded device set,
+         * then release COM.  The allocation destructor synchronously opens and
+         * finishes that batch when the last reference actually disappears and
+         * calls back with the immutable generation/token pair. */
+        let mut outer_teardown_armed = false;
+        if let Some(identity) = outer_identity {
+            if state.com_raw != 0 {
+                if let Some(dev) = helios_device(h) {
+                    let resident = state.allocation.take();
+                    let cpu_backing = state.cpu_backing.take();
+                    match arm_outer_allocation_teardown(
+                        dev,
+                        identity,
+                        resident,
+                        state.km_resource,
+                        state.rt_resource,
+                        state.ownership,
+                        cpu_backing,
+                    ) {
+                        Ok(()) => outer_teardown_armed = true,
+                        Err((refusal, resident, cpu_backing)) => {
+                            state.allocation = resident;
+                            state.cpu_backing = cpu_backing;
+                            let removed = remove_outer_allocation(&dev.outer, identity);
+                            dev.outer.device_lost.store(1, Ordering::Release);
+                            log_error!(
+                                "DDI outer allocation teardown REFUSED: {:?} token={} generation={} removed={}",
+                                refusal,
+                                identity.token,
+                                identity.allocation_generation,
+                                removed
+                            );
+                        }
+                    }
+                }
+            }
+
+            if outer_teardown_armed {
+                let com_raw = core::mem::replace(&mut state.com_raw, 0);
+                drop(IUnknown::from_raw(com_raw as *mut c_void));
+                return;
+            }
+
+            /* Construction invariants make this path unreachable.  Keep it
+             * fail-closed: erase a still-live token before COM storage can be
+             * reused, let the lower destructor name its missing-pending
+             * refusal, and only then fall through to ordinary WDDM cleanup. */
+            if let Some(dev) = helios_device(h) {
+                let _ = remove_outer_allocation(&dev.outer, identity);
+                dev.outer.device_lost.store(1, Ordering::Release);
+            }
+            if state.com_raw != 0 {
+                let com_raw = core::mem::replace(&mut state.com_raw, 0);
+                drop(IUnknown::from_raw(com_raw as *mut c_void));
+            }
+        }
+
         // Evict while the allocation and runtime device are both still valid.
         // Option::take makes it impossible for ResourceState::drop to evict a
         // second time after pfnDeallocateCb.
@@ -1108,7 +1649,8 @@ pub(crate) unsafe fn release_resource(h: Hdevice, h_res: ddi::D3D10DDI_HRESOURCE
             }
         }
         if (*state).com_raw != 0 {
-            drop(IUnknown::from_raw((*state).com_raw as *mut c_void));
+            let com_raw = core::mem::replace(&mut state.com_raw, 0);
+            drop(IUnknown::from_raw(com_raw as *mut c_void));
         }
     }
 }

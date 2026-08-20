@@ -783,7 +783,7 @@ pub(crate) unsafe fn submit_runtime_submission(
 ) -> i32 {
     static LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-    let Some(ctx) = dev.context.as_ref() else {
+    let Some(ctx) = dev.outer.context.as_ref() else {
         probe_early_refusal(entry, "missing runtime context");
         return E_FAIL;
     };
@@ -798,6 +798,10 @@ pub(crate) unsafe fn submit_runtime_submission(
         log_error!("DXGI submission: pfnRenderCb missing");
         return E_FAIL;
     };
+    // The same physical runtime context carries HOB1 and the selected present
+    // command. Serialize access to all three returned windows and pfnRenderCb;
+    // the guard is released before any later Present callback or fence wait.
+    let _render_guard = crate::forward::lock_ignore_poison(&ctx.render_lock);
     let command_window = ctx.command.get();
     let command = command_window.map_or(core::ptr::null_mut(), |w| w.ptr.as_ptr());
     let (command_length, label) = submission.command_length_and_label();
@@ -1123,7 +1127,8 @@ pub(crate) unsafe fn finish_present(
                             "DXGI Present: skip PresentCb callbacks={} src=0x{:x} hContext={:p}",
                             dev.dxgi_callbacks.is_null(),
                             src_alloc,
-                            dev.context
+                            dev.outer
+                                .context
                                 .as_ref()
                                 .map_or(core::ptr::null_mut(), |c| c.handle.as_ptr())
                         );
@@ -1133,7 +1138,7 @@ pub(crate) unsafe fn finish_present(
                     log_error!(
                         "DXGI Present1 multi: missing callback table/context callbacks={} hContext={:p}",
                         dev.dxgi_callbacks.is_null(),
-                        dev.context
+                        dev.outer.context
                             .as_ref()
                             .map_or(core::ptr::null_mut(), |c| c.handle.as_ptr())
                     );
@@ -1609,7 +1614,8 @@ unsafe fn dxgi_present_impl(
 pub(crate) fn dev_context_for_log(h: ddi::D3D10DDI_HDEVICE) -> *mut core::ffi::c_void {
     unsafe {
         helios_device(h).map_or(core::ptr::null_mut(), |d| {
-            d.context
+            d.outer
+                .context
                 .as_ref()
                 .map_or(core::ptr::null_mut(), |c| c.handle.as_ptr())
         })
@@ -2328,7 +2334,7 @@ pub(crate) unsafe extern "C" fn dxgi_present_mpo(
         probe_early_refusal(PresentBoundaryEntry::Mpo, "MPO device handle not live");
         return E_INVALIDARG;
     };
-    let (false, Some(ctx)) = (dev.dxgi_callbacks.is_null(), dev.context.as_ref()) else {
+    let (false, Some(ctx)) = (dev.dxgi_callbacks.is_null(), dev.outer.context.as_ref()) else {
         if dev.dxgi_callbacks.is_null() {
             PRESENT_BOUNDARY_MPO_MISSING.fetch_add(1, Ordering::Relaxed);
         }

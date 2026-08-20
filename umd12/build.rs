@@ -432,6 +432,7 @@ fn build_vkd3d_bridge() {
     let clang_cl = def("HELIOS_CLANG_CL", r"C:\Program Files\LLVM\bin\clang-cl.exe");
     let archiver = def("HELIOS_MSVC_LIB", r"C:\Program Files\LLVM\bin\llvm-lib.exe");
     let vkd3d_build = def("HELIOS_VKD3D_BUILD", r"C:\Users\Rupansh\vkd3d-build");
+    let mesa_build = def("HELIOS_MESA_BUILD", r"C:\Users\Rupansh\helios-mesa-build");
 
     // The module doc above calls the C++ ABI / CRT agreement critical, and a
     // build that declares no dependency on the compiler that decides it is
@@ -457,6 +458,7 @@ fn build_vkd3d_bridge() {
     require_path("HELIOS_CLANG_CL", &clang_cl, false);
     require_path("HELIOS_MSVC_LIB", &archiver, false);
     require_path("HELIOS_VKD3D_BUILD", &vkd3d_build, true);
+    require_path("HELIOS_MESA_BUILD", &mesa_build, true);
 
     // ⭐ THE MEASURED LINK SET — one archive.
     // `tmp/dx12/gates/G1-static/RESULT.md:27-42`: `libhelios_d3d12_static.a` is
@@ -476,12 +478,6 @@ fn build_vkd3d_bridge() {
     let mut build = cxx_build::bridge("src/bridge12.rs");
     build
         .file("bridge/vkd3d_bridge.cpp")
-        // S4b: the process-global venus-ICD anchor (`ARCHITECTURE.md` §6.4).
-        // ⛔ ONE source compiled into BOTH cdylibs — that is the mechanism, not
-        // duplication: each copy exports `helios_icd_anchor_v1`, and the copy in
-        // whichever module the loader enumerated first becomes the single
-        // publisher for the process. `umd/build.rs` lists the identical line.
-        .file("../umd_common/bridge/bridge_icd_anchor.cpp")
         .compiler(&clang_cl)
         .archiver(&archiver)
         .std("c++17")
@@ -500,6 +496,7 @@ fn build_vkd3d_bridge() {
         // source, compiled by this bridge and by `umd`'s — which is the whole
         // reason there is exactly one `bridge_guard` in the tree.
         .include("../umd_common/bridge")
+        .include("../protocol/include")
         // ⛔ NO vkd3d include directory. `vkd3d-proton-helios/include/vkd3d.h`
         // drags in `vulkan.h` and vkd3d's own widl `D3D12_*` types, which then
         // collide with the SDK's. The `D12-G1` static arm proved the Windows SDK
@@ -544,6 +541,13 @@ fn build_vkd3d_bridge() {
     println!("cargo:rustc-link-arg-cdylib={archive}");
     println!("cargo:rerun-if-changed={archive}");
 
+    // Explicit A5 package edge; no loader or module search is permitted in the
+    // translator-bearing D3D12 path.
+    let mesa_import = format!(r"{mesa_build}\src\virtio\vulkan\vulkan_virtio.dll.a");
+    require_path("HELIOS_MESA_BUILD", &mesa_import, false);
+    println!("cargo:rustc-link-arg-cdylib={mesa_import}");
+    println!("cargo:rerun-if-changed={mesa_import}");
+
     // ⛔ `gdi32` and NOTHING else. Measured, not assumed: the gate's link
     // attempt with the archive alone left 14 `__imp_D3DKMT*` unresolved
     // (`libs/vkd3d/d3dkmt.c`; `vkd3d_dep` does not carry `lib_gdi32`), and after
@@ -566,8 +570,6 @@ fn build_vkd3d_bridge() {
         // a build failure. `umd/build.rs:258-266` carries the identical list.
         "../umd_common/bridge/bridge_common.h",
         "../umd_common/bridge/bridge_guard.h",
-        "../umd_common/bridge/bridge_icd_anchor.cpp",
-        "../umd_common/bridge/bridge_icd_anchor.h",
         "../umd_common/bridge/bridge_util.h",
         "bridge/vkd3d_bridge.cpp",
         "bridge/vkd3d_bridge.h",
@@ -577,6 +579,7 @@ fn build_vkd3d_bridge() {
     ] {
         println!("cargo:rerun-if-changed={path}");
     }
+    println!("cargo:rerun-if-env-changed=HELIOS_MESA_BUILD");
 }
 
 fn main() {

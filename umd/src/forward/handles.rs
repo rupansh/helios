@@ -30,8 +30,8 @@ use helios_umd_common::{boxed_handles, com_handles};
 // well because the macro-generated impls above are only useful to callers that
 // can name the traits; importing them from two places would be the start of the
 // duplication D3b forbids.
-pub(crate) use helios_umd_common::slot::{Boxed, Com, ComHandle, DdiHandle, Slot};
 pub(super) use helios_umd_common::slot::BoxedHandle;
+pub(crate) use helios_umd_common::slot::{Boxed, Com, ComHandle, DdiHandle, Slot};
 
 com_handles!(
     crate::ddi::D3D10DDI_HSHADER,

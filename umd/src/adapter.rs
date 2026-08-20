@@ -11,26 +11,27 @@
 //! is the only export S5 removes from the D3D11 driver, and it is deliberately
 //! not replaced by a refusing stub — see the note above `AdapterToken`.
 
-use core::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::get_caps;
-use crate::hr::{
-    Hresult, DXGI_STATUS_NO_REDIRECTION, E_FAIL, E_NOTIMPL, E_OUTOFMEMORY, S_OK,
-};
+use crate::hr::{Hresult, DXGI_STATUS_NO_REDIRECTION, E_FAIL, E_NOTIMPL, E_OUTOFMEMORY, S_OK};
 use crate::{bridge, ddi, device_funcs, forward};
 use crate::{log_error, trace_line};
 use crate::{log_knob_inventory, log_self_module_path, trace_enabled};
+use helios_protocol::{HeliosUmdAdapterInfoV1, HELIOS_PACKAGE_GENERATION};
+use helios_umd_common::direct_translator::DirectTranslator;
 
 const fn ddi_supported(major: u64, minor: u64, build: u64) -> u64 {
     let interface = (major << 16) | minor;
     (interface << 32) | (build << 16)
 }
 
-// Advertise D3D11.1 first so the runtime exposes DXGI 1.1 resource-sharing
-// DDIs (notably ResolveSharedResource) and the extended resource-sharing path
-// DWM/IddCx require. Keep D3D11.0 as a fallback for older/runtime-selected paths.
+// WDDM 2.1 is the selected package surface: it provides the modern callback
+// table used by the exact-context HQC1 and resource sync-token path while the
+// device retains its physical Render submission. Keep the older layouts as
+// explicit runtime-selected fallbacks.
 const SUPPORTED_DDI_VERSIONS: &[u64] = &[
+    ddi_supported(11, 34, 1), // D3DWDDM2_1_DDI_SUPPORTED
     ddi_supported(11, 16, 1), // D3DWDDM1_3_DDI_SUPPORTED
     ddi_supported(11, 15, 0), // D3D11_1_DDI_SUPPORTED
     ddi_supported(11, 10, 2), // D3D11_0_DDI_SUPPORTED
@@ -53,16 +54,19 @@ pub(crate) enum NegotiatedInterface {
     D3D11_0,
     D3D11_1,
     Wddm1_3,
+    Wddm2_1,
 }
 
 impl NegotiatedInterface {
     const D3D11_0_INTERFACE: u32 = 0x000b_000a;
     const D3D11_1_INTERFACE: u32 = 0x000b_000f;
     const WDDM1_3_INTERFACE: u32 = 0x000b_0010;
+    const WDDM2_1_INTERFACE: u32 = 0x000b_0022;
 
-    /// Panic-free: a linear scan of a three-element array literal, no indexing.
+    /// Panic-free: a closed four-value match, with no table indexing.
     fn from_interface(interface: u32) -> Option<Self> {
         match interface {
+            Self::WDDM2_1_INTERFACE => Some(Self::Wddm2_1),
             Self::WDDM1_3_INTERFACE => Some(Self::Wddm1_3),
             Self::D3D11_1_INTERFACE => Some(Self::D3D11_1),
             Self::D3D11_0_INTERFACE => Some(Self::D3D11_0),
@@ -72,6 +76,7 @@ impl NegotiatedInterface {
 
     pub(crate) fn name(self) -> &'static str {
         match self {
+            Self::Wddm2_1 => "WDDM2_1",
             Self::Wddm1_3 => "WDDM1_3",
             Self::D3D11_1 => "D3D11_1",
             Self::D3D11_0 => "D3D11_0",
@@ -84,18 +89,12 @@ impl NegotiatedInterface {
 // and adding a variant without a fill arm fails the exhaustive match in
 // `create_device`. That is the property the `else`-as-default did not have.
 //
-// This is also what retired the WDDM2.1 chain in T6/R918: `0x000b_0022`
-// (D3DWDDM2_1_DDI_INTERFACE_VERSION) is strictly greater than the maximum
-// advertised here, so the runtime could never negotiate it and the fifth
-// device-funcs fill behind it was unreachable by construction. Making that path
-// live means ADDING a version above -- a behaviour change (DWM would negotiate
-// a 170-slot table and the AcquireResource/ReleaseResource DDIs would start
-// being called) that needs its own validation, not a silently dead fifth copy.
 const _: () = {
-    assert!(SUPPORTED_DDI_VERSIONS.len() == 3);
-    assert!((SUPPORTED_DDI_VERSIONS[0] >> 32) as u32 == NegotiatedInterface::WDDM1_3_INTERFACE);
-    assert!((SUPPORTED_DDI_VERSIONS[1] >> 32) as u32 == NegotiatedInterface::D3D11_1_INTERFACE);
-    assert!((SUPPORTED_DDI_VERSIONS[2] >> 32) as u32 == NegotiatedInterface::D3D11_0_INTERFACE);
+    assert!(SUPPORTED_DDI_VERSIONS.len() == 4);
+    assert!((SUPPORTED_DDI_VERSIONS[0] >> 32) as u32 == NegotiatedInterface::WDDM2_1_INTERFACE);
+    assert!((SUPPORTED_DDI_VERSIONS[1] >> 32) as u32 == NegotiatedInterface::WDDM1_3_INTERFACE);
+    assert!((SUPPORTED_DDI_VERSIONS[2] >> 32) as u32 == NegotiatedInterface::D3D11_1_INTERFACE);
+    assert!((SUPPORTED_DDI_VERSIONS[3] >> 32) as u32 == NegotiatedInterface::D3D11_0_INTERFACE);
 };
 
 // The seven d3d10umddi ABI structs that used to be hand-transcribed here
@@ -122,19 +121,19 @@ const _: () = {
 // D3D12 kill switch lives in `umd12/src/knobs12.rs` as `UmdD3D12`, so "D3D12 is
 // off" is already a countable, greppable fact in exactly one place.
 
-/// The value handed back as every adapter's `pDrvPrivate`.
-///
-/// A zero-sized type, address-taken. It replaces a `static mut ADAPTER_COOKIE:
-/// usize = 0x4845_4c49_4f53_554d` ("HELIOSUM") whose stated purpose -- letting
-/// the driver recognise its own adapter -- was never realised: all three
-/// consumers bound it as `_h_adapter` and it was never read or written. A ZST
-/// says "this pointer is not dereferenceable state" in a way a `usize`
-/// carrying a magic number does not, and it drops a `static mut` carried for a
-/// value nothing consulted. R821.
-struct AdapterToken;
-static ADAPTER_TOKEN: AdapterToken = AdapterToken;
+const ADAPTER_STATE_MAGIC: u64 = 0x3141_3131_534F_494C;
 
-/// Adapter handles that did not carry [`ADAPTER_TOKEN`].
+/// Per-open adapter identity returned by the package KMD.
+///
+/// This is owned directly by `hAdapter`, never indexed through a process-global
+/// table.  `CloseAdapter` invalidates the tag before reclaiming the allocation.
+struct AdapterState {
+    magic: u64,
+    generation: u64,
+    luid: i64,
+}
+
+/// Adapter handles that did not carry a live [`AdapterState`].
 ///
 /// COUNT AND LOG ONLY -- deliberately not a refusal. The counter has to be
 /// observed at zero on a real boot before any DDI starts rejecting on it.
@@ -143,22 +142,68 @@ static ADAPTER_TOKEN: AdapterToken = AdapterToken;
 /// reading is now unexplained and worth chasing.
 static ADAPTER_UNRECOGNISED: AtomicUsize = AtomicUsize::new(0);
 
-/// Validate an adapter handle against the token we handed out. Reports only.
-fn adapter_ok(h: ddi::D3D10DDI_HADAPTER) -> bool {
-    let expected = core::ptr::addr_of!(ADAPTER_TOKEN) as *const c_void;
-    if core::ptr::eq(h.pDrvPrivate as *const c_void, expected) {
-        return true;
+/// Resolve an adapter handle to the exact state we handed out. Reports only.
+unsafe fn adapter_state(h: ddi::D3D10DDI_HADAPTER) -> Option<*mut AdapterState> {
+    let state = h.pDrvPrivate.cast::<AdapterState>();
+    if !state.is_null()
+        && state.is_aligned()
+        // SAFETY: WDDM only returns a driver handle supplied by this UMD.  The
+        // null/alignment checks make malformed handles fail before the read.
+        && unsafe { (*state).magic == ADAPTER_STATE_MAGIC }
+    {
+        return Some(state);
     }
     let n = ADAPTER_UNRECOGNISED.fetch_add(1, Ordering::Relaxed);
     if n < 8 {
         log_error!(
-            "adapter handle not ours: pDrvPrivate={:p} expected={:p} (x{}) — counted only",
+            "adapter handle not ours: pDrvPrivate={:p} (x{}) — counted only",
             h.pDrvPrivate,
-            expected,
             n + 1
         );
     }
-    false
+    None
+}
+
+unsafe fn query_adapter_state(
+    open: &ddi::D3D10DDIARG_OPENADAPTER,
+) -> Result<Box<AdapterState>, Hresult> {
+    if open.pAdapterCallbacks.is_null() {
+        log_error!("OpenAdapter: null pAdapterCallbacks");
+        return Err(E_FAIL);
+    }
+    // SAFETY: the runtime owns this callback table for the duration of
+    // OpenAdapter and supplied its typed pointer in `open`.
+    let Some(query) = (unsafe { &*open.pAdapterCallbacks }).pfnQueryAdapterInfoCb else {
+        log_error!("OpenAdapter: null pfnQueryAdapterInfoCb");
+        return Err(E_FAIL);
+    };
+    let mut info = HeliosUmdAdapterInfoV1::query(HELIOS_PACKAGE_GENERATION);
+    let args = ddi::D3DDDICB_QUERYADAPTERINFO {
+        pPrivateDriverData: core::ptr::addr_of_mut!(info).cast(),
+        PrivateDriverDataSize: core::mem::size_of_val(&info) as u32,
+    };
+    // SAFETY: the runtime handle and callback are paired by OpenAdapter; the
+    // fixed record lives across the synchronous call.
+    let hr = unsafe { query(open.hRTAdapter.handle, &args) };
+    if hr < 0 || info.validate_reply(HELIOS_PACKAGE_GENERATION).is_err() {
+        log_error!(
+            "OpenAdapter: private adapter identity query failed hr=0x{:08x}",
+            hr as u32
+        );
+        return Err(E_FAIL);
+    }
+    let luid = info.adapter_luid as u64;
+    log_error!(
+        "OpenAdapter: adapter generation={} luid={:08x}:{:08x}",
+        info.adapter_generation,
+        (luid >> 32) as u32,
+        luid as u32,
+    );
+    Ok(Box::new(AdapterState {
+        magic: ADAPTER_STATE_MAGIC,
+        generation: info.adapter_generation,
+        luid: info.adapter_luid,
+    }))
 }
 
 #[no_mangle]
@@ -226,6 +271,11 @@ unsafe fn open_adapter_common(
     log_self_module_path();
     log_knob_inventory();
 
+    let adapter = match unsafe { query_adapter_state(open) } {
+        Ok(adapter) => adapter,
+        Err(hr) => return hr,
+    };
+
     // D4a scanout acquire: `pfnEscapeCb`'s first argument is the RUNTIME
     // adapter handle (PFND3DDDI_ESCAPECB(hAdapter, ..) — the WDK's own
     // signature), which only ever appears here. Capture it; every open in a
@@ -233,7 +283,7 @@ unsafe fn open_adapter_common(
     crate::scanout_acquire::note_runtime_adapter(open.hRTAdapter.handle);
 
     open.hAdapter = ddi::D3D10DDI_HADAPTER {
-        pDrvPrivate: core::ptr::addr_of!(ADAPTER_TOKEN) as *mut c_void,
+        pDrvPrivate: Box::into_raw(adapter).cast(),
     };
 
     // The generated D3D10_2DDI_ADAPTERFUNCS is FLAT -- the WDK repeats the
@@ -282,8 +332,9 @@ unsafe extern "C" fn create_device(
     h_adapter: ddi::D3D10DDI_HADAPTER,
     args: *mut ddi::D3D10DDIARG_CREATEDEVICE,
 ) -> Hresult {
-    // Report-only until the counter is observed at zero on a real boot (R821).
-    let _ = adapter_ok(h_adapter);
+    let Some(adapter) = (unsafe { adapter_state(h_adapter) }) else {
+        return E_FAIL;
+    };
     // SAFETY: the runtime passes a valid `D3D10DDIARG_CREATEDEVICE*` per the
     // `PFND3D10DDI_CREATEDEVICE` contract; we only read scalar/pointer fields and
     // never write through it, so an E_NOTIMPL return leaves the runtime's state
@@ -330,7 +381,9 @@ unsafe extern "C" fn create_device(
         // when the negotiated interface says it is there, keyed on the same
         // closed set R405 introduced; an unknown interface reads the short shape.
         let words = match NegotiatedInterface::from_interface(create.Interface) {
-            Some(NegotiatedInterface::D3D11_1) | Some(NegotiatedInterface::Wddm1_3) => 11,
+            Some(NegotiatedInterface::D3D11_1)
+            | Some(NegotiatedInterface::Wddm1_3)
+            | Some(NegotiatedInterface::Wddm2_1) => 11,
             Some(NegotiatedInterface::D3D11_0) | None => 10,
         };
         let q = args as *const u64;
@@ -375,8 +428,9 @@ unsafe extern "C" fn create_device(
     //    set rather than defaulting to D3D11.0's 150-slot fill.
     let Some(negotiated) = NegotiatedInterface::from_interface(create.Interface) else {
         log_error!(
-            "  CreateDevice: unsupported interface 0x{:08x} (advertised 0x{:08x}/0x{:08x}/0x{:08x}) -> E_NOTIMPL",
+            "  CreateDevice: unsupported interface 0x{:08x} (advertised 0x{:08x}/0x{:08x}/0x{:08x}/0x{:08x}) -> E_NOTIMPL",
             create.Interface,
+            NegotiatedInterface::WDDM2_1_INTERFACE,
             NegotiatedInterface::WDDM1_3_INTERFACE,
             NegotiatedInterface::D3D11_1_INTERFACE,
             NegotiatedInterface::D3D11_0_INTERFACE,
@@ -387,8 +441,75 @@ unsafe extern "C" fn create_device(
     // 1) Bring up the DXVK device on the Helios venus adapter.
     // BridgeDevice::create folds the old is_null() test into construction, so a
     // stored BridgeDevice is always usable. R815.
-    let Some(dxvk) = bridge::BridgeDevice::create(0, 0) else {
+    // SAFETY: `adapter_state` validated the exact live object and it remains
+    // owned by hAdapter until CloseAdapter, after every device is destroyed.
+    let adapter = unsafe { &*adapter };
+    let luid = adapter.luid as u64;
+    log_error!(
+        "  CreateDevice: adapter generation={} luid={:08x}:{:08x}",
+        adapter.generation,
+        (luid >> 32) as u32,
+        luid as u32,
+    );
+    let translator = match DirectTranslator::create(
+        adapter.luid,
+        helios_protocol::HELIOS_HTS1_MAX_ENDPOINTS_PER_SESSION,
+        Some(device_funcs::translator_sync_progress_join),
+        Some(device_funcs::translator_sync_progress_query),
+    ) {
+        Ok(translator) => translator,
+        Err(error) => {
+            log_error!(
+                "  CreateDevice: A5 translator creation refused: {:?}",
+                error
+            );
+            return E_FAIL;
+        }
+    };
+    let mut outer = Box::new(device_funcs::OuterDevice {
+        translator,
+        context: None,
+        allocations: std::sync::Mutex::new(device_funcs::OuterAllocationSet::new()),
+        h_rt_device: create.hRTDevice.handle,
+        kt_callbacks: create.pKTCallbacks,
+        paging_queue: None,
+        device_lost: std::sync::atomic::AtomicU32::new(0),
+    });
+    let context_hr = unsafe { device_funcs::create_runtime_context(&mut outer) };
+    if context_hr != S_OK {
+        log_error!(
+            "  CreateDevice: HQA1/HQC1 context creation failed hr=0x{:08x}",
+            context_hr as u32
+        );
+        return context_hr;
+    }
+    let paging_hr = unsafe { device_funcs::create_runtime_paging_queue(&mut outer) };
+    if paging_hr != S_OK {
+        log_error!(
+            "  CreateDevice: paging queue creation failed hr=0x{:08x}",
+            paging_hr as u32
+        );
+        unsafe { device_funcs::destroy_outer_runtime_context(&mut outer) };
+        return paging_hr;
+    }
+    let outer_context = outer.as_mut() as *mut device_funcs::OuterDevice as usize;
+    let Some(dxvk) = bridge::BridgeDevice::create(
+        outer.translator.vk_instance() as usize,
+        outer.translator.get_instance_proc_addr() as usize,
+        outer.translator.module_base() as usize,
+        luid as u32,
+        (luid >> 32) as u32 as i32,
+        outer_context,
+        device_funcs::dxvk_outer_submit_begin as *const () as usize,
+        device_funcs::dxvk_outer_submit_finish as *const () as usize,
+        device_funcs::dxvk_outer_submit_join as *const () as usize,
+        device_funcs::dxvk_outer_allocation_create as *const () as usize,
+        device_funcs::dxvk_outer_allocation_teardown_begin as *const () as usize,
+        device_funcs::dxvk_outer_allocation_retire as *const () as usize,
+    ) else {
         log_error!("  CreateDevice: DXVK device creation FAILED -> E_FAIL");
+        unsafe { device_funcs::destroy_outer_runtime_context(&mut outer) };
+        unsafe { device_funcs::destroy_runtime_paging_queue(&mut outer) };
         return E_FAIL;
     };
 
@@ -407,16 +528,12 @@ unsafe extern "C" fn create_device(
                 // it. R807.
                 owned: device_funcs::BridgeOwned::new(),
                 dxvk,
+                outer,
                 h_rt_device: create.hRTDevice.handle,
-                // Populated by create_runtime_context below; CreateDevice
-                // fails if that does not succeed, so a device the runtime ever
-                // sees always has one. R808.
-                context: None,
                 // Both of these arrive already typed from the bindgen struct;
                 // the hand copy declared them as bare `c_void` pointers and had
                 // to cast at this site.
                 kt_callbacks: create.pKTCallbacks,
-                paging_queue: None,
                 dxgi_callbacks: create.DXGIBaseDDI.pDXGIBaseCallbacks,
                 // R910 retired the whole legacy LINEAR scan-out value model
                 // (ScanoutTarget/ScanoutKind/ScanoutProbe, scanout_epoch,
@@ -437,26 +554,6 @@ unsafe extern "C" fn create_device(
         dev: create.hDrvDevice.pDrvPrivate as *mut device_funcs::HeliosDevice,
     };
 
-    unsafe {
-        let dev = &mut *(create.hDrvDevice.pDrvPrivate as *mut device_funcs::HeliosDevice);
-        let context_hr = device_funcs::create_runtime_context(dev);
-        if context_hr != S_OK {
-            log_error!(
-                "  CreateDevice: kernel context creation failed hr=0x{:08x}",
-                context_hr as u32
-            );
-            return context_hr;
-        }
-        let paging_hr = device_funcs::create_runtime_paging_queue(dev);
-        if paging_hr != S_OK {
-            log_error!(
-                "  CreateDevice: paging queue creation failed hr=0x{:08x}",
-                paging_hr as u32
-            );
-            return paging_hr;
-        }
-    }
-
     // 3) Fill the device-funcs table (Interface == D3D11_0 -> p11DeviceFuncs) and
     //    the DXGI base DDI table the runtime handed us.
     log_error!(
@@ -472,6 +569,14 @@ unsafe extern "C" fn create_device(
     // would still compile.
     unsafe {
         match negotiated {
+            NegotiatedInterface::Wddm2_1 => {
+                device_funcs::fill_wddm2_1_device_funcs(
+                    create.__bindgen_anon_1.pWDDM2_1DeviceFuncs,
+                );
+                device_funcs::fill_dxgi_1_3_base_funcs(
+                    create.DXGIBaseDDI.__bindgen_anon_1.pDXGIDDIBaseFunctions4,
+                );
+            }
             NegotiatedInterface::Wddm1_3 => {
                 device_funcs::fill_wddm1_3_device_funcs(
                     create.__bindgen_anon_1.pWDDM1_3DeviceFuncs,
@@ -571,6 +676,7 @@ impl Drop for DeviceUnderConstruction {
                 variants,
                 layouts
             );
+            (*self.dev).dxvk.shutdown();
             device_funcs::destroy_runtime_objects(&mut *self.dev);
             core::ptr::drop_in_place(self.dev);
         }
@@ -578,7 +684,15 @@ impl Drop for DeviceUnderConstruction {
 }
 
 unsafe extern "C" fn close_adapter(h_adapter: ddi::D3D10DDI_HADAPTER) -> Hresult {
-    let _ = adapter_ok(h_adapter);
+    let Some(state) = (unsafe { adapter_state(h_adapter) }) else {
+        return E_FAIL;
+    };
+    // SAFETY: CloseAdapter consumes the driver handle exactly once. Invalidate
+    // before reclaiming so storage reuse cannot preserve a live association.
+    unsafe {
+        (*state).magic = 0;
+        drop(Box::from_raw(state));
+    }
     log_error!("CloseAdapter");
     S_OK
 }

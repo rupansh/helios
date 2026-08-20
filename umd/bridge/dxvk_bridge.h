@@ -32,7 +32,34 @@ struct HeliosDxvkDevice {
   // Raw ID3D11Device* / ID3D11DeviceContext* (as size_t) for the DDI forwarders.
   std::size_t d3d11_device_ptr() const;
   std::size_t d3d11_context_ptr() const;
-  std::uint32_t venus_context_id() const;
+  // Package-private resource creation edge. Each call copies one validated
+  // HRA1 record into the exact DXVK resource allocation graph before Vulkan
+  // memory is allocated; the descriptor and initial-data pointers are only
+  // borrowed for this synchronous call.
+  std::size_t create_associated_buffer(
+      std::size_t desc_ptr, std::size_t initial_data_ptr,
+      std::uint64_t package_generation, std::uint64_t device_generation,
+      std::uint64_t outer_allocation_token,
+      std::uint64_t outer_allocation_bytes, std::size_t cpu_mapping,
+      std::uint32_t association_flags) const;
+  std::size_t create_associated_texture1d(
+      std::size_t desc_ptr, std::size_t initial_data_ptr,
+      std::uint64_t package_generation, std::uint64_t device_generation,
+      std::uint64_t outer_allocation_token,
+      std::uint64_t outer_allocation_bytes, std::size_t cpu_mapping,
+      std::uint32_t association_flags) const;
+  std::size_t create_associated_texture2d(
+      std::size_t desc_ptr, std::size_t initial_data_ptr,
+      std::uint64_t package_generation, std::uint64_t device_generation,
+      std::uint64_t outer_allocation_token,
+      std::uint64_t outer_allocation_bytes, std::size_t cpu_mapping,
+      std::uint32_t association_flags) const;
+  std::size_t create_associated_texture3d(
+      std::size_t desc_ptr, std::size_t initial_data_ptr,
+      std::uint64_t package_generation, std::uint64_t device_generation,
+      std::uint64_t outer_allocation_token,
+      std::uint64_t outer_allocation_bytes, std::size_t cpu_mapping,
+      std::uint32_t association_flags) const;
   // Opt-in queue-feed attribution. The timestamp is zero when tracing is off,
   // so the ordinary callback path performs no clock read or atomic update.
   std::uint64_t feed_trace_timestamp_ns() const noexcept;
@@ -177,6 +204,12 @@ struct HeliosDxvkDevice {
   //     still outstanding — the stale-frame window this gate exists to close.
   bool present_frame_gate(std::uint32_t timeout_us, std::uint32_t order_mode) const;
 
+  // WDDM 2.1 ReleaseResource ordering. Flush the immediate context and wait
+  // only until its work has reached the real vkQueueSubmit edge. The outer
+  // submit hook closes the corresponding A5 scope before this returns; this is
+  // not a GPU-completion wait and has no timeout, polling, or private timeline.
+  bool flush_submitted() const;
+
   // Dcomp present vehicle (road 4 unit 2): record an image-level copy of the
   // imported ICD frame (src) into the vehicle backbuffer texture (dst) on
   // the open command list. Sources the import's LIVE storage (the
@@ -216,5 +249,15 @@ struct HeliosDxvkDevice {
 // Create a DXVK instance + logical device on the Helios venus adapter.
 // Returns nullptr on failure. Matches the cxx bridge signature in src/bridge.rs.
 std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
+    std::size_t   vk_instance,
+    std::size_t   get_instance_proc_addr,
+    std::size_t   icd_module_base,
     std::uint32_t luid_low,
-    std::int32_t  luid_high);
+    std::int32_t  luid_high,
+    std::size_t   outer_context,
+    std::size_t   outer_begin,
+    std::size_t   outer_finish,
+    std::size_t   outer_join,
+    std::size_t   outer_allocate,
+    std::size_t   outer_teardown_begin,
+    std::size_t   outer_retire);

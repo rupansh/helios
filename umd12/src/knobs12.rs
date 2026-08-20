@@ -224,7 +224,7 @@ pub(crate) static UMD12_CORE_DDI: DwordKnob =
 /// against it at compile time. `DwordKnob`'s default is otherwise only readable
 /// at runtime, and "the default matches the implemented table shape" is exactly
 /// the kind of claim that must not be checkable only by reading two files.
-pub(crate) const UMD12_CORE_DDI_DEFAULT: u32 = 110;
+pub(crate) const UMD12_CORE_DDI_DEFAULT: u32 = 116;
 
 /// Resolve `HKLM\SOFTWARE\Helios!Umd12CoreDdi` (REG_DWORD), forcing its
 /// `OnceLock`. **Absent = `110`.**
@@ -651,7 +651,9 @@ pub(crate) static UMD12_ECL_FENCE: BoolKnob = BoolKnob::new(c"Umd12EclFence", tr
 /// The `pfnSignalFence` diagnostic delay in microseconds, clamped. `0` = off.
 /// See [`UMD12_FENCE_SIGNAL_DELAY_US`].
 pub(crate) fn umd12_fence_signal_delay_us() -> u32 {
-    UMD12_FENCE_SIGNAL_DELAY_US.get().min(MAX_DIAGNOSTIC_DELAY_US)
+    UMD12_FENCE_SIGNAL_DELAY_US
+        .get()
+        .min(MAX_DIAGNOSTIC_DELAY_US)
 }
 
 /// The `pfnExecuteCommandLists` diagnostic delay in microseconds, clamped.

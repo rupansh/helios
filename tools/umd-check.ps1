@@ -66,7 +66,7 @@ switch ($Mode) {
     'build'   { $cargoArgs = @('build') }
     'release' { $cargoArgs = @('build', '--release') }
 }
-$cargoArgs += @('--message-format', 'short')
+$cargoArgs += @('--locked', '--message-format', 'short')
 
 # Build one crate in the mirror and report its Rust diagnostics.
 #

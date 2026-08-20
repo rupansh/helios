@@ -32,7 +32,7 @@
 //! ⭐ **Placed resources do not name a heap.** `ResourceHeaps.md:1212`, mined in
 //! `SPECS.md` §9.7: *"The D3D12 DDI carries no heap-handle-plus-heap-offset
 //! placement parameter. The only placement parent expressible in
-//! `D3D12DDIARG_CREATERESOURCE_0109` is `ReuseBufferGPUVA`"* — a
+//! `D3D12DDIARG_CREATERESOURCE_0111` is `ReuseBufferGPUVA`"* — a
 //! `D3D12DDIARG_HRESOURCE_PLACEMENT { D3D12DDI_HRESOURCE hResource; UINT64
 //! Offset }`. And *"a RESERVED resource is the resource-args-only arm with
 //! `ReuseBufferGPUVA.BaseAddress.UMD.hResource == NULL`"* (`:1204`). So the
@@ -44,7 +44,7 @@
 //!
 //! # ⭐ The engine is reached through `ID3D12Device10`, not `ID3D12Device`
 //!
-//! `D3D12DDIARG_CREATERESOURCE_0109` carries `InitialBarrierLayout`,
+//! `D3D12DDIARG_CREATERESOURCE_0111` carries `InitialBarrierLayout`,
 //! `SamplerFeedbackMipRegion` and `NumCastableFormats`/`pCastableFormats`. Those
 //! three fields exist on exactly one API entry point family —
 //! `ID3D12Device10::CreateCommittedResource3` / `CreatePlacedResource2`, which
@@ -156,25 +156,23 @@
 
 use core::ffi::c_void;
 
-use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_NOTIMPL, S_OK};
+use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, S_OK};
 use helios_umd_common::refusals::RefusalCounter;
 use helios_umd_common::slot::{Boxed, Slot};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12Device10, ID3D12Heap, ID3D12Resource,
-    D3D12_BARRIER_LAYOUT, D3D12_BARRIER_LAYOUT_COMMON, D3D12_BARRIER_LAYOUT_COPY_DEST,
-    D3D12_BARRIER_LAYOUT_COPY_SOURCE, D3D12_BARRIER_LAYOUT_GENERIC_READ,
-    D3D12_BARRIER_LAYOUT_SHADER_RESOURCE, D3D12_BARRIER_LAYOUT_UNDEFINED,
-    D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON, D3D12_CLEAR_VALUE, D3D12_CLEAR_VALUE_0,
-    D3D12_CPU_PAGE_PROPERTY, D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
+    ID3D12Device10, ID3D12Heap, ID3D12Resource, D3D12_BARRIER_LAYOUT, D3D12_BARRIER_LAYOUT_COMMON,
+    D3D12_BARRIER_LAYOUT_COPY_DEST, D3D12_BARRIER_LAYOUT_COPY_SOURCE,
+    D3D12_BARRIER_LAYOUT_GENERIC_READ, D3D12_BARRIER_LAYOUT_SHADER_RESOURCE,
+    D3D12_BARRIER_LAYOUT_UNDEFINED, D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON, D3D12_CLEAR_VALUE,
+    D3D12_CLEAR_VALUE_0, D3D12_CPU_PAGE_PROPERTY, D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
     D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
     D3D12_DEPTH_STENCIL_VALUE, D3D12_HEAP_DESC, D3D12_HEAP_FLAGS, D3D12_HEAP_FLAG_DENY_BUFFERS,
     D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES, D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES,
     D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_CUSTOM, D3D12_MEMORY_POOL,
     D3D12_MEMORY_POOL_L0, D3D12_MEMORY_POOL_L1, D3D12_MIP_REGION,
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DESC1,
-    D3D12_SUBRESOURCE_FOOTPRINT, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,
     D3D12_RESOURCE_DIMENSION, D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE1D,
     D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_FLAGS,
     D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
@@ -182,7 +180,8 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
     D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE,
     D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY,
-    D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY, D3D12_TEXTURE_LAYOUT,
+    D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY, D3D12_SUBRESOURCE_FOOTPRINT,
+    D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, D3D12_TEXTURE_LAYOUT,
     D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
     D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_TEXTURE_LAYOUT_UNKNOWN,
 };
@@ -299,7 +298,7 @@ mod v {
     /// arrives on `pfnCheckResourceAllocationInfo`, NOT on the create. This
     /// enum appears in exactly one function-pointer family
     /// (`d3d12umddi.rs:51734`, `:59866`, `:75022`, `:76696`, `:79414`,
-    /// `:87548`), and `D3D12DDIARG_CREATERESOURCE_0109` has no field of the
+    /// `:87548`), and `D3D12DDIARG_CREATERESOURCE_0111` has no field of the
     /// type. See [`super::create_committed_allocation`].
     pub(super) const RESOURCE_OPT_PRIMARY: D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS =
         D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS_D3D12DDI_RESOURCE_OPTIMIZATION_FLAG_PRIMARY;
@@ -386,7 +385,7 @@ const FOOTPRINT_UNANSWERED_U64: u64 = u64::MAX;
 
 /// The largest castable-format list this driver will forward.
 ///
-/// `D3D12DDIARG_CREATERESOURCE_0109::NumCastableFormats` is a `UINT32` read
+/// `D3D12DDIARG_CREATERESOURCE_0111::NumCastableFormats` is a `UINT32` read
 /// straight from the runtime, and it becomes a slice length. DXGI defines fewer
 /// than 200 formats, so anything above this is not a list.
 const CASTABLE_FORMAT_LIMIT: usize = 1_024;
@@ -514,6 +513,9 @@ struct ResourceState {
     /// its own create — so it cannot distinguish which operation is asking.
     /// The resource is the object whose create knew the answer.
     owns_heap_block: bool,
+    /// Exact committed WDDM identity. Stored on the resource itself so
+    /// teardown does not need an address-keyed process-global lookup.
+    identity: Option<identity12::AllocationIdentity>,
 }
 
 // ⚠⚠ **`D3D12DDI_HRTRESOURCE` is still not a field of `ResourceState`, but the RULE
@@ -646,6 +648,15 @@ pub(crate) unsafe fn engine_resource<'a>(
     state.resource.as_ref()
 }
 
+/// Copy the exact committed WDDM identity stored on this resource. The runtime
+/// owns the resource for the duration of each caller, so this snapshot cannot
+/// race its destroy; no process-global lookup or pointer key participates.
+pub(crate) unsafe fn allocation_identity(
+    h_resource: ddi12::D3D12DDI_HRESOURCE,
+) -> Option<identity12::AllocationIdentity> {
+    unsafe { resource_state(h_resource) }?.identity
+}
+
 /// The engine device, at the `ID3D12Device10` revision this lane forwards to.
 ///
 /// Returns an **owned** reference (`Interface::cast` is a `QueryInterface`), so
@@ -731,6 +742,10 @@ fn cpu_page_property(prop: ddi12::D3D12DDI_CPU_PAGE_PROPERTY) -> D3D12_CPU_PAGE_
     }
 }
 
+fn cpu_page_property_is_visible(prop: ddi12::D3D12DDI_CPU_PAGE_PROPERTY) -> bool {
+    matches!(prop, v::CPU_WRITE_COMBINE | v::CPU_WRITE_BACK)
+}
+
 /// `D3D12DDI_HEAP_FLAGS` (positive ALLOW bits) -> `D3D12_HEAP_FLAGS` (DENY bits).
 ///
 /// ⛔ **The polarity inverts.** `ResourceHeaps.md:874`: *"the app writes
@@ -766,10 +781,7 @@ fn cpu_page_property(prop: ddi12::D3D12DDI_CPU_PAGE_PROPERTY) -> D3D12_CPU_PAGE_
 /// [`PrimaryTranslation::Dropped`] keeps the old behaviour and the old counter, and
 /// is reachable only from the heap-only arm — where the declaration cannot be
 /// honoured at all.
-fn heap_flags(
-    flags: ddi12::D3D12DDI_HEAP_FLAGS,
-    primary: PrimaryTranslation,
-) -> D3D12_HEAP_FLAGS {
+fn heap_flags(flags: ddi12::D3D12DDI_HEAP_FLAGS, primary: PrimaryTranslation) -> D3D12_HEAP_FLAGS {
     let mut out = D3D12_HEAP_FLAG_NONE;
     if flags & v::HEAP_ALLOW_BUFFERS == 0 {
         out |= D3D12_HEAP_FLAG_DENY_BUFFERS;
@@ -955,10 +967,7 @@ fn resource_flags(flags: ddi12::D3D12DDI_RESOURCE_FLAGS_0003) -> D3D12_RESOURCE_
 /// allowed."*, `libs/vkd3d/device.c:9427` and `:9463`, `E_INVALIDARG`. That is
 /// the API's rule, not vkd3d's invention, so a buffer's layout is forced and
 /// counted here rather than discovered as a failed create.
-fn barrier_layout(
-    layout: ddi12::D3D12DDI_BARRIER_LAYOUT,
-    is_buffer: bool,
-) -> D3D12_BARRIER_LAYOUT {
+fn barrier_layout(layout: ddi12::D3D12DDI_BARRIER_LAYOUT, is_buffer: bool) -> D3D12_BARRIER_LAYOUT {
     if is_buffer {
         if layout != v::LAYOUT_UNDEFINED {
             L4_REFUSALS.resource_barrier_layout_coerced.bump();
@@ -977,7 +986,8 @@ fn barrier_layout(
     // asserted at compile time so "the enums agree" is checked, not claimed.
     const _: () = assert!(v::LAYOUT_UNDEFINED == D3D12_BARRIER_LAYOUT_UNDEFINED.0);
     const _: () = assert!(v::LAYOUT_COMMON == D3D12_BARRIER_LAYOUT_COMMON.0);
-    const _: () = assert!(v::LAYOUT_VIDEO_QUEUE_COMMON == D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON.0);
+    const _: () =
+        assert!(v::LAYOUT_VIDEO_QUEUE_COMMON == D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON.0);
     if (v::LAYOUT_UNDEFINED..=v::LAYOUT_VIDEO_QUEUE_COMMON).contains(&layout) {
         return D3D12_BARRIER_LAYOUT(layout);
     }
@@ -1010,7 +1020,7 @@ fn barrier_layout(
 /// Build the API resource description from the DDI's.
 ///
 /// ⛔ **`Alignment` is always 0, and it is NOT a parameter.** The DDI moved the
-/// field out of the struct — `D3D12DDIARG_CREATERESOURCE_0109` has no
+/// field out of the struct — `D3D12DDIARG_CREATERESOURCE_0111` has no
 /// `Alignment` while `D3D12_RESOURCE_DESC` does — and `pfnCreateHeapAndResource`
 /// has no such argument either, so the create path can only ever say 0: the
 /// API's *"the driver picks"*, which is exactly what the DDI means by omitting
@@ -1022,10 +1032,18 @@ fn barrier_layout(
 /// again.
 ///
 /// # Safety
-/// `a` must be a live `D3D12DDIARG_CREATERESOURCE_0109`.
+/// `a` must be a live `D3D12DDIARG_CREATERESOURCE_0111`.
 unsafe fn resource_desc1(
-    a: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+    a: &ddi12::D3D12DDIARG_CREATERESOURCE_0111,
 ) -> Option<D3D12_RESOURCE_DESC1> {
+    if a.LayoutGuid.Data1 != 0
+        || a.LayoutGuid.Data2 != 0
+        || a.LayoutGuid.Data3 != 0
+        || a.LayoutGuid.Data4 != [0; 8]
+    {
+        note_refusal(&L4_REFUSALS.resource_layout_guid_refused);
+        return None;
+    }
     let dimension = resource_dimension(a.ResourceType)?;
     Some(D3D12_RESOURCE_DESC1 {
         Dimension: dimension,
@@ -1134,7 +1152,7 @@ unsafe fn clear_value(
 ///   asking for a fresh block would invite the runtime to hand a newly allocated
 ///   empty one instead.
 /// * The **resource** block is asked for unconditionally, even on the heap-only
-///   arm. `D3D12DDIARG_CREATERESOURCE_0109` has no field naming a heap, and
+///   arm. `D3D12DDIARG_CREATERESOURCE_0111` has no field naming a heap, and
 ///   placement is expressed as `ReuseBufferGPUVA.hResource` — a *resource*
 ///   handle (`ResourceHeaps.md:1212`). Whether the runtime hands this driver an
 ///   `hResource` for a heap's own address range is not established here and can
@@ -1148,7 +1166,7 @@ unsafe fn clear_value(
 /// is the D3D11 site that answers `8` for exactly this reason.
 fn heap_and_resource_private_sizes(
     p_heap: *const ddi12::D3D12DDIARG_CREATEHEAP_0001,
-    p_resource: *const ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+    p_resource: *const ddi12::D3D12DDIARG_CREATERESOURCE_0111,
 ) -> ddi12::D3D12DDI_HEAP_AND_RESOURCE_SIZES {
     let word = core::mem::size_of::<*mut c_void>() as ddi12::SIZE_T;
     let both_null = p_heap.is_null() && p_resource.is_null();
@@ -1171,7 +1189,7 @@ fn heap_and_resource_private_sizes(
 unsafe extern "C" fn calc_private_heap_and_resource_sizes(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     p_heap: *const ddi12::D3D12DDIARG_CREATEHEAP_0001,
-    p_resource: *const ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+    p_resource: *const ddi12::D3D12DDIARG_CREATERESOURCE_0111,
     h_protected_session: ddi12::D3D12DDI_HPROTECTEDRESOURCESESSION_0030,
 ) -> ddi12::D3D12DDI_HEAP_AND_RESOURCE_SIZES {
     if !h_protected_session.pDrvPrivate.is_null() {
@@ -1418,6 +1436,7 @@ unsafe fn create_heap_only(
                 // The heap-only arm: `pCreateHeap` was non-null, so the sizing
                 // asked for a heap block and it is this driver's to reclaim.
                 owns_heap_block: true,
+                identity: None,
             });
         }
     }
@@ -1652,7 +1671,7 @@ fn hwa2_d3d_ddi_format(dxgi_format: u32) -> u32 {
 /// it knew was wrong would be asking the kernel to catch its own bug.
 fn hwa2_create_input(
     heap_arg: &ddi12::D3D12DDIARG_CREATEHEAP_0001,
-    res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+    res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0111,
     byte_size: u64,
     row_pitch: u32,
 ) -> Option<helios_protocol::HeliosWddmAllocationDescV2> {
@@ -1816,10 +1835,7 @@ fn hwa2_create_input(
     // engine, so the record and the heap cannot disagree about CPU visibility. It is
     // spelled out here rather than routed through that function because that function
     // bumps `HeapPropertyUnrepresentable`, and one create must not count twice.
-    let cpu_visible = matches!(
-        heap_arg.CPUPageProperty,
-        v::CPU_WRITE_COMBINE | v::CPU_WRITE_BACK
-    );
+    let cpu_visible = cpu_page_property_is_visible(heap_arg.CPUPageProperty);
     if cpu_visible {
         flags |= helios_protocol::HELIOS_HWA2_FLAG_CPU_VISIBLE;
         desc.memory_class = helios_protocol::HELIOS_HWA2_MEMORY_CPU_VISIBLE;
@@ -1935,135 +1951,51 @@ fn hwa2_create_input(
 /// resource it just created, and `h_rt_resource` the runtime handle
 /// `pfnCreateHeapAndResource` was called with — which is live for the duration of
 /// the call, because this runs **inside** that DDI.
+fn finish_cpu_backing_rollback(
+    cpu_backing: Option<helios_umd_common::cpu_backing::CpuBacking>,
+    deallocated: bool,
+) {
+    if !deallocated {
+        if let Some(backing) = cpu_backing {
+            backing.leak();
+        }
+    }
+}
+
 unsafe fn create_committed_allocation(
     dev: &HeliosD3D12Device,
     device10: &ID3D12Device10,
     resource: &ID3D12Resource,
     heap_arg: &ddi12::D3D12DDIARG_CREATEHEAP_0001,
-    res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+    res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0111,
     desc: &D3D12_RESOURCE_DESC1,
     h_rt_resource: ddi12::D3D12DDI_HRTRESOURCE,
-) -> Result<(), Hresult> {
+    association: &helios_protocol::HeliosResourceAssociationV1,
+    mut cpu_backing: Option<helios_umd_common::cpu_backing::CpuBacking>,
+) -> Result<identity12::AllocationIdentity, Hresult> {
     let engine_resource = resource.as_raw() as usize;
-
-    // ── 1. the engine's memory facts ───────────────────────────────────────
-    //
-    // ⛔ **What this create needs from the engine is now much narrower than it was,
-    // and what it needs from the ICD is nothing.** HWA2 offset 24 is the *exact
-    // backing extent* — "nonzero, and bounds every plane" — and only the engine knows
-    // it, so the bound `VkDeviceMemory`'s size is still required. The same call also
-    // answers a venus resource id and a Vulkan memory type index; **neither has an
-    // HWA2 field and neither may be sent** (§10.3: "no host resource token, resid …
-    // or independently usable identity"; K4-CONTRACT §5's second casualty is
-    // `memory_type_index` by name). They are read here only so that dropping them is
-    // a counted event with a log line rather than a silence.
-    //
-    // SAFETY: `resource` is the `ID3D12Resource` this driver's own engine just
-    // created and holds a reference to for the whole call; the bridge borrows it
-    // and takes no reference.
-    let (id, status) = unsafe { dev.engine.resource_venus_identity(engine_resource) };
-
-    // ⚠ **The admission predicate changed with the record, and this is the change.**
-    // It used to be `status == Resolved`, which required the ICD to have a venus
-    // resource for the memory — because the old record's whole purpose was to carry
-    // that id. HWA2 carries no id, so requiring one would fail every create for a
-    // fact the descriptor does not contain. The predicate is now the ENGINE half
-    // alone: a bound memory with a stated size.
-    if id.vk_memory == 0 || id.memory_size == 0 {
-        note_refusal(&L4_REFUSALS.identity_vk_memory_unresolved);
-        log_error!(
-            "L4: COMMITTED create REFUSED -- vkd3d could not name the memory the engine \
-             resource {:#x} is bound to (status={:?} vk_memory={:#x} off={} size={}), so HWA2's \
-             byte_size cannot be stated and no allocation may be described. {}x{} fmt={} \
-             heapFlags={:#x}",
-            engine_resource,
-            status,
-            id.vk_memory,
-            id.memory_offset,
-            id.memory_size,
-            res_arg.Width,
-            res_arg.Height,
-            res_arg.Format,
-            heap_arg.Flags,
-        );
-        return Err(E_FAIL);
+    if association
+        .validate(
+            helios_protocol::HELIOS_PACKAGE_GENERATION,
+            dev.translator.session_generation(),
+        )
+        .is_err()
+        || association.outer_allocation_bytes != heap_arg.ByteSize
+        || cpu_backing.as_ref().map(|backing| backing.as_ptr())
+            != (!association.cpu_mapping.is_null()).then_some(association.cpu_mapping)
+        || cpu_backing
+            .as_ref()
+            .is_some_and(|backing| u64::try_from(backing.bytes()).ok() != Some(heap_arg.ByteSize))
+    {
+        note_refusal(&L4_REFUSALS.identity_registry_alloc_failed);
+        return Err(E_INVALIDARG);
     }
 
-    // ⛔ **THE §5 GAP, counted at the exact site where the value is dropped.** The
-    // engine and the ICD between them can still name the host resource behind this
-    // memory; this driver may not pass it to the kernel and does not. There is no
-    // replacement field, no side channel, and nothing stashed in the identity table.
-    // ⇒ **mesa lane unit A3** is the mechanism that replaces it: the ICD stops naming
-    // host resources at all and the KMD patches the resid in from
-    // `HeliosNativeRenderPatch` (`protocol/src/native_render.rs`'s
-    // `HELIOS_NATIVE_RENDER_PATCH_*`). Until A3 lands, the allocation this create
-    // mints is a valid WDDM allocation whose backing is not yet the memory vkd3d
-    // renders into, which is why `present12` refuses.
-    if status == crate::bridge12::IdentityStatus::Resolved && id.venus_res_id != 0 {
-        L4_REFUSALS.hwa2_venus_res_id_dropped.bump();
-        let n = L4_REFUSALS.hwa2_venus_res_id_dropped.get();
-        if n <= LOG_BUDGET {
-            log_error!(
-                "L4: HWA2 carries NO host resource id -- venus res_id {} and memory type index \
-                 {} for the engine resource {:#x} are DROPPED, not sent. This is mesa unit A3's \
-                 gap: until the ICD stops naming host resources and the KMD patches the resid \
-                 in from HeliosNativeRenderPatch, this allocation's backing is not the memory \
-                 the engine renders into and the frame cannot be presented or opened (x{n})",
-                id.venus_res_id,
-                id.memory_type_index,
-                engine_resource,
-            );
-        }
-    } else {
-        // ⚠ **Re-graded from a refusal to a census.** The memory has no venus
-        // resource, which used to fail the create because the old record needed one.
-        // It no longer does. The counter still says the export chain did not engage,
-        // which stays worth knowing while `HELIOS_HEAP_FLAG_VENUS_EXPORT` is still in
-        // the tree.
-        note_refusal(&L4_REFUSALS.identity_venus_unresolved);
-    }
-
-    // ⛔ `memory_offset == 0` is a PRECONDITION of the record, not a preference, and
-    // the argument survives the retirement intact: HWA2's plane records are bounded
-    // against `byte_size`, and `byte_size` is the whole bound `VkDeviceMemory`. A
-    // suballocated resource would have its rows described inside an extent it does not
-    // own. `HELIOS_HEAP_FLAG_VENUS_EXPORT`'s dedicated allocation is what guarantees
-    // it; this is the assertion that the guarantee held.
-    if id.memory_offset != 0 {
-        note_refusal(&L4_REFUSALS.identity_offset_nonzero);
-        log_error!(
-            "L4: COMMITTED create REFUSED -- the engine SUBALLOCATED the resource {:#x} at \
-             offset {} of vk_memory {:#x}. HWA2 byte_size is the whole bound VkDeviceMemory and \
-             every plane record is bounded against it, so a resource that does not own its \
-             extent cannot be described. The private heap flag {:#x} asks for a dedicated \
-             allocation",
-            engine_resource,
-            id.memory_offset,
-            id.vk_memory,
-            HELIOS_HEAP_FLAG_VENUS_EXPORT.0,
-        );
-        return Err(E_FAIL);
-    }
-
-    // ⚠ Two independent readings of one number, kept as a cross-check while the ICD
-    // still answers. vkd3d reports the whole `VkDeviceMemory`'s
-    // `VkMemoryAllocateInfo::allocationSize` from its own allocator record; the ICD
-    // reports what it passed to `vkAllocateMemory`. ⛔ Guarded on the venus half
-    // having resolved at all, because an unresolved half is 0 and comparing against a
-    // 0 would make this fire on every create the moment A3 removes the ICD export —
-    // which is a change in the ICD, not a disagreement about a size.
-    if id.venus_alloc_size != 0 && id.memory_size != id.venus_alloc_size {
-        note_refusal(&L4_REFUSALS.identity_alloc_size_disagreement);
-        log_error!(
-            "L4: allocation size DISAGREEMENT for vk_memory {:#x}: engine says {}, the venus \
-             ICD says {}. HWA2 byte_size carries the ENGINE's value, because that is the extent \
-             the resource is bound inside",
-            id.vk_memory,
-            id.memory_size,
-            id.venus_alloc_size,
-        );
-    }
-
+    // The immutable HRA1 was consumed by this exact vkd3d heap allocation.
+    // Its byte extent is therefore the only size fact this outer WDDM
+    // allocation needs.  No VkDeviceMemory handle, host resource id, memory
+    // type, or ICD export is queried or retained.
+    let allocation_bytes = association.outer_allocation_bytes;
     // ── 2. the row pitch and the subresource extent, from the ENGINE ───────
     //
     // ⛔ Asked, never computed. HWA2's plane record is what an opener lays rows out
@@ -2110,7 +2042,7 @@ unsafe fn create_committed_allocation(
     };
 
     // ── 3. the HWA2 create-input descriptor ────────────────────────────────
-    let Some(create_input) = hwa2_create_input(heap_arg, res_arg, id.memory_size, pitch) else {
+    let Some(create_input) = hwa2_create_input(heap_arg, res_arg, allocation_bytes, pitch) else {
         note_refusal(&L4_REFUSALS.hwa2_geometry_unrepresentable);
         log_error!(
             "L4: COMMITTED create REFUSED -- this create has no HWA2 spelling: type={} {}x{}x{} \
@@ -2128,7 +2060,7 @@ unsafe fn create_committed_allocation(
             res_arg.Format,
             res_arg.Layout,
             pitch,
-            id.memory_size,
+            allocation_bytes,
         );
         return Err(E_FAIL);
     };
@@ -2139,7 +2071,8 @@ unsafe fn create_committed_allocation(
     // is applied here first. Sending a descriptor this driver could have known was
     // malformed would turn a local bug into an `AllocateCbFailed` with a kernel-side
     // rejection nobody can attribute.
-    if let Err(reject) = create_input.validate_create_input(helios_protocol::HELIOS_PACKAGE_GENERATION)
+    if let Err(reject) =
+        create_input.validate_create_input(helios_protocol::HELIOS_PACKAGE_GENERATION)
     {
         note_refusal(&L4_REFUSALS.hwa2_create_input_invalid);
         log_error!(
@@ -2164,6 +2097,12 @@ unsafe fn create_committed_allocation(
             create_input.dxgi_format,
         );
         return Err(E_FAIL);
+    }
+    if (create_input.flags & helios_protocol::HELIOS_HWA2_FLAG_CPU_VISIBLE != 0)
+        != cpu_backing.is_some()
+    {
+        note_refusal(&L4_REFUSALS.identity_registry_alloc_failed);
+        return Err(E_INVALIDARG);
     }
 
     // ⛔ **A byte buffer, not a struct pointer handed to the kernel.** The buffer is
@@ -2208,8 +2147,12 @@ unsafe fn create_committed_allocation(
     let private_size = u32::from(helios_protocol::HELIOS_HWA2_BYTES);
     let mut allocation_info = ddi12::D3D12DDI_ALLOCATION_INFO_0022 {
         hAllocation: 0,
-        // Not a system-memory allocation: the bytes are the host's.
-        pSystemMem: core::ptr::null(),
+        // A CPU-visible heap uses this exact outer allocation's process-local
+        // view. The pointer is data access only; HRA1's token remains the sole
+        // allocation association key.
+        pSystemMem: cpu_backing
+            .as_ref()
+            .map_or(core::ptr::null(), |backing| backing.as_ptr().cast_const()),
         pPrivateDriverData: private_ptr,
         PrivateDriverDataSize: private_size,
         // ⭐ C44's sentinel, and it must MATCH the descriptor's `vidpn_source` — see
@@ -2259,6 +2202,15 @@ unsafe fn create_committed_allocation(
             h_rt_resource.handle,
             private_size,
         );
+        let deallocated = allocation_info.hAllocation == 0
+            || unsafe {
+                deallocate_committed(
+                    dev,
+                    allocation_info.hAllocation,
+                    DeallocateForm::ByHandleList,
+                )
+            };
+        finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
         return Err(hr);
     }
     let h_allocation = allocation_info.hAllocation;
@@ -2305,7 +2257,9 @@ unsafe fn create_committed_allocation(
             );
             // SAFETY: `h_allocation` is the handle `pfnAllocateCb` just minted for this
             // driver, not yet recorded anywhere, so this is its only reference.
-            unsafe { deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList) };
+            let deallocated =
+                unsafe { deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList) };
+            finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
             return Err(E_FAIL);
         }
         Ok(desc) => {
@@ -2331,7 +2285,10 @@ unsafe fn create_committed_allocation(
                         desc.byte_size,
                     );
                     // SAFETY: as above -- the only reference to a handle nothing recorded.
-                    unsafe { deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList) };
+                    let deallocated = unsafe {
+                        deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList)
+                    };
+                    finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
                     return Err(E_FAIL);
                 }
             }
@@ -2349,7 +2306,9 @@ unsafe fn create_committed_allocation(
                 reject,
             );
             // SAFETY: as above.
-            unsafe { deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList) };
+            let deallocated =
+                unsafe { deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList) };
+            finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
             return Err(E_FAIL);
         }
     };
@@ -2408,38 +2367,32 @@ unsafe fn create_committed_allocation(
             allocation_desc.planes[0].row_pitch,
         );
         // SAFETY: as above -- the only reference to a handle nothing recorded.
-        unsafe { deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList) };
+        let deallocated =
+            unsafe { deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList) };
+        finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
         return Err(E_FAIL);
     }
 
     // ── 6. record ──────────────────────────────────────────────────────────
     //
     // ⚠ **No venus ownership transfer, and its absence is the retirement.** This step
-    // used to hand the host resource behind the memory to the WDDM allocation that had
-    // just adopted it, so the ICD would stop unref'ing it. There is no adoption now:
-    // the kernel allocation owns backing the KMD created, the ICD keeps its own
-    // resource, and neither double-unrefs the other's. `OwnershipTransferFailed` is a
-    // retired counter slot.
-    let ctx_id = dev.engine.venus_instance_context_id();
-    if ctx_id == 0 {
-        // ⚠ Counted, NOT refused, and its consumer is now local. The value used to
-        // travel into `HeliosWddmOpenIdentity::ctx_id`; that record is retired and
-        // HWA2 has no context field, so this is process-local diagnostic evidence and
-        // failing a create over it would be the wrong severity.
-        note_refusal(&L4_REFUSALS.identity_ctx_id_unavailable);
-    }
+    // No renderer identity or instance diagnostic is queried here. HRA1 plus
+    // the exact WDDM callback results are the complete ownership graph.
     let identity = identity12::AllocationIdentity {
         // ⚠ An identity token, never dereferenced by the table -- see
         // `identity12`'s module doc for the whole argument, including how the
         // address-recycling hazard is closed.
         engine_resource,
-        vk_memory: id.vk_memory,
-        memory_offset: id.memory_offset,
-        memory_size: id.memory_size,
+        memory_offset: 0,
+        memory_size: allocation_bytes,
         h_allocation,
         h_km_resource: alloc.hKMResource,
         h_rt_resource: h_rt_resource.handle as usize,
-        ctx_id,
+        gpu_virtual_address: allocation_info.GpuVirtualAddress,
+        gpuva_reserved_bytes: 0,
+        standalone: false,
+        device_generation: association.device_generation,
+        outer_allocation_token: association.outer_allocation_token,
         // ⭐ The KMD's own stamp, out of the validated output descriptor. ⛔ **Never
         // an identity lookup key** (§10.3): it is kept so a later stale-descriptor
         // finding has something to compare against and so the log line below reports
@@ -2459,22 +2412,20 @@ unsafe fn create_committed_allocation(
         // independent things rather than one thing with itself.
         pitch,
         heap_flags: heap_arg.Flags as u32,
+        last_context_generation: 0,
+        teardown_pending: false,
     };
 
-    match identity12::record(identity) {
-        identity12::RecordOutcome::Inserted => {
+    match identity12::lock(&dev.outer_allocations).commit(identity, cpu_backing.take()) {
+        Ok(()) => {
             L4_REFUSALS.identity_recorded.bump();
         }
-        identity12::RecordOutcome::Replaced => {
-            L4_REFUSALS.identity_recorded.bump();
-            note_refusal(&L4_REFUSALS.identity_replaced);
-        }
-        identity12::RecordOutcome::RegistryAllocationFailed => {
+        Err((refusal, cpu_backing)) => {
             note_refusal(&L4_REFUSALS.identity_registry_alloc_failed);
             log_error!(
-                "L4: identity registry allocation FAILED -- committed resource {:#x} cannot be \
-                 recorded, so its WDDM allocation would be unreachable and unfreeable; rolling \
-                 it back. {}x{} fmt={} heapFlags={:#x}",
+                "L4: device-owned identity commit REFUSED ({:?}) -- committed resource {:#x} \
+                 cannot be recorded; rolling it back. {}x{} fmt={} heapFlags={:#x}",
+                refusal,
                 engine_resource,
                 res_arg.Width,
                 res_arg.Height,
@@ -2482,7 +2433,9 @@ unsafe fn create_committed_allocation(
                 heap_arg.Flags,
             );
             // SAFETY: as above -- the only reference to a handle nothing recorded.
-            unsafe { deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList) };
+            let deallocated =
+                unsafe { deallocate_committed(dev, h_allocation, DeallocateForm::ByHandleList) };
+            finish_cpu_backing_rollback(cpu_backing, deallocated);
             return Err(E_FAIL);
         }
     }
@@ -2497,17 +2450,17 @@ unsafe fn create_committed_allocation(
         // `pitch` is read out of the record too, even though the local it was built
         // from is two statements away.
         log_error!(
-            "L4: COMMITTED alloc={:#x} km={:#x} rt={:#x} res={:#x} ctx={} gen={} vk_memory={:#x} \
-             off={} size={} pitch={} {}x{}x{} mips={} samples={} fmt={} heapFlags={:#x} (x{n})",
+            "L4: COMMITTED alloc={:#x} km={:#x} rt={:#x} res={:#x} gen={} \
+             off={} size={} gpuva=0x{:x} pitch={} {}x{}x{} mips={} samples={} fmt={} \
+             heapFlags={:#x} token={} deviceGen={} (x{n})",
             identity.h_allocation,
             identity.h_km_resource,
             identity.h_rt_resource,
             identity.engine_resource,
-            identity.ctx_id,
             identity.allocation_generation,
-            identity.vk_memory,
             identity.memory_offset,
             identity.memory_size,
+            identity.gpu_virtual_address,
             identity.pitch,
             identity.geometry.width,
             identity.geometry.height,
@@ -2516,9 +2469,194 @@ unsafe fn create_committed_allocation(
             identity.geometry.sample_count,
             identity.geometry.dxgi_format,
             identity.heap_flags,
+            identity.outer_allocation_token,
+            identity.device_generation,
         );
     }
-    Ok(())
+    Ok(identity)
+}
+
+unsafe fn deallocate_standalone_outer(
+    outer: &device12::Vkd3dOuterContext12,
+    h_allocation: ddi12::D3DKMT_HANDLE,
+) -> bool {
+    if h_allocation == 0 || outer.um_callbacks.is_null() {
+        return false;
+    }
+    let Some(deallocate) = (unsafe { (*outer.um_callbacks).pfnDeallocateCb }) else {
+        return false;
+    };
+    let allocation = h_allocation;
+    let arg = ddi12::D3D12DDICB_DEALLOCATE_0022 {
+        hResource: core::ptr::null_mut(),
+        NumAllocations: 1,
+        HandleList: core::ptr::from_ref(&allocation),
+        Flags: ddi12::D3D12DDI_DEALLOCATE_FLAGS_0022_D3D12DDI_DEALLOCATE_FLAGS_0022_NONE,
+    };
+    (unsafe { deallocate(outer.h_rt_device, core::ptr::from_ref(&arg)) }) >= 0
+}
+
+/// Construct and retain the exact standalone WDDM allocation for one
+/// vkd3d-internal `VkDeviceMemory`. The returned HRA1 is copied into that exact
+/// synchronous `vkAllocateMemory` pNext chain; no WDDM handle or GPUVA crosses
+/// the bridge. Its optional CPU data view is not an identity or lookup key.
+pub(crate) unsafe fn allocate_vkd3d_internal_wddm_memory(
+    outer: &device12::Vkd3dOuterContext12,
+    bytes: u64,
+    cpu_visible: bool,
+    device_local: bool,
+) -> Result<helios_protocol::HeliosResourceAssociationV1, i32> {
+    if bytes == 0 || outer.device_generation == 0 || outer.um_callbacks.is_null() {
+        return Err(E_INVALIDARG);
+    }
+    let Some(allocate) = (unsafe { (*outer.um_callbacks).pfnAllocateCb }) else {
+        return Err(E_FAIL);
+    };
+    let mut cpu_backing = if cpu_visible {
+        Some(helios_umd_common::cpu_backing::CpuBacking::new(bytes).ok_or(E_OUTOFMEMORY)?)
+    } else {
+        None
+    };
+    let cpu_mapping = cpu_backing
+        .as_ref()
+        .map_or(core::ptr::null_mut(), |backing| backing.as_ptr());
+    let association = identity12::lock(&outer.outer_allocations)
+        .reserve(outer.device_generation, bytes, cpu_mapping)
+        .map_err(|_| E_OUTOFMEMORY)?;
+
+    let mut create_input = helios_protocol::HeliosWddmAllocationDescV2::header(
+        helios_protocol::HELIOS_PACKAGE_GENERATION,
+        0,
+    );
+    create_input.byte_size = bytes;
+    create_input.allocation_kind = helios_protocol::HELIOS_HWA2_KIND_BUFFER;
+    create_input.swizzle_class = helios_protocol::HELIOS_HWA2_SWIZZLE_LINEAR;
+    if cpu_visible {
+        create_input.flags = helios_protocol::HELIOS_HWA2_FLAG_CPU_VISIBLE;
+        create_input.memory_class = helios_protocol::HELIOS_HWA2_MEMORY_CPU_VISIBLE;
+    } else if device_local {
+        create_input.memory_class = helios_protocol::HELIOS_HWA2_MEMORY_DEVICE_LOCAL;
+    } else {
+        create_input.memory_class = helios_protocol::HELIOS_HWA2_MEMORY_SHARED;
+    }
+    create_input
+        .validate_create_input(helios_protocol::HELIOS_PACKAGE_GENERATION)
+        .map_err(|_| E_INVALIDARG)?;
+
+    let mut private_bytes = [0u8; helios_protocol::HELIOS_HWA2_BYTES as usize];
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            core::ptr::from_ref(&create_input).cast::<u8>(),
+            private_bytes.as_mut_ptr(),
+            private_bytes.len(),
+        );
+    }
+    let private_ptr = private_bytes.as_mut_ptr().cast::<c_void>();
+    let private_size = u32::from(helios_protocol::HELIOS_HWA2_BYTES);
+    let mut allocation_info = ddi12::D3D12DDI_ALLOCATION_INFO_0022 {
+        hAllocation: 0,
+        pSystemMem: cpu_mapping.cast_const(),
+        pPrivateDriverData: private_ptr,
+        PrivateDriverDataSize: private_size,
+        VidPnSourceId: helios_protocol::D3DDDI_ID_UNINITIALIZED,
+        Flags: ddi12::D3D12DDI_ALLOCATION_INFO_FLAGS_0022_D3D12DDI_ALLOCATION_INFO_FLAGS_0022_NONE,
+        GpuVirtualAddress: 0,
+        Priority: 0,
+        Reserved: [0; 5],
+    };
+    let mut arg = ddi12::D3D12DDICB_ALLOCATE_0022 {
+        pPrivateDriverData: private_ptr,
+        PrivateDriverDataSize: private_size,
+        hResource: core::ptr::null_mut(),
+        hKMResource: 0,
+        NumAllocations: 1,
+        pAllocationInfo: core::ptr::from_mut(&mut allocation_info),
+    };
+    let hr = unsafe { allocate(outer.h_rt_device, core::ptr::from_mut(&mut arg)) };
+    if hr < 0 || allocation_info.hAllocation == 0 {
+        let deallocated = allocation_info.hAllocation == 0
+            || unsafe { deallocate_standalone_outer(outer, allocation_info.hAllocation) };
+        finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
+        return Err(if hr < 0 { hr } else { E_OUTOFMEMORY });
+    }
+    let h_allocation = allocation_info.hAllocation;
+    let output =
+        match helios_protocol::HeliosWddmAllocationDescV2::from_private_data(&private_bytes) {
+            Ok(output)
+                if output
+                    .validate_create_output(helios_protocol::HELIOS_PACKAGE_GENERATION)
+                    .is_ok() =>
+            {
+                output
+            }
+            _ => {
+                let deallocated = unsafe { deallocate_standalone_outer(outer, h_allocation) };
+                finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
+                return Err(E_FAIL);
+            }
+        };
+    let echoed = helios_protocol::HeliosWddmAllocationDescV2 {
+        allocation_generation: 0,
+        flags: output.flags & !helios_protocol::HELIOS_HWA2_FLAG_KMD_OWNED_MASK,
+        ..output
+    };
+    if echoed != create_input {
+        let deallocated = unsafe { deallocate_standalone_outer(outer, h_allocation) };
+        finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
+        return Err(E_FAIL);
+    }
+
+    let (gpuva, gpuva_reserved_bytes) = match unsafe {
+        outer
+            .outer_command_pool
+            .map_internal_allocation(h_allocation, bytes)
+    } {
+        Ok(mapping) => mapping,
+        Err(hr) => {
+            let deallocated = unsafe { deallocate_standalone_outer(outer, h_allocation) };
+            finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
+            return Err(hr);
+        }
+    };
+    let identity = identity12::AllocationIdentity {
+        engine_resource: 0,
+        memory_offset: 0,
+        memory_size: bytes,
+        allocation_generation: output.allocation_generation,
+        h_allocation,
+        h_km_resource: arg.hKMResource,
+        h_rt_resource: 0,
+        gpu_virtual_address: gpuva,
+        gpuva_reserved_bytes,
+        standalone: true,
+        device_generation: association.device_generation,
+        outer_allocation_token: association.outer_allocation_token,
+        geometry: identity12::IdentityGeometry {
+            width: 0,
+            height: 0,
+            depth_or_array_size: 0,
+            mip_levels: 0,
+            sample_count: 0,
+            dxgi_format: 0,
+        },
+        pitch: 0,
+        heap_flags: 0,
+        last_context_generation: 0,
+        teardown_pending: false,
+    };
+    if let Err((_refusal, cpu_backing)) =
+        identity12::lock(&outer.outer_allocations).commit(identity, cpu_backing.take())
+    {
+        let _ = unsafe {
+            outer
+                .outer_command_pool
+                .free_internal_gpuva(gpuva, gpuva_reserved_bytes)
+        };
+        let deallocated = unsafe { deallocate_standalone_outer(outer, h_allocation) };
+        finish_cpu_backing_rollback(cpu_backing, deallocated);
+        return Err(E_OUTOFMEMORY);
+    }
+    Ok(association)
 }
 
 /// Release one WDDM allocation this driver minted with `pfnAllocateCb`.
@@ -2546,10 +2684,10 @@ unsafe fn deallocate_committed(
     dev: &HeliosD3D12Device,
     h_allocation: ddi12::D3DKMT_HANDLE,
     form: DeallocateForm,
-) {
+) -> bool {
     if dev.um_callbacks.is_null() {
         note_refusal(&L4_REFUSALS.deallocate_cb_missing);
-        return;
+        return false;
     }
     // SAFETY: non-null per the check; the same table `create_committed_allocation` read.
     let Some(deallocate_cb) = (unsafe { (*dev.um_callbacks).pfnDeallocateCb }) else {
@@ -2561,7 +2699,7 @@ unsafe fn deallocate_committed(
              LEAKED for the lifetime of this process",
             h_allocation,
         );
-        return;
+        return false;
     };
     // ⚠ `handle` must outlive the call: `HandleList` points into it on the
     // handle-list arm. Declared before `arg` so that is a lifetime the compiler
@@ -2597,7 +2735,44 @@ unsafe fn deallocate_committed(
             arg.hResource,
             arg.NumAllocations,
         );
+        return false;
     }
+    true
+}
+
+/// Complete reverse teardown after vkd3d/Mesa accepted the exact terminal
+/// allocation scope. The caller has already removed the pending token from the
+/// device registry, so this is the WDDM allocation's sole remaining owner.
+pub(crate) unsafe fn retire_outer_allocation(
+    outer: &device12::Vkd3dOuterContext12,
+    identity: identity12::AllocationIdentity,
+) -> bool {
+    let retired = if identity.standalone {
+        let unmapped = unsafe {
+            outer
+                .outer_command_pool
+                .free_internal_gpuva(identity.gpu_virtual_address, identity.gpuva_reserved_bytes)
+        };
+        let deallocated = unsafe { deallocate_standalone_outer(outer, identity.h_allocation) };
+        unmapped && deallocated
+    } else {
+        let Some(dev) = (unsafe { device12::device(outer.h_device) }) else {
+            return false;
+        };
+        unsafe {
+            deallocate_committed(
+                dev,
+                identity.h_allocation,
+                DeallocateForm::ByResource(ddi12::D3D12DDI_HRTRESOURCE {
+                    handle: identity.h_rt_resource as *mut c_void,
+                }),
+            )
+        }
+    };
+    if retired {
+        L4_REFUSALS.identity_removed.bump();
+    }
+    retired
 }
 
 /// The one legal shape of a `D3D12DDICB_DEALLOCATE_0022` call.
@@ -2668,7 +2843,7 @@ unsafe fn create_fused_heap_and_resource(
     dev: &HeliosD3D12Device,
     device10: &ID3D12Device10,
     heap_arg: &ddi12::D3D12DDIARG_CREATEHEAP_0001,
-    res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+    res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0111,
     p_clear: *const ddi12::D3D12DDI_CLEAR_VALUES,
     h_rt_resource: ddi12::D3D12DDI_HRTRESOURCE,
     heap_slot: Slot<Boxed<HeapState>>,
@@ -2724,27 +2899,52 @@ unsafe fn create_fused_heap_and_resource(
         Flags: engine_heap_flags,
     };
 
-    let mut engine_heap: Option<ID3D12Heap> = None;
-    // SAFETY: the description and output slot are live locals. Keeping the heap
-    // explicit is the contract-preserving representation shared by both fused
-    // DDI meanings; see the function doc.
-    let heap_created = unsafe { device10.CreateHeap(&engine_heap_desc, &mut engine_heap) };
-    let heap_hr = match heap_created {
-        Ok(()) => S_OK,
-        Err(err) => err.code().0,
+    let mut cpu_backing = if cpu_page_property_is_visible(heap_arg.CPUPageProperty) {
+        match helios_umd_common::cpu_backing::CpuBacking::new(heap_arg.ByteSize) {
+            Some(backing) => Some(backing),
+            None => {
+                note_refusal(&L4_REFUSALS.identity_registry_alloc_failed);
+                return E_OUTOFMEMORY;
+            }
+        }
+    } else {
+        None
     };
-    let Some(engine_heap) = engine_heap.filter(|_| heap_hr >= 0) else {
+    let cpu_mapping = cpu_backing
+        .as_ref()
+        .map_or(core::ptr::null_mut(), |backing| backing.as_ptr());
+    let association = match identity12::lock(&dev.outer_allocations).reserve(
+        dev.translator.session_generation(),
+        heap_arg.ByteSize,
+        cpu_mapping,
+    ) {
+        Ok(association) => association,
+        Err(refusal) => {
+            note_refusal(&L4_REFUSALS.identity_registry_alloc_failed);
+            log_error!("L4: HRA1 token reservation REFUSED: {:?}", refusal);
+            return E_FAIL;
+        }
+    };
+    // SAFETY: the descriptor is live for the synchronous bridge call. The
+    // bridge copies `association` into vkd3d's exact vkAllocateMemory pNext
+    // chain and transfers one owned heap reference on success.
+    let Some(engine_heap) = (unsafe {
+        dev.engine.create_associated_heap(
+            (&engine_heap_desc as *const D3D12_HEAP_DESC) as usize,
+            &association,
+        )
+    }) else {
         note_refusal(&L4_REFUSALS.heap_create_engine_failed);
         log_error!(
-            "L4: fused CreateHeap FAILED hr={:#010x} size={} align={} pool={} cpu={} flags={:#x}",
-            heap_hr as u32,
+            "L4: associated fused CreateHeap REFUSED token={} size={} align={} pool={} cpu={} flags={:#x}",
+            association.outer_allocation_token,
             heap_arg.ByteSize,
             heap_arg.Alignment,
             heap_arg.MemoryPool,
             heap_arg.CPUPageProperty,
             heap_arg.Flags,
         );
-        return if heap_hr < 0 { heap_hr } else { E_FAIL };
+        return E_FAIL;
     };
 
     let mut out: Option<ID3D12Resource> = None;
@@ -2808,7 +3008,7 @@ unsafe fn create_fused_heap_and_resource(
     // SAFETY: `dev` is the live device this create is running on, `resource` the
     // engine resource just created (owned here, so alive for the call), and
     // `h_rt_resource` the runtime handle this DDI was invoked with.
-    if let Err(hr) = unsafe {
+    let identity = match unsafe {
         create_committed_allocation(
             dev,
             device10,
@@ -2817,10 +3017,13 @@ unsafe fn create_fused_heap_and_resource(
             res_arg,
             &desc,
             h_rt_resource,
+            &association,
+            cpu_backing.take(),
         )
     } {
-        return hr;
-    }
+        Ok(identity) => identity,
+        Err(hr) => return hr,
+    };
 
     // SAFETY: `resource_slot` is this driver's private block for the resource
     // being created, cleared by the caller and written exactly once.
@@ -2850,6 +3053,7 @@ unsafe fn create_fused_heap_and_resource(
             // asked for a heap block and the explicit heap stored below is this
             // driver's to reclaim.
             owns_heap_block: true,
+            identity: Some(identity),
         });
     }
     // SAFETY: as above, for the fused heap's block.
@@ -2908,7 +3112,7 @@ unsafe fn create_fused_heap_and_resource(
 /// driver's own private block, already cleared by the caller.
 unsafe fn create_placed_or_reserved(
     device10: &ID3D12Device10,
-    res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+    res_arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0111,
     h_heap: ddi12::D3D12DDI_HHEAP,
     p_clear: *const ddi12::D3D12DDI_CLEAR_VALUES,
     resource_slot: Slot<Boxed<ResourceState>>,
@@ -3049,6 +3253,7 @@ unsafe fn create_placed_or_reserved(
             // **already-live** heap owned by its own create. Destroying this
             // resource must not touch it.
             owns_heap_block: false,
+            identity: None,
         });
     }
     S_OK
@@ -3065,9 +3270,7 @@ unsafe fn create_placed_or_reserved(
 /// # Safety
 /// `a` must be live, and `a.pCastableFormats` must address
 /// `a.NumCastableFormats` `DXGI_FORMAT`s for the duration of the call.
-unsafe fn castable_formats(
-    a: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
-) -> Option<&[DXGI_FORMAT]> {
+unsafe fn castable_formats(a: &ddi12::D3D12DDIARG_CREATERESOURCE_0111) -> Option<&[DXGI_FORMAT]> {
     let count = a.NumCastableFormats as usize;
     if count == 0 || a.pCastableFormats.is_null() {
         return None;
@@ -3108,7 +3311,7 @@ unsafe extern "C" fn create_heap_and_resource(
     p_heap: *const ddi12::D3D12DDIARG_CREATEHEAP_0001,
     h_heap: ddi12::D3D12DDI_HHEAP,
     h_rt_resource: ddi12::D3D12DDI_HRTRESOURCE,
-    p_resource: *const ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+    p_resource: *const ddi12::D3D12DDIARG_CREATERESOURCE_0111,
     p_clear: *const ddi12::D3D12DDI_CLEAR_VALUES,
     h_protected_session: ddi12::D3D12DDI_HPROTECTEDRESOURCESESSION_0030,
     h_resource: ddi12::D3D12DDI_HRESOURCE,
@@ -3256,9 +3459,7 @@ unsafe extern "C" fn create_heap_and_resource(
                 return E_INVALIDARG;
             };
             // SAFETY: as above.
-            unsafe {
-                create_heap_only(&device10, heap_arg, heap_slot, resource_slot)
-            }
+            unsafe { create_heap_only(&device10, heap_arg, heap_slot, resource_slot) }
         }
         (None, Some(res_arg)) => {
             let Some(resource_slot) = resource_slot else {
@@ -3266,15 +3467,7 @@ unsafe extern "C" fn create_heap_and_resource(
                 return E_INVALIDARG;
             };
             // SAFETY: as above.
-            unsafe {
-                create_placed_or_reserved(
-                    &device10,
-                    res_arg,
-                    h_heap,
-                    p_clear,
-                    resource_slot,
-                )
-            }
+            unsafe { create_placed_or_reserved(&device10, res_arg, h_heap, p_clear, resource_slot) }
         }
         (None, None) => {
             // Row four of the arm table.
@@ -3327,72 +3520,40 @@ unsafe extern "C" fn destroy_heap_and_resource(
         // SAFETY: as above.
         if let Some(state) = unsafe { slot.take() } {
             owns_heap_block = state.owns_heap_block;
-            // ⛔ UP-4: the identity dies with the resource, and it dies HERE
-            // because this is the only site that ever retires an
-            // `ID3D12Resource` this driver created. The engine address is read
-            // out of the state box while the box is still alive and the COM
-            // reference it holds is still valid, so the key that is removed is
-            // provably the key `create_committed_allocation` inserted -- both are
-            // `ID3D12Resource::as_raw()` on the same object.
-            //
-            // ⚠ Ordering: before `drop(state)`. After the drop the resource may
-            // be released, its address may be recycled, and removing it then
-            // could delete an entry a *different* create had just inserted at
-            // the same address. Reading the address first makes the removal
-            // unconditionally about this object.
-            //
-            // ⚠ Unconditional: a resource not created on the committed arm has
-            // no entry; `take` finds nothing and nothing is
-            // counted. `IdentityRecorded - IdentityRemoved` is therefore the
-            // live-entry count and a leak shows up as a growing difference
-            // rather than needing its own instrument.
-            if let Some(engine) = state.resource.as_ref() {
-                if let Some(identity) = identity12::take(engine.as_raw() as usize) {
-                    L4_REFUSALS.identity_removed.bump();
-                    // ⛔ UP-5's other half. An entry EXISTS iff this driver owns a
-                    // WDDM allocation for the resource (`identity12`'s module doc
-                    // states that invariant), so the deallocate is unconditional
-                    // here rather than gated on a second flag that could disagree
-                    // with the table. `take` cleared the slot under the same lock
-                    // acquisition that read it, so two concurrent destroys of one
-                    // resource cannot both reach this line with the same handle.
-                    //
-                    // ⚠ The `hResource` form needs a device, which this DDI supplies
-                    // and did not used to resolve. A device that does not resolve is
-                    // a leaked allocation, counted -- it cannot be a silent skip,
-                    // because the handle is unreachable from that moment on.
-                    // SAFETY: `h_device` is the device this destroy was dispatched
-                    // on; the borrow ends inside this block.
-                    match unsafe { device12::device(h_device) } {
-                        Some(dev) => {
-                            // SAFETY: `h_allocation` is the handle `pfnAllocateCb`
-                            // minted for this resource, taken out of the table so no
-                            // other path can reach it, and `h_rt_resource` is the
-                            // runtime handle it was associated with at the create.
-                            unsafe {
-                                deallocate_committed(
-                                    dev,
-                                    identity.h_allocation,
-                                    // ⛔ The `hResource` form on the destroy, and the
-                                    // handle-list form on the create's rollback --
-                                    // see `DeallocateForm` for why the two arms are
-                                    // used from two places.
-                                    DeallocateForm::ByResource(ddi12::D3D12DDI_HRTRESOURCE {
-                                        handle: identity.h_rt_resource as *mut c_void,
-                                    }),
-                                )
-                            };
-                        }
-                        None => {
-                            note_refusal(&L4_REFUSALS.resource_no_device);
-                            note_refusal(&L4_REFUSALS.deallocate_cb_missing);
+            // Arm reverse teardown before either the resource or heap COM
+            // reference can release the associated VkDeviceMemory. The final
+            // heap release enters vkd3d's immutable begin/finish/retire edge;
+            // only retire removes the token and releases the WDDM allocation.
+            if let (Some(engine), Some(stored_identity)) = (state.resource.as_ref(), state.identity)
+            {
+                match unsafe { device12::device(h_device) } {
+                    Some(dev) => {
+                        let armed = identity12::lock(&dev.outer_allocations).arm_teardown(
+                            engine.as_raw() as usize,
+                            stored_identity.device_generation,
+                            stored_identity.outer_allocation_token,
+                        );
+                        if let Err(refusal) = armed {
+                            note_refusal(&L4_REFUSALS.identity_replaced);
                             log_error!(
-                                "L4: destroy could not resolve the device -- the WDDM \
-                                 allocation {:#x} for the committed resource {:#x} is LEAKED",
-                                identity.h_allocation,
-                                identity.engine_resource,
+                                "L4: exact token teardown arm REFUSED token={} resource={:#x}: {:?}",
+                                stored_identity.outer_allocation_token,
+                                stored_identity.engine_resource,
+                                refusal,
                             );
+                            let _ = device12::set_error(dev, E_FAIL);
+                            // Fail closed: keep the COM/WDDM graph alive so the
+                            // engine address cannot be recycled under a live
+                            // association. Device rundown owns the leak.
+                            core::mem::forget(state);
+                            return;
                         }
+                    }
+                    None => {
+                        note_refusal(&L4_REFUSALS.resource_no_device);
+                        note_refusal(&L4_REFUSALS.deallocate_cb_missing);
+                        core::mem::forget(state);
+                        return;
                     }
                 }
             }
@@ -3818,7 +3979,7 @@ unsafe extern "C" fn open_heap_and_resource(
 fn allocation_info_from_engine(
     device10: &ID3D12Device10,
     desc1: &D3D12_RESOURCE_DESC1,
-    a: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+    a: &ddi12::D3D12DDIARG_CREATERESOURCE_0111,
     visible_node_mask: u32,
 ) -> ddi12::D3D12DDI_RESOURCE_ALLOCATION_INFO_0022 {
     let desc = resource_desc(desc1);
@@ -3885,7 +4046,7 @@ fn allocation_info_from_engine(
 /// `pfnCheckResourceAllocationInfo`.
 ///
 /// ⭐ **`AlignmentRestriction` is the API's `D3D12_RESOURCE_DESC::Alignment`.**
-/// The DDI moved the field out of the struct — `D3D12DDIARG_CREATERESOURCE_0109`
+/// The DDI moved the field out of the struct — `D3D12DDIARG_CREATERESOURCE_0111`
 /// has no `Alignment` while `D3D12_RESOURCE_DESC` does — and put it here as a
 /// parameter, which is also why `pfnCreateHeapAndResource` has no such argument.
 ///
@@ -3917,11 +4078,11 @@ fn allocation_info_from_engine(
 /// arrivals are counted so "we ignored it" is a number.
 ///
 /// # Safety
-/// `p_resource` must be a live `D3D12DDIARG_CREATERESOURCE_0109`, and `out` must
+/// `p_resource` must be a live `D3D12DDIARG_CREATERESOURCE_0111`, and `out` must
 /// address one writable `D3D12DDI_RESOURCE_ALLOCATION_INFO_0022`.
 unsafe extern "C" fn check_resource_allocation_info(
     h_device: ddi12::D3D12DDI_HDEVICE,
-    p_resource: *const ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+    p_resource: *const ddi12::D3D12DDIARG_CREATERESOURCE_0111,
     optimization_flags: ddi12::D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS,
     alignment_restriction: ddi12::UINT32,
     visible_node_mask: ddi12::UINT,
@@ -3934,7 +4095,10 @@ unsafe extern "C" fn check_resource_allocation_info(
     // ⛔ A defined answer on every path, before anything can fail.
     // SAFETY: non-null per the check; the DDI declares it an out-parameter.
     unsafe {
-        core::ptr::write_unaligned(out, ddi12::D3D12DDI_RESOURCE_ALLOCATION_INFO_0022::default())
+        core::ptr::write_unaligned(
+            out,
+            ddi12::D3D12DDI_RESOURCE_ALLOCATION_INFO_0022::default(),
+        )
     };
 
     if p_resource.is_null() {
@@ -4010,6 +4174,28 @@ unsafe extern "C" fn check_resource_allocation_info(
     unsafe { core::ptr::write_unaligned(out, info) };
 }
 
+/// `pfnGetTextureLayouts` for the unadvertised GUID-layout tier.
+///
+/// Helios reports `GUID_TEXTURE_LAYOUT_TIER_NOT_SUPPORTED`, so the only
+/// truthful finite answer is an empty set. A non-null count is always written
+/// before returning; no caller-provided GUID storage is touched.
+unsafe extern "C" fn get_texture_layouts(
+    _h_device: ddi12::D3D12DDI_HDEVICE,
+    _resource: *const ddi12::D3D12DDIARG_CREATERESOURCE_0111,
+    _allowed_access: ddi12::D3D12DDI_BARRIER_ACCESS,
+    _optimized_access: ddi12::D3D12DDI_BARRIER_ACCESS,
+    num_guids: *mut ddi12::UINT,
+    _guids: *mut ddi12::GUID,
+) {
+    if num_guids.is_null() {
+        note_refusal(&L4_REFUSALS.texture_layout_query_bad_arg);
+        return;
+    }
+    // SAFETY: the DDI declares `pNumGuids` writable; non-null was checked.
+    unsafe { num_guids.write(0) };
+    note_refusal(&L4_REFUSALS.texture_layout_query_empty);
+}
+
 /// `pfnCheckExistingResourceAllocationInfo`.
 ///
 /// Answers from the resource's own state, which is the allocation info this
@@ -4036,7 +4222,10 @@ unsafe extern "C" fn check_existing_resource_allocation_info(
     }
     // SAFETY: non-null per the check; the DDI declares it an out-parameter.
     unsafe {
-        core::ptr::write_unaligned(out, ddi12::D3D12DDI_RESOURCE_ALLOCATION_INFO_0022::default())
+        core::ptr::write_unaligned(
+            out,
+            ddi12::D3D12DDI_RESOURCE_ALLOCATION_INFO_0022::default(),
+        )
     };
 
     // SAFETY: the runtime passes a resource handle this driver wrote; the borrow
@@ -4316,11 +4505,7 @@ unsafe extern "C" fn check_resource_allocation_handle(
 ) -> ddi12::D3DKMT_HANDLE {
     // SAFETY: the runtime passes a resource handle this driver wrote; the borrow
     // ends with this call.
-    let Some(engine) = (unsafe { engine_resource(h_resource) }) else {
-        note_refusal(&L4_REFUSALS.resource_handle_unresolved);
-        return 0;
-    };
-    match identity12::lookup(engine.as_raw() as usize) {
+    match unsafe { allocation_identity(h_resource) } {
         Some(identity) => identity.h_allocation,
         None => {
             note_refusal(&L4_REFUSALS.resource_allocation_handle_unavailable);
@@ -4365,6 +4550,7 @@ pub(crate) fn install(
     table.pfnCheckSubresourceInfo = Some(check_subresource_info);
     table.pfnCheckExistingResourceAllocationInfo = Some(check_existing_resource_allocation_info);
     table.pfnCheckResourceAllocationHandle = Some(check_resource_allocation_handle);
+    table.pfnGetTextureLayouts = Some(get_texture_layouts);
 
     filling.advance()
 }
@@ -4890,6 +5076,13 @@ struct L4Refusals {
     /// its complement, and against `PresentIdentityNoResourceId`, which is where the
     /// gap is actually paid for.
     hwa2_venus_res_id_dropped: RefusalCounter,
+    /// A Core-0111 resource named a nonzero GUID layout while the GUID layout
+    /// tier is unadvertised. The resource or allocation-info query is refused.
+    resource_layout_guid_refused: RefusalCounter,
+    /// `pfnGetTextureLayouts` lacked its mandatory writable count pointer.
+    texture_layout_query_bad_arg: RefusalCounter,
+    /// The runtime queried GUID layouts and received the truthful empty set.
+    texture_layout_query_empty: RefusalCounter,
 }
 
 static L4_REFUSALS: L4Refusals = L4Refusals {
@@ -4965,6 +5158,9 @@ static L4_REFUSALS: L4Refusals = L4Refusals {
     hwa2_create_output_invalid: RefusalCounter::new("Hwa2CreateOutputInvalid"),
     hwa2_echo_mismatch: RefusalCounter::new("Hwa2EchoMismatch"),
     hwa2_venus_res_id_dropped: RefusalCounter::new("Hwa2VenusResIdDropped"),
+    resource_layout_guid_refused: RefusalCounter::new("ResourceLayoutGuidRefused"),
+    texture_layout_query_bad_arg: RefusalCounter::new("TextureLayoutQueryBadArg"),
+    texture_layout_query_empty: RefusalCounter::new("TextureLayoutQueryEmpty"),
 };
 
 /// L4's refusal set, printed by `crate::log_refusal_summary` at this lane's
@@ -5053,4 +5249,8 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L4_REFUSALS.hwa2_create_output_invalid,
     &L4_REFUSALS.hwa2_echo_mismatch,
     &L4_REFUSALS.hwa2_venus_res_id_dropped,
+    // APPENDED with the Core-0111 descriptor/table transition.
+    &L4_REFUSALS.resource_layout_guid_refused,
+    &L4_REFUSALS.texture_layout_query_bad_arg,
+    &L4_REFUSALS.texture_layout_query_empty,
 ];

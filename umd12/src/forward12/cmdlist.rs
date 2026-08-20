@@ -99,14 +99,14 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ, D3D_PRIMITIVE_TOPOLOGY_UNDEFINED,
 };
 use windows::Win32::Graphics::Direct3D12::{
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF,
     ID3D12CommandAllocator, ID3D12GraphicsCommandList9, ID3D12Resource, D3D12_COMMAND_LIST_TYPE,
     D3D12_COMMAND_LIST_TYPE_BUNDLE, D3D12_CPU_DESCRIPTOR_HANDLE,
     D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
-    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF,
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED, D3D12_INDEX_BUFFER_VIEW,
     D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT, D3D12_SO_BUFFER_SLOT_COUNT,
-    D3D12_STREAM_OUTPUT_BUFFER_VIEW, D3D12_VERTEX_BUFFER_VIEW,
-    D3D12_VIEWPORT, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE,
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW, D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT,
+    D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE,
 };
 
 use super::pso;
@@ -406,46 +406,45 @@ unsafe extern "C" fn reset_command_list(
 
     // SAFETY: the caller guarantees `hDrvCommandRecorder` is a live recorder
     // handle; the returned allocator is owned by this call.
-    let (allocator, allocator_type): (ID3D12CommandAllocator, D3D12_COMMAND_LIST_TYPE) =
-        match unsafe {
-            queue::recorder_allocator(state.h_device(), a.hDrvCommandRecorder, state.list_type())
-        } {
-            RecorderAllocator::Ready {
-                allocator,
-                list_type,
-            } => (allocator, list_type),
-            RecorderAllocator::NoRecorder => {
-                note_refusal(&L3A_REFUSALS.reset_recorder_missing);
-                // SAFETY: `state` is live for this DDI call, as above.
-                unsafe { report_error(state, E_INVALIDARG) };
-                return;
-            }
-            RecorderAllocator::NoPoolBound => {
-                note_refusal(&L3A_REFUSALS.reset_no_allocator);
-                if let Some(n) = budget() {
-                    log_error!(
-                        "ResetCommandList: the recorder has never been bound to a command pool, \
+    let (allocator, allocator_type): (ID3D12CommandAllocator, D3D12_COMMAND_LIST_TYPE) = match unsafe {
+        queue::recorder_allocator(state.h_device(), a.hDrvCommandRecorder, state.list_type())
+    } {
+        RecorderAllocator::Ready {
+            allocator,
+            list_type,
+        } => (allocator, list_type),
+        RecorderAllocator::NoRecorder => {
+            note_refusal(&L3A_REFUSALS.reset_recorder_missing);
+            // SAFETY: `state` is live for this DDI call, as above.
+            unsafe { report_error(state, E_INVALIDARG) };
+            return;
+        }
+        RecorderAllocator::NoPoolBound => {
+            note_refusal(&L3A_REFUSALS.reset_no_allocator);
+            if let Some(n) = budget() {
+                log_error!(
+                    "ResetCommandList: the recorder has never been bound to a command pool, \
                          so there is no ID3D12CommandAllocator to reset against (x{})",
-                        n + 1,
-                    );
-                }
-                // SAFETY: `state` is live for this DDI call, as above.
-                unsafe { report_error(state, E_FAIL) };
-                return;
+                    n + 1,
+                );
             }
-            RecorderAllocator::NoDevice | RecorderAllocator::EngineFailed => {
-                // The queue lane already counted and logged the exact engine-side
-                // reason. This VOID DDI still owes the runtime a list-scoped
-                // failure so it will not record into an unreset engine list.
-                unsafe { report_error(state, E_FAIL) };
-                return;
-            }
-            RecorderAllocator::UnsupportedClass => {
-                note_refusal(&L3A_REFUSALS.reset_list_type_mismatch);
-                unsafe { report_error(state, E_INVALIDARG) };
-                return;
-            }
-        };
+            // SAFETY: `state` is live for this DDI call, as above.
+            unsafe { report_error(state, E_FAIL) };
+            return;
+        }
+        RecorderAllocator::NoDevice | RecorderAllocator::EngineFailed => {
+            // The queue lane already counted and logged the exact engine-side
+            // reason. This VOID DDI still owes the runtime a list-scoped
+            // failure so it will not record into an unreset engine list.
+            unsafe { report_error(state, E_FAIL) };
+            return;
+        }
+        RecorderAllocator::UnsupportedClass => {
+            note_refusal(&L3A_REFUSALS.reset_list_type_mismatch);
+            unsafe { report_error(state, E_INVALIDARG) };
+            return;
+        }
+    };
 
     // ⛔ The class check, and it REFUSES rather than falling through. See the doc
     // above: both `d3d12_command_list_Reset` (command.c:7378-7382) and
@@ -594,9 +593,11 @@ unsafe extern "C" fn dispatch(
     };
     // SAFETY: as `draw_instanced`; three by-value scalars.
     unsafe {
-        state
-            .engine()
-            .Dispatch(thread_group_count_x, thread_group_count_y, thread_group_count_z);
+        state.engine().Dispatch(
+            thread_group_count_x,
+            thread_group_count_y,
+            thread_group_count_z,
+        );
     }
 }
 
@@ -1904,6 +1905,119 @@ unsafe extern "C" fn execute_indirect(
 // Install
 // ---------------------------------------------------------------------------
 
+// Core-0114 changes only the application-facing handles for these slots. Keep
+// the established typed handlers on driver handles and make the runtime-bypass
+// dereference explicit at one wrapper per changed slot.
+macro_rules! bypass_list_wrapper {
+    ($wrapper:ident => $target:ident ( $( $arg:ident : $ty:ty ),* $(,)? )) => {
+        unsafe extern "C" fn $wrapper(
+            h_list: ddi12::D3D12DDI_API_HCOMMANDLIST,
+            $( $arg: $ty ),*
+        ) {
+            // SAFETY: Core-0114 supplies a live runtime-bypass header for this
+            // application handle for the duration of the DDI call.
+            let Some(h_list) = (unsafe { queue::command_list_from_api(h_list) }) else {
+                return;
+            };
+            // SAFETY: the wrapper preserves every non-handle argument and the
+            // conversion above recovered the exact driver object.
+            unsafe { $target(h_list, $( $arg ),*) }
+        }
+    };
+}
+
+bypass_list_wrapper!(draw_instanced_0114 => draw_instanced(
+    vertex_count_per_instance: ddi12::UINT,
+    instance_count: ddi12::UINT,
+    start_vertex_location: ddi12::UINT,
+    start_instance_location: ddi12::UINT,
+));
+bypass_list_wrapper!(draw_indexed_instanced_0114 => draw_indexed_instanced(
+    index_count_per_instance: ddi12::UINT,
+    instance_count: ddi12::UINT,
+    start_index_location: ddi12::UINT,
+    base_vertex_location: ddi12::INT,
+    start_instance_location: ddi12::UINT,
+));
+bypass_list_wrapper!(dispatch_0114 => dispatch(
+    thread_group_count_x: ddi12::UINT,
+    thread_group_count_y: ddi12::UINT,
+    thread_group_count_z: ddi12::UINT,
+));
+bypass_list_wrapper!(ia_set_topology_0114 => ia_set_topology(
+    topology: ddi12::D3D12DDI_PRIMITIVE_TOPOLOGY,
+));
+bypass_list_wrapper!(rs_set_viewports_0114 => rs_set_viewports(
+    count: ddi12::UINT,
+    viewports: *const ddi12::D3D12DDI_VIEWPORT,
+));
+bypass_list_wrapper!(rs_set_scissor_rects_0114 => rs_set_scissor_rects(
+    count: ddi12::UINT,
+    rects: *const ddi12::D3D12DDI_RECT,
+));
+bypass_list_wrapper!(om_set_blend_factor_0114 => om_set_blend_factor(
+    factor: *const ddi12::FLOAT,
+));
+bypass_list_wrapper!(om_set_stencil_ref_0114 => om_set_stencil_ref(
+    stencil_ref: ddi12::UINT,
+));
+
+unsafe extern "C" fn set_pipeline_state_0114(
+    h_list: ddi12::D3D12DDI_API_HCOMMANDLIST,
+    h_pso: ddi12::D3D12DDI_API_HPIPELINESTATE,
+) {
+    // SAFETY: both application handles are live Core-0114 bypass headers for
+    // this call. The helpers preserve a null object for the typed handler.
+    let Some(h_list) = (unsafe { queue::command_list_from_api(h_list) }) else {
+        return;
+    };
+    let Some(h_pso) = (unsafe { queue::pipeline_state_from_api(h_pso) }) else {
+        return;
+    };
+    unsafe { set_pipeline_state(h_list, h_pso) }
+}
+
+bypass_list_wrapper!(om_set_depth_bounds_0114 => om_set_depth_bounds(
+    min: ddi12::FLOAT,
+    max: ddi12::FLOAT,
+));
+bypass_list_wrapper!(set_sample_positions_0114 => set_sample_positions(
+    num_samples_per_pixel: ddi12::UINT,
+    num_pixels: ddi12::UINT,
+    sample_positions: *mut ddi12::D3D12DDI_SAMPLE_POSITION,
+));
+bypass_list_wrapper!(om_set_front_and_back_stencil_ref_0114 => om_set_front_and_back_stencil_ref(
+    front: ddi12::UINT,
+    back: ddi12::UINT,
+));
+bypass_list_wrapper!(rs_set_depth_bias_0114 => rs_set_depth_bias(
+    depth_bias: ddi12::FLOAT,
+    depth_bias_clamp: ddi12::FLOAT,
+    slope_scaled_depth_bias: ddi12::FLOAT,
+));
+bypass_list_wrapper!(ia_set_index_buffer_0114 => ia_set_index_buffer(
+    desc: *const ddi12::D3D12DDI_INDEX_BUFFER_VIEW,
+));
+bypass_list_wrapper!(ia_set_vertex_buffers_0114 => ia_set_vertex_buffers(
+    start_slot: ddi12::UINT,
+    num_views: ddi12::UINT,
+    views: *const ddi12::D3D12DDI_VERTEX_BUFFER_VIEW,
+));
+bypass_list_wrapper!(so_set_targets_0114 => so_set_targets(
+    start_slot: ddi12::UINT,
+    num_views: ddi12::UINT,
+    views: *const ddi12::D3D12DDI_STREAM_OUTPUT_BUFFER_VIEW,
+));
+bypass_list_wrapper!(om_set_render_targets_0114 => om_set_render_targets(
+    num_render_targets: ddi12::UINT,
+    render_targets: *const ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
+    rts_single_handle: ddi12::BOOL,
+    depth_stencil: *const ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
+));
+bypass_list_wrapper!(ia_set_index_buffer_strip_cut_value_0114 => ia_set_index_buffer_strip_cut_value(
+    strip_cut: ddi12::D3D12DDI_INDEX_BUFFER_STRIP_CUT_VALUE,
+));
+
 /// Install L3a's 23 command-list slots.
 ///
 /// Chain position: `Stubbed` -> `RecordSlots` on the command-list table.
@@ -1915,27 +2029,27 @@ pub(crate) fn install(
     table.pfnCloseCommandList = Some(close_command_list);
     table.pfnResetCommandList = Some(reset_command_list);
     // draw — 3
-    table.pfnDrawInstanced = Some(draw_instanced);
-    table.pfnDrawIndexedInstanced = Some(draw_indexed_instanced);
-    table.pfnDispatch = Some(dispatch);
+    table.pfnDrawInstanced = Some(draw_instanced_0114);
+    table.pfnDrawIndexedInstanced = Some(draw_indexed_instanced_0114);
+    table.pfnDispatch = Some(dispatch_0114);
     // fixed-function state — 11
-    table.pfnIaSetTopology = Some(ia_set_topology);
-    table.pfnRsSetViewports = Some(rs_set_viewports);
-    table.pfnRsSetScissorRects = Some(rs_set_scissor_rects);
-    table.pfnOmSetBlendFactor = Some(om_set_blend_factor);
-    table.pfnOmSetStencilRef = Some(om_set_stencil_ref);
-    table.pfnSetPipelineState = Some(set_pipeline_state);
-    table.pfnOMSetDepthBounds = Some(om_set_depth_bounds);
-    table.pfnSetSamplePositions = Some(set_sample_positions);
+    table.pfnIaSetTopology = Some(ia_set_topology_0114);
+    table.pfnRsSetViewports = Some(rs_set_viewports_0114);
+    table.pfnRsSetScissorRects = Some(rs_set_scissor_rects_0114);
+    table.pfnOmSetBlendFactor = Some(om_set_blend_factor_0114);
+    table.pfnOmSetStencilRef = Some(om_set_stencil_ref_0114);
+    table.pfnSetPipelineState = Some(set_pipeline_state_0114);
+    table.pfnOMSetDepthBounds = Some(om_set_depth_bounds_0114);
+    table.pfnSetSamplePositions = Some(set_sample_positions_0114);
     table.pfnOmSetAlphaBlendFactor = Some(om_set_alpha_blend_factor);
-    table.pfnOmSetFrontAndBackStencilRef = Some(om_set_front_and_back_stencil_ref);
-    table.pfnRSSetDepthBias = Some(rs_set_depth_bias);
+    table.pfnOmSetFrontAndBackStencilRef = Some(om_set_front_and_back_stencil_ref_0114);
+    table.pfnRSSetDepthBias = Some(rs_set_depth_bias_0114);
     // IA / SO / OM — 5
-    table.pfnIASetIndexBuffer = Some(ia_set_index_buffer);
-    table.pfnIASetVertexBuffers = Some(ia_set_vertex_buffers);
-    table.pfnSOSetTargets = Some(so_set_targets);
-    table.pfnOMSetRenderTargets = Some(om_set_render_targets);
-    table.pfnIASetIndexBufferStripCutValue = Some(ia_set_index_buffer_strip_cut_value);
+    table.pfnIASetIndexBuffer = Some(ia_set_index_buffer_0114);
+    table.pfnIASetVertexBuffers = Some(ia_set_vertex_buffers_0114);
+    table.pfnSOSetTargets = Some(so_set_targets_0114);
+    table.pfnOMSetRenderTargets = Some(om_set_render_targets_0114);
+    table.pfnIASetIndexBufferStripCutValue = Some(ia_set_index_buffer_strip_cut_value_0114);
     // indirect and bundles — 2
     table.pfnExecuteBundle = Some(execute_bundle);
     table.pfnExecuteIndirect = Some(execute_indirect);

@@ -126,6 +126,7 @@ fi
 # `"$@"` is forwarded so a lane can add e.g. `--message-format short`,
 # `--quiet`, or (with `--clippy`) `-- -D warnings`.
 CARGO_TARGET_DIR="${target_dir}" exec cargo "${cargo_cmd}" \
+    --locked \
     --target "${TARGET_TRIPLE}" \
     --config "target.${TARGET_TRIPLE}.cplusplus.rustc-link-lib=[]" \
     --config "target.${TARGET_TRIPLE}.cxxbridge1.rustc-cfg=[\"built_with_cargo\"]" \

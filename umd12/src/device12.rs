@@ -58,6 +58,31 @@ use helios_umd_common::hr::{
 use crate::adapter12::{self, Ddi12Interface};
 use crate::bridge12::BridgeDevice12;
 use crate::{ddi12, forward12, log_error, note_refusal, UMD12_REFUSALS};
+use core::ffi::c_void;
+use helios_protocol::{
+    HeliosSyncProgressJoinV1, HeliosSyncProgressResultV1, HeliosTranslatorStatusCode,
+};
+use helios_umd_common::direct_translator::DirectTranslator;
+
+pub(crate) extern "C" fn translator_sync_progress_join(
+    host_context_cookie: *mut c_void,
+    request: *const HeliosSyncProgressJoinV1,
+    out_result: *mut HeliosSyncProgressResultV1,
+) -> HeliosTranslatorStatusCode {
+    forward12::queue::translator_sync_progress_join(host_context_cookie, request, out_result)
+}
+
+pub(crate) extern "C" fn translator_sync_progress_query(
+    host_context_cookie: *mut c_void,
+    context_generation: u64,
+    out_result: *mut HeliosSyncProgressResultV1,
+) -> HeliosTranslatorStatusCode {
+    forward12::queue::translator_sync_progress_query(
+        host_context_cookie,
+        context_generation,
+        out_result,
+    )
+}
 
 /// The Helios D3D12 device: what this driver keeps for the lifetime of one
 /// `ID3D12Device`.
@@ -89,6 +114,11 @@ pub(crate) struct HeliosD3D12Device {
     /// and a later reader must be able to check that this block was sized by the
     /// same input it was built with.
     pub(crate) flags: ddi12::D3D12DDI_CREATE_DEVICE_FLAGS,
+
+    /// Exact adapter LUID captured from the package-owned OpenAdapter record.
+    /// Native-fence HNF1 create/open validation compares this value; zero is
+    /// never used as a wildcard.
+    pub(crate) adapter_luid: i64,
 
     /// The **usermode** D3D12 corelayer callbacks, at the `_0062` revision.
     ///
@@ -142,6 +172,44 @@ pub(crate) struct HeliosD3D12Device {
     /// not a reinterpretation: the compile-time block below asserts all 18
     /// shared fields are at identical offsets in the two shapes.
     pub(crate) um_callbacks_0116: *const ddi12::D3D12DDI_CORELAYER_DEVICECALLBACKS_0116,
+
+    /// Owns the sole A5 VkInstance and drops after the vkd3d wrapper.
+    pub(crate) translator: DirectTranslator,
+
+    /// Bounded token/resource/WDDM ownership for this exact A5 device
+    /// generation. Never process-global; distinct devices in one process have
+    /// disjoint registries and reject each other's tokens.
+    pub(crate) outer_allocations:
+        std::sync::Arc<std::sync::Mutex<forward12::identity12::IdentityRegistry>>,
+
+    /// The sole device-owned C65/HOC1 allocation.  It drops after every queue
+    /// has been destroyed and before the runtime callback pointers disappear.
+    pub(crate) outer_command_pool: std::sync::Arc<forward12::command_pool12::OuterCommandPool>,
+
+    /// Queue context generations are monotonically assigned and never reused
+    /// within this A5 device generation.
+    pub(crate) next_outer_context_generation: std::sync::atomic::AtomicU64,
+
+    /// Bounded weak lifetime set for exact terminal allocation scopes. Queue
+    /// pointers are never allocation identities or lookup keys.
+    pub(crate) outer_queues: forward12::queue::OuterQueueRegistry12,
+
+    /// Stable construction-time callback context. vkd3d may allocate internal
+    /// Vulkan memory before this runtime-owned device block is initialized, so
+    /// the callbacks must never dereference `hDrvDevice` on that forward edge.
+    /// The shared registry and paging pool are the same objects later consumed
+    /// by submission; this is not a second namespace or lookup service.
+    pub(crate) vkd3d_outer_context: Box<Vkd3dOuterContext12>,
+}
+
+pub(crate) struct Vkd3dOuterContext12 {
+    pub(crate) h_device: ddi12::D3D12DDI_HDEVICE,
+    pub(crate) h_rt_device: ddi12::D3D12DDI_HRTDEVICE,
+    pub(crate) um_callbacks: *const ddi12::D3D12DDI_CORELAYER_DEVICECALLBACKS_0062,
+    pub(crate) device_generation: u64,
+    pub(crate) outer_allocations:
+        std::sync::Arc<std::sync::Mutex<forward12::identity12::IdentityRegistry>>,
+    pub(crate) outer_command_pool: std::sync::Arc<forward12::command_pool12::OuterCommandPool>,
 }
 
 /// `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` is a byte-exact **prefix** of
@@ -287,10 +355,7 @@ pub(crate) unsafe fn calc_private_device_size(
     // either way.
 
     let size = device_private_size(a.Flags);
-    log_error!(
-        "CalcPrivateDeviceSize: Flags={:#x} -> {size}",
-        a.Flags,
-    );
+    log_error!("CalcPrivateDeviceSize: Flags={:#x} -> {size}", a.Flags,);
     size
 }
 
@@ -319,6 +384,7 @@ pub(crate) unsafe fn calc_private_device_size(
 /// device.
 pub(crate) unsafe fn create_device(
     arg: *const ddi12::D3D12DDIARG_CREATEDEVICE_0109,
+    adapter_identity: adapter12::AdapterIdentity,
 ) -> Hresult {
     if arg.is_null() {
         note_refusal(&UMD12_REFUSALS.create_device_bad_arg);
@@ -500,29 +566,71 @@ pub(crate) unsafe fn create_device(
         note_refusal(&UMD12_REFUSALS.reserve_ranges_ignored);
     }
 
-    // ── 3. Bring the engine up ──────────────────────────────────────────────
-    //
-    // ⚠ `(0, 0)` means "do not match on LUID", and it is what the D3D11 driver
-    // passes too (`umd/src/adapter.rs:390`). Three reasons it is the honest
-    // value here rather than a shortcut:
-    //   * a D3D12 UMD has no supported way to obtain its adapter's LUID —
-    //     `D3D12DDIARG_OPENADAPTER` does not carry one, and
-    //     `pfnQueryAdapterInfoCb` returns the KMD's *private* adapter data, not
-    //     an identity;
-    //   * vkd3d does not LUID-match anyway. `helios_entry.c:172-179` passes
-    //     `vk_physical_device = VK_NULL_HANDLE` and delegates to
-    //     `vkd3d_select_physical_device`, whose own comment says it "is NOT LUID
-    //     matching" — so a *correct* LUID would change nothing today;
-    //   * the guest is single-GPU, so there is one physical device to pick.
-    // ⛔ None of that makes it right on a multi-adapter guest, and that is
-    // `ARCHITECTURE.md` §13 UNVERIFIED-11.
-    let Some(engine) = BridgeDevice12::create(0, 0) else {
+    // ── 3. Bring the engine up on the exact adapter identity queried during
+    // OpenAdapter. A zero or stale identity cannot reach this point because the
+    // package-versioned record was validated before hAdapter was published.
+    let luid = adapter_identity.luid as u64;
+    log_error!(
+        "CreateDevice: adapter generation={} luid={:08x}:{:08x}",
+        adapter_identity.generation,
+        (luid >> 32) as u32,
+        luid as u32,
+    );
+    let translator = match DirectTranslator::create(
+        adapter_identity.luid,
+        helios_protocol::HELIOS_HTS1_MAX_ENDPOINTS_PER_SESSION,
+        Some(translator_sync_progress_join),
+        Some(translator_sync_progress_query),
+    ) {
+        Ok(translator) => translator,
+        Err(error) => {
+            log_error!("CreateDevice: A5 translator creation refused: {:?}", error);
+            note_refusal(&UMD12_REFUSALS.create_device_engine_failed);
+            return E_FAIL;
+        }
+    };
+    let outer_command_pool = match unsafe {
+        forward12::command_pool12::OuterCommandPool::create(a.hRTDevice.handle, a.pKTCallbacks)
+    } {
+        Ok(pool) => std::sync::Arc::new(pool),
+        Err(hr) => {
+            log_error!(
+                "CreateDevice: HOC1 pool construction refused hr={:#010x}",
+                hr as u32
+            );
+            return if hr < 0 { hr } else { E_FAIL };
+        }
+    };
+    let outer_allocations = std::sync::Arc::new(std::sync::Mutex::new(
+        forward12::identity12::IdentityRegistry::new(),
+    ));
+    let mut vkd3d_outer_context = Box::new(Vkd3dOuterContext12 {
+        h_device: a.hDrvDevice,
+        h_rt_device: a.hRTDevice,
+        um_callbacks: um_callbacks_raw,
+        device_generation: translator.session_generation(),
+        outer_allocations: std::sync::Arc::clone(&outer_allocations),
+        outer_command_pool: std::sync::Arc::clone(&outer_command_pool),
+    });
+    let outer_context = vkd3d_outer_context.as_mut() as *mut Vkd3dOuterContext12 as usize;
+    let Some(engine) = BridgeDevice12::create(
+        translator.vk_instance() as usize,
+        translator.get_instance_proc_addr() as usize,
+        translator.module_base() as usize,
+        luid as u32,
+        (luid >> 32) as u32 as i32,
+        outer_context,
+        forward12::queue::outer_allocation_create as *const () as usize,
+        forward12::queue::outer_allocation_teardown_begin as *const () as usize,
+        forward12::queue::outer_allocation_begin as *const () as usize,
+        forward12::queue::outer_allocation_finish as *const () as usize,
+        forward12::queue::outer_allocation_retire as *const () as usize,
+    ) else {
         // The C++ side has already logged the engine's HRESULT.
         log_error!("CreateDevice: vkd3d device creation FAILED -> E_FAIL");
         note_refusal(&UMD12_REFUSALS.create_device_engine_failed);
         return E_FAIL;
     };
-
     // ── 4. Construct in place, under the guard ──────────────────────────────
     let device = a.hDrvDevice.pDrvPrivate.cast::<HeliosD3D12Device>();
     // SAFETY: `pDrvPrivate` is non-null (checked above) and points at the block
@@ -538,10 +646,17 @@ pub(crate) unsafe fn create_device(
                 h_rt_device: a.hRTDevice,
                 negotiated,
                 flags: a.Flags,
+                adapter_luid: adapter_identity.luid,
                 um_callbacks: um_callbacks_raw,
                 kt_callbacks: a.pKTCallbacks,
                 engine,
+                translator,
                 um_callbacks_0116,
+                outer_allocations,
+                outer_command_pool,
+                next_outer_context_generation: std::sync::atomic::AtomicU64::new(1),
+                outer_queues: forward12::queue::OuterQueueRegistry12::new(),
+                vkd3d_outer_context,
             },
         );
     }
@@ -600,24 +715,20 @@ pub(crate) unsafe fn destroy_device(h_device: ddi12::D3D12DDI_HDEVICE) {
 ///   `ARCHITECTURE.md` §12 trap 2 landmine in its D3D12 form (four union arms of
 ///   12/14/17/18 members). *"Did every device get the same `_0062` table?"* is a
 ///   real question with a real failure mode, and this is what answers it.
-/// * **the engine's venus context id**, per device rather than per process —
-///   S4b's evidence channel at the granularity S4b could not reach. ⚠ It is a
-///   *degraded read* at 0 (no ICD, or one too old), never an anchor failure: a
-///   genuine anchor mismatch refuses device creation, so there would be no
-///   device here to ask.
 /// * **the counters and the noop hits at device scope**, which says what *this*
 ///   device touched rather than what the whole adapter did.
 fn log_device_teardown(dev: &HeliosD3D12Device) {
     log_error!(
         "DestroyDevice: {} hRTDevice={:p} Flags={:#x} p12UMCallbacks={:p} p12UMCallbacks_0116={:p} \
-         pKTCallbacks={:p} venusCtx={}",
+         pKTCallbacks={:p} vkd3dOuter={:p} generation={}",
         dev.negotiated.name(),
         dev.h_rt_device.handle,
         dev.flags,
         dev.um_callbacks,
         dev.um_callbacks_0116,
         dev.kt_callbacks,
-        dev.engine.venus_context_id(),
+        dev.vkd3d_outer_context.as_ref(),
+        dev.vkd3d_outer_context.device_generation,
     );
     crate::log_refusal_summary();
     crate::forward12::noop12::log_noop_hits();

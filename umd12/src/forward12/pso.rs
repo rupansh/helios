@@ -58,23 +58,21 @@ use helios_umd_common::slot::{Boxed, BoxedHandle, Com, ComHandle, Slot};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12Device2, ID3D12PipelineState, ID3D12RootSignature, D3D12_BLEND, D3D12_BLEND_DESC,
-    D3D12_BLEND_OP, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
-    D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMPARISON_FUNC, D3D12_COMPARISON_FUNC_ALWAYS,
-    D3D12_COMPARISON_FUNC_LESS, D3D12_COMPUTE_PIPELINE_STATE_DESC,
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF, ID3D12Device2, ID3D12PipelineState,
+    ID3D12RootSignature, D3D12_BLEND, D3D12_BLEND_DESC, D3D12_BLEND_ONE, D3D12_BLEND_OP,
+    D3D12_BLEND_OP_ADD, D3D12_BLEND_ZERO, D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMPARISON_FUNC,
+    D3D12_COMPARISON_FUNC_ALWAYS, D3D12_COMPARISON_FUNC_LESS, D3D12_COMPUTE_PIPELINE_STATE_DESC,
     D3D12_CONSERVATIVE_RASTERIZATION_MODE, D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF,
     D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON, D3D12_CULL_MODE, D3D12_CULL_MODE_BACK,
-    D3D12_DEFAULT_STENCIL_READ_MASK, D3D12_DEFAULT_STENCIL_WRITE_MASK,
-    D3D12_DEPTH_STENCILOP_DESC1, D3D12_DEPTH_STENCIL_DESC2,
-    D3D12_DEPTH_WRITE_MASK, D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DESCRIPTOR_RANGE,
-    D3D12_DESCRIPTOR_RANGE_TYPE, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, D3D12_FILL_MODE,
-    D3D12_FILL_MODE_SOLID, D3D12_FILTER, D3D12_FILTER_ANISOTROPIC,
-    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF,
-    D3D12_INPUT_CLASSIFICATION, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
-    D3D12_INPUT_ELEMENT_DESC, D3D12_INPUT_LAYOUT_DESC, D3D12_LINE_RASTERIZATION_MODE,
-    D3D12_LINE_RASTERIZATION_MODE_ALIASED, D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW,
-    D3D12_LOGIC_OP, D3D12_LOGIC_OP_NOOP, D3D12_PIPELINE_STATE_FLAGS,
-    D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS,
+    D3D12_DEFAULT_STENCIL_READ_MASK, D3D12_DEFAULT_STENCIL_WRITE_MASK, D3D12_DEPTH_STENCILOP_DESC1,
+    D3D12_DEPTH_STENCIL_DESC2, D3D12_DEPTH_WRITE_MASK, D3D12_DEPTH_WRITE_MASK_ALL,
+    D3D12_DESCRIPTOR_RANGE, D3D12_DESCRIPTOR_RANGE_TYPE, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER,
+    D3D12_FILL_MODE, D3D12_FILL_MODE_SOLID, D3D12_FILTER, D3D12_FILTER_ANISOTROPIC,
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE, D3D12_INPUT_CLASSIFICATION,
+    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, D3D12_INPUT_ELEMENT_DESC,
+    D3D12_INPUT_LAYOUT_DESC, D3D12_LINE_RASTERIZATION_MODE, D3D12_LINE_RASTERIZATION_MODE_ALIASED,
+    D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW, D3D12_LOGIC_OP, D3D12_LOGIC_OP_NOOP,
+    D3D12_PIPELINE_STATE_FLAGS, D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS,
     D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT, D3D12_PIPELINE_STATE_STREAM_DESC,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2,
@@ -83,26 +81,25 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS,
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING,
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_PRIMITIVE_TOPOLOGY_TYPE,
-    D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH, D3D12_RASTERIZER_DESC2, D3D12_RENDER_TARGET_BLEND_DESC,
-    D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER,
-    D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE, D3D12_ROOT_PARAMETER_TYPE_UAV,
-    D3D12_ROOT_SIGNATURE_DESC,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE, D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH, D3D12_RASTERIZER_DESC2,
+    D3D12_RENDER_TARGET_BLEND_DESC, D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR,
+    D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER, D3D12_ROOT_PARAMETER_0,
+    D3D12_ROOT_PARAMETER_TYPE, D3D12_ROOT_PARAMETER_TYPE_UAV, D3D12_ROOT_SIGNATURE_DESC,
     D3D12_ROOT_SIGNATURE_FLAGS, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
     D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED, D3D12_RT_FORMAT_ARRAY,
     D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY, D3D12_SHADER_VISIBILITY_MESH,
     D3D12_STATIC_BORDER_COLOR, D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT,
     D3D12_STATIC_SAMPLER_DESC, D3D12_STENCIL_OP_KEEP, D3D12_TEXTURE_ADDRESS_MODE,
-    D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
-    D3D12_VIEW_INSTANCE_LOCATION, D3D12_VIEW_INSTANCING_DESC, D3D12_VIEW_INSTANCING_FLAGS,
-    D3D_ROOT_SIGNATURE_VERSION_1_0,
+    D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE, D3D12_VIEW_INSTANCE_LOCATION,
+    D3D12_VIEW_INSTANCING_DESC, D3D12_VIEW_INSTANCING_FLAGS, D3D_ROOT_SIGNATURE_VERSION_1_0,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
@@ -1070,7 +1067,9 @@ struct RootSignature10 {
 /// # Safety
 /// `src` must point at a live `D3D12DDI_ROOT_SIGNATURE_0100` whose parameter and
 /// sampler arrays are live for the call.
-unsafe fn root_signature_to_1_0(src: &ddi12::D3D12DDI_ROOT_SIGNATURE_0100) -> Option<RootSignature10> {
+unsafe fn root_signature_to_1_0(
+    src: &ddi12::D3D12DDI_ROOT_SIGNATURE_0100,
+) -> Option<RootSignature10> {
     let n_params = src.NumParameters as usize;
     let n_samplers = src.NumStaticSamplers as usize;
     if n_params > MAX_ROOT_PARAMETERS || n_samplers > MAX_STATIC_SAMPLERS {
@@ -1106,7 +1105,8 @@ unsafe fn root_signature_to_1_0(src: &ddi12::D3D12DDI_ROOT_SIGNATURE_0100) -> Op
     // never resized once pass 2 starts taking pointers into it.
     let mut ranges: Vec<Vec<D3D12_DESCRIPTOR_RANGE>> = Vec::with_capacity(n_params);
     for p in ddi_params {
-        if p.ParameterType != ddi12::D3D12DDI_ROOT_PARAMETER_TYPE_D3D12DDI_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE
+        if p.ParameterType
+            != ddi12::D3D12DDI_ROOT_PARAMETER_TYPE_D3D12DDI_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE
         {
             ranges.push(Vec::new());
             continue;
@@ -1355,7 +1355,10 @@ unsafe extern "C" fn create_root_signature(
     }
     if hr < 0 || blob_raw == 0 {
         note_refusal(&L6_REFUSALS.root_sig_serialize_failed);
-        log_error!("CreateRootSignature: serialize failed hr={:#010x}", hr as u32);
+        log_error!(
+            "CreateRootSignature: serialize failed hr={:#010x}",
+            hr as u32
+        );
         return if hr < 0 { hr } else { E_FAIL };
     }
     // SAFETY: `blob_raw` is the OWNED `ID3DBlob*` the bridge produced; adopting
@@ -1728,7 +1731,13 @@ unsafe extern "C" fn create_pipeline_state(
 
     let created = if !a.hComputeShader.pDrvPrivate.is_null() {
         // SAFETY: the runtime handed this handle in this call, so it is live.
-        let cs = unsafe { bytecode_of(a.hComputeShader, shaders::ShaderStage::Compute, root_signature_raw) };
+        let cs = unsafe {
+            bytecode_of(
+                a.hComputeShader,
+                shaders::ShaderStage::Compute,
+                root_signature_raw,
+            )
+        };
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             // SAFETY: `root_signature_com` is the slot's BORROWED reference;
             // `ManuallyDrop` is what stops the descriptor from releasing a
@@ -1801,31 +1810,59 @@ unsafe extern "C" fn create_pipeline_state(
             // SAFETY: every one of these handles was passed in this call and is
             // live for it.
             vs: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, unsafe {
-                bytecode_of(a.hVertexShader, shaders::ShaderStage::Vertex, root_signature_raw)
+                bytecode_of(
+                    a.hVertexShader,
+                    shaders::ShaderStage::Vertex,
+                    root_signature_raw,
+                )
             }),
             // SAFETY: as above.
             ps: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, unsafe {
-                bytecode_of(a.hPixelShader, shaders::ShaderStage::Pixel, root_signature_raw)
+                bytecode_of(
+                    a.hPixelShader,
+                    shaders::ShaderStage::Pixel,
+                    root_signature_raw,
+                )
             }),
             // SAFETY: as above.
             ds: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, unsafe {
-                bytecode_of(a.hDomainShader, shaders::ShaderStage::Domain, root_signature_raw)
+                bytecode_of(
+                    a.hDomainShader,
+                    shaders::ShaderStage::Domain,
+                    root_signature_raw,
+                )
             }),
             // SAFETY: as above.
             hs: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS, unsafe {
-                bytecode_of(a.hHullShader, shaders::ShaderStage::Hull, root_signature_raw)
+                bytecode_of(
+                    a.hHullShader,
+                    shaders::ShaderStage::Hull,
+                    root_signature_raw,
+                )
             }),
             // SAFETY: as above.
             gs: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, unsafe {
-                bytecode_of(a.hGeometryShader, shaders::ShaderStage::Geometry, root_signature_raw)
+                bytecode_of(
+                    a.hGeometryShader,
+                    shaders::ShaderStage::Geometry,
+                    root_signature_raw,
+                )
             }),
             // SAFETY: as above.
             amplification: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, unsafe {
-                bytecode_of(a.hAmplificationShader, shaders::ShaderStage::Amplification, root_signature_raw)
+                bytecode_of(
+                    a.hAmplificationShader,
+                    shaders::ShaderStage::Amplification,
+                    root_signature_raw,
+                )
             }),
             // SAFETY: as above.
             mesh: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, unsafe {
-                bytecode_of(a.hMeshShader, shaders::ShaderStage::Mesh, root_signature_raw)
+                bytecode_of(
+                    a.hMeshShader,
+                    shaders::ShaderStage::Mesh,
+                    root_signature_raw,
+                )
             }),
             blend: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             sample_mask: Sub::new(
@@ -1837,8 +1874,7 @@ unsafe extern "C" fn create_pipeline_state(
             input_layout: Sub::new(
                 D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT,
                 D3D12_INPUT_LAYOUT_DESC {
-                    pInputElementDescs: layout
-                        .map_or(core::ptr::null(), |l| l.elements.as_ptr()),
+                    pInputElementDescs: layout.map_or(core::ptr::null(), |l| l.elements.as_ptr()),
                     NumElements: layout.map_or(0, |l| l.elements.len() as u32),
                 },
             ),
@@ -2266,7 +2302,12 @@ unsafe extern "C" fn create_pipeline_library(
         // SAFETY: non-null per the check, and it is the word the paired
         // calc-size sized. Nulling it leaves a refused create with a clear
         // handle rather than stale garbage.
-        unsafe { core::ptr::write(h_library.pDrvPrivate.cast::<*mut c_void>(), core::ptr::null_mut()) };
+        unsafe {
+            core::ptr::write(
+                h_library.pDrvPrivate.cast::<*mut c_void>(),
+                core::ptr::null_mut(),
+            )
+        };
     }
     note_refusal(&L6_REFUSALS.pipeline_library_refused);
     helios_umd_common::hr::E_NOTIMPL

@@ -69,12 +69,10 @@ namespace helios_bridge {
 // checked-in generated artifact, bridge.rs.cc), so an exception escaping a
 // bridge method is std::terminate — dwm.exe dies instead of the DDI returning
 // a failure. Seven methods had no handler at all, and every one of them
-// reaches code that allocates (find_helios_icd_export ->
-// discover_vulkan_icd_manifests builds a std::vector<std::string>, runs
-// ifstream/ostringstream over the manifest and concatenates strings; the
-// now-retired present_flip_wait_setup additionally took a lock_guard,
-// make_shared and constructed a std::thread). Defect class: a recoverable
-// resource failure escalated to unconditional death of the compositor.
+// reaches code that allocates (DXVK resource construction and the surviving
+// snapshot/present bookkeeping both allocate STL/engine objects). Defect class:
+// a recoverable resource failure escalated to unconditional death of the
+// compositor.
 //
 // R1014(4): this is the ONLY catch triple in the D3D11 bridge. The other nine
 // were hand-written copies whose DxvkError arm built a std::string, which is

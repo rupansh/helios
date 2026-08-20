@@ -263,8 +263,7 @@ mod v {
         D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_D3D12_OPTIONS;
     pub(super) const CAPS_3DPIPELINESUPPORT: D3D12DDICAPS_TYPE =
         D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_3DPIPELINESUPPORT;
-    pub(super) const CAPS_GPUVA: D3D12DDICAPS_TYPE =
-        D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_GPUVA_CAPS;
+    pub(super) const CAPS_GPUVA: D3D12DDICAPS_TYPE = D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_GPUVA_CAPS;
     pub(super) const CAPS_TEXTURE_LAYOUT1: D3D12DDICAPS_TYPE =
         D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_TEXTURE_LAYOUT1;
     pub(super) const CAPS_SHADER_MODELS: D3D12DDICAPS_TYPE =
@@ -652,10 +651,13 @@ unsafe fn pipeline_support1(a: &ddi12::D3D12DDIARG_GETCAPS) -> Hresult {
         note_refusal(&UMD12_REFUSALS.caps_data_size_too_small);
         return E_INVALIDARG;
     }
-    let slot = a.pData.cast::<ddi12::D3D12DDI_3DPIPELINESUPPORT1_DATA_0081>();
+    let slot = a
+        .pData
+        .cast::<ddi12::D3D12DDI_3DPIPELINESUPPORT1_DATA_0081>();
     // SAFETY: non-null and at least `needed` writable bytes per the check above.
     // Read first, write second, and never `write_bytes` over it.
-    let runtime_max = unsafe { core::ptr::read_unaligned(slot) }.HighestRuntimeSupportedFeatureLevel;
+    let runtime_max =
+        unsafe { core::ptr::read_unaligned(slot) }.HighestRuntimeSupportedFeatureLevel;
     let answer = if DRIVER_MAX_FEATURE_LEVEL <= runtime_max {
         DRIVER_MAX_FEATURE_LEVEL
     } else {
@@ -1264,7 +1266,10 @@ unsafe fn shader_models(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
     // SAFETY: `pData` is non-null with at least `needed` readable bytes; the two
     // members are the caller's own pointers and are read, never overwritten.
     let slots = unsafe {
-        core::ptr::read_unaligned(a.pData.cast::<ddi12::D3D12DDI_D3D12_SHADER_MODELS_DATA_0011>())
+        core::ptr::read_unaligned(
+            a.pData
+                .cast::<ddi12::D3D12DDI_D3D12_SHADER_MODELS_DATA_0011>(),
+        )
     };
     if slots.pNumShaderModelsSupported.is_null() {
         note_refusal(&UMD12_REFUSALS.caps_bad_arg);
@@ -1279,10 +1284,7 @@ unsafe fn shader_models(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         log_error!("GetCaps SHADER_MODELS: count query -> {}", MODELS.len());
         // SAFETY: the count slot is non-null per the check above.
         unsafe {
-            core::ptr::write_unaligned(
-                slots.pNumShaderModelsSupported,
-                MODELS.len() as ddi12::UINT,
-            )
+            core::ptr::write_unaligned(slots.pNumShaderModelsSupported, MODELS.len() as ddi12::UINT)
         };
         return S_OK;
     }
@@ -1301,9 +1303,7 @@ unsafe fn shader_models(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         unsafe { core::ptr::write_unaligned(slots.pShaderModelsSupported.add(index), *model) };
     }
     // SAFETY: the count slot is non-null per the check above.
-    unsafe {
-        core::ptr::write_unaligned(slots.pNumShaderModelsSupported, written as ddi12::UINT)
-    };
+    unsafe { core::ptr::write_unaligned(slots.pNumShaderModelsSupported, written as ddi12::UINT) };
     log_error!("GetCaps SHADER_MODELS: capacity={capacity} -> wrote {written}");
     S_OK
 }
@@ -1406,10 +1406,7 @@ unsafe fn cpu_page_table_false_positives(
 ///
 /// # Safety
 /// As [`get_caps`].
-unsafe fn texture_layout_deprecated(
-    a: &ddi12::D3D12DDIARG_GETCAPS,
-    data_size: usize,
-) -> Hresult {
+unsafe fn texture_layout_deprecated(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresult {
     let caps = ddi12::D3D12DDI_TEXTURE_LAYOUT_CAPS {
         DeviceDependentLayoutCount: 0,
         DeviceDependentSwizzleCount: 0,
@@ -1508,7 +1505,8 @@ unsafe fn texture_layout_sets(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) 
     // alignment may be zero or non-power-of-two, and the depth pitch cannot be
     // aligned more strictly than the row pitch it is a multiple of.
     const _: () = assert!(SUB.PitchAlignment != 0 && SUB.PitchAlignment.is_power_of_two());
-    const _: () = assert!(SUB.BaseOffsetAlignment != 0 && SUB.BaseOffsetAlignment.is_power_of_two());
+    const _: () =
+        assert!(SUB.BaseOffsetAlignment != 0 && SUB.BaseOffsetAlignment.is_power_of_two());
     const _: () = assert!(
         SUB.DepthPitchAlignment != 0
             && SUB.DepthPitchAlignment.is_power_of_two()
@@ -1594,9 +1592,8 @@ unsafe fn umd_queue_priority(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -
 ///
 /// # What TRUE requires, and how this function knows
 ///
-/// [`native_gpu_fence_supported`] derives it. Today it reads FALSE and
-/// `CapsNativeFenceWithheld` counts every query, which is the loud form of "not
-/// yet".
+/// [`native_gpu_fence_supported`] derives it from the selected Core arm and the
+/// exact typed handlers installed in the device/queue tables.
 ///
 /// ⚠ **`pInfo` is documented as a `NodeIndex`-shaped input for several caps in
 /// this family; this one carries none** and it is not dereferenced. The struct
@@ -1633,22 +1630,25 @@ unsafe fn native_fence_support(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize)
 ///    `device12::create_device` refuses the negotiation outright and no device
 ///    exists to hold a fence.
 ///
-/// ⚠ **Necessary, not sufficient, and the gap is named.** Neither conjunct
-/// proves that `forward12::fence.rs` handles `NATIVE` / `OPENED_NATIVE`, stores
-/// the `HRTFENCE` and the local `hSyncObject`, and fails a `MONITORED` create
-/// (§10.6's Queue Wait/Signal contract, §12.1 steps 1-2), nor that the KMD
-/// exposes `DXGK_FEATURE_NATIVE_FENCE` and `DXGKQAITYPE_NATIVE_FENCE_CAPS`
-/// (§10.2's third and fourth admission rows — a *different component*, and this
-/// process cannot observe it). ⛔ The commit that makes this cap capable of
-/// answering TRUE is the commit that lands the fence DDI, and it must extend
-/// this function with the third conjunct rather than delete the first two.
+/// 3. **The exact typed Core-0116 create and command-queue wait/signal handlers
+///    must be the values installed into those tables.** The owning modules
+///    export the same `Option<fn>` constants their installers consume, so this
+///    is derived wiring rather than a parallel feature switch.
+///
+/// The KMD's `DXGK_FEATURE_NATIVE_FENCE` and native-fence caps remain a package
+/// admission condition outside this process; this UMD cap cannot observe or
+/// replace that KMD negotiation.
 ///
 /// ⚠ Adapter-scoped, like every other answer in this file: `pfnGetCaps` runs
 /// before any device exists, so this reads the process-wide knob arm and never
 /// a `HeliosD3D12Device`.
 fn native_gpu_fence_supported() -> bool {
     let arm = crate::adapter12::Ddi12Interface::selected();
-    matches!(arm, crate::adapter12::Ddi12Interface::R8_0116) && arm.tables_implemented()
+    matches!(arm, crate::adapter12::Ddi12Interface::R8_0116)
+        && arm.tables_implemented()
+        && crate::forward12::fence::NATIVE_FENCE_CREATE_HANDLER.is_some()
+        && crate::forward12::queue::NATIVE_FENCE_SIGNAL_HANDLER.is_some()
+        && crate::forward12::queue::NATIVE_FENCE_WAIT_HANDLER.is_some()
 }
 
 /// `1088 OPTIONS_0110` — ⛔ **the zero-fill default writes an out-of-range
@@ -1819,15 +1819,14 @@ unsafe fn options_0102(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hres
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS,
     D3D12_FEATURE_FORMAT_SUPPORT, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, D3D12_FORMAT_SUPPORT1,
-    D3D12_FORMAT_SUPPORT1_BLENDABLE, D3D12_FORMAT_SUPPORT1_BUFFER, D3D12_FORMAT_SUPPORT1_DISPLAY,
+    D3D12_FORMAT_SUPPORT1_BLENDABLE, D3D12_FORMAT_SUPPORT1_BUFFER,
+    D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL, D3D12_FORMAT_SUPPORT1_DISPLAY,
     D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER, D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD,
-    D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL, D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET,
-    D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+    D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET, D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
     D3D12_FORMAT_SUPPORT1_SHADER_GATHER, D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE,
     D3D12_FORMAT_SUPPORT2, D3D12_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP,
-    D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD,
-    D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE,
-    D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS,
+    D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD, D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE,
+    D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE, D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 
@@ -1893,8 +1892,14 @@ mod fs {
 /// `D32_FLOAT_S8X24_UINT` answers `MULTISAMPLE_RENDERTARGET` alone — and the
 /// runtime already knows which formats are depth formats without asking.
 const SUPPORT1_TO_DDI: &[(u32, u32)] = &[
-    (D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE.0 as u32, fs::SHADER_SAMPLE),
-    (D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32, fs::RENDERTARGET),
+    (
+        D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE.0 as u32,
+        fs::SHADER_SAMPLE,
+    ),
+    (
+        D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32,
+        fs::RENDERTARGET,
+    ),
     (D3D12_FORMAT_SUPPORT1_BLENDABLE.0 as u32, fs::BLENDABLE),
     (
         D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET.0 as u32,
@@ -1909,7 +1914,10 @@ const SUPPORT1_TO_DDI: &[(u32, u32)] = &[
         fs::VERTEX_BUFFER,
     ),
     (D3D12_FORMAT_SUPPORT1_BUFFER.0 as u32, fs::BUFFER),
-    (D3D12_FORMAT_SUPPORT1_SHADER_GATHER.0 as u32, fs::SHADER_GATHER),
+    (
+        D3D12_FORMAT_SUPPORT1_SHADER_GATHER.0 as u32,
+        fs::SHADER_GATHER,
+    ),
     // ⚠ Scan-out capability, and the one bit here that another Helios component
     // has to back. The KMD owns a real VidPn source and sends DWM's shared
     // primary through `SET_SCANOUT_BLOB`, so the capability exists; the engine's
@@ -1920,7 +1928,10 @@ const SUPPORT1_TO_DDI: &[(u32, u32)] = &[
 
 /// The engine's `D3D12_FORMAT_SUPPORT2` bit -> this DDI's bit.
 const SUPPORT2_TO_DDI: &[(u32, u32)] = &[
-    (D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 as u32, fs::UAV_WRITES),
+    (
+        D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 as u32,
+        fs::UAV_WRITES,
+    ),
     // ⚠ Additionally narrowed by [`FL11_TYPED_UAV_LOAD_FORMATS`] when
     // [`TYPED_UAV_LOAD_ADDITIONAL_FORMATS`] is FALSE. It is TRUE now, so the
     // narrowing falls away by construction and this is a plain forward.
@@ -2059,7 +2070,10 @@ fn translate(pairs: &[(u32, u32)], src: u32) -> u32 {
 
 /// Ask the engine what it supports for one format. `None` when there is no
 /// engine to ask or it refused; both are counted.
-fn engine_format_support(dev: &HeliosD3D12Device, format: ddi12::DXGI_FORMAT) -> Option<(u32, u32)> {
+fn engine_format_support(
+    dev: &HeliosD3D12Device,
+    format: ddi12::DXGI_FORMAT,
+) -> Option<(u32, u32)> {
     let Some(engine) = dev.engine.d3d12_device() else {
         // Unreachable by construction — `helios_vkd3d_bridge_create_device`
         // returns a null `unique_ptr` rather than an empty one on every failure
@@ -2499,7 +2513,8 @@ unsafe extern "C" fn check_multisample_quality_levels(
         );
     }
     // SAFETY: as above.
-    unsafe { core::ptr::write_unaligned(num_quality_levels, levels) };}
+    unsafe { core::ptr::write_unaligned(num_quality_levels, levels) };
+}
 
 /// Ask the engine how many quality levels one (format, sample count, flags)
 /// triple has. `None` when there is no engine or it refused; both are counted.

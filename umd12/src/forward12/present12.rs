@@ -85,7 +85,7 @@ use windows::core::Interface;
 
 use super::tables12::{stage, Filling};
 use super::tables12::{CommandListTable, DeviceCoreTable};
-use super::{identity12, queue, resource12};
+use super::{queue, resource12};
 use crate::{ddi12, log_error, note_refusal};
 
 /// How many times any one bounded evidence line may repeat, per site.
@@ -280,7 +280,7 @@ unsafe extern "C" fn present(
         note_refusal(&L8_REFUSALS.present_source_unresolved);
         return;
     };
-    let Some(identity) = identity12::lookup(engine.as_raw() as usize) else {
+    let Some(identity) = (unsafe { resource12::allocation_identity(surface.hSurface) }) else {
         // ⛔ The back buffer has no WDDM allocation, so there is nothing to present.
         // Distinct from `PresentSourceUnresolved`: the resource IS this driver's, and
         // its create did not reach `identity12::record` — which means

@@ -18,7 +18,15 @@ use crate::bridge;
 use crate::ddi;
 use crate::log_error;
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use helios_protocol::{
+    HeliosSyncProgressJoinV1, HeliosSyncProgressResultV1, HeliosTranslatorScope,
+    HeliosTranslatorStatus, HeliosTranslatorStatusCode, HELIOS_ENGINE_CLASS_GRAPHICS,
+    HELIOS_HOB1_ACCESS_WRITE, HELIOS_HOB1_MAX_BYTES, HELIOS_HQA1_FLAG_D3D11_PHYSICAL,
+    HELIOS_HVC1_ALLOCATION_LIST_ENTRIES, HELIOS_HVC1_PATCH_LOCATION_ENTRIES,
+    HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION, HELIOS_TRANSLATOR_PROGRESS_FLAG_DEVICE_LOST,
+    HELIOS_TRANSLATOR_SYNC_PROGRESS_RESULT_BYTES,
+};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use windows::core::{IUnknown, Interface};
 
 /// One cached dcomp-vehicle present source (road 4): an alias-imported D3D11
@@ -164,6 +172,103 @@ pub struct RuntimeContext {
     pub command: core::cell::Cell<Option<Window<c_void>>>,
     pub allocations: core::cell::Cell<Option<Window<ddi::D3DDDI_ALLOCATIONLIST>>>,
     pub patches: core::cell::Cell<Option<Window<ddi::D3DDDI_PATCHLOCATIONLIST>>>,
+    /// A5/HQA1 identity of this exact runtime context.
+    pub context_generation: u64,
+    pub endpoint_id: u32,
+    pub context_flags: u32,
+    /// The context-private HQC1 monitored fence and its read-only CPU mapping.
+    pub hqc1: core::num::NonZeroU32,
+    pub hqc1_cpu: core::ptr::NonNull<u64>,
+    /// Strictly increasing values issued only after an accepted outer batch.
+    pub next_progress: AtomicU64,
+    pub last_submitted_progress: AtomicU64,
+    pub last_batch_id: AtomicU64,
+    /// Serializes the runtime-owned command/allocation windows and Render.
+    pub render_lock: std::sync::Mutex<()>,
+    /// One scope owned by the current DXVK outer operation. A join takes,
+    /// seals, closes, and replaces it without TLS or a global registry.
+    pub active_scope: std::sync::Mutex<Option<HeliosTranslatorScope>>,
+}
+
+/// The complete outer submission object. It is boxed before HQA1 creation so
+/// the address attached to A5 and published to DXVK remains stable until
+/// direct rundown. No process-global lookup participates in either direction.
+pub struct OuterDevice {
+    pub translator: helios_umd_common::direct_translator::DirectTranslator,
+    pub context: Option<RuntimeContext>,
+    pub allocations: std::sync::Mutex<OuterAllocationSet>,
+    pub h_rt_device: ddi::HANDLE,
+    pub kt_callbacks: *const ddi::D3DDDI_DEVICECALLBACKS,
+    pub paging_queue: Option<RuntimePagingQueue>,
+    pub device_lost: AtomicU32,
+}
+
+const VK_SUCCESS: i32 = 0;
+const VK_ERROR_DEVICE_LOST: i32 = -4;
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateEventW(
+        security_attributes: *mut c_void,
+        manual_reset: i32,
+        initial_state: i32,
+        name: *const u16,
+    ) -> *mut c_void;
+    fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+    fn CloseHandle(handle: *mut c_void) -> i32;
+}
+
+const WAIT_OBJECT_0: u32 = 0;
+const INFINITE: u32 = u32::MAX;
+const E_PENDING: i32 = 0x8000_000Au32 as i32;
+
+/// A5 host callbacks dereference only the boxed object that was attached to
+/// this exact context. The context generation is checked before any wait or
+/// down-call; there is no lookup, TLS identity, or process-global state.
+pub(crate) extern "C" fn translator_sync_progress_join(
+    host_context_cookie: *mut c_void,
+    request: *const HeliosSyncProgressJoinV1,
+    out_result: *mut HeliosSyncProgressResultV1,
+) -> HeliosTranslatorStatusCode {
+    if host_context_cookie.is_null() || request.is_null() || out_result.is_null() {
+        return HeliosTranslatorStatus::NullArgument as HeliosTranslatorStatusCode;
+    }
+    // SAFETY: A5 owns an attachment reference until detach returns. The cookie
+    // is the stable Box<OuterDevice> address supplied by create_runtime_context.
+    let outer = unsafe { &*(host_context_cookie as *const OuterDevice) };
+    let Some(context) = outer.context.as_ref() else {
+        return HeliosTranslatorStatus::UnknownContext as HeliosTranslatorStatusCode;
+    };
+    let request = unsafe { &*request };
+    if let Err(status) = request.validate(context.context_generation) {
+        return status as HeliosTranslatorStatusCode;
+    }
+    match unsafe { join_outer_progress(outer, request.required_progress_value) } {
+        Ok(result) => {
+            unsafe { out_result.write(result) };
+            HeliosTranslatorStatus::Ok as HeliosTranslatorStatusCode
+        }
+        Err(status) => status as HeliosTranslatorStatusCode,
+    }
+}
+
+pub(crate) extern "C" fn translator_sync_progress_query(
+    host_context_cookie: *mut c_void,
+    context_generation: u64,
+    out_result: *mut HeliosSyncProgressResultV1,
+) -> HeliosTranslatorStatusCode {
+    if host_context_cookie.is_null() || out_result.is_null() {
+        return HeliosTranslatorStatus::NullArgument as HeliosTranslatorStatusCode;
+    }
+    let outer = unsafe { &*(host_context_cookie as *const OuterDevice) };
+    let Some(context) = outer.context.as_ref() else {
+        return HeliosTranslatorStatus::UnknownContext as HeliosTranslatorStatusCode;
+    };
+    if context_generation == 0 || context_generation != context.context_generation {
+        return HeliosTranslatorStatus::UnknownContext as HeliosTranslatorStatusCode;
+    }
+    unsafe { out_result.write(progress_result(outer, context)) };
+    HeliosTranslatorStatus::Ok as HeliosTranslatorStatusCode
 }
 
 /// Every COM object this device holds that came OUT of the bridge.
@@ -324,6 +429,37 @@ pub const HELIOS_TAG_DEFERRED: usize = 0x4845_4C49_4F44_4643; // "HELIODFC"
 /// down through a DC pointer, or vice versa).
 pub static DEVICE_TAG_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 
+pub(crate) const HELIOS_MAX_LIVE_OUTER_ALLOCATIONS: usize = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OuterAllocationState {
+    pub token: u64,
+    pub allocation: u32,
+    pub allocation_generation: u64,
+    pub bytes: u64,
+}
+
+/// Bounded ownership of the exact live WDDM allocations for one A5 device
+/// generation. Tokens only move forward; removing an entry never makes its
+/// token available again.
+pub struct OuterAllocationSet {
+    pub(crate) next_token: u64,
+    pub(crate) entries: Vec<OuterAllocationState>,
+    pub(crate) internal_owned: Vec<crate::forward::InternalOuterAllocation>,
+    pub(crate) pending_teardown: Vec<crate::forward::PendingOuterAllocationTeardown>,
+}
+
+impl OuterAllocationSet {
+    pub(crate) fn new() -> Self {
+        Self {
+            next_token: 1,
+            entries: Vec::new(),
+            internal_owned: Vec::new(),
+            pending_teardown: Vec::new(),
+        }
+    }
+}
+
 /// Bump the mismatch counter and log its first hits.
 pub(crate) fn note_device_tag_mismatch(site: &str, tag: usize) {
     let n = DEVICE_TAG_MISMATCH.fetch_add(1, Ordering::Relaxed);
@@ -353,16 +489,12 @@ pub struct HeliosDevice {
     /// the explicit `release()` both exist.
     pub owned: BridgeOwned,
     pub dxvk: bridge::BridgeDevice,
+    /// Owns the sole A5 VkInstance, its attached runtime context/HQC1, and the
+    /// exact allocation-token set. It follows DXVK in declaration/drop order
+    /// so no queue callback can outlive this stable boxed cookie.
+    pub outer: Box<OuterDevice>,
     pub h_rt_device: ddi::HANDLE,
-    /// The kernel context and its buffer windows, validated at construction.
-    /// `None` until `create_runtime_context` succeeds -- and CreateDevice now
-    /// refuses a device that never gets one, so a live device always has it.
-    pub context: Option<RuntimeContext>,
     pub kt_callbacks: *const ddi::D3DDDI_DEVICECALLBACKS,
-    /// Created once with pfnCreatePagingQueueCb. WDDM 2.x residency is an
-    /// explicit per-device list; allocation/patch lists do not make resources
-    /// resident.
-    pub paging_queue: Option<RuntimePagingQueue>,
     pub dxgi_callbacks: *mut ddi::DXGI_DDI_BASE_CALLBACKS,
     /// Exact pPrimaryDesc allocation identity -> Venus scanout metadata.
     /// DXGI can present a stable resource object while rotating its allocation
@@ -672,6 +804,7 @@ pub(crate) use helios_umd_common::noop::log_backtrace;
 static DEVICE_NOOP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DXGI_NOOP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WDDM13_TABLE_AUDIT_COUNT: AtomicUsize = AtomicUsize::new(0);
+static WDDM21_TABLE_AUDIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DXGI13_TABLE_AUDIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// No-op DDI stub: returns 0 (S_OK for HRESULT funcs; ignored for void funcs).
@@ -770,6 +903,13 @@ unsafe extern "C" fn ddi_relocate_device_funcs_wddm1_3(
     relocate_log("WDDM1.3");
 }
 
+unsafe extern "C" fn ddi_relocate_device_funcs_wddm2_1(
+    _h_device: ddi::D3D10DDI_HDEVICE,
+    _funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS,
+) {
+    relocate_log("WDDM2.1");
+}
+
 unsafe fn audit_wddm1_3_device_funcs(tag: &str, funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS) {
     let hit = WDDM13_TABLE_AUDIT_COUNT.fetch_add(1, Ordering::Relaxed);
     if hit >= 32 || !crate::trace_enabled() {
@@ -836,6 +976,40 @@ unsafe fn audit_wddm1_3_device_funcs(tag: &str, funcs: *mut ddi::D3DWDDM1_3DDI_D
         calc_slots,
         null_slots
     );
+}
+
+unsafe fn audit_wddm2_1_device_funcs(tag: &str, funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS) {
+    const EXPECTED_SLOTS: usize = 170;
+    const _: () = assert!(
+        core::mem::size_of::<ddi::D3DWDDM2_1DDI_DEVICEFUNCS>()
+            == EXPECTED_SLOTS * core::mem::size_of::<usize>()
+    );
+    let hit = WDDM21_TABLE_AUDIT_COUNT.fetch_add(1, Ordering::Relaxed);
+    if hit >= 32 || !crate::trace_enabled() {
+        return;
+    }
+    let slots = funcs as *const usize;
+    log_error!(
+        "{tag}: WDDM2.1 funcs table={funcs:p} slots={EXPECTED_SLOTS} audit={}",
+        hit + 1
+    );
+    const TAIL_NAMES: [&str; 6] = [
+        "SetHardwareProtection",
+        "GetResourceLayout",
+        "RetrieveShaderComment",
+        "SetHardwareProtectionState",
+        "AcquireResource",
+        "ReleaseResource",
+    ];
+    let noop = ddi_noop_device as UniformFn as usize;
+    for (offset, name) in TAIL_NAMES.iter().enumerate() {
+        let index = 164 + offset;
+        let value = *slots.add(index);
+        log_error!("{tag}: WDDM2.1 slot[{index:03}] {name}=0x{value:016x}");
+        if value == 0 || value == noop {
+            log_error!("{tag}: WDDM2.1 tail refusal: {name} is not typed");
+        }
+    }
 }
 
 unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE_FUNCTIONS) {
@@ -960,6 +1134,7 @@ pub(crate) unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVI
             variants,
             layouts
         );
+        dev.dxvk.shutdown();
         destroy_runtime_objects(dev);
         core::ptr::drop_in_place(h_device.pDrvPrivate as *mut HeliosDevice);
         // D4a scanout acquire, the tail of the §5.3 teardown order. The
@@ -976,13 +1151,18 @@ pub(crate) unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVI
 /// callback table are still valid. This is shared by normal DestroyDevice and
 /// the CreateDevice rollback path.
 pub unsafe fn destroy_runtime_objects(dev: &mut HeliosDevice) {
-    if !dev.kt_callbacks.is_null() {
-        if let Some(queue) = dev.paging_queue.take() {
-            if let Some(destroy_queue_cb) = (*dev.kt_callbacks).pfnDestroyPagingQueueCb {
+    destroy_outer_runtime_context(&mut dev.outer);
+    destroy_runtime_paging_queue(&mut dev.outer);
+}
+
+pub unsafe fn destroy_runtime_paging_queue(outer: &mut OuterDevice) {
+    if !outer.kt_callbacks.is_null() {
+        if let Some(queue) = outer.paging_queue.take() {
+            if let Some(destroy_queue_cb) = (*outer.kt_callbacks).pfnDestroyPagingQueueCb {
                 let arg = ddi::D3DDDI_DESTROYPAGINGQUEUE {
                     hPagingQueue: queue.handle.get(),
                 };
-                let hr = destroy_queue_cb(dev.h_rt_device, &arg);
+                let hr = destroy_queue_cb(outer.h_rt_device, &arg);
                 log_error!(
                     "DDI DestroyDevice: DestroyPagingQueue hQueue=0x{:x} hr=0x{:08x}",
                     queue.handle.get(),
@@ -990,19 +1170,60 @@ pub unsafe fn destroy_runtime_objects(dev: &mut HeliosDevice) {
                 );
             }
         }
+    }
+}
 
-        if let Some(ctx) = dev.context.take() {
-            if let Some(destroy_context_cb) = (*dev.kt_callbacks).pfnDestroyContextCb {
-                let arg = ddi::D3DDDICB_DESTROYCONTEXT {
-                    hContext: ctx.handle.as_ptr(),
-                };
-                let hr = destroy_context_cb(dev.h_rt_device, &arg);
-                log_error!(
-                    "DDI DestroyDevice: DestroyContext hContext={:p} hr=0x{:08x}",
-                    ctx.handle.as_ptr(),
-                    hr as u32
-                );
-            }
+/// Detach A5 before destroying HQC1 and the exact runtime context. This helper
+/// also services construction rollback, where no HeliosDevice exists yet.
+pub unsafe fn destroy_outer_runtime_context(outer: &mut OuterDevice) {
+    let Some(context) = outer.context.take() else {
+        return;
+    };
+
+    if let Some(scope) = crate::forward::lock_ignore_poison(&context.active_scope).take() {
+        let result = outer.translator.close_outer_scope(scope, None);
+        log_error!("DDI outer teardown: abandoned live scope result={result:?}");
+    }
+    let (pending_teardown, live_allocations) =
+        crate::forward::drain_outer_allocation_teardown(outer);
+    if pending_teardown != 0 || live_allocations != 0 {
+        outer.device_lost.store(1, Ordering::Release);
+        log_error!(
+            "DDI outer teardown: forced allocation rundown pending={} live={}",
+            pending_teardown,
+            live_allocations
+        );
+    }
+    let detach = outer
+        .translator
+        .detach_outer_context(context.context_generation);
+    log_error!(
+        "DDI outer teardown: detach generation={} result={detach:?}",
+        context.context_generation
+    );
+
+    if !outer.kt_callbacks.is_null() {
+        if let Some(destroy_sync_cb) = (*outer.kt_callbacks).pfnDestroySynchronizationObjectCb {
+            let arg = ddi::D3DDDICB_DESTROYSYNCHRONIZATIONOBJECT {
+                hSyncObject: context.hqc1.get(),
+            };
+            let hr = destroy_sync_cb(outer.h_rt_device, &arg);
+            log_error!(
+                "DDI outer teardown: DestroySynchronizationObject hSync=0x{:x} hr=0x{:08x}",
+                context.hqc1.get(),
+                hr as u32
+            );
+        }
+        if let Some(destroy_context_cb) = (*outer.kt_callbacks).pfnDestroyContextCb {
+            let arg = ddi::D3DDDICB_DESTROYCONTEXT {
+                hContext: context.handle.as_ptr(),
+            };
+            let hr = destroy_context_cb(outer.h_rt_device, &arg);
+            log_error!(
+                "DDI outer teardown: DestroyContext hContext={:p} hr=0x{:08x}",
+                context.handle.as_ptr(),
+                hr as u32
+            );
         }
     }
 }
@@ -1011,22 +1232,68 @@ pub unsafe fn destroy_runtime_objects(dev: &mut HeliosDevice) {
 /// HRESULT: a context-less device is not a usable device — its presents run the
 /// GPU copy and the flush, report S_OK to DXGI and never call `pfnPresentCb`,
 /// so the swapchain token is never minted and DXGI never falls back.
-pub unsafe fn create_runtime_context(dev: &mut HeliosDevice) -> i32 {
+pub unsafe fn create_runtime_context(outer: &mut OuterDevice) -> i32 {
     use crate::hr::E_FAIL;
 
-    if dev.kt_callbacks.is_null() {
+    if outer.kt_callbacks.is_null() {
         log_error!("CreateDevice: no KT callbacks for CreateContext");
         return E_FAIL;
     }
-    let Some(create_context_cb) = (*dev.kt_callbacks).pfnCreateContextCb else {
+    let callbacks = &*outer.kt_callbacks;
+    let Some(create_context_cb) = callbacks.pfnCreateContextCb else {
         log_error!("CreateDevice: pfnCreateContextCb missing");
         return E_FAIL;
+    };
+    let Some(create_sync_cb) = callbacks.pfnCreateSynchronizationObject2Cb else {
+        log_error!("CreateDevice: pfnCreateSynchronizationObject2Cb missing");
+        return E_FAIL;
+    };
+    if callbacks.pfnDestroyContextCb.is_none()
+        || callbacks.pfnDestroySynchronizationObjectCb.is_none()
+        || callbacks.pfnRenderCb.is_none()
+        || callbacks.pfnSignalSynchronizationObjectFromGpuCb.is_none()
+        || callbacks.pfnWaitForSynchronizationObjectFromCpuCb.is_none()
+    {
+        log_error!("CreateDevice: complete Render/HQC1 callback set missing");
+        return E_FAIL;
+    }
+
+    let endpoints = match outer.translator.endpoints() {
+        Ok(endpoints) => endpoints,
+        Err(error) => {
+            log_error!("CreateDevice: A5 endpoint enumeration refused: {error:?}");
+            return E_FAIL;
+        }
+    };
+    let Some(endpoint) = endpoints.into_iter().find(|endpoint| {
+        endpoint
+            .validate(outer.translator.endpoint_capacity())
+            .is_ok()
+            && endpoint.engine_class == HELIOS_ENGINE_CLASS_GRAPHICS
+    }) else {
+        log_error!("CreateDevice: A5 has no validated graphics endpoint");
+        return E_FAIL;
+    };
+    let context_generation = 1u64;
+    let attach = match outer.translator.build_queue_attach(
+        context_generation,
+        endpoint.endpoint_id,
+        HELIOS_ENGINE_CLASS_GRAPHICS,
+        HELIOS_HQA1_FLAG_D3D11_PHYSICAL,
+    ) {
+        Ok(attach) => attach,
+        Err(error) => {
+            log_error!("CreateDevice: A5 HQA1 build refused: {error:?}");
+            return E_FAIL;
+        }
     };
 
     let mut arg = ddi::D3DDDICB_CREATECONTEXT::default();
     arg.NodeOrdinal = 0;
     arg.EngineAffinity = 0;
-    let hr = create_context_cb(dev.h_rt_device, &mut arg);
+    arg.pPrivateDriverData = (&attach as *const _ as *mut c_void).cast();
+    arg.PrivateDriverDataSize = core::mem::size_of_val(&attach) as u32;
+    let hr = create_context_cb(outer.h_rt_device, &mut arg);
     log_error!(
         "CreateDevice: CreateContext hr=0x{:08x} hContext={:p} cmd={:p}/{} allocList={:p}/{} patchList={:p}/{}",
         hr as u32,
@@ -1048,32 +1315,715 @@ pub unsafe fn create_runtime_context(dev: &mut HeliosDevice) -> i32 {
         log_error!("CreateDevice: CreateContext returned S_OK with a null hContext");
         return E_FAIL;
     };
-    dev.context = Some(RuntimeContext {
-        handle,
-        command: core::cell::Cell::new(Window::new(arg.pCommandBuffer, arg.CommandBufferSize)),
-        allocations: core::cell::Cell::new(Window::new(
-            arg.pAllocationList,
+    let command = Window::new(arg.pCommandBuffer, arg.CommandBufferSize);
+    let allocations = Window::new(arg.pAllocationList, arg.AllocationListSize);
+    let patches = Window::new(arg.pPatchLocationList, arg.PatchLocationListSize);
+    if command.is_none()
+        || allocations.is_none()
+        || patches.is_none()
+        || arg.CommandBufferSize < HELIOS_HOB1_MAX_BYTES as u32
+        || arg.AllocationListSize < HELIOS_HVC1_ALLOCATION_LIST_ENTRIES
+        || arg.PatchLocationListSize < HELIOS_HVC1_PATCH_LOCATION_ENTRIES
+    {
+        log_error!(
+            "CreateDevice: HOB1 windows below package minimum cmd={} alloc={} patch={}",
+            arg.CommandBufferSize,
             arg.AllocationListSize,
-        )),
-        patches: core::cell::Cell::new(Window::new(
-            arg.pPatchLocationList,
-            arg.PatchLocationListSize,
-        )),
+            arg.PatchLocationListSize
+        );
+        if let Some(destroy_context_cb) = callbacks.pfnDestroyContextCb {
+            let destroy = ddi::D3DDDICB_DESTROYCONTEXT {
+                hContext: handle.as_ptr(),
+            };
+            let _ = destroy_context_cb(outer.h_rt_device, &destroy);
+        }
+        return E_FAIL;
+    }
+
+    let mut sync = ddi::D3DDDICB_CREATESYNCHRONIZATIONOBJECT2::default();
+    sync.Info.Type = ddi::_D3DDDI_SYNCHRONIZATIONOBJECT_TYPE_D3DDDI_MONITORED_FENCE;
+    sync.Info.Flags.__bindgen_anon_1.Value = (1 << 6) | (1 << 7);
+    sync.Info.__bindgen_anon_1.MonitoredFence = Default::default();
+    sync.Info.__bindgen_anon_1.MonitoredFence.InitialFenceValue = 0;
+    sync.Info.__bindgen_anon_1.MonitoredFence.EngineAffinity = 1;
+    let sync_hr = create_sync_cb(outer.h_rt_device, &mut sync);
+    let hqc1 = core::num::NonZeroU32::new(sync.hSyncObject);
+    let hqc1_cpu = core::ptr::NonNull::new(
+        sync.Info
+            .__bindgen_anon_1
+            .MonitoredFence
+            .FenceValueCPUVirtualAddress
+            .cast::<u64>(),
+    );
+    let (Some(hqc1), Some(hqc1_cpu)) = (hqc1, hqc1_cpu) else {
+        log_error!(
+            "CreateDevice: HQC1 creation refused hr=0x{:08x} hSync=0x{:x} cpu={:p}",
+            sync_hr as u32,
+            sync.hSyncObject,
+            sync.Info
+                .__bindgen_anon_1
+                .MonitoredFence
+                .FenceValueCPUVirtualAddress
+        );
+        if sync.hSyncObject != 0 {
+            if let Some(destroy_sync_cb) = callbacks.pfnDestroySynchronizationObjectCb {
+                let destroy = ddi::D3DDDICB_DESTROYSYNCHRONIZATIONOBJECT {
+                    hSyncObject: sync.hSyncObject,
+                };
+                let _ = destroy_sync_cb(outer.h_rt_device, &destroy);
+            }
+        }
+        if let Some(destroy_context_cb) = callbacks.pfnDestroyContextCb {
+            let destroy = ddi::D3DDDICB_DESTROYCONTEXT {
+                hContext: handle.as_ptr(),
+            };
+            let _ = destroy_context_cb(outer.h_rt_device, &destroy);
+        }
+        return if sync_hr != 0 { sync_hr } else { E_FAIL };
+    };
+    if sync_hr != 0 {
+        log_error!(
+            "CreateDevice: HQC1 creation returned failure with handles hr=0x{:08x} hSync=0x{:x}",
+            sync_hr as u32,
+            sync.hSyncObject
+        );
+        if let Some(destroy_sync_cb) = callbacks.pfnDestroySynchronizationObjectCb {
+            let destroy = ddi::D3DDDICB_DESTROYSYNCHRONIZATIONOBJECT {
+                hSyncObject: sync.hSyncObject,
+            };
+            let _ = destroy_sync_cb(outer.h_rt_device, &destroy);
+        }
+        if let Some(destroy_context_cb) = callbacks.pfnDestroyContextCb {
+            let destroy = ddi::D3DDDICB_DESTROYCONTEXT {
+                hContext: handle.as_ptr(),
+            };
+            let _ = destroy_context_cb(outer.h_rt_device, &destroy);
+        }
+        return sync_hr;
+    }
+
+    outer.context = Some(RuntimeContext {
+        handle,
+        command: core::cell::Cell::new(command),
+        allocations: core::cell::Cell::new(allocations),
+        patches: core::cell::Cell::new(patches),
+        context_generation,
+        endpoint_id: endpoint.endpoint_id,
+        context_flags: HELIOS_HQA1_FLAG_D3D11_PHYSICAL,
+        hqc1,
+        hqc1_cpu,
+        next_progress: AtomicU64::new(1),
+        last_submitted_progress: AtomicU64::new(0),
+        last_batch_id: AtomicU64::new(0),
+        render_lock: std::sync::Mutex::new(()),
+        active_scope: std::sync::Mutex::new(None),
     });
+    let cookie = outer as *mut OuterDevice as *mut c_void;
+    if let Err(error) = outer.translator.attach_outer_context(
+        context_generation,
+        endpoint.endpoint_id,
+        HELIOS_HQA1_FLAG_D3D11_PHYSICAL,
+        cookie,
+    ) {
+        log_error!("CreateDevice: A5 outer-context attach refused: {error:?}");
+        destroy_outer_runtime_context(outer);
+        return E_FAIL;
+    }
+    log_error!(
+        "CreateDevice: A5 HQA1 attached generation={} endpoint={} HQC1=0x{:x}",
+        context_generation,
+        endpoint.endpoint_id,
+        hqc1.get()
+    );
     0
+}
+
+fn direct_error_status(
+    error: helios_umd_common::direct_translator::DirectTranslatorError,
+) -> HeliosTranslatorStatus {
+    match error {
+        helios_umd_common::direct_translator::DirectTranslatorError::Refused(status) => status,
+        _ => HeliosTranslatorStatus::HostCallbackFailed,
+    }
+}
+
+fn progress_result(outer: &OuterDevice, context: &RuntimeContext) -> HeliosSyncProgressResultV1 {
+    let last = context.last_submitted_progress.load(Ordering::Acquire);
+    // SAFETY: HQC1 construction proved the runtime mapping non-null and detach
+    // cannot run until A5 has released the callback reference.
+    let completed = unsafe { context.hqc1_cpu.as_ptr().read_volatile() }.min(last);
+    HeliosSyncProgressResultV1 {
+        struct_bytes: HELIOS_TRANSLATOR_SYNC_PROGRESS_RESULT_BYTES,
+        abi_version: HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION,
+        completed_progress_value: completed,
+        last_submitted_progress_value: last,
+        flags: if outer.device_lost.load(Ordering::Acquire) != 0 {
+            HELIOS_TRANSLATOR_PROGRESS_FLAG_DEVICE_LOST
+        } else {
+            0
+        },
+        reserved: 0,
+    }
+}
+
+fn mark_outer_lost(outer: &OuterDevice, site: &str) {
+    if outer.device_lost.swap(1, Ordering::AcqRel) == 0 {
+        log_error!("A7 D3D11 outer device lost at {site}");
+    }
+}
+
+/// Publish one FromGpu signal after every accepted HOB1, or an explicit join
+/// against an empty context. The render mutex is the context's single writer
+/// serialization; callers release it before any event-backed CPU wait.
+unsafe fn signal_hqc1_locked(
+    outer: &OuterDevice,
+    context: &RuntimeContext,
+) -> Result<u64, HeliosTranslatorStatus> {
+    if outer.device_lost.load(Ordering::Acquire) != 0 || outer.kt_callbacks.is_null() {
+        return Err(HeliosTranslatorStatus::DeviceLost);
+    }
+    let progress = context.next_progress.load(Ordering::Acquire);
+    if progress == 0 || progress == u64::MAX {
+        mark_outer_lost(outer, "HQC1 progress overflow");
+        return Err(HeliosTranslatorStatus::DeviceLost);
+    }
+    let Some(signal_cb) = (*outer.kt_callbacks).pfnSignalSynchronizationObjectFromGpuCb else {
+        mark_outer_lost(outer, "missing FromGpu signal callback");
+        return Err(HeliosTranslatorStatus::DeviceLost);
+    };
+    let sync = context.hqc1.get();
+    let mut signal = ddi::D3DDDICB_SIGNALSYNCHRONIZATIONOBJECTFROMGPU::default();
+    signal.hContext = context.handle.as_ptr();
+    signal.ObjectCount = 1;
+    signal.ObjectHandleArray = &sync;
+    signal.__bindgen_anon_1.MonitoredFenceValueArray = &progress;
+    let hr = signal_cb(outer.h_rt_device, &signal);
+    if hr != 0 {
+        log_error!(
+            "A7 D3D11 HQC1 FromGpu signal failed value={} hr=0x{:08x}",
+            progress,
+            hr as u32
+        );
+        mark_outer_lost(outer, "HQC1 FromGpu signal");
+        return Err(HeliosTranslatorStatus::DeviceLost);
+    }
+    context
+        .last_submitted_progress
+        .store(progress, Ordering::Release);
+    context.next_progress.store(progress + 1, Ordering::Release);
+    Ok(progress)
+}
+
+/// Convert, copy and submit one immutable seal through the exact D3D11 Render
+/// command/allocation windows. Returns None only for a named empty scope, which
+/// is always closed ABANDONED and never emitted as an empty HOB1.
+unsafe fn submit_outer_scope(
+    outer: &OuterDevice,
+    context: &RuntimeContext,
+    scope: HeliosTranslatorScope,
+) -> Result<Option<u64>, HeliosTranslatorStatus> {
+    use helios_umd_common::direct_translator::{
+        DirectHobContext, DirectIdentityRefusal, DirectResolvedUse,
+    };
+
+    let batch = match outer.translator.seal_and_copy(scope) {
+        Ok(batch) => batch,
+        Err(helios_umd_common::direct_translator::DirectTranslatorError::Refused(
+            HeliosTranslatorStatus::ScopeEmpty,
+        )) => {
+            outer
+                .translator
+                .close_outer_scope(scope, None)
+                .map_err(direct_error_status)?;
+            return Ok(None);
+        }
+        Err(error) => {
+            let status = direct_error_status(error);
+            let _ = outer.translator.close_outer_scope(scope, None);
+            return Err(status);
+        }
+    };
+
+    let command_capacity = context.command.get().map_or(0, |window| window.capacity);
+    let allocation_capacity = context
+        .allocations
+        .get()
+        .map_or(0, |window| window.capacity);
+    let hob_context = DirectHobContext {
+        context_generation: context.context_generation,
+        endpoint_id: context.endpoint_id,
+        context_flags: context.context_flags,
+        max_command_bytes: u64::from(command_capacity),
+        last_batch_id: context.last_batch_id.load(Ordering::Acquire),
+        allocation_list_count: allocation_capacity,
+    };
+
+    let mut resolved = Vec::with_capacity(batch.uses.len());
+    let mut seen_tokens = Vec::with_capacity(batch.uses.len());
+    let allocations = crate::forward::lock_ignore_poison(&outer.allocations);
+    let hob = outer
+        .translator
+        .encode_hob1(&batch, hob_context, |index, use_record| {
+            if use_record.byte_offset != 0 {
+                return Err(DirectIdentityRefusal::D3D11ByteOffset);
+            }
+            if seen_tokens.contains(&use_record.outer_allocation_token) {
+                return Err(DirectIdentityRefusal::DuplicateAssociation);
+            }
+            let end = use_record
+                .byte_offset
+                .checked_add(use_record.byte_length)
+                .ok_or(DirectIdentityRefusal::RangeOverflow)?;
+            let state = allocations
+                .entries
+                .iter()
+                .find(|state| state.token == use_record.outer_allocation_token)
+                .copied()
+                .ok_or(DirectIdentityRefusal::MissingToken)?;
+            if state.allocation == 0 || state.allocation_generation == 0 {
+                return Err(DirectIdentityRefusal::StaleGeneration);
+            }
+            if use_record.byte_length == 0 || end > state.bytes {
+                return Err(DirectIdentityRefusal::RangeOutOfBounds);
+            }
+            let allocation_index =
+                u32::try_from(index).map_err(|_| DirectIdentityRefusal::AllocationIndexOverflow)?;
+            seen_tokens.push(use_record.outer_allocation_token);
+            resolved.push((state, use_record.access_flags));
+            Ok(DirectResolvedUse {
+                address_or_index: u64::from(allocation_index),
+                allocation_generation: state.allocation_generation,
+            })
+        });
+    drop(allocations);
+    let hob = match hob {
+        Ok(hob) => hob,
+        Err(error) => {
+            log_error!("A7 D3D11 sealed-use/HOB1 refusal: {error:?}");
+            let _ = outer.translator.close_outer_scope(scope, None);
+            return Err(HeliosTranslatorStatus::HostCallbackFailed);
+        }
+    };
+
+    let _render_guard = crate::forward::lock_ignore_poison(&context.render_lock);
+    let command_window = context.command.get();
+    let allocation_window = context.allocations.get();
+    let patch_window = context.patches.get();
+    let Some(command_window) = command_window else {
+        let _ = outer.translator.close_outer_scope(scope, None);
+        return Err(HeliosTranslatorStatus::HostCallbackFailed);
+    };
+    let Some(allocation_window) = allocation_window else {
+        let _ = outer.translator.close_outer_scope(scope, None);
+        return Err(HeliosTranslatorStatus::HostCallbackFailed);
+    };
+    let Some(patch_window) = patch_window else {
+        let _ = outer.translator.close_outer_scope(scope, None);
+        return Err(HeliosTranslatorStatus::HostCallbackFailed);
+    };
+    if hob.as_bytes().len() > command_window.capacity as usize
+        || resolved.len() > allocation_window.capacity as usize
+    {
+        log_error!(
+            "A7 D3D11 complete batch exceeds current windows hob={}/{} uses={}/{}",
+            hob.as_bytes().len(),
+            command_window.capacity,
+            resolved.len(),
+            allocation_window.capacity
+        );
+        let _ = outer.translator.close_outer_scope(scope, None);
+        return Err(HeliosTranslatorStatus::BatchBoundExceeded);
+    }
+
+    core::ptr::copy_nonoverlapping(
+        hob.as_bytes().as_ptr(),
+        command_window.ptr.as_ptr().cast::<u8>(),
+        hob.as_bytes().len(),
+    );
+    for (index, (state, access_flags)) in resolved.iter().enumerate() {
+        let mut entry = ddi::D3DDDI_ALLOCATIONLIST::default();
+        entry.hAllocation = state.allocation;
+        entry.__bindgen_anon_1.Value = u32::from(access_flags & HELIOS_HOB1_ACCESS_WRITE != 0);
+        allocation_window.ptr.as_ptr().add(index).write(entry);
+    }
+
+    let Some(render_cb) = (*outer.kt_callbacks).pfnRenderCb else {
+        let _ = outer.translator.close_outer_scope(scope, None);
+        return Err(HeliosTranslatorStatus::DeviceLost);
+    };
+    let mut render = ddi::D3DDDICB_RENDER::default();
+    render.CommandLength = hob.as_bytes().len() as u32;
+    render.CommandOffset = 0;
+    render.NumAllocations = resolved.len() as u32;
+    render.NumPatchLocations = 0;
+    render.hContext = context.handle.as_ptr();
+    if command_window.capacity < HELIOS_HOB1_MAX_BYTES as u32 {
+        render.Flags.__bindgen_anon_1.Value |= 1;
+        render.NewCommandBufferSize = HELIOS_HOB1_MAX_BYTES as u32;
+    }
+    if allocation_window.capacity < HELIOS_HVC1_ALLOCATION_LIST_ENTRIES {
+        render.Flags.__bindgen_anon_1.Value |= 1 << 1;
+        render.NewAllocationListSize = HELIOS_HVC1_ALLOCATION_LIST_ENTRIES;
+    }
+    if patch_window.capacity < HELIOS_HVC1_PATCH_LOCATION_ENTRIES {
+        render.Flags.__bindgen_anon_1.Value |= 1 << 2;
+        render.NewPatchLocationListSize = HELIOS_HVC1_PATCH_LOCATION_ENTRIES;
+    }
+    let hr = render_cb(outer.h_rt_device, &mut render);
+    if hr < 0 {
+        log_error!(
+            "A7 D3D11 HOB1 Render refused batch={} hr=0x{:08x}",
+            hob.header().batch_id,
+            hr as u32
+        );
+        let _ = outer.translator.close_outer_scope(scope, None);
+        mark_outer_lost(outer, "HOB1 Render");
+        return Err(HeliosTranslatorStatus::DeviceLost);
+    }
+
+    if render.NewCommandBufferSize != 0 {
+        if let Some(window) = Window::new(render.pNewCommandBuffer, render.NewCommandBufferSize) {
+            context.command.set(Some(window));
+        }
+    }
+    if render.NewAllocationListSize != 0 {
+        if let Some(window) = Window::new(render.pNewAllocationList, render.NewAllocationListSize) {
+            context.allocations.set(Some(window));
+        }
+    }
+    if render.NewPatchLocationListSize != 0 {
+        if let Some(window) = Window::new(
+            render.pNewPatchLocationList,
+            render.NewPatchLocationListSize,
+        ) {
+            context.patches.set(Some(window));
+        }
+    }
+    context
+        .last_batch_id
+        .store(hob.header().batch_id, Ordering::Release);
+
+    let progress = match signal_hqc1_locked(outer, context) {
+        Ok(progress) => progress,
+        Err(status) => {
+            let _ = outer.translator.close_outer_scope(scope, None);
+            return Err(status);
+        }
+    };
+    if let Err(error) = outer.translator.close_outer_scope(scope, Some(progress)) {
+        log_error!("A7 D3D11 committed scope close failed: {error:?}");
+        mark_outer_lost(outer, "committed scope close");
+        return Err(HeliosTranslatorStatus::DeviceLost);
+    }
+    Ok(Some(progress))
+}
+
+unsafe fn wait_hqc1(
+    outer: &OuterDevice,
+    context: &RuntimeContext,
+    required: u64,
+) -> Result<(), HeliosTranslatorStatus> {
+    if required == 0 || required > context.last_submitted_progress.load(Ordering::Acquire) {
+        return Err(HeliosTranslatorStatus::HostCallbackFailed);
+    }
+    let event = CreateEventW(core::ptr::null_mut(), 0, 0, core::ptr::null());
+    if event.is_null() {
+        mark_outer_lost(outer, "HQC1 event creation");
+        return Err(HeliosTranslatorStatus::DeviceLost);
+    }
+    let Some(wait_cb) = (*outer.kt_callbacks).pfnWaitForSynchronizationObjectFromCpuCb else {
+        CloseHandle(event);
+        mark_outer_lost(outer, "missing FromCpu wait callback");
+        return Err(HeliosTranslatorStatus::DeviceLost);
+    };
+    let sync = context.hqc1.get();
+    let mut wait = ddi::D3DDDICB_WAITFORSYNCHRONIZATIONOBJECTFROMCPU::default();
+    wait.ObjectCount = 1;
+    wait.ObjectHandleArray = &sync;
+    wait.FenceValueArray = &required;
+    wait.hAsyncEvent = event;
+    let hr = wait_cb(outer.h_rt_device, &wait);
+    if hr != 0 && hr != E_PENDING {
+        CloseHandle(event);
+        log_error!(
+            "A7 D3D11 HQC1 FromCpu wait refused value={} hr=0x{:08x}",
+            required,
+            hr as u32
+        );
+        mark_outer_lost(outer, "HQC1 FromCpu callback");
+        return Err(HeliosTranslatorStatus::DeviceLost);
+    }
+    let wait_result = WaitForSingleObject(event, INFINITE);
+    CloseHandle(event);
+    if wait_result != WAIT_OBJECT_0 || context.hqc1_cpu.as_ptr().read_volatile() < required {
+        mark_outer_lost(outer, "HQC1 event completion");
+        return Err(HeliosTranslatorStatus::DeviceLost);
+    }
+    Ok(())
+}
+
+unsafe fn join_outer_progress(
+    outer: &OuterDevice,
+    required_progress: u64,
+) -> Result<HeliosSyncProgressResultV1, HeliosTranslatorStatus> {
+    if outer.device_lost.load(Ordering::Acquire) != 0 {
+        return Err(HeliosTranslatorStatus::DeviceLost);
+    }
+    let context = outer
+        .context
+        .as_ref()
+        .ok_or(HeliosTranslatorStatus::UnknownContext)?;
+
+    let mut active = crate::forward::lock_ignore_poison(&context.active_scope);
+    let cut_progress = if let Some(scope) = active.take() {
+        let submitted = submit_outer_scope(outer, context, scope)?;
+        let progress = match submitted {
+            Some(progress) => progress,
+            None => {
+                let _render_guard = crate::forward::lock_ignore_poison(&context.render_lock);
+                signal_hqc1_locked(outer, context)?
+            }
+        };
+        let reopened = outer
+            .translator
+            .open_outer_scope(context.context_generation, context.endpoint_id)
+            .map_err(direct_error_status)?;
+        *active = Some(reopened);
+        Some(progress)
+    } else {
+        None
+    };
+
+    let target = if required_progress != 0 {
+        if required_progress > context.last_submitted_progress.load(Ordering::Acquire) {
+            return Err(HeliosTranslatorStatus::HostCallbackFailed);
+        }
+        required_progress
+    } else if let Some(progress) = cut_progress {
+        progress
+    } else {
+        let _render_guard = crate::forward::lock_ignore_poison(&context.render_lock);
+        signal_hqc1_locked(outer, context)?
+    };
+    drop(active);
+    wait_hqc1(outer, context, target)?;
+    let result = progress_result(outer, context);
+    result
+        .validate_join(required_progress)
+        .map_err(|_| HeliosTranslatorStatus::HostCallbackFailed)?;
+    Ok(result)
+}
+
+/// DXVK opens one scope immediately around each actual lower queue submit.
+/// The returned cookie is the stable outer object itself, not the A5 scope
+/// pointer; a synchronous join may replace that scope before finish returns.
+pub(crate) extern "C" fn dxvk_outer_submit_begin(context: *mut c_void) -> *mut c_void {
+    if context.is_null() {
+        return core::ptr::null_mut();
+    }
+    let outer = unsafe { &*(context as *const OuterDevice) };
+    let Some(runtime) = outer.context.as_ref() else {
+        return core::ptr::null_mut();
+    };
+    if outer.device_lost.load(Ordering::Acquire) != 0 {
+        return core::ptr::null_mut();
+    }
+    let mut active = crate::forward::lock_ignore_poison(&runtime.active_scope);
+    if active.is_some() {
+        return core::ptr::null_mut();
+    }
+    match outer
+        .translator
+        .open_outer_scope(runtime.context_generation, runtime.endpoint_id)
+    {
+        Ok(scope) => {
+            *active = Some(scope);
+            context
+        }
+        Err(error) => {
+            log_error!("A7 D3D11 outer scope open refused: {error:?}");
+            core::ptr::null_mut()
+        }
+    }
+}
+
+pub(crate) extern "C" fn dxvk_outer_submit_finish(
+    context: *mut c_void,
+    cookie: *mut c_void,
+    lower_result: i32,
+) -> i32 {
+    if context.is_null() {
+        return VK_ERROR_DEVICE_LOST;
+    }
+    let outer = unsafe { &*(context as *const OuterDevice) };
+    let Some(runtime) = outer.context.as_ref() else {
+        return VK_ERROR_DEVICE_LOST;
+    };
+    let mut active = crate::forward::lock_ignore_poison(&runtime.active_scope);
+    let Some(scope) = active.take() else {
+        return VK_ERROR_DEVICE_LOST;
+    };
+    if cookie != context {
+        let _ = outer.translator.close_outer_scope(scope, None);
+        mark_outer_lost(outer, "outer submit cookie mismatch");
+        return VK_ERROR_DEVICE_LOST;
+    }
+    if lower_result != VK_SUCCESS {
+        let _ = outer.translator.close_outer_scope(scope, None);
+        return lower_result;
+    }
+    match unsafe { submit_outer_scope(outer, runtime, scope) } {
+        Ok(_) => VK_SUCCESS,
+        Err(status) => {
+            log_error!("A7 D3D11 outer submit refused: {status:?}");
+            mark_outer_lost(outer, "outer submit");
+            VK_ERROR_DEVICE_LOST
+        }
+    }
+}
+
+/// Complete the C60 GPU-dependent path on the same physical D3D11 context.
+/// No lower Vulkan queue wait or independent timeline is permitted here.
+pub(crate) extern "C" fn dxvk_outer_submit_join(context: *mut c_void) -> i32 {
+    if context.is_null() {
+        return VK_ERROR_DEVICE_LOST;
+    }
+    let outer = unsafe { &*(context as *const OuterDevice) };
+    match unsafe { join_outer_progress(outer, 0) } {
+        Ok(_) => VK_SUCCESS,
+        Err(status) => {
+            log_error!("A7 D3D11 exact outer join refused: {status:?}");
+            mark_outer_lost(outer, "outer join");
+            VK_ERROR_DEVICE_LOST
+        }
+    }
+}
+
+/// Direct forward half of one DXVK-internal allocation construction. The UMD
+/// creates and retains the exact WDDM allocation before returning an immutable
+/// HRA1 value for the one synchronous vkAllocateMemory call.
+pub(crate) extern "C" fn dxvk_outer_allocation_create(
+    context: *mut c_void,
+    bytes: u64,
+    cpu_visible: u32,
+    device_local: u32,
+    association_out: *mut helios_protocol::HeliosResourceAssociationV1,
+) -> i32 {
+    if context.is_null()
+        || association_out.is_null()
+        || bytes == 0
+        || cpu_visible > 1
+        || device_local > 1
+    {
+        return VK_ERROR_DEVICE_LOST;
+    }
+    unsafe { association_out.write(core::mem::zeroed()) };
+    let outer = unsafe { &*(context as *const OuterDevice) };
+    match unsafe {
+        crate::forward::allocate_dxvk_internal_wddm_memory(
+            outer,
+            bytes,
+            cpu_visible != 0,
+            device_local != 0,
+        )
+    } {
+        Ok(association) => {
+            unsafe { association_out.write(association) };
+            VK_SUCCESS
+        }
+        Err(hr) => {
+            log_error!(
+                "A7 D3D11 internal WDDM allocation REFUSED: bytes={} cpu_visible={} device_local={} hr=0x{:08x}",
+                bytes,
+                cpu_visible,
+                device_local,
+                hr as u32
+            );
+            VK_ERROR_DEVICE_LOST
+        }
+    }
+}
+
+/// Reverse construction edge. Internal allocations are armed here; ordinary
+/// DDI resources must already have been armed by DestroyResource. Only after
+/// that exact token transition succeeds may DXVK record the terminal batch.
+pub(crate) extern "C" fn dxvk_outer_allocation_teardown_begin(
+    context: *mut c_void,
+    device_generation: u64,
+    outer_allocation_token: u64,
+) -> *mut c_void {
+    if context.is_null() || device_generation == 0 || outer_allocation_token == 0 {
+        return core::ptr::null_mut();
+    }
+    let outer = unsafe { &*(context as *const OuterDevice) };
+    if let Err(refusal) = crate::forward::arm_dxvk_outer_allocation_teardown(
+        outer,
+        device_generation,
+        outer_allocation_token,
+    ) {
+        log_error!(
+            "A7 D3D11 outer teardown begin REFUSED: {:?} generation={} token={}",
+            refusal,
+            device_generation,
+            outer_allocation_token
+        );
+        mark_outer_lost(outer, "outer allocation teardown begin");
+        return core::ptr::null_mut();
+    }
+    dxvk_outer_submit_begin(context)
+}
+
+/// Reverse half of the immutable HRA1 construction edge. DXVK calls this
+/// only from the exact associated allocation destructor, after Mesa has
+/// accepted or refused its terminal outer batch. The callback cookie is
+/// lifetime only; generation plus token remain the sole identity.
+pub(crate) extern "C" fn dxvk_outer_allocation_retire(
+    context: *mut c_void,
+    device_generation: u64,
+    outer_allocation_token: u64,
+    teardown_result: i32,
+) -> i32 {
+    if context.is_null() || device_generation == 0 || outer_allocation_token == 0 {
+        return VK_ERROR_DEVICE_LOST;
+    }
+    let outer = unsafe { &*(context as *const OuterDevice) };
+    let retired = unsafe {
+        crate::forward::retire_outer_allocation(outer, device_generation, outer_allocation_token)
+    };
+    if let Err(refusal) = retired {
+        log_error!(
+            "A7 D3D11 outer allocation retire REFUSED: {:?} generation={} token={}",
+            refusal,
+            device_generation,
+            outer_allocation_token
+        );
+        mark_outer_lost(outer, "outer allocation retire");
+        return VK_ERROR_DEVICE_LOST;
+    }
+    if teardown_result != VK_SUCCESS {
+        log_error!(
+            "A7 D3D11 outer allocation retired after failed terminal batch: generation={} token={} result={}",
+            device_generation,
+            outer_allocation_token,
+            teardown_result
+        );
+        mark_outer_lost(outer, "outer allocation terminal batch");
+        return teardown_result;
+    }
+    VK_SUCCESS
 }
 
 /// Create the monitored-fence paging queue required by WDDM 2.x
 /// pfnMakeResidentCb. Returns an HRESULT and leaves `paging_queue` empty on
 /// failure.
-pub unsafe fn create_runtime_paging_queue(dev: &mut HeliosDevice) -> i32 {
+pub unsafe fn create_runtime_paging_queue(outer: &mut OuterDevice) -> i32 {
     use crate::hr::E_FAIL;
 
-    if dev.kt_callbacks.is_null() {
+    if outer.kt_callbacks.is_null() {
         log_error!("CreateDevice: no KT callbacks for CreatePagingQueue");
         return E_FAIL;
     }
-    let Some(create_queue_cb) = (*dev.kt_callbacks).pfnCreatePagingQueueCb else {
+    let Some(create_queue_cb) = (*outer.kt_callbacks).pfnCreatePagingQueueCb else {
         log_error!("CreateDevice: pfnCreatePagingQueueCb missing");
         return E_FAIL;
     };
@@ -1082,7 +2032,7 @@ pub unsafe fn create_runtime_paging_queue(dev: &mut HeliosDevice) -> i32 {
     // D3DDDI_PAGINGQUEUE_PRIORITY_NORMAL == 0.
     arg.Priority = 0;
     arg.PhysicalAdapterIndex = 0;
-    let hr = create_queue_cb(dev.h_rt_device, &mut arg);
+    let hr = create_queue_cb(outer.h_rt_device, &mut arg);
     log_error!(
         "CreateDevice: CreatePagingQueue hr=0x{:08x} hQueue=0x{:x} hSync=0x{:x} fence={:p}",
         hr as u32,
@@ -1101,18 +2051,18 @@ pub unsafe fn create_runtime_paging_queue(dev: &mut HeliosDevice) -> i32 {
         (queue, sync_object, fence_value_cpu)
     else {
         log_error!("CreateDevice: CreatePagingQueue returned invalid outputs");
-        if let Some(destroy_queue_cb) = (*dev.kt_callbacks).pfnDestroyPagingQueueCb {
+        if let Some(destroy_queue_cb) = (*outer.kt_callbacks).pfnDestroyPagingQueueCb {
             if arg.hPagingQueue != 0 {
                 let destroy = ddi::D3DDDI_DESTROYPAGINGQUEUE {
                     hPagingQueue: arg.hPagingQueue,
                 };
-                let _ = destroy_queue_cb(dev.h_rt_device, &destroy);
+                let _ = destroy_queue_cb(outer.h_rt_device, &destroy);
             }
         }
         return E_FAIL;
     };
 
-    dev.paging_queue = Some(RuntimePagingQueue {
+    outer.paging_queue = Some(RuntimePagingQueue {
         handle,
         sync_object,
         fence_value_cpu,
@@ -1235,6 +2185,18 @@ pub unsafe fn fill_wddm1_3_device_funcs(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUN
     let l1 = crate::forward::install_11_1(base, funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS);
     let _l13 = crate::forward::install_wddm1_3(l1, funcs);
     audit_wddm1_3_device_funcs("FillDeviceFuncs", funcs);
+}
+
+pub unsafe fn fill_wddm2_1_device_funcs(funcs: *mut ddi::D3DWDDM2_1DDI_DEVICEFUNCS) {
+    let f = &mut *stub_fill_device_table(funcs);
+    install_calc_and_lifecycle(f);
+    (*funcs).pfnRelocateDeviceFuncs = Some(ddi_relocate_device_funcs_wddm2_1);
+
+    let base = crate::forward::install(f);
+    let l1 = crate::forward::install_11_1(base, funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS);
+    let l13 = crate::forward::install_wddm1_3(l1, funcs as *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS);
+    let _l21 = crate::forward::install_wddm2_1(l13, funcs);
+    audit_wddm2_1_device_funcs("FillDeviceFuncs", funcs);
 }
 
 /// Fill the DXGI base DDI table (presentation/resource base funcs) the runtime

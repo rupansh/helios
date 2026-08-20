@@ -173,18 +173,16 @@
 //! now is still this lane's job: the runtime creates a query heap when the
 //! application does, not when the first query is recorded.
 
-use core::sync::atomic::{AtomicU64, Ordering};
-
 use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, S_OK};
 use helios_umd_common::refusals::RefusalCounter;
 use helios_umd_common::slot::{Boxed, Com, DdiHandle, Slot};
 use helios_umd_common::throttle::LogThrottle;
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12Fence, ID3D12QueryHeap, D3D12_FENCE_FLAG_NONE, D3D12_QUERY_HEAP_DESC,
-    D3D12_QUERY_HEAP_TYPE, D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP,
-    D3D12_QUERY_HEAP_TYPE_OCCLUSION, D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
-    D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1, D3D12_QUERY_HEAP_TYPE_SO_STATISTICS,
-    D3D12_QUERY_HEAP_TYPE_TIMESTAMP, D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS,
+    ID3D12QueryHeap, D3D12_QUERY_HEAP_DESC, D3D12_QUERY_HEAP_TYPE,
+    D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP, D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+    D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1,
+    D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+    D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS,
 };
 
 use super::tables12::{stage, DeviceCoreTable, Filling};
@@ -249,7 +247,7 @@ fn budget(t: &LogThrottle) -> Option<usize> {
 /// still answered.
 const PRIVATE_SLOT_SIZE: usize = core::mem::size_of::<*mut core::ffi::c_void>();
 
-/// Per-`D3D12DDI_HFENCE` shadow state.
+/// Per-`D3D12DDI_HFENCE` Core-0116 native object state.
 ///
 /// ⚠ **`pub`, not `pub(crate)`, and that is forced rather than chosen.**
 /// `BoxedHandle` is a `pub` trait in `helios_umd_common`, so an associated type
@@ -257,98 +255,29 @@ const PRIVATE_SLOT_SIZE: usize = core::mem::size_of::<*mut core::ffi::c_void>();
 /// `fence` are both `pub(crate) mod` inside a `cdylib` that exports no Rust API,
 /// every field below is private, and the three methods are the whole surface L2
 /// can reach. Same shape as `queue::QueueState`.
+/// No lower-vkd3d fence or independent timeline exists. Queue Signal/Wait names
+/// `h_sync_object` through the exact owning WDDM context callbacks.
 pub struct FenceState {
-    /// The engine fence. **Owned** — dropping this state releases it.
-    engine: ID3D12Fence,
-    /// The highest `D3D12DDIARG_FENCE_OPERATION::Value` this driver has issued an
-    /// `ID3D12CommandQueue::Signal` for on [`Self::engine`], **biased by one** so
-    /// that `0` means *"never signalled"*.
-    ///
-    /// ⛔ This is a lower bound on what the engine timeline will reach, and it is
-    /// the *only* such bound the DDI gives this driver — the initial value and
-    /// every CPU signal are invisible here.
-    ///
-    /// ⛔⛔ **ONE word, deliberately, and it was TWO until 2026-08-07.** The
-    /// predecessor kept `signalled_watermark` and a separate `signals_issued`
-    /// count, because a legal `pfnSignalFence` with `Value = 0` raises no
-    /// watermark and a bare `> 0` test could not tell *"never touched"* from
-    /// *"signalled 0"* — the distinction both dropped-wait arms turn on. That
-    /// reasoning is right; **two atomics were the wrong way to get it.**
-    /// `note_signal` had to publish them in some order, and whichever order it
-    /// chose left a window in which the pair is torn: a concurrent
-    /// `queue::fence_operation` wait arm reads one fact from before the signal and
-    /// the other from after, and takes an arm neither state justifies. No
-    /// reader-side fix closes a writer-side tear — reading the count first only
-    /// moves the window, since the writer can be preempted between its two stores.
-    ///
-    /// ⭐ The bias makes both predicates derive from **one load**, so they can
-    /// never disagree: `0` = never signalled; `N + 1` = watermark `N`. `Signal(0)`
-    /// stores `1`, which is distinguishable from never-signalled, so the ambiguity
-    /// the two-field design existed to remove is still removed.
-    ///
-    /// ⚠ Honest edge: `saturating_add` makes `Signal(u64::MAX - 1)` and
-    /// `Signal(u64::MAX)` both store `u64::MAX`, so a wait for exactly `u64::MAX`
-    /// reads reachable after only `MAX - 1` was signalled. A D3D12 fence timeline
-    /// would have to be advanced 2^64 times to reach it; recorded rather than
-    /// hidden.
-    signalled_biased: AtomicU64,
+    h_device: ddi12::D3D12DDI_HDEVICE,
+    h_rt_fence: ddi12::D3D12DDI_HRTFENCE,
+    h_sync_object: ddi12::D3DKMT_HANDLE,
+    mapping: ddi12::D3DDDI_NATIVEFENCEMAPPING,
+    pdd: helios_protocol::HeliosNativeFencePddV1,
+    opened: bool,
 }
 
 impl FenceState {
-    /// The engine fence to order against.
-    pub(crate) fn engine(&self) -> &ID3D12Fence {
-        &self.engine
+    pub(crate) fn belongs_to(&self, h_device: ddi12::D3D12DDI_HDEVICE) -> bool {
+        !self.h_device.pDrvPrivate.is_null()
+            && self.h_device.pDrvPrivate == h_device.pDrvPrivate
+            && self.h_sync_object != 0
+            && self.pdd.object_generation != 0
     }
 
-    /// Record that a queue-level signal for `value` has been **issued** on the
-    /// engine timeline.
-    ///
-    /// ⚠ Called *before* `ID3D12CommandQueue::Signal`, not after, and that is
-    /// deliberate. The predicate a wait needs is "a signal for this value is on
-    /// the engine timeline", which becomes true at issue; raising the mark only
-    /// on success would open a window in which a legitimately paired wait
-    /// arriving on another thread is dropped instead of forwarded. The engine
-    /// call failing is already a device-scope error reported through
-    /// `pfnSetErrorCb` and counted as `FenceOpEngineFailed`, so it does not need
-    /// a second, weaker instrument here.
-    ///
-    /// `fetch_max` because D3D12 fence values are not required to arrive in
-    /// order and a lower one must not lower the bound.
-    ///
-    /// ⭐ **One store, so there is no publication order to get wrong.** Both facts
-    /// the wait arm needs live in [`Self::signalled_biased`], whose doc carries
-    /// why two atomics could not be made correct from the reader's side.
-    pub(crate) fn note_signal(&self, value: u64) {
-        self.signalled_biased
-            .fetch_max(value.saturating_add(1), Ordering::AcqRel);
-    }
-
-    /// Whether this driver has issued **any** signal on this fence's engine
-    /// timeline.
-    ///
-    /// `false` means the fence's whole timeline is the runtime's — a
-    /// `CreateFence` initial value and/or CPU `ID3D12Fence::Signal`s, neither of
-    /// which reaches this DDI (`DDI_REFERENCE.md` §10.3) — which is the module
-    /// doc's first dropped-wait arm.
-    pub(crate) fn driver_signals_issued(&self) -> bool {
-        self.signalled_biased.load(Ordering::Acquire) != 0
-    }
-
-    /// Whether this driver's own engine timeline can reach `value`.
-    ///
-    /// `false` means the value's provenance is outside what this DDI shows the
-    /// driver — a `CreateFence` initial value, a CPU `ID3D12Fence::Signal`, or a
-    /// signal not yet issued — and forwarding a wait for it would be
-    /// unsatisfiable. See the module doc for what the caller must do instead.
-    ///
-    /// ⚠ Compares in the **biased** domain so it never has to subtract from a
-    /// value that may be `0`: `value + 1 <= biased` is `value <= watermark` for
-    /// every signalled state, and is false for all `value` when `biased == 0`.
-    pub(crate) fn signal_reachable(&self, value: u64) -> bool {
-        value.saturating_add(1) <= self.signalled_biased.load(Ordering::Acquire)
+    pub(crate) fn h_sync_object(&self) -> ddi12::D3DKMT_HANDLE {
+        self.h_sync_object
     }
 }
-
 /// The slot behind a `D3D12DDI_HFENCE`.
 ///
 /// ⭐ Named rather than generic **on purpose**: a `slot_of::<T>(h)` helper would
@@ -469,7 +398,7 @@ pub(crate) unsafe fn engine_query_heap(
 /// duration of the call.
 unsafe extern "C" fn calc_private_fence_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
-    arg: *const ddi12::D3D12DDIARG_CREATE_FENCE,
+    arg: *const ddi12::D3D12DDIARG_CREATE_FENCE_0116,
 ) -> ddi12::SIZE_T {
     if arg.is_null() {
         note_refusal(&L7_REFUSALS.fence_bad_arg);
@@ -490,10 +419,167 @@ unsafe extern "C" fn calc_private_fence_size(
 /// `pDrvPrivate` must address the private block [`calc_private_fence_size`]
 /// sized; `arg` must point at a live `D3D12DDIARG_CREATE_FENCE` whose `Fences`
 /// addresses `FenceCount` readable `D3D12DDI_FENCE`s for the call.
+fn all_zero(bytes: &[u8]) -> bool {
+    bytes.iter().all(|byte| *byte == 0)
+}
+
+fn mapping_is_valid(mapping: &ddi12::D3DDDI_NATIVEFENCEMAPPING) -> bool {
+    !mapping.CurrentValueCpuVa.is_null()
+        && mapping.CurrentValueGpuVa != 0
+        && mapping.MonitoredValueGpuVa != 0
+        && all_zero(&mapping.Reserved)
+}
+
+fn hnf1_flags_from_sync_flags(flags: &ddi12::D3DDDI_SYNCHRONIZATIONOBJECT_FLAGS) -> Option<u32> {
+    // SAFETY: `Value` is the documented UINT view of this flags union.
+    let value = unsafe { flags.__bindgen_anon_1.Value };
+    const SHARED: u32 = 1 << 0;
+    const NT_SECURITY_SHARING: u32 = 1 << 1;
+    if value & !(SHARED | NT_SECURITY_SHARING) != 0
+        || value & NT_SECURITY_SHARING != 0 && value & SHARED == 0
+    {
+        return None;
+    }
+    Some(if value & SHARED != 0 {
+        helios_protocol::HELIOS_HNF1_FLAG_SHARED
+    } else {
+        0
+    })
+}
+
+unsafe fn create_native_fence(
+    dev: &device12::HeliosD3D12Device,
+    h_device: ddi12::D3D12DDI_HDEVICE,
+    h_rt_fence: ddi12::D3D12DDI_HRTFENCE,
+    native_args: *mut ddi12::D3DKMT_CREATENATIVEFENCE,
+) -> Result<FenceState, ddi12::HRESULT> {
+    let Some(callbacks) = (unsafe { dev.um_callbacks_0116.as_ref() }) else {
+        return Err(E_FAIL);
+    };
+    let Some(create) = callbacks.pfnCreateNativeFenceCb else {
+        return Err(E_FAIL);
+    };
+    let Some(args) = (unsafe { native_args.as_mut() }) else {
+        return Err(E_INVALIDARG);
+    };
+    let sync_flags = hnf1_flags_from_sync_flags(&args.Info.Flags).ok_or(E_INVALIDARG)?;
+    if args.Info.Type as u32 != helios_protocol::HELIOS_NATIVE_FENCE_TYPE_DEFAULT
+        || args.Info.EngineAffinity != 1
+        || args.Info.PhysicalAdapterIndex != 0
+        || !all_zero(&args.Info.Reserved)
+        || !all_zero(&args.Reserved)
+        // SAFETY: `Value` is the UINT view; every create-flags bit is reserved.
+        || unsafe { args.Flags.__bindgen_anon_1.Value } != 0
+    {
+        return Err(E_INVALIDARG);
+    }
+    args.PrivateDriverData = helios_protocol::HeliosNativeFencePddV1::create_input(
+        helios_protocol::HELIOS_PACKAGE_GENERATION,
+        helios_protocol::HELIOS_NATIVE_FENCE_TYPE_DEFAULT,
+        sync_flags,
+    )
+    .to_bytes();
+
+    let hr = unsafe { create(dev.h_rt_device, h_rt_fence, args) };
+    if hr < 0 {
+        return Err(hr);
+    }
+    let pdd = helios_protocol::HeliosNativeFencePddV1::from_bytes(&args.PrivateDriverData);
+    pdd.validate_returned(
+        helios_protocol::HELIOS_PACKAGE_GENERATION,
+        dev.adapter_luid,
+        helios_protocol::HELIOS_NATIVE_FENCE_TYPE_DEFAULT,
+        sync_flags,
+    )
+    .map_err(|_| E_FAIL)?;
+    if args.hSyncObject == 0
+        || args.Info.Type as u32 != helios_protocol::HELIOS_NATIVE_FENCE_TYPE_DEFAULT
+        || args.Info.EngineAffinity != 1
+        || args.Info.PhysicalAdapterIndex != 0
+        || !mapping_is_valid(&args.Info.NativeFenceMapping)
+        || !all_zero(&args.Info.Reserved)
+        || !all_zero(&args.Reserved)
+    {
+        return Err(E_FAIL);
+    }
+    Ok(FenceState {
+        h_device,
+        h_rt_fence,
+        h_sync_object: args.hSyncObject,
+        mapping: args.Info.NativeFenceMapping,
+        pdd,
+        opened: false,
+    })
+}
+
+unsafe fn open_native_fence(
+    dev: &device12::HeliosD3D12Device,
+    h_device: ddi12::D3D12DDI_HDEVICE,
+    h_rt_fence: ddi12::D3D12DDI_HRTFENCE,
+    open_args: *mut ddi12::D3DKMT_OPENNATIVEFENCEFROMNTHANDLE,
+) -> Result<FenceState, ddi12::HRESULT> {
+    let Some(callbacks) = (unsafe { dev.um_callbacks_0116.as_ref() }) else {
+        return Err(E_FAIL);
+    };
+    let Some(open) = callbacks.pfnOpenNativeFenceCb else {
+        return Err(E_FAIL);
+    };
+    let Some(args) = (unsafe { open_args.as_mut() }) else {
+        return Err(E_INVALIDARG);
+    };
+    // Core-0116 shared open is one-node, shared NT-security only. Cross-adapter
+    // and every reserved byte are a named refusal, never a fallback.
+    // SAFETY: `Value` is the UINT view of the flags union.
+    let flags = unsafe { args.Flags.__bindgen_anon_1.Value };
+    if args.hNtHandle.is_null()
+        || args.EngineAffinity != 1
+        || flags != 0b11
+        || !all_zero(&args.Reserved)
+    {
+        return Err(E_INVALIDARG);
+    }
+    let mut input = helios_protocol::HeliosNativeFencePddV1::create_input(
+        helios_protocol::HELIOS_PACKAGE_GENERATION,
+        helios_protocol::HELIOS_NATIVE_FENCE_TYPE_DEFAULT,
+        helios_protocol::HELIOS_HNF1_FLAG_SHARED,
+    );
+    input.adapter_luid = dev.adapter_luid;
+    args.PrivateDriverData = input.to_bytes();
+
+    let hr = unsafe { open(dev.h_rt_device, h_rt_fence, args) };
+    if hr < 0 {
+        return Err(hr);
+    }
+    let pdd = helios_protocol::HeliosNativeFencePddV1::from_bytes(&args.PrivateDriverData);
+    pdd.validate_returned(
+        helios_protocol::HELIOS_PACKAGE_GENERATION,
+        dev.adapter_luid,
+        helios_protocol::HELIOS_NATIVE_FENCE_TYPE_DEFAULT,
+        helios_protocol::HELIOS_HNF1_FLAG_SHARED,
+    )
+    .map_err(|_| E_FAIL)?;
+    if args.hSyncObject == 0
+        || args.EngineAffinity != 1
+        || !mapping_is_valid(&args.NativeFenceMapping)
+        || !all_zero(&args.Reserved)
+    {
+        return Err(E_FAIL);
+    }
+    Ok(FenceState {
+        h_device,
+        h_rt_fence,
+        h_sync_object: args.hSyncObject,
+        mapping: args.NativeFenceMapping,
+        pdd,
+        opened: true,
+    })
+}
+
 unsafe extern "C" fn create_fence(
     h_device: ddi12::D3D12DDI_HDEVICE,
     h_fence: ddi12::D3D12DDI_HFENCE,
-    arg: *const ddi12::D3D12DDIARG_CREATE_FENCE,
+    h_rt_fence: ddi12::D3D12DDI_HRTFENCE,
+    arg: *const ddi12::D3D12DDIARG_CREATE_FENCE_0116,
 ) -> ddi12::HRESULT {
     // SAFETY: the caller guarantees the slot lies in the sized private block.
     let Some(slot) = (unsafe { fence_slot(h_fence) }) else {
@@ -512,113 +598,62 @@ unsafe extern "C" fn create_fence(
     }
     // SAFETY: non-null per the check; the DDI declares it `_In_ CONST`.
     let a = unsafe { &*arg };
-
-    // ⚠ Per-arm validation, not a max-union: `Fences` is only readable for
-    // `FenceCount` entries and only meaningful when that count is 1 here.
-    if a.FenceCount != 1 || a.Fences.is_null() {
-        note_refusal(&L7_REFUSALS.fence_multi_adapter_refused);
-        if let Some(n) = budget(&FENCE_LOG) {
-            log_error!(
-                "CreateFence: FenceCount={} Fences={:p} -- single-adapter Helios backs exactly one \
-                 placement -> E_INVALIDARG (x{})",
-                a.FenceCount,
-                a.Fences,
-                n + 1,
-            );
-        }
-        return E_INVALIDARG;
-    }
-    // SAFETY: `Fences` is non-null and `FenceCount == 1` per the check above, so
-    // element 0 is inside the array the DDI declares `_Field_size_(FenceCount)`.
-    let placement = unsafe { &*a.Fences };
-
-    let flags = placement.Flags;
-    if flags & ddi12::D3D12DDI_FENCE_FLAGS_D3D12DDI_FENCE_FLAG_BOTTOM_OF_PIPE != 0 {
-        note_refusal(&L7_REFUSALS.fence_bottom_of_pipe_unproven);
-    }
-    let known = ddi12::D3D12DDI_FENCE_FLAGS_D3D12DDI_FENCE_FLAG_BOTTOM_OF_PIPE;
-    if flags & !known != 0 {
-        note_refusal(&L7_REFUSALS.fence_flags_unknown);
-        if budget(&FENCE_LOG).is_some() {
-            log_error!("CreateFence: unknown D3D12DDI_FENCE_FLAGS bits in {flags:#x}");
-        }
-    }
-
-    // SAFETY: this is a device-scope DDI, so the runtime passes a handle
-    // `create_device` returned `S_OK` for; the borrow lives only until the end
-    // of this call, which is `device12::device`'s stated precondition.
     let Some(dev) = (unsafe { device12::device(h_device) }) else {
         note_refusal(&L7_REFUSALS.fence_no_device);
         return E_FAIL;
     };
-    let Some(engine) = dev.engine.d3d12_device() else {
-        note_refusal(&L7_REFUSALS.fence_no_device);
-        return E_FAIL;
-    };
+    if h_rt_fence.handle.is_null() {
+        note_refusal(&L7_REFUSALS.fence_bad_arg);
+        return E_INVALIDARG;
+    }
 
-    // ⚠ Initial value 0 and `D3D12_FENCE_FLAG_NONE`, both deliberate:
-    //   * the runtime owns the *observable* fence value (it holds the CPU
-    //     mapping and services `GetCompletedValue`), and every value that ever
-    //     reaches this engine fence arrives as an absolute `Value` on
-    //     `D3D12DDIARG_FENCE_OPERATION`. Starting anywhere but 0 would make a
-    //     first `Signal(1)` a backwards step on a monotonic timeline;
-    //   * `SHARED`/`CROSS_ADAPTER` are API flags the DDI does not carry (module
-    //     doc), and asking vkd3d for a shared fence would engage
-    //     `VK_KHR_external_memory_win32`, which venus does not expose
-    //     (`DECISIONS.md` V1).
-    // SAFETY: `engine` is the bridge's live borrowed `ID3D12Device` and the call
-    // takes only by-value scalars plus the out-param the wrapper owns.
-    let created = unsafe { engine.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) };
-    let fence = match created {
-        Ok(f) => f,
-        Err(e) => {
-            note_refusal(&L7_REFUSALS.fence_engine_failed);
+    let created = match a.FenceType {
+        ddi12::D3D12DDI_FENCE_TYPE_0112_D3D12DDI_FENCE_TYPE_NATIVE => unsafe {
+            create_native_fence(
+                dev,
+                h_device,
+                h_rt_fence,
+                a.__bindgen_anon_1.pNativeFenceArgs,
+            )
+        },
+        ddi12::D3D12DDI_FENCE_TYPE_0112_D3D12DDI_FENCE_TYPE_OPENED_NATIVE => unsafe {
+            open_native_fence(
+                dev,
+                h_device,
+                h_rt_fence,
+                a.__bindgen_anon_1.pNativeFenceOpenArgs,
+            )
+        },
+        ddi12::D3D12DDI_FENCE_TYPE_0112_D3D12DDI_FENCE_TYPE_MONITORED => {
+            note_refusal(&L7_REFUSALS.fence_monitored_refused);
+            Err(E_INVALIDARG)
+        }
+        _ => {
+            note_refusal(&L7_REFUSALS.fence_type_unknown);
+            Err(E_INVALIDARG)
+        }
+    };
+    match created {
+        Ok(state) => {
             if let Some(n) = budget(&FENCE_LOG) {
                 log_error!(
-                    "CreateFence: engine CreateFence failed hr={:#010x} (x{})",
-                    e.code().0 as u32,
+                    "CreateFence0116: type={} hRTFence={:p} hSyncObject={} generation={} opened={} (x{})",
+                    a.FenceType,
+                    state.h_rt_fence.handle,
+                    state.h_sync_object,
+                    state.pdd.object_generation,
+                    state.opened,
                     n + 1,
                 );
             }
-            return E_FAIL;
+            unsafe { slot.store(state) };
+            S_OK
         }
-    };
-
-    // ⚠ On the SUCCESS path, and budgeted: this is the only capture anywhere of
-    // the GPU virtual addresses the runtime picks for a D3D12 monitored fence on
-    // this adapter, which is contract data no document in `docs/dx12/` holds and
-    // which the G-fence probe (`DDI_REFERENCE.md` §10.5) will want to compare
-    // against.
-    if let Some(n) = budget(&FENCE_LOG) {
-        log_error!(
-            "CreateFence: valueVA={:#x} monitoredVA={:#x} flags={:#x} -> engine fence (x{})",
-            placement.FenceValue.BaseAddress,
-            placement.FenceMonitoredValue.BaseAddress,
-            flags,
-            n + 1,
-        );
+        Err(hr) => {
+            note_refusal(&L7_REFUSALS.fence_native_callback_failed);
+            hr
+        }
     }
-
-    // SAFETY: the slot lies in the sized private block and is currently null
-    // (cleared above); `store` boxes the state and moves the box into it, so the
-    // slot owns both the box and, through it, the single reference `CreateFence`
-    // returned. `destroy_fence` takes the box back out and drops it.
-    unsafe {
-        slot.store(FenceState {
-            engine: fence,
-            // ⛔ 0 is the BIASED "never signalled" value, not a watermark of 0 —
-            // the field's doc carries the bias. Nothing on this fence's engine
-            // timeline is this driver's yet, which is what routes a wait arriving
-            // now to the module doc's benign `FenceWaitRuntimeOwned` arm.
-            //
-            // ⚠ It must start where the ENGINE timeline starts and not where the
-            // runtime's monitored fence does — which the DDI never says. A
-            // `CreateFence(InitialValue = N)` is invisible here, so biased-0 is
-            // the only honest initial claim.
-            signalled_biased: AtomicU64::new(0),
-        });
-    }
-    S_OK
 }
 
 /// `pfnDestroyFence`.
@@ -630,7 +665,7 @@ unsafe extern "C" fn create_fence(
 /// `h_fence` must be a handle [`create_fence`] returned `S_OK` for and which has
 /// not already been destroyed.
 unsafe extern "C" fn destroy_fence(
-    _h_device: ddi12::D3D12DDI_HDEVICE,
+    h_device: ddi12::D3D12DDI_HDEVICE,
     h_fence: ddi12::D3D12DDI_HFENCE,
 ) {
     // SAFETY: the caller guarantees a live handle from `create_fence`.
@@ -642,8 +677,37 @@ unsafe extern "C" fn destroy_fence(
     // `take` empties it, so a destroy after a refused create — or a second
     // destroy — is a no-op rather than a double free. Dropping the box releases
     // the engine fence's single reference.
-    drop(unsafe { slot.take() });
+    let Some(state) = (unsafe { slot.take() }) else {
+        note_refusal(&L7_REFUSALS.fence_bad_arg);
+        return;
+    };
+    if !state.belongs_to(h_device)
+        || !mapping_is_valid(&state.mapping)
+        || unsafe { device12::device(h_device) }.is_none_or(|dev| {
+            state
+                .pdd
+                .validate_returned(
+                    helios_protocol::HELIOS_PACKAGE_GENERATION,
+                    dev.adapter_luid,
+                    helios_protocol::HELIOS_NATIVE_FENCE_TYPE_DEFAULT,
+                    state.pdd.flags,
+                )
+                .is_err()
+        })
+    {
+        note_refusal(&L7_REFUSALS.fence_destroy_invalid);
+        if let Some(dev) = unsafe { device12::device(h_device) } {
+            let _ = device12::set_error(dev, E_FAIL);
+        }
+    }
+    drop(state);
 }
+
+/// The exact Core-0116 create slot installed below. The native-fence cap reads
+/// this same typed value, so capability publication and table wiring cannot
+/// drift into separate hand-maintained booleans.
+pub(crate) const NATIVE_FENCE_CREATE_HANDLER: ddi12::PFND3D12DDI_CREATEFENCE_0116 =
+    Some(create_fence);
 
 // ---------------------------------------------------------------------------
 // (j) Query heaps — 3 slots
@@ -817,7 +881,7 @@ pub(crate) fn install(
     let table = filling.table();
     // (i) fences — 3
     table.pfnCalcPrivateFenceSize = Some(calc_private_fence_size);
-    table.pfnCreateFence = Some(create_fence);
+    table.pfnCreateFence = NATIVE_FENCE_CREATE_HANDLER;
     table.pfnDestroyFence = Some(destroy_fence);
     // (j) query heaps — 3
     table.pfnCalcPrivateQueryHeapSize = Some(calc_private_query_heap_size);
@@ -841,6 +905,10 @@ pub(crate) struct L7Refusals {
     /// the bridge carries no `ID3D12Device`. **Expected 0** — these are
     /// device-scope DDIs and a device exists by construction.
     fence_no_device: RefusalCounter,
+    fence_monitored_refused: RefusalCounter,
+    fence_type_unknown: RefusalCounter,
+    fence_native_callback_failed: RefusalCounter,
+    fence_destroy_invalid: RefusalCounter,
     /// `D3D12DDIARG_CREATE_FENCE` asked for `FenceCount != 1` (or a null array),
     /// and the create was refused.
     ///
@@ -908,6 +976,10 @@ pub(crate) struct L7Refusals {
 pub(crate) static L7_REFUSALS: L7Refusals = L7Refusals {
     fence_bad_arg: RefusalCounter::new("FenceBadArg"),
     fence_no_device: RefusalCounter::new("FenceNoDevice"),
+    fence_monitored_refused: RefusalCounter::new("FenceMonitoredRefused"),
+    fence_type_unknown: RefusalCounter::new("FenceTypeUnknown"),
+    fence_native_callback_failed: RefusalCounter::new("FenceNativeCallbackFailed"),
+    fence_destroy_invalid: RefusalCounter::new("FenceDestroyInvalid"),
     fence_multi_adapter_refused: RefusalCounter::new("FenceMultiAdapterRefused"),
     fence_bottom_of_pipe_unproven: RefusalCounter::new("FenceBottomOfPipeUnproven"),
     fence_flags_unknown: RefusalCounter::new("FenceFlagsUnknown"),
@@ -935,6 +1007,10 @@ pub(crate) static L7_REFUSALS: L7Refusals = L7Refusals {
 pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L7_REFUSALS.fence_bad_arg,
     &L7_REFUSALS.fence_no_device,
+    &L7_REFUSALS.fence_monitored_refused,
+    &L7_REFUSALS.fence_type_unknown,
+    &L7_REFUSALS.fence_native_callback_failed,
+    &L7_REFUSALS.fence_destroy_invalid,
     &L7_REFUSALS.fence_multi_adapter_refused,
     &L7_REFUSALS.fence_bottom_of_pipe_unproven,
     &L7_REFUSALS.fence_flags_unknown,

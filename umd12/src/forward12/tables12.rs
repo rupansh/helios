@@ -59,14 +59,14 @@ use core::marker::PhantomData;
 use helios_umd_common::hr::{Hresult, E_INVALIDARG, S_OK};
 use helios_umd_common::noop::stub_fill_bytes;
 
-use super::{cmdlist, copy, descriptors, fence, misc, present12, pso, queue, resource12, rootargs};
 use super::noop12;
+use super::{cmdlist, copy, descriptors, fence, misc, present12, pso, queue, resource12, rootargs};
 use crate::{caps12, ddi12, log_error, note_refusal, UMD12_REFUSALS};
 
-/// `D3D12DDI_DEVICE_FUNCS_CORE_0109` — 124 slots.
-pub(crate) type DeviceCoreTable = ddi12::D3D12DDI_DEVICE_FUNCS_CORE_0109;
-/// `D3D12DDI_COMMAND_LIST_FUNCS_3D_0108` — 75 slots.
-pub(crate) type CommandListTable = ddi12::D3D12DDI_COMMAND_LIST_FUNCS_3D_0108;
+/// `D3D12DDI_DEVICE_FUNCS_CORE_0116` — 128 slots.
+pub(crate) type DeviceCoreTable = ddi12::D3D12DDI_DEVICE_FUNCS_CORE_0116;
+/// `D3D12DDI_COMMAND_LIST_FUNCS_3D_0114` — 75 slots.
+pub(crate) type CommandListTable = ddi12::D3D12DDI_COMMAND_LIST_FUNCS_3D_0114;
 /// `D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001` — 7 slots.
 pub(crate) type CommandQueueTable = ddi12::D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001;
 

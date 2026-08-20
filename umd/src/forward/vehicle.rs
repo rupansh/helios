@@ -169,7 +169,10 @@ pub fn wait_last_present(timeout_us: u32) -> i32 {
     // that the ordinary present path answers is a different question with a
     // different answer -- which is why deleting the `PresentOrder` knob (owner
     // directive, 2026-07-29) does not touch this call.
-    if dev.dxvk.present_frame_gate(timeout_us, PRESENT_ORDER_COMPLETE) {
+    if dev
+        .dxvk
+        .present_frame_gate(timeout_us, PRESENT_ORDER_COMPLETE)
+    {
         0
     } else {
         1

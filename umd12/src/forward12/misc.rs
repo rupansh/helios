@@ -156,8 +156,8 @@ use windows::Win32::Graphics::Direct3D12::{
 };
 
 use super::queue;
+use super::resource12;
 use super::tables12::{stage, Filling};
-use super::{identity12, resource12};
 use super::tables12::{CommandListTable, DeviceCoreTable};
 use crate::{ddi12, log_error, note_refusal, UMD12_REFUSALS};
 
@@ -555,10 +555,10 @@ unsafe fn fill_kmt_allocation_info(
     };
     // SAFETY: the type tag says this is a resource handle and the caller guarantees
     // it is one this driver's create returned; the borrow ends inside this function.
-    let Some(engine) = (unsafe { resource12::engine_resource(h_resource) }) else {
+    let Some(_engine) = (unsafe { resource12::engine_resource(h_resource) }) else {
         return false;
     };
-    let Some(identity) = identity12::lookup(engine.as_raw() as usize) else {
+    let Some(identity) = (unsafe { resource12::allocation_identity(h_resource) }) else {
         // ⚠ The ordinary case, not a fault: only a resource the runtime declared a
         // PRIMARY has a WDDM allocation at all. `resource12`'s
         // `pfnCheckResourceAllocationHandle` answers 0 for the same class and for the
@@ -2017,14 +2017,43 @@ unsafe extern "C" fn dispatch_graph(
 }
 
 // ---------------------------------------------------------------------------
+// Core-0113 application-specific driver state — explicitly unsupported
+// ---------------------------------------------------------------------------
+
+unsafe extern "C" fn get_application_specific_driver_state(
+    _h_device: ddi12::D3D12DDI_HDEVICE,
+    _blob: *mut core::ffi::c_void,
+    _blob_size: ddi12::UINT,
+) -> ddi12::HRESULT {
+    note_refusal(&L9_REFUSALS.application_driver_state_refused);
+    E_NOTIMPL
+}
+
+unsafe extern "C" fn get_application_specific_driver_blob_status(
+    _h_device: ddi12::D3D12DDI_HDEVICE,
+) -> ddi12::D3D12DDI_APPLICATION_SPECIFIC_DRIVER_BLOB_STATUS {
+    note_refusal(&L9_REFUSALS.application_driver_blob_not_specified);
+    ddi12::D3D12DDI_APPLICATION_SPECIFIC_DRIVER_BLOB_STATUS_D3D12DDI_APPLICATION_SPECIFIC_DRIVER_BLOB_NOT_SPECIFIED
+}
+
+unsafe extern "C" fn get_application_specific_driver_state_blob_size(
+    _h_device: ddi12::D3D12DDI_HDEVICE,
+) -> ddi12::UINT {
+    note_refusal(&L9_REFUSALS.application_driver_blob_size_zero);
+    0
+}
+
+// ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
 
-/// Install L9's 28 device-core slots.
+/// Install L9's 31 device-core slots.
 ///
 /// Chain position: `PresentSlots` -> `MiscSlots` on the device-core table.
 ///
-/// ⚠ **28, and the four groups below sum to it: 4 + 3 + 6 + 13 + 2.** Group (k)
+/// The original 28 slots are followed by the three Core-0113 application-state
+/// slots. Helios advertises no such state and answers them explicitly rather
+/// than leaving output-bearing functions on the uniform counting stub.
 /// has *five* slots in `DDI_REFERENCE.md` §3.2 and only four are assigned here —
 /// `pfnGetPresentPrivateDriverDataSize` is **L8's**, installed by
 /// `present12::install_core` one link earlier in this chain, and `PARALLEL.md`
@@ -2073,12 +2102,72 @@ pub(crate) fn install_core(
     table.pfnSetBackgroundProcessingMode = Some(set_background_processing_mode);
     table.pfnImplicitShaderCacheControl = Some(implicit_shader_cache_control);
 
+    // Core-0113 application-specific driver state — 3, unsupported.
+    table.pfnGetApplicationSpecificDriverState = Some(get_application_specific_driver_state);
+    table.pfnGetApplicationSpecificDriverBlobStatus =
+        Some(get_application_specific_driver_blob_status);
+    table.pfnGetApplicationSpecificDriverStateBlobSize =
+        Some(get_application_specific_driver_state_blob_size);
+
     filling.advance()
 }
 
 /// Install L9's 16 command-list slots.
 ///
 /// Chain position: `PresentSlots` -> `MiscSlots` on the command-list table.
+macro_rules! bypass_list_wrapper {
+    ($wrapper:ident => $target:ident ( $( $arg:ident : $ty:ty ),* $(,)? )) => {
+        unsafe extern "C" fn $wrapper(
+            h_list: ddi12::D3D12DDI_API_HCOMMANDLIST,
+            $( $arg: $ty ),*
+        ) {
+            // SAFETY: Core-0114 supplies this live runtime-bypass header for
+            // the duration of the application-to-driver call.
+            let Some(h_list) = (unsafe { queue::command_list_from_api(h_list) }) else {
+                return;
+            };
+            unsafe { $target(h_list, $( $arg ),*) }
+        }
+    };
+}
+
+bypass_list_wrapper!(set_view_instance_mask_0114 => set_view_instance_mask(
+    mask: ddi12::UINT,
+));
+
+unsafe extern "C" fn set_pipeline_state1_0114(
+    h_list: ddi12::D3D12DDI_API_HCOMMANDLIST,
+    h_state_object: ddi12::D3D12DDI_API_HSTATEOBJECT,
+) {
+    // SAFETY: both application handles are valid for this Core-0114 call.
+    let Some(h_list) = (unsafe { queue::command_list_from_api(h_list) }) else {
+        return;
+    };
+    let Some(h_state_object) = (unsafe { queue::state_object_from_api(h_state_object) }) else {
+        return;
+    };
+    unsafe { set_pipeline_state1(h_list, h_state_object) }
+}
+
+bypass_list_wrapper!(dispatch_rays_0114 => dispatch_rays(
+    arg: *const ddi12::D3D12DDIARG_DISPATCH_RAYS_0054,
+));
+bypass_list_wrapper!(rs_set_shading_rate_0114 => rs_set_shading_rate(
+    shading_rate: ddi12::D3D12DDI_SHADING_RATE_0062,
+    combiners: *const ddi12::D3D12DDI_SHADING_RATE_COMBINER_0062,
+));
+bypass_list_wrapper!(dispatch_mesh_0114 => dispatch_mesh(
+    x: ddi12::UINT,
+    y: ddi12::UINT,
+    z: ddi12::UINT,
+));
+bypass_list_wrapper!(set_program_0114 => set_program(
+    p_desc: *const ddi12::D3D12DDI_SET_PROGRAM_DESC_0108,
+));
+bypass_list_wrapper!(dispatch_graph_0114 => dispatch_graph(
+    p_desc: *const ddi12::D3D12DDI_DISPATCH_GRAPH_DESC_0108,
+));
+
 pub(crate) fn install_cmdlist(
     mut filling: Filling<'_, CommandListTable, stage::PresentSlots>,
 ) -> Filling<'_, CommandListTable, stage::MiscSlots> {
@@ -2088,7 +2177,7 @@ pub(crate) fn install_cmdlist(
     table.pfnSetMarker = Some(set_marker);
     table.pfnSetProtectedResourceSession = Some(set_protected_resource_session);
     table.pfnWriteBufferImmediate = Some(write_buffer_immediate);
-    table.pfnSetViewInstanceMask = Some(set_view_instance_mask);
+    table.pfnSetViewInstanceMask = Some(set_view_instance_mask_0114);
 
     // meta-commands — 2
     table.pfnInitializeMetaCommand = Some(initialize_meta_command);
@@ -2099,19 +2188,19 @@ pub(crate) fn install_cmdlist(
     table.pfnEmitRaytracingAccelerationStructurePostbuildInfo =
         Some(emit_raytracing_acceleration_structure_postbuild_info);
     table.pfnCopyRaytracingAccelerationStructure = Some(copy_raytracing_acceleration_structure);
-    table.pfnSetPipelineState1 = Some(set_pipeline_state1);
-    table.pfnDispatchRays = Some(dispatch_rays);
+    table.pfnSetPipelineState1 = Some(set_pipeline_state1_0114);
+    table.pfnDispatchRays = Some(dispatch_rays_0114);
 
     // VRS — 2
-    table.pfnRSSetShadingRate = Some(rs_set_shading_rate);
+    table.pfnRSSetShadingRate = Some(rs_set_shading_rate_0114);
     table.pfnRSSetShadingRateImage = Some(rs_set_shading_rate_image);
 
     // mesh shaders — 1
-    table.pfnDispatchMesh = Some(dispatch_mesh);
+    table.pfnDispatchMesh = Some(dispatch_mesh_0114);
 
     // work graphs — 2
-    table.pfnSetProgram = Some(set_program);
-    table.pfnDispatchGraph = Some(dispatch_graph);
+    table.pfnSetProgram = Some(set_program_0114);
+    table.pfnDispatchGraph = Some(dispatch_graph_0114);
 
     filling.advance()
 }
@@ -2208,6 +2297,10 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L9_REFUSALS.dispatch_mesh_refused,
     &L9_REFUSALS.set_program_refused,
     &L9_REFUSALS.dispatch_graph_refused,
+    // APPENDED with the Core-0116 table transition.
+    &L9_REFUSALS.application_driver_state_refused,
+    &L9_REFUSALS.application_driver_blob_not_specified,
+    &L9_REFUSALS.application_driver_blob_size_zero,
 ];
 
 /// `pfnGetDebugAllocationInfo` answered "no VA infos, no KMT infos".
@@ -2568,6 +2661,13 @@ pub(crate) struct L9Refusals {
     /// `pfnDispatchGraph` refused. **Expected 0**; like `DispatchMeshRefused`,
     /// its symptom is silence.
     dispatch_graph_refused: RefusalCounter,
+    /// Core-0113 application-specific state was requested although Helios
+    /// publishes no driver-managed application blob.
+    application_driver_state_refused: RefusalCounter,
+    /// The truthful status response for the absent application-specific blob.
+    application_driver_blob_not_specified: RefusalCounter,
+    /// The truthful zero-size response for the absent application-specific blob.
+    application_driver_blob_size_zero: RefusalCounter,
 }
 
 pub(crate) static L9_REFUSALS: L9Refusals = L9Refusals {
@@ -2613,9 +2713,7 @@ pub(crate) static L9_REFUSALS: L9Refusals = L9Refusals {
     marker_dropped: RefusalCounter::new("L9MarkerDropped"),
     protected_resource_session_none: RefusalCounter::new("L9ProtectedResourceSessionNone"),
     protected_resource_session_refused: RefusalCounter::new("L9ProtectedResourceSessionRefused"),
-    write_buffer_immediate_calls: RefusalCounter::new(
-        "L9WriteBufferImmediateCalls",
-    ),
+    write_buffer_immediate_calls: RefusalCounter::new("L9WriteBufferImmediateCalls"),
     write_buffer_immediate_bad_arg: RefusalCounter::new("L9WriteBufferImmediateBadArg"),
     write_buffer_immediate_mode_unknown: RefusalCounter::new("L9WriteBufferImmediateModeUnknown"),
     write_buffer_immediate_engine_missing: RefusalCounter::new(
@@ -2637,4 +2735,9 @@ pub(crate) static L9_REFUSALS: L9Refusals = L9Refusals {
     dispatch_mesh_refused: RefusalCounter::new("L9DispatchMeshRefused"),
     set_program_refused: RefusalCounter::new("L9SetProgramRefused"),
     dispatch_graph_refused: RefusalCounter::new("L9DispatchGraphRefused"),
+    application_driver_state_refused: RefusalCounter::new("L9ApplicationDriverStateRefused"),
+    application_driver_blob_not_specified: RefusalCounter::new(
+        "L9ApplicationDriverBlobNotSpecified",
+    ),
+    application_driver_blob_size_zero: RefusalCounter::new("L9ApplicationDriverBlobSizeZero"),
 };
