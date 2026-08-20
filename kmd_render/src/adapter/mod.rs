@@ -32,8 +32,8 @@ mod segments;
 
 pub(crate) use backing::{SystemBackingSnapshot, SystemBackingTable};
 pub(crate) use locks::{
-    dump_ordered_engine_atomics, NotifyOrdered, OrderedEngineTicket, ScanoutGuard,
-    WddmNotifyGuard, WITH_VIRTIO_TORN,
+    dump_ordered_engine_atomics, NotifyOrdered, OrderedEngineTicket, ScanoutGuard, WddmNotifyGuard,
+    WITH_VIRTIO_TORN,
 };
 pub(crate) use read_ledger::{
     dump_counters as read_ledger_dump_counters, reset_counters as read_ledger_reset_counters,
@@ -326,10 +326,8 @@ impl StartedState {
     pub(crate) unsafe fn copy_dxgkrnl_interface(
         source: *const DXGKRNL_INTERFACE,
     ) -> Option<Box<DXGKRNL_INTERFACE>> {
-        const REQUIRED: usize = core::mem::offset_of!(
-            DXGKRNL_INTERFACE,
-            DxgkCbQueryFeatureSupport
-        ) + core::mem::size_of::<DXGKCB_QUERYFEATURESUPPORT>();
+        const REQUIRED: usize = core::mem::offset_of!(DXGKRNL_INTERFACE, DxgkCbQueryFeatureSupport)
+            + core::mem::size_of::<DXGKCB_QUERYFEATURESUPPORT>();
 
         // SAFETY: StartDevice supplies at least the interface prefix containing
         // Size. No other field is read until Size proves its coverage.
@@ -342,8 +340,16 @@ impl StartedState {
         // SAFETY: zeroing the complete heap destination makes absent future
         // fields NULL; the source copy is bounded by both Size and our layout.
         unsafe {
-            core::ptr::write_bytes(copy.as_mut_ptr() as *mut u8, 0, core::mem::size_of::<DXGKRNL_INTERFACE>());
-            core::ptr::copy_nonoverlapping(source as *const u8, copy.as_mut_ptr() as *mut u8, bytes);
+            core::ptr::write_bytes(
+                copy.as_mut_ptr() as *mut u8,
+                0,
+                core::mem::size_of::<DXGKRNL_INTERFACE>(),
+            );
+            core::ptr::copy_nonoverlapping(
+                source as *const u8,
+                copy.as_mut_ptr() as *mut u8,
+                bytes,
+            );
             Some(copy.assume_init())
         }
     }
@@ -474,6 +480,11 @@ pub(crate) struct TransportGeneration {
 }
 
 pub struct AdapterContext {
+    /// AddDevice's exact PDO, retained only so each HQA1 context can allocate
+    /// one IoWorkItem for PASSIVE HOB1 snapshot/validation.  The work item is
+    /// context-owned and joined before context teardown; this is not an
+    /// adapter work queue or an execution identity.
+    physical_device_object: PDEVICE_OBJECT,
     /// Service-key knobs as read at **AddAdapter**, for the window before
     /// StartDevice has published its own snapshot.
     ///
@@ -1097,6 +1108,13 @@ pub(crate) fn clear_programming_gate(gate: &AtomicU64, ticket: ProgrammingTicket
 }
 
 impl AdapterContext {
+    /// Exact PDO supplied by dxgkrnl at AddDevice.  Outer HQA1 contexts use it
+    /// only to allocate their own one-shot PASSIVE work item; it is never an
+    /// allocation, session, or submission lookup key.
+    pub(crate) fn physical_device_object(&self) -> PDEVICE_OBJECT {
+        self.physical_device_object
+    }
+
     /// Allocate a fully initialised adapter context and return only a pointer to
     /// it.
     ///
@@ -1128,13 +1146,11 @@ impl AdapterContext {
     /// Domain or fixed owner-storage exhaustion is refused before allocating
     /// this context or initializing any dispatcher object.
     ///
-    /// Takes no PDO. AddAdapter is handed one, and this context used to store
-    /// it in a `pub pdo` field that NOTHING ever read -- every path to the OS
-    /// goes through the `DXGKRNL_INTERFACE` callback table saved at
-    /// StartDevice, not through the device object. T6/R917.
-    pub(crate) fn create() -> Result<NonNull<AdapterContext>, TransportOwnerCreateError> {
+    pub(crate) fn create(
+        physical_device_object: PDEVICE_OBJECT,
+    ) -> Result<NonNull<AdapterContext>, TransportOwnerCreateError> {
         let transport_owner = TransportOwner::unbound()?;
-        let raw = Box::into_raw(Box::new(Self::new(transport_owner)));
+        let raw = Box::into_raw(Box::new(Self::new(transport_owner, physical_device_object)));
         // SAFETY: `Box::into_raw` never returns null.
         let context = unsafe { NonNull::new_unchecked(raw) };
         // SAFETY: `context` is this owner's final heap address, freshly allocated,
@@ -1150,8 +1166,9 @@ impl AdapterContext {
 
     /// Private: an `AdapterContext` by value is only ever a transient inside
     /// [`Self::create`], before the in-place dispatcher init runs.
-    fn new(transport_owner: TransportOwner) -> Self {
+    fn new(transport_owner: TransportOwner, physical_device_object: PDEVICE_OBJECT) -> Self {
         Self {
+            physical_device_object,
             // PASSIVE_LEVEL: `create` is called from AddAdapter. Read here so the
             // AddAdapter-time caps/segment queries — which run BEFORE
             // StartDevice — answer from the registry rather than from
@@ -1167,8 +1184,7 @@ impl AdapterContext {
             committed_mode: crate::ddi::committed_mode::CommittedModeStorage::new(),
             direct_scanout: crate::ddi::direct_scanout::DirectScanoutRuntime::new(),
             native_fence: Arc::new(crate::ddi::native_fence::NativeFenceAdapterState::new()),
-            k11_completion:
-                crate::ddi::session_transport::K11CompletionRundown::new(),
+            k11_completion: crate::ddi::session_transport::K11CompletionRundown::new(),
             last_completed_fence: AtomicU32::new(0),
             wddm_notify_lock: UnsafeCell::new(0),
             ordered_engine: UnsafeCell::new(locks::allocate_ordered_engine_frontier()),
@@ -1789,16 +1805,21 @@ impl AdapterContext {
         // pins the separately boxed queue. Unlike that publisher, this phase
         // retains the caller's real PASSIVE_LEVEL and may therefore perform PCI
         // configuration status access without holding `virtio_lock`.
-        let reset = unsafe { queue.as_ref().reset_status_and_poll(passive, expected_instance) };
+        let reset = unsafe {
+            queue
+                .as_ref()
+                .reset_status_and_poll(passive, expected_instance)
+        };
         self.d4_dirql_readers.fetch_sub(1, Ordering::SeqCst);
         let (status, spins) = reset?;
         // The device is now reset. Re-enter the ordinary transport lock only to
         // retire value/DMA-buffer bookkeeping; no PCI callback or wait occurs
         // in this phase.
-        let finished = self.with_virtio(|gpu| {
-            gpu.finish_physical_reset_and_abort(expected_instance, status, spins)
-        })
-        .map_err(|_| crate::virtio::VirtioError::DeviceError)??;
+        let finished = self
+            .with_virtio(|gpu| {
+                gpu.finish_physical_reset_and_abort(expected_instance, status, spins)
+            })
+            .map_err(|_| crate::virtio::VirtioError::DeviceError)??;
         if finished == 0 {
             crate::ddi::native_render::drain_host_terminals(self);
         }
@@ -1975,9 +1996,9 @@ impl AdapterContext {
         if self.d4_dirql_transport_retained.load(Ordering::Acquire) != 0 {
             return true;
         }
-        match self.with_virtio(|gpu| {
-            gpu.direct_queue_holds_allocation(handle, generation, resource_id)
-        }) {
+        match self
+            .with_virtio(|gpu| gpu.direct_queue_holds_allocation(handle, generation, resource_id))
+        {
             Ok(Ok(holds)) => holds,
             // A live transport whose queue cannot be observed is ambiguous;
             // retain the backing. No transport means no fixed descriptor can

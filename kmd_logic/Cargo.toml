@@ -26,11 +26,9 @@ crate-type = ["lib"]
 # kernel state by construction (§10.3: "no host resource token, resid, PID,
 # process handle, synchronization object, mutable value, or independently
 # usable identity"). The alternative was worse and there is prior art for how
-# much worse: `native_fence_lifecycle` below re-declares the whole HNF1 offset
-# table locally because this edge was absent, which is a second declaration of
-# a wire record and exactly what the "shared private data has ONE declaration"
-# directive forbids. K4 models the allocation-identity state machine against
-# protocol's own validators instead.
+# much worse: the old native-fence lifecycle code re-declared the whole HNF1
+# offset table locally because this edge was absent. HNF1 now follows the same
+# rule as HWA2/HVM1/HOC1 and consumes protocol's record and validators directly.
 #
 # The edge does pull `bytemuck` into the graph transitively. That is not a
 # regression of the rule above: `bytemuck` is not re-exported by

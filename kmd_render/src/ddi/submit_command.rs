@@ -962,8 +962,7 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
     // completion this driver controls. It is minted here regardless, because the
     // flush executor's ownership gate decides with it. D4 has its own exact
     // PlaneState lifetime and must not mint an unconsumed legacy lease.
-    let legacy_epoch = (!crate::virtio::KMD_D2_OWNER_ENABLED)
-        .then(|| adapter.mint_present_epoch());
+    let legacy_epoch = (!crate::virtio::KMD_D2_OWNER_ENABLED).then(|| adapter.mint_present_epoch());
     if unsafe {
         crate::ddi::display::arm_dma_flip_programming(
             adapter,
@@ -1105,15 +1104,36 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
         SUBMIT_PAGING_COUNT.fetch_add(1, Ordering::Relaxed);
     }
 
-    // K6: HOS1 on the D3D12-virtual HQA1 arm. It is VALIDATED and never
-    // enqueued, and it does not take the packet over — an outer context is an
-    // ordinary D3D runtime context whose presents still need the legacy decode
-    // below, and HOS1's magic is disjoint from both present magics.
+    // F21: an HQA1 D3D12 context is an exclusive HOS1 submission lane. Admit
+    // its exact K9 ticket before the context-owned PASSIVE worker takes HOC1
+    // custody; neither a refusal nor an async terminal may fall through to the
+    // compatibility FIFO or present-marker decoders below.
     if !submit.hContext.is_null() {
         let context = unsafe { crate::device::ContextHandleRef::from_raw(submit.hContext) };
-        if let Some(outer) = context.as_ref().and_then(|c| c.outer_submit()) {
-            // SAFETY: the private-data pair for this submission.
-            unsafe { crate::ddi::native_render::submit_virtual(outer, submit) };
+        if let Some((native, session, device, outer)) =
+            context.as_ref().and_then(|c| c.outer_native())
+        {
+            let _ = adapter.with_k11_completion(|| {
+                let Some(ticket) = adapter
+                    .with_wddm_notify_lock(|guard| guard.admit_ordered_engine_submission(fence))
+                else {
+                    return;
+                };
+                // SAFETY: the role resolution above proves all four direct
+                // owners and this submission's private-data/GPUVA pair.
+                let disposition = unsafe {
+                    crate::ddi::native_render::submit_virtual(
+                        native, session, device, outer, submit, ticket,
+                    )
+                };
+                if !matches!(
+                    disposition,
+                    crate::ddi::native_render::NativeSubmitDisposition::Pending
+                ) {
+                    let _ = super::interrupt::fail_ordered_engine_submission(adapter, ticket);
+                }
+            });
+            return STATUS_SUCCESS;
         }
     }
 
@@ -1131,8 +1151,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
     };
     // The submission is accepted regardless of how the notification went; a
     // non-SUCCESS return here bugchecks dxgmms2 with 0x119 Arg1=2.
-    let SubmitAck::Accepted =
-        note_and_maybe_signal(adapter, fence, is_paging, present_fence, None);
+    let SubmitAck::Accepted = note_and_maybe_signal(adapter, fence, is_paging, present_fence, None);
     STATUS_SUCCESS
 }
 
@@ -1173,6 +1192,31 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
     let h_context = unsafe { submit.__bindgen_anon_1.hContext };
     if !h_context.is_null() {
         let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
+        if let Some((native, session, _device, _outer)) =
+            context.as_ref().and_then(|c| c.outer_native())
+        {
+            let _ = adapter.with_k11_completion(|| {
+                let Some(ticket) = adapter
+                    .with_wddm_notify_lock(|guard| guard.admit_ordered_engine_submission(fence))
+                else {
+                    return;
+                };
+                // SAFETY: the attached context is the direct owner of this
+                // scheduler private-data window.
+                let disposition = unsafe {
+                    crate::ddi::native_render::submit_outer_physical(
+                        native, session, submit, ticket,
+                    )
+                };
+                if !matches!(
+                    disposition,
+                    crate::ddi::native_render::NativeSubmitDisposition::Pending
+                ) {
+                    let _ = super::interrupt::fail_ordered_engine_submission(adapter, ticket);
+                }
+            });
+            return STATUS_SUCCESS;
+        }
         if let Some((native, session)) = context.as_ref().and_then(|c| c.native()) {
             // One fixed adapter rundown guard spans scheduler admission and the
             // synchronous K11-control completion path.  Queue work moves its
@@ -1206,30 +1250,24 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
                             // The direct context admitted a different scheduler
                             // fence than the callback supplied. Fail this generation
                             // closed; never substitute either scalar.
-                            let _ = super::interrupt::fail_ordered_engine_submission(
-                                adapter, ticket,
-                            );
+                            let _ =
+                                super::interrupt::fail_ordered_engine_submission(adapter, ticket);
                         }
                     } else if matches!(
                         disposition,
                         crate::ddi::native_render::NativeSubmitDisposition::Revoked
                     ) {
-                        let _ =
-                            super::interrupt::fail_ordered_engine_submission(adapter, ticket);
+                        let _ = super::interrupt::fail_ordered_engine_submission(adapter, ticket);
                     }
                     Some((disposition, ticket))
                 })
                 .flatten();
             let SubmitAck::Accepted = match disposition {
-                Some((
-                    crate::ddi::native_render::NativeSubmitDisposition::HostCompleted(_),
-                    _,
-                ))
+                Some((crate::ddi::native_render::NativeSubmitDisposition::HostCompleted(_), _))
                 | Some((crate::ddi::native_render::NativeSubmitDisposition::Pending, _)) => {
                     SubmitAck::Accepted
                 }
-                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, _))
-                | None => {
+                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, _)) | None => {
                     // The host-completed marker belonged to a session whose
                     // exact transport/fence authority was revoked before this
                     // callback, or reset already closed the adapter completion
@@ -1253,8 +1291,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
         )
     };
     // As above: accepted regardless of the notification outcome.
-    let SubmitAck::Accepted =
-        note_and_maybe_signal(adapter, fence, is_paging, present_fence, None);
+    let SubmitAck::Accepted = note_and_maybe_signal(adapter, fence, is_paging, present_fence, None);
     STATUS_SUCCESS
 }
 
@@ -1521,9 +1558,11 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
             }
         };
         if reserve != 0 {
-            let exact_window = gpu
-                .host_visible()
-                .is_some_and(|window| adapter.bar_segment().is_some_and(|bar| window.base == bar.gpa));
+            let exact_window = gpu.host_visible().is_some_and(|window| {
+                adapter
+                    .bar_segment()
+                    .is_some_and(|bar| window.base == bar.gpa)
+            });
             if !exact_window || !gpu.configure_window_reserve(reserve) {
                 crate::diag::fault(crate::diag::FaultCounter::StVioR, u32::MAX);
                 return match crate::virtio::VirtioGpu::reset_unpublished_or_retain(passive, gpu) {
@@ -1599,8 +1638,7 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
                 let status = match cleanup {
                     Ok(()) => {
                         crate::ddi::direct_scanout::complete_verified_reset(passive, adapter);
-                        let _ =
-                            adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
+                        let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
                         adapter.reset_display_publication_state();
                         let _ = unsafe { adapter.set_reset_venus_context(0) };
                         start_error.into()
@@ -1671,6 +1709,17 @@ pub unsafe extern "C" fn dxgkddi_render(
     // one dereferences null in a DDI, which is a silent graphics deadlock.
     if !h_context.is_null() {
         let context = unsafe { crate::device::ContextHandleRef::from_raw(h_context) };
+        if let Some((native, session, device, outer)) =
+            context.as_ref().and_then(|c| c.outer_native())
+        {
+            // SAFETY: the attached role supplies the exact context/session/
+            // device graph and Render's live command/allocation windows.
+            return unsafe {
+                crate::ddi::native_render::render_outer_physical(
+                    native, session, device, outer, args,
+                )
+            };
+        }
         if let Some((native, session)) = context.as_ref().and_then(|c| c.native()) {
             // SAFETY: `args` is dxgkrnl's live argument struct, and `native` /
             // `session` belong to the context handle it just passed.

@@ -8,11 +8,7 @@ use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 
 pub unsafe extern "C" fn dxgkddi_add_device(
-    // The DDI hands us the PDO; nothing in this driver retains or uses it.
-    // Every path to the OS goes through the DXGKRNL_INTERFACE callback table
-    // saved at StartDevice. T6/R917 deleted the `AdapterContext::pdo` field
-    // that stored it and was never read.
-    _physical_device_object: PDEVICE_OBJECT,
+    physical_device_object: PDEVICE_OBJECT,
     miniport_device_context: *mut *mut c_void,
 ) -> NTSTATUS {
     crate::kmsg(c"Helios: AddDevice\n");
@@ -32,7 +28,10 @@ pub unsafe extern "C" fn dxgkddi_add_device(
     // cannot move the context afterwards. The context is leaked to a raw
     // pointer; Dxgkrnl returns it to us on every DDI and we reclaim it in
     // DxgkDdiRemoveDevice.
-    let raw = match AdapterContext::create() {
+    if physical_device_object.is_null() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let raw = match AdapterContext::create(physical_device_object) {
         Ok(raw) => raw,
         Err(crate::virtio::TransportOwnerCreateError::DomainExhausted) => {
             crate::kmsg(c"Helios: AddDevice transport domain exhausted\n");

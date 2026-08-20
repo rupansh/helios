@@ -68,27 +68,27 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use bytemuck::bytes_of;
 use helios_protocol::{
     helios_hwa2_kind_is_image, helios_hwa2_swizzle_is_direct_flip_capable,
     HeliosOuterCommandAllocationV1, HeliosVenusMemoryAllocationV1, HeliosWddmAllocationDescV2,
-    HeliosWddmPlaneRecordV2, Hvm1Role, Hvm1Stage, D3DDDI_ID_UNINITIALIZED, HELIOS_HOC1_BYTES,
-    HELIOS_HOC1_MAGIC, HELIOS_HVM1_MAGIC, HELIOS_HVM1_SEGMENT_PAGE_SHIFT, HELIOS_HVM1_SIZE,
-    HELIOS_HWA2_BIND_RENDER_TARGET, HELIOS_HWA2_BIND_SHADER_RESOURCE,
-    HELIOS_HWA2_BIND_UNORDERED_ACCESS, HELIOS_HWA2_BYTES, HELIOS_HWA2_FLAG_CPU_VISIBLE,
-    HELIOS_HWA2_FLAG_CROSS_ADAPTER, HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY,
-    HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE, HELIOS_HWA2_FLAG_DISPLAYABLE,
-    HELIOS_HWA2_FLAG_PRIMARY, HELIOS_HWA2_FLAG_PROTECTED, HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED,
-    HELIOS_HWA2_FLAG_SHARED, HELIOS_HWA2_FLAG_STANDARD, HELIOS_HWA2_FLAG_STEREO,
-    HELIOS_HWA2_KIND_BUFFER, HELIOS_HWA2_KIND_IMAGE, HELIOS_HWA2_KIND_PAGING_OBJECT,
-    HELIOS_HWA2_KIND_STANDARD_PRIMARY, HELIOS_HWA2_KIND_STANDARD_SHADOW,
-    HELIOS_HWA2_KIND_STANDARD_STAGING, HELIOS_HWA2_MAGIC, HELIOS_HWA2_MEMORY_CPU_VISIBLE,
-    HELIOS_HWA2_MEMORY_DEVICE_LOCAL, HELIOS_HWA2_MISC_GDI_COMPATIBLE, HELIOS_HWA2_SWIZZLE_LINEAR,
+    HeliosWddmPlaneRecordV2, Hvm1Role, Hvm1Stage, VirtioGpuMemEntry, D3DDDI_ID_UNINITIALIZED,
+    HELIOS_HOC1_BYTES, HELIOS_HOC1_MAGIC, HELIOS_HOC1_POOL_BYTES, HELIOS_HVM1_MAGIC,
+    HELIOS_HVM1_SEGMENT_PAGE_SHIFT, HELIOS_HVM1_SIZE, HELIOS_HWA2_BIND_RENDER_TARGET,
+    HELIOS_HWA2_BIND_SHADER_RESOURCE, HELIOS_HWA2_BIND_UNORDERED_ACCESS, HELIOS_HWA2_BYTES,
+    HELIOS_HWA2_FLAG_CPU_VISIBLE, HELIOS_HWA2_FLAG_CROSS_ADAPTER,
+    HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY, HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE,
+    HELIOS_HWA2_FLAG_DISPLAYABLE, HELIOS_HWA2_FLAG_PRIMARY, HELIOS_HWA2_FLAG_PROTECTED,
+    HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED, HELIOS_HWA2_FLAG_SHARED, HELIOS_HWA2_FLAG_STANDARD,
+    HELIOS_HWA2_FLAG_STEREO, HELIOS_HWA2_KIND_BUFFER, HELIOS_HWA2_KIND_IMAGE,
+    HELIOS_HWA2_KIND_PAGING_OBJECT, HELIOS_HWA2_KIND_STANDARD_PRIMARY,
+    HELIOS_HWA2_KIND_STANDARD_SHADOW, HELIOS_HWA2_KIND_STANDARD_STAGING, HELIOS_HWA2_MAGIC,
+    HELIOS_HWA2_MEMORY_CPU_VISIBLE, HELIOS_HWA2_MEMORY_DEVICE_LOCAL,
+    HELIOS_HWA2_MISC_GDI_COMPATIBLE, HELIOS_HWA2_SWIZZLE_LINEAR,
     HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL, HELIOS_PACKAGE_GENERATION, HELIOS_SEGMENT_ID_HLM1,
-    VirtioGpuMemEntry, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
-    VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
+    VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
 };
 use wdk_sys::ntddk::{
     IoAllocateMdl, IoFreeMdl, KeClearEvent, KeGetCurrentIrql, KeInitializeEvent, KeSetEvent,
@@ -107,6 +107,7 @@ use crate::dxgk::_D3DKMDT_STANDARDALLOCATION_TYPE::{
 use crate::dxgk::*;
 use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
+use crate::virtio::hal::DmaBuffer;
 use helios_kmd_logic::snapshot_bind::SnapshotDescriptor;
 use helios_kmd_logic::ScanoutFormat;
 
@@ -121,6 +122,20 @@ const BACKING_STORE_BOUND: u32 = 2;
 extern "C" {
     fn helios_mm_probe_and_lock_pages_seh(mdl: PMDL) -> i32;
     fn helios_mm_get_mdl_pfn_array(mdl: PMDL) -> *const u64;
+}
+
+const OUTER_GPUVA_MAX_RANGES: usize = 256;
+
+#[derive(Clone, Copy)]
+struct OuterGpuVaMapping {
+    process: usize,
+    gpuva: u64,
+    allocation_offset: u64,
+    bytes: u64,
+}
+
+struct OuterGpuVaState {
+    mappings: SpinLock<crate::sync::FixedVec<OuterGpuVaMapping>>,
 }
 
 /// Sentinel for [`AllocationContext::bar_placed`]: not placed in the BAR segment.
@@ -149,6 +164,13 @@ struct AllocationContext {
     /// The canonical resource finalizer keeps the MDL locked until host UNREF
     /// or verified physical reset, which is exactly this mapping's lifetime.
     backing_store_va: AtomicUsize,
+    /// MDL retained only for the non-renderer HOC1 shared backing.  HVM1 MDLs
+    /// continue to live in their canonical virtio resource finalizer.
+    backing_store_mdl: AtomicUsize,
+    /// Lazily allocated per-allocation GPUVA mappings.  The pointer is created
+    /// only when an exact device open publishes this allocation into an HQA1
+    /// device graph; there is no adapter/process lookup table.
+    outer_gpuva: AtomicPtr<OuterGpuVaState>,
     /// Exact live HTS1 session that owns this role-1 reply pool, or zero.
     /// Internal direct-object edge only: never serialized, searched, logged, or
     /// accepted from a caller. The owning OpenAllocation holds the strong ref.
@@ -331,6 +353,27 @@ struct AllocationContext {
 impl AllocationContext {
     fn resource_id(&self) -> u32 {
         self.resource_id.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for AllocationContext {
+    fn drop(&mut self) {
+        let gpuva = self
+            .outer_gpuva
+            .swap(core::ptr::null_mut(), Ordering::AcqRel);
+        if !gpuva.is_null() {
+            drop(unsafe { Box::from_raw(gpuva) });
+        }
+        let mdl = self.backing_store_mdl.swap(0, Ordering::AcqRel) as PMDL;
+        if !mdl.is_null() {
+            self.backing_store_va.store(0, Ordering::Relaxed);
+            self.backing_store_state
+                .store(BACKING_STORE_UNBOUND, Ordering::Release);
+            unsafe {
+                wdk_sys::ntddk::MmUnlockPages(mdl);
+                IoFreeMdl(mdl);
+            }
+        }
     }
 }
 
@@ -890,6 +933,104 @@ struct OpenAllocationContext {
     /// Render reaches it only from the `hDeviceSpecificAllocation` in its own
     /// allocation list.
     execution: Option<OpenExecutionBinding>,
+    /// Generic open-object rundown used by the D3D12 GPUVA resolver, including
+    /// HOC1 which intentionally has no renderer resource attachment.
+    outer: OpenOuterBinding,
+}
+
+#[derive(Clone, Copy)]
+struct OpenOuterRundown {
+    open: bool,
+    active: u32,
+}
+
+struct OpenOuterBinding {
+    rundown: SpinLock<OpenOuterRundown>,
+    drained: UnsafeCell<KEVENT>,
+}
+
+unsafe impl Send for OpenOuterBinding {}
+unsafe impl Sync for OpenOuterBinding {}
+
+impl OpenOuterBinding {
+    fn new() -> Self {
+        Self {
+            rundown: SpinLock::new(OpenOuterRundown {
+                open: true,
+                active: 0,
+            }),
+            drained: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+        }
+    }
+
+    unsafe fn init_event(&self) {
+        unsafe { KeInitializeEvent(self.drained.get(), 0, 1) };
+    }
+
+    fn acquire(&self) -> bool {
+        let mut state = self.rundown.lock();
+        if !state.open || state.active == u32::MAX {
+            return false;
+        }
+        if state.active == 0 {
+            unsafe { KeClearEvent(self.drained.get()) };
+        }
+        state.active += 1;
+        true
+    }
+
+    fn release(&self) {
+        let signal = {
+            let mut state = self.rundown.lock();
+            debug_assert!(state.active != 0);
+            state.active = state.active.saturating_sub(1);
+            state.active == 0
+        };
+        if signal {
+            unsafe { KeSetEvent(self.drained.get(), 0, 0) };
+        }
+    }
+
+    fn close(&self) {
+        let active = {
+            let mut state = self.rundown.lock();
+            state.open = false;
+            state.active
+        };
+        if active != 0 {
+            let _ = unsafe {
+                KeWaitForSingleObject(self.drained.get() as PVOID, 0, 0, 0, core::ptr::null_mut())
+            };
+        }
+    }
+}
+
+/// Small lifetime token taken under the owning device's open-table lock before
+/// a potentially blocking PASSIVE resource attachment.
+pub(crate) struct OuterBindGuard {
+    open: core::ptr::NonNull<OpenAllocationContext>,
+}
+
+unsafe impl Send for OuterBindGuard {}
+
+impl OuterBindGuard {
+    pub(crate) fn bind(
+        &self,
+        passive: PassiveLevel,
+        session: core::ptr::NonNull<crate::ddi::translation_session::SessionObject>,
+        session_generation: u64,
+    ) -> bool {
+        let open = unsafe { self.open.as_ref() };
+        open.execution
+            .as_ref()
+            .is_none_or(|binding| binding.bind_outer(passive, session, session_generation))
+    }
+}
+
+impl Drop for OuterBindGuard {
+    fn drop(&mut self) {
+        unsafe { self.open.as_ref() }.outer.release();
+    }
 }
 
 /// What an open published, as K6's Render and Patch read it back.
@@ -921,6 +1062,8 @@ const OPEN_EXECUTION_ATTACHED: u32 = 2;
 struct OpenExecutionRundown {
     open: bool,
     active: u32,
+    session: usize,
+    owns_session_reference: bool,
     attachment: u32,
     resource_id: u32,
 }
@@ -933,13 +1076,11 @@ struct OpenExecutionRundown {
 /// the strong session reference.  No generation or resource scalar can find
 /// this object; they are validation facts after the direct edge is reached.
 struct OpenExecutionBinding {
-    session: core::ptr::NonNull<crate::ddi::translation_session::SessionObject>,
     allocation: usize,
     /// Roles 2-4 and C57 retain a second session reference specifically for
     /// executor custody. Role 1 is opened while the session is provisional and
     /// borrows the adjacent `reply_pool_session` reference instead; close still
     /// revokes this binding before releasing that owner.
-    owns_session_reference: bool,
     rundown: SpinLock<OpenExecutionRundown>,
     drained: UnsafeCell<KEVENT>,
     /// Signaled whenever the one-time CTX_ATTACH transition is not in flight.
@@ -961,12 +1102,28 @@ impl OpenExecutionBinding {
         owns_session_reference: bool,
     ) -> Self {
         Self {
-            session,
             allocation,
-            owns_session_reference,
             rundown: SpinLock::new(OpenExecutionRundown {
                 open: true,
                 active: 0,
+                session: session.as_ptr() as usize,
+                owns_session_reference,
+                attachment: OPEN_EXECUTION_UNATTACHED,
+                resource_id: 0,
+            }),
+            drained: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+            attachment_ready: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+        }
+    }
+
+    fn new_unbound(allocation: usize) -> Self {
+        Self {
+            allocation,
+            rundown: SpinLock::new(OpenExecutionRundown {
+                open: true,
+                active: 0,
+                session: 0,
+                owns_session_reference: false,
                 attachment: OPEN_EXECUTION_UNATTACHED,
                 resource_id: 0,
             }),
@@ -988,12 +1145,12 @@ impl OpenExecutionBinding {
         expected_session: core::ptr::NonNull<crate::ddi::translation_session::SessionObject>,
         expected_generation: u64,
     ) -> Option<OpenExecutionUse> {
-        if self.session != expected_session {
-            return None;
-        }
         {
             let mut state = self.rundown.lock();
-            if !state.open || state.active == u32::MAX {
+            if !state.open
+                || state.active == u32::MAX
+                || state.session != expected_session.as_ptr() as usize
+            {
                 return None;
             }
             if state.active == 0 {
@@ -1056,16 +1213,15 @@ impl OpenExecutionBinding {
                 continue;
             }
             let attached = crate::ddi::translation_session::attach_execution_resource(
-                self.session,
+                expected_session,
                 passive,
                 facts.resource_id,
                 facts.transport_instance,
             );
             let published = {
                 let mut state = self.rundown.lock();
-                let publish = attached.is_ok()
-                    && state.open
-                    && state.attachment == OPEN_EXECUTION_ATTACHING;
+                let publish =
+                    attached.is_ok() && state.open && state.attachment == OPEN_EXECUTION_ATTACHING;
                 if publish {
                     state.resource_id = facts.resource_id;
                     state.attachment = OPEN_EXECUTION_ATTACHED;
@@ -1083,7 +1239,7 @@ impl OpenExecutionBinding {
                 // reference away.
                 if attached.is_ok() {
                     crate::ddi::translation_session::detach_execution_resource(
-                        self.session,
+                        expected_session,
                         passive,
                         facts.resource_id,
                     );
@@ -1103,6 +1259,101 @@ impl OpenExecutionBinding {
         Some(guard)
     }
 
+    /// Bind an ordinary D3D-device open to the exact HQA1 session before any
+    /// scheduler-level submit can name it.  The host CTX_ATTACH round trip runs
+    /// at PASSIVE and is one-shot; a second device/session is refused.
+    fn bind_outer(
+        &self,
+        passive: PassiveLevel,
+        session: core::ptr::NonNull<crate::ddi::translation_session::SessionObject>,
+        session_generation: u64,
+    ) -> bool {
+        if crate::ddi::translation_session::execution_session_generation(session)
+            != Some(session_generation)
+        {
+            return false;
+        }
+        let session_word = session.as_ptr() as usize;
+        {
+            let state = self.rundown.lock();
+            if !state.open {
+                return false;
+            }
+            if state.session != 0 {
+                if state.session != session_word {
+                    return false;
+                }
+                if state.attachment == OPEN_EXECUTION_ATTACHED {
+                    return true;
+                }
+            }
+        }
+        if self.rundown.lock().session == 0 {
+            let Some(retained) =
+                crate::ddi::translation_session::retain_direct_execution_session(session)
+            else {
+                return false;
+            };
+            let published = {
+                let mut state = self.rundown.lock();
+                if state.open && state.session == 0 {
+                    state.session = retained.as_ptr() as usize;
+                    state.owns_session_reference = true;
+                    true
+                } else {
+                    false
+                }
+            };
+            if !published {
+                unsafe { crate::ddi::translation_session::release_execution_session(retained) };
+            }
+        }
+        let Some(facts) = (unsafe { hnr2_execution_allocation_facts(self.allocation) }) else {
+            return false;
+        };
+        self.acquire(passive, session, facts.allocation_generation)
+            .is_some()
+    }
+
+    /// DISPATCH-safe acquisition after [`Self::bind_outer`] completed the only
+    /// host attach.  No wait, allocation, lookup, or control-queue operation is
+    /// reachable from this method.
+    fn acquire_attached(
+        &self,
+        expected_session: core::ptr::NonNull<crate::ddi::translation_session::SessionObject>,
+        expected_generation: u64,
+    ) -> Option<OpenExecutionUse> {
+        let facts = unsafe { hnr2_execution_allocation_facts(self.allocation) }?;
+        if facts.allocation_generation != expected_generation {
+            return None;
+        }
+        {
+            let mut state = self.rundown.lock();
+            if !state.open
+                || state.active == u32::MAX
+                || state.session != expected_session.as_ptr() as usize
+                || state.attachment != OPEN_EXECUTION_ATTACHED
+                || state.resource_id != facts.resource_id
+            {
+                return None;
+            }
+            if state.active == 0 {
+                unsafe { KeClearEvent(self.drained.get()) };
+            }
+            state.active += 1;
+        }
+        Some(OpenExecutionUse {
+            owner: core::ptr::NonNull::from(self),
+            allocation_generation: facts.allocation_generation,
+            resource_id: facts.resource_id,
+            transport_instance: facts.transport_instance,
+            byte_size: facts.byte_size,
+            memory_type_index: facts.memory_type_index,
+            hvm1_role: facts.hvm1_role,
+            kernel_va: facts.kernel_va,
+        })
+    }
+
     fn close(self, passive: PassiveLevel) {
         let active = {
             let mut state = self.rundown.lock();
@@ -1114,34 +1365,41 @@ impl OpenExecutionBinding {
         };
         if active != 0 {
             let _ = unsafe {
-                KeWaitForSingleObject(
-                    self.drained.get() as PVOID,
-                    0,
-                    0,
-                    0,
-                    core::ptr::null_mut(),
-                )
+                KeWaitForSingleObject(self.drained.get() as PVOID, 0, 0, 0, core::ptr::null_mut())
             };
         }
-        let (attachment, resource_id) = {
+        let (session, owns_session_reference, attachment, resource_id) = {
             let mut state = self.rundown.lock();
-            let pair = (state.attachment, state.resource_id);
+            let tuple = (
+                state.session,
+                state.owns_session_reference,
+                state.attachment,
+                state.resource_id,
+            );
+            state.session = 0;
+            state.owns_session_reference = false;
             state.attachment = OPEN_EXECUTION_UNATTACHED;
             state.resource_id = 0;
-            pair
+            tuple
         };
+        let session =
+            core::ptr::NonNull::new(session as *mut crate::ddi::translation_session::SessionObject);
         if attachment == OPEN_EXECUTION_ATTACHED && resource_id != 0 {
-            crate::ddi::translation_session::detach_execution_resource(
-                self.session,
-                passive,
-                resource_id,
-            );
+            if let Some(session) = session {
+                crate::ddi::translation_session::detach_execution_resource(
+                    session,
+                    passive,
+                    resource_id,
+                );
+            }
         }
-        if self.owns_session_reference {
+        if owns_session_reference {
             // SAFETY: `new` consumed the exact strong reference and close runs
             // once. Role 1 instead borrows the still-live adjacent reply-pool
             // reference, which its caller releases only after this returns.
-            unsafe { crate::ddi::translation_session::release_execution_session(self.session) };
+            if let Some(session) = session {
+                unsafe { crate::ddi::translation_session::release_execution_session(session) };
+            }
         }
     }
 }
@@ -1179,6 +1437,205 @@ impl Drop for OpenExecutionUse {
             unsafe { KeSetEvent(owner.drained.get(), 0, 0) };
         }
     }
+}
+
+/// Move-only custody obtained from the owning DeviceContext's bounded open set.
+/// The optional execution guard proves the exact resource remains attached to
+/// this HTS1 session; HOC1 deliberately has none and is retained by `outer`.
+pub(crate) struct OpenOuterUse {
+    open: core::ptr::NonNull<OpenAllocationContext>,
+    execution: Option<OpenExecutionUse>,
+    identity: OpenIdentity,
+    allocation_offset: u64,
+}
+
+unsafe impl Send for OpenOuterUse {}
+
+impl OpenOuterUse {
+    pub(crate) fn generation(&self) -> u64 {
+        self.identity.generation
+    }
+
+    pub(crate) fn resource_id(&self) -> Option<u32> {
+        self.execution.as_ref().map(|guard| guard.resource_id)
+    }
+
+    pub(crate) fn transport_instance(&self) -> Option<u64> {
+        self.execution
+            .as_ref()
+            .map(|guard| guard.transport_instance)
+    }
+
+    /// Snapshot one submitted HOC1 extent into a caller-owned KMD-private DMA
+    /// buffer.  The caller runs at PASSIVE_LEVEL (the exact context work item),
+    /// while `self` retains both the device-specific open and its permanent
+    /// kernel mapping.  No arbitrary GPUVA is dereferenced here: GPUVA
+    /// resolution already selected this exact HOC1 open and produced the
+    /// allocation-relative offset below.
+    pub(crate) fn copy_hoc1(&self, total_bytes: u64, target: &mut DmaBuffer) -> bool {
+        let Ok(total_bytes) = usize::try_from(total_bytes) else {
+            return false;
+        };
+        if self.identity.kind != ALLOC_KIND_HOC1
+            || self.execution.is_some()
+            || total_bytes == 0
+            || total_bytes != target.as_slice().len()
+        {
+            return false;
+        }
+        let open = unsafe { self.open.as_ref() };
+        let Some(allocation) = (unsafe { resolve_alloc(open.allocation as HANDLE) }) else {
+            return false;
+        };
+        if allocation.kind != ALLOC_KIND_HOC1
+            || allocation.generation != self.identity.generation
+            || allocation.backing_store_state.load(Ordering::Acquire) != BACKING_STORE_BOUND
+        {
+            return false;
+        }
+        let Some(source) =
+            core::ptr::NonNull::new(allocation.backing_store_va.load(Ordering::Relaxed) as *mut u8)
+        else {
+            return false;
+        };
+        let Some(end) = self.allocation_offset.checked_add(total_bytes as u64) else {
+            return false;
+        };
+        if end > self.identity.byte_size {
+            return false;
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                source.as_ptr().add(self.allocation_offset as usize),
+                target.as_mut_slice().as_mut_ptr(),
+                total_bytes,
+            );
+        }
+        // The UMD seals the WC extent before pfnSubmitCommandCb.  Acquire keeps
+        // all subsequent validation reads after the completed snapshot.
+        core::sync::atomic::fence(Ordering::Acquire);
+        true
+    }
+}
+
+impl Drop for OpenOuterUse {
+    fn drop(&mut self) {
+        unsafe { self.open.as_ref() }.outer.release();
+    }
+}
+
+/// Try one exact open while the owning DeviceContext table lock prevents its
+/// removal. `None` is both non-match and refusal; the caller requires exactly
+/// one successful match and therefore rejects duplicates as well as absence.
+pub(crate) unsafe fn acquire_outer_gpuva_use(
+    open: usize,
+    session: core::ptr::NonNull<crate::ddi::translation_session::SessionObject>,
+    process: usize,
+    gpuva: u64,
+    bytes: u64,
+    expected_generation: Option<u64>,
+    require_hoc1: bool,
+) -> Option<OpenOuterUse> {
+    if process == 0 || gpuva == 0 || bytes == 0 {
+        return None;
+    }
+    let end = gpuva.checked_add(bytes)?;
+    let open = unsafe { open_allocation_context(open as HANDLE)? };
+    let identity = open.identity?;
+    if require_hoc1 != (identity.kind == ALLOC_KIND_HOC1)
+        || expected_generation.is_some_and(|generation| generation != identity.generation)
+        || !allocation_object::is_current(identity.generation)
+    {
+        return None;
+    }
+    let allocation = unsafe { resolve_alloc(open.allocation as HANDLE) }?;
+    if allocation.generation != identity.generation || allocation.kind != identity.kind {
+        return None;
+    }
+    let mappings = unsafe { allocation.outer_gpuva.load(Ordering::Acquire).as_ref() }?;
+    let mappings = mappings.mappings.lock();
+    let mut found = None;
+    for mapping in mappings.as_slice() {
+        let mapping_end = mapping.gpuva.checked_add(mapping.bytes)?;
+        if mapping.process == process && gpuva >= mapping.gpuva && end <= mapping_end {
+            let offset = mapping
+                .allocation_offset
+                .checked_add(gpuva.checked_sub(mapping.gpuva)?)?;
+            if offset.checked_add(bytes)? > identity.byte_size || found.is_some() {
+                return None;
+            }
+            found = Some(offset);
+        }
+    }
+    let allocation_offset = found?;
+    if !open.outer.acquire() {
+        return None;
+    }
+    let execution = if require_hoc1 {
+        None
+    } else {
+        match open
+            .execution
+            .as_ref()
+            .and_then(|binding| binding.acquire_attached(session, identity.generation))
+        {
+            Some(execution) => Some(execution),
+            None => {
+                open.outer.release();
+                return None;
+            }
+        }
+    };
+    Some(OpenOuterUse {
+        open: core::ptr::NonNull::from(open),
+        execution,
+        identity,
+        allocation_offset,
+    })
+}
+
+/// Acquire the exact D3D11 allocation-list open after DeviceContext proved it
+/// is a member of that device's bounded open set. No numeric allocation token,
+/// resource id, name, PID, or pointer value is used to find another owner.
+pub(crate) unsafe fn acquire_outer_physical_use(
+    open: HANDLE,
+    session: core::ptr::NonNull<crate::ddi::translation_session::SessionObject>,
+    expected_generation: u64,
+    bytes: u64,
+) -> Option<OpenOuterUse> {
+    if open.is_null() || expected_generation == 0 || bytes == 0 {
+        return None;
+    }
+    let open = unsafe { open_allocation_context(open)? };
+    let identity = open.identity?;
+    if identity.kind == ALLOC_KIND_HOC1
+        || identity.generation != expected_generation
+        || bytes > identity.byte_size
+        || !allocation_object::is_current(identity.generation)
+    {
+        return None;
+    }
+    let allocation = unsafe { resolve_alloc(open.allocation as HANDLE) }?;
+    if allocation.generation != identity.generation || allocation.kind != identity.kind {
+        return None;
+    }
+    if !open.outer.acquire() {
+        return None;
+    }
+    let Some(execution) = open
+        .execution
+        .as_ref()
+        .and_then(|binding| binding.acquire_attached(session, identity.generation))
+    else {
+        open.outer.release();
+        return None;
+    };
+    Some(OpenOuterUse {
+        open: core::ptr::NonNull::from(open),
+        execution: Some(execution),
+        identity,
+        allocation_offset: 0,
+    })
 }
 
 /// Surface identity + geometry for a Present allocation-list entry, resolved from
@@ -1561,6 +2018,18 @@ unsafe fn open_allocation_context<'a>(h: HANDLE) -> Option<&'a OpenAllocationCon
     }
     // SAFETY: the magic matched, so this is one of our contexts.
     Some(unsafe { &*p })
+}
+
+/// Acquire generic open-object rundown from a pointer already selected under
+/// the owning DeviceContext's bounded open-table lock.
+pub(crate) unsafe fn acquire_outer_bind_guard(open: usize) -> Option<OuterBindGuard> {
+    let open = unsafe { open_allocation_context(open as HANDLE)? };
+    if !open.outer.acquire() {
+        return None;
+    }
+    Some(OuterBindGuard {
+        open: core::ptr::NonNull::from(open),
+    })
 }
 
 /// Non-null open-allocation handles that failed alignment or the magic check.
@@ -1963,6 +2432,103 @@ pub(crate) unsafe fn paging_alloc_info(h: HANDLE) -> Option<PagingAllocInfo> {
         hlm1_eligible: ctx.hlm1_eligible,
         hlm1_bound: ctx.hlm1_bound.load(Ordering::Acquire),
     })
+}
+
+/// Apply one authoritative leaf GPUVA update to the exact allocation object it
+/// names.  The state exists only for allocations opened on a D3D device; no
+/// process/global address-space table is created.
+pub(crate) unsafe fn update_outer_gpuva_mapping(
+    update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE,
+) -> bool {
+    if update.PageTableLevel != 0 || update.NumPageTableEntries == 0 {
+        return true;
+    }
+    let Some(allocation) = (unsafe { resolve_alloc(update.hAllocation) }) else {
+        return true;
+    };
+    let state = allocation.outer_gpuva.load(Ordering::Acquire);
+    let Some(state) = (unsafe { state.as_ref() }) else {
+        return true;
+    };
+    if update.hProcess.is_null() || update.pPageTableEntries.is_null() {
+        return false;
+    }
+    let process = update.hProcess as usize;
+    let page_count = update.NumPageTableEntries as u64;
+    let Some(update_bytes) = page_count.checked_mul(PAGE as u64) else {
+        return false;
+    };
+    let Some(update_end) = update.FirstPteVirtualAddress.checked_add(update_bytes) else {
+        return false;
+    };
+    let repeat = update.Flags.Repeat() != 0;
+    let pte_valid = |index: usize| {
+        let pte_index = if repeat { 0 } else { index };
+        let pte = unsafe { core::ptr::read_unaligned(update.pPageTableEntries.add(pte_index)) };
+        let bits = unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 };
+        bits.Valid() != 0 && bits.Zero() == 0
+    };
+
+    let mut runs = 0usize;
+    let mut in_run = false;
+    for i in 0..update.NumPageTableEntries as usize {
+        let valid = pte_valid(i);
+        if valid {
+            let Some(end) = update
+                .AllocationOffsetInBytes
+                .checked_add((i as u64 + 1) * PAGE as u64)
+            else {
+                return false;
+            };
+            if end > allocation.size as u64 {
+                return false;
+            }
+            if !in_run {
+                runs = runs.saturating_add(1);
+                in_run = true;
+            }
+        } else {
+            in_run = false;
+        }
+    }
+    if runs > OUTER_GPUVA_MAX_RANGES {
+        return false;
+    }
+
+    let mut mappings = state.mappings.lock();
+    mappings.retain(|mapping| {
+        if mapping.process != process {
+            return true;
+        }
+        let mapping_end = mapping.gpuva.saturating_add(mapping.bytes);
+        mapping_end <= update.FirstPteVirtualAddress || mapping.gpuva >= update_end
+    });
+    if !mappings.can_fit(runs) {
+        return false;
+    }
+
+    let mut run_start = None;
+    for i in 0..=update.NumPageTableEntries as usize {
+        let valid = i < update.NumPageTableEntries as usize && pte_valid(i);
+        match (run_start, valid) {
+            (None, true) => run_start = Some(i),
+            (Some(start), false) => {
+                let count = i - start;
+                let mapping = OuterGpuVaMapping {
+                    process,
+                    gpuva: update.FirstPteVirtualAddress + start as u64 * PAGE as u64,
+                    allocation_offset: update.AllocationOffsetInBytes + start as u64 * PAGE as u64,
+                    bytes: count as u64 * PAGE as u64,
+                };
+                if !mappings.push(mapping) {
+                    return false;
+                }
+                run_start = None;
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// The Windows-supplied identity of one specific `hAllocation`, plus the
@@ -3213,8 +3779,9 @@ unsafe fn destroy_allocation_ctx(
                 // A dispatched request stays pinned in the FIFO until its
                 // exact ring response; cache release below drains that fence
                 // before the backing can be destroyed.
-                let _ = adapter
-                    .with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, ctx.resource_id()));
+                let _ = adapter.with_virtio(|v| {
+                    v.cancel_windowed_blt_for_resource(adapter, ctx.resource_id())
+                });
                 client.release_present_blits_for_resource(adapter, ctx.resource_id())
             })
             .map(|result| result.is_ok())
@@ -3230,7 +3797,9 @@ unsafe fn destroy_allocation_ctx(
         // `with_venus_client` has returned before this virtio step, so the
         // established scanout -> Venus ordering is not extended.
         adapter
-            .with_virtio(|v| v.finish_windowed_blt_teardown_for_resource(adapter, ctx.resource_id()))
+            .with_virtio(|v| {
+                v.finish_windowed_blt_teardown_for_resource(adapter, ctx.resource_id())
+            })
             .unwrap_or(false)
     });
     if !windowed_terminal {
@@ -4027,7 +4596,9 @@ unsafe fn admit_hwa2(
     // the host's real requirement" — only has a meaning where WE authored the
     // estimate. Both KMD-authored arms are in scope; what differs between them
     // is what the code then DOES, which is the block below.
-    if claims_standard && created.venus_alloc_size != 0 && created.venus_alloc_size != authored_byte_size
+    if claims_standard
+        && created.venus_alloc_size != 0
+        && created.venus_alloc_size != authored_byte_size
     {
         LINEAR_BLOB_SIZE_DIVERGENCE.fetch_add(1, Ordering::Relaxed);
     }
@@ -4105,10 +4676,9 @@ unsafe fn admit_hwa2(
         desc.byte_size = created.blob_size.bytes();
         desc.planes[0].offset = created.plane_offset;
         desc.planes[0].row_pitch = created.pitch;
-        desc.planes[0].slice_pitch = created
-            .pitch
-            .saturating_mul(desc.height)
-            .min(u32::try_from(desc.byte_size.saturating_sub(created.plane_offset)).unwrap_or(u32::MAX));
+        desc.planes[0].slice_pitch = created.pitch.saturating_mul(desc.height).min(
+            u32::try_from(desc.byte_size.saturating_sub(created.plane_offset)).unwrap_or(u32::MAX),
+        );
     }
 
     // ⛔ ACTED ON: an UNDERSIZED backing, for every descriptor whose extent this
@@ -4124,7 +4694,9 @@ unsafe fn admit_hwa2(
     // applying this to the OPAQUE_OPTIMAL arm compares a notional LINEAR estimate
     // against a TILED requirement and refuses legal GDI creates (round 3).
     // Narrowing that check means widening this guard in the same commit.
-    if !claims_standard && created.venus_alloc_size != 0 && created.venus_alloc_size < desc.byte_size
+    if !claims_standard
+        && created.venus_alloc_size != 0
+        && created.venus_alloc_size < desc.byte_size
     {
         bump(&CREATE_SIZE_REJECT, b"AcSize");
         crate::diag::record(0x0C01_00E7);
@@ -4305,7 +4877,7 @@ unsafe fn admit_hwa2(
     Ok(AdmittedAllocation {
         kind: desc.allocation_kind,
         hvm1_role: 0,
-        share_backing_store: false,
+        share_backing_store: true,
         generation,
         final_hwa2: Some(desc),
         vidmm_size,
@@ -4391,7 +4963,11 @@ unsafe fn admit_hvm1(
 
     let cpu_visible = role.placement().cpu_visible;
     if cpu_visible && !adapter.share_backing_store_with_kmd() {
-        bump_with_code(&CREATE_HVM1_MEMORY_CLASS_REFUSED, b"AcHvm1Mem", role.to_u32());
+        bump_with_code(
+            &CREATE_HVM1_MEMORY_CLASS_REFUSED,
+            b"AcHvm1Mem",
+            role.to_u32(),
+        );
         return Err(STATUS_NOT_SUPPORTED);
     }
     if record.byte_size == 0
@@ -4498,11 +5074,9 @@ unsafe fn admit_hvm1(
         share_backing_store: cpu_visible,
         generation,
         final_hwa2: None,
-        vidmm_size: backing
-            .as_ref()
-            .map_or(record.byte_size, |created| {
-                created.blob_size.bytes().max(record.byte_size)
-            }) as SIZE_T,
+        vidmm_size: backing.as_ref().map_or(record.byte_size, |created| {
+            created.blob_size.bytes().max(record.byte_size)
+        }) as SIZE_T,
         // The same value the segment check above interrogated — computed once so
         // the placement that was validated is the placement that ships.
         placement,
@@ -4806,6 +5380,8 @@ unsafe fn create_one(
         resource_id: AtomicU32::new(resource_id),
         backing_store_state: AtomicU32::new(BACKING_STORE_UNBOUND),
         backing_store_va: AtomicUsize::new(0),
+        backing_store_mdl: AtomicUsize::new(0),
+        outer_gpuva: AtomicPtr::new(core::ptr::null_mut()),
         k11_session_binding: AtomicUsize::new(0),
         transport_instance: if crate::virtio::KMD_D2_OWNER_ENABLED {
             adapter
@@ -5133,6 +5709,27 @@ unsafe fn k2a_mdl_system_va(mdl: PMDL, expected_bytes: u64) -> Option<usize> {
     core::ptr::NonNull::new(va as *mut u8).map(|va| va.as_ptr() as usize)
 }
 
+unsafe fn hoc1_mdl_system_va(mdl: PMDL, expected_bytes: u64) -> Option<usize> {
+    if mdl.is_null() || u64::from(unsafe { (*mdl).ByteCount }) != expected_bytes {
+        return None;
+    }
+    if unsafe { (*mdl).MdlFlags } & K2A_MDL_HAS_SYSTEM_VA != 0 {
+        return core::ptr::NonNull::new(unsafe { (*mdl).MappedSystemVa } as *mut u8)
+            .map(|va| va.as_ptr() as usize);
+    }
+    let va = unsafe {
+        MmMapLockedPagesSpecifyCache(
+            mdl,
+            0,
+            _MEMORY_CACHING_TYPE::MmNonCached,
+            core::ptr::null_mut(),
+            0,
+            K2A_MDL_MAP_PRIORITY,
+        )
+    };
+    core::ptr::NonNull::new(va as *mut u8).map(|va| va.as_ptr() as usize)
+}
+
 pub unsafe extern "C" fn dxgkddi_set_allocation_backing_store(
     h_adapter: IN_CONST_HANDLE,
     set_backing: IN_CONST_PDXGKARG_SETALLOCATIONBACKINGSTORE,
@@ -5154,6 +5751,60 @@ pub unsafe extern "C" fn dxgkddi_set_allocation_backing_store(
     let Some(ctx) = (unsafe { resolve_alloc(args.hDriverAllocation) }) else {
         return STATUS_INVALID_HANDLE;
     };
+    if ctx.kind == ALLOC_KIND_HOC1 {
+        let bytes = ctx.size as u64;
+        if bytes != HELIOS_HOC1_POOL_BYTES
+            || !allocation_object::is_current(ctx.generation)
+            || ctx.resource_id() != 0
+            || bytes > u32::MAX as u64
+            || (args.pBackingStore as usize) & (PAGE as usize - 1) != 0
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+        if ctx
+            .backing_store_state
+            .compare_exchange(
+                BACKING_STORE_UNBOUND,
+                BACKING_STORE_BINDING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return STATUS_INVALID_DEVICE_REQUEST;
+        }
+        let mdl = unsafe {
+            IoAllocateMdl(
+                args.pBackingStore,
+                bytes as u32,
+                0,
+                0,
+                core::ptr::null_mut(),
+            )
+        };
+        if mdl.is_null() || unsafe { helios_mm_probe_and_lock_pages_seh(mdl) } == 0 {
+            if !mdl.is_null() {
+                unsafe { IoFreeMdl(mdl) };
+            }
+            ctx.backing_store_state
+                .store(BACKING_STORE_UNBOUND, Ordering::Release);
+            return STATUS_NO_MEMORY;
+        }
+        let Some(kernel_va) = (unsafe { hoc1_mdl_system_va(mdl, bytes) }) else {
+            unsafe {
+                wdk_sys::ntddk::MmUnlockPages(mdl);
+                IoFreeMdl(mdl);
+            }
+            ctx.backing_store_state
+                .store(BACKING_STORE_UNBOUND, Ordering::Release);
+            return STATUS_NO_MEMORY;
+        };
+        ctx.backing_store_mdl.store(mdl as usize, Ordering::Relaxed);
+        ctx.backing_store_va.store(kernel_va, Ordering::Relaxed);
+        ctx.backing_store_state
+            .store(BACKING_STORE_BOUND, Ordering::Release);
+        return STATUS_SUCCESS;
+    }
     let Some(role) = Hvm1Role::from_u32(ctx.hvm1_role) else {
         return STATUS_INVALID_PARAMETER;
     };
@@ -5573,23 +6224,46 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 )
             }
         };
+        let hoc1 = if open_flags & DXGK_OPENALLOCATION_FLAG_CREATE != 0 {
+            unsafe {
+                stamp_open_hoc1(
+                    info.pPrivateDriverData,
+                    info.PrivateDriverDataSize,
+                    canonical_allocation,
+                )
+            }
+        } else {
+            unsafe {
+                read_open_hoc1(
+                    info.pPrivateDriverData,
+                    info.PrivateDriverDataSize,
+                    canonical_allocation,
+                )
+            }
+        };
         // What the guest was TOLD, for K6 to check its use records against.
         // HWA2's generation comes from the descriptor for the same reason: it is
         // the value the opener reads out of the identical bytes.
-        let open_identity = match (hvm1, desc) {
-            (Some((role, byte_size, generation)), _) => Some(OpenIdentity {
+        let open_identity = match (hvm1, hoc1, desc) {
+            (Some((role, byte_size, generation)), _, _) => Some(OpenIdentity {
                 generation,
                 kind: ALLOC_KIND_HVM1,
                 hvm1_role: role.to_u32(),
                 byte_size,
             }),
-            (None, Some(d)) => Some(OpenIdentity {
+            (None, Some((byte_size, generation)), _) => Some(OpenIdentity {
+                generation,
+                kind: ALLOC_KIND_HOC1,
+                hvm1_role: 0,
+                byte_size,
+            }),
+            (None, None, Some(d)) => Some(OpenIdentity {
                 generation: d.allocation_generation,
                 kind: d.allocation_kind,
                 hvm1_role: 0,
                 byte_size: d.byte_size,
             }),
-            (None, None) => None,
+            (None, None, None) => None,
         };
         let mut reply_pool_session = None;
         if let Some((Hvm1Role::ReplyPool, byte_size, generation)) = hvm1 {
@@ -5606,18 +6280,13 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 // The role-1 open creates the provisional session and owns its
                 // reference in `reply_pool_session`; executor attachment becomes
                 // legal only after INIT transitions that exact object to Live.
-                Hvm1Role::ReplyPool => reply_pool_session.map(|session| {
-                    OpenExecutionBinding::new(session, canonical_allocation, false)
-                }),
-                Hvm1Role::VulkanHostVisible
-                | Hvm1Role::Feedback
-                | Hvm1Role::VulkanDeviceLocal => {
-                    crate::ddi::translation_session::retain_execution_session(
-                        device.session_cell(),
-                    )
-                    .map(|session| {
-                        OpenExecutionBinding::new(session, canonical_allocation, true)
-                    })
+                Hvm1Role::ReplyPool => reply_pool_session
+                    .map(|session| OpenExecutionBinding::new(session, canonical_allocation, false)),
+                Hvm1Role::VulkanHostVisible | Hvm1Role::Feedback | Hvm1Role::VulkanDeviceLocal => {
+                    crate::ddi::translation_session::retain_execution_session(device.session_cell())
+                        .map(|session| {
+                            OpenExecutionBinding::new(session, canonical_allocation, true)
+                        })
                 }
             }
         } else if desc.is_some_and(|d| {
@@ -5627,11 +6296,19 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 && d.has_flag(HELIOS_HWA2_FLAG_SHARED)
                 && d.has_flag(HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED)
         }) {
-            crate::ddi::translation_session::retain_execution_session(device.session_cell())
-                .map(|session| OpenExecutionBinding::new(session, canonical_allocation, true))
+            Some(
+                crate::ddi::translation_session::retain_execution_session(device.session_cell())
+                    .map(|session| OpenExecutionBinding::new(session, canonical_allocation, true))
+                    .unwrap_or_else(|| OpenExecutionBinding::new_unbound(canonical_allocation)),
+            )
         } else {
             None
         };
+
+        if open_identity.is_some() && !(unsafe { prepare_outer_gpuva_state(canonical_allocation) })
+        {
+            return STATUS_NO_MEMORY;
+        }
 
         // ⛔ C1's liveness gate is GONE with the resid it gated on.
         //
@@ -5680,12 +6357,14 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
             identity: open_identity,
             reply_pool_session,
             execution,
+            outer: OpenOuterBinding::new(),
         });
         if let Some(binding) = open.execution.as_ref() {
             // SAFETY: `open` is already heap-pinned and is not published until
             // `Box::into_raw` below.
             unsafe { binding.init_event() };
         }
+        unsafe { open.outer.init_event() };
         record_alloc_event(
             0,
             desc.map_or(0, |d| d.width),
@@ -5693,7 +6372,24 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
             0,
             true,
         );
-        info.hDeviceSpecificAllocation = Box::into_raw(open) as HANDLE;
+        let raw_open = Box::into_raw(open);
+        if !device.register_outer_open(raw_open as usize) {
+            let mut open = unsafe { Box::from_raw(raw_open) };
+            open.outer.close();
+            if let Some(execution) = open.execution.take() {
+                execution.close(unsafe { PassiveLevel::assume() });
+            }
+            if let Some(session) = open.reply_pool_session.take() {
+                unsafe {
+                    crate::ddi::translation_session::close_reply_pool_binding(
+                        session,
+                        open.allocation,
+                    )
+                };
+            }
+            return STATUS_NO_MEMORY;
+        }
+        info.hDeviceSpecificAllocation = raw_open as HANDLE;
         crate::diag::record(
             0x0C36_0000 | ((info.hDeviceSpecificAllocation as usize as u32) & 0xFFFF),
         );
@@ -5768,6 +6464,104 @@ unsafe fn read_open_descriptor(
         return None;
     }
     Some(desc)
+}
+
+unsafe fn prepare_outer_gpuva_state(canonical_allocation: usize) -> bool {
+    let Some(ctx) = (unsafe { resolve_alloc(canonical_allocation as HANDLE) }) else {
+        return false;
+    };
+    if !ctx.outer_gpuva.load(Ordering::Acquire).is_null() {
+        return true;
+    }
+    let candidate = Box::new(OuterGpuVaState {
+        mappings: SpinLock::new(crate::sync::FixedVec::with_max(OUTER_GPUVA_MAX_RANGES)),
+    });
+    let raw = Box::into_raw(candidate);
+    match ctx.outer_gpuva.compare_exchange(
+        core::ptr::null_mut(),
+        raw,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => true,
+        Err(found) => {
+            drop(unsafe { Box::from_raw(raw) });
+            !found.is_null()
+        }
+    }
+}
+
+unsafe fn read_open_hoc1(
+    private: *const c_void,
+    private_size: UINT,
+    canonical_allocation: usize,
+) -> Option<(u64, u64)> {
+    if private.is_null() || private_size as usize != HELIOS_HOC1_BYTES as usize {
+        return None;
+    }
+    let bytes =
+        unsafe { core::slice::from_raw_parts(private as *const u8, HELIOS_HOC1_BYTES as usize) };
+    let record = HeliosOuterCommandAllocationV1::from_private_data(bytes).ok()?;
+    if record.magic != HELIOS_HOC1_MAGIC
+        || record
+            .validate_create_output(HELIOS_PACKAGE_GENERATION)
+            .is_err()
+    {
+        return None;
+    }
+    let ctx = unsafe { resolve_alloc(canonical_allocation as HANDLE) }?;
+    (ctx.kind == ALLOC_KIND_HOC1
+        && ctx.size as u64 == record.byte_size
+        && ctx.generation == record.allocation_generation)
+        .then_some((record.byte_size, record.allocation_generation))
+}
+
+unsafe fn stamp_open_hoc1(
+    private: *mut c_void,
+    private_size: UINT,
+    canonical_allocation: usize,
+) -> Option<(u64, u64)> {
+    if private.is_null() || private_size as usize != HELIOS_HOC1_BYTES as usize {
+        return None;
+    }
+    let parsed = {
+        let bytes = unsafe {
+            core::slice::from_raw_parts(private as *const u8, HELIOS_HOC1_BYTES as usize)
+        };
+        HeliosOuterCommandAllocationV1::from_private_data(bytes).ok()?
+    };
+    let mut record = parsed;
+    if record.magic != HELIOS_HOC1_MAGIC {
+        return None;
+    }
+    let ctx = unsafe { resolve_alloc(canonical_allocation as HANDLE) }?;
+    if ctx.kind != ALLOC_KIND_HOC1 || ctx.size as u64 != record.byte_size {
+        return None;
+    }
+    if record
+        .validate_create_output(HELIOS_PACKAGE_GENERATION)
+        .is_ok()
+    {
+        return (record.allocation_generation == ctx.generation)
+            .then_some((record.byte_size, record.allocation_generation));
+    }
+    if record
+        .validate_create_input(HELIOS_PACKAGE_GENERATION)
+        .is_err()
+    {
+        return None;
+    }
+    record.allocation_generation = ctx.generation;
+    if record
+        .validate_create_output(HELIOS_PACKAGE_GENERATION)
+        .is_err()
+    {
+        return None;
+    }
+    let out =
+        unsafe { core::slice::from_raw_parts_mut(private as *mut u8, HELIOS_HOC1_BYTES as usize) };
+    out.copy_from_slice(bytes_of(&record));
+    Some((record.byte_size, record.allocation_generation))
 }
 
 /// Read an already-published HVM1 create-output. The ORDINARY-open half of
@@ -5953,12 +6747,15 @@ unsafe fn stamp_open_hvm1(
 
 /// `DxgkDdiCloseAllocation` — release device-local allocation references.
 pub unsafe extern "C" fn dxgkddi_close_allocation(
-    _h_device: IN_CONST_HANDLE,
+    h_device: IN_CONST_HANDLE,
     close_allocation: IN_CONST_PDXGKARG_CLOSEALLOCATION,
 ) -> NTSTATUS {
-    if close_allocation.is_null() {
+    if h_device.is_null() || close_allocation.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
+    let Some(device) = (unsafe { crate::device::DeviceHandleRef::from_raw(h_device) }) else {
+        return STATUS_INVALID_PARAMETER;
+    };
     let args = unsafe { &*close_allocation };
     if args.NumAllocations != 0 && args.pOpenHandleList.is_null() {
         return STATUS_INVALID_PARAMETER;
@@ -5967,7 +6764,12 @@ pub unsafe extern "C" fn dxgkddi_close_allocation(
         let handle = unsafe { *args.pOpenHandleList.add(i) };
         if !handle.is_null() {
             crate::diag::record(0x0C37_0000 | ((handle as usize as u32) & 0xFFFF));
+            // Remove the association before object storage can be reused.  A
+            // resolver that already acquired it owns `outer` rundown and is
+            // joined immediately below.
+            device.unregister_outer_open(handle as usize);
             if let Some(mut open) = unsafe { take_open_ctx(handle) } {
+                open.outer.close();
                 if let Some(execution) = open.execution.take() {
                     // CloseAllocation is PASSIVE_LEVEL.  Revoke new use,
                     // event-join exact host custody, then detach/release before

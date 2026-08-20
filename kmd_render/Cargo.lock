@@ -63,15 +63,15 @@ dependencies = [
 
 [[package]]
 name = "anyhow"
-version = "1.0.102"
+version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "bindgen"
-version = "0.71.1"
+version = "0.72.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f58bf3d7db68cfbac37cfc485a8d711e87e064c3d0fe0435b92f7a407f9d6b3"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
 dependencies = [
  "bitflags",
  "cexpr",
@@ -295,6 +295,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 [[package]]
 name = "helios_kmd_logic"
 version = "0.1.0"
+dependencies = [
+ "helios_protocol",
+]
 
 [[package]]
 name = "helios_kmd_render"
@@ -758,8 +761,7 @@ dependencies = [
 [[package]]
 name = "wdk"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd496a19ec75c3d98f8be805f62ebde4651fc01babf681b832d8bae9c584d25"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=6b040c03e56fbbebc10ed86136839774a82c3b59#6b040c03e56fbbebc10ed86136839774a82c3b59"
 dependencies = [
  "cfg-if",
  "tracing",
@@ -771,8 +773,7 @@ dependencies = [
 [[package]]
 name = "wdk-alloc"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0000f9d158618c1dce7de647338e8219f9d6b618abd140c373c0552c6dbda1ca"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=6b040c03e56fbbebc10ed86136839774a82c3b59#6b040c03e56fbbebc10ed86136839774a82c3b59"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -783,8 +784,7 @@ dependencies = [
 [[package]]
 name = "wdk-build"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c150122a579af759770b354064cd2994d29e97525d904f65ff1412ad5122766"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=6b040c03e56fbbebc10ed86136839774a82c3b59#6b040c03e56fbbebc10ed86136839774a82c3b59"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -807,8 +807,7 @@ dependencies = [
 [[package]]
 name = "wdk-macros"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b288d5ef6b276345d197fe0b82ef274dcb5a1f658a2294c67ff85b775f63ee26"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=6b040c03e56fbbebc10ed86136839774a82c3b59#6b040c03e56fbbebc10ed86136839774a82c3b59"
 dependencies = [
  "cfg-if",
  "fs4",
@@ -824,14 +823,18 @@ dependencies = [
 [[package]]
 name = "wdk-panic"
 version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e594cced255434b29bfca586a74653985281377ff4e36b8cfa58fd4c4c63073a"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=6b040c03e56fbbebc10ed86136839774a82c3b59#6b040c03e56fbbebc10ed86136839774a82c3b59"
+dependencies = [
+ "tracing",
+ "tracing-subscriber",
+ "wdk",
+ "wdk-build",
+]
 
 [[package]]
 name = "wdk-sys"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e13e19ed97609bc1d1236806019309ca2d47aaad6d3217ab374e73c9ff3b8a9"
+source = "git+https://github.com/microsoft/windows-drivers-rs?rev=6b040c03e56fbbebc10ed86136839774a82c3b59#6b040c03e56fbbebc10ed86136839774a82c3b59"
 dependencies = [
  "anyhow",
  "bindgen",

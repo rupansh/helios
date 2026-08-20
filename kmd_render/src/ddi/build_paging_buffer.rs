@@ -646,9 +646,7 @@ unsafe fn hlm1_maybe_bind(
             // ⛔ Only on the Ok path. A store after a failed map would make the
             // next observation report `Action::None` and skip the retry.
             // SAFETY: the handle this arm resolved, per the fn contract.
-            unsafe {
-                crate::ddi::create_allocation::set_hlm1_binding(h, placement.byte_offset)
-            };
+            unsafe { crate::ddi::create_allocation::set_hlm1_binding(h, placement.byte_offset) };
             HLM1_BINDS.fetch_add(1, Ordering::Relaxed);
             if matches!(action, Action::Rebind { .. }) {
                 HLM1_REBINDS.fetch_add(1, Ordering::Relaxed);
@@ -1574,7 +1572,9 @@ unsafe fn bar_transfer(
             })
         } else {
             // SAFETY: as above, for the source end.
-            (src_seg, unsafe { *t.Source.__bindgen_anon_1.SegmentAddress.as_ref() })
+            (src_seg, unsafe {
+                *t.Source.__bindgen_anon_1.SegmentAddress.as_ref()
+            })
         };
         hlm1_observe(
             crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_TRANSFER as u32,
@@ -2031,6 +2031,12 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
 
     // Placement harvest is DISPATCH-safe (atomic store only) — no IRQL gate.
     if let PagingOperation::UpdatePageTable(update) = operation {
+        // F21: retain the exact allocation-local GPUVA association before the
+        // paging fence can retire.  An incomplete update is a hard refusal;
+        // virtual HOB1 execution must never observe a prefix as current.
+        if !unsafe { crate::ddi::create_allocation::update_outer_gpuva_mapping(update) } {
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
         let track_system_pages = unsafe { paging_alloc_info(update.hAllocation) }
             .is_some_and(|alloc| alloc.bar_eligible);
         // Preserve the exact leaf mapping before retiring the page-table update.
@@ -2135,7 +2141,14 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                 } else {
                     t.Source.SegmentId
                 };
-                hlm1_observe(args.Operation as u32, &alloc, Some(seg), None, None, bar.size);
+                hlm1_observe(
+                    args.Operation as u32,
+                    &alloc,
+                    Some(seg),
+                    None,
+                    None,
+                    bar.size,
+                );
             }
             return STATUS_SUCCESS;
         }

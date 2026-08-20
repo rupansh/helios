@@ -16,9 +16,7 @@
 //! ⚠ The one admitted edge is `helios_protocol` (K4, 2026-08-10). It is
 //! `no_std`, it is already a `kmd_render` dependency, and its records carry no
 //! handle, pointer or kernel state by construction, so it does not weaken the
-//! rule above — see the argument in `kmd_logic/Cargo.toml`. Note that
-//! [`native_fence_lifecycle`] predates the decision and still re-declares the
-//! HNF1 offset table locally; that is history, not a pattern to copy.
+//! rule above — see the argument in `kmd_logic/Cargo.toml`.
 //!
 //! Run the tests with `cargo test` inside `kmd_logic/`, the same way `protocol/`
 //! is tested. Nothing else runs them.
@@ -5561,7 +5559,7 @@ pub mod wddm_head_bound {
 
 #[cfg(test)]
 mod wddm_head_bound_tests {
-    use super::wddm_head_bound::{Action, clamp_bound_ms, heartbeat_due, look};
+    use super::wddm_head_bound::{clamp_bound_ms, heartbeat_due, look, Action};
 
     const MIN: u32 = 100;
     const MAX: u32 = 1000;
@@ -5744,7 +5742,7 @@ pub mod wddm_boundary {
 
 #[cfg(test)]
 mod wddm_boundary_tests {
-    use super::wddm_boundary::{Kind, Rejection, select};
+    use super::wddm_boundary::{select, Kind, Rejection};
 
     /// A representative live generation: base 1 + 3·2^32, 40 ids issued.
     const BASE: u64 = 1 + (3u64 << 32);
@@ -6037,8 +6035,8 @@ mod present_stream_tests {
 #[cfg(test)]
 mod present_stream_boundary_tests {
     use super::present_stream::{
-        GENERATION_MAX, MAX_STREAMS, advance_retired, decode_boundary, encode_boundary,
-        handle_index, slot_handle, slot_ready, terminal_on_response_ok,
+        advance_retired, decode_boundary, encode_boundary, handle_index, slot_handle, slot_ready,
+        terminal_on_response_ok, GENERATION_MAX, MAX_STREAMS,
     };
 
     #[test]
@@ -6131,48 +6129,53 @@ mod present_stream_boundary_tests {
 /// is a single adapter-wide epoch ([`epoch_is_current`]) rather than an
 /// enumeration — reset invalidates every object with one store and no scan.
 pub mod native_fence_lifecycle {
+    use helios_protocol::HeliosNativeFencePddV1;
+
     /// HNF1 magic at offset 0 — `0x31464e48`, i.e. the bytes `H N F 1`
     /// little-endian (section 12.1 line 3138).
-    pub const HNF1_MAGIC: u32 = 0x3146_4e48;
+    pub const HNF1_MAGIC: u32 = helios_protocol::HELIOS_HNF1_MAGIC;
     /// HNF1 ABI version at offset 4 (section 12.1 line 3139).
-    pub const HNF1_ABI_VERSION: u16 = 1;
+    pub const HNF1_ABI_VERSION: u16 = helios_protocol::HELIOS_HNF1_ABI_VERSION;
     /// HNF1 structure size at offset 6, and the whole record's length. Equal to
     /// the WDK's `D3DDDI_NATIVE_FENCE_PDD_SIZE`; `kmd_render` asserts that
     /// equality against the generated bindings.
-    pub const HNF1_SIZE: usize = 64;
+    pub const HNF1_SIZE: usize = helios_protocol::HELIOS_HNF1_SIZE;
 
     /// Byte offsets of the section-12.1 table. Named so the parser and the
     /// encoder cannot drift from each other.
-    pub const OFF_MAGIC: usize = 0;
+    pub const OFF_MAGIC: usize = core::mem::offset_of!(HeliosNativeFencePddV1, magic);
     /// Offset of the 2-byte ABI version.
-    pub const OFF_ABI_VERSION: usize = 4;
+    pub const OFF_ABI_VERSION: usize = core::mem::offset_of!(HeliosNativeFencePddV1, abi_version);
     /// Offset of the 2-byte structure size.
-    pub const OFF_STRUCT_SIZE: usize = 6;
+    pub const OFF_STRUCT_SIZE: usize = core::mem::offset_of!(HeliosNativeFencePddV1, struct_size);
     /// Offset of the 8-byte atomic package generation.
-    pub const OFF_PACKAGE_GENERATION: usize = 8;
+    pub const OFF_PACKAGE_GENERATION: usize =
+        core::mem::offset_of!(HeliosNativeFencePddV1, package_generation);
     /// Offset of the 8-byte KMD-assigned object generation.
-    pub const OFF_OBJECT_GENERATION: usize = 16;
+    pub const OFF_OBJECT_GENERATION: usize =
+        core::mem::offset_of!(HeliosNativeFencePddV1, object_generation);
     /// Offset of the 4-byte `D3DDDI_NATIVEFENCE_TYPE`.
-    pub const OFF_NATIVE_TYPE: usize = 24;
+    pub const OFF_NATIVE_TYPE: usize = core::mem::offset_of!(HeliosNativeFencePddV1, native_type);
     /// Offset of the 4-byte flag word.
-    pub const OFF_FLAGS: usize = 28;
+    pub const OFF_FLAGS: usize = core::mem::offset_of!(HeliosNativeFencePddV1, flags);
     /// Offset of the 8-byte creating adapter LUID.
-    pub const OFF_ADAPTER_LUID: usize = 32;
+    pub const OFF_ADAPTER_LUID: usize = core::mem::offset_of!(HeliosNativeFencePddV1, adapter_luid);
     /// Offset of the 24 reserved bytes, which must be zero.
-    pub const OFF_RESERVED: usize = 40;
+    pub const OFF_RESERVED: usize = core::mem::offset_of!(HeliosNativeFencePddV1, reserved);
     /// Length of the reserved tail.
-    pub const RESERVED_LEN: usize = 24;
+    pub const RESERVED_LEN: usize = core::mem::size_of::<[u8; 24]>();
 
     /// HNF1 flags bit 0 — the object is shareable (section 12.1 line 3144).
-    pub const HNF1_FLAG_SHARED: u32 = 1 << 0;
+    pub const HNF1_FLAG_SHARED: u32 = helios_protocol::HELIOS_HNF1_FLAG_SHARED;
     /// Every other flag bit, including cross-adapter, is zero in this
     /// generation (section 12.1 line 3144, section 12.1 item 7).
-    pub const HNF1_FLAGS_RESERVED_MASK: u32 = !HNF1_FLAG_SHARED;
+    pub const HNF1_FLAGS_RESERVED_MASK: u32 = helios_protocol::HELIOS_HNF1_FLAGS_RESERVED_MASK;
 
     /// `D3DDDI_NATIVEFENCE_TYPE_DEFAULT`.
-    pub const NATIVE_FENCE_TYPE_DEFAULT: u32 = 0;
+    pub const NATIVE_FENCE_TYPE_DEFAULT: u32 = helios_protocol::HELIOS_NATIVE_FENCE_TYPE_DEFAULT;
     /// `D3DDDI_NATIVEFENCE_TYPE_INTRA_GPU`.
-    pub const NATIVE_FENCE_TYPE_INTRA_GPU: u32 = 1;
+    pub const NATIVE_FENCE_TYPE_INTRA_GPU: u32 =
+        helios_protocol::HELIOS_NATIVE_FENCE_TYPE_INTRA_GPU;
 
     /// Live global (created) native-fence objects admitted per adapter.
     ///
@@ -6186,116 +6189,17 @@ pub mod native_fence_lifecycle {
     /// deliberately larger than the global one.
     pub const MAX_LIVE_LOCAL: u32 = 16384;
 
-    /// Why a PDD was refused. Every variant is a distinct counted refusal in
-    /// `kmd_render`; none of them is ever silently repaired.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub enum PddReject {
-        /// Offset 0 is not [`HNF1_MAGIC`].
-        Magic,
-        /// Offset 4 is not [`HNF1_ABI_VERSION`]. There is no version fallback
-        /// (section 3: "no version or feature fallback").
-        AbiVersion,
-        /// Offset 6 is not [`HNF1_SIZE`].
-        StructSize,
-        /// Offset 8 is not this package's generation.
-        PackageGeneration,
-        /// Offset 16 was nonzero on the way in. The object generation is
-        /// KMD-assigned; a caller-supplied value is a forged identity attempt.
-        ObjectGenerationNotZero,
-        /// Offset 24 is not the documented native-fence type this package
-        /// supports.
-        NativeType,
-        /// Offset 24 disagrees with the type the OS passed in the DDI argument.
-        NativeTypeMismatch,
-        /// Offset 28 has a bit set outside [`HNF1_FLAG_SHARED`].
-        Flags,
-        /// Offset 32 is neither zero nor the exact creating adapter LUID.
-        AdapterLuid,
-        /// The 24 reserved bytes at offset 40 are not all zero.
-        Reserved,
-    }
-
-    /// The parsed HNF1 payload. Pointer-free by construction — the record
-    /// carries no pointer, NT handle, PID, GPUVA, host token, or allocation ID
-    /// (section 12.1 line 3152).
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub struct Hnf1 {
-        /// Offset 8.
-        pub package_generation: u64,
-        /// Offset 16.
-        pub object_generation: u64,
-        /// Offset 24.
-        pub native_type: u32,
-        /// Offset 28.
-        pub flags: u32,
-        /// Offset 32.
-        pub adapter_luid: i64,
-    }
-
-    fn rd_u16(b: &[u8; HNF1_SIZE], off: usize) -> u16 {
-        u16::from_le_bytes([b[off], b[off + 1]])
-    }
-
-    fn rd_u32(b: &[u8; HNF1_SIZE], off: usize) -> u32 {
-        u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
-    }
-
-    fn rd_u64(b: &[u8; HNF1_SIZE], off: usize) -> u64 {
-        let mut v = [0u8; 8];
-        let mut i = 0;
-        while i < 8 {
-            v[i] = b[off + i];
-            i += 1;
-        }
-        u64::from_le_bytes(v)
-    }
+    /// The single protocol-owned rejection taxonomy used by UMD and KMD.
+    pub use helios_protocol::HeliosNativeFencePddReject as PddReject;
+    /// The parsed HNF1 payload is the protocol record itself; there is no local
+    /// wire mirror or second offset table.
+    pub type Hnf1 = HeliosNativeFencePddV1;
 
     /// Decode the record without judging it. Used by both validators and by the
     /// diagnostics path; every caller that acts on the contents goes through
     /// [`validate_create`] or [`validate_open`] first.
     pub fn parse(bytes: &[u8; HNF1_SIZE]) -> Hnf1 {
-        Hnf1 {
-            package_generation: rd_u64(bytes, OFF_PACKAGE_GENERATION),
-            object_generation: rd_u64(bytes, OFF_OBJECT_GENERATION),
-            native_type: rd_u32(bytes, OFF_NATIVE_TYPE),
-            flags: rd_u32(bytes, OFF_FLAGS),
-            adapter_luid: rd_u64(bytes, OFF_ADAPTER_LUID) as i64,
-        }
-    }
-
-    /// Validate the fields shared by create and open before either stage applies
-    /// its object-specific identity rules.
-    fn validate_header(
-        bytes: &[u8; HNF1_SIZE],
-        package_generation: u64,
-    ) -> Result<Hnf1, PddReject> {
-        if rd_u32(bytes, OFF_MAGIC) != HNF1_MAGIC {
-            return Err(PddReject::Magic);
-        }
-        if rd_u16(bytes, OFF_ABI_VERSION) != HNF1_ABI_VERSION {
-            return Err(PddReject::AbiVersion);
-        }
-        if rd_u16(bytes, OFF_STRUCT_SIZE) as usize != HNF1_SIZE {
-            return Err(PddReject::StructSize);
-        }
-        let parsed = parse(bytes);
-        if parsed.package_generation != package_generation {
-            return Err(PddReject::PackageGeneration);
-        }
-        if parsed.object_generation != 0 {
-            return Err(PddReject::ObjectGenerationNotZero);
-        }
-        if parsed.flags & HNF1_FLAGS_RESERVED_MASK != 0 {
-            return Err(PddReject::Flags);
-        }
-        let mut i = 0;
-        while i < RESERVED_LEN {
-            if bytes[OFF_RESERVED + i] != 0 {
-                return Err(PddReject::Reserved);
-            }
-            i += 1;
-        }
-        Ok(parsed)
+        HeliosNativeFencePddV1::from_bytes(bytes)
     }
 
     /// Validate a `DxgkDdiCreateNativeFence` PDD.
@@ -6315,16 +6219,8 @@ pub mod native_fence_lifecycle {
         adapter_luid: i64,
         ddi_native_type: u32,
     ) -> Result<Hnf1, PddReject> {
-        let parsed = validate_header(bytes, package_generation)?;
-        if !native_type_is_documented(parsed.native_type) {
-            return Err(PddReject::NativeType);
-        }
-        if parsed.native_type != ddi_native_type {
-            return Err(PddReject::NativeTypeMismatch);
-        }
-        if parsed.adapter_luid != 0 && parsed.adapter_luid != adapter_luid {
-            return Err(PddReject::AdapterLuid);
-        }
+        let parsed = parse(bytes);
+        parsed.validate_create_input(package_generation, adapter_luid, ddi_native_type)?;
         Ok(parsed)
     }
 
@@ -6338,13 +6234,8 @@ pub mod native_fence_lifecycle {
         native_type: u32,
         flags: u32,
     ) -> Result<Hnf1, PddReject> {
-        let parsed = validate_header(bytes, package_generation)?;
-        if !native_type_is_documented(parsed.native_type) {
-            return Err(PddReject::NativeType);
-        }
-        if parsed.native_type != native_type {
-            return Err(PddReject::NativeTypeMismatch);
-        }
+        let parsed = parse(bytes);
+        parsed.validate_create_input(package_generation, adapter_luid, native_type)?;
         if parsed.flags != flags {
             return Err(PddReject::Flags);
         }
@@ -6360,7 +6251,7 @@ pub mod native_fence_lifecycle {
     /// which this traditional-queue package does not advertise. Merely being a
     /// documented enum value is not enough to accept it.
     pub fn native_type_is_documented(native_type: u32) -> bool {
-        native_type == NATIVE_FENCE_TYPE_DEFAULT
+        helios_protocol::native_type_is_admitted(native_type)
     }
 
     /// Render the KMD's answer: the same header, the assigned nonzero object
@@ -6376,20 +6267,10 @@ pub mod native_fence_lifecycle {
         flags: u32,
         adapter_luid: i64,
     ) -> [u8; HNF1_SIZE] {
-        let mut out = [0u8; HNF1_SIZE];
-        out[OFF_MAGIC..OFF_MAGIC + 4].copy_from_slice(&HNF1_MAGIC.to_le_bytes());
-        out[OFF_ABI_VERSION..OFF_ABI_VERSION + 2].copy_from_slice(&HNF1_ABI_VERSION.to_le_bytes());
-        out[OFF_STRUCT_SIZE..OFF_STRUCT_SIZE + 2]
-            .copy_from_slice(&(HNF1_SIZE as u16).to_le_bytes());
-        out[OFF_PACKAGE_GENERATION..OFF_PACKAGE_GENERATION + 8]
-            .copy_from_slice(&package_generation.to_le_bytes());
-        out[OFF_OBJECT_GENERATION..OFF_OBJECT_GENERATION + 8]
-            .copy_from_slice(&object_generation.to_le_bytes());
-        out[OFF_NATIVE_TYPE..OFF_NATIVE_TYPE + 4].copy_from_slice(&native_type.to_le_bytes());
-        out[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
-        out[OFF_ADAPTER_LUID..OFF_ADAPTER_LUID + 8]
-            .copy_from_slice(&(adapter_luid as u64).to_le_bytes());
-        out
+        let mut pdd = HeliosNativeFencePddV1::create_input(package_generation, native_type, flags);
+        pdd.object_generation = object_generation;
+        pdd.adapter_luid = adapter_luid;
+        pdd.to_bytes()
     }
 
     /// Why a native-fence lifecycle operation was refused.
@@ -6784,14 +6665,7 @@ mod native_fence_lifecycle_tests {
     #[test]
     fn open_requires_the_exact_global_identity() {
         let b = encode(PKG, 0, NATIVE_FENCE_TYPE_DEFAULT, HNF1_FLAG_SHARED, LUID);
-        assert!(validate_open(
-            &b,
-            PKG,
-            LUID,
-            NATIVE_FENCE_TYPE_DEFAULT,
-            HNF1_FLAG_SHARED,
-        )
-        .is_ok());
+        assert!(validate_open(&b, PKG, LUID, NATIVE_FENCE_TYPE_DEFAULT, HNF1_FLAG_SHARED,).is_ok());
         assert_eq!(
             validate_open(
                 &b,
@@ -6802,13 +6676,7 @@ mod native_fence_lifecycle_tests {
             ),
             Err(PddReject::AdapterLuid)
         );
-        let nonzero_generation = encode(
-            PKG,
-            7,
-            NATIVE_FENCE_TYPE_DEFAULT,
-            HNF1_FLAG_SHARED,
-            LUID,
-        );
+        let nonzero_generation = encode(PKG, 7, NATIVE_FENCE_TYPE_DEFAULT, HNF1_FLAG_SHARED, LUID);
         assert_eq!(
             validate_open(
                 &nonzero_generation,
@@ -6879,7 +6747,11 @@ mod native_fence_lifecycle_tests {
         f = open_local(f, 0).unwrap();
         f.state = FenceState::Draining;
         f = close_local(f).unwrap();
-        assert_eq!(f.state, FenceState::Draining, "one reference still holds it");
+        assert_eq!(
+            f.state,
+            FenceState::Draining,
+            "one reference still holds it"
+        );
         f = close_local(f).unwrap();
         assert_eq!(f.state, FenceState::Dead);
     }
@@ -7200,7 +7072,9 @@ pub mod allocation_identity {
     impl AllocationIdentity {
         /// Mint one identity at create. Returns the advanced counter, so a
         /// caller cannot mint twice from the same value by accident.
-        pub fn create(counter: GenerationCounter) -> Result<(Self, GenerationCounter), IdentityRefusal> {
+        pub fn create(
+            counter: GenerationCounter,
+        ) -> Result<(Self, GenerationCounter), IdentityRefusal> {
             let (generation, counter) = counter.mint()?;
             Ok((
                 Self {
@@ -7400,9 +7274,7 @@ pub mod allocation_identity {
         aperture_segment_exposed: bool,
     ) -> Result<Hvm1Placement, IdentityRefusal> {
         let placement = role.placement();
-        if placement.preferred_segment == HELIOS_SEGMENT_ID_APERTURE
-            && !aperture_segment_exposed
-        {
+        if placement.preferred_segment == HELIOS_SEGMENT_ID_APERTURE && !aperture_segment_exposed {
             return Err(IdentityRefusal::ApertureSegmentNotExposed {
                 role: role.to_u32(),
             });
@@ -7620,7 +7492,13 @@ pub mod allocation_identity {
                 Some(live) => live,
                 None => return Err(IdentityRefusal::LiveExtentCounterOverflow),
             };
-            Ok((state, Self { live_extents, ..self }))
+            Ok((
+                state,
+                Self {
+                    live_extents,
+                    ..self
+                },
+            ))
         }
 
         /// Retire one extent against its owning context's completed HQC1 value.
@@ -7739,7 +7617,9 @@ pub mod allocation_identity {
     }
 
     /// Encode one HOC1 record into its 64 documented bytes.
-    pub fn encode_hoc1(record: &HeliosOuterCommandAllocationV1) -> [u8; HELIOS_HOC1_BYTES as usize] {
+    pub fn encode_hoc1(
+        record: &HeliosOuterCommandAllocationV1,
+    ) -> [u8; HELIOS_HOC1_BYTES as usize] {
         let mut out = [0u8; HELIOS_HOC1_BYTES as usize];
         wr_u32(&mut out, 0, record.magic);
         wr_u16(&mut out, 4, record.abi_version);
@@ -8062,13 +7942,9 @@ mod allocation_identity_tests {
     #[test]
     fn hwa2_write_back_passes_create_output_and_then_fails_create_input() {
         let input = hwa2_admit_create_input(&encode_hwa2(&primary_input()), PKG).expect("admit");
-        let output = hwa2_stamp_create_output(
-            &input,
-            0x51,
-            HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE,
-            PKG,
-        )
-        .expect("stamp");
+        let output =
+            hwa2_stamp_create_output(&input, 0x51, HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE, PKG)
+                .expect("stamp");
 
         assert_eq!(output.validate_create_output(PKG), Ok(()));
         assert_eq!(output.validate(PKG), Ok(()));
@@ -8190,13 +8066,9 @@ mod allocation_identity_tests {
     #[test]
     fn open_is_a_pure_read() {
         let input = hwa2_admit_create_input(&encode_hwa2(&primary_input()), PKG).expect("admit");
-        let output = hwa2_stamp_create_output(
-            &input,
-            0x51,
-            HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE,
-            PKG,
-        )
-        .expect("stamp");
+        let output =
+            hwa2_stamp_create_output(&input, 0x51, HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE, PKG)
+                .expect("stamp");
         let on_the_wire = encode_hwa2(&output);
 
         let opened = hwa2_admit_open(&on_the_wire, PKG).expect("open");
@@ -8297,8 +8169,7 @@ mod allocation_identity_tests {
             );
         }
 
-        let (admitted, role) =
-            hvm1_admit_create_input(&encode_hvm1(&input), PKG).expect("admit");
+        let (admitted, role) = hvm1_admit_create_input(&encode_hvm1(&input), PKG).expect("admit");
         assert_eq!(role, Hvm1Role::VulkanHostVisible);
         let output = hvm1_stamp_create_output(&admitted, 42, 4096, PKG).expect("stamp");
         assert_eq!(output.object_generation, 42);
@@ -8440,7 +8311,9 @@ mod allocation_identity_tests {
         let mut pool = Hoc1Pool::new();
         for i in 0..HELIOS_HOC1_MAX_LIVE_EXTENTS {
             let offset = u64::from(i) * u64::from(HELIOS_HOC1_EXTENT_ALIGNMENT);
-            let (state, next) = pool.reserve(offset, 4096).expect("reservation inside the pool");
+            let (state, next) = pool
+                .reserve(offset, 4096)
+                .expect("reservation inside the pool");
             assert_eq!(state, HeliosExtentSealState::Reserved);
             assert!(state.cpu_writable());
             pool = next;
@@ -8548,7 +8421,10 @@ mod allocation_identity_tests {
             ))
         );
         assert_eq!(
-            pool.reserve(HELIOS_HOC1_POOL_BYTES - u64::from(HELIOS_HOC1_EXTENT_ALIGNMENT), 65537),
+            pool.reserve(
+                HELIOS_HOC1_POOL_BYTES - u64::from(HELIOS_HOC1_EXTENT_ALIGNMENT),
+                65537
+            ),
             Err(IdentityRefusal::Extent(
                 HeliosExtentRejection::RangeOutsidePool {
                     end: HELIOS_HOC1_POOL_BYTES + 1,
@@ -8769,11 +8645,11 @@ mod allocation_identity_tests {
 /// share one vocabulary.
 pub mod translation_session {
     use helios_protocol::native_render::{
-        Hvm1Role, HELIOS_HNR2_ACCESS_WRITE, HELIOS_HVM1_REPLY_POOL_BYTES,
-        HELIOS_HVM1_REPLY_SLOT_BYTES, HELIOS_HVM1_REPLY_SLOT_COUNT,
+        admit_snapshot, Hnr2CapacityRefusal, HELIOS_HVR1_MAX_SNAPSHOT_BYTES,
     };
     use helios_protocol::native_render::{
-        admit_snapshot, Hnr2CapacityRefusal, HELIOS_HVR1_MAX_SNAPSHOT_BYTES,
+        Hvm1Role, HELIOS_HNR2_ACCESS_WRITE, HELIOS_HVM1_REPLY_POOL_BYTES,
+        HELIOS_HVM1_REPLY_SLOT_BYTES, HELIOS_HVM1_REPLY_SLOT_COUNT,
     };
     use helios_protocol::translation_session::{
         admit_host_dispatch_enqueue, admit_new_session, check_generation_match, AttachRefusal,
@@ -9884,7 +9760,10 @@ pub mod translation_session {
 
     /// Package/session generation cross-check for a later record (HOB1/HOS1)
     /// that repeats the session generation as an anti-stale check.
-    pub fn check_session_generation(found: u64, session: &TranslationSession) -> Result<(), SessionRefusal> {
+    pub fn check_session_generation(
+        found: u64,
+        session: &TranslationSession,
+    ) -> Result<(), SessionRefusal> {
         check_generation_match(found, session.session_generation).map_err(|reason| {
             SessionRefusal::Init(InitRefusal::Generation {
                 field: GenerationField::Session,
@@ -9957,10 +9836,7 @@ pub mod translation_session {
             }
         }
 
-        fn execution_reply_request(
-            slot: usize,
-            slot_generation: u64,
-        ) -> ExecutionReplyRequest {
+        fn execution_reply_request(slot: usize, slot_generation: u64) -> ExecutionReplyRequest {
             ExecutionReplyRequest {
                 names_reply_pool: true,
                 expected_allocation_generation: POOL_GEN,
@@ -10053,7 +9929,11 @@ pub mod translation_session {
                 })
             );
             assert_eq!(
-                s.bind_reply_pool(Hvm1Role::ReplyPool, HELIOS_HVM1_REPLY_POOL_BYTES / 2, POOL_GEN),
+                s.bind_reply_pool(
+                    Hvm1Role::ReplyPool,
+                    HELIOS_HVM1_REPLY_POOL_BYTES / 2,
+                    POOL_GEN
+                ),
                 Err(SessionRefusal::ReplyPoolSizeMismatch {
                     found: HELIOS_HVM1_REPLY_POOL_BYTES / 2
                 })
@@ -10320,7 +10200,8 @@ pub mod translation_session {
         #[test]
         fn the_first_attach_declares_an_endpoint_and_later_ones_are_cross_checked() {
             let mut s = live_session(4);
-            s.attach(&attach_packet(1, 10)).expect("declares endpoint 1");
+            s.attach(&attach_packet(1, 10))
+                .expect("declares endpoint 1");
             assert_eq!(s.endpoint(1).unwrap().descriptor, endpoint(1));
 
             // Same ordinal, different engine class: refused as a mismatch against
@@ -10350,7 +10231,8 @@ pub mod translation_session {
             let mut second = attach_packet(2, 11);
             second.engine_class = HELIOS_ENGINE_CLASS_COMPUTE;
             second.queue_family = 1;
-            s.attach(&second).expect("endpoint 2 is its own declaration");
+            s.attach(&second)
+                .expect("endpoint 2 is its own declaration");
             assert_eq!(
                 s.endpoint(2).unwrap().descriptor.engine_class,
                 HELIOS_ENGINE_CLASS_COMPUTE
@@ -10377,9 +10259,9 @@ pub mod translation_session {
         fn declare_endpoint_is_idempotent_and_refuses_a_conflict() {
             let mut s = live_session(4);
             s.declare_endpoint(endpoint(1)).expect("declares");
-            s.declare_endpoint(endpoint(1)).expect("re-declares identically");
-            let conflicting =
-                HeliosTranslationEndpointV1::new(1, HeliosEngineClass::Copy, 0, 0);
+            s.declare_endpoint(endpoint(1))
+                .expect("re-declares identically");
+            let conflicting = HeliosTranslationEndpointV1::new(1, HeliosEngineClass::Copy, 0, 0);
             assert_eq!(
                 s.declare_endpoint(conflicting),
                 Err(SessionRefusal::EndpointDescriptorConflict { endpoint_id: 1 })
@@ -10411,7 +10293,8 @@ pub mod translation_session {
             // ...and the session is still fully usable afterwards.
             s.admit_control_render(&reply_request(0, 1))
                 .expect("a refused predecessor left nothing behind");
-            s.attach(&attach_packet(1, 1)).expect("still admits a good packet");
+            s.attach(&attach_packet(1, 1))
+                .expect("still admits a good packet");
         }
 
         #[test]
@@ -10427,8 +10310,10 @@ pub mod translation_session {
 
             s.begin_draining();
             s.detach(10).expect("an attached context still detaches");
-            s.retire_host_dispatch(1).expect("an enqueued DMA still retires");
-            s.release_snapshot_bytes(64).expect("a live snapshot still releases");
+            s.retire_host_dispatch(1)
+                .expect("an enqueued DMA still retires");
+            s.release_snapshot_bytes(64)
+                .expect("a live snapshot still releases");
             assert_eq!(s.attached_contexts(), 0);
             assert_eq!(s.live_snapshots(), 0);
         }
@@ -10725,9 +10610,7 @@ pub mod translation_session {
             );
             assert_eq!(
                 s.retire_slot(REPLY_SLOTS, 1),
-                Err(SessionRefusal::ControlRenderSlotIndexOutOfRange {
-                    found: REPLY_SLOTS
-                })
+                Err(SessionRefusal::ControlRenderSlotIndexOutOfRange { found: REPLY_SLOTS })
             );
         }
 
@@ -10759,9 +10642,7 @@ pub mod translation_session {
             past.reply_offset = HELIOS_HVM1_REPLY_POOL_BYTES;
             assert_eq!(
                 s.admit_control_render(&past),
-                Err(SessionRefusal::ControlRenderSlotIndexOutOfRange {
-                    found: REPLY_SLOTS
-                })
+                Err(SessionRefusal::ControlRenderSlotIndexOutOfRange { found: REPLY_SLOTS })
             );
         }
 
@@ -10935,7 +10816,8 @@ pub mod translation_session {
             ));
             // A refused enqueue must not have consumed a serial or a slot.
             s.retire_host_dispatch(1).expect("one retires");
-            s.enqueue_host_dispatch(1).expect("and the slot is reusable");
+            s.enqueue_host_dispatch(1)
+                .expect("and the slot is reusable");
             // Endpoint 2 is untouched by endpoint 1's exhaustion.
             s.enqueue_host_dispatch(2).expect("independent FIFO");
         }
@@ -11448,9 +11330,8 @@ pub mod native_render {
 
     /// One [`Hnr2PhysicalCapability`], as an offset stride.
     pub const CAPABILITY_RECORD_BYTES: u32 = 48;
-    const _: () = assert!(
-        CAPABILITY_RECORD_BYTES as usize == core::mem::size_of::<Hnr2PhysicalCapability>()
-    );
+    const _: () =
+        assert!(CAPABILITY_RECORD_BYTES as usize == core::mem::size_of::<Hnr2PhysicalCapability>());
 
     /// Where a COMMIT's capability table lives in the DMA buffer dxgkrnl
     /// returned for that Render.
@@ -11506,9 +11387,7 @@ pub mod native_render {
         dma_buffer_bytes: u32,
     ) -> Result<CapabilityTablePlan, RenderRefusal> {
         if count > HELIOS_HNR2_MAX_OUTPUT_PATCHES {
-            return Err(RenderRefusal::Dma(
-                Hnr2DmaReject::OutputPatchCountTooLarge,
-            ));
+            return Err(RenderRefusal::Dma(Hnr2DmaReject::OutputPatchCountTooLarge));
         }
         let bytes = count as u64 * CAPABILITY_RECORD_BYTES as u64;
         let end = bytes + offset as u64;
@@ -11706,6 +11585,19 @@ pub mod native_render {
         Ok(())
     }
 
+    /// Commit a fully validated D3D11 physical HOB1 batch to the same
+    /// context-local monotonic watermark used by HOS1. The caller has already
+    /// validated the complete immutable record against `last_batch_id()`; this
+    /// final compare-and-advance prevents a replay if another admission ever
+    /// appears between validation and publication.
+    pub fn commit_physical_hob1(context: &mut OuterSubmitContext, batch_id: u64) -> bool {
+        if batch_id == 0 || batch_id <= context.last_batch_id {
+            return false;
+        }
+        context.last_batch_id = batch_id;
+        true
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -11714,10 +11606,10 @@ pub mod native_render {
             HELIOS_HNR2_FLAG_BEGIN, HELIOS_HNR2_FLAG_COMMIT, HELIOS_HNR2_HEADER_SIZE,
             HELIOS_HNR2_MAGIC, HELIOS_HNR2_MAX_OUTSTANDING_SUBMISSIONS,
             HELIOS_HNR2_NO_REPLY_ALLOCATION_INDEX, HELIOS_HNR2_SLOT_POOL_BYTES,
-            HELIOS_HNR2_USE_RECORD_SIZE, HELIOS_HVC1_DMA_BUFFER_BYTES,
+            HELIOS_HVC1_DMA_BUFFER_BYTES,
         };
 
-        const PKG: u64 = 0x4845_4C49_0000_0002;
+        const PKG: u64 = helios_protocol::HELIOS_PACKAGE_GENERATION;
 
         /// One fragment of a `fragment_count`-fragment batch, with no tables.
         fn frag(token: u64, index: u16, count: u16, chunk: u32) -> HeliosNativeRenderV2 {
@@ -11779,19 +11671,6 @@ pub mod native_render {
             h
         }
 
-        fn use_env(header: &HeliosNativeRenderV2) -> RenderEnv {
-            let table = header.use_record_count * HELIOS_HNR2_USE_RECORD_SIZE;
-            RenderEnv {
-                package_generation: PKG,
-                allocation_list_count: header.use_record_count,
-                command_length: HELIOS_HNR2_HEADER_SIZE as u32
-                    + table
-                    + header.fragment_payload_bytes,
-                command_buffer_bytes: HELIOS_HVC1_DMA_BUFFER_BYTES as u32,
-                patch_location_list_in_size: 0,
-            }
-        }
-
         fn use_record(index: u32, write: bool) -> HeliosNativeRenderUse {
             HeliosNativeRenderUse {
                 allocation_list_index: index,
@@ -11843,7 +11722,10 @@ pub mod native_render {
                 err,
                 RenderRefusal::Header(Hnr2Reject::FragmentIndexOutOfOrder)
             );
-            assert_eq!(ctx, before, "a refused fragment must not move the assembler");
+            assert_eq!(
+                ctx, before,
+                "a refused fragment must not move the assembler"
+            );
 
             // The batch is still completable.
             for i in 1..3u16 {
@@ -11946,7 +11828,11 @@ pub mod native_render {
         #[test]
         fn the_commit_table_admission_runs_the_whole_use_list() {
             let h = commit_with_uses(3, 3, 16);
-            let uses = [use_record(0, false), use_record(1, false), use_record(2, true)];
+            let uses = [
+                use_record(0, false),
+                use_record(1, false),
+                use_record(2, true),
+            ];
             // Only the LAST entry disagrees, so a loop that stops early passes.
             assert_eq!(
                 admit_commit_tables(&h, &uses, &[], 3, &[false, false, false]).unwrap_err(),
@@ -11956,7 +11842,11 @@ pub mod native_render {
 
         #[test]
         fn the_patch_plan_is_one_slot_per_use_and_is_repeatable() {
-            let uses = [use_record(0, false), use_record(1, true), use_record(2, false)];
+            let uses = [
+                use_record(0, false),
+                use_record(1, true),
+                use_record(2, false),
+            ];
             let plan = plan_output_patch_slots(&uses, 16).unwrap();
             assert_eq!(plan.first_slot, 0);
             assert_eq!(plan.count, 3);
@@ -12056,7 +11946,7 @@ pub mod native_render {
                 + OUTER_SUBMIT_REJECT_COUNT;
             let mut codes = [0u32; TOTAL];
             let mut n = 0;
-            let mut push = |slot: &mut [u32; TOTAL], at: &mut usize, code: u32| {
+            let push = |slot: &mut [u32; TOTAL], at: &mut usize, code: u32| {
                 slot[*at] = code;
                 *at += 1;
             };
@@ -12203,8 +12093,7 @@ pub mod native_render {
 
         #[test]
         fn the_capability_table_is_addressed_by_offset_in_both_directions() {
-            let plan =
-                plan_capability_table(TABLE_BASE, 3, HELIOS_HVC1_DMA_BUFFER_BYTES).unwrap();
+            let plan = plan_capability_table(TABLE_BASE, 3, HELIOS_HVC1_DMA_BUFFER_BYTES).unwrap();
             assert_eq!(plan.offset, TABLE_BASE);
             assert_eq!(plan.bytes, 3 * CAPABILITY_RECORD_BYTES);
             assert_eq!(plan.entry_offset(0), Some(TABLE_BASE));
@@ -12312,11 +12201,9 @@ pub mod native_render {
             let record = hos1(&ctx, 1, HOB1_HEADER);
             assert_eq!(
                 admit_hos1(&mut ctx, &record, HOB1_HEADER as u64).unwrap_err(),
-                RenderRefusal::OuterSubmit(
-                    HeliosOuterSubmitRejection::NotD3D12VirtualContext {
-                        context_flags: D3D11_PHYSICAL
-                    }
-                )
+                RenderRefusal::OuterSubmit(HeliosOuterSubmitRejection::NotD3D12VirtualContext {
+                    context_flags: D3D11_PHYSICAL
+                })
             );
         }
 
@@ -12597,17 +12484,26 @@ pub mod hlm1_placement {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub enum PlacementRefusal {
         /// The operation cannot carry a placement — see [`carries_placement`].
-        NotPlacementBearing { operation: u32 },
+        NotPlacementBearing {
+            operation: u32,
+        },
         /// A segment this allocation is not bound to. Not a defect on its own:
         /// `hvm1_placement` keeps the aperture in the supported set, so VidMm may
         /// legally place elsewhere — and then no CPU view exists to bind.
-        ForeignSegment { found: u32 },
-        Unaligned { found: u64 },
+        ForeignSegment {
+            found: u32,
+        },
+        Unaligned {
+            found: u64,
+        },
         ZeroLength,
         /// `byte_offset + length_bytes` does not fit a `u64`.
         RangeOverflow,
         /// The range leaves the window partition VidMm owns.
-        ExceedsReserve { end: u64, reserve: u64 },
+        ExceedsReserve {
+            end: u64,
+            reserve: u64,
+        },
     }
 
     /// Why an offset is not a legal fixed-map target.
@@ -12684,10 +12580,15 @@ pub mod hlm1_placement {
     pub enum Action {
         /// Already mapped there. The host round-trip must not be re-issued.
         None,
-        Bind { to: u64 },
+        Bind {
+            to: u64,
+        },
         /// The old mapping is torn down by `map_blob_at` itself; the pair is
         /// carried so the caller can count a move rather than a first bind.
-        Rebind { from: u64, to: u64 },
+        Rebind {
+            from: u64,
+            to: u64,
+        },
     }
 
     /// The per-allocation binding state. One `u64`, so the platform half can
@@ -12881,7 +12782,10 @@ mod hlm1_placement_tests {
     #[test]
     fn offset_bounds_at_the_four_edges() {
         assert_eq!(admissible_window_offset(0, POOL, RESERVE), Ok(()));
-        assert_eq!(admissible_window_offset(RESERVE - POOL, POOL, RESERVE), Ok(()));
+        assert_eq!(
+            admissible_window_offset(RESERVE - POOL, POOL, RESERVE),
+            Ok(())
+        );
         assert_eq!(
             admissible_window_offset(RESERVE - POOL + PAGE_BYTES, POOL, RESERVE),
             Err(OffsetRefusal::ExceedsReserve {

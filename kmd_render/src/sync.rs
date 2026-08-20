@@ -152,12 +152,30 @@ impl<T> FixedVec<T> {
         true
     }
 
+    /// Move-preserving form of [`Self::push`].  Callers that carry rundown
+    /// guards can return the exact value on capacity refusal instead of
+    /// dropping those guards inside a DISPATCH-level critical path.
+    pub(crate) fn try_push(&mut self, value: T) -> Result<(), T> {
+        if self.entries.len() >= self.max || self.entries.len() >= self.entries.capacity() {
+            return Err(value);
+        }
+        self.entries.push(value);
+        Ok(())
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
     }
 
     pub(crate) fn is_full(&self) -> bool {
         self.entries.len() >= self.max || self.entries.len() >= self.entries.capacity()
+    }
+
+    pub(crate) fn can_fit(&self, additional: usize) -> bool {
+        self.entries
+            .len()
+            .checked_add(additional)
+            .is_some_and(|needed| needed <= self.max && needed <= self.entries.capacity())
     }
 
     pub(crate) fn as_slice(&self) -> &[T] {
@@ -182,5 +200,11 @@ impl<T> FixedVec<T> {
     /// use only on tables with no order invariant.
     pub(crate) fn swap_remove(&mut self, index: usize) -> T {
         self.entries.swap_remove(index)
+    }
+
+    /// Remove one entry while preserving the order of all later entries.
+    /// `Vec::remove` shifts initialized elements in place and never allocates.
+    pub(crate) fn remove(&mut self, index: usize) -> T {
+        self.entries.remove(index)
     }
 }

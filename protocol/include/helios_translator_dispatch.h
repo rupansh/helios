@@ -302,9 +302,10 @@ enum HeliosTranslatorStatusValues {
      * zero" — a nonzero placeholder is how a raw host resource id would reach
      * the host at a position the operand table blesses. */
     HELIOS_TRANSLATOR_STATUS_PAYLOAD_PLACEHOLDER_NON_ZERO = 45,
+    HELIOS_TRANSLATOR_STATUS_SCOPE_EMPTY = 46,
 
     /* The highest defined code. Bounds-check before indexing a name table. */
-    HELIOS_TRANSLATOR_STATUS_MAX = 45
+    HELIOS_TRANSLATOR_STATUS_MAX = 46
 };
 
 /* ------------------------------------------------------------------------ */

@@ -26,8 +26,7 @@ use helios_protocol::native_render::{
     HELIOS_HVC1_MAGIC, HELIOS_HVC1_SIZE, HELIOS_NATIVE_RENDER_CAPSET,
 };
 use helios_protocol::translation_session::{
-    parse_create_context_private_data, HeliosSessionCapability, HELIOS_HQA1_MAGIC,
-    HELIOS_HQA1_SIZE,
+    parse_create_context_private_data, HeliosSessionCapability, HELIOS_HQA1_MAGIC, HELIOS_HQA1_SIZE,
 };
 use helios_protocol::HELIOS_PACKAGE_GENERATION;
 
@@ -696,8 +695,7 @@ fn admit_hvc1(
             if model.phase() != model::SessionPhase::Live {
                 drop(model);
                 drop(cell);
-                crate::ddi::native_render::NR2_QUEUE_CTX_REJECT
-                    .fetch_add(1, Ordering::Relaxed);
+                crate::ddi::native_render::NR2_QUEUE_CTX_REJECT.fetch_add(1, Ordering::Relaxed);
                 return Err(STATUS_INVALID_DEVICE_REQUEST);
             }
             model.endpoint_capacity()
@@ -712,8 +710,7 @@ fn admit_hvc1(
         ) {
             Ok(index) => index as usize,
             Err(_) => {
-                crate::ddi::native_render::NR2_QUEUE_CTX_REJECT
-                    .fetch_add(1, Ordering::Relaxed);
+                crate::ddi::native_render::NR2_QUEUE_CTX_REJECT.fetch_add(1, Ordering::Relaxed);
                 drop(cell);
                 return Err(STATUS_NOT_SUPPORTED);
             }
@@ -1198,14 +1195,88 @@ pub(crate) fn execution_session_generation(session: NonNull<SessionObject>) -> O
 /// generated reply from the nonzero-ring executor.  The caller already owns a
 /// direct session rundown operation; this function performs no discovery and
 /// refuses a non-live session or exhausted generation space.
-pub(crate) fn mint_execution_snapshot_generation(
-    session: NonNull<SessionObject>,
-) -> Option<u64> {
+pub(crate) fn mint_execution_snapshot_generation(session: NonNull<SessionObject>) -> Option<u64> {
     let obj = unsafe { session.as_ref() };
     if obj.model.lock().phase() != model::SessionPhase::Live {
         return None;
     }
     obj.snapshot_generations.lock().mint().ok()
+}
+
+pub(crate) fn execute_generated_control(
+    session: NonNull<SessionObject>,
+    facts: crate::ddi::create_allocation::K11ReplyPoolFacts,
+    payload: &[u8],
+    reply_offset: u64,
+    reply_capacity: u64,
+    raw_reply_bytes: u64,
+    slot_generation: u64,
+    batch_token: u64,
+    expected_opcode: u32,
+) -> Result<(), NTSTATUS> {
+    let obj = unsafe { session.as_ref() };
+    if obj.model.lock().phase() != model::SessionPhase::Live {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let adapter = unsafe { obj.adapter.as_ref() }.ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    let snapshot_generation = obj
+        .snapshot_generations
+        .lock()
+        .mint()
+        .map_err(|_| STATUS_INSUFFICIENT_RESOURCES)?;
+    let raw_offset = reply_offset
+        .checked_add(helios_protocol::native_render::HELIOS_HVR1_HEADER_SIZE as u64)
+        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    obj.transport.execute_generated_control(
+        unsafe { crate::irql::PassiveLevel::assume() },
+        adapter,
+        obj.owner,
+        facts,
+        payload,
+        raw_offset,
+        raw_reply_bytes,
+        expected_opcode,
+    )?;
+    let hvr1 = helios_protocol::native_render::HeliosVenusReplyV1 {
+        magic: helios_protocol::native_render::HELIOS_HVR1_MAGIC,
+        version: helios_protocol::native_render::HELIOS_HVR1_VERSION,
+        header_size: helios_protocol::native_render::HELIOS_HVR1_HEADER_SIZE,
+        package_generation: HELIOS_PACKAGE_GENERATION,
+        session_generation: obj.model.lock().session_generation(),
+        slot_generation,
+        batch_token,
+        snapshot_generation,
+        opcode: expected_opcode,
+        status: 0,
+        total_bytes: raw_reply_bytes,
+        chunk_offset: 0,
+        chunk_bytes: u32::try_from(raw_reply_bytes).map_err(|_| STATUS_INVALID_DEVICE_REQUEST)?,
+        flags: helios_protocol::native_render::HELIOS_HVR1_FLAG_FINAL,
+    };
+    crate::ddi::session_transport::SessionTransport::publish_hvr1_existing_payload(
+        facts,
+        reply_offset,
+        reply_capacity,
+        &hvr1,
+        raw_reply_bytes,
+    )
+}
+
+pub(crate) fn execute_control_no_reply(
+    session: NonNull<SessionObject>,
+    payload: &[u8],
+) -> Result<(), NTSTATUS> {
+    let obj = unsafe { session.as_ref() };
+    if obj.model.lock().phase() != model::SessionPhase::Live {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let adapter = unsafe { obj.adapter.as_ref() }.ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    obj.transport.execute_control_no_reply(
+        unsafe { crate::irql::PassiveLevel::assume() },
+        adapter,
+        obj.owner,
+        payload,
+    )
 }
 
 /// Retain the raw device's exact live session for one roles 2-4 HVM1 ordinary
@@ -1216,6 +1287,21 @@ pub(crate) fn retain_execution_session(
 ) -> Option<NonNull<SessionObject>> {
     let cell = device_session.lock();
     let session = (*cell)?;
+    let obj = unsafe { session.as_ref() };
+    if obj.model.lock().phase() != model::SessionPhase::Live {
+        return None;
+    }
+    obj.acquire();
+    Some(session)
+}
+
+/// Retain the exact live session already carried by an HQA1 context.  This is
+/// a direct-object edge, not the process-list capability search used only at
+/// context creation.  Allocation opens use the returned reference to keep
+/// their one-time host resource attachment alive through reverse teardown.
+pub(crate) fn retain_direct_execution_session(
+    session: NonNull<SessionObject>,
+) -> Option<NonNull<SessionObject>> {
     let obj = unsafe { session.as_ref() };
     if obj.model.lock().phase() != model::SessionPhase::Live {
         return None;

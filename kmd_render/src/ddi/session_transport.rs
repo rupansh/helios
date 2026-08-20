@@ -39,7 +39,8 @@ const SESSION_REPLY_OFFSET: u64 = 0;
 // then the optional terminal DESTROY during teardown.
 const SESSION_SET_REPLY_FENCE: u64 = 1;
 const SESSION_CREATE_INSTANCE_FENCE: u64 = 2;
-const SESSION_DESTROY_INSTANCE_FENCE: u64 = 3;
+const SESSION_CONTROL_FENCE: u64 = 3;
+const SESSION_DESTROY_INSTANCE_FENCE: u64 = 4;
 
 pub(crate) static K11_CONTEXT_CREATED: AtomicU32 = AtomicU32::new(0);
 pub(crate) static K11_CONTEXT_DESTROYED: AtomicU32 = AtomicU32::new(0);
@@ -280,10 +281,7 @@ impl SessionReplyMap {
             unsafe { core::ptr::write_volatile(self.va.as_ptr().add(offset), 0) };
         }
         unsafe {
-            core::ptr::write_volatile(
-                self.va.as_ptr().cast::<u32>(),
-                HOST_REPLY_POISON.to_le(),
-            )
+            core::ptr::write_volatile(self.va.as_ptr().cast::<u32>(), HOST_REPLY_POISON.to_le())
         };
         core::sync::atomic::fence(Ordering::SeqCst);
     }
@@ -342,7 +340,9 @@ unsafe impl Sync for SessionTransport {}
 impl SessionTransport {
     pub(crate) fn new() -> Option<Self> {
         let mut attachments = alloc::vec::Vec::new();
-        attachments.try_reserve_exact(MAX_SESSION_ATTACHMENTS).ok()?;
+        attachments
+            .try_reserve_exact(MAX_SESSION_ATTACHMENTS)
+            .ok()?;
         Some(Self {
             state: SpinLock::new(HostState::Provisional { allocation: 0 }),
             rundown: SpinLock::new(RundownState {
@@ -656,6 +656,101 @@ impl SessionTransport {
         Some(operation())
     }
 
+    /// Execute one generated HVC1 payload on the already-owned stock Venus
+    /// context.  The caller's open-allocation guard has attached `facts` to
+    /// this exact namespace and remains live across this synchronous terminal.
+    pub(crate) fn execute_generated_control(
+        &self,
+        passive: PassiveLevel,
+        adapter: &AdapterContext,
+        owner: DeviceOwner,
+        facts: K11ReplyPoolFacts,
+        payload: &[u8],
+        raw_reply_offset: u64,
+        raw_reply_bytes: u64,
+        expected_opcode: u32,
+    ) -> Result<(), NTSTATUS> {
+        let _operation = self.acquire().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        let host = match &*self.state.lock() {
+            HostState::Live(host) => host.identity(),
+            _ => return Err(STATUS_DEVICE_NOT_READY),
+        };
+        if Self::current_transport(adapter) != Some(host.transport_instance)
+            || facts.transport_instance != host.transport_instance
+            || facts.resource_id != host.k2a_resource_id
+            || facts.resource_id == 0
+            || raw_reply_bytes < core::mem::size_of::<u32>() as u64
+        {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let end = raw_reply_offset
+            .checked_add(raw_reply_bytes)
+            .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        if end > facts.byte_size {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let pair = crate::virtio::ctrl::borrow_venus_session_pair(
+            adapter,
+            owner,
+            host.context_id,
+            host.reply_resource_id,
+        )
+        .map_err(|_| STATUS_DEVICE_NOT_READY)?;
+        let dst = unsafe { facts.kernel_va.as_ptr().add(raw_reply_offset as usize) };
+        unsafe {
+            core::ptr::write_bytes(dst, 0, raw_reply_bytes as usize);
+            core::ptr::write_unaligned(dst.cast::<u32>(), HOST_REPLY_POISON.to_le());
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        crate::virtio::ctrl::submit_venus_session_sync(
+            passive,
+            adapter,
+            &pair,
+            SESSION_CONTROL_FENCE,
+            payload,
+        )
+        .map_err(|_| STATUS_DEVICE_NOT_READY)?;
+        core::sync::atomic::fence(Ordering::Acquire);
+        let opcode = unsafe { core::ptr::read_volatile(dst.cast::<u32>()) };
+        if u32::from_le(opcode) != expected_opcode {
+            K11_HOST_REPLY_REJECT.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn execute_control_no_reply(
+        &self,
+        passive: PassiveLevel,
+        adapter: &AdapterContext,
+        owner: DeviceOwner,
+        payload: &[u8],
+    ) -> Result<(), NTSTATUS> {
+        let _operation = self.acquire().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        let host = match &*self.state.lock() {
+            HostState::Live(host) => host.identity(),
+            _ => return Err(STATUS_DEVICE_NOT_READY),
+        };
+        if Self::current_transport(adapter) != Some(host.transport_instance) {
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
+        let pair = crate::virtio::ctrl::borrow_venus_session_pair(
+            adapter,
+            owner,
+            host.context_id,
+            host.reply_resource_id,
+        )
+        .map_err(|_| STATUS_DEVICE_NOT_READY)?;
+        crate::virtio::ctrl::submit_venus_session_sync(
+            passive,
+            adapter,
+            &pair,
+            SESSION_CONTROL_FENCE,
+            payload,
+        )
+        .map_err(|_| STATUS_DEVICE_NOT_READY)
+    }
+
     /// Create one distinct stock Venus context and one `VkInstance`, validate
     /// the real host reply, and let `publish` atomically finish the HTS1/HVR1
     /// side before the session becomes externally live.
@@ -729,18 +824,15 @@ impl SessionTransport {
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
 
-        let context_id = match crate::virtio::ctrl::ctx_create_session(
-            passive,
-            adapter,
-            VENUS_CAPSET_ID,
-            owner,
-        ) {
-            Ok(id) => id,
-            Err(_) => {
-                self.fail_initialization(allocation);
-                return Err(STATUS_DEVICE_NOT_READY);
-            }
-        };
+        let context_id =
+            match crate::virtio::ctrl::ctx_create_session(passive, adapter, VENUS_CAPSET_ID, owner)
+            {
+                Ok(id) => id,
+                Err(_) => {
+                    self.fail_initialization(allocation);
+                    return Err(STATUS_DEVICE_NOT_READY);
+                }
+            };
         K11_CONTEXT_CREATED.fetch_add(1, Ordering::Relaxed);
 
         let reply_resource_id = match crate::virtio::ctrl::resource_create_session_reply_blob(
@@ -822,33 +914,28 @@ impl SessionTransport {
             }
         };
 
-        let evidence = match self.create_instance(
-            passive,
-            adapter,
-            &pair,
-            reply_resource_id,
-            &reply_map,
-        ) {
-            Ok(evidence) => evidence,
-            Err(status) => {
-                drop(pair);
-                // INIT was never admitted, so do not issue vkDestroyInstance
-                // against an unproven handle. Destroying the private Venus
-                // context is the exact fail-closed cleanup whether CREATE was
-                // rejected, completed with a malformed reply, or ambiguous.
-                self.cleanup_session_resource(
-                    passive,
-                    adapter,
-                    owner,
-                    context_id,
-                    reply_resource_id,
-                    true,
-                    Some(reply_map),
-                );
-                self.fail_initialization(allocation);
-                return Err(status);
-            }
-        };
+        let evidence =
+            match self.create_instance(passive, adapter, &pair, reply_resource_id, &reply_map) {
+                Ok(evidence) => evidence,
+                Err(status) => {
+                    drop(pair);
+                    // INIT was never admitted, so do not issue vkDestroyInstance
+                    // against an unproven handle. Destroying the private Venus
+                    // context is the exact fail-closed cleanup whether CREATE was
+                    // rejected, completed with a malformed reply, or ambiguous.
+                    self.cleanup_session_resource(
+                        passive,
+                        adapter,
+                        owner,
+                        context_id,
+                        reply_resource_id,
+                        true,
+                        Some(reply_map),
+                    );
+                    self.fail_initialization(allocation);
+                    return Err(status);
+                }
+            };
 
         let live = LiveHost {
             allocation,
@@ -927,16 +1014,14 @@ impl SessionTransport {
         // write. Read only the fixed private SHM bytes; K2a is written later,
         // after this evidence is fully validated.
         let raw_reply = reply_map.read_create_reply();
-        let evidence = match pure::validate_create_instance_reply(
-            &raw_reply,
-            SESSION_INSTANCE_HANDLE,
-        ) {
-            Ok(evidence) => evidence,
-            Err(_) => {
-                K11_HOST_REPLY_REJECT.fetch_add(1, Ordering::Relaxed);
-                return Err(STATUS_DEVICE_NOT_READY);
-            }
-        };
+        let evidence =
+            match pure::validate_create_instance_reply(&raw_reply, SESSION_INSTANCE_HANDLE) {
+                Ok(evidence) => evidence,
+                Err(_) => {
+                    K11_HOST_REPLY_REJECT.fetch_add(1, Ordering::Relaxed);
+                    return Err(STATUS_DEVICE_NOT_READY);
+                }
+            };
         if evidence.opcode != pure::CMD_CREATE_INSTANCE || evidence.status != 0 {
             K11_HOST_REPLY_REJECT.fetch_add(1, Ordering::Relaxed);
             return Err(STATUS_DEVICE_NOT_READY);

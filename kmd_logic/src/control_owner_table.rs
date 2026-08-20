@@ -451,9 +451,7 @@ mod tests {
         ready.request.table = exact_table;
         table.cancel_next_transport(ready).must();
         let request = table.request_next_transport().must();
-        let stale = unsafe {
-            request.assume_ready(table.physical_instance(), successor_config)
-        };
+        let stale = unsafe { request.assume_ready(table.physical_instance(), successor_config) };
         let refused = table.reopen(stale).must_err();
         assert_eq!(refused.reason(), OwnerTableRefusal::NextTransportMismatch);
         table.cancel_next_transport(refused.into_ready()).must();
@@ -1014,12 +1012,8 @@ mod tests {
         table.config = table.config.with_first_fit_base(0x5000).must();
 
         let prefix_resource = create_resource(&mut table, &drops);
-        let prefix_identity = TransportWindow::new(
-            table.resource(prefix_resource).must(),
-            0x1000,
-            0x1000,
-        )
-        .must();
+        let prefix_identity =
+            TransportWindow::new(table.resource(prefix_resource).must(), 0x1000, 0x1000).must();
         let prefix = table
             .begin_window_map(prefix_resource, prefix_identity, Token::new(&drops))
             .must();
@@ -1030,18 +1024,10 @@ mod tests {
 
         let first_fit_resource = create_resource(&mut table, &drops);
         let first_fit_id = table.resource(first_fit_resource).must().id();
-        let first_fit_identity = TransportWindow::new(
-            table.resource(first_fit_resource).must(),
-            0x5000,
-            0x1000,
-        )
-        .must();
+        let first_fit_identity =
+            TransportWindow::new(table.resource(first_fit_resource).must(), 0x5000, 0x1000).must();
         let admission = table
-            .begin_window_map(
-                first_fit_resource,
-                first_fit_identity,
-                Token::new(&drops),
-            )
+            .begin_window_map(first_fit_resource, first_fit_identity, Token::new(&drops))
             .must();
         let (_, prepared) = admission.into_parts();
 
@@ -3630,10 +3616,7 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
     /// Exact mapped resource whose live window contains `offset`. Initializing,
     /// unmapping, release-pending, and quarantined rows deliberately do not
     /// answer: none proves bytes are currently addressable at that offset.
-    pub fn mapped_resource_at_offset(
-        &self,
-        offset: u64,
-    ) -> Result<Option<u32>, OwnerTableRefusal> {
+    pub fn mapped_resource_at_offset(&self, offset: u64) -> Result<Option<u32>, OwnerTableRefusal> {
         if !matches!(self.phase, OwnerPhase::Open | OwnerPhase::Closing) {
             return Err(OwnerTableRefusal::WrongPhase { found: self.phase });
         }
@@ -3657,7 +3640,9 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
                 .checked_add(window.length())
                 .ok_or(OwnerTableRefusal::InvariantLost)?;
             if window.offset() <= offset && offset < end {
-                return self.resource(row.resource).map(|resource| Some(resource.id()));
+                return self
+                    .resource(row.resource)
+                    .map(|resource| Some(resource.id()));
             }
         }
         Ok(None)
@@ -3741,10 +3726,7 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
         Ok(None)
     }
 
-    pub fn reserve_resource(
-        &mut self,
-        backing: B,
-    ) -> Result<ResourceHandle, RefusedAdmission<B>> {
+    pub fn reserve_resource(&mut self, backing: B) -> Result<ResourceHandle, RefusedAdmission<B>> {
         if self.phase != OwnerPhase::Open {
             return Err(RefusedAdmission {
                 reason: OwnerTableRefusal::WrongPhase { found: self.phase },
@@ -3801,10 +3783,7 @@ impl<'a, B, C, A, W, E> OwnerTable<'a, B, C, A, W, E> {
         }
     }
 
-    pub fn reserve_context(
-        &mut self,
-        owner: C,
-    ) -> Result<ContextHandle, RefusedAdmission<C>> {
+    pub fn reserve_context(&mut self, owner: C) -> Result<ContextHandle, RefusedAdmission<C>> {
         if self.phase != OwnerPhase::Open {
             return Err(RefusedAdmission {
                 reason: OwnerTableRefusal::WrongPhase { found: self.phase },

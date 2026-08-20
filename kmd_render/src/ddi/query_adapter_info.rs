@@ -16,9 +16,12 @@ use crate::dxgk::_DXGK_QUERYADAPTERINFOTYPE::{
     DXGKQAITYPE_HARDWARERESERVEDRANGES2, DXGKQAITYPE_HISTORYBUFFERPRECISION,
     DXGKQAITYPE_IOMMU_CAPS, DXGKQAITYPE_NATIVE_FENCE_CAPS, DXGKQAITYPE_PAGETABLELEVELDESC,
     DXGKQAITYPE_PHYSICALADAPTERCAPS, DXGKQAITYPE_PHYSICAL_MEMORY_CAPS, DXGKQAITYPE_QUERYSEGMENT,
-    DXGKQAITYPE_QUERYSEGMENT3, DXGKQAITYPE_QUERYSEGMENT4, DXGKQAITYPE_WDDMDEVICECAPS,
+    DXGKQAITYPE_QUERYSEGMENT3, DXGKQAITYPE_QUERYSEGMENT4, DXGKQAITYPE_UMDRIVERPRIVATE,
+    DXGKQAITYPE_WDDMDEVICECAPS,
 };
 use crate::dxgk::*;
+
+use helios_protocol::{HeliosUmdAdapterInfoV1, HELIOS_PACKAGE_GENERATION};
 
 use crate::adapter::{AdapterContext, AdapterKnobs};
 use crate::ddi::gpummu;
@@ -49,6 +52,7 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
     }
 
     match args.Type {
+        DXGKQAITYPE_UMDRIVERPRIVATE => unsafe { query_umd_private(adapter, args) },
         DXGKQAITYPE_DRIVERCAPS => unsafe { query_driver_caps(adapter, args) },
         DXGKQAITYPE_QUERYSEGMENT => unsafe { query_segments_legacy(adapter, args) },
         DXGKQAITYPE_QUERYSEGMENT3 => unsafe { query_segments3(adapter, args) },
@@ -88,6 +92,50 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
             STATUS_NOT_SUPPORTED
         }
     }
+}
+
+/// Answer the package UMDs' one fixed adapter-bootstrap query.
+///
+/// WDDM carries the UMD bytes in `pInputData` and gives the KMD a distinct
+/// `pOutputData` buffer.  Read and validate the complete input before touching
+/// the output; no prefix, alternate size, or zero-generation wildcard is
+/// admitted.
+unsafe fn query_umd_private(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+    let input = args.pInputData.cast::<HeliosUmdAdapterInfoV1>();
+    let output = args.pOutputData.cast::<HeliosUmdAdapterInfoV1>();
+    if args.InputDataSize as usize != size_of::<HeliosUmdAdapterInfoV1>()
+        || args.OutputDataSize as usize != size_of::<HeliosUmdAdapterInfoV1>()
+        || input.is_null()
+        || output.is_null()
+        || !input.is_aligned()
+        || !output.is_aligned()
+        || args.hKmdProcessHandle.is_null()
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    // SAFETY: the exact size, alignment and non-nullness were checked, and the
+    // input is copied by value before the output is written.
+    let request = unsafe { core::ptr::read(input) };
+    if request.validate_query(HELIOS_PACKAGE_GENERATION).is_err() {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let Some((adapter_generation, adapter_luid)) =
+        crate::ddi::native_fence::lifecycle_identity(adapter)
+    else {
+        return STATUS_DEVICE_NOT_READY;
+    };
+
+    let reply = HeliosUmdAdapterInfoV1 {
+        adapter_generation,
+        adapter_luid,
+        ..request
+    };
+    debug_assert!(reply.validate_reply(HELIOS_PACKAGE_GENERATION).is_ok());
+    // SAFETY: the output buffer is valid for one exact record by the DDI
+    // contract and the checks above.  No reference aliases the raw write.
+    unsafe { core::ptr::write(output, reply) };
+    STATUS_SUCCESS
 }
 
 /// A dxgkrnl-supplied **versioned** output buffer: a leading prefix of `T` whose
@@ -383,11 +431,11 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // `ddi/present_packet.rs`'s `PresentFlipPrivate` implements the DMA-buffer
     // contract instead, which is the one designed for exactly this hardware.
     const FLIPCAPS_DEFAULT: UINT = FLIPCAPS_FLIP_ON_VSYNC_MMIO;
-    let flip_caps: UINT = match crate::diag::read_config_dword(crate::diag::knobs::FLIP_CAPS_EXTRA, 0)
-    {
-        0 => FLIPCAPS_DEFAULT,
-        override_word => override_word,
-    };
+    let flip_caps: UINT =
+        match crate::diag::read_config_dword(crate::diag::knobs::FLIP_CAPS_EXTRA, 0) {
+            0 => FLIPCAPS_DEFAULT,
+            override_word => override_word,
+        };
     let scheduling_caps: UINT = SCHEDULINGCAPS_MULTI_ENGINE_AWARE
         | SCHEDULINGCAPS_PREEMPTION_AWARE
         | unsafe { crate::ddi::native_fence::vidschcaps_native_fence_bits(adapter) };
@@ -444,8 +492,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // D9 publishes MPO only as part of the one atomic 3.2/D2 package. The
     // callback table itself remains the exact one-primary, RGB-only,
     // unity-transform D3 profile; no independent capability switch exists.
-    const SUPPORT_MULTI_PLANE_OVERLAY: BOOLEAN =
-        crate::virtio::KMD_D2_OWNER_ENABLED as BOOLEAN;
+    const SUPPORT_MULTI_PLANE_OVERLAY: BOOLEAN = crate::virtio::KMD_D2_OWNER_ENABLED as BOOLEAN;
     out.set(
         caps_offset!(SupportMultiPlaneOverlay),
         SUPPORT_MULTI_PLANE_OVERLAY,
@@ -1036,8 +1083,7 @@ unsafe fn write_aperture_descriptor3(seg: *mut DXGK_SEGMENTDESCRIPTOR3) {
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR`.
 unsafe fn write_aperture_descriptor_legacy(seg: *mut DXGK_SEGMENTDESCRIPTOR) {
     unsafe {
-        SegmentDescriptorSpec::aperture(crate::virtio::KMD_D2_OWNER_ENABLED)
-            .write_into_legacy(seg)
+        SegmentDescriptorSpec::aperture(crate::virtio::KMD_D2_OWNER_ENABLED).write_into_legacy(seg)
     };
 }
 
@@ -1215,14 +1261,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
                     // at the dxgkrnl-chosen aperture offset within this window.
                     // SAFETY: d is a writable descriptor slot (above).
                     unsafe {
-                        write_bar_knob_descriptor(
-                            d,
-                            gpa,
-                            gpu_base,
-                            size,
-                            cpu_aperture_size,
-                            &knobs,
-                        )
+                        write_bar_knob_descriptor(d, gpa, gpu_base, size, cpu_aperture_size, &knobs)
                     };
                 }
             }

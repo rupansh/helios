@@ -26,31 +26,44 @@ use alloc::vec::Vec;
 
 use helios_kmd_logic::native_render::{
     admit_commit_tables, admit_hos1, apply_placement, apply_render_fragment, build_capability,
-    plan_capability_table, plan_output_patch_slots, snapshot_placement, validate_render_fragment,
-    CapabilityTablePlan, OuterSubmitContext, RenderContext, RenderEnv, RenderRefusal,
+    commit_physical_hob1, plan_capability_table, plan_output_patch_slots, snapshot_placement,
+    validate_render_fragment, CapabilityTablePlan, OuterSubmitContext, RenderContext, RenderEnv,
+    RenderRefusal,
 };
 use helios_kmd_logic::session_transport::{HostSubmissionRefusal, HostSubmissionState};
+use helios_kmd_logic::venus_executor::validate_venus_a7_outer_stream;
 use helios_protocol::native_render::kernel_dma::{
-    Hnr2DmaReject, Hnr2KmdDmaPrivateV1, Hnr2PhysicalCapability,
-    HELIOS_HNR2_KMD_DMA_FLAG_HOST_COMPLETED,
+    Hnr2DmaReject, Hnr2KmdDmaPrivateV1, Hnr2PhysicalCapability, Hob1KmdDmaPrivateV1,
+    HELIOS_HNR2_KMD_DMA_FLAG_HOST_COMPLETED, HELIOS_HOB1_KMD_DMA_ABI_VERSION,
+    HELIOS_HOB1_KMD_DMA_BYTES, HELIOS_HOB1_KMD_DMA_MAGIC,
 };
 use helios_protocol::native_render::{
     HeliosNativeRenderPatch, HeliosNativeRenderUse, HeliosNativeRenderV2, Hnr2Accept, Hnr2Reject,
-    Hnr2TableReject, HELIOS_HNR2_HEADER_SIZE, HELIOS_HNR2_MAX_PATCH_RECORDS,
-    HELIOS_HNR2_MAX_FRAGMENTS, HELIOS_HNR2_MAX_OUTSTANDING_SUBMISSIONS,
-    HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32,
-    HELIOS_HVC1_ALLOCATION_LIST_ENTRIES, HELIOS_HVM1_ROLE_REPLY_POOL,
-    HELIOS_HVM1_ROLE_VULKAN_DEVICE_LOCAL,
-    HELIOS_HVR1_FLAG_FINAL, HELIOS_HVR1_HEADER_SIZE, HELIOS_HVR1_MAGIC, HELIOS_HVR1_VERSION,
+    Hnr2TableReject, HELIOS_HNR2_HEADER_SIZE, HELIOS_HNR2_MAX_FRAGMENTS,
+    HELIOS_HNR2_MAX_OUTSTANDING_SUBMISSIONS, HELIOS_HNR2_MAX_PATCH_RECORDS,
+    HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32, HELIOS_HVC1_ALLOCATION_LIST_ENTRIES,
+    HELIOS_HVM1_ROLE_REPLY_POOL, HELIOS_HVM1_ROLE_VULKAN_DEVICE_LOCAL, HELIOS_HVR1_FLAG_FINAL,
+    HELIOS_HVR1_HEADER_SIZE, HELIOS_HVR1_MAGIC, HELIOS_HVR1_VERSION,
 };
-use helios_protocol::wddm::HeliosOuterSubmitV1;
+use helios_protocol::wddm::{
+    hob1_header, hob1_operand_records, hob1_payload, hob1_use_records, validate_batch_record,
+    HeliosOuterBatchExpectation, HeliosOuterSubmitV1, HELIOS_HOB1_ACCESS_WRITE,
+    HELIOS_HOB1_FLAG_D3D11_PHYSICAL, HELIOS_HOB1_FLAG_D3D12_VIRTUAL,
+    HELIOS_HOB1_IDENTITY_D3D11_ALLOCATION_INDEX, HELIOS_HOB1_IDENTITY_D3D12_GPUVA,
+    HELIOS_HOB1_MAX_USE_RECORDS, HELIOS_HOB1_OPERAND_KIND_GENERATED_RESOURCE,
+    HELIOS_HOB1_OPERAND_WIDTH_4,
+};
 
 use crate::dxgk::*;
 use crate::irql::PassiveLevel;
-use crate::sync::SpinLock;
-use crate::virtio::hal::DmaBuffer;
+use crate::sync::{FixedVec, SpinLock};
 use crate::virtio::gpu::SUBMIT_META_BYTES;
-use wdk_sys::ntddk::{KeClearEvent, KeInitializeEvent, KeSetEvent, KeWaitForSingleObject};
+use crate::virtio::hal::DmaBuffer;
+use wdk_sys::ntddk::{
+    IoAllocateWorkItem, IoFreeWorkItem, IoQueueWorkItem, KeClearEvent, KeInitializeEvent,
+    KeSetEvent, KeWaitForSingleObject,
+};
+use wdk_sys::{_WORK_QUEUE_TYPE, PIO_WORKITEM};
 
 // ── Named counters ───────────────────────────────────────────────────────────
 //
@@ -219,6 +232,15 @@ pub static NR2_SUBMIT_VIRTUAL_IRQL: AtomicU32 = AtomicU32::new(0);
 pub static NR2_HOS1_OK: AtomicU32 = AtomicU32::new(0);
 /// HOS1 refusals, packed `(count << 16) | RenderRefusal::code()`.
 pub static NR2_HOS1_REJECT: AtomicU32 = AtomicU32::new(0);
+/// HOS1 submissions whose exact HOC1 extent and K9 ticket entered the owning
+/// context's bounded PASSIVE staging queue.
+pub static NR2_OUTER_QUEUED: AtomicU32 = AtomicU32::new(0);
+/// Outer execution refusals, packed `(count << 16) | OuterExecutionRefusal`.
+pub static NR2_OUTER_REJECT: AtomicU32 = AtomicU32::new(0);
+/// Fully validated HOB1 payloads accepted by the existing stock-Venus
+/// endpoint.  This moves only after private operand patching and descriptor
+/// publication, never from HOS1 validation alone.
+pub static NR2_OUTER_HOST: AtomicU32 = AtomicU32::new(0);
 
 // ── The boundary counters. Each names something K6 deliberately does NOT do,
 // at the site where a later unit will do it. None of them is a failure; all of
@@ -249,12 +271,9 @@ pub static NR2_NO_STAGE: AtomicU32 = AtomicU32::new(0);
 /// epoch is K2/K3's and has no producer — which is why `validate_at_submit` is
 /// not called.
 pub static NR2_NO_EPOCH: AtomicU32 = AtomicU32::new(0);
-/// HOS1 descriptors validated and then NOT enqueued at a GPUVA.
-pub static NR2_HOS1_NOT_EXECUTED: AtomicU32 = AtomicU32::new(0);
-
 /// The counter names, as one list, so the collision proof and the writer cannot
 /// drift apart.
-const COUNTER_NAMES: [&[u8]; 38] = [
+const COUNTER_NAMES: [&[u8]; 41] = [
     b"Nr2QCtx",
     b"Nr2QCtxRej",
     b"Nr2Scratch",
@@ -293,15 +312,17 @@ const COUNTER_NAMES: [&[u8]; 38] = [
     b"Nr2WinFB",
     b"Nr2HostOk",
     b"Nr2HostRej",
+    b"Nr2OuterQ",
+    b"Nr2OuterRej",
+    b"Nr2OuterHost",
 ];
 
 /// The boundary counters that did not fit [`COUNTER_NAMES`]'s block, mirrored
 /// alongside it. Split only because a `CounterBlock` writes one registry value
 /// per entry and 27 is already the largest block in this driver.
-const BOUNDARY_NAMES: [&[u8]; 4] = [
+const BOUNDARY_NAMES: [&[u8]; 3] = [
     b"Nr2NoStage",
     b"Nr2NoEpoch",
-    b"Nr2Hos1NoX",
     // Not a K6 counter by subject, but K6 is what made the hazard reachable:
     // `DxgkDdiPatch`/`DxgkDdiSubmitCommand` deliver the context through a
     // `hDevice`/`hContext` union. It is mirrored here because this block already
@@ -391,10 +412,12 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(COUNTER_NAMES[35], &NR2_WINDOW_FALLBACK),
         e(COUNTER_NAMES[36], &NR2_HOST_SUBMIT_OK),
         f(COUNTER_NAMES[37], &NR2_HOST_SUBMIT_REJECT),
+        e(COUNTER_NAMES[38], &NR2_OUTER_QUEUED),
+        f(COUNTER_NAMES[39], &NR2_OUTER_REJECT),
+        e(COUNTER_NAMES[40], &NR2_OUTER_HOST),
         e(BOUNDARY_NAMES[0], &NR2_NO_STAGE),
         e(BOUNDARY_NAMES[1], &NR2_NO_EPOCH),
-        e(BOUNDARY_NAMES[2], &NR2_HOS1_NOT_EXECUTED),
-        f(BOUNDARY_NAMES[3], &crate::device::CONTEXT_HANDLE_REFUSED),
+        f(BOUNDARY_NAMES[2], &crate::device::CONTEXT_HANDLE_REFUSED),
     ],
     ticks: &NR2_FLUSH_TICKS,
     failures: &NR2_FLUSH_FAILURES,
@@ -442,12 +465,23 @@ struct Hnr2Scratch {
     /// mapping. Both are fixed at context creation; COMMIT never allocates
     /// parser scratch from attacker-controlled counts.
     expected_operands: Vec<helios_kmd_logic::venus_executor::VenusOperand>,
+    /// Bounded scratch for count expressions nested inside generated A7
+    /// command records (currently acceleration-structure geometry arrays).
+    /// It is allocated once with the context and never grows during Render.
+    schema_counts: Vec<u32>,
     patch_order: Vec<u32>,
     use_ordinals: Vec<u32>,
+    /// Exact HWA2 generations resolved for one outer batch.  The worker sorts
+    /// the populated prefix to enforce HOB1's unique-allocation closure without
+    /// allocating parser scratch per submission.
+    outer_generations: Vec<u64>,
     /// The one incomplete batch permitted by HNR2. Its payload is copied into
     /// KMD-owned DMA memory fragment by fragment and becomes immutable at
     /// COMMIT.
     building: Option<BuildingBatch>,
+    /// HVC1's one incomplete pure-control stream. It owns no executor slot or
+    /// separate completion identity; COMMIT executes it synchronously.
+    control_building: Option<ControlBuilding>,
 }
 
 impl Hnr2Scratch {
@@ -487,6 +521,11 @@ impl Hnr2Scratch {
             HELIOS_HNR2_MAX_PATCH_RECORDS as usize,
             helios_kmd_logic::venus_executor::VenusOperand::default(),
         );
+        let mut schema_counts = Vec::new();
+        schema_counts
+            .try_reserve_exact(HELIOS_HVC1_ALLOCATION_LIST_ENTRIES as usize)
+            .ok()?;
+        schema_counts.resize(HELIOS_HVC1_ALLOCATION_LIST_ENTRIES as usize, 0);
         let mut patch_order = Vec::new();
         patch_order
             .try_reserve_exact(HELIOS_HNR2_MAX_PATCH_RECORDS as usize)
@@ -497,14 +536,22 @@ impl Hnr2Scratch {
             .try_reserve_exact(HELIOS_HVC1_ALLOCATION_LIST_ENTRIES as usize)
             .ok()?;
         use_ordinals.resize(HELIOS_HVC1_ALLOCATION_LIST_ENTRIES as usize, u32::MAX);
+        let mut outer_generations = Vec::new();
+        outer_generations
+            .try_reserve_exact(HELIOS_HOB1_MAX_USE_RECORDS as usize)
+            .ok()?;
+        outer_generations.resize(HELIOS_HOB1_MAX_USE_RECORDS as usize, 0);
         Some(Self {
             uses,
             patches,
             write_bits,
             expected_operands,
+            schema_counts,
             patch_order,
             use_ordinals,
+            outer_generations,
             building: None,
+            control_building: None,
         })
     }
 }
@@ -627,20 +674,58 @@ struct NativeContextRundown {
     active: u32,
 }
 
-struct NativeCustody {
-    _staging: StagingCustody,
-    _session: crate::ddi::session_transport::SessionExecutionOperation,
-    _allocations: Vec<crate::ddi::create_allocation::OpenExecutionUse>,
-    reply: Option<ExecutionReply>,
+enum OuterCustody {
+    Physical {
+        _context: NativeContextOperation,
+        _session: crate::ddi::session_transport::SessionExecutionOperation,
+        _allocations: Vec<crate::ddi::create_allocation::OpenOuterUse>,
+    },
+    Virtual {
+        _context: NativeContextOperation,
+        _session: crate::ddi::session_transport::SessionExecutionOperation,
+        _command_pool: crate::ddi::create_allocation::OpenOuterUse,
+        _allocations: Vec<crate::ddi::create_allocation::OpenOuterUse>,
+    },
+}
+
+impl OuterCustody {
+    fn session(&self) -> &crate::ddi::session_transport::SessionExecutionOperation {
+        match self {
+            Self::Physical { _session, .. } | Self::Virtual { _session, .. } => _session,
+        }
+    }
+}
+
+enum NativeCustody {
+    Hnr2 {
+        _staging: StagingCustody,
+        _session: crate::ddi::session_transport::SessionExecutionOperation,
+        _allocations: Vec<crate::ddi::create_allocation::OpenExecutionUse>,
+        reply: Option<ExecutionReply>,
+    },
+    Outer(OuterCustody),
 }
 
 impl NativeCustody {
     fn host_context_id(&self) -> u32 {
-        self._session.context_id
+        match self {
+            Self::Hnr2 { _session, .. } => _session.context_id,
+            Self::Outer(custody) => custody.session().context_id,
+        }
     }
 
     fn transport_instance(&self) -> u64 {
-        self._session.transport_instance
+        match self {
+            Self::Hnr2 { _session, .. } => _session.transport_instance,
+            Self::Outer(custody) => custody.session().transport_instance,
+        }
+    }
+
+    fn take_reply(&mut self) -> Option<ExecutionReply> {
+        match self {
+            Self::Hnr2 { reply, .. } => reply.take(),
+            Self::Outer(_) => None,
+        }
     }
 }
 
@@ -707,8 +792,7 @@ impl ExecutionReply {
             let opcode = unsafe { core::ptr::read_unaligned(payload.cast::<u32>()) };
             let status = unsafe { core::ptr::read_unaligned(payload.add(4).cast::<i32>()) };
             let output_present = unsafe { core::ptr::read_unaligned(payload.add(8).cast::<u64>()) };
-            if opcode == helios_kmd_logic::venus_executor::OP_ALLOCATE_MEMORY
-                && output_present == 1
+            if opcode == helios_kmd_logic::venus_executor::OP_ALLOCATE_MEMORY && output_present == 1
             {
                 let header = helios_protocol::native_render::HeliosVenusReplyV1 {
                     magic: HELIOS_HVR1_MAGIC,
@@ -726,14 +810,15 @@ impl ExecutionReply {
                     chunk_bytes: Self::RAW_ALLOCATE_REPLY_BYTES as u32,
                     flags: HELIOS_HVR1_FLAG_FINAL,
                 };
-                published = crate::ddi::session_transport::SessionTransport::publish_hvr1_existing_payload(
-                    self.facts,
-                    self.reply_offset,
-                    self.reply_capacity,
-                    &header,
-                    Self::RAW_ALLOCATE_REPLY_BYTES,
-                )
-                .is_ok();
+                published =
+                    crate::ddi::session_transport::SessionTransport::publish_hvr1_existing_payload(
+                        self.facts,
+                        self.reply_offset,
+                        self.reply_capacity,
+                        &header,
+                        Self::RAW_ALLOCATE_REPLY_BYTES,
+                    )
+                    .is_ok();
             }
         }
         if published {
@@ -780,6 +865,14 @@ struct BuildingBatch {
     meta: DmaBuffer,
     staging: StagingCustody,
     session: crate::ddi::session_transport::SessionExecutionOperation,
+}
+
+struct ControlBuilding {
+    batch_token: u64,
+    total_payload_bytes: u64,
+    full_payload_crc64: u64,
+    fragment_count: u16,
+    payload: DmaBuffer,
 }
 
 /// One exact checkout from the existing per-context HNR2 staging model.
@@ -863,6 +956,181 @@ impl ExecutorState {
     }
 }
 
+/// Stable reasons the outer path can refuse before or during exact HOB1
+/// execution.  The registry counter stores the latest code alongside its
+/// count; source gates pin these names so a missing/stale/cross-device token
+/// can never collapse into an anonymous submit failure.
+#[repr(u32)]
+#[derive(Clone, Copy)]
+enum OuterExecutionRefusal {
+    PrivateData = 1,
+    Descriptor = 2,
+    FenceOrder = 3,
+    ContextClosed = 4,
+    SessionClosed = 5,
+    SlotExhausted = 6,
+    ResubmissionMismatch = 7,
+    CommandPoolMissing = 8,
+    WorkerClosed = 9,
+    WorkerFull = 10,
+    SnapshotFailed = 11,
+    BatchRecord = 12,
+    SubmitCrossCheck = 13,
+    UseMissingOrForeign = 14,
+    UseStaleGeneration = 15,
+    DuplicateUse = 16,
+    TransportMismatch = 17,
+    Schema = 18,
+    OperandClosure = 19,
+    OperandWidth = 20,
+    PatchBounds = 21,
+    HostUnavailable = 22,
+    HostEnqueue = 23,
+    WorkerIrql = 24,
+}
+
+impl OuterExecutionRefusal {
+    fn record(self) {
+        bump_with_code(&NR2_OUTER_REJECT, self as u32);
+    }
+}
+
+/// One HOS1 submission after all DISPATCH-safe identity checks have succeeded.
+/// It carries direct object guards, never scalar rediscovery keys, into the
+/// owning context's PASSIVE work item.
+struct OuterPending {
+    identity: BatchIdentity,
+    slot_index: u32,
+    prior_batch_id: u64,
+    submit: HeliosOuterSubmitV1,
+    device: NonNull<crate::device::DeviceContext>,
+    session: NonNull<crate::ddi::translation_session::SessionObject>,
+    command_pool: crate::ddi::create_allocation::OpenOuterUse,
+    context_operation: NativeContextOperation,
+    session_operation: crate::ddi::session_transport::SessionExecutionOperation,
+}
+
+// Every field is either immutable scalar state or a move-only rundown guard
+// whose own type is Send. The pointed-to device/session/context objects are
+// heap-pinned and cannot be freed until those guards are dropped.
+unsafe impl Send for OuterPending {}
+
+struct OuterWorkerState {
+    open: bool,
+    queued: bool,
+    pending: FixedVec<OuterPending>,
+}
+
+struct OuterWorker {
+    item: PIO_WORKITEM,
+    state: SpinLock<OuterWorkerState>,
+    drained: UnsafeCell<KEVENT>,
+}
+
+unsafe impl Send for OuterWorker {}
+unsafe impl Sync for OuterWorker {}
+
+impl OuterWorker {
+    fn new(adapter: &crate::adapter::AdapterContext) -> Option<Self> {
+        // PASSIVE_LEVEL: NativeContext::new is called only from CreateContext.
+        let item = unsafe { IoAllocateWorkItem(adapter.physical_device_object()) };
+        if item.is_null() {
+            return None;
+        }
+        Some(Self {
+            item,
+            state: SpinLock::new(OuterWorkerState {
+                open: true,
+                queued: false,
+                pending: FixedVec::with_max(EXECUTOR_SLOTS),
+            }),
+            drained: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+        })
+    }
+
+    /// Initialize the embedded dispatcher object only after NativeContext has
+    /// reached its final boxed address.
+    unsafe fn init_event(&self) {
+        unsafe { KeInitializeEvent(self.drained.get(), 0, 1) };
+    }
+
+    fn enqueue(
+        &self,
+        native: NonNull<NativeContext>,
+        pending: OuterPending,
+    ) -> Result<(), (OuterExecutionRefusal, OuterPending)> {
+        let schedule = {
+            let mut state = self.state.lock();
+            if !state.open {
+                return Err((OuterExecutionRefusal::WorkerClosed, pending));
+            }
+            let schedule = !state.queued;
+            state
+                .pending
+                .try_push(pending)
+                .map_err(|pending| (OuterExecutionRefusal::WorkerFull, pending))?;
+            if schedule {
+                state.queued = true;
+                unsafe { KeClearEvent(self.drained.get()) };
+            }
+            schedule
+        };
+        if schedule {
+            // IoQueueWorkItem is legal through DISPATCH_LEVEL. The context
+            // pointer is direct callback custody, never an identity lookup.
+            unsafe {
+                IoQueueWorkItem(
+                    self.item,
+                    Some(outer_work_item),
+                    _WORK_QUEUE_TYPE::DelayedWorkQueue,
+                    native.as_ptr().cast::<c_void>(),
+                )
+            };
+        }
+        Ok(())
+    }
+
+    fn take_next(&self) -> Option<(bool, OuterPending)> {
+        let mut state = self.state.lock();
+        if state.pending.len() != 0 {
+            let open = state.open;
+            return Some((open, state.pending.remove(0)));
+        }
+        state.queued = false;
+        unsafe { KeSetEvent(self.drained.get(), 0, 0) };
+        None
+    }
+
+    fn close_and_wait(&self) {
+        let wait = {
+            let mut state = self.state.lock();
+            state.open = false;
+            if !state.queued {
+                unsafe { KeSetEvent(self.drained.get(), 0, 0) };
+            }
+            state.queued
+        };
+        if wait {
+            let _ = unsafe {
+                KeWaitForSingleObject(
+                    self.drained.get() as wdk_sys::PVOID,
+                    0,
+                    0,
+                    0,
+                    core::ptr::null_mut(),
+                )
+            };
+        }
+    }
+}
+
+impl Drop for OuterWorker {
+    fn drop(&mut self) {
+        // Context destruction and every constructor failure run at PASSIVE.
+        unsafe { IoFreeWorkItem(self.item) };
+    }
+}
+
 // ── The per-context native state ─────────────────────────────────────────────
 
 /// Which HVC1 class a native context is.
@@ -874,6 +1142,10 @@ impl ExecutorState {
 pub(crate) enum NativeClass {
     Control,
     Queue,
+    /// HQA1 outer context.  It uses the same endpoint and K9/used-ring
+    /// completion graph as `Queue`, but accepts only complete HOB1 records from
+    /// the owning UMD path.
+    Outer,
 }
 
 /// One HVC1 context's K6 state, allocated at `DxgkDdiCreateContext` and owned by
@@ -886,6 +1158,10 @@ pub(crate) struct NativeContext {
     /// Control is ring zero.  A queue context owns one direct, nonzero,
     /// non-recycled endpoint selected by its session at context creation.
     ring_index: u32,
+    /// Exact HTS1 endpoint identity.  It is currently numerically equal to the
+    /// ring index for real endpoints, but remains a separate immutable fact so
+    /// HQA1/HOB1 validation never depends on that implementation coincidence.
+    endpoint_id: u32,
     /// Exact session and context-local generations written into every private
     /// DMA record and rechecked by the context slot. For queue contexts the
     /// non-recycled endpoint ordinal is also the context generation.
@@ -899,6 +1175,10 @@ pub(crate) struct NativeContext {
     /// a host call, or a wait.
     state: SpinLock<RenderContext>,
     executor: SpinLock<ExecutorState>,
+    /// Present only on HQA1 outer contexts. One context-owned work item moves
+    /// full HOB1 snapshot/CRC/schema work out of SubmitCommandVirtual's
+    /// DISPATCH-level window; it never forms an adapter/global queue.
+    outer_worker: Option<OuterWorker>,
     rundown: SpinLock<NativeContextRundown>,
     drained: UnsafeCell<KEVENT>,
     /// Claimed for the whole of one `DxgkDdiRender`, so [`Self::scratch`] has
@@ -915,8 +1195,8 @@ pub(crate) struct NativeContext {
 }
 
 // SAFETY: `state` and `host_submissions` are reachable only through their
-// `SpinLock`s; `class`/`ring_index` are written once at construction and
-// read-only afterwards; `scratch` is reachable only through
+// `SpinLock`s; `class`/`ring_index`/`endpoint_id` are written once at
+// construction and read-only afterwards; `scratch` is reachable only through
 // [`NativeContext::claim`], which hands out at most one reference at a time via
 // `busy`.
 unsafe impl Send for NativeContext {}
@@ -930,13 +1210,17 @@ impl NativeContext {
         adapter: NonNull<crate::adapter::AdapterContext>,
         class: NativeClass,
         ring_index: u32,
+        endpoint_id: u32,
         session_generation: u64,
         context_generation: u64,
     ) -> Option<alloc::boxed::Box<Self>> {
-        if (class == NativeClass::Control) != (ring_index == 0) {
+        if match class {
+            NativeClass::Control => ring_index != 0 || endpoint_id != 0,
+            NativeClass::Queue | NativeClass::Outer => ring_index == 0 || endpoint_id == 0,
+        } {
             return None;
         }
-        if class == NativeClass::Queue
+        if matches!(class, NativeClass::Queue | NativeClass::Outer)
             && (session_generation == 0 || context_generation == 0)
         {
             return None;
@@ -946,15 +1230,22 @@ impl NativeContext {
             return None;
         };
         let executor = ExecutorState::new()?;
+        let outer_worker = if class == NativeClass::Outer {
+            Some(OuterWorker::new(unsafe { adapter.as_ref() })?)
+        } else {
+            None
+        };
         let native = alloc::boxed::Box::new(Self {
             adapter,
             class,
             ring_index,
+            endpoint_id,
             session_generation,
             context_generation,
             host_submissions: SpinLock::new(HostSubmissionState::new()),
             state: SpinLock::new(RenderContext::new()),
             executor: SpinLock::new(executor),
+            outer_worker,
             rundown: SpinLock::new(NativeContextRundown {
                 open: true,
                 active: 0,
@@ -964,6 +1255,9 @@ impl NativeContext {
             scratch: UnsafeCell::new(scratch),
         });
         unsafe { KeInitializeEvent(native.drained.get(), 0, 1) };
+        if let Some(worker) = native.outer_worker.as_ref() {
+            unsafe { worker.init_event() };
+        }
         Some(native)
     }
 
@@ -1008,9 +1302,18 @@ impl NativeContext {
             }
         }
 
+        // No new HOS1 can enter after the rundown closes. Join this context's
+        // sole PASSIVE staging item before walking executor slots so no worker
+        // can race a Ready/InFlight transition with teardown.
+        if let Some(worker) = self.outer_worker.as_ref() {
+            worker.close_and_wait();
+        }
+
         // DestroyContext is serialized with Render for this handle. Give back a
         // partially assembled batch before walking its corresponding slot.
-        let building = unsafe { &mut *self.scratch.get() }.building.take();
+        let scratch = unsafe { &mut *self.scratch.get() };
+        let building = scratch.building.take();
+        abandon_control_building(scratch, self);
 
         let adapter = unsafe { self.adapter.as_ref() };
         for index in 0..EXECUTOR_SLOTS {
@@ -1058,7 +1361,7 @@ impl NativeContext {
                     settle_batch_tickets(adapter, tickets, false);
                 }
                 CloseSlotWork::DropReady(tickets, mut batch) => {
-                    if let Some(reply) = batch.custody.reply.take() {
+                    if let Some(reply) = batch.custody.take_reply() {
                         let _ = reply.finish(false);
                     }
                     settle_batch_tickets(adapter, tickets, false);
@@ -1161,7 +1464,7 @@ impl NativeHostCompletion {
         };
         let mut success = host_ok && exact_adapter && exact_slot;
         let mut custody = self.custody.take();
-        if let Some(reply) = custody.as_mut().and_then(|custody| custody.reply.take()) {
+        if let Some(reply) = custody.as_mut().and_then(NativeCustody::take_reply) {
             success &= reply.finish(success);
         }
 
@@ -1171,9 +1474,7 @@ impl NativeHostCompletion {
             if let Some(slot) = executor.slots.get_mut(self.slot_index as usize) {
                 let old = core::mem::replace(slot, SubmissionSlot::Free);
                 match old {
-                    SubmissionSlot::InFlight { identity, tickets }
-                        if identity == self.identity =>
-                    {
+                    SubmissionSlot::InFlight { identity, tickets } if identity == self.identity => {
                         *slot = SubmissionSlot::Terminal {
                             identity,
                             tickets,
@@ -1325,6 +1626,728 @@ fn reap_terminal_slots(native: &NativeContext, _passive: PassiveLevel) {
     }
 }
 
+fn fail_outer_slot(
+    native: &NativeContext,
+    identity: BatchIdentity,
+    slot_index: u32,
+    refusal: OuterExecutionRefusal,
+) {
+    refusal.record();
+    let adapter = unsafe { native.adapter.as_ref() };
+    fail_inflight_without_completion(native, adapter, identity, slot_index);
+}
+
+/// Snapshot, validate, resolve, and privately patch one already-admitted HOB1
+/// at PASSIVE_LEVEL. The only host enqueue is the same stock SUBMIT_3D path the
+/// HNR2 executor uses; its used-ring terminal retains every exact object guard.
+fn execute_outer_pending(
+    native: &NativeContext,
+    pending: OuterPending,
+    passive: PassiveLevel,
+) -> Result<(), OuterExecutionRefusal> {
+    let OuterPending {
+        identity,
+        slot_index,
+        prior_batch_id,
+        submit,
+        device,
+        session,
+        command_pool,
+        context_operation,
+        session_operation,
+    } = pending;
+    let adapter = unsafe { native.adapter.as_ref() };
+
+    crate::virtio::ctrl::reap_parked(passive, adapter);
+    reap_terminal_slots(native, passive);
+
+    let record_len =
+        usize::try_from(submit.hob1_bytes).map_err(|_| OuterExecutionRefusal::Descriptor)?;
+    let mut record_buffer = adapter
+        .with_virtio(|gpu| gpu.take_dma_buffer(record_len))
+        .ok()
+        .flatten()
+        .or_else(|| DmaBuffer::new(passive, record_len))
+        .ok_or(OuterExecutionRefusal::SnapshotFailed)?;
+    let meta = adapter
+        .with_virtio(|gpu| gpu.take_dma_buffer(SUBMIT_META_BYTES))
+        .ok()
+        .flatten()
+        .or_else(|| DmaBuffer::new(passive, SUBMIT_META_BYTES))
+        .ok_or(OuterExecutionRefusal::SnapshotFailed)?;
+    if !command_pool.copy_hoc1(submit.hob1_bytes as u64, &mut record_buffer) {
+        return Err(OuterExecutionRefusal::SnapshotFailed);
+    }
+
+    let expectation = HeliosOuterBatchExpectation {
+        package_generation: helios_protocol::HELIOS_PACKAGE_GENERATION,
+        session_generation: native.session_generation,
+        context_generation: native.context_generation,
+        endpoint_id: native.endpoint_id,
+        flags: HELIOS_HOB1_FLAG_D3D12_VIRTUAL,
+        max_command_bytes: submit.hob1_bytes as u64,
+        last_batch_id: prior_batch_id,
+        allocation_list_count: 0,
+    };
+    let record = record_buffer.as_slice();
+    validate_batch_record(record, &expectation).map_err(|_| OuterExecutionRefusal::BatchRecord)?;
+    let header = *hob1_header(record).map_err(|_| OuterExecutionRefusal::BatchRecord)?;
+    submit
+        .cross_check(&header)
+        .map_err(|_| OuterExecutionRefusal::SubmitCrossCheck)?;
+    let uses = hob1_use_records(record, &header).map_err(|_| OuterExecutionRefusal::BatchRecord)?;
+    let operands =
+        hob1_operand_records(record, &header).map_err(|_| OuterExecutionRefusal::BatchRecord)?;
+    let payload = hob1_payload(record, &header).map_err(|_| OuterExecutionRefusal::BatchRecord)?;
+
+    let mut allocations = Vec::new();
+    allocations
+        .try_reserve_exact(uses.len())
+        .map_err(|_| OuterExecutionRefusal::SlotExhausted)?;
+    let mut claim = native.claim().ok_or(OuterExecutionRefusal::ContextClosed)?;
+    let scratch = claim.scratch();
+    if uses.len() > scratch.outer_generations.len() || operands.len() > scratch.patch_order.len() {
+        return Err(OuterExecutionRefusal::OperandClosure);
+    }
+    let exact_device = unsafe { device.as_ref() };
+    for (index, record_use) in uses.iter().enumerate() {
+        if record_use.identity_kind != HELIOS_HOB1_IDENTITY_D3D12_GPUVA {
+            return Err(OuterExecutionRefusal::OperandClosure);
+        }
+        let Some(guard) = exact_device.acquire_outer_gpuva_use(
+            session,
+            record_use.address_or_index,
+            record_use.byte_length,
+            Some(record_use.expected_allocation_generation),
+            false,
+        ) else {
+            return Err(
+                if !crate::adapter::allocation_object::is_current(
+                    record_use.expected_allocation_generation,
+                ) {
+                    OuterExecutionRefusal::UseStaleGeneration
+                } else {
+                    OuterExecutionRefusal::UseMissingOrForeign
+                },
+            );
+        };
+        if guard.generation() != record_use.expected_allocation_generation {
+            return Err(OuterExecutionRefusal::UseStaleGeneration);
+        }
+        if guard.transport_instance() != Some(session_operation.transport_instance)
+            || guard
+                .resource_id()
+                .is_none_or(|resource_id| resource_id == 0)
+        {
+            return Err(OuterExecutionRefusal::TransportMismatch);
+        }
+        scratch.outer_generations[index] = guard.generation();
+        allocations.push(guard);
+    }
+    let generations = &mut scratch.outer_generations[..uses.len()];
+    generations.sort_unstable();
+    if generations.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(OuterExecutionRefusal::DuplicateUse);
+    }
+
+    let admission = validate_venus_a7_outer_stream(
+        payload,
+        &mut scratch.expected_operands,
+        &mut scratch.schema_counts,
+    )
+    .map_err(|_| OuterExecutionRefusal::Schema)?;
+    if admission.operand_count as usize != operands.len() {
+        return Err(OuterExecutionRefusal::OperandClosure);
+    }
+    for (index, operand) in operands.iter().enumerate() {
+        let expected = scratch.expected_operands[index];
+        if operand.operand_kind != HELIOS_HOB1_OPERAND_KIND_GENERATED_RESOURCE
+            || expected.operand_kind != HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32
+            || operand.use_index as usize >= allocations.len()
+        {
+            return Err(OuterExecutionRefusal::OperandClosure);
+        }
+        if operand.encoded_width != HELIOS_HOB1_OPERAND_WIDTH_4 {
+            return Err(OuterExecutionRefusal::OperandWidth);
+        }
+        let Some(expected_absolute) = header.payload_offset.checked_add(expected.payload_offset)
+        else {
+            return Err(OuterExecutionRefusal::PatchBounds);
+        };
+        if operand.payload_offset != expected_absolute {
+            return Err(OuterExecutionRefusal::OperandClosure);
+        }
+        let Some(resource_id) = allocations[operand.use_index as usize].resource_id() else {
+            return Err(OuterExecutionRefusal::UseMissingOrForeign);
+        };
+        scratch.patch_order[index] = resource_id;
+    }
+
+    let payload_start =
+        usize::try_from(header.payload_offset).map_err(|_| OuterExecutionRefusal::PatchBounds)?;
+    let payload_len =
+        usize::try_from(header.payload_bytes).map_err(|_| OuterExecutionRefusal::PatchBounds)?;
+    let payload_end = payload_start
+        .checked_add(payload_len)
+        .ok_or(OuterExecutionRefusal::PatchBounds)?;
+    // End every immutable HOB1 borrow before converting the same KMD-private
+    // buffer into the host payload. The original HOC1 bytes remain untouched.
+    let _ = (uses, operands, payload, record);
+    record_buffer
+        .as_mut_slice()
+        .copy_within(payload_start..payload_end, 0);
+    if !record_buffer.reset(payload_len) {
+        return Err(OuterExecutionRefusal::PatchBounds);
+    }
+    for index in 0..admission.operand_count as usize {
+        let start = scratch.expected_operands[index].payload_offset as usize;
+        let end = start
+            .checked_add(core::mem::size_of::<u32>())
+            .ok_or(OuterExecutionRefusal::PatchBounds)?;
+        let Some(dst) = record_buffer.as_mut_slice().get_mut(start..end) else {
+            return Err(OuterExecutionRefusal::PatchBounds);
+        };
+        dst.copy_from_slice(&scratch.patch_order[index].to_le_bytes());
+    }
+    drop(claim);
+
+    let custody = NativeCustody::Outer(OuterCustody::Virtual {
+        _context: context_operation,
+        _session: session_operation,
+        _command_pool: command_pool,
+        _allocations: allocations,
+    });
+    let host_context_id = custody.host_context_id();
+    let transport_instance = custody.transport_instance();
+    let completion = NativeHostCompletion {
+        context: NonNull::from(native),
+        identity,
+        slot_index,
+        custody: Some(custody),
+    };
+    let mut pending_buffers = Some((meta, record_buffer, completion));
+    let queued = adapter.with_virtio(|gpu| {
+        if gpu.scanout_transport_instance() != transport_instance {
+            return None;
+        }
+        pending_buffers.take().map(|(meta, payload, completion)| {
+            gpu.enqueue_native_submit(
+                host_context_id,
+                native.ring_index,
+                meta,
+                payload,
+                payload_len,
+                completion,
+            )
+        })
+    });
+    match queued {
+        Ok(Some(Ok(_))) => {
+            NR2_OUTER_HOST.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(Some(Err((meta, payload, Some(completion), _)))) => {
+            OuterExecutionRefusal::HostEnqueue.record();
+            completion.finish_with_cleanup(adapter, false, Some((meta, payload)));
+        }
+        Ok(Some(Err((meta, payload, None, _)))) => {
+            OuterExecutionRefusal::HostEnqueue.record();
+            drop(meta);
+            drop(payload);
+            fail_inflight_without_completion(native, adapter, identity, slot_index);
+        }
+        Ok(None) | Err(_) => {
+            OuterExecutionRefusal::HostUnavailable.record();
+            if let Some((meta, payload, completion)) = pending_buffers.take() {
+                completion.finish_with_cleanup(adapter, false, Some((meta, payload)));
+            } else {
+                fail_inflight_without_completion(native, adapter, identity, slot_index);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// System work-item callback for exactly one HQA1 context. No global queue,
+/// lookup, or polling exists: the callback receives the owning context pointer
+/// and drains only that context's fixed admission queue in FIFO order.
+unsafe extern "C" fn outer_work_item(_device: PDEVICE_OBJECT, context: wdk_sys::PVOID) {
+    let Some(native) = (context as *const NativeContext).as_ref() else {
+        return;
+    };
+    let Some(worker) = native.outer_worker.as_ref() else {
+        return;
+    };
+    loop {
+        let Some((open, pending)) = worker.take_next() else {
+            break;
+        };
+        let identity = pending.identity;
+        let slot_index = pending.slot_index;
+        if !open {
+            fail_outer_slot(
+                native,
+                identity,
+                slot_index,
+                OuterExecutionRefusal::ContextClosed,
+            );
+            drop(pending);
+            continue;
+        }
+        if unsafe { wdk_sys::ntddk::KeGetCurrentIrql() } != 0 {
+            fail_outer_slot(
+                native,
+                identity,
+                slot_index,
+                OuterExecutionRefusal::WorkerIrql,
+            );
+            drop(pending);
+            continue;
+        }
+        let passive = unsafe { PassiveLevel::assume() };
+        if let Err(refusal) = execute_outer_pending(native, pending, passive) {
+            fail_outer_slot(native, identity, slot_index, refusal);
+        }
+    }
+}
+
+/// D3D11 physical HOB1 Render. The UMD has already assembled one complete
+/// record and the exact runtime allocation list; this function snapshots both,
+/// resolves each list entry through the owning device, and parks a privately
+/// patched Venus payload for the matching SubmitCommand callback.
+pub(crate) unsafe fn render_outer_physical(
+    native: &NativeContext,
+    session: NonNull<crate::ddi::translation_session::SessionObject>,
+    device: &crate::device::DeviceContext,
+    outer: &SpinLock<OuterSubmitContext>,
+    args: &mut DXGKARG_RENDER,
+) -> NTSTATUS {
+    let fail = |refusal: OuterExecutionRefusal, status: NTSTATUS| {
+        refusal.record();
+        status
+    };
+    if native.class != NativeClass::Outer
+        || args.CommandLength == 0
+        || args.pCommand.is_null()
+        || args.pDmaBuffer.is_null()
+        || args.CommandLength > args.DmaSize
+        || args.PatchLocationListInSize != 0
+        || args.AllocationListSize == 0
+        || args.pAllocationList.is_null()
+        || args.pDmaBufferPrivateData.is_null()
+        || (args.DmaBufferPrivateDataSize as usize) < size_of::<Hob1KmdDmaPrivateV1>()
+    {
+        return fail(OuterExecutionRefusal::PrivateData, STATUS_INVALID_PARAMETER);
+    }
+    let Some(context_operation) = native.acquire_operation() else {
+        return fail(
+            OuterExecutionRefusal::ContextClosed,
+            STATUS_INVALID_DEVICE_REQUEST,
+        );
+    };
+    let Some(session_operation) =
+        crate::ddi::translation_session::acquire_execution_operation(session)
+    else {
+        return fail(
+            OuterExecutionRefusal::SessionClosed,
+            STATUS_INVALID_DEVICE_REQUEST,
+        );
+    };
+    if session_operation.transport_instance == 0
+        || crate::ddi::translation_session::execution_session_generation(session)
+            != Some(native.session_generation)
+    {
+        return fail(
+            OuterExecutionRefusal::TransportMismatch,
+            STATUS_INVALID_DEVICE_REQUEST,
+        );
+    }
+    let Some(mut claim) = native.claim() else {
+        return fail(
+            OuterExecutionRefusal::ContextClosed,
+            STATUS_DEVICE_NOT_READY,
+        );
+    };
+    let passive = unsafe { PassiveLevel::assume() };
+    let adapter = unsafe { native.adapter.as_ref() };
+    crate::virtio::ctrl::reap_parked(passive, adapter);
+    reap_terminal_slots(native, passive);
+
+    let record_len = args.CommandLength as usize;
+    let mut record_buffer = match adapter
+        .with_virtio(|gpu| gpu.take_dma_buffer(record_len))
+        .ok()
+        .flatten()
+        .or_else(|| DmaBuffer::new(passive, record_len))
+    {
+        Some(buffer) => buffer,
+        None => return fail(OuterExecutionRefusal::SnapshotFailed, STATUS_NO_MEMORY),
+    };
+    if !unsafe {
+        copy_from_command(
+            record_buffer.as_mut_slice().as_mut_ptr(),
+            args.pCommand.cast::<u8>(),
+            record_len,
+        )
+    } {
+        return fail(
+            OuterExecutionRefusal::SnapshotFailed,
+            STATUS_INVALID_PARAMETER,
+        );
+    }
+    let meta = match adapter
+        .with_virtio(|gpu| gpu.take_dma_buffer(SUBMIT_META_BYTES))
+        .ok()
+        .flatten()
+        .or_else(|| DmaBuffer::new(passive, SUBMIT_META_BYTES))
+    {
+        Some(buffer) => buffer,
+        None => return fail(OuterExecutionRefusal::SnapshotFailed, STATUS_NO_MEMORY),
+    };
+
+    let (expectation, expected_last) = {
+        let context = outer.lock();
+        if context.arm_flags != HELIOS_HOB1_FLAG_D3D11_PHYSICAL {
+            return fail(
+                OuterExecutionRefusal::Descriptor,
+                STATUS_INVALID_DEVICE_REQUEST,
+            );
+        }
+        (
+            HeliosOuterBatchExpectation {
+                package_generation: context.package_generation,
+                session_generation: context.session_generation,
+                context_generation: context.context_generation,
+                endpoint_id: context.endpoint_id,
+                flags: context.arm_flags,
+                max_command_bytes: args.CommandLength as u64,
+                last_batch_id: context.last_batch_id(),
+                allocation_list_count: args.AllocationListSize,
+            },
+            context.last_batch_id(),
+        )
+    };
+    let record = record_buffer.as_slice();
+    if validate_batch_record(record, &expectation).is_err() {
+        return fail(OuterExecutionRefusal::BatchRecord, STATUS_INVALID_PARAMETER);
+    }
+    let header = match hob1_header(record) {
+        Ok(header) => *header,
+        Err(_) => return fail(OuterExecutionRefusal::BatchRecord, STATUS_INVALID_PARAMETER),
+    };
+    let uses = match hob1_use_records(record, &header) {
+        Ok(uses) => uses,
+        Err(_) => return fail(OuterExecutionRefusal::BatchRecord, STATUS_INVALID_PARAMETER),
+    };
+    let operands = match hob1_operand_records(record, &header) {
+        Ok(operands) => operands,
+        Err(_) => return fail(OuterExecutionRefusal::BatchRecord, STATUS_INVALID_PARAMETER),
+    };
+    let payload = match hob1_payload(record, &header) {
+        Ok(payload) => payload,
+        Err(_) => return fail(OuterExecutionRefusal::BatchRecord, STATUS_INVALID_PARAMETER),
+    };
+    if uses.len() != args.AllocationListSize as usize {
+        return fail(
+            OuterExecutionRefusal::OperandClosure,
+            STATUS_INVALID_PARAMETER,
+        );
+    }
+
+    let scratch = claim.scratch();
+    if uses.len() > scratch.outer_generations.len() || operands.len() > scratch.patch_order.len() {
+        return fail(
+            OuterExecutionRefusal::OperandClosure,
+            STATUS_INVALID_PARAMETER,
+        );
+    }
+    let mut allocations = Vec::new();
+    if allocations.try_reserve_exact(uses.len()).is_err() {
+        return fail(OuterExecutionRefusal::SlotExhausted, STATUS_NO_MEMORY);
+    }
+    for (index, record_use) in uses.iter().enumerate() {
+        if record_use.identity_kind != HELIOS_HOB1_IDENTITY_D3D11_ALLOCATION_INDEX {
+            return fail(
+                OuterExecutionRefusal::OperandClosure,
+                STATUS_INVALID_PARAMETER,
+            );
+        }
+        let allocation_index = record_use.address_or_index as usize;
+        let Some(entry) = (allocation_index < args.AllocationListSize as usize)
+            .then(|| unsafe { &*args.pAllocationList.add(allocation_index) })
+        else {
+            return fail(
+                OuterExecutionRefusal::UseMissingOrForeign,
+                STATUS_INVALID_PARAMETER,
+            );
+        };
+        let write = entry.__bindgen_anon_1.WriteOperation() != 0;
+        if write != (record_use.access_flags & HELIOS_HOB1_ACCESS_WRITE != 0) {
+            return fail(
+                OuterExecutionRefusal::OperandClosure,
+                STATUS_INVALID_PARAMETER,
+            );
+        }
+        let Some(guard) = device.acquire_outer_physical_use(
+            session,
+            entry.hDeviceSpecificAllocation,
+            record_use.expected_allocation_generation,
+            record_use.byte_length,
+        ) else {
+            return fail(
+                if !crate::adapter::allocation_object::is_current(
+                    record_use.expected_allocation_generation,
+                ) {
+                    OuterExecutionRefusal::UseStaleGeneration
+                } else {
+                    OuterExecutionRefusal::UseMissingOrForeign
+                },
+                STATUS_INVALID_PARAMETER,
+            );
+        };
+        if guard.generation() != record_use.expected_allocation_generation {
+            return fail(
+                OuterExecutionRefusal::UseStaleGeneration,
+                STATUS_INVALID_PARAMETER,
+            );
+        }
+        if guard.transport_instance() != Some(session_operation.transport_instance)
+            || guard
+                .resource_id()
+                .is_none_or(|resource_id| resource_id == 0)
+        {
+            return fail(
+                OuterExecutionRefusal::TransportMismatch,
+                STATUS_INVALID_PARAMETER,
+            );
+        }
+        scratch.outer_generations[index] = guard.generation();
+        allocations.push(guard);
+    }
+    let generations = &mut scratch.outer_generations[..uses.len()];
+    generations.sort_unstable();
+    if generations.windows(2).any(|pair| pair[0] == pair[1]) {
+        return fail(
+            OuterExecutionRefusal::DuplicateUse,
+            STATUS_INVALID_PARAMETER,
+        );
+    }
+
+    let admission = match validate_venus_a7_outer_stream(
+        payload,
+        &mut scratch.expected_operands,
+        &mut scratch.schema_counts,
+    ) {
+        Ok(admission) => admission,
+        Err(_) => return fail(OuterExecutionRefusal::Schema, STATUS_INVALID_PARAMETER),
+    };
+    if admission.operand_count as usize != operands.len() {
+        return fail(
+            OuterExecutionRefusal::OperandClosure,
+            STATUS_INVALID_PARAMETER,
+        );
+    }
+    for (index, operand) in operands.iter().enumerate() {
+        let expected = scratch.expected_operands[index];
+        if operand.operand_kind != HELIOS_HOB1_OPERAND_KIND_GENERATED_RESOURCE
+            || expected.operand_kind != HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32
+            || operand.use_index as usize >= allocations.len()
+        {
+            return fail(
+                OuterExecutionRefusal::OperandClosure,
+                STATUS_INVALID_PARAMETER,
+            );
+        }
+        if operand.encoded_width != HELIOS_HOB1_OPERAND_WIDTH_4 {
+            return fail(
+                OuterExecutionRefusal::OperandWidth,
+                STATUS_INVALID_PARAMETER,
+            );
+        }
+        let Some(expected_absolute) = header.payload_offset.checked_add(expected.payload_offset)
+        else {
+            return fail(OuterExecutionRefusal::PatchBounds, STATUS_INVALID_PARAMETER);
+        };
+        if operand.payload_offset != expected_absolute {
+            return fail(
+                OuterExecutionRefusal::OperandClosure,
+                STATUS_INVALID_PARAMETER,
+            );
+        }
+        let Some(resource_id) = allocations[operand.use_index as usize].resource_id() else {
+            return fail(
+                OuterExecutionRefusal::UseMissingOrForeign,
+                STATUS_INVALID_PARAMETER,
+            );
+        };
+        scratch.patch_order[index] = resource_id;
+    }
+
+    // Preserve the complete zero-operand HOB1 in scheduler DMA. Only the
+    // separately owned host buffer below receives renderer-private ids.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            record_buffer.as_slice().as_ptr(),
+            args.pDmaBuffer.cast::<u8>(),
+            record_len,
+        )
+    };
+    let payload_start = header.payload_offset as usize;
+    let payload_len = header.payload_bytes as usize;
+    let Some(payload_end) = payload_start.checked_add(payload_len) else {
+        return fail(OuterExecutionRefusal::PatchBounds, STATUS_INVALID_PARAMETER);
+    };
+    let _ = (record, uses, operands, payload);
+    record_buffer
+        .as_mut_slice()
+        .copy_within(payload_start..payload_end, 0);
+    if !record_buffer.reset(payload_len) {
+        return fail(OuterExecutionRefusal::PatchBounds, STATUS_INVALID_PARAMETER);
+    }
+    for index in 0..admission.operand_count as usize {
+        let start = scratch.expected_operands[index].payload_offset as usize;
+        let Some(end) = start.checked_add(size_of::<u32>()) else {
+            return fail(OuterExecutionRefusal::PatchBounds, STATUS_INVALID_PARAMETER);
+        };
+        let Some(dst) = record_buffer.as_mut_slice().get_mut(start..end) else {
+            return fail(OuterExecutionRefusal::PatchBounds, STATUS_INVALID_PARAMETER);
+        };
+        dst.copy_from_slice(&scratch.patch_order[index].to_le_bytes());
+    }
+    drop(claim);
+
+    let (slot_index, slot_generation) = {
+        let mut executor = native.executor.lock();
+        let Some(slot_index) = executor
+            .slots
+            .iter()
+            .position(|slot| matches!(slot, SubmissionSlot::Free))
+        else {
+            return fail(OuterExecutionRefusal::SlotExhausted, STATUS_NO_MEMORY);
+        };
+        let Some(slot_generation) = executor.mint_slot_generation() else {
+            return fail(
+                OuterExecutionRefusal::SlotExhausted,
+                STATUS_INVALID_DEVICE_REQUEST,
+            );
+        };
+        (slot_index as u32, slot_generation)
+    };
+    let identity = BatchIdentity {
+        batch_token: header.batch_id,
+        slot_generation,
+        payload_bytes: header.payload_bytes,
+        full_payload_crc64: header.crc64,
+        fragment_count: 1,
+        session_generation: native.session_generation,
+        context_generation: native.context_generation,
+        ring_index: native.ring_index,
+    };
+    let batch = ReadyBatch {
+        payload: record_buffer,
+        meta,
+        custody: NativeCustody::Outer(OuterCustody::Physical {
+            _context: context_operation,
+            _session: session_operation,
+            _allocations: allocations,
+        }),
+    };
+    {
+        let mut executor = native.executor.lock();
+        let Some(slot) = executor.slots.get_mut(slot_index as usize) else {
+            return fail(
+                OuterExecutionRefusal::SlotExhausted,
+                STATUS_INVALID_DEVICE_REQUEST,
+            );
+        };
+        if !matches!(slot, SubmissionSlot::Free) {
+            return fail(
+                OuterExecutionRefusal::SlotExhausted,
+                STATUS_DEVICE_NOT_READY,
+            );
+        }
+        *slot = SubmissionSlot::Ready {
+            identity,
+            tickets: BatchTickets::new(),
+            batch: Some(batch),
+        };
+    }
+    let committed = {
+        let mut context = outer.lock();
+        context.last_batch_id() == expected_last
+            && context.package_generation == expectation.package_generation
+            && context.session_generation == expectation.session_generation
+            && context.context_generation == expectation.context_generation
+            && context.endpoint_id == expectation.endpoint_id
+            && context.arm_flags == expectation.flags
+            && commit_physical_hob1(&mut context, header.batch_id)
+    };
+    if !committed {
+        // The runtime cannot submit this slot before Render returns, so an
+        // exact zero-ticket Ready record is still ours to retract.  Drop its
+        // buffers and allocation custody at PASSIVE after releasing the lock.
+        let abandoned = {
+            let mut executor = native.executor.lock();
+            executor
+                .slots
+                .get_mut(slot_index as usize)
+                .and_then(|slot| match slot {
+                    SubmissionSlot::Ready {
+                        identity: live_identity,
+                        tickets,
+                        ..
+                    } if *live_identity == identity && tickets.count == 0 => {
+                        match core::mem::replace(slot, SubmissionSlot::Free) {
+                            SubmissionSlot::Ready {
+                                batch: Some(batch), ..
+                            } => Some(batch),
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                })
+        };
+        debug_assert!(abandoned.is_some());
+        drop(abandoned);
+        return fail(
+            OuterExecutionRefusal::Descriptor,
+            STATUS_INVALID_DEVICE_REQUEST,
+        );
+    }
+
+    let private = Hob1KmdDmaPrivateV1 {
+        magic: HELIOS_HOB1_KMD_DMA_MAGIC,
+        abi_version: HELIOS_HOB1_KMD_DMA_ABI_VERSION,
+        struct_bytes: HELIOS_HOB1_KMD_DMA_BYTES,
+        batch_id: header.batch_id,
+        session_generation: native.session_generation,
+        context_generation: native.context_generation,
+        slot_generation,
+        hob1_crc64: header.crc64,
+        payload_bytes: header.payload_bytes,
+        ring_index: native.ring_index,
+        slot_index,
+        flags: 0,
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            bytemuck::bytes_of(&private).as_ptr(),
+            args.pDmaBufferPrivateData.cast::<u8>(),
+            size_of::<Hob1KmdDmaPrivateV1>(),
+        )
+    };
+    args.pDmaBuffer = unsafe {
+        args.pDmaBuffer
+            .cast::<u8>()
+            .add(record_len)
+            .cast::<c_void>()
+    };
+    args.PatchLocationListOutSize = 0;
+    args.MultipassOffset = 0;
+    NR2_OUTER_QUEUED.fetch_add(1, Ordering::Relaxed);
+    NR2_COUNTERS.flush();
+    STATUS_SUCCESS
+}
+
 fn abandon_unsubmitted_building(scratch: &mut Hnr2Scratch, native: &NativeContext) -> bool {
     let Some(building) = scratch.building.as_ref() else {
         return true;
@@ -1346,6 +2369,108 @@ fn abandon_unsubmitted_building(scratch: &mut Hnr2Scratch, native: &NativeContex
     // Render is PASSIVE; the two DMA buffers may be freed here.
     drop(scratch.building.take());
     true
+}
+
+fn abandon_control_building(scratch: &mut Hnr2Scratch, native: &NativeContext) {
+    let Some(building) = scratch.control_building.take() else {
+        return;
+    };
+    if native
+        .state
+        .lock()
+        .staging_mut()
+        .retire(building.total_payload_bytes)
+        .is_ok()
+    {
+        NR2_SLOT_RETIRED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        NR2_SLOT_UNDERFLOW.fetch_add(1, Ordering::Relaxed);
+    }
+    drop(building);
+}
+
+fn begin_control_batch(
+    scratch: &mut Hnr2Scratch,
+    native: &NativeContext,
+    header: &HeliosNativeRenderV2,
+    passive: PassiveLevel,
+) -> Result<(), NTSTATUS> {
+    if let Some(building) = scratch.control_building.as_ref() {
+        if building.batch_token == header.batch_token
+            && building.total_payload_bytes == header.total_payload_bytes
+            && building.full_payload_crc64 == header.full_payload_crc64
+            && building.fragment_count == header.fragment_count
+        {
+            return Ok(());
+        }
+        abandon_control_building(scratch, native);
+    }
+    {
+        let mut state = native.state.lock();
+        state
+            .staging_mut()
+            .checkout(header.total_payload_bytes)
+            .map_err(|refusal| refuse(refusal, STATUS_NO_MEMORY))?;
+    }
+    NR2_SLOT_TAKEN.fetch_add(1, Ordering::Relaxed);
+    let payload_len =
+        usize::try_from(header.total_payload_bytes).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let adapter = unsafe { native.adapter.as_ref() };
+    let payload = adapter
+        .with_virtio(|gpu| gpu.take_dma_buffer(payload_len))
+        .ok()
+        .flatten()
+        .or_else(|| DmaBuffer::new(passive, payload_len));
+    let Some(payload) = payload else {
+        let _ = native
+            .state
+            .lock()
+            .staging_mut()
+            .retire(header.total_payload_bytes);
+        NR2_SLOT_RETIRED.fetch_add(1, Ordering::Relaxed);
+        return Err(STATUS_NO_MEMORY);
+    };
+    scratch.control_building = Some(ControlBuilding {
+        batch_token: header.batch_token,
+        total_payload_bytes: header.total_payload_bytes,
+        full_payload_crc64: header.full_payload_crc64,
+        fragment_count: header.fragment_count,
+        payload,
+    });
+    Ok(())
+}
+
+fn copy_control_fragment(
+    scratch: &mut Hnr2Scratch,
+    args: &DXGKARG_RENDER,
+    header: &HeliosNativeRenderV2,
+    accept: &Hnr2Accept,
+) -> Result<(), NTSTATUS> {
+    let Some(building) = scratch.control_building.as_mut() else {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    };
+    if building.batch_token != header.batch_token
+        || building.total_payload_bytes != header.total_payload_bytes
+        || building.full_payload_crc64 != header.full_payload_crc64
+        || building.fragment_count != header.fragment_count
+    {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let start =
+        usize::try_from(header.fragment_payload_offset).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let end = start
+        .checked_add(header.fragment_payload_bytes as usize)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let dst = building
+        .payload
+        .as_mut_slice()
+        .get_mut(start..end)
+        .ok_or(STATUS_INVALID_PARAMETER)?;
+    let src = unsafe { (args.pCommand as *const u8).add(accept.layout.payload_offset as usize) };
+    if !unsafe { copy_from_command(dst.as_mut_ptr(), src, dst.len()) } {
+        return Err(STATUS_INVALID_PARAMETER);
+    }
+    Ok(())
 }
 
 fn begin_executor_batch(
@@ -1374,7 +2499,9 @@ fn begin_executor_batch(
     reap_terminal_slots(native, passive);
     crate::virtio::ctrl::reap_parked(passive, unsafe { native.adapter.as_ref() });
 
-    let context = native.acquire_operation().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    let context = native
+        .acquire_operation()
+        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
     {
         let mut state = native.state.lock();
         if let Err(refusal) = state.staging_mut().checkout(header.total_payload_bytes) {
@@ -1392,8 +2519,8 @@ fn begin_executor_batch(
     if session_operation.transport_instance == 0 {
         return Err(STATUS_DEVICE_NOT_READY);
     }
-    let payload_len = usize::try_from(header.total_payload_bytes)
-        .map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let payload_len =
+        usize::try_from(header.total_payload_bytes).map_err(|_| STATUS_INVALID_PARAMETER)?;
     let adapter = unsafe { native.adapter.as_ref() };
     let payload = adapter
         .with_virtio(|v| v.take_dma_buffer(payload_len))
@@ -1472,8 +2599,8 @@ fn copy_executor_fragment(
     {
         return Err(STATUS_INVALID_DEVICE_REQUEST);
     }
-    let dst_offset = usize::try_from(header.fragment_payload_offset)
-        .map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let dst_offset =
+        usize::try_from(header.fragment_payload_offset).map_err(|_| STATUS_INVALID_PARAMETER)?;
     let bytes = header.fragment_payload_bytes as usize;
     let end = dst_offset
         .checked_add(bytes)
@@ -1483,9 +2610,7 @@ fn copy_executor_fragment(
         .as_mut_slice()
         .get_mut(dst_offset..end)
         .ok_or(STATUS_INVALID_PARAMETER)?;
-    let source = unsafe {
-        (args.pCommand as *const u8).add(accept.layout.payload_offset as usize)
-    };
+    let source = unsafe { (args.pCommand as *const u8).add(accept.layout.payload_offset as usize) };
     if !unsafe { copy_from_command(dst.as_mut_ptr(), source, bytes) } {
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -1721,8 +2846,8 @@ fn prepare_executor_commit(
                 core::ptr::write_bytes(
                     facts.kernel_va.as_ptr().add(header.reply_offset as usize),
                     0,
-                    (HELIOS_HVR1_HEADER_SIZE as u64
-                        + ExecutionReply::RAW_ALLOCATE_REPLY_BYTES) as usize,
+                    (HELIOS_HVR1_HEADER_SIZE as u64 + ExecutionReply::RAW_ALLOCATE_REPLY_BYTES)
+                        as usize,
                 )
             };
             reply = Some(ExecutionReply {
@@ -1809,7 +2934,7 @@ fn finalize_executor_commit(
     let batch = ReadyBatch {
         payload: building.payload,
         meta: building.meta,
-        custody: NativeCustody {
+        custody: NativeCustody::Hnr2 {
             _staging: building.staging,
             _session: building.session,
             _allocations: prepared.allocations,
@@ -1824,11 +2949,9 @@ fn finalize_executor_commit(
     };
     let old = core::mem::replace(slot, SubmissionSlot::Free);
     match old {
-        SubmissionSlot::Collecting {
-            identity,
-            tickets,
-        } if identity.batch_token == prepared.identity.batch_token
-            && identity.slot_generation == prepared.identity.slot_generation =>
+        SubmissionSlot::Collecting { identity, tickets }
+            if identity.batch_token == prepared.identity.batch_token
+                && identity.slot_generation == prepared.identity.slot_generation =>
         {
             *slot = SubmissionSlot::Ready {
                 identity: prepared.identity,
@@ -1869,9 +2992,7 @@ extern "C" {
 /// dereferenced inside the shim's exception frame.
 unsafe fn copy_from_command(dst: *mut u8, src: *const u8, bytes: usize) -> bool {
     // SAFETY: `dst` is a kernel buffer of at least `bytes`; `src` is guarded.
-    match unsafe {
-        helios_render_copy_user_seh(dst.cast(), src.cast(), bytes as u64, 1)
-    } {
+    match unsafe { helios_render_copy_user_seh(dst.cast(), src.cast(), bytes as u64, 1) } {
         0 => true,
         1 => {
             NR2_PROBE_FAULTS.fetch_add(1, Ordering::Relaxed);
@@ -2069,6 +3190,35 @@ unsafe fn read_dma_record(
     bytemuck::try_pod_read_unaligned::<Hnr2KmdDmaPrivateV1>(&raw).ok()
 }
 
+/// Read the distinct D3D11 outer private record from the exact scheduler
+/// submission window. The one-record zero-window fallback mirrors HNR2 and is
+/// bounded by the same exact 64-byte total-size proof.
+unsafe fn read_hob1_dma_record(
+    base: *const c_void,
+    total: u32,
+    start: u32,
+    end: u32,
+) -> Option<Hob1KmdDmaPrivateV1> {
+    let bytes = size_of::<Hob1KmdDmaPrivateV1>();
+    let (mut start, mut end, total) = (start as usize, end as usize, total as usize);
+    if base.is_null() {
+        return None;
+    }
+    if end <= start && total == bytes {
+        NR2_WINDOW_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        start = 0;
+        end = bytes;
+    }
+    if start > end || end > total || end - start < bytes {
+        return None;
+    }
+    let mut raw = [0u8; size_of::<Hob1KmdDmaPrivateV1>()];
+    unsafe {
+        core::ptr::copy_nonoverlapping((base as *const u8).add(start), raw.as_mut_ptr(), bytes)
+    };
+    bytemuck::try_pod_read_unaligned::<Hob1KmdDmaPrivateV1>(&raw).ok()
+}
+
 /// Refuse this Render, naming the rule.
 ///
 /// ⛔ ONE registry write, not a block flush. `Nr2Rej` is a FAILURE entry, and
@@ -2176,6 +3326,22 @@ pub(crate) unsafe fn render(
         }
     };
 
+    let control_init = if native.class == NativeClass::Control
+        && header.fragment_count == 1
+        && header.total_payload_bytes
+            == size_of::<helios_protocol::translation_session::HeliosTranslationSessionInitV1>()
+                as u64
+    {
+        let mut magic = [0u8; size_of::<u32>()];
+        let src =
+            unsafe { (args.pCommand as *const u8).add(accept.layout.payload_offset as usize) };
+        (unsafe { copy_from_command(magic.as_mut_ptr(), src, magic.len()) })
+            && u32::from_le_bytes(magic)
+                == helios_protocol::translation_session::HELIOS_HTS1_INIT_MAGIC
+    } else {
+        false
+    };
+
     let executor_slot = if native.class == NativeClass::Queue {
         let passive = unsafe { PassiveLevel::assume() };
         let scratch = claim.scratch();
@@ -2192,6 +3358,20 @@ pub(crate) unsafe fn render(
                 return status;
             }
         }
+    } else if native.class == NativeClass::Control && !control_init {
+        let passive = unsafe { PassiveLevel::assume() };
+        let scratch = claim.scratch();
+        if accept.class.is_begin() {
+            if let Err(status) = begin_control_batch(scratch, native, &header, passive) {
+                NR2_NO_STAGE.fetch_add(1, Ordering::Relaxed);
+                return status;
+            }
+        }
+        if let Err(status) = copy_control_fragment(scratch, args, &header, &accept) {
+            NR2_NO_STAGE.fetch_add(1, Ordering::Relaxed);
+            return status;
+        }
+        Some((header.batch_token, 0))
     } else {
         None
     };
@@ -2365,11 +3545,11 @@ fn commit(
                 STATUS_INVALID_PARAMETER,
             );
         }
-        let mut capability =
-            match build_capability(record, identity.generation, identity.byte_size) {
-                Ok(capability) => capability,
-                Err(refusal) => return refuse(refusal, STATUS_INVALID_PARAMETER),
-            };
+        let mut capability = match build_capability(record, identity.generation, identity.byte_size)
+        {
+            Ok(capability) => capability,
+            Err(refusal) => return refuse(refusal, STATUS_INVALID_PARAMETER),
+        };
         // §10.7:1856 — pre-patch whenever the validated allocation list ALREADY
         // reports a segment. It normally does not at Render (residency has not
         // run), which is what `DxgkDdiPatch` is for.
@@ -2378,7 +3558,8 @@ fn commit(
             // SAFETY: the union's `PhysicalAddress` arm is the one a context
             // created with `VirtualAddressing = 0` gets, and HVC1 admits only
             // that (`hvc1_admit_context_flags`).
-            let physical = unsafe { entry.__bindgen_anon_2.PhysicalAddress.as_ref().QuadPart } as u64;
+            let physical =
+                unsafe { entry.__bindgen_anon_2.PhysicalAddress.as_ref().QuadPart } as u64;
             match apply_placement(&mut capability, segment, physical, identity.byte_size) {
                 // Placed, but with no epoch behind it: the KMD placement epoch
                 // is K2/K3's and has no producer, which is why the record can
@@ -2418,20 +3599,24 @@ fn commit(
         out.SplitOffset = 0;
     }
 
-    // K11 executes only this finite, copied one-fragment INIT allowlist on ring
-    // zero. The bounded executor below separately classifies the exact queue
-    // reply class (SetReply + vkAllocateMemory) on the nonzero endpoint.
+    // INIT is the only pre-session control command.  Every later HVC1 payload
+    // must have been copied through the bounded control assembler and will be
+    // re-parsed by the generated schema below.
+    let control_generated = native.class == NativeClass::Control
+        && scratch.control_building.as_ref().is_some_and(|building| {
+            building.batch_token == header.batch_token
+                && building.total_payload_bytes == header.total_payload_bytes
+                && building.full_payload_crc64 == header.full_payload_crc64
+                && building.fragment_count == header.fragment_count
+        });
     let k11_init = native.class == NativeClass::Control
+        && !control_generated
         && accept.has_reply
         && header.fragment_count == 1
         && header.total_payload_bytes
             == size_of::<helios_protocol::translation_session::HeliosTranslationSessionInitV1>()
                 as u64;
-    if native.class == NativeClass::Control && !accept.has_reply {
-        NR2_NO_REPLY.fetch_add(1, Ordering::Relaxed);
-        return STATUS_INVALID_PARAMETER;
-    }
-    if native.class == NativeClass::Control && !k11_init {
+    if native.class == NativeClass::Control && !k11_init && !control_generated {
         NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
@@ -2440,7 +3625,7 @@ fn commit(
     // DMA custody until the actual host terminal.  The one-fragment control
     // INIT has no such building object, so it retains the original checkout at
     // COMMIT and retirement in SubmitCommand.
-    if native.class == NativeClass::Control {
+    if native.class == NativeClass::Control && k11_init {
         let mut state = native.state.lock();
         if let Err(refusal) = state.staging_mut().checkout(header.total_payload_bytes) {
             drop(state);
@@ -2455,8 +3640,7 @@ fn commit(
     // CRC-zeroed wire bytes rather than a half-prepared host copy.
     if native.class == NativeClass::Queue
         && (args.pDmaBufferPrivateData.is_null()
-            || (args.DmaBufferPrivateDataSize as usize)
-                < size_of::<Hnr2KmdDmaPrivateV1>())
+            || (args.DmaBufferPrivateDataSize as usize) < size_of::<Hnr2KmdDmaPrivateV1>())
     {
         return STATUS_INVALID_PARAMETER;
     }
@@ -2504,9 +3688,11 @@ fn commit(
             slot_index,
             full_payload_crc64,
         )
-    }
-    {
+    } {
         if native.class == NativeClass::Control {
+            if control_generated {
+                let _ = scratch.control_building.take();
+            }
             let _ = native
                 .state
                 .lock()
@@ -2518,13 +3704,52 @@ fn commit(
 
     // ── the control-context reply slot, and the finite host INIT ─────────────
     if native.class == NativeClass::Control {
+        let mut init_payload = [0u8; size_of::<
+            helios_protocol::translation_session::HeliosTranslationSessionInitV1,
+        >()];
+        let mut generated = if control_generated {
+            scratch.control_building.take()
+        } else {
+            None
+        };
+        let payload = if let Some(building) = generated.as_mut() {
+            if helios_protocol::wddm::crc64_ecma(building.payload.as_slice())
+                != header.full_payload_crc64
+            {
+                let _ = native
+                    .state
+                    .lock()
+                    .staging_mut()
+                    .retire(header.total_payload_bytes);
+                NR2_SLOT_RETIRED.fetch_add(1, Ordering::Relaxed);
+                return STATUS_INVALID_PARAMETER;
+            }
+            building.payload.as_mut_slice()
+        } else {
+            let src =
+                unsafe { (args.pCommand as *const u8).add(accept.layout.payload_offset as usize) };
+            if !unsafe { copy_from_command(init_payload.as_mut_ptr(), src, init_payload.len()) } {
+                let _ = native
+                    .state
+                    .lock()
+                    .staging_mut()
+                    .retire(header.total_payload_bytes);
+                NR2_SLOT_RETIRED.fetch_add(1, Ordering::Relaxed);
+                return STATUS_INVALID_PARAMETER;
+            }
+            &mut init_payload
+        };
         let status = control_render(
             session,
             args,
             header,
             accept,
             &scratch.uses[..use_count],
+            &scratch.patches[..patch_count],
             list_count,
+            payload,
+            &mut scratch.expected_operands,
+            &mut scratch.schema_counts,
         );
         if status != STATUS_SUCCESS {
             // No SubmitCommand follows a failed Render, so give back the exact
@@ -2537,7 +3762,6 @@ fn commit(
                 .retire(header.total_payload_bytes);
             return status;
         }
-        debug_assert!(k11_init);
         // SAFETY: `publish_dma_record` succeeded above and the private-data
         // pointer is not advanced until after this exact marker is written.
         unsafe { mark_dma_host_completed(args, header.batch_token) };
@@ -2560,8 +3784,7 @@ fn commit(
     unsafe { advance_private_data(args) };
     args.PatchLocationListOutSize = plan.count;
     if !args.pPatchLocationListOut.is_null() {
-        args.pPatchLocationListOut =
-            unsafe { args.pPatchLocationListOut.add(plan.count as usize) };
+        args.pPatchLocationListOut = unsafe { args.pPatchLocationListOut.add(plan.count as usize) };
     }
     args.MultipassOffset = 0;
     // The assembler moves HERE, after the last thing that could have refused.
@@ -2579,6 +3802,8 @@ fn commit(
 enum ControlPayloadOutcome {
     /// A real host reply and HVR1 payload were published.
     Published,
+    /// A reply-less generated operation reached a real stock-Venus terminal.
+    Completed,
     /// The payload was refused before any host reply existed.
     Refused,
     /// INIT failed after closing this session's admission; finish teardown only
@@ -2589,7 +3814,7 @@ enum ControlPayloadOutcome {
 impl ControlPayloadOutcome {
     const fn status(self) -> NTSTATUS {
         match self {
-            Self::Published => STATUS_SUCCESS,
+            Self::Published | Self::Completed => STATUS_SUCCESS,
             Self::Refused | Self::InitFailed => STATUS_INVALID_PARAMETER,
         }
     }
@@ -2609,7 +3834,11 @@ fn control_render(
     header: &HeliosNativeRenderV2,
     accept: &Hnr2Accept,
     uses: &[HeliosNativeRenderUse],
+    patches: &[HeliosNativeRenderPatch],
     list_count: usize,
+    payload: &mut [u8],
+    expected_operands: &mut [helios_kmd_logic::venus_executor::VenusOperand],
+    schema_counts: &mut [u32],
 ) -> NTSTATUS {
     use crate::ddi::translation_session as hts1;
 
@@ -2669,30 +3898,35 @@ fn control_render(
         Err(status) => return status,
     };
     NR2_CONTROL_RENDERS.fetch_add(1, Ordering::Relaxed);
-    let Some(slot_index) = admission.slot_index else {
-        // K11's finite allowlist contains only INIT, and INIT has an actual
-        // host reply.  A reply-less control stream has no classified operation
-        // behind it and is refused before SubmitCommand.
-        NR2_NO_REPLY.fetch_add(1, Ordering::Relaxed);
-        return STATUS_INVALID_PARAMETER;
-    };
-
     // The finite operation and HVR1 publication are synchronous. Success
     // retires a genuinely-published reply; refusal cancels ownership without a
     // synthetic completion. Failed INIT has already closed admission, and only
     // after that exact cancellation may teardown destroy the host namespace.
-    let outcome = run_control_payload(session, args, header, accept, &admission);
-    match outcome {
-        ControlPayloadOutcome::Published => {
+    let outcome = run_control_payload(
+        session,
+        args,
+        header,
+        accept,
+        &admission,
+        uses,
+        patches,
+        payload,
+        expected_operands,
+        schema_counts,
+    );
+    match (outcome, admission.slot_index) {
+        (ControlPayloadOutcome::Published, Some(slot_index)) => {
             hts1::release_control_slot(session, slot_index, admission.slot_generation)
         }
-        ControlPayloadOutcome::Refused => {
-            hts1::abort_control_slot(session, slot_index, admission.slot_generation)
-        }
-        ControlPayloadOutcome::InitFailed => {
+        (ControlPayloadOutcome::Completed, None) => {}
+        (ControlPayloadOutcome::InitFailed, Some(slot_index)) => {
             hts1::abort_control_slot(session, slot_index, admission.slot_generation);
             hts1::finish_failed_session_init(session);
         }
+        (_, Some(slot_index)) => {
+            hts1::abort_control_slot(session, slot_index, admission.slot_generation)
+        }
+        _ => {}
     }
     outcome.status()
 }
@@ -2704,51 +3938,152 @@ fn run_control_payload(
     header: &HeliosNativeRenderV2,
     accept: &Hnr2Accept,
     admission: &helios_kmd_logic::translation_session::ControlRenderAdmission,
+    uses: &[HeliosNativeRenderUse],
+    patches: &[HeliosNativeRenderPatch],
+    payload: &mut [u8],
+    expected_operands: &mut [helios_kmd_logic::venus_executor::VenusOperand],
+    schema_counts: &mut [u32],
 ) -> ControlPayloadOutcome {
     use helios_protocol::translation_session::HeliosTranslationSessionInitV1;
     const INIT_BYTES: usize = size_of::<HeliosTranslationSessionInitV1>();
 
-    // The finite HTS1 INIT is the one control payload this package understands,
-    // and it always arrives whole: A1 sends it as one fragment.
-    if header.fragment_count != 1 || header.total_payload_bytes != INIT_BYTES as u64 {
-        // Any other payload is an opaque Venus control stream, and there is no
-        // generated opcode schema on this side to classify it against — so it is
-        // refused rather than admitted unclassified onto ring 0.
+    if header.fragment_count == 1
+        && header.total_payload_bytes == INIT_BYTES as u64
+        && payload.len() == INIT_BYTES
+        && u32::from_le_bytes(payload[..4].try_into().unwrap_or_default())
+            == helios_protocol::translation_session::HELIOS_HTS1_INIT_MAGIC
+    {
+        if !accept.has_reply || !patches.is_empty() || uses.len() != 1 {
+            return ControlPayloadOutcome::Refused;
+        }
+        return match crate::ddi::translation_session::session_init(
+            session,
+            payload,
+            admission.reply_offset,
+            admission.reply_capacity_bytes,
+            admission.slot_generation,
+            admission.batch_token,
+        ) {
+            // K11 synchronously validated the actual host reply and release-
+            // published HVR1/HTS1 into the admitted role-1 slot. The ordinary C51
+            // signal submitted immediately after Render remains the user-visible
+            // completion edge; no synthetic SubmissionFenceId is created here.
+            Ok(_reply) => ControlPayloadOutcome::Published,
+            // ⛔ NORMALISED. `session_init` answers STATUS_DEVICE_NOT_READY /
+            // STATUS_INSUFFICIENT_RESOURCES, and neither is in `DxgkDdiRender`'s
+            // documented return set — an illegal NTSTATUS out of a DDI is itself
+            // logged by dxgkrnl as a driver bug. The real reason is in `TsInitRej`.
+            Err(_status) => ControlPayloadOutcome::InitFailed,
+        };
+    }
+
+    let generated = match helios_kmd_logic::venus_executor::validate_venus_control_stream(
+        payload,
+        accept.has_reply,
+        expected_operands,
+        schema_counts,
+    ) {
+        Ok(generated) => generated,
+        Err(_) => {
+            NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+            return ControlPayloadOutcome::Refused;
+        }
+    };
+    if generated.operand_count as usize != patches.len() {
         NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
         return ControlPayloadOutcome::Refused;
     }
-    let mut raw = [0u8; INIT_BYTES];
-    // SAFETY: `payload_offset`/`payload_bytes` were validated against
-    // `CommandLength` by `HeliosNativeRenderV2::validate`, and the length equals
-    // the destination exactly. `pCommand` is read only inside the shim's frame.
-    let ok = unsafe {
-        copy_from_command(
-            raw.as_mut_ptr(),
-            (args.pCommand as *const u8).add(accept.layout.payload_offset as usize),
-            INIT_BYTES,
-        )
-    };
-    if !ok {
+
+    if !accept.has_reply {
+        if !uses.is_empty() || !patches.is_empty() || args.AllocationListSize != 0 {
+            NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+            return ControlPayloadOutcome::Refused;
+        }
+        return match crate::ddi::translation_session::execute_control_no_reply(session, payload) {
+            Ok(()) => ControlPayloadOutcome::Completed,
+            Err(_) => ControlPayloadOutcome::Refused,
+        };
+    }
+
+    if uses.len() != 1 || patches.len() != 1 || admission.slot_index.is_none() {
+        NR2_NO_REPLY.fetch_add(1, Ordering::Relaxed);
         return ControlPayloadOutcome::Refused;
     }
-    match crate::ddi::translation_session::session_init(
+    let patch = patches[0];
+    let expected = expected_operands[0];
+    let reply_index = header.reply_allocation_list_index as usize;
+    if patch.payload_offset != expected.payload_offset
+        || patch.allocation_list_index as usize != reply_index
+        || patch.operand_kind != HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32
+        || patch.encoded_width != size_of::<u32>() as u16
+        || generated.reply_offset
+            != header
+                .reply_offset
+                .checked_add(HELIOS_HVR1_HEADER_SIZE as u64)
+                .unwrap_or(u64::MAX)
+        || generated.reply_size == 0
+        || header.reply_capacity_bytes < HELIOS_HVR1_HEADER_SIZE as u64 + generated.reply_size
+        || reply_index >= args.AllocationListSize as usize
+        || args.pAllocationList.is_null()
+    {
+        NR2_NO_REPLY.fetch_add(1, Ordering::Relaxed);
+        return ControlPayloadOutcome::Refused;
+    }
+    let use_record = uses[0];
+    if use_record.allocation_list_index as usize != reply_index {
+        return ControlPayloadOutcome::Refused;
+    }
+    let handle = unsafe { (*args.pAllocationList.add(reply_index)).hDeviceSpecificAllocation };
+    let passive = unsafe { PassiveLevel::assume() };
+    let Some(guard) = (unsafe {
+        crate::ddi::create_allocation::open_allocation_execution_use(
+            handle,
+            session,
+            use_record.expected_allocation_generation,
+            passive,
+        )
+    }) else {
+        NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+        return ControlPayloadOutcome::Refused;
+    };
+    let Some(kernel_va) = guard.kernel_va else {
+        return ControlPayloadOutcome::Refused;
+    };
+    if guard.hvm1_role != HELIOS_HVM1_ROLE_REPLY_POOL
+        || guard.allocation_generation != use_record.expected_allocation_generation
+        || guard.resource_id == 0
+        || guard.transport_instance == 0
+    {
+        return ControlPayloadOutcome::Refused;
+    }
+    let start = patch.payload_offset as usize;
+    let Some(end) = start.checked_add(size_of::<u32>()) else {
+        return ControlPayloadOutcome::Refused;
+    };
+    let Some(dst) = payload.get_mut(start..end) else {
+        return ControlPayloadOutcome::Refused;
+    };
+    dst.copy_from_slice(&guard.resource_id.to_le_bytes());
+    let facts = crate::ddi::create_allocation::K11ReplyPoolFacts {
+        allocation_generation: guard.allocation_generation,
+        resource_id: guard.resource_id,
+        transport_instance: guard.transport_instance,
+        kernel_va,
+        byte_size: guard.byte_size,
+    };
+    match crate::ddi::translation_session::execute_generated_control(
         session,
-        &raw,
-        admission.reply_offset,
-        admission.reply_capacity_bytes,
+        facts,
+        payload,
+        header.reply_offset,
+        header.reply_capacity_bytes,
+        generated.reply_size,
         admission.slot_generation,
         admission.batch_token,
+        generated.opcode,
     ) {
-        // K11 synchronously validated the actual host reply and release-
-        // published HVR1/HTS1 into the admitted role-1 slot. The ordinary C51
-        // signal submitted immediately after Render remains the user-visible
-        // completion edge; no synthetic SubmissionFenceId is created here.
-        Ok(_reply) => ControlPayloadOutcome::Published,
-        // ⛔ NORMALISED. `session_init` answers STATUS_DEVICE_NOT_READY /
-        // STATUS_INSUFFICIENT_RESOURCES, and neither is in `DxgkDdiRender`'s
-        // documented return set — an illegal NTSTATUS out of a DDI is itself
-        // logged by dxgkrnl as a driver bug. The real reason is in `TsInitRej`.
-        Err(_status) => ControlPayloadOutcome::InitFailed,
+        Ok(()) => ControlPayloadOutcome::Published,
+        Err(_) => ControlPayloadOutcome::Refused,
     }
 }
 
@@ -2901,8 +4236,13 @@ pub(crate) unsafe fn patch(args: &DXGKARG_PATCH) {
         let mut capability = unsafe { core::ptr::read_unaligned(slot) };
         // SAFETY: the `PhysicalAddress` arm — HVC1 admits only
         // `VirtualAddressing = 0`.
-        let physical =
-            unsafe { allocation.__bindgen_anon_2.PhysicalAddress.as_ref().QuadPart } as u64;
+        let physical = unsafe {
+            allocation
+                .__bindgen_anon_2
+                .PhysicalAddress
+                .as_ref()
+                .QuadPart
+        } as u64;
         // The record's own span, which Render set from the allocation's size:
         // `DXGK_ALLOCATIONLIST` carries no length, so this is the only bound
         // available here and re-deriving it would be a second source.
@@ -3003,6 +4343,270 @@ fn append_queue_ticket(
         commit_record,
         |old| adapter.with_wddm_notify_lock(|guard| guard.ordered_engine_ticket_is_live(old)),
     )
+}
+
+fn outer_physical_record_matches(
+    native: &NativeContext,
+    record: &Hob1KmdDmaPrivateV1,
+    identity: BatchIdentity,
+    slot_index: usize,
+) -> bool {
+    record.magic == HELIOS_HOB1_KMD_DMA_MAGIC
+        && record.abi_version == HELIOS_HOB1_KMD_DMA_ABI_VERSION
+        && record.struct_bytes == HELIOS_HOB1_KMD_DMA_BYTES
+        && record.flags == 0
+        && record.batch_id == identity.batch_token
+        && record.session_generation == identity.session_generation
+        && record.context_generation == identity.context_generation
+        && record.slot_generation == identity.slot_generation
+        && record.hob1_crc64 == identity.full_payload_crc64
+        && record.payload_bytes == identity.payload_bytes
+        && record.ring_index == identity.ring_index
+        && record.slot_index as usize == slot_index
+        && identity.session_generation == native.session_generation
+        && identity.context_generation == native.context_generation
+        && identity.ring_index == native.ring_index
+        && identity.fragment_count == 1
+        && identity.ring_index != 0
+}
+
+/// Consume the D3D11 physical record parked by `render_outer_physical` and
+/// transfer its exact K9 ticket plus direct custody into the existing host
+/// completion path. No legacy scheduler FIFO observes an outer-context packet.
+pub(crate) unsafe fn submit_outer_physical(
+    native: &NativeContext,
+    session: NonNull<crate::ddi::translation_session::SessionObject>,
+    submit: &DXGKARG_SUBMITCOMMAND,
+    ticket: crate::adapter::OrderedEngineTicket,
+) -> NativeSubmitDisposition {
+    NR2_SUBMITS.fetch_add(1, Ordering::Relaxed);
+    let Some(_submit_operation) = native.acquire_operation() else {
+        OuterExecutionRefusal::ContextClosed.record();
+        return NativeSubmitDisposition::Revoked;
+    };
+    if native.class != NativeClass::Outer
+        || crate::ddi::translation_session::execution_session_generation(session)
+            != Some(native.session_generation)
+    {
+        OuterExecutionRefusal::SessionClosed.record();
+        return NativeSubmitDisposition::Revoked;
+    }
+    let resubmission = (unsafe { submit.Flags.__bindgen_anon_1.Value } & (1 << 7)) != 0;
+    let Some(record) = (unsafe {
+        read_hob1_dma_record(
+            submit.pDmaBufferPrivateData,
+            submit.DmaBufferPrivateDataSize,
+            submit.DmaBufferPrivateDataSubmissionStartOffset,
+            submit.DmaBufferPrivateDataSubmissionEndOffset,
+        )
+    }) else {
+        OuterExecutionRefusal::PrivateData.record();
+        return NativeSubmitDisposition::Revoked;
+    };
+    if let Err(refusal) = native
+        .host_submissions
+        .lock()
+        .admit_host_completion(submit.SubmissionFenceId, resubmission)
+    {
+        let code = match refusal {
+            HostSubmissionRefusal::Duplicate { .. } => 2,
+            HostSubmissionRefusal::WentBackward { .. } => 3,
+        };
+        bump_with_code(&NR2_HOST_SUBMIT_REJECT, code);
+        OuterExecutionRefusal::FenceOrder.record();
+        return NativeSubmitDisposition::Revoked;
+    }
+    let adapter = unsafe { native.adapter.as_ref() };
+    let action = {
+        let mut executor = native.executor.lock();
+        let Some(slot) = executor.slots.get_mut(record.slot_index as usize) else {
+            OuterExecutionRefusal::ResubmissionMismatch.record();
+            return NativeSubmitDisposition::Revoked;
+        };
+        let old = core::mem::replace(slot, SubmissionSlot::Free);
+        match old {
+            SubmissionSlot::Ready {
+                identity,
+                mut tickets,
+                mut batch,
+            } => {
+                if outer_physical_record_matches(
+                    native,
+                    &record,
+                    identity,
+                    record.slot_index as usize,
+                ) && append_queue_ticket(
+                    adapter,
+                    &mut tickets,
+                    identity,
+                    ticket,
+                    resubmission,
+                    true,
+                ) {
+                    if let Some(batch) = batch.take() {
+                        *slot = SubmissionSlot::InFlight { identity, tickets };
+                        Some(QueueSubmitAction::Enqueue {
+                            identity,
+                            slot_index: record.slot_index,
+                            batch,
+                        })
+                    } else {
+                        *slot = SubmissionSlot::Ready {
+                            identity,
+                            tickets,
+                            batch,
+                        };
+                        None
+                    }
+                } else {
+                    *slot = SubmissionSlot::Ready {
+                        identity,
+                        tickets,
+                        batch,
+                    };
+                    None
+                }
+            }
+            SubmissionSlot::InFlight {
+                identity,
+                mut tickets,
+            } => {
+                if outer_physical_record_matches(
+                    native,
+                    &record,
+                    identity,
+                    record.slot_index as usize,
+                ) && append_queue_ticket(
+                    adapter,
+                    &mut tickets,
+                    identity,
+                    ticket,
+                    resubmission,
+                    true,
+                ) {
+                    *slot = SubmissionSlot::InFlight { identity, tickets };
+                    Some(QueueSubmitAction::Pending)
+                } else {
+                    *slot = SubmissionSlot::InFlight { identity, tickets };
+                    None
+                }
+            }
+            SubmissionSlot::Terminal {
+                identity,
+                mut tickets,
+                success,
+                cleanup,
+            } => {
+                if outer_physical_record_matches(
+                    native,
+                    &record,
+                    identity,
+                    record.slot_index as usize,
+                ) && append_queue_ticket(
+                    adapter,
+                    &mut tickets,
+                    identity,
+                    ticket,
+                    resubmission,
+                    true,
+                ) {
+                    *slot = SubmissionSlot::Terminal {
+                        identity,
+                        tickets,
+                        success,
+                        cleanup,
+                    };
+                    Some(QueueSubmitAction::AlreadyTerminal { success })
+                } else {
+                    *slot = SubmissionSlot::Terminal {
+                        identity,
+                        tickets,
+                        success,
+                        cleanup,
+                    };
+                    None
+                }
+            }
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    };
+    let Some(action) = action else {
+        OuterExecutionRefusal::ResubmissionMismatch.record();
+        return NativeSubmitDisposition::Revoked;
+    };
+    NR2_HOST_SUBMIT_OK.fetch_add(1, Ordering::Relaxed);
+    match action {
+        QueueSubmitAction::Pending => NativeSubmitDisposition::Pending,
+        QueueSubmitAction::AlreadyTerminal { success } => {
+            if success {
+                let _ = crate::ddi::interrupt::complete_ordered_engine_submission(adapter, ticket);
+            } else {
+                let _ = crate::ddi::interrupt::fail_ordered_engine_submission(adapter, ticket);
+            }
+            NativeSubmitDisposition::Pending
+        }
+        QueueSubmitAction::Enqueue {
+            identity,
+            slot_index,
+            batch,
+        } => {
+            let host_context_id = batch.custody.host_context_id();
+            let transport_instance = batch.custody.transport_instance();
+            let completion = NativeHostCompletion {
+                context: NonNull::from(native),
+                identity,
+                slot_index,
+                custody: Some(batch.custody),
+            };
+            let mut pending = Some((batch.meta, batch.payload, completion));
+            let queued = adapter.with_virtio(|gpu| {
+                if gpu.scanout_transport_instance() != transport_instance {
+                    return None;
+                }
+                pending.take().map(|(meta, payload, completion)| {
+                    gpu.enqueue_native_submit(
+                        host_context_id,
+                        native.ring_index,
+                        meta,
+                        payload,
+                        identity.payload_bytes as usize,
+                        completion,
+                    )
+                })
+            });
+            match queued {
+                Ok(Some(Ok(_))) => {
+                    NR2_OUTER_HOST.fetch_add(1, Ordering::Relaxed);
+                    NativeSubmitDisposition::Pending
+                }
+                Ok(Some(Err((meta, payload, Some(completion), _)))) => {
+                    OuterExecutionRefusal::HostEnqueue.record();
+                    completion.finish_with_cleanup(adapter, false, Some((meta, payload)));
+                    NativeSubmitDisposition::Pending
+                }
+                Ok(Some(Err((meta, payload, None, _)))) => {
+                    OuterExecutionRefusal::HostEnqueue.record();
+                    core::mem::forget(meta);
+                    core::mem::forget(payload);
+                    fail_inflight_without_completion(native, adapter, identity, slot_index);
+                    NativeSubmitDisposition::Pending
+                }
+                Ok(None) | Err(_) => {
+                    OuterExecutionRefusal::HostUnavailable.record();
+                    if let Some((meta, payload, completion)) = pending.take() {
+                        completion.finish_with_cleanup(adapter, false, Some((meta, payload)));
+                        NativeSubmitDisposition::Pending
+                    } else {
+                        fail_inflight_without_completion(native, adapter, identity, slot_index);
+                        NativeSubmitDisposition::Revoked
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Retire one HNR2 submission's staging admission. K11's exact INIT token has
@@ -3260,13 +4864,10 @@ pub(crate) unsafe fn submit(
             QueueSubmitAction::Pending => NativeSubmitDisposition::Pending,
             QueueSubmitAction::AlreadyTerminal { success } => {
                 if success {
-                    let _ = crate::ddi::interrupt::complete_ordered_engine_submission(
-                        adapter, ticket,
-                    );
+                    let _ =
+                        crate::ddi::interrupt::complete_ordered_engine_submission(adapter, ticket);
                 } else {
-                    let _ = crate::ddi::interrupt::fail_ordered_engine_submission(
-                        adapter, ticket,
-                    );
+                    let _ = crate::ddi::interrupt::fail_ordered_engine_submission(adapter, ticket);
                 }
                 NativeSubmitDisposition::Pending
             }
@@ -3302,11 +4903,7 @@ pub(crate) unsafe fn submit(
                 match queued {
                     Ok(Some(Ok(_))) => NativeSubmitDisposition::Pending,
                     Ok(Some(Err((meta, payload, Some(completion), _)))) => {
-                        completion.finish_with_cleanup(
-                            adapter,
-                            false,
-                            Some((meta, payload)),
-                        );
+                        completion.finish_with_cleanup(adapter, false, Some((meta, payload)));
                         NativeSubmitDisposition::Pending
                     }
                     Ok(Some(Err((meta, payload, None, _)))) => {
@@ -3317,21 +4914,12 @@ pub(crate) unsafe fn submit(
                         core::mem::forget(meta);
                         core::mem::forget(payload);
                         bump_with_code(&NR2_HOST_SUBMIT_REJECT, 5);
-                        fail_inflight_without_completion(
-                            native,
-                            adapter,
-                            identity,
-                            slot_index,
-                        );
+                        fail_inflight_without_completion(native, adapter, identity, slot_index);
                         NativeSubmitDisposition::Pending
                     }
                     Ok(None) | Err(_) => {
                         if let Some((meta, payload, completion)) = pending.take() {
-                            completion.finish_with_cleanup(
-                                adapter,
-                                false,
-                                Some((meta, payload)),
-                            );
+                            completion.finish_with_cleanup(adapter, false, Some((meta, payload)));
                             NativeSubmitDisposition::Pending
                         } else {
                             bump_with_code(&NR2_HOST_SUBMIT_REJECT, 5);
@@ -3359,9 +4947,8 @@ pub(crate) unsafe fn submit(
     // completion guard through notification. Reset joins it, while ordinary
     // session teardown never waits on an OS callback that may itself be waiting
     // for a same-context Render to return.
-    let disposition = crate::ddi::translation_session::with_current_host_submission(
-        session,
-        || {
+    let disposition =
+        crate::ddi::translation_session::with_current_host_submission(session, || {
             let fence = submit.SubmissionFenceId;
             let admission = native
                 .host_submissions
@@ -3377,8 +4964,7 @@ pub(crate) unsafe fn submit(
             }
             NR2_HOST_SUBMIT_OK.fetch_add(1, Ordering::Relaxed);
             NativeSubmitDisposition::HostCompleted(fence)
-        },
-    );
+        });
     disposition.unwrap_or_else(|| {
         bump_with_code(&NR2_HOST_SUBMIT_REJECT, 1);
         NativeSubmitDisposition::Revoked
@@ -3387,20 +4973,25 @@ pub(crate) unsafe fn submit(
 
 // ── `DxgkDdiSubmitCommandVirtual`, the HOS1 arm ──────────────────────────────
 
-/// Validate one HOS1 descriptor on a D3D12-virtual HQA1 outer context.
+/// Admit one HOS1 descriptor on a D3D12-virtual HQA1 outer context.
 ///
-/// ⛔ VALIDATED, NEVER ENQUEUED. The HOB1 lives at the submitted GPUVA and
-/// §10.4 forbids the KMD from dereferencing it, so `cross_check` is not called
-/// and nothing is executed. Like its physical sibling this returns nothing: a
-/// non-SUCCESS return bugchecks the scheduler.
+/// This DISPATCH-level edge performs only bounded scalar/direct-object work:
+/// exact 64-byte HOS1 validation, context/session/HOC1 rundown acquisition,
+/// K9 ticket publication, and enqueue to the context-owned system work item.
+/// The worker performs the potentially 15-MiB HOB1 snapshot/CRC/schema pass at
+/// PASSIVE and enters the existing stock-Venus used-ring completion graph.
 ///
 /// # Safety
 /// `submit` is dxgkrnl's live argument struct for a submission on a context
 /// whose role this driver resolved as an HQA1 attach.
 pub(crate) unsafe fn submit_virtual(
+    native: &NativeContext,
+    session: NonNull<crate::ddi::translation_session::SessionObject>,
+    device: &crate::device::DeviceContext,
     outer: &SpinLock<OuterSubmitContext>,
     submit: &DXGKARG_SUBMITCOMMANDVIRTUAL,
-) {
+    ticket: crate::adapter::OrderedEngineTicket,
+) -> NativeSubmitDisposition {
     // The measurement the two texts disagree about. Legal at any IRQL.
     // SAFETY: `KeGetCurrentIrql` reads the current processor's IRQL and has no
     // preconditions.
@@ -3409,19 +5000,33 @@ pub(crate) unsafe fn submit_virtual(
         Ordering::Relaxed,
     );
 
+    let Some(context_operation) = native.acquire_operation() else {
+        OuterExecutionRefusal::ContextClosed.record();
+        return NativeSubmitDisposition::Revoked;
+    };
+    if native.class != NativeClass::Outer
+        || crate::ddi::translation_session::execution_session_generation(session)
+            != Some(native.session_generation)
+    {
+        OuterExecutionRefusal::SessionClosed.record();
+        return NativeSubmitDisposition::Revoked;
+    }
+
     let bytes = size_of::<HeliosOuterSubmitV1>();
     // §10.4: dxgkrnl copies the UMD's prefix into the front of KMD private data,
     // and `DmaBufferUmdPrivateDataSize` is how many bytes of it are the UMD's.
-    // A shorter prefix is not a HOS1.
+    // The selected UMD path contributes exactly one HOS1 and no compatibility
+    // suffix. A shorter or larger UMD region cannot be reclassified.
     //
     // ⚠ `DXGKARG_SUBMITCOMMANDVIRTUAL` carries NO submission-offset pair, unlike
     // its physical sibling — the virtual DDI hands one submission's private data
     // directly — so offset 0 is the record here, and only here.
     if submit.pDmaBufferPrivateData.is_null()
-        || (submit.DmaBufferPrivateDataSize as usize) < bytes
-        || (submit.DmaBufferUmdPrivateDataSize as usize) < bytes
+        || (submit.DmaBufferPrivateDataSize as usize) != bytes
+        || (submit.DmaBufferUmdPrivateDataSize as usize) != bytes
     {
-        return;
+        OuterExecutionRefusal::PrivateData.record();
+        return NativeSubmitDisposition::Revoked;
     }
     let mut raw = [0u8; size_of::<HeliosOuterSubmitV1>()];
     // SAFETY: non-null with at least `bytes`, checked above.
@@ -3439,22 +5044,205 @@ pub(crate) unsafe fn submit_virtual(
                 &NR2_HOS1_REJECT,
                 helios_kmd_logic::native_render::outer_submit_code(reject),
             );
-            return;
+            OuterExecutionRefusal::Descriptor.record();
+            return NativeSubmitDisposition::Revoked;
         }
     };
-    let mut context = outer.lock();
-    match admit_hos1(&mut context, &record, submit.DmaBufferSize as u64) {
-        Ok(()) => {
-            drop(context);
-            NR2_HOS1_OK.fetch_add(1, Ordering::Relaxed);
-            // The boundary: a validated descriptor that names a GPUVA nobody
-            // reads. K7/K8 own the HOB1; allocation/GPU dispatch remains a
-            // later execution unit and is not part of K11's pure INIT.
-            NR2_HOS1_NOT_EXECUTED.fetch_add(1, Ordering::Relaxed);
+
+    // SAFETY: `Value` is the UINT view of the WDK flags union. Bit 7 is the
+    // same Resubmission discriminator used by physical SubmitCommand.
+    let resubmission = (unsafe { submit.Flags.__bindgen_anon_1.Value } & (1 << 7)) != 0;
+    let expectation = {
+        let context = outer.lock();
+        HeliosOuterBatchExpectation {
+            package_generation: context.package_generation,
+            session_generation: context.session_generation,
+            context_generation: context.context_generation,
+            endpoint_id: context.endpoint_id,
+            flags: context.arm_flags,
+            max_command_bytes: submit.DmaBufferSize as u64,
+            last_batch_id: if resubmission {
+                record.batch_id.saturating_sub(1)
+            } else {
+                context.last_batch_id()
+            },
+            allocation_list_count: 0,
         }
-        Err(refusal) => {
-            drop(context);
-            bump_with_code(&NR2_HOS1_REJECT, refusal.code());
-        }
+    };
+    if let Err(reject) = record.validate(&expectation, submit.DmaBufferSize as u64) {
+        bump_with_code(
+            &NR2_HOS1_REJECT,
+            helios_kmd_logic::native_render::outer_submit_code(reject),
+        );
+        OuterExecutionRefusal::Descriptor.record();
+        return NativeSubmitDisposition::Revoked;
     }
+
+    let fence = submit.SubmissionFenceId;
+    if let Err(refusal) = native
+        .host_submissions
+        .lock()
+        .admit_host_completion(fence, resubmission)
+    {
+        let code = match refusal {
+            HostSubmissionRefusal::Duplicate { .. } => 2,
+            HostSubmissionRefusal::WentBackward { .. } => 3,
+        };
+        bump_with_code(&NR2_HOST_SUBMIT_REJECT, code);
+        OuterExecutionRefusal::FenceOrder.record();
+        return NativeSubmitDisposition::Revoked;
+    }
+
+    let adapter = unsafe { native.adapter.as_ref() };
+    if resubmission {
+        let terminal = {
+            let mut executor = native.executor.lock();
+            let mut found = None;
+            for slot in executor.slots.iter_mut() {
+                let (identity, tickets, terminal) = match slot {
+                    SubmissionSlot::InFlight { identity, tickets } => (identity, tickets, None),
+                    SubmissionSlot::Terminal {
+                        identity,
+                        tickets,
+                        success,
+                        ..
+                    } => (identity, tickets, Some(*success)),
+                    _ => continue,
+                };
+                let exact = identity.batch_token == record.batch_id
+                    && identity.payload_bytes == record.hob1_bytes
+                    && identity.full_payload_crc64 == record.hob1_crc64
+                    && identity.fragment_count == 1
+                    && identity.session_generation == native.session_generation
+                    && identity.context_generation == native.context_generation
+                    && identity.ring_index == native.ring_index;
+                if !exact {
+                    continue;
+                }
+                if found.is_some()
+                    || !append_queue_ticket(adapter, tickets, *identity, ticket, true, true)
+                {
+                    found = Some(Err(()));
+                    break;
+                }
+                found = Some(Ok(terminal));
+            }
+            found
+        };
+        return match terminal {
+            Some(Ok(Some(success))) => {
+                if success {
+                    let _ =
+                        crate::ddi::interrupt::complete_ordered_engine_submission(adapter, ticket);
+                } else {
+                    let _ = crate::ddi::interrupt::fail_ordered_engine_submission(adapter, ticket);
+                }
+                NR2_HOST_SUBMIT_OK.fetch_add(1, Ordering::Relaxed);
+                NativeSubmitDisposition::Pending
+            }
+            Some(Ok(None)) => {
+                NR2_HOST_SUBMIT_OK.fetch_add(1, Ordering::Relaxed);
+                NativeSubmitDisposition::Pending
+            }
+            Some(Err(())) | None => {
+                OuterExecutionRefusal::ResubmissionMismatch.record();
+                NativeSubmitDisposition::Revoked
+            }
+        };
+    }
+
+    let mut context = outer.lock();
+    let prior_batch_id = context.last_batch_id();
+    if let Err(refusal) = admit_hos1(&mut context, &record, submit.DmaBufferSize as u64) {
+        drop(context);
+        bump_with_code(&NR2_HOS1_REJECT, refusal.code());
+        OuterExecutionRefusal::Descriptor.record();
+        return NativeSubmitDisposition::Revoked;
+    }
+    drop(context);
+
+    let Some(session_operation) =
+        crate::ddi::translation_session::acquire_execution_operation(session)
+    else {
+        OuterExecutionRefusal::SessionClosed.record();
+        return NativeSubmitDisposition::Revoked;
+    };
+    if session_operation.transport_instance == 0 {
+        OuterExecutionRefusal::TransportMismatch.record();
+        return NativeSubmitDisposition::Revoked;
+    }
+    let Some(command_pool) = device.acquire_outer_gpuva_use(
+        session,
+        submit.DmaBufferVirtualAddress,
+        submit.DmaBufferSize as u64,
+        None,
+        true,
+    ) else {
+        OuterExecutionRefusal::CommandPoolMissing.record();
+        return NativeSubmitDisposition::Revoked;
+    };
+
+    let (slot_index, identity) = {
+        let mut executor = native.executor.lock();
+        let Some(slot_index) = executor
+            .slots
+            .iter()
+            .position(|slot| matches!(slot, SubmissionSlot::Free))
+        else {
+            OuterExecutionRefusal::SlotExhausted.record();
+            return NativeSubmitDisposition::Revoked;
+        };
+        let Some(slot_generation) = executor.mint_slot_generation() else {
+            OuterExecutionRefusal::SlotExhausted.record();
+            return NativeSubmitDisposition::Revoked;
+        };
+        let identity = BatchIdentity {
+            batch_token: record.batch_id,
+            slot_generation,
+            payload_bytes: record.hob1_bytes,
+            full_payload_crc64: record.hob1_crc64,
+            fragment_count: 1,
+            session_generation: native.session_generation,
+            context_generation: native.context_generation,
+            ring_index: native.ring_index,
+        };
+        let mut tickets = BatchTickets::new();
+        if !append_queue_ticket(adapter, &mut tickets, identity, ticket, false, true) {
+            OuterExecutionRefusal::SlotExhausted.record();
+            return NativeSubmitDisposition::Revoked;
+        }
+        executor.slots[slot_index] = SubmissionSlot::InFlight { identity, tickets };
+        (slot_index as u32, identity)
+    };
+
+    let pending = OuterPending {
+        identity,
+        slot_index,
+        prior_batch_id,
+        submit: record,
+        device: NonNull::from(device),
+        session,
+        command_pool,
+        context_operation,
+        session_operation,
+    };
+    let Some(worker) = native.outer_worker.as_ref() else {
+        fail_outer_slot(
+            native,
+            identity,
+            slot_index,
+            OuterExecutionRefusal::WorkerClosed,
+        );
+        drop(pending);
+        return NativeSubmitDisposition::Pending;
+    };
+    if let Err((refusal, pending)) = worker.enqueue(NonNull::from(native), pending) {
+        fail_outer_slot(native, identity, slot_index, refusal);
+        drop(pending);
+        return NativeSubmitDisposition::Pending;
+    }
+    NR2_HOS1_OK.fetch_add(1, Ordering::Relaxed);
+    NR2_OUTER_QUEUED.fetch_add(1, Ordering::Relaxed);
+    NR2_HOST_SUBMIT_OK.fetch_add(1, Ordering::Relaxed);
+    NativeSubmitDisposition::Pending
 }

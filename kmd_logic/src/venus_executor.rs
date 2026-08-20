@@ -8,6 +8,10 @@
 
 use helios_protocol::native_render::HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32;
 
+mod a7_schema;
+
+pub use a7_schema::{A7CommandKind, SchemaScratch};
+
 // Generated command opcodes (`vn_protocol_driver_defines.h`).
 pub const OP_QUEUE_SUBMIT: u32 = 18;
 pub const OP_ALLOCATE_MEMORY: u32 = 21;
@@ -65,6 +69,24 @@ pub struct VenusAdmission {
     pub memory_type_index: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VenusA7Admission {
+    pub command_count: u32,
+    pub allocation_command_count: u32,
+    pub command_buffer_count: u32,
+    pub queue_command_count: u32,
+    pub operand_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VenusControlAdmission {
+    pub command_count: u32,
+    pub opcode: u32,
+    pub operand_count: u32,
+    pub reply_offset: u64,
+    pub reply_size: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VenusReject {
     Truncated,
@@ -80,6 +102,7 @@ pub enum VenusReject {
     NonZeroResourceOperand,
     OperandCapacity,
     CountOverflow,
+    InvalidSequence,
 }
 
 struct Cursor<'a> {
@@ -107,6 +130,36 @@ impl<'a> Cursor<'a> {
             .ok_or(VenusReject::Truncated)?;
         self.offset = end;
         Ok(out)
+    }
+
+    fn array_count(&mut self) -> Result<u64, VenusReject> {
+        self.u64()
+    }
+
+    fn bound_loop_count(&self, count: u64) -> Result<(), VenusReject> {
+        let remaining = self.bytes.len().saturating_sub(self.offset);
+        if count > (remaining / 4).saturating_add(1) as u64 {
+            return Err(VenusReject::BadArrayCount);
+        }
+        Ok(())
+    }
+
+    fn skip_array(&mut self, count: u64, width: usize) -> Result<(), VenusReject> {
+        let count = usize::try_from(count).map_err(|_| VenusReject::CountOverflow)?;
+        let bytes = count.checked_mul(width).ok_or(VenusReject::CountOverflow)?;
+        let padded = if width < 4 {
+            bytes.checked_add(3).ok_or(VenusReject::CountOverflow)? & !3
+        } else {
+            bytes
+        };
+        self.skip(padded)
+    }
+
+    fn take_padded(&mut self, count: u64) -> Result<&'a [u8], VenusReject> {
+        let bytes = usize::try_from(count).map_err(|_| VenusReject::CountOverflow)?;
+        let padded = bytes.checked_add(3).ok_or(VenusReject::CountOverflow)? & !3;
+        let out = self.take(padded)?;
+        Ok(&out[..bytes])
     }
 
     fn u32(&mut self) -> Result<u32, VenusReject> {
@@ -178,6 +231,13 @@ impl OperandWriter<'_> {
         };
         self.count += 1;
         Ok(())
+    }
+
+    fn push_resource(&mut self, offset: u32, width: usize) -> Result<(), VenusReject> {
+        match width {
+            4 => self.push(offset, HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32),
+            _ => Err(VenusReject::OperandCapacity),
+        }
     }
 }
 
@@ -577,6 +637,185 @@ pub fn validate_venus_stream(
     })
 }
 
+/// Validate one complete record-only outer stream.
+///
+/// Unlike the legacy HNR2 helper above, an A7 outer operation is deliberately
+/// a sequence: zero or more allocation materialization/bind commands, complete
+/// `BeginCommandBuffer .. EndCommandBuffer` recordings, and exactly one final
+/// queue operation.  Every command is walked by the generated package schema;
+/// no trailing byte can hide an unclassified opcode.
+pub fn validate_venus_a7_outer_stream(
+    bytes: &[u8],
+    operand_storage: &mut [VenusOperand],
+    geometry_storage: &mut [u32],
+) -> Result<VenusA7Admission, VenusReject> {
+    const OP_BEGIN_COMMAND_BUFFER: u32 = 90;
+    const OP_END_COMMAND_BUFFER: u32 = 91;
+
+    let mut c = Cursor::new(bytes);
+    let mut operands = OperandWriter {
+        out: operand_storage,
+        count: 0,
+    };
+    let mut scratch = SchemaScratch::new(geometry_storage);
+    let mut admission = VenusA7Admission::default();
+    let mut recording = false;
+    let mut recorded_any = false;
+
+    while c.offset != bytes.len() {
+        let (opcode, flags) = command_header(&mut c)?;
+        if flags != 0 {
+            return Err(VenusReject::BadFlags);
+        }
+        let operands_before = operands.count;
+        let facts =
+            a7_schema::parse_a7_command(opcode, flags, &mut c, &mut operands, &mut scratch)?;
+        admission.command_count = admission
+            .command_count
+            .checked_add(1)
+            .ok_or(VenusReject::CountOverflow)?;
+
+        match facts.kind {
+            A7CommandKind::Allocation => {
+                if recording || recorded_any || admission.queue_command_count != 0 {
+                    return Err(VenusReject::InvalidSequence);
+                }
+                admission.allocation_command_count = admission
+                    .allocation_command_count
+                    .checked_add(1)
+                    .ok_or(VenusReject::CountOverflow)?;
+                let added = operands.count - operands_before;
+                if opcode == OP_ALLOCATE_MEMORY {
+                    if added != 1
+                        || facts.allocation_size == 0
+                        || facts.memory_type_index == u32::MAX
+                    {
+                        return Err(VenusReject::MissingImport);
+                    }
+                } else if added != 0 {
+                    return Err(VenusReject::InvalidSequence);
+                }
+            }
+            A7CommandKind::CommandRecord => {
+                if admission.queue_command_count != 0 {
+                    return Err(VenusReject::InvalidSequence);
+                }
+                match opcode {
+                    OP_BEGIN_COMMAND_BUFFER if !recording => {
+                        recording = true;
+                    }
+                    OP_END_COMMAND_BUFFER if recording => {
+                        recording = false;
+                        recorded_any = true;
+                        admission.command_buffer_count = admission
+                            .command_buffer_count
+                            .checked_add(1)
+                            .ok_or(VenusReject::CountOverflow)?;
+                    }
+                    OP_BEGIN_COMMAND_BUFFER | OP_END_COMMAND_BUFFER => {
+                        return Err(VenusReject::InvalidSequence);
+                    }
+                    _ if !recording => return Err(VenusReject::InvalidSequence),
+                    _ => {}
+                }
+            }
+            A7CommandKind::Queue => {
+                if recording || admission.queue_command_count != 0 {
+                    return Err(VenusReject::InvalidSequence);
+                }
+                admission.queue_command_count = 1;
+                if c.offset != bytes.len() {
+                    return Err(VenusReject::TrailingBytes);
+                }
+            }
+            A7CommandKind::PureControl => {
+                return Err(VenusReject::InvalidSequence);
+            }
+        }
+    }
+
+    if recording || admission.queue_command_count != 1 {
+        return Err(VenusReject::InvalidSequence);
+    }
+    admission.operand_count =
+        u32::try_from(operands.count).map_err(|_| VenusReject::CountOverflow)?;
+    Ok(admission)
+}
+
+/// Validate one finite HVC1 generated-control transaction.  A reply-bearing
+/// transaction is exactly SetReply plus one GENERATE_REPLY command; a
+/// reply-less transaction is one or more zero-flag commands.  SetReply's zero
+/// placeholder is the only generated resource operand permitted.
+pub fn validate_venus_control_stream(
+    bytes: &[u8],
+    has_reply: bool,
+    operand_storage: &mut [VenusOperand],
+    geometry_storage: &mut [u32],
+) -> Result<VenusControlAdmission, VenusReject> {
+    let mut c = Cursor::new(bytes);
+    let mut operands = OperandWriter {
+        out: operand_storage,
+        count: 0,
+    };
+    let mut scratch = SchemaScratch::new(geometry_storage);
+    let mut admission = VenusControlAdmission::default();
+
+    if has_reply {
+        let (opcode, flags) = command_header(&mut c)?;
+        if opcode != OP_SET_REPLY || flags != 0 || !c.pointer()? {
+            return Err(VenusReject::InvalidSequence);
+        }
+        let operand_offset = c.offset_u32()?;
+        if c.u32()? != 0 {
+            return Err(VenusReject::NonZeroResourceOperand);
+        }
+        operands.push(operand_offset, HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32)?;
+        admission.reply_offset = c.u64()?;
+        admission.reply_size = c.u64()?;
+        if admission.reply_size == 0 {
+            return Err(VenusReject::BadArrayCount);
+        }
+
+        let (opcode, flags) = command_header(&mut c)?;
+        if flags != COMMAND_GENERATE_REPLY {
+            return Err(VenusReject::BadFlags);
+        }
+        let facts =
+            a7_schema::parse_a7_command(opcode, flags, &mut c, &mut operands, &mut scratch)?;
+        if facts.kind != A7CommandKind::PureControl || operands.count != 1 {
+            return Err(VenusReject::InvalidSequence);
+        }
+        admission.command_count = 1;
+        admission.opcode = facts.opcode;
+    } else {
+        while c.offset != bytes.len() {
+            let (opcode, flags) = command_header(&mut c)?;
+            if opcode == OP_SET_REPLY || flags != 0 {
+                return Err(VenusReject::BadFlags);
+            }
+            let facts =
+                a7_schema::parse_a7_command(opcode, flags, &mut c, &mut operands, &mut scratch)?;
+            if facts.kind != A7CommandKind::PureControl || operands.count != 0 {
+                return Err(VenusReject::InvalidSequence);
+            }
+            admission.command_count = admission
+                .command_count
+                .checked_add(1)
+                .ok_or(VenusReject::CountOverflow)?;
+            admission.opcode = facts.opcode;
+        }
+        if admission.command_count == 0 {
+            return Err(VenusReject::InvalidSequence);
+        }
+    }
+    if c.offset != bytes.len() {
+        return Err(VenusReject::TrailingBytes);
+    }
+    admission.operand_count =
+        u32::try_from(operands.count).map_err(|_| VenusReject::CountOverflow)?;
+    Ok(admission)
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -628,6 +867,115 @@ mod tests {
         put64(&mut b, 1); // pMemory
         put64(&mut b, 99);
         b
+    }
+
+    fn a7_allocate(out: &mut Vec<u8>) -> usize {
+        put32(out, OP_ALLOCATE_MEMORY);
+        put32(out, 0);
+        put64(out, 7); // device
+        put64(out, 1); // pAllocateInfo
+        put32(out, ST_MEMORY_ALLOCATE_INFO);
+        put64(out, 1); // pNext
+        put32(out, ST_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+        put64(out, 0); // pNext
+        let resource_offset = out.len();
+        put32(out, 0); // KMD-private host resource patch
+        put64(out, 4096);
+        put32(out, 0);
+        put64(out, 0); // pAllocator
+        put64(out, 1); // pMemory
+        put64(out, 99);
+        resource_offset
+    }
+
+    fn a7_empty_recording(out: &mut Vec<u8>) {
+        put32(out, 90); // vkBeginCommandBuffer
+        put32(out, 0);
+        put64(out, 0x301);
+        put64(out, 1); // pBeginInfo
+        put32(out, 42); // VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+        put64(out, 0); // pNext
+        put32(out, 0); // flags
+        put64(out, 0); // pInheritanceInfo
+
+        put32(out, 91); // vkEndCommandBuffer
+        put32(out, 0);
+        put64(out, 0x301);
+    }
+
+    fn a7_empty_queue(out: &mut Vec<u8>) {
+        put32(out, OP_QUEUE_SUBMIT);
+        put32(out, 0);
+        put64(out, 0x101);
+        put32(out, 0);
+        put64(out, 0); // pSubmits
+        put64(out, 0); // fence
+    }
+
+    #[test]
+    fn a7_admits_deferred_allocate_record_and_exact_final_queue() {
+        let mut b = Vec::new();
+        let resource_offset = a7_allocate(&mut b);
+        a7_empty_recording(&mut b);
+        a7_empty_queue(&mut b);
+
+        let mut operands = [VenusOperand::default(); 1];
+        let mut geometry = [0u32; 8];
+        let admitted = validate_venus_a7_outer_stream(&b, &mut operands, &mut geometry).unwrap();
+        assert_eq!(admitted.command_count, 4);
+        assert_eq!(admitted.allocation_command_count, 1);
+        assert_eq!(admitted.command_buffer_count, 1);
+        assert_eq!(admitted.queue_command_count, 1);
+        assert_eq!(admitted.operand_count, 1);
+        assert_eq!(operands[0].payload_offset, resource_offset as u32);
+        assert_eq!(
+            operands[0].operand_kind,
+            HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32
+        );
+    }
+
+    #[test]
+    fn a7_refuses_nonzero_resource_and_incomplete_or_reordered_scope() {
+        let mut nonzero = Vec::new();
+        let resource_offset = a7_allocate(&mut nonzero);
+        nonzero[resource_offset] = 1;
+        a7_empty_queue(&mut nonzero);
+        assert_eq!(
+            validate_venus_a7_outer_stream(
+                &nonzero,
+                &mut [VenusOperand::default(); 1],
+                &mut [0u32; 8],
+            ),
+            Err(VenusReject::NonZeroResourceOperand)
+        );
+
+        let mut unterminated = Vec::new();
+        put32(&mut unterminated, 90);
+        put32(&mut unterminated, 0);
+        put64(&mut unterminated, 0x301);
+        put64(&mut unterminated, 1);
+        put32(&mut unterminated, 42);
+        put64(&mut unterminated, 0);
+        put32(&mut unterminated, 0);
+        put64(&mut unterminated, 0);
+        a7_empty_queue(&mut unterminated);
+        assert_eq!(
+            validate_venus_a7_outer_stream(&unterminated, &mut [], &mut [0u32; 8]),
+            Err(VenusReject::InvalidSequence)
+        );
+
+        let mut allocation_after_record = Vec::new();
+        a7_empty_recording(&mut allocation_after_record);
+        a7_allocate(&mut allocation_after_record);
+        a7_empty_queue(&mut allocation_after_record);
+        assert_eq!(
+            validate_venus_a7_outer_stream(
+                &allocation_after_record,
+                &mut [VenusOperand::default(); 1],
+                &mut [0u32; 8],
+            ),
+            Err(VenusReject::InvalidSequence)
+        );
     }
 
     #[test]

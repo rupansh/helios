@@ -98,7 +98,7 @@ for (crate_name, dll_name, engine_hint) in umds {
     let crate_dir = repo.join(crate_name);
 
     let mut build = Command::new("cargo");
-    build.arg("build").current_dir(&crate_dir);
+    build.arg("build").arg("--locked").current_dir(&crate_dir);
     match cargo_profile.as_str() {
         "dev" => {}
         "release" => { build.arg("--release"); }

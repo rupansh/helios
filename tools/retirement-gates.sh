@@ -145,6 +145,9 @@ run_gate "kmd_logic unit tests" \
 run_gate "WDDM 3.2 slot audit is not stale vs its generator" \
     python3 "$REPO/kmd_render/tools/gen_wddm32_slot_audit.py" --check
 
+run_gate "windows-drivers-rs patch and Cargo lock are target-independent and mutation-closed" \
+    python3 "$REPO/tools/wdk-patch-lock-gate.py" "$REPO" --mutations
+
 # ── K4-CONTRACT.md §8 rows 5 and 6.
 #
 # Both rows say their evidence is "a grep gate in tools/retirement-gates.sh".
@@ -969,6 +972,9 @@ run_gate "K9 one-engine completion frontier is ordered, host-terminal, reset-clo
 
 run_gate "Post-K9 HVM1/Venus executor is bounded, direct-owned, host-terminal, and mutation-checked" \
     python3 "$REPO/tools/post-k9-executor-gate.py" "$REPO" --mutations
+
+run_gate "A7 generated Venus schema is pinned, parse-only, privately patched, and mutation-closed" \
+    python3 "$REPO/tools/venus-executor-schema-gate.py" "$REPO" --mutations
 
 run_gate "Mesa A3 HVM1 renderer is escape-free, role-4-unmapped, exact-import, and mutation-checked" \
     python3 "$REPO/tools/mesa-a3-hvm-gate.py" "$REPO" --mutations

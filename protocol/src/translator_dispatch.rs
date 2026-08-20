@@ -613,6 +613,10 @@ pub enum HeliosTranslatorStatus {
     /// bytes are zero" — a nonzero placeholder is how a raw host resource id
     /// would reach the host at a position the operand table blesses.
     PayloadPlaceholderNonZero = 45,
+    /// The bridge attempted to seal a live scope before any complete record
+    /// was appended. The join contract closes this scope ABANDONED and signals
+    /// the outer HQC1; it must not confuse this legal state with a size bound.
+    ScopeEmpty = 46,
 }
 
 /// An `i32` returned by a foreign implementation that this build does not know.
@@ -691,6 +695,7 @@ impl HeliosTranslatorStatus {
             43 => ContextStillAttached,
             44 => UnknownAllocationToken,
             45 => PayloadPlaceholderNonZero,
+            46 => ScopeEmpty,
             other => return Err(HeliosTranslatorUnknownStatus { code: other }),
         };
         Result::Ok(s)
@@ -699,7 +704,7 @@ impl HeliosTranslatorStatus {
     /// The highest defined discriminant. A C consumer bounds-checks against its
     /// mirror of this before indexing any status-name table.
     pub const MAX: HeliosTranslatorStatusCode =
-        HeliosTranslatorStatus::PayloadPlaceholderNonZero.wire();
+        HeliosTranslatorStatus::ScopeEmpty.wire();
 
     #[inline]
     pub const fn is_ok(self) -> bool {
@@ -3308,7 +3313,7 @@ const _: () = {
     assert!(HELIOS_TRANSLATOR_SCOPE_DISPOSITION_ABANDONED == 2);
     assert!(HELIOS_TRANSLATOR_PROGRESS_FLAGS_MASK == 1);
     assert!(HeliosTranslatorStatus::Ok.wire() == 0);
-    assert!(HeliosTranslatorStatus::MAX == 45);
+    assert!(HeliosTranslatorStatus::MAX == 46);
 };
 
 #[cfg(test)]
@@ -4291,7 +4296,8 @@ mod tests {
         assert_eq!(HeliosTranslatorStatus::ContextStillAttached.wire(), 43);
         assert_eq!(HeliosTranslatorStatus::UnknownAllocationToken.wire(), 44);
         assert_eq!(HeliosTranslatorStatus::PayloadPlaceholderNonZero.wire(), 45);
-        assert_eq!(HeliosTranslatorStatus::MAX, 45);
+        assert_eq!(HeliosTranslatorStatus::ScopeEmpty.wire(), 46);
+        assert_eq!(HeliosTranslatorStatus::MAX, 46);
     }
 
     /// The prohibitions in the module header are kept by *absence*, and absence

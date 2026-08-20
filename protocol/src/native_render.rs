@@ -2846,6 +2846,33 @@ pub mod kernel_dma {
     pub const HELIOS_HNR2_KMD_DMA_FLAG_MASK: u32 =
         HELIOS_HNR2_KMD_DMA_FLAG_HOST_COMPLETED;
 
+    /// `HKD1` — KMD-private descriptor for one D3D11 physical HOB1 Render.
+    /// It never leaves scheduler DMA private data and therefore carries no
+    /// WDDM handle, GPUVA, pointer, host resource id, PID, or fallback key.
+    pub const HELIOS_HOB1_KMD_DMA_MAGIC: u32 = 0x3144_4B48;
+    pub const HELIOS_HOB1_KMD_DMA_ABI_VERSION: u16 = 1;
+    pub const HELIOS_HOB1_KMD_DMA_BYTES: u16 = HELIOS_HVC1_DMA_PRIVATE_DATA_BYTES as u16;
+
+    /// Exact 64-byte Render-to-SubmitCommand custody descriptor for the D3D11
+    /// outer lane. Identity remains the live context plus its executor slot;
+    /// every scalar here is only an anti-stale cross-check.
+    #[repr(C)]
+    #[derive(Debug, Default, Clone, Copy, Pod, Zeroable, PartialEq, Eq)]
+    pub struct Hob1KmdDmaPrivateV1 {
+        pub magic: u32,
+        pub abi_version: u16,
+        pub struct_bytes: u16,
+        pub batch_id: u64,
+        pub session_generation: u64,
+        pub context_generation: u64,
+        pub slot_generation: u64,
+        pub hob1_crc64: u64,
+        pub payload_bytes: u32,
+        pub ring_index: u32,
+        pub slot_index: u32,
+        pub flags: u32,
+    }
+
     /// 64-byte KMD-only DMA private record for one HNR2 submission.
     ///
     /// ⚠ Section 10.7 fixes the size ("A 64-byte pointer-free KMD DMA-private
@@ -3057,6 +3084,23 @@ pub mod kernel_dma {
         assert!(core::mem::offset_of!(Hnr2PhysicalCapability, allocation_offset) == 24);
         assert!(core::mem::offset_of!(Hnr2PhysicalCapability, byte_length) == 32);
         assert!(core::mem::offset_of!(Hnr2PhysicalCapability, hpm_epoch) == 40);
+
+        assert!(core::mem::size_of::<Hob1KmdDmaPrivateV1>() == 64);
+        assert!(
+            core::mem::size_of::<Hob1KmdDmaPrivateV1>()
+                == HELIOS_HVC1_DMA_PRIVATE_DATA_BYTES as usize
+        );
+        assert!(core::mem::align_of::<Hob1KmdDmaPrivateV1>() == 8);
+        assert!(core::mem::offset_of!(Hob1KmdDmaPrivateV1, magic) == 0);
+        assert!(core::mem::offset_of!(Hob1KmdDmaPrivateV1, batch_id) == 8);
+        assert!(core::mem::offset_of!(Hob1KmdDmaPrivateV1, session_generation) == 16);
+        assert!(core::mem::offset_of!(Hob1KmdDmaPrivateV1, context_generation) == 24);
+        assert!(core::mem::offset_of!(Hob1KmdDmaPrivateV1, slot_generation) == 32);
+        assert!(core::mem::offset_of!(Hob1KmdDmaPrivateV1, hob1_crc64) == 40);
+        assert!(core::mem::offset_of!(Hob1KmdDmaPrivateV1, payload_bytes) == 48);
+        assert!(core::mem::offset_of!(Hob1KmdDmaPrivateV1, ring_index) == 52);
+        assert!(core::mem::offset_of!(Hob1KmdDmaPrivateV1, slot_index) == 56);
+        assert!(core::mem::offset_of!(Hob1KmdDmaPrivateV1, flags) == 60);
 
         assert!(
             core::mem::size_of::<Hnr2KmdDmaPrivateV1>()

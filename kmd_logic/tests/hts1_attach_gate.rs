@@ -7,9 +7,7 @@
 //! ⛔ Without that variable this test SKIPS, so the runner checks the case count
 //! it prints — a gate that can pass on an empty corpus is not a gate.
 
-use helios_kmd_logic::translation_session::{
-    SessionPhase, SessionRefusal, TranslationSession,
-};
+use helios_kmd_logic::translation_session::{SessionPhase, SessionRefusal, TranslationSession};
 use helios_protocol::native_render::{Hvm1Role, HELIOS_HVM1_REPLY_POOL_BYTES};
 use helios_protocol::translation_session::{
     HeliosQueueAttachV1, HeliosSessionCapability, HeliosTranslationSessionInitV1,
@@ -253,5 +251,8 @@ fn the_kmd_session_agrees_with_the_guest_on_every_corpus_case() {
         "HTS1 corpus: {} cases replayed, {admitted} admitted, {refused} refused",
         corpus.cases.len()
     );
-    assert!(admitted > 0 && refused > 0, "a one-sided corpus is not a gate");
+    assert!(
+        admitted > 0 && refused > 0,
+        "a one-sided corpus is not a gate"
+    );
 }

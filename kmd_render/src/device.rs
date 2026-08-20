@@ -8,6 +8,7 @@
 //! `dxgk` bindings and may need a binding-alignment pass at first compile.
 
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -20,6 +21,7 @@ use crate::ddi::translation_session::{
     SessionObject as TranslationSessionObject,
 };
 use crate::dxgk::*;
+use crate::irql::PassiveLevel;
 
 /// State for one D3D device opened on the adapter.
 pub struct DeviceContext {
@@ -41,6 +43,27 @@ pub struct DeviceContext {
     /// created, if it is a raw device at all. `None` for every ordinary D3D
     /// device, which is most of them. §10.7:1720-1721 permits exactly one.
     session: crate::sync::SpinLock<Option<core::ptr::NonNull<TranslationSessionObject>>>,
+    /// F21: the one direct HTS1 session used by this ordinary D3D device's
+    /// HQA1 contexts, plus the bounded exact set of device-specific allocation
+    /// objects opened on this device.  This is deliberately device-owned: it
+    /// is neither a process allocation table nor a scalar-identity lookup.
+    outer: crate::sync::SpinLock<DeviceOuterState>,
+}
+
+const MAX_DEVICE_OUTER_OPENS: usize = 4096;
+
+struct DeviceOuterState {
+    session: Option<core::ptr::NonNull<TranslationSessionObject>>,
+    session_generation: u64,
+    context_kind: u32,
+    /// Transient one-shot host-attachment phase. OpenAllocation refuses while
+    /// this is set, so the snapshot being attached cannot gain an unbound tail.
+    binding: bool,
+    /// Sticky after any partial binding failure. Some opens may then retain
+    /// host attachment custody until their ordinary reverse teardown; no later
+    /// context may reinterpret that partial set as complete.
+    failed: bool,
+    opens: crate::sync::FixedVec<usize>,
 }
 
 /// Tag proving a `HANDLE` really is a [`ContextContext`] — must be the FIRST
@@ -159,6 +182,10 @@ enum HeliosContextRole {
         /// rediscovering the session at submit time (§10.4:1255-1258).
         #[allow(dead_code)]
         endpoint: core::ptr::NonNull<SessionEndpointObject>,
+        /// Outer profile of the existing post-K9 executor.  The endpoint above
+        /// remains the sole host context; this object owns only bounded guest
+        /// validation, custody, and ordered-completion state.
+        native: alloc::boxed::Box<NativeContext>,
         /// K6: the HOS1 gate `DxgkDdiSubmitCommandVirtual` validates against.
         /// Present on both arms because the arm itself is one of the things
         /// HOS1 checks — a D3D11-physical context must refuse a HOS1, and it can
@@ -181,6 +208,214 @@ impl DeviceContext {
         // long as this device.
         unsafe { (self.creator_process as *const ProcessContext).as_ref() }
             .map(|process| &process.sessions)
+    }
+
+    /// Publish the exact session carried by the first HQA1 context and bind all
+    /// allocation opens that predate it.  Later opens observe the published
+    /// direct edge and bind themselves before becoming visible in `opens`.
+    fn bind_outer_session(
+        &self,
+        passive: PassiveLevel,
+        session: core::ptr::NonNull<TranslationSessionObject>,
+        session_generation: u64,
+        context_kind: u32,
+    ) -> bool {
+        if session_generation == 0 || context_kind == 0 {
+            return false;
+        }
+
+        {
+            let mut state = self.outer.lock();
+            if state.failed || state.binding {
+                return false;
+            }
+            match state.session {
+                Some(found) => {
+                    return found == session
+                        && state.session_generation == session_generation
+                        && state.context_kind == context_kind;
+                }
+                None => state.binding = true,
+            }
+        }
+        let Some(retained) = hts1::retain_direct_execution_session(session) else {
+            let mut state = self.outer.lock();
+            state.binding = false;
+            state.failed = true;
+            return false;
+        };
+
+        // Acquire every open's small rundown while the device table prevents
+        // CloseAllocation from removing and freeing it.  Host CTX_ATTACH calls
+        // happen only after the device spinlock is released.
+        let count = self.outer.lock().opens.len();
+        let mut guards = Vec::new();
+        if guards.try_reserve_exact(count).is_err() {
+            let mut state = self.outer.lock();
+            state.binding = false;
+            state.failed = true;
+            drop(state);
+            unsafe { hts1::release_execution_session(retained) };
+            return false;
+        }
+        {
+            let state = self.outer.lock();
+            for &open in state.opens.as_slice() {
+                let Some(guard) =
+                    (unsafe { crate::ddi::create_allocation::acquire_outer_bind_guard(open) })
+                else {
+                    drop(state);
+                    let mut state = self.outer.lock();
+                    state.binding = false;
+                    state.failed = true;
+                    drop(state);
+                    unsafe { hts1::release_execution_session(retained) };
+                    return false;
+                };
+                guards.push(guard);
+            }
+        }
+        let attached = guards
+            .iter()
+            .all(|guard| guard.bind(passive, session, session_generation));
+        let published = {
+            let mut state = self.outer.lock();
+            let complete = attached
+                && state.binding
+                && !state.failed
+                && state.session.is_none()
+                && state.opens.len() == count;
+            state.binding = false;
+            if complete {
+                state.session = Some(retained);
+                state.session_generation = session_generation;
+                state.context_kind = context_kind;
+            } else {
+                state.failed = true;
+            }
+            complete
+        };
+        if !published {
+            unsafe { hts1::release_execution_session(retained) };
+        }
+        published
+    }
+
+    pub(crate) fn register_outer_open(&self, open: usize) -> bool {
+        if open == 0 {
+            return false;
+        }
+        let session = {
+            let state = self.outer.lock();
+            if state.failed || state.binding || state.opens.as_slice().contains(&open) {
+                return false;
+            }
+            state
+                .session
+                .map(|session| (session, state.session_generation))
+        };
+        if let Some((session, generation)) = session {
+            let Some(guard) =
+                (unsafe { crate::ddi::create_allocation::acquire_outer_bind_guard(open) })
+            else {
+                return false;
+            };
+            if !guard.bind(unsafe { PassiveLevel::assume() }, session, generation) {
+                return false;
+            }
+        }
+        let mut state = self.outer.lock();
+        if state.failed
+            || state.binding
+            || state.opens.as_slice().contains(&open)
+            || session.is_some_and(|(session, generation)| {
+                state.session != Some(session) || state.session_generation != generation
+            })
+        {
+            return false;
+        }
+        state.opens.push(open)
+    }
+
+    pub(crate) fn unregister_outer_open(&self, open: usize) {
+        let mut state = self.outer.lock();
+        if let Some(index) = state
+            .opens
+            .as_slice()
+            .iter()
+            .position(|value| *value == open)
+        {
+            let _ = state.opens.swap_remove(index);
+        }
+    }
+
+    pub(crate) fn acquire_outer_gpuva_use(
+        &self,
+        session: core::ptr::NonNull<TranslationSessionObject>,
+        gpuva: u64,
+        bytes: u64,
+        expected_generation: Option<u64>,
+        require_hoc1: bool,
+    ) -> Option<crate::ddi::create_allocation::OpenOuterUse> {
+        let state = self.outer.lock();
+        if state.session != Some(session)
+            || state.session_generation == 0
+            || self.creator_process == 0
+        {
+            return None;
+        }
+        let mut found = None;
+        for &open in state.opens.as_slice() {
+            let candidate = unsafe {
+                crate::ddi::create_allocation::acquire_outer_gpuva_use(
+                    open,
+                    session,
+                    self.creator_process,
+                    gpuva,
+                    bytes,
+                    expected_generation,
+                    require_hoc1,
+                )
+            };
+            if let Some(candidate) = candidate {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(candidate);
+            }
+        }
+        found
+    }
+
+    /// Resolve one D3D11 HOB1 allocation-list entry through this device's exact
+    /// bounded open set. A live device-specific handle is insufficient by
+    /// itself: the open must belong to this device and this direct session.
+    pub(crate) fn acquire_outer_physical_use(
+        &self,
+        session: core::ptr::NonNull<TranslationSessionObject>,
+        open: HANDLE,
+        expected_generation: u64,
+        bytes: u64,
+    ) -> Option<crate::ddi::create_allocation::OpenOuterUse> {
+        if open.is_null() || expected_generation == 0 || bytes == 0 {
+            return None;
+        }
+        let state = self.outer.lock();
+        if state.session != Some(session)
+            || state.session_generation == 0
+            || self.creator_process == 0
+            || !state.opens.as_slice().contains(&(open as usize))
+        {
+            return None;
+        }
+        unsafe {
+            crate::ddi::create_allocation::acquire_outer_physical_use(
+                open,
+                session,
+                expected_generation,
+                bytes,
+            )
+        }
     }
 }
 
@@ -323,13 +558,25 @@ impl<'a> ContextHandleRef<'a> {
         }
     }
 
-    /// The HOS1 gate of an HQA1-attached outer context.
-    pub(crate) fn outer_submit(
+    /// Complete direct ownership required by the outer executor.  No value is
+    /// rediscovered at submit: all four references live in this exact context
+    /// and its owning device.
+    pub(crate) fn outer_native(
         &self,
-    ) -> Option<&'a crate::sync::SpinLock<helios_kmd_logic::native_render::OuterSubmitContext>>
-    {
+    ) -> Option<(
+        &'a NativeContext,
+        core::ptr::NonNull<TranslationSessionObject>,
+        &'a DeviceContext,
+        &'a crate::sync::SpinLock<helios_kmd_logic::native_render::OuterSubmitContext>,
+    )> {
+        let device = unsafe { self.context.device.as_ref() }?;
         match &self.context.helios {
-            HeliosContextRole::Attached { outer, .. } => Some(outer),
+            HeliosContextRole::Attached {
+                session,
+                native,
+                outer,
+                ..
+            } => Some((native, *session, device, outer)),
             _ => None,
         }
     }
@@ -391,6 +638,14 @@ impl<'a> DeviceHandleRef<'a> {
     pub fn creator_process(&self) -> usize {
         self.device.creator_process
     }
+
+    pub(crate) fn register_outer_open(&self, open: usize) -> bool {
+        self.device.register_outer_open(open)
+    }
+
+    pub(crate) fn unregister_outer_open(&self, open: usize) {
+        self.device.unregister_outer_open(open);
+    }
 }
 
 /// State for one GPU process object (WDDM 2.0 GPU-VA requirement). We keep no
@@ -425,6 +680,14 @@ pub unsafe extern "C" fn dxgkddi_create_device(
         adapter: miniport_device_context as *mut AdapterContext,
         creator_process: args.hKmdProcess as usize,
         session: crate::sync::SpinLock::new(None),
+        outer: crate::sync::SpinLock::new(DeviceOuterState {
+            session: None,
+            session_generation: 0,
+            context_kind: 0,
+            binding: false,
+            failed: false,
+            opens: crate::sync::FixedVec::with_max(MAX_DEVICE_OUTER_OPENS),
+        }),
     });
     // Hand the device handle back to Dxgkrnl; reclaimed in destroy_device.
     args.hDevice = Box::into_raw(ctx) as *mut c_void;
@@ -456,14 +719,18 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
             // somehow null — leaking it would be the worse failure — and so does
             // any session reference it still holds, which the main path below
             // releases and this arm used to walk past.
-            let stale = (unsafe { (h_device as *const DeviceContext).as_ref() })
-                .and_then(|d| d.session.lock().take());
+            let device = unsafe { (h_device as *const DeviceContext).as_ref() };
+            let stale = device.and_then(|d| d.session.lock().take());
+            let outer = device.and_then(|d| d.outer.lock().session.take());
             if let Some(session) = stale {
                 // SAFETY: the device's own reference. `take()` under the cell's
                 // spinlock is what makes this single-release: whichever of this
                 // and `dxgkddi_destroy_context` runs first gets the pointer and
                 // the other sees `None`.
                 unsafe { hts1::release_device_session(session, None) };
+            }
+            if let Some(session) = outer {
+                unsafe { hts1::release_execution_session(session) };
             }
             // SAFETY: produced by Box::into_raw in create_device.
             drop(unsafe { Box::from_raw(h_device as *mut DeviceContext) });
@@ -477,6 +744,22 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // because the diag dumps between also require it; still ONE mint for
         // this DDI.
         let passive = unsafe { crate::irql::PassiveLevel::assume() };
+        // No allocation open may survive DestroyDevice.  Drop the device-owned
+        // HQA1 session reference only after CloseAllocation removed every exact
+        // open and joined its host custody.
+        let outer_session = {
+            let Some(device) = (unsafe { (h_device as *const DeviceContext).as_ref() }) else {
+                return STATUS_INVALID_HANDLE;
+            };
+            let mut outer = device.outer.lock();
+            if outer.opens.len() != 0 {
+                crate::diag::record_named_bytes(b"OtOpenLeak", outer.opens.len() as u32);
+            }
+            outer.session.take()
+        };
+        if let Some(session) = outer_session {
+            unsafe { hts1::release_execution_session(session) };
+        }
         // Drain THIS device's mappings in batches, unmapping outside the table
         // lock (MmUnmapLockedPages needs PASSIVE; the table lock raises to
         // DISPATCH). One acquisition per entry was O(n) acquisitions and O(n^2)
@@ -636,14 +919,12 @@ pub unsafe extern "C" fn dxgkddi_create_context(
                 helios_protocol::native_render::HELIOS_HVC1_CONTROL_RING_INDEX,
                 0,
                 0,
+                0,
             ) else {
                 return STATUS_NO_MEMORY;
             };
             (
-                HeliosContextRole::Control {
-                    session,
-                    native,
-                },
+                HeliosContextRole::Control { session, native },
                 ContextInfoProfile::Hvc1,
             )
         }
@@ -652,9 +933,7 @@ pub unsafe extern "C" fn dxgkddi_create_context(
             // strong session reference that keeps the fixed array live.
             let ring_index = unsafe { endpoint.as_ref().ring_index() };
             let context_generation = unsafe { endpoint.as_ref().endpoint_id() } as u64;
-            let Some(session_generation) =
-                hts1::execution_session_generation(session)
-            else {
+            let Some(session_generation) = hts1::execution_session_generation(session) else {
                 unsafe { hts1::release_queue_context(session) };
                 return STATUS_INVALID_DEVICE_REQUEST;
             };
@@ -666,6 +945,7 @@ pub unsafe extern "C" fn dxgkddi_create_context(
                 adapter,
                 NativeClass::Queue,
                 ring_index,
+                unsafe { endpoint.as_ref().endpoint_id() },
                 session_generation,
                 context_generation,
             ) else {
@@ -675,10 +955,7 @@ pub unsafe extern "C" fn dxgkddi_create_context(
                 return STATUS_NO_MEMORY;
             };
             (
-                HeliosContextRole::Queue {
-                    session,
-                    native,
-                },
+                HeliosContextRole::Queue { session, native },
                 ContextInfoProfile::Hvc1,
             )
         }
@@ -692,11 +969,37 @@ pub unsafe extern "C" fn dxgkddi_create_context(
             // SAFETY: `classify_context` returned the endpoint together with a
             // strong session reference, so the fixed endpoint array is live.
             let endpoint_id = unsafe { endpoint.as_ref().endpoint_id() };
+            let ring_index = unsafe { endpoint.as_ref().ring_index() };
+            let Some(adapter) = core::ptr::NonNull::new(device.adapter) else {
+                unsafe { hts1::release_attached_context(session, context_generation) };
+                return STATUS_INVALID_DEVICE_REQUEST;
+            };
+            if !device.bind_outer_session(
+                unsafe { PassiveLevel::assume() },
+                session,
+                session_generation,
+                kind.wire(),
+            ) {
+                unsafe { hts1::release_attached_context(session, context_generation) };
+                return STATUS_INVALID_DEVICE_REQUEST;
+            }
+            let Some(native) = NativeContext::new(
+                adapter,
+                NativeClass::Outer,
+                ring_index,
+                endpoint_id,
+                session_generation,
+                context_generation,
+            ) else {
+                unsafe { hts1::release_attached_context(session, context_generation) };
+                return STATUS_NO_MEMORY;
+            };
             (
                 HeliosContextRole::Attached {
                     session,
                     context_generation,
                     endpoint,
+                    native,
                     outer: crate::sync::SpinLock::new(
                         helios_kmd_logic::native_render::OuterSubmitContext::new(
                             helios_protocol::HELIOS_PACKAGE_GENERATION,
@@ -846,8 +1149,11 @@ pub unsafe extern "C" fn dxgkddi_destroy_context(h_context: *mut c_void) -> NTST
             HeliosContextRole::Attached {
                 session,
                 context_generation,
+                native,
                 ..
             } => {
+                native.close(passive);
+                drop(native);
                 // SAFETY: the reference this context took at HQA1 attach.
                 unsafe { hts1::release_attached_context(session, context_generation) };
             }

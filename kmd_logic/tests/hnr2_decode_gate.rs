@@ -256,7 +256,9 @@ fn the_kmd_assembler_admits_every_batch_the_icd_encoder_emits() {
             for i in 0..header.use_record_count as usize {
                 let at =
                     layout.use_record_offset as usize + i * HELIOS_HNR2_USE_RECORD_SIZE as usize;
-                uses.push(decode_use(&command[at..at + HELIOS_HNR2_USE_RECORD_SIZE as usize]));
+                uses.push(decode_use(
+                    &command[at..at + HELIOS_HNR2_USE_RECORD_SIZE as usize],
+                ));
             }
             let mut patches = Vec::with_capacity(header.patch_record_count as usize);
             for i in 0..header.patch_record_count as usize {
@@ -321,7 +323,10 @@ fn the_kmd_assembler_admits_every_batch_the_icd_encoder_emits() {
                     index, uses[i as usize].allocation_list_index,
                     "{ctx_name}: plan entry {i} names its use record's allocation"
                 );
-                assert_eq!(ordinal, i, "{ctx_name}: capability ordinal is the slot index");
+                assert_eq!(
+                    ordinal, i,
+                    "{ctx_name}: capability ordinal is the slot index"
+                );
             }
             patch_slots += plan.count;
 
@@ -414,8 +419,16 @@ fn the_kmd_assembler_admits_every_batch_the_icd_encoder_emits() {
             interleaved += 1;
         }
     }
-    assert_eq!(ctx_a.open_batch(), None, "interleave: context A left a batch open");
-    assert_eq!(ctx_b.open_batch(), None, "interleave: context B left a batch open");
+    assert_eq!(
+        ctx_a.open_batch(),
+        None,
+        "interleave: context A left a batch open"
+    );
+    assert_eq!(
+        ctx_b.open_batch(),
+        None,
+        "interleave: context B left a batch open"
+    );
     assert_eq!(
         ctx_a.last_batch_token(),
         multi_fragment[0].0,

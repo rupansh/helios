@@ -43,7 +43,7 @@ Push-Location "$mirror\kmd_render"
 $env:CARGO_TARGET_DIR = "$mirror\kmd_render\target"
 $env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
 
-$cargoArgs = @($Mode, '--message-format', 'short')
+$cargoArgs = @($Mode, '--locked', '--message-format', 'short')
 
 $log = "Z:\tmp\kmd-$Mode.log"
 & cargo @cargoArgs 2>&1 | Tee-Object -FilePath $log | Out-Null

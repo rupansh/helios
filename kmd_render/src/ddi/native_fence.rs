@@ -146,7 +146,8 @@ fn fence_gpuva_is_supported(address: u64) -> bool {
 /// unsupported scheduler capability.
 const _: () = assert!(
     VIDSCHCAPS_NATIVE_GPU_FENCE
-        & (VIDSCHCAPS_NO_64BIT_ATOMICS | VIDSCHCAPS_OPTIMIZED_NATIVE_FENCE_INTERRUPT) == 0,
+        & (VIDSCHCAPS_NO_64BIT_ATOMICS | VIDSCHCAPS_OPTIMIZED_NATIVE_FENCE_INTERRUPT)
+        == 0,
     "section 10.2 requires No64BitAtomics=0, and this generation advertises no HWQueue \
      native-fence log, so OptimizedNativeFenceSignaledInterrupt must stay 0"
 );
@@ -368,14 +369,19 @@ pub(crate) fn publish_adapter_luid(adapter: &AdapterContext, luid: LUID) {
     state.lifecycle.store(LIFECYCLE_STOPPED, Ordering::Release);
     let generation = feature_generation(state.feature.load(Ordering::Acquire));
     let Some(next) = nf::next_epoch(generation, MAX_ADAPTER_GENERATION) else {
-        state.feature.store(feature_word(generation, FEATURE_POISONED), Ordering::Release);
+        state.feature.store(
+            feature_word(generation, FEATURE_POISONED),
+            Ordering::Release,
+        );
         state.lifecycle.store(LIFECYCLE_POISONED, Ordering::Release);
         NF_EPOCH_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
         return;
     };
     let exact = ((luid.HighPart as i64) << 32) | luid.LowPart as i64;
     state.luid.store(exact, Ordering::Release);
-    state.feature.store(feature_word(next, FEATURE_UNKNOWN), Ordering::Release);
+    state
+        .feature
+        .store(feature_word(next, FEATURE_UNKNOWN), Ordering::Release);
     state.lifecycle.store(LIFECYCLE_ACTIVE, Ordering::Release);
 }
 
@@ -403,6 +409,30 @@ fn admitted_identity(state: &NativeFenceAdapterState) -> Option<AdapterIdentity>
         return None;
     }
     Some(identity)
+}
+
+/// Return the exact StartDevice identity for the current adapter lifetime.
+///
+/// Unlike [`admitted_identity`], this does not require native-fence feature
+/// admission.  The UMD-private bootstrap query runs before either UMD creates
+/// its direct translator, and its identity is an adapter-lifecycle fact rather
+/// than a native-fence capability.  The before/after snapshot makes a
+/// concurrent stop or new StartDevice fail closed.
+pub(crate) fn lifecycle_identity(adapter: &AdapterContext) -> Option<(u64, i64)> {
+    let state = adapter.native_fence.as_ref();
+    if !state.lifecycle_active() {
+        return None;
+    }
+    let before = state.feature.load(Ordering::Acquire);
+    let generation = feature_generation(before);
+    let luid = state.luid.load(Ordering::Acquire);
+    if generation == 0 || luid == 0 {
+        return None;
+    }
+    if state.feature.load(Ordering::Acquire) != before || !state.lifecycle_active() {
+        return None;
+    }
+    Some((generation, luid))
 }
 
 /// Invalidate every native-fence object on this adapter.
@@ -498,7 +528,11 @@ pub(crate) unsafe fn ensure_feature_admitted(adapter: &AdapterContext) -> bool {
         return false;
     }
     let enabled = unsafe { query_feature_support(adapter) };
-    let final_state = if enabled { FEATURE_ENABLED } else { FEATURE_DECLINED };
+    let final_state = if enabled {
+        FEATURE_ENABLED
+    } else {
+        FEATURE_DECLINED
+    };
     let published = state
         .feature
         .compare_exchange(
@@ -1098,10 +1132,7 @@ pub unsafe extern "C" fn dxgkddi_close_native_fence(
         note_bad_handle();
         return STATUS_INVALID_HANDLE;
     };
-    if !core::ptr::eq(
-        global_ref.authority.as_ref(),
-        adapter.native_fence.as_ref(),
-    ) {
+    if !core::ptr::eq(global_ref.authority.as_ref(), adapter.native_fence.as_ref()) {
         NF_TEARDOWN_REJ.fetch_add(1, Ordering::Relaxed);
         NF_FOREIGN_ADAPTER.fetch_add(1, Ordering::Relaxed);
         return STATUS_INVALID_HANDLE;
@@ -1442,10 +1473,7 @@ unsafe fn update_values(
             let active = u32::from(value != u64::MAX);
             let was_active = global.monitored_active.swap(active, Ordering::AcqRel);
             if was_active == 0 && active != 0 {
-                let _ = admit(
-                    &global.authority.active_monitored,
-                    nf::MAX_LIVE_GLOBAL,
-                );
+                let _ = admit(&global.authority.active_monitored, nf::MAX_LIVE_GLOBAL);
             } else if was_active != 0 && active == 0 {
                 let _ = retire(&global.authority.active_monitored);
             }
@@ -1491,8 +1519,7 @@ pub(crate) unsafe fn fill_native_fence_caps(
     adapter: &AdapterContext,
     args: &DXGKARG_QUERYADAPTERINFO,
 ) -> NTSTATUS {
-    if args.pOutputData.is_null()
-        || !(args.pOutputData as *mut DXGK_NATIVE_FENCE_CAPS).is_aligned()
+    if args.pOutputData.is_null() || !(args.pOutputData as *mut DXGK_NATIVE_FENCE_CAPS).is_aligned()
     {
         NF_CAPS_REJ.fetch_add(1, Ordering::Relaxed);
         NF_BUFFER_REJ.fetch_add(1, Ordering::Relaxed);
@@ -1566,9 +1593,7 @@ pub(crate) unsafe fn signal_native_fence_signaled(
     arm.pSignaledNativeFenceArray = core::ptr::null_mut();
     arm.hHWQueue = core::ptr::null_mut();
 
-    let status = unsafe {
-        super::submit_command::notify_at_dirql(dxgkrnl, &mut interrupt, false)
-    };
+    let status = unsafe { super::submit_command::notify_at_dirql(dxgkrnl, &mut interrupt, false) };
     if status != STATUS_SUCCESS {
         NF_INT_FAILED.fetch_add(1, Ordering::Relaxed);
         return status;
