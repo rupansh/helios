@@ -97,10 +97,12 @@ run_gate "protocol Rust<->C ABI parity (sizes, aligns, offsets, constant values)
 run_gate "protocol C mirrors compile (all _Static_asserts evaluated)" \
     bash -c 'printf "%s\n" \
         "#include \"helios_diagnostics.h\"" \
+        "#include \"helios_native_fence.h\"" \
         "#include \"helios_native_render.h\"" \
         "#include \"helios_resource_association.h\"" \
         "#include \"helios_translation_session.h\"" \
         "#include \"helios_translator_dispatch.h\"" \
+        "#include \"helios_umd_adapter_info.h\"" \
         "#include \"helios_wddm.h\"" \
         "int main(void){return 0;}" \
       | gcc -I '"$REPO"'/protocol/include -fsyntax-only -x c - && echo "all mirrors compile"'

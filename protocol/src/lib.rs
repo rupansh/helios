@@ -86,11 +86,13 @@ pub mod diagnostics;
 pub mod escape;
 pub mod features;
 pub mod ioctl;
+pub mod native_fence;
 pub mod native_render;
 pub mod physical_memory;
 pub mod resource_association;
 pub mod translation_session;
 pub mod translator_dispatch;
+pub mod umd_adapter_info;
 pub mod virtio_gpu;
 pub mod wddm;
 pub mod wddm_legacy;
@@ -99,11 +101,13 @@ pub use diagnostics::*;
 pub use escape::*;
 pub use features::*;
 pub use ioctl::*;
+pub use native_fence::*;
 pub use native_render::*;
 pub use physical_memory::*;
 pub use resource_association::*;
 pub use translation_session::*;
 pub use translator_dispatch::*;
+pub use umd_adapter_info::*;
 pub use virtio_gpu::*;
 pub use wddm::*;
 pub use wddm_legacy::*;
@@ -156,7 +160,8 @@ pub const HELIOS_PACKAGE_GENERATION_TAG: u32 = 0x4845_4C49;
 ///
 /// `1` was the first HPS2-retirement generation. `2` changed the role-1 reply
 /// pool to four 1-MiB slots. `3` adds the immutable, process-local allocation
-/// association used by the direct translator creation graph. These are the
+/// association used by the direct translator creation graph and the fixed
+/// UMD-private adapter bootstrap record. These are the generations in which
 /// `helios_present_sync_v2.bin` is neither published nor read, HWA2/HOB1/HOS1/
 /// HOC1/HQA1/HTS1/HVC1/HNR2/HVM1/HVR1 are the complete guest ABI, and the
 /// `escape`/`ioctl` verbs are retired. Bump it for **any** change to any record
