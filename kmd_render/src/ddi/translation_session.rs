@@ -1206,7 +1206,8 @@ pub(crate) fn mint_execution_snapshot_generation(session: NonNull<SessionObject>
 pub(crate) fn execute_generated_control(
     session: NonNull<SessionObject>,
     facts: crate::ddi::create_allocation::K11ReplyPoolFacts,
-    payload: &[u8],
+    payload: &mut [u8],
+    resource_operand_offset: u32,
     reply_offset: u64,
     reply_capacity: u64,
     raw_reply_bytes: u64,
@@ -1233,6 +1234,7 @@ pub(crate) fn execute_generated_control(
         obj.owner,
         facts,
         payload,
+        resource_operand_offset,
         raw_offset,
         raw_reply_bytes,
         expected_opcode,
@@ -1259,6 +1261,52 @@ pub(crate) fn execute_generated_control(
         reply_capacity,
         &hvr1,
         raw_reply_bytes,
+    )
+}
+
+pub(crate) fn prepare_generated_reply(
+    session: NonNull<SessionObject>,
+    facts: crate::ddi::create_allocation::K11ReplyPoolFacts,
+    payload: &mut [u8],
+    resource_operand_offset: u32,
+    raw_reply_offset: u64,
+    raw_reply_bytes: u64,
+) -> Result<(), NTSTATUS> {
+    let obj = unsafe { session.as_ref() };
+    if obj.model.lock().phase() != model::SessionPhase::Live {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let adapter = unsafe { obj.adapter.as_ref() }.ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    obj.transport.prepare_generated_reply(
+        adapter,
+        obj.owner,
+        facts,
+        payload,
+        resource_operand_offset,
+        raw_reply_offset,
+        raw_reply_bytes,
+    )
+}
+
+pub(crate) fn complete_generated_reply(
+    session: NonNull<SessionObject>,
+    facts: crate::ddi::create_allocation::K11ReplyPoolFacts,
+    raw_reply_offset: u64,
+    raw_reply_bytes: u64,
+    expected_opcode: u32,
+) -> Result<(), NTSTATUS> {
+    let obj = unsafe { session.as_ref() };
+    if obj.model.lock().phase() != model::SessionPhase::Live {
+        return Err(STATUS_INVALID_DEVICE_REQUEST);
+    }
+    let adapter = unsafe { obj.adapter.as_ref() }.ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+    obj.transport.complete_generated_reply(
+        adapter,
+        obj.owner,
+        facts,
+        raw_reply_offset,
+        raw_reply_bytes,
+        expected_opcode,
     )
 }
 

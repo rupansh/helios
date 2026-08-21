@@ -96,6 +96,40 @@ pub struct OuterDevice {
     pub device_lost: AtomicU32,
 }
 
+/// Complete the WDDM half of device admission after DXVK's `vkCreateDevice`
+/// has created the exact A5 queues and before its D3D11 COM constructor can use
+/// them. The boxed `OuterDevice` is the sole identity in both directions.
+pub(crate) extern "C" fn dxvk_outer_device_admit(context: *mut c_void) -> i32 {
+    use crate::hr::{E_FAIL, S_OK};
+
+    let Some(outer) = (unsafe { context.cast::<OuterDevice>().as_mut() }) else {
+        return E_FAIL;
+    };
+    if outer.context.is_some() || outer.paging_queue.is_some() {
+        log_error!("CreateDevice: repeated outer device admission refused");
+        return E_FAIL;
+    }
+
+    let context_hr = unsafe { create_runtime_context(outer) };
+    if context_hr != S_OK {
+        log_error!(
+            "CreateDevice: HQA1/HQC1 context creation failed hr=0x{:08x}",
+            context_hr as u32
+        );
+        return context_hr;
+    }
+    let paging_hr = unsafe { create_runtime_paging_queue(outer) };
+    if paging_hr != S_OK {
+        log_error!(
+            "CreateDevice: paging queue creation failed hr=0x{:08x}",
+            paging_hr as u32
+        );
+        unsafe { destroy_outer_runtime_context(outer) };
+        return paging_hr;
+    }
+    S_OK
+}
+
 const VK_SUCCESS: i32 = 0;
 const VK_ERROR_DEVICE_LOST: i32 = -4;
 

@@ -705,6 +705,39 @@ pub mod session_transport {
         stream
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ReplyOperandRefusal {
+        ResourceIdZero,
+        OffsetOutsidePayload,
+        OperandNotPlaceholder,
+    }
+
+    /// Patch only the generated SetReply resource operand in the KMD-owned
+    /// payload copy. The renderer-private id must never be substituted by the
+    /// user-visible K2a reply-pool id: K2a receives only the validated final
+    /// reply after the context-local private target reaches its host terminal.
+    pub fn patch_private_reply_resource(
+        payload: &mut [u8],
+        operand_offset: u32,
+        private_resource_id: u32,
+    ) -> Result<(), ReplyOperandRefusal> {
+        if private_resource_id == 0 {
+            return Err(ReplyOperandRefusal::ResourceIdZero);
+        }
+        let start = operand_offset as usize;
+        let end = start
+            .checked_add(core::mem::size_of::<u32>())
+            .ok_or(ReplyOperandRefusal::OffsetOutsidePayload)?;
+        let dst = payload
+            .get_mut(start..end)
+            .ok_or(ReplyOperandRefusal::OffsetOutsidePayload)?;
+        if dst != 0u32.to_le_bytes() {
+            return Err(ReplyOperandRefusal::OperandNotPlaceholder);
+        }
+        dst.copy_from_slice(&private_resource_id.to_le_bytes());
+        Ok(())
+    }
+
     /// Encode K11's one allowlisted reply-generating host operation.  Reply
     /// target setup is intentionally not repeated or combined with this stream.
     pub fn encode_create_instance(instance_handle: u64) -> Writer {
@@ -863,6 +896,27 @@ pub mod session_transport {
             assert_eq!(bytes.len(), 88);
             assert_eq!(&bytes[0..8], &[0, 0, 0, 0, 1, 0, 0, 0]);
             assert_eq!(&bytes[80..88], &0x8877_6655_4433_2211u64.to_le_bytes());
+        }
+
+        #[test]
+        fn generated_reply_uses_only_the_private_context_resource() {
+            let mut payload = [0xAA; 24];
+            payload[12..16].fill(0);
+            patch_private_reply_resource(&mut payload, 12, 0x1122_3344).expect("private patch");
+            assert_eq!(&payload[12..16], &0x1122_3344u32.to_le_bytes());
+
+            assert_eq!(
+                patch_private_reply_resource(&mut payload, 12, 0x5566_7788),
+                Err(ReplyOperandRefusal::OperandNotPlaceholder)
+            );
+            assert_eq!(
+                patch_private_reply_resource(&mut payload, 24, 1),
+                Err(ReplyOperandRefusal::OffsetOutsidePayload)
+            );
+            assert_eq!(
+                patch_private_reply_resource(&mut [0; 4], 0, 0),
+                Err(ReplyOperandRefusal::ResourceIdZero)
+            );
         }
 
         #[test]

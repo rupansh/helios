@@ -46331,7 +46331,7 @@ fn parse_command_vk_enumerate_device_extension_properties(
     c.skip(8)?;
     let count_p_layer_name_0 = c.array_count()?;
     let bytes = c.take_padded(count_p_layer_name_0)?;
-    if count_p_layer_name_0 == 0 || bytes[count_p_layer_name_0 as usize - 1] != 0 {
+    if count_p_layer_name_0 != 0 && bytes[count_p_layer_name_0 as usize - 1] != 0 {
         return Err(VenusReject::BadArrayCount);
     }
     let present_p_property_count = c.pointer()?;

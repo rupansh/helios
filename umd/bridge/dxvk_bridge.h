@@ -130,6 +130,7 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     std::uint32_t luid_low,
     std::int32_t  luid_high,
     std::size_t   outer_context,
+    std::size_t   outer_admit,
     std::size_t   outer_begin,
     std::size_t   outer_finish,
     std::size_t   outer_join,

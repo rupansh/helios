@@ -779,10 +779,24 @@ impl ExecutionReply {
 
     fn finish(mut self, host_ok: bool) -> bool {
         let mut published = false;
-        if host_ok
+        let session_current = host_ok
             && crate::ddi::translation_session::execution_session_generation(self.session)
-                == Some(self.session_generation)
-        {
+                == Some(self.session_generation);
+        let raw_reply_offset = self
+            .reply_offset
+            .checked_add(HELIOS_HVR1_HEADER_SIZE as u64);
+        let private_reply_copied = session_current
+            && raw_reply_offset.is_some_and(|offset| {
+                crate::ddi::translation_session::complete_generated_reply(
+                    self.session,
+                    self.facts,
+                    offset,
+                    Self::RAW_ALLOCATE_REPLY_BYTES,
+                    helios_kmd_logic::venus_executor::OP_ALLOCATE_MEMORY,
+                )
+                .is_ok()
+            });
+        if private_reply_copied {
             let payload = unsafe {
                 self.facts
                     .kernel_va
@@ -2757,6 +2771,7 @@ fn prepare_executor_commit(
     };
 
     let mut reply = None;
+    let mut private_reply_patch = None;
     match admission.class {
         helios_kmd_logic::venus_executor::VenusCommandClass::AllocateMemory => {
             if !accept.has_reply
@@ -2850,6 +2865,12 @@ fn prepare_executor_commit(
                         as usize,
                 )
             };
+            private_reply_patch = Some((
+                facts,
+                set_reply_patch.payload_offset,
+                admission.reply_offset,
+                admission.reply_size,
+            ));
             reply = Some(ExecutionReply {
                 session,
                 facts,
@@ -2894,7 +2915,22 @@ fn prepare_executor_commit(
     let Some(building) = building.as_mut() else {
         return Err(STATUS_INVALID_DEVICE_REQUEST);
     };
+    if let Some((facts, operand_offset, raw_reply_offset, raw_reply_bytes)) = private_reply_patch {
+        crate::ddi::translation_session::prepare_generated_reply(
+            session,
+            facts,
+            building.payload.as_mut_slice(),
+            operand_offset,
+            raw_reply_offset,
+            raw_reply_bytes,
+        )?;
+    }
     for patch in patches {
+        if private_reply_patch
+            .is_some_and(|(_, operand_offset, _, _)| operand_offset == patch.payload_offset)
+        {
+            continue;
+        }
         let Some(guard) = guard_for_patch(*patch) else {
             return Err(STATUS_INVALID_PARAMETER);
         };
@@ -4056,14 +4092,6 @@ fn run_control_payload(
     {
         return ControlPayloadOutcome::Refused;
     }
-    let start = patch.payload_offset as usize;
-    let Some(end) = start.checked_add(size_of::<u32>()) else {
-        return ControlPayloadOutcome::Refused;
-    };
-    let Some(dst) = payload.get_mut(start..end) else {
-        return ControlPayloadOutcome::Refused;
-    };
-    dst.copy_from_slice(&guard.resource_id.to_le_bytes());
     let facts = crate::ddi::create_allocation::K11ReplyPoolFacts {
         allocation_generation: guard.allocation_generation,
         resource_id: guard.resource_id,
@@ -4075,6 +4103,7 @@ fn run_control_payload(
         session,
         facts,
         payload,
+        patch.payload_offset,
         header.reply_offset,
         header.reply_capacity_bytes,
         generated.reply_size,

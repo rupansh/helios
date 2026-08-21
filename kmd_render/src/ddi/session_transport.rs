@@ -11,7 +11,7 @@ use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use helios_protocol::native_render::HELIOS_HVR1_HEADER_SIZE;
+use helios_protocol::native_render::{HELIOS_HVM1_REPLY_POOL_BYTES, HELIOS_HVR1_HEADER_SIZE};
 use helios_protocol::{
     VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED, VIRTIO_GPU_MAP_CACHE_WC,
 };
@@ -32,7 +32,10 @@ use helios_kmd_logic::session_transport as pure;
 const VENUS_CAPSET_ID: u32 = 4;
 const SESSION_INSTANCE_HANDLE: u64 = 1;
 const HOST_REPLY_POISON: u32 = u32::MAX;
-const SESSION_REPLY_BYTES: u64 = 4096;
+// Mirror the four public HVR1 slot offsets in one renderer-private resource.
+// Host reply bytes never target the K2a allocation itself; after a real host
+// terminal the KMD copies only the validated finite range into that slot.
+const SESSION_REPLY_BYTES: u64 = HELIOS_HVM1_REPLY_POOL_BYTES;
 const SESSION_REPLY_OFFSET: u64 = 0;
 // Reused only across distinct Venus contexts.  Within one session/context,
 // 1/2 name the two finite initialization submits, 3 is the fixed label for a
@@ -278,14 +281,36 @@ impl SessionReplyMap {
         Some(Self { va })
     }
 
-    fn prepare_create_reply(&self) {
-        for offset in 0..SESSION_REPLY_BYTES as usize {
-            unsafe { core::ptr::write_volatile(self.va.as_ptr().add(offset), 0) };
+    fn checked_range(offset: u64, bytes: u64) -> Option<core::ops::Range<usize>> {
+        if bytes < core::mem::size_of::<u32>() as u64 {
+            return None;
         }
-        unsafe {
-            core::ptr::write_volatile(self.va.as_ptr().cast::<u32>(), HOST_REPLY_POISON.to_le())
+        let end = offset.checked_add(bytes)?;
+        if end > SESSION_REPLY_BYTES {
+            return None;
+        }
+        Some(usize::try_from(offset).ok()?..usize::try_from(end).ok()?)
+    }
+
+    fn prepare_reply(&self, offset: u64, bytes: u64) -> bool {
+        let Some(range) = Self::checked_range(offset, bytes) else {
+            return false;
         };
+        for index in range.clone() {
+            unsafe { core::ptr::write_volatile(self.va.as_ptr().add(index), 0) };
+        }
+        let poison = HOST_REPLY_POISON.to_le_bytes();
+        for (index, byte) in poison.iter().copied().enumerate() {
+            unsafe { core::ptr::write_volatile(self.va.as_ptr().add(range.start + index), byte) };
+        }
         core::sync::atomic::fence(Ordering::SeqCst);
+        true
+    }
+
+    fn prepare_create_reply(&self) {
+        let prepared =
+            self.prepare_reply(SESSION_REPLY_OFFSET, pure::HOST_CREATE_INSTANCE_REPLY_BYTES);
+        debug_assert!(prepared);
     }
 
     fn read_create_reply(&self) -> [u8; pure::HOST_CREATE_INSTANCE_REPLY_BYTES as usize] {
@@ -295,6 +320,35 @@ impl SessionReplyMap {
             *byte = unsafe { core::ptr::read_volatile(self.va.as_ptr().add(offset)) };
         }
         reply
+    }
+
+    /// Copy one real host-written range from the context-local private pool to
+    /// its exact public K2a slot. The caller proves the destination range from
+    /// the retained canonical allocation; volatile reads preserve the mapped
+    /// resource semantics after the host terminal.
+    unsafe fn copy_reply_to(
+        &self,
+        offset: u64,
+        bytes: u64,
+        expected_opcode: u32,
+        destination: NonNull<u8>,
+    ) -> bool {
+        let Some(range) = Self::checked_range(offset, bytes) else {
+            return false;
+        };
+        core::sync::atomic::fence(Ordering::Acquire);
+        let mut opcode = [0u8; core::mem::size_of::<u32>()];
+        for (index, byte) in opcode.iter_mut().enumerate() {
+            *byte = unsafe { core::ptr::read_volatile(self.va.as_ptr().add(range.start + index)) };
+        }
+        if u32::from_le_bytes(opcode) != expected_opcode {
+            return false;
+        }
+        for (destination_offset, source_offset) in range.enumerate() {
+            let byte = unsafe { core::ptr::read_volatile(self.va.as_ptr().add(source_offset)) };
+            unsafe { core::ptr::write(destination.as_ptr().add(destination_offset), byte) };
+        }
+        true
     }
 }
 
@@ -658,30 +712,32 @@ impl SessionTransport {
         Some(operation())
     }
 
-    /// Execute one generated HVC1 payload on the already-owned stock Venus
-    /// context.  The caller's open-allocation guard has attached `facts` to
-    /// this exact namespace and remains live across this synchronous terminal.
-    pub(crate) fn execute_generated_control(
+    /// Prepare one asynchronous generated reply in the exact private resource
+    /// created with this session context. The caller's retained session and
+    /// allocation custody spans the later host terminal; this short operation
+    /// only patches the KMD-owned payload and poisons its unique slot range.
+    pub(crate) fn prepare_generated_reply(
         &self,
-        passive: PassiveLevel,
         adapter: &AdapterContext,
         owner: DeviceOwner,
         facts: K11ReplyPoolFacts,
-        payload: &[u8],
+        payload: &mut [u8],
+        resource_operand_offset: u32,
         raw_reply_offset: u64,
         raw_reply_bytes: u64,
-        expected_opcode: u32,
     ) -> Result<(), NTSTATUS> {
-        let _operation = self.acquire().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
-        let host = match &*self.state.lock() {
-            HostState::Live(host) => host.identity(),
+        let operation = self
+            .acquire_execution(adapter, owner)
+            .ok_or(STATUS_DEVICE_NOT_READY)?;
+        let (host, reply_map) = match &*self.state.lock() {
+            HostState::Live(host) => (host.identity(), NonNull::from(&host.reply_map)),
             _ => return Err(STATUS_DEVICE_NOT_READY),
         };
-        if Self::current_transport(adapter) != Some(host.transport_instance)
+        if operation.context_id != host.context_id
+            || operation.transport_instance != host.transport_instance
             || facts.transport_instance != host.transport_instance
             || facts.resource_id != host.k2a_resource_id
             || facts.resource_id == 0
-            || raw_reply_bytes < core::mem::size_of::<u32>() as u64
         {
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
@@ -691,6 +747,121 @@ impl SessionTransport {
         if end > facts.byte_size {
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
+        // SAFETY: `operation` owns session rundown, so teardown cannot move or
+        // unmap the LiveHost reply map before this method returns.
+        let reply_map = unsafe { reply_map.as_ref() };
+        if !reply_map.prepare_reply(raw_reply_offset, raw_reply_bytes) {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        pure::patch_private_reply_resource(payload, resource_operand_offset, host.reply_resource_id)
+            .map_err(|_| STATUS_INVALID_DEVICE_REQUEST)
+    }
+
+    /// Copy a terminal asynchronous reply into its canonical K2a/HVR1 slot.
+    /// The renderer-private id and mapping stay inside K11; callers retain only
+    /// their direct SessionObject and canonical allocation facts.
+    pub(crate) fn complete_generated_reply(
+        &self,
+        adapter: &AdapterContext,
+        owner: DeviceOwner,
+        facts: K11ReplyPoolFacts,
+        raw_reply_offset: u64,
+        raw_reply_bytes: u64,
+        expected_opcode: u32,
+    ) -> Result<(), NTSTATUS> {
+        let _operation = self.acquire().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        let (host, reply_map) = match &*self.state.lock() {
+            HostState::Live(host) => (host.identity(), NonNull::from(&host.reply_map)),
+            _ => return Err(STATUS_DEVICE_NOT_READY),
+        };
+        if Self::current_transport(adapter) != Some(host.transport_instance)
+            || facts.transport_instance != host.transport_instance
+            || facts.resource_id != host.k2a_resource_id
+            || facts.resource_id == 0
+        {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let _pair = crate::virtio::ctrl::borrow_venus_session_pair(
+            adapter,
+            owner,
+            host.context_id,
+            host.reply_resource_id,
+        )
+        .map_err(|_| STATUS_DEVICE_NOT_READY)?;
+        let end = raw_reply_offset
+            .checked_add(raw_reply_bytes)
+            .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        if end > facts.byte_size {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let destination_offset =
+            usize::try_from(raw_reply_offset).map_err(|_| STATUS_INVALID_DEVICE_REQUEST)?;
+        let destination = NonNull::new(unsafe { facts.kernel_va.as_ptr().add(destination_offset) })
+            .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        // SAFETY: rundown and `_pair` retain the private map; the caller's
+        // OpenExecutionUse retains the K2a allocation and the range was checked
+        // above against its canonical byte size.
+        if !unsafe {
+            reply_map.as_ref().copy_reply_to(
+                raw_reply_offset,
+                raw_reply_bytes,
+                expected_opcode,
+                destination,
+            )
+        } {
+            K11_HOST_REPLY_REJECT.fetch_add(1, Ordering::Relaxed);
+            return Err(STATUS_DEVICE_NOT_READY);
+        }
+        Ok(())
+    }
+
+    /// Execute one generated HVC1 payload on the already-owned stock Venus
+    /// context. The host writes its context-local private target; only after
+    /// the synchronous terminal does K11 copy validated bytes into K2a.
+    pub(crate) fn execute_generated_control(
+        &self,
+        passive: PassiveLevel,
+        adapter: &AdapterContext,
+        owner: DeviceOwner,
+        facts: K11ReplyPoolFacts,
+        payload: &mut [u8],
+        resource_operand_offset: u32,
+        raw_reply_offset: u64,
+        raw_reply_bytes: u64,
+        expected_opcode: u32,
+    ) -> Result<(), NTSTATUS> {
+        let operation = self
+            .acquire_execution(adapter, owner)
+            .ok_or(STATUS_DEVICE_NOT_READY)?;
+        let (host, reply_map) = match &*self.state.lock() {
+            HostState::Live(host) => (host.identity(), NonNull::from(&host.reply_map)),
+            _ => return Err(STATUS_DEVICE_NOT_READY),
+        };
+        if operation.context_id != host.context_id
+            || operation.transport_instance != host.transport_instance
+            || facts.transport_instance != host.transport_instance
+            || facts.resource_id != host.k2a_resource_id
+            || facts.resource_id == 0
+        {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        let end = raw_reply_offset
+            .checked_add(raw_reply_bytes)
+            .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        if end > facts.byte_size {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        // SAFETY: `operation` owns rundown through the terminal and copy.
+        let reply_map = unsafe { reply_map.as_ref() };
+        if !reply_map.prepare_reply(raw_reply_offset, raw_reply_bytes) {
+            return Err(STATUS_INVALID_DEVICE_REQUEST);
+        }
+        pure::patch_private_reply_resource(
+            payload,
+            resource_operand_offset,
+            host.reply_resource_id,
+        )
+        .map_err(|_| STATUS_INVALID_DEVICE_REQUEST)?;
         let pair = crate::virtio::ctrl::borrow_venus_session_pair(
             adapter,
             owner,
@@ -698,12 +869,6 @@ impl SessionTransport {
             host.reply_resource_id,
         )
         .map_err(|_| STATUS_DEVICE_NOT_READY)?;
-        let dst = unsafe { facts.kernel_va.as_ptr().add(raw_reply_offset as usize) };
-        unsafe {
-            core::ptr::write_bytes(dst, 0, raw_reply_bytes as usize);
-            core::ptr::write_unaligned(dst.cast::<u32>(), HOST_REPLY_POISON.to_le());
-        }
-        core::sync::atomic::fence(Ordering::SeqCst);
         crate::virtio::ctrl::submit_venus_session_sync(
             passive,
             adapter,
@@ -712,9 +877,20 @@ impl SessionTransport {
             payload,
         )
         .map_err(|_| STATUS_DEVICE_NOT_READY)?;
-        core::sync::atomic::fence(Ordering::Acquire);
-        let opcode = unsafe { core::ptr::read_volatile(dst.cast::<u32>()) };
-        if u32::from_le(opcode) != expected_opcode {
+        let destination_offset =
+            usize::try_from(raw_reply_offset).map_err(|_| STATUS_INVALID_DEVICE_REQUEST)?;
+        let destination = NonNull::new(unsafe { facts.kernel_va.as_ptr().add(destination_offset) })
+            .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        // SAFETY: `operation` and `pair` retain both sides, and the exact K2a
+        // destination range was checked above.
+        if !unsafe {
+            reply_map.copy_reply_to(
+                raw_reply_offset,
+                raw_reply_bytes,
+                expected_opcode,
+                destination,
+            )
+        } {
             K11_HOST_REPLY_REJECT.fetch_add(1, Ordering::Relaxed);
             return Err(STATUS_DEVICE_NOT_READY);
         }
@@ -892,8 +1068,9 @@ impl SessionTransport {
         };
 
         // The canonical pair lease covers both direct submissions and the raw
-        // SHM read. K2a is deliberately not attached to the renderer context;
-        // its retained ordinary allocation reference is used only by publish.
+        // private-SHM read used to establish the instance. K2a is never a host
+        // reply target; it receives only validated bytes copied after a real
+        // context-local terminal.
         let pair = match crate::virtio::ctrl::borrow_venus_session_pair(
             adapter,
             owner,
@@ -1264,12 +1441,10 @@ impl SessionTransport {
         Ok(())
     }
 
-    /// Publish an HVR1 header over reply bytes the host has already DMA-written
-    /// into the exact role-1 K2a range.  This is the nonzero-ring executor seam:
-    /// the raw generated reply starts immediately after the header and is never
-    /// copied through a second buffer.  Magic remains zero until every header
-    /// field is present, so a stale slot can never look published while Venus is
-    /// still writing it.
+    /// Publish an HVR1 header over reply bytes K11 has already copied from its
+    /// context-local private resource into the exact role-1 K2a range. This is
+    /// the nonzero-ring executor seam: magic remains zero until both the real
+    /// host terminal and the finite private-to-K2a copy have completed.
     pub(crate) fn publish_hvr1_existing_payload(
         facts: K11ReplyPoolFacts,
         reply_offset: u64,
@@ -1344,7 +1519,7 @@ impl Drop for SessionOperation {
 const _: () = {
     assert!(pure::HOST_CREATE_INSTANCE_REPLY_BYTES == 24);
     assert!(pure::HOST_CREATE_INSTANCE_REPLY_BYTES <= SESSION_REPLY_BYTES);
-    assert!(SESSION_REPLY_BYTES == 4096);
+    assert!(SESSION_REPLY_BYTES == HELIOS_HVM1_REPLY_POOL_BYTES);
     assert!(HELIOS_HVR1_HEADER_SIZE == 80);
     assert!(SESSION_INSTANCE_HANDLE != 0);
 };

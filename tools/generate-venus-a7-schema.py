@@ -354,7 +354,15 @@ class Generator:
             if info.func_stem in ("blob_array", "char_array"):
                 out.append(f"{cur_indent}let bytes = c.take_padded({count})?;")
                 if info.func_stem == "char_array":
-                    out.append(f"{cur_indent}if {count} == 0 || bytes[{count} as usize - 1] != 0 {{")
+                    optional_string = var.is_optional() and level == 0
+                    zero_check = (
+                        f"{count} != 0 && "
+                        if optional_string
+                        else f"{count} == 0 || "
+                    )
+                    out.append(
+                        f"{cur_indent}if {zero_check}bytes[{count} as usize - 1] != 0 {{"
+                    )
                     out.append(f"{cur_indent}    return Err(VenusReject::BadArrayCount);")
                     out.append(f"{cur_indent}}}")
             elif width is not None and info.array_size:

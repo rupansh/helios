@@ -1190,6 +1190,53 @@ mod tests {
     }
 
     #[test]
+    fn admits_reply_bearing_device_extension_enumeration_with_null_layer() {
+        let mut b = Vec::new();
+        put32(&mut b, OP_SET_REPLY);
+        put32(&mut b, 0);
+        put64(&mut b, 1); // pStream
+        put32(&mut b, 0); // private reply resource placeholder
+        put64(&mut b, 80); // reply offset
+        put64(&mut b, 28); // generated reply bytes
+
+        put32(&mut b, 14); // vkEnumerateDeviceExtensionProperties
+        put32(&mut b, COMMAND_GENERATE_REPLY);
+        put64(&mut b, 2); // physical device
+        put64(&mut b, 0); // optional pLayerName = NULL
+        put64(&mut b, 1); // pPropertyCount
+        put32(&mut b, 0); // extension-property capacity query
+        put64(&mut b, 0); // pProperties = NULL
+
+        let mut operands = [VenusOperand::default(); 1];
+        let mut geometry = [0u32; 8];
+        let admitted = validate_venus_control_stream(
+            &b,
+            true,
+            &mut operands,
+            &mut geometry,
+        )
+        .expect("vkEnumerateDeviceExtensionProperties NULL-layer count query");
+        assert_eq!(admitted.opcode, 14);
+        assert_eq!(admitted.operand_count, 1);
+        assert_eq!(admitted.reply_offset, 80);
+        assert_eq!(admitted.reply_size, 28);
+        assert_eq!(operands[0].payload_offset, 16);
+
+        let mut unterminated = b;
+        unterminated[52..60].copy_from_slice(&1u64.to_le_bytes());
+        unterminated.splice(60..60, [b'x', 0, 0, 0]);
+        assert_eq!(
+            validate_venus_control_stream(
+                &unterminated,
+                true,
+                &mut [VenusOperand::default(); 1],
+                &mut [0u32; 8],
+            ),
+            Err(VenusReject::BadArrayCount)
+        );
+    }
+
+    #[test]
     fn every_nested_shape_refuses_a_truncated_tail() {
         let mut streams = Vec::new();
 

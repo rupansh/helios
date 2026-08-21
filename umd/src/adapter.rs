@@ -469,31 +469,22 @@ unsafe extern "C" fn create_device(
         paging_queue: None,
         device_lost: std::sync::atomic::AtomicU32::new(0),
     });
-    let context_hr = unsafe { device_funcs::create_runtime_context(&mut outer) };
-    if context_hr != S_OK {
-        log_error!(
-            "  CreateDevice: HQA1/HQC1 context creation failed hr=0x{:08x}",
-            context_hr as u32
-        );
-        return context_hr;
-    }
-    let paging_hr = unsafe { device_funcs::create_runtime_paging_queue(&mut outer) };
-    if paging_hr != S_OK {
-        log_error!(
-            "  CreateDevice: paging queue creation failed hr=0x{:08x}",
-            paging_hr as u32
-        );
-        unsafe { device_funcs::destroy_outer_runtime_context(&mut outer) };
-        return paging_hr;
-    }
     let outer_context = outer.as_mut() as *mut device_funcs::OuterDevice as usize;
+    // Snapshot every A5 pointer before entering C++. The bridge synchronously
+    // calls `dxvk_outer_device_admit` after vkCreateDevice has registered the
+    // exact queues; no Rust borrow of `outer.translator` may remain live across
+    // that callback's unique access to the boxed outer object.
+    let vk_instance = outer.translator.vk_instance() as usize;
+    let get_instance_proc_addr = outer.translator.get_instance_proc_addr() as usize;
+    let icd_module_base = outer.translator.module_base() as usize;
     let Some(dxvk) = bridge::BridgeDevice::create(
-        outer.translator.vk_instance() as usize,
-        outer.translator.get_instance_proc_addr() as usize,
-        outer.translator.module_base() as usize,
+        vk_instance,
+        get_instance_proc_addr,
+        icd_module_base,
         luid as u32,
         (luid >> 32) as u32 as i32,
         outer_context,
+        device_funcs::dxvk_outer_device_admit as *const () as usize,
         device_funcs::dxvk_outer_submit_begin as *const () as usize,
         device_funcs::dxvk_outer_submit_finish as *const () as usize,
         device_funcs::dxvk_outer_submit_join as *const () as usize,
@@ -506,6 +497,14 @@ unsafe extern "C" fn create_device(
         unsafe { device_funcs::destroy_runtime_paging_queue(&mut outer) };
         return E_FAIL;
     };
+    if outer.context.is_none() || outer.paging_queue.is_none() {
+        log_error!("  CreateDevice: DXVK returned without complete outer admission");
+        let mut dxvk = dxvk;
+        dxvk.shutdown();
+        unsafe { device_funcs::destroy_outer_runtime_context(&mut outer) };
+        unsafe { device_funcs::destroy_runtime_paging_queue(&mut outer) };
+        return E_FAIL;
+    }
 
     // 2) Construct our device object in the runtime-allocated private memory
     //    (size came from CalcPrivateDeviceSize). hDrvDevice IS that pointer.

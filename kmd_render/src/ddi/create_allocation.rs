@@ -945,6 +945,22 @@ impl OpenExecutionBinding {
             return None;
         }
 
+        // Role 1 is the CPU-visible final HVR1 carrier, not a renderer reply
+        // target. K11's context-local private resource receives host writes and
+        // copies the validated finite range here only after the real terminal;
+        // attempting a secondary CTX_ATTACH would cross renderer namespaces
+        // without creating usable resource identity in that context.
+        if facts.hvm1_role == Hvm1Role::ReplyPool.to_u32() {
+            guard.allocation_generation = facts.allocation_generation;
+            guard.resource_id = facts.resource_id;
+            guard.transport_instance = facts.transport_instance;
+            guard.byte_size = facts.byte_size;
+            guard.memory_type_index = facts.memory_type_index;
+            guard.hvm1_role = facts.hvm1_role;
+            guard.kernel_va = facts.kernel_va;
+            return Some(guard);
+        }
+
         loop {
             let attach = {
                 let mut state = self.rundown.lock();

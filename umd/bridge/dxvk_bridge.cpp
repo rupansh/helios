@@ -831,6 +831,7 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     std::uint32_t luid_low,
     std::int32_t  luid_high,
     std::size_t   outer_context,
+    std::size_t   outer_admit,
     std::size_t   outer_begin,
     std::size_t   outer_finish,
     std::size_t   outer_join,
@@ -886,7 +887,7 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
       auto& d = *out->impl;
 
       if (!vk_instance || !get_instance_proc_addr || !icd_module_base ||
-          !outer_context || !outer_begin || !outer_finish || !outer_join ||
+          !outer_context || !outer_admit || !outer_begin || !outer_finish || !outer_join ||
           !outer_allocate || !outer_teardown_begin || !outer_retire ||
           (!luid_low && !luid_high)) {
         umd_log("REFUSING DXVK device: incomplete A5/provenance/LUID/outer edge");
@@ -925,6 +926,24 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
         return nullptr;
       }
       umd_log("DxvkDevice created from exact A5 record-only instance");
+
+      // vkCreateDevice has now created and registered the exact A5 queues.
+      // Admit the WDDM HQA1/HQC1 context before the D3D11 COM constructor can
+      // allocate resources or submit through those queues. This synchronous
+      // callback owns no lookup: outer_context is the same boxed object carried
+      // by every other direct edge.
+      using OuterAdmitProc = std::int32_t (*)(void*);
+      auto admit = reinterpret_cast<OuterAdmitProc>(outer_admit);
+      const std::int32_t admit_result =
+          admit(reinterpret_cast<void*>(outer_context));
+      if (admit_result < 0) {
+        char msg[128];
+        std::snprintf(msg, sizeof(msg),
+          "REFUSING DXVK device: outer HQA1/HQC1 admission failed hr=0x%08x",
+          static_cast<std::uint32_t>(admit_result));
+        umd_log(msg);
+        return nullptr;
+      }
 
       // Instantiate DXVK's full D3D11 COM device from the DxvkDevice. The DDI
       // device-funcs forward to this ID3D11Device / its immediate context.

@@ -37,11 +37,25 @@ unsafe extern "system" {
     fn GetModuleHandleExW(flags: u32, address: *const u16, module: *mut *mut c_void) -> i32;
 }
 
+type PfnHeliosIcdCreateTranslatorV1 = unsafe extern "C" fn(
+    create_info: *const HeliosTranslatorCreateInfoV1,
+    out_instance: *mut HeliosTranslatorInstanceV1,
+) -> HeliosTranslatorStatusCode;
+
 unsafe extern "C" {
-    fn helios_icd_create_translator_v1(
-        create_info: *const HeliosTranslatorCreateInfoV1,
-        out_instance: *mut HeliosTranslatorInstanceV1,
-    ) -> HeliosTranslatorStatusCode;
+    /// The loader-resolved target stored in this UMD's ordinary PE import
+    /// address table.  Naming the import slot is what makes address provenance
+    /// exact: taking the Rust function symbol's address names the local linker
+    /// thunk (`jmp [IAT]`) inside the UMD, not the lower-ICD procedure it calls.
+    #[link_name = "__imp_helios_icd_create_translator_v1"]
+    static HELIOS_ICD_CREATE_TRANSLATOR_V1_IAT: PfnHeliosIcdCreateTranslatorV1;
+}
+
+unsafe fn imported_create_translator_v1() -> PfnHeliosIcdCreateTranslatorV1 {
+    // SAFETY: the package links one ordinary import library for
+    // vulkan_virtio.dll; the Windows loader fills this immutable IAT slot
+    // before either UMD entry point can run.
+    unsafe { HELIOS_ICD_CREATE_TRANSLATOR_V1_IAT }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,8 +217,10 @@ impl DirectTranslator {
             submission_mode: 0,
         };
         // SAFETY: both exact protocol records remain live across this
-        // synchronous call. The entry point is a package import, not a lookup.
-        let status = unsafe { helios_icd_create_translator_v1(&create_info, &mut instance) };
+        // synchronous call. The entry point comes from the package's fixed PE
+        // import slot, not a loader/module/procedure lookup.
+        let entry = unsafe { imported_create_translator_v1() };
+        let status = unsafe { entry(&create_info, &mut instance) };
         let status = HeliosTranslatorStatus::from_wire(status)
             .map_err(|unknown| DirectTranslatorError::UnknownStatus(unknown.code))?;
         if status != HeliosTranslatorStatus::Ok {
@@ -226,9 +242,7 @@ impl DirectTranslator {
             return Err(DirectTranslatorError::EndpointCapacity);
         }
         // SAFETY: address-only module queries do not dereference either pointer.
-        let entry_module = unsafe {
-            module_for_address(helios_icd_create_translator_v1 as *const () as *const c_void)
-        };
+        let entry_module = unsafe { module_for_address(entry as *const () as *const c_void) };
         if entry_module.is_null() || entry_module != dispatch.icd_module_base.cast_mut() {
             Self::destroy_validated(&instance);
             return Err(DirectTranslatorError::EntryProvenance);
