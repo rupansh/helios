@@ -29,7 +29,7 @@
 //!
 //! **⛔⛔ In particular: no actual virtio-gpu `resource_id` (`resid`) may appear
 //! anywhere in this ABI.** This is the single rule most likely to be broken by a
-//! writer porting code from [`crate::escape`] or [`crate::wddm`], where raw
+//! writer porting code from the retired Escape or legacy-WDDM ABIs, where raw
 //! `resid`s *were* the command identity:
 //!
 //!   * Mesa stores an **opaque local HVM1 allocation capability/generation** —
@@ -77,16 +77,15 @@
 //!
 //! # Which legacy modules this supersedes
 //!
-//! This module supersedes [`crate::escape`] outright for the native ICD lane:
+//! This module supersedes the deleted `escape.rs` ABI outright for the native ICD lane:
 //! `HELIOS_ESCAPE_OP_SUBMIT_VENUS`, the blob create/map/release verbs, and
 //! `WAIT_FENCE` all become HNR2 Render + HVM1 allocation + the context's own
 //! monitored fence. It also supersedes the deleted `HeliosWddmCmdBuf` and
 //! `HeliosWddmAllocPrivate` records of the pre-retirement [`crate::wddm`]
 //! *for this lane only* — the D3D outer path keeps its own records (HOB1/HOS1,
 //! section 10.4) in [`crate::wddm`].
-//! Per section 17.1 `escape.rs` and `ioctl.rs` are deleted once `kmd_render`,
-//! `umd`, and `umd12` have migrated; that deletion is a later phase and this
-//! file adds no dependency on either.
+//! Section 17.1's `escape.rs` and `ioctl.rs` carriers are deleted; this file
+//! has no dependency on either and provides no compatibility route back to them.
 //!
 //! # How this differs from the D3D outer-batch path (section 10.4)
 //!

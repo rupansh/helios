@@ -38,12 +38,9 @@
 //!
 //! # What supersedes what
 //!
-//! This module supersedes the *context/session establishment* verbs of the
-//! System-class stack: [`crate::escape`]'s `HELIOS_ESCAPE_CTX_CREATE` /
-//! `CTX_DESTROY` payloads and [`crate::ioctl`]'s `IOCTL_HELIOS_CTX_*` carrier.
-//! Section 17.1 deletes both of those files outright, but their consumers
-//! (`kmd_render`, `umd`, `umd12`) have not migrated yet, so this phase is purely
-//! additive and both legacy modules remain in the tree.
+//! This module supersedes the deleted System-class context/session verbs:
+//! `HELIOS_ESCAPE_CTX_CREATE` / `CTX_DESTROY` and the `IOCTL_HELIOS_CTX_*`
+//! carrier. No compatibility module remains in the active protocol crate.
 //!
 //! # Prohibitions this file is required to keep true
 //!

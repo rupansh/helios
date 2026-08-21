@@ -28,12 +28,10 @@
 //! object plus a nonzero KMD-assigned allocation *generation*, never a renderer
 //! resource id, ticket, PID, handle, or timing/dimension inference.
 //!
-//! It also supersedes [`crate::escape`], the `D3DKMTEscape` verb ABI (§3: no
-//! Escape for transport, discovery, metadata, synchronization, completion,
-//! lifetime, diagnostics, or fallback), and — with the retired System-class
-//! `kmd/` package — [`crate::ioctl`]. §17.1 requires both files deleted; they
-//! remain in the tree only until `kmd_render`, `umd`, and `umd12` have migrated
-//! off them, and nothing in this module may be routed through either.
+//! It also supersedes the deleted `escape.rs` D3DKMTEscape verb ABI and the
+//! deleted System-class `ioctl.rs` carrier. No transport, discovery, metadata,
+//! synchronization, completion, lifetime, diagnostic, or fallback path may be
+//! routed through either retired mechanism.
 //!
 //! # Reading the invariants that shaped these bytes (§10.1)
 //!

@@ -117,16 +117,15 @@
 //! # Legacy modules this supersedes
 //!
 //! This module replaces the *byte-authority* half of the Escape/IOCTL blob
-//! mapper: [`crate::escape`]'s `HELIOS_ESCAPE_ALLOC_BLOB` /
+//! mapper: the retired Escape ABI's `HELIOS_ESCAPE_ALLOC_BLOB` /
 //! `HELIOS_ESCAPE_MAP_BLOB` / `HELIOS_ESCAPE_RELEASE_BLOB` (and their
 //! `HeliosEscapeAllocBlob` / `HeliosEscapeMapBlob` / `HeliosEscapeReleaseBlob`
-//! payloads) together with [`crate::ioctl`]'s `IOCTL_HELIOS_ALLOC_BLOB` /
+//! payloads) together with the retired `IOCTL_HELIOS_ALLOC_BLOB` /
 //! `IOCTL_HELIOS_MAP_BLOB` / `IOCTL_HELIOS_RELEASE_BLOB`. Those carried a whole
 //! `RESOURCE_MAP_BLOB` host mapping as the authoritative bytes, which can
 //! diverge from VidMm's placement on relocation/eviction (§19.1 row 66). Here
 //! the authoritative bytes are the actual WDDM placement, moved by real paging
-//! DMA. §17.1 deletes both legacy files outright; that deletion is a later
-//! cleanup phase because `kmd_render`, `umd`, and `umd12` have not migrated yet.
+//! DMA. Both legacy carrier files are deleted and no compatibility route remains.
 //!
 //! # Mirroring (⛔ FALSE AT HEAD — F5)
 //!

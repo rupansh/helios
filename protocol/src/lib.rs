@@ -48,28 +48,10 @@
 //! | [`virtio_gpu`] | standard virtio-gpu control headers/capsets | VirtIO 1.2 §5.7 |
 //! | [`features`] | virtio feature bits | — |
 //!
-//! ⚠ [`escape`] and [`ioctl`] are the **legacy System-class** ABI. Section 17.1
-//! of the retirement manifest deletes both files outright — `escape.rs` because
-//! every verb `0x0001..0x0011` is graphics/presentation/synchronization/
-//! allocation or their private diagnostic query and none belongs to the new
-//! package (explicitly including `QUERY_STATS` and `QUERY_SCANOUT_TIMELINE`,
-//! which may **not** be retained as an observability fallback), and `ioctl.rs`
-//! with the obsolete `kmd/` package, since no IOCTL verb may become a
-//! compatibility carrier for the new generation. [`wddm_legacy`] joins them: it
-//! is the pre-retirement content of [`wddm`], carried verbatim so the same three
-//! consumers keep compiling while each migrates to HWA2/HOB1/HOS1/HOC1.
-//! They remain declared here only
-//! because their current consumers (`kmd_render`, `umd`, `umd12`) have not yet
-//! migrated; deletion is a later cleanup phase of the same one-shot change.
-//! **They must not gain a new caller, a new symbol, or a new field.** The
-//! superseding module is named in each new module's header comment.
-//!
-//! ⚠ That prohibition is a review rule, not a mechanism, and the obvious
-//! mechanism is unavailable: `#[deprecated]` on either module would fail the
-//! build outright, because `umd/src/lib.rs` and `umd12/src/lib.rs` both carry
-//! `#![deny(deprecated)]` and there are live callers today. So the guard cannot
-//! be tightened before those callers move — the deletion and the migration are
-//! one step, and §17.8's atomic activation is not satisfied until both land.
+//! The former `escape.rs`, `ioctl.rs`, and `wddm_legacy.rs` modules are
+//! deleted. Their active consumers have migrated to the direct records above;
+//! no private Escape, IOCTL, present-ticket, or compatibility ABI is re-exported
+//! by this crate.
 //!
 //! References:
 //!   - `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` (this repo) — normative for
@@ -83,9 +65,7 @@
 #![allow(non_camel_case_types, non_upper_case_globals)]
 
 pub mod diagnostics;
-pub mod escape;
 pub mod features;
-pub mod ioctl;
 pub mod native_fence;
 pub mod native_render;
 pub mod physical_memory;
@@ -95,12 +75,9 @@ pub mod translator_dispatch;
 pub mod umd_adapter_info;
 pub mod virtio_gpu;
 pub mod wddm;
-pub mod wddm_legacy;
 
 pub use diagnostics::*;
-pub use escape::*;
 pub use features::*;
-pub use ioctl::*;
 pub use native_fence::*;
 pub use native_render::*;
 pub use physical_memory::*;
@@ -110,7 +87,6 @@ pub use translator_dispatch::*;
 pub use umd_adapter_info::*;
 pub use virtio_gpu::*;
 pub use wddm::*;
-pub use wddm_legacy::*;
 
 // ── The atomic package generation ───────────────────────────────────────────
 //
