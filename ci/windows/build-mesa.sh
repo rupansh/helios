@@ -25,7 +25,7 @@ meson setup "${build_dir}" "${mesa_src}" \
   "-Dhelios-wdk-include=${repo_root}/icd/win-build/wdk-include" \
   -Dplatforms=windows \
   -Dvideo-codecs= \
-  -Dvulkan-layers= \
+  -Dvulkan-layers=helios-present \
   -Degl=disabled \
   -Dgbm=disabled \
   -Dglx=disabled \
@@ -44,13 +44,18 @@ meson setup "${build_dir}" "${mesa_src}" \
 meson compile -C "${build_dir}"
 
 cp "${build_dir}/src/virtio/vulkan/vulkan_virtio.dll" "${output_dir}/"
+cp "${build_dir}/src/vulkan/helios-present-layer/VkLayer_HELIOS_present.dll" "${output_dir}/"
+cp "${build_dir}/src/vulkan/helios-present-layer/VkLayer_HELIOS_present.json" "${output_dir}/"
 cp "${build_dir}/src/gallium/targets/wgl/libgallium_wgl.dll" "${output_dir}/"
 cp "${build_dir}/src/gallium/targets/libgl-gdi/opengl32.dll" "${output_dir}/opengl32-app-local.dll"
 
 # WGL ICD dependencies are resolved by opengl32.dll and do not reliably search
 # the private driver directory. Keep the Mesa ICDs self-contained instead of
 # silently shipping a MinGW DLL that the Windows loader will not find.
-for dll in "${output_dir}/vulkan_virtio.dll" "${output_dir}/libgallium_wgl.dll"; do
+for dll in \
+  "${output_dir}/vulkan_virtio.dll" \
+  "${output_dir}/VkLayer_HELIOS_present.dll" \
+  "${output_dir}/libgallium_wgl.dll"; do
   while read -r dependency; do
     case "${dependency,,}" in
       lib*.dll|zlib1.dll)

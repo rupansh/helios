@@ -1,6 +1,22 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+$script:HeliosPackageGeneration = "0x48454C4900000004"
+$script:HeliosRequiredPayloadPaths = @(
+    "payload/driver/helios_kmd_render.inf",
+    "payload/driver/helios_kmd_render.sys",
+    "payload/driver/helios_umd.dll",
+    "payload/driver/helios_umd12.dll",
+    "payload/mesa/vulkan_virtio.dll",
+    "payload/mesa/VkLayer_HELIOS_present.dll",
+    "payload/mesa/VkLayer_HELIOS_present.json",
+    "payload/mesa/libgallium_wgl.dll",
+    "payload/opencl/clvk.dll",
+    "payload/loaders/vulkan-1.dll",
+    "payload/loaders/OpenCL.dll",
+    "payload/prerequisites/vc_redist.x64.exe"
+)
+
 function Assert-HeliosAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = [Security.Principal.WindowsPrincipal]::new($identity)
@@ -20,18 +36,30 @@ function Read-HeliosManifest([Parameter(Mandatory)][string]$BundleRoot) {
         throw "Package manifest is missing: $manifestPath"
     }
     $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-    if ($manifest.schemaVersion -ne 1 -or $manifest.architecture -ne "x64") {
+    if ($manifest.schemaVersion -ne 2 -or $manifest.architecture -ne "x64") {
         throw "Unsupported Helios package schema or architecture."
+    }
+    if ([string]$manifest.packageGeneration -cne $script:HeliosPackageGeneration -or
+        [string]$manifest.components.driver.packageGeneration -cne $script:HeliosPackageGeneration -or
+        [string]$manifest.components.mesa.packageGeneration -cne $script:HeliosPackageGeneration) {
+        throw "The package manifest does not describe one complete Helios generation."
     }
     return $manifest
 }
 
 function Test-HeliosManifest([Parameter(Mandatory)][string]$BundleRoot, [Parameter(Mandatory)]$Manifest) {
     $root = [IO.Path]::GetFullPath($BundleRoot).TrimEnd("\") + "\"
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($entry in @($Manifest.files)) {
-        $relative = [string]$entry.path
+        $relative = ([string]$entry.path) -replace "\\", "/"
         if ([IO.Path]::IsPathRooted($relative) -or $relative -match "(^|[\\/])\.\.([\\/]|$)") {
             throw "Unsafe path in package manifest: $relative"
+        }
+        if (-not $seen.Add($relative)) {
+            throw "Duplicate path in package manifest: $relative"
+        }
+        if ([string]$entry.sha256 -notmatch '^[0-9A-Fa-f]{64}$' -or [int64]$entry.size -lt 0) {
+            throw "Invalid size or SHA-256 metadata for $relative."
         }
         $full = [IO.Path]::GetFullPath((Join-Path $BundleRoot ($relative -replace "/", "\")))
         if (-not $full.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) {
@@ -44,6 +72,15 @@ function Test-HeliosManifest([Parameter(Mandatory)][string]$BundleRoot, [Paramet
         if ((Get-Item -LiteralPath $full).Length -ne [int64]$entry.size) {
             throw "Package size mismatch for $relative."
         }
+    }
+    foreach ($required in $script:HeliosRequiredPayloadPaths) {
+        if (-not $seen.Contains($required)) {
+            throw "Required generation payload is missing from the manifest: $required"
+        }
+    }
+    $certificate = ([string]$Manifest.signing.certificate) -replace "\\", "/"
+    if (-not $certificate -or -not $seen.Contains($certificate)) {
+        throw "The signing certificate is missing from the package manifest."
     }
 }
 

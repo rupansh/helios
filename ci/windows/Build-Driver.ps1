@@ -118,7 +118,7 @@ try {
 }
 
 $package = Join-Path $kmdRoot "target\release\helios_kmd_render_package"
-$required = @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll")
+$required = @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll")
 foreach ($name in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $package $name) -PathType Leaf)) {
         throw "Driver package output is missing $name in $package."
@@ -146,12 +146,34 @@ if ($dynamicCrtImports.Count -ne 0) {
     throw "helios_umd.dll imports an application-resolvable dynamic CRT: $($dynamicCrtImports -join '; ')"
 }
 
+# The vkd3d engine and its C++ shim deliberately share the dynamic MSVC CRT,
+# but a WDDM UMD still cannot import the DXGI/D3D12 runtime above it or the
+# Vulkan loader beside it. Keep that load-order boundary explicit here.
+$umd12Dll = Join-Path $package "helios_umd12.dll"
+$umd12Imports = @(& $llvmReadObj --coff-imports $umd12Dll 2>&1)
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to inspect helios_umd12.dll imports with llvm-readobj (exit $LASTEXITCODE)."
+}
+$forbiddenUmd12Imports = @(
+    $umd12Imports |
+        Where-Object { $_ -match '(?i)\b(?:dxgi|d3d12|vulkan-1)\.dll\b' } |
+        ForEach-Object { $_.Trim() } |
+        Sort-Object -Unique
+)
+if ($forbiddenUmd12Imports.Count -ne 0) {
+    throw "helios_umd12.dll imports a forbidden upper-layer runtime: $($forbiddenUmd12Imports -join '; ')"
+}
+
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 Copy-Item -Path (Join-Path $package "*") -Destination $OutputDir -Recurse -Force
 
 $umdPdb = Join-Path $RepoRoot "umd\target\release\helios_umd.pdb"
 if (Test-Path -LiteralPath $umdPdb -PathType Leaf) {
     Copy-Item -LiteralPath $umdPdb -Destination $OutputDir -Force
+}
+$umd12Pdb = Join-Path $RepoRoot "umd12\target\release\helios_umd12.pdb"
+if (Test-Path -LiteralPath $umd12Pdb -PathType Leaf) {
+    Copy-Item -LiteralPath $umd12Pdb -Destination $OutputDir -Force
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $OutputDir "licenses\dxvk") | Out-Null
 Copy-Item -LiteralPath (Join-Path $dxvkSource "LICENSE") -Destination (Join-Path $OutputDir "licenses\dxvk\LICENSE") -Force

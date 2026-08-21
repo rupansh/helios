@@ -16,6 +16,10 @@ $failures = [Collections.Generic.List[string]]::new()
 $instanceId = ""
 $classKey = ""
 
+if ($state.schemaVersion -ne 2 -or [string]$state.packageGeneration -cne $script:HeliosPackageGeneration) {
+    $failures.Add("The installed state does not describe the active Helios package generation.")
+}
+
 foreach ($entry in @($state.runtimeFiles)) {
     if (-not (Test-Path -LiteralPath ([string]$entry.path) -PathType Leaf)) {
         $failures.Add("Missing runtime file: $($entry.path)")
@@ -55,6 +59,30 @@ $vulkanValue = if (Test-Path -LiteralPath $vulkanRegistry) { (Get-Item -LiteralP
 if ($null -eq $vulkanValue -or [int]$vulkanValue -ne 0) {
     $failures.Add("The Vulkan ICD manifest is not enabled in the machine registry.")
 } else { Write-Host "Vulkan: registered $($state.vulkanManifest)" }
+
+$vulkanImplicitLayerRegistry = "HKLM:\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+$presentLayerValue = if (Test-Path -LiteralPath $vulkanImplicitLayerRegistry) {
+    (Get-Item -LiteralPath $vulkanImplicitLayerRegistry).GetValue([string]$state.presentLayerManifest, $null)
+} else { $null }
+if ($null -eq $presentLayerValue -or [int]$presentLayerValue -ne 0) {
+    $failures.Add("VK_LAYER_HELIOS_present is not enabled in the machine implicit-layer registry.")
+} elseif (-not (Test-Path -LiteralPath ([string]$state.presentLayerManifest) -PathType Leaf)) {
+    $failures.Add("The VK_LAYER_HELIOS_present manifest is missing.")
+} else {
+    try {
+        $presentLayer = Get-Content -LiteralPath ([string]$state.presentLayerManifest) -Raw | ConvertFrom-Json
+        $expectedLayerDll = Join-Path ([string]$state.installRoot) "runtime\mesa\VkLayer_HELIOS_present.dll"
+        $actualLayerDll = ([string]$presentLayer.layer.library_path) -replace "/", "\"
+        if ([string]$presentLayer.layer.name -cne "VK_LAYER_HELIOS_present" -or
+            $actualLayerDll -ine $expectedLayerDll) {
+            $failures.Add("The VK_LAYER_HELIOS_present manifest does not name the exact installed layer DLL.")
+        } else {
+            Write-Host "Vulkan layer: registered $($state.presentLayerManifest)"
+        }
+    } catch {
+        $failures.Add("The VK_LAYER_HELIOS_present manifest is invalid: $($_.Exception.Message)")
+    }
+}
 
 $openGlDriver = if ($classKey -and (Test-Path -LiteralPath $classKey)) { (Get-Item -LiteralPath $classKey).GetValue("OpenGLDriverName", $null) } else { $null }
 if (-not $openGlDriver -or ([string]$openGlDriver -ine (Join-Path ([string]$state.installRoot) "runtime\mesa\libgallium_wgl.dll"))) {

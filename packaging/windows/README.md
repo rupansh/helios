@@ -4,7 +4,10 @@ This archive installs the Helios WDDM driver and its x64 user-mode graphics and
 compute stack:
 
 - Direct3D 11 through the DXVK core embedded in `helios_umd.dll`
+- Direct3D 12 through vkd3d-proton embedded in `helios_umd12.dll`
 - Vulkan through Mesa Venus (`vulkan_virtio.dll`)
+- native Win32 Vulkan presentation through the separate implicit
+  `VK_LAYER_HELIOS_present` DLL and manifest
 - desktop OpenGL through Mesa Zink's Microsoft WGL ICD
 - OpenCL through CLVK with its clspv compiler embedded
 - official Khronos Vulkan and OpenCL loaders when Windows has no loader yet
@@ -24,11 +27,17 @@ From an elevated 64-bit PowerShell, the equivalent command is:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Install-Helios.ps1 -EnableTestSigning
 ```
 
-The installer verifies every payload hash before changing the machine. It does
+The installer requires one complete package-generation manifest and verifies
+every payload hash before changing the machine. It does
 not replace `opengl32.dll`, and it never overwrites existing Khronos loader
 DLLs. Vulkan and OpenCL coexist with other vendors through their standard ICD
 registries. OpenGL is registered only on the Helios display adapter software
 key.
+
+This generation no longer creates or grants ACLs on
+`C:\ProgramData\Helios\helios_present_sync_v2.bin`. It also does not delete a
+pre-existing copy: proving that no legacy process still maps that file requires
+an explicitly authorized shutdown/activation procedure outside this installer.
 
 If the virtio-gpu device is using Red Hat's `viogpudo` driver, desktop setup
 shows a Yes/No dialog (default No) before uninstalling that driver package and

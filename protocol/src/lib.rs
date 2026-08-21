@@ -90,26 +90,26 @@ pub use wddm::*;
 // three C mirrors … all four places together") was wrong in both numbers and
 // counted a QEMU header that no longer exists:
 //
-//   - `helios_wddm.h`, `helios_native_render.h`, `helios_translation_session.h`
-//     each `#define` it behind `#ifndef HELIOS_PACKAGE_GENERATION`.
+//   - `helios_wddm.h`, `helios_native_fence.h`, `helios_native_render.h`, and
+//     `helios_translation_session.h` each `#define` it behind
+//     `#ifndef HELIOS_PACKAGE_GENERATION`.
 //   - `helios_diagnostics.h` `#define`s it **unguarded**.
 //   - `helios_translator_dispatch.h` only *names* it in comments and field
 //     annotations; it defines nothing.
 //   - There is no host-side copy. F5 reset `qemu-helios`, so the sixth site
 //     lives on branch `helios/hpm1-parked` only.
 //
-// ⇒ the value must be changed in **five** places together: this file and the
-// four defining headers.
+// ⇒ the value must be changed in **six** places together: this file and the
+// five defining headers.
 //
-// ⚠ And nothing mechanically enforces that. `abi_parity.py` compares only
-// size/align/offset claims, not macro values, so the four headers' copies are
-// checked by no tool. Worse, the `#ifndef` guards actively *suppress* the one
+// `resource-association-gate.py` mechanically enforces those six source copies.
+// `abi_parity.py` still compares only size/align/offset claims, not macro
+// values. The `#ifndef` guards actively *suppress* the one
 // check C would have given for free: if two headers disagreed on the value, the
 // guard makes the second one silently skip instead of raising "macro
 // redefinition" — and `tools/retirement-gates.sh` includes all five in one
 // translation unit, so that error is exactly what it would otherwise catch. The
-// `c_mirrors_carry_this_exact_value` test below pins the Rust literal and names
-// the headers, but a reader has to open them; it cannot fail on their behalf.
+// `c_mirrors_carry_this_exact_value` test below pins the Rust literal too.
 
 /// The ASCII tag `'HELI'` occupying the high 32 bits of
 /// [`HELIOS_PACKAGE_GENERATION`].
@@ -125,9 +125,12 @@ pub const HELIOS_PACKAGE_GENERATION_TAG: u32 = 0x4845_4C49;
 /// [`HELIOS_PACKAGE_GENERATION`].
 ///
 /// `1` was the first HPS2-retirement generation. `2` changed the role-1 reply
-/// pool to four 1-MiB slots. `3` adds the immutable, process-local allocation
+/// pool to four 1-MiB slots. `3` added the immutable, process-local allocation
 /// association used by the direct translator creation graph and the fixed
-/// UMD-private adapter bootstrap record. These are the generations in which
+/// UMD-private adapter bootstrap record. `4` is the first complete guest source
+/// generation after broad HPS2/Escape/read-ledger/present-stream demolition and
+/// packages the separate `VK_LAYER_HELIOS_present` beside the lower ICD. In
+/// generation 4,
 /// `helios_present_sync_v2.bin` is neither published nor read, HWA2/HOB1/HOS1/
 /// HOC1/HQA1/HTS1/HVC1/HNR2/HVM1/HVR1 are the complete guest ABI, and the
 /// `escape`/`ioctl` verbs are retired. Bump it for **any** change to any record
@@ -137,24 +140,11 @@ pub const HELIOS_PACKAGE_GENERATION_TAG: u32 = 0x4845_4C49;
 /// grounds; no QEMU generation handshake or paging protocol is part of this
 /// package.
 ///
-/// ⚠ Of the ten records still listed, only **HWA2**, **HVM1** and **HOC1** have
-/// a producer or consumer at HEAD (measured 2026-08-10 by grepping each
-/// record's constant prefix across `kmd_render/src kmd_logic/src umd/src
-/// umd12/src umd_common/src icd/mesa/src`). Precisely:
-///
-///   - **HWA2** — 418 references; the UMDs build it, the KMD validates it, the
-///     ICD asserts its offsets via `vn_helios_hwa2.h`.
-///   - **HVM1**, **HOC1** — read and written by
-///     `kmd_render/src/ddi/create_allocation.rs`.
-///   - **HOB1** — 5 references, all to the single bound `HELIOS_HOB1_MAX_BYTES`
-///     inside `kmd_logic` tests. **No HOB1 record is built or parsed anywhere.**
-///   - **HOS1**, **HQA1**, **HTS1**, **HVC1**, **HNR2**, **HVR1** — zero
-///     references outside `protocol/`.
-///
-/// For everything after the first two bullets, this constant appearing in a
-/// header is a contract binding a future implementer, not traffic anybody
-/// sends. Each module's banner names the unit that will produce it.
-pub const HELIOS_PACKAGE_GENERATION_ORDINAL: u32 = 3;
+/// The A3-A9 direct graph now actively consumes the session, context,
+/// allocation, batch, typed-operand, reply, and dispatch records. The focused
+/// retirement gates own the current producer/consumer inventory; historical
+/// reference counts are not an authority boundary.
+pub const HELIOS_PACKAGE_GENERATION_ORDINAL: u32 = 4;
 
 /// The exact atomic package generation.
 ///
@@ -185,8 +175,10 @@ pub const HELIOS_PACKAGE_GENERATION_ORDINAL: u32 = 3;
 ///     this constant. §17.8 step 5's KMD↔host generation exchange is
 ///     consequently **unimplemented on the host side**; nothing in the tree
 ///     enforces it. Whoever implements it names the host mechanism here.
-///   - **Installer**: a mismatch across the staged KMD/UMDs/ICD/translators/WSI
-///     layer/manifests/host attestation fails activation (section 17.8 step 6).
+///   - **Installer**: a mismatch or incomplete staged guest
+///     KMD/UMDs/ICD/translators/WSI-layer payload fails activation. No host
+///     attestation exists in this non-HPM1 generation, so that separate runtime
+///     admission claim remains unavailable.
 ///
 /// No component may downgrade, translate, or tolerate a foreign generation, and
 /// none may treat `0` as a wildcard — see [`check_package_generation`].
@@ -264,6 +256,7 @@ mod package_generation_tests {
         // Defining sites, verified 2026-08-10 with
         // `grep -n 'define HELIOS_PACKAGE_GENERATION' protocol/include/*.h`:
         //   protocol/include/helios_wddm.h                (#ifndef-guarded)
+        //   protocol/include/helios_native_fence.h        (#ifndef-guarded)
         //   protocol/include/helios_native_render.h       (#ifndef-guarded)
         //   protocol/include/helios_translation_session.h (#ifndef-guarded)
         //   protocol/include/helios_diagnostics.h         (UNGUARDED)
@@ -273,6 +266,6 @@ mod package_generation_tests {
         // ⛔ `qemu-helios/include/hw/virtio/helios_physical_memory.h` used to be
         // listed here. F5 declined HPM1 and reset the submodule; that header is
         // on branch `helios/hpm1-parked` only and is NOT a site to keep in sync.
-        assert_eq!(HELIOS_PACKAGE_GENERATION, 0x4845_4C49_0000_0003);
+        assert_eq!(HELIOS_PACKAGE_GENERATION, 0x4845_4C49_0000_0004);
     }
 }

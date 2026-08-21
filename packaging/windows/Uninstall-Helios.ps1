@@ -20,6 +20,10 @@ $vulkanRegistry = "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers"
 if (Test-Path -LiteralPath $vulkanRegistry) {
     Remove-ItemProperty -LiteralPath $vulkanRegistry -Name ([string]$state.vulkanManifest) -ErrorAction SilentlyContinue
 }
+$vulkanImplicitLayerRegistry = "HKLM:\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
+if (Test-Path -LiteralPath $vulkanImplicitLayerRegistry) {
+    Remove-ItemProperty -LiteralPath $vulkanImplicitLayerRegistry -Name ([string]$state.presentLayerManifest) -ErrorAction SilentlyContinue
+}
 $openClRegistry = "HKLM:\SOFTWARE\Khronos\OpenCL\Vendors"
 if (Test-Path -LiteralPath $openClRegistry) {
     Remove-ItemProperty -LiteralPath $openClRegistry -Name ([string]$state.openClVendor) -ErrorAction SilentlyContinue

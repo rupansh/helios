@@ -164,8 +164,11 @@ if ($activeInfBeforeInstall -and (Test-HeliosViogpudoDriver $activeInfBeforeInst
 
 $classKey = ""
 $vulkanRegistry = "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers"
+$vulkanImplicitLayerRegistry = "HKLM:\SOFTWARE\Khronos\Vulkan\ImplicitLayers"
 $openClRegistry = "HKLM:\SOFTWARE\Khronos\OpenCL\Vendors"
 $vulkanManifestPath = Join-Path $runtimeRoot "mesa\helios_vulkan.json"
+$presentLayerManifestPath = Join-Path $runtimeRoot "mesa\VkLayer_HELIOS_present.json"
+$presentLayerDllPath = Join-Path $runtimeRoot "mesa\VkLayer_HELIOS_present.dll"
 $clvkPath = Join-Path $runtimeRoot "opencl\clvk.dll"
 $wglPath = Join-Path $runtimeRoot "mesa\libgallium_wgl.dll"
 $previousOpenGL = [ordered]@{
@@ -175,9 +178,10 @@ $previousOpenGL = [ordered]@{
 }
 
 $state = [ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
     packageId = [string]$manifest.packageId
     version = [string]$manifest.version
+    packageGeneration = [string]$manifest.packageGeneration
     installedAtUtc = [DateTime]::UtcNow.ToString("o")
     installRoot = $installRoot
     instanceId = $instanceId
@@ -185,6 +189,7 @@ $state = [ordered]@{
     activeInf = ""
     signingCertificateThumbprint = ""
     vulkanManifest = $vulkanManifestPath
+    presentLayerManifest = $presentLayerManifestPath
     openClVendor = $clvkPath
     installedVulkanLoader = $false
     installedOpenClLoader = $false
@@ -203,6 +208,35 @@ Copy-Item -Path (Join-Path $payloadRoot "loaders") -Destination $runtimeRoot -Re
 if (Test-Path -LiteralPath (Join-Path $payloadRoot "smoke")) {
     Copy-Item -Path (Join-Path $payloadRoot "smoke") -Destination $runtimeRoot -Recurse -Force
 }
+
+# The Mesa artifact supplies the generated implicit-layer manifest. Preserve
+# its extension inventory and policy, but bind library_path to this exact
+# generation's installed DLL before the runtime hash snapshot is recorded.
+if (-not (Test-Path -LiteralPath $presentLayerManifestPath -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $presentLayerDllPath -PathType Leaf)) {
+    throw "The VK_LAYER_HELIOS_present DLL/manifest pair is incomplete."
+}
+$presentLayerJson = Get-Content -LiteralPath $presentLayerManifestPath -Raw | ConvertFrom-Json
+if ([string]$presentLayerJson.layer.name -cne "VK_LAYER_HELIOS_present" -or
+    [string]$presentLayerJson.layer.type -cne "GLOBAL" -or
+    [string]$presentLayerJson.layer.disable_environment.DISABLE_LAYER_HELIOS_PRESENT -cne "1") {
+    throw "The generated VK_LAYER_HELIOS_present manifest has an unexpected identity or policy."
+}
+$presentLayerJson.layer.library_path = ($presentLayerDllPath -replace "\\", "/")
+Write-HeliosJson $presentLayerJson $presentLayerManifestPath -Encoding ASCII
+
+# Generate the lower ICD manifest before hashing as well. The lower ICD and
+# the presentation layer remain distinct artifacts and registry surfaces.
+$vulkanDll = Join-Path $runtimeRoot "mesa\vulkan_virtio.dll"
+$vulkanJson = [ordered]@{
+    file_format_version = "1.0.1"
+    ICD = [ordered]@{
+        library_path = ($vulkanDll -replace "\\", "/")
+        library_arch = "64"
+        api_version = [string]$manifest.components.mesa.vulkanApiVersion
+    }
+}
+Write-HeliosJson $vulkanJson $vulkanManifestPath -Encoding ASCII
 
 foreach ($file in Get-ChildItem -LiteralPath $runtimeRoot -File -Recurse) {
     $state.runtimeFiles += [ordered]@{ path = $file.FullName; sha256 = Get-HeliosSha256 $file.FullName }
@@ -297,18 +331,10 @@ $state.previousOpenGL = [ordered]@{
 $state.activeInf = $activeInf
 Write-HeliosJson $state $statePath
 
-$vulkanDll = Join-Path $runtimeRoot "mesa\vulkan_virtio.dll"
-$vulkanJson = [ordered]@{
-    file_format_version = "1.0.1"
-    ICD = [ordered]@{
-        library_path = ($vulkanDll -replace "\\", "/")
-        library_arch = "64"
-        api_version = [string]$manifest.components.mesa.vulkanApiVersion
-    }
-}
-Write-HeliosJson $vulkanJson $vulkanManifestPath -Encoding ASCII
 New-Item -Path $vulkanRegistry -Force | Out-Null
 New-ItemProperty -LiteralPath $vulkanRegistry -Name $vulkanManifestPath -Value 0 -PropertyType DWord -Force | Out-Null
+New-Item -Path $vulkanImplicitLayerRegistry -Force | Out-Null
+New-ItemProperty -LiteralPath $vulkanImplicitLayerRegistry -Name $presentLayerManifestPath -Value 0 -PropertyType DWord -Force | Out-Null
 
 New-ItemProperty -LiteralPath $classKey -Name "OpenGLDriverName" -Value $wglPath -PropertyType String -Force | Out-Null
 New-ItemProperty -LiteralPath $classKey -Name "OpenGLVersion" -Value 2 -PropertyType DWord -Force | Out-Null

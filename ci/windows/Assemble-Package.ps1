@@ -22,6 +22,19 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "Initialize-HeliosBuild.ps1")
 Import-VisualStudioEnvironment
 
+$versionLine = Get-Content -LiteralPath (Join-Path $RepoRoot "kmd_render\driver-version.env") |
+    Where-Object { $_ -match '^HELIOS_KMD_VERSION=' } |
+    Select-Object -First 1
+$expectedVersion = ([string]$versionLine) -replace '^HELIOS_KMD_VERSION=', ''
+if (-not $expectedVersion -or $Version -cne $expectedVersion) {
+    throw "Package version $Version does not match kmd_render/driver-version.env ($expectedVersion)."
+}
+$protocolSource = Get-Content -LiteralPath (Join-Path $RepoRoot "protocol\src\lib.rs") -Raw
+if ($protocolSource -notmatch 'pub const HELIOS_PACKAGE_GENERATION_ORDINAL: u32 = 4;') {
+    throw "Protocol source does not carry package generation ordinal 4."
+}
+$packageGeneration = "0x48454C4900000004"
+
 function Copy-Required([string]$Source, [string]$Destination) {
     if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) { throw "Required artifact is missing: $Source" }
     $parent = Split-Path -Parent $Destination
@@ -47,16 +60,16 @@ foreach ($script in @("Install-Helios.cmd", "Install-Helios.ps1", "Uninstall-Hel
 }
 
 $driverOut = Join-Path $payload "driver"
-foreach ($name in @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll")) {
+foreach ($name in @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll")) {
     Copy-Required (Join-Path $DriverArtifact $name) (Join-Path $driverOut $name)
 }
-foreach ($optional in @("helios_kmd_render.pdb", "helios_kmd_render.map", "helios_umd.pdb")) {
+foreach ($optional in @("helios_kmd_render.pdb", "helios_kmd_render.map", "helios_umd.pdb", "helios_umd12.pdb")) {
     $source = Join-Path $DriverArtifact $optional
     if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Required $source (Join-Path $driverOut $optional) }
 }
 
 $mesaOut = Join-Path $payload "mesa"
-foreach ($name in @("vulkan_virtio.dll", "libgallium_wgl.dll")) {
+foreach ($name in @("vulkan_virtio.dll", "VkLayer_HELIOS_present.dll", "VkLayer_HELIOS_present.json", "libgallium_wgl.dll")) {
     Copy-Required (Join-Path $MesaArtifact $name) (Join-Path $mesaOut $name)
 }
 foreach ($dependency in Get-ChildItem -LiteralPath $MesaArtifact -Filter "lib*.dll" -File) {
@@ -113,10 +126,11 @@ try {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $certificateOut) | Out-Null
     Export-Certificate -Cert $certificate -FilePath $certificateOut -Type CERT | Out-Null
 
-    # The catalog hashes the SYS and UMD. Sign those first, generate the
+    # The catalog hashes the SYS and both UMDs. Sign those first, generate the
     # catalog over the final bytes, and sign the catalog last.
     Invoke-SignTool $signTool $certificate.Thumbprint (Join-Path $driverOut "helios_kmd_render.sys")
     Invoke-SignTool $signTool $certificate.Thumbprint (Join-Path $driverOut "helios_umd.dll")
+    Invoke-SignTool $signTool $certificate.Thumbprint (Join-Path $driverOut "helios_umd12.dll")
     & $inf2Cat "/driver:$driverOut" "/os:10_X64" /uselocaltime
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $catalog -PathType Leaf)) {
         throw "Inf2Cat failed to produce the Helios catalog."
@@ -148,9 +162,10 @@ foreach ($file in Get-ChildItem -LiteralPath $stagingRoot -File -Recurse | Where
 }
 
 $manifest = [ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
     packageId = $packageId
     version = $Version
+    packageGeneration = $packageGeneration
     architecture = "x64"
     createdAtUtc = [DateTime]::UtcNow.ToString("o")
     source = [ordered]@{
@@ -170,8 +185,19 @@ $manifest = [ordered]@{
         certificate = "certificate/helios-ci-test.cer"
     }
     components = [ordered]@{
-        driver = [ordered]@{ version = $Version; direct3D = "DXVK embedded WDDM UMD" }
-        mesa = [ordered]@{ vulkan = "Venus"; openGL = "Zink WGL ICD"; vulkanApiVersion = "1.4.352" }
+        driver = [ordered]@{
+            version = $Version
+            packageGeneration = $packageGeneration
+            direct3D11 = "DXVK embedded WDDM UMD"
+            direct3D12 = "vkd3d-proton embedded WDDM UMD"
+        }
+        mesa = [ordered]@{
+            packageGeneration = $packageGeneration
+            vulkan = "Venus lower ICD"
+            presentLayer = "VK_LAYER_HELIOS_present"
+            openGL = "Zink WGL ICD"
+            vulkanApiVersion = "1.4.352"
+        }
         openCl = [ordered]@{ implementation = "CLVK"; onlineCompiler = $true }
         compatibility = [ordered]@{ davinciResolve = "App-local ADL GPU-detection shim" }
     }
