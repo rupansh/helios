@@ -242,59 +242,14 @@ function Write-CausalStatus {
     ) -join ',')
 }
 
-$timelineTool = 'C:\ProgramData\Helios\scanout_timeline_dump.exe'
-$ledgerTool = 'C:\ProgramData\Helios\read_ledger_dump.exe'
 $counterTool = 'Z:\tools\kmd-counter-snapshot.ps1'
 $causalErrorLog = Join-Path $OutDir 'causal-errors.txt'
 $causalCounterLog = Join-Path $OutDir 'causal-counter-output.txt'
-$causalPreCursor = $null
 $causalPreTaken = $false
-
-function Get-TimelineCursor {
-    param([int64]$TimeMs, [string]$Phase)
-    if (-not (Test-Path -LiteralPath $timelineTool)) {
-        Write-CausalStatus -TimeMs $TimeMs -Phase $Phase -Tool 'timeline_cursor' -Status 'missing' -Detail $timelineTool
-        return $null
-    }
-    try {
-        $output = & $timelineTool --cursor 2>> $causalErrorLog
-        if ($LASTEXITCODE -ne 0) {
-            Write-CausalStatus -TimeMs $TimeMs -Phase $Phase -Tool 'timeline_cursor' -Status 'failed' -Detail "exit=$LASTEXITCODE"
-            return $null
-        }
-        $text = (($output | Out-String).Trim())
-        [uint64]$cursor = 0
-        if (-not [uint64]::TryParse($text, [ref]$cursor)) {
-            Write-CausalStatus -TimeMs $TimeMs -Phase $Phase -Tool 'timeline_cursor' -Status 'invalid' -Detail $text
-            return $null
-        }
-        Set-Content -LiteralPath (Join-Path $OutDir ("timeline-{0}-cursor.txt" -f $Phase)) -Value $cursor
-        Write-CausalStatus -TimeMs $TimeMs -Phase $Phase -Tool 'timeline_cursor' -Status 'ok' -Detail $cursor
-        return $cursor
-    } catch {
-        Write-CausalStatus -TimeMs $TimeMs -Phase $Phase -Tool 'timeline_cursor' -Status 'exception' -Detail $_.Exception.Message
-        return $null
-    }
-}
 
 function Invoke-CausalSnapshot {
     param([int64]$TimeMs, [string]$Phase)
     if (-not $CaptureCausalBaselines) { return }
-
-    $cursor = Get-TimelineCursor -TimeMs $TimeMs -Phase $Phase
-    if ($Phase -eq 'pre') { $script:causalPreCursor = $cursor }
-
-    if (Test-Path -LiteralPath $ledgerTool) {
-        try {
-            & $ledgerTool 2>> $causalErrorLog | Set-Content -LiteralPath (Join-Path $OutDir ("read-ledger-{0}.csv" -f $Phase))
-            $status = if ($LASTEXITCODE -eq 0) { 'ok' } else { 'failed' }
-            Write-CausalStatus -TimeMs $TimeMs -Phase $Phase -Tool 'read_ledger' -Status $status -Detail "exit=$LASTEXITCODE"
-        } catch {
-            Write-CausalStatus -TimeMs $TimeMs -Phase $Phase -Tool 'read_ledger' -Status 'exception' -Detail $_.Exception.Message
-        }
-    } else {
-        Write-CausalStatus -TimeMs $TimeMs -Phase $Phase -Tool 'read_ledger' -Status 'missing' -Detail $ledgerTool
-    }
 
     if (Test-Path -LiteralPath $counterTool) {
         try {
@@ -314,21 +269,6 @@ function Complete-CausalCapture {
     param([int64]$TimeMs)
     if (-not $CaptureCausalBaselines -or -not $causalPreTaken) { return }
     Invoke-CausalSnapshot -TimeMs $TimeMs -Phase 'post'
-    if ($null -eq $causalPreCursor) { return }
-    $postText = Get-Content -LiteralPath (Join-Path $OutDir 'timeline-post-cursor.txt') -ErrorAction SilentlyContinue | Select-Object -First 1
-    [uint64]$postCursor = 0
-    if (-not [uint64]::TryParse($postText, [ref]$postCursor) -or $postCursor -le $causalPreCursor) {
-        Write-CausalStatus -TimeMs $TimeMs -Phase 'post' -Tool 'timeline_dump' -Status 'empty_or_invalid' -Detail "pre=$causalPreCursor post=$postText"
-        return
-    }
-    try {
-        & $timelineTool --dump ($causalPreCursor + 1) $postCursor 2>> $causalErrorLog |
-            Set-Content -LiteralPath (Join-Path $OutDir 'scanout-timeline.csv')
-        $status = if ($LASTEXITCODE -eq 0) { 'ok' } else { 'failed' }
-        Write-CausalStatus -TimeMs $TimeMs -Phase 'post' -Tool 'timeline_dump' -Status $status -Detail "first=$($causalPreCursor + 1) last=$postCursor exit=$LASTEXITCODE"
-    } catch {
-        Write-CausalStatus -TimeMs $TimeMs -Phase 'post' -Tool 'timeline_dump' -Status 'exception' -Detail $_.Exception.Message
-    }
 }
 
 function Find-TargetWindow {

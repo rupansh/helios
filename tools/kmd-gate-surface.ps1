@@ -21,8 +21,8 @@ param(
     # Counters that must read 0. A missing name is fine (never created = never
     # hit); a present, nonzero one fails the gate.
     [string[]] $MustBeZero = @(
-        # transport. NOTE: PARKED_LEAKS has no registry mirror — read it from
-        # tools/escape_owner_probe.c (QUERY_STATS) or a CollectDbgInfo dump.
+        # transport. NOTE: PARKED_LEAKS has no registry mirror; the retained
+        # OS-invoked CollectDbgInfo path is its bounded diagnostic surface.
         'WtOut', 'WtTbl', 'CtOut',
         # T3 deferred-programming refusals
         'ScBadAlc', 'ScBadExt', 'ScBadLay', 'ScBadFmt', 'ScLinErr', 'ScSetErr',
@@ -38,7 +38,7 @@ param(
         # machine. It is the one counter in this list that indicts the driver's
         # own reasoning rather than the host or the transport, and a nonzero
         # value is a design-gap escalation, not something to absorb: the DDI it
-        # names needs its own IRQL split, like MapCpuHostAperture already has.
+        # names needs its own audited IRQL split.
         'IrqlBad',
         # aperture / paging failure family
         'ChEi', 'ChEa', 'ChEp', 'ChEs', 'ChEb', 'ChEm', 'ChEu'

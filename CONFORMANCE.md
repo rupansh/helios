@@ -211,7 +211,6 @@ documented as a suite; this is that catalogue. One line each = what it proves.
 - `tools/d3d11_shared_content_probe.cpp` — dev1 clears a SHARED-NTHANDLE RT and flushes, dev2 opens/copies/reads; the discriminating test for whether *content* survives the alias.
 - `tools/d3d11_shared_draw_probe.cpp` — same shape with a real compiled-shader draw plus self-readback on dev1; proves draws propagate across the alias.
 - `tools/d3d11_xproc_draw_probe.cpp` — cross-**process** replica (`write`/`read` modes over a published global KMT handle); the dwm→IDD route.
-- `tools/d3d11_shared_blob_truth_probe.cpp` — shared-content shape plus `HELIOS_ESCAPE_MAP_BLOB` of the venus blob, histogramming raw dwords per step; separates write-side from read-side divergence.
 - `tools/d3d11_live_surface_probe.cpp` — opens supplied global KMT handles from a fresh process and histograms bytes 3× at 2 s; ground truth for where dwm's pixels land.
 - `tools/d3d11_dwm_shared_repro.cpp` — DWM's exact failing creates (1896×1030 BGRA, misc 0x2 and 0x802) so the swallowed DxvkError reaches the DXVK log.
 - `tools/d3d11_shared_wedge_repro.cpp` — WS1 defect 0w: contended 704×576 A8 SHARED\|SHARED_NTHANDLE creates to wedge inside `SyncSharedTexture → waitForResource`; exit 2 = wedged.
@@ -233,18 +232,14 @@ documented as a suite; this is that catalogue. One line each = what it proves.
 - `tools/dcomp_present_probe.cpp` — `CreateSwapChainForComposition` + dcomp target/visual on an HWND, animated by clear+Present(0); the Road-4 vehicle proof.
 
 ### D3DKMT
-- `tools/d3dkmt_sync_probe.cpp` — which synchronization-object forms (monitored / legacy / CPU-notification) the adapter accepts, per-form NTSTATUS.
 - `tools/d3dkmt_keyed_mutex_probe.cpp` — `D3DKMTCreateKeyedMutex2` → Acquire(0) → Release(1) → Destroy with no D3D11 involvement.
 - `tools/d3dkmt_display_mode_list_probe.cpp` — `D3DKMTOpenAdapterFromGdiDisplayName` + two-pass `D3DKMTGetDisplayModeList` per device.
-- `tools/d3dkmt_alloc_probe.c` — venus context over `D3DKMTEscape`, then `D3DKMTCreateAllocation` with a HOST3D mappable blob private struct.
-- `tools/blob_capacity_probe.c` — allocates 4 KiB blobs until failure; measures free slots in the KMD's bounded blob table, state-neutral.
-- `tools/blob_map_size_probe.c` — sweeps blob sizes to find where `MAP_BLOB` starts returning `0xC000009A` (the single-MDL `CSHORT Size` ceiling).
-- `tools/escape_owner_probe.c` — the T1b escape trust boundary: bad magic, unknown verb, and (under `--attack`) a forged `hDevice=NULL` RELEASE_BLOB against the live DWM primary and a cross-device CTX_DESTROY, both of which must be refused.
-- `tools/vidmm_tracking_probe.c` — TRACKING allocations made resident, per-process segment usage before/after (`nonlocal` switches budget).
-- `tools/vehicle_flipwait_probe.c` — queue `WAIT(F>=1)` then `SIGNAL(G=5)`; proves VidSch honours queued GPU-side monitored-fence waits on this software-scheduled adapter.
-- `tools/read_ledger_dump.c` — `HELIOS_ESCAPE_MAP_READ_LEDGER` consumer emitting stable CSV with re-claim detection.
-- `tools/scanout_timeline_dump.c` — `HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE` META/READ to CSV; never submits work.
 - `tools/vram_report_probe.cpp` — DXGI/VidMm numbers vs Venus Vulkan heaps, with `--d3d11-allocs`/`--vulkan-allocs` to see what the tracker charges.
+
+The former Helios-private Escape allocation, blob, ledger, timeline, tracking,
+and flip-wait probes were deleted with broad HPS2 source retirement. Retained
+diagnostics use only OS-invoked ETW/CollectDbgInfo surfaces; ordinary documented
+D3DKMT synchronization and sharing probes remain valid.
 
 ### Vulkan / OpenGL / OpenCL
 - `tools/vk_ring_fence_probe.cpp` — exportable OPAQUE_WIN32 timeline semaphore re-imported; an early short wait must `VK_TIMEOUT` and the full wait must elapse ≈ T_gpu. Proves signals retire at host GPU completion, not decode. schtask `helios_ringprobe`.
