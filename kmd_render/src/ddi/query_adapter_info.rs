@@ -21,6 +21,7 @@ use crate::dxgk::_DXGK_QUERYADAPTERINFOTYPE::{
 };
 use crate::dxgk::*;
 
+use helios_kmd_logic::umd_private_query;
 use helios_protocol::{HeliosUmdAdapterInfoV1, HELIOS_PACKAGE_GENERATION};
 
 use crate::adapter::AdapterContext;
@@ -96,10 +97,12 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
 
 /// Answer the package UMDs' one fixed adapter-bootstrap query.
 ///
-/// WDDM carries the UMD bytes in `pInputData` and gives the KMD a distinct
-/// `pOutputData` buffer.  Read and validate the complete input before touching
-/// the output; no prefix, alternate size, or zero-generation wildcard is
-/// admitted.
+/// `D3DDDICB_QUERYADAPTERINFO` gives the UMD one private buffer.  Dxgkrnl
+/// presents that buffer here as `pOutputData`; the live OpenAdapter call has
+/// zero `InputDataSize` and null `pInputData`.  Require that exact output-only
+/// shape and fill the complete record from package constants plus the
+/// adapter-lifetime identity.  The UMD validates the complete reply, including
+/// the package generation, after the synchronous callback returns.
 ///
 /// The WDK declares `hKmdProcessHandle` as "maybe NULL".  In particular, this
 /// callback is legal from `OpenAdapter`, before the runtime has created a D3D
@@ -107,24 +110,17 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
 /// adapter-lifetime identity and creates no process-owned state, so a process
 /// handle is neither required nor consumed here.
 unsafe fn query_umd_private(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
-    let input = args.pInputData.cast::<HeliosUmdAdapterInfoV1>();
     let output = args.pOutputData.cast::<HeliosUmdAdapterInfoV1>();
-    if args.InputDataSize as usize != size_of::<HeliosUmdAdapterInfoV1>()
-        || args.OutputDataSize as usize != size_of::<HeliosUmdAdapterInfoV1>()
-        || input.is_null()
-        || output.is_null()
-        || !input.is_aligned()
-        || !output.is_aligned()
-    {
+    if !umd_private_query::is_exact(
+        args.InputDataSize,
+        args.pInputData.is_null(),
+        args.OutputDataSize,
+        output.is_null(),
+        output.is_aligned(),
+    ) {
         return STATUS_INVALID_PARAMETER;
     }
 
-    // SAFETY: the exact size, alignment and non-nullness were checked, and the
-    // input is copied by value before the output is written.
-    let request = unsafe { core::ptr::read(input) };
-    if request.validate_query(HELIOS_PACKAGE_GENERATION).is_err() {
-        return STATUS_INVALID_PARAMETER;
-    }
     let Some((adapter_generation, adapter_luid)) =
         crate::ddi::native_fence::lifecycle_identity(adapter)
     else {
@@ -134,7 +130,7 @@ unsafe fn query_umd_private(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     let reply = HeliosUmdAdapterInfoV1 {
         adapter_generation,
         adapter_luid,
-        ..request
+        ..HeliosUmdAdapterInfoV1::query(HELIOS_PACKAGE_GENERATION)
     };
     debug_assert!(reply.validate_reply(HELIOS_PACKAGE_GENERATION).is_ok());
     // SAFETY: the output buffer is valid for one exact record by the DDI

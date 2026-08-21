@@ -35,6 +35,7 @@ pub mod direct_scanout_admission;
 pub mod direct_scanout_lifetime;
 pub mod display_backing_lifetime;
 pub mod ordered_engine;
+pub mod umd_private_query;
 pub mod venus_executor;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
