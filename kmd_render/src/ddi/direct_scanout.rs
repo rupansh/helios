@@ -21,17 +21,17 @@ use helios_kmd_logic::direct_scanout_lifetime::{
 };
 use helios_protocol::diagnostics::HeliosGraphicsEtwPayloadV1;
 use helios_protocol::{
-    HeliosAdapterMatch, HELIOS_PACKAGE_GENERATION, VIRTIO_GPU_FLAG_FENCE,
-    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, VIRTIO_GPU_RESP_OK_NODATA, VirtioGpuCtrlHdr,
+    HeliosAdapterMatch, VirtioGpuCtrlHdr, HELIOS_PACKAGE_GENERATION, VIRTIO_GPU_FLAG_FENCE,
+    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, VIRTIO_GPU_RESP_OK_NODATA,
 };
-use wdk_sys::{HANDLE, NTSTATUS, STATUS_DEVICE_NOT_READY, STATUS_INVALID_PARAMETER, STATUS_SUCCESS};
+use wdk_sys::{
+    HANDLE, NTSTATUS, STATUS_DEVICE_NOT_READY, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
+};
 
 use crate::adapter::AdapterContext;
 use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
-use crate::virtio::ctrl::{
-    FencedScanoutPublish, FencedScanoutSetOutcome, ScanoutBindIdentity,
-};
+use crate::virtio::ctrl::{FencedScanoutPublish, FencedScanoutSetOutcome, ScanoutBindIdentity};
 use crate::virtio::VirtioError;
 
 use super::committed_mode::{CommittedModeRead, CommittedModeWriteRefusal};
@@ -77,10 +77,26 @@ fn record_refusal(counter: &RefusalCounter, _name: &'static [u8], code: u32) {
 
 pub(crate) fn record_refusal_counters() {
     for (name, reason_name, counter) in [
-        (b"D2AdmRef".as_slice(), b"D2AdmWhy".as_slice(), &ADMISSION_REFUSALS),
-        (b"D2MbxRef".as_slice(), b"D2MbxWhy".as_slice(), &MAILBOX_REFUSALS),
-        (b"D2PlnRef".as_slice(), b"D2PlnWhy".as_slice(), &PLANE_REFUSALS),
-        (b"D2RstRef".as_slice(), b"D2RstWhy".as_slice(), &RESET_REFUSALS),
+        (
+            b"D2AdmRef".as_slice(),
+            b"D2AdmWhy".as_slice(),
+            &ADMISSION_REFUSALS,
+        ),
+        (
+            b"D2MbxRef".as_slice(),
+            b"D2MbxWhy".as_slice(),
+            &MAILBOX_REFUSALS,
+        ),
+        (
+            b"D2PlnRef".as_slice(),
+            b"D2PlnWhy".as_slice(),
+            &PLANE_REFUSALS,
+        ),
+        (
+            b"D2RstRef".as_slice(),
+            b"D2RstWhy".as_slice(),
+            &RESET_REFUSALS,
+        ),
     ] {
         crate::diag::record_named_bytes(name, counter.count.load(Ordering::Relaxed));
         crate::diag::record_named_bytes(reason_name, counter.last_reason.load(Ordering::Relaxed));
@@ -202,17 +218,7 @@ impl QueuedDirectScanoutBinding {
             .matches_allocation(handle, generation, resource_id)
     }
 
-    fn into_parts(
-        self,
-    ) -> (
-        Binding<DisplayBacking>,
-        u64,
-        u64,
-        u32,
-        u32,
-        u64,
-        u32,
-    ) {
+    fn into_parts(self) -> (Binding<DisplayBacking>, u64, u64, u32, u32, u64, u32) {
         (
             self.candidate.binding,
             self.candidate.mode_generation,
@@ -275,12 +281,7 @@ impl CandidateMailbox {
         Some(value)
     }
 
-    fn take_matching(
-        &self,
-        handle: usize,
-        generation: u64,
-        resource_id: u32,
-    ) -> MailboxMatch {
+    fn take_matching(&self, handle: usize, generation: u64, resource_id: u32) -> MailboxMatch {
         let state = self.state.load(Ordering::Acquire);
         if state == MAILBOX_EMPTY {
             return MailboxMatch::Absent;
@@ -520,15 +521,14 @@ pub(crate) fn complete_queued(
 ) {
     let resource_id = completion.work.resource_id();
     let work_instance = completion.work.transport_instance();
-    let response = (completion.written_length as usize
-        == core::mem::size_of::<VirtioGpuCtrlHdr>())
-    .then(|| {
-        // SAFETY: the fixed byte array contains exactly one complete response
-        // when the used length matches; the array has no alignment promise.
-        unsafe {
-            core::ptr::read_unaligned(completion.response.as_ptr().cast::<VirtioGpuCtrlHdr>())
-        }
-    });
+    let response = (completion.written_length as usize == core::mem::size_of::<VirtioGpuCtrlHdr>())
+        .then(|| {
+            // SAFETY: the fixed byte array contains exactly one complete response
+            // when the used length matches; the array has no alignment promise.
+            unsafe {
+                core::ptr::read_unaligned(completion.response.as_ptr().cast::<VirtioGpuCtrlHdr>())
+            }
+        });
     let exact_fence = response.is_some_and(|header| {
         header.flags == VIRTIO_GPU_FLAG_FENCE
             && header.fence_id == completion.fence_id
@@ -536,8 +536,8 @@ pub(crate) fn complete_queued(
             && header.ring_idx == 0
             && header.padding == [0; 3]
     });
-    let accepted = exact_fence
-        && response.is_some_and(|header| header.type_ == VIRTIO_GPU_RESP_OK_NODATA);
+    let accepted =
+        exact_fence && response.is_some_and(|header| header.type_ == VIRTIO_GPU_RESP_OK_NODATA);
     let rejected = exact_fence
         && response.is_some_and(|header| HostRejection::from_response_type(header.type_).is_ok());
     let (
@@ -801,10 +801,7 @@ fn finish_transition(adapter: &AdapterContext, mut transition: Transition<Displa
 /// Physical reset/removal has already retired the canonical OwnerTable rows.
 /// Barrier releases therefore discard only these values-only plane tokens;
 /// recycling a parking token here would resurrect authority for a dead resource.
-fn finish_barrier_transition(
-    adapter: &AdapterContext,
-    mut transition: Transition<DisplayBacking>,
-) {
+fn finish_barrier_transition(adapter: &AdapterContext, mut transition: Transition<DisplayBacking>) {
     for event in transition.events.into_iter().flatten() {
         emit_event(adapter, event);
     }
@@ -833,11 +830,7 @@ fn issue_fenced_set(
         None => PublishCapture::disable(),
     };
     let publish = |published: FencedScanoutPublish| {
-        let key = CompletionKey::new(
-            published.instance,
-            published.fence_id,
-            published.sequence,
-        );
+        let key = CompletionKey::new(published.instance, published.fence_id, published.sequence);
         capture.store_key(key);
         let mut state = adapter.direct_scanout.state.lock();
         if state.poisoned
@@ -982,9 +975,7 @@ fn issue_fenced_set(
             return false;
         };
         match kind {
-            PublishKind::Real | PublishKind::Parking => {
-                plane.complete_replacement(key, success)
-            }
+            PublishKind::Real | PublishKind::Parking => plane.complete_replacement(key, success),
             PublishKind::DisableZero => plane.complete_disable_zero(key, success),
         }
     };
@@ -1036,10 +1027,7 @@ fn service_pending_locked(passive: PassiveLevel, adapter: &AdapterContext) {
     let geometry = *candidate.binding.token();
     let expected_instance = {
         let state = adapter.direct_scanout.state.lock();
-        state
-            .plane
-            .as_ref()
-            .map_or(0, PlaneState::transport_epoch)
+        state.plane.as_ref().map_or(0, PlaneState::transport_epoch)
     };
     let _ = issue_fenced_set(
         passive,
@@ -1055,9 +1043,7 @@ pub(crate) fn service_pending(passive: PassiveLevel, adapter: &AdapterContext) {
     if !crate::virtio::KMD_D2_OWNER_ENABLED {
         return;
     }
-    adapter.with_scanout_lifecycle(passive, |_guard| {
-        service_pending_locked(passive, adapter)
-    });
+    adapter.with_scanout_lifecycle(passive, |_guard| service_pending_locked(passive, adapter));
 }
 
 fn issue_parking_locked(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
@@ -1179,9 +1165,7 @@ fn unbind_locked(
             !plane
                 .backend()
                 .is_some_and(|backend| backend.binding.is_real())
-                && !plane
-                    .pending_binding()
-                    .is_some_and(BackendBinding::is_real)
+                && !plane.pending_binding().is_some_and(BackendBinding::is_real)
         })
     };
     if !real_released {
@@ -1269,11 +1253,7 @@ pub(crate) fn start(
     })
 }
 
-pub(crate) fn prepare_reset(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    reason: DrainReason,
-) {
+pub(crate) fn prepare_reset(passive: PassiveLevel, adapter: &AdapterContext, reason: DrainReason) {
     if !crate::virtio::KMD_D2_OWNER_ENABLED {
         return;
     }
@@ -1298,17 +1278,13 @@ pub(crate) fn complete_verified_reset(passive: PassiveLevel, adapter: &AdapterCo
         .active_transport_instance
         .store(0, Ordering::Release);
     adapter.with_scanout_lifecycle(passive, |_guard| {
-        if adapter.direct_scanout.mailbox.take().is_none()
-            && adapter.direct_scanout.mailbox.busy()
+        if adapter.direct_scanout.mailbox.take().is_none() && adapter.direct_scanout.mailbox.busy()
         {
             record_refusal(&RESET_REFUSALS, b"D2RstRef", 2);
         }
         let transition = {
             let mut state = adapter.direct_scanout.state.lock();
-            let transition = state
-                .plane
-                .as_mut()
-                .map(PlaneState::complete_reset_barrier);
+            let transition = state.plane.as_mut().map(PlaneState::complete_reset_barrier);
             state.parking_reserve = None;
             for slot in &mut state.quarantine {
                 *slot = None;
@@ -1401,11 +1377,7 @@ pub(crate) fn retire_allocation(
     if !crate::virtio::KMD_D2_OWNER_ENABLED {
         return true;
     }
-    if adapter.d4_queue_holds_allocation(
-        h_allocation as usize,
-        generation,
-        resource_id,
-    ) {
+    if adapter.d4_queue_holds_allocation(h_allocation as usize, generation, resource_id) {
         return false;
     }
     adapter.with_scanout_lifecycle(passive, |_guard| {
@@ -1482,7 +1454,8 @@ pub(crate) fn commit_mode(
         }
         match facts {
             CommittedVidPnFacts::Active(facts) => {
-                let status = mode_write_status(adapter.committed_mode.publish_active(passive, facts));
+                let status =
+                    mode_write_status(adapter.committed_mode.publish_active(passive, facts));
                 if status == STATUS_SUCCESS
                     && committed_mode_allows_scanout(adapter)
                     && !resume_plane(adapter)

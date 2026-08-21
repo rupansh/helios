@@ -49,12 +49,9 @@
 //! The guest still receives no host resource id: K6 patches host operands from
 //! the canonical allocation owner.
 //!
-//! ⇒ [`dxgkddi_open_allocation`] therefore publishes **no** [`PresentAllocInfo`]
-//! and counts every such open in `OaNoRid`. `present_alloc_info` answers `None`,
-//! the Present path refuses at its own gates, and the desktop does not composite
-//! until A3 lands. That is the retirement's intended intermediate state, not a
-//! regression (`ROADMAP.md` sequencing decision: "the KMD lane goes next,
-//! desktop breakage accepted"). Never fabricate a resid to make it look alive.
+//! ⇒ [`dxgkddi_open_allocation`] stores the canonical allocation association
+//! directly. Present and D4 consume that exact owner; no host resource id,
+//! reverse lookup, or diagnostic snapshot is published through the open object.
 //!
 //! TRUST BOUNDARY: `pPrivateDriverData` is guest-supplied and
 //! `PrivateDriverDataSize` is the only authoritative length. Every record is
@@ -485,26 +482,6 @@ static CREATE_BACKING_FAILED: AtomicU32 = AtomicU32::new(0);
 /// Creates refused because the allocation-generation ordinal is exhausted
 /// (`AcGenExh`); see `adapter::allocation_object::GENERATION_EXHAUSTED`.
 static CREATE_GENERATION_EXHAUSTED: AtomicU32 = AtomicU32::new(0);
-/// Opens that could NOT publish a [`PresentAllocInfo`] because HWA2 carries no
-/// host resource id (`OaNoRid`) — the A3 gap named in the module doc and in
-/// `K4-CONTRACT.md` §5.
-///
-/// ⚠ This counter is expected to be LARGE and rising until mesa lane unit **A3**
-/// and K6 land. It is not a fault; it is the measurement of how much of the
-/// present path is waiting on them. It must reach 0 when they do.
-///
-/// ⛔ A PLAIN `fetch_add`, NOT [`bump`], and the distinction is the point.
-/// [`bump`] mirrors on n==1 and every 64th hit, forever, through
-/// `diag::record_named_bytes` — a synchronous `RtlWriteRegistryValue`. Every
-/// OTHER name in [`RETIREMENT_COUNTER_NAMES`] marks a REFUSAL, which is rare by
-/// construction and stays rare; this one fires on every SUCCESSFUL open, i.e. on
-/// DWM's own path, for as long as the A3 gap is open. Putting a registry write
-/// there would make the throttle's period the only thing between this driver and
-/// a per-open kernel registry round-trip on the hot path, and it would make one
-/// array mean two different things. It is mirrored instead from [`ALLOC_COUNTERS`]
-/// on a PASSIVE create-path cadence — the same shape
-/// [`APERTURE_MISSING_CPU_VISIBLE`] uses.
-static OPEN_NO_RESOURCE_ID: AtomicU32 = AtomicU32::new(0);
 /// Opens whose per-allocation private data failed HWA2 create-**output**
 /// validation (`OaHwa2Rej`). §10.3:1079-1080 makes a malformed descriptor fail
 /// the OPEN as well as the create; the open is not a place to be lenient,
@@ -524,34 +501,6 @@ static OPEN_HWA2_REJECT: AtomicU32 = AtomicU32::new(0);
 /// WDK annotates `in/out`; `DXGK_ALLOCATIONINFO::pPrivateDriverData` is `in`.
 static OPEN_HVM1_STAMPED: AtomicU32 = AtomicU32::new(0);
 static OPEN_HVM1_REJECT: AtomicU32 = AtomicU32::new(0);
-/// Presents refused because [`present_alloc_info`] answered `None` — the A3 gap
-/// reaching the DISPLAY path (`PrNoRid`).
-///
-/// ⭐ Added by round 3 of the Phase-2 review, which found the symptom site
-/// silent. [`PresentAllocationStorage`] is permanently `None`
-/// ([`PresentAllocInfo`]'s doc has the argument), so BOTH of `ddi/display.rs`'s
-/// present-side consumers now take their `else` arm on every call — and they
-/// did so through the pre-existing last-value breadcrumbs `PBFlip`/`PBCpy =
-/// 0xE1`, whose meaning in that file is "dxgkrnl handed us a source handle we
-/// could not resolve", i.e. a handle-lifetime bug. An operator reading
-/// `PBFlip = 0xE1` after this changeset would have been looking for the wrong
-/// defect, and because those are last-value writes rather than counts, could not
-/// even tell whether it fired once or per frame.
-///
-/// So the two sites now write a distinct breadcrumb (`0xEA`, unused in both
-/// families) *and* bump this. [`OPEN_NO_RESOURCE_ID`] is the same gap measured
-/// one stage earlier, at the open; this is the stage the desktop actually dies
-/// at, and the pair localises whether an open ever produced usable state.
-///
-/// ⛔ Expected LARGE and rising until mesa unit **A3** plus K6 land. Like
-/// `OaNoRid` it must be **revisited, not merely zeroed**, when the KMD gains a
-/// way to name the real host image.
-///
-/// ⛔ A PLAIN `fetch_add`, never [`bump`]: `DxgkDdiPresent` is a per-frame path
-/// and a registry write there is the producer-side CPU stall this project has
-/// already paid for once. Mirrored from [`ALLOC_COUNTERS`] on the create-path
-/// cadence.
-pub(crate) static PRESENT_NO_ALLOC_INFO: AtomicU32 = AtomicU32::new(0);
 /// HWA2 descriptors whose `RESOURCE_ASSOCIATED` claim disagreed with
 /// `DXGK_CREATEALLOCATIONFLAGS::Resource` on the call that carried them
 /// (`AcRcAssoc`). See the read site for why this is counted and not refused.
@@ -638,7 +587,7 @@ static STANDARD_SELF_REJECT: AtomicU32 = AtomicU32::new(0);
 /// names sharing a 14-byte prefix would MERGE into one registry value — a
 /// refusal counter reading someone else's number. Same guard
 /// `diag::FaultCounter` and `native_fence.rs` use.
-const RETIREMENT_COUNTER_NAMES: [&[u8]; 29] = [
+const RETIREMENT_COUNTER_NAMES: [&[u8]; 27] = [
     b"AcOk",
     b"AcMagic",
     b"AcHwa2Rej",
@@ -660,15 +609,13 @@ const RETIREMENT_COUNTER_NAMES: [&[u8]; 29] = [
     b"AcBackFail",
     b"AcGenExh",
     b"AcRcAssoc",
-    // The three [`ALLOC_COUNTERS`] names, published by that block rather than by
+    // The [`ALLOC_COUNTERS`] names, published by that block rather than by
     // [`bump`] — see its own doc for why. Listed here anyway because this array
     // is the file's ONE truncation proof, and a name that skips it is a name
     // nothing checks. `AcGenEpoch` is 10 bytes; `diag::CounterBlock` has no
     // truncation assert of its own, so this list is the only thing standing
     // between it and a silent merge with another value.
-    b"OaNoRid",
     b"OaBadH",
-    b"PrNoRid",
     b"AcGenEpoch",
     b"AcOptLin",
     b"OaHwa2Rej",
@@ -709,48 +656,22 @@ fn bump(counter: &AtomicU32, name: &[u8]) -> u32 {
 static ALLOC_FLUSH_TICKS: AtomicU32 = AtomicU32::new(0);
 static ALLOC_FLUSH_FAILURES: AtomicU32 = AtomicU32::new(0);
 
-/// The counters this file publishes WITHOUT [`bump`], because their sites are
-/// success paths rather than refusals.
+/// Counters this file publishes on a bounded PASSIVE create-path cadence.
 ///
 /// [`bump`] is the right emitter for a refusal: refusals are rare, so a mirror on
 /// the 1st and every 64th is bounded by construction. It is the WRONG emitter for
 /// anything that fires on success — `diag::record_named_bytes` is a synchronous
 /// `RtlWriteRegistryValue`, and a success-path counter's period is set by the
-/// workload, not by the driver. `OaNoRid` is exactly that: one hit per successful
-/// open, on DWM's path, for as long as the A3 gap stays open.
-///
-/// So the atomic stays hot-path-free and this block mirrors it, which is the
-/// shape [`APERTURE_MISSING_CPU_VISIBLE`] already uses (`diag::CounterBlock`,
+/// workload, not by the driver. This block keeps those mirrors off the measured
+/// hot paths, following the shape [`APERTURE_MISSING_CPU_VISIBLE`] already uses
+/// (`diag::CounterBlock`,
 /// x-dup-dead-27: three modules had each hand-rolled the same dump with
 /// different throttles).
 ///
-/// ⚠ The flush site is the CREATE DDI, not the open DDI, and that is deliberate:
-/// flushing from the site being measured would just re-impose the same period on
-/// the same path. An allocation is created once and opened at least once per
-/// device that binds it, so creates are the rarer event — one block flush per 64
-/// creates, at `PASSIVE_LEVEL`, off the open path entirely. The value is a
-/// cumulative atomic, so a create-less stretch costs mirror LATENCY and never a
-/// wrong number, and `DiagLevel >= 1` flushes every call regardless.
+/// The flush site is the CREATE DDI: one block flush per 64 creates at
+/// `PASSIVE_LEVEL`, and `DiagLevel >= 1` flushes every call.
 static ALLOC_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
     entries: &[
-        crate::diag::CounterEntry {
-            name: b"PrNoRid",
-            value: crate::diag::CounterRef::U32(&PRESENT_NO_ALLOC_INFO),
-            // A VALUE entry for [`OPEN_NO_RESOURCE_ID`]'s reason, one level
-            // further along: while the A3 gap is open this fires on EVERY
-            // present, so a failure entry would force a registry flush per
-            // frame.
-            failure: false,
-        },
-        crate::diag::CounterEntry {
-            name: b"OaNoRid",
-            value: crate::diag::CounterRef::U32(&OPEN_NO_RESOURCE_ID),
-            // A VALUE entry, not a failure: it is expected to be large and
-            // rising until A3/K6 land, and marking it a failure would force an
-            // immediate flush on every single open — reintroducing precisely the
-            // per-open registry write this block exists to remove.
-            failure: false,
-        },
         crate::diag::CounterEntry {
             name: b"AcGenEpoch",
             value: crate::diag::CounterRef::U32(
@@ -766,16 +687,15 @@ static ALLOC_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
             //
             // A FAILURE entry, so any movement flushes on the next create rather
             // than up to 63 creates later. Adapter resets are rare by
-            // construction, so the forced flush is bounded — unlike `OaNoRid`
-            // above, which is why the two entries differ.
+            // construction, so the forced flush is bounded.
             failure: true,
         },
         crate::diag::CounterEntry {
             name: b"AcOptLin",
             value: crate::diag::CounterRef::U32(&CREATE_OPTIMAL_AS_LINEAR),
-            // A VALUE entry for `OaNoRid`'s reason exactly: it fires on every
-            // successful D3D12 committed-texture create, so marking it a failure
-            // would force a registry write per create on that lane's hot path.
+            // A VALUE entry: it can fire on a successful committed-texture
+            // create, so marking it a failure would force a registry write per
+            // create on that lane's hot path.
             failure: false,
         },
         crate::diag::CounterEntry {
@@ -829,13 +749,6 @@ struct OpenAllocationContext {
     /// live because dxgkrnl closes every device-specific binding before calling
     /// DestroyAllocation. It is read only while that open handle remains live.
     allocation: usize,
-    /// Validated immutable view captured from open-time private data. Present
-    /// receives only this device-specific open handle, so it must use this
-    /// snapshot rather than trying to reinterpret dxgkrnl's runtime token as an
-    /// `AllocationContext*`.
-    present: Option<PresentAllocInfo>,
-    /// Trace-only companion; never read by a decision path.
-    present_diag: Option<PresentAllocDiag>,
     /// Exactly what this open PUBLISHED to the guest, for K6's Render/Patch
     /// staleness check and its capability records ([`open_allocation_identity`]).
     ///
@@ -1560,130 +1473,6 @@ pub(crate) unsafe fn acquire_outer_physical_use(
     })
 }
 
-/// Surface identity + geometry for a Present allocation-list entry, resolved from
-/// its `hDeviceSpecificAllocation` ([`present_alloc_info`]).
-///
-/// ⚠ **NOTHING CONSTRUCTS THIS TODAY, and that is the A3 gap, not an oversight.**
-/// Its `resource_id` is a host resource id, HWA2 deliberately carries none
-/// (the "No host resource token, `resid`, PID, …" paragraph on
-/// [`helios_protocol::HeliosWddmAllocationDescV2`]; the line range this cite
-/// used to carry is stale), and `DXGK_OPENALLOCATIONINFO::hAllocation`
-/// is dxgkrnl's runtime token rather than this driver's `AllocationContext*` —
-/// so `dxgkddi_open_allocation` has nothing to build one FROM and refuses to
-/// fabricate one (see that DDI's doc and the `OaNoRid` counter).
-///
-/// ⭐ CROSS-LANE, RESOLVED — round 3 of the Phase-2 review found the SYMPTOM
-/// site silent. Both of `ddi/display.rs`'s consumers refuse on every call while
-/// this is `None`, and they did so through the pre-existing last-value
-/// breadcrumb `PBFlip`/`PBCpy = 0xE1`, which in that file already means
-/// "dxgkrnl handed us a handle we could not resolve" — so the retirement's
-/// intended intermediate state was indistinguishable from a handle-lifetime bug,
-/// and a last-value write could not even say whether it fired once or per frame.
-/// The display sites now write `0xEA` and bump [`PRESENT_NO_ALLOC_INFO`]
-/// (`PrNoRid`), the symptom-side pair to [`OPEN_NO_RESOURCE_ID`]'s cause side.
-///
-/// The type,
-/// `present_alloc_info`, and `ddi/display.rs`'s exhaustive consumers are all
-/// otherwise retained unchanged so that mesa lane unit **A3** plus K6 re-point the
-/// producer and nothing else has to move.
-#[derive(Clone, Copy)]
-#[allow(dead_code)] // no producer until A3/K6; see the paragraph above.
-pub struct PresentAllocInfo {
-    pub resource_id: u32,
-    /// Versioned allocation kind from the creator/open identity. Present uses
-    /// this explicit contract to choose image-vs-buffer interpretation; a
-    /// resource id is never guessed from geometry or memory visibility.
-    pub kind: u32,
-    pub width: u32,
-    pub height: u32,
-    /// Authoritative byte stride of KMD-created standard allocations. Ordinary
-    /// UMD OPTIMAL images leave this at zero because they have no linear row
-    /// layout; Present destinations backed by the GDI staging contract carry
-    /// the exact 256-byte-aligned pitch.
-    pub pitch: u32,
-    /// Exact memory-plane-0 offset carried in the allocation private data.
-    pub plane_offset: u64,
-    /// Authoritative legacy D3DDDIFORMAT supplied for KMD-created standard
-    /// allocations. Some such allocations predate an exact DXGI trailer.
-    pub format: u32,
-    /// Exact creator-side DXGI format; unlike D3DDDIFORMAT, this preserves
-    /// BGRA alpha-vs-X identity.
-    pub dxgi_format: u32,
-    /// Exact D3D11 DDI bind flags used to create the ordinary OPTIMAL image.
-    pub bind_flags: u32,
-    /// The creator's image/buffer storage contract, captured from authoritative
-    /// private data. Present must match this exhaustively; a STANDARD allocation
-    /// is not inherently a linear byte buffer.
-    pub storage: PresentAllocationStorage,
-    /// Exact external allocation contract required by Venus import.
-    pub venus_alloc_size: u64,
-    pub memory_type_index: u32,
-    /// The allocation was created from the runtime's documented
-    /// `pPrimaryDesc` contract and explicitly exported for direct scanout.
-    pub direct_scanout: bool,
-}
-
-/// TRACE-ONLY companion to [`PresentAllocInfo`], resolved by
-/// [`present_alloc_diag`].
-///
-/// These seven fields have no consumer outside the Present identity dump: they
-/// are read, formatted and written to the registry, and nothing branches on
-/// them. Splitting them out of the acted-upon struct is what makes that
-/// visible — the Present path can no longer accidentally make a decision on a
-/// value that exists only to be logged, and the trace resolves them only inside
-/// its own sampling gate.
-#[derive(Clone, Copy)]
-pub struct PresentAllocDiag {
-    /// Per-device runtime allocation token supplied by dxgkrnl in
-    /// `DXGK_OPENALLOCATIONINFO::hAllocation`.
-    pub runtime_allocation: u32,
-    /// Exact `D3DKMDT_STANDARDALLOCATION_TYPE` supplied by Windows, or zero for
-    /// a UMD-created allocation.
-    pub standard_allocation_type: u32,
-    /// Exact `D3DKMDT_GDISURFACETYPE` supplied by Windows, or zero when the
-    /// standard allocation is not a GDI surface.
-    pub standard_gdi_surface_type: u32,
-    /// Exact `DXGK_OPENALLOCATIONFLAGS::Value` supplied by dxgkrnl.
-    pub open_flags: u32,
-    /// Whether `DXGK_CREATEALLOCATIONFLAGS::Resource` was set for the
-    /// allocation's create call.
-    pub resource_associated: bool,
-    pub allocation_private_size: u32,
-    pub resource_private_size: u32,
-}
-
-/// ⚠ No variant is constructed today — same A3 gap as [`PresentAllocInfo`],
-/// which is the only thing that holds one.
-#[repr(u32)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // no producer until A3/K6; see `PresentAllocInfo`.
-pub enum PresentAllocationStorage {
-    /// Ordinary UMD shared OPTIMAL image, imported through OPAQUE_FD.
-    OptimalOpaqueFdImage = 0,
-    /// Cross-context DMA_BUF image (direct primary or a KMD-created GDI
-    /// redirection texture).
-    OptimalCrossContextImage = 1,
-    /// KMD-created standard CPU-visible surface with an authoritative pitch.
-    PitchedStandardBuffer = 2,
-}
-
-impl PresentAllocInfo {
-    /// Resolve the exact Vulkan/DXGI Present format without
-    /// geometry/content heuristics.
-    ///
-    /// UMD-created allocations carry an exact DXGI value. KMD-created standard
-    /// allocations may carry only the authoritative D3DDDIFORMAT; use the same
-    /// fixed mapping as UMD `d3d_format_to_dxgi`.
-    pub fn resolved_dxgi_format(self) -> Option<u32> {
-        match self.dxgi_format {
-            exact if exact != 0 => Some(exact),
-            // Same fixed mapping as UMD `d3d_format_to_dxgi`, now single-sourced.
-            0 => d3dddi_to_dxgi(self.format).map(DxgiFormat::as_u32),
-            _ => None,
-        }
-    }
-}
-
 /// A resolved byte row stride for a surface that HAS a linear row layout.
 ///
 /// R1007. "What is this surface's row stride" had several independent answers:
@@ -1891,20 +1680,6 @@ pub(crate) const fn scanout_dxgi_for_primary() -> DxgiFormat {
     DxgiFormat::B8G8R8X8Unorm
 }
 
-/// Resolve a Present allocation-list entry's `hDeviceSpecificAllocation` (an
-/// [`OpenAllocationContext`] we returned from `DxgkDdiOpenAllocation`) to the
-/// backing venus resource id + geometry. Returns `None` for a null handle.
-///
-/// SAFETY: `h` must be an `hDeviceSpecificAllocation` value the KMD returned from
-/// `DxgkDdiOpenAllocation` (dxgkrnl round-trips it unmodified in command/present
-/// allocation lists) and still open (not yet `CloseAllocation`-freed).
-pub unsafe fn present_alloc_info(h: HANDLE) -> Option<PresentAllocInfo> {
-    // SAFETY: validated by `open_allocation_context`, which reads the magic
-    // through an unaligned raw read before forming any reference.
-    let open = unsafe { open_allocation_context(h)? };
-    open.present
-}
-
 /// Validate an `hDeviceSpecificAllocation` BEFORE forming a reference to it.
 ///
 /// The handle is an integer from dxgkrnl and the check cannot be encoded — but
@@ -1970,27 +1745,12 @@ fn refuse_open_allocation_handle() {
     OPEN_ALLOC_BAD_HANDLE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
-/// Trace-only identity for a Present allocation-list entry. Call ONLY from
-/// inside a diag sampling gate — nothing here may influence a Present decision.
-///
-/// # Safety
-/// As [`present_alloc_info`].
-pub unsafe fn present_alloc_diag(h: HANDLE) -> Option<PresentAllocDiag> {
-    // SAFETY: as `present_alloc_info` — validated before any reference is formed.
-    let open = unsafe { open_allocation_context(h)? };
-    open.present_diag
-}
-
 /// Snapshot of the [`AllocationContext`] fields `BuildPagingBuffer` needs to
 /// service content/placement ops against the CPU-visible BAR segment.
 #[derive(Clone, Copy)]
 pub(crate) struct PagingAllocInfo {
     pub resource_id: u32,
     pub size: u64,
-    /// Where `size` came from. Carried so the aperture path can eventually
-    /// require [`BackingSize::HostAuthoritative`] in its signature rather than
-    /// inferring it; today it only feeds the `ChSzMm` cross-check.
-    pub size_provenance: BackingSize,
     pub bar_eligible: bool,
     /// Current placement ([`BAR_UNPLACED`] if none).
     pub bar_placed: u64,
@@ -2348,7 +2108,6 @@ pub(crate) unsafe fn paging_alloc_info(h: HANDLE) -> Option<PagingAllocInfo> {
     Some(PagingAllocInfo {
         resource_id: ctx.resource_id(),
         size: ctx.size as u64,
-        size_provenance: ctx.size_provenance,
         bar_eligible: ctx.bar_eligible,
         bar_placed: ctx.bar_placed.load(Ordering::Acquire),
         hlm1_eligible: ctx.hlm1_eligible,
@@ -2909,22 +2668,6 @@ unsafe fn destroy_allocation_ctx(
         // counter and `flush` would then write nothing here.
         crate::ddi::build_paging_buffer::hlm1_publish_counters();
     }
-    // ⛔ `adapter.system_backings.remove(ctx.resource_id)` was here.
-    //
-    // `adapter/backing.rs` is the private byte mirror §10.7:1940 forbids ("its
-    // bytes are never an independent private copy") and its deletion is
-    // sequenced to K3, which owns 8 of its 10 call sites
-    // (`K4-CONTRACT.md` §3). K4 removes only its own call so K3 can delete the
-    // file without editing this one.
-    //
-    // ⚠ TRANSIENT CONSEQUENCE, recorded rather than absorbed: until K3 lands, a
-    // destroyed BAR allocation leaves its entry in a table of 128 and
-    // `BAR_SYSTEM_BACKING_ERRORS` will start counting once the table fills. The
-    // damage is bounded exactly as the k-paging-04 comment argued — resource ids
-    // are monotonic and never recycled within a transport generation, so a stale
-    // entry consumes a slot rather than aliasing a new allocation, and the
-    // Present-time mirror's `contains(resource_id)` therefore cannot answer true
-    // for the wrong surface.
     // Retire the exact Windows/KMD allocation identity before any backing
     // resource or Venus image can be torn down. Ambiguous plane retirement
     // retains the backing until the verified reset barrier.
@@ -2939,46 +2682,15 @@ unsafe fn destroy_allocation_ctx(
         return;
     }
 
-    // Present BLT command buffers bake imported aliases of ordinary WDDM
-    // resources. Drain the cache before any one backing resource can be
-    // detached/unref'd. The cache is intentionally one ownership unit because
-    // several swapchain sources may share the same DWM destination.
-    let present_drained = adapter.with_scanout_lifecycle(passive, |lock| {
-        lock.with_venus_client(|client| {
-            client.release_present_blits_for_resource(adapter, ctx.resource_id())
-        })
-            .map(|result| result.is_ok())
-            .unwrap_or(false)
-    });
-    if !present_drained {
-        crate::diag::record_named_bytes(b"PBDrn", 0xE);
-        // Retain all backing state until context teardown rather than UAF it.
-        drop(ctx);
-        return;
-    }
-
     if ctx.resource_id() != 0 {
         // OwnerTable is the sole resource/backing owner. Terminal UNREF
         // extracts and runs the exact image/memory finalizer outside the owner
         // lock; an ambiguous detach or unref retains the row until reset.
-        let _ = crate::virtio::ctrl::forget_allocation_blob(
-            passive,
-            adapter,
-            ctx.resource_id(),
-        );
-        if crate::virtio::ctrl::ctx_detach_resource(
-            passive,
-            adapter,
-            ctx.ctx_id,
-            ctx.resource_id(),
-        )
-        .is_ok()
+        let _ = crate::virtio::ctrl::forget_allocation_blob(passive, adapter, ctx.resource_id());
+        if crate::virtio::ctrl::ctx_detach_resource(passive, adapter, ctx.ctx_id, ctx.resource_id())
+            .is_ok()
         {
-            let _ = crate::virtio::ctrl::resource_unref(
-                passive,
-                adapter,
-                ctx.resource_id(),
-            );
+            let _ = crate::virtio::ctrl::resource_unref(passive, adapter, ctx.resource_id());
         }
     }
     drop(ctx);
@@ -3121,11 +2833,11 @@ enum Hwa2Backing {
 /// in the D3D12 DDI. The retired trailer carried the raw DDI word and a second
 /// producer wrote a *D3D12* word into the same field — a different vocabulary at
 /// overlapping bit positions, which is not a mismatch any reader can detect.
-/// Passing an HWA2 word straight into `create_optimal_present_image_alias`
+/// Passing an HWA2 word straight into `create_optimal_gdi_image`
 /// would silently drop SAMPLED and add nothing, so this translation is
 /// load-bearing rather than cosmetic.
 ///
-/// Only the three bits `create_optimal_present_image_alias` reads are mapped;
+/// Only the three bits `create_optimal_gdi_image` reads are mapped;
 /// the rest have no effect on the created image and are deliberately not
 /// invented into DDI bits the venus client would ignore anyway.
 const fn hwa2_bind_to_ddi(bind_flags: u32) -> u32 {
@@ -4752,13 +4464,8 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
         }
     }
 
-    // The PASSIVE dump site for the counters that must not mirror from their own
-    // (success-path) sites — today just `OaNoRid`. `DxgkDdiCreateAllocation` is
-    // documented PASSIVE_LEVEL, which `passive` above already asserts, and the
-    // block's own throttle bounds this to one mirror per 64 creates. Placed on
-    // the success tail only: a failed create returns early above, and the values
-    // are cumulative atomics, so skipping it there costs mirror latency and never
-    // a wrong number.
+    // PASSIVE bounded dump for allocation counters that must not perform
+    // registry I/O from their measured success paths.
     dump_alloc_counters();
     STATUS_SUCCESS
 }
@@ -5161,9 +4868,8 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
 /// instead can pin dxgkrnl's own open/destroy transition. We follow that scoped
 /// pattern and rely on the separate documented ordering that CloseAllocation is
 /// called for every binding before DestroyAllocation. We never search by resource
-/// id, geometry, current scanout, or list position. [`PresentAllocInfo`] remains
-/// `None` until its own A3 producer composes; the D4 display path reads only the
-/// canonical allocation projection.
+/// id, geometry, current scanout, or list position. The D4 display path reads
+/// only the canonical allocation projection.
 unsafe fn canonical_open_allocation(
     adapter: &AdapterContext,
     runtime_handle: u32,
@@ -5401,39 +5107,9 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         // patched WDDM capability against the live allocation generation
         // (§18.1:4723-4726).
 
-        // ⚠ A3: no `PresentAllocInfo` is constructible here. See the DDI doc.
-        // The trace-only companion IS built, because every field it carries
-        // comes from the descriptor and none of them is an identity.
-        //
-        // A PLAIN `fetch_add`: this is the SUCCESS path of every open, so `bump`
-        // would put a synchronous `RtlWriteRegistryValue` on DWM's open path at a
-        // period the workload chooses. The atomic is mirrored from
-        // [`ALLOC_COUNTERS`] on the create DDI's PASSIVE cadence instead.
-        if desc.is_some() {
-            OPEN_NO_RESOURCE_ID.fetch_add(1, Ordering::Relaxed);
-        }
-        let present_diag = desc.map(|desc| PresentAllocDiag {
-            runtime_allocation: info.hAllocation,
-            // §10.3 offset 84 carries the exact OS enum when `STANDARD` is set
-            // and zero otherwise, which is precisely this field's contract.
-            standard_allocation_type: desc.standard_allocation_type,
-            // ⛔ NOT CARRIED BY HWA2. The retired trailer packed
-            // `D3DKMDT_GDISURFACETYPE` into its misc word; §10.3's misc
-            // vocabulary has four bits and none of them is it. The honest
-            // successor is the swizzle class — a GDI texture is the OPAQUE
-            // OPTIMAL one — but that is a different value with a different
-            // meaning, so this trace field reports 0 rather than a lookalike.
-            standard_gdi_surface_type: 0,
-            open_flags,
-            resource_associated: desc.has_flag(HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED),
-            allocation_private_size: info.PrivateDriverDataSize,
-            resource_private_size: args.PrivateDriverSize,
-        });
         let open = Box::new(OpenAllocationContext {
             magic: OPEN_ALLOCATION_CTX_MAGIC,
             allocation: canonical_allocation,
-            present: None,
-            present_diag,
             identity: open_identity,
             reply_pool_session,
             execution,

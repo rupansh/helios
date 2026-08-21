@@ -191,11 +191,6 @@ impl<T> FixedVec<T> {
         self.entries.retain(f);
     }
 
-    /// Replace the entry at `index`, returning the old value.
-    pub(crate) fn replace_at(&mut self, index: usize, value: T) -> T {
-        core::mem::replace(&mut self.entries[index], value)
-    }
-
     /// Remove by swapping the last entry into `index`. O(1), order-destroying —
     /// use only on tables with no order invariant.
     pub(crate) fn swap_remove(&mut self, index: usize) -> T {

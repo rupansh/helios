@@ -8,7 +8,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::adapter::{AdapterContext, WddmNotifyGuard};
-use crate::ddi::present_packet::{PresentSubmissionBoundary, PresentSubmissionPrivate};
+use crate::ddi::present_packet::{D3d12SubmissionBoundary, D3d12SubmissionPrivate};
 use crate::dxgk::_DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_DMA_COMPLETED;
 use crate::dxgk::*;
 
@@ -65,15 +65,11 @@ pub static D3D12_SUBMIT_RECORDS: AtomicU32 = AtomicU32::new(0);
 /// to be sampling a real ring-1 fence: `D12Zero` climbing then means the ICD
 /// handed it nothing.
 ///
-/// ⚠ `EscSubRing` IS THE CROSS-CHECK BUT ONLY AS A DELTA. It is adapter-global and
-/// DWM's own present path makes it nonzero, so "`EscSubRing == 0` ⇒ no such fence
-/// exists to name" is a test that can never pass. Compare an idle-desktop delta
-/// with a probe delta over the same wall-clock window; the procedure is beside the
-/// static in `virtio/counters.rs`.
+/// This is an image-lifetime census. Attribute it only as a delta over a
+/// correlated D3D12 submission window.
 pub static D3D12_SUBMIT_ZERO_FENCE: AtomicU32 = AtomicU32::new(0);
 /// Records whose boundary could not be written into this Render's private data
-/// (`merge_fence` refused: null pointer, or a private-data buffer shorter than
-/// the 32-byte record).
+/// because the buffer was null or shorter than the fixed record.
 ///
 /// Must stay 0: `DxgkDdiCreateContext` reports
 /// `PRESENT_DMA_PRIVATE_DATA_BYTES = 64` for EVERY context, so
@@ -84,7 +80,7 @@ pub static D3D12_SUBMIT_MERGE_FAILS: AtomicU32 = AtomicU32::new(0);
 /// buffer, and merged their fences (largest wins).
 ///
 /// This is the counter for the recycled-buffer hazard, and it is the reason the
-/// hazard is closed rather than merely counted: `mark_d3d12` writes on every
+/// hazard is closed rather than merely counted: `mark` writes on every
 /// record and `decode` consumes the D3D12 arm, so a predecessor can now only be
 /// an ECL batched into the SAME DMA buffer, or a buffer whose earlier submission
 /// never reached SubmitCommand (preempted / TDR-abandoned). Both merge
@@ -95,31 +91,8 @@ pub static D3D12_SUBMIT_MERGE_FAILS: AtomicU32 = AtomicU32::new(0);
 /// into a later submission — which is now unrepresentable, and this counter is
 /// how you would see the batching that used to make it look benign.
 pub static D3D12_SUBMIT_MERGED: AtomicU32 = AtomicU32::new(0);
-/// `'HD12'` records cleared by a `DxgkDdiRender` that did **not** write one —
-/// the present-identity Render, or any other Render on a D3D12 WDDM context.
-///
-/// ⛔ **This closes the half of the recycled-buffer hazard that `D12Merged`'s doc
-/// above assumed away.** That doc argues a predecessor "can now only be an ECL
-/// batched into the SAME DMA buffer, or a buffer whose earlier submission never
-/// reached SubmitCommand" — true, and both merge conservatively *for another ECL*.
-/// It does not cover a **non-ECL** Render inheriting the record, which UP-9 made
-/// possible by adding a second `pfnRenderCb` on the same context that writes
-/// nothing at offset 0. `invalidate_d3d12` removes that inheritance.
-///
-/// ⚠ **NOT a failure counter, and not expected to be 0.** Nonzero means either
-/// the hazard was live (a stale record really was inherited before this landed),
-/// or — the benign and probably dominant cause — dxgkrnl batched an ECL and a
-/// present identity into one DMA buffer, in which case the cleared boundary was
-/// correct for that packet and the packet falls back to the conservative
-/// `next_wire_fence` prefix. ⛔ The two are not separable by this counter alone;
-/// `D12Clr` climbing in lockstep with present frequency is the batching, while
-/// `D12Clr` moving on a run with no D3D12 presents at all is the hazard.
-///
-/// ⚠ It was one of the terms missing from the `D12Exact` "identity" this file's
-/// mirror comment used to assert. **That identity is retired** — it could not hold
-/// for four other reasons besides this one, and its failure was documented as
-/// re-opening a closed defect. `D12Exact` now carries a sound bound and a
-/// qualitative A4 signal instead; see `D3D12_EXACT_WATERMARK_USED`.
+/// Consume-once HD12 records cleared by a Render that did not write a new one.
+/// This is a recycled-DMA-buffer safety census, not a failure counter.
 pub static D3D12_STALE_RECORD_CLEARED: AtomicU32 = AtomicU32::new(0);
 
 /// Mirror the DISPATCH-safe engine tracers into the PASSIVE diag ring. Call ONLY
@@ -162,7 +135,7 @@ pub fn diag_dump_engine_atomics() {
     // C3/M3.4 async-transport atoms:
     //   0x0F13_NNNN = async SUBMIT_3D enqueues   0x0F14_NNNN = completions
     //   0x0F15_NNNN = WDDM fences completed from the DPC
-    //   0x0F16_NNNN = WAIT_FENCE timeouts        0x0F17_NNNN = sync cmd timeouts
+    //   0x0F17_NNNN = sync command timeouts
     crate::diag::record(
         0x0F13_0000 | (crate::virtio::gpu::ASYNC_SUBMIT_COUNT.load(Ordering::Relaxed) & 0xFFFF),
     );
@@ -171,9 +144,6 @@ pub fn diag_dump_engine_atomics() {
     );
     crate::diag::record(
         0x0F15_0000 | (crate::virtio::gpu::WDDM_FENCE_FROM_DPC.load(Ordering::Relaxed) & 0xFFFF),
-    );
-    crate::diag::record(
-        0x0F16_0000 | (crate::virtio::gpu::FENCE_WAIT_TIMEOUTS.load(Ordering::Relaxed) & 0xFFFF),
     );
     crate::diag::record(
         0x0F17_0000 | (crate::virtio::gpu::CTRL_TIMEOUT_COUNT.load(Ordering::Relaxed) & 0xFFFF),
@@ -392,7 +362,7 @@ fn note_and_maybe_signal(
     adapter: &AdapterContext,
     fence: u32,
     is_paging: bool,
-    present_submission: Option<PresentSubmissionBoundary>,
+    d3d12_submission: Option<D3d12SubmissionBoundary>,
     preadmitted: Option<crate::adapter::OrderedEngineTicket>,
 ) -> SubmitAck {
     let complete_now = adapter.with_wddm_notify_lock(|guard| {
@@ -403,19 +373,10 @@ fn note_and_maybe_signal(
         };
         let admission = guard
             .with_virtio(|o, v| {
-                let gpu_completion_fence = present_submission.and_then(|present| {
-                    (present.gpu_fence_id != 0).then_some(present.gpu_fence_id)
+                let gpu_completion_fence = d3d12_submission.and_then(|submission| {
+                    (submission.gpu_fence_id != 0).then_some(submission.gpu_fence_id)
                 });
-                // D3D12 selects the exact F21/A4 boundary; ordinary submissions
-                // retain their conservative prefix semantics.
-                let d3d12 = present_submission.is_some_and(|present| present.d3d12);
-                v.note_wddm_submission(
-                    o,
-                    ticket,
-                    is_paging,
-                    gpu_completion_fence,
-                    d3d12,
-                )
+                v.note_wddm_submission(o, ticket, is_paging, gpu_completion_fence)
             })
             // Transport down is a failed boundary, never proof of completion.
             .unwrap_or(crate::virtio::gpu::WddmAdmission::Failed);
@@ -434,7 +395,7 @@ fn note_and_maybe_signal(
     SubmitAck::Accepted
 }
 
-/// The ONE present-marker decoder, shared by both SubmitCommand entry points.
+/// The one D3D12 boundary decoder shared by both SubmitCommand entry points.
 ///
 /// `kmd_range` is the half of the private data the KMD owns: `umd..total` on the
 /// virtual path (dxgkrnl reports a UMD prefix size) and `start..end` on the
@@ -445,35 +406,24 @@ fn note_and_maybe_signal(
 /// `base` must be readable and writable for `total` bytes for the duration of
 /// the call.
 ///
-/// THE PRESENT RECORD IS NOT MUTATED, and that rule stands: replay is resolved by
-/// exact pending/terminal membership in `VirtioGpu`, because preemption may
-/// resubmit that same documented record after the host copy has already
-/// terminalized.
-///
-/// ⚠ THE D3D12 RECORD IS THE EXCEPTION — `PresentSubmissionPrivate::decode`
-/// consumes that one arm, which is why `base` is now `*mut`. The reason is the
-/// hazard in the other direction: dxgkrnl recycles these buffers, and a D3D12
-/// boundary left behind is read again by the next submission that reuses the
-/// buffer, gating it on an already-retired fence. The replay cost is acceptable
-/// where the Present path's would not have been: a replayed D3D12 packet finds no
-/// record and falls back to `next_wire_fence`, i.e. every transport entry
-/// enqueued before it — conservative, always eventually satisfied, never a lie.
-unsafe fn decode_present_fence(
+/// The record is consumed: a replay falls back to the conservative prefix and
+/// can never reuse an already-retired exact boundary.
+unsafe fn decode_d3d12_boundary(
     base: *mut u8,
     total: usize,
     kmd_range: core::ops::Range<usize>,
-) -> Option<PresentSubmissionBoundary> {
+) -> Option<D3d12SubmissionBoundary> {
     if !base.is_null() && kmd_range.start <= kmd_range.end && kmd_range.end <= total {
         let size = kmd_range.end - kmd_range.start;
-        if let Some(fence) = unsafe {
-            PresentSubmissionPrivate::decode(base.add(kmd_range.start).cast(), size as u32)
-        } {
+        if let Some(fence) =
+            unsafe { D3d12SubmissionPrivate::decode(base.add(kmd_range.start).cast(), size as u32) }
+        {
             return Some(fence);
         }
     }
-    if let Some(fence) = unsafe {
-        PresentSubmissionPrivate::decode(base.cast(), total.min(u32::MAX as usize) as u32)
-    } {
+    if let Some(fence) =
+        unsafe { D3d12SubmissionPrivate::decode(base.cast(), total.min(u32::MAX as usize) as u32) }
+    {
         return Some(fence);
     }
     None
@@ -509,23 +459,23 @@ unsafe fn arm_dma_flip(adapter: &AdapterContext, base: *mut c_void, total: u32) 
     };
 }
 
-unsafe fn decode_virtual_present_fence(
+unsafe fn decode_virtual_d3d12_boundary(
     submit: &DXGKARG_SUBMITCOMMANDVIRTUAL,
-) -> Option<PresentSubmissionBoundary> {
+) -> Option<D3d12SubmissionBoundary> {
     let base = submit.pDmaBufferPrivateData.cast::<u8>();
     let total = submit.DmaBufferPrivateDataSize as usize;
     let umd = submit.DmaBufferUmdPrivateDataSize as usize;
-    unsafe { decode_present_fence(base, total, umd..total) }
+    unsafe { decode_d3d12_boundary(base, total, umd..total) }
 }
 
-unsafe fn decode_legacy_present_fence(
+unsafe fn decode_legacy_d3d12_boundary(
     submit: &DXGKARG_SUBMITCOMMAND,
-) -> Option<PresentSubmissionBoundary> {
+) -> Option<D3d12SubmissionBoundary> {
     let base = submit.pDmaBufferPrivateData.cast::<u8>();
     let total = submit.DmaBufferPrivateDataSize as usize;
     let start = submit.DmaBufferPrivateDataSubmissionStartOffset as usize;
     let end = submit.DmaBufferPrivateDataSubmissionEndOffset as usize;
-    unsafe { decode_present_fence(base, total, start..end) }
+    unsafe { decode_d3d12_boundary(base, total, start..end) }
 }
 
 /// `DxgkDdiSubmitCommandVirtual` — submit a DMA buffer addressed by GPU virtual
@@ -594,7 +544,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
         }
     }
 
-    let present_fence = unsafe { decode_virtual_present_fence(submit) };
+    let d3d12_boundary = unsafe { decode_virtual_d3d12_boundary(submit) };
     // Before the completion bookkeeping: a flip carried in this buffer must be
     // armed while its fence is still outstanding, which is the whole point of
     // the DMA-flip contract. It also mints the presentation epoch and takes the
@@ -608,7 +558,8 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
     };
     // The submission is accepted regardless of how the notification went; a
     // non-SUCCESS return here bugchecks dxgmms2 with 0x119 Arg1=2.
-    let SubmitAck::Accepted = note_and_maybe_signal(adapter, fence, is_paging, present_fence, None);
+    let SubmitAck::Accepted =
+        note_and_maybe_signal(adapter, fence, is_paging, d3d12_boundary, None);
     STATUS_SUCCESS
 }
 
@@ -739,7 +690,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
         }
     }
 
-    let present_fence = unsafe { decode_legacy_present_fence(submit) };
+    let d3d12_boundary = unsafe { decode_legacy_d3d12_boundary(submit) };
     unsafe {
         arm_dma_flip(
             adapter,
@@ -748,7 +699,8 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
         )
     };
     // As above: accepted regardless of the notification outcome.
-    let SubmitAck::Accepted = note_and_maybe_signal(adapter, fence, is_paging, present_fence, None);
+    let SubmitAck::Accepted =
+        note_and_maybe_signal(adapter, fence, is_paging, d3d12_boundary, None);
     STATUS_SUCCESS
 }
 
@@ -1145,7 +1097,7 @@ pub unsafe extern "C" fn dxgkddi_render(
     // ⛔ BRANCH ON THE CONTEXT ROLE, NEVER ON A FOURTH COMMAND MAGIC. The three
     // arms below are magic-disjoint by construction; a magic-keyed HNR2 arm
     // would let a legacy DWM/CDD Render take the HNR2 path, and an HNR2 Render
-    // would still fall through `invalidate_d3d12` and the tail memcpy. This
+    // would still fall through `invalidate` and the tail memcpy. This
     // returns before all of them.
     //
     // ⚠ `h_context` IS NULL-CHECKED HERE and was not checked anywhere in this
@@ -1179,7 +1131,7 @@ pub unsafe extern "C" fn dxgkddi_render(
     // packet at all. The record's `gpu_wire_fence` is the completion boundary,
     // and writing it into THIS Render's `pDmaBufferPrivateData` is the whole
     // commit: `dxgkddi_submit_command{,_virtual}` already decode a
-    // `PresentSubmissionPrivate` from that same buffer unconditionally
+    // `D3d12SubmissionPrivate` from that same buffer unconditionally
     // (`:871` / `:827`, keyed only on the record's magic — nothing there is
     // Present-specific), and `note_wddm_submission` already turns a nonzero
     // `gpu_fence_id` into `RetireDomain::IncludingGpu` with the exact watermark.
@@ -1189,7 +1141,7 @@ pub unsafe extern "C" fn dxgkddi_render(
     // `pDmaBufferPrivateData` + `DmaBufferPrivateDataSize`
     // (`tmp/dx12/sdk/d3dkmddi.h:130-147`). Offset 0, and the pointer is NOT
     // advanced — the shape the Present path already proves, and the shape
-    // SubmitCommand's offset-0 fallback (`decode_present_fence`) reads.
+    // SubmitCommand's offset-0 fallback (`decode_d3d12_boundary`) reads.
     //
     // ⛔ THE WRITE IS UNCONDITIONAL, INCLUDING THE ZERO-FENCE ARM, and that is a
     // correction of this arm's first form (which declined to write when the fence
@@ -1200,7 +1152,7 @@ pub unsafe extern "C" fn dxgkddi_render(
     // `ID3D12Fence` signals early while `D12Rec` moves, `D12MrgF` is 0 and
     // `GpuFncClamp` is 0. The original defect wearing the instrumentation of the
     // fix. Writing every time makes "no boundary" explicit for THIS submission
-    // instead of inherited from another one, `mark_d3d12`'s own magic keeps an
+    // instead of inherited from another one, `mark`'s own magic keeps an
     // all-zero payload identifiable, and `decode` consumes the D3D12 arm so a
     // missing write can only fail safe. It does not touch the
     // `D12Rec` and `D12Merged` count this arm.
@@ -1231,7 +1183,7 @@ pub unsafe extern "C" fn dxgkddi_render(
                 D3D12_SUBMIT_ZERO_FENCE.fetch_add(1, Ordering::Relaxed);
             }
             match unsafe {
-                PresentSubmissionPrivate::mark_d3d12(
+                D3d12SubmissionPrivate::mark(
                     args.pDmaBufferPrivateData,
                     args.DmaBufferPrivateDataSize,
                     command.gpu_wire_fence,
@@ -1258,7 +1210,7 @@ pub unsafe extern "C" fn dxgkddi_render(
 
     // ⛔ THE OTHER HALF OF THE UNCONDITIONAL WRITE ABOVE. A Render that did not
     // stamp a `'HD12'` record must not leave one it found, or it inherits another
-    // submission's boundary. `mark_d3d12`'s write covers the ECL arm; this covers
+    // submission's boundary. `mark` covers the ECL arm; this covers
     // every other `pfnRenderCb` on a D3D12 WDDM context — above all UP-9's
     // present-identity Render, which writes nothing at offset 0.
     //
@@ -1268,13 +1220,12 @@ pub unsafe extern "C" fn dxgkddi_render(
     // one), so once that arm has been decided nothing later can re-stamp it.
     //
     // ⚠ A HOLE WAS SUSPECTED HERE AND IS **REFUTED BY GUARD SYMMETRY** — recorded
-    // so it is not re-raised. `stamped_d3d12` is set on the `mark_d3d12` ERROR arm
+    // so it is not re-raised. `stamped_d3d12` is set on the `mark` error arm
     // too, which looks like a Render that neither writes nor clears and could
-    // therefore inherit a predecessor's boundary. It cannot: `mark_d3d12`,
-    // `invalidate_d3d12` and `peek` carry the **identical** guard
-    // (`private_data.is_null() || private_size < size_of::<PresentSubmissionPrivate>()`).
-    // So `mark_d3d12` returning `Err` implies `invalidate_d3d12` would have
-    // returned `false` anyway AND `peek` returns `None`, i.e. the buffer is too
+    // therefore inherit a predecessor's boundary. It cannot: `mark`,
+    // `invalidate`, and `decode` carry the identical null/size guard.
+    // So `mark` returning `Err` implies `invalidate` returns false and `decode`
+    // returns `None`, i.e. the buffer is too
     // small (or absent) to hold a record at all — there is nothing to inherit and
     // no boundary is decoded. The three guards must stay identical for this
     // argument to hold; that is the invariant to preserve, not the branch.
@@ -1284,7 +1235,7 @@ pub unsafe extern "C" fn dxgkddi_render(
     // touching a byte, and writes only the 4-byte magic at offset 0.
     if !stamped_d3d12
         && unsafe {
-            PresentSubmissionPrivate::invalidate_d3d12(
+            D3d12SubmissionPrivate::invalidate(
                 args.pDmaBufferPrivateData,
                 args.DmaBufferPrivateDataSize,
             )
@@ -1580,8 +1531,9 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         crate::virtio::gpu::ASYNC_SUBMIT_COUNT.load(Ordering::Relaxed),
         crate::virtio::gpu::ASYNC_COMPLETE_COUNT.load(Ordering::Relaxed),
         crate::virtio::gpu::ASYNC_RESP_ERRORS.load(Ordering::Relaxed),
-        crate::virtio::gpu::FENCE_WAIT_REGISTERED.load(Ordering::Relaxed),
-        crate::virtio::gpu::FENCE_WAIT_TIMEOUTS.load(Ordering::Relaxed),
+        // Retired GPU-wait registration/timeout words retain their indices.
+        0,
+        0,
         crate::virtio::gpu::DRAIN_BAD_TOKEN.load(Ordering::Relaxed),
         crate::virtio::gpu::QUEUE_FULL_RETRIES.load(Ordering::Relaxed),
         crate::virtio::gpu::WDDM_PENDING_OVERFLOWS.load(Ordering::Relaxed),
@@ -1598,13 +1550,8 @@ pub unsafe extern "C" fn dxgkddi_collect_dbg_info(
         // Second retired v5 control-path word retained for the same fixed-index
         // compatibility; neither word is backed by a live outbound carrier.
         0,
-        // v6 (R604): split out of FENCE_WAIT_TIMEOUTS (word 25), which now means
-        // only "the host did not complete this fence". This word means "all 64
-        // waiter slots were taken", a guest table-size condition. The report is
-        // decoded offline BY INDEX, so word 25 keeps its meaning and the new
-        // word is appended — never renumbered — and the version word above moves
-        // with the array in the same commit.
-        crate::virtio::gpu::FENCE_WAIT_TABLE_FULL.load(Ordering::Relaxed),
+        // Retired GPU-wait table-full word; fixed-index offline ABI.
+        0,
         // v7: D0 provider registration, appended so every older word retains its index.
         etw_registration.attempts,
         etw_registration.failures,

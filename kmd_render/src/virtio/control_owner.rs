@@ -296,11 +296,7 @@ impl OwnerStorageArena {
             StorageClass::ContextRows,
             ContextSlot::vacant,
         )?;
-        let pairs = allocate_exact(
-            PAIR_CAPACITY,
-            StorageClass::PairRows,
-            PairSlot::vacant,
-        )?;
+        let pairs = allocate_exact(PAIR_CAPACITY, StorageClass::PairRows, PairSlot::vacant)?;
         let windows = allocate_exact(
             WINDOW_CAPACITY,
             StorageClass::WindowRows,
@@ -316,11 +312,8 @@ impl OwnerStorageArena {
             StorageClass::ContextTickets,
             ContextTicket::empty,
         )?;
-        let pair_tickets = allocate_exact(
-            PAIR_CAPACITY,
-            StorageClass::PairTickets,
-            PairTicket::empty,
-        )?;
+        let pair_tickets =
+            allocate_exact(PAIR_CAPACITY, StorageClass::PairTickets, PairTicket::empty)?;
         let window_tickets = allocate_exact(
             WINDOW_CAPACITY,
             StorageClass::WindowTickets,
@@ -601,9 +594,7 @@ impl TransportOwner {
         // host completion; without the close, even an otherwise empty context
         // is correctly refused as non-terminal and K11 can never retire its
         // per-session host namespace.
-        table
-            .close_context_admission(row)
-            .map_err(owner_refusal)?;
+        table.close_context_admission(row).map_err(owner_refusal)?;
         let prepared = table.begin_context_destroy(row).map_err(owner_refusal)?;
         table.dispatch_context(prepared).map_err(|refused| {
             let error = owner_refusal(refused.reason());
@@ -712,14 +703,12 @@ impl TransportOwner {
             Err(refused) => {
                 let error = owner_refusal(refused.reason());
                 let finalizer = match refused.into_custody() {
-                    ReturnedCustody::Input(custody)
-                    | ReturnedCustody::Quarantined(custody) => Some(custody.finalizer),
+                    ReturnedCustody::Input(custody) | ReturnedCustody::Quarantined(custody) => {
+                        Some(custody.finalizer)
+                    }
                     ReturnedCustody::TableQuarantined => None,
                 };
-                return Err(ResourceCreateBeginRefusal {
-                    error,
-                    finalizer,
-                });
+                return Err(ResourceCreateBeginRefusal { error, finalizer });
             }
         };
         let id = match table.resource(row) {
@@ -974,28 +963,6 @@ impl TransportOwner {
             .resource_backing(resource)
             .map_err(owner_refusal)?
             .size)
-    }
-
-    pub(crate) fn blob_lookup(
-        &self,
-        resource_id: u32,
-    ) -> Result<Option<(Option<super::gpu::DeviceOwner>, u64, bool)>, super::VirtioError> {
-        let mut state = self.state.lock();
-        let table = state.table_mut()?;
-        let resource = match table.resource_handle_by_id(resource_id) {
-            Ok(resource) => resource,
-            Err(OwnerTableRefusal::ResourceNotFound) => return Ok(None),
-            Err(reason) => return Err(owner_refusal(reason)),
-        };
-        let backing = table.resource_backing(resource).map_err(owner_refusal)?;
-        let owner = backing.owner;
-        let size = backing.size;
-        let mapped = match table.window_handle_by_resource_id(resource_id) {
-            Ok(window) => table.mapped_window(window).is_ok(),
-            Err(OwnerTableRefusal::WindowNotFound) => false,
-            Err(reason) => return Err(owner_refusal(reason)),
-        };
-        Ok(Some((owner, size, mapped)))
     }
 
     pub(crate) fn first_overlapping_window_resource(
@@ -1260,14 +1227,6 @@ impl TransportOwner {
                     .map_err(|_| super::VirtioError::DeviceError)?;
                 Ok(effect)
             }
-        }
-    }
-
-    pub(crate) fn resource_is_live(&self, resource_id: u32) -> bool {
-        let mut state = self.state.lock();
-        match state.table_mut() {
-            Ok(table) => table.resource_handle_by_id(resource_id).is_ok(),
-            Err(_) => false,
         }
     }
 
@@ -1583,10 +1542,7 @@ impl TransportOwner {
                     );
                     drop(backing);
                     drop(association);
-                    crate::virtio::ctrl::finalize_resource_backing_after_reset(
-                        passive,
-                        finalizer,
-                    );
+                    crate::virtio::ctrl::finalize_resource_backing_after_reset(passive, finalizer);
                     pending
                 }
                 OwnerResetAction::Context(action) => {

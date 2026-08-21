@@ -82,9 +82,8 @@ fn drain_ordered_engine_locked(
         // SAFETY: the WDDM notification lock is held; `ready.fence()` is the
         // exact OS fence admitted at SubmitCommand arrival and is currently the
         // ordered engine head.
-        let status = unsafe {
-            super::submit_command::signal_dma_completed(guard, dxgkrnl, ready.fence())
-        };
+        let status =
+            unsafe { super::submit_command::signal_dma_completed(guard, dxgkrnl, ready.fence()) };
         if status != STATUS_SUCCESS {
             super::submit_command::DMA_NOTIFY_FAILS.fetch_add(1, Ordering::Relaxed);
             guard.note_ordered_engine_notify_retry();
@@ -111,10 +110,7 @@ fn drain_ordered_engine_locked(
 /// Retry the K7 empty-array native-fence rescan only downstream of a
 /// successfully delivered DMA frontier edge. The count remains published until
 /// dxgkrnl accepts the callback; success subtracts only the observed prefix.
-fn service_native_fence_rescans(
-    adapter: &AdapterContext,
-    guard: &WddmNotifyGuard<'_>,
-) {
+fn service_native_fence_rescans(adapter: &AdapterContext, guard: &WddmNotifyGuard<'_>) {
     // Keep pending nonzero until dxgkrnl accepts the edge. The guard serializes
     // DPCs and reset; exchange-before-callback would instead require restoring
     // credit after failure and risks carrying an old edge into a successor.
@@ -146,8 +142,7 @@ pub(crate) fn complete_ordered_engine_submission(
     let (disposition, delivered) = adapter.with_wddm_notify_lock(|guard| {
         let disposition = guard.mark_ordered_engine_host_completed(ticket);
         let delivered = match disposition {
-            CompletionDisposition::Marked { .. }
-            | CompletionDisposition::AlreadyCompleted => {
+            CompletionDisposition::Marked { .. } | CompletionDisposition::AlreadyCompleted => {
                 drain_ordered_engine_locked(adapter, guard).delivered
             }
             CompletionDisposition::StaleEpoch
@@ -199,15 +194,15 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
                 .unwrap_or(crate::virtio::WddmTake::Empty);
             let ready = match taken {
                 crate::virtio::WddmTake::Ready(ready) => ready,
-                crate::virtio::WddmTake::Empty
-                | crate::virtio::WddmTake::BlockedOnProducer => break,
+                crate::virtio::WddmTake::Empty | crate::virtio::WddmTake::BlockedOnProducer => {
+                    break
+                }
             };
             let ticket = ready.engine_ticket();
             let disposition = guard.mark_ordered_engine_host_completed(ticket);
             let mark_owned = matches!(
                 disposition,
-                CompletionDisposition::Marked { .. }
-                    | CompletionDisposition::AlreadyCompleted
+                CompletionDisposition::Marked { .. } | CompletionDisposition::AlreadyCompleted
             );
             if mark_owned {
                 let _ = drain_ordered_engine_locked(adapter, guard);
@@ -225,9 +220,8 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
 
             // Preserve the exact FIFO owner when the K9 frontier cannot yet
             // consume it. Bypassing this entry would violate engine order.
-            let _ = guard.with_virtio(|order, transport| {
-                transport.requeue_wddm_front(order, ready)
-            });
+            let _ =
+                guard.with_virtio(|order, transport| transport.requeue_wddm_front(order, ready));
             break;
         }
 

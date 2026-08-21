@@ -106,14 +106,12 @@ fn typecheck_d9_disabled_legacy_callbacks() {
     let _ = scheduler::dxgkddi_switch_to_hw_context_list;
     let _ = scheduler::dxgkddi_present_to_hw_queue;
 }
-pub(crate) use submit_command::{
-    abandon_pending_submissions, AbandonOutcome,
-};
 pub use native_render::diag_dump_native_render_atomics;
-pub use translation_session::diag_dump_translation_session_atomics;
+pub(crate) use submit_command::{abandon_pending_submissions, AbandonOutcome};
 pub use submit_command::{
     diag_dump_engine_atomics, dxgkddi_collect_dbg_info, dxgkddi_patch, dxgkddi_preempt_command,
     dxgkddi_query_current_fence, dxgkddi_render, dxgkddi_render_gdi, dxgkddi_render_km,
     dxgkddi_reset_from_timeout, dxgkddi_restart_from_timeout, dxgkddi_submit_command,
     dxgkddi_submit_command_virtual,
 };
+pub use translation_session::diag_dump_translation_session_atomics;

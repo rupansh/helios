@@ -253,8 +253,7 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
         Some(ddi::dxgkddi_set_vidpn_source_address_with_multi_plane_overlay3);
     data.DxgkDdiGetMultiPlaneOverlayCaps = Some(ddi::dxgkddi_get_multi_plane_overlay_caps);
     data.DxgkDdiGetPostCompositionCaps = Some(ddi::dxgkddi_get_post_composition_caps);
-    data.DxgkDdiPostMultiPlaneOverlayPresent =
-        Some(ddi::dxgkddi_post_multi_plane_overlay_present);
+    data.DxgkDdiPostMultiPlaneOverlayPresent = Some(ddi::dxgkddi_post_multi_plane_overlay_present);
     data.DxgkDdiValidateUpdateAllocationProperty =
         Some(ddi::dxgkddi_validate_update_allocation_property);
     data.DxgkDdiControlModeBehavior = Some(ddi::dxgkddi_control_mode_behavior);

@@ -60,7 +60,6 @@ pub fn allocate_host_visible_blob(
     let blob = HostVisibleBlob {
         blob_id: blob.blob_id,
         res_id: blob.res_id,
-        gpa: pt_prep.gpa,
         size: pt_prep.size,
     };
     diag(0x000C);
@@ -291,48 +290,8 @@ impl VenusRing {
 }
 
 impl VenusInstance {
-    /// `vkGetDeviceQueue2` for family 0, queue 0 on ring 1.
-    ///
-    /// Takes the device id as an argument rather than reading a field: at this
-    /// point the device exists but the `VenusClient` that will own it does not,
-    /// which is exactly the window the old two-phase init left writable.
-    pub(super) fn get_device_queue(
-        &mut self,
-        adapter: &AdapterContext,
-        device_id: VkDeviceId,
-    ) -> Result<VkQueueId, VirtioError> {
-        let queue_id = self.ring.next_raw();
-        let mut w = Writer::new();
-        w.header(CMD_GET_DEVICE_QUEUE_2, CMD_FLAG_GENERATE_REPLY);
-        w.handle(device_id);
-        w.count(true); // pQueueInfo
-        w.i32(ST_DEVICE_QUEUE_INFO_2);
-        w.count(true); // pNext: VkDeviceQueueTimelineInfoMESA
-        w.i32(ST_DEVICE_QUEUE_TIMELINE_INFO_MESA);
-        w.count(false);
-        w.u32(1); // ringIdx; 0 is the renderer's CPU timeline.
-        w.u32(0); // flags
-        w.u32(0); // queueFamilyIndex
-        w.u32(0); // queueIndex
-        w.count(true);
-        w.u64(queue_id.get());
-        // No VkResult in this reply shape: word 1 is the simple-pointer.
-        let mut r = self.ring.ring_command_expect(
-            adapter,
-            w.as_slice()?,
-            ReplyCheck::new(CMD_GET_DEVICE_QUEUE_2).mismatch(0x0110),
-        )?;
-        if r.read_u64()? == 0 {
-            diag(0x0111);
-            return Err(VirtioError::DeviceError);
-        }
-        // The host may substitute its own handle; adopt it when it does.
-        let returned = r.read_u64()?;
-        Ok(VkQueueId::from_raw(returned).unwrap_or(VkQueueId(queue_id)))
-    }
-
-    /// Bring-up stages 6-7 plus the queue: memory properties, the CreateDevice
-    /// extension ladder, and `vkGetDeviceQueue2`.
+    /// Bring-up stages 6-7: memory properties and the CreateDevice extension
+    /// ladder.
     ///
     /// The ladder computes the device id in a LOCAL and returns it from the
     /// loop; it can no longer write a half-built client mid-retry. Each attempt
@@ -410,19 +369,12 @@ impl VenusInstance {
         let device_id = self.create_device_with_ext_ladder(adapter)?;
         diag(0x0009);
 
-        let queue_id = self.get_device_queue(adapter, device_id)?;
-        diag(0x000D);
-
         Ok(VenusClient {
             ring: self.ring,
             device_id,
-            queue_id,
             memory_type_index,
             memory_type_flags,
             memory_type_count,
-            present_images: Vec::with_capacity(MAX_PRESENT_IMAGES),
-            present_buffers: Vec::with_capacity(MAX_PRESENT_BUFFERS),
-            present_blits: Vec::with_capacity(MAX_PRESENT_BLITS),
             owned_memory_blobs: Vec::with_capacity(MAX_OWNED_MEMORY_BLOBS),
         })
     }

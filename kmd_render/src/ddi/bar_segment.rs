@@ -207,13 +207,7 @@ pub(super) fn build_segment_table(
                 u64::from(knobs.bar_seg_base_mb) << 20
             };
             let reported_size = vidmm_vram_size.unwrap_or(bar.size);
-            specs[len] = SegmentSpec::bar(
-                bar.gpa,
-                gpu_base,
-                reported_size,
-                bar.size,
-                knobs,
-            );
+            specs[len] = SegmentSpec::bar(bar.gpa, gpu_base, reported_size, bar.size, knobs);
             len += 1;
         }
         // Disabled: the recovery baseline.

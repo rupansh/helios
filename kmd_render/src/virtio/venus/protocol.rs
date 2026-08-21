@@ -12,29 +12,11 @@ pub(crate) const CMD_CREATE_INSTANCE: u32 = 0;
 pub(crate) const CMD_ENUMERATE_PHYSICAL_DEVICES: u32 = 2;
 pub(crate) const CMD_GET_PHYSICAL_DEVICE_MEMORY_PROPERTIES: u32 = 8;
 pub(crate) const CMD_CREATE_DEVICE: u32 = 11;
-pub(crate) const CMD_QUEUE_SUBMIT: u32 = 18;
 pub(crate) const CMD_FREE_MEMORY: u32 = 22;
 pub(crate) const CMD_BIND_IMAGE_MEMORY: u32 = 29;
-pub(crate) const CMD_BIND_BUFFER_MEMORY: u32 = 28;
-pub(crate) const CMD_GET_BUFFER_MEMORY_REQUIREMENTS: u32 = 30;
 pub(crate) const CMD_GET_IMAGE_MEMORY_REQUIREMENTS: u32 = 31;
-pub(crate) const CMD_CREATE_FENCE: u32 = 35;
-pub(crate) const CMD_DESTROY_FENCE: u32 = 36;
-pub(crate) const CMD_WAIT_FOR_FENCES: u32 = 39;
-pub(crate) const CMD_CREATE_BUFFER: u32 = 50;
-pub(crate) const CMD_DESTROY_BUFFER: u32 = 51;
 pub(crate) const CMD_DESTROY_IMAGE: u32 = 55;
 pub(crate) const CMD_GET_IMAGE_SUBRESOURCE_LAYOUT: u32 = 56;
-pub(crate) const CMD_CREATE_COMMAND_POOL: u32 = 85;
-pub(crate) const CMD_DESTROY_COMMAND_POOL: u32 = 86;
-pub(crate) const CMD_ALLOCATE_COMMAND_BUFFERS: u32 = 88;
-pub(crate) const CMD_BEGIN_COMMAND_BUFFER: u32 = 90;
-pub(crate) const CMD_END_COMMAND_BUFFER: u32 = 91;
-pub(crate) const CMD_COPY_IMAGE: u32 = 113;
-pub(crate) const CMD_BLIT_IMAGE: u32 = 114;
-pub(crate) const CMD_COPY_IMAGE_TO_BUFFER: u32 = 116;
-pub(crate) const CMD_PIPELINE_BARRIER: u32 = 126;
-pub(crate) const CMD_GET_DEVICE_QUEUE_2: u32 = 155;
 pub(crate) const CMD_SET_REPLY_COMMAND_STREAM_MESA: u32 = 178;
 pub(crate) const CMD_CREATE_RING_MESA: u32 = 188;
 pub(crate) const CMD_NOTIFY_RING_MESA: u32 = 190;
@@ -46,52 +28,11 @@ pub(crate) const CMD_NOTIFY_RING_MESA: u32 = 190;
 pub(crate) const ST_INSTANCE_CREATE_INFO: i32 = 1;
 pub(crate) const ST_DEVICE_QUEUE_CREATE_INFO: i32 = 2;
 pub(crate) const ST_DEVICE_CREATE_INFO: i32 = 3;
-pub(crate) const ST_SUBMIT_INFO: i32 = 4;
-pub(crate) const ST_BUFFER_CREATE_INFO: i32 = 12;
-pub(crate) const ST_FENCE_CREATE_INFO: i32 = 8;
-pub(crate) const ST_COMMAND_POOL_CREATE_INFO: i32 = 39;
-pub(crate) const ST_COMMAND_BUFFER_ALLOCATE_INFO: i32 = 40;
-pub(crate) const ST_COMMAND_BUFFER_BEGIN_INFO: i32 = 42;
-pub(crate) const ST_BUFFER_MEMORY_BARRIER: i32 = 44;
-pub(crate) const ST_IMAGE_MEMORY_BARRIER: i32 = 45;
-pub(crate) const ST_DEVICE_QUEUE_INFO_2: i32 = 1000145003;
 pub(crate) const ST_RING_CREATE_INFO_MESA: i32 = 1000384000;
-pub(crate) const ST_DEVICE_QUEUE_TIMELINE_INFO_MESA: i32 = 1000384005;
 
-/// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT`.
-///
-/// Ordinary Helios/DXVK shared images use the renderer's OPAQUE_FD export path;
-/// the KMD alias must carry the same external-image handle type even though the
-/// actual memory import is named by `VkImportMemoryResourceInfoMESA`.
-pub(crate) const EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD: u32 = 0x0000_0001;
 /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`.
 pub(crate) const EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF: u32 = 0x0000_0200;
-
-/// External-memory transport used for an OPTIMAL image and its backing blob.
-///
-/// Keeping this as one value prevents the image-create, memory-export and
-/// import contract from drifting apart. Direct-optimal scanout images use the
-/// DMA_BUF variant; ordinary UMD images use OPAQUE_FD.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OptimalImageTransport {
-    OpaqueFd,
-    CrossContextDmaBuf,
-}
-
-impl OptimalImageTransport {
-    pub(crate) const fn handle_type(self) -> u32 {
-        match self {
-            Self::OpaqueFd => EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD,
-            Self::CrossContextDmaBuf => EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF,
-        }
-    }
-}
-pub(crate) const FORMAT_R8G8B8A8_UNORM: u32 = 37;
-pub(crate) const FORMAT_R8G8B8A8_SRGB: u32 = 43;
 pub(crate) const FORMAT_B8G8R8A8_UNORM: u32 = 44;
-pub(crate) const FORMAT_B8G8R8A8_SRGB: u32 = 50;
-pub(crate) const FORMAT_A2B10G10R10_UNORM_PACK32: u32 = 64;
-pub(crate) const FORMAT_R16G16B16A16_SFLOAT: u32 = 97;
 // IMAGE_TILING_LINEAR / IMAGE_TILING_OPTIMAL moved to `helios_kmd_logic` with
 // the encoders that write them (R1002), and the 39th session's evidence moved
 // with them. In short: LINEAR was defined as 0 (OPTIMAL), so
@@ -105,24 +46,10 @@ pub(crate) const IMAGE_USAGE_TRANSFER_DST: u32 = 0x0000_0002;
 pub(crate) const IMAGE_USAGE_SAMPLED: u32 = 0x0000_0004;
 pub(crate) const IMAGE_USAGE_STORAGE: u32 = 0x0000_0008;
 pub(crate) const IMAGE_USAGE_COLOR_ATTACHMENT: u32 = 0x0000_0010;
-pub(crate) const BUFFER_USAGE_TRANSFER_DST: u32 = 0x0000_0002;
 pub(crate) const IMAGE_CREATE_MUTABLE_FORMAT: u32 = 0x0000_0008;
 pub(crate) const IMAGE_LAYOUT_UNDEFINED: u32 = 0;
-pub(crate) const IMAGE_LAYOUT_GENERAL: u32 = 1;
 pub(crate) const IMAGE_LAYOUT_PREINITIALIZED: u32 = 8;
 pub(crate) const IMAGE_ASPECT_COLOR: u32 = 0x0000_0001;
-pub(crate) const QUEUE_FAMILY_IGNORED: u32 = u32::MAX;
-pub(crate) const QUEUE_FAMILY_EXTERNAL: u32 = u32::MAX - 1;
-// Kept for the older diagnostic call sites. Its numeric value has always been
-// VK_QUEUE_FAMILY_EXTERNAL (`~1U`), despite the historical name.
-pub(crate) const COMMAND_BUFFER_LEVEL_PRIMARY: u32 = 0;
-pub(crate) const COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT: u32 = 0x0000_0001;
-pub(crate) const COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE: u32 = 0x0000_0004;
-pub(crate) const PIPELINE_STAGE_TOP_OF_PIPE: u32 = 0x0000_0001;
-pub(crate) const PIPELINE_STAGE_TRANSFER: u32 = 0x0000_1000;
-pub(crate) const PIPELINE_STAGE_BOTTOM_OF_PIPE: u32 = 0x0000_2000;
-pub(crate) const ACCESS_TRANSFER_WRITE: u32 = 0x0000_1000;
-pub(crate) const ACCESS_TRANSFER_READ: u32 = 0x0000_0800;
 
 // ── VkMemoryPropertyFlags bits we require ────────────────────────────────────
 //
@@ -196,9 +123,9 @@ pub(crate) const RING_WAIT_TIMEOUT_MS: u64 = 30_000;
 // `writer_ext_full_create_device_is_332_bytes` there for the real number — the
 // comment that used to sit here said "~120 bytes" and was wrong by 212.
 pub(crate) use helios_kmd_logic::{
-    encode_image_create, encode_memory_allocate, ImageCreateSpec, ImagePNext, MemoryAllocateSpec,
-    MemoryPNext, MemoryTypeChoice, Writer, CMD_ALLOCATE_MEMORY, CMD_CREATE_IMAGE,
-    CMD_FLAG_GENERATE_REPLY, IMAGE_TILING_LINEAR, IMAGE_TILING_OPTIMAL, SHARING_MODE_EXCLUSIVE,
+    encode_image_create, encode_memory_allocate, ImageCreateSpec, MemoryAllocateSpec, MemoryPNext,
+    MemoryTypeChoice, Writer, CMD_ALLOCATE_MEMORY, CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY,
+    IMAGE_TILING_LINEAR, IMAGE_TILING_OPTIMAL,
 };
 
 /// Why the venus ring was declared unusable. Each arm names a registry counter

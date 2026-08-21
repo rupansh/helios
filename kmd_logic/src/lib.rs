@@ -1013,7 +1013,6 @@ pub const ST_IMAGE_CREATE_INFO: i32 = 14;
 pub const ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: i32 = 1000072001;
 pub const ST_EXPORT_MEMORY_ALLOCATE_INFO: i32 = 1000072002;
 pub const ST_MEMORY_DEDICATED_ALLOCATE_INFO: i32 = 1000127001;
-pub const ST_IMPORT_MEMORY_RESOURCE_INFO_MESA: i32 = 1000384002;
 
 pub const IMAGE_TYPE_2D: u32 = 1;
 pub const SAMPLE_COUNT_1: u32 = 0x0000_0001;
@@ -1033,30 +1032,14 @@ pub const IMAGE_TILING_OPTIMAL: u32 = 0;
 /// screen with no error anywhere. It is 1. Do not "simplify" it.
 pub const IMAGE_TILING_LINEAR: u32 = 1;
 
-/// Which pNext chain a `VkImageCreateInfo` carries.
-///
-/// An exhaustive enum rather than an ad-hoc `count(true)/i32(ST_…)` sequence, so
-/// the nesting order lives in exactly one place and an unrepresentable chain
-/// cannot be encoded.
-///
-/// The `ExternalMemoryWithModifierList` variant the review specifies is NOT
-/// here: `ST_IMAGE_DRM_FORMAT_MODIFIER_LIST_CREATE_INFO`, `DRM_FORMAT_MOD_LINEAR`
-/// and `IMAGE_TILING_DRM_FORMAT_MODIFIER` all went with T6/R906 when the modifier
-/// path was deleted, so it would have zero users.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum ImagePNext {
-    /// An internal image with no external-memory contract.
-    None,
-    /// `VkExternalMemoryImageCreateInfo` with the given `VkExternalMemoryHandleTypeFlags`.
-    ExternalMemory { handle_type: u32 },
-}
-
-/// Everything the three image creates differ by. The rest of
+/// Everything the two live external image creates differ by. The rest of
 /// `VkImageCreateInfo` — 2D, depth 1, one mip, one layer, 1 sample, exclusive
 /// sharing, no queue families — is fixed by [`encode_image_create`].
 #[derive(Clone, Copy)]
 pub struct ImageCreateSpec {
-    pub pnext: ImagePNext,
+    /// Exact `VkExternalMemoryHandleTypeFlags` for the mandatory external-memory
+    /// create chain.
+    pub external_handle_type: u32,
     pub flags: u32,
     pub format: u32,
     pub width: u32,
@@ -1073,15 +1056,10 @@ pub fn encode_image_create(device_id: u64, image_id: u64, spec: &ImageCreateSpec
     w.u64(device_id);
     w.count(true);
     w.i32(ST_IMAGE_CREATE_INFO);
-    match spec.pnext {
-        ImagePNext::None => w.count(false),
-        ImagePNext::ExternalMemory { handle_type } => {
-            w.count(true);
-            w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
-            w.count(false);
-            w.u32(handle_type);
-        }
-    }
+    w.count(true);
+    w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+    w.count(false);
+    w.u32(spec.external_handle_type);
     w.u32(spec.flags);
     w.u32(IMAGE_TYPE_2D);
     w.u32(spec.format);
@@ -1115,15 +1093,11 @@ pub enum MemoryPNext {
     None,
     /// `VkExportMemoryAllocateInfo`.
     Export { handle_type: u32 },
-    /// `VkMemoryDedicatedAllocateInfo` for an image.
-    Dedicated { image: u64 },
     /// `VkExportMemoryAllocateInfo` -> `VkMemoryDedicatedAllocateInfo`.
     ExportDedicated { handle_type: u32, image: u64 },
-    /// `VkImportMemoryResourceInfoMESA` — adopt an existing virtio resource.
-    ImportResource { resource_id: u32 },
 }
 
-/// Everything the five memory allocations differ by.
+/// Everything the three live memory allocations differ by.
 #[derive(Clone, Copy)]
 pub struct MemoryAllocateSpec {
     pub pnext: MemoryPNext,
@@ -1146,13 +1120,6 @@ pub fn encode_memory_allocate(device_id: u64, memory_id: u64, spec: &MemoryAlloc
             w.count(false);
             w.u32(handle_type);
         }
-        MemoryPNext::Dedicated { image } => {
-            w.count(true);
-            w.i32(ST_MEMORY_DEDICATED_ALLOCATE_INFO);
-            w.count(false);
-            w.u64(image);
-            w.u64(0); // buffer
-        }
         MemoryPNext::ExportDedicated { handle_type, image } => {
             w.count(true);
             w.i32(ST_EXPORT_MEMORY_ALLOCATE_INFO);
@@ -1163,12 +1130,6 @@ pub fn encode_memory_allocate(device_id: u64, memory_id: u64, spec: &MemoryAlloc
             w.u64(0); // buffer
                       // The EXPORT struct's own field, after the nested dedicated one.
             w.u32(handle_type);
-        }
-        MemoryPNext::ImportResource { resource_id } => {
-            w.count(true);
-            w.i32(ST_IMPORT_MEMORY_RESOURCE_INFO_MESA);
-            w.count(false);
-            w.u32(resource_id);
         }
     }
     w.u64(spec.size);
@@ -1371,30 +1332,18 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x88, 0x77,
         0x77, 0x66, 0x66, 0x55, 0x55,
     ];
-    // GOLDEN_OPTIMAL_PRESENT_IMAGE_ALIAS (140 bytes)
-    const GOLDEN_OPTIMAL_PRESENT_IMAGE_ALIAS: &[u8] = &[
+    // GOLDEN_OPTIMAL_GDI_IMAGE (140 bytes)
+    const GOLDEN_OPTIMAL_GDI_IMAGE: &[u8] = &[
         0x36, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x44, 0x44, 0x33, 0x33, 0x22, 0x22, 0x11,
         0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x01, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0xe3, 0x9b, 0x3b, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
         0x2c, 0x00, 0x00, 0x00, 0x68, 0x07, 0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x01, 0x00, 0x00,
         0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x17, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x88, 0x77,
         0x77, 0x66, 0x66, 0x55, 0x55,
-    ];
-    // GOLDEN_PRESENT_CONVERSION_IMAGE (124 bytes)
-    const GOLDEN_PRESENT_CONVERSION_IMAGE: &[u8] = &[
-        0x36, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x44, 0x44, 0x33, 0x33, 0x22, 0x22, 0x11,
-        0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x2c,
-        0x00, 0x00, 0x00, 0x68, 0x07, 0x00, 0x00, 0x06, 0x04, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-        0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0x88, 0x77, 0x77,
-        0x66, 0x66, 0x55, 0x55,
     ];
     // GOLDEN_MEMORY_PLAIN (72 bytes)
     const GOLDEN_MEMORY_PLAIN: &[u8] = &[
@@ -1413,16 +1362,6 @@ mod tests {
         0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
         0x00, 0x00, 0x00, 0x00, 0x00, 0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa, 0x99, 0x99,
     ];
-    // GOLDEN_MEMORY_DEDICATED (100 bytes)
-    const GOLDEN_MEMORY_DEDICATED: &[u8] = &[
-        0x15, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x44, 0x44, 0x33, 0x33, 0x22, 0x22, 0x11,
-        0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x19, 0xba, 0x9c, 0x3b, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x88, 0x88, 0x77, 0x77, 0x66, 0x66, 0x55, 0x55, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa, 0x99, 0x99,
-    ];
     // GOLDEN_MEMORY_EXPORT_DEDICATED (116 bytes)
     const GOLDEN_MEMORY_EXPORT_DEDICATED: &[u8] = &[
         0x15, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x44, 0x44, 0x33, 0x33, 0x22, 0x22, 0x11,
@@ -1434,16 +1373,6 @@ mod tests {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
         0x00, 0x00, 0x00, 0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa, 0x99, 0x99,
     ];
-    // GOLDEN_MEMORY_IMPORT_RESOURCE (88 bytes)
-    const GOLDEN_MEMORY_IMPORT_RESOURCE: &[u8] = &[
-        0x15, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x44, 0x44, 0x33, 0x33, 0x22, 0x22, 0x11,
-        0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00, 0x01, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xa6, 0xa0, 0x3b, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0xcc, 0xcc, 0xbb, 0xbb, 0xaa, 0xaa, 0x99, 0x99,
-    ];
-
     /// The production LINEAR scan-out image. The frozen direct-primary path:
     /// wrong bytes here are a black desktop, which is how the 39th session
     /// started.
@@ -1453,9 +1382,7 @@ mod tests {
             GOLD_DEVICE,
             GOLD_IMAGE,
             &ImageCreateSpec {
-                pnext: ImagePNext::ExternalMemory {
-                    handle_type: 0x0000_0200,
-                },
+                external_handle_type: 0x0000_0200,
                 flags: 0,
                 format: 44, // VK_FORMAT_B8G8R8A8_UNORM
                 width: 1896,
@@ -1469,14 +1396,12 @@ mod tests {
     }
 
     #[test]
-    fn optimal_present_image_alias_bytes_are_unchanged() {
+    fn optimal_gdi_image_bytes_are_unchanged() {
         let w = encode_image_create(
             GOLD_DEVICE,
             GOLD_IMAGE,
             &ImageCreateSpec {
-                pnext: ImagePNext::ExternalMemory {
-                    handle_type: 0x0000_0001,
-                },
+                external_handle_type: 0x0000_0200,
                 flags: 0x8, // MUTABLE_FORMAT
                 format: 44,
                 width: 1896,
@@ -1486,26 +1411,7 @@ mod tests {
                 initial_layout: 0, // UNDEFINED
             },
         );
-        assert_eq!(w.finished(), Some(GOLDEN_OPTIMAL_PRESENT_IMAGE_ALIAS));
-    }
-
-    #[test]
-    fn present_conversion_image_bytes_are_unchanged() {
-        let w = encode_image_create(
-            GOLD_DEVICE,
-            GOLD_IMAGE,
-            &ImageCreateSpec {
-                pnext: ImagePNext::None,
-                flags: 0,
-                format: 44,
-                width: 1896,
-                height: 1030,
-                tiling: IMAGE_TILING_OPTIMAL,
-                usage: 0x1 | 0x2,
-                initial_layout: 0,
-            },
-        );
-        assert_eq!(w.finished(), Some(GOLDEN_PRESENT_CONVERSION_IMAGE));
+        assert_eq!(w.finished(), Some(GOLDEN_OPTIMAL_GDI_IMAGE));
     }
 
     #[test]
@@ -1538,20 +1444,6 @@ mod tests {
         assert_eq!(w.finished(), Some(GOLDEN_MEMORY_EXPORT));
     }
 
-    #[test]
-    fn dedicated_memory_allocate_bytes_are_unchanged() {
-        let w = encode_memory_allocate(
-            GOLD_DEVICE,
-            GOLD_MEMORY,
-            &MemoryAllocateSpec {
-                pnext: MemoryPNext::Dedicated { image: GOLD_IMAGE },
-                size: GOLD_SIZE,
-                memory_type_index: GOLD_MTI,
-            },
-        );
-        assert_eq!(w.finished(), Some(GOLDEN_MEMORY_DEDICATED));
-    }
-
     /// The order-sensitive one: the dedicated struct's image/buffer fields come
     /// BEFORE the export struct's own handleTypes, because export's pNext points
     /// at dedicated. Swapping them still compiles and still type-checks.
@@ -1570,22 +1462,6 @@ mod tests {
             },
         );
         assert_eq!(w.finished(), Some(GOLDEN_MEMORY_EXPORT_DEDICATED));
-    }
-
-    #[test]
-    fn import_resource_memory_allocate_bytes_are_unchanged() {
-        let w = encode_memory_allocate(
-            GOLD_DEVICE,
-            GOLD_MEMORY,
-            &MemoryAllocateSpec {
-                pnext: MemoryPNext::ImportResource {
-                    resource_id: 0x1234,
-                },
-                size: GOLD_SIZE,
-                memory_type_index: GOLD_MTI,
-            },
-        );
-        assert_eq!(w.finished(), Some(GOLDEN_MEMORY_IMPORT_RESOURCE));
     }
 
     /// The 39th session, as an assertion. `IMAGE_TILING_LINEAR` was 0 — which
@@ -2531,18 +2407,13 @@ pub mod wddm_boundary {
     /// assigned and enqueued, so `[base, next)` is exactly "issued by this
     /// generation".
     ///
-    /// `d3d12` says the submission carried a `HeliosD3D12SubmitCmd` record — an
-    /// IDENTITY, never a boundary. It selects [`Kind::Exact`] because a D3D12 ECL
-    /// packet carries no GPU commands of its own: the only thing its DMA completion
-    /// can truthfully report is that the batch the UMD named has finished, so
-    /// waiting on the prefix below that fence is waiting on other processes'
-    /// frames. The legacy Present writer of the same field keeps [`Kind::Prefix`]
-    /// because that is the shipping, measured desktop configuration.
+    /// Only the D3D12 ECL record reaches this selector. The exact kind is
+    /// required because the ECL packet carries no GPU commands of its own: its
+    /// DMA completion can truthfully report only the batch the UMD named.
     pub const fn select(
         gpu_fence_id: u64,
         wire_fence_base: u64,
         next_wire_fence: u64,
-        d3d12: bool,
     ) -> Selection {
         if gpu_fence_id == 0 || gpu_fence_id >= next_wire_fence {
             return Selection {
@@ -2558,20 +2429,9 @@ pub mod wddm_boundary {
                 rejection: Rejection::ForeignGeneration,
             };
         }
-        if d3d12 {
-            return Selection {
-                watermark: gpu_fence_id,
-                kind: Kind::Exact,
-                rejection: Rejection::Accepted,
-            };
-        }
         Selection {
-            // The prefix bound is EXCLUSIVE, so naming fence N means waiting for
-            // everything below N + 1. `saturating_add` because a u64 fence id at
-            // the representation's ceiling must not wrap to 0, which is the "no
-            // dependency" watermark.
-            watermark: gpu_fence_id.saturating_add(1),
-            kind: Kind::Prefix,
+            watermark: gpu_fence_id,
+            kind: Kind::Exact,
             rejection: Rejection::Accepted,
         }
     }
@@ -2587,7 +2447,7 @@ mod wddm_boundary_tests {
 
     #[test]
     fn a_d3d12_boundary_is_exact_and_names_the_fence_itself() {
-        let s = select(BASE + 12, BASE, NEXT, true);
+        let s = select(BASE + 12, BASE, NEXT);
         assert_eq!(s.kind, Kind::Exact);
         assert_eq!(s.rejection, Rejection::Accepted);
         // NOT `+ 1`: an exact test names the fence, and adding one would silently
@@ -2596,19 +2456,11 @@ mod wddm_boundary_tests {
     }
 
     #[test]
-    fn the_legacy_present_writer_keeps_the_exclusive_prefix() {
-        let s = select(BASE + 12, BASE, NEXT, false);
-        assert_eq!(s.kind, Kind::Prefix);
-        assert_eq!(s.rejection, Rejection::Accepted);
-        assert_eq!(s.watermark, BASE + 13);
-    }
-
-    #[test]
     fn a_foreign_generation_fence_is_rejected_however_plausible_it_looks() {
         // A6. The previous generation's ids are a whole stride below, and every
         // one of them satisfies `< next_wire_fence`.
         for id in [1u64, 42, BASE - 1, 1 + (2u64 << 32) + 7] {
-            let s = select(id, BASE, NEXT, true);
+            let s = select(id, BASE, NEXT);
             assert_eq!(s.rejection, Rejection::ForeignGeneration, "id {id}");
             // The fallback must be the conservative prefix, never the named id:
             // an exact wait on a fence this generation never issued is satisfied
@@ -2621,7 +2473,7 @@ mod wddm_boundary_tests {
     #[test]
     fn zero_and_beyond_the_range_stay_on_the_old_clamp_and_its_own_counter() {
         for id in [0u64, NEXT, NEXT + 1, u64::MAX] {
-            let s = select(id, BASE, NEXT, true);
+            let s = select(id, BASE, NEXT);
             assert_eq!(s.rejection, Rejection::OutOfRange, "id {id}");
             assert_eq!(s.kind, Kind::Prefix, "id {id}");
             assert_eq!(s.watermark, NEXT, "id {id}");
@@ -2633,7 +2485,7 @@ mod wddm_boundary_tests {
         // The two rejections must partition, or a counter pair reads as double
         // the truth. Sweep the boundaries of both conditions.
         for id in [0, 1, BASE - 1, BASE, BASE + 1, NEXT - 1, NEXT, NEXT + 1] {
-            let s = select(id, BASE, NEXT, true);
+            let s = select(id, BASE, NEXT);
             let out_of_range = id == 0 || id >= NEXT;
             let foreign = !out_of_range && id < BASE;
             assert_eq!(
@@ -2658,10 +2510,10 @@ mod wddm_boundary_tests {
     fn the_first_generation_starts_at_one_and_accepts_its_own_low_ids() {
         // `NEXT_WIRE_FENCE_BASE` starts at 1, so instance 0's ids ARE small. The
         // foreign-generation test must not reject them.
-        let s = select(1, 1, 5, true);
+        let s = select(1, 1, 5);
         assert_eq!(s.rejection, Rejection::Accepted);
         assert_eq!(s.watermark, 1);
-        assert_eq!(select(0, 1, 5, true).rejection, Rejection::OutOfRange);
+        assert_eq!(select(0, 1, 5).rejection, Rejection::OutOfRange);
     }
 
     #[test]
@@ -2669,19 +2521,18 @@ mod wddm_boundary_tests {
         // Nothing assigned yet: base == next, so every id is out of range and no
         // boundary can be honoured. Notably NOT reported as foreign — the
         // out-of-range test runs first, and it is the honest description.
-        let s = select(BASE, BASE, BASE, true);
+        let s = select(BASE, BASE, BASE);
         assert_eq!(s.rejection, Rejection::OutOfRange);
         assert_eq!(s.watermark, BASE);
         assert_eq!(s.kind, Kind::Prefix);
     }
 
     #[test]
-    fn a_prefix_watermark_never_wraps_to_the_no_dependency_sentinel() {
-        // 0 is "no dependency". A `+ 1` that wrapped would turn the strongest
-        // possible wait into none at all.
-        let s = select(u64::MAX - 1, 0, u64::MAX, false);
+    fn an_exact_watermark_never_advances_past_the_named_fence() {
+        let s = select(u64::MAX - 1, 0, u64::MAX);
         assert_eq!(s.rejection, Rejection::Accepted);
-        assert_eq!(s.watermark, u64::MAX);
+        assert_eq!(s.kind, Kind::Exact);
+        assert_eq!(s.watermark, u64::MAX - 1);
         assert_ne!(s.watermark, 0);
     }
 }

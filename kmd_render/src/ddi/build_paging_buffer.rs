@@ -44,15 +44,13 @@
 //! a DISPATCH-illegal call. `SetRootPageTable` can run at DISPATCH_LEVEL and
 //! keeps its atomics-only tracing.
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use wdk_sys::ntddk::{
-    KeGetCurrentIrql, MmGetPhysicalAddress, MmMapIoSpace, MmMapLockedPagesSpecifyCache,
-    MmUnmapIoSpace,
+    KeGetCurrentIrql, MmMapIoSpace, MmMapLockedPagesSpecifyCache, MmUnmapIoSpace,
 };
 use wdk_sys::{_MEMORY_CACHING_TYPE, PHYSICAL_ADDRESS, PMDL};
 
@@ -60,7 +58,7 @@ use helios_protocol::{
     VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED, VIRTIO_GPU_MAP_CACHE_WC,
 };
 
-use crate::adapter::{AdapterContext, SystemBackingSnapshot};
+use crate::adapter::AdapterContext;
 use crate::ddi::create_allocation::{paging_alloc_info, set_bar_placement, PagingAllocInfo};
 use crate::dxgk::*;
 
@@ -203,16 +201,12 @@ static BAR_ERR_FILL_HANDLE: AtomicU32 = AtomicU32::new(0);
 /// system pages, not the blob. Whether that is reachable at all is an open
 /// question this counter answers before anything is built for it: a nonzero
 /// value is the trigger for a VA-resolving implementation (k-paging-14).
-static BAR_VIRTUAL_FILL_SYSTEM: AtomicU32 = AtomicU32::new(0);
 static BAR_VIRTUAL_PTES: AtomicU32 = AtomicU32::new(0); // system PTEs retained
 static BAR_LAST_VIRTUAL_SRC: AtomicU64 = AtomicU64::new(0);
 static BAR_LAST_VIRTUAL_DST: AtomicU64 = AtomicU64::new(0);
 /// Paging content op named a device-local/opaque allocation. Such resources
 /// have no CPU byte mapping; attempting RESOURCE_MAP_BLOB is a contract error.
 static BAR_DEVICE_OP_SKIPS: AtomicU32 = AtomicU32::new(0);
-static BAR_SYSTEM_BACKING_CAPTURES: AtomicU32 = AtomicU32::new(0);
-static BAR_SYSTEM_BACKING_MIRRORS: AtomicU32 = AtomicU32::new(0);
-static BAR_SYSTEM_BACKING_ERRORS: AtomicU32 = AtomicU32::new(0);
 
 /// The BAR paging counter block, mirrored into the registry through the shared
 /// throttled emitter (R317). Named values and encodings are unchanged; only the
@@ -247,12 +241,8 @@ static PAGING_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e64(b"PgVs", &BAR_LAST_VIRTUAL_SRC),
         e64(b"PgVd", &BAR_LAST_VIRTUAL_DST),
         e(b"PgDi", &BAR_DEVICE_OP_SKIPS),
-        e(b"PgSc", &BAR_SYSTEM_BACKING_CAPTURES),
-        e(b"PgSm", &BAR_SYSTEM_BACKING_MIRRORS),
-        f(b"PgSe", &BAR_SYSTEM_BACKING_ERRORS),
         f(b"PgEh", &BAR_ERR_XFER_HANDLE),
         f(b"PgFh", &BAR_ERR_FILL_HANDLE),
-        e(b"PgFv", &BAR_VIRTUAL_FILL_SYSTEM),
     ],
     ticks: &PAGING_FLUSH_TICKS,
     failures: &PAGING_FLUSH_FAILURES,
@@ -1334,105 +1324,6 @@ unsafe fn copy_blob_system_pages(
     true
 }
 
-/// Capture the exact physical pages in a Windows paging-transfer MDL.
-///
-/// `system_start` is the mapped byte at which this allocation range begins.
-/// Every page number comes from `MmGetPhysicalAddress` while the MDL is locked;
-/// no allocation dimensions, process identity, or placement ordering is used.
-/// Snapshot the physical pages behind a paging transfer's system end.
-///
-/// Takes the PASSIVE proof token: `MmGetPhysicalAddress` over a mapped range and
-/// the `Arc<[u64]>` allocation below are both PASSIVE obligations.
-unsafe fn remember_system_backing(
-    _passive: PassiveLevel,
-    adapter: &AdapterContext,
-    resource_id: u32,
-    blob_offset: u64,
-    size: u64,
-    system_start: *mut u8,
-) -> bool {
-    if size == 0 || system_start.is_null() {
-        return false;
-    }
-    let first_pa = unsafe { MmGetPhysicalAddress(system_start.cast()) }.QuadPart as u64;
-    let first_page_offset = (first_pa & 0xFFF) as u32;
-    let page_count = (u64::from(first_page_offset)
-        .saturating_add(size)
-        .saturating_add(4095))
-        >> 12;
-    let Ok(page_count) = usize::try_from(page_count) else {
-        BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    };
-    let mut pages = Vec::new();
-    if pages.try_reserve_exact(page_count).is_err() {
-        BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
-        return false;
-    }
-    pages.push(first_pa >> 12);
-    for index in 1..page_count {
-        let delta = (4096usize - first_page_offset as usize)
-            .saturating_add((index - 1).saturating_mul(4096));
-        let pa = unsafe { MmGetPhysicalAddress(system_start.add(delta).cast()) }.QuadPart as u64;
-        if pa & 0xFFF != 0 {
-            BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        pages.push(pa >> 12);
-    }
-    let backing = SystemBackingSnapshot {
-        resource_id,
-        blob_offset,
-        size,
-        first_page_offset,
-        pages: Arc::from(pages.into_boxed_slice()),
-    };
-    if adapter.system_backings.replace(backing) {
-        BAR_SYSTEM_BACKING_CAPTURES.fetch_add(1, Ordering::Relaxed);
-        true
-    } else {
-        BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
-        false
-    }
-}
-
-/// Mirror a completed Present destination blob into the exact system-memory
-/// backing Windows previously supplied for that allocation.
-///
-/// `None` means the allocation is no longer system-backed (for example Windows
-/// paged it back into the BAR before this Present). `Some(false)` is a real
-/// mapping/copy failure and must not be silently treated as a successful frame.
-pub(crate) unsafe fn mirror_present_system_backing(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    resource_id: u32,
-) -> Option<bool> {
-    let backing = adapter.system_backings.snapshot(resource_id)?;
-    let mut copied = false;
-    let mapped = unsafe {
-        with_blob_bytes(passive, adapter, resource_id, |blob, len| {
-            if backing.blob_offset.saturating_add(backing.size) > len {
-                return;
-            }
-            copied = copy_blob_system_pages(
-                blob,
-                backing.blob_offset,
-                backing.pages.as_ref(),
-                u64::from(backing.first_page_offset),
-                backing.size,
-                true,
-            );
-        })
-    };
-    let ok = mapped && copied;
-    if ok {
-        BAR_SYSTEM_BACKING_MIRRORS.fetch_add(1, Ordering::Relaxed);
-    } else {
-        BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
-    }
-    Some(ok)
-}
-
 /// WDDM 2.x `VIRTUAL_TRANSFER` for a Helios blob allocation.
 ///
 /// The allocation handle, direction, VAs, size, and the leaf PTEs resolving the
@@ -1524,22 +1415,8 @@ unsafe fn bar_virtual_transfer(
     };
     if mapped && copied {
         if blob_to_system {
-            let backing = SystemBackingSnapshot {
-                resource_id: alloc.resource_id,
-                blob_offset: offset,
-                size,
-                first_page_offset: (system_va & 0xFFF) as u32,
-                pages: Arc::from(system_pages.into_boxed_slice()),
-            };
-            if adapter.system_backings.replace(backing) {
-                BAR_SYSTEM_BACKING_CAPTURES.fetch_add(1, Ordering::Relaxed);
-            } else {
-                BAR_SYSTEM_BACKING_ERRORS.fetch_add(1, Ordering::Relaxed);
-                return false;
-            }
             BAR_XFER_OUT.fetch_add(1, Ordering::Relaxed);
         } else {
-            adapter.system_backings.remove(alloc.resource_id);
             BAR_XFER_IN.fetch_add(1, Ordering::Relaxed);
         }
         true
@@ -1649,8 +1526,6 @@ unsafe fn bar_transfer(
                 // PgEm (blob map) or PgEb (out-of-blob range) already counted.
                 return PagingOpOutcome::Failed(paging_failure());
             }
-            // The inverse transfer makes the BAR blob authoritative again.
-            adapter.system_backings.remove(alloc.resource_id);
             BAR_XFER_IN.fetch_add(1, Ordering::Relaxed);
             PagingOpOutcome::Executed
         }
@@ -1694,16 +1569,6 @@ unsafe fn bar_transfer(
                 // PgEm / PgEb already counted.
                 return PagingOpOutcome::Failed(paging_failure());
             }
-            let _ = unsafe {
-                remember_system_backing(
-                    passive,
-                    adapter,
-                    alloc.resource_id,
-                    blob_off,
-                    bytes,
-                    dst_start,
-                )
-            };
             BAR_XFER_OUT.fetch_add(1, Ordering::Relaxed);
             PagingOpOutcome::Executed
         }
@@ -2252,9 +2117,6 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         },
         PagingOperation::Fill(f) => unsafe { bar_fill(passive, adapter, bar.seg_id, bar.size, f) },
         PagingOperation::DiscardContent(d) => {
-            if let Some(alloc) = unsafe { paging_alloc_info(d.hAllocation) } {
-                adapter.system_backings.remove(alloc.resource_id);
-            }
             if d.SegmentId == bar.seg_id && unsafe { paging_alloc_info(d.hAllocation) }.is_some() {
                 // Content lives in the blob; nothing to release here (aperture
                 // unmaps handle CPU visibility). Counted for the op census.
@@ -2287,11 +2149,6 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                     let off = fv.AllocationOffsetInBytes;
                     let fill_len = fv.FillSizeInBytes;
                     let pattern = fv.FillPattern;
-                    // Evidence for the blob-versus-system-pages asymmetry
-                    // documented on PgFv; the fill below is unchanged.
-                    if adapter.system_backings.contains(alloc.resource_id) {
-                        BAR_VIRTUAL_FILL_SYSTEM.fetch_add(1, Ordering::Relaxed);
-                    }
                     let mut filled = false;
                     let ok = unsafe {
                         with_blob_bytes(passive, adapter, alloc.resource_id, |dst, len| {

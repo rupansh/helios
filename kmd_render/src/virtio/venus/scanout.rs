@@ -60,20 +60,12 @@ impl VenusClient {
         if width == 0 || height == 0 || !matches!(dxgi_format, 87 | 88) {
             return Err(VirtioError::DeviceError);
         }
-        if crate::virtio::KMD_D2_OWNER_ENABLED
-            && !adapter.control_owner().backing_creation_open()
-        {
+        if crate::virtio::KMD_D2_OWNER_ENABLED && !adapter.control_owner().backing_creation_open() {
             return Err(VirtioError::DeviceError);
         }
 
-        let image_id = self.create_optimal_present_image_alias(
-            adapter,
-            width,
-            height,
-            ddi_bind_flags,
-            dxgi_format,
-            OptimalImageTransport::CrossContextDmaBuf,
-        )?;
+        let image_id =
+            self.create_optimal_gdi_image(adapter, width, height, ddi_bind_flags, dxgi_format)?;
         let (required_size, memory_type_bits) =
             match self.image_memory_requirements(adapter, image_id) {
                 Ok(requirements) => requirements,
@@ -153,7 +145,6 @@ impl VenusClient {
             blob: HostVisibleBlob {
                 blob_id: memory_id.get(),
                 res_id: resource_id,
-                gpa: 0,
                 size: allocation_size,
             },
             image_id,
@@ -170,9 +161,7 @@ impl VenusClient {
         width: u32,
         height: u32,
     ) -> Result<ScanoutImageBlob, VirtioError> {
-        if crate::virtio::KMD_D2_OWNER_ENABLED
-            && !adapter.control_owner().backing_creation_open()
-        {
+        if crate::virtio::KMD_D2_OWNER_ENABLED && !adapter.control_owner().backing_creation_open() {
             return Err(VirtioError::DeviceError);
         }
         // Stage breadcrumb: `SdgLStg` holds the stage last ENTERED. On an early
@@ -295,7 +284,6 @@ impl VenusClient {
             blob: HostVisibleBlob {
                 blob_id: memory_id.get(),
                 res_id,
-                gpa: 0,
                 size: alloc_size,
             },
             image_id,

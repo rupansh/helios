@@ -21,8 +21,7 @@
 //!
 //!   * Fenced `SUBMIT_3D` is ASYNC ([`VirtioGpu::enqueue_async_submit`]): the
 //!     KMD assigns a globally-monotonic WIRE fence id, queues the descriptors,
-//!     notifies, and returns. Completion signals any registered
-//!     [`FenceWaiter`] (KEVENT) and advances the WDDM pending FIFO.
+//!     notifies, and returns. Completion advances the WDDM pending FIFO.
 //!   * Synchronous verbs (ctx/blob/map) are enqueued with an optional
 //!     [`SyncWaitBlock`] waiter ([`VirtioGpu::enqueue_sync`]); the waiter
 //!     blocks at PASSIVE_LEVEL in `virtio::ctrl`, NEVER at DISPATCH under the
@@ -47,33 +46,32 @@ use alloc::vec::Vec;
 use bytemuck::Zeroable;
 use helios_kmd_logic::control_ownership::HostRejection;
 use helios_protocol::{
+    VirtioGpuCmdSubmit, VirtioGpuCtrlHdr, VirtioGpuRespDisplayInfo, VirtioGpuSetScanoutBlob,
     HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
     VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE,
-    VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_RESP_OK_DISPLAY_INFO,
-    VIRTIO_GPU_RESP_OK_NODATA, VirtioGpuCmdSubmit, VirtioGpuCtrlHdr,
-    VirtioGpuRespDisplayInfo, VirtioGpuSetScanoutBlob,
+    VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_RESP_OK_DISPLAY_INFO, VIRTIO_GPU_RESP_OK_NODATA,
 };
 use virtio_drivers::queue::VirtQueue;
-use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::pci::bus::{DeviceFunction, PciRoot};
+use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::{DeviceStatus, Transport};
-use wdk_sys::ntddk::{
-    KeInitializeEvent, KeSetEvent,
-};
+use wdk_sys::ntddk::{KeInitializeEvent, KeSetEvent};
 use wdk_sys::KEVENT;
 
 mod resource_tables;
 
 use super::config::DxgkConfigAccess;
 use super::hal::{DmaBuffer, DmaSpan, WdkHal};
-use super::pci_caps::{HostVisibleWindow, map_isr_status_register, scan_host_visible_window};
+use super::pci_caps::{map_isr_status_register, scan_host_visible_window, HostVisibleWindow};
 
 // R1103: the telemetry atomics moved to `super::counters`. Re-exported here so
 // all 53+ external `gpu::<COUNTER>` paths keep compiling unchanged; narrowing
 // the re-export is a follow-up, not part of the move.
-use super::VirtioError;
 pub use super::counters::*;
-use crate::dxgk::{BOOLEAN, DXGKCB_SYNCHRONIZE_EXECUTION, DXGKRNL_INTERFACE, HANDLE, STATUS_SUCCESS};
+use super::VirtioError;
+use crate::dxgk::{
+    BOOLEAN, DXGKCB_SYNCHRONIZE_EXECUTION, DXGKRNL_INTERFACE, HANDLE, STATUS_SUCCESS,
+};
 
 /// Control queue index (virtio-gpu controlq = 0; cursorq = 1 is unused).
 const CTRL_QUEUE: u16 = 0;
@@ -217,15 +215,11 @@ const MAX_DMA_POOL_BYTES: usize = 2 * 1024 * 1024;
 /// Enqueue refusal threshold for the parked table (forces the PASSIVE caller
 /// to reap before submitting more).
 const PARKED_ENQUEUE_GATE: usize = MAX_PARKED - MAX_INFLIGHT;
-/// Max concurrent WAIT_FENCE waiters.
-const MAX_FENCE_WAITERS: usize = 64;
 /// Max WDDM submissions pending on venus completion.
-const MAX_WDDM_PENDING: usize =
-    helios_kmd_logic::ordered_engine::MAX_ORDERED_ENGINE_SUBMISSIONS;
+const MAX_WDDM_PENDING: usize = helios_kmd_logic::ordered_engine::MAX_ORDERED_ENGINE_SUBMISSIONS;
 const _: () = assert!(
     MAX_WDDM_PENDING
-        == helios_protocol::translation_session::HELIOS_HTS1_MAX_HOST_DISPATCH_FIFO_DEPTH
-            as usize
+        == helios_protocol::translation_session::HELIOS_HTS1_MAX_HOST_DISPATCH_FIFO_DEPTH as usize
 );
 /// Max response bytes a synchronous command may expect (copied into the
 /// waiter's [`SyncWaitBlock`]; the largest runtime response is
@@ -418,171 +412,170 @@ unsafe extern "C" fn interrupt_queue_operation(context: *mut c_void) -> BOOLEAN 
     };
     let handled = (|| {
         match operation {
-        QueueOperation::Add {
-            core,
-            reads,
-            count,
-            response,
-            sequence_adapter,
-            sequence_resource,
-            result,
-        } => {
-            let sequence = if sequence_adapter.is_null() {
-                0
-            } else {
-                let Some(sequence) = (unsafe { &**sequence_adapter }).reserve_scanout_bind_seq()
+            QueueOperation::Add {
+                core,
+                reads,
+                count,
+                response,
+                sequence_adapter,
+                sequence_resource,
+                result,
+            } => {
+                let sequence = if sequence_adapter.is_null() {
+                    0
+                } else {
+                    let Some(sequence) =
+                        (unsafe { &**sequence_adapter }).reserve_scanout_bind_seq()
+                    else {
+                        unsafe { **result = QueueCallResult::SequenceExhausted };
+                        return 1;
+                    };
+                    sequence
+                };
+                let read_slices = unsafe { [reads[0].as_slice(), reads[1].as_slice()] };
+                let added = unsafe {
+                    (**core)
+                        .control
+                        .add(&read_slices[..*count], &mut [response.as_mut_slice()])
+                };
+                unsafe {
+                    **result = match added {
+                        Ok(token) => {
+                            if !sequence_adapter.is_null() {
+                                (&**sequence_adapter)
+                                    .commit_scanout_bind_seq(sequence, *sequence_resource);
+                            }
+                            QueueCallResult::Added { token, sequence }
+                        }
+                        Err(virtio_drivers::Error::QueueFull) => QueueCallResult::QueueFull,
+                        Err(_) => QueueCallResult::Failed,
+                    }
+                };
+            }
+            QueueOperation::Peek { core, result } => unsafe {
+                **result = QueueCallResult::Peek((**core).control.peek_used());
+            },
+            QueueOperation::Pop {
+                core,
+                token,
+                reads,
+                count,
+                response,
+                result,
+            } => {
+                let read_slices = unsafe { [reads[0].as_slice(), reads[1].as_slice()] };
+                let popped = unsafe {
+                    (**core).control.pop_used(
+                        *token,
+                        &read_slices[..*count],
+                        &mut [response.as_mut_slice()],
+                    )
+                };
+                unsafe {
+                    **result = match popped {
+                        Ok(length) => QueueCallResult::Popped(length),
+                        Err(_) => QueueCallResult::Failed,
+                    }
+                };
+            }
+            QueueOperation::PopDirect {
+                core,
+                token,
+                output,
+                result,
+            } => unsafe {
+                let core = &mut **core;
+                let Some(index) = core
+                    .direct_slots
+                    .iter()
+                    .position(|slot| slot.token == Some(*token))
                 else {
-                    unsafe { **result = QueueCallResult::SequenceExhausted };
+                    **result = QueueCallResult::Direct(false);
                     return 1;
                 };
-                sequence
-            };
-            let read_slices = unsafe { [reads[0].as_slice(), reads[1].as_slice()] };
-            let added = unsafe {
-                (**core)
-                    .control
-                    .add(&read_slices[..*count], &mut [response.as_mut_slice()])
-            };
-            unsafe {
-                **result = match added {
-                    Ok(token) => {
-                        if !sequence_adapter.is_null() {
-                            (&**sequence_adapter)
-                                .commit_scanout_bind_seq(sequence, *sequence_resource);
-                        }
-                        QueueCallResult::Added { token, sequence }
-                    }
-                    Err(virtio_drivers::Error::QueueFull) => QueueCallResult::QueueFull,
-                    Err(_) => QueueCallResult::Failed,
+                let slot = &mut core.direct_slots[index];
+                let in0_len = core::mem::size_of::<VirtioGpuSetScanoutBlob>();
+                let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
+                let Some(read) = slot.buffer.span(0, in0_len) else {
+                    **result = QueueCallResult::Failed;
+                    return 1;
+                };
+                let Some(response_span) = slot.buffer.span(in0_len, resp_len) else {
+                    **result = QueueCallResult::Failed;
+                    return 1;
+                };
+                let reads = [read.as_slice(), DmaSpan::EMPTY.as_slice()];
+                let popped =
+                    core.control
+                        .pop_used(*token, &reads[..1], &mut [response_span.as_mut_slice()]);
+                let Ok(written_length) = popped else {
+                    **result = QueueCallResult::Failed;
+                    return 1;
+                };
+                if written_length as usize > resp_len {
+                    **result = QueueCallResult::Failed;
+                    return 1;
                 }
-            };
-        }
-        QueueOperation::Peek { core, result } => unsafe {
-            **result = QueueCallResult::Peek((**core).control.peek_used());
-        },
-        QueueOperation::Pop {
-            core,
-            token,
-            reads,
-            count,
-            response,
-            result,
-        } => {
-            let read_slices = unsafe { [reads[0].as_slice(), reads[1].as_slice()] };
-            let popped = unsafe {
-                (**core).control.pop_used(
-                    *token,
-                    &read_slices[..*count],
-                    &mut [response.as_mut_slice()],
-                )
-            };
-            unsafe {
-                **result = match popped {
-                    Ok(length) => QueueCallResult::Popped(length),
-                    Err(_) => QueueCallResult::Failed,
-                }
-            };
-        }
-        QueueOperation::PopDirect {
-            core,
-            token,
-            output,
-            result,
-        } => unsafe {
-            let core = &mut **core;
-            let Some(index) = core
-                .direct_slots
-                .iter()
-                .position(|slot| slot.token == Some(*token))
-            else {
-                **result = QueueCallResult::Direct(false);
-                return 1;
-            };
-            let slot = &mut core.direct_slots[index];
-            let in0_len = core::mem::size_of::<VirtioGpuSetScanoutBlob>();
-            let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
-            let Some(read) = slot.buffer.span(0, in0_len) else {
-                **result = QueueCallResult::Failed;
-                return 1;
-            };
-            let Some(response_span) = slot.buffer.span(in0_len, resp_len) else {
-                **result = QueueCallResult::Failed;
-                return 1;
-            };
-            let reads = [read.as_slice(), DmaSpan::EMPTY.as_slice()];
-            let popped = core
-                .control
-                .pop_used(*token, &reads[..1], &mut [response_span.as_mut_slice()]);
-            let Ok(written_length) = popped else {
-                **result = QueueCallResult::Failed;
-                return 1;
-            };
-            if written_length as usize > resp_len {
-                **result = QueueCallResult::Failed;
-                return 1;
-            }
-            let Some(work) = slot.work.take() else {
-                **result = QueueCallResult::Failed;
-                return 1;
-            };
-            let Some(identity) = slot.identity.take() else {
-                // Preserve ambiguous custody rather than drop the candidate when
-                // its queue identity is corrupt.
-                slot.work = Some(work);
-                **result = QueueCallResult::Failed;
-                return 1;
-            };
-            let mut response = [0u8; core::mem::size_of::<VirtioGpuCtrlHdr>()];
-            response[..written_length as usize].copy_from_slice(
-                &slot.buffer.as_slice()[in0_len..in0_len + written_length as usize],
-            );
-            slot.token = None;
-            **output = Some(DirectQueueCompletion {
+                let Some(work) = slot.work.take() else {
+                    **result = QueueCallResult::Failed;
+                    return 1;
+                };
+                let Some(identity) = slot.identity.take() else {
+                    // Preserve ambiguous custody rather than drop the candidate when
+                    // its queue identity is corrupt.
+                    slot.work = Some(work);
+                    **result = QueueCallResult::Failed;
+                    return 1;
+                };
+                let mut response = [0u8; core::mem::size_of::<VirtioGpuCtrlHdr>()];
+                response[..written_length as usize].copy_from_slice(
+                    &slot.buffer.as_slice()[in0_len..in0_len + written_length as usize],
+                );
+                slot.token = None;
+                **output = Some(DirectQueueCompletion {
+                    work,
+                    instance: identity.instance,
+                    fence_id: identity.fence_id,
+                    sequence: identity.sequence,
+                    resource_id: identity.resource_id,
+                    written_length,
+                    response,
+                });
+                **result = QueueCallResult::Direct(true);
+            },
+            QueueOperation::EnqueueDirect {
+                queue,
+                adapter,
                 work,
-                instance: identity.instance,
-                fence_id: identity.fence_id,
-                sequence: identity.sequence,
-                resource_id: identity.resource_id,
-                written_length,
-                response,
-            });
-            **result = QueueCallResult::Direct(true);
-        },
-        QueueOperation::EnqueueDirect {
-            queue,
-            adapter,
-            work,
-            result,
-        } => unsafe {
-            let Some(work) = (&mut **work).take() else {
-                **result = QueueCallResult::Failed;
-                return 1;
-            };
-            **result = match (&**queue).enqueue_direct_locked(&**adapter, work) {
-                Ok(()) => QueueCallResult::Direct(true),
-                Err(VirtioError::QueueFull) => QueueCallResult::QueueFull,
-                Err(VirtioError::BindSequenceExhausted) => {
-                    QueueCallResult::SequenceExhausted
-                }
-                Err(_) => QueueCallResult::Failed,
-            };
-        },
-        QueueOperation::DirectHolds {
-            core,
-            handle,
-            generation,
-            resource_id,
-            result,
-        } => unsafe {
-            **result = QueueCallResult::Holds((**core).direct_slots.iter().any(|slot| {
-                slot.work.as_ref().is_some_and(|work| {
-                    work.matches_exact_allocation(*handle, *generation, *resource_id)
-                })
-            }));
-        },
-        QueueOperation::Notify { result, .. } => unsafe {
-            **result = QueueCallResult::Notified;
-        },
+                result,
+            } => unsafe {
+                let Some(work) = (&mut **work).take() else {
+                    **result = QueueCallResult::Failed;
+                    return 1;
+                };
+                **result = match (&**queue).enqueue_direct_locked(&**adapter, work) {
+                    Ok(()) => QueueCallResult::Direct(true),
+                    Err(VirtioError::QueueFull) => QueueCallResult::QueueFull,
+                    Err(VirtioError::BindSequenceExhausted) => QueueCallResult::SequenceExhausted,
+                    Err(_) => QueueCallResult::Failed,
+                };
+            },
+            QueueOperation::DirectHolds {
+                core,
+                handle,
+                generation,
+                resource_id,
+                result,
+            } => unsafe {
+                **result = QueueCallResult::Holds((**core).direct_slots.iter().any(|slot| {
+                    slot.work.as_ref().is_some_and(|work| {
+                        work.matches_exact_allocation(*handle, *generation, *resource_id)
+                    })
+                }));
+            },
+            QueueOperation::Notify { result, .. } => unsafe {
+                **result = QueueCallResult::Notified;
+            },
         }
         1
     })();
@@ -646,9 +639,7 @@ impl InterruptQueue {
         // code that may touch the queue core. A notification deferred by a
         // contending lower-IRQL caller is folded into this exact section.
         let core = unsafe { &mut *self.core.get() };
-        if self.notify_pending.swap(0, Ordering::AcqRel) != 0
-            && core.control.should_notify()
-        {
+        if self.notify_pending.swap(0, Ordering::AcqRel) != 0 && core.control.should_notify() {
             core.transport.notify(CTRL_QUEUE);
         }
         self.access.store(0, Ordering::Release);
@@ -998,13 +989,12 @@ const NOTIFICATION_EVENT: i32 = 0;
 /// `IO_NO_INCREMENT` priority boost for `KeSetEvent`.
 const IO_NO_INCREMENT: i32 = 0;
 
-/// Exact terminal cause published to one synchronous or fence waiter.
+/// Exact terminal cause published to one synchronous waiter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub(crate) enum WaitDisposition {
     Pending = 0,
     HostResponseAvailable = 1,
-    FenceCompleted = 2,
     TransportAborted = 3,
     MalformedResponse = 4,
 }
@@ -1014,7 +1004,6 @@ impl WaitDisposition {
         match raw {
             0 => Self::Pending,
             1 => Self::HostResponseAvailable,
-            2 => Self::FenceCompleted,
             3 => Self::TransportAborted,
             4 => Self::MalformedResponse,
             _ => Self::TransportAborted,
@@ -1060,11 +1049,10 @@ impl SyncWaitBlock {
     /// The three invariants — initialised before registration, never moved
     /// after, always deregistered before the frame dies — used to be carried by
     /// comments over a `new_zeroed()` -> `unsafe { init() }` ->
-    /// `NonNull::from(&mut block)` dance at two call sites. A KEVENT dispatcher
+    /// `NonNull::from(&mut block)` dance. A KEVENT dispatcher
     /// header is self-referential, so a move after `init` corrupts the wait list
-    /// silently, and BOTH misuses compiled with zero `unsafe`, because
-    /// `enqueue_sync` and `fence_wait_prepare` are safe fns taking a
-    /// `NonNull<SyncWaitBlock>`:
+    /// silently, and the misuse compiled with zero `unsafe`, because
+    /// `enqueue_sync` is a safe fn taking a `NonNull<SyncWaitBlock>`:
     ///
     ///     let mut b = SyncWaitBlock::new_zeroed();
     ///     enqueue_sync(.., NonNull::from(&mut b));     // never init'ed
@@ -1162,7 +1150,7 @@ pub struct WaitBlockRef<'a> {
 }
 
 impl WaitBlockRef<'_> {
-    /// The registration pointer for `enqueue_sync` / `fence_wait_prepare`.
+    /// The registration pointer for `enqueue_sync`.
     pub fn as_ptr(&self) -> NonNull<SyncWaitBlock> {
         self.ptr
     }
@@ -1176,14 +1164,6 @@ impl WaitBlockRef<'_> {
     ) -> SyncResponseObservation {
         // SAFETY: the caller contract proves the raw target is no longer touched.
         unsafe { self.ptr.as_ref() }.copy_host_response(out)
-    }
-
-    /// # Safety
-    /// Same terminal signal/deregistration proof as
-    /// [`Self::copy_host_response_after_completion`].
-    pub unsafe fn classify_fence_after_completion(&self) -> WaitDisposition {
-        // SAFETY: the caller contract proves the raw target is no longer touched.
-        unsafe { self.ptr.as_ref() }.disposition()
     }
 }
 
@@ -1207,8 +1187,7 @@ fn take_native_completion(
 ) -> Option<crate::ddi::native_render::NativeHostCompletion> {
     match kind {
         InFlightKind::AsyncVenus {
-            native_completion,
-            ..
+            native_completion, ..
         } => native_completion.take(),
         _ => None,
     }
@@ -1363,12 +1342,6 @@ pub enum SyncOutcome {
     NotOurs,
 }
 
-/// A registered WAIT_FENCE waiter.
-struct FenceWaiter {
-    fence_id: u64,
-    block: NonNull<SyncWaitBlock>,
-}
-
 /// First wire fence id the NEXT transport instance will hand out.
 ///
 /// Driver-global and monotonic across StartDevice/StopDevice cycles. Starts at
@@ -1408,71 +1381,9 @@ fn reserve_scanout_transport_instance() -> Option<u64> {
     }
 }
 
-/// D3D12 ECL submissions gated on the EXACT wire fence their batch ends at rather
-/// than on the prefix below it (A4, `docs/dx12/PENDING.md` §1). Mirrored as
-/// `D12Exact`.
-///
-/// ⚠ NOT KNOB-GATED, and that is deliberate: the prefix was an invariant
-/// violation, not a tuning choice, so there is no "restore the superset" arm to
-/// keep reachable. The A/B that matters is `D12Zero` — a UMD naming no boundary at
-/// all — which is already the documented order-against-nothing lever.
-///
-/// WHOSE ACTIVITY INCREMENTS IT: only a submission that carried a live
-/// `HeliosD3D12SubmitCmd` record, i.e. `helios_umd12.dll`'s. DWM cannot move it —
-/// the D3D11 present writer of the same field is routed to `Kind::Prefix` by
-/// `wddm_boundary::select`. It is the one counter in this cluster with a clean
-/// population.
-///
-/// ⛔⛔ **THERE IS NO EXACT IDENTITY FOR THIS COUNTER, AND AN EARLIER GRADING
-/// ASSERTED ONE**: `D12Exact == D12Rec - D12Zero - D12MrgF - GpuFncClamp -
-/// GpuFncGen`, with *"any shortfall means a D3D12 packet took a prefix arm, which
-/// is the defect A4 names coming back"*. That arithmetic cannot hold, so its
-/// failure would have been reported as a closed defect re-opening. Four
-/// independent reasons, each sufficient:
-///
-///  1. **THE UNITS DIFFER.** `D12Rec`/`D12Zero`/`D12MrgF`/`D12Merged`/`D12Clr`
-///     count `DxgkDdiRender` calls — one per ECL record decoded. THIS counts
-///     `DxgkDdiSubmitCommand{,Virtual}` packets. dxgkrnl batches Renders into one
-///     DMA buffer, so N records can produce one submission.
-///  2. **`D12Merged` IS NOT IN THE EXPRESSION** and is exactly the collapse in
-///     (1): the k-1 later records in a batch merge into the first (largest fence
-///     wins), contributing 0 further exact submissions.
-///  3. **REPLAYS ARE UNACCOUNTED.** `PresentSubmissionPrivate::decode` CONSUMES
-///     the D3D12 magic by design, so a packet resubmitted out of the same buffer
-///     falls back to the prefix on purpose — a `D12Rec` with no `D12Exact`, and
-///     the fail-safe direction the consume exists for.
-///  4. **`GpuFncClamp` / `GpuFncGen` ARE ADAPTER-GLOBAL.** Both are decided in
-///     `wddm_boundary::select` BEFORE the `d3d12` bit is read, so DWM's D3D11
-///     present BLT marker moves them. Subtracting them from a D3D12 accounting
-///     mixes populations; their own docs in `virtio/counters.rs` say so.
-///  (5. `D12Clr` post-dates the expression and is a further term.)
-///
-/// ⇒ GRADING, in the forms that ARE true:
-///
-///  * **SOUND BOUND: `D12Exact <= D12Rec - D12Zero`.** Every exact submission
-///    consumes one `'HD12'` record whose surviving `gpu_fence_id` is nonzero, and
-///    only a nonzero-fence Render can put one there (`mark_d3d12` takes the max,
-///    and a zero-fence record is overwritten rather than merged). A VIOLATION is a
-///    real defect — a record honoured twice, or a boundary from somewhere
-///    `mark_d3d12` did not write. Every term above slackens this bound in the same
-///    direction, which is why it survives all of them.
-///  * **THE A4 REGRESSION SIGNAL is qualitative: `D12Rec > D12Zero` while
-///    `D12Exact == 0`.** Records named real boundaries and NOT ONE reached
-///    SubmitCommand as an exact wait. That is A4 coming back, or the record never
-///    surviving to SubmitCommand at all — and unlike a shortfall it needs no
-///    arithmetic to state.
-///  * **HEALTHY = `D12Exact` MOVES**, at roughly the rate of `ExecuteCommandLists`
-///    batches that named a fence, and well below `D12Rec`.
-///  * ⛔ **A SHORTFALL AGAINST ANY EXPRESSION ATTRIBUTES NOTHING.** At least five
-///    independent terms sit between the two counters, four legitimately nonzero
-///    and two adapter-global. If the per-term attribution is ever needed it has to
-///    be counted at the site, not inferred here.
-///
-/// ⚠ The old rule's second half — *"`D12Exact > 0` with `EscSubRing == 0` means
-/// the ICD is handing the UMD ring-0 fence ids"* — rests on a reading that cannot
-/// occur: `EscSubRing` is adapter-global and DWM's own present path makes it
-/// nonzero. The ring question is answerable only as a delta against a control arm;
-/// see `EscSubRing`'s block in `virtio/counters.rs`.
+/// Generated D3D12 submissions admitted against the exact wire fence named by
+/// their consume-once HD12 boundary. Ordinary D3D11 Present never writes this
+/// private record and cannot increment the counter.
 pub(crate) static D3D12_EXACT_WATERMARK_USED: AtomicU32 = AtomicU32::new(0);
 /// Gap between one instance's first id and the next instance's.
 ///
@@ -1613,13 +1524,11 @@ impl WindowAllocator {
 enum RetireDomain {
     /// Ring-0 only: host DECODE retirement.
     ///
-    /// This is the domain the WDDM pending FIFO's contract was built on. It
-    /// exists to order DMA_COMPLETED behind the venus escape traffic queued
-    /// before it, and ring-0 fences retire at decode. ring >= 1 fences (WS1 #4)
+    /// This is the domain the WDDM pending FIFO's contract was built on. Ring-0
+    /// fences retire at decode. ring >= 1 fences (WS1 #4)
     /// retire at host GPU COMPLETION and stay in flight for the full GPU-work
     /// duration, so counting them here would couple every WDDM DMA fence
-    /// (GDI/paging pacing) to unrelated multi-ms GPU work. Consumers that need
-    /// GPU completion wait on those fences explicitly (WAIT_FENCE).
+    /// (GDI/paging pacing) to unrelated multi-ms GPU work.
     DecodeOnly,
     /// Every ring: the caller genuinely needs host GPU completion, e.g. the
     /// direct-primary refresh marker ordering on a Venus completion watermark.
@@ -1644,7 +1553,7 @@ enum WireBoundary {
     ///
     /// The frame's own boundary. See the D3D12 arm in
     /// [`VirtioGpu::note_wddm_submission`] for why exactness is sound there and
-    /// why it is not applied to the legacy Present arm.
+    /// why it is applied only to a generated HD12 boundary.
     Exact,
 }
 
@@ -1731,18 +1640,6 @@ impl WddmReady {
     /// Exists so the success path *states* that it consumed the fence rather
     /// than letting it fall out of scope.
     pub fn delivered(self) {}
-}
-
-/// Result of [`VirtioGpu::fence_wait_prepare`].
-pub enum FenceWaitPrep {
-    /// The fence already completed (or the id predates the tracked window).
-    Complete,
-    /// Registered; wait on the block's event.
-    Registered,
-    /// The id was never assigned by this transport instance.
-    Invalid,
-    /// Waiter table full — retry after a short PASSIVE sleep.
-    TableFull,
 }
 
 /// Result of [`VirtioGpu::blob_map_begin`].
@@ -1856,8 +1753,6 @@ pub struct VirtioGpu {
     /// existing virtio spinlock, but allocation/free never occurs there.
     dma_pool: Vec<DmaBuffer>,
     dma_pool_bytes: usize,
-    /// Registered WAIT_FENCE waiters (capacity MAX_FENCE_WAITERS).
-    fence_waiters: Vec<FenceWaiter>,
     /// Next wire fence id to assign (globally monotonic, starts at 1; 0 is
     /// never a valid wire fence).
     next_wire_fence: u64,
@@ -1875,12 +1770,6 @@ pub struct VirtioGpu {
     /// For a wait that is merely a hint that is harmless; for a WDDM DMA fence it
     /// is a completion reported before the work exists.
     ///
-    /// ⚠ `fence_wait_prepare` / `fence_event_register` (`:4390`, `:4433`) share the
-    /// same one-sided predicate and are deliberately NOT changed here: their
-    /// failure mode is a usermode wait that returns early to the process that
-    /// forged the id, and the striding comment above records that arm as the
-    /// intended behaviour for a client which survived a device restart. The WDDM
-    /// arm is different in kind because dxgkrnl schedules the whole desktop on it.
     wire_fence_base: u64,
     /// Nonwrapping driver-global identity for synchronous persistent SET
     /// completions. Separate from the wire-fence range so neither namespace's
@@ -2191,11 +2080,8 @@ impl VirtioGpu {
             native_terminal_drain_in_progress: false,
             dma_pool: Vec::with_capacity(MAX_DMA_POOL),
             dma_pool_bytes: 0,
-            fence_waiters: Vec::with_capacity(MAX_FENCE_WAITERS),
-            // NOT 1. Wire fence ids arrive from an untrusted usermode buffer at
-            // the bounded KMD wait path, and `fence_wait_prepare` plus the WDDM
-            // boundary arm both decide against
-            // the ordinal predicate `id < next_wire_fence && not in-flight`.
+            // NOT 1. WDDM boundaries decide against the ordinal predicate
+            // `id < next_wire_fence && not in-flight`.
             // Restarting the id space at 1 on every transport init lets a stale id
             // from a PREVIOUS instance — an ICD that survived a `pnputil
             // /restart-device` still holding fences — ALIAS a live id of the new
@@ -2401,47 +2287,40 @@ impl VirtioGpu {
         };
 
         let sequence_request = scanout_bind.map(|(resource_id, _)| (adapter, resource_id));
-        let (token, reserved_sequence) = match self.enqueue_core(
-            chain,
-            &meta,
-            None,
-            resp_len,
-            sequence_request,
-        ) {
-            Ok(accepted) => accepted,
-            Err(error) => {
-                if reserved_fence.is_some() {
-                    // SAFETY: restore the exact header patched above before
-                    // returning the unaccepted buffer to its PASSIVE owner.
-                    let mut header = unsafe {
-                        core::ptr::read_unaligned(
-                            meta.as_slice().as_ptr().cast::<VirtioGpuCtrlHdr>(),
-                        )
-                    };
-                    header.flags = 0;
-                    header.fence_id = 0;
-                    unsafe {
-                        core::ptr::write_unaligned(
-                            meta.as_mut_slice().as_mut_ptr().cast::<VirtioGpuCtrlHdr>(),
-                            header,
-                        );
+        let (token, reserved_sequence) =
+            match self.enqueue_core(chain, &meta, None, resp_len, sequence_request) {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    if reserved_fence.is_some() {
+                        // SAFETY: restore the exact header patched above before
+                        // returning the unaccepted buffer to its PASSIVE owner.
+                        let mut header = unsafe {
+                            core::ptr::read_unaligned(
+                                meta.as_slice().as_ptr().cast::<VirtioGpuCtrlHdr>(),
+                            )
+                        };
+                        header.flags = 0;
+                        header.fence_id = 0;
+                        unsafe {
+                            core::ptr::write_unaligned(
+                                meta.as_mut_slice().as_mut_ptr().cast::<VirtioGpuCtrlHdr>(),
+                                header,
+                            );
+                        }
                     }
+                    return Err((meta, error));
                 }
-                return Err((meta, error));
-            }
-        };
+            };
         if reserved_fence.is_some() {
             self.next_wire_fence += 1;
         }
-        let identity = scanout_bind
-            .zip(reserved_sequence)
-            .map(|(_, sequence)| {
-                (
-                    self.scanout_transport_instance,
-                    sequence,
-                    reserved_fence.unwrap_or(0),
-                )
-            });
+        let identity = scanout_bind.zip(reserved_sequence).map(|(_, sequence)| {
+            (
+                self.scanout_transport_instance,
+                sequence,
+                reserved_fence.unwrap_or(0),
+            )
+        });
         self.publish_then_notify(InFlight {
             token,
             kind: InFlightKind::Sync {
@@ -2545,27 +2424,6 @@ impl VirtioGpu {
         }
     }
 
-    /// Enqueue a control command without a blocking waiter.  Completion still
-    /// consumes and validates the device response in [`Self::drain_used`], owns
-    /// `meta` until then, clears the adapter-owned `completion` gate, and wakes
-    /// `wake_event`.  The pointed-to objects must remain live until transport
-    /// teardown; the scanout caller uses fields embedded in `AdapterContext`,
-    /// whose lifetime encloses the virtio transport.
-    pub fn enqueue_async_submit(
-        &mut self,
-        ctx_id: u32,
-        ring_idx: u32,
-        meta: DmaBuffer,
-        venus: DmaBuffer,
-        venus_len: usize,
-    ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
-        self.enqueue_submit_inner(ctx_id, ring_idx, meta, venus, venus_len, None)
-        .map_err(|(meta, venus, native, error)| {
-            debug_assert!(native.is_none());
-            (meta, venus, error)
-        })
-    }
-
     /// Enqueue one already-validated HNR2 batch on its exact nonzero session
     /// endpoint. The move-only completion token returns intact on every refusal
     /// and is published into the ordinary in-flight entry only after `add`
@@ -2588,21 +2446,9 @@ impl VirtioGpu {
         ),
     > {
         if ctx_id == 0 || ring_idx == 0 {
-            return Err((
-                meta,
-                venus,
-                Some(completion),
-                VirtioError::DeviceError,
-            ));
+            return Err((meta, venus, Some(completion), VirtioError::DeviceError));
         }
-        self.enqueue_submit_inner(
-            ctx_id,
-            ring_idx,
-            meta,
-            venus,
-            venus_len,
-            Some(completion),
-        )
+        self.enqueue_submit_inner(ctx_id, ring_idx, meta, venus, venus_len, Some(completion))
     }
 
     /// Shared body for ordinary and native Venus submissions.
@@ -2638,8 +2484,7 @@ impl VirtioGpu {
         {
             return Err((meta, venus, native_completion, VirtioError::QueueFull));
         }
-        let Some(wire_fence_limit) = self.wire_fence_base.checked_add(D4_FENCE_OFFSET)
-        else {
+        let Some(wire_fence_limit) = self.wire_fence_base.checked_add(D4_FENCE_OFFSET) else {
             WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
             return Err((
                 meta,
@@ -2759,50 +2604,12 @@ impl VirtioGpu {
                 core::mem::forget(entry);
             }
         }
-
-        // No wire fence can ever retire now, so release every bounded KMD
-        // waiter rather than leaving it blocked on a dead transport.
-        while let Some(w) = self.fence_waiters.pop() {
-            // SAFETY: registered blocks stay valid until deregistration, which
-            // happens under this same lock.
-            unsafe {
-                let b = w.block.as_ptr();
-                if (*b).publish_terminal(WaitDisposition::TransportAborted) {
-                    KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
-                }
-            }
-        }
     }
 
     /// Drain every completed entry off the used ring: pop the descriptor chain
-    /// (token-matched), signal sync/fence waiters, and park the entry for a
+    /// (token-matched), signal sync waiters, and park the entry for a
     /// PASSIVE reap. The ONLY used-ring consumer (interrupt DPC + opportunistic
     /// callers under the same spinlock).
-    /// Retire one assigned wire fence from the bounded KMD waiter table. The
-    /// in-flight entry has already been removed, so the ordinal
-    /// predicate used by WAIT_FENCE agrees with these explicit wakeups.
-    fn retire_wire_fence_notifications(&mut self, fence_id: u64) {
-        if fence_id == 0 {
-            return;
-        }
-        let mut j = 0;
-        while j < self.fence_waiters.len() {
-            if self.fence_waiters[j].fence_id == fence_id {
-                let w = self.fence_waiters.swap_remove(j);
-                // SAFETY: registered blocks stay valid until deregistration
-                // removes them under this same transport lock.
-                unsafe {
-                    let b = w.block.as_ptr();
-                    if (*b).publish_terminal(WaitDisposition::FenceCompleted) {
-                        KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
-                    }
-                }
-            } else {
-                j += 1;
-            }
-        }
-    }
-
     pub fn drain_used(&mut self, adapter: &crate::adapter::AdapterContext) {
         if self.failed {
             return;
@@ -2894,8 +2701,7 @@ impl VirtioGpu {
                                     (*block).resp.get().cast::<u8>(),
                                     written_length as usize,
                                 );
-                                if (*block)
-                                    .publish_terminal(WaitDisposition::HostResponseAvailable)
+                                if (*block).publish_terminal(WaitDisposition::HostResponseAvailable)
                                 {
                                     KeSetEvent(&mut (*block).event, IO_NO_INCREMENT, 0);
                                 }
@@ -2904,7 +2710,7 @@ impl VirtioGpu {
                     }
                 }
                 InFlightKind::AsyncVenus {
-                    fence_id,
+                    fence_id: _,
                     ring_idx,
                     native_completion: _,
                 } => {
@@ -2912,13 +2718,11 @@ impl VirtioGpu {
                     if ring_idx != 0 {
                         RING_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
                     }
-                    let response_ok = written_length as usize
-                        == size_of::<VirtioGpuCtrlHdr>()
+                    let response_ok = written_length as usize == size_of::<VirtioGpuCtrlHdr>()
                         && response_type == Some(VIRTIO_GPU_RESP_OK_NODATA);
                     if !response_ok {
                         ASYNC_RESP_ERRORS.fetch_add(1, Ordering::Relaxed);
                     }
-                    self.retire_wire_fence_notifications(fence_id);
                     if let Some(completion) = native_completion {
                         if self.native_terminals.len() < MAX_INFLIGHT
                             && self.native_terminals.len() < self.native_terminals.capacity()
@@ -3132,73 +2936,6 @@ impl VirtioGpu {
         SyncOutcome::AlreadyCompleted
     }
 
-    // ── Wire-fence table (WAIT_FENCE) ────────────────────────────────────────
-
-    /// Prepare a wait on wire fence `fence_id`, registering `block` if the
-    /// fence is still in flight. Runs under the device spinlock — the
-    /// in-flight check and the registration are atomic with respect to
-    /// [`Self::drain_used`], so a completion can never fall between them.
-    ///
-    /// Completion predicate (System-class phase4e model): wire ids are
-    /// assigned by this transport, monotonic and never reused, and every
-    /// assigned id lives in `inflight` until its used-ring completion — so
-    /// `id < next_wire_fence && not in-flight` ⇒ complete.
-    ///
-    /// ⚠ "ASSIGNED BY THIS TRANSPORT" IS THE LOAD-BEARING WORD, and until
-    /// 2026-08-06 nothing tested it: the range check was one-sided, and StartDevice
-    /// strides the id space up by 2^32, so an id from a PREVIOUS generation is
-    /// below the range and reached the `Complete` arm. The ICD was then told a wire
-    /// fence had retired when its whole transport generation was gone — exactly
-    /// [`TRANSPORT_GONE_AT_WAIT`]'s failure, reported as success.
-    pub fn fence_wait_prepare(
-        &mut self,
-        fence_id: u64,
-        block: NonNull<SyncWaitBlock>,
-    ) -> FenceWaitPrep {
-        // A failed transport can never retire a fence, so parking a PASSIVE
-        // waiter against one is a guaranteed timeout at best.
-        if self.failed || fence_id == 0 || fence_id >= self.next_wire_fence {
-            return FenceWaitPrep::Invalid;
-        }
-        if fence_id < self.wire_fence_base {
-            FENCE_ID_FOREIGN_GENERATION.fetch_add(1, Ordering::Relaxed);
-            return FenceWaitPrep::Invalid;
-        }
-        let in_flight = self.inflight.iter().any(|entry| {
-            matches!(
-                entry.kind,
-                InFlightKind::AsyncVenus { fence_id: assigned, .. } if assigned == fence_id
-            )
-        });
-        if !in_flight {
-            // SAFETY: `block` is the initialized, frame-borrowed waiter supplied
-            // by the caller, and this lock excludes every terminal publisher.
-            unsafe {
-                let _ = block
-                    .as_ref()
-                    .publish_terminal(WaitDisposition::FenceCompleted);
-            }
-            return FenceWaitPrep::Complete;
-        }
-        if self.fence_waiters.len() >= MAX_FENCE_WAITERS {
-            return FenceWaitPrep::TableFull;
-        }
-        self.fence_waiters.push(FenceWaiter { fence_id, block });
-        FENCE_WAIT_REGISTERED.fetch_add(1, Ordering::Relaxed);
-        FenceWaitPrep::Registered
-    }
-
-    /// Deregister a timed-out fence waiter. Returns `true` if completion or
-    /// transport abort signaled and removed it first; disposition distinguishes them.
-    pub fn fence_wait_cancel(&mut self, block: NonNull<SyncWaitBlock>) -> bool {
-        if let Some(i) = self.fence_waiters.iter().position(|w| w.block == block) {
-            self.fence_waiters.swap_remove(i);
-            false
-        } else {
-            true
-        }
-    }
-
     // ── WDDM pending-fence FIFO (SubmitCommand → DPC completion) ─────────────
 
     /// Whether every async wire fence `< watermark` in `domain` has retired.
@@ -3274,7 +3011,6 @@ impl VirtioGpu {
         engine_ticket: crate::adapter::OrderedEngineTicket,
         paging: bool,
         gpu_completion_fence: Option<u64>,
-        d3d12: bool,
     ) -> WddmAdmission {
         if self.failed {
             WDDM_SIGNAL_AFTER_FAILURE.fetch_add(1, Ordering::Relaxed);
@@ -3293,12 +3029,8 @@ impl VirtioGpu {
             (0, WireBoundary::Prefix)
         } else if let Some(gpu_fence_id) = gpu_completion_fence {
             use helios_kmd_logic::wddm_boundary as boundary;
-            let selection = boundary::select(
-                gpu_fence_id,
-                self.wire_fence_base,
-                self.next_wire_fence,
-                d3d12,
-            );
+            let selection =
+                boundary::select(gpu_fence_id, self.wire_fence_base, self.next_wire_fence);
             match selection.rejection {
                 boundary::Rejection::OutOfRange => {
                     GPU_FENCE_CLAMPED.fetch_add(1, Ordering::Relaxed);
@@ -3341,10 +3073,7 @@ impl VirtioGpu {
     /// Pop the head-of-FIFO WDDM submission once its real producer boundary
     /// has retired. The FIFO remains strictly ordered; no completion is
     /// synthesized or allowed to bypass an older ticket.
-    pub fn take_one_ready_wddm(
-        &mut self,
-        _order: &crate::adapter::NotifyOrdered<'_>,
-    ) -> WddmTake {
+    pub fn take_one_ready_wddm(&mut self, _order: &crate::adapter::NotifyOrdered<'_>) -> WddmTake {
         let Some(head) = self.wddm_pending.front() else {
             return WddmTake::Empty;
         };
@@ -3358,7 +3087,6 @@ impl VirtioGpu {
         WDDM_FENCE_FROM_DPC.fetch_add(1, Ordering::Relaxed);
         WddmTake::Ready(WddmReady { pending })
     }
-
 
     /// Put a popped-but-undelivered submission back at the head of the FIFO.
     ///

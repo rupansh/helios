@@ -427,7 +427,7 @@ unsafe fn query_driver_caps(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
     // Returning SUCCESS from a DIRQL stash is a lie dxgkrnl acts on: it frees
     // the previous buffer to the app and issues the next flip while nothing has
     // been programmed. Measured the same day: 80 dropped binds and 145 of 1245
-    // present markers writing the buffer that was on screen (defect 0ab).
+    // ordinary Present work racing ahead of the buffer actually on screen.
     // `ddi/present_packet.rs`'s `PresentFlipPrivate` implements the DMA-buffer
     // contract instead, which is the one designed for exactly this hardware.
     const FLIPCAPS_DEFAULT: UINT = FLIPCAPS_FLIP_ON_VSYNC_MMIO;

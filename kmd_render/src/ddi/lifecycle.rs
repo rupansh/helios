@@ -206,9 +206,9 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // Copy only the OS-supplied byte range, directly to the heap. Requiring the
     // feature-query callback here also makes every later callback read covered
     // by the validated Size.
-    let Some(dxgkrnl) = (unsafe {
-        crate::adapter::StartedState::copy_dxgkrnl_interface(dxgkrnl_interface)
-    }) else {
+    let Some(dxgkrnl) =
+        (unsafe { crate::adapter::StartedState::copy_dxgkrnl_interface(dxgkrnl_interface) })
+    else {
         unsafe {
             *number_of_video_present_sources = 0;
             *number_of_children = 0;
@@ -486,8 +486,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // partial started package.
     if crate::virtio::KMD_D2_OWNER_ENABLED && knobs.display_half {
         let (width, height) = scanout_mode.extent();
-        if let Err(start_error) =
-            crate::ddi::direct_scanout::start(passive, adapter, width, height)
+        if let Err(start_error) = crate::ddi::direct_scanout::start(passive, adapter, width, height)
         {
             crate::ddi::direct_scanout::prepare_reset(
                 passive,
@@ -607,8 +606,8 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // SAFETY: our adapter context, handed back from AddDevice.
         let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
         let passive_stop = unsafe { crate::irql::PassiveLevel::assume() };
-        let d2_had_transport = crate::virtio::KMD_D2_OWNER_ENABLED
-            && adapter.with_virtio(|_| ()).is_ok();
+        let d2_had_transport =
+            crate::virtio::KMD_D2_OWNER_ENABLED && adapter.with_virtio(|_| ()).is_ok();
         if d2_had_transport {
             // Close every asynchronous display producer before the D2 plane
             // enters its causal drain. ETW remains admitted until those plane
@@ -794,8 +793,7 @@ pub unsafe extern "C" fn dxgkddi_remove_device(miniport_device_context: *mut c_v
                         return status;
                     }
                     crate::ddi::direct_scanout::complete_verified_reset(passive_remove, adapter);
-                    let _ =
-                        adapter.remove_virtio_and_reset_scanout_bind_generation(passive_remove);
+                    let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive_remove);
                     unsafe { adapter.set_transport_generation(None) };
                 }
                 crate::ddi::direct_scanout::complete_removal(passive_remove, adapter);

@@ -49,36 +49,27 @@ use crate::irql::PassiveLevel;
 
 mod bringup;
 mod commands;
-mod present;
 mod protocol;
 mod ring;
 mod scanout;
 
 pub(crate) use bringup::*;
-use commands::*;
-pub(crate) use present::*;
 pub(crate) use protocol::*;
-pub(crate) use scanout::zero_host_visible_blob;
 use ring::*;
+pub(crate) use scanout::zero_host_visible_blob;
 
 /// Declare one handle newtype per Vulkan object class.
 ///
-/// One untyped counter minted every handle — images, memory, buffers, pools,
-/// command buffers, fences, queues and the device — and every id is a live
-/// handle in the SAME host object space. So a swapped argument does not fail
-/// loudly: it destroys or rebinds the wrong host object, and surfaces much later
-/// as a corrupt frame or a host decoder abort.
-/// `cleanup_imported_source_alias(adapter, resource_id, memory_id, image_id)`
-/// compiles today and would issue `vkDestroyImage` on a `VkDeviceMemory` handle
-/// and `vkFreeMemory` on a `VkImage` handle; the encoder accepts both, only the
-/// host notices. Likewise `bind_image_memory(memory_id, image_id)`.
+/// One untyped counter mints every image, memory, and device handle in the same
+/// host object space. Distinct newtypes keep a swapped image/memory argument
+/// from compiling.
 ///
 /// `NonZeroU64` also retires the "0 means absent" convention and the ~30
 /// scattered `if x != 0` guards that implemented it: `Option<VkImageId>` is the
 /// same size as the `u64` it replaces, and "not yet valid" stops being encodable
 /// as a legal-looking handle the encoder will happily write into the stream.
 ///
-/// The macro exists so eight identical definitions cannot drift; it expands to
+/// The macro exists so the identical definitions cannot drift; it expands to
 /// exactly the three items written below and nothing else.
 macro_rules! vk_handle {
     ($(#[$attr:meta])* $name:ident) => {
@@ -119,32 +110,6 @@ vk_handle!(
     VkDeviceMemoryId
 );
 vk_handle!(
-    /// `VkBuffer`.
-    VkBufferId
-);
-vk_handle!(
-    /// `VkCommandPool`.
-    VkCommandPoolId
-);
-vk_handle!(
-    /// `VkCommandBuffer`.
-    VkCommandBufferId
-);
-vk_handle!(
-    /// `VkFence`.
-    VkFenceId
-);
-// `VkQueue` and `VkDevice` are the two handles that used to exist in a "not yet
-// valid, encoded as 0" state during bring-up. They are newtypes now because
-// R608's VenusRing -> VenusInstance -> VenusClient typestate removed that state:
-// a VenusClient without a device is unrepresentable, so no Option is needed and
-// no encoder has to unwrap one.
-vk_handle!(
-    /// `VkQueue`. Obtained from `vkGetDeviceQueue`, not minted, but it is still
-    /// a guest-assigned handle in the same space.
-    VkQueueId
-);
-vk_handle!(
     /// `VkDevice`.
     VkDeviceId
 );
@@ -157,15 +122,13 @@ pub struct HostVisibleBlob {
     pub blob_id: u64,
     /// The virtio-gpu resource id of the mapped blob (for teardown / unref).
     pub res_id: u32,
-    /// Guest-physical base inside the host-visible window (`base + offset`).
-    pub gpa: u64,
     /// Page-rounded size mapped into the window.
     pub size: u64,
 }
 
 /// A HOST3D blob backed by a pure DEVICE_LOCAL, non-HOST_VISIBLE Vulkan
-/// allocation.  Unlike [`HostVisibleBlob`], this object is deliberately not
-/// mappable and carries no guest physical address.
+/// allocation. Unlike [`HostVisibleBlob`], this object is deliberately not
+/// mappable.
 pub struct DeviceLocalBlob {
     pub blob_id: u64,
     pub res_id: u32,
@@ -191,6 +154,10 @@ pub struct OptimalImageBlob {
     pub image_id: VkImageId,
     pub memory_type_index: u32,
 }
+
+/// Every owned memory blob is also tracked by VirtioGpu's bounded blob table,
+/// so the transport capacity is the exact upper bound.
+const MAX_OWNED_MEMORY_BLOBS: usize = crate::virtio::gpu::MAX_BLOBS;
 
 /// Bring-up stage 2: an instance and a physical device exist on the ring.
 ///
@@ -226,25 +193,15 @@ pub struct VenusClient {
     /// venus device handle. Not `Option`: a `VenusClient` without a device is
     /// unrepresentable, which is the whole point of the typestate.
     device_id: VkDeviceId,
-    /// Graphics queue handle from family 0, queue 0.
-    queue_id: VkQueueId,
     /// HOST_VISIBLE|HOST_COHERENT memory type chosen during bring-up.
     memory_type_index: MemoryTypeIndex,
     /// Raw VkMemoryPropertyFlags for physical-device memory types.
     memory_type_flags: [u32; VK_MAX_MEMORY_TYPES as usize],
     memory_type_count: u32,
-    /// App/DWM BLT imports and recorded copies. Both vectors are preallocated
-    /// and capacity-bounded. Every access is serialized by
-    /// AdapterContext::with_venus_client, so setup/submission/teardown cannot
-    /// race through incidental call ordering.
-    present_images: Vec<ImportedOptimalImage>,
-    present_buffers: Vec<BorrowedPresentBuffer>,
-    present_blits: Vec<PreparedPresentBlt>,
-    /// Exact identities of `allocate_memory_blob` allocations. This registry
-    /// turns a standard Present destination into a checked borrow of the
-    /// already-live local `VkDeviceMemory`; no resource-id heuristic or
-    /// same-device re-import is permitted.
-    owned_memory_blobs: Vec<OwnedMemoryBlob>,
+    /// Exact identities of live memory-blob allocations. Capacity is bounded
+    /// by the transport's blob table and teardown removes an id only after the
+    /// corresponding Venus free command has been accepted.
+    owned_memory_blobs: Vec<VkDeviceMemoryId>,
 }
 
 impl VenusClient {
@@ -314,22 +271,6 @@ impl VenusClient {
         VkDeviceMemoryId(self.next_raw())
     }
 
-    fn new_buffer_id(&mut self) -> VkBufferId {
-        VkBufferId(self.next_raw())
-    }
-
-    fn new_command_pool_id(&mut self) -> VkCommandPoolId {
-        VkCommandPoolId(self.next_raw())
-    }
-
-    fn new_command_buffer_id(&mut self) -> VkCommandBufferId {
-        VkCommandBufferId(self.next_raw())
-    }
-
-    fn new_fence_id(&mut self) -> VkFenceId {
-        VkFenceId(self.next_raw())
-    }
-
     /// Destroy a Venus `VkImage` allocated by the kernel Venus client. Best
     /// effort: allocation teardown must not wedge if the host context is already
     /// being destroyed.
@@ -363,28 +304,16 @@ impl VenusClient {
 
     /// Free a Venus `VkDeviceMemory`, removing its local blob identity only
     /// after the free command has been accepted by the ring.
-    ///
-    /// A memory object borrowed by a cached Present buffer cannot be freed.
-    /// Allocation teardown must first drain `release_present_blits_for_resource`;
-    /// this check turns that lifetime contract into an enforced invariant.
     pub fn free_memory_blob(
         &mut self,
         adapter: &AdapterContext,
         memory_id: u64,
     ) -> Result<(), VirtioError> {
         let memory_id = VkDeviceMemoryId::from_raw(memory_id).ok_or(VirtioError::DeviceError)?;
-        if self
-            .present_buffers
-            .iter()
-            .any(|buffer| buffer.memory.memory_id == memory_id)
-        {
-            crate::diag::record_named_bytes(b"PBFree", 0xE1);
-            return Err(VirtioError::DeviceError);
-        }
         let owned_index = self
             .owned_memory_blobs
             .iter()
-            .position(|blob| blob.memory_id == memory_id);
+            .position(|owned| *owned == memory_id);
         self.free_memory_object(adapter, memory_id)?;
         if let Some(index) = owned_index {
             self.owned_memory_blobs.swap_remove(index);

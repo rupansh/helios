@@ -8,8 +8,8 @@
 //!
 //! Every method here is field-disjoint from the control queue and the fence
 //! tables -- verified, not assumed: none of the methods touches `transport`,
-//! `control`, `inflight`, `parked`, `dma_pool`, `fence_waiters`, or
-//! `wddm_pending`, and there is no `self.<method>()` call across the boundary in
+//! `control`, `inflight`, `parked`, `dma_pool`, or `wddm_pending`, and there is
+//! no `self.<method>()` call across the boundary in
 //! either direction.
 
 use super::*;
@@ -135,22 +135,6 @@ impl VirtioGpu {
             slot.map_offset,
             slot.map_len,
         ))
-    }
-
-    /// Whether `resource_id` is alive host-side, per the KMD's authoritative
-    /// live-resource table (the KMD owns the resid namespace: every blob create
-    /// and every unref goes through it, so this mirrors the host's global
-    /// resource table exactly).
-    ///
-    /// This exists because the host's CTX_ATTACH_RESOURCE path CANNOT be
-    /// trusted to report failure: `virgl_renderer_ctx_attach_resource` is void
-    /// and silently no-ops on an unknown resource, so QEMU replies OK_NODATA
-    /// for an attach that never happened — the exact mechanism behind the
-    /// boot-#3 `vkr: failed to import resource: invalid res_id 45` dwm kill.
-    /// OpenAllocation and the ATTACH_RESOURCE escape validate against this
-    /// table and fail loudly instead.
-    pub fn resource_is_live(&self, resource_id: u32) -> bool {
-        self.resources.iter().any(|&r| r == resource_id)
     }
 
     /// Remove a live resource id from the one-shot ownership table.

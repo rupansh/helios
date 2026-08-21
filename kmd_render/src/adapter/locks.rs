@@ -9,8 +9,8 @@ use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use helios_kmd_logic::ordered_engine::{
-    AdmissionRefusal, CompletionDisposition, FailureDisposition, OrderedEngine,
-    RetirementRefusal, MAX_ORDERED_ENGINE_SUBMISSIONS,
+    AdmissionRefusal, CompletionDisposition, FailureDisposition, OrderedEngine, RetirementRefusal,
+    MAX_ORDERED_ENGINE_SUBMISSIONS,
 };
 use wdk_sys::ntddk::{
     KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock, KeSetEvent, KeWaitForSingleObject,
@@ -38,8 +38,7 @@ pub(crate) use helios_kmd_logic::ordered_engine::{
 };
 
 /// The concrete K9 frontier stored once per adapter.
-pub(super) type OrderedEngineFrontier =
-    OrderedEngine<{ MAX_ORDERED_ENGINE_SUBMISSIONS }>;
+pub(super) type OrderedEngineFrontier = OrderedEngine<{ MAX_ORDERED_ENGINE_SUBMISSIONS }>;
 
 /// Allocate K9's multi-KiB frontier directly on the heap.
 ///
@@ -300,12 +299,11 @@ impl WddmNotifyGuard<'_> {
         if count == 0 {
             return;
         }
-        let _ = self
-            .adapter
-            .ordered_engine_native_rescans
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                Some(pending.saturating_add(count))
-            });
+        let _ = self.adapter.ordered_engine_native_rescans.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |pending| Some(pending.saturating_add(count)),
+        );
     }
 
     pub(crate) fn ordered_engine_native_rescans(&self) -> u32 {
@@ -317,12 +315,11 @@ impl WddmNotifyGuard<'_> {
     /// Discharge only the prefix one accepted K7 rescan observed. The guard
     /// prevents reset from clearing an old epoch between callback and update.
     pub(crate) fn retire_ordered_engine_native_rescans(&self, observed: u32) {
-        let _ = self
-            .adapter
-            .ordered_engine_native_rescans
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(observed))
-            });
+        let _ = self.adapter.ordered_engine_native_rescans.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| Some(current.saturating_sub(observed)),
+        );
     }
 
     /// Run `f` against this adapter's transport with the notify lock already
@@ -394,7 +391,6 @@ impl ScanoutGuard<'_> {
     ) -> Result<R, NotStarted> {
         self.adapter.with_venus_client(self.passive, f)
     }
-
 }
 
 impl AdapterContext {

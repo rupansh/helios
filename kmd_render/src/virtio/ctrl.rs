@@ -62,10 +62,9 @@ use wdk_sys::{LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::control_owner::ResourceBackingFinalizer;
 use super::gpu::{
-    BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner, FenceWaitPrep,
-    OwnerFilter, SyncOutcome, SyncTicket, SyncWaitBlock, WaitBlockRef, WaitDisposition,
-    CTRL_TEARDOWN_ABANDONS, CTRL_TIMEOUT_COUNT, FENCE_WAIT_TABLE_FULL, FENCE_WAIT_TIMEOUTS,
-    SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
+    BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner, OwnerFilter,
+    SyncOutcome, SyncTicket, SyncWaitBlock, WaitBlockRef, WaitDisposition, CTRL_TEARDOWN_ABANDONS,
+    CTRL_TIMEOUT_COUNT,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
@@ -81,29 +80,23 @@ use helios_kmd_logic::control_ownership::{
 };
 use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
-    VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuMemEntry, VirtioGpuResourceMapBlob,
-    VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref,
-    VirtioGpuRespMapInfo, VirtioGpuSetScanoutBlob, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
-    VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY,
-    VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE, VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
-    VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
-    VIRTIO_GPU_CMD_RESOURCE_UNREF, VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_FLAG_FENCE,
-    VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
-    VIRTIO_GPU_BLOB_MEM_GUEST, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAP_CACHE_MASK,
+    VirtioGpuMemEntry, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceMapBlob,
+    VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref, VirtioGpuRespMapInfo,
+    VirtioGpuSetScanoutBlob, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_MEM_GUEST,
+    VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_CTX_CREATE,
+    VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
+    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
+    VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNREF,
+    VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
+    VIRTIO_GPU_MAP_CACHE_MASK,
 };
 
 /// `KernelMode` (`KPROCESSOR_MODE`).
 const KERNEL_MODE: i8 = 0;
 /// `Executive` (`KWAIT_REASON`).
 const EXECUTIVE: i32 = 0;
-/// Stock Venus GPU-completion ring used by ordinary KMD Present BLTs.
-const GPU_COMPLETION_RING_IDX: u32 = 1;
-
 static CTRL_WAIT_PENDING: AtomicU32 = AtomicU32::new(0);
-static CTRL_WAIT_FENCE_COMPLETED: AtomicU32 = AtomicU32::new(0);
 static CTRL_RESPONSE_MALFORMED: AtomicU32 = AtomicU32::new(0);
-static FENCE_WAIT_PENDING: AtomicU32 = AtomicU32::new(0);
-static FENCE_WAIT_HOST_RESPONSE: AtomicU32 = AtomicU32::new(0);
 static FINALIZER_CUSTODY_INVARIANT: AtomicU32 = AtomicU32::new(0);
 
 fn retain_resource_finalizer(
@@ -220,9 +213,6 @@ const SYNC_ROUNDTRIP_TIMEOUT_MS: u64 = 30_000;
 /// count that only *happened* to equal 5 s because the sleep is hard-coded to
 /// 1 ms.
 const ENQUEUE_RETRY_MAX_MS: u64 = 5_000;
-/// Hard cap on a single WAIT_FENCE escape (the ICD's own forward-progress
-/// deadline fires far earlier; this only bounds kernel-side thread residency).
-const WAIT_FENCE_MAX_MS: u64 = 120_000;
 /// Bound on waiting out another mapper's in-flight RESOURCE_MAP_BLOB.
 /// MILLISECONDS, as above.
 const MAP_BUSY_MAX_MS: u64 = 30_000;
@@ -711,10 +701,6 @@ fn ctrl_roundtrip_observed(
             }
             WaitDisposition::Pending => {
                 bump_wait_refusal(&CTRL_WAIT_PENDING, b"CtDsPend");
-                CtrlRoundtripOutcome::Ambiguous(AbandonReason::MalformedResponse)
-            }
-            WaitDisposition::FenceCompleted => {
-                bump_wait_refusal(&CTRL_WAIT_FENCE_COMPLETED, b"CtDsFence");
                 CtrlRoundtripOutcome::Ambiguous(AbandonReason::MalformedResponse)
             }
         }
@@ -1389,9 +1375,8 @@ pub(crate) fn set_scanout_blob_fenced(
         {
             // SAFETY: the exact observed length covers the complete response
             // array; the byte array itself carries no alignment guarantee.
-            let header = unsafe {
-                core::ptr::read_unaligned(response.as_ptr().cast::<VirtioGpuCtrlHdr>())
-            };
+            let header =
+                unsafe { core::ptr::read_unaligned(response.as_ptr().cast::<VirtioGpuCtrlHdr>()) };
             let Some(identity) = identity() else {
                 record_fenced_scanout_response_refusal(2);
                 return FencedScanoutSetOutcome::Ambiguous(None);
@@ -1560,34 +1545,6 @@ pub(crate) fn resource_unref_session_reply(
     )
 }
 
-/// Attach an EXISTING live resource id to a context without taking ownership
-/// (the DXVK/Mesa shared-resource import path). C1: liveness is validated
-/// against the KMD's authoritative table BEFORE sending — the host attach path
-/// cannot be trusted to fail (`virgl_renderer_ctx_attach_resource` is void and
-/// silently no-ops on an unknown resource; QEMU still replies OK_NODATA).
-pub fn attach_resource_checked(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    ctx_id: u32,
-    resource_id: u32,
-) -> Result<(), VirtioError> {
-    if super::control_owner::KMD_D2_OWNER_ENABLED {
-        if !adapter.control_owner().resource_is_live(resource_id) {
-            crate::diag::record(0x0E09_0000 | (resource_id & 0xFFFF));
-            return Err(VirtioError::DeviceError);
-        }
-        return ctx_attach_resource(passive, adapter, ctx_id, resource_id);
-    }
-    let live = adapter
-        .with_virtio(|v| v.resource_is_live(resource_id))
-        .map_err(|_| VirtioError::DeviceError)?;
-    if !live {
-        crate::diag::record(0x0E09_0000 | (resource_id & 0xFFFF));
-        return Err(VirtioError::DeviceError);
-    }
-    ctx_attach_resource(passive, adapter, ctx_id, resource_id)
-}
-
 /// Create a HOST3D virtio-gpu blob resource in venus context `ctx_id`,
 /// referencing venus device-memory `blob_id`, and attach it to the context.
 /// Returns the guest-assigned resource id. Mirrors the proven System-class
@@ -1667,11 +1624,8 @@ pub(crate) fn resource_create_guest_blob(
         return Err(VirtioError::DeviceError);
     }
     if !super::control_owner::KMD_D2_OWNER_ENABLED {
-        let _ = finalize_resource_backing(
-            passive,
-            adapter,
-            ResourceBackingFinalizer::guest_pages(mdl),
-        );
+        let _ =
+            finalize_resource_backing(passive, adapter, ResourceBackingFinalizer::guest_pages(mdl));
         return Err(VirtioError::DeviceError);
     }
     let mut finalize = |finalizer| finalize_resource_backing(passive, adapter, finalizer);
@@ -1926,19 +1880,12 @@ where
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
-    if let Err(e) =
-        ctx_attach_resource_mode(passive, adapter, ctx_id, resource_id, mode)
-    {
+    if let Err(e) = ctx_attach_resource_mode(passive, adapter, ctx_id, resource_id, mode) {
         // The resource exists host-side but could not attach: drop it so it
         // does not leak untracked.
         let mut finalize = retain_resource_finalizer;
-        let _ = resource_unref_with_finalizer_mode(
-            passive,
-            adapter,
-            resource_id,
-            &mut finalize,
-            mode,
-        );
+        let _ =
+            resource_unref_with_finalizer_mode(passive, adapter, resource_id, &mut finalize, mode);
         let _ = adapter.with_virtio(|v| v.cancel_resource_reservation());
         return Err(e);
     }
@@ -2359,14 +2306,6 @@ fn release_owner_resource(
     if !super::control_owner::KMD_D2_OWNER_ENABLED {
         return Err(VirtioError::DeviceError);
     }
-    let terminal = adapter.with_scanout_lifecycle(passive, |lock| -> Result<(), VirtioError> {
-        lock.with_venus_client(|client| {
-            client.release_present_blits_for_resource(adapter, resource_id)
-        })
-        .map_err(|_| VirtioError::DeviceError)??;
-        Ok(())
-    });
-    terminal?;
     if adapter
         .control_owner()
         .mapped_blob_offset(resource_id)?
@@ -2405,20 +2344,6 @@ pub fn release_blobs_for_owner(
         let Some((ctx_id, res, mapped, map_offset, map_len)) = taken else {
             return reclaimed;
         };
-        let terminal = adapter.with_scanout_lifecycle(passive, |lock| {
-            matches!(
-                lock.with_venus_client(|client| {
-                    client.release_present_blits_for_resource(adapter, res)
-                }),
-                Ok(Ok(()))
-            )
-        });
-        if !terminal {
-            // The blob tracking entry was intentionally taken first. Retaining
-            // the host objects on an ambiguous drain leaks safely until Venus
-            // teardown; continuing would detach a possibly in-flight resource.
-            return reclaimed;
-        }
         if mapped {
             let _ = resource_unmap_blob(passive, adapter, res);
             let _ = adapter.with_virtio(|v| v.free_window_range_pub(map_offset, map_len));
@@ -2560,202 +2485,4 @@ pub(crate) fn submit_venus_session_sync(
     cmd.hdr.ring_idx = 0;
     cmd.size = size;
     ctrl_roundtrip_ok_finite(passive, adapter, bytes_of(&cmd), Some(stream))
-}
-
-/// The prologue both per-frame display submitters share: refuse an empty
-/// stream, reap parked buffers, and stage the meta + venus DMA buffers.
-///
-/// R1004. `submit_venus_async_scanout` and `submit_venus_async_present` were
-/// identical apart from which enqueue entry point they called.
-///
-/// Neither display submitter uses the DMA pool: `DmaBuffer::new` allocates
-/// contiguous memory per frame on both.
-/// Switching them onto `take_dma_buffer` is a perf change with its own gate and
-/// is explicitly out of scope here; what this commit buys is that the policy is
-/// now stated in one place instead of inferred from two.
-fn stage_display_submit(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    stream: &[u8],
-) -> Result<(DmaBuffer, DmaBuffer, usize), VirtioError> {
-    if stream.is_empty() {
-        return Err(VirtioError::DeviceError);
-    }
-    reap_parked(passive, adapter);
-    let meta = DmaBuffer::new(passive, SUBMIT_META_BYTES).ok_or(VirtioError::OutOfMemory)?;
-    let mut venus = DmaBuffer::new(passive, stream.len()).ok_or(VirtioError::OutOfMemory)?;
-    venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
-    Ok((meta, venus, stream.len()))
-}
-
-/// The outcome mapping both display submitters share: a transport-gone outer
-/// error and a per-enqueue inner error are distinct, and the handed-back
-/// buffers are dropped at PASSIVE.
-///
-/// Neither path retries. That is deliberate and unchanged: one enqueue attempt
-/// either succeeds or reports QueueFull to the caller, which keeps
-/// SetVidPnSourceAddress out of a hidden multi-second retry loop.
-fn display_submit_outcome(
-    queued: Result<Result<u64, (DmaBuffer, DmaBuffer, VirtioError)>, crate::error::NotStarted>,
-) -> Result<u64, VirtioError> {
-    match queued {
-        Ok(Ok(fence_id)) => Ok(fence_id),
-        Ok(Err((_meta, _venus, e))) => Err(e),
-        Err(_) => Err(VirtioError::DeviceError),
-    }
-}
-
-/// Nonblocking KMD Present-BLT submission.
-///
-/// Like the scanout copy path, ring_idx=1 makes used-ring retirement represent
-/// GPU completion. Unlike scanout, an ordinary app/DWM BLT must not mark the
-/// physical scanout dirty or wake the display refresh worker.
-pub fn submit_venus_async_present(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    ctx_id: u32,
-    stream: &[u8],
-) -> Result<u64, VirtioError> {
-    let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
-
-    // Ring 1 WITHOUT a notify, which is the whole difference from the scanout
-    // path above: used-ring retirement still represents GPU completion, but an
-    // ordinary app/DWM BLT must not mark the physical scanout dirty or wake the
-    // display refresh worker.
-    display_submit_outcome(adapter.with_virtio(move |v| {
-        v.drain_used(adapter);
-        v.enqueue_async_submit(
-            ctx_id,
-            GPU_COMPLETION_RING_IDX,
-            meta,
-            venus,
-            venus_len,
-        )
-    }))
-}
-
-/// Outcome of a [`wait_fence`] call.
-///
-/// ⚠ The escape boundary (`ddi/escape.rs`'s `escape_wait_fence`) must keep
-/// matching every variant explicitly, with **no wildcard arm**: today it maps
-/// three variants to three statuses, so adding a variant is a compile error
-/// there instead of a silent collapse into `TimedOut`. That is the whole
-/// encoding — `#[non_exhaustive]` is deliberately NOT used, because it only
-/// affects downstream crates and would claim a guarantee it cannot provide
-/// inside this one.
-///
-/// A fourth variant also needs a paired ICD change: `escape_wait_fence` reports
-/// only `out_completed` 1/0 plus `STATUS_INVALID_PARAMETER`, so a third state
-/// has nowhere to go on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WaitFenceOutcome {
-    /// The wire fence has completed (host-visible-complete).
-    Complete,
-    /// `timeout_ns` elapsed first (or this was a poll and it is still pending).
-    TimedOut,
-    /// The id was never assigned / the transport is gone.
-    Invalid,
-}
-
-fn completed_fence_outcome(block: &WaitBlockRef<'_>) -> WaitFenceOutcome {
-    // SAFETY: callers reach this only after exact pre-completion publication,
-    // a satisfied signal, or locked cancellation proving the signal arm won.
-    match unsafe { block.classify_fence_after_completion() } {
-        WaitDisposition::FenceCompleted => WaitFenceOutcome::Complete,
-        WaitDisposition::TransportAborted => {
-            TRANSPORT_GONE_AT_WAIT.fetch_add(1, Ordering::Relaxed);
-            WaitFenceOutcome::Invalid
-        }
-        WaitDisposition::Pending => {
-            bump_wait_refusal(&FENCE_WAIT_PENDING, b"FwDsPend");
-            WaitFenceOutcome::Invalid
-        }
-        WaitDisposition::HostResponseAvailable | WaitDisposition::MalformedResponse => {
-            bump_wait_refusal(&FENCE_WAIT_HOST_RESPONSE, b"FwDsHost");
-            WaitFenceOutcome::Invalid
-        }
-    }
-}
-
-/// Wait (PASSIVE, KEVENT) until wire fence `fence_id` completes or
-/// `timeout_ns` elapses. `timeout_ns == 0` is a poll.
-pub fn wait_fence(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    fence_id: u64,
-    timeout_ns: u64,
-) -> WaitFenceOutcome {
-    // Scoped exactly as in `ctrl_roundtrip`. Every `return` below is a return
-    // from the closure, and the deregistration pairing is unchanged: the four
-    // early exits in the registration loop all happen BEFORE `Registered`, so
-    // there is no waiter to cancel, and both post-registration exits call
-    // `fence_wait_cancel`.
-    SyncWaitBlock::with(|block| {
-        let mut full_retries = 0u32;
-        loop {
-            let prep = adapter.with_virtio(|v| {
-                v.drain_used(adapter);
-                v.fence_wait_prepare(fence_id, block.as_ptr())
-            });
-            match prep {
-                Err(_) => return WaitFenceOutcome::Invalid, // transport gone
-                Ok(FenceWaitPrep::Complete) => return completed_fence_outcome(block),
-                Ok(FenceWaitPrep::Invalid) => return WaitFenceOutcome::Invalid,
-                Ok(FenceWaitPrep::TableFull) => {
-                    full_retries += 1;
-                    if full_retries > 1_000 {
-                        // NOT FENCE_WAIT_TIMEOUTS: the host may be perfectly
-                        // healthy and all MAX_FENCE_WAITERS slots simply occupied.
-                        // The outcome stays TimedOut so the ICD is untouched; only
-                        // the evidence is split. Note the budget is nominally 1 s
-                        // but KeDelayExecutionThread rounds a 1 ms relative timeout
-                        // up to the system timer granularity (~15.6 ms), so this is
-                        // up to ~16 s of thread residency.
-                        FENCE_WAIT_TABLE_FULL.fetch_add(1, Ordering::Relaxed);
-                        return WaitFenceOutcome::TimedOut;
-                    }
-                    sleep_ms(passive, 1);
-                }
-                Ok(FenceWaitPrep::Registered) => break,
-            }
-        }
-
-        if timeout_ns == 0 {
-            // Poll: deregister immediately; completion may still have raced in.
-            return match adapter.with_virtio(|v| v.fence_wait_cancel(block.as_ptr())) {
-                Ok(true) => completed_fence_outcome(block),
-                Ok(false) => WaitFenceOutcome::TimedOut,
-                // Transport gone: the fence did NOT retire. Reporting Complete here
-                // made escape_wait_fence write out_completed = 1 and return
-                // STATUS_SUCCESS for an unretired wire fence - a direct violation of
-                // "never signal a wire fence before host completion". Invalid is
-                // already mapped to STATUS_INVALID_PARAMETER and already handled by
-                // the ICD.
-                Err(_) => {
-                    TRANSPORT_GONE_AT_WAIT.fetch_add(1, Ordering::Relaxed);
-                    WaitFenceOutcome::Invalid
-                }
-            };
-        }
-
-        let total_ms = (timeout_ns / 1_000_000).max(1).min(WAIT_FENCE_MAX_MS);
-        if wait_block(passive, adapter, block, total_ms) {
-            return completed_fence_outcome(block);
-        }
-        match adapter.with_virtio(|v| {
-            v.drain_used(adapter);
-            v.fence_wait_cancel(block.as_ptr())
-        }) {
-            Ok(true) => completed_fence_outcome(block),
-            Ok(false) => {
-                FENCE_WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-                WaitFenceOutcome::TimedOut
-            }
-            // As in the poll exit above.
-            Err(_) => {
-                TRANSPORT_GONE_AT_WAIT.fetch_add(1, Ordering::Relaxed);
-                WaitFenceOutcome::Invalid
-            }
-        }
-    })
 }

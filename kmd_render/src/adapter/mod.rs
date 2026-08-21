@@ -20,12 +20,10 @@ use crate::virtio::{TransportOwner, TransportOwnerCreateError, VirtioGpu};
 use helios_kmd_logic::DisplayMode;
 
 pub(crate) mod allocation_object;
-mod backing;
 mod kobj;
 mod locks;
 mod segments;
 
-pub(crate) use backing::{SystemBackingSnapshot, SystemBackingTable};
 pub(crate) use locks::{
     dump_ordered_engine_atomics, NotifyOrdered, OrderedEngineTicket, WddmNotifyGuard,
 };
@@ -554,7 +552,6 @@ pub struct AdapterContext {
     pub paging_pte_shadow: crate::ddi::PagingPteShadow,
     /// Exact system-memory pages Windows associates with a BAR allocation
     /// through paging TRANSFER requests.
-    pub(crate) system_backings: SystemBackingTable,
     // ⛔ `vidmm_trackers: VidMmTrackerTable` lived here. It was the attestation
     // half of UMD-backing adoption: its only producer was the retired
     // `HELIOS_WDDM_ALLOC_KIND_TRACKING` create and its only consumer the
@@ -792,7 +789,6 @@ impl AdapterContext {
             // Zeroed placeholder — initialized in place by init_kernel_events.
             scanout_mutex: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             paging_pte_shadow: crate::ddi::PagingPteShadow::new(),
-            system_backings: SystemBackingTable::new(),
             venus_client: UnsafeCell::new(None),
             // Zeroed placeholder — the real dispatcher header is written by
             // `init_kernel_events` once the context is at its final address.
@@ -1085,21 +1081,6 @@ impl AdapterContext {
             unreachable!("the canonical control owner requires the WDDM 3.2 D2 package");
         }
         &self.transport_owner
-    }
-
-    pub(crate) fn canonical_blob_lookup(
-        &self,
-        resource_id: u32,
-    ) -> Result<
-        Option<(Option<crate::virtio::gpu::DeviceOwner>, u64, bool)>,
-        crate::virtio::VirtioError,
-    > {
-        if crate::virtio::KMD_D2_OWNER_ENABLED {
-            self.transport_owner.blob_lookup(resource_id)
-        } else {
-            self.with_virtio(|gpu| gpu.blob_lookup(resource_id))
-                .map_err(|_| crate::virtio::VirtioError::DeviceError)
-        }
     }
 
     pub(crate) fn reset_virtio_physical(

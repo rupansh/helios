@@ -7,33 +7,18 @@ use core::ffi::c_void;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use helios_protocol::{HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY, HELIOS_WDDM_ALLOC_KIND_STANDARD};
-
 use crate::adapter::AdapterContext;
-use crate::ddi::create_allocation::{present_alloc_info, PresentAllocationStorage};
 use crate::ddi::present_packet::{
-    MpoPresentRefusal, PatchCapacity, PresentAllocations, PresentMpoPayload, PresentPayload,
-    PresentSubmissionPrivate, PRESENT_DMA_PACKET_BYTES, STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
+    MpoPresentRefusal, PresentAllocations, PresentMpoPayload, PresentPayload,
+    PRESENT_DMA_PACKET_BYTES, STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER,
 };
-use crate::device::ContextHandleRef;
 use crate::dxgk::*;
-use crate::virtio::venus::{OptimalPresentImageDesc, PresentBufferDesc, PresentDestinationDesc};
-use crate::virtio::VirtioError;
 use helios_kmd_logic::ScanoutFormat;
 use wdk_sys::ntddk::KeGetCurrentIrql;
 
 pub static PRESENT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// Drives the throttle for this DDI's IDENTITY dumps (`diag::sample_tick`).
-/// Failure values — PBRet, PBCpy, PBSyWt, PBSyCp and PBFlip's error arms — are
-/// never sampled; they stay unconditional.
-///
-/// ⚠ `PBCpy`/`PBFlip` **`0xEA`** is the newest of those and the one to expect
-/// first after an allocation-association regression: it means
-/// `present_alloc_info` answered `None`. It is counted by
-/// `create_allocation::PRESENT_NO_ALLOC_INFO`, because a last-value breadcrumb
-/// cannot distinguish "once" from "every frame". Do not read this as `0xE1`,
-/// which means dxgkrnl handed us a handle we could not resolve. The two shared one
-/// value until round 3 of the Phase-2 review separated them.
+/// Failure values remain unconditional; per-call identity dumps are sampled.
 static PRESENT_TRACE_TICK: AtomicU32 = AtomicU32::new(0);
 /// Drives the independent success-result mirror. `PBRet` used to perform a
 /// synchronous registry write for every successful Present, directly on the
@@ -224,7 +209,7 @@ pub unsafe extern "C" fn dxgkddi_present(
 }
 
 unsafe fn dxgkddi_present_inner(
-    h_context: IN_CONST_HANDLE,
+    _h_context: IN_CONST_HANDLE,
     present: INOUT_PDXGKARG_PRESENT,
 ) -> NTSTATUS {
     PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -261,10 +246,6 @@ unsafe fn dxgkddi_present_inner(
     // fixed present allocation array.
     let present_allocations = unsafe { PresentAllocations::from_allocation_list(&allocation_list) };
 
-    // The patch-capacity proof, acquired before any host GPU work on the BLT
-    // path and consumed by the single write below.
-    let mut patch_capacity: Option<PatchCapacity> = None;
-
     // Present-path IDENTITY trace, SAMPLED (R316). These are per-call dumps of
     // flags / counts / sizes that mattered during bring-up; at 60 Hz they were
     // ~8 synchronous kernel registry writes per frame before the surface block
@@ -287,8 +268,6 @@ unsafe fn dxgkddi_present_inner(
     if sample {
         crate::diag::record_named_bytes(b"PBkpsz", args.DmaBufferPrivateDataSize);
     }
-    let present_context = unsafe { ContextHandleRef::from_raw(h_context) };
-    let adapter = present_context.as_ref().and_then(ContextHandleRef::adapter);
     let src_handle = present_allocations
         .source()
         .map(|allocation| allocation.handle())
@@ -297,104 +276,20 @@ unsafe fn dxgkddi_present_inner(
         .destination()
         .map(|allocation| allocation.handle())
         .unwrap_or(core::ptr::null_mut());
-    let src_info = unsafe { present_alloc_info(src_handle) };
-    let dst_info = unsafe { present_alloc_info(dst_handle) };
     if payload_has_list {
         PRESENT_LAST_SRC_OPEN_LOW.store(src_handle as usize as u32, Ordering::Relaxed);
         PRESENT_LAST_DST_OPEN_LOW.store(dst_handle as usize as u32, Ordering::Relaxed);
-
-        // Present-blit feasibility trace (read-only), SAMPLED. Resolves the
-        // composition source + destination surfaces to their venus resource ids
-        // and geometry, and reports whether each is a tracked
-        // host-visible-mappable blob. 38 registry writes plus two blob_lookup
-        // round-trips under the device lock — per present, for values that change
-        // only when the surface set changes. Note this block runs for the FLIP
-        // shape too (the flip arm reads src_info, resolved from the allocation
-        // list), so it was genuinely per-frame.
         if sample {
-            // Trace-only identity, resolved ONLY here — inside the sampling gate.
-            let src_diag = unsafe { crate::ddi::create_allocation::present_alloc_diag(src_handle) };
-            let dst_diag = unsafe { crate::ddi::create_allocation::present_alloc_diag(dst_handle) };
             crate::diag::record_named_bytes(b"PBsrcH", (src_handle as usize as u32) & 0xFFFF);
             crate::diag::record_named_bytes(b"PBdstH", (dst_handle as usize as u32) & 0xFFFF);
-            if let Some(s) = src_info {
-                if let Some(dg) = src_diag {
-                    crate::diag::record_named_bytes(b"PBsRtA", dg.runtime_allocation);
-                }
-                crate::diag::record_named_bytes(b"PBsrc", s.resource_id);
-                crate::diag::record_named_bytes(b"PBsw", s.width);
-                crate::diag::record_named_bytes(b"PBsh", s.height);
-                crate::diag::record_named_bytes(b"PBsPch", s.pitch);
-                crate::diag::record_named_bytes(b"PBsFmt", s.dxgi_format);
-                crate::diag::record_named_bytes(b"PBsD3F", s.format);
-                crate::diag::record_named_bytes(b"PBsBnd", s.bind_flags);
-                crate::diag::record_named_bytes(b"PBsSto", s.storage as u32);
-                crate::diag::record_named_bytes(b"PBsKnd", s.kind);
-                crate::diag::record_named_bytes(b"PBsMt", s.memory_type_index);
-                crate::diag::record_named_bytes(b"PBsSz", s.venus_alloc_size as u32);
-                if let Some(dg) = src_diag {
-                    crate::diag::record_named_bytes(b"PBsStd", dg.standard_allocation_type);
-                    crate::diag::record_named_bytes(b"PBsGdi", dg.standard_gdi_surface_type);
-                    crate::diag::record_named_bytes(b"PBsOF", dg.open_flags);
-                    crate::diag::record_named_bytes(b"PBsRA", u32::from(dg.resource_associated));
-                    crate::diag::record_named_bytes(b"PBsAPS", dg.allocation_private_size);
-                    crate::diag::record_named_bytes(b"PBsRPS", dg.resource_private_size);
-                }
-                let lk = adapter
-                    .and_then(|adapter| adapter.canonical_blob_lookup(s.resource_id).ok());
-                // 0=untracked, else 0x1_0000 | (mapped<<8) | (size in 4KiB pages, low byte)
-                let code = match lk {
-                    Some(Some((_owner, size, mapped))) => {
-                        0x0001_0000 | ((mapped as u32) << 8) | ((size / 4096) as u32 & 0xFF)
-                    }
-                    _ => 0,
-                };
-                crate::diag::record_named_bytes(b"PBstrk", code);
-            } else {
-                crate::diag::record_named_bytes(b"PBsrc", 0);
-            }
-            if let Some(d) = dst_info {
-                if let Some(dg) = dst_diag {
-                    crate::diag::record_named_bytes(b"PBdRtA", dg.runtime_allocation);
-                }
-                crate::diag::record_named_bytes(b"PBdst", d.resource_id);
-                crate::diag::record_named_bytes(b"PBdw", d.width);
-                crate::diag::record_named_bytes(b"PBdh", d.height);
-                crate::diag::record_named_bytes(b"PBdPch", d.pitch);
-                crate::diag::record_named_bytes(b"PBdFmt", d.dxgi_format);
-                crate::diag::record_named_bytes(b"PBdD3F", d.format);
-                crate::diag::record_named_bytes(b"PBdBnd", d.bind_flags);
-                crate::diag::record_named_bytes(b"PBdSto", d.storage as u32);
-                crate::diag::record_named_bytes(b"PBdKnd", d.kind);
-                crate::diag::record_named_bytes(b"PBdMt", d.memory_type_index);
-                crate::diag::record_named_bytes(b"PBdSz", d.venus_alloc_size as u32);
-                if let Some(dg) = dst_diag {
-                    crate::diag::record_named_bytes(b"PBdStd", dg.standard_allocation_type);
-                    crate::diag::record_named_bytes(b"PBdGdi", dg.standard_gdi_surface_type);
-                    crate::diag::record_named_bytes(b"PBdOF", dg.open_flags);
-                    crate::diag::record_named_bytes(b"PBdRA", u32::from(dg.resource_associated));
-                    crate::diag::record_named_bytes(b"PBdAPS", dg.allocation_private_size);
-                    crate::diag::record_named_bytes(b"PBdRPS", dg.resource_private_size);
-                }
-                let lk = adapter
-                    .and_then(|adapter| adapter.canonical_blob_lookup(d.resource_id).ok());
-                let code = match lk {
-                    Some(Some((_owner, size, mapped))) => {
-                        0x0001_0000 | ((mapped as u32) << 8) | ((size / 4096) as u32 & 0xFF)
-                    }
-                    _ => 0,
-                };
-                crate::diag::record_named_bytes(b"PBdtrk", code);
-            } else {
-                crate::diag::record_named_bytes(b"PBdst", 0);
-            }
         }
 
-        // DXGK_PRESENTFLAGS.Blt is bit 0. Dxgkrnl has already resolved both
-        // fixed allocation-list entries to our typed open handles. Perform the
-        // actual full-surface source -> destination copy before emitting the
-        // scheduler marker; a no-op Present leaves DWM's shared render target
-        // black even though the application's source rendered correctly.
+        // DXGK_PRESENTFLAGS.Blt is bit 0. The UMD has already executed the
+        // source-to-destination copy and flushed its exact direct translator
+        // context before invoking pfnPresentCb. KMD contributes only the
+        // ordinary allocation references and K9-ordered DMA boundary; it does
+        // not reconstruct either allocation from a renderer resource id or
+        // submit a second private Venus copy.
         if present_flags & 1 != 0 {
             let bytes = PRESENT_DMA_PACKET_BYTES as UINT;
             if args.pDmaBuffer.is_null() || args.DmaSize < bytes {
@@ -404,293 +299,15 @@ unsafe fn dxgkddi_present_inner(
                 );
                 return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
             }
-            if args.pDmaBufferPrivateData.is_null()
-                || (args.DmaBufferPrivateDataSize as usize)
-                    < core::mem::size_of::<PresentSubmissionPrivate>()
-            {
-                PRESENT_LAST_STATUS.store(
-                    STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER as u32,
-                    Ordering::Relaxed,
-                );
-                return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
-            }
-            // BEFORE any host GPU work: an insufficient-buffer retry must not
-            // be able to duplicate the BLT below. The token is carried to the
-            // single write site rather than dropped, so the ordering is a
-            // type-level fact on this path and not a convention.
-            match present_allocations.validate_patch_capacity(args) {
-                Ok(capacity) => patch_capacity = Some(capacity),
-                Err(status) => {
-                    PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
-                    return status;
-                }
-            }
-
-            // ⚠ THE A3 GAP REACHING THE DISPLAY PATH, separated from the
-            // handle-lifetime failure it used to be indistinguishable from.
-            //
-            // `present_alloc_info` answers `None` for every allocation while
-            // `PresentAllocationStorage` has no producer (K4-CONTRACT §5: HWA2
-            // carries no host resource id, so `DxgkDdiOpenAllocation` has
-            // nothing to build one from and refuses to fabricate one). So this
-            // arm is taken on EVERY present, and it used to report `0xE1` —
-            // whose meaning here is "dxgkrnl handed us a handle we could not
-            // resolve", a handle-lifetime bug. An operator would have chased the
-            // wrong defect. `0xEA` is the A3 arm and
-            // `create_allocation::PRESENT_NO_ALLOC_INFO` (`PrNoRid`) counts it,
-            // because a last-value breadcrumb cannot say whether this fired once
-            // or once per frame.
-            let alloc_info_absent = src_info.is_none() || dst_info.is_none();
-            let (Some(adapter), Some(source), Some(destination)) = (adapter, src_info, dst_info)
-            else {
-                if alloc_info_absent {
-                    crate::ddi::create_allocation::PRESENT_NO_ALLOC_INFO
-                        .fetch_add(1, Ordering::Relaxed);
-                    crate::diag::record_named_bytes(b"PBCpy", 0xEA);
-                } else {
-                    crate::diag::record_named_bytes(b"PBCpy", 0xE1);
-                }
-                PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
-                return STATUS_INVALID_PARAMETER;
-            };
-            let source_dxgi_format = source.resolved_dxgi_format();
-            let destination_dxgi_format = destination.resolved_dxgi_format();
-            let (Some(source_dxgi_format), Some(destination_dxgi_format)) =
-                (source_dxgi_format, destination_dxgi_format)
-            else {
-                crate::diag::record_named_bytes(b"PBCpy", 0xE2);
-                PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
-                return STATUS_INVALID_PARAMETER;
-            };
-            if source.kind != HELIOS_WDDM_ALLOC_KIND_DEVICE_MEMORY {
-                crate::diag::record_named_bytes(b"PBCpy", 0xE6);
-                PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
-                return STATUS_INVALID_PARAMETER;
-            }
-            let source_desc = match source.storage {
-                PresentAllocationStorage::OptimalCrossContextImage => {
-                    OptimalPresentImageDesc::new_cross_context_dma_buf(
-                        source.resource_id,
-                        source.venus_alloc_size,
-                        source.memory_type_index,
-                        source.width,
-                        source.height,
-                        source.bind_flags,
-                        source_dxgi_format,
-                    )
-                }
-                PresentAllocationStorage::OptimalOpaqueFdImage => {
-                    OptimalPresentImageDesc::new_opaque_fd(
-                        source.resource_id,
-                        source.venus_alloc_size,
-                        source.memory_type_index,
-                        source.width,
-                        source.height,
-                        source.bind_flags,
-                        source_dxgi_format,
-                    )
-                }
-                PresentAllocationStorage::PitchedStandardBuffer => None,
-            };
-            let destination_desc = match destination.storage {
-                PresentAllocationStorage::PitchedStandardBuffer
-                    if destination.kind == HELIOS_WDDM_ALLOC_KIND_STANDARD =>
-                {
-                    PresentBufferDesc::new(
-                        destination.resource_id,
-                        destination.venus_alloc_size,
-                        destination.memory_type_index,
-                        destination.width,
-                        destination.height,
-                        destination.pitch,
-                        destination_dxgi_format,
-                    )
-                    .map(PresentDestinationDesc::StandardBuffer)
-                }
-                PresentAllocationStorage::OptimalCrossContextImage => {
-                    OptimalPresentImageDesc::new_cross_context_dma_buf(
-                        destination.resource_id,
-                        destination.venus_alloc_size,
-                        destination.memory_type_index,
-                        destination.width,
-                        destination.height,
-                        destination.bind_flags,
-                        destination_dxgi_format,
-                    )
-                    .map(PresentDestinationDesc::OptimalImage)
-                }
-                PresentAllocationStorage::OptimalOpaqueFdImage => {
-                    OptimalPresentImageDesc::new_opaque_fd(
-                        destination.resource_id,
-                        destination.venus_alloc_size,
-                        destination.memory_type_index,
-                        destination.width,
-                        destination.height,
-                        destination.bind_flags,
-                        destination_dxgi_format,
-                    )
-                    .map(PresentDestinationDesc::OptimalImage)
-                }
-                PresentAllocationStorage::PitchedStandardBuffer => None,
-            };
-            let (Some(source_desc), Some(destination_desc)) = (source_desc, destination_desc)
-            else {
-                crate::diag::record_named_bytes(b"PBCpy", 0xE2);
-                PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
-                return STATUS_INVALID_PARAMETER;
-            };
-            if source.width != destination.width || source.height != destination.height {
-                crate::diag::record_named_bytes(b"PBCpy", 0xE3);
-                PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
-                return STATUS_INVALID_PARAMETER;
-            }
-
-            {
-                // SAFETY: `DxgkDdiPresent` is documented "IRQL: PASSIVE_LEVEL" (WDK
-                // DXGKDDI_PRESENT) — it is a pageable DDI, and the BLT arm below
-                // waits on a wire fence and maps blob bytes, neither of which is
-                // legal above PASSIVE. Note this is the BLT arm only; the MMIO-flip
-                // arm generates no DMA buffer and is completed through
-                // SetVidPnSourceAddress, whose DIRQL half holds no token at all.
-                let passive = unsafe { crate::irql::PassiveLevel::assume() };
-                let copy = adapter.with_venus_client(passive, |client| {
-                    client.submit_present_blt(adapter, source_desc, destination_desc)
-                });
-                let gpu_fence = match copy {
-                    Ok(Ok(fence)) => fence,
-                    Ok(Err(VirtioError::OutOfMemory | VirtioError::QueueFull)) => {
-                        crate::diag::record_named_bytes(b"PBCpy", 0xE4);
-                        PRESENT_LAST_STATUS.store(STATUS_NO_MEMORY as u32, Ordering::Relaxed);
-                        return STATUS_NO_MEMORY;
-                    }
-                    Ok(Err(_)) | Err(_) => {
-                        crate::diag::record_named_bytes(b"PBCpy", 0xE5);
-                        PRESENT_LAST_STATUS
-                            .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
-                        return STATUS_DEVICE_NOT_READY;
-                    }
-                };
-                crate::diag::record_named_bytes(
-                    b"PBConv",
-                    u32::from(source_dxgi_format != destination_dxgi_format),
-                );
-                // Windows can page a lockable standard staging destination from
-                // the BAR/Venus allocation into system memory and keep DWM's CPU
-                // view there. BuildPagingBuffer records that exact MDL-page
-                // association by resource id. Once this Venus copy completes,
-                // mirror into those pages before Present retires; otherwise later
-                // frames update only the stale BAR blob.
-                let has_system_backing = adapter.system_backings.contains(destination.resource_id);
-                if has_system_backing {
-                    match crate::virtio::ctrl::wait_fence(
-                        passive,
-                        adapter,
-                        gpu_fence,
-                        5_000_000_000,
-                    ) {
-                        crate::virtio::ctrl::WaitFenceOutcome::Complete => {
-                            crate::diag::record_named_bytes(b"PBSyWt", 1);
-                        }
-                        crate::virtio::ctrl::WaitFenceOutcome::TimedOut => {
-                            crate::diag::record_named_bytes(b"PBSyWt", 0xE1);
-                            PRESENT_LAST_STATUS
-                                .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
-                            return STATUS_DEVICE_NOT_READY;
-                        }
-                        crate::virtio::ctrl::WaitFenceOutcome::Invalid => {
-                            crate::diag::record_named_bytes(b"PBSyWt", 0xE2);
-                            PRESENT_LAST_STATUS
-                                .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
-                            return STATUS_DEVICE_NOT_READY;
-                        }
-                    }
-                }
-                if has_system_backing {
-                    match unsafe {
-                        crate::ddi::build_paging_buffer::mirror_present_system_backing(
-                            passive,
-                            adapter,
-                            destination.resource_id,
-                        )
-                    } {
-                        Some(true) => crate::diag::record_named_bytes(b"PBSyCp", 1),
-                        // Windows may page the allocation back to the BAR between
-                        // the pre-check and completed fence. With no system
-                        // backing, the Venus destination is authoritative again.
-                        None => crate::diag::record_named_bytes(b"PBSyCp", 2),
-                        Some(false) => {
-                            crate::diag::record_named_bytes(b"PBSyCp", 0xE1);
-                            PRESENT_LAST_STATUS
-                                .store(STATUS_DEVICE_NOT_READY as u32, Ordering::Relaxed);
-                            return STATUS_DEVICE_NOT_READY;
-                        }
-                    }
-                } else {
-                    crate::diag::record_named_bytes(b"PBSyCp", 0);
-                }
-                // Capacity was checked before host work was queued, so this cannot
-                // fail. Merge preserves the newest fence if dxgkrnl batches more
-                // than one Present into the same DMA private-data buffer.
-                if let Err(status) = unsafe {
-                    PresentSubmissionPrivate::merge_fence(
-                        args.pDmaBufferPrivateData,
-                        args.DmaBufferPrivateDataSize,
-                        gpu_fence,
-                    )
-                } {
-                    crate::diag::record_named_bytes(b"PBCpy", 0xE6);
-                    PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
-                    return status;
-                }
-                // NOT sampled: PBCpy is the value a failed Present is read from
-                // (its 0xE1..0xE6 arms), so its success arm has to keep the same
-                // cadence or "last PBCpy" stops meaning "what the last BLT did".
-                crate::diag::record_named_bytes(b"PBCpy", 1);
-                crate::diag::record_named_bytes(b"PBFnc", gpu_fence as u32);
-            }
         }
     }
 
     if present_flags & (1 << 2) != 0 {
-        if adapter.is_none() {
-            PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
-            return STATUS_INVALID_PARAMETER;
-        }
-        // DXGK_PRESENTFLAGS.Flip is an allocation-identity handoff, not a
-        // no-op. The source slot contains the exact
-        // hDeviceSpecificAllocation that dxgkrnl opened on this device. Select
-        // scanout only from that Windows-owned handle and the immutable
-        // private-data snapshot captured by OpenAllocation. In particular, do
-        // not let the UMD command payload independently select a resource.
-        // ⚠ As the BLT arm above: this is the A3 gap, not a handle-lifetime
-        // failure, and it is the arm every DWM flip now takes. `0xEA` + `PrNoRid`
-        // (`create_allocation::PRESENT_NO_ALLOC_INFO`) so the two are
-        // distinguishable and countable; `0xE1` stays reserved for its original
-        // meaning even though nothing can currently reach it here.
-        let Some(source) = src_info else {
-            crate::ddi::create_allocation::PRESENT_NO_ALLOC_INFO.fetch_add(1, Ordering::Relaxed);
-            crate::diag::record_named_bytes(b"PBFlip", 0xEA);
-            PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
-            return STATUS_INVALID_PARAMETER;
-        };
-        let Some(_dxgi_format) = source.resolved_dxgi_format() else {
-            crate::diag::record_named_bytes(b"PBFlip", 0xE2);
-            PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
-            return STATUS_INVALID_PARAMETER;
-        };
-        // Flip identity, SAMPLED (the 0xEA/0xE2 failure arms above stay
-        // unconditional — those are the values a failed Present is read from).
-        if sample {
-            crate::diag::record_named_bytes(b"PBsrc", source.resource_id);
-            crate::diag::record_named_bytes(b"PBsw", source.width);
-            crate::diag::record_named_bytes(b"PBsh", source.height);
-            crate::diag::record_named_bytes(b"PBsDir", u32::from(source.direct_scanout));
-        }
-
-        // The FLIP itself (epoch stamp, VidMm physical address, CRTC_VSYNC
-        // retirement) always belongs to the allocation-list source. D4 removes
-        // the former snapshot bind-target override; the Render-command stash is
-        // still consumed only by the unrelated legacy BLT arm above.
+        // DXGK_PRESENTFLAGS.Flip is an exact allocation-list handoff. The
+        // source slot contains the hDeviceSpecificAllocation that dxgkrnl
+        // opened on this device; D4 resolves that canonical association and no
+        // UMD payload, resource id, snapshot, or process-global lookup can
+        // independently select scanout.
 
         // It must not program scanout here: dxgkrnl subsequently names the
         // allocation that actually reached the VidPn source through
@@ -756,17 +373,15 @@ unsafe fn dxgkddi_present_inner(
         }
     }
 
-    // The BLT path carried its token here; every other path queues nothing, so
-    // acquiring immediately before the write is correct and says so.
-    let capacity = match patch_capacity {
-        Some(capacity) => capacity,
-        None => match present_allocations.validate_patch_capacity(args) {
-            Ok(capacity) => capacity,
-            Err(status) => {
-                PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
-                return status;
-            }
-        },
+    // Ordinary allocation references are validated once immediately before
+    // the write. Present itself performs no host work and queues no private
+    // resource transport before this point.
+    let capacity = match present_allocations.validate_patch_capacity(args) {
+        Ok(capacity) => capacity,
+        Err(status) => {
+            PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+            return status;
+        }
     };
     if let Err(status) = unsafe { present_allocations.write_patch_references(capacity, args) } {
         PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
@@ -1056,9 +671,7 @@ unsafe fn set_vidpn_source_address_d4(
     if !crate::virtio::KMD_D2_OWNER_ENABLED {
         return STATUS_NOT_SUPPORTED;
     }
-    if address.is_null()
-        || !(address as *const DXGKARG_SETVIDPNSOURCEADDRESS).is_aligned()
-    {
+    if address.is_null() || !(address as *const DXGKARG_SETVIDPNSOURCEADDRESS).is_aligned() {
         D4_CLASSIC_REFUSALS.fetch_add(1, Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
@@ -1211,14 +824,8 @@ unsafe fn arm_dma_flip_d4(
 }
 
 pub(crate) fn record_scanout_reject_counters() {
-    crate::diag::record_named_bytes(
-        b"D4ClsOk",
-        D4_CLASSIC_ACCEPTS.load(Ordering::Relaxed),
-    );
-    crate::diag::record_named_bytes(
-        b"D4ClsRef",
-        D4_CLASSIC_REFUSALS.load(Ordering::Relaxed),
-    );
+    crate::diag::record_named_bytes(b"D4ClsOk", D4_CLASSIC_ACCEPTS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D4ClsRef", D4_CLASSIC_REFUSALS.load(Ordering::Relaxed));
     crate::ddi::direct_scanout::record_refusal_counters();
 }
 

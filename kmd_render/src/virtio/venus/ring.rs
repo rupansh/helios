@@ -400,9 +400,9 @@ enum ResultPolicy {
     Refuse {
         diag: Option<u32>,
         /// A named breadcrumb recorded as the RAW `VkResult` before refusing.
-        /// The six host-VkResult breadcrumbs (`SdgLImg`, `CpImgVr`, `PBBufVr`,
-        /// `SdgLMem`, `CpMemVr`, `SdgDevR`) are the owner's first look at a
-        /// host-side rejection.
+        /// The surviving host-VkResult breadcrumbs (`SdgLImg`, `SdgOImg`,
+        /// `SdgLMem`, `SdgDevR`) are the owner's first look at a host-side
+        /// rejection.
         mark: Option<&'static [u8]>,
     },
 }
@@ -439,15 +439,6 @@ impl ReplyCheck {
         self
     }
 
-    /// As [`Self::refuse_result`], but the site records no diag code.
-    pub(super) const fn refuse_result_undiagnosed(mut self) -> Self {
-        self.result = ResultPolicy::Refuse {
-            diag: None,
-            mark: None,
-        };
-        self
-    }
-
     /// Record `name = <raw VkResult>` before refusing. Only meaningful after
     /// one of the `refuse_result*` builders.
     pub(super) const fn result_marks(mut self, name: &'static [u8]) -> Self {
@@ -467,7 +458,7 @@ impl ReplyCheck {
 /// Splitting this out is the point of the typestate. `VenusClient` used to be
 /// constructed complete-looking at stage 2 and then mutated through seven more
 /// ordered stages; between them it was a perfectly valid `VenusClient` whose
-/// `device_id`/`queue_id`/`memory_type_index` were 0, and every one of its ~40
+/// `device_id`/`memory_type_index` were 0, and every method
 /// methods would happily encode `VkDevice 0` into the wire stream — which the
 /// host answers by poisoning the ring. The ordering was enforced only by the
 /// linear layout of one 400-line function, so hoisting any helper above its
