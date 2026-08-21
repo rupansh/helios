@@ -1262,6 +1262,123 @@ mod tests {
         );
     }
 
+    fn physical_device_features2_stream(chain: &[u32]) -> Vec<u8> {
+        let mut b = Vec::new();
+        put32(&mut b, OP_SET_REPLY);
+        put32(&mut b, 0);
+        put64(&mut b, 1); // pStream
+        put32(&mut b, 0); // private reply resource placeholder
+        put64(&mut b, 80); // reply offset
+        put64(&mut b, 2_036); // captured generated reply bytes
+
+        put32(&mut b, 147); // vkGetPhysicalDeviceFeatures2
+        put32(&mut b, COMMAND_GENERATE_REPLY);
+        put64(&mut b, 2); // physical device
+        put64(&mut b, 1); // pFeatures
+        put32(&mut b, 1_000_059_000); // VkPhysicalDeviceFeatures2
+        for &structure_type in chain {
+            put64(&mut b, 1); // pNext
+            put32(&mut b, structure_type);
+        }
+        put64(&mut b, 0); // terminal pNext
+        b
+    }
+
+    #[test]
+    fn admits_captured_dxvk_feature_chain_but_keeps_a_finite_depth_bound() {
+        let chain = [
+            1_000_252_000,
+            1_000_352_000,
+            1_000_028_000,
+            1_000_642_000,
+            1_000_564_000,
+            1_000_234_000,
+            1_000_567_000,
+            1_000_260_000,
+            1_000_254_000,
+            1_000_382_000,
+            1_000_356_000,
+            1_000_498_000,
+            1_000_422_000,
+            1_000_451_000,
+            1_000_351_000,
+            1_000_392_000,
+            1_000_328_000,
+            1_000_495_000,
+            1_000_391_000,
+            1_000_418_000,
+            1_000_393_000,
+            1_000_320_000,
+            1_000_251_000,
+            1_000_455_000,
+            1_000_499_000,
+            1_000_102_000,
+            1_000_355_000,
+            1_000_582_000,
+            1_000_283_000,
+            1_000_287_002,
+            1_000_081_001,
+            1_000_381_000,
+            1_000_244_000,
+            1_000_411_000,
+            1_000_148_000,
+            1_000_339_000,
+            1_000_524_000,
+            1_000_336_000,
+            1_000_387_000,
+            1_000_235_000,
+            1_000_323_000,
+            1_000_558_000,
+            1_000_434_000,
+            1_000_181_000,
+            1_000_141_000,
+            1_000_286_000,
+            1_000_481_000,
+            1_000_347_000,
+            1_000_386_000,
+            1_000_348_013,
+            1_000_562_000,
+            1_000_226_003,
+            1_000_203_000,
+            1_000_421_000,
+            1_000_506_000,
+            1_000_201_000,
+            1_000_150_013,
+            1_000_232_000,
+            55,
+            1_000_330_000,
+            1_000_281_000,
+            1_000_267_000,
+            1_000_377_000,
+            1_000_340_000,
+            53,
+            51,
+            49,
+        ];
+        let stream = physical_device_features2_stream(&chain);
+        assert_eq!(stream.len(), 876);
+        let admitted = validate_venus_control_stream(
+            &stream,
+            true,
+            &mut [VenusOperand::default(); 1],
+            &mut [0u32; 8],
+        )
+        .expect("captured DXVK vkGetPhysicalDeviceFeatures2 chain");
+        assert_eq!(admitted.opcode, 147);
+        assert_eq!(admitted.reply_size, 2_036);
+
+        let too_deep = physical_device_features2_stream(&std::vec![1_000_252_000; 129]);
+        assert_eq!(
+            validate_venus_control_stream(
+                &too_deep,
+                true,
+                &mut [VenusOperand::default(); 1],
+                &mut [0u32; 8],
+            ),
+            Err(VenusReject::UnsupportedChain)
+        );
+    }
+
     #[test]
     fn every_nested_shape_refuses_a_truncated_tail() {
         let mut streams = Vec::new();

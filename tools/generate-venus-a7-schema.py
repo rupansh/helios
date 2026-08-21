@@ -672,7 +672,7 @@ class Generator:
             "",
             "use super::{Cursor, OperandWriter, VenusReject};",
             "",
-            "const MAX_A7_NESTING: u32 = 64;",
+            "const MAX_A7_NESTING: u32 = 128;",
             "",
             "#[derive(Clone, Copy, Debug, PartialEq, Eq)]",
             "pub enum A7CommandKind { Allocation, CommandRecord, Queue, PureControl }",
