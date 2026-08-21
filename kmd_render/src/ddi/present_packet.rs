@@ -29,16 +29,9 @@ pub(crate) const STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER: NTSTATUS = 0xC01E_0001
 /// allocation lists; the DMA payload carries no stream, cookie, or resource id.
 pub(crate) const PRESENT_DMA_PACKET_BYTES: usize = core::mem::size_of::<u32>();
 
-const D3D12_SUBMISSION_VERSION: u32 = 4;
-/// "HD12" — distinct from `helios_protocol`'s wire-side
-/// `HELIOS_D3D12_SUBMIT_MAGIC` ("HE12") because they identify different things:
-/// that one is the UMD's command record, this one is the KMD's private handoff.
-const D3D12_SUBMISSION_MAGIC: u32 = 0x4844_3132; // "HD12"
-
 /// Byte offset of [`PresentFlipPrivate`] inside the per-context DMA
-/// private-data buffer. [`D3d12SubmissionPrivate`] owns bytes 0..16; the
-/// established flip offset remains 32, so the two never collide when dxgkrnl
-/// batches a BLT and a flip into one DMA buffer.
+/// private-data buffer. The established offset remains 32 so the ordinary
+/// Present ABI does not move while retired private carriers are deleted.
 pub(crate) const PRESENT_FLIP_PRIVATE_OFFSET: usize = 32;
 
 /// `DmaBufferPrivateDataSize` this driver requests per context (`device.rs`'s
@@ -196,118 +189,7 @@ const _: () = {
             <= PRESENT_DMA_PRIVATE_DATA_BYTES as usize,
         "PresentFlipPrivate does not fit the DMA private-data buffer"
     );
-    assert!(
-        core::mem::size_of::<D3d12SubmissionPrivate>() <= PRESENT_FLIP_PRIVATE_OFFSET,
-        "D3d12SubmissionPrivate overlaps PresentFlipPrivate"
-    );
 };
-
-/// KMD-private scheduler handoff for one D3D12 ECL submission.
-///
-/// This fixed 16-byte record lives only in dxgkrnl's per-context DMA private
-/// data. It carries the exact K9 wire-fence boundary and no stream, allocation,
-/// resource id, or user-visible protocol.
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct D3d12SubmissionPrivate {
-    magic: u32,
-    version: u32,
-    gpu_fence_id: u64,
-}
-
-/// Whether an ECL record found another ECL already batched into this DMA buffer.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum D3d12Mark {
-    First,
-    MergedWithPredecessor,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct D3d12SubmissionBoundary {
-    pub gpu_fence_id: u64,
-}
-
-impl D3d12SubmissionPrivate {
-    #[inline]
-    fn for_fence(gpu_fence_id: u64) -> Self {
-        Self {
-            magic: D3D12_SUBMISSION_MAGIC,
-            version: D3D12_SUBMISSION_VERSION,
-            gpu_fence_id,
-        }
-    }
-
-    /// Stamp one ECL identity and its exact boundary. A zero boundary is still
-    /// written so a recycled buffer cannot inherit a predecessor.
-    ///
-    /// # Safety
-    /// `private_data` points to `private_size` writable dxgkrnl bytes.
-    pub(crate) unsafe fn mark(
-        private_data: *mut c_void,
-        private_size: u32,
-        gpu_fence_id: u64,
-    ) -> Result<D3d12Mark, NTSTATUS> {
-        if private_data.is_null() || (private_size as usize) < core::mem::size_of::<Self>() {
-            return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
-        }
-        let old = unsafe { core::ptr::read_unaligned(private_data.cast::<Self>()) };
-        let predecessor = old.magic == D3D12_SUBMISSION_MAGIC
-            && old.version == D3D12_SUBMISSION_VERSION
-            && old.gpu_fence_id != 0;
-        let fence = if predecessor {
-            old.gpu_fence_id.max(gpu_fence_id)
-        } else {
-            gpu_fence_id
-        };
-        unsafe {
-            core::ptr::write_unaligned(private_data.cast::<Self>(), Self::for_fence(fence));
-        }
-        Ok(if predecessor {
-            D3d12Mark::MergedWithPredecessor
-        } else {
-            D3d12Mark::First
-        })
-    }
-
-    /// Clear a valid record this Render did not write. This prevents a
-    /// non-ECL Render that reuses the buffer from inheriting an exact boundary.
-    ///
-    /// # Safety
-    /// `private_data` points to `private_size` writable dxgkrnl bytes.
-    pub(crate) unsafe fn invalidate(private_data: *mut c_void, private_size: u32) -> bool {
-        if private_data.is_null() || (private_size as usize) < core::mem::size_of::<Self>() {
-            return false;
-        }
-        let old = unsafe { core::ptr::read_unaligned(private_data.cast::<Self>()) };
-        if old.magic != D3D12_SUBMISSION_MAGIC || old.version != D3D12_SUBMISSION_VERSION {
-            return false;
-        }
-        unsafe { core::ptr::write_unaligned(private_data.cast::<u32>(), 0) };
-        true
-    }
-
-    /// Decode and consume the record. Consumption makes a replay fall back to
-    /// the conservative prefix instead of reusing an already-retired boundary.
-    ///
-    /// # Safety
-    /// `private_data` points to `private_size` readable and writable bytes.
-    pub(crate) unsafe fn decode(
-        private_data: *mut c_void,
-        private_size: u32,
-    ) -> Option<D3d12SubmissionBoundary> {
-        if private_data.is_null() || (private_size as usize) < core::mem::size_of::<Self>() {
-            return None;
-        }
-        let value = unsafe { core::ptr::read_unaligned(private_data.cast::<Self>()) };
-        if value.magic != D3D12_SUBMISSION_MAGIC || value.version != D3D12_SUBMISSION_VERSION {
-            return None;
-        }
-        unsafe { core::ptr::write_unaligned(private_data.cast::<u32>(), 0) };
-        Some(D3d12SubmissionBoundary {
-            gpu_fence_id: value.gpu_fence_id,
-        })
-    }
-}
 
 #[derive(Clone, Copy)]
 pub(crate) struct PresentAllocation {

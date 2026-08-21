@@ -1381,10 +1381,6 @@ fn reserve_scanout_transport_instance() -> Option<u64> {
     }
 }
 
-/// Generated D3D12 submissions admitted against the exact wire fence named by
-/// their consume-once HD12 boundary. Ordinary D3D11 Present never writes this
-/// private record and cannot increment the counter.
-pub(crate) static D3D12_EXACT_WATERMARK_USED: AtomicU32 = AtomicU32::new(0);
 /// Gap between one instance's first id and the next instance's.
 ///
 /// Far more than any instance can consume: at the ~10^5 fences a heavy session
@@ -1514,12 +1510,9 @@ impl WindowAllocator {
 
 /// Which retirement domain a wait is against.
 ///
-/// The nine-line doc this replaces explained at length that the wait is ring-0
-/// only and why counting ring >= 1 fences would be wrong — while sitting on a
-/// function whose `wait_gpu: bool` parameter did exactly that, undocumented,
-/// and whose three callers picked the mode three different ways (two hardcode
-/// true, one derives it from `gpu_completion_fence.is_some()`, one replays a
-/// stored value). Both values genuinely occur.
+/// Compatibility scheduler work can retire at decode or include host GPU
+/// completion, depending on the adapter's admitted fence mode. Direct HOB1/HOS1
+/// work does not enter this queue; K9 owns its exact completion frontier.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RetireDomain {
     /// Ring-0 only: host DECODE retirement.
@@ -1535,54 +1528,18 @@ enum RetireDomain {
     IncludingGpu,
 }
 
-/// How a [`WddmPending::watermark`] is compared against the in-flight wire fences.
-///
-/// ⛔ THE DISTINCTION IS A CLAUDE.md INVARIANT, not a tuning choice: *"a WDDM fence
-/// may wait on the frame's OWN boundary, never on the whole `next_wire_fence`
-/// backlog."* A prefix wait is satisfied only when EVERY async fence below the
-/// watermark has retired — every ring, every process, DWM's ring-1 scanout copies
-/// included — so it delays the fence by the whole pipeline depth and is the
-/// over-wait avoided by the exact D3D12 boundary path.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum WireBoundary {
-    /// `watermark` is EXCLUSIVE and a PREFIX: every async fence strictly below it
-    /// must have retired. Conservative, always eventually satisfied, never a lie,
-    /// and the fallback whenever a boundary cannot be trusted.
-    Prefix,
-    /// `watermark` names ONE wire fence and ONLY that fence must have retired.
-    ///
-    /// The frame's own boundary. See the D3D12 arm in
-    /// [`VirtioGpu::note_wddm_submission`] for why exactness is sound there and
-    /// why it is applied only to a generated HD12 boundary.
-    Exact,
-}
-
 /// A WDDM submission whose `DXGK_INTERRUPT_DMA_COMPLETED` is gated on venus
 /// completion: it may signal once every async wire fence `< watermark` has
 /// retired (and strictly in FIFO order — SubmissionFenceIds are watermarks to
 /// dxgkrnl, so they must complete monotonically).
-/// One WDDM submission waiting for its Venus watermark.
-///
-/// ⚠ IT CARRIED A SECOND HALF UNTIL 22.22.217.0 — the presentation epoch whose
-/// host `RESOURCE_FLUSH` had to complete before dxgkrnl could hand the
-/// allocation back to DXGI (ROADMAP defect 0ab-B). The theory was sound and the
-/// measurement was not: a 2×2 factorial over 46 681 frames moved whole-flush
-/// black by nothing in any cell, because the app's clear of a reclaimed buffer
-/// never travels in a WDDM DMA buffer and so waits on no completion this driver
-/// controls. `watermark` — "has the app finished WRITING this frame?" — is the
-/// only question a WDDM completion can answer, and it is the one asked here
-/// again. The epochs live on, deciding the flush executor's ownership gate.
 struct WddmPending {
     /// Direct slot/generation authority in K9's adapter-owned ordered engine
     /// frontier. This is scheduler-private lifetime state; it never crosses a
     /// wire or renderer ABI and is not looked up by a resource identity.
     engine_ticket: crate::adapter::OrderedEngineTicket,
-    /// Normal-wire producer boundary (possibly the KMD scanout-copy ring-1
-    /// fence).
+    /// Exclusive normal-wire prefix captured when the compatibility submission
+    /// was admitted. Exact direct HOB1/HOS1 work retires through K9 instead.
     watermark: u64,
-    /// Whether `watermark` is a prefix bound or the one fence this packet's own
-    /// work ends at. See [`WireBoundary`].
-    wire_boundary: WireBoundary,
     domain: RetireDomain,
 }
 
@@ -2955,49 +2912,6 @@ impl VirtioGpu {
             })
     }
 
-    /// Whether the ONE async wire fence `fence_id` has retired.
-    ///
-    /// ⛔ THE FRAME'S OWN BOUNDARY, and the point of A4. Where
-    /// [`Self::async_retired_up_to`] asks *"has everything below this retired"* —
-    /// a prefix over every ring and every process — this asks only about the fence
-    /// the submitting UMD actually named. Every id below `next_wire_fence` was
-    /// genuinely assigned AND enqueued (the counter is bumped only after
-    /// `control.add` succeeds, in the same spinlock section as the `inflight`
-    /// push), so an id that is not in flight has necessarily retired: absence is a
-    /// completion proof here, not an unknown.
-    ///
-    /// ⚠ NO `RetireDomain` FILTER, deliberately. A domain filter over a SINGLE
-    /// a ring filter could only ever fake readiness — "ring 1, so ignore it" — never
-    /// add safety, and the exact arm is constructed exclusively with
-    /// `IncludingGpu` anyway (`gpu_completion_fence.is_some()` forces that domain
-    /// one screen above the watermark selection). Taking the domain as a parameter
-    /// and ignoring it would have been the trap.
-    fn async_exact_retired(&self, fence_id: u64) -> bool {
-        fence_id == 0
-            || !self.inflight.iter().any(|e| match e.kind {
-                InFlightKind::AsyncVenus {
-                    fence_id: in_flight,
-                    ..
-                } => in_flight == fence_id,
-                _ => false,
-            })
-    }
-
-    /// Evaluate one WDDM entry's wire-fence dependency under its own
-    /// interpretation. The ONLY caller shape for a `WddmPending`; the bare
-    /// [`Self::async_retired_up_to`] keeps its three existing non-WDDM callers.
-    fn wire_boundary_ready(
-        &self,
-        watermark: u64,
-        domain: RetireDomain,
-        boundary: WireBoundary,
-    ) -> bool {
-        match boundary {
-            WireBoundary::Prefix => self.async_retired_up_to(watermark, domain),
-            WireBoundary::Exact => self.async_exact_retired(watermark),
-        }
-    }
-
     fn overflow_wddm_pending(&mut self) {
         self.wddm_pending.clear();
     }
@@ -3010,7 +2924,6 @@ impl VirtioGpu {
         _order: &crate::adapter::NotifyOrdered<'_>,
         engine_ticket: crate::adapter::OrderedEngineTicket,
         paging: bool,
-        gpu_completion_fence: Option<u64>,
     ) -> WddmAdmission {
         if self.failed {
             WDDM_SIGNAL_AFTER_FAILURE.fetch_add(1, Ordering::Relaxed);
@@ -3018,43 +2931,14 @@ impl VirtioGpu {
             return WddmAdmission::Failed;
         }
 
-        let domain = if gpu_completion_fence.is_some() {
-            RetireDomain::IncludingGpu
-        } else if paging || !self.dma_gpu_fence {
+        let domain = if paging || !self.dma_gpu_fence {
             RetireDomain::DecodeOnly
         } else {
             RetireDomain::IncludingGpu
         };
-        let (watermark, wire_boundary) = if paging {
-            (0, WireBoundary::Prefix)
-        } else if let Some(gpu_fence_id) = gpu_completion_fence {
-            use helios_kmd_logic::wddm_boundary as boundary;
-            let selection =
-                boundary::select(gpu_fence_id, self.wire_fence_base, self.next_wire_fence);
-            match selection.rejection {
-                boundary::Rejection::OutOfRange => {
-                    GPU_FENCE_CLAMPED.fetch_add(1, Ordering::Relaxed);
-                }
-                boundary::Rejection::ForeignGeneration => {
-                    GPU_FENCE_FOREIGN_GENERATION.fetch_add(1, Ordering::Relaxed);
-                }
-                boundary::Rejection::Accepted => {}
-            }
-            let wire_boundary = match selection.kind {
-                boundary::Kind::Prefix => WireBoundary::Prefix,
-                boundary::Kind::Exact => {
-                    D3D12_EXACT_WATERMARK_USED.fetch_add(1, Ordering::Relaxed);
-                    WireBoundary::Exact
-                }
-            };
-            (selection.watermark, wire_boundary)
-        } else {
-            (self.next_wire_fence, WireBoundary::Prefix)
-        };
+        let watermark = if paging { 0 } else { self.next_wire_fence };
 
-        if self.wddm_pending.is_empty()
-            && self.wire_boundary_ready(watermark, domain, wire_boundary)
-        {
+        if self.wddm_pending.is_empty() && self.async_retired_up_to(watermark, domain) {
             return WddmAdmission::HostTerminal;
         }
         if self.wddm_pending.len() >= MAX_WDDM_PENDING {
@@ -3065,7 +2949,6 @@ impl VirtioGpu {
         self.wddm_pending.push_back(WddmPending {
             engine_ticket,
             watermark,
-            wire_boundary,
             domain,
         });
         WddmAdmission::Pending
@@ -3077,7 +2960,7 @@ impl VirtioGpu {
         let Some(head) = self.wddm_pending.front() else {
             return WddmTake::Empty;
         };
-        if !self.wire_boundary_ready(head.watermark, head.domain, head.wire_boundary) {
+        if !self.async_retired_up_to(head.watermark, head.domain) {
             WDDM_HEAD_BLOCKED_WIRE.fetch_add(1, Ordering::Relaxed);
             return WddmTake::BlockedOnProducer;
         }

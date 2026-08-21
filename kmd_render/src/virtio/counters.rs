@@ -74,15 +74,6 @@ pub static RING_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
 /// ring-1 depth, and a permanent gap means ring-1 work that never retired.
 pub static RING_COMPLETE_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// Generated D3D12 completion boundaries replaced by the conservative current
-/// prefix because they were zero or beyond the fence allocator's high-water.
-/// This is image-lifetime telemetry; only a correlated delta is attributable.
-pub static GPU_FENCE_CLAMPED: AtomicU32 = AtomicU32::new(0);
-/// Generated D3D12 completion boundaries rejected because they name a fence
-/// below this transport instance's generation base. The submission falls back
-/// to the conservative current prefix. Read this image-lifetime counter only as
-/// a correlated delta.
-pub static GPU_FENCE_FOREIGN_GENERATION: AtomicU32 = AtomicU32::new(0);
 /// Reused PASSIVE-allocated command buffers served from the bounded DMA pool.
 pub static DMA_POOL_HITS: AtomicU32 = AtomicU32::new(0);
 /// Command buffers that required a fresh PASSIVE allocation.
