@@ -48,10 +48,9 @@
 //! memory to write. `KMD_IMPACT.md` §14a.5 then **forbids** the design outright:
 //! *"No `pfnSignal*Cb` for the application's fence."*
 //!
-//! ⭐ What is true instead: the runtime owns the fence and its signal, and this
-//! driver's only lever is **what dxgkrnl orders that signal behind** — the DMA
-//! packets already submitted on the queue's WDDM context. That is `EclWddmSubmitted`
-//! and nothing in this file.
+//! The runtime owns the monitored fence and its kernel signal. This driver owns
+//! only the lower engine-fence ordering described below; exact A5/A7 work reaches
+//! K9 through HOB1/HOS1 and no private Render marker is emitted here.
 //!
 //! # ⛔⛔ The engine fence is a SHADOW, and it CAN diverge from the runtime's
 //!
@@ -132,23 +131,11 @@
 //!   physical adapter (§10.1). Helios is single-adapter and
 //!   `pfnGetImplicitPhysicalAdapterMask` says so, so a multi-placement fence is
 //!   refused rather than silently backed by one engine fence.
-//! * **`D3D12DDI_FENCE_FLAG_BOTTOM_OF_PIPE`** is the driver being told the fence
-//!   must be signalled after *all* preceding GPU work retires, not at
-//!   command-processor front-end time. ⛔ §10.4: *"Do not claim
-//!   `BOTTOM_OF_PIPE` semantics the stack cannot deliver."* Forwarding to
-//!   `ID3D12CommandQueue::Signal` does give bottom-of-pipe ordering **within the
-//!   engine** — vkd3d signals the timeline semaphore after the submission — and
-//!   the WDDM half is `pfnExecuteCommandLists`' `pfnRenderCb` packet carrying the
-//!   frame's own completion boundary (`EclFenceSampled`, CLAUDE.md's fence
-//!   invariant). ⛔ Its old text said that boundary is *"knob-gated and off by
-//!   default (A1, `knobs12::UMD12_ECL_DRAIN`)"* — **FALSE since `f71fef4`**:
-//!   `Umd12EclFence` defaults **ON** and samples on **both** drain arms, so
-//!   `EclFenceSampled` is nonzero on a default build. `Umd12EclDrain` (default
-//!   OFF) decides only EXACT vs a **prefix that may under-wait**, and
-//!   `EclFenceNoDrain` — not `EclFenceSampled` — is what says which you got.
-//!   ⛔ It is **not** a queued software signal packet on this fence; that design
-//!   is struck and forbidden, see above. The flag is accepted and **counted**.
-//!
+//! * **`D3D12DDI_FENCE_FLAG_BOTTOM_OF_PIPE`** asks for retirement behind all
+//!   preceding GPU work. Forwarding to `ID3D12CommandQueue::Signal` provides
+//!   that ordering inside the lower engine. Scheduler completion for direct work
+//!   is independently owned by the exact HOB1/HOS1 K9 path; this flag does not
+//!   create a software signal packet, named fence, or private WDDM carrier.
 //! ⚠ **There is no shared / cross-adapter fence flag at this DDI.**
 //! `D3D12DDI_FENCE_FLAGS` has exactly two enumerators, `NONE = 0x0` and
 //! `BOTTOM_OF_PIPE = 0x1` (`d3d12umddi.h:1156-1161`); `D3D12_FENCE_FLAG_SHARED`
@@ -918,33 +905,9 @@ pub(crate) struct L7Refusals {
     /// multi-adapter assumption behind `ARCHITECTURE.md` §13 UNVERIFIED-11 has
     /// been reached for real, and a single engine fence cannot honour it.
     fence_multi_adapter_refused: RefusalCounter,
-    /// A fence carried `D3D12DDI_FENCE_FLAG_BOTTOM_OF_PIPE`, which this driver
-    /// backs **only inside the engine**.
-    ///
-    /// ⚠ **Expected non-zero, and it is a coupling rather than a fault.**
-    /// `ID3D12CommandQueue::Signal` on the vkd3d queue does retire behind that
-    /// queue's submitted work, so the engine half is honoured.
-    ///
-    /// ⛔ **The WDDM half this doc used to name — *"the queued software signal
-    /// packet"* on this fence — CANNOT EXIST.** `DDI_REFERENCE.md` §10.4's
-    /// correction block (`:2306-2331`) struck it, because every `pfnSignal*Cb`
-    /// names its target by `D3DKMT_HANDLE` and `D3D12DDIARG_CREATE_FENCE` carries
-    /// none; `KMD_IMPACT.md` §14a.5 forbids the design by name. The real WDDM half
-    /// is the `pfnRenderCb` packet `pfnExecuteCommandLists` submits with the
-    /// frame's own GPU-completion boundary (`EclFenceSampled`).
-    ///
-    /// ⛔ **GRADING CORRECTED 2026-08-07.** This said the boundary is *"off by
-    /// default under A1 (`knobs12::UMD12_ECL_DRAIN`)"*, which has been false since
-    /// `f71fef4`. Reading it that way inverts the conclusion on a default build:
-    /// `Umd12EclFence` is **ON**, so `EclFenceSampled` is nonzero on every ECL,
-    /// and someone told to expect 0 would read a flat fence measurement as
-    /// unattributable when in fact a boundary was carried.
-    ///
-    /// ⇒ read this counter beside **`EclFenceNoDrain`**, not beside
-    /// `EclFenceSampled`. `EclFenceSampled` only says a boundary was sampled;
-    /// `EclFenceNoDrain` is what distinguishes an EXACT boundary from a **prefix**
-    /// that may name less work than the frame contains — which is the distinction
-    /// a bottom-of-pipe claim actually turns on.
+    /// A fence carried `D3D12DDI_FENCE_FLAG_BOTTOM_OF_PIPE`. The lower
+    /// engine signal is ordered behind that queue's work; this remains a census
+    /// because the runtime-owned monitored-fence half is not visible to the UMD.
     fence_bottom_of_pipe_unproven: RefusalCounter,
     /// A `D3D12DDI_FENCE::Flags` carried a bit outside the two enumerators
     /// `d3d12umddi.h` defines. **Expected 0**; a hit means the header this build

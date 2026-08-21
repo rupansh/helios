@@ -1885,8 +1885,8 @@ fn hwa2_create_input(
 /// `E_INVALIDARG` or a black window with no counter naming its cause. ⛔ It is
 /// deliberately **not**
 /// knob-gated: `METHOD.md` §2 Phase 4 consequence 1 records that a default chosen to
-/// keep a run alive rather than to be correct is *"a hack wearing a knob's
-/// clothes"*, with this driver's own `Umd12EclSubmitStrict` as the example.
+/// keep a run alive rather than to be correct is not an acceptable create
+/// contract; this path therefore has no compatibility or soft-failure knob.
 ///
 /// Every distinguishable cause has its own counter, because they are different
 /// findings with different fixes:
