@@ -6144,3 +6144,117 @@ ONLY; NO RETIREMENT PACKAGE OR PRESENT LAYER WAS INSTALLED, REGISTERED, OR
 EXERCISED ON THE TARGET, THE WDDM 3.2 DISPLAY PACKAGE REMAINS
 RUNTIME-UNADMITTED, AND RUNTIME HPS2 RETIREMENT AND PRODUCTION CORRECTNESS ARE
 NOT ESTABLISHED.**
+
+## 2026-08-22 append-only generation-4 targeted runtime-admission attempt
+
+This amendment records the bounded target deployment and the first runtime
+admission failure after the broad source demolition.  At the owner's direction,
+the final builds and installs used the targeted Windows MCP build/deploy tools,
+not the GitHub Actions scripts; CLVK and the now-retired source gates were not
+run further.  Looking Glass IDD remained disabled (`ROOT\\DISPLAY\\0000`, Code
+22).  A full guest restart, rather than an adapter-only hotplug, was the cache
+boundary for every final UMD measurement.
+
+* **Source and repair boundary:** the root began at `6e455d6` and ends this
+  attempt at `069ade3`, after the six narrowly evidenced runtime repairs
+  `50371fe`, `317ab0e`, `1ebc53a`, `1956038`, `3e5c714`, and `069ade3`.
+  They repair generation-4 adapter admission, the output-only adapter query,
+  direct-translator construction, bounded extension/property and feature-chain
+  replies, and memory-property replies inside the existing A3-A9/K11 contracts.
+  The KMD version advanced monotonically to `22.22.306.0`.  An exploratory DXVK
+  descriptor-heap allow-list change could not affect the missing renderer
+  extension and was completely reverted; DXVK remains clean at `418f5745`,
+  Mesa remains `8b3c9359`, and vkd3d remains `9a2716c0` with its owner-owned
+  `.wraplock` preserved.
+* **Installed KMD/UMDs after the final restart:** boot time is
+  `2026-08-21T22:18:13.5000000Z`.  Helios is Code 0 on `oem52.inf`, version
+  `22.22.306.0`.  The active DriverStore SYS is 1,119,992 bytes / SHA-256
+  `E3BE06ADB9CA291084BBB5C78489BF67A2C13FF0885143EFE94CEA04B39A36A2`;
+  its file/product version is `22.22.306.0`, its signature is valid under
+  `CN=WDRLocalTestCert` / thumbprint
+  `E251CEEDAD2600F74838AB63177BA3E2EC64AB6D`, it imports only
+  `ntoskrnl.exe`, and it exports `DriverEntry` plus four compiler-runtime
+  symbols.  UMD11 is
+  `C:\\ProgramData\\HeliosUmd\\helios_umd_01c537f5d19f6f86.dll`,
+  6,295,552 bytes / SHA-256
+  `01C537F5D19F6F86A5B0E9C7949BB724EDCBCB14066788B80697BF5DA1D2625C`.
+  UMD12 is
+  `C:\\ProgramData\\HeliosUmd\\helios_umd12_edd150a33f6f853a.dll`,
+  4,651,520 bytes / SHA-256
+  `EDD150A33F6F853A969C4E156D9CD8DFA0F3A5C7C87AC48840CBA30CDF810D90`.
+  All four `UserModeDriverName` slots name those current content-addressed
+  files.  Fresh-boot DWM and session-1 probe records contain the current UMD11
+  path only, so no stale UMD was hit after the restart.
+* **Vulkan registration and binary shape:** the machine ICD value names
+  `C:\\ProgramData\\HeliosVulkan\\virtio_devenv_icd.x86_64.json`,
+  253 bytes / SHA-256
+  `B91AFDB72C8BC5A2DBCB0D4CAFD203BD77E358ABE1C2EBAC44841C3F587D5667`.
+  It resolves to `vulkan_virtio-95a61e26617b.dll`, 6,530,789 bytes /
+  SHA-256
+  `95A61E26617B5B284517FA28FFF3BCE175C5E6077F2D4508B0319D535A2C69A1`,
+  with exactly the four expected ICD exports and no DXGI, D3D11, D3D12,
+  DComp, or `vulkan-1` import.  The machine implicit-layer value names
+  `C:\\ProgramData\\HeliosVulkanLayer\\VkLayer_HELIOS_present.json`,
+  2,756 bytes / SHA-256
+  `B61C9772CCD64B88C083B19C1FCB4E5D9E4DF347215DA78842464F534DBDD0C2`.
+  It resolves to `VkLayer_HELIOS_present-f79ef3fadc76.dll`, 805,130 bytes /
+  SHA-256
+  `F79EF3FADC76529C38A2E80EE081E90924F0EF09588921DB226D405DF981A2AD`,
+  with exactly the eight expected layer exports, permitted `d3d12.dll` and
+  `dxgi.dll` imports, and no `vulkan-1` import.  ASCII and UTF-16LE scans of
+  the active SYS, both UMDs, ICD, and layer found none of `HPS2`, the literal
+  HPS2 path, `SharedGpuResource`, `D3DKMTEscape`, private IOCTL,
+  scanout-acquire, or read-ledger strings.  The four userspace graphics DLLs
+  are not Authenticode-signed; only the KMD is signed.
+* **Deployment limitation:** this was the owner-directed targeted deployment,
+  not an assembled managed-package admission.  The exact
+  `C:\\ProgramData\\Helios\\install-state.json` is absent.  Consequently there
+  is no installed package ID, ZIP hash, schema-2 manifest hash, or atomic
+  generation-4 install state to report, and the unsigned userspace payload does
+  not satisfy the original complete-package/signing criterion.
+* **First runtime failure:** the final session-1 probe under
+  `C:\\ProgramData\\HeliosEvidence\\final-descriptor-blocker-20260821-2218`
+  enumerates Helios and calls ordinary `D3D11CreateDevice`, which returns
+  `0x80004005`.  DXVK's first refusal is
+  `DxvkDeviceCapabilities::checkDeviceCompatibility`: `Device does not support
+  required feature 'descriptorBindingSampledImageUpdateAfterBind'`, followed by
+  `DXVK: No adapters found`.  Mesa's Helios record-only profile intentionally
+  withholds update-after-bind because A7 snapshots an ordinary descriptor-set
+  allocation graph immutably.  The intended safe alternative is
+  `VK_EXT_descriptor_heap`, but the installed virglrenderer 1.3.0
+  `vkr_extension_table` lacks the extension even though the guest protocol and
+  host GPU have it.  Resynchronizing virglrenderer's Venus protocol/table is the
+  missing input, owned by virglrenderer and outside this authorized tranche.
+  A3-A9 cannot advertise mutable descriptor state without violating A7; B0-B9
+  and K2a/K7/K9/K11 are downstream of Vulkan/D3D device creation and cannot
+  manufacture a missing physical-device capability.
+* **Display result:** DWM PID 1812 in session 1 started at
+  `2026-08-21T22:18:18.1860805Z`.  Its Helios device attempts end in
+  `DxvkError`/`E_FAIL`; loaded `Microsoft.Internal.WarpPal.dll` and
+  `D3D10Warp.dll` are supporting fallback evidence, not by themselves an
+  adapter-identity proof.  The bounded adapter map at
+  `C:\\ProgramData\\HeliosEvidence\\final-adapter-map-20260821-2219` sees
+  Helios as Render=1, Display=1, `NumOfSources=1`, but DXGI reports zero Helios
+  outputs and DisplayConfig reports zero active and zero total paths.  There was
+  no visible Helios desktop and therefore no owner `VISIBLE_DWM_DESKTOP`
+  confirmation.  D3D12 Present, native Vulkan WSI, layer/direct-translator
+  ownership, post-admission adapter restart, and teardown/liveness acceptance
+  were not run after this first failure.
+* **Original QEMU error and HPS2 cleanup:** the prior
+  `vkSetReplyCommandStreamMESA` invalid-`res_id`/context-destruction sequence last
+  appears at `2026-08-21T20:34:35Z`; later boots through the final restart show
+  resource flushes without that sequence.  This closes recurrence of that exact
+  K11 reply-stream symptom but is not display-admission evidence.  The exact
+  legacy file still exists at
+  `C:\\ProgramData\\Helios\\helios_present_sync_v2.bin`, 131,104 bytes,
+  creation/last-write `2026-08-08T12:20:09.8417455Z`, SHA-256
+  `3377A8F6F2D9C540A2F268E17501FD7A8C79BFE62D5C70FAAB8C759C70116E00`.
+  Runtime admission and complete mapper-absence proof were not obtained, so the
+  file was deliberately not renamed or removed; non-recreation was not tested.
+
+**THE FULL RESTART EXCLUDES A STALE UMD HIT IN THE FINAL MEASUREMENT, BUT THIS
+TARGET IS BLOCKED BEFORE D3D11 DEVICE CREATION BY A VIRGLRENDERER-OWNED
+DESCRIPTOR CAPABILITY.  THERE IS NO ACTIVE DISPLAYCONFIG PATH OR VISIBLE HELIOS
+DESKTOP, NO COMPLETE MANAGED GENERATION-4 PACKAGE STATE, AND NO SAFE MAPPER
+PROOF; RUNTIME HPS2 RETIREMENT IS NOT COMPLETE AND THE LEGACY FILE REMAINS
+UNTOUCHED.**
