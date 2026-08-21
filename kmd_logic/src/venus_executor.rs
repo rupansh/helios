@@ -1284,6 +1284,35 @@ mod tests {
         b
     }
 
+    fn physical_device_memory_properties2_stream(
+        reply_size: u64,
+        memory_budget: bool,
+    ) -> Vec<u8> {
+        let mut b = Vec::new();
+        put32(&mut b, OP_SET_REPLY);
+        put32(&mut b, 0);
+        put64(&mut b, 1); // pStream
+        put32(&mut b, 0); // private reply resource placeholder
+        put64(&mut b, 80); // reply offset
+        put64(&mut b, reply_size);
+
+        put32(&mut b, 152); // vkGetPhysicalDeviceMemoryProperties2
+        put32(&mut b, COMMAND_GENERATE_REPLY);
+        put64(&mut b, 2); // physical device
+        put64(&mut b, 1); // pMemoryProperties
+        put32(&mut b, 1_000_059_006); // VkPhysicalDeviceMemoryProperties2
+        if memory_budget {
+            put64(&mut b, 1); // pNext
+            put32(&mut b, 1_000_237_000); // VkPhysicalDeviceMemoryBudgetPropertiesEXT
+            put64(&mut b, 0); // terminal pNext
+        } else {
+            put64(&mut b, 0); // terminal pNext
+        }
+        put64(&mut b, 32); // VK_MAX_MEMORY_TYPES output slots
+        put64(&mut b, 16); // VK_MAX_MEMORY_HEAPS output slots
+        b
+    }
+
     #[test]
     fn admits_captured_dxvk_feature_chain_but_keeps_a_finite_depth_bound() {
         let chain = [
@@ -1376,6 +1405,55 @@ mod tests {
                 &mut [0u32; 8],
             ),
             Err(VenusReject::UnsupportedChain)
+        );
+    }
+
+    #[test]
+    fn admits_captured_memory_properties2_output_shape_and_exact_reply_sizes() {
+        let captured = physical_device_memory_properties2_stream(496, false);
+        assert_eq!(captured.len(), 88);
+        let admitted = validate_venus_control_stream(
+            &captured,
+            true,
+            &mut [VenusOperand::default(); 1],
+            &mut [0u32; 8],
+        )
+        .expect("captured vkGetPhysicalDeviceMemoryProperties2 request");
+        assert_eq!(admitted.opcode, 152);
+        assert_eq!(admitted.reply_size, 496);
+
+        let wrong_null_reply = physical_device_memory_properties2_stream(495, false);
+        assert_eq!(
+            validate_venus_control_stream(
+                &wrong_null_reply,
+                true,
+                &mut [VenusOperand::default(); 1],
+                &mut [0u32; 8],
+            ),
+            Err(VenusReject::BadArrayCount)
+        );
+
+        let with_budget = physical_device_memory_properties2_stream(780, true);
+        assert_eq!(with_budget.len(), 100);
+        let admitted = validate_venus_control_stream(
+            &with_budget,
+            true,
+            &mut [VenusOperand::default(); 1],
+            &mut [0u32; 8],
+        )
+        .expect("memory-budget pNext reply shape");
+        assert_eq!(admitted.opcode, 152);
+        assert_eq!(admitted.reply_size, 780);
+
+        let wrong_budget_reply = physical_device_memory_properties2_stream(496, true);
+        assert_eq!(
+            validate_venus_control_stream(
+                &wrong_budget_reply,
+                true,
+                &mut [VenusOperand::default(); 1],
+                &mut [0u32; 8],
+            ),
+            Err(VenusReject::BadArrayCount)
         );
     }
 

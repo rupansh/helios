@@ -39,6 +39,12 @@ impl<'a> SchemaScratch<'a> {
     pub(super) fn set_reply_size(&mut self, reply_size: u64) {
         self.reply_size = reply_size;
     }
+    fn expect_reply_size(&self, expected: u64) -> Result<(), VenusReject> {
+        if self.reply_size != expected {
+            return Err(VenusReject::BadArrayCount);
+        }
+        Ok(())
+    }
     fn expect_fixed_reply_array(
         &self,
         count: u64,
@@ -49,10 +55,7 @@ impl<'a> SchemaScratch<'a> {
             .checked_mul(element_bytes)
             .and_then(|bytes| base_bytes.checked_add(bytes))
             .ok_or(VenusReject::CountOverflow)?;
-        if self.reply_size != expected {
-            return Err(VenusReject::BadArrayCount);
-        }
-        Ok(())
+        self.expect_reply_size(expected)
     }
     fn reset_geometry(&mut self) {
         self.geometry_len = 0;
@@ -47437,17 +47440,34 @@ fn parse_command_vk_get_physical_device_memory_properties2(
     operands: &mut OperandWriter<'_>,
     scratch: &mut SchemaScratch<'_>,
 ) -> Result<A7CommandFacts, VenusReject> {
-    let depth = 0u32;
-    let mut p_memory_properties = ParsedVkPhysicalDeviceMemoryProperties2::default();
-    c.skip(8)?;
-    let present_p_memory_properties = c.pointer()?;
-    if !present_p_memory_properties {
+    c.skip(8)?; // physicalDevice
+    if !c.pointer()? {
         return Err(VenusReject::BadPointer);
     }
-    if present_p_memory_properties {
-        p_memory_properties =
-            parse_partial_vk_physical_device_memory_properties2(c, operands, scratch, depth + 1)?;
+    if c.u32()? != 1000059006 {
+        return Err(VenusReject::BadStructureType);
     }
+    let memory_budget = if c.pointer()? {
+        if c.u32()? != 1000237000 {
+            return Err(VenusReject::UnsupportedChain);
+        }
+        if c.pointer()? {
+            let _ = c.u32()?;
+            return Err(VenusReject::UnsupportedChain);
+        }
+        true
+    } else {
+        false
+    };
+    let memory_type_slots = c.array_count()?;
+    if memory_type_slots != 32 {
+        return Err(VenusReject::BadArrayCount);
+    }
+    let memory_heap_slots = c.array_count()?;
+    if memory_heap_slots != 16 {
+        return Err(VenusReject::BadArrayCount);
+    }
+    scratch.expect_reply_size(if memory_budget { 780 } else { 496 })?;
     Ok(A7CommandFacts {
         kind: A7CommandKind::PureControl,
         opcode: 152,
