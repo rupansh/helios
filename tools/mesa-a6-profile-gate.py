@@ -292,16 +292,17 @@ def check_sources(sources: dict[str, str]) -> list[str]:
             "sem_type == VK_SEMAPHORE_TYPE_TIMELINE",
             "VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT",
             "exportFromImportedHandleTypes = 0",
+            "VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT",
             "VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT",
         ),
         errors,
     )
     require(
         PHYSICAL,
-        "D3D12_FENCE import-only block",
+        "D3D12_FENCE export-only block",
         semaphore_props,
         (
-            "compatibleHandleTypes =\n         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;\n      pExternalSemaphoreProperties->exportFromImportedHandleTypes = 0;\n      pExternalSemaphoreProperties->externalSemaphoreFeatures =\n         VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;\n      return;",
+            "compatibleHandleTypes =\n         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;\n      pExternalSemaphoreProperties->exportFromImportedHandleTypes = 0;\n      pExternalSemaphoreProperties->externalSemaphoreFeatures =\n         VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT;\n      return;",
         ),
         errors,
     )
@@ -319,6 +320,23 @@ def check_sources(sources: dict[str, str]) -> list[str]:
             "pImportSemaphoreWin32HandleInfo->name",
             "sem->permanent.win32_sync = sync",
             "sem->payload = &sem->permanent",
+        ),
+        errors,
+    )
+    semaphore_export = function(sources[QUEUE], "vn_GetSemaphoreWin32HandleKHR")
+    require(
+        QUEUE,
+        "Vulkan-owned D3D12 fence export",
+        semaphore_export,
+        (
+            "sem->base.vk.device != &dev->base.vk",
+            "sem->type != VK_SEMAPHORE_TYPE_TIMELINE",
+            "VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT",
+            "sem->external_handle_types & pGetWin32HandleInfo->handleType",
+            "sem->payload != &sem->permanent",
+            "!sem->permanent.win32_sync",
+            "vn_renderer_helios_sync_export_win32",
+            "*pHandle = (HANDLE)handle",
         ),
         errors,
     )
@@ -458,7 +476,8 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("report host-visible Win32 type", MEMORY, "UINT32_C(1) << VN_HELIOS_MEMORY_TYPE_DEVICE_LOCAL;", "UINT32_C(1) << VN_HELIOS_MEMORY_TYPE_HOST_VISIBLE;"),
         Mutation("drop dedicated-only", PHYSICAL, "VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT |\n            VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT", "VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT"),
         Mutation("export imported fence", PHYSICAL, "compatibleHandleTypes =\n         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;\n      pExternalSemaphoreProperties->exportFromImportedHandleTypes = 0;", "compatibleHandleTypes =\n         VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;\n      pExternalSemaphoreProperties->exportFromImportedHandleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;"),
-        Mutation("accept binary fence", QUEUE, "sem->base.vk.device != &dev->base.vk ||\n       sem->type != VK_SEMAPHORE_TYPE_TIMELINE", "sem->base.vk.device != &dev->base.vk ||\n       false"),
+        Mutation("restore rejected fence import capability", PHYSICAL, "pExternalSemaphoreProperties->externalSemaphoreFeatures =\n         VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT;", "pExternalSemaphoreProperties->externalSemaphoreFeatures =\n         VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;"),
+        Mutation("accept binary fence", QUEUE, "sem->base.vk.device != &dev->base.vk ||\n       sem->type != VK_SEMAPHORE_TYPE_TIMELINE ||\n       pImportSemaphoreWin32HandleInfo->handleType", "sem->base.vk.device != &dev->base.vk ||\n       false ||\n       pImportSemaphoreWin32HandleInfo->handleType"),
         Mutation("accept temporary fence", QUEUE, "pImportSemaphoreWin32HandleInfo->flags != 0", "false"),
         Mutation("enable descriptor indexing", PHYSICAL, "feats->descriptorIndexing = false;", "feats->descriptorIndexing = true;"),
         Mutation("drop use closure assertion", PHYSICAL, "VN_HELIOS_NORMAL_MAX_GENERATED_USES <=\n                 HELIOS_HNR2_MAX_USE_RECORDS", "true"),

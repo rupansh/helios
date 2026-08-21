@@ -399,9 +399,11 @@ def check_sources(s: dict[str, str]) -> list[str]:
         (
             "img->base.vk.base.device != &dev->base.vk",
             "!swapchainId",
-            "VK_SHARING_MODE_EXCLUSIVE",
             "VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY",
             "VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT",
+            "imageIndex == HELIOS_PRESENTABLE_IMAGE_ALIAS_CANDIDATE",
+            "img->helios_presentable.alias_candidate",
+            "(img->helios_presentable.alias_candidate &&\n           img->helios_presentable.swapchain_id != swapchainId)",
             "img->helios_presentable.tagged",
             "img->helios_presentable.swapchain_id != swapchainId",
         ),
@@ -433,7 +435,6 @@ def check_sources(s: dict[str, str]) -> list[str]:
         barrier,
         (
             "img && img->helios_presentable.tagged",
-            "VK_SHARING_MODE_EXCLUSIVE",
             "*new_layout != VK_IMAGE_LAYOUT_GENERAL",
             "*dst_qfi != VK_QUEUE_FAMILY_EXTERNAL",
             "*old_layout != VK_IMAGE_LAYOUT_GENERAL",
@@ -479,6 +480,7 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("commit unsealed scope", RECORD, "HELIOS_TRANSLATOR_SCOPE_DISPOSITION_COMMITTED &&\n       !scope->is_sealed", "false &&\n       !scope->is_sealed"),
         Mutation("publish tag to record-only", DEVICE, "VN_HELIOS_SUBMISSION_MODE_RECORD_ONLY\n                ? NULL", "VN_HELIOS_SUBMISSION_MODE_NORMAL\n                ? NULL"),
         Mutation("tag arbitrary external image", IMAGE, "VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT", "VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT"),
+        Mutation("accept foreign alias generation", IMAGE, "(img->helios_presentable.alias_candidate &&\n           img->helios_presentable.swapchain_id != swapchainId)", "false"),
         Mutation("accept foreign present owner", COMMAND, "*dst_qfi != VK_QUEUE_FAMILY_EXTERNAL", "false"),
     )
 

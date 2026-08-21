@@ -6017,3 +6017,63 @@ any load-bearing line number above:
 **THE ESCAPE-FREE K11 PER-SESSION HOST TRANSPORT LANDED AND WAS EXERCISED ON
 THE TARGET, WHILE THE WDDM 3.2 DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED;
 MESA A3/A4, HPS2 RETIREMENT, AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**
+
+## 2026-08-21 append-only `VK_LAYER_HELIOS_present` B-lane amendment
+
+F7, F8, F21, and `lane-mesa.md` override the frozen present-layer text without
+moving any load-bearing body line. The complete B lane is now source/build
+closed at Mesa B0 `bb7a787a5a1`, B1-B5 `e06abf3025f`, B6 `11d723ea10b`,
+B7/B8 `51054338012`, and B9 `871c62bf8a0`.
+The single bounded ordinary review fix is `8b3c9359b5a`: it preserves the
+loader-owned device-create node during feature-chain copying and closes every
+post-validation per-swapchain `pResults` failure path.
+
+* **§10.3 / §§10.7 and 12.2 fence direction:** the image direction remains the
+  frozen committed-D3D12-resource → dedicated lower-Vulkan import chain. The
+  Ready/Release direction is reversed from the frozen text: the lower Vulkan
+  device creates each exportable `D3D12_FENCE_BIT` timeline semaphore,
+  `vkGetSemaphoreWin32HandleKHR` exports its NT handle, and the exact owning
+  D3D12 device opens it as `ID3D12Fence`. The transient handle closes on every
+  success/refusal path. There is no Ready/Release D3D12 `CreateFence`/
+  `CreateSharedHandle` → `vkImportSemaphoreWin32HandleKHR` path.
+* **§§10.3-10.7 / §11.4:** canonical image import, offset-zero bind, and the
+  next-GDPA presentable-image tag complete before exposure. Acquire owns the
+  exact nine-state/nonwrapping-epoch machine and event-based finite waits.
+  Present exercises ordinary lower `vkQueueSubmit2` for the external ownership
+  release and Ready signal, followed causally by D3D wait, current-backbuffer
+  copy, Release signal, and `Present(1,0)`. No polling, independent timeline,
+  background work queue, synthetic completion, or A7 bypass exists.
+* **§§10.7, 11.4, 13:** the layer's opaque virtual handles and associations are
+  rooted in the exact captured instance/device/swapchain/slot graph. Alias
+  create/bind/destroy, NULL-swapchain pass-through, ordered mixed binds,
+  `ALIAS_ONLY` retention, replacement-before-retirement, D3D/DXGI drain, final
+  helper-queue ownership return, and reverse teardown are source-closed. There
+  is no loader/module/filename search, second translator, global/PID/name/TLS/
+  pointer identity, fallback key, Escape, IOCTL, or compatibility carrier.
+* **§17.3:** B0 deletes Mesa's HPS2 WSI writer and its Helios-specific generic-
+  WSI plumbing while preserving ordinary non-Windows WSI. B9 builds
+  `VK_LAYER_HELIOS_present` as a separate shared library with the generated
+  manifest and exact `.def`; it does not enter `libvulkan_wsi` or the lower ICD.
+* **§18.3:** focused in-process source/mutation gates, Linux cross compilation,
+  Windows `win_meson` compilation, and PE export/import scans pass. The Windows
+  lower ICD is 49,251,322 bytes / SHA-256
+  `6CFE645EDEC6BDE779300DAB4DC257F1092713EB9D06BCBA0A844AF683EC5D14`, has
+  exactly four exports, and imports no DXGI/D3D11/D3D12/DComp/`vulkan-1` DLL.
+  The separate layer is 3,314,217 bytes / SHA-256
+  `0260E5AE530B4DAA0346F3AE2D4DAA53215E88C71486A8FFD57C12420CD73712`, has
+  exactly eight layer exports, imports the permitted `d3d12.dll`/`dxgi.dll`,
+  and does not import `vulkan-1.dll`.
+* The final serial retirement suite passed once: protocol 151 plus integration/
+  parity, kmd_logic 545 plus both integrations, every standing source gate, and
+  27 in-memory present-layer mutations.
+
+No layer or ICD was registered or installed, and no target runtime exercise,
+adapter restart, reboot, VNC, or cold-DWM probe occurred. The last measured
+target remains KMD 22.22.296.0 / `oem128.inf`, DWM on WARP, and zero active
+DisplayConfig paths. Broad HPS2 demolition and production admission remain
+separate future ownership boundaries.
+
+**THE VK_LAYER_HELIOS_PRESENT B-LANE SOURCE CUTOVER LANDED AND PASSED
+SOURCE/BUILD VALIDATION ONLY; IT WAS NOT REGISTERED, INSTALLED, OR EXERCISED
+ON THE TARGET, THE WDDM 3.2 DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED, AND
+BROAD HPS2 RETIREMENT AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**

@@ -1,11 +1,13 @@
 # Lane: Mesa/ICD — record-only submit, direct dispatch, HTS1 session, native KMT lane, and the new WSI layer
 
 ⛔ **Doc line numbers here were swept +10 on 2026-08-10 and mechanically
-verified.** `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` is **5976 lines** (`wc -l`)
-— 5918 when this brief was written, 5928 after commit `c17f17c` inserted a
+verified.** `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md`'s frozen body and original
+superseded-claims index reached **5976 lines** — 5918 when this brief was
+written, 5928 after commit `c17f17c` inserted a
 ten-line banner at `:11-20`, and 5973 after `afebe66` **appended** the SUPERSEDED
 CLAIMS INDEX at `:5932`; later append-only index corrections raised the total to
-5976 without moving a body line. Only the banner moved anything: it shifted every body
+5976 without moving a body line. Later checkpoints remain append-only. Only the
+banner moved anything: it shifted every body
 line after 8 by +10, so every citation written here before 2026-08-10 was 10 too
 low. All of them have now been shifted, and the sweep was checked by requiring
 each `§N.M`-anchored cite to land inside §N.M's own heading-to-heading range —
@@ -106,6 +108,37 @@ lower ICD uses WSI headers without linking/compiling the full WSI backend. The
 present-layer B lane is the stop-boundary handoff. This is source/build evidence
 only: no ICD/KMD was installed or target-exercised.
 
+**2026-08-21 B0-B9 present-layer source/build checkpoint.** The authorized B
+lane is complete in dependency order: B0 `bb7a787a5a1`, B1-B5
+`e06abf3025f`, B6 `11d723ea10b`, B7/B8 `51054338012`, and B9
+`871c62bf8a0`, followed by bounded review fix `8b3c9359b5a`. B0 removes Mesa's HPS2 WSI writer without changing generic
+non-Windows WSI. B1-B5 retain the historical image-sharing half and apply F8:
+the lower Vulkan device creates exportable Ready/Release timeline semaphores,
+`vkGetSemaphoreWin32HandleKHR` exports each `D3D12_FENCE_BIT` handle, and the
+exact owning D3D12 device opens it; every transient handle closes on success and
+refusal. No D3D12-created Ready/Release fence enters Vulkan.
+
+B6 closes the nine-state/epoch machine with event-backed finite waits and the
+ordinary lower `vkQueueSubmit2` → Ready → D3D wait/copy → Release →
+`Present(1,0)` causal path. B7/B8 close exact owner-scoped alias association,
+NULL-swapchain pass-through, mixed bind/status ordering, `ALIAS_ONLY` lifetime,
+atomic old-swapchain retirement, final helper-queue ownership restoration,
+reverse teardown, and device-loss mapping. B9 builds a separate layer DLL and
+generated manifest; it does not enter `libvulkan_wsi` or the lower ICD.
+
+The Linux-host and Windows builds pass. The Windows lower ICD is 49,251,322
+bytes / SHA-256
+`6CFE645EDEC6BDE779300DAB4DC257F1092713EB9D06BCBA0A844AF683EC5D14` with
+exactly four exports and no DXGI/D3D11/D3D12/DComp/`vulkan-1` import. The layer
+is 3,314,217 bytes / SHA-256
+`0260E5AE530B4DAA0346F3AE2D4DAA53215E88C71486A8FFD57C12420CD73712` with
+exactly the eight `.def` exports, direct `d3d12.dll`/`dxgi.dll` imports, and no
+`vulkan-1` import. Source/mutation gates pass; no layer or ICD was registered,
+installed, or target-exercised. The one final serial retirement run passed
+protocol 151 plus integration/parity, kmd_logic 545 plus both integrations,
+every standing gate, and 27 present-layer mutations. Broad HPS2 demolition is
+the next owner handoff, not part of this lane.
+
 Reconnaissance brief. No implementation code was written. Every line/symbol
 reference below was re-verified against the working tree at
 `icd/mesa` commit `8559b66299a8f91fcde30edfdd23310195cc7ca6` — the same commit
@@ -132,9 +165,9 @@ independently implementable.
 |---|---|---|
 | §2 executive decision | 122–368 | *Why*: items 1, 6, 7, 8, 9 are this lane. Item 6 is the whole native-KMT carrier; item 7 is the whole WSI layer; item 8 is the acyclicity rule that forbids any ICD→DXGI edge; item 9 is HTS1 pre-queue control. The responsibility table (302–317) names the replacement owner for every retired mechanism. |
 | §3 hard constraints | 369–406 | The bounding non-goals: no Escape, no global registry/polling/PID keys, **no ICD call to DXGI/D3D11/D3D12**, no CPU wait on GPU completion in steady state, no cross-adapter inference, no version/feature fallback. |
-| §10.3 resource identity | 1014–1189 | The `HeliosWddmAllocationDescV2` (HWA2, 168 bytes) create-time descriptor this lane must *read* on import; the "Native Vulkan WSI" subsection (1121–1188) is the exact canonical import chain: `VkExternalMemoryImageCreateInfo{D3D12_RESOURCE_BIT}` → `vkGetMemoryWin32HandlePropertiesKHR` → `VkImportMemoryWin32HandleInfoKHR` + `VkMemoryDedicatedAllocateInfo` → C57 `D3DKMTQueryResourceInfoFromNtHandle` + `D3DKMTOpenResourceFromNtHandle`; plus the Ready/Release `D3D12_FENCE_BIT` timeline-semaphore import chain (1180–1188). |
+| §10.3 resource identity | 1014–1189 | The `HeliosWddmAllocationDescV2` (HWA2, 168 bytes) create-time descriptor this lane must *read* on import; the "Native Vulkan WSI" subsection (1121–1188) gives the exact canonical import chain: `VkExternalMemoryImageCreateInfo{D3D12_RESOURCE_BIT}` → `vkGetMemoryWin32HandlePropertiesKHR` → `VkImportMemoryWin32HandleInfoKHR` + `VkMemoryDedicatedAllocateInfo` → C57 `D3DKMTQueryResourceInfoFromNtHandle` + `D3DKMTOpenResourceFromNtHandle`. Its fence direction is superseded by F8 and the append-only B-lane amendment: create exportable lower-Vulkan Ready/Release timelines, export `D3D12_FENCE_BIT`, then open them on the exact D3D12 device. |
 | §10.4 record-only translation | 1190–1430 | HTS1 session creation per `vn_instance`; the 72-byte HQA1 create-context packet (the ICD *produces* the endpoint descriptor, the outer UMD sends the packet); the C60 three-way control classification (pure control / outer-allocation-backed / GPU-dependent, 1345–1376); the five-point record-only submit contract (1378–1406); `HELIOS_TRANSLATOR_SUBMISSION_MODE_RECORD_ONLY`; the rejection rule for any queue entry point without a live outer scope (1397–1406). |
-| §10.7 native KMT + WSI layer | 1685–2710 | The single largest source. Sub-parts: normal-ICD KMT carrier (1687–1758, incl. the 32-byte HVC1 table at 1708–1717 and the legacy `DXGK_CONTEXTINFO` minima at 1735–1750); HNR2 (1759–1850, header table 1765–1787, 24-byte use / 16-byte patch records 1789–1793, fragmentation arithmetic 1820–1829); Patch/SubmitCommand expectations (1866–1906); the one unshared monitored progress fence per context (1908–1934); HVM1 (1936–1972, table 1949–1962); segment/HLM1/HPM1 admission (1974–2021); reply pool + Lock2 rules (2037–2060); the two exposed memory types (2062–2078); HVR1 reply/snapshot storage (2135–2178); teardown (2180–2185). Then the WSI layer: virtual surface ownership (2206–2233), extension discovery/dispatch closure (2235–2272), `vkCreateDevice` interception + helper-queue construction (2274–2311), singleton device-group + swapchain-memory alias contract (2313–2445), the normative copy-only surface profile table (2447–2487), D3D12 object creation + canonical import + C57 carrier (2489–2561), fence import (2563–2579), presentable-image tagging (2581–2588), sharing mode / helper queue (2590–2606), Acquire (2608–2643), Present (2645–2709). |
+| §10.7 native KMT + WSI layer | 1685–2710 | The single largest source. Sub-parts: normal-ICD KMT carrier (1687–1758, incl. the 32-byte HVC1 table at 1708–1717 and the legacy `DXGK_CONTEXTINFO` minima at 1735–1750); HNR2 (1759–1850, header table 1765–1787, 24-byte use / 16-byte patch records 1789–1793, fragmentation arithmetic 1820–1829); Patch/SubmitCommand expectations (1866–1906); the one unshared monitored progress fence per context (1908–1934); HVM1 (1936–1972, table 1949–1962); segment/HLM1/HPM1 admission (1974–2021); reply pool + Lock2 rules (2037–2060); the two exposed memory types (2062–2078); HVR1 reply/snapshot storage (2135–2178); teardown (2180–2185). Then the WSI layer: virtual surface ownership (2206–2233), extension discovery/dispatch closure (2235–2272), `vkCreateDevice` interception + helper-queue construction (2274–2311), singleton device-group + swapchain-memory alias contract (2313–2445), the normative copy-only surface profile table (2447–2487), D3D12 object creation + canonical import + C57 carrier (2489–2561), F8-correct Vulkan-export/D3D12-open fences (the frozen 2563–2579 text is superseded), presentable-image tagging (2581–2588), sharing mode / helper queue (2590–2606), Acquire (2608–2643), Present (2645–2709). |
 | §11.3 native Vulkan sequence | 2980–3025 | The end-to-end mermaid ordering for allocation → paging → Lock2 → HNR2 BEGIN/COMMIT → Patch → SUBMIT_3D → reply decode. Use it as the acceptance ordering for sub-lane (a). |
 | §11.4 native Vulkan WSI sequence | 3026–3050 | The Acquire/Present arrow order for sub-lane (b). |
 | §12.2 native-WSI ICD-side fence contract | 3197–3249 | Exact `D3DKMT_OPENNATIVEFENCEFROMNTHANDLE` field rules (`EngineAffinity=1u<<0`, `Shared=1`+`NtSecuritySharing=1` only, 64-byte HNF1 private data, acceptance conditions), and the wait/signal placement rule: `D3DKMTWaitForSynchronizationObjectFromGpu` before the acquire barrier, `D3DKMTSignalSynchronizationObjectFromGpu` (**not** `FromGpu2`) after the release barrier, both on the submitting ICD context. |
@@ -288,18 +321,18 @@ unadvertised").
 
 | Id | Goal | Files it owns (exclusive) | Deps | Size |
 |---|---|---|---|---|
-| **B1** | Layer skeleton: `vkNegotiateLoaderLayerInterfaceVersion`, instance/device dispatch capture, `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr` returning exactly the §10.7:2250-2267 lists and `NULL` elsewhere, both extension-enumeration forms with the two-call/`VK_INCOMPLETE` contract for both `pLayerName` forms, instance/device create-chain copy + consumption + lower-name filtering, the generated entry-point manifest compared byte-for-byte. | `helios_present_layer.h`, `helios_present_layer.def`, `VkLayer_HELIOS_present.json.in` | — | L |
-| **B2** | Device creation: require lower Vulkan 1.3; add `VK_KHR_external_memory_win32` + `VK_KHR_external_semaphore_win32`; force `timelineSemaphore` + `synchronization2` without duplicating feature structs or mutating app memory; the **one** private helper queue appended to the app's own canonical `flags=0` record (`q-1` reported, private index hidden from both getters); singleton device-group admission. | `helios_present_layer.cpp` (shared — see note) | B1 | L |
-| **B3** | Surface + profile: `vkCreateWin32SurfaceKHR`/`vkDestroySurfaceKHR`, support/caps/formats/present-modes/`capabilities2`, `vkGetPhysicalDeviceWin32PresentationSupportKHR`, `vkGetPhysicalDevicePresentRectanglesKHR`, `vkGetDeviceGroupPresentCapabilitiesKHR`, `vkGetDeviceGroupSurfacePresentModesKHR`; the §10.7:2454-2463 admission table enforced as *queries return unsupported*, not as later failures; `(0,0)` client extent; resize/minimize → `OUT_OF_DATE`, destroyed HWND → `SURFACE_LOST`. | `helios_present_layer.cpp` (shared) | B2 | L |
-| **B4** | D3D12/DXGI object graph: adapter selection by exact LUID; D3D12 device + copy queue; `CreateSwapChainForHwnd` FLIP_DISCARD / `DXGI_SCALING_NONE` / `ALPHA_MODE_IGNORE` / `CheckColorSpaceSupport`+`SetColorSpace1`; `S[i]` `CreateCommittedResource` with exactly the §10.7:2492-2500 flag set; two `CreateFence(0, SHARED)` per slot; one `CreateSharedHandle` per object; per-slot allocator/list. | `helios_present_layer.cpp` (shared) | B3 | L |
-| **B5** | Canonical import: per slot, lower external `VkImage` → `vkGetMemoryWin32HandlePropertiesKHR` → dedicated `VkImportMemoryWin32HandleInfoKHR` → offset-zero bind → ICD presentable-image tag, **all before `vkGetSwapchainImagesKHR` can expose the image**; permanent `D3D12_FENCE_BIT` timeline-semaphore import for `Ready[i]`/`Release[i]` with the transient NT handle closed immediately after. | `helios_present_layer.cpp` (shared) | B4, **A3**, **A6**, **A7** | L |
-| **B6** | Acquire/Present state machine: the nine-state slot machine, epoch `e[i]`, `GetCompletedValue` selection, `SetEventOnCompletion` blocking with no polling, `VK_NOT_READY`/`VK_TIMEOUT`; the single `vkQueueSubmit2` release on the app's queue, per-slot release command buffers, `Ready[i]=e` signal; then per-`(swapchain,image)` D3D wait → `GetCurrentBackBufferIndex` → `CopyResource` → `Release[i]=e` → `Present(1,0)`; per-swapchain `pResults`. | `helios_present_layer.cpp` (shared) | B5 | XL |
-| **B7** | C45 alias images: intercept `vkCreateImage`/`vkBindImageMemory2`/`vkDestroyImage`; VUID 00995/01630/01631/01644 enforcement; `swapchain=VK_NULL_HANDLE` consume-and-strip pass-through; mixed batches preserving order and `VkBindMemoryStatus`; `ALIAS_ONLY` survival past swapchain destruction. | `helios_present_layer.cpp` (shared) | B6 | L |
-| **B8** | Teardown/retirement: `oldSwapchain` (new set first, then atomic retire), destruction drain of in-flight D3D Release + DXGI Present, the final `EXTERNAL → canonical-family` `GENERAL→GENERAL` barrier on the helper queue, backing lifetime held while any alias lives, device-loss/`VK_ERROR_DEVICE_LOST` mapping. | `helios_present_layer.cpp` (shared) | B7 | M |
-| **B9** | Build + manifest wiring: the layer `shared_library()` (must **not** enter `libvulkan_wsi`), `.def` exports, `configure_file` of the JSON, mingw `d3d12`/`dxgi`/`dxguid` link. | `src/vulkan/wsi/meson.build` (shared with A? no — shared with the `wsi_helios_present_sync.c` removal, unit B0 below) | B1 | S |
-| **B0** | Delete the HPS2 writer and every `helios_*` addition to upstream WSI. | `wsi_helios_present_sync.{c,h}` (delete), `wsi_common.c`, `wsi_common.h`, `wsi_common_private.h`, `wsi_common_win32.cpp` | — | L |
+| **B0 ✅** | Delete the HPS2 writer and every Helios addition to upstream WSI while preserving ordinary platform selection and non-Windows WSI. | `wsi_helios_present_sync.{c,h}` (delete), generic WSI files, `wsi/meson.build` | — | landed `bb7a787a5a1` |
+| **B1 ✅** | Exact loader negotiation, next-layer dispatch capture, proc lists, extension enumeration, copied/consumed create chains, lower-name filtering, and generated entry-point manifest. | layer `.cpp`/`.h`, `.def`, JSON template | B0 | audited/corrected `e06abf3025f` |
+| **B2 ✅** | Require lower Vulkan 1.3 and the two Win32 external extensions/features; reserve exactly one copied, hidden helper queue; admit only a singleton device group. | `helios_present_layer.cpp` | B1 | audited/corrected `e06abf3025f` |
+| **B3 ✅** | Own virtual Win32 surfaces and the exact BGRA8/sRGB/FIFO profile, capability2/device-group queries, client extent, and OUT_OF_DATE/SURFACE_LOST mapping. | `helios_present_layer.cpp` | B2 | audited/corrected `e06abf3025f` |
+| **B4 ✅** | Own exact-LUID adapter selection, D3D12 device/copy queue, FLIP_DISCARD DXGI swapchain, shared committed `S[i]`, and per-slot D3D allocator/list. Ready/Release are lower-Vulkan semaphores, not D3D-created fences. | `helios_present_layer.cpp` | B3 | audited/corrected `e06abf3025f` |
+| **B5 ✅** | Finish canonical external-image query/dedicated import/offset-zero bind/private tag before exposure. Create exportable lower-Vulkan Ready/Release timelines, export each `D3D12_FENCE_BIT` handle, open it on the exact D3D12 device, and close every transient handle. | `helios_present_layer.cpp` | B4, A3, A6, A7 | landed `e06abf3025f` |
+| **B6 ✅** | Implement the nine-state/nonwrapping-epoch machine, event-based finite waits, exact NOT_READY/TIMEOUT results, and ordinary lower `vkQueueSubmit2` release → Ready → D3D wait/copy → Release → `Present(1,0)` causality with exact `pResults`. | `helios_present_layer.cpp` | B5 | landed `11d723ea10b` |
+| **B7 ✅** | Intercept alias create/bind/destroy with VUID 00995/01630/01631/01644, NULL-swapchain pass-through, ordered mixed binds/status preservation, and `ALIAS_ONLY` lifetime. | `helios_present_layer.cpp` | B6 | landed `51054338012` |
+| **B8 ✅** | Publish replacement before atomic old-swapchain retirement; drain D3D/DXGI work; issue the final helper-queue external-to-canonical GENERAL barrier; retain aliases; map loss and tear down in reverse order. | `helios_present_layer.cpp` | B7 | landed `51054338012` |
+| **B9 ✅** | Build a separate layer library/generated manifest with exact `.def` exports and `d3d12`/`dxgi`/`dxguid` linkage; never enter `libvulkan_wsi` or the lower ICD. | `src/vulkan/helios-present-layer/meson.build`, `src/vulkan/meson.build` | B0-B8 | landed `871c62bf8a0`; review `8b3c9359b5a` |
 
-**Serialization note for (b), and it is the important one.** The manifest names
+**Historical serialization note for (b).** The manifest names
 exactly **one** `.cpp` for the whole layer, so B2–B8 all write
 `helios_present_layer.cpp`. They cannot be parallelised as written.
 Recommended (and, I believe, permitted — §17 line 3745 calls the manifest "the
@@ -309,7 +342,8 @@ owner of the loader/dispatch surface (B1/B2) and add
 `helios_present_layer_surface.cpp`, `helios_present_layer_swapchain.cpp`,
 `helios_present_layer_d3d12.cpp`, `helios_present_layer_alias.cpp` as internal
 compilation units declared by `helios_present_layer.h`. If that is refused,
-B2→B8 must run strictly serially in one worktree.
+B2→B8 must run strictly serially in one worktree. The landed implementation
+kept the single `.cpp` and followed that serial order.
 
 `B0` and `B9` both edit `src/vulkan/wsi/meson.build` — land B0 first, then B9.
 
@@ -427,16 +461,26 @@ traces, and every pixel result. None of it can be reached from this lane.
 
 ### 5.4 What passes today
 
-- The tree cross-builds clean (above).
-- There is **no unit-test harness** for the ICD in this repo — `-Dbuild-tests=false`
-  is part of both the VM and host configure lines, and Mesa's own tests do not
-  cover `src/virtio/vulkan`. Every assertion this lane can make on the host is a
-  compile-time one, which is precisely why A0's offset `_Static_assert`s matter
-  more here than anywhere else in the project.
+- The lower ICD and separate present layer cross-build clean on Linux; the
+  authorized Windows `win_meson` build is also clean.
+- `tools/mesa-present-layer-gate.py --mutations` covers B0-B9 source ownership,
+  ordering, refusal, lifetime, artifact separation, and rejected-path absence;
+  the updated A6/A7 gates cover the lower export/tag seams it consumes.
+- Windows artifact scans prove the lower four-export/no-D3D-or-loader boundary
+  and the layer's exact eight exports plus permitted D3D12/DXGI dependencies.
+- There is **no runtime unit-test harness** for this layer or the ICD in this
+  repository. `-Dbuild-tests=false` is part of both Windows and host configure
+  lines, and upstream Mesa tests do not exercise this private Windows path.
+  Source/mutation and compile/link/import-table evidence therefore remain
+  source/build validation, never runtime admission.
 
 ---
 
 ## 6. Blockers, ambiguities, and contradictions
+
+The inventory below is retained as historical derivation. The 2026-08-21
+B0-B9 checkpoint above records which choices landed and supersedes any item
+that still describes the present layer as partial or unwired.
 
 **14 items.** Each states both sides.
 

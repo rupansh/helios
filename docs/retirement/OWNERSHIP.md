@@ -97,8 +97,10 @@ flip.
 That source/boot activation is **not** the activation of the whole HPS2
 retirement. KMD 22.22.296.0 now also carries K2a's documented shared-backing CPU
 view and K11's per-session stock-Venus host transport, but the display remains
-runtime-unadmitted. Mesa A3/A4's escape-free consumer cutover still precedes the
-cold-DWM visible-admission retry and every HPS2 demolition step.
+runtime-unadmitted. Mesa A3-A9 and the separate present-layer B0-B9 cutover have
+now crossed source/build validation only; no installed target has exercised
+that graph. Cold-DWM visible admission and every broad HPS2 demolition step
+remain later, separately authorized boundaries.
 
 Do not infer display admission from the raised surface, callback counts, Code 0,
 WDDM 3.2, K2a mapping, counters, or hashes. Escape and the HWQueue family remain
@@ -177,6 +179,36 @@ compatibility carrier. Reverse teardown remains with the exact device/resource
 owner. The present-layer B lane, K1/K8/K10, broad HPS2 demolition, packaging,
 deployment, and target runtime work remain unowned by this tranche. Its stop
 boundary is the present-layer handoff after A9.
+
+**Bounded present-layer authorization and landed ownership, 2026-08-21.** The
+owner then authorized exactly the Mesa B lane. Mesa exclusively owns B0's HPS2
+WSI deletion, the layer's loader/dispatch and virtual object graph, the minimum
+private presentable-image tag plumbing already below A7, and the separate
+layer build. B0 landed at `bb7a787a5a1`; B1-B5 at `e06abf3025f`; B6 at
+`11d723ea10b`; B7/B8 at `51054338012`; and B9 at `871c62bf8a0`.
+The single ordinary review fix is `8b3c9359b5a`; it stays wholly inside the
+same layer owner and changes no cross-repository contract.
+
+The exact ownership roots are unchanged: each captured next-layer instance
+owns its devices/surfaces; each device owns its queues/swapchains/aliases; each
+swapchain owns its slots/backing/epochs; and each slot owns its canonical image,
+Ready/Release timelines, D3D12 views, and recording objects. Non-dispatchable
+layer handles are opaque generated values indexed only inside that exact owner.
+No process-global object table, pointer/PID/name/TLS identity, fallback key, or
+second translator instance exists.
+
+F8 changes only the fence direction. The lower Vulkan device owns each
+exportable Ready/Release timeline; the layer exports its `D3D12_FENCE_BIT` NT
+handle and the exact owning D3D12 device opens it. The layer does not create a
+Ready/Release `ID3D12Fence` and import it into Vulkan. The fixed 112-byte A5
+table, lower-ICD four-export boundary, protocol, KMD, UMDs, translators, QEMU,
+virglrenderer, Looking Glass, and packaging are unchanged by this ownership
+cutover.
+
+This authorization ended at source/build validation. Packaging still owns any
+future installation/registration; runtime owners still own adapter restart,
+reboot, and cold-DWM admission. Broad DXVK/UMD/installer HPS2 deletion and
+K1/K8/K10/K14 remain the next handoff and were not started.
 
 ## 4. Orchestrator decision: the private direct-dispatch ABI has one home
 

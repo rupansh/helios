@@ -78,11 +78,12 @@ successful K2a/K11 target exercises:
 | Mesa A5 and direct consumers | The fixed 112-byte/eleven-slot A5 table is unchanged. Package generation 3 adds the separate immutable 72-byte HRA1 creation/bind record; DXVK and vkd3d consume the sole explicit package-owned direct instance and carry each outer-UMD token to the exact Mesa allocation. No selected Helios path searches `vulkan-1`, creates a second instance, or owns an allocation registry. | Protocol `eec9564`; DXVK `1cf7e631`; vkd3d `9a2716c0`; root UMD integration `0fe5677`. Source/build validated only; nothing was installed or target-exercised. |
 | Outer UMD/KMD execution | D3D11 owns a bounded device allocation set and resolves each token to its exact Render allocation-list index with current HWA2 generation; D3D12 resolves it to exact current GPUVA plus offset and generation. Both own HQA1/HQC1 context lifetime and emit field-by-field HOB1; D3D12 also emits exact HOS1. KMD validates the generated A7 subset, patches only its private copy, executes on the existing session endpoint, and completes through K9. | Protocol support `ccd2891`; minimum generated KMD admission `eccfd19`; K4 const-open/shared-backing follow-up `d75f649`; UMD11/12 `0fe5677`. Source/build validated only; the installed KMD remains unchanged. |
 | Mesa A6-A9 | The fail-closed A6 profile is preserved; A7 now classifies control/deferred/GPU-dependent work and emits complete exact-token use and typed-operand closure with zero wire host-resource bytes. A8 makes the selected Windows generic-ring operations unreachable and folds replies into exact HNR2 COMMIT. A9 prunes the lower-ICD build without wiring the present layer. | Mesa A6 `d07d1d13687` + `478c71a0fff`; A7 `ae9c9f4c89d`; A8/A9 `fa61439bfd7`. Source/build validated only; no ICD was installed or exercised. |
+| `VK_LAYER_HELIOS_present` B0-B9 | Mesa's HPS2 WSI writer is gone; the separate layer owns the loader/dispatch, exact-LUID D3D12/DXGI image graph, Vulkan-exported Ready/Release timelines, nine-state acquire/present machine, alias lifetime, retirement, and generated manifest. The lower ICD remains separate and escape-free. | Mesa B0 `bb7a787a5a1`; B1-B5 `e06abf3025f`; B6 `11d723ea10b`; B7/B8 `51054338012`; B9 `871c62bf8a0`; bounded review fix `8b3c9359b5a`. Source/build validated only; the layer was not registered, installed, or target-exercised. |
 
-**THE ESCAPE-FREE MESA A5-A9 LOWER-ICD CUTOVER LANDED AND PASSED SOURCE/BUILD
-VALIDATION ONLY; IT WAS NOT INSTALLED OR EXERCISED ON THE TARGET, THE WDDM 3.2
-DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED, AND THE PRESENT-LAYER CUTOVER, HPS2
-RETIREMENT, AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**
+**THE VK_LAYER_HELIOS_PRESENT B-LANE SOURCE CUTOVER LANDED AND PASSED
+SOURCE/BUILD VALIDATION ONLY; IT WAS NOT REGISTERED, INSTALLED, OR EXERCISED
+ON THE TARGET, THE WDDM 3.2 DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED, AND
+BROAD HPS2 RETIREMENT AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**
 
 **AUTHORIZED F21 CONSUMER CUTOVER AND MESA A7-A9 LANDED (2026-08-21).** The
 owner expanded the prior lower-ICD-only boundary to the bounded direct DXVK/
@@ -139,6 +140,13 @@ be **created by the ICD and opened by the D3D12 side**, not imported from
 since `helios_wddm_sync_create` + `helios_wddm_sync_share_nt` already build that
 object. Nothing above `vkCreateSwapchainKHR` has run: no acquire, no present, no
 frame.
+
+That correction is now source-closed in Mesa B1-B5 `e06abf3025f`: the layer
+creates lower-Vulkan-owned exportable timeline semaphores, exports each
+`D3D12_FENCE_BIT` NT handle with `vkGetSemaphoreWin32HandleKHR`, opens it on the
+exact owning D3D12 device, and closes the transient handle on every path. The
+historical target measurement above was not repeated, and the new source has
+not been registered, installed, or exercised.
 
 ⚠ Falling out of that work: **`ID3D12Fence::CreateSharedHandle` could never
 have worked on Helios** — vkd3d refuses a shared fence unless the driver
@@ -1089,6 +1097,53 @@ runtime probe was run. The installed package remains KMD 22.22.296.0 /
 `oem128.inf`; DWM on WARP with zero active DisplayConfig paths remains the last
 measured target state.
 
+#### ⭐ `VK_LAYER_HELIOS_present` B0-B9 source/build checkpoint (2026-08-21)
+
+The owner-authorized present-layer cutover landed dependency-first in Mesa:
+B0 `bb7a787a5a1`, B1-B5 `e06abf3025f`, B6 `11d723ea10b`, B7/B8
+`51054338012`, and B9 `871c62bf8a0`. B0 deletes only Mesa's HPS2 WSI writer and
+its generic-WSI additions. B1-B5 preserve the loader-layer chain, private next-
+dispatch provenance, exact-LUID D3D12/DXGI image graph, canonical dedicated
+offset-zero import and private tag, while applying F8 in the measured direction:
+lower Vulkan creates and exports each Ready/Release timeline semaphore and the
+exact D3D12 device opens the transient NT handle. No D3D12-created Ready/Release
+fence is imported into Vulkan.
+
+B6 implements the bounded nine-state, monotonic-epoch acquire/present machine.
+Finite backpressure uses `SetEventOnCompletion`; Present exercises the ordinary
+lower `vkQueueSubmit2` path before the exact Ready wait, copy, Release signal,
+and `Present(1,0)` sequence. B7/B8 implement owner-scoped canonical/alias state,
+NULL-swapchain pass-through, mixed bind status ordering, `ALIAS_ONLY` retention,
+atomic `oldSwapchain` retirement, exact D3D/DXGI drain, final helper-queue
+ownership restoration, reverse teardown, and device-loss mapping. B9 builds
+the layer as its own DLL/manifest; it does not enter `libvulkan_wsi` or the
+lower ICD.
+
+The one bounded ordinary review then landed `8b3c9359b5a`: feature-chain
+copying now preserves the loader's own device-create node when forcing existing
+feature bits, and every post-validation Present failure writes the exact
+per-swapchain `pResults` array before returning. No second review loop ran.
+
+The Linux-host cross build and the authorized Windows `win_meson` build pass.
+The Windows lower ICD is 49,251,322 bytes, SHA-256
+`6CFE645EDEC6BDE779300DAB4DC257F1092713EB9D06BCBA0A844AF683EC5D14`,
+and exports exactly `helios_icd_create_translator_v1` plus the three Vulkan ICD
+loader entry points. The separate layer is 3,314,217 bytes, SHA-256
+`0260E5AE530B4DAA0346F3AE2D4DAA53215E88C71486A8FFD57C12420CD73712`,
+exports exactly its eight `.def` names, imports `d3d12.dll` and `dxgi.dll`, and
+does not import `vulkan-1.dll`. The lower ICD imports none of DXGI, D3D11,
+D3D12, DComp, or `vulkan-1.dll`. These are build-provenance facts only.
+
+The one final serial `tools/retirement-gates.sh` run passed: protocol 151 unit
+tests plus its integration/parity checks, kmd_logic 545 unit tests plus both
+integrations, every standing retirement gate, A3/A6/A7 at 31/34/18 mutations,
+and the new present-layer gate at 27 mutations.
+
+Nothing was installed or registered, no installer or registry state was
+touched, and no restart, reboot, VNC, cold-DWM, or target runtime probe ran.
+The next handoff is broad HPS2 demolition in its separately owned repositories;
+it is not part of this cutover.
+
 #### ⭐ THE CRITICAL PATH IS NOW THE DISPLAY LANE — decided 2026-08-11 by the owner
 
 *"no probing or hacks, we go the proper way, i dont care if I dont see the desktop
@@ -1114,16 +1169,17 @@ statements without changing the display-admission result.
 | 10 | **Mesa A3/A4** | Consume the exact session/executor without Escape, duplicate host instance, raw resource ID, or synthetic completion. | **LANDED; SOURCE/BUILD-VALIDATED ONLY** at Mesa `2c2763b8b1a` + `5cbc0254f43`. The escape-free HVM1 renderer and mode-dispatched HNR2 submit path build on Windows and pass their mutation gates. A7-dependent command-buffer closure stays refused, and A5-A9 plus the present layer remain the handoff. No ICD installation or target exercise occurred. |
 | 11 | **Mesa A5/A6; F21 stop** | Expose only the fixed direct record-only interface and prepare the exact lower profile before closing all allocation use/operand identity. | **HISTORICAL SOURCE/BUILD CHECKPOINT** at Mesa `4ea18b3512f` + `d07d1d13687` + review fix `478c71a0fff`. It correctly stopped at the then-unauthorized outer-token producer boundary and is superseded by row 12. |
 | 12 | **F21 direct consumers, outer UMD/KMD, Mesa A7-A9** | Carry the exact outer allocation token from its UMD owner through DXVK/vkd3d into Mesa, resolve it back to current WDDM identity at submission, then close A7 and retire only the selected Windows ring/build path. | **LANDED; SOURCE/BUILD-VALIDATED ONLY.** Protocol `eec9564` + `ccd2891`, KMD `eccfd19` + K4 follow-up `d75f649`, DXVK `1cf7e631`, vkd3d `9a2716c0`, UMD11/12 root `0fe5677`, Mesa A7 `ae9c9f4c89d`, and A8/A9 `fa61439bfd7`. The fixed A5 table is unchanged; no generic registry/fallback or new host carrier exists. Nothing was installed or target-exercised, and the present-layer B lane is the stop-boundary handoff. |
+| 13 | **`VK_LAYER_HELIOS_present` B0-B9** | Remove the Mesa HPS2 WSI writer and move native Win32 WSI into the separate, acyclic layer using the landed A5-A9 lower contract and F8-correct fence direction. | **LANDED; SOURCE/BUILD-VALIDATED ONLY.** Mesa `bb7a787a5a1`, `e06abf3025f`, `11d723ea10b`, `51054338012`, `871c62bf8a0`, plus bounded review fix `8b3c9359b5a`. The layer and lower ICD build as separate DLLs with their exact export/dependency boundaries. Nothing was registered, installed, or target-exercised; broad HPS2 demolition remains the handoff. |
 
 ⚠ **The desktop stays dark for most of this**, by the owner's explicit acceptance.
 D9, K2a, and K11 have crossed their source and exact-target runtime boundaries;
-the post-K9 executor and Mesa A3-A9 direct-consumer cutover have crossed
-source/build only. The display
+the post-K9 executor, Mesa A3-A9 direct-consumer cutover, and present-layer
+B0-B9 cutover have crossed source/build only. The display
 therefore remains runtime-unadmitted. The last measured target still selected
 the old installed ICD path, fell back to WARP before a primary was programmed,
 and reported zero active paths. Escape must not be restored. This tranche stops
-after A9 before the present-layer cutover; neither this source/build evidence nor
-the historical target evidence evaluates the new path.
+after the complete B lane before broad HPS2 demolition; neither this
+source/build evidence nor the historical target evidence evaluates the new path.
 Only visible DWM startup on WDDM 3.2 admits the surface; a build, callback count,
 Code 0, counter, map result, or log cannot. F1 permits the measured build-26100
 target; WDK 28000 remains the compile-time header/binding authority.

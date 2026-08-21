@@ -2130,3 +2130,86 @@ later unit remain outside this tranche.
 VALIDATION ONLY; IT WAS NOT INSTALLED OR EXERCISED ON THE TARGET, THE WDDM 3.2
 DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED, AND THE PRESENT-LAYER CUTOVER, HPS2
 RETIREMENT, AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**
+
+## F22 — The F8-correct `VK_LAYER_HELIOS_present` B lane is source-closed as a separate artifact; no target admission was exercised.
+
+**Landed source boundary, 2026-08-21.** The bounded Mesa B lane landed in the
+required dependency order: B0 `bb7a787a5a1`, B1-B5 `e06abf3025f`, B6
+`11d723ea10b`, B7/B8 `51054338012`, and B9 `871c62bf8a0`. No protocol, KMD,
+UMD11, UMD12, DXVK, vkd3d, QEMU, virglrenderer, Looking Glass, packaging, Cargo
+manifest, or lockfile changed.
+
+The one bounded ordinary review landed `8b3c9359b5a`. It found and fixed two
+in-scope issues: copying a feature-chain prefix now includes the loader's own
+`VkLayerDeviceCreateInfo`, and every post-validation Present refusal writes all
+per-swapchain `pResults`. No adversarial or rotating-lens review followed.
+
+B0 removes `wsi_helios_present_sync.{c,h}` and the Helios additions that made
+generic Mesa WSI publish HPS2 while preserving ordinary non-Windows WSI and the
+Windows lower-ICD fail-closed boundary. B1-B4 were re-derived against the landed
+A5-A9 contract: loader negotiation, next-chain dispatch provenance, extension
+enumeration, copied create chains, lower-name filtering, Vulkan-1.3/external-
+feature admission, hidden helper queue, exact surface profile, exact-LUID
+adapter selection, D3D12 copy queue, DXGI flip swapchain, and committed shared
+image graph remain owner-scoped. Translator-owned A5 instances never enter the
+layer; no loader/module/filename search or compatibility registry was added.
+
+**F8 is corrected in source.** Each slot creates lower-Vulkan-owned exportable
+Ready and Release timeline semaphores. The layer calls
+`vkGetSemaphoreWin32HandleKHR` for `D3D12_FENCE_BIT`, opens each handle through
+the exact owning `ID3D12Device::OpenSharedHandle`, and closes the transient NT
+handle on every success and refusal path. The live B lane contains no
+Ready/Release `ID3D12Fence::CreateSharedHandle`, no
+`vkImportSemaphoreWin32HandleKHR`, and no assumption that a D3D12-created fence
+handle can enter the KMT/Vulkan open path. The valid F7 image direction remains:
+committed D3D12 texture → resource NT handle → memory-handle properties →
+dedicated import → offset-zero bind → next-GDPA private tag, all before image
+exposure.
+
+B6 owns the documented nine states and checked monotonic slot epoch. Acquire
+selects only Release-proven reusable slots and uses `SetEventOnCompletion` for
+finite waits; no poll/sleep/watchdog or synthetic completion exists. Present
+uses the ordinary lower `vkQueueSubmit2` path for the canonical-to-EXTERNAL
+barrier and exact Ready signal before D3D waits, copies the current backbuffer,
+signals Release, and calls `Present(1,0)` with per-swapchain results.
+
+B7/B8 retain exact instance/device/swapchain/slot associations and enforce the
+alias VUIDs, NULL-swapchain pass-through, mixed-bind/status order, `ALIAS_ONLY`
+lifetime, replacement-before-retirement, D3D/DXGI drain, final helper-queue
+ownership restoration, retained backing, reverse teardown, and device-loss
+mapping. B9 emits the layer as its own DLL/generated manifest. It does not enter
+`libvulkan_wsi` or the lower ICD.
+
+**Build provenance.** Focused source/mutation gates, the Linux-host cross build,
+and the Windows `win_meson` build pass. The Windows lower ICD is 49,251,322
+bytes with SHA-256
+`6CFE645EDEC6BDE779300DAB4DC257F1092713EB9D06BCBA0A844AF683EC5D14` and
+exports exactly `helios_icd_create_translator_v1`,
+`vk_icdGetInstanceProcAddr`, `vk_icdGetPhysicalDeviceProcAddr`, and
+`vk_icdNegotiateLoaderICDInterfaceVersion`. It imports none of DXGI, D3D11,
+D3D12, DComp, or `vulkan-1.dll`.
+
+The separate layer is 3,314,217 bytes with SHA-256
+`0260E5AE530B4DAA0346F3AE2D4DAA53215E88C71486A8FFD57C12420CD73712` and
+exports exactly the four layer-enumeration names, `vkGetInstanceProcAddr`,
+`vkGetDeviceProcAddr`, `vkNegotiateLoaderLayerInterfaceVersion`, and
+`vk_layerGetPhysicalDeviceProcAddr`. Its import table contains the permitted
+`d3d12.dll` and `dxgi.dll` dependencies and no `vulkan-1.dll`; `dxguid` is a
+static link input and therefore is not a DLL import.
+
+The final serial `tools/retirement-gates.sh` run passed once. It included
+protocol 151 unit tests plus integration/parity, kmd_logic 545 unit tests plus
+both integrations, every standing gate, the updated A3/A6/A7 mutation suites
+at 31/34/18, and 27 rejected present-layer mutations.
+
+**Bound.** These facts establish source/build provenance only. The layer and
+lower ICD were not installed or registered; no installer, registry, scheduled
+task, adapter restart, reboot, VNC, cold-DWM exercise, or other target probe ran.
+The installed target remains KMD 22.22.296.0 / `oem128.inf`, with DWM on WARP
+and zero active DisplayConfig paths as the last measured state. The next owner
+handoff is broad HPS2 demolition; it was not started.
+
+**THE VK_LAYER_HELIOS_PRESENT B-LANE SOURCE CUTOVER LANDED AND PASSED
+SOURCE/BUILD VALIDATION ONLY; IT WAS NOT REGISTERED, INSTALLED, OR EXERCISED
+ON THE TARGET, THE WDDM 3.2 DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED, AND
+BROAD HPS2 RETIREMENT AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**

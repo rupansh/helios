@@ -997,6 +997,9 @@ run_gate "Mesa A7 exact-token command closure, joins, and presentable tag are mu
 run_gate "Mesa A8 Windows ring retirement and A9 lower-ICD wiring are mutation-closed" \
     python3 "$REPO/tools/mesa-a8-a9-gate.py" "$REPO" --mutations
 
+run_gate "Mesa present layer B0-B9 is owner-exact, causal, lifetime-closed, artifact-separated, and mutation-checked" \
+    python3 "$REPO/tools/mesa-present-layer-gate.py" "$REPO" --mutations
+
 run_gate "D4 classic/DMA DIRQL enqueue is capability-restricted and fixed-storage" \
     python3 "$REPO/tools/d4-dirql-gate.py" "$REPO"
 
