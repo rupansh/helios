@@ -1,4 +1,4 @@
-//! HPS2 D2 platform plane: exact HWA2 admission, fenced replacement, and
+//! D2 platform plane: exact HWA2 admission, fenced replacement, and
 //! reset-bounded backing custody for source 0 / plane 0.
 
 #![allow(

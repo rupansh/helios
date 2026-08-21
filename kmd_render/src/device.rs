@@ -10,9 +10,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-
-use helios_kmd_logic::snapshot_bind::SnapshotDescriptor;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::adapter::AdapterContext;
 use crate::ddi::native_render::{NativeClass, NativeContext};
@@ -32,12 +30,8 @@ pub struct DeviceContext {
     /// prevents.
     adapter: *mut AdapterContext,
     /// Documented WDDM KMD-process token (`DXGKARG_CREATEDEVICE.hKmdProcess`).
-    /// Present markers arrive through the UMD runtime's D3DKMT device rather
-    /// than the ICD device that registered a stream, so this exact per-process
-    /// object association — never a PID or current-thread inference — is the
-    /// authorization edge between the two devices.  Zero means that async
-    /// stream registration/marker use is refused while ordinary rendering stays
-    /// available.
+    /// This exact per-process object association is used by session and outer
+    /// allocation ownership; it is never replaced by a PID or thread identity.
     creator_process: usize,
     /// K5: the one HTS1 session this raw KMT device's HVC1 control context
     /// created, if it is a raw device at all. `None` for every ordinary D3D
@@ -98,56 +92,6 @@ pub struct ContextContext {
     /// Back-pointer to the owning device (valid for the context's lifetime).
     /// PRIVATE, for the same reason as [`DeviceContext::adapter`].
     device: *mut DeviceContext,
-    /// D4b snapshot descriptor STASH: the render→present handoff
-    /// (FIX-DESIGN-d4b-snapshot.md §4, corrected delivery route).
-    ///
-    /// WHY IT EXISTS. dxgkrnl does NOT forward the UMD's PresentCb
-    /// `pPrivateDriverData` to `DxgkDdiPresent` on flip presents (measured:
-    /// `PBIdOk` reads "no payload" across three driver generations), so the
-    /// descriptor's only working route into the KMD is the inline
-    /// `HeliosPresentRenderCmd` that `DxgkDdiRender` already decodes — the
-    /// same route the present-marker resid has always used. The UMD issues
-    /// pfnRenderCb then pfnPresentCb back-to-back on one thread for the same
-    /// hContext, so Render stashes HERE and the immediately following Present
-    /// takes it.
-    ///
-    /// DISCIPLINE. `snap_resid == 0` = empty. The writer stores the payload
-    /// fields Relaxed and the resid LAST with Release; the taker swaps the
-    /// resid to 0 with Acquire and only then reads the payload — read+clear on
-    /// EVERY present that resolves its context (flip, MMIO, BLT alike), so an
-    /// orphaned stash (a Render whose Present failed) cannot outlive the next
-    /// present on this context: staleness is bounded to one present, and the
-    /// Present-time validation (extent vs the allocation list, layout,
-    /// liveness at the executor) re-checks everything the stash claims.
-    /// Atomics rather than plain fields because context state is reached
-    /// through a shared reference; the same-thread Render→Present pairing is
-    /// the expected regime, and under any cross-thread interleaving a torn
-    /// stash degrades to a mix of two VALIDATED descriptors, which that same
-    /// validation absorbs. The stash is plain data inside this Box — it dies
-    /// with the context in `dxgkddi_destroy_context`, and dxgkrnl serializes
-    /// context destruction against in-flight Render/Present on the handle, so
-    /// nothing can dangle.
-    snap_resid: AtomicU32,
-    snap_width: AtomicU32,
-    snap_height: AtomicU32,
-    snap_pitch: AtomicU32,
-    snap_dxgi_format: AtomicU32,
-    /// Kept full-width: narrowing to u32 happens only AFTER Present-time
-    /// validation proved `plane_offset <= u32::MAX` (a pre-narrow truncation
-    /// could alias an invalid offset onto a valid-looking one).
-    snap_plane_offset: AtomicU64,
-    snap_alloc_size: AtomicU64,
-    snap_memory_type: AtomicU32,
-    snap_purpose: AtomicU32,
-    /// Registered-stream marker STASH. Exactly like the snapshot handoff, the
-    /// Render→Present pair is the only documented route from UMD command bytes
-    /// into the KMD-private DMA record consumed by SubmitCommand. The three
-    /// fields are one lock-protected value: publishing/claiming them as separate
-    /// atomics lets a later Render overwrite ctx/value after Present claims the
-    /// prior cookie, cross-pairing two frames. The fixed Option neither allocates
-    /// nor blocks below DISPATCH; `SpinLock` raises/restores IRQL around the
-    /// handful of scalar accesses.
-    present_stream_marker: crate::sync::SpinLock<Option<(u32, u32, u64)>>,
     /// K5: what this context is, and the strong session reference it holds.
     /// Written once at create and read once at destroy — the live context object
     /// is the identity, and nothing looks the numeric generation up again
@@ -466,77 +410,6 @@ impl<'a> ContextHandleRef<'a> {
         unsafe { device.adapter.as_ref() }
     }
 
-    /// The exact documented KMD-process object token that created this
-    /// context's device.
-    pub fn creator_process(&self) -> Option<usize> {
-        let device = unsafe { self.context.device.as_ref() }?;
-        Some(device.creator_process)
-    }
-
-    /// Stash a VALIDATED-shape D4b snapshot descriptor from `DxgkDdiRender`'s
-    /// `HeliosPresentRenderCmd` for the present that follows on this context.
-    /// See [`ContextContext::snap_resid`] for the whole contract; the payload
-    /// stores precede the resid's Release publication so the taker's Acquire
-    /// swap observes a complete descriptor.
-    pub fn stash_snapshot(&self, snap: &SnapshotDescriptor) {
-        let ctx = self.context;
-        ctx.snap_width.store(snap.width, Ordering::Relaxed);
-        ctx.snap_height.store(snap.height, Ordering::Relaxed);
-        ctx.snap_pitch.store(snap.pitch, Ordering::Relaxed);
-        ctx.snap_dxgi_format
-            .store(snap.dxgi_format, Ordering::Relaxed);
-        ctx.snap_plane_offset
-            .store(snap.plane_offset, Ordering::Relaxed);
-        ctx.snap_alloc_size
-            .store(snap.venus_alloc_size, Ordering::Relaxed);
-        ctx.snap_memory_type
-            .store(snap.memory_type_index, Ordering::Relaxed);
-        ctx.snap_purpose.store(snap.purpose, Ordering::Relaxed);
-        ctx.snap_resid.store(snap.resource_id, Ordering::Release);
-    }
-
-    /// Take (read + CLEAR) the stashed snapshot descriptor, or `None`.
-    ///
-    /// Called on EVERY present that resolves this context — including the
-    /// MMIO/desktop and BLT arms, which never substitute — because the clear
-    /// is the orphan bound: a stash whose present failed must not leak past
-    /// the next present. The swap claims the descriptor exactly once.
-    pub fn take_snapshot_stash(&self) -> Option<SnapshotDescriptor> {
-        let ctx = self.context;
-        let resid = ctx.snap_resid.swap(0, Ordering::Acquire);
-        if resid == 0 {
-            return None;
-        }
-        Some(SnapshotDescriptor {
-            resource_id: resid,
-            width: ctx.snap_width.load(Ordering::Relaxed),
-            height: ctx.snap_height.load(Ordering::Relaxed),
-            pitch: ctx.snap_pitch.load(Ordering::Relaxed),
-            dxgi_format: ctx.snap_dxgi_format.load(Ordering::Relaxed),
-            plane_offset: ctx.snap_plane_offset.load(Ordering::Relaxed),
-            venus_alloc_size: ctx.snap_alloc_size.load(Ordering::Relaxed),
-            memory_type_index: ctx.snap_memory_type.load(Ordering::Relaxed),
-            purpose: ctx.snap_purpose.load(Ordering::Relaxed),
-        })
-    }
-
-    /// Stash one complete nonzero stream marker for the immediately following
-    /// Present on this context.  The KMD validates registry/process ownership
-    /// while consuming it; this handoff only preserves the exact UMD boundary
-    /// until the WDDM private-data buffer exists.
-    pub fn stash_present_stream_marker(&self, ctx_id: u32, value: u32, cookie: u64) {
-        if ctx_id == 0 || value == 0 || cookie == 0 {
-            return;
-        }
-        *self.context.present_stream_marker.lock() = Some((ctx_id, value, cookie));
-    }
-
-    /// Take and clear the stream marker stash, bounding an orphaned Render to
-    /// one following Present just like the snapshot descriptor.
-    pub fn take_present_stream_marker_stash(&self) -> Option<(u32, u32, u64)> {
-        self.context.present_stream_marker.lock().take()
-    }
-
     /// K6's native-render state and the session it belongs to, or `None` for
     /// every context that is not an HVC1 one.
     ///
@@ -634,11 +507,6 @@ impl<'a> DeviceHandleRef<'a> {
         self.device.adapter
     }
 
-    /// The exact documented KMD-process object token that created this device.
-    pub fn creator_process(&self) -> usize {
-        self.device.creator_process
-    }
-
     pub(crate) fn register_outer_open(&self, open: usize) -> bool {
         self.device.register_outer_open(open)
     }
@@ -694,20 +562,8 @@ pub unsafe extern "C" fn dxgkddi_create_device(
     STATUS_SUCCESS
 }
 
-/// `DxgkDdiDestroyDevice` — free per-device state, after unmapping any host-visible
-/// blob views this device opened (Gate 5a Stage 2b). The user VAs were mapped by
-/// `HELIOS_ESCAPE_MAP_BLOB` (tagged with this `h_device` as owner) and MUST be
-/// unmapped here — in the creating process, at PASSIVE_LEVEL — or the kernel
-/// bugchecks `0x76 PROCESS_HAS_LOCKED_PAGES` at process exit. This DDI runs in the
-/// context of the thread destroying the device (the ICD's process), so the unmap is
-/// in-process. The mapping table is on the AdapterContext (independent spinlock), so
-/// teardown is correct even if the virtio transport is already gone.
-/// Mappings harvested per spinlock acquisition in DestroyDevice.
-///
-/// 64 pairs = 1 KiB of stack, which is affordable on the PASSIVE DestroyDevice
-/// frame and turns an 8192-mapping teardown from 8192 acquisitions into 128.
-const MAPPING_DRAIN_BATCH: usize = 64;
-
+/// `DxgkDdiDestroyDevice` — close admission, drain exact session/open custody,
+/// reclaim this device's transport objects, and free its per-device state.
 pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTATUS {
     if !h_device.is_null() {
         // SAFETY: h_device came from Box::into_raw in create_device; its `adapter`
@@ -737,12 +593,9 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
             return STATUS_SUCCESS;
         };
         let owner = h_device as usize;
-        // SAFETY: `DxgkDdiDestroyDevice` is documented "IRQL: PASSIVE_LEVEL" (WDK
-        // DXGKDDI_DESTROYDEVICE), and the unmap loop below already depends on it
-        // — `MmUnmapLockedPages` is PASSIVE-only, which is exactly why the table
-        // lock is dropped between batches. Minted HERE rather than further down
-        // because the diag dumps between also require it; still ONE mint for
-        // this DDI.
+        // SAFETY: `DxgkDdiDestroyDevice` is documented PASSIVE_LEVEL. Session
+        // transport teardown and the diagnostic dumps below both require it;
+        // mint the proof once for this DDI.
         let passive = unsafe { crate::irql::PassiveLevel::assume() };
         // No allocation open may survive DestroyDevice.  Drop the device-owned
         // HQA1 session reference only after CloseAllocation removed every exact
@@ -759,23 +612,6 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         };
         if let Some(session) = outer_session {
             unsafe { hts1::release_execution_session(session) };
-        }
-        // Drain THIS device's mappings in batches, unmapping outside the table
-        // lock (MmUnmapLockedPages needs PASSIVE; the table lock raises to
-        // DISPATCH). One acquisition per entry was O(n) acquisitions and O(n^2)
-        // comparisons, and MAX_MAPPINGS is 8192 because a DOOM level load really
-        // does hold thousands.
-        let mut batch = [(0u64, 0usize); MAPPING_DRAIN_BATCH];
-        loop {
-            let n = adapter.mappings.drain_for(owner, &mut batch);
-            if n == 0 {
-                break;
-            }
-            for &(user_va, mdl) in &batch[..n] {
-                // SAFETY: PASSIVE_LEVEL in the creating process; pair from a
-                // prior MAP_BLOB on this device handle.
-                unsafe { crate::ddi::unmap_io_pages_from_user(user_va, mdl as *mut wdk_sys::MDL) };
-            }
         }
         // Reclaim any virtio blobs / contexts this device allocated but did not
         // release (ICD crash, or a process that skipped RELEASE_BLOB/CTX_DESTROY —
@@ -809,24 +645,9 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         crate::ddi::diag_dump_native_fence_atomics(adapter.native_fence.as_ref());
         crate::ddi::diag_dump_translation_session_atomics();
         crate::ddi::diag_dump_native_render_atomics();
-        // D4a: drop this device's scanout retirement-event registrations —
-        // dereference ONLY, no signal (the process is exiting; a wake would
-        // land nowhere). Its read-ledger page mapping needs nothing here: it
-        // rides the MappingTable and was unmapped by the drain above.
-        adapter.read_ledger.reclaim_events_for_owner(owner);
         // Sweep exactly this device's slots. A null hDevice would sweep the
         // KMD-owned ones, so the token is minted rather than cast.
         let device_owner = crate::virtio::gpu::DeviceOwner::new(owner);
-        // Present-stream slots borrow this DeviceContext's KMD-process token,
-        // so purge them before the device handle can disappear.
-        let purged_streams = adapter.with_wddm_notify_lock(|guard| {
-            guard
-                .with_virtio(|order, v| v.purge_present_streams_for_owner(order, device_owner))
-                .unwrap_or(0)
-        });
-        if purged_streams != 0 {
-            crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
-        }
         // Revoke/drain/destroy the session namespace before the generic owner
         // sweep can release the reply pool or context custody underneath it.
         let stale = { unsafe { (h_device as *const DeviceContext).as_ref() } }
@@ -1021,16 +842,6 @@ pub unsafe extern "C" fn dxgkddi_create_context(
     let ctx = Box::new(ContextContext {
         magic: CONTEXT_CTX_MAGIC,
         device: h_device as *mut DeviceContext,
-        snap_resid: AtomicU32::new(0),
-        snap_width: AtomicU32::new(0),
-        snap_height: AtomicU32::new(0),
-        snap_pitch: AtomicU32::new(0),
-        snap_dxgi_format: AtomicU32::new(0),
-        snap_plane_offset: AtomicU64::new(0),
-        snap_alloc_size: AtomicU64::new(0),
-        snap_memory_type: AtomicU32::new(0),
-        snap_purpose: AtomicU32::new(0),
-        present_stream_marker: crate::sync::SpinLock::new(None),
         helios: role,
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;

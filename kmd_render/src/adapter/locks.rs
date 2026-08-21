@@ -4,16 +4,6 @@
 //! `wddm_notify_lock` taken before the interrupt object. Moved verbatim out of
 //! `adapter.rs` by T8/R1101.
 //!
-//! Two independent D4a LEAF spinlocks sit below all of the above:
-//! `ReadLedger`'s mutation lock and its event-table lock
-//! (`adapter/read_ledger.rs`). Each is acquired LAST; nothing may be acquired,
-//! allocated, waited on, logged to the registry, or paged while either is held.
-//! The mutation lock serializes issue, allocation retire, reset, and token
-//! retirement. It is always released before the event-table lock broadcasts
-//! `KeSetEvent(Wait = FALSE)`, so the two leaf locks never nest. They have no
-//! accessor here because `crate::sync::SpinLock`'s guard is their whole
-//! discipline.
-
 use alloc::boxed::Box;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -40,7 +30,7 @@ use super::AdapterContext;
 /// 22.22.212.0. A nonzero value here is a hard, attributable answer to a
 /// question a stack-only post-mortem could not settle: the adapter pointer this
 /// call was made with was not the one it woke up with. Mirrored from
-/// `pacing_snapshot`, a PASSIVE site, because this one runs at DISPATCH.
+/// an OS-invoked bounded diagnostic snapshot, because this one runs at DISPATCH.
 pub(crate) static WITH_VIRTIO_TORN: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) use helios_kmd_logic::ordered_engine::{
@@ -54,9 +44,9 @@ pub(super) type OrderedEngineFrontier =
 /// Allocate K9's multi-KiB frontier directly on the heap.
 ///
 /// `AdapterContext::new` itself is part of the measured boot-stack chain. A
-/// by-value `[slot; 256]` temporary here would repeat the historical
-/// present-stream double-fault, so initialize the boxed storage element by
-/// element and never materialize the array in this frame.
+/// by-value `[slot; 256]` temporary here would be unsafe on the boot stack, so
+/// initialize the boxed storage element by element and never materialize the
+/// array in this frame.
 #[inline(never)]
 pub(super) fn allocate_ordered_engine_frontier() -> Box<OrderedEngineFrontier> {
     let mut frontier = Box::<OrderedEngineFrontier>::new_uninit();
@@ -345,11 +335,9 @@ impl WddmNotifyGuard<'_> {
     ///
     /// ⚠ Do NOT grow this into a `with_notify_then_virtio` that holds both locks
     /// for one closure: `drain_used_and_complete` deliberately makes several
-    /// separate `with_virtio` calls inside one notify scope and runs
-    /// `request_scanout_refresh()` and `signal_dma_completed()` (which
-    /// raises to the device DIRQL via `DxgkCbSynchronizeExecution`) between
-    /// them. Folding those into one transport critical section would change
-    /// frame-path timing.
+    /// separate `with_virtio` calls inside one notify scope and raises to the
+    /// device DIRQL via `DxgkCbSynchronizeExecution` between them. Folding those
+    /// into one transport critical section would change completion-path timing.
     pub(crate) fn with_virtio<R>(
         &self,
         f: impl FnOnce(&NotifyOrdered<'_>, &mut VirtioGpu) -> R,
@@ -370,20 +358,15 @@ impl WddmNotifyGuard<'_> {
 /// carrying a `_locked` suffix and a doc comment.
 ///
 /// The lock order this token sits at the head of is
-/// `scanout_mutex -> venus_mutex -> virtio_lock` (below which one D4a read
-/// ledger LEAF may nest — see the module doc);
+/// `scanout_mutex -> venus_mutex -> virtio_lock`;
 /// [`Self::with_venus_client`] is the enforced path for the middle step.
 ///
 /// ⚠ This does NOT make recursion unrepresentable: the guard is handed to the
 /// very closure that could call a re-acquiring wrapper. Callers must still not
-/// invoke [`AdapterContext::with_scanout_lifecycle`],
-/// [`AdapterContext::queue_active_scanout_refresh`] or
-/// [`AdapterContext::retire_scanout_allocation`] from inside a guarded closure —
+/// invoke [`AdapterContext::with_scanout_lifecycle`] from inside a guarded closure —
 /// `scanout_mutex` is a non-recursive `SynchronizationEvent` and a re-entry is a
 /// permanent PASSIVE self-deadlock of the HPD worker with no bugcheck and no
-/// counter. `request_scanout_refresh` is deliberately token-free: it only sets a
-/// bit and signals an event, so it is legal from inside the lock and from
-/// DISPATCH.
+/// counter.
 pub(crate) struct ScanoutGuard<'a> {
     adapter: &'a AdapterContext,
     /// The caller's PASSIVE proof (R614), carried so the helpers that already
@@ -412,11 +395,6 @@ impl ScanoutGuard<'_> {
         self.adapter.with_venus_client(self.passive, f)
     }
 
-    /// The caller's PASSIVE proof, for the guarded helpers that reach
-    /// `virtio::ctrl` directly instead of through the venus client.
-    pub(crate) fn passive(&self) -> PassiveLevel {
-        self.passive
-    }
 }
 
 impl AdapterContext {

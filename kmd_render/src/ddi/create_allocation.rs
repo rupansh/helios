@@ -1,4 +1,4 @@
-//! Allocation management DDIs — the HPS2 retirement's allocation identity model.
+//! Allocation management DDIs for exact runtime allocation ownership.
 //!
 //! Normative: `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` and the orchestrator's
 //! decision record `docs/retirement/K4-CONTRACT.md`, which wins wherever it
@@ -68,7 +68,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
 use bytemuck::bytes_of;
 use helios_protocol::{
@@ -97,8 +97,7 @@ use wdk_sys::ntddk::{
 use wdk_sys::{KEVENT, PMDL, PVOID};
 
 use crate::adapter::allocation_object;
-use crate::adapter::{AdapterContext, ScanoutGuard};
-use crate::ddi::display::ScanoutReject;
+use crate::adapter::AdapterContext;
 use crate::dxgk::_D3DDDIFORMAT::{D3DDDIFMT_A8B8G8R8, D3DDDIFMT_A8R8G8B8, D3DDDIFMT_X8R8G8B8};
 use crate::dxgk::_D3DKMDT_STANDARDALLOCATION_TYPE::{
     D3DKMDT_STANDARDALLOCATION_GDISURFACE, D3DKMDT_STANDARDALLOCATION_SHADOWSURFACE,
@@ -108,8 +107,6 @@ use crate::dxgk::*;
 use crate::irql::PassiveLevel;
 use crate::sync::SpinLock;
 use crate::virtio::hal::DmaBuffer;
-use helios_kmd_logic::snapshot_bind::SnapshotDescriptor;
-use helios_kmd_logic::ScanoutFormat;
 
 /// `AllocationContext::magic` — validates `hAllocation` casts in paging DDIs
 /// (a garbage dereference in BuildPagingBuffer is a bugcheck).
@@ -209,75 +206,6 @@ struct AllocationContext {
     /// kernel-created Venus `VkImage`. As above, enabled teardown authority is
     /// held only by the canonical resource row.
     venus_image_id: u64,
-    /// Lazily-created kernel-Venus alias of an adopted UMD OPTIMAL image. The
-    /// alias imports `resource_id` memory and exists solely so the KMD can copy
-    /// the exact SetVidPn primary into its durable LINEAR scanout image.
-    scanout_copy_image_id: core::sync::atomic::AtomicU64,
-    scanout_copy_memory_id: core::sync::atomic::AtomicU64,
-    scanout_copy_conversion_image_id: core::sync::atomic::AtomicU64,
-    scanout_copy_conversion_memory_id: core::sync::atomic::AtomicU64,
-    scanout_copy_conversion_init_pool_id: core::sync::atomic::AtomicU64,
-    scanout_copy_pool_id: core::sync::atomic::AtomicU64,
-    scanout_copy_command_buffer_id: core::sync::atomic::AtomicU64,
-    scanout_copy_target_image_id: core::sync::atomic::AtomicU64,
-    /// DIAGNOSTIC MIRROR ONLY since R609. The authoritative drain fence lives on
-    /// the VenusClient that submitted it, where writer and reader are both
-    /// inside the venus mutex by construction. This copy is kept because it is
-    /// the per-allocation value a dump wants; nothing reads it to decide
-    /// anything.
-    scanout_copy_last_fence: core::sync::atomic::AtomicU64,
-    scanout_copy_owns_source_alias: AtomicU32,
-    scanout_copy_orphaned: AtomicU32,
-    /// Exact segment-relative address supplied by Windows in
-    /// `DXGKARG_SETVIDPNSOURCEADDRESS` for this allocation. Keeping it on the
-    /// allocation makes the raised-IRQL callback's deferred handle and address
-    /// one identity; the worker never combines an allocation with a global
-    /// "latest address" from another flip.
-    vidpn_primary_address: AtomicU64,
-    /// Exact WDDM segment containing `vidpn_primary_address`, supplied in the
-    /// same `DXGKARG_SETVIDPNSOURCEADDRESS` callback.
-    vidpn_primary_segment: AtomicU32,
-    /// Exact `DXGK_SETVIDPNSOURCEADDRESS_FLAGS::Value` paired with the callback.
-    vidpn_primary_flags: AtomicU32,
-    /// Presentation epoch this allocation's pending flip published, or
-    /// `NO_LEASE` (ROADMAP defect 0ab-B).
-    ///
-    /// It rides on the ALLOCATION, exactly like `vidpn_primary_address` above
-    /// and for exactly the same reason: `pending_vidpn_allocation` is a single
-    /// slot that coalesces, so a parallel "latest epoch" atomic would let the
-    /// display worker pair one flip's handle with another flip's epoch. Here the
-    /// pairing is by construction. Nonzero only on the DMA-buffer flip contract;
-    /// the MMIO/`FlipOnVSyncMmIo` desktop path stores 0 and is unchanged.
-    vidpn_present_epoch: AtomicU64,
-    /// This flip's own frame-completion boundary, taken out of the per-buffer
-    /// mark table at flip-arm time, or 0 (ROADMAP defect 0ab-B, D1(i)).
-    ///
-    /// It rides on the allocation for the same reason the epoch above does, and
-    /// it is taken at the FLIP rather than read at the BIND because the table
-    /// holds one mark per resource: a bind more than two frame periods after its
-    /// present finds the mark already replaced by the same buffer's next
-    /// present, and then waits a frame too long. Written by the flip arm only,
-    /// on every arm, so a bind can never read a mark from an older flip.
-    vidpn_frame_watermark: AtomicU64,
-    /// D4b snapshot BIND-TARGET substitution stamped by this allocation's most
-    /// recent flip, BY VALUE — never a pointer, never the snapshot's own
-    /// `AllocationContext` (the snapshot has no WDDM allocation to resolve).
-    /// `vidpn_snap_resid == 0` means no substitution. Rides on the allocation
-    /// for the same coalescing reason the epoch/watermark above do, and is
-    /// stored on EVERY `set_vidpn_primary_address` (zeroed on the MMIO path)
-    /// so a bind can never read a descriptor left by an older flip. Like the
-    /// epoch pair, the fields publish under the address's Release store and
-    /// are read after its Acquire; a torn read across two concurrent flips of
-    /// the same allocation can at worst mix two VALIDATED descriptors, which
-    /// the executor's `resource_is_live` arm and the extent gates absorb.
-    vidpn_snap_resid: AtomicU32,
-    vidpn_snap_width: AtomicU32,
-    vidpn_snap_height: AtomicU32,
-    vidpn_snap_pitch: AtomicU32,
-    vidpn_snap_dxgi_format: AtomicU32,
-    /// Validated `<= u32::MAX` at Present; stored narrow like the flip record.
-    vidpn_snap_plane_offset: AtomicU32,
-    vidpn_snap_alloc_size: AtomicU64,
     size: SIZE_T,
     /// Surface geometry for `DxgkDdiDescribeAllocation` (0 for UMD blob allocations
     /// that carry no dimensions). Populated from the standard-allocation trailer.
@@ -702,9 +630,6 @@ static STANDARD_FORMAT_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// value means this driver produces a record the create path will reject, i.e.
 /// the two halves of one file disagree.
 static STANDARD_SELF_REJECT: AtomicU32 = AtomicU32::new(0);
-static PRIMARY_COPY_ORPHAN_REFUSED: AtomicU32 = AtomicU32::new(0);
-static PRIMARY_COPY_ORPHAN_TRANSITION_FAILED: AtomicU32 = AtomicU32::new(0);
-static PRIMARY_COPY_ORPHAN_RETAINED: AtomicU32 = AtomicU32::new(0);
 
 /// Every registry name the counters above publish, so the compile-time
 /// no-truncation proof below has one list to check.
@@ -713,7 +638,7 @@ static PRIMARY_COPY_ORPHAN_RETAINED: AtomicU32 = AtomicU32::new(0);
 /// names sharing a 14-byte prefix would MERGE into one registry value — a
 /// refusal counter reading someone else's number. Same guard
 /// `diag::FaultCounter` and `native_fence.rs` use.
-const RETIREMENT_COUNTER_NAMES: [&[u8]; 32] = [
+const RETIREMENT_COUNTER_NAMES: [&[u8]; 29] = [
     b"AcOk",
     b"AcMagic",
     b"AcHwa2Rej",
@@ -749,9 +674,6 @@ const RETIREMENT_COUNTER_NAMES: [&[u8]; 32] = [
     b"OaHwa2Rej",
     b"OaHvm1Stamp",
     b"OaHvm1Rej",
-    b"CpOrRef",
-    b"CpOrFail",
-    b"CpOrKeep",
 ];
 
 const _: () = {
@@ -2531,715 +2453,6 @@ pub(crate) unsafe fn update_outer_gpuva_mapping(
     true
 }
 
-/// The Windows-supplied identity of one specific `hAllocation`, plus the
-/// geometry and layout the UMD created it with.
-///
-/// This is the *unvalidated* half. It says what Windows named and what the
-/// allocation claims about itself; it does NOT say that any of it is a legal
-/// scan-out target. Produced only by [`scanout_alloc_info`].
-///
-/// It used to be the same type as the scan-out target
-/// (`ScanoutInfo`), which meant `production_linear_scanout` returned a value
-/// whose `primary_*` fields were meaningless zeros — twice — and the programming
-/// path then juggled a `source` and a `target` whose fields were valid in
-/// different subsets, with correctness resting on the author remembering to read
-/// the address from `source`. Writing `last_primary_address.store(
-/// target.primary_address, ..)` compiled and published 0 as the displayed
-/// address, making the flip unretirable.
-#[derive(Clone, Copy)]
-pub(crate) struct WindowsPrimary {
-    pub resource_id: u32,
-    pub width: u32,
-    pub height: u32,
-    /// Row pitch the UMD laid the surface out with (bytes) — the stride
-    /// `SET_SCANOUT_BLOB` must use, NOT `width*4`. 0 if unknown.
-    pub pitch: u32,
-    /// Exact DXGI format (lossless) for resolving the virtio scan-out format.
-    pub dxgi_format: u32,
-    /// Memory-plane-0 byte offset for `SET_SCANOUT_BLOB` (0 if data starts at 0).
-    pub plane_offset: u64,
-    /// Exact Venus allocation identity used by cross-context imports.
-    pub venus_alloc_size: u64,
-    pub memory_type_index: u32,
-    /// Whether the UMD created this primary in the proven directly-scannable
-    /// shape. Kept HERE and not on the target: the programming path still
-    /// branches on it to decide whether to publish the fallback cache.
-    pub direct_scanout: bool,
-    /// Exact `PrimarySegment` paired with this hAllocation by Windows.
-    pub primary_segment: u32,
-    /// Exact `PrimaryAddress` paired with this hAllocation by Windows. The ONLY
-    /// address that may ever be published as displayed.
-    pub primary_address: u64,
-    /// Exact `DXGK_SETVIDPNSOURCEADDRESS_FLAGS::Value` supplied by Windows.
-    pub primary_flags: u32,
-    /// The presentation epoch the flip that named this allocation minted, or
-    /// `NO_LEASE` on the MMIO path. Paired with the allocation rather than read
-    /// from a global, because the pending-flip slot coalesces (ROADMAP 0ab-B).
-    pub present_epoch: u64,
-    /// The frame-completion boundary that flip took out of the mark table, or 0.
-    /// Same pairing argument as `present_epoch`, and the same reason: the single
-    /// pending-flip slot coalesces.
-    pub frame_watermark: u64,
-    /// D4b: the validated snapshot descriptor that flip carried, or `None`.
-    /// Same pairing argument again — the descriptor must travel with the exact
-    /// handle it was flipped with, not through a coalescing global. When
-    /// present, the bind paths build the `ScanoutTarget` from IT instead of
-    /// from this primary's own layout; everything else here (address, epoch,
-    /// retirement) still describes the flipped allocation.
-    pub snapshot: Option<SnapshotDescriptor>,
-}
-
-/// A scan-out surface that has been validated as legal for `SET_SCANOUT_BLOB`.
-///
-/// Private fields and exactly two constructors, both returning
-/// `Result<Self, ScanoutReject>`: [`Self::from_direct_primary`] and
-/// [`Self::adapter_linear`]. There is no way to partially initialise one, and it
-/// carries no `primary_address` — the fallback path cannot construct the type
-/// that publication needs.
-///
-/// The arm IS the constructor, so there is no `direct_scanout` flag here either.
-#[derive(Clone, Copy)]
-pub(crate) struct ScanoutTarget {
-    resource_id: u32,
-    width: u32,
-    height: u32,
-    /// Already resolved: the allocation's own pitch if it carried one, else the
-    /// same 256-byte alignment the UMD uses. Never 0.
-    pitch: u32,
-    plane_offset: u32,
-    venus_alloc_size: u64,
-    memory_type_index: u32,
-    format: ScanoutFormat,
-    /// The DXGI value this target was built from, preserved verbatim for the
-    /// fallback cache (`remember_primary_scanout`) so the published identity is
-    /// byte-identical to what it was before R507.
-    dxgi_format: u32,
-}
-
-impl ScanoutTarget {
-    /// Validate a UMD-created primary for DIRECT scan-out.
-    ///
-    /// ⚠ These checks are the guard that keeps QEMU from reading past the blob
-    /// (the undersize-guard lesson from the 38th session). They are moved
-    /// VERBATIM, saturating arithmetic included. Do not "simplify" them.
-    pub(crate) fn from_direct_primary(
-        primary: &WindowsPrimary,
-        width: u32,
-        height: u32,
-    ) -> Result<Self, ScanoutReject> {
-        let min_size = primary
-            .plane_offset
-            .saturating_add((primary.pitch as u64).saturating_mul(height as u64));
-        let valid = primary.pitch >= width.saturating_mul(4)
-            && primary.pitch & 3 == 0
-            && primary.plane_offset <= u32::MAX as u64
-            && primary.venus_alloc_size >= min_size
-            && ScanoutFormat::from_dxgi(primary.dxgi_format).is_some();
-        if !valid {
-            return Err(ScanoutReject::Layout);
-        }
-        Self::new(
-            primary.resource_id,
-            width,
-            height,
-            primary.pitch,
-            primary.plane_offset,
-            primary.venus_alloc_size,
-            primary.memory_type_index,
-            primary.dxgi_format,
-        )
-    }
-
-    /// Validate a D4b snapshot descriptor as the bind target (beside
-    /// [`Self::from_direct_primary`], same validation, same
-    /// `fill_set_scanout_blob` inputs: resid/width/height/format/stride/
-    /// offset).
-    ///
-    /// The layout predicate is the SHARED one in
-    /// `helios_kmd_logic::snapshot_bind` — the identical arithmetic the direct
-    /// arm spells inline, so the undersize guard cannot be restated here in a
-    /// weakened form. The descriptor was already validated at the Present DDI;
-    /// re-running it costs a few compares and keeps this constructor
-    /// impossible to reach with an unchecked layout.
-    ///
-    /// `memory_type_index` is 0: the target's memory type is only ever
-    /// consumed by the LINEAR-fallback cache (`remember_primary_scanout`),
-    /// which a snapshot target never feeds — the snapshot has no cross-process
-    /// import identity to remember.
-    pub(crate) fn from_snapshot_descriptor(
-        snap: &SnapshotDescriptor,
-    ) -> Result<Self, ScanoutReject> {
-        if helios_kmd_logic::snapshot_bind::validate_layout(snap).is_err() {
-            return Err(ScanoutReject::Layout);
-        }
-        Self::new(
-            snap.resource_id,
-            snap.width,
-            snap.height,
-            snap.pitch,
-            snap.plane_offset,
-            snap.venus_alloc_size,
-            0,
-            snap.dxgi_format,
-        )
-    }
-
-    /// Build the adapter-owned LINEAR fallback target.
-    ///
-    /// Same pitch resolution as the direct arm so the two behave identically,
-    /// even though the LINEAR pitch is never 0 in practice.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn adapter_linear(
-        resource_id: u32,
-        width: u32,
-        height: u32,
-        pitch: u32,
-        plane_offset: u64,
-        venus_alloc_size: u64,
-        memory_type_index: u32,
-        dxgi_format: u32,
-    ) -> Result<Self, ScanoutReject> {
-        Self::new(
-            resource_id,
-            width,
-            height,
-            pitch,
-            plane_offset,
-            venus_alloc_size,
-            memory_type_index,
-            dxgi_format,
-        )
-    }
-
-    /// The shared tail of both constructors: resolve the pitch, then resolve the
-    /// wire format.
-    ///
-    /// Order matters and matches the pre-R507 code: the pitch substitution ran
-    /// AFTER the direct arm's checks (which is why `from_direct_primary`
-    /// validates against the RAW pitch), and the format conversion ran after
-    /// both.
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        resource_id: u32,
-        width: u32,
-        height: u32,
-        pitch: u32,
-        plane_offset: u64,
-        venus_alloc_size: u64,
-        memory_type_index: u32,
-        dxgi_format: u32,
-    ) -> Result<Self, ScanoutReject> {
-        // Stride MUST match the UMD's actual row pitch (`cross_adapter_pitch`,
-        // 256-aligned), NOT `width*4`: for 1896 wide that is 7680 vs 7584, and a
-        // wrong stride shears the scan-out so the host reads each row 96 bytes
-        // short. Fall back to the same alignment the UMD uses if the allocation
-        // carried no pitch. R1007: one resolver, shared with OpenAllocation.
-        let pitch = RowPitch::linear(pitch, width).get();
-        // Resolve the scan-out format from the creator's EXACT DXGI format (the
-        // KMD D3DDDIFORMAT is lossy — B8G8R8A8 and R8G8B8A8 both collapse to
-        // A8R8G8B8). The legacy-zero arm is what the converter has always
-        // accepted; the direct arm's stricter validator already ran above.
-        let Some(format) = ScanoutFormat::from_dxgi_or_legacy_zero(dxgi_format) else {
-            return Err(ScanoutReject::Format(dxgi_format));
-        };
-        Ok(Self {
-            resource_id,
-            width,
-            height,
-            pitch,
-            plane_offset: plane_offset as u32,
-            venus_alloc_size,
-            memory_type_index,
-            format,
-            dxgi_format,
-        })
-    }
-
-    pub(crate) fn resource_id(&self) -> u32 {
-        self.resource_id
-    }
-    pub(crate) fn width(&self) -> u32 {
-        self.width
-    }
-    pub(crate) fn height(&self) -> u32 {
-        self.height
-    }
-    pub(crate) fn pitch(&self) -> u32 {
-        self.pitch
-    }
-    pub(crate) fn plane_offset(&self) -> u32 {
-        self.plane_offset
-    }
-    pub(crate) fn venus_alloc_size(&self) -> u64 {
-        self.venus_alloc_size
-    }
-    pub(crate) fn memory_type_index(&self) -> u32 {
-        self.memory_type_index
-    }
-    pub(crate) fn format(&self) -> ScanoutFormat {
-        self.format
-    }
-    pub(crate) fn dxgi_format(&self) -> u32 {
-        self.dxgi_format
-    }
-}
-
-/// Preserve the exact segment, address, flags, presentation epoch, frame
-/// boundary and D4b snapshot descriptor Windows (or the DMA-flip record)
-/// paired with a SetVidPn allocation.
-///
-/// `present_epoch` is `NO_LEASE` on the MMIO path, where dxgkrnl retires the
-/// flip before calling us and there is nothing to gate, and the minted epoch on
-/// the DMA-buffer flip contract. `frame_watermark` is 0 on the MMIO path for the
-/// matching reason: that path has no earlier capture point to carry from, so its
-/// bind samples the boundary exactly as it always has. `snapshot` is `None`
-/// there too (the desktop always binds the allocation itself).
-///
-/// All are stored on EVERY call, including with 0/`None`: this is the only
-/// writer, so an unconditional store is what guarantees a bind cannot read a
-/// value left behind by an older flip of the same allocation.
-///
-/// SAFETY: `h` is the live KMD allocation handle supplied by dxgkrnl to
-/// `DxgkDdiSetVidPnSourceAddress`, or the one this driver copied into the
-/// kernel-only DMA private data for a flip.
-pub(crate) unsafe fn set_vidpn_primary_address(
-    h: HANDLE,
-    primary_segment: u32,
-    primary_address: u64,
-    primary_flags: u32,
-    present_epoch: u64,
-    frame_watermark: u64,
-    snapshot: Option<SnapshotDescriptor>,
-) -> bool {
-    if h.is_null() {
-        return false;
-    }
-    let ctx = unsafe { &*(h as *const AllocationContext) };
-    if ctx.magic != ALLOCATION_CTX_MAGIC {
-        return false;
-    }
-    ctx.vidpn_primary_segment
-        .store(primary_segment, Ordering::Relaxed);
-    ctx.vidpn_primary_flags
-        .store(primary_flags, Ordering::Relaxed);
-    ctx.vidpn_present_epoch
-        .store(present_epoch, Ordering::Relaxed);
-    ctx.vidpn_frame_watermark
-        .store(frame_watermark, Ordering::Relaxed);
-    // The snapshot stamp, resid LAST among its fields so a reader that races
-    // this store observes either the old descriptor, the new one, or a mix of
-    // two VALIDATED descriptors — never a nonzero resid paired with wholly
-    // unwritten geometry from a zeroed stamp.
-    let snap = snapshot.unwrap_or(SnapshotDescriptor {
-        resource_id: 0,
-        width: 0,
-        height: 0,
-        pitch: 0,
-        dxgi_format: 0,
-        plane_offset: 0,
-        venus_alloc_size: 0,
-        memory_type_index: 0,
-        purpose: 0,
-    });
-    ctx.vidpn_snap_width.store(snap.width, Ordering::Relaxed);
-    ctx.vidpn_snap_height.store(snap.height, Ordering::Relaxed);
-    ctx.vidpn_snap_pitch.store(snap.pitch, Ordering::Relaxed);
-    ctx.vidpn_snap_dxgi_format
-        .store(snap.dxgi_format, Ordering::Relaxed);
-    ctx.vidpn_snap_plane_offset
-        .store(snap.plane_offset as u32, Ordering::Relaxed);
-    ctx.vidpn_snap_alloc_size
-        .store(snap.venus_alloc_size, Ordering::Relaxed);
-    ctx.vidpn_snap_resid
-        .store(snap.resource_id, Ordering::Relaxed);
-    ctx.vidpn_primary_address
-        .store(primary_address, Ordering::Release);
-    true
-}
-
-/// The venus resource behind an `hAllocation`, or 0 for a null/foreign handle or
-/// an unbacked allocation.
-///
-/// Exists so the DISPATCH-level flip arm can name the buffer whose frame mark it
-/// must take without building a whole [`WindowsPrimary`] for one field.
-///
-/// # Safety
-/// Same contract as [`scanout_alloc_info`].
-pub(crate) unsafe fn allocation_resource_id(h: HANDLE) -> u32 {
-    if h.is_null() {
-        return 0;
-    }
-    let ctx = unsafe { &*(h as *const AllocationContext) };
-    if ctx.magic != ALLOCATION_CTX_MAGIC {
-        return 0;
-    }
-    ctx.resource_id()
-}
-
-/// The allocation generation and record kind held by one KMD allocation object.
-///
-/// The generation is the value this unit minted at create and stamped into the
-/// descriptor it wrote back; the kind is the `HELIOS_HWA2_KIND_*` it was created
-/// with, or [`ALLOC_KIND_HVM1`] / [`ALLOC_KIND_HOC1`]. `None` for a null or
-/// foreign handle.
-///
-/// # ⛔ NOT K6's READER — that is [`open_allocation_identity`]
-///
-/// This answers what the KERNEL OBJECT holds, keyed on the create-time
-/// `hAllocation`. Render and Patch never see that handle:
-/// `DXGK_ALLOCATIONLIST::hDeviceSpecificAllocation` is the OPEN handle
-/// (`d3dkmddi.h`), so a K6 check written against this accessor would compare the
-/// create-minted generation with the OPEN-minted one the guest actually holds
-/// and refuse every use record. The doc here used to name K6 as the reader; that
-/// was written before the create-time write was measured to go nowhere
-/// (`FINDINGS.md` F11), and it would have cost K6 a whole debugging round.
-///
-/// ⛔ It answers "what generation does this object hold", NEVER "which object has
-/// this generation". §10.3:1049 forbids the second reading and nothing that
-/// resolves an allocation *from* a generation may be added beside it.
-///
-/// # Safety
-/// Same contract as [`scanout_alloc_info`]: `h` is either null or an
-/// `hAllocation` this driver returned from `DxgkDdiCreateAllocation` and
-/// dxgkrnl has round-tripped unmodified.
-#[allow(dead_code)] // reader is K6 (`ddi/native_render.rs`); see the note above.
-pub(crate) unsafe fn allocation_identity(h: HANDLE) -> Option<(u64, u32)> {
-    if h.is_null() {
-        return None;
-    }
-    let ctx = unsafe { &*(h as *const AllocationContext) };
-    if ctx.magic != ALLOCATION_CTX_MAGIC {
-        return None;
-    }
-    Some((ctx.generation, ctx.kind))
-}
-
-/// Resolve a primary allocation's `hAllocation` (the CreateAllocation handle
-/// dxgkrnl passes in `SetVidPnSourceAddress`) to its scan-out geometry + layout
-/// for `SET_SCANOUT_BLOB`. Returns `None` for a null/foreign handle or an
-/// unbacked allocation. SAFETY: same contract as [`paging_alloc_info`].
-pub(crate) unsafe fn scanout_alloc_info(h: HANDLE) -> Option<WindowsPrimary> {
-    if h.is_null() {
-        return None;
-    }
-    let ctx = unsafe { &*(h as *const AllocationContext) };
-    if ctx.magic != ALLOCATION_CTX_MAGIC || ctx.resource_id() == 0 {
-        return None;
-    }
-    // Acquire on the address pairs with the Release in
-    // `set_vidpn_primary_address`, so every companion field stored before it —
-    // the presentation epoch, the watermark, and the D4b snapshot stamp — is
-    // visible here. Loaded FIRST for that reason.
-    let primary_address = ctx.vidpn_primary_address.load(Ordering::Acquire);
-    let snap_resid = ctx.vidpn_snap_resid.load(Ordering::Relaxed);
-    let snapshot = if snap_resid != 0 {
-        Some(SnapshotDescriptor {
-            resource_id: snap_resid,
-            width: ctx.vidpn_snap_width.load(Ordering::Relaxed),
-            height: ctx.vidpn_snap_height.load(Ordering::Relaxed),
-            pitch: ctx.vidpn_snap_pitch.load(Ordering::Relaxed),
-            dxgi_format: ctx.vidpn_snap_dxgi_format.load(Ordering::Relaxed),
-            plane_offset: ctx.vidpn_snap_plane_offset.load(Ordering::Relaxed) as u64,
-            venus_alloc_size: ctx.vidpn_snap_alloc_size.load(Ordering::Relaxed),
-            memory_type_index: 0,
-            purpose: 0,
-        })
-    } else {
-        None
-    };
-    Some(WindowsPrimary {
-        resource_id: ctx.resource_id(),
-        width: ctx.width,
-        height: ctx.height,
-        pitch: ctx.pitch,
-        dxgi_format: ctx.dxgi_format,
-        plane_offset: ctx.plane_offset,
-        venus_alloc_size: ctx.venus_alloc_size,
-        memory_type_index: ctx.memory_type_index,
-        direct_scanout: ctx.direct_scanout,
-        primary_segment: ctx.vidpn_primary_segment.load(Ordering::Relaxed),
-        primary_address,
-        primary_flags: ctx.vidpn_primary_flags.load(Ordering::Relaxed),
-        present_epoch: ctx.vidpn_present_epoch.load(Ordering::Relaxed),
-        frame_watermark: ctx.vidpn_frame_watermark.load(Ordering::Relaxed),
-        snapshot,
-    })
-}
-
-/// Rebuild the published [`PreparedImageCopy`] snapshot from its atomic mirror.
-///
-/// The atomics stay raw `u64` — that is what an `AtomicU64` can hold — so this
-/// is the ONE place raw words become typed handles, and it is a *validating*
-/// restore: a snapshot missing any of the three handles it cannot function
-/// without is no snapshot at all and reads as `None`. Before the handle
-/// newtypes those three were `!= 0` tests scattered across the two consumers
-/// (`submit_prepared_image_copy` had two of them; the third had none).
-///
-/// `scanout_copy_command_buffer_id` is the publish word: acquiring a nonzero
-/// value there means the eight Relaxed payload stores that preceded its Release
-/// store are visible, so the rest of the snapshot is coherent.
-fn cached_prepared_copy(
-    ctx: &AllocationContext,
-) -> Option<crate::virtio::venus::PreparedImageCopy> {
-    use crate::virtio::venus::{VkCommandBufferId, VkCommandPoolId, VkDeviceMemoryId, VkImageId};
-
-    let command_buffer_id =
-        VkCommandBufferId::from_raw(ctx.scanout_copy_command_buffer_id.load(Ordering::Acquire))?;
-    let command_pool_id =
-        VkCommandPoolId::from_raw(ctx.scanout_copy_pool_id.load(Ordering::Relaxed))?;
-    let source_image_id = VkImageId::from_raw(ctx.scanout_copy_image_id.load(Ordering::Relaxed))?;
-    let target_image_id =
-        VkImageId::from_raw(ctx.scanout_copy_target_image_id.load(Ordering::Relaxed))?;
-    let owns_source_alias = ctx.scanout_copy_owns_source_alias.load(Ordering::Relaxed) != 0;
-    Some(crate::virtio::venus::PreparedImageCopy {
-        owns_source_alias,
-        source_resource_id: if owns_source_alias {
-            ctx.resource_id()
-        } else {
-            0
-        },
-        source_image_id,
-        source_memory_id: VkDeviceMemoryId::from_raw(
-            ctx.scanout_copy_memory_id.load(Ordering::Relaxed),
-        ),
-        conversion_image_id: VkImageId::from_raw(
-            ctx.scanout_copy_conversion_image_id.load(Ordering::Relaxed),
-        ),
-        conversion_memory_id: VkDeviceMemoryId::from_raw(
-            ctx.scanout_copy_conversion_memory_id
-                .load(Ordering::Relaxed),
-        ),
-        conversion_init_pool_id: VkCommandPoolId::from_raw(
-            ctx.scanout_copy_conversion_init_pool_id
-                .load(Ordering::Relaxed),
-        ),
-        command_pool_id,
-        command_buffer_id,
-        target_image_id,
-        width: ctx.width,
-        height: ctx.height,
-    })
-}
-
-/// `None` stores as 0, the value the mirror has always used for "absent".
-fn raw<T: Into<u64>>(id: Option<T>) -> u64 {
-    id.map_or(0, Into::into)
-}
-
-fn publish_prepared_copy(ctx: &AllocationContext, copy: &crate::virtio::venus::PreparedImageCopy) {
-    // command_buffer_id is the publish word. A reader that acquires a nonzero
-    // command id sees one coherent immutable PreparedImageCopy snapshot.
-    ctx.scanout_copy_owns_source_alias
-        .store(copy.owns_source_alias as u32, Ordering::Relaxed);
-    ctx.scanout_copy_image_id
-        .store(copy.source_image_id.get(), Ordering::Relaxed);
-    ctx.scanout_copy_memory_id
-        .store(raw(copy.source_memory_id), Ordering::Relaxed);
-    ctx.scanout_copy_conversion_image_id
-        .store(raw(copy.conversion_image_id), Ordering::Relaxed);
-    ctx.scanout_copy_conversion_memory_id
-        .store(raw(copy.conversion_memory_id), Ordering::Relaxed);
-    ctx.scanout_copy_conversion_init_pool_id
-        .store(raw(copy.conversion_init_pool_id), Ordering::Relaxed);
-    ctx.scanout_copy_pool_id
-        .store(copy.command_pool_id.get(), Ordering::Relaxed);
-    ctx.scanout_copy_target_image_id
-        .store(copy.target_image_id.get(), Ordering::Relaxed);
-    ctx.scanout_copy_command_buffer_id
-        .store(copy.command_buffer_id.get(), Ordering::Release);
-}
-
-/// The exact mirror of [`publish_prepared_copy`]: payload words Relaxed FIRST,
-/// then the publish word with Release.
-///
-/// The clear used to run in the opposite order — publish word first, payload
-/// after — so between the two a reader that acquired a *stale-nonzero* publish
-/// word could read half-cleared payload. That reader is not constructible
-/// today: the scanout-lifecycle mutex orders every access, and `take`-style
-/// readers hold it for their whole critical section. This removes a trap rather
-/// than fixing a race, and the trap is real — four call sites can each mutate
-/// these ten words, so any new writer outside the mutex would tear the slot.
-fn clear_prepared_copy(ctx: &AllocationContext) {
-    ctx.scanout_copy_last_fence.store(0, Ordering::Relaxed);
-    ctx.scanout_copy_target_image_id.store(0, Ordering::Relaxed);
-    ctx.scanout_copy_pool_id.store(0, Ordering::Relaxed);
-    ctx.scanout_copy_conversion_init_pool_id
-        .store(0, Ordering::Relaxed);
-    ctx.scanout_copy_conversion_memory_id
-        .store(0, Ordering::Relaxed);
-    ctx.scanout_copy_conversion_image_id
-        .store(0, Ordering::Relaxed);
-    ctx.scanout_copy_memory_id.store(0, Ordering::Relaxed);
-    ctx.scanout_copy_image_id.store(0, Ordering::Relaxed);
-    ctx.scanout_copy_owns_source_alias
-        .store(0, Ordering::Relaxed);
-    // The publish word LAST, with Release — the mirror of publish's
-    // eight-Relaxed-then-one-Release protocol.
-    ctx.scanout_copy_command_buffer_id
-        .store(0, Ordering::Release);
-}
-
-fn orphaned_copy_requires_backing_retain(ctx: &AllocationContext) -> bool {
-    let orphaned = ctx.scanout_copy_orphaned.load(Ordering::Acquire) != 0;
-    if orphaned {
-        bump(&PRIMARY_COPY_ORPHAN_RETAINED, b"CpOrKeep");
-    }
-    orphaned
-}
-
-/// Submit a GPU copy from the exact allocation selected by
-/// `SetVidPnSourceAddress` into the durable adapter-owned LINEAR scanout image.
-/// Setup (external-memory import + command recording) happens once per WDDM
-/// allocation; the frame path only queues the reusable command buffer and
-/// returns its ring-1 GPU-completion fence.
-///
-/// Takes the `WindowsPrimary` rather than a loose `(handle, address)` pair, so
-/// the address it hands the copy is provably the one Windows paired with THIS
-/// allocation instead of whatever the caller passed alongside the handle.
-///
-/// SAFETY: `h` is the live `hAllocation` passed by dxgkrnl to
-/// SetVidPnSourceAddress, and `primary` is the identity resolved from that same
-/// handle. PASSIVE_LEVEL only (the Venus client mutex may wait).
-pub(crate) unsafe fn submit_primary_scanout_copy(
-    adapter: &AdapterContext,
-    lock: &ScanoutGuard<'_>,
-    h: HANDLE,
-    primary: &WindowsPrimary,
-    target_image_id: u64,
-    width: u32,
-    height: u32,
-    ticket: crate::adapter::ProgrammingTicket,
-) -> Result<u64, NTSTATUS> {
-    let primary_address = primary.primary_address;
-    if h.is_null() || target_image_id == 0 || width == 0 || height == 0 {
-        return Err(STATUS_INVALID_PARAMETER);
-    }
-    let ctx = unsafe { &*(h as *const AllocationContext) };
-    if ctx.magic != ALLOCATION_CTX_MAGIC
-        || ctx.resource_id() == 0
-        || ctx.width != width
-        || ctx.height != height
-    {
-        crate::diag::record_named_bytes(b"CpCpy", 0xE1);
-        return Err(STATUS_INVALID_PARAMETER);
-    }
-    if ScanoutFormat::from_dxgi(ctx.dxgi_format).is_none() {
-        crate::diag::record_named_bytes(b"CpFmt", ctx.dxgi_format);
-        crate::diag::record_named_bytes(b"CpCpy", 0xE2);
-        return Err(STATUS_NOT_SUPPORTED);
-    }
-    if ctx.scanout_copy_orphaned.load(Ordering::Acquire) != 0 {
-        bump(&PRIMARY_COPY_ORPHAN_REFUSED, b"CpOrRef");
-        crate::diag::record_named_bytes(b"CpCpy", 0xE3);
-        return Err(STATUS_DEVICE_NOT_READY);
-    }
-
-    // Through the scanout token: the second of the two Venus acquisitions that
-    // run under `scanout_mutex` (see `ScanoutGuard`).
-    let mut orphan_refused = false;
-    let mut orphan_transition_failed = false;
-    let result = lock.with_venus_client(|client| {
-        // Retarget: a cached copy baked against a *different* destination image
-        // is destroyed and rebuilt. Matching on the option directly replaces a
-        // map-then-unwrap_or guard followed by a take-then-unwrap — two
-        // statements that had to agree for the unwrap to be sound. Note the
-        // cache-HIT path must fall through with the value still in place; a bare
-        // `if let Some(old) = prepared.take()` would destroy it every frame.
-        let prepared = match cached_prepared_copy(ctx) {
-            Some(old)
-                if Some(old.target_image_id)
-                    != crate::virtio::venus::VkImageId::from_raw(target_image_id) =>
-            {
-                if ctx
-                    .scanout_copy_orphaned
-                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-                {
-                    orphan_refused = true;
-                    return Err(crate::virtio::VirtioError::DeviceError);
-                }
-                // Poison before withdrawing: a partial destructor cannot be retried,
-                // and DestroyAllocation must retain its backing for context teardown.
-                clear_prepared_copy(ctx);
-                match client.destroy_prepared_image_copy(adapter, old) {
-                    Ok(()) => {
-                        ctx.scanout_copy_orphaned.store(0, Ordering::Release);
-                        None
-                    }
-                    Err(e) => {
-                        orphan_transition_failed = true;
-                        return Err(e);
-                    }
-                }
-            }
-            other => other,
-        };
-        let copy = match prepared {
-            Some(copy) => copy,
-            None => {
-                let copy = if ctx.venus_image_id != 0 {
-                    client.prepare_existing_linear_source_copy(
-                        adapter,
-                        ctx.venus_image_id,
-                        width,
-                        height,
-                        ctx.dxgi_format,
-                        target_image_id,
-                    )?
-                } else {
-                    client.prepare_optimal_scanout_copy(
-                        adapter,
-                        ctx.resource_id(),
-                        ctx.venus_alloc_size,
-                        ctx.memory_type_index,
-                        width,
-                        height,
-                        ctx.dxgi_format,
-                        ctx.bind_flags,
-                        target_image_id,
-                    )?
-                };
-                publish_prepared_copy(ctx, &copy);
-                copy
-            }
-        };
-        let fence = client.submit_prepared_image_copy(adapter, &copy, primary_address, ticket)?;
-        ctx.scanout_copy_last_fence.store(fence, Ordering::Release);
-        Ok::<u64, crate::virtio::VirtioError>(fence)
-    });
-
-    if orphan_refused {
-        bump(&PRIMARY_COPY_ORPHAN_REFUSED, b"CpOrRef");
-    }
-    if orphan_transition_failed {
-        bump(&PRIMARY_COPY_ORPHAN_TRANSITION_FAILED, b"CpOrFail");
-    }
-
-    match result {
-        Ok(Ok(fence)) => {
-            let n = PRIMARY_COPY_SUBMIT_COUNT
-                .fetch_add(1, Ordering::Relaxed)
-                .wrapping_add(1);
-            if n == 1 || n % 600 == 0 {
-                crate::diag::record_named_bytes(b"CpCpy", 1);
-                crate::diag::record_named_bytes(b"CpFnc", fence as u32);
-                crate::diag::record_named_bytes(b"CpCnt", n);
-            }
-            Ok(fence)
-        }
-        Ok(Err(_)) => {
-            crate::diag::record_named_bytes(b"CpCpy", 0xE3);
-            Err(STATUS_DEVICE_NOT_READY)
-        }
-        Err(_) => {
-            crate::diag::record_named_bytes(b"CpCpy", 0xE4);
-            Err(STATUS_DEVICE_NOT_READY)
-        }
-    }
-}
-
-/// Record (or clear, with [`BAR_UNPLACED`]) an allocation's VidMm-assigned BAR
-/// SegmentAddress. SAFETY: same contract as [`paging_alloc_info`].
 pub(crate) unsafe fn set_bar_placement(h: HANDLE, offset: u64) {
     if h.is_null() {
         return;
@@ -3298,11 +2511,6 @@ fn round_up_page(n: SIZE_T) -> SIZE_T {
 /// venus resid ⇒ shared (sync problem), different ⇒ the surfaces never alias and
 /// the composed pixels are never copied into what the IDD reads.
 static ALLOC_EVENT_SEQ: AtomicU32 = AtomicU32::new(0);
-/// Successful exact-primary copy submissions. Fixed registry breadcrumbs are
-/// throttled from this counter; writing the registry per frame would itself
-/// throttle the display path.
-static PRIMARY_COPY_SUBMIT_COUNT: AtomicU32 = AtomicU32::new(0);
-
 /// Ticks the create/open breadcrumb throttle (R317 / k-alloc-05). The ring
 /// itself stays 8 slots; what changes is how often it reaches the registry.
 static ALLOC_EVENT_TICKS: AtomicU32 = AtomicU32::new(0);
@@ -3718,52 +2926,15 @@ unsafe fn destroy_allocation_ctx(
     // Present-time mirror's `contains(resource_id)` therefore cannot answer true
     // for the wrong surface.
     // Retire the exact Windows/KMD allocation identity before any backing
-    // resource, Venus image, or cached copy can be torn down. If QEMU cannot
-    // confirm resource_id=0 scanout disable, retain every host object until
-    // device teardown rather than leave scanout 0 pointing at an unref'd blob.
-    let scanout_retired = if crate::virtio::KMD_D2_OWNER_ENABLED {
-        super::direct_scanout::retire_allocation(
-            passive,
-            adapter,
-            allocation_handle as HANDLE,
-            ctx.generation,
-            ctx.resource_id(),
-        )
-    } else {
-        adapter.retire_scanout_allocation(passive, allocation_handle, ctx.resource_id())
-    };
-    if !scanout_retired {
-        let _ = orphaned_copy_requires_backing_retain(&ctx);
-        drop(ctx);
-        return;
-    }
-    // A prepared scanout copy owns a command buffer which may still be queued
-    // through the outer async SUBMIT_3D. Drain that GPU-completion fence and
-    // tear the prepared objects down BEFORE touching the allocation's resource,
-    // image, or memory. On an ambiguous drain failure, leak the allocation's
-    // host objects to Venus-context teardown rather than use-after-free them.
-    if let Some(copy) = cached_prepared_copy(&ctx) {
-        // The drain fence lives on the VenusClient now (R609). This read used to
-        // load ctx.scanout_copy_last_fence with Acquire BEFORE acquiring the
-        // venus mutex, while the only writer performed its Release store INSIDE
-        // it — so a concurrent SetVidPnSourceAddress submit could leave this
-        // thread with a stale-or-zero fence and skip the mandatory drain.
-        let drained = adapter
-            .with_venus_client(passive, |client| {
-                client.destroy_prepared_image_copy(adapter, copy)
-            })
-            .map(|r| r.is_ok())
-            .unwrap_or(false);
-        if !drained {
-            crate::diag::record_named_bytes(b"CpDrn", 0xE);
-            let _ = orphaned_copy_requires_backing_retain(&ctx);
-            drop(ctx);
-            return;
-        }
-        clear_prepared_copy(&ctx);
-        crate::diag::record_named_bytes(b"CpDrn", 1);
-    }
-    if orphaned_copy_requires_backing_retain(&ctx) {
+    // resource or Venus image can be torn down. Ambiguous plane retirement
+    // retains the backing until the verified reset barrier.
+    if !super::direct_scanout::retire_allocation(
+        passive,
+        adapter,
+        allocation_handle as HANDLE,
+        ctx.generation,
+        ctx.resource_id(),
+    ) {
         drop(ctx);
         return;
     }
@@ -3772,118 +2943,43 @@ unsafe fn destroy_allocation_ctx(
     // resources. Drain the cache before any one backing resource can be
     // detached/unref'd. The cache is intentionally one ownership unit because
     // several swapchain sources may share the same DWM destination.
-    let windowed_terminal = adapter.with_scanout_lifecycle(passive, |lock| {
-        let present_drained = lock
-            .with_venus_client(|client| {
-                // Undispatched requests have no host reader and cancel now.
-                // A dispatched request stays pinned in the FIFO until its
-                // exact ring response; cache release below drains that fence
-                // before the backing can be destroyed.
-                let _ = adapter.with_virtio(|v| {
-                    v.cancel_windowed_blt_for_resource(adapter, ctx.resource_id())
-                });
-                client.release_present_blits_for_resource(adapter, ctx.resource_id())
-            })
+    let present_drained = adapter.with_scanout_lifecycle(passive, |lock| {
+        lock.with_venus_client(|client| {
+            client.release_present_blits_for_resource(adapter, ctx.resource_id())
+        })
             .map(|result| result.is_ok())
-            .unwrap_or(false);
-        if !present_drained {
-            return false;
-        }
-
-        // Keep the scanout lifecycle lock from cancellation through the
-        // exact reader terminal.  Releasing it between these phases would
-        // let the HPD worker dispatch a request for this resource after
-        // the cache drain but before the backing is retained/destroyed.
-        // `with_venus_client` has returned before this virtio step, so the
-        // established scanout -> Venus ordering is not extended.
-        adapter
-            .with_virtio(|v| {
-                v.finish_windowed_blt_teardown_for_resource(adapter, ctx.resource_id())
-            })
             .unwrap_or(false)
     });
-    if !windowed_terminal {
+    if !present_drained {
         crate::diag::record_named_bytes(b"PBDrn", 0xE);
-        // A matching ring-1 command still owns the source or destination.
         // Retain all backing state until context teardown rather than UAF it.
         drop(ctx);
         return;
     }
 
-    // A DWM import of the adapter-owned LINEAR target can acquire a transient
-    // WDDM AllocationContext carrying the same resource id.  That allocation
-    // is only an importer: destroying it must not clear, detach, unref, or
-    // destroy the adapter-owned scanout image/memory.
-    let adapter_owned_scanout = ctx.resource_id() != 0
-        && adapter.dedicated_scanout_resource.load(Ordering::Acquire) == ctx.resource_id();
-    if ctx.resource_id() != 0 && !adapter_owned_scanout {
-        adapter.forget_primary_scanout(ctx.resource_id());
-    }
-    // `ctx.owns_resource` used to gate this arm. It is GONE: it was false only
-    // for a non-owning `AdoptedUmdResource`, and with adoption deleted the KMD
-    // creates every backing it names, so the field was a constant `true` for
-    // every reachable arm. `resource_id != 0` is the surviving, honest test —
-    // an HOC1 pool and a failed backing both have none.
-    if ctx.resource_id() != 0 && !adapter_owned_scanout {
-        // Drop the owner-0 tracking slot (registered at CreateAllocation, or
-        // re-owned to the allocation at adopt), unmapping the GDI executor's
-        // host-visible mapping if one is live.
-        // `forget_allocation_blob` already OWNS the unmap decision. The
-        // fallback that used to sit here was gated on `ctx.mapped`, whose doc
-        // claimed "true once RESOURCE_MAP_BLOB has succeeded" -- but its only
-        // writer set it `false`, so the branch never ran and the doc described
-        // a state the field could not reach. T6/R915.
-        let _ = crate::virtio::ctrl::forget_allocation_blob(passive, adapter, ctx.resource_id());
-        // One guarded teardown path for created AND adopted resources. The old
-        // adopted arm unref'd unconditionally, which double-freed resources
-        // another path had already reclaimed — QEMU's "virgl_cmd_resource_unref:
-        // resource does not exist ×9" at the 2026-07-03 boot-#3 dwm teardown.
-        if crate::virtio::KMD_D2_OWNER_ENABLED {
-            // OwnerTable is the sole resource/backing owner in this arm. The
-            // allocation wrapper carries only immutable observation fields;
-            // terminal UNREF extracts and runs the exact image/memory finalizer
-            // outside the owner lock. An ambiguous detach or unref retains the
-            // row and its backing until verified physical reset.
-            if crate::virtio::ctrl::ctx_detach_resource(
+    if ctx.resource_id() != 0 {
+        // OwnerTable is the sole resource/backing owner. Terminal UNREF
+        // extracts and runs the exact image/memory finalizer outside the owner
+        // lock; an ambiguous detach or unref retains the row until reset.
+        let _ = crate::virtio::ctrl::forget_allocation_blob(
+            passive,
+            adapter,
+            ctx.resource_id(),
+        );
+        if crate::virtio::ctrl::ctx_detach_resource(
+            passive,
+            adapter,
+            ctx.ctx_id,
+            ctx.resource_id(),
+        )
+        .is_ok()
+        {
+            let _ = crate::virtio::ctrl::resource_unref(
                 passive,
                 adapter,
-                ctx.ctx_id,
                 ctx.resource_id(),
-            )
-            .is_ok()
-            {
-                let _ = crate::virtio::ctrl::resource_unref(passive, adapter, ctx.resource_id());
-            }
-        } else {
-            let first_teardown = adapter
-                .with_virtio(|v| v.take_live_resource(ctx.resource_id()))
-                .unwrap_or(false);
-            if first_teardown {
-                let _ = crate::virtio::ctrl::ctx_detach_resource(
-                    passive,
-                    adapter,
-                    ctx.ctx_id,
-                    ctx.resource_id(),
-                );
-                let _ = crate::virtio::ctrl::resource_unref(passive, adapter, ctx.resource_id());
-            }
-            if ctx.venus_image_id != 0 {
-                let _ = adapter
-                    .with_venus_client(passive, |c| c.destroy_image(adapter, ctx.venus_image_id));
-            }
-            if ctx.venus_memory_id != 0 {
-                // KMD-backed standard allocation: after the RESOURCE teardown above
-                // (the host blob holds a reference into the memory object),
-                // vkFreeMemory the venus memory. Best-effort: if the venus client
-                // is already gone (device teardown), the host context destruction
-                // reclaims everything anyway.
-                let _ = adapter.with_venus_client(passive, |c| {
-                    c.free_memory_blob(adapter, ctx.venus_memory_id)
-                });
-            }
+            );
         }
-    } else if adapter_owned_scanout {
-        crate::diag::record_named_bytes(b"CpKeep", ctx.resource_id());
     }
     drop(ctx);
 }
@@ -5408,29 +4504,6 @@ unsafe fn create_one(
         final_hwa2: admitted.final_hwa2,
         venus_memory_id: backing.map_or(0, |b| b.venus_memory_id),
         venus_image_id: backing.map_or(0, |b| b.venus_image_id),
-        scanout_copy_image_id: core::sync::atomic::AtomicU64::new(0),
-        scanout_copy_memory_id: core::sync::atomic::AtomicU64::new(0),
-        scanout_copy_conversion_image_id: core::sync::atomic::AtomicU64::new(0),
-        scanout_copy_conversion_memory_id: core::sync::atomic::AtomicU64::new(0),
-        scanout_copy_conversion_init_pool_id: core::sync::atomic::AtomicU64::new(0),
-        scanout_copy_pool_id: core::sync::atomic::AtomicU64::new(0),
-        scanout_copy_command_buffer_id: core::sync::atomic::AtomicU64::new(0),
-        scanout_copy_target_image_id: core::sync::atomic::AtomicU64::new(0),
-        scanout_copy_last_fence: core::sync::atomic::AtomicU64::new(0),
-        scanout_copy_owns_source_alias: AtomicU32::new(0),
-        scanout_copy_orphaned: AtomicU32::new(0),
-        vidpn_primary_address: AtomicU64::new(0),
-        vidpn_primary_segment: AtomicU32::new(0),
-        vidpn_primary_flags: AtomicU32::new(0),
-        vidpn_present_epoch: AtomicU64::new(helios_kmd_logic::scanout_lease::NO_LEASE),
-        vidpn_frame_watermark: AtomicU64::new(0),
-        vidpn_snap_resid: AtomicU32::new(0),
-        vidpn_snap_width: AtomicU32::new(0),
-        vidpn_snap_height: AtomicU32::new(0),
-        vidpn_snap_pitch: AtomicU32::new(0),
-        vidpn_snap_dxgi_format: AtomicU32::new(0),
-        vidpn_snap_plane_offset: AtomicU32::new(0),
-        vidpn_snap_alloc_size: AtomicU64::new(0),
         size: admitted.vidmm_size,
         width: admitted.width,
         height: admitted.height,

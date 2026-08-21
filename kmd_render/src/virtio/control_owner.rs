@@ -998,17 +998,6 @@ impl TransportOwner {
         Ok(Some((owner, size, mapped)))
     }
 
-    pub(crate) fn mapped_resource_at_offset(
-        &self,
-        offset: u64,
-    ) -> Result<Option<u32>, super::VirtioError> {
-        let mut state = self.state.lock();
-        state
-            .table_mut()?
-            .mapped_resource_at_offset(offset)
-            .map_err(owner_refusal)
-    }
-
     pub(crate) fn first_overlapping_window_resource(
         &self,
         resource_id: u32,

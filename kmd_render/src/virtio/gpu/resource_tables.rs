@@ -7,12 +7,10 @@
 //! not).
 //!
 //! Every method here is field-disjoint from the control queue and the fence
-//! tables -- verified, not assumed: none of the 32 touches `transport`,
-//! `control`, `inflight`, `parked`, `dma_pool`, `fence_waiters`,
-//! `fence_events`, `wddm_pending` or `scanout_refresh_watermark`, and there is
-//! no `self.<method>()` call across the boundary in either direction. Present
-//! stream teardown deliberately happens one layer up under `wddm_notify_lock`,
-//! because it must discharge WDDM waiters as well as remove the registry row.
+//! tables -- verified, not assumed: none of the methods touches `transport`,
+//! `control`, `inflight`, `parked`, `dma_pool`, `fence_waiters`, or
+//! `wddm_pending`, and there is no `self.<method>()` call across the boundary in
+//! either direction.
 
 use super::*;
 
@@ -76,15 +74,6 @@ impl VirtioGpu {
         self.contexts_reserved = self.contexts_reserved.saturating_sub(1);
     }
 
-    /// Resolve `ctx_id` for `owner`, or `None` if it is untracked or tracked by
-    /// a DIFFERENT owner.
-    pub fn resolve_owned_ctx(&self, owner: Option<DeviceOwner>, ctx_id: u32) -> Option<OwnedCtx> {
-        self.contexts
-            .iter()
-            .find(|c| c.ctx_id == ctx_id && c.owner == owner)
-            .map(|c| OwnedCtx { id: c.ctx_id })
-    }
-
     /// Drop a context's tracking slot, but only for its owner. Returns the
     /// resolved id, or `None` if the caller does not own it.
     pub fn untrack_owned_context(
@@ -129,64 +118,6 @@ impl VirtioGpu {
     /// Release a reserved resource slot after a failed create.
     pub fn cancel_resource_reservation(&mut self) {
         self.resources_reserved = self.resources_reserved.saturating_sub(1);
-    }
-
-    /// Reserve a blob-table slot for an in-flight ALLOC_BLOB.
-    pub fn reserve_blob_slot(&mut self) -> bool {
-        if self.blobs.len() + self.blobs_reserved >= MAX_BLOBS {
-            BLOB_FULL_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        self.blobs_reserved += 1;
-        true
-    }
-
-    /// Commit a reserved blob slot.
-    pub fn commit_blob(
-        &mut self,
-        owner: Option<DeviceOwner>,
-        ctx_id: u32,
-        resource_id: u32,
-        size: u64,
-    ) {
-        self.blobs_reserved = self.blobs_reserved.saturating_sub(1);
-        self.blobs.push(BlobSlot {
-            owner,
-            ctx_id,
-            resource_id,
-            size,
-            mapped: false,
-            map_pending: false,
-            map_cache: 0,
-            map_offset: 0,
-            map_len: 0,
-        });
-        bump_high_water(&BLOB_HIGH_WATER, self.blobs.len());
-    }
-
-    /// Release a reserved blob slot after a failed create.
-    pub fn cancel_blob_reservation(&mut self) {
-        self.blobs_reserved = self.blobs_reserved.saturating_sub(1);
-    }
-
-    /// Pop the blob slot matching (`owner`, `ctx_id`, `resource_id`) — the
-    /// RELEASE_BLOB path. The caller unmaps/detaches/unrefs outside the lock
-    /// and returns the window range via [`Self::free_window_range_pub`].
-    /// Takes a `DeviceOwner`, not an `Option`: the KMD-owned slots are
-    /// unreachable from this path by TYPE, which is the whole point — an escape
-    /// with a null hDevice used to match every blob the KMD had adopted for a
-    /// live WDDM allocation.
-    pub fn take_blob_matching(
-        &mut self,
-        owner: DeviceOwner,
-        ctx_id: u32,
-        resource_id: u32,
-    ) -> Option<(u32, bool, u64, u64)> {
-        let idx = self.blobs.iter().position(|s| {
-            s.owner == Some(owner) && s.ctx_id == ctx_id && s.resource_id == resource_id
-        })?;
-        let slot = self.blobs.swap_remove(idx);
-        Some((slot.resource_id, slot.mapped, slot.map_offset, slot.map_len))
     }
 
     /// Pop one blob still owned by `owner` (device-teardown reclamation).
@@ -248,12 +179,12 @@ impl VirtioGpu {
         if self.blobs.iter().any(|s| s.resource_id == resource_id) {
             return;
         }
-        if self.blobs.len() + self.blobs_reserved >= MAX_BLOBS {
+        if self.blobs.len() >= MAX_BLOBS {
             BLOB_FULL_REJECTS.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        // Record with ctx_id 0 / KMD owner: these blobs are not driven by an escape
-        // device handle; teardown unrefs them explicitly via the venus client.
+        // Record with ctx_id 0 / KMD owner; teardown unrefs them explicitly via
+        // the Venus client.
         self.blobs.push(BlobSlot {
             owner: None,
             ctx_id: 0,
@@ -265,6 +196,7 @@ impl VirtioGpu {
             map_offset: 0,
             map_len: 0,
         });
+        bump_high_water(&BLOB_HIGH_WATER, self.blobs.len());
     }
 
     /// Look up a blob's tracking state by resource id (any owner). Returns
@@ -507,16 +439,6 @@ impl VirtioGpu {
         Ok(n)
     }
 
-    /// The blob currently mapped exactly at window `offset`, if any. Used by
-    /// `DxgkDdiUnmapCpuHostAperture`, which names aperture pages but not the
-    /// allocation.
-    pub fn blob_resid_at_offset(&self, offset: u64) -> Option<u32> {
-        self.blobs
-            .iter()
-            .find(|s| s.mapped && s.map_offset == offset)
-            .map(|s| s.resource_id)
-    }
-
     /// Record that a blob's host mapping was torn down outside the normal
     /// release path (stale-placement eviction in `map_blob_at`). No window
     /// range is freed here — VidMm-partition offsets never enter the free list.
@@ -530,49 +452,6 @@ impl VirtioGpu {
             s.map_offset = 0;
             s.map_len = 0;
         }
-    }
-
-    /// Return the recorded size of a live blob resource.
-    pub fn live_blob_size(&self, resource_id: u32) -> Option<u64> {
-        if !self.resource_is_live(resource_id) {
-            return None;
-        }
-        self.blobs
-            .iter()
-            .find(|slot| slot.resource_id == resource_id)
-            .map(|slot| slot.size)
-    }
-
-    /// Transfer a blob's lifetime ownership from its escape owner (the D3DKMT
-    /// device handle the ICD allocated it under) to the WDDM allocation adopting
-    /// it in `DxgkDdiCreateAllocation`. Returns the live blob table's recorded
-    /// size; adopting a dead or untracked resid must fail CreateAllocation.
-    ///
-    /// This closes the res-45 lifetime hole (2026-07-03 boot #3): without the
-    /// re-tag, `DxgkDdiDestroyDevice`'s `release_blobs_for_owner` sweep unrefs
-    /// the host resource when the CREATING process's device dies, even though
-    /// the shared WDDM allocation (and its cross-process openers) still
-    /// reference it. Re-tagging to the KMD owner removes it from every escape-owner
-    /// reclaim path; from here the allocation destroy path
-    /// (`destroy_allocation_ctx` → `forget_allocation_blob` + guarded unref)
-    /// owns the lifetime, matching KMD-created standard allocations.
-    pub fn adopt_blob_for_allocation(&mut self, resource_id: u32) -> Option<u64> {
-        if !self.resource_is_live(resource_id) {
-            // Atomic, not diag::record — CreateAllocation calls this under the
-            // device spinlock (DISPATCH_LEVEL); the registry tracer is PASSIVE-only.
-            ADOPT_DEAD_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        let Some(slot) = self
-            .blobs
-            .iter_mut()
-            .find(|slot| slot.resource_id == resource_id)
-        else {
-            ADOPT_DEAD_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return None;
-        };
-        slot.owner = None;
-        Some(slot.size)
     }
 
     /// Drop the KMD-internal (KMD-owned) tracking slot for an allocation's blob at
@@ -593,18 +472,6 @@ impl VirtioGpu {
     /// Current number of tracked blob slots (diagnostics).
     pub fn blob_count(&self) -> usize {
         self.blobs.len()
-    }
-
-    /// Point-in-time table occupancy + host-visible-window usage for
-    /// `HELIOS_ESCAPE_QUERY_STATS`. Called under the device spinlock; pure reads.
-    pub fn table_stats(&self) -> TableStats {
-        TableStats {
-            blobs_live: self.blobs.len() as u32,
-            resources_live: self.resources.len() as u32,
-            contexts_live: self.contexts.len() as u32,
-            window_used: self.window.used(),
-            window_len: self.window.window_len,
-        }
     }
 
     /// The host-visible blob window, or `None` if the device exposes none.

@@ -24,13 +24,7 @@ pub mod venus;
 
 pub(crate) use control_owner::{TransportOwner, TransportOwnerCreateError, KMD_D2_OWNER_ENABLED};
 
-// `gpu::CompletedBind` is deliberately NOT re-exported: its only consumer names
-// it through inference (`take_completed_bind`), and an unused re-export is a
-// warning in a crate that keeps its build clean.
-pub use gpu::{
-    FastBindDispatch, PublicationRefresh, ScanoutBindRequest, ScanoutFlushToken, ScanoutNotify,
-    VirtioGpu, WddmTake, WorkerBindDispatch,
-};
+pub use gpu::{VirtioGpu, WddmTake};
 
 use wdk_sys::{
     NTSTATUS, STATUS_DEVICE_BUSY, STATUS_INSUFFICIENT_RESOURCES, STATUS_INVALID_DEVICE_REQUEST,

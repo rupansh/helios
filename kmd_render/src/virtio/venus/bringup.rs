@@ -415,15 +415,11 @@ impl VenusInstance {
 
         Ok(VenusClient {
             ring: self.ring,
-            probe_pending: None,
-            scanout_copy_last_fence: 0,
             device_id,
             queue_id,
             memory_type_index,
             memory_type_flags,
             memory_type_count,
-            copy_target_image_id: None,
-            copy_target_init_pool_id: None,
             present_images: Vec::with_capacity(MAX_PRESENT_IMAGES),
             present_buffers: Vec::with_capacity(MAX_PRESENT_BUFFERS),
             present_blits: Vec::with_capacity(MAX_PRESENT_BLITS),

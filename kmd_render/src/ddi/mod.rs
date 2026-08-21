@@ -10,16 +10,13 @@ pub(crate) use crate::irql::PASSIVE_LEVEL_IRQL;
 mod add_device;
 mod bar_segment;
 mod base;
-mod blob_map;
 mod build_paging_buffer;
 mod child;
 pub(crate) mod committed_mode;
-pub(crate) mod cpu_host_aperture;
 pub(crate) mod create_allocation;
 pub(crate) mod diag_etw;
 pub(crate) mod direct_scanout;
 pub(crate) mod display;
-mod escape;
 mod gpummu;
 pub(crate) mod hpd;
 pub(crate) mod interrupt;
@@ -29,8 +26,6 @@ pub(crate) mod native_fence;
 pub(crate) mod native_render;
 pub(crate) mod present_packet;
 pub(crate) mod query_adapter_info;
-pub(crate) mod scanout_timeline;
-pub(crate) mod scanout_trace;
 mod scheduler;
 pub(crate) mod segment_table;
 pub(crate) mod session_transport;
@@ -45,7 +40,6 @@ pub use base::{
     dxgkddi_control_etw_logging, dxgkddi_notify_acpi_event, dxgkddi_query_interface,
     dxgkddi_reset_device, dxgkddi_unload,
 };
-pub use blob_map::unmap_io_pages_from_user;
 pub(crate) use build_paging_buffer::PagingPteShadow;
 pub use build_paging_buffer::{
     diag_dump_gpummu_atomics, dxgkddi_build_paging_buffer, dxgkddi_get_root_page_table_size,
@@ -55,16 +49,12 @@ pub use child::{
     dxgkddi_get_child_container_id, dxgkddi_query_child_relations, dxgkddi_query_child_status,
     dxgkddi_query_device_descriptor,
 };
-pub use cpu_host_aperture::{
-    diag_dump_cpu_host_atomics, dxgkddi_map_cpu_host_aperture, dxgkddi_unmap_cpu_host_aperture,
-};
 pub use create_allocation::{
     dxgkddi_close_allocation, dxgkddi_create_allocation, dxgkddi_describe_allocation,
     dxgkddi_destroy_allocation, dxgkddi_get_standard_allocation_driver_data,
     dxgkddi_open_allocation, dxgkddi_set_allocation_backing_store,
 };
 pub use diag_etw::{dxgkddi_collect_dbg_info2, dxgkddi_collect_diagnostic_info};
-pub(crate) use display::VIDPN_SOURCE_ADDRESS_COUNT;
 pub use display::{
     diag_dump_present_atomics, dxgkddi_commit_vidpn, dxgkddi_enum_vidpn_cofunc_modality,
     dxgkddi_exchange_pre_start_info, dxgkddi_get_scan_line, dxgkddi_is_supported_vidpn,
@@ -108,7 +98,6 @@ pub use scheduler::{
     reason = "D9 table-disabled legacy source retained for later demolition"
 )]
 fn typecheck_d9_disabled_legacy_callbacks() {
-    let _ = escape::dxgkddi_escape;
     let _ = scheduler::dxgkddi_create_hw_context;
     let _ = scheduler::dxgkddi_destroy_hw_context;
     let _ = scheduler::dxgkddi_create_hw_queue;
@@ -118,8 +107,7 @@ fn typecheck_d9_disabled_legacy_callbacks() {
     let _ = scheduler::dxgkddi_present_to_hw_queue;
 }
 pub(crate) use submit_command::{
-    abandon_pending_submissions, record_present_handoff_telemetry, AbandonOutcome,
-    ABANDONED_FENCES, DMA_STALE_SKIP_COUNT,
+    abandon_pending_submissions, AbandonOutcome,
 };
 pub use native_render::diag_dump_native_render_atomics;
 pub use translation_session::diag_dump_translation_session_atomics;

@@ -12,7 +12,6 @@
 //! being split across two modules.
 
 use core::ffi::c_void;
-use core::sync::atomic::AtomicU64;
 
 use wdk_sys::ntddk::{KeInitializeEvent, KeResetEvent, KeSetEvent, KeWaitForSingleObject};
 use wdk_sys::PVOID;
@@ -23,7 +22,6 @@ use super::AdapterContext;
 
 /// One event per epoch, not one per timer tick. This is a diagnostic cursor
 /// only; the VSync protocol remains untouched.
-static LAST_TIMELINE_VSYNC_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 /// Opaque `PEX_TIMER` storage. `wdk-sys` 0.5.1 does not bind the Windows 8.1
 /// ExXxx timer API yet, so retain only the pointer representation the WDK
@@ -81,16 +79,6 @@ impl AdapterContext {
         // worker's rundown proof.
         unsafe { KeResetEvent(self.hpd_exited.get()) };
         self.hpd_stop.store(0, Ordering::Release);
-        self.scanout_refresh_pending.store(0, Ordering::Release);
-        self.scanout_flush_inflight.store(0, Ordering::Release);
-        // ⚠ `host_bound_scanout_resource` is zeroed here WITHOUT clearing
-        // `active_scanout_resource`, so after a StopDevice/StartDevice cycle
-        // the two disagree and `queue_active_scanout_refresh_locked` reaches
-        // the `host_bound != resource_id` test below. That is the ONE path
-        // that made the deleted async-bind arm reachable, and it is why the
-        // refusal survives the deletion as `RfUnb` rather than falling through
-        // to a RESOURCE_FLUSH against a resource the host never bound.
-        self.host_bound_scanout_resource.store(0, Ordering::Release);
         let mut handle: wdk_sys::HANDLE = core::ptr::null_mut();
         const THREAD_ALL_ACCESS: u32 = 0x001F_FFFF;
         // SAFETY: PASSIVE_LEVEL; a kernel system thread in the system process
@@ -468,34 +456,6 @@ impl AdapterContext {
 /// and arm just one future expiration. No timer source performs a catch-up burst.
 unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     use core::sync::atomic::Ordering;
-    // THE RELEASE EDGE FOR THE TWO THINGS THAT WAIT ON NOTHING, and the reason it
-    // is here: a WDDM head held by `WddmHoldMs`, or blocked past its `WddmHeadMs`
-    // bound, is not waiting on any completion — so no used-ring DPC is guaranteed
-    // to arrive and look at it again. This 60 Hz tick is the one periodic DISPATCH
-    // edge this driver already owns; at 16.7 ms granularity it releases a 100 ms
-    // hold with ~17 ms of slop, which neither the experiment's
-    // three-orders-of-magnitude signal nor a 250 ms liveness bound cares about.
-    //
-    // Deliberately BEFORE the display gates below, so the release does not also
-    // depend on `vsync_enabled`.
-    //
-    // ⛔ THE SECOND TEST IS STATE, NOT THE KNOB, and that is not a style choice:
-    // `WddmHeadMs` DEFAULTS TO 250, so `WDDM_HEAD_MS != 0` is true on every
-    // shipping boot and would queue a DPC on all 60 ticks a second forever, on a
-    // desktop with no D3D12 client — a permanent DISPATCH tax on the compositor
-    // path. `wddm_head_bound_due` is non-false only while a head is genuinely
-    // armed AND past its deadline, and it CLAIMS the deadline, so one arm buys at
-    // most one prompt.
-    //
-    // COST WHEN NEITHER APPLIES, which is the shipping steady state: one relaxed
-    // 32-bit load for the knob, one relaxed 64-bit load inside
-    // `wddm_head_bound_due`, and NO clock read — it samples the time only after a
-    // non-zero deadline proves there is something to compare against.
-    if crate::virtio::gpu::WDDM_HOLD_MS.load(Ordering::Relaxed) != 0
-        || crate::virtio::VirtioGpu::wddm_head_bound_due()
-    {
-        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
-    }
     if !adapter.display_half() || adapter.vsync_armed.load(Ordering::Acquire) == 0 {
         return;
     }
@@ -556,50 +516,9 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     let phys = adapter.last_primary_address.load(Ordering::Acquire) as i64;
     // SAFETY: live callback interface; signal_crtc_vsync raises to DIRQL internally
     // via DxgkCbSynchronizeExecution and delivers the CRTC_VSYNC packet.
-    let status = unsafe {
+    let _ = unsafe {
         crate::ddi::submit_command::signal_crtc_vsync(dxgkrnl, phys, crate::ddi::vidpn::CHILD_UID)
     };
-    let epoch = adapter.scanout_bound_epoch.load(Ordering::Acquire);
-    if status == STATUS_SUCCESS {
-        // Record every callback that actually reached dxgkrnl. At ~60 Hz the
-        // fixed 32768-entry ring retains several minutes, and this is the
-        // causal heartbeat a trace needs rather than a stale sampled mirror.
-        crate::ddi::scanout_timeline::note(
-            crate::ddi::scanout_timeline::kind::VBLANK_TICK,
-            crate::ddi::scanout_timeline::flag::SUCCESS,
-            epoch,
-            0,
-            phys as u64,
-            adapter.active_scanout_resource.load(Ordering::Acquire),
-            if adapter.vsync_uses_ex_timer() {
-                crate::ddi::scanout_timeline::vblank_source::EX_HIGH_RESOLUTION
-            } else {
-                crate::ddi::scanout_timeline::vblank_source::KTIMER_FALLBACK
-            },
-        );
-        if epoch != 0 && LAST_TIMELINE_VSYNC_EPOCH.swap(epoch, Ordering::AcqRel) != epoch {
-            crate::ddi::scanout_timeline::note(
-                crate::ddi::scanout_timeline::kind::VBLANK_EPOCH,
-                crate::ddi::scanout_timeline::flag::SUCCESS,
-                epoch,
-                0,
-                phys as u64,
-                adapter.active_scanout_resource.load(Ordering::Acquire),
-                0,
-            );
-        }
-    }
-    // SetVidPnSourceAddress may run inside the synchronized MMIO-flip callback
-    // above at DIRQL. It can only publish the exact hAllocation there. Back at
-    // this timer DPC's DISPATCH_LEVEL, wake the PASSIVE worker that is allowed
-    // to take the Venus mutex and issue the host scanout commands.
-    // Signal after the synchronized callback. This covers both a request that
-    // was already pending and one that the callback just published. Replacing
-    // this with a before/after nonzero comparison loses a wake if another CPU
-    // consumes the old request while the callback publishes its successor.
-    if adapter.pending_vidpn_allocation.load(Ordering::Acquire) != 0 {
-        adapter.signal_hpd();
-    }
     adapter.vsync_count.fetch_add(1, Ordering::Relaxed);
 }
 

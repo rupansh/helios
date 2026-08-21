@@ -56,6 +56,10 @@ use wdk_sys::ntddk::{
 };
 use wdk_sys::{_MEMORY_CACHING_TYPE, PHYSICAL_ADDRESS, PMDL};
 
+use helios_protocol::{
+    VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED, VIRTIO_GPU_MAP_CACHE_WC,
+};
+
 use crate::adapter::{AdapterContext, SystemBackingSnapshot};
 use crate::ddi::create_allocation::{paging_alloc_info, set_bar_placement, PagingAllocInfo};
 use crate::dxgk::*;
@@ -143,6 +147,17 @@ enum PagingOpOutcome {
 /// arm through one function keeps the legal-return set a one-line audit.
 const fn paging_failure() -> NTSTATUS {
     STATUS_INSUFFICIENT_RESOURCES
+}
+
+/// Translate the host's virtio cache nibble for the surviving transient kernel
+/// view used by paging transfers. User mappings were retired with Escape.
+fn map_cache_to_mm(map_cache: u32) -> _MEMORY_CACHING_TYPE::Type {
+    match map_cache {
+        VIRTIO_GPU_MAP_CACHE_CACHED => _MEMORY_CACHING_TYPE::MmCached,
+        VIRTIO_GPU_MAP_CACHE_WC => _MEMORY_CACHING_TYPE::MmWriteCombined,
+        VIRTIO_GPU_MAP_CACHE_UNCACHED => _MEMORY_CACHING_TYPE::MmNonCached,
+        _ => _MEMORY_CACHING_TYPE::MmNonCached,
+    }
 }
 
 // Counters (registry-visible after any BAR-segment op; atomics are the source
@@ -1190,7 +1205,7 @@ unsafe fn with_blob_bytes(
     // creates a conflicting WB alias when virglrenderer reports WC/UC. Such an
     // alias is architecturally invalid and can expose stale cache lines after
     // the host GPU writes the blob. Unmapped below.
-    let cache = super::blob_map::map_cache_to_mm(prep.map_cache);
+    let cache = map_cache_to_mm(prep.map_cache);
     let va = unsafe { MmMapIoSpace(pa, prep.size, cache) } as *mut u8;
     if va.is_null() {
         BAR_ERR_MAP.fetch_add(1, Ordering::Relaxed);

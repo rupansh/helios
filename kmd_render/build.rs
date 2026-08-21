@@ -64,7 +64,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     verify_slot_audit_not_stale();
     generate_dxgk_bindings()?;
     compile_version_resource()?;
-    compile_seh_shim();
     compile_render_user_copy();
 
     // Emit the link configuration for a WDK binary (resolves ntoskrnl, etc.).
@@ -240,21 +239,6 @@ fn verify_slot_audit_not_stale() {
             "cargo:warning=slot-audit staleness check SKIPPED (could not run python3: {e})"
         ),
     }
-}
-
-/// Compile the SEH shim for `MmMapLockedPagesSpecifyCache(UserMode)` (which
-/// raises on failure — un-catchable from no_std Rust). Kernel-appropriate
-/// flags: `/Zl` omits default-CRT lib records from the object (rustc drives
-/// the kernel link; msvcrt must not be pulled in) and `/GS-` avoids
-/// `__security_cookie` references. The `__C_specific_handler` reference the
-/// `__try/__except` emits resolves from ntoskrnl.lib, already on the link.
-fn compile_seh_shim() {
-    cc::Build::new()
-        .file("src/seh_shim.c")
-        .flag("/Zl")
-        .flag("/GS-")
-        .compile("helios_seh_shim");
-    println!("cargo:rerun-if-changed=src/seh_shim.c");
 }
 
 /// Compile K6's SEH-guarded probe+copy of `DxgkDdiRender`'s user command

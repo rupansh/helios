@@ -13,7 +13,7 @@
 use core::ffi::c_void;
 use core::sync::atomic::Ordering;
 
-use crate::adapter::{AdapterContext, ScanoutRefreshQueue};
+use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 use wdk_sys::ntddk::{KeWaitForSingleObject, PsTerminateSystemThread};
 
@@ -28,16 +28,6 @@ const STATUS_TIMEOUT: NTSTATUS = 0x0000_0102;
 /// deliberate — the defect was a delay standing in for an event, not the
 /// existence of a timeout.
 const START_COMPLETE_FALLBACK_100NS: i64 = -5_000_000; // 500 ms, relative
-
-/// Bounded lost-interrupt fallback while one async ctrl command owns descriptors.
-///
-/// NOT the R515 defect: the KEVENT (ISR -> DPC -> drain -> signal) is the real
-/// wake source and this only covers a delayed device interrupt.
-const CTRL_INFLIGHT_POLL_100NS: i64 = -40_000; // 4 ms, relative
-
-/// Retry delay after a loud scanout-refresh enqueue failure. Also a real bound,
-/// not a stand-in: the failure has no wake source of its own.
-const REFRESH_RETRY_100NS: i64 = -160_000; // 16 ms, relative
 
 /// Indicate the single child video-output's connection state to the OS. PASSIVE.
 fn indicate_child_status(adapter: &AdapterContext, connected: bool) {
@@ -159,39 +149,22 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
     adapter.config_change_pending.swap(0, Ordering::AcqRel);
     indicate_child_status(adapter, true);
 
-    // Steady state is event/dirty driven. A real virtio display-change wakes us
-    // to re-indicate the child; a completed primary GPU copy wakes us to queue
-    // exactly one asynchronous RESOURCE_FLUSH. While that one command is in
-    // flight, use a short used-ring poll only as interrupt-loss tolerance. This
-    // never emits another flush by itself, so an idle desktop produces no ctrl
-    // spam and a delayed synchronous response cannot cap presentation at 2.4 Hz.
-    let mut reported_fail = 0u32;
+    // Steady state is edge-driven. Interrupt/DPC completion owns control-ring
+    // draining; this thread only handles the OS child-status edge and the one
+    // PASSIVE continuation for D4 plane work.
     loop {
-        // One in-flight class since T6/R902 deleted the async bind: the
-        // composition `flush_inflight || bind_inflight` reduces to the flush
-        // term, because `scanout_bind_inflight`'s only non-zero writer was the
-        // CAS inside the deleted arm.
-        let ctrl_inflight = adapter.scanout_flush_inflight.load(Ordering::Acquire) != 0;
-        let retry_pending =
-            adapter.scanout_refresh_pending.load(Ordering::Acquire) != 0 && !ctrl_inflight;
-        let mut timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
-        let timeout_ptr = if ctrl_inflight {
-            timeout.QuadPart = CTRL_INFLIGHT_POLL_100NS;
-            &mut timeout
-        } else if retry_pending {
-            timeout.QuadPart = REFRESH_RETRY_100NS;
-            &mut timeout
-        } else {
-            core::ptr::null_mut()
-        };
-        // SAFETY: wait on the initialized event; NULL timeout means sleep until
-        // config change, scanout dirty, completion, or StopDevice.
-        let wait_status = unsafe {
-            KeWaitForSingleObject(adapter.hpd_event.get() as PVOID, 0, 0, 0, timeout_ptr)
+        // SAFETY: wait on the initialized synchronization event. No timeout:
+        // there is no deferred retry continuation.
+        let _ = unsafe {
+            KeWaitForSingleObject(
+                adapter.hpd_event.get() as PVOID,
+                0,
+                0,
+                0,
+                core::ptr::null_mut(),
+            )
         };
         if adapter.hpd_stop.load(Ordering::Acquire) != 0 {
-            // Publish "worker exited" BEFORE terminating, so stop_hpd's join
-            // does not depend on ObReferenceObjectByHandle succeeding.
             // SAFETY: initialized NotificationEvent on the adapter, which
             // outlives this thread by the leak rule in stop_hpd.
             unsafe { wdk_sys::ntddk::KeSetEvent(adapter.hpd_exited.get(), 0, 0) };
@@ -200,130 +173,9 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
             return;
         }
 
-        // The KEVENT is the primary completion path (ISR -> DPC -> drain ->
-        // signal). If that device interrupt is delayed, poll only while one
-        // async flush owns descriptors; also do one poll when a new dirty frame
-        // arrives behind it. This frees the coalescing gate without waiting for
-        // the old exponential synchronous-roundtrip slices.
-        if (wait_status == STATUS_TIMEOUT && ctrl_inflight)
-            || (adapter.scanout_flush_inflight.load(Ordering::Acquire) != 0
-                && adapter.scanout_refresh_pending.load(Ordering::Acquire) != 0)
-            // A presentation lease ended somewhere that could not pop the WDDM
-            // pending FIFO itself — the used-ring drain holds `virtio_lock`, and
-            // taking `wddm_notify_lock` under it inverts the driver's lock order
-            // (ROADMAP defect 0ab-B). This is that work's PASSIVE home, and it
-            // is a real edge rather than a poll: the same store that sets the
-            // flag signals the event we just woke on.
-            || adapter.scanout_retire_wanted.swap(0, Ordering::AcqRel) != 0
-        {
-            crate::ddi::interrupt::drain_used_and_complete(adapter);
-        }
-
-        // The ISR owns setting this bit; the PASSIVE worker consumes it after
-        // the DPC's wake so a scanout-completion wake cannot masquerade as HPD.
         if adapter.config_change_pending.swap(0, Ordering::AcqRel) != 0 {
             indicate_child_status(adapter, true);
         }
-
-        // D2 candidates are published by bounded display DDIs and have exactly
-        // one PASSIVE continuation. The following legacy continuations refuse
-        // locally while the SURFACE-derived D2 owner is active.
         crate::ddi::direct_scanout::service_pending(passive, adapter);
-
-        // Consume only the allocation identity supplied by Windows through
-        // SetVidPnSourceAddress. The DDI can be called at DIRQL, where neither
-        // Venus waits nor registry diagnostics are legal; this worker is the
-        // PASSIVE continuation for that exact callback.
-        crate::ddi::display::process_deferred_vidpn_source_address(passive, adapter);
-
-        // WindowedBlt has an event-driven PASSIVE continuation distinct from
-        // scanout refresh: the request must first be admitted by SubmitCommand
-        // and have its exact producer stream retire. This call merely consumes
-        // those already-signalled edges; it never polls a producer.
-        crate::ddi::display::service_windowed_blt(passive, adapter);
-
-        // Publish the unsampled scanout-bind trace. This is the ONE PASSIVE
-        // site that mirrors it; accumulation happens at DIRQL/DISPATCH with
-        // atomics only. Throttled inside `dump_periodic` — a dump is ~120
-        // registry writes, so it must never run per frame. Placed after the
-        // deferred programming so a dump reflects the bind that just ran.
-        crate::ddi::scanout_trace::dump_periodic(adapter);
-
-        // T6/R901 deleted the `ScanoutDiag` forced-rebind experiment that used
-        // to run here. T1a had already moved it off
-        // `apply_vidpn_source_address_locked`, where both of its `return true`
-        // arms short-circuited the production publication path -- skipping the
-        // `vidpn_programming.store(0)` every sibling exit performs -- while the
-        // DDI returned STATUS_SUCCESS to dxgkrnl as if the Windows primary had
-        // been programmed. The gate stayed at 1 and the Windows primary was
-        // never bound again for the rest of the boot.
-        // Deleting the experiment removes that failure mode by construction
-        // rather than by keeping it on a worker that cannot lie to the OS.
-        //
-        // It also removed a synchronous `RtlQueryRegistryValues` per programmed
-        // primary, which contradicted `adapter.rs`'s own "never query the
-        // registry on every frame".
-
-        // Drain an armed one-shot Present probe (R320). Taking the record is a
-        // quick operation under the venus mutex; the probe itself — a 5 s fence
-        // wait, a host map round-trip with 1 ms sleeps, MmMapIoSpace, ~196
-        // volatile reads and 7 registry writes — runs HERE, at PASSIVE, with no
-        // lock held and off the Present path entirely.
-        if adapter.probe_pending.swap(0, Ordering::AcqRel) != 0 {
-            let pending = adapter
-                .with_venus_client(passive, |client| client.take_pending_probe())
-                .ok()
-                .flatten();
-            if let Some((destination, fence_id)) = pending {
-                // The probe now samples LATER than the fence retirement it waits
-                // for, so the destination may have been destroyed in between.
-                // Re-validate liveness by resource id before touching it; the
-                // record deliberately carries the id, never a raw pointer.
-                let live = adapter
-                    .canonical_resource_is_live(destination.resource_id())
-                    .unwrap_or(false);
-                if live {
-                    crate::virtio::venus::VenusClient::probe_present_destination(
-                        passive,
-                        adapter,
-                        destination,
-                        fence_id,
-                    );
-                } else {
-                    crate::diag::record_named_bytes(b"PBPrF", 0xE6);
-                }
-            }
-        }
-
-        if adapter.scanout_refresh_pending.swap(0, Ordering::AcqRel) != 0 {
-            match adapter.queue_active_scanout_refresh(passive) {
-                ScanoutRefreshQueue::Queued => {}
-                ScanoutRefreshQueue::Busy | ScanoutRefreshQueue::Failed => {
-                    // Preserve the first dirty frame. Busy completion wakes us;
-                    // an enqueue failure gets the bounded retry timeout above.
-                    adapter.scanout_refresh_pending.store(1, Ordering::Release);
-                }
-                // No bound scanout: there is nothing meaningful to flush. A
-                // later completed copy will publish a fresh dirty edge. This
-                // DROPS the dirty bit, so it is counted (`ScUnav`) rather than
-                // being a comment — a rising count here means dirty frames are
-                // being discarded because nothing is bound.
-                ScanoutRefreshQueue::Unavailable => {
-                    crate::ddi::display::SC_UNAVAILABLE.fetch_add(1, Ordering::Relaxed);
-                }
-                // The ownership gate refused this edge (ROADMAP defect 0ab-B).
-                // Deliberately NOT re-armed: re-arming would reissue the same
-                // refused flush every wakeup, and the whole argument for the
-                // drop is that a better-timed publisher exists — the incoming
-                // buffer's own bind edge. Censused as `OgIdn`/`OgEpo`.
-                ScanoutRefreshQueue::Dropped => {}
-            }
-        }
-
-        let failed = adapter.scanout_refresh_fail.load(Ordering::Relaxed);
-        if failed != reported_fail && (failed == 1 || (failed != 0 && (failed % 60) == 0)) {
-            crate::diag::record_named_bytes(b"RfFail", failed);
-            reported_fail = failed;
-        }
     }
 }

@@ -49,7 +49,6 @@ use crate::irql::PassiveLevel;
 
 mod bringup;
 mod commands;
-mod diagnostics;
 mod present;
 mod protocol;
 mod ring;
@@ -193,55 +192,6 @@ pub struct OptimalImageBlob {
     pub memory_type_index: u32,
 }
 
-/// Persistent Vulkan objects for copying one authoritative WDDM primary into
-/// the adapter-owned LINEAR scanout image.
-///
-/// Creation is deliberately expensive and submission deliberately cheap:
-/// [`VenusClient::prepare_optimal_scanout_copy`] imports the primary once and
-/// records one `SIMULTANEOUS_USE` command buffer; each display tick then calls
-/// [`VenusClient::submit_prepared_image_copy`], which only enqueues that already
-/// recorded buffer. The object must remain alive until
-/// [`VenusClient::destroy_prepared_image_copy`] has drained the queue.
-#[derive(Clone, Copy)]
-pub struct PreparedImageCopy {
-    /// True when preparation created/attached/imported the source objects below.
-    /// False for a borrowed KMD-created LINEAR source image.
-    pub owns_source_alias: bool,
-    /// Virtio-gpu resource attached to the kernel Venus context and imported as
-    /// `memory_id`. Zero for a borrowed KMD-created source.
-    pub source_resource_id: u32,
-    /// KMD-device OPTIMAL alias of the source allocation.
-    pub source_image_id: VkImageId,
-    /// `VkDeviceMemory` imported through `VkImportMemoryResourceInfoMESA`.
-    /// `None` for a borrowed source, which used to be spelled 0.
-    pub source_memory_id: Option<VkDeviceMemoryId>,
-    /// KMD-owned OPTIMAL BGRA scratch used only when the Windows-selected
-    /// primary format differs from the physical BGRA scanout format. `None`
-    /// when no conversion is needed — the common case.
-    pub conversion_image_id: Option<VkImageId>,
-    pub conversion_memory_id: Option<VkDeviceMemoryId>,
-    /// Pool retaining the one-time UNDEFINED-to-GENERAL transition for the
-    /// conversion image.
-    pub conversion_init_pool_id: Option<VkCommandPoolId>,
-    /// Pool owning `command_buffer_id`; retained while submissions may be live.
-    pub command_pool_id: VkCommandPoolId,
-    /// Reusable source-acquire/copy/release command buffer. Also the publish
-    /// word of the `AllocationContext` mirror: a nonzero value there means the
-    /// whole snapshot is coherent.
-    pub command_buffer_id: VkCommandBufferId,
-    /// Persistent adapter-owned destination image baked into the command buffer.
-    pub target_image_id: VkImageId,
-    /// Geometry of the baked copy, carried for diagnosis of a mismatched
-    /// retarget. NOT read by any decision path -- the command buffer already
-    /// encodes the extent. Pre-dates T6; surfaced when R906 removed the
-    /// crate-wide `dead_code` allow over `mod virtio`, kept because a snapshot
-    /// that cannot report its own geometry is harder to debug than one field.
-    #[allow(dead_code)]
-    pub width: u32,
-    #[allow(dead_code)]
-    pub height: u32,
-}
-
 /// Bring-up stage 2: an instance and a physical device exist on the ring.
 ///
 /// Exists only between `VenusRing::into_instance` and `into_device`. Its only
@@ -273,16 +223,6 @@ pub struct VenusClient {
     /// reach it through the small delegating helpers rather than by owning the
     /// fields directly.
     ring: VenusRing,
-    /// One-shot destination probe ARMED but not yet run (R320). The probe is a
-    /// blocking PASSIVE diagnostic — a 5 s fence wait, a host map round-trip
-    /// with 1 ms Busy sleeps, MmMapIoSpace, ~196 volatile reads and 7 registry
-    /// writes — and it used to run inside `submit_present_blt`, i.e. on the
-    /// Present path with the adapter venus mutex HELD. Since the one-shot is per
-    /// source/destination PAIR, a session with the knob enabled could pay that
-    /// up to MAX_PRESENT_BLITS times, each a potential multi-second stall of the
-    /// compositor. It is now recorded here and drained by the PASSIVE display
-    /// worker outside the mutex.
-    probe_pending: Option<(PresentBufferDesc, u64)>,
     /// venus device handle. Not `Option`: a `VenusClient` without a device is
     /// unrepresentable, which is the whole point of the typestate.
     device_id: VkDeviceId,
@@ -293,32 +233,6 @@ pub struct VenusClient {
     /// Raw VkMemoryPropertyFlags for physical-device memory types.
     memory_type_flags: [u32; VK_MAX_MEMORY_TYPES as usize],
     memory_type_count: u32,
-    /// Wire fence of the most recent [`Self::submit_prepared_image_copy`].
-    ///
-    /// The client submits that fence itself, so it is the only thing that
-    /// legitimately knows it. It used to round-trip through an `AtomicU64` in
-    /// the caller's `AllocationContext` and come back as a parameter — and the
-    /// only writer stored it INSIDE the venus mutex while
-    /// `destroy_allocation_ctx` read it OUTSIDE, so a SetVidPnSourceAddress
-    /// that had enqueued its outer SUBMIT_3D but whose store this thread had
-    /// not yet observed yielded a stale-or-zero fence. With 0 the mandatory
-    /// drain was skipped silently and uncounted, the ring marker could be
-    /// decoded ahead of the still-pending SUBMIT_3D, and vkDestroyCommandPool
-    /// ran against a pool with in-flight work.
-    ///
-    /// One client-wide field is correct and conservative: `copy_target_image_id`
-    /// is a single-slot invariant, wire fence ids are monotonic, and ring-1
-    /// submissions retire in order, so draining the highest prepared-copy fence
-    /// drains every earlier one. NEVER cleared — waiting on an already-retired
-    /// fence returns `Complete` immediately through `fence_wait_prepare`'s
-    /// `!in_flight` arm.
-    scanout_copy_last_fence: u64,
-    /// One-time PREINITIALIZED -> GENERAL -> EXTERNAL setup for the persistent
-    /// LINEAR scanout target. The pool/buffer remain live because setup is
-    /// intentionally submitted without a fence wait; queue order makes every
-    /// later copy execute after it.
-    copy_target_image_id: Option<VkImageId>,
-    copy_target_init_pool_id: Option<VkCommandPoolId>,
     /// App/DWM BLT imports and recorded copies. Both vectors are preallocated
     /// and capacity-bounded. Every access is serialized by
     /// AdapterContext::with_venus_client, so setup/submission/teardown cannot

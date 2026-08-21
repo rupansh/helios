@@ -217,23 +217,6 @@ pub enum FaultCounter {
     /// this is the counter behind that clamp's SAFETY comment. Not constructible
     /// with an immutable post-StartDevice table; it exists so that stays true.
     SegCntMis,
-    /// An escape arrived with `DXGKARG_ESCAPE.Flags.HardwareAccess` set — value
-    /// is the running count.
-    ///
-    /// This must read 0. A HardwareAccess escape makes dxgkrnl take the adapter
-    /// core resource EXCLUSIVE, which first runs `FlushAllDevice` against a
-    /// kwait-parked queue and wedges the whole graphics stack — the wedge class
-    /// the 26th session killed. Until now that contract was enforced entirely in
-    /// another codebase (the Mesa ICD's `HELIOS_ESCAPE_HW` kill switch), so an
-    /// ICD rebuild or a stale test-VM environment regressed it with no counter
-    /// and no breadcrumb: the only symptom was a frozen desktop, indistinguishable
-    /// from a venus hang.
-    EscHwA,
-    /// An escape arrived with `DXGKARG_ESCAPE.Flags.NoAdapterSynchronization`
-    /// set — value is the running count. Same class as [`Self::EscHwA`]: a
-    /// second env-driven ICD flag riding the same struct, whose own ICD comment
-    /// records a cold boot producing black output.
-    EscNoSy,
 }
 
 impl FaultCounter {
@@ -261,8 +244,6 @@ impl FaultCounter {
             FaultCounter::SegRule => b"SegRule",
             FaultCounter::SegDiv => b"SegDiv",
             FaultCounter::SegCntMis => b"SegCntMis",
-            FaultCounter::EscHwA => b"EscHwA",
-            FaultCounter::EscNoSy => b"EscNoSy",
         }
     }
 
@@ -288,8 +269,6 @@ impl FaultCounter {
         FaultCounter::SegRule,
         FaultCounter::SegDiv,
         FaultCounter::SegCntMis,
-        FaultCounter::EscHwA,
-        FaultCounter::EscNoSy,
     ];
 }
 
@@ -367,14 +346,6 @@ pub fn sample_tick(ticks: &AtomicU32) -> bool {
     level() >= 1 || n == 1 || n % SAMPLE_EVERY == 0
 }
 
-/// One-shot throttled identity value, for a site with no surrounding block.
-/// Same policy as [`sample_tick`].
-pub fn sample_named(name: &[u8], value: u32, ticks: &AtomicU32) {
-    if sample_tick(ticks) {
-        record_named_bytes(name, value);
-    }
-}
-
 /// One counter in a [`CounterBlock`].
 pub struct CounterEntry {
     /// Registry value name (≤14 chars, as [`record_named_bytes`] requires).
@@ -404,22 +375,15 @@ impl CounterRef {
 
 /// How often a [`CounterBlock`] mirrors itself into the registry.
 pub enum FlushPolicy {
-    /// Every call (for blocks that only run at a rate that is already low).
-    EveryOp,
     /// The 1st call and every Nth after it, at the default `DiagLevel`.
     EveryNth(u32),
 }
 
 /// A named counter block that can only be emitted through a throttled emitter.
 ///
-/// Three modules each implemented the same "flush my counters to fixed registry
-/// names" routine, and they had already drifted on throttling: the GDI executor
-/// deferred to every 64th batch, while the paging block ran at the tail of EVERY
-/// content op (24 synchronous registry writes) and the aperture block on every
-/// map, unmap and refusal (16). Under VidMm eviction pressure the paging path is
-/// per-allocation, so a storm of N allocations performed 24N registry writes
-/// INSIDE BuildPagingBuffer — inflating paging latency and therefore the storm
-/// (x-dup-dead-27).
+/// Several modules once implemented the same "flush my counters to fixed
+/// registry names" routine and had drifted on throttling. The remaining blocks
+/// all use one bounded periodic policy plus immediate failure publication.
 ///
 /// Values stay cumulative atomics, so flushing less often does not change what a
 /// `reg query` reads at rest; only failure latency changes, and the
@@ -448,10 +412,8 @@ impl CounterBlock {
         }
         let previous = self.failures.swap(fail_sum, Ordering::Relaxed);
         let n = self.ticks.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
-        let due = match self.policy {
-            FlushPolicy::EveryOp => true,
-            FlushPolicy::EveryNth(period) => n == 1 || n % period == 0,
-        };
+        let FlushPolicy::EveryNth(period) = self.policy;
+        let due = n == 1 || n % period == 0;
         // A changed failure counter always wins over the throttle.
         if !(due || fail_sum != previous || level() >= 1) {
             return;
@@ -550,25 +512,6 @@ pub mod knobs {
     /// restores) is `crate::virtio::gpu::VirtioGpu::dma_gpu_fence`; the unread
     /// `AdapterKnobs` copy was deleted 2026-08-05.
     pub const DMA_GPU_FENCE: KnobName = KnobName::new(b"DmaGpuFence");
-    /// `BindFlushMode` (default 0). Selects when the bind edge tells the host
-    /// to READ the freshly bound primary (ROADMAP defect 0ab-B):
-    ///   0 = completion-ordered against the boundary this buffer's own present
-    ///       marker captured (`AdapterContext::arm_bind_refresh`),
-    ///   1 = IMMEDIATE — flush at the bind with no ordering at all.
-    ///
-    /// 1 is the discriminating A/B, not a shipping mode: it answers "is the
-    /// buffer's content already correct when we bind it?" directly, which two
-    /// falsified boundary variants could only answer by inference.
-    pub const BIND_FLUSH_MODE: KnobName = KnobName::new(b"BindFlushMode");
-    /// `DispatchBind` (default 1 = ON). Enqueue the flip's `SET_SCANOUT_BLOB`
-    /// from the DISPATCH-level flip arm as well as from the PASSIVE display
-    /// worker (ROADMAP defect 0ab-C, D1(ii)) — a pure accelerator: the worker
-    /// path is unchanged and still consumes the pending slot, and the earlier
-    /// enqueue wins on a FIFO control queue. 0 is the same-boot A/B disable,
-    /// which restores the worker-only bind cadence exactly.
-    pub const DISPATCH_BIND: KnobName = KnobName::new(b"DispatchBind");
-    /// Per-present probe instrumentation (default 0).
-    pub const PRESENT_PROBE: KnobName = KnobName::new(b"PresentProbe");
     /// Render+display adapter shape (default 1 = the render+display miniport,
     /// which is the product). 0 restores the boot-era render-only surface.
     pub const DISPLAY_HALF: KnobName = KnobName::new(b"DisplayHalf");
@@ -646,84 +589,6 @@ pub mod knobs {
     /// 0 is coerced to 1 (a zero-depth flip queue is not representable) and the
     /// value actually advertised is mirrored in the `FlipQueV` counter.
     pub const FLIP_QUEUE_DEPTH: KnobName = KnobName::new(b"FlipQueueN");
-    /// `PresentWmk` (default 1 = ON since 22.22.244.0). Gate a WDDM submission
-    /// that carries a LIVE present stream boundary on that exact boundary
-    /// alone, rather than additionally on every transport entry enqueued before
-    /// it. The superset delays the DMA fence by the whole guest→host pipeline
-    /// depth, which is what makes dxgkrnl block the presenting thread at its
-    /// 3-deep present queue (ETW `BlockThread` Reason=2). Measured 2026-08-04
-    /// on GT1: `DxgkDdiSubmitCommand`→DMA_COMPLETED mean 5.825→4.854 ms
-    /// (p50 6.110→3.995), flip packet lifetime 8.594→7.398 ms,
-    /// `umd_present_callback` 625-661→359 us, GT1 +3.7…+4.3% paired.
-    /// `0` is the same-boot A/B disable and restores the historical superset
-    /// exactly. Snapshotted at transport init, so `pnputil /restart-device`
-    /// flips it without a reboot.
-    pub const PRESENT_EXACT_WATERMARK: KnobName = KnobName::new(b"PresentWmk");
-    /// `WddmHoldMs` (default 0 = OFF, and OFF is the only shipping value).
-    ///
-    /// # THE KNOB IS THE EXPERIMENT (UV1, `docs/dx12/KMD_IMPACT.md` §14a.1)
-    ///
-    /// Hold a D3D12 ECL packet's `DMA_COMPLETED` back by N ms after everything it
-    /// really depends on is satisfied, then read the D3D12 probe's own
-    /// `WaitForSingleObject signalled in N us` against the measured 0.8–1.1 µs
-    /// baseline:
-    ///
-    /// * **N grows by ~the hold** ⇒ **UV1 ✓**. dxgkrnl DOES release the runtime's
-    ///   queued monitored-fence signal behind our DMA packets, so the fence bridge
-    ///   is the right lever and everything after it is plumbing.
-    /// * **N stays at the baseline** ⇒ **UV1 ✗**. The runtime's fence advance has
-    ///   no causal dependency on this context's packets at all, and none of
-    ///   K-F3..K-F9 is the answer. Say so loudly and stop.
-    ///
-    /// ⛔⛔ **PRECONDITION, AND WITHOUT IT THE ✗ ROW IS A TRUSTING-A-ZERO.**
-    /// `WfBHold` must have **MOVED** on the run. Three different states produce a
-    /// flat N and only the third is UV1 ✗:
-    ///   1. **The knob never took.** `WDDM_HOLD_MS` is snapshotted at
-    ///      `VirtioGpu::init`, so setting the registry value and then doing
-    ///      `pnputil /restart-device` — the project's standard deploy — leaves the
-    ///      hold at 0. It needs a **reboot**, exactly like `DiagLevel`.
-    ///   2. **The hold never armed.** It only arms when a D3D12 packet reaches the
-    ///      FIFO head with its three real dependency arms already satisfied. If
-    ///      `Umd12EclSubmit` is off, or no D3D12 packet reached the head at all,
-    ///      nothing was ever held.
-    ///   3. Genuinely no causal dependency — the only reading that licenses ✗.
-    /// ⇒ **read `WfBHold` first. If it is 0, the experiment did not run, and the
-    /// flat N says nothing whatever about UV1.**
-    ///
-    /// ⭐ THIS IS THE ONLY CLEAN UV1 TEST AVAILABLE. The bare submission's reading
-    /// is confounded: the venus ring emits NO wire fence at all while it is busier
-    /// than 1 ms (`icd/mesa/src/virtio/vulkan/vn_ring.c:673-690` — the doorbell is
-    /// rate-limited and only sent when the host ring advertises IDLE), so an
-    /// unheld packet can retire immediately for a reason that has nothing to do
-    /// with whether dxgkrnl would have ordered anything. A hold is the one
-    /// dependency this driver can create unilaterally and time exactly.
-    ///
-    /// ⛔ SCOPED, and it must stay scoped: only a submission whose private data
-    /// carries the D3D12 ECL record is eligible (`present_packet.rs`'s
-    /// `mark_d3d12`). `wddm_pending` is adapter-global and strictly head-of-line,
-    /// so an unscoped hold stalls DWM.
-    /// ⛔ Clamped in code to `WDDM_HOLD_MS_MAX`, because an unbounded hold on that
-    /// FIFO is a TDR and an operator typo must not be able to cause one.
-    /// ⚠ The release edge is the 60 Hz display heartbeat (`adapter/kobj.rs`), so
-    /// the experiment requires the display half armed — which is the configuration
-    /// it runs in anyway. `WfBHold` counts the blocked looks.
-    pub const WDDM_HOLD_MS: KnobName = KnobName::new(b"WddmHoldMs");
-    /// `WddmHeadMs` (default 250 = ON; `0` is the A/B disable).
-    ///
-    /// CONSUMER-SIDE LIVENESS FOR THE WDDM FIFO HEAD (`KMD_IMPACT.md` §14a.2
-    /// K-F2, and `docs/dx12/PENDING.md` §1 A5). How long the head may stay blocked
-    /// on a TAGGED-namespace dependency — a present-stream boundary or a
-    /// WindowedBlt terminal, both of which can be unsatisfiable by construction —
-    /// before that dependency is rebased onto the conservative wire watermark and
-    /// counted (`WfBReb`).
-    ///
-    /// ⚠ A rebase RELEASES a fence whose named producer has not completed, so this
-    /// is a bounded last resort, not a policy. The alternative it is traded against
-    /// is an adapter-wide TDR (or the 256-entry FIFO overflow, which drops 256
-    /// fences at once) — see the read site and `WDDM_HEAD_MS_DEFAULT`.
-    /// ⛔ Clamped in code to `[WDDM_HEAD_MS_MIN, WDDM_HEAD_MS_MAX]` when nonzero:
-    /// too large reinstates the TDR, too small re-opens the 0ab-B stale-frame class.
-    pub const WDDM_HEAD_MS: KnobName = KnobName::new(b"WddmHeadMs");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.

@@ -124,9 +124,6 @@ pub unsafe extern "C" fn dxgkddi_reset_engine(
             out: &mut reset.LastAbortedFenceId,
         },
     );
-    adapter.with_wddm_notify_lock(|guard| {
-        let _ = guard.with_virtio(|order, v| v.purge_all_present_streams_ordered(order));
-    });
     adapter.reopen_k11_completions();
     STATUS_SUCCESS
 }
@@ -365,30 +362,6 @@ static STABLE_POWER_ENABLE_CALLS: AtomicU32 = AtomicU32::new(0);
 /// question worth having.
 static FORMAT_HISTORY_CALLS: AtomicU32 = AtomicU32::new(0);
 
-/// Mirror the clock-calibration counters at PASSIVE. Called from
-/// [`crate::ddi::record_present_handoff_telemetry`]; the DDI itself may run at
-/// DISPATCH, where a registry write is a never-violate rule.
-pub(crate) fn gpu_clock_counters() -> (u32, u32, u32) {
-    (
-        GPU_CLOCK_CALIBRATE_CALLS.load(Ordering::Relaxed),
-        GPU_CLOCK_NO_GPU_COUNTER.load(Ordering::Relaxed),
-        // Reported in Hz. 1e9 fits a u32 registry DWORD with room to spare, so
-        // the answer itself is readable rather than inferred from this file.
-        GPU_TIMESTAMP_FREQUENCY_HZ as u32,
-    )
-}
-
-/// Mirror the two fabricated-success counters for the `void` DDI at PASSIVE, from
-/// the same site and for the same IRQL reason as [`gpu_clock_counters`].
-/// Returns `(StblPwr, StblPwrEn, HistBuf)`.
-pub(crate) fn fabricated_success_counters() -> (u32, u32, u32) {
-    (
-        STABLE_POWER_CALLS.load(Ordering::Relaxed),
-        STABLE_POWER_ENABLE_CALLS.load(Ordering::Relaxed),
-        FORMAT_HISTORY_CALLS.load(Ordering::Relaxed),
-    )
-}
-
 /// ⛔ THE ONE CHANNEL FOR THE GPU TIMESTAMP FREQUENCY. See
 /// [`GPU_TIMESTAMP_FREQUENCY_HZ`] for why, and for what would make the answer
 /// wrong.
@@ -541,7 +514,7 @@ pub unsafe extern "C" fn dxgkddi_format_history_buffer(
 /// omission — identical to `dxgkddi_calibrate_gpu_clock`: this DDI is reached from
 /// a power/scheduler path that may run at DISPATCH-capable IRQL, `diag::record*`
 /// writes the registry and is PASSIVE-only, and the counters are mirrored from a
-/// PASSIVE site instead (`record_present_handoff_telemetry`).
+/// a bounded OS diagnostic callback if these values need external reporting.
 ///
 /// ⛔ DO NOT "IMPLEMENT" THIS BY STORING THE FLAG AND REPORTING IT BACK SOMEWHERE.
 /// A remembered `Enabled` that changes no clock is a better-dressed version of the

@@ -41,7 +41,6 @@ mod dxgk;
 mod error;
 // The PASSIVE_LEVEL proof token (R614) and the one definition of PASSIVE_LEVEL.
 mod irql;
-mod mapping;
 // The guard-based spinlock and the fixed-capacity vector the three bounded
 // tables share. `irql` is the execution-LEVEL contract; this is the mutual
 // exclusion one.
@@ -201,15 +200,15 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiCreateProcess = Some(device::dxgkddi_create_process);
     data.DxgkDdiDestroyProcess = Some(device::dxgkddi_destroy_process);
 
-    // ── Memory management (registered, but fails honestly until implemented) ─
+    // ── Memory management ───────────────────────────────────────────────────
     data.DxgkDdiCreateAllocation = Some(ddi::dxgkddi_create_allocation);
     data.DxgkDdiDestroyAllocation = Some(ddi::dxgkddi_destroy_allocation);
     data.DxgkDdiSetAllocationBackingStore = Some(ddi::dxgkddi_set_allocation_backing_store);
     data.DxgkDdiBuildPagingBuffer = Some(ddi::dxgkddi_build_paging_buffer);
-    data.DxgkDdiMapCpuHostAperture = Some(ddi::dxgkddi_map_cpu_host_aperture);
-    data.DxgkDdiUnmapCpuHostAperture = Some(ddi::dxgkddi_unmap_cpu_host_aperture);
+    data.DxgkDdiMapCpuHostAperture = None;
+    data.DxgkDdiUnmapCpuHostAperture = None;
 
-    // ── Command submission (registered, but not advertised as usable yet) ────
+    // ── Command submission ──────────────────────────────────────────────────
     data.DxgkDdiSubmitCommand = Some(ddi::dxgkddi_submit_command);
     data.DxgkDdiSubmitCommandVirtual = Some(ddi::dxgkddi_submit_command_virtual);
     data.DxgkDdiPreemptCommand = Some(ddi::dxgkddi_preempt_command);
@@ -246,7 +245,7 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiUpdateMonitorLinkInfo = Some(ddi::dxgkddi_update_monitor_link_info);
     data.DxgkDdiExchangePreStartInfo = Some(ddi::dxgkddi_exchange_pre_start_info);
 
-    // ── Active HPS2 D3 one-primary MPO3 table. D9 publishes its capability
+    // ── Active D3 one-primary MPO3 table. D9 publishes its capability
     // through the same SURFACE value that derives the D2 authority predicate.
     data.DxgkDdiCheckMultiPlaneOverlaySupport3 =
         Some(ddi::dxgkddi_check_multi_plane_overlay_support3);

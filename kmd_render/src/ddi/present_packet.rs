@@ -8,7 +8,6 @@
 
 use core::ffi::c_void;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, Ordering};
 
 use helios_protocol::{
     D3DDDIFMT_A8R8G8B8, D3DDDI_ID_UNINITIALIZED, DXGI_FORMAT_B8G8R8A8_UNORM,
@@ -25,29 +24,32 @@ use crate::dxgk::*;
 // cannot hold the complete operation (ntstatus.h).
 pub(crate) const STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER: NTSTATUS = 0xC01E_0001u32 as NTSTATUS;
 
-// Version 3 appends the exact WindowedBlt admission token. Do not decode an
-// older layout as v3: the tail belongs to another private record there.
-const PRESENT_SUBMISSION_VERSION: u32 = 3;
+/// Opaque bytes that make an ordinary Present DMA packet non-empty. Submission
+/// ordering and allocation identity live in dxgkrnl-owned private data and
+/// allocation lists; the DMA payload carries no stream, cookie, or resource id.
+pub(crate) const PRESENT_DMA_PACKET_BYTES: usize = core::mem::size_of::<u32>();
+
+const PRESENT_SUBMISSION_VERSION: u32 = 4;
 const PRESENT_SUBMISSION_MAGIC: u32 = 0x4850_424C; // "HPBL"
-/// The same 32-byte record, written by `dxgkddi_render`'s D3D12 ECL arm instead
+/// The same 16-byte record, written by `dxgkddi_render`'s D3D12 ECL arm instead
 /// of by Present. "HD12" — distinct from `helios_protocol`'s wire-side
 /// `HELIOS_D3D12_SUBMIT_MAGIC` ("HE12") because they identify different things:
 /// that one is the UMD's command record, this one is the KMD's private handoff.
 ///
 /// It exists so `decode` can tell the scheduler that a submission belongs to a
 /// D3D12 command queue. The FIFO it feeds is adapter-global and strictly
-/// head-of-line, so any experiment that delays a packet MUST be able to name the
-/// packets it may delay; see `PresentSubmissionPrivate::mark_d3d12`.
+/// head-of-line, so every packet must retain its exact producer boundary; see
+/// `PresentSubmissionPrivate::mark_d3d12`.
 const D3D12_SUBMISSION_MAGIC: u32 = 0x4844_3132; // "HD12"
 
 /// Byte offset of [`PresentFlipPrivate`] inside the per-context DMA
-/// private-data buffer. [`PresentSubmissionPrivate`] owns bytes 0..32, so the
-/// flip record occupies bytes 32.. and the two never collide even when dxgkrnl
+/// private-data buffer. [`PresentSubmissionPrivate`] owns bytes 0..16; the
+/// established flip offset remains 32, so the two never collide when dxgkrnl
 /// batches a BLT and a flip into one DMA buffer.
 pub(crate) const PRESENT_FLIP_PRIVATE_OFFSET: usize = 32;
 
 /// `DmaBufferPrivateDataSize` this driver requests per context (`device.rs`'s
-/// CreateContext reads it from here). The D4 record is exactly 32 bytes and
+/// CreateContext reads it from here). The flip record is exactly 32 bytes and
 /// carries only the OS allocation/address/segment/operation pairing.
 pub(crate) const PRESENT_DMA_PRIVATE_DATA_BYTES: u32 = 64;
 
@@ -207,11 +209,6 @@ const _: () = {
     );
 };
 
-/// DISPATCH-safe proof that Present wrote a scheduler handoff marker.
-pub(crate) static PRESENT_MARKER_WRITES: AtomicU32 = AtomicU32::new(0);
-pub(crate) static PRESENT_MARKER_LAST_FENCE: AtomicU32 = AtomicU32::new(0);
-pub(crate) static PRESENT_MARKER_LAST_SIZE: AtomicU32 = AtomicU32::new(0);
-
 /// KMD-private scheduler handoff for a BLT submitted while building Present.
 ///
 /// This lives only in the per-context DMA private-data buffer allocated by
@@ -225,13 +222,6 @@ pub(crate) struct PresentSubmissionPrivate {
     magic: u32,
     version: u32,
     gpu_fence_id: u64,
-    /// Exact opaque stream boundary captured from the UMD present marker.
-    /// Bit 63 selects the stream namespace; zero means no stream marker and
-    /// SubmitCommand keeps its legacy current-wire behavior.
-    stream_boundary: u64,
-    /// Monotonic WindowedBlt request token. Zero means this submission has no
-    /// deferred BLT admission to promote.
-    blt_token: u64,
 }
 
 /// Whether a D3D12 ECL record found one of its own already in this DMA buffer.
@@ -254,8 +244,6 @@ pub(crate) enum D3d12Mark {
 #[derive(Clone, Copy)]
 pub(crate) struct PresentSubmissionBoundary {
     pub gpu_fence_id: u64,
-    pub stream_boundary: u64,
-    pub blt_token: u64,
     /// This submission carried a `HeliosD3D12SubmitCmd` — the scoping signal for
     /// anything that must apply to D3D12 ECL packets and to nothing else.
     ///
@@ -263,35 +251,29 @@ pub(crate) struct PresentSubmissionBoundary {
     /// fence VALUE. It **does** decide what to wait for: `wddm_boundary::select`
     /// reads it to choose `Kind::Exact` (the frame's own fence) over
     /// `Kind::Prefix` (the whole `next_wire_fence` backlog). That is the A4
-    /// repair, it is deliberate, and `kmd_logic` pins it with five tests. Its
-    /// second consumer is the `WddmHoldMs` experiment's scoping.
+    /// repair, it is deliberate, and `kmd_logic` pins it with five tests. It
+    /// has no diagnostic-delay or compatibility consumer.
     pub d3d12: bool,
 }
 
 impl PresentSubmissionPrivate {
-    /// `magic` says WHICH DDI arm wrote this record. The two are the same 32-byte
+    /// `magic` says WHICH DDI arm wrote this record. The two are the same 16-byte
     /// shape with the same field meanings; the distinction exists only so
     /// [`Self::decode`] can report a D3D12 ECL submission as itself — see
     /// [`D3D12_SUBMISSION_MAGIC`].
     #[inline]
-    fn for_parts(magic: u32, gpu_fence_id: u64, stream_boundary: u64, blt_token: u64) -> Self {
+    fn for_parts(magic: u32, gpu_fence_id: u64) -> Self {
         Self {
             magic,
             version: PRESENT_SUBMISSION_VERSION,
             gpu_fence_id,
-            stream_boundary,
-            blt_token,
         }
     }
 
     /// Whether a record already in the buffer is one PRESENT wrote.
     ///
-    /// ⚠ Deliberately NOT "either magic". The three Present writers must keep
-    /// their exact prior behaviour, and accepting the D3D12 magic here would not
-    /// be neutral: a D3D12 record's `stream_boundary`/`blt_token` are always 0, so
-    /// preserving those would write the same zeros, but its `gpu_fence_id` would
-    /// start being inherited into a Present record where before it was discarded.
-    /// `mark_d3d12` runs the mirror-image check on its own magic instead.
+    /// Deliberately not "either magic": a D3D12 record's fence must not be
+    /// inherited into an ordinary Present record.
     #[inline]
     fn is_present_record(&self) -> bool {
         self.magic == PRESENT_SUBMISSION_MAGIC && self.version == PRESENT_SUBMISSION_VERSION
@@ -328,17 +310,9 @@ impl PresentSubmissionPrivate {
         unsafe {
             core::ptr::write_unaligned(
                 private_data.cast::<PresentSubmissionPrivate>(),
-                Self::for_parts(
-                    PRESENT_SUBMISSION_MAGIC,
-                    merged,
-                    if recognised { old.stream_boundary } else { 0 },
-                    if recognised { old.blt_token } else { 0 },
-                ),
+                Self::for_parts(PRESENT_SUBMISSION_MAGIC, merged),
             );
         }
-        PRESENT_MARKER_LAST_FENCE.store(merged as u32, Ordering::Relaxed);
-        PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
-        PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -347,19 +321,15 @@ impl PresentSubmissionPrivate {
     ///
     /// # Why a second magic instead of a flag
     ///
-    /// The record is exactly full — 32 bytes at offset 0, with `PresentFlipPrivate`
-    /// immediately after it and a compile-time assert forbidding overlap — so
-    /// there is no spare field, and `PRESENT_DMA_PRIVATE_DATA_BYTES` is exactly
-    /// consumed. Identity also cannot ride the fence: `gpu_wire_fence` is legally
+    /// The record occupies 16 bytes at offset 0, with `PresentFlipPrivate` at
+    /// the established offset 32 and a compile-time assert forbidding overlap.
+    /// Identity cannot ride the fence: `gpu_wire_fence` is legally
     /// 0 (the documented *order it against nothing* arm), and [`Self::decode`]
     /// rejects an all-zero payload under Present's magic — as it must, so a zeroed
     /// buffer is never read as a boundary. A distinct magic is positively
     /// identifying with every payload field still 0, which is precisely what
     /// `HELIOS_D3D12_SUBMIT_MAGIC`'s own doc means by *"its mere presence is what
     /// identifies a submission as a D3D12 ECL packet"*.
-    ///
-    /// Deliberately does NOT touch the `PRESENT_MARKER_*` trio: `PmWr`/`PmWFn`/
-    /// `PmWSz` name the Present handoff, and `D12Rec` already counts this arm.
     ///
     /// # It is called for EVERY D3D12 record, including `gpu_fence_id == 0`
     ///
@@ -379,9 +349,7 @@ impl PresentSubmissionPrivate {
     /// max only over a predecessor under THIS magic — several ECL records can be
     /// batched into one DMA buffer, exactly as several Presents can, and wire
     /// fence ids are monotonic so the largest subsumes the earlier ones.
-    /// `stream_boundary` and `blt_token` are always ZEROED: a D3D12 ECL has no
-    /// present stream and no windowed BLT, so inheriting either from whatever
-    /// last used this buffer would attach a foreign dependency to this packet.
+    /// No auxiliary stream or raw-resource identity is carried here.
     ///
     /// # Safety
     /// `private_data` points to `private_size` writable bytes supplied by dxgkrnl
@@ -411,8 +379,6 @@ impl PresentSubmissionPrivate {
                     } else {
                         gpu_fence_id
                     },
-                    0,
-                    0,
                 ),
             );
         }
@@ -469,128 +435,13 @@ impl PresentSubmissionPrivate {
         if old.magic != D3D12_SUBMISSION_MAGIC || old.version != PRESENT_SUBMISSION_VERSION {
             return false;
         }
-        // Only the magic word, exactly as `decode` consumes it — a Present record
-        // written into the same buffer later must still be recognisable, and
-        // zeroing the whole struct would also discard a `stream_boundary` or
-        // `blt_token` that a Present arm may legitimately have merged.
+        // Only the magic word, exactly as `decode` consumes it.
         //
         // SAFETY: the size check above proved `private_data` non-null with at
         // least `size_of::<PresentSubmissionPrivate>()` writable bytes; `magic` is
         // the first field of that record, at offset 0.
         unsafe { core::ptr::write_unaligned(private_data.cast::<u32>(), 0) };
         true
-    }
-
-    /// Merge one same-context registered stream boundary into this submission.
-    /// A context owns at most one live stream, so repeated Present records can
-    /// only advance the same generation-qualified handle.  Different handles
-    /// are refused instead of being numerically compared across namespaces.
-    pub(crate) unsafe fn merge_stream_boundary(
-        private_data: *mut c_void,
-        private_size: u32,
-        boundary: u64,
-    ) -> Result<(), NTSTATUS> {
-        if private_data.is_null()
-            || (private_size as usize) < core::mem::size_of::<PresentSubmissionPrivate>()
-        {
-            return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
-        }
-        // This private record carries only the opaque tagged stream namespace;
-        // a legacy wire fence must stay in `gpu_fence_id` rather than being
-        // reinterpreted as a stream handle.
-        if boundary >> 63 != 1 || ((boundary >> 32) & 0x7fff_ffff) == 0 || boundary as u32 == 0 {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let old =
-            unsafe { core::ptr::read_unaligned(private_data.cast::<PresentSubmissionPrivate>()) };
-        let (gpu_fence_id, old_boundary, blt_token) = if old.is_present_record() {
-            (old.gpu_fence_id, old.stream_boundary, old.blt_token)
-        } else {
-            (0, 0, 0)
-        };
-        let merged_boundary = if old_boundary == 0 || old_boundary == boundary {
-            boundary
-        } else if (old_boundary >> 63) == 1
-            && (boundary >> 63) == 1
-            && ((old_boundary >> 32) & 0x7fff_ffff) == ((boundary >> 32) & 0x7fff_ffff)
-        {
-            // Same stream handle: values are monotonic, so the later/larger
-            // value subsumes the earlier marker without crossing namespaces.
-            let value = (old_boundary as u32).max(boundary as u32);
-            (boundary & !0xffff_ffff) | value as u64
-        } else {
-            return Err(STATUS_INVALID_PARAMETER);
-        };
-        unsafe {
-            core::ptr::write_unaligned(
-                private_data.cast::<PresentSubmissionPrivate>(),
-                Self::for_parts(
-                    PRESENT_SUBMISSION_MAGIC,
-                    gpu_fence_id,
-                    merged_boundary,
-                    blt_token,
-                ),
-            );
-        }
-        PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
-        PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
-        Ok(())
-    }
-
-    /// Carry a bounded WindowedBlt request token into the exact DMA submission
-    /// that admits its destination residency. Tokens may merge only under one
-    /// generation-qualified stream; the largest token then represents the
-    /// same-stream prefix SubmitCommand is allowed to promote.
-    pub(crate) unsafe fn merge_windowed_blt_token(
-        private_data: *mut c_void,
-        private_size: u32,
-        token: u64,
-        boundary: u64,
-    ) -> Result<(), NTSTATUS> {
-        if token == 0
-            || boundary >> 63 != 1
-            || ((boundary >> 32) & 0x7fff_ffff) == 0
-            || boundary as u32 == 0
-        {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        if private_data.is_null()
-            || (private_size as usize) < core::mem::size_of::<PresentSubmissionPrivate>()
-        {
-            return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
-        }
-        let old =
-            unsafe { core::ptr::read_unaligned(private_data.cast::<PresentSubmissionPrivate>()) };
-        let (gpu_fence_id, old_boundary, old_token) = if old.is_present_record() {
-            (old.gpu_fence_id, old.stream_boundary, old.blt_token)
-        } else {
-            (0, 0, 0)
-        };
-        let same_stream = old_boundary == 0
-            || (old_boundary >> 63) == 1
-                && ((old_boundary >> 32) & 0x7fff_ffff) == ((boundary >> 32) & 0x7fff_ffff);
-        if !same_stream {
-            return Err(STATUS_INVALID_PARAMETER);
-        }
-        let merged_boundary = if old_boundary == 0 || old_boundary == boundary {
-            boundary
-        } else {
-            (boundary & !0xffff_ffff) | u64::from((old_boundary as u32).max(boundary as u32))
-        };
-        unsafe {
-            core::ptr::write_unaligned(
-                private_data.cast::<PresentSubmissionPrivate>(),
-                Self::for_parts(
-                    PRESENT_SUBMISSION_MAGIC,
-                    gpu_fence_id,
-                    merged_boundary,
-                    old_token.max(token),
-                ),
-            );
-        }
-        PRESENT_MARKER_LAST_SIZE.store(private_size, Ordering::Relaxed);
-        PRESENT_MARKER_WRITES.fetch_add(1, Ordering::Relaxed);
-        Ok(())
     }
 
     /// Decode a scheduler submission's KMD-private data.
@@ -667,52 +518,15 @@ impl PresentSubmissionPrivate {
             return None;
         }
         let d3d12 = value.magic == D3D12_SUBMISSION_MAGIC;
-        let carries_boundary =
-            value.gpu_fence_id != 0 || value.stream_boundary != 0 || value.blt_token != 0;
+        let carries_boundary = value.gpu_fence_id != 0;
         (d3d12 || (value.magic == PRESENT_SUBMISSION_MAGIC && carries_boundary)).then_some(
             PresentSubmissionBoundary {
                 gpu_fence_id: value.gpu_fence_id,
-                stream_boundary: value.stream_boundary,
-                blt_token: value.blt_token,
                 d3d12,
             },
         )
     }
 
-    /// Locate a valid marker anywhere in a bounded private-data snapshot.
-    ///
-    /// This is diagnostic only. SubmitCommand must never use a scan result for
-    /// scheduling correctness: the exact WDDM private-data offset contract has
-    /// to be identified and encoded explicitly.
-    ///
-    /// # Safety
-    /// `private_data` points to `private_size` readable bytes supplied by
-    /// dxgkrnl for the current SubmitCommand call.
-    pub(crate) unsafe fn diagnostic_find_offset(
-        private_data: *const c_void,
-        private_size: u32,
-    ) -> Option<u32> {
-        const MAX_DIAGNOSTIC_BYTES: usize = 256;
-        let record_size = core::mem::size_of::<PresentSubmissionPrivate>();
-        let size = (private_size as usize).min(MAX_DIAGNOSTIC_BYTES);
-        if private_data.is_null() || size < record_size {
-            return None;
-        }
-        let base = private_data.cast::<u8>();
-        for offset in 0..=size - record_size {
-            if unsafe {
-                Self::peek(
-                    base.add(offset).cast(),
-                    (size - offset).min(u32::MAX as usize) as u32,
-                )
-            }
-            .is_some()
-            {
-                return Some(offset as u32);
-            }
-        }
-        None
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -849,7 +663,6 @@ struct PresentMpoAllocation {
 pub(crate) struct MpoPresentPacketPlan {
     dma: *mut c_void,
     next_dma: *mut c_void,
-    command: helios_protocol::HeliosPresentRefreshCmd,
     plane: PresentMpoAllocation,
 }
 
@@ -990,7 +803,7 @@ impl PresentMpoPayload {
             physical_address: unsafe { plane.PhysicalAddress.QuadPart as u64 },
         };
 
-        let dma_bytes = core::mem::size_of::<helios_protocol::HeliosPresentRefreshCmd>();
+        let dma_bytes = PRESENT_DMA_PACKET_BYTES;
         if !output_capacity(args.pDmaBuffer, args.DmaSize as usize, dma_bytes)
             || !output_capacity(
                 args.pDmaBufferPrivateData,
@@ -1008,25 +821,9 @@ impl PresentMpoPayload {
         let Some(next_dma_address) = (args.pDmaBuffer as usize).checked_add(dma_bytes) else {
             return Err(MpoPresentRefusal::PacketConstruction);
         };
-        let command = helios_protocol::HeliosPresentRefreshCmd {
-            magic: helios_protocol::HELIOS_PRESENT_REFRESH_MAGIC,
-            version: helios_protocol::HELIOS_PRESENT_REFRESH_VERSION,
-            // WDK 28000 says the Win7+ patch-list fields are unused, and the
-            // MPO plane list has no allocation-list index mapping. Do not force
-            // the classic source/destination indices onto this packet.
-            source_index: 0,
-            destination_index: 0,
-            present_ctx_id: 0,
-            present_value: 0,
-            present_cookie: 0,
-        };
-        if !command.is_valid() {
-            return Err(MpoPresentRefusal::PacketConstruction);
-        }
         Ok(MpoPresentPacketPlan {
             dma: args.pDmaBuffer,
             next_dma: next_dma_address as *mut c_void,
-            command,
             plane,
         })
     }
@@ -1040,20 +837,17 @@ impl MpoPresentPacketPlan {
     /// `prepare_mpo_present` proved the DMA pointer and size for this same
     /// `args` object.
     pub(crate) unsafe fn emit_mpo_present(self, args: &mut DXGKARG_PRESENT) {
-        // Consume the exact handle/segment/address tuple as one value. HERF has
-        // no identity fields: the WDK MPO list itself is dxgkrnl's allocation
-        // and placement contract, and inventing an allocation-list index here
-        // would be a different packet ABI.
+        // Consume the exact handle/segment/address tuple as one value. The WDK
+        // MPO list itself is dxgkrnl's allocation and placement contract, and
+        // inventing an allocation-list index in the DMA bytes would be a
+        // different packet ABI.
         let _exact_os_plane = (
             self.plane.open_handle.as_ptr(),
             self.plane.segment_id,
             self.plane.physical_address,
         );
         unsafe {
-            core::ptr::write_unaligned(
-                self.dma.cast::<helios_protocol::HeliosPresentRefreshCmd>(),
-                self.command,
-            );
+            core::ptr::write_unaligned(self.dma.cast::<u32>(), 0);
         }
         args.pDmaBuffer = self.next_dma;
         args.MultipassOffset = 0;

@@ -1,4 +1,4 @@
-//! Active HPS2 D3 one-primary MPO3 table for the local D9 source package.
+//! D3 one-primary MPO3 table for the active D9 source package.
 //! WDK 10.0.28000 ABI; every authority-bearing path is fenced by the D2
 //! SURFACE-derived predicate and reaches the exact allocation-object interface.
 

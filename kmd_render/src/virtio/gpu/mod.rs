@@ -26,7 +26,7 @@
 //!   * Synchronous verbs (ctx/blob/map) are enqueued with an optional
 //!     [`SyncWaitBlock`] waiter ([`VirtioGpu::enqueue_sync`]); the waiter
 //!     blocks at PASSIVE_LEVEL in `virtio::ctrl`, NEVER at DISPATCH under the
-//!     device spinlock (the 2026-07-04 Escape-convoy root cause).
+//!     device spinlock.
 //!   * Completed entries are parked (their `DmaBuffer`s are PASSIVE-only to
 //!     free) and reaped by PASSIVE callers via [`VirtioGpu::begin_parked_reap`].
 //!
@@ -46,8 +46,6 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use bytemuck::Zeroable;
 use helios_kmd_logic::control_ownership::HostRejection;
-use helios_kmd_logic::scanout_read_ledger::LedgerTicket;
-use helios_kmd_logic::scanout_refresh::{Marker as ScanoutRefreshMarker, State as RefreshState};
 use helios_protocol::{
     HELIOS_OPTIONAL_FEATURES, HELIOS_REQUIRED_FEATURES, VIRTIO_GPU_CMD_GET_DISPLAY_INFO,
     VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_CMD_SUBMIT_3D, VIRTIO_GPU_FLAG_FENCE,
@@ -60,9 +58,9 @@ use virtio_drivers::transport::pci::PciTransport;
 use virtio_drivers::transport::pci::bus::{DeviceFunction, PciRoot};
 use virtio_drivers::transport::{DeviceStatus, Transport};
 use wdk_sys::ntddk::{
-    KeInitializeEvent, KeQueryInterruptTimePrecise, KeSetEvent, ObDereferenceObjectDeferDelete,
+    KeInitializeEvent, KeSetEvent,
 };
-use wdk_sys::{KEVENT, PVOID};
+use wdk_sys::KEVENT;
 
 mod resource_tables;
 
@@ -76,9 +74,6 @@ use super::pci_caps::{HostVisibleWindow, map_isr_status_register, scan_host_visi
 use super::VirtioError;
 pub use super::counters::*;
 use crate::dxgk::{BOOLEAN, DXGKCB_SYNCHRONIZE_EXECUTION, DXGKRNL_INTERFACE, HANDLE, STATUS_SUCCESS};
-use crate::virtio::venus::{
-    OptimalPresentImageDesc, PreparedPresentBltSubmission, PresentDestinationDesc,
-};
 
 /// Control queue index (virtio-gpu controlq = 0; cursorq = 1 is unused).
 const CTRL_QUEUE: u16 = 0;
@@ -92,25 +87,7 @@ const SCRATCH_BYTES: usize = 4096;
 /// a volatile used-ring read + `spin_loop` (~10 ns) → bound ≈ 1 s.
 const CTRL_POLL_SPINS: u64 = 100_000_000;
 
-/// Windowed Present requests are fixed-capacity because they retain a KMD read
-/// lease until host completion. Exceeding this is a loud Present refusal, never
-/// an untracked copy whose snapshot slot DXVK may overwrite.
-const MAX_WINDOWED_BLT_PENDING: usize = 64;
-
-// The READ LEDGER has exactly one slot for every admissible WindowedBlt reader
-// plus the globally serialized direct flush reader. Keep this assertion at the
-// bound that governs the WindowedBlt issuer, not as a distant sizing comment.
-const _: () = {
-    assert!(helios_protocol::HELIOS_READ_LEDGER_SLOTS == MAX_WINDOWED_BLT_PENDING + 1);
-};
-
-// ── Host-visible blob mapping (Gate 5a Stage 2b, venus-over-Escape) ──────────
-// Ported (synchronous variant) from the proven System-class `kmd/src/virtio/gpu.rs`.
-// The venus ICD allocates HOST3D blobs (ALLOC_BLOB) and maps them into its address
-// space (MAP_BLOB) over `DxgkDdiEscape`; the KMD picks a window offset, issues
-// `RESOURCE_MAP_BLOB`, and the Escape handler maps `host_visible.base + offset`
-// into the calling process with `MmMapLockedPagesSpecifyCache` — the zero-copy BAR
-// model (no WDDM memory segment / GpuMmu; see GATE5_STAGE2_ALLOC_DESIGN.md).
+// ── KMD-internal host-visible blob mapping ───────────────────────────────────
 
 /// Page granularity for blob window offsets/sizes.
 pub(super) const BLOB_PAGE: u64 = 4096;
@@ -125,10 +102,10 @@ pub(super) const BLOB_PAGE: u64 = 4096;
 /// VK_ERROR_OUT_OF_HOST_MEMORY for new processes; dwm lost its device → no
 /// IddCx swapchain offers). 8192 slots ≈ 448 KiB of non-paged pool, reserved
 /// once at init. Exhaustion is now counted (`BLOB_FULL_REJECTS`) and visible
-/// via `HELIOS_ESCAPE_QUERY_STATS`; hitting the new cap indicates a leak, not
-/// a workload.
+/// through the bounded OS diagnostic callback; hitting the cap indicates a leak,
+/// not a workload.
 pub(crate) const MAX_BLOBS: usize = 8192;
-/// Max live virtio resources. This covers both escape blobs and KMD/WDDM standard
+/// Max live virtio resources. This covers both Venus blobs and KMD/WDDM standard
 /// allocations, so teardown can suppress duplicate RESOURCE_UNREF commands. Must
 /// be ≥ MAX_BLOBS (every blob is a live resource; non-blob resources add more).
 pub(super) const MAX_RESOURCES: usize = 16384;
@@ -146,10 +123,8 @@ const MAX_BLOB_MAP_BYTES: u64 = 256 << 20;
 // here because the window allocator still uses it directly at `map_blob_prepare`.
 use helios_kmd_logic::round_up_page;
 
-/// Result of the under-lock phase of MAP_BLOB ([`VirtioGpu::map_blob_prepare`]): the
-/// guest-physical range to map and the host's requested caching. The user-space
-/// mapping (MDL + `MmMapLockedPagesSpecifyCache`) is built by the Escape handler at
-/// PASSIVE_LEVEL, OUTSIDE the virtio spinlock.
+/// Result of the under-lock phase of MAP_BLOB ([`VirtioGpu::map_blob_prepare`]):
+/// the guest-physical range and host-requested caching for a bounded KMD map.
 #[derive(Clone, Copy)]
 pub struct BlobMapPrep {
     /// Guest-physical base of the resource's mapping inside the host-visible window.
@@ -161,16 +136,9 @@ pub struct BlobMapPrep {
 }
 
 /// One tracked blob resource.
-/// A device that can own escape-tracked state: dxgkrnl's `DXGKARG_ESCAPE.hDevice`
-/// for the escaping device, proven non-null.
-///
-/// The guest and kernel ownership domains used to share one `usize`
-/// representation, and 0 belonged to BOTH: it was a legal (forgeable) escape
-/// handle value AND the kernel's "KMD-owned, invisible to escape reclaim"
-/// sentinel. `NonZeroUsize` separates them — `Option<DeviceOwner>` costs no
-/// extra bytes (niche-optimised), `None` means KMD-owned, and an escape verb
-/// that takes a `DeviceOwner` cannot be handed the kernel sentinel at all
-/// (k-capsescape-01).
+/// Exact non-null dxgkrnl device identity used by K11 session ownership.
+/// `Option<DeviceOwner>` remains niche-optimised: `None` is KMD-owned and
+/// `Some` is an exact session/device owner, never a process or name lookup.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct DeviceOwner(core::num::NonZeroUsize);
 
@@ -179,41 +147,12 @@ impl DeviceOwner {
     pub fn new(raw: usize) -> Option<Self> {
         core::num::NonZeroUsize::new(raw).map(Self)
     }
-
-    /// The opaque handle value, for tables that are not owner-typed (the
-    /// user-mapping table) and for diagnostics.
-    pub fn raw(self) -> usize {
-        self.0.get()
-    }
-}
-
-/// A context id resolved through the tracking table against its owner.
-///
-/// The wire-facing context calls take this rather than a raw `u32`, so a
-/// guest-supplied id cannot reach the host without the table lookup. This is a
-/// real guarantee only because context tracking is mandatory
-/// (`VirtioGpu::reserve_context_slot`): with best-effort tracking the resolver
-/// would have to fall back to trusting unknown ids, and the type would merely
-/// relocate the check.
-#[derive(Clone, Copy)]
-pub struct OwnedCtx {
-    id: u32,
-}
-
-impl OwnedCtx {
-    /// The wire context id. Only reachable from a successful table lookup.
-    pub fn id(self) -> u32 {
-        self.id
-    }
 }
 
 /// Which slots a blob lookup may match.
 ///
-/// The two "no owner" concepts are deliberately NOT the same value: `Any` is a
-/// wildcard used by kernel paths that resolve by resource id alone (the paging
-/// engine, the Present blit, the scan-out diagnostics), while
-/// `Exactly(None)` means specifically the KMD-owned slots. Collapsing them
-/// would either break the kernel lookups or hand escapes a wildcard.
+/// `Any` is a kernel-only resource-id lookup; `Exactly(None)` selects only
+/// KMD-owned backing and `Exactly(Some(owner))` selects one exact K11 owner.
 #[derive(Clone, Copy)]
 pub enum OwnerFilter {
     Any,
@@ -222,13 +161,9 @@ pub enum OwnerFilter {
 
 #[derive(Clone, Copy)]
 struct BlobSlot {
-    /// The owner that allocated this blob: `Some(device)` for an escape-owned
-    /// blob, `None` for KMD-owned (venus infrastructure, or a blob adopted by a
-    /// WDDM allocation). `DxgkDdiDestroyDevice` reclaims every
-    /// blob tagged with the destroyed handle, so a crashing/forgetful ICD (e.g.
-    /// the crash-looping LogonUI, or any process that skips RELEASE_BLOB) cannot
-    /// leak the bounded blob table (`MAX_BLOBS`) and false-trip later allocations
-    /// with `STATUS_INSUFFICIENT_RESOURCES`.
+    /// `Some(device)` is an exact K11 session owner; `None` is KMD-owned Venus
+    /// infrastructure or an allocation backing. DestroyDevice drains the
+    /// session namespace before sweeping any surviving owner rows.
     owner: Option<DeviceOwner>,
     ctx_id: u32,
     resource_id: u32,
@@ -252,19 +187,6 @@ struct BlobSlot {
 struct WindowRange {
     offset: u64,
     len: u64,
-}
-
-/// Point-in-time occupancy snapshot of the bounded tables (see
-/// [`VirtioGpu::table_stats`]); consumed by `HELIOS_ESCAPE_QUERY_STATS`.
-#[derive(Clone, Copy)]
-pub struct TableStats {
-    pub blobs_live: u32,
-    pub resources_live: u32,
-    pub contexts_live: u32,
-    /// Bytes allocated in the window offset space (bump high-water minus free list).
-    pub window_used: u64,
-    /// Total window length (0 if the device exposes no host-visible window).
-    pub window_len: u64,
 }
 
 /// One tracked virtio-gpu context, tagged with the owning device handle for
@@ -297,24 +219,6 @@ const MAX_DMA_POOL_BYTES: usize = 2 * 1024 * 1024;
 const PARKED_ENQUEUE_GATE: usize = MAX_PARKED - MAX_INFLIGHT;
 /// Max concurrent WAIT_FENCE waiters.
 const MAX_FENCE_WAITERS: usize = 64;
-/// Max parked fence-event registrations (REGISTER_FENCE_EVENT). Sized for
-/// every venus process (dwm + apps + WUDFHost) to park several waits each
-/// (retire thread + app fence waits + flip/acquire gates); overflow is
-/// counted and the ICD falls back to the blocking-escape wait.
-const MAX_FENCE_EVENTS: usize = 256;
-/// Registered UMD present streams. The table is allocated once at transport
-/// initialization; every register/tag/retire lookup thereafter runs under the
-/// transport spinlock without allocating at DISPATCH.
-/// ⚠ ALIASES, NOT DEFINITIONS since 2026-08-06. The tagged-boundary and packed-
-/// handle ABI now lives in `helios_kmd_logic::present_stream`, because the six
-/// tests that cover it could never run inside this `panic = "abort"` cdylib. Two
-/// copies of these numbers would let the tested rules and the shipped ones drift.
-/// (`INDEX_BITS` has no alias here on purpose: after the delegation nothing in
-/// this crate packs or unpacks a handle by hand, and an unused alias is a warning.)
-const MAX_PRESENT_STREAMS: usize = helios_kmd_logic::present_stream::MAX_STREAMS;
-const PRESENT_STREAM_GENERATION_MAX: u32 = helios_kmd_logic::present_stream::GENERATION_MAX;
-/// Bit 63 distinguishes this from the legacy exclusive wire-fence namespace.
-pub const PRESENT_STREAM_BOUNDARY_TAG: u64 = helios_kmd_logic::present_stream::BOUNDARY_TAG;
 /// Max WDDM submissions pending on venus completion.
 const MAX_WDDM_PENDING: usize =
     helios_kmd_logic::ordered_engine::MAX_ORDERED_ENGINE_SUBMISSIONS;
@@ -323,111 +227,6 @@ const _: () = assert!(
         == helios_protocol::translation_session::HELIOS_HTS1_MAX_HOST_DISPATCH_FIFO_DEPTH
             as usize
 );
-/// Ceiling the `WddmHoldMs` knob is clamped to, IN CODE.
-///
-/// The hold delays the head of an adapter-global, strictly head-of-line FIFO, so
-/// an operator typo (`WddmHoldMs=100000`) must not be able to produce a TDR. 250
-/// ms is an eighth of the default `TdrDelay` (2 s) and still five orders of
-/// magnitude above the 0.8–1.1 µs `WaitForSingleObject` baseline the experiment
-/// reads against — the reading needs no more range than that, and the
-/// `MAX_WDDM_PENDING` overflow escape remains the second line of defence.
-const WDDM_HOLD_MS_MAX: u32 = 250;
-/// `WddmHoldMs`, snapshotted once at transport init. 0 = off (the default), which
-/// is the only value the shipping driver runs with.
-///
-/// ONE read site for this knob, deliberately: `dma_gpu_fence`'s doc records that
-/// a second, unread copy of a registry value existed here and was deleted so the
-/// two could not disagree. A static rather than a `VirtioGpu` field because the
-/// 60 Hz heartbeat in `adapter/kobj.rs` must test it WITHOUT taking `virtio_lock`
-/// — it is that heartbeat that provides the hold's release edge.
-///
-/// ⛔⛔ **SNAPSHOTTED AT `VirtioGpu::init`, SO SETTING THE REGISTRY VALUE DOES
-/// NOTHING UNTIL THE NEXT StartDevice.** `pnputil /restart-device` is enough (no
-/// reboot); without it the hold stays 0 and UV1's experiment silently does not
-/// run. This matters because the outcome of not running is INDISTINGUISHABLE from
-/// the experiment's own negative result: both produce the flat 0.8–1.1 µs
-/// `WaitForSingleObject` reading that the UV1 table at `diag::knobs::WDDM_HOLD_MS`
-/// grades as **UV1 ✗ — "say so loudly and stop"**. The discriminator is
-/// [`WDDM_HEAD_BLOCKED_HOLD`] (`WfBHold`): it must have MOVED during the measured
-/// window, or the run measured nothing. Its own doc carries the full precondition
-/// and the two other ways a flat reading arises.
-pub static WDDM_HOLD_MS: AtomicU32 = AtomicU32::new(0);
-/// `WddmHeadMs`: how long the head of the WDDM FIFO may stay blocked on a
-/// TAGGED-NAMESPACE dependency before that dependency is rebased onto the
-/// conservative wire watermark. Snapshotted once at transport init and CLAMPED —
-/// see [`WDDM_HEAD_MS_MIN`] / [`WDDM_HEAD_MS_MAX`].
-///
-/// A static, not a `VirtioGpu` field, for the same reason as [`WDDM_HOLD_MS`]: one
-/// read site, and readable without `virtio_lock`.
-pub static WDDM_HEAD_MS: AtomicU32 = AtomicU32::new(WDDM_HEAD_MS_DEFAULT);
-/// `WddmHeadMs`'s shipping default, in ms, and it is a DECISION (CLAUDE.md rule 8).
-///
-/// The bound exists because `present_stream_marker_boundary` accepts any nonzero
-/// marker value and bounds it in no way, so a guest can name a boundary
-/// `present_stream_slot_ready` will never satisfy — and `wddm_pending` is
-/// adapter-global and strictly head-of-line, so that blocks EVERY context, DWM's
-/// presents included, until either the 256-entry overflow drops 256 fences on the
-/// floor or dxgkrnl TDRs the adapter. `KMD_IMPACT.md` §14a.2 K-F2, which also
-/// records why the acceptance-side guard (`value <= submitted_value`) is refuted:
-/// on the shipping default the marker is delivered BEFORE the frame's
-/// `vkQueueSubmit` deliberately, so that test would refuse every legitimate frame.
-///
-/// 250 ms is picked, not tuned: an eighth of the default `TdrDelay` (2 s), so
-/// several rebases fit inside one TDR window, and ~68x the measured 3.7 ms/frame
-/// producer floor, so no legitimate frame's producer can reach it without the
-/// desktop having visibly frozen already.
-///
-/// 0 is the same-boot A/B disable and restores the historical unbounded head
-/// exactly — which is what makes the rebase's cost measurable rather than argued.
-const WDDM_HEAD_MS_DEFAULT: u32 = 250;
-/// Ceiling for `WddmHeadMs`, IN CODE. An operator typo (`WddmHeadMs=100000`) must
-/// not be able to reinstate the unbounded head and hence the TDR; 1 s is half the
-/// default `TdrDelay`, which is the largest bound that can still act before one.
-const WDDM_HEAD_MS_MAX: u32 = 1000;
-/// FLOOR for a nonzero `WddmHeadMs`, IN CODE, and it protects correctness rather
-/// than liveness: a rebase RELEASES a fence whose named producer has not completed,
-/// which is the 0ab-B stale/black-frame class. A 1 ms bound would rebase healthy
-/// frames continuously. 100 ms is ~27 frames at the measured producer floor.
-const WDDM_HEAD_MS_MIN: u32 = 100;
-/// Which blocked arm reached [`VirtioGpu::rebase_blocked_head`].
-///
-/// An enum rather than a `bool`, because the value is only ever used to select a
-/// counter and a bare `true` at the call site would say nothing about which arm it
-/// meant. There is no `Wire` variant on purpose: the wire arm returns
-/// `BlockedOnProducer` without ever calling the rebase (it has nothing to rebase
-/// onto), and the hold arm is not a dependency.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum RebaseArm {
-    /// The present-stream boundary was still unsatisfied.
-    Stream,
-    /// The windowed-BLT terminal prefix was still unsatisfied.
-    Blt,
-}
-
-/// The FIFO head's armed `WddmHeadMs` deadline, in interrupt-time 100 ns units, or
-/// 0 when nothing is armed — which is the state of every ordinary desktop.
-///
-/// ⛔ IT IS STATE, NOT CONFIGURATION, AND THE DISTINCTION IS THE WHOLE POINT. The
-/// 60 Hz heartbeat in `adapter/kobj.rs` needs to know whether it should prompt a
-/// completion DPC, and the obvious-looking test — *"is `WddmHeadMs` non-zero"* —
-/// is TRUE ON EVERY SHIPPING BOOT, because [`WDDM_HEAD_MS_DEFAULT`] is 250. That
-/// would fire `request_wddm_completion_dpc` on all 60 ticks a second forever, on a
-/// desktop with no D3D12 client at all: a permanent DISPATCH tax on the exact
-/// compositor path WS2 fought over. This atomic is non-zero only while a head is
-/// genuinely waiting on a bound it may exceed.
-///
-/// ⚠ A HINT, NEVER THE AUTHORITY. The authoritative deadline lives on the FIFO
-/// entry (`WddmPending::head_deadline_100ns`); this is a lock-free shadow so a
-/// caller holding no transport lock can ask "is there any point in a DPC". It may
-/// therefore be STALE in exactly one direction: a head that retires normally before
-/// its deadline leaves a future value behind, which costs at most ONE spurious DPC
-/// (the reader claims and clears it — see [`VirtioGpu::wddm_head_bound_due`]) and
-/// never a repeating one. It is deliberately not cleared on the hot success path.
-///
-/// ⚠ Driver-global, like [`WDDM_HOLD_MS`], and for the same reason: one adapter,
-/// one FIFO, and the heartbeat cannot take `virtio_lock`. A value left behind by a
-/// dead transport generation costs the same single DPC.
-static WDDM_HEAD_DEADLINE_100NS: AtomicU64 = AtomicU64::new(0);
 /// Max response bytes a synchronous command may expect (copied into the
 /// waiter's [`SyncWaitBlock`]; the largest runtime response is
 /// `VirtioGpuRespMapInfo`. `init`'s big GET_DISPLAY_INFO reply stays on the
@@ -437,25 +236,13 @@ pub const SYNC_RESP_MAX: usize = 64;
 /// header followed by the device-written ctrl response.
 pub const SUBMIT_META_BYTES: usize =
     core::mem::size_of::<VirtioGpuCmdSubmit>() + core::mem::size_of::<VirtioGpuCtrlHdr>();
-/// Bytes for one DISPATCH-level fast-bind command buffer: the device-read
-/// `SET_SCANOUT_BLOB` followed by the device-written ctrl response (ROADMAP
-/// defect 0ab-C, D1(ii)).
+/// Bytes for one fixed direct-plane command buffer: the device-read
+/// `SET_SCANOUT_BLOB` followed by the device-written ctrl response.
 pub const BIND_CMD_BYTES: usize =
     core::mem::size_of::<VirtioGpuSetScanoutBlob>() + core::mem::size_of::<VirtioGpuCtrlHdr>();
-/// Fast-bind command buffers held in the pool.
-///
-/// A SINGLE buffer was the coverage bottleneck (22.22.220.0, measured): the
-/// buffer only returns to the driver at the guest DPC drain, which lags the
-/// host's consume by several flip periods under load, so ~18 % of flips found it
-/// in flight and fell back to the worker's late bind (`FpBusy` 1776/run against
-/// `FpBind` +98 once the skip predicate stopped hiding them). Four covers that
-/// lag with the same "one buffer per outstanding command" ownership rule — no
-/// sharing, no reuse-before-completion.
-///
-/// It is BOTH the reserved capacity and the refill bound: `init` fills to it and
-/// every return site checks `len` against it, so the pool can never grow past
-/// the capacity reserved at PASSIVE and therefore never reallocates under the
-/// device spinlock.
+/// Fixed direct-plane queue depth. Every slot owns one command buffer for its
+/// complete transport lifetime; no buffer is shared or recycled through an
+/// unrelated control path.
 const BIND_CMD_POOL: usize = 4;
 
 /// The D4 half of each transport generation uses the upper half of the ordinary
@@ -1266,242 +1053,6 @@ pub struct SyncWaitBlock {
     resp: UnsafeCell<[u8; SYNC_RESP_MAX]>,
 }
 
-/// Stable adapter-owned notification target for a scanout copy submitted on a
-/// GPU-completion ring. The used-ring drain sets `pending` and wakes `event`
-/// only after a successful ring-1 SUBMIT_3D completion.
-///
-/// Fields are PRIVATE and there is exactly one constructor,
-/// [`Self::for_adapter`], which derives all four pointers from a single
-/// `&AdapterContext`. That is what makes "the four pointers always come from the
-/// same adapter" structural rather than assembled field by field.
-///
-/// It can only be attached to a submission through
-/// [`VirtioGpu::enqueue_scanout_submit`], which hard-codes ring 1 — the ring the
-/// drain actually honours. A notify on any other ring used to be silently
-/// discarded at completion with no counter, and because the drain is the ONLY
-/// clear of `vidpn_programming` on the copied-primary path, that stranded the
-/// pending Windows primary and its programming ownership indefinitely.
-///
-/// The four `NonNull`s' validity rests on the adapter outliving the transport,
-/// which StopDevice enforces by ordering (transport removal after cancel/join),
-/// and on `init_kernel_events` having run before any `KeSetEvent` on `hpd_event`.
-/// Neither is encodable — the self-referential lifetime (`VirtioGpu` lives inside
-/// the `AdapterContext` it points back into) is what defeats it — so both are
-/// documented HERE, once, instead of on four fields.
-/// The virtio ring whose used-ring completion represents real host GPU
-/// completion, and therefore the only one on which a [`ScanoutNotify`] may be
-/// honoured. Ring 0 retires at host DECODE, which is too early to publish pixels.
-pub(crate) const SCANOUT_RING_IDX: u32 = 1;
-
-#[derive(Clone, Copy)]
-pub struct ScanoutNotify {
-    pending: NonNull<AtomicU32>,
-    /// Address of the Windows primary whose compatibility copy this submission
-    /// performs. Published as displayed only on successful GPU completion.
-    displayed_primary: NonNull<AtomicU64>,
-    /// Exact SetVidPnSourceAddress programming gate, packed `(seq << 32) | active`.
-    /// Cleared after the copy succeeds or fails so VSync can resume with
-    /// authoritative state — but only for THIS submission's interval, named by
-    /// `ticket`.
-    programming: NonNull<AtomicU64>,
-    /// The programming generation this submission belongs to, carried BY VALUE
-    /// rather than only as a pointer to the gate. A completion that arrives
-    /// after a newer interval was raised fails its compare-exchange and counts
-    /// `ScStale` instead of clearing a gate that is not its own.
-    ticket: crate::adapter::ProgrammingTicket,
-    primary_address: u64,
-    event: NonNull<KEVENT>,
-}
-
-/// Typed completion token for one scan-out `RESOURCE_FLUSH` (ROADMAP defect
-/// 0ab-B).
-///
-/// The generic `AsyncControl` completion plumbing —
-/// `completion`/`completion_errors`/`wake_event`/`success_store` — can say THAT
-/// a control command finished; it cannot say WHICH presentation the host read
-/// while finishing it. That identity is the whole content of the ownership
-/// invariant, so it travels as its own value: `covers_epoch` is the presentation
-/// epoch the host was bound to when this exact command was enqueued, and a
-/// returned response therefore proves the host has read that buffer.
-///
-/// Carrying the adapter pointer (rather than a `NonNull<AtomicU64>` to the
-/// watermark alone) is deliberate: ending a lease also publishes any withheld
-/// primary address and wakes the worker that can pop the WDDM pending FIFO, and
-/// splitting those across three raw pointers is exactly the class of mistake
-/// `ScanoutNotify`'s four-pointer doc paragraph was written about.
-///
-/// Validity rests on the same fact `ScanoutNotify` documents: the adapter
-/// outlives the transport, enforced by ordering in StopDevice (transport removal
-/// after cancel/join), and every field this touches is an atomic on the shared
-/// `&AdapterContext` that every DDI, ISR and DPC already holds — no `&mut` to it
-/// exists anywhere in the driver.
-pub struct ScanoutFlushToken {
-    adapter: NonNull<crate::adapter::AdapterContext>,
-    covers_epoch: u64,
-    trace_id: u64,
-    /// The venus resource this exact read names — the D4a ledger identity
-    /// (FIX-DESIGN-d4a.md §3.2). `covers_epoch` cannot stand in for it: the
-    /// MMIO/desktop path reads with `NO_LEASE` epochs, and those reads must
-    /// still retire in the ledger.
-    resource_id: u32,
-    /// Exact generation-qualified ledger claim for this read. An unledgered
-    /// direct flush carries `LedgerTicket::NONE`; WindowedBlt refuses one.
-    ledger_ticket: LedgerTicket,
-    /// `complete` ran; `Drop` must not retire a second time. A plain field,
-    /// not an atomic: the token is single-owner and never `Copy`.
-    done: bool,
-}
-
-static NEXT_SCANOUT_FLUSH_ID: AtomicU64 = AtomicU64::new(0);
-
-impl ScanoutFlushToken {
-    /// The ONE construction site, called from
-    /// `queue_active_scanout_refresh_locked` with the epoch it snapshotted and
-    /// the ledger slot its issue bump claimed.
-    pub(crate) fn new(
-        adapter: &crate::adapter::AdapterContext,
-        covers_epoch: u64,
-        resource_id: u32,
-        ledger_ticket: LedgerTicket,
-    ) -> Self {
-        Self {
-            adapter: NonNull::from(adapter),
-            covers_epoch,
-            trace_id: NEXT_SCANOUT_FLUSH_ID
-                .fetch_add(1, Ordering::Relaxed)
-                .wrapping_add(1),
-            resource_id,
-            ledger_ticket,
-            done: false,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn trace_context(&self) -> (u64, u64, u32) {
-        (self.trace_id, self.covers_epoch, self.resource_id)
-    }
-
-    /// The ONE ledger-retirement site (`ledger_retire`, §3.2): every
-    /// constructed token reaches it exactly once — from [`Self::complete`]
-    /// (host OK and host-error arms) or, if `complete` never ran, from `Drop`
-    /// (enqueue failure, in-flight table teardown).
-    ///
-    /// Legal at PASSIVE and at DISPATCH under `virtio_lock`: atomics, the leaf
-    /// event lock, `KeSetEvent(Wait = FALSE)` — no allocation, no registry
-    /// write, never `wddm_notify_lock`.
-    fn retire_ledger(&mut self, via_drop: bool) {
-        if self.done {
-            return;
-        }
-        self.done = true;
-        // SAFETY: per the type's doc — the adapter outlives every in-flight
-        // transport entry, and the call touches only atomics + the leaf lock.
-        unsafe { self.adapter.as_ref() }.read_ledger.retire(
-            self.ledger_ticket,
-            via_drop,
-        );
-    }
-
-    /// Consume the token when the control response has been drained.
-    ///
-    /// `ok` is the `VIRTIO_GPU_RESP_*` verdict. A host ERROR still ends the
-    /// lease, and that is not a loophole: the command has terminated, so no
-    /// future read can originate from it. It is counted as `Cancelled` rather
-    /// than `HostRead` precisely so an error storm cannot masquerade as healthy
-    /// publication.
-    ///
-    /// Runs at DISPATCH_LEVEL inside the used-ring drain, holding `virtio_lock`.
-    /// It must therefore NOT take `wddm_notify_lock` — the driver's order is the
-    /// reverse — which is why every operation it reaches is a monotone atomic.
-    pub(crate) fn complete(mut self, ok: bool) {
-        crate::ddi::scanout_timeline::note(
-            crate::ddi::scanout_timeline::kind::FLUSH_COMPLETE,
-            if ok {
-                crate::ddi::scanout_timeline::flag::SUCCESS
-            } else {
-                0
-            },
-            self.covers_epoch,
-            0,
-            self.trace_id,
-            self.resource_id,
-            0,
-        );
-        // Ledger first, BEFORE the `NO_LEASE` early return below: the desktop
-        // path's reads carry no epoch but are still host readbacks the ledger
-        // issued, and the D4a invariant is one retirement per issue, no
-        // exceptions. (`self.done` then makes the implicit `Drop` at this
-        // function's exit a no-op.)
-        self.retire_ledger(false);
-        crate::ddi::scanout_trace::note_lease_read_done();
-        if self.covers_epoch == helios_kmd_logic::scanout_lease::NO_LEASE {
-            // Nothing was bound with an epoch when this flush was issued — the
-            // MMIO/`FlipOnVSyncMmIo` desktop path, which mints no presentations
-            // at all. That is not a stale token, it is a read with nothing to
-            // cover, and counting it as one made `LsStal` read 389 of 389 on an
-            // idle desktop, i.e. useless for the thing it exists to detect.
-            return;
-        }
-        let reason = if ok {
-            crate::ddi::scanout_trace::LeaseEnd::HostRead
-        } else {
-            crate::ddi::scanout_trace::LeaseEnd::Cancelled
-        };
-        // SAFETY: per the type's doc — the adapter outlives every in-flight
-        // transport entry, and the call touches only its atomics.
-        let advanced =
-            unsafe { self.adapter.as_ref() }.end_scanout_leases_through(self.covers_epoch, reason);
-        if !advanced {
-            // The token was at or behind the watermark: a coalesced, duplicated
-            // or reordered read. Inert by construction — counted so that
-            // "inert" is a measurement rather than an assumption, because a
-            // large `LsStal` means the flush path is spending host readbacks on
-            // presentations nobody is waiting for.
-            crate::ddi::scanout_trace::note_lease_stale();
-        }
-    }
-}
-
-impl Drop for ScanoutFlushToken {
-    /// The backstop that makes the D4a liveness matrix rows 4 and 5 true BY
-    /// TYPE: a token dropped without `complete` — the enqueue-failure arm
-    /// (`resource_flush_async` / `enqueue_async_control` error paths, some at
-    /// DISPATCH under `virtio_lock`) and the in-flight table dying with its
-    /// `VirtioGpu` (PASSIVE, transport removal) — still retires its ledger
-    /// issue, counted `RdDrp`.
-    ///
-    /// Deliberately NOT the lease-end site: the enqueue-failure caller ends
-    /// exactly the epochs it named (`end_scanout_leases_through`, counted
-    /// `LsCanc`) and `latch_failed_and_fail_inflight` completes in-flight
-    /// tokens explicitly — duplicating that here would double-count the `Ls*`
-    /// census. The ledger is the one obligation only the token can discharge.
-    fn drop(&mut self) {
-        self.retire_ledger(true);
-    }
-}
-
-impl ScanoutNotify {
-    /// The ONE construction site. Reached through
-    /// `AdapterContext::scanout_notify`.
-    pub(crate) fn for_adapter(
-        adapter: &crate::adapter::AdapterContext,
-        primary_address: u64,
-        ticket: crate::adapter::ProgrammingTicket,
-    ) -> Self {
-        Self {
-            pending: NonNull::from(&adapter.scanout_refresh_pending),
-            displayed_primary: NonNull::from(&adapter.last_primary_address),
-            programming: NonNull::from(&adapter.vidpn_programming),
-            ticket,
-            primary_address,
-            // SAFETY: hpd_event is embedded in the stable adapter and
-            // initialized by init_kernel_events before StartDevice creates any
-            // Venus submissions.
-            event: unsafe { NonNull::new_unchecked(adapter.hpd_event.get()) },
-        }
-    }
-}
-
 impl SyncWaitBlock {
     /// Run `f` with a wait block that is zeroed and initialised in place on
     /// THIS frame and is never nameable by the caller.
@@ -1638,311 +1189,17 @@ impl WaitBlockRef<'_> {
 
 /// What an in-flight entry is.
 enum InFlightKind {
-    /// A synchronous control command; `waiter` (if any) is signaled on
-    /// completion. `None` = the waiter timed out and abandoned the entry.
+    /// A synchronous control command; `waiter` is cleared if its stack owner
+    /// abandons the wait before the descriptor completes.
     Sync {
         waiter: Option<NonNull<SyncWaitBlock>>,
-        /// A synchronous SET_SCANOUT_BLOB already reached the control FIFO.
-        /// Its waiter may time out, but an eventual successful response still
-        /// changes the host's scanout selection and must remain visible to
-        /// DestroyAllocation's lifetime barrier.
-        scanout_bind: Option<SyncScanoutBind>,
     },
-    /// An async fenced SUBMIT_3D carrying `fence_id` (KMD-assigned wire id).
-    /// `ring_idx` 0 = host CPU ring (retires at decode); >= 1 = a per-queue
-    /// GPU-completion fence (virglrenderer vkr sync thread) that legally stays
-    /// in flight for the full GPU-work duration.
+    /// A fenced SUBMIT_3D carrying the KMD-assigned wire identity.
     AsyncVenus {
         fence_id: u64,
         ring_idx: u8,
-        /// Exact HNR2 context/session/allocation custody. Only the bounded
-        /// nonzero-endpoint executor sets this; compatibility submissions keep
-        /// it absent.
         native_completion: Option<crate::ddi::native_render::NativeHostCompletion>,
-        scanout_notify: Option<ScanoutNotify>,
-        /// Registered present-stream value this normal wire-fence submission
-        /// retires.  The stream handle carries its generation, so a stale
-        /// completion can never advance a re-registered stream slot.
-        present_stream: Option<PresentStreamRetire>,
-        /// Exact deferred WindowedBlt transaction whose ring-1 response this
-        /// entry represents. It owns no allocation pointers; lookup remains in
-        /// the bounded FIFO by token/stream.
-        windowed_blt: Option<WindowedBltRetire>,
     },
-    /// A fire-and-forget `SET_SCANOUT_BLOB` enqueued by the DISPATCH-level flip
-    /// arm (ROADMAP defect 0ab-C, D1(ii)).
-    ///
-    /// VALUES ONLY, and that is the design rather than an accident: the entry
-    /// carries no allocation handle and no pointer into any WDDM object, so its
-    /// completion has nothing to dereference and the DestroyAllocation cancel
-    /// path (`retire_scanout_allocation_locked`, which CASes the single pending
-    /// slot) is untouched by it. The fast path deliberately does NOT claim the
-    /// pending slot: hiding the handle from that CAS is the use-after-free this
-    /// feature was analysed out of.
-    ///
-    /// `seq` orders this bind's bookkeeping against the PASSIVE worker's
-    /// (`AdapterContext::scanout_bind_wire_seq`); the rest is exactly what
-    /// applying that bookkeeping needs — the identity to remember, the epoch to
-    /// publish, the physical address the next CRTC_VSYNC reports, and the frame
-    /// boundary the flush arm must order against.
-    AsyncScanoutBind {
-        seq: u64,
-        resource_id: u32,
-        /// `(width << 32) | height`, as `remember_scanout_blob` wants it.
-        wh: u64,
-        format: u32,
-        stride: u32,
-        offset: u32,
-        present_epoch: u64,
-        primary_address: u64,
-        carried_watermark: u64,
-    },
-    /// A control command whose caller must not wait for the host response.
-    /// `completion` is a stable adapter-owned 0/1 gate; the used-ring drain
-    /// clears it and wakes the stable worker event.  This lets scanout refresh
-    /// coalesce to one outstanding RESOURCE_FLUSH without a synchronous ctrl
-    /// round-trip limiting presentation cadence.
-    AsyncControl {
-        completion: NonNull<AtomicU32>,
-        completion_errors: NonNull<AtomicU32>,
-        wake_event: NonNull<KEVENT>,
-        success_store: Option<(NonNull<AtomicU32>, u32)>,
-        resubmit: Option<NonNull<AtomicU32>>,
-        /// Which presentation this command's host read covers, when it is a
-        /// scan-out `RESOURCE_FLUSH`. `None` for every other async control
-        /// command. See [`ScanoutFlushToken`].
-        scanout_flush: Option<ScanoutFlushToken>,
-    },
-}
-
-#[derive(Clone, Copy)]
-struct WindowedBltRetire {
-    adapter: NonNull<crate::adapter::AdapterContext>,
-    token: u64,
-    stream_boundary: u64,
-}
-
-/// Value-only lifecycle tag for a synchronous `SET_SCANOUT_BLOB`.
-///
-/// This stays in the transport entry after its stack-resident waiter is
-/// abandoned.  The used-ring drain can therefore record a late successful host
-/// bind without dereferencing the caller's frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct SyncScanoutBind {
-    seq: u64,
-    resource_id: u32,
-    /// Unique standard virtio-gpu fence carried by this SET. Zero preserves
-    /// the legacy SET shape; only the SURFACE-derived D2 owner requests a fence.
-    fence_id: u64,
-    /// Present only for a direct-primary worker SET. Disable/fallback SETs
-    /// still carry their resource/sequence into the host-selection ledger but
-    /// do not begin a presentation publication transaction.
-    request: Option<ScanoutBindRequest>,
-}
-
-/// The lifecycle tag reaches the host-selection ledger only for a terminal
-/// successful response.  Kept pure so the timeout/late-completion contract has
-/// a host-testable edge independent of the WDK transport.
-#[inline]
-fn terminal_sync_scanout_bind(
-    response_ok: bool,
-    scanout_bind: Option<SyncScanoutBind>,
-) -> Option<SyncScanoutBind> {
-    helios_kmd_logic::present_stream::terminal_on_response_ok(response_ok, scanout_bind)
-}
-
-/// The stream-side payload attached to one ordinary async Venus submission.
-/// Values advance monotonically when the normal wire fence reaches a terminal
-/// completion; this is deliberately separate from the wire-fence namespace.
-#[derive(Clone, Copy)]
-struct PresentStreamRetire {
-    handle: u32,
-    value: u32,
-}
-
-/// One preallocated registered present stream. `creator_process` stores the
-/// opaque `hKmdProcess` value associated with the owning `DeviceContext`; it is
-/// used only for exact equality and is purged at owner/context teardown.
-#[derive(Clone, Copy)]
-struct PresentStreamSlot {
-    live: bool,
-    owner: Option<DeviceOwner>,
-    ctx_id: u32,
-    ring_idx: u8,
-    generation: u32,
-    cookie: u64,
-    creator_process: usize,
-    submitted_value: u32,
-    retired_value: u32,
-}
-
-impl PresentStreamSlot {
-    const EMPTY: Self = Self {
-        live: false,
-        owner: None,
-        ctx_id: 0,
-        ring_idx: 0,
-        generation: 0,
-        cookie: 0,
-        creator_process: 0,
-        submitted_value: 0,
-        retired_value: 0,
-    };
-
-    fn handle(self, index: usize) -> u32 {
-        // Low six bits are the raw slot index.  Generation is nonzero, so the
-        // whole handle is nonzero without making slot 63 carry into bit 6.
-        // This keeps the packed handle within the 31 bits reserved by the
-        // tagged-boundary ABI.
-        helios_kmd_logic::present_stream::slot_handle(self.generation, index)
-    }
-}
-
-/// Allocate the bounded present-stream registry outside `VirtioGpu::init`'s
-/// already-critical boot stack frame.
-///
-/// This table used to be an inline `[PresentStreamSlot; 64]` field. Because
-/// `VirtioGpu` is returned by value through `DxgkDdiStartDevice`, LLVM
-/// materialized that 3 KiB array in both frames and took the measured nested
-/// boot chain from the 17,936-byte known-good ceiling to 29,264 bytes. On the
-/// 24 KiB x64 kernel stack that double-faults before Windows can write a dump,
-/// surfacing only as `0xc0000001`/Startup Repair.
-///
-/// `#[inline(never)]` keeps the small allocation loop transient. The returned
-/// boxed slice is fixed-length for the entire transport generation, so no
-/// registration, submission, completion, DPC, or teardown path can reallocate.
-#[inline(never)]
-fn allocate_present_streams() -> Box<[PresentStreamSlot; MAX_PRESENT_STREAMS]> {
-    let mut slots = Box::<[PresentStreamSlot; MAX_PRESENT_STREAMS]>::new_uninit();
-    let first = slots.as_mut_ptr().cast::<PresentStreamSlot>();
-    for index in 0..MAX_PRESENT_STREAMS {
-        // SAFETY: `first` addresses the boxed array allocation and every index
-        // is in bounds. Each element is written exactly once before
-        // `assume_init` below; no reference to an uninitialized slot is made.
-        unsafe { first.add(index).write(PresentStreamSlot::EMPTY) };
-    }
-    // SAFETY: the loop initialized all MAX_PRESENT_STREAMS elements.
-    unsafe { slots.assume_init() }
-}
-
-/// Bounded completion-ordered scanout work.
-///
-/// There are intentionally only two records. `earliest` is the first pending
-/// producer boundary and is never overwritten by a faster Present stream; it
-/// guarantees that a continuously submitting app cannot postpone every dirty
-/// edge forever. `latest` coalesces the later work, but retains *its own*
-/// resource/boundary pair. Once the earliest completes, it is issued first
-/// unless the latest is already safe, in which case the latest supersedes it.
-///
-/// This lives behind a Box in `VirtioGpu`: StartDevice already has a narrow
-/// kernel-stack budget, so even this fixed, small state must not grow its
-/// by-value construction frame.
-struct ScanoutRefreshState {
-    inner: RefreshState,
-}
-
-#[inline(never)]
-fn allocate_scanout_refresh_state() -> Box<ScanoutRefreshState> {
-    Box::new(ScanoutRefreshState {
-        inner: RefreshState::new(),
-    })
-}
-
-impl ScanoutRefreshState {
-    fn clear(&mut self) {
-        self.inner.clear();
-    }
-
-    fn note(&mut self, marker: ScanoutRefreshMarker, ready: bool) -> bool {
-        self.inner.note(marker, ready)
-    }
-
-    fn earliest(&self) -> Option<ScanoutRefreshMarker> {
-        self.inner.earliest()
-    }
-
-    fn latest(&self) -> Option<ScanoutRefreshMarker> {
-        self.inner.latest()
-    }
-
-    fn take_ready(
-        &mut self,
-        earliest_ready: bool,
-        latest_ready: bool,
-    ) -> Option<ScanoutRefreshMarker> {
-        self.inner.take_ready(earliest_ready, latest_ready)
-    }
-
-    fn discard_dead_present_stream_markers<F>(&mut self, stream_live: F)
-    where
-        F: Fn(u64) -> bool,
-    {
-        self.inner.discard_cancelled(|marker| {
-            decode_present_stream_boundary(marker.boundary()).is_none()
-                || stream_live(marker.boundary())
-        });
-    }
-}
-
-/// Readiness for one decoded stream slot.
-///
-/// A dead or generation-mismatched slot is never success.  Its owner must
-/// explicitly discharge any scheduler/scanout wait that still carries the old
-/// boundary before the slot is retired; accepting it here would turn a rejected
-/// producer into a false `DMA_COMPLETED` edge.
-#[inline]
-fn present_stream_slot_ready(
-    slot: PresentStreamSlot,
-    index: usize,
-    handle: u32,
-    value: u32,
-) -> bool {
-    helios_kmd_logic::present_stream::slot_ready(
-        slot.live,
-        slot.generation,
-        index,
-        handle,
-        value,
-        slot.retired_value,
-    )
-}
-
-#[inline]
-fn advance_present_stream_retired(retired_value: u32, completed_value: u32) -> u32 {
-    helios_kmd_logic::present_stream::advance_retired(retired_value, completed_value)
-}
-
-/// Encode a generation-qualified opaque present-stream boundary.
-#[inline]
-pub fn encode_present_stream_boundary(handle: u32, value: u32) -> u64 {
-    helios_kmd_logic::present_stream::encode_boundary(handle, value)
-}
-
-/// Decode a tagged boundary.  Legacy wire-fence boundaries are intentionally
-/// not accepted here: their ordering relation is unrelated to stream values.
-#[inline]
-pub fn decode_present_stream_boundary(boundary: u64) -> Option<(u32, u32)> {
-    helios_kmd_logic::present_stream::decode_boundary(boundary)
-}
-
-/// Capacity of the fixed, allocation-free registered present-stream table.
-pub fn max_present_streams() -> usize {
-    MAX_PRESENT_STREAMS
-}
-
-/// Take the scan-out ownership token out of an in-flight entry, leaving the rest
-/// of the entry intact.
-///
-/// Both drain paths do `match entry.kind { .. }` by value and then PARK the
-/// entry (a `DmaBuffer` may not be freed above PASSIVE), so the token — the one
-/// non-`Copy` field in `InFlightKind` — has to come out first or `entry` is
-/// partially moved. Not making [`ScanoutFlushToken`] `Copy` is deliberate:
-/// completing one twice would count a host read that never happened.
-fn take_scanout_flush_token(kind: &mut InFlightKind) -> Option<ScanoutFlushToken> {
-    match kind {
-        InFlightKind::AsyncControl { scanout_flush, .. } => scanout_flush.take(),
-        _ => None,
-    }
 }
 
 fn take_native_completion(
@@ -1965,239 +1222,6 @@ fn has_native_completion(kind: &InFlightKind) -> bool {
             ..
         }
     )
-}
-
-/// What one DISPATCH-level fast bind asks for: the wire command's geometry plus
-/// the bookkeeping its completion must apply (ROADMAP defect 0ab-C, D1(ii)).
-///
-/// One `Copy` value rather than eleven arguments, so the enqueue and the
-/// in-flight entry cannot disagree about which flip they describe.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ScanoutBindRequest {
-    pub resource_id: u32,
-    pub width: u32,
-    pub height: u32,
-    /// `ScanoutFormat::virtio()` — the wire format word.
-    pub format: u32,
-    pub stride: u32,
-    pub offset: u32,
-    /// The presentation epoch this flip minted.
-    pub present_epoch: u64,
-    /// The physical address a later CRTC_VSYNC reports for this primary.
-    pub primary_address: u64,
-    /// The frame-completion boundary the flip took out of the mark table (0 =
-    /// none), which the flush arm orders against.
-    pub carried_watermark: u64,
-}
-
-/// A fast bind the host has ACCEPTED, waiting for its bookkeeping to be applied
-/// outside `virtio_lock` (ROADMAP defect 0ab-C, D1(ii)).
-///
-/// The drain cannot apply it itself: applying ends in a flush arm that needs
-/// `wddm_notify_lock`, and the driver's order is notify → virtio (see
-/// `adapter/locks.rs`). So the drain stashes these values and
-/// `drain_used_and_complete` — one frame up the same DPC, holding no transport
-/// lock — applies them.
-#[derive(Clone, Copy)]
-pub struct CompletedBind {
-    pub seq: u64,
-    pub resource_id: u32,
-    pub wh: u64,
-    pub present_epoch: u64,
-    pub primary_address: u64,
-    pub carried_watermark: u64,
-    pub format: u32,
-    pub stride: u32,
-    pub offset: u32,
-}
-
-pub(crate) enum SyncBindApply {
-    Applied { ready: bool, carried: bool },
-    Stale,
-    Foreign,
-    Inconsistent,
-}
-
-/// Move-only proof that one exact transport instance has sealed fast-bind
-/// admission while `resource_id` is being retired.
-pub(crate) struct ScanoutRetireToken {
-    transport_instance: u64,
-    resource_id: u32,
-    wire_sequence: u64,
-    accepted_sequence: u64,
-    host_resource: u32,
-    selection_ambiguous: bool,
-}
-
-impl ScanoutRetireToken {
-    pub(crate) const fn transport_instance(&self) -> u64 {
-        self.transport_instance
-    }
-
-    pub(crate) const fn wire_sequence(&self) -> u64 {
-        self.wire_sequence
-    }
-
-    pub(crate) const fn accepted_sequence(&self) -> u64 {
-        self.accepted_sequence
-    }
-
-    pub(crate) const fn host_resource(&self) -> u32 {
-        self.host_resource
-    }
-
-    pub(crate) const fn selection_ambiguous(&self) -> bool {
-        self.selection_ambiguous
-    }
-}
-
-#[inline]
-pub fn completed_request(bind: CompletedBind) -> ScanoutBindRequest {
-    ScanoutBindRequest {
-        resource_id: bind.resource_id,
-        width: (bind.wh >> 32) as u32,
-        height: bind.wh as u32,
-        format: bind.format,
-        stride: bind.stride,
-        offset: bind.offset,
-        present_epoch: bind.present_epoch,
-        primary_address: bind.primary_address,
-        carried_watermark: bind.carried_watermark,
-    }
-}
-
-/// Heap-owned fixed storage for the fast-bind completion handoff and its one
-/// completion-ordered request. Keeping these values out of `VirtioGpu`'s
-/// by-value construction path preserves the StartDevice stack ceiling; the box
-/// is allocated once at PASSIVE and never resized under a spinlock.
-struct FastBindState {
-    completed: Option<CompletedBind>,
-    /// Exactly one host-visible presentation SET may be outstanding.  It owns
-    /// the full request through its SET response and, on success, through that
-    /// request's exact RESOURCE_FLUSH response.  This is fixed value-only
-    /// state: it never extends a Windows allocation lifetime or allocates under
-    /// `virtio_lock`.
-    publication_request: Option<ScanoutBindRequest>,
-    /// Exact direct SET accepted by the queue when the supposedly-free
-    /// publication slot could not be claimed. This is invariant quarantine,
-    /// not a retry source; a strictly later accepted SET(0) or physical
-    /// transport replacement is the only release proof.
-    orphaned_set: Option<SyncScanoutBind>,
-    publication: helios_kmd_logic::scanout_publish_txn::State,
-    /// Highest direct presentation epoch whose SET descriptor was accepted by
-    /// the control queue. Unlike the host-reader transaction this is never
-    /// lowered by a host error, flush terminal response, or resource retirement:
-    /// admitting an older descriptor would make control-FIFO scanout move
-    /// backward after a newer presentation already reached the host.
-    presentation_epoch_floor: u64,
-    /// The oldest unresolved producer boundary.  This is a liveness frontier:
-    /// do not overwrite it with a newer frame, or a stream producing more
-    /// quickly than it retires can starve scanout forever.
-    deferred_earliest: Option<ScanoutBindRequest>,
-    /// One coalescing slot behind the frontier.  Once the frontier retires we
-    /// prefer this newest ready request, retaining it if it is still waiting.
-    deferred_latest: Option<ScanoutBindRequest>,
-    /// Last SET_SCANOUT_BLOB which the host acknowledged.  It survives the
-    /// DPC's value handoff, so DestroyAllocation can issue a real disable
-    /// barrier even during the response-to-bookkeeping gap.
-    host_accepted_seq: u64,
-    host_accepted_resource: u32,
-    host_accepted_fast: bool,
-    host_accepted_fast_request: Option<ScanoutBindRequest>,
-    selection_ambiguity: helios_kmd_logic::scanout_retire::SelectionAmbiguity,
-    /// DestroyAllocation sets this while it is establishing its disable
-    /// barrier.  A later DISPATCH flip for the same resource is refused before
-    /// it can place a new SET behind that barrier.
-    retiring_resource: u32,
-    /// Global lifecycle barrier while DestroyAllocation resolves the final host
-    /// scanout selection. The PASSIVE worker is serialized by `scanout_mutex`,
-    /// so only the DISPATCH fast path needs this explicit gate.
-    retire_barrier: bool,
-    /// Exact request claimed by the synchronous worker. It remains cached after
-    /// a successful response so a flip thread preempted between publishing the
-    /// pending handle and staging its fast request cannot enqueue the same SET
-    /// behind the worker's already-completed one. A distinct worker claim
-    /// replaces it.
-    sync_worker_owned: Option<ScanoutBindRequest>,
-    deferred_worker: Option<ScanoutBindRequest>,
-    fast_failure_wake: Option<ScanoutBindRequest>,
-}
-
-#[inline(never)]
-fn allocate_fast_bind_state() -> Box<FastBindState> {
-    Box::new(FastBindState {
-        completed: None,
-        publication_request: None,
-        orphaned_set: None,
-        publication: helios_kmd_logic::scanout_publish_txn::State::new(),
-        presentation_epoch_floor: 0,
-        deferred_earliest: None,
-        deferred_latest: None,
-        host_accepted_seq: 0,
-        host_accepted_resource: 0,
-        host_accepted_fast: false,
-        host_accepted_fast_request: None,
-        selection_ambiguity: helios_kmd_logic::scanout_retire::SelectionAmbiguity::new(),
-        retiring_resource: 0,
-        retire_barrier: false,
-        sync_worker_owned: None,
-        deferred_worker: None,
-        fast_failure_wake: None,
-    })
-}
-
-/// Why a fast bind did not reach the wire. Both arms leave the transport
-/// exactly as they found it.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum FastBindRefusal {
-    /// Every preallocated command buffer is still in flight (`FpBusy`).
-    Busy,
-    /// This direct presentation is at or below an already-accepted SET epoch.
-    /// It is terminal, not queue pressure, and must not be retried.
-    Superseded,
-    /// The command could not be encoded, or the ring refused it (`FpErr`). The
-    /// buffer is back in its slot.
-    Failed,
-}
-
-/// Result of staging or promoting one completion-ordered fast bind. `Deferred`
-/// owns no DMA buffer and does not touch the wire sequence; `Queued` is the
-/// only outcome that has published a `SET_SCANOUT_BLOB` descriptor.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum FastBindDispatch {
-    Queued,
-    Deferred,
-    /// The exact request is already owned or completed by the synchronous
-    /// worker. No fast descriptor was published and no fallback is needed.
-    Handled,
-    /// The request was at/below the descriptor-acceptance floor and was
-    /// discarded without publishing another SET.
-    Superseded,
-    Busy,
-    Failed,
-}
-
-/// Whether the refresh executor may issue a read for the currently sampled
-/// scanout resource.  This is deliberately a tri-state, rather than an
-/// `Option<request>`: an active transaction for another resource or in either
-/// non-ready phase must block an ordinary atomic-epoch refresh, never fall
-/// through as though no transaction existed.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum PublicationRefresh {
-    NoActive,
-    ReadyExact(ScanoutBindRequest),
-    Blocked,
-}
-
-/// Decision for the PASSIVE synchronous fallback.  `Abandoned` is distinct
-/// from `Waiting`: retrying a destroyed or explicitly dead producer would
-/// retain the programming gate with no future used-ring wake.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum WorkerBindDispatch {
-    Ready,
-    Waiting,
-    Abandoned,
-    Superseded,
 }
 
 /// One outstanding control-queue submission. Owns its device-visible buffers
@@ -2345,33 +1369,6 @@ struct FenceWaiter {
     block: NonNull<SyncWaitBlock>,
 }
 
-/// A usermode event registered for one-shot signaling at wire-fence retirement
-/// (REGISTER_FENCE_EVENT, KMD 22.22.54). `event` is the executive event
-/// object's body (a `KEVENT`) from `ObReferenceObjectByHandle` — the escape
-/// handler took a reference, so the object outlives the registering process;
-/// whoever removes the entry MUST dereference it (the drain uses
-/// `ObDereferenceObjectDeferDelete` — a plain deref at DISPATCH could run the
-/// object's PASSIVE-only deletion if it drops the last reference).
-struct FenceEventEntry {
-    fence_id: u64,
-    event: NonNull<KEVENT>,
-}
-
-/// Result of [`VirtioGpu::fence_event_register`].
-pub enum FenceEventReg {
-    /// Parked; the drain will KeSetEvent + deref at retirement.
-    Registered,
-    /// The fence has already retired. NOT parked, no reference kept by the
-    /// table — the caller signals + derefs.
-    AlreadyComplete,
-    /// The id was never assigned by this transport instance.
-    Invalid,
-    /// Table full (counted) — the caller falls back to the blocking wait.
-    TableFull,
-    /// This (fence_id, event) pair is already parked (counted, refused).
-    Duplicate,
-}
-
 /// First wire fence id the NEXT transport instance will hand out.
 ///
 /// Driver-global and monotonic across StartDevice/StopDevice cycles. Starts at
@@ -2411,10 +1408,6 @@ fn reserve_scanout_transport_instance() -> Option<u64> {
     }
 }
 
-/// WDDM submissions whose fence was gated on their exact live present stream
-/// boundary instead of the whole `next_wire_fence` backlog (`PresentWmk=1`).
-/// Mirrored as `PwExact`; zero while the knob is off is the correct reading.
-pub(crate) static PRESENT_EXACT_WATERMARK_USED: AtomicU32 = AtomicU32::new(0);
 /// D3D12 ECL submissions gated on the EXACT wire fence their batch ends at rather
 /// than on the prefix below it (A4, `docs/dx12/PENDING.md` §1). Mirrored as
 /// `D12Exact`.
@@ -2536,12 +1529,6 @@ impl WindowAllocator {
         self.next_offset == self.reserve && self.free_ranges.is_empty()
     }
 
-    /// Bytes currently handed out.
-    fn used(&self) -> u64 {
-        let free: u64 = self.free_ranges.iter().map(|r| r.len).sum();
-        self.next_offset.saturating_sub(free)
-    }
-
     /// Allocate a page-rounded `len`-byte range: reuse a free range if one fits,
     /// else bump the high-water mark (bounded by `window_len`).
     fn alloc(&mut self, len: u64) -> Result<u64, VirtioError> {
@@ -2646,9 +1633,7 @@ enum RetireDomain {
 /// backlog."* A prefix wait is satisfied only when EVERY async fence below the
 /// watermark has retired — every ring, every process, DWM's ring-1 scanout copies
 /// included — so it delays the fence by the whole pipeline depth and is the
-/// over-wait `PRESENT_EXACT_WATERMARK_USED` had to relax away on the present path
-/// (measured: dxgkrnl blocks the presenting thread at its 3-deep present queue,
-/// 21 % of presents, 2.45 ms each).
+/// over-wait avoided by the exact D3D12 boundary path.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WireBoundary {
     /// `watermark` is EXCLUSIVE and a PREFIX: every async fence strictly below it
@@ -2683,166 +1668,13 @@ struct WddmPending {
     /// frontier. This is scheduler-private lifetime state; it never crosses a
     /// wire or renderer ABI and is not looked up by a resource identity.
     engine_ticket: crate::adapter::OrderedEngineTicket,
-    /// Legacy normal-wire producer boundary (possibly the KMD scanout-copy
-    /// ring-1 fence).  This namespace is intentionally separate from
-    /// `stream_boundary` below.
+    /// Normal-wire producer boundary (possibly the KMD scanout-copy ring-1
+    /// fence).
     watermark: u64,
     /// Whether `watermark` is a prefix bound or the one fence this packet's own
     /// work ends at. See [`WireBoundary`].
     wire_boundary: WireBoundary,
     domain: RetireDomain,
-    /// Optional generation-qualified registered-stream marker carried by the
-    /// KMD private DMA record.  A WDDM completion requires BOTH boundaries.
-    stream_boundary: Option<u64>,
-    /// Exact WindowedBlt request admitted by this scheduler submission. A
-    /// token is not comparable across streams; readiness tests membership in
-    /// the bounded terminal set, never a global numeric watermark.
-    blt_token: Option<u64>,
-    /// Preserved exact stream identity for `blt_token`. `stream_boundary` can
-    /// be discharged after generation death, but a dispatched copy still has
-    /// to wait for the terminal pair rather than `(token, None)`.
-    blt_stream_boundary: Option<u64>,
-    /// `WddmHoldMs`: interrupt-time deadline (100 ns units) before which this
-    /// entry may not complete, or 0 for every ordinary submission.
-    ///
-    /// ⚠ THE ONLY ARTIFICIAL DELAY IN THIS STRUCT, and the only field here that
-    /// does not describe real work. It is set exclusively for a packet that
-    /// carried a `HeliosD3D12SubmitCmd`, because this FIFO is adapter-global and
-    /// head-of-line: attaching a hold to anything else stalls DWM. It exists to
-    /// answer UV1 — whether dxgkrnl orders the D3D12 runtime's monitored-fence
-    /// signal behind our DMA packets — and nothing in the shipping path reads it,
-    /// since the knob defaults to 0.
-    hold_until_100ns: u64,
-    /// `WddmHeadMs`: absolute interrupt-time deadline (100 ns units) after which
-    /// this entry's TAGGED-namespace dependencies are rebased onto the conservative
-    /// wire watermark. 0 until the first blocked look at this entry AS HEAD arms it.
-    ///
-    /// ⚠ Armed lazily, and from the HEAD position only, because the bound is on how
-    /// long the head may block. An entry that sits in the FIFO behind legitimately
-    /// slow predecessors has not blocked on anything of its own.
-    head_deadline_100ns: u64,
-    /// Set once this entry has been rebased. A second rebase could only make the
-    /// dependency STRICTER — it would install a NEWER `next_wire_fence` — so it is
-    /// forbidden rather than merely pointless.
-    rebased: bool,
-}
-
-/// One WDDM submission represents every WindowedBlt terminal for the same
-/// generation-qualified stream through `max_token`.  Tokens have no ordering
-/// relation across streams, so the decoded stream handle is part of the
-/// representation rather than an optimization.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct WindowedBltTerminalPrefix {
-    max_token: u64,
-    max_boundary: u64,
-}
-
-impl WindowedBltTerminalPrefix {
-    fn new(max_token: u64, max_boundary: u64) -> Option<Self> {
-        let _ = decode_present_stream_boundary(max_boundary)?;
-        (max_token != 0).then_some(Self {
-            max_token,
-            max_boundary,
-        })
-    }
-
-    fn contains(self, token: u64, boundary: u64) -> bool {
-        helios_kmd_logic::windowed_blt_token::prefix_contains(
-            self.max_token,
-            self.max_boundary,
-            token,
-            boundary,
-        )
-    }
-}
-
-/// One complete two-phase WindowedBlt transaction. It is created by Present
-/// while holding scanout -> venus -> virtio, but cannot submit until the exact
-/// same stream/token appears in SubmitCommand after residency is effective.
-#[derive(Clone, Copy)]
-pub(crate) struct WindowedBltPending {
-    adapter: NonNull<crate::adapter::AdapterContext>,
-    pub(crate) token: u64,
-    pub(crate) stream_boundary: u64,
-    pub(crate) source_resource_id: u32,
-    pub(crate) destination_resource_id: u32,
-    pub(crate) source: OptimalPresentImageDesc,
-    pub(crate) destination: PresentDestinationDesc,
-    pub(crate) prepared: PreparedPresentBltSubmission,
-    pub(crate) ledger_ticket: LedgerTicket,
-    pub(crate) admitted: bool,
-    pub(crate) dispatched: bool,
-    pub(crate) ring_complete: bool,
-    pub(crate) ledger_retired: bool,
-    /// `false` after the WDDM overflow path has discarded the DMA completion
-    /// that formerly owned this token. The host copy may still need to reach
-    /// ring completion, but it must not retain a terminal membership no WDDM
-    /// submission can ever consume.
-    pub(crate) wddm_completion_required: bool,
-    pub(crate) system_backing: bool,
-    pub(crate) mirror_claimed: bool,
-}
-
-/// Preallocated FIFO plus an exact terminal-membership table. Keeping terminal
-/// identity as `(token, stream)` avoids the unsound cross-context conclusion
-/// that a larger token means an unrelated stream has completed.
-struct WindowedBltState {
-    pending: VecDeque<WindowedBltPending>,
-    /// Submission-order admission queue. Present order is not a residency
-    /// order across contexts, so only SubmitCommand may push here.
-    ready: VecDeque<u64>,
-    terminal: VecDeque<(u64, u64)>,
-    next_token: u64,
-}
-
-impl WindowedBltState {
-    fn new() -> Self {
-        Self {
-            pending: VecDeque::with_capacity(MAX_WINDOWED_BLT_PENDING),
-            ready: VecDeque::with_capacity(MAX_WINDOWED_BLT_PENDING),
-            terminal: VecDeque::with_capacity(MAX_WINDOWED_BLT_PENDING),
-            next_token: 1,
-        }
-    }
-
-    fn issue_token(&mut self) -> Option<u64> {
-        // Terminal identities stay resident until their WDDM fence is
-        // delivered/requeued. Count both populations, otherwise a blocked
-        // WDDM head could silently evict a newer terminal identity.
-        if self.pending.len() + self.terminal.len() >= MAX_WINDOWED_BLT_PENDING {
-            return None;
-        }
-        let token = self.next_token;
-        self.next_token = self.next_token.checked_add(1)?;
-        Some(token)
-    }
-
-    fn terminal_contains(&self, token: u64, stream_boundary: u64) -> bool {
-        self.terminal
-            .iter()
-            .any(|&(known, stream)| known == token && stream == stream_boundary)
-    }
-
-    /// A merged private record is complete only when its own terminal exists
-    /// AND no still-pending request from that same stream can belong to the
-    /// represented token prefix. A numeric token from another stream never
-    /// participates in either part of this test.
-    fn terminal_prefix_ready(&self, prefix: WindowedBltTerminalPrefix) -> bool {
-        self.terminal_contains(prefix.max_token, prefix.max_boundary)
-            && !self.pending.iter().any(|request| {
-                request.wddm_completion_required
-                    && prefix.contains(request.token, request.stream_boundary)
-            })
-    }
-
-    /// Discard exactly the terminal identities represented by a successfully
-    /// delivered WDDM DMA completion (or by an overflow that abandoned it).
-    /// Entries for an interleaved stream stay resident even if their numeric
-    /// tokens are lower.
-    fn consume_terminal_prefix(&mut self, prefix: WindowedBltTerminalPrefix) {
-        self.terminal
-            .retain(|&(token, boundary)| !prefix.contains(token, boundary));
-    }
 }
 
 /// A WDDM submission popped from the pending FIFO whose `DMA_COMPLETED` has not
@@ -2859,9 +1691,6 @@ impl WindowedBltState {
 #[must_use = "a popped WDDM fence must be delivered or requeued, never dropped"]
 pub struct WddmReady {
     pending: WddmPending,
-    /// Kept as a compact prefix until the interrupt callback succeeds. Taking
-    /// a WDDM entry never removes terminals, so requeue cannot lose a batch.
-    terminal_prefix: Option<WindowedBltTerminalPrefix>,
 }
 
 /// The outcome of one attempt to retire the head of the WDDM pending FIFO.
@@ -2896,10 +1725,6 @@ pub enum WddmAdmission {
 impl WddmReady {
     pub(crate) fn engine_ticket(&self) -> crate::adapter::OrderedEngineTicket {
         self.pending.engine_ticket
-    }
-
-    pub(crate) fn terminal_prefix(&self) -> Option<WindowedBltTerminalPrefix> {
-        self.terminal_prefix
     }
 
     /// Consume the token after `DMA_COMPLETED` was delivered successfully.
@@ -2991,16 +1816,12 @@ pub struct VirtioGpu {
     /// Tracked blobs (resource_id → size/mapping state). Heap-reserved to MAX_BLOBS
     /// at init so `push` under the spinlock never reallocates (the 0x7F lesson).
     blobs: Vec<BlobSlot>,
-    /// Blob-table slots reserved by in-flight (multi-phase) creates, counted
-    /// against MAX_BLOBS so a burst of concurrent creates cannot overshoot the
-    /// reserved capacity (push under the spinlock must never reallocate).
-    blobs_reserved: usize,
     /// Every host-live virtio resource id created through this transport.
     /// Removal is one-shot and gates CTX_DETACH_RESOURCE/RESOURCE_UNREF, avoiding
     /// qemu `RESOURCE_UNREF: resource does not exist` errors from duplicate DDI
     /// teardown paths.
     resources: Vec<u32>,
-    /// Live-resource slots reserved by in-flight creates (see `blobs_reserved`).
+    /// Live-resource slots reserved by in-flight creates.
     resources_reserved: usize,
     /// Context tracking slots reserved by in-flight CTX_CREATEs. Tracking is
     /// MANDATORY (see `reserve_context_slot`), so a context is reserved before
@@ -3035,52 +1856,8 @@ pub struct VirtioGpu {
     /// existing virtio spinlock, but allocation/free never occurs there.
     dma_pool: Vec<DmaBuffer>,
     dma_pool_bytes: usize,
-    /// The command buffers the DISPATCH-level fast bind may use (ROADMAP defect
-    /// 0ab-C, D1(ii)), allocated at transport init and recycled by the drain
-    /// forever after.
-    ///
-    /// TAKING A BUFFER IS THE GATE — no companion counter, because a counter and
-    /// a buffer can disagree and these cannot. An empty pool means
-    /// [`BIND_CMD_POOL`] binds are already outstanding (the flip arm counts
-    /// `FpBusy` and falls through to the worker's bind, i.e. today's behaviour),
-    /// or that the allocations failed at init, in which case the accelerator is
-    /// simply off for this transport generation.
-    ///
-    /// Depth 4 rather than 1 since 22.22.221.0: a buffer is only returned by the
-    /// guest's DPC drain, which lags the host's consume by several flip periods
-    /// under load, so one buffer left ~18 % of flips uncovered. See
-    /// [`BIND_CMD_POOL`].
-    ///
-    /// ⚠ A `Vec` RATHER THAN A `[Option<DmaBuffer>; 4]`, and that is a measured
-    /// requirement, not a preference. Before `VirtioGpu` became heap-returned,
-    /// it was built in `DxgkDdiStartDevice`'s frame, which the T3 kernel-stack
-    /// overflow left with ~160 bytes of headroom; the inline array's 128 bytes
-    /// took the boot chain to 18128 against the 17936-byte known-good ceiling
-    /// (`tools/kmd-frame-sizes.ps1`, and it fails the build gate). Three words
-    /// of `Vec` header put the buffers on the heap instead.
-    ///
-    /// Capacity is reserved ONCE at init and `len` never exceeds
-    /// [`BIND_CMD_POOL`], so the pushes below never reallocate under the device
-    /// spinlock — the same discipline `inflight`/`parked`/`dma_pool` follow, and
-    /// for the same reason (the 0x7F lesson).
-    bind_cmd_pool: Vec<DmaBuffer>,
-    /// Fixed fast-bind handoff state. It owns both the newest host-accepted
-    /// bind awaiting application and the single unready producer-bound request.
-    /// See [`FastBindState`].
-    fast_bind: Box<FastBindState>,
     /// Registered WAIT_FENCE waiters (capacity MAX_FENCE_WAITERS).
     fence_waiters: Vec<FenceWaiter>,
-    /// Usermode events awaiting wire-fence retirement (capacity
-    /// MAX_FENCE_EVENTS, reserved at init — pushes never reallocate under the
-    /// spinlock). Entries hold an object reference each.
-    fence_events: Vec<FenceEventEntry>,
-    /// Registered present streams. Fixed-size heap storage keeps the large
-    /// table out of the StartDevice/VirtioGpu::init stack chain while remaining
-    /// allocation-free on registration, tagging, completion, and DISPATCH
-    /// marker-readiness paths.
-    present_streams: Box<[PresentStreamSlot; MAX_PRESENT_STREAMS]>,
-    /// Fresh opaque registration capability.  Zero is never issued.
-    next_present_stream_cookie: u64,
     /// Next wire fence id to assign (globally monotonic, starts at 1; 0 is
     /// never a valid wire fence).
     next_wire_fence: u64,
@@ -3112,10 +1889,6 @@ pub struct VirtioGpu {
     /// WDDM submissions pending on venus completion, FIFO (capacity
     /// MAX_WDDM_PENDING, reserved at init).
     wddm_pending: VecDeque<WddmPending>,
-    /// Bounded two-phase WindowedBlt transactions. Both deques reserve at
-    /// StartDevice, so Present/Submit/DPC mutations never allocate under the
-    /// virtio spinlock.
-    windowed_blt: WindowedBltState,
     /// Bounded completion-ordered DWM/primary dirty state.  Its oldest
     /// outstanding marker is retained for liveness while one later marker is
     /// coalesced with exact resource identity; boxed to keep StartDevice's
@@ -3147,13 +1920,6 @@ pub struct VirtioGpu {
     /// copy of the same registry value; it was deleted 2026-08-05 so the two
     /// cannot disagree.
     dma_gpu_fence: bool,
-    /// `PresentWmk`: gate a WDDM submission that carries a LIVE present stream
-    /// boundary on that exact boundary alone, instead of additionally on the
-    /// whole `next_wire_fence` backlog. Default 1 since 22.22.244.0; `0` is the
-    /// same-boot A/B disable that restores the historical superset.
-    /// See the watermark arm in [`Self::note_wddm_submission`].
-    present_exact_watermark: bool,
-    scanout_refresh: Box<ScanoutRefreshState>,
     /// Ring-corruption latch: set when the used ring returns a token we do not
     /// track or `pop_used` fails structurally. The ring state is then
     /// untrustworthy and every subsequent command fails fast. NOTE: unlike the
@@ -3276,16 +2042,9 @@ impl VirtioGpu {
         // the device, response is written by it. The page is a local RAII
         // `DmaBuffer` — the runtime paths own per-command buffers instead
         // (C3/M3.4), so no shared scratch survives init.
-        // The fast bind's command buffers, minted HERE because `DmaBuffer::new`
-        // is `MmAllocateContiguousMemory` (PASSIVE-only) and the path that uses
-        // them runs at DISPATCH under the device spinlock. A `None` is not a
-        // failure: that slot is simply never available, and a fully empty pool
-        // degrades to every flip arm counting `FpBusy`, which is exactly the
-        // pre-0ab-C behaviour.
-        //
-        // The capacity is reserved here, at PASSIVE, so every later `push` under
-        // the device spinlock is reallocation-free. A short pool (an allocation
-        // that failed) is a degraded accelerator, never an error.
+        // Allocate the fixed direct-plane command owners at PASSIVE_LEVEL.
+        // Their buffers are installed into `InterruptQueue` once and remain
+        // there until transport teardown.
         let mut bind_cmd_pool = Vec::with_capacity(BIND_CMD_POOL);
         for _ in 0..BIND_CMD_POOL {
             let Some(buf) = DmaBuffer::new(passive, BIND_CMD_BYTES) else {
@@ -3417,7 +2176,6 @@ impl VirtioGpu {
             host_visible,
             isr_status_va,
             blobs: Vec::with_capacity(MAX_BLOBS),
-            blobs_reserved: 0,
             resources: Vec::with_capacity(MAX_RESOURCES),
             resources_reserved: 0,
             contexts_reserved: 0,
@@ -3433,15 +2191,10 @@ impl VirtioGpu {
             native_terminal_drain_in_progress: false,
             dma_pool: Vec::with_capacity(MAX_DMA_POOL),
             dma_pool_bytes: 0,
-            bind_cmd_pool,
-            fast_bind: allocate_fast_bind_state(),
             fence_waiters: Vec::with_capacity(MAX_FENCE_WAITERS),
-            fence_events: Vec::with_capacity(MAX_FENCE_EVENTS),
-            present_streams: allocate_present_streams(),
-            next_present_stream_cookie: 1,
             // NOT 1. Wire fence ids arrive from an untrusted usermode buffer at
-            // the WAIT_FENCE escape, and `fence_wait_prepare` /
-            // `fence_event_register` / the WDDM boundary arm all decide against
+            // the bounded KMD wait path, and `fence_wait_prepare` plus the WDDM
+            // boundary arm both decide against
             // the ordinal predicate `id < next_wire_fence && not in-flight`.
             // Restarting the id space at 1 on every transport init lets a stale id
             // from a PREVIOUS instance — an ICD that survived a `pnputil
@@ -3465,42 +2218,13 @@ impl VirtioGpu {
             wire_fence_base,
             scanout_transport_instance,
             wddm_pending: VecDeque::with_capacity(MAX_WDDM_PENDING),
-            windowed_blt: WindowedBltState::new(),
             // Snapshotted at transport init like every other knob, so
             // `reg add` + `pnputil /restart-device` flips it with no reboot.
             dma_gpu_fence: crate::diag::read_config_dword(crate::diag::knobs::DMA_GPU_FENCE, 1)
                 != 0,
-            present_exact_watermark: crate::diag::read_config_dword(
-                crate::diag::knobs::PRESENT_EXACT_WATERMARK,
-                1,
-            ) != 0,
-            scanout_refresh: allocate_scanout_refresh_state(),
             failed: false,
             display_mode,
         });
-        // `WddmHoldMs` (UV1's instrument). Snapshotted here with every other knob
-        // so `reg add` + `pnputil /restart-device` applies it with no reboot, and
-        // CLAMPED here rather than trusted: see `WDDM_HOLD_MS_MAX`.
-        WDDM_HOLD_MS.store(
-            crate::diag::read_config_dword(crate::diag::knobs::WDDM_HOLD_MS, 0)
-                .min(WDDM_HOLD_MS_MAX),
-            Ordering::Relaxed,
-        );
-        // `WddmHeadMs` (K-F2 / A5's consumer-side head bound). Snapshotted with
-        // every other knob, and CLAMPED IN BOTH DIRECTIONS rather than trusted: too
-        // large reinstates the unbounded head and hence the TDR, too small turns a
-        // last-resort rebase into a continuous early-fence generator (0ab-B). 0
-        // stays 0 — it is the A/B disable and must remain reachable.
-        let head_ms =
-            crate::diag::read_config_dword(crate::diag::knobs::WDDM_HEAD_MS, WDDM_HEAD_MS_DEFAULT);
-        WDDM_HEAD_MS.store(
-            helios_kmd_logic::wddm_head_bound::clamp_bound_ms(
-                head_ms,
-                WDDM_HEAD_MS_MIN,
-                WDDM_HEAD_MS_MAX,
-            ),
-            Ordering::Relaxed,
-        );
         // (The old Gate-2 venus ctx self-test is gone: the StartDevice venus
         // client bring-up right after transport init exercises the full context
         // + blob lifecycle for real.)
@@ -3625,92 +2349,31 @@ impl VirtioGpu {
         in1_len: usize,
         resp_len: usize,
         waiter: NonNull<SyncWaitBlock>,
-        scanout_bind: Option<(u32, Option<ScanoutBindRequest>, bool)>,
+        scanout_bind: Option<(u32, bool)>,
         adapter: &crate::adapter::AdapterContext,
     ) -> Result<(SyncTicket, Option<(u64, u64, u64)>), (DmaBuffer, VirtioError)> {
-        // The shape is decided ONCE, here, and carried on the entry; the drain
-        // no longer re-derives it from `in1_len > 0`.
         let chain = if in1_len > 0 {
             Chain::Meta2 { in0_len, in1_len }
         } else {
             Chain::Meta1 { in0_len }
         };
-        // Validate BEFORE the capacity gate, exactly as the old summed-total
-        // check did: a malformed request must report DeviceError even when the
-        // queue also happens to be full. The `t <= meta.as_slice().len()` test
-        // this replaces now lives in DmaBuffer::span, per span rather than on
-        // the sum. `enqueue_core` re-checks `failed` first, as this path did.
         if in0_len == 0 || resp_len == 0 || resp_len > SYNC_RESP_MAX {
-            self.release_sync_claim_for_refusal(scanout_bind);
             return Err((meta, VirtioError::DeviceError));
         }
-        if let Some(request) = scanout_bind.and_then(|(_, request, _)| request) {
-            // QueueFull retry burns no descriptor authority. Reclaim this exact
-            // worker slot only if nothing else acquired it while PASSIVE slept;
-            // otherwise defer behind the winner rather than enqueueing without
-            // a row-bound owner.
-            if self.fast_bind.sync_worker_owned.is_none() {
-                self.fast_bind.sync_worker_owned = Some(request);
-            }
-            if self.fast_bind.sync_worker_owned != Some(request) {
-                return Err((meta, VirtioError::PublicationBusy));
-            }
-        }
-        // A synchronous worker reserves its request before reaching this point.
-        // Enforce the monotonic descriptor floor BEFORE the transaction-busy
-        // gate, so an old request is terminally superseded rather than sleeping
-        // and retrying until the current host-reader transaction ends.
-        if scanout_bind.is_some_and(|(_, request, _)| {
-            request.is_some_and(|request| self.presentation_epoch_is_superseded(request))
-        }) {
-            self.release_sync_claim_for_refusal(scanout_bind);
-            return Err((meta, VirtioError::PresentationSuperseded));
-        }
-        if scanout_bind.is_some_and(|(resource_id, _, _)| resource_id != 0)
-            && self.fast_bind.selection_ambiguity.blocks_admission()
-        {
-            self.release_sync_claim_for_refusal(scanout_bind);
-            return Err((meta, VirtioError::PublicationBusy));
-        }
-        // This second check is the reader-lifecycle wire invariant. Refuse
-        // before descriptor add so a pre-wire error clears only the worker
-        // reservation, never an active host-reader transaction.
-        // A presentation transaction also fences adapter-owned fallback SETs:
-        // they change QEMU's selected reader just as surely as a direct
-        // presentation does.  SET(0) is the one deliberate exception; its
-        // caller has already proved FIFO retirement for the named allocation
-        // and it is the explicit terminal unbind for this transaction.
-        if scanout_bind.is_some_and(|(resource_id, _, _)| resource_id != 0)
-            && self.publication_active()
-        {
-            self.release_sync_claim_for_refusal(scanout_bind);
-            return Err((meta, VirtioError::PublicationBusy));
-        }
-        let fenced_scanout = scanout_bind.is_some_and(|(_, _, fenced)| fenced);
+
+        let fenced_scanout = scanout_bind.is_some_and(|(_, fenced)| fenced);
         let reserved_fence = if fenced_scanout {
-            let Some(wire_fence_limit) = self
-                .wire_fence_base
-                .checked_add(D4_FENCE_OFFSET)
-            else {
+            let Some(wire_fence_limit) = self.wire_fence_base.checked_add(D4_FENCE_OFFSET) else {
                 WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-                self.release_sync_claim_for_refusal(scanout_bind);
                 return Err((meta, VirtioError::WireFenceNamespaceExhausted));
             };
-            if self.next_wire_fence >= wire_fence_limit {
+            if self.next_wire_fence >= wire_fence_limit
+                || in0_len < core::mem::size_of::<VirtioGpuCtrlHdr>()
+            {
                 WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-                self.release_sync_claim_for_refusal(scanout_bind);
                 return Err((meta, VirtioError::WireFenceNamespaceExhausted));
             }
-            if in0_len < core::mem::size_of::<VirtioGpuCtrlHdr>() {
-                self.release_sync_claim_for_refusal(scanout_bind);
-                return Err((meta, VirtioError::DeviceError));
-            }
-            // The caller staged an unfenced global SET. Patch only its header,
-            // under the same transport lock that owns the wire-fence allocator.
-            // A refused descriptor add restores the zero header before the DMA
-            // buffer is handed back for a retry.
-            // SAFETY: `in0_len` covers a complete header in the DMA buffer;
-            // the command span has no Rust alignment promise.
+            // SAFETY: the complete global command header is contained in in0.
             let mut header = unsafe {
                 core::ptr::read_unaligned(meta.as_slice().as_ptr().cast::<VirtioGpuCtrlHdr>())
             };
@@ -3721,13 +2384,11 @@ impl VirtioGpu {
                 || header.ring_idx != 0
                 || header.padding != [0; 3]
             {
-                self.release_sync_claim_for_refusal(scanout_bind);
                 return Err((meta, VirtioError::DeviceError));
             }
             header.flags = VIRTIO_GPU_FLAG_FENCE;
             header.fence_id = self.next_wire_fence;
-            // SAFETY: the same complete in-buffer header proven above; an
-            // unaligned write preserves the remainder of the staged command.
+            // SAFETY: same complete in-buffer header.
             unsafe {
                 core::ptr::write_unaligned(
                     meta.as_mut_slice().as_mut_ptr().cast::<VirtioGpuCtrlHdr>(),
@@ -3738,7 +2399,8 @@ impl VirtioGpu {
         } else {
             None
         };
-        let sequence_request = scanout_bind.map(|(resource_id, _, _)| (adapter, resource_id));
+
+        let sequence_request = scanout_bind.map(|(resource_id, _)| (adapter, resource_id));
         let (token, reserved_sequence) = match self.enqueue_core(
             chain,
             &meta,
@@ -3747,10 +2409,10 @@ impl VirtioGpu {
             sequence_request,
         ) {
             Ok(accepted) => accepted,
-            Err(e) => {
+            Err(error) => {
                 if reserved_fence.is_some() {
-                    // SAFETY: this is the header patched above and the DMA
-                    // buffer was returned intact after a refused queue add.
+                    // SAFETY: restore the exact header patched above before
+                    // returning the unaccepted buffer to its PASSIVE owner.
                     let mut header = unsafe {
                         core::ptr::read_unaligned(
                             meta.as_slice().as_ptr().cast::<VirtioGpuCtrlHdr>(),
@@ -3758,8 +2420,6 @@ impl VirtioGpu {
                     };
                     header.flags = 0;
                     header.fence_id = 0;
-                    // SAFETY: same in-buffer header; restoring it makes a
-                    // later retry mint from the then-current fence namespace.
                     unsafe {
                         core::ptr::write_unaligned(
                             meta.as_mut_slice().as_mut_ptr().cast::<VirtioGpuCtrlHdr>(),
@@ -3767,100 +2427,32 @@ impl VirtioGpu {
                         );
                     }
                 }
-                self.release_sync_claim_for_refusal(scanout_bind);
-                return Err((meta, e));
+                return Err((meta, error));
             }
         };
         if reserved_fence.is_some() {
-            // Spend the id only after `add` accepted the descriptor, exactly as
-            // the async Venus path does. The checked instance limit above makes
-            // this increment nonwrapping.
             self.next_wire_fence += 1;
         }
-        // ⚠ This path used to notify BEFORE pushing; it now publishes first,
-        // like the other two. Unobservable -- both happen inside one hold of
-        // `virtio_lock`, which `drain_used` also takes -- and deliberate.
-        // `VirtQueue::add` publishes avail.idx, so the reservation above must
-        // happen before `enqueue_core`; a refused add may burn the id but cannot
-        // publish a false wire identity. The accepted identity and in-flight tag
-        // are committed under this same virtio-lock hold before it is released.
-        let scanout_bind =
-            scanout_bind
-                .zip(reserved_sequence)
-                .map(|((resource_id, request, _), sequence)| {
-                    SyncScanoutBind {
-                        seq: sequence,
-                        resource_id,
-                        fence_id: reserved_fence.unwrap_or(0),
-                        request,
-                    }
-                });
-        if let Some(bind) = scanout_bind {
-            if let Some(request) = bind.request {
-                let claimed = self.claim_publication(request, bind.seq);
-                if !claimed {
-                    // The descriptor is already host-visible. Do not publish an
-                    // untracked request in release builds; retain its exact
-                    // in-flight tag and fail closed for this transport.
-                    self.fast_bind.selection_ambiguity = self
-                        .fast_bind
-                        .selection_ambiguity
-                        .observe_malformed(bind.seq);
-                    self.fast_bind.orphaned_set = Some(bind);
-                    SCANOUT_PUBLICATION_CLAIM_LOST.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    self.note_presentation_set_accepted(request);
-                }
-            }
-        }
-        let scanout_bind_identity =
-            scanout_bind.map(|bind| {
+        let identity = scanout_bind
+            .zip(reserved_sequence)
+            .map(|(_, sequence)| {
                 (
                     self.scanout_transport_instance,
-                    bind.seq,
-                    bind.fence_id,
+                    sequence,
+                    reserved_fence.unwrap_or(0),
                 )
             });
         self.publish_then_notify(InFlight {
             token,
             kind: InFlightKind::Sync {
                 waiter: Some(waiter),
-                scanout_bind,
             },
             meta,
             chain,
             resp_len,
             venus: None,
         });
-        Ok((SyncTicket { token }, scanout_bind_identity))
-    }
-
-    fn release_sync_claim_for_refusal(
-        &mut self,
-        scanout_bind: Option<(u32, Option<ScanoutBindRequest>, bool)>,
-    ) {
-        let request = scanout_bind.and_then(|(_, request, _)| request);
-        if request.is_some() && self.fast_bind.sync_worker_owned == request {
-            self.fast_bind.sync_worker_owned = None;
-        }
-    }
-
-    pub(crate) fn release_sync_claim_if_instance(
-        &mut self,
-        instance: u64,
-        request: ScanoutBindRequest,
-    ) -> bool {
-        if instance == 0 || instance != self.scanout_transport_instance {
-            return false;
-        }
-        if self.fast_bind.sync_worker_owned == Some(request)
-            && self.fast_bind.publication_request != Some(request)
-        {
-            self.fast_bind.sync_worker_owned = None;
-            true
-        } else {
-            false
-        }
+        Ok((SyncTicket { token }, identity))
     }
 
     pub(crate) const fn scanout_transport_instance(&self) -> u64 {
@@ -3904,8 +2496,6 @@ impl VirtioGpu {
         if status == 0 {
             self.terminalize_native_after_physical_reset();
         }
-        self.abort_windowed_blt_for_terminal_transport();
-        self.purge_all_present_streams();
         if status != 0 {
             crate::diag::fault(crate::diag::FaultCounter::StVioR, spins);
         }
@@ -3961,1250 +2551,6 @@ impl VirtioGpu {
     /// `wake_event`.  The pointed-to objects must remain live until transport
     /// teardown; the scanout caller uses fields embedded in `AdapterContext`,
     /// whose lifetime encloses the virtio transport.
-    pub fn enqueue_async_control(
-        &mut self,
-        meta: DmaBuffer,
-        in0_len: usize,
-        resp_len: usize,
-        completion: NonNull<AtomicU32>,
-        completion_errors: NonNull<AtomicU32>,
-        wake_event: NonNull<KEVENT>,
-        success_store: Option<(NonNull<AtomicU32>, u32)>,
-        resubmit: Option<NonNull<AtomicU32>>,
-        scanout_flush: Option<ScanoutFlushToken>,
-    ) -> Result<(), (DmaBuffer, VirtioError)> {
-        let chain = Chain::Meta1 { in0_len };
-        // Validated before the capacity gate, as in enqueue_sync.
-        if in0_len == 0 || resp_len == 0 || resp_len > SYNC_RESP_MAX {
-            return Err((meta, VirtioError::DeviceError));
-        }
-        // Arm before accepting the descriptor, while this virtio-lock hold
-        // still excludes `drain_used`.  If `enqueue_core` refuses it below we
-        // roll this pre-publication arm back to SetSucceeded; after acceptance
-        // the phase is already FlushInFlight before publication/doorbell, so a
-        // very fast completion can never observe the old phase.
-        let armed_publication = if let Some(flush) = scanout_flush.as_ref() {
-            let (_, present_epoch, resource_id) = flush.trace_context();
-            match self.publication_refresh_for(resource_id) {
-                // The lock was released between the refresh worker's initial
-                // classification and this enqueue. Reclassify here: a newly
-                // claimed SET must not let the old flush slip behind it.
-                PublicationRefresh::NoActive => None,
-                PublicationRefresh::ReadyExact(request)
-                    if request.present_epoch == present_epoch =>
-                {
-                    Some((resource_id, present_epoch))
-                }
-                PublicationRefresh::ReadyExact(_) | PublicationRefresh::Blocked => {
-                    return Err((meta, VirtioError::QueueFull));
-                }
-            }
-        } else {
-            None
-        };
-        if let Some((resource_id, present_epoch)) = armed_publication {
-            if !self.arm_publication_flush(resource_id, present_epoch) {
-                // No descriptor has reached the queue.  Return a normal
-                // pre-wire failure; the caller's exact cancellation path owns
-                // the unchanged SetSucceeded transaction.
-                crate::ddi::scanout_trace::note_fast_bind_error();
-                return Err((meta, VirtioError::DeviceError));
-            }
-        }
-        let token = match self.enqueue_core(chain, &meta, None, resp_len, None) {
-            Ok((token, None)) => token,
-            Ok((_, Some(_))) => return Err((meta, VirtioError::DeviceError)),
-            Err(e) => {
-                if let Some((resource_id, present_epoch)) = armed_publication {
-                    let rolled_back = self.rollback_publication_flush(resource_id, present_epoch);
-                    debug_assert!(
-                        rolled_back,
-                        "refused exact flush did not roll back transaction"
-                    );
-                }
-                return Err((meta, e));
-            }
-        };
-        ASYNC_CTRL_COUNT.fetch_add(1, Ordering::Relaxed);
-        if let Some(flush) = scanout_flush.as_ref() {
-            let (flush_id, covers_epoch, resource_id) = flush.trace_context();
-            // Record descriptor acceptance while `virtio_lock` still excludes
-            // `drain_used`, and before the doorbell below. Emitting this after
-            // returning to the PASSIVE caller let a fast host response record
-            // FLUSH_COMPLETE first even though the wire order was correct.
-            crate::ddi::scanout_timeline::note(
-                crate::ddi::scanout_timeline::kind::FLUSH_PUBLISH,
-                crate::ddi::scanout_timeline::flag::SUCCESS,
-                covers_epoch,
-                0,
-                flush_id,
-                resource_id,
-                0,
-            );
-        }
-        self.publish_then_notify(InFlight {
-            token,
-            kind: InFlightKind::AsyncControl {
-                completion,
-                completion_errors,
-                wake_event,
-                success_store,
-                resubmit,
-                scanout_flush,
-            },
-            meta,
-            chain,
-            resp_len,
-            venus: None,
-        });
-        Ok(())
-    }
-
-    /// Enqueue the DISPATCH-level fast bind: one fire-and-forget
-    /// `SET_SCANOUT_BLOB` for the flip being armed (ROADMAP defect 0ab-C,
-    /// D1(ii)).
-    ///
-    /// DISPATCH_LEVEL by construction — a `&mut VirtioGpu` exists only inside
-    /// `with_virtio`, i.e. under the device spinlock. Nothing here allocates,
-    /// waits, or writes the registry: the command buffer is the preallocated
-    /// singleton, and the wire command is written straight into it.
-    ///
-    /// Sequence reserve/add/commit all happen under THIS lock hold, which makes
-    /// the nonwrapping sequence order equal control-queue publication order.
-    ///
-    /// On any refusal the buffer goes back in its slot, so a failure costs
-    /// nothing but the counter: the PASSIVE worker's own bind is still armed and
-    /// is still the recovery path, exactly as it is with the accelerator off.
-    pub fn enqueue_scanout_bind_async(
-        &mut self,
-        mut buf: DmaBuffer,
-        req: &ScanoutBindRequest,
-        adapter: &crate::adapter::AdapterContext,
-    ) -> Result<(), FastBindRefusal> {
-        // Enforce the monotonic descriptor floor at the wire boundary too:
-        // ready/immediate and deferred promotions share this function, and a
-        // later accepted epoch must make every older request terminal.
-        if self.presentation_epoch_is_superseded(*req) {
-            self.return_bind_cmd_buffer(buf);
-            return Err(FastBindRefusal::Superseded);
-        }
-        // The caller stages under this same lock, but keep the refusal local to
-        // the wire publication too: no second descriptor may be accepted while
-        // the first SET still owns its exact host-reader transaction.
-        if self.publication_active() {
-            self.return_bind_cmd_buffer(buf);
-            return Err(FastBindRefusal::Busy);
-        }
-        if self.fast_bind.selection_ambiguity.blocks_admission() {
-            self.return_bind_cmd_buffer(buf);
-            return Err(FastBindRefusal::Busy);
-        }
-        let in0_len = core::mem::size_of::<VirtioGpuSetScanoutBlob>();
-        let resp_len = core::mem::size_of::<VirtioGpuCtrlHdr>();
-        // The buffer is recycled across binds, so its logical length is reset
-        // per use exactly like the DMA pool's; capacity was proved at init.
-        if !buf.reset(in0_len + resp_len) {
-            self.return_bind_cmd_buffer(buf);
-            return Err(FastBindRefusal::Failed);
-        }
-        {
-            // Written IN the device-visible buffer, not staged on this DISPATCH
-            // stack: `try_from_bytes_mut` is the checked cast (it returns Err
-            // rather than panicking on a bad size/alignment, and a panic in this
-            // path would be a bugcheck inside SubmitCommand). The DMA buffer is
-            // page-aligned, so the alignment arm cannot fire in practice.
-            let Ok(cmd) = bytemuck::try_from_bytes_mut::<VirtioGpuSetScanoutBlob>(
-                &mut buf.as_mut_slice()[..in0_len],
-            ) else {
-                self.return_bind_cmd_buffer(buf);
-                return Err(FastBindRefusal::Failed);
-            };
-            super::ctrl::fill_set_scanout_blob(
-                cmd,
-                req.resource_id,
-                req.width,
-                req.height,
-                req.format,
-                req.stride,
-                req.offset,
-            );
-        }
-        let chain = Chain::Meta1 { in0_len };
-        let (token, seq) = match self.enqueue_core(
-            chain,
-            &buf,
-            None,
-            resp_len,
-            Some((adapter, req.resource_id)),
-        ) {
-            Ok((token, Some(sequence))) => (token, sequence),
-            Err(_) => {
-                self.return_bind_cmd_buffer(buf);
-                return Err(FastBindRefusal::Failed);
-            }
-            Ok((_, None)) => {
-                self.return_bind_cmd_buffer(buf);
-                return Err(FastBindRefusal::Failed);
-            }
-        };
-        // `enqueue_core` accepted this descriptor while this lock stayed held,
-        // so no other producer can claim the fixed transaction slot between the
-        // readiness check above and this publication. Keep the full request —
-        // resource plus epoch alone is not enough to reconstruct a late worker
-        // bind's geometry/address safely.
-        let claimed = self.claim_publication(*req, seq);
-        if !claimed {
-            // `add` has published this persistent SET, so rollback is no longer
-            // possible. Latch ambiguity before publishing the in-flight owner;
-            // retirement and further SET admission now fail closed.
-            self.fast_bind.selection_ambiguity =
-                self.fast_bind.selection_ambiguity.observe_malformed(seq);
-            self.fast_bind.orphaned_set = Some(SyncScanoutBind {
-                seq,
-                resource_id: req.resource_id,
-                fence_id: 0,
-                request: Some(*req),
-            });
-            SCANOUT_PUBLICATION_CLAIM_LOST.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.note_presentation_set_accepted(*req);
-        }
-        self.publish_then_notify(InFlight {
-            token,
-            kind: InFlightKind::AsyncScanoutBind {
-                seq,
-                resource_id: req.resource_id,
-                wh: ((req.width as u64) << 32) | req.height as u64,
-                format: req.format,
-                stride: req.stride,
-                offset: req.offset,
-                present_epoch: req.present_epoch,
-                primary_address: req.primary_address,
-                carried_watermark: req.carried_watermark,
-            },
-            meta: buf,
-            chain,
-            resp_len,
-            venus: None,
-        });
-        crate::ddi::scanout_timeline::note(
-            crate::ddi::scanout_timeline::kind::FAST_SET_PUBLISH,
-            0,
-            req.present_epoch,
-            req.carried_watermark,
-            seq,
-            req.resource_id,
-            // Auxiliary only: exact primary address remains the flip-arm
-            // identity, never this truncated diagnostic field.
-            req.primary_address as u32,
-        );
-        Ok(())
-    }
-
-    #[inline]
-    fn publication_key(request: ScanoutBindRequest) -> helios_kmd_logic::scanout_publish_txn::Key {
-        helios_kmd_logic::scanout_publish_txn::Key {
-            resource_id: request.resource_id,
-            present_epoch: request.present_epoch,
-        }
-    }
-
-    #[inline]
-    fn presentation_epoch_admission(
-        &self,
-        request: ScanoutBindRequest,
-    ) -> helios_kmd_logic::scanout_presentation_epoch::Admission {
-        if request.resource_id == 0 {
-            helios_kmd_logic::scanout_presentation_epoch::Admission::Untracked
-        } else {
-            helios_kmd_logic::scanout_presentation_epoch::decide(
-                self.fast_bind.presentation_epoch_floor,
-                request.present_epoch,
-            )
-        }
-    }
-
-    #[inline]
-    fn presentation_epoch_is_superseded(&self, request: ScanoutBindRequest) -> bool {
-        self.presentation_epoch_admission(request)
-            == helios_kmd_logic::scanout_presentation_epoch::Admission::Superseded
-    }
-
-    /// Advance the monotonic admission floor only after `enqueue_core` accepted
-    /// this direct presentation SET descriptor. Completion/error/retirement do
-    /// not alter it: the host FIFO has already seen this epoch's position.
-    fn note_presentation_set_accepted(&mut self, request: ScanoutBindRequest) {
-        if self.presentation_epoch_admission(request)
-            == helios_kmd_logic::scanout_presentation_epoch::Admission::Newer
-        {
-            self.fast_bind.presentation_epoch_floor =
-                helios_kmd_logic::scanout_presentation_epoch::advance_after_accept(
-                    self.fast_bind.presentation_epoch_floor,
-                    request.present_epoch,
-                );
-        }
-    }
-
-    #[inline]
-    pub fn publication_active(&self) -> bool {
-        self.fast_bind.publication.active().is_some()
-    }
-
-    /// Claim the fixed host-reader transaction after a SET descriptor was
-    /// accepted.  The key/sequence state is policy-tested in `kmd_logic`; this
-    /// side stores the complete value needed to apply a late sync response.
-    fn claim_publication(&mut self, request: ScanoutBindRequest, seq: u64) -> bool {
-        if !self
-            .fast_bind
-            .publication
-            .claim(Self::publication_key(request), seq)
-        {
-            return false;
-        }
-        self.fast_bind.publication_request = Some(request);
-        true
-    }
-
-    fn complete_publication_set(
-        &mut self,
-        request: ScanoutBindRequest,
-        seq: u64,
-        ok: bool,
-    ) -> bool {
-        if self.fast_bind.publication_request != Some(request)
-            || !self
-                .fast_bind
-                .publication
-                .complete_set(Self::publication_key(request), seq, ok)
-        {
-            return false;
-        }
-        if !ok {
-            self.fast_bind.publication_request = None;
-        }
-        true
-    }
-
-    /// The exact flush was accepted after the bind application armed it.
-    pub fn arm_publication_flush(&mut self, resource_id: u32, present_epoch: u64) -> bool {
-        let key = helios_kmd_logic::scanout_publish_txn::Key {
-            resource_id,
-            present_epoch,
-        };
-        self.fast_bind.publication_request.is_some_and(|request| {
-            Self::publication_key(request) == key && self.fast_bind.publication.arm_flush(key)
-        })
-    }
-
-    fn rollback_publication_flush(&mut self, resource_id: u32, present_epoch: u64) -> bool {
-        let key = helios_kmd_logic::scanout_publish_txn::Key {
-            resource_id,
-            present_epoch,
-        };
-        self.fast_bind.publication_request.is_some_and(|request| {
-            Self::publication_key(request) == key && self.fast_bind.publication.rollback_flush(key)
-        })
-    }
-
-    /// Terminal host-read response.  A mismatched flush is deliberately inert:
-    /// it may not release the publication that owns another resource/epoch.
-    pub fn complete_publication_flush(&mut self, resource_id: u32, present_epoch: u64) -> bool {
-        let key = helios_kmd_logic::scanout_publish_txn::Key {
-            resource_id,
-            present_epoch,
-        };
-        let request = self
-            .fast_bind
-            .publication_request
-            .filter(|request| Self::publication_key(*request) == key);
-        if !self.fast_bind.publication.complete_flush(key) {
-            return false;
-        }
-        self.fast_bind.publication_request = None;
-        if request.is_some() && self.fast_bind.sync_worker_owned == request {
-            self.fast_bind.sync_worker_owned = None;
-        }
-        true
-    }
-
-    /// Exact terminal path where no flush can or will exist: a stale accepted
-    /// bind, host-unbound/dead refresh, enqueue failure, or cancelled worker.
-    pub fn cancel_publication_exact(&mut self, resource_id: u32, present_epoch: u64) -> bool {
-        let key = helios_kmd_logic::scanout_publish_txn::Key {
-            resource_id,
-            present_epoch,
-        };
-        let request = self
-            .fast_bind
-            .publication_request
-            .filter(|request| Self::publication_key(*request) == key);
-        if !self.fast_bind.publication.cancel_exact(key) {
-            return false;
-        }
-        self.fast_bind.publication_request = None;
-        if request.is_some() && self.fast_bind.sync_worker_owned == request {
-            self.fast_bind.sync_worker_owned = None;
-        }
-        true
-    }
-
-    /// Snapshot the full active publication only when it names this exact
-    /// bound resource. The caller uses its epoch to create a coherent flush
-    /// token; sampling `active_scanout_resource` and `scanout_bound_epoch`
-    /// separately can otherwise pair a newly stored resource with an older
-    /// epoch during bind application.
-    pub fn publication_request_for(&self, resource_id: u32) -> Option<ScanoutBindRequest> {
-        self.fast_bind
-            .publication_request
-            .filter(|request| request.resource_id == resource_id)
-    }
-
-    /// Classify a prospective refresh against the one exact host-reader
-    /// transaction.  Only a SetSucceeded transaction for this exact request is
-    /// allowed to create the first flush; every other active state retains the
-    /// queue gate until its terminal response/cancellation.
-    pub fn publication_refresh_for(&self, resource_id: u32) -> PublicationRefresh {
-        let Some(transaction) = self.fast_bind.publication.active() else {
-            return PublicationRefresh::NoActive;
-        };
-        let Some(request) = self.fast_bind.publication_request else {
-            return PublicationRefresh::Blocked;
-        };
-        if transaction.key != Self::publication_key(request) || request.resource_id != resource_id {
-            return PublicationRefresh::Blocked;
-        }
-        if transaction.phase == helios_kmd_logic::scanout_publish_txn::Phase::SetSucceeded {
-            PublicationRefresh::ReadyExact(request)
-        } else {
-            PublicationRefresh::Blocked
-        }
-    }
-
-    /// A successful scanout-disable is an explicit terminal unbind for the
-    /// retiring resource. Resource ids are allocation identities and are not
-    /// recycled while this transport generation is live; the full request stays
-    /// in the slot until this exact lifecycle barrier confirms the unbind.
-    pub fn cancel_publication_for_retirement(&mut self, resource_id: u32) -> bool {
-        let Some(request) = self.fast_bind.publication_request else {
-            return false;
-        };
-        if request.resource_id != resource_id {
-            return false;
-        }
-        self.cancel_publication_exact(request.resource_id, request.present_epoch)
-    }
-
-    fn cancel_publication_superseded_by(&mut self, sequence: u64) -> bool {
-        let request = self.fast_bind.publication_request;
-        if !self.fast_bind.publication.cancel_if_superseded_by(sequence) {
-            return false;
-        }
-        self.fast_bind.publication_request = None;
-        if request.is_some() && self.fast_bind.sync_worker_owned == request {
-            self.fast_bind.sync_worker_owned = None;
-        }
-        true
-    }
-
-    /// Stage a fast bind behind its exact producer boundary, or enqueue it now
-    /// when that boundary is already retired. This includes a validated D4b
-    /// snapshot: keeping SET publication producer-ordered prevents a successor
-    /// SET from overtaking this epoch's producer-gated exact refresh. Both
-    /// decisions and the eventual descriptor publication run under
-    /// `virtio_lock`; the stored request is values only, so it does not extend a
-    /// WDDM allocation lifetime.
-    pub fn stage_scanout_bind(
-        &mut self,
-        request: ScanoutBindRequest,
-        adapter: &crate::adapter::AdapterContext,
-    ) -> FastBindDispatch {
-        // An exact synchronous worker owner has already claimed the same
-        // descriptor path. Preserve that ownership even though its accepted
-        // epoch now equals the floor: it is not a second SET attempt and must
-        // not have its successful reservation cleared by fast staging.
-        if self.fast_bind.sync_worker_owned == Some(request) {
-            return FastBindDispatch::Handled;
-        }
-        if self.presentation_epoch_is_superseded(request) {
-            if self.fast_bind.sync_worker_owned == Some(request) {
-                self.fast_bind.sync_worker_owned = None;
-            }
-            if self.fast_bind.deferred_worker == Some(request) {
-                self.fast_bind.deferred_worker = None;
-            }
-            self.note_fast_bind_epoch_superseded(request);
-            return FastBindDispatch::Superseded;
-        }
-        if self.fast_bind.retire_barrier
-            || request.resource_id == self.fast_bind.retiring_resource
-            || !self.scanout_bind_boundary_live(request.carried_watermark)
-        {
-            // A tagged producer was explicitly torn down. It must not be
-            // rebased into a successful fast bind; the normal worker remains
-            // the recovery path and will apply its own cancellation contract.
-            return FastBindDispatch::Failed;
-        }
-        if self.publication_active()
-            || self.fast_bind.selection_ambiguity.blocks_admission()
-            || !self.scanout_boundary_ready(request.carried_watermark)
-        {
-            // A ready successor must not overtake a SET whose exact host-reader
-            // transaction is still live. Retain the bounded oldest+latest
-            // frontier exactly as for a producer-unready request; completion of
-            // the active transaction is the only promotion edge.
-            if self.fast_bind.deferred_earliest.is_none() {
-                self.fast_bind.deferred_earliest = Some(request);
-            } else if let Some(replaced) = self.fast_bind.deferred_latest.replace(request) {
-                // The first slot is a liveness frontier.  Only its trailing
-                // companion coalesces, so a 5--10 ms producer cannot be
-                // perpetually replaced by 4.5 ms presents.
-                crate::ddi::scanout_trace::note_fast_bind_coalesced();
-                crate::ddi::scanout_timeline::note(
-                    crate::ddi::scanout_timeline::kind::DEFERRED_REPLACED,
-                    crate::ddi::scanout_timeline::flag::REPLACED
-                        | crate::ddi::scanout_timeline::flag::FAST_FRONTIER,
-                    replaced.present_epoch,
-                    replaced.carried_watermark,
-                    replaced.primary_address,
-                    replaced.resource_id,
-                    request.resource_id,
-                );
-            }
-            return FastBindDispatch::Deferred;
-        }
-        self.enqueue_ready_scanout_bind(request, adapter)
-    }
-
-    /// Re-evaluate the bounded earliest+latest frontier after a used-ring
-    /// retirement.
-    /// Called by the completion DPC after `drain_used`, so a ready producer
-    /// binds before any exact refresh is armed from the bind response.
-    pub fn service_deferred_scanout_bind(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-    ) -> Option<FastBindDispatch> {
-        // The floor moves when a SET descriptor is accepted, while these two
-        // slots may have been retained much earlier for producer completion.
-        // Prune before the transaction-active return so a 1055-style stale
-        // frontier cannot survive the newer 1056 descriptor's lifetime.
-        let superseded = self.discard_superseded_fast_bind_frontier();
-        if self.fast_bind.retire_barrier {
-            return superseded.then_some(FastBindDispatch::Superseded);
-        }
-        if self.publication_active() || self.fast_bind.selection_ambiguity.blocks_admission() {
-            return superseded.then_some(FastBindDispatch::Superseded);
-        }
-        let discarded = self.discard_invalid_fast_bind_frontier();
-        let Some(earliest) = self.fast_bind.deferred_earliest else {
-            return if superseded {
-                Some(FastBindDispatch::Superseded)
-            } else {
-                discarded.then_some(FastBindDispatch::Failed)
-            };
-        };
-        if !self.scanout_boundary_ready(earliest.carried_watermark) {
-            return None;
-        }
-
-        // The frontier proved progress. Issue its exact oldest request first,
-        // and retain any live successor regardless of whether its producer is
-        // ready yet. If the successor is already ready, this SET's completion
-        // queues the next DPC that issues it; dropping it here would silently
-        // erase a producer that already proved readiness.
-        let latest = self.fast_bind.deferred_latest.take();
-        self.fast_bind.deferred_earliest = latest.filter(|request| {
-            request.resource_id != self.fast_bind.retiring_resource
-                && self.scanout_bind_boundary_live(request.carried_watermark)
-        });
-        let request = earliest;
-        if self.fast_bind.sync_worker_owned == Some(request) {
-            return Some(FastBindDispatch::Handled);
-        }
-        let dispatched = self.enqueue_ready_scanout_bind(request, adapter);
-        if matches!(
-            dispatched,
-            FastBindDispatch::Busy | FastBindDispatch::Failed
-        ) {
-            // The selected ready request belongs to the existing synchronous
-            // worker recovery path now. Do not put it back behind an unready
-            // frontier: that would duplicate/reorder it on a later DPC.
-            self.fast_bind.deferred_worker = Some(request);
-        }
-        Some(dispatched)
-    }
-
-    /// Freeze all new fast SETs while one exact resource is retired, and return
-    /// one move-only token bound to this transport instance. Every later
-    /// barrier/snapshot/disable/finish step revalidates that same instance.
-    pub(crate) fn begin_scanout_resource_retire(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-        resource_id: u32,
-    ) -> ScanoutRetireToken {
-        self.fast_bind.retiring_resource = resource_id;
-        self.fast_bind.retire_barrier = true;
-        if self
-            .fast_bind
-            .deferred_worker
-            .is_some_and(|request| request.resource_id == resource_id)
-        {
-            self.fast_bind.deferred_worker = None;
-        }
-        if self
-            .fast_bind
-            .sync_worker_owned
-            .is_some_and(|request| request.resource_id == resource_id)
-        {
-            self.fast_bind.sync_worker_owned = None;
-        }
-        // The existing WDDM pending slot is the authoritative newest fallback.
-        // No value-only request may survive the lifecycle barrier and later bind
-        // behind that worker, so discard both frontier positions, not just the
-        // retiring identity.
-        self.fast_bind.deferred_earliest = None;
-        self.fast_bind.deferred_latest = None;
-        if self
-            .fast_bind
-            .fast_failure_wake
-            .is_some_and(|request| request.resource_id == resource_id)
-        {
-            self.fast_bind.fast_failure_wake = None;
-        }
-        ScanoutRetireToken {
-            transport_instance: self.scanout_transport_instance,
-            resource_id,
-            wire_sequence: adapter.scanout_bind_wire_seq.load(Ordering::Acquire),
-            accepted_sequence: self.fast_bind.host_accepted_seq,
-            host_resource: self.fast_bind.host_accepted_resource,
-            selection_ambiguous: self.fast_bind.selection_ambiguity.blocks_admission(),
-        }
-    }
-
-    /// Refresh the final host-selection fields in one exact-instance lock hold.
-    pub(crate) fn refresh_scanout_retire(&self, token: &mut ScanoutRetireToken) -> bool {
-        if token.transport_instance != self.scanout_transport_instance
-            || token.resource_id != self.fast_bind.retiring_resource
-            || !self.fast_bind.retire_barrier
-        {
-            return false;
-        }
-        token.accepted_sequence = self.fast_bind.host_accepted_seq;
-        token.host_resource = self.fast_bind.host_accepted_resource;
-        token.selection_ambiguous = self.fast_bind.selection_ambiguity.blocks_admission();
-        true
-    }
-
-    pub(crate) fn complete_scanout_retire_without_disable(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-        token: &ScanoutRetireToken,
-    ) -> bool {
-        if token.transport_instance != self.scanout_transport_instance
-            || token.resource_id != self.fast_bind.retiring_resource
-            || !self.fast_bind.retire_barrier
-            || token.accepted_sequence != self.fast_bind.host_accepted_seq
-            || token.host_resource != self.fast_bind.host_accepted_resource
-            || token.selection_ambiguous != self.fast_bind.selection_ambiguity.blocks_admission()
-            || token.selection_ambiguous
-            || helios_kmd_logic::scanout_retire::needs_disable(
-                token.resource_id,
-                token.host_resource,
-            )
-        {
-            return false;
-        }
-        let resource_id = token.resource_id;
-        let host_was_resource = adapter
-            .host_bound_scanout_resource
-            .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        let active_was_resource = adapter
-            .active_scanout_resource
-            .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        if active_was_resource {
-            adapter.active_scanout_wh.store(0, Ordering::Release);
-        }
-        if adapter
-            .pending_refresh_resource
-            .compare_exchange(resource_id, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            adapter.scanout_refresh_pending.store(0, Ordering::Release);
-        }
-        if host_was_resource || active_was_resource {
-            let reason = if token.host_resource == 0 {
-                crate::ddi::scanout_trace::LeaseEnd::Cancelled
-            } else {
-                crate::ddi::scanout_trace::LeaseEnd::Superseded
-            };
-            if token.host_resource == 0 {
-                adapter.scanout_epoch_tracked.store(0, Ordering::Release);
-            }
-            let _ = adapter.end_scanout_leases_through(
-                adapter.scanout_bound_epoch.load(Ordering::Acquire),
-                reason,
-            );
-        }
-        let _ = self.cancel_publication_for_retirement(resource_id);
-        self.fast_bind.retire_barrier = false;
-        self.fast_bind.retiring_resource = 0;
-        true
-    }
-
-    /// Re-open the exact producing transport's DISPATCH fast path.
-    pub(crate) fn finish_scanout_resource_retire(
-        &mut self,
-        token: ScanoutRetireToken,
-    ) -> Result<(), ScanoutRetireToken> {
-        if token.transport_instance != self.scanout_transport_instance
-            || token.resource_id != self.fast_bind.retiring_resource
-            || !self.fast_bind.retire_barrier
-        {
-            return Err(token);
-        }
-        self.fast_bind.retire_barrier = false;
-        self.fast_bind.retiring_resource = 0;
-        Ok(())
-    }
-
-    /// Remove the oldest frontier and promote the sole coalesced successor.
-    /// All callers are under `virtio_lock`; this is fixed-state movement only.
-    fn promote_latest_frontier(&mut self) {
-        self.fast_bind.deferred_earliest = self.fast_bind.deferred_latest.take();
-    }
-
-    /// Remove every dead/retiring request from the two-slot frontier without
-    /// orphaning a surviving latest request. The loop is statically bounded by
-    /// the two physical slots and performs only fixed-state movement.
-    fn discard_invalid_fast_bind_frontier(&mut self) -> bool {
-        let mut discarded = false;
-        for _ in 0..2 {
-            let Some(request) = self.fast_bind.deferred_earliest else {
-                break;
-            };
-            if request.resource_id != self.fast_bind.retiring_resource
-                && self.scanout_bind_boundary_live(request.carried_watermark)
-            {
-                break;
-            }
-            self.promote_latest_frontier();
-            discarded = true;
-        }
-        if self.fast_bind.deferred_latest.is_some_and(|request| {
-            request.resource_id == self.fast_bind.retiring_resource
-                || !self.scanout_bind_boundary_live(request.carried_watermark)
-        }) {
-            self.fast_bind.deferred_latest = None;
-            discarded = true;
-        }
-        discarded
-    }
-
-    /// Drop every deferred fast request at or below the accepted presentation
-    /// descriptor floor. The fixed two-slot frontier remains ordered: if the
-    /// old head is stale and the trailing request is newer, it is promoted to
-    /// the head in this same virtio-lock hold.
-    fn discard_superseded_fast_bind_frontier(&mut self) -> bool {
-        let earliest = self.fast_bind.deferred_earliest.take();
-        let latest = self.fast_bind.deferred_latest.take();
-        let mut discarded = false;
-        let mut kept_earliest = None;
-        let mut kept_latest = None;
-
-        for request in [earliest, latest].into_iter().flatten() {
-            if self.presentation_epoch_is_superseded(request) {
-                self.note_fast_bind_epoch_superseded(request);
-                discarded = true;
-            } else if kept_earliest.is_none() {
-                kept_earliest = Some(request);
-            } else {
-                kept_latest = Some(request);
-            }
-        }
-        self.fast_bind.deferred_earliest = kept_earliest;
-        self.fast_bind.deferred_latest = kept_latest;
-        discarded
-    }
-
-    /// One explicit diagnostic edge per request discarded by the monotonic
-    /// descriptor floor. It is neither the trailing-slot coalescing counter nor
-    /// a host-reader cancellation: this request never reached the control FIFO.
-    fn note_fast_bind_epoch_superseded(&self, request: ScanoutBindRequest) {
-        crate::ddi::scanout_trace::note_fast_bind_superseded();
-        crate::ddi::scanout_timeline::note(
-            crate::ddi::scanout_timeline::kind::DEFERRED_SUPERSEDED,
-            crate::ddi::scanout_timeline::flag::SUPERSEDED
-                | crate::ddi::scanout_timeline::flag::FAST_FRONTIER,
-            request.present_epoch,
-            request.carried_watermark,
-            request.primary_address,
-            request.resource_id,
-            self.fast_bind.presentation_epoch_floor as u32,
-        );
-    }
-
-    /// Record a SET_SCANOUT_BLOB response as host-visible before its DPC
-    /// bookkeeping is handed off.  The sequence is control-FIFO order.
-    pub fn note_host_accepted_scanout_bind(&mut self, seq: u64, resource_id: u32) {
-        if seq >= self.fast_bind.host_accepted_seq {
-            self.fast_bind.host_accepted_seq = seq;
-            self.fast_bind.host_accepted_resource = resource_id;
-            self.fast_bind.host_accepted_fast = false;
-            self.fast_bind.host_accepted_fast_request = None;
-        }
-        if self.fast_bind.completed.is_some_and(|bind| {
-            helios_kmd_logic::scanout_retire::completion_superseded(bind.seq, seq)
-        }) {
-            self.fast_bind.completed = None;
-        }
-        if self.fast_bind.orphaned_set.is_some_and(|orphan| {
-            helios_kmd_logic::scanout_retire::completion_superseded(orphan.seq, seq)
-        }) {
-            self.fast_bind.orphaned_set = None;
-        }
-        self.fast_bind.selection_ambiguity =
-            self.fast_bind.selection_ambiguity.observe_success(seq);
-        let _ = self.cancel_publication_superseded_by(seq);
-    }
-
-    /// Apply a synchronous SET completion only to the exact transport that
-    /// enqueued it. The caller holds notify order; this method runs under that
-    /// transport's lock and performs every guest-side effect before returning.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn apply_sync_scanout_bind(
-        &mut self,
-        order: &crate::adapter::NotifyOrdered<'_>,
-        adapter: &crate::adapter::AdapterContext,
-        identity: super::ctrl::ScanoutBindIdentity,
-        resource_id: u32,
-        width: u32,
-        height: u32,
-        exact_request: Option<ScanoutBindRequest>,
-        fallback_primary: Option<(u32, u32, u32, u32, u32, u64, u32, u32)>,
-        direct_epoch: Option<(u64, u64, u64)>,
-    ) -> SyncBindApply {
-        if identity.instance() != self.scanout_transport_instance {
-            return SyncBindApply::Foreign;
-        }
-        if self.fast_bind.selection_ambiguity.blocks_admission()
-            || self.fast_bind.host_accepted_seq < identity.sequence()
-            || (self.fast_bind.host_accepted_seq == identity.sequence()
-                && self.fast_bind.host_accepted_resource != resource_id)
-        {
-            return SyncBindApply::Inconsistent;
-        }
-        if self.fast_bind.host_accepted_seq > identity.sequence() {
-            return SyncBindApply::Stale;
-        }
-        if let Some(request) = exact_request {
-            let transaction = self.fast_bind.publication.active();
-            if self.fast_bind.sync_worker_owned != Some(request)
-                || self.fast_bind.publication_request != Some(request)
-                || transaction.is_none_or(|transaction| {
-                    transaction.key != Self::publication_key(request)
-                        || transaction.seq != identity.sequence()
-                        || transaction.phase
-                            != helios_kmd_logic::scanout_publish_txn::Phase::SetSucceeded
-                })
-            {
-                return SyncBindApply::Inconsistent;
-            }
-        }
-        if !adapter.adopt_scanout_bind_seq(identity.sequence()) {
-            return SyncBindApply::Stale;
-        }
-        let previous = adapter.host_bound_scanout_resource.load(Ordering::Acquire);
-        if let Some((id, w, h, pitch, plane, alloc_size, memory_type, format)) = fallback_primary {
-            adapter.remember_primary_scanout(
-                id,
-                w,
-                h,
-                pitch,
-                plane,
-                alloc_size,
-                memory_type,
-                format,
-            );
-        }
-        adapter.remember_scanout_blob(resource_id, width, height);
-        if let Some((epoch, primary_address, frame_watermark)) = direct_epoch {
-            adapter.publish_bound_epoch(epoch, previous != 0 && previous != resource_id);
-            adapter.publish_bound_primary(primary_address);
-            if adapter.knobs().bind_flush_immediate {
-                adapter.request_scanout_refresh_for(resource_id);
-                return SyncBindApply::Applied {
-                    ready: true,
-                    carried: false,
-                };
-            }
-            let table = adapter.take_frame_watermark(resource_id);
-            let carried = frame_watermark != 0 || table.is_some();
-            let watermark = if frame_watermark != 0 {
-                crate::ddi::scanout_trace::note_bind_watermark_allocation();
-                frame_watermark
-            } else {
-                table.unwrap_or_else(|| self.wire_fence_watermark())
-            };
-            let watermark = self
-                .rebase_dead_present_stream_boundary(watermark)
-                .unwrap_or(watermark);
-            let ready = self.note_scanout_refresh_at(order, resource_id, watermark);
-            if ready {
-                adapter.request_scanout_refresh_for(resource_id);
-            }
-            return SyncBindApply::Applied { ready, carried };
-        }
-        SyncBindApply::Applied {
-            ready: false,
-            carried: false,
-        }
-    }
-
-    fn note_host_accepted_fast_scanout_bind(&mut self, seq: u64, request: ScanoutBindRequest) {
-        if seq >= self.fast_bind.host_accepted_seq {
-            self.fast_bind.host_accepted_seq = seq;
-            self.fast_bind.host_accepted_resource = request.resource_id;
-            self.fast_bind.host_accepted_fast = true;
-            self.fast_bind.host_accepted_fast_request = Some(request);
-        }
-        if self.fast_bind.completed.is_some_and(|bind| {
-            helios_kmd_logic::scanout_retire::completion_superseded(bind.seq, seq)
-        }) {
-            self.fast_bind.completed = None;
-        }
-        if self.fast_bind.orphaned_set.is_some_and(|orphan| {
-            helios_kmd_logic::scanout_retire::completion_superseded(orphan.seq, seq)
-        }) {
-            self.fast_bind.orphaned_set = None;
-        }
-        self.fast_bind.selection_ambiguity =
-            self.fast_bind.selection_ambiguity.observe_success(seq);
-        let _ = self.cancel_publication_superseded_by(seq);
-    }
-
-    fn note_ambiguous_scanout_bind(&mut self, seq: u64) {
-        self.fast_bind.selection_ambiguity =
-            self.fast_bind.selection_ambiguity.observe_malformed(seq);
-    }
-
-    fn canonical_resource_is_live(
-        &self,
-        adapter: &crate::adapter::AdapterContext,
-        resource_id: u32,
-    ) -> bool {
-        if crate::virtio::KMD_D2_OWNER_ENABLED {
-            adapter.control_owner().resource_is_live(resource_id)
-        } else {
-            self.resource_is_live(resource_id)
-        }
-    }
-
-    /// Gate the PASSIVE worker's synchronous fallback on the same exact
-    /// producer boundary as the fast path. The worker retains the WDDM handle
-    /// and is woken by the completion DPC; this state holds values only.
-    ///
-    /// `reserve_sync_set` is false only when the caller has already observed
-    /// this target bound. It still performs every liveness, fast-owner, and
-    /// producer-boundary check, but does not claim a synchronous SET that the
-    /// caller will deliberately not issue.
-    pub fn stage_worker_scanout_bind(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-        request: ScanoutBindRequest,
-        reserve_sync_set: bool,
-    ) -> WorkerBindDispatch {
-        if self.fast_bind.retire_barrier
-            || request.resource_id == self.fast_bind.retiring_resource
-            || !self.canonical_resource_is_live(adapter, request.resource_id)
-        {
-            if self.fast_bind.deferred_worker == Some(request) {
-                self.fast_bind.deferred_worker = None;
-            }
-            return WorkerBindDispatch::Abandoned;
-        }
-        if !self.scanout_bind_boundary_live(request.carried_watermark) {
-            if self.fast_bind.deferred_worker == Some(request) {
-                self.fast_bind.deferred_worker = None;
-            }
-            return WorkerBindDispatch::Abandoned;
-        }
-        if self.presentation_epoch_is_superseded(request) {
-            if self.fast_bind.deferred_worker == Some(request) {
-                self.fast_bind.deferred_worker = None;
-            }
-            if self.fast_bind.sync_worker_owned == Some(request) {
-                self.fast_bind.sync_worker_owned = None;
-            }
-            return WorkerBindDispatch::Superseded;
-        }
-        // A host-visible SET (fast or synchronous) owns the exact reader
-        // transaction until its response and, on success, its exact flush
-        // terminate. The worker must wait behind that transaction even when its
-        // own producer is ready; otherwise it could publish a later SET before
-        // the host has read the first binding.
-        if self.publication_active()
-            || self.fast_bind.selection_ambiguity.blocks_admission()
-            || self.fast_bind.sync_worker_owned == Some(request)
-            || self.fast_owns_request(request)
-        {
-            self.fast_bind.deferred_worker = Some(request);
-            return WorkerBindDispatch::Waiting;
-        }
-        if self.scanout_boundary_ready(request.carried_watermark) {
-            // Claim under the same transport lock the fast stage uses. This
-            // closes the pre-existing-HPD race where both producers observed no
-            // owner and published duplicate SETs for one exact flip.
-            // A spurious worker wake can re-check a request before the DPC has
-            // consumed it; a ready request has no reason to remain deferred.
-            if self.fast_bind.deferred_worker == Some(request) {
-                self.fast_bind.deferred_worker = None;
-            }
-            if reserve_sync_set {
-                self.fast_bind.sync_worker_owned = Some(request);
-            }
-            return WorkerBindDispatch::Ready;
-        }
-        self.fast_bind.deferred_worker = Some(request);
-        WorkerBindDispatch::Waiting
-    }
-
-    /// True once the retained PASSIVE fallback can be retried without binding
-    /// ahead of its producer.  Consumed by the DPC, which wakes the worker.
-    pub fn take_ready_worker_scanout_bind(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-    ) -> bool {
-        let Some(request) = self.fast_bind.deferred_worker else {
-            return false;
-        };
-        // `service_deferred_scanout_bind` may have published the fast command
-        // earlier in this same DPC. Re-check here so the worker never wakes to
-        // place a synchronous SET behind that exact command.
-        if self.publication_active()
-            || self.fast_bind.selection_ambiguity.blocks_admission()
-            || self.fast_owns_request(request)
-        {
-            return false;
-        }
-        if self.presentation_epoch_is_superseded(request) {
-            // Wake the PASSIVE worker to consume the stale handle through its
-            // terminal Superseded outcome, which lowers/reassigns the existing
-            // WDDM programming gate without issuing another SET.
-            self.fast_bind.deferred_worker = None;
-            if self.fast_bind.sync_worker_owned == Some(request) {
-                self.fast_bind.sync_worker_owned = None;
-            }
-            return true;
-        }
-        if request.resource_id == self.fast_bind.retiring_resource
-            || !self.canonical_resource_is_live(adapter, request.resource_id)
-            || !self.scanout_bind_boundary_live(request.carried_watermark)
-        {
-            self.fast_bind.deferred_worker = None;
-            return false;
-        }
-        if !self.scanout_boundary_ready(request.carried_watermark) {
-            return false;
-        }
-        self.fast_bind.deferred_worker = None;
-        true
-    }
-
-    pub(crate) fn apply_sync_scanout_disable(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-        identity: super::ctrl::ScanoutBindIdentity,
-        token: &ScanoutRetireToken,
-    ) -> bool {
-        if identity.instance() != self.scanout_transport_instance
-            || token.transport_instance != self.scanout_transport_instance
-            || token.resource_id != self.fast_bind.retiring_resource
-            || !self.fast_bind.retire_barrier
-            || self.fast_bind.host_accepted_seq != identity.sequence()
-            || self.fast_bind.host_accepted_resource != 0
-            || self.fast_bind.selection_ambiguity.blocks_admission()
-            || !adapter.adopt_scanout_bind_seq(identity.sequence())
-        {
-            return false;
-        }
-        adapter
-            .host_bound_scanout_resource
-            .store(0, Ordering::Release);
-        adapter.active_scanout_resource.store(0, Ordering::Release);
-        adapter.active_scanout_wh.store(0, Ordering::Release);
-        adapter.scanout_epoch_tracked.store(0, Ordering::Release);
-        let _ = adapter.end_scanout_leases_through(
-            adapter.scanout_bound_epoch.load(Ordering::Acquire),
-            crate::ddi::scanout_trace::LeaseEnd::Cancelled,
-        );
-        adapter.scanout_refresh_pending.store(0, Ordering::Release);
-        adapter.pending_refresh_resource.store(0, Ordering::Release);
-        self.fast_bind.retire_barrier = false;
-        self.fast_bind.retiring_resource = 0;
-        true
-    }
-
-    pub fn release_fast_owned_worker(&mut self, request: ScanoutBindRequest) {
-        if self.fast_bind.host_accepted_fast_request == Some(request) {
-            // Keep the host resource/sequence for DestroyAllocation's lifetime
-            // barrier; only clear its *worker suppression* role after DPC
-            // publication made `already_bound` authoritative.
-            self.fast_bind.host_accepted_fast = false;
-            self.fast_bind.host_accepted_fast_request = None;
-        }
-        if self.fast_bind.deferred_worker == Some(request) {
-            self.fast_bind.deferred_worker = None;
-        }
-    }
-
-    /// Consume one failure wake and release only its exact worker suppression
-    /// while the producing transport remains locked.
-    pub fn take_fast_failure_wake_and_release(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-    ) -> bool {
-        let Some(request) = self.fast_bind.fast_failure_wake.take() else {
-            return false;
-        };
-        self.release_fast_owned_worker(request);
-        adapter.signal_hpd();
-        true
-    }
-
-    pub fn wake_ready_worker_scanout_bind(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-    ) -> bool {
-        if !self.take_ready_worker_scanout_bind(adapter) {
-            return false;
-        }
-        adapter.signal_hpd();
-        true
-    }
-
-    fn fast_owns_request(&self, request: ScanoutBindRequest) -> bool {
-        self.fast_bind.publication_request == Some(request)
-            || self
-                .fast_bind
-                .completed
-                .is_some_and(|bind| completed_request(bind) == request)
-            || (self.fast_bind.host_accepted_fast
-                && self.fast_bind.host_accepted_fast_request == Some(request))
-            || self
-                .fast_bind
-                .orphaned_set
-                .is_some_and(|orphan| orphan.request == Some(request))
-            || self.inflight.iter().any(|entry| match entry.kind {
-                InFlightKind::AsyncScanoutBind {
-                    resource_id,
-                    wh,
-                    format,
-                    stride,
-                    offset,
-                    present_epoch,
-                    primary_address,
-                    carried_watermark,
-                    ..
-                } => {
-                    ScanoutBindRequest {
-                        resource_id,
-                        width: (wh >> 32) as u32,
-                        height: wh as u32,
-                        format,
-                        stride,
-                        offset,
-                        present_epoch,
-                        primary_address,
-                        carried_watermark,
-                    } == request
-                }
-                _ => false,
-            })
-    }
-
-    fn enqueue_ready_scanout_bind(
-        &mut self,
-        request: ScanoutBindRequest,
-        adapter: &crate::adapter::AdapterContext,
-    ) -> FastBindDispatch {
-        // See `stage_scanout_bind`: this exact owner is a previously accepted
-        // synchronous descriptor, not a deferred attempt to publish another
-        // SET at the now-equal floor.
-        if self.fast_bind.sync_worker_owned == Some(request) {
-            return FastBindDispatch::Handled;
-        }
-        if self.presentation_epoch_is_superseded(request) {
-            if self.fast_bind.sync_worker_owned == Some(request) {
-                self.fast_bind.sync_worker_owned = None;
-            }
-            if self.fast_bind.deferred_worker == Some(request) {
-                self.fast_bind.deferred_worker = None;
-            }
-            self.note_fast_bind_epoch_superseded(request);
-            return FastBindDispatch::Superseded;
-        }
-        if self.publication_active() || self.fast_bind.selection_ambiguity.blocks_admission() {
-            return FastBindDispatch::Deferred;
-        }
-        if self.fast_bind.retire_barrier
-            || request.resource_id == self.fast_bind.retiring_resource
-            || !self.canonical_resource_is_live(adapter, request.resource_id)
-        {
-            return FastBindDispatch::Failed;
-        }
-        let Some(buffer) = self.take_bind_cmd_buffer() else {
-            return FastBindDispatch::Busy;
-        };
-        match self.enqueue_scanout_bind_async(buffer, &request, adapter) {
-            Ok(()) => FastBindDispatch::Queued,
-            Err(FastBindRefusal::Busy) => FastBindDispatch::Busy,
-            Err(FastBindRefusal::Superseded) => {
-                self.note_fast_bind_epoch_superseded(request);
-                FastBindDispatch::Superseded
-            }
-            Err(FastBindRefusal::Failed) => FastBindDispatch::Failed,
-        }
-    }
-
-    /// Take a fast-bind command buffer, or `None` when all [`BIND_CMD_POOL`] of
-    /// them are already in flight. The take IS the gate — see
-    /// [`Self::bind_cmd_pool`].
-    pub fn take_bind_cmd_buffer(&mut self) -> Option<DmaBuffer> {
-        self.bind_cmd_pool.pop()
-    }
-
-    /// Put a fast-bind command buffer back, for the enqueue's failure arms.
-    ///
-    /// Cannot fail in practice: the buffer came out of this pool under the lock
-    /// the caller still holds, so the pool is one short of full. The `len` test
-    /// is what keeps the push inside the reserved capacity — a reallocation
-    /// under the device spinlock is the 0x7F class of bug — and the impossible
-    /// arm LEAKS rather than frees, because `DmaBuffer::drop` is
-    /// `MmFreeContiguousMemory` and that is PASSIVE-only; the same policy
-    /// `PARKED_LEAKS` follows. `FpErr` rising with no host errors is then the
-    /// visible signature of the accounting having broken.
-    fn return_bind_cmd_buffer(&mut self, buf: DmaBuffer) {
-        if self.bind_cmd_pool.len() < BIND_CMD_POOL {
-            self.bind_cmd_pool.push(buf);
-            return;
-        }
-        crate::ddi::scanout_trace::note_fast_bind_error();
-        core::mem::forget(buf);
-    }
-
-    /// Take the newest host-accepted fast bind, for application outside this
-    /// lock. See [`CompletedBind`] for why the drain cannot apply it itself.
-    pub fn take_completed_bind(&mut self) -> Option<CompletedBind> {
-        self.fast_bind.completed.take()
-    }
-
-    /// Enqueue an ASYNC fenced SUBMIT_3D and return the KMD-assigned wire
-    /// fence id. Returns at queue time — completion arrives on the used ring
-    /// (interrupt DPC), which signals WAIT_FENCE waiters and advances the WDDM
-    /// pending FIFO. `meta` carries `[SUBMIT_3D hdr | ctrl resp]`; `venus` is
-    /// the opaque stream (second device-read descriptor — kept split so the
-    /// host never mis-parses the submit header as another control command).
     pub fn enqueue_async_submit(
         &mut self,
         ctx_id: u32,
@@ -5213,9 +2559,7 @@ impl VirtioGpu {
         venus: DmaBuffer,
         venus_len: usize,
     ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
-        self.enqueue_submit_inner(
-            ctx_id, ring_idx, meta, venus, venus_len, None, None, None, None,
-        )
+        self.enqueue_submit_inner(ctx_id, ring_idx, meta, venus, venus_len, None)
         .map_err(|(meta, venus, native, error)| {
             debug_assert!(native.is_none());
             (meta, venus, error)
@@ -5257,131 +2601,11 @@ impl VirtioGpu {
             meta,
             venus,
             venus_len,
-            None,
-            None,
-            None,
             Some(completion),
         )
     }
 
-    /// Ring-1 submission belonging to an already admitted WindowedBlt FIFO
-    /// entry. Failure is terminalized by the caller while it still owns the
-    /// request; a successful used-ring response resolves it by exact token.
-    pub fn enqueue_async_submit_windowed_blt(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-        ctx_id: u32,
-        meta: DmaBuffer,
-        venus: DmaBuffer,
-        venus_len: usize,
-        token: u64,
-        stream_boundary: u64,
-    ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
-        let known = self.windowed_blt.pending.iter().any(|request| {
-            request.token == token
-                && request.stream_boundary == stream_boundary
-                && request.admitted
-                && request.dispatched
-        });
-        if !known {
-            return Err((meta, venus, VirtioError::DeviceError));
-        }
-        self.enqueue_submit_inner(
-            ctx_id,
-            SCANOUT_RING_IDX,
-            meta,
-            venus,
-            venus_len,
-            None,
-            None,
-            Some(WindowedBltRetire {
-                adapter: NonNull::from(adapter),
-                token,
-                stream_boundary,
-            }),
-            None,
-        )
-        .map_err(|(meta, venus, native, error)| {
-            debug_assert!(native.is_none());
-            (meta, venus, error)
-        })
-    }
-
-    /// Enqueue a tagged ICD submit.  Validation and the descriptor add happen
-    /// under the same transport lock, so CTX_DESTROY cannot leave an accepted
-    /// queue entry carrying a stream that was concurrently purged.
-    pub fn enqueue_async_submit_present_stream(
-        &mut self,
-        owner: DeviceOwner,
-        ctx_id: u32,
-        ring_idx: u32,
-        cookie: u64,
-        value: u32,
-        meta: DmaBuffer,
-        venus: DmaBuffer,
-        venus_len: usize,
-    ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
-        let retire = match self.prepare_present_stream_tag(owner, ctx_id, ring_idx, cookie, value) {
-            Ok(retire) => retire,
-            Err(error) => return Err((meta, venus, error)),
-        };
-        self.enqueue_submit_inner(
-            ctx_id,
-            ring_idx,
-            meta,
-            venus,
-            venus_len,
-            None,
-            Some(retire),
-            None,
-            None,
-        )
-        .map_err(|(meta, venus, native, error)| {
-            debug_assert!(native.is_none());
-            (meta, venus, error)
-        })
-    }
-
-    /// Enqueue the scan-out copy: an ASYNC fenced SUBMIT_3D on ring 1 carrying
-    /// the notification target whose completion publishes the displayed primary
-    /// and clears the programming gate.
-    ///
-    /// The ring is NOT a parameter. It used to be, independently of the notify,
-    /// while the drain only honoured a notify on ring 1 — so
-    /// `enqueue_async_submit(ctx, 0, .., Some(notify))` compiled, completed
-    /// through the `ring_idx != 1` path, and silently discarded the notify with
-    /// no counter and no error. Because that drain is the ONLY clear of
-    /// `vidpn_programming` on the copied-primary path, the pending primary and
-    /// its programming ownership remained stranded for the rest of the boot.
-    /// Making the ring an implicit property of this entry point takes the
-    /// `(ring, notify)` mismatch out of the type space entirely.
-    pub fn enqueue_scanout_submit(
-        &mut self,
-        ctx_id: u32,
-        meta: DmaBuffer,
-        venus: DmaBuffer,
-        venus_len: usize,
-        notify: ScanoutNotify,
-    ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
-        self.enqueue_submit_inner(
-            ctx_id,
-            SCANOUT_RING_IDX,
-            meta,
-            venus,
-            venus_len,
-            Some(notify),
-            None,
-            None,
-            None,
-        )
-        .map_err(|(meta, venus, native, error)| {
-            debug_assert!(native.is_none());
-            (meta, venus, error)
-        })
-    }
-
-    /// Shared body of the two entry points above. Private: the notify/ring
-    /// pairing is theirs to decide, not a caller's.
+    /// Shared body for ordinary and native Venus submissions.
     fn enqueue_submit_inner(
         &mut self,
         ctx_id: u32,
@@ -5389,9 +2613,6 @@ impl VirtioGpu {
         mut meta: DmaBuffer,
         venus: DmaBuffer,
         venus_len: usize,
-        scanout_notify: Option<ScanoutNotify>,
-        present_stream: Option<PresentStreamRetire>,
-        windowed_blt: Option<WindowedBltRetire>,
         mut native_completion: Option<crate::ddi::native_render::NativeHostCompletion>,
     ) -> Result<
         u64,
@@ -5463,9 +2684,6 @@ impl VirtioGpu {
             }
             Err(e) => return Err((meta, venus, native_completion, e)),
         };
-        if let Some(retire) = present_stream {
-            self.commit_present_stream_tag(retire, ring_idx);
-        }
         // Stays BETWEEN a successful `add` and the publish: the wire fence id
         // is only spent once the device has actually taken the descriptor.
         // Proven strictly below the checked transport limit above.
@@ -5481,9 +2699,6 @@ impl VirtioGpu {
                 fence_id,
                 ring_idx: ring,
                 native_completion: native_completion.take(),
-                scanout_notify,
-                present_stream,
-                windowed_blt,
             },
             meta,
             chain,
@@ -5497,56 +2712,15 @@ impl VirtioGpu {
     /// once. Call at the moment the latch is set, never later, and always under
     /// the device spinlock.
     ///
-    /// Before this, latching `failed` made `drain_used` return immediately and
-    /// left every entry in `inflight` forever. `async_retired_up_to` then
-    /// reported false for every watermark above those stuck ids,
-    /// `note_wddm_submission` never returned "signal now" and `take_ready_wddm`
-    /// never popped, so DMA_COMPLETED was never delivered again. ResetFromTimeout
-    /// cleared the FIFO but neither the latch nor the stuck entries, so dxgkrnl
-    /// resubmitted with fresh ids into the same wedge: a TDR loop. And the
-    /// `AsyncControl` entries that own `scanout_flush_inflight` were abandoned
-    /// with their completion gates still set, so `queue_active_scanout_refresh`
-    /// returned Busy forever and the HPD worker spun its 4 ms lost-interrupt
-    /// poll for the rest of the boot. (`scanout_bind_inflight` was the other
-    /// such gate until T6/R902 deleted the async bind.)
-    ///
-    /// Everything here mirrors the success path's ordering exactly, because a
-    /// mistake in the Sync-waiter sequence is a use-after-free of a stack block.
+    /// This mirrors the success path's waiter and native-completion ownership:
+    /// synchronous stack waiters are terminalized, while move-only native
+    /// completions remain attached to the parked entry until PASSIVE teardown.
     fn latch_failed_and_fail_inflight(&mut self) {
         self.failed = true;
         self.queue.mark_failed();
-        // A transport failure is not proof that a published persistent SET had
-        // no host side effect. Permanently seal this generation's ordinary SET
-        // admission and resource retirement until the transport is replaced.
-        self.fast_bind.selection_ambiguity = self
-            .fast_bind
-            .selection_ambiguity
-            .observe_malformed(u64::MAX);
-        // Neither a host-accepted completion nor a deferred producer boundary
-        // survives a terminal transport failure. Clear both value-only slots so
-        // no later DPC can publish bookkeeping from this generation.
-        self.fast_bind.completed = None;
-        self.fast_bind.publication_request = None;
-        self.fast_bind.publication = helios_kmd_logic::scanout_publish_txn::State::new();
-        self.fast_bind.deferred_earliest = None;
-        self.fast_bind.deferred_latest = None;
-        self.fast_bind.host_accepted_seq = 0;
-        self.fast_bind.host_accepted_resource = 0;
-        self.fast_bind.host_accepted_fast = false;
-        self.fast_bind.retiring_resource = 0;
-        self.fast_bind.retire_barrier = false;
-        self.fast_bind.sync_worker_owned = None;
-        self.fast_bind.deferred_worker = None;
-        self.fast_bind.fast_failure_wake = None;
-        self.fast_bind.host_accepted_fast_request = None;
-        while let Some(mut entry) = self.inflight.pop() {
-            // Taken out BEFORE the match, so `entry` itself is never partially
-            // moved and can still be parked below. `ScanoutFlushToken` is
-            // deliberately not `Copy`: completing one twice would count a second
-            // host read that never happened.
-            let scanout_flush = take_scanout_flush_token(&mut entry.kind);
+        while let Some(entry) = self.inflight.pop() {
             match entry.kind {
-                InFlightKind::Sync { waiter, .. } => {
+                InFlightKind::Sync { waiter } => {
                     if let Some(block) = waiter {
                         // No response is copied: TransportAborted is the exact
                         // terminal state and readers never decode `resp` for it.
@@ -5572,84 +2746,7 @@ impl VirtioGpu {
                         }
                     }
                 }
-                InFlightKind::AsyncControl {
-                    completion,
-                    completion_errors,
-                    wake_event,
-                    ..
-                } => {
-                    // The transport is dead: this command has terminated and no
-                    // host read can originate from it any more. End its lease
-                    // (counted `LsCanc`), or the flip that presented that buffer
-                    // never retires and VidSch escalates to a TDR — the same
-                    // wedge class this function's own doc paragraph describes.
-                    if let Some(token) = scanout_flush {
-                        token.complete(false);
-                    }
-                    // Clear the gate and wake the worker, so the display's
-                    // coalescing gates unstick instead of reading Busy forever.
-                    // No `success_store`, no `resubmit`: nothing succeeded.
-                    // SAFETY: all three name stable AdapterContext fields whose
-                    // lifetime encloses this transport entry.
-                    unsafe {
-                        completion_errors.as_ref().fetch_add(1, Ordering::Relaxed);
-                        completion.as_ref().store(0, Ordering::Release);
-                        KeSetEvent(wake_event.as_ptr(), IO_NO_INCREMENT, 0);
-                    }
-                }
-                InFlightKind::AsyncScanoutBind { .. } => {
-                    // Transport failure cannot distinguish an unapplied SET
-                    // from a persistent host selection. Apply no success
-                    // bookkeeping; the generation-wide ambiguity marker above
-                    // now blocks every retirement until transport replacement.
-                    //
-                    // The preallocated command buffer parks with the entry
-                    // below, and the slot stays empty for the rest of this
-                    // transport generation — the next StartDevice builds a fresh
-                    // `VirtioGpu` with a fresh buffer. That costs one page after
-                    // a transport death, which is not a state anything else
-                    // survives either.
-                    crate::ddi::scanout_trace::note_fast_bind_error();
-                }
-                InFlightKind::AsyncVenus {
-                    scanout_notify,
-                    present_stream: _,
-                    windowed_blt,
-                    ..
-                } => {
-                    // A transport latch is an epoch abort, not a producer
-                    // retirement. `purge_all_present_streams` below explicitly
-                    // cancels every remaining stream; advancing a marker here
-                    // would manufacture a successful boundary for work the
-                    // host never accepted.
-                    if let Some(notify) = scanout_notify {
-                        // Publish nothing as displayed - the copy did not happen -
-                        // but DO clear the programming gate so this failed
-                        // primary does not retain ownership indefinitely.
-                        // Ticketed: if a newer interval was raised meanwhile,
-                        // that gate is not ours to lower.
-                        // SAFETY: stable AdapterContext fields; the adapter owns
-                        // this transport and outlives every in-flight entry.
-                        unsafe {
-                            crate::adapter::clear_programming_gate(
-                                notify.programming.as_ref(),
-                                notify.ticket,
-                            );
-                            KeSetEvent(notify.event.as_ptr(), IO_NO_INCREMENT, 0);
-                        }
-                    }
-                    if let Some(retire) = windowed_blt {
-                        // The host can no longer read this request after a
-                        // terminal transport latch. End the exact reader and
-                        // WDDM gate rather than leaking a snapshot slot.
-                        self.terminal_windowed_blt(
-                            unsafe { retire.adapter.as_ref() },
-                            retire.token,
-                            retire.stream_boundary,
-                            false,
-                        );
-                    }
-                }
+                InFlightKind::AsyncVenus { .. } => {}
             }
             // Park, never free: the host may still be DMAing into these buffers,
             // and DmaBuffer frees are PASSIVE-only. Same policy as the success
@@ -5663,8 +2760,8 @@ impl VirtioGpu {
             }
         }
 
-        // No wire fence can ever retire now, so release every parked waiter and
-        // usermode event rather than leaving them blocked on a dead transport.
+        // No wire fence can ever retire now, so release every bounded KMD
+        // waiter rather than leaving it blocked on a dead transport.
         while let Some(w) = self.fence_waiters.pop() {
             // SAFETY: registered blocks stay valid until deregistration, which
             // happens under this same lock.
@@ -5675,30 +2772,14 @@ impl VirtioGpu {
                 }
             }
         }
-        // A failed transport cannot satisfy an outstanding stream boundary.
-        // Clear the table and any coalesced marker so a future generation never
-        // reads an old handle as live.
-        self.purge_all_present_streams();
-        self.abort_windowed_blt_for_terminal_transport();
-        while let Some(e) = self.fence_events.pop() {
-            // SAFETY: the entry holds an object reference taken by the escape
-            // handler. The deref MUST be deferred: dropping the last reference
-            // with a plain deref at DISPATCH would run the object's PASSIVE-only
-            // deletion.
-            unsafe {
-                KeSetEvent(e.event.as_ptr(), IO_NO_INCREMENT, 0);
-                ObDereferenceObjectDeferDelete(e.event.as_ptr() as PVOID);
-            }
-            FENCE_EVENT_SIGNALS.fetch_add(1, Ordering::Relaxed);
-        }
     }
 
     /// Drain every completed entry off the used ring: pop the descriptor chain
     /// (token-matched), signal sync/fence waiters, and park the entry for a
     /// PASSIVE reap. The ONLY used-ring consumer (interrupt DPC + opportunistic
     /// callers under the same spinlock).
-    /// Retire one assigned wire fence from the two optional notification
-    /// tables. The in-flight entry has already been removed, so the ordinal
+    /// Retire one assigned wire fence from the bounded KMD waiter table. The
+    /// in-flight entry has already been removed, so the ordinal
     /// predicate used by WAIT_FENCE agrees with these explicit wakeups.
     fn retire_wire_fence_notifications(&mut self, fence_id: u64) {
         if fence_id == 0 {
@@ -5720,21 +2801,6 @@ impl VirtioGpu {
                 j += 1;
             }
         }
-        let mut j = 0;
-        while j < self.fence_events.len() {
-            if self.fence_events[j].fence_id == fence_id {
-                let e = self.fence_events.swap_remove(j);
-                // SAFETY: the table owns an object reference until this exact
-                // removal. Deferred dereference is required at DISPATCH.
-                unsafe {
-                    KeSetEvent(e.event.as_ptr(), IO_NO_INCREMENT, 0);
-                    ObDereferenceObjectDeferDelete(e.event.as_ptr() as PVOID);
-                }
-                FENCE_EVENT_SIGNALS.fetch_add(1, Ordering::Relaxed);
-            } else {
-                j += 1;
-            }
-        }
     }
 
     pub fn drain_used(&mut self, adapter: &crate::adapter::AdapterContext) {
@@ -5742,9 +2808,6 @@ impl VirtioGpu {
             return;
         }
         if self.queue.is_failed() {
-            // A structural failure observed by the DIRQL-only publisher must
-            // retire ordinary waiters and seal persistent SET custody too. A
-            // bare early return would strand both indefinitely.
             self.latch_failed_and_fail_inflight();
             return;
         }
@@ -5769,32 +2832,27 @@ impl VirtioGpu {
                     self.latch_failed_and_fail_inflight();
                     return;
                 }
-            };
-            let Some(idx) = self.inflight.iter().position(|e| e.token == token) else {
-                // A completion we do not track: the ring state is corrupt.
+            }
+            let Some(idx) = self.inflight.iter().position(|entry| entry.token == token) else {
                 DRAIN_BAD_TOKEN.fetch_add(1, Ordering::Relaxed);
                 self.latch_failed_and_fail_inflight();
                 return;
             };
-            // Rebuild the spans through the SAME producer `add` used, so the
-            // two lists cannot drift. The result is copied out so no borrow of
-            // `self.inflight` is held across the interrupt-synchronized queue call.
             let (spans, resp_len) = {
-                let e = &self.inflight[idx];
+                let entry = &self.inflight[idx];
                 (
-                    e.chain.spans(&e.meta, e.venus.as_ref(), e.resp_len),
-                    e.resp_len,
+                    entry
+                        .chain
+                        .spans(&entry.meta, entry.venus.as_ref(), entry.resp_len),
+                    entry.resp_len,
                 )
             };
-            // The entry's own spans were proved at enqueue and nothing has
-            // resized the buffers since, so this cannot fail; treat it as a
-            // corrupt entry rather than assuming.
-            let Some((reads, count, resp)) = spans else {
+            let Some((reads, count, response)) = spans else {
                 DRAIN_BAD_TOKEN.fetch_add(1, Ordering::Relaxed);
                 self.latch_failed_and_fail_inflight();
                 return;
             };
-            let written_length = match self.queue.pop_used(token, reads, count, resp) {
+            let written_length = match self.queue.pop_used(token, reads, count, response) {
                 Ok(length) => length,
                 Err(VirtioError::QueueFull) => return,
                 Err(_) => {
@@ -5807,484 +2865,83 @@ impl VirtioGpu {
                 self.latch_failed_and_fail_inflight();
                 return;
             }
+
             let mut entry = self.inflight.swap_remove(idx);
-            // As in `latch_failed_and_fail_inflight`: take the ownership token
-            // out before the `match entry.kind` moves the other fields, so the
-            // entry stays whole for the park below.
-            let scanout_flush = take_scanout_flush_token(&mut entry.kind);
             let native_completion = take_native_completion(&mut entry.kind);
-            let resp_base = {
-                // SAFETY: the resp span is within the entry-owned meta buffer.
-                unsafe { resp.as_slice() }.as_ptr()
+            let response_base = {
+                // SAFETY: the response span is within the entry-owned buffer.
+                unsafe { response.as_slice() }.as_ptr()
             };
-            let response_in_bounds = written_length as usize >= size_of::<VirtioGpuCtrlHdr>();
-            let resp_type = response_in_bounds.then(|| {
-                // SAFETY: an in-bounds used length proves the full response
-                // header is device-written; the offset may be unaligned.
-                unsafe { core::ptr::read_unaligned(resp_base as *const u32) }
-            });
+            let response_type =
+                (written_length as usize >= size_of::<VirtioGpuCtrlHdr>()).then(|| {
+                    // SAFETY: the used length covers the response type word.
+                    unsafe { core::ptr::read_unaligned(response_base.cast::<u32>()) }
+                });
+
             match entry.kind {
-                InFlightKind::Sync {
-                    waiter,
-                    scanout_bind,
-                } => {
-                    let response_header = if written_length as usize
-                        == size_of::<VirtioGpuCtrlHdr>()
-                    {
-                        // SAFETY: the exact written length covers one complete
-                        // header in the entry-owned response span; alignment is
-                        // not promised by the virtqueue layout.
-                        Some(unsafe {
-                            core::ptr::read_unaligned(resp_base.cast::<VirtioGpuCtrlHdr>())
-                        })
-                    } else {
-                        None
-                    };
-                    let exact_fence = scanout_bind.is_none_or(|bind| {
-                        bind.fence_id == 0
-                            || response_header.is_some_and(|header| {
-                                header.flags == VIRTIO_GPU_FLAG_FENCE
-                                    && header.fence_id == bind.fence_id
-                                    && header.ctx_id == 0
-                                    && header.ring_idx == 0
-                                    && header.padding == [0; 3]
-                            })
-                    });
-                    let response_ok = response_header
-                        .is_some_and(|header| header.type_ == VIRTIO_GPU_RESP_OK_NODATA)
-                        && exact_fence;
-                    let response_rejected = written_length as usize
-                        == size_of::<VirtioGpuCtrlHdr>()
-                        && resp_type
-                            .is_some_and(|raw| HostRejection::from_response_type(raw).is_ok())
-                        && exact_fence;
-                    let waiter_abandoned = waiter.is_none();
-                    if let Some(bind) = terminal_sync_scanout_bind(response_ok, scanout_bind) {
-                        // This runs even after `abandon_sync` detached the
-                        // stack waiter. A successful SET remains host-visible,
-                        // so lifecycle retirement must learn its exact wire
-                        // identity before deciding whether a disable is needed.
-                        self.note_host_accepted_scanout_bind(bind.seq, bind.resource_id);
-                        if let Some(request) = bind.request {
-                            let terminal =
-                                self.complete_publication_set(request, bind.seq, response_ok);
-                            debug_assert!(
-                                terminal,
-                                "sync SET terminal response mismatched transaction"
-                            );
-                            if response_ok && waiter_abandoned && terminal {
-                                // The PASSIVE caller timed out and detached its
-                                // stack waiter. The host nevertheless bound this
-                                // exact request, so the DPC must apply its full
-                                // geometry/epoch and arm the matching flush.
-                                self.fast_bind.completed = Some(CompletedBind {
-                                    seq: bind.seq,
-                                    resource_id: request.resource_id,
-                                    wh: ((request.width as u64) << 32) | request.height as u64,
-                                    present_epoch: request.present_epoch,
-                                    primary_address: request.primary_address,
-                                    carried_watermark: request.carried_watermark,
-                                    format: request.format,
-                                    stride: request.stride,
-                                    offset: request.offset,
-                                });
-                            }
-                        }
-                    } else if response_rejected {
-                        if let Some(bind) = scanout_bind {
-                            // A direct presentation host-error is terminal for its
-                            // exact transaction. Wake the retained worker recovery
-                            // path; it may re-stage only after this clear.
-                            if let Some(request) = bind.request {
-                                let terminal =
-                                    self.complete_publication_set(request, bind.seq, false);
-                                debug_assert!(terminal, "sync SET error mismatched transaction");
-                                if terminal {
-                                    if self.fast_bind.sync_worker_owned == Some(request) {
-                                        self.fast_bind.sync_worker_owned = None;
-                                    }
-                                    self.fast_bind.fast_failure_wake = Some(request);
-                                }
-                            }
-                        }
-                    } else if let Some(bind) = scanout_bind {
-                        SCANOUT_BIND_AMBIGUOUS_RESPONSES.fetch_add(1, Ordering::Relaxed);
-                        self.note_ambiguous_scanout_bind(bind.seq);
-                    }
-                    if let Some(bind) = scanout_bind {
-                        self.retire_wire_fence_notifications(bind.fence_id);
-                    }
+                InFlightKind::Sync { waiter } => {
                     if let Some(block) = waiter {
-                        // THE WRITE SITE THE 22.22.218.0 `0xA` RACED, and the
-                        // ordering below is now correct only because
-                        // `ctrl::wait_block` has no lock-free disposition fast
-                        // path. Keep it that way: the terminal state is published
-                        // immediately before the signal, so an exit authorized
-                        // by that state lets the waiter pop the frame these three
-                        // accesses are still writing (ROADMAP defect 0ab-C).
-                        //
-                        // SAFETY: the block outlives every access here, and the
-                        // argument is now about the waiter's TWO exits rather
-                        // than about deregistration:
-                        //   * the SIGNAL — the waiter is inside
-                        //     `KeWaitForSingleObject` on `event`, and the
-                        //     kernel's stack-event contract says it cannot
-                        //     resume before `KeSetEvent` has finished with the
-                        //     dispatcher object;
-                        //   * the TIMEOUT — `abandon_sync` runs under THIS lock,
-                        //     so it either clears `waiter` before this arm runs
-                        //     (`waiter` is still `Some`, so it did not) or runs
-                        //     after the whole arm and reports AlreadyCompleted;
-                        //     its own frame is alive across that call.
-                        // Response copied BEFORE the Release terminal publish;
-                        // KeSetEvent is DISPATCH-safe (Wait=FALSE). All three
-                        // stay inside the critical section for the second exit's
-                        // half of the argument.
+                        // SAFETY: the stack waiter remains registered until this
+                        // lock publishes a terminal or abandonment removes it.
                         unsafe {
-                            let b = block.as_ptr();
-                            if (*b).disposition() == WaitDisposition::Pending {
-                                (*b).response_written
+                            let block = block.as_ptr();
+                            if (*block).disposition() == WaitDisposition::Pending {
+                                (*block)
+                                    .response_written
                                     .store(written_length, Ordering::Relaxed);
-                                // Every in-capacity completion is published
-                                // losslessly, including a short prefix. SET and
-                                // future OwnerTable normalization consume the
-                                // exact length; legacy persistent callers retain
-                                // their old zero-tail response-type behavior.
                                 core::ptr::copy_nonoverlapping(
-                                    resp_base,
-                                    (*b).resp.get() as *mut u8,
+                                    response_base,
+                                    (*block).resp.get().cast::<u8>(),
                                     written_length as usize,
                                 );
-                                let terminal = WaitDisposition::HostResponseAvailable;
-                                if (*b).publish_terminal(terminal) {
-                                    KeSetEvent(&mut (*b).event, IO_NO_INCREMENT, 0);
+                                if (*block)
+                                    .publish_terminal(WaitDisposition::HostResponseAvailable)
+                                {
+                                    KeSetEvent(&mut (*block).event, IO_NO_INCREMENT, 0);
                                 }
                             }
                         }
-                    }
-                }
-                InFlightKind::AsyncScanoutBind {
-                    seq,
-                    resource_id,
-                    wh,
-                    format,
-                    stride,
-                    offset,
-                    present_epoch,
-                    primary_address,
-                    carried_watermark,
-                } => {
-                    // NO adapter bookkeeping here, on purpose. This runs under
-                    // `virtio_lock`, and applying ends in a flush arm that needs
-                    // `wddm_notify_lock` — the reverse of the driver's order,
-                    // which `end_scanout_leases_through` documents and which is
-                    // a DIRQL deadlock, not a lock-contention slowdown. Stash
-                    // the values; `drain_used_and_complete` applies them one
-                    // frame up, with no transport lock held.
-                    let set_ok = written_length as usize == size_of::<VirtioGpuCtrlHdr>()
-                        && resp_type == Some(VIRTIO_GPU_RESP_OK_NODATA);
-                    let set_rejected = written_length as usize == size_of::<VirtioGpuCtrlHdr>()
-                        && resp_type
-                            .is_some_and(|raw| HostRejection::from_response_type(raw).is_ok());
-                    crate::ddi::scanout_timeline::note(
-                        crate::ddi::scanout_timeline::kind::FAST_SET_COMPLETE,
-                        if set_ok {
-                            crate::ddi::scanout_timeline::flag::SUCCESS
-                        } else {
-                            0
-                        },
-                        present_epoch,
-                        carried_watermark,
-                        seq,
-                        resource_id,
-                        resp_type.unwrap_or(0),
-                    );
-                    if set_ok {
-                        let request = ScanoutBindRequest {
-                            resource_id,
-                            width: (wh >> 32) as u32,
-                            height: wh as u32,
-                            format,
-                            stride,
-                            offset,
-                            present_epoch,
-                            primary_address,
-                            carried_watermark,
-                        };
-                        let terminal = self.complete_publication_set(request, seq, true);
-                        debug_assert!(
-                            terminal,
-                            "fast SET terminal response mismatched transaction"
-                        );
-                        if terminal {
-                            self.note_host_accepted_fast_scanout_bind(seq, request);
-                        } else {
-                            // The host did accept this selection, so retain the
-                            // conservative host ledger, but never publish guest
-                            // primary/refresh effects without the exact reader
-                            // transaction. Ambiguity remains latched.
-                            self.note_host_accepted_scanout_bind(seq, resource_id);
-                            self.fast_bind.selection_ambiguity =
-                                self.fast_bind.selection_ambiguity.observe_malformed(seq);
-                        }
-                        if terminal && self.fast_bind.completed.is_some() {
-                            // Two binds completed in one drain pass. The newest
-                            // is the identity the host is left with, so it wins
-                            // — the same coalescing the pending-flip slot does,
-                            // and counted for the same reason (`VpCoal` is that
-                            // slot's; this is `FpCoal`).
-                            crate::ddi::scanout_trace::note_fast_bind_coalesced();
-                        }
-                        if terminal {
-                            self.fast_bind.completed = Some(CompletedBind {
-                                seq,
-                                resource_id,
-                                wh,
-                                present_epoch,
-                                primary_address,
-                                carried_watermark,
-                                format,
-                                stride,
-                                offset,
-                            });
-                        }
-                    } else if set_rejected {
-                        // The host refused the bind. Nothing is bound to this
-                        // resource, so nothing may be remembered or published;
-                        // the PASSIVE worker's own validate/retry ladder is the
-                        // recovery path, unchanged.
-                        crate::ddi::scanout_trace::note_fast_bind_error();
-                        let request = ScanoutBindRequest {
-                            resource_id,
-                            width: (wh >> 32) as u32,
-                            height: wh as u32,
-                            format,
-                            stride,
-                            offset,
-                            present_epoch,
-                            primary_address,
-                            carried_watermark,
-                        };
-                        let terminal = self.complete_publication_set(request, seq, false);
-                        debug_assert!(terminal, "fast SET error mismatched transaction");
-                        if terminal {
-                            self.fast_bind.fast_failure_wake = Some(request);
-                        }
-                    } else {
-                        SCANOUT_BIND_AMBIGUOUS_RESPONSES.fetch_add(1, Ordering::Relaxed);
-                        self.note_ambiguous_scanout_bind(seq);
-                    }
-                }
-                InFlightKind::AsyncControl {
-                    completion,
-                    completion_errors,
-                    wake_event,
-                    success_store,
-                    resubmit,
-                    ..
-                } => {
-                    ASYNC_CTRL_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
-                    let response_ok = written_length as usize == size_of::<VirtioGpuCtrlHdr>()
-                        && resp_type == Some(VIRTIO_GPU_RESP_OK_NODATA);
-                    // THE CONSUMER EDGE (ROADMAP defect 0ab-B). QEMU's
-                    // `RESOURCE_FLUSH` handler is synchronous — the Vulkan
-                    // readback submits, waits on its fence, copies the staging
-                    // bytes and only then does this response go on the used ring
-                    // — so this exact point is "the host has finished reading
-                    // the buffer we published". Ending the lease HERE, before
-                    // the completion gate is cleared below, means the WDDM pop
-                    // that follows in the same DPC already sees it.
-                    if let Some(token) = scanout_flush {
-                        let (_, covers_epoch, resource_id) = token.trace_context();
-                        let exact_publication = self
-                            .publication_request_for(resource_id)
-                            .is_some_and(|request| request.present_epoch == covers_epoch);
-                        token.complete(response_ok);
-                        // Success completes the exact host-read transaction.
-                        // An error is an explicit exact cancellation: it must
-                        // not masquerade as a successful reader completion,
-                        // but the returned command cannot create a future read
-                        // and therefore may release this request's gate.
-                        if exact_publication {
-                            let terminal = if response_ok {
-                                self.complete_publication_flush(resource_id, covers_epoch)
-                            } else {
-                                self.cancel_publication_exact(resource_id, covers_epoch)
-                            };
-                            debug_assert!(
-                                terminal,
-                                "exact flush terminal response mismatched transaction"
-                            );
-                        }
-                    }
-                    if !response_ok {
-                        ASYNC_CTRL_RESP_ERRORS.fetch_add(1, Ordering::Relaxed);
-                        // SAFETY: adapter-owned atomic; see enqueue contract.
-                        unsafe { completion_errors.as_ref() }.fetch_add(1, Ordering::Relaxed);
-                    } else if let Some((target, value)) = success_store {
-                        // Publish which scanout the host accepted before the
-                        // worker consumes the follow-up dirty edge.
-                        unsafe { target.as_ref() }.store(value, Ordering::Release);
-                    }
-                    // Publish completion before waking the coalescing worker.
-                    // SAFETY: both pointers refer to stable AdapterContext
-                    // fields whose lifetime encloses this transport entry.
-                    unsafe {
-                        // A rejected SET_SCANOUT_BLOB must not become a
-                        // self-sustaining retry loop. New exact-primary/dirty
-                        // publication is the only retry trigger; successful
-                        // binds re-arm once to issue their first flush.
-                        if response_ok {
-                            if let Some(pending) = resubmit {
-                                pending.as_ref().store(1, Ordering::Release);
-                            }
-                        }
-                        completion.as_ref().store(0, Ordering::Release);
-                        KeSetEvent(wake_event.as_ptr(), IO_NO_INCREMENT, 0);
                     }
                 }
                 InFlightKind::AsyncVenus {
                     fence_id,
                     ring_idx,
                     native_completion: _,
-                    scanout_notify,
-                    present_stream,
-                    windowed_blt,
                 } => {
                     ASYNC_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
                     if ring_idx != 0 {
                         RING_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
                     }
-                    let response_ok = written_length as usize == size_of::<VirtioGpuCtrlHdr>()
-                        && resp_type == Some(VIRTIO_GPU_RESP_OK_NODATA);
+                    let response_ok = written_length as usize
+                        == size_of::<VirtioGpuCtrlHdr>()
+                        && response_type == Some(VIRTIO_GPU_RESP_OK_NODATA);
                     if !response_ok {
                         ASYNC_RESP_ERRORS.fetch_add(1, Ordering::Relaxed);
-                    }
-                    // Only a successful host response retires this stream
-                    // value.  A rejected tagged submit invalidates the stream
-                    // instead; the next ordered WDDM pass explicitly discharges
-                    // its waits onto their ordinary wire watermark.  Treating a
-                    // rejection as retirement would make `DMA_COMPLETED` claim
-                    // that the producer ran when the host said it did not.
-                    if let Some(retire) = present_stream {
-                        if response_ok {
-                            self.retire_present_stream_value(retire);
-                        } else {
-                            self.fail_present_stream_value(retire);
-                        }
-                        // An admitted WindowedBlt may have been waiting only
-                        // for this exact producer edge. Signal its PASSIVE
-                        // worker; readiness remains checked again under lock.
-                        self.wake_ready_windowed_blt();
-                    }
-                    if let Some(retire) = windowed_blt {
-                        // SAFETY: every token stores the stable adapter that
-                        // constructed it; StopDevice drains/cancels inflight
-                        // entries before destroying that adapter.
-                        self.complete_windowed_blt_ring(
-                            unsafe { retire.adapter.as_ref() },
-                            retire.token,
-                            retire.stream_boundary,
-                            response_ok,
-                        );
-                    }
-                    // ring_idx=1 is the GPU-completion domain. Queue the host
-                    // display refresh only after the copy has really completed;
-                    // a decode-level or failed submit must never publish pixels.
-                    // A notify can now only exist on this ring
-                    // (`enqueue_scanout_submit`), so the test is a belt-and-braces
-                    // check rather than the sole guard it used to be.
-                    if ring_idx == SCANOUT_RING_IDX as u8 {
-                        if let Some(notify) = scanout_notify {
-                            // SAFETY: both pointers name stable AdapterContext
-                            // fields; the adapter owns this transport and outlives
-                            // every in-flight entry.
-                            unsafe {
-                                if response_ok {
-                                    notify
-                                        .displayed_primary
-                                        .as_ref()
-                                        .store(notify.primary_address, Ordering::Release);
-                                    notify.pending.as_ref().store(1, Ordering::Release);
-                                }
-                                // Ticketed clear, unconditional on response_ok
-                                // exactly as before: a failed copy must still
-                                // release OUR interval or VSync stops. What it
-                                // must NOT do is release a NEWER interval that a
-                                // second SetVidPnSourceAddress raised while this
-                                // copy was outstanding — that is the stale clear
-                                // this ticket exists to reject.
-                                crate::adapter::clear_programming_gate(
-                                    notify.programming.as_ref(),
-                                    notify.ticket,
-                                );
-                                KeSetEvent(notify.event.as_ptr(), IO_NO_INCREMENT, 0);
-                            }
-                        }
                     }
                     self.retire_wire_fence_notifications(fence_id);
                     if let Some(completion) = native_completion {
                         if self.native_terminals.len() < MAX_INFLIGHT
                             && self.native_terminals.len() < self.native_terminals.capacity()
                         {
-                            self.native_terminals
-                                .push(completion.terminal(response_ok));
-                            // This response may have been consumed by a
-                            // PASSIVE opportunistic drain. Queue the ordinary
-                            // DPC so K9 is serviced outside `virtio_lock`.
+                            self.native_terminals.push(completion.terminal(response_ok));
                             crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
                         } else {
-                            // The native enqueue gate proves this unreachable.
-                            // Never destroy custody or its heap storage under
-                            // the transport spinlock if the invariant is lost.
                             PARKED_LEAKS.fetch_add(1, Ordering::Relaxed);
                             core::mem::forget(completion);
                         }
                     }
                 }
             }
-            // The fast bind's buffer is RETAINED, not parked: it is one of the
-            // preallocated pool buffers, the device is done with it (`pop_used`
-            // returned), and nothing is freed here — which is the only reason
-            // parking exists (`DmaBuffer::drop` is PASSIVE-only). Returning it
-            // to the pool is also what re-arms the accelerator, and doing it
-            // HERE rather than at a PASSIVE reap is the point of the pool: the
-            // return is what a flip arm finds, so it must happen as early as the
-            // completion does. `venus.is_none()` is belt-and-braces — this kind
-            // is created with `venus: None`.
-            if matches!(entry.kind, InFlightKind::AsyncScanoutBind { .. }) && entry.venus.is_none()
-            {
-                if self.bind_cmd_pool.len() < BIND_CMD_POOL {
-                    let (meta, _none) = entry.into_dma_buffers();
-                    // Inside the reserved capacity by the test above, so no
-                    // reallocation under the spinlock.
-                    self.bind_cmd_pool.push(meta);
-                    continue;
-                }
-                // IMPOSSIBLE: at most BIND_CMD_POOL binds can be outstanding,
-                // and each one holds the buffer it popped, so a completing bind
-                // always has room to return to. Reaching this means the pool
-                // accounting has broken (a buffer returned twice, or one that
-                // never came from here). Park the entry like any other — never
-                // free at DISPATCH — and count it: `FpErr` rising while
-                // `FpBind`/`FpApply` look healthy and the host reports no errors
-                // is the signature.
-                crate::ddi::scanout_trace::note_fast_bind_error();
-            }
-            // Park the entry for a PASSIVE reap (DmaBuffer frees are
-            // PASSIVE-only).
+
             if self.parked.len() < MAX_PARKED {
                 self.parked.push(entry);
                 bump_high_water(&PARKED_HIGH_WATER, self.parked.len());
             } else {
-                // Unreachable given PARKED_ENQUEUE_GATE; never reallocate or
-                // free under the spinlock — leak loudly instead.
                 PARKED_LEAKS.fetch_add(1, Ordering::Relaxed);
                 core::mem::forget(entry);
             }
         }
     }
-
     /// Number of completed entries awaiting a PASSIVE reap.
     ///
     /// Unused today: `PARKED_LEAKS` is surfaced through the escape's
@@ -6507,13 +3164,11 @@ impl VirtioGpu {
             FENCE_ID_FOREIGN_GENERATION.fetch_add(1, Ordering::Relaxed);
             return FenceWaitPrep::Invalid;
         }
-        let in_flight = self.inflight.iter().any(|e| match e.kind {
-            InFlightKind::AsyncVenus { fence_id: f, .. } => f == fence_id,
-            InFlightKind::Sync {
-                scanout_bind: Some(bind),
-                ..
-            } => bind.fence_id == fence_id,
-            _ => false,
+        let in_flight = self.inflight.iter().any(|entry| {
+            matches!(
+                entry.kind,
+                InFlightKind::AsyncVenus { fence_id: assigned, .. } if assigned == fence_id
+            )
         });
         if !in_flight {
             // SAFETY: `block` is the initialized, frame-borrowed waiter supplied
@@ -6544,637 +3199,7 @@ impl VirtioGpu {
         }
     }
 
-    // ── Fence-event table (REGISTER_FENCE_EVENT, KMD 22.22.54) ──────────────
-
-    /// Park `event` for one-shot signaling when wire fence `fence_id` retires.
-    /// Runs under the device spinlock — the completion check and the insert
-    /// are atomic against [`Self::drain_used`], so a wakeup can never be lost
-    /// (same predicate as [`Self::fence_wait_prepare`]: assigned ids live in
-    /// `inflight` until their used-ring completion).
-    ///
-    /// Ownership: on `Registered` the TABLE owns the caller's object
-    /// reference (released by the drain / unregister / teardown). On every
-    /// other outcome the caller still owns it and must deref.
-    pub fn fence_event_register(&mut self, fence_id: u64, event: NonNull<KEVENT>) -> FenceEventReg {
-        // As in fence_wait_prepare. `Invalid` leaves the object reference with
-        // the caller, per the ownership contract documented on this function —
-        // including the foreign-generation arm below, which is why it returns
-        // `Invalid` rather than `AlreadyComplete`: the caller must still deref.
-        if self.failed || fence_id == 0 || fence_id >= self.next_wire_fence {
-            return FenceEventReg::Invalid;
-        }
-        if fence_id < self.wire_fence_base {
-            FENCE_ID_FOREIGN_GENERATION.fetch_add(1, Ordering::Relaxed);
-            return FenceEventReg::Invalid;
-        }
-        let in_flight = self.inflight.iter().any(|e| match e.kind {
-            InFlightKind::AsyncVenus { fence_id: f, .. } => f == fence_id,
-            InFlightKind::Sync {
-                scanout_bind: Some(bind),
-                ..
-            } => bind.fence_id == fence_id,
-            _ => false,
-        });
-        if !in_flight {
-            FENCE_EVENT_ALREADY_COMPLETE.fetch_add(1, Ordering::Relaxed);
-            return FenceEventReg::AlreadyComplete;
-        }
-        if self
-            .fence_events
-            .iter()
-            .any(|e| e.fence_id == fence_id && e.event == event)
-        {
-            FENCE_EVENT_DUP_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return FenceEventReg::Duplicate;
-        }
-        if self.fence_events.len() >= MAX_FENCE_EVENTS {
-            FENCE_EVENT_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
-            return FenceEventReg::TableFull;
-        }
-        self.fence_events.push(FenceEventEntry { fence_id, event });
-        bump_high_water(&FENCE_EVENT_HIGH_WATER, self.fence_events.len());
-        FENCE_EVENT_REGISTERS.fetch_add(1, Ordering::Relaxed);
-        FenceEventReg::Registered
-    }
-
-    /// Remove a parked (fence_id, event) registration. Returns `true` if it
-    /// was found and removed — the TABLE's object reference transfers back to
-    /// the caller (who must deref it); `false` = no such entry (the drain
-    /// consumed it — the event was signaled — or it was never parked).
-    pub fn fence_event_unregister(&mut self, fence_id: u64, event: NonNull<KEVENT>) -> bool {
-        if let Some(i) = self
-            .fence_events
-            .iter()
-            .position(|e| e.fence_id == fence_id && e.event == event)
-        {
-            self.fence_events.swap_remove(i);
-            FENCE_EVENT_CANCELS.fetch_add(1, Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
-    }
-
-    /// Current fence-event table occupancy (QUERY_STATS v2).
-    pub fn fence_events_live(&self) -> u32 {
-        self.fence_events.len() as u32
-    }
-
-    // ── Registered async present streams ───────────────────────────────────
-
-    /// Reserve one bounded, owner-scoped stream for an ICD context.  The
-    /// process association is the exact opaque `hKmdProcess` handle dxgkrnl
-    /// supplied to both devices. It is compared byte-for-byte with the UMD
-    /// marker context's handle, never dereferenced and never inferred from a
-    /// PID or the current thread/process.
-    pub fn register_present_stream(
-        &mut self,
-        owner: DeviceOwner,
-        ctx_id: u32,
-        creator_process: usize,
-    ) -> Result<u64, VirtioError> {
-        if self.failed || ctx_id == 0 || creator_process == 0 {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return Err(VirtioError::DeviceError);
-        }
-        if self.resolve_owned_ctx(Some(owner), ctx_id).is_none() {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return Err(VirtioError::NotOwned);
-        }
-        // One stream per owned Venus context.  That is what makes a batched
-        // PresentSubmissionPrivate record compactly merge same-context marker
-        // values without inventing an ordering between two stream namespaces.
-        if self
-            .present_streams
-            .iter()
-            .any(|slot| slot.live && slot.owner == Some(owner) && slot.ctx_id == ctx_id)
-        {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return Err(VirtioError::DeviceError);
-        }
-        let Some((index, _)) = self
-            .present_streams
-            .iter()
-            .enumerate()
-            .find(|(_, slot)| !slot.live && slot.generation < PRESENT_STREAM_GENERATION_MAX)
-        else {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return Err(VirtioError::OutOfMemory);
-        };
-        let Some(next_cookie) = self.next_present_stream_cookie.checked_add(1) else {
-            // Do not wrap an opaque capability into an old registration's
-            // value. Exhaustion after 2^64 registrations is a loud failure.
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return Err(VirtioError::OutOfMemory);
-        };
-        let generation = self.present_streams[index].generation + 1;
-        let cookie = self.next_present_stream_cookie;
-        self.next_present_stream_cookie = next_cookie;
-        self.present_streams[index] = PresentStreamSlot {
-            live: true,
-            owner: Some(owner),
-            ctx_id,
-            ring_idx: 0,
-            generation,
-            cookie,
-            creator_process,
-            submitted_value: 0,
-            retired_value: 0,
-        };
-        let live = PRESENT_STREAM_LIVE.fetch_add(1, Ordering::Relaxed) as usize + 1;
-        bump_high_water(&PRESENT_STREAM_HIGH_WATER, live);
-        PRESENT_STREAM_REGISTERS.fetch_add(1, Ordering::Relaxed);
-        Ok(cookie)
-    }
-
-    /// Remove exactly one stream capability.  Wrong owner/context/cookie is a
-    /// refusal, not an idempotent wildcard unregister.
-    pub fn unregister_present_stream(
-        &mut self,
-        order: &crate::adapter::NotifyOrdered<'_>,
-        owner: DeviceOwner,
-        ctx_id: u32,
-        cookie: u64,
-    ) -> bool {
-        let found = self.present_streams.iter().position(|slot| {
-            slot.live && slot.owner == Some(owner) && slot.ctx_id == ctx_id && slot.cookie == cookie
-        });
-        let Some(index) = found else {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return false;
-        };
-        self.retire_present_stream_slot(index);
-        let _ = self.discharge_dead_present_stream_waits(order);
-        self.cancel_dead_undispatched_windowed_blt();
-        true
-    }
-
-    /// Purge all streams whose owning ICD device is gone.  Used before that
-    /// DeviceContext releases the object reference the rows borrow.
-    pub fn purge_present_streams_for_owner(
-        &mut self,
-        order: &crate::adapter::NotifyOrdered<'_>,
-        owner: Option<DeviceOwner>,
-    ) -> u32 {
-        let mut count = 0;
-        for index in 0..self.present_streams.len() {
-            if self.present_streams[index].live && self.present_streams[index].owner == owner {
-                self.retire_present_stream_slot(index);
-                count += 1;
-            }
-        }
-        let _ = self.discharge_dead_present_stream_waits(order);
-        self.cancel_dead_undispatched_windowed_blt();
-        count
-    }
-
-    /// Context destruction is an exact lifecycle boundary: every stream on the
-    /// destroyed owned context is invalid before the host CTX_DESTROY roundtrip.
-    pub fn purge_present_streams_for_context(
-        &mut self,
-        order: &crate::adapter::NotifyOrdered<'_>,
-        owner: Option<DeviceOwner>,
-        ctx_id: u32,
-    ) -> u32 {
-        let mut count = 0;
-        for index in 0..self.present_streams.len() {
-            let slot = self.present_streams[index];
-            if slot.live && slot.owner == owner && slot.ctx_id == ctx_id {
-                self.retire_present_stream_slot(index);
-                count += 1;
-            }
-        }
-        let _ = self.discharge_dead_present_stream_waits(order);
-        self.cancel_dead_undispatched_windowed_blt();
-        count
-    }
-
-    /// Purge all registrations for this transport generation (failure/reset).
-    pub fn purge_all_present_streams(&mut self) {
-        for index in 0..self.present_streams.len() {
-            if self.present_streams[index].live {
-                self.retire_present_stream_slot(index);
-            }
-        }
-        self.scanout_refresh.clear();
-        // A retained fast bind carrying a tagged boundary may no longer be
-        // promoted once every stream generation has been invalidated.
-        for deferred in [
-            &mut self.fast_bind.deferred_earliest,
-            &mut self.fast_bind.deferred_latest,
-        ] {
-            if deferred.is_some_and(|request| {
-                decode_present_stream_boundary(request.carried_watermark).is_some()
-            }) {
-                *deferred = None;
-            }
-        }
-    }
-
-    /// Reset under scheduler ordering: first invalidate every registration,
-    /// then explicitly discharge any WDDM/scanout wait that named it.  The
-    /// plain variant is reserved for terminal transport teardown, where the
-    /// WDDM FIFO has already been abandoned with the scheduler epoch.
-    pub fn purge_all_present_streams_ordered(&mut self, order: &crate::adapter::NotifyOrdered<'_>) {
-        self.purge_all_present_streams();
-        let _ = self.discharge_dead_present_stream_waits(order);
-        self.cancel_dead_undispatched_windowed_blt();
-    }
-
-    fn retire_present_stream_slot(&mut self, index: usize) {
-        let generation = self.present_streams[index].generation;
-        self.present_streams[index] = PresentStreamSlot {
-            generation,
-            ..PresentStreamSlot::EMPTY
-        };
-        let _ = PRESENT_STREAM_LIVE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |live| {
-            live.checked_sub(1)
-        });
-    }
-
-    fn present_stream_handle_live(&self, handle: u32) -> bool {
-        let Some(index) = Self::present_stream_index(handle) else {
-            return false;
-        };
-        let slot = self.present_streams[index];
-        slot.live && slot.handle(index) == handle
-    }
-
-    fn present_stream_boundary_live(&self, boundary: u64) -> bool {
-        Self::present_stream_boundary_live_in(&self.present_streams[..], boundary)
-    }
-
-    fn present_stream_boundary_live_in(
-        present_streams: &[PresentStreamSlot],
-        boundary: u64,
-    ) -> bool {
-        let Some((handle, _)) = decode_present_stream_boundary(boundary) else {
-            return false;
-        };
-        let Some(index) = Self::present_stream_index(handle) else {
-            return false;
-        };
-        let slot = present_streams[index];
-        slot.live && slot.handle(index) == handle
-    }
-
-    /// Explicitly remove scheduler/scanout waits whose registration was
-    /// retired.  This requires the WDDM notification ordering proof because it
-    /// mutates the pending `DMA_COMPLETED` FIFO; it never treats a dead stream
-    /// as retired.
-    ///
-    /// ⚠ CORRECTED 2026-08-06. This used to claim *"a discharged WDDM entry still
-    /// waits for its ordinary wire watermark, which covers the transport work
-    /// submitted before that WDDM buffer"*. That is FALSE whenever `PresentWmk` is
-    /// on — which is the shipping default — because the exact-present-watermark arm
-    /// in [`Self::note_wddm_submission`] sets `watermark = 0` for precisely the
-    /// entries that carry a live stream boundary. Discharging the stream on such an
-    /// entry therefore leaves it with NO dependency at all, and it completes on the
-    /// next look.
-    ///
-    /// That is defensible on this path — a dead stream is a context/device teardown,
-    /// i.e. an explicit cancellation rather than a producer that will complete — but
-    /// it is not what the comment said, and it is not what
-    /// [`Self::rebase_blocked_head`] does for a LIVE-but-unsatisfiable boundary
-    /// (that one installs the conservative wire prefix, because there the producer
-    /// may genuinely still be running). Left as-is deliberately: tightening a
-    /// teardown-path fence is an unmeasured behaviour change on the desktop path.
-    pub fn discharge_dead_present_stream_waits(
-        &mut self,
-        _order: &crate::adapter::NotifyOrdered<'_>,
-    ) -> u32 {
-        let mut discharged = 0u32;
-        for index in 0..self.wddm_pending.len() {
-            let Some(boundary) = self.wddm_pending[index].stream_boundary else {
-                continue;
-            };
-            if decode_present_stream_boundary(boundary).is_some()
-                && !Self::present_stream_boundary_live_in(&self.present_streams[..], boundary)
-            {
-                let blt = self.wddm_pending[index]
-                    .blt_token
-                    .zip(self.wddm_pending[index].blt_stream_boundary);
-                if let Some((token, blt_boundary)) = blt {
-                    let max_dispatched = self
-                        .windowed_blt
-                        .pending
-                        .iter()
-                        .find(|request| {
-                            request.token == token && request.stream_boundary == blt_boundary
-                        })
-                        .is_some_and(|request| request.dispatched);
-                    if !max_dispatched {
-                        if let Some(prefix) = WindowedBltTerminalPrefix::new(token, blt_boundary) {
-                            // This WDDM entry owned the whole merged prefix.
-                            // An earlier member may already be in-flight even
-                            // though the max member is not, so abandon also
-                            // detaches those dispatched readers from the now
-                            // unreachable terminal membership.
-                            self.abandon_windowed_blt_wddm_prefix(prefix);
-                        }
-                        self.wddm_pending[index].blt_token = None;
-                        self.wddm_pending[index].blt_stream_boundary = None;
-                    }
-                }
-                // The ordinary producer stream is cancelled, never treated as
-                // complete. A dispatched BLT retains its separate exact
-                // token/stream key above until its ring response terminalizes.
-                self.wddm_pending[index].stream_boundary = None;
-                discharged += 1;
-            }
-        }
-        let streams = &self.present_streams[..];
-        self.scanout_refresh
-            .discard_dead_present_stream_markers(|boundary| {
-                Self::present_stream_boundary_live_in(streams, boundary)
-            });
-        let _ = self.discard_invalid_fast_bind_frontier();
-        discharged
-    }
-
-    /// A carried marker can outlive context/device teardown in the per-flip
-    /// private packet.  Rebase that *explicitly cancelled* marker onto the
-    /// ordinary current-wire boundary; do not make the dead marker read as a
-    /// completed producer.
-    pub fn rebase_dead_present_stream_boundary(&self, boundary: u64) -> Option<u64> {
-        decode_present_stream_boundary(boundary)
-            .filter(|_| !self.present_stream_boundary_live(boundary))
-            .map(|_| self.wire_fence_watermark())
-    }
-
-    fn present_stream_index(handle: u32) -> Option<usize> {
-        helios_kmd_logic::present_stream::handle_index(handle)
-    }
-
-    /// Turn one complete marker tail into an opaque, generation-qualified
-    /// boundary. The UMD device must carry the exact same opaque
-    /// `hKmdProcess` association as the ICD device that registered the stream.
-    pub fn present_stream_marker_boundary(
-        &self,
-        ctx_id: u32,
-        value: u32,
-        cookie: u64,
-        creator_process: usize,
-    ) -> Option<u64> {
-        if ctx_id == 0 || value == 0 || cookie == 0 || creator_process == 0 {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        let found = self.present_streams.iter().enumerate().find(|(_, slot)| {
-            slot.live
-                && slot.ctx_id == ctx_id
-                && slot.cookie == cookie
-                && slot.creator_process == creator_process
-        });
-        let Some((index, slot)) = found else {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return None;
-        };
-        // INSTRUMENT ONLY — nothing below refuses, and the boundary returned is
-        // byte-identical to the one this function returned before these two
-        // counters existed (K-F2, 2026-08-06).
-        //
-        // WHY THE DIRECTION HERE IS INVERTED FROM THE TAG PATH'S. Both siblings
-        // bound their value against the same field — `prepare_present_stream_tag`
-        // (`:4770`) and `commit_present_stream_tag` (`:4790`) reject
-        // `value <= slot.submitted_value` — because they are the PRODUCER
-        // advancing the stream, and an advance that is not strictly ahead is
-        // either a replay or a forgery. This is the CONSUMER side, and copying
-        // that comparison inverted would refuse every legitimate frame: the UMD
-        // hands the marker over BEFORE the frame's `vkQueueSubmit` on purpose
-        // (`umd/src/forward/present.rs:1479-1528` skips its own submitted-gate
-        // exactly because this marker carries the dependency instead), while the
-        // tag that moves `submitted_value` rides DXVK's submission thread. So
-        // "ahead" is the normal state, not a defect, and a refusal here would
-        // fall back to `wire_fence_watermark()` — which does not cover an
-        // unsubmitted frame at all (ROADMAP defect 0ab-B).
-        //
-        // What IS still unguarded is MAGNITUDE: a guest naming a value tens of
-        // thousands of frames out gets a live boundary `present_stream_slot_ready`
-        // can never satisfy. These two counters measure the legitimate
-        // magnitude so a bound can be chosen from data rather than assumption;
-        // grading and the reading that would refute all of this are in
-        // `virtio/counters.rs` beside the statics.
-        let lookahead =
-            helios_kmd_logic::present_stream::marker_lookahead(value, slot.submitted_value);
-        if lookahead != 0 {
-            PRESENT_STREAM_MARKER_AHEAD.fetch_add(1, Ordering::Relaxed);
-            bump_high_water(&PRESENT_STREAM_MARKER_AHEAD_HIGH_WATER, lookahead as usize);
-        }
-        PRESENT_STREAM_MARKERS.fetch_add(1, Ordering::Relaxed);
-        Some(encode_present_stream_boundary(slot.handle(index), value))
-    }
-
-    fn prepare_present_stream_tag(
-        &self,
-        owner: DeviceOwner,
-        ctx_id: u32,
-        ring_idx: u32,
-        cookie: u64,
-        value: u32,
-    ) -> Result<PresentStreamRetire, VirtioError> {
-        if self.failed
-            || ctx_id == 0
-            || cookie == 0
-            || value == 0
-            || ring_idx == 0
-            || ring_idx > u8::MAX as u32
-        {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return Err(VirtioError::DeviceError);
-        }
-        let Some((index, slot)) = self.present_streams.iter().enumerate().find(|(_, slot)| {
-            slot.live && slot.owner == Some(owner) && slot.ctx_id == ctx_id && slot.cookie == cookie
-        }) else {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return Err(VirtioError::NotOwned);
-        };
-        if (slot.ring_idx != 0 && slot.ring_idx != ring_idx as u8) || value <= slot.submitted_value
-        {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return Err(VirtioError::DeviceError);
-        }
-        Ok(PresentStreamRetire {
-            handle: slot.handle(index),
-            value,
-        })
-    }
-
-    fn commit_present_stream_tag(&mut self, retire: PresentStreamRetire, ring_idx: u32) {
-        let Some(index) = Self::present_stream_index(retire.handle) else {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return;
-        };
-        let slot = &mut self.present_streams[index];
-        if !slot.live
-            || slot.handle(index) != retire.handle
-            || (slot.ring_idx != 0 && slot.ring_idx != ring_idx as u8)
-            || retire.value <= slot.submitted_value
-        {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        slot.ring_idx = ring_idx as u8;
-        slot.submitted_value = retire.value;
-        PRESENT_STREAM_TAGS.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn retire_present_stream_value(&mut self, retire: PresentStreamRetire) {
-        let Some(index) = Self::present_stream_index(retire.handle) else {
-            return;
-        };
-        let slot = &mut self.present_streams[index];
-        let advanced = advance_present_stream_retired(slot.retired_value, retire.value);
-        if slot.live && slot.handle(index) == retire.handle && advanced != slot.retired_value {
-            slot.retired_value = advanced;
-            PRESENT_STREAM_RETIRES.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    /// A host-rejected tagged submit poisons this exact generation.  The
-    /// scheduler/scanout waits are discharged separately under
-    /// `wddm_notify_lock`; this helper only removes the capability while the
-    /// used-ring drain holds `virtio_lock`.
-    fn fail_present_stream_value(&mut self, retire: PresentStreamRetire) {
-        let Some(index) = Self::present_stream_index(retire.handle) else {
-            return;
-        };
-        if self.present_streams[index].live
-            && self.present_streams[index].handle(index) == retire.handle
-        {
-            self.retire_present_stream_slot(index);
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     // ── WDDM pending-fence FIFO (SubmitCommand → DPC completion) ─────────────
-
-    /// Capture the exact Venus ordering boundary for a scanout dirty marker.
-    ///
-    /// The `NotifyOrdered` token is mintable only inside
-    /// `WddmNotifyGuard::with_virtio`, so reaching this method proves that THIS
-    /// adapter's `wddm_notify` lock was taken before its `virtio` lock and is
-    /// still held.
-    ///
-    /// `resource_id` is the allocation this dirty edge BELONGS TO — the exact
-    /// venus resource the present named — or 0 when the marker carries no
-    /// identity (the generic HERF refresh, whose meaning is "whatever is
-    /// currently bound").
-    ///
-    /// Carrying it is the fix for a real ordering defect. The watermark alone
-    /// says WHEN it is safe to flush; it never said WHAT to flush, so
-    /// `queue_active_scanout_refresh_locked` read `active_scanout_resource` at
-    /// flush time instead. Those are different frames: the bind is deferred
-    /// (`SetVidPnSourceAddress` stashes `pending_vidpn_allocation` at DIRQL for
-    /// a PASSIVE worker, which coalesces), so a refresh armed for frame N could
-    /// fire against the previous buffer — a stale frame — or against a buffer
-    /// the flip had already advanced to but the app had not yet rendered, which
-    /// is a BLACK frame. Host tracing showed both shapes directly: binds whose
-    /// content was never flushed, and repeated flushes of one bind.
-    ///
-    /// The old producer-side CPU gate hid this by removing all overlap: with
-    /// the app blocked until its own GPU work completed, bind and flush landed
-    /// in the same quiescent window and the bound buffer was always fully
-    /// rendered. That is why restoring CPU/GPU overlap exposed it.
-    /// The wire-fence boundary as it stands right now: every Venus command
-    /// submitted so far carries a fence BELOW this value.
-    ///
-    /// Read by a caller that knows WHICH FRAME it is arming for, so the
-    /// boundary can be captured when that frame is PRESENTED and carried to the
-    /// bind edge — see [`Self::note_scanout_refresh_at`].
-    pub fn wire_fence_watermark(&self) -> u64 {
-        self.next_wire_fence
-    }
-
-    /// Arm the marker against an EXPLICIT completion boundary instead of "now".
-    ///
-    /// WHY THIS EXISTS (ROADMAP defect 0ab-B, measured 2026-07-29). Sampling
-    /// `next_wire_fence` inside the bind edge names the wrong frame. The bind
-    /// runs in the PASSIVE display worker, ~10 ms after the flip was submitted,
-    /// and at 183 fps the app has pushed frame N+1 into the ring by then — so
-    /// the flush for frame N waited for N+1 to complete, one whole frame too
-    /// long. With two rotating buffers the app has had buffer N handed back and
-    /// CLEARED it for N+2 by the time QEMU reads it: an entirely black frame,
-    /// re-cleared rather than half-drawn.
-    ///
-    /// The QEMU-side per-flush oracle measured exactly that split over one GT1
-    /// run (`tools/scanout_oracle_report.py`): flushes landing 1–3 ms after
-    /// their bind were 1.0 % black, those landing 9–12 ms after were 41.1 %,
-    /// and 611 of 619 black frames landed within 0.5 ms of the NEXT bind.
-    ///
-    /// A watermark captured when the frame was submitted is that frame's own
-    /// completion boundary, and nothing later. Still an ordering, never a
-    /// stall.
-    pub fn note_scanout_refresh_at(
-        &mut self,
-        _order: &crate::adapter::NotifyOrdered<'_>,
-        resource_id: u32,
-        watermark: u64,
-    ) -> bool {
-        // A newer exact marker whose producer is already retired is a complete
-        // replacement for an older wait. Waking it now avoids stranding it on
-        // an idle used-ring; the executor still refuses an unaccepted or stale
-        // binding before it can issue a host read.
-        let ready = self.scanout_boundary_ready(watermark);
-        self.scanout_refresh
-            .note(ScanoutRefreshMarker::new(resource_id, watermark), ready)
-    }
-
-    /// Consume a completion-ordered scanout marker after the used-ring drain.
-    /// Must be called under the same statically witnessed notification lock as
-    /// [`Self::note_scanout_refresh`].
-    ///
-    /// Returns the full armed marker on success, preserving the exact producer
-    /// boundary through promotion and into the diagnostic timeline.
-    pub fn take_ready_scanout_refresh(
-        &mut self,
-        _order: &crate::adapter::NotifyOrdered<'_>,
-    ) -> Option<ScanoutRefreshMarker> {
-        let earliest = self.scanout_refresh.earliest()?;
-        let earliest_ready = self.scanout_boundary_ready(earliest.boundary());
-        let latest_ready = self
-            .scanout_refresh
-            .latest()
-            .is_some_and(|marker| self.scanout_boundary_ready(marker.boundary()));
-        let marker = self
-            .scanout_refresh
-            .take_ready(earliest_ready, latest_ready)?;
-        Some(marker)
-    }
-
-    /// How many async Venus fences below `watermark` are still outstanding, and
-    /// the ring of the lowest one (0 = host DECODE, >= 1 = host GPU).
-    ///
-    /// Diagnostic for defect 0ab-B: it says WHAT a deferred bind-edge arm is
-    /// waiting for. One or two GPU-ring fences means the app's own next frames;
-    /// a large count, or a decode-ring fence, means the boundary is blocked by
-    /// something that has nothing to do with this frame.
-    pub fn outstanding_below(&self, watermark: u64) -> (u32, u8) {
-        if let Some((handle, _)) = decode_present_stream_boundary(watermark) {
-            let ring = Self::present_stream_index(handle)
-                .map(|index| self.present_streams[index].ring_idx)
-                .unwrap_or(0);
-            return (u32::from(!self.scanout_boundary_ready(watermark)), ring);
-        }
-        let mut count = 0u32;
-        let mut lowest = u64::MAX;
-        let mut lowest_ring = 0u8;
-        for e in self.inflight.iter() {
-            if let InFlightKind::AsyncVenus {
-                fence_id, ring_idx, ..
-            } = e.kind
-            {
-                if fence_id < watermark {
-                    count += 1;
-                    if fence_id < lowest {
-                        lowest = fence_id;
-                        lowest_ring = ring_idx;
-                    }
-                }
-            }
-        }
-        (count, lowest_ring)
-    }
 
     /// Whether every async wire fence `< watermark` in `domain` has retired.
     fn async_retired_up_to(&self, watermark: u64, domain: RetireDomain) -> bool {
@@ -7205,7 +3230,7 @@ impl VirtioGpu {
     /// completion proof here, not an unknown.
     ///
     /// ⚠ NO `RetireDomain` FILTER, deliberately. A domain filter over a SINGLE
-    /// named fence could only ever fake readiness — "ring 1, so ignore it" — never
+    /// a ring filter could only ever fake readiness — "ring 1, so ignore it" — never
     /// add safety, and the exact arm is constructed exclusively with
     /// `IncludingGpu` anyway (`gpu_completion_fence.is_some()` forces that domain
     /// one screen above the watermark selection). Taking the domain as a parameter
@@ -7236,625 +3261,28 @@ impl VirtioGpu {
         }
     }
 
-    /// Readiness for the two intentionally incomparable boundary namespaces.
-    /// A tagged stream boundary is never fed to the wire-fence `< watermark`
-    /// scan: it is ready only when the same generation-qualified stream has
-    /// retired at least the marker value.  A vanished stream is *not* ready;
-    /// lifecycle code must explicitly discharge the associated WDDM/scanout
-    /// wait under the notification lock before its fence can progress.
-    fn scanout_boundary_ready(&self, boundary: u64) -> bool {
-        let Some((handle, value)) = decode_present_stream_boundary(boundary) else {
-            return self.async_retired_up_to(boundary, RetireDomain::IncludingGpu);
-        };
-        let Some(index) = Self::present_stream_index(handle) else {
-            return false;
-        };
-        present_stream_slot_ready(self.present_streams[index], index, handle, value)
-    }
-
-    /// Liveness companion to [`Self::scanout_boundary_ready`] for a bind that
-    /// has not yet reached the control FIFO. Ordinary wire watermarks are live
-    /// for this transport generation; tagged boundaries require the exact live
-    /// stream generation and are discarded on teardown rather than treated as
-    /// producer completion.
-    fn scanout_bind_boundary_live(&self, boundary: u64) -> bool {
-        decode_present_stream_boundary(boundary)
-            .map_or(true, |_| self.present_stream_boundary_live(boundary))
-    }
-
-    /// Reserve one exact WindowedBlt reader before Present returns. Caller
-    /// holds the scanout lifecycle lock and has already prepared the immutable
-    /// Venus cache record under the Venus mutex; this final mutation happens
-    /// under virtio only and never submits host work.
-    pub fn queue_windowed_blt(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-        source: OptimalPresentImageDesc,
-        destination: PresentDestinationDesc,
-        prepared: PreparedPresentBltSubmission,
-        stream_boundary: u64,
-        system_backing: bool,
-    ) -> Result<u64, VirtioError> {
-        if self.failed
-            || !self.present_stream_boundary_live(stream_boundary)
-            || source.resource_id() == 0
-            || source.resource_id() == destination.resource_id()
-        {
-            return Err(VirtioError::DeviceError);
-        }
-        let Some(token) = self.windowed_blt.issue_token() else {
-            return Err(VirtioError::OutOfMemory);
-        };
-        // Unlike legacy D4a, an unledgered WindowedBlt would let DXVK reuse a
-        // snapshot without an exact reader lifetime. Refuse loudly instead.
-        let ledger_ticket = adapter.read_ledger.issue(source.resource_id());
-        if !ledger_ticket.is_claimed() {
-            return Err(VirtioError::OutOfMemory);
-        }
-        self.windowed_blt.pending.push_back(WindowedBltPending {
-            adapter: NonNull::from(adapter),
-            token,
-            stream_boundary,
-            source_resource_id: source.resource_id(),
-            destination_resource_id: destination.resource_id(),
-            source,
-            destination,
-            prepared,
-            ledger_ticket,
-            admitted: false,
-            dispatched: false,
-            ring_complete: false,
-            ledger_retired: false,
-            wddm_completion_required: true,
-            system_backing,
-            mirror_claimed: false,
-        });
-        crate::ddi::scanout_timeline::note(
-            crate::ddi::scanout_timeline::kind::WINDOWED_BLT_ARM,
-            crate::ddi::scanout_timeline::flag::SNAPSHOT,
-            0,
-            stream_boundary,
-            token,
-            source.resource_id(),
-            destination.resource_id(),
-        );
-        Ok(token)
-    }
-
-    /// Promote only requests represented by the same SubmitCommand private
-    /// record. Cross-stream token comparison is prohibited: the boundary's
-    /// generation-qualified handle is the identity; a numeric token alone is
-    /// never a scheduler admission proof.
-    fn admit_windowed_blt_prefix(&mut self, stream_boundary: u64, max_token: u64) {
-        if max_token == 0 || !self.present_stream_boundary_live(stream_boundary) {
-            return;
-        }
-        let Some((handle, _)) = decode_present_stream_boundary(stream_boundary) else {
-            return;
-        };
-        for request in self.windowed_blt.pending.iter_mut() {
-            let same_stream = decode_present_stream_boundary(request.stream_boundary)
-                .is_some_and(|(candidate, _)| candidate == handle);
-            if same_stream && !request.admitted && request.token <= max_token {
-                request.admitted = true;
-                // Capacity is coupled to pending and reserved at init.
-                self.windowed_blt.ready.push_back(request.token);
-                crate::ddi::scanout_timeline::note(
-                    crate::ddi::scanout_timeline::kind::WINDOWED_BLT_ADMIT,
-                    crate::ddi::scanout_timeline::flag::READY,
-                    0,
-                    request.stream_boundary,
-                    request.token,
-                    request.source_resource_id,
-                    request.destination_resource_id,
-                );
-            }
-        }
-    }
-
-    /// Worker-side selection. Both scheduler admission and the exact producer
-    /// boundary are mandatory; a retired producer without residency admission
-    /// remains inert in `pending`.
-    pub fn take_ready_windowed_blt(&mut self) -> Option<WindowedBltPending> {
-        let token = *self.windowed_blt.ready.front()?;
-        let index = self
-            .windowed_blt
-            .pending
-            .iter()
-            .position(|request| request.token == token)?;
-        let boundary = self.windowed_blt.pending[index].stream_boundary;
-        if !self.windowed_blt.pending[index].admitted
-            || self.windowed_blt.pending[index].dispatched
-            || !self.scanout_boundary_ready(boundary)
-        {
-            return None;
-        }
-        self.windowed_blt.pending[index].dispatched = true;
-        self.windowed_blt.ready.pop_front();
-        Some(self.windowed_blt.pending[index])
-    }
-
-    fn wake_ready_windowed_blt(&self) {
-        let ready = self.windowed_blt.pending.iter().find(|request| {
-            request.admitted
-                && !request.dispatched
-                && self.scanout_boundary_ready(request.stream_boundary)
-        });
-        if let Some(request) = ready {
-            // SAFETY: pending requests hold the adapter that owns this live
-            // transport; teardown cancels the FIFO before freeing it.
-            unsafe { request.adapter.as_ref() }.signal_hpd();
-        }
-    }
-
-    fn terminal_windowed_blt(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-        token: u64,
-        stream_boundary: u64,
-        ok: bool,
-    ) {
-        let Some(index) = self.windowed_blt.pending.iter().position(|request| {
-            request.token == token && request.stream_boundary == stream_boundary
-        }) else {
-            return;
-        };
-        let Some(request) = self.windowed_blt.pending.remove(index) else {
-            return;
-        };
-        if !request.ledger_retired {
-            adapter
-                .read_ledger
-                .retire(request.ledger_ticket, !ok);
-        }
-        crate::ddi::scanout_timeline::note(
-            crate::ddi::scanout_timeline::kind::WINDOWED_BLT_TERMINAL,
-            if ok {
-                crate::ddi::scanout_timeline::flag::SUCCESS
-            } else {
-                0
-            },
-            0,
-            stream_boundary,
-            token,
-            request.source_resource_id,
-            request.destination_resource_id,
-        );
-        if request.wddm_completion_required {
-            debug_assert!(self.windowed_blt.terminal.len() < MAX_WINDOWED_BLT_PENDING);
-            self.windowed_blt
-                .terminal
-                .push_back((token, stream_boundary));
-        }
-        adapter.scanout_retire_wanted.store(1, Ordering::Release);
-        adapter.signal_hpd();
-    }
-
-    /// Completion of the ring-1 copy. The reader lease ends exactly here. A
-    /// system-backed destination remains non-terminal until the PASSIVE mirror
-    /// finishes, while an ordinary destination terminalizes immediately.
-    pub fn complete_windowed_blt_ring(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-        token: u64,
-        stream_boundary: u64,
-        ok: bool,
-    ) {
-        let Some(request) =
-            self.windowed_blt.pending.iter_mut().find(|request| {
-                request.token == token && request.stream_boundary == stream_boundary
-            })
-        else {
-            return;
-        };
-        request.ring_complete = true;
-        if !request.ledger_retired {
-            adapter
-                .read_ledger
-                .retire(request.ledger_ticket, !ok);
-            request.ledger_retired = true;
-        }
-        crate::ddi::scanout_timeline::note(
-            crate::ddi::scanout_timeline::kind::WINDOWED_BLT_RING_COMPLETE,
-            if ok {
-                crate::ddi::scanout_timeline::flag::SUCCESS
-            } else {
-                0
-            },
-            0,
-            stream_boundary,
-            token,
-            request.source_resource_id,
-            request.destination_resource_id,
-        );
-        if !ok || !request.system_backing {
-            self.terminal_windowed_blt(adapter, token, stream_boundary, ok);
-        } else {
-            // The worker owns the preallocated mirror continuation.
-            adapter.signal_hpd();
-        }
-    }
-
-    /// PASSIVE mirror completion; `None` means Windows repaged back to BAR and
-    /// therefore the Venus destination is authoritative again.
-    pub fn complete_windowed_blt_mirror(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-        token: u64,
-        stream_boundary: u64,
-        ok: bool,
-    ) {
-        self.terminal_windowed_blt(adapter, token, stream_boundary, ok);
-    }
-
-    /// Present-private write failed after reservation. No scheduler submission
-    /// can carry this request, so retire its exact reader and remove it without
-    /// manufacturing a terminal WDDM token.
-    pub fn cancel_windowed_blt(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-        token: u64,
-        stream_boundary: u64,
-    ) {
-        let Some(index) = self.windowed_blt.pending.iter().position(|request| {
-            request.token == token && request.stream_boundary == stream_boundary
-        }) else {
-            return;
-        };
-        let Some(request) = self.windowed_blt.pending.remove(index) else {
-            return;
-        };
-        if !request.ledger_retired {
-            adapter
-                .read_ledger
-                .retire(request.ledger_ticket, true);
-        }
-        self.windowed_blt.ready.retain(|known| *known != token);
-        adapter.signal_hpd();
-    }
-
-    /// Drop the WDDM completion ownership of one merged same-stream prefix.
-    /// This is used only when VidSch has terminally abandoned that FIFO entry
-    /// (overflow): undispatched work is cancelled because its residency proof
-    /// vanished, while submitted host work stays pinned through ring completion
-    /// but cannot leave an unreachable terminal membership behind.
-    fn cancel_undispatched_windowed_blt_prefix(&mut self, prefix: WindowedBltTerminalPrefix) {
-        while let Some((token, boundary, adapter)) =
-            self.windowed_blt.pending.iter().find_map(|request| {
-                (!request.dispatched && prefix.contains(request.token, request.stream_boundary))
-                    .then_some((request.token, request.stream_boundary, request.adapter))
-            })
-        {
-            // SAFETY: an undispatched FIFO request has no host ring entry and
-            // stores the live adapter that owns this transport.
-            self.cancel_windowed_blt(unsafe { adapter.as_ref() }, token, boundary);
-        }
-    }
-
-    /// A dead present-stream registration revokes every undispatched request
-    /// in its exact prefix.  Its terminal identities are unreachable too, but
-    /// a dispatched request stays pinned until its ring response: that host
-    /// reader is real even though VidSch can no longer consume its fence.
-    fn discard_unreachable_windowed_blt_prefix(&mut self, prefix: WindowedBltTerminalPrefix) {
-        self.consume_windowed_blt_terminal_prefix(prefix);
-        self.cancel_undispatched_windowed_blt_prefix(prefix);
-    }
-
-    /// Lifecycle teardown may invalidate a stream before any WDDM submission
-    /// names a queued request.  Walk those unadmitted FIFO entries explicitly;
-    /// relying only on `wddm_pending` would strand their reader leases forever.
-    fn cancel_dead_undispatched_windowed_blt(&mut self) {
-        while let Some((token, boundary, adapter)) =
-            self.windowed_blt.pending.iter().find_map(|request| {
-                (!request.dispatched && !self.present_stream_boundary_live(request.stream_boundary))
-                    .then_some((request.token, request.stream_boundary, request.adapter))
-            })
-        {
-            // SAFETY: an undispatched request has no host reader and retains
-            // its owning adapter until this exact cancellation retires it.
-            self.cancel_windowed_blt(unsafe { adapter.as_ref() }, token, boundary);
-        }
-    }
-
-    fn abandon_windowed_blt_wddm_prefix(&mut self, prefix: WindowedBltTerminalPrefix) {
-        self.discard_unreachable_windowed_blt_prefix(prefix);
-
-        for request in self.windowed_blt.pending.iter_mut() {
-            if request.dispatched && prefix.contains(request.token, request.stream_boundary) {
-                request.wddm_completion_required = false;
-            }
-        }
-    }
-
-    /// ResetEngine/ResetFromTimeout abandon the entire scheduler epoch.  This
-    /// differs from preemption: dxgkrnl will not replay those DMA buffers, so
-    /// every undispatched request loses its residency proof. Submitted host
-    /// copies keep their reader until ring completion but no longer retain a
-    /// terminal WDDM membership that the reset destroyed.
-    pub fn terminal_abandon_wddm_epoch(
-        &mut self,
-        _order: &crate::adapter::NotifyOrdered<'_>,
-    ) -> u32 {
-        let n = self.wddm_pending.len() as u32;
-        while let Some(pending) = self.wddm_pending.pop_front() {
-            if let Some(prefix) = pending
-                .blt_token
-                .zip(pending.blt_stream_boundary)
-                .and_then(|(token, boundary)| WindowedBltTerminalPrefix::new(token, boundary))
-            {
-                self.abandon_windowed_blt_wddm_prefix(prefix);
-            }
-        }
-        while let Some((token, boundary, adapter)) =
-            self.windowed_blt.pending.iter().find_map(|request| {
-                (!request.dispatched).then_some((
-                    request.token,
-                    request.stream_boundary,
-                    request.adapter,
-                ))
-            })
-        {
-            // SAFETY: not dispatched means no host ring entry can retain it.
-            self.cancel_windowed_blt(unsafe { adapter.as_ref() }, token, boundary);
-        }
-        for request in self.windowed_blt.pending.iter_mut() {
-            request.wddm_completion_required = false;
-        }
-        self.windowed_blt.ready.clear();
-        self.windowed_blt.terminal.clear();
-        n
-    }
-
-    /// Terminal transport death is stronger than scheduler preemption: after
-    /// the transport latches failed (or its device status is reset), no host
-    /// reader can complete. Retire EVERY exact WindowedBlt ledger issue now and
-    /// discard terminal memberships because the WDDM FIFO has no consumer.
-    fn abort_windowed_blt_for_terminal_transport(&mut self) {
-        self.windowed_blt.ready.clear();
-        self.windowed_blt.terminal.clear();
-        while let Some(request) = self.windowed_blt.pending.pop_front() {
-            if !request.ledger_retired {
-                // SAFETY: every queued request was created with this live
-                // adapter; transport destruction is below its lifecycle.
-                unsafe { request.adapter.as_ref() }.read_ledger.retire(
-                    request.ledger_ticket,
-                    true,
-                );
-            }
-            crate::ddi::scanout_timeline::note(
-                crate::ddi::scanout_timeline::kind::WINDOWED_BLT_TERMINAL,
-                0,
-                0,
-                request.stream_boundary,
-                request.token,
-                request.source_resource_id,
-                request.destination_resource_id,
-            );
-        }
-    }
-
-    /// Clear every WDDM FIFO entry after an overflow and detach the exact
-    /// WindowedBlt prefix each entry used to own. `current` is the submission
-    /// that discovered the full FIFO and is never enqueued, but its newly
-    /// admitted prefix must be abandoned too.
-    fn overflow_wddm_pending(&mut self, current: Option<WindowedBltTerminalPrefix>) {
-        while let Some(pending) = self.wddm_pending.pop_front() {
-            if let (Some(token), Some(boundary)) = (pending.blt_token, pending.blt_stream_boundary)
-            {
-                if let Some(prefix) = WindowedBltTerminalPrefix::new(token, boundary) {
-                    self.abandon_windowed_blt_wddm_prefix(prefix);
-                }
-            }
-        }
-        if let Some(prefix) = current {
-            self.abandon_windowed_blt_wddm_prefix(prefix);
-        }
-    }
-
-    /// Allocation teardown cancels every transaction that names this exact
-    /// snapshot source or DXGI destination before cache/resource destruction.
-    /// Each request becomes a terminal cancellation so an already admitted
-    /// WDDM fence cannot wait forever on a resource that no longer exists.
-    pub fn cancel_windowed_blt_for_resource(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-        resource_id: u32,
-    ) {
-        while let Some((token, boundary, admitted)) =
-            self.windowed_blt.pending.iter().find_map(|request| {
-                (!request.dispatched
-                    && (request.source_resource_id == resource_id
-                        || request.destination_resource_id == resource_id))
-                    .then_some((request.token, request.stream_boundary, request.admitted))
-            })
-        {
-            if admitted {
-                self.terminal_windowed_blt(adapter, token, boundary, false);
-            } else {
-                self.cancel_windowed_blt(adapter, token, boundary);
-            }
-        }
-    }
-
-    /// Called only after Venus cache drain proved every matching submitted
-    /// command has reached a terminal ring response. System-backed requests
-    /// may still be awaiting their PASSIVE mirror; teardown cancels those now
-    /// (their reader was already retired at ring completion). A still-dispatched
-    /// request is a hard refusal so callers retain the backing rather than
-    /// destroying memory an in-flight host GPU command can read.
-    pub fn finish_windowed_blt_teardown_for_resource(
-        &mut self,
-        adapter: &crate::adapter::AdapterContext,
-        resource_id: u32,
-    ) -> bool {
-        if self.windowed_blt.pending.iter().any(|request| {
-            request.dispatched
-                && !request.ring_complete
-                && (request.source_resource_id == resource_id
-                    || request.destination_resource_id == resource_id)
-        }) {
-            return false;
-        }
-        while let Some((token, boundary)) = self.windowed_blt.pending.iter().find_map(|request| {
-            (request.ring_complete
-                && (request.source_resource_id == resource_id
-                    || request.destination_resource_id == resource_id))
-                .then_some((request.token, request.stream_boundary))
-        }) {
-            self.terminal_windowed_blt(adapter, token, boundary, false);
-        }
-        true
-    }
-
-    /// Claim exactly one ring-complete system backing for PASSIVE mirroring.
-    /// The claim bit makes a lost HPD wake harmless without a polling loop.
-    pub fn take_windowed_blt_mirror(&mut self) -> Option<WindowedBltPending> {
-        let request = self.windowed_blt.pending.iter_mut().find(|request| {
-            request.ring_complete && request.system_backing && !request.mirror_claimed
-        })?;
-        request.mirror_claimed = true;
-        Some(*request)
-    }
-
-    pub fn windowed_blt_terminal(&self, token: u64, stream_boundary: u64) -> bool {
-        self.windowed_blt.terminal_contains(token, stream_boundary)
-    }
-
-    fn windowed_blt_terminal_prefix_ready(&self, token: u64, stream_boundary: u64) -> bool {
-        WindowedBltTerminalPrefix::new(token, stream_boundary)
-            .is_some_and(|prefix| self.windowed_blt.terminal_prefix_ready(prefix))
-    }
-
-    /// Called only after the matching WDDM DMA completion was delivered, or
-    /// when its WDDM FIFO entry was terminally abandoned. The compact prefix
-    /// removes every same-stream token it represented and nothing else.
-    pub(crate) fn consume_windowed_blt_terminal_prefix(
-        &mut self,
-        prefix: WindowedBltTerminalPrefix,
-    ) {
-        self.windowed_blt.consume_terminal_prefix(prefix);
+    fn overflow_wddm_pending(&mut self) {
+        self.wddm_pending.clear();
     }
 
     /// Record the compatibility Venus boundary for K9's already-admitted exact
-    /// WDDM submission ticket. The returned state never reports or reconstructs
-    /// a scheduler fence. Paging buffers carry no Venus work (watermark 0) but
-    /// still queue FIFO behind earlier render submissions.
+    /// WDDM submission ticket. The returned state never reconstructs or
+    /// manufactures a scheduler completion.
     pub fn note_wddm_submission(
         &mut self,
         _order: &crate::adapter::NotifyOrdered<'_>,
         engine_ticket: crate::adapter::OrderedEngineTicket,
         paging: bool,
         gpu_completion_fence: Option<u64>,
-        stream_boundary: Option<u64>,
-        blt_token: Option<u64>,
         d3d12: bool,
     ) -> WddmAdmission {
         if self.failed {
-            // Nothing will ever retire. Clear compatibility owners, but never
-            // convert transport loss into completion: K9 poisons the exact
-            // scheduler generation and lets reset/removal own the outcome.
             WDDM_SIGNAL_AFTER_FAILURE.fetch_add(1, Ordering::Relaxed);
             self.wddm_pending.clear();
-            // A failure latch aborted every WindowedBlt reader before this
-            // path can be reached. Clear any stale membership defensively: no
-            // WDDM FIFO entry remains that could consume it.
-            self.windowed_blt.terminal.clear();
             return WddmAdmission::Failed;
         }
-        // A non-paging DMA fence must mean "the GPU is finished", because that
-        // is what dxgkrnl schedules on. Retiring it at DECODE reports completion
-        // with host GPU work still executing, which lets dxgkrnl advance a flip
-        // or release an app's surface to the compositor mid-write. Paging keeps
-        // the decode domain: it moves memory rather than producing pixels, and
-        // coupling it to unrelated GPU work is the pacing cost the DecodeOnly
-        // doc warns about with none of the ordering benefit.
-        // A stale stream record is an explicit cancellation, never a satisfied
-        // producer.  Preserve the ordinary wire watermark below, which still
-        // orders every transport entry before this WDDM buffer.
-        let raw_stream_boundary = stream_boundary;
-        let stream_boundary =
-            raw_stream_boundary.filter(|boundary| self.present_stream_boundary_live(*boundary));
-        let mut blt_token = blt_token.filter(|token| *token != 0);
-        let mut blt_stream_boundary = raw_stream_boundary
-            .filter(|boundary| decode_present_stream_boundary(*boundary).is_some());
-        if !matches!((blt_token, blt_stream_boundary), (Some(_), Some(_))) {
-            // WindowedBlt identity is all-or-none. A token without its exact
-            // generation-qualified stream (or a stream tail without a token)
-            // cannot name a terminal, so it must not become a permanently
-            // blocked `(Some, None)` FIFO head.
-            blt_token = None;
-            blt_stream_boundary = None;
-        }
-        if let (Some(token), Some(boundary)) = (blt_token, blt_stream_boundary) {
-            let exact_pending = self
-                .windowed_blt
-                .pending
-                .iter()
-                .any(|request| request.token == token && request.stream_boundary == boundary);
-            let exact_terminal = self.windowed_blt.terminal_contains(token, boundary);
-            let prefix = WindowedBltTerminalPrefix::new(token, boundary);
-            let already_owned_by_wddm = prefix.is_some()
-                && self.wddm_pending.iter().any(|pending| {
-                    pending
-                        .blt_token
-                        .zip(pending.blt_stream_boundary)
-                        .and_then(|(max_token, max_boundary)| {
-                            WindowedBltTerminalPrefix::new(max_token, max_boundary)
-                        })
-                        .is_some_and(|owner| owner.contains(token, boundary))
-                });
-            if !helios_kmd_logic::windowed_blt_token::can_attach_dependency(
-                exact_pending,
-                exact_terminal,
-                already_owned_by_wddm,
-            ) {
-                // A stale/recycled private record has neither an exact live
-                // transaction nor a retained terminal. A duplicate WDDM
-                // owner is equally invalid. Preemption is intentionally not
-                // one-shot: a host copy may terminalize before dxgkrnl
-                // resubmits its private buffer, in which case `exact_terminal`
-                // is the authoritative replay proof.
-                crate::ddi::scanout_timeline::note(
-                    crate::ddi::scanout_timeline::kind::WINDOWED_BLT_TERMINAL,
-                    0,
-                    0,
-                    boundary,
-                    token,
-                    0,
-                    0,
-                );
-                blt_token = None;
-                blt_stream_boundary = None;
-            } else if stream_boundary.is_none() {
-                // The generation died between Present and SubmitCommand.
-                // Cancel every undispatched transaction represented by this
-                // merged same-stream prefix. A dispatched exact max stays
-                // pinned to its ring response; on the first SubmitCommand
-                // there cannot be one, but do not turn that invariant into a
-                // use-after-free if lifecycle ordering changes.
-                let max_dispatched = self
-                    .windowed_blt
-                    .pending
-                    .iter()
-                    .find(|request| request.token == token && request.stream_boundary == boundary)
-                    .is_some_and(|request| request.dispatched);
-                if !max_dispatched {
-                    if let Some(prefix) = prefix {
-                        // This dead SubmitCommand cannot own the merged
-                        // prefix. Earlier members can already be in flight,
-                        // so abandonment also detaches their eventual ring
-                        // responses from unreachable WDDM terminal state.
-                        self.abandon_windowed_blt_wddm_prefix(prefix);
-                    }
-                    blt_token = None;
-                    blt_stream_boundary = None;
-                }
-            }
-        }
-        if let (Some(boundary), Some(token)) = (stream_boundary, blt_token) {
-            self.admit_windowed_blt_prefix(boundary, token);
-        }
-        let domain = if stream_boundary.is_some() || gpu_completion_fence.is_some() {
+
+        let domain = if gpu_completion_fence.is_some() {
             RetireDomain::IncludingGpu
         } else if paging || !self.dma_gpu_fence {
             RetireDomain::DecodeOnly
@@ -7864,16 +3292,6 @@ impl VirtioGpu {
         let (watermark, wire_boundary) = if paging {
             (0, WireBoundary::Prefix)
         } else if let Some(gpu_fence_id) = gpu_completion_fence {
-            // THE DECISION TABLE IS `helios_kmd_logic::wddm_boundary::select`, and
-            // it is there rather than here because A4 and A6 are both defects OF
-            // THIS TABLE and this crate cannot host a test (`panic = "abort"`
-            // cdylib). `wddm_boundary_tests` is the oracle; this frame only maps
-            // its verdict onto counters and onto the transport's own enum.
-            //
-            // `[wire_fence_base, next_wire_fence)` is exactly "issued by this
-            // transport generation": ids stride up by 2^32 at every StartDevice,
-            // and `next_wire_fence` is bumped only after `control.add` succeeds,
-            // in the same spinlock section as the `inflight` push.
             use helios_kmd_logic::wddm_boundary as boundary;
             let selection = boundary::select(
                 gpu_fence_id,
@@ -7882,48 +3300,9 @@ impl VirtioGpu {
                 d3d12,
             );
             match selection.rejection {
-                // A malformed/stale private marker must not manufacture an
-                // impossible future dependency. Conservatively gate on all work
-                // actually enqueued before this WDDM submission.
-                //
-                // COUNTED since the D3D12 arm exists (2026-08-06). This clamp was
-                // silent, and it is the one place a guest-supplied boundary is
-                // quietly replaced by a different one: the fence then reports a
-                // watermark nobody asked for. Both writers reach it — Present's BLT
-                // marker and `HeliosD3D12SubmitCmd` — so it is deliberately NOT
-                // named after either.
                 boundary::Rejection::OutOfRange => {
                     GPU_FENCE_CLAMPED.fetch_add(1, Ordering::Relaxed);
                 }
-                // FOREIGN GENERATION (A6). Same conservative fallback, its own
-                // counter: the two conditions are diagnosed differently — an id
-                // ahead of the range is a stale or forged sample inside this
-                // generation, an id below it is a survivor of a device restart —
-                // and one counter for both would have hidden the whole A6 class
-                // inside a number that reads as the known-benign clamp.
-                //
-                // ⛔ NO OWNER CHECK BESIDE IT, AND THAT IS A DECISION. The check
-                // would be "was this id issued to the process/context that
-                // submitted this DMA buffer", and it is not worth its cost:
-                //  * it cannot be answered from existing state —
-                //    `InFlightKind::AsyncVenus` records `fence_id`/`ring_idx` and
-                //    no owner, so it means a new field in the transport's hottest
-                //    DISPATCH-time table that every enqueue, drain and reap must
-                //    maintain;
-                //  * the harm it would prevent is strictly weaker than one the
-                //    contract already grants. A fence id here is only ever a WAIT
-                //    TARGET, never something this arm signals, so naming another
-                //    process's id can only stall the naming context or — if that id
-                //    already retired — complete without waiting for the namer's own
-                //    work, which lands on the namer's own pixels. A hostile guest
-                //    already has the cheaper form: `gpu_wire_fence = 0` is the
-                //    DOCUMENTED order-against-nothing arm (`D12Zero`);
-                //  * nothing another process owns becomes reachable — the boundary
-                //    selects a wait, and every other client's WDDM fence keeps its
-                //    own entry with its own watermark.
-                // ⇒ generation is checked because a cross-generation id breaks the
-                // predicate's soundness for the OS scheduler; ownership is not,
-                // because it only re-describes a self-harm the DDI already permits.
                 boundary::Rejection::ForeignGeneration => {
                     GPU_FENCE_FOREIGN_GENERATION.fetch_add(1, Ordering::Relaxed);
                 }
@@ -7931,132 +3310,24 @@ impl VirtioGpu {
             }
             let wire_boundary = match selection.kind {
                 boundary::Kind::Prefix => WireBoundary::Prefix,
-                // ⛔⛔ THE EXACT D3D12 BOUNDARY (A4). CLAUDE.md's invariant table:
-                // *"A WDDM fence may wait on the frame's OWN boundary, never on the
-                // whole `next_wire_fence` backlog."* Until 2026-08-06 this arm
-                // produced `gpu_fence_id + 1` as a PREFIX, so a D3D12 packet waited
-                // for every async wire fence below the named one to retire — every
-                // ring, every process, DWM's ring-1 scanout copies included. That is
-                // the exact superset the present path had to relax away
-                // (`PRESENT_EXACT_WATERMARK_USED`), reintroduced on the new arm.
-                //
-                // WHY EXACTNESS IS SOUND HERE. The WDDM DMA buffers on this driver
-                // carry no GPU commands at all — this one carries a
-                // `HeliosD3D12SubmitCmd` record and nothing else — so the only thing
-                // DMA_COMPLETED can truthfully report is that the work this
-                // submission named has finished. `pfnExecuteCommandLists` submits
-                // the batch's Vulkan work through the ICD and hands us the ring-1
-                // wire fence it ends at, and `mark_d3d12` takes the MAX over records
-                // batched into the same private-data buffer, so the named id
-                // subsumes every earlier submission of this packet. Waiting on
-                // anything else is waiting on another process's frames.
-                //
-                // ⚠ WHY THE LEGACY PRESENT ARM KEEPS THE PREFIX (the same
-                // `gpu_completion_fence` field, written by Present's BLT marker).
-                // Two reasons, and neither is "exactness would not work there":
-                // (1) that arm IS the shipping, measured desktop configuration —
-                // every accepted present-path measurement, `PresentWmk`'s
-                // +3.7…+4.3 % paired GT1 delta included, was taken with the prefix
-                // on the wire-fence boundary, and CLAUDE.md rule 8 forbids shipping
-                // a default nobody measured; (2) A4 is a defect report about THIS
-                // arm, and widening the repair to the desktop path would mean the
-                // first D3D12 deploy could not attribute a present regression.
-                // `D12Exact` against `PwExact` keeps the two answerable separately.
                 boundary::Kind::Exact => {
                     D3D12_EXACT_WATERMARK_USED.fetch_add(1, Ordering::Relaxed);
                     WireBoundary::Exact
                 }
             };
             (selection.watermark, wire_boundary)
-        } else if stream_boundary.is_some() && self.present_exact_watermark {
-            // EXACT PRESENT WATERMARK (2026-08-04). `next_wire_fence` is "every
-            // transport entry enqueued before this WDDM buffer" — a superset
-            // that includes work belonging to LATER frames, because the DXVK CS
-            // thread runs ahead of the presenting thread and dxgkrnl submits a
-            // flip about a frame after the app presented (the same over-wait
-            // `arm_dma_flip`'s 0ab-B note already recorded from the flush side).
-            //
-            // A submission that carries a LIVE stream boundary already states
-            // its exact dependency: `stream_ready` below is that frame's own
-            // producer completion, in the generation-qualified stream namespace.
-            // The WDDM DMA buffers on this driver carry no GPU commands at all —
-            // a Render marker or a flip record — so the frame the marker names
-            // IS the work this fence reports. Keeping the superset on top of it
-            // only delays the fence by the pipeline depth, which is what makes
-            // dxgkrnl block the presenting thread at its 3-deep present queue
-            // (ETW `BlockThread` Reason=2; 21% of presents, 2.45 ms each).
-            //
-            // The relaxation is deliberately NOT applied when the boundary was
-            // filtered out as stale above: a dead generation is a cancellation,
-            // not a satisfied producer, and keeps the ordinary wire watermark.
-            PRESENT_EXACT_WATERMARK_USED.fetch_add(1, Ordering::Relaxed);
-            (0, WireBoundary::Prefix)
         } else {
             (self.next_wire_fence, WireBoundary::Prefix)
         };
-        // UV1's instrument (`WddmHoldMs`, KMD_IMPACT §14a.1). Scoped to D3D12 ECL
-        // packets by the record's identity, never by timing or by which context
-        // happened to submit: this FIFO is adapter-global and strictly
-        // head-of-line, so a hold that could attach to a DWM present would stall
-        // the whole desktop. Default 0 makes every line below inert.
-        let hold_until_100ns = if d3d12 { self.wddm_hold_deadline() } else { 0 };
-        let stream_ready =
-            stream_boundary.map_or(true, |boundary| self.scanout_boundary_ready(boundary));
-        let blt_ready = match (blt_token, blt_stream_boundary) {
-            (Some(token), Some(boundary)) => {
-                self.windowed_blt_terminal_prefix_ready(token, boundary)
-            }
-            (None, _) => true,
-            _ => false,
-        };
+
         if self.wddm_pending.is_empty()
             && self.wire_boundary_ready(watermark, domain, wire_boundary)
-            && stream_ready
-            && blt_ready
-            // A held packet must not take the immediate-signal path: that is the
-            // exact case the experiment measures (a packet with nothing real to
-            // wait for), so the hold has to be able to reach it.
-            && hold_until_100ns == 0
-            // A WindowedBlt terminal can predate a preempted DMA replay. It
-            // still must enter the FIFO so a failed NotifyInterrupt leaves a
-            // retryable owner; only the DPC's successful callback consumes
-            // the exact terminal prefix.
-            && blt_token.is_none()
         {
             return WddmAdmission::HostTerminal;
         }
         if self.wddm_pending.len() >= MAX_WDDM_PENDING {
-            // The compatibility FIFO cannot represent another owner. Drop its
-            // private rows, but K9 keeps this a terminal generation failure;
-            // signaling the newest fence would falsely complete every older
-            // scheduler entry.
-            //
-            // ⚠ THE "PRACTICALLY UNREACHABLE (VidSch queues far fewer than 256)"
-            // LINE THAT USED TO BE HERE IS RETIRED (A5, 2026-08-06). It was an
-            // assumption about dxgkrnl's queue depths — closed source, and this
-            // FIFO is adapter-global across every context, so no single queue depth
-            // bounds it — and the D3D12 arm adds a writer at
-            // `pfnExecuteCommandLists` frequency rather than at present frequency.
-            // What actually keeps this path away is now stated and measured:
-            // `WddmHeadMs` bounds how long a head may block on a boundary that may
-            // be unsatisfiable, so 256 outstanding entries requires 256 genuinely
-            // in-flight producers. If this counter ever moves, `WfBWire`/`WfBReb`
-            // say whether the host stopped retiring or the bound was disabled.
-            //
-            // ⚠ The caller still releases every outstanding scan-out lease when
-            // this returns `Failed` after an overflow. The leases no longer gate a
-            // retirement, but they DO decide the flush executor's ownership
-            // gate, and an epoch whose presentation was just dropped on the
-            // floor must not read as one that is still coming.
-            // `note_wddm_submission` cannot do it itself — the lease state lives
-            // on the adapter and this runs under `virtio_lock`, inside
-            // `wddm_notify_lock`.
             WDDM_PENDING_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
-            let current = match (blt_token, blt_stream_boundary) {
-                (Some(token), Some(boundary)) => WindowedBltTerminalPrefix::new(token, boundary),
-                _ => None,
-            };
-            self.overflow_wddm_pending(current);
+            self.overflow_wddm_pending();
             return WddmAdmission::Failed;
         }
         self.wddm_pending.push_back(WddmPending {
@@ -8064,371 +3335,30 @@ impl VirtioGpu {
             watermark,
             wire_boundary,
             domain,
-            stream_boundary,
-            blt_token,
-            blt_stream_boundary,
-            hold_until_100ns,
-            head_deadline_100ns: 0,
-            rebased: false,
         });
         WddmAdmission::Pending
     }
-
-    /// The interrupt-time deadline a held D3D12 packet may not complete before,
-    /// or 0 when `WddmHoldMs` is off (the default) or the clock is unusable.
-    ///
-    /// The clamp is in CODE, not in the operator's registry value: an unbounded
-    /// hold on a head-of-line FIFO is a TDR, and a typo must not be able to cause
-    /// one. `WDDM_HOLD_MS_MAX` is far below the default `TdrDelay` of 2 s while
-    /// still five orders of magnitude above the 0.8–1.1 µs fence-wait baseline the
-    /// experiment reads against, so nothing about the reading needs the extra
-    /// range.
-    fn wddm_hold_deadline(&self) -> u64 {
-        let ms = WDDM_HOLD_MS.load(Ordering::Relaxed);
-        if ms == 0 {
-            return 0;
-        }
-        let mut qpc_timestamp = 0;
-        // SAFETY: `KeQueryInterruptTimePrecise` is a scalar time read legal at any
-        // IRQL (the same call this driver already makes at DIRQL in
-        // `ddi/display.rs` and from the vsync DPC); it takes no lock and cannot
-        // re-enter this transport.
-        let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
-        // 100 ns units. A saturating add keeps an exhausted interrupt-time
-        // representation from wrapping into a deadline already in the past.
-        now.saturating_add(ms as u64 * 10_000)
-    }
-
-    /// Whether a `WddmHeadMs` deadline is armed AND has expired, so the periodic
-    /// heartbeat should prompt a completion DPC. Claims the deadline on the way out,
-    /// so one arm yields at most one prompt.
-    ///
-    /// # Why the heartbeat needs this at all
-    ///
-    /// [`Self::rebase_blocked_head`] can only run when something looks at the FIFO,
-    /// and the release edges are all opportunistic: a used-ring completion DPC, or
-    /// `request_wddm_completion_dpc` from the ctrl/escape/device paths. On a busy
-    /// desktop those arrive constantly. The residual is the FULLY IDLE tail — a head
-    /// blocked on an unsatisfiable boundary while nothing else submits anything —
-    /// where without a periodic prompt the bound would never fire and the outcome
-    /// would be the TDR it exists to prevent.
-    ///
-    /// # ⛔ Why it is not `WDDM_HEAD_MS != 0`
-    ///
-    /// Because that is CONFIGURATION and it is true on every shipping boot
-    /// ([`WDDM_HEAD_MS_DEFAULT`] is 250), so it would prompt a DPC 60 times a second
-    /// forever on a desktop with no D3D12 client. See [`WDDM_HEAD_DEADLINE_100NS`].
-    ///
-    /// # Cost
-    ///
-    /// In the common case (nothing armed) exactly ONE relaxed 64-bit load, and
-    /// notably NO clock read: the time is sampled only after a non-zero deadline
-    /// proves there is something to compare against.
-    ///
-    /// # An associated function
-    ///
-    /// It takes no `&self` deliberately — the caller is the display heartbeat, which
-    /// holds no transport lock and must not take one. The FIFO entry remains the
-    /// authority; this only decides whether looking is worthwhile.
-    ///
-    /// # Why claiming (rather than re-arming) does not lose the prompt
-    ///
-    /// The alternative — push the shadow forward instead of clearing it, so a
-    /// dropped prompt retries — was rejected: nothing would then clear a STALE arm,
-    /// and a head that retired normally before its deadline would prompt once per
-    /// bound forever. Claiming is safe because the prompt cannot be dropped in any
-    /// state where it would have mattered: `request_wddm_completion_dpc` bails only
-    /// when the adapter has no callback table or no `DxgkCbQueueDpc`, and dxgkrnl is
-    /// set at StartDevice and never cleared — so if it is absent, no `DMA_COMPLETED`
-    /// can be delivered at all and a blocked FIFO head is not the live problem.
-    /// `DxgkCbQueueDpc` itself has no failure return.
-    ///
-    /// A later look that finds the entry's own deadline already past rebases on that
-    /// look, with no prompt needed, which is what covers the ordinary case where the
-    /// prompted DPC happens to find the head blocked on the (non-rebasable) wire arm
-    /// instead.
-    pub fn wddm_head_bound_due() -> bool {
-        let deadline = WDDM_HEAD_DEADLINE_100NS.load(Ordering::Relaxed);
-        if deadline == 0 {
-            return false;
-        }
-        let mut qpc_timestamp = 0;
-        // SAFETY: `KeQueryInterruptTimePrecise` is a scalar time read legal at any
-        // IRQL (this heartbeat runs at DISPATCH); it takes no lock and cannot
-        // re-enter the transport.
-        let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
-        if !helios_kmd_logic::wddm_head_bound::heartbeat_due(deadline, now) {
-            return false;
-        }
-        // CLAIM IT. A stale arm (the head retired before its deadline) must cost one
-        // prompt, never a repeating one, and a `compare_exchange` rather than a
-        // `swap` so a concurrent re-arm with a LATER deadline is not silently
-        // discarded by this reader.
-        WDDM_HEAD_DEADLINE_100NS
-            .compare_exchange(deadline, 0, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    }
-
-    /// Whether the last [`Self::note_wddm_submission`] overflowed the pending
-    /// FIFO, and the caller therefore owes a lease release.
-    ///
-    /// A counter read rather than a second return value, because the overflow is a
-    /// rare last resort and threading a tuple through the one call site would put
-    /// it in everyone's way. The caller compares before and after;
-    /// `WDDM_PENDING_OVERFLOWS` is cumulative and monotonic.
-    ///
-    /// ⚠ "PRACTICALLY UNREACHABLE" WAS THE OLD WORDING AND IT IS RETIRED (A5): it
-    /// rested on an assumption about dxgkrnl's queue depths, and this FIFO is
-    /// adapter-global across every context. What keeps it away is now
-    /// `WddmHeadMs` — see the overflow arm in [`Self::note_wddm_submission`].
-    pub fn wddm_pending_overflows() -> u32 {
-        WDDM_PENDING_OVERFLOWS.load(Ordering::Relaxed)
-    }
-
-    /// Pop the head-of-FIFO WDDM submission once its venus watermark has been
-    /// reached — the app has finished writing the frame. The DPC signals
-    /// DMA_COMPLETED for it OUTSIDE the device spinlock.
-    ///
-    /// The presentation-lease half that also gated this until 22.22.217.0 is
-    /// gone; see [`WddmPending`] for the measurement that retired it.
-    ///
-    /// Strictly head-of-line. A blocked head is never bypassed: dxgkrnl treats
-    /// `SubmissionFenceId` as a watermark and requires monotonic completion, so
-    /// skipping ahead is bugcheck 0x119/1.
-    pub fn take_one_ready_wddm(&mut self, _order: &crate::adapter::NotifyOrdered<'_>) -> WddmTake {
-        // TWO PASSES AT MOST, and the loop exists for LIVENESS, not for retrying:
-        // `rebase_blocked_head` can succeed at most once per entry
-        // (`WddmPending::rebased`), and the `pass` guard bounds it again in case
-        // that ever breaks. Without the second pass a rebase would return
-        // `BlockedOnProducer`, which ENDS the DPC's drain loop
-        // (`ddi/interrupt.rs`), so a head this driver just released would then sit
-        // there waiting for an unrelated wake edge — and the whole point of the
-        // bound is that no such edge is guaranteed.
-        let mut pass = 0u8;
-        loop {
-            pass += 1;
-            let (
-                watermark,
-                wire_boundary,
-                domain,
-                stream_boundary,
-                blt_token,
-                blt_stream_boundary,
-                hold_until,
-            ) = {
-                let Some(head) = self.wddm_pending.front() else {
-                    return WddmTake::Empty;
-                };
-                (
-                    head.watermark,
-                    head.wire_boundary,
-                    head.domain,
-                    head.stream_boundary,
-                    head.blt_token,
-                    head.blt_stream_boundary,
-                    head.hold_until_100ns,
-                )
-            };
-            // Evaluated as three named conditions rather than one `||` chain: the
-            // FIFO is strictly ordered, so whatever paces its head paces every
-            // WDDM fence behind it, and "blocked" without saying ON WHAT is not an
-            // instrument. Exactly one counter moves per blocked look.
-            if !self.wire_boundary_ready(watermark, domain, wire_boundary) {
-                WDDM_HEAD_BLOCKED_WIRE.fetch_add(1, Ordering::Relaxed);
-                // ⛔ DELIBERATELY NOT REBASABLE, and this is the load-bearing half
-                // of `WddmHeadMs`'s scope. There is nothing to rebase a wire
-                // dependency ONTO: the rebase target IS the conservative wire
-                // prefix at the current `next_wire_fence`, which for a Prefix head
-                // is the same class of wait and for an Exact head is STRICTER (it
-                // still includes the named fence, plus everything below it). A wire
-                // arm that never clears means the host has stopped retiring work
-                // altogether, and the honest outcome of a wedged host is a TDR, not
-                // a fence this driver signals on its behalf.
-                return WddmTake::BlockedOnProducer;
-            }
-            if !stream_boundary.map_or(true, |boundary| self.scanout_boundary_ready(boundary)) {
-                WDDM_HEAD_BLOCKED_STREAM.fetch_add(1, Ordering::Relaxed);
-                if pass == 1 && self.rebase_blocked_head(RebaseArm::Stream) {
-                    continue;
-                }
-                return WddmTake::BlockedOnProducer;
-            }
-            if !match (blt_token, blt_stream_boundary) {
-                (Some(token), Some(boundary)) => {
-                    self.windowed_blt_terminal_prefix_ready(token, boundary)
-                }
-                (None, _) => true,
-                _ => false,
-            } {
-                WDDM_HEAD_BLOCKED_BLT.fetch_add(1, Ordering::Relaxed);
-                if pass == 1 && self.rebase_blocked_head(RebaseArm::Blt) {
-                    continue;
-                }
-                return WddmTake::BlockedOnProducer;
-            }
-            // FOURTH ARM, AND DELIBERATELY LAST (`WddmHoldMs`, UV1). Placed after
-            // the three real dependencies so `WfBHold` can only mean "an otherwise
-            // READY packet was artificially delayed" — which is the experiment's
-            // signal — and so the meaning of the other three counters is unchanged.
-            // Inert unless the knob is on AND the head is a D3D12 ECL packet.
-            //
-            // ⚠ NOT REBASABLE EITHER, and the two knobs therefore do not interact:
-            // a hold is not a dependency, so `WddmHeadMs` has nothing to rebase it
-            // onto, and letting the head bound cut a hold short would make UV1's
-            // experiment measure `WddmHeadMs` instead of dxgkrnl. The hold is also
-            // reached only when the three real arms are already satisfied, so it can
-            // never be the reason a deadline was armed.
-            if hold_until != 0 {
-                let mut qpc_timestamp = 0;
-                // SAFETY: scalar any-IRQL time read, as in `wddm_hold_deadline`.
-                let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
-                if now < hold_until {
-                    WDDM_HEAD_BLOCKED_HOLD.fetch_add(1, Ordering::Relaxed);
-                    return WddmTake::BlockedOnProducer;
-                }
-            }
-            let Some(pending) = self.wddm_pending.pop_front() else {
-                return WddmTake::Empty;
-            };
-            let terminal_prefix = match (blt_token, blt_stream_boundary) {
-                (Some(token), Some(boundary)) => WindowedBltTerminalPrefix::new(token, boundary),
-                _ => None,
-            };
-            WDDM_FENCE_FROM_DPC.fetch_add(1, Ordering::Relaxed);
-            return WddmTake::Ready(WddmReady {
-                pending,
-                terminal_prefix,
-            });
-        }
-    }
-
-    /// CONSUMER-SIDE LIVENESS FOR THE FIFO HEAD (`WddmHeadMs`; `KMD_IMPACT.md`
-    /// §14a.2 K-F2 and `docs/dx12/PENDING.md` §1 A5). Arms a deadline on the first
-    /// blocked look at this head, and once it expires REBASES the head's
-    /// tagged-namespace dependencies onto the conservative wire watermark. Returns
-    /// `true` only on the call that actually rebases.
-    ///
-    /// # ⚠ THE REBASE RELEASES A FENCE WHOSE NAMED PRODUCER MAY NOT HAVE COMPLETED
-    ///
-    /// That is a LIE, stated plainly because it is one. A present-stream boundary
-    /// names a specific producer completion, and on the shipping default the marker
-    /// is delivered BEFORE the frame's `vkQueueSubmit` on purpose
-    /// (`PsMkAhd`/`PsMkAhdHi` measure exactly that), so the wire prefix this rebases
-    /// onto need not cover it. The frame dxgkrnl then hands onward can be one the
-    /// app has not finished writing — the 0ab-B stale/black-frame class.
-    ///
-    /// # Why that trade was made anyway
-    ///
-    /// `present_stream_marker_boundary` bounds a marker's value in NO way, so a
-    /// guest can name a boundary `present_stream_slot_ready` will never satisfy —
-    /// and an acceptance-side bound cannot fix it (K-F2 records why: legitimate
-    /// lookahead reaches DXVK's `MaxNumQueuedCommandBuffers = 32`, and a forged
-    /// value whose process then stops presenting is unsatisfiable at any bound). The
-    /// FIFO is ADAPTER-GLOBAL and strictly head-of-line, so such a head blocks every
-    /// context including DWM's. The two alternatives are both worse:
-    ///
-    ///  * the 256-entry overflow escape, which completes 256 queued fences at once
-    ///    while their host work is still running AND forces
-    ///    `release_all_scanout_leases(Teardown)` — the same lie times 256, plus the
-    ///    whole adapter's presentation state;
-    ///  * an adapter-wide TDR, i.e. every D3D device in the system lost.
-    ///
-    /// ⇒ one bounded, counted, per-entry release beats both. `WfBReb` is the price
-    /// tag: it must read 0 on a healthy session.
-    ///
-    /// # What it does NOT touch
-    ///
-    /// Only the tagged namespaces. The wire arm is not rebasable (see the WIRE arm
-    /// in [`Self::take_one_ready_wddm`]), the hold arm is not a dependency, and the
-    /// entry's direct K9 ticket and FIFO position are untouched — dxgkrnl requires
-    /// monotonic `SubmissionFenceId` completion and this must never become a bypass.
-    ///
-    /// # `arm` — why the caller has to say
-    ///
-    /// ⛔ THE REBASE IS THE ONLY PLACE THE ANSWER EXISTS. `WfBReb` used to be
-    /// graded *"whichever of `WfBStrm`/`WfBBlt` moved with it is the diagnosis"*,
-    /// which cannot work: those are session-cumulative, adapter-global blocked-look
-    /// totals that climb continuously under DWM, so both have thousands of
-    /// unrelated increments by the time one rebase fires. Passing the blocking arm
-    /// in costs one relaxed `fetch_add` on the path that already writes three of
-    /// them, and turns an undiagnosable price tag into an attributed one
-    /// (`WfBRebS`/`WfBRebB`, which partition `WfBReb`).
-    fn rebase_blocked_head(&mut self, arm: RebaseArm) -> bool {
-        let ms = WDDM_HEAD_MS.load(Ordering::Relaxed);
-        if ms == 0 {
-            return false;
-        }
-        let mut qpc_timestamp = 0;
-        // SAFETY: `KeQueryInterruptTimePrecise` is a scalar time read legal at any
-        // IRQL, as in `wddm_hold_deadline`; it takes no lock and cannot re-enter
-        // this transport.
-        let now = unsafe { KeQueryInterruptTimePrecise(&mut qpc_timestamp) };
-        // Read before the mutable borrow of the FIFO below.
-        let rebase_watermark = self.next_wire_fence;
-        let abandoned_prefix = {
-            let Some(head) = self.wddm_pending.front_mut() else {
-                return false;
-            };
-            // The arm/wait/expire state machine is
-            // `helios_kmd_logic::wddm_head_bound::look`, tested there: this crate
-            // cannot host a test, and an off-by-one or an unsaturated add here would
-            // release fences for a reason that has nothing to do with a producer.
-            use helios_kmd_logic::wddm_head_bound as bound;
-            match bound::look(ms, now, head.head_deadline_100ns, head.rebased) {
-                bound::Action::Disabled | bound::Action::Wait | bound::Action::AlreadyRebased => {
-                    return false;
-                }
-                bound::Action::Arm(deadline) => {
-                    // FIRST blocked look at this entry as head.
-                    head.head_deadline_100ns = deadline;
-                    // Publish the lock-free shadow so the 60 Hz heartbeat can tell
-                    // that a look is now worth prompting for. A store, not a
-                    // compare-exchange: the newest armed head is the one that
-                    // matters, and this runs under `virtio_lock` inside
-                    // `wddm_notify_lock` so there is no second arming writer.
-                    WDDM_HEAD_DEADLINE_100NS.store(deadline, Ordering::Relaxed);
-                    return false;
-                }
-                bound::Action::Rebase => {}
-            }
-            // The shadow's purpose is discharged: this head will never arm again
-            // (`rebased`), so leaving the value behind could only buy a spurious
-            // prompt. A later head arming overwrites it.
-            WDDM_HEAD_DEADLINE_100NS.store(0, Ordering::Relaxed);
-            head.rebased = true;
-            head.stream_boundary = None;
-            head.watermark = rebase_watermark;
-            // The rebase target is the LEGACY watermark in every sense: an
-            // exclusive prefix over every ring, which is "everything this transport
-            // had enqueued at the moment of the rebase". Conservative, and always
-            // eventually satisfied unless the host itself has stopped.
-            head.wire_boundary = WireBoundary::Prefix;
-            head.domain = RetireDomain::IncludingGpu;
-            let prefix = head
-                .blt_token
-                .zip(head.blt_stream_boundary)
-                .and_then(|(token, boundary)| WindowedBltTerminalPrefix::new(token, boundary));
-            head.blt_token = None;
-            head.blt_stream_boundary = None;
-            prefix
+    /// Pop the head-of-FIFO WDDM submission once its real producer boundary
+    /// has retired. The FIFO remains strictly ordered; no completion is
+    /// synthesized or allowed to bypass an older ticket.
+    pub fn take_one_ready_wddm(
+        &mut self,
+        _order: &crate::adapter::NotifyOrdered<'_>,
+    ) -> WddmTake {
+        let Some(head) = self.wddm_pending.front() else {
+            return WddmTake::Empty;
         };
-        if let Some(prefix) = abandoned_prefix {
-            // The FIFO entry OWNED this terminal prefix; dropping the dependency
-            // without detaching the ownership would strand the reader leases the
-            // exact same way the overflow path documents. Same helper, same reason.
-            self.abandon_windowed_blt_wddm_prefix(prefix);
+        if !self.wire_boundary_ready(head.watermark, head.domain, head.wire_boundary) {
+            WDDM_HEAD_BLOCKED_WIRE.fetch_add(1, Ordering::Relaxed);
+            return WddmTake::BlockedOnProducer;
         }
-        WDDM_HEAD_REBASED.fetch_add(1, Ordering::Relaxed);
-        // The two subsets partition `WfBReb` exactly: one increment per rebase,
-        // chosen by the caller's arm. A relaxed atomic, like every counter around
-        // it — this runs under `virtio_lock` at DISPATCH, where `diag::record` is
-        // forbidden (it writes the registry and is PASSIVE-only).
-        match arm {
-            RebaseArm::Stream => WDDM_HEAD_REBASED_STREAM.fetch_add(1, Ordering::Relaxed),
-            RebaseArm::Blt => WDDM_HEAD_REBASED_BLT.fetch_add(1, Ordering::Relaxed),
+        let Some(pending) = self.wddm_pending.pop_front() else {
+            return WddmTake::Empty;
         };
-        true
+        WDDM_FENCE_FROM_DPC.fetch_add(1, Ordering::Relaxed);
+        WddmTake::Ready(WddmReady { pending })
     }
+
 
     /// Put a popped-but-undelivered submission back at the head of the FIFO.
     ///
@@ -8455,16 +3385,17 @@ impl VirtioGpu {
     pub fn preempt_flush(&mut self, _order: &crate::adapter::NotifyOrdered<'_>) -> u32 {
         let n = self.wddm_pending.len() as u32;
         self.wddm_pending.clear();
-        // Scheduler residency admission was revoked. A request that has not
-        // reached ring 1 must await the resubmitted DMA buffer's exact token;
-        // dispatching it merely because its producer happened to retire would
-        // race destination paging.
-        for request in self.windowed_blt.pending.iter_mut() {
-            if !request.dispatched {
-                request.admitted = false;
-            }
-        }
-        self.windowed_blt.ready.clear();
+        n
+    }
+
+    /// Terminally abandon the compatibility FIFO after K9 has already
+    /// invalidated the authoritative ordered-engine generation.
+    pub fn terminal_abandon_wddm_epoch(
+        &mut self,
+        _order: &crate::adapter::NotifyOrdered<'_>,
+    ) -> u32 {
+        let n = self.wddm_pending.len() as u32;
+        self.wddm_pending.clear();
         n
     }
 
@@ -8483,43 +3414,14 @@ impl VirtioGpu {
     }
 }
 
-// The `#[cfg(test)] mod present_stream_tests` that used to sit HERE was moved to
-// `helios_kmd_logic::present_stream_boundary_tests` on 2026-08-06, together with
-// the pure helpers it covered. FIVE tests (not six, as `docs/dx12/PENDING.md` §6
-// said), none of which had ever executed: this crate is a `panic = "abort"`
-// cdylib whose `build.rs` runs bindgen and shells to `rc.exe`, so a libtest
-// harness cannot exist here at all — CLAUDE.md's invariant table says exactly
-// that. Do not reintroduce tests in this file; add them to `kmd_logic`.
-
 impl Drop for VirtioGpu {
     fn drop(&mut self) {
-        // Quiesce the device before ending reader leases: unlike ordinary
-        // scheduler reset, transport Drop is terminal and no host DMA may
-        // retain a snapshot once this reset returns.
         // SAFETY: every VirtioGpu owner drops at the documented PASSIVE
         // lifecycle/reap edge; DmaBuffer teardown below has the same contract.
         let passive = unsafe { crate::irql::PassiveLevel::assume() };
         let _ = self
             .queue
             .reset_status_and_poll(passive, self.scanout_transport_instance);
-        self.abort_windowed_blt_for_terminal_transport();
-        // Stop/StartDevice destroys this transport generation.  Clear stream
-        // registrations before resource ids or device owner tokens can be
-        // recycled by the next generation.
-        self.purge_all_present_streams();
-        // Drop any fence-event registrations still parked: dereference WITHOUT
-        // signaling (the fences will never retire on a dead transport, and a
-        // signal here would report fake completion — the waiter's own deadline
-        // fires instead, and its unregister sees NOT_FOUND with an UNSIGNALED
-        // event, which the ICD treats as failure). PASSIVE_LEVEL, outside the
-        // device lock, so the deferred-delete variant is not required — but it
-        // is unconditionally legal, and using it keeps a single deref path.
-        for e in self.fence_events.drain(..) {
-            FENCE_EVENT_TEARDOWN_DROPS.fetch_add(1, Ordering::Relaxed);
-            // SAFETY: the entry owns an object reference taken at registration.
-            unsafe { ObDereferenceObjectDeferDelete(e.event.as_ptr() as PVOID) };
-        }
-
         // The reset above quiesced the device before the in-flight/parked entry
         // buffers free with this struct.
         //

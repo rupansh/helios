@@ -187,124 +187,20 @@ pub(crate) fn fail_ordered_engine_submission(
 /// The bind application lives HERE rather than in `drain_used` because of the
 /// lock order — see the comment on it below.
 pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
-    let _ = adapter.with_virtio(|v| v.drain_used(adapter));
+    let _ = adapter.with_virtio(|transport| transport.drain_used(adapter));
     crate::ddi::native_render::drain_host_terminals(adapter);
 
-    // A producer completion may have made the one deferred fast bind safe.
-    // Promotion and sequence minting share this virtio-lock hold, so the host
-    // sees `SET_SCANOUT_BLOB` only after the exact carried boundary retired and
-    // its bookkeeping sequence still equals control-FIFO order.
-    let deferred_fast_bind = adapter.with_virtio(|v| v.service_deferred_scanout_bind(adapter));
-    match deferred_fast_bind {
-        Ok(Some(crate::virtio::FastBindDispatch::Queued)) => {
-            crate::ddi::scanout_trace::note_fast_bind_enqueued()
-        }
-        Ok(Some(crate::virtio::FastBindDispatch::Busy)) => {
-            crate::ddi::scanout_trace::note_fast_bind_busy()
-        }
-        Ok(Some(crate::virtio::FastBindDispatch::Failed)) => {
-            crate::ddi::scanout_trace::note_fast_bind_error()
-        }
-        Ok(Some(crate::virtio::FastBindDispatch::Deferred))
-        | Ok(Some(crate::virtio::FastBindDispatch::Handled))
-        | Ok(Some(crate::virtio::FastBindDispatch::Superseded))
-        | Ok(None)
-        | Err(_) => {}
-    }
-
-    // Consume + release + wake under the producing transport lock, so removal
-    // cannot turn an old-generation effect into a successor wake.
-    let _ = adapter.with_virtio(|v| v.take_fast_failure_wake_and_release(adapter));
-
-    // The synchronous VidPN worker uses the identical producer boundary.  Its
-    // handle remains in the existing pending slot; waking it only after this
-    // exact boundary retires prevents `set_scanout_blob` from racing Venus.
-    let _ = adapter.with_virtio(|v| v.wake_ready_worker_scanout_bind(adapter));
-
-    // ── The DISPATCH fast bind's application (ROADMAP defect 0ab-C, D1(ii)) ──
-    //
-    // Apply only under notify → virtio ordering. Keeping take, validation,
-    // publication, cancellation and worker release inside that exact transport
-    // lock prevents StopDevice from removing/resetting the generation between
-    // handoff and effects.
     adapter.with_wddm_notify_lock(|guard| {
-        // `drain_used` runs under only `virtio_lock`, so a rejected tagged
-        // submit can only invalidate its stream there.  Discharge the stale
-        // scheduler/scanout waits here, under the required notify→virtio order;
-        // they remain gated on their ordinary wire watermark rather than being
-        // mistaken for a successful stream retirement.
-        let _ = guard.with_virtio(|order, v| v.discharge_dead_present_stream_waits(order));
-
-        // Apply the accepted bind and arm its flush edge as ONE notify-ordered
-        // transition.  In particular, `active_scanout_resource` is not exposed
-        // to PRESENT classification until its carried boundary is in the
-        // refresh state.  Otherwise a same-resource re-present could insert W2
-        // after seeing the active identity, then this older bind insert W1;
-        // `RefreshState::note(W1, ready)` correctly treats a ready *newer*
-        // marker as a replacement and would incorrectly clear W2.  The notify
-        // lock supplies the required W1-before-W2 order.
-        //
-        // This block is atomics plus `KeSetEvent(Wait = FALSE)` only: it remains
-        // DISPATCH-safe and takes no transport lock until `arm_bind_refresh`
-        // reaches its witnessed notify -> virtio critical section below.
-        //
-        // The bind edge uses the boundary the FLIP carried (D1(i)) rather than a
-        // sample taken now — the whole point of the 22.22.217.0 ordering,
-        // preserved by carrying the mark through the in-flight entry. The
-        // notification scope performs both the decision and pending-identity
-        // publication, so a later PRESENT cannot replace this bind edge after it
-        // has selected its exact resource.
-        //
-        // No liveness re-check here on purpose: the flush executor re-validates
-        // (`resource_is_live` + the `RfUnb` arm) before it issues any read, so a
-        // resource that died between the bind and now self-heals exactly as
-        // today's stale states do — and host-side FIFO means our bind always
-        // precedes any unref of the same resource.
-        adapter.apply_completed_bind_locked(guard);
-
-        // Carries the armed resource through: the refresh must flush the frame
-        // its marker belonged to, not whatever is bound when the worker runs.
-        let refresh_ready = guard
-            .with_virtio(|o, v| v.take_ready_scanout_refresh(o))
-            .ok()
-            .flatten();
-        if let Some(marker) = refresh_ready {
-            crate::ddi::scanout_timeline::note(
-                crate::ddi::scanout_timeline::kind::REFRESH_PROMOTE,
-                crate::ddi::scanout_timeline::flag::READY,
-                adapter.scanout_bound_epoch.load(Ordering::Acquire),
-                marker.boundary(),
-                0,
-                marker.resource_id(),
-                0,
-            );
-            adapter.request_scanout_refresh_for_locked(guard, marker.resource_id());
-        }
-
         // One compatibility Venus entry at a time. Its direct K9 ticket was
-        // admitted in SubmitCommand order; readiness marks that ticket only.
-        // The frontier may retain it behind an earlier context and a failed
-        // notification leaves both owners intact for a later DPC.
+        // admitted in SubmitCommand order; readiness marks that exact ticket.
         loop {
-            // No lease watermark is read here any more. Until 22.22.217.0 a
-            // submission also waited for the host to READ the buffer it
-            // published, and a blocked head ran a liveness pump that asked the
-            // display worker for that read. Both are gone: the withholding was
-            // measured inert against the black frames (the 2×2 factorial), and
-            // the pump was itself a black-frame producer — a flush issued to
-            // satisfy a lease republishes whatever is bound NOW, which is an
-            // older buffer the app may already have reclaimed (measured: the
-            // 1–3 ms bucket 0.6 % → 5.0 %, duplicate-content reads 3.5 % → 9.1 %
-            // on 22.22.215.0). The ordering the frames actually need is the
-            // ownership gate on the flush executor, not a completion policy.
             let taken = guard
-                .with_virtio(|o, v| v.take_one_ready_wddm(o))
+                .with_virtio(|order, transport| transport.take_one_ready_wddm(order))
                 .unwrap_or(crate::virtio::WddmTake::Empty);
             let ready = match taken {
                 crate::virtio::WddmTake::Ready(ready) => ready,
-                crate::virtio::WddmTake::Empty | crate::virtio::WddmTake::BlockedOnProducer => {
-                    break;
-                }
+                crate::virtio::WddmTake::Empty
+                | crate::virtio::WddmTake::BlockedOnProducer => break,
             };
             let ticket = ready.engine_ticket();
             let disposition = guard.mark_ordered_engine_host_completed(ticket);
@@ -317,52 +213,28 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
                 let _ = drain_ordered_engine_locked(adapter, guard);
             }
             if mark_owned && !guard.ordered_engine_ticket_is_live(ticket) {
-                // The notification succeeded in this drain (or an earlier
-                // drain retired it before this separate FIFO owner was popped).
-                let terminal_prefix = ready.terminal_prefix();
                 ready.delivered();
-                if let Some(prefix) = terminal_prefix {
-                    // Consume the complete same-stream WindowedBlt prefix
-                    // only after dxgkrnl accepted the DMA completion. A
-                    // callback failure requeues the WDDM entry without
-                    // having to reconstruct terminal membership.
-                    let _ = guard.with_virtio(|_o, v| {
-                        v.consume_windowed_blt_terminal_prefix(prefix)
-                    });
-                }
                 continue;
             }
-
             if matches!(disposition, CompletionDisposition::StaleTicket)
                 && guard.ordered_engine_ticket_was_retired(ticket)
             {
-                // A direct completion source drained this scheduler entry and
-                // queued the DPC before the compatibility FIFO discharged its
-                // separate WindowedBlt ownership token.
-                let terminal_prefix = ready.terminal_prefix();
                 ready.delivered();
-                if let Some(prefix) = terminal_prefix {
-                    let _ = guard.with_virtio(|_o, v| {
-                        v.consume_windowed_blt_terminal_prefix(prefix)
-                    });
-                }
                 continue;
             }
 
-            // Early, failed, poisoned, or stale-reset entry: no DMA completion
-            // was delivered for this token. Put the exact owner back and stop;
-            // bypassing it would violate both FIFO and engine order.
-            let _ = guard.with_virtio(|o, v| v.requeue_wddm_front(o, ready));
+            // Preserve the exact FIFO owner when the K9 frontier cannot yet
+            // consume it. Bypassing this entry would violate engine order.
+            let _ = guard.with_virtio(|order, transport| {
+                transport.requeue_wddm_front(order, ready)
+            });
             break;
         }
 
-        // Also retries an already-terminal direct ticket whose prior DIRQL
-        // notification failed; no fresh used-ring edge is required.
         let _ = drain_ordered_engine_locked(adapter, guard);
         service_native_fence_rescans(adapter, guard);
     });
 }
-
 /// `DxgkDdiInterruptRoutine` — runs at the device's DIRQL; returns TRUE if the
 /// interrupt was ours.
 //

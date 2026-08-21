@@ -54,19 +54,18 @@
 use alloc::vec::Vec;
 use core::cell::Cell;
 use core::mem::size_of;
-use core::ptr::NonNull;
 use core::sync::atomic::AtomicU32;
 
 use bytemuck::{bytes_of, cast_slice, Zeroable};
 use wdk_sys::ntddk::{IoFreeMdl, KeDelayExecutionThread, KeWaitForSingleObject, MmUnlockPages};
-use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
+use wdk_sys::{LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::control_owner::ResourceBackingFinalizer;
 use super::gpu::{
     BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner, FenceWaitPrep,
     OwnerFilter, SyncOutcome, SyncTicket, SyncWaitBlock, WaitBlockRef, WaitDisposition,
-    CTRL_TEARDOWN_ABANDONS, CTRL_TIMEOUT_COUNT, ESCAPE_SUBMIT_COUNT, ESCAPE_SUBMIT_RING_COUNT,
-    FENCE_WAIT_TABLE_FULL, FENCE_WAIT_TIMEOUTS, SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
+    CTRL_TEARDOWN_ABANDONS, CTRL_TIMEOUT_COUNT, FENCE_WAIT_TABLE_FULL, FENCE_WAIT_TIMEOUTS,
+    SUBMIT_META_BYTES, TRANSPORT_GONE_AT_WAIT,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
@@ -82,12 +81,11 @@ use helios_kmd_logic::control_ownership::{
 };
 use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
-    VirtioGpuGetCapsetInfo, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush,
-    VirtioGpuMemEntry, VirtioGpuResourceMapBlob, VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref,
-    VirtioGpuRespCapsetInfo, VirtioGpuRespMapInfo, VirtioGpuSetScanoutBlob,
-    VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY,
-    VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE, VIRTIO_GPU_CMD_GET_CAPSET_INFO,
-    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_FLUSH,
+    VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuMemEntry, VirtioGpuResourceMapBlob,
+    VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref,
+    VirtioGpuRespMapInfo, VirtioGpuSetScanoutBlob, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
+    VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY,
+    VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE, VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB,
     VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
     VIRTIO_GPU_CMD_RESOURCE_UNREF, VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_FLAG_FENCE,
     VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
@@ -98,6 +96,8 @@ use helios_protocol::{
 const KERNEL_MODE: i8 = 0;
 /// `Executive` (`KWAIT_REASON`).
 const EXECUTIVE: i32 = 0;
+/// Stock Venus GPU-completion ring used by ordinary KMD Present BLTs.
+const GPU_COMPLETION_RING_IDX: u32 = 1;
 
 static CTRL_WAIT_PENDING: AtomicU32 = AtomicU32::new(0);
 static CTRL_WAIT_FENCE_COMPLETED: AtomicU32 = AtomicU32::new(0);
@@ -433,23 +433,6 @@ struct BindMint<'a> {
     /// `virtio_lock` hold can drain a completion. It may perform bounded plane
     /// state transitions only; no allocation, wait, cleanup, or ETW write.
     publish: Option<&'a dyn Fn(FencedScanoutPublish)>,
-    /// The full presentation identity carried by a direct synchronous SET. It
-    /// survives waiter abandonment in the in-flight tag so a late success can
-    /// be applied and arm this request's exact flush from the DPC.
-    request: Option<crate::virtio::ScanoutBindRequest>,
-    timeline: Option<ScanoutSetTimeline>,
-}
-
-/// Caller-owned context for the synchronous `SET_SCANOUT_BLOB` timeline.
-/// The wire sequence is still minted by `VirtioGpu::enqueue_sync` under
-/// `virtio_lock`; this values-only context lets that exact publish and the
-/// PASSIVE caller's eventual return retain the originating epoch/watermark.
-#[derive(Clone, Copy)]
-pub(crate) struct ScanoutSetTimeline {
-    pub request: crate::virtio::ScanoutBindRequest,
-    pub present_epoch: u64,
-    pub carried_watermark: u64,
-    pub flags: u32,
 }
 
 pub(crate) struct ScanoutBindIdentity {
@@ -475,20 +458,6 @@ impl ScanoutBindIdentity {
     pub(crate) const fn resource_id(&self) -> u32 {
         self.resource_id
     }
-}
-
-/// Terminal classification for one synchronous persistent scanout SET.
-///
-/// Only `Accepted` carries the move-only producing-transport identity needed
-/// for guest bookkeeping. `Ambiguous` deliberately carries no retry authority:
-/// the exact request remains owned by the producing transport until a later
-/// FIFO SET resolves it or that transport is physically reset.
-#[must_use]
-pub(crate) enum ScanoutSetOutcome {
-    Accepted(ScanoutBindIdentity),
-    Rejected,
-    DefiniteNotEnqueued { error: VirtioError, instance: u64 },
-    Ambiguous,
 }
 
 /// Terminal classification for the D2 fenced SET path.
@@ -627,7 +596,7 @@ fn ctrl_roundtrip_observed(
                         in1_len,
                         resp_len,
                         block.as_ptr(),
-                        bind.map(|bind| (bind.resource_id, bind.request, bind.fenced)),
+                        bind.map(|bind| (bind.resource_id, bind.fenced)),
                         adapter,
                     )
                 };
@@ -649,17 +618,6 @@ fn ctrl_roundtrip_observed(
                                     fence_id,
                                     resource_id: bind.resource_id,
                                 });
-                            }
-                            if let Some(timeline) = bind.timeline {
-                                crate::ddi::scanout_timeline::note(
-                                    crate::ddi::scanout_timeline::kind::SYNC_SET_PUBLISH,
-                                    timeline.flags | crate::ddi::scanout_timeline::flag::SUCCESS,
-                                    timeline.present_epoch,
-                                    timeline.carried_watermark,
-                                    seq,
-                                    bind.resource_id,
-                                    0,
-                                );
                             }
                         }
                         Ok(ticket)
@@ -949,38 +907,6 @@ fn ctrl_roundtrip_ok_mode(
     }
 }
 
-/// Wait until every control descriptor published before this call has reached a
-/// terminal host response, without changing device state.
-///
-/// GET_CAPSET_INFO is a pure query. Its response type is deliberately not
-/// validated here: even an error for capset index 0 proves the command reached
-/// the head of the FIFO, which is the only property lifecycle callers need.
-/// Transport enqueue/wait failure still returns `Err`, because then no ordering
-/// proof exists. The small fixed request/response keep this barrier off the
-/// already-constrained display-init stack.
-#[inline(never)]
-pub(crate) fn ctrl_fifo_barrier_for_instance(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    expected_instance: u64,
-) -> Result<(), VirtioError> {
-    let mut cmd = VirtioGpuGetCapsetInfo::zeroed();
-    cmd.hdr.type_ = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
-    cmd.capset_index = 0;
-    let mut response = [0u8; size_of::<VirtioGpuRespCapsetInfo>()];
-    ctrl_roundtrip(
-        passive,
-        adapter,
-        bytes_of(&cmd),
-        None,
-        &mut response,
-        SYNC_ROUNDTRIP_TIMEOUT_MS,
-        None,
-        Some(expected_instance),
-    )
-    .map(|_| ())
-}
-
 // ── Context lifecycle ────────────────────────────────────────────────────────
 
 /// Create a virtio-gpu 3D context bound to `capset_id` (Venus = 4) and return
@@ -1137,10 +1063,6 @@ fn ctx_destroy_mode(
         let work = adapter
             .control_owner()
             .begin_context_destroy(owner, ctx_id)?;
-        let _ = adapter.with_wddm_notify_lock(|guard| {
-            guard.with_virtio(|order, v| v.purge_present_streams_for_context(order, owner, ctx_id))
-        });
-        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
         let mut cmd = VirtioGpuCtxDestroy::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
         cmd.hdr.ctx_id = ctx_id;
@@ -1166,23 +1088,11 @@ fn ctx_destroy_mode(
         };
     }
     let owned = adapter
-        .with_wddm_notify_lock(|guard| {
-            guard.with_virtio(|order, v| {
-                let owned = v.untrack_owned_context(owner, ctx_id);
-                if let Some(ctx_id) = owned {
-                    let _ = v.purge_present_streams_for_context(order, owner, ctx_id);
-                }
-                owned
-            })
-        })
+        .with_virtio(|v| v.untrack_owned_context(owner, ctx_id))
         .map_err(|_| VirtioError::DeviceError)?;
     let Some(ctx_id) = owned else {
         return Err(VirtioError::NotOwned);
     };
-    // The stream wait was explicitly discharged under the notify lock above.
-    // Wake the normal DPC so a now-ready WDDM head is observed even if no
-    // unrelated virtio completion arrives after CTX_DESTROY's roundtrip.
-    crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
     let mut cmd = VirtioGpuCtxDestroy::zeroed();
     cmd.hdr.type_ = VIRTIO_GPU_CMD_CTX_DESTROY;
     cmd.hdr.ctx_id = ctx_id;
@@ -1218,17 +1128,9 @@ pub fn destroy_contexts_for_owner(
     }
     let mut destroyed = 0u32;
     loop {
-        let taken = adapter.with_wddm_notify_lock(|guard| {
-            guard
-                .with_virtio(|order, v| {
-                    let taken = v.take_context_for_owner(owner);
-                    if let Some(ctx_id) = taken {
-                        let _ = v.purge_present_streams_for_context(order, owner, ctx_id);
-                    }
-                    taken
-                })
-                .unwrap_or(None)
-        });
+        let taken = adapter
+            .with_virtio(|v| v.take_context_for_owner(owner))
+            .unwrap_or(None);
         let Some(ctx_id) = taken else {
             break;
         };
@@ -1237,9 +1139,6 @@ pub fn destroy_contexts_for_owner(
         cmd.hdr.ctx_id = ctx_id;
         let _ = ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None);
         destroyed += 1;
-    }
-    if destroyed != 0 {
-        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
     }
     destroyed
 }
@@ -1404,111 +1303,6 @@ fn ctx_detach_resource_mode(
     ctrl_roundtrip_ok_mode(passive, adapter, bytes_of(&cmd), None, None, mode)
 }
 
-/// Bind a venus blob `resource_id` to scanout 0 (the QEMU gtk/sdl display) via
-/// `SET_SCANOUT_BLOB` — the Phase-7 zero-copy display path (DISPLAY.md §8), now
-/// driven from the WDDM VidPn scanout DDI. The blob must be a dmabuf-exportable
-/// HOST3D resource (the host's venus render-server exports its `dmabuf_fd`, e.g.
-/// via ANV); a non-exportable/wrong-layout resource is rejected host-side and
-/// surfaces here as `VirtioError::DeviceError` — that IS the export-gate signal.
-/// `stride`/`offset` are plane-0 geometry of the LINEAR image. Device-global
-/// (`hdr.ctx_id = 0`). PASSIVE_LEVEL only (control round-trip).
-///
-/// Returns the WIRE-ORDER SEQUENCE this bind was minted with (ROADMAP defect
-/// 0ab-C): the caller's post-response bookkeeping is only allowed to run if no
-/// LATER bind has already applied its own — see
-/// `AdapterContext::adopt_scanout_bind_seq`.
-pub(crate) fn set_scanout_blob(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    resource_id: u32,
-    width: u32,
-    height: u32,
-    format: u32,
-    stride: u32,
-    offset: u32,
-    timeline: Option<ScanoutSetTimeline>,
-    expected_instance: Option<u64>,
-) -> ScanoutSetOutcome {
-    let mut cmd = VirtioGpuSetScanoutBlob::zeroed();
-    fill_set_scanout_blob(&mut cmd, resource_id, width, height, format, stride, offset);
-    let seq = Cell::new(0u64);
-    let instance = Cell::new(0u64);
-    let fence_id = Cell::new(0u64);
-    // `resource_id` rides down to the mint: it is 0 for the scan-out DISABLE the
-    // retire path sends, which is exactly what must land in the wire-resource
-    // word — after a disable nothing is bound, so nothing may be skipped as
-    // already bound.
-    let bind = BindMint {
-        seq_out: &seq,
-        instance_out: &instance,
-        fence_out: &fence_id,
-        resource_id,
-        fenced: false,
-        publish: None,
-        request: timeline.map(|timeline| timeline.request),
-        timeline,
-    };
-    let mut response = [0u8; size_of::<VirtioGpuCtrlHdr>()];
-    let observed = ctrl_roundtrip_observed(
-        passive,
-        adapter,
-        bytes_of(&cmd),
-        None,
-        &mut response,
-        SYNC_ROUNDTRIP_TIMEOUT_MS,
-        Some(bind),
-        expected_instance,
-        CtrlRoundtripMode::LegacyRetry,
-    );
-    let outcome = match observed {
-        CtrlRoundtripOutcome::HostResponseCopied { written_length }
-            if written_length as usize == response.len() =>
-        {
-            let response_type =
-                u32::from_le_bytes([response[0], response[1], response[2], response[3]]);
-            if response_type == helios_protocol::VIRTIO_GPU_RESP_OK_NODATA {
-                debug_assert!(instance.get() != 0 && seq.get() != 0);
-                ScanoutSetOutcome::Accepted(ScanoutBindIdentity {
-                    instance: instance.get(),
-                    sequence: seq.get(),
-                    fence_id: 0,
-                    resource_id,
-                })
-            } else if HostRejection::from_response_type(response_type).is_ok() {
-                ScanoutSetOutcome::Rejected
-            } else {
-                ScanoutSetOutcome::Ambiguous
-            }
-        }
-        CtrlRoundtripOutcome::HostResponseCopied { .. } | CtrlRoundtripOutcome::Ambiguous(_) => {
-            ScanoutSetOutcome::Ambiguous
-        }
-        CtrlRoundtripOutcome::DefiniteNotEnqueued(error) => {
-            ScanoutSetOutcome::DefiniteNotEnqueued {
-                error,
-                instance: instance.get(),
-            }
-        }
-    };
-    if let Some(timeline) = timeline {
-        crate::ddi::scanout_timeline::note(
-            crate::ddi::scanout_timeline::kind::SYNC_SET_RETURN,
-            timeline.flags
-                | if matches!(&outcome, ScanoutSetOutcome::Accepted(_)) {
-                    crate::ddi::scanout_timeline::flag::SUCCESS
-                } else {
-                    0
-                },
-            timeline.present_epoch,
-            timeline.carried_watermark,
-            seq.get(),
-            resource_id,
-            0,
-        );
-    }
-    outcome
-}
-
 static FENCED_SCANOUT_RESPONSE_REFUSALS: AtomicU32 = AtomicU32::new(0);
 
 fn record_fenced_scanout_response_refusal(code: u32) {
@@ -1556,8 +1350,6 @@ pub(crate) fn set_scanout_blob_fenced(
         resource_id,
         fenced: true,
         publish: Some(on_publish),
-        request: None,
-        timeline: None,
     };
     let mut response = [0u8; size_of::<VirtioGpuCtrlHdr>()];
     let observed = ctrl_roundtrip_observed(
@@ -1670,68 +1462,6 @@ pub(crate) fn fill_set_scanout_blob(
     cmd.padding = 0;
     cmd.strides = [stride, 0, 0, 0];
     cmd.offsets = [offset, 0, 0, 0];
-}
-
-/// Queue a RESOURCE_FLUSH without synchronously waiting for its ctrl response.
-/// The used-ring drain validates the response, clears `completion`, and wakes
-/// `wake_event`.  This is intentionally limited to scanout refresh: unlike
-/// lifecycle commands, the caller does not need response data before it can
-/// continue, and blocking here previously imposed the observed ~0.41 s/frame
-/// cadence when ctrl interrupts were delayed.
-///
-/// `scanout_flush` is the presentation-ownership token (ROADMAP defect 0ab-B):
-/// the epoch this command's host read covers. It is CONSUMED by the used-ring
-/// drain. On every error return below the command never reaches the ring, so no
-/// host read exists for that epoch — the caller
-/// (`queue_active_scanout_refresh_locked`) ends the lease explicitly, which is
-/// why the token being dropped here is correct rather than a leak.
-pub fn resource_flush_async(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    resource_id: u32,
-    width: u32,
-    height: u32,
-    completion: NonNull<AtomicU32>,
-    completion_errors: NonNull<AtomicU32>,
-    wake_event: NonNull<KEVENT>,
-    scanout_flush: crate::virtio::ScanoutFlushToken,
-) -> Result<(), VirtioError> {
-    let mut cmd = VirtioGpuResourceFlush::zeroed();
-    cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
-    cmd.r = VirtioGpuRect {
-        x: 0,
-        y: 0,
-        width,
-        height,
-    };
-    cmd.resource_id = resource_id;
-
-    reap_parked(passive, adapter);
-    let request = bytes_of(&cmd);
-    let response_len = size_of::<VirtioGpuCtrlHdr>();
-    let mut meta =
-        DmaBuffer::new(passive, request.len() + response_len).ok_or(VirtioError::OutOfMemory)?;
-    meta.as_mut_slice()[..request.len()].copy_from_slice(request);
-
-    let queued = adapter.with_virtio(move |v| {
-        v.drain_used(adapter);
-        v.enqueue_async_control(
-            meta,
-            request.len(),
-            response_len,
-            completion,
-            completion_errors,
-            wake_event,
-            None,
-            None,
-            Some(scanout_flush),
-        )
-    });
-    match queued {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err((_meta, e))) => Err(e),
-        Err(_) => Err(VirtioError::DeviceError),
-    }
 }
 
 /// Drop the host's reference to a resource.
@@ -2246,57 +1976,6 @@ pub(crate) fn resource_create_session_reply_blob(
     )
 }
 
-/// `HELIOS_ESCAPE_ALLOC_BLOB` — create a HOST3D blob (create + attach) and
-/// record it in the blob table. Returns the resource id.
-pub fn alloc_blob(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    ctx_id: u32,
-    blob_mem: u32,
-    blob_flags: u32,
-    blob_id: u64,
-    size: u64,
-    owner: Option<DeviceOwner>,
-) -> Result<u32, VirtioError> {
-    if size == 0 {
-        return Err(VirtioError::DeviceError);
-    }
-    if super::control_owner::KMD_D2_OWNER_ENABLED {
-        let mut finalize = retain_resource_finalizer;
-        return resource_create_blob_owned(
-            passive,
-            adapter,
-            ctx_id,
-            blob_mem,
-            blob_flags,
-            blob_id,
-            size,
-            &[],
-            owner,
-            ResourceBackingFinalizer::none(),
-            &mut finalize,
-        );
-    }
-    let reserved = adapter
-        .with_virtio(|v| v.reserve_blob_slot())
-        .map_err(|_| VirtioError::DeviceError)?;
-    if !reserved {
-        return Err(VirtioError::OutOfMemory);
-    }
-    match resource_create_blob(
-        passive, adapter, ctx_id, blob_mem, blob_flags, blob_id, size,
-    ) {
-        Ok(resource_id) => {
-            let _ = adapter.with_virtio(|v| v.commit_blob(owner, ctx_id, resource_id, size));
-            Ok(resource_id)
-        }
-        Err(e) => {
-            let _ = adapter.with_virtio(|v| v.cancel_blob_reservation());
-            Err(e)
-        }
-    }
-}
-
 fn resource_map_blob_owner_work(
     passive: PassiveLevel,
     adapter: &AdapterContext,
@@ -2682,19 +2361,10 @@ fn release_owner_resource(
     }
     let terminal = adapter.with_scanout_lifecycle(passive, |lock| -> Result<(), VirtioError> {
         lock.with_venus_client(|client| {
-            let _ =
-                adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, resource_id));
             client.release_present_blits_for_resource(adapter, resource_id)
         })
         .map_err(|_| VirtioError::DeviceError)??;
-        if adapter
-            .with_virtio(|v| v.finish_windowed_blt_teardown_for_resource(adapter, resource_id))
-            .unwrap_or(false)
-        {
-            Ok(())
-        } else {
-            Err(VirtioError::DeviceError)
-        }
+        Ok(())
     });
     terminal?;
     if adapter
@@ -2706,84 +2376,7 @@ fn release_owner_resource(
     }
     ctx_detach_resource(passive, adapter, ctx_id, resource_id)?;
     resource_unref(passive, adapter, resource_id)?;
-    adapter.with_scanout_lifecycle(passive, |_lock| {
-        adapter.read_ledger.note_alloc_retired(resource_id);
-    });
     Ok(())
-}
-
-/// `HELIOS_ESCAPE_RELEASE_BLOB` — unmap (if mapped) + detach + unref a blob and
-/// drop its tracking slot, returning its window range to the free list.
-pub fn release_blob_for_owner(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    owner: DeviceOwner,
-    ctx_id: u32,
-    resource_id: u32,
-) -> Result<(), VirtioError> {
-    if super::control_owner::KMD_D2_OWNER_ENABLED {
-        if !adapter
-            .control_owner()
-            .resource_owned_by(Some(owner), ctx_id, resource_id)
-        {
-            return Ok(());
-        }
-        return release_owner_resource(passive, adapter, ctx_id, resource_id);
-    }
-    let taken = adapter
-        .with_virtio(|v| v.take_blob_matching(owner, ctx_id, resource_id))
-        .map_err(|_| VirtioError::DeviceError)?;
-    let Some((res, mapped, map_offset, map_len)) = taken else {
-        return Ok(());
-    };
-    // A snapshot/DWM resource cannot detach while a deferred WindowedBlt
-    // still owns its reader lease or reusable Venus command. Cancellation is
-    // exact by resource id; cache release runs before detach/unref.
-    let terminal = adapter.with_scanout_lifecycle(passive, |lock| -> Result<(), VirtioError> {
-        lock.with_venus_client(|client| {
-            let _ = adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
-            client.release_present_blits_for_resource(adapter, res)
-        })
-        .map_err(|_| VirtioError::DeviceError)??;
-
-        // Hold the lifecycle gate until the exact reader terminal has
-        // been established.  The Venus guard is released above, before
-        // this virtio-only finalization, preserving lock order.
-        if adapter
-            .with_virtio(|v| v.finish_windowed_blt_teardown_for_resource(adapter, res))
-            .unwrap_or(false)
-        {
-            Ok(())
-        } else {
-            Err(VirtioError::DeviceError)
-        }
-    });
-    terminal?;
-    if mapped {
-        let _ = resource_unmap_blob(passive, adapter, res);
-        let _ = adapter.with_virtio(|v| v.free_window_range_pub(map_offset, map_len));
-    }
-    let first_teardown = adapter
-        .with_virtio(|v| v.take_live_resource(res))
-        .unwrap_or(false);
-    let result = if first_teardown {
-        let _ = ctx_detach_resource(passive, adapter, ctx_id, res);
-        resource_unref(passive, adapter, res)
-    } else {
-        Ok(())
-    };
-    // D4b: reclaim this resid's D4a read-ledger slot. Snapshot resids never
-    // pass through `retire_scanout_allocation` (they have no WDDM allocation),
-    // so without this the 8-slot ledger leaks one slot per snapshot-ring
-    // recreate and `RdOvf` climbs across app restarts. Under the scanout
-    // lifecycle mutex because `ReadLedger::issue`'s claim discipline is
-    // serialized by it (see `note_alloc_retired`'s contract); PASSIVE here, no
-    // other lock held, so the acquisition is legal and unordered against
-    // nothing. A resid with no ledger slot no-ops.
-    adapter.with_scanout_lifecycle(passive, |_lock| {
-        adapter.read_ledger.note_alloc_retired(res);
-    });
-    result
 }
 
 /// Reclaim every blob still owned by `owner` (a destroyed D3D device handle):
@@ -2813,20 +2406,12 @@ pub fn release_blobs_for_owner(
             return reclaimed;
         };
         let terminal = adapter.with_scanout_lifecycle(passive, |lock| {
-            let cache_release = lock.with_venus_client(|client| {
-                let _ = adapter.with_virtio(|v| v.cancel_windowed_blt_for_resource(adapter, res));
-                client.release_present_blits_for_resource(adapter, res)
-            });
-            if !matches!(cache_release, Ok(Ok(()))) {
-                return false;
-            }
-
-            // As in the single-resource path, the worker cannot pass this
-            // point until cancellation, cache drain, and reader terminal are
-            // one lifecycle transaction.
-            adapter
-                .with_virtio(|v| v.finish_windowed_blt_teardown_for_resource(adapter, res))
-                .unwrap_or(false)
+            matches!(
+                lock.with_venus_client(|client| {
+                    client.release_present_blits_for_resource(adapter, res)
+                }),
+                Ok(Ok(()))
+            )
         });
         if !terminal {
             // The blob tracking entry was intentionally taken first. Retaining
@@ -2845,13 +2430,6 @@ pub fn release_blobs_for_owner(
             let _ = ctx_detach_resource(passive, adapter, ctx_id, res);
             let _ = resource_unref(passive, adapter, res);
         }
-        // Same D4b ledger reclaim as `release_blob_for_owner`: this sweep is
-        // how a crashed/exited process's snapshot resids reach the ledger at
-        // all (`RdOvf` must stay 0 across app restarts). Per-resid acquisition
-        // keeps the display worker's lock hold times unchanged during a sweep.
-        adapter.with_scanout_lifecycle(passive, |_lock| {
-            adapter.read_ledger.note_alloc_retired(res);
-        });
         reclaimed += 1;
     }
 }
@@ -2984,188 +2562,14 @@ pub(crate) fn submit_venus_session_sync(
     ctrl_roundtrip_ok_finite(passive, adapter, bytes_of(&cmd), Some(stream))
 }
 
-/// ASYNC venus SUBMIT_3D (the ICD escape path): stage the stream into DMA
-/// buffers, enqueue fenced with a fresh KMD wire fence id, and return that id
-/// at QUEUE time. Completion is observed via [`wait_fence`].
-pub fn submit_venus_async(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    owner: Option<DeviceOwner>,
-    ctx_id: u32,
-    ring_idx: u32,
-    stream: &[u8],
-) -> Result<u64, VirtioError> {
-    submit_venus_async_inner(passive, adapter, owner, ctx_id, ring_idx, stream, None)
-}
-
-/// Tagged async submit for a registered present stream.  `cookie` and `value`
-/// are validated again in the exact transport-lock critical section that adds
-/// the normal wire-fenced command, so CTX_DESTROY cannot race a successful
-/// enqueue.
-pub fn submit_venus_async_present_stream(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    owner: DeviceOwner,
-    ctx_id: u32,
-    ring_idx: u32,
-    cookie: u64,
-    value: u32,
-    stream: &[u8],
-) -> Result<u64, VirtioError> {
-    let result = submit_venus_async_inner(
-        passive,
-        adapter,
-        Some(owner),
-        ctx_id,
-        ring_idx,
-        stream,
-        Some((owner, cookie, value)),
-    );
-
-    if result.is_err() {
-        // The UMD Present marker is deliberately allowed to reach VidSch before
-        // Mesa has queued this tagged batch.  Once this function returns an
-        // error, however, no tag can ever retire that marker.  Revoke the exact
-        // registration and explicitly discharge its scheduler condition while
-        // retaining the ordinary wire/GPU watermark; otherwise an allocation or
-        // queue failure here can leave DMA_COMPLETED waiting forever for a tag
-        // that was never placed on the transport.
-        let _ = adapter.with_wddm_notify_lock(|guard| {
-            guard.with_virtio(|order, v| {
-                // `submit_venus_async_inner` opportunistically drains used
-                // descriptors before enqueue. If that drain consumed a host
-                // rejection, the stream is already dead and unregister returns
-                // false; still run the ordered discharge here so correctness
-                // never depends on receiving the interrupt that prompted the
-                // opportunistic drain in the first place.
-                let _ = v.unregister_present_stream(order, owner, ctx_id, cookie);
-                let _ = v.discharge_dead_present_stream_waits(order);
-            })
-        });
-        // Rare terminal path: request unconditionally. The stream may have
-        // been invalidated by the drain above even when exact unregister could
-        // no longer find it, and a now-ready WDDM head needs a fresh DPC edge.
-        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
-    }
-
-    result
-}
-
-fn submit_venus_async_inner(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    owner: Option<DeviceOwner>,
-    ctx_id: u32,
-    ring_idx: u32,
-    stream: &[u8],
-    present_stream: Option<(DeviceOwner, u64, u32)>,
-) -> Result<u64, VirtioError> {
-    if stream.is_empty() {
-        return Err(VirtioError::DeviceError);
-    }
-    // Ownership is resolved under the device lock, the same lock the enqueue
-    // below takes, so a foreign command stream cannot reach another process's
-    // Venus ring. This costs no extra acquisition on the ~89 us submit path.
-    let owned = adapter
-        .with_virtio(|v| v.resolve_owned_ctx(owner, ctx_id))
-        .map_err(|_| VirtioError::DeviceError)?;
-    let Some(owned) = owned else {
-        return Err(VirtioError::NotOwned);
-    };
-    let ctx_id = owned.id();
-    reap_parked(passive, adapter);
-    let mut meta = adapter
-        .with_virtio(|v| v.take_dma_buffer(SUBMIT_META_BYTES))
-        .ok()
-        .flatten()
-        .or_else(|| DmaBuffer::new(passive, SUBMIT_META_BYTES))
-        .ok_or(VirtioError::OutOfMemory)?;
-    let mut venus = adapter
-        .with_virtio(|v| v.take_dma_buffer(stream.len()))
-        .ok()
-        .flatten()
-        .or_else(|| DmaBuffer::new(passive, stream.len()))
-        .ok_or(VirtioError::OutOfMemory)?;
-    venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
-    let venus_len = stream.len();
-
-    // Both buffers are carried as loop values for the reason given in
-    // `ctrl_roundtrip`: this loop has two of them, so an arm that returns only
-    // one is exactly the maintenance mistake the take-then-expect pair used to
-    // turn into a bugcheck. As loop values it does not compile.
-    let mut budget = Budget::new(ENQUEUE_RETRY_MAX_MS);
-    loop {
-        let res = adapter.with_virtio(move |v| {
-            v.drain_used(adapter);
-            match present_stream {
-                Some((stream_owner, cookie, value)) => v.enqueue_async_submit_present_stream(
-                    stream_owner,
-                    ctx_id,
-                    ring_idx,
-                    cookie,
-                    value,
-                    meta,
-                    venus,
-                    venus_len,
-                ),
-                None => v.enqueue_async_submit(ctx_id, ring_idx, meta, venus, venus_len),
-            }
-        });
-        match res {
-            Err(_) => return Err(VirtioError::DeviceError), // transport gone
-            Ok(Ok(fence_id)) => {
-                // ATTRIBUTION POINT for guest venus traffic (KMD_IMPACT §14a.1
-                // UV3). This function is reachable only from the escape
-                // (`ddi/escape.rs:1233`, `:1242`), so a count here is
-                // GUEST-originated by construction — which the adapter-wide
-                // `RING_SUBMIT_COUNT` is not: three internal producers reach
-                // ring 1 on their own, one of them (`submit_venus_async_present`
-                // below) through the same generic enqueue this path uses.
-                // Counted on the accepted arm only, so it compares directly with
-                // `ASYNC_SUBMIT_COUNT`.
-                //
-                // ⛔ The retired text here named "the two readings that matter" as
-                // *a zero `EscSubRing` with a nonzero `EscSub`, versus a zero
-                // `EscSub`*. **Both of those readings are UNREACHABLE.** This
-                // counter is guest-originated but NOT process-scoped, and DWM's own
-                // DXVK -> Mesa-venus ICD submits through this same escape: every
-                // present signals a win32 external semaphore whose batch carries a
-                // ring index that is always >= 1 (ring 0 is reserved for the CPU
-                // timeline and never handed out). So on any live desktop BOTH
-                // counters are already climbing before a D3D12 client starts, and a
-                // zero in either can only mean the driver never ran.
-                // ⇒ the grading in `virtio/counters.rs` is a **delta against a
-                // control arm** over the same wall-clock window, never an absolute
-                // value and never a zero-test. Read it there.
-                ESCAPE_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
-                if ring_idx != 0 {
-                    ESCAPE_SUBMIT_RING_COUNT.fetch_add(1, Ordering::Relaxed);
-                }
-                return Ok(fence_id);
-            }
-            Ok(Err((m_back, v_back, VirtioError::QueueFull))) => {
-                meta = m_back;
-                venus = v_back;
-                if budget.charge_slice() {
-                    return Err(VirtioError::QueueFull);
-                }
-                reap_parked(passive, adapter);
-                sleep_ms(passive, RETRY_SLICE_MS);
-            }
-            Ok(Err((_m, _v, e))) => return Err(e), // buffers dropped at PASSIVE
-        }
-    }
-}
-
 /// The prologue both per-frame display submitters share: refuse an empty
 /// stream, reap parked buffers, and stage the meta + venus DMA buffers.
 ///
 /// R1004. `submit_venus_async_scanout` and `submit_venus_async_present` were
 /// identical apart from which enqueue entry point they called.
 ///
-/// ⚠ NOTE THE DIVERGENCE THIS MAKES VISIBLE, and does NOT change: unlike
-/// `submit_venus_async` (the escape path), neither display submitter uses the
-/// DMA POOL -- `DmaBuffer::new` allocates contiguous memory PER FRAME on both.
+/// Neither display submitter uses the DMA pool: `DmaBuffer::new` allocates
+/// contiguous memory per frame on both.
 /// Switching them onto `take_dma_buffer` is a perf change with its own gate and
 /// is explicitly out of scope here; what this commit buys is that the policy is
 /// now stated in one place instead of inferred from two.
@@ -3201,35 +2605,6 @@ fn display_submit_outcome(
     }
 }
 
-/// Nonblocking KMD scanout-copy submission. `stream` is the already encoded
-/// Venus vkQueueSubmit command; the outer virtio SUBMIT_3D is fenced on
-/// ring_idx=1, whose used-ring completion represents GPU completion. Only a
-/// successful completion marks scanout dirty and wakes the refresh worker.
-///
-/// Unlike the user escape path above, this per-frame display path never sleeps
-/// for queue backpressure: one enqueue attempt either succeeds or reports
-/// QueueFull to the caller. That keeps SetVidPnSourceAddress out of a hidden
-/// multi-second retry loop.
-pub fn submit_venus_async_scanout(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    ctx_id: u32,
-    stream: &[u8],
-    primary_address: u64,
-    ticket: crate::adapter::ProgrammingTicket,
-) -> Result<u64, VirtioError> {
-    let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
-    // One construction site, on the adapter, so all four pointers necessarily
-    // come from the same adapter; and `enqueue_scanout_submit` is the only way
-    // to attach it, so it necessarily lands on the ring the drain honours.
-    let notify = adapter.scanout_notify(primary_address, ticket);
-
-    display_submit_outcome(adapter.with_virtio(move |v| {
-        v.drain_used(adapter);
-        v.enqueue_scanout_submit(ctx_id, meta, venus, venus_len, notify)
-    }))
-}
-
 /// Nonblocking KMD Present-BLT submission.
 ///
 /// Like the scanout copy path, ring_idx=1 makes used-ring retirement represent
@@ -3251,36 +2626,10 @@ pub fn submit_venus_async_present(
         v.drain_used(adapter);
         v.enqueue_async_submit(
             ctx_id,
-            crate::virtio::gpu::SCANOUT_RING_IDX,
+            GPU_COMPLETION_RING_IDX,
             meta,
             venus,
             venus_len,
-        )
-    }))
-}
-
-/// Nonblocking ring-1 submission for an already admitted WindowedBlt token.
-/// The used-ring entry carries the token back to the DPC so the reader lease
-/// and WDDM completion cannot be released by a different present stream.
-pub fn submit_venus_async_windowed_blt(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    ctx_id: u32,
-    stream: &[u8],
-    token: u64,
-    stream_boundary: u64,
-) -> Result<u64, VirtioError> {
-    let (meta, venus, venus_len) = stage_display_submit(passive, adapter, stream)?;
-    display_submit_outcome(adapter.with_virtio(move |v| {
-        v.drain_used(adapter);
-        v.enqueue_async_submit_windowed_blt(
-            adapter,
-            ctx_id,
-            meta,
-            venus,
-            venus_len,
-            token,
-            stream_boundary,
         )
     }))
 }
