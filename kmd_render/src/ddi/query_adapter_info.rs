@@ -100,6 +100,12 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
 /// `pOutputData` buffer.  Read and validate the complete input before touching
 /// the output; no prefix, alternate size, or zero-generation wildcard is
 /// admitted.
+///
+/// The WDK declares `hKmdProcessHandle` as "maybe NULL".  In particular, this
+/// callback is legal from `OpenAdapter`, before the runtime has created a D3D
+/// device/process object.  This query returns only the already-published
+/// adapter-lifetime identity and creates no process-owned state, so a process
+/// handle is neither required nor consumed here.
 unsafe fn query_umd_private(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     let input = args.pInputData.cast::<HeliosUmdAdapterInfoV1>();
     let output = args.pOutputData.cast::<HeliosUmdAdapterInfoV1>();
@@ -109,7 +115,6 @@ unsafe fn query_umd_private(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTE
         || output.is_null()
         || !input.is_aligned()
         || !output.is_aligned()
-        || args.hKmdProcessHandle.is_null()
     {
         return STATUS_INVALID_PARAMETER;
     }

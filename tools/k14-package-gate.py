@@ -29,6 +29,9 @@ UNINSTALL = "packaging/windows/Uninstall-Helios.ps1"
 RETIREMENT = "tools/retirement-gates.sh"
 INF = "kmd_render/helios_kmd_render.inx"
 CARGO_MAKE = "kmd_render/Cargo.make.toml"
+KMD_QUERY = "kmd_render/src/ddi/query_adapter_info.rs"
+DEV_INSTALL = "tools/install-helios-kmd.ps1"
+HOTPLUG = "tools/hotplug-helios-umd.ps1"
 LAYER_HEADER = "icd/mesa/src/vulkan/helios-present-layer/helios_present_layer.h"
 LAYER_DEF = "icd/mesa/src/vulkan/helios-present-layer/helios_present_layer.def"
 LOWER_DEF = "icd/mesa/src/virtio/vulkan/vn_helios_exports.def"
@@ -60,6 +63,9 @@ PATHS = (
     RETIREMENT,
     INF,
     CARGO_MAKE,
+    KMD_QUERY,
+    DEV_INSTALL,
+    HOTPLUG,
     LAYER_HEADER,
     LAYER_DEF,
     LOWER_DEF,
@@ -92,10 +98,10 @@ def exports(source: str) -> list[str]:
 def check(sources: dict[str, str]) -> list[str]:
     errors: list[str] = []
     version = sources[VERSION]
-    if version.count("HELIOS_KMD_VERSION=") != 1 or "HELIOS_KMD_VERSION=22.22.297.0" not in version:
-        errors.append(f"{VERSION}: KMD version must advance exactly once to 22.22.297.0")
-    if "22.22.296.0" in version:
-        errors.append(f"{VERSION}: prior K11 version remains active")
+    if version.count("HELIOS_KMD_VERSION=") != 1 or "HELIOS_KMD_VERSION=22.22.298.0" not in version:
+        errors.append(f"{VERSION}: repaired generation-4 KMD version must be 22.22.298.0")
+    if "22.22.296.0" in version or "22.22.297.0" in version:
+        errors.append(f"{VERSION}: a pre-repair KMD version remains active")
 
     protocol = sources[PROTOCOL]
     require(
@@ -232,6 +238,65 @@ def check(sources: dict[str, str]) -> list[str]:
         ),
     )
     require(errors, CARGO_MAKE, sources[CARGO_MAKE], ('("umd12", "helios_umd12.dll"',))
+    query = sources[KMD_QUERY]
+    require(
+        errors,
+        KMD_QUERY,
+        query,
+        (
+            'The WDK declares `hKmdProcessHandle` as "maybe NULL"',
+            "args.InputDataSize as usize != size_of::<HeliosUmdAdapterInfoV1>()",
+            "args.OutputDataSize as usize != size_of::<HeliosUmdAdapterInfoV1>()",
+            "request.validate_query(HELIOS_PACKAGE_GENERATION)",
+        ),
+    )
+    private_query = query.split("unsafe fn query_umd_private", 1)[-1].split("/// A dxgkrnl-supplied", 1)[0]
+    if "hKmdProcessHandle.is_null" in private_query:
+        errors.append(f"{KMD_QUERY}: OpenAdapter-private query rejects the WDK's legal null process handle")
+
+    for path in (DEV_INSTALL, HOTPLUG):
+        require(
+            errors,
+            path,
+            sources[path],
+            (
+                '[string]$VulkanDll = "C:\\Users\\Rupansh\\helios-mesa-build\\src\\virtio\\vulkan\\vulkan_virtio.dll"',
+                '"vulkan_virtio.dll"',
+                "UMD lower-ICD companion",
+            ),
+        )
+    require(
+        errors,
+        DEV_INSTALL,
+        sources[DEV_INSTALL],
+        (
+            '[string]$Umd12Dll = "C:\\Users\\Rupansh\\helios-vgpu\\umd12\\target\\release\\helios_umd12.dll"',
+            "function Sync-HeliosPackageUmdCompanion",
+            "Sync-HeliosPackageUmd $Umd12Dll $umd12",
+            "Sync-HeliosPackageUmdCompanion $VulkanDll $PackageDir $inf",
+            "vulkan_virtio.dll = 1,,",
+            "Active UMD companion verified",
+        ),
+    )
+    require_order(
+        errors,
+        DEV_INSTALL,
+        sources[DEV_INSTALL],
+        (
+            "Sync-HeliosPackageUmdCompanion $VulkanDll $PackageDir $inf",
+            "New-HeliosCatalog $PackageDir $cat",
+        ),
+    )
+    require(
+        errors,
+        HOTPLUG,
+        sources[HOTPLUG],
+        (
+            '$programDataVulkanDll = Join-Path $ProgramDataDir "vulkan_virtio.dll"',
+            "Copy-HeliosFileVerified $VulkanDll $programDataVulkanDll",
+            "Active companion hash",
+        ),
+    )
     require(
         errors,
         LAYER_HEADER,
@@ -285,7 +350,7 @@ class Mutation:
 def run_mutations(sources: dict[str, str]) -> None:
     cases = (
         Mutation("roll generation back", PROTOCOL, "HELIOS_PACKAGE_GENERATION_ORDINAL: u32 = 4;", "HELIOS_PACKAGE_GENERATION_ORDINAL: u32 = 3;"),
-        Mutation("reuse K11 driver version", VERSION, "22.22.297.0", "22.22.296.0"),
+        Mutation("reuse pre-repair driver version", VERSION, "22.22.298.0", "22.22.297.0"),
         Mutation("omit packaged UMD12", ASSEMBLE, '"helios_umd.dll", "helios_umd12.dll"', '"helios_umd.dll"'),
         Mutation("omit present-layer manifest", ASSEMBLE, '"VkLayer_HELIOS_present.dll", "VkLayer_HELIOS_present.json"', '"VkLayer_HELIOS_present.dll"'),
         Mutation("accept old manifest schema", COMMON, "$manifest.schemaVersion -ne 2", "$manifest.schemaVersion -ne 1"),
@@ -295,6 +360,10 @@ def run_mutations(sources: dict[str, str]) -> None:
         Mutation("point layer at lower ICD", INSTALL, "$presentLayerJson.layer.library_path = ($presentLayerDllPath", "$presentLayerJson.layer.library_path = ($vulkanDll"),
         Mutation("let translators enter the layer", LAYER_HEADER, "private direct-dispatch entry point and never see this layer", "Vulkan loader and may see this layer"),
         Mutation("drop UMD12 import boundary", DRIVER_BUILD, "$umd12Dll = Join-Path $package", "$unusedUmd12Dll = Join-Path $package"),
+        Mutation("reject legal null OpenAdapter process handle", KMD_QUERY, "|| !output.is_aligned()", "|| !output.is_aligned()\n        || args.hKmdProcessHandle.is_null()"),
+        Mutation("omit DriverStore UMD companion", DEV_INSTALL, "function Sync-HeliosPackageUmdCompanion", "function Skip-HeliosPackageUmdCompanion"),
+        Mutation("mix debug package UMD12", DEV_INSTALL, '[string]$Umd12Dll = "C:\\Users\\Rupansh\\helios-vgpu\\umd12\\target\\release\\helios_umd12.dll"', '[string]$Umd12Dll = "C:\\Users\\Rupansh\\helios-vgpu\\umd12\\target\\debug\\helios_umd12.dll"'),
+        Mutation("omit ProgramData UMD companion", HOTPLUG, "Copy-HeliosFileVerified $VulkanDll $programDataVulkanDll", "Copy-HeliosFileVerified $UmdDll $programDataVulkanDll"),
         Mutation("delete an unproven mapped legacy file", INSTALL, "Assert-HeliosAdministrator", 'Remove-Item "C:\\ProgramData\\Helios\\helios_present_sync_v2.bin"\nAssert-HeliosAdministrator'),
     )
     for case in cases:
@@ -319,7 +388,7 @@ def main() -> None:
     if errors:
         raise SystemExit("K14 package gate violated:\n" + "\n".join(errors))
     run_mutations(sources)
-    print("OK: generation 4 / KMD 22.22.297.0 is one complete lower/layer package source")
+    print("OK: repaired generation 4 / KMD 22.22.298.0 preserves OpenAdapter and UMD companion admission")
 
 
 if __name__ == "__main__":

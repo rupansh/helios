@@ -16,6 +16,9 @@ param(
   # DXGI_ERROR_UNSUPPORTED, so registering it is inert -- but it is still a
   # change to what dwm resolves, so it must be asked for.
   [string]$Umd12Dll = "",
+  # Both UMDs import the lower ICD by this unversioned module name. Keep the
+  # exact matching build beside the content-addressed UMDs in ProgramData.
+  [string]$VulkanDll = "C:\Users\Rupansh\helios-mesa-build\src\virtio\vulkan\vulkan_virtio.dll",
   [ValidateSet("ProgramData", "DriverStore", "PackageUpgrade")]
   [string]$Mode = "ProgramData",
   [string]$PackageDir = "C:\Users\Rupansh\helios-vgpu\kmd_render\target\debug\helios_kmd_render_package",
@@ -57,6 +60,10 @@ $cleared = Clear-HeliosPendingRenames
 if ($cleared -gt 0) { Write-Host "Removed $cleared stale Helios pending rename operation(s)." }
 
 if (-not (Test-Path -LiteralPath $UmdDll -PathType Leaf)) { throw "UMD DLL not found: $UmdDll" }
+$deployVulkan = $Mode -eq "ProgramData"
+if ($deployVulkan -and -not (Test-Path -LiteralPath $VulkanDll -PathType Leaf)) {
+  throw "UMD lower-ICD companion not found: $VulkanDll"
+}
 $deployUmd12 = -not [string]::IsNullOrWhiteSpace($Umd12Dll)
 if ($deployUmd12) {
   if (-not (Test-Path -LiteralPath $Umd12Dll -PathType Leaf)) { throw "D3D12 UMD DLL not found: $Umd12Dll" }
@@ -69,6 +76,7 @@ if ($deployUmd12) {
 $id = Get-HeliosInstanceId $InstanceId
 $srcHash = Get-HeliosFileHash $UmdDll
 $src12Hash = if ($deployUmd12) { Get-HeliosFileHash $Umd12Dll } else { "" }
+$vulkanHash = if ($deployVulkan) { Get-HeliosFileHash $VulkanDll } else { "" }
 $classKey = Get-HeliosClassKey $id
 $activeInf = Get-HeliosActiveInfName $id
 $store = Get-HeliosActiveStoreDir $id $activeInf
@@ -76,6 +84,7 @@ $programDataDll = Join-Path $ProgramDataDir ("helios_umd_{0}.dll" -f $srcHash.Su
 $programData12Dll = if ($deployUmd12) {
   Join-Path $ProgramDataDir ("helios_umd12_{0}.dll" -f $src12Hash.Substring(0, 16).ToLowerInvariant())
 } else { "" }
+$programDataVulkanDll = Join-Path $ProgramDataDir "vulkan_virtio.dll"
 
 Write-HeliosPlan "Helios UMD hotplug" @{
   Mode = $Mode
@@ -83,6 +92,8 @@ Write-HeliosPlan "Helios UMD hotplug" @{
   SourceHash = $srcHash
   Source12 = if ($deployUmd12) { $Umd12Dll } else { "(not deployed)" }
   Source12Hash = if ($deployUmd12) { $src12Hash } else { "(n/a)" }
+  VulkanSource = if ($deployVulkan) { $VulkanDll } else { "(package-owned)" }
+  VulkanSourceHash = if ($deployVulkan) { $vulkanHash } else { "(n/a)" }
   Instance = $id
   ClassKey = $classKey
   ActiveInf = $activeInf
@@ -123,9 +134,16 @@ if ($Mode -eq "PackageUpgrade") {
     Invoke-HeliosPnpUtil @("/disable-device", $id, "/force") 90 | Out-Null
   }
   try {
-    if ($KillUmdUsers) { Stop-UmdUsers $programDataDll }
+    if ($KillUmdUsers) {
+      Stop-UmdUsers $programDataDll
+      Stop-UmdUsers $programDataVulkanDll
+    }
     $copy = Copy-HeliosFileVerified $UmdDll $programDataDll 10 1000
+    $vulkanCopy = Copy-HeliosFileVerified $VulkanDll $programDataVulkanDll 10 1000 -DisplaceInUse
     Grant-HeliosReadExecute $ProgramDataDir
+    $reapedVulkan = Remove-HeliosDisplacedCopies $programDataVulkanDll
+    if ($reapedVulkan -gt 0) { Write-Host "Reaped $reapedVulkan displaced lower-ICD companion copy(ies)." }
+    Write-Host "Installed ProgramData UMD companion: $($vulkanCopy.Destination)"
 
     if ($deployUmd12) {
       $copy12 = Copy-HeliosFileVerified $Umd12Dll $programData12Dll 10 1000
@@ -211,6 +229,15 @@ $activeHash = Get-HeliosFileHash $activeUmd
 Write-Host "Active UMD:  $activeUmd"
 Write-Host "Active hash: $activeHash"
 if ($activeHash -ne $srcHash) { throw "UMD hotplug failed: active hash $activeHash does not match source $srcHash" }
+
+if ($deployVulkan) {
+  $activeVulkanHash = Get-HeliosFileHash $programDataVulkanDll
+  Write-Host "Active UMD companion:  $programDataVulkanDll"
+  Write-Host "Active companion hash: $activeVulkanHash"
+  if ($activeVulkanHash -ne $vulkanHash) {
+    throw "UMD companion hotplug failed: active hash $activeVulkanHash does not match source $vulkanHash"
+  }
+}
 
 if ($deployUmd12) {
   $active12Hash = Get-HeliosFileHash $programData12Dll

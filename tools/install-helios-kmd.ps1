@@ -8,6 +8,14 @@ param(
   # every cadence and wake-latency number a measurement of the wrong binary.
   # Pass -UmdDll ...\target\debug\helios_umd.dll for a deliberate debug deploy.
   [string]$UmdDll = "C:\Users\Rupansh\helios-vgpu\umd\target\release\helios_umd.dll",
+  # Keep the package's slot-3 driver on the same release profile. A bare
+  # development-profile cargo-make build otherwise leaves a debug UMD12 beside
+  # the release UMD11 that Sync-HeliosPackageUmd installs below.
+  [string]$Umd12Dll = "C:\Users\Rupansh\helios-vgpu\umd12\target\release\helios_umd12.dll",
+  # Both package UMDs import this exact lower-ICD module name. The ordinary
+  # Windows DLL search does not follow Vulkan registry values, so the matching
+  # DLL must be staged beside the UMDs in the DriverStore package.
+  [string]$VulkanDll = "C:\Users\Rupansh\helios-mesa-build\src\virtio\vulkan\vulkan_virtio.dll",
   [string]$InstanceId = "",
   [switch]$SkipSign,
   [switch]$BinaryOnly,
@@ -195,6 +203,50 @@ function Sync-HeliosPackageUmd([string]$Source, [string]$Destination) {
   }
 }
 
+function Sync-HeliosPackageUmdCompanion([string]$Source, [string]$PackageDir, [string]$InfPath) {
+  if ($BinaryOnly) { return }
+  if (-not (Test-Path -LiteralPath $Source -PathType Leaf)) {
+    throw "UMD lower-ICD companion not found: $Source"
+  }
+
+  $destination = Join-Path $PackageDir "vulkan_virtio.dll"
+  $srcHash = Get-HeliosFileHash $Source
+  $dstHash = if (Test-Path -LiteralPath $destination -PathType Leaf) { Get-HeliosFileHash $destination } else { "" }
+  if ($srcHash -ne $dstHash) {
+    Copy-Item -LiteralPath $Source -Destination $destination -Force
+  }
+  $newHash = Get-HeliosFileHash $destination
+  if ($newHash -ne $srcHash) {
+    throw "Package UMD companion copy hash mismatch. source=$srcHash package=$newHash"
+  }
+
+  # The base KMD build stays independent of Mesa. At install time, extend the
+  # generated INF before Inf2Cat so SetupAPI copies and catalogs the exact
+  # companion used by this deployment. Both insertions are idempotent.
+  $infText = Get-Content -LiteralPath $InfPath -Raw
+  $sourceEntry = [regex]::new('(?mi)^[ \t]*vulkan_virtio\.dll[ \t]*=[ \t]*1,,[ \t]*\r?$')
+  $copyEntry = [regex]::new('(?mi)^[ \t]*vulkan_virtio\.dll[ \t]*\r?$')
+  if ($sourceEntry.Matches($infText).Count -eq 0) {
+    $anchor = [regex]::new('(?mi)^([ \t]*helios_umd12\.dll[ \t]*=[ \t]*1,,[ \t]*)\r?$')
+    if ($anchor.Matches($infText).Count -ne 1) {
+      throw "Package INF has no unique helios_umd12.dll SourceDisksFiles anchor: $InfPath"
+    }
+    $infText = $anchor.Replace($infText, ('$1' + [Environment]::NewLine + 'vulkan_virtio.dll = 1,,'), 1)
+  }
+  if ($copyEntry.Matches($infText).Count -eq 0) {
+    $anchor = [regex]::new('(?mi)^([ \t]*helios_umd12\.dll[ \t]*)\r?$')
+    if ($anchor.Matches($infText).Count -ne 1) {
+      throw "Package INF has no unique helios_umd12.dll CopyFiles anchor: $InfPath"
+    }
+    $infText = $anchor.Replace($infText, ('$1' + [Environment]::NewLine + 'vulkan_virtio.dll'), 1)
+  }
+  if ($sourceEntry.Matches($infText).Count -ne 1 -or $copyEntry.Matches($infText).Count -ne 1) {
+    throw "Package INF must name the UMD companion exactly once in SourceDisksFiles and CopyFiles: $InfPath"
+  }
+  Set-Content -LiteralPath $InfPath -Value $infText -Encoding Ascii -NoNewline
+  Write-Host "Staged package UMD companion: $destination hash $newHash"
+}
+
 function Restore-HeliosPreviousPackage([string]$InstanceId, [string]$PreviousInf, [string]$CurrentInf) {
   if ($CurrentInf -and $CurrentInf -ne $PreviousInf) {
     Write-Warning "Removing failed Helios package $CurrentInf and returning to $PreviousInf."
@@ -320,21 +372,27 @@ if (-not (Test-Path -LiteralPath $PackageDir -PathType Container)) { throw "Pack
 $inf = Join-Path $PackageDir "helios_kmd_render.inf"
 $sys = Join-Path $PackageDir "helios_kmd_render.sys"
 $umd = Join-Path $PackageDir "helios_umd.dll"
+$umd12 = Join-Path $PackageDir "helios_umd12.dll"
 $cat = Join-Path $PackageDir "helios_kmd_render.cat"
 foreach ($path in @($inf, $sys, $cat)) {
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing package file $path" }
 }
 if ((-not $BinaryOnly -or $IncludeUmd) -and -not (Test-Path -LiteralPath $umd -PathType Leaf)) { throw "Missing package UMD file $umd" }
+if ((-not $BinaryOnly -or $IncludeUmd) -and -not (Test-Path -LiteralPath $umd12 -PathType Leaf)) { throw "Missing package D3D12 UMD file $umd12" }
 
 if ($StageOnly) {
   Write-HeliosPlan "Helios KMD stage-only install" @{
     PackageDir = $PackageDir
     UmdSource = $UmdDll
+    Umd12Source = $Umd12Dll
     UmdProfile = (Split-Path -Leaf (Split-Path -Parent $UmdDll))
+    VulkanSource = $VulkanDll
     StageOnly = [bool]$StageOnly
   }
   if ($PlanOnly) { return }
   Sync-HeliosPackageUmd $UmdDll $umd
+  Sync-HeliosPackageUmd $Umd12Dll $umd12
+  Sync-HeliosPackageUmdCompanion $VulkanDll $PackageDir $inf
   New-HeliosCatalog $PackageDir $cat
   Sign-HeliosPackage $sys $cat
   Publish-HeliosPackageOnly $inf
@@ -346,8 +404,8 @@ $id = Get-HeliosInstanceId $InstanceId
 $hwid = Get-HeliosHardwareId $id
 $activeInf = Get-HeliosActiveInfName $id
 $store = Get-HeliosActiveStoreDir $id $activeInf
-$copyNames = if ($BinaryOnly) { @("helios_kmd_render.sys", "helios_kmd_render.cat") } else { @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_kmd_render.cat", "helios_umd.dll") }
-if ($IncludeUmd) { $copyNames += "helios_umd.dll" }
+$copyNames = if ($BinaryOnly) { @("helios_kmd_render.sys", "helios_kmd_render.cat") } else { @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_kmd_render.cat", "helios_umd.dll", "helios_umd12.dll", "vulkan_virtio.dll") }
+if ($IncludeUmd) { $copyNames += @("helios_umd.dll", "helios_umd12.dll") }
 $copyNames = $copyNames | Select-Object -Unique
 
 Write-HeliosPlan "Helios KMD install" @{
@@ -357,7 +415,9 @@ Write-HeliosPlan "Helios KMD install" @{
   ActiveInf = $activeInf
   DriverStore = $store
   UmdSource = $UmdDll
+  Umd12Source = $Umd12Dll
   UmdProfile = (Split-Path -Leaf (Split-Path -Parent $UmdDll))
+  VulkanSource = $VulkanDll
   BinaryOnly = [bool]$BinaryOnly
   IncludeUmd = [bool]$IncludeUmd
   AllowRebootRequired = [bool]$AllowRebootRequired
@@ -371,6 +431,8 @@ Write-HeliosPlan "Helios KMD install" @{
 if ($PlanOnly) { return }
 
 Sync-HeliosPackageUmd $UmdDll $umd
+Sync-HeliosPackageUmd $Umd12Dll $umd12
+Sync-HeliosPackageUmdCompanion $VulkanDll $PackageDir $inf
 New-HeliosCatalog $PackageDir $cat
 Sign-HeliosPackage $sys $cat
 
@@ -390,6 +452,21 @@ if (-not $BinaryOnly) {
     throw "devcon/pnputil did not bind the staged KMD image. activeInf=$newActiveInf activeSys=$activeSys activeHash=$activeSysHash packageHash=$packageSysHash. Bump DriverVer or remove the stale active package with pnputil; do not continue with a stale DriverStore image."
   }
   Write-Host "Active KMD image verified: $activeSys hash $activeSysHash"
+  $packageVulkan = Join-Path $PackageDir "vulkan_virtio.dll"
+  $activeVulkan = Join-Path $newStore "vulkan_virtio.dll"
+  $packageVulkanHash = Get-HeliosFileHash $packageVulkan
+  $activeVulkanHash = Get-HeliosFileHash $activeVulkan
+  if ($activeVulkanHash -ne $packageVulkanHash) {
+    throw "SetupAPI did not install the matching UMD companion. active=$activeVulkan activeHash=$activeVulkanHash packageHash=$packageVulkanHash"
+  }
+  Write-Host "Active UMD companion verified: $activeVulkan hash $activeVulkanHash"
+  $activeUmd12 = Join-Path $newStore "helios_umd12.dll"
+  $packageUmd12Hash = Get-HeliosFileHash $umd12
+  $activeUmd12Hash = Get-HeliosFileHash $activeUmd12
+  if ($activeUmd12Hash -ne $packageUmd12Hash) {
+    throw "SetupAPI did not install the matching D3D12 UMD. active=$activeUmd12 activeHash=$activeUmd12Hash packageHash=$packageUmd12Hash"
+  }
+  Write-Host "Active D3D12 UMD verified: $activeUmd12 hash $activeUmd12Hash"
   $serviceImageChanged = ($oldImagePath -and $newImagePath -and ([string]$oldImagePath -ne [string]$newImagePath))
   if ($serviceImageChanged -or $update.RestartRequired) {
     Write-Warning "The Helios service image path changed or SetupAPI reported restart required. A reboot is the reliable KMD activation path for this package."
