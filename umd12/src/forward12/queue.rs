@@ -4333,16 +4333,6 @@ pub(crate) struct L2Refusals {
     /// the two arms. A `D3D12 DDI refusals:` line where that does not hold is
     /// reporting something other than what this code does.
     ///
-    /// ⚠⚠ **RE-GRADED BY UP-9, and the re-grading is what KEEPS the arithmetic
-    /// above true.** `submit_wddm_render` used to bump this counter itself, which
-    /// was exact while `pfnExecuteCommandLists` was its only caller. UP-9 made the
-    /// present a second caller, so the bump moved out to the ECL call site and this
-    /// counter's scope **narrowed to ECL submissions alone**. Had it stayed inside,
-    /// every present would have added to it and the invariant would have broken
-    /// silently — the `METHOD.md` instrument-attribution failure, in the one counter
-    /// whose whole value is that it is client-specific. The present arm's
-    /// counterpart is `PresentIdentitySubmitted`.
-    ///
     /// ⚠ **It says the PACKET was accepted; it does not say the fence became
     /// truthful.** What it settles is the plumbing — that dxgkrnl takes
     /// `pfnRenderCb` on a *legacy* D3D12 context and returns success — and, unlike
@@ -4356,8 +4346,7 @@ pub(crate) struct L2Refusals {
     /// unheld packet retires instantly. `knobs12::UMD12_ECL_SUBMIT` has that
     /// correction with its ICD citations, and the module doc repeats it.
     ecl_wddm_submitted: RefusalCounter,
-    // ⚠⚠ THE SIX COUNTERS BELOW ARE SHARED BY BOTH `pfnRenderCb` USERS SINCE UP-9,
-    // and their `Ecl` names are LEGACY. Every one of them is a fact about dxgkrnl's
+    // The counters below describe the ECL submission path. Every one is a fact about dxgkrnl's
     // callback table or about the windows on *this queue's context* — the same
     // context `pfnExecuteCommandLists` and `pfnPresent` both submit on — so a hit
     // means the same thing whichever DDI produced it, and the fix is the same. The
@@ -4658,32 +4647,6 @@ pub(crate) struct L2Refusals {
     /// root signature"* as *"the application passed none"*, which is the exact
     /// conflation `pso::root_signature`'s own doc warns callers to separate.
     command_signature_root_sig_unresolved: RefusalCounter,
-    /// ⛔ Retired append-only telemetry slot. D3D12 Render callbacks in this driver
-    /// carry metadata only and submit `NumAllocations = 0`; the D3D12 runtime owns
-    /// residency and `pfnPresent` returns the source allocation separately. Kept in
-    /// its historical position so refusal-summary ordering does not change.
-    wddm_alloc_list_unavailable: RefusalCounter,
-    /// ⭐ **UP-9's success counter: a present identity record went in.**
-    ///
-    /// ⛔ Its own counter rather than `EclWddmSubmitted`, deliberately — see
-    /// [`submit_wddm_render`]'s doc.
-    ///
-    /// ⛔ **Retired append-only telemetry slot: PERMANENTLY 0 as of the HPS2
-    /// retirement (K4).** It counted present-identity records submitted through
-    /// `pfnRenderCb`, and it was the right-hand side of L8's `PresentEntered`
-    /// arithmetic. `submit_present_identity` is deleted — see the block comment where
-    /// it stood — because its record names a host venus resource id §10.3 forbids any
-    /// UMD supplying. ⚠ The replacement term in that arithmetic is
-    /// `PresentIdentityNoResourceId`; this slot keeps its position because
-    /// `D3D12 DDI refusals:` field order is the evidence contract.
-    present_identity_submitted: RefusalCounter,
-    /// ⛔ **Retired append-only telemetry slot: PERMANENTLY 0**, same reason. It
-    /// counted a present-identity submission on a queue handle that did not resolve.
-    present_submit_no_queue: RefusalCounter,
-    /// ⛔ **Retired append-only telemetry slot: PERMANENTLY 0**, same reason. It
-    /// counted a present-identity submission that found no live device behind its
-    /// queue.
-    present_submit_no_device: RefusalCounter,
     /// A Core-0114 application handle did not name an aligned, complete
     /// `D3D12DDI_RUNTIME_BYPASS_HEADER`. The call was dropped rather than
     /// interpreting runtime storage as a Helios private object. **Expected 0.**
@@ -4764,10 +4727,6 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     command_signature_engine_failed: RefusalCounter::new("CommandSignatureEngineFailed"),
     command_signature_root_sig_unexpected: RefusalCounter::new("CommandSignatureRootSigUnexpected"),
     command_signature_root_sig_unresolved: RefusalCounter::new("CommandSignatureRootSigUnresolved"),
-    wddm_alloc_list_unavailable: RefusalCounter::new("WddmAllocListUnavailable"),
-    present_identity_submitted: RefusalCounter::new("PresentIdentitySubmitted"),
-    present_submit_no_queue: RefusalCounter::new("PresentSubmitNoQueue"),
-    present_submit_no_device: RefusalCounter::new("PresentSubmitNoDevice"),
     runtime_bypass_handle_invalid: RefusalCounter::new("RuntimeBypassHandleInvalid"),
 };
 
@@ -4887,16 +4846,6 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L2_REFUSALS.command_signature_engine_failed,
     &L2_REFUSALS.command_signature_root_sig_unexpected,
     &L2_REFUSALS.command_signature_root_sig_unresolved,
-    // ⛔ APPENDED, UP-9 (the present identity `pfnRenderCb`). One shared-window
-    // refusal and three present-scoped outcomes, at the end for the same reason as
-    // every block above. ⚠ `EclWddmSubmitted` keeps its position and its name, and
-    // only its SCOPE narrowed -- it now counts `pfnExecuteCommandLists` submissions
-    // alone, because `submit_wddm_render` stopped bumping it when UP-9 became its
-    // second caller. Its doc carries the re-grading.
-    &L2_REFUSALS.wddm_alloc_list_unavailable,
-    &L2_REFUSALS.present_identity_submitted,
-    &L2_REFUSALS.present_submit_no_queue,
-    &L2_REFUSALS.present_submit_no_device,
     // APPENDED with Core-0114 runtime-bypass support. Never insert counters
     // above this point: refusal-summary field order is an evidence contract.
     &L2_REFUSALS.runtime_bypass_handle_invalid,

@@ -1,57 +1,10 @@
 //! Validated descriptors for the WDDM allocation path, and the one place this
-//! driver builds an **HWA2 create-input** record.
+//! driver builds an HWA2 create-input record.
 //!
-//! `allocate_wddm_resource` took eight interdependent scalars —
-//! `backing_blob_id`, `backing_blob_size`, `backing_resource_id`,
-//! `venus_alloc_size`, `memory_type_index`, `direct_scanout_primary`,
-//! `scanout_pitch`, `scanout_offset` — expressing three real modes (no backing
-//! / venus-backed non-primary / venus-backed direct scan-out primary), and
-//! re-derived which mode it was in from six independent `!= 0` conjunctions
-//! spread through the body. Four were `u64`/`u32` pairs that would swap
-//! silently, and two of the three call sites passed `0, 0, 0, 0, 0, false, 0, 0`.
-//!
-//! R806 grouped them into the descriptors below. The per-field zero semantics
-//! are preserved exactly, which matters more than it looks:
-//!
-//! - `blob_id` is the ONLY field that gates a mode. A live `blob_id` with
-//!   `blob_size == 0` must still fall back to the computed linear size.
-//! - `resource_id == 0` cannot describe an importable Venus backing. Passing
-//!   the device-memory id onward without a resource to adopt makes the host
-//!   try to export non-exportable memory, so construction rejects it.
-//! - `direct_scanout_primary` stays a separate argument and is deliberately
-//!   NOT folded into `Option<ScanoutGeometry>`: it selects the HWA2
-//!   swizzle/layout class, and dropping it because the geometry happened to be
-//!   absent would be a wire-visible behaviour change.
-//!
-//! # ⛔ What the HPS2 retirement changed here (K4)
-//!
-//! The create-time wire record used to be `HeliosWddmAllocPrivate` (48 B) plus
-//! a `HeliosWddmAllocMeta` geometry trailer (48 B). Both are retired. The one
-//! record a create may now carry is [`HeliosWddmAllocationDescV2`] — HWA2, 168
-//! bytes, `docs/retirement/K4-CONTRACT.md` §1 — and the field partition is
-//! fixed: this UMD writes the header, the geometry, the vocabularies and the
-//! plane records; the KMD assigns `allocation_generation` and owns the
-//! `DIRECT_FLIP_COMPATIBLE` / `D3D12_RUNTIME_PRIMARY` bits. The KMD validates
-//! and echoes the rest, and **refuses the create rather than correcting a
-//! field**, so a wrong value below is a hard create failure, not a fixup.
-//!
-//! ⛔⛔ HWA2 carries **no host resource id, no `blob_id`, no venus context id,
-//! no Vulkan memory-type index and no VidMm tracker** (§10.3: "no host resource
-//! token, resid, PID, process handle, synchronization object, mutable value, or
-//! independently usable identity … no UMD, ICD, batch, or private descriptor
-//! can name or supply one"). [`VenusBacking`] therefore no longer feeds the
-//! wire at all: it survives **only as a classifier**, so a create that needs
-//! the kernel to adopt this process's venus resource can be refused by name
-//! instead of silently producing a WDDM allocation disconnected from the DXVK
-//! image that backs it (the two-memory split, 15th session). The mechanism that
-//! replaces adoption is Mesa lane unit **A3** plus K6: the ICD stops naming
-//! host resources and the KMD patches the resid in from
-//! `HeliosNativeRenderPatch`. Until A3 lands, this path refuses — see
-//! `K4-CONTRACT.md` §5, which is explicit that this is the retirement's
-//! intended intermediate state and not a regression to work around.
-
-use core::num::{NonZeroU32, NonZeroU64};
-
+//! Resource creation allocates the exact WDDM object first. The resulting
+//! package-owned outer allocation token is then associated with DXVK/Mesa
+//! resource creation; no host resource ID, blob identity, or scanout-private
+//! descriptor crosses this allocation seam.
 use helios_protocol::{
     HeliosWddmAllocationDescV2, HeliosWddmPlaneRecordV2, DXGI_FORMAT_UNKNOWN,
     HELIOS_HWA2_BIND_CONSTANT_BUFFER, HELIOS_HWA2_BIND_DEPTH_STENCIL,
@@ -67,87 +20,6 @@ use helios_protocol::{
 };
 
 use super::{note_ddi_refusal, ResourceDimension, DDI_REFUSALS};
-
-/// A venus device-memory allocation this UMD already created.
-///
-/// ⛔ **No longer a wire descriptor.** Before the retirement its three ids were
-/// copied into `HeliosWddmAllocPrivate` so the KMD would *adopt* this process's
-/// venus resource instead of allocating its own. HWA2 cannot express that and
-/// may not be extended to (`K4-CONTRACT.md` §5, §10.3), so the struct's whole
-/// remaining job is to answer one question at the create boundary: **does this
-/// resource need an adopted host backing?** If it does, the create is refused
-/// with a counter naming Mesa unit A3 rather than producing a WDDM allocation
-/// that does not name the memory DXVK actually rendered into.
-///
-/// Its presence is still the mode discriminator: `None` is a plain KMD-backed
-/// allocation, `Some` is venus-backed.
-#[derive(Clone, Copy)]
-pub(crate) struct VenusBacking {
-    /// The venus device-memory id. Non-zero by construction — this is the
-    /// field the three `blob_id != 0` conjunctions used to test independently.
-    pub(crate) blob_id: NonZeroU64,
-    /// Size of the backing allocation. Zero is legal and means "fall back to
-    /// the computed linear size", which is why this is not a `NonZeroU64`.
-    pub(crate) blob_size: u64,
-    /// The existing virtio resource id the KMD used to adopt. A Venus backing
-    /// without one cannot be exported by the host and is therefore invalid.
-    ///
-    /// ⛔ Read for LOGGING and for the A3 refusal message only. It must never
-    /// reach a private-data buffer again.
-    pub(crate) resource_id: NonZeroU32,
-}
-
-impl VenusBacking {
-    /// Build a backing from the raw values `dxvk_resource_memory_info` and
-    /// `get_resource_alloc_identity` produce. Returns `None` when there is no
-    /// importable backing. Both the device-memory id and its already-exportable
-    /// virtio resource id are required.
-    ///
-    /// ⚠ `venus_alloc_size` / `memory_type_index` / `global_vidmm_tracker` are
-    /// no longer parameters. The first two are still read at the call site for
-    /// the windowed-BLT snapshot descriptor (a UMD-internal record that never
-    /// crosses the allocation seam); the third — the `GlobalVidMmTracker`
-    /// system-wide KMT share and cookie — is **gone with no successor**
-    /// (`K4-CONTRACT.md` §6: `wddm_legacy.rs:30`'s "folded into HWA2's own
-    /// tracking-kind fields" is false; there is no tracking kind, no cookie and
-    /// no tracker flag bit in HWA2, and §10.3 forbids reintroducing the
-    /// mechanism under another name).
-    pub(crate) fn new(blob_id: u64, blob_size: u64, resource_id: u32) -> Option<Self> {
-        let resource_id = NonZeroU32::new(resource_id)?;
-        Some(Self {
-            blob_id: NonZeroU64::new(blob_id)?,
-            blob_size,
-            resource_id,
-        })
-    }
-}
-
-/// Where a scan-out primary's pixels actually are.
-///
-/// A zero pitch is unrepresentable, which is the point: it is the operand a
-/// scan-out primary cannot be described without, and a wrong or absent stride
-/// shears the scanned-out image. Both fields now land in HWA2 plane record 0
-/// (`row_pitch` and `offset`).
-#[derive(Clone, Copy)]
-pub(crate) struct ScanoutGeometry {
-    /// Row stride the KMD hands to `SET_SCANOUT_BLOB`.
-    pub(crate) pitch: NonZeroU32,
-    /// Memory-plane-0 offset; the KMD adds it to the blob base.
-    pub(crate) plane_offset: u64,
-}
-
-impl ScanoutGeometry {
-    /// `None` for a zero pitch. Note the arithmetic that produces the pitch is
-    /// deliberately untouched by R806/R822 — `(width * 4 + 255) & !255`, giving
-    /// 7680 for a 1896-wide primary, is what the frozen host reconstruction
-    /// expects.
-    pub(crate) fn new(pitch: u32, plane_offset: u64) -> Option<Self> {
-        Some(Self {
-            pitch: NonZeroU32::new(pitch)?,
-            plane_offset,
-        })
-    }
-}
 
 // ── the D3D11 DDI bit vocabularies, spelled once ────────────────────────────
 //

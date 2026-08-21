@@ -1,83 +1,16 @@
-//! L8 — present.
+//! L8 — ordinary D3D12 present output.
 //!
-//! Owns 3 slots: `pfnGetPresentPrivateDriverDataSize` on the device-core table
-//! and `pfnBlt` / `pfnPresent` on the command-list table.
+//! Owns `pfnGetPresentPrivateDriverDataSize` on the device-core table and
+//! `pfnBlt` / `pfnPresent` on the command-list table. `pfnPresent` names the
+//! exact source allocation and queue context through the standard D3D12 DDI
+//! outputs. It emits no private packet, marker, host resource ID, or present
+//! stream. Exact outer-token propagation remains owned by resource creation and
+//! queue submission, while the separate present layer owns composition.
 //!
-//! ⛔ **Not parallelisable, and it lands after L3a/L3b, not beside them**
-//! (`PARALLEL.md` §8): it used to touch the `HeliosPresentRenderCmd` identity
-//! channel shared with the KMD **and** with the D3D11 driver.
-//!
-//! ⚠⚠ **That channel is RETIRED here, and the reversal is recorded rather than
-//! quietly edited.** `DECISIONS.md` D13 made the record `helios_protocol`'s
-//! (`HeliosPresentRenderCmd`, `HeliosPresentPrivateData`), reused verbatim so the
-//! KMD had one spelling to decode. Its load-bearing field is
-//! `HeliosPresentPrivateData::resource_id` — the back buffer's **host** venus
-//! resource id — and `HELIOS_PRESENT_SYNC_RETIREMENT.md` §10.3 forbids any UMD,
-//! ICD, batch or private descriptor naming or supplying one
-//! (`docs/retirement/K4-CONTRACT.md` §5). ⇒ **this driver builds and submits no
-//! identity record at all**; it counts `PresentIdentityNoResourceId` naming mesa
-//! lane unit **A3**, and the present proceeds. See [`present`] for the severity
-//! argument.
-//!
-//! ⚠ Present private data **never reaches `DxgkDdiPresent` on DMA flips** — it
-//! rides the Render command (64th session, permanent). And ⛔ never reintroduce
-//! a producer-side CPU present gate: owner directive, 2026-07-29
-//! (`ARCHITECTURE.md` §12 rule 13, `DECISIONS.md` §7.9).
-//!
-//! ⚠ There is **no DXGI table** to fill: `D3D12DDI_TABLE_TYPE_DXGI` was never
-//! requested across 20 flip-model presents, and present arrives on the
-//! command-list table (`D12-G5`).
-//!
-//! # ⭐ What `pfnPresent` actually is, and why it needs no KMD work
-//!
-//! `PFND3D12DDI_PRESENT_0051` **outputs** handles. Its primary job is to name the
-//! kernel objects the runtime should then hand `D3DKMTPresent` — the back buffer's
-//! `D3DKMT_HANDLE`, the WDDM context to submit on, and a few scalars — and nothing
-//! here touches the scanout.
-//!
-//! ⚠ **This block has now been right, wrong and right again, and all three states
-//! are recorded.** It first said *"it is not a submission … nothing here builds a
-//! packet"*; UP-9 made that false by adding the identity `pfnRenderCb`; the HPS2
-//! retirement makes it true once more, because the record that submission carried
-//! may no longer be built. ⇒ `pfnPresent` is once again an out-parameter DDI and
-//! nothing else, and the kernel learns no identity for a D3D12 frame until mesa lane
-//! unit A3 lands.
-//!
-//! ⭐ **A windowed DWM-composited present never reaches `DxgkDdiPresent` at all**,
-//! which is measured rather than assumed: `PRESENT_FLAGS_HISTOGRAM`
-//! (`kmd_render/src/ddi/scanout_trace.rs`) is unsampled and non-overflowing, only
-//! `0x1` and `0xC` have ever arrived, and `RedirectedFlip` has zero occurrences in
-//! `kmd_render`. So the windowed path this lane targets needs **no**
-//! `DIRECT_SCANOUT` bit, no host stride agreement and none of the 0ab machinery.
-//! Fullscreen flip is a later, separate piece of work.
-//!
-//! # ⭐ The two seams into `forward12::queue.rs`, and why they are two
-//!
-//! This lane needs two things from the queue and neither of them is a
-//! `&QueueState`:
-//!
-//! 1. [`queue::present_context`] — the WDDM context
-//!    `D3D12DDI_PRESENT_CONTEXTS_0051::hContext` must name, i.e. the one
-//!    `pfnCreateCommandQueue` minted (UP-7).
-//! 2. ⛔ **RETIRED** — [`queue::submit_present_identity`], the `pfnRenderCb`
-//!    submission carrying this frame's `HeliosPresentRenderCmd` (UP-9). That record's
-//!    load-bearing field is a **host** venus resource id, which §10.3 forbids any UMD
-//!    supplying; see the refusal in [`present`] and `PresentIdentityNoResourceId`.
-//!    ⚠ The accessor itself is left standing in `queue.rs` for the present-ticket
-//!    retirement unit to remove together with the record it takes — it is not K4's.
-//!
-//! ⛔ **Both are handle-taking free functions rather than accessors on the
-//! state**, because `QueueState` carries invariants that are `queue.rs`'s to
-//! keep: the window guard spans write → `pfnRenderCb` → re-latch, the three
-//! runtime windows rotate under it, and the submission must happen on the thread
-//! inside the owning DDI. A borrow handed across the module boundary would export
-//! all three. Each accessor's own doc has the argument.
-//!
-//! ⚠ **The order below is load-bearing and it is not the order the fields are
-//! declared in.** The context is resolved first and the out-structs are filled
-//! last — so a refusal at any step leaves the all-zero descriptor written at the
-//! top of [`present`] standing, which is unmistakably *"the driver answered
-//! nothing"* rather than a half-filled answer.
+//! The queue seam is [`queue::present_context`], which returns the context minted
+//! for the runtime-owned queue without exporting `QueueState` lifetime details.
+//! Outputs are zeroed before validation and populated only after every refusal
+//! arm, so no partial descriptor can escape.
 
 use helios_umd_common::refusals::RefusalCounter;
 
@@ -99,23 +32,8 @@ const LOG_BUDGET: usize = 32;
 /// than a placeholder.**
 ///
 /// The runtime asks how many bytes of driver-private data to carry alongside a
-/// present. This driver needs none, and the reason is a measurement this project
-/// paid for twice:
-///
-/// ⛔ **Present private data never reaches `DxgkDdiPresent` on a DMA flip** (64th
-/// session, recorded as PERMANENT in `DECISIONS.md`'s D4b chain). So a private-data
-/// trailer was never the identity channel, and asking the runtime to allocate one
-/// nothing reads would be bytes per frame in exchange for nothing. ⚠ The channel
-/// that *was* used instead — `HeliosPresentRenderCmd` on `pfnRenderCb` — is retired
-/// with the host resource id it carried; see the module doc. Neither answer changes:
-/// this is still 0.
-///
-/// ⚠ `KMD_IMPACT.md` §14a.3 UP-8 describes *"0, with a 72-byte arm behind a knob for
-/// U6's arrival half"* — U6 being the open question of whether the runtime ever
-/// delivers that trailer to the kernel. The knob arm is **not** implemented here:
-/// the knobs live in `knobs12.rs`, which this lane does not own, and a knob whose ON
-/// arm nothing consumes would be a configuration with no stated meaning. The census
-/// counter below is what says how often the runtime asks.
+/// present. This driver produces and consumes no private present data, so the
+/// standard size query always answers zero.
 ///
 /// # Safety
 /// `_p_present` is not dereferenced. Declared `unsafe` because the DDI's PFN typedef
@@ -136,9 +54,8 @@ unsafe extern "C" fn get_present_private_driver_data_size(
 /// `D3D12DDI_PRESENT_0051` (the allocations and the scalars),
 /// `D3D12DDI_PRESENT_CONTEXTS_0051` (the WDDM context) and
 /// `D3D12DDI_PRESENT_HWQUEUES_0051` (hardware queues, which this driver has none of
-/// — `pfnCreateHwQueue` is refused with `HwQRef`). ⚠ Nothing is submitted from here
-/// any more: UP-9's identity `pfnRenderCb` is retired with the record it carried
-/// (module doc), so this DDI is its out-parameters and nothing else.
+/// — `pfnCreateHwQueue` is refused with `HwQRef`). Nothing is submitted here;
+/// this DDI only fills its ordinary outputs.
 ///
 /// The values this driver answers with, each with its reason:
 ///
@@ -146,10 +63,10 @@ unsafe extern "C" fn get_present_private_driver_data_size(
 /// |---|---|---|
 /// | `BroadcastSrcAllocation[0]` | the back buffer's `D3DKMT_HANDLE` | the create-time HWA2 allocation, out of the `identity12` table |
 /// | `BroadcastDstAllocation[0]` | 0 | there is no destination allocation: a windowed present's destination is DWM's, named by the runtime and not by this driver |
-/// | `AddedGpuWork` | `FALSE` | ⛔ nothing is recorded into `hCommandList`. The UP-9 `pfnRenderCb` below is a **kernel** submission already in dxgkrnl's FIFO for the same context, not pending command-list work |
+/// | `AddedGpuWork` | `FALSE` | nothing is recorded into `hCommandList` |
 /// | `BackBufferMultiplicity` | 1 | ⛔ an **output**, not a request: the D3D12 in-struct has no such field, so there is nothing to honour, refuse or count. See the field |
 /// | `SyncIntervalOverrideValid` | `FALSE` | the driver does not override the application's sync interval; `SyncIntervalOverride` is therefore left alone |
-/// | `_CONTEXTS.hContext` | the queue's WDDM context | [`queue::present_context`], the first of the module doc's two seams |
+/// | `_CONTEXTS.hContext` | the queue's WDDM context | [`queue::present_context`] |
 /// | `_CONTEXTS.BroadcastContextCount` | 0 | one adapter, one context; broadcast is a multi-GPU shape |
 /// | `_HWQUEUES.BroadcastQueueCount` | 0 | this driver refuses hardware queues |
 ///
@@ -180,10 +97,7 @@ unsafe extern "C" fn present(
     p_hw_queues: *mut ddi12::D3D12DDI_PRESENT_HWQUEUES_0051,
 ) {
     // ⭐ The DENOMINATOR, counted as the first statement so it counts *entries* and
-    // not successes — the same construction and the same reason as
-    // `FenceSignalEntered`. Without it `PresentIdentitySubmitted` and the four L8
-    // refusals below are a partition with no left-hand side, and a run could not be
-    // checked as arithmetic. ⚠ `bump`, not `note_refusal`: this is a per-frame census
+    // not successes. `bump`, not `note_refusal`: this is a per-frame census
     // rather than a refusal, and R911 forbids an already-loud-or-benign arm emitting
     // the whole ~300-counter summary. `log_refusal_summary` prints the set at adapter
     // close and device teardown, so it is still readable.
@@ -353,65 +267,6 @@ unsafe extern "C" fn present(
         return;
     }
 
-    // ── ⛔ THE FRAME'S IDENTITY CANNOT BE BUILT, and this is the §5 gap ─────
-    //
-    // ⛔⛔ **ORDER IS LOAD-BEARING: this block must stay BELOW every arm that
-    // returns.** It is `PresentEntered`'s terminal term — it fires on exactly the
-    // presents that complete — so it has to be the last thing counted before the
-    // descriptor write, and the `h_allocation == 0` refusal above was moved up
-    // past it for that reason. While it sat above that arm, a
-    // `PresentSourceAllocationZero` event was counted in BOTH terms and
-    // `PresentEntered`'s documented identity over-counted by exactly the number of
-    // hits on the one arm the identity exists to catch. That is the
-    // instrument-attribution failure class this project has already paid for with
-    // `WfBWire`, `RING_SUBMIT_COUNT` and `RENDER_COUNT`: an arithmetic check that
-    // breaks hardest precisely when the thing it watches for happens.
-    //
-    // ⚠ **This block used to submit `HeliosPresentRenderCmd` on the queue's WDDM
-    // context (UP-9) and the reversal is recorded rather than quietly edited.** The
-    // record's load-bearing field is `HeliosPresentPrivateData::resource_id`, the
-    // **host** venus resource id of the back buffer, and its `is_valid()` gates on
-    // `resource_id != 0`. `docs/retirement/K4-CONTRACT.md` §5, from §10.3: *"no host
-    // resource token, resid, PID, process handle, synchronization object, mutable
-    // value, or independently usable identity … no UMD, ICD, batch, or private
-    // descriptor can name or supply one"*. ⇒ this driver may not put one in a private
-    // descriptor and hand it to the kernel, and the identity table no longer holds one
-    // to put there. The record is not built, not zero-filled and not faked.
-    //
-    // ⛔ **The mechanism that replaces it is mesa lane unit A3**, not a different
-    // field: the ICD stops naming host resources at all and the KMD patches the resid
-    // in from `HeliosNativeRenderPatch`. Until A3 lands, the kernel learns no identity
-    // for a D3D12 frame — which is the retirement's intended intermediate state and is
-    // why this is a *counted refusal*, not a fallback.
-    //
-    // ⚠ **Counted, NOT raised, and the present PROCEEDS**, which is the severity this
-    // path already chose for a missing identity — see `PresentIdentityUnavailable`'s
-    // own argument: a windowed D3D12 frame reaches the screen through DWM's own D3D11
-    // composition, which carries its own identity for the primary. This record is the
-    // KMD's per-frame watermark and identity channel, not a precondition for a pixel,
-    // and refusing the whole present over it would turn a lost diagnostic into a black
-    // window. ⛔ It is deliberately not knob-gated (`METHOD.md` §2 Phase 4
-    // consequence 1).
-    note_refusal(&L8_REFUSALS.present_identity_no_resource_id);
-    {
-        let n = L8_REFUSALS.present_identity_no_resource_id.get();
-        if n <= LOG_BUDGET {
-            log_error!(
-                "L8: pfnPresent carries NO identity record -- HWA2 has no host resource id and \
-                 §10.3 forbids this UMD supplying one, so HeliosPresentPrivateData::resource_id \
-                 has no legal source. alloc={:#x} gen={} {}x{} fmt={} on ctx={h_context:p}. The \
-                 kernel will not learn this frame's identity until mesa unit A3 lands (the ICD \
-                 stops naming host resources and the KMD patches the resid in from \
-                 HeliosNativeRenderPatch) (x{n})",
-                identity.h_allocation,
-                identity.allocation_generation,
-                identity.geometry.width,
-                identity.geometry.height,
-                identity.geometry.dxgi_format,
-            );
-        }
-    }
-
     // ── the descriptor ──────────────────────────────────────────────────────
     //
     // ⛔ Written LAST and only once nothing above refused, so that every refusal
@@ -435,14 +290,8 @@ unsafe extern "C" fn present(
             // driver; naming one here would be a claim about a resource this driver
             // does not own.
             //
-            // ⛔ `AddedGpuWork = FALSE`, and the reason is narrower than it looks.
-            // The flag is about GPU work **recorded into `hCommandList`**
-            // (`PRESENT.md` §3.4's *"optionally record GPU work into the given
-            // command list and set `AddedGpuWork`"*), and this body records nothing
-            // into it. ⚠ It does make a kernel submission — the UP-9 `pfnRenderCb`
-            // below — but that packet is already in dxgkrnl's FIFO for this very
-            // context by the time the runtime's own present is issued on it, so
-            // there is nothing left for the runtime to flush. TRUE would ask it to.
+            // `AddedGpuWork = FALSE`: this body records no work into
+            // `hCommandList`.
             out.AddedGpuWork = 0;
             // One back buffer per present. 1 is the value that *means* "no
             // multiplicity" rather than a guess at one.
@@ -589,47 +438,9 @@ struct L8Refusals {
     /// queue always has one. ⇒ a hit is a lifetime finding (a present on a
     /// destroyed queue), not a missing feature.
     present_queue_context_unavailable: RefusalCounter,
-    /// ⭐ **`pfnPresent` entries — the census, not a refusal.** Counted as the
-    /// function's first statement, above the out-struct zero-fill, so it counts
-    /// entries and not outcomes.
-    ///
-    /// ⛔ **It is the left-hand side of this lane's arithmetic**, and nothing else in
-    /// the driver can be: `PresentEntered == PresentIdentityNoResourceId +
-    /// PresentBadArg + PresentNoOutStruct + PresentDstResourceRefused +
-    /// PresentSourceUnresolved + PresentSourceNotAdopted +
-    /// PresentQueueContextUnavailable + PresentSourceAllocationZero`.
-    ///
-    /// ⛔⛔ **What makes that hold is that every term is a path that RETURNS, plus
-    /// exactly one terminal term.** `PresentIdentityNoResourceId` is the terminal
-    /// one — it is counted after the last refusal arm, so it equals the presents
-    /// that complete. It did NOT hold when it was first written: the
-    /// `PresentIdentityNoResourceId` bump sat *above* the `h_allocation == 0` arm,
-    /// so every `PresentSourceAllocationZero` was counted in both terms and the
-    /// right-hand side over-counted by exactly the hits on the arm this identity
-    /// exists to catch. The site now carries a comment forbidding the move back.
-    ///
-    /// ⚠ **`PresentExtraSurfacesIgnored` is deliberately NOT a term** — it does not
-    /// return, so a present that hits it goes on to land in one of the terms above.
-    /// Summing "all of L8's counters" therefore does not reproduce this identity,
-    /// and neither does adding `PresentPrivateDataSizeQueries`, which counts a
-    /// different DDI. ⚠ The four identity-submission slots
-    /// (`PresentIdentitySubmitted` in L2's set, `PresentIdentityRefused`,
-    /// `PresentIdentityUnavailable`, `PresentIdentityInvalid`) are no longer terms
-    /// either: nothing reaches them. Same construction and
-    /// the same reason as `FenceSignalEntered`: a zero here and a zero everywhere else
-    /// is *"the runtime never presented through this driver"*, which is a completely
-    /// different finding from *"every present refused"*, and before this counter the
-    /// two were indistinguishable.
+    /// `pfnPresent` entries, counted before validation. This distinguishes a runtime
+    /// that never calls the DDI from one whose calls all take a refusal arm.
     present_entered: RefusalCounter,
-    /// ⛔ **Retired append-only telemetry slot: PERMANENTLY 0 as of the HPS2
-    /// retirement, and that is what it now means.** It counted a
-    /// `HeliosPresentRenderCmd` that failed its own `is_valid()`. No such record is
-    /// built any more — `resource_id` is a host resource id and §10.3 forbids this
-    /// UMD supplying one — so nothing can reach the check. ⚠ Read
-    /// `PresentIdentityNoResourceId` instead; this slot keeps its position because
-    /// `D3D12 DDI refusals:` field order is the evidence contract and re-numbering it
-    /// would invalidate every cross-build diff.
-    present_identity_invalid: RefusalCounter,
     /// A present resolved to a recorded identity whose `h_allocation` was **0**, so
     /// no allocation list could be built.
     ///
@@ -638,37 +449,6 @@ struct L8Refusals {
     /// because "unreachable by construction" is a claim about another module's
     /// invariant, and this is the site that would observe it breaking.
     present_source_allocation_zero: RefusalCounter,
-    /// ⛔ **Retired append-only telemetry slot: PERMANENTLY 0**, same reason as
-    /// `PresentIdentityInvalid` above. It counted an identity submission that could
-    /// not be built for a *local* reason (no `pfnRenderCb`, no context, no command
-    /// window); no submission is attempted at all now.
-    present_identity_unavailable: RefusalCounter,
-    /// ⛔ **Retired append-only telemetry slot: PERMANENTLY 0**, same reason. It
-    /// counted dxgkrnl refusing a present identity packet this driver had built.
-    present_identity_refused: RefusalCounter,
-    /// ⛔⛔ **The frame's identity record has no legal source, so none was built or
-    /// submitted — and this is the §5 gap, named.**
-    ///
-    /// `HeliosPresentPrivateData::resource_id` is the back buffer's **host** venus
-    /// resource id, and §10.3 forbids any UMD, ICD, batch or private descriptor
-    /// naming or supplying one. HWA2 carries no such field, `identity12` no longer
-    /// holds one, and nothing here fabricates one.
-    ///
-    /// ⛔ **Counted after the LAST arm that returns**, which makes it exactly the
-    /// presents that complete and makes `PresentEntered`'s documented identity an
-    /// equality rather than an over-count. Moving this bump back above the
-    /// `h_allocation == 0` refusal would double-count that arm; the site says so.
-    ///
-    /// ⚠ **Expected to equal `PresentEntered` minus the other refusals, i.e. to fire
-    /// on EVERY present**, until mesa lane unit **A3** lands: the ICD stops naming
-    /// host resources at all and the KMD patches the resid in from
-    /// `HeliosNativeRenderPatch`. That is the retirement's intended intermediate state
-    /// and not a regression — an ICD in this state cannot import, which is recorded
-    /// rather than worked around.
-    ///
-    /// ⛔ The present still PROCEEDS; see the site for why a lost diagnostic must not
-    /// become a black window.
-    present_identity_no_resource_id: RefusalCounter,
 }
 
 static L8_REFUSALS: L8Refusals = L8Refusals {
@@ -681,11 +461,7 @@ static L8_REFUSALS: L8Refusals = L8Refusals {
     present_source_not_adopted: RefusalCounter::new("PresentSourceNotAdopted"),
     present_queue_context_unavailable: RefusalCounter::new("PresentQueueContextUnavailable"),
     present_entered: RefusalCounter::new("PresentEntered"),
-    present_identity_invalid: RefusalCounter::new("PresentIdentityInvalid"),
     present_source_allocation_zero: RefusalCounter::new("PresentSourceAllocationZero"),
-    present_identity_unavailable: RefusalCounter::new("PresentIdentityUnavailable"),
-    present_identity_refused: RefusalCounter::new("PresentIdentityRefused"),
-    present_identity_no_resource_id: RefusalCounter::new("PresentIdentityNoResourceId"),
 };
 
 /// L8's refusal counters, printed by `crate::log_refusal_summary` at this lane's
@@ -711,17 +487,6 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L8_REFUSALS.present_source_unresolved,
     &L8_REFUSALS.present_source_not_adopted,
     &L8_REFUSALS.present_queue_context_unavailable,
-    // ⛔ APPENDED, UP-9 (the identity `pfnRenderCb`). Four, at the END for the reason
-    // the block comment above states: `D3D12 DDI refusals:` lines are diffed across
-    // builds and inserting shifts every counter after the insertion point. ⚠ The
-    // submission's SUCCESS counter is `PresentIdentitySubmitted` and it lives in L2's
-    // set, beside the code that submits -- see `queue::submit_present_identity`.
     &L8_REFUSALS.present_entered,
-    &L8_REFUSALS.present_identity_invalid,
     &L8_REFUSALS.present_source_allocation_zero,
-    &L8_REFUSALS.present_identity_unavailable,
-    &L8_REFUSALS.present_identity_refused,
-    // ⛔ APPENDED, the HPS2 retirement (K4): the §5 host-resource-id gap, naming mesa
-    // unit A3. At the END for the reason above -- field order is the evidence contract.
-    &L8_REFUSALS.present_identity_no_resource_id,
 ];

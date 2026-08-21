@@ -26,18 +26,15 @@ mod present;
 mod queries;
 mod resource;
 mod shaders;
-mod snapshot;
 mod state;
 mod state_objects;
 mod tables;
 mod tiles;
 mod transfer;
-mod vehicle;
 mod views;
 mod wddm2;
 
-pub(super) use crate::bridge::{DstRes, PresentStreamCorrelation, SrcRes};
-pub(super) use alloc::{Hwa2CreateInput, Hwa2InputRefusal, ScanoutGeometry, VenusBacking};
+pub(super) use alloc::{Hwa2CreateInput, Hwa2InputRefusal};
 pub(crate) use bindings::*;
 pub(crate) use deferred::*;
 pub(crate) use format_caps::*;
@@ -48,13 +45,11 @@ pub(crate) use present::*;
 pub(crate) use queries::*;
 pub(crate) use resource::*;
 pub(crate) use shaders::*;
-pub(crate) use snapshot::*;
 pub(crate) use state::*;
 pub(crate) use state_objects::*;
 pub(crate) use tables::*;
 pub(crate) use tiles::*;
 pub(crate) use transfer::*;
-pub(crate) use vehicle::*;
 pub(crate) use views::*;
 pub(crate) use wddm2::*;
 // NOT re-exported: `boxed_slot` is `pub(super)` in `handles` and its
@@ -90,21 +85,10 @@ pub(super) use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE
 // a `wddm_legacy` allocation symbol: `docs/retirement/K4-CONTRACT.md` §1
 // (the two-stage contract), §5 (the `resource_id` gap is NAMED, not bridged)
 // and §6 (the VidMm tracker has no successor).
-//
-// ⚠ The `HeliosPresent*` family below is a DIFFERENT record set (present
-// tickets, §10.5) with its own retirement unit; K4 does not touch it.
 pub(super) use helios_protocol::{
-    HeliosAllocDescRejection, HeliosPresentPrivateData, HeliosPresentRefreshCmd,
-    HeliosPresentRenderCmd, HeliosResourceAssociationV1, HeliosWddmAllocationDescV2,
-    HELIOS_HWA2_BYTES, HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY,
-    HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE, HELIOS_PACKAGE_GENERATION,
-    HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT, HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT,
-    HELIOS_PRESENT_PRIVATE_FLAG_WINDOWED_BLT_SNAPSHOT, HELIOS_PRESENT_PRIVATE_MAGIC,
-    HELIOS_PRESENT_PRIVATE_VERSION, HELIOS_PRESENT_REFRESH_MAGIC, HELIOS_PRESENT_REFRESH_VERSION,
-    HELIOS_PRESENT_RENDER_MAGIC, HELIOS_PRESENT_RENDER_VERSION,
-    HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE, HELIOS_PRESENT_SNAPSHOT_PURPOSE_WINDOWED_BLT,
-    HELIOS_RESOURCE_ASSOCIATION_ABI_VERSION, HELIOS_RESOURCE_ASSOCIATION_BYTES,
-    HELIOS_RESOURCE_ASSOCIATION_STRUCTURE_TYPE,
+    HeliosAllocDescRejection, HeliosResourceAssociationV1, HeliosWddmAllocationDescV2,
+    HELIOS_HWA2_BYTES, HELIOS_PACKAGE_GENERATION, HELIOS_RESOURCE_ASSOCIATION_ABI_VERSION,
+    HELIOS_RESOURCE_ASSOCIATION_BYTES, HELIOS_RESOURCE_ASSOCIATION_STRUCTURE_TYPE,
 };
 
 pub(super) use crate::ddi;
@@ -142,7 +126,6 @@ pub(super) use helios_umd_common::throttle::LogThrottle;
 // `DDI refusals:` per driver.
 use helios_umd_common::refusals::{self, RefusalCounter};
 
-pub(super) static RESOURCE_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(super) static CREATE_RESOURCE_IDENTITY_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(super) static VIEW_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(super) static WDDM_ALLOC_LOG_COUNT: LogThrottle = LogThrottle::new();
@@ -248,64 +231,11 @@ fn dxgi_integer_typed_format(fmt: u32) -> bool {
 pub(super) use crate::hr::{
     DXGI_ERROR_UNSUPPORTED, E_FAIL, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY,
 };
-/// Live `HeliosDevice` private blocks.
-///
-/// `wait_last_present` dereferences a device pointer recorded by an earlier
-/// DDI call, and nothing tied that pointer to the device's lifetime: the
-/// vehicle D3D11 device is per-swapchain and released on the ICD worker thread,
-/// and a SUCCESS-but-not-displayed `Present` status (DXGI_STATUS_OCCLUDED, which
-/// the ICD explicitly handles) means dxgkrnl never calls our present DDI, so the
-/// slot is neither updated nor cleared. The runtime-owned private block dxgkrnl
-/// frees can then be reused by an unrelated device.
-///
-/// This is a runtime-guarded REFUSAL, not a proof: a compile-time lifetime is
-/// not achievable across the `extern "C"` export boundary, and the ICD may
-/// still call on a thread whose device dies between the check and the
-/// dereference. Deliberately NOT a global epoch bumped on any destroy — a
-/// stale-epoch refusal returns -1, which the ICD reads as "no gate" and then
-/// performs no wait at all, reintroducing the 21st-session torn-copy class for
-/// unrelated devices.
-///
-/// The lock is taken once per wait and once per device create/destroy, never on
-/// a per-draw or per-present path.
-fn live_devices() -> &'static std::sync::Mutex<std::collections::HashSet<usize>> {
-    static LIVE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<usize>>> =
-        std::sync::OnceLock::new();
-    LIVE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
-}
-
 /// Lock a mutex, ignoring poison. With `panic = "abort"` in both profiles no
 /// unwind can ever poison a mutex, and a DDI must never panic on lock — so the
 /// poisoned arm hands back the inner guard instead of propagating.
 pub(crate) fn lock_ignore_poison<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-pub(crate) fn register_live_device(device: usize) {
-    if device == 0 {
-        return;
-    }
-    if let Ok(mut live) = live_devices().lock() {
-        live.insert(device);
-    }
-}
-
-pub(crate) fn unregister_live_device(device: usize) {
-    if device == 0 {
-        return;
-    }
-    if let Ok(mut live) = live_devices().lock() {
-        live.remove(&device);
-    }
-}
-
-fn device_is_live(device: usize) -> bool {
-    match live_devices().lock() {
-        Ok(live) => live.contains(&device),
-        // `panic = "abort"` makes poisoning unreachable; refusing is the safe
-        // answer if it ever were not.
-        Err(_) => false,
-    }
 }
 
 /// The DDI paths that refuse or silently downgrade runtime-requested work.
@@ -400,19 +330,6 @@ struct DdiRefusals {
     /// with the resource we believe we made is exactly the state §10.3 exists
     /// to make impossible.
     hwa2_output_invalid: RefusalCounter,
-    /// A create needs the kernel to ADOPT this process's venus resource, and
-    /// HWA2 cannot name a host resource id (§10.3: "no host resource token,
-    /// resid, … A host resid may live SOLELY inside the KMD allocation
-    /// object"). Refused, not substituted.
-    ///
-    /// ⛔ The replacement is **Mesa lane unit A3** (plus K6): the ICD stops
-    /// naming host resources at all and the KMD patches the resid in from
-    /// `HeliosNativeRenderPatch`. `K4-CONTRACT.md` §5 is explicit that this is
-    /// NOT a substitution and must not be planned as one — so until A3 lands
-    /// this counter moving IS the expected steady state, and every shared /
-    /// keyed-mutex / present / primary D3D11 texture create fails. That is the
-    /// retirement's intended intermediate state, not a regression.
-    hwa2_create_venus_backing_needs_mesa_a3: RefusalCounter,
     /// No open-time private buffer (per-allocation or resource-level) was
     /// exactly `HELIOS_HWA2_BYTES`. `from_private_data` requires an exact
     /// length — §10.3 forbids ever selecting a legacy parser, so a 96-byte
@@ -426,8 +343,7 @@ struct DdiRefusals {
     /// D3D11 import path needs the host `resource_id` / `venus_alloc_size` /
     /// Vulkan memory-type index that HWA2 deliberately does not carry.
     ///
-    /// ⛔ Same gap as `hwa2_create_venus_backing_needs_mesa_a3`, other end of
-    /// the wire, same owner: **Mesa unit A3**. `K4-CONTRACT.md` §5 requires
+    /// `K4-CONTRACT.md` §5 requires
     /// this to fail loudly and to record that "an ICD in this state cannot
     /// import" — never to fall back, never to fabricate a 1x1 alias (audit
     /// U-B2, the black-forever failure).
@@ -480,9 +396,6 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
     readback_stride_unsafe: RefusalCounter::new("readback_stride_unsafe"),
     hwa2_input_invalid: RefusalCounter::new("hwa2_input_invalid"),
     hwa2_output_invalid: RefusalCounter::new("hwa2_output_invalid"),
-    hwa2_create_venus_backing_needs_mesa_a3: RefusalCounter::new(
-        "hwa2_create_venus_backing_needs_mesa_a3",
-    ),
     hwa2_open_private_size: RefusalCounter::new("hwa2_open_private_size"),
     hwa2_open_desc_invalid: RefusalCounter::new("hwa2_open_desc_invalid"),
     hwa2_open_needs_mesa_a3: RefusalCounter::new("hwa2_open_needs_mesa_a3"),
@@ -496,7 +409,7 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
 /// The set, in the order the summary prints them. ⛔ This order is the
 /// evidence contract: `DDI refusals:` lines from different builds are diffed.
 /// The K4 counters are APPENDED so every pre-existing column keeps its place.
-static DDI_REFUSAL_SET: [&RefusalCounter; 22] = [
+static DDI_REFUSAL_SET: [&RefusalCounter; 21] = [
     &DDI_REFUSALS.srv_raw_hazard,
     &DDI_REFUSALS.resource_raw_hazard,
     &DDI_REFUSALS.text_filter_size_ignored,
@@ -510,7 +423,6 @@ static DDI_REFUSAL_SET: [&RefusalCounter; 22] = [
     &DDI_REFUSALS.readback_stride_unsafe,
     &DDI_REFUSALS.hwa2_input_invalid,
     &DDI_REFUSALS.hwa2_output_invalid,
-    &DDI_REFUSALS.hwa2_create_venus_backing_needs_mesa_a3,
     &DDI_REFUSALS.hwa2_open_private_size,
     &DDI_REFUSALS.hwa2_open_desc_invalid,
     &DDI_REFUSALS.hwa2_open_needs_mesa_a3,
@@ -553,21 +465,6 @@ fn note_ddi_refusal(counter: &RefusalCounter) {
     }
 }
 
-/// Scan-out primary creates refused because the bridge returned a resource
-/// with a zero row pitch (R806 sub-commit 2).
-///
-/// Expected to stay 0: `create_ddi_scanout_texture2d` returns 0 for a zero
-/// width/height and otherwise computes a non-zero pitch, so a non-zero
-/// resource implies a non-zero pitch. A non-zero value here means that
-/// cross-FFI contract has been broken, and the refusal is what stops a
-/// direct-scanout primary being stamped into the KMD meta that the UMD could
-/// never identify through PresentCb private data.
-static SCANOUT_PRIMARY_ZERO_PITCH: AtomicUsize = AtomicUsize::new(0);
-
-/// Bounded flip-ordering gate expiries (the flip proceeds; a stale frame on
-/// a direct-flip window beats a wedged worker). Steady-state nonzero =
-/// the retire→signal chain is slower than the gate bound.
-static EXT_FLIP_GATE_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
 /// Why a present returned without minting a swapchain token. All three shapes
 /// used to share one log line and return S_OK to DXGI, so the failing stage was
 /// lost and the runtime never learned the present had not happened.
@@ -623,82 +520,4 @@ unsafe fn present_prerequisites(
         h_context,
         src_alloc,
     })
-}
-
-/// `order_mode` values of `HeliosDxvkDevice::present_frame_gate`, mirroring
-/// `kPresentOrderComplete` / `kPresentOrderSubmitted` in `bridge/dxvk_bridge.h`.
-pub(super) const PRESENT_ORDER_COMPLETE: u32 = 0;
-pub(super) const PRESENT_ORDER_SUBMITTED: u32 = 1;
-
-/// Outcome of the bounded frame gate. `#[must_use]` because `dxgi_present1`'s
-/// multi arm silently discarded the boolean this replaces.
-///
-/// "Did not confirm completion", not "timed out": `present_frame_gate` also
-/// returns false when the bridge impl/context is missing or an exception was
-/// caught, so a nonzero count folds those in.
-#[must_use]
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum GateOutcome {
-    Completed,
-    NotConfirmed,
-}
-
-/// Frame-gate non-confirmations on EVERY path. `EXT_FLIP_GATE_TIMEOUTS` is
-/// conditioned on `is_vehicle_present`, so an expiry on the direct-primary
-/// path — the one that ships — incremented nothing and logged nothing, and the
-/// only trace was the aggregated C++ `present-gate: ... timeouts=` line every
-/// 128 presents. A gate expiry means the present is published while DXVK still
-/// has queued work: exactly the producer race the gate exists to close, so a
-/// steady-state expiry was indistinguishable from a healthy run in the guest
-/// counters and the stale-frame symptom got blamed on the KMD marker or the
-/// host.
-static PRESENT_GATE_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
-static PRESENT_GATE_LOG_COUNT: LogThrottle = LogThrottle::new();
-
-/// Run the bounded gate and count every non-confirmation. The present proceeds
-/// either way — a stale frame beats a wedged worker — so the outcome is
-/// telemetry, not control flow, but it must not be droppable by accident.
-unsafe fn run_present_frame_gate(
-    dev: &crate::device_funcs::HeliosDevice,
-    gate_us: u32,
-    is_vehicle_present: bool,
-) -> GateOutcome {
-    // The vehicle keeps the COMPLETE wait, and it is the ONLY path that may.
-    // Its ordering requirement is genuinely different and genuinely stronger:
-    // the vehicle backbuffer is scanned out on a direct/independent flip
-    // ordered only on the KMD's DMA fence, which completes at DECODE, so the
-    // copy's host-GPU completion is what has to be waited for (24th session).
-    // It has its own bound, `VehicleFlipGateUs`.
-    //
-    // The DIRECT-PRIMARY / ordinary-app path is SUBMITTED, unconditionally and
-    // with no knob. It is ordered by the `DxgkDdiRender` watermark, which needs
-    // only that the frame's Venus work has reached `vkQueueSubmit`; waiting for
-    // GPU completion here is a producer-side CPU stall that removes all
-    // CPU/GPU overlap and does not fix the ordering anyway (owner-verified
-    // 2026-07-29: an unexpirable 200 ms completion gate still flashed black).
-    // The `PresentOrder`/`PresentGateUs` knobs that used to select and bound it
-    // were deleted with it — see the ⛔ note in `crate::knobs`.
-    let order_mode = if is_vehicle_present {
-        PRESENT_ORDER_COMPLETE
-    } else {
-        PRESENT_ORDER_SUBMITTED
-    };
-    if dev.dxvk.present_frame_gate(gate_us, order_mode) {
-        return GateOutcome::Completed;
-    }
-    let total = PRESENT_GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
-    if is_vehicle_present {
-        // Unchanged text and cadence: this is the pre-existing vehicle line.
-        let n = EXT_FLIP_GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-        if n < 16 || n % 512 == 0 {
-            log_error!("vehicle flip gate TIMEOUT (x{}) — flipping anyway", n + 1);
-        }
-    } else {
-        if PRESENT_GATE_LOG_COUNT.first_n_then_every(16, 512).is_some() {
-            log_error!(
-                "present frame gate did not confirm completion (x{total}) — presenting anyway"
-            );
-        }
-    }
-    GateOutcome::NotConfirmed
 }

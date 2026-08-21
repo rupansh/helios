@@ -433,16 +433,6 @@ pub(crate) unsafe fn allocate_wddm_resource(
     a: &ddi::D3D11DDIARG_CREATERESOURCE,
     mip0: &ddi::D3D10DDI_MIPINFO,
     h_rt: ddi::D3D10DDI_HRTRESOURCE,
-    // `Some` = venus-backed (the KMD adopts our allocation), `None` = plain
-    // KMD-backed standard allocation. This one `Option` replaces the three
-    // independent `backing_blob_id != 0` conjunctions.
-    backing: Option<VenusBacking>,
-    // Kept separate from `scanout` on purpose -- see alloc.rs.
-    direct_scanout_primary: bool,
-    // Scan-out primary metadata. LINEAR paths use the queried COLOR row pitch;
-    // direct OPTIMAL uses a logical scanout stride while QEMU validates the
-    // opaque allocation with its exact Vulkan allocation size.
-    scanout: Option<ScanoutGeometry>,
 ) -> Result<CreatedWddmAllocation, i32> {
     const DDI_BIND_PRESENT: u32 = 0x0000_0080;
 
@@ -458,70 +448,13 @@ pub(crate) unsafe fn allocate_wddm_resource(
         return Err(E_FAIL);
     };
 
-    // ⛔⛔ K4 / `K4-CONTRACT.md` §5 — the resid gap, at the producer end.
-    //
-    // A `Some(backing)` create is the one this driver used to answer by putting
-    // the venus resource id in `HeliosWddmAllocPrivate::adopt_resource_id` and
-    // asking the kernel to ADOPT the memory DXVK had already allocated. HWA2
-    // carries no host resource id, no venus context id and no blob id, and
-    // §10.3 forbids adding one: "no UMD, ICD, batch, or private descriptor can
-    // name or supply" a host resid — it may live SOLELY inside the KMD
-    // allocation object.
-    //
-    // There is no substitution available and inventing one is explicitly out of
-    // bounds. Proceeding without the id is worse than refusing: the kernel
-    // would allocate its OWN blob, `stamp_dxvk_resource_kmt_handles` would then
-    // bind a KMT handle to a DXVK image whose memory that blob does not
-    // describe, and the result is the two-memory split — a resident, storable,
-    // real-handled alias that renders black forever (15th session). That is
-    // fake success; this is loud failure.
-    //
-    // ⇒ Refuse, count, and name the successor mechanism: **Mesa lane unit A3**
-    // (plus K6) — the ICD stops naming host resources at all and the KMD
-    // patches the resid in from `HeliosNativeRenderPatch`. Until A3 lands,
-    // every shared / keyed-mutex / present / primary D3D11 texture create
-    // fails here. §5 records that as the retirement's intended intermediate
-    // state, not a regression.
-    if let Some(b) = backing {
-        note_ddi_refusal(&DDI_REFUSALS.hwa2_create_venus_backing_needs_mesa_a3);
-        log_error!(
-            "DDI allocate_wddm_resource REFUSED: venus-backed create needs an adopted host \
-             resource id, which HWA2 cannot carry (blob=0x{:x} res_id={} blob_size={} \
-             {}x{} fmt={} bind=0x{:x} misc=0x{:x} primary={} direct_scanout={}) -> \
-             blocked on mesa unit A3 (+K6): the ICD stops naming host resources and the KMD \
-             patches the resid in from HeliosNativeRenderPatch",
-            b.blob_id.get(),
-            b.resource_id.get(),
-            b.blob_size,
-            mip0.TexelWidth,
-            mip0.TexelHeight,
-            a.Format,
-            a.BindFlags,
-            a.MiscFlags,
-            !a.pPrimaryDesc.is_null(),
-            direct_scanout_primary,
-        );
-        return Err(E_OUTOFMEMORY);
-    }
-
     const CROSS_ADAPTER_PITCH_ALIGN: u32 = 256;
     let raw_pitch = mip0
         .TexelWidth
         .saturating_mul(dxgi_bytes_per_pixel(a.Format as u32));
     let pitch =
         raw_pitch.saturating_add(CROSS_ADAPTER_PITCH_ALIGN - 1) & !(CROSS_ADAPTER_PITCH_ALIGN - 1);
-    // A LINEAR scan-out primary reports its exact COLOR row pitch; use it verbatim so
-    // `SET_SCANOUT_BLOB` reads rows at the true host stride instead of the
-    // cross-adapter guess (a wrong stride shears the scanned-out image).
-    let pitch = match scanout {
-        Some(g) => g.pitch.get(),
-        None => pitch,
-    };
-    // ⚠ `backing` is `None` from here down — the `Some` arm returned above — so
-    // the "a live blob_size overrides the computed linear size" fallback that
-    // used to sit here has no reachable input. The extent HWA2 records is the
-    // one this UMD can compute, and it is byte-for-byte the value the retired
-    // `HeliosWddmAllocPrivate::size` carried.
+    // The extent HWA2 records is the one this UMD can compute.
     //
     // ⭐ DECIDED — `K4-CONTRACT.md` §1.3, and this arm is **Tier 2**. The KMD
     // computes a KMD-side linear extent of its own — `create_allocation.rs`
@@ -597,11 +530,9 @@ pub(crate) unsafe fn allocate_wddm_resource(
         ddi_misc_flags: a.MiscFlags,
         byte_size: size,
         row_pitch: pitch,
-        // Scan-out primary's real memory-plane-0 offset (0 for everything
-        // else); the KMD adds it to the blob base in SET_SCANOUT_BLOB.
-        plane_offset: scanout.map_or(0, |g| g.plane_offset),
+        plane_offset: 0,
         primary_vidpn_source,
-        direct_scanout_primary,
+        direct_scanout_primary: false,
     };
 
     let mut desc = match input.build() {
@@ -935,223 +866,6 @@ pub(crate) unsafe fn allocate_wddm_resource(
     }
 }
 
-#[cfg(any())]
-/// Retired A7 predecessor retained out of the compiled path while the focused
-/// removal gate is landed with A8. The live path below allocates WDDM first and
-/// supplies HRA1 during exact DXVK/Vulkan resource creation.
-/// Common tail for a freshly created 2D texture resource (normal or scan-out
-/// primary): record the venus backing identity, make the paired WDDM/KMD
-/// allocation (carrying the scan-out row pitch + plane offset for a primary),
-/// transfer venus-resource ownership to that allocation, KMT-stamp the DXVK
-/// resource, and store it in the DDI handle. `scanout_pitch`/`scanout_offset`
-/// are either the LINEAR COLOR layout or the direct-OPTIMAL logical scanout
-/// metadata; they are 0/0 for non-primary resources.
-pub(crate) unsafe fn finish_wddm_tex2d(
-    h: Hdevice,
-    a: &ddi::D3D11DDIARG_CREATERESOURCE,
-    mip0: &ddi::D3D10DDI_MIPINFO,
-    h_rt: ddi::D3D10DDI_HRTRESOURCE,
-    h_resource: ddi::D3D10DDI_HRESOURCE,
-    res: ID3D11Resource,
-    direct_scanout_primary: bool,
-    scanout: Option<ScanoutGeometry>,
-) {
-    let (memory, memory_size, memory_offset, resource_id) = dxvk_resource_memory_info(h, &res);
-    let needs_importable = needs_wddm_texture_allocation(a);
-    let (backing_blob_id, backing_blob_size, backing_resource_id) = if memory != 0
-        && memory_offset == 0
-        && memory <= u32::MAX as u64
-    {
-        (memory, memory_size, resource_id)
-    } else {
-        // Only resources that get a WDDM allocation (shared / keyed-mutex /
-        // present / primary) NEED an importable backing — for those a
-        // suballocated DXVK memory means a cross-process opener sees a
-        // disconnected KMD blob (two-memory split), so shout. Private
-        // textures are suballocated by design (18th session).
-        if memory != 0 && needs_importable {
-            log_error!(
-                    "DDI create_resource(tex2d): SHARED RESOURCE WITHOUT IMPORTABLE BACKING memory=0x{:x} res_id={} size={} offset={} bind=0x{:x} misc=0x{:x}",
-                    memory, resource_id, memory_size, memory_offset, a.BindFlags, a.MiscFlags
-                );
-        } else if memory != 0 {
-            trace_line!(
-                "DDI create_resource(tex2d): private suballocated memory=0x{:x} size={} offset={}",
-                memory,
-                memory_size,
-                memory_offset
-            );
-        }
-        (0, 0, 0)
-    };
-    // The creating `vkAllocateMemory`'s exact size + memory type.
-    //
-    // ⛔ K4: these NO LONGER reach any allocation private data. HWA2 carries no
-    // `venus_alloc_size` and §10.3 is explicit that the Vulkan memory-type index
-    // is gone ("no Vulkan memory-type index … the retired trailer carried
-    // `memory_type_index`; it is gone"). Both are still read here for exactly
-    // one surviving consumer — `SnapshotSourceDesc` below, the windowed-BLT
-    // snapshot descriptor, which is a UMD-internal record that never crosses
-    // the allocation seam.
-    //
-    // ⚠ `global_vidmm_tracker` is now a WRITE-ONLY sink. The `GlobalVidMmTracker`
-    // system-wide KMT share + cookie has NO successor at all
-    // (`K4-CONTRACT.md` §6: `wddm_legacy.rs:30`'s claim that it was "folded into
-    // HWA2's own tracking-kind fields" is false — HWA2 has no tracking kind, no
-    // cookie, no global-share field and no tracker flag bit, and §10.3's "no …
-    // independently usable identity" forbids reintroducing it under another
-    // name). The out-parameter survives only because the C++ bridge declares it
-    // (`umd/bridge/`, not this lane). Removing it must change the Rust extern
-    // and the C++ declaration in ONE changeset or the bridge stops linking —
-    // that is an open cross-lane request against `umd/bridge/`, and §6 rules
-    // only that the tracker has no successor; it does not itself cover the
-    // bridge signature.
-    let (mut venus_alloc_size, mut memory_type_index) = (0u64, 0u32);
-    let mut retired_global_vidmm_tracker = 0u64;
-    if backing_resource_id != 0 {
-        if let Some(dev) = helios_device(h) {
-            if !dev.dxvk.get_resource_alloc_identity(
-                res.as_raw() as usize,
-                &mut venus_alloc_size,
-                &mut memory_type_index,
-                &mut retired_global_vidmm_tracker,
-            ) {
-                log_error!(
-                    "DDI create_resource(tex2d): no venus alloc identity for res_id={}",
-                    backing_resource_id
-                );
-            }
-        }
-    }
-    let backing = VenusBacking::new(backing_blob_id, backing_blob_size, backing_resource_id);
-    // A shared/present/primary texture must bind its WDDM allocation to the
-    // exact exportable Venus resource that backs the DXVK image. Falling back
-    // to a fresh KMD blob would create two disconnected allocations; treating
-    // a bare VkDeviceMemory id as a blob id is worse, because virglrenderer
-    // rejects the non-exportable memory and destroys the Venus context.
-    if needs_importable && backing.is_none() {
-        log_error!(
-            "DDI create_resource(tex2d): SHARED RESOURCE WITHOUT IMPORTABLE BACKING memory=0x{:x} res_id={} size={} offset={} bind=0x{:x} misc=0x{:x} -> refused",
-            memory,
-            resource_id,
-            memory_size,
-            memory_offset,
-            a.BindFlags,
-            a.MiscFlags
-        );
-        set_runtime_error(h, E_OUTOFMEMORY);
-        return;
-    }
-    let (allocation, km_resource) =
-        match allocate_wddm_resource(h, a, mip0, h_rt, backing, direct_scanout_primary, scanout) {
-            Ok(allocation) => allocation,
-            Err(hr) => {
-                log_error!(
-                    "DDI create_resource(tex2d): WDDM allocation/residency failed hr=0x{:08x}",
-                    hr as u32
-                );
-                set_runtime_error(h, hr);
-                return;
-            }
-        };
-    let allocation_handle = allocation
-        .as_ref()
-        .map(ResidentAllocation::handle)
-        .unwrap_or(0);
-    // ⚠ K4: UNREACHABLE until mesa unit A3 lands, and deliberately kept.
-    // `backing_resource_id != 0` implies `backing.is_some()`, and
-    // `allocate_wddm_resource` refuses that create outright (HWA2 cannot name a
-    // host resource id — see its `hwa2_create_venus_backing_needs_mesa_a3`
-    // refusal), so this arm has no reachable input today. It is the ownership
-    // hand-off the adopt path needs the moment the KMD starts patching the
-    // resid in from `HeliosNativeRenderPatch`; deleting it would silently drop
-    // that hand-off from the A3 changeset.
-    if allocation_handle != 0 && backing_resource_id != 0 {
-        if let Some(dev) = helios_device(h) {
-            // SAFETY: `res` is the live resource this DDI just created.
-            if !unsafe { dev.dxvk.transfer_resource_ownership(res.as_raw() as usize) } {
-                log_error!(
-                    "DDI create_resource(tex2d): ownership transfer failed res_id={}",
-                    backing_resource_id
-                );
-            }
-        }
-    }
-    trace_line!(
-        "DDI create_resource(tex2d): before KMT stamp km=0x{:x} alloc=0x{:x} blob=0x{:x} res_id={} blob_size={}",
-        km_resource,
-        allocation_handle,
-        backing_blob_id,
-        backing_resource_id,
-        backing_blob_size
-    );
-    stamp_dxvk_resource_kmt_handles(h, &res, allocation_handle, km_resource);
-    let snapshot_source = core::num::NonZeroU32::new(backing_resource_id).and_then(|resource_id| {
-        (venus_alloc_size != 0 && mip0.TexelWidth != 0 && mip0.TexelHeight != 0).then_some(
-            SnapshotSourceDesc {
-                resource_id: resource_id.get(),
-                venus_alloc_size,
-                memory_type_index,
-                width: mip0.TexelWidth,
-                height: mip0.TexelHeight,
-                dxgi_format: a.Format as u32,
-            },
-        )
-    });
-    // Only the exact runtime-designated primary may identify itself through
-    // Present private data. Ordinary resource identity stays in
-    // `snapshot_source` above, never in this rotation-coupled field.
-    let present_private = match (
-        direct_scanout_primary,
-        core::num::NonZeroU32::new(backing_resource_id),
-        scanout,
-    ) {
-        (true, Some(resource_id), Some(geometry)) => HeliosPresentPrivateData {
-            plane_offset: geometry.plane_offset,
-            magic: HELIOS_PRESENT_PRIVATE_MAGIC,
-            version: HELIOS_PRESENT_PRIVATE_VERSION,
-            resource_id: resource_id.get(),
-            width: mip0.TexelWidth,
-            height: mip0.TexelHeight,
-            pitch: geometry.pitch.get(),
-            dxgi_format: a.Format as u32,
-            reserved: HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT,
-            venus_alloc_size: 0,
-            // The direct-primary creation path has no relationship to the
-            // registered present signal. The per-present eligible path alone
-            // fills this appended stream-correlation tail.
-            present_ctx_id: 0,
-            present_value: 0,
-            present_cookie: 0,
-            snapshot_memory_type_index: 0,
-            snapshot_purpose: HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE,
-        },
-        _ => empty_present_private(),
-    };
-    if RESOURCE_LOG_COUNT.first_n(128).is_some() {
-        trace_line!(
-            "DDI create_resource(tex2d) ok after-stamp-call: {}x{} fmt={} usage={} bind=0x{:x} misc=0x{:x} sample={}x{}",
-            mip0.TexelWidth, mip0.TexelHeight, a.Format, a.Usage, a.BindFlags,
-            a.MiscFlags, a.SampleDesc.Count, a.SampleDesc.Quality
-        );
-    }
-    store_resource(
-        h_resource,
-        res,
-        allocation,
-        None,
-        None,
-        km_resource,
-        h_rt.handle,
-        AllocationOwnership::CreatedByUmd, // via pfnAllocateCb above
-        present_private,
-        snapshot_source,
-    );
-    if present_private.is_valid() {
-        unsafe { remember_direct_scanout_allocation(h, allocation_handle, present_private) };
-    }
-}
-
 unsafe fn create_and_store_associated_resource(
     h: Hdevice,
     h_resource: ddi::D3D10DDI_HRESOURCE,
@@ -1189,8 +903,6 @@ unsafe fn create_and_store_associated_resource(
         km_resource,
         h_rt.handle,
         AllocationOwnership::CreatedByUmd,
-        empty_present_private(),
-        None,
     );
     Ok(())
 }
@@ -1357,7 +1069,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                 MiscFlags: misc,
                 StructureByteStride: a.ByteStride,
             };
-            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
+            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt) {
                 Ok(allocation) => allocation,
                 Err(hr) => {
                     log_error!(
@@ -1428,178 +1140,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                 CPUAccessFlags: cpu,
                 MiscFlags: misc,
             };
-            #[cfg(any())]
-            {
-                // Retired direct-scanout/generic DXVK create predecessor. The A7
-                // path below names the WDDM allocation before Vulkan allocation.
-                // Windows' pPrimaryDesc is the authoritative, non-heuristic marker
-                // for a scan-out primary. The supported 32-bit Windows primary
-                // formats become dedicated OPTIMAL DMA_BUF exports.
-                let is_scanout =
-                    !a.pPrimaryDesc.is_null() && matches!(a.Format as u32, 28 | 87 | 88);
-                let mut handled = false;
-                if is_scanout {
-                    // The QEMU fork reconstructs this exact same-driver OPTIMAL
-                    // DMA_BUF with the original blob allocation size. This avoids a
-                    // guest copy and any virtio protocol field or global modifier
-                    // extension. The host display backend currently reads it back.
-                    // The wrapper adopts the reference and returns the metadata
-                    // with it, so `rp`/`off` cannot be read on the failure path.
-                    // R813.
-                    let created = helios_device(h).and_then(|dev| {
-                        dev.dxvk.create_scanout_texture2d(
-                            mip0.TexelWidth,
-                            mip0.TexelHeight,
-                            a.Format as u32,
-                            bind,
-                            misc,
-                            false,
-                        )
-                    });
-                    let (rp, off) = created.as_ref().map_or((0, 0), |(_, p, o)| (*p, *o));
-                    // BEHAVIOUR CHANGE (R806 sub-commit 2): a zero row pitch is a
-                    // failed scan-out-primary create, not a primary with no
-                    // geometry. Previously only `raw != 0` was checked, so a
-                    // non-zero resource with `rp == 0` would stamp
-                    // HELIOS_WDDM_ALLOC_MISC_PRIMARY | MISC_DIRECT_SCANOUT into the
-                    // KMD meta while finish_wddm_tex2d's present_private gate
-                    // failed -- a direct scan-out primary in the kernel that the
-                    // UMD never registered in direct_scanout_allocations and could
-                    // never identify through PresentCb private data. Nothing
-                    // detected that split state.
-                    //
-                    // Not reachable through today's bridge: create_ddi_scanout_
-                    // texture2d returns 0 for a zero width/height and otherwise
-                    // computes a non-zero pitch, so raw != 0 implies rp != 0. This
-                    // closes the cross-FFI contract dependency rather than a live
-                    // bug, which is why the counter is expected to stay 0.
-                    let geometry = ScanoutGeometry::new(rp as u32, off);
-                    // One match over the pair, so the created resource is moved
-                    // into exactly one arm and the refusal arm still owns it (and
-                    // therefore still releases it).
-                    match (created, geometry) {
-                        (Some((res, _, _)), Some(geometry)) => {
-                            log_error!(
-                        "DDI create_resource(tex2d): direct scan-out primary {}x{} fmt={} logicalPitch={} offset={} (OPTIMAL DMA_BUF)",
-                        mip0.TexelWidth, mip0.TexelHeight, a.Format, rp, off
-                    );
-                            finish_wddm_tex2d(
-                                h,
-                                a,
-                                &mip0,
-                                h_rt,
-                                h_resource,
-                                res,
-                                true,
-                                Some(geometry),
-                            );
-                        }
-                        (created, _) => {
-                            // Loud failure over fake success: do NOT fall back to a plain
-                            // primary — that reintroduces the black scan-out as a "working"
-                            // desktop. A failure here is a real direct-scanout regression.
-                            if let Some((res, _, _)) = created {
-                                // The new arm: the bridge handed back a resource but no
-                                // usable stride. Dropping the adopted wrapper releases
-                                // it -- nothing else will. R813 removed the manual
-                                // IUnknown::from_raw this used to need.
-                                SCANOUT_PRIMARY_ZERO_PITCH.fetch_add(1, Ordering::Relaxed);
-                                let raw = res.as_raw() as usize;
-                                drop(res);
-                                log_error!(
-                            "DDI create_resource(tex2d): SCAN-OUT PRIMARY ZERO PITCH {}x{} fmt={} raw=0x{:x} offset={} -> refused (zero_pitch={})",
-                            mip0.TexelWidth,
-                            mip0.TexelHeight,
-                            a.Format,
-                            raw,
-                            off,
-                            SCANOUT_PRIMARY_ZERO_PITCH.load(Ordering::Relaxed)
-                        );
-                            }
-                            log_error!(
-                        "DDI create_resource(tex2d): SCAN-OUT PRIMARY CREATE FAILED {}x{} fmt={} bind=0x{:x} -> no primary (optimal/dmabuf rejected?)",
-                        mip0.TexelWidth, mip0.TexelHeight, a.Format, bind
-                    );
-                            // The loudness has to reach the runtime, not stop at the log
-                            // file: this DDI returns void, so pfnSetErrorCb is the only
-                            // way CreateTexture2D fails instead of handing the caller
-                            // S_OK with a null driver resource. E_OUTOFMEMORY is in
-                            // CreateTexture2D's documented return set; the bridge
-                            // returns 0 with no HRESULT to map through.
-                            set_runtime_error(h, E_OUTOFMEMORY);
-                        }
-                    }
-                    handled = true;
-                }
-                if !handled {
-                    let mut tex: Option<ID3D11Texture2D> = None;
-                    // The five existing tex2d trace gates are the same predicate;
-                    // name it once so the restructured arm cannot drift between them.
-                    let big = mip0.TexelWidth >= 1024 || mip0.TexelHeight >= 576 || misc != 0;
-                    if big {
-                        log_error!(
-                        "DDI create_resource(tex2d): calling DXVK CreateTexture2D {}x{} fmt={} bind=0x{:x} misc=0x{:x} init={} hrt={:p} mips={} array={} usage={} cpu=0x{:x} sample={}x{}",
-                        mip0.TexelWidth,
-                        mip0.TexelHeight,
-                        a.Format,
-                        bind,
-                        misc,
-                        init_ptr.is_some(),
-                        h_rt.handle,
-                        desc.MipLevels,
-                        desc.ArraySize,
-                        a.Usage,
-                        cpu,
-                        a.SampleDesc.Count,
-                        a.SampleDesc.Quality
-                    );
-                    }
-                    let created = device.CreateTexture2D(&desc, init_ptr, Some(&mut tex));
-                    match created {
-                        Ok(()) => {
-                            if big {
-                                log_error!(
-                                "DDI create_resource(tex2d): DXVK CreateTexture2D returned S_OK tex_present={}",
-                                tex.is_some()
-                            );
-                            }
-                        }
-                        Err(ref e) => log_error!("DDI create_resource(tex2d) failed: {e:?}"),
-                    }
-                    let res = match tex {
-                        Some(t) => match t.cast::<ID3D11Resource>() {
-                            Ok(r) => {
-                                if big {
-                                    log_error!(
-                                        "DDI create_resource(tex2d): cast to ID3D11Resource OK"
-                                    );
-                                }
-                                Some(r)
-                            }
-                            Err(_) => {
-                                if big {
-                                    log_error!(
-                                        "DDI create_resource(tex2d): cast to ID3D11Resource failed"
-                                    );
-                                }
-                                None
-                            }
-                        },
-                        None => {
-                            if big && created.is_ok() {
-                                log_error!(
-                                "DDI create_resource(tex2d): DXVK CreateTexture2D returned no texture"
-                            );
-                            }
-                            None
-                        }
-                    };
-                    finish_create(h, created, res, |res| {
-                        finish_wddm_tex2d(h, a, &mip0, h_rt, h_resource, res, false, None);
-                    });
-                }
-            }
-            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
+            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt) {
                 Ok(allocation) => allocation,
                 Err(hr) => {
                     log_error!(
@@ -1654,7 +1195,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                 CPUAccessFlags: cpu,
                 MiscFlags: misc,
             };
-            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
+            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt) {
                 Ok(allocation) => allocation,
                 Err(hr) => {
                     log_error!(
@@ -1705,7 +1246,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                 CPUAccessFlags: cpu,
                 MiscFlags: misc,
             };
-            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt, None, false, None) {
+            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt) {
                 Ok(allocation) => allocation,
                 Err(hr) => {
                     log_error!(
@@ -1984,36 +1525,6 @@ pub(crate) unsafe extern "C" fn calc_size_opened_resource(
     _arg: *const ddi::D3D10DDIARG_OPENRESOURCE,
 ) -> u64 {
     8
-}
-
-pub(crate) unsafe extern "C" fn resolve_shared_resource(
-    h: ddi::HANDLE,
-    arg: *const ddi::D3DDDIARG_RESOLVESHAREDRESOURCE,
-) -> i32 {
-    let h_resource: *mut c_void = if arg.is_null() {
-        core::ptr::null_mut()
-    } else {
-        (*arg).hResource as *mut c_void
-    };
-    let resource = ddi::D3D10DDI_HRESOURCE {
-        pDrvPrivate: h_resource,
-    };
-    let alloc = resource_allocation(resource);
-    let (width, height) = resource_dimensions(resource);
-    log_error!(
-        "DDI ResolveSharedResource: hDevice={:p} hResource={:p} alloc=0x{:x} {}x{}",
-        h,
-        h_resource,
-        alloc,
-        width,
-        height
-    );
-    if let Some(context) = d3d11_context(Hdevice {
-        pDrvPrivate: h as *mut c_void,
-    }) {
-        context.Flush();
-    }
-    0
 }
 
 pub(crate) unsafe extern "C" fn dxgi_resolve_shared_resource(

@@ -29,113 +29,6 @@ use helios_protocol::{
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use windows::core::{IUnknown, Interface};
 
-/// One cached dcomp-vehicle present source (road 4): an alias-imported D3D11
-/// texture over the producing ICD's frame blob, keyed by venus resid. Owns
-/// one COM ref on the imported resource, released on drop (eviction,
-/// geometry change, or device teardown).
-pub struct PresentSrcEntry {
-    pub resid: u32,
-    pub width: u32,
-    pub height: u32,
-    pub dxgi_format: u32,
-    /// Owned `ID3D11Resource` COM pointer from `open_ddi_texture2d`.
-    pub resource_raw: usize,
-}
-
-impl Drop for PresentSrcEntry {
-    fn drop(&mut self) {
-        if self.resource_raw != 0 {
-            // SAFETY: `resource_raw` is the owned COM ref returned by
-            // open_ddi_texture2d; from_raw adopts it so drop releases it.
-            unsafe {
-                drop(
-                    windows::Win32::Graphics::Direct3D11::ID3D11Resource::from_raw(
-                        self.resource_raw as *mut c_void,
-                    ),
-                );
-            }
-        }
-    }
-}
-
-/// One slot of the D4b snapshot ring (FIX-DESIGN-d4b-snapshot.md §3): an
-/// ICD-owned DirectOptimalScanout OPTIMAL image the present-time blit fills
-/// from the presented primary, plus the identity the KMD binds it by. NO
-/// runtime object and NO WDDM allocation exist for it — the KMD needs only
-/// the resid + descriptor, and ownership is never transferred (the snapshot
-/// stays an ICD-owned blob). Owns one COM ref on the created resource,
-/// released on drop (ring recreate or `BridgeOwned::release`).
-pub struct SnapshotSlot {
-    /// Owned `ID3D11Resource` COM pointer from `create_ddi_scanout_texture2d`.
-    pub resource_raw: usize,
-    /// Venus resource id the KMD binds (`dxvk_resource_memory_info`).
-    pub resid: u32,
-    /// Logical scanout row pitch, from the same create outparam the primary
-    /// path records into its `ScanoutGeometry`.
-    pub pitch: u32,
-    /// Memory-plane-0 offset, same source as `pitch`.
-    pub plane_offset: u64,
-    /// Venus blob size backing `resid`, for the KMD's bind-time undersize
-    /// guard (`alloc_size >= plane_offset + pitch*height`).
-    pub alloc_size: u64,
-    /// Exact allocation memory type. Direct scanout never consumes this field,
-    /// but a WindowedBlt snapshot imports the same image in the KMD Venus
-    /// context and must not guess it from a resource id.
-    pub memory_type_index: u32,
-    /// `get_resource_alloc_identity` completed successfully. Zero is a valid
-    /// memory-type index, so the value itself cannot prove this fact.
-    pub alloc_identity_known: bool,
-}
-
-impl Drop for SnapshotSlot {
-    fn drop(&mut self) {
-        if self.resource_raw != 0 {
-            // SAFETY: `resource_raw` is the owned COM ref adopted from
-            // create_scanout_texture2d and handed over with into_raw;
-            // from_raw re-adopts it so drop releases it.
-            unsafe {
-                drop(
-                    windows::Win32::Graphics::Direct3D11::ID3D11Resource::from_raw(
-                        self.resource_raw as *mut c_void,
-                    ),
-                );
-            }
-        }
-    }
-}
-
-/// One D4b snapshot ring: 4 slots rotated per present for one exact geometry.
-/// Never handed to `dxgi_rotate_resource_identities` — its list is
-/// `a.pResources` only, so the ring is naturally excluded.
-pub struct SnapshotRing {
-    pub width: u32,
-    pub height: u32,
-    pub dxgi_format: u32,
-    /// Direct scan-out snapshots retain SHADER_READ_ONLY_OPTIMAL for QEMU;
-    /// WindowedBlt snapshots are born GENERAL for the KMD transfer importer.
-    /// The two contracts must never share slots even at identical geometry.
-    pub purpose: crate::forward::SnapshotPurpose,
-    /// Exactly [`crate::forward::SNAPSHOT_RING_SLOTS`] entries once built.
-    pub slots: Vec<SnapshotSlot>,
-    /// Next slot index to rotate into.
-    pub next: usize,
-}
-
-/// Device-local D4b rings, one per concurrently presented geometry.
-///
-/// Snapshot descriptors cross into the KMD as raw Venus resource IDs. There
-/// is no WDDM allocation reference in that descriptor which could make a
-/// geometry-change eviction scheduler-safe, so a ring that has ever been
-/// published stays alive until device teardown. The forward path enforces a
-/// hard count/byte budget and seals the cache when a new ring would exceed it;
-/// later unknown geometries fail closed to the ordinary present path.
-#[derive(Default)]
-pub struct SnapshotRingCache {
-    pub rings: Vec<SnapshotRing>,
-    pub bytes: u64,
-    pub sealed: bool,
-}
-
 /// WDDM 2.x paging queue used to order explicit residency operations.
 ///
 /// The non-zero handles and non-null monitored-fence mapping are validated at
@@ -293,13 +186,6 @@ pub(crate) extern "C" fn translator_sync_progress_query(
 /// correctness not depend on drop order at all; `Drop` remains as the
 /// rollback/panic path. R807.
 pub struct BridgeOwned {
-    /// Dcomp present-vehicle source cache. Immediate-path-only RefCell: only
-    /// present-path DDIs touch it, and those stay runtime-serialized with the
-    /// rest of the immediate context even under FREETHREADED caps.
-    pub present_src_cache: core::cell::RefCell<Vec<PresentSrcEntry>>,
-    /// D4b rings, keyed by geometry and retained until device teardown. Same
-    /// immediate-path-only RefCell contract as `present_src_cache`.
-    pub snapshot_rings: core::cell::RefCell<SnapshotRingCache>,
     /// Device-global shader/layout caches for lazy `ID3D11InputLayout`
     /// creation. The d3d10umddi `CreateElementLayout` DDI does NOT pass the
     /// vertex-shader input-signature bytecode that
@@ -320,8 +206,6 @@ pub struct BridgeOwned {
 impl BridgeOwned {
     pub fn new() -> Self {
         Self {
-            present_src_cache: core::cell::RefCell::new(Vec::new()),
-            snapshot_rings: core::cell::RefCell::new(SnapshotRingCache::default()),
             caches: std::sync::Mutex::new(ShaderCaches::default()),
             bindings: CtxBindings::default(),
         }
@@ -348,15 +232,6 @@ impl BridgeOwned {
     /// but they move from "released here" to "released whenever the field
     /// drops", which is the ordering this type exists to stop depending on.
     pub fn release(&mut self) -> (usize, usize) {
-        // Order: present caches first, shader caches last, matching the
-        // pre-R807 sequence where `ia` was the field released explicitly. The
-        // Snapshot rings are a cache too: dropping the slots releases their
-        // COM refs, and that is ALL their teardown — no WDDM handles or KMD
-        // registrations to unwind. This happens only at device teardown;
-        // mid-device eviction is forbidden because the KMD carries snapshot
-        // identities by value and may consume them after Present returns.
-        self.present_src_cache.get_mut().clear();
-        *self.snapshot_rings.get_mut() = SnapshotRingCache::default();
         self.bindings.bound_vs_com.store(0, Ordering::Relaxed);
         match self.caches.get_mut() {
             Ok(caches) => caches.release_owned_com(),
@@ -388,11 +263,9 @@ pub const THREADING_CAPS_POSSIBLE: u32 =
 /// when the `UmdFreeThreaded` knob is on (absent = ON; explicit 0 is the kill
 /// switch), else 0. The runtime then calls create/destroy/calc DDIs from any
 /// thread, concurrent with the immediate context — the state that exposes
-/// went thread-safe in Phase A ([`ShaderCaches`] mutex, [`CtxBindings`]
-/// atomics, `direct_scanout_allocations` mutex). The present-path `RefCell`s
-/// ([`BridgeOwned::present_src_cache`], [`BridgeOwned::snapshot_rings`]) and
-/// the [`RuntimeContext`] window `Cell`s remain sound: present and the other
-/// immediate-context DDIs stay runtime-serialized under FREETHREADED.
+/// went thread-safe in Phase A ([`ShaderCaches`] mutex and [`CtxBindings`]
+/// atomics). The [`RuntimeContext`] window `Cell`s remain sound: present and
+/// the other immediate-context DDIs stay runtime-serialized under FREETHREADED.
 ///
 /// Phase C: |= COMMANDLISTS_BUILD_2 when `UmdCommandLists` is also on (the
 /// knob accessor itself forces it off without FREETHREADED — COMMANDLISTS
@@ -496,15 +369,6 @@ pub struct HeliosDevice {
     pub h_rt_device: ddi::HANDLE,
     pub kt_callbacks: *const ddi::D3DDDI_DEVICECALLBACKS,
     pub dxgi_callbacks: *mut ddi::DXGI_DDI_BASE_CALLBACKS,
-    /// Exact pPrimaryDesc allocation identity -> Venus scanout metadata.
-    /// DXGI can present a stable resource object while rotating its allocation
-    /// handle, so the allocation is the authoritative lookup key.
-    ///
-    /// Mutex, not RefCell: written by CreateResource/DestroyResource (any
-    /// thread under FREETHREADED caps), read by the present path. Lock with
-    /// `crate::forward::lock_ignore_poison`.
-    pub direct_scanout_allocations:
-        std::sync::Mutex<Vec<(u32, helios_protocol::HeliosPresentPrivateData)>>,
     /// Runtime corelayer handle + callbacks (pfnSetErrorCb) so VOID-returning
     /// DDIs can report failures to the runtime instead of leaving null handles.
     pub h_rt_core_layer: *mut core::ffi::c_void,
@@ -1119,10 +983,6 @@ pub(crate) unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVI
     // Bounded, process-global Present/Present1/MPO entry and callback evidence.
     // This is emitted before teardown while the UMD log remains available.
     log_error!("{}", crate::forward::present_boundary_summary());
-    // Drop it from the liveness registry BEFORE anything is torn down, so a
-    // concurrent `wait_last_present` on an ICD worker refuses rather than
-    // dereferencing a block dxgkrnl is about to free and reuse (R415).
-    crate::forward::unregister_live_device(h_device.pDrvPrivate as usize);
     {
         let dev = &mut *(h_device.pDrvPrivate as *mut HeliosDevice);
         // One explicit release of everything bridge-derived, while the bridge
@@ -1137,13 +997,6 @@ pub(crate) unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVI
         dev.dxvk.shutdown();
         destroy_runtime_objects(dev);
         core::ptr::drop_in_place(h_device.pDrvPrivate as *mut HeliosDevice);
-        // D4a scanout acquire, the tail of the §5.3 teardown order. The
-        // drop_in_place above released the bridge device, and ~DxvkDevice ran
-        // the DXVK half (stop arming → signal every gate to max → join the
-        // signaler) — so by here no thread waits the event and no reader can
-        // pick this device's ledger VA (the registry entry is removed under
-        // the same mutex every reader holds). Unregister + close + unmap.
-        crate::scanout_acquire::teardown_for_device(h_device.pDrvPrivate as usize);
     }
 }
 

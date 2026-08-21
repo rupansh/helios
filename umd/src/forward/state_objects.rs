@@ -297,19 +297,3 @@ pub(crate) unsafe extern "C" fn set_blend_state(
 pub(crate) unsafe extern "C" fn destroy_blend_state(_h: Hdevice, h_bs: ddi::D3D10DDI_HBLENDSTATE) {
     release_com(h_bs);
 }
-
-// --- Dcomp present vehicle (road 4 unit 2) ----------------------------------
-//
-// The ICD (mesa WSI) presents a Vulkan frame through a D3D11 composition
-// swapchain it owns (the "vehicle"): it publishes its frame's
-// (resid -> pid, fenceId, value) in the WS1 #4 seqlock table, hands
-// (resid, value, geometry, allocation identity) to
-// `helios_umd_set_present_source` — stored per-THREAD below — and calls
-// Present() on the vehicle ON THE SAME THREAD. The next dxgi_present on
-// that thread consumes the slot: instead of the normal src->dst copy it
-// alias-imports the ICD frame by resid (cached per resid), image-copies it
-// into hSurfaceToPresent's DXVK texture (the copy-time consumer wait orders
-// the copy against the ICD's GPU writes via the published slot), publishes
-// the BACKBUFFER slot with THIS device's own fence (correct: the vehicle
-// wrote the backbuffer; dwm's consumer wait needs zero changes), then mints
-// the token via pfnPresentCb exactly as any flip-model present.

@@ -1,21 +1,3 @@
-//! # Where `unsafe` sits on these declarations (R814)
-//!
-//! Rust's one memory-safety signal used to be attached to the wrong six
-//! declarations here, so a reviewer scanning for `unsafe` call sites looked in
-//! the wrong places. Three pointer-laundering entry points were SAFE
-//! (`set_resource_kmt_handles`, `transfer_resource_ownership`,
-//! `open_ddi_texture2d`) while three that take only scalars and cannot violate
-//! memory safety were `unsafe fn` (`present_frame_gate`, and
-//! `present_sync_fence_id` / `present_flip_wait_arm`, both retired with the
-//! kwait subsystem in T6/R912a).
-//!
-//! Scope limit worth stating, because it changes the finding's shape: cxx
-//! REQUIRES `unsafe fn` for any signature containing a raw pointer, and every
-//! raw-pointer declaration in this block already is. Those are correct and are
-//! not touched. `present_vehicle_copy` takes `usize` COM pointers AND is
-//! already unsafe, which is the correct end state; it is left alone too
-//! (`present_sync_publish` was its twin until R912a retired it).
-
 //! cxx bridge to DXVK's C++ engine.
 //!
 //! The UMD's `d3d10umddi` frontend (Rust) calls into DXVK's `DxvkInstance`/
@@ -85,7 +67,6 @@ mod ffi {
             association_flags: u32,
         ) -> usize;
         fn feed_trace_timestamp_ns(self: &HeliosDxvkDevice) -> u64;
-        fn feed_trace_render_callback(self: &HeliosDxvkDevice, duration_ns: u64);
         fn feed_trace_present_callback(self: &HeliosDxvkDevice, duration_ns: u64);
         /// # Safety
         /// `deferred_context_ptr` is borrowed and live. `command_list_ptr`
@@ -103,75 +84,6 @@ mod ffi {
             self: &HeliosDxvkDevice,
             deferred_context_ptr: usize,
         ) -> bool;
-        /// # Safety
-        /// `d3d11_resource_ptr` must be a live `ID3D11Resource*`; the bridge
-        /// `reinterpret_cast`s it and calls `GetCommonTexture` on it.
-        unsafe fn set_resource_kmt_handles(
-            self: &HeliosDxvkDevice,
-            d3d11_resource_ptr: usize,
-            local: u32,
-            global: u32,
-        ) -> bool;
-        unsafe fn get_resource_memory_info(
-            self: &HeliosDxvkDevice,
-            d3d11_resource_ptr: usize,
-            memory: *mut u64,
-            size: *mut u64,
-            offset: *mut u64,
-            resource_id: *mut u32,
-        ) -> bool;
-        /// C1 identity: exact creating-`vkAllocateMemory` size + memoryTypeIndex
-        /// of the resource's backing venus memory (recorded into the WDDM
-        /// allocation trailer for cross-process openers).
-        unsafe fn get_resource_alloc_identity(
-            self: &HeliosDxvkDevice,
-            d3d11_resource_ptr: usize,
-            venus_alloc_size: *mut u64,
-            memory_type_index: *mut u32,
-            global_vidmm_tracker: *mut u64,
-        ) -> bool;
-        /// # Safety
-        /// `d3d11_resource_ptr` must be a live `ID3D11Resource*`.
-        unsafe fn transfer_resource_ownership(
-            self: &HeliosDxvkDevice,
-            d3d11_resource_ptr: usize,
-        ) -> bool;
-        /// # Safety
-        /// Returns an OWNED COM pointer the caller must release; the safe
-        /// wrapper `open_texture2d` is the only thing that should call it.
-        unsafe fn open_ddi_texture2d(
-            self: &HeliosDxvkDevice,
-            width: u32,
-            height: u32,
-            format: u32,
-            bind_flags: u32,
-            misc_flags: u32,
-            global: u32,
-            renderer_resource_id: u32,
-            venus_alloc_size: u64,
-            memory_type_index: u32,
-            global_vidmm_tracker: u64,
-            scanout_linear: bool,
-            linear_scanout_target: bool,
-            cross_context_optimal: bool,
-        ) -> usize;
-
-        /// Create a dedicated OPTIMAL, DMA_BUF-exportable image and report
-        /// logical scanout metadata. `kmd_transfer_source` selects the
-        /// canonical GENERAL layout required by the KMD transfer importer.
-        /// Returns an owned `ID3D11Resource*` (as usize), or 0 on failure.
-        unsafe fn create_ddi_scanout_texture2d(
-            self: &HeliosDxvkDevice,
-            width: u32,
-            height: u32,
-            format: u32,
-            bind_flags: u32,
-            misc_flags: u32,
-            kmd_transfer_source: bool,
-            out_row_pitch: *mut u64,
-            out_offset: *mut u64,
-        ) -> usize;
-
         unsafe fn create_vertex_shader(
             self: &HeliosDxvkDevice,
             code: *const u8,
@@ -214,60 +126,9 @@ mod ffi {
             d3d11_resource_ptrs: *const usize,
             count: usize,
         ) -> bool;
-        /// Present-path frame-completion gate: bounded wait (timeout_us)
-        /// until the current flush's submission completes on the GPU, so the
-        /// IddCx consumer never copies a buffer whose writes are in flight.
-        /// Returns false on timeout (caller proceeds — bounded by design).
-        fn present_frame_gate(self: &HeliosDxvkDevice, timeout_us: u32, order_mode: u32) -> bool;
-        /// Flush and wait only through the actual vkQueueSubmit edge. Used by
-        /// WDDM 2.1 ReleaseResource; never waits for GPU completion.
+        /// Flush DXVK's CS thread and wait only through the actual
+        /// vkQueueSubmit edge. This never waits for GPU completion.
         fn flush_submitted(self: &HeliosDxvkDevice) -> bool;
-
-        /// # Safety
-        /// The three output pointers are live writable u32/u32/u64 storage for
-        /// the duration of the call. `d3d11_resource_ptr` is a live D3D11
-        /// resource COM pointer, as documented by the C++ bridge method.
-        unsafe fn publish_present_order(
-            self: &HeliosDxvkDevice,
-            d3d11_resource_ptr: usize,
-            out_ctx_id: *mut u32,
-            out_value32: *mut u32,
-            out_cookie: *mut u64,
-        ) -> bool;
-
-        /// D4a scanout acquire: hand the per-device KMD retirement event to
-        /// the DXVK device's signaler thread (auto-reset HANDLE as usize,
-        /// never 0). The UMD keeps ownership — DXVK only waits on it, and
-        /// DestroyDevice closes it after the bridge device has dropped (the
-        /// signaler joins inside ~DxvkDevice, so no waiter can outlive the
-        /// handle).
-        fn set_scanout_acquire_event(self: &HeliosDxvkDevice, event_handle: usize) -> bool;
-        /// Dcomp present vehicle: image-level copy of the imported ICD frame
-        /// (src) into the vehicle backbuffer texture (dst), sourcing the
-        /// import's LIVE storage (staging alias when present). The copy-time
-        /// consumer present-wait orders it against the producer's GPU
-        /// writes. 0 = ok, 1 = copied with a (counted) geometry mismatch,
-        /// negative = failure — fail the present loudly, do not flip.
-        unsafe fn present_vehicle_copy(
-            self: &HeliosDxvkDevice,
-            dst_resource_ptr: usize,
-            src_resource_ptr: usize,
-        ) -> i32;
-        /// D4b snapshot ring: image-level copy of the presented primary (src)
-        /// into a snapshot-ring image (dst), recorded on the open command
-        /// list BEFORE the present-time Flush so it rides frame N's own
-        /// command stream (queue-ordered after the frame's draws — no waits,
-        /// no CPU stalls). Clone of `present_vehicle_copy` minus the
-        /// staging-alias substitution: both operands are this device's own
-        /// images, never imports. 0 = ok, 1 = copied with a (counted)
-        /// geometry mismatch — the caller must NOT substitute the descriptor
-        /// for this present — negative = failure (present exactly as today).
-        unsafe fn present_snapshot_copy(
-            self: &HeliosDxvkDevice,
-            dst_resource_ptr: usize,
-            src_resource_ptr: usize,
-            windowed_blt_reservation: bool,
-        ) -> i32;
         unsafe fn create_geometry_shader(
             self: &HeliosDxvkDevice,
             code: *const u8,
@@ -338,16 +199,6 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11Texture2D, ID3D11Texture3D,
 };
 
-/// Adopt an owned COM pointer the bridge returned, or `None` for its 0-failure
-/// sentinel. The single `from_raw` for every owning bridge entry point.
-///
-/// # Safety
-/// `raw`, when non-zero, must be an `ID3D11Resource*` whose reference the
-/// bridge transferred to this caller.
-unsafe fn adopt_resource(raw: usize) -> Option<ID3D11Resource> {
-    (raw != 0).then(|| unsafe { ID3D11Resource::from_raw(raw as *mut c_void) })
-}
-
 impl ffi::HeliosDxvkDevice {
     // -- borrowed ----------------------------------------------------------
     //
@@ -368,83 +219,7 @@ impl ffi::HeliosDxvkDevice {
         (p != 0)
             .then(|| ManuallyDrop::new(unsafe { ID3D11DeviceContext::from_raw(p as *mut c_void) }))
     }
-
-    // -- owned -------------------------------------------------------------
-
-    /// # Safety
-    /// Caller upholds `open_ddi_texture2d`'s preconditions (a live KMT handle
-    /// and a renderer resource id the host still has).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn open_texture2d(
-        &self,
-        width: u32,
-        height: u32,
-        format: u32,
-        bind_flags: u32,
-        misc_flags: u32,
-        global: u32,
-        renderer_resource_id: u32,
-        venus_alloc_size: u64,
-        memory_type_index: u32,
-        global_vidmm_tracker: u64,
-        scanout_linear: bool,
-        linear_scanout_target: bool,
-        cross_context_optimal: bool,
-    ) -> Option<ID3D11Resource> {
-        // SAFETY: the caller upholds the resource-id/handle preconditions
-        // above, and the bridge transfers one reference on success.
-        unsafe {
-            adopt_resource(self.open_ddi_texture2d(
-                width,
-                height,
-                format,
-                bind_flags,
-                misc_flags,
-                global,
-                renderer_resource_id,
-                venus_alloc_size,
-                memory_type_index,
-                global_vidmm_tracker,
-                scanout_linear,
-                linear_scanout_target,
-                cross_context_optimal,
-            ))
-        }
-    }
-
-    /// A dedicated OPTIMAL, DMA_BUF-exportable image, plus its logical
-    /// scan-out metadata. `kmd_transfer_source` selects the canonical GENERAL
-    /// layout required by the KMD transfer importer.
-    pub(crate) fn create_scanout_texture2d(
-        &self,
-        width: u32,
-        height: u32,
-        format: u32,
-        bind_flags: u32,
-        misc_flags: u32,
-        kmd_transfer_source: bool,
-    ) -> Option<(ID3D11Resource, u64, u64)> {
-        let mut row_pitch: u64 = 0;
-        let mut offset: u64 = 0;
-        // SAFETY: both out-params point at live locals; the bridge zeroes them
-        // on entry and writes them before returning non-zero.
-        let raw = unsafe {
-            self.create_ddi_scanout_texture2d(
-                width,
-                height,
-                format,
-                bind_flags,
-                misc_flags,
-                kmd_transfer_source,
-                &mut row_pitch,
-                &mut offset,
-            )
-        };
-        // SAFETY: the bridge transfers one reference on success.
-        unsafe { adopt_resource(raw) }.map(|r| (r, row_pitch, offset))
-    }
 }
-
 // NOT wrapped, deliberately: the eight shader creates.
 //
 // R813 suggests an `Option<usize>` (or NonZero) wrapper for them too. Audited
@@ -471,44 +246,6 @@ impl ffi::HeliosDxvkDevice {
 //
 // The C++ side still returns `usize`, so the ABI is unchanged and this
 // migration cannot break the wire.
-
-/// A **source** resource pointer for the present path.
-///
-/// `present_vehicle_copy(dst, src)` took the same two COM pointers in the
-/// OPPOSITE order to the neighbouring `present_sync_publish(src, dst)` (retired
-/// in R912a), they were called ~30 lines apart in the same function, and a
-/// transposition compiled cleanly on both sides of the FFI. Transposing
-/// `present_vehicle_copy` is ALWAYS harmful -- the bridge copies the vehicle
-/// backbuffer INTO the imported ICD frame, the geometry check passes because
-/// both are the same size, `EXT_GEOM_MISMATCH` never fires, and the flipped
-/// backbuffer shows whatever it held last frame. That is exactly the
-/// stale-frame symptom class this project has already spent multiple sessions
-/// chasing.
-///
-/// With `SrcRes`/`DstRes` the transposition is a type error regardless of
-/// parameter order. R816.
-#[derive(Clone, Copy)]
-pub(crate) struct SrcRes(pub(crate) usize);
-
-/// A **destination** resource pointer for the present path. See [`SrcRes`].
-#[derive(Clone, Copy)]
-pub(crate) struct DstRes(pub(crate) usize);
-
-/// The optional KMD correlation for one ordinary present's exact producer
-/// submission. Zero is the only fallback representation: callers cannot carry
-/// a partial `{ctx,value,cookie}` into a KMD marker.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct PresentStreamCorrelation {
-    pub(crate) ctx_id: u32,
-    pub(crate) value32: u32,
-    pub(crate) cookie: u64,
-}
-
-impl PresentStreamCorrelation {
-    pub(crate) fn is_complete(self) -> bool {
-        self.ctx_id != 0 && self.value32 != 0 && self.cookie != 0
-    }
-}
 
 /// The DXVK bridge device, with the raw cxx surface sealed off.
 pub struct BridgeDevice {
@@ -691,75 +428,10 @@ impl BridgeDevice {
         })
     }
 
-    // -- owned COM ---------------------------------------------------------
-
-    /// # Safety
-    /// See [`ffi::HeliosDxvkDevice::open_texture2d`].
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn open_texture2d(
-        &self,
-        width: u32,
-        height: u32,
-        format: u32,
-        bind_flags: u32,
-        misc_flags: u32,
-        global: u32,
-        renderer_resource_id: u32,
-        venus_alloc_size: u64,
-        memory_type_index: u32,
-        global_vidmm_tracker: u64,
-        scanout_linear: bool,
-        linear_scanout_target: bool,
-        cross_context_optimal: bool,
-    ) -> Option<ID3D11Resource> {
-        unsafe {
-            self.get()?.open_texture2d(
-                width,
-                height,
-                format,
-                bind_flags,
-                misc_flags,
-                global,
-                renderer_resource_id,
-                venus_alloc_size,
-                memory_type_index,
-                global_vidmm_tracker,
-                scanout_linear,
-                linear_scanout_target,
-                cross_context_optimal,
-            )
-        }
-    }
-
-    pub(crate) fn create_scanout_texture2d(
-        &self,
-        width: u32,
-        height: u32,
-        format: u32,
-        bind_flags: u32,
-        misc_flags: u32,
-        kmd_transfer_source: bool,
-    ) -> Option<(ID3D11Resource, u64, u64)> {
-        self.get()?.create_scanout_texture2d(
-            width,
-            height,
-            format,
-            bind_flags,
-            misc_flags,
-            kmd_transfer_source,
-        )
-    }
-
     // -- scalar passthroughs ----------------------------------------------
 
     pub(crate) fn feed_trace_timestamp_ns(&self) -> u64 {
         self.get().map_or(0, |d| d.feed_trace_timestamp_ns())
-    }
-
-    pub(crate) fn feed_trace_render_callback(&self, duration_ns: u64) {
-        if let Some(d) = self.get() {
-            d.feed_trace_render_callback(duration_ns);
-        }
     }
 
     pub(crate) fn feed_trace_present_callback(&self, duration_ns: u64) {
@@ -768,111 +440,14 @@ impl BridgeDevice {
         }
     }
 
-    pub(crate) fn present_frame_gate(&self, timeout_us: u32, order_mode: u32) -> bool {
-        self.get()
-            .is_some_and(|d| d.present_frame_gate(timeout_us, order_mode))
-    }
-
     pub(crate) fn flush_submitted(&self) -> bool {
         self.get().is_some_and(|d| d.flush_submitted())
-    }
-
-    /// Publish this present on the device's named timeline so a consumer can
-    /// order its read GPU-side. `d3d11_resource_ptr` is the presented source
-    /// resource's COM pointer; the bridge derives the venus resource id the
-    /// consumer imports by. Slot publication remains the boolean result; the
-    /// optional stream correlation is fully zero unless all three fields name
-    /// this exact signal.
-    pub(crate) fn publish_present_order(
-        &self,
-        d3d11_resource_ptr: usize,
-    ) -> (bool, PresentStreamCorrelation) {
-        let Some(d) = self.get() else {
-            return (false, PresentStreamCorrelation::default());
-        };
-        let mut correlation = PresentStreamCorrelation::default();
-        // SAFETY: `d` is the bridge-owned live C++ device and all three
-        // out-pointers borrow initialized local fields for this synchronous
-        // call. The C++ bridge zeroes them before reporting failure.
-        let published = unsafe {
-            d.publish_present_order(
-                d3d11_resource_ptr,
-                &mut correlation.ctx_id,
-                &mut correlation.value32,
-                &mut correlation.cookie,
-            )
-        };
-        if !published || !correlation.is_complete() {
-            correlation = PresentStreamCorrelation::default();
-        }
-        (published, correlation)
-    }
-
-    /// D4a scanout acquire: deliver this device's KMD retirement event handle
-    /// to the DXVK signaler. See the ffi declaration for the ownership rule.
-    pub(crate) fn set_scanout_acquire_event(&self, event_handle: usize) -> bool {
-        self.get()
-            .is_some_and(|d| d.set_scanout_acquire_event(event_handle))
     }
 
     // -- pointer-laundering passthroughs -----------------------------------
     //
     // `unsafe` for the reason R814 established: each hands the bridge a raw
     // address it reinterpret_casts.
-
-    /// # Safety
-    /// `d3d11_resource_ptr` must be a live `ID3D11Resource*`.
-    pub(crate) unsafe fn set_resource_kmt_handles(
-        &self,
-        d3d11_resource_ptr: usize,
-        local: u32,
-        global: u32,
-    ) -> bool {
-        self.get().is_some_and(|d| unsafe {
-            d.set_resource_kmt_handles(d3d11_resource_ptr, local, global)
-        })
-    }
-
-    /// # Safety
-    /// `d3d11_resource_ptr` must be live; the out-params must be writable.
-    pub(crate) unsafe fn get_resource_memory_info(
-        &self,
-        d3d11_resource_ptr: usize,
-        memory: *mut u64,
-        size: *mut u64,
-        offset: *mut u64,
-        resource_id: *mut u32,
-    ) -> bool {
-        self.get().is_some_and(|d| unsafe {
-            d.get_resource_memory_info(d3d11_resource_ptr, memory, size, offset, resource_id)
-        })
-    }
-
-    /// # Safety
-    /// `d3d11_resource_ptr` must be live; the out-params must be writable.
-    pub(crate) unsafe fn get_resource_alloc_identity(
-        &self,
-        d3d11_resource_ptr: usize,
-        venus_alloc_size: *mut u64,
-        memory_type_index: *mut u32,
-        global_vidmm_tracker: *mut u64,
-    ) -> bool {
-        self.get().is_some_and(|d| unsafe {
-            d.get_resource_alloc_identity(
-                d3d11_resource_ptr,
-                venus_alloc_size,
-                memory_type_index,
-                global_vidmm_tracker,
-            )
-        })
-    }
-
-    /// # Safety
-    /// `d3d11_resource_ptr` must be a live `ID3D11Resource*`.
-    pub(crate) unsafe fn transfer_resource_ownership(&self, d3d11_resource_ptr: usize) -> bool {
-        self.get()
-            .is_some_and(|d| unsafe { d.transfer_resource_ownership(d3d11_resource_ptr) })
-    }
 
     /// # Safety
     /// `d3d11_resource_ptrs` must point at `count` live `ID3D11Resource*`.
@@ -883,34 +458,6 @@ impl BridgeDevice {
     ) -> bool {
         self.get()
             .is_some_and(|d| unsafe { d.rotate_resource_backings(d3d11_resource_ptrs, count) })
-    }
-
-    /// # Safety
-    /// Both pointers must be live `ID3D11Resource*`.
-    pub(crate) unsafe fn present_vehicle_copy(&self, dst: DstRes, src: SrcRes) -> i32 {
-        // C++ order here is (dst, src) -- the opposite of publish above, which
-        // is the whole hazard. The named types mean the two orders no longer
-        // have to agree for the call to be correct.
-        self.get()
-            .map_or(-1, |d| unsafe { d.present_vehicle_copy(dst.0, src.0) })
-    }
-
-    /// D4b snapshot blit: S_i <- presented primary, recorded before the
-    /// present-time Flush. See the ffi declaration for the return contract.
-    ///
-    /// # Safety
-    /// Both pointers must be live `ID3D11Resource*`.
-    pub(crate) unsafe fn present_snapshot_copy(
-        &self,
-        dst: DstRes,
-        src: SrcRes,
-        windowed_blt_reservation: bool,
-    ) -> i32 {
-        // Same (dst, src) C++ order and the same transposition hazard as
-        // `present_vehicle_copy`; the newtypes are what make it a type error.
-        self.get().map_or(-1, |d| unsafe {
-            d.present_snapshot_copy(dst.0, src.0, windowed_blt_reservation)
-        })
     }
 
     // -- shader creates ----------------------------------------------------

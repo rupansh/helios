@@ -29,14 +29,9 @@
 //! `helios_protocol`'s, read by `kmd_render` and by the D3D11 driver, and L4
 //! reuses it verbatim.
 //!
-//! ⚠ The three records this block used to name — `HeliosWddmAllocPrivate`, the
-//! KMD-stamped `HeliosWddmOpenIdentity` and the `HeliosPresentRenderCmd` present
-//! identity channel — are **retired**, and the reversal is recorded rather than
-//! quietly edited. The first two are replaced by HWA2 in one direction only (the
-//! KMD writes at create, every opener treats it as `const`); the third has no
-//! successor in this driver yet, because its `resource_id` is a host resource id
-//! §10.3 forbids any UMD supplying — see `PresentIdentityNoResourceId` and mesa
-//! lane unit A3.
+//! HWA2 remains the create-time allocation descriptor. Present emits no private
+//! identity record; exact outer-token ownership is resolved through the landed
+//! direct translator graph.
 //!
 //! # The unwind guard
 //!

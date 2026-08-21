@@ -36,9 +36,6 @@ mod device_funcs;
 mod forward;
 mod knobs;
 
-mod scanout_acquire;
-mod vehicle_exports;
-
 // `format` and `hr` moved to the shared `umd_common` crate at stage S1, `log`
 // (with the rest of the mechanisms) at S2 (`DECISIONS.md` D3b). Re-exported at
 // the crate root under their original names so every `crate::format::…`,
@@ -80,9 +77,8 @@ pub extern "system" fn DllMain(
 }
 
 pub(crate) use knobs::{
-    feature_level_mode, log_knob_inventory, scanout_acquire_knob, scanout_snapshot_knob,
-    umd_async_present_stream, umd_command_lists, umd_deferred_diagnostics, umd_free_threaded,
-    vehicle_flip_gate_us,
+    feature_level_mode, log_knob_inventory, umd_command_lists, umd_deferred_diagnostics,
+    umd_free_threaded,
 };
 // The two writers are `#[macro_export]`ed by `umd_common`, so they live at that
 // crate's root rather than in its `log` module. Re-exported here under their

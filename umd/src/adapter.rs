@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::get_caps;
 use crate::hr::{Hresult, DXGI_STATUS_NO_REDIRECTION, E_FAIL, E_NOTIMPL, E_OUTOFMEMORY, S_OK};
-use crate::{bridge, ddi, device_funcs, forward};
+use crate::{bridge, ddi, device_funcs};
 use crate::{log_error, trace_line};
 use crate::{log_knob_inventory, log_self_module_path, trace_enabled};
 use helios_protocol::{HeliosUmdAdapterInfoV1, HELIOS_PACKAGE_GENERATION};
@@ -276,12 +276,6 @@ unsafe fn open_adapter_common(
         Err(hr) => return hr,
     };
 
-    // D4a scanout acquire: `pfnEscapeCb`'s first argument is the RUNTIME
-    // adapter handle (PFND3DDDI_ESCAPECB(hAdapter, ..) — the WDK's own
-    // signature), which only ever appears here. Capture it; every open in a
-    // process targets the same Helios adapter.
-    crate::scanout_acquire::note_runtime_adapter(open.hRTAdapter.handle);
-
     open.hAdapter = ddi::D3D10DDI_HADAPTER {
         pDrvPrivate: Box::into_raw(adapter).cast(),
     };
@@ -535,12 +529,6 @@ unsafe extern "C" fn create_device(
                 // to cast at this site.
                 kt_callbacks: create.pKTCallbacks,
                 dxgi_callbacks: create.DXGIBaseDDI.pDXGIBaseCallbacks,
-                // R910 retired the whole legacy LINEAR scan-out value model
-                // (ScanoutTarget/ScanoutKind/ScanoutProbe, scanout_epoch,
-                // scanout_copy_count, composition_source). The exact-primary
-                // identity path is `direct_scanout_allocations` plus
-                // `presented_primary_private`, and it is now the only one.
-                direct_scanout_allocations: std::sync::Mutex::new(Vec::new()),
                 h_rt_core_layer: create.hRTCoreLayer.handle,
                 um_callbacks: p_um_callbacks.cast(),
                 negotiated,
@@ -603,26 +591,6 @@ unsafe extern "C" fn create_device(
     // The device is handed to the runtime from here; it owns teardown through
     // DestroyDevice.
     guard.defuse();
-    // Record it live for `helios_umd_wait_last_present`, which dereferences a
-    // device pointer the ICD recorded on an earlier call (R415).
-    forward::register_live_device(create.hDrvDevice.pDrvPrivate as usize);
-
-    // D4a scanout acquire (FIX-DESIGN-d4a.md §4): probe the KMD read-ledger
-    // capability, map the ledger, register this device's retirement event, and
-    // hand the event to the DXVK device's signaler thread. Deliberately after
-    // defuse(): every failure inside degrades to "feature off for this
-    // device" (logged + counted) and never unwinds device creation, so the
-    // rollback guard needs no acquire knowledge. Knob off = no calls at all.
-    unsafe {
-        let dev = &mut *(create.hDrvDevice.pDrvPrivate as *mut device_funcs::HeliosDevice);
-        let event = crate::scanout_acquire::init_for_device(dev);
-        if event != 0 {
-            // The UMD keeps ownership of the handle; DestroyDevice closes it
-            // only after the bridge (and with it the DXVK signaler) is gone.
-            dev.dxvk.set_scanout_acquire_event(event);
-        }
-    }
-
     if std::env::var_os("HELIOS_DXGI_NO_REDIRECTION").is_some() {
         log_error!(
             "  CreateDevice -> DXGI_STATUS_NO_REDIRECTION (env-gated; DXGI desktop fallback)"

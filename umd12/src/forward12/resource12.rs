@@ -107,18 +107,9 @@
 //!    sends an HWA2 descriptor the KMD validates, echoes and completes, and an opener
 //!    treats the result as `const` — `DxgkDdiOpenAllocation` writes no byte of it.
 //!
-//! # ⛔ The §5 gap this lane now carries, named
-//!
-//! The retired record's host resid was the link between the WDDM allocation and the
-//! `VkDeviceMemory` vkd3d renders into. HWA2 has no successor field and one may not be
-//! invented (`K4-CONTRACT.md` §5). ⇒ this driver mints a valid kernel allocation for
-//! every committed resource and **cannot yet present or export its contents**:
-//! `Hwa2VenusResIdDropped` counts every create that had a host resid available and did
-//! not send it, and `PresentIdentityNoResourceId` refuses the frame's identity record.
-//! Both name **mesa lane unit A3**, which replaces the mechanism rather than the field:
-//! the ICD stops naming host resources and the KMD patches the resid in from
-//! `HeliosNativeRenderPatch`. An ICD in this state cannot import; that is the
-//! retirement's intended intermediate state, recorded rather than worked around.
+//! The landed F21/A3-A9 graph associates this allocation with the exact outer
+//! allocation token at resource creation and resolves it device-locally before
+//! direct translator dispatch. No host resource ID is carried by HWA2 or Present.
 //!
 //! ⇒ `PARALLEL.md` §5's *"`umd12` does not yet depend on `helios_protocol`; the
 //! first lane that needs a crossing record adds it, and says so"* is discharged
@@ -208,10 +199,8 @@ use crate::{ddi12, log_error, note_refusal};
 /// argument lives. This is a mirror, kept in sync by hand, because the
 /// `D3D12_HEAP_FLAGS` word is the only channel between the two and neither side can
 /// include the other's header — the same arrangement as `HELIOS_VKD3D_FENCE_*` in
-/// `umd12/bridge/vkd3d_bridge.h`. ⚠ A drift is not silent: the fork would take no
-/// export arm, the memory would have no venus resource, and
-/// `IdentityVenusUnresolved` would count every primary create while
-/// `HeapPrimaryVenusExport` counted the same number of translations.
+/// `umd12/bridge/vkd3d_bridge.h`. Focused source gates keep the mirrored value
+/// coherent with the fork.
 ///
 /// `1 << 30` is above every value `D3D12_HEAP_FLAGS` defines (the highest is
 /// `TOOLS_USE_MANUAL_WRITE_TRACKING`, `0x2000`), and vkd3d's `validate_heap_desc`
@@ -1657,12 +1646,9 @@ fn hwa2_d3d_ddi_format(dxgi_format: u32) -> u32 {
 /// **No host resource id, and no Vulkan memory type index** (§10.3, K4-CONTRACT §5).
 /// The retired `HeliosWddmAllocPrivate::adopt_resource_id` carried the first and the
 /// retired `HeliosWddmAllocMeta::memory_type_index` the second; HWA2 has an
-/// equivalent for neither and neither may be re-added under another name. The engine
-/// still *knows* both — [`crate::bridge12::BridgeDevice12::resource_venus_identity`]
-/// answers them — and this driver deliberately drops them on the floor, counting
-/// `Hwa2VenusResIdDropped` so the drop is a number rather than a silence. The
-/// mechanism that replaces them is **mesa lane unit A3**: the ICD stops naming host
-/// resources at all and the KMD patches the resid in from `HeliosNativeRenderPatch`.
+/// equivalent for neither and neither may be re-added under another name. The exact
+/// outer allocation token travels through the separate device-scoped F21/A7
+/// association and is resolved before direct translator dispatch.
 ///
 /// Returns `None` when some field of this create has no HWA2 spelling; the caller
 /// counts `Hwa2GeometryUnrepresentable` and fails the create. ⛔ Never a partial
@@ -1881,16 +1867,9 @@ fn hwa2_create_input(
 /// the backing rather than adopting one, and the open-time restamp is deleted —
 /// an opener reads the same immutable descriptor the creator sent.
 ///
-/// ⛔ **What that costs until mesa unit A3 lands, stated rather than papered over.**
-/// The kernel allocation this function mints is not yet the same host object as the
-/// `VkDeviceMemory` vkd3d renders into; joining them is A3's job (the ICD stops
-/// naming host resources and the KMD patches the resid in from
-/// `HeliosNativeRenderPatch`). Until then this driver owns a valid WDDM allocation
-/// for every committed resource and **cannot present or export its contents** —
-/// `present12` refuses with `PresentIdentityNoResourceId` naming A3, which is the
-/// retirement's intended intermediate state and not a regression. Nothing here
-/// fabricates the missing link, and `Hwa2VenusResIdDropped` counts every create that
-/// had a host resid available and did not send it.
+/// The exact engine allocation association is established independently by F21 and
+/// consumed by the landed A3-A9 direct graph. This function neither fabricates nor
+/// transports a host resource ID.
 ///
 /// # ⛔ Every failure fails the CREATE, and that is the contract rather than a
 /// severity choice
@@ -1915,18 +1894,12 @@ fn hwa2_create_input(
 /// | counter | what it means | where the fix is |
 /// |---|---|---|
 /// | `IdentityVkMemoryUnresolved` | the engine could not name the memory a resource is bound to, so its **size** is unknown and HWA2's `byte_size` cannot be stated | the vkd3d fork / the interop interface |
-/// | `IdentityOffsetNonZero` | the engine suballocated the resource, so the plane records cannot be bounded against a dedicated extent | the fork's dedicated-allocation arm |
 /// | `Hwa2GeometryUnrepresentable` | some field of this create has no HWA2 spelling (a standard-swizzle layout, a 0 row pitch, a width above `u32::MAX`) | this file's translation, or the record |
 /// | `Hwa2CreateInputInvalid` | the descriptor this driver built failed `validate_create_input` — **a bug in this file**, caught before the kernel sees it | this file |
 /// | `Hwa2WriteBackAbsent` | `pfnAllocateCb` succeeded and the private buffer came back with `allocation_generation == 0`, i.e. the kernel's create-time write did not reach this buffer | dxgkrnl's propagation, or the KMD's write site |
 /// | `Hwa2CreateOutputInvalid` | the kernel wrote a descriptor that failed `validate_create_output` | the KMD |
 /// | `AllocateCbMissing` / `AllocateCbFailed` / `AllocateCbNoHandle` | dxgkrnl refused | the record, the flags, or the kernel |
 /// | `IdentityRegistryAllocFailed` | process memory could not grow the identity registry | process memory pressure |
-///
-/// ⚠ `IdentityVenusUnresolved` is **no longer in that table**: it is now a census,
-/// not a refusal. This create needs the *engine* half of the identity (the bound
-/// memory's size) and needs nothing at all from the ICD, so an unexportable memory no
-/// longer fails a create — it fails a *present*, later, in `present12`.
 ///
 /// # ⚠ What this does NOT set, and why each omission is a decision
 ///
@@ -4806,24 +4779,10 @@ struct L4Refusals {
     /// the gap, and the gap is the interesting quantity.
     /// `CommittedVenusExport - IdentityRecorded` is the number of committed resources
     /// that got no kernel allocation, and the counter that says why is one of
-    /// `IdentityVkMemoryUnresolved`, `IdentityOffsetNonZero`,
     /// `Hwa2GeometryUnrepresentable`, `Hwa2CreateInputInvalid`, `AllocateCb*`,
     /// `Hwa2WriteBackAbsent`, `Hwa2CreateOutputInvalid`, `Hwa2EchoMismatch` or
     /// `IdentityRegistryAllocFailed`.
-    ///
-    /// ⚠ The word "adopted" and the counters `IdentityResIdShared` and
-    /// `OwnershipTransferFailed` are struck from this list rather than reworded.
-    /// Both counters survive as retired append-only slots that are **permanently 0**
-    /// — the first had no id left to collide, the second's bridge call is deleted —
-    /// because there is no adoption any more (K4-CONTRACT §5), so neither can widen
-    /// this gap and reading them as a cause would send a reader looking for a
-    /// mechanism that is gone.
     identity_recorded: RefusalCounter,
-    /// ⛔ Retired append-only telemetry slot. The fixed 64-entry identity table no
-    /// longer exists; the dynamic registry reports allocation pressure through
-    /// `IdentityRegistryAllocFailed`. This counter remains in its historical
-    /// position so refusal-summary field order does not change; expected 0.
-    identity_table_full: RefusalCounter,
     /// A recorded identity **overwrote** one already held for the same engine
     /// resource address. ⛔ Expected 0, and non-zero is a lifetime defect, not a
     /// benign duplicate: it means a `pfnDestroyHeapAndResource` did not retire
@@ -4837,34 +4796,6 @@ struct L4Refusals {
     /// needed. It counts only removals that found an entry, so non-committed
     /// resource destroys do not move it.
     identity_removed: RefusalCounter,
-    /// ⚠⚠ **RE-GRADED at UP-5, and its bump site moved.** It used to count *entries
-    /// recorded with `vk_memory == 0`*, and was expected to equal `IdentityRecorded`
-    /// because no bridge accessor existed. Both halves are now false: the accessor
-    /// exists, and an entry with a zero half is no longer representable — the table's
-    /// invariant is that an entry exists **iff** a WDDM allocation exists.
-    ///
-    /// It now counts **a committed create refused because the ENGINE could not name
-    /// the memory the resource is bound to** — a zero `vk_memory` or a zero
-    /// `memory_size`, i.e. `IdentityStatus::BadArg`, `NoInterop` or `EngineRefused`.
-    /// ⛔ Expected 0, and non-zero points at the vkd3d fork or the interop interface,
-    /// not at the ICD. ⚠ **This is now the ONLY identity failure that refuses a
-    /// create**: HWA2's `byte_size` is the bound memory's extent and only the engine
-    /// knows it, whereas nothing in the record needs the ICD at all.
-    identity_vk_memory_unresolved: RefusalCounter,
-    /// ⚠⚠ **RE-GRADED AGAIN by the HPS2 retirement (K4), from a refusal to a
-    /// census**, and both gradings are written out so neither change is silent. At
-    /// UP-4 it counted entries recorded with `vk_memory == 0`; at UP-5 it counted **a
-    /// committed create refused because the memory had no venus resource**. It now
-    /// counts a create that simply *proceeded* without one.
-    ///
-    /// ⛔ Nothing in HWA2 names a host resource (§10.3), so a memory the ICD cannot
-    /// export no longer blocks anything at create time — it blocks the *present*,
-    /// where `PresentIdentityNoResourceId` names mesa unit A3. This counter still says
-    /// the export chain did not engage, which stays worth knowing while
-    /// `HELIOS_HEAP_FLAG_VENUS_EXPORT` is still in the tree; read it against
-    /// `CommittedVenusExport` and `Hwa2VenusResIdDropped`, which is its complement —
-    /// the two partition every committed create.
-    identity_venus_unresolved: RefusalCounter,
     /// `D3D12DDI_HEAP_FLAG_PRIMARY` arrived on the **heap-only** arm, with no
     /// resource description. ⛔ Expected 0: `ResourceHeaps.md:897` says the flag
     /// obliges the driver to create a resource simultaneously with the heap, and
@@ -4892,75 +4823,6 @@ struct L4Refusals {
     /// primary. `CommittedVenusExport`, not this counter, is the adoption
     /// denominator now.
     heap_primary_venus_export: RefusalCounter,
-    /// A committed resource's memory came back with a non-zero **offset**, i.e. the engine
-    /// suballocated it. ⛔ Expected 0, and non-zero means the fork's dedicated
-    /// arm did not engage — the create is refused.
-    ///
-    /// ⚠ **The reason changed with the record and is restated rather than left
-    /// stale.** It used to be that one venus resource id shared between D3D12
-    /// resources breaks the *adopt* model. There is no adoption
-    /// (`docs/retirement/K4-CONTRACT.md` §5). The reason now is the descriptor's own
-    /// shape: `HeliosWddmAllocationDescV2::byte_size` is the whole bound
-    /// `VkDeviceMemory` and every plane record is bounded against it, so a resource
-    /// that does not own its extent cannot be described at all.
-    identity_offset_nonzero: RefusalCounter,
-    /// ⛔ **Retired append-only telemetry slot: PERMANENTLY 0 as of the HPS2
-    /// retirement.** It was the rotation-collapse detector — two live resources
-    /// claiming one `venus_res_id` — and it died with the id: `identity12` holds no
-    /// host resource id and §10.3 forbids it keeping one, so there is nothing left to
-    /// collide. It remains in its historical position so refusal-summary field order
-    /// does not change.
-    ///
-    /// ⚠⚠ **THE SUCCESSOR DOES NOT EXIST YET, and it is recorded here rather than
-    /// asserted away.** `identity12`'s module doc says the property "is now settled in
-    /// the kernel's own allocation objects plus mesa unit **A3**". Measured at HEAD,
-    /// the A3 half is future work and the kernel half is not there at all:
-    ///
-    /// * `kmd_render`'s `AllocationContext::resource_id` is the resid's sole legal
-    ///   home, but those contexts are per-`hAllocation` boxes with no adapter-wide
-    ///   index, and the allocation generation is explicitly *"never an identity lookup
-    ///   key"* (`adapter/allocation_object.rs`). Nothing scans for a duplicate.
-    /// * The one adapter-wide resid index that does exist — `create_allocation.rs`'s
-    ///   `SCANOUT_ALLOCS` — does **not** detect duplicates.
-    ///   `register_scanout_allocation` CASes the first *free* slot without checking
-    ///   whether the resid is already registered, so two allocations sharing one resid
-    ///   take two slots;
-    ///   `scanout_allocation_for_resource` returns whichever comes first in array
-    ///   order; and `unregister_scanout_allocation` clears the first match, which can
-    ///   be the *other* allocation's slot.
-    ///
-    /// ⭐ **Unreachable today**, which is why this is a recorded gap and not a live
-    /// defect: the KMD mints one venus resource per allocation (`blob.res_id`, from
-    /// its own create), so resids are unique per allocation by construction, and this
-    /// driver's `IdentityOffsetNonZero` refuses the suballocated committed resource
-    /// that is the usual route to a shared id. ⛔ **It becomes reachable exactly when
-    /// mesa unit A3 lands** and the resid starts arriving from
-    /// `HeliosNativeRenderPatch` instead of a KMD-local create. At that point the
-    /// failure is worse than the lost surface the deleted detector caught: a destroy
-    /// can clear the *surviving* allocation's slot and leave a freed
-    /// `AllocationContext*` published under the id for `DxgkDdiPresent` to read.
-    /// `destroy_allocation_ctx`'s comment — *"after this no Present can resolve this
-    /// resource id to a handle whose Box is about to be dropped"* — is a claim that
-    /// holds only while resids are unique.
-    ///
-    /// ⇒ **CROSS-LANE**, against the A3 unit and `ddi/create_allocation.rs`: A3 must
-    /// not land without a duplicate-resid check in `register_scanout_allocation` and a
-    /// named counter for it. This slot cannot be that counter — it is a UMD counter
-    /// and the collision is no longer visible from user mode at all.
-    identity_res_id_shared: RefusalCounter,
-    /// A committed allocation was recorded with `ctx_id == 0`, because the
-    /// instance-scoped venus context id was unavailable. ⚠ **Not a refusal and not a
-    /// defect.** The value used to travel into `HeliosWddmOpenIdentity::ctx_id`
-    /// (*"diagnostic only"* by that retired record's own doc); HWA2 has no context
-    /// field at all, so it now stays inside this process. Non-zero means the ICD is
-    /// absent or predates `helios_venus_instance_ctx_id`.
-    identity_ctx_id_unavailable: RefusalCounter,
-    /// vkd3d's `memory_size` and the ICD's `venus_alloc_size` **disagreed** for one
-    /// `VkDeviceMemory`. ⛔ Expected 0: they are two readings of one
-    /// `VkMemoryAllocateInfo::allocationSize`. Non-zero means one of them describes a
-    /// different object, and a cross-process import is exact-size — so an opener will
-    /// reject the surface.
-    identity_alloc_size_disagreement: RefusalCounter,
     /// `pfnAllocateCb` was absent from the corelayer table, or the table itself was
     /// null. ⛔ Expected 0 — `create_device` refuses a null `p12UMCallbacks` — and a
     /// hit means no committed resource can get a kernel allocation at all.
@@ -4977,13 +4839,6 @@ struct L4Refusals {
     /// runtime contract violation, refused here rather than allowed to become a 0
     /// in `pfnPresent`'s `BroadcastSrcAllocation[0]`.
     allocate_cb_no_handle: RefusalCounter,
-    /// ⛔ **Retired append-only telemetry slot: PERMANENTLY 0 as of the HPS2
-    /// retirement.** It counted the venus ICD refusing to hand a host resource's
-    /// ownership to the WDDM allocation that had just adopted it. There is no
-    /// adoption: the KMD creates the backing, the ICD keeps its own resource, and
-    /// neither can double-unref the other's. Kept in position so refusal-summary field
-    /// order does not change.
-    ownership_transfer_failed: RefusalCounter,
     /// `pfnDeallocateCb` was unreachable at destroy — absent from the table, or the
     /// device did not resolve. ⛔ Expected 0, and every hit is **one leaked WDDM
     /// allocation**, unreachable until process exit.
@@ -5063,19 +4918,6 @@ struct L4Refusals {
     /// finding about the kernel's write site, not a value to adopt — the create is
     /// refused and rolled back.
     hwa2_echo_mismatch: RefusalCounter,
-    /// A committed create for which the engine and the ICD **could** name the host
-    /// venus resource id, and this driver deliberately did **not** send it.
-    ///
-    /// ⚠ **Not a refusal — the census of the §5 gap**, at the exact site where the
-    /// value is dropped. HWA2 carries no host resource token (§10.3) and
-    /// `docs/retirement/K4-CONTRACT.md` §5 forbids inventing a replacement field,
-    /// stashing it elsewhere, or keeping the legacy record alive as a side channel.
-    /// ⇒ the mechanism that replaces it is **mesa lane unit A3**: the ICD stops naming
-    /// host resources at all and the KMD patches the resid in from
-    /// `HeliosNativeRenderPatch`. Read it against `IdentityVenusUnresolved`, which is
-    /// its complement, and against `PresentIdentityNoResourceId`, which is where the
-    /// gap is actually paid for.
-    hwa2_venus_res_id_dropped: RefusalCounter,
     /// A Core-0111 resource named a nonzero GUID layout while the GUID layout
     /// tier is unadvertised. The resource or allocation-info query is refused.
     resource_layout_guid_refused: RefusalCounter,
@@ -5130,22 +4972,14 @@ static L4_REFUSALS: L4Refusals = L4Refusals {
     ),
     heap_block_unreclaimed: RefusalCounter::new("HeapBlockUnreclaimed"),
     identity_recorded: RefusalCounter::new("IdentityRecorded"),
-    identity_table_full: RefusalCounter::new("IdentityTableFull"),
     identity_replaced: RefusalCounter::new("IdentityReplaced"),
     identity_removed: RefusalCounter::new("IdentityRemoved"),
-    identity_vk_memory_unresolved: RefusalCounter::new("IdentityVkMemoryUnresolved"),
-    identity_venus_unresolved: RefusalCounter::new("IdentityVenusUnresolved"),
     heap_primary_without_resource: RefusalCounter::new("HeapPrimaryWithoutResource"),
     resource_optimization_primary: RefusalCounter::new("ResourceOptimizationPrimary"),
     heap_primary_venus_export: RefusalCounter::new("HeapPrimaryVenusExport"),
-    identity_offset_nonzero: RefusalCounter::new("IdentityOffsetNonZero"),
-    identity_res_id_shared: RefusalCounter::new("IdentityResIdShared"),
-    identity_ctx_id_unavailable: RefusalCounter::new("IdentityCtxIdUnavailable"),
-    identity_alloc_size_disagreement: RefusalCounter::new("IdentityAllocSizeDisagreement"),
     allocate_cb_missing: RefusalCounter::new("AllocateCbMissing"),
     allocate_cb_failed: RefusalCounter::new("AllocateCbFailed"),
     allocate_cb_no_handle: RefusalCounter::new("AllocateCbNoHandle"),
-    ownership_transfer_failed: RefusalCounter::new("OwnershipTransferFailed"),
     deallocate_cb_missing: RefusalCounter::new("DeallocateCbMissing"),
     deallocate_cb_failed: RefusalCounter::new("DeallocateCbFailed"),
     alloc_private_written_back: RefusalCounter::new("AllocPrivateWrittenBack"),
@@ -5157,7 +4991,6 @@ static L4_REFUSALS: L4Refusals = L4Refusals {
     hwa2_write_back_absent: RefusalCounter::new("Hwa2WriteBackAbsent"),
     hwa2_create_output_invalid: RefusalCounter::new("Hwa2CreateOutputInvalid"),
     hwa2_echo_mismatch: RefusalCounter::new("Hwa2EchoMismatch"),
-    hwa2_venus_res_id_dropped: RefusalCounter::new("Hwa2VenusResIdDropped"),
     resource_layout_guid_refused: RefusalCounter::new("ResourceLayoutGuidRefused"),
     texture_layout_query_bad_arg: RefusalCounter::new("TextureLayoutQueryBadArg"),
     texture_layout_query_empty: RefusalCounter::new("TextureLayoutQueryEmpty"),
@@ -5216,22 +5049,14 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L4_REFUSALS.resource_alignment_restriction_ignored,
     &L4_REFUSALS.heap_block_unreclaimed,
     &L4_REFUSALS.identity_recorded,
-    &L4_REFUSALS.identity_table_full,
     &L4_REFUSALS.identity_replaced,
     &L4_REFUSALS.identity_removed,
-    &L4_REFUSALS.identity_vk_memory_unresolved,
-    &L4_REFUSALS.identity_venus_unresolved,
     &L4_REFUSALS.heap_primary_without_resource,
     &L4_REFUSALS.resource_optimization_primary,
     &L4_REFUSALS.heap_primary_venus_export,
-    &L4_REFUSALS.identity_offset_nonzero,
-    &L4_REFUSALS.identity_res_id_shared,
-    &L4_REFUSALS.identity_ctx_id_unavailable,
-    &L4_REFUSALS.identity_alloc_size_disagreement,
     &L4_REFUSALS.allocate_cb_missing,
     &L4_REFUSALS.allocate_cb_failed,
     &L4_REFUSALS.allocate_cb_no_handle,
-    &L4_REFUSALS.ownership_transfer_failed,
     &L4_REFUSALS.deallocate_cb_missing,
     &L4_REFUSALS.deallocate_cb_failed,
     &L4_REFUSALS.alloc_private_written_back,
@@ -5248,7 +5073,6 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L4_REFUSALS.hwa2_write_back_absent,
     &L4_REFUSALS.hwa2_create_output_invalid,
     &L4_REFUSALS.hwa2_echo_mismatch,
-    &L4_REFUSALS.hwa2_venus_res_id_dropped,
     // APPENDED with the Core-0111 descriptor/table transition.
     &L4_REFUSALS.resource_layout_guid_refused,
     &L4_REFUSALS.texture_layout_query_bad_arg,

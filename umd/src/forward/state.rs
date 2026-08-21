@@ -55,13 +55,6 @@ pub struct ResourceState {
     /// handles that way is what returned 0x80070057 and leaked the runtime's
     /// side of the open.
     pub(crate) ownership: AllocationOwnership,
-    pub(crate) present_private: HeliosPresentPrivateData,
-    /// Exact creation/open-time ordinary texture identity used only to create a
-    /// WindowedBlt snapshot. It is deliberately distinct from `present_private`:
-    /// the latter rotates with a direct primary and remains empty for ordinary
-    /// resources, so no validity test can turn this source into a scanout
-    /// selector.
-    pub(crate) snapshot_source: Option<SnapshotSourceDesc>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -530,16 +523,6 @@ pub(crate) unsafe fn drain_outer_allocation_teardown(
     (pending_count, live)
 }
 
-#[derive(Clone, Copy)]
-pub(crate) struct SnapshotSourceDesc {
-    pub(crate) resource_id: u32,
-    pub(crate) venus_alloc_size: u64,
-    pub(crate) memory_type_index: u32,
-    pub(crate) width: u32,
-    pub(crate) height: u32,
-    pub(crate) dxgi_format: u32,
-}
-
 /// Who owns the WDDM allocation behind a resource.
 ///
 /// This used to be an unnamed positional `bool` sitting between `km_resource`
@@ -715,26 +698,6 @@ pub(crate) fn present_force_opaque_enabled() -> bool {
 pub(crate) fn present_optimize_composition_enabled() -> bool {
     static VALUE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VALUE.get_or_init(|| env_flag("HELIOS_PRESENT_OPTIMIZE_COMPOSITION"))
-}
-
-pub(crate) fn empty_present_private() -> HeliosPresentPrivateData {
-    HeliosPresentPrivateData {
-        plane_offset: 0,
-        magic: 0,
-        version: 0,
-        resource_id: 0,
-        width: 0,
-        height: 0,
-        pitch: 0,
-        dxgi_format: 0,
-        reserved: 0,
-        venus_alloc_size: 0,
-        present_ctx_id: 0,
-        present_value: 0,
-        present_cookie: 0,
-        snapshot_memory_type_index: 0,
-        snapshot_purpose: HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE,
-    }
 }
 
 // ⛔⛔ K4 DELETED four things that used to live here, and none of them may come
@@ -1033,8 +996,6 @@ pub(crate) unsafe fn store_resource(
     km_resource: ddi::D3DKMT_HANDLE,
     rt_resource: ddi::HANDLE,
     ownership: AllocationOwnership,
-    present_private: HeliosPresentPrivateData,
-    snapshot_source: Option<SnapshotSourceDesc>,
 ) {
     let Some(slot) = boxed_slot(h_res) else {
         drop(obj);
@@ -1055,51 +1016,7 @@ pub(crate) unsafe fn store_resource(
         km_resource,
         rt_resource,
         ownership,
-        present_private,
-        snapshot_source,
     });
-}
-
-pub(crate) unsafe fn stamp_dxvk_resource_kmt_handles(
-    h: Hdevice,
-    obj: &ID3D11Resource,
-    local: ddi::D3DKMT_HANDLE,
-    global: ddi::D3DKMT_HANDLE,
-) {
-    trace_line!(
-        "DDI resource KMT stamp enter: raw_local=0x{:x} raw_global=0x{:x}",
-        local,
-        global
-    );
-    let local = if local != 0 { local } else { global };
-    if local == 0 {
-        trace_line!("DDI resource KMT stamp skipped: no usable handle");
-        return;
-    }
-    let Some(dev) = helios_device(h) else {
-        log_error!("DDI resource KMT stamp skipped: missing device");
-        return;
-    };
-    if dev
-        .dxvk
-        // SAFETY: `obj` is a live ID3D11Resource borrowed for this call, so the
-        // pointer the bridge reinterpret_casts is valid for its duration.
-        // R814 moved `unsafe` onto this declaration because it launders a
-        // pointer; the marking now matches where the precondition is.
-        .set_resource_kmt_handles(obj.as_raw() as usize, local, global)
-    {
-        log_error!(
-            "DDI resource KMT handles stamped: local=0x{:x} global=0x{:x}",
-            local,
-            global
-        );
-    } else {
-        log_error!(
-            "DDI resource KMT handle stamp failed: local=0x{:x} global=0x{:x}",
-            local,
-            global
-        );
-    }
 }
 
 pub(crate) unsafe fn load_resource(
@@ -1164,113 +1081,6 @@ pub(crate) unsafe fn resource_parent_handles(
     resource_state(h_res).map_or((core::ptr::null_mut(), 0), |s| {
         (s.rt_resource, s.km_resource)
     })
-}
-
-pub(crate) unsafe fn resource_present_private(
-    h_res: ddi::D3D10DDI_HRESOURCE,
-) -> Option<HeliosPresentPrivateData> {
-    let p = resource_state(h_res)?.present_private;
-    p.is_valid().then_some(p)
-}
-
-pub(crate) unsafe fn resource_snapshot_source(
-    h_res: ddi::D3D10DDI_HRESOURCE,
-) -> Option<SnapshotSourceDesc> {
-    resource_state(h_res)?.snapshot_source
-}
-
-/// Resolve scanout metadata by the allocation Windows is actually presenting.
-/// DXGI may keep one stable resource object while rotating its `hAllocation`
-/// among the pPrimaryDesc ring, so resource-local metadata alone is not enough.
-pub(crate) unsafe fn presented_primary_private(
-    h: Hdevice,
-    h_res: ddi::D3D10DDI_HRESOURCE,
-) -> Option<HeliosPresentPrivateData> {
-    if let Some(private) = unsafe { resource_present_private(h_res) } {
-        if private.reserved & HELIOS_PRESENT_PRIVATE_FLAG_DIRECT_SCANOUT != 0 {
-            return Some(private);
-        }
-    }
-    let allocation = unsafe { resource_allocation(h_res) };
-    if allocation == 0 {
-        return None;
-    }
-    let dev = unsafe { helios_device(h) }?;
-    lock_ignore_poison(&dev.direct_scanout_allocations)
-        .iter()
-        .find_map(|(candidate, private)| (*candidate == allocation).then_some(*private))
-}
-
-pub(crate) unsafe fn remember_direct_scanout_allocation(
-    h: Hdevice,
-    allocation: ddi::D3DKMT_HANDLE,
-    private: HeliosPresentPrivateData,
-) {
-    if allocation == 0 || !private.is_valid() {
-        return;
-    }
-    let Some(dev) = (unsafe { helios_device(h) }) else {
-        return;
-    };
-    {
-        let mut entries = lock_ignore_poison(&dev.direct_scanout_allocations);
-        entries.retain(|(candidate, _)| *candidate != allocation);
-        entries.push((allocation, private));
-    }
-}
-
-/// Drop a destroyed allocation's direct-scanout entry. Returns
-/// `(removed, remaining)` when something was removed, so the caller can log the
-/// list length — the property that must stay bounded.
-pub(crate) unsafe fn forget_direct_scanout_allocation(
-    h: Hdevice,
-    allocation: ddi::D3DKMT_HANDLE,
-) -> Option<(usize, usize)> {
-    if allocation == 0 {
-        return None;
-    }
-    let dev = unsafe { helios_device(h) }?;
-    let mut entries = lock_ignore_poison(&dev.direct_scanout_allocations);
-    let before = entries.len();
-    entries.retain(|(candidate, _)| *candidate != allocation);
-    let removed = before - entries.len();
-    let remaining = entries.len();
-    drop(entries);
-    (removed != 0).then_some((removed, remaining))
-}
-
-pub(crate) fn needs_wddm_texture_allocation(a: &ddi::D3D11DDIARG_CREATERESOURCE) -> bool {
-    const DDI_BIND_PRESENT: u32 = 0x0000_0080;
-    const DDI_MISC_SHARED: u32 = 0x0000_0002;
-    const DDI_MISC_SHARED_KEYEDMUTEX: u32 = 0x0000_0100;
-
-    !a.pPrimaryDesc.is_null()
-        || (a.BindFlags & DDI_BIND_PRESENT) != 0
-        || (a.MiscFlags & (DDI_MISC_SHARED | DDI_MISC_SHARED_KEYEDMUTEX)) != 0
-}
-
-pub(crate) unsafe fn dxvk_resource_memory_info(
-    h: Hdevice,
-    obj: &ID3D11Resource,
-) -> (u64, u64, u64, u32) {
-    let Some(dev) = helios_device(h) else {
-        return (0, 0, 0, 0);
-    };
-    let mut memory = 0u64;
-    let mut size = 0u64;
-    let mut offset = 0u64;
-    let mut resource_id = 0u32;
-    if dev.dxvk.get_resource_memory_info(
-        obj.as_raw() as usize,
-        &mut memory,
-        &mut size,
-        &mut offset,
-        &mut resource_id,
-    ) {
-        (memory, size, offset, resource_id)
-    } else {
-        (0, 0, 0, 0)
-    }
 }
 
 pub(crate) unsafe fn resource_dimensions(h_res: ddi::D3D10DDI_HRESOURCE) -> (u32, u32) {
@@ -1506,18 +1316,6 @@ pub(crate) unsafe fn release_resource(h: Hdevice, h_res: ddi::D3D10DDI_HRESOURCE
             .as_ref()
             .map(ResidentAllocation::handle)
             .unwrap_or(0);
-        // The direct-scanout registry was add-only: it grew without bound across
-        // mode changes and DWM primary generations inside one process, the
-        // per-present `presented_primary_private` lookup became a linear scan
-        // over dead entries, and if dxgkrnl reissues a freed D3DKMT_HANDLE the
-        // lookup returns the previous primary's resource_id/width/height/pitch
-        // for the new allocation — a stale scanout identity handed to the KMD.
-        if let Some((removed, remaining)) = forget_direct_scanout_allocation(h, allocation) {
-            log_error!(
-                "DDI scanout registry: dropped {removed} entry alloc=0x{allocation:x} remaining={remaining}"
-            );
-        }
-
         /* An associated resource cannot retire its WDDM identity at the DDI
          * handle edge: DXVK may still own internal references, and Mesa's
          * DestroyBuffer/DestroyImage/FreeMemory records must all land in one

@@ -19,34 +19,12 @@
 //! |---|---|---|
 //! | `UmdTrace` | DWORD | `false` (explicit non-zero enables) |
 //! | `FeatureLevel11` | DWORD | `1` |
-//! | `VehicleFlipGateUs` | DWORD | `32000` |
-//! | `ScanoutAcquire` | DWORD | `true` (explicit 0 is the kill switch) |
-//! | `ScanoutSnapshot` | DWORD | `true` (explicit 0 is the kill switch) |
-//! | `UmdPresentBatchFold` | DWORD | `true` (explicit 0 is the kill switch) |
-//! | `UmdAsyncPresentStream` | DWORD | `true` (explicit 0 keeps the old gate) |
 //! | `UmdFreeThreaded` | DWORD | `true` (explicit 0 reverts the threading surface) |
 //! | `UmdCommandLists` | DWORD | `true` (explicit 0 reverts to emulated lists) |
 //! | `UmdDeferredDiagnostics` | DWORD | `false` (diagnostic atomics, opt-in) |
 //!
-//! ⛔ **`PresentGateUs` and `PresentOrder` were DELETED 2026-07-29 by owner
-//! directive and must not come back.** They were the producer-side CPU
-//! present gate: `PresentOrder=0` made the app's Present block until its own
-//! GPU work finished, and `PresentGateUs` put a timeout on that block. It is a
-//! hack in both directions — on expiry it publishes the present with work
-//! still outstanding (the very thing it exists to prevent), and when it does
-//! hold it removes all CPU/GPU overlap, costing Fire Strike GT1 158 -> 136 fps.
-//! It also does not work: with `PresentOrder=0` and a 200 ms bound that cannot
-//! expire, the owner still saw black-frame flashes, only less often. Reaching
-//! for a producer-side stall to "fix" an ordering defect hides the defect
-//! instead of fixing it; the ordering belongs on the GPU timeline
-//! (`publish_present_order` + a consumer-side wait), not on a blocked CPU
-//! thread. See ROADMAP defect 0ab.
-//!
-//! Two policies survive, not four: `BoolKnob` ("absent = off, non-zero = on")
-//! and `DwordKnob` ("absent = this default, else the stored value"). The
-//! absent-means-ON policy (`rc != 0 || value != 0`) belonged to
-//! `VehicleKernelFlipWait` and the second bool to `PresentSyncPublish`; both
-//! knobs went with T6/R912 when the kwait subsystem was retired.
+//! The surviving policies are `BoolKnob` ("absent = off, non-zero = on") and
+//! `DwordKnob` ("absent = this default, else the stored value").
 //!
 //! **Not covered here:** the environment-variable knobs, which are process
 //! environment rather than registry state and have their own `OnceLock`s —
@@ -75,60 +53,6 @@ pub(crate) static UMD_TRACE: BoolKnob = BoolKnob::new(c"UmdTrace", false);
 /// Feature-level profile selector. Absent = 1 (the full FL11 profile).
 pub(crate) static FEATURE_LEVEL_11: DwordKnob = DwordKnob::new(c"FeatureLevel11", 1);
 
-/// Dcomp-vehicle flip-ordering gate cap, microseconds. Absent = 32 ms.
-pub(crate) static VEHICLE_FLIP_GATE_US: DwordKnob = DwordKnob::new(c"VehicleFlipGateUs", 32_000);
-
-/// D4a scanout-read acquire kill switch (FIX-DESIGN-d4a.md §4). Absent = ON;
-/// explicit 0 disables without a reboot (a fresh process re-reads it).
-///
-/// This gates the **GPU-timeline** ordering mechanism the ⛔ note above points
-/// at as the correct alternative to the deleted CPU present gate: at submit
-/// time the DXVK engine arms a `VkSemaphoreSubmitInfo` TOP_OF_PIPE wait on the
-/// command list that re-writes a scan-out buffer, iff the KMD's read ledger
-/// says a host readback of THAT buffer is still in flight (`issued > retired`).
-/// The wait parks the host GPU queue, never a guest CPU thread — no app,
-/// present, CS or submit thread ever blocks, which is what distinguishes it
-/// from PresentGateUs/PresentOrder and keeps it on the right side of the
-/// owner directive. OFF (or an old KMD failing the probe) reverts to today's
-/// unordered behavior with a single cheap flag check on the flush path.
-pub(crate) static SCANOUT_ACQUIRE: BoolKnob = BoolKnob::new(c"ScanoutAcquire", true);
-
-/// D4b ordered-snapshot substitution kill switch
-/// (FIX-DESIGN-d4b-snapshot.md §3). Absent = ON; explicit 0 disables without
-/// a reboot (a fresh process re-reads it).
-///
-/// Gates the direct-flip present-time snapshot: DXVK records a **GPU-queue-
-/// ordered** image copy of the presented primary into a 4-slot ring of
-/// ICD-owned OPTIMAL snapshot images, and the present's private data then
-/// describes the snapshot (`HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT`) so the KMD
-/// binds/flushes an image whose sole writer is that ordered copy — app
-/// clears/draws can never touch a scanned-out surface. The copy rides frame
-/// N's own command stream at present position; **no CPU stall is introduced
-/// anywhere**, which is what keeps it on the right side of the ⛔ note above
-/// (the deleted `PresentGateUs`/`PresentOrder` were producer-side CPU gates;
-/// this is command-stream ordering the GPU already provides). Substitution
-/// additionally requires the KMD to advertise
-/// `HELIOS_SCANOUT_CAP_SNAPSHOT_BIND` in the D4a probe reply
-/// (`scanout_acquire::scanout_snapshot_capable`); knob off or an incapable
-/// KMD leaves the present path bit-identical to a build without the
-/// mechanism, behind one cheap check.
-pub(crate) static SCANOUT_SNAPSHOT: BoolKnob = BoolKnob::new(c"ScanoutSnapshot", true);
-
-/// Ordinary-present batch-fold kill switch. Absent = ON; explicit 0 keeps the
-/// historical ordering where `publish_present_order` is recorded after the
-/// Present flush. When enabled, the ordinary no-debug path records the
-/// present-fence signal after its copy/snapshot and before that existing flush,
-/// so the signal shares the frame's real submission. Vehicle, force-opaque and
-/// readback presents deliberately retain their historical sequencing.
-pub(crate) static UMD_PRESENT_BATCH_FOLD: BoolKnob = BoolKnob::new(c"UmdPresentBatchFold", true);
-
-/// Registered monotonic present-stream kill switch. Absent = ON; explicit 0
-/// preserves the old frame gate even when an early folded publication has a
-/// valid KMD correlation. This gates only the final skip decision: it never
-/// changes publication or the existing Flush that dispatches the frame batch.
-pub(crate) static UMD_ASYNC_PRESENT_STREAM: BoolKnob =
-    BoolKnob::new(c"UmdAsyncPresentStream", true);
-
 /// FREETHREADED THREADING-caps kill switch (Phase B of the command-list
 /// build, `tmp/handoff-perf-structural/PLAN-commandlists.md`). Absent = ON;
 /// explicit 0 reverts the adapter to THREADING caps = 0 without a redeploy
@@ -140,8 +64,7 @@ pub(crate) static UMD_ASYNC_PRESENT_STREAM: BoolKnob =
 /// was measured at 5.6 % of the render thread (65th session,
 /// `RtlpEnterCriticalSectionContended` under `CUseCountedObject::Release`).
 /// The state this exposes went thread-safe in Phase A (`ShaderCaches` mutex,
-/// `CtxBindings` atomics, `direct_scanout_allocations` mutex); present-path
-/// RefCells stay immediate-only and the runtime still serializes those.
+/// `CtxBindings` atomics and shader-cache mutexes).
 /// This knob NEVER enables command-list caps — see
 /// `device_funcs::threading_caps`.
 pub(crate) static UMD_FREE_THREADED: BoolKnob = BoolKnob::new(c"UmdFreeThreaded", true);
@@ -198,18 +121,10 @@ pub(crate) fn log_knob_inventory() {
     helios_umd_common::log::log_knob_inventory(&resolved_inventory());
 }
 
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 10] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 5] {
     [
         ("UmdTrace", UMD_TRACE.get() as u32),
         ("FeatureLevel11", FEATURE_LEVEL_11.get()),
-        ("VehicleFlipGateUs", VEHICLE_FLIP_GATE_US.get()),
-        ("ScanoutAcquire", SCANOUT_ACQUIRE.get() as u32),
-        ("ScanoutSnapshot", SCANOUT_SNAPSHOT.get() as u32),
-        ("UmdPresentBatchFold", UMD_PRESENT_BATCH_FOLD.get() as u32),
-        (
-            "UmdAsyncPresentStream",
-            UMD_ASYNC_PRESENT_STREAM.get() as u32,
-        ),
         ("UmdFreeThreaded", UMD_FREE_THREADED.get() as u32),
         ("UmdCommandLists", UMD_COMMAND_LISTS.get() as u32),
         (
@@ -222,9 +137,7 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 10] {
 // ── The typed accessors ──────────────────────────────────────────────────────
 //
 // Moved verbatim out of `lib.rs` by T8/R1106, beside the knobs they read.
-// `lib.rs` re-exports all of them, so `crate::trace_enabled()`,
-// `crate::feature_level_mode()` and `crate::vehicle_flip_gate_us()` still
-// resolve at every call site.
+// `lib.rs` re-exports the accessors used outside this module.
 
 /// Resolve `HKLM\SOFTWARE\Helios!UmdTrace` (REG_DWORD) != 0, forcing its
 /// `OnceLock`. Read once per process.
@@ -273,53 +186,6 @@ pub(crate) fn umd_trace_knob() -> bool {
 ///       isolates pipeline-level validation from the later FL11 caps gates.
 pub(crate) fn feature_level_mode() -> u32 {
     FEATURE_LEVEL_11.get()
-}
-
-/// Dcomp-vehicle flip-ordering gate cap in microseconds:
-/// `HKLM\SOFTWARE\Helios!VehicleFlipGateUs` (REG_DWORD). Read once per
-/// process. Absent = 32000; 0 disables (A/B lever). Bounds the worker-side
-/// wait for the vehicle frame COPY's host-GPU completion before the flip is
-/// minted: a direct/independent-flip present is ordered only on the KMD's
-/// DMA fence, which completes at DECODE — without this gate the backbuffer
-/// scans out before the venus copy lands and the previous occupant of the
-/// buffer pops out (the 24th-session gameplay stutter). Composed presents
-/// are protected by dwm's consumer wait either way; direct flip is not.
-pub(crate) fn vehicle_flip_gate_us() -> u32 {
-    VEHICLE_FLIP_GATE_US.get()
-}
-
-/// D4a scanout-read acquire kill switch:
-/// `HKLM\SOFTWARE\Helios!ScanoutAcquire` (REG_DWORD). Read once per process.
-/// Absent = ON. `false` means `scanout_acquire::init_for_device` does nothing
-/// at all — no escapes, no event, no mapping — so the off path is
-/// bit-identical to a build without the mechanism. See [`SCANOUT_ACQUIRE`].
-pub(crate) fn scanout_acquire_knob() -> bool {
-    SCANOUT_ACQUIRE.get()
-}
-
-/// D4b ordered-snapshot substitution kill switch:
-/// `HKLM\SOFTWARE\Helios!ScanoutSnapshot` (REG_DWORD). Read once per process.
-/// Absent = ON. `false` means the direct-flip present path never touches the
-/// snapshot ring — no ring create, no blit, no descriptor override — so the
-/// off path is bit-identical to a build without the mechanism. See
-/// [`SCANOUT_SNAPSHOT`].
-pub(crate) fn scanout_snapshot_knob() -> bool {
-    SCANOUT_SNAPSHOT.get()
-}
-
-/// Whether an ordinary Present records its producer timeline signal in the
-/// same batch as the frame copy/snapshot. `HKLM\\SOFTWARE\\Helios!UmdPresentBatchFold`
-/// (REG_DWORD), read once per process. Absent = ON; explicit 0 restores the
-/// post-flush publication order for same-binary A/B.
-pub(crate) fn present_batch_fold() -> bool {
-    UMD_PRESENT_BATCH_FOLD.get()
-}
-
-/// Registered monotonic present-stream kill switch:
-/// `HKLM\\SOFTWARE\\Helios!UmdAsyncPresentStream` (REG_DWORD), read once per
-/// process. Absent = ON; explicit 0 retains the historical frame gate.
-pub(crate) fn umd_async_present_stream() -> bool {
-    UMD_ASYNC_PRESENT_STREAM.get()
 }
 
 /// FREETHREADED THREADING-caps kill switch:

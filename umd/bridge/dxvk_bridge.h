@@ -15,12 +15,6 @@
 // Owns the DXVK Rc<DxvkInstance/Adapter/Device>; defined in dxvk_bridge.cpp.
 struct HeliosDxvkDeviceImpl;
 
-// `order_mode` of HeliosDxvkDevice::present_frame_gate. The values are the
-// `HKLM\SOFTWARE\Helios!PresentOrder` registry values, spelled here so the
-// wire meaning of the knob lives beside the code that branches on it.
-inline constexpr std::uint32_t kPresentOrderComplete = 0;
-inline constexpr std::uint32_t kPresentOrderSubmitted = 1;
-
 struct HeliosDxvkDevice {
   HeliosDxvkDevice() noexcept;
   ~HeliosDxvkDevice();
@@ -63,7 +57,6 @@ struct HeliosDxvkDevice {
   // Opt-in queue-feed attribution. The timestamp is zero when tracing is off,
   // so the ordinary callback path performs no clock read or atomic update.
   std::uint64_t feed_trace_timestamp_ns() const noexcept;
-  void feed_trace_render_callback(std::uint64_t duration_ns) const noexcept;
   void feed_trace_present_callback(std::uint64_t duration_ns) const noexcept;
   // BUILD_2 recycle handoff. The deferred-context address is borrowed; the
   // command-list address transfers its one owned IC hCL reference on true.
@@ -78,56 +71,6 @@ struct HeliosDxvkDevice {
   // originate from this device's CreateDeferredContext call.
   bool enable_deferred_context_ddi_logical_reset(
       std::size_t deferred_context_ptr) const noexcept;
-  bool set_resource_kmt_handles(
-      std::size_t d3d11_resource_ptr,
-      std::uint32_t local,
-      std::uint32_t global) const noexcept;
-  bool get_resource_memory_info(
-      std::size_t d3d11_resource_ptr,
-      std::uint64_t* memory,
-      std::uint64_t* size,
-      std::uint64_t* offset,
-      std::uint32_t* resource_id) const noexcept;
-  // C1 identity: the creating vkAllocateMemory's exact allocationSize and
-  // memoryTypeIndex for the resource's backing venus memory (recorded into
-  // the WDDM allocation trailer so cross-process openers import with them).
-  bool get_resource_alloc_identity(
-      std::size_t d3d11_resource_ptr,
-      std::uint64_t* venus_alloc_size,
-      std::uint32_t* memory_type_index,
-      std::uint64_t* global_vidmm_tracker) const noexcept;
-  bool transfer_resource_ownership(std::size_t d3d11_resource_ptr) const noexcept;
-  std::size_t open_ddi_texture2d(
-      std::uint32_t width,
-      std::uint32_t height,
-      std::uint32_t format,
-      std::uint32_t bind_flags,
-      std::uint32_t misc_flags,
-      std::uint32_t global,
-      std::uint32_t renderer_resource_id,
-      std::uint64_t venus_alloc_size,
-      std::uint32_t memory_type_index,
-      std::uint64_t global_vidmm_tracker,
-      bool scanout_linear,
-      bool linear_scanout_target,
-      bool cross_context_optimal) const;
-
-  // Create a dedicated OPTIMAL, DMA_BUF-exportable image (via the
-  // D3D11_HELIOS_CREATE_INFO marker) and report logical scanout metadata for
-  // exact reconstruction. kmd_transfer_source selects GENERAL as the image's
-  // canonical layout for a KMD transfer consumer; false retains the direct
-  // scan-out SHADER_READ_ONLY_OPTIMAL contract. Returns an owned
-  // ID3D11Resource* (as usize), or 0.
-  std::size_t create_ddi_scanout_texture2d(
-      std::uint32_t width,
-      std::uint32_t height,
-      std::uint32_t format,
-      std::uint32_t bind_flags,
-      std::uint32_t misc_flags,
-      bool kmd_transfer_source,
-      std::uint64_t* out_row_pitch,
-      std::uint64_t* out_offset) const;
-
   // Shader creation wrappers. DXVK may throw dxvk::DxvkError while compiling
   // shader modules; these methods catch it and return 0 so exceptions never
   // cross the D3D UMD ABI.
@@ -167,79 +110,11 @@ struct HeliosDxvkDevice {
       const std::size_t* d3d11_resource_ptrs,
       std::size_t count) const;
 
-  // Cross-process present ordering, PRODUCER side. Records a signal on this
-  // device's named present timeline at the presented frame's GPU completion and
-  // publishes (resid -> pid, fenceId, value), so a consumer compositing this
-  // surface waits on the GPU instead of us blocking the CPU here. Call once per
-  // present, BEFORE the gate, with the presented source resource.
-  //
-  // Returns the existing slot-publication success.  On success it also writes
-  // the registered stream correlation when it is representable; all three
-  // outputs remain zero when the private ICD export/KMD stream is unavailable
-  // or the full timeline value exceeds u32, so the Rust side retains its gate.
-  bool publish_present_order(std::size_t d3d11_resource_ptr,
-                             std::uint32_t* out_ctx_id,
-                             std::uint32_t* out_value32,
-                             std::uint64_t* out_cookie) const;
-
-  // D4a scanout acquire: hand the per-device KMD read-retirement event to the
-  // DXVK device's signaler thread (DxvkHeliosScanoutAcquire). `event_handle`
-  // is a usermode auto-reset event HANDLE as a machine word, never 0. The UMD
-  // keeps ownership of the handle and closes it in DestroyDevice only after
-  // this bridge device has dropped — the signaler joins inside ~DxvkDevice, so
-  // the handle always outlives its last waiter. Returns false if no live DXVK
-  // device.
-  bool set_scanout_acquire_event(std::size_t event_handle) const noexcept;
-
-  // Present-path ordering gate. `order_mode` selects WHAT is waited for:
-  //
-  //   kPresentOrderSubmitted — wait until the frame's Venus work has reached
-  //     vkQueueSubmit (D3D11ImmediateContext::HeliosWaitFrameSubmitted). This
-  //     is the KMD's actual requirement: pfnRenderCb then samples a watermark
-  //     that covers the frame. `timeout_us` is unused; the wait is on guest CPU
-  //     threads only and always reports true.
-  //   kPresentOrderComplete — additionally wait, bounded by `timeout_us`, for
-  //     the GPU to finish it (HeliosWaitFrameComplete). Returns false on
-  //     timeout/error, and a timeout means the present is published with work
-  //     still outstanding — the stale-frame window this gate exists to close.
-  bool present_frame_gate(std::uint32_t timeout_us, std::uint32_t order_mode) const;
-
   // WDDM 2.1 ReleaseResource ordering. Flush the immediate context and wait
   // only until its work has reached the real vkQueueSubmit edge. The outer
   // submit hook closes the corresponding A5 scope before this returns; this is
   // not a GPU-completion wait and has no timeout, polling, or private timeline.
   bool flush_submitted() const;
-
-  // Dcomp present vehicle (road 4 unit 2): record an image-level copy of the
-  // imported ICD frame (src) into the vehicle backbuffer texture (dst) on
-  // the open command list. Sources the import's LIVE storage (the
-  // direct-bind staging alias for device-local imports) so no
-  // refresh-arming is needed, and DxvkContext::copyImage fires the bounded
-  // copy-time consumer present-wait for the imported source — the published
-  // (resid -> fence, value) slot orders the copy against the producing
-  // ICD's GPU writes. Returns 0 on success, 1 on a (copied, loud) geometry
-  // mismatch, negative on failure — the caller must fail the present loudly
-  // rather than flip a stale backbuffer.
-  std::int32_t present_vehicle_copy(
-      std::size_t dst_resource_ptr,
-      std::size_t src_resource_ptr) const;
-
-  // D4b snapshot ring: record an image-level copy of the presented primary
-  // (src) into a snapshot-ring image (dst) on the open command list, BEFORE
-  // the present-time Flush, so the copy rides frame N's own command stream —
-  // ordered after the frame's draws and before anything of frame N+1 by queue
-  // order alone (no waits, no stalls). Unlike present_vehicle_copy there is no
-  // staging-alias substitution: both operands are this device's own DXVK
-  // images (the source is never an import), so the copy-time consumer
-  // present-wait no-ops and the full-extent OPTIMAL->OPTIMAL same-format copy
-  // takes DxvkContext::copyImageHw. Returns 0 on success, 1 on a (copied,
-  // loud) geometry mismatch — the caller must then SKIP the descriptor
-  // substitution (a partially-filled snapshot must never be bound) — and
-  // negative on failure, where the caller presents exactly as today.
-  std::int32_t present_snapshot_copy(
-      std::size_t dst_resource_ptr,
-      std::size_t src_resource_ptr,
-      bool windowed_blt_reservation) const;
 
   std::size_t create_hull_shader(const std::uint8_t* code, std::size_t len) const;
   std::size_t create_domain_shader(const std::uint8_t* code, std::size_t len) const;
