@@ -822,12 +822,12 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
             Ok(interface) => interface,
             Err(_) => return STATUS_DEVICE_NOT_READY,
         };
-        let reserve = adapter.bar_segment().map_or(0, |bar| bar.size);
+        let local_capacity = adapter.local_segment().map(|segment| segment.size);
         let absent = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
         if !absent.installable() {
             return STATUS_DEVICE_NOT_READY;
         }
-        let mut gpu = match crate::virtio::VirtioGpu::init(passive, dxgkrnl) {
+        let gpu = match crate::virtio::VirtioGpu::init(passive, dxgkrnl) {
             Ok(gpu) => gpu,
             Err(error) => {
                 let status: NTSTATUS = error.into();
@@ -835,13 +835,11 @@ pub unsafe extern "C" fn dxgkddi_restart_from_timeout(h_adapter: *mut c_void) ->
                 return status;
             }
         };
-        if reserve != 0 {
-            let exact_window = gpu.host_visible().is_some_and(|window| {
-                adapter
-                    .bar_segment()
-                    .is_some_and(|bar| window.base == bar.gpa)
-            });
-            if !exact_window || !gpu.configure_window_reserve(reserve) {
+        if let Some(expected) = local_capacity {
+            if !gpu
+                .host_visible()
+                .is_some_and(|window| window.len == expected)
+            {
                 crate::diag::fault(crate::diag::FaultCounter::StVioR, u32::MAX);
                 return match crate::virtio::VirtioGpu::reset_unpublished_or_retain(passive, gpu) {
                     Ok(()) => STATUS_DEVICE_NOT_READY,

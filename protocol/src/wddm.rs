@@ -1789,8 +1789,8 @@ pub enum HeliosUseIdentity {
     /// `identityKind=1`: an index into the D3D11 `D3DDDI_ALLOCATIONLIST` that
     /// dxgkrnl resolves for KMD during Render/Patch.
     D3D11AllocationListIndex(u32),
-    /// `identityKind=2`: a D3D12 GPUVA that QEMU/HPM1 resolves from the exact
-    /// submitted process page tables.
+    /// `identityKind=2`: a D3D12 GPUVA that KMD resolves through the exact live
+    /// device-scoped outer allocation/GPUVA association.
     D3D12GpuVirtualAddress(u64),
 }
 
@@ -1961,9 +1961,8 @@ impl HeliosOuterBatchUseV1 {
             if self.address_or_index == 0 {
                 return Err(R::D3D12GpuVaZero);
             }
-            // QEMU/HPM1 resolves `[address, +byte_length)` through the exact
-            // submitted process page tables; a range that wraps would make that
-            // walk start below its own base.
+            // KMD resolves `[address, +byte_length)` through the exact live
+            // allocation association; a wrapping range cannot name one extent.
             if self.address_or_index.checked_add(self.byte_length).is_none() {
                 return Err(R::D3D12GpuVaRangeOverflow {
                     address: self.address_or_index,
@@ -3206,8 +3205,7 @@ impl HeliosOuterSubmitV1 {
     /// ⚠ Deliberately separate from [`Self::validate`]: at virtual submit **KMD
     /// never dereferences the command GPUVA** (§10.4), so it can only run
     /// [`Self::validate`]. This routine is for the sealing UMD's own self-check
-    /// and for QEMU/HPM1, which does read and validate the HOB1 through the
-    /// current process page tables.
+    /// and for KMD after it snapshots HOB1 from the exact HOC1 allocation.
     pub fn cross_check(&self, hob1: &HeliosOuterBatchV1) -> Result<(), HeliosOuterSubmitRejection> {
         use HeliosOuterSubmitRejection as R;
 
@@ -3296,10 +3294,10 @@ pub const HELIOS_HOC1_PHYSICAL_ADAPTER_MASK_NODE0: u32 = 1;
 /// # HOC1 is neither a renderer/resource identity nor a shareable object
 ///
 /// KMD admits it only as a **nonprimary, nonshared**, CPU-visible/WC allocation
-/// preferred in HLM1, with ordinary system placement supported, no HAP flags,
-/// and real C64/HPM1 page-table handling. ⛔ It is *not* an HVM1 renderer
-/// resource: nothing in it names a host backing, a `resid`, a Venus object, or
-/// anything another process could open. Its only mutable field is
+/// in the ordinary aperture, with its exact CPU view supplied by
+/// ShareBackingStoreWithKmd. It is *not* an HVM1 renderer resource: nothing in
+/// it names a host backing, a `resid`, a Venus object, or anything another
+/// process could open. Its only mutable field is
 /// [`Self::allocation_generation`], which is zero on input and which KMD writes
 /// back nonzero at create — the one create-time write-back in this ABI.
 #[repr(C)]

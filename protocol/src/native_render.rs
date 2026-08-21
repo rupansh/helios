@@ -49,15 +49,9 @@
 //!     not go stale the way a count would. This banner was the last place that
 //!     still said otherwise.
 //!
-//!     ⛔ **SUPERSEDED BY `docs/retirement/FINDINGS.md` F5.** This bullet used
-//!     to end "…so the KMD can rewrite it to a DMA-local capability ordinal at
-//!     COMMIT, and QEMU substitutes the renderer-private resource ID only in
-//!     its own host-only copy of the stream, after resolving the capability
-//!     through HPM1." HPM1 is **DECLINED** — on maintenance grounds, not
-//!     deferred — `qemu-helios` is reset to its pre-retirement base, and the
-//!     three HPM1 commits survive only on branch `helios/hpm1-parked`. No host
-//!     component resolves a capability, so the substitution is guest-side or it
-//!     does not happen at all.
+//!     No host page-owner or host-only command copy participates. A3/A7 provide
+//!     complete typed use/operand closure, and the KMD resolves each exact live
+//!     allocation before guest-side substitution.
 //!
 //!     ⚖ **The property this trades away, named.** F5's own C55 discussion
 //!     requires it be recorded wherever it is relied on, so: *the host is no
@@ -167,11 +161,10 @@ pub const HELIOS_NATIVE_RENDER_CAPSET: u32 = crate::virtio_gpu::VIRTIO_GPU_CAPSE
 // diagnostic and never validation authority** (section 10.7), so no validator in
 // this file consults it, but a producer computing it must call that one function.
 //
-// The WDDM memory-segment IDs are likewise defined exactly once, in
-// [`crate::physical_memory`], which owns the whole segment/page-number
-// interpretation (`HELIOS_SEGMENT_ID_SYSTEM` / `_APERTURE` / `_HLM1`). This lane
-// only names segments; it does not define them.
-use crate::physical_memory::{HELIOS_SEGMENT_ID_APERTURE, HELIOS_SEGMENT_ID_HLM1};
+// The one live HVM1 placement segment is declared exactly once in
+// [`crate::segments`]. Local VidMm capacity is not an HVM1 placement and never
+// enters this record family.
+use crate::segments::HELIOS_SEGMENT_ID_APERTURE;
 
 /// Why a package-generation check failed. Folded into every record's reject
 /// enum; kept separate so the two distinct failures cannot be confused.
@@ -682,16 +675,8 @@ pub struct HeliosNativeRenderUse {
 /// `HeliosNativeRenderPatch`" — as the *replacement mechanism* for the retired
 /// 48-byte `HeliosWddmOpenIdentity::resource_id` that HWA2 deliberately does not
 /// carry. It is not a substitution of one field for another; it is a different
-/// mechanism, and it is mesa lane unit **A3** plus K6. Not QEMU: HPM1 is
-/// declined (`docs/retirement/FINDINGS.md` F5) and there is no host-side
-/// resolver.
-///
-/// ⚠ **No producer or consumer exists at HEAD.** `grep -rn
-/// HeliosNativeRenderPatch kmd_render/src umd/src umd12/src icd/mesa/src`
-/// returns matches, but **not one of them is a use of this type** — every hit
-/// is a doc comment or a refusal-message string literal naming this record as
-/// the thing A3 will build, sited where the driver fails loudly meanwhile. This
-/// record is declared, not wired.
+/// mechanism, implemented by Mesa A3/A7 and the KMD native-render validator.
+/// No host-side page-owner or resolver exists.
 #[repr(C)]
 #[derive(Debug, Default, Clone, Copy, Pod, Zeroable, PartialEq, Eq)]
 pub struct HeliosNativeRenderPatch {
@@ -2752,7 +2737,7 @@ const _: () = {
 ///
 ///   * [`kernel_dma::Hnr2PhysicalCapability`] carries a **physical address**, a
 ///     segment ID, and a placement epoch. Handing any of those to user mode
-///     would leak the guest-physical layout of HLM1's BAR window.
+///     would expose guest-physical placement to user mode.
 ///   * [`kernel_dma::Hnr2KmdDmaPrivateV1`] is the `DmaBufferPrivateDataSize`
 ///     record; Dxgkrnl
 ///     keeps it opaque and the UMD never sees it. HVC1 contexts advertise
@@ -2764,36 +2749,28 @@ const _: () = {
 /// substitute a host resource id or execute an allocation-backed `SUBMIT_3D` in
 /// the current package.
 ///
-/// ⛔ **SUPERSEDED BY `docs/retirement/FINDINGS.md` F5.** The two paragraphs
-/// above previously read "an HPM1 placement epoch" and "QEMU resolves each
-/// capability through the exact HPM1 page owner and substitutes
-/// renderer-private resource IDs only in its own host-only copy of the command
-/// stream". HPM1 is declined and `qemu-helios` is at its pre-retirement base,
-/// so there is no host-side resolver and no host-only copy. See the file
-/// banner's "⛔⛔ no resid may appear" block for the property that trades away.
-///
 /// # Producer status
 ///
 /// Re-measured 2026-08-13: K6 emits the capability table and DMA-private record,
 /// Patch snapshots the exact allocation-list placement, and Submit consumes the
 /// private record for staging retirement. K11 marks only an exact synchronous
 /// pure-control INIT after its host reply and HVR1 publication are terminal.
-/// [`kernel_dma::Hnr2PhysicalCapability::validate_at_submit`] and the general
-/// allocation/GPU executor remain deliberately unreachable until their owning
-/// later units exist.
+/// The legacy physical-capability submit validator remains deliberately
+/// unreachable because this package owns no placement-epoch producer. The
+/// landed direct A7/post-K9 executor instead uses complete exact allocation
+/// closure and the session-owned stock-Venus path.
 ///
 /// The `hpm_epoch` field and [`kernel_dma::Hnr2DmaReject::PlacementEpochStale`]
 /// keep their names because this file is the wire ABI and a rename is a layout
 /// event with C mirrors and `_Static_assert` twins; their *meaning* is now "the
-/// KMD's own placement epoch", not HPM1's. A later allocation executor must
-/// preserve that meaning rather than reviving a host page-owner dependency.
+/// KMD's own placement epoch. Nothing may revive a host page-owner dependency.
 ///
 /// Passing this file's unit tests or a source gate is not evidence that general
 /// host execution exists.
 pub mod kernel_dma {
     use super::{
         HELIOS_HNR2_ACCESS_MASK, HELIOS_HNR2_MAX_USE_RECORDS, HELIOS_HVC1_DMA_PRIVATE_DATA_BYTES,
-        HELIOS_SEGMENT_ID_APERTURE, HELIOS_SEGMENT_ID_HLM1,
+        HELIOS_SEGMENT_ID_APERTURE,
     };
     use bytemuck::{Pod, Zeroable};
 
@@ -2817,8 +2794,8 @@ pub mod kernel_dma {
         /// The KMD allocation object's generation — the same value the use
         /// record carried as `expected_allocation_generation`.
         pub allocation_generation: u64,
-        /// Current segment: [`HELIOS_SEGMENT_ID_APERTURE`] or
-        /// [`HELIOS_SEGMENT_ID_HLM1`]; zero means "not yet placed".
+        /// Current segment: [`HELIOS_SEGMENT_ID_APERTURE`]; zero means "not yet
+        /// placed".
         pub segment_id: u32,
         /// `HELIOS_HNR2_ACCESS_*`, copied from the use record and the
         /// allocation list's `WriteOperation`.
@@ -2832,10 +2809,9 @@ pub mod kernel_dma {
         /// Placement epoch this capability was snapshotted against. A stale
         /// epoch removes the context; it is never repaired by a lookup.
         ///
-        /// ⛔ The name is HPM1's, the meaning is not: per `FINDINGS.md` F5 the
-        /// epoch is the **KMD's own** placement epoch, because HPM1 is declined
-        /// and no host-side page owner exists. The field keeps its wire name
-        /// only because renaming it is a layout event across the C mirrors.
+        /// The field keeps its historical wire name, but its only permitted
+        /// meaning is a KMD-owned placement epoch. Renaming it would be a fixed
+        /// ABI event across the C mirrors.
         pub hpm_epoch: u64,
     }
 
@@ -2930,14 +2906,13 @@ pub mod kernel_dma {
         /// An unplaced capability (`segment_id == 0`) carries a nonzero physical
         /// address or epoch.
         UnplacedCapabilityNotZeroed,
-        /// `segment_id` is neither the aperture segment nor HLM1.
+        /// `segment_id` is not the aperture segment.
         SegmentUnknown,
         /// A capability reached Submit still unplaced.
         CapabilityUnplacedAtSubmit,
         /// `allocation_generation` no longer matches the KMD allocation object.
         AllocationGenerationStale,
-        /// `hpm_epoch` is not the current placement epoch. (Named for HPM1;
-        /// the epoch is the KMD's own — `FINDINGS.md` F5.)
+        /// `hpm_epoch` is not the current KMD placement epoch.
         PlacementEpochStale,
         /// The capability's segment is not the allocation's current segment.
         SegmentNotCurrent,
@@ -2982,9 +2957,7 @@ pub mod kernel_dma {
     }
 
     /// The current placement of one allocation, as `DxgkDdiSubmitCommand` sees
-    /// it. Everything here is live KMD state, never anything the batch
-    /// supplied. (Was "live KMD/HPM1 state" — HPM1 is declined, `FINDINGS.md`
-    /// F5, so the KMD is the only source.)
+    /// it. Everything here is live KMD state, never anything the batch supplied.
     #[derive(Debug, Clone, Copy)]
     pub struct Hnr2CapabilityExpect {
         /// The allocation object's current generation.
@@ -3029,18 +3002,15 @@ pub mod kernel_dma {
                 if self.physical_address != 0 || self.hpm_epoch != 0 {
                     return Err(Hnr2DmaReject::UnplacedCapabilityNotZeroed);
                 }
-            } else if self.segment_id != HELIOS_SEGMENT_ID_APERTURE
-                && self.segment_id != HELIOS_SEGMENT_ID_HLM1
-            {
+            } else if self.segment_id != HELIOS_SEGMENT_ID_APERTURE {
                 return Err(Hnr2DmaReject::SegmentUnknown);
             }
             Ok(())
         }
 
         /// Full validation against the still-current KMD-side placement at
-        /// `DxgkDdiSubmitCommand` (was "still-current HPM1 ownership";
-        /// `FINDINGS.md` F5 declines HPM1, so the KMD's allocation objects are
-        /// the only ownership record).
+        /// `DxgkDdiSubmitCommand`; KMD allocation objects are the only ownership
+        /// record.
         /// A stale, unresident, or mismatched capability
         /// removes the context/device — it is **never** repaired by looking up a
         /// host ID.
@@ -3931,7 +3901,7 @@ mod tests {
 
         let expect = Hnr2CapabilityExpect {
             allocation_generation: 5,
-            segment_id: HELIOS_SEGMENT_ID_HLM1,
+            segment_id: HELIOS_SEGMENT_ID_APERTURE,
             hpm_epoch: 3,
             allocation_bytes: 4096,
             page_bytes: 4096,
@@ -3942,7 +3912,7 @@ mod tests {
         );
 
         let mut patched = unplaced;
-        patched.segment_id = HELIOS_SEGMENT_ID_HLM1;
+        patched.segment_id = HELIOS_SEGMENT_ID_APERTURE;
         patched.physical_address = 0x1_0000_0000;
         patched.hpm_epoch = 3;
         assert_eq!(patched.validate_at_submit(&expect), Ok(()));

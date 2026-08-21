@@ -12,7 +12,7 @@
 //!   reference for each allocation generation. Create/open private data is only
 //!   an immutable descriptor paired with that object.
 //! * §14:3430 ("Adapter reset") — KMD invalidates queue, endpoint/ring,
-//!   **allocation**/HPM1, host-batch, native-fence mapping, WSI and flip
+//!   **allocation**, host-batch, native-fence mapping, WSI and flip
 //!   generations **together**. The allocation generation is part of that one
 //!   coordinated invalidation, not an independent counter.
 //! * §15:3516-3520 — HOB1 carries "the expected live allocation generation";

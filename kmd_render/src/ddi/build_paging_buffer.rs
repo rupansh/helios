@@ -59,7 +59,7 @@ use helios_protocol::{
 };
 
 use crate::adapter::AdapterContext;
-use crate::ddi::create_allocation::{paging_alloc_info, set_bar_placement, PagingAllocInfo};
+use crate::ddi::create_allocation::paging_alloc_info;
 use crate::dxgk::*;
 
 /// DISPATCH-safe paging tracers (ntoseye reads these by symbol — no IRQL
@@ -165,7 +165,6 @@ static BAR_XFER_OUT: AtomicU32 = AtomicU32::new(0); // blob → system MDL copie
 static BAR_XFER_MOVE: AtomicU32 = AtomicU32::new(0); // segment→segment (no-op)
 static BAR_FILLS: AtomicU32 = AtomicU32::new(0);
 static BAR_DISCARDS: AtomicU32 = AtomicU32::new(0);
-static BAR_PT_HARVESTS: AtomicU32 = AtomicU32::new(0); // placements seen in leaf PTEs
 static BAR_LAST_RESID: AtomicU32 = AtomicU32::new(0);
 /// Host cache mode used for the most recent transient blob mapping.
 ///
@@ -181,7 +180,6 @@ static BAR_LAST_MDL_OFF: AtomicU32 = AtomicU32::new(0);
 static BAR_ERR_IRQL: AtomicU32 = AtomicU32::new(0); // content op arrived > PASSIVE
 static BAR_ERR_MAP: AtomicU32 = AtomicU32::new(0); // blob map / kernel map failed
 static BAR_ERR_BOUNDS: AtomicU32 = AtomicU32::new(0); // op range outside the blob
-static BAR_ERR_DISCONTIG: AtomicU32 = AtomicU32::new(0); // leaf PTEs not contiguous
 static BAR_ERR_VIRTUAL: AtomicU32 = AtomicU32::new(0); // unresolved paging-process VA
 static BAR_ERR_MDL: AtomicU32 = AtomicU32::new(0); // system-MDL kernel map failed
 static BAR_ERR_SHADOW_FULL: AtomicU32 = AtomicU32::new(0); // PTE shadow capacity exhausted
@@ -224,7 +222,6 @@ static PAGING_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(b"PgTm", &BAR_XFER_MOVE),
         e(b"PgFn", &BAR_FILLS),
         e(b"PgDn", &BAR_DISCARDS),
-        e(b"PgUn", &BAR_PT_HARVESTS),
         e(b"PgMr", &BAR_LAST_RESID),
         e(b"PgMc", &BAR_LAST_MAP_CACHE),
         e(b"PgSf", &BAR_LAST_XFER_FLAGS),
@@ -233,7 +230,6 @@ static PAGING_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         f(b"PgEi", &BAR_ERR_IRQL),
         f(b"PgEm", &BAR_ERR_MAP),
         f(b"PgEb", &BAR_ERR_BOUNDS),
-        f(b"PgEc", &BAR_ERR_DISCONTIG),
         f(b"PgEv", &BAR_ERR_VIRTUAL),
         f(b"PgEx", &BAR_ERR_MDL),
         f(b"PgEf", &BAR_ERR_SHADOW_FULL),
@@ -272,623 +268,6 @@ const fn e64(name: &'static [u8], value: &'static AtomicU64) -> crate::diag::Cou
         value: crate::diag::CounterRef::U64Low(value),
         failure: false,
     }
-}
-
-// ── K2a: the HLM1 placement instrument ───────────────────────────────────────
-//
-// `FINDINGS.md` F14: an HVM1 allocation's Lock2 view is not its venus blob, and
-// the fix needs the window offset VidMm placed it at. WHICH operation carries
-// that offset is not knowable read-only — `PgDi` moving proves nothing, because
-// two of its four sites are the virtual content ops, which carry GPU virtual
-// addresses and no segment at all. This block answers it in one deploy.
-
-/// `1 << operation` for every paging op naming an HLM1-eligible allocation.
-static HLM1_OP_MASK: AtomicU32 = AtomicU32::new(0);
-/// `1 << segment` for every segment such an op named.
-static HLM1_SEG_MASK: AtomicU32 = AtomicU32::new(0);
-/// Allocations admitted with a CPU view in HLM1. The denominator: without it,
-/// an all-zero block cannot distinguish "no producer ran" from "no hook fired".
-static HLM1_ELIGIBLE: AtomicU32 = AtomicU32::new(0);
-/// Observations that carried BOTH a segment id and an offset within it.
-static HLM1_PLACEMENTS: AtomicU32 = AtomicU32::new(0);
-static HLM1_LAST_SEG: AtomicU32 = AtomicU32::new(0);
-/// Offsets and lengths are reported in PAGES: a 32-bit byte offset cannot hold
-/// an 8 GiB window. Same convention as `ChMo`.
-static HLM1_LAST_PAGE: AtomicU32 = AtomicU32::new(0);
-static HLM1_LAST_PAGES: AtomicU32 = AtomicU32::new(0);
-/// `UPDATE_PAGE_TABLE` leaf PTE[0] for such an allocation — the arm that is
-/// completely uninstrumented today (its `!bar_eligible` return is a bare
-/// `return`, not a counted one).
-static HLM1_PT_SEG: AtomicU32 = AtomicU32::new(0);
-static HLM1_PT_PAGE: AtomicU32 = AtomicU32::new(0);
-/// Last `NOTIFY_RESIDENCY2.Adl.PageCount` for such an allocation. The ADL is
-/// where this kit puts the placement; the count says whether decoding one would
-/// describe the whole allocation or a fragment.
-static HLM1_NR2_MDL: AtomicU32 = AtomicU32::new(0);
-/// The operation that produced the last placement triple. ⛔ Without it the
-/// triple is unattributable: `UPDATE_PAGE_TABLE`, `NOTIFY_RESIDENCY` and
-/// `MAP_APERTURE_SEGMENT` are all live on this target and all write it.
-static HLM1_LAST_OP: AtomicU32 = AtomicU32::new(0);
-/// Observations arriving above PASSIVE. A VALUE, not a failure: a "yes" is this
-/// deploy's expected positive result, and a failure entry would force a 13-write
-/// registry flush on every one — reinstating the storm `diag.rs` records removing.
-static HLM1_ERR_IRQL: AtomicU32 = AtomicU32::new(0);
-/// A placement outside the window range the KMD can fixed-map (`bar.size`).
-///
-/// ⚠ NOT "VidMm misbehaved". The segment REPORTED to VidMm is
-/// `vidmm_vram_size.unwrap_or(bar.size)` — the whole host-visible window — while
-/// the KMD's fixed-map partition is `bar.size`. A nonzero value here says those
-/// two must be tied together before any bind is safe, which is a K2a deploy-2
-/// prerequisite, not a fault.
-static HLM1_ERR_WINDOW: AtomicU32 = AtomicU32::new(0);
-/// The observation named a segment this allocation is not bound to, or an
-/// operation that cannot carry a placement. Ordinary — `hvm1_placement` keeps
-/// the aperture in the supported set — and counted apart from the range refusal
-/// so one cannot be read as the other.
-static HLM1_FOREIGN: AtomicU32 = AtomicU32::new(0);
-/// `NOTIFY_RESIDENCY`/`_2` saying the allocation was EVICTED. Recorded and NOT
-/// treated as a placement: the eviction is the last notification a destroyed
-/// allocation gets, so publishing its (zeroed) address would overwrite the
-/// residency answer with its inverse.
-static HLM1_EVICT: AtomicU32 = AtomicU32::new(0);
-/// `UPDATE_PAGE_TABLE` leaf whose base arithmetic was rejected (PFN out of
-/// range, or an allocation offset past the PTE's own address). The sibling
-/// counts this as `PgEc`; without it the arm looks like it carried no placement.
-static HLM1_PT_ERR: AtomicU32 = AtomicU32::new(0);
-/// An HLM1-eligible allocation was destroyed having never been bound.
-pub(crate) static HLM1_ERR_NEVER_BOUND: AtomicU32 = AtomicU32::new(0);
-
-// ── K2a deploy 2: the bind (behind `Hlm1Bind`) ───────────────────────────────
-
-/// `map_blob_at` calls that succeeded — the blob is now mapped at the window
-/// offset VidMm placed the allocation at, which is what makes the Lock2 view and
-/// the venus blob one set of bytes.
-static HLM1_BINDS: AtomicU32 = AtomicU32::new(0);
-/// Window page the last successful bind used. Compare against `HlPlPg`.
-static HLM1_BIND_PAGE: AtomicU32 = AtomicU32::new(0);
-/// `map_blob_at` refused the placement. A failure entry: it means an admitted
-/// HLM1 placement could not be honoured, which is not a normal state.
-static HLM1_BIND_FAIL: AtomicU32 = AtomicU32::new(0);
-/// Binds that MOVED an existing mapping. Expected small: the page-table arm
-/// fires ~99 times per pool life, and every batch that agrees with the current
-/// binding short-circuits on `Action::None` rather than re-issuing the host
-/// round-trip. A large value means the placement is not stable and the bind is
-/// churning host mappings inside a paging op.
-static HLM1_REBINDS: AtomicU32 = AtomicU32::new(0);
-/// An admitted placement arrived above PASSIVE, so the host round-trip could not
-/// be issued. A VALUE, not a failure: F15 measured `HlEirq = 0`, and a
-/// per-observation registry flush is the storm `diag.rs` records removing.
-static HLM1_BIND_IRQL: AtomicU32 = AtomicU32::new(0);
-/// Stamps written (`Hlm1Bind = 2`), and the nonce + digest of the last one. The
-/// guest reads the stamped bytes through its OWN Lock2 pointer, so a match
-/// cannot be satisfied by the guest's own writes — which is exactly what the
-/// `hts1_session_probe` H5 self-round-trip could not distinguish.
-static HLM1_STAMPS: AtomicU32 = AtomicU32::new(0);
-static HLM1_STAMP_FAIL: AtomicU32 = AtomicU32::new(0);
-static HLM1_NONCE: AtomicU32 = AtomicU32::new(0);
-static HLM1_DIGEST: AtomicU32 = AtomicU32::new(0);
-
-/// `Hlm1Bind` value that additionally stamps the sampled bytes.
-const HLM1_BIND_MODE_STAMP: u32 = 2;
-
-/// The three bytes the BLOB holds at destroy, at the three offsets
-/// `hts1_session_probe` H5 writes — packed `(first << 16) | (slot_end << 8) |
-/// last`. See [`hlm1_readback`]; `HlRdEr` counts a mapping that could not be
-/// read at all, which is the difference between "not the blob" and "no answer".
-static HLM1_READBACK: AtomicU32 = AtomicU32::new(0);
-static HLM1_READBACK_FAIL: AtomicU32 = AtomicU32::new(0);
-/// `1 << operation` for every op that produced an ADMITTED HLM1 placement, and
-/// the FIRST such (op, page).
-///
-/// ⛔ The instrument's placement triple is last-writer-wins, and F15 read its
-/// aperture value as "VidMm is not using HLM1 at all". That was wrong — the pool
-/// visits segment 2 and the aperture is merely LAST — so the admitted set is
-/// recorded separately and cannot be overwritten by a later foreign placement.
-static HLM1_ADMIT_MASK: AtomicU32 = AtomicU32::new(0);
-static HLM1_ADMIT_FIRST_OP: AtomicU32 = AtomicU32::new(0);
-static HLM1_ADMIT_FIRST_PAGE: AtomicU32 = AtomicU32::new(0);
-/// `UPDATE_PAGE_TABLE` PTE[0] observations by segment: HLM1 vs system memory.
-/// `HlPtSg` alone cannot distinguish "the page table never named HLM1" from "the
-/// last batch happened to be system memory".
-static HLM1_PT_HLM1: AtomicU32 = AtomicU32::new(0);
-static HLM1_PT_SYSTEM: AtomicU32 = AtomicU32::new(0);
-
-static HLM1_FLUSH_TICKS: AtomicU32 = AtomicU32::new(0);
-static HLM1_FLUSH_FAILURES: AtomicU32 = AtomicU32::new(0);
-
-static HLM1_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
-    entries: &[
-        e(b"HlOpMs", &HLM1_OP_MASK),
-        e(b"HlSgMs", &HLM1_SEG_MASK),
-        e(b"HlElig", &HLM1_ELIGIBLE),
-        e(b"HlPlN", &HLM1_PLACEMENTS),
-        e(b"HlPlSg", &HLM1_LAST_SEG),
-        e(b"HlPlPg", &HLM1_LAST_PAGE),
-        e(b"HlPlLn", &HLM1_LAST_PAGES),
-        e(b"HlPtSg", &HLM1_PT_SEG),
-        e(b"HlPtPg", &HLM1_PT_PAGE),
-        e(b"HlNr2M", &HLM1_NR2_MDL),
-        e(b"HlPlOp", &HLM1_LAST_OP),
-        e(b"HlEirq", &HLM1_ERR_IRQL),
-        e(b"HlEwin", &HLM1_ERR_WINDOW),
-        e(b"HlFrgn", &HLM1_FOREIGN),
-        e(b"HlEvic", &HLM1_EVICT),
-        e(b"HlPtEr", &HLM1_PT_ERR),
-        f(b"HlEnb", &HLM1_ERR_NEVER_BOUND),
-        e(b"HlBndN", &HLM1_BINDS),
-        e(b"HlBndPg", &HLM1_BIND_PAGE),
-        f(b"HlBndE", &HLM1_BIND_FAIL),
-        e(b"HlBndQ", &HLM1_BIND_IRQL),
-        e(b"HlBndR", &HLM1_REBINDS),
-        e(b"HlStmp", &HLM1_STAMPS),
-        f(b"HlStmpE", &HLM1_STAMP_FAIL),
-        e(b"HlNnce", &HLM1_NONCE),
-        e(b"HlDgst", &HLM1_DIGEST),
-        e(b"HlRdbk", &HLM1_READBACK),
-        f(b"HlRdEr", &HLM1_READBACK_FAIL),
-        e(b"HlAdMs", &HLM1_ADMIT_MASK),
-        e(b"HlAd1Op", &HLM1_ADMIT_FIRST_OP),
-        e(b"HlAd1Pg", &HLM1_ADMIT_FIRST_PAGE),
-        e(b"HlPt2", &HLM1_PT_HLM1),
-        e(b"HlPt0", &HLM1_PT_SYSTEM),
-    ],
-    ticks: &HLM1_FLUSH_TICKS,
-    failures: &HLM1_FLUSH_FAILURES,
-    policy: crate::diag::FlushPolicy::EveryNth(64),
-};
-
-/// Publish the block. PASSIVE_LEVEL only — it writes the registry.
-pub(crate) fn hlm1_dump_counters() {
-    HLM1_COUNTERS.flush();
-}
-
-/// Publish the block with no throttle. PASSIVE_LEVEL only.
-///
-/// ⛔ The bind and the destroy tail must use THIS, not [`hlm1_dump_counters`]: a
-/// successful bind moves no failure counter, so `flush`'s throttle would publish
-/// the pre-bind reading on the one call that decides whether the unit worked.
-pub(crate) fn hlm1_publish_counters() {
-    HLM1_COUNTERS.publish();
-}
-
-/// Zero the block, atomics and registry both, so every value read afterwards is
-/// attributable to THIS device start.
-///
-/// ⛔ NOT `flush()`. A `pnputil /restart-device` re-runs StartDevice with the
-/// image still loaded, where `flush`'s own throttle (`n == 1 || n % 64 == 0 ||
-/// the failure sum moved`) writes NOTHING and leaves the previous instance's
-/// counts in place. `diag::reset_fault_counters` beside it writes literal zeros
-/// unconditionally; so does this.
-pub(crate) fn hlm1_reset_counters() {
-    let mut i = 0;
-    while i < HLM1_COUNTERS.entries.len() {
-        match HLM1_COUNTERS.entries[i].value {
-            crate::diag::CounterRef::U32(a) => a.store(0, Ordering::Relaxed),
-            crate::diag::CounterRef::U64Low(a) => a.store(0, Ordering::Relaxed),
-        }
-        crate::diag::record_named_bytes(HLM1_COUNTERS.entries[i].name, 0);
-        i += 1;
-    }
-    HLM1_FLUSH_TICKS.store(0, Ordering::Relaxed);
-    HLM1_FLUSH_FAILURES.store(0, Ordering::Relaxed);
-}
-
-/// One admitted HLM1-eligible allocation. Called from `DxgkDdiCreateAllocation`.
-pub(crate) fn hlm1_note_eligible() {
-    HLM1_ELIGIBLE.fetch_add(1, Ordering::Relaxed);
-}
-
-// The operation ordinals `kmd_logic` classifies against are dxgkrnl's. That
-// crate cannot see the generated enum, so the link is asserted here.
-const _: () = {
-    use crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION as Op;
-    use helios_kmd_logic::hlm1_placement::op;
-    assert!(Op::DXGK_OPERATION_TRANSFER as u32 == op::TRANSFER);
-    assert!(Op::DXGK_OPERATION_FILL as u32 == op::FILL);
-    assert!(Op::DXGK_OPERATION_DISCARD_CONTENT as u32 == op::DISCARD_CONTENT);
-    assert!(Op::DXGK_OPERATION_MAP_APERTURE_SEGMENT as u32 == op::MAP_APERTURE_SEGMENT);
-    assert!(Op::DXGK_OPERATION_VIRTUAL_TRANSFER as u32 == op::VIRTUAL_TRANSFER);
-    assert!(Op::DXGK_OPERATION_VIRTUAL_FILL as u32 == op::VIRTUAL_FILL);
-    assert!(Op::DXGK_OPERATION_UPDATE_PAGE_TABLE as u32 == op::UPDATE_PAGE_TABLE);
-    assert!(Op::DXGK_OPERATION_NOTIFY_RESIDENCY as u32 == op::NOTIFY_RESIDENCY);
-    assert!(Op::DXGK_OPERATION_MAP_APERTURE_SEGMENT2 as u32 == op::MAP_APERTURE_SEGMENT2);
-    assert!(Op::DXGK_OPERATION_NOTIFY_RESIDENCY2 as u32 == op::NOTIFY_RESIDENCY2);
-    assert!(Op::DXGK_OPERATION_TRANSFER2 as u32 == op::TRANSFER2);
-    assert!(Op::DXGK_OPERATION_FILL2 as u32 == op::FILL2);
-    assert!(Op::DXGK_OPERATION_DISCARD_CONTENT2 as u32 == op::DISCARD_CONTENT2);
-};
-
-/// Record one paging observation about an HLM1-eligible allocation.
-///
-/// ⛔ ATOMIC STORES ONLY, and that is a hard requirement rather than a style
-/// choice: half the call sites are ABOVE this DDI's IRQL gate. A registry write
-/// here is exactly the defect the tombstone at the gate records being removed.
-///
-/// `reserve` is `bar.size`, the window partition the KMD's fixed map may use
-/// (`bar_segment.rs:138,150`). ⚠ It is NOT the size of the segment VidMm places
-/// into — that is `vidmm_vram_size.unwrap_or(bar.size)` (`:206`), the whole
-/// host-visible window. `HlEwin` measures the gap.
-fn hlm1_observe(
-    operation: u32,
-    alloc: &PagingAllocInfo,
-    segment: Option<u32>,
-    byte_offset: Option<u64>,
-    length_bytes: Option<u64>,
-    reserve: u64,
-) {
-    if !alloc.hlm1_eligible {
-        return;
-    }
-    if operation < 32 {
-        HLM1_OP_MASK.fetch_or(1u32 << operation, Ordering::Relaxed);
-    }
-    if let Some(seg) = segment {
-        if seg < 32 {
-            HLM1_SEG_MASK.fetch_or(1u32 << seg, Ordering::Relaxed);
-        }
-    }
-    // ⛔ ABOVE the let-else below. The arms that pass no offset — the residency
-    // notifications and TRANSFER2 — are exactly the ones whose IRQL nobody has
-    // measured and which the bind would have to issue a host round-trip from.
-    // SAFETY: KeGetCurrentIrql is callable at any IRQL.
-    if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
-        HLM1_ERR_IRQL.fetch_add(1, Ordering::Relaxed);
-    }
-    let (Some(seg), Some(offset), Some(len)) = (segment, byte_offset, length_bytes) else {
-        return;
-    };
-    HLM1_PLACEMENTS.fetch_add(1, Ordering::Relaxed);
-    HLM1_LAST_OP.store(operation, Ordering::Relaxed);
-    HLM1_LAST_SEG.store(seg, Ordering::Relaxed);
-    HLM1_LAST_PAGE.store((offset >> 12) as u32, Ordering::Relaxed);
-    HLM1_LAST_PAGES.store((len >> 12) as u32, Ordering::Relaxed);
-    use helios_kmd_logic::hlm1_placement::{admit, Observation, PlacementRefusal};
-    match admit(
-        Observation {
-            operation,
-            segment_id: seg,
-            byte_offset: offset,
-            length_bytes: len,
-        },
-        reserve,
-    ) {
-        Ok(placement) => {
-            if operation < 32 {
-                HLM1_ADMIT_MASK.fetch_or(1u32 << operation, Ordering::Relaxed);
-            }
-            // FIRST, not last: the aperture placement that overwrites `HlPlSg`
-            // arrives after this one, and F15 read that overwrite as the whole
-            // story. `compare_exchange` on the page keeps the pair consistent —
-            // both fields describe the same observation or neither is written.
-            if HLM1_ADMIT_FIRST_PAGE
-                .compare_exchange(
-                    0,
-                    (placement.byte_offset >> 12) as u32,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-            {
-                HLM1_ADMIT_FIRST_OP.store(operation, Ordering::Relaxed);
-            }
-        }
-        Err(PlacementRefusal::ForeignSegment { .. })
-        | Err(PlacementRefusal::NotPlacementBearing { .. }) => {
-            HLM1_FOREIGN.fetch_add(1, Ordering::Relaxed);
-        }
-        Err(_) => {
-            HLM1_ERR_WINDOW.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
-/// Alias an HLM1 allocation's CPU view onto its venus blob, at the exact window
-/// offset VidMm placed the allocation at (K2a deploy 2, behind `Hlm1Bind`).
-///
-/// This is the whole of F14's fix: dxgkrnl derives the Lock2 VA from the
-/// segment's `CpuTranslatedAddress` plus the allocation's segment offset, so
-/// mapping the blob at that same offset makes the guest's CPU view and the host's
-/// blob one set of bytes. Without it the view is unrelated guest RAM.
-///
-/// ⛔ Its own IRQL gate and its own token mint. F15 measured every observation at
-/// PASSIVE (`HlEirq = 0`), but this arm sits ABOVE the DDI's content-op gate and
-/// `map_blob_at` is a host round-trip, so the check is made here rather than
-/// inherited from an annotation.
-///
-/// # Safety
-/// `h` must be the live allocation handle `alloc` was resolved from.
-unsafe fn hlm1_maybe_bind(
-    adapter: &AdapterContext,
-    h: HANDLE,
-    alloc: &PagingAllocInfo,
-    operation: u32,
-    segment_id: u32,
-    byte_offset: u64,
-    reserve: u64,
-) {
-    use helios_kmd_logic::hlm1_placement::{admit, Action, BindingState, Observation};
-    let mode = adapter.knobs().hlm1_bind;
-    if mode == 0 || !alloc.hlm1_eligible {
-        return;
-    }
-    // Refusals are already counted by `hlm1_observe` for this same observation
-    // (`HlFrgn` for a non-HLM1 segment, `HlEwin` for a range the KMD's fixed-map
-    // partition cannot hold), so this arm must not count them a second time.
-    let Ok(placement) = admit(
-        Observation {
-            operation,
-            segment_id,
-            byte_offset,
-            length_bytes: alloc.size,
-        },
-        reserve,
-    ) else {
-        return;
-    };
-    // `alloc.hlm1_bound` is a snapshot, so two notifications for one allocation
-    // can both decide to bind. Benign, and deliberately not locked: `map_blob_at`
-    // is idempotent at the same offset (`blob_remap_begin` answers `Mapped`), and
-    // both then store the same value.
-    let action = BindingState(alloc.hlm1_bound).observe(placement);
-    if matches!(action, Action::None) {
-        return;
-    }
-    // SAFETY: KeGetCurrentIrql is callable at any IRQL.
-    if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
-        HLM1_BIND_IRQL.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    // SAFETY: downstream of the runtime check immediately above, not of the
-    // documented annotation — the same discipline as the content-op mint below.
-    let passive = unsafe { crate::irql::PassiveLevel::assume() };
-    match crate::virtio::ctrl::map_blob_at(
-        passive,
-        adapter,
-        alloc.resource_id,
-        placement.byte_offset,
-    ) {
-        Ok(_) => {
-            // ⛔ Only on the Ok path. A store after a failed map would make the
-            // next observation report `Action::None` and skip the retry.
-            // SAFETY: the handle this arm resolved, per the fn contract.
-            unsafe { crate::ddi::create_allocation::set_hlm1_binding(h, placement.byte_offset) };
-            HLM1_BINDS.fetch_add(1, Ordering::Relaxed);
-            if matches!(action, Action::Rebind { .. }) {
-                HLM1_REBINDS.fetch_add(1, Ordering::Relaxed);
-            }
-            HLM1_BIND_PAGE.store((placement.byte_offset >> 12) as u32, Ordering::Relaxed);
-            if mode >= HLM1_BIND_MODE_STAMP {
-                // SAFETY: PASSIVE (token above); the blob is mapped at
-                // `placement.byte_offset` by the call that just succeeded.
-                unsafe { hlm1_stamp(passive, adapter, alloc.resource_id, placement.length_bytes) };
-            }
-        }
-        Err(_) => {
-            HLM1_BIND_FAIL.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    // Bounded: at most one publication per bind or rebind of one allocation, and
-    // `Action::None` returns above before reaching here. The allocation can die
-    // without another paging op, so waiting for the content tail is waiting for a
-    // call that may never come.
-    hlm1_publish_counters();
-}
-
-/// Write the shared verify vocabulary's stamp bytes into the freshly bound blob
-/// and publish the nonce + digest.
-///
-/// The direction is deliberate: the KMD writes and the GUEST reads. A guest that
-/// writes and re-reads its own pointer passes identically on a private buffer,
-/// which is precisely why `hts1_session_probe` H5 could never see F14.
-/// `stamp_byte` is `!verify_byte`, so a guest that finds these bytes cannot have
-/// produced them itself for any nonce.
-///
-/// # Safety
-/// PASSIVE_LEVEL, and `resource_id` must name a live blob.
-unsafe fn hlm1_stamp(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    resource_id: u32,
-    length_bytes: u64,
-) {
-    use helios_kmd_logic::hlm1_placement::{digest, sample_offsets, stamp_byte, MAX_SAMPLES};
-    // The bind ordinal, so a stale stamp from an earlier bind cannot satisfy a
-    // later one. Published as `HlNnce`, which is what a reader needs to
-    // reconstruct the expected bytes.
-    let nonce = u64::from(HLM1_BINDS.load(Ordering::Relaxed));
-    let mut offsets = [0u64; MAX_SAMPLES];
-    let n = sample_offsets(length_bytes, &mut offsets);
-    let mut samples = [(0u64, 0u8); MAX_SAMPLES];
-    let mut i = 0;
-    while i < n {
-        samples[i] = (offsets[i], stamp_byte(nonce, offsets[i]));
-        i += 1;
-    }
-    let mut wrote_all = false;
-    // SAFETY: PASSIVE per the fn contract; the closure writes only inside the
-    // mapping `with_blob_bytes` proves the length of.
-    let mapped = unsafe {
-        with_blob_bytes(passive, adapter, resource_id, |blob, len| {
-            // A blob shorter than the placement would leave some samples
-            // unwritten while the digest still covered them, which reads as a
-            // readback mismatch rather than as the short mapping it is.
-            if len < length_bytes {
-                return;
-            }
-            let mut i = 0;
-            while i < n {
-                let (offset, byte) = samples[i];
-                // SAFETY (inside the caller's `unsafe` block, so no nested one):
-                // `offset < length_bytes <= len` and `blob` maps `len` bytes.
-                // Volatile — the reader of these bytes is another mapping of the
-                // same pages, which the compiler cannot see.
-                blob.add(offset as usize).write_volatile(byte);
-                i += 1;
-            }
-            wrote_all = true;
-        })
-    };
-    if !mapped || !wrote_all {
-        HLM1_STAMP_FAIL.fetch_add(1, Ordering::Relaxed);
-        return;
-    }
-    // The mapping is WC (`Cached = 0` for every HVM1 role), so the stores may sit
-    // in the write-combining buffers until something drains them. The guest reads
-    // these bytes from another mapping of the same pages.
-    // SAFETY: SFENCE is unprivileged and valid at any IRQL.
-    unsafe { core::arch::x86_64::_mm_sfence() };
-    HLM1_NONCE.store(nonce as u32, Ordering::Relaxed);
-    HLM1_DIGEST.store(digest(nonce, &samples[..n]) as u32, Ordering::Relaxed);
-    HLM1_STAMPS.fetch_add(1, Ordering::Relaxed);
-}
-
-/// Read the BLOB's bytes at the three offsets `hts1_session_probe` H5 writes and
-/// publish them raw (`HlRdbk`).
-///
-/// ⭐ The one acceptance check that cannot pass on a private buffer. H5 writes
-/// three bytes through `lk.pData` and reads them back through the SAME pointer,
-/// so it passes identically whether or not that pointer is the venus blob
-/// (`FINDINGS.md` F14). This reads the OTHER side of the alias, from kernel space,
-/// through `map_blob_prepare` + `MmMapIoSpace`.
-///
-/// It publishes bytes, not a verdict: the KMD is told neither H5's constants nor
-/// the stamp's, so `0xA55AC3` (H5's writes reached the blob) and the K2a stamp
-/// bytes (the mapping reads fine and the guest wrote elsewhere) are both readings
-/// a human makes, and neither can be manufactured here.
-///
-/// # Safety
-/// PASSIVE_LEVEL, and `resource_id` must still be live.
-pub(crate) unsafe fn hlm1_readback(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    resource_id: u32,
-    byte_size: u64,
-) {
-    // H5's offsets, from the protocol constants rather than from literals.
-    let slot_end = helios_protocol::HELIOS_HVM1_REPLY_SLOT_BYTES.saturating_sub(1);
-    let last = byte_size.saturating_sub(1);
-    if byte_size == 0 || slot_end >= byte_size {
-        return;
-    }
-    let mut packed = 0u32;
-    let mut read = false;
-    // SAFETY: PASSIVE per the fn contract; the closure reads only inside the
-    // mapping whose length `with_blob_bytes` supplies.
-    let mapped = unsafe {
-        with_blob_bytes(passive, adapter, resource_id, |blob, len| {
-            if len <= last {
-                return;
-            }
-            // SAFETY (inside the caller's `unsafe` block): every offset is
-            // `< byte_size <= len` and `blob` maps `len` bytes. Volatile because
-            // the writer is another mapping of the same pages.
-            let b0 = blob.read_volatile();
-            let b1 = blob.add(slot_end as usize).read_volatile();
-            let b2 = blob.add(last as usize).read_volatile();
-            packed = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
-            read = true;
-        })
-    };
-    if mapped && read {
-        HLM1_READBACK.store(packed, Ordering::Relaxed);
-    } else {
-        HLM1_READBACK_FAIL.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
-/// The `UPDATE_PAGE_TABLE` half, kept separate from [`bar_harvest_page_table`]
-/// because that function's `bar_placed` comparison is `PgUn`'s definition and
-/// re-basing it would silently change what `PgUn` counts.
-///
-/// # Safety
-/// As [`bar_harvest_page_table`].
-unsafe fn hlm1_harvest_page_table(
-    adapter: &AdapterContext,
-    reserve: u64,
-    u: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE,
-) {
-    if u.PageTableLevel != 0 || u.pPageTableEntries.is_null() || u.NumPageTableEntries == 0 {
-        return;
-    }
-    let Some(alloc) = (unsafe { paging_alloc_info(u.hAllocation) }) else {
-        return;
-    };
-    if !alloc.hlm1_eligible {
-        return;
-    }
-    // SAFETY: pPageTableEntries holds NumPageTableEntries DXGK_PTEs for the call.
-    let pte0 = unsafe { core::ptr::read_unaligned(u.pPageTableEntries) };
-    if unsafe { pte0.__bindgen_anon_1.__bindgen_anon_1 }.Valid() == 0 {
-        hlm1_observe(
-            crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_UPDATE_PAGE_TABLE as u32,
-            &alloc,
-            None,
-            None,
-            None,
-            reserve,
-        );
-        return;
-    }
-    let seg = unsafe { pte0.__bindgen_anon_1.__bindgen_anon_1 }.Segment() as u32;
-    let page0 = unsafe { pte0.__bindgen_anon_2.PageAddress };
-    if seg == helios_protocol::HELIOS_SEGMENT_ID_HLM1 {
-        HLM1_PT_HLM1.fetch_add(1, Ordering::Relaxed);
-    } else if seg == 0 {
-        HLM1_PT_SYSTEM.fetch_add(1, Ordering::Relaxed);
-    }
-    HLM1_PT_SEG.store(seg, Ordering::Relaxed);
-    HLM1_PT_PAGE.store(page0 as u32, Ordering::Relaxed);
-    // The same base arithmetic `bar_harvest_page_table` uses: an unchecked
-    // `page0 << 12` wraps, and the PTE addresses the allocation's own offset.
-    let base = helios_kmd_logic::Pfn(page0)
-        .physical_address()
-        .and_then(|address| address.checked_sub(u.AllocationOffsetInBytes));
-    if base.is_none() {
-        HLM1_PT_ERR.fetch_add(1, Ordering::Relaxed);
-    }
-    hlm1_observe(
-        crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_UPDATE_PAGE_TABLE as u32,
-        &alloc,
-        Some(seg),
-        base,
-        base.map(|_| (u.NumPageTableEntries as u64) << 12),
-        reserve,
-    );
-    // ⭐ THE PAGE TABLE IS ALSO A BIND HOOK, and with `AccessedPhysically` cleared
-    // it is the ONLY one: `NOTIFY_RESIDENCY` stops firing entirely in that
-    // configuration (`HlOpMs` 0x8B20 → 0xB00) while this arm still reports the
-    // pool in segment 2 (`HlPt2 = 66`). The offset arithmetic is
-    // `bar_harvest_page_table`'s, which is the PROVEN one — it is what
-    // `MapCpuHostAperture` compares its own placement against for every D3D11
-    // BAR surface — and the two arms AGREE where both fire (`HlAd1Pg` =
-    // `HlBndPg` = 4108 on the default configuration).
-    let Some(base) = base else { return };
-    // The bind maps the WHOLE blob, so the window bound must be checked against
-    // the allocation's size, not this batch's PTE count.
-    // ⚠ A discontiguous run cannot be one window range. `bar_harvest_page_table`
-    // refuses it into `PgEd`; refuse it here too rather than binding a range the
-    // page table contradicts.
-    let n = u.NumPageTableEntries as u64;
-    if n >= 2 && u.Flags.Repeat() == 0 {
-        // SAFETY: pPageTableEntries holds NumPageTableEntries entries.
-        let last = unsafe { core::ptr::read_unaligned(u.pPageTableEntries.add((n - 1) as usize)) };
-        let last_valid = unsafe { last.__bindgen_anon_1.__bindgen_anon_1 }.Valid() != 0;
-        if last_valid && unsafe { last.__bindgen_anon_2.PageAddress } != page0 + (n - 1) {
-            return;
-        }
-    }
-    // SAFETY: the live paging-op allocation handle `alloc` was resolved from.
-    unsafe {
-        hlm1_maybe_bind(
-            adapter,
-            u.hAllocation,
-            &alloc,
-            crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_UPDATE_PAGE_TABLE as u32,
-            seg,
-            base,
-            reserve,
-        )
-    };
 }
 
 /// Mirror the paging counter block into the registry.
@@ -1333,7 +712,6 @@ unsafe fn copy_blob_system_pages(
 unsafe fn bar_virtual_transfer(
     passive: PassiveLevel,
     adapter: &AdapterContext,
-    reserve: u64,
     transfer: &DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL,
 ) -> bool {
     let Some(alloc) = (unsafe { paging_alloc_info(transfer.hAllocation) }) else {
@@ -1345,17 +723,6 @@ unsafe fn bar_virtual_transfer(
         // This preserves the existing host-owned-content behavior; the software
         // content engine applies only to allocations KMD made blob-linear.
         BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
-        // No segment and no offset: TRANSFERVIRTUAL carries GPU virtual
-        // addresses only. Recorded so `HlOpMs` can say this fired without
-        // `HlPlN` claiming a placement arrived.
-        hlm1_observe(
-            crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_VIRTUAL_TRANSFER as u32,
-            &alloc,
-            None,
-            None,
-            None,
-            reserve,
-        );
         return true;
     }
 
@@ -1433,7 +800,6 @@ unsafe fn bar_transfer(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     bar_id: u32,
-    reserve: u64,
     t: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_1,
 ) -> PagingOpOutcome {
     let src_seg = t.Source.SegmentId;
@@ -1453,30 +819,6 @@ unsafe fn bar_transfer(
         // VidMm placement bookkeeping is decorative for this host-owned memory;
         // never issue RESOURCE_MAP_BLOB for it.
         BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
-        // The BAR end of the transfer is the one carrying an offset.
-        let (seg, address) = if dst_seg == bar_id {
-            // SAFETY: `SegmentId != 0` selects the SegmentAddress arm of the
-            // union `TransferEnd` discriminates on — established by the
-            // `src_seg != bar_id && dst_seg != bar_id` return above, since
-            // `bar_id` is the memory segment id and is never 0.
-            (dst_seg, unsafe {
-                *t.Destination.__bindgen_anon_1.SegmentAddress.as_ref()
-            })
-        } else {
-            // SAFETY: as above, for the source end.
-            (src_seg, unsafe {
-                *t.Source.__bindgen_anon_1.SegmentAddress.as_ref()
-            })
-        };
-        hlm1_observe(
-            crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_TRANSFER as u32,
-            &alloc,
-            Some(seg),
-            // SAFETY: LARGE_INTEGER's QuadPart arm is the whole value.
-            Some(unsafe { address.QuadPart } as u64),
-            Some(t.TransferSize as u64),
-            reserve,
-        );
         return PagingOpOutcome::NotOurs;
     }
     let flags = unsafe { t.Flags.__bindgen_anon_1.Value };
@@ -1592,7 +934,6 @@ unsafe fn bar_fill(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     bar_id: u32,
-    reserve: u64,
     f: &_DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_2,
 ) -> PagingOpOutcome {
     if f.Destination.SegmentId != bar_id {
@@ -1606,16 +947,6 @@ unsafe fn bar_fill(
     };
     if !alloc.bar_eligible {
         BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
-        hlm1_observe(
-            crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_FILL as u32,
-            &alloc,
-            Some(f.Destination.SegmentId),
-            // SAFETY: classic FILL's `Destination.SegmentAddress` is a plain
-            // PHYSICAL_ADDRESS, not a union; QuadPart is its whole value.
-            Some(unsafe { f.Destination.SegmentAddress.QuadPart } as u64),
-            Some(f.FillSize as u64),
-            reserve,
-        );
         return PagingOpOutcome::NotOurs;
     }
     let fill_len = f.FillSize as u64;
@@ -1659,60 +990,6 @@ fn fill_pattern(dst: *mut u8, len: usize, pattern: u32) {
     }
 }
 
-/// Diagnostic harvest of a LEAF `UPDATE_PAGE_TABLE`: record the BAR-segment
-/// physical placement VidMm assigned (pure atomic store — DISPATCH-safe, no
-/// side effects; content ops do not depend on it in the aperture model).
-unsafe fn bar_harvest_page_table(
-    bar_id: u32,
-    bar_size: u64,
-    u: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE,
-) {
-    if u.PageTableLevel != 0 || u.pPageTableEntries.is_null() || u.NumPageTableEntries == 0 {
-        return;
-    }
-    let Some(alloc) = (unsafe { paging_alloc_info(u.hAllocation) }) else {
-        return;
-    };
-    if !alloc.bar_eligible {
-        return;
-    }
-    // SAFETY: pPageTableEntries holds NumPageTableEntries DXGK_PTEs for the call.
-    let pte0 = unsafe { core::ptr::read_unaligned(u.pPageTableEntries) };
-    let valid = unsafe { pte0.__bindgen_anon_1.__bindgen_anon_1 }.Valid() != 0;
-    let seg = unsafe { pte0.__bindgen_anon_1.__bindgen_anon_1 }.Segment() as u32;
-    if !valid || seg != bar_id {
-        return;
-    }
-    let page0 = unsafe { pte0.__bindgen_anon_2.PageAddress };
-    // Contiguity check: a memory-segment allocation should be one contiguous
-    // range; discontiguous PTEs are counted (they would matter if partial
-    // aperture maps ever need placement-relative offsets).
-    let n = u.NumPageTableEntries as u64;
-    if n >= 2 && u.Flags.Repeat() == 0 {
-        let last = unsafe { core::ptr::read_unaligned(u.pPageTableEntries.add((n - 1) as usize)) };
-        let last_valid = unsafe { last.__bindgen_anon_1.__bindgen_anon_1 }.Valid() != 0;
-        if last_valid && unsafe { last.__bindgen_anon_2.PageAddress } != page0 + (n - 1) {
-            BAR_ERR_DISCONTIG.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-    }
-    // Same guard as the transfer path: an unchecked `page0 << 12` wraps.
-    let Some(page0_address) = helios_kmd_logic::Pfn(page0).physical_address() else {
-        BAR_ERR_VIRTUAL.fetch_add(1, Ordering::Relaxed);
-        return;
-    };
-    if let Some(base) = page0_address
-        .checked_sub(u.AllocationOffsetInBytes)
-        .filter(|b| *b < bar_size)
-    {
-        if alloc.bar_placed != base {
-            // SAFETY: h is the live paging-op allocation handle.
-            unsafe { set_bar_placement(u.hAllocation, base) };
-            BAR_PT_HARVESTS.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-}
-
 /// One `DXGKARG_BUILDPAGINGBUFFER` operation, with its union arm already resolved.
 ///
 /// # What this replaces
@@ -1738,15 +1015,6 @@ enum PagingOperation<'a> {
     DiscardContent(&'a _DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_3),
     VirtualFill(&'a DXGK_BUILDPAGINGBUFFER_FILLVIRTUAL),
     VirtualTransfer(&'a DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL),
-    /// K2a instrument arms. Parsed for their placement only; they are NOT
-    /// content ops and still answer `STATUS_SUCCESS`, exactly as they did while
-    /// falling through to [`Self::Other`].
-    NotifyResidency(&'a DXGK_BUILDPAGINGBUFFER_NOTIFYRESIDENCY),
-    NotifyResidency2(&'a DXGK_BUILDPAGINGBUFFER_NOTIFYRESIDENCY2),
-    Transfer2(&'a DXGK_BUILDPAGINGBUFFER_TRANSFER2),
-    Fill2(&'a DXGK_BUILDPAGINGBUFFER_FILL2),
-    MapApertureSegment(&'a _DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_6),
-    MapApertureSegment2(&'a _DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_10),
     /// Any operation this driver does not service — the null engine.
     Other,
 }
@@ -1779,22 +1047,6 @@ impl<'a> PagingOperation<'a> {
                 }
                 PagingOp::DXGK_OPERATION_VIRTUAL_TRANSFER => {
                     Self::VirtualTransfer(args.__bindgen_anon_1.TransferVirtual.as_ref())
-                }
-                PagingOp::DXGK_OPERATION_NOTIFY_RESIDENCY => {
-                    Self::NotifyResidency(args.__bindgen_anon_1.NotifyResidency.as_ref())
-                }
-                PagingOp::DXGK_OPERATION_NOTIFY_RESIDENCY2 => {
-                    Self::NotifyResidency2(args.__bindgen_anon_1.NotifyResidency2.as_ref())
-                }
-                PagingOp::DXGK_OPERATION_TRANSFER2 => {
-                    Self::Transfer2(args.__bindgen_anon_1.Transfer2.as_ref())
-                }
-                PagingOp::DXGK_OPERATION_FILL2 => Self::Fill2(args.__bindgen_anon_1.Fill2.as_ref()),
-                PagingOp::DXGK_OPERATION_MAP_APERTURE_SEGMENT => {
-                    Self::MapApertureSegment(args.__bindgen_anon_1.MapApertureSegment.as_ref())
-                }
-                PagingOp::DXGK_OPERATION_MAP_APERTURE_SEGMENT2 => {
-                    Self::MapApertureSegment2(args.__bindgen_anon_1.MapApertureSegment2.as_ref())
                 }
                 _ => Self::Other,
             }
@@ -1900,8 +1152,8 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
 
     // SAFETY: dxgkrnl hands back our AdapterContext as the miniport context.
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
-    let Some(bar) = adapter.bar_segment() else {
-        return STATUS_SUCCESS; // BAR segment inactive → pure null engine
+    let Some(local) = adapter.local_segment() else {
+        return STATUS_SUCCESS; // local segment inactive → pure null engine
     };
 
     // ONE union read for the whole DDI.
@@ -1938,145 +1190,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
             // whole block, so only the latency of that one value changes.
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        unsafe { bar_harvest_page_table(bar.seg_id, bar.size, update) };
-        // SAFETY: the same live `update` the harvest above just read.
-        unsafe { hlm1_harvest_page_table(adapter, bar.size, update) };
         return STATUS_SUCCESS;
-    }
-
-    // K2a instrument. Above the IRQL gate on purpose — atomics only — because
-    // the residency notifications are the arms most likely to carry an HLM1
-    // placement and are the ones whose IRQL nobody has measured.
-    match operation {
-        PagingOperation::NotifyResidency(n) => {
-            // SAFETY: non-null per the DDI contract; `PhysicalAddress` is a plain
-            // field here, not a union — unlike NOTIFY_RESIDENCY2's.
-            if let Some(alloc) = unsafe { paging_alloc_info(n.hAllocation) } {
-                // An eviction is the LAST notification a destroyed allocation
-                // gets, and its address is stale or zero. Publishing it would
-                // overwrite the residency answer with its inverse.
-                if n.__bindgen_anon_1.Resident() == 0 {
-                    if alloc.hlm1_eligible {
-                        HLM1_EVICT.fetch_add(1, Ordering::Relaxed);
-                    }
-                    hlm1_observe(args.Operation as u32, &alloc, None, None, None, bar.size);
-                    return STATUS_SUCCESS;
-                }
-                hlm1_observe(
-                    args.Operation as u32,
-                    &alloc,
-                    Some(n.PhysicalAddress.SegmentId),
-                    Some(n.PhysicalAddress.SegmentOffset),
-                    Some(alloc.size),
-                    bar.size,
-                );
-                // SAFETY: `n.hAllocation` is the handle `paging_alloc_info` just
-                // resolved `alloc` from, live for this call.
-                unsafe {
-                    hlm1_maybe_bind(
-                        adapter,
-                        n.hAllocation,
-                        &alloc,
-                        args.Operation as u32,
-                        n.PhysicalAddress.SegmentId,
-                        n.PhysicalAddress.SegmentOffset,
-                        bar.size,
-                    )
-                };
-            }
-            return STATUS_SUCCESS;
-        }
-        PagingOperation::NotifyResidency2(n) => {
-            // ⚠ In WDK 28000 this carries NO `PhysicalAddress` and no size — the
-            // placement is inside its `Adl`, and the 2026-07-08 binding snapshot
-            // that showed a `{PhysicalAddress | Mdl}` union describes a different
-            // kit. Segment only, until deploy 1 says this is the hook worth
-            // decoding an ADL for.
-            // SAFETY: non-null per the DDI contract.
-            if let Some(alloc) = unsafe { paging_alloc_info(n.hAllocation) } {
-                if alloc.hlm1_eligible {
-                    HLM1_NR2_MDL.store(n.Adl.PageCount, Ordering::Relaxed);
-                    if n.__bindgen_anon_1.Resident() == 0 {
-                        HLM1_EVICT.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                hlm1_observe(
-                    args.Operation as u32,
-                    &alloc,
-                    Some(n.SegmentId as u32),
-                    None,
-                    None,
-                    bar.size,
-                );
-            }
-            return STATUS_SUCCESS;
-        }
-        PagingOperation::Transfer2(t) => {
-            // Both ends are `{SegmentId, Adl}`. Segment only for the same reason
-            // as NOTIFY_RESIDENCY2.
-            // SAFETY: non-null per the DDI contract.
-            if let Some(alloc) = unsafe { paging_alloc_info(t.hAllocation) } {
-                let seg = if t.Destination.SegmentId != 0 {
-                    t.Destination.SegmentId
-                } else {
-                    t.Source.SegmentId
-                };
-                hlm1_observe(
-                    args.Operation as u32,
-                    &alloc,
-                    Some(seg),
-                    None,
-                    None,
-                    bar.size,
-                );
-            }
-            return STATUS_SUCCESS;
-        }
-        PagingOperation::Fill2(f) => {
-            // ⭐ The only operation in the whole DDI carrying a bare
-            // (SegmentId, SegmentAddress) pair in this kit.
-            // SAFETY: non-null per the DDI contract.
-            if let Some(alloc) = unsafe { paging_alloc_info(f.hAllocation) } {
-                hlm1_observe(
-                    args.Operation as u32,
-                    &alloc,
-                    Some(f.SegmentId),
-                    Some(f.SegmentAddress),
-                    Some((f.SizeInPages as u64) << 12),
-                    bar.size,
-                );
-            }
-            return STATUS_SUCCESS;
-        }
-        PagingOperation::MapApertureSegment(m) => {
-            // SAFETY: non-null per the DDI contract.
-            if let Some(alloc) = unsafe { paging_alloc_info(m.hAllocation) } {
-                hlm1_observe(
-                    args.Operation as u32,
-                    &alloc,
-                    Some(m.SegmentId),
-                    Some((m.OffsetInPages as u64) << 12),
-                    Some((m.NumberOfPages as u64) << 12),
-                    bar.size,
-                );
-            }
-            return STATUS_SUCCESS;
-        }
-        PagingOperation::MapApertureSegment2(m) => {
-            // SAFETY: as above.
-            if let Some(alloc) = unsafe { paging_alloc_info(m.hAllocation) } {
-                hlm1_observe(
-                    args.Operation as u32,
-                    &alloc,
-                    Some(m.SegmentId),
-                    Some((m.OffsetInPages as u64) << 12),
-                    Some((m.NumberOfPages as u64) << 12),
-                    bar.size,
-                );
-            }
-            return STATUS_SUCCESS;
-        }
-        _ => {}
     }
 
     // The content-op set is a method on the parsed value, so it cannot drift
@@ -2112,12 +1226,11 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     // driver's answer: `Failed` is the only variant that reaches VidMm as a
     // status, and every arm that produces one routes through `paging_failure()`.
     let outcome = match operation {
-        PagingOperation::Transfer(t) => unsafe {
-            bar_transfer(passive, adapter, bar.seg_id, bar.size, t)
-        },
-        PagingOperation::Fill(f) => unsafe { bar_fill(passive, adapter, bar.seg_id, bar.size, f) },
+        PagingOperation::Transfer(t) => unsafe { bar_transfer(passive, adapter, local.seg_id, t) },
+        PagingOperation::Fill(f) => unsafe { bar_fill(passive, adapter, local.seg_id, f) },
         PagingOperation::DiscardContent(d) => {
-            if d.SegmentId == bar.seg_id && unsafe { paging_alloc_info(d.hAllocation) }.is_some() {
+            if d.SegmentId == local.seg_id && unsafe { paging_alloc_info(d.hAllocation) }.is_some()
+            {
                 // Content lives in the blob; nothing to release here (aperture
                 // unmaps handle CPU visibility). Counted for the op census.
                 BAR_DISCARDS.fetch_add(1, Ordering::Relaxed);
@@ -2133,16 +1246,6 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
                 }
                 Some(alloc) if !alloc.bar_eligible => {
                     BAR_DEVICE_OP_SKIPS.fetch_add(1, Ordering::Relaxed);
-                    // FILLVIRTUAL carries a GPU virtual address and no segment.
-                    hlm1_observe(
-                        crate::dxgk::_DXGK_BUILDPAGINGBUFFER_OPERATION::DXGK_OPERATION_VIRTUAL_FILL
-                            as u32,
-                        &alloc,
-                        None,
-                        None,
-                        None,
-                        bar.size,
-                    );
                     PagingOpOutcome::NotOurs
                 }
                 Some(alloc) => {
@@ -2172,7 +1275,7 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
             }
         }
         PagingOperation::VirtualTransfer(tv) => {
-            if unsafe { bar_virtual_transfer(passive, adapter, bar.size, tv) } {
+            if unsafe { bar_virtual_transfer(passive, adapter, tv) } {
                 PagingOpOutcome::Executed
             } else {
                 // Was STATUS_UNSUCCESSFUL — the crate's last use of a status two
@@ -2184,17 +1287,9 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         // Exhaustive: `is_content_op` already returned for these, so reaching
         // them here is impossible. Named rather than wildcarded so a new variant
         // is a compile error in BOTH places at once.
-        PagingOperation::UpdatePageTable(_)
-        | PagingOperation::NotifyResidency(_)
-        | PagingOperation::NotifyResidency2(_)
-        | PagingOperation::Transfer2(_)
-        | PagingOperation::Fill2(_)
-        | PagingOperation::MapApertureSegment(_)
-        | PagingOperation::MapApertureSegment2(_)
-        | PagingOperation::Other => PagingOpOutcome::NotOurs,
+        PagingOperation::UpdatePageTable(_) | PagingOperation::Other => PagingOpOutcome::NotOurs,
     };
     dump_bar_counters(passive);
-    hlm1_dump_counters();
     match outcome {
         PagingOpOutcome::Failed(reason) => reason,
         PagingOpOutcome::Executed | PagingOpOutcome::NotOurs => STATUS_SUCCESS,

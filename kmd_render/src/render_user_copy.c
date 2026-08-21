@@ -28,9 +28,22 @@
  */
 
 typedef void *PVOID;
+typedef struct _MDL {
+    struct _MDL *Next;
+    short Size;
+    short MdlFlags;
+    PVOID Process;
+    PVOID MappedSystemVa;
+    PVOID StartVa;
+    unsigned long ByteCount;
+    unsigned long ByteOffset;
+} MDL, *PMDL;
+typedef char helios_mdl_size_must_be_48[(sizeof(MDL) == 48) ? 1 : -1];
 
 void __stdcall ProbeForRead(const volatile void *Address, unsigned __int64 Length,
                             unsigned long Alignment);
+void MmProbeAndLockPages(PMDL MemoryDescriptorList, signed char AccessMode,
+                         int Operation);
 void *memcpy(void *Destination, const void *Source, unsigned __int64 Length);
 
 #define EXCEPTION_EXECUTE_HANDLER 1
@@ -72,4 +85,27 @@ helios_render_copy_user_seh(void *Destination, const void *Source, unsigned __in
     }
 
     return HELIOS_RENDER_COPY_OK;
+}
+
+/* K2a's OS-owned ShareBackingStoreWithKmd MDL is a separate, kernel-mode
+ * lifetime from the Render command copy above.  MmProbeAndLockPages raises on
+ * an invalid backing-store range, so keep only this bounded exception
+ * conversion from the deleted broad mapping shim. */
+int
+helios_mm_probe_and_lock_pages_seh(PMDL Mdl)
+{
+    __try {
+        MmProbeAndLockPages(Mdl, /*KernelMode*/ 0, /*IoModifyAccess*/ 2);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
+/* MmGetMdlPfnArray is a WDK macro.  Its x64 expansion is the first byte after
+ * the fixed MDL header; the compile-time size check above pins that ABI. */
+unsigned long long *
+helios_mm_get_mdl_pfn_array(PMDL Mdl)
+{
+    return (unsigned long long *)(Mdl + 1);
 }

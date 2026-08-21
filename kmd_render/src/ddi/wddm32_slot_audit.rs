@@ -283,7 +283,7 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         offset: 224,
         min_version: "BASE",
         class: SlotClass::Implemented,
-        reason: "HPM1 paging DMA encoding (section 17.6:4421).",
+        reason: "Ordinary aperture/local content migration plus exact F21 GPUVA association; no HPM1 carrier.",
     },
     SlotAudit {
         name: "DxgkDdiSetPalette",
@@ -325,7 +325,7 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         offset: 272,
         min_version: "BASE",
         class: SlotClass::Disabled,
-        reason: "D9 leaves the WDDM 3.2 initialization slot NULL. No replacement Escape, IOCTL, registry, mapped-page, ticket, name, or discovery channel is advertised; wider K1 source demolition remains a later all-or-nothing retirement gate.",
+        reason: "K0/K1 leave the WDDM 3.2 slot NULL and delete its implementation; no replacement private query carrier is advertised.",
     },
     SlotAudit {
         name: "DxgkDdiCollectDbgInfo",
@@ -724,7 +724,7 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         offset: 728,
         min_version: "WDDM2_0",
         class: SlotClass::Implemented,
-        reason: "C64 authoritative per-process root.",
+        reason: "Decorative WDDM GpuMmu root publication only; no C64 or HPM1 host resolver.",
     },
     SlotAudit {
         name: "DxgkDdiGetRootPageTableSize",
@@ -737,15 +737,15 @@ pub(crate) const SLOTS: [SlotAudit; SLOT_COUNT] = [
         name: "DxgkDdiMapCpuHostAperture",
         offset: 744,
         min_version: "WDDM2_0",
-        class: SlotClass::Implemented,
-        reason: "COUPLED DELETE: goes with the HLM1 two-segment table (K1/K2); the current segment table still advertises SupportsCpuHostAperture, so removing the slot alone would break a live cap.",
+        class: SlotClass::Disabled,
+        reason: "K0 leaves the slot NULL; no reported segment advertises SupportsCpuHostAperture.",
     },
     SlotAudit {
         name: "DxgkDdiUnmapCpuHostAperture",
         offset: 752,
         min_version: "WDDM2_0",
-        class: SlotClass::Implemented,
-        reason: "COUPLED DELETE: pairs with MapCpuHostAperture; see that row.",
+        class: SlotClass::Disabled,
+        reason: "K0 leaves the paired slot NULL; no CPU-host-aperture mapping can be created.",
     },
     SlotAudit {
         name: "DxgkDdiCheckMultiPlaneOverlaySupport2",
@@ -1458,12 +1458,7 @@ const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCreateDevice
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCreateAllocation) == 152);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiDestroyAllocation) == 160);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiDescribeAllocation) == 168);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiGetStandardAllocationDriverData
-    ) == 176
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiGetStandardAllocationDriverData) == 176);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiAcquireSwizzlingRange) == 184);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiReleaseSwizzlingRange) == 192);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiPatch) == 200);
@@ -1479,20 +1474,12 @@ const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiEscape) == 2
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCollectDbgInfo) == 280);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiQueryCurrentFence) == 288);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiIsSupportedVidPn) == 296);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiRecommendFunctionalVidPn) == 304);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiEnumVidPnCofuncModality) == 312);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiRecommendFunctionalVidPn) == 304);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiEnumVidPnCofuncModality) == 312);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetVidPnSourceAddress) == 320);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetVidPnSourceVisibility) == 328);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetVidPnSourceVisibility) == 328);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCommitVidPn) == 336);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiUpdateActiveVidPnPresentPath
-    ) == 344
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiUpdateActiveVidPnPresentPath) == 344);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiRecommendMonitorModes) == 352);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiRecommendVidPnTopology) == 360);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiGetScanLine) == 368);
@@ -1510,12 +1497,7 @@ const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiDestroyOverl
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCreateContext) == 464);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiDestroyContext) == 472);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiLinkDevice) == 480);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiSetDisplayPrivateDriverFormat
-    ) == 488
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetDisplayPrivateDriverFormat) == 488);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiDescribePageTable) == 496);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiUpdatePageTable) == 504);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiUpdatePageDirectory) == 512);
@@ -1525,44 +1507,22 @@ const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCreateAlloca
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiRenderKm) == 544);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, Reserved) == 552);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiQueryVidPnHWCapability) == 560);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetPowerComponentFState) == 568);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiQueryDependentEngineGroup) == 576);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetPowerComponentFState) == 568);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiQueryDependentEngineGroup) == 576);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiQueryEngineStatus) == 584);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiResetEngine) == 592);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiStopDeviceAndReleasePostDisplayOwnership
-    ) == 600
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiStopDeviceAndReleasePostDisplayOwnership) == 600);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSystemDisplayEnable) == 608);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSystemDisplayWrite) == 616);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCancelCommand) == 624);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiGetChildContainerId) == 632);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiPowerRuntimeControlRequest
-    ) == 640
-);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay
-    ) == 648
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiPowerRuntimeControlRequest) == 640);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay) == 648);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiNotifySurpriseRemoval) == 656);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiGetNodeMetadata) == 664);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetPowerPState) == 672);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiControlInterrupt2) == 680);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiCheckMultiPlaneOverlaySupport
-    ) == 688
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCheckMultiPlaneOverlaySupport) == 688);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCalibrateGpuClock) == 696);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiFormatHistoryBuffer) == 704);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiRenderGdi) == 712);
@@ -1571,55 +1531,19 @@ const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetRootPageT
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiGetRootPageTableSize) == 736);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiMapCpuHostAperture) == 744);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiUnmapCpuHostAperture) == 752);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiCheckMultiPlaneOverlaySupport2
-    ) == 760
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCheckMultiPlaneOverlaySupport2) == 760);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCreateProcess) == 768);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiDestroyProcess) == 776);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay2
-    ) == 784
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay2) == 784);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, Reserved1) == 792);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, Reserved2) == 800);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiPowerRuntimeSetDeviceHandle
-    ) == 808
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiPowerRuntimeSetDeviceHandle) == 808);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetStablePowerState) == 816);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetVideoProtectedRegion) == 824);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiCheckMultiPlaneOverlaySupport3
-    ) == 832
-);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3
-    ) == 840
-);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiPostMultiPlaneOverlayPresent
-    ) == 848
-);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiValidateUpdateAllocationProperty
-    ) == 856
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetVideoProtectedRegion) == 824);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCheckMultiPlaneOverlaySupport3) == 832);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetVidPnSourceAddressWithMultiPlaneOverlay3) == 840);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiPostMultiPlaneOverlayPresent) == 848);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiValidateUpdateAllocationProperty) == 856);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiControlModeBehavior) == 864);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiUpdateMonitorLinkInfo) == 872);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCreateHwContext) == 880);
@@ -1629,118 +1553,55 @@ const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiDestroyHwQue
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSubmitCommandToHwQueue) == 912);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSwitchToHwContextList) == 920);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiResetHwEngine) == 928);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiCreatePeriodicFrameNotification
-    ) == 936
-);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiDestroyPeriodicFrameNotification
-    ) == 944
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCreatePeriodicFrameNotification) == 936);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiDestroyPeriodicFrameNotification) == 944);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetTimingsFromVidPn) == 952);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetTargetGamma) == 960);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetTargetContentType) == 968);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiSetTargetAnalogCopyProtection
-    ) == 976
-);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiSetTargetAdjustedColorimetry
-    ) == 984
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetTargetAnalogCopyProtection) == 976);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetTargetAdjustedColorimetry) == 984);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiDisplayDetectControl) == 992);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiQueryConnectionChange) == 1000);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiExchangePreStartInfo) == 1008);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiGetMultiPlaneOverlayCaps) == 1016);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiGetPostCompositionCaps) == 1024);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiGetMultiPlaneOverlayCaps) == 1016);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiGetPostCompositionCaps) == 1024);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiUpdateHwContextState) == 1032);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCreateProtectedSession) == 1040);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiDestroyProtectedSession) == 1048);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetSchedulingLogBuffer) == 1056);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCreateProtectedSession) == 1040);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiDestroyProtectedSession) == 1048);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetSchedulingLogBuffer) == 1056);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetupPriorityBands) == 1064);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiNotifyFocusPresent) == 1072);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiSetContextSchedulingProperties
-    ) == 1080
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetContextSchedulingProperties) == 1080);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSuspendContext) == 1088);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiResumeContext) == 1096);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetVirtualMachineData) == 1104);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiBeginExclusiveAccess) == 1112);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiEndExclusiveAccess) == 1120);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiQueryDiagnosticTypesSupport
-    ) == 1128
-);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiControlDiagnosticReporting
-    ) == 1136
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiQueryDiagnosticTypesSupport) == 1128);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiControlDiagnosticReporting) == 1136);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiResumeHwEngine) == 1144);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSignalMonitoredFence) == 1152);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiPresentToHwQueue) == 1160);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiValidateSubmitCommand) == 1168);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiSetTargetAdjustedColorimetry2
-    ) == 1176
-);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiSetTrackedWorkloadPowerLevel
-    ) == 1184
-);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSaveMemoryForHotUpdate) == 1192);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiRestoreMemoryForHotUpdate) == 1200);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetTargetAdjustedColorimetry2) == 1176);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetTrackedWorkloadPowerLevel) == 1184);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSaveMemoryForHotUpdate) == 1192);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiRestoreMemoryForHotUpdate) == 1200);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCollectDiagnosticInfo) == 1208);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, Reserved3) == 1216);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiControlInterrupt3) == 1224);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetFlipQueueLogBuffer) == 1232);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiUpdateFlipQueueLog) == 1240);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCancelQueuedFlips) == 1248);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiSetInterruptTargetPresentId
-    ) == 1256
-);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetAllocationBackingStore) == 1264);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetInterruptTargetPresentId) == 1256);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetAllocationBackingStore) == 1264);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCreateCpuEvent) == 1272);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiDestroyCpuEvent) == 1280);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCancelFlips) == 1288);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCreateNativeFence) == 1296);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiDestroyNativeFence) == 1304);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiUpdateMonitoredValues) == 1312);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiUpdateCurrentValuesFromCpu
-    ) == 1320
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiUpdateCurrentValuesFromCpu) == 1320);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCreateDoorbell) == 1328);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiConnectDoorbell) == 1336);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiDisconnectDoorbell) == 1344);
@@ -1753,49 +1614,20 @@ const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiStartDirtyTr
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiStopDirtyTracking) == 1400);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiQueryDirtyBitData) == 1408);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiPrepareLiveMigration) == 1416);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiSaveImmutableMigrationData
-    ) == 1424
-);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSaveMutableMigrationData) == 1432);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSaveImmutableMigrationData) == 1424);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSaveMutableMigrationData) == 1432);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiEndLiveMigration) == 1440);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiRestoreImmutableMigrationData
-    ) == 1448
-);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiRestoreMutableMigrationData
-    ) == 1456
-);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiWriteVirtualizedInterrupt) == 1464);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetVirtualGpuResources2) == 1472);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiSetVirtualFunctionPauseState
-    ) == 1480
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiRestoreImmutableMigrationData) == 1448);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiRestoreMutableMigrationData) == 1456);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiWriteVirtualizedInterrupt) == 1464);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetVirtualGpuResources2) == 1472);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetVirtualFunctionPauseState) == 1480);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiOpenNativeFence) == 1488);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCloseNativeFence) == 1496);
-const _: () =
-    assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetNativeFenceLogBuffer) == 1504);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiSetNativeFenceLogBuffer) == 1504);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiUpdateNativeFenceLogs) == 1512);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiCollectDbgInfo2) == 1520);
-const _: () = assert!(
-    offset_of!(
-        DRIVER_INITIALIZATION_DATA,
-        DxgkDdiNotifyContextPriorityChange
-    ) == 1528
-);
+const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiNotifyContextPriorityChange) == 1528);
 const _: () = assert!(offset_of!(DRIVER_INITIALIZATION_DATA, DxgkDdiResetDisplayEngine) == 1536);
 
 /// Compile-time proof that the audited struct is the struct we bindgen.

@@ -183,17 +183,6 @@ impl VirtioGpu {
         bump_high_water(&BLOB_HIGH_WATER, self.blobs.len());
     }
 
-    /// Look up a blob's tracking state by resource id (any owner). Returns
-    /// `(owner, size, mapped)` if the resource is a tracked, host-visible-mappable
-    /// blob. Used by the Present blit to decide whether the composition source /
-    /// IddCx destination can be CPU-mapped for a coherence copy.
-    pub fn blob_lookup(&self, resource_id: u32) -> Option<(Option<DeviceOwner>, u64, bool)> {
-        self.blobs
-            .iter()
-            .find(|s| s.resource_id == resource_id)
-            .map(|s| (s.owner, s.size, s.mapped))
-    }
-
     /// Begin mapping a blob into the host-visible window: if already mapped,
     /// return the mapping; otherwise reserve a window range and hand the
     /// RESOURCE_MAP_BLOB round-trip to the caller (PASSIVE, outside this lock),
@@ -296,146 +285,10 @@ impl VirtioGpu {
         self.window.free(offset, len);
     }
 
-    /// Install the VidMm reserve: the first `len` bytes of the host-visible
-    /// window belong to the CPU-visible BAR memory segment, so the KMD offset
-    /// allocator starts past them and freed ranges inside them are never
-    /// recycled by the KMD side.
-    ///
-    /// Legal ONLY while nothing has been issued. A second call, or one after any
-    /// blob has been mapped, is refused and counted rather than silently
-    /// stranding every offset already handed out below the new mark — those
-    /// ranges could never be recycled, because `WindowAllocator::free` returns
-    /// early for `offset < reserve`.
-    ///
-    /// Returns whether the reserve was installed.
-    pub fn configure_window_reserve(&mut self, len: u64) -> bool {
-        if len > self.window.window_len
-            || len & (super::BLOB_PAGE - 1) != 0
-            || !self.window.is_pristine()
-        {
-            WINDOW_RECONFIG_REFUSED.fetch_add(1, Ordering::Relaxed);
-            return false;
-        }
-        self.window.reserve = len;
-        self.window.next_offset = len;
-        true
-    }
-
-    /// Exact host-window bounds after StartDevice has installed the immutable
-    /// VidMm prefix. Fixed mappings may use the complete range; canonical
-    /// first-fit mappings begin at `reserve`.
-    pub(crate) fn owner_window_geometry(&self) -> Option<(u64, u64, u64)> {
-        self.host_visible
-            .map(|window| (window.base, window.len, self.window.reserve))
-    }
-
-    /// Begin a fixed-offset (re)map of a blob at the VidMm-assigned window
-    /// offset `offset` (must lie inside the VidMm partition). Unlike
-    /// [`Self::blob_map_begin`] the offset is dictated by the caller, and an
-    /// existing mapping at a DIFFERENT offset is handed back for unmapping —
-    /// blob content is intrinsic to the host memory object, so a remap is
-    /// content-preserving. Any-owner resolve (kernel path, like the executor).
-    pub fn blob_remap_begin(&mut self, resource_id: u32, offset: u64) -> BlobRemapBegin {
-        if self.host_visible.is_none() {
-            return BlobRemapBegin::Failed(VirtioError::DeviceError);
-        }
-        let window_base = self.host_visible.map_or(0, |w| w.base);
-        let Some(idx) = self.blobs.iter().position(|s| s.resource_id == resource_id) else {
-            return BlobRemapBegin::Failed(VirtioError::DeviceError);
-        };
-        if self.blobs[idx].map_pending {
-            return BlobRemapBegin::Busy;
-        }
-        if self.blobs[idx].mapped && self.blobs[idx].map_offset == offset {
-            let s = &self.blobs[idx];
-            return BlobRemapBegin::Mapped(BlobMapPrep {
-                gpa: window_base + s.map_offset,
-                size: s.map_len,
-                map_cache: s.map_cache,
-            });
-        }
-        let map_len = round_up_page(self.blobs[idx].size);
-        if map_len == 0 || map_len > MAX_BLOB_MAP_BYTES {
-            return BlobRemapBegin::Failed(VirtioError::DeviceError);
-        }
-        // The target range must sit entirely inside the VidMm partition —
-        // anything else would collide with the KMD-side offset allocator.
-        if offset % BLOB_PAGE != 0
-            || offset
-                .checked_add(map_len)
-                .map_or(true, |e| e > self.window.reserve)
-        {
-            return BlobRemapBegin::Failed(VirtioError::DeviceError);
-        }
-        let old = if self.blobs[idx].mapped {
-            Some((self.blobs[idx].map_offset, self.blobs[idx].map_len))
-        } else {
-            None
-        };
-        let s = &mut self.blobs[idx];
-        s.map_pending = true;
-        s.mapped = false;
-        s.map_offset = offset;
-        s.map_len = map_len;
-        BlobRemapBegin::Start { old, len: map_len }
-    }
-
-    /// Blobs currently mapped overlapping `[offset, offset+len)` inside the
-    /// VidMm partition, EXCLUDING `keep_resource_id`. Such mappings are stale
-    /// VidMm placements (an eviction this driver missed or dropped): VidMm
-    /// never double-books segment ranges, so before mapping a new blob into
-    /// the range the caller must RESOURCE_UNMAP_BLOB each returned id and
-    /// clear it via [`Self::blob_note_unmapped`]. Bounded scan under the lock.
-    ///
-    /// Returns `Err(WindowOverlapTruncated)` if a further overlap is found once
-    /// `out` is full. The scan used to stop RECORDING at that point and return
-    /// the truncated count, which the caller read as the complete set: a ninth
-    /// overlapping mapping was neither unmapped nor reported, and the
-    /// RESOURCE_MAP_BLOB that followed created exactly the overlapping host
-    /// window subregion the eviction pass exists to prevent — two host resources
-    /// through one window subregion, against the blob-window-offset invariant
-    /// (k-gputransport-04). The buffer deliberately stays fixed-size: this scan
-    /// runs under the device spinlock, where allocation is forbidden.
-    pub fn blobs_overlapping(
-        &self,
-        offset: u64,
-        len: u64,
-        keep_resource_id: u32,
-        out: &mut [u32],
-    ) -> Result<usize, WindowOverlapTruncated> {
-        let end = offset.saturating_add(len);
-        let mut n = 0;
-        for s in self.blobs.iter() {
-            if s.mapped
-                && s.resource_id != keep_resource_id
-                && s.map_offset < self.window.reserve
-                && s.map_offset < end
-                && s.map_offset.saturating_add(s.map_len) > offset
-            {
-                if n == out.len() {
-                    WINDOW_OVERLAP_TRUNCATED.fetch_add(1, Ordering::Relaxed);
-                    return Err(WindowOverlapTruncated);
-                }
-                out[n] = s.resource_id;
-                n += 1;
-            }
-        }
-        Ok(n)
-    }
-
-    /// Record that a blob's host mapping was torn down outside the normal
-    /// release path (stale-placement eviction in `map_blob_at`). No window
-    /// range is freed here — VidMm-partition offsets never enter the free list.
-    pub fn blob_note_unmapped(&mut self, resource_id: u32) {
-        if let Some(s) = self
-            .blobs
-            .iter_mut()
-            .find(|s| s.resource_id == resource_id && s.mapped)
-        {
-            s.mapped = false;
-            s.map_offset = 0;
-            s.map_len = 0;
-        }
+    /// Exact host-window bounds used by the canonical owner table. First-fit
+    /// allocation begins at zero; no VidMm-owned prefix exists.
+    pub(crate) fn owner_window_geometry(&self) -> Option<(u64, u64)> {
+        self.host_visible.map(|window| (window.base, window.len))
     }
 
     /// Drop the KMD-internal (KMD-owned) tracking slot for an allocation's blob at
@@ -459,9 +312,8 @@ impl VirtioGpu {
     }
 
     /// The host-visible blob window, or `None` if the device exposes none.
-    /// `DxgkDdiQueryAdapterInfo` uses `base`/`len` to describe the CPU-visible
-    /// memory segment, and `DxgkDdiBuildPagingBuffer` adds the VidMm-assigned
-    /// segment offset to `base` for the user mapping. Gate 5a Stage 2.
+    /// Used only by ordinary KMD-owned blob mappings and canonical owner-table
+    /// window allocation.
     pub fn host_visible(&self) -> Option<HostVisibleWindow> {
         self.host_visible
     }

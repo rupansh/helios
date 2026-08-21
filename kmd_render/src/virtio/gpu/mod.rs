@@ -1388,30 +1388,12 @@ fn reserve_scanout_transport_instance() -> Option<u64> {
 /// cannot wrap in the machine's lifetime.
 const WIRE_FENCE_INSTANCE_STRIDE: u64 = 1 << 32;
 
-/// The KMD's allocator for offsets inside the host-visible BAR window.
-///
-/// Its three pieces — the high-water bump, the coalescing free list and the
-/// VidMm reserve — were three loose fields of `VirtioGpu`, and the reserve was
-/// installed by a plain setter two statements after `set_virtio` in StartDevice.
-/// A SECOND `reserve_window_prefix` with a larger len would silently strand
-/// every offset already issued below the new mark: `free_window_range` returns
-/// early for `offset < reserve`, so those ranges could never be recycled and
-/// nothing would say so.
-///
-/// The reserve is now immutable once any offset has been issued —
-/// [`VirtioGpu::configure_window_reserve`] refuses and counts otherwise. It is a
-/// guarded setter rather than a literal construct-with-reserve because the
-/// reserve is computed from the window length AFTER `VirtioGpu::init` and
-/// installed under the device spinlock, where allocating the free list's `Vec`
-/// is forbidden.
+/// The KMD's ordinary first-fit allocator for host-visible blob mappings.
+/// VidMm owns no prefix and supplies no offset; every mapping is allocated and
+/// reclaimed by this object or the canonical control owner.
 struct WindowAllocator {
     /// Total bytes of the host-visible window (0 if the device exposes none).
     window_len: u64,
-    /// First `reserve` bytes are OWNED BY VIDMM (the CPU-visible BAR memory
-    /// segment, `query_adapter_info`): VidMm's segment allocator assigns offsets
-    /// there and `BuildPagingBuffer` maps each allocation's blob at the assigned
-    /// offset. This allocator never hands out or reclaims offsets below the mark.
-    reserve: u64,
     /// Bump high-water.
     next_offset: u64,
     /// Coalescing free list (bounded by MAX_WINDOW_RANGES).
@@ -1424,16 +1406,9 @@ impl WindowAllocator {
     fn new(window_len: u64) -> Self {
         Self {
             window_len,
-            reserve: 0,
             next_offset: 0,
             free_ranges: Vec::with_capacity(MAX_WINDOW_RANGES),
         }
-    }
-
-    /// True while no offset has been issued and nothing has been freed — the
-    /// only state in which the reserve may still be set.
-    fn is_pristine(&self) -> bool {
-        self.next_offset == self.reserve && self.free_ranges.is_empty()
     }
 
     /// Allocate a page-rounded `len`-byte range: reuse a free range if one fits,
@@ -1466,15 +1441,6 @@ impl WindowAllocator {
     /// the bounded free list is full — bring-up acceptable).
     fn free(&mut self, offset: u64, len: u64) {
         if len == 0 {
-            return;
-        }
-        // VidMm-partition offsets are owned by VidMm's segment allocator — they
-        // must never enter the KMD free list (a later KMD-side map would collide
-        // with a VidMm placement). Every release path funnels here, so this one
-        // guard covers DestroyAllocation/ReleaseBlob/teardown of VidMm-placed
-        // blobs uniformly. PRESERVED VERBATIM: it is what keeps VidMm-partition
-        // offsets out of the KMD free list.
-        if offset < self.reserve {
             return;
         }
         if offset.checked_add(len) == Some(self.next_offset) {
@@ -1610,23 +1576,6 @@ pub enum BlobMapBegin {
     Busy,
     /// Unknown resource / no host-visible window / size out of range / window
     /// exhausted.
-    Failed(VirtioError),
-}
-
-/// Result of [`VirtioGpu::blob_remap_begin`] (fixed-offset, VidMm-dictated maps
-/// for the CPU-visible BAR memory segment — `build_paging_buffer.rs`).
-pub enum BlobRemapBegin {
-    /// Already mapped at exactly the requested offset — nothing to do.
-    Mapped(BlobMapPrep),
-    /// Reserved. The caller must (1) RESOURCE_UNMAP_BLOB if `old` is
-    /// `Some((offset, len))` and return that range via
-    /// [`VirtioGpu::free_window_range_pub`] (a no-op for VidMm-partition
-    /// offsets), (2) RESOURCE_MAP_BLOB at the new offset, then (3) call
-    /// [`VirtioGpu::blob_map_finish`] with the new offset.
-    Start { old: Option<(u64, u64)>, len: u64 },
-    /// Another mapper's round-trip is in flight — retry after a PASSIVE sleep.
-    Busy,
-    /// Unknown resource / out-of-partition target / bad size.
     Failed(VirtioError),
 }
 

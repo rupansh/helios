@@ -45,13 +45,13 @@ DxgkDdiReleaseSwizzlingRange	Disabled	DXGK_DRIVERCAPS::NumberOfSwizzlingRanges=0
 DxgkDdiPatch	Implemented	Infallible idempotent physical-capability snapshotter (section 10.7:1856).
 DxgkDdiSubmitCommand	Implemented	Physical submit: epoch validation plus one fenced SUBMIT_3D.
 DxgkDdiPreemptCommand	Implemented	Preemption request; reports DMA_PREEMPTED.
-DxgkDdiBuildPagingBuffer	Implemented	HPM1 paging DMA encoding (section 17.6:4421).
+DxgkDdiBuildPagingBuffer	Implemented	Ordinary aperture/local content migration plus exact F21 GPUVA association; no HPM1 carrier.
 DxgkDdiSetPalette	Disabled	No palettized mode is enumerated; every VidPn source mode is 32bpp RGB.
 DxgkDdiSetPointerPosition	Implemented	Hardware pointer position.
 DxgkDdiSetPointerShape	Implemented	Hardware pointer shape.
 DxgkDdiResetFromTimeout	Implemented	TDR reset.
 DxgkDdiRestartFromTimeout	Implemented	TDR restart.
-DxgkDdiEscape	Disabled	D9 leaves the WDDM 3.2 initialization slot NULL. No replacement Escape, IOCTL, registry, mapped-page, ticket, name, or discovery channel is advertised; wider K1 source demolition remains a later all-or-nothing retirement gate.
+DxgkDdiEscape	Disabled	K0/K1 leave the WDDM 3.2 slot NULL and delete its implementation; no replacement private query carrier is advertised.
 DxgkDdiCollectDbgInfo	Implemented	OS-requested bounded debug snapshot.
 DxgkDdiQueryCurrentFence	Implemented	Last completed submission fence for a node.
 DxgkDdiIsSupportedVidPn	Implemented	VidPn validation.
@@ -108,10 +108,10 @@ DxgkDdiCalibrateGpuClock	Implemented	GPU clock calibration for the scheduler.
 DxgkDdiFormatHistoryBuffer	Implemented	History buffer formatting.
 DxgkDdiRenderGdi	Implemented	PENDING DELETE with the retired GDI path (K6; A.4 row 5770). Registered until the display lane confirms nothing lands here.
 DxgkDdiSubmitCommandVirtual	Implemented	D3D12 virtual submit: HOS1 validation plus nonblocking GPUVA enqueue.
-DxgkDdiSetRootPageTable	Implemented	C64 authoritative per-process root.
+DxgkDdiSetRootPageTable	Implemented	Decorative WDDM GpuMmu root publication only; no C64 or HPM1 host resolver.
 DxgkDdiGetRootPageTableSize	Implemented	GpuMmu root table sizing.
-DxgkDdiMapCpuHostAperture	Implemented	COUPLED DELETE: goes with the HLM1 two-segment table (K1/K2); the current segment table still advertises SupportsCpuHostAperture, so removing the slot alone would break a live cap.
-DxgkDdiUnmapCpuHostAperture	Implemented	COUPLED DELETE: pairs with MapCpuHostAperture; see that row.
+DxgkDdiMapCpuHostAperture	Disabled	K0 leaves the slot NULL; no reported segment advertises SupportsCpuHostAperture.
+DxgkDdiUnmapCpuHostAperture	Disabled	K0 leaves the paired slot NULL; no CPU-host-aperture mapping can be created.
 DxgkDdiCheckMultiPlaneOverlaySupport2	Disabled	Superseded revision. Section 17.6:4465 selects only the MPO3 revision.
 DxgkDdiCreateProcess	Implemented	One bounded ProcessContext HTS1 session list (section 17.6:4336).
 DxgkDdiDestroyProcess	Implemented	Process teardown cancels all sessions.

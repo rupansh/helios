@@ -27,7 +27,7 @@ mod segments;
 pub(crate) use locks::{
     dump_ordered_engine_atomics, NotifyOrdered, OrderedEngineTicket, WddmNotifyGuard,
 };
-pub(crate) use segments::{BarSegment, PagingRam};
+pub(crate) use segments::LocalSegment;
 
 /// Move-only proof that this exact adapter has no installed transport.
 pub(crate) struct TransportAbsent {
@@ -76,7 +76,7 @@ pub(crate) struct StartedState {
     /// [`AdapterKnobs`].
     pub knobs: AdapterKnobs,
     /// The segment table this adapter REPORTS, built once in StartDevice from
-    /// the same `BarSegment` value every other consumer reads.
+    /// the same `LocalSegment` value every other consumer reads.
     ///
     /// `query_segments` renders this; it does not re-derive one. That is what
     /// makes the count reported on the descriptor-NULL call and the descriptors
@@ -86,38 +86,14 @@ pub(crate) struct StartedState {
     /// Scanout-0 mode the display half presents, together with the EDID
     /// generated from it. See [`ScanoutMode`].
     pub scanout_mode: ScanoutMode,
-    /// Real-RAM-backed segment for VidMm page tables / paging buffers (segment 2).
-    /// `None` if the contiguous allocation failed (then we fall back to the old
-    /// single-segment shape). Freed in `AdapterContext::drop`.
-    pub paging_ram: Option<PagingRam>,
     /// The half StopDevice clears. `None` between StopDevice and the next
     /// StartDevice.
     transport: UnsafeCell<Option<TransportGeneration>>,
 }
 
-/// Every service-key knob this driver reads, snapshotted ONCE per StartDevice.
-///
-/// One concept, one mechanism. Before this existed there were three:
-/// `AllocCached`/`PresentProbe`/`ScForceReject`/`DisplayHalf` were snapshotted
-/// here at StartDevice, while `BarSegFlags`/`BarSegBaseMB` were read
-/// *inside* `write_bar_knob_descriptor`, which also performed two synchronous
-/// registry WRITES on every descriptor write — ungated by `DiagLevel`, because
-/// `record_named` has no such gate. A function named "write this descriptor"
-/// did blocking registry I/O in both directions.
-///
-/// Passing `&AdapterKnobs` to the descriptor writers removes their ability to do
-/// I/O at all: they become pure functions of their arguments. D9 also removes
-/// `DirectFlipCaps` entirely: Direct Flip, MPO, and the segment capability now
-/// derive from the SURFACE-owned D2 package, so a registry value cannot create a
-/// mixed activation state during AddAdapter.
-///
-/// Every field name here corresponds to a [`crate::diag::knobs`] entry, which is
-/// where the ≤14-byte lookup-buffer rule is enforced at compile time.
-/// `VidMmVramMB` value used internally when the registry value is absent. It is
-/// resolved from the virtio host-visible capability during StartDevice, after
-/// the transport has exposed the exact QEMU `hostmem` length. Keeping this
-/// distinct from zero preserves zero as the explicit legacy-topology switch.
-pub(crate) const VIDMM_VRAM_MB_AUTO: u32 = u32::MAX;
+/// The three surviving service-key policies, snapshotted once per StartDevice.
+/// Segment shape and capacity are deliberately absent: K8 derives them only
+/// from the active WDDM surface and exact transport capability.
 
 #[derive(Clone, Copy)]
 pub(crate) struct AdapterKnobs {
@@ -145,58 +121,6 @@ pub(crate) struct AdapterKnobs {
     /// with was a `const false` and went with T6/R905; this knob is now the only
     /// way to set the bit.
     pub cross_adapter: bool,
-    /// `BarSegFlags` (default 0x1C = CacheCoherent | SupportsCpuHostAperture |
-    /// SupportsCachedCpuHostAperture). The BAR descriptor's flag word.
-    pub bar_seg_flags: u32,
-    /// `BarSegBaseMB` (default 0). The BAR descriptor's GPU-physical
-    /// `BaseAddress` in MiB; a nonzero value tests the BaseAddress-overlap
-    /// hypothesis.
-    pub bar_seg_base_mb: u32,
-    /// `BarSegMode` (default 10). Parsed into
-    /// `crate::ddi::bar_segment::BarSegTopology`; kept raw here so the coerced
-    /// value can be reported.
-    pub bar_seg_mode: u32,
-    /// `Hlm1Only` (default false = the placement F15 measured). Narrows an HVM1
-    /// role's supported segment set to HLM1 alone. See
-    /// `crate::diag::knobs::HLM1_ONLY`; mirrored to `HlOnly`.
-    pub hlm1_only: bool,
-    /// `Hlm1Bar` (default false = §17.6's model). Routes an HVM1 allocation's CPU
-    /// view through the CpuHostAperture path. See `crate::diag::knobs::HLM1_BAR`;
-    /// mirrored to `HlBarEl`.
-    pub hlm1_bar: bool,
-    /// `Hlm1FlagsOff` (default 0). Mask of §10.7 placement bits to clear on an
-    /// HVM1 role. See `crate::diag::knobs::HLM1_FLAGS_OFF`; mirrored to
-    /// `HlFlgOff`.
-    pub hlm1_flags_off: u32,
-    /// `Hlm1Bind` (default 0 = OFF). 1 binds an HVM1 allocation's venus blob at
-    /// the window offset VidMm placed it at; 2 additionally stamps it. Kept raw
-    /// because the value selects the mode. See `crate::diag::knobs::HLM1_BIND`;
-    /// mirrored to `HlBind`.
-    pub hlm1_bind: u32,
-    /// `VidMmVramMB`. When absent, StartDevice derives the value from the exact
-    /// virtio host-visible capability length (QEMU `hostmem`). A valid nonzero
-    /// registry value overrides that automatic value; zero explicitly restores
-    /// the legacy topology. The selected value makes the existing BAR-backed
-    /// memory segment report this device-local capacity and opts device-local
-    /// Venus tracking allocations into that local segment. Non-local Vulkan
-    /// heaps remain in the aperture/shared budget. The programmable CPU aperture
-    /// stays capped separately; tracking allocations never map their identity
-    /// blobs through it.
-    ///
-    /// The default was 0 (no local segment) while the heap-aware accounting was
-    /// being brought up, then 4096 since 22.22.252.0. That fixed default made
-    /// every VM report 4 GiB even when the host configured a different capacity.
-    /// 4096 is the configuration that originally validated the path — Task
-    /// Manager shows a 4.0 GiB dedicated capacity, and direct-KMT and
-    /// native-Vulkan four-by-64 MiB probes each measured exactly +256.00 MiB in
-    /// the selected segment with no movement in the other and a clean return to
-    /// baseline after destroy (ROADMAP, "VidMm / Task Manager validation").
-    /// Shipping 0 meant no install ever got the configuration that was proven.
-    /// Re-confirmed on 22.22.251.0 before this flip: `VidVram=4096`,
-    /// `VidVBad=0`, adapter problem code 0, GT1 221.37 fps, all scanout gates
-    /// clean. Out-of-range values are refused into `VidVBad` and fall back to
-    /// the legacy topology rather than silently collapsing.
-    pub vidmm_vram_mb: u32,
 }
 
 impl AdapterKnobs {
@@ -212,14 +136,6 @@ impl AdapterKnobs {
         alloc_cached: true,
         display_half: true,
         cross_adapter: false,
-        bar_seg_flags: 0x1C,
-        bar_seg_base_mb: 0,
-        bar_seg_mode: 10,
-        hlm1_only: false,
-        hlm1_bar: false,
-        hlm1_flags_off: 0,
-        hlm1_bind: 0,
-        vidmm_vram_mb: VIDMM_VRAM_MB_AUTO,
     };
 
     /// Read every knob once. PASSIVE_LEVEL.
@@ -234,39 +150,15 @@ impl AdapterKnobs {
             alloc_cached: read_config_dword(knobs::ALLOC_CACHED, 1) != 0,
             display_half: read_config_dword(knobs::DISPLAY_HALF, 1) != 0,
             cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
-            bar_seg_flags: read_config_dword(knobs::BAR_SEG_FLAGS, 0x1C),
-            bar_seg_base_mb: read_config_dword(knobs::BAR_SEG_BASE_MB, 0),
-            bar_seg_mode: read_config_dword(knobs::BAR_SEG_MODE, 10),
-            hlm1_only: read_config_dword(knobs::HLM1_ONLY, 0) != 0,
-            hlm1_bar: read_config_dword(knobs::HLM1_BAR, 0) != 0,
-            hlm1_flags_off: read_config_dword(knobs::HLM1_FLAGS_OFF, 0),
-            hlm1_bind: read_config_dword(knobs::HLM1_BIND, 0),
-            vidmm_vram_mb: read_config_dword(knobs::VIDMM_VRAM_MB, VIDMM_VRAM_MB_AUTO),
         }
     }
 
-    /// [`Self::read`] plus the fixed-name breadcrumbs that mirror the knobs.
-    /// StartDevice only, so they cost one registry write per start — the
-    /// `BarF`/`BarB` pair used to be written on every descriptor write, from
-    /// inside `write_bar_knob_descriptor`, ungated by `DiagLevel`. Names and
-    /// values unchanged.
+    /// [`Self::read`] plus the two existing policy breadcrumbs consumed by the
+    /// bounded diagnostics path.
     pub fn read_at_start() -> Self {
         let knobs = Self::read();
         crate::diag::record_named_bytes(b"AlcC", knobs.alloc_cached as u32);
         crate::diag::record_named_bytes(b"DspH", knobs.display_half as u32);
-        crate::diag::record_named_bytes(b"BarF", knobs.bar_seg_flags);
-        crate::diag::record_named_bytes(b"BarB", knobs.bar_seg_base_mb);
-        crate::diag::record_named_bytes(b"BarM", knobs.bar_seg_mode);
-        // ⛔ NOT part of the `Hl*` counter block, deliberately: `hlm1_reset_counters`
-        // zeroes that block at every StartDevice, and a knob echo that reads 0
-        // because it was reset is indistinguishable from one that never took.
-        crate::diag::record_named_bytes(b"HlOnly", knobs.hlm1_only as u32);
-        crate::diag::record_named_bytes(b"HlBind", knobs.hlm1_bind);
-        crate::diag::record_named_bytes(b"HlFlgOff", knobs.hlm1_flags_off);
-        crate::diag::record_named_bytes(b"HlBarEl", knobs.hlm1_bar as u32);
-        // VidVram is recorded after StartDevice resolves the absent-value
-        // sentinel from the virtio host-visible capability.
-        crate::diag::record_named_bytes(b"VidVBad", 0);
         knobs
     }
 }
@@ -335,7 +227,6 @@ impl StartedState {
         share_backing_store_with_kmd: bool,
         knobs: AdapterKnobs,
         scanout_mode: ScanoutMode,
-        paging_ram: Option<PagingRam>,
         segment_table: crate::ddi::segment_table::SegmentTable,
     ) -> Box<Self> {
         Box::new(Self {
@@ -343,7 +234,6 @@ impl StartedState {
             share_backing_store_with_kmd,
             knobs,
             scanout_mode,
-            paging_ram,
             segment_table,
             transport: UnsafeCell::new(None),
         })
@@ -422,11 +312,10 @@ const _: () = {
 /// restart at 1 and whose liveness test is bare membership — which is how a
 /// recycled id used to be accepted as the cached LINEAR scan-out target.
 pub(crate) struct TransportGeneration {
-    /// BAR memory segment — the head partition of the host-visible
-    /// window, reserved as dxgkrnl's CPU-host-aperture region at StartDevice.
-    /// `None` if the window is absent/too small; the BAR segment is then not
-    /// reported and standard allocations stay on the aperture (old behavior).
-    pub bar_segment: Option<BarSegment>,
+    /// Exact optional local VidMm capacity for this transport. It has no CPU
+    /// mapping address and is absent when the transport exposes no admissible
+    /// host-visible capability.
+    pub local_segment: Option<LocalSegment>,
     /// The persistent venus 3D context id (`VIRTIO_GPU_CAPSET_VENUS`) the venus
     /// client rides, created in StartDevice and destroyed in StopDevice. `0` = none.
     pub venus_ctx_id: u32,
@@ -909,23 +798,6 @@ impl AdapterContext {
         unsafe { (*self.started.get()).as_deref() }
     }
 
-    /// Take the contiguous RAM blocks out of a PREVIOUS start's state so the
-    /// next one can carry them forward.
-    ///
-    /// These blocks are normally reused across a stop/start cycle and released
-    /// by their owning `PagingRam` on failed Start or final adapter destruction.
-    /// Leaving them inside StartedState across StopDevice is what lets this take
-    /// move them into the successor publication without a leak.
-    ///
-    /// # Safety
-    /// PASSIVE_LEVEL, from `DxgkDdiStartDevice` only, which dxgkrnl serializes.
-    pub(crate) unsafe fn take_paging_ram(&self) -> Option<PagingRam> {
-        // SAFETY: per the fn contract — StartDevice is serialized against every
-        // other lifecycle DDI, and nothing reads `paging_ram` between the take
-        // and the republish inside the same call.
-        unsafe { (*self.started.get()).as_deref_mut() }.and_then(|s| s.paging_ram.take())
-    }
-
     /// Publish the started state. StartDevice only, exactly once per start.
     ///
     /// # Safety
@@ -1070,10 +942,10 @@ impl AdapterContext {
         self.transport_generation().map_or(0, |t| t.venus_ctx_id)
     }
 
-    /// The BAR memory segment for this transport generation, if any.
-    pub(crate) fn bar_segment(&self) -> Option<&BarSegment> {
+    /// The local-memory segment for this transport generation, if any.
+    pub(crate) fn local_segment(&self) -> Option<&LocalSegment> {
         self.transport_generation()
-            .and_then(|t| t.bar_segment.as_ref())
+            .and_then(|t| t.local_segment.as_ref())
     }
 
     pub(crate) fn control_owner(&self) -> &TransportOwner {
@@ -1400,14 +1272,6 @@ impl AdapterContext {
         }
     }
 
-    /// The real-RAM paging/page-table segment backing, if it was allocated.
-    /// `query_segments` reports it as segment 2 (`(phys_base, size)`).
-    pub fn paging_ram(&self) -> Option<(u64, u64)> {
-        self.started()
-            .and_then(|s| s.paging_ram.as_ref())
-            .map(|p| (p.phys, p.size))
-    }
-
     /// Install or clear the persistent KMD Venus client, under the PASSIVE
     /// venus mutex (so an in-flight `with_venus_client` cannot be raced by
     /// StopDevice teardown). Device-lifecycle callers only; the previous client
@@ -1431,16 +1295,5 @@ impl Drop for AdapterContext {
         self.stop_vsync();
         self.delete_vsync_ex_timer();
         self.stop_hpd();
-        // Free the contiguous paging-RAM segment. RemoveDevice (which drops the
-        // boxed AdapterContext) runs at PASSIVE_LEVEL, where MmFreeContiguousMemory
-        // is legal.
-        // The RAM blocks now live in `StartedState`. `&mut self` here is genuinely
-        // unique (RemoveDevice owns the box), so reaching into the cell is sound.
-        // SAFETY: exclusive access via `&mut self`; RemoveDevice runs after the
-        // VSync timer is cancelled and the HPD worker joined, so no other agent
-        // holds a reference into this context.
-        if let Some(state) = unsafe { (*self.started.get()).as_deref_mut() } {
-            drop(state.paging_ram.take());
-        }
     }
 }

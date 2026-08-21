@@ -8,8 +8,8 @@ Audited header: `kmd_render/tools/wdk-28000/km/dispmprt.h`
 
 Slots: **192** (plus `Version`), struct size **1544** bytes.
 
-* `Implemented` — 92
-* `Disabled` — 100 (unreachable behind a truthful zero capability)
+* `Implemented` — 90
+* `Disabled` — 102 (unreachable behind a truthful zero capability)
 * `Pending` — 0 (pre-D9 only; D9 requires zero)
 * `Retiring` — 0 (pre-D9 only; D9 requires zero)
 
@@ -47,13 +47,13 @@ refuses to load if any slot disagrees with its class here.
 | 24 | 200 | `DxgkDdiPatch` | BASE | Implemented | Infallible idempotent physical-capability snapshotter (section 10.7:1856). |
 | 25 | 208 | `DxgkDdiSubmitCommand` | BASE | Implemented | Physical submit: epoch validation plus one fenced SUBMIT_3D. |
 | 26 | 216 | `DxgkDdiPreemptCommand` | BASE | Implemented | Preemption request; reports DMA_PREEMPTED. |
-| 27 | 224 | `DxgkDdiBuildPagingBuffer` | BASE | Implemented | HPM1 paging DMA encoding (section 17.6:4421). |
+| 27 | 224 | `DxgkDdiBuildPagingBuffer` | BASE | Implemented | Ordinary aperture/local content migration plus exact F21 GPUVA association; no HPM1 carrier. |
 | 28 | 232 | `DxgkDdiSetPalette` | BASE | Disabled | No palettized mode is enumerated; every VidPn source mode is 32bpp RGB. |
 | 29 | 240 | `DxgkDdiSetPointerPosition` | BASE | Implemented | Hardware pointer position. |
 | 30 | 248 | `DxgkDdiSetPointerShape` | BASE | Implemented | Hardware pointer shape. |
 | 31 | 256 | `DxgkDdiResetFromTimeout` | BASE | Implemented | TDR reset. |
 | 32 | 264 | `DxgkDdiRestartFromTimeout` | BASE | Implemented | TDR restart. |
-| 33 | 272 | `DxgkDdiEscape` | BASE | Disabled | D9 leaves the WDDM 3.2 initialization slot NULL. No replacement Escape, IOCTL, registry, mapped-page, ticket, name, or discovery channel is advertised; wider K1 source demolition remains a later all-or-nothing retirement gate. |
+| 33 | 272 | `DxgkDdiEscape` | BASE | Disabled | K0/K1 leave the WDDM 3.2 slot NULL and delete its implementation; no replacement private query carrier is advertised. |
 | 34 | 280 | `DxgkDdiCollectDbgInfo` | BASE | Implemented | OS-requested bounded debug snapshot. |
 | 35 | 288 | `DxgkDdiQueryCurrentFence` | BASE | Implemented | Last completed submission fence for a node. |
 | 36 | 296 | `DxgkDdiIsSupportedVidPn` | BASE | Implemented | VidPn validation. |
@@ -110,10 +110,10 @@ refuses to load if any slot disagrees with its class here.
 | 87 | 704 | `DxgkDdiFormatHistoryBuffer` | WDDM1_3 | Implemented | History buffer formatting. |
 | 88 | 712 | `DxgkDdiRenderGdi` | WDDM2_0 | Implemented | PENDING DELETE with the retired GDI path (K6; A.4 row 5770). Registered until the display lane confirms nothing lands here. |
 | 89 | 720 | `DxgkDdiSubmitCommandVirtual` | WDDM2_0 | Implemented | D3D12 virtual submit: HOS1 validation plus nonblocking GPUVA enqueue. |
-| 90 | 728 | `DxgkDdiSetRootPageTable` | WDDM2_0 | Implemented | C64 authoritative per-process root. |
+| 90 | 728 | `DxgkDdiSetRootPageTable` | WDDM2_0 | Implemented | Decorative WDDM GpuMmu root publication only; no C64 or HPM1 host resolver. |
 | 91 | 736 | `DxgkDdiGetRootPageTableSize` | WDDM2_0 | Implemented | GpuMmu root table sizing. |
-| 92 | 744 | `DxgkDdiMapCpuHostAperture` | WDDM2_0 | Implemented | COUPLED DELETE: goes with the HLM1 two-segment table (K1/K2); the current segment table still advertises SupportsCpuHostAperture, so removing the slot alone would break a live cap. |
-| 93 | 752 | `DxgkDdiUnmapCpuHostAperture` | WDDM2_0 | Implemented | COUPLED DELETE: pairs with MapCpuHostAperture; see that row. |
+| 92 | 744 | `DxgkDdiMapCpuHostAperture` | WDDM2_0 | Disabled | K0 leaves the slot NULL; no reported segment advertises SupportsCpuHostAperture. |
+| 93 | 752 | `DxgkDdiUnmapCpuHostAperture` | WDDM2_0 | Disabled | K0 leaves the paired slot NULL; no CPU-host-aperture mapping can be created. |
 | 94 | 760 | `DxgkDdiCheckMultiPlaneOverlaySupport2` | WDDM2_0 | Disabled | Superseded revision. Section 17.6:4465 selects only the MPO3 revision. |
 | 95 | 768 | `DxgkDdiCreateProcess` | WDDM2_0 | Implemented | One bounded ProcessContext HTS1 session list (section 17.6:4336). |
 | 96 | 776 | `DxgkDdiDestroyProcess` | WDDM2_0 | Implemented | Process teardown cancels all sessions. |

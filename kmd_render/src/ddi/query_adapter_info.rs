@@ -23,7 +23,7 @@ use crate::dxgk::*;
 
 use helios_protocol::{HeliosUmdAdapterInfoV1, HELIOS_PACKAGE_GENERATION};
 
-use crate::adapter::{AdapterContext, AdapterKnobs};
+use crate::adapter::AdapterContext;
 use crate::ddi::gpummu;
 use crate::ddi::wddm_surface::SURFACE;
 
@@ -753,12 +753,8 @@ const _: () = assert!(APERTURE_COMMIT_LIMIT <= APERTURE_SEGMENT_SIZE as u64);
 /// GetRootPageTableSize, BuildPagingBuffer, SubmitCommand/SubmitCommandVirtual,
 /// CreateProcess) is implemented (decorative/null engine), so the level only flips
 /// the capability *declaration*.
-// `DirectFlipCaps` and `CrossAdaptCaps` used to be read here, by a helper each,
-// on every call. `DirectFlipCaps` alone cost FOUR registry reads per AddAdapter
-// (the caps path plus once inside each of the three aperture descriptor writers)
-// and could therefore change value mid-AddAdapter. Both now arrive through
-// `AdapterKnobs`, snapshotted once at StartDevice — see that type for the
-// inconsistency this closes.
+// DirectFlip derives from the surface-owned D2 predicate. CrossAdaptCaps is the
+// one remaining user policy in this block and is snapshotted at StartDevice.
 //
 // `CrossAdaptCaps` is the gate for the cross-adapter *redirected-bitblt*
 // windowed present: without `DXGK_VIDMMCAPS.CrossAdapterResource` the OS never
@@ -787,29 +783,6 @@ const PAGING_BUFFER_BYTES_V4: u32 = 64 * 1024;
 /// have. Which surface serves which build is documented on `query_segments3`.
 const PAGING_BUFFER_BYTES_LEGACY: u32 = 10 * 4096;
 
-/// Which union member of a `DXGK_SEGMENTDESCRIPTOR4` carries CPU access.
-///
-/// R1006. `CpuTranslatedAddress` and `CpuHostAperture` SHARE a union, so
-/// writing both is not "two flags set" -- it is one silently overwriting the
-/// other. That exclusivity used to be maintained by hand, with the condition
-/// `flags & 0x08 != 0 && flags & 0x02 == 0` at the single site that knew about
-/// it. As an enum, which member gets written is decided BY CONSTRUCTION and
-/// there is no expressible way to write both.
-///
-/// This does NOT make the bindgen union writes safe -- the layout is a WDK
-/// header property no Rust type can assert -- and it is separate from the
-/// FLAG bits, which stay independently settable so an arbitrary `BarSegFlags`
-/// value still produces byte-identical output.
-#[derive(Clone, Copy)]
-enum CpuAccess {
-    /// Nothing written; the union stays zeroed.
-    None,
-    /// `CpuTranslatedAddress.QuadPart = gpa`.
-    Translated(u64),
-    /// `CpuHostAperture = { PhysicalAddress: gpa, SizeInPages: pages }`.
-    HostAperture { gpa: u64, pages: u32 },
-}
-
 /// Aperture segments redirect system-memory MDLs; memory segments hold bits.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SegmentKind {
@@ -819,11 +792,9 @@ enum SegmentKind {
 
 /// One segment descriptor, independent of which bindgen generation carries it.
 ///
-/// The three aperture writers differed ONLY in the descriptor type -- identical
-/// flags, identical base, size and commit limit -- and
-/// `write_bar_knob_descriptor` at its default `BarSegFlags = 0x1C` emits a
-/// descriptor byte-identical to `write_cpu_host_memory_descriptor`. One spec,
-/// three renderers.
+/// The three aperture writers differ only in descriptor generation. The local
+/// memory constructor is intentionally closed: it cannot express CpuVisible,
+/// a CPU-host aperture, or a translated CPU address.
 #[derive(Clone, Copy)]
 struct SegmentDescriptorSpec {
     base: i64,
@@ -832,13 +803,8 @@ struct SegmentDescriptorSpec {
     kind: SegmentKind,
     cache_coherent: bool,
     direct_flip: bool,
-    cpu_visible: bool,
-    supports_cpu_host_aperture: bool,
-    supports_cached_cpu_host_aperture: bool,
-    populated_from_system_memory: bool,
     application_target: bool,
     local_budget_group: bool,
-    cpu_access: CpuAccess,
 }
 
 impl SegmentDescriptorSpec {
@@ -855,98 +821,23 @@ impl SegmentDescriptorSpec {
             kind: SegmentKind::Aperture,
             cache_coherent: true,
             direct_flip,
-            cpu_visible: false,
-            supports_cpu_host_aperture: false,
-            supports_cached_cpu_host_aperture: false,
-            populated_from_system_memory: false,
             application_target: false,
             local_budget_group: false,
-            cpu_access: CpuAccess::None,
         }
     }
 
-    /// A MEMORY segment whose backing lives at `base` (guest-physical) for
-    /// `len` bytes, exposed through WDDM's CPU host aperture rather than the
-    /// legacy CpuVisible direct-BAR path.
-    ///
-    /// CpuVisible deliberately stays 0. If it is set, dxgkrnl treats the union
-    /// as CpuTranslatedAddress and does not create the CPU-host-aperture segment
-    /// attributes VidMm needs for paging-process page tables: `GetCpuVisibleAddress`
-    /// accepts the internal segment attribute only for a CPU-host-aperture
-    /// segment (bit 13).
-    fn cpu_host_memory(base: u64, len: u64) -> Self {
+    /// Exact non-CPU-visible local VidMm capacity. CPU-visible allocations also
+    /// support the ordinary aperture, and the content engine owns migration.
+    const fn local(base: u64, len: u64, direct_flip: bool) -> Self {
         Self {
-            base: 0,
+            base: base as i64,
             size: len as SIZE_T,
             commit_limit: len as SIZE_T,
             kind: SegmentKind::Memory,
-            cache_coherent: true,
-            direct_flip: false,
-            cpu_visible: false,
-            supports_cpu_host_aperture: true,
-            supports_cached_cpu_host_aperture: true,
-            populated_from_system_memory: false,
-            application_target: false,
-            local_budget_group: false,
-            cpu_access: CpuAccess::HostAperture {
-                gpa: base,
-                pages: (len / 4096).min(u32::MAX as u64) as u32,
-            },
-        }
-    }
-
-    /// The fully knob-driven BAR descriptor. The bit ladder and its union
-    /// special case exist HERE and nowhere else.
-    ///
-    ///   bit0 Aperture   bit1 CpuVisible(CpuTranslatedAddress=gpa)
-    ///   bit2 CacheCoherent    bit3 SupportsCpuHostAperture
-    ///   bit4 SupportsCachedCpuHostAperture   bit5 DirectFlip
-    ///   bit6 PopulatedFromSystemMemory
-    fn from_bar_flags(
-        flags: u32,
-        gpu_base: u64,
-        gpa: u64,
-        len: u64,
-        cpu_aperture_len: u64,
-        application_target: bool,
-    ) -> Self {
-        Self {
-            base: gpu_base as i64,
-            size: len as SIZE_T,
-            commit_limit: len as SIZE_T,
-            kind: if flags & 0x01 != 0 {
-                SegmentKind::Aperture
-            } else {
-                SegmentKind::Memory
-            },
-            cache_coherent: flags & 0x04 != 0,
-            direct_flip: flags & 0x20 != 0,
-            cpu_visible: flags & 0x02 != 0,
-            supports_cpu_host_aperture: flags & 0x08 != 0,
-            supports_cached_cpu_host_aperture: flags & 0x10 != 0,
-            // The CPU-host aperture is only a mapping window into the Venus
-            // device-memory segment; it does not make the whole segment system
-            // memory. Leaving this clear is what makes Windows count the
-            // reported capacity as dedicated video memory.
-            populated_from_system_memory: flags & 0x40 != 0,
-            application_target,
-            // ApplicationTarget enrolls the segment in process budgeting;
-            // LocalBudgetGroup classifies its residency as local video
-            // memory. A dedicated Helios heap needs both.
-            local_budget_group: application_target,
-            // CpuVisible claims the union first; the host aperture only gets it
-            // when CpuVisible did not. This is the one condition the old code
-            // spelled out inline, and the reason `CpuAccess` is an enum.
-            cpu_access: if flags & 0x02 != 0 {
-                CpuAccess::Translated(gpa)
-            } else if flags & 0x08 != 0 {
-                CpuAccess::HostAperture {
-                    gpa,
-                    pages: (cpu_aperture_len / 4096).min(u32::MAX as u64) as u32,
-                }
-            } else {
-                CpuAccess::None
-            },
+            cache_coherent: false,
+            direct_flip,
+            application_target: true,
+            local_budget_group: true,
         }
     }
 
@@ -964,41 +855,17 @@ impl SegmentDescriptorSpec {
                 if self.kind == SegmentKind::Aperture {
                     f.set_Aperture(1);
                 }
-                if self.cpu_visible {
-                    f.set_CpuVisible(1);
-                }
                 if self.cache_coherent {
                     f.set_CacheCoherent(1);
                 }
-                if self.supports_cpu_host_aperture {
-                    f.set_SupportsCpuHostAperture(1);
-                }
-                if self.supports_cached_cpu_host_aperture {
-                    f.set_SupportsCachedCpuHostAperture(1);
-                }
                 if self.direct_flip {
                     f.set_DirectFlip(1);
-                }
-                if self.populated_from_system_memory {
-                    f.set_PopulatedFromSystemMemory(1);
                 }
                 if self.application_target {
                     f.set_ApplicationTarget(1);
                 }
                 if self.local_budget_group {
                     f.set_LocalBudgetGroup(1);
-                }
-            }
-            match self.cpu_access {
-                CpuAccess::None => {}
-                CpuAccess::Translated(gpa) => {
-                    (*s.__bindgen_anon_1.CpuTranslatedAddress.as_mut()).QuadPart = gpa as i64;
-                }
-                CpuAccess::HostAperture { gpa, pages } => {
-                    *s.__bindgen_anon_1.CpuHostAperture.as_mut() = DXGK_CPUHOSTAPERTURE {
-                        PhysicalAddress: gpa,
-                        SizeInPages: pages,
-                    };
                 }
             }
             s.Size = self.size;
@@ -1008,13 +875,8 @@ impl SegmentDescriptorSpec {
 
     /// Render into a WDDM 1.2/1.3 `DXGK_QUERYSEGMENTOUT3` descriptor.
     ///
-    /// ⚠ `DXGK_SEGMENTDESCRIPTOR3` cannot express a CPU-host-aperture segment at
-    /// all -- there is no such union member -- so `cpu_access`, `cpu_visible`
-    /// and `populated_from_system_memory` have NO representation here and are
-    /// dropped. That is sound only because the only spec this generation ever
-    /// receives is [`SegmentDescriptorSpec::aperture`], on which all three are
-    /// false/None. It is a documented mapping, NOT a claimed invariant: the type
-    /// system does not enforce it, which is why it is written down.
+    /// The recovery surface receives only the aperture spec; local-memory
+    /// capacity remains a WDDM 3.2 fact.
     ///
     /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR3`.
     unsafe fn write_into_v3(self, seg: *mut DXGK_SEGMENTDESCRIPTOR3) {
@@ -1087,76 +949,25 @@ unsafe fn write_aperture_descriptor_legacy(seg: *mut DXGK_SEGMENTDESCRIPTOR) {
     };
 }
 
-/// Write a MEMORY descriptor (`Aperture=0`, holds bits) whose backing lives at
-/// `base` (guest-physical) for `len` bytes.
+/// Write the deterministic non-CPU-visible local-memory descriptor.
+/// DirectFlip is derived from the same surface-owned D2 predicate as the other
+/// display caps; no segment flag or topology knob exists.
 /// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
-unsafe fn write_cpu_host_memory_descriptor(seg: *mut DXGK_SEGMENTDESCRIPTOR4, base: u64, len: u64) {
-    unsafe { SegmentDescriptorSpec::cpu_host_memory(base, len).write_into_v4(seg) };
-}
-
-/// BAR descriptor, with topology/cache properties knob-driven (AddAdapter shape bisect: both the
-/// classic-CpuVisible and CpuHostAperture shapes were rejected identically, as
-/// were 64 MiB and RAM-backed variants -- the remaining hypotheses are flag
-/// combinations and GPU-physical BaseAddress overlap with segment 2, and each
-/// compiled-in variant costs an owner reboot; registry knobs + devcon restart
-/// cost nothing).
-///
-///   `BarSegFlags` (REG_DWORD, default 0x1C = CacheCoherent |
-///                  SupportsCpuHostAperture | SupportsCachedCpuHostAperture)
-///   `BarSegBaseMB` (REG_DWORD, default 0): GPU-physical BaseAddress in MiB for
-///     the legacy topology. The opt-in larger-capacity shape uses a fixed
-///     non-overlap base above the paging aperture.
-///
-/// The bit ladder itself lives on [`SegmentDescriptorSpec::from_bar_flags`].
-/// Bit 5 is not a knob any more: D9 clears the caller's value and derives the
-/// DirectFlip segment capability from the same SURFACE-owned D2 predicate as
-/// `DXGK_DRIVERCAPS.SupportDirectFlip` and `SupportMultiPlaneOverlay`.
-///
-/// Pure: the flag word and base come from the [`AdapterKnobs`] snapshot, and the
-/// `BarF`/`BarB` breadcrumbs are written once in `AdapterKnobs::read_at_start`.
-/// This function used to do two blocking registry READS and two ungated registry
-/// WRITES on every descriptor write.
-///
-/// SAFETY: `seg` points to a writable `DXGK_SEGMENTDESCRIPTOR4`.
-unsafe fn write_bar_knob_descriptor(
+unsafe fn write_local_memory_descriptor(
     seg: *mut DXGK_SEGMENTDESCRIPTOR4,
-    gpa: u64,
     gpu_base: u64,
     len: u64,
-    cpu_aperture_len: u64,
-    knobs: &AdapterKnobs,
 ) {
-    const DIRECT_FLIP_FLAG: u32 = 0x20;
-    let bar_flags = (knobs.bar_seg_flags & !DIRECT_FLIP_FLAG)
-        | if crate::virtio::KMD_D2_OWNER_ENABLED {
-            DIRECT_FLIP_FLAG
-        } else {
-            0
-        };
-    let spec = SegmentDescriptorSpec::from_bar_flags(
-        bar_flags,
-        gpu_base,
-        gpa,
-        len,
-        cpu_aperture_len,
-        super::bar_segment::vidmm_vram_size(knobs).is_some(),
-    );
-    unsafe { spec.write_into_v4(seg) };
+    unsafe {
+        SegmentDescriptorSpec::local(gpu_base, len, crate::virtio::KMD_D2_OWNER_ENABLED)
+            .write_into_v4(seg)
+    };
 }
 
 unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
     if (args.OutputDataSize as usize) < size_of::<DXGK_QUERYSEGMENTOUT4>() {
         return STATUS_BUFFER_TOO_SMALL;
     }
-
-    let knobs = adapter.knobs();
-    // The host-visible BAR window backs the CPU-visible memory segment.
-    let window = adapter.with_virtio(|v| v.host_visible()).ok().flatten();
-    crate::diag::record(if window.is_some() {
-        0x0900_0001
-    } else {
-        0x0900_0000
-    });
 
     // SAFETY: pOutputData points to a writable DXGK_QUERYSEGMENTOUT4 of
     // sufficient size, checked above.
@@ -1178,7 +989,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
 
     // The table is BUILT IN StartDevice (`build_segment_table`) and only
     // RENDERED here. It used to be synthesized from live adapter state on every
-    // call, independently of the `adapter.bar_segment` three other subsystems
+    // call, independently of the `adapter.local_segment` consumers
     // read, and the two could disagree (k-capsescape-04).
     //
     // `None` means StartDevice has not published one. Not reachable in practice
@@ -1195,12 +1006,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
     } else {
         0x0901_0001
     });
-    crate::diag::record(if adapter.paging_ram().is_some() {
-        0x0902_0001
-    } else {
-        0x0902_0000
-    });
-    crate::diag::record(if table.bar_seg_id().is_some() {
+    crate::diag::record(if table.local_seg_id().is_some() {
         0x0905_0001
     } else {
         0x0905_0000
@@ -1241,28 +1047,10 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
                 crate::ddi::segment_table::SegmentSpec::Aperture => unsafe {
                     write_aperture_descriptor(d)
                 },
-                crate::ddi::segment_table::SegmentSpec::RamCpuHost { base, size } => {
-                    crate::diag::record(0x0903_0000 | (((base >> 12) as u32) & 0xFFFF));
-                    crate::diag::record(0x0904_0000 | (((size >> 12) as u32) & 0xFFFF));
-                    // SAFETY: d is a writable descriptor slot (above).
-                    unsafe { write_cpu_host_memory_descriptor(d, base, size) };
-                }
-                crate::ddi::segment_table::SegmentSpec::Bar {
-                    gpa,
-                    gpu_base,
-                    size,
-                    cpu_aperture_size,
-                    ..
-                } => {
+                crate::ddi::segment_table::SegmentSpec::Local { gpu_base, size } => {
                     crate::diag::record(0x0906_0000 | (((size >> 20) as u32) & 0xFFFF));
-                    // Knob-driven descriptor (BarSegFlags/BarSegBaseMB). The
-                    // production shape is CpuHostAperture-like:
-                    // DxgkDdiMapCpuHostAperture maps each allocation's venus blob
-                    // at the dxgkrnl-chosen aperture offset within this window.
                     // SAFETY: d is a writable descriptor slot (above).
-                    unsafe {
-                        write_bar_knob_descriptor(d, gpa, gpu_base, size, cpu_aperture_size, &knobs)
-                    };
+                    unsafe { write_local_memory_descriptor(d, gpu_base, size) };
                 }
             }
         }

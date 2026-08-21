@@ -953,31 +953,6 @@ impl TransportOwner {
             })
     }
 
-    pub(crate) fn resource_size(&self, resource_id: u32) -> Result<u64, super::VirtioError> {
-        let mut state = self.state.lock();
-        let table = state.table_mut()?;
-        let resource = table
-            .resource_handle_by_id(resource_id)
-            .map_err(owner_refusal)?;
-        Ok(table
-            .resource_backing(resource)
-            .map_err(owner_refusal)?
-            .size)
-    }
-
-    pub(crate) fn first_overlapping_window_resource(
-        &self,
-        resource_id: u32,
-        offset: u64,
-        length: u64,
-    ) -> Result<Option<u32>, super::VirtioError> {
-        let mut state = self.state.lock();
-        state
-            .table_mut()?
-            .first_overlapping_window_resource(resource_id, offset, length)
-            .map_err(owner_refusal)
-    }
-
     pub(crate) fn begin_window_unmap(
         &self,
         resource_id: u32,
@@ -1654,10 +1629,8 @@ impl TransportOwner {
                 0,
                 Some(DormantTransportUnavailable::NoWindow),
             ),
-            Some((window_base, window_length, first_fit_base)) => {
-                match OwnerConfig::new(0, window_length, super::gpu::BLOB_PAGE)
-                    .and_then(|config| config.with_first_fit_base(first_fit_base))
-                {
+            Some((window_base, window_length)) => {
+                match OwnerConfig::new(0, window_length, super::gpu::BLOB_PAGE) {
                     Ok(config) => (Ok(config), window_base, None),
                     Err(_) => (
                         Err(DormantTransportUnavailable::InvalidBounds),

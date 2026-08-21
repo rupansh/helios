@@ -19,8 +19,8 @@
  * INIT on its raw KMT device's HVC1 control context, validates the reply, and
  * exports the endpoint descriptor the outer UMD copies into HQA1
  * (docs/retirement/lane-mesa.md, units A1 and A5). §17.1 asks for generated C
- * declarations only for `physical_memory` and `diagnostics`, and for "both Rust
- * **and C**" offsets for `wddm`; it says nothing about HQA1/HTS1. The ICD's
+ * declarations for `diagnostics`, and for "both Rust **and C**" offsets for
+ * `wddm`; it says nothing about HQA1/HTS1. The ICD's
  * answer today is `icd/mesa/src/virtio/vulkan/vn_renderer_helios.c:255-352` —
  * hand-declared structs guarded by `_Static_assert(sizeof(...) == N)` only, i.e.
  * SIZE and not offsets, across two repositories, with nothing binding them to

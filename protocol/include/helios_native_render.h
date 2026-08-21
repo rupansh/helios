@@ -16,9 +16,9 @@
  * and HVR1 (the bounded reply header and its continuation request). §17.1 is the
  * module mandate for the Rust side.
  *
- * WHY C NEEDS THIS AT ALL: §17.1 asks for generated C declarations only for
- * `physical_memory` (QEMU) and `diagnostics`, and for "both Rust **and C**
- * offsets" for `wddm`. It says nothing about HVC1/HNR2/HVM1/HVR1 — which only
+ * WHY C NEEDS THIS AT ALL: §17.1 asks for generated C declarations for
+ * `diagnostics`, and for "both Rust **and C** offsets" for `wddm`. It says
+ * nothing about HVC1/HNR2/HVM1/HVR1 — which only
  * Mesa and the KMD consume — and the ICD's answer today is
  * `icd/mesa/src/virtio/vulkan/vn_renderer_helios.c:255-352`: hand-declared
  * structs guarded by `_Static_assert(sizeof(...) == N)` only, i.e. SIZE and not
@@ -41,12 +41,13 @@
  *
  * ⛔ WHAT THIS HEADER DELIBERATELY OMITS — and why the omission is not an
  * oversight to be "fixed" later: the Rust module's `kernel_dma` submodule.
- * `Hnr2PhysicalCapability` (48 bytes) carries a physical address, a segment ID
- * and an HPM1 placement epoch, and `Hnr2KmdDmaPrivateV1` (64 bytes) is the
+ * `Hnr2PhysicalCapability` (48 bytes) carries a physical address, the ordinary
+ * aperture segment ID and a KMD-local placement epoch, and
+ * `Hnr2KmdDmaPrivateV1` (64 bytes) is the
  * `DmaBufferPrivateDataSize` record dxgkrnl keeps opaque. §17.1: "this record
  * exists only in scheduler DMA and is never returned to user mode." Declaring
- * either in a Mesa-facing header would publish the guest-physical layout of the
- * HLM1 BAR window to user mode. Whoever needs them is writing kernel code and
+ * either in a Mesa-facing header would publish guest-physical placement to user
+ * mode. Whoever needs them is writing kernel code and
  * must use the Rust module. `HELIOS_HVC1_DMA_PRIVATE_DATA_BYTES` below IS
  * mirrored, because it is an advertised `DXGK_CONTEXTINFO` value the ICD checks;
  * the record it sizes is not.
@@ -135,11 +136,9 @@ HELIOS_NR_STATIC_ASSERT(HELIOS_PACKAGE_GENERATION == UINT64_C(0x48454C4900000003
  * one. It is a CORRUPTION DIAGNOSTIC and never validation authority: no
  * validator in this ABI consults it.
  *
- * The WDDM memory-segment IDs (`HELIOS_SEGMENT_ID_SYSTEM` / `_APERTURE` /
- * `_HLM1`) are likewise declared once, in
- * qemu-helios/include/hw/virtio/helios_physical_memory.h, which owns the whole
- * segment/page-number interpretation. This lane only names segments; it does not
- * define them, and neither does this header.
+ * The one live HVM1 placement segment is the ordinary WDDM aperture declared in
+ * protocol/src/segments.rs. It is kernel placement vocabulary, not a C wire
+ * declaration in this header.
  */
 
 /* ------------------------------------------------------------------------ */

@@ -12,11 +12,8 @@
 //!   why `ddi::display` splits it into a DIRQL atomics-only half and a PASSIVE
 //!   worker continuation. `program_vidpn_source` → `ctrl::set_scanout_blob` is
 //!   the call that split exists to keep unreachable from the DIRQL entry.
-//! * `DxgkDdiMapCpuHostAperture` is documented PASSIVE but arrives at DISPATCH
-//!   in practice (ETW-proven, v71), which is why it carries a runtime IRQL gate
-//!   and defers with `STATUS_NO_MEMORY`.
 //!
-//! Before this module, adding a `ctrl::` call to the DIRQL half of either DDI
+//! Before this module, adding a `ctrl::` call to the DIRQL half of that DDI
 //! compiled, linked and shipped, and then either deadlocked at DISPATCH on a
 //! KEVENT wait or called `MmAllocateContiguousMemory` above APC_LEVEL. Now it
 //! does not compile: the callee needs a [`PassiveLevel`], the DIRQL half has
@@ -128,12 +125,10 @@ impl PassiveLevel {
     /// A wrong IRQL is counted into [`IRQL_ASSUME_BAD`] and the token is handed
     /// over anyway. That is not a swallow: the refusal a violation needs is a
     /// *legal NTSTATUS for the DDI that was entered*, and this constructor
-    /// cannot know one. `DxgkDdiMapCpuHostAperture` must defer with
-    /// `STATUS_NO_MEMORY` and never `STATUS_UNSUCCESSFUL` (out of its legal set,
-    /// so dxgkrnl discards the whole VidPn); `DxgkDdiBuildPagingBuffer`'s
-    /// content gate deliberately keeps `STATUS_SUCCESS`; the display DDI defers
-    /// to a worker. All three already own that decision at the DDI, above their
-    /// mint. `IrqlBad` moving is the signal that a fourth DDI needs one too —
+    /// cannot know one. `DxgkDdiBuildPagingBuffer`'s content gate deliberately
+    /// keeps `STATUS_SUCCESS`, while the display DDI defers to a worker. Both
+    /// own that decision at the DDI, above their mint. `IrqlBad` moving is the
+    /// signal that another DDI needs one too —
     /// and returning a `Result` here would instead have put an unreachable
     /// error arm at all twelve audited sites and a new refusal population in a
     /// tranche whose whole claim is "identical counters, identical desktop".

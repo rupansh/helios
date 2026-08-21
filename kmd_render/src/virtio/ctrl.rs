@@ -62,9 +62,8 @@ use wdk_sys::{LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::control_owner::ResourceBackingFinalizer;
 use super::gpu::{
-    BlobMapBegin, BlobMapFinish, BlobMapPrep, BlobRemapBegin, DeviceOwner, OwnerFilter,
-    SyncOutcome, SyncTicket, SyncWaitBlock, WaitBlockRef, WaitDisposition, CTRL_TEARDOWN_ABANDONS,
-    CTRL_TIMEOUT_COUNT,
+    BlobMapBegin, BlobMapFinish, BlobMapPrep, DeviceOwner, OwnerFilter, SyncOutcome, SyncTicket,
+    SyncWaitBlock, WaitBlockRef, WaitDisposition, CTRL_TEARDOWN_ABANDONS, CTRL_TIMEOUT_COUNT,
 };
 use super::hal::DmaBuffer;
 use super::VirtioError;
@@ -2186,115 +2185,6 @@ pub(crate) fn unmap_session_reply_blob(
         resource_id,
         CtrlRoundtripMode::FiniteEvent,
     )
-}
-
-/// Map a blob at the FIXED window offset VidMm assigned (the CPU-visible BAR
-/// memory segment, `build_paging_buffer.rs`). Inverts the normal order: instead
-/// of the KMD allocator picking the offset, the blob is placed where VidMm put
-/// the allocation, so CPU raster (through the segment's CpuTranslatedAddress),
-/// the GDI executor, and the host all address the same bytes.
-///
-/// A pre-existing mapping at another offset is torn down first (blob content is
-/// intrinsic to the host memory object — a remap is content-preserving), and
-/// any STALE other-blob mapping overlapping the target range (an eviction this
-/// driver missed) is unmapped so host window subregions never overlap.
-/// PASSIVE_LEVEL only (host round-trips).
-pub fn map_blob_at(
-    passive: PassiveLevel,
-    adapter: &AdapterContext,
-    resource_id: u32,
-    window_offset: u64,
-) -> Result<BlobMapPrep, VirtioError> {
-    if super::control_owner::KMD_D2_OWNER_ENABLED {
-        let size = adapter.control_owner().resource_size(resource_id)?;
-        let map_len = helios_kmd_logic::round_up_page(size);
-        if let Some(current) = adapter.control_owner().mapped_blob_offset(resource_id)? {
-            if current == window_offset {
-                return adapter
-                    .control_owner()
-                    .mapped_blob(resource_id)?
-                    .ok_or(VirtioError::DeviceError);
-            }
-            resource_unmap_blob(passive, adapter, resource_id)?;
-        }
-        while let Some(stale) = adapter.control_owner().first_overlapping_window_resource(
-            resource_id,
-            window_offset,
-            map_len,
-        )? {
-            resource_unmap_blob(passive, adapter, stale)?;
-        }
-        let _ = resource_map_blob_roundtrip(passive, adapter, resource_id, window_offset)?;
-        return adapter
-            .control_owner()
-            .mapped_blob(resource_id)?
-            .ok_or(VirtioError::DeviceError);
-    }
-    // Evict stale overlapping placements before reserving our own slot.
-    let (_, blob_size, _) = adapter
-        .with_virtio(|v| v.blob_lookup(resource_id))
-        .map_err(|_| VirtioError::DeviceError)?
-        .ok_or(VirtioError::DeviceError)?;
-    let map_len = blob_size.saturating_add(4095) & !4095;
-    let mut stale = [0u32; 8];
-    // Two swallows used to live on this line. `.unwrap_or(0)` turned a torn-down
-    // transport into "no stale placements", skipping the eviction pass entirely
-    // instead of failing the map; and the scan itself silently stopped recording
-    // once `stale` was full, so a ninth overlapping mapping was neither unmapped
-    // nor reported and the RESOURCE_MAP_BLOB below created the overlapping host
-    // window subregion this pass exists to prevent. Both are now hard failures:
-    // refusing the aperture map / paging op is strictly better than two host
-    // resources sharing one window subregion (k-gputransport-04).
-    let n = adapter
-        .with_virtio(|v| v.blobs_overlapping(window_offset, map_len, resource_id, &mut stale))
-        .map_err(|_| VirtioError::DeviceError)?
-        .map_err(|_truncated| VirtioError::DeviceError)?;
-    for &res in stale[..n].iter() {
-        let _ = resource_unmap_blob(passive, adapter, res);
-        let _ = adapter.with_virtio(|v| v.blob_note_unmapped(res));
-    }
-
-    let mut busy = Budget::new(MAP_BUSY_MAX_MS);
-    loop {
-        let begin = adapter
-            .with_virtio(|v| v.blob_remap_begin(resource_id, window_offset))
-            .map_err(|_| VirtioError::DeviceError)?;
-        match begin {
-            BlobRemapBegin::Mapped(prep) => return Ok(prep),
-            BlobRemapBegin::Failed(e) => return Err(e),
-            BlobRemapBegin::Busy => {
-                if busy.charge_slice() {
-                    return Err(VirtioError::Timeout);
-                }
-                sleep_ms(passive, RETRY_SLICE_MS);
-            }
-            BlobRemapBegin::Start { old, len } => {
-                if let Some((old_offset, old_len)) = old {
-                    // Content-preserving move: unmap the previous placement and
-                    // (for KMD-partition offsets only — the free guard ignores
-                    // VidMm-partition ones) return its range.
-                    let _ = resource_unmap_blob(passive, adapter, resource_id);
-                    let _ = adapter.with_virtio(|v| v.free_window_range_pub(old_offset, old_len));
-                }
-                let cache =
-                    resource_map_blob_roundtrip(passive, adapter, resource_id, window_offset);
-                let cache_ok = cache.as_ref().ok().copied();
-                let fin = adapter
-                    .with_virtio(|v| v.blob_map_finish(resource_id, window_offset, len, cache_ok))
-                    .map_err(|_| VirtioError::DeviceError)?;
-                return match fin {
-                    BlobMapFinish::Done(prep) => Ok(prep),
-                    BlobMapFinish::HostRejected => {
-                        Err(cache.err().unwrap_or(VirtioError::DeviceError))
-                    }
-                    BlobMapFinish::SlotGone => {
-                        let _ = resource_unmap_blob(passive, adapter, resource_id);
-                        Err(VirtioError::DeviceError)
-                    }
-                };
-            }
-        }
-    }
 }
 
 fn release_owner_resource(

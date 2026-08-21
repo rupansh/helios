@@ -12,7 +12,7 @@ use core::ffi::c_void;
 use crate::adapter::AdapterContext;
 use crate::dxgk::*;
 
-use super::bar_segment::{build_segment_table, setup_bar_segment};
+use super::local_segment::{build_segment_table, setup_local_segment};
 
 const DXGK_FEATURE_SUPPORT_STABLE_VALUE: u32 = 2;
 
@@ -64,16 +64,10 @@ fn zero_linear_scanout_breadcrumbs() {
     }
 }
 
-/// Stand up the persistent venus context + page-table blob. Returns the venus
-/// context id, or 0 on any failure.
-///
-/// It used to also return the blob's `(gpa, size)` window, which was stored in
-/// the transport generation and read by nobody — `query_segments` deliberately
-/// reports `paging_ram` instead, because QuerySegment4 runs BEFORE this
-/// allocation exists. R510 annotated that field write-only and left the
-/// deletion to a dead-code commit with its own reachability evidence; this is
-/// that commit (2026-08-05). The blob itself is still allocated and still owned
-/// by the venus client — only the unread copy of its address is gone.
+/// Stand up the persistent Venus client used by standard allocations, direct
+/// scanout, and the post-K9 executor. Returns its context id, or 0 on failure.
+/// K11 owns session transport, not these device/display call flows, so this
+/// lifecycle owner remains required after the HPM1 lane is gone.
 ///
 /// ⚠ `#[inline(never)]` is a STACK BUDGET decision, not style. `VenusClient` and
 /// the blob descriptors are large locals, and StartDevice's frame is already
@@ -155,7 +149,7 @@ fn retire_skipped_stop_transport(
     crate::ddi::diag_etw::adapter_stop(adapter);
     let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
     // SAFETY: StartDevice owns the serialized generation transition. Leaving
-    // the old BAR/context tuple published after its transport was retired would
+    // the old local-capacity/context tuple published after retirement would
     // let pre-publication queries observe a dead generation.
     unsafe { adapter.set_transport_generation(None) };
     Ok(())
@@ -238,10 +232,6 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // before anything can fail, so the gate's "verify movement, not presence"
     // rule applies to every counter below.
     crate::diag::reset_fault_counters();
-    // Same reason, for the K2a block: its atomics are fresh in a newly loaded
-    // image but its registry values are not.
-    crate::ddi::build_paging_buffer::hlm1_reset_counters();
-
     // Reconcile a prior generation before taking any persistent StartedState
     // storage. This is the skipped-Stop path: with KMD D2 active, failure to
     // prove a physical reset leaves the old transport installed and fails this
@@ -259,16 +249,6 @@ pub unsafe extern "C" fn dxgkddi_start_device(
         return status;
     }
 
-    // Carried over from a previous start on this same context, if any: these
-    // blocks are allocated once and freed only in Drop, and today's code gets
-    // that by leaving the fields untouched across StopDevice. Publish-once would
-    // otherwise leak them and allocate again.
-    // SAFETY: StartDevice, PASSIVE, serialized by dxgkrnl against every other
-    // lifecycle DDI; the blocks are republished below in the new state.
-    let mut paging_ram = unsafe { adapter.take_paging_ram() };
-    if paging_ram.is_none() {
-        paging_ram = AdapterContext::alloc_paging_ram();
-    }
     // ── Phase 2: bring up the virtio-gpu transport ──────────────────────────
     // VirtioGpu::init reads PCI config + maps BARs through the Dxgkrnl callbacks
     // (DxgkConfigAccess / WdkHal) and discovers the virtio device.
@@ -291,7 +271,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // the status that actually killed the transport rather than a bare flag.
     let mut transport_fail_status: u32 = 0;
     // The transport generation, built as locals and installed after publication.
-    let mut bar_segment = None;
+    let mut local_segment;
     let mut venus_ctx_id = 0u32;
     // SAFETY: dxgkrnl_interface is valid per the DDI contract (also copied into
     // the `dxgkrnl` local above); init only borrows it for the call.
@@ -301,17 +281,14 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // -> `VenusRing::bring_up`, which is why it is a by-value ZST and not a
     // reference: see `crate::irql` and tools/kmd-frame-sizes.ps1.
     match crate::virtio::VirtioGpu::init(passive, dxgkrnl.as_ref()) {
-        Ok(mut gpu) => {
+        Ok(gpu) => {
             crate::kmsg(c"Helios: virtio-gpu transport up\n");
             crate::diag::record(0x0B00_0003);
-            let host_visible_bytes = gpu.host_visible().map(|window| window.len);
 
-            // Resolve and install the immutable VidMm prefix while the
-            // transport is still a StartDevice-local value. OwnerTable sees
-            // this exact final geometry at construction, before any control
-            // operation or window offset can escape.
-            super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, host_visible_bytes);
-            bar_segment = setup_bar_segment(&mut gpu, &knobs);
+            // Derive local VidMm capacity from the exact transport capability
+            // before the generation is published. No registry value and no CPU
+            // mapping window participates.
+            local_segment = setup_local_segment(&gpu);
 
             // Publish the ISR-status register VA for the DIRQL ISR before the
             // transport goes live (capture before `gpu` is moved into set_virtio).
@@ -323,12 +300,8 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             // installer is reachable before this call.
             match unsafe { adapter.install_virtio(passive, transport_absent, gpu) } {
                 Ok(()) => {
-                    // ── Venus-backed page-table memory (best-effort) ─────────
-                    // Self-allocate a 16-MiB HOST_VISIBLE|HOST_COHERENT
-                    // VkDeviceMemory over venus and expose it as a BAR-backed,
-                    // CPU-coherent region VidMm can register as the page-table
-                    // segment. The owner table is already canonical before any
-                    // of these control operations can run.
+                    // Bring up the device/display Venus owner after the
+                    // canonical control owner is installed.
                     venus_ctx_id = bring_up_venus(passive, adapter);
                     if crate::virtio::KMD_D2_OWNER_ENABLED && venus_ctx_id == 0 {
                         adapter
@@ -361,8 +334,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                     adapter
                         .isr_status
                         .store(0, core::sync::atomic::Ordering::Release);
-                    bar_segment = None;
-                    super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None);
+                    local_segment = None;
                     if crate::virtio::KMD_D2_OWNER_ENABLED {
                         unsafe {
                             *number_of_video_present_sources = 0;
@@ -384,7 +356,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
                 .isr_status
                 .store(0, core::sync::atomic::Ordering::Release);
             let _ = adapter.remove_virtio_and_reset_scanout_bind_generation(passive);
-            super::bar_segment::resolve_vidmm_vram_mb(&mut knobs, None);
+            local_segment = None;
             if crate::virtio::KMD_D2_OWNER_ENABLED {
                 unsafe {
                     *number_of_video_present_sources = 0;
@@ -521,17 +493,13 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // ── The reported segment table, built ONCE from the same locals every other
     // consumer will read. `query_segments` renders this; it no longer re-derives
     // a table of its own from live adapter state, which is what let the reported
-    // topology and `bar_segment` disagree (k-capsescape-04).
+    // topology and `local_segment` disagree (k-capsescape-04).
     //
     // Ordering is proven, not assumed: on a DiagLevel=1 boot the ring shows
     // StartDevice entry/exit (0x0B00_0001 .. 0x0B00_0004) completing before the
     // first QueryAdapterInfo (0x0100_0001), so the table always exists by the
     // time QUERYSEGMENT4 runs.
-    let segment_table = build_segment_table(
-        &mut bar_segment,
-        paging_ram.as_ref().map(|r| (r.phys, r.size)),
-        &knobs,
-    );
+    let segment_table = build_segment_table(local_segment.as_ref());
 
     // ── Publish. Everything above was a local; from here the adapter answers. ──
     // SAFETY: StartDevice, PASSIVE_LEVEL, serialized by dxgkrnl; published once
@@ -543,11 +511,10 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             share_backing_store_with_kmd,
             knobs,
             scanout_mode,
-            paging_ram,
             segment_table,
         ));
         adapter.set_transport_generation(Some(crate::adapter::TransportGeneration {
-            bar_segment,
+            local_segment,
             venus_ctx_id,
         }));
     }
@@ -645,15 +612,13 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // clears the ISR's gate but NOT `started_published`, so the boxed
         // StartedState — including the DXGKRNL_INTERFACE both DPCs read
         // lock-free — stays published across the stop. That is deliberate on
-        // one count (a stop/start cycle carries the contiguous RAM blocks
-        // forward through it) and unexamined on another: a DPC already queued
+        // one count (sticky OS callback/capability state survives StopDevice)
+        // and unexamined on another: a DPC already queued
         // when this runs can still resolve `started()` for a stopped device.
         // The DPC's actual work all goes through `with_virtio`, which is
         // `Err(DeviceNotFound)` once the transport-removal transition below
-        // runs, so the window is currently harmless. Clearing the publication properly needs
-        // the take-and-republish dance `take_paging_ram` already performs, and
-        // that is a lifecycle change with its own reboot-level gate — not a
-        // T4a minor item.
+        // runs, so the window is currently harmless. Clearing publication is a
+        // separate lifecycle change requiring its own runtime admission.
         adapter
             .isr_status
             .store(0, core::sync::atomic::Ordering::Release);
@@ -685,9 +650,8 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
             return status;
         }
 
-        // Tear down the venus client + page-table blob + context BEFORE dropping
-        // the transport (the unref/detach/destroy commands need the live device).
-        // Drop the client first to unmap its ring/reply BAR kernel mappings.
+        // Tear down the device/display Venus client before dropping the
+        // transport; its unmap/detach/destroy commands need the live device.
         let venus_ctx = adapter.venus_ctx_id();
         adapter.set_venus_client(None); // Drop → MmUnmapIoSpace ring + reply mappings.
         if venus_ctx != 0 && !crate::virtio::KMD_D2_OWNER_ENABLED {
@@ -726,7 +690,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device(miniport_device_context: *mut c_voi
         // so the winner ordering always leaves publication state empty.
         adapter.reset_display_publication_state();
 
-        // Drop the whole transport generation in one store — `bar_segment` and
+        // Drop the whole transport generation in one store — `local_segment` and
         // `venus_ctx_id` together, since both are meaningless in the next
         // generation.
         //

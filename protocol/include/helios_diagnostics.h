@@ -73,8 +73,8 @@ extern "C" {
  * different package generation and must be reported as undecodable, never
  * reinterpreted, and never allowed to affect synchronization, recovery,
  * lifetime, or admission (§12.3). The fatal-mismatch behavior itself lives on
- * the control paths — KMD/UMD device creation, HPM1 negotiation, and installer
- * activation (§10.2 admission table, §17.8 steps 5-6).
+ * the control paths — KMD/UMD device creation, direct translator/session
+ * admission, and installer activation (§10.2 admission table, §17.8 steps 5-6).
  */
 #define HELIOS_PACKAGE_GENERATION_TAG     0x48454C49u
 #define HELIOS_PACKAGE_GENERATION_ORDINAL 3u

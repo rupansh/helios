@@ -132,15 +132,12 @@ pub enum FaultCounter {
     /// `VirtioGpu::init` failed — value is the resulting NTSTATUS. The adapter
     /// starts render-only with no transport.
     StVio,
-    /// Venus bring-up failed — value is the resulting NTSTATUS. Transport is up
-    /// but there is no page-table window.
+    /// Venus client bring-up failed — value is the resulting NTSTATUS.
     StVnu,
     /// The HPD worker thread could not be created — value is the NTSTATUS.
     StHpd,
-    /// `MmAllocateContiguousMemory` for the paging RAM returned null — value is
-    /// the requested size in bytes.
-    StRam,
-    /// The BAR segment size was rejected — value is the rejected size in MiB.
+    /// The exact transport local-memory capacity was rejected — value is the
+    /// rejected size in MiB.
     StBar,
     /// The display half asked the host for its scan-out mode but the transport
     /// was gone — value is the NTSTATUS. The mode falls back to a fabricated
@@ -193,24 +190,6 @@ pub enum FaultCounter {
     /// this driver believes it said. Expected 0 on 24H2, which passes the full
     /// 592-byte struct.
     CapTrunc,
-    /// `BarSegMode` held a value that is no longer a segment topology — value is
-    /// that stale number. The adapter binds the production shape anyway. Most
-    /// likely a VM left set from one of the deleted Code-43 bisect arms
-    /// (1/2/5/11); the only legal values are 0 and 10.
-    BarMCo,
-    /// The proposed segment table broke the AddAdapter ordering rule and was
-    /// REFUSED — value is the `SegmentRuleViolation` code (1 = a cpu-host
-    /// segment was not last, 2 = too many segments). The adapter binds with the
-    /// aperture-only shape instead of landing in Code 43, which is the whole
-    /// point: the rule was previously enforced by nothing and its violation
-    /// surfaced only as a dead device.
-    SegRule,
-    /// The BAR segment was dropped from the REPORTED table while the driver's
-    /// own `bar_segment` said otherwise — value is 1. StartDevice clears
-    /// `bar_segment` in the same step, so this counts a state divergence that
-    /// was PREVENTED. Any movement means the reported topology and the
-    /// allocation path disagreed about which segment ids exist.
-    SegDiv,
     /// The descriptor pass of the two-call segment protocol disagreed with the
     /// count reported on the descriptor-NULL call — value is the count the
     /// render pass wanted. The write loop is clamped to the reported count, so
@@ -227,7 +206,6 @@ impl FaultCounter {
             FaultCounter::StVio => b"StVio",
             FaultCounter::StVnu => b"StVnu",
             FaultCounter::StHpd => b"StHpd",
-            FaultCounter::StRam => b"StRam",
             FaultCounter::StBar => b"StBar",
             FaultCounter::StTxG => b"StTxG",
             FaultCounter::StMdB => b"StMdB",
@@ -240,9 +218,6 @@ impl FaultCounter {
             FaultCounter::StHpdX => b"StHpdX",
             FaultCounter::StVioR => b"StVioR",
             FaultCounter::CapTrunc => b"CapTrunc",
-            FaultCounter::BarMCo => b"BarMCo",
-            FaultCounter::SegRule => b"SegRule",
-            FaultCounter::SegDiv => b"SegDiv",
             FaultCounter::SegCntMis => b"SegCntMis",
         }
     }
@@ -252,7 +227,6 @@ impl FaultCounter {
         FaultCounter::StVio,
         FaultCounter::StVnu,
         FaultCounter::StHpd,
-        FaultCounter::StRam,
         FaultCounter::StBar,
         FaultCounter::StTxG,
         FaultCounter::StMdB,
@@ -265,9 +239,6 @@ impl FaultCounter {
         FaultCounter::StHpdX,
         FaultCounter::StVioR,
         FaultCounter::CapTrunc,
-        FaultCounter::BarMCo,
-        FaultCounter::SegRule,
-        FaultCounter::SegDiv,
         FaultCounter::SegCntMis,
     ];
 }
@@ -502,8 +473,6 @@ pub mod knobs {
 
     /// Breadcrumb ring level. 0 (default) = the `S<idx>` ring is off.
     pub const DIAG_LEVEL: KnobName = KnobName::new(b"DiagLevel");
-    /// Segment topology. Legal values 0 and 10 only — see `BarSegTopology`.
-    pub const BAR_SEG_MODE: KnobName = KnobName::new(b"BarSegMode");
     /// CpuVisible cached-allocation kill switch (default 1 = cached).
     pub const ALLOC_CACHED: KnobName = KnobName::new(b"AllocCached");
     /// Retire ordinary (non-paging) WDDM DMA fences on host GPU COMPLETION
@@ -518,61 +487,6 @@ pub mod knobs {
     /// Advertise `DXGK_VIDMMCAPS.CrossAdapterResource` (default 0).
     /// Exactly [`super::MAX_CONFIG_NAME`] bytes — the assert's live subject.
     pub const CROSS_ADAPT_CAPS: KnobName = KnobName::new(b"CrossAdaptCaps");
-    /// BAR descriptor flag word (default 0x1C).
-    pub const BAR_SEG_FLAGS: KnobName = KnobName::new(b"BarSegFlags");
-    /// BAR descriptor `BaseAddress` in MiB (default 0).
-    pub const BAR_SEG_BASE_MB: KnobName = KnobName::new(b"BarSegBaseMB");
-    /// `Hlm1Only` (default 0 = the shape F15 measured). Drop the aperture
-    /// segment from an HVM1 role's `SupportedWriteSegmentSet`, so VidMm must
-    /// place the allocation in HLM1 or fail residency loudly.
-    ///
-    /// ⛔⛔ **MEASURED, AND 1 BREAKS THE DRIVER — do not flip this** (`FINDINGS.md`
-    /// F16). It does not redirect the placement, it breaks the page-in:
-    /// `MakeResident` still succeeds, then `D3DKMTLock2` returns
-    /// `STATUS_UNSUCCESSFUL` and dxgkrnl's ETW says "WORKER_THREAD: Unrecoverable
-    /// page in failure" with no Helios paging counter moving. Both segment flag
-    /// shapes, both arms. §10.7:2001-2002's aperture bit is load-bearing.
-    ///
-    /// Kept reachable because a falsified hypothesis with a knob behind it is
-    /// cheaper to re-check than to re-argue, and because rule 8 requires the
-    /// opposite value of a measured default to stay reachable. Read at
-    /// AddAdapter, so `pnputil /restart-device` applies it with no rebuild.
-    pub const HLM1_ONLY: KnobName = KnobName::new(b"Hlm1Only");
-    /// `Hlm1Bar` (default 0 = §17.6's model: HVM1 is NOT BAR-eligible). 1 routes
-    /// an HVM1 allocation's CPU view through the `CpuHostAperture` path instead —
-    /// the mechanism the retirement deletes, and the ONLY one on this driver that
-    /// has ever produced a CPU view aliased to a venus blob (every D3D11
-    /// CpuVisible surface uses it).
-    ///
-    /// The experiment F16 leaves: with the aperture bit dropped, kept, the
-    /// segment's flag word at 0x1C/0x02/0x06, and `AccessedPhysically` on or off,
-    /// `HlRdbk` never stops reading the KMD's own stamp — VidMm gives the guest
-    /// the allocation's SYSTEM backing and expects paging transfers to move
-    /// content, which is a copy and §10.7:1940 forbids one. This knob asks whether
-    /// the path §17.6 deletes is the only one that works.
-    pub const HLM1_BAR: KnobName = KnobName::new(b"Hlm1Bar");
-    /// `Hlm1FlagsOff` (default 0 = §10.7's flag set exactly). A MASK of
-    /// `Hvm1Placement` bits to CLEAR, because each is a candidate explanation for
-    /// VidMm ending the allocation in the aperture rather than HLM1
-    /// (`FINDINGS.md` F16):
-    ///   bit0 `AccessedPhysically`  bit1 `DisablePartialResidency`
-    ///   bit2 `RestrictedToSingleSegment`
-    /// `AccessedPhysically` is the prime suspect: in the GpuMmu model it says the
-    /// allocation is dereferenced by PHYSICAL address, and the aperture is how a
-    /// system-backed allocation gets one. A mask rather than three knobs so the
-    /// eight arms cost registry writes instead of rebuilds.
-    pub const HLM1_FLAGS_OFF: KnobName = KnobName::new(b"Hlm1FlagsOff");
-    /// `Hlm1Bind` (default 0 = OFF). Alias an HVM1 allocation's CPU view onto
-    /// its venus blob: `map_blob_at` the blob at the window offset VidMm placed
-    /// the allocation at, from the `NOTIFY_RESIDENCY` arm F15 named as the hook.
-    ///   0 = off, 1 = bind, 2 = bind and stamp the sampled bytes so a guest
-    ///       readback can prove the alias (`HlNnce` / `HlDgst`).
-    /// Inert unless the observed placement IS HLM1's, so it does nothing at
-    /// `Hlm1Only=0` on today's measurement.
-    pub const HLM1_BIND: KnobName = KnobName::new(b"Hlm1Bind");
-    /// Reported device-memory capacity in MiB. 0 (default) preserves the proven
-    /// one-GiB capacity of the existing aperture+BAR topology.
-    pub const VIDMM_VRAM_MB: KnobName = KnobName::new(b"VidMmVramMB");
     /// `DXGK_FLIPCAPS` OVERRIDE. 0 (default) = the driver's own word
     /// (`FlipOnVSyncMmIo | FlipImmediateMmIo`); nonzero replaces it verbatim,
     /// so `FlipCapsX=2` restores the pre-2026-07-29 advertisement for an A/B.

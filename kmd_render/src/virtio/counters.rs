@@ -110,30 +110,12 @@ pub static RESOURCE_FULL_REJECTS: AtomicU32 = AtomicU32::new(0);
 pub static CONTEXT_FULL_DROPS: AtomicU32 = AtomicU32::new(0);
 /// Freed window ranges dropped because the free list was full (leaked offsets).
 pub static WINDOW_RANGE_DROPS: AtomicU32 = AtomicU32::new(0);
-/// `configure_window_reserve` refusals — offsets had already been issued. Must
-/// stay 0: a nonzero value means someone tried to move the VidMm partition out
-/// from under live mappings.
-pub static WINDOW_RECONFIG_REFUSED: AtomicU32 = AtomicU32::new(0);
 /// `take_live_resource` misses (duplicate-teardown suppressions). Replaces the
 /// in-lock `diag::record(0x0D20_00E0)` breadcrumb.
 pub static TAKE_LIVE_MISSES: AtomicU32 = AtomicU32::new(0);
 /// `alloc_window_range` refusals (host-visible window offset space exhausted /
 /// fragmented past the request). Each one fails the bounded in-kernel map.
 pub static WINDOW_ALLOC_REJECTS: AtomicU32 = AtomicU32::new(0);
-/// Stale-overlap scans that found more overlapping window placements than the
-/// caller's fixed buffer could hold. Nonzero means an eviction pass ran against
-/// an incomplete list and the map that followed it was REFUSED rather than
-/// allowed to create an overlapping host window subregion.
-pub static WINDOW_OVERLAP_TRUNCATED: AtomicU32 = AtomicU32::new(0);
-
-/// The stale-overlap scan could not report every overlapping placement.
-///
-/// A distinct type rather than a `usize` the caller may ignore: acting on a
-/// truncated list is what creates two host resources through one window
-/// subregion.
-#[derive(Clone, Copy, Debug)]
-pub struct WindowOverlapTruncated;
-
 /// Raise `hw` to at least `n` (relaxed; approximate under concurrency is fine
 /// for telemetry).
 pub fn bump_high_water(hw: &AtomicU32, n: usize) {

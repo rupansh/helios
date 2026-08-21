@@ -84,7 +84,7 @@ use helios_protocol::{
     HELIOS_HWA2_KIND_STANDARD_SHADOW, HELIOS_HWA2_KIND_STANDARD_STAGING, HELIOS_HWA2_MAGIC,
     HELIOS_HWA2_MEMORY_CPU_VISIBLE, HELIOS_HWA2_MEMORY_DEVICE_LOCAL,
     HELIOS_HWA2_MISC_GDI_COMPATIBLE, HELIOS_HWA2_SWIZZLE_LINEAR,
-    HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL, HELIOS_PACKAGE_GENERATION, HELIOS_SEGMENT_ID_HLM1,
+    HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL, HELIOS_PACKAGE_GENERATION,
     VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
 };
 use wdk_sys::ntddk::{
@@ -131,9 +131,6 @@ struct OuterGpuVaMapping {
 struct OuterGpuVaState {
     mappings: SpinLock<crate::sync::FixedVec<OuterGpuVaMapping>>,
 }
-
-/// Sentinel for [`AllocationContext::bar_placed`]: not placed in the BAR segment.
-pub(crate) const BAR_UNPLACED: u64 = u64::MAX;
 
 /// Per-allocation KMD state: the venus context + virtio resource backing it, plus
 /// the host-visible window mapping (filled in Stage 2b by BuildPagingBuffer).
@@ -245,29 +242,6 @@ struct AllocationContext {
     /// authoritative record travels in the private-data trailer / open identity.
     venus_alloc_size: u64,
     memory_type_index: u32,
-    /// VidMm-assigned SegmentAddress in the CPU-visible BAR segment, or
-    /// [`BAR_UNPLACED`]. Written by `BuildPagingBuffer` when it maps the blob at
-    /// the assigned offset; atomic because paging DDIs run concurrently with
-    /// allocation DDIs. Only meaningful for `bar_eligible` allocations.
-    ///
-    /// ⚠ PLACEMENT-CHANGE DETECTOR FOR `PgUn`, not a mapping decision. Nothing
-    /// consults it to decide whether to map or unmap: `build_paging_buffer.rs`
-    /// compares it against the incoming offset purely to count
-    /// `BAR_PT_HARVESTS`, surfaced as the `PgUn` registry value. Deleting it or
-    /// re-basing that comparison would silently change what `PgUn` means, which
-    /// is why T6/R915 kept it while deleting its write-only neighbours.
-    bar_placed: core::sync::atomic::AtomicU64,
-    /// K2a: this allocation's contract gives it a CPU view in HLM1, so its blob
-    /// must be fixed-mapped at whatever window offset VidMm places it at.
-    /// Const — the role and its placement are decided once, at admit.
-    hlm1_eligible: bool,
-    /// The window offset this allocation's blob is currently fixed-mapped at, or
-    /// [`BAR_UNPLACED`].
-    ///
-    /// ⛔ NOT `bar_placed`. That one is a placement-change detector whose only
-    /// consumer is `PgUn`'s count; re-basing it would silently change what `PgUn`
-    /// means. This one decides whether a host round-trip is issued.
-    hlm1_bound: core::sync::atomic::AtomicU64,
     /// This allocation was reported to VidMm as BAR-segment-only (KMD-backed
     /// standard allocation with a mappable venus blob, BAR segment active).
     bar_eligible: bool,
@@ -394,53 +368,15 @@ static CREATE_HOC1_OUTPUT_REJECT: AtomicU32 = AtomicU32::new(0);
 /// this driver actually reports — ONE COUNTER PER ROLE, `AcSegRole1` (reply
 /// pool) … `AcSegRole4` (Vulkan device-local).
 ///
-/// `K4-CONTRACT.md` §4, **as amended 2026-08-10**. The first draft of that clause
-/// said "role 4 is admitted and counted, not satisfied", and this file
-/// implemented exactly that: it refused `VulkanDeviceLocal` and admitted roles
-/// 1-3. Both halves were wrong, and the admitting half is the dangerous one.
-/// `Hvm1Role::placement()` (`native_render.rs:1763-1775`) hardcodes
-/// `HELIOS_SEGMENT_ID_HLM1` for **every** role, so a role-1..3 create was handed
-/// a `PreferredSegment` that `QUERYSEGMENT4` may never have reported — and
-/// dxgkrnl then refuses that create **outside this driver, with no Helios
-/// counter at all**. That is exactly the invisible refusal CLAUDE.md's "every
-/// skipped/refused path gets a named counter" rule exists to prevent, and it is
-/// invisible in the way this project has repeatedly been burned by.
-///
-/// ⇒ The rule is neither "role 4" nor "all roles": the KMD asks the segment
-/// table it actually reported ([`segment_is_reported`]) and refuses per role when
-/// the answer is no. A hardcoded role number is a claim about K2's schedule
-/// embedded in kernel code and goes stale silently; a runtime question about the
-/// reported table cannot. `FINDINGS.md` F2 measured that the HLM1 *flag shape* is
-/// already admitted by the OS (`BarSegFlags=0x02` starts `OK/CM_PROB_NONE` with a
-/// fully composited desktop), so segment id 2 may well be reported before K2
-/// lands at all — which is precisely why this is read at runtime instead of
-/// assumed in either direction.
-///
-/// There is no honest substitution to fall back to: §10.7:1999-2002 fixes HLM1 as
-/// the preferred segment for every role, and quietly preferring the aperture
-/// instead would hand VidMm a placement the doc forbids, on a role-4 object that
-/// has `CpuVisible=0` and no CPU VA at all, and would hide the sequencing gap
-/// behind a create that looked like success.
-///
-/// ⚠ Nonzero here is EXPECTED until K2 reports the segment; it measures that gap
-/// rather than a fault. Which of the four moves also names which client is
-/// asking, which one packed reason code could not: 1 reply pool, 2 host-visible
-/// Vulkan, 3 feedback, 4 device-local.
+/// K2a places every role in the ordinary aperture and the current segment table
+/// always reports it. These counters retain the named fail-closed check so a
+/// future table/placement drift cannot escape as an unowned dxgkrnl refusal.
 static CREATE_ROLE1_SEGMENT_ABSENT: AtomicU32 = AtomicU32::new(0);
 static CREATE_ROLE2_SEGMENT_ABSENT: AtomicU32 = AtomicU32::new(0);
 static CREATE_ROLE3_SEGMENT_ABSENT: AtomicU32 = AtomicU32::new(0);
 static CREATE_ROLE4_SEGMENT_ABSENT: AtomicU32 = AtomicU32::new(0);
-/// The HOC1 pool refused by the same check for the same reason (`AcSegHoc1`).
-///
-/// ⚠ BEYOND THE LETTER of `K4-CONTRACT.md` §4, which is written about HVM1 roles,
-/// and recorded here as such. [`hoc1_placement`] hardcodes the identical
-/// `HELIOS_SEGMENT_ID_HLM1` (§10.6:1510-1512), so an HOC1 create carries the
-/// identical exposure: refused by dxgkrnl, outside this driver, with nothing in
-/// the guest naming it. Applying §4's argument to the one other placement in this
-/// file that shares its shape is the whole change; the alternative was to
-/// knowingly leave one uncounted external refusal sitting beside the one just
-/// fixed. Revert by deleting the check in [`admit_hoc1`] — the placement itself
-/// is untouched.
+/// HOC1's aperture placement refused by the same table cross-check
+/// (`AcSegHoc1`).
 static CREATE_HOC1_SEGMENT_ABSENT: AtomicU32 = AtomicU32::new(0);
 /// Creates refused because the OS call shape contradicts the record
 /// (`AcShape`). HVM1 (§10.7:1964-1972) and HOC1 (§10.6:1489-1494) both fix the
@@ -663,8 +599,7 @@ static ALLOC_FLUSH_FAILURES: AtomicU32 = AtomicU32::new(0);
 /// anything that fires on success — `diag::record_named_bytes` is a synchronous
 /// `RtlWriteRegistryValue`, and a success-path counter's period is set by the
 /// workload, not by the driver. This block keeps those mirrors off the measured
-/// hot paths, following the shape [`APERTURE_MISSING_CPU_VISIBLE`] already uses
-/// (`diag::CounterBlock`,
+/// hot paths through the shared `diag::CounterBlock` shape
 /// x-dup-dead-27: three modules had each hand-rolled the same dump with
 /// different throttles).
 ///
@@ -1752,13 +1687,6 @@ pub(crate) struct PagingAllocInfo {
     pub resource_id: u32,
     pub size: u64,
     pub bar_eligible: bool,
-    /// Current placement ([`BAR_UNPLACED`] if none).
-    pub bar_placed: u64,
-    /// K2a. See [`AllocationContext::hlm1_eligible`].
-    pub hlm1_eligible: bool,
-    /// K2a. See [`AllocationContext::hlm1_bound`]. Read by the bind, which
-    /// decides `Bind`/`Rebind`/`None` from this one snapshot.
-    pub hlm1_bound: u64,
 }
 
 /// Allocation handles refused because they were null or failed the magic check
@@ -2109,9 +2037,6 @@ pub(crate) unsafe fn paging_alloc_info(h: HANDLE) -> Option<PagingAllocInfo> {
         resource_id: ctx.resource_id(),
         size: ctx.size as u64,
         bar_eligible: ctx.bar_eligible,
-        bar_placed: ctx.bar_placed.load(Ordering::Acquire),
-        hlm1_eligible: ctx.hlm1_eligible,
-        hlm1_bound: ctx.hlm1_bound.load(Ordering::Acquire),
     })
 }
 
@@ -2212,32 +2137,6 @@ pub(crate) unsafe fn update_outer_gpuva_mapping(
     true
 }
 
-pub(crate) unsafe fn set_bar_placement(h: HANDLE, offset: u64) {
-    if h.is_null() {
-        return;
-    }
-    let ctx = unsafe { &*(h as *const AllocationContext) };
-    if ctx.magic == ALLOCATION_CTX_MAGIC {
-        ctx.bar_placed.store(offset, Ordering::Release);
-    }
-}
-
-/// Record the window offset an HLM1 allocation's blob is now fixed-mapped at
-/// (or [`BAR_UNPLACED`] to clear). SAFETY: as [`set_bar_placement`].
-///
-/// ⛔ Called only with an offset `map_blob_at` actually returned `Ok` for. A
-/// store on the failure path would make the next observation report
-/// `Action::None` and skip the retry — see `hlm1_placement::BindingState`.
-pub(crate) unsafe fn set_hlm1_binding(h: HANDLE, offset: u64) {
-    if h.is_null() {
-        return;
-    }
-    let ctx = unsafe { &*(h as *const AllocationContext) };
-    if ctx.magic == ALLOCATION_CTX_MAGIC {
-        ctx.hlm1_bound.store(offset, Ordering::Release);
-    }
-}
-
 const PAGE: SIZE_T = 4096;
 const D3DDDI_ALLOCATIONPRIORITY_NORMAL: UINT = 0x7800_0000;
 
@@ -2311,37 +2210,8 @@ fn record_alloc_event(resid: u32, width: u32, height: u32, ctx_id: u32, is_open:
 //     write is now a different function writing a different record.
 
 /// What VidMm is told about one allocation: where it goes and how it may be
-/// touched.
-///
-/// # Why this is one function
-///
-/// The segments and the flags are ONE decision and were made in two places
-/// twenty lines apart, which is how the illegal combination below stayed
-/// invisible. dxgkrnl rejects a CpuVisible allocation in a non-CPU-accessible
-/// segment unless its supported set contains an APERTURE segment — the v71/v72
-/// "10 x 0x0202 violators" VidPn-commit failure — and `set_CpuVisible(!
-/// is_optimal_gdi_texture)` marks every BAR-placed allocation CpuVisible while
-/// the aperture bit is gated on `DisplayHalf`, a registry knob defaulting to 0.
-///
-/// So with `DisplayHalf=0` the driver KNOWINGLY emits the shape that produced
-/// that failure. The tolerance is real — the render-only surface never demanded
-/// the aperture fallback, because its CpuHostAperture always had space — but
-/// nothing recorded how large the violating population is, so it could not be
-/// re-verified after any change. `ApMiss` is that measurement, incremented
-/// exactly where the illegal combination is constructed.
-///
-/// BEHAVIOUR IS UNCHANGED. The `DisplayHalf` gate is preserved exactly; only the
-/// violation becomes visible.
-///
-/// # The limit of the encoding, which is the point
-///
-/// A `SupportedSegments` newtype whose `cpu_visible_in(bar)` constructor could
-/// only produce `bar_bit | aperture_bit` would make the illegal shape
-/// unconstructible — but preserving today's `DisplayHalf=0` behaviour requires a
-/// `legacy_render_only()` constructor that still yields it. So the honest
-/// guarantee is "the illegal shape has exactly one, explicitly named
-/// constructor", not "the illegal shape is unconstructible". This function IS
-/// that one constructor.
+/// touched. Segment placement and access flags are kept in one value so a
+/// CPU-visible local allocation cannot omit its aperture fallback.
 struct VidMmPlacement {
     preferred_segment: u32,
     supported_segments: u32,
@@ -2393,7 +2263,7 @@ const fn segment_bit(seg_id: u32) -> u32 {
 /// are POSITIONAL — index 0 is id 1 — and that type owns the mapping precisely so
 /// the id and the slot cannot be maintained separately in two files. Asking it is
 /// therefore the only way to answer this question without re-deriving the
-/// topology; `bar_seg_id()` is the same question asked about the BAR segment, and
+/// topology; `local_seg_id()` is the same question asked about local memory, and
 /// [`vidmm_placement`] already routes through it.
 ///
 /// `None` — StartDevice has not published a table — resolves to `APERTURE_ONLY`,
@@ -2437,86 +2307,27 @@ fn role_segment_absent_counter(role: Hvm1Role) -> (&'static AtomicU32, &'static 
     }
 }
 
-/// Allocations marked CpuVisible in the BAR segment WITHOUT an aperture segment
-/// in their supported set — the shape dxgkrnl rejects for a VidPn commit.
-///
-/// Expected NONZERO on the render-only configuration (`DisplayHalf=0`) and ZERO
-/// on the production `DisplayHalf=1` one. It documents the current population
-/// rather than changing it.
-///
-/// A per-allocation ATOMIC, flushed from an existing PASSIVE dump site — never a
-/// per-allocation registry write (T1b's k-alloc-05).
-///
-/// ⚠ CROSS-LANE: its flush site is `ddi/cpu_host_aperture.rs:141-144`, which K1
-/// deletes. K4 does not re-home it (that would be an edit to a file this unit
-/// does not own); the counter must be re-homed by whichever of K1/K4's successor
-/// runs second, or it silently stops being readable.
-pub(crate) static APERTURE_MISSING_CPU_VISIBLE: AtomicU32 = AtomicU32::new(0);
-
 /// The placement for an ordinary HWA2 allocation.
 ///
-/// ⚠ The `TrackingBudget` parameter and its two arms are GONE with the VidMm
-/// tracker (`K4-CONTRACT.md` §6): they existed only to place the one-page
-/// identity object of a `HELIOS_WDDM_ALLOC_KIND_TRACKING` allocation, a kind
-/// HWA2 does not have. Everything else is byte-identical to the pre-retirement
-/// rule, including the `DisplayHalf` gate and the `ApMiss` measurement.
-///
-/// The three WDDM-3.2 flags are **not** set here: §10.7:2005-2007 states them
-/// for HVM1 roles, and asserting whole-allocation single-segment residency for
-/// every D3D11 texture would be a new claim with no evidence behind it. See
-/// [`hvm1_placement`].
+/// The local memory segment has no CPU mapping service. Every CPU-visible HWA2
+/// allocation that prefers it therefore also names the ordinary aperture, so
+/// VidMm can migrate content before supplying a CPU view. The BAR content engine
+/// owns those transfers; no MapCpuHostAperture callback or fixed-offset mapper
+/// participates.
 fn vidmm_placement(
     bar_eligible: bool,
-    bar_seg_id: Option<u32>,
+    local_seg_id: Option<u32>,
     is_primary: bool,
     cpu_visible: bool,
-    display_half: bool,
 ) -> VidMmPlacement {
     let aperture_bit = segment_bit(crate::ddi::gpummu::APERTURE_SEGMENT_ID);
 
     let (preferred_segment, supported_segments) =
-        if let (true, Some(seg_id)) = (bar_eligible, bar_seg_id) {
-            // Prefer the BAR (the two-memory-split fix keeps CPU raster in the venus
-            // blob's bytes). These allocations are CpuVisible (set below) in a
-            // NON-CPU-accessible memory segment — the BAR exposes CPU access only via
-            // the CpuHostAperture (segment CpuVisible=0) — and WDDM REQUIRES every such
-            // allocation to list an aperture segment in its supported set so VidMm can
-            // always obtain a CPU virtual address, falling back to system memory if the
-            // CpuHostAperture is full (allocation-usage-tracking.md: "all CPU-accessible
-            // allocations in non-CPU-accessible memory segments must contain an aperture
-            // segment in their supported segment set"). v71 added it to the PRIMARY only;
-            // the other CpuVisible surfaces (SHADOW/STAGING/GDI) shipped BAR-only and
-            // dxgkrnl rejected them ("CPUVisible allocations must include an aperture
-            // segment", ETW-confirmed v71/v72 — 10 `0x0202` violators in the S-ring) →
-            // the whole VidPn commit failed. Gated on the display half so the proven
-            // render-only surface (DisplayHalf off) stays byte-identical: it never hit
-            // the rejection because its CpuHostAperture always had space, so the fallback
-            // was never demanded. PreferredSegment stays the BAR — with a 1 GiB BAR vs a
-            // ~200 MB CpuVisible working set, content lives in the venus blob in steady
-            // state and the aperture (which VidMm upgrades to the implicit system-memory
-            // segment without AccessedPhysically, iommu-dma-remapping.md) is an
-            // eviction-only fallback not exercised at this scale — negligible runtime cost.
-            let needs_aperture = is_primary || display_half;
-            let supp = segment_bit(seg_id);
-            (
-                seg_id,
-                if needs_aperture {
-                    supp | aperture_bit
-                } else {
-                    supp
-                },
-            )
+        if let (true, Some(seg_id)) = (bar_eligible, local_seg_id) {
+            (seg_id, segment_bit(seg_id) | aperture_bit)
         } else {
             (crate::ddi::gpummu::APERTURE_SEGMENT_ID, aperture_bit)
         };
-    // THE MEASUREMENT. Counted here, at the one site that constructs the shape:
-    // CpuVisible, preferred to the BAR, with no aperture segment to fall back to.
-    if cpu_visible
-        && Some(preferred_segment) == bar_seg_id
-        && supported_segments & aperture_bit == 0
-    {
-        APERTURE_MISSING_CPU_VISIBLE.fetch_add(1, Ordering::Relaxed);
-    }
     VidMmPlacement {
         preferred_segment,
         supported_segments,
@@ -2556,7 +2367,7 @@ fn vidmm_placement(
 ///
 /// `ShareBackingStoreWithKmd` requires system-memory-only placement. The role
 /// table therefore names the reported aperture as both preferred and solely
-/// supported; no BAR/HLM1 alternative can silently take custody of these bytes.
+/// supported; no local-memory alternative can silently take custody of these bytes.
 /// [`admit_hvm1`] verifies that exact segment before publishing an allocation.
 fn hvm1_placement(role: Hvm1Role) -> VidMmPlacement {
     let contract = role.placement();
@@ -2568,8 +2379,7 @@ fn hvm1_placement(role: Hvm1Role) -> VidMmPlacement {
         // §10.7:2003-2005 — `Cached = 0` for every role, and the CPU publication
         // ordering proof depends on it: a `HOST_CACHED` mapping would break the
         // `HOST_VISIBLE|HOST_COHERENT` advertisement (§18.1:4763-4766). NOT
-        // subject to the `AllocCached` knob, which is a BAR-readback tuning
-        // switch for the D3D11 surfaces and has no authority here.
+        // subject to the `AllocCached` knob, which has no authority here.
         cached: contract.cached,
         // §10.7:2007-2010 — truthful, not a contiguity request: the legacy
         // physical Render engine really does dereference the final
@@ -2577,38 +2387,26 @@ fn hvm1_placement(role: Hvm1Role) -> VidMmPlacement {
         // ⚠ If K6's Render/Patch path ever stops dereferencing it, this bit
         // becomes a lie even though it is set exactly as specified.
         accessed_physically: contract.accessed_physically,
-        // NOT maskable: this bit is what delivers `NOTIFY_RESIDENCY`, which is
-        // the arm the bind runs on (F15).
+        // NOT maskable: this is part of the fixed HVM1 residency contract.
         explicit_residency_notification: contract.explicit_residency_notification,
         disable_partial_residency: contract.disable_partial_residency,
         restricted_to_single_segment: contract.restricted_to_single_segment,
     }
 }
 
-/// The placement §10.6:1510-1512 and §17.6:4414-4418 fix for the HOC1 pool.
+/// Current HOC1 placement.
 ///
-/// ⚠ Note the DELIBERATE ASYMMETRY with [`hvm1_placement`], which is the obvious
-/// implementation error here: HOC1 must **not** claim `AccessedPhysically`
-/// (§17.6:4417-4418) whereas every HVM1 role must (§10.7:2002-2003). HOC1 is
-/// executed through C64/HPM1 page-table handling from a GPUVA, not through a
-/// patched physical capability, so the claim would be untrue.
-///
-/// "No HAP flags" (§10.6:1511) is satisfied by construction: this driver's
-/// CpuHostAperture participation is a segment property, and the HOC1 allocation
-/// names no BAR segment.
-///
-/// ⛔ Same HLM1 caveat as [`hvm1_placement`], and now the same check —
-/// "preferred in HLM1, with ordinary system placement supported" needs K2's
-/// segment table, so [`admit_hoc1`] refuses through [`segment_is_reported`] and
-/// [`CREATE_HOC1_SEGMENT_ABSENT`] rather than letting dxgkrnl refuse it where no
-/// Helios counter can see it. The aperture bit is the "ordinary system placement"
-/// half and does exist today.
+/// The UMD12 pool is CPU-visible/write-combined and obtains its exact KMD view
+/// through `ShareBackingStoreWithKmd`. A7 snapshots sealed extents directly
+/// from that allocation object; there is no HPM1 page-table executor and no
+/// renderer resource. The ordinary aperture is therefore both preferred and
+/// solely supported. HOC1 deliberately does not claim `AccessedPhysically`:
+/// no physical capability is patched for this allocation.
 fn hoc1_placement() -> VidMmPlacement {
     VidMmPlacement {
-        preferred_segment: HELIOS_SEGMENT_ID_HLM1,
-        supported_segments: segment_bit(HELIOS_SEGMENT_ID_HLM1)
-            | segment_bit(crate::ddi::gpummu::APERTURE_SEGMENT_ID),
-        // §10.6:1510-1511 — nonprimary, nonshared, CPU-visible/WC.
+        preferred_segment: crate::ddi::gpummu::APERTURE_SEGMENT_ID,
+        supported_segments: segment_bit(crate::ddi::gpummu::APERTURE_SEGMENT_ID),
+        // Nonprimary, allocation-private and CPU-visible/WC.
         cpu_visible: true,
         // Write-combined, and the D3D12 UMD's whole seal protocol depends on it:
         // §18.2:4946-4949 rejects device qualification if the returned mapping's
@@ -2616,9 +2414,7 @@ fn hoc1_placement() -> VidMmPlacement {
         // that seals an HOB1 unobservable.
         cached: false,
         accessed_physically: false,
-        // §10.7's Flags2/residency-notification set is stated for HVM1 roles.
-        // §17.6:4414-4418's HOC1 list does not include them, and asserting them
-        // here would be a claim with no line behind it.
+        // HVM1's Flags2/residency-notification set does not apply to HOC1.
         explicit_residency_notification: false,
         disable_partial_residency: false,
         restricted_to_single_segment: false,
@@ -2635,39 +2431,6 @@ unsafe fn destroy_allocation_ctx(
     ctx: Box<AllocationContext>,
 ) {
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
-    // K2a: an HLM1 allocation that lived and died without ever being bound had
-    // a CPU view backed by nothing this driver owns. There is no Lock-time
-    // callback to refuse it at, so this post-hoc count is the only signal.
-    if ctx.hlm1_eligible {
-        if ctx.hlm1_bound.load(Ordering::Acquire) == BAR_UNPLACED {
-            crate::ddi::build_paging_buffer::HLM1_ERR_NEVER_BOUND.fetch_add(1, Ordering::Relaxed);
-        }
-        // ⭐ THE ACCEPTANCE ORACLE, and the only one that does not round-trip
-        // through the same pointer it is testing (`hts1_session_probe` H5's
-        // defect, `FINDINGS.md` F14). Read the BLOB's bytes at the three offsets
-        // that probe writes and report them raw: `0xA55AC3` means the guest's
-        // Lock2 view IS the blob; the K2a stamp bytes mean the mapping is being
-        // read correctly and the guest wrote somewhere else. The KMD knows
-        // neither expectation, which is what makes the reading evidence.
-        //
-        // Before any teardown below: the blob must still exist to be read.
-        // SAFETY: PASSIVE (this DDI), and `resource_id` is still live here.
-        unsafe {
-            crate::ddi::build_paging_buffer::hlm1_readback(
-                passive,
-                adapter,
-                ctx.resource_id(),
-                ctx.size as u64,
-            )
-        };
-        // Publish here or not at all: the only other flush site is the paging
-        // content tail, and destroy runs after this allocation's last paging op.
-        // ⛔ Unconditional on eligibility, not on the never-bound arm it used to
-        // sit inside — a SUCCESSFUL bind is exactly the case whose counters no
-        // other site publishes — and unthrottled, because a bind moves no failure
-        // counter and `flush` would then write nothing here.
-        crate::ddi::build_paging_buffer::hlm1_publish_counters();
-    }
     // Retire the exact Windows/KMD allocation identity before any backing
     // resource or Venus image can be torn down. Ambiguous plane retirement
     // retains the backing until the verified reset barrier.
@@ -2717,13 +2480,8 @@ unsafe fn destroy_allocation_ctx(
 /// else). So the type is not degenerate; it separates "a host backing exists and
 /// reported its extent" from "a VidMm-only allocation".
 ///
-/// Why it is a type rather than a bool at the call site: it gives Tier 1's
-/// adoption and the aperture path a **typed precondition** instead of an
-/// implicit one, so the aperture path can eventually REQUIRE `HostAuthoritative`
-/// in its signature. `MapCpuHostAperture`'s whole-allocation refusal computes a
-/// page count from `PagingAllocInfo::size` while `map_blob_at` maps whatever the
-/// TRACKED BLOB size implies — two sources — and that comparison is only sound
-/// where the size came from the host.
+/// Why it is a type rather than a bool at the call site: the local-memory
+/// content engine may map bytes only when the host reported the backing extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BackingSize {
     /// The host allocated it and reported the size back.
@@ -3626,7 +3384,7 @@ unsafe fn admit_hwa2(
         plane0.offset
     };
 
-    let bar_seg_id = adapter.bar_segment().map(|b| b.seg_id);
+    let local_seg_id = adapter.local_segment().map(|segment| segment.seg_id);
     // HostAuthoritative is exactly the three KMD-created arms, which are exactly
     // the arms that set `venus_memory_id`. What that buys is that the aperture
     // path's safety rests on a stated fact rather than on an incidental property
@@ -3650,10 +3408,9 @@ unsafe fn admit_hwa2(
     // not-eligible arm says in terms that the eligible arm is the one that maps.
     // `BAR_ERR_MAP` would then name the symptom and not the cause.
     //
-    // The term also states the thing the placement is FOR: the BAR exposes CPU
-    // access through the CpuHostAperture, so an allocation with no CPU view has
-    // no reason to prefer it. The excluded population falls back to the aperture
-    // segment, which is where every other non-eligible allocation already goes.
+    // The term also states what the placement is for: only a CPU-visible linear
+    // allocation participates in the KMD content-transfer engine. Device-local
+    // and opaque resources stay in the aperture-backed renderer path.
     //
     // ⚠ The live D3D11 desktop cannot reach the broken arm today — the D3D11
     // producer sets `HELIOS_HWA2_FLAG_CPU_VISIBLE` unconditionally — and `umd12`
@@ -3666,19 +3423,18 @@ unsafe fn admit_hwa2(
     let bar_eligible = created.blob_size.is_host_authoritative()
         && desc.swizzle_class != HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL
         && desc.has_flag(HELIOS_HWA2_FLAG_CPU_VISIBLE)
-        && bar_seg_id.is_some();
+        && local_seg_id.is_some();
     let placement = vidmm_placement(
         bar_eligible,
-        bar_seg_id,
+        local_seg_id,
         is_primary,
         desc.has_flag(HELIOS_HWA2_FLAG_CPU_VISIBLE),
-        adapter.display_half(),
     );
 
     // VidMm is charged the LARGER of the descriptor's extent and the backing the
     // host actually produced. The descriptor is const and may under-state a
-    // host-rounded image requirement; charging the smaller number would let
-    // `MapCpuHostAperture` compute a page count below the tracked blob's length.
+    // host-rounded image requirement; charging the smaller number would make
+    // VidMm account less storage than the content engine owns.
     let charged = created.blob_size.bytes().max(desc.byte_size);
     let vidmm_size = round_up_page(if charged == 0 {
         PAGE
@@ -3900,7 +3656,7 @@ unsafe fn admit_hvm1(
         plane_offset: 0,
         pitch: 0,
         direct_scanout: false,
-        // Shared-backing HVM1 never enters the legacy CpuHostAperture path.
+        // Shared-backing HVM1 is aperture-only.
         bar_eligible: false,
         size_provenance: backing.as_ref().map_or(
             BackingSize::SharedBackingStore(record.byte_size),
@@ -3972,11 +3728,8 @@ unsafe fn admit_hoc1(
         bump(&CREATE_HOC1_REJECT, b"AcHoc1Rej");
         return Err(STATUS_NOT_SUPPORTED);
     }
-    // The same segment check `admit_hvm1` performs, for the same reason: this
-    // placement also prefers `HELIOS_SEGMENT_ID_HLM1`, so without it an HOC1
-    // create is refused by dxgkrnl with nothing in the guest naming why. See
-    // [`CREATE_HOC1_SEGMENT_ABSENT`], which records that this goes one step
-    // beyond §4's letter and how to revert it.
+    // Keep the same runtime segment-table cross-check as HVM1: a missing
+    // aperture is a named refusal before dxgkrnl sees an impossible placement.
     let placement = hoc1_placement();
     if !segment_is_reported(adapter, placement.preferred_segment) {
         bump(&CREATE_HOC1_SEGMENT_ABSENT, b"AcSegHoc1");
@@ -3988,8 +3741,8 @@ unsafe fn admit_hoc1(
         // See the same site in `admit_hwa2` for why this is `STATUS_NO_MEMORY`.
         return Err(STATUS_NO_MEMORY);
     };
-    // §17.6:4418-4419 — "KMD writes ONE allocation generation into HOC1 and lets
-    // C64/HPM1 map its pages for virtual execution".
+    // The KMD writes one immutable allocation generation. A7 later reaches the
+    // exact pool only through the device/context/allocation ownership graph.
     record.allocation_generation = generation;
     if record
         .validate_create_output(HELIOS_PACKAGE_GENERATION)
@@ -4012,12 +3765,9 @@ unsafe fn admit_hoc1(
         // Validated by the segment check above; computed once so the placement
         // that was validated is the placement that ships.
         placement,
-        // ⛔ NO BACKING, and that is the contract, not an omission
-        // (§10.6:1511-1512, §17.6:4416-4417): the pool is "not an HVM1 renderer
-        // resource", has "no renderer view", and its bytes are ordinary VidMm
-        // memory the UMD Lock2-maps and C64/HPM1 page-tables for execution.
-        // Creating a venus object here would give it exactly the renderer view
-        // the doc forbids.
+        // No Venus backing: this pool is not an HVM1 renderer resource. K2a's
+        // OS-owned shared backing is retained directly on the allocation object
+        // for A7 snapshotting; creating a renderer object would duplicate it.
         backing: None,
         width: 0,
         height: 0,
@@ -4176,24 +3926,6 @@ unsafe fn create_one(
         false,
     );
 
-    // Derived from the placement that was admitted, not from the record kind: the
-    // predicate that decided this allocation has a CPU view is the one that
-    // decides its blob must be mapped where VidMm puts it.
-    //
-    // The excluded population is DWM's D3D11 textures: `vidmm_placement` gives
-    // every BAR-eligible one `cpu_visible` on this same segment, and without a
-    // term for it the counters are dominated by them and attribute nothing to an
-    // HVM1 allocation.
-    //
-    // ⛔ That term used to be `!bar_eligible`, which was a PROXY for "not a D3D11
-    // surface" and stopped being one the moment `Hlm1Bar` could make an HVM1
-    // allocation BAR-eligible — the instrument would have gone dark in exactly the
-    // arm it was built to measure. The allocation KIND says the same thing
-    // directly and cannot be turned off by a knob.
-    let hlm1_eligible = admitted.placement.cpu_visible
-        && admitted.placement.preferred_segment == HELIOS_SEGMENT_ID_HLM1
-        && matches!(admitted.kind, ALLOC_KIND_HVM1 | ALLOC_KIND_HOC1);
-
     let ctx = Box::new(AllocationContext {
         magic: ALLOCATION_CTX_MAGIC,
         ctx_id: adapter.venus_ctx_id(),
@@ -4227,16 +3959,9 @@ unsafe fn create_one(
         plane_offset: admitted.plane_offset,
         venus_alloc_size: backing.map_or(0, |b| b.venus_alloc_size),
         memory_type_index: backing.map_or(0, |b| b.memory_type_index),
-        bar_placed: core::sync::atomic::AtomicU64::new(BAR_UNPLACED),
-        hlm1_eligible,
-        hlm1_bound: core::sync::atomic::AtomicU64::new(BAR_UNPLACED),
         bar_eligible: admitted.bar_eligible,
         size_provenance: admitted.size_provenance,
     });
-
-    if hlm1_eligible {
-        crate::ddi::build_paging_buffer::hlm1_note_eligible();
-    }
 
     // ── VidMm metadata: segment placement + CPU visibility ──────────────────
     info.hAllocation = Box::into_raw(ctx) as HANDLE;

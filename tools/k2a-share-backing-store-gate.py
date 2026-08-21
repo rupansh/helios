@@ -25,7 +25,7 @@ LIFECYCLE = "kmd_render/src/ddi/lifecycle.rs"
 ALLOC = "kmd_render/src/ddi/create_allocation.rs"
 DDI_MOD = "kmd_render/src/ddi/mod.rs"
 LIB = "kmd_render/src/lib.rs"
-SEH = "kmd_render/src/seh_shim.c"
+COPY_HELPER = "kmd_render/src/render_user_copy.c"
 OWNER = "kmd_render/src/virtio/control_owner.rs"
 CTRL = "kmd_render/src/virtio/ctrl.rs"
 CLASSES = "kmd_render/tools/wddm32_slot_classes.tsv"
@@ -48,7 +48,7 @@ WDK_HEADER = "kmd_render/tools/wdk-28000/km/dispmprt.h"
 K2A_PROBE = "tools/k2a_shared_backing_probe.c"
 
 EXTRA_SOURCES = (
-    SEH,
+    COPY_HELPER,
     MESA,
     HTS_PROBE,
     HNR_PROBE,
@@ -460,15 +460,15 @@ def check_allocation(sources: dict[str, str], errors: list[str]) -> None:
 
 
 def check_mdl_and_owner(sources: dict[str, str], errors: list[str]) -> None:
-    seh = compact(sources.get(SEH, ""))
+    helper = compact(sources.get(COPY_HELPER, ""))
     for fragment in (
         "typedefcharhelios_mdl_size_must_be_48[(sizeof(MDL)==48)?1:-1];",
         "MmProbeAndLockPages(Mdl,/*KernelMode*/0,/*IoModifyAccess*/2);",
         "__except(EXCEPTION_EXECUTE_HANDLER)",
         "return(unsignedlonglong*)(Mdl+1);",
     ):
-        if compact(fragment) not in seh:
-            errors.append(f"{SEH}: locked-MDL proof missing: {fragment}")
+        if compact(fragment) not in helper:
+            errors.append(f"{COPY_HELPER}: locked-MDL proof missing: {fragment}")
 
     request = body(sources, CTRL, "create_blob_request", errors)
     require_fragments(

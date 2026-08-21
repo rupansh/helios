@@ -8,7 +8,6 @@
 pub(crate) use crate::irql::PASSIVE_LEVEL_IRQL;
 
 mod add_device;
-mod bar_segment;
 mod base;
 mod build_paging_buffer;
 mod child;
@@ -21,6 +20,7 @@ mod gpummu;
 pub(crate) mod hpd;
 pub(crate) mod interrupt;
 mod lifecycle;
+mod local_segment;
 pub(crate) mod mpo3;
 pub(crate) mod native_fence;
 pub(crate) mod native_render;

@@ -14,10 +14,9 @@
  * satisfy: "Generate/assert both Rust **and C** offsets and the D3D11-type-1
  * versus D3D12-type-2 validator."
  *
- * WHY C NEEDS THIS AT ALL: §10.4 makes the host a first-class HOB1 reader —
- * "QEMU/HPM1 reads and validates HOB1 through the current process page tables,
- * resolves every GPUVA operand, and executes it". Without these declarations
- * the host half of a kernel/host boundary would parse a 112-byte header, a
+ * WHY C NEEDS THIS AT ALL: the D3D UMDs produce HOB1/HOS1 while KMD validates
+ * and snapshots those records through the exact allocation association.
+ * Without these declarations the C producer would emit a 112-byte header, a
  * 40-byte use record and a 16-byte operand from a hand-written layout that
  * nothing binds to the Rust side.
  *
@@ -609,7 +608,7 @@ HELIOS_WDDM_STATIC_ASSERT(sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint16_t)
  * ⛔ HOC1 is NEITHER A RENDERER/RESOURCE IDENTITY NOR A SHAREABLE OBJECT.
  * Nothing in it names a host backing, a `resid`, a Venus object, or anything
  * another process could open; KMD admits it only as a nonprimary, nonshared,
- * CPU-visible/WC allocation preferred in HLM1.
+ * CPU-visible/WC aperture allocation with exact shared backing.
  *
  * Its only mutable field is `allocation_generation`: zero on input, and written
  * back nonzero by KMD at create. That is the one create-time write-back in this

@@ -20,16 +20,6 @@
 //! | `protocol/include/helios_translator_dispatch.h` | [`translator_dispatch`] — the private direct-dispatch ABI (in-process, not a wire format) | nobody yet; `tools/retirement-gates.sh` only |
 //! | `protocol/include/helios_diagnostics.h` | [`diagnostics`] — the §12.3 ETW schema | nobody yet; `tools/retirement-gates.sh` only |
 //!
-//! ⛔ A sixth row used to read
-//! "`qemu-helios/include/hw/virtio/helios_physical_memory.h` | [`physical_memory`]
-//! — HPM1 and the HLM1 BAR profile". **That header is not in the tree**:
-//! `docs/retirement/FINDINGS.md` **F5** declined HPM1 and reset `qemu-helios` to
-//! its pre-retirement base, so the header survives only on branch
-//! `helios/hpm1-parked`. [`physical_memory`] therefore has **no** C mirror, is
-//! covered by **neither** `tools/retirement-gates.sh`'s mirror-compile gate nor
-//! `protocol/tools/abi_parity.py`, and is declared-but-unwired by owner
-//! decision. Read that module's banner before touching it.
-//!
 //! ⚠ Four of the five mirrors above are compiled by nothing but the gate
 //! script. "The `_Static_assert`s hold" is a statement about `gcc
 //! -fsyntax-only`, not evidence that a consumer of those bytes exists — see
@@ -43,7 +33,7 @@
 //! | [`translation_session`] | Mesa `vn_instance` -> KMD session establishment (HTS1) and outer-context attach (HQA1) | 10.4 |
 //! | [`translator_dispatch`] | D3D UMD bridge <-> DXVK/vkd3d <-> Helios Mesa, **in-process only**: the private direct-dispatch entry point and its versioned two-half function table | 2.8, 10.4, 13 |
 //! | [`native_render`] | native Vulkan ICD -> KMD Render (HVC1/HNR2), allocation (HVM1), synchronous reply (HVR1) | 10.7 |
-//! | [`physical_memory`] | ⛔ **DECLINED (F5).** Was: KMD paging DMA -> QEMU device page tables (HPM1) and the HLM1 BAR profile. Only [`HELIOS_SEGMENT_ID_SYSTEM`]/[`HELIOS_SEGMENT_ID_APERTURE`]/[`HELIOS_SEGMENT_ID_HLM1`] are live | 10.7 |
+//! | [`segments`] | The ordinary WDDM aperture id used by K2a/HVM1/HOC1 placement | 10.7 |
 //! | [`diagnostics`] | KMD -> OS ETW, one-way lossy schema | 12.3 |
 //! | [`virtio_gpu`] | standard virtio-gpu control headers/capsets | VirtIO 1.2 §5.7 |
 //! | [`features`] | virtio feature bits | — |
@@ -56,7 +46,7 @@
 //! References:
 //!   - `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` (this repo) — normative for
 //!     every record in [`wddm`], [`translation_session`], [`native_render`],
-//!     [`physical_memory`], and [`diagnostics`]
+//!     [`diagnostics`]
 //!   - TRANSPORT.md (this repo) — virtio-gpu layouts
 //!   - VirtIO 1.2 spec §5.7 (GPU Device):
 //!     <https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html#sec-gpu>
@@ -68,8 +58,8 @@ pub mod diagnostics;
 pub mod features;
 pub mod native_fence;
 pub mod native_render;
-pub mod physical_memory;
 pub mod resource_association;
+pub mod segments;
 pub mod translation_session;
 pub mod translator_dispatch;
 pub mod umd_adapter_info;
@@ -80,8 +70,8 @@ pub use diagnostics::*;
 pub use features::*;
 pub use native_fence::*;
 pub use native_render::*;
-pub use physical_memory::*;
 pub use resource_association::*;
+pub use segments::*;
 pub use translation_session::*;
 pub use translator_dispatch::*;
 pub use umd_adapter_info::*;
@@ -143,10 +133,9 @@ pub const HELIOS_PACKAGE_GENERATION_TAG: u32 = 0x4845_4C49;
 /// `escape`/`ioctl` verbs are retired. Bump it for **any** change to any record
 /// in this crate, including a field that only widens a reserved region.
 ///
-/// ⛔ **HPM1 was in that list and has been removed.** `docs/retirement/
-/// FINDINGS.md` **F5** declines it — owner decision, maintenance grounds — and
-/// resets `qemu-helios` to its pre-retirement base, so HPM1 is no part of the
-/// guest ABI this generation names. See [`physical_memory`]'s banner.
+/// HPM1 is absent. `docs/retirement/FINDINGS.md` F5 declines it on maintenance
+/// grounds; no QEMU generation handshake or paging protocol is part of this
+/// package.
 ///
 /// ⚠ Of the ten records still listed, only **HWA2**, **HVM1** and **HOC1** have
 /// a producer or consumer at HEAD (measured 2026-08-10 by grepping each
@@ -171,7 +160,7 @@ pub const HELIOS_PACKAGE_GENERATION_ORDINAL: u32 = 3;
 ///
 /// Every record in this crate that carries a `package generation` field
 /// (HWA2 offset 8, HOB1 offset 8, HOS1 offset 8, HOC1, HQA1 offset 8, HTS1
-/// INIT/reply, HVC1 offset 8, HNR2 offset 8, HVM1, HVR1, HPM1, and the
+/// INIT/reply, HVC1 offset 8, HNR2 offset 8, HVM1, HVR1, and the
 /// section-12.3 ETW payload offset 0) must carry exactly this value.
 ///
 /// # Mismatch is fatal, everywhere, with no fallback
@@ -230,8 +219,8 @@ const _: () = {
 /// generation-comparison rule: zero is never a wildcard on either side, and a
 /// difference is a hard refusal with both values named.
 ///
-/// Validators in [`wddm`], [`native_render`], [`physical_memory`],
-/// [`translation_session`], and [`diagnostics`] deliberately take the expected
+/// Validators in [`wddm`], [`native_render`], [`translation_session`], and
+/// [`diagnostics`] deliberately take the expected
 /// generation as a *parameter* rather than reading this constant directly, so
 /// that the KMD can pin one generation for an adapter's lifetime and a unit test
 /// can exercise a mismatch. The parameter's production value is this constant.
