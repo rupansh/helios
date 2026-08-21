@@ -25,6 +25,7 @@ pub struct A7CommandFacts {
 pub struct SchemaScratch<'a> {
     geometry_counts: &'a mut [u32],
     geometry_len: usize,
+    reply_size: u64,
 }
 
 impl<'a> SchemaScratch<'a> {
@@ -32,7 +33,26 @@ impl<'a> SchemaScratch<'a> {
         Self {
             geometry_counts,
             geometry_len: 0,
+            reply_size: 0,
         }
+    }
+    pub(super) fn set_reply_size(&mut self, reply_size: u64) {
+        self.reply_size = reply_size;
+    }
+    fn expect_fixed_reply_array(
+        &self,
+        count: u64,
+        base_bytes: u64,
+        element_bytes: u64,
+    ) -> Result<(), VenusReject> {
+        let expected = count
+            .checked_mul(element_bytes)
+            .and_then(|bytes| base_bytes.checked_add(bytes))
+            .ok_or(VenusReject::CountOverflow)?;
+        if self.reply_size != expected {
+            return Err(VenusReject::BadArrayCount);
+        }
+        Ok(())
     }
     fn reset_geometry(&mut self) {
         self.geometry_len = 0;
@@ -46348,10 +46368,7 @@ fn parse_command_vk_enumerate_device_extension_properties(
     {
         return Err(VenusReject::BadArrayCount);
     }
-    c.bound_loop_count(count_p_properties_0)?;
-    for i in 0..count_p_properties_0 {
-        let _ = parse_partial_vk_extension_properties(c, operands, scratch, depth + 1)?;
-    }
+    scratch.expect_fixed_reply_array(count_p_properties_0, 28, 268)?;
     Ok(A7CommandFacts {
         kind: A7CommandKind::PureControl,
         opcode: 14,

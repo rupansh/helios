@@ -55,6 +55,17 @@ CONTROL_EXCLUDED_FILES = {
     "vn_host_copy.c",
 }
 
+# These output arrays carry only their count in the request because each
+# partial element is zero bytes.  Bind the count to the exact generated reply
+# size instead of trying to consume nonexistent request elements.
+#
+# vkEnumerateDeviceExtensionProperties reply:
+#   command/result + pPropertyCount + pProperties count = 28 bytes
+#   VkExtensionProperties = array count + 256-byte name + specVersion = 268
+ZERO_WIDTH_REPLY_ARRAYS = {
+    ("vkEnumerateDeviceExtensionProperties", "pProperties"): (28, 268),
+}
+
 
 def command_buffer_commands(source: Path) -> set[str]:
     text = source.read_text(encoding="utf-8")
@@ -351,6 +362,14 @@ class Generator:
 
             base = var.ty.base
             width = self.scalar_width(var.ty)
+            reply_shape = ZERO_WIDTH_REPLY_ARRAYS.get((command_name, var.name))
+            if reply_shape is not None:
+                base_bytes, element_bytes = reply_shape
+                out.append(
+                    f"{cur_indent}scratch.expect_fixed_reply_array("
+                    f"{count}, {base_bytes}, {element_bytes})?;"
+                )
+                return
             if info.func_stem in ("blob_array", "char_array"):
                 out.append(f"{cur_indent}let bytes = c.take_padded({count})?;")
                 if info.func_stem == "char_array":
@@ -669,10 +688,17 @@ class Generator:
             "pub struct SchemaScratch<'a> {",
             "    geometry_counts: &'a mut [u32],",
             "    geometry_len: usize,",
+            "    reply_size: u64,",
             "}",
             "",
             "impl<'a> SchemaScratch<'a> {",
-            "    pub fn new(geometry_counts: &'a mut [u32]) -> Self { Self { geometry_counts, geometry_len: 0 } }",
+            "    pub fn new(geometry_counts: &'a mut [u32]) -> Self { Self { geometry_counts, geometry_len: 0, reply_size: 0 } }",
+            "    pub(super) fn set_reply_size(&mut self, reply_size: u64) { self.reply_size = reply_size; }",
+            "    fn expect_fixed_reply_array(&self, count: u64, base_bytes: u64, element_bytes: u64) -> Result<(), VenusReject> {",
+            "        let expected = count.checked_mul(element_bytes).and_then(|bytes| base_bytes.checked_add(bytes)).ok_or(VenusReject::CountOverflow)?;",
+            "        if self.reply_size != expected { return Err(VenusReject::BadArrayCount); }",
+            "        Ok(())",
+            "    }",
             "    fn reset_geometry(&mut self) { self.geometry_len = 0; }",
             "    fn push_geometry(&mut self, value: u64) -> Result<(), VenusReject> {",
             "        let slot = self.geometry_counts.get_mut(self.geometry_len).ok_or(VenusReject::OperandCapacity)?;",

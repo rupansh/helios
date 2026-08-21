@@ -775,6 +775,7 @@ pub fn validate_venus_control_stream(
         if admission.reply_size == 0 {
             return Err(VenusReject::BadArrayCount);
         }
+        scratch.set_reply_size(admission.reply_size);
 
         let (opcode, flags) = command_header(&mut c)?;
         if flags != COMMAND_GENERATE_REPLY {
@@ -1190,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn admits_reply_bearing_device_extension_enumeration_with_null_layer() {
+    fn admits_device_extension_count_and_fill_with_null_layer() {
         let mut b = Vec::new();
         put32(&mut b, OP_SET_REPLY);
         put32(&mut b, 0);
@@ -1221,6 +1222,31 @@ mod tests {
         assert_eq!(admitted.reply_offset, 80);
         assert_eq!(admitted.reply_size, 28);
         assert_eq!(operands[0].payload_offset, 16);
+
+        let mut fill = b.clone();
+        fill[28..36].copy_from_slice(&43_444u64.to_le_bytes());
+        fill[68..72].copy_from_slice(&162u32.to_le_bytes());
+        fill[72..80].copy_from_slice(&162u64.to_le_bytes());
+        let admitted = validate_venus_control_stream(
+            &fill,
+            true,
+            &mut [VenusOperand::default(); 1],
+            &mut [0u32; 8],
+        )
+        .expect("vkEnumerateDeviceExtensionProperties output-array fill");
+        assert_eq!(admitted.opcode, 14);
+        assert_eq!(admitted.reply_size, 43_444);
+
+        fill[28..36].copy_from_slice(&43_443u64.to_le_bytes());
+        assert_eq!(
+            validate_venus_control_stream(
+                &fill,
+                true,
+                &mut [VenusOperand::default(); 1],
+                &mut [0u32; 8],
+            ),
+            Err(VenusReject::BadArrayCount)
+        );
 
         let mut unterminated = b;
         unterminated[52..60].copy_from_slice(&1u64.to_le_bytes());
