@@ -18,6 +18,7 @@ DISPATCH = "protocol/include/helios_translator_dispatch.h"
 RETIREMENT = "tools/retirement-gates.sh"
 GENERATION_HEADERS = (
     "protocol/include/helios_diagnostics.h",
+    "protocol/include/helios_native_fence.h",
     "protocol/include/helios_native_render.h",
     "protocol/include/helios_translation_session.h",
     "protocol/include/helios_wddm.h",
@@ -147,8 +148,8 @@ def check_sources(s: dict[str, str]) -> list[str]:
         (
             "pub mod resource_association;",
             "pub use resource_association::*;",
-            "pub const HELIOS_PACKAGE_GENERATION_ORDINAL: u32 = 3",
-            "0x4845_4C49_0000_0003",
+            "pub const HELIOS_PACKAGE_GENERATION_ORDINAL: u32 = 4",
+            "0x4845_4C49_0000_0004",
         ),
         errors,
     )
@@ -157,8 +158,8 @@ def check_sources(s: dict[str, str]) -> list[str]:
             path,
             s[path],
             (
-                "HELIOS_PACKAGE_GENERATION_ORDINAL 3u",
-                "0x48454C4900000003",
+                "HELIOS_PACKAGE_GENERATION_ORDINAL 4u",
+                "0x48454C4900000004",
             ),
             errors,
         )
@@ -248,8 +249,8 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation(
             "package generation drift",
             GENERATION_HEADERS[0],
+            "HELIOS_PACKAGE_GENERATION_ORDINAL 4u",
             "HELIOS_PACKAGE_GENERATION_ORDINAL 3u",
-            "HELIOS_PACKAGE_GENERATION_ORDINAL 2u",
         ),
         Mutation(
             "generic dispatch registration",

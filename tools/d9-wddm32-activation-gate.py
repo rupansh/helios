@@ -215,7 +215,7 @@ def check_audit(sources: dict[str, str], errors: list[str]) -> None:
         errors.append(
             f"{CLASSES}: every D9 slot must be terminal; non-terminal rows={transitional + unknown!r}"
         )
-    if counts != collections.Counter({"Disabled": 100, "Implemented": 92}):
+    if counts != collections.Counter({"Disabled": 102, "Implemented": 90}):
         errors.append(f"{CLASSES}: terminal count drifted: {dict(counts)!r}")
 
     rs = sources.get(AUDIT_RS, "")
@@ -229,8 +229,8 @@ def check_audit(sources: dict[str, str], errors: list[str]) -> None:
             errors.append(f"{AUDIT_RS}: generated layout proof missing: {fragment}")
     for fragment in (
         "Slots: **192** (plus `Version`), struct size **1544** bytes.",
-        "* `Implemented` — 92",
-        "* `Disabled` — 100",
+        "* `Implemented` — 90",
+        "* `Disabled` — 102",
         "* `Pending` — 0",
         "* `Retiring` — 0",
     ):
@@ -474,15 +474,13 @@ def check_caps_and_mpo(sources: dict[str, str], errors: list[str]) -> None:
         errors.append(
             f"{QUERY}: all three aperture generations must derive DirectFlip from D2 authority"
         )
-    bar_authority = (
-        "constDIRECT_FLIP_FLAG:u32=0x20;"
-        "letbar_flags=(knobs.bar_seg_flags&!DIRECT_FLIP_FLAG)|"
-        "ifcrate::virtio::KMD_D2_OWNER_ENABLED{DIRECT_FLIP_FLAG}else{0};"
-        "letspec=SegmentDescriptorSpec::from_bar_flags(bar_flags,"
+    local_authority = (
+        "SegmentDescriptorSpec::local(gpu_base,len,"
+        "crate::virtio::KMD_D2_OWNER_ENABLED)"
     )
-    if query_live.count(bar_authority) != 1:
+    if query_live.count(local_authority) != 1:
         errors.append(
-            f"{QUERY}: BAR DirectFlip must mask the knob bit and derive from D2 authority"
+            f"{QUERY}: local-memory DirectFlip must derive from D2 authority"
         )
 
     mpo = compact(live_rust(sources.get(MPO, "")))
@@ -796,43 +794,21 @@ def check_umd_mpo(sources: dict[str, str], errors: list[str]) -> None:
 
 
 def check_legacy_authority_closure(sources: dict[str, str], errors: list[str]) -> None:
-    guarded = (
-        (
-            DISPLAY,
-            "service_windowed_blt",
-            "if crate::virtio::KMD_D2_OWNER_ENABLED { return; }",
-        ),
-        (
-            DISPLAY,
-            "process_deferred_vidpn_source_address",
-            "if crate::virtio::KMD_D2_OWNER_ENABLED { return; }",
-        ),
-        (
-            ADAPTER_SCANOUT,
-            "queue_active_scanout_refresh",
-            "if crate::virtio::KMD_D2_OWNER_ENABLED { return ScanoutRefreshQueue::Dropped; }",
-        ),
-        (
-            SUBMIT,
-            "arm_scanout_refresh_after_current_venus",
-            "if crate::virtio::KMD_D2_OWNER_ENABLED { return; }",
-        ),
+    # K12/K13 deleted these models rather than retaining permanently disabled
+    # branches. Their names must stay absent from live KMD code, and the former
+    # adapter-owned scanout module must not return as a second plane owner.
+    retired = (
+        "service_windowed_blt",
+        "process_deferred_vidpn_source_address",
+        "queue_active_scanout_refresh",
+        "arm_scanout_refresh_after_current_venus",
     )
-    for path, name, guard in guarded:
-        function = unique_function(sources, path, name, errors)
-        if function is None:
-            continue
-        body = compact(function[1])
-        guard_at = body.find(compact(guard))
-        if guard_at < 0:
-            errors.append(f"{path}:{name}: active D9 does not locally close legacy authority")
-            continue
-        first_effect = min(
-            (position for position in (body.find("with_scanout_lifecycle("), body.find("MARKER_HISTOGRAM.note(")) if position >= 0),
-            default=len(body),
-        )
-        if guard_at > first_effect:
-            errors.append(f"{path}:{name}: legacy authority guard is not the first effect")
+    joined = "\n".join(live_rust(text) for path, text in sources.items() if path.startswith("kmd_render/src/"))
+    for name in retired:
+        if re.search(rf"\b{re.escape(name)}\b", joined):
+            errors.append(f"K12/K13 retired legacy authority returned: {name}")
+    if ADAPTER_SCANOUT in sources:
+        errors.append(f"{ADAPTER_SCANOUT}: retired parallel scanout owner returned")
     direct = unique_function(sources, LOGIC_ADMISSION, "validate_direct_scanout_binding", errors)
     if direct is not None:
         require_fragments(
@@ -1093,12 +1069,11 @@ def mutation_cases() -> tuple[Mutation, ...]:
             "}",
         ),
         Mutation(
-            "restore BAR Direct Flip knob authority",
+            "decouple local-memory Direct Flip from D2 authority",
             QUERY,
-            "    let spec = SegmentDescriptorSpec::from_bar_flags(\n"
-            "        bar_flags,",
-            "    let spec = SegmentDescriptorSpec::from_bar_flags(\n"
-            "        knobs.bar_seg_flags,",
+            "        SegmentDescriptorSpec::local(gpu_base, len, crate::virtio::KMD_D2_OWNER_ENABLED)\n"
+            "            .write_into_v4(seg)",
+            "        SegmentDescriptorSpec::local(gpu_base, len, false).write_into_v4(seg)",
         ),
         Mutation(
             "restore DirectFlipCaps activation knob",
@@ -1352,38 +1327,29 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation(
             "reopen legacy WindowedBlt authority",
             DISPLAY,
-            "    if crate::virtio::KMD_D2_OWNER_ENABLED {\n"
-            "        return;\n"
-            "    }\n"
-            "    adapter.with_scanout_lifecycle(passive, |lock| {",
-            "    adapter.with_scanout_lifecycle(passive, |lock| {",
+            'pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(\n',
+            "fn service_windowed_blt() {}\n\n"
+            'pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(\n',
         ),
         Mutation(
             "reopen legacy deferred VidPn authority",
             DISPLAY,
-            "    if crate::virtio::KMD_D2_OWNER_ENABLED {\n"
-            "        return;\n"
-            "    }\n"
-            "    let status = adapter.with_scanout_lifecycle(passive, |lock| {",
-            "    let status = adapter.with_scanout_lifecycle(passive, |lock| {",
+            'pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(\n',
+            "fn process_deferred_vidpn_source_address() {}\n\n"
+            'pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(\n',
         ),
         Mutation(
             "reopen legacy refresh queue",
-            ADAPTER_SCANOUT,
-            "        if crate::virtio::KMD_D2_OWNER_ENABLED {\n"
-            "            return ScanoutRefreshQueue::Dropped;\n"
-            "        }\n"
-            "        let outcome = self.with_scanout_lifecycle(passive, |lock| {",
-            "        let outcome = self.with_scanout_lifecycle(passive, |lock| {",
+            ADAPTER,
+            "pub struct AdapterContext {\n",
+            "fn queue_active_scanout_refresh() {}\n\npub struct AdapterContext {\n",
         ),
         Mutation(
             "reopen legacy marker refresh",
             SUBMIT,
-            "    if crate::virtio::KMD_D2_OWNER_ENABLED {\n"
-            "        return;\n"
-            "    }\n"
-            "    // Unsampled: what the app PRESENTED",
-            "    // Unsampled: what the app PRESENTED",
+            'pub unsafe extern "C" fn dxgkddi_submit_command(\n',
+            "fn arm_scanout_refresh_after_current_venus() {}\n\n"
+            'pub unsafe extern "C" fn dxgkddi_submit_command(\n',
         ),
         Mutation(
             "accept Code 0 without visible desktop",

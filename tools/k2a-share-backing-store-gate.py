@@ -545,7 +545,7 @@ def check_mdl_and_owner(sources: dict[str, str], errors: list[str]) -> None:
             "authorize_reset(verified)",
             "next_reset_action()",
             "ResourceBackingFinalizer::none()",
-            "finalize_resource_backing_after_reset(passive, finalizer,)",
+            "finalize_resource_backing_after_reset(passive, finalizer)",
             "assume_payloads_finalized()",
         ),
         errors,

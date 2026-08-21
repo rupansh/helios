@@ -1046,7 +1046,7 @@ def check_allowlist_and_completion(sources: dict[str, str], errors: list[str]) -
     submit_ddi = body(sources, SUBMIT, "dxgkddi_submit_command", errors)
     outer_start = submit_ddi.find("if let Some((native, session, _device, _outer))")
     native_start = submit_ddi.find("if let Some((native, session))")
-    legacy_start = submit_ddi.find("let present_fence =", native_start)
+    legacy_start = submit_ddi.find("arm_dma_flip(", native_start)
     if (
         outer_start < 0
         or native_start < 0
@@ -1092,7 +1092,7 @@ def check_allowlist_and_completion(sources: dict[str, str], errors: list[str]) -
             "NativeSubmitDisposition::Pending, _",
             "NativeSubmitDisposition::Revoked, _",
             "NativeSubmitDisposition::Refused, ticket",
-            "note_and_maybe_signal(adapter, fence, is_paging, None, Some(ticket))",
+            "note_and_maybe_signal(adapter, fence, is_paging, Some(ticket))",
         ),
         errors,
     )
@@ -1465,7 +1465,6 @@ def check_teardown(sources: dict[str, str], errors: list[str]) -> None:
         (
             "adapter.close_k11_completions_and_wait(passive)",
             "abandon_pending_submissions",
-            "purge_all_present_streams_ordered",
             "adapter.reopen_k11_completions()",
         ),
         errors,
@@ -1661,7 +1660,7 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("drop K11 context timeline identity", CTRL, "    cmd.hdr.flags = VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX;\n", "    cmd.hdr.flags = VIRTIO_GPU_FLAG_FENCE;\n"),
         Mutation("move K11 pure control off ring zero", CTRL, "    cmd.hdr.ring_idx = 0;\n", "    cmd.hdr.ring_idx = 1;\n"),
         Mutation("forge K11 control fence from WDDM", CTRL, "    cmd.hdr.fence_id = control_fence_id;\n", "    cmd.hdr.fence_id = SubmissionFenceId as u64;\n"),
-        Mutation("route K11 through adapter boundary queue", SUBMIT, "                        complete_k11_host_submission(adapter, ticket);\n", "                        let _ = note_and_maybe_signal(adapter, exact_fence, false, None, Some(ticket));\n"),
+        Mutation("route K11 through adapter boundary queue", SUBMIT, "                        complete_k11_host_submission(adapter, ticket);\n", "                        let _ = note_and_maybe_signal(adapter, exact_fence, false, Some(ticket));\n"),
         Mutation(
             "forge a later K11 SubmissionFenceId",
             SUBMIT,
@@ -1672,7 +1671,7 @@ def mutation_cases() -> tuple[Mutation, ...]:
             "                        guard.admit_ordered_engine_submission(fence.wrapping_add(1))\n"
             "                    })?;\n",
         ),
-        Mutation("complete revoked K11 work through legacy queue", SUBMIT, "                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, _)) | None => {\n                    // The host-completed marker belonged to a session whose\n                    // exact transport/fence authority was revoked before this\n                    // callback, or reset already closed the adapter completion\n                    // epoch. Do not forge completion through the legacy queue.\n                    SubmitAck::Accepted\n                }\n", "                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, ticket)) | None => {\n                    note_and_maybe_signal(adapter, fence, is_paging, None, Some(ticket))\n                }\n"),
+        Mutation("complete revoked K11 work through legacy queue", SUBMIT, "                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, _)) | None => {\n                    // The host-completed marker belonged to a session whose\n                    // exact transport/fence authority was revoked before this\n                    // callback, or reset already closed the adapter completion\n                    // epoch. Do not forge completion through the legacy queue.\n                    SubmitAck::Accepted\n                }\n", "                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, _)) | None => {\n                    let _ = note_and_maybe_signal(adapter, fence, is_paging, None);\n                    SubmitAck::Accepted\n                }\n"),
         Mutation("skip current session generation at submit", NATIVE, "    let disposition =\n        crate::ddi::translation_session::with_current_host_submission(session, || {\n", "    let disposition = Some({\n"),
         Mutation("drop adapter completion rundown", SUBMIT, "                .with_k11_completion(|| {\n", "                .with_k11_completion_unchecked(|| {\n"),
         Mutation("drop exact K11 completion after admission", SUBMIT, "                        complete_k11_host_submission(adapter, ticket);\n", "                        let _ = (exact_fence, ticket);\n"),
@@ -1734,7 +1733,7 @@ def mutation_cases() -> tuple[Mutation, ...]:
         Mutation("drop pair-use rundown", CTRL, "let pair = adapter\n        .control_owner()\n        .borrow_session_pair(owner, reply_resource_id, context_id)?;", "let pair = ();"),
         Mutation("release pair before HVR1 publication", TRANSPORT, "let result = match publish(facts, &evidence) {", "drop(pair);\n        let result = match publish(facts, &evidence) {"),
         Mutation("destroy context before host instance", TRANSPORT, "let destroy = pure::encode_destroy_instance(instance_handle);", "let _ = crate::virtio::ctrl::ctx_destroy_session(passive, adapter, owner, context_id);\n            let destroy = pure::encode_destroy_instance(instance_handle);"),
-        Mutation("leave K11 context attachment admission open", OWNER, "        table\n            .close_context_admission(row)\n            .map_err(owner_refusal)?;\n", ""),
+        Mutation("leave K11 context attachment admission open", OWNER, "        table.close_context_admission(row).map_err(owner_refusal)?;\n", ""),
         Mutation("release physical pool early", DEVICE, "let blobs = crate::virtio::ctrl::release_blobs_for_owner(passive, adapter, device_owner);", "let _ = crate::virtio::ctrl::release_blobs_for_owner(passive, adapter, device_owner);\n        let blobs = 0;"),
         Mutation("restore 64 MiB physical pool", PROTO_NATIVE, "pub const HELIOS_HVM1_REPLY_POOL_BYTES: u64 = 4 * 1024 * 1024;", "pub const HELIOS_HVM1_REPLY_POOL_BYTES: u64 = 64 * 1024 * 1024;"),
         Mutation("shrink logical snapshot ceiling", PROTO_NATIVE, "pub const HELIOS_HVR1_MAX_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;", "pub const HELIOS_HVR1_MAX_SNAPSHOT_BYTES: u64 = 4 * 1024 * 1024;"),

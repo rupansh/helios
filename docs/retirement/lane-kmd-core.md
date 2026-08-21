@@ -36,6 +36,21 @@ remain, and the display is runtime-unadmitted. See `FINDINGS.md` F18/F19. The
 older 2026-08-10 inventory below is retained as historical input and is
 superseded wherever it conflicts with this checkpoint, D9, K7, F18, or F19.
 
+**2026-08-21 K0/K1, K12/K13, and non-HPM1 K8/K10 checkpoint.** Root `60a9988`
+makes Escape and both CPU-host-aperture callbacks terminal NULL slots, deletes
+their implementation units plus blob map, read ledger, and `seh_shim.c`, and
+keeps `render_user_copy.c` as the bounded surviving user-copy helper. Root
+`5e1fbda` deletes the causally dependent present-stream, reverse-reader,
+mapping-table, and retired device/display/scanout/control-queue state. Root
+`ce3765a` closes admission before teardown, invalidates capabilities and
+generations before device-lost wakeup, and drains K9/session/native-fence/
+allocation/display ownership in documented reverse order. Canonical D2 parking/
+current/candidate custody, K2a `ShareBackingStoreWithKmd`, K7, K9, K11, and the
+post-K9 executor remain exact. HPM1, K2/K3, hardware queues, QEMU, new host
+protocols, and compatibility carriers remain excluded. Windows debug-warning
+and release builds plus all focused/serial gates pass; the resulting compiler
+image was not package-assembled, staged, installed, or target-exercised.
+
 ---
 
 ## 1. Normative sources

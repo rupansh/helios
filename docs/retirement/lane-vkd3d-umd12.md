@@ -3,8 +3,8 @@
 Reconnaissance brief. **No implementation code was written.** Source scope:
 `vkd3d-proton-helios/**` and `umd12/**`.
 
-Reference: `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` (**5976** lines, "the doc"
-below).
+Reference: `docs/HELIOS_PRESENT_SYNC_RETIREMENT.md` (a **5976-line frozen
+body** followed by append-only amendments, "the doc" below).
 
 ⛔ **Doc line numbers here were swept +10 on 2026-08-10 and mechanically
 verified.** The doc was 5918 when this brief was written, 5928 after commit
@@ -12,8 +12,9 @@ verified.** The doc was 5918 when this brief was written, 5928 after commit
 **appended** the SUPERSEDED CLAIMS INDEX at `:5932`. Only the banner moved
 anything: it shifted every body line after 8 by +10, so every citation written
 here before 2026-08-10 was 10 too low. All of them have now been shifted, and
-later append-only index corrections bring the current file to 5976 without
-moving any cited body line. The sweep was checked by requiring each
+later append-only index corrections bring the frozen body to 5976 without
+moving any cited body line; newer amendments follow that frozen body. The sweep
+was checked by requiring each
 `§N.M`-anchored cite to land inside
 §N.M's own heading-to-heading range — not by adding 10 on faith. ⚠ **Source-file line numbers were deliberately NOT touched** — `foo.rs:123`, `virtio-gpu-virgl.c` function ranges and the like are cites into the tree, not into the doc, and the banner never moved them. If a number here is not a doc line, it was correct before this sweep and is correct now. ⚠ The §10.3
 bullet in §1 and its `§17.5:4259-4263` cite were already corrected on 2026-08-10
@@ -44,6 +45,16 @@ checks pass; the broader native vkd3d test run encountered the separately
 reported host Vulkan device-loss/hang boundary and is not runtime evidence. No
 UMD/ICD/KMD was installed or target-exercised, and the present-layer B lane
 remains unstarted.
+
+**2026-08-21 broad-demolition audit checkpoint.** Audit of vkd3d commit
+`912a3d4d` found no remaining active Wine-Escape or `SharedGpuResource`
+transport, so no redundant nested change was made and HEAD remains `9a2716c0`.
+Root UMD12 cleanup `e7bdb0f` and `3663956` removes only reachable retired
+present/submit marker residue. Exact device-scoped outer-allocation association,
+HRA1/F21 token propagation, HWA2 identity, normal Present, Core-0116/native-
+fence ownership, and the Venus-export heap required by B5 remain. Windows
+UMD12 and the complete focused/serial gates pass. This is source/build closure
+only; no UMD, package, layer, ICD, or KMD was installed or target-exercised.
 
 ---
 

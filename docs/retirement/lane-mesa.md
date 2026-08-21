@@ -139,6 +139,20 @@ protocol 151 plus integration/parity, kmd_logic 545 plus both integrations,
 every standing gate, and 27 present-layer mutations. Broad HPS2 demolition is
 the next owner handoff, not part of this lane.
 
+**2026-08-21 broad-demolition regression checkpoint.** The later cross-repo
+tranche found no remaining Mesa-owned carrier after B0-B9, so Mesa remains
+unchanged at `8b3c9359b5a`. K14 root source, not Mesa, now packages the generated
+layer DLL/JSON separately from the four-export lower ICD and preserves the
+translator-owned A5 layer bypass. Fresh Linux-host and Windows regression builds
+pass. The rebuilt lower ICD is 49,251,322 bytes / SHA-256
+`89F7F0A2FDA0A872CC9971C012A828C936E903E15159E277D9FB30B9CDBE8943`, with
+the same exact four exports and forbidden-dependency boundary. The unchanged
+layer is 3,314,217 bytes / SHA-256
+`0260E5AE530B4DAA0346F3AE2D4DAA53215E88C71486A8FFD57C12420CD73712`, with
+the same exact eight exports, permitted `d3d12.dll`/`dxgi.dll` imports, and no
+`vulkan-1.dll`. These are build-provenance facts only; no layer or ICD was
+registered, installed, or target-exercised.
+
 Reconnaissance brief. No implementation code was written. Every line/symbol
 reference below was re-verified against the working tree at
 `icd/mesa` commit `8559b66299a8f91fcde30edfdd23310195cc7ca6` — the same commit

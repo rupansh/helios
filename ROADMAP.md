@@ -79,11 +79,13 @@ successful K2a/K11 target exercises:
 | Outer UMD/KMD execution | D3D11 owns a bounded device allocation set and resolves each token to its exact Render allocation-list index with current HWA2 generation; D3D12 resolves it to exact current GPUVA plus offset and generation. Both own HQA1/HQC1 context lifetime and emit field-by-field HOB1; D3D12 also emits exact HOS1. KMD validates the generated A7 subset, patches only its private copy, executes on the existing session endpoint, and completes through K9. | Protocol support `ccd2891`; minimum generated KMD admission `eccfd19`; K4 const-open/shared-backing follow-up `d75f649`; UMD11/12 `0fe5677`. Source/build validated only; the installed KMD remains unchanged. |
 | Mesa A6-A9 | The fail-closed A6 profile is preserved; A7 now classifies control/deferred/GPU-dependent work and emits complete exact-token use and typed-operand closure with zero wire host-resource bytes. A8 makes the selected Windows generic-ring operations unreachable and folds replies into exact HNR2 COMMIT. A9 prunes the lower-ICD build without wiring the present layer. | Mesa A6 `d07d1d13687` + `478c71a0fff`; A7 `ae9c9f4c89d`; A8/A9 `fa61439bfd7`. Source/build validated only; no ICD was installed or exercised. |
 | `VK_LAYER_HELIOS_present` B0-B9 | Mesa's HPS2 WSI writer is gone; the separate layer owns the loader/dispatch, exact-LUID D3D12/DXGI image graph, Vulkan-exported Ready/Release timelines, nine-state acquire/present machine, alias lifetime, retirement, and generated manifest. The lower ICD remains separate and escape-free. | Mesa B0 `bb7a787a5a1`; B1-B5 `e06abf3025f`; B6 `11d723ea10b`; B7/B8 `51054338012`; B9 `871c62bf8a0`; bounded review fix `8b3c9359b5a`. Source/build validated only; the layer was not registered, installed, or target-exercised. |
+| Broad HPS2 source demolition and K14 | DXVK/UMD HPS2 and reverse-reader producers/consumers, KMD Escape/HAP/read-ledger/present-stream state, obsolete protocol/host carriers, and source packaging assumptions are gone. K8/K10 retain the D9/K2a/K7/K9/K11 graph and reverse teardown. | DXVK `418f5745`; root `b955a2c`, `60a9988`, `5e1fbda`, `e7bdb0f`, `3663956`, `e96b304`, `ce3765a`, `5901f55`, and K14 `dcf0e1e`. Generation 4 / KMD 22.22.297.0 package source requires one complete lower/layer/UMD payload. Source/build validated only; no package was assembled, installed, registered, or target-exercised. |
 
-**THE VK_LAYER_HELIOS_PRESENT B-LANE SOURCE CUTOVER LANDED AND PASSED
-SOURCE/BUILD VALIDATION ONLY; IT WAS NOT REGISTERED, INSTALLED, OR EXERCISED
-ON THE TARGET, THE WDDM 3.2 DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED, AND
-BROAD HPS2 RETIREMENT AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**
+**THE BROAD HPS2 SOURCE DEMOLITION LANDED AND PASSED SOURCE/BUILD VALIDATION
+ONLY; NO RETIREMENT PACKAGE OR PRESENT LAYER WAS INSTALLED, REGISTERED, OR
+EXERCISED ON THE TARGET, THE WDDM 3.2 DISPLAY PACKAGE REMAINS
+RUNTIME-UNADMITTED, AND RUNTIME HPS2 RETIREMENT AND PRODUCTION CORRECTNESS ARE
+NOT ESTABLISHED.**
 
 **AUTHORIZED F21 CONSUMER CUTOVER AND MESA A7-A9 LANDED (2026-08-21).** The
 owner expanded the prior lower-ICD-only boundary to the bounded direct DXVK/
@@ -103,8 +105,9 @@ unclassified state. A8 retires only the selected Windows generic-ring path;
 generic non-Windows Venus remains. A9 completes the lower-ICD wiring and keeps
 the present layer unwired. The minimum generated KMD decoder admits only the
 required A7 subset over existing HNR2 and adds no host/QEMU protocol or executor.
-This checkpoint stops before `VK_LAYER_HELIOS_present`, broad HPS2 demolition,
-packaging, deployment, or target exercise.
+That historical checkpoint stopped before `VK_LAYER_HELIOS_present`, broad
+HPS2 demolition, packaging, deployment, or target exercise. The current table
+and the broad-demolition checkpoint below supersede that stop boundary.
 
 **`VK_LAYER_HELIOS_present` LOADS, RUNS, and now BUILDS A WSI DEVICE**
 (`FINDINGS.md` F7 + its two addenda). Staged by
@@ -1144,6 +1147,77 @@ touched, and no restart, reboot, VNC, cold-DWM, or target runtime probe ran.
 The next handoff is broad HPS2 demolition in its separately owned repositories;
 it is not part of this cutover.
 
+#### ⭐ Broad HPS2 source-demolition and K14 checkpoint (2026-08-21)
+
+The separately authorized demolition is now source-closed. DXVK `418f5745`
+deletes its HPS2 publisher/lookup/reclaim and scanout-acquire machinery and all
+active-package private Escape/`SharedGpuResource` transport in D3D9, D3D11,
+and Win32 WSI. Root `b955a2c` removes the UMD11 vehicle, raw-resid snapshot,
+named-present-fence, scanout-acquire, and publication paths while retaining
+ordinary Present, exact allocation ownership, standard KMT sharing, and the
+direct translator graph. The vkd3d audit found no remaining carrier after
+`912a3d4d`, so its HEAD remains `9a2716c0`; Mesa remains at the complete B-lane
+HEAD `8b3c9359b5a`.
+
+KMD `60a9988` makes Escape, MapCpuHostAperture, and UnmapCpuHostAperture terminal
+NULL slots and deletes the Escape/blob/HAP/read-ledger implementations, their
+SEH shim and build reachability. `5e1fbda` removes the causally dependent
+present-stream, reverse-reader, mapping-table, device/display/scanout/control-
+queue state while retaining `render_user_copy.c`, canonical D2 plane custody,
+K2a backing, K7 fences, K9 completion, K11 session transport, and the post-K9
+executor. UMD12 cleanup `e7bdb0f`/`3663956` and protocol cleanup `e96b304`
+remove only unreachable retired carriers; F21 outer-token association, HRA1,
+HWA2/HVM1/HQA1/HNR2/HOB1/HOS1/HNF1, UMD12 identity and Venus-export heap
+ownership remain intact.
+
+The non-HPM1 K8/K10 closure is `ce3765a`: capabilities remain surface-derived,
+K2a `ShareBackingStoreWithKmd` remains advertised, admission closes before
+teardown, capability generations invalidate before device-lost wakeup, and
+K9/session/native-fence/allocation/display ownership drains in documented
+reverse order. No HPM1, K2/K3, hardware queue, QEMU, virglrenderer, new host
+protocol, or compatibility carrier was opened. Host cleanup `5901f55` removes
+the final source-side HPS2 creator/ACL/verification assumptions without deleting
+any live machine file.
+
+K14 `dcf0e1e` advances the source package exactly once to generation 4 and KMD
+22.22.297.0. The manifest requires one generation-matched payload containing
+both UMDs, the four-export lower ICD, and the separate eight-export present
+layer plus generated manifest. The installer source rewrites the manifest to
+the exact installed layer DLL path and preserves the translator-owned A5 layer
+bypass; it has no HPS2 creation, ACL, mapper, or legacy-file deletion path.
+Package assembly, installer execution, registry mutation, and ProgramData
+cleanup were deliberately not run.
+
+Focused demolition, K8/K10, and K14 gates reject 11, 8, and 12 in-memory
+mutations. The final serial suite passed once with protocol 113 unit tests plus
+integration/parity, kmd_logic 402 unit tests plus both integrations, all
+standing D9/K2a/K7/K9/K11/post-K9/F21/A3-A9/B-lane gates, and every new gate.
+Windows UMD11/UMD12/KMD release builds, the KMD warning/binding checks, DXVK
+Linux/Windows builds, and Mesa Linux-host/Windows builds passed. The one bounded
+ordinary review found one validation omission, then extended the demolition
+gate to headers, export files, and build inputs; no production-code defect or
+second review loop followed.
+
+Current shipping-build provenance is: `helios_umd.dll` 6,529,536 bytes /
+SHA-256 `41C7B2D49C59E015753E8167F0447A5B107492A1CDFA95F8EF5509B08766D03A`;
+`helios_umd12.dll` 4,651,520 bytes /
+`8A84C5D9180EBA40883BFE29E7ED66CB180EB1EAD5C97C677E66305EDB20481E`;
+the compiler-linked release KMD image (not package-assembled or renamed to
+`.sys`) 793,088 bytes /
+`C15D6EA23BC594842333A9AE4C20A238BEB61DC3832FE5D2428103139F83C72D`;
+`vulkan_virtio.dll` 49,251,322 bytes /
+`89F7F0A2FDA0A872CC9971C012A828C936E903E15159E277D9FB30B9CDBE8943`;
+and `VkLayer_HELIOS_present.dll` 3,314,217 bytes /
+`0260E5AE530B4DAA0346F3AE2D4DAA53215E88C71486A8FFD57C12420CD73712`.
+Export, dependency, object, and retired-string scans pass their exact lower/
+layer/UMD/KMD boundaries. These are build facts only.
+
+No retirement package or layer was assembled, installed, registered, or
+exercised; no target binary was replaced; and no adapter restart, reboot, VNC,
+cold-DWM, or target probe ran. The installed target therefore remains KMD
+22.22.296.0 / `oem128.inf`, DWM on WARP, and zero active DisplayConfig paths.
+Visible cold-DWM admission remains the next separately authorized boundary.
+
 #### ⭐ THE CRITICAL PATH IS NOW THE DISPLAY LANE — decided 2026-08-11 by the owner
 
 *"no probing or hacks, we go the proper way, i dont care if I dont see the desktop
@@ -1151,9 +1225,10 @@ immediately."* K2a's CPU view is reached by earning the WDDM 3.2 surface, not by
 another placement experiment or an instrument (`FINDINGS.md` F17). The sequence is
 `lane-kmd-display.md`'s own dependency graph, and it ends where K2a resumes:
 
-Rows 1-11 preserve the evidence at each precursor checkpoint. Row 12 is the
-authoritative current source/build state and supersedes their dormant/false-boundary
-statements without changing the display-admission result.
+Rows 1-11 preserve the evidence at each precursor checkpoint. Rows 12-14 carry
+the authoritative direct-consumer, present-layer, and broad-demolition
+source/build state and supersede their dormant/false-boundary statements without
+changing the display-admission result.
 
 | # | Unit | Why it is on THIS path | State |
 |---|---|---|---|
@@ -1170,23 +1245,28 @@ statements without changing the display-admission result.
 | 11 | **Mesa A5/A6; F21 stop** | Expose only the fixed direct record-only interface and prepare the exact lower profile before closing all allocation use/operand identity. | **HISTORICAL SOURCE/BUILD CHECKPOINT** at Mesa `4ea18b3512f` + `d07d1d13687` + review fix `478c71a0fff`. It correctly stopped at the then-unauthorized outer-token producer boundary and is superseded by row 12. |
 | 12 | **F21 direct consumers, outer UMD/KMD, Mesa A7-A9** | Carry the exact outer allocation token from its UMD owner through DXVK/vkd3d into Mesa, resolve it back to current WDDM identity at submission, then close A7 and retire only the selected Windows ring/build path. | **LANDED; SOURCE/BUILD-VALIDATED ONLY.** Protocol `eec9564` + `ccd2891`, KMD `eccfd19` + K4 follow-up `d75f649`, DXVK `1cf7e631`, vkd3d `9a2716c0`, UMD11/12 root `0fe5677`, Mesa A7 `ae9c9f4c89d`, and A8/A9 `fa61439bfd7`. The fixed A5 table is unchanged; no generic registry/fallback or new host carrier exists. Nothing was installed or target-exercised, and the present-layer B lane is the stop-boundary handoff. |
 | 13 | **`VK_LAYER_HELIOS_present` B0-B9** | Remove the Mesa HPS2 WSI writer and move native Win32 WSI into the separate, acyclic layer using the landed A5-A9 lower contract and F8-correct fence direction. | **LANDED; SOURCE/BUILD-VALIDATED ONLY.** Mesa `bb7a787a5a1`, `e06abf3025f`, `11d723ea10b`, `51054338012`, `871c62bf8a0`, plus bounded review fix `8b3c9359b5a`. The layer and lower ICD build as separate DLLs with their exact export/dependency boundaries. Nothing was registered, installed, or target-exercised; broad HPS2 demolition remains the handoff. |
+| 14 | **Broad HPS2 demolition, K1/K8/K10/K14** | Delete every active HPS2/reverse-reader/Escape/private-sharing carrier after the direct and present graphs exist, then source-activate one coherent retirement package. | **LANDED; SOURCE/BUILD-VALIDATED ONLY.** DXVK `418f5745`; root UMD/KMD/protocol/lifecycle/host/K14 commits `b955a2c`, `60a9988`, `5e1fbda`, `e7bdb0f`, `3663956`, `e96b304`, `ce3765a`, `5901f55`, `dcf0e1e`; vkd3d and Mesa unchanged after audit. Generation 4 / KMD 22.22.297.0 source is coherent and all focused/serial gates and affected builds pass. No package was assembled, installed, registered, or target-exercised. |
 
 ⚠ **The desktop stays dark for most of this**, by the owner's explicit acceptance.
 D9, K2a, and K11 have crossed their source and exact-target runtime boundaries;
-the post-K9 executor, Mesa A3-A9 direct-consumer cutover, and present-layer
-B0-B9 cutover have crossed source/build only. The display
+the post-K9 executor, Mesa A3-A9 direct-consumer cutover, present-layer B0-B9,
+and broad HPS2/K1/K8/K10/K14 cutover have crossed source/build only. The display
 therefore remains runtime-unadmitted. The last measured target still selected
 the old installed ICD path, fell back to WARP before a primary was programmed,
 and reported zero active paths. Escape must not be restored. This tranche stops
-after the complete B lane before broad HPS2 demolition; neither this
+after source demolition and package-source activation, before any package
+assembly, installation, registration, or runtime exercise; neither this
 source/build evidence nor the historical target evidence evaluates the new path.
 Only visible DWM startup on WDDM 3.2 admits the surface; a build, callback count,
 Code 0, counter, map result, or log cannot. F1 permits the measured build-26100
 target; WDK 28000 remains the compile-time header/binding authority.
 
-4. **Delete the 29 dead symbols in `protocol/src/wddm_legacy.rs`** — see the
-   correction below before touching it. Not on the critical path.
-5. **K1 (demolition), K3** — and `SURFACE` last of all (`OWNERSHIP.md` §3).
+4. **Protocol dead-carrier cleanup is source-closed** at `e96b304`; surviving
+   legacy declarations remain only where a current HWA2/HVM1/HQA1/HNR2/HOB1/
+   HOS1/HNF1 or released-platform contract still owns them.
+5. **K1 and the non-HPM1 K8/K10 remainder are source-closed** at `60a9988`,
+   `5e1fbda`, and `ce3765a`. K2/K3/HPM1 and runtime admission remain outside
+   this tranche.
 
 #### What round 4's 8 code defects were, since they are the class worth repeating
 

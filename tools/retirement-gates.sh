@@ -973,6 +973,15 @@ run_gate "K9 one-engine completion frontier is ordered, host-terminal, reset-clo
 run_gate "Post-K9 HVM1/Venus executor is bounded, direct-owned, host-terminal, and mutation-checked" \
     python3 "$REPO/tools/post-k9-executor-gate.py" "$REPO" --mutations
 
+run_gate "Broad HPS2, Escape, reverse-reader, private-IOCTL, and installer carriers are demolished" \
+    python3 "$REPO/tools/hps2-demolition-gate.py" "$REPO"
+
+run_gate "K8 caps and K10 lifecycle are deterministic, non-HPM1, and reverse-order closed" \
+    python3 "$REPO/tools/k8-k10-lifecycle-gate.py" "$REPO"
+
+run_gate "K14 package generation, complete payload, and lower/layer activation source are coherent" \
+    python3 "$REPO/tools/k14-package-gate.py" "$REPO"
+
 run_gate "A7 generated Venus schema is pinned, parse-only, privately patched, and mutation-closed" \
     python3 "$REPO/tools/venus-executor-schema-gate.py" "$REPO" --mutations
 

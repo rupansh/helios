@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static and mutation gate for the active HPS2 D5 MPO Present arm."""
+"""Static and mutation gate for the active ordinary D5 MPO Present arm."""
 
 from __future__ import annotations
 
@@ -82,12 +82,10 @@ CALL_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
             "is_aligned",
             "is_current",
             "is_null",
-            "is_valid",
             "new",
             "open_allocation_identity",
             "open_direct_scanout_allocation_facts",
             "output_capacity",
-            "size_of",
         }
     ),
     (PACKET, "emit_mpo_present"): frozenset({"as_ptr", "cast", "write_unaligned"}),
@@ -101,7 +99,6 @@ QUALIFIED_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
     (PACKET, "prepare_mpo_present"): frozenset(
         {
             "NonNull::new",
-            "core::mem::size_of",
             "crate::adapter::allocation_object::is_current",
             "crate::ddi::create_allocation::open_allocation_identity",
             "crate::ddi::create_allocation::open_direct_scanout_allocation_facts",
@@ -293,12 +290,9 @@ def check_sources(sources: dict[str, str]) -> list[str]:
             if fragment not in prepare_compact:
                 errors.append(f"{PACKET}: complete D5 output capacity proof missing: {fragment}")
         command_fragments = (
-            "HeliosPresentRefreshCmd{",
-            "source_index:0",
-            "destination_index:0",
-            "present_ctx_id:0",
-            "present_value:0",
-            "present_cookie:0",
+            "letSome(next_dma_address)=(args.pDmaBufferasusize).checked_add(dma_bytes)else{",
+            "dma:args.pDmaBuffer",
+            "next_dma:next_dma_addressas*mutc_void",
         )
         for fragment in command_fragments:
             if fragment not in prepare_compact:
@@ -371,6 +365,7 @@ def check_sources(sources: dict[str, str]) -> list[str]:
         "display_lease",
         "PresentFlipPrivate::write",
         "PresentSubmissionPrivate",
+        "DXGK_PRESENT_SOURCE_INDEX",
     )
     for spelling in forbidden:
         if spelling in d5_function_live:
@@ -774,8 +769,13 @@ def main() -> None:
     require_rejected("private HPS ticket packet", private_packet, "private HPS/ticket/lookup")
     require_rejected(
         "classic allocation index forced onto MPO",
-        replace_once(sources, PACKET, "source_index: 0,", "source_index: DXGK_PRESENT_SOURCE_INDEX,"),
-        "ordinary MPO packet contract drifted",
+        inject_function(
+            sources,
+            PACKET,
+            "prepare_mpo_present",
+            " let _ = DXGK_PRESENT_SOURCE_INDEX; ",
+        ),
+        "DXGK_PRESENT_SOURCE_INDEX",
     )
     require_rejected(
         "D4 flip record minted by MPO Present",
@@ -821,15 +821,15 @@ def main() -> None:
         "complete D5 output capacity proof missing",
     )
     require_rejected(
-        "packet construction validation removed",
+        "packet construction overflow check removed",
         replace_in_function(
             sources,
             PACKET,
             "prepare_mpo_present",
-            "if !command.is_valid() {",
-            "if false {",
+            "let Some(next_dma_address) = (args.pDmaBuffer as usize).checked_add(dma_bytes) else {",
+            "let next_dma_address = (args.pDmaBuffer as usize).wrapping_add(dma_bytes); if false {",
         ),
-        "D5 call surface drifted",
+        "ordinary MPO packet contract drifted",
     )
     require_rejected(
         "stale allocation epoch accepted",
@@ -889,7 +889,7 @@ def main() -> None:
 
     print(
         "OK: active D5 MPO Present guard, exact one-plane allocation provenance, "
-        "ordinary packet, no-lease closure, D4 proof, and mutations are enforced"
+        "ordinary zero-marker packet, no-lease closure, D4 proof, and mutations are enforced"
     )
 
 

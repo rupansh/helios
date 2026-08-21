@@ -6077,3 +6077,70 @@ separate future ownership boundaries.
 SOURCE/BUILD VALIDATION ONLY; IT WAS NOT REGISTERED, INSTALLED, OR EXERCISED
 ON THE TARGET, THE WDDM 3.2 DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED, AND
 BROAD HPS2 RETIREMENT AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**
+
+## 2026-08-21 append-only broad HPS2 source-demolition amendment
+
+F5, F18-F23, the landed A3-A9/B0-B9 graph, and the current lane checkpoints
+override the frozen K1/K8/K10/K12/K13/K14 inventories without moving any
+load-bearing body line above. The owner authorized and source-closed one bounded
+cross-repository demolition tranche; this amendment records its end state.
+
+* **DXVK and UMD11:** DXVK `418f5745` deletes the HPS2 publisher/lookup/reclaim,
+  gate-flush and scanout-acquire/event/thread/watchdog graph, plus every shipped
+  D3D9/D3D11/Win32-WSI private Escape and `SharedGpuResource` transport. Root
+  `b955a2c` deletes UMD11 vehicle, raw-resid snapshot, present-stream, named-
+  present-fence, reverse-reader, publication/discovery, and configuration state.
+  Ordinary DXGI Present, standard KMT sharing, exact runtime allocation
+  ownership, and the direct translator graph remain.
+* **K0/K1 and K12/K13:** root `60a9988` keeps Escape and both CPU-host-aperture
+  callbacks NULL and deletes Escape, blob-map, HAP, read-ledger, `seh_shim.c`,
+  build inputs, mappings, counters, and rundown. Root `5e1fbda` deletes the
+  causally dependent present-stream/reverse-reader state from device, display,
+  scanout, control queue, submit, counters, and logic. `render_user_copy.c`, the
+  canonical D2 parking/current/candidate graph, K2a, K7, K9, K11, and post-K9
+  executor remain.
+* **Protocol and D3D12:** root `e7bdb0f`/`3663956` removes only reachable UMD12
+  retired residue; `e96b304` deletes dead private Escape/IOCTL/HPS2/read-ledger/
+  present-stream declarations after their consumers. vkd3d `912a3d4d` had
+  already removed its active transports, so vkd3d remains `9a2716c0`. HWA2,
+  HVM1, HQA1, HNR2, HOB1/HOS1, HNF1, HRA1, UMD12 identity, exact outer-token
+  association, and the Venus-export heap remain.
+* **K8/K10:** root `ce3765a` retains exact StartDevice LUID publication,
+  surface-derived native-fence admission, and K2a shared-backing facts. It closes
+  admission before teardown, invalidates capability generations before device-
+  lost wakeup, and drains K9/session/native-fence/allocation/display ownership in
+  reverse order. No HPM1, K2/K3, BAR/paging-DMA/C64, hardware queue, QEMU,
+  virglrenderer, host protocol, or compatibility carrier was opened.
+* **Host cleanup and K14:** root `5901f55` removes every source creator/ACL/
+  verifier/install-state assumption for the HPS2 ProgramData mapping without a
+  machine-side deletion. K14 `dcf0e1e` advances generation 3 → 4 and KMD
+  22.22.296.0 → 22.22.297.0 exactly once. Source now requires one complete,
+  generation-matched payload with both UMDs, the lower ICD, and separate layer
+  DLL/generated manifest; it retains translator A5 bypass. Package assembly,
+  installation, registry changes, layer registration, and ProgramData cleanup
+  were not executed.
+* **Gates and review:** the new demolition, K8/K10, and K14 gates reject 11, 8,
+  and 12 in-process mutations and are integrated exactly once. The final serial
+  suite passed once with protocol 113 plus integration/parity, kmd_logic 402 plus
+  both integrations, every standing D9/K2a/K7/K9/K11/post-K9/F21/A3-A9/B-lane
+  gate, and all new gates. A single bounded ordinary review extended the
+  demolition scan from implementation units to headers, export files, and build
+  inputs; no production defect or second review loop followed.
+* **Build boundary:** DXVK Linux/Windows, UMD11/UMD12 Windows, KMD Windows
+  debug-warning/release, and Mesa Linux-host/Windows builds pass. The rebuilt
+  shipping artifacts and their exact sizes, hashes, exports, dependencies,
+  object reachability, and zero retired-string results are recorded in
+  `retirement/FINDINGS.md` F23. They establish provenance only.
+
+No package was assembled, installed, or staged; no layer was registered; no
+target UMD, ICD, KMD, or manifest was replaced; and no adapter restart, reboot,
+VNC, cold-DWM, or target runtime probe occurred. The installed target remains
+KMD 22.22.296.0 / `oem128.inf`, with DWM on WARP and zero active DisplayConfig
+paths as the last measured state. Visible runtime admission remains a separate
+owner boundary.
+
+**THE BROAD HPS2 SOURCE DEMOLITION LANDED AND PASSED SOURCE/BUILD VALIDATION
+ONLY; NO RETIREMENT PACKAGE OR PRESENT LAYER WAS INSTALLED, REGISTERED, OR
+EXERCISED ON THE TARGET, THE WDDM 3.2 DISPLAY PACKAGE REMAINS
+RUNTIME-UNADMITTED, AND RUNTIME HPS2 RETIREMENT AND PRODUCTION CORRECTNESS ARE
+NOT ESTABLISHED.**

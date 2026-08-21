@@ -210,6 +210,50 @@ future installation/registration; runtime owners still own adapter restart,
 reboot, and cold-DWM admission. Broad DXVK/UMD/installer HPS2 deletion and
 K1/K8/K10/K14 remain the next handoff and were not started.
 
+**Broad HPS2 demolition authorization and landed ownership, 2026-08-21.** The
+owner subsequently authorized one bounded cross-repository source/build tranche
+through K14. DXVK exclusively owned deletion of its HPS2 publisher/reclaimer,
+scanout-acquire state, and shipped private Escape/`SharedGpuResource` call sites;
+that tree landed at `418f5745`. The root UMD11 owner deleted its matching
+vehicle, snapshot, reverse-reader, named-fence, publication, and discovery state
+at `b955a2c`. vkd3d's live audit proved `912a3d4d` had already removed the
+authorized carriers, so it remains unchanged at `9a2716c0`. Mesa's complete
+lower/present graph remains unchanged at `8b3c9359b5a`.
+
+KMD core exclusively owned K0/K1 and the causally required K12/K13 cleanup at
+`60a9988` and `5e1fbda`. Its callback table keeps Escape, MapCpuHostAperture,
+and UnmapCpuHostAperture NULL; their implementations, read ledger, present
+stream, reverse-reader mappings, and SEH build input are gone. The same owner
+retains the canonical D2 candidate/current/parking graph, K2a shared-backing
+references, K7 fence state, K9 completion frontier, K11 session transport, and
+post-K9 executor. No other lane may replace the deleted graph with an IOCTL,
+file, registry, name, ticket, shared page, raw resource ID, polling thread, or
+process-global table.
+
+Protocol owned dead-carrier deletion at `e96b304` only after all active users
+were gone. UMD12 owned the narrow reachable cleanup at `e7bdb0f` and `3663956`.
+Those owners continue to preserve HWA2, HVM1, HQA1, HNR2, HOB1/HOS1, HNF1,
+HRA1, the exact outer-allocation association, UMD12 identity, and the Venus-
+export heap needed by the present layer. K8/K10 lifecycle ownership landed at
+`ce3765a` and may expose only the current D9/K2a/K7/K9/K11 non-HPM1 facts. HPM1,
+K2/K3, hardware queues, QEMU, virglrenderer, new protocols, and compatibility
+carriers remain outside every owner in this tranche.
+
+Host-tool ownership `5901f55` removes the HPS2 creator/ACL/verifier assumptions
+without deleting a live machine file. Packaging owns only the source activation
+in K14 `dcf0e1e`: generation 4 / KMD 22.22.297.0 requires one complete,
+generation-matched lower/layer/both-UMD payload and preserves the translator A5
+bypass. That commit confers no authority to assemble a package, run an
+installer, change ProgramData or registry state, stage a driver, or register a
+layer.
+
+The final integration owner adds each focused gate exactly once, records the
+DXVK pointer, and updates the retirement handoff. The landed stop boundary is
+source/build validation. Installation/registration, adapter restart, reboot,
+VNC/cold-DWM, and target runtime admission remain separately owned and were not
+exercised. Visible DWM on the WDDM 3.2 package—not a build, hash, Code 0,
+counter, or ordered completion—is still the admission authority.
+
 ## 4. Orchestrator decision: the private direct-dispatch ABI has one home
 
 Three lanes independently reported this as unspecified (mesa A3, dxvk 6.14,

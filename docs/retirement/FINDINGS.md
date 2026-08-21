@@ -2213,3 +2213,98 @@ handoff is broad HPS2 demolition; it was not started.
 SOURCE/BUILD VALIDATION ONLY; IT WAS NOT REGISTERED, INSTALLED, OR EXERCISED
 ON THE TARGET, THE WDDM 3.2 DISPLAY PACKAGE REMAINS RUNTIME-UNADMITTED, AND
 BROAD HPS2 RETIREMENT AND PRODUCTION CORRECTNESS ARE NOT ESTABLISHED.**
+
+## F23 — Broad HPS2 demolition is source-closed through K14; runtime retirement remains unmeasured.
+
+**Landed source boundary, 2026-08-21.** The owner-authorized bounded tranche
+closed the remaining active HPS2/reverse-reader graph without adding a successor
+carrier. DXVK `418f5745` deletes `dxvk_helios_present_sync`, scanout-acquire,
+gate-flush/reclaim/watchdog state, and every shipped D3D9/D3D11/Win32-WSI use
+of the Helios private Escape and `SharedGpuResource` device. Root `b955a2c`
+deletes UMD11 scanout-acquire, vehicle, raw-resid snapshot, present-stream,
+named-present-fence, publication, export-discovery, and configuration state.
+Ordinary DXGI Present, standard KMT resource/fence sharing, exact runtime
+allocation ownership, and the direct translator remain.
+
+KMD K0/K1 landed in `60a9988`: `DxgkDdiEscape`,
+`DxgkDdiMapCpuHostAperture`, and `DxgkDdiUnmapCpuHostAperture` are terminal NULL
+slots, and the Escape, blob-map, CPU-host-aperture, read-ledger, and `seh_shim.c`
+implementations and build inputs are deleted. `render_user_copy.c` remains the
+bounded Render-copy helper. The causally required K12/K13 cleanup `5e1fbda`
+deletes present-stream, reverse-reader, user-mapping/mapping-table, and retired
+device/display/scanout/control-queue state. It retains canonical D2 candidate/
+current/parking custody, K2a shared backing, K7 native fences, K9 terminal
+ordering, K11 per-session transport, and the bounded post-K9 executor.
+
+UMD12 commits `e7bdb0f` and `3663956` remove only its reachable retired
+submission residue. Protocol `e96b304` deletes dead Escape/private-IOCTL/HPS2/
+read-ledger/present-stream declarations after their last consumers disappear.
+The current HWA2/HVM1/HQA1/HNR2/HOB1/HOS1/HNF1 contracts, HRA1 outer-token
+association, fixed 112-byte A5 dispatch, UMD12 identity, and D3D12 Venus-export
+heap ownership remain. Audit of vkd3d `912a3d4d` proved that its active Wine-
+Escape and `SharedGpuResource` carriers were already gone, so vkd3d stays at
+`9a2716c0`; the complete Mesa lower/present graph stays at `8b3c9359b5a`.
+
+**K8/K10 and K14.** Root `ce3765a` closes the current non-HPM1 caps/lifecycle
+remainder. StartDevice LUID publication and native-fence admission remain
+surface-derived; K2a `ShareBackingStoreWithKmd` remains; stop/remove/reset close
+admission before teardown, invalidate capabilities/generations before device-
+lost wakeup, and drain K9/session/native-fence/allocation/display ownership in
+the documented reverse order. No HPM1 caps, BAR/paging-DMA/C64 work, hardware
+queue, QEMU/virglrenderer change, new host protocol, or compatibility carrier
+was introduced. Host cleanup `5901f55` removes every source creator/ACL/verifier
+assumption for `C:\ProgramData\Helios\helios_present_sync_v2.bin` and contains no
+legacy-file deletion action.
+
+K14 `dcf0e1e` advances package generation exactly once, from ordinal 3 to 4,
+and KMD version exactly once, from 22.22.296.0 to 22.22.297.0. Package source
+requires one schema-2, generation-matched payload containing both UMDs, the
+four-export lower ICD, and the separate eight-export layer plus generated JSON.
+It rejects missing and duplicate payload members, rewrites and hashes the layer
+manifest against the exact installed DLL path before registration, and retains
+the translator-owned A5 bypass. Package assembly and every installer/registry/
+ProgramData action remained unexecuted.
+
+**Focused and serial validation.** The demolition, K8/K10, and K14 gates reject
+11, 8, and 12 in-process mutations. The demolition gate distinguishes released
+WDK declarations and archived evidence from active outbound carriers and scans
+implementation units, headers, `.def` files, and build inputs. The final serial
+`tools/retirement-gates.sh` run passed exactly once after focused validation:
+protocol 113 unit tests plus integration/parity, kmd_logic 402 unit tests plus
+both integrations, D9 73, K2a 62, K11 62, K9 42, post-K9 45, K7 35, A3 31,
+A4 42, A5 20, A6 34, F21 19, A7 18, A8/A9 16, B lane 27, and every other
+standing gate. DXVK Linux/Windows, UMD11/UMD12 Windows release, KMD Windows
+debug-warning/release, and Mesa Linux-host/Windows builds passed. Protocol C-
+mirror parity and compilation passed. KMD release emitted the same two current
+generated-audit dead-field warnings and no build error.
+
+The one bounded ordinary review found one validation gap rather than a
+production defect: the new demolition gate initially omitted headers, export
+files, and build-input references. Those surfaces and two new mutations were
+added before the serial run. No adversarial or rotating-lens review followed.
+
+**Final rebuilt artifact provenance.** Every listed retired-string scan was
+zero. The release KMD link map contains only the five surviving bounded
+`helios_render_user_copy` symbols and no `seh_shim`, Escape, blob-map,
+CPU-host-aperture, or read-ledger object.
+
+| Artifact | Bytes | SHA-256 | Exports and dependencies |
+|---|---:|---|---|
+| `helios_umd.dll` | 6,529,536 | `41C7B2D49C59E015753E8167F0447A5B107492A1CDFA95F8EF5509B08766D03A` | 152 exports: 149 `cxxbridge1$...` names plus `DllMain`, `OpenAdapter10`, `OpenAdapter10_2`. Imports `ADVAPI32.dll`, `api-ms-win-core-synch-l1-2-0.dll`, `bcryptprimitives.dll`, `GDI32.dll`, `kernel32.dll`, `ntdll.dll`, `OLEAUT32.dll`, `SETUPAPI.dll`, `USER32.dll`, `vulkan_virtio.dll`. |
+| `helios_umd12.dll` | 4,651,520 | `8A84C5D9180EBA40883BFE29E7ED66CB180EB1EAD5C97C677E66305EDB20481E` | 156 exports: 149 `cxxbridge1$...`, `DllMain`, `OpenAdapter12`, and five `helios_umd12_probe_*_v1` entry points. Imports `ADVAPI32.dll`, `api-ms-win-core-synch-l1-2-0.dll`, CRT convert/environment/heap/math/runtime/stdio/string/utility API sets, `GDI32.dll`, `kernel32.dll`, `MSVCP140.dll`, `ntdll.dll`, `oleaut32.dll`, `VCRUNTIME140.dll`, `VCRUNTIME140_1.dll`, `vulkan_virtio.dll`; no DXGI, D3D12, or `vulkan-1.dll`. |
+| release compiler-linked `helios_kmd_render.dll` | 793,088 | `C15D6EA23BC594842333A9AE4C20A238BEB61DC3832FE5D2428103139F83C72D` | File/product version 22.22.297.0; exports `DriverEntry`, `__CxxFrameHandler3`, `__CxxFrameHandler4`, `__GSHandlerCheck_EH4`, `_fltused`; imports only `ntoskrnl.exe`. This compiler image was not package-assembled or renamed to `.sys`. |
+| `vulkan_virtio.dll` | 49,251,322 | `89F7F0A2FDA0A872CC9971C012A828C936E903E15159E277D9FB30B9CDBE8943` | Exactly `helios_icd_create_translator_v1` and the three Vulkan ICD loader exports. Imports the CRT core/convert/environment/filesystem/heap/locale/math/private/runtime/stdio/string/time/utility API sets, `GDI32.dll`, and `KERNEL32.dll`; no DXGI, D3D11, D3D12, DComp, or `vulkan-1.dll`. |
+| `VkLayer_HELIOS_present.dll` | 3,314,217 | `0260E5AE530B4DAA0346F3AE2D4DAA53215E88C71486A8FFD57C12420CD73712` | Exactly its four enumeration exports plus `vkGetDeviceProcAddr`, `vkGetInstanceProcAddr`, `vkNegotiateLoaderLayerInterfaceVersion`, and `vk_layerGetPhysicalDeviceProcAddr`. Imports CRT core/convert/environment/heap/locale/private/runtime/stdio/string/utility API sets, `d3d12.dll`, `dxgi.dll`, `KERNEL32.dll`, and `USER32.dll`; no `vulkan-1.dll`. |
+
+**Bound.** These are source/build facts. No package was assembled or installed;
+no layer was registered; no target lower ICD, UMD, KMD, or package was replaced;
+and no adapter restart, reboot, VNC, cold-DWM, or target runtime probe occurred.
+The installed target remains KMD 22.22.296.0 / `oem128.inf`, with DWM on WARP
+and zero active DisplayConfig paths as the last measured state. Runtime HPS2
+absence, display admission, and production correctness remain unestablished.
+
+**THE BROAD HPS2 SOURCE DEMOLITION LANDED AND PASSED SOURCE/BUILD VALIDATION
+ONLY; NO RETIREMENT PACKAGE OR PRESENT LAYER WAS INSTALLED, REGISTERED, OR
+EXERCISED ON THE TARGET, THE WDDM 3.2 DISPLAY PACKAGE REMAINS
+RUNTIME-UNADMITTED, AND RUNTIME HPS2 RETIREMENT AND PRODUCTION CORRECTNESS ARE
+NOT ESTABLISHED.**

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Static and mutation gate for the active HPS2 D4 DIRQL enqueue seam."""
+"""Static and mutation gate for the active direct-plane D4 DIRQL enqueue seam."""
 
 from __future__ import annotations
 
@@ -167,7 +167,9 @@ DISPLAY = "kmd_render/src/ddi/display.rs"
 DIRECT = "kmd_render/src/ddi/direct_scanout.rs"
 ALLOC = "kmd_render/src/ddi/create_allocation.rs"
 ADAPTER = "kmd_render/src/adapter/mod.rs"
-ADAPTER_SCANOUT = "kmd_render/src/adapter/scanout.rs"
+# K13 retired the separate present/scanout state module. The canonical adapter
+# now owns the two sequence helpers beside the enqueue admission itself.
+ADAPTER_SCANOUT = ADAPTER
 GPU = "kmd_render/src/virtio/gpu/mod.rs"
 HAL = "kmd_render/src/virtio/hal.rs"
 CTRL = "kmd_render/src/virtio/ctrl.rs"
@@ -483,7 +485,7 @@ DIRQL_CALL_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
             "revision",
         }
     ),
-    (LOGIC_LIB, "next_bind_sequence"): frozenset(),
+    (LOGIC_LIB, "next_bind_sequence"): frozenset({"checked_add"}),
     (PROTOCOL_WDDM, "HeliosWddmAllocationDescV2::validate_create_output"): frozenset(
         {"validate_stage"}
     ),
