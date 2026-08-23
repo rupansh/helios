@@ -3,13 +3,13 @@
 //! the retirement target; current OPAQUE/platform mismatches gate activation.
 
 use helios_protocol::{
-    helios_hwa2_swizzle_is_direct_flip_capable, HeliosAdapterMatch, HeliosAllocDescRejection,
+    helios_hwa2_swizzle_is_scanout_bindable, HeliosAdapterMatch, HeliosAllocDescRejection,
     HeliosWddmAllocationDescV2, D3DDDIFMT_A8R8G8B8, D3DDDI_ID_UNINITIALIZED,
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM, HELIOS_HWA2_FLAG_CROSS_ADAPTER,
     HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY, HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE,
     HELIOS_HWA2_FLAG_DISPLAYABLE, HELIOS_HWA2_FLAG_PRIMARY, HELIOS_HWA2_FLAG_PROTECTED,
     HELIOS_HWA2_FLAG_STANDARD, HELIOS_HWA2_FLAG_STEREO, HELIOS_HWA2_KIND_IMAGE,
-    HELIOS_HWA2_KIND_STANDARD_PRIMARY, HELIOS_PACKAGE_GENERATION,
+    HELIOS_HWA2_KIND_STANDARD_PRIMARY, HELIOS_HWA2_SWIZZLE_LINEAR, HELIOS_PACKAGE_GENERATION,
 };
 
 const SHARED_PRIMARY_STANDARD_ALLOCATION_TYPE: u32 = 1;
@@ -514,12 +514,19 @@ pub fn validate_direct_scanout_binding(
             minimum: full_frame_span,
         });
     }
-    if !helios_hwa2_swizzle_is_direct_flip_capable(allocation.swizzle_class) {
+    if !helios_hwa2_swizzle_is_scanout_bindable(allocation.swizzle_class) {
         return Err(Refusal::UnsupportedSwizzleClass {
             found: allocation.swizzle_class,
         });
     }
-    if allocation.flags & HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE == 0 {
+    // Only the LINEAR arm carries the Direct-Flip WIRE claim, so only it can be
+    // held to the bit. An OPAQUE_OPTIMAL primary can never earn it -- §10.3
+    // rules the class out and `admit_hwa2` therefore never stamps it -- and
+    // requiring it here refused every UMD primary 32x/boot with
+    // DisplayableFlagMissing sitting in front of it (22.22.341.0).
+    if allocation.swizzle_class == HELIOS_HWA2_SWIZZLE_LINEAR
+        && allocation.flags & HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE == 0
+    {
         return Err(Refusal::DirectFlipCompatibleFlagMissing);
     }
 
@@ -1111,11 +1118,6 @@ mod tests {
         } => Refusal::PlaneOffsetExceedsSetScanoutBlob {
             found: (u32::MAX as u64) + 1,
         };
-        swizzle(f) {
-            f.allocation.flags &= !HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE;
-            f.allocation.swizzle_class = HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL;
-        }
-            => Refusal::UnsupportedSwizzleClass { found: HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL };
         missing_direct_flip(f) { f.allocation.flags &= !HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE; }
             => Refusal::DirectFlipCompatibleFlagMissing;
         allocation_source_mismatch(f) { f.allocation.vidpn_source = 1; }
@@ -1172,8 +1174,55 @@ mod tests {
             seen[kind] = true;
         }
 
-        assert_eq!(MUTATION_CASES.len(), REFUSAL_COUNT);
-        assert!(seen.into_iter().all(|present| present));
+        // `UnsupportedSwizzleClass` is the one refusal with no mutation case,
+        // and deliberately: every class `validate_create_output` admits is now
+        // scanout-bindable, so nothing can reach it through this entry point.
+        // `unsupported_swizzle_class_is_unreachable_by_construction` states that
+        // as a property instead of pretending a case exercises it.
+        const UNREACHABLE: usize = 41;
+        assert_eq!(MUTATION_CASES.len(), REFUSAL_COUNT - 1);
+        assert!(!seen[UNREACHABLE]);
+        assert!(seen
+            .into_iter()
+            .enumerate()
+            .all(|(kind, present)| present || kind == UNREACHABLE));
+    }
+
+    /// The relaxation that admits the OPTIMAL direct-scanout primary, stated as
+    /// the property that makes the refusal above unreachable.
+    #[test]
+    fn unsupported_swizzle_class_is_unreachable_by_construction() {
+        for class in [HELIOS_HWA2_SWIZZLE_LINEAR, HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL] {
+            assert!(helios_hwa2_swizzle_is_scanout_bindable(class), "{class}");
+        }
+        assert_eq!(
+            refusal_kind(Refusal::UnsupportedSwizzleClass { found: 0 }),
+            41
+        );
+    }
+
+    /// The UMD's direct-scanout primary: OPAQUE_OPTIMAL, and therefore never
+    /// `DIRECT_FLIP_COMPATIBLE` (§10.3 rules the class out, so `admit_hwa2`
+    /// cannot stamp it). Requiring the bit here refused DWM's primary 32x/boot.
+    #[test]
+    fn optimal_primary_without_the_direct_flip_bit_is_admitted() {
+        let mut fixture = fixture();
+        fixture.allocation.flags &= !HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE;
+        fixture.allocation.swizzle_class = HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL;
+        assert_eq!(validate(&fixture), Ok(()));
+    }
+
+    /// The LINEAR arm is unchanged: it carries the Direct-Flip wire claim, so it
+    /// is still held to the bit.
+    #[test]
+    fn linear_primary_still_requires_the_direct_flip_bit() {
+        let mut fixture = fixture();
+        fixture.allocation.flags &= !HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE;
+        assert_eq!(fixture.allocation.swizzle_class, HELIOS_HWA2_SWIZZLE_LINEAR);
+        assert_eq!(
+            validate(&fixture),
+            Err(Refusal::DirectFlipCompatibleFlagMissing)
+        );
     }
 }
 

@@ -813,7 +813,15 @@ pub(crate) unsafe fn allocate_wddm_resource(
         row_pitch: pitch,
         plane_offset: 0,
         primary_vidpn_source,
-        direct_scanout_primary: false,
+        // THE DIRECT ARM (owner decision 2026-08-23). Every WDDM primary is what
+        // `SET_SCANOUT_BLOB` binds, so it claims `DISPLAYABLE` and is built
+        // `OPAQUE_OPTIMAL` for the QEMU fork's native reconstruction -- rather
+        // than being copied into the KMD-owned LINEAR target. This was the
+        // hard-coded `false` that made `HELIOS_HWA2_FLAG_DISPLAYABLE`
+        // unreachable for every UMD allocation, so `SetVidPnSourceAddress`
+        // refused DWM's primary 32x/boot (`D2AdmWhy=0x53`, KMD 22.22.341.0) and
+        // the only thing ever scanned out was the KMD's own blank primary.
+        direct_scanout_primary: primary_vidpn_source.is_some(),
     };
 
     let mut desc = match input.build() {

@@ -89,7 +89,9 @@ CALL_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
         }
     ),
     (PACKET, "emit_mpo_present"): frozenset({"as_ptr", "cast", "write_unaligned"}),
-    (PACKET, "exact_mpo_primary_profile"): frozenset({"is_err", "validate_create_output"}),
+    (PACKET, "exact_mpo_primary_profile"): frozenset(
+        {"helios_hwa2_swizzle_is_scanout_bindable", "is_err", "validate_create_output"}
+    ),
     (PACKET, "output_capacity"): frozenset({"is_null"}),
 }
 

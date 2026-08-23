@@ -323,6 +323,22 @@ pub const fn helios_hwa2_swizzle_is_direct_flip_capable(class: u32) -> bool {
     class == HELIOS_HWA2_SWIZZLE_LINEAR
 }
 
+/// Is this a class `SetVidPnSourceAddress` can bind the allocation's OWN host
+/// resource for, instead of copying it into the adapter's LINEAR target?
+///
+/// ⛔ Deliberately WIDER than [`helios_hwa2_swizzle_is_direct_flip_capable`],
+/// and the two must not be merged. That one answers a WIRE question an opener
+/// reads ("dxgkrnl and DWM may Direct-Flip this"), which §10.3 rules out for
+/// `OPAQUE_OPTIMAL` outright. This one answers a KMD-PRIVATE routing question,
+/// and `OPAQUE_OPTIMAL` passes it because the QEMU fork reconstructs that
+/// native layout (`qemu-helios`, native OPTIMAL readback). The same argument is
+/// spelled out at `kmd_render/src/ddi/create_allocation.rs`'s
+/// `DIRECT_FLIP_COMPATIBLE` stamp.
+#[inline]
+pub const fn helios_hwa2_swizzle_is_scanout_bindable(class: u32) -> bool {
+    class == HELIOS_HWA2_SWIZZLE_LINEAR || class == HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL
+}
+
 // ── memory class (§10.3, offset 92) ─────────────────────────────────────────
 //
 // "device-local/shared/CPU-visible protocol enum; no Vulkan memory-type index".

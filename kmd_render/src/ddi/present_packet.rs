@@ -10,12 +10,13 @@ use core::ffi::c_void;
 use core::ptr::NonNull;
 
 use helios_protocol::{
-    D3DDDIFMT_A8R8G8B8, D3DDDI_ID_UNINITIALIZED, DXGI_FORMAT_B8G8R8A8_UNORM,
+    helios_hwa2_swizzle_is_scanout_bindable, D3DDDIFMT_A8R8G8B8, D3DDDI_ID_UNINITIALIZED,
+    DXGI_FORMAT_B8G8R8A8_UNORM,
     HELIOS_HWA2_FLAG_CROSS_ADAPTER, HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY,
     HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE, HELIOS_HWA2_FLAG_DISPLAYABLE,
     HELIOS_HWA2_FLAG_PRIMARY, HELIOS_HWA2_FLAG_PROTECTED, HELIOS_HWA2_FLAG_STANDARD,
     HELIOS_HWA2_FLAG_STEREO, HELIOS_HWA2_KIND_IMAGE, HELIOS_HWA2_KIND_STANDARD_PRIMARY,
-    HELIOS_PACKAGE_GENERATION,
+    HELIOS_HWA2_SWIZZLE_LINEAR, HELIOS_PACKAGE_GENERATION,
 };
 
 use crate::dxgk::*;
@@ -368,9 +369,18 @@ fn exact_mpo_primary_profile(
         }
         _ => false,
     };
+    // `DIRECT_FLIP_COMPATIBLE` is required only of the LINEAR arm, which is the
+    // one that carries the Direct-Flip WIRE claim. The UMD's direct-scanout
+    // primary is `OPAQUE_OPTIMAL`, a class §10.3 rules out for that claim, so
+    // `admit_hwa2` never stamps the bit on it and demanding it here would refuse
+    // exactly the allocation this path exists to flip.
     let required_flags = HELIOS_HWA2_FLAG_PRIMARY
         | HELIOS_HWA2_FLAG_DISPLAYABLE
-        | HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE;
+        | if allocation.swizzle_class == HELIOS_HWA2_SWIZZLE_LINEAR {
+            HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE
+        } else {
+            0
+        };
     let forbidden_flags =
         HELIOS_HWA2_FLAG_STEREO | HELIOS_HWA2_FLAG_PROTECTED | HELIOS_HWA2_FLAG_CROSS_ADAPTER;
     let exact_source = if allocation.flags & HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY != 0 {
@@ -389,6 +399,7 @@ fn exact_mpo_primary_profile(
         && allocation.sample_count == 1
         && allocation.sample_quality == 0
         && allocation.plane_count == MPO_MAX_PLANES
+        && helios_hwa2_swizzle_is_scanout_bindable(allocation.swizzle_class)
         && exact_source
 }
 

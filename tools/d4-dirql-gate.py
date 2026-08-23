@@ -435,7 +435,7 @@ DIRQL_CALL_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
             "checked_add",
             "checked_mul",
             "from",
-            "helios_hwa2_swizzle_is_direct_flip_capable",
+            "helios_hwa2_swizzle_is_scanout_bindable",
             "map_err",
             "ok_or",
             "validate_create_output",
@@ -510,6 +510,7 @@ DIRQL_CALL_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
     (PROTOCOL_WDDM, "helios_hwa2_kind_is_image"): frozenset(),
     (PROTOCOL_WDDM, "helios_hwa2_kind_is_standard"): frozenset(),
     (PROTOCOL_WDDM, "helios_hwa2_swizzle_is_direct_flip_capable"): frozenset(),
+    (PROTOCOL_WDDM, "helios_hwa2_swizzle_is_scanout_bindable"): frozenset(),
 }
 
 DIRQL_QUALIFIED_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
@@ -993,6 +994,7 @@ def check_sources(sources: dict[str, str]) -> list[str]:
         (PROTOCOL_WDDM, "helios_hwa2_kind_is_image"),
         (PROTOCOL_WDDM, "helios_hwa2_kind_is_standard"),
         (PROTOCOL_WDDM, "helios_hwa2_swizzle_is_direct_flip_capable"),
+        (PROTOCOL_WDDM, "helios_hwa2_swizzle_is_scanout_bindable"),
     )
     if set(audited_bodies) != set(DIRQL_CALL_MANIFEST):
         errors.append("internal D4 gate error: audited body set and call manifest differ")
