@@ -4,6 +4,34 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ⚠ GUEST IN A REBOOT LOOP, 2026-08-24 ~02:15 — recover before resuming
+
+QEMU exited during a verification boot and the guest came back looping. Owner is
+relaunching **without the Helios GPU** so evidence can be gathered on the basic
+display adapter.
+
+**Leading suspect is not the driver.** Six QMP `system_reset`s in ~90 minutes,
+several of them mid-boot (graceful `shutdown /r` does not reboot this guest when
+the display stack is wedged), is exactly how Windows lands in Automatic Repair.
+Last KMD deployed was 22.22.352.0; its diff is small and IRQL-safe on inspection,
+which is not a measurement.
+
+**The discriminator:** `C:\Windows\Minidump\*.dmp`. A dump names the faulting
+driver; **no dump at all** means Windows never bugchecked and the loop is the
+repair path, not us. Run `tools/collect-boot-failure-evidence.ps1` — it gathers
+dumps, BugCheck/Kernel-Power events, `setupapi.dev.log`, `ConfigFlags`, the
+service `Start` value, `UserModeDriverName`, the DriverStore version list, the
+UMD logs and the live counters into `Z:\tmp\bootfail-<stamp>\`, and touches no
+device. ⛔ Invoke it with `Invoke-Expression (Get-Content -Raw ...)`: machine
+ExecutionPolicy is Restricted, so `& script.ps1` runs and prints nothing.
+
+Rollback levers: `Services\helios_kmd_render\Start = 4` (inert with the GPU
+present); backups in `C:\ProgramData\HeliosDeployBackups\<stamp>\`; every prior
+version still published in the DriverStore. Last KMD that reached a full
+display bring-up: **22.22.350.0**.
+
+---
+
 ## ⛔ BLACK DESKTOP, 2026-08-24 — DWM NEVER PRESENTS, AND TWO OF OUR GATES ARE WHY
 
 **Root cause found and two of its links fixed.** DWM composites fine and its
