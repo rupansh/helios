@@ -48,6 +48,8 @@ static SET_REFUSALS: AtomicU32 = AtomicU32::new(0);
 static SET_RETRIES: AtomicU32 = AtomicU32::new(0);
 static SET_RETRIES_MIRRORED: AtomicU32 = AtomicU32::new(0);
 static SET_ACCEPTS: AtomicU32 = AtomicU32::new(0);
+static SET_PRIVATE_IGNORED: AtomicU32 = AtomicU32::new(0);
+static SET_FLIPLINE_IGNORED: AtomicU32 = AtomicU32::new(0);
 static LAST_PRESENT_ID: AtomicU64 = AtomicU64::new(0);
 static POST_PRESENT_HITS: AtomicU32 = AtomicU32::new(0);
 static UPDATE_REFUSALS: AtomicU32 = AtomicU32::new(0);
@@ -339,12 +341,23 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_with_multi_plane_overl
     let plane = unsafe { &mut *plane_ptr };
     plane.OutputFlags = Default::default();
     let plane_flags = unsafe { plane.InputFlags.__bindgen_anon_1.Value };
-    if plane.ContextCount != 1
-        || plane.DriverPrivateDataSize != 0
-        || !plane.pDriverPrivateData.is_null()
-        || plane.MaxImmediateFlipLine != 0
-    {
+    // One site per predicate: 0x06000001 was measured on the first parked DWM
+    // flip (2026-08-24) and could not say WHICH of four fields tripped.
+    // ContextCount must be 1 — the context record is the allocation channel.
+    // Private data (our UMD sends none) and MaxImmediateFlipLine (an immediate-
+    // flip latency hint) cannot change what is scanned out: count, continue.
+    if plane.ContextCount != 1 {
         return park_set_refusal(6);
+    }
+    if (plane.DriverPrivateDataSize != 0 || !plane.pDriverPrivateData.is_null())
+        && SET_PRIVATE_IGNORED.fetch_add(1, Ordering::Relaxed) == 0
+    {
+        crate::diag::record_named_bytes(b"MpoPrvIg", plane.DriverPrivateDataSize);
+    }
+    if plane.MaxImmediateFlipLine != 0
+        && SET_FLIPLINE_IGNORED.fetch_add(1, Ordering::Relaxed) == 0
+    {
+        crate::diag::record_named_bytes(b"MpoFlLnIg", plane.MaxImmediateFlipLine);
     }
     let Some(context_ptr) = (unsafe { first_mut_ptr(plane.ppContextData) }) else {
         return park_set_refusal(7);
