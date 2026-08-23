@@ -16,7 +16,7 @@ use helios_protocol::{
     HELIOS_HWA2_FLAG_SHARED, HELIOS_HWA2_KIND_BUFFER, HELIOS_HWA2_KIND_IMAGE,
     HELIOS_HWA2_MEMORY_CPU_VISIBLE, HELIOS_HWA2_MISC_GDI_COMPATIBLE,
     HELIOS_HWA2_MISC_RESOURCE_CLAMP, HELIOS_HWA2_MISC_TEXTURE_CUBE, HELIOS_HWA2_SWIZZLE_LINEAR,
-    HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL, HELIOS_PACKAGE_GENERATION,
+    HELIOS_PACKAGE_GENERATION,
 };
 
 use super::{note_ddi_refusal, ResourceDimension, DDI_REFUSALS};
@@ -337,13 +337,16 @@ impl Hwa2CreateInput {
         }
 
         // ── layout and memory class (offsets 88-95) ─────────────────────────
-        desc.swizzle_class = if self.direct_scanout_primary {
-            // The direct arm scans out of the OPTIMAL image DXVK rendered into;
-            // its "pitch" is a logical scan-out stride, not a row-major one.
-            HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL
-        } else {
-            HELIOS_HWA2_SWIZZLE_LINEAR
-        };
+        // ⛔ MEASURED 2026-08-23 (KMD 22.22.343.0): the primary stays LINEAR even
+        // on the direct arm. Claiming `OPAQUE_OPTIMAL` here flips the KMD's
+        // `classify_hwa2` from a linear memory blob to `OptimalImage`
+        // (`KIND_IMAGE` + OPTIMAL + direct is that router's tiled arm), and
+        // dxgkrnl then E_FAILs `pfnSetDisplayModeCb` for DWM's primary
+        // (hr=0x80004005, was S_OK) -- DWM destroys the device without ever
+        // presenting, `PresentBoundary present=0`. The scan-out admission is
+        // clean in that arm (D2AdmRef 32 -> 0), so this is dxgkrnl refusing the
+        // tiled primary, not our validator.
+        desc.swizzle_class = HELIOS_HWA2_SWIZZLE_LINEAR;
         desc.memory_class = HELIOS_HWA2_MEMORY_CPU_VISIBLE;
 
         // ── plane records (offsets 96-167) ──────────────────────────────────
