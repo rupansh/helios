@@ -5,7 +5,7 @@
 use helios_protocol::{
     helios_hwa2_swizzle_is_direct_flip_capable, HeliosAdapterMatch, HeliosAllocDescRejection,
     HeliosWddmAllocationDescV2, D3DDDIFMT_A8R8G8B8, D3DDDI_ID_UNINITIALIZED,
-    DXGI_FORMAT_B8G8R8A8_UNORM, HELIOS_HWA2_FLAG_CROSS_ADAPTER,
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8X8_UNORM, HELIOS_HWA2_FLAG_CROSS_ADAPTER,
     HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY, HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE,
     HELIOS_HWA2_FLAG_DISPLAYABLE, HELIOS_HWA2_FLAG_PRIMARY, HELIOS_HWA2_FLAG_PROTECTED,
     HELIOS_HWA2_FLAG_STANDARD, HELIOS_HWA2_FLAG_STEREO, HELIOS_HWA2_KIND_IMAGE,
@@ -36,6 +36,11 @@ pub struct OperationFacts {
     pub stereo: bool,
     pub shared_primary_transition: bool,
     pub independent_flip_exclusive: bool,
+    /// The classic `ModeChange` programming flip. Measured on 26100.8972
+    /// (S-ring, KMD 22.22.328.0): dxgkrnl orders CommitVidPn →
+    /// SetVidPnSourceAddress(MODE_CHANGE) → SetVidPnSourceVisibility(TRUE), so
+    /// this one flip legally arrives while the source is still invisible.
+    pub mode_change: bool,
     pub unsupported_or_reserved_flags: u32,
 }
 
@@ -252,7 +257,7 @@ pub fn validate_direct_scanout_binding(
     if !mode.active {
         return Err(Refusal::CommittedModeInactive);
     }
-    if !mode.visible {
+    if !mode.visible && !operation.mode_change {
         return Err(Refusal::SourceInvisible);
     }
     if !mode.powered {
@@ -327,7 +332,13 @@ pub fn validate_direct_scanout_binding(
     if allocation.flags & HELIOS_HWA2_FLAG_CROSS_ADAPTER != 0 {
         return Err(Refusal::CrossAdapterAllocation);
     }
-    if allocation.dxgi_format != DXGI_FORMAT_B8G8R8A8_UNORM {
+    // 88 (B8G8R8X8) is what the KMD's own standard-primary author writes — XR24
+    // is the measured egl-headless scanout format (39th session) — and 87 stays
+    // admitted for UMD-authored primaries. Demanding 87 alone refused every OS
+    // shared-primary flip with D2AdmWhy=4 (measured, KMD 22.22.330.0).
+    if allocation.dxgi_format != DXGI_FORMAT_B8G8R8A8_UNORM
+        && allocation.dxgi_format != DXGI_FORMAT_B8G8R8X8_UNORM
+    {
         return Err(Refusal::FormatNotBgra8 {
             found: allocation.dxgi_format,
         });
@@ -624,6 +635,7 @@ mod tests {
                 stereo: false,
                 shared_primary_transition: false,
                 independent_flip_exclusive: false,
+                mode_change: false,
                 unsupported_or_reserved_flags: 0,
             },
             plane: PlaneFacts::MpoSet(MpoSetPlaneFacts {
@@ -675,6 +687,28 @@ mod tests {
 
         fixture.plane = PlaneFacts::Classic;
         assert_eq!(validate(&fixture), Ok(()));
+    }
+
+    #[test]
+    fn bgrx8_standard_primary_and_invisible_mode_change_flip_admit() {
+        // The OS shared-primary shape as the KMD authors it: dxgi 88 (XR24),
+        // programmed by the MODE_CHANGE flip before visibility is set.
+        let mut fixture = fixture();
+        fixture.allocation.dxgi_format = DXGI_FORMAT_B8G8R8X8_UNORM;
+        fixture.mode.visible = false;
+        fixture.operation.mode_change = true;
+        fixture.plane = PlaneFacts::Classic;
+        assert_eq!(
+            fixture
+                .allocation
+                .validate_create_output(HELIOS_PACKAGE_GENERATION),
+            Ok(())
+        );
+        assert_eq!(validate(&fixture), Ok(()));
+
+        // The same invisible flip without MODE_CHANGE still refuses.
+        fixture.operation.mode_change = false;
+        assert_eq!(validate(&fixture), Err(Refusal::SourceInvisible));
     }
 
     #[test]

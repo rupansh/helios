@@ -25,10 +25,16 @@ pub(crate) const CMD_NOTIFY_RING_MESA: u32 = 190;
 /// a reply written into the previously-set reply command stream.
 
 // ── Vulkan structure-type ids (VkStructureType) ──────────────────────────────
+pub(crate) const ST_APPLICATION_INFO: i32 = 0;
 pub(crate) const ST_INSTANCE_CREATE_INFO: i32 = 1;
 pub(crate) const ST_DEVICE_QUEUE_CREATE_INFO: i32 = 2;
 pub(crate) const ST_DEVICE_CREATE_INFO: i32 = 3;
 pub(crate) const ST_RING_CREATE_INFO_MESA: i32 = 1000384000;
+
+/// `VK_MAKE_API_VERSION(0, 1, 4, 0)` — the instance apiVersion the bootstrap
+/// pins so vkr's per-device proc tables resolve every core-1.2/1.3/1.4 entry
+/// point (see the vkCreateInstance encoder in `bringup.rs`).
+pub(crate) const API_VERSION_1_4: u32 = (1 << 22) | (4 << 12);
 
 /// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT`.
 pub(crate) const EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF: u32 = 0x0000_0200;
@@ -123,9 +129,9 @@ pub(crate) const RING_WAIT_TIMEOUT_MS: u64 = 30_000;
 // `writer_ext_full_create_device_is_332_bytes` there for the real number — the
 // comment that used to sit here said "~120 bytes" and was wrong by 212.
 pub(crate) use helios_kmd_logic::{
-    encode_image_create, encode_memory_allocate, ImageCreateSpec, MemoryAllocateSpec, MemoryPNext,
-    MemoryTypeChoice, Writer, CMD_ALLOCATE_MEMORY, CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY,
-    IMAGE_TILING_LINEAR, IMAGE_TILING_OPTIMAL,
+    encode_image_create, encode_memory_allocate, optimal_gdi_memory_pnext, ImageCreateSpec,
+    MemoryAllocateSpec, MemoryPNext, MemoryTypeChoice, Writer, CMD_ALLOCATE_MEMORY,
+    CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY, IMAGE_TILING_LINEAR, IMAGE_TILING_OPTIMAL,
 };
 
 /// Why the venus ring was declared unusable. Each arm names a registry counter

@@ -521,7 +521,11 @@ pub unsafe extern "C" fn dxgkddi_enum_vidpn_cofunc_modality(
         return STATUS_NOT_SUPPORTED;
     }
     let adapter = unsafe { &*p };
-    unsafe { crate::ddi::vidpn::enum_cofunc_modality(adapter, enum_modality) }
+    // 0x1329 = EnumVidPnCofuncModality's return status (low 16 bits) — pairs
+    // with the 0x1313 pivot crumb to expose the mode-set retry loop's shape.
+    let status = unsafe { crate::ddi::vidpn::enum_cofunc_modality(adapter, enum_modality) };
+    crate::diag::record(0x1329_0000 | (status as u32 & 0xFFFF));
+    status
 }
 
 pub unsafe extern "C" fn dxgkddi_set_vidpn_source_visibility(
@@ -544,18 +548,56 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_visibility(
         // the call. D2 consumes the exact source and visibility bit only.
         let passive = unsafe { crate::irql::PassiveLevel::assume() };
         let visibility = unsafe { &*visibility };
-        return crate::ddi::direct_scanout::transition_visibility(
+        // 0x132A = the visible bit; 0x132B = the return status (low 16) — the
+        // rollback discriminator paired with 0x1319's commit status. This DDI
+        // also runs AFTER any flip attempt, so republish the flip/admission
+        // counters here — the RecommendMonitorModes publish predates them.
+        crate::diag::record(0x132A_0000 | (visibility.Visible != 0) as u32);
+        let status = crate::ddi::direct_scanout::transition_visibility(
             passive,
             unsafe { &*p },
             visibility.VidPnSourceId,
             visibility.Visible != 0,
         );
+        crate::diag::record(0x132B_0000 | (status as u32 & 0xFFFF));
+        record_scanout_reject_counters();
+        // Live (unflushed) heartbeat state: whether the OS ever enabled
+        // CRTC_VSYNC delivery this boot, how many ticks delivered, and the
+        // last primary the tick reports — the flip-retirement inputs.
+        let adapter = unsafe { &*p };
+        crate::diag::record_named_bytes(
+            b"VsLive",
+            adapter.vsync_count.load(core::sync::atomic::Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"VsEnNow",
+            adapter.vsync_enabled.load(core::sync::atomic::Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"LastPA",
+            adapter
+                .last_primary_address
+                .load(core::sync::atomic::Ordering::Relaxed) as u32,
+        );
+        return status;
     }
     // Legacy production behavior remains the accepted no-op.
     STATUS_SUCCESS
 }
 
 pub unsafe extern "C" fn dxgkddi_commit_vidpn(
+    _adapter: IN_CONST_HANDLE,
+    commit: IN_CONST_PDXGKARG_COMMITVIDPN_CONST,
+) -> NTSTATUS {
+    // 0x1319 = CommitVidPn's return status (low 16 bits): the mode-set retry
+    // loop's discriminator — 0x0000 SUCCESS vs 0x00A3 DEVICE_NOT_READY vs
+    // 0x03xx GRAPHICS_*.
+    let status = unsafe { commit_vidpn_impl(_adapter, commit) };
+    crate::diag::record(0x1319_0000 | (status as u32 & 0xFFFF));
+    status
+}
+
+unsafe fn commit_vidpn_impl(
     _adapter: IN_CONST_HANDLE,
     commit: IN_CONST_PDXGKARG_COMMITVIDPN_CONST,
 ) -> NTSTATUS {
@@ -585,8 +627,16 @@ pub unsafe extern "C" fn dxgkddi_commit_vidpn(
             )
         } {
             Ok(facts) => facts,
-            Err(error) => return error.status,
+            Err(error) => {
+                crate::diag::record(0x131E_0000 | (error.status as u32 & 0xFFFF));
+                return error.status;
+            }
         };
+        // 0x131F: which facts arm the commit carried (1 = Active, 2 = Empty).
+        crate::diag::record(match facts {
+            crate::ddi::vidpn::CommittedVidPnFacts::Active(_) => 0x131F_0001,
+            crate::ddi::vidpn::CommittedVidPnFacts::Empty { .. } => 0x131F_0002,
+        });
         let status = crate::ddi::vidpn::legalize_vidpn(unsafe {
             crate::ddi::vidpn::commit_vidpn(adapter, commit as *const DXGKARG_COMMITVIDPN)
         });
@@ -682,6 +732,7 @@ unsafe fn set_vidpn_source_address_d4(
         stereo: flags & CLASSIC_STEREO_MASK != 0,
         shared_primary_transition: flags & CLASSIC_SHARED_PRIMARY_TRANSITION != 0,
         independent_flip_exclusive: flags & CLASSIC_INDEPENDENT_FLIP_EXCLUSIVE != 0,
+        mode_change: flags & CLASSIC_MODE_CHANGE != 0,
         unsupported_or_reserved_flags: flags & !CLASSIC_SUPPORTED_FLAG_MASK,
     };
     let candidate = match unsafe {
@@ -787,6 +838,7 @@ unsafe fn arm_dma_flip_d4(
         stereo: operation_flags & CLASSIC_STEREO_MASK != 0,
         shared_primary_transition: operation_flags & CLASSIC_SHARED_PRIMARY_TRANSITION != 0,
         independent_flip_exclusive: operation_flags & CLASSIC_INDEPENDENT_FLIP_EXCLUSIVE != 0,
+        mode_change: operation_flags & CLASSIC_MODE_CHANGE != 0,
         unsupported_or_reserved_flags: operation_flags & !CLASSIC_SUPPORTED_FLAG_MASK,
     };
     let candidate = match unsafe {
@@ -826,6 +878,10 @@ unsafe fn arm_dma_flip_d4(
 pub(crate) fn record_scanout_reject_counters() {
     crate::diag::record_named_bytes(b"D4ClsOk", D4_CLASSIC_ACCEPTS.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"D4ClsRef", D4_CLASSIC_REFUSALS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(
+        b"CtlInt",
+        crate::ddi::interrupt::CONTROL_INT_COUNT.load(Ordering::Relaxed),
+    );
     crate::ddi::direct_scanout::record_refusal_counters();
 }
 

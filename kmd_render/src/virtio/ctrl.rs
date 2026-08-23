@@ -2351,10 +2351,9 @@ pub(crate) fn submit_venus_session_sync(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     session: &VenusSessionGuard<'_>,
-    control_fence_id: u64,
     stream: &[u8],
 ) -> Result<(), VirtioError> {
-    if control_fence_id == 0 || stream.is_empty() {
+    if stream.is_empty() {
         return Err(VirtioError::DeviceError);
     }
     let Ok(size) = u32::try_from(stream.len()) else {
@@ -2364,15 +2363,46 @@ pub(crate) fn submit_venus_session_sync(
     cmd.hdr.type_ = helios_protocol::VIRTIO_GPU_CMD_SUBMIT_3D;
     // A bare SUBMIT_3D response proves only that the renderer accepted the
     // bytes for decode.  K11 needs the reply write itself to be terminal, so
-    // each of its fixed CPU-control submissions carries a stock per-context
-    // fence on ring zero.  This is neither the adapter-global wire timeline nor
-    // a WDDM SubmissionFenceId: the newly created Venus context is the fence
-    // namespace, ring zero is its decoder/pure-control timeline, and the
-    // caller supplies one of that session's finite ordered constants.
+    // each CPU-control submission carries a stock per-context fence on ring
+    // zero. `enqueue_sync` mints the id from the transport-global wire
+    // namespace shared with native decoder teardown; QEMU's mergeable `<=`
+    // retirement therefore cannot let one namespace overtake the other. This
+    // remains separate from a WDDM SubmissionFenceId.
     cmd.hdr.flags = VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX;
     cmd.hdr.ctx_id = session.context_id;
-    cmd.hdr.fence_id = control_fence_id;
+    // Exact zero sentinel: `enqueue_sync` replaces it atomically with the next
+    // wire id only after it has validated this complete context-fence header.
+    cmd.hdr.fence_id = 0;
     cmd.hdr.ring_idx = 0;
+    cmd.size = size;
+    ctrl_roundtrip_ok_finite(passive, adapter, bytes_of(&cmd), Some(stream))
+}
+
+/// Submit K11's replyless terminal `vkDestroyInstance` stream.
+///
+/// Session rundown has already closed and every admitted HVC1 operation
+/// reached its own ring-zero terminal before this call.  Do not set
+/// `VIRTIO_GPU_FLAG_FENCE` here: QEMU dispatches SUBMIT_3D before asking the
+/// renderer to create that fence, while this stream destroys the instance the
+/// proxy serves.  A failed post-destroy fence leaves the virtio request without
+/// a response until K11's finite waiter expires.  The bare control response
+/// orders this replyless stream before the subsequent resource teardown, and
+/// the owned `CTX_DESTROY` remains the final host-namespace terminal.
+pub(crate) fn submit_venus_session_destroy(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    session: &VenusSessionGuard<'_>,
+    stream: &[u8],
+) -> Result<(), VirtioError> {
+    if stream.is_empty() {
+        return Err(VirtioError::DeviceError);
+    }
+    let Ok(size) = u32::try_from(stream.len()) else {
+        return Err(VirtioError::DeviceError);
+    };
+    let mut cmd = helios_protocol::VirtioGpuCmdSubmit::zeroed();
+    cmd.hdr.type_ = helios_protocol::VIRTIO_GPU_CMD_SUBMIT_3D;
+    cmd.hdr.ctx_id = session.context_id;
     cmd.size = size;
     ctrl_roundtrip_ok_finite(passive, adapter, bytes_of(&cmd), Some(stream))
 }

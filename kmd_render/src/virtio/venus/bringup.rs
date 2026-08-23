@@ -196,7 +196,23 @@ impl VenusRing {
             w.i32(ST_INSTANCE_CREATE_INFO); // sType
             w.u64(0); // pNext NULL
             w.u32(0); // flags
-            w.count(false); // simple_pointer(pApplicationInfo) NULL
+            // pApplicationInfo must be PRESENT with a real apiVersion. A NULL
+            // one is patched by vkr_instance.c to apiVersion 1.1, which
+            // vkr_physical_device.c MIN2s into every device proc table: all
+            // core-1.2+/1.3+ procs whose KHR alias ext the guest does not
+            // enable resolve NULL, and vkr dispatch calls them unchecked — the
+            // first vkQueueSubmit2/vkCmdBeginRendering then kills the render
+            // worker at ip=0 (2,835 host SIGSEGVs, 2026-08-22/23). 1.4 is the
+            // ceiling vn_renderer_helios_hvm.c already pins for the ICD.
+            w.count(true); // simple_pointer(pApplicationInfo)
+                           // VkApplicationInfo:
+            w.i32(ST_APPLICATION_INFO); // sType
+            w.u64(0); // pNext NULL
+            w.count(false); // pApplicationName: array_size 0
+            w.u32(0); // applicationVersion
+            w.count(false); // pEngineName: array_size 0
+            w.u32(0); // engineVersion
+            w.u32(API_VERSION_1_4); // apiVersion
             w.u32(0); // enabledLayerCount
             w.count(false); // ppEnabledLayerNames array_size 0
             w.u32(0); // enabledExtensionCount

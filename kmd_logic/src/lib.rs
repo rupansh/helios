@@ -23,6 +23,7 @@
 
 #![no_std]
 
+pub mod allocation_placement;
 pub mod committed_mode;
 pub mod committed_mode_lifecycle;
 pub mod context_attachment;
@@ -35,6 +36,7 @@ pub mod direct_scanout_admission;
 pub mod direct_scanout_lifetime;
 pub mod display_backing_lifetime;
 pub mod ordered_engine;
+pub mod outer_execution;
 pub mod umd_private_query;
 pub mod venus_executor;
 
@@ -627,8 +629,51 @@ pub mod session_transport {
     pub const CMD_CREATE_INSTANCE: u32 = 0;
     pub const CMD_DESTROY_INSTANCE: u32 = 1;
     pub const CMD_SET_REPLY_COMMAND_STREAM_MESA: u32 = 178;
+    pub const ST_APPLICATION_INFO: i32 = 0;
     pub const ST_INSTANCE_CREATE_INFO: i32 = 1;
     pub const HOST_CREATE_INSTANCE_REPLY_BYTES: u64 = 24;
+    /// `VK_MAKE_API_VERSION(0, 1, 4, 0)`. A NULL `pApplicationInfo` is patched
+    /// by vkr_instance.c to apiVersion 1.1, which MIN2s into every device proc
+    /// table and leaves all core-1.2+/1.3+ procs NULL when their KHR alias ext
+    /// is unenabled — vkr dispatch then jumps to 0 on the first
+    /// vkQueueSubmit2/vkCmdBeginRendering (2,835 host SIGSEGVs, 2026-08-22/23).
+    pub const API_VERSION_1_4: u32 = (1 << 22) | (4 << 12);
+
+    /// Admission state for the one synchronous ring-zero control operation a
+    /// live K11 session may own.  The WDK half supplies the exact wait/event
+    /// and mints the fence from the transport-global wire namespace at enqueue;
+    /// this state makes the single-owner transition independently testable.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct RingZeroControlState {
+        occupied: bool,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RingZeroControlRefusal {
+        Occupied,
+    }
+
+    impl RingZeroControlState {
+        pub const fn new() -> Self {
+            Self { occupied: false }
+        }
+
+        pub fn try_acquire(&mut self) -> Result<(), RingZeroControlRefusal> {
+            if self.occupied {
+                return Err(RingZeroControlRefusal::Occupied);
+            }
+            self.occupied = true;
+            Ok(())
+        }
+
+        pub fn release(&mut self) -> bool {
+            if !self.occupied {
+                return false;
+            }
+            self.occupied = false;
+            true
+        }
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct ReplyRange {
@@ -747,7 +792,14 @@ pub mod session_transport {
         stream.i32(ST_INSTANCE_CREATE_INFO);
         stream.u64(0); // pNext
         stream.u32(0); // flags
-        stream.count(false); // pApplicationInfo
+        stream.count(true); // pApplicationInfo — see API_VERSION_1_4
+        stream.i32(ST_APPLICATION_INFO); // sType
+        stream.u64(0); // pNext
+        stream.count(false); // pApplicationName: array_size 0
+        stream.u32(0); // applicationVersion
+        stream.count(false); // pEngineName: array_size 0
+        stream.u32(0); // engineVersion
+        stream.u32(API_VERSION_1_4); // apiVersion
         stream.u32(0); // enabledLayerCount
         stream.count(false); // ppEnabledLayerNames
         stream.u32(0); // enabledExtensionCount
@@ -893,9 +945,23 @@ pub mod session_transport {
 
             let stream = encode_create_instance(0x8877_6655_4433_2211);
             let bytes = stream.finished().unwrap();
-            assert_eq!(bytes.len(), 88);
+            assert_eq!(bytes.len(), 128);
             assert_eq!(&bytes[0..8], &[0, 0, 0, 0, 1, 0, 0, 0]);
-            assert_eq!(&bytes[80..88], &0x8877_6655_4433_2211u64.to_le_bytes());
+            // VkApplicationInfo.apiVersion sits after sType(4)+pNext(8)+
+            // appName size(8)+appVer(4)+engName size(8)+engVer(4) inside the
+            // app-info body that starts at offset 40.
+            assert_eq!(&bytes[76..80], &API_VERSION_1_4.to_le_bytes());
+            assert_eq!(&bytes[120..128], &0x8877_6655_4433_2211u64.to_le_bytes());
+        }
+
+        #[test]
+        fn ring_zero_control_admits_one_owner_at_a_time() {
+            let mut state = RingZeroControlState::new();
+            assert_eq!(state.try_acquire(), Ok(()));
+            assert_eq!(state.try_acquire(), Err(RingZeroControlRefusal::Occupied));
+            assert!(state.release());
+            assert!(!state.release());
+            assert_eq!(state.try_acquire(), Ok(()));
         }
 
         #[test]
@@ -1150,6 +1216,18 @@ pub enum MemoryPNext {
     Export { handle_type: u32 },
     /// `VkExportMemoryAllocateInfo` -> `VkMemoryDedicatedAllocateInfo`.
     ExportDedicated { handle_type: u32, image: u64 },
+}
+
+/// The allocation chain for the KMD-owned OPTIMAL GDI image on the admitted
+/// target.
+///
+/// The target's exact external-image query reports dedicated allocation as
+/// preferred, not required.  Keeping the image out of `vkAllocateMemory` is
+/// therefore valid and removes an unnecessary object-table dependency from the
+/// command that creates the exportable memory.  The image is still the exact
+/// object passed to the subsequent `vkBindImageMemory`.
+pub const fn optimal_gdi_memory_pnext(handle_type: u32) -> MemoryPNext {
+    MemoryPNext::Export { handle_type }
 }
 
 /// Everything the three live memory allocations differ by.
@@ -1497,6 +1575,16 @@ mod tests {
             },
         );
         assert_eq!(w.finished(), Some(GOLDEN_MEMORY_EXPORT));
+    }
+
+    #[test]
+    fn optimal_gdi_memory_export_has_no_dedicated_image_dependency() {
+        assert!(matches!(
+            optimal_gdi_memory_pnext(0x0000_0200),
+            MemoryPNext::Export {
+                handle_type: 0x0000_0200
+            }
+        ));
     }
 
     /// The order-sensitive one: the dedicated struct's image/buffer fields come
@@ -7430,6 +7518,14 @@ pub mod native_render {
             self.staged_bytes -= bytes;
             Ok(())
         }
+
+        /// Release a staging slot whose finite host operation completed in the
+        /// synchronous Render callback. There is no scheduler-owned payload
+        /// custody after this terminal; SubmitCommand carries only the fence
+        /// edge and must not retain or retire the staging bytes again.
+        pub fn finish_synchronous(&mut self, bytes: u64) -> Result<(), RenderRefusal> {
+            self.retire(bytes)
+        }
     }
 
     /// Where a COMMIT's output patch entries go in the runtime's
@@ -8207,6 +8303,21 @@ pub mod native_render {
             pool.checkout(8).unwrap();
             assert_eq!(pool.retire(9).unwrap_err(), RenderRefusal::StagingUnderflow);
             pool.retire(8).unwrap();
+        }
+
+        #[test]
+        fn synchronous_render_terminals_do_not_accumulate_outstanding_slots() {
+            let mut pool = StagingPool::new();
+            for _ in 0..(HELIOS_HNR2_MAX_OUTSTANDING_SUBMISSIONS * 2) {
+                pool.checkout(312).unwrap();
+                pool.finish_synchronous(312).unwrap();
+            }
+            assert_eq!(pool.outstanding(), 0);
+            assert_eq!(pool.staged_bytes(), 0);
+            assert_eq!(
+                pool.finish_synchronous(312).unwrap_err(),
+                RenderRefusal::StagingUnderflow
+            );
         }
 
         #[test]

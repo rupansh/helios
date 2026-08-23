@@ -418,10 +418,16 @@ static CREATE_BACKING_FAILED: AtomicU32 = AtomicU32::new(0);
 /// Creates refused because the allocation-generation ordinal is exhausted
 /// (`AcGenExh`); see `adapter::allocation_object::GENERATION_EXHAUSTED`.
 static CREATE_GENERATION_EXHAUSTED: AtomicU32 = AtomicU32::new(0);
-/// Opens whose per-allocation private data failed HWA2 create-**output**
-/// validation (`OaHwa2Rej`). §10.3:1079-1080 makes a malformed descriptor fail
-/// the OPEN as well as the create; the open is not a place to be lenient,
-/// because the receiving UMD reads the identical bytes.
+/// HWA2 records published through a create-flagged open (`OaHwa2Stamp`) and
+/// opens whose private data could not be reconciled with the exact canonical
+/// allocation (`OaHwa2Rej`).
+///
+/// The create DDI still mints and stores the one allocation generation. Windows
+/// discards a KMD write into the user-supplied create buffer, so the
+/// create-flagged OpenAllocation is the observable in/out leg of that same
+/// transaction. Ordinary opens remain read-only and must carry the identical
+/// canonical output.
+static OPEN_HWA2_STAMPED: AtomicU32 = AtomicU32::new(0);
 static OPEN_HWA2_REJECT: AtomicU32 = AtomicU32::new(0);
 /// HVM1 records stamped with their create-output at OPEN (`OaHvm1Stamp`), and
 /// the ones that could not be (`OaHvm1Rej`: a mint failure, or bytes that were
@@ -523,7 +529,7 @@ static STANDARD_SELF_REJECT: AtomicU32 = AtomicU32::new(0);
 /// names sharing a 14-byte prefix would MERGE into one registry value — a
 /// refusal counter reading someone else's number. Same guard
 /// `diag::FaultCounter` and `native_fence.rs` use.
-const RETIREMENT_COUNTER_NAMES: [&[u8]; 27] = [
+const RETIREMENT_COUNTER_NAMES: [&[u8]; 28] = [
     b"AcOk",
     b"AcMagic",
     b"AcHwa2Rej",
@@ -554,6 +560,7 @@ const RETIREMENT_COUNTER_NAMES: [&[u8]; 27] = [
     b"OaBadH",
     b"AcGenEpoch",
     b"AcOptLin",
+    b"OaHwa2Stamp",
     b"OaHwa2Rej",
     b"OaHvm1Stamp",
     b"OaHvm1Rej",
@@ -698,10 +705,12 @@ struct OpenAllocationContext {
     /// `allocation` and the K2a MDL are still canonically live.
     reply_pool_session: Option<core::ptr::NonNull<crate::ddi::translation_session::SessionObject>>,
     /// Direct executor edge retained from this exact raw-device open.  It is
-    /// present only for HVM1 roles 1-4 and the exact shared,
-    /// resource-associated HWA2 C57 class.  It is never serialized or searched:
-    /// Render reaches it only from the `hDeviceSpecificAllocation` in its own
-    /// allocation list.
+    /// present only for HVM1 roles 1-4 and exact non-standard,
+    /// resource-associated HWA2 buffers/images. `SHARED` is deliberately not
+    /// part of this decision: that bit describes external D3D sharing, while
+    /// `RESOURCE_ASSOCIATED` is the HRA1 ownership edge. It is never serialized
+    /// or searched: Render reaches it only from the
+    /// `hDeviceSpecificAllocation` in its own allocation list.
     execution: Option<OpenExecutionBinding>,
     /// Generic open-object rundown used by the D3D12 GPUVA resolver, including
     /// HOC1 which intentionally has no renderer resource attachment.
@@ -847,10 +856,10 @@ struct OpenExecutionRundown {
 /// this object; they are validation facts after the direct edge is reached.
 struct OpenExecutionBinding {
     allocation: usize,
-    /// Roles 2-4 and C57 retain a second session reference specifically for
-    /// executor custody. Role 1 is opened while the session is provisional and
-    /// borrows the adjacent `reply_pool_session` reference instead; close still
-    /// revokes this binding before releasing that owner.
+    /// Roles 2-4 and HWA2 outer resources retain a second session reference
+    /// specifically for executor custody. Role 1 is opened while the session is
+    /// provisional and borrows the adjacent `reply_pool_session` reference
+    /// instead; close still revokes this binding before releasing that owner.
     rundown: SpinLock<OpenExecutionRundown>,
     drained: UnsafeCell<KEVENT>,
     /// Signaled whenever the one-time CTX_ATTACH transition is not in flight.
@@ -1782,9 +1791,11 @@ struct Hnr2ExecutionAllocationFacts {
 /// HVM1 roles 1-3 are admitted only after K2a has release-published its
 /// OS-owned backing and stable kernel view. Role 4 is the inverse contract: its
 /// KMD-created pure-device-local HOST3D backing must exist while every K2a/CPU
-/// mapping field remains absent. The only HWA2 admission is the C57 shape: a
-/// non-standard shared resource-associated buffer/image opened directly on the
-/// submitting KMT device. No present/global classification participates.
+/// mapping field remains absent. HWA2 admission is an exact non-standard,
+/// resource-associated buffer/image opened directly on the submitting KMT
+/// device. External D3D sharing is orthogonal: ordinary associated allocations
+/// and C57 imports both require the same executor edge. No present/global
+/// classification participates.
 unsafe fn hnr2_execution_allocation_facts(
     allocation: usize,
 ) -> Option<Hnr2ExecutionAllocationFacts> {
@@ -1823,15 +1834,11 @@ unsafe fn hnr2_execution_allocation_facts(
     } else {
         let desc = ctx.final_hwa2?;
         let byte_size = desc.byte_size;
-        let exact_c57 = desc.allocation_generation == ctx.generation
-            && (desc.allocation_kind == HELIOS_HWA2_KIND_BUFFER
-                || desc.allocation_kind == HELIOS_HWA2_KIND_IMAGE)
-            && !desc.has_flag(HELIOS_HWA2_FLAG_STANDARD)
-            && desc.has_flag(HELIOS_HWA2_FLAG_SHARED)
-            && desc.has_flag(HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED)
+        let exact_outer = desc.allocation_generation == ctx.generation
+            && helios_kmd_logic::outer_execution::hwa2_is_outer_execution_resource(&desc)
             && ctx.venus_alloc_size >= byte_size
             && ctx.venus_alloc_size != 0;
-        if !exact_c57 {
+        if !exact_outer {
             return None;
         }
         (byte_size, 0, None)
@@ -3022,6 +3029,15 @@ struct AdmittedAllocation {
     size_provenance: BackingSize,
 }
 
+// HWA2 allocations already own the Venus backing created by `build_backing`.
+// Requesting an additional OS shared backing makes dxgkrnl call
+// `DxgkDdiSetAllocationBackingStore`, whose exact contract is intentionally
+// limited to HVM1 and HOC1. Keep this a compile-time invariant: the accidental
+// `true` value made every first D3D11 buffer fail its enclosing pfnAllocateCb
+// with E_INVALIDARG after an otherwise successful HWA2 CreateAllocation.
+const HWA2_SHARE_BACKING_STORE_WITH_KMD: bool = false;
+const _: () = assert!(!HWA2_SHARE_BACKING_STORE_WITH_KMD);
+
 /// Admit one HWA2 create-input record, create its backing, and stamp the
 /// create-output record back into the `[in/out]` buffer.
 ///
@@ -3401,45 +3417,18 @@ unsafe fn admit_hwa2(
     };
 
     let local_seg_id = adapter.local_segment().map(|segment| segment.seg_id);
-    // HostAuthoritative is exactly the three KMD-created arms, which are exactly
-    // the arms that set `venus_memory_id`. What that buys is that the aperture
-    // path's safety rests on a stated fact rather than on an incidental property
-    // of an unrelated field.
-    //
-    // ⛔ THE THIRD TERM IS LOAD-BEARING AND IS NEW: **BAR eligibility requires a
-    // MAPPABLE blob**, and since K4 that is no longer true by construction.
-    // Round 3 of the Phase-2 review found the disagreement.
-    //
-    // Before K4, `create_one` passed `mappable = true` unconditionally
-    // (`d1c820a:create_allocation.rs:2214`), so every host-authoritative blob
-    // could be mapped and this predicate did not need to care. `classify_hwa2`
-    // now derives `mappable` from `HELIOS_HWA2_FLAG_CPU_VISIBLE`, and
-    // `allocate_memory_blob` omits `VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE` when it
-    // is false. Meanwhile this predicate had no CPU-visibility term at all — so
-    // a D3D12 `D3D12_HEAP_TYPE_DEFAULT` resource (`CPUPageProperty ==
-    // CPU_NOT_AVAILABLE` ⇒ the flag clear ⇒ a non-mappable blob) was published
-    // BAR-eligible, `vidmm_placement` PREFERRED it into the BAR, and the paging
-    // engine then issued `VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB` against a blob the
-    // host was never asked to make mappable — `build_paging_buffer.rs`'s
-    // not-eligible arm says in terms that the eligible arm is the one that maps.
-    // `BAR_ERR_MAP` would then name the symptom and not the cause.
-    //
-    // The term also states what the placement is for: only a CPU-visible linear
-    // allocation participates in the KMD content-transfer engine. Device-local
-    // and opaque resources stay in the aperture-backed renderer path.
-    //
-    // ⚠ The live D3D11 desktop cannot reach the broken arm today — the D3D11
-    // producer sets `HELIOS_HWA2_FLAG_CPU_VISIBLE` unconditionally — and `umd12`
-    // is behind the default-OFF `UmdD3D12` knob. This is fixed before its first
-    // boot rather than after, which is the point of reviewing before flipping.
-    //
-    // The `OPAQUE_OPTIMAL` exclusion is the same invariant from the other side:
-    // `scanout.rs` records that the OPTIMAL GDI image "is deliberately not
-    // mappable". Both terms now say one thing — BAR ⇒ mappable.
-    let bar_eligible = created.blob_size.is_host_authoritative()
-        && desc.swizzle_class != HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL
-        && desc.has_flag(HELIOS_HWA2_FLAG_CPU_VISIBLE)
-        && local_seg_id.is_some();
+    // Keep the complete local-placement policy in host-testable logic. In
+    // particular, HWA2 `SHARED` resources must remain aperture-only: the
+    // pre-retirement adopted-resource path deliberately excluded this class
+    // after local placement destabilized LogonUI/DWM, and dxgkrnl now rejects
+    // the same shape during pfnAllocateCb after Create/Open have succeeded.
+    // Ordinary CPU-visible linear allocations retain local placement.
+    let bar_eligible =
+        helios_kmd_logic::allocation_placement::hwa2_may_prefer_local_memory(
+            &desc,
+            created.blob_size.is_host_authoritative(),
+            local_seg_id.is_some(),
+        );
     let placement = vidmm_placement(
         bar_eligible,
         local_seg_id,
@@ -3461,7 +3450,7 @@ unsafe fn admit_hwa2(
     Ok(AdmittedAllocation {
         kind: desc.allocation_kind,
         hvm1_role: 0,
-        share_backing_store: true,
+        share_backing_store: HWA2_SHARE_BACKING_STORE_WITH_KMD,
         generation,
         final_hwa2: Some(desc),
         vidmm_size,
@@ -4574,28 +4563,28 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
 /// return a miniport-owned, device-specific tracking handle as required by the
 /// DDI contract.
 ///
-/// # ⛔ THIS DDI WRITES NO BYTE OF AN HWA2 OR HOC1 BUFFER — and exactly one of an HVM1
+/// # The create-open publishes HWA2/HVM1; ordinary opens are const
 ///
 /// The no-restamp rule is the retirement's identity model (§10.3:1033-1034,
 /// §18.1:4769, A.2 row 5694): two `write_open_identity` restamps used to live
 /// here, one per entry and one call-level, and their existence is exactly why
-/// two openers of one allocation could disagree about what they had. That rule
-/// stands for HWA2 and HOC1, whose descriptors are `const` from the instant
-/// `DxgkDdiCreateAllocation` returns.
+/// two openers of one allocation could disagree about what they had. HOC1 and
+/// every ordinary open remain const.
 ///
 /// ⛔ It could NOT stand for the HVM1 create-output, and the premise underneath
 /// it — that a create-time write reaches the caller — was FALSIFIED on the
 /// target on 2026-08-11: dxgkrnl discards a KMD write into
 /// `DXGK_ALLOCATIONINFO::pPrivateDriverData` for any user-supplied buffer, so
-/// there was no channel left. [`stamp_open_hvm1`] is that one licensed write and
-/// carries the measurement; nothing else here may take a `*mut` to
-/// `pPrivateDriverData`.
+/// there was no channel left. [`stamp_open_hvm1`] and [`stamp_open_hwa2`] are
+/// the two create-flagged publications through the WDK's actual in/out field.
+/// Both copy the one canonical output already minted by CreateAllocation;
+/// neither derives a per-open identity, and neither writes on an ordinary open.
 ///
 /// The thing the restamps were FOR — giving a UMD opener of a KMD-created
 /// standard allocation something to alias the venus resource with — is not
-/// solved by writing a different record here. It is solved structurally: HWA2 is
-/// written once at create and dxgkrnl carries the identical bytes to
-/// `OpenResource`.
+/// solved by writing a different record here. It is solved structurally: the
+/// canonical allocation owns one final HWA2, the create-open publishes exactly
+/// those bytes, and every later opener must match them byte-for-byte.
 ///
 /// # The canonical open/allocation association
 ///
@@ -4715,13 +4704,30 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         crate::diag::record(0x0C21_0000 | ((info.PrivateDriverDataSize as u32).min(0xFFFF)));
         crate::diag::record(0x0C35_0000 | ((info.hAllocation as usize as u32) & 0xFFFF));
 
-        // Read-only, and only from the PER-ALLOCATION buffer. The resource-level
-        // fallback the pre-retirement path had is gone for the same reason the
-        // create-time one is: §10.3 associates one descriptor with one
-        // allocation, so reading the resource-level copy would be reading a
-        // different allocation's identity.
-        let desc =
-            unsafe { read_open_descriptor(info.pPrivateDriverData, info.PrivateDriverDataSize) };
+        // Only the PER-ALLOCATION buffer participates. The resource-level
+        // fallback remains gone: §10.3 associates one descriptor with one
+        // allocation, so consulting that copy would read a different
+        // allocation's identity. A create-flagged open publishes the exact
+        // canonical HWA2 output because Windows discards the earlier create-DDI
+        // write; an ordinary open is strictly read-only.
+        let open_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
+        let desc = if open_flags & DXGK_OPENALLOCATION_FLAG_CREATE != 0 {
+            unsafe {
+                stamp_open_hwa2(
+                    info.pPrivateDriverData,
+                    info.PrivateDriverDataSize,
+                    canonical_allocation,
+                )
+            }
+        } else {
+            unsafe {
+                read_open_descriptor(
+                    info.pPrivateDriverData,
+                    info.PrivateDriverDataSize,
+                    canonical_allocation,
+                )
+            }
+        };
 
         // K5: stamp the HVM1 create-output and bind the role-1 reply pool to the
         // raw device's provisional HTS1 session. This DDI is the ONLY allocation
@@ -4740,7 +4746,6 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         // `DXGK_OPENALLOCATIONFLAGS::Create` ("if not set then allocation is
         // being opened", `d3dkmddi.h`) is the bit that says which open this is.
         // An ordinary open reads the record the creating open already published.
-        let open_flags = unsafe { args.Flags.__bindgen_anon_1.Value };
         let hvm1 = if open_flags & DXGK_OPENALLOCATION_FLAG_CREATE != 0 {
             unsafe {
                 stamp_open_hvm1(
@@ -4817,11 +4822,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
                 }
             }
         } else if desc.is_some_and(|d| {
-            (d.allocation_kind == HELIOS_HWA2_KIND_BUFFER
-                || d.allocation_kind == HELIOS_HWA2_KIND_IMAGE)
-                && !d.has_flag(HELIOS_HWA2_FLAG_STANDARD)
-                && d.has_flag(HELIOS_HWA2_FLAG_SHARED)
-                && d.has_flag(HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED)
+            helios_kmd_logic::outer_execution::hwa2_is_outer_execution_resource(&d)
         }) {
             Some(
                 crate::ddi::translation_session::retain_execution_session(device.session_cell())
@@ -4939,6 +4940,7 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
 unsafe fn read_open_descriptor(
     private: *const c_void,
     private_size: UINT,
+    canonical_allocation: usize,
 ) -> Option<HeliosWddmAllocationDescV2> {
     if private.is_null() || private_size as usize != HELIOS_HWA2_BYTES as usize {
         return None;
@@ -4952,15 +4954,115 @@ unsafe fn read_open_descriptor(
         // counted: it is not a rejected HWA2, it is a different record.
         return None;
     }
+    let Some(ctx) = (unsafe { resolve_alloc(canonical_allocation as HANDLE) }) else {
+        bump(&OPEN_HWA2_REJECT, b"OaHwa2Rej");
+        return None;
+    };
     if desc
         .validate_create_output(HELIOS_PACKAGE_GENERATION)
         .is_err()
+        || ctx.final_hwa2 != Some(desc)
+        || ctx.generation != desc.allocation_generation
+        || ctx.kind != desc.allocation_kind
     {
         bump(&OPEN_HWA2_REJECT, b"OaHwa2Rej");
         crate::diag::record(0x0C02_00E6);
         return None;
     }
     Some(desc)
+}
+
+/// Publish the canonical HWA2 create-output through a create-flagged
+/// `DxgkDdiOpenAllocation`.
+///
+/// Windows was measured to discard the KMD's write into the user-supplied
+/// `DXGK_ALLOCATIONINFO::pPrivateDriverData`, while this open buffer is the
+/// WDK-annotated in/out channel. The generation is still minted exactly once by
+/// `admit_hwa2` and stored on the canonical allocation; this function merely
+/// copies that same final record. It accepts either the exact create-input or
+/// the exact already-published output, so KMD-authored standard allocations and
+/// an OS that preserves the earlier write converge on the same bytes.
+///
+/// # Safety
+/// `private` is dxgkrnl's per-allocation private buffer and `private_size` its
+/// authoritative length. The only write is bounded by the exact-size check and
+/// occurs only on the create-flagged open selected by the caller.
+unsafe fn stamp_open_hwa2(
+    private: *mut c_void,
+    private_size: UINT,
+    canonical_allocation: usize,
+) -> Option<HeliosWddmAllocationDescV2> {
+    if private.is_null() || private_size as usize != HELIOS_HWA2_BYTES as usize {
+        return None;
+    }
+    let parsed = {
+        // SAFETY: non-null and exact length proven above. Keep the read slice
+        // scoped before forming the mutable output slice below.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(private as *const u8, HELIOS_HWA2_BYTES as usize)
+        };
+        HeliosWddmAllocationDescV2::from_private_data(bytes)
+    };
+    let Ok(desc) = parsed else {
+        return None;
+    };
+    if desc.magic != HELIOS_HWA2_MAGIC {
+        return None;
+    }
+    let Some(ctx) = (unsafe { resolve_alloc(canonical_allocation as HANDLE) }) else {
+        bump(&OPEN_HWA2_REJECT, b"OaHwa2Rej");
+        return None;
+    };
+    let Some(canonical) = ctx.final_hwa2 else {
+        bump(&OPEN_HWA2_REJECT, b"OaHwa2Rej");
+        return None;
+    };
+    if canonical
+        .validate_create_output(HELIOS_PACKAGE_GENERATION)
+        .is_err()
+        || canonical.allocation_generation != ctx.generation
+        || canonical.allocation_kind != ctx.kind
+    {
+        bump(&OPEN_HWA2_REJECT, b"OaHwa2Rej");
+        return None;
+    }
+
+    // A KMD-authored standard allocation can already carry the output because
+    // dxgkrnl owns that buffer. Never rewrite an already-canonical record.
+    if desc == canonical {
+        return Some(canonical);
+    }
+
+    // Reconstruct the one legal create-input from the canonical output. HWA2's
+    // field partition makes generation and the KMD-owned flag bits the only
+    // differences for UMD-authored allocations. If KMD standard-allocation
+    // extent adoption changed any other field, only the already-canonical arm
+    // above is legal; a guessed reconstruction is refused.
+    if desc
+        .validate_create_input(HELIOS_PACKAGE_GENERATION)
+        .is_err()
+    {
+        bump(&OPEN_HWA2_REJECT, b"OaHwa2Rej");
+        crate::diag::record(0x0C02_00E6);
+        return None;
+    }
+    let expected_input = HeliosWddmAllocationDescV2 {
+        allocation_generation: 0,
+        flags: canonical.flags & !helios_protocol::HELIOS_HWA2_FLAG_KMD_OWNED_MASK,
+        ..canonical
+    };
+    if desc != expected_input {
+        bump(&OPEN_HWA2_REJECT, b"OaHwa2Rej");
+        crate::diag::record(0x0C02_00E6);
+        return None;
+    }
+
+    // SAFETY: exact size and writable create-open buffer proven above.
+    let out =
+        unsafe { core::slice::from_raw_parts_mut(private as *mut u8, HELIOS_HWA2_BYTES as usize) };
+    out.copy_from_slice(bytes_of(&canonical));
+    bump(&OPEN_HWA2_STAMPED, b"OaHwa2Stamp");
+    Some(canonical)
 }
 
 unsafe fn prepare_outer_gpuva_state(canonical_allocation: usize) -> bool {

@@ -21,8 +21,9 @@ use helios_kmd_logic::direct_scanout_lifetime::{
 };
 use helios_protocol::diagnostics::HeliosGraphicsEtwPayloadV1;
 use helios_protocol::{
-    HeliosAdapterMatch, VirtioGpuCtrlHdr, HELIOS_PACKAGE_GENERATION, VIRTIO_GPU_FLAG_FENCE,
-    VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, VIRTIO_GPU_RESP_OK_NODATA,
+    HeliosAdapterMatch, VirtioGpuCtrlHdr, DXGI_FORMAT_B8G8R8X8_UNORM, HELIOS_PACKAGE_GENERATION,
+    VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM, VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM,
+    VIRTIO_GPU_RESP_OK_NODATA,
 };
 use wdk_sys::{
     HANDLE, NTSTATUS, STATUS_DEVICE_NOT_READY, STATUS_INVALID_PARAMETER, STATUS_SUCCESS,
@@ -66,6 +67,10 @@ static ADMISSION_REFUSALS: RefusalCounter = RefusalCounter::new();
 static MAILBOX_REFUSALS: RefusalCounter = RefusalCounter::new();
 static PLANE_REFUSALS: RefusalCounter = RefusalCounter::new();
 static RESET_REFUSALS: RefusalCounter = RefusalCounter::new();
+// Last 0xf0 completion refusal's raw facts — see complete_queued.
+static COMPLETION_RESPONSE_TYPE: AtomicU32 = AtomicU32::new(0);
+static COMPLETION_RESPONSE_FLAGS: AtomicU32 = AtomicU32::new(0);
+static COMPLETION_FAIL_BITS: AtomicU32 = AtomicU32::new(0);
 
 fn record_refusal(counter: &RefusalCounter, _name: &'static [u8], code: u32) {
     // Admission is shared by MPO3 and classic SetVidPn, whose latter entry may
@@ -101,6 +106,9 @@ pub(crate) fn record_refusal_counters() {
         crate::diag::record_named_bytes(name, counter.count.load(Ordering::Relaxed));
         crate::diag::record_named_bytes(reason_name, counter.last_reason.load(Ordering::Relaxed));
     }
+    crate::diag::record_named_bytes(b"D2CmpTyp", COMPLETION_RESPONSE_TYPE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2CmpFlg", COMPLETION_RESPONSE_FLAGS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2CmpBit", COMPLETION_FAIL_BITS.load(Ordering::Relaxed));
 }
 
 pub(crate) fn reset_refusal_counters() {
@@ -121,6 +129,8 @@ pub(crate) struct DirectScanoutOperation {
     pub stereo: bool,
     pub shared_primary_transition: bool,
     pub independent_flip_exclusive: bool,
+    /// Classic `ModeChange` flip — see `OperationFacts::mode_change`.
+    pub mode_change: bool,
     pub unsupported_or_reserved_flags: u32,
 }
 
@@ -451,13 +461,45 @@ pub(crate) unsafe fn validate_direct_scanout_binding(
         stereo: operation.stereo,
         shared_primary_transition: operation.shared_primary_transition,
         independent_flip_exclusive: operation.independent_flip_exclusive,
+        mode_change: operation.mode_change,
         unsupported_or_reserved_flags: operation.unsupported_or_reserved_flags,
     };
-    if validate_binding_model(&final_hwa2, &mode, os_source, &operation, &plane).is_err() {
-        record_refusal(&ADMISSION_REFUSALS, b"D2AdmRef", 4);
+    let verdict = validate_binding_model(&final_hwa2, &mode, os_source, &operation, &plane);
+    if verdict.is_err() {
+        // 0x4X/0x5X/0x6X name the refusal arm (a literal match — this function
+        // is on D4's pinned DIRQL call surface, so no helper call); 0x7F is
+        // every arm not yet worth its own code.
+        use helios_kmd_logic::direct_scanout_admission::Refusal as R;
+        let code = match verdict {
+            Err(R::SourceInvisible) => 0x45,
+            Err(R::SourcePoweredOff) => 0x46,
+            Err(R::CommittedSourceMismatch { .. }) => 0x4A,
+            Err(R::UnsupportedOrReservedOperationFlags { .. }) => 0x4E,
+            Err(R::StandardPrimarySemanticsMismatch { .. }) => 0x51,
+            Err(R::DirectFlipCompatibleFlagMissing) => 0x54,
+            Err(R::FormatNotBgra8 { .. }) => 0x58,
+            Err(R::D3dDdiFormatNotA8R8G8B8 { .. }) => 0x59,
+            Err(R::AllocationSourceExtentMismatch { .. }) => 0x5D,
+            Err(R::PlaneRowPitchTooSmall { .. }) => 0x63,
+            Err(R::PlaneFullFrameRangeExceedsBacking { .. }) => 0x66,
+            Err(R::PlaneSlicePitchTooSmall { .. }) => 0x67,
+            Err(R::UnsupportedSwizzleClass { .. }) => 0x69,
+            Err(R::AllocationSourceMismatch { .. }) => 0x6A,
+            _ => 0x7F,
+        };
+        record_refusal(&ADMISSION_REFUSALS, b"D2AdmRef", code);
         return Err(STATUS_INVALID_PARAMETER);
     }
     let plane0 = final_hwa2.planes[0];
+    // The admitted set is exactly {87 Bgra8, 88 Bgrx8}; map to the matching
+    // SET_SCANOUT_BLOB wire format instead of claiming alpha on an XR24 frame.
+    // A literal match, not the kmd_logic converter: this path is on D4's
+    // audited DIRQL call surface, which pins its qualified-call set.
+    let wire_format = if final_hwa2.dxgi_format == DXGI_FORMAT_B8G8R8X8_UNORM {
+        VIRTIO_GPU_FORMAT_B8G8R8X8_UNORM
+    } else {
+        VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM
+    };
     Ok(ValidatedDirectScanoutBinding {
         binding: Binding::new(
             DisplayBacking {
@@ -466,7 +508,7 @@ pub(crate) unsafe fn validate_direct_scanout_binding(
                 resource_id,
                 width: final_hwa2.width,
                 height: final_hwa2.height,
-                format: VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM,
+                format: wire_format,
                 stride: plane0.row_pitch,
                 offset: plane0.offset as u32,
             },
@@ -550,21 +592,74 @@ pub(crate) fn complete_queued(
         _operation_flags,
     ) = completion.work.into_parts();
 
-    let current_mode_generation = match adapter.committed_mode.read() {
-        Ok(CommittedModeRead::Present(observation)) => observation.mode().generation,
-        _ => 0,
+    let current_mode = match adapter.committed_mode.read() {
+        Ok(CommittedModeRead::Present(observation)) => Some(observation.mode()),
+        _ => None,
     };
+    let current_mode_generation = current_mode.map_or(0, |mode| mode.generation);
     let provenance_exact = accepted || rejected;
-    let identity_exact = completion.instance != 0
+    let identity_exact_except_generation = completion.instance != 0
         && completion.instance == work_instance
         && completion.instance == candidate_instance
         && completion.sequence != 0
         && completion.fence_id != 0
         && completion.resource_id == resource_id
-        && source_id == SOURCE_ID
+        && source_id == SOURCE_ID;
+    let identity_exact = identity_exact_except_generation
         && current_mode_generation != 0
         && current_mode_generation == mode_generation;
+    // The stored generation moves on EVERY policy write (visibility/power
+    // rewrite mode.generation, and storage reconstructs it from high_water),
+    // so a bind in flight across the modeset's own visibility-TRUE is stale by
+    // construction (D2CmpBit=0xFF7 on all four boot flips, 22.22.334.0).
+    // Staleness is not corruption: when the CURRENT mode still names this
+    // exact source and geometry, the OS still wants this frame — accept it as
+    // current. A geometry/source change means the frame really is outdated:
+    // retain the backing (QEMU may still read it) without poisoning.
+    let stale_generation_only = provenance_exact
+        && identity_exact_except_generation
+        && current_mode_generation != 0
+        && current_mode_generation != mode_generation;
+    let geometry_current = current_mode.is_some_and(|mode| {
+        mode.active
+            && mode.source_id == SOURCE_ID
+            && mode.source_width == binding.token().width
+            && mode.source_height == binding.token().height
+    });
+    if stale_generation_only && !geometry_current {
+        let mut state = adapter.direct_scanout.state.lock();
+        state.quarantine(BackendBinding::Real(binding));
+        drop(state);
+        record_refusal(&PLANE_REFUSALS, b"D2PlnRef", 0xf1);
+        return;
+    }
+    let identity_exact = identity_exact || (stale_generation_only && geometry_current);
     if !provenance_exact || !identity_exact {
+        // DIRQL-safe facts for the 0xf0 refusal: the response type, its
+        // flags/length, and one bit per sub-check (0 = the failing one).
+        // Published by record_refusal_counters as D2CmpTyp/D2CmpFlg/D2CmpBit.
+        COMPLETION_RESPONSE_TYPE.store(
+            response.map_or(0, |header| header.type_),
+            Ordering::Relaxed,
+        );
+        COMPLETION_RESPONSE_FLAGS.store(
+            response.map_or(0, |header| header.flags) | ((completion.written_length as u32) << 16),
+            Ordering::Relaxed,
+        );
+        let bits = (response.is_some() as u32)
+            | ((exact_fence as u32) << 1)
+            | ((accepted as u32) << 2)
+            | ((rejected as u32) << 3)
+            | (((completion.instance != 0) as u32) << 4)
+            | (((completion.instance == work_instance) as u32) << 5)
+            | (((completion.instance == candidate_instance) as u32) << 6)
+            | (((completion.sequence != 0) as u32) << 7)
+            | (((completion.fence_id != 0) as u32) << 8)
+            | (((completion.resource_id == resource_id) as u32) << 9)
+            | (((source_id == SOURCE_ID) as u32) << 10)
+            | (((current_mode_generation != 0) as u32) << 11)
+            | (((current_mode_generation == mode_generation) as u32) << 12);
+        COMPLETION_FAIL_BITS.store(bits, Ordering::Relaxed);
         let mut state = adapter.direct_scanout.state.lock();
         state.quarantine(BackendBinding::Real(binding));
         state.poisoned = true;
@@ -1400,9 +1495,15 @@ pub(crate) fn retire_allocation(
 }
 
 fn resume_plane(adapter: &AdapterContext) -> bool {
+    // 0x132C = why resume_plane failed: 1 poisoned, 2 non-resumable lifecycle,
+    // 3 plane.resume() refused (PendingBusy / real backend / generation).
+    // Recorded only after the spinlock is released — diag::record is a
+    // registry write and this lock raises to DISPATCH.
     let transition = {
         let mut state = adapter.direct_scanout.state.lock();
         if state.poisoned {
+            drop(state);
+            crate::diag::record(0x132C_0001);
             return false;
         }
         let Some(plane) = state.plane.as_mut() else {
@@ -1411,10 +1512,17 @@ fn resume_plane(adapter: &AdapterContext) -> bool {
         match plane.lifecycle() {
             Lifecycle::Active => return true,
             Lifecycle::Quiescent(_) | Lifecycle::ResetQuiescent => plane.resume(),
-            _ => return false,
+            _ => {
+                drop(state);
+                crate::diag::record(0x132C_0002);
+                return false;
+            }
         }
     };
     let resumed = transition.effect == Effect::Resumed;
+    if !resumed {
+        crate::diag::record(0x132C_0003);
+    }
     finish_transition(adapter, transition);
     resumed
 }

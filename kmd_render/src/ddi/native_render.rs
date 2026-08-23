@@ -185,12 +185,11 @@ pub static NR2_PATCH_WINDOW_TOTAL: AtomicU32 = AtomicU32::new(0);
 pub static NR2_SLOT_UNDERFLOW: AtomicU32 = AtomicU32::new(0);
 /// Staging admissions (COMMITs whose reassembled size the §10.7 pool accepted).
 pub static NR2_SLOT_TAKEN: AtomicU32 = AtomicU32::new(0);
-/// Staging retirements at SubmitCommand.
+/// Staging retirements at the exact custody terminal: synchronous control work
+/// at Render return, and queued work at its asynchronous host terminal.
 ///
 /// ⚠ GRADE IT AS A PAIR WITH `Nr2Slot`, NOT AS A LEVEL. A persistent shortfall
-/// means dxgkrnl is not calling `DxgkDdiSubmitCommand` for these submissions,
-/// which is the one thing about this path that is asserted rather than measured
-/// — hence the 112-byte header copy that keeps every HNR2 DMA buffer non-empty.
+/// means a checked-out payload still has live custody or missed its terminal.
 pub static NR2_SLOT_RETIRED: AtomicU32 = AtomicU32::new(0);
 /// HNR2 `DxgkDdiSubmitCommand` calls.
 pub static NR2_SUBMITS: AtomicU32 = AtomicU32::new(0);
@@ -870,6 +869,8 @@ struct ReadyBatch {
     payload: DmaBuffer,
     meta: DmaBuffer,
     custody: NativeCustody,
+    /// A7 proved an allocation-only destroy/free terminal with no queue op.
+    terminal_teardown: bool,
 }
 
 struct BuildingBatch {
@@ -1770,6 +1771,9 @@ fn execute_outer_pending(
         &mut scratch.schema_counts,
     )
     .map_err(|_| OuterExecutionRefusal::Schema)?;
+    if admission.terminal_teardown && (uses.len() != 1 || !operands.is_empty()) {
+        return Err(OuterExecutionRefusal::OperandClosure);
+    }
     if admission.operand_count as usize != operands.len() {
         return Err(OuterExecutionRefusal::OperandClosure);
     }
@@ -1839,6 +1843,16 @@ fn execute_outer_pending(
         slot_index,
         custody: Some(custody),
     };
+    // A nonzero INFO_RING_IDX is a Vulkan queue object id at the renderer.
+    // The terminal A7 form contains no queue operation and Mesa joined every
+    // exact allocation progress point before emitting it, so fence its actual
+    // decoder execution on K11's existing session-local ring-zero timeline.
+    // The used-ring response remains the sole normal K9 terminal.
+    let submit_domain = if admission.terminal_teardown {
+        crate::virtio::gpu::NativeSubmitDomain::Decoder
+    } else {
+        crate::virtio::gpu::NativeSubmitDomain::Queue(native.ring_index)
+    };
     let mut pending_buffers = Some((meta, record_buffer, completion));
     let queued = adapter.with_virtio(|gpu| {
         if gpu.scanout_transport_instance() != transport_instance {
@@ -1847,7 +1861,7 @@ fn execute_outer_pending(
         pending_buffers.take().map(|(meta, payload, completion)| {
             gpu.enqueue_native_submit(
                 host_context_id,
-                native.ring_index,
+                submit_domain,
                 meta,
                 payload,
                 payload_len,
@@ -2154,6 +2168,12 @@ pub(crate) unsafe fn render_outer_physical(
         Ok(admission) => admission,
         Err(_) => return fail(OuterExecutionRefusal::Schema, STATUS_INVALID_PARAMETER),
     };
+    if admission.terminal_teardown && (uses.len() != 1 || !operands.is_empty()) {
+        return fail(
+            OuterExecutionRefusal::OperandClosure,
+            STATUS_INVALID_PARAMETER,
+        );
+    }
     if admission.operand_count as usize != operands.len() {
         return fail(
             OuterExecutionRefusal::OperandClosure,
@@ -2264,6 +2284,7 @@ pub(crate) unsafe fn render_outer_physical(
             _session: session_operation,
             _allocations: allocations,
         }),
+        terminal_teardown: admission.terminal_teardown,
     };
     {
         let mut executor = native.executor.lock();
@@ -2401,6 +2422,21 @@ fn abandon_control_building(scratch: &mut Hnr2Scratch, native: &NativeContext) {
         NR2_SLOT_UNDERFLOW.fetch_add(1, Ordering::Relaxed);
     }
     drop(building);
+}
+
+/// Finish the exact staging checkout for a control operation that has already
+/// reached its synchronous host terminal in Render. The host-completed DMA
+/// flag prevents SubmitCommand from retiring the same checkout a second time.
+fn finish_synchronous_control_staging(native: &NativeContext, bytes: u64) {
+    let finished = native.state.lock().staging_mut().finish_synchronous(bytes);
+    match finished {
+        Ok(()) => {
+            NR2_SLOT_RETIRED.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(_) => {
+            NR2_SLOT_UNDERFLOW.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 fn begin_control_batch(
@@ -2976,6 +3012,7 @@ fn finalize_executor_commit(
             _allocations: prepared.allocations,
             reply: prepared.reply,
         },
+        terminal_teardown: false,
     };
     let mut executor = native.executor.lock();
     let Some(slot) = executor.slots.get_mut(prepared.slot_index as usize) else {
@@ -3787,6 +3824,9 @@ fn commit(
             &mut scratch.expected_operands,
             &mut scratch.schema_counts,
         );
+        // Generated payload custody ends with the synchronous host operation,
+        // not with the later scheduler fence callback.
+        drop(generated);
         if status != STATUS_SUCCESS {
             // No SubmitCommand follows a failed Render, so give back the exact
             // staging admission here. `control_render` likewise gives back its
@@ -3801,6 +3841,7 @@ fn commit(
         // SAFETY: `publish_dma_record` succeeded above and the private-data
         // pointer is not advanced until after this exact marker is written.
         unsafe { mark_dma_host_completed(args, header.batch_token) };
+        finish_synchronous_control_staging(native, header.total_payload_bytes);
     } else if let Some(prepared) = prepared_executor {
         if let Err(status) = finalize_executor_commit(scratch, native, prepared) {
             return status;
@@ -4582,6 +4623,11 @@ pub(crate) unsafe fn submit_outer_physical(
             slot_index,
             batch,
         } => {
+            let submit_domain = if batch.terminal_teardown {
+                crate::virtio::gpu::NativeSubmitDomain::Decoder
+            } else {
+                crate::virtio::gpu::NativeSubmitDomain::Queue(native.ring_index)
+            };
             let host_context_id = batch.custody.host_context_id();
             let transport_instance = batch.custody.transport_instance();
             let completion = NativeHostCompletion {
@@ -4598,7 +4644,7 @@ pub(crate) unsafe fn submit_outer_physical(
                 pending.take().map(|(meta, payload, completion)| {
                     gpu.enqueue_native_submit(
                         host_context_id,
-                        native.ring_index,
+                        submit_domain,
                         meta,
                         payload,
                         identity.payload_bytes as usize,
@@ -4701,7 +4747,14 @@ pub(crate) unsafe fn submit(
     };
     if resubmission {
         NR2_SUBMIT_RESUBMISSION.fetch_add(1, Ordering::Relaxed);
-    } else if native.class == NativeClass::Control && record.payload_bytes != 0 {
+    } else if native.class == NativeClass::Control
+        && record.payload_bytes != 0
+        && record.flags != HELIOS_HNR2_KMD_DMA_FLAG_HOST_COMPLETED
+    {
+        // Successful finite control work already released its staging at the
+        // synchronous Render terminal. This arm is only defensive cleanup for
+        // an unmarked record; the host-completed bit is the existing exact
+        // per-submission discriminator and avoids a second retirement.
         let mut state = native.state.lock();
         let retired = state.staging_mut().retire(record.payload_bytes as u64);
         drop(state);
@@ -4921,7 +4974,7 @@ pub(crate) unsafe fn submit(
                     pending.take().map(|(meta, payload, completion)| {
                         gpu.enqueue_native_submit(
                             host_context_id,
-                            native.ring_index,
+                            crate::virtio::gpu::NativeSubmitDomain::Queue(native.ring_index),
                             meta,
                             payload,
                             identity.payload_bytes as usize,

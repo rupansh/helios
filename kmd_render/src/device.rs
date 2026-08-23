@@ -874,14 +874,11 @@ const _: () = assert!(
     crate::ddi::present_packet::PRESENT_DMA_PRIVATE_DATA_BYTES
         >= helios_protocol::wddm::HELIOS_HOS1_BYTES as u32
 );
+const _: () = assert!(helios_protocol::wddm::HELIOS_HOB1_MAX_BYTES <= u32::MAX as u64);
 
 fn write_context_info(info: &mut DXGK_CONTEXTINFO, profile: ContextInfoProfile) {
     match profile {
-        // ⛔ IDENTICAL TO `Legacy`, INCLUDING `DmaBufferSegmentSet = 1`. A zero
-        // segment set null-derefs dxgmms2 in `VidMmInitDmaPool` for a runtime
-        // context (measured, see the profile enum), and an HQA1 outer context IS
-        // a runtime context — only HVC1 selects zero.
-        ContextInfoProfile::Hqa1Outer | ContextInfoProfile::Legacy => {
+        ContextInfoProfile::Legacy => {
             // Use the paging aperture for DMA buffers. With the decorative GpuMmu
             // model, dxgkrnl's CDD context creates a privileged DMA pool with
             // GPU-VA mapping enabled; if this is 0, dxgmms2 uses contiguous system
@@ -895,6 +892,24 @@ fn write_context_info(info: &mut DXGK_CONTEXTINFO, profile: ContextInfoProfile) 
                 crate::ddi::present_packet::PRESENT_DMA_PRIVATE_DATA_BYTES;
             info.AllocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
             info.PatchLocationListSize = DXGK_ALLOCATION_LIST_SIZE_GDICONTEXT;
+        }
+        ContextInfoProfile::Hqa1Outer => {
+            // HQA1 is still an ordinary D3D runtime context, so it must retain
+            // the aperture-backed DMA allocation. A zero segment set null-derefs
+            // dxgmms2 in VidMmInitDmaPool for this context class.
+            info.DmaBufferSegmentSet = 1;
+
+            // Unlike a legacy context, the first legal outer batch may be any
+            // bounded HOB1. Advertise the complete package maximum up front so
+            // the UMD never needs a smaller sacrificial batch before it can ask
+            // the runtime to resize these three coupled windows.
+            info.DmaBufferSize = helios_protocol::wddm::HELIOS_HOB1_MAX_BYTES as u32;
+            info.DmaBufferPrivateDataSize =
+                crate::ddi::present_packet::PRESENT_DMA_PRIVATE_DATA_BYTES;
+            info.AllocationListSize =
+                helios_protocol::native_render::HELIOS_HVC1_ALLOCATION_LIST_ENTRIES;
+            info.PatchLocationListSize =
+                helios_protocol::native_render::HELIOS_HVC1_PATCH_LOCATION_ENTRIES;
         }
         ContextInfoProfile::Hvc1 => {
             // §10.7:1734-1738, verbatim: a 256-KiB DMA buffer, a 4096-entry

@@ -382,10 +382,9 @@ impl VenusClient {
         Ok((size, memory_type_bits))
     }
 
-    pub(super) fn allocate_dedicated_image_memory(
+    pub(super) fn allocate_optimal_image_memory(
         &mut self,
         adapter: &AdapterContext,
-        image_id: VkImageId,
         size: u64,
         memory_type_index: u32,
     ) -> Result<VkDeviceMemoryId, VirtioError> {
@@ -394,11 +393,12 @@ impl VenusClient {
             self.device_id.into(),
             memory_id.into(),
             &MemoryAllocateSpec {
-                // VkExportMemoryAllocateInfo -> VkMemoryDedicatedAllocateInfo.
-                pnext: MemoryPNext::ExportDedicated {
-                    handle_type: EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF,
-                    image: image_id.into(),
-                },
+                // The admitted host reports dedicated allocation as preferred,
+                // not required, for the exact OPTIMAL external-image shape.
+                // Export-only memory keeps vkAllocateMemory independent of the
+                // image object table; vkBindImageMemory supplies the exact
+                // image/memory association immediately afterwards.
+                pnext: optimal_gdi_memory_pnext(EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF),
                 size,
                 memory_type_index,
             },
@@ -408,7 +408,9 @@ impl VenusClient {
             w.as_slice()?,
             ReplyCheck::new(CMD_ALLOCATE_MEMORY)
                 .mismatch(0x0106)
-                .refuse_result(0x0107),
+                .mismatch_marks(b"SdgOMem")
+                .refuse_result(0x0107)
+                .result_marks(b"SdgOMem"),
         )?;
         Ok(memory_id)
     }

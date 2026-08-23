@@ -202,6 +202,19 @@ struct ContextSlot {
 /// they are always `< CTRL_QUEUE_SIZE`; each chain uses ≥ 2 descriptors, which
 /// caps real concurrency at half this.
 pub const MAX_INFLIGHT: usize = CTRL_QUEUE_SIZE;
+
+/// Host completion domain for a native Venus submission.
+///
+/// `Decoder` is deliberately not a generic fallback: callers may select it
+/// only after proving that the stream contains allocation destroy/free control
+/// commands and no Vulkan queue operation. Its ring-zero fence is the same
+/// session-local CPU timeline already used by K11 control submissions.
+#[derive(Clone, Copy)]
+pub(crate) enum NativeSubmitDomain {
+    Queue(u32),
+    Decoder,
+}
+
 /// Parked (completed, awaiting PASSIVE free) entry capacity. Enqueues are
 /// refused once `parked` crosses [`PARKED_ENQUEUE_GATE`], and one drain can
 /// park at most `MAX_INFLIGHT` entries, so this bound is never exceeded.
@@ -2154,7 +2167,17 @@ impl VirtioGpu {
         }
 
         let fenced_scanout = scanout_bind.is_some_and(|(_, fenced)| fenced);
-        let reserved_fence = if fenced_scanout {
+        let context_fence = if in0_len >= core::mem::size_of::<VirtioGpuCtrlHdr>() {
+            // SAFETY: the complete global command header is contained in in0.
+            let header = unsafe {
+                core::ptr::read_unaligned(meta.as_slice().as_ptr().cast::<VirtioGpuCtrlHdr>())
+            };
+            header.type_ == VIRTIO_GPU_CMD_SUBMIT_3D
+                && header.flags & VIRTIO_GPU_FLAG_INFO_RING_IDX != 0
+        } else {
+            false
+        };
+        let reserved_fence = if fenced_scanout || context_fence {
             let Some(wire_fence_limit) = self.wire_fence_base.checked_add(D4_FENCE_OFFSET) else {
                 WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
                 return Err((meta, VirtioError::WireFenceNamespaceExhausted));
@@ -2169,16 +2192,30 @@ impl VirtioGpu {
             let mut header = unsafe {
                 core::ptr::read_unaligned(meta.as_slice().as_ptr().cast::<VirtioGpuCtrlHdr>())
             };
-            if header.type_ != VIRTIO_GPU_CMD_SET_SCANOUT_BLOB
-                || header.flags != 0
+            if fenced_scanout {
+                if header.type_ != VIRTIO_GPU_CMD_SET_SCANOUT_BLOB
+                    || header.flags != 0
+                    || header.fence_id != 0
+                    || header.ctx_id != 0
+                    || header.ring_idx != 0
+                    || header.padding != [0; 3]
+                {
+                    return Err((meta, VirtioError::DeviceError));
+                }
+                header.flags = VIRTIO_GPU_FLAG_FENCE;
+            } else if header.type_ != VIRTIO_GPU_CMD_SUBMIT_3D
+                || header.flags != (VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX)
                 || header.fence_id != 0
-                || header.ctx_id != 0
-                || header.ring_idx != 0
+                || header.ctx_id == 0
                 || header.padding != [0; 3]
             {
                 return Err((meta, VirtioError::DeviceError));
             }
-            header.flags = VIRTIO_GPU_FLAG_FENCE;
+            // Context-fenced synchronous submits and native asynchronous
+            // submits must share one id space. QEMU's mergeable callback
+            // retires every matching (context, ring) id <= the callback id;
+            // a smaller per-session namespace can therefore be overtaken by a
+            // delayed ring-zero allocation-teardown callback.
             header.fence_id = self.next_wire_fence;
             // SAFETY: same complete in-buffer header.
             unsafe {
@@ -2205,7 +2242,9 @@ impl VirtioGpu {
                                 meta.as_slice().as_ptr().cast::<VirtioGpuCtrlHdr>(),
                             )
                         };
-                        header.flags = 0;
+                        if fenced_scanout {
+                            header.flags = 0;
+                        }
                         header.fence_id = 0;
                         unsafe {
                             core::ptr::write_unaligned(
@@ -2330,14 +2369,19 @@ impl VirtioGpu {
         }
     }
 
-    /// Enqueue one already-validated HNR2 batch on its exact nonzero session
-    /// endpoint. The move-only completion token returns intact on every refusal
-    /// and is published into the ordinary in-flight entry only after `add`
-    /// accepts the descriptor chain.
+    /// Enqueue one already-validated HNR2 batch on its exact session timeline.
+    /// Queue work names its nonzero Vulkan queue endpoint. A parser-proven
+    /// allocation teardown has no queue operation to fence and instead names
+    /// the session's existing ring-zero decoder timeline. Both forms retain
+    /// `INFO_RING_IDX`; a bare/global virtio fence is never substituted.
+    ///
+    /// The move-only completion token returns intact on every refusal and is
+    /// published into the ordinary in-flight entry only after `add` accepts the
+    /// descriptor chain.
     pub(crate) fn enqueue_native_submit(
         &mut self,
         ctx_id: u32,
-        ring_idx: u32,
+        domain: NativeSubmitDomain,
         meta: DmaBuffer,
         venus: DmaBuffer,
         venus_len: usize,
@@ -2351,7 +2395,14 @@ impl VirtioGpu {
             VirtioError,
         ),
     > {
-        if ctx_id == 0 || ring_idx == 0 {
+        let ring_idx = match domain {
+            NativeSubmitDomain::Queue(ring_idx) if ring_idx != 0 => ring_idx,
+            NativeSubmitDomain::Decoder => 0,
+            NativeSubmitDomain::Queue(_) => {
+                return Err((meta, venus, Some(completion), VirtioError::DeviceError))
+            }
+        };
+        if ctx_id == 0 {
             return Err((meta, venus, Some(completion), VirtioError::DeviceError));
         }
         self.enqueue_submit_inner(ctx_id, ring_idx, meta, venus, venus_len, Some(completion))
@@ -2417,13 +2468,10 @@ impl VirtioGpu {
         let fence_id = self.next_wire_fence;
         let mut cmd = VirtioGpuCmdSubmit::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_SUBMIT_3D;
-        cmd.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+        cmd.hdr.flags = VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX;
         cmd.hdr.fence_id = fence_id;
         cmd.hdr.ctx_id = ctx_id;
-        if ring_idx != 0 {
-            cmd.hdr.flags |= VIRTIO_GPU_FLAG_INFO_RING_IDX;
-            cmd.hdr.ring_idx = ring_idx.min(u8::MAX as u32) as u8;
-        }
+        cmd.hdr.ring_idx = ring_idx.min(u8::MAX as u32) as u8;
         cmd.size = venus_len as u32;
         meta.as_mut_slice()[..hdr_len].copy_from_slice(bytemuck::bytes_of(&cmd));
 

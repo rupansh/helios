@@ -37,21 +37,29 @@ const HOST_REPLY_POISON: u32 = u32::MAX;
 // terminal the KMD copies only the validated finite range into that slot.
 const SESSION_REPLY_BYTES: u64 = HELIOS_HVM1_REPLY_POOL_BYTES;
 const SESSION_REPLY_OFFSET: u64 = 0;
-// Reused only across distinct Venus contexts.  Within one session/context,
-// 1/2 name the two finite initialization submits, 3 is the fixed label for a
-// generated HVC1 operation and is reused only after that synchronous operation
-// reached its exact terminal, and 4 names the optional terminal DESTROY.  The
-// control label is deliberately not an independently advancing timeline.
-const SESSION_SET_REPLY_FENCE: u64 = 1;
-const SESSION_CREATE_INSTANCE_FENCE: u64 = 2;
-const SESSION_CONTROL_FENCE: u64 = 3;
-const SESSION_DESTROY_INSTANCE_FENCE: u64 = 4;
+// Every fenced ring-zero submit is serialized here, while the virtio enqueue
+// mints its id from the same transport-global wire namespace used by native
+// decoder teardown.  QEMU retires every matching context-fence command whose
+// id is <= the callback id, so mixing small per-session ids with large decoder
+// ids would let a delayed teardown callback satisfy a later control before its
+// reply was written.  The replyless terminal vkDestroyInstance remains
+// deliberately unfenced: QEMU asks the renderer to create an INFO_RING fence
+// only after dispatching the stream, but that stream has already extinguished
+// the host instance.  The following ordinary CTX_DESTROY is its teardown
+// terminal.
 
 pub(crate) static K11_CONTEXT_CREATED: AtomicU32 = AtomicU32::new(0);
 pub(crate) static K11_CONTEXT_DESTROYED: AtomicU32 = AtomicU32::new(0);
 pub(crate) static K11_HOST_INIT_OK: AtomicU32 = AtomicU32::new(0);
 pub(crate) static K11_HOST_INIT_REJECT: AtomicU32 = AtomicU32::new(0);
 pub(crate) static K11_HOST_REPLY_REJECT: AtomicU32 = AtomicU32::new(0);
+pub(crate) static K11_SYNC_REPLY_REJECT: AtomicU32 = AtomicU32::new(0);
+pub(crate) static K11_ASYNC_REPLY_REJECT: AtomicU32 = AtomicU32::new(0);
+pub(crate) static K11_REPLY_REJECT_KIND: AtomicU32 = AtomicU32::new(0);
+pub(crate) static K11_REPLY_EXPECTED_OPCODE: AtomicU32 = AtomicU32::new(0);
+pub(crate) static K11_REPLY_FOUND_OPCODE: AtomicU32 = AtomicU32::new(0);
+pub(crate) static K11_REPLY_REJECT_OFFSET: AtomicU32 = AtomicU32::new(0);
+pub(crate) static K11_REPLY_REJECT_BYTES: AtomicU32 = AtomicU32::new(0);
 pub(crate) static K11_REPLY_PUBLISHED: AtomicU32 = AtomicU32::new(0);
 pub(crate) static K11_RUNDOWN_WAITED: AtomicU32 = AtomicU32::new(0);
 pub(crate) static K11_COMPLETION_WAITED: AtomicU32 = AtomicU32::new(0);
@@ -59,12 +67,19 @@ pub(crate) static K11_COMPLETION_REOPEN_REJECT: AtomicU32 = AtomicU32::new(0);
 pub(crate) static K11_STALE_TRANSPORT: AtomicU32 = AtomicU32::new(0);
 pub(crate) static K11_CLEANUP_REJECT: AtomicU32 = AtomicU32::new(0);
 
-const COUNTERS: [(&[u8], &AtomicU32); 11] = [
+const COUNTERS: [(&[u8], &AtomicU32); 18] = [
     (b"K11CtxNew", &K11_CONTEXT_CREATED),
     (b"K11CtxDel", &K11_CONTEXT_DESTROYED),
     (b"K11InitOk", &K11_HOST_INIT_OK),
     (b"K11InitRej", &K11_HOST_INIT_REJECT),
     (b"K11ReplyRej", &K11_HOST_REPLY_REJECT),
+    (b"K11SyncRpRej", &K11_SYNC_REPLY_REJECT),
+    (b"K11AsyncRpRej", &K11_ASYNC_REPLY_REJECT),
+    (b"K11RpKind", &K11_REPLY_REJECT_KIND),
+    (b"K11RpExpOp", &K11_REPLY_EXPECTED_OPCODE),
+    (b"K11RpGotOp", &K11_REPLY_FOUND_OPCODE),
+    (b"K11RpOff", &K11_REPLY_REJECT_OFFSET),
+    (b"K11RpLen", &K11_REPLY_REJECT_BYTES),
     (b"K11ReplyOk", &K11_REPLY_PUBLISHED),
     (b"K11RdWait", &K11_RUNDOWN_WAITED),
     (b"K11CmpWait", &K11_COMPLETION_WAITED),
@@ -258,6 +273,47 @@ struct SessionReplyMap {
     va: NonNull<u8>,
 }
 
+#[derive(Clone, Copy)]
+enum ReplyCopyRefusal {
+    Range,
+    Opcode(u32),
+}
+
+#[derive(Clone, Copy)]
+enum ReplyCopyPath {
+    Async = 1,
+    Sync = 2,
+}
+
+fn record_reply_copy_refusal(
+    path: ReplyCopyPath,
+    offset: u64,
+    bytes: u64,
+    expected_opcode: u32,
+    refusal: ReplyCopyRefusal,
+) {
+    K11_HOST_REPLY_REJECT.fetch_add(1, Ordering::Relaxed);
+    match path {
+        ReplyCopyPath::Async => {
+            K11_ASYNC_REPLY_REJECT.fetch_add(1, Ordering::Relaxed);
+        }
+        ReplyCopyPath::Sync => {
+            K11_SYNC_REPLY_REJECT.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    K11_REPLY_REJECT_KIND.store(path as u32, Ordering::Relaxed);
+    K11_REPLY_EXPECTED_OPCODE.store(expected_opcode, Ordering::Relaxed);
+    K11_REPLY_FOUND_OPCODE.store(
+        match refusal {
+            ReplyCopyRefusal::Range => u32::MAX - 1,
+            ReplyCopyRefusal::Opcode(found) => found,
+        },
+        Ordering::Relaxed,
+    );
+    K11_REPLY_REJECT_OFFSET.store(u32::try_from(offset).unwrap_or(u32::MAX), Ordering::Relaxed);
+    K11_REPLY_REJECT_BYTES.store(u32::try_from(bytes).unwrap_or(u32::MAX), Ordering::Relaxed);
+}
+
 // SAFETY: the mapping is accessed only while the enclosing session rundown is
 // held. It is moved into the live host state and dropped once after rundown.
 unsafe impl Send for SessionReplyMap {}
@@ -332,23 +388,24 @@ impl SessionReplyMap {
         bytes: u64,
         expected_opcode: u32,
         destination: NonNull<u8>,
-    ) -> bool {
+    ) -> Result<(), ReplyCopyRefusal> {
         let Some(range) = Self::checked_range(offset, bytes) else {
-            return false;
+            return Err(ReplyCopyRefusal::Range);
         };
         core::sync::atomic::fence(Ordering::Acquire);
         let mut opcode = [0u8; core::mem::size_of::<u32>()];
         for (index, byte) in opcode.iter_mut().enumerate() {
             *byte = unsafe { core::ptr::read_volatile(self.va.as_ptr().add(range.start + index)) };
         }
-        if u32::from_le_bytes(opcode) != expected_opcode {
-            return false;
+        let found_opcode = u32::from_le_bytes(opcode);
+        if found_opcode != expected_opcode {
+            return Err(ReplyCopyRefusal::Opcode(found_opcode));
         }
         for (destination_offset, source_offset) in range.enumerate() {
             let byte = unsafe { core::ptr::read_volatile(self.va.as_ptr().add(source_offset)) };
             unsafe { core::ptr::write(destination.as_ptr().add(destination_offset), byte) };
         }
-        true
+        Ok(())
     }
 }
 
@@ -376,6 +433,11 @@ pub(crate) struct SessionTransport {
     state: SpinLock<HostState>,
     rundown: SpinLock<RundownState>,
     drained: UnsafeCell<KEVENT>,
+    /// Keep the complete prepare/submit/reply interval single-owner. The
+    /// transport-global fence is minted later under the virtio lock so it also
+    /// orders against allocation teardown on this context's ring zero.
+    ring_zero_control: SpinLock<pure::RingZeroControlState>,
+    ring_zero_available: UnsafeCell<KEVENT>,
     /// Notification event for the finite attachment ledger.  A duplicate open
     /// that finds the same resource in `Attaching` waits on this event and then
     /// re-checks the ledger under its lock; no caller guesses whether the first
@@ -387,11 +449,31 @@ pub(crate) struct SessionTransport {
     attachments: SpinLock<alloc::vec::Vec<SessionAttachment>>,
 }
 
-// SAFETY: mutable state is reachable only through the two spinlocks.  `drained`
-// is initialized once after the enclosing SessionObject reaches its final heap
+// SAFETY: mutable state is reachable only through spinlocks.  Both events are
+// initialized once after the enclosing SessionObject reaches its final heap
 // address and thereafter used only through kernel dispatcher APIs.
 unsafe impl Send for SessionTransport {}
 unsafe impl Sync for SessionTransport {}
+
+struct RingZeroControlOperation {
+    owner: NonNull<SessionTransport>,
+}
+
+unsafe impl Send for RingZeroControlOperation {}
+
+impl Drop for RingZeroControlOperation {
+    fn drop(&mut self) {
+        let owner = unsafe { self.owner.as_ref() };
+        let mut state = owner.ring_zero_control.lock();
+        let released = state.release();
+        debug_assert!(released);
+        if released {
+            // Publish availability while holding the state lock, so a new
+            // owner cannot clear the event before this release signals it.
+            unsafe { KeSetEvent(owner.ring_zero_available.get(), 0, 0) };
+        }
+    }
+}
 
 impl SessionTransport {
     pub(crate) fn new() -> Option<Self> {
@@ -407,6 +489,8 @@ impl SessionTransport {
             }),
             // Initialized in place by `init_event` before publication.
             drained: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+            ring_zero_control: SpinLock::new(pure::RingZeroControlState::new()),
+            ring_zero_available: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             attachments_changed: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             attachments: SpinLock::new(attachments),
         })
@@ -419,6 +503,9 @@ impl SessionTransport {
     pub(crate) unsafe fn init_event(&self) {
         // NotificationEvent, initially signaled because active == 0.
         unsafe { KeInitializeEvent(self.drained.get(), 0, 1) };
+        // NotificationEvent, initially signaled because no synchronous
+        // ring-zero control operation owns the session yet.
+        unsafe { KeInitializeEvent(self.ring_zero_available.get(), 0, 1) };
         // NotificationEvent.  There is no transition to observe before the
         // first ledger entry is published, so the initial signaled state lets a
         // spurious waiter simply re-check.
@@ -467,6 +554,43 @@ impl SessionTransport {
         Some(SessionOperation {
             owner: NonNull::from(self),
         })
+    }
+
+    /// Serialize the complete synchronous ring-zero interval. Every caller
+    /// already owns session rundown, and every underlying control roundtrip is
+    /// bounded, so teardown cannot free this event or strand a waiter. The
+    /// exact fence is minted from the shared wire namespace during enqueue.
+    /// This is an exact dispatcher-object wait, never polling or synthetic
+    /// completion.
+    fn acquire_ring_zero_control(
+        &self,
+        _passive: PassiveLevel,
+    ) -> Result<RingZeroControlOperation, NTSTATUS> {
+        loop {
+            let mut state = self.ring_zero_control.lock();
+            match state.try_acquire() {
+                Ok(()) => {
+                    unsafe { KeClearEvent(self.ring_zero_available.get()) };
+                    return Ok(RingZeroControlOperation {
+                        owner: NonNull::from(self),
+                    });
+                }
+                Err(pure::RingZeroControlRefusal::Occupied) => {}
+            }
+            // Clear under the same lock used by Drop's set, preventing a lost
+            // wake between observing the occupied state and beginning to wait.
+            unsafe { KeClearEvent(self.ring_zero_available.get()) };
+            drop(state);
+            let _ = unsafe {
+                KeWaitForSingleObject(
+                    self.ring_zero_available.get() as PVOID,
+                    0,
+                    0,
+                    0,
+                    core::ptr::null_mut(),
+                )
+            };
+        }
     }
 
     /// Acquire the session's exact live host namespace for an asynchronous
@@ -801,7 +925,7 @@ impl SessionTransport {
         // SAFETY: rundown and `_pair` retain the private map; the caller's
         // OpenExecutionUse retains the K2a allocation and the range was checked
         // above against its canonical byte size.
-        if !unsafe {
+        if let Err(refusal) = unsafe {
             reply_map.as_ref().copy_reply_to(
                 raw_reply_offset,
                 raw_reply_bytes,
@@ -809,7 +933,13 @@ impl SessionTransport {
                 destination,
             )
         } {
-            K11_HOST_REPLY_REJECT.fetch_add(1, Ordering::Relaxed);
+            record_reply_copy_refusal(
+                ReplyCopyPath::Async,
+                raw_reply_offset,
+                raw_reply_bytes,
+                expected_opcode,
+                refusal,
+            );
             return Err(STATUS_DEVICE_NOT_READY);
         }
         Ok(())
@@ -851,6 +981,7 @@ impl SessionTransport {
         if end > facts.byte_size {
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
+        let _ring_zero = self.acquire_ring_zero_control(passive)?;
         // SAFETY: `operation` owns rundown through the terminal and copy.
         let reply_map = unsafe { reply_map.as_ref() };
         if !reply_map.prepare_reply(raw_reply_offset, raw_reply_bytes) {
@@ -869,21 +1000,15 @@ impl SessionTransport {
             host.reply_resource_id,
         )
         .map_err(|_| STATUS_DEVICE_NOT_READY)?;
-        crate::virtio::ctrl::submit_venus_session_sync(
-            passive,
-            adapter,
-            &pair,
-            SESSION_CONTROL_FENCE,
-            payload,
-        )
-        .map_err(|_| STATUS_DEVICE_NOT_READY)?;
+        crate::virtio::ctrl::submit_venus_session_sync(passive, adapter, &pair, payload)
+            .map_err(|_| STATUS_DEVICE_NOT_READY)?;
         let destination_offset =
             usize::try_from(raw_reply_offset).map_err(|_| STATUS_INVALID_DEVICE_REQUEST)?;
         let destination = NonNull::new(unsafe { facts.kernel_va.as_ptr().add(destination_offset) })
             .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
         // SAFETY: `operation` and `pair` retain both sides, and the exact K2a
         // destination range was checked above.
-        if !unsafe {
+        if let Err(refusal) = unsafe {
             reply_map.copy_reply_to(
                 raw_reply_offset,
                 raw_reply_bytes,
@@ -891,7 +1016,13 @@ impl SessionTransport {
                 destination,
             )
         } {
-            K11_HOST_REPLY_REJECT.fetch_add(1, Ordering::Relaxed);
+            record_reply_copy_refusal(
+                ReplyCopyPath::Sync,
+                raw_reply_offset,
+                raw_reply_bytes,
+                expected_opcode,
+                refusal,
+            );
             return Err(STATUS_DEVICE_NOT_READY);
         }
         Ok(())
@@ -912,6 +1043,7 @@ impl SessionTransport {
         if Self::current_transport(adapter) != Some(host.transport_instance) {
             return Err(STATUS_DEVICE_NOT_READY);
         }
+        let _ring_zero = self.acquire_ring_zero_control(passive)?;
         let pair = crate::virtio::ctrl::borrow_venus_session_pair(
             adapter,
             owner,
@@ -919,14 +1051,8 @@ impl SessionTransport {
             host.reply_resource_id,
         )
         .map_err(|_| STATUS_DEVICE_NOT_READY)?;
-        crate::virtio::ctrl::submit_venus_session_sync(
-            passive,
-            adapter,
-            &pair,
-            SESSION_CONTROL_FENCE,
-            payload,
-        )
-        .map_err(|_| STATUS_DEVICE_NOT_READY)
+        crate::virtio::ctrl::submit_venus_session_sync(passive, adapter, &pair, payload)
+            .map_err(|_| STATUS_DEVICE_NOT_READY)
     }
 
     /// Create one distinct stock Venus context and one `VkInstance`, validate
@@ -1162,29 +1288,13 @@ impl SessionTransport {
             pure::HOST_CREATE_INSTANCE_REPLY_BYTES,
         );
         let bytes = target.finished().ok_or(STATUS_DEVICE_NOT_READY)?;
-        if crate::virtio::ctrl::submit_venus_session_sync(
-            passive,
-            adapter,
-            pair,
-            SESSION_SET_REPLY_FENCE,
-            bytes,
-        )
-        .is_err()
-        {
+        if crate::virtio::ctrl::submit_venus_session_sync(passive, adapter, pair, bytes).is_err() {
             return Err(STATUS_DEVICE_NOT_READY);
         }
 
         let create = pure::encode_create_instance(SESSION_INSTANCE_HANDLE);
         let bytes = create.finished().ok_or(STATUS_DEVICE_NOT_READY)?;
-        if crate::virtio::ctrl::submit_venus_session_sync(
-            passive,
-            adapter,
-            pair,
-            SESSION_CREATE_INSTANCE_FENCE,
-            bytes,
-        )
-        .is_err()
-        {
+        if crate::virtio::ctrl::submit_venus_session_sync(passive, adapter, pair, bytes).is_err() {
             return Err(STATUS_DEVICE_NOT_READY);
         }
 
@@ -1266,12 +1376,8 @@ impl SessionTransport {
         ) {
             let destroy = pure::encode_destroy_instance(instance_handle);
             if let Some(bytes) = destroy.finished() {
-                let _ = crate::virtio::ctrl::submit_venus_session_sync(
-                    passive,
-                    adapter,
-                    &pair,
-                    SESSION_DESTROY_INSTANCE_FENCE,
-                    bytes,
+                let _ = crate::virtio::ctrl::submit_venus_session_destroy(
+                    passive, adapter, &pair, bytes,
                 );
             }
             drop(pair);

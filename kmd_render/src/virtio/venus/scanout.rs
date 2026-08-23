@@ -82,9 +82,8 @@ impl VenusClient {
             }
         };
         let allocation_size = round_up_page(required_size.max(4096));
-        let memory_id = match self.allocate_dedicated_image_memory(
+        let memory_id = match self.allocate_optimal_image_memory(
             adapter,
-            image_id,
             allocation_size,
             memory_type_index,
         ) {

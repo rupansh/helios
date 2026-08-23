@@ -153,13 +153,16 @@ pub struct CommittedModeState {
 
 impl CommittedModeState {
     pub fn new(source_id: u32, target_id: u32) -> Result<Self, Refusal> {
+        // Adapter and target start POWERED: D0 is the boot default and dxgkrnl
+        // issues no DxgkDdiSetPowerState at boot (0 calls across a full 26100
+        // boot, S-ring 0x0A11 census, KMD 22.22.328.0) — waiting for one made
+        // every first flip refuse SourcePoweredOff. Visibility still starts
+        // false; SetPowerState transitions both bits from here.
         Ok(Self {
             high_water: 0,
             current: None,
             removed: false,
-            policy: ModePolicySnapshot::from_stored(
-                source_id, target_id, false, false, false, None,
-            )?,
+            policy: ModePolicySnapshot::from_stored(source_id, target_id, false, true, true, None)?,
         })
     }
 
@@ -489,15 +492,17 @@ mod tests {
     }
 
     #[test]
-    fn binding_starts_hidden_and_power_unknown_fail_closed() {
+    fn binding_starts_hidden_and_powered_d0() {
+        // D0 is the boot default and dxgkrnl issues no boot SetPowerState
+        // (26100 S-ring census) — power starts TRUE; visibility still starts
+        // false and fail-closed.
         let state = state();
         assert_eq!(state.high_water(), 0);
         assert_eq!(state.current(), None);
         assert!(!state.is_removed());
         assert_eq!(
             state.policy_snapshot(),
-            ModePolicySnapshot::from_stored(SOURCE_ID, TARGET_ID, false, false, false, None)
-                .unwrap()
+            ModePolicySnapshot::from_stored(SOURCE_ID, TARGET_ID, false, true, true, None).unwrap()
         );
     }
 
@@ -511,7 +516,7 @@ mod tests {
         let mode = committed.mode().unwrap();
         assert!(mode.active);
         assert!(!mode.visible);
-        assert!(!mode.powered);
+        assert!(mode.powered);
         assert_eq!((mode.source_id, mode.target_id), (SOURCE_ID, TARGET_ID));
         assert_eq!((mode.source_width, mode.source_height), (1920, 1080));
         assert_eq!((mode.target_width, mode.target_height), (1920, 1080));
@@ -538,7 +543,7 @@ mod tests {
         assert_eq!(empty.generation(), 4);
         assert_eq!(empty.mode(), None);
         assert!(empty.policy_snapshot().visible());
-        assert!(!empty.policy_snapshot().adapter_powered());
+        assert!(empty.policy_snapshot().adapter_powered());
         assert!(empty.policy_snapshot().target_powered());
         assert_eq!(empty.policy_snapshot().path_powered(), None);
     }
@@ -611,19 +616,26 @@ mod tests {
 
     #[test]
     fn adapter_and_target_d0_observations_are_required_in_both_orders() {
+        // Power starts D0 (boot default); a D3 observation on either subject
+        // drops effective power, and the matching D0 restores it — in both
+        // orders.
         fn exercise(first: PowerSubject, second: PowerSubject) -> CommittedModePublication {
             let mut state = state();
             assert!(
-                !state
+                state
                     .publish_active(1, facts(true))
                     .unwrap()
                     .mode()
                     .unwrap()
                     .powered
             );
-            let one_sided = state.transition_power(2, first, true).unwrap();
+            let one_off = state.transition_power(2, first, false).unwrap();
+            assert!(!one_off.mode().unwrap().powered);
+            let both_off = state.transition_power(3, second, false).unwrap();
+            assert!(!both_off.mode().unwrap().powered);
+            let one_sided = state.transition_power(4, first, true).unwrap();
             assert!(!one_sided.mode().unwrap().powered);
-            state.transition_power(3, second, true).unwrap()
+            state.transition_power(5, second, true).unwrap()
         }
 
         let adapter_then_target = exercise(
@@ -1097,8 +1109,8 @@ mod tests {
             name: "current_mode_power_does_not_match_policy",
             exercise: current_mode_power_does_not_match_policy,
             expected: Refusal::CurrentModePowerDoesNotMatchPolicy {
-                expected: false,
-                found: true,
+                expected: true,
+                found: false,
             },
         },
     ];

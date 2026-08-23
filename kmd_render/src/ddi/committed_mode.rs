@@ -249,7 +249,11 @@ impl CommittedModeStorage {
             target_width: AtomicU32::new(0),
             target_height: AtomicU32::new(0),
             mode_state: AtomicU32::new(0),
-            policy_state: AtomicU32::new(0),
+            // Adapter and target start POWERED: D0 is the boot default and
+            // dxgkrnl issues no boot DxgkDdiSetPowerState (0 calls across a
+            // full 26100 boot, S-ring 0x0A11 census) — a zero word made every
+            // first flip refuse SourcePoweredOff (D2AdmWhy=0x46, 22.22.332.0).
+            policy_state: AtomicU32::new(POLICY_ADAPTER_POWERED | POLICY_TARGET_POWERED),
             reason: AtomicU32::new(REASON_NONE),
         }
     }

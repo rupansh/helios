@@ -26,6 +26,8 @@ pub struct SchemaScratch<'a> {
     geometry_counts: &'a mut [u32],
     geometry_len: usize,
     reply_size: u64,
+    command_device_handle: u64,
+    command_object_handle: u64,
 }
 
 impl<'a> SchemaScratch<'a> {
@@ -34,10 +36,23 @@ impl<'a> SchemaScratch<'a> {
             geometry_counts,
             geometry_len: 0,
             reply_size: 0,
+            command_device_handle: 0,
+            command_object_handle: 0,
         }
     }
     pub(super) fn set_reply_size(&mut self, reply_size: u64) {
         self.reply_size = reply_size;
+    }
+    pub(super) fn begin_command(&mut self) {
+        self.command_device_handle = 0;
+        self.command_object_handle = 0;
+    }
+    fn set_command_identity(&mut self, device: u64, object: u64) {
+        self.command_device_handle = device;
+        self.command_object_handle = object;
+    }
+    pub(super) fn command_identity(&self) -> (u64, u64) {
+        (self.command_device_handle, self.command_object_handle)
     }
     fn expect_reply_size(&self, expected: u64) -> Result<(), VenusReject> {
         if self.reply_size != expected {
@@ -340,6 +355,7 @@ struct ParsedVkBufferMemoryBarrier2 {
 #[derive(Clone, Copy, Debug, Default)]
 struct ParsedVkBufferMemoryRequirementsInfo2 {
     s_type: u64,
+    buffer: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1190,6 +1206,7 @@ struct ParsedVkImageMemoryBarrier2 {
 #[derive(Clone, Copy, Debug, Default)]
 struct ParsedVkImageMemoryRequirementsInfo2 {
     s_type: u64,
+    image: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -6014,7 +6031,7 @@ fn parse_full_vk_buffer_memory_requirements_info2_self(
         return Err(VenusReject::UnsupportedChain);
     }
     let mut parsed = ParsedVkBufferMemoryRequirementsInfo2::default();
-    c.skip(8)?;
+    parsed.buffer = c.u64()? as u64;
     Ok(parsed)
 }
 
@@ -13384,7 +13401,7 @@ fn parse_full_vk_image_memory_requirements_info2_self(
         return Err(VenusReject::UnsupportedChain);
     }
     let mut parsed = ParsedVkImageMemoryRequirementsInfo2::default();
-    c.skip(8)?;
+    parsed.image = c.u64()? as u64;
     Ok(parsed)
 }
 
@@ -40897,8 +40914,9 @@ fn parse_full_vk_write_descriptor_set_self(
     parsed.descriptor_count = c.u32()? as u64;
     parsed.descriptor_type = c.u32()? as u64;
     let count_p_image_info_0 = c.array_count()?;
-    if count_p_image_info_0
-        != u64::try_from(parsed.descriptor_count).map_err(|_| VenusReject::CountOverflow)?
+    if count_p_image_info_0 != 0
+        && count_p_image_info_0
+            != u64::try_from(parsed.descriptor_count).map_err(|_| VenusReject::CountOverflow)?
     {
         return Err(VenusReject::BadArrayCount);
     }
@@ -40907,8 +40925,9 @@ fn parse_full_vk_write_descriptor_set_self(
         let _ = parse_full_vk_descriptor_image_info(c, operands, scratch, depth + 1)?;
     }
     let count_p_buffer_info_0 = c.array_count()?;
-    if count_p_buffer_info_0
-        != u64::try_from(parsed.descriptor_count).map_err(|_| VenusReject::CountOverflow)?
+    if count_p_buffer_info_0 != 0
+        && count_p_buffer_info_0
+            != u64::try_from(parsed.descriptor_count).map_err(|_| VenusReject::CountOverflow)?
     {
         return Err(VenusReject::BadArrayCount);
     }
@@ -40917,8 +40936,9 @@ fn parse_full_vk_write_descriptor_set_self(
         let _ = parse_full_vk_descriptor_buffer_info(c, operands, scratch, depth + 1)?;
     }
     let count_p_texel_buffer_view_0 = c.array_count()?;
-    if count_p_texel_buffer_view_0
-        != u64::try_from(parsed.descriptor_count).map_err(|_| VenusReject::CountOverflow)?
+    if count_p_texel_buffer_view_0 != 0
+        && count_p_texel_buffer_view_0
+            != u64::try_from(parsed.descriptor_count).map_err(|_| VenusReject::CountOverflow)?
     {
         return Err(VenusReject::BadArrayCount);
     }
@@ -41163,7 +41183,11 @@ fn parse_vk_clear_color_value(
     }
     match tag {
         2 => {
-            c.skip(4)?;
+            let count_uint32_0 = c.array_count()?;
+            if count_uint32_0 != u64::try_from(4).map_err(|_| VenusReject::CountOverflow)? {
+                return Err(VenusReject::BadArrayCount);
+            }
+            c.skip_array(count_uint32_0, 4)?;
             Ok(())
         }
         _ => Err(VenusReject::BadStructureType),
@@ -41350,49 +41374,90 @@ fn parse_vk_resource_descriptor_data_ext(
     }
     match tag {
         2 => {
-            let _ = parse_full_vk_image_descriptor_info_ext(c, operands, scratch, depth + 1)?;
+            let present_p_image = c.pointer()?;
+            if present_p_image {
+                let _ = parse_full_vk_image_descriptor_info_ext(c, operands, scratch, depth + 1)?;
+            }
             Ok(())
         }
         3 => {
-            let _ = parse_full_vk_image_descriptor_info_ext(c, operands, scratch, depth + 1)?;
+            let present_p_image = c.pointer()?;
+            if present_p_image {
+                let _ = parse_full_vk_image_descriptor_info_ext(c, operands, scratch, depth + 1)?;
+            }
             Ok(())
         }
         10 => {
-            let _ = parse_full_vk_image_descriptor_info_ext(c, operands, scratch, depth + 1)?;
+            let present_p_image = c.pointer()?;
+            if present_p_image {
+                let _ = parse_full_vk_image_descriptor_info_ext(c, operands, scratch, depth + 1)?;
+            }
             Ok(())
         }
         1000440001 => {
-            let _ = parse_full_vk_image_descriptor_info_ext(c, operands, scratch, depth + 1)?;
+            let present_p_image = c.pointer()?;
+            if present_p_image {
+                let _ = parse_full_vk_image_descriptor_info_ext(c, operands, scratch, depth + 1)?;
+            }
             Ok(())
         }
         1000440000 => {
-            let _ = parse_full_vk_image_descriptor_info_ext(c, operands, scratch, depth + 1)?;
+            let present_p_image = c.pointer()?;
+            if present_p_image {
+                let _ = parse_full_vk_image_descriptor_info_ext(c, operands, scratch, depth + 1)?;
+            }
             Ok(())
         }
         4 => {
-            let _ =
-                parse_full_vk_texel_buffer_descriptor_info_ext(c, operands, scratch, depth + 1)?;
+            let present_p_texel_buffer = c.pointer()?;
+            if present_p_texel_buffer {
+                let _ = parse_full_vk_texel_buffer_descriptor_info_ext(
+                    c,
+                    operands,
+                    scratch,
+                    depth + 1,
+                )?;
+            }
             Ok(())
         }
         5 => {
-            let _ =
-                parse_full_vk_texel_buffer_descriptor_info_ext(c, operands, scratch, depth + 1)?;
+            let present_p_texel_buffer = c.pointer()?;
+            if present_p_texel_buffer {
+                let _ = parse_full_vk_texel_buffer_descriptor_info_ext(
+                    c,
+                    operands,
+                    scratch,
+                    depth + 1,
+                )?;
+            }
             Ok(())
         }
         1000150000 => {
-            let _ = parse_full_vk_device_address_range_ext(c, operands, scratch, depth + 1)?;
+            let present_p_address_range = c.pointer()?;
+            if present_p_address_range {
+                let _ = parse_full_vk_device_address_range_ext(c, operands, scratch, depth + 1)?;
+            }
             Ok(())
         }
         6 => {
-            let _ = parse_full_vk_device_address_range_ext(c, operands, scratch, depth + 1)?;
+            let present_p_address_range = c.pointer()?;
+            if present_p_address_range {
+                let _ = parse_full_vk_device_address_range_ext(c, operands, scratch, depth + 1)?;
+            }
             Ok(())
         }
         7 => {
-            let _ = parse_full_vk_device_address_range_ext(c, operands, scratch, depth + 1)?;
+            let present_p_address_range = c.pointer()?;
+            if present_p_address_range {
+                let _ = parse_full_vk_device_address_range_ext(c, operands, scratch, depth + 1)?;
+            }
             Ok(())
         }
         1000460000 => {
-            let _ = parse_full_vk_tensor_view_create_info_arm(c, operands, scratch, depth + 1)?;
+            let present_p_tensor_arm = c.pointer()?;
+            if present_p_tensor_arm {
+                let _ = parse_full_vk_tensor_view_create_info_arm(c, operands, scratch, depth + 1)?;
+            }
             Ok(())
         }
         _ => Err(VenusReject::BadStructureType),
@@ -45185,9 +45250,11 @@ fn parse_command_vk_create_buffer(
     scratch: &mut SchemaScratch<'_>,
 ) -> Result<A7CommandFacts, VenusReject> {
     let depth = 0u32;
+    let mut device: u64 = 0;
     let mut p_create_info = ParsedVkBufferCreateInfo::default();
     let mut p_allocator = ParsedVkAllocationCallbacks::default();
-    c.skip(8)?;
+    let mut p_buffer: u64 = 0;
+    device = c.u64()? as u64;
     let present_p_create_info = c.pointer()?;
     if !present_p_create_info {
         return Err(VenusReject::BadPointer);
@@ -45203,8 +45270,9 @@ fn parse_command_vk_create_buffer(
         return Err(VenusReject::BadPointer);
     }
     if present_p_buffer {
-        c.skip(8)?;
+        p_buffer = c.u64()? as u64;
     }
+    scratch.set_command_identity(device, p_buffer);
     Ok(A7CommandFacts {
         kind: A7CommandKind::PureControl,
         opcode: 50,
@@ -45578,9 +45646,11 @@ fn parse_command_vk_create_image(
     scratch: &mut SchemaScratch<'_>,
 ) -> Result<A7CommandFacts, VenusReject> {
     let depth = 0u32;
+    let mut device: u64 = 0;
     let mut p_create_info = ParsedVkImageCreateInfo::default();
     let mut p_allocator = ParsedVkAllocationCallbacks::default();
-    c.skip(8)?;
+    let mut p_image: u64 = 0;
+    device = c.u64()? as u64;
     let present_p_create_info = c.pointer()?;
     if !present_p_create_info {
         return Err(VenusReject::BadPointer);
@@ -45596,8 +45666,9 @@ fn parse_command_vk_create_image(
         return Err(VenusReject::BadPointer);
     }
     if present_p_image {
-        c.skip(8)?;
+        p_image = c.u64()? as u64;
     }
+    scratch.set_command_identity(device, p_image);
     Ok(A7CommandFacts {
         kind: A7CommandKind::PureControl,
         opcode: 54,
@@ -45953,12 +46024,15 @@ fn parse_command_vk_destroy_buffer(
     scratch: &mut SchemaScratch<'_>,
 ) -> Result<A7CommandFacts, VenusReject> {
     let depth = 0u32;
+    let mut device: u64 = 0;
+    let mut buffer: u64 = 0;
     let mut p_allocator = ParsedVkAllocationCallbacks::default();
-    c.skip(8)?;
-    c.skip(8)?;
+    device = c.u64()? as u64;
+    buffer = c.u64()? as u64;
     if c.pointer()? {
         return Err(VenusReject::UnsupportedChain);
     }
+    scratch.set_command_identity(device, buffer);
     Ok(A7CommandFacts {
         kind: A7CommandKind::Allocation,
         opcode: 51,
@@ -46571,9 +46645,10 @@ fn parse_command_vk_get_buffer_memory_requirements2(
     scratch: &mut SchemaScratch<'_>,
 ) -> Result<A7CommandFacts, VenusReject> {
     let depth = 0u32;
+    let mut device: u64 = 0;
     let mut p_info = ParsedVkBufferMemoryRequirementsInfo2::default();
     let mut p_memory_requirements = ParsedVkMemoryRequirements2::default();
-    c.skip(8)?;
+    device = c.u64()? as u64;
     let present_p_info = c.pointer()?;
     if !present_p_info {
         return Err(VenusReject::BadPointer);
@@ -46589,6 +46664,7 @@ fn parse_command_vk_get_buffer_memory_requirements2(
         p_memory_requirements =
             parse_partial_vk_memory_requirements2(c, operands, scratch, depth + 1)?;
     }
+    scratch.set_command_identity(device, p_info.buffer);
     Ok(A7CommandFacts {
         kind: A7CommandKind::PureControl,
         opcode: 145,
@@ -46991,9 +47067,10 @@ fn parse_command_vk_get_image_memory_requirements2(
     scratch: &mut SchemaScratch<'_>,
 ) -> Result<A7CommandFacts, VenusReject> {
     let depth = 0u32;
+    let mut device: u64 = 0;
     let mut p_info = ParsedVkImageMemoryRequirementsInfo2::default();
     let mut p_memory_requirements = ParsedVkMemoryRequirements2::default();
-    c.skip(8)?;
+    device = c.u64()? as u64;
     let present_p_info = c.pointer()?;
     if !present_p_info {
         return Err(VenusReject::BadPointer);
@@ -47009,6 +47086,7 @@ fn parse_command_vk_get_image_memory_requirements2(
         p_memory_requirements =
             parse_partial_vk_memory_requirements2(c, operands, scratch, depth + 1)?;
     }
+    scratch.set_command_identity(device, p_info.image);
     Ok(A7CommandFacts {
         kind: A7CommandKind::PureControl,
         opcode: 144,
@@ -48253,6 +48331,7 @@ pub fn parse_a7_command(
     if flags & !1 != 0 {
         return Err(VenusReject::BadFlags);
     }
+    scratch.begin_command();
     match opcode {
         88 => parse_command_vk_allocate_command_buffers(c, operands, scratch),
         77 => parse_command_vk_allocate_descriptor_sets(c, operands, scratch),

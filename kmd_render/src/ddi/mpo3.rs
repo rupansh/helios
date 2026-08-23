@@ -193,6 +193,9 @@ fn operation_facts(global_flags: u32, plane_flags: u32, extra: u32) -> DirectSca
         stereo: global_flags & INPUT_STEREO_MASK != 0,
         shared_primary_transition: plane_flags & PLANE_SHARED_PRIMARY_TRANSITION != 0,
         independent_flip_exclusive: plane_flags & PLANE_INDEPENDENT_FLIP_EXCLUSIVE != 0,
+        // MPO3 flips only arrive on an already-visible source; the classic
+        // MODE_CHANGE pre-visibility programming window does not exist here.
+        mode_change: false,
         unsupported_or_reserved_flags: (global_flags & !INPUT_KNOWN_MASK)
             | (plane_flags & !PLANE_KNOWN_MASK)
             | extra,

@@ -17,6 +17,14 @@ pub const OP_QUEUE_SUBMIT: u32 = 18;
 pub const OP_ALLOCATE_MEMORY: u32 = 21;
 pub const OP_FREE_MEMORY: u32 = 22;
 pub const OP_QUEUE_BIND_SPARSE: u32 = 34;
+const OP_CREATE_BUFFER: u32 = 50;
+const OP_DESTROY_BUFFER: u32 = 51;
+const OP_CREATE_IMAGE: u32 = 54;
+const OP_DESTROY_IMAGE: u32 = 55;
+const OP_BIND_BUFFER_MEMORY2: u32 = 138;
+const OP_BIND_IMAGE_MEMORY2: u32 = 139;
+const OP_GET_IMAGE_MEMORY_REQUIREMENTS2: u32 = 144;
+const OP_GET_BUFFER_MEMORY_REQUIREMENTS2: u32 = 145;
 pub const OP_SET_REPLY: u32 = 178;
 pub const OP_QUEUE_SUBMIT2: u32 = 206;
 
@@ -76,6 +84,10 @@ pub struct VenusA7Admission {
     pub command_buffer_count: u32,
     pub queue_command_count: u32,
     pub operand_count: u32,
+    /// An exact allocation-lifetime terminal: zero or more object destroys
+    /// followed by one FreeMemory, after the owning queue progress was joined.
+    /// It contains no queue command and must carry one outer allocation use.
+    pub terminal_teardown: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -661,6 +673,9 @@ pub fn validate_venus_a7_outer_stream(
     let mut admission = VenusA7Admission::default();
     let mut recording = false;
     let mut recorded_any = false;
+    let mut materializing = false;
+    let mut tearing_down = false;
+    let mut terminal_free_seen = false;
 
     while c.offset != bytes.len() {
         let (opcode, flags) = command_header(&mut c)?;
@@ -677,27 +692,52 @@ pub fn validate_venus_a7_outer_stream(
 
         match facts.kind {
             A7CommandKind::Allocation => {
-                if recording || recorded_any || admission.queue_command_count != 0 {
-                    return Err(VenusReject::InvalidSequence);
+                match opcode {
+                    OP_ALLOCATE_MEMORY | OP_BIND_BUFFER_MEMORY2 | OP_BIND_IMAGE_MEMORY2 => {
+                        if tearing_down
+                            || recording
+                            || recorded_any
+                            || admission.queue_command_count != 0
+                        {
+                            return Err(VenusReject::InvalidSequence);
+                        }
+                        materializing = true;
+                        let added = operands.count - operands_before;
+                        if opcode == OP_ALLOCATE_MEMORY {
+                            if added != 1
+                                || facts.allocation_size == 0
+                                || facts.memory_type_index == u32::MAX
+                            {
+                                return Err(VenusReject::MissingImport);
+                            }
+                        } else if added != 0 {
+                            return Err(VenusReject::InvalidSequence);
+                        }
+                    }
+                    OP_DESTROY_BUFFER | OP_DESTROY_IMAGE | OP_FREE_MEMORY => {
+                        if materializing
+                            || recording
+                            || recorded_any
+                            || admission.queue_command_count != 0
+                            || terminal_free_seen
+                            || operands.count != operands_before
+                        {
+                            return Err(VenusReject::InvalidSequence);
+                        }
+                        tearing_down = true;
+                        terminal_free_seen = opcode == OP_FREE_MEMORY;
+                    }
+                    _ => {
+                        return Err(VenusReject::InvalidSequence);
+                    }
                 }
                 admission.allocation_command_count = admission
                     .allocation_command_count
                     .checked_add(1)
                     .ok_or(VenusReject::CountOverflow)?;
-                let added = operands.count - operands_before;
-                if opcode == OP_ALLOCATE_MEMORY {
-                    if added != 1
-                        || facts.allocation_size == 0
-                        || facts.memory_type_index == u32::MAX
-                    {
-                        return Err(VenusReject::MissingImport);
-                    }
-                } else if added != 0 {
-                    return Err(VenusReject::InvalidSequence);
-                }
             }
             A7CommandKind::CommandRecord => {
-                if admission.queue_command_count != 0 {
+                if tearing_down || admission.queue_command_count != 0 {
                     return Err(VenusReject::InvalidSequence);
                 }
                 match opcode {
@@ -720,7 +760,7 @@ pub fn validate_venus_a7_outer_stream(
                 }
             }
             A7CommandKind::Queue => {
-                if recording || admission.queue_command_count != 0 {
+                if tearing_down || recording || admission.queue_command_count != 0 {
                     return Err(VenusReject::InvalidSequence);
                 }
                 admission.queue_command_count = 1;
@@ -734,18 +774,27 @@ pub fn validate_venus_a7_outer_stream(
         }
     }
 
-    if recording || admission.queue_command_count != 1 {
+    if recording
+        || (tearing_down && (!terminal_free_seen || admission.queue_command_count != 0))
+        || (!tearing_down && admission.queue_command_count != 1)
+    {
         return Err(VenusReject::InvalidSequence);
     }
+    admission.terminal_teardown = tearing_down;
     admission.operand_count =
         u32::try_from(operands.count).map_err(|_| VenusReject::CountOverflow)?;
     Ok(admission)
 }
 
 /// Validate one finite HVC1 generated-control transaction.  A reply-bearing
-/// transaction is exactly SetReply plus one GENERATE_REPLY command; a
-/// reply-less transaction is one or more zero-flag commands.  SetReply's zero
-/// placeholder is the only generated resource operand permitted.
+/// transaction is normally exactly SetReply plus one GENERATE_REPLY command.
+/// The bounded multi-command exceptions are a generated-parser-proven
+/// CreateBuffer/GetBufferMemoryRequirements2/DestroyBuffer triplet naming one
+/// never-bound private buffer, and a CreateImage/GetImageMemoryRequirements2
+/// pair naming one still-live image.  Every command in either sequence names
+/// the same nonzero device/object.  A reply-less transaction is one or more
+/// zero-flag commands.  SetReply's zero placeholder is the only generated
+/// resource operand permitted.
 pub fn validate_venus_control_stream(
     bytes: &[u8],
     has_reply: bool,
@@ -778,16 +827,93 @@ pub fn validate_venus_control_stream(
         scratch.set_reply_size(admission.reply_size);
 
         let (opcode, flags) = command_header(&mut c)?;
-        if flags != COMMAND_GENERATE_REPLY {
-            return Err(VenusReject::BadFlags);
-        }
         let facts =
             a7_schema::parse_a7_command(opcode, flags, &mut c, &mut operands, &mut scratch)?;
-        if facts.kind != A7CommandKind::PureControl || operands.count != 1 {
-            return Err(VenusReject::InvalidSequence);
+        if opcode == OP_CREATE_BUFFER {
+            let identity = scratch.command_identity();
+            if flags != 0
+                || facts.kind != A7CommandKind::PureControl
+                || identity.0 == 0
+                || identity.1 == 0
+                || operands.count != 1
+            {
+                return Err(VenusReject::InvalidSequence);
+            }
+
+            let (query_opcode, query_flags) = command_header(&mut c)?;
+            let query_facts = a7_schema::parse_a7_command(
+                query_opcode,
+                query_flags,
+                &mut c,
+                &mut operands,
+                &mut scratch,
+            )?;
+            if query_opcode != OP_GET_BUFFER_MEMORY_REQUIREMENTS2
+                || query_flags != COMMAND_GENERATE_REPLY
+                || query_facts.kind != A7CommandKind::PureControl
+                || scratch.command_identity() != identity
+                || operands.count != 1
+            {
+                return Err(VenusReject::InvalidSequence);
+            }
+
+            let (destroy_opcode, destroy_flags) = command_header(&mut c)?;
+            let destroy_facts = a7_schema::parse_a7_command(
+                destroy_opcode,
+                destroy_flags,
+                &mut c,
+                &mut operands,
+                &mut scratch,
+            )?;
+            if destroy_opcode != OP_DESTROY_BUFFER
+                || destroy_flags != 0
+                || destroy_facts.kind != A7CommandKind::Allocation
+                || scratch.command_identity() != identity
+                || operands.count != 1
+            {
+                return Err(VenusReject::InvalidSequence);
+            }
+            admission.command_count = 3;
+            admission.opcode = query_facts.opcode;
+        } else if opcode == OP_CREATE_IMAGE {
+            let identity = scratch.command_identity();
+            if flags != 0
+                || facts.kind != A7CommandKind::PureControl
+                || identity.0 == 0
+                || identity.1 == 0
+                || operands.count != 1
+            {
+                return Err(VenusReject::InvalidSequence);
+            }
+
+            let (query_opcode, query_flags) = command_header(&mut c)?;
+            let query_facts = a7_schema::parse_a7_command(
+                query_opcode,
+                query_flags,
+                &mut c,
+                &mut operands,
+                &mut scratch,
+            )?;
+            if query_opcode != OP_GET_IMAGE_MEMORY_REQUIREMENTS2
+                || query_flags != COMMAND_GENERATE_REPLY
+                || query_facts.kind != A7CommandKind::PureControl
+                || scratch.command_identity() != identity
+                || operands.count != 1
+            {
+                return Err(VenusReject::InvalidSequence);
+            }
+            admission.command_count = 2;
+            admission.opcode = query_facts.opcode;
+        } else {
+            if flags != COMMAND_GENERATE_REPLY
+                || facts.kind != A7CommandKind::PureControl
+                || operands.count != 1
+            {
+                return Err(VenusReject::InvalidSequence);
+            }
+            admission.command_count = 1;
+            admission.opcode = facts.opcode;
         }
-        admission.command_count = 1;
-        admission.opcode = facts.opcode;
     } else {
         while c.offset != bytes.len() {
             let (opcode, flags) = command_header(&mut c)?;
@@ -904,6 +1030,43 @@ mod tests {
         put64(out, 0x301);
     }
 
+    fn a7_clear_color_recording(out: &mut Vec<u8>) -> usize {
+        put32(out, 90); // vkBeginCommandBuffer
+        put32(out, 0);
+        put64(out, 0x301);
+        put64(out, 1); // pBeginInfo
+        put32(out, 42); // VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO
+        put64(out, 0); // pNext
+        put32(out, 0); // flags
+        put64(out, 0); // pInheritanceInfo
+
+        put32(out, 119); // vkCmdClearColorImage
+        put32(out, 0);
+        put64(out, 0x301); // commandBuffer
+        put64(out, 0x501); // image
+        put32(out, 1); // imageLayout
+        put64(out, 1); // pColor
+        put32(out, 2); // VkClearColorValue uint32 tag
+        let color_count_offset = out.len();
+        put64(out, 4); // uint32[4] array count
+        put32(out, 0x1122_3344);
+        put32(out, 0x5566_7788);
+        put32(out, 0x99aa_bbcc);
+        put32(out, 0xddee_ff00);
+        put32(out, 1); // rangeCount
+        put64(out, 1); // pRanges array count
+        put32(out, 1); // aspectMask
+        put32(out, 0); // baseMipLevel
+        put32(out, 1); // levelCount
+        put32(out, 0); // baseArrayLayer
+        put32(out, 1); // layerCount
+
+        put32(out, 91); // vkEndCommandBuffer
+        put32(out, 0);
+        put64(out, 0x301);
+        color_count_offset
+    }
+
     fn a7_empty_queue(out: &mut Vec<u8>) {
         put32(out, OP_QUEUE_SUBMIT);
         put32(out, 0);
@@ -911,6 +1074,287 @@ mod tests {
         put32(out, 0);
         put64(out, 0); // pSubmits
         put64(out, 0); // fence
+    }
+
+    fn a7_destroy_allocation_object(out: &mut Vec<u8>, opcode: u32) {
+        assert!(matches!(opcode, OP_DESTROY_BUFFER | OP_DESTROY_IMAGE));
+        put32(out, opcode);
+        put32(out, 0);
+        put64(out, 7); // device
+        put64(out, 0x501); // buffer or image
+        put64(out, 0); // pAllocator
+    }
+
+    fn a7_free(out: &mut Vec<u8>) {
+        put32(out, OP_FREE_MEMORY);
+        put32(out, 0);
+        put64(out, 7); // device
+        put64(out, 99); // memory
+        put64(out, 0); // pAllocator
+    }
+
+    fn unbound_buffer_query_stream() -> (Vec<u8>, [usize; 6]) {
+        let mut b = Vec::new();
+        put32(&mut b, OP_SET_REPLY);
+        put32(&mut b, 0);
+        put64(&mut b, 1); // pStream
+        put32(&mut b, 0); // private reply resource placeholder
+        put64(&mut b, 80); // reply offset
+        put64(&mut b, 44); // VkMemoryRequirements2 reply without pNext
+
+        put32(&mut b, OP_CREATE_BUFFER);
+        put32(&mut b, 0);
+        let create_device = b.len();
+        put64(&mut b, 7); // device
+        put64(&mut b, 1); // pCreateInfo
+        put32(&mut b, 12); // VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+        put64(&mut b, 0); // pNext
+        put32(&mut b, 0); // flags
+        put64(&mut b, 65_536); // size
+        put32(&mut b, 3); // usage
+        put32(&mut b, 0); // exclusive sharing
+        put32(&mut b, 0); // queueFamilyIndexCount
+        put64(&mut b, 0); // pQueueFamilyIndices
+        put64(&mut b, 0); // pAllocator
+        put64(&mut b, 1); // pBuffer
+        let create_buffer = b.len();
+        put64(&mut b, 0x501); // output buffer object id
+
+        put32(&mut b, OP_GET_BUFFER_MEMORY_REQUIREMENTS2);
+        put32(&mut b, COMMAND_GENERATE_REPLY);
+        let query_device = b.len();
+        put64(&mut b, 7); // device
+        put64(&mut b, 1); // pInfo
+        put32(&mut b, 1_000_146_000); // VkBufferMemoryRequirementsInfo2
+        put64(&mut b, 0); // pNext
+        let query_buffer = b.len();
+        put64(&mut b, 0x501); // buffer
+        put64(&mut b, 1); // pMemoryRequirements
+        put32(&mut b, 1_000_146_003); // VkMemoryRequirements2
+        put64(&mut b, 0); // pNext
+
+        put32(&mut b, OP_DESTROY_BUFFER);
+        put32(&mut b, 0);
+        let destroy_device = b.len();
+        put64(&mut b, 7); // device
+        let destroy_buffer = b.len();
+        put64(&mut b, 0x501); // buffer
+        put64(&mut b, 0); // pAllocator
+
+        (
+            b,
+            [
+                create_device,
+                create_buffer,
+                query_device,
+                query_buffer,
+                destroy_device,
+                destroy_buffer,
+            ],
+        )
+    }
+
+    fn dxvk_unbound_buffer_query_stream() -> Vec<u8> {
+        let mut b = Vec::new();
+        put32(&mut b, OP_SET_REPLY);
+        put32(&mut b, 0);
+        put64(&mut b, 1); // pStream
+        put32(&mut b, 0); // private reply resource placeholder
+        put64(&mut b, 80); // reply offset
+        put64(&mut b, 64); // VkMemoryRequirements2 + dedicated requirements
+
+        put32(&mut b, OP_CREATE_BUFFER);
+        put32(&mut b, 0);
+        put64(&mut b, 7); // device
+        put64(&mut b, 1); // pCreateInfo
+        put32(&mut b, 12); // VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO
+        put64(&mut b, 1); // pNext
+        put32(&mut b, 1_000_072_000); // external memory buffer create info
+        put64(&mut b, 0); // pNext
+        put32(&mut b, 0x200); // renderer external handle type
+        put32(&mut b, 0); // flags
+        put64(&mut b, 65_536); // size
+        put32(&mut b, 7); // first DXVK usage probe plus transfer bits
+        put32(&mut b, 1); // concurrent sharing
+        put32(&mut b, 2); // queueFamilyIndexCount
+        put64(&mut b, 2); // pQueueFamilyIndices array count
+        put32(&mut b, 0); // graphics queue family
+        put32(&mut b, 1); // transfer queue family
+        put64(&mut b, 0); // pAllocator
+        put64(&mut b, 1); // pBuffer
+        put64(&mut b, 0x501); // output buffer object id
+
+        put32(&mut b, OP_GET_BUFFER_MEMORY_REQUIREMENTS2);
+        put32(&mut b, COMMAND_GENERATE_REPLY);
+        put64(&mut b, 7); // device
+        put64(&mut b, 1); // pInfo
+        put32(&mut b, 1_000_146_000); // VkBufferMemoryRequirementsInfo2
+        put64(&mut b, 0); // pNext
+        put64(&mut b, 0x501); // buffer
+        put64(&mut b, 1); // pMemoryRequirements
+        put32(&mut b, 1_000_146_003); // VkMemoryRequirements2
+        put64(&mut b, 1); // pNext
+        put32(&mut b, 1_000_127_000); // VkMemoryDedicatedRequirements
+        put64(&mut b, 0); // pNext
+
+        put32(&mut b, OP_DESTROY_BUFFER);
+        put32(&mut b, 0);
+        put64(&mut b, 7); // device
+        put64(&mut b, 0x501); // buffer
+        put64(&mut b, 0); // pAllocator
+        b
+    }
+
+    fn dxvk_image_create_query_stream() -> (Vec<u8>, [usize; 4]) {
+        let mut b = Vec::new();
+        put32(&mut b, OP_SET_REPLY);
+        put32(&mut b, 0);
+        put64(&mut b, 1); // pStream
+        put32(&mut b, 0); // private reply resource placeholder
+        put64(&mut b, 80); // reply offset
+        put64(&mut b, 64); // VkMemoryRequirements2 + dedicated requirements
+
+        put32(&mut b, OP_CREATE_IMAGE);
+        put32(&mut b, 0);
+        let create_device = b.len();
+        put64(&mut b, 7); // device
+        put64(&mut b, 1); // pCreateInfo
+        put32(&mut b, 14); // VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
+        put64(&mut b, 1); // pNext
+        put32(&mut b, 1_000_147_000); // VkImageFormatListCreateInfo
+        put64(&mut b, 0); // pNext
+        put32(&mut b, 2); // viewFormatCount
+        put64(&mut b, 2); // pViewFormats array count
+        put32(&mut b, 44); // VK_FORMAT_B8G8R8A8_UNORM
+        put32(&mut b, 50); // VK_FORMAT_B8G8R8A8_SRGB
+        put32(&mut b, 8); // VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT
+        put32(&mut b, 1); // VK_IMAGE_TYPE_2D
+        put32(&mut b, 44); // format
+        put32(&mut b, 1920); // extent.width
+        put32(&mut b, 1080); // extent.height
+        put32(&mut b, 1); // extent.depth
+        put32(&mut b, 1); // mipLevels
+        put32(&mut b, 1); // arrayLayers
+        put32(&mut b, 1); // samples
+        put32(&mut b, 0); // optimal tiling
+        put32(&mut b, 0x14); // sampled + color attachment usage
+        put32(&mut b, 0); // exclusive sharing
+        put32(&mut b, 0); // queueFamilyIndexCount
+        put64(&mut b, 0); // pQueueFamilyIndices
+        put32(&mut b, 0); // initialLayout
+        put64(&mut b, 0); // pAllocator
+        put64(&mut b, 1); // pImage
+        let create_image = b.len();
+        put64(&mut b, 0x601); // output image object id
+
+        put32(&mut b, OP_GET_IMAGE_MEMORY_REQUIREMENTS2);
+        put32(&mut b, COMMAND_GENERATE_REPLY);
+        let query_device = b.len();
+        put64(&mut b, 7); // device
+        put64(&mut b, 1); // pInfo
+        put32(&mut b, 1_000_146_001); // VkImageMemoryRequirementsInfo2
+        put64(&mut b, 0); // pNext
+        let query_image = b.len();
+        put64(&mut b, 0x601); // image
+        put64(&mut b, 1); // pMemoryRequirements
+        put32(&mut b, 1_000_146_003); // VkMemoryRequirements2
+        put64(&mut b, 1); // pNext
+        put32(&mut b, 1_000_127_000); // VkMemoryDedicatedRequirements
+        put64(&mut b, 0); // pNext
+
+        (b, [create_device, create_image, query_device, query_image])
+    }
+
+    #[test]
+    fn control_admits_only_exact_self_contained_unbound_buffer_query() {
+        let (stream, offsets) = unbound_buffer_query_stream();
+        let admitted = validate_venus_control_stream(
+            &stream,
+            true,
+            &mut [VenusOperand::default(); 1],
+            &mut [0u32; 8],
+        )
+        .expect("same-device same-buffer create/query/destroy transaction");
+        assert_eq!(admitted.command_count, 3);
+        assert_eq!(admitted.opcode, OP_GET_BUFFER_MEMORY_REQUIREMENTS2);
+        assert_eq!(admitted.operand_count, 1);
+
+        for offset in offsets {
+            let mut mismatched = stream.clone();
+            mismatched[offset..offset + 8].copy_from_slice(&0x777u64.to_le_bytes());
+            assert_eq!(
+                validate_venus_control_stream(
+                    &mismatched,
+                    true,
+                    &mut [VenusOperand::default(); 1],
+                    &mut [0u32; 8],
+                ),
+                Err(VenusReject::InvalidSequence)
+            );
+        }
+
+        let mut missing_destroy = stream;
+        missing_destroy.truncate(offsets[4] - 8);
+        assert!(validate_venus_control_stream(
+            &missing_destroy,
+            true,
+            &mut [VenusOperand::default(); 1],
+            &mut [0u32; 8],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn control_admits_dxvk_concurrent_external_buffer_query_shape() {
+        let stream = dxvk_unbound_buffer_query_stream();
+        let admitted = validate_venus_control_stream(
+            &stream,
+            true,
+            &mut [VenusOperand::default(); 1],
+            &mut [0u32; 8],
+        )
+        .expect("DXVK concurrent external buffer query transaction");
+        assert_eq!(admitted.command_count, 3);
+        assert_eq!(admitted.opcode, OP_GET_BUFFER_MEMORY_REQUIREMENTS2);
+        assert_eq!(admitted.operand_count, 1);
+        assert_eq!(admitted.reply_size, 64);
+    }
+
+    #[test]
+    fn control_admits_only_same_image_create_query_pair() {
+        let (stream, offsets) = dxvk_image_create_query_stream();
+        let admitted = validate_venus_control_stream(
+            &stream,
+            true,
+            &mut [VenusOperand::default(); 1],
+            &mut [0u32; 8],
+        )
+        .expect("same-device same-image create/query transaction");
+        assert_eq!(admitted.command_count, 2);
+        assert_eq!(admitted.opcode, OP_GET_IMAGE_MEMORY_REQUIREMENTS2);
+        assert_eq!(admitted.operand_count, 1);
+        assert_eq!(admitted.reply_size, 64);
+
+        for offset in offsets {
+            let mut mismatched = stream.clone();
+            mismatched[offset..offset + 8].copy_from_slice(&0x777u64.to_le_bytes());
+            assert_eq!(
+                validate_venus_control_stream(
+                    &mismatched,
+                    true,
+                    &mut [VenusOperand::default(); 1],
+                    &mut [0u32; 8],
+                ),
+                Err(VenusReject::InvalidSequence)
+            );
+        }
+
+        let mut standalone_teardown = Vec::new();
+        a7_destroy_allocation_object(&mut standalone_teardown, OP_DESTROY_IMAGE);
+        assert_eq!(
+            validate_venus_control_stream(&standalone_teardown, false, &mut [], &mut [0u32; 8],),
+            Err(VenusReject::InvalidSequence)
+        );
     }
 
     #[test]
@@ -932,6 +1376,86 @@ mod tests {
         assert_eq!(
             operands[0].operand_kind,
             HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32
+        );
+    }
+
+    #[test]
+    fn a7_consumes_clear_color_union_array_exactly() {
+        let mut b = Vec::new();
+        let color_count_offset = a7_clear_color_recording(&mut b);
+        a7_empty_queue(&mut b);
+
+        let admitted = validate_venus_a7_outer_stream(&b, &mut [], &mut [0u32; 8]).unwrap();
+        assert_eq!(admitted.command_count, 4);
+        assert_eq!(admitted.command_buffer_count, 1);
+        assert_eq!(admitted.queue_command_count, 1);
+
+        b[color_count_offset..color_count_offset + 8].copy_from_slice(&3u64.to_le_bytes());
+        assert_eq!(
+            validate_venus_a7_outer_stream(&b, &mut [], &mut [0u32; 8]),
+            Err(VenusReject::BadArrayCount)
+        );
+    }
+
+    #[test]
+    fn a7_admits_exact_joined_allocation_teardown_without_synthetic_queue() {
+        for opcode in [OP_DESTROY_BUFFER, OP_DESTROY_IMAGE] {
+            let mut b = Vec::new();
+            a7_destroy_allocation_object(&mut b, opcode);
+            a7_free(&mut b);
+
+            let admitted = validate_venus_a7_outer_stream(&b, &mut [], &mut [0u32; 8]).unwrap();
+            assert_eq!(admitted.command_count, 2);
+            assert_eq!(admitted.allocation_command_count, 2);
+            assert_eq!(admitted.command_buffer_count, 0);
+            assert_eq!(admitted.queue_command_count, 0);
+            assert_eq!(admitted.operand_count, 0);
+            assert!(admitted.terminal_teardown);
+        }
+
+        let mut free_only = Vec::new();
+        a7_free(&mut free_only);
+        let admitted = validate_venus_a7_outer_stream(&free_only, &mut [], &mut [0u32; 8]).unwrap();
+        assert_eq!(admitted.command_count, 1);
+        assert!(admitted.terminal_teardown);
+    }
+
+    #[test]
+    fn a7_refuses_incomplete_reordered_or_mixed_allocation_teardown() {
+        let mut destroy_only = Vec::new();
+        a7_destroy_allocation_object(&mut destroy_only, OP_DESTROY_IMAGE);
+        assert_eq!(
+            validate_venus_a7_outer_stream(&destroy_only, &mut [], &mut [0u32; 8]),
+            Err(VenusReject::InvalidSequence)
+        );
+
+        let mut after_free = Vec::new();
+        a7_free(&mut after_free);
+        a7_destroy_allocation_object(&mut after_free, OP_DESTROY_IMAGE);
+        assert_eq!(
+            validate_venus_a7_outer_stream(&after_free, &mut [], &mut [0u32; 8]),
+            Err(VenusReject::InvalidSequence)
+        );
+
+        let mut synthetic_queue = Vec::new();
+        a7_destroy_allocation_object(&mut synthetic_queue, OP_DESTROY_IMAGE);
+        a7_free(&mut synthetic_queue);
+        a7_empty_queue(&mut synthetic_queue);
+        assert_eq!(
+            validate_venus_a7_outer_stream(&synthetic_queue, &mut [], &mut [0u32; 8]),
+            Err(VenusReject::InvalidSequence)
+        );
+
+        let mut allocate_then_free = Vec::new();
+        a7_allocate(&mut allocate_then_free);
+        a7_free(&mut allocate_then_free);
+        assert_eq!(
+            validate_venus_a7_outer_stream(
+                &allocate_then_free,
+                &mut [VenusOperand::default(); 1],
+                &mut [0u32; 8],
+            ),
+            Err(VenusReject::InvalidSequence)
         );
     }
 
@@ -1210,13 +1734,8 @@ mod tests {
 
         let mut operands = [VenusOperand::default(); 1];
         let mut geometry = [0u32; 8];
-        let admitted = validate_venus_control_stream(
-            &b,
-            true,
-            &mut operands,
-            &mut geometry,
-        )
-        .expect("vkEnumerateDeviceExtensionProperties NULL-layer count query");
+        let admitted = validate_venus_control_stream(&b, true, &mut operands, &mut geometry)
+            .expect("vkEnumerateDeviceExtensionProperties NULL-layer count query");
         assert_eq!(admitted.opcode, 14);
         assert_eq!(admitted.operand_count, 1);
         assert_eq!(admitted.reply_offset, 80);
@@ -1284,10 +1803,7 @@ mod tests {
         b
     }
 
-    fn physical_device_memory_properties2_stream(
-        reply_size: u64,
-        memory_budget: bool,
-    ) -> Vec<u8> {
+    fn physical_device_memory_properties2_stream(reply_size: u64, memory_budget: bool) -> Vec<u8> {
         let mut b = Vec::new();
         put32(&mut b, OP_SET_REPLY);
         put32(&mut b, 0);
@@ -1455,6 +1971,94 @@ mod tests {
             ),
             Err(VenusReject::BadArrayCount)
         );
+    }
+
+    #[test]
+    fn admits_captured_dxvk_update_descriptor_sets_control_batch() {
+        // Exact 120-byte payload captured at the first rejected Render on
+        // KMD 22.22.316.0.  It is one reply-less vkUpdateDescriptorSets from
+        // the dxvk-cs thread (SHA-256 5d50933e16eabdb484515ee65ff7a934f4
+        // 33ba1adcff3674e8e606671209dc07), not a reply-stream or allocation call.
+        let words = [
+            0x4f, 0, 3, 0, 1, 1, 0, 0x23, 0, 0, 0x7c, 0, 0, 0, 1, 0, 1, 0, 0x13, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0,
+        ];
+        let mut captured = Vec::new();
+        for word in words {
+            put32(&mut captured, word);
+        }
+        assert_eq!(captured.len(), 120);
+
+        let admitted = validate_venus_control_stream(&captured, false, &mut [], &mut [0u32; 8])
+            .expect("captured DXVK vkUpdateDescriptorSets batch");
+        assert_eq!(admitted.opcode, 79);
+        assert_eq!(admitted.command_count, 1);
+        assert_eq!(admitted.operand_count, 0);
+
+        // A present payload pointer must still carry exactly descriptorCount
+        // elements; only the two unused semantic-union pointers may be zero.
+        captured[64..72].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(
+            validate_venus_control_stream(&captured, false, &mut [], &mut [0u32; 8],),
+            Err(VenusReject::BadArrayCount)
+        );
+    }
+
+    #[test]
+    fn admits_captured_dxvk_image_format_query_control_batch() {
+        // Exact 112-byte Venus payload captured at the first repeating
+        // 264-byte HNR2 refusal on KMD 22.22.317.0 (SHA-256
+        // 0b4455c6fc0ddbc23b01041622d1bd5ee8c8be2e33b9e927886ece385606cbda).
+        // It is SetReplyCommandStreamMESA followed by one generated-reply
+        // vkGetPhysicalDeviceImageFormatProperties2 call.
+        let words = [
+            0xb2,
+            0,
+            1,
+            0,
+            0,
+            0x50,
+            0,
+            0x3c,
+            0,
+            0x96,
+            1,
+            2,
+            0,
+            1,
+            0,
+            0x3b9b_b07c,
+            0,
+            0,
+            0x2c,
+            1,
+            0,
+            3,
+            8,
+            1,
+            0,
+            0x3b9b_b07b,
+            0,
+            0,
+        ];
+        let mut captured = Vec::new();
+        for word in words {
+            put32(&mut captured, word);
+        }
+        assert_eq!(captured.len(), 112);
+
+        let admitted = validate_venus_control_stream(
+            &captured,
+            true,
+            &mut [VenusOperand::default(); 1],
+            &mut [0u32; 8],
+        )
+        .expect("captured DXVK image-format query");
+        assert_eq!(admitted.opcode, 150);
+        assert_eq!(admitted.command_count, 1);
+        assert_eq!(admitted.operand_count, 1);
+        assert_eq!(admitted.reply_offset, 80);
+        assert_eq!(admitted.reply_size, 60);
     }
 
     #[test]

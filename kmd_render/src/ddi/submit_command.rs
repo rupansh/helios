@@ -248,6 +248,34 @@ pub(crate) unsafe fn signal_crtc_vsync(
     unsafe { notify_at_dirql(dxgkrnl, &mut interrupt, true) }
 }
 
+/// Synthesize `DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY3` for the
+/// single target. An MPO3-capable driver must report THIS vsync shape: dxgkrnl
+/// ignores plain `CRTC_VSYNC` for flip retirement on such adapters — measured
+/// as a ~6 s modeset wait (350 delivered plain vsyncs) then rollback to zero
+/// paths on 22.22.337.0. One layer-0 entry, no HW flip-queue log.
+/// Callable at <= DIRQL (the DPC path).
+pub(crate) unsafe fn signal_crtc_vsync_mpo3(
+    dxgkrnl: &DXGKRNL_INTERFACE,
+    target_id: u32,
+) -> NTSTATUS {
+    let mut info = DXGK_MULTIPLANE_OVERLAY_VSYNC_INFO3 {
+        LayerIndex: 0,
+        FirstFreeFlipQueueLogEntryIndex: 0,
+    };
+    let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
+    interrupt.InterruptType = _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY3;
+    // SAFETY: CrtcVsyncWithMultiPlaneOverlay3 is the arm for that type.
+    let vsync = unsafe { interrupt.__bindgen_anon_1.CrtcVsyncWithMultiPlaneOverlay3.as_mut() };
+    vsync.VidPnTargetId = target_id;
+    vsync.PhysicalAdapterMask = 1;
+    vsync.MultiPlaneOverlayVsyncInfoCount = 1;
+    vsync.pMultiPlaneOverlayVsyncInfo = &mut info;
+    vsync.GpuFrequency = 0;
+    vsync.GpuClockCounter = 0;
+    // SAFETY: fully-initialized packet; `info` outlives the synchronous call.
+    unsafe { notify_at_dirql(dxgkrnl, &mut interrupt, true) }
+}
+
 /// Signal `DXGK_INTERRUPT_DMA_PREEMPTED` (see [`notify_at_dirql`]): the node's
 /// pending submissions are released back to the scheduler, which resubmits the
 /// incomplete ones later.

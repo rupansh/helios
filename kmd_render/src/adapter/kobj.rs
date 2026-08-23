@@ -514,10 +514,22 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
     // is therefore the truthful address to report.
     //
     let phys = adapter.last_primary_address.load(Ordering::Acquire) as i64;
-    // SAFETY: live callback interface; signal_crtc_vsync raises to DIRQL internally
-    // via DxgkCbSynchronizeExecution and delivers the CRTC_VSYNC packet.
+    // SAFETY: live callback interface; both signalers raise to DIRQL internally
+    // via DxgkCbSynchronizeExecution and deliver the packet synchronously. The
+    // MPO3 shape is mandatory on this MPO3-capable surface (see its doc).
     let _ = unsafe {
-        crate::ddi::submit_command::signal_crtc_vsync(dxgkrnl, phys, crate::ddi::vidpn::CHILD_UID)
+        if crate::virtio::KMD_D2_OWNER_ENABLED {
+            crate::ddi::submit_command::signal_crtc_vsync_mpo3(
+                dxgkrnl,
+                crate::ddi::vidpn::CHILD_UID,
+            )
+        } else {
+            crate::ddi::submit_command::signal_crtc_vsync(
+                dxgkrnl,
+                phys,
+                crate::ddi::vidpn::CHILD_UID,
+            )
+        }
     };
     adapter.vsync_count.fetch_add(1, Ordering::Relaxed);
 }
