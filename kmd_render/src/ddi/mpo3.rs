@@ -52,6 +52,21 @@ static SET_PRIVATE_IGNORED: AtomicU32 = AtomicU32::new(0);
 static SET_FLIPLINE_IGNORED: AtomicU32 = AtomicU32::new(0);
 static SET_SDR_WHITE_IGNORED: AtomicU32 = AtomicU32::new(0);
 static SET_DIRTY_IGNORED: AtomicU32 = AtomicU32::new(0);
+static VSYNC2_ENABLED: AtomicU32 = AtomicU32::new(1);
+
+pub(crate) fn set_vsync2_enabled(value: u32) {
+    VSYNC2_ENABLED.store(value, Ordering::Relaxed);
+}
+
+pub(crate) fn vsync2_enabled() -> bool {
+    VSYNC2_ENABLED.load(Ordering::Relaxed) != 0
+}
+
+/// The last MPO3 PresentId this driver has SEEN (accepted or parked): reported
+/// as completed in the INFO2 vsync so no flip can outlive the next vsync.
+pub(crate) fn mpo_last_present_id() -> u64 {
+    LAST_PRESENT_ID.load(Ordering::Acquire)
+}
 static LAST_PRESENT_ID: AtomicU64 = AtomicU64::new(0);
 static POST_PRESENT_HITS: AtomicU32 = AtomicU32::new(0);
 static UPDATE_REFUSALS: AtomicU32 = AtomicU32::new(0);
@@ -351,6 +366,10 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_with_multi_plane_overl
     };
     let plane = unsafe { &mut *plane_ptr };
     plane.OutputFlags = Default::default();
+    // Stored for accepted AND parked flips: the INFO2 vsync reports this id as
+    // completed, and a parked flip that never retires is DEVICEREMOVED for the
+    // presenter within seconds (measured .353-.356).
+    LAST_PRESENT_ID.store(plane.PresentId, Ordering::Release);
     let plane_flags = unsafe { plane.InputFlags.__bindgen_anon_1.Value };
     // One site per predicate: 0x06000001 was measured on the first parked DWM
     // flip (2026-08-24) and could not say WHICH of four fields tripped.
@@ -417,7 +436,6 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_with_multi_plane_overl
     if status != STATUS_SUCCESS {
         return park_set_refusal(10);
     }
-    LAST_PRESENT_ID.store(plane.PresentId, Ordering::Release);
     let accepted = SET_ACCEPTS.fetch_add(1, Ordering::Relaxed) + 1;
     if accepted == 1 || accepted % 64 == 0 {
         crate::diag::record_named_bytes(b"MpoSetOk", accepted);

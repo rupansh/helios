@@ -503,6 +503,14 @@ pub mod knobs {
     /// 0 is coerced to 1 (a zero-depth flip queue is not representable) and the
     /// value actually advertised is mirrored in the `FlipQueV` counter.
     pub const FLIP_QUEUE_DEPTH: KnobName = KnobName::new(b"FlipQueueN");
+    /// MPO vsync shape (default 1): report `CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY2`
+    /// (INFO2, carries the completed PresentId — the non-HW-flip-queue model).
+    /// 0 restores the INFO3 shape, whose only completion channel is the
+    /// flip-queue log this driver does not implement: measured on .353-.356
+    /// (2026-08-24), every MPO flip then never completes and dxgkrnl removes
+    /// DWM's device seconds after its first present. Read at
+    /// `direct_scanout::start`, so `pnputil /restart-device` applies it.
+    pub const MPO_VSYNC2: KnobName = KnobName::new(b"MpoVsync2");
     /// Diagnostic: fill the D2 parking image with this byte instead of zeroing
     /// it, and flush the parking bind so the host reads it. Default 0 = zeroed
     /// and unflushed, the shipping behaviour. Nonzero turns parking into an

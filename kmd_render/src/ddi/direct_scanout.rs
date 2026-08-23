@@ -1661,6 +1661,10 @@ pub(crate) fn start(
             crate::diag::read_config_dword(crate::diag::knobs::PIXEL_PROBE, 0),
             Ordering::Relaxed,
         );
+        crate::ddi::mpo3::set_vsync2_enabled(crate::diag::read_config_dword(
+            crate::diag::knobs::MPO_VSYNC2,
+            1,
+        ));
         crate::virtio::venus::fill_host_visible_blob(
             passive,
             adapter,

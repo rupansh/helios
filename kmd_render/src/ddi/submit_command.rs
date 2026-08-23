@@ -258,6 +258,30 @@ pub(crate) unsafe fn signal_crtc_vsync_mpo3(
     dxgkrnl: &DXGKRNL_INTERFACE,
     target_id: u32,
 ) -> NTSTATUS {
+    // Default: the INFO2 shape (WDDM 2.1), whose PresentId is the ONLY
+    // completion channel a non-flip-queue MPO driver has. With INFO3 (no
+    // PresentId; completion = the flip-queue log we do not implement) every
+    // MPO flip stayed pending and dxgkrnl removed DWM's device seconds after
+    // its first present (.353-.356, 2026-08-24). `MpoVsync2=0` restores INFO3.
+    if crate::ddi::mpo3::vsync2_enabled() {
+        // SAFETY: all-zero is the documented empty flags value for the arm.
+        let mut info = unsafe { core::mem::zeroed::<DXGK_MULTIPLANE_OVERLAY_VSYNC_INFO2>() };
+        info.LayerIndex = 0;
+        info.PresentId = crate::ddi::mpo3::mpo_last_present_id();
+        let mut interrupt = unsafe { core::mem::zeroed::<DXGKARGCB_NOTIFY_INTERRUPT_DATA>() };
+        interrupt.InterruptType =
+            _DXGK_INTERRUPT_TYPE::DXGK_INTERRUPT_CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY2;
+        // SAFETY: CrtcVsyncWithMultiPlaneOverlay2 is the arm for that type.
+        let vsync = unsafe { interrupt.__bindgen_anon_1.CrtcVsyncWithMultiPlaneOverlay2.as_mut() };
+        vsync.VidPnTargetId = target_id;
+        vsync.PhysicalAdapterMask = 1;
+        vsync.MultiPlaneOverlayVsyncInfoCount = 1;
+        vsync.pMultiPlaneOverlayVsyncInfo = &mut info;
+        vsync.GpuFrequency = 0;
+        vsync.GpuClockCounter = 0;
+        // SAFETY: fully-initialized packet; `info` outlives the synchronous call.
+        return unsafe { notify_at_dirql(dxgkrnl, &mut interrupt, true) };
+    }
     let mut info = DXGK_MULTIPLANE_OVERLAY_VSYNC_INFO3 {
         LayerIndex: 0,
         FirstFreeFlipQueueLogEntryIndex: 0,
