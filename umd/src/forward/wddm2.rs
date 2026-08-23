@@ -401,16 +401,13 @@ pub(crate) unsafe extern "C" fn set_hardware_protection_state_wddm2(
     );
 }
 
-unsafe fn exact_sync_token_context(
-    h: Hdevice,
+/// The resource-side identity of one sync-token call. Its result is recorded,
+/// never used to fail the DDI — see the call site.
+unsafe fn sync_token_resource_identity(
+    dev: &'static HeliosDevice,
     resource: ddi::D3D10DDI_HRESOURCE,
-    sync_token: ddi::HANDLE,
-) -> Result<(&'static HeliosDevice, ddi::D3DDDICB_SYNCTOKEN), Wddm2Refusal> {
-    if sync_token.is_null() {
-        return Err(Wddm2Refusal::ZeroSyncToken);
-    }
-    let dev = helios_device(h).ok_or(Wddm2Refusal::ForeignDevice)?;
-    let state = resource_state(resource).ok_or(Wddm2Refusal::MissingResource)?;
+) -> Result<(), Wddm2Refusal> {
+    let state = unsafe { resource_state(resource) }.ok_or(Wddm2Refusal::MissingResource)?;
     let identity = state
         .outer_allocation
         .ok_or(Wddm2Refusal::MissingAssociation)?;
@@ -436,7 +433,34 @@ unsafe fn exact_sync_token_context(
     {
         return Err(Wddm2Refusal::StaleGeneration);
     }
-    drop(allocations);
+    Ok(())
+}
+
+unsafe fn exact_sync_token_context(
+    h: Hdevice,
+    resource: ddi::D3D10DDI_HRESOURCE,
+    sync_token: ddi::HANDLE,
+) -> Result<(&'static HeliosDevice, ddi::D3DDDICB_SYNCTOKEN), Wddm2Refusal> {
+    if sync_token.is_null() {
+        return Err(Wddm2Refusal::ZeroSyncToken);
+    }
+    let dev = helios_device(h).ok_or(Wddm2Refusal::ForeignDevice)?;
+    // ⛔ ADVISORY, NOT A GATE — measured 2026-08-24 on KMD 22.22.352.0. See
+    // `DdiRefusals::sync_token_identity_unverified`: refusing the DDI on these
+    // checks made DWM's very first `AcquireResource` fatal and it never
+    // presented a frame. The callback below consumes only the sync token and
+    // this device's broadcast context.
+    if let Err(reason) = unsafe { sync_token_resource_identity(dev, resource) } {
+        note_ddi_refusal(&DDI_REFUSALS.sync_token_identity_unverified);
+        if SYNC_TOKEN_IDENTITY_LOG.first_n_then_every(16, 4096).is_some() {
+            log_error!(
+                "WDDM2.1 sync token identity unverified: {reason:?} priv={:p} slot=0x{:x} token={:p}",
+                resource.pDrvPrivate,
+                unsafe { state::resource_slot_word(resource) },
+                sync_token
+            );
+        }
+    }
     let _context = dev
         .outer
         .context

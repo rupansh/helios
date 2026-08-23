@@ -129,6 +129,7 @@ pub(super) use helios_umd_common::throttle::LogThrottle;
 use helios_umd_common::refusals::{self, RefusalCounter};
 
 pub(super) static CREATE_RESOURCE_IDENTITY_LOG_COUNT: LogThrottle = LogThrottle::new();
+pub(super) static SYNC_TOKEN_IDENTITY_LOG: LogThrottle = LogThrottle::new();
 pub(super) static VIEW_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(super) static WDDM_ALLOC_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(super) static D3D11_1_LOG_COUNT: LogThrottle = LogThrottle::new();
@@ -377,6 +378,18 @@ struct DdiRefusals {
     /// kind, or lower image whose exact requirement exceeds the immutable HWA2
     /// extent. No allocation is guessed or partially associated.
     hwa2_open_unsupported_shape: RefusalCounter,
+    /// `pfnAcquireResource`/`pfnReleaseResource` whose RESOURCE-side identity
+    /// could not be verified, and which were forwarded anyway.
+    ///
+    /// ⛔ MEASURED 2026-08-24 (KMD 22.22.352.0): refusing here is fatal. The
+    /// first `AcquireResource` DWM makes lands on a resource whose slot this
+    /// device never stored; the old code answered `set_runtime_error(
+    /// E_INVALIDARG)`, and DWM tore both devices down with `PresentBoundary
+    /// present=0` — it never presented a single frame all boot, which is the
+    /// black desktop. `D3DDDICB_SYNCTOKEN` carries only the token and the
+    /// broadcast context, neither of which comes from the resource, so the
+    /// check was validation the DDI does not require.
+    sync_token_identity_unverified: RefusalCounter,
 }
 
 /// ⚠ Each counter now carries its own NAME (`RefusalCounter`, stage S2), so
@@ -407,12 +420,13 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
     hwa2_image_format_unknown: RefusalCounter::new("hwa2_image_format_unknown"),
     hwa2_unknown_dimension: RefusalCounter::new("hwa2_unknown_dimension"),
     hwa2_open_unsupported_shape: RefusalCounter::new("hwa2_open_unsupported_shape"),
+    sync_token_identity_unverified: RefusalCounter::new("sync_token_identity_unverified"),
 };
 
 /// The set, in the order the summary prints them. ⛔ This order is the
 /// evidence contract: `DDI refusals:` lines from different builds are diffed.
 /// The K4 counters are APPENDED so every pre-existing column keeps its place.
-static DDI_REFUSAL_SET: [&RefusalCounter; 22] = [
+static DDI_REFUSAL_SET: [&RefusalCounter; 23] = [
     &DDI_REFUSALS.srv_raw_hazard,
     &DDI_REFUSALS.resource_raw_hazard,
     &DDI_REFUSALS.text_filter_size_ignored,
@@ -435,6 +449,7 @@ static DDI_REFUSAL_SET: [&RefusalCounter; 22] = [
     &DDI_REFUSALS.hwa2_image_format_unknown,
     &DDI_REFUSALS.hwa2_unknown_dimension,
     &DDI_REFUSALS.hwa2_open_unsupported_shape,
+    &DDI_REFUSALS.sync_token_identity_unverified,
 ];
 
 /// One bounded log line carrying every counter.

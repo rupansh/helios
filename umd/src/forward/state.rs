@@ -1045,7 +1045,14 @@ pub(crate) unsafe fn load_resource_at(
 pub(crate) unsafe fn resource_state(
     h_res: ddi::D3D10DDI_HRESOURCE,
 ) -> Option<&'static ResourceState> {
-    boxed_slot(h_res)?.get()
+    unsafe { boxed_slot(h_res) }?.get()
+}
+
+/// The raw slot word behind a resource handle: 0 when the runtime allocated the
+/// private storage but this driver never stored a payload there. Diagnostic
+/// only — it distinguishes "not our handle" from "our handle, never filled".
+pub(crate) unsafe fn resource_slot_word(h_res: ddi::D3D10DDI_HRESOURCE) -> usize {
+    unsafe { boxed_slot(h_res) }.map_or(0, |slot| unsafe { slot.word() })
 }
 
 /// `resource_state` for the runtime-tag dispatches. See `load_resource_at`.
