@@ -200,6 +200,12 @@ struct AllocationContext {
     /// kernel-created Venus `VkImage`. As above, enabled teardown authority is
     /// held only by the canonical resource row.
     venus_image_id: u64,
+    /// How many times this allocation's `resource_id` was substituted into a
+    /// generated `VkImportMemoryResourceInfoMESA` operand — i.e. how many times
+    /// a host `VkDeviceMemory` was bound to THIS blob. Zero on an allocation
+    /// the renderer never imported, which is exactly what an empty scanned-out
+    /// primary looks like (22.22.350.0: the primary blob is zero at both ends).
+    import_operand_substitutions: AtomicU32,
     size: SIZE_T,
     /// Surface geometry for `DxgkDdiDescribeAllocation` (0 for UMD blob allocations
     /// that carry no dimensions). Populated from the standard-allocation trailer.
@@ -1255,6 +1261,19 @@ impl OpenOuterUse {
         self.execution.as_ref().map(|guard| guard.resource_id)
     }
 
+    /// Record that this use's blob was just named by a generated resource
+    /// operand — the KMD half of the venus memory import.
+    pub(crate) fn note_import_operand_substitution(&self) {
+        // SAFETY: the open object outlives this use guard (dxgkrnl closes every
+        // device-specific binding before DestroyAllocation), and `allocation`
+        // is the canonical KMD allocation it was opened against.
+        let allocation = unsafe { self.open.as_ref() }.allocation;
+        if let Some(ctx) = (unsafe { resolve_alloc(allocation as HANDLE) }) {
+            ctx.import_operand_substitutions
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn transport_instance(&self) -> Option<u64> {
         self.execution
             .as_ref()
@@ -1759,6 +1778,11 @@ pub(crate) struct DirectScanoutAllocationFacts {
     /// Keeping it in this immutable projection lets DIRQL admission prove the
     /// HWA2 byte range without taking the canonical-owner DISPATCH spinlock.
     pub backing_size: u64,
+    /// [`AllocationContext::import_operand_substitutions`] at projection time.
+    pub import_substitutions: u32,
+    /// Nonzero when the KMD built a real Venus `VkImage` for this allocation
+    /// rather than a plain memory blob.
+    pub venus_image: bool,
 }
 
 /// Exact K2a role-1 backing used by one HTS1 session transport.
@@ -1965,6 +1989,8 @@ pub(crate) unsafe fn direct_scanout_allocation_facts(
         allocation_generation: ctx.generation,
         transport_instance: ctx.transport_instance,
         backing_size: ctx.venus_alloc_size,
+        import_substitutions: ctx.import_operand_substitutions.load(Ordering::Relaxed),
+        venus_image: ctx.venus_image_id != 0,
     })
 }
 
@@ -3953,6 +3979,7 @@ unsafe fn create_one(
         final_hwa2: admitted.final_hwa2,
         venus_memory_id: backing.map_or(0, |b| b.venus_memory_id),
         venus_image_id: backing.map_or(0, |b| b.venus_image_id),
+        import_operand_substitutions: AtomicU32::new(0),
         size: admitted.vidmm_size,
         width: admitted.width,
         height: admitted.height,

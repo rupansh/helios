@@ -236,6 +236,12 @@ pub static NR2_HOS1_REJECT: AtomicU32 = AtomicU32::new(0);
 pub static NR2_OUTER_QUEUED: AtomicU32 = AtomicU32::new(0);
 /// Outer execution refusals, packed `(count << 16) | OuterExecutionRefusal`.
 pub static NR2_OUTER_REJECT: AtomicU32 = AtomicU32::new(0);
+/// Generated resource operands substituted with a real virtio resource id —
+/// the KMD half of the venus memory import, counted globally so a per-allocation
+/// zero (`D2BnImp`) can be told apart from a dead instrument.
+pub static NR2_IMPORT_SUBSTITUTIONS: AtomicU32 = AtomicU32::new(0);
+/// The last resource id substituted into such an operand.
+pub static NR2_IMPORT_LAST_RESOURCE: AtomicU32 = AtomicU32::new(0);
 /// Fully validated HOB1 payloads accepted by the existing stock-Venus
 /// endpoint.  This moves only after private operand patching and descriptor
 /// publication, never from HOS1 validation alone.
@@ -272,7 +278,7 @@ pub static NR2_NO_STAGE: AtomicU32 = AtomicU32::new(0);
 pub static NR2_NO_EPOCH: AtomicU32 = AtomicU32::new(0);
 /// The counter names, as one list, so the collision proof and the writer cannot
 /// drift apart.
-const COUNTER_NAMES: [&[u8]; 41] = [
+const COUNTER_NAMES: [&[u8]; 43] = [
     b"Nr2QCtx",
     b"Nr2QCtxRej",
     b"Nr2Scratch",
@@ -314,6 +320,8 @@ const COUNTER_NAMES: [&[u8]; 41] = [
     b"Nr2OuterQ",
     b"Nr2OuterRej",
     b"Nr2OuterHost",
+    b"Nr2ImpN",
+    b"Nr2ImpRid",
 ];
 
 /// The boundary counters that did not fit [`COUNTER_NAMES`]'s block, mirrored
@@ -414,6 +422,8 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(COUNTER_NAMES[38], &NR2_OUTER_QUEUED),
         f(COUNTER_NAMES[39], &NR2_OUTER_REJECT),
         e(COUNTER_NAMES[40], &NR2_OUTER_HOST),
+        e(COUNTER_NAMES[41], &NR2_IMPORT_SUBSTITUTIONS),
+        e(COUNTER_NAMES[42], &NR2_IMPORT_LAST_RESOURCE),
         e(BOUNDARY_NAMES[0], &NR2_NO_STAGE),
         e(BOUNDARY_NAMES[1], &NR2_NO_EPOCH),
         f(BOUNDARY_NAMES[2], &crate::device::CONTEXT_HANDLE_REFUSED),
@@ -1798,6 +1808,9 @@ fn execute_outer_pending(
         let Some(resource_id) = allocations[operand.use_index as usize].resource_id() else {
             return Err(OuterExecutionRefusal::UseMissingOrForeign);
         };
+        allocations[operand.use_index as usize].note_import_operand_substitution();
+        NR2_IMPORT_SUBSTITUTIONS.fetch_add(1, Ordering::Relaxed);
+        NR2_IMPORT_LAST_RESOURCE.store(resource_id, Ordering::Relaxed);
         scratch.patch_order[index] = resource_id;
     }
 
@@ -2213,6 +2226,9 @@ pub(crate) unsafe fn render_outer_physical(
                 STATUS_INVALID_PARAMETER,
             );
         };
+        allocations[operand.use_index as usize].note_import_operand_substitution();
+        NR2_IMPORT_SUBSTITUTIONS.fetch_add(1, Ordering::Relaxed);
+        NR2_IMPORT_LAST_RESOURCE.store(resource_id, Ordering::Relaxed);
         scratch.patch_order[index] = resource_id;
     }
 

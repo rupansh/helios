@@ -113,6 +113,12 @@ static BIND_LAST_EXTENT: AtomicU32 = AtomicU32::new(0);
 static BIND_LAST_STRIDE: AtomicU32 = AtomicU32::new(0);
 static BIND_LAST_FORMAT: AtomicU32 = AtomicU32::new(0);
 static BIND_LAST_OFFSET: AtomicU32 = AtomicU32::new(0);
+static BIND_LAST_FLAGS: AtomicU32 = AtomicU32::new(0);
+static BIND_LAST_KIND: AtomicU32 = AtomicU32::new(0);
+static BIND_LAST_SWIZZLE: AtomicU32 = AtomicU32::new(0);
+static BIND_LAST_DXGI: AtomicU32 = AtomicU32::new(0);
+static BIND_LAST_IMPORTS: AtomicU32 = AtomicU32::new(0);
+static BIND_LAST_VENUS_IMAGE: AtomicU32 = AtomicU32::new(0);
 /// Why the plane drained: `direct_scanout_lifetime::drain_reason_code`, 1..=7.
 /// The FIRST drain is the one that matters — after it the OS stopped offering
 /// addresses entirely (D2AdmRef=D4AdrRef=0 with the display already dark).
@@ -131,6 +137,12 @@ fn note_bind_real(geometry: &DisplayBacking) {
     BIND_LAST_STRIDE.store(geometry.stride, Ordering::Relaxed);
     BIND_LAST_FORMAT.store(geometry.format, Ordering::Relaxed);
     BIND_LAST_OFFSET.store(geometry.offset, Ordering::Relaxed);
+    BIND_LAST_FLAGS.store(geometry.hwa2_flags, Ordering::Relaxed);
+    BIND_LAST_KIND.store(geometry.hwa2_kind, Ordering::Relaxed);
+    BIND_LAST_SWIZZLE.store(geometry.hwa2_swizzle, Ordering::Relaxed);
+    BIND_LAST_DXGI.store(geometry.dxgi_format, Ordering::Relaxed);
+    BIND_LAST_IMPORTS.store(geometry.imports, Ordering::Relaxed);
+    BIND_LAST_VENUS_IMAGE.store(geometry.venus_image as u32, Ordering::Relaxed);
 }
 
 /// The flushed blob as the GUEST sees it, sampled through the canonical map.
@@ -246,6 +258,12 @@ pub(crate) fn record_refusal_counters() {
     crate::diag::record_named_bytes(b"D2PxNz", PIXEL_PROBE_NONZERO.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"D2PxMax", PIXEL_PROBE_MAX.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"D2PxPark", PIXEL_PROBE_PARK.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2BnFlg", BIND_LAST_FLAGS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2BnKnd", BIND_LAST_KIND.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2BnSwz", BIND_LAST_SWIZZLE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2BnDxgi", BIND_LAST_DXGI.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2BnImp", BIND_LAST_IMPORTS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2BnVImg", BIND_LAST_VENUS_IMAGE.load(Ordering::Relaxed));
 }
 
 pub(crate) fn reset_refusal_counters() {
@@ -286,6 +304,12 @@ pub(crate) fn reset_refusal_counters() {
         &PIXEL_PROBE_NONZERO,
         &PIXEL_PROBE_MAX,
         &PIXEL_PROBE_PARK,
+        &BIND_LAST_FLAGS,
+        &BIND_LAST_KIND,
+        &BIND_LAST_SWIZZLE,
+        &BIND_LAST_DXGI,
+        &BIND_LAST_IMPORTS,
+        &BIND_LAST_VENUS_IMAGE,
     ] {
         counter.store(0, Ordering::Relaxed);
     }
@@ -304,6 +328,15 @@ pub(crate) struct DirectScanoutOperation {
 
 #[derive(Clone, Copy)]
 struct DisplayBacking {
+    /// The subject's HWA2 identity, carried so the bind census names WHAT it
+    /// bound and not only where. `imports` is how many host `VkDeviceMemory`
+    /// objects were ever imported onto this blob.
+    hwa2_flags: u32,
+    hwa2_kind: u32,
+    hwa2_swizzle: u32,
+    dxgi_format: u32,
+    imports: u32,
+    venus_image: bool,
     allocation_handle: usize,
     allocation_generation: u64,
     resource_id: u32,
@@ -668,6 +701,8 @@ pub(crate) unsafe fn validate_direct_scanout_binding(
         allocation_generation,
         transport_instance,
         backing_size,
+        import_substitutions,
+        venus_image,
     }) = (unsafe { super::create_allocation::direct_scanout_allocation_facts(h_allocation) })
     else {
         record_refusal(&ADMISSION_REFUSALS, b"D2AdmRef", 2);
@@ -723,6 +758,12 @@ pub(crate) unsafe fn validate_direct_scanout_binding(
     Ok(ValidatedDirectScanoutBinding {
         binding: Binding::new(
             DisplayBacking {
+                hwa2_flags: final_hwa2.flags,
+                hwa2_kind: final_hwa2.allocation_kind,
+                hwa2_swizzle: final_hwa2.swizzle_class,
+                dxgi_format: final_hwa2.dxgi_format,
+                imports: import_substitutions,
+                venus_image,
                 allocation_handle: h_allocation as usize,
                 allocation_generation,
                 resource_id,
@@ -1501,6 +1542,12 @@ fn issue_disable_locked(passive: PassiveLevel, adapter: &AdapterContext) -> bool
         PublishKind::DisableZero,
         None,
         DisplayBacking {
+            hwa2_flags: 0,
+            hwa2_kind: 0,
+            hwa2_swizzle: 0,
+            dxgi_format: 0,
+            imports: 0,
+            venus_image: false,
             allocation_handle: 0,
             allocation_generation: 0,
             resource_id: 0,
@@ -1642,6 +1689,12 @@ pub(crate) fn start(
             .map_err(|_| VirtioError::DeviceError)?;
         let parking = Binding::new(
             DisplayBacking {
+                hwa2_flags: 0,
+                hwa2_kind: 0,
+                hwa2_swizzle: 0,
+                dxgi_format: 0,
+                imports: 0,
+                venus_image: false,
                 allocation_handle: 0,
                 allocation_generation: plane_generation,
                 resource_id: parking.blob.res_id,
