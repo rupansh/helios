@@ -1218,6 +1218,78 @@ cold-DWM, or target probe ran. The installed target therefore remains KMD
 22.22.296.0 / `oem128.inf`, DWM on WARP, and zero active DisplayConfig paths.
 Visible cold-DWM admission remains the next separately authorized boundary.
 
+#### ⭐ 2026-08-23: THE DISPLAY LANE IS RUNTIME-ADMITTED (KMD 22.22.338.0)
+
+Session-1 DisplayConfig reports **one ACTIVE path**: Helios `\\.\DISPLAY3`
+`state=0x5` (attached-to-desktop, primary), current mode **1896x1030 32bpp
+60Hz**, Generic PnP Monitor on HLS0001; auto-logon completes and DWM is stable.
+Six stacked runtime fixes, each measured before written (KMD .325→.338,
+uncommitted): (1) both KMD `vkCreateInstance` encoders pin apiVersion 1.4 — a
+NULL `pApplicationInfo` made vkr default the host instance to 1.1, NULLing
+every core-1.2/1.3 device proc and SIGSEGV'ing the render worker at each
+client's first frame (2,835 host segfaults; the mesa/DXVK "maintenance4"
+workarounds were misdiagnoses of this); (2) `CommittedModeStorage` initial
+policy word = adapter+target POWERED (dxgkrnl issues zero boot SetPowerState
+calls; the zero word refused every first flip `SourcePoweredOff`); (3) the
+classic MODE_CHANGE flip is admissible while the source is still invisible
+(measured order: Commit → SetVidPnSourceAddress(MODE_CHANGE) →
+visibility(TRUE)); (4) scanout admission accepts dxgi 88 (the KMD's own
+standard-primary author writes B8G8R8X8/XR24) and maps it to virtio format 2;
+(5) a completion stale only by generation latches when the current mode still
+names the same source+geometry (visibility transitions bump the stored
+generation, so the first bind was stale BY CONSTRUCTION; poisoning there
+killed the boot); (6) the vsync heartbeat reports
+`CRTC_VSYNC_WITH_MULTIPLANE_OVERLAY3` under the D2 owner (plain CRTC_VSYNC is
+ignored for flip retirement on an MPO3-capable adapter — 350 delivered ticks,
+6 s wait, rollback). ⚠ (5) and (6) landed together; not separated by A/B.
+
+⛔ Session-0 `GetDisplayConfigBufferSizes` reads **0 paths while session 1 has
+an active path** — only the session-1 schtask (`HeliosDispCfg`) is evidence.
+Remaining: the HOST cannot present the linear no-modifier scanout under SDL
+**or egl-headless+VNC**. Owner-captured stderr 2026-08-23 08:16Z:
+`egl-headless: modifier-less DMA-BUF rejected; refusing implicit LINEAR
+reinterpretation` — an EXPLICIT gate (`egl-headless.c:549-558`) that returns
+before the vk-linear/cpu-mmap arms, which only explicit-modifier bufs can
+reach; sdl2-gl.c has no linear arm at all. Owner authorization same day:
+*"its fine to add support for linear bufs in qemu back"* — the immutable-qemu
+ruling is lifted for this one change (the failed exact-size OPTIMAL probe
+already excludes the native-OPTIMAL alias the refusal guards against).
+`helios_paintcap` currently wedges (own defect);
+one dead venus context still wedges the whole transport. Details + trap list:
+agent memory `display-lane-runtime-admission-chain`.
+
+**HOST CHANGE LANDED 2026-08-23** (`qemu-helios` d1769f2a9c, awaiting a VM
+relaunch to measure). Modifier-less buffers that failed BOTH the exact-size
+OPTIMAL reimport and EGL now fall into the linear arms, gated on the existing
+span-fits-fd check, in `egl-headless.c` and `sdl2-gl.c` alike. Two arms back
+it: the LINEAR-VkImage arm now verifies its reimport's rowPitch/offset against
+the declared ones and REFUSES on mismatch (a driver-chosen pitch reconstructs a
+sheared picture), and below it a VkBuffer external-fd import carries no tiling
+contract at all, so it cannot disagree with the declared stride. egl-headless
+keeps cpu-mmap last.
+
+⛔ **Two cheaper-looking alternatives are MEASURED OUT — do not re-open either.**
+*(a) Declare a guest-side DRM modifier* (`VK_EXT_image_drm_format_modifier` on
+the scanout image): three independent structural blockers. The wire has no field
+for it — `virtio_gpu_set_scanout_blob` carries only `strides[4]`/`offsets[4]`.
+What crosses is `VkDeviceMemory`, not a `VkImage` (`scanout.rs` builds the blob
+from `memory_id`), and a modifier is a property of an image, so `MOD_INVALID` is
+ACCURATE, not a gap. And QEMU's query cannot fire for a venus blob anyway:
+`virgl_renderer_resource_get_info_ext` (virglrenderer 1.3.0, disassembled) fills
+`has_dmabuf_export`/`modifiers` only via `virgl_egl_get_attrs_for_texture`, the
+GL path gated on `use_context == 1`, so `res->dmabuf_modifier` keeps its
+`virtio-gpu-virgl.c:900` INVALID init. It would also re-open the 38th-session
+regression the T6/R901 ladder deletion exists to prevent (`bringup.rs:398-442`).
+*(b) Use `SET_SCANOUT` instead of `SET_SCANOUT_BLOB`*: `virgl_cmd_set_scanout`
+ends in `qemu_console_gl_scanout_texture(con, info.tex_id, ...)` and a venus
+resource has no GL texture, so the classic command cannot carry the primary at
+all. The variants that would display (`RESOURCE_CREATE_2D`, or `SET_SCANOUT_BLOB`
+with `BLOB_MEM_GUEST`) put the framebuffer in guest RAM, costing a 7.9 MB/frame
+GPU readback over the PCI BAR plus the same again across the wire — the
+producer-side CPU present stall the 57th session forbids. The readback arm and
+SET_SCANOUT do the SAME single copy; the only question is which side of the wire
+it happens on, and host-local wins.
+
 #### ⭐ THE CRITICAL PATH IS NOW THE DISPLAY LANE — decided 2026-08-11 by the owner
 
 *"no probing or hacks, we go the proper way, i dont care if I dont see the desktop
