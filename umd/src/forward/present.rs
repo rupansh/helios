@@ -1534,10 +1534,92 @@ pub(crate) unsafe extern "C" fn dxgi_present_mpo(
         || attrs.StereoBaseViewFrame0 != 0
         || attrs.StereoFlipMode
             != ddi::DXGI_DDI_MULTIPLANE_OVERLAY_STEREO_FLIP_MODE_DXGI_DDI_MULTIPLANE_OVERLAY_STEREO_FLIP_NONE
-        || attrs.StretchQuality != 0
+        // ⛔ `StretchQuality` is NOT checked, and must not be. This gate already
+        // requires SrcRect == DstRect == ClipRect below, so the plane is never
+        // scaled and the filter the field names cannot affect a single pixel.
+        // Requiring 0 refused DWM's very first MPO present on every boot
+        // (measured 2026-08-24: `failing=[stretch_quality] ... stretch=1
+        // src=(0,0)-(1280,800) dst=(0,0)-(1280,800) clip=(0,0)-(1280,800)`),
+        // and DWM answered by destroying the device without presenting — the
+        // black desktop. 1 is `..._STRETCH_QUALITY_BILINEAR`; 0 is not even a
+        // defined enumerator, so the old test could only ever pass by accident.
         || !same_mpo_rect(&attrs.SrcRect, &attrs.DstRect)
         || !same_mpo_rect(&attrs.SrcRect, &attrs.ClipRect)
     {
+        // ⛔ ONE message for thirteen predicates was unattributable: DWM's very
+        // first MPO present lands here and the device is torn down, so the
+        // refusal costs a whole boot per guess. Name every failing field and
+        // print the values with it.
+        let failing: [(&str, bool); 12] = [
+            ("subresource", plane.SubResourceIndex != 0),
+            ("attr_flags", attrs.Flags != 0),
+            (
+                "rotation",
+                attrs.Rotation != ddi::DXGI_DDI_MODE_ROTATION_DXGI_DDI_MODE_ROTATION_IDENTITY,
+            ),
+            (
+                "blend",
+                attrs.Blend
+                    != ddi::DXGI_DDI_MULTIPLANE_OVERLAY_BLEND_DXGI_DDI_MULTIPLANE_OVERLAY_BLEND_OPAQUE,
+            ),
+            (
+                "frame_format",
+                attrs.VideoFrameFormat
+                    != ddi::DXGI_DDI_MULTIPLANE_OVERLAY_VIDEO_FRAME_FORMAT_DXGI_DDI_MULIIPLANE_OVERLAY_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+            ),
+            ("ycbcr_flags", attrs.YCbCrFlags != 0),
+            (
+                "stereo_format",
+                attrs.StereoFormat
+                    != ddi::DXGI_DDI_MULTIPLANE_OVERLAY_STEREO_FORMAT_DXGI_DDI_MULTIPLANE_OVERLAY_STEREO_FORMAT_MONO,
+            ),
+            ("stereo_left_view", attrs.StereoLeftViewFrame0 != 0),
+            ("stereo_base_view", attrs.StereoBaseViewFrame0 != 0),
+            (
+                "stereo_flip",
+                attrs.StereoFlipMode
+                    != ddi::DXGI_DDI_MULTIPLANE_OVERLAY_STEREO_FLIP_MODE_DXGI_DDI_MULTIPLANE_OVERLAY_STEREO_FLIP_NONE,
+            ),
+            ("src_vs_dst", !same_mpo_rect(&attrs.SrcRect, &attrs.DstRect)),
+            ("src_vs_clip", !same_mpo_rect(&attrs.SrcRect, &attrs.ClipRect)),
+        ];
+        let mut names = [""; 12];
+        let mut n = 0;
+        for (name, bad) in failing {
+            if bad {
+                names[n] = name;
+                n += 1;
+            }
+        }
+        log_error!(
+            "DXGI PresentMultiplaneOverlay REFUSED: failing=[{}] sub={} flags=0x{:x} rot={} \
+             blend={} frame={} ycbcr=0x{:x} stereo_fmt={} stereo_l={} stereo_b={} stereo_flip={} \
+             stretch={} src=({},{})-({},{}) dst=({},{})-({},{}) clip=({},{})-({},{})",
+            names[..n].join(","),
+            plane.SubResourceIndex,
+            attrs.Flags,
+            attrs.Rotation,
+            attrs.Blend,
+            attrs.VideoFrameFormat,
+            attrs.YCbCrFlags,
+            attrs.StereoFormat,
+            attrs.StereoLeftViewFrame0,
+            attrs.StereoBaseViewFrame0,
+            attrs.StereoFlipMode,
+            attrs.StretchQuality,
+            attrs.SrcRect.left,
+            attrs.SrcRect.top,
+            attrs.SrcRect.right,
+            attrs.SrcRect.bottom,
+            attrs.DstRect.left,
+            attrs.DstRect.top,
+            attrs.DstRect.right,
+            attrs.DstRect.bottom,
+            attrs.ClipRect.left,
+            attrs.ClipRect.top,
+            attrs.ClipRect.right,
+            attrs.ClipRect.bottom,
+        );
         probe_early_refusal(PresentBoundaryEntry::Mpo, "unsupported MPO plane attributes");
         return DXGI_ERROR_UNSUPPORTED;
     }
