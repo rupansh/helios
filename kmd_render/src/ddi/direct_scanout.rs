@@ -75,6 +75,13 @@ static COMPLETION_FAIL_BITS: AtomicU32 = AtomicU32::new(0);
 // to be on screen: a bind the host never read is a black desktop.
 static SCANOUT_FLUSHES: AtomicU32 = AtomicU32::new(0);
 static SCANOUT_FLUSH_FAILURES: AtomicU32 = AtomicU32::new(0);
+// Where a present is lost between completion and flush. Each counts one exact
+// step, so a gap between two of them names the failing edge.
+static COMPLETIONS_TERMINAL: AtomicU32 = AtomicU32::new(0);
+static COMPLETIONS_ACCEPTED: AtomicU32 = AtomicU32::new(0);
+static FLUSH_REQUESTS_PUBLISHED: AtomicU32 = AtomicU32::new(0);
+static FLUSH_REQUESTS_TAKEN: AtomicU32 = AtomicU32::new(0);
+static SERVICE_PENDING_RUNS: AtomicU32 = AtomicU32::new(0);
 
 fn record_refusal(counter: &RefusalCounter, _name: &'static [u8], code: u32) {
     // Admission is shared by MPO3 and classic SetVidPn, whose latter entry may
@@ -121,6 +128,14 @@ pub(crate) fn record_refusal_counters() {
     crate::diag::record_named_bytes(b"D2CmpBit", COMPLETION_FAIL_BITS.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"D2FlshN", SCANOUT_FLUSHES.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"D2FlshE", SCANOUT_FLUSH_FAILURES.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2CmpTrm", COMPLETIONS_TERMINAL.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2CmpAcc", COMPLETIONS_ACCEPTED.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(
+        b"D2FlqPub",
+        FLUSH_REQUESTS_PUBLISHED.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(b"D2FlqTak", FLUSH_REQUESTS_TAKEN.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2SvcRun", SERVICE_PENDING_RUNS.load(Ordering::Relaxed));
 }
 
 pub(crate) fn reset_refusal_counters() {
@@ -428,16 +443,20 @@ impl DirectScanoutRuntime {
         }
         let packed = resource_id as u64 | ((width as u64) << 32) | ((height as u64) << 48);
         self.flush_request.store(packed, Ordering::Release);
+        FLUSH_REQUESTS_PUBLISHED.fetch_add(1, Ordering::Relaxed);
     }
 
     fn take_flush_request(&self) -> Option<(u32, u32, u32)> {
         match self.flush_request.swap(0, Ordering::AcqRel) {
             0 => None,
-            packed => Some((
-                packed as u32,
-                ((packed >> 32) & 0xffff) as u32,
-                ((packed >> 48) & 0xffff) as u32,
-            )),
+            packed => Some({
+                FLUSH_REQUESTS_TAKEN.fetch_add(1, Ordering::Relaxed);
+                (
+                    packed as u32,
+                    ((packed >> 32) & 0xffff) as u32,
+                    ((packed >> 48) & 0xffff) as u32,
+                )
+            }),
         }
     }
 
@@ -776,7 +795,9 @@ pub(crate) fn complete_queued(
         record_refusal(&PLANE_REFUSALS, b"D2PlnRef", 0xf1);
         return;
     }
+    COMPLETIONS_TERMINAL.fetch_add(1, Ordering::Relaxed);
     if accepted {
+        COMPLETIONS_ACCEPTED.fetch_add(1, Ordering::Relaxed);
         adapter
             .last_primary_address
             .store(primary_address, Ordering::Release);
@@ -1188,6 +1209,7 @@ pub(crate) fn service_pending(passive: PassiveLevel, adapter: &AdapterContext) {
     if !crate::virtio::KMD_D2_OWNER_ENABLED {
         return;
     }
+    SERVICE_PENDING_RUNS.fetch_add(1, Ordering::Relaxed);
     adapter.with_scanout_lifecycle(passive, |_guard| service_pending_locked(passive, adapter));
     issue_pending_flush(passive, adapter);
 }
