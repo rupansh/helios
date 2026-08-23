@@ -50,6 +50,8 @@ static SET_RETRIES_MIRRORED: AtomicU32 = AtomicU32::new(0);
 static SET_ACCEPTS: AtomicU32 = AtomicU32::new(0);
 static SET_PRIVATE_IGNORED: AtomicU32 = AtomicU32::new(0);
 static SET_FLIPLINE_IGNORED: AtomicU32 = AtomicU32::new(0);
+static SET_SDR_WHITE_IGNORED: AtomicU32 = AtomicU32::new(0);
+static SET_DIRTY_IGNORED: AtomicU32 = AtomicU32::new(0);
 static LAST_PRESENT_ID: AtomicU64 = AtomicU64::new(0);
 static POST_PRESENT_HITS: AtomicU32 = AtomicU32::new(0);
 static UPDATE_REFUSALS: AtomicU32 = AtomicU32::new(0);
@@ -173,13 +175,22 @@ fn plane_facts(
     // StretchQuality is NOT a bit here (was bit 33): the validator refuses any
     // `scaling`, so the filter cannot change a pixel — and DWM sends BILINEAR(1)
     // on its 1:1 primary every boot (0x119 x5, 22.22.352.0; same as umd f401bc1).
-    let unsupported = extra_unsupported
-        | u64::from(flags & !allowed_flags)
-        | (u64::from(blend & !1) << 32)
-        | (u64::from(
-            attributes.SDRWhiteLevel != 0 && attributes.SDRWhiteLevel != DEFAULT_SDR_WHITE_NITS,
-        ) << 34)
-        | (u64::from(attributes.DirtyRectCnt != 0) << 35);
+    // SDRWhiteLevel (was bit 34) and DirtyRectCnt (was bit 35) cannot change an
+    // SDR full-plane scanout either — the color space is separately required to
+    // be SDR RGB and SET_SCANOUT_BLOB always presents the whole buffer, so
+    // dirty rects are only an optimization hint. Both are counted, not refused
+    // (0x6D with a truncated detail parked DWM's flip on .355, 2026-08-24).
+    if attributes.SDRWhiteLevel != 0
+        && attributes.SDRWhiteLevel != DEFAULT_SDR_WHITE_NITS
+        && SET_SDR_WHITE_IGNORED.fetch_add(1, Ordering::Relaxed) == 0
+    {
+        crate::diag::record_named_bytes(b"MpoSdrWlIg", attributes.SDRWhiteLevel);
+    }
+    if attributes.DirtyRectCnt != 0 && SET_DIRTY_IGNORED.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::diag::record_named_bytes(b"MpoDirtyIg", attributes.DirtyRectCnt);
+    }
+    let unsupported =
+        extra_unsupported | u64::from(flags & !allowed_flags) | (u64::from(blend & !1) << 32);
     let source = rect(&attributes.SrcRect);
     let destination = rect(&attributes.DstRect);
     MpoPlaneFacts {

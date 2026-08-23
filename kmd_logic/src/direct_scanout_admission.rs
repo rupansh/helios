@@ -286,7 +286,11 @@ pub fn refusal_code_and_detail(refusal: Refusal) -> (u32, u32) {
         R::AllocationSourceMismatch { allocation, .. } => (0x6A, allocation),
         R::MpoPlaneCountNotOne { found, .. } => (0x6B, found),
         R::MpoLayerNotZero { found, .. } => (0x6C, found),
-        R::MpoUnsupportedOrReservedAttributesOrFeatures { found, .. } => (0x6D, found as u32),
+        // Fold both halves: the meaningful bits live at 0..=2 and 32..=35, and
+        // `found as u32` reported detail=0 for every high-half refusal (.355).
+        R::MpoUnsupportedOrReservedAttributesOrFeatures { found, .. } => {
+            (0x6D, (((found >> 32) as u32) << 16) | (found as u32 & 0xFFFF))
+        }
         R::MpoSetEnabledInputFlagMissing => (0x6E, 0),
         R::MpoContextCountNotOne { found, .. } => (0x6F, found),
         R::MpoContextRecordMissing => (0x70, 0),
