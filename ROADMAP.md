@@ -4,6 +4,70 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ⛔ BLACK DESKTOP, 2026-08-24 (KMD 22.22.350.0) — THE SCANNED-OUT PRIMARY IS EMPTY
+
+**The display path is exonerated by positive control. Nothing writes pixels into
+the WDDM allocation dxgkrnl hands us as DWM's primary.** One boot, both content
+oracles on (`D2ParkPaint=0x40`, `D2PxProbe=1`), commit e2cce68:
+
+| blob | what it is | host readback | guest sample |
+|------|-----------|---------------|--------------|
+| res 4 | the KMD's parking image, painted 0x40 by the KMD itself | `nonzero 64000 max 64 csum 0x5cccbdb424318000` | `D2PxPark=0x1000040` |
+| res 17 | a real DWM primary bind | `nonzero 0 max 0 csum 0` | — |
+| res 67 | a real DWM primary bind | `nonzero 0 max 0 csum 0` | `D2PxRid=67 D2PxNz=0 D2PxMax=0 D2PxErr=0` |
+
+Same map, same sampler, same flush path, same boot. `SET_SCANOUT_BLOB`,
+`RESOURCE_FLUSH`, the venus blob export, the dma-buf and QEMU's readback all
+carry a KMD-written blob end to end and show it on the host. The primary is zero
+at **both** ends, so the defect is upstream of the KMD entirely.
+
+DWM is genuinely on Helios: `dwm.exe` (session 1) has `helios_umd.dll` +
+`vulkan_virtio.dll` loaded and **no `d3d10warp.dll`**. So the producer is our own
+UMD/DXVK/ICD graph, and the open question is which memory DXVK's composited
+frame actually lands in — the HRA1 association names the WDDM allocation, and
+`a7_schema.rs`'s `VkImportMemoryResourceInfoMESA` operand is patched with a real
+resource id by `native_render.rs`, so the intended aliasing exists on paper.
+⚠ 281d2b7 asked exactly this and left it open ("whether the zero-copy route can
+bind a LINEAR primary is still open, and is the next question"). Answered: the
+route binds fine and the buffer is empty.
+
+### The second, independent finding: the plane drains and never comes back
+
+`D2DrnSet=6` — only two reasons ever fire, `ModeChange` first (`D2DrnWh1=3`) and
+`SourceInvisible` last (`D2DrnLst=2`) — and after that last `SourceInvisible`
+the OS never offers another address (`D2AdmRef=D4AdrRef=D2PlnRef=0`). Every boot
+ends: 2-3 real binds → drain → park → `SET_SCANOUT_BLOB(res 0)` → dark, about
+11 s after DWM starts. Even a correct primary would only be shown for that
+window, so this needs its own answer.
+
+### Next measurement (not yet taken)
+
+Name the object we bind: publish, per real bind, whether the allocation has a
+KMD-created `venus_image_id` or only a plain memory blob, its HWA2
+swizzle/flags, and whether its resource id was ever substituted into a patched
+`VkImportMemoryResourceInfoMESA` operand (`native_render.rs` `patch_order`).
+That distinguishes "DXVK's memory does not alias this blob" from "it aliases it
+and DWM composites somewhere else".
+
+⛔ **Do not read fossil counters.** The service key is append-only across every
+KMD ever installed: 286 live names against 3,951 registry values on 2026-08-24.
+`ScFlu`, `ScSet`, `ScRid`, `ScCpy`, `ScWH`, `VsCnt`, `IrqN`, `DpcN`, `AsSub`,
+`DspBnd` and ~600 others lost their writers in 60a9988 (2026-08-21) and still
+read their last pre-deletion value. The previous session's lead ("D2FlshN=3 but
+ScFlu=2") was two fossils. Use `tools/kmd-live-counter-names.sh`, which derives
+the live set from `kmd_render/src` and emits the PowerShell that reads exactly
+those. Note `& script.ps1` reads as empty on this VM (machine ExecutionPolicy is
+Restricted) — use `Invoke-Expression (Get-Content -Raw ...)`.
+
+---
+
+## ✅ CLOSED 2026-08-23 (KMD 22.22.342.0) — `DisplayableFlagMissing`
+
+*Fixed in e44d54d + 281d2b7; `D2AdmRef`/`D4AdrRef` 32 → 0. Kept for the chain and
+the two claims it falsified. Its "What the fix turns on" section below is
+superseded by the section above: the UMD now claims DIRECT (arm (a)) and the
+allocation is admitted, bound, and flushed — and is empty.*
+
 ## ⛔ BLACK DESKTOP ROOT-CAUSED 2026-08-23 (KMD 22.22.342.0) — `DisplayableFlagMissing`
 
 `DxgkDdiSetVidPnSourceAddress` refuses DWM's primary **32 times per boot**, and
