@@ -1008,14 +1008,15 @@ pub unsafe extern "C" fn dxgkddi_stop_device_and_release_post_display_ownership(
 
 pub unsafe extern "C" fn dxgkddi_system_display_enable(
     _miniport_device_context: *mut c_void,
-    target_id: D3DDDI_VIDEO_PRESENT_TARGET_ID,
+    _target_id: D3DDDI_VIDEO_PRESENT_TARGET_ID,
     _flags: PDXGKARG_SYSTEM_DISPLAY_ENABLE_FLAGS,
     _width: *mut UINT,
     _height: *mut UINT,
     _color_format: *mut D3DDDIFORMAT,
 ) -> NTSTATUS {
-    crate::diag::record(0x1300_000F);
-    crate::diag::record(0x131C_0000 | (target_id & 0xFFFF));
+    // NO diag::record here: this runs INSIDE KeBugCheckEx at arbitrary IRQL,
+    // and the registry write nested a second fault while Windows drew the
+    // bluescreen (all five 0x119 dumps, 22.22.352.0). STUB: no panic-time FB.
     STATUS_NOT_SUPPORTED
 }
 
