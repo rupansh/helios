@@ -66,8 +66,10 @@ pub(crate) static K11_COMPLETION_WAITED: AtomicU32 = AtomicU32::new(0);
 pub(crate) static K11_COMPLETION_REOPEN_REJECT: AtomicU32 = AtomicU32::new(0);
 pub(crate) static K11_STALE_TRANSPORT: AtomicU32 = AtomicU32::new(0);
 pub(crate) static K11_CLEANUP_REJECT: AtomicU32 = AtomicU32::new(0);
+pub(crate) static K11_REPLY_MAP_GONE: AtomicU32 = AtomicU32::new(0);
 
-const COUNTERS: [(&[u8], &AtomicU32); 18] = [
+const COUNTERS: [(&[u8], &AtomicU32); 19] = [
+    (b"K11MapGone", &K11_REPLY_MAP_GONE),
     (b"K11CtxNew", &K11_CONTEXT_CREATED),
     (b"K11CtxDel", &K11_CONTEXT_DESTROYED),
     (b"K11InitOk", &K11_HOST_INIT_OK),
@@ -767,6 +769,29 @@ impl SessionTransport {
         }
     }
 
+    /// Run `f` on the live reply map WHILE `state` is locked, so a concurrent
+    /// Live->Dead replacement (same lock) cannot unmap the window mid-access.
+    /// Two identical 0x50 dumps (2026-08-24, explorer, copy_reply_to+f5) prove
+    /// the rundown alone does NOT order the unmap against a caller that
+    /// captured the map pointer before a host round-trip. Bounded volatile
+    /// copies only inside `f` -- the lock raises to DISPATCH.
+    fn with_live_reply_map<R>(
+        &self,
+        expected_transport: u64,
+        f: impl FnOnce(&SessionReplyMap) -> R,
+    ) -> Option<R> {
+        let state = self.state.lock();
+        match &*state {
+            HostState::Live(host) if host.transport_instance == expected_transport => {
+                Some(f(&host.reply_map))
+            }
+            _ => {
+                K11_REPLY_MAP_GONE.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
     fn close_and_wait(&self, _passive: PassiveLevel) {
         let active = {
             let mut rundown = self.rundown.lock();
@@ -853,8 +878,8 @@ impl SessionTransport {
         let operation = self
             .acquire_execution(adapter, owner)
             .ok_or(STATUS_DEVICE_NOT_READY)?;
-        let (host, reply_map) = match &*self.state.lock() {
-            HostState::Live(host) => (host.identity(), NonNull::from(&host.reply_map)),
+        let host = match &*self.state.lock() {
+            HostState::Live(host) => host.identity(),
             _ => return Err(STATUS_DEVICE_NOT_READY),
         };
         if operation.context_id != host.context_id
@@ -871,10 +896,12 @@ impl SessionTransport {
         if end > facts.byte_size {
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
-        // SAFETY: `operation` owns session rundown, so teardown cannot move or
-        // unmap the LiveHost reply map before this method returns.
-        let reply_map = unsafe { reply_map.as_ref() };
-        if !reply_map.prepare_reply(raw_reply_offset, raw_reply_bytes) {
+        let prepared = self
+            .with_live_reply_map(host.transport_instance, |map| {
+                map.prepare_reply(raw_reply_offset, raw_reply_bytes)
+            })
+            .ok_or(STATUS_DEVICE_NOT_READY)?;
+        if !prepared {
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
         pure::patch_private_reply_resource(payload, resource_operand_offset, host.reply_resource_id)
@@ -894,8 +921,8 @@ impl SessionTransport {
         expected_opcode: u32,
     ) -> Result<(), NTSTATUS> {
         let _operation = self.acquire().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
-        let (host, reply_map) = match &*self.state.lock() {
-            HostState::Live(host) => (host.identity(), NonNull::from(&host.reply_map)),
+        let host = match &*self.state.lock() {
+            HostState::Live(host) => host.identity(),
             _ => return Err(STATUS_DEVICE_NOT_READY),
         };
         if Self::current_transport(adapter) != Some(host.transport_instance)
@@ -922,17 +949,20 @@ impl SessionTransport {
             usize::try_from(raw_reply_offset).map_err(|_| STATUS_INVALID_DEVICE_REQUEST)?;
         let destination = NonNull::new(unsafe { facts.kernel_va.as_ptr().add(destination_offset) })
             .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
-        // SAFETY: rundown and `_pair` retain the private map; the caller's
-        // OpenExecutionUse retains the K2a allocation and the range was checked
-        // above against its canonical byte size.
-        if let Err(refusal) = unsafe {
-            reply_map.as_ref().copy_reply_to(
-                raw_reply_offset,
-                raw_reply_bytes,
-                expected_opcode,
-                destination,
-            )
-        } {
+        // SAFETY: the map is accessed only under the state lock (no unmap can
+        // interleave); the caller's OpenExecutionUse retains the K2a
+        // allocation and the range was checked above against its byte size.
+        if let Err(refusal) = self
+            .with_live_reply_map(host.transport_instance, |map| unsafe {
+                map.copy_reply_to(
+                    raw_reply_offset,
+                    raw_reply_bytes,
+                    expected_opcode,
+                    destination,
+                )
+            })
+            .ok_or(STATUS_DEVICE_NOT_READY)?
+        {
             record_reply_copy_refusal(
                 ReplyCopyPath::Async,
                 raw_reply_offset,
@@ -963,8 +993,8 @@ impl SessionTransport {
         let operation = self
             .acquire_execution(adapter, owner)
             .ok_or(STATUS_DEVICE_NOT_READY)?;
-        let (host, reply_map) = match &*self.state.lock() {
-            HostState::Live(host) => (host.identity(), NonNull::from(&host.reply_map)),
+        let host = match &*self.state.lock() {
+            HostState::Live(host) => host.identity(),
             _ => return Err(STATUS_DEVICE_NOT_READY),
         };
         if operation.context_id != host.context_id
@@ -982,9 +1012,12 @@ impl SessionTransport {
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
         let _ring_zero = self.acquire_ring_zero_control(passive)?;
-        // SAFETY: `operation` owns rundown through the terminal and copy.
-        let reply_map = unsafe { reply_map.as_ref() };
-        if !reply_map.prepare_reply(raw_reply_offset, raw_reply_bytes) {
+        let prepared = self
+            .with_live_reply_map(host.transport_instance, |map| {
+                map.prepare_reply(raw_reply_offset, raw_reply_bytes)
+            })
+            .ok_or(STATUS_DEVICE_NOT_READY)?;
+        if !prepared {
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
         pure::patch_private_reply_resource(
@@ -1006,16 +1039,21 @@ impl SessionTransport {
             usize::try_from(raw_reply_offset).map_err(|_| STATUS_INVALID_DEVICE_REQUEST)?;
         let destination = NonNull::new(unsafe { facts.kernel_va.as_ptr().add(destination_offset) })
             .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
-        // SAFETY: `operation` and `pair` retain both sides, and the exact K2a
-        // destination range was checked above.
-        if let Err(refusal) = unsafe {
-            reply_map.copy_reply_to(
-                raw_reply_offset,
-                raw_reply_bytes,
-                expected_opcode,
-                destination,
-            )
-        } {
+        // SAFETY: the map is accessed only under the state lock -- the sync
+        // submit above is a host round-trip, and this exact shape (capture the
+        // map, wait, then dereference) is the 2026-08-24 0x50 pair. `pair`
+        // retains the host side; the K2a destination range was checked above.
+        if let Err(refusal) = self
+            .with_live_reply_map(host.transport_instance, |map| unsafe {
+                map.copy_reply_to(
+                    raw_reply_offset,
+                    raw_reply_bytes,
+                    expected_opcode,
+                    destination,
+                )
+            })
+            .ok_or(STATUS_DEVICE_NOT_READY)?
+        {
             record_reply_copy_refusal(
                 ReplyCopyPath::Sync,
                 raw_reply_offset,
