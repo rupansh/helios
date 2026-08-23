@@ -158,10 +158,12 @@ fn plane_facts(
     } else {
         ATTR_VERTICAL_FLIP | ATTR_HORIZONTAL_FLIP | ATTR_STATIC_CHECK
     };
+    // StretchQuality is NOT a bit here (was bit 33): the validator refuses any
+    // `scaling`, so the filter cannot change a pixel — and DWM sends BILINEAR(1)
+    // on its 1:1 primary every boot (0x119 x5, 22.22.352.0; same as umd f401bc1).
     let unsupported = extra_unsupported
         | u64::from(flags & !allowed_flags)
         | (u64::from(blend & !1) << 32)
-        | (u64::from(attributes.StretchQuality != 0) << 33)
         | (u64::from(
             attributes.SDRWhiteLevel != 0 && attributes.SDRWhiteLevel != DEFAULT_SDR_WHITE_NITS,
         ) << 34)
