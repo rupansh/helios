@@ -1568,9 +1568,20 @@ unsafe fn submit_outer_scope(
     let hr = render_cb(outer.h_rt_device, &mut render);
     if hr < 0 {
         log_error!(
-            "A7 D3D11 HOB1 Render refused batch={} hr=0x{:08x}",
+            "A7 D3D11 HOB1 Render refused batch={} hr=0x{:08x} cmdlen={} nalloc={} npatch={} \
+             flags=0x{:08x} newcmd={} newalloc={} newpatch={} cap_cmd={} cap_alloc={} cap_patch={}",
             hob.header().batch_id,
-            hr as u32
+            hr as u32,
+            render.CommandLength,
+            render.NumAllocations,
+            render.NumPatchLocations,
+            unsafe { render.Flags.__bindgen_anon_1.Value },
+            render.NewCommandBufferSize,
+            render.NewAllocationListSize,
+            render.NewPatchLocationListSize,
+            command_window.capacity,
+            allocation_window.capacity,
+            patch_window.capacity
         );
         let _ = outer.translator.close_outer_scope(scope, None);
         mark_outer_lost(outer, "HOB1 Render");
