@@ -79,15 +79,15 @@ use helios_kmd_logic::control_ownership::{
 };
 use helios_protocol::{
     resp_is_ok, VirtioGpuCtrlHdr, VirtioGpuCtxCreate, VirtioGpuCtxDestroy, VirtioGpuCtxResource,
-    VirtioGpuMemEntry, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceMapBlob,
-    VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref, VirtioGpuRespMapInfo,
-    VirtioGpuSetScanoutBlob, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE, VIRTIO_GPU_BLOB_MEM_GUEST,
-    VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE, VIRTIO_GPU_CMD_CTX_CREATE,
-    VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
-    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB,
-    VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNREF,
-    VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
-    VIRTIO_GPU_MAP_CACHE_MASK,
+    VirtioGpuMemEntry, VirtioGpuRect, VirtioGpuResourceCreateBlob, VirtioGpuResourceFlush,
+    VirtioGpuResourceMapBlob, VirtioGpuResourceUnmapBlob, VirtioGpuResourceUnref,
+    VirtioGpuRespMapInfo, VirtioGpuSetScanoutBlob, VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE,
+    VIRTIO_GPU_BLOB_MEM_GUEST, VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE,
+    VIRTIO_GPU_CMD_CTX_CREATE, VIRTIO_GPU_CMD_CTX_DESTROY, VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE,
+    VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB, VIRTIO_GPU_CMD_RESOURCE_FLUSH,
+    VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB, VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB,
+    VIRTIO_GPU_CMD_RESOURCE_UNREF, VIRTIO_GPU_CMD_SET_SCANOUT_BLOB, VIRTIO_GPU_FLAG_FENCE,
+    VIRTIO_GPU_FLAG_INFO_RING_IDX, VIRTIO_GPU_MAP_CACHE_MASK,
 };
 
 /// `KernelMode` (`KPROCESSOR_MODE`).
@@ -1446,6 +1446,36 @@ pub(crate) fn fill_set_scanout_blob(
     cmd.padding = 0;
     cmd.strides = [stride, 0, 0, 0];
     cmd.offsets = [offset, 0, 0, 0];
+}
+
+/// Present the bound scanout: `VIRTIO_GPU_CMD_RESOURCE_FLUSH` over the whole
+/// source rect.
+///
+/// This is the ONLY thing that makes QEMU read a blob scanout — it is what
+/// reaches `qemu_console_gl_update` (`hw/display/virtio-gpu.c:537-551`), and
+/// `virtio_gpu_update_display`, the device's `gfx_update`, is `return true;`.
+/// A bind with no flush is therefore never presented, which is exactly the
+/// black screen `60a9988` left behind when it deleted `resource_flush_async`.
+pub(crate) fn resource_flush(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    width: u32,
+    height: u32,
+) -> Result<(), VirtioError> {
+    if resource_id == 0 || width == 0 || height == 0 {
+        return Err(VirtioError::DeviceError);
+    }
+    let mut cmd = VirtioGpuResourceFlush::zeroed();
+    cmd.hdr.type_ = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    cmd.r = VirtioGpuRect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    cmd.resource_id = resource_id;
+    ctrl_roundtrip_ok(passive, adapter, bytes_of(&cmd), None)
 }
 
 /// Drop the host's reference to a resource.

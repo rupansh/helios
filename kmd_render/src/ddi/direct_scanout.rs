@@ -71,6 +71,10 @@ static RESET_REFUSALS: RefusalCounter = RefusalCounter::new();
 static COMPLETION_RESPONSE_TYPE: AtomicU32 = AtomicU32::new(0);
 static COMPLETION_RESPONSE_FLAGS: AtomicU32 = AtomicU32::new(0);
 static COMPLETION_FAIL_BITS: AtomicU32 = AtomicU32::new(0);
+// Presents actually issued, and their failures. D2FlshN must MOVE for anything
+// to be on screen: a bind the host never read is a black desktop.
+static SCANOUT_FLUSHES: AtomicU32 = AtomicU32::new(0);
+static SCANOUT_FLUSH_FAILURES: AtomicU32 = AtomicU32::new(0);
 
 fn record_refusal(counter: &RefusalCounter, _name: &'static [u8], code: u32) {
     // Admission is shared by MPO3 and classic SetVidPn, whose latter entry may
@@ -106,9 +110,17 @@ pub(crate) fn record_refusal_counters() {
         crate::diag::record_named_bytes(name, counter.count.load(Ordering::Relaxed));
         crate::diag::record_named_bytes(reason_name, counter.last_reason.load(Ordering::Relaxed));
     }
-    crate::diag::record_named_bytes(b"D2CmpTyp", COMPLETION_RESPONSE_TYPE.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"D2CmpFlg", COMPLETION_RESPONSE_FLAGS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(
+        b"D2CmpTyp",
+        COMPLETION_RESPONSE_TYPE.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"D2CmpFlg",
+        COMPLETION_RESPONSE_FLAGS.load(Ordering::Relaxed),
+    );
     crate::diag::record_named_bytes(b"D2CmpBit", COMPLETION_FAIL_BITS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2FlshN", SCANOUT_FLUSHES.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2FlshE", SCANOUT_FLUSH_FAILURES.load(Ordering::Relaxed));
 }
 
 pub(crate) fn reset_refusal_counters() {
@@ -385,6 +397,11 @@ pub(crate) struct DirectScanoutRuntime {
     /// published only after parking and PlaneState are fully initialized. DIRQL
     /// validation reads this atomically instead of taking `virtio_lock`.
     active_transport_instance: AtomicU64,
+    /// The presentation the host still owes us a read of: `resource_id |
+    /// width << 32 | height << 48`, 0 when none. Published by the DPC (which
+    /// may not issue a control request) and consumed by the PASSIVE worker.
+    /// One word so a bind cannot be paired with another bind's geometry.
+    flush_request: AtomicU64,
 }
 
 impl DirectScanoutRuntime {
@@ -394,6 +411,33 @@ impl DirectScanoutRuntime {
             state: SpinLock::new(RuntimeState::new()),
             next_plane_generation: AtomicU64::new(1),
             active_transport_instance: AtomicU64::new(0),
+            flush_request: AtomicU64::new(0),
+        }
+    }
+
+    /// Latest-wins: a superseded frame is not worth a flush of its own, and the
+    /// newer request already covers the same scanout.
+    fn request_flush(&self, resource_id: u32, width: u32, height: u32) {
+        if resource_id == 0
+            || width == 0
+            || height == 0
+            || width > u16::MAX as u32
+            || height > u16::MAX as u32
+        {
+            return;
+        }
+        let packed = resource_id as u64 | ((width as u64) << 32) | ((height as u64) << 48);
+        self.flush_request.store(packed, Ordering::Release);
+    }
+
+    fn take_flush_request(&self) -> Option<(u32, u32, u32)> {
+        match self.flush_request.swap(0, Ordering::AcqRel) {
+            0 => None,
+            packed => Some((
+                packed as u32,
+                ((packed >> 32) & 0xffff) as u32,
+                ((packed >> 48) & 0xffff) as u32,
+            )),
         }
     }
 
@@ -620,6 +664,8 @@ pub(crate) fn complete_queued(
         && identity_exact_except_generation
         && current_mode_generation != 0
         && current_mode_generation != mode_generation;
+    let flush_width = binding.token().width;
+    let flush_height = binding.token().height;
     let geometry_current = current_mode.is_some_and(|mode| {
         mode.active
             && mode.source_id == SOURCE_ID
@@ -638,10 +684,8 @@ pub(crate) fn complete_queued(
         // DIRQL-safe facts for the 0xf0 refusal: the response type, its
         // flags/length, and one bit per sub-check (0 = the failing one).
         // Published by record_refusal_counters as D2CmpTyp/D2CmpFlg/D2CmpBit.
-        COMPLETION_RESPONSE_TYPE.store(
-            response.map_or(0, |header| header.type_),
-            Ordering::Relaxed,
-        );
+        COMPLETION_RESPONSE_TYPE
+            .store(response.map_or(0, |header| header.type_), Ordering::Relaxed);
         COMPLETION_RESPONSE_FLAGS.store(
             response.map_or(0, |header| header.flags) | ((completion.written_length as u32) << 16),
             Ordering::Relaxed,
@@ -736,6 +780,12 @@ pub(crate) fn complete_queued(
         adapter
             .last_primary_address
             .store(primary_address, Ordering::Release);
+        // QEMU reads a blob scanout only on RESOURCE_FLUSH, and this routine may
+        // not issue a control request, so hand the present to the PASSIVE worker.
+        adapter
+            .direct_scanout
+            .request_flush(resource_id, flush_width, flush_height);
+        adapter.signal_hpd();
     }
 }
 
@@ -1139,6 +1189,23 @@ pub(crate) fn service_pending(passive: PassiveLevel, adapter: &AdapterContext) {
         return;
     }
     adapter.with_scanout_lifecycle(passive, |_guard| service_pending_locked(passive, adapter));
+    issue_pending_flush(passive, adapter);
+}
+
+/// Present what the last accepted bind left owed.
+///
+/// Outside the lifecycle lock on purpose: this is a whole-surface present of an
+/// already-latched binding, and holding that lock across a control round-trip
+/// would serialize the next flip behind the host.
+fn issue_pending_flush(passive: PassiveLevel, adapter: &AdapterContext) {
+    let Some((resource_id, width, height)) = adapter.direct_scanout.take_flush_request() else {
+        return;
+    };
+    if crate::virtio::ctrl::resource_flush(passive, adapter, resource_id, width, height).is_ok() {
+        SCANOUT_FLUSHES.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SCANOUT_FLUSH_FAILURES.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn issue_parking_locked(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
