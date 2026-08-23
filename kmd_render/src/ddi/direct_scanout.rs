@@ -101,6 +101,64 @@ static FLUSH_REQUESTS_PUBLISHED: AtomicU32 = AtomicU32::new(0);
 static FLUSH_REQUESTS_TAKEN: AtomicU32 = AtomicU32::new(0);
 static SERVICE_PENDING_RUNS: AtomicU32 = AtomicU32::new(0);
 
+/// Which bind kinds reached the host, and the last REAL bind's exact wire
+/// geometry. The host trace names a resource id per SET_SCANOUT_BLOB; nothing
+/// guest-side did, so "res 5 read all zeros" could not be attributed to a
+/// subject (measured 22.22.347.0: three flushes, three zero reads).
+static BIND_REAL: AtomicU32 = AtomicU32::new(0);
+static BIND_PARKING: AtomicU32 = AtomicU32::new(0);
+static BIND_DISABLE: AtomicU32 = AtomicU32::new(0);
+static BIND_LAST_RESOURCE: AtomicU32 = AtomicU32::new(0);
+static BIND_LAST_EXTENT: AtomicU32 = AtomicU32::new(0);
+static BIND_LAST_STRIDE: AtomicU32 = AtomicU32::new(0);
+static BIND_LAST_FORMAT: AtomicU32 = AtomicU32::new(0);
+static BIND_LAST_OFFSET: AtomicU32 = AtomicU32::new(0);
+/// Why the plane drained: `direct_scanout_lifetime::drain_reason_code`, 1..=7.
+/// The FIRST drain is the one that matters — after it the OS stopped offering
+/// addresses entirely (D2AdmRef=D4AdrRef=0 with the display already dark).
+static DRAIN_COUNT: AtomicU32 = AtomicU32::new(0);
+static DRAIN_FIRST: AtomicU32 = AtomicU32::new(0);
+static DRAIN_LAST: AtomicU32 = AtomicU32::new(0);
+static DRAIN_SET: AtomicU32 = AtomicU32::new(0);
+
+fn note_bind_real(geometry: &DisplayBacking) {
+    BIND_REAL.fetch_add(1, Ordering::Relaxed);
+    BIND_LAST_RESOURCE.store(geometry.resource_id, Ordering::Relaxed);
+    BIND_LAST_EXTENT.store(
+        (geometry.width << 16) | (geometry.height & 0xffff),
+        Ordering::Relaxed,
+    );
+    BIND_LAST_STRIDE.store(geometry.stride, Ordering::Relaxed);
+    BIND_LAST_FORMAT.store(geometry.format, Ordering::Relaxed);
+    BIND_LAST_OFFSET.store(geometry.offset, Ordering::Relaxed);
+}
+
+/// The flushed blob as the GUEST sees it, sampled through the canonical map.
+/// The host's own readback of every real bind is all-zero while a KMD-painted
+/// parking blob reads back exactly (22.22.348.0), so the open question is
+/// whether the producer ever writes these bytes at all. Knob `D2PxProbe`.
+static PIXEL_PROBE_RUNS: AtomicU32 = AtomicU32::new(0);
+static PIXEL_PROBE_ERRORS: AtomicU32 = AtomicU32::new(0);
+static PIXEL_PROBE_RESOURCE: AtomicU32 = AtomicU32::new(0);
+static PIXEL_PROBE_NONZERO: AtomicU32 = AtomicU32::new(0);
+static PIXEL_PROBE_MAX: AtomicU32 = AtomicU32::new(0);
+static PIXEL_PROBE_ENABLED: AtomicU32 = AtomicU32::new(0);
+/// The same sampler run against the parking blob the KMD has just written
+/// itself, so a `D2PxNz=0` on a real primary cannot be read as a broken probe.
+static PIXEL_PROBE_PARK: AtomicU32 = AtomicU32::new(0);
+
+/// Cached `D2ParkPaint` byte, refreshed at every `start`. 0 = shipping.
+static PARK_PAINT: AtomicU32 = AtomicU32::new(0);
+
+fn note_drain(reason: DrainReason) {
+    let code = helios_kmd_logic::direct_scanout_lifetime::drain_reason_code(reason);
+    DRAIN_COUNT.fetch_add(1, Ordering::Relaxed);
+    let _ = DRAIN_FIRST.compare_exchange(0, code, Ordering::Relaxed, Ordering::Relaxed);
+    DRAIN_LAST.store(code, Ordering::Relaxed);
+    DRAIN_SET.fetch_or(1u32 << (code - 1), Ordering::Relaxed);
+}
+
+
 fn record_refusal(counter: &RefusalCounter, _name: &'static [u8], code: u32) {
     // Admission is shared by MPO3 and classic SetVidPn, whose latter entry may
     // run at device DIRQL. Keep the entire transitive refusal path atomics-only;
@@ -170,6 +228,24 @@ pub(crate) fn record_refusal_counters() {
     );
     crate::diag::record_named_bytes(b"D2FlqTak", FLUSH_REQUESTS_TAKEN.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"D2SvcRun", SERVICE_PENDING_RUNS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2BnReal", BIND_REAL.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2BnPark", BIND_PARKING.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2BnDis", BIND_DISABLE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2BnRid", BIND_LAST_RESOURCE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2BnWH", BIND_LAST_EXTENT.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2BnPch", BIND_LAST_STRIDE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2BnFmt", BIND_LAST_FORMAT.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2BnOff", BIND_LAST_OFFSET.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2DrnN", DRAIN_COUNT.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2DrnWh1", DRAIN_FIRST.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2DrnLst", DRAIN_LAST.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2DrnSet", DRAIN_SET.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2PxN", PIXEL_PROBE_RUNS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2PxErr", PIXEL_PROBE_ERRORS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2PxRid", PIXEL_PROBE_RESOURCE.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2PxNz", PIXEL_PROBE_NONZERO.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2PxMax", PIXEL_PROBE_MAX.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2PxPark", PIXEL_PROBE_PARK.load(Ordering::Relaxed));
 }
 
 pub(crate) fn reset_refusal_counters() {
@@ -192,6 +268,24 @@ pub(crate) fn reset_refusal_counters() {
         &POISON_FIRST,
         &POISON_SET,
         &POISON_REFUSAL,
+        &BIND_REAL,
+        &BIND_PARKING,
+        &BIND_DISABLE,
+        &BIND_LAST_RESOURCE,
+        &BIND_LAST_EXTENT,
+        &BIND_LAST_STRIDE,
+        &BIND_LAST_FORMAT,
+        &BIND_LAST_OFFSET,
+        &DRAIN_COUNT,
+        &DRAIN_FIRST,
+        &DRAIN_LAST,
+        &DRAIN_SET,
+        &PIXEL_PROBE_RUNS,
+        &PIXEL_PROBE_ERRORS,
+        &PIXEL_PROBE_RESOURCE,
+        &PIXEL_PROBE_NONZERO,
+        &PIXEL_PROBE_MAX,
+        &PIXEL_PROBE_PARK,
     ] {
         counter.store(0, Ordering::Relaxed);
     }
@@ -746,8 +840,9 @@ pub(crate) fn complete_queued(
         && identity_exact_except_generation
         && current_mode_generation != 0
         && current_mode_generation != mode_generation;
-    let flush_width = binding.token().width;
-    let flush_height = binding.token().height;
+    let bound_geometry = *binding.token();
+    let flush_width = bound_geometry.width;
+    let flush_height = bound_geometry.height;
     let geometry_current = current_mode.is_some_and(|mode| {
         mode.active
             && mode.source_id == SOURCE_ID
@@ -861,6 +956,7 @@ pub(crate) fn complete_queued(
     COMPLETIONS_TERMINAL.fetch_add(1, Ordering::Relaxed);
     if accepted {
         COMPLETIONS_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+        note_bind_real(&bound_geometry);
         adapter
             .last_primary_address
             .store(primary_address, Ordering::Release);
@@ -1059,6 +1155,17 @@ fn issue_fenced_set(
         None => PublishCapture::disable(),
     };
     let publish = |published: FencedScanoutPublish| {
+        // The descriptor is minted, so this command is on the wire whatever the
+        // plane bookkeeping below decides.
+        match kind {
+            PublishKind::Real => note_bind_real(&geometry),
+            PublishKind::Parking => {
+                BIND_PARKING.fetch_add(1, Ordering::Relaxed);
+            }
+            PublishKind::DisableZero => {
+                BIND_DISABLE.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         let key = CompletionKey::new(published.instance, published.fence_id, published.sequence);
         capture.store_key(key);
         let mut state = adapter.direct_scanout.state.lock();
@@ -1226,7 +1333,24 @@ fn issue_fenced_set(
         record_refusal(&PLANE_REFUSALS, b"D2PlnRef", 3);
     }
     finish_transition(adapter, transition);
-    terminal && success
+    let bound = terminal && success;
+    // Knob-only: parking is otherwise never flushed, so a painted parking image
+    // would never be read. Issued inside the lifecycle lock, which the shipping
+    // present path deliberately avoids — acceptable for a diagnostic that is
+    // off by default and only runs on a drain.
+    if bound
+        && matches!(kind, PublishKind::Parking)
+        && PARK_PAINT.load(Ordering::Relaxed) != 0
+    {
+        let _ = crate::virtio::ctrl::resource_flush(
+            passive,
+            adapter,
+            geometry.resource_id,
+            geometry.width,
+            geometry.height,
+        );
+    }
+    bound
 }
 
 fn service_pending_locked(passive: PassiveLevel, adapter: &AdapterContext) {
@@ -1291,6 +1415,37 @@ fn issue_pending_flush(passive: PassiveLevel, adapter: &AdapterContext) {
     } else {
         SCANOUT_FLUSH_FAILURES.fetch_add(1, Ordering::Relaxed);
     }
+    sample_flushed_blob(passive, adapter, resource_id);
+}
+
+/// Knob-only: read back what the GUEST sees in the blob the host was just told
+/// to present.
+///
+/// Deliberately never unmaps. The window mapping is idempotent per resource
+/// (`map_blob_prepare` returns the live one), so the probe costs at most one
+/// window slot per scanned-out resource, and unmapping could pull the mapping
+/// out from under a UMD that owns the same backing.
+fn sample_flushed_blob(passive: PassiveLevel, adapter: &AdapterContext, resource_id: u32) {
+    if PIXEL_PROBE_ENABLED.load(Ordering::Relaxed) == 0 || resource_id == 0 {
+        return;
+    }
+    PIXEL_PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
+    PIXEL_PROBE_RESOURCE.store(resource_id, Ordering::Relaxed);
+    let Ok(prep) = crate::virtio::ctrl::map_blob_prepare(
+        passive,
+        adapter,
+        crate::virtio::gpu::OwnerFilter::Exactly(None),
+        resource_id,
+    ) else {
+        PIXEL_PROBE_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    let Some(sample) = crate::virtio::venus::sample_host_visible_blob(prep) else {
+        PIXEL_PROBE_ERRORS.fetch_add(1, Ordering::Relaxed);
+        return;
+    };
+    PIXEL_PROBE_NONZERO.store(sample.nonzero, Ordering::Relaxed);
+    PIXEL_PROBE_MAX.store(sample.max as u32, Ordering::Relaxed);
 }
 
 fn issue_parking_locked(passive: PassiveLevel, adapter: &AdapterContext) -> bool {
@@ -1365,6 +1520,7 @@ fn unbind_locked(
     reason: DrainReason,
     optional_disable: bool,
 ) -> bool {
+    note_drain(reason);
     let (begin, mailbox_candidate) = {
         let mut state = adapter.direct_scanout.state.lock();
         if state.poisoned {
@@ -1451,12 +1607,34 @@ pub(crate) fn start(
                 client.allocate_linear_scanout_image_blob(adapter, width, height)
             })
             .map_err(|_| VirtioError::DeviceError)??;
-        crate::virtio::venus::zero_host_visible_blob(
+        let paint = (crate::diag::read_config_dword(crate::diag::knobs::PARK_PAINT, 0)
+            & 0xff) as u8;
+        PARK_PAINT.store(paint as u32, Ordering::Relaxed);
+        PIXEL_PROBE_ENABLED.store(
+            crate::diag::read_config_dword(crate::diag::knobs::PIXEL_PROBE, 0),
+            Ordering::Relaxed,
+        );
+        crate::virtio::venus::fill_host_visible_blob(
             passive,
             adapter,
             parking.blob.res_id,
             parking.blob.size,
+            paint,
         )?;
+        if PIXEL_PROBE_ENABLED.load(Ordering::Relaxed) != 0 {
+            // The sampler's positive control: this blob was just written by
+            // this driver, through the same map the probe reads.
+            let sampled = crate::virtio::ctrl::map_blob_prepare(
+                passive,
+                adapter,
+                crate::virtio::gpu::OwnerFilter::Exactly(None),
+                parking.blob.res_id,
+            )
+            .ok()
+            .and_then(crate::virtio::venus::sample_host_visible_blob)
+            .map_or(0, |sample| (sample.nonzero << 8) | sample.max as u32);
+            PIXEL_PROBE_PARK.store(sampled, Ordering::Relaxed);
+        }
         let Some(plane_generation) = adapter.direct_scanout.mint_plane_generation() else {
             return Err(VirtioError::OutOfMemory);
         };

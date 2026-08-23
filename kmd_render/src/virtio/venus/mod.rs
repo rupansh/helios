@@ -56,7 +56,7 @@ mod scanout;
 pub(crate) use bringup::*;
 pub(crate) use protocol::*;
 use ring::*;
-pub(crate) use scanout::zero_host_visible_blob;
+pub(crate) use scanout::{fill_host_visible_blob, sample_host_visible_blob, zero_host_visible_blob};
 
 /// Declare one handle newtype per Vulkan object class.
 ///

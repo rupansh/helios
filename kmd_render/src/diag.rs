@@ -503,6 +503,21 @@ pub mod knobs {
     /// 0 is coerced to 1 (a zero-depth flip queue is not representable) and the
     /// value actually advertised is mirrored in the `FlipQueV` counter.
     pub const FLIP_QUEUE_DEPTH: KnobName = KnobName::new(b"FlipQueueN");
+    /// Diagnostic: fill the D2 parking image with this byte instead of zeroing
+    /// it, and flush the parking bind so the host reads it. Default 0 = zeroed
+    /// and unflushed, the shipping behaviour. Nonzero turns parking into an
+    /// end-to-end oracle: a host readback that still shows zero proves the
+    /// KMD's own writes do not reach the scanned-out blob, which no counter can
+    /// distinguish from "DWM rendered nothing". Read at `direct_scanout::start`.
+    pub const PARK_PAINT: KnobName = KnobName::new(b"D2ParkPaint");
+    /// Diagnostic: after each scan-out flush, sample the flushed blob through
+    /// the KMD's own canonical map and publish what the GUEST sees
+    /// (`D2PxNz`/`D2PxMax`). Default 0 = off. It separates "the producer never
+    /// wrote these bytes" from "the guest wrote them and the host reads a
+    /// different allocation", which no host-side counter can. Read at
+    /// `direct_scanout::start`; it leaks one window mapping per scanned-out
+    /// resource on purpose.
+    pub const PIXEL_PROBE: KnobName = KnobName::new(b"D2PxProbe");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.

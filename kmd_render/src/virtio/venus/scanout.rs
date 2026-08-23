@@ -18,6 +18,48 @@ pub(crate) fn zero_host_visible_blob(
     resource_id: u32,
     minimum_size: u64,
 ) -> Result<(), VirtioError> {
+    fill_host_visible_blob(passive, adapter, resource_id, minimum_size, 0)
+}
+
+/// What a bounded sample of a mapped blob contains.
+pub(crate) struct BlobSample {
+    pub nonzero: u32,
+    pub max: u8,
+}
+
+/// Read up to 64 KiB from the front of an already-prepared blob mapping.
+///
+/// Bounded on purpose: the caller runs this per present, and the question it
+/// answers ("did anything write this at all") does not need the whole surface.
+pub(crate) fn sample_host_visible_blob(prep: crate::virtio::gpu::BlobMapPrep) -> Option<BlobSample> {
+    const SAMPLE_BYTES: u64 = 64 * 1024;
+    let len = prep.size.min(SAMPLE_BYTES);
+    if len == 0 {
+        return None;
+    }
+    let map = KernelMap::new(prep.gpa, prep.size, prep.map_cache)?;
+    let mut sample = BlobSample { nonzero: 0, max: 0 };
+    for i in 0..len {
+        let byte = map.read_u8(i);
+        if byte != 0 {
+            sample.nonzero += 1;
+            if byte > sample.max {
+                sample.max = byte;
+            }
+        }
+    }
+    Some(sample)
+}
+
+/// [`zero_host_visible_blob`] with the fill byte named. Nonzero is the
+/// `D2ParkPaint` diagnostic only.
+pub(crate) fn fill_host_visible_blob(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    minimum_size: u64,
+    value: u8,
+) -> Result<(), VirtioError> {
     if !crate::virtio::KMD_D2_OWNER_ENABLED || resource_id == 0 || minimum_size == 0 {
         return Err(VirtioError::DeviceError);
     }
@@ -35,7 +77,7 @@ pub(crate) fn zero_host_visible_blob(
         let _ = ctrl::resource_unmap_blob(passive, adapter, resource_id);
         return Err(VirtioError::OutOfMemory);
     };
-    map.zero();
+    map.fill(value);
     core::sync::atomic::fence(Ordering::SeqCst);
     drop(map);
     ctrl::resource_unmap_blob(passive, adapter, resource_id)

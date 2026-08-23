@@ -20,6 +20,22 @@ pub enum DrainReason {
     AllocationDestroyed,
 }
 
+/// A stable 1-based code for each drain reason, so a KMD counter can name why
+/// the plane stopped. Same shape as [`refusal_code`] and for the same reason:
+/// the plane drained ~10 s into every boot and published only "not active".
+pub fn drain_reason_code(reason: DrainReason) -> u32 {
+    use DrainReason as D;
+    match reason {
+        D::ExplicitUnbind => 1,
+        D::SourceInvisible => 2,
+        D::ModeChange => 3,
+        D::PowerTransition => 4,
+        D::DwmRestart => 5,
+        D::AdapterStop => 6,
+        D::AllocationDestroyed => 7,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Lifecycle {
     Active,
@@ -2062,4 +2078,27 @@ mod refusal_code_tests {
     }
 
     const COUNT: usize = 28;
+
+    #[test]
+    fn drain_reason_codes_are_dense_and_distinct() {
+        const ALL: &[DrainReason] = &[
+            DrainReason::ExplicitUnbind,
+            DrainReason::SourceInvisible,
+            DrainReason::ModeChange,
+            DrainReason::PowerTransition,
+            DrainReason::DwmRestart,
+            DrainReason::AdapterStop,
+            DrainReason::AllocationDestroyed,
+        ];
+        assert_eq!(ALL.len(), DRAIN_COUNT, "add the new DrainReason to ALL");
+        let mut seen = [false; DRAIN_COUNT + 1];
+        for r in ALL {
+            let c = drain_reason_code(*r) as usize;
+            assert!((1..=DRAIN_COUNT).contains(&c), "code {c} out of range");
+            assert!(!seen[c], "duplicate code {c} for {r:?}");
+            seen[c] = true;
+        }
+    }
+
+    const DRAIN_COUNT: usize = 7;
 }

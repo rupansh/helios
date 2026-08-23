@@ -51,9 +51,24 @@ impl KernelMap {
 
     /// Zero the whole mapping (volatile, byte by byte — the region is MMIO).
     pub(super) fn zero(&self) {
+        self.fill(0);
+    }
+
+    /// Volatile byte read at `offset`, or 0 past the end of the mapping.
+    pub(super) fn read_u8(&self, offset: u64) -> u8 {
+        if offset >= self.size {
+            return 0;
+        }
+        // SAFETY: `offset < size`, and `va` owns `size` mapped bytes for our
+        // lifetime.
+        unsafe { core::ptr::read_volatile(self.va.add(offset as usize)) }
+    }
+
+    /// Fill the whole mapping with one byte (volatile — the region is MMIO).
+    pub(super) fn fill(&self, value: u8) {
         // SAFETY: `va` owns `size` mapped bytes for our lifetime.
         for i in 0..self.size {
-            unsafe { core::ptr::write_volatile(self.va.add(i as usize), 0u8) };
+            unsafe { core::ptr::write_volatile(self.va.add(i as usize), value) };
         }
     }
 
