@@ -4,6 +4,76 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ⛔ BLACK DESKTOP ROOT-CAUSED 2026-08-23 (KMD 22.22.342.0) — `DisplayableFlagMissing`
+
+`DxgkDdiSetVidPnSourceAddress` refuses DWM's primary **32 times per boot**, and
+the reason is now named: `Refusal::DisplayableFlagMissing` (code 0x53).
+`D2AdmSL=0x80000` has exactly one bit set, so all 32 are the SAME reason, not a
+mixture. The refusals arrive on the `SetVidPnSourceAddress` surface
+(`D4AdrOk=2` / `D4AdrRef=32`); the DMA-flip surface is not used at all this boot
+(`D4DmaOk=0` / `D4DmaRef=0`).
+
+The chain, entirely guest-side:
+
+1. `umd/src/forward/resource.rs:816` — the UMD's ONLY `Hwa2CreateInput`
+   construction hard-codes `direct_scanout_primary: false`.
+2. `umd/src/forward/alloc.rs:291` sets `HELIOS_HWA2_FLAG_DISPLAYABLE` only when
+   that field is true ⇒ **no UMD-created allocation can ever carry it.**
+3. `kmd_logic/src/direct_scanout_admission.rs:396` requires it unconditionally.
+4. The only allocation that passes is the KMD's own standard/blank primary
+   (`create_allocation.rs:5643`) — which is exactly the blank frame on screen.
+
+⛔ **Two entries below are falsified by this measurement.** "dxgkrnl NEVER issues
+`SetVidPnSourceAddress` (0 occurrences in a full ETW slice)" is wrong — it issues
+it 34 times. And "the break is between `SetDisplayMode` (S_OK) and any
+`SetVidPnSourceAddress`" is wrong — the break is inside our own validator.
+
+### What the fix turns on (OPEN — needs an architecture decision)
+
+`create_allocation.rs:2656-2675` documents two intended arms:
+
+| arm | shape | who |
+|-----|-------|-----|
+| DIRECT | `DISPLAYABLE` + `SWIZZLE_OPAQUE_OPTIMAL`, zero-copy, QEMU reconstructs natively | the UMD's direct scan-out primary |
+| COPY | `LINEAR`, blitted into the KMD-owned linear target — "the fail-safe direction … the proven desktop" | the OS standard primary |
+
+`set_vidpn_source_address_d4` has **no copy arm**: it calls the direct validator
+and returns its error, so a copy-path primary can never be admitted there. Either
+(a) the UMD must claim DIRECT for DWM's primary — but `direct_scanout_primary`
+also flips `swizzle_class` to `OPAQUE_OPTIMAL` (`alloc.rs:340`), so it is not a
+one-bit change and the allocation must actually be that layout; or (b) the DDI
+needs the copy arm the design describes. DWM's primary is 1280x800 fmt=87,
+pitch 5120 (= 1280*4, linear-compatible), size 4587520 (= 5120*896, padded).
+
+### Latent contradiction found and measured OUT (not the current defect)
+
+`direct_scanout_admission.rs:357` refuses **every** immediate flip
+(`ImmediateFlipRequested`, 0x4C), while `present_packet.rs`'s DMA-buffer flip
+contract exists specifically to serve immediate flips, and `mpo3.rs` advertises
+`PLANE_FLIP_IMMEDIATE`. It is not firing this boot because the DMA-flip surface
+is unused — but it will refuse every flip the moment that surface is used.
+
+### Instruments added (commit 4bffe1f)
+
+- `refusal_code_and_detail()` in `kmd_logic` maps all 60 `Refusal` variants;
+  code = declaration index + 63 (range 0x40..=0x7B), which reproduces the
+  fourteen previously published codes exactly. Exhaustive match ⇒ a new variant
+  is a build error, not a silent `0x7F` bucket.
+- `D2AdmSL`/`D2AdmSH` — the SET of admission codes seen this boot, as a bitset
+  over `code - 0x40`. `D2AdmWhy` is last-value and cannot distinguish one
+  repeated refusal from a mixture of 32.
+- `D2AdmDat` — the last refusal's diagnostic scalar.
+- `D4AdrOk`/`D4AdrRef` vs `D4DmaOk`/`D4DmaRef` — the two call surfaces that share
+  the admission validator, split. This is what falsified the ETW claim.
+- `tools/decode-admission-refusals.py D2AdmSL D2AdmSH [D2AdmWhy] [D2AdmDat]`.
+
+⚠ Deploy trap: `win_install_kmd`'s `devcon update` timed out at 180s and the tool
+skipped the reboot, then `shutdown /r` wedged (error 1115, "a system shutdown is
+in progress") without rebooting — the publish itself had succeeded. QMP
+`system_reset` on `/tmp/helios-tpm/mon.sock` is the recovery (guest reset only).
+
+---
+
 ## ⭐ In progress since 2026-08-09: the HPS2 retirement (WDDM 3.2 uplift)
 
 A one-shot, all-or-nothing architecture change across nine repositories,
