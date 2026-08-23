@@ -388,10 +388,14 @@ DIRQL_CALL_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
             "try_access",
         }
     ),
+    # The ONE wire-fence allocator: a single atomic bump plus the exhaustion
+    # counter. Lock-free because the D4 arm reaches it at DIRQL.
+    (GPU, "reserve_wire_fence"): frozenset({"fetch_add", "is_none", "reserve"}),
     (GPU, "enqueue_direct_locked"): frozenset(
         {
             "add",
             "as_mut_ptr",
+            "reserve_wire_fence",
             "as_mut_slice",
             "as_slice",
             "cast",
@@ -557,6 +561,7 @@ DIRQL_QUALIFIED_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
     (GPU, "enqueue_direct_locked"): frozenset(
         {"core::mem::size_of", "super::ctrl::fill_set_scanout_blob"}
     ),
+    (GPU, "reserve_wire_fence"): frozenset(),
     (HAL, "share"): frozenset(),
     (CTRL, "fill_set_scanout_blob"): frozenset({"VirtioGpuCtrlHdr::zeroed"}),
     (LOGIC_ADMISSION, "validate_direct_scanout_binding"): frozenset(
@@ -950,6 +955,7 @@ def check_sources(sources: dict[str, str]) -> list[str]:
         (GPU, "interrupt_queue_operation"),
         (GPU, "enqueue_direct_at_dirql"),
         (GPU, "enqueue_direct_locked"),
+        (GPU, "reserve_wire_fence"),
         (GPU, "try_access"),
         (GPU, "release"),
         (GPU, "release_access"),

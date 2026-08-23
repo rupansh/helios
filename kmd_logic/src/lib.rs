@@ -39,6 +39,7 @@ pub mod ordered_engine;
 pub mod outer_execution;
 pub mod umd_private_query;
 pub mod venus_executor;
+pub mod wire_fence;
 
 /// Fixed-phase scheduling for the synthetic 60 Hz CRTC heartbeat.
 ///

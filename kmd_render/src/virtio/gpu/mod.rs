@@ -252,11 +252,6 @@ pub const BIND_CMD_BYTES: usize =
 /// unrelated control path.
 const BIND_CMD_POOL: usize = 4;
 
-/// The D4 half of each transport generation uses the upper half of the ordinary
-/// per-instance fence range. This keeps fixed DIRQL SETs disjoint from legacy
-/// user/control fence ids without creating a second unbounded namespace.
-const D4_FENCE_OFFSET: u64 = WIRE_FENCE_INSTANCE_STRIDE / 2;
-
 #[derive(Clone, Copy)]
 struct DirectQueueIdentity {
     instance: u64,
@@ -289,8 +284,6 @@ struct InterruptQueueCore {
     transport: PciTransport,
     control: VirtQueue<WdkHal, CTRL_QUEUE_SIZE>,
     direct_slots: Box<[DirectQueueSlot]>,
-    next_direct_fence: u64,
-    direct_fence_limit: u64,
     transport_instance: u64,
 }
 
@@ -303,6 +296,42 @@ struct InterruptQueueCore {
 /// this nonblocking gate. Contention refuses the flip without spinning.
 pub(crate) struct InterruptQueue {
     core: UnsafeCell<InterruptQueueCore>,
+    /// THE wire-fence allocator for this transport generation. Deliberately
+    /// outside `core`, because it is the one piece of transport state both
+    /// serialization domains must share: the virtio spinlock (VirtioGpu) and
+    /// this queue's DIRQL access gate.
+    ///
+    /// ⛔ THERE USED TO BE TWO, AND THAT WAS THE BLACK DESKTOP. `VirtioGpu::
+    /// next_wire_fence` and `InterruptQueueCore::next_direct_fence` split the
+    /// range at `WIRE_FENCE_INSTANCE_STRIDE / 2` so each domain had a private
+    /// half it could allocate from without the other's lock. But both feed the
+    /// SAME `PlaneState`, which enforces one monotonic `fence_id_high_water`,
+    /// and both emit ctx-0 `SET_SCANOUT_BLOB` into the same host retirement
+    /// space, where QEMU retires every id <= the callback id. D4's half was
+    /// unconditionally ABOVE the control half, so the first control bind after
+    /// any D4 bind went backwards: `FenceIdWentBackward` -> plane poisoned ->
+    /// `SetVidPnSourceVisibility(TRUE)` -> DEVICE_NOT_READY -> `SetDisplayMode`
+    /// E_FAIL -> DWM destroyed the device without ever presenting. Measured on
+    /// 22.22.346.0: `D2PsnN=1 D2PsnWh1=13 D2PsnRfs=10`.
+    ///
+    /// A partitioned id space cannot fix an allocator problem whose cause is
+    /// "DIRQL cannot take the lock". A lock-free allocator can. Do not re-split.
+    /// First id NOT in this generation's range is the allocator's own upper
+    /// bound, so the two-sided check lives in ONE place instead of being
+    /// recomputed at each of the three allocation sites.
+    ///
+    /// ⛔ AN UPPER BOUND IS NOT A GENERATION CHECK (A6, `docs/dx12/PENDING.md`
+    /// §1). Every id-space check in this transport was `id != 0 && id < next`,
+    /// and [`NEXT_WIRE_FENCE_BASE`] strides the range by
+    /// `WIRE_FENCE_INSTANCE_STRIDE` at every StartDevice — so an id sampled by a
+    /// usermode client BEFORE a StopDevice/StartDevice cycle is billions below
+    /// the new generation's range and satisfies that test trivially, while
+    /// naming a fence this instance never issued. The in-flight scan then finds
+    /// nothing at or below it and the dependency is satisfied INSTANTLY. For a
+    /// wait that is merely a hint that is harmless; for a WDDM DMA fence it is a
+    /// completion reported before the work exists. The stride buys disjointness;
+    /// rejection needs the LOWER bound too, which is why this pair is one type.
+    wire_fence: helios_kmd_logic::wire_fence::WireFenceAllocator,
     synchronize: DXGKCB_SYNCHRONIZE_EXECUTION,
     device_handle: HANDLE,
     failed: AtomicU32,
@@ -606,10 +635,7 @@ impl InterruptQueue {
         direct_buffers: Vec<DmaBuffer>,
         wire_fence_base: u64,
     ) -> Result<Self, VirtioError> {
-        let Some(next_direct_fence) = wire_fence_base.checked_add(D4_FENCE_OFFSET) else {
-            return Err(VirtioError::WireFenceNamespaceExhausted);
-        };
-        let Some(direct_fence_limit) = wire_fence_base.checked_add(WIRE_FENCE_INSTANCE_STRIDE)
+        let Some(wire_fence_limit) = wire_fence_base.checked_add(WIRE_FENCE_INSTANCE_STRIDE)
         else {
             return Err(VirtioError::WireFenceNamespaceExhausted);
         };
@@ -628,16 +654,43 @@ impl InterruptQueue {
                 transport,
                 control,
                 direct_slots,
-                next_direct_fence,
-                direct_fence_limit,
                 transport_instance,
             }),
+            wire_fence: helios_kmd_logic::wire_fence::WireFenceAllocator::new(
+                wire_fence_base,
+                wire_fence_limit,
+            ),
             synchronize,
             device_handle,
             failed: AtomicU32::new(0),
             access: AtomicU32::new(0),
             notify_pending: AtomicU32::new(0),
         })
+    }
+
+    /// Reserve the next wire fence id, or `None` once this generation's range
+    /// is spent. Lock-free by construction: the D4 arm calls it at DIRQL, where
+    /// neither the virtio spinlock nor the access gate may be taken.
+    ///
+    /// ⚠ The id is spent even if the caller then fails to enqueue, which the
+    /// two private allocators did not do — each peeked and only committed after
+    /// `add` was accepted. Two serialization domains cannot share a peek, so
+    /// that property is traded for monotonicity, which is the one the consumers
+    /// actually require. A burned id is harmless: it never enters `inflight`,
+    /// so `async_retired_up_to` cannot see it, and nothing on the host waits on
+    /// an id that was never sent. The range is 2^32 wide per generation.
+    pub(crate) fn reserve_wire_fence(&self) -> Option<u64> {
+        let id = self.wire_fence.reserve();
+        if id.is_none() {
+            WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+        }
+        id
+    }
+
+    /// One past the highest id this generation may have issued, for the
+    /// in-flight retirement predicate.
+    pub(crate) fn wire_fence_watermark(&self) -> u64 {
+        self.wire_fence.watermark()
     }
 
     fn try_access(&self) -> Option<InterruptQueueAccess<'_>> {
@@ -868,9 +921,7 @@ impl InterruptQueue {
         work: crate::ddi::direct_scanout::QueuedDirectScanoutBinding,
     ) -> Result<(), VirtioError> {
         let core = unsafe { &mut *self.core.get() };
-        if work.transport_instance() != core.transport_instance
-            || core.next_direct_fence >= core.direct_fence_limit
-        {
+        if work.transport_instance() != core.transport_instance {
             return Err(VirtioError::DeviceError);
         }
         let Some(slot) = core
@@ -907,11 +958,16 @@ impl InterruptQueue {
             work.offset(),
         );
         command.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
-        command.hdr.fence_id = core.next_direct_fence;
+        // Reserved AFTER the cheap refusals above, so an id is burned only when
+        // the descriptor add itself fails. `reserve_wire_fence` touches neither
+        // `core` nor any lock, which is what makes it legal here.
+        let Some(fence_id) = self.reserve_wire_fence() else {
+            return Err(VirtioError::WireFenceNamespaceExhausted);
+        };
+        command.hdr.fence_id = fence_id;
         let Some(sequence) = adapter.reserve_scanout_bind_seq() else {
             return Err(VirtioError::BindSequenceExhausted);
         };
-        let fence_id = core.next_direct_fence;
         let reads = [
             slot.buffer
                 .span(0, in0_len)
@@ -951,7 +1007,6 @@ impl InterruptQueue {
             sequence,
             resource_id,
         });
-        core.next_direct_fence += 1;
         self.notify_pending.store(1, Ordering::Release);
         Ok(())
     }
@@ -1672,24 +1727,6 @@ pub struct VirtioGpu {
     /// existing virtio spinlock, but allocation/free never occurs there.
     dma_pool: Vec<DmaBuffer>,
     dma_pool_bytes: usize,
-    /// Next wire fence id to assign (globally monotonic, starts at 1; 0 is
-    /// never a valid wire fence).
-    next_wire_fence: u64,
-    /// FIRST wire fence id THIS transport generation may hand out — i.e.
-    /// `next_wire_fence` as of `init`, before anything was assigned.
-    ///
-    /// ⛔ IT EXISTS BECAUSE AN UPPER BOUND IS NOT A GENERATION CHECK (A6,
-    /// `docs/dx12/PENDING.md` §1). Every id space check in this transport was
-    /// `id != 0 && id < next_wire_fence`, and [`NEXT_WIRE_FENCE_BASE`] strides the
-    /// range by `WIRE_FENCE_INSTANCE_STRIDE` at every StartDevice — so an id
-    /// sampled by a usermode client BEFORE a StopDevice/StartDevice cycle is
-    /// billions below the new instance's range and satisfies that test trivially,
-    /// while naming a fence this instance never issued. The in-flight scan then
-    /// finds nothing at or below it and the dependency is satisfied INSTANTLY.
-    /// For a wait that is merely a hint that is harmless; for a WDDM DMA fence it
-    /// is a completion reported before the work exists.
-    ///
-    wire_fence_base: u64,
     /// Nonwrapping driver-global identity for synchronous persistent SET
     /// completions. Separate from the wire-fence range so neither namespace's
     /// exhaustion or reset semantics can authorize the other.
@@ -2008,9 +2045,19 @@ impl VirtioGpu {
             // that happens to occupy the same number. Striding the base by
             // `WIRE_FENCE_INSTANCE_STRIDE` at each init makes the id ranges
             // disjoint, which removes the aliasing. Behaviour within one instance
-            // is unchanged; the predicate is sound there, because next_wire_fence
-            // is bumped only after `control.add` succeeds, in the same spinlock
-            // section as the `inflight` push.
+            // is unchanged.
+            //
+            // ⚠ The predicate's soundness argument CHANGED when the two private
+            // allocators were merged into `InterruptQueue::wire_fence_next`. It
+            // used to be "the id is bumped only after `control.add` succeeds, in
+            // the same spinlock section as the `inflight` push", which is no
+            // longer true: the id is spent at reservation, so a reserved id can
+            // be below the watermark before its `inflight` entry exists. The
+            // predicate is still sound, for a different reason — its only
+            // consumer, `async_retired_up_to`, asks "is ANY in-flight entry below
+            // the watermark", so a watermark that is too HIGH can only make it
+            // answer "not retired" more often. It is conservative in the safe
+            // direction, and D4 ids (which never enter `inflight`) only raise it.
             //
             // ⛔ THIS COMMENT USED TO CLAIM the stride *"moves those ids into the
             // `>= next_wire_fence` Invalid arm"*. THAT IS BACKWARDS and it was
@@ -2019,8 +2066,6 @@ impl VirtioGpu {
             // arm — the one that reads "already complete". The stride buys
             // disjointness, never rejection. Rejection needs the two-sided bound
             // against `wire_fence_base`, which is why that field exists (A6).
-            next_wire_fence: wire_fence_base,
-            wire_fence_base,
             scanout_transport_instance,
             wddm_pending: VecDeque::with_capacity(MAX_WDDM_PENDING),
             // Snapshotted at transport init like every other knob, so
@@ -2178,16 +2223,13 @@ impl VirtioGpu {
             false
         };
         let reserved_fence = if fenced_scanout || context_fence {
-            let Some(wire_fence_limit) = self.wire_fence_base.checked_add(D4_FENCE_OFFSET) else {
-                WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-                return Err((meta, VirtioError::WireFenceNamespaceExhausted));
-            };
-            if self.next_wire_fence >= wire_fence_limit
-                || in0_len < core::mem::size_of::<VirtioGpuCtrlHdr>()
-            {
+            if in0_len < core::mem::size_of::<VirtioGpuCtrlHdr>() {
                 WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
                 return Err((meta, VirtioError::WireFenceNamespaceExhausted));
             }
+            let Some(reserved) = self.queue.reserve_wire_fence() else {
+                return Err((meta, VirtioError::WireFenceNamespaceExhausted));
+            };
             // SAFETY: the complete global command header is contained in in0.
             let mut header = unsafe {
                 core::ptr::read_unaligned(meta.as_slice().as_ptr().cast::<VirtioGpuCtrlHdr>())
@@ -2216,7 +2258,7 @@ impl VirtioGpu {
             // retires every matching (context, ring) id <= the callback id;
             // a smaller per-session namespace can therefore be overtaken by a
             // delayed ring-zero allocation-teardown callback.
-            header.fence_id = self.next_wire_fence;
+            header.fence_id = reserved;
             // SAFETY: same complete in-buffer header.
             unsafe {
                 core::ptr::write_unaligned(
@@ -2224,7 +2266,7 @@ impl VirtioGpu {
                     header,
                 );
             }
-            Some(self.next_wire_fence)
+            Some(reserved)
         } else {
             None
         };
@@ -2256,9 +2298,6 @@ impl VirtioGpu {
                     return Err((meta, error));
                 }
             };
-        if reserved_fence.is_some() {
-            self.next_wire_fence += 1;
-        }
         let identity = scanout_bind.zip(reserved_sequence).map(|(_, sequence)| {
             (
                 self.scanout_transport_instance,
@@ -2441,8 +2480,14 @@ impl VirtioGpu {
         {
             return Err((meta, venus, native_completion, VirtioError::QueueFull));
         }
-        let Some(wire_fence_limit) = self.wire_fence_base.checked_add(D4_FENCE_OFFSET) else {
-            WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+        if venus_len == 0
+            || venus_len > venus.as_slice().len()
+            || hdr_len + resp_len > meta.as_slice().len()
+        {
+            return Err((meta, venus, native_completion, VirtioError::DeviceError));
+        }
+        // After the shape refusals, so a malformed submit does not burn an id.
+        let Some(fence_id) = self.queue.reserve_wire_fence() else {
             return Err((
                 meta,
                 venus,
@@ -2450,22 +2495,6 @@ impl VirtioGpu {
                 VirtioError::WireFenceNamespaceExhausted,
             ));
         };
-        if self.next_wire_fence >= wire_fence_limit {
-            WIRE_FENCE_NAMESPACE_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
-            return Err((
-                meta,
-                venus,
-                native_completion,
-                VirtioError::WireFenceNamespaceExhausted,
-            ));
-        }
-        if venus_len == 0
-            || venus_len > venus.as_slice().len()
-            || hdr_len + resp_len > meta.as_slice().len()
-        {
-            return Err((meta, venus, native_completion, VirtioError::DeviceError));
-        }
-        let fence_id = self.next_wire_fence;
         let mut cmd = VirtioGpuCmdSubmit::zeroed();
         cmd.hdr.type_ = VIRTIO_GPU_CMD_SUBMIT_3D;
         cmd.hdr.flags = VIRTIO_GPU_FLAG_FENCE | VIRTIO_GPU_FLAG_INFO_RING_IDX;
@@ -2483,10 +2512,6 @@ impl VirtioGpu {
             }
             Err(e) => return Err((meta, venus, native_completion, e)),
         };
-        // Stays BETWEEN a successful `add` and the publish: the wire fence id
-        // is only spent once the device has actually taken the descriptor.
-        // Proven strictly below the checked transport limit above.
-        self.next_wire_fence += 1;
         let ring = cmd.hdr.ring_idx;
         ASYNC_SUBMIT_COUNT.fetch_add(1, Ordering::Relaxed);
         if ring != 0 {
@@ -2933,7 +2958,11 @@ impl VirtioGpu {
         } else {
             RetireDomain::IncludingGpu
         };
-        let watermark = if paging { 0 } else { self.next_wire_fence };
+        let watermark = if paging {
+            0
+        } else {
+            self.queue.wire_fence_watermark()
+        };
 
         if self.wddm_pending.is_empty() && self.async_retired_up_to(watermark, domain) {
             return WddmAdmission::HostTerminal;
