@@ -2877,8 +2877,8 @@ pub mod kernel_dma {
         pub capability_offset: u32,
         /// Capability-table entry count; equals the COMMIT use count.
         pub capability_count: u32,
-        /// The context's host ring index: zero for control (decode-only
-        /// retirement), nonzero for a real VkQueue timeline.
+        /// The context's host ring index: zero for synchronous control,
+        /// nonzero for a real VkQueue timeline.
         pub ring_index: u32,
         /// Index of the staging slot within the context-local pool.
         pub slot_index: u32,

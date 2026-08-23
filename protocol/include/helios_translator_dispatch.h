@@ -877,7 +877,7 @@ typedef struct HeliosSealedResourceUseV1 {
     uint16_t operand_count;  /* 30 how many operands belong to this use */
     /* 32: {first_operand, operand_count} runs tile the operand table in order,
      * exactly as HOB1 requires. */
-    uint32_t first_operand;
+    uint32_t first_operand; /* zero when operand_count is zero */
     uint32_t reserved1;      /* 36 zero */
 } HeliosSealedResourceUseV1;
 
@@ -2003,6 +2003,9 @@ helios_translator_check_sealed_use(const HeliosSealedResourceUseV1 *use, uint32_
     }
     if (context_flags == HELIOS_HOB1_FLAG_D3D11_PHYSICAL && use->byte_offset != 0u) {
         return HELIOS_TRANSLATOR_STATUS_D3D11_SUBRANGE_USE;
+    }
+    if (use->operand_count == 0u && use->first_operand != 0u) {
+        return HELIOS_TRANSLATOR_STATUS_OPERAND_ENCODING;
     }
     return HELIOS_TRANSLATOR_STATUS_OK;
 }

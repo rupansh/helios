@@ -100,6 +100,10 @@ pub const DXGI_FORMAT_UNKNOWN: u32 = 0;
 /// `DXGI_FORMAT_B8G8R8A8_UNORM` — the sole SDR presentable format in this
 /// protocol generation (§10.7 profile, C38).
 pub const DXGI_FORMAT_B8G8R8A8_UNORM: u32 = 87;
+/// `DXGI_FORMAT_B8G8R8X8_UNORM` — the format the KMD's own standard-primary
+/// author deliberately writes (XR24 is the measured egl-headless scanout
+/// format, 39th session), so scanout admission accepts it alongside 87.
+pub const DXGI_FORMAT_B8G8R8X8_UNORM: u32 = 88;
 
 /// `D3DDDIFMT_A8R8G8B8`, the BGRA `D3DDDIFORMAT` the display path reports.
 ///

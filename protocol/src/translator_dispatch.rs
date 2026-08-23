@@ -1501,7 +1501,7 @@ pub struct HeliosSealedResourceUseV1 {
     /// **HOB1 offset 30.**
     pub operand_count: u16,
     /// Index of this use's first operand. The `{first_operand, operand_count}`
-    /// runs tile the operand table in order, exactly as HOB1 requires.
+    /// runs tile the operand table in order; an empty run carries zero.
     /// **HOB1 offset 32.**
     pub first_operand: u32,
     /// Reserved, zero. **HOB1 offset 36.**
@@ -2764,6 +2764,9 @@ impl HeliosSealedResourceUseV1 {
         {
             return Err(HeliosTranslatorStatus::D3D11SubrangeUse);
         }
+        if self.operand_count == 0 && self.first_operand != 0 {
+            return Err(HeliosTranslatorStatus::OperandEncoding);
+        }
         Ok(())
     }
 }
@@ -3869,6 +3872,27 @@ mod tests {
             u.validate(HELIOS_HQA1_FLAG_D3D11_PHYSICAL),
             Err(HeliosTranslatorStatus::ReservedNonZero)
         );
+
+    }
+
+    #[test]
+    fn an_empty_sealed_use_has_a_zero_operand_cursor() {
+        let mut u = HeliosSealedResourceUseV1 {
+            outer_allocation_token: 0x51,
+            byte_offset: 0,
+            byte_length: 4096,
+            access_flags: crate::wddm::HELIOS_HOB1_ACCESS_WRITE,
+            operand_count: 0,
+            reserved0: 0,
+            first_operand: 1,
+            reserved1: 0,
+        };
+        assert_eq!(
+            u.validate(HELIOS_HQA1_FLAG_D3D11_PHYSICAL),
+            Err(HeliosTranslatorStatus::OperandEncoding)
+        );
+        u.first_operand = 0;
+        assert_eq!(u.validate(HELIOS_HQA1_FLAG_D3D11_PHYSICAL), Ok(()));
     }
 
     #[test]
