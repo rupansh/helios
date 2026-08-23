@@ -4,7 +4,51 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
-## ⛔ BLACK DESKTOP, 2026-08-24 (KMD 22.22.350.0) — THE SCANNED-OUT PRIMARY IS EMPTY
+## ⛔ BLACK DESKTOP, 2026-08-24 — DWM NEVER PRESENTS, AND TWO OF OUR GATES ARE WHY
+
+**Root cause found and two of its links fixed.** DWM composites fine and its
+device is created fine; it simply never reaches a present, because this driver
+refuses two DDIs and DWM answers by destroying the device. Per-boot UMD log
+(`C:\ProgramData\Helios\umd-<pid>.log`, delete before the boot — the file is
+appended across boots and pids are reused, which made an earlier read of it
+worthless):
+
+    DDI PresentBoundary: entry present=0 present1_single=0 present1_multi=0
+      mpo=1 present attempt/success/failure/missing=0/0/0/0 early_refusal=1
+
+| # | gate | evidence | state |
+|---|------|----------|-------|
+| 1 | `pfnAcquireResource` refused the DDI when the resource-side identity did not verify, and reported `E_INVALIDARG` to the runtime | `WDDM2.1 sync token identity unverified: MissingResource priv=0x0 slot=0x0 token=0x1` — the runtime passes **no resource at all** | FIXED `4884429` — advisory + counted (`sync_token_identity_unverified`), callback forwarded |
+| 2 | `pfnPresentMultiplaneOverlay` refused on `StretchQuality != 0` | `failing=[stretch_quality] ... stretch=1 src=(0,0)-(1280,800) dst=(0,0)-(1280,800) clip=(0,0)-(1280,800)` — a 1:1 plane, and 0 is not a defined enumerator | FIXED `f401bc1` — test deleted; the gate already requires src==dst==clip |
+
+⚠ **NOT YET MEASURED.** The build carrying fix 2 was deployed but QEMU exited
+during the verification boot, so whether DWM presents after both fixes is
+open. That is the next thing to run.
+
+### The instrument that made this tractable
+
+`DDI PresentBoundary` and the per-field refusal log. A gate that covers N
+predicates behind ONE message costs a boot per guess; naming the failing field
+answered the MPO gate in a single boot. Both refusals sit on DWM's first
+present of every boot.
+
+### Deploy notes learned the hard way
+
+- `win_install_umd` **hangs** on its probe step: always pass `-NoProbe`.
+- ⛔ NEVER pass `-KillUmdUsers -RestartDevice`: its `pnputil /disable-device`
+  timed out and left `ConfigFlags=1` (CONFIGFLAG_DISABLED) on the device, which
+  would have Code-22'd the next boot. Recovery: `Set-ItemProperty ... ConfigFlags 0`
+  on `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\...`; `pnputil /enable-device`
+  answers "already enabled" and does NOT clear it.
+- A **boot reverts `UserModeDriverName`** to a previous generation's value, so a
+  hotplug + reboot can silently run the PREVIOUS UMD. Verify what DWM actually
+  loaded: `(Get-Process dwm).Modules | ? ModuleName -match helios_umd`.
+- `pnputil /restart-device` completes in seconds and reproduces the whole
+  display bring-up — a full repro without a reboot.
+
+---
+
+## ⛔ THE SCANNED-OUT PRIMARY IS EMPTY, 2026-08-24 (KMD 22.22.350.0)
 
 **The display path is exonerated by positive control. Nothing writes pixels into
 the WDDM allocation dxgkrnl hands us as DWM's primary.** One boot, both content
