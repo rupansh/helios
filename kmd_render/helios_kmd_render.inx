@@ -21,6 +21,7 @@ Helios_CopyFiles = 13  ; driver store (DIRID 13) — required for a universal IN
 helios_kmd_render.sys = 1,,
 helios_umd.dll = 1,,
 helios_umd12.dll = 1,,
+vulkan_virtio.dll = 1,,
 
 ; ──── Manufacturer / Models ────────────────────────────────────────────────
 
@@ -44,6 +45,10 @@ AddReg = Helios_DeviceSettings
 helios_kmd_render.sys
 helios_umd.dll
 helios_umd12.dll
+; Both UMDs statically import the venus ICD; a store dir without it fails
+; LoadLibrary with ERROR_MOD_NOT_FOUND and dwm silently lands on WARP
+; (measured 2026-08-24, GLE=126 on the .353 store copy).
+vulkan_virtio.dll
 
 [Helios_Install.Services]
 AddService = helios_kmd_render, 0x00000002, Helios_ServiceInstall, Helios_EventLog
