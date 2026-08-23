@@ -22,6 +22,12 @@ mod ffi {
         /// the owning ref; wrap on the Rust side without taking ownership.
         fn d3d11_device_ptr(self: &HeliosDxvkDevice) -> usize;
         fn d3d11_context_ptr(self: &HeliosDxvkDevice) -> usize;
+        unsafe fn prepare_associated_texture2d(self: &HeliosDxvkDevice, desc_ptr: usize) -> usize;
+        fn associated_texture2d_preflight_bytes(
+            self: &HeliosDxvkDevice,
+            preflight_ptr: usize,
+        ) -> u64;
+        fn discard_associated_texture2d_preflight(self: &HeliosDxvkDevice, preflight_ptr: usize);
         unsafe fn create_associated_buffer(
             self: &HeliosDxvkDevice,
             desc_ptr: usize,
@@ -54,6 +60,7 @@ mod ffi {
             outer_allocation_bytes: u64,
             cpu_mapping: usize,
             association_flags: u32,
+            preflight_ptr: usize,
         ) -> usize;
         unsafe fn create_associated_texture3d(
             self: &HeliosDxvkDevice,
@@ -253,6 +260,11 @@ pub struct BridgeDevice {
     inner: cxx::UniquePtr<ffi::HeliosDxvkDevice>,
 }
 
+pub(crate) struct AssociatedTexture2DPreflight {
+    pub(crate) token: usize,
+    pub(crate) bytes: u64,
+}
+
 impl BridgeDevice {
     /// Create a DXVK instance and logical device on the Helios venus adapter.
     /// `None` when the bridge returned a null device (no adapter, creation
@@ -314,6 +326,28 @@ impl BridgeDevice {
         self.get()?.d3d11_context()
     }
 
+    /// Create the exact lower image and retain it across outer WDDM allocation.
+    /// The opaque token is a direct, single-owner C++ object; it is consumed by
+    /// the associated Texture2D create or explicitly discarded on rollback.
+    pub(crate) unsafe fn prepare_associated_texture2d(
+        &self,
+        desc_ptr: usize,
+    ) -> Option<AssociatedTexture2DPreflight> {
+        let d = self.get()?;
+        let token = unsafe { d.prepare_associated_texture2d(desc_ptr) };
+        let bytes = d.associated_texture2d_preflight_bytes(token);
+        (token != 0 && bytes != 0).then_some(AssociatedTexture2DPreflight { token, bytes })
+    }
+
+    pub(crate) fn discard_associated_texture2d_preflight(
+        &self,
+        preflight: AssociatedTexture2DPreflight,
+    ) {
+        if let Some(d) = self.get() {
+            d.discard_associated_texture2d_preflight(preflight.token);
+        }
+    }
+
     /// Create one resource through the immutable HRA1 construction edge.
     /// `kind` is the closed D3D11 resource dimension set: 0 buffer, 1 texture
     /// 1D, 2 texture 2D, 3 texture 3D. The returned pointer is the owning
@@ -324,8 +358,16 @@ impl BridgeDevice {
         desc_ptr: usize,
         initial_data_ptr: usize,
         association: &helios_protocol::HeliosResourceAssociationV1,
+        texture2d_preflight: Option<AssociatedTexture2DPreflight>,
     ) -> Option<ID3D11Resource> {
         let d = self.get()?;
+        let preflight_token = texture2d_preflight.map_or(0, |preflight| preflight.token);
+        if (kind == 2) != (preflight_token != 0) {
+            if preflight_token != 0 {
+                d.discard_associated_texture2d_preflight(preflight_token);
+            }
+            return None;
+        }
         let raw = match kind {
             0 => unsafe {
                 d.create_associated_buffer(
@@ -361,6 +403,7 @@ impl BridgeDevice {
                     association.outer_allocation_bytes,
                     association.cpu_mapping as usize,
                     association.association_flags,
+                    preflight_token,
                 )
             },
             3 => unsafe {

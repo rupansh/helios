@@ -157,6 +157,7 @@ pub(crate) unsafe extern "C" fn get_caps(
         D3D10_2DDICAPS_TYPE_D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT as D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT,
         D3D10_2DDICAPS_TYPE_D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 as D3DWDDM1_3DDICAPS_D3D11_OPTIONS1,
         D3D10_2DDICAPS_TYPE_D3DWDDM1_3DDICAPS_MARKER as D3DWDDM1_3DDICAPS_MARKER,
+        D3D10_2DDICAPS_TYPE_D3DWDDM2_0DDICAPS_GPUVA_CAPS as D3DWDDM2_0DDICAPS_GPUVA_CAPS,
     };
     // The old literals, pinned so the alias swap is provably value-preserving.
     const _: () = assert!(D3D11DDICAPS_THREADING == 128);
@@ -167,6 +168,8 @@ pub(crate) unsafe extern "C" fn get_caps(
     const _: () = assert!(D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT == 134);
     const _: () = assert!(D3DWDDM1_3DDICAPS_D3D11_OPTIONS1 == 136);
     const _: () = assert!(D3DWDDM1_3DDICAPS_MARKER == 137);
+    const _: () = assert!(D3DWDDM2_0DDICAPS_GPUVA_CAPS == 153);
+    const _: () = assert!(core::mem::size_of::<ddi::D3DWDDM2_0DDI_GPUVA_CAPS_DATA>() == 4);
 
     if !args.is_null() {
         let args = unsafe { &*args };
@@ -249,6 +252,25 @@ pub(crate) unsafe extern "C" fn get_caps(
                     const D3DWDDM1_3DDI_MARKER_TYPE_NONE: u32 = 0;
                     unsafe { *(args.pData as *mut u32) = D3DWDDM1_3DDI_MARKER_TYPE_NONE };
                     log_error!("  GetCaps: MARKER type = NONE");
+                }
+                D3DWDDM2_0DDICAPS_GPUVA_CAPS
+                    if args.DataSize as usize
+                        >= core::mem::size_of::<ddi::D3DWDDM2_0DDI_GPUVA_CAPS_DATA>() =>
+                {
+                    // This is the UMD half of the same WDDM 2.0 GPUVA contract
+                    // that the KMD reports through DXGK_GPUMMUCAPS. The KMD's
+                    // page-table geometry is exactly 40 bits; reporting zero
+                    // here makes d3d11.dll reject an otherwise successful
+                    // CreateDevice with DXGI_ERROR_DRIVER_INTERNAL_ERROR.
+                    const GPU_VIRTUAL_ADDRESS_BITS_PER_RESOURCE: u32 = 40;
+                    let caps =
+                        unsafe { &mut *(args.pData as *mut ddi::D3DWDDM2_0DDI_GPUVA_CAPS_DATA) };
+                    caps.MaxGPUVirtualAddressBitsPerResource =
+                        GPU_VIRTUAL_ADDRESS_BITS_PER_RESOURCE;
+                    log_error!(
+                        "  GetCaps: GPUVA MaxGPUVirtualAddressBitsPerResource={}",
+                        GPU_VIRTUAL_ADDRESS_BITS_PER_RESOURCE
+                    );
                 }
                 other => {
                     log_error!(

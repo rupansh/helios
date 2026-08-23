@@ -537,15 +537,9 @@ pub(crate) enum AllocationOwnership {
     /// `pfnDeallocateCb`'s HandleList form is what returned 0x80070057 and
     /// leaked the runtime's side of the open.
     ///
-    /// ⚠ K4: currently UNCONSTRUCTED, and kept deliberately. `open_resource`
-    /// refuses every open until Mesa unit A3 supplies the host resource id HWA2
-    /// cannot carry (`K4-CONTRACT.md` §5), so nothing reaches `store_resource`
-    /// on the opened path today. Deleting the variant would delete the
-    /// deallocate-form rule that made the 0x80070057 leak unrepresentable, and
-    /// it would have to be reinvented — from the same bug — the moment A3
-    /// lands. `#[allow(dead_code)]` because "never constructed" is the true and
-    /// intended state of this variant right now, not an oversight.
-    #[allow(dead_code)]
+    /// A3/A7 make this live without supplying a host resource id: the opener
+    /// assigns its own HRA1 token to this exact handle, and the KMD resolves the
+    /// token from the allocation list when it executes the sealed batch.
     OpenedByRuntime,
 }
 

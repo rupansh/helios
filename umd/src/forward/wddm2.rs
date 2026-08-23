@@ -14,7 +14,7 @@ enum Wddm2Refusal {
     NullArgument,
     PlaneSlice,
     ConservativeRasterization,
-    ForcedSampleCount,
+    MissingD3d11_1Device,
     UnsupportedHardwareProtection,
     UnsupportedResourceLayout,
     UnsupportedShaderComment,
@@ -245,7 +245,7 @@ pub(crate) unsafe extern "C" fn create_raster_wddm2(
     h: Hdevice,
     desc: *const ddi::D3DWDDM2_0DDI_RASTERIZER_DESC,
     h_rs: ddi::D3D10DDI_HRASTERIZERSTATE,
-    h_rt: ddi::D3D10DDI_HRTRASTERIZERSTATE,
+    _h_rt: ddi::D3D10DDI_HRTRASTERIZERSTATE,
 ) {
     clear_handle(h_rs);
     let Some(d) = desc.as_ref() else {
@@ -263,28 +263,57 @@ pub(crate) unsafe extern "C" fn create_raster_wddm2(
         refuse_void(h, "CreateRasterizerState", Wddm2Refusal::ConservativeRasterization, E_NOTIMPL);
         return;
     }
-    if d.ForcedSampleCount != 0 {
+
+    let Some(device) = d3d11_device(h) else {
+        return;
+    };
+    let Ok(device1) = device.cast::<ID3D11Device1>() else {
         refuse_void(
             h,
             "CreateRasterizerState",
-            Wddm2Refusal::ForcedSampleCount,
+            Wddm2Refusal::MissingD3d11_1Device,
             E_NOTIMPL,
         );
         return;
-    }
-    let old = ddi::D3D10_DDI_RASTERIZER_DESC {
-        FillMode: d.FillMode,
-        CullMode: d.CullMode,
-        FrontCounterClockwise: d.FrontCounterClockwise,
+    };
+
+    // The WDDM 2.x descriptor carries the D3D11.1 ForcedSampleCount field.
+    // Dropping it into the D3D10 prefix changes the requested state, while
+    // refusing a nonzero value makes d3d11.dll tear down an otherwise valid
+    // device. DXVK implements ID3D11Device1 and consumes this field through
+    // CreateRasterizerState1, so preserve it exactly at that ABI boundary.
+    let rd = D3D11_RASTERIZER_DESC1 {
+        FillMode: D3D11_FILL_MODE(d.FillMode),
+        CullMode: D3D11_CULL_MODE(d.CullMode),
+        FrontCounterClockwise: BOOL(d.FrontCounterClockwise),
         DepthBias: d.DepthBias,
         DepthBiasClamp: d.DepthBiasClamp,
         SlopeScaledDepthBias: d.SlopeScaledDepthBias,
-        DepthClipEnable: d.DepthClipEnable,
-        ScissorEnable: d.ScissorEnable,
-        MultisampleEnable: d.MultisampleEnable,
-        AntialiasedLineEnable: d.AntialiasedLineEnable,
+        DepthClipEnable: BOOL(d.DepthClipEnable),
+        ScissorEnable: BOOL(d.ScissorEnable),
+        MultisampleEnable: BOOL(d.MultisampleEnable),
+        AntialiasedLineEnable: BOOL(d.AntialiasedLineEnable),
+        ForcedSampleCount: d.ForcedSampleCount,
     };
-    create_rasterizer_state(h, &old, h_rs, h_rt);
+    let mut rs: Option<ID3D11RasterizerState1> = None;
+    let created = device1.CreateRasterizerState1(&rd, Some(&mut rs));
+    if let Err(ref e) = created {
+        log_error!(
+            "WDDM2.1 CreateRasterizerState1 failed: forced_samples={} {e:?}",
+            d.ForcedSampleCount
+        );
+    }
+    let base = match rs {
+        Some(s) => match s.cast::<ID3D11RasterizerState>() {
+            Ok(b) => Some(b),
+            Err(e) => {
+                log_error!("WDDM2.1 CreateRasterizerState1 base cast failed: {e:?}");
+                None
+            }
+        },
+        None => None,
+    };
+    finish_create(h, created, base, |s| store_com(h_rs, s));
 }
 
 pub(crate) unsafe extern "C" fn calc_size_query_wddm2(

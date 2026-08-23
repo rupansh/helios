@@ -240,6 +240,17 @@ struct HeliosDxvkDeviceImpl {
 
 namespace {
 
+  struct Texture2DPreflight {
+    dxvk::D3D11Device* owner = nullptr;
+    VkImage image = VK_NULL_HANDLE;
+    VkMemoryRequirements requirements = { };
+
+    ~Texture2DPreflight() {
+      if (owner && image)
+        owner->DiscardTexture2DHeliosPreflight(image);
+    }
+  };
+
   std::optional<HeliosResourceAssociationV1> make_resource_association(
       std::uint64_t package_generation,
       std::uint64_t device_generation,
@@ -323,6 +334,48 @@ std::size_t HeliosDxvkDevice::d3d11_context_ptr() const {
   return impl ? reinterpret_cast<std::size_t>(impl->context) : 0;
 }
 
+std::size_t HeliosDxvkDevice::prepare_associated_texture2d(
+    std::size_t desc_ptr) const {
+  return bridge_guard("prepare_associated_texture2d", std::size_t(0), [&]() {
+    if (!impl || !impl->d3d11 || !desc_ptr)
+      return std::size_t(0);
+    auto preflight = std::make_unique<Texture2DPreflight>();
+    preflight->owner = static_cast<dxvk::D3D11Device*>(impl->d3d11);
+    HRESULT hr = preflight->owner->PrepareTexture2DHelios(
+      reinterpret_cast<const D3D11_TEXTURE2D_DESC*>(desc_ptr),
+      &preflight->requirements, &preflight->image);
+    if (FAILED(hr) || !preflight->requirements.size || !preflight->image) {
+      char msg[128];
+      std::snprintf(msg, sizeof(msg),
+        "texture2d preflight failed hr=0x%08lx",
+        static_cast<unsigned long>(hr));
+      umd_log(msg);
+      return std::size_t(0);
+    }
+    return reinterpret_cast<std::size_t>(preflight.release());
+  });
+}
+
+std::uint64_t HeliosDxvkDevice::associated_texture2d_preflight_bytes(
+    std::size_t preflight_ptr) const {
+  if (!impl || !impl->d3d11 || !preflight_ptr)
+    return 0;
+  const auto* preflight = reinterpret_cast<const Texture2DPreflight*>(preflight_ptr);
+  return preflight->owner == static_cast<dxvk::D3D11Device*>(impl->d3d11)
+    ? static_cast<std::uint64_t>(preflight->requirements.size)
+    : 0;
+}
+
+void HeliosDxvkDevice::discard_associated_texture2d_preflight(
+    std::size_t preflight_ptr) const {
+  if (!preflight_ptr)
+    return;
+  auto preflight = std::unique_ptr<Texture2DPreflight>(
+    reinterpret_cast<Texture2DPreflight*>(preflight_ptr));
+  if (!impl || preflight->owner != static_cast<dxvk::D3D11Device*>(impl->d3d11))
+    preflight.release();
+}
+
 std::size_t HeliosDxvkDevice::create_associated_buffer(
     std::size_t desc_ptr,
     std::size_t initial_data_ptr,
@@ -381,15 +434,21 @@ std::size_t HeliosDxvkDevice::create_associated_texture2d(
     std::uint64_t outer_allocation_token,
     std::uint64_t outer_allocation_bytes,
     std::size_t cpu_mapping,
-    std::uint32_t association_flags) const {
+    std::uint32_t association_flags,
+    std::size_t preflight_ptr) const {
   return bridge_guard("create_associated_texture2d", std::size_t(0), [&]() {
+    auto preflight = std::unique_ptr<Texture2DPreflight>(
+      reinterpret_cast<Texture2DPreflight*>(preflight_ptr));
     auto association = make_resource_association(package_generation,
       device_generation, outer_allocation_token, outer_allocation_bytes,
       cpu_mapping, association_flags);
-    if (!impl || !impl->d3d11 || !desc_ptr || !association)
+    if (!impl || !impl->d3d11 || !desc_ptr || !association || !preflight
+     || preflight->owner != static_cast<dxvk::D3D11Device*>(impl->d3d11)
+     || !preflight->image || !preflight->requirements.size)
       return std::size_t(0);
     dxvk::D3D11_HELIOS_CREATE_INFO create = { };
     create.ResourceAssociation = &*association;
+    create.PrecreatedImage = &preflight->image;
     ID3D11Texture2D* resource = nullptr;
     HRESULT hr = static_cast<dxvk::D3D11Device*>(impl->d3d11)->CreateTexture2DHelios(
       reinterpret_cast<const D3D11_TEXTURE2D_DESC*>(desc_ptr),

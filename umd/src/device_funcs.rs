@@ -1063,9 +1063,10 @@ pub unsafe fn destroy_runtime_paging_queue(outer: &mut OuterDevice) {
 /// Detach A5 before destroying HQC1 and the exact runtime context. This helper
 /// also services construction rollback, where no HeliosDevice exists yet.
 pub unsafe fn destroy_outer_runtime_context(outer: &mut OuterDevice) {
-    let Some(context) = outer.context.take() else {
+    let Some(context) = outer.context.as_ref() else {
         return;
     };
+    let context_generation = context.context_generation;
 
     if let Some(scope) = crate::forward::lock_ignore_poison(&context.active_scope).take() {
         let result = outer.translator.close_outer_scope(scope, None);
@@ -1081,13 +1082,21 @@ pub unsafe fn destroy_outer_runtime_context(outer: &mut OuterDevice) {
             live_allocations
         );
     }
-    let detach = outer
-        .translator
-        .detach_outer_context(context.context_generation);
+    let detach = outer.translator.detach_outer_context(context_generation);
     log_error!(
         "DDI outer teardown: detach generation={} result={detach:?}",
-        context.context_generation
+        context_generation
     );
+
+    // Detach performs the final real-progress join through
+    // `translator_sync_progress_join`. That callback resolves the exact
+    // attached `RuntimeContext` from this boxed `OuterDevice`; taking the
+    // option before detach made the callback reject its own live context as
+    // `UnknownContext`. Detach has now returned, so no A5 callback retains the
+    // context and the kernel handles can be consumed below.
+    let Some(context) = outer.context.take() else {
+        return;
+    };
 
     if !outer.kt_callbacks.is_null() {
         if let Some(destroy_sync_cb) = (*outer.kt_callbacks).pfnDestroySynchronizationObjectCb {

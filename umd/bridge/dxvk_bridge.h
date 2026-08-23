@@ -26,6 +26,11 @@ struct HeliosDxvkDevice {
   // Raw ID3D11Device* / ID3D11DeviceContext* (as size_t) for the DDI forwarders.
   std::size_t d3d11_device_ptr() const;
   std::size_t d3d11_context_ptr() const;
+  std::size_t prepare_associated_texture2d(std::size_t desc_ptr) const;
+  std::uint64_t associated_texture2d_preflight_bytes(
+      std::size_t preflight_ptr) const;
+  void discard_associated_texture2d_preflight(
+      std::size_t preflight_ptr) const;
   // Package-private resource creation edge. Each call copies one validated
   // HRA1 record into the exact DXVK resource allocation graph before Vulkan
   // memory is allocated; the descriptor and initial-data pointers are only
@@ -47,7 +52,8 @@ struct HeliosDxvkDevice {
       std::uint64_t package_generation, std::uint64_t device_generation,
       std::uint64_t outer_allocation_token,
       std::uint64_t outer_allocation_bytes, std::size_t cpu_mapping,
-      std::uint32_t association_flags) const;
+      std::uint32_t association_flags,
+      std::size_t preflight_ptr) const;
   std::size_t create_associated_texture3d(
       std::size_t desc_ptr, std::size_t initial_data_ptr,
       std::uint64_t package_generation, std::uint64_t device_generation,

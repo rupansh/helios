@@ -83,8 +83,10 @@ pub(super) use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE
 // it now — `HeliosWddmAllocationDescV2` (HWA2, 168 B) — and it is built in
 // `forward/alloc.rs` and read in `forward/state.rs`. Nothing here may re-import
 // a `wddm_legacy` allocation symbol: `docs/retirement/K4-CONTRACT.md` §1
-// (the two-stage contract), §5 (the `resource_id` gap is NAMED, not bridged)
-// and §6 (the VidMm tracker has no successor).
+// (the two-stage contract) and §6 (the VidMm tracker has no successor). The
+// interim §5 `resource_id` gap is closed only by the landed HRA1/A7 path: an
+// opener assigns its own package token to the exact runtime allocation and the
+// KMD resolves it from the allocation list. No UMD-visible resid replaces it.
 pub(super) use helios_protocol::{
     HeliosAllocDescRejection, HeliosResourceAssociationV1, HeliosWddmAllocationDescV2,
     HELIOS_HWA2_BYTES, HELIOS_PACKAGE_GENERATION, HELIOS_RESOURCE_ASSOCIATION_ABI_VERSION,
@@ -339,14 +341,9 @@ struct DdiRefusals {
     /// An open-time buffer WAS 168 bytes but failed
     /// `HeliosWddmAllocationDescV2::validate`.
     hwa2_open_desc_invalid: RefusalCounter,
-    /// A valid HWA2 open descriptor, and the import still cannot proceed: the
-    /// D3D11 import path needs the host `resource_id` / `venus_alloc_size` /
-    /// Vulkan memory-type index that HWA2 deliberately does not carry.
-    ///
-    /// `K4-CONTRACT.md` §5 requires
-    /// this to fail loudly and to record that "an ICD in this state cannot
-    /// import" — never to fall back, never to fabricate a 1x1 alias (audit
-    /// U-B2, the black-forever failure).
+    /// Historical K4 refusal column. It remains in the append-only evidence
+    /// order, but no live path increments it after A3/A7: `OpenResource` now
+    /// constructs through HRA1 and never asks HWA2 for a host resource id.
     hwa2_open_needs_mesa_a3: RefusalCounter,
     /// A D3D11 DDI bind bit with no HWA2 counterpart was dropped from the
     /// descriptor (`D3D11DDI_BIND_CAPTURE`, or anything the runtime adds
@@ -375,6 +372,11 @@ struct DdiRefusals {
     /// dimension first (`unhandled_resource_dimension`); counted separately so
     /// a future caller that skips that gate cannot allocate with a guessed kind.
     hwa2_unknown_dimension: RefusalCounter,
+    /// A valid HWA2 open cannot be represented by the generation-4 D3D11
+    /// single-allocation image path: a disjoint allocation array, non-image
+    /// kind, or lower image whose exact requirement exceeds the immutable HWA2
+    /// extent. No allocation is guessed or partially associated.
+    hwa2_open_unsupported_shape: RefusalCounter,
 }
 
 /// ⚠ Each counter now carries its own NAME (`RefusalCounter`, stage S2), so
@@ -404,12 +406,13 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
     hwa2_plane_unrepresentable: RefusalCounter::new("hwa2_plane_unrepresentable"),
     hwa2_image_format_unknown: RefusalCounter::new("hwa2_image_format_unknown"),
     hwa2_unknown_dimension: RefusalCounter::new("hwa2_unknown_dimension"),
+    hwa2_open_unsupported_shape: RefusalCounter::new("hwa2_open_unsupported_shape"),
 };
 
 /// The set, in the order the summary prints them. ⛔ This order is the
 /// evidence contract: `DDI refusals:` lines from different builds are diffed.
 /// The K4 counters are APPENDED so every pre-existing column keeps its place.
-static DDI_REFUSAL_SET: [&RefusalCounter; 21] = [
+static DDI_REFUSAL_SET: [&RefusalCounter; 22] = [
     &DDI_REFUSALS.srv_raw_hazard,
     &DDI_REFUSALS.resource_raw_hazard,
     &DDI_REFUSALS.text_filter_size_ignored,
@@ -431,6 +434,7 @@ static DDI_REFUSAL_SET: [&RefusalCounter; 21] = [
     &DDI_REFUSALS.hwa2_plane_unrepresentable,
     &DDI_REFUSALS.hwa2_image_format_unknown,
     &DDI_REFUSALS.hwa2_unknown_dimension,
+    &DDI_REFUSALS.hwa2_open_unsupported_shape,
 ];
 
 /// One bounded log line carrying every counter.

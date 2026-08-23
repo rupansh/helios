@@ -92,6 +92,247 @@ fn resource_needs_cpu_mapping(
     }
 }
 
+/// DXVK implements a staging texture as one mapped buffer per subresource and
+/// deliberately creates no VkImage for it. Those buffers already enter the A5
+/// record-only allocator independently, so each receives its own exact HRA1
+/// identity. A top-level image preflight/allocation would both fail (there is
+/// no image) and incorrectly collapse a multi-subresource texture onto one
+/// outer token.
+fn texture2d_uses_internal_mapped_buffers(usage: u32) -> bool {
+    usage == D3D11_USAGE_STAGING.0 as u32
+}
+
+const WDDM_ALLOCATION_PAGE_BYTES: u64 = 4096;
+
+fn round_up_wddm_allocation_bytes(bytes: u64) -> Option<u64> {
+    bytes
+        .checked_add(WDDM_ALLOCATION_PAGE_BYTES - 1)
+        .map(|end| end & !(WDDM_ALLOCATION_PAGE_BYTES - 1))
+}
+
+fn select_wddm_allocation_bytes(
+    resource_extent: u64,
+    lower_memory_requirement: u64,
+) -> Option<u64> {
+    round_up_wddm_allocation_bytes(resource_extent.max(lower_memory_requirement))
+}
+
+/// Rebuild the D3D11 API descriptor for one runtime-opened HWA2 image.
+///
+/// HWA2's bind and misc words are package vocabularies, not D3D11 bitfields.
+/// Keep the inverse translation here beside the create-time forward
+/// translation in `alloc.rs`; in particular, HWA2 `PRESENT` has no D3D11 API
+/// bind bit and must not be reinterpreted as `UNORDERED_ACCESS` merely because
+/// both happen to occupy bit 8 in their respective vocabularies.
+fn opened_texture2d_desc(descriptor: &HeliosWddmAllocationDescV2) -> Option<D3D11_TEXTURE2D_DESC> {
+    if !descriptor.is_image() {
+        return None;
+    }
+
+    use helios_protocol::{
+        HELIOS_HWA2_BIND_CONSTANT_BUFFER, HELIOS_HWA2_BIND_DEPTH_STENCIL,
+        HELIOS_HWA2_BIND_INDEX_BUFFER, HELIOS_HWA2_BIND_RENDER_TARGET,
+        HELIOS_HWA2_BIND_SHADER_RESOURCE, HELIOS_HWA2_BIND_STREAM_OUTPUT,
+        HELIOS_HWA2_BIND_UNORDERED_ACCESS, HELIOS_HWA2_BIND_VERTEX_BUFFER,
+        HELIOS_HWA2_BIND_VIDEO_DECODER, HELIOS_HWA2_BIND_VIDEO_ENCODER, HELIOS_HWA2_FLAG_SHARED,
+        HELIOS_HWA2_MISC_GDI_COMPATIBLE, HELIOS_HWA2_MISC_RESOURCE_CLAMP,
+        HELIOS_HWA2_MISC_SHARED_NT_HANDLE, HELIOS_HWA2_MISC_TEXTURE_CUBE,
+    };
+
+    let mut bind = 0;
+    for (hwa2_bit, d3d11_bit) in [
+        (
+            HELIOS_HWA2_BIND_VERTEX_BUFFER,
+            D3D11_BIND_VERTEX_BUFFER.0 as u32,
+        ),
+        (
+            HELIOS_HWA2_BIND_INDEX_BUFFER,
+            D3D11_BIND_INDEX_BUFFER.0 as u32,
+        ),
+        (
+            HELIOS_HWA2_BIND_CONSTANT_BUFFER,
+            D3D11_BIND_CONSTANT_BUFFER.0 as u32,
+        ),
+        (
+            HELIOS_HWA2_BIND_SHADER_RESOURCE,
+            D3D11_BIND_SHADER_RESOURCE.0 as u32,
+        ),
+        (
+            HELIOS_HWA2_BIND_STREAM_OUTPUT,
+            D3D11_BIND_STREAM_OUTPUT.0 as u32,
+        ),
+        (
+            HELIOS_HWA2_BIND_RENDER_TARGET,
+            D3D11_BIND_RENDER_TARGET.0 as u32,
+        ),
+        (
+            HELIOS_HWA2_BIND_DEPTH_STENCIL,
+            D3D11_BIND_DEPTH_STENCIL.0 as u32,
+        ),
+        (
+            HELIOS_HWA2_BIND_UNORDERED_ACCESS,
+            D3D11_BIND_UNORDERED_ACCESS.0 as u32,
+        ),
+        (HELIOS_HWA2_BIND_VIDEO_DECODER, D3D11_BIND_DECODER.0 as u32),
+        (
+            HELIOS_HWA2_BIND_VIDEO_ENCODER,
+            D3D11_BIND_VIDEO_ENCODER.0 as u32,
+        ),
+    ] {
+        if descriptor.bind_flags & hwa2_bit != 0 {
+            bind |= d3d11_bit;
+        }
+    }
+
+    let mut misc = 0;
+    for (hwa2_bit, d3d11_bit) in [
+        (
+            HELIOS_HWA2_MISC_GDI_COMPATIBLE,
+            D3D11_RESOURCE_MISC_GDI_COMPATIBLE.0 as u32,
+        ),
+        (
+            HELIOS_HWA2_MISC_TEXTURE_CUBE,
+            D3D11_RESOURCE_MISC_TEXTURECUBE.0 as u32,
+        ),
+        (
+            HELIOS_HWA2_MISC_RESOURCE_CLAMP,
+            D3D11_RESOURCE_MISC_RESOURCE_CLAMP.0 as u32,
+        ),
+        (
+            HELIOS_HWA2_MISC_SHARED_NT_HANDLE,
+            D3D11_RESOURCE_MISC_SHARED_NTHANDLE.0 as u32,
+        ),
+    ] {
+        if descriptor.misc_flags & hwa2_bit != 0 {
+            misc |= d3d11_bit;
+        }
+    }
+    // The runtime opened a shared WDDM resource. Keep DXVK's resource model
+    // shared as the pre-HRA1 open path did, while the HRA1 association below
+    // suppresses every Vulkan external-memory import/export carrier.
+    if descriptor.flags & HELIOS_HWA2_FLAG_SHARED != 0 {
+        misc |= D3D11_RESOURCE_MISC_SHARED.0 as u32;
+    }
+
+    Some(D3D11_TEXTURE2D_DESC {
+        Width: descriptor.width,
+        Height: descriptor.height,
+        MipLevels: descriptor.mip_levels,
+        ArraySize: descriptor.depth_or_array_size,
+        Format: DXGI_FORMAT(descriptor.dxgi_format as i32),
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: descriptor.sample_count,
+            Quality: descriptor.sample_quality,
+        },
+        Usage: D3D11_USAGE_DEFAULT,
+        BindFlags: bind,
+        CPUAccessFlags: 0,
+        MiscFlags: misc,
+    })
+}
+
+#[cfg(test)]
+mod allocation_size_tests {
+    use super::*;
+
+    #[test]
+    fn staging_texture2d_bypasses_image_preflight() {
+        assert!(texture2d_uses_internal_mapped_buffers(
+            D3D11_USAGE_STAGING.0 as u32
+        ));
+        assert!(!texture2d_uses_internal_mapped_buffers(0));
+        assert!(!texture2d_uses_internal_mapped_buffers(1));
+        assert!(!texture2d_uses_internal_mapped_buffers(2));
+    }
+
+    #[test]
+    fn wddm_allocation_extent_is_page_rounded() {
+        assert_eq!(round_up_wddm_allocation_bytes(1), Some(4096));
+        assert_eq!(round_up_wddm_allocation_bytes(4096), Some(4096));
+        assert_eq!(round_up_wddm_allocation_bytes(12_800), Some(16_384));
+        assert_eq!(round_up_wddm_allocation_bytes(u64::MAX), None);
+    }
+
+    #[test]
+    fn lower_image_requirement_expands_the_outer_allocation() {
+        assert_eq!(select_wddm_allocation_bytes(81_920, 131_072), Some(131_072));
+        assert_eq!(select_wddm_allocation_bytes(131_072, 81_920), Some(131_072));
+        assert_eq!(select_wddm_allocation_bytes(12_800, 16_384), Some(16_384));
+    }
+}
+
+#[cfg(test)]
+mod open_resource_tests {
+    use super::*;
+    use helios_protocol::{
+        HELIOS_HWA2_BIND_PRESENT, HELIOS_HWA2_BIND_RENDER_TARGET, HELIOS_HWA2_BIND_SHADER_RESOURCE,
+        HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED, HELIOS_HWA2_FLAG_SHARED, HELIOS_HWA2_KIND_BUFFER,
+        HELIOS_HWA2_KIND_IMAGE, HELIOS_HWA2_MEMORY_SHARED, HELIOS_HWA2_MISC_GDI_COMPATIBLE,
+        HELIOS_HWA2_MISC_RESOURCE_CLAMP, HELIOS_HWA2_SWIZZLE_LINEAR,
+    };
+
+    fn shared_image() -> HeliosWddmAllocationDescV2 {
+        let mut descriptor = HeliosWddmAllocationDescV2::header(HELIOS_PACKAGE_GENERATION, 7);
+        descriptor.byte_size = 2 * 1024 * 1024;
+        descriptor.width = 704;
+        descriptor.height = 704;
+        descriptor.depth_or_array_size = 2;
+        descriptor.mip_levels = 3;
+        descriptor.dxgi_format = 87;
+        descriptor.d3d_ddi_format = 21;
+        descriptor.sample_count = 1;
+        descriptor.allocation_kind = HELIOS_HWA2_KIND_IMAGE;
+        descriptor.flags = HELIOS_HWA2_FLAG_SHARED | HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED;
+        descriptor.bind_flags = HELIOS_HWA2_BIND_SHADER_RESOURCE
+            | HELIOS_HWA2_BIND_RENDER_TARGET
+            | HELIOS_HWA2_BIND_PRESENT;
+        descriptor.misc_flags = HELIOS_HWA2_MISC_GDI_COMPATIBLE | HELIOS_HWA2_MISC_RESOURCE_CLAMP;
+        descriptor.swizzle_class = HELIOS_HWA2_SWIZZLE_LINEAR;
+        descriptor.memory_class = HELIOS_HWA2_MEMORY_SHARED;
+        descriptor.plane_count = 1;
+        descriptor.planes[0].row_pitch = 2816;
+        descriptor.planes[0].slice_pitch = 1_982_464;
+        assert_eq!(
+            descriptor.validate_create_output(HELIOS_PACKAGE_GENERATION),
+            Ok(())
+        );
+        descriptor
+    }
+
+    #[test]
+    fn opened_image_preserves_exact_geometry_and_translates_vocabularies() {
+        let descriptor = shared_image();
+        let opened = opened_texture2d_desc(&descriptor).expect("image descriptor");
+
+        assert_eq!(opened.Width, 704);
+        assert_eq!(opened.Height, 704);
+        assert_eq!(opened.ArraySize, 2);
+        assert_eq!(opened.MipLevels, 3);
+        assert_eq!(opened.Format.0, 87);
+        assert_eq!(opened.SampleDesc.Count, 1);
+        assert_eq!(opened.SampleDesc.Quality, 0);
+        assert_eq!(opened.Usage, D3D11_USAGE_DEFAULT);
+        assert_eq!(opened.CPUAccessFlags, 0);
+        assert_eq!(
+            opened.BindFlags,
+            D3D11_BIND_SHADER_RESOURCE.0 as u32 | D3D11_BIND_RENDER_TARGET.0 as u32
+        );
+        assert_eq!(
+            opened.MiscFlags,
+            D3D11_RESOURCE_MISC_SHARED.0 as u32
+                | D3D11_RESOURCE_MISC_GDI_COMPATIBLE.0 as u32
+                | D3D11_RESOURCE_MISC_RESOURCE_CLAMP.0 as u32
+        );
+    }
+
+    #[test]
+    fn opened_non_image_is_not_reinterpreted_as_a_texture() {
+        let mut descriptor = shared_image();
+        descriptor.allocation_kind = HELIOS_HWA2_KIND_BUFFER;
+        assert!(opened_texture2d_desc(&descriptor).is_none());
+    }
+}
+
 /// Add one allocation to the WDDM 2.x device residency list.
 ///
 /// E_PENDING is completed with a blocking monitored-fence wait through the
@@ -274,6 +515,36 @@ impl CreatedWddmAllocation {
     }
 }
 
+/// One allocation handle dxgkrnl handed this device at `OpenResource`.
+///
+/// It participates in the same exact per-device HRA1 token map as a created
+/// allocation, but rollback may only evict it.  The runtime owns the open and
+/// therefore this UMD must never pass its handle to `pfnDeallocateCb`'s
+/// HandleList form.
+struct OpenedWddmAllocation {
+    resident: Option<ResidentAllocation>,
+    km_resource: ddi::D3DKMT_HANDLE,
+    identity: OuterAllocationIdentity,
+    association: HeliosResourceAssociationV1,
+}
+
+impl OpenedWddmAllocation {
+    unsafe fn rollback(mut self, dev: &crate::device_funcs::HeliosDevice) {
+        remove_outer_allocation(&dev.outer, self.identity);
+        drop(self.resident.take());
+    }
+
+    fn into_state(
+        mut self,
+    ) -> (
+        Option<ResidentAllocation>,
+        ddi::D3DKMT_HANDLE,
+        Option<OuterAllocationIdentity>,
+    ) {
+        (self.resident.take(), self.km_resource, Some(self.identity))
+    }
+}
+
 /// Create the exact standalone WDDM allocation that backs one DXVK-internal
 /// VkDeviceMemory, then retain its residency and ownership on this device.
 /// The returned HRA1 value is consumed synchronously by that same
@@ -433,6 +704,7 @@ pub(crate) unsafe fn allocate_wddm_resource(
     a: &ddi::D3D11DDIARG_CREATERESOURCE,
     mip0: &ddi::D3D10DDI_MIPINFO,
     h_rt: ddi::D3D10DDI_HRTRESOURCE,
+    lower_memory_requirement: u64,
 ) -> Result<CreatedWddmAllocation, i32> {
     const DDI_BIND_PRESENT: u32 = 0x0000_0080;
 
@@ -471,19 +743,28 @@ pub(crate) unsafe fn allocate_wddm_resource(
     // is admitted, and nothing is rewritten — the UMD's claim stands or the
     // create fails.** It does NOT demand equality with `linear_blob_size` on
     // this arm; had it done so, every D3D11 create would have failed. So the
-    // extent this driver can actually compute is the right thing to send.
+    // extent this driver can actually compute is the right baseline to send.
     // WAS `pitch * mip0.TexelHeight` — one 2D slice of mip 0 — while the
     // descriptor declares depth, array size and mips, and the KMD sizes the venus
     // blob FROM this number: a 64^3 shared Texture3D got 16 KiB for 1 MiB, the
     // Xid-31 undersize shape. Over-estimates on purpose (Tier 2 admits it); the
-    // mip chain is bounded by 2x the base level. Depth 1 / array 1 / 1 mip — the
-    // shape that composites the desktop — is byte-for-byte unchanged.
+    // mip chain is bounded by 2x the base level. The final extent is rounded to
+    // the WDDM page boundary. For an associated lower image, DXVK first creates
+    // the exact storage-less image and retains it across outer allocation; that
+    // same object is adopted for the later dedicated memory allocation. Its
+    // measured size is `lower_memory_requirement`, and the outer allocation
+    // must cover the larger bound. This is not an empirical padding rule: the
+    // target's 256x80 BGRA image measured 131,072 bytes while its texel extent
+    // was 81,920 bytes, and the smaller HRA1 was rejected locally before any
+    // HOB1 could reach KMD.
     let slices = (mip0.TexelDepth.max(1) as u64).saturating_mul(a.ArraySize.max(1) as u64);
-    let size = (pitch as u64)
+    let unaligned_size = (pitch as u64)
         .saturating_mul(mip0.TexelHeight.max(1) as u64)
         .saturating_mul(slices)
         .saturating_mul(if a.MipLevels > 1 { 2 } else { 1 })
-        .max(4096);
+        .max(WDDM_ALLOCATION_PAGE_BYTES);
+    let size = select_wddm_allocation_bytes(unaligned_size, lower_memory_requirement)
+        .ok_or(E_OUTOFMEMORY)?;
 
     // pPrimaryDesc is the runtime's authoritative primary classification.
     // A dedicated-copy source is intentionally OPTIMAL and has no scanout
@@ -874,16 +1155,20 @@ unsafe fn create_and_store_associated_resource(
     desc_ptr: usize,
     initial_data_ptr: usize,
     allocation: CreatedWddmAllocation,
+    texture2d_preflight: Option<crate::bridge::AssociatedTexture2DPreflight>,
 ) -> Result<(), i32> {
     let Some(dev) = helios_device(h) else {
         return Err(E_FAIL);
     };
     let allocation_handle = allocation.allocation_handle();
     let association = *allocation.association();
-    let Some(resource) =
-        dev.dxvk
-            .create_associated_resource(kind, desc_ptr, initial_data_ptr, &association)
-    else {
+    let Some(resource) = dev.dxvk.create_associated_resource(
+        kind,
+        desc_ptr,
+        initial_data_ptr,
+        &association,
+        texture2d_preflight,
+    ) else {
         allocation.rollback(dev);
         log_error!(
             "DDI associated create REFUSED: kind={} token={} allocation=0x{:x}",
@@ -919,7 +1204,7 @@ pub(crate) unsafe extern "C" fn create_resource(
         set_runtime_error(h, E_INVALIDARG);
         return;
     }
-    let Some(_device) = d3d11_device(h) else {
+    let Some(device) = d3d11_device(h) else {
         return;
     };
     let a = &*arg;
@@ -1069,7 +1354,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                 MiscFlags: misc,
                 StructureByteStride: a.ByteStride,
             };
-            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt) {
+            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt, 0) {
                 Ok(allocation) => allocation,
                 Err(hr) => {
                     log_error!(
@@ -1088,6 +1373,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                 (&desc as *const D3D11_BUFFER_DESC) as usize,
                 init_ptr.map_or(0, |ptr| ptr as usize),
                 allocation,
+                None,
             ) {
                 set_runtime_error(h, hr);
             }
@@ -1140,17 +1426,73 @@ pub(crate) unsafe extern "C" fn create_resource(
                 CPUAccessFlags: cpu,
                 MiscFlags: misc,
             };
-            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt) {
-                Ok(allocation) => allocation,
-                Err(hr) => {
+            if texture2d_uses_internal_mapped_buffers(a.Usage) {
+                let mut texture = None;
+                if let Err(e) = device.CreateTexture2D(&desc, init_ptr, Some(&mut texture)) {
                     log_error!(
-                        "DDI create_resource(tex2d): WDDM allocation/residency failed hr=0x{:08x}",
-                        hr as u32
+                        "DDI create_resource(tex2d): staging mapped-buffer create failed {e:?}"
                     );
-                    set_runtime_error(h, hr);
+                    set_runtime_error(h, create_error_hr(&e));
+                    return;
+                }
+                let Some(texture) = texture else {
+                    log_error!(
+                        "DDI create_resource(tex2d): staging mapped-buffer create returned no resource"
+                    );
+                    set_runtime_error(h, E_OUTOFMEMORY);
+                    return;
+                };
+                let Ok(resource) = texture.cast::<ID3D11Resource>() else {
+                    log_error!(
+                        "DDI create_resource(tex2d): staging mapped-buffer resource cast failed"
+                    );
+                    set_runtime_error(h, E_OUTOFMEMORY);
+                    return;
+                };
+                // The DDI resource has no single top-level WDDM allocation.
+                // Each DXVK mapped buffer owns and retires its exact standalone
+                // allocation through the existing A5 outer callbacks.
+                store_resource(
+                    h_resource,
+                    resource,
+                    None,
+                    None,
+                    None,
+                    0,
+                    h_rt.handle,
+                    AllocationOwnership::CreatedByUmd,
+                );
+                return;
+            }
+            let Some(dev) = helios_device(h) else {
+                set_runtime_error(h, E_FAIL);
+                return;
+            };
+            let preflight = match unsafe {
+                dev.dxvk
+                    .prepare_associated_texture2d((&desc as *const D3D11_TEXTURE2D_DESC) as usize)
+            } {
+                Some(preflight) => preflight,
+                None => {
+                    log_error!("DDI create_resource(tex2d): exact lower-image preflight failed");
+                    set_runtime_error(h, E_OUTOFMEMORY);
                     return;
                 }
             };
+            let lower_memory_requirement = preflight.bytes;
+            let allocation =
+                match allocate_wddm_resource(h, a, &mip0, h_rt, lower_memory_requirement) {
+                    Ok(allocation) => allocation,
+                    Err(hr) => {
+                        dev.dxvk.discard_associated_texture2d_preflight(preflight);
+                        log_error!(
+                        "DDI create_resource(tex2d): WDDM allocation/residency failed hr=0x{:08x}",
+                        hr as u32
+                    );
+                        set_runtime_error(h, hr);
+                        return;
+                    }
+                };
             if let Err(hr) = create_and_store_associated_resource(
                 h,
                 h_resource,
@@ -1159,6 +1501,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                 (&desc as *const D3D11_TEXTURE2D_DESC) as usize,
                 init_ptr.map_or(0, |ptr| ptr as usize),
                 allocation,
+                Some(preflight),
             ) {
                 set_runtime_error(h, hr);
             }
@@ -1195,7 +1538,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                 CPUAccessFlags: cpu,
                 MiscFlags: misc,
             };
-            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt) {
+            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt, 0) {
                 Ok(allocation) => allocation,
                 Err(hr) => {
                     log_error!(
@@ -1214,6 +1557,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                 (&desc as *const D3D11_TEXTURE1D_DESC) as usize,
                 init_ptr.map_or(0, |ptr| ptr as usize),
                 allocation,
+                None,
             ) {
                 set_runtime_error(h, hr);
             }
@@ -1246,7 +1590,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                 CPUAccessFlags: cpu,
                 MiscFlags: misc,
             };
-            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt) {
+            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt, 0) {
                 Ok(allocation) => allocation,
                 Err(hr) => {
                     log_error!(
@@ -1265,6 +1609,7 @@ pub(crate) unsafe extern "C" fn create_resource(
                 (&desc as *const D3D11_TEXTURE3D_DESC) as usize,
                 init_ptr.map_or(0, |ptr| ptr as usize),
                 allocation,
+                None,
             ) {
                 set_runtime_error(h, hr);
             }
@@ -1374,8 +1719,17 @@ pub(crate) unsafe extern "C" fn open_resource(
     let info2 = unsafe { a.__bindgen_anon_1.pOpenAllocationInfo2 };
     let mut allocation: ddi::D3DKMT_HANDLE = 0;
 
-    if a.NumAllocations != 0 && info2.is_null() {
-        log_error!("DDI open_resource FAILED: allocation array is null");
+    // A7 binds one exact VkDeviceMemory to one exact outer allocation. HWA2
+    // represents multiple image planes inside that allocation; it does not
+    // authorize a disjoint multi-allocation resource or a guessed primary
+    // allocation from an array.
+    if a.NumAllocations != 1 || info2.is_null() {
+        note_ddi_refusal(&DDI_REFUSALS.hwa2_open_unsupported_shape);
+        log_error!(
+            "DDI open_resource FAILED: expected one exact allocation, got {} array={:p}",
+            a.NumAllocations,
+            info2
+        );
         set_runtime_error(h, E_INVALIDARG);
         return;
     }
@@ -1476,48 +1830,138 @@ pub(crate) unsafe extern "C" fn open_resource(
         return;
     }
 
-    // ⛔⛔ K4 / `K4-CONTRACT.md` §5 — the resid gap, at the consumer end.
-    //
-    // The descriptor above is valid and carries the full geometry: extent,
-    // exact `DXGI_FORMAT`, bind/misc vocabulary, swizzle class, plane layout.
-    // What it does not carry — and may never be extended to carry — is the host
-    // resource id, the creating `vkAllocateMemory`'s size, and the Vulkan
-    // memory-type index. `dxvk.open_texture2d` needs all three: they are how
-    // the guest names the host object it is importing
-    // (`VkImportMemoryResourceInfoMESA::resourceId`).
-    //
-    // §5 is explicit that re-pointing this reader at HWA2 is NOT a substitution
-    // and must not be planned as one. The replacement is a different MECHANISM:
-    // the ICD stops naming host resources at all and the KMD patches the resid
-    // in from `HeliosNativeRenderPatch` — **mesa lane unit A3**, plus K6. Until
-    // that lands, an ICD in this state CANNOT IMPORT, and §5 requires that to
-    // be recorded as the retirement's intended intermediate state rather than a
-    // regression.
-    //
-    // Refuse. Do not fall back, do not fabricate a 1x1 alias, do not reconstruct
-    // an identity from the allocation handle: an alias that is UNDERSIZE
-    // relative to the true allocation defeats even the oversize guard that
-    // caught the 38th-session import regression.
-    note_ddi_refusal(&DDI_REFUSALS.hwa2_open_needs_mesa_a3);
-    log_error!(
-        "DDI open_resource REFUSED: HWA2 carries no host resource id, venus allocation size \
-         or memory-type index, and the D3D11 import needs all three (hKM={:?} alloc=0x{:x} \
-         alloc_gen=0x{:x} {}x{} dxgi={} bind=0x{:x} misc=0x{:x} swizzle={} planes={}) -> \
-         blocked on mesa unit A3 (+K6): the ICD stops naming host resources and the KMD \
-         patches the resid in from HeliosNativeRenderPatch. An ICD in this state cannot \
-         import; this is the retirement's intended intermediate state, not a regression.",
-        a.hKMResource,
+    let Some(dev) = helios_device(h) else {
+        log_error!("DDI open_resource FAILED: no Helios device");
+        set_runtime_error(h, E_FAIL);
+        return;
+    };
+    let Some(open_desc) = opened_texture2d_desc(&descriptor) else {
+        note_ddi_refusal(&DDI_REFUSALS.hwa2_open_unsupported_shape);
+        log_error!(
+            "DDI open_resource REFUSED: valid HWA2 kind {} is not a D3D11 shared image",
+            descriptor.allocation_kind
+        );
+        set_runtime_error(h, E_FAIL);
+        return;
+    };
+
+    // The lower image object is created once and retained across the WDDM
+    // residency/token edge. This is the same exact-object preflight used by
+    // CreateResource; recreating it after the callback reintroduces the
+    // VkImage lifetime/object-number race seen during cold admission.
+    let Some(preflight) = dev
+        .dxvk
+        .prepare_associated_texture2d((&open_desc as *const D3D11_TEXTURE2D_DESC) as usize)
+    else {
+        log_error!("DDI open_resource FAILED: exact lower-image preflight failed");
+        set_runtime_error(h, E_OUTOFMEMORY);
+        return;
+    };
+    let lower_memory_requirement = preflight.bytes;
+    if lower_memory_requirement > descriptor.byte_size {
+        dev.dxvk.discard_associated_texture2d_preflight(preflight);
+        note_ddi_refusal(&DDI_REFUSALS.hwa2_open_unsupported_shape);
+        log_error!(
+            "DDI open_resource REFUSED: lower image needs {} bytes but HWA2 owns {} bytes \
+             (alloc=0x{:x} generation={})",
+            lower_memory_requirement,
+            descriptor.byte_size,
+            allocation,
+            descriptor.allocation_generation
+        );
+        set_runtime_error(h, E_FAIL);
+        return;
+    }
+
+    let resident = match make_resident(&dev.outer, allocation) {
+        Ok(resident) => resident,
+        Err(hr) => {
+            dev.dxvk.discard_associated_texture2d_preflight(preflight);
+            log_error!(
+                "DDI open_resource FAILED: MakeResident alloc=0x{:x} hr=0x{:08x}",
+                allocation,
+                hr as u32
+            );
+            set_runtime_error(h, hr);
+            return;
+        }
+    };
+    let (identity, association) = match assign_outer_allocation(
+        &dev.outer,
         allocation,
         descriptor.allocation_generation,
-        descriptor.width,
-        descriptor.height,
-        descriptor.dxgi_format,
-        descriptor.bind_flags,
-        descriptor.misc_flags,
-        descriptor.swizzle_class,
-        descriptor.plane_count
+        descriptor.byte_size,
+        core::ptr::null_mut(),
+    ) {
+        Ok(assigned) => assigned,
+        Err(refusal) => {
+            dev.dxvk.discard_associated_texture2d_preflight(preflight);
+            drop(resident);
+            log_error!(
+                "DDI open_resource REFUSED: outer association {:?} alloc=0x{:x} \
+                 generation={} bytes={}",
+                refusal,
+                allocation,
+                descriptor.allocation_generation,
+                descriptor.byte_size
+            );
+            set_runtime_error(h, E_OUTOFMEMORY);
+            return;
+        }
+    };
+    let opened = OpenedWddmAllocation {
+        resident: Some(resident),
+        km_resource: a.hKMResource.handle,
+        identity,
+        association,
+    };
+    let token = opened.association.outer_allocation_token;
+    let Some(resource) = dev.dxvk.create_associated_resource(
+        2,
+        (&open_desc as *const D3D11_TEXTURE2D_DESC) as usize,
+        0,
+        &opened.association,
+        Some(preflight),
+    ) else {
+        opened.rollback(dev);
+        log_error!(
+            "DDI open_resource REFUSED: associated image construction failed token={} \
+             alloc=0x{:x}",
+            token,
+            allocation
+        );
+        set_runtime_error(h, E_OUTOFMEMORY);
+        return;
+    };
+
+    let raw = resource.as_raw() as usize;
+    let (resident, km_resource, outer_allocation) = opened.into_state();
+    store_resource(
+        h_resource,
+        resource,
+        resident,
+        outer_allocation,
+        None,
+        km_resource,
+        h_rt.handle,
+        AllocationOwnership::OpenedByRuntime,
     );
-    set_runtime_error(h, E_FAIL);
+    log_error!(
+        "DDI open_resource HRA1 ok: {}x{} array={} mips={} dxgi={} bind=0x{:x} \
+         misc=0x{:x} alloc=0x{:x} hKM=0x{:x} token={} lower_bytes={} raw=0x{:x}",
+        open_desc.Width,
+        open_desc.Height,
+        open_desc.ArraySize,
+        open_desc.MipLevels,
+        open_desc.Format.0,
+        open_desc.BindFlags,
+        open_desc.MiscFlags,
+        allocation,
+        km_resource,
+        token,
+        lower_memory_requirement,
+        raw
+    );
 }
 
 pub(crate) unsafe extern "C" fn calc_size_opened_resource(
