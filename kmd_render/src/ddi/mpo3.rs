@@ -118,6 +118,16 @@ fn mirror_retries_passive() {
     }
 }
 
+/// A refused MmIo flip must still return SUCCESS: dxgmms2 bugchecks
+/// 0x119/0xb on ANY failing SetVidPnSourceMPO command (five identical dumps,
+/// 22.22.352.0, uptime ~10 s each). The plane keeps its previous binding, the
+/// flip retires at the next MPO3 vsync, and `MpoSetRef`'s top byte names the
+/// refused predicate — the loud channel the return code is not allowed to be.
+fn park_set_refusal(code: u32) -> NTSTATUS {
+    record_passive(&SET_REFUSALS, b"MpoSetRef", code);
+    STATUS_SUCCESS
+}
+
 fn adapter_from_handle<'a>(h_adapter: IN_CONST_HANDLE) -> Option<&'a AdapterContext> {
     if h_adapter.is_null() || !(h_adapter as *const AdapterContext).is_aligned() {
         return None;
@@ -266,6 +276,8 @@ pub unsafe extern "C" fn dxgkddi_check_multi_plane_overlay_support3(
 
 /// DIRQL-to-PASSIVE split. Above PASSIVE this touches only the writable output
 /// flag and atomics; the retry owns all pointer walks and plane transitions.
+/// Once at PASSIVE, every refusal parks via [`park_set_refusal`] — a failing
+/// return here is bugcheck 0x119/0xb, not an error path.
 pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_with_multi_plane_overlay3(
     h_adapter: IN_CONST_HANDLE,
     p_set: IN_OUT_PDXGKARG_SETVIDPNSOURCEADDRESSWITHMULTIPLANEOVERLAY3,
@@ -288,13 +300,11 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_with_multi_plane_overl
 
     mirror_retries_passive();
     let Some(adapter) = adapter_from_handle(h_adapter) else {
-        record_passive(&SET_REFUSALS, b"MpoSetRef", 1);
-        return STATUS_INVALID_PARAMETER;
+        return park_set_refusal(1);
     };
     let global_flags = unsafe { args.InputFlags.__bindgen_anon_1.Value };
     if args.VidPnSourceId != SOURCE_ID || global_flags & !INPUT_KNOWN_MASK != 0 {
-        record_passive(&SET_REFUSALS, b"MpoSetRef", 2);
-        return STATUS_INVALID_PARAMETER;
+        return park_set_refusal(2);
     }
     // SAFETY: this is the OS-documented PASSIVE retry, verified above with
     // KeGetCurrentIrql before minting the proof token.
@@ -306,10 +316,14 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_with_multi_plane_overl
             || !args.pHDRMetaData.is_null()
             || args.TargetFlipTime != 0
         {
+            // Count the unhandled extras but disable the plane anyway: skipping
+            // the unbind would keep scanning out a surface the OS may now free.
             record_passive(&SET_REFUSALS, b"MpoSetRef", 3);
-            return STATUS_INVALID_PARAMETER;
         }
-        return explicit_unbind(passive, adapter);
+        if explicit_unbind(passive, adapter) != STATUS_SUCCESS {
+            return park_set_refusal(11);
+        }
+        return STATUS_SUCCESS;
     }
     if args.PlaneCount != 1
         || !args.pPostComposition.is_null()
@@ -317,12 +331,10 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_with_multi_plane_overl
         || !args.pHDRMetaData.is_null()
         || args.TargetFlipTime != 0
     {
-        record_passive(&SET_REFUSALS, b"MpoSetRef", 4);
-        return STATUS_INVALID_PARAMETER;
+        return park_set_refusal(4);
     }
     let Some(plane_ptr) = (unsafe { first_mut_ptr(args.ppPlanes) }) else {
-        record_passive(&SET_REFUSALS, b"MpoSetRef", 5);
-        return STATUS_INVALID_PARAMETER;
+        return park_set_refusal(5);
     };
     let plane = unsafe { &mut *plane_ptr };
     plane.OutputFlags = Default::default();
@@ -332,12 +344,10 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_with_multi_plane_overl
         || !plane.pDriverPrivateData.is_null()
         || plane.MaxImmediateFlipLine != 0
     {
-        record_passive(&SET_REFUSALS, b"MpoSetRef", 6);
-        return STATUS_INVALID_PARAMETER;
+        return park_set_refusal(6);
     }
     let Some(context_ptr) = (unsafe { first_mut_ptr(plane.ppContextData) }) else {
-        record_passive(&SET_REFUSALS, b"MpoSetRef", 7);
-        return STATUS_INVALID_PARAMETER;
+        return park_set_refusal(7);
     };
     let context = unsafe { &*context_ptr };
     let context_adapter =
@@ -347,8 +357,7 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_with_multi_plane_overl
         || gpuva == 0
         || context_adapter.is_none_or(|owner| !core::ptr::eq(owner, adapter))
     {
-        record_passive(&SET_REFUSALS, b"MpoSetRef", 8);
-        return STATUS_INVALID_PARAMETER;
+        return park_set_refusal(8);
     }
     let extra = u32::from(plane_flags & PLANE_ENABLED == 0)
         | (u32::from(plane_flags & PLANE_FLIP_ON_NEXT_VSYNC == 0) << 1);
@@ -377,15 +386,12 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_with_multi_plane_overl
         )
     } {
         Ok(candidate) => candidate,
-        Err(status) => {
-            record_passive(&SET_REFUSALS, b"MpoSetRef", 9);
-            return status;
-        }
+        // D2AdmRef/D2AdmSL carry the validator's refusal variant.
+        Err(_) => return park_set_refusal(9),
     };
     let status = retain_candidate(adapter, candidate);
     if status != STATUS_SUCCESS {
-        record_passive(&SET_REFUSALS, b"MpoSetRef", 10);
-        return status;
+        return park_set_refusal(10);
     }
     LAST_PRESENT_ID.store(plane.PresentId, Ordering::Release);
     let accepted = SET_ACCEPTS.fetch_add(1, Ordering::Relaxed) + 1;
