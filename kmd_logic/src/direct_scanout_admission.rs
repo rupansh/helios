@@ -231,6 +231,79 @@ pub enum Refusal {
     MpoHdrMetadata,
 }
 
+/// The refusal's diagnostic code and its most informative scalar.
+///
+/// `code` is the variant's 1-based declaration index + 63, which reproduces the
+/// fourteen codes already published in `D2AdmWhy` (0x45 `SourceInvisible` ..
+/// 0x6A `AllocationSourceMismatch`) and extends the scheme to every arm. The
+/// range is 0x40..=0x7B, so it stays clear of the 0x7F "unnamed" bucket this
+/// replaces -- a bucket that hid 32 real refusals on 22.22.341.0.
+pub fn refusal_code_and_detail(refusal: Refusal) -> (u32, u32) {
+    use Refusal as R;
+    match refusal {
+        R::InvalidFinalHwa2(..) => (0x40, 0),
+        R::CommittedModeGenerationZero => (0x41, 0),
+        R::CurrentModeGenerationZero => (0x42, 0),
+        R::StaleCommittedModeGeneration { current, .. } => (0x43, current as u32),
+        R::CommittedModeInactive => (0x44, 0),
+        R::SourceInvisible => (0x45, 0),
+        R::SourcePoweredOff => (0x46, 0),
+        R::OsSourceUninitialized => (0x47, 0),
+        R::CommittedSourceUninitialized => (0x48, 0),
+        R::CommittedTargetUninitialized => (0x49, 0),
+        R::CommittedSourceMismatch { os, .. } => (0x4A, os),
+        R::AdapterDifferentOrUnknown => (0x4B, 0),
+        R::ImmediateFlipRequested => (0x4C, 0),
+        R::StereoOperationRequested => (0x4D, 0),
+        R::UnsupportedOrReservedOperationFlags { found, .. } => (0x4E, found),
+        R::AllocationKindNotImageOrStandardPrimary { found, .. } => (0x4F, found),
+        R::OrdinaryImageHasStandardSemantics { flags, .. } => (0x50, flags),
+        R::StandardPrimarySemanticsMismatch { flags, .. } => (0x51, flags),
+        R::PrimaryFlagMissing => (0x52, 0),
+        R::DisplayableFlagMissing => (0x53, 0),
+        R::DirectFlipCompatibleFlagMissing => (0x54, 0),
+        R::StereoAllocation => (0x55, 0),
+        R::ProtectedAllocation => (0x56, 0),
+        R::CrossAdapterAllocation => (0x57, 0),
+        R::FormatNotBgra8 { found, .. } => (0x58, found),
+        R::D3dDdiFormatNotA8R8G8B8 { found, .. } => (0x59, found),
+        R::CommittedSourceExtentZero => (0x5A, 0),
+        R::CommittedTargetExtentZero => (0x5B, 0),
+        R::CommittedSourceTargetExtentMismatch { source_height, source_width, .. } => (0x5C, ((source_width & 0xffff) << 16) | (source_height & 0xffff)),
+        R::AllocationSourceExtentMismatch { allocation_height, allocation_width, .. } => (0x5D, ((allocation_width & 0xffff) << 16) | (allocation_height & 0xffff)),
+        R::DepthOrArraySizeNotOne { found, .. } => (0x5E, found),
+        R::MipLevelsNotOne { found, .. } => (0x5F, found),
+        R::SampleCountNotOne { found, .. } => (0x60, found),
+        R::SampleQualityNotZero { found, .. } => (0x61, found),
+        R::AllocationPlaneCountNotOne { found, .. } => (0x62, found),
+        R::PlaneRowPitchTooSmall { found, .. } => (0x63, found),
+        R::PlaneRowPitchNotPixelAligned { found, .. } => (0x64, found),
+        R::PlaneFullFrameArithmeticOverflow { row_pitch, .. } => (0x65, row_pitch),
+        R::PlaneFullFrameRangeExceedsBacking { end, .. } => (0x66, end as u32),
+        R::PlaneSlicePitchTooSmall { found, .. } => (0x67, found),
+        R::PlaneOffsetExceedsSetScanoutBlob { found, .. } => (0x68, found as u32),
+        R::UnsupportedSwizzleClass { found, .. } => (0x69, found),
+        R::AllocationSourceMismatch { allocation, .. } => (0x6A, allocation),
+        R::MpoPlaneCountNotOne { found, .. } => (0x6B, found),
+        R::MpoLayerNotZero { found, .. } => (0x6C, found),
+        R::MpoUnsupportedOrReservedAttributesOrFeatures { found, .. } => (0x6D, found as u32),
+        R::MpoSetEnabledInputFlagMissing => (0x6E, 0),
+        R::MpoContextCountNotOne { found, .. } => (0x6F, found),
+        R::MpoContextRecordMissing => (0x70, 0),
+        R::MpoSourceRectNotFullOutput => (0x71, 0),
+        R::MpoDestinationRectNotFullOutput => (0x72, 0),
+        R::MpoClipRectNotFullOutput => (0x73, 0),
+        R::MpoRotationNotIdentity => (0x74, 0),
+        R::MpoVerticalFlip => (0x75, 0),
+        R::MpoHorizontalFlip => (0x76, 0),
+        R::MpoAlphaBlend => (0x77, 0),
+        R::MpoColorSpaceNotSdrRgb => (0x78, 0),
+        R::MpoScaling => (0x79, 0),
+        R::MpoPostComposition => (0x7A, 0),
+        R::MpoHdrMetadata => (0x7B, 0),
+    }
+}
+
 pub fn validate_direct_scanout_binding(
     allocation: &HeliosWddmAllocationDescV2,
     mode: &CommittedMode,
@@ -1101,5 +1174,150 @@ mod tests {
 
         assert_eq!(MUTATION_CASES.len(), REFUSAL_COUNT);
         assert!(seen.into_iter().all(|present| present));
+    }
+}
+
+#[cfg(test)]
+mod refusal_code_tests {
+    use super::Refusal as R;
+    use super::*;
+
+    /// Every `Refusal`, so the uniqueness check below cannot silently skip one.
+    /// A new variant fails to compile in `refusal_code_and_detail` (the match is
+    /// exhaustive) and fails the count assert here.
+    const ALL: &[Refusal] = &[
+        R::InvalidFinalHwa2(HeliosAllocDescRejection::ByteSizeZero),
+        R::CommittedModeGenerationZero,
+        R::CurrentModeGenerationZero,
+        R::StaleCommittedModeGeneration { committed: 0, current: 0 },
+        R::CommittedModeInactive,
+        R::SourceInvisible,
+        R::SourcePoweredOff,
+        R::OsSourceUninitialized,
+        R::CommittedSourceUninitialized,
+        R::CommittedTargetUninitialized,
+        R::CommittedSourceMismatch { committed: 0, os: 0 },
+        R::AdapterDifferentOrUnknown,
+        R::ImmediateFlipRequested,
+        R::StereoOperationRequested,
+        R::UnsupportedOrReservedOperationFlags { found: 0 },
+        R::AllocationKindNotImageOrStandardPrimary { found: 0 },
+        R::OrdinaryImageHasStandardSemantics { flags: 0, standard_allocation_type: 0 },
+        R::StandardPrimarySemanticsMismatch { flags: 0, standard_allocation_type: 0 },
+        R::PrimaryFlagMissing,
+        R::DisplayableFlagMissing,
+        R::DirectFlipCompatibleFlagMissing,
+        R::StereoAllocation,
+        R::ProtectedAllocation,
+        R::CrossAdapterAllocation,
+        R::FormatNotBgra8 { found: 0 },
+        R::D3dDdiFormatNotA8R8G8B8 { found: 0 },
+        R::CommittedSourceExtentZero,
+        R::CommittedTargetExtentZero,
+        R::CommittedSourceTargetExtentMismatch { source_width: 0, source_height: 0, target_width: 0, target_height: 0 },
+        R::AllocationSourceExtentMismatch { allocation_width: 0, allocation_height: 0, source_width: 0, source_height: 0 },
+        R::DepthOrArraySizeNotOne { found: 0 },
+        R::MipLevelsNotOne { found: 0 },
+        R::SampleCountNotOne { found: 0 },
+        R::SampleQualityNotZero { found: 0 },
+        R::AllocationPlaneCountNotOne { found: 0 },
+        R::PlaneRowPitchTooSmall { found: 0, minimum: 0 },
+        R::PlaneRowPitchNotPixelAligned { found: 0 },
+        R::PlaneFullFrameArithmeticOverflow { offset: 0, row_pitch: 0, height: 0, minimum_row_pitch: 0 },
+        R::PlaneFullFrameRangeExceedsBacking { end: 0, byte_size: 0 },
+        R::PlaneSlicePitchTooSmall { found: 0, minimum: 0 },
+        R::PlaneOffsetExceedsSetScanoutBlob { found: 0 },
+        R::UnsupportedSwizzleClass { found: 0 },
+        R::AllocationSourceMismatch { allocation: 0, os: 0 },
+        R::MpoPlaneCountNotOne { found: 0 },
+        R::MpoLayerNotZero { found: 0 },
+        R::MpoUnsupportedOrReservedAttributesOrFeatures { found: 0 },
+        R::MpoSetEnabledInputFlagMissing,
+        R::MpoContextCountNotOne { found: 0 },
+        R::MpoContextRecordMissing,
+        R::MpoSourceRectNotFullOutput,
+        R::MpoDestinationRectNotFullOutput,
+        R::MpoClipRectNotFullOutput,
+        R::MpoRotationNotIdentity,
+        R::MpoVerticalFlip,
+        R::MpoHorizontalFlip,
+        R::MpoAlphaBlend,
+        R::MpoColorSpaceNotSdrRgb,
+        R::MpoScaling,
+        R::MpoPostComposition,
+        R::MpoHdrMetadata,
+    ];
+
+    #[test]
+    fn every_refusal_has_a_distinct_code_in_range() {
+        assert_eq!(ALL.len(), 60, "add the new Refusal to ALL");
+        let mut seen = [false; 256];
+        for refusal in ALL {
+            let (code, _) = refusal_code_and_detail(*refusal);
+            assert!(
+                (0x40..=0x7b).contains(&code),
+                "code {code:#x} outside 0x40..=0x7B for {refusal:?}"
+            );
+            assert!(!seen[code as usize], "duplicate code {code:#x} at {refusal:?}");
+            seen[code as usize] = true;
+        }
+    }
+
+    /// 0x7F was the catch-all these codes replace; nothing may collide with it.
+    #[test]
+    fn no_code_collides_with_the_retired_catch_all() {
+        for refusal in ALL {
+            assert_ne!(refusal_code_and_detail(*refusal).0, 0x7f);
+        }
+    }
+
+    /// The fourteen codes already published in `D2AdmWhy` keep their values, so
+    /// counter values recorded before this change still decode.
+    #[test]
+    fn published_codes_are_unchanged() {
+        use Refusal as R;
+        for (refusal, code) in [
+            (R::SourceInvisible, 0x45),
+            (R::SourcePoweredOff, 0x46),
+            (R::CommittedSourceMismatch { committed: 0, os: 0 }, 0x4a),
+            (R::UnsupportedOrReservedOperationFlags { found: 0 }, 0x4e),
+            (
+                R::StandardPrimarySemanticsMismatch { flags: 0, standard_allocation_type: 0 },
+                0x51,
+            ),
+            (R::DirectFlipCompatibleFlagMissing, 0x54),
+            (R::FormatNotBgra8 { found: 0 }, 0x58),
+            (R::D3dDdiFormatNotA8R8G8B8 { found: 0 }, 0x59),
+            (
+                R::AllocationSourceExtentMismatch {
+                    allocation_width: 0,
+                    allocation_height: 0,
+                    source_width: 0,
+                    source_height: 0,
+                },
+                0x5d,
+            ),
+            (R::PlaneRowPitchTooSmall { found: 0, minimum: 0 }, 0x63),
+            (R::PlaneFullFrameRangeExceedsBacking { end: 0, byte_size: 0 }, 0x66),
+            (R::PlaneSlicePitchTooSmall { found: 0, minimum: 0 }, 0x67),
+            (R::UnsupportedSwizzleClass { found: 0 }, 0x69),
+            (R::AllocationSourceMismatch { allocation: 0, os: 0 }, 0x6a),
+        ] {
+            assert_eq!(refusal_code_and_detail(refusal).0, code, "{refusal:?}");
+        }
+    }
+
+    #[test]
+    fn detail_carries_the_diagnostic_scalar() {
+        let (code, detail) =
+            refusal_code_and_detail(Refusal::AllocationKindNotImageOrStandardPrimary { found: 9 });
+        assert_eq!((code, detail), (0x4f, 9));
+        let (_, detail) = refusal_code_and_detail(Refusal::AllocationSourceExtentMismatch {
+            allocation_width: 1280,
+            allocation_height: 896,
+            source_width: 1280,
+            source_height: 800,
+        });
+        assert_eq!(detail, (1280 << 16) | 896);
     }
 }

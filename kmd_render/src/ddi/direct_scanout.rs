@@ -13,7 +13,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use helios_kmd_logic::committed_mode::PowerSubject;
 use helios_kmd_logic::control_ownership::HostRejection;
 use helios_kmd_logic::direct_scanout_admission::{
-    validate_direct_scanout_binding as validate_binding_model, OperationFacts, PlaneFacts,
+    refusal_code_and_detail, validate_direct_scanout_binding as validate_binding_model,
+    OperationFacts, PlaneFacts,
 };
 use helios_kmd_logic::direct_scanout_lifetime::{
     BackendBinding, Binding, CompletionKey, DrainReason, Effect, Event, Lifecycle, PendingPhase,
@@ -67,6 +68,11 @@ static ADMISSION_REFUSALS: RefusalCounter = RefusalCounter::new();
 static MAILBOX_REFUSALS: RefusalCounter = RefusalCounter::new();
 static PLANE_REFUSALS: RefusalCounter = RefusalCounter::new();
 static RESET_REFUSALS: RefusalCounter = RefusalCounter::new();
+// The admission refusal codes seen this boot, as a bitset over `code - 0x40`,
+// plus the last refusal's diagnostic scalar. See `refusal_code_and_detail`.
+static ADMISSION_REASON_SET_LO: AtomicU32 = AtomicU32::new(0);
+static ADMISSION_REASON_SET_HI: AtomicU32 = AtomicU32::new(0);
+static ADMISSION_REFUSAL_DETAIL: AtomicU32 = AtomicU32::new(0);
 // Last 0xf0 completion refusal's raw facts — see complete_queued.
 static COMPLETION_RESPONSE_TYPE: AtomicU32 = AtomicU32::new(0);
 static COMPLETION_RESPONSE_FLAGS: AtomicU32 = AtomicU32::new(0);
@@ -117,6 +123,18 @@ pub(crate) fn record_refusal_counters() {
         crate::diag::record_named_bytes(name, counter.count.load(Ordering::Relaxed));
         crate::diag::record_named_bytes(reason_name, counter.last_reason.load(Ordering::Relaxed));
     }
+    crate::diag::record_named_bytes(
+        b"D2AdmSL",
+        ADMISSION_REASON_SET_LO.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"D2AdmSH",
+        ADMISSION_REASON_SET_HI.load(Ordering::Relaxed),
+    );
+    crate::diag::record_named_bytes(
+        b"D2AdmDat",
+        ADMISSION_REFUSAL_DETAIL.load(Ordering::Relaxed),
+    );
     crate::diag::record_named_bytes(
         b"D2CmpTyp",
         COMPLETION_RESPONSE_TYPE.load(Ordering::Relaxed),
@@ -528,29 +546,22 @@ pub(crate) unsafe fn validate_direct_scanout_binding(
         unsupported_or_reserved_flags: operation.unsupported_or_reserved_flags,
     };
     let verdict = validate_binding_model(&final_hwa2, &mode, os_source, &operation, &plane);
-    if verdict.is_err() {
-        // 0x4X/0x5X/0x6X name the refusal arm (a literal match — this function
-        // is on D4's pinned DIRQL call surface, so no helper call); 0x7F is
-        // every arm not yet worth its own code.
-        use helios_kmd_logic::direct_scanout_admission::Refusal as R;
-        let code = match verdict {
-            Err(R::SourceInvisible) => 0x45,
-            Err(R::SourcePoweredOff) => 0x46,
-            Err(R::CommittedSourceMismatch { .. }) => 0x4A,
-            Err(R::UnsupportedOrReservedOperationFlags { .. }) => 0x4E,
-            Err(R::StandardPrimarySemanticsMismatch { .. }) => 0x51,
-            Err(R::DirectFlipCompatibleFlagMissing) => 0x54,
-            Err(R::FormatNotBgra8 { .. }) => 0x58,
-            Err(R::D3dDdiFormatNotA8R8G8B8 { .. }) => 0x59,
-            Err(R::AllocationSourceExtentMismatch { .. }) => 0x5D,
-            Err(R::PlaneRowPitchTooSmall { .. }) => 0x63,
-            Err(R::PlaneFullFrameRangeExceedsBacking { .. }) => 0x66,
-            Err(R::PlaneSlicePitchTooSmall { .. }) => 0x67,
-            Err(R::UnsupportedSwizzleClass { .. }) => 0x69,
-            Err(R::AllocationSourceMismatch { .. }) => 0x6A,
-            _ => 0x7F,
-        };
+    if let Err(refusal) = verdict {
+        // Every arm now carries its own code. The `_ => 0x7F` bucket this
+        // replaces swallowed 32 of the 34 DMA-flip admissions on 22.22.341.0
+        // and named none of them, which is the whole black-desktop question.
+        let (code, detail) = refusal_code_and_detail(refusal);
         record_refusal(&ADMISSION_REFUSALS, b"D2AdmRef", code);
+        // Codes are 0x40..=0x7B, so the SET of reasons seen fits in two words.
+        // `D2AdmWhy` is last-value and cannot tell one repeated refusal from a
+        // mixture; these two can.
+        let bit = code - 0x40;
+        if bit < 32 {
+            ADMISSION_REASON_SET_LO.fetch_or(1u32 << bit, Ordering::Relaxed);
+        } else {
+            ADMISSION_REASON_SET_HI.fetch_or(1u32 << (bit - 32), Ordering::Relaxed);
+        }
+        ADMISSION_REFUSAL_DETAIL.store(detail, Ordering::Relaxed);
         return Err(STATUS_INVALID_PARAMETER);
     }
     let plane0 = final_hwa2.planes[0];

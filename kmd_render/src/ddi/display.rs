@@ -701,6 +701,14 @@ const _: () = assert!(CLASSIC_SUPPORTED_FLAG_MASK == 0x0000_00ff);
 
 static D4_CLASSIC_ACCEPTS: AtomicU32 = AtomicU32::new(0);
 static D4_CLASSIC_REFUSALS: AtomicU32 = AtomicU32::new(0);
+// The same two totals split by CALL SURFACE. `SetVidPnSourceAddress` and the
+// DMA-buffer flip contract share the admission validator, so a single pair
+// cannot say which one dxgkrnl is actually using -- and on 22.22.341.0 an ETW
+// slice showed zero `DdiSetVidPnSourceAddress` while the pair read 2/32.
+static D4_ADDRESS_ACCEPTS: AtomicU32 = AtomicU32::new(0);
+static D4_ADDRESS_REFUSALS: AtomicU32 = AtomicU32::new(0);
+static D4_DMA_FLIP_ACCEPTS: AtomicU32 = AtomicU32::new(0);
+static D4_DMA_FLIP_REFUSALS: AtomicU32 = AtomicU32::new(0);
 
 fn d4_queue_status(error: crate::virtio::VirtioError) -> NTSTATUS {
     match error {
@@ -723,6 +731,7 @@ unsafe fn set_vidpn_source_address_d4(
     }
     if address.is_null() || !(address as *const DXGKARG_SETVIDPNSOURCEADDRESS).is_aligned() {
         D4_CLASSIC_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        D4_ADDRESS_REFUSALS.fetch_add(1, Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
     }
     let args = unsafe { &*address };
@@ -747,6 +756,7 @@ unsafe fn set_vidpn_source_address_d4(
         Ok(candidate) => candidate,
         Err(status) => {
             D4_CLASSIC_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            D4_ADDRESS_REFUSALS.fetch_add(1, Ordering::Relaxed);
             return status;
         }
     };
@@ -768,10 +778,12 @@ unsafe fn set_vidpn_source_address_d4(
     match queued {
         Ok(()) => {
             D4_CLASSIC_ACCEPTS.fetch_add(1, Ordering::Relaxed);
+            D4_ADDRESS_ACCEPTS.fetch_add(1, Ordering::Relaxed);
             STATUS_SUCCESS
         }
         Err(error) => {
             D4_CLASSIC_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            D4_ADDRESS_REFUSALS.fetch_add(1, Ordering::Relaxed);
             d4_queue_status(error)
         }
     }
@@ -831,6 +843,7 @@ unsafe fn arm_dma_flip_d4(
         crate::ddi::create_allocation::open_direct_scanout_allocation_facts(h_open_allocation)
     }) else {
         D4_CLASSIC_REFUSALS.fetch_add(1, Ordering::Relaxed);
+        D4_DMA_FLIP_REFUSALS.fetch_add(1, Ordering::Relaxed);
         return false;
     };
     let operation = crate::ddi::direct_scanout::DirectScanoutOperation {
@@ -853,6 +866,7 @@ unsafe fn arm_dma_flip_d4(
         Ok(candidate) => candidate,
         Err(_) => {
             D4_CLASSIC_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            D4_DMA_FLIP_REFUSALS.fetch_add(1, Ordering::Relaxed);
             return false;
         }
     };
@@ -866,10 +880,12 @@ unsafe fn arm_dma_flip_d4(
     match adapter.enqueue_d4_scanout_dispatch(work) {
         Ok(()) => {
             D4_CLASSIC_ACCEPTS.fetch_add(1, Ordering::Relaxed);
+            D4_DMA_FLIP_ACCEPTS.fetch_add(1, Ordering::Relaxed);
             true
         }
         Err(_) => {
             D4_CLASSIC_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            D4_DMA_FLIP_REFUSALS.fetch_add(1, Ordering::Relaxed);
             false
         }
     }
@@ -878,6 +894,10 @@ unsafe fn arm_dma_flip_d4(
 pub(crate) fn record_scanout_reject_counters() {
     crate::diag::record_named_bytes(b"D4ClsOk", D4_CLASSIC_ACCEPTS.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"D4ClsRef", D4_CLASSIC_REFUSALS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D4AdrOk", D4_ADDRESS_ACCEPTS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D4AdrRef", D4_ADDRESS_REFUSALS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D4DmaOk", D4_DMA_FLIP_ACCEPTS.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D4DmaRef", D4_DMA_FLIP_REFUSALS.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(
         b"CtlInt",
         crate::ddi::interrupt::CONTROL_INT_COUNT.load(Ordering::Relaxed),
@@ -888,6 +908,10 @@ pub(crate) fn record_scanout_reject_counters() {
 pub(crate) fn reset_scanout_reject_counters() {
     D4_CLASSIC_ACCEPTS.store(0, Ordering::Relaxed);
     D4_CLASSIC_REFUSALS.store(0, Ordering::Relaxed);
+    D4_ADDRESS_ACCEPTS.store(0, Ordering::Relaxed);
+    D4_ADDRESS_REFUSALS.store(0, Ordering::Relaxed);
+    D4_DMA_FLIP_ACCEPTS.store(0, Ordering::Relaxed);
+    D4_DMA_FLIP_REFUSALS.store(0, Ordering::Relaxed);
     crate::ddi::direct_scanout::reset_refusal_counters();
     record_scanout_reject_counters();
 }

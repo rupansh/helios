@@ -259,14 +259,18 @@ DIRQL_CALL_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
             "Present",
             "active_transport_instance",
             "direct_scanout_allocation_facts",
-            "is_err",
+            "fetch_or",
             "mode",
             "new",
             "read",
             "record_refusal",
+            "refusal_code_and_detail",
+            "store",
             "validate_binding_model",
         }
     ),
+    # Pure arithmetic over a Copy enum: no allocation, no lock, no callback.
+    (LOGIC_ADMISSION, "refusal_code_and_detail"): frozenset({"InvalidFinalHwa2"}),
     (DIRECT, "record_refusal"): frozenset({"fetch_add", "store"}),
     (DIRECT, "active_transport_instance"): frozenset({"load"}),
     (DIRECT, "from_exact_os_transition"): frozenset(),
@@ -558,6 +562,8 @@ DIRQL_QUALIFIED_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
         {"PlaneFacts::MpoCheck", "PlaneFacts::MpoSet", "u64::from"}
     ),
     (LOGIC_ADMISSION, "validate_mpo_plane"): frozenset({"PlaneRect::full_output"}),
+    # A tuple-variant match pattern, not a call.
+    (LOGIC_ADMISSION, "refusal_code_and_detail"): frozenset({"R::InvalidFinalHwa2"}),
 }
 
 DIRQL_MACRO_MANIFEST: dict[tuple[str, str], frozenset[str]] = {
@@ -953,6 +959,7 @@ def check_sources(sources: dict[str, str]) -> list[str]:
         (HAL, "span"),
         (HAL, "share"),
         (CTRL, "fill_set_scanout_blob"),
+        (LOGIC_ADMISSION, "refusal_code_and_detail"),
         (LOGIC_ADMISSION, "validate_direct_scanout_binding"),
         (LOGIC_ADMISSION, "validate_mpo_set"),
         (LOGIC_ADMISSION, "validate_mpo_plane"),
