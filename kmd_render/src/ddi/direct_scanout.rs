@@ -1681,13 +1681,30 @@ pub(crate) fn transition_visibility(
         return STATUS_SUCCESS;
     }
     adapter.with_scanout_lifecycle(passive, |_guard| {
-        if !visible && !unbind_locked(passive, adapter, DrainReason::SourceInvisible, true) {
-            return STATUS_DEVICE_NOT_READY;
+        if !visible {
+            // A source going INVISIBLE is not negotiable. dxgkrnl is removing it
+            // from the desktop; an error here makes it roll the whole path back,
+            // and it does not retry forever -- S-ring 2026-08-23 caught nine
+            // Visible=FALSE calls answered 0x132B00A3 (DEVICE_NOT_READY) and
+            // then no active path at all, i.e. the desktop was gone. Record
+            // what failed, never refuse it.
+            if !unbind_locked(passive, adapter, DrainReason::SourceInvisible, true) {
+                record_refusal(&PLANE_REFUSALS, b"D2PlnRef", 0xf2);
+            }
+            if mode_write_status(
+                adapter
+                    .committed_mode
+                    .transition_visibility(passive, source_id, false),
+            ) != STATUS_SUCCESS
+            {
+                record_refusal(&PLANE_REFUSALS, b"D2PlnRef", 0xf3);
+            }
+            return STATUS_SUCCESS;
         }
         let status = mode_write_status(
             adapter
                 .committed_mode
-                .transition_visibility(passive, source_id, visible),
+                .transition_visibility(passive, source_id, true),
         );
         if status == STATUS_SUCCESS
             && committed_mode_allows_scanout(adapter)
