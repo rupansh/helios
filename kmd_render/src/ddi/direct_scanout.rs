@@ -73,6 +73,15 @@ static RESET_REFUSALS: RefusalCounter = RefusalCounter::new();
 static ADMISSION_REASON_SET_LO: AtomicU32 = AtomicU32::new(0);
 static ADMISSION_REASON_SET_HI: AtomicU32 = AtomicU32::new(0);
 static ADMISSION_REFUSAL_DETAIL: AtomicU32 = AtomicU32::new(0);
+// Why the direct-scanout plane poisoned. 18 sites set `poisoned` and none of
+// them named itself, so a poisoned plane presented only as
+// `SetVidPnSourceVisibility(TRUE) -> DEVICE_NOT_READY` with no cause (measured
+// 22.22.344.0). Codes are 1..=18 in file order; POISON_SET is a bitset over
+// `code - 1`, because the first poison is the one that matters and the last
+// overwrites it.
+static POISON_COUNT: AtomicU32 = AtomicU32::new(0);
+static POISON_FIRST: AtomicU32 = AtomicU32::new(0);
+static POISON_SET: AtomicU32 = AtomicU32::new(0);
 // Last 0xf0 completion refusal's raw facts — see complete_queued.
 static COMPLETION_RESPONSE_TYPE: AtomicU32 = AtomicU32::new(0);
 static COMPLETION_RESPONSE_FLAGS: AtomicU32 = AtomicU32::new(0);
@@ -123,6 +132,9 @@ pub(crate) fn record_refusal_counters() {
         crate::diag::record_named_bytes(name, counter.count.load(Ordering::Relaxed));
         crate::diag::record_named_bytes(reason_name, counter.last_reason.load(Ordering::Relaxed));
     }
+    crate::diag::record_named_bytes(b"D2PsnN", POISON_COUNT.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2PsnWh1", POISON_FIRST.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2PsnSet", POISON_SET.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(
         b"D2AdmSL",
         ADMISSION_REASON_SET_LO.load(Ordering::Relaxed),
@@ -165,6 +177,18 @@ pub(crate) fn reset_refusal_counters() {
     ] {
         counter.count.store(0, Ordering::Relaxed);
         counter.last_reason.store(0, Ordering::Relaxed);
+    }
+    // Same reason as the loop above (R505): a value that merely EXISTS in the
+    // service key must not read as one that moved this boot.
+    for counter in [
+        &ADMISSION_REASON_SET_LO,
+        &ADMISSION_REASON_SET_HI,
+        &ADMISSION_REFUSAL_DETAIL,
+        &POISON_COUNT,
+        &POISON_FIRST,
+        &POISON_SET,
+    ] {
+        counter.store(0, Ordering::Relaxed);
     }
 }
 
@@ -398,6 +422,18 @@ struct RuntimeState {
 }
 
 impl RuntimeState {
+    /// Poison the plane and name the site that did it.
+    ///
+    /// Atomics only: several callers hold the state spinlock at DISPATCH, where
+    /// `diag::record` (a registry write) is illegal. The PASSIVE snapshot in
+    /// `record_refusal_counters` publishes these.
+    fn poison(&mut self, code: u32) {
+        self.poisoned = true;
+        POISON_COUNT.fetch_add(1, Ordering::Relaxed);
+        let _ = POISON_FIRST.compare_exchange(0, code, Ordering::Relaxed, Ordering::Relaxed);
+        POISON_SET.fetch_or(1u32 << (code - 1), Ordering::Relaxed);
+    }
+
     const fn new() -> Self {
         Self {
             plane: None,
@@ -415,7 +451,7 @@ impl RuntimeState {
             // the value token rather than manufacturing an early release when
             // a violated invariant exhausted the bounded platform quarantine.
             core::mem::forget(binding);
-            self.poisoned = true;
+            self.poison(1);
             record_refusal(&PLANE_REFUSALS, b"D2PlnRef", 0xfe);
         }
     }
@@ -736,7 +772,7 @@ pub(crate) fn complete_queued(
         COMPLETION_FAIL_BITS.store(bits, Ordering::Relaxed);
         let mut state = adapter.direct_scanout.state.lock();
         state.quarantine(BackendBinding::Real(binding));
-        state.poisoned = true;
+        state.poison(2);
         drop(state);
         record_refusal(&PLANE_REFUSALS, b"D2PlnRef", 0xf0);
         return;
@@ -759,7 +795,7 @@ pub(crate) fn complete_queued(
                 || plane.transport_epoch() != completion.instance
         }) {
             state.quarantine(BackendBinding::Real(binding));
-            state.poisoned = true;
+            state.poison(3);
             false
         } else if let Some(plane) = state.plane.as_mut() {
             let mut retained = plane.retain_real_candidate(binding, completion.sequence);
@@ -767,7 +803,7 @@ pub(crate) fn complete_queued(
                 if let Some(candidate) = retained.release_candidate.take() {
                     state.quarantine(candidate);
                 }
-                state.poisoned = true;
+                state.poison(4);
                 transitions[0] = Some(retained);
                 false
             } else {
@@ -776,14 +812,14 @@ pub(crate) fn complete_queued(
                 let submitted_ok = submitted.effect == Effect::CandidateSubmitted;
                 transitions[1] = Some(submitted);
                 if !submitted_ok {
-                    state.poisoned = true;
+                    state.poison(5);
                     false
                 } else {
                     let completed = plane.complete_replacement(key, accepted);
                     let terminal = (accepted && completed.effect == Effect::ReplacementLatched)
                         || (!accepted && completed.effect == Effect::ReplacementFailed);
                     if !terminal {
-                        state.poisoned = true;
+                        state.poison(6);
                     }
                     transitions[2] = Some(completed);
                     terminal
@@ -795,7 +831,7 @@ pub(crate) fn complete_queued(
             // refactor must quarantine custody instead of turning an internal
             // mismatch into a kernel panic.
             state.quarantine(BackendBinding::Real(binding));
-            state.poisoned = true;
+            state.poison(7);
             false
         }
     };
@@ -957,7 +993,7 @@ fn recycle_binding(adapter: &AdapterContext, binding: BackendBinding<DisplayBack
                 state.parking_reserve = Some(binding);
             } else {
                 state.quarantine(BackendBinding::Parking(binding));
-                state.poisoned = true;
+                state.poison(8);
             }
         }
     }
@@ -1023,7 +1059,7 @@ fn issue_fenced_set(
                     PublishKind::DisableZero => return,
                 });
             }
-            state.poisoned = true;
+            state.poison(9);
             return;
         }
         let Some(plane) = state.plane.as_mut() else {
@@ -1034,13 +1070,13 @@ fn issue_fenced_set(
                     PublishKind::DisableZero => return,
                 });
             }
-            state.poisoned = true;
+            state.poison(10);
             return;
         };
         match kind {
             PublishKind::Real | PublishKind::Parking => {
                 let Some(binding) = capture.take_candidate() else {
-                    state.poisoned = true;
+                    state.poison(11);
                     return;
                 };
                 let mut retained = match kind {
@@ -1054,21 +1090,21 @@ fn issue_fenced_set(
                     if let Some(binding) = retained.release_candidate.take() {
                         state.quarantine(binding);
                     }
-                    state.poisoned = true;
+                    state.poison(12);
                     capture.store_transition(0, retained);
                     return;
                 }
                 capture.store_transition(0, retained);
                 let submitted = plane.submit_candidate(key);
                 if submitted.effect != Effect::CandidateSubmitted {
-                    state.poisoned = true;
+                    state.poison(13);
                 }
                 capture.store_transition(1, submitted);
             }
             PublishKind::DisableZero => {
                 let submitted = plane.submit_disable_zero(key);
                 if submitted.effect != Effect::DisableZeroSubmitted {
-                    state.poisoned = true;
+                    state.poison(14);
                 }
                 capture.store_transition(0, submitted);
             }
@@ -1121,7 +1157,7 @@ fn issue_fenced_set(
                 PublishKind::Parking => BackendBinding::Parking(binding),
                 PublishKind::DisableZero => return false,
             });
-            state.poisoned = true;
+            state.poison(15);
         } else {
             recycle_binding(
                 adapter,
@@ -1139,7 +1175,7 @@ fn issue_fenced_set(
     let key = identity_key(&identity);
     if published_key != Some(key) || identity.resource_id() != geometry.resource_id {
         let mut state = adapter.direct_scanout.state.lock();
-        state.poisoned = true;
+        state.poison(16);
         record_refusal(&PLANE_REFUSALS, b"D2PlnRef", 2);
         return false;
     }
@@ -1248,7 +1284,7 @@ fn issue_parking_locked(passive: PassiveLevel, adapter: &AdapterContext) -> bool
             return false;
         }
         let Some(binding) = state.parking_reserve.take() else {
-            state.poisoned = true;
+            state.poison(17);
             record_refusal(&PLANE_REFUSALS, b"D2PlnRef", 5);
             return false;
         };
@@ -1433,7 +1469,7 @@ pub(crate) fn start(
             || !adapter.direct_scanout.mailbox.empty()
         {
             state.quarantine(BackendBinding::Parking(parking));
-            state.poisoned = true;
+            state.poison(18);
             return Err(VirtioError::DeviceError);
         }
         state.plane = Some(plane);
