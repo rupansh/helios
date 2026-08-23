@@ -245,6 +245,44 @@ pub enum Refusal {
     EventCapacityExceeded,
 }
 
+/// A stable 1-based code for each refusal, so a KMD counter can name which
+/// transition was refused. The plane poisons on a refused transition and
+/// published only "poisoned" until 22.22.346.0, which cost a deploy cycle
+/// guessing between five `submit_candidate` arms.
+pub fn refusal_code(refusal: Refusal) -> u32 {
+    use Refusal as R;
+    match refusal {
+        R::ZeroPlaneGeneration => 1,
+        R::ZeroTransportEpoch => 2,
+        R::ZeroObjectGeneration => 3,
+        R::ZeroBindingSequence => 4,
+        R::ZeroFenceId => 5,
+        R::BindingSequenceReused { .. } => 6,
+        R::BindingSequenceWentBackward { .. } => 7,
+        R::BindingSequenceExhausted => 8,
+        R::FenceIdReused { .. } => 9,
+        R::FenceIdWentBackward { .. } => 10,
+        R::FenceIdExhausted => 11,
+        R::TransportEpochMismatch { .. } => 12,
+        R::BindingSequenceMismatch { .. } => 13,
+        R::PendingBusy => 14,
+        R::NoCandidate => 15,
+        R::WrongPendingKind => 16,
+        R::NotActive => 17,
+        R::NotDraining => 18,
+        R::NotQuiescent => 19,
+        R::NoBackendToPark => 20,
+        R::BackendNotParking => 21,
+        R::NoCompletionPending => 22,
+        R::StaleCompletion => 23,
+        R::PlaneGenerationExhausted => 24,
+        R::TransportEpochExhausted => 25,
+        R::Poisoned => 26,
+        R::Removed => 27,
+        R::EventCapacityExceeded => 28,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum InvariantViolation {
     ZeroPlaneGeneration,
@@ -1975,4 +2013,53 @@ mod tests {
         assert_eq!(state.held_reference_count(), 0);
         assert_eq!(state.check_invariants(), Ok(()));
     }
+}
+
+#[cfg(test)]
+mod refusal_code_tests {
+    use super::*;
+
+    #[test]
+    fn refusal_codes_are_distinct_and_dense() {
+        const ALL: &[Refusal] = &[
+            Refusal::ZeroPlaneGeneration,
+            Refusal::ZeroTransportEpoch,
+            Refusal::ZeroObjectGeneration,
+            Refusal::ZeroBindingSequence,
+            Refusal::ZeroFenceId,
+            Refusal::BindingSequenceReused { value: 0 },
+            Refusal::BindingSequenceWentBackward { high_water: 0, found: 0 },
+            Refusal::BindingSequenceExhausted,
+            Refusal::FenceIdReused { value: 0 },
+            Refusal::FenceIdWentBackward { high_water: 0, found: 0 },
+            Refusal::FenceIdExhausted,
+            Refusal::TransportEpochMismatch { expected: 0, found: 0 },
+            Refusal::BindingSequenceMismatch { expected: 0, found: 0 },
+            Refusal::PendingBusy,
+            Refusal::NoCandidate,
+            Refusal::WrongPendingKind,
+            Refusal::NotActive,
+            Refusal::NotDraining,
+            Refusal::NotQuiescent,
+            Refusal::NoBackendToPark,
+            Refusal::BackendNotParking,
+            Refusal::NoCompletionPending,
+            Refusal::StaleCompletion,
+            Refusal::PlaneGenerationExhausted,
+            Refusal::TransportEpochExhausted,
+            Refusal::Poisoned,
+            Refusal::Removed,
+            Refusal::EventCapacityExceeded,
+        ];
+        assert_eq!(ALL.len(), COUNT, "add the new Refusal to ALL");
+        let mut seen = [false; COUNT + 1];
+        for r in ALL {
+            let c = refusal_code(*r) as usize;
+            assert!((1..=COUNT).contains(&c), "code {c} out of range");
+            assert!(!seen[c], "duplicate code {c} for {r:?}");
+            seen[c] = true;
+        }
+    }
+
+    const COUNT: usize = 28;
 }

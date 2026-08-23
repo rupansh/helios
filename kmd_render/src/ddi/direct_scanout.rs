@@ -82,6 +82,9 @@ static ADMISSION_REFUSAL_DETAIL: AtomicU32 = AtomicU32::new(0);
 static POISON_COUNT: AtomicU32 = AtomicU32::new(0);
 static POISON_FIRST: AtomicU32 = AtomicU32::new(0);
 static POISON_SET: AtomicU32 = AtomicU32::new(0);
+// The kmd_logic `Refusal` behind the poison, when a refused Transition is the
+// cause. `helios_kmd_logic::direct_scanout_lifetime::refusal_code`, 1..=28.
+static POISON_REFUSAL: AtomicU32 = AtomicU32::new(0);
 // Last 0xf0 completion refusal's raw facts — see complete_queued.
 static COMPLETION_RESPONSE_TYPE: AtomicU32 = AtomicU32::new(0);
 static COMPLETION_RESPONSE_FLAGS: AtomicU32 = AtomicU32::new(0);
@@ -135,6 +138,7 @@ pub(crate) fn record_refusal_counters() {
     crate::diag::record_named_bytes(b"D2PsnN", POISON_COUNT.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"D2PsnWh1", POISON_FIRST.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"D2PsnSet", POISON_SET.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"D2PsnRfs", POISON_REFUSAL.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(
         b"D2AdmSL",
         ADMISSION_REASON_SET_LO.load(Ordering::Relaxed),
@@ -187,6 +191,7 @@ pub(crate) fn reset_refusal_counters() {
         &POISON_COUNT,
         &POISON_FIRST,
         &POISON_SET,
+        &POISON_REFUSAL,
     ] {
         counter.store(0, Ordering::Relaxed);
     }
@@ -427,6 +432,17 @@ impl RuntimeState {
     /// Atomics only: several callers hold the state spinlock at DISPATCH, where
     /// `diag::record` (a registry write) is illegal. The PASSIVE snapshot in
     /// `record_refusal_counters` publishes these.
+    /// [`Self::poison`] plus the `kmd_logic` refusal that caused it.
+    fn poison_refused<T>(&mut self, code: u32, transition: &Transition<T>) {
+        if let Some(refusal) = transition.refusal {
+            POISON_REFUSAL.store(
+                helios_kmd_logic::direct_scanout_lifetime::refusal_code(refusal),
+                Ordering::Relaxed,
+            );
+        }
+        self.poison(code);
+    }
+
     fn poison(&mut self, code: u32) {
         self.poisoned = true;
         POISON_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -1090,21 +1106,21 @@ fn issue_fenced_set(
                     if let Some(binding) = retained.release_candidate.take() {
                         state.quarantine(binding);
                     }
-                    state.poison(12);
+                    state.poison_refused(12, &retained);
                     capture.store_transition(0, retained);
                     return;
                 }
                 capture.store_transition(0, retained);
                 let submitted = plane.submit_candidate(key);
                 if submitted.effect != Effect::CandidateSubmitted {
-                    state.poison(13);
+                    state.poison_refused(13, &submitted);
                 }
                 capture.store_transition(1, submitted);
             }
             PublishKind::DisableZero => {
                 let submitted = plane.submit_disable_zero(key);
                 if submitted.effect != Effect::DisableZeroSubmitted {
-                    state.poison(14);
+                    state.poison_refused(14, &submitted);
                 }
                 capture.store_transition(0, submitted);
             }
