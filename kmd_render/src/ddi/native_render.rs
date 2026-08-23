@@ -2134,6 +2134,21 @@ pub(crate) unsafe fn render_outer_physical(
             record_use.expected_allocation_generation,
             record_use.byte_length,
         ) else {
+            // Name the failing use: DxgkDdiRender is PASSIVE and this refusal
+            // kills the whole outer device, so it is rare and worth a registry
+            // write. Arm codes: device.rs / create_allocation.rs diagnose fns.
+            let arm = device.diagnose_outer_physical_use(
+                session,
+                entry.hDeviceSpecificAllocation,
+                record_use.expected_allocation_generation,
+                record_use.byte_length,
+            );
+            crate::diag::record_named_bytes(b"Nr2UseArm", arm);
+            crate::diag::record_named_bytes(b"Nr2UseIdx", index as u32);
+            crate::diag::record_named_bytes(
+                b"Nr2UseLen",
+                u32::try_from(record_use.byte_length).unwrap_or(u32::MAX),
+            );
             return fail(
                 if !crate::adapter::allocation_object::is_current(
                     record_use.expected_allocation_generation,

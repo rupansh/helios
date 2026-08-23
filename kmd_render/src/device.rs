@@ -361,6 +361,38 @@ impl DeviceContext {
             )
         }
     }
+
+    /// Name the refusal arm for a failed [`Self::acquire_outer_physical_use`].
+    /// Diagnostic only; device-level arms are 1 (state/session) and 0
+    /// (open not registered on this device), the rest come from
+    /// [`crate::ddi::create_allocation::diagnose_outer_physical_use`].
+    pub(crate) fn diagnose_outer_physical_use(
+        &self,
+        session: core::ptr::NonNull<TranslationSessionObject>,
+        open: HANDLE,
+        expected_generation: u64,
+        bytes: u64,
+    ) -> u32 {
+        let state = self.outer.lock();
+        if state.session != Some(session)
+            || state.session_generation == 0
+            || self.creator_process == 0
+        {
+            return 1;
+        }
+        if !state.opens.as_slice().contains(&(open as usize)) {
+            return 0;
+        }
+        drop(state);
+        unsafe {
+            crate::ddi::create_allocation::diagnose_outer_physical_use(
+                open,
+                session,
+                expected_generation,
+                bytes,
+            )
+        }
+    }
 }
 
 /// Typed borrowed view of a scheduler context handle.

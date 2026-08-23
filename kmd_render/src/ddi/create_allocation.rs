@@ -1411,6 +1411,57 @@ pub(crate) unsafe fn acquire_outer_gpuva_use(
 /// Acquire the exact D3D11 allocation-list open after DeviceContext proved it
 /// is a member of that device's bounded open set. No numeric allocation token,
 /// resource id, name, PID, or pointer value is used to find another owner.
+/// Name the arm [`acquire_outer_physical_use`] would refuse on, WITHOUT
+/// acquiring. Diagnostic only, called on the already-failed path: eleven
+/// silent `None` arms made the 2026-08-24 `UseMissingOrForeign` batch
+/// refusals unattributable.
+pub(crate) unsafe fn diagnose_outer_physical_use(
+    open: HANDLE,
+    session: core::ptr::NonNull<crate::ddi::translation_session::SessionObject>,
+    expected_generation: u64,
+    bytes: u64,
+) -> u32 {
+    if open.is_null() || expected_generation == 0 || bytes == 0 {
+        return 2;
+    }
+    let Some(open) = (unsafe { open_allocation_context(open) }) else {
+        return 3;
+    };
+    let Some(identity) = open.identity else {
+        return 4;
+    };
+    if identity.kind == ALLOC_KIND_HOC1 {
+        return 5;
+    }
+    if identity.generation != expected_generation {
+        return 6;
+    }
+    if bytes > identity.byte_size {
+        return 7;
+    }
+    if !allocation_object::is_current(identity.generation) {
+        return 8;
+    }
+    let Some(allocation) = (unsafe { resolve_alloc(open.allocation as HANDLE) }) else {
+        return 9;
+    };
+    if allocation.generation != identity.generation || allocation.kind != identity.kind {
+        return 10;
+    }
+    let Some(binding) = open.execution.as_ref() else {
+        return 11;
+    };
+    match binding.acquire_attached(session, identity.generation) {
+        Some(execution) => {
+            drop(execution);
+            // Every arm passes in isolation: the refusal was the outer rundown
+            // or a race; 12 marks "no arm reproduces".
+            12
+        }
+        None => 13,
+    }
+}
+
 pub(crate) unsafe fn acquire_outer_physical_use(
     open: HANDLE,
     session: core::ptr::NonNull<crate::ddi::translation_session::SessionObject>,
