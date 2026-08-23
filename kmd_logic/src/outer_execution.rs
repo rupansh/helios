@@ -1,13 +1,20 @@
 //! Pure HWA2 admission for the direct outer executor.
 //!
 //! `SHARED` means an allocation may cross D3D devices/processes.  It does not
-//! mean that the allocation owns an HRA1 association.  The latter is stated by
-//! `RESOURCE_ASSOCIATED`, and that is the exact edge HOB1 must retain whether
-//! or not the D3D resource was created with a shared-resource misc flag.
+//! mean that the allocation owns an HRA1 association; `RESOURCE_ASSOCIATED`
+//! states that, and neither flag decides admission here.  What decides it is
+//! whether a HOB1 batch may legitimately NAME the allocation in its use list —
+//! and DXVK's internal allocator chunks (plain unassociated buffers backing
+//! every vkAllocateMemory) are named by every content batch.  Requiring
+//! `RESOURCE_ASSOCIATED` left those opens without an execution edge, and the
+//! first content batch of every device died on arm 11 / UseMissingOrForeign
+//! (measured 2026-08-24: Nr2UseArm=11, Nr2UseLen=4 MiB, the readback probe and
+//! every dwm generation alike).  Only KMD-authored `STANDARD` allocations stay
+//! out: batches never name them.
 
 use helios_protocol::wddm::{
-    HeliosWddmAllocationDescV2, HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED, HELIOS_HWA2_FLAG_STANDARD,
-    HELIOS_HWA2_KIND_BUFFER, HELIOS_HWA2_KIND_IMAGE,
+    HeliosWddmAllocationDescV2, HELIOS_HWA2_FLAG_STANDARD, HELIOS_HWA2_KIND_BUFFER,
+    HELIOS_HWA2_KIND_IMAGE,
 };
 use helios_protocol::HELIOS_PACKAGE_GENERATION;
 
@@ -25,15 +32,14 @@ pub fn hwa2_is_outer_execution_resource(desc: &HeliosWddmAllocationDescV2) -> bo
             HELIOS_HWA2_KIND_BUFFER | HELIOS_HWA2_KIND_IMAGE
         )
         && !desc.has_flag(HELIOS_HWA2_FLAG_STANDARD)
-        && desc.has_flag(HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use helios_protocol::wddm::{
-        HELIOS_HWA2_FLAG_CPU_VISIBLE, HELIOS_HWA2_FLAG_SHARED, HELIOS_HWA2_MEMORY_CPU_VISIBLE,
-        HELIOS_HWA2_SWIZZLE_LINEAR,
+        HELIOS_HWA2_FLAG_CPU_VISIBLE, HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED,
+        HELIOS_HWA2_FLAG_SHARED, HELIOS_HWA2_MEMORY_CPU_VISIBLE, HELIOS_HWA2_SWIZZLE_LINEAR,
     };
 
     fn associated_buffer() -> HeliosWddmAllocationDescV2 {
@@ -64,11 +70,16 @@ mod tests {
     }
 
     #[test]
-    fn association_standard_kind_and_validation_remain_fail_closed() {
-        let mut missing_association = associated_buffer();
-        missing_association.flags &= !HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED;
-        assert!(!hwa2_is_outer_execution_resource(&missing_association));
+    fn unassociated_internal_chunk_is_admitted() {
+        // The DXVK-internal allocator chunk shape: plain buffer, no HRA1
+        // association. Batches name it, so it needs the execution edge.
+        let mut internal = associated_buffer();
+        internal.flags &= !HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED;
+        assert!(hwa2_is_outer_execution_resource(&internal));
+    }
 
+    #[test]
+    fn association_standard_kind_and_validation_remain_fail_closed() {
         let mut standard = associated_buffer();
         standard.flags |= HELIOS_HWA2_FLAG_STANDARD;
         assert!(!hwa2_is_outer_execution_resource(&standard));
