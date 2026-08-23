@@ -17,7 +17,8 @@ param(
   # change to what dwm resolves, so it must be asked for.
   [string]$Umd12Dll = "",
   # Both UMDs import the lower ICD by this unversioned module name. Keep the
-  # exact matching build beside the content-addressed UMDs in ProgramData.
+  # exact matching build beside the content-addressed UMDs in ProgramData and
+  # beside the package UMDs in the active DriverStore directory.
   [string]$VulkanDll = "C:\Users\Rupansh\helios-mesa-build\src\virtio\vulkan\vulkan_virtio.dll",
   [ValidateSet("ProgramData", "DriverStore", "PackageUpgrade")]
   [string]$Mode = "ProgramData",
@@ -85,6 +86,7 @@ $programData12Dll = if ($deployUmd12) {
   Join-Path $ProgramDataDir ("helios_umd12_{0}.dll" -f $src12Hash.Substring(0, 16).ToLowerInvariant())
 } else { "" }
 $programDataVulkanDll = Join-Path $ProgramDataDir "vulkan_virtio.dll"
+$driverStoreVulkanDll = Join-Path $store "vulkan_virtio.dll"
 
 Write-HeliosPlan "Helios UMD hotplug" @{
   Mode = $Mode
@@ -98,6 +100,7 @@ Write-HeliosPlan "Helios UMD hotplug" @{
   ClassKey = $classKey
   ActiveInf = $activeInf
   DriverStore = $store
+  DriverStoreVulkan = $driverStoreVulkanDll
   ProgramDataDll = $programDataDll
   RestartDevice = [bool]$RestartDevice
   ForceDriverStoreEdit = [bool]$ForceDriverStoreEdit
@@ -200,23 +203,38 @@ if ($Mode -eq "PackageUpgrade") {
     } else {
       Write-Warning "DriverStore UMD not found at $storeDll - cold boots may load a stale UMD"
     }
+
+    # The package UMD imports vulkan_virtio.dll by its unversioned name. During
+    # the first UMD load after a cold boot, normal DLL search therefore resolves
+    # the copy beside helios_umd.dll in DriverStore. Keeping only ProgramData in
+    # sync can pair a current UMD with an older lower ICD before the registry
+    # override is observed, which is not a coherent deploy.
+    if (-not (Test-Path -LiteralPath $driverStoreVulkanDll -PathType Leaf)) {
+      throw "DriverStore UMD companion not found at $driverStoreVulkanDll"
+    }
+    $oldStoreVulkanHash = Get-HeliosFileHash $driverStoreVulkanDll
+    if ($oldStoreVulkanHash -ne $vulkanHash) {
+      $backupDir = Join-Path "C:\ProgramData\HeliosDeployBackups" ((Get-Date -Format "yyyyMMdd-HHmmss-fff") + "-umd-companion")
+      New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+      $backupVulkanDll = Join-Path $backupDir "vulkan_virtio.dll"
+      Copy-Item -LiteralPath $driverStoreVulkanDll -Destination $backupVulkanDll -Force
+      $backupVulkanHash = Get-HeliosFileHash $backupVulkanDll
+      if ($backupVulkanHash -ne $oldStoreVulkanHash) {
+        throw "DriverStore UMD companion backup hash mismatch: source=$oldStoreVulkanHash backup=$backupVulkanHash"
+      }
+      Write-Host "Backed up DriverStore UMD companion: $backupVulkanDll hash $backupVulkanHash"
+    }
+    $storeVulkanCopy = Copy-HeliosFileVerified $VulkanDll $driverStoreVulkanDll 5 750 -DisplaceInUse
+    Write-Host "Synced DriverStore UMD companion: $($storeVulkanCopy.Destination)"
+    $reapedStoreVulkan = Remove-HeliosDisplacedCopies $driverStoreVulkanDll
+    if ($reapedStoreVulkan -gt 0) { Write-Host "Reaped $reapedStoreVulkan displaced DriverStore UMD companion copy(ies)." }
   } finally {
     if ($RestartDevice) {
       Write-Host "Re-enabling Helios after ProgramData UMD replacement."
       Invoke-HeliosPnpUtil @("/enable-device", $id) 90 | Out-Null
-      # The Helios PnP restart mints a new adapter LUID; the IDD's latched
-      # render-adapter pairing then names a dead adapter and the OS never
-      # re-offers a swapchain (observed 2026-07-04: endless no-AssignSwapChain
-      # replug loop after a deploy). Restart the IDD so it re-pairs against
-      # the fresh LUID. (LGIdd also revalidates the LUID on fruitless replugs
-      # now — this keeps deploys deterministic rather than waiting on that.)
-      $devcon = "C:\Program Files (x86)\Windows Kits\10\Tools\10.0.26100.0\x64\devcon.exe"
-      if (Test-Path -LiteralPath $devcon) {
-        Write-Host "Restarting the LG IDD so it re-pairs with the new Helios adapter LUID."
-        & $devcon restart '@ROOT\DISPLAY\0000' | Out-Null
-      } else {
-        Write-Warning "devcon not found at $devcon; restart ROOT\DISPLAY\0000 manually so the IDD re-pairs."
-      }
+      # Looking Glass IDD is retired for this target and must remain disabled.
+      # A Helios restart therefore ends here; no ROOT\DISPLAY device is
+      # restarted or used as a display-admission substitute.
     }
   }
 }
@@ -236,6 +254,12 @@ if ($deployVulkan) {
   Write-Host "Active companion hash: $activeVulkanHash"
   if ($activeVulkanHash -ne $vulkanHash) {
     throw "UMD companion hotplug failed: active hash $activeVulkanHash does not match source $vulkanHash"
+  }
+  $driverStoreVulkanHash = Get-HeliosFileHash $driverStoreVulkanDll
+  Write-Host "DriverStore UMD companion:  $driverStoreVulkanDll"
+  Write-Host "DriverStore companion hash: $driverStoreVulkanHash"
+  if ($driverStoreVulkanHash -ne $vulkanHash) {
+    throw "DriverStore UMD companion hotplug failed: active hash $driverStoreVulkanHash does not match source $vulkanHash"
   }
 }
 

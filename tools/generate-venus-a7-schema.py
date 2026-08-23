@@ -66,6 +66,39 @@ ZERO_WIDTH_REPLY_ARRAYS = {
     ("vkEnumerateDeviceExtensionProperties", "pProperties"): (28, 268),
 }
 
+# VkWriteDescriptorSet's three descriptor payload pointers are a semantic
+# union selected by descriptorType, but vk.xml represents them as independent
+# noautovalidity arrays.  The Venus encoder therefore emits descriptorCount
+# for a present pointer and zero for each absent pointer.  Keep this exception
+# bound to the exact generated wire fields instead of weakening every
+# noautovalidity array.
+WIRE_NULLABLE_DYNAMIC_ARRAYS = {
+    ("VkWriteDescriptorSet", "pImageInfo"),
+    ("VkWriteDescriptorSet", "pBufferInfo"),
+    ("VkWriteDescriptorSet", "pTexelBufferView"),
+}
+
+# Reply-bearing maintenance fallbacks may either create, query, and destroy one
+# private unbound buffer or create and query one still-live image in a single
+# HVC1 transaction.  Capture only the exact generated handles needed to prove
+# that each bounded sequence names the same device/object; no general object
+# lookup or heuristic handle class is added.
+CAPTURED_COMMAND_HANDLES = {
+    ("vkCreateBuffer", "device"),
+    ("vkCreateBuffer", "pBuffer"),
+    ("vkDestroyBuffer", "device"),
+    ("vkDestroyBuffer", "buffer"),
+    ("vkGetBufferMemoryRequirements2", "device"),
+    ("vkCreateImage", "device"),
+    ("vkCreateImage", "pImage"),
+    ("vkGetImageMemoryRequirements2", "device"),
+}
+
+CAPTURED_STRUCT_HANDLES = {
+    ("VkBufferMemoryRequirementsInfo2", "buffer"),
+    ("VkImageMemoryRequirementsInfo2", "image"),
+}
+
 
 def command_buffer_commands(source: Path) -> set[str]:
     text = source.read_text(encoding="utf-8")
@@ -195,6 +228,14 @@ class Generator:
     def scalar_fields(self, ty) -> list:
         return [var for var in ty.variables if self.is_scalar(var.ty)]
 
+    def parsed_fields(self, ty) -> list:
+        return [
+            var
+            for var in ty.variables
+            if self.is_scalar(var.ty)
+            or (ty.name, var.name) in CAPTURED_STRUCT_HANDLES
+        ]
+
     def rust_expr(self, expr: str, locals_: dict[str, str], loop_vars: set[str]) -> str:
         expr = expr.strip()
         if expr == "null-terminated":
@@ -294,6 +335,8 @@ class Generator:
         if width is not None:
             return self.emit_scalar_read(width, capture, indent)
         if base.category == self.VkType.HANDLE:
+            if capture:
+                return [f"{indent}{capture} = c.u64()? as u64;"]
             return [f"{indent}c.skip(8)?;"]
         if base.category == self.VkType.STRUCT:
             child_mode = "partial" if validity == self.gen.VariableInfo.PARTIAL else "full"
@@ -343,7 +386,10 @@ class Generator:
             count = f"count_{snake(var.name)}_{level}"
             out.append(f"{cur_indent}let {count} = c.array_count()?;")
             if not unchecked_string:
-                optional = var.is_optional() and level == 0
+                optional = level == 0 and (
+                    var.is_optional()
+                    or (owner.name, var.name) in WIRE_NULLABLE_DYNAMIC_ARRAYS
+                )
                 if optional:
                     out.append(f"{cur_indent}if {count} != 0 && {count} != {expected} {{")
                 else:
@@ -481,7 +527,7 @@ class Generator:
         out: list[str] = []
         for name in names:
             ty = self.reg.type_table[name]
-            fields = self.scalar_fields(ty)
+            fields = self.parsed_fields(ty)
             out.append("#[derive(Clone, Copy, Debug, Default)]")
             out.append(f"struct {self.parsed_name(ty)} {{")
             for var in fields:
@@ -548,7 +594,7 @@ class Generator:
         return out
 
     def emit_struct(self, ty, mode: str) -> list[str]:
-        fields = self.scalar_fields(ty)
+        fields = self.parsed_fields(ty)
         locals_ = {var.name: f"parsed.{snake(var.name)}" for var in fields}
         out: list[str] = [
             f"fn {self.parse_self_name(ty, mode)}(c: &mut Cursor<'_>, operands: &mut OperandWriter<'_>, scratch: &mut SchemaScratch<'_>, depth: u32) -> Result<{self.parsed_name(ty)}, VenusReject> {{",
@@ -607,7 +653,20 @@ class Generator:
                 continue
             seen.add(value)
             out.append(f"        {value} => {{")
-            out.extend(self.emit_element(ty, var, self.gen.VariableInfo.VALID, "full", {}, "            "))
+            # Union members retain the same generated wire shape as ordinary
+            # variables.  In particular, fixed-size scalar arrays carry an
+            # explicit array count before their elements; treating the member
+            # as one scalar under-consumes the command that follows it.
+            out.extend(
+                self.emit_var(
+                    ty,
+                    var,
+                    self.gen.VariableInfo.VALID,
+                    "full",
+                    {},
+                    "            ",
+                )
+            )
             out.append("            Ok(())")
             out.append("        }")
         out.extend(["        _ => Err(VenusReject::BadStructureType),", "    }", "}", ""])
@@ -706,6 +765,13 @@ class Generator:
                 declarations.append(
                     f"    let mut {local} = {self.parsed_name(var.ty.base)}::default();"
                 )
+            elif (
+                var.ty.base.category == self.VkType.HANDLE
+                and (name, var.name) in CAPTURED_COMMAND_HANDLES
+            ):
+                local = snake(var.name)
+                locals_[var.name] = local
+                declarations.append(f"    let mut {local}: u64 = 0;")
         out = [
             f"fn parse_command_{snake(name)}(c: &mut Cursor<'_>, operands: &mut OperandWriter<'_>, scratch: &mut SchemaScratch<'_>) -> Result<A7CommandFacts, VenusReject> {{",
             "    let depth = 0u32;",
@@ -719,6 +785,17 @@ class Generator:
         for var in ty.variables:
             validity = self.validity(ty, var, "full", command=True)
             out.extend(self.emit_var(ty, var, validity, "full", locals_, "    ", name))
+        identity = {
+            "vkCreateBuffer": ("device", "p_buffer"),
+            "vkDestroyBuffer": ("device", "buffer"),
+            "vkGetBufferMemoryRequirements2": ("device", "p_info.buffer"),
+            "vkCreateImage": ("device", "p_image"),
+            "vkGetImageMemoryRequirements2": ("device", "p_info.image"),
+        }.get(name)
+        if identity:
+            out.append(
+                f"    scratch.set_command_identity({identity[0]}, {identity[1]});"
+            )
         out.extend(
             [
                 "    Ok(A7CommandFacts {",
@@ -761,11 +838,16 @@ class Generator:
             "    geometry_counts: &'a mut [u32],",
             "    geometry_len: usize,",
             "    reply_size: u64,",
+            "    command_device_handle: u64,",
+            "    command_object_handle: u64,",
             "}",
             "",
             "impl<'a> SchemaScratch<'a> {",
-            "    pub fn new(geometry_counts: &'a mut [u32]) -> Self { Self { geometry_counts, geometry_len: 0, reply_size: 0 } }",
+            "    pub fn new(geometry_counts: &'a mut [u32]) -> Self { Self { geometry_counts, geometry_len: 0, reply_size: 0, command_device_handle: 0, command_object_handle: 0 } }",
             "    pub(super) fn set_reply_size(&mut self, reply_size: u64) { self.reply_size = reply_size; }",
+            "    pub(super) fn begin_command(&mut self) { self.command_device_handle = 0; self.command_object_handle = 0; }",
+            "    fn set_command_identity(&mut self, device: u64, object: u64) { self.command_device_handle = device; self.command_object_handle = object; }",
+            "    pub(super) fn command_identity(&self) -> (u64, u64) { (self.command_device_handle, self.command_object_handle) }",
             "    fn expect_reply_size(&self, expected: u64) -> Result<(), VenusReject> {",
             "        if self.reply_size != expected { return Err(VenusReject::BadArrayCount); }",
             "        Ok(())",
@@ -799,6 +881,7 @@ class Generator:
             [
                 "pub fn parse_a7_command(opcode: u32, flags: u32, c: &mut Cursor<'_>, operands: &mut OperandWriter<'_>, scratch: &mut SchemaScratch<'_>) -> Result<A7CommandFacts, VenusReject> {",
                 "    if flags & !1 != 0 { return Err(VenusReject::BadFlags); }",
+                "    scratch.begin_command();",
                 "    match opcode {",
             ]
         )
