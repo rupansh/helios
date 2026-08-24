@@ -922,7 +922,16 @@ pub fn validate_venus_control_stream(
             }
             let facts =
                 a7_schema::parse_a7_command(opcode, flags, &mut c, &mut operands, &mut scratch)?;
-            if facts.kind != A7CommandKind::PureControl || operands.count != 0 {
+            // The ICD's C60 classifier rings a destroy only for an UNBOUND
+            // buffer/image (a bound one defers into an outer batch), so a bare
+            // destroy here touches no allocation. Measured 2026-08-24: every
+            // D3D11 process died at its first transient-buffer destroy
+            // (Nr2NoSchWho=0x60E). Allocate/free/bind stay refused.
+            let ring_legal_destroy = facts.kind == A7CommandKind::Allocation
+                && matches!(opcode, OP_DESTROY_BUFFER | OP_DESTROY_IMAGE);
+            if (facts.kind != A7CommandKind::PureControl && !ring_legal_destroy)
+                || operands.count != 0
+            {
                 return Err(VenusReject::InvalidSequence);
             }
             admission.command_count = admission
@@ -1349,12 +1358,16 @@ mod tests {
             );
         }
 
+        // A standalone no-reply destroy is ADMITTED since 2026-08-24: the
+        // ICD rings exactly the unbound destroys (bound ones defer into outer
+        // batches), and refusing them killed every D3D11 process at its first
+        // transient buffer (Nr2NoSchWho=0x60E).
         let mut standalone_teardown = Vec::new();
         a7_destroy_allocation_object(&mut standalone_teardown, OP_DESTROY_IMAGE);
-        assert_eq!(
-            validate_venus_control_stream(&standalone_teardown, false, &mut [], &mut [0u32; 8],),
-            Err(VenusReject::InvalidSequence)
-        );
+        let teardown =
+            validate_venus_control_stream(&standalone_teardown, false, &mut [], &mut [0u32; 8])
+                .expect("standalone unbound teardown");
+        assert_eq!(teardown.command_count, 1);
     }
 
     #[test]
@@ -1970,6 +1983,52 @@ mod tests {
                 &mut [0u32; 8],
             ),
             Err(VenusReject::BadArrayCount)
+        );
+    }
+
+    #[test]
+    fn admits_captured_unbound_destroy_buffer_control_batch() {
+        // Exact 32-byte payload captured at the first rejected control Render
+        // on KMD 22.22.364.0 (Nr2NoSchWho=0x60E, ~20 processes/boot): one
+        // reply-less vkDestroyBuffer of an UNBOUND transient buffer, which the
+        // ICD's C60 classifier deliberately sends down the ring.
+        let mut captured = Vec::new();
+        put32(&mut captured, OP_DESTROY_BUFFER);
+        put32(&mut captured, 0);
+        put64(&mut captured, 3); // device
+        put64(&mut captured, 0x3a); // buffer
+        put64(&mut captured, 0); // pAllocator
+        assert_eq!(captured.len(), 32);
+        let admitted = validate_venus_control_stream(&captured, false, &mut [], &mut [0u32; 8])
+            .expect("captured unbound vkDestroyBuffer");
+        assert_eq!(admitted.opcode, OP_DESTROY_BUFFER);
+        assert_eq!(admitted.command_count, 1);
+        assert_eq!(admitted.operand_count, 0);
+    }
+
+    #[test]
+    fn admits_unbound_destroy_image_after_pure_control() {
+        let mut b = Vec::new();
+        // vkDestroyBufferView (53) is an ordinary pure-control destroy.
+        put32(&mut b, 53);
+        put32(&mut b, 0);
+        put64(&mut b, 7); // device
+        put64(&mut b, 0x77); // bufferView
+        put64(&mut b, 0); // pAllocator
+        a7_destroy_allocation_object(&mut b, OP_DESTROY_IMAGE);
+        let admitted = validate_venus_control_stream(&b, false, &mut [], &mut [0u32; 8])
+            .expect("pure control followed by unbound vkDestroyImage");
+        assert_eq!(admitted.command_count, 2);
+        assert_eq!(admitted.operand_count, 0);
+    }
+
+    #[test]
+    fn control_no_reply_still_refuses_free_memory() {
+        let mut b = Vec::new();
+        a7_free(&mut b);
+        assert_eq!(
+            validate_venus_control_stream(&b, false, &mut [], &mut [0u32; 8]),
+            Err(VenusReject::InvalidSequence)
         );
     }
 
