@@ -4,6 +4,41 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ⭐ TWO PRODUCER ROOT CAUSES FIXED, 2026-08-24 evening (KMD 22.22.369.0)
+
+The ".363 silent in-flight stall" was a refusal cascade, not a sync-graph bug.
+Fixed, one boot per predicate, each verified:
+
+1. **Control lane refused ring-borne destroys** (`kmd_logic` 354f1d3, .365).
+   The ICD's C60 classifier rings a destroy exactly when the buffer/image is
+   UNBOUND; `validate_venus_control_stream`'s no-reply arm admitted only
+   PureControl. First transient destroy of EVERY process → 0xc000000d →
+   DEVICE_LOST → a process churning every ~5 s. `Nr2NoSchWho=0x60E` named it.
+2. **Buffer WDDM backing undershot the venus import requirement** (umd
+   c6e5f63 + dxvk-helios e957290e, .369). The buffer create arm passed
+   `lower_memory_requirement=0` (tex2d preflights): 4096-byte backing vs a
+   65536-byte requirement refused every dedicated buffer import. Fix =
+   `PrepareBufferHelios` (maintenance4 query on the exact create info,
+   assembly factored so UMD and DXVK cannot drift). ⚠ tex1d/tex3d still pass
+   0 (resource.rs:1549/1601) — conformance backlog; now caught loudly.
+
+**State on the .369 boot:** no churn, dwm alive and rendering continuously,
+`Nr2OuterQ/OuterHost` climbing (70/56 vs the old ceiling of 3/2), sessions
+live, zero Xids. Desktop still black (`MpoSetOk=1`, vnc-grab 0 px). Open:
+- **Shared-resource creates fail** (`VK_KHR_EXTERNAL_MEMORY_WIN32 not
+  supported`, dxvk_image.cpp:675) — DWM's shared surfaces. ⛔ Sits inside
+  UNCOMMITTED dxvk-helios + icd/mesa rework (the HPS2 sharing retirement);
+  owner call needed before finishing that in-flight work.
+- **CreateDevice wedge persists**: a fresh probe hangs at D3DKMTCreateDevice
+  even on the healthy boot. NEW `Nr2CmpStale=1` (an ordered-completion ticket
+  dropped as Stale*/Poisoned = a fence dxgkrnl waits on forever) is the prime
+  suspect; counter added this session (interrupt.rs).
+- Diagnostics deployed: ICD `HNS1` submit/sync-point tracing + refused-payload
+  hex, `HAM1` alloc-failure lines, `Nr2NoSchWho` site codes, DXVK association
+  validator term logging. ETW autologger `autosession\helios_boot` still
+  armed (bincirc 384 MB, C:\tmp\helios_boot.etl) — collect or delete.
+Memory: `producer-chain-destroys-and-buffer-undersize-fixed.md`.
+
 ## ⚠ GUEST IN A REBOOT LOOP, 2026-08-24 ~02:15 — recover before resuming
 
 QEMU exited during a verification boot and the guest came back looping. Owner is
