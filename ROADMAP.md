@@ -4,6 +4,32 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ⭐ FRONTIER A ROOT-CAUSED + FIXED, 2026-08-24 night (KMD 22.22.370.0 STAGED, NOT BOOTED)
+
+The black desktop's producer defect was NOT the `VK_KHR_EXTERNAL_MEMORY_WIN32`
+log line (red herring — shared creates succeed via associations). It was an A7
+classifier gap: record-only defers every allocate/bind into the first outer
+batch naming the allocation, but `vkCreateImageView`/`vkCreateBufferView`/
+`vkUpdateDescriptorSets` rode the HVC1 ring, which is unordered against
+pending batches — the host executed view creates on UNBOUND images (qemu
+stderr validation, every worker; dwm's RTV 0x5c stuck in UNDEFINED across 9
+submits), so views baked dead addresses and every composition write vanished.
+§10.4 already classifies these as outer-allocation-backed; the sweep missed
+them. Fix: the object-materialization lane — icd/mesa `64681966a0a` (device
+FIFO, synthetic uses, skip/drop rules, HOC1 diag) + kmd_logic `cf08023`
+(outer-stream grammar admits opcodes 52/53/57/58/79 between allocations and
+recordings; 446 tests). Deployed to the DriverStore as 22.22.370.0 + ICD
+F0FA9D90 — **binds at the next real boot; unverified**.
+
+⛔ **QMP `system_reset` does NOT reboot this guest** (measured twice: render
+workers with fresh context ids 6 s after "reset" = TDR recovery, not boot).
+It resets only the devices → graphics TDRs and recovers, virtio-net dies
+permanently (no SSH/ping; hot-replug did not revive it), and `inject-nmi`
+breaks into the armed-but-unattached serial KD instead of bugchecking. The
+guest was left running but invisible + unreachable — the VM needs an
+owner-driven restart before any verification. See the
+`object-lane-fix-landed-reset-does-not-reboot` memory for the full ladder.
+
 ## ⭐ TWO PRODUCER ROOT CAUSES FIXED, 2026-08-24 evening (KMD 22.22.369.0)
 
 The ".363 silent in-flight stall" was a refusal cascade, not a sync-graph bug.
