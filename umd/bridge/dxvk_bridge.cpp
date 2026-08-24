@@ -356,6 +356,27 @@ std::size_t HeliosDxvkDevice::prepare_associated_texture2d(
   });
 }
 
+std::uint64_t HeliosDxvkDevice::prepare_associated_buffer_bytes(
+    std::size_t desc_ptr) const {
+  return bridge_guard("prepare_associated_buffer_bytes", std::uint64_t(0), [&]() {
+    if (!impl || !impl->d3d11 || !desc_ptr)
+      return std::uint64_t(0);
+    VkMemoryRequirements requirements = { };
+    HRESULT hr = static_cast<dxvk::D3D11Device*>(impl->d3d11)->PrepareBufferHelios(
+      reinterpret_cast<const D3D11_BUFFER_DESC*>(desc_ptr), &requirements);
+    if (FAILED(hr) || !requirements.size) {
+      char msg[96];
+      std::snprintf(msg, sizeof(msg),
+        "buffer preflight failed hr=0x%08lx size=%llu",
+        static_cast<unsigned long>(hr),
+        static_cast<unsigned long long>(requirements.size));
+      umd_log(msg);
+      return std::uint64_t(0);
+    }
+    return static_cast<std::uint64_t>(requirements.size);
+  });
+}
+
 std::uint64_t HeliosDxvkDevice::associated_texture2d_preflight_bytes(
     std::size_t preflight_ptr) const {
   if (!impl || !impl->d3d11 || !preflight_ptr)

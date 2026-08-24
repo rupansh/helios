@@ -23,6 +23,7 @@ mod ffi {
         fn d3d11_device_ptr(self: &HeliosDxvkDevice) -> usize;
         fn d3d11_context_ptr(self: &HeliosDxvkDevice) -> usize;
         unsafe fn prepare_associated_texture2d(self: &HeliosDxvkDevice, desc_ptr: usize) -> usize;
+        unsafe fn prepare_associated_buffer_bytes(self: &HeliosDxvkDevice, desc_ptr: usize) -> u64;
         fn associated_texture2d_preflight_bytes(
             self: &HeliosDxvkDevice,
             preflight_ptr: usize,
@@ -329,6 +330,17 @@ impl BridgeDevice {
     /// Create the exact lower image and retain it across outer WDDM allocation.
     /// The opaque token is a direct, single-owner C++ object; it is consumed by
     /// the associated Texture2D create or explicitly discarded on rollback.
+    /// Exact lower memory requirement for a D3D11 buffer description, or 0
+    /// on refusal. Sizes the outer WDDM allocation so the dedicated venus
+    /// import can never undershoot the requirement (measured 2026-08-24:
+    /// 4096-byte backing vs a 65536-byte requirement killed every device).
+    pub(crate) unsafe fn prepare_associated_buffer_bytes(&self, desc_ptr: usize) -> u64 {
+        let Some(d) = self.get() else {
+            return 0;
+        };
+        unsafe { d.prepare_associated_buffer_bytes(desc_ptr) }
+    }
+
     pub(crate) unsafe fn prepare_associated_texture2d(
         &self,
         desc_ptr: usize,

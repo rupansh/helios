@@ -1362,17 +1362,35 @@ pub(crate) unsafe extern "C" fn create_resource(
                 MiscFlags: misc,
                 StructureByteStride: a.ByteStride,
             };
-            let allocation = match allocate_wddm_resource(h, a, &mip0, h_rt, 0) {
-                Ok(allocation) => allocation,
-                Err(hr) => {
-                    log_error!(
+            let Some(dev) = helios_device(h) else {
+                set_runtime_error(h, E_FAIL);
+                return;
+            };
+            // The venus import model demands the buffer's exact lower memory
+            // requirement (64 KiB for a 48-byte buffer, measured 2026-08-24);
+            // sizing from ByteWidth alone made every dedicated import refuse.
+            let lower_memory_requirement = unsafe {
+                dev.dxvk.prepare_associated_buffer_bytes(
+                    (&desc as *const D3D11_BUFFER_DESC) as usize,
+                )
+            };
+            if lower_memory_requirement == 0 {
+                log_error!("DDI create_resource(buffer): lower-buffer preflight failed");
+                set_runtime_error(h, E_OUTOFMEMORY);
+                return;
+            }
+            let allocation =
+                match allocate_wddm_resource(h, a, &mip0, h_rt, lower_memory_requirement) {
+                    Ok(allocation) => allocation,
+                    Err(hr) => {
+                        log_error!(
                         "DDI create_resource(buffer): WDDM allocation/residency failed hr=0x{:08x}",
                         hr as u32
                     );
-                    set_runtime_error(h, hr);
-                    return;
-                }
-            };
+                        set_runtime_error(h, hr);
+                        return;
+                    }
+                };
             if let Err(hr) = create_and_store_associated_resource(
                 h,
                 h_resource,

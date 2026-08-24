@@ -27,6 +27,9 @@ struct HeliosDxvkDevice {
   std::size_t d3d11_device_ptr() const;
   std::size_t d3d11_context_ptr() const;
   std::size_t prepare_associated_texture2d(std::size_t desc_ptr) const;
+  // Exact lower memory requirement for a D3D11 buffer description; 0 on
+  // refusal. Device-level query, no transient object is created.
+  std::uint64_t prepare_associated_buffer_bytes(std::size_t desc_ptr) const;
   std::uint64_t associated_texture2d_preflight_bytes(
       std::size_t preflight_ptr) const;
   void discard_associated_texture2d_preflight(
