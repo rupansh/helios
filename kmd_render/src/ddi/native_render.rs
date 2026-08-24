@@ -258,6 +258,16 @@ pub static NR2_OUTER_HOST: AtomicU32 = AtomicU32::new(0);
 /// duplicated; `virtio/venus/protocol.rs` is ~30 hand-picked constants with no
 /// parser). The COMMIT is refused rather than admitted unclassified.
 pub static NR2_NO_SCHEMA: AtomicU32 = AtomicU32::new(0);
+/// Last NO_SCHEMA refusal, `(site << 8) | (VenusReject as u32 + 1)`; site
+/// 1/2 = legacy validate/count, 3 = Free shape, 4 = QueueSubmit shape,
+/// 5 = control not-init, 6/7 = control validate/count. Added 2026-08-24:
+/// 26 c000000d refusals in one boot with no way to name the predicate.
+pub static NR2_NO_SCHEMA_WHO: AtomicU32 = AtomicU32::new(0);
+
+fn no_schema(site: u32, code: u32) {
+    NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+    NR2_NO_SCHEMA_WHO.store((site << 8) | (code & 0xFF), Ordering::Relaxed);
+}
 /// COMMITs whose typed operands were left as the encoder wrote them (zero).
 /// The capability ordinal and the output patch entry ARE written; the resid
 /// rewrite belongs to the later allocation/GPU execution units.
@@ -327,9 +337,13 @@ const COUNTER_NAMES: [&[u8]; 43] = [
 /// The boundary counters that did not fit [`COUNTER_NAMES`]'s block, mirrored
 /// alongside it. Split only because a `CounterBlock` writes one registry value
 /// per entry and 27 is already the largest block in this driver.
-const BOUNDARY_NAMES: [&[u8]; 3] = [
+const BOUNDARY_NAMES: [&[u8]; 7] = [
     b"Nr2NoStage",
     b"Nr2NoEpoch",
+    b"Nr2NoSchWho",
+    b"Nr2CmpStale",
+    b"Nr2DmaNtfF",
+    b"Nr2DmaStale",
     // Not a K6 counter by subject, but K6 is what made the hazard reachable:
     // `DxgkDdiPatch`/`DxgkDdiSubmitCommand` deliver the context through a
     // `hDevice`/`hContext` union. It is mirrored here because this block already
@@ -426,7 +440,11 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(COUNTER_NAMES[42], &NR2_IMPORT_LAST_RESOURCE),
         e(BOUNDARY_NAMES[0], &NR2_NO_STAGE),
         e(BOUNDARY_NAMES[1], &NR2_NO_EPOCH),
-        f(BOUNDARY_NAMES[2], &crate::device::CONTEXT_HANDLE_REFUSED),
+        e(BOUNDARY_NAMES[2], &NR2_NO_SCHEMA_WHO),
+        f(BOUNDARY_NAMES[3], &crate::ddi::interrupt::ORDERED_COMPLETION_STALE),
+        f(BOUNDARY_NAMES[4], &crate::ddi::submit_command::DMA_NOTIFY_FAILS),
+        f(BOUNDARY_NAMES[5], &crate::ddi::submit_command::DMA_STALE_SKIP_COUNT),
+        f(BOUNDARY_NAMES[6], &crate::device::CONTEXT_HANDLE_REFUSED),
     ],
     ticks: &NR2_FLUSH_TICKS,
     failures: &NR2_FLUSH_FAILURES,
@@ -2754,13 +2772,13 @@ fn prepare_executor_commit(
         expected_operands,
     ) {
         Ok(admission) => admission,
-        Err(_) => {
-            NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+        Err(reject) => {
+            no_schema(1, reject as u32 + 1);
             return Err(STATUS_INVALID_PARAMETER);
         }
     };
     if admission.operand_count as usize != patches.len() {
-        NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+        no_schema(2, 0);
         return Err(STATUS_INVALID_PARAMETER);
     }
 
@@ -2957,7 +2975,7 @@ fn prepare_executor_commit(
                 || uses.len() != 1
                 || allocations[0].hvm1_role == HELIOS_HVM1_ROLE_REPLY_POOL
             {
-                NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+                no_schema(3, 0);
                 return Err(STATUS_INVALID_PARAMETER);
             }
         }
@@ -2970,7 +2988,7 @@ fn prepare_executor_commit(
                     .iter()
                     .any(|guard| guard.hvm1_role == HELIOS_HVM1_ROLE_REPLY_POOL)
             {
-                NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+                no_schema(4, 0);
                 return Err(STATUS_INVALID_PARAMETER);
             }
         }
@@ -3721,7 +3739,7 @@ fn commit(
             == size_of::<helios_protocol::translation_session::HeliosTranslationSessionInitV1>()
                 as u64;
     if native.class == NativeClass::Control && !k11_init && !control_generated {
-        NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+        no_schema(5, 0);
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -4092,19 +4110,19 @@ fn run_control_payload(
         schema_counts,
     ) {
         Ok(generated) => generated,
-        Err(_) => {
-            NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+        Err(reject) => {
+            no_schema(6, reject as u32 + 1);
             return ControlPayloadOutcome::Refused;
         }
     };
     if generated.operand_count as usize != patches.len() {
-        NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+        no_schema(7, 0);
         return ControlPayloadOutcome::Refused;
     }
 
     if !accept.has_reply {
         if !uses.is_empty() || !patches.is_empty() || args.AllocationListSize != 0 {
-            NR2_NO_SCHEMA.fetch_add(1, Ordering::Relaxed);
+            no_schema(8, 0);
             return ControlPayloadOutcome::Refused;
         }
         return match crate::ddi::translation_session::execute_control_no_reply(session, payload) {

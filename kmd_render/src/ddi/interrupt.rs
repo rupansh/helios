@@ -29,6 +29,9 @@ use crate::dxgk::*;
 pub static INT_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DPC_ROUTINE_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static CONTROL_INT_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Host completions whose ticket was Stale*/Poisoned — each is a scheduler
+/// fence dxgkrnl will keep waiting for (2026-08-24 wedge instrumentation).
+pub static ORDERED_COMPLETION_STALE: AtomicU32 = AtomicU32::new(0);
 
 /// Ask dxgkrnl to run the normal completion DPC after PASSIVE-side lifecycle
 /// code changed a WDDM wait predicate.  The caller has already preserved the
@@ -147,7 +150,10 @@ pub(crate) fn complete_ordered_engine_submission(
             }
             CompletionDisposition::StaleEpoch
             | CompletionDisposition::StaleTicket
-            | CompletionDisposition::Poisoned => 0,
+            | CompletionDisposition::Poisoned => {
+                ORDERED_COMPLETION_STALE.fetch_add(1, Ordering::Relaxed);
+                0
+            }
         };
         service_native_fence_rescans(adapter, guard);
         (disposition, delivered)
