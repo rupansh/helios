@@ -81,6 +81,11 @@ pub struct VenusAdmission {
 pub struct VenusA7Admission {
     pub command_count: u32,
     pub allocation_command_count: u32,
+    /// Object-materialization commands (view create/destroy, descriptor-set
+    /// update): dereference an outer allocation on the host, so the ICD
+    /// defers them out of the unordered control lane into the batch, after
+    /// the allocate/bind region and before the recordings.
+    pub object_command_count: u32,
     pub command_buffer_count: u32,
     pub queue_command_count: u32,
     pub operand_count: u32,
@@ -663,6 +668,11 @@ pub fn validate_venus_a7_outer_stream(
 ) -> Result<VenusA7Admission, VenusReject> {
     const OP_BEGIN_COMMAND_BUFFER: u32 = 90;
     const OP_END_COMMAND_BUFFER: u32 = 91;
+    const OP_CREATE_BUFFER_VIEW: u32 = 52;
+    const OP_DESTROY_BUFFER_VIEW: u32 = 53;
+    const OP_CREATE_IMAGE_VIEW: u32 = 57;
+    const OP_DESTROY_IMAGE_VIEW: u32 = 58;
+    const OP_UPDATE_DESCRIPTOR_SETS: u32 = 79;
 
     let mut c = Cursor::new(bytes);
     let mut operands = OperandWriter {
@@ -674,6 +684,7 @@ pub fn validate_venus_a7_outer_stream(
     let mut recording = false;
     let mut recorded_any = false;
     let mut materializing = false;
+    let mut object_phase = false;
     let mut tearing_down = false;
     let mut terminal_free_seen = false;
 
@@ -697,6 +708,7 @@ pub fn validate_venus_a7_outer_stream(
                         if tearing_down
                             || recording
                             || recorded_any
+                            || object_phase
                             || admission.queue_command_count != 0
                         {
                             return Err(VenusReject::InvalidSequence);
@@ -718,6 +730,7 @@ pub fn validate_venus_a7_outer_stream(
                         if materializing
                             || recording
                             || recorded_any
+                            || object_phase
                             || admission.queue_command_count != 0
                             || terminal_free_seen
                             || operands.count != operands_before
@@ -769,7 +782,35 @@ pub fn validate_venus_a7_outer_stream(
                 }
             }
             A7CommandKind::PureControl => {
-                return Err(VenusReject::InvalidSequence);
+                // Object-materialization region: view creates/destroys and
+                // descriptor updates dereference an outer allocation on the
+                // host, so the ICD orders them into the batch behind its
+                // allocate/bind records (HVC1 is unordered against pending
+                // batches — measured 2026-08-24 as host-side view creates on
+                // unbound images).  They parse to zero resource operands;
+                // any other pure-control opcode stays refused here.
+                let object_materialization = matches!(
+                    opcode,
+                    OP_CREATE_BUFFER_VIEW
+                        | OP_DESTROY_BUFFER_VIEW
+                        | OP_CREATE_IMAGE_VIEW
+                        | OP_DESTROY_IMAGE_VIEW
+                        | OP_UPDATE_DESCRIPTOR_SETS
+                );
+                if !object_materialization
+                    || tearing_down
+                    || recording
+                    || recorded_any
+                    || admission.queue_command_count != 0
+                    || operands.count != operands_before
+                {
+                    return Err(VenusReject::InvalidSequence);
+                }
+                object_phase = true;
+                admission.object_command_count = admission
+                    .object_command_count
+                    .checked_add(1)
+                    .ok_or(VenusReject::CountOverflow)?;
             }
         }
     }
@@ -1368,6 +1409,131 @@ mod tests {
             validate_venus_control_stream(&standalone_teardown, false, &mut [], &mut [0u32; 8])
                 .expect("standalone unbound teardown");
         assert_eq!(teardown.command_count, 1);
+    }
+
+    fn a7_create_image_view(out: &mut Vec<u8>) {
+        put32(out, 57); // vkCreateImageView
+        put32(out, 0);
+        put64(out, 0x101); // device
+        put64(out, 1); // pCreateInfo present
+        put32(out, 15); // VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO
+        put64(out, 0); // pNext
+        put32(out, 0); // flags
+        put64(out, 0x501); // image
+        put32(out, 1); // viewType
+        put32(out, 37); // format
+        for _ in 0..4 {
+            put32(out, 0); // components
+        }
+        put32(out, 1); // aspectMask
+        put32(out, 0);
+        put32(out, 1);
+        put32(out, 0);
+        put32(out, 1);
+        put64(out, 0); // pAllocator
+        put64(out, 1); // pView present
+        put64(out, 0x601); // view handle
+    }
+
+    fn a7_destroy_image_view(out: &mut Vec<u8>) {
+        put32(out, 58); // vkDestroyImageView
+        put32(out, 0);
+        put64(out, 0x101);
+        put64(out, 0x601);
+        put64(out, 0); // pAllocator
+    }
+
+    fn a7_update_descriptor_sets_empty(out: &mut Vec<u8>) {
+        put32(out, 79); // vkUpdateDescriptorSets
+        put32(out, 0);
+        put64(out, 0x101);
+        put32(out, 0); // descriptorWriteCount
+        put64(out, 0); // writes array size
+        put32(out, 0); // descriptorCopyCount
+        put64(out, 0); // copies array size
+    }
+
+    #[test]
+    fn a7_admits_object_materialization_between_records_and_recordings() {
+        let mut b = Vec::new();
+        let resource_offset = a7_allocate(&mut b);
+        a7_create_image_view(&mut b);
+        a7_update_descriptor_sets_empty(&mut b);
+        a7_destroy_image_view(&mut b);
+        a7_empty_recording(&mut b);
+        a7_empty_queue(&mut b);
+
+        let mut operands = [VenusOperand::default(); 1];
+        let admitted =
+            validate_venus_a7_outer_stream(&b, &mut operands, &mut [0u32; 8]).unwrap();
+        assert_eq!(admitted.command_count, 7);
+        assert_eq!(admitted.allocation_command_count, 1);
+        assert_eq!(admitted.object_command_count, 3);
+        assert_eq!(admitted.command_buffer_count, 1);
+        assert_eq!(admitted.queue_command_count, 1);
+        assert_eq!(admitted.operand_count, 1);
+        assert_eq!(operands[0].payload_offset, resource_offset as u32);
+
+        // The common no-allocation shape: object commands straight into a
+        // recording batch.
+        let mut plain = Vec::new();
+        a7_create_image_view(&mut plain);
+        a7_empty_recording(&mut plain);
+        a7_empty_queue(&mut plain);
+        let admitted =
+            validate_venus_a7_outer_stream(&plain, &mut [], &mut [0u32; 8]).unwrap();
+        assert_eq!(admitted.object_command_count, 1);
+        assert_eq!(admitted.queue_command_count, 1);
+    }
+
+    #[test]
+    fn a7_refuses_misplaced_or_foreign_object_materialization() {
+        // Allocation region must be closed before the object region.
+        let mut alloc_after = Vec::new();
+        a7_create_image_view(&mut alloc_after);
+        a7_allocate(&mut alloc_after);
+        assert_eq!(
+            validate_venus_a7_outer_stream(
+                &alloc_after,
+                &mut [VenusOperand::default(); 1],
+                &mut [0u32; 8],
+            ),
+            Err(VenusReject::InvalidSequence)
+        );
+
+        // Object commands may not follow a completed recording.
+        let mut after_recording = Vec::new();
+        a7_empty_recording(&mut after_recording);
+        a7_create_image_view(&mut after_recording);
+        assert_eq!(
+            validate_venus_a7_outer_stream(&after_recording, &mut [], &mut [0u32; 8]),
+            Err(VenusReject::InvalidSequence)
+        );
+
+        // Nor ride a teardown stream.
+        let mut in_teardown = Vec::new();
+        a7_destroy_allocation_object(&mut in_teardown, OP_DESTROY_IMAGE);
+        a7_create_image_view(&mut in_teardown);
+        a7_free(&mut in_teardown);
+        assert_eq!(
+            validate_venus_a7_outer_stream(&in_teardown, &mut [], &mut [0u32; 8]),
+            Err(VenusReject::InvalidSequence)
+        );
+
+        // Every other pure-control opcode stays refused in an outer stream —
+        // vkDestroySampler shares vkDestroyImageView's exact wire shape.
+        let mut foreign = Vec::new();
+        put32(&mut foreign, 71); // vkDestroySampler
+        put32(&mut foreign, 0);
+        put64(&mut foreign, 0x101);
+        put64(&mut foreign, 0x601);
+        put64(&mut foreign, 0);
+        a7_empty_recording(&mut foreign);
+        a7_empty_queue(&mut foreign);
+        assert_eq!(
+            validate_venus_a7_outer_stream(&foreign, &mut [], &mut [0u32; 8]),
+            Err(VenusReject::InvalidSequence)
+        );
     }
 
     #[test]
