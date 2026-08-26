@@ -246,6 +246,19 @@ pub static NR2_IMPORT_LAST_RESOURCE: AtomicU32 = AtomicU32::new(0);
 /// endpoint.  This moves only after private operand patching and descriptor
 /// publication, never from HOS1 validation alone.
 pub static NR2_OUTER_HOST: AtomicU32 = AtomicU32::new(0);
+/// Parked, never-submitted batches retracted by `DxgkDdiCancelCommand` — the
+/// custody release CloseAllocation's rundown join waits for.
+pub static NR2_CANCEL_RELEASED: AtomicU32 = AtomicU32::new(0);
+/// LIVE GAUGE, not a total: items queued on outer work items and not yet taken
+/// by `outer_work_item`. Each holds batch custody that pins allocations, so this
+/// is the discriminator for the freeze: nonzero and standing still means the
+/// work item stopped draining, zero means the custody is pinned by a parked
+/// never-submitted `Ready` batch instead.
+pub static NR2_WORKER_PENDING_LIVE: AtomicU32 = AtomicU32::new(0);
+/// Cancels that found no parked custody, `(code << 24) | count` — see
+/// [`cancel_command`] for the codes. Expected for any packet that already
+/// reached SubmitCommand.
+pub static NR2_CANCEL_MISSED: AtomicU32 = AtomicU32::new(0);
 
 // ── The boundary counters. Each names something K6 deliberately does NOT do,
 // at the site where a later unit will do it. None of them is a failure; all of
@@ -674,6 +687,59 @@ impl BatchTickets {
     }
 }
 
+/// Live HQA1 outer contexts, so `CloseAllocation` can reach the batches parked
+/// on them. Nothing else enumerates contexts: dxgkrnl hands each DDI the one
+/// handle it needs, and neither the device nor the session keeps a list.
+///
+/// ⛔ THE LOCK IS ALSO THE LIFETIME. `NativeContext::close` unregisters here
+/// BEFORE it tears anything down, so a walker holding this lock cannot be
+/// looking at a context that is being freed. Order is registry -> rundown in
+/// both paths; never the reverse.
+const MAX_OUTER_CONTEXTS: usize = 64;
+
+struct OuterContextRegistry {
+    /// `(adapter, context)` pairs. Fixed storage: this is registered from
+    /// CreateContext and walked from CloseAllocation, neither of which may
+    /// allocate on behalf of the other.
+    entries: [(usize, usize); MAX_OUTER_CONTEXTS],
+    count: usize,
+}
+
+static OUTER_CONTEXTS: SpinLock<OuterContextRegistry> = SpinLock::new(OuterContextRegistry {
+    entries: [(0, 0); MAX_OUTER_CONTEXTS],
+    count: 0,
+});
+
+/// Outer contexts that did not fit [`MAX_OUTER_CONTEXTS`]. A nonzero value means
+/// `CloseAllocation` cannot see every parked batch and the freeze this registry
+/// exists to prevent is reachable again.
+pub static NR2_CTX_REGISTRY_FULL: AtomicU32 = AtomicU32::new(0);
+
+fn register_outer_context(adapter: usize, context: usize) {
+    let mut registry = OUTER_CONTEXTS.lock();
+    if registry.count >= MAX_OUTER_CONTEXTS {
+        drop(registry);
+        NR2_CTX_REGISTRY_FULL.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    let count = registry.count;
+    registry.entries[count] = (adapter, context);
+    registry.count += 1;
+}
+
+fn unregister_outer_context(context: usize) {
+    let mut registry = OUTER_CONTEXTS.lock();
+    if let Some(index) = registry.entries[..registry.count]
+        .iter()
+        .position(|(_, value)| *value == context)
+    {
+        let last = registry.count - 1;
+        registry.entries[index] = registry.entries[last];
+        registry.entries[last] = (0, 0);
+        registry.count = last;
+    }
+}
+
 struct NativeContextOperation {
     owner: NonNull<NativeContext>,
 }
@@ -721,6 +787,23 @@ impl OuterCustody {
             Self::Physical { _session, .. } | Self::Virtual { _session, .. } => _session,
         }
     }
+
+    /// Does this custody pin the allocation open object `open`?
+    fn references_open(&self, open: usize) -> bool {
+        match self {
+            Self::Physical { _allocations, .. } => {
+                _allocations.iter().any(|use_| use_.references_open(open))
+            }
+            Self::Virtual {
+                _command_pool,
+                _allocations,
+                ..
+            } => {
+                _command_pool.references_open(open)
+                    || _allocations.iter().any(|use_| use_.references_open(open))
+            }
+        }
+    }
 }
 
 enum NativeCustody {
@@ -752,6 +835,21 @@ impl NativeCustody {
         match self {
             Self::Hnr2 { reply, .. } => reply.take(),
             Self::Outer(_) => None,
+        }
+    }
+
+    /// See [`OuterCustody::references_open`].
+    ///
+    /// The HNR2 arm answers `false`: its guards are `OpenExecutionUse`, which
+    /// pin the SEPARATE execution rundown (`OpenExecutionBinding`), not the
+    /// outer one this retraction unblocks — and that join has never been
+    /// observed to block (`OaExeAct` unwritten while `OaOutAct=1` hung, .373).
+    /// `OaExeAct` with no `OaExeDrn` beside it is what would prove otherwise,
+    /// and it is recorded for exactly that reason.
+    fn references_open(&self, _open: usize) -> bool {
+        match self {
+            Self::Hnr2 { .. } => false,
+            Self::Outer(custody) => custody.references_open(_open),
         }
     }
 }
@@ -1112,6 +1210,7 @@ impl OuterWorker {
                 .pending
                 .try_push(pending)
                 .map_err(|pending| (OuterExecutionRefusal::WorkerFull, pending))?;
+            NR2_WORKER_PENDING_LIVE.fetch_add(1, Ordering::Relaxed);
             if schedule {
                 state.queued = true;
                 unsafe { KeClearEvent(self.drained.get()) };
@@ -1137,7 +1236,9 @@ impl OuterWorker {
         let mut state = self.state.lock();
         if state.pending.len() != 0 {
             let open = state.open;
-            return Some((open, state.pending.remove(0)));
+            let taken = state.pending.remove(0);
+            NR2_WORKER_PENDING_LIVE.fetch_sub(1, Ordering::Relaxed);
+            return Some((open, taken));
         }
         state.queued = false;
         unsafe { KeSetEvent(self.drained.get(), 0, 0) };
@@ -1301,6 +1402,14 @@ impl NativeContext {
         if let Some(worker) = native.outer_worker.as_ref() {
             unsafe { worker.init_event() };
         }
+        if class == NativeClass::Outer {
+            // Registered at its final boxed address, so CloseAllocation can find
+            // the batches this context parks. `close` unregisters.
+            register_outer_context(
+                adapter.as_ptr() as usize,
+                core::ptr::from_ref(native.as_ref()) as usize,
+            );
+        }
         Some(native)
     }
 
@@ -1337,6 +1446,9 @@ impl NativeContext {
     /// polling or synthetic completion is involved: an InFlight slot can release
     /// its rundown only from a used-ring response or a proven physical reset.
     pub(crate) fn close(&self, passive: PassiveLevel) {
+        // FIRST, and under the registry lock: a CloseAllocation walker holding
+        // that lock must never be looking at a context that is being torn down.
+        unregister_outer_context(core::ptr::from_ref(self) as usize);
         {
             let mut rundown = self.rundown.lock();
             rundown.open = false;
@@ -1484,6 +1596,225 @@ fn fail_inflight_without_completion(
         settle_batch_tickets(adapter, tickets, false);
     }
 }
+
+/// `DxgkDdiCancelCommand` service (PASSIVE): dxgkrnl removed this queued packet
+/// from its software queue and SubmitCommand will never arrive — DestroyAllocation
+/// flushes queued packets referencing a dying allocation. The parked Ready batch
+/// owns allocation custody, and an unreleased one deadlocks CloseAllocation's
+/// rundown join under dxgkrnl's adapter-exclusive DDI lock (live-KD root cause of
+/// the boot+13s session freeze, 2026-08-25). Slot state is the idempotency guard:
+/// a packet that DID reach SubmitCommand sits InFlight/Terminal and is left alone.
+///
+/// # Safety
+/// `private_*` is dxgkrnl's live `DXGKARG_CANCELCOMMAND` private-data window for
+/// a packet on this HVC1 context, owned by dxgkrnl for the duration of the call.
+pub(crate) unsafe fn cancel_command(
+    native: &NativeContext,
+    private_base: *const c_void,
+    private_total: u32,
+    private_start: u32,
+    private_end: u32,
+) {
+    let miss = |code: u32| {
+        let count = NR2_CANCEL_MISSED.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::diag::record_named_bytes(b"CanMiss", (code << 24) | count.min(0x00ff_ffff));
+    };
+    let Some(_operation) = native.acquire_operation() else {
+        // Context close owns the slots now and drops every parked batch itself.
+        miss(1);
+        return;
+    };
+    enum CancelRecord {
+        Outer(Hob1KmdDmaPrivateV1),
+        Queue(Hnr2KmdDmaPrivateV1),
+    }
+    let record = match native.class {
+        NativeClass::Outer => {
+            match unsafe {
+                read_hob1_dma_record(private_base, private_total, private_start, private_end)
+            } {
+                Some(record) => CancelRecord::Outer(record),
+                None => return miss(2),
+            }
+        }
+        NativeClass::Queue => {
+            match unsafe {
+                read_dma_record(private_base, private_total, private_start, private_end)
+            } {
+                Some(record) => CancelRecord::Queue(record),
+                None => return miss(3),
+            }
+        }
+        // Control work reaches its host terminal synchronously in Render and no
+        // slot custody exists. Retiring staging here has no per-packet
+        // discriminator against a submitted-then-canceled resubmission, and a
+        // wrong retire consumes a LIVE submission's accounting (the `submit`
+        // resubmission hazard) — count instead; the pool drift stays visible as
+        // Nr2Slot vs Nr2SlotRet.
+        NativeClass::Control => return miss(4),
+    };
+    let slot_index = match &record {
+        CancelRecord::Outer(record) => record.slot_index,
+        CancelRecord::Queue(record) => record.slot_index,
+    };
+    // ⛔ ZERO TICKETS IS THE WHOLE SAFETY ARGUMENT, and it is why this retracts
+    // rather than settles. A ticket is admitted in SubmitCommand; a packet
+    // dxgkrnl cancels never got there, so the exact slot it names still has
+    // none. Settling tickets here would drive `fail_ordered_engine_submission`
+    // for a packet dxgkrnl has already discarded — inventing a completion
+    // transition for a submission the scheduler no longer owns. Any other slot
+    // shape either reached SubmitCommand (dxgkrnl owns its terminal) or holds no
+    // batch custody, so it is counted and left exactly as it was. Same retract
+    // shape as the uncommitted-descriptor path in `render_outer_physical`.
+    let mut batch = {
+        let mut executor = native.executor.lock();
+        let Some(slot) = executor.slots.get_mut(slot_index as usize) else {
+            drop(executor);
+            miss(5);
+            return;
+        };
+        let retract = matches!(
+            slot,
+            SubmissionSlot::Ready { identity, tickets, batch: Some(_) }
+                if tickets.count == 0
+                    && match &record {
+                        CancelRecord::Outer(record) => outer_physical_record_matches(
+                            native, record, *identity, slot_index as usize),
+                        CancelRecord::Queue(record) => queue_record_matches(
+                            native, record, *identity, slot_index as usize),
+                    }
+        );
+        if !retract {
+            drop(executor);
+            miss(6);
+            return;
+        }
+        match core::mem::replace(slot, SubmissionSlot::Free) {
+            SubmissionSlot::Ready {
+                batch: Some(batch), ..
+            } => batch,
+            // Unreachable: the arm was just matched under this same lock.
+            other => {
+                *slot = other;
+                drop(executor);
+                miss(7);
+                return;
+            }
+        }
+    };
+    if let Some(reply) = batch.custody.take_reply() {
+        let _ = reply.finish(false);
+    }
+    // PASSIVE per the DDI contract: the batch's two DMA buffers and its
+    // session/context/allocation custody are all released right here, which is
+    // the release CloseAllocation's rundown join is waiting for.
+    drop(batch);
+    let count = NR2_CANCEL_RELEASED.fetch_add(1, Ordering::Relaxed) + 1;
+    crate::diag::record_named_bytes(b"CanRel", (1 << 24) | count.min(0x00ff_ffff));
+}
+
+/// Retract every parked, never-submitted batch that pins the allocation open
+/// object `open`, so `CloseAllocation` can complete. Returns how many were freed.
+///
+/// ⛔ THE LIFETIME INVERSION THIS EXISTS FOR. A `Ready` batch holds an
+/// `OpenOuterUse` on each allocation it names, and until 22.22.373.0 that guard
+/// was released only when the batch was submitted or the whole CONTEXT was
+/// destroyed. dxgkrnl destroys allocations FIRST and contexts after, so a batch
+/// dxgkrnl silently discarded (Render returned, SubmitCommand never came —
+/// measured 15 of them, `Nr2OuterQ` 38 vs `Nr2OuterHost` 23) pinned an
+/// allocation forever: `CloseAllocation` blocked in an untimed rundown join
+/// while holding dxgkrnl's adapter-exclusive DDI lock, deadlocking every vblank
+/// waiter and the whole win32k session behind it.
+///
+/// Only ZERO-TICKET batches are retracted, which is what makes this safe rather
+/// than a race with an imminent SubmitCommand: a ticket is admitted in
+/// SubmitCommand, so a batch with none is one the scheduler does not own. That a
+/// batch names a dying allocation is dxgkrnl's own statement that no submission
+/// still needs it.
+pub(crate) fn retract_parked_referencing(
+    adapter: &crate::adapter::AdapterContext,
+    open: usize,
+) -> u32 {
+    if open == 0 {
+        return 0;
+    }
+    let adapter_key = core::ptr::from_ref(adapter) as usize;
+    let mut freed = 0u32;
+    let mut index = 0usize;
+    loop {
+        // Re-derive the guard each round: the registry lock cannot be held while
+        // a batch is dropped (contiguous DMA buffers are PASSIVE-only) and this
+        // spinlock raises to DISPATCH.
+        let operation = {
+            let registry = OUTER_CONTEXTS.lock();
+            if index >= registry.count {
+                break;
+            }
+            let (owner, context) = registry.entries[index];
+            index += 1;
+            if owner != adapter_key || context == 0 {
+                continue;
+            }
+            // SAFETY: `close` unregisters under this same lock before it tears
+            // the context down, so a registered entry is live for as long as the
+            // lock is held, and the rundown guard taken here keeps it live after.
+            let native = unsafe { &*(context as *const NativeContext) };
+            native.acquire_operation()
+        };
+        let Some(operation) = operation else {
+            continue;
+        };
+        // SAFETY: the guard holds this context's rundown open.
+        let native = unsafe { operation.owner.as_ref() };
+        // One batch per pass: taking them all under the executor lock would need
+        // an unbounded local, and dropping any of them under it is illegal.
+        loop {
+            let batch = {
+                let mut executor = native.executor.lock();
+                let found = executor.slots.iter().position(|slot| {
+                    matches!(
+                        slot,
+                        SubmissionSlot::Ready { tickets, batch: Some(batch), .. }
+                            if tickets.count == 0 && batch.custody.references_open(open)
+                    )
+                });
+                match found.and_then(|slot_index| {
+                    executor.slots.get_mut(slot_index).and_then(|slot| {
+                        match core::mem::replace(slot, SubmissionSlot::Free) {
+                            SubmissionSlot::Ready {
+                                batch: Some(batch), ..
+                            } => Some(batch),
+                            other => {
+                                *slot = other;
+                                None
+                            }
+                        }
+                    })
+                }) {
+                    Some(batch) => batch,
+                    None => break,
+                }
+            };
+            let mut batch = batch;
+            if let Some(reply) = batch.custody.take_reply() {
+                let _ = reply.finish(false);
+            }
+            // PASSIVE: CloseAllocation's contract. This drop is the release the
+            // rundown join is waiting for.
+            drop(batch);
+            freed += 1;
+        }
+        drop(operation);
+    }
+    if freed != 0 {
+        let total = NR2_RETRACTED.fetch_add(freed, Ordering::Relaxed) + freed;
+        crate::diag::record_named_bytes(b"Nr2Retract", total);
+    }
+    freed
+}
+
+/// Parked batches freed by [`retract_parked_referencing`].
+pub static NR2_RETRACTED: AtomicU32 = AtomicU32::new(0);
 
 impl NativeHostCompletion {
     fn finish_with_cleanup(

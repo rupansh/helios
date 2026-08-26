@@ -9,7 +9,7 @@ use alloc::boxed::Box;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use wdk_sys::ntddk::KeQueryInterruptTimePrecise;
+use wdk_sys::ntddk::{KeGetCurrentIrql, KeQueryInterruptTimePrecise};
 
 use crate::adapter::AdapterContext;
 use crate::device::DeviceHandleRef;
@@ -258,6 +258,14 @@ pub unsafe extern "C" fn dxgkddi_present_to_hw_queue(
     STATUS_NOT_SUPPORTED
 }
 
+/// `DxgkDdiCancelCommand` calls this boot. PASSIVE_LEVEL per the WDK contract.
+static CANCEL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// PASSIVE_LEVEL. A queued packet dxgkrnl is discarding without SubmitCommand.
+/// The HNR2/HOB1 lanes park allocation custody between Render and Submit, and
+/// this was the only consumer that could release it for a discarded packet —
+/// the silent no-op here deadlocked CloseAllocation at every display-off drain
+/// (the boot+13s freeze, root-caused 2026-08-25).
 pub unsafe extern "C" fn dxgkddi_cancel_command(
     _h_adapter: IN_CONST_HANDLE,
     cancel: IN_CONST_PDXGKARG_CANCELCOMMAND,
@@ -265,7 +273,38 @@ pub unsafe extern "C" fn dxgkddi_cancel_command(
     if cancel.is_null() {
         return STATUS_INVALID_PARAMETER;
     }
-
+    // SAFETY: dxgkrnl owns the argument struct for the duration of the call.
+    let args = unsafe { &*cancel };
+    let count = CANCEL_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    // `_IRQL_requires_(PASSIVE_LEVEL)` in the WDK; everything below (registry
+    // writes, DMA-buffer frees) is PASSIVE-only, so a violated contract gets a
+    // do-nothing SUCCESS instead of a bugcheck.
+    if unsafe { KeGetCurrentIrql() } != 0 {
+        return STATUS_SUCCESS;
+    }
+    crate::diag::record_named_bytes(b"CanN", count);
+    // SAFETY: hContext is a context handle this driver returned (or null);
+    // from_raw tag-checks before trusting it.
+    let context = unsafe { crate::device::ContextHandleRef::from_raw(args.hContext) };
+    let native = context.as_ref().and_then(|c| {
+        c.outer_native()
+            .map(|(native, ..)| native)
+            .or_else(|| c.native().map(|(native, _session)| native))
+    });
+    let Some(native) = native else {
+        // Paging and legacy-present packets park no custody keyed to a record.
+        return STATUS_SUCCESS;
+    };
+    // SAFETY: the private-data window is dxgkrnl's, live for the call.
+    unsafe {
+        crate::ddi::native_render::cancel_command(
+            native,
+            args.pDmaBufferPrivateData,
+            args.DmaBufferPrivateDataSize,
+            args.DmaBufferPrivateDataSubmissionStartOffset,
+            args.DmaBufferPrivateDataSubmissionEndOffset,
+        )
+    };
     STATUS_SUCCESS
 }
 

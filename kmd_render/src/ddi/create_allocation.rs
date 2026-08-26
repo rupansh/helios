@@ -732,6 +732,9 @@ struct OpenOuterRundown {
 struct OpenOuterBinding {
     rundown: SpinLock<OpenOuterRundown>,
     drained: UnsafeCell<KEVENT>,
+    /// Call-site tag of the most recent [`Self::acquire_tagged`]; published by
+    /// `close` when the join blocks, to name the guard that was never returned.
+    last_tag: AtomicU32,
 }
 
 unsafe impl Send for OpenOuterBinding {}
@@ -745,6 +748,7 @@ impl OpenOuterBinding {
                 active: 0,
             }),
             drained: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+            last_tag: AtomicU32::new(0),
         }
     }
 
@@ -753,6 +757,14 @@ impl OpenOuterBinding {
     }
 
     fn acquire(&self) -> bool {
+        self.acquire_tagged(0)
+    }
+
+    /// `tag` names the call site, so a guard that is never returned can be
+    /// attributed. There are three acquirers and no other way to tell them
+    /// apart once the count is all that is left: 1 = GPUVA patch resolution,
+    /// 2 = physical allocation-list use, 3 = the device open-table bind guard.
+    fn acquire_tagged(&self, tag: u32) -> bool {
         let mut state = self.rundown.lock();
         if !state.open || state.active == u32::MAX {
             return false;
@@ -761,6 +773,7 @@ impl OpenOuterBinding {
             unsafe { KeClearEvent(self.drained.get()) };
         }
         state.active += 1;
+        self.last_tag.store(tag, Ordering::Relaxed);
         true
     }
 
@@ -783,9 +796,28 @@ impl OpenOuterBinding {
             state.active
         };
         if active != 0 {
+            // PUBLISHED BEFORE THE WAIT ON PURPOSE. This wait has no timeout, and
+            // when it does not return, CloseAllocation is holding dxgkrnl's
+            // adapter-exclusive DDI lock and the whole interactive session
+            // deadlocks behind it — so anything recorded after the wait would
+            // never be written. `OaOutAct` is therefore the only in-driver
+            // evidence of the blocking state, and `Nr2WkPend` beside it says
+            // whether the guards are held by undrained work items or by a parked
+            // never-submitted batch.
+            crate::diag::record_named_bytes(b"OaOutAct", active);
+            crate::diag::record_named_bytes(
+                b"OaOutTag",
+                self.last_tag.load(Ordering::Relaxed),
+            );
+            crate::diag::record_named_bytes(
+                b"Nr2WkPend",
+                crate::ddi::native_render::NR2_WORKER_PENDING_LIVE
+                    .load(core::sync::atomic::Ordering::Relaxed),
+            );
             let _ = unsafe {
                 KeWaitForSingleObject(self.drained.get() as PVOID, 0, 0, 0, core::ptr::null_mut())
             };
+            crate::diag::record_named_bytes(b"OaOutDrn", active);
         }
     }
 }
@@ -1165,9 +1197,15 @@ impl OpenExecutionBinding {
             state.active
         };
         if active != 0 {
+            // Same before/after pair as `OpenOuterBinding::close`, and for the
+            // same reason: the wait is untimed and a missing `OaExeDrn` beside a
+            // written `OaExeAct` is the only way to tell which of the two joins
+            // never returned.
+            crate::diag::record_named_bytes(b"OaExeAct", active);
             let _ = unsafe {
                 KeWaitForSingleObject(self.drained.get() as PVOID, 0, 0, 0, core::ptr::null_mut())
             };
+            crate::diag::record_named_bytes(b"OaExeDrn", active);
         }
         let (session, owns_session_reference, attachment, resource_id) = {
             let mut state = self.rundown.lock();
@@ -1253,6 +1291,12 @@ pub(crate) struct OpenOuterUse {
 unsafe impl Send for OpenOuterUse {}
 
 impl OpenOuterUse {
+    /// Does this guard pin the open allocation object at `open`? Pointer
+    /// identity only — the same object `CloseAllocation` is tearing down.
+    pub(crate) fn references_open(&self, open: usize) -> bool {
+        self.open.as_ptr() as usize == open
+    }
+
     pub(crate) fn generation(&self) -> u64 {
         self.identity.generation
     }
@@ -1382,7 +1426,7 @@ pub(crate) unsafe fn acquire_outer_gpuva_use(
         }
     }
     let allocation_offset = found?;
-    if !open.outer.acquire() {
+    if !open.outer.acquire_tagged(1) {
         return None;
     }
     let execution = if require_hoc1 {
@@ -1484,7 +1528,7 @@ pub(crate) unsafe fn acquire_outer_physical_use(
     if allocation.generation != identity.generation || allocation.kind != identity.kind {
         return None;
     }
-    if !open.outer.acquire() {
+    if !open.outer.acquire_tagged(2) {
         return None;
     }
     let Some(execution) = open
@@ -1751,7 +1795,7 @@ unsafe fn open_allocation_context<'a>(h: HANDLE) -> Option<&'a OpenAllocationCon
 /// the owning DeviceContext's bounded open-table lock.
 pub(crate) unsafe fn acquire_outer_bind_guard(open: usize) -> Option<OuterBindGuard> {
     let open = unsafe { open_allocation_context(open as HANDLE)? };
-    if !open.outer.acquire() {
+    if !open.outer.acquire_tagged(3) {
         return None;
     }
     Some(OuterBindGuard {
@@ -5398,6 +5442,16 @@ pub unsafe extern "C" fn dxgkddi_close_allocation(
             // joined immediately below.
             device.unregister_outer_open(handle as usize);
             if let Some(mut open) = unsafe { take_open_ctx(handle) } {
+                // BEFORE the join, never after: `outer.close()` waits untimed,
+                // and a batch dxgkrnl discarded without ever submitting holds a
+                // guard nothing else will ever return. Retracting those is what
+                // makes the join finite — see `retract_parked_referencing`.
+                if let Some(adapter) = device.adapter() {
+                    crate::ddi::native_render::retract_parked_referencing(
+                        adapter,
+                        handle as usize,
+                    );
+                }
                 open.outer.close();
                 if let Some(execution) = open.execution.take() {
                     // CloseAllocation is PASSIVE_LEVEL.  Revoke new use,
