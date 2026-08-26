@@ -1713,6 +1713,131 @@ pub(crate) unsafe fn cancel_command(
     crate::diag::record_named_bytes(b"CanRel", (1 << 24) | count.min(0x00ff_ffff));
 }
 
+/// Guard every registered outer context of this adapter in ONE registry pass.
+/// The guards, not the lock, keep them alive, so the caller may drop batches at
+/// PASSIVE afterwards. Lock order is registry -> rundown, as everywhere else.
+///
+/// ⛔ ONE PASS, NOT AN INDEX WALK: `unregister_outer_context` swap-removes, so a
+/// walk that retakes the lock between entries can have an unvisited context
+/// moved behind it and silently miss the one holding custody.
+fn hold_outer_contexts(adapter_key: usize) -> HeldOuterContexts {
+    let mut held: [Option<NativeContextOperation>; MAX_OUTER_CONTEXTS] =
+        core::array::from_fn(|_| None);
+    let mut count = 0usize;
+    {
+        let registry = OUTER_CONTEXTS.lock();
+        let mut index = 0usize;
+        while index < registry.count && count < held.len() {
+            let (owner, context) = registry.entries[index];
+            index += 1;
+            if owner != adapter_key || context == 0 {
+                continue;
+            }
+            // SAFETY: `close` unregisters under this same lock before it tears
+            // the context down, so a registered entry is live for as long as
+            // the lock is held, and the guard taken here keeps it live after.
+            let native = unsafe { &*(context as *const NativeContext) };
+            if let Some(operation) = native.acquire_operation() {
+                held[count] = Some(operation);
+                count += 1;
+            }
+        }
+    }
+    HeldOuterContexts { held, count }
+}
+
+struct HeldOuterContexts {
+    held: [Option<NativeContextOperation>; MAX_OUTER_CONTEXTS],
+    count: usize,
+}
+
+impl HeldOuterContexts {
+    fn iter(&self) -> impl Iterator<Item = &NativeContextOperation> {
+        self.held[..self.count].iter().flatten()
+    }
+}
+
+/// Six-bit saturating field, packed at `shift`.
+fn census_field(value: u32, shift: u32) -> u32 {
+    (value.min(0x3f)) << shift
+}
+
+/// Who, inside this driver, still holds a guard on the allocation open object
+/// `open`. Published as `OaOutWho` when `CloseAllocation`'s rundown join is
+/// about to block, to name the holder the retraction did not reach:
+///
+/// ```text
+/// bits  0..5   parked Ready batches referencing `open` with NO ticket
+/// bits  6..11  parked Ready batches referencing `open` WITH a ticket
+/// bits 12..17  OuterPending entries queued on a worker referencing `open`
+/// bits 18..23  InFlight slots across the walked contexts
+/// bits 24..29  outer contexts walked
+/// bits 30..31  0b01, so a census that ran is never confusable with an absent
+///              or fossil zero
+/// ```
+///
+/// A nonzero no-ticket count is the loud one: the retraction runs immediately
+/// before the join and takes exactly those, so any left is a walk that missed.
+///
+/// ⛔ `InFlight` is here because `Nr2Sub == Nr2HostOk` does NOT exclude a live
+/// submission: `NR2_HOST_SUBMIT_OK` is bumped right after `worker.enqueue`
+/// returns, long before any host terminal.
+pub(crate) fn census_open_holders(adapter: &crate::adapter::AdapterContext, open: usize) -> u32 {
+    if open == 0 {
+        return 1 << 30;
+    }
+    let held = hold_outer_contexts(core::ptr::from_ref(adapter) as usize);
+    let mut parked_free = 0u32;
+    let mut parked_ticketed = 0u32;
+    let mut queued = 0u32;
+    let mut in_flight = 0u32;
+    let mut contexts = 0u32;
+    for operation in held.iter() {
+        contexts = contexts.saturating_add(1);
+        // SAFETY: the guard holds this context's rundown open.
+        let native = unsafe { operation.owner.as_ref() };
+        {
+            let executor = native.executor.lock();
+            for slot in executor.slots.iter() {
+                match slot {
+                    SubmissionSlot::Ready {
+                        tickets,
+                        batch: Some(batch),
+                        ..
+                    } if batch.custody.references_open(open) => {
+                        if tickets.count == 0 {
+                            parked_free = parked_free.saturating_add(1);
+                        } else {
+                            parked_ticketed = parked_ticketed.saturating_add(1);
+                        }
+                    }
+                    // Custody has moved to the transport's in-flight entry, so
+                    // there is nothing here to test against `open` — the count
+                    // itself is the statement that a host terminal is owed.
+                    SubmissionSlot::InFlight { .. } => {
+                        in_flight = in_flight.saturating_add(1);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Some(worker) = native.outer_worker.as_ref() {
+            let state = worker.state.lock();
+            for pending in state.pending.as_slice() {
+                if pending.command_pool.references_open(open) {
+                    queued = queued.saturating_add(1);
+                }
+            }
+        }
+    }
+    census_field(parked_free, 0)
+        | census_field(parked_ticketed, 6)
+        | census_field(queued, 12)
+        | census_field(in_flight, 18)
+        | census_field(contexts, 24)
+        | (1 << 30)
+}
+
 /// Retract every parked, never-submitted batch that pins the allocation open
 /// object `open`, so `CloseAllocation` can complete. Returns how many were freed.
 ///
@@ -1738,32 +1863,9 @@ pub(crate) fn retract_parked_referencing(
     if open == 0 {
         return 0;
     }
-    let adapter_key = core::ptr::from_ref(adapter) as usize;
+    let held = hold_outer_contexts(core::ptr::from_ref(adapter) as usize);
     let mut freed = 0u32;
-    let mut index = 0usize;
-    loop {
-        // Re-derive the guard each round: the registry lock cannot be held while
-        // a batch is dropped (contiguous DMA buffers are PASSIVE-only) and this
-        // spinlock raises to DISPATCH.
-        let operation = {
-            let registry = OUTER_CONTEXTS.lock();
-            if index >= registry.count {
-                break;
-            }
-            let (owner, context) = registry.entries[index];
-            index += 1;
-            if owner != adapter_key || context == 0 {
-                continue;
-            }
-            // SAFETY: `close` unregisters under this same lock before it tears
-            // the context down, so a registered entry is live for as long as the
-            // lock is held, and the rundown guard taken here keeps it live after.
-            let native = unsafe { &*(context as *const NativeContext) };
-            native.acquire_operation()
-        };
-        let Some(operation) = operation else {
-            continue;
-        };
+    for operation in held.iter() {
         // SAFETY: the guard holds this context's rundown open.
         let native = unsafe { operation.owner.as_ref() };
         // One batch per pass: taking them all under the executor lock would need
@@ -1804,7 +1906,6 @@ pub(crate) fn retract_parked_referencing(
             drop(batch);
             freed += 1;
         }
-        drop(operation);
     }
     if freed != 0 {
         let total = NR2_RETRACTED.fetch_add(freed, Ordering::Relaxed) + freed;

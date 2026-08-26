@@ -729,12 +729,21 @@ struct OpenOuterRundown {
     active: u32,
 }
 
+/// GPUVA patch resolution / command-pool use.
+const OUTER_TAG_GPUVA: u32 = 1;
+/// Physical allocation-list use.
+const OUTER_TAG_PHYSICAL: u32 = 2;
+/// The device open-table bind guard.
+const OUTER_TAG_BIND: u32 = 3;
+const OUTER_TAG_COUNT: usize = 3;
+
 struct OpenOuterBinding {
     rundown: SpinLock<OpenOuterRundown>,
     drained: UnsafeCell<KEVENT>,
-    /// Call-site tag of the most recent [`Self::acquire_tagged`]; published by
-    /// `close` when the join blocks, to name the guard that was never returned.
-    last_tag: AtomicU32,
+    /// Outstanding guards per acquire site, indexed by tag - 1. Maintained
+    /// under `rundown`, so the three always sum to `active` and a sum that
+    /// does not is itself the news.
+    by_tag: [AtomicU32; OUTER_TAG_COUNT],
 }
 
 unsafe impl Send for OpenOuterBinding {}
@@ -748,7 +757,7 @@ impl OpenOuterBinding {
                 active: 0,
             }),
             drained: UnsafeCell::new(unsafe { core::mem::zeroed() }),
-            last_tag: AtomicU32::new(0),
+            by_tag: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
         }
     }
 
@@ -756,14 +765,11 @@ impl OpenOuterBinding {
         unsafe { KeInitializeEvent(self.drained.get(), 0, 1) };
     }
 
-    fn acquire(&self) -> bool {
-        self.acquire_tagged(0)
-    }
-
-    /// `tag` names the call site, so a guard that is never returned can be
-    /// attributed. There are three acquirers and no other way to tell them
-    /// apart once the count is all that is left: 1 = GPUVA patch resolution,
-    /// 2 = physical allocation-list use, 3 = the device open-table bind guard.
+    /// `tag` names the acquire site, and every guard carries the tag it was
+    /// taken with so `release_tagged` can return it to the same counter. The
+    /// earlier design stored only the LAST tag, which cannot answer the
+    /// question it was added for: the most recent acquire is not the one that
+    /// never came back.
     fn acquire_tagged(&self, tag: u32) -> bool {
         let mut state = self.rundown.lock();
         if !state.open || state.active == u32::MAX {
@@ -773,15 +779,24 @@ impl OpenOuterBinding {
             unsafe { KeClearEvent(self.drained.get()) };
         }
         state.active += 1;
-        self.last_tag.store(tag, Ordering::Relaxed);
+        // Under `rundown` on purpose: outside it the per-tag sum could lag
+        // `active` by the number of threads mid-acquire, and a disagreement
+        // then would not mean anything.
+        if let Some(counter) = self.by_tag.get(tag.wrapping_sub(1) as usize) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
         true
     }
 
-    fn release(&self) {
+    fn release_tagged(&self, tag: u32) {
         let signal = {
             let mut state = self.rundown.lock();
             debug_assert!(state.active != 0);
             state.active = state.active.saturating_sub(1);
+            if let Some(counter) = self.by_tag.get(tag.wrapping_sub(1) as usize) {
+                let previous = counter.load(Ordering::Relaxed);
+                counter.store(previous.saturating_sub(1), Ordering::Relaxed);
+            }
             state.active == 0
         };
         if signal {
@@ -789,7 +804,9 @@ impl OpenOuterBinding {
         }
     }
 
-    fn close(&self) {
+    /// `census` names the driver's own structures that still hold a guard; it
+    /// is evaluated only on the blocking path.
+    fn close(&self, census: impl FnOnce() -> u32) {
         let active = {
             let mut state = self.rundown.lock();
             state.open = false;
@@ -800,15 +817,22 @@ impl OpenOuterBinding {
             // when it does not return, CloseAllocation is holding dxgkrnl's
             // adapter-exclusive DDI lock and the whole interactive session
             // deadlocks behind it — so anything recorded after the wait would
-            // never be written. `OaOutAct` is therefore the only in-driver
-            // evidence of the blocking state, and `Nr2WkPend` beside it says
-            // whether the guards are held by undrained work items or by a parked
-            // never-submitted batch.
-            crate::diag::record_named_bytes(b"OaOutAct", active);
-            crate::diag::record_named_bytes(
-                b"OaOutTag",
-                self.last_tag.load(Ordering::Relaxed),
-            );
+            // never be written. The per-tag census rides on `OaOutAct` rather
+            // than a second value name because on .375 `OaOutTag` never
+            // appeared even though the writes either side of it did, and the
+            // reason was never found.
+            //   bits 0..7 active | 8..15 tag 1 | 16..23 tag 2 | 24..31 tag 3
+            // The three tag bytes sum to `active`, so all-zero high bytes mean
+            // a .375 fossil in the old `active`-only encoding or a guard taken
+            // with a tag outside 1..=3.
+            let mut packed = active.min(0xff);
+            let mut index = 0;
+            while index < self.by_tag.len() {
+                packed |= self.by_tag[index].load(Ordering::Relaxed).min(0xff) << (8 * (index + 1));
+                index += 1;
+            }
+            crate::diag::record_named_bytes(b"OaOutAct", packed);
+            crate::diag::record_named_bytes(b"OaOutWho", census());
             crate::diag::record_named_bytes(
                 b"Nr2WkPend",
                 crate::ddi::native_render::NR2_WORKER_PENDING_LIVE
@@ -846,7 +870,9 @@ impl OuterBindGuard {
 
 impl Drop for OuterBindGuard {
     fn drop(&mut self) {
-        unsafe { self.open.as_ref() }.outer.release();
+        unsafe { self.open.as_ref() }
+            .outer
+            .release_tagged(OUTER_TAG_BIND);
     }
 }
 
@@ -1286,6 +1312,9 @@ pub(crate) struct OpenOuterUse {
     execution: Option<OpenExecutionUse>,
     identity: OpenIdentity,
     allocation_offset: u64,
+    /// The acquire site this guard came from, so `Drop` returns it to the same
+    /// per-tag counter the join publishes.
+    tag: u32,
 }
 
 unsafe impl Send for OpenOuterUse {}
@@ -1378,7 +1407,7 @@ impl OpenOuterUse {
 
 impl Drop for OpenOuterUse {
     fn drop(&mut self) {
-        unsafe { self.open.as_ref() }.outer.release();
+        unsafe { self.open.as_ref() }.outer.release_tagged(self.tag);
     }
 }
 
@@ -1426,7 +1455,7 @@ pub(crate) unsafe fn acquire_outer_gpuva_use(
         }
     }
     let allocation_offset = found?;
-    if !open.outer.acquire_tagged(1) {
+    if !open.outer.acquire_tagged(OUTER_TAG_GPUVA) {
         return None;
     }
     let execution = if require_hoc1 {
@@ -1439,7 +1468,7 @@ pub(crate) unsafe fn acquire_outer_gpuva_use(
         {
             Some(execution) => Some(execution),
             None => {
-                open.outer.release();
+                open.outer.release_tagged(OUTER_TAG_GPUVA);
                 return None;
             }
         }
@@ -1449,6 +1478,7 @@ pub(crate) unsafe fn acquire_outer_gpuva_use(
         execution,
         identity,
         allocation_offset,
+        tag: OUTER_TAG_GPUVA,
     })
 }
 
@@ -1528,7 +1558,7 @@ pub(crate) unsafe fn acquire_outer_physical_use(
     if allocation.generation != identity.generation || allocation.kind != identity.kind {
         return None;
     }
-    if !open.outer.acquire_tagged(2) {
+    if !open.outer.acquire_tagged(OUTER_TAG_PHYSICAL) {
         return None;
     }
     let Some(execution) = open
@@ -1536,7 +1566,7 @@ pub(crate) unsafe fn acquire_outer_physical_use(
         .as_ref()
         .and_then(|binding| binding.acquire_attached(session, identity.generation))
     else {
-        open.outer.release();
+        open.outer.release_tagged(OUTER_TAG_PHYSICAL);
         return None;
     };
     Some(OpenOuterUse {
@@ -1544,6 +1574,7 @@ pub(crate) unsafe fn acquire_outer_physical_use(
         execution: Some(execution),
         identity,
         allocation_offset: 0,
+        tag: OUTER_TAG_PHYSICAL,
     })
 }
 
@@ -1795,7 +1826,7 @@ unsafe fn open_allocation_context<'a>(h: HANDLE) -> Option<&'a OpenAllocationCon
 /// the owning DeviceContext's bounded open-table lock.
 pub(crate) unsafe fn acquire_outer_bind_guard(open: usize) -> Option<OuterBindGuard> {
     let open = unsafe { open_allocation_context(open as HANDLE)? };
-    if !open.outer.acquire_tagged(3) {
+    if !open.outer.acquire_tagged(OUTER_TAG_BIND) {
         return None;
     }
     Some(OuterBindGuard {
@@ -4995,7 +5026,9 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         let raw_open = Box::into_raw(open);
         if !device.register_outer_open(raw_open as usize) {
             let mut open = unsafe { Box::from_raw(raw_open) };
-            open.outer.close();
+            // Never published, so no guard can exist and there is nothing to
+            // census.
+            open.outer.close(|| 0);
             if let Some(execution) = open.execution.take() {
                 execution.close(unsafe { PassiveLevel::assume() });
             }
@@ -5447,12 +5480,13 @@ pub unsafe extern "C" fn dxgkddi_close_allocation(
                 // guard nothing else will ever return. Retracting those is what
                 // makes the join finite — see `retract_parked_referencing`.
                 if let Some(adapter) = device.adapter() {
-                    crate::ddi::native_render::retract_parked_referencing(
-                        adapter,
-                        handle as usize,
-                    );
+                    crate::ddi::native_render::retract_parked_referencing(adapter, handle as usize);
                 }
-                open.outer.close();
+                open.outer.close(|| {
+                    device.adapter().map_or(0, |adapter| {
+                        crate::ddi::native_render::census_open_holders(adapter, handle as usize)
+                    })
+                });
                 if let Some(execution) = open.execution.take() {
                     // CloseAllocation is PASSIVE_LEVEL.  Revoke new use,
                     // event-join exact host custody, then detach/release before

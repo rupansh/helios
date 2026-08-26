@@ -18,13 +18,37 @@ the parked leak fell 15 → 2). Plus the `OUTER_CONTEXTS` registry it needs, a r
 before/after join diagnostics (`OaOutAct`/`OaOutDrn`, `OaExeAct`/`OaExeDrn`,
 `Nr2WkPend`, `Nr2Retract`).
 
-**Open:** one `OpenOuterBinding` guard is still outstanding at the join with NO
-submission pending anywhere (`K9Adm=K9Ret=44`, `Nr2Sub=Nr2HostOk`, `Nr2WkPend=0`),
-so the holder is not a batch. Prime suspect: `scratch.building`, which holds
-allocation custody for a partially assembled batch and is released only at commit
-or context close — the same inversion one layer up. ⚠ The `OaOutTag` call-site
-tag added to answer this does not appear in the registry even though the writes
-around it do; do not trust it until that is understood.
+**Open:** one `OpenOuterBinding` guard is still outstanding at the join
+(`OaOutAct=1`). Two claims made about it on 2026-08-25 are now **refuted from the
+source**, and both were narrowing the search wrongly:
+
+- ⛔ **`scratch.building` cannot be the holder.** `BuildingBatch` carries
+  `identity`/`slot_index`/`payload`/`meta`/`staging`/`session` and **no allocation
+  custody at all**. Every live `OpenOuterUse` in the driver sits in exactly one of
+  `OuterCustody::{Physical,Virtual}` (so: a `Ready` batch, or the transport's
+  in-flight `NativeHostCompletion`) or `OuterPending.command_pool`. It was the
+  prime suspect and it is not reachable.
+- ⛔ **`Nr2Sub == Nr2HostOk` does NOT exclude a live submission.**
+  `NR2_HOST_SUBMIT_OK` is incremented immediately after `worker.enqueue` returns
+  — before the work item runs, long before any host terminal. So "the holder is
+  not an in-flight submission" was never established, and a submitted batch whose
+  used-ring response never arrived is back in the candidate set, alongside a
+  ticketed `Ready` batch and a leaked `OuterBindGuard`.
+
+**Instrument (22.22.376.0).** `OaOutTag` was doubly useless — it never appeared in
+the registry, and storing only the LAST tag could not have named a guard that was
+never returned anyway. Replaced by per-tag outstanding counts maintained under the
+rundown lock and packed into `OaOutAct` itself, which is the write proven to land:
+`bits 0..7 active | 8..15 tag 1 (GPUVA/command pool) | 16..23 tag 2 (physical
+list) | 24..31 tag 3 (bind guard)`. Beside it `OaOutWho` names the structure
+still holding: `bits 0..5 parked no-ticket | 6..11 parked ticketed | 12..17 worker-queued
+| 18..23 InFlight | 24..29 contexts walked | 30..31 = 0b01`.
+
+**Also fixed:** `retract_parked_referencing` walked the context registry by index,
+retaking the lock between entries. `unregister_outer_context` swap-removes, so a
+concurrent unregister could move an unvisited context into an already-passed slot
+and the walk would never see it — a silent miss during exactly the teardown storm
+it runs in. It now guards every matching context in one pass.
 
 ⛔ A timeout on the join is a **use-after-free**, not a fix. Reproduce with
 `powercfg /change monitor-timeout-ac 1` (+ `VIDEOCONLOCK 60`); suppress with both
