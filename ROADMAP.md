@@ -60,6 +60,32 @@ wait ~3 min — and there is no lasting way to hold an unwedged session.
 session); confirm every reboot with `LastBootUpTime` and use QMP `system_reset`.
 Full detail: `freeze-rootcaused-closealloc-unbounded-join` memory.
 
+### ⭐ .377 measurement: the outstanding guard is UNATTRIBUTED
+
+Fossil-free, image proven by **hash** (service `ImagePath` →
+`..._13a0394f2729d86f`, SHA256 `674924D0D4DBCCA2` = the built package) rather
+than by `DriverVersion`, which does not prove which image loaded.
+
+`OaOutAct = 0x00000001` decodes to: `active`=1, tag1=tag2=tag3=0, and every
+structural field 0 — no parked Ready batch (ticketed or not), no worker-queued
+`OuterPending`, no `InFlight` slot. `OaOutDrn` absent (join never returned),
+`OaExeAct` absent (the execution join is not involved).
+
+`active` is incremented only in `acquire_tagged` and decremented only in
+`release_tagged`, both under the same lock and both touching a tag counter in
+the same critical section, so `active=1` with all tags 0 should be impossible —
+and the counters are not underflowed (.377 uses `wrapping_sub` so an underflow
+reads `0xF`). Leading reading: **stale rundown state, not a live holder** — a
+different defect class from the lifetime inversion already fixed.
+
+⛔ Instrument caveat: in `close()`'s blocking branch the FIRST and THIRD
+`record_named_bytes` land and the SECOND never appears — across .375
+(`OaOutTag`), .376 and .377 (`OaOutWho`), the last carrying the same value with
+nothing called between the writes. Refuted and not to be re-tested: the name
+(creatable by hand), a value cap (3998 values, takes new ones), the argument
+being a call, a mangled name, driver-side deletion (none exists), a stale image.
+**Put the answer on `OaOutAct`; never on a second name.**
+
 ### The mechanism (proven by live KD, then re-proven in-driver)
 
 **It is NOT flip retirement.** With ntoseye (KD-over-serial) attached to the
