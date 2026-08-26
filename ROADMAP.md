@@ -4,6 +4,63 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ⛔ TOP DEFECT — session FREEZE: root-caused, PARTIALLY fixed in 22.22.375.0, STILL REPRODUCES
+
+**Status 2026-08-25 05:00.** The mechanism below is proven and one holder class
+is fixed and verified firing — but the freeze is NOT gone. On .375 with a
+**cleared** counter key: `OaOutAct=1`, `OaOutDrn` absent, `wake_ran=False`.
+
+**Landed:** `native_render::retract_parked_referencing`, called from
+`dxgkddi_close_allocation` before the join, drops every zero-ticket parked
+`Ready` batch whose custody references the dying allocation (`Nr2Retract` hit 17;
+the parked leak fell 15 → 2). Plus the `OUTER_CONTEXTS` registry it needs, a real
+`DxgkDdiCancelCommand` (never invoked by dxgkrnl — `CanN` always absent), and
+before/after join diagnostics (`OaOutAct`/`OaOutDrn`, `OaExeAct`/`OaExeDrn`,
+`Nr2WkPend`, `Nr2Retract`).
+
+**Open:** one `OpenOuterBinding` guard is still outstanding at the join with NO
+submission pending anywhere (`K9Adm=K9Ret=44`, `Nr2Sub=Nr2HostOk`, `Nr2WkPend=0`),
+so the holder is not a batch. Prime suspect: `scratch.building`, which holds
+allocation custody for a partially assembled batch and is released only at commit
+or context close — the same inversion one layer up. ⚠ The `OaOutTag` call-site
+tag added to answer this does not appear in the registry even though the writes
+around it do; do not trust it until that is understood.
+
+⛔ A timeout on the join is a **use-after-free**, not a fix. Reproduce with
+`powercfg /change monitor-timeout-ac 1` (+ `VIDEOCONLOCK 60`); suppress with both
+`0` — suppression is also REQUIRED for `win_install_kmd`, since devcon's device
+restart hangs on a wedged session. Full detail:
+`freeze-rootcaused-closealloc-unbounded-join` memory.
+
+### The mechanism (proven by live KD, then re-proven in-driver)
+
+**It is NOT flip retirement.** With ntoseye (KD-over-serial) attached to the
+wedged 22.22.370.0 guest, kernel stack walks prove: **dwm's `D3DKMTDestroyAllocation`
+(rotating out old primaries after the SourceInvisible display-off drain) enters
+our `DxgkDdiCloseAllocation`, which blocks forever in an unbounded
+`KeWaitForSingleObject`** — `.map` pins the frame to `dxgkddi_close_allocation+0x131`
+= the inlined `open.outer.close()` rundown join (`create_allocation.rs:5401` →
+`:779`, `Timeout=NULL`). dxgkrnl holds the **DXGADAPTER core resource / DDI-sync
+EXCLUSIVE** across that DDI, so LogonUI's `DxgkWaitForVerticalBlankEvent`
+(`AcquireCoreResourceShared`) and the ENTIRE win32k User-lock chain (dwm, csrss
+both sessions, winlogon, LogonUI, any `NtUserCreateSystemThreads`) deadlock
+behind it. Session 0 (SSH) is unaffected. Matches every symptom (dwm 0 CPU,
+counters byte-identical, no DEVICE_LOST, no bugcheck).
+
+Layer-2 (why the join never releases): a queued/in-flight **OUTER native-render
+batch** never retired its `OpenOuterUse` custody on the destroyed allocation
+(`native_render.rs` OuterWorker / `drain_host_terminals`), so `outer.drained`
+never signals. Not fully pinned — needs live device-ring/worker-queue offsets and
+intersects the UNCOMMITTED dxvk sharing rework + A7 lane (owner-gated).
+
+Fix: ⛔ a naive join timeout is a **use-after-free** (`drop(open)` frees the
+binding while the batch still holds an `OpenOuterUse`). Correct shape (B): bound
+the join + force the in-flight/queued entries terminal via the existing
+physical-reset mechanism (`submit_command.rs:568`) before the free, loud counter
+— upholds "a DDI must not deadlock the adapter"; touches TDR, owner-review. Or
+(A, preferred/lower-risk): fix why the outer batch never retires. Full evidence +
+KD-bridge tooling in the `freeze-rootcaused-closealloc-unbounded-join` memory.
+
 ## ⭐ FRONTIER A ROOT-CAUSED + FIXED, 2026-08-24 night (KMD 22.22.370.0 STAGED, NOT BOOTED)
 
 The black desktop's producer defect was NOT the `VK_KHR_EXTERNAL_MEMORY_WIN32`
