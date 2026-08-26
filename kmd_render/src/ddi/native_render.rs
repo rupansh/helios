@@ -1757,23 +1757,23 @@ impl HeldOuterContexts {
     }
 }
 
-/// Six-bit saturating field, packed at `shift`.
+/// Saturating nibble, packed at `shift`.
 fn census_field(value: u32, shift: u32) -> u32 {
-    (value.min(0x3f)) << shift
+    (value.min(0xf)) << shift
 }
 
 /// Who, inside this driver, still holds a guard on the allocation open object
 /// `open`. Published as `OaOutWho` when `CloseAllocation`'s rundown join is
 /// about to block, to name the holder the retraction did not reach:
 ///
+/// Four saturating nibbles, which `OpenOuterBinding::close` shifts into the top
+/// half of the single value it publishes:
+///
 /// ```text
-/// bits  0..5   parked Ready batches referencing `open` with NO ticket
-/// bits  6..11  parked Ready batches referencing `open` WITH a ticket
-/// bits 12..17  OuterPending entries queued on a worker referencing `open`
-/// bits 18..23  InFlight slots across the walked contexts
-/// bits 24..29  outer contexts walked
-/// bits 30..31  0b01, so a census that ran is never confusable with an absent
-///              or fossil zero
+/// bits  0..3   parked Ready batches referencing `open` with NO ticket
+/// bits  4..7   parked Ready batches referencing `open` WITH a ticket
+/// bits  8..11  OuterPending entries queued on a worker referencing `open`
+/// bits 12..15  InFlight slots across the walked contexts
 /// ```
 ///
 /// A nonzero no-ticket count is the loud one: the retraction runs immediately
@@ -1784,16 +1784,14 @@ fn census_field(value: u32, shift: u32) -> u32 {
 /// returns, long before any host terminal.
 pub(crate) fn census_open_holders(adapter: &crate::adapter::AdapterContext, open: usize) -> u32 {
     if open == 0 {
-        return 1 << 30;
+        return 0;
     }
     let held = hold_outer_contexts(core::ptr::from_ref(adapter) as usize);
     let mut parked_free = 0u32;
     let mut parked_ticketed = 0u32;
     let mut queued = 0u32;
     let mut in_flight = 0u32;
-    let mut contexts = 0u32;
     for operation in held.iter() {
-        contexts = contexts.saturating_add(1);
         // SAFETY: the guard holds this context's rundown open.
         let native = unsafe { operation.owner.as_ref() };
         {
@@ -1831,11 +1829,9 @@ pub(crate) fn census_open_holders(adapter: &crate::adapter::AdapterContext, open
         }
     }
     census_field(parked_free, 0)
-        | census_field(parked_ticketed, 6)
-        | census_field(queued, 12)
-        | census_field(in_flight, 18)
-        | census_field(contexts, 24)
-        | (1 << 30)
+        | census_field(parked_ticketed, 4)
+        | census_field(queued, 8)
+        | census_field(in_flight, 12)
 }
 
 /// Retract every parked, never-submitted batch that pins the allocation open

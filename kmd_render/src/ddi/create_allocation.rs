@@ -793,9 +793,12 @@ impl OpenOuterBinding {
             let mut state = self.rundown.lock();
             debug_assert!(state.active != 0);
             state.active = state.active.saturating_sub(1);
+            // WRAPPING, not saturating: a release whose tag does not match its
+            // acquire would otherwise clamp the counter to 0 and read exactly
+            // like "nothing outstanding". Underflow shows as 0xF in the nibble.
             if let Some(counter) = self.by_tag.get(tag.wrapping_sub(1) as usize) {
                 let previous = counter.load(Ordering::Relaxed);
-                counter.store(previous.saturating_sub(1), Ordering::Relaxed);
+                counter.store(previous.wrapping_sub(1), Ordering::Relaxed);
             }
             state.active == 0
         };
@@ -813,26 +816,36 @@ impl OpenOuterBinding {
             state.active
         };
         if active != 0 {
-            // PUBLISHED BEFORE THE WAIT ON PURPOSE. This wait has no timeout, and
-            // when it does not return, CloseAllocation is holding dxgkrnl's
-            // adapter-exclusive DDI lock and the whole interactive session
-            // deadlocks behind it — so anything recorded after the wait would
-            // never be written. The per-tag census rides on `OaOutAct` rather
-            // than a second value name because on .375 `OaOutTag` never
-            // appeared even though the writes either side of it did, and the
-            // reason was never found.
-            //   bits 0..7 active | 8..15 tag 1 | 16..23 tag 2 | 24..31 tag 3
-            // The three tag bytes sum to `active`, so all-zero high bytes mean
-            // a .375 fossil in the old `active`-only encoding or a guard taken
-            // with a tag outside 1..=3.
-            let mut packed = active.min(0xff);
+            // PUBLISHED BEFORE THE WAIT ON PURPOSE: this wait has no timeout,
+            // and when it does not return, CloseAllocation holds dxgkrnl's
+            // adapter-exclusive DDI lock and the whole win32k session deadlocks
+            // behind it, so nothing recorded after the wait is ever written.
+            //
+            // ⛔ ONE VALUE, AND EVERY FIELD COMPUTED BEFORE THE FIRST WRITE.
+            // Twice now a `record_named_bytes` sitting BETWEEN two that landed
+            // has failed to appear in the registry — `OaOutTag` on .375 and
+            // `OaOutWho` on .376 — and both times the vanishing write was the
+            // one whose value argument was a CALL. The name is not the cause:
+            // `OaOutWho` can be created in that key by hand. So nothing is
+            // called between the writes any more, and the answer rides on
+            // `OaOutAct`, the write that has always landed. Nibbles, saturating,
+            // so it reads straight out of hex as 0xIQPp_321A:
+            //   0  active     1 tag1 GPUVA   2 tag2 physical  3 tag3 bind
+            //   4  parked no-ticket          5 parked ticketed
+            //   6  worker-queued             7 InFlight
+            // A tag nibble of 0xF is an underflowed counter, not a count.
+            let mut packed = active.min(0xf);
             let mut index = 0;
             while index < self.by_tag.len() {
-                packed |= self.by_tag[index].load(Ordering::Relaxed).min(0xff) << (8 * (index + 1));
+                packed |= self.by_tag[index].load(Ordering::Relaxed).min(0xf) << (4 * (index + 1));
                 index += 1;
             }
+            packed |= census() << 16;
             crate::diag::record_named_bytes(b"OaOutAct", packed);
-            crate::diag::record_named_bytes(b"OaOutWho", census());
+            // Control for the vanishing-write anomaly: same value, second name,
+            // nothing called in between. If this one lands, the trigger was the
+            // call in the argument; if it does not, it is the name after all.
+            crate::diag::record_named_bytes(b"OaOutWho", packed);
             crate::diag::record_named_bytes(
                 b"Nr2WkPend",
                 crate::ddi::native_render::NR2_WORKER_PENDING_LIVE
