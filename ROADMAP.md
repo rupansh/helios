@@ -50,11 +50,15 @@ concurrent unregister could move an unvisited context into an already-passed slo
 and the walk would never see it — a silent miss during exactly the teardown storm
 it runs in. It now guards every matching context in one pass.
 
-⛔ A timeout on the join is a **use-after-free**, not a fix. Reproduce with
-`powercfg /change monitor-timeout-ac 1` (+ `VIDEOCONLOCK 60`); suppress with both
-`0` — suppression is also REQUIRED for `win_install_kmd`, since devcon's device
-restart hangs on a wedged session. Full detail:
-`freeze-rootcaused-closealloc-unbounded-join` memory.
+⛔ A timeout on the join is a **use-after-free**, not a fix.
+
+⛔ **The display-off timeout is NOT the trigger (measured 2026-08-26).** With
+`VIDEOIDLE`=0 on AC and DC a fresh boot still wedges at ~2.4 min uptime, on
+counters proven fresh for that boot. So reproduction needs no arming — boot and
+wait ~3 min — and there is no lasting way to hold an unwedged session.
+⛔ `shutdown /r` cannot recover a wedged guest (it needs the deadlocked win32k
+session); confirm every reboot with `LastBootUpTime` and use QMP `system_reset`.
+Full detail: `freeze-rootcaused-closealloc-unbounded-join` memory.
 
 ### The mechanism (proven by live KD, then re-proven in-driver)
 
