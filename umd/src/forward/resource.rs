@@ -389,11 +389,7 @@ pub(crate) unsafe fn make_resident(
         return Err(hr);
     }
 
-    let resident = ResidentAllocation {
-        handle,
-        h_rt_device: outer.h_rt_device,
-        evict_cb,
-    };
+    let resident = ResidentAllocation::new(handle, outer.h_rt_device, evict_cb);
     if hr == E_PENDING {
         let Some(wait_cb) = (*outer.kt_callbacks).pfnWaitForSynchronizationObjectFromCpuCb else {
             log_error!("WDDM residency: E_PENDING but CPU fence-wait callback is missing");
@@ -493,8 +489,10 @@ impl CreatedWddmAllocation {
         let allocation = self.allocation_handle();
         let cpu_backing = self.cpu_backing.take();
         remove_outer_allocation(&dev.outer, self.identity);
-        drop(self.resident.take());
+        // Deallocate first, then release the residency guard through the
+        // channel that actually ran -- see `state::release_residency`.
         let deallocated = deallocate_standalone(&dev.outer, allocation);
+        release_residency(self.resident.take(), deallocated);
         finish_cpu_backing_rollback(cpu_backing, deallocated);
     }
 
@@ -531,7 +529,9 @@ struct OpenedWddmAllocation {
 impl OpenedWddmAllocation {
     unsafe fn rollback(mut self, dev: &crate::device_funcs::HeliosDevice) {
         remove_outer_allocation(&dev.outer, self.identity);
-        drop(self.resident.take());
+        // The runtime owns the open, so nothing deallocates here and the evict
+        // is the only way to give the residency reference back.
+        release_residency(self.resident.take(), false);
     }
 
     fn into_state(

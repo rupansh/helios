@@ -410,12 +410,13 @@ unsafe fn complete_pending_outer_allocation(
 
     let token = pending.identity.token;
     let mut cpu_backing = pending.cpu_backing;
-    let allocation = pending
-        .resident
+    // The residency guard stays alive until the deallocate below has run, so
+    // `release_residency` can pick its channel from what actually happened.
+    let resident = pending.resident;
+    let allocation = resident
         .as_ref()
         .map(ResidentAllocation::handle)
         .unwrap_or(0);
-    drop(pending.resident);
 
     let needs_deallocate = allocation != 0 || !pending.rt_resource.is_null();
     if needs_deallocate
@@ -430,9 +431,11 @@ unsafe fn complete_pending_outer_allocation(
         if let Some(backing) = cpu_backing.take() {
             backing.leak();
         }
+        release_residency(resident, false);
         return Err(R::TeardownNotPending);
     }
 
+    let mut deallocated = false;
     if needs_deallocate {
         if let Some(deallocate_cb) = (*outer.kt_callbacks).pfnDeallocateCb {
             let mut allocation = allocation;
@@ -477,15 +480,18 @@ unsafe fn complete_pending_outer_allocation(
                     pending.rt_resource,
                     pending.ownership.owns()
                 );
+                deallocated = hr == 0;
                 if hr != 0 {
                     if let Some(backing) = cpu_backing.take() {
                         backing.leak();
                     }
+                    release_residency(resident, false);
                     return Err(R::TeardownNotPending);
                 }
             }
         }
     }
+    release_residency(resident, deallocated);
     drop(cpu_backing);
     Ok(())
 }
@@ -605,16 +611,70 @@ pub(crate) struct ResidentAllocation {
     pub(crate) handle: core::num::NonZeroU32,
     pub(crate) h_rt_device: ddi::HANDLE,
     pub(crate) evict_cb: EvictCallback,
+    /// Cleared by [`ResidentAllocation::suppress_evict`]. Private, and the
+    /// reason the constructor exists: a guard built by struct literal
+    /// elsewhere could silently default it the wrong way.
+    evict_on_drop: bool,
 }
 
 impl ResidentAllocation {
+    /// The only constructor. A new guard always owes an evict.
+    pub(crate) fn new(
+        handle: core::num::NonZeroU32,
+        h_rt_device: ddi::HANDLE,
+        evict_cb: EvictCallback,
+    ) -> Self {
+        Self {
+            handle,
+            h_rt_device,
+            evict_cb,
+            evict_on_drop: true,
+        }
+    }
+
     pub(crate) fn handle(&self) -> ddi::D3DKMT_HANDLE {
         self.handle.get()
     }
+
+    /// Drop this guard without calling `pfnEvictCb`. Legal ONLY when a
+    /// `pfnDeallocateCb` that covers the same handle has already returned
+    /// success -- see [`release_residency`], the one caller.
+    fn suppress_evict(&mut self) {
+        self.evict_on_drop = false;
+    }
+}
+
+/// Release a residency guard through the channel the teardown actually used.
+///
+/// `deallocated` means a `pfnDeallocateCb` covering this handle returned
+/// success. `D3DKMTDestroyAllocation` takes the allocation out of the residency
+/// list itself, so the paired `pfnEvictCb` adds nothing -- and it is the call
+/// dxgkrnl answers with `VidSchErrorEvictingWhileInUse` when a
+/// submitted-but-unretired DMA packet still references the allocation. That
+/// error sets the device execution state to 7, D3D11 then calls
+/// `MarkDeviceAsError`, and dwm's device-lost teardown deadlocks the session
+/// ~180 ms later (ROADMAP "TOP DEFECT", two boot traces, 2026-08-28).
+/// `DestroyAllocation` in the same position waits for the packet instead.
+///
+/// Every other path -- an opened allocation nobody deallocates, a failed
+/// deallocate, a missing callback -- still evicts: the residency reference is
+/// real and unbalanced budget is its own defect.
+pub(crate) fn release_residency(resident: Option<ResidentAllocation>, deallocated: bool) {
+    let Some(mut resident) = resident else {
+        return;
+    };
+    if deallocated && !crate::knobs::umd_evict_on_deallocate() {
+        resident.suppress_evict();
+        crate::forward::note_residency_evict_suppressed();
+    }
+    drop(resident);
 }
 
 impl Drop for ResidentAllocation {
     fn drop(&mut self) {
+        if !self.evict_on_drop {
+            return;
+        }
         let handle = self.handle.get();
         let mut evict = ddi::D3DDDICB_EVICT::default();
         evict.NumAllocations = 1;

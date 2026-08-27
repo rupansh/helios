@@ -22,6 +22,7 @@
 //! | `UmdFreeThreaded` | DWORD | `true` (explicit 0 reverts the threading surface) |
 //! | `UmdCommandLists` | DWORD | `true` (explicit 0 reverts to emulated lists) |
 //! | `UmdDeferredDiagnostics` | DWORD | `false` (diagnostic atomics, opt-in) |
+//! | `UmdEvictOnDeallocate` | DWORD | `false` (pair the evict with the deallocate) |
 //!
 //! The surviving policies are `BoolKnob` ("absent = off, non-zero = on") and
 //! `DwordKnob` ("absent = this default, else the stored value").
@@ -211,4 +212,24 @@ pub(crate) fn umd_command_lists() -> bool {
 /// counter or log-throttle atomic RMWs.
 pub(crate) fn umd_deferred_diagnostics() -> bool {
     UMD_DEFERRED_DIAGNOSTICS.get()
+}
+
+/// Pair `pfnEvictCb` with `pfnDeallocateCb` on the same allocation handle — the
+/// behaviour before 2026-08-28. Absent = OFF.
+///
+/// OFF is not a shortcut: `D3DKMTDestroyAllocation` already takes the
+/// allocation out of the residency list, so the evict adds nothing, and it is
+/// the call dxgkrnl answers with `VidSchErrorEvictingWhileInUse` when a
+/// submitted-but-unretired DMA packet still references the allocation — first
+/// error in two boot traces, ~180 ms before the session-freeze deadlock
+/// (ROADMAP "TOP DEFECT"). `DestroyAllocation` in the same position waits for
+/// the packet instead. Set to 1 to restore the paired evict for an A/B.
+pub(crate) static UMD_EVICT_ON_DEALLOCATE: BoolKnob = BoolKnob::new(c"UmdEvictOnDeallocate", false);
+
+/// Whether a residency guard released alongside a successful `pfnDeallocateCb`
+/// still calls `pfnEvictCb`: `HKLM\SOFTWARE\Helios!UmdEvictOnDeallocate`
+/// (REG_DWORD). Read once per process. Absent = OFF. See
+/// [`UMD_EVICT_ON_DEALLOCATE`].
+pub(crate) fn umd_evict_on_deallocate() -> bool {
+    UMD_EVICT_ON_DEALLOCATE.get()
 }

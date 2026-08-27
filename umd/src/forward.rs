@@ -390,6 +390,16 @@ struct DdiRefusals {
     /// broadcast context, neither of which comes from the resource, so the
     /// check was validation the DDI does not require.
     sync_token_identity_unverified: RefusalCounter,
+    /// `pfnEvictCb` skipped because a successful `pfnDeallocateCb` on the same
+    /// handle had already dropped the residency reference.
+    ///
+    /// The paired evict is redundant AND raced: dxgkrnl answers a
+    /// `D3DKMTEvict` whose allocation a submitted-but-unretired DMA packet
+    /// still references with `VidSchErrorEvictingWhileInUse`, which sets the
+    /// device execution state to 7 and ends in the session freeze (ROADMAP,
+    /// 2026-08-28). `DestroyAllocation` has no such race -- dxgkrnl waits for
+    /// the packet. Knob `UmdEvictOnDeallocate=1` restores the paired evict.
+    residency_evict_suppressed: RefusalCounter,
 }
 
 /// ⚠ Each counter now carries its own NAME (`RefusalCounter`, stage S2), so
@@ -421,12 +431,13 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
     hwa2_unknown_dimension: RefusalCounter::new("hwa2_unknown_dimension"),
     hwa2_open_unsupported_shape: RefusalCounter::new("hwa2_open_unsupported_shape"),
     sync_token_identity_unverified: RefusalCounter::new("sync_token_identity_unverified"),
+    residency_evict_suppressed: RefusalCounter::new("residency_evict_suppressed"),
 };
 
 /// The set, in the order the summary prints them. ⛔ This order is the
 /// evidence contract: `DDI refusals:` lines from different builds are diffed.
 /// The K4 counters are APPENDED so every pre-existing column keeps its place.
-static DDI_REFUSAL_SET: [&RefusalCounter; 23] = [
+static DDI_REFUSAL_SET: [&RefusalCounter; 24] = [
     &DDI_REFUSALS.srv_raw_hazard,
     &DDI_REFUSALS.resource_raw_hazard,
     &DDI_REFUSALS.text_filter_size_ignored,
@@ -450,6 +461,7 @@ static DDI_REFUSAL_SET: [&RefusalCounter; 23] = [
     &DDI_REFUSALS.hwa2_unknown_dimension,
     &DDI_REFUSALS.hwa2_open_unsupported_shape,
     &DDI_REFUSALS.sync_token_identity_unverified,
+    &DDI_REFUSALS.residency_evict_suppressed,
 ];
 
 /// One bounded log line carrying every counter.
@@ -482,6 +494,13 @@ fn note_ddi_refusal(counter: &RefusalCounter) {
     if counter.note() {
         log_error!("{}", ddi_refusal_summary());
     }
+}
+
+/// `state::release_residency` skipped a `pfnEvictCb` the deallocate had
+/// already made redundant. Its own function because `DDI_REFUSALS` is private to
+/// this module.
+pub(crate) fn note_residency_evict_suppressed() {
+    note_ddi_refusal(&DDI_REFUSALS.residency_evict_suppressed);
 }
 
 /// Why a present returned without minting a swapchain token. All three shapes
