@@ -107,6 +107,35 @@ inside the failing Evict). That needs a KMD-side instrument, not more ETW.
   state AFTER our own disable. The `required=4587520 fd_size=4096000` messages are
   QEMU's first import attempt; it retries LINEAR and succeeds.
 
+### ✅ FIXED 2026-08-28 — the KMD refused every batch with an empty allocation list
+
+**`f7ef162`, KMD 22.22.382.0.** `render_outer_physical`'s entry guard required a
+non-empty allocation list. DXVK's SECOND batch on every device it has ever
+created is 416 bytes with zero allocation uses, so **every D3D11 device on the
+box died on its second submit**: the KMD answered STATUS_INVALID_PARAMETER, the
+UMD turned that into DeviceLost, and every texture read back zero.
+
+```
+A7 D3D11 HOB1 Render in  batch=1 cmdlen=2212 nalloc=2 ... -> hr=0x00000000
+A7 D3D11 HOB1 Render in  batch=2 cmdlen=416  nalloc=0 ... -> hr=0x80070057
+A7 D3D11 outer device lost at HOB1 Render
+```
+
+| | before | after |
+|---|---|---|
+| `Nr2OuterRej` | `0x000D0001`, +4 per probe run, code 1 | **absent (zero all boot)** |
+| `Nr2OuterQ` / `Nr2OuterHost` | 47 / 48 | 102 / 102, balanced |
+| UMD log | "HOB1 Render refused" then DeviceLost, every process | neither, in any process |
+| host teardown | "19 leaked objects" | clean |
+
+The guard's ten disjuncts all recorded one code, `PrivateData`, and that single
+bucket is what cost the day — the counter named a predicate that was not the one
+failing. Now split into `OuterClassMismatch` / `OuterCommandShape` /
+`OuterPatchListNonEmpty` / `OuterAllocationList`.
+
+⛔ **The desktop is still black and the probe's three GPU stages still read
+zero.** This was a layer, not the end.
+
 ### ⛔ TOP DEFECT — the black desktop is NOT a display defect
 
 **2026-08-28.** `tools/d3d11_roundtrip_split_probe.cpp` reproduces it headless,
@@ -158,6 +187,35 @@ features (EXT buffer_device_address, sync2) the guest demonstrably enabled;
 this names which layer loses them"*). The guest's own diag prints
 `HD1 bdaEXT present=1 enable=1 capture=1` and the wire encoder handles both
 feature structs, so the loss is at or past `vn_call_vkCreateDevice`.
+
+#### Where it stands after `f7ef162`
+
+The batches now reach the host in volume — one probe run moves
+`Nr2OuterQ +8`, `Nr2OuterHost +9`, `Nr2Sub +445`, `Nr2Commit +437`, all
+balanced — the host creates the objects, the device tears down clean, and the
+readback is still exactly zero. So the commands arrive and produce nothing the
+CPU can see.
+
+⭐ Two threads, in order:
+
+1. **`bufferDeviceAddress` is not enabled on the host device.** The host says
+   so 79 + 31 times a boot. `dxvk_device_info.cpp:502` deliberately picks the
+   **EXT** arm for the record-only path and turns the core Vulkan 1.2 feature
+   OFF (`m_recordOnlyDirect` is unconditionally true for our D3D11 bridge,
+   `umd/bridge/dxvk_bridge.cpp:981`), because the unbound-buffer arm of
+   `vkGetBufferDeviceAddress` is EXT-only. The guest chains the EXT struct and
+   its diag confirms it (`HD1 bdaEXT present=1 enable=1`), the venus encoder
+   handles both structs — **so the loss is at or past `vn_call_vkCreateDevice`,
+   most likely vkr filtering the device extension list.** Next step: log the
+   renderer-side extension set the ICD believes it has, then check whether
+   `VK_EXT_buffer_device_address` survives to the host `vkCreateDevice`.
+2. **`vkCreateBuffer` CONCURRENT with `pQueueFamilyIndices[0] = 1000146003`**
+   (= `VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2`), 77 a boot, from
+   `vn_feedback.c`'s feedback buffer — the fence/timeline-completion channel.
+
+⚠ Only 3 of the probe's 7 textures get WDDM allocations; stages 2 and 3 use
+DXVK-internal memory end to end and STILL read zero, so this is not an
+outer-allocation aliasing problem.
 
 #### Bounded, not the cause: the per-process `D3DKMTRender` refusal
 
