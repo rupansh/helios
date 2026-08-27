@@ -107,7 +107,76 @@ inside the failing Evict). That needs a KMD-side instrument, not more ETW.
   state AFTER our own disable. The `required=4587520 fd_size=4096000` messages are
   QEMU's first import attempt; it retries LINEAR and succeeds.
 
-### Still open and independent: the primaries are BLACK
+### ⛔ TOP DEFECT — the black desktop is NOT a display defect
+
+**2026-08-28.** `tools/d3d11_roundtrip_split_probe.cpp` reproduces it headless,
+in session 0, in two seconds — no window, no DWM, no scanout:
+
+```
+1 CPU     match=4096/4096 zero=0/4096    PASS   Map(WRITE)->Unmap->Map(READ)
+2 UPLOAD  match=0/4096    zero=4096/4096 FAIL   staging -> CopyResource -> staging
+3 INIT    match=0/4096    zero=4096/4096 FAIL   D3D11_SUBRESOURCE_DATA -> copy
+4 CLEAR   px0=0x00000000  zero=4096/4096 FAIL   ClearRenderTargetView -> copy
+```
+
+**The CPU view is real and coherent. Everything that routes through the GPU
+comes back exactly zero — not garbage.** Four older probes agree:
+`helios_clear_test_321` RESULT: FAIL, `d3d11_staging_readback_probe` first bytes
+`00 00 00 00`, `d3d11_upload_integrity_probe` **30/30 FAIL** with
+`zeroBytes=8294400 of 8294400`, and `d3d11_shared_content_probe`'s
+**A(dev1 self)=FAIL** — same device, no sharing.
+
+⇒ Nothing about the display, the primary, the scanout or DWM is required to see
+this. `D2PxNz=0` and the black `helios_paintcap` are downstream of it.
+
+**Submission is not the missing piece.** A live `DxgKrnl` trace of one probe run
+shows **414 `DxgkRender` calls, every one reaching `DdiRender`**. The work is
+submitted and produces nothing the CPU can then read.
+
+#### The three named host-side defects, with counts (all still open)
+
+Per boot, `Microsoft-Windows-DxgKrnl` off, `HELIOS_VKR_DEBUG=validate` on:
+
+| n | what |
+|---|---|
+| 79 | `vkCreateGraphicsPipelines`: SPIR-V `PhysicalStorageBufferAddresses` declared, `bufferDeviceAddress` **not enabled on the device** |
+| 31 | `vkAllocateMemory`: `VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT` with the same feature off |
+| 77 | `vkCreateBuffer`: `sharingMode=CONCURRENT`, `pQueueFamilyIndices[0] = 1000146003` |
+
+⭐ **1000146003 is `VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2`** — a structure type
+being read as a queue-family index, i.e. wire corruption, not a bad value. The
+only CONCURRENT buffer in the stack is **`vn_feedback.c`'s feedback buffer**
+(`.pQueueFamilyIndices = dev->queue_families`), and Venus feedback buffers are
+how the guest observes **fence and timeline-semaphore completion**. A broken
+feedback buffer makes DXVK believe a copy has finished and map the destination
+before it has — which returns exactly zero, not garbage. **That is the
+best-supported next hypothesis and it is untested.**
+
+The bufferDeviceAddress rows are the same defect the ICD already names in
+`vn_device.c` (2026-08-24: *"host validation reports the session device lacks
+features (EXT buffer_device_address, sync2) the guest demonstrably enabled;
+this names which layer loses them"*). The guest's own diag prints
+`HD1 bdaEXT present=1 enable=1 capture=1` and the wire encoder handles both
+feature structs, so the loss is at or past `vn_call_vkCreateDevice`.
+
+#### Bounded, not the cause: the per-process `D3DKMTRender` refusal
+
+Every process logs exactly once, at ICD load:
+
+```
+HNS1 pid=N refused payload@0/24 kind=0: 0c00…0300…0000…
+HNR2 context REFUSED at render count=1 status=0xc000000d: D3DKMTRender fragment 0/1 len=136
+HOC1 drop pending=1 bytes=32
+```
+
+dwm included. It loses one context and drops one 32-byte deferred object
+command. Open since 2026-08-24 (*"26 boots-worth of c000000d with no way to see
+WHICH predicate refused"*), and now bounded two ways: dxgkrnl emits **no
+`DxgkRender` scope at all** for it, so it is rejected in the thunk before the
+traced body; and it is one render out of 415 in a probe run whose other 414 all
+reach the miniport, so it cannot by itself be why nothing renders.
+
+### Superseded: the primaries are BLACK
 
 `D2PxN`=2–3 real primaries sampled through the canonical map, `D2PxNz`=0,
 `D2PxMax`=0, while `D2PxPark` on the KMD's own parking blob reads nonzero. The
