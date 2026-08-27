@@ -4,7 +4,44 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
-## ⛔ TOP DEFECT — session FREEZE: root-caused, PARTIALLY fixed in 22.22.375.0, STILL REPRODUCES
+## ⛔ TOP DEFECT — session FREEZE: the CloseAllocation join is FIXED; the freeze is a SECOND mechanism
+
+**2026-08-27.** The counter evidence that drove this whole investigation was
+**measurement artifact**. The service key had hit a ~4000-value ceiling — 3000 of
+them dead `S<num>` S-ring breadcrumbs, because `DiagLevel=1` rewrites them every
+boot — and past that ceiling `RtlWriteRegistryValue` **silently fails to CREATE a
+new value name** while still updating existing ones. `diag::record_named`
+discards the status (`let _ = ...`), so it is invisible. Proven by a full
+before/after `reg query` snapshot across a boot: **ADDED none, REMOVED none, 2497
+CHANGED**.
+
+⇒ `OaOutDrn` "absent" never meant the join failed to return — that name could
+never be created. Same for `OaOutTag`/`OaOutWho`/`OaExeAct`/`OaExeDrn`/`CanN`.
+And `OaOutAct=1` was a stale fossil from a pre-.377 build that an earlier
+PowerShell clear had silently under-deleted.
+
+**Re-measured with a sound instrument** (S-ring fossils deleted, all ten names
+pre-created with sentinel `0x7E57`, QMP reset, image hash-verified .377): every
+one of `OaOutAct`/`OaOutWho`/`OaOutDrn`/`OaExeAct`/`OaExeDrn`/`Nr2WkPend`/
+`Nr2Retract`/`CanN`/`CanRel`/`CanMiss` still reads `0x7E57` — **never written** —
+while `Nr2Sub`=7322 and `Nr2OuterQ`=23 update live. **And the session still
+wedges.**
+
+⇒ `close()`'s `if active != 0` branch never executes on .377. The outer rundown
+join no longer blocks; `retract_parked_referencing` closed that holder class. The
+live-KD stack that pinned `dxgkddi_close_allocation+0x131` was taken on **.370**,
+before the fix. **The remaining freeze is a distinct, unidentified mechanism, and
+it must be found with a fresh instrument** — not with the counters below.
+
+⇒ `DxgkDdiCancelCommand` genuinely is never called: `CanN` now exists and would
+update. That dead end is properly dead.
+
+**Instrument rule, permanent:** a missing counter is evidence of NOTHING until its
+name is pre-created (`0x7E57` sentinel). See
+`kmd-registry-counters-are-append-only-fossils` memory for the one-shot cleanup.
+
+### Historical (the .370-era mechanism, now fixed)
+
 
 **Status 2026-08-25 05:00.** The mechanism below is proven and one holder class
 is fixed and verified firing — but the freeze is NOT gone. On .375 with a
