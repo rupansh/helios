@@ -587,6 +587,38 @@ const _: () = {
     assert!(b"StdSelf".len() <= crate::diag::MAX_CONFIG_NAME);
 };
 
+/// `DiagStep` cache: 0 = unread, 1 = off, 2 = on. Read once — the knob lookup
+/// is itself a registry round-trip and these DDIs are hot.
+static STEP_DIAG: AtomicU32 = AtomicU32::new(0);
+
+fn step_diag_on() -> bool {
+    match STEP_DIAG.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = crate::diag::read_config_dword(crate::diag::knobs::DIAG_STEP, 0) != 0;
+            STEP_DIAG.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Publish "this DDI reached step `n` on call `seq`" as `(seq << 8) | n`.
+///
+/// PASSIVE only. The value that survives a hang is the step that never
+/// returned: the hung thread holds dxgkrnl's adapter DDI lock, so no later call
+/// can overwrite it. ⚠ The name must be PRE-CREATED in the service key — see
+/// `kmd-registry-counters-are-append-only-fossils`; the key silently refuses to
+/// create new values once it is full.
+fn step(name: &[u8], seq: u32, n: u32) {
+    if step_diag_on() {
+        crate::diag::record_named_bytes(name, (seq << 8) | (n & 0xff));
+    }
+}
+
+static CLOSE_ALLOC_SEQ: AtomicU32 = AtomicU32::new(0);
+static DESTROY_ALLOC_SEQ: AtomicU32 = AtomicU32::new(0);
+
 /// Count one refusal and mirror it on the file's bounded cadence.
 ///
 /// Returns the new count so a caller that wants to pack a reason code into the
@@ -2617,11 +2649,16 @@ unsafe fn destroy_allocation_ctx(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     ctx: Box<AllocationContext>,
+    seq: u32,
 ) {
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
     // Retire the exact Windows/KMD allocation identity before any backing
     // resource or Venus image can be torn down. Ambiguous plane retirement
     // retains the backing until the verified reset barrier.
+    // Step 2 is the one the static sweep singled out: `retire_allocation` takes
+    // the scanout mutex, an untimed non-recursive SynchronizationEvent, and it
+    // is the only unbounded wait reachable on this path.
+    step(b"DaStep", seq, 2);
     if !super::direct_scanout::retire_allocation(
         passive,
         adapter,
@@ -2633,18 +2670,24 @@ unsafe fn destroy_allocation_ctx(
         return;
     }
 
+    step(b"DaStep", seq, 3);
     if ctx.resource_id() != 0 {
         // OwnerTable is the sole resource/backing owner. Terminal UNREF
         // extracts and runs the exact image/memory finalizer outside the owner
         // lock; an ambiguous detach or unref retains the row until reset.
+        step(b"DaStep", seq, 4);
         let _ = crate::virtio::ctrl::forget_allocation_blob(passive, adapter, ctx.resource_id());
+        step(b"DaStep", seq, 5);
         if crate::virtio::ctrl::ctx_detach_resource(passive, adapter, ctx.ctx_id, ctx.resource_id())
             .is_ok()
         {
+            step(b"DaStep", seq, 6);
             let _ = crate::virtio::ctrl::resource_unref(passive, adapter, ctx.resource_id());
         }
     }
+    step(b"DaStep", seq, 7);
     drop(ctx);
+    step(b"DaStep", seq, 8);
 }
 
 /// Where an allocation's backing size came from.
@@ -4348,7 +4391,9 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
             for j in 0..i {
                 let prev = unsafe { &mut *args.pAllocationInfo.add(j) };
                 if let Some(ctx) = unsafe { take_alloc_ctx(prev.hAllocation) } {
-                    unsafe { destroy_allocation_ctx(passive, adapter, ctx) };
+                    // seq 0 marks the CreateAllocation unwind, so a `DaStep`
+                    // reading cannot be mistaken for the DestroyAllocation DDI.
+                    unsafe { destroy_allocation_ctx(passive, adapter, ctx, 0) };
                 }
                 prev.hAllocation = core::ptr::null_mut();
             }
@@ -4676,9 +4721,12 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
 
     for i in 0..args.NumAllocations as usize {
         let handle = unsafe { *args.pAllocationList.add(i) };
+        let seq = DESTROY_ALLOC_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+        step(b"DaStep", seq, 1);
         if let Some(ctx) = unsafe { take_alloc_ctx(handle) } {
-            unsafe { destroy_allocation_ctx(passive, adapter, ctx) };
+            unsafe { destroy_allocation_ctx(passive, adapter, ctx, seq) };
         }
+        step(b"DaStep", seq, 9);
     }
 
     let destroy_resource = unsafe {
@@ -5486,26 +5534,33 @@ pub unsafe extern "C" fn dxgkddi_close_allocation(
             // Remove the association before object storage can be reused.  A
             // resolver that already acquired it owns `outer` rundown and is
             // joined immediately below.
+            let seq = CLOSE_ALLOC_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+            step(b"CaStep", seq, 1);
             device.unregister_outer_open(handle as usize);
+            step(b"CaStep", seq, 2);
             if let Some(mut open) = unsafe { take_open_ctx(handle) } {
                 // BEFORE the join, never after: `outer.close()` waits untimed,
                 // and a batch dxgkrnl discarded without ever submitting holds a
                 // guard nothing else will ever return. Retracting those is what
                 // makes the join finite — see `retract_parked_referencing`.
+                step(b"CaStep", seq, 3);
                 if let Some(adapter) = device.adapter() {
                     crate::ddi::native_render::retract_parked_referencing(adapter, handle as usize);
                 }
+                step(b"CaStep", seq, 4);
                 open.outer.close(|| {
                     device.adapter().map_or(0, |adapter| {
                         crate::ddi::native_render::census_open_holders(adapter, handle as usize)
                     })
                 });
+                step(b"CaStep", seq, 5);
                 if let Some(execution) = open.execution.take() {
                     // CloseAllocation is PASSIVE_LEVEL.  Revoke new use,
                     // event-join exact host custody, then detach/release before
                     // any session role-1 teardown below.
                     execution.close(unsafe { PassiveLevel::assume() });
                 }
+                step(b"CaStep", seq, 6);
                 if let Some(session) = open.reply_pool_session.take() {
                     // SAFETY: this is the strong reference the exact open took
                     // in `bind_reply_pool`; its canonical allocation remains
@@ -5517,8 +5572,10 @@ pub unsafe extern "C" fn dxgkddi_close_allocation(
                         )
                     };
                 }
+                step(b"CaStep", seq, 7);
                 // Box drops only after K11 has revoked/drained/destroyed.
                 drop(open);
+                step(b"CaStep", seq, 8);
             }
         }
     }

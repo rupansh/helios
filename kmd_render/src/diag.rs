@@ -518,6 +518,13 @@ pub mod knobs {
     /// KMD's own writes do not reach the scanned-out blob, which no counter can
     /// distinguish from "DWM rendered nothing". Read at `direct_scanout::start`.
     pub const PARK_PAINT: KnobName = KnobName::new(b"D2ParkPaint");
+    /// Per-step progress brackets in `DxgkDdiCloseAllocation` and
+    /// `DxgkDdiDestroyAllocation` (`CaStep`/`DaStep`). Default 0 = off, because
+    /// each step is a synchronous `RtlWriteRegistryValue` on a DDI the
+    /// compositor calls constantly. 1 = on: the LAST value written names the
+    /// step that never returned, which is the only way to attribute a hang that
+    /// holds dxgkrnl's adapter DDI lock and so silences everything after it.
+    pub const DIAG_STEP: KnobName = KnobName::new(b"DiagStep");
     /// Diagnostic: after each scan-out flush, sample the flushed blob through
     /// the KMD's own canonical map and publish what the GUEST sees
     /// (`D2PxNz`/`D2PxMax`). Default 0 = off. It separates "the producer never
