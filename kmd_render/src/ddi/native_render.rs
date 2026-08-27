@@ -1128,6 +1128,16 @@ enum OuterExecutionRefusal {
     HostUnavailable = 22,
     HostEnqueue = 23,
     WorkerIrql = 24,
+    // ⛔ APPENDED, and the reason is worth the four lines: the ten disjuncts of
+    // `render_outer_physical`'s entry guard all recorded `PrivateData`, and on
+    // 2026-08-28 that one bucket cost a day. Every D3D11 device on the box lost
+    // itself on its second batch, `helios_umd` marked it DeviceLost, and every
+    // texture read back zero — the black desktop — with the counter naming a
+    // predicate that was not the one failing.
+    OuterClassMismatch = 25,
+    OuterCommandShape = 26,
+    OuterPatchListNonEmpty = 27,
+    OuterAllocationList = 28,
 }
 
 impl OuterExecutionRefusal {
@@ -2416,15 +2426,43 @@ pub(crate) unsafe fn render_outer_physical(
         refusal.record();
         status
     };
-    if native.class != NativeClass::Outer
-        || args.CommandLength == 0
+    if native.class != NativeClass::Outer {
+        return fail(
+            OuterExecutionRefusal::OuterClassMismatch,
+            STATUS_INVALID_PARAMETER,
+        );
+    }
+    if args.CommandLength == 0
         || args.pCommand.is_null()
         || args.pDmaBuffer.is_null()
         || args.CommandLength > args.DmaSize
-        || args.PatchLocationListInSize != 0
-        || args.AllocationListSize == 0
-        || args.pAllocationList.is_null()
-        || args.pDmaBufferPrivateData.is_null()
+    {
+        return fail(
+            OuterExecutionRefusal::OuterCommandShape,
+            STATUS_INVALID_PARAMETER,
+        );
+    }
+    if args.PatchLocationListInSize != 0 {
+        return fail(
+            OuterExecutionRefusal::OuterPatchListNonEmpty,
+            STATUS_INVALID_PARAMETER,
+        );
+    }
+    // An empty allocation list is a LEGAL batch, not a malformed one: a HOB1
+    // whose commands reference no WDDM allocation has nothing to put in it, and
+    // the use/list cross-check below (`uses.len() != AllocationListSize`) is
+    // what actually ties the two together. Requiring a non-empty list here
+    // refused DXVK's second batch on every device ever created — 416 bytes, zero
+    // uses — and the UMD answered that E_INVALIDARG by losing the device, so no
+    // process on the box could render anything (2026-08-28). The HNR2 arm has
+    // always had the right shape; this now matches it.
+    if args.AllocationListSize != 0 && args.pAllocationList.is_null() {
+        return fail(
+            OuterExecutionRefusal::OuterAllocationList,
+            STATUS_INVALID_PARAMETER,
+        );
+    }
+    if args.pDmaBufferPrivateData.is_null()
         || (args.DmaBufferPrivateDataSize as usize) < size_of::<Hob1KmdDmaPrivateV1>()
     {
         return fail(OuterExecutionRefusal::PrivateData, STATUS_INVALID_PARAMETER);
