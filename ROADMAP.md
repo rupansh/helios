@@ -4,41 +4,88 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
-## ⛔ TOP DEFECT — session FREEZE: ROOT-CAUSED BY KERNEL STACK — a PINNED PRIMARY
+## ⛔ TOP DEFECT — session FREEZE: the DEVICE IS POISONED BEFORE THE DEADLOCK
 
-**2026-08-27, KD.** dwm tid 1912, `wait=Executive`, bottom-up:
+**2026-08-28, boot ETW (`Microsoft-Windows-DxgKrnl`, all keywords, autologger).
+Reproduced twice on a hash-verified 22.22.380.0.** The freeze is a two-stage
+chain and the deadlock is the SECOND stage. Recover all of it in one command:
 
 ```
-dxgkrnl!DxgkDestroyAllocationInternal          <- D3DKMTDestroyAllocation
-dxgkrnl!DXGDEVICE::DestroyAllocationInternal
-dxgkrnl!DXGDEVICE::UnpinPrimaryAllocations     <- unpinning a PRIMARY
-dxgkrnl!DXGDEVICE::TerminateAllocations
-dxgkrnl!DXGDEVICE::DestroyResource / DestroyAllocations
-dxgkrnl!VIDMM_EXPORT::VidMmCloseAllocation
-dxgmms2!VidMmCloseAllocation / VIDMM_GLOBAL::CloseAllocation
+# guest: tracerpt C:\heliosboot.etl -o C:\hb.csv -of CSV -y ; gzip to Z:\tmp
+tools/etw-wedge-report.py tmp/hb.csv.gz            # summary
+tools/etw-wedge-report.py tmp/hb.csv.gz 8.93 8.94  # microsecond window
+```
+
+### Stage 1 — the first cause, ~180 ms before anything looks wrong
+
+```
+t+0.0 us  DxgkRender  (dwm "dxvk-cs")  DMA buffer references allocation A
+t+80 us   eid 178     the command buffer is QUEUED (216 B, 1 allocation)
+t+92 us   DdiSubmitCommand Start   <- our KMD; this one does NOT complete inline
+t+98 us   DxgkEvict   (same thread) on A
+t+102 us  ★ VidSchErrorEvictingWhileInUse  -> device execution state := 7
+t+160 us  GetDeviceState = 7, three times
+t+270 us  DxgkMarkDeviceAsError -> VidSchErrorDriverFaulted
+```
+
+`VidSchErrorEvictingWhileInUse` is the **first error in the whole trace** (three
+`VidSchError*` events total, 253k events). It is D3D11's normal free of a
+resource — `D3DKMTEvict` then `D3DKMTDestroyAllocation` — landing inside the
+window in which our `DxgkDdiSubmitCommand` has the referencing packet and has not
+yet reported `DXGK_INTERRUPT_DMA_COMPLETED`. **3068 of 3185 submits complete the
+packet inline inside `DdiSubmitCommand`; 117 do not, and the loser is one of
+those 117.** dwm then sees DEVICE_REMOVED and tears its device down — correctly.
+
+### Stage 2 — the teardown deadlocks
+
+Everything previously recorded as "the freeze" is dwm's correct device-lost
+teardown: the last MPO3 flip, `DdiSetVidPnSourceVisibility` (94–164 ms, two host
+round-trips for park+disable), `SetVidPnSourceOwner`, then ~13 Evict/Destroy
+pairs. The last one never returns — the KD stack still stands:
+
+```
+dxgkrnl!DxgkDestroyAllocationInternal ... DXGDEVICE::UnpinPrimaryAllocations
 dxgmms2!VIDMM_GLOBAL::CloseOneAllocation+0x210 <- BLOCKED (waits on a _KEVENT**)
 ```
 
-**VidMm is waiting for a primary to become unpinnable — the scanout reference on
-it never goes away.** It holds the DXGADAPTER core resource EXCLUSIVE while it
-waits, so: `AcquireCoreResourceShared` (tid 1520, plus a `DXGDEADLOCK_TRACKER`
-frame) → win32k User fast-resource (tids 1972/2180 at win32kbase+0x1b1240) →
-loader lock via `ImmDllInitialize` → no process can start in session 1 → the
-whole session reads as frozen. Session 0 never takes that path, which is why SSH
-survives.
+VidMm holds the DXGADAPTER core resource EXCLUSIVE while it waits ⇒
+`AcquireCoreResourceShared` → win32k User fast-resource → loader lock
+(`ImmDllInitialize`) → nothing starts in session 1. Session 0 never takes that
+path, which is why SSH survives for a few minutes.
 
-⛔ **This is why the miniport looked innocent and why three instrumented builds
-found nothing.** dxgkrnl blocks BEFORE calling the miniport: `CaStep`/`DaStep`
-show their last calls completed, `SxWait=0` (none of the ten untimed waits
-blocked), every ledger balances, no TDR. All true, all irrelevant.
+⭐ The teardown's own tell: **exactly one `DxgkRender` out of 3100 returns without
+queuing a packet, and it is the render that references the allocation that then
+deadlocks**, 200 us later. Same in both traces.
 
-Corroboration on the same boot: `ScPub=6` vs `ScRet=5` — **one scanout publish
-never retired** — `ScOff=0` (scanout never disabled), and QEMU renders "Display
-output is not active".
+⛔ dxgkrnl blocks BEFORE calling the miniport, so `CaStep`/`DaStep` last-call
+complete, `SxWait=0`, every ledger balanced and no TDR are all true and all
+irrelevant. Do not re-instrument the teardown DDIs.
 
-⇒ **Fix direction: the display lane must drop/retarget its scanout reference on a
-primary so dxgkrnl can unpin it.** The allocation-teardown path is the wrong
-place — it is never reached. Start from the `ScPub`/`ScRet` imbalance.
+⇒ **Fix stage 1 first.** It is upstream, it is ours, and stage 2 may not be
+reachable without it. The open question is why VidSch calls A "in use": the
+candidates are the async-completion window itself and what our KMD reports as the
+context's completed fence (`eid 553` names two monitored fences, both unsatisfied,
+inside the failing Evict). That needs a KMD-side instrument, not more ETW.
+
+### ⛔ Two leads that were live on 2026-08-27 and are now void
+
+- **`ScPub`/`ScRet`/`ScOff` are fossils.** Their only writer,
+  `kmd_render/src/adapter/scanout.rs`, was deleted in `60a9988`. `ScPub=6` vs
+  `ScRet=5` is a registry fossil from before 2026-08-21, not a live imbalance.
+  Check any counter with `tools/kmd-live-counter-names.sh` before reasoning from it.
+- **The display DOES activate.** QEMU imports DWM's 4587520-byte primaries as
+  OPTIMAL and composites them for 1–7 s on every boot (20 boots in
+  `/tmp/helios-qemu-stderr.log`, one signature: rotate 3 primaries → park to
+  res 0x4 → `set_scanout_blob res 0x0`). "Display output is not active" is the
+  state AFTER our own disable. The `required=4587520 fd_size=4096000` messages are
+  QEMU's first import attempt; it retries LINEAR and succeeds.
+
+### Still open and independent: the primaries are BLACK
+
+`D2PxN`=2–3 real primaries sampled through the canonical map, `D2PxNz`=0,
+`D2PxMax`=0, while `D2PxPark` on the KMD's own parking blob reads nonzero. The
+producer's pixels never reach the blob we scan out. Unrelated to the freeze
+chain above and unaffected by it.
 
 ### Superseded: the CloseAllocation join (fixed, and a measurement artifact)
 
