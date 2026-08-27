@@ -426,7 +426,7 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_position(
     if unsafe { display_half_on(_adapter) } {
         STATUS_SUCCESS
     } else {
-        STATUS_NOT_SUPPORTED
+        crate::diag::not_supported(15)
     }
 }
 
@@ -443,7 +443,7 @@ pub unsafe extern "C" fn dxgkddi_set_pointer_shape(
     if unsafe { display_half_on(_adapter) } {
         STATUS_SUCCESS
     } else {
-        STATUS_NOT_SUPPORTED
+        crate::diag::not_supported(16)
     }
 }
 
@@ -499,7 +499,7 @@ pub unsafe extern "C" fn dxgkddi_recommend_functional_vidpn(
 ) -> NTSTATUS {
     crate::diag::record(0x1300_0005);
     if !unsafe { display_half_on(_adapter) } {
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(17);
     }
     // Decline: let the OS synthesize the simple one-path VidPn it then validates
     // via IsSupportedVidPn (enumerating-child-devices-of-a-display-adapter.md).
@@ -518,7 +518,7 @@ pub unsafe extern "C" fn dxgkddi_enum_vidpn_cofunc_modality(
     }
     let p = _adapter as *const AdapterContext;
     if p.is_null() || !unsafe { (*p).display_half() } {
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(18);
     }
     let adapter = unsafe { &*p };
     // 0x1329 = EnumVidPnCofuncModality's return status (low 16 bits) — pairs
@@ -538,7 +538,7 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_visibility(
     }
     let p = _adapter as *const AdapterContext;
     if p.is_null() || !unsafe { (*p).display_half() } {
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(19);
     }
     if crate::virtio::KMD_D2_OWNER_ENABLED {
         if visibility.is_null() {
@@ -608,7 +608,7 @@ unsafe fn commit_vidpn_impl(
     }
     let p = _adapter as *const AdapterContext;
     if p.is_null() || !unsafe { (*p).display_half() } {
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(20);
     }
     crate::diag::record_named_bytes(b"VpCM", 1);
     // Inspect + validate the committed VidPn and record whether the OS pinned a
@@ -666,7 +666,7 @@ pub unsafe extern "C" fn dxgkddi_update_active_vidpn_present_path(
     if unsafe { display_half_on(_adapter) } {
         STATUS_SUCCESS
     } else {
-        STATUS_NOT_SUPPORTED
+        crate::diag::not_supported(21)
     }
 }
 
@@ -676,13 +676,13 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address(
 ) -> NTSTATUS {
     let p = _adapter as *const AdapterContext;
     if p.is_null() || !unsafe { (*p).display_half() } {
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(22);
     }
     let adapter = unsafe { &*p };
     if crate::virtio::KMD_D2_OWNER_ENABLED {
         return unsafe { set_vidpn_source_address_d4(adapter, address) };
     }
-    STATUS_NOT_SUPPORTED
+    crate::diag::not_supported(23)
 }
 
 const CLASSIC_MODE_CHANGE: u32 = 0x0000_0001;
@@ -727,7 +727,7 @@ unsafe fn set_vidpn_source_address_d4(
     address: IN_CONST_PDXGKARG_SETVIDPNSOURCEADDRESS,
 ) -> NTSTATUS {
     if !crate::virtio::KMD_D2_OWNER_ENABLED {
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(24);
     }
     if address.is_null() || !(address as *const DXGKARG_SETVIDPNSOURCEADDRESS).is_aligned() {
         D4_CLASSIC_REFUSALS.fetch_add(1, Ordering::Relaxed);
@@ -923,7 +923,7 @@ pub unsafe extern "C" fn dxgkddi_recommend_monitor_modes(
     crate::diag::record(0x1300_000B);
     let p = _adapter as *const AdapterContext;
     if p.is_null() || !unsafe { (*p).display_half() } {
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(25);
     }
     let adapter = unsafe { &*p };
     // Clamp to the DDI's legal return set: an out-of-contract NTSTATUS makes
@@ -939,7 +939,7 @@ pub unsafe extern "C" fn dxgkddi_query_vidpn_hw_capability(
 ) -> NTSTATUS {
     crate::diag::record(0x1300_000C);
     if !unsafe { display_half_on(_adapter) } {
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(26);
     }
     if caps.is_null() {
         return STATUS_INVALID_PARAMETER;
@@ -992,7 +992,7 @@ pub unsafe extern "C" fn dxgkddi_get_scan_line(
         }
         STATUS_SUCCESS
     } else {
-        STATUS_NOT_SUPPORTED
+        crate::diag::not_supported(27)
     }
 }
 
@@ -1003,7 +1003,7 @@ pub unsafe extern "C" fn dxgkddi_stop_device_and_release_post_display_ownership(
 ) -> NTSTATUS {
     crate::diag::record(0x1300_000E);
     crate::diag::record(0x131B_0000 | (target_id & 0xFFFF));
-    STATUS_NOT_SUPPORTED
+    crate::diag::not_supported(28)
 }
 
 pub unsafe extern "C" fn dxgkddi_system_display_enable(
@@ -1017,7 +1017,7 @@ pub unsafe extern "C" fn dxgkddi_system_display_enable(
     // NO diag::record here: this runs INSIDE KeBugCheckEx at arbitrary IRQL,
     // and the registry write nested a second fault while Windows drew the
     // bluescreen (all five 0x119 dumps, 22.22.352.0). STUB: no panic-time FB.
-    STATUS_NOT_SUPPORTED
+    crate::diag::not_supported(29)
 }
 
 pub unsafe extern "C" fn dxgkddi_system_display_write(

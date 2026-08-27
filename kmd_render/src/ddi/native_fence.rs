@@ -837,7 +837,7 @@ pub unsafe extern "C" fn dxgkddi_create_native_fence(
     }
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     let Some(identity) = admitted_identity_for_ddi(adapter, &NF_CREATE_REJ) else {
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(8);
     };
 
     // SAFETY: non-null per the check above; dxgkrnl owns a valid, writable
@@ -868,7 +868,7 @@ pub unsafe extern "C" fn dxgkddi_create_native_fence(
     if unsafe { args.Flags.__bindgen_anon_1.Value } != 0 {
         NF_CREATE_REJ.fetch_add(1, Ordering::Relaxed);
         NF_FLAGS_REJ.fetch_add(1, Ordering::Relaxed);
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(9);
     }
     if args.hGlobalNativeFence.is_null()
         || !all_zero(&args.Reserved)
@@ -974,7 +974,7 @@ pub unsafe extern "C" fn dxgkddi_open_native_fence(
     }
     let adapter = unsafe { &*(h_adapter as *const AdapterContext) };
     if admitted_identity_for_ddi(adapter, &NF_OPEN_REJ).is_none() {
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(10);
     }
     // SAFETY: non-null per the check above.
     let args = unsafe { &mut *p_open };
@@ -1012,7 +1012,7 @@ pub unsafe extern "C" fn dxgkddi_open_native_fence(
     if unsafe { args.Flags.__bindgen_anon_1.Value } != 0 {
         NF_OPEN_REJ.fetch_add(1, Ordering::Relaxed);
         NF_FLAGS_REJ.fetch_add(1, Ordering::Relaxed);
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(11);
     }
     let device_adapter = unsafe { crate::device::DeviceHandleRef::from_raw(args.hDevice) }
         .and_then(|device| device.adapter());
@@ -1297,7 +1297,7 @@ pub unsafe extern "C" fn dxgkddi_update_monitored_values(
     if unsafe { args.Flags.__bindgen_anon_1.Value } != 0 || !all_zero(&args.Reserved) {
         NF_UPD_REJ.fetch_add(1, Ordering::Relaxed);
         NF_FLAGS_REJ.fetch_add(1, Ordering::Relaxed);
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(12);
     }
     // SAFETY: the three arrays are `_Field_size_(NumFences)`; `update_values`
     // reads exactly that many entries and refuses a null array outright.
@@ -1344,7 +1344,7 @@ pub unsafe extern "C" fn dxgkddi_update_current_values_from_cpu(
     if flags & !(ALWAYS_SIGNALED | NOTIFICATION_ONLY) != 0 || !all_zero(&args.Reserved) {
         NF_UPD_REJ.fetch_add(1, Ordering::Relaxed);
         NF_FLAGS_REJ.fetch_add(1, Ordering::Relaxed);
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(13);
     }
     // SAFETY: as for `dxgkddi_update_monitored_values`.
     unsafe {
@@ -1541,7 +1541,7 @@ pub(crate) unsafe fn fill_native_fence_caps(
     if !admitted {
         NF_CAPS_REJ.fetch_add(1, Ordering::Relaxed);
         NF_NOT_ADMITTED.fetch_add(1, Ordering::Relaxed);
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(14);
     }
     let mut caps = unsafe { core::mem::zeroed::<DXGK_NATIVE_FENCE_CAPS>() };
     caps.MonitoredValuePadding = 0;

@@ -462,6 +462,32 @@ pub fn wait(code: u32, entering: bool) {
     }
 }
 
+/// Sites that have returned `STATUS_NOT_SUPPORTED` from a DDI, one bit each.
+static NOT_SUPPORTED_SITES: AtomicU32 = AtomicU32::new(0);
+static NOT_SUPPORTED_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Return `STATUS_NOT_SUPPORTED` from a DDI and record WHICH site did.
+///
+/// dxgkrnl logs an illegal DDI return as `AzureTriage` "Driver returned an
+/// invalid NTSTATUS code", and on 2026-08-27 a burst of 12 of those
+/// (0xC00000BB) landed at boot+65 s, exactly when the session wedges. The
+/// driver has ~30 sites that can return this and the trace names only a
+/// dxgkrnl-internal function id, so the site has to identify itself.
+///
+/// `NotSupM` is a bitmask of every site that has fired (a last-value counter
+/// would be swamped by the legal, expected returns); `NotSup` carries the last
+/// site and a total. PASSIVE_LEVEL only.
+pub fn not_supported(site: u32) -> crate::dxgk::NTSTATUS {
+    let bit = 1u32 << (site & 31);
+    let mask = NOT_SUPPORTED_SITES.fetch_or(bit, Ordering::Relaxed) | bit;
+    let count = NOT_SUPPORTED_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if diag_step_on() {
+        record_named_bytes(b"NotSupM", mask);
+        record_named_bytes(b"NotSup", (site << 16) | (count & 0xffff));
+    }
+    crate::dxgk::STATUS_NOT_SUPPORTED
+}
+
 /// `record_named` convenience: build the UTF-16 value name from an ASCII byte
 /// slice (≤14 chars). PASSIVE_LEVEL only.
 pub fn record_named_bytes(name: &[u8], value: u32) {

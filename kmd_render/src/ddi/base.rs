@@ -36,7 +36,7 @@ pub unsafe extern "C" fn dxgkddi_query_interface(
             crate::diag::record(unsafe { (*qi.InterfaceType).Data1 });
         }
     }
-    STATUS_NOT_SUPPORTED
+    crate::diag::not_supported(0)
 }
 
 /// `DxgkDdiControlEtwLogging` — enable/disable the driver's ETW logging.

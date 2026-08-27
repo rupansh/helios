@@ -207,7 +207,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             *number_of_video_present_sources = 0;
             *number_of_children = 0;
         }
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(6);
     };
     let share_backing_store_with_kmd = unsafe { share_backing_store_admitted(&dxgkrnl) };
     crate::diag::record_named_bytes(b"DxgkSz", dxgkrnl.Size);
@@ -217,7 +217,7 @@ pub unsafe extern "C" fn dxgkddi_start_device(
             *number_of_video_present_sources = 0;
             *number_of_children = 0;
         }
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(7);
     }
     crate::diag::record(0x0B00_0002);
 

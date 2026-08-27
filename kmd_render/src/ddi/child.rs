@@ -113,7 +113,7 @@ pub unsafe extern "C" fn dxgkddi_query_child_status(
         crate::diag::fault(crate::diag::FaultCounter::StQcs, unsafe {
             (*child_status).Type as u32
         });
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(1);
     }
 
     // SAFETY: non-null per the check; dxgkrnl provides a writable DXGK_CHILD_STATUS.
@@ -127,7 +127,7 @@ pub unsafe extern "C" fn dxgkddi_query_child_status(
         }
         // We reported MonitorOrientationAwareness = NONE, so the OS must not query
         // rotation status; anything else is not serviced.
-        _ => STATUS_NOT_SUPPORTED,
+        _ => crate::diag::not_supported(2),
     }
 }
 
@@ -153,7 +153,7 @@ pub unsafe extern "C" fn dxgkddi_query_device_descriptor(
     // SAFETY: our AdapterContext.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
     if !adapter.display_half() {
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(3);
     }
     if device_descriptor.is_null() {
         return STATUS_INVALID_PARAMETER;
@@ -164,7 +164,7 @@ pub unsafe extern "C" fn dxgkddi_query_device_descriptor(
     // target — the 35th session's CHILD_DESCRIPTOR_NOT_SUPPORTED default-monitor
     // path is a suspect for the mode-set retry loop (WINDOWED_BLT_DESIGN §6.3).
     let Some(edid) = adapter.edid() else {
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(4);
     };
     // SAFETY: non-null per the check; dxgkrnl provides a writable descriptor.
     let dd = unsafe { &mut *device_descriptor };
@@ -209,7 +209,7 @@ pub unsafe extern "C" fn dxgkddi_get_child_container_id(
     // SAFETY: our AdapterContext.
     let adapter = unsafe { &*(miniport_device_context as *const AdapterContext) };
     if !adapter.display_half() {
-        return STATUS_NOT_SUPPORTED;
+        return crate::diag::not_supported(5);
     }
     // SAFETY: dxgkrnl provides a writable DXGK_CHILD_CONTAINER_ID.
     unsafe {
