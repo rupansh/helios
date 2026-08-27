@@ -399,6 +399,7 @@ impl AdapterContext {
         // SAFETY: the event was initialized in place by `init_kernel_events`;
         // an infinite Executive/KernelMode wait at PASSIVE_LEVEL. The
         // SynchronizationEvent auto-clears on a satisfied wait (mutex acquire).
+        crate::diag::wait(crate::diag::waits::VENUS_MUTEX, true);
         let _ = unsafe {
             KeWaitForSingleObject(
                 self.venus_mutex.get() as PVOID,
@@ -408,6 +409,7 @@ impl AdapterContext {
                 core::ptr::null_mut(),
             )
         };
+        crate::diag::wait(crate::diag::waits::VENUS_MUTEX, false);
     }
 
     /// Release the PASSIVE venus mutex.
@@ -429,6 +431,7 @@ impl AdapterContext {
     ) -> R {
         // SAFETY: initialized in place by `init_kernel_events`; all callers are
         // PASSIVE-level display worker or allocation-lifecycle paths.
+        crate::diag::wait(crate::diag::waits::SCANOUT_MUTEX, true);
         let _ = unsafe {
             KeWaitForSingleObject(
                 self.scanout_mutex.get() as PVOID,
@@ -438,6 +441,7 @@ impl AdapterContext {
                 core::ptr::null_mut(),
             )
         };
+        crate::diag::wait(crate::diag::waits::SCANOUT_MUTEX, false);
         let guard = ScanoutGuard {
             adapter: self,
             passive,

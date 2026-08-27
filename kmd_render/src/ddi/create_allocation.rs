@@ -587,22 +587,6 @@ const _: () = {
     assert!(b"StdSelf".len() <= crate::diag::MAX_CONFIG_NAME);
 };
 
-/// `DiagStep` cache: 0 = unread, 1 = off, 2 = on. Read once — the knob lookup
-/// is itself a registry round-trip and these DDIs are hot.
-static STEP_DIAG: AtomicU32 = AtomicU32::new(0);
-
-fn step_diag_on() -> bool {
-    match STEP_DIAG.load(Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => {
-            let on = crate::diag::read_config_dword(crate::diag::knobs::DIAG_STEP, 0) != 0;
-            STEP_DIAG.store(if on { 2 } else { 1 }, Ordering::Relaxed);
-            on
-        }
-    }
-}
-
 /// Publish "this DDI reached step `n` on call `seq`" as `(seq << 8) | n`.
 ///
 /// PASSIVE only. The value that survives a hang is the step that never
@@ -611,7 +595,7 @@ fn step_diag_on() -> bool {
 /// `kmd-registry-counters-are-append-only-fossils`; the key silently refuses to
 /// create new values once it is full.
 fn step(name: &[u8], seq: u32, n: u32) {
-    if step_diag_on() {
+    if crate::diag::diag_step_on() {
         crate::diag::record_named_bytes(name, (seq << 8) | (n & 0xff));
     }
 }
@@ -883,9 +867,11 @@ impl OpenOuterBinding {
                 crate::ddi::native_render::NR2_WORKER_PENDING_LIVE
                     .load(core::sync::atomic::Ordering::Relaxed),
             );
+            crate::diag::wait(crate::diag::waits::OPEN_OUTER, true);
             let _ = unsafe {
                 KeWaitForSingleObject(self.drained.get() as PVOID, 0, 0, 0, core::ptr::null_mut())
             };
+            crate::diag::wait(crate::diag::waits::OPEN_OUTER, false);
             crate::diag::record_named_bytes(b"OaOutDrn", active);
         }
     }
@@ -1273,9 +1259,11 @@ impl OpenExecutionBinding {
             // written `OaExeAct` is the only way to tell which of the two joins
             // never returned.
             crate::diag::record_named_bytes(b"OaExeAct", active);
+            crate::diag::wait(crate::diag::waits::OPEN_EXECUTION, true);
             let _ = unsafe {
                 KeWaitForSingleObject(self.drained.get() as PVOID, 0, 0, 0, core::ptr::null_mut())
             };
+            crate::diag::wait(crate::diag::waits::OPEN_EXECUTION, false);
             crate::diag::record_named_bytes(b"OaExeDrn", active);
         }
         let (session, owns_session_reference, attachment, resource_id) = {

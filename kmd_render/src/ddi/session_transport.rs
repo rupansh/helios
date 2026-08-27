@@ -173,9 +173,11 @@ impl K11CompletionRundown {
         K11_COMPLETION_WAITED.fetch_add(1, Ordering::Relaxed);
         // Exact rundown event, never polling or sleeping. Every admitted
         // SubmitCommand interval owns a Drop guard through notification.
+        crate::diag::wait(crate::diag::waits::K11_COMPLETION, true);
         let _ = unsafe {
             KeWaitForSingleObject(self.drained.get() as PVOID, 0, 0, 0, core::ptr::null_mut())
         };
+        crate::diag::wait(crate::diag::waits::K11_COMPLETION, false);
     }
 
     pub(crate) fn reopen(&self) {
@@ -583,6 +585,7 @@ impl SessionTransport {
             // wake between observing the occupied state and beginning to wait.
             unsafe { KeClearEvent(self.ring_zero_available.get()) };
             drop(state);
+            crate::diag::wait(crate::diag::waits::RING_ZERO, true);
             let _ = unsafe {
                 KeWaitForSingleObject(
                     self.ring_zero_available.get() as PVOID,
@@ -592,6 +595,7 @@ impl SessionTransport {
                     core::ptr::null_mut(),
                 )
             };
+            crate::diag::wait(crate::diag::waits::RING_ZERO, false);
         }
     }
 
@@ -669,6 +673,7 @@ impl SessionTransport {
                         // cannot be lost between this observation and the wait.
                         unsafe { KeClearEvent(self.attachments_changed.get()) };
                         drop(attachments);
+                        crate::diag::wait(crate::diag::waits::ATTACH_CHANGED, true);
                         let _ = unsafe {
                             KeWaitForSingleObject(
                                 self.attachments_changed.get() as PVOID,
@@ -678,6 +683,7 @@ impl SessionTransport {
                                 core::ptr::null_mut(),
                             )
                         };
+                        crate::diag::wait(crate::diag::waits::ATTACH_CHANGED, false);
                         continue;
                     }
                     // A failed host detach is deliberately retained for final
@@ -805,9 +811,11 @@ impl SessionTransport {
         // Exact event wait, never polling or a time slice.  Every admitted host
         // operation owns a Drop guard and the underlying control roundtrip is
         // itself bounded.
+        crate::diag::wait(crate::diag::waits::K11_RUNDOWN, true);
         let _ = unsafe {
             KeWaitForSingleObject(self.drained.get() as PVOID, 0, 0, 0, core::ptr::null_mut())
         };
+        crate::diag::wait(crate::diag::waits::K11_RUNDOWN, false);
     }
 
     fn current_transport(adapter: &AdapterContext) -> Option<u64> {

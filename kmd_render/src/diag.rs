@@ -407,6 +407,61 @@ impl CounterBlock {
     }
 }
 
+/// Live set of UNBOUNDED `KeWaitForSingleObject` waits currently blocked, one
+/// bit per [`wait`] code. A wait that never returns leaves its bit set, which is
+/// what a single last-value breadcrumb cannot express: several threads block on
+/// different objects at once and the last writer would hide the rest.
+static WAIT_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// `DiagStep` cache: 0 = unread, 1 = off, 2 = on. The knob lookup is itself a
+/// registry round-trip, so it is read once.
+static STEP_DIAG: AtomicU32 = AtomicU32::new(0);
+
+/// Is per-step / per-wait breadcrumbing enabled? PASSIVE_LEVEL only.
+pub fn diag_step_on() -> bool {
+    match STEP_DIAG.load(Ordering::Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let on = read_config_dword(knobs::DIAG_STEP, 0) != 0;
+            STEP_DIAG.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Codes for [`wait`]. Each names one untimed wait; the driver has no other way
+/// to block forever, so `SxWait` nonzero after a hang IS the hang.
+pub mod waits {
+    pub const VENUS_MUTEX: u32 = 1;
+    pub const SCANOUT_MUTEX: u32 = 2;
+    pub const K11_COMPLETION: u32 = 3;
+    pub const RING_ZERO: u32 = 4;
+    pub const ATTACH_CHANGED: u32 = 5;
+    pub const K11_RUNDOWN: u32 = 6;
+    pub const OUTER_WORKER: u32 = 7;
+    pub const NATIVE_CONTEXT: u32 = 8;
+    pub const OPEN_OUTER: u32 = 9;
+    pub const OPEN_EXECUTION: u32 = 10;
+}
+
+/// Bracket one untimed wait. PASSIVE_LEVEL only (every untimed wait is).
+///
+/// ⚠ `SxWait` must be PRE-CREATED in the service key: once the key is full the
+/// registry silently refuses to create new values, which is what made three
+/// earlier instruments read as "never fired".
+pub fn wait(code: u32, entering: bool) {
+    let bit = 1u32 << (code & 31);
+    let mask = if entering {
+        WAIT_MASK.fetch_or(bit, Ordering::Relaxed) | bit
+    } else {
+        WAIT_MASK.fetch_and(!bit, Ordering::Relaxed) & !bit
+    };
+    if diag_step_on() {
+        record_named_bytes(b"SxWait", mask);
+    }
+}
+
 /// `record_named` convenience: build the UTF-16 value name from an ASCII byte
 /// slice (≤14 chars). PASSIVE_LEVEL only.
 pub fn record_named_bytes(name: &[u8], value: u32) {

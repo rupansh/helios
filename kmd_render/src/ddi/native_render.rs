@@ -1255,6 +1255,7 @@ impl OuterWorker {
             state.queued
         };
         if wait {
+            crate::diag::wait(crate::diag::waits::OUTER_WORKER, true);
             let _ = unsafe {
                 KeWaitForSingleObject(
                     self.drained.get() as wdk_sys::PVOID,
@@ -1264,6 +1265,7 @@ impl OuterWorker {
                     core::ptr::null_mut(),
                 )
             };
+            crate::diag::wait(crate::diag::waits::OUTER_WORKER, false);
         }
     }
 }
@@ -1530,6 +1532,7 @@ impl NativeContext {
         drop(building);
 
         drain_host_terminals(adapter);
+        crate::diag::wait(crate::diag::waits::NATIVE_CONTEXT, true);
         let _ = unsafe {
             KeWaitForSingleObject(
                 self.drained.get() as wdk_sys::PVOID,
@@ -1539,6 +1542,7 @@ impl NativeContext {
                 core::ptr::null_mut(),
             )
         };
+        crate::diag::wait(crate::diag::waits::NATIVE_CONTEXT, false);
         // A reset path may have queued failed terminals immediately before the
         // final rundown release. Discharge them and free only PASSIVE-owned
         // enqueue-failure buffers before the context box disappears.
