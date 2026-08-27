@@ -4,7 +4,44 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
-## ⛔ TOP DEFECT — session FREEZE: the CloseAllocation join is FIXED; the freeze is a SECOND mechanism
+## ⛔ TOP DEFECT — session FREEZE: ROOT-CAUSED BY KERNEL STACK — a PINNED PRIMARY
+
+**2026-08-27, KD.** dwm tid 1912, `wait=Executive`, bottom-up:
+
+```
+dxgkrnl!DxgkDestroyAllocationInternal          <- D3DKMTDestroyAllocation
+dxgkrnl!DXGDEVICE::DestroyAllocationInternal
+dxgkrnl!DXGDEVICE::UnpinPrimaryAllocations     <- unpinning a PRIMARY
+dxgkrnl!DXGDEVICE::TerminateAllocations
+dxgkrnl!DXGDEVICE::DestroyResource / DestroyAllocations
+dxgkrnl!VIDMM_EXPORT::VidMmCloseAllocation
+dxgmms2!VidMmCloseAllocation / VIDMM_GLOBAL::CloseAllocation
+dxgmms2!VIDMM_GLOBAL::CloseOneAllocation+0x210 <- BLOCKED (waits on a _KEVENT**)
+```
+
+**VidMm is waiting for a primary to become unpinnable — the scanout reference on
+it never goes away.** It holds the DXGADAPTER core resource EXCLUSIVE while it
+waits, so: `AcquireCoreResourceShared` (tid 1520, plus a `DXGDEADLOCK_TRACKER`
+frame) → win32k User fast-resource (tids 1972/2180 at win32kbase+0x1b1240) →
+loader lock via `ImmDllInitialize` → no process can start in session 1 → the
+whole session reads as frozen. Session 0 never takes that path, which is why SSH
+survives.
+
+⛔ **This is why the miniport looked innocent and why three instrumented builds
+found nothing.** dxgkrnl blocks BEFORE calling the miniport: `CaStep`/`DaStep`
+show their last calls completed, `SxWait=0` (none of the ten untimed waits
+blocked), every ledger balances, no TDR. All true, all irrelevant.
+
+Corroboration on the same boot: `ScPub=6` vs `ScRet=5` — **one scanout publish
+never retired** — `ScOff=0` (scanout never disabled), and QEMU renders "Display
+output is not active".
+
+⇒ **Fix direction: the display lane must drop/retarget its scanout reference on a
+primary so dxgkrnl can unpin it.** The allocation-teardown path is the wrong
+place — it is never reached. Start from the `ScPub`/`ScRet` imbalance.
+
+### Superseded: the CloseAllocation join (fixed, and a measurement artifact)
+
 
 **2026-08-27.** The counter evidence that drove this whole investigation was
 **measurement artifact**. The service key had hit a ~4000-value ceiling — 3000 of
