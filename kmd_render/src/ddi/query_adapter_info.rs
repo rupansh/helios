@@ -90,7 +90,14 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
             if !is_perf_poll {
                 crate::diag::record(0x0200_0000 | (other as u32 & 0xFFFF));
             }
-            STATUS_NOT_SUPPORTED
+            // Site 30. Left untagged in .380, which made the NotSupM reading
+            // ("only site 0") an artifact of the instrument rather than a
+            // result: this arm was invisible to it. QueryAdapterInfo's
+            // documented set is SUCCESS / INVALID_PARAMETER / NO_MEMORY /
+            // GRAPHICS_DRIVER_MISMATCH, but the doc says "such as", so
+            // NOT_SUPPORTED is not provably illegal — measure before changing a
+            // return dxgkrnl polls constantly.
+            crate::diag::not_supported(30)
         }
     }
 }
