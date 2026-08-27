@@ -4,7 +4,34 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
-## ⛔ TOP DEFECT — session FREEZE: the DEVICE IS POISONED BEFORE THE DEADLOCK
+## ✅ CLOSED 2026-08-28 — session FREEZE: a redundant `pfnEvictCb` poisoned the device
+
+**Fixed in `93d3601` (UMD only; KMD 22.22.380.0 unchanged).**
+`ResidentAllocation::drop` called `pfnEvictCb` unconditionally, and every
+teardown that drops the guard follows it with a `pfnDeallocateCb` covering the
+same handle. The evict is redundant — `D3DKMTDestroyAllocation` takes the
+allocation out of the residency list itself — and it is the call that races a
+submitted-but-unretired DMA packet. `release_residency(resident, deallocated)`
+now decides: only a successful deallocate suppresses the evict; an opened
+allocation nobody deallocates, a failed deallocate and a missing callback all
+still evict. `residency_evict_suppressed` is the last column of the
+`DDI refusals:` line; `UmdEvictOnDeallocate=1` is the A/B disable.
+
+| | before | after |
+|---|---|---|
+| boot ETW | 253,204 events / 36.6 s | 993,394 events / 102 s, 0 lost |
+| `VidSchError*` | `EvictingWhileInUse` → `DriverFaulted` at boot+9 s | **zero, of any kind** |
+| unreturned `DxgkDestroyAllocation` | 1 (the deadlock) | none |
+| dwm CPU | 1.48 s, then 0.000 s over 8 s | 12.8 s and climbing |
+| session-1 scheduled task | hangs at `SCHED_S_TASK_RUNNING` | runs, writes its file |
+| terminal scanout signature | 20/20 boots | absent, 2/2 boots |
+
+⛔ The desktop is **still black** (`D2PxNz=0`) — that producer defect is
+independent, unchanged, and is now the top display defect. See below.
+
+<details><summary>The chain as it was diagnosed (kept: the method and the two dead leads)</summary>
+
+## The freeze chain — the DEVICE WAS POISONED BEFORE THE DEADLOCK
 
 **2026-08-28, boot ETW (`Microsoft-Windows-DxgKrnl`, all keywords, autologger).
 Reproduced twice on a hash-verified 22.22.380.0.** The freeze is a two-stage
@@ -86,6 +113,8 @@ inside the failing Evict). That needs a KMD-side instrument, not more ETW.
 `D2PxMax`=0, while `D2PxPark` on the KMD's own parking blob reads nonzero. The
 producer's pixels never reach the blob we scan out. Unrelated to the freeze
 chain above and unaffected by it.
+
+</details>
 
 ### Superseded: the CloseAllocation join (fixed, and a measurement artifact)
 
