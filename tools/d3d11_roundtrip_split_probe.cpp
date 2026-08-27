@@ -21,6 +21,7 @@
 //       Z:\tools\d3d11_roundtrip_split_probe.cpp -ld3d11 -ldxgi -ldxguid
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <windows.h>
 #include <cstdio>
 #include <cstdint>
 #include <cwchar>
@@ -59,7 +60,7 @@ static ID3D11Texture2D *mktex(ID3D11Device *dev, D3D11_USAGE usage, UINT bind,
 // Map(READ) `stage` and count how many of the W*H pixels match pat(), and how
 // many bytes are zero. Both numbers are printed: "all zero" and "wrong values"
 // are different diagnoses and have been confused before.
-static bool verify(ID3D11DeviceContext *ctx, ID3D11Texture2D *stage, const char *tag) {
+static bool verify_once(ID3D11DeviceContext *ctx, ID3D11Texture2D *stage, const char *tag) {
   D3D11_MAPPED_SUBRESOURCE m = {};
   HRESULT hr = ctx->Map(stage, 0, D3D11_MAP_READ, 0, &m);
   if (FAILED(hr)) { printf("%-7s Map(READ) hr=0x%08x FAIL\n", tag, (unsigned)hr); return false; }
@@ -76,6 +77,39 @@ static bool verify(ID3D11DeviceContext *ctx, ID3D11Texture2D *stage, const char 
   printf("%-7s match=%u/%u zero=%u/%u pitch=%u  %s\n", tag, good, total, zero, total,
          m.RowPitch, good == total ? "PASS" : "FAIL");
   return good == total;
+}
+
+// Read the staging texture twice: once as soon as Map returns, then again a
+// second later. D3D11 Map(READ) without DO_NOT_WAIT must already block until
+// the GPU is done, so a second read that DIFFERS means the wait returned early
+// — the fence lied — while two identical zero reads mean the copy never ran.
+// Also times a D3D11_QUERY_EVENT, which is the same wait through a different
+// primitive: an event that never signals and one that signals instantly are
+// different diagnoses.
+static bool verify(ID3D11DeviceContext *ctx, ID3D11Device *dev,
+                   ID3D11Texture2D *stage, const char *tag) {
+  ID3D11Query *q = nullptr;
+  D3D11_QUERY_DESC qd = {}; qd.Query = D3D11_QUERY_EVENT;
+  DWORD spent = 0;
+  if (SUCCEEDED(dev->CreateQuery(&qd, &q))) {
+    ctx->End(q);
+    ctx->Flush();
+    BOOL done = FALSE;
+    const DWORD t0 = GetTickCount();
+    while (GetTickCount() - t0 < 2000) {
+      if (ctx->GetData(q, &done, sizeof(done), 0) == S_OK) break;
+      Sleep(1);
+    }
+    spent = GetTickCount() - t0;
+    printf("%-7s QUERY_EVENT signalled in %lu ms\n", tag, (unsigned long)spent);
+    q->Release();
+  }
+  const bool now = verify_once(ctx, stage, tag);
+  Sleep(1000);
+  char later[16];
+  snprintf(later, sizeof(later), "%s+1s", tag);
+  const bool after = verify_once(ctx, stage, later);
+  return now || after;
 }
 
 static void fill(void *base, UINT pitch) {
@@ -106,7 +140,7 @@ int main() {
     D3D11_MAPPED_SUBRESOURCE m = {};
     hr = ctx->Map(s, 0, D3D11_MAP_WRITE, 0, &m);
     if (FAILED(hr)) { printf("1 CPU   Map(WRITE) hr=0x%08x FAIL\n", (unsigned)hr); ++fails; }
-    else { fill(m.pData, m.RowPitch); ctx->Unmap(s, 0); if (!verify(ctx, s, "1 CPU")) ++fails; }
+    else { fill(m.pData, m.RowPitch); ctx->Unmap(s, 0); if (!verify_once(ctx, s, "1 CPU")) ++fails; }
     s->Release();
   } else ++fails;
 
@@ -122,7 +156,7 @@ int main() {
         ctx->CopyResource(mid, src);
         ctx->CopyResource(dst, mid);
         ctx->Flush();
-        if (!verify(ctx, dst, "2 UPLOAD")) ++fails;
+        if (!verify(ctx, dev, dst, "2 UPLOAD")) ++fails;
       } else { printf("2 UPLOAD Map(WRITE) failed\n"); ++fails; }
     } else ++fails;
     if (src) src->Release(); if (mid) mid->Release(); if (dst) dst->Release();
@@ -137,7 +171,7 @@ int main() {
     ID3D11Texture2D *dst = mktex(dev, D3D11_USAGE_STAGING, 0, D3D11_CPU_ACCESS_READ, nullptr);
     if (mid && dst) {
       ctx->CopyResource(dst, mid); ctx->Flush();
-      if (!verify(ctx, dst, "3 INIT")) ++fails;
+      if (!verify(ctx, dev, dst, "3 INIT")) ++fails;
     } else ++fails;
     if (mid) mid->Release(); if (dst) dst->Release();
   }
@@ -155,6 +189,7 @@ int main() {
         ctx->ClearRenderTargetView(rtv, col);
         ctx->CopyResource(dst, rt);
         ctx->Flush();
+        Sleep(1000);
         D3D11_MAPPED_SUBRESOURCE m = {};
         if (SUCCEEDED(ctx->Map(dst, 0, D3D11_MAP_READ, 0, &m))) {
           const uint32_t px = *(const uint32_t *)m.pData;
@@ -164,7 +199,7 @@ int main() {
             for (UINT x = 0; x < W; ++x) if (row[x] == 0) ++zero;
           }
           ctx->Unmap(dst, 0);
-          printf("4 CLEAR px0=0x%08x zero=%u/%u  %s\n", px, zero, W * H,
+          printf("4 CLEAR (+1s) px0=0x%08x zero=%u/%u  %s\n", px, zero, W * H,
                  zero == 0 && px != 0 ? "PASS" : "FAIL");
           if (!(zero == 0 && px != 0)) ++fails;
         } else { printf("4 CLEAR Map(READ) failed\n"); ++fails; }
