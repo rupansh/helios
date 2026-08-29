@@ -105,31 +105,50 @@ gets. The working path and the broken one are distinguishable in one
 
 ### The two routes that remain
 
-**(I) ICD-owned storage** — the ICD allocates a role-1 HVM1 allocation itself
-(shared, guest-backed, `MEM_MAPPED` Lock2) and executes `vkAllocateMemory`
-through the session with the import operand, instead of deferring it into the
-outer stream. Both halves already run in record-only mode: they are what the
-D3D12-resource import path uses. **Written and shipped OFF** behind
-`HELIOS_HOST_VISIBLE_SHARED=1` (icd `846efc3793c`). What it needs next, measured
-on KMD 22.22.392.0:
+**(I) ICD-owned storage** — the ICD allocates the role-1 HVM1 allocation itself
+(shared, guest-backed, `MEM_MAPPED` Lock2) and has the host import those pages,
+instead of deferring the allocate into the outer stream. Written; **ships off**
+(icd `7cc9ec2d432`, `HELIOS_HOST_VISIBLE_SHARED=1` is the arm). Everything it
+needs now works except one thing:
 
-* a role-1 create refuses any size `D3DKMTCreateAllocation` will not take
-  page-aligned, and **DXVK asks for 64-byte host-visible allocations**;
-* `HVM1_CPU_VISIBLE_MAX_BYTES` caps one allocation at **4 MiB** — the KMD's
-  worst-case reading of the host's stock udmabuf `list_limit` of 1024 pages
-  (this host: `list_limit` 1024, `size_limit_mb` 64). Sweep: 1 and 4 MiB
-  succeed, 8 MiB and up return `STATUS_NOT_SUPPORTED`;
-* the surviving 4 MiB arm still fails its session allocate, and the probe
-  process then **wedges in the kernel**. `Nr2Stale` moved by one and named
-  nothing, which is why `f3d0fa9` split its eleven writers — `Nr2StaleWhy`,
-  `Nr2StaleSub`, `Nr2StaleSz`/`Nr2StaleWant`, `Nr2OaeWhy` now answer "which
-  predicate" in one run. **That instrument is deployed and unread.**
+| step | state |
+|---|---|
+| create the HVM1 allocation inside a record-only device | ✅ clean, proven by the `bo-only` control |
+| KMD accepts the allocate render and patches the import operand | ✅ no refusal counter moves |
+| host imports guest pages as `VkDeviceMemory` | ✅ **and the memory is BINDABLE** |
+| host `vkAllocateMemory` returns success | ✅ once the memory type is right |
+| the next command on the device's ring | ❌ **refused, session poisoned** |
 
-✅ Fixed en route and independent of the knob: `vn_renderer_helios_allocate_memory`
-built its payload from `vn_sizeof_vkAllocateMemory` and
-`vn_encode_vkAllocateMemory`, which **disagree — 128 against 144**. Same
-divergence `vn_device_memory_defer_outer_allocate` documents at 120 against 136,
-where the generated wrapper's overrun corrupted the process heap.
+⭐ **The importable-memory-type finding, measured on the host GPU outside the
+stack** (`tools/udmabuf_import_probe.c`): NVIDIA's `vkGetMemoryFdProperties`
+mask for a udmabuf is `0x9`, and **only type 0 — `propertyFlags = 0x00` —
+actually imports; type 3, the host-visible one, returns
+`VK_ERROR_OUT_OF_DEVICE_MEMORY`**, which is precisely what the guest saw. The
+guest never needed a host-visible type: the host does not map this memory, the
+GUEST holds the CPU view of the same pages. Rule now: fewest property flags.
+A buffer then binds to it, so the GPU really can read and write guest RAM.
+
+⛔ **The one remaining blocker, isolated by control rather than inferred.**
+`vn_renderer_helios_allocate_memory` executes on `helios->bootstrap`, and a
+session execute is not safe once the device's primary ring is live. The next
+ring command — the uncached direct `vkCreateBuffer` that `vn_buffer.c`
+legitimately issues in record-only mode (venus command type 50, read verbatim
+out of the refused payload) — comes back `STATUS_INVALID_PARAMETER`, which
+poisons the session and removes **every D3D11 device on the box**. The control
+that proves it: `HELIOS_HOST_VISIBLE_SHARED=bo-only` builds the identical HVM1
+allocation and skips only the session execute — probe clean, zero refusals.
+
+⇒ **Next step: issue the allocate on the device's own ring, with its import
+operand patched there**, instead of on the bootstrap session. That is also why
+the D3D12-resource import path, which uses the same function, has never been
+exercised.
+
+⚠ It stays off because turning it on is strictly worse than the defect it
+fixes: a black desktop becomes no desktop. Two sub-limits to carry forward — a
+4 MiB cap per allocation (`HVM1_CPU_VISIBLE_MAX_BYTES`, the host's stock udmabuf
+`list_limit` of 1024 pages), and page granularity (DXVK asks for 64-byte
+host-visible allocations; the size is rounded up, and sub-page requests fall
+back).
 
 **(II) Restore the CPU host aperture** — the pre-retirement design, and the one
 the rest of the driver still assumes: `build_paging_buffer.rs` states outright
@@ -138,13 +157,14 @@ aperture exposes the blob bytes — `cpu_host_aperture.rs`)"*. That file was
 **deleted by K1 in `60a9988`** (490 lines) along with `blob_map.rs` (193), and
 `DxgkDdiMapCpuHostAperture` is `None` today with no segment advertising
 `SupportsCpuHostAperture`. Recover it with
-`git show 60a9988^:kmd_render/src/ddi/cpu_host_aperture.rs`. No 4 MiB cap, since
-the host owns the memory; costs a segment-table change and carries the Code-43
-history the CLAUDE.md invariant records.
+`git show 60a9988^:kmd_render/src/ddi/cpu_host_aperture.rs`. No 4 MiB cap, no
+page-granularity limit, and — decisively — **it does not touch the record-only
+submission machinery at all**, which is where route (I) keeps snagging. Costs a
+segment-table change and carries the Code-43 history the CLAUDE.md invariant
+records.
 
-⇒ **(I) iterates in minutes (meson + `win_install_umd`, no reboot) and its next
-step is to read the instrument that is already deployed. (II) is the general
-fix.**
+⇒ Route (I) is one plumbing change from working and iterates in minutes; route
+(II) is the general fix and avoids the ring/session hazard entirely.
 
 ---
 
