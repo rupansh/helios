@@ -3352,10 +3352,11 @@ unsafe fn build_guest_backed_linear(
     // well, which `Drop` also unlocks and frees, is a double free; the
     // shared-backing path deliberately stores only `backing_store_va` for the
     // same reason. Nothing below may free it, including the failure paths.
-    let memory_id = match adapter
-        .with_venus_client(passive, |c| c.import_guest_memory(adapter, resource_id, bytes))
-    {
-        Ok(Ok(id)) => id,
+    let (memory_id, memory_type_index) = match adapter.with_venus_client(passive, |c| {
+        c.import_guest_memory(adapter, resource_id, bytes)
+            .map(|id| (id, c.memory_type_index()))
+    }) {
+        Ok(Ok(pair)) => pair,
         _ => {
             // ⛔ The resource MUST go, and not merely to avoid a leak: while it
             // lives, the host holds a udmabuf over these page frames and the
@@ -3391,7 +3392,10 @@ unsafe fn build_guest_backed_linear(
         pitch: 0,
         plane_offset: 0,
         venus_alloc_size: bytes,
-        memory_type_index: 0,
+        // The type the memory was actually imported into. Publishing 0 here
+        // while importing into another is what a cross-process opener would
+        // then re-import with.
+        memory_type_index,
         blob_size: BackingSize::HostAuthoritative(bytes),
         guest_backed: true,
     })

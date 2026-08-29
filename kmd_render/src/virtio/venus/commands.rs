@@ -140,8 +140,13 @@ impl VenusClient {
             crate::diag::record_named_bytes(b"GbImpCap", self.owned_memory_blobs.len() as u32);
             return Err(VirtioError::OutOfMemory);
         }
-        // "Fewest property flags", measured on the host: only the flagless type
-        // imports a udmabuf. See `choose_importable_memory_type`.
+        // "Fewest property flags". ⭐ MEASURED TWICE, and the second reading is
+        // why this is not the obvious choice: using
+        // `self.memory_type_index` — the HOST_VISIBLE|HOST_COHERENT type every
+        // other KMD blob uses, and the one the ICD asks for — makes the import
+        // itself fail (`GbImp` 0 -> 1, 22.22.413.0). `udmabuf_import_probe.c`
+        // measured the same rule on the host GPU: only the flagless type
+        // imports a dmabuf. The venus virtual device inherits it.
         let Some(memory_type_index) = helios_kmd_logic::choose_importable_memory_type(
             &self.memory_type_flags,
             self.memory_type_count,
