@@ -130,6 +130,10 @@ pub(crate) struct AdapterKnobs {
     /// allocation prefer local memory. See
     /// [`crate::diag::knobs::BAR_LOCAL_SHARED`].
     pub bar_local_shared: bool,
+    /// `BarSegOnly` (default 0 = off). Nonzero drops the linear aperture from a
+    /// local-preferring allocation's supported segment set. See
+    /// [`crate::diag::knobs::BAR_SEGMENT_ONLY`].
+    pub bar_segment_only: bool,
 }
 
 impl AdapterKnobs {
@@ -147,6 +151,7 @@ impl AdapterKnobs {
         cross_adapter: false,
         bar_seg_flags_extra: 0,
         bar_local_shared: false,
+        bar_segment_only: false,
     };
 
     /// Read every knob once. PASSIVE_LEVEL.
@@ -163,6 +168,7 @@ impl AdapterKnobs {
             cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
             bar_seg_flags_extra: read_config_dword(knobs::BAR_SEG_FLAGS_EXTRA, 0),
             bar_local_shared: read_config_dword(knobs::BAR_LOCAL_SHARED, 0) != 0,
+            bar_segment_only: read_config_dword(knobs::BAR_SEGMENT_ONLY, 0) != 0,
         }
     }
 
@@ -176,6 +182,7 @@ impl AdapterKnobs {
         // transcript cannot be told apart from the default it silently took.
         crate::diag::record_named_bytes(b"BarSgX", knobs.bar_seg_flags_extra);
         crate::diag::record_named_bytes(b"BarLcS", knobs.bar_local_shared as u32);
+        crate::diag::record_named_bytes(b"BarSgO", knobs.bar_segment_only as u32);
         knobs
     }
 }

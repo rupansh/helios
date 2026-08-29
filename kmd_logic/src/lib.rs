@@ -1135,6 +1135,13 @@ pub const ST_IMAGE_CREATE_INFO: i32 = 14;
 pub const ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO: i32 = 1000072001;
 pub const ST_EXPORT_MEMORY_ALLOCATE_INFO: i32 = 1000072002;
 pub const ST_MEMORY_DEDICATED_ALLOCATE_INFO: i32 = 1000127001;
+/// `VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA`.
+///
+/// Venus-private — it is not in `vulkan_core.h`. The value is venus-protocol's
+/// own `vn_protocol_driver_defines.h:20`, which is the same header the ICD
+/// encodes against, so guest and host agree by construction rather than by a
+/// number copied out of a doc.
+pub const ST_IMPORT_MEMORY_RESOURCE_INFO_MESA: i32 = 1000384002;
 
 pub const IMAGE_TYPE_2D: u32 = 1;
 pub const SAMPLE_COUNT_1: u32 = 0x0000_0001;
@@ -1217,6 +1224,13 @@ pub enum MemoryPNext {
     Export { handle_type: u32 },
     /// `VkExportMemoryAllocateInfo` -> `VkMemoryDedicatedAllocateInfo`.
     ExportDedicated { handle_type: u32, image: u64 },
+    /// `VkImportMemoryResourceInfoMESA` — the memory's storage IS the named
+    /// virtio resource, not a fresh host allocation. This is how a guest-backed
+    /// blob becomes a `VkDeviceMemory`: QEMU turns the guest pages into a
+    /// udmabuf and virglrenderer imports it
+    /// (`virtio-gpu-virgl.c:951-964`), so the host GPU and the guest CPU
+    /// address the same physical memory.
+    ImportResource { resource_id: u32 },
 }
 
 /// The allocation chain for the KMD-owned OPTIMAL GDI image on the admitted
@@ -1253,6 +1267,12 @@ pub fn encode_memory_allocate(device_id: u64, memory_id: u64, spec: &MemoryAlloc
             w.i32(ST_EXPORT_MEMORY_ALLOCATE_INFO);
             w.count(false);
             w.u32(handle_type);
+        }
+        MemoryPNext::ImportResource { resource_id } => {
+            w.count(true);
+            w.i32(ST_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+            w.count(false);
+            w.u32(resource_id);
         }
         MemoryPNext::ExportDedicated { handle_type, image } => {
             w.count(true);
@@ -1586,6 +1606,64 @@ mod tests {
                 handle_type: 0x0000_0200
             }
         ));
+    }
+
+    /// Not a golden-byte tautology: `VkImportMemoryResourceInfoMESA` and
+    /// `VkExportMemoryAllocateInfo` have the SAME wire shape as a pNext element
+    /// — non-null pointer, sType, null pNext, one u32 — so the two streams must
+    /// differ in exactly two words, the sType and that u32. Anything else means
+    /// the import arm emitted a different chain shape than the encoder venus
+    /// decodes with.
+    #[test]
+    fn import_resource_differs_from_export_only_in_stype_and_payload() {
+        let mk = |pnext| {
+            encode_memory_allocate(
+                GOLD_DEVICE,
+                GOLD_MEMORY,
+                &MemoryAllocateSpec {
+                    pnext,
+                    size: GOLD_SIZE,
+                    memory_type_index: GOLD_MTI,
+                },
+            )
+        };
+        let export_w = mk(MemoryPNext::Export {
+            handle_type: 0x0000_0200,
+        });
+        let import_w = mk(MemoryPNext::ImportResource {
+            resource_id: 0x0000_0201,
+        });
+        let export = export_w.finished().expect("encoder must not overflow");
+        let import = import_w.finished().expect("encoder must not overflow");
+        assert_eq!(export.len(), import.len());
+        assert_eq!(export.len() % 4, 0);
+        let word = |b: &[u8], i: usize| {
+            u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]])
+        };
+        let mut differing = 0;
+        for i in 0..export.len() / 4 {
+            if word(export, i) == word(import, i) {
+                continue;
+            }
+            differing += 1;
+            let v = word(import, i);
+            assert!(
+                v == ST_IMPORT_MEMORY_RESOURCE_INFO_MESA as u32 || v == 0x0000_0201,
+                "word {i} differs but is neither the sType nor the resource id: {v:#x}"
+            );
+        }
+        assert_eq!(
+            differing, 2,
+            "expected exactly the sType word and the payload word to differ"
+        );
+    }
+
+    #[test]
+    fn import_resource_stype_is_the_venus_protocol_value() {
+        // `vn_protocol_driver_defines.h:20`. A wrong sType is silently ignored
+        // by the host decoder's `default:` arm, which would leave the memory a
+        // plain host allocation with no import and no error anywhere.
+        assert_eq!(ST_IMPORT_MEMORY_RESOURCE_INFO_MESA, 1000384002);
     }
 
     /// The order-sensitive one: the dedicated struct's image/buffer fields come

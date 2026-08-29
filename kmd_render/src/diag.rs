@@ -637,6 +637,19 @@ pub mod knobs {
     /// LogonUI/DWM), so it stays the default; this is the A/B for re-testing it
     /// once a CPU lock can be served in place. Read at AddAdapter.
     pub const BAR_LOCAL_SHARED: KnobName = KnobName::new(b"BarLocalShare");
+    /// Drop the linear aperture from a local-preferring allocation's SUPPORTED
+    /// segment set, so segment 2 is the only place VidMm may put it
+    /// (default 0 = both, the measured shape).
+    ///
+    /// This is the arm that FORCES the CPU-host-aperture path: with no aperture
+    /// segment to escape to, a CPU lock must either be served through
+    /// `DxgkDdiMapCpuHostAperture` or fail. Removing it alone historically made
+    /// `pfnAllocateCb` return `E_INVALIDARG` on every CPU-visible allocation —
+    /// which is the expected answer when the sole supported segment is a
+    /// memory segment dxgkrnl does not consider CPU-reachable. Pair it with
+    /// `BarSegFlagsX=4`, which supplies the `CpuVisible` bit that objection is
+    /// about; that combination has never been measured. Read at AddAdapter.
+    pub const BAR_SEGMENT_ONLY: KnobName = KnobName::new(b"BarSegOnly");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.

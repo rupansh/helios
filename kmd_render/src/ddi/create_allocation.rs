@@ -2002,6 +2002,12 @@ pub(crate) struct PagingAllocInfo {
     pub resource_id: u32,
     pub size: u64,
     pub bar_eligible: bool,
+    /// `HELIOS_HWA2_*` allocation kind. With `hvm1_role` it separates an
+    /// ordinary D3D11 resource from the HVM1 pool, which the aperture census
+    /// otherwise cannot tell apart — every `>= 1024`-page map it caught on
+    /// 22.22.399.0 turned out to be HVM1.
+    pub kind: u32,
+    pub hvm1_role: u32,
 }
 
 /// Allocation handles refused because they were null or failed the magic check
@@ -2357,6 +2363,8 @@ pub(crate) unsafe fn paging_alloc_info(h: HANDLE) -> Option<PagingAllocInfo> {
         resource_id: ctx.resource_id(),
         size: ctx.size as u64,
         bar_eligible: ctx.bar_eligible,
+        kind: ctx.kind,
+        hvm1_role: ctx.hvm1_role,
     })
 }
 
@@ -2639,21 +2647,25 @@ fn vidmm_placement(
     local_seg_id: Option<u32>,
     is_primary: bool,
     cpu_visible: bool,
+    segment_only: bool,
 ) -> VidMmPlacement {
     let aperture_bit = segment_bit(crate::ddi::gpummu::APERTURE_SEGMENT_ID);
 
     let (preferred_segment, supported_segments) =
         if let (true, Some(seg_id)) = (bar_eligible, local_seg_id) {
-            // ⚠ The aperture stays in the supported set. Removing it -- to stop
-            // VidMm putting CPU-locked allocations in system memory, which is
-            // NOT where their content lives -- makes pfnAllocateCb refuse every
-            // CPU-visible allocation with E_INVALIDARG. Measured on .394/.395/
-            // .396, across three segment-flag shapes including the historical
-            // BarSegFlags 0x1C, so it is not the flags: dxgkrnl requires a
-            // system-memory home for these allocations. Left as-is until that
-            // requirement is understood; the cost is that `ChMc` stays 0 and
-            // the CPU view is still not the blob.
-            (seg_id, segment_bit(seg_id) | aperture_bit)
+            // The aperture stays in the supported set by default. `BarSegOnly`
+            // removes it, which is the only shape that FORCES a CPU lock
+            // through the aperture DDI: DxgKrnl ETW (2026-08-30) shows VidMm
+            // otherwise answering the lock by evicting the allocation out of
+            // segment 2 into an aperture segment. Removing it alone was
+            // measured at E_INVALIDARG on .394-.396; see the knob for why that
+            // measurement does not settle the pair with `BarSegFlagsX=4`.
+            let supported = if segment_only {
+                segment_bit(seg_id)
+            } else {
+                segment_bit(seg_id) | aperture_bit
+            };
+            (seg_id, supported)
         } else {
             (crate::ddi::gpummu::APERTURE_SEGMENT_ID, aperture_bit)
         };
@@ -3753,6 +3765,7 @@ unsafe fn admit_hwa2(
         local_seg_id,
         is_primary,
         desc.has_flag(HELIOS_HWA2_FLAG_CPU_VISIBLE),
+        adapter.knobs().bar_segment_only,
     );
 
     // VidMm is charged the LARGER of the descriptor's extent and the backing the

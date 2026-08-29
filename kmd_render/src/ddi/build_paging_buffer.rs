@@ -226,9 +226,43 @@ static BAR_APMAP_LAST_SEG: AtomicU32 = AtomicU32::new(0);
 static BAR_APMAP_NULL_MDL: AtomicU32 = AtomicU32::new(0);
 /// Same, filtered to maps of >= 1024 pages, so the 4 MiB subject of
 /// `d3d11_hostram_alias_probe` stays readable after smaller maps follow it.
+///
+/// ⚠ SPLIT BY CLASS on 22.22.400.0. On .399 this was one last-value slot and
+/// every big map it caught was HVM1: all three sampled resource ids appeared in
+/// QEMU's `virtio_gpu_virgl_guest_blob_backing` trace, which fires ONLY for
+/// `VIRTIO_GPU_BLOB_MEM_GUEST` (`virtio-gpu-virgl.c:936`) — and HWA2 backings
+/// are HOST3D. So the reading that mattered, an ordinary D3D11 resource's
+/// aperture MDL, was never taken. `Ab` is now HWA2-only and `Ah` is the HVM1
+/// pool it was drowning in.
 static BAR_APBIG_PAGES: AtomicU32 = AtomicU32::new(0);
 static BAR_APBIG_PFN: AtomicU64 = AtomicU64::new(0);
 static BAR_APBIG_RESID: AtomicU32 = AtomicU32::new(0);
+static BAR_APBIG_KIND: AtomicU32 = AtomicU32::new(0);
+static BAR_APHVM1_PAGES: AtomicU32 = AtomicU32::new(0);
+static BAR_APHVM1_PFN: AtomicU64 = AtomicU64::new(0);
+static BAR_APHVM1_RESID: AtomicU32 = AtomicU32::new(0);
+/// Aperture maps naming an allocation this driver does not own. SPLIT, because
+/// one bucket over two predicates is not evidence: a NULL `hAllocation` (a map
+/// not tied to an allocation at all) and a live handle that fails the magic
+/// check are different findings and were indistinguishable at 22 on .400.
+static BAR_APMAP_NULL_HANDLE: AtomicU32 = AtomicU32::new(0);
+static BAR_APMAP_FOREIGN: AtomicU32 = AtomicU32::new(0);
+
+/// An 8-slot ring of every aperture map of >= 256 pages, resolved or not.
+///
+/// ⛔ REPLACES the per-class last-value slots, which could not answer the one
+/// question that mattered. On .400 the ETW showed exactly four aperture maps
+/// over a probe run — two `CpuVisible|Shareable` 4 MiB and two
+/// `Protected|FromEndOfSegment` 15 MiB — while the counters reported "2 foreign,
+/// last resolved = HVM1". Which of the four was the D3D11 staging texture is
+/// not derivable from a slot the next map overwrites. A ring is.
+const AP_RING: usize = 8;
+static AP_RING_SEQ: AtomicU32 = AtomicU32::new(0);
+static AP_RING_RESID: [AtomicU32; AP_RING] = [const { AtomicU32::new(0) }; AP_RING];
+static AP_RING_PAGES: [AtomicU32; AP_RING] = [const { AtomicU32::new(0) }; AP_RING];
+static AP_RING_PFN: [AtomicU64; AP_RING] = [const { AtomicU64::new(0) }; AP_RING];
+/// `kind | role<<8 | segid<<16 | resolved<<24 | null_handle<<25`.
+static AP_RING_CLASS: [AtomicU32; AP_RING] = [const { AtomicU32::new(0) }; AP_RING];
 
 /// The BAR paging counter block, mirrored into the registry through the shared
 /// throttled emitter (R317). Named values and encodings are unchanged; only the
@@ -273,6 +307,12 @@ static PAGING_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(b"PgAbN", &BAR_APBIG_PAGES),
         e64(b"PgAbP", &BAR_APBIG_PFN),
         e(b"PgAbR", &BAR_APBIG_RESID),
+        e(b"PgAbK", &BAR_APBIG_KIND),
+        e(b"PgAhN", &BAR_APHVM1_PAGES),
+        e64(b"PgAhP", &BAR_APHVM1_PFN),
+        e(b"PgAhR", &BAR_APHVM1_RESID),
+        f(b"PgAmF", &BAR_APMAP_FOREIGN),
+        f(b"PgAmZ", &BAR_APMAP_NULL_HANDLE),
     ],
     ticks: &PAGING_FLUSH_TICKS,
     failures: &PAGING_FLUSH_FAILURES,
@@ -1145,9 +1185,17 @@ unsafe fn record_aperture_census(operation: &PagingOperation<'_>) {
     let pages = map.NumberOfPages as u32;
     BAR_APMAP_LAST_PAGES.store(pages, Ordering::Relaxed);
     BAR_APMAP_LAST_SEG.store(map.SegmentId, Ordering::Relaxed);
-    // Zero when the allocation is not one of ours; that is itself the reading.
-    let resid = unsafe { paging_alloc_info(map.hAllocation) }.map_or(0, |a| a.resource_id);
-    BAR_APMAP_LAST_RESID.store(resid, Ordering::Relaxed);
+
+    let null_handle = map.hAllocation.is_null();
+    let alloc = unsafe { paging_alloc_info(map.hAllocation) };
+    match (&alloc, null_handle) {
+        (None, true) => BAR_APMAP_NULL_HANDLE.fetch_add(1, Ordering::Relaxed),
+        (None, false) => BAR_APMAP_FOREIGN.fetch_add(1, Ordering::Relaxed),
+        (Some(a), _) => {
+            BAR_APMAP_LAST_RESID.store(a.resource_id, Ordering::Relaxed);
+            0
+        }
+    };
     if map.pMdl.is_null() {
         BAR_APMAP_NULL_MDL.fetch_add(1, Ordering::Relaxed);
         return;
@@ -1159,29 +1207,56 @@ unsafe fn record_aperture_census(operation: &PagingOperation<'_>) {
         core::ptr::read_unaligned(array.add(map.MdlOffset as usize)) as u64
     };
     BAR_APMAP_LAST_PFN.store(pfn, Ordering::Relaxed);
-    if pages < 1024 {
+    // >= 1 MiB. Below that is DWM's ordinary churn and it would evict the
+    // subjects out of an 8-slot ring before they could be read.
+    if pages < 256 {
         return;
     }
-    BAR_APBIG_PAGES.store(pages, Ordering::Relaxed);
-    BAR_APBIG_PFN.store(pfn, Ordering::Relaxed);
-    BAR_APBIG_RESID.store(resid, Ordering::Relaxed);
+    let class = u32::from(alloc.map_or(0u8, |a| a.kind as u8))
+        | (u32::from(alloc.map_or(0u8, |a| a.hvm1_role as u8)) << 8)
+        | ((map.SegmentId & 0xFF) << 16)
+        | (u32::from(alloc.is_some()) << 24)
+        | (u32::from(null_handle) << 25);
+    let i = (AP_RING_SEQ.fetch_add(1, Ordering::Relaxed) as usize) % AP_RING;
+    AP_RING_RESID[i].store(alloc.map_or(0, |a| a.resource_id), Ordering::Relaxed);
+    AP_RING_PAGES[i].store(pages, Ordering::Relaxed);
+    AP_RING_PFN[i].store(pfn, Ordering::Relaxed);
+    AP_RING_CLASS[i].store(class, Ordering::Relaxed);
+
+    // Keep the two per-class last-value slots as a quick read, but they are no
+    // longer the evidence — the ring is.
+    if let Some(a) = alloc {
+        if pages >= 1024 {
+            if a.hvm1_role != 0 {
+                BAR_APHVM1_PAGES.store(pages, Ordering::Relaxed);
+                BAR_APHVM1_PFN.store(pfn, Ordering::Relaxed);
+                BAR_APHVM1_RESID.store(a.resource_id, Ordering::Relaxed);
+            } else {
+                BAR_APBIG_PAGES.store(pages, Ordering::Relaxed);
+                BAR_APBIG_PFN.store(pfn, Ordering::Relaxed);
+                BAR_APBIG_RESID.store(a.resource_id, Ordering::Relaxed);
+                BAR_APBIG_KIND.store(a.kind, Ordering::Relaxed);
+            }
+        }
+    }
+
     // Published HERE rather than through `PAGING_COUNTERS`: that block flushes
     // on every 64th CONTENT op, and an aperture map is not one — a whole probe
     // run produces a handful of them and no transfers, so the throttled path
-    // would never write. Gated to >= 1024 pages so the write rate stays bounded
-    // by the 4 MiB-and-up class instead of DWM's ordinary churn.
+    // would never write.
     // SAFETY: KeGetCurrentIrql is callable at any IRQL.
     if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
         return;
     }
+    let d = b'0' + i as u8;
     crate::diag::record_named_bytes(b"PgAm", BAR_APMAP.load(Ordering::Relaxed));
     crate::diag::record_named_bytes(b"PgAu", BAR_APUNMAP.load(Ordering::Relaxed));
-    crate::diag::record_named_bytes(b"PgAbN", pages);
-    crate::diag::record_named_bytes(b"PgAbR", resid);
-    crate::diag::record_named_bytes(b"PgAbS", map.SegmentId);
+    crate::diag::record_named_bytes(&[b'P', b'g', b'R', d, b'r'], alloc.map_or(0, |a| a.resource_id));
+    crate::diag::record_named_bytes(&[b'P', b'g', b'R', d, b'n'], pages);
+    crate::diag::record_named_bytes(&[b'P', b'g', b'R', d, b'k'], class);
     // Split: a page frame is up to 52 bits and the ring value is 32.
-    crate::diag::record_named_bytes(b"PgAbPlo", (pfn & 0xFFFF_FFFF) as u32);
-    crate::diag::record_named_bytes(b"PgAbPhi", (pfn >> 32) as u32);
+    crate::diag::record_named_bytes(&[b'P', b'g', b'R', d, b'l'], (pfn & 0xFFFF_FFFF) as u32);
+    crate::diag::record_named_bytes(&[b'P', b'g', b'R', d, b'h'], (pfn >> 32) as u32);
 }
 
 /// Which end of a classic TRANSFER a `DXGK_TRANSFERVIRTUAL`-style descriptor
