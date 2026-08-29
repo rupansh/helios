@@ -242,6 +242,61 @@ lines crowded the 12 single-occurrence `create_blob` lines off the list. Count
 the event you care about explicitly; never read a null out of a truncated
 histogram.
 
+### ⭐⭐⭐⭐ 2026-08-29 FINAL: THE HOST RENDERS. THE GUEST CANNOT READ IT BACK.
+
+⛔ **This supersedes the ranking immediately below it.** The decisive measurement
+came from the one observer outside the entire stack: the host GPU.
+
+`tools/d3d11_gpu_load_probe.cpp` (1024×1024, 64 full-viewport draws per
+iteration, expensive pixel shader) with `nvidia-smi pmon -c 30 -s u -d 1` on the
+Linux host:
+
+```
+0  104293  C+G  42  0 ... virgl_render_se
+0  104293  C+G  58  0 ... virgl_render_se
+0  104293  C+G  59  0 ... virgl_render_se      <- ~23 s sustained
+```
+
+pid 104293 is the render server **spawned for this probe**; every other render
+server stayed at `-` throughout, and the GPU returned to 0% when it ended.
+
+⇒ **THE HOST GPU EXECUTES OUR DRAWS — fragment shader and all.**
+
+#### What that settles
+
+| | verdict |
+|---|---|
+| Guest emits a correct venus stream | ✅ proven (`HRA2`) |
+| KMD accepts, QEMU receives | ✅ proven |
+| **Host rasterises it** | ✅ **proven (42–59% SM)** |
+| Guest sees any result | ❌ never |
+
+* **Theory 3 (host never executes) is REFUTED.** The occlusion/pipeline-statistic
+  zeros were read-before-execute artifacts of the broken query channel, exactly
+  as `PREFLUSH GetData` indicated.
+* **Theory 2 (F16 — the guest CPU view is not the host's memory) is now the
+  leading theory**, by elimination *and* on its own evidence. Everything in the
+  pipeline works except the guest's ability to read what was rendered.
+* **Theory 1 (premature completion) is demoted to contributing.** It is real and
+  proven for the query path, but it cannot explain a poison that survives a
+  +1 s re-read once execution is established.
+
+⇒ **The next step is a code change to the readback path**, not another
+measurement. The question to answer first is the one the invalid sampler failed
+to: for a host-visible HVM1 allocation, is `D3DKMTLock2`'s pointer the same
+physical memory the KMD locks, udmabufs and the host imports? Prove it with a
+per-allocation mapping that records its own VA.
+
+#### Two further defects found by the same probe (neither is the black desktop)
+
+1. **`Nr2OuterRej = 0x00010006` — one `SlotExhausted`** under sustained load,
+   from 0 before. Submission slots run out.
+2. **The submit path then wedges**: a single loop iteration spun ~100 s of CPU
+   across 19 threads without draining, while the host GPU sat idle and the probe
+   never reached its own exit print. The adapter survived (`OK/CM_PROB_NONE`).
+   This is almost certainly a retry spin on the exhausted slot, and it is a
+   plausible contributor to the historical "freeze" reports.
+
 ### ⭐⭐⭐ 2026-08-29 END-OF-DAY: ranked theories for the next session
 
 ⛔ **Read this block before anything else in this file.** Several conclusions
