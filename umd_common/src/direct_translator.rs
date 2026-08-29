@@ -291,6 +291,28 @@ impl DirectTranslator {
         self.instance.handle
     }
 
+    /// The ICD's own refusal tally.
+    ///
+    /// `HeliosTranslatorDispatchV1::query_refusal_counters` is documented as
+    /// "every value must be zero on a healthy run", and until 2026-08-29 nothing
+    /// in the stack called it — a designed-in refusal channel with no reader,
+    /// while `vkQueueSubmit` refusals would have been invisible.
+    pub fn refusal_counters(
+        &self,
+    ) -> Result<helios_protocol::HeliosTranslatorRefusalCountersV1, DirectTranslatorError> {
+        let query = self
+            .dispatch()
+            .query_refusal_counters
+            .ok_or(DirectTranslatorError::Refused(
+                HeliosTranslatorStatus::NullArgument,
+            ))?;
+        let mut out = helios_protocol::HeliosTranslatorRefusalCountersV1::default();
+        out.struct_bytes = helios_protocol::HELIOS_TRANSLATOR_REFUSAL_COUNTERS_BYTES;
+        out.abi_version = helios_protocol::HELIOS_TRANSLATOR_DISPATCH_ABI_VERSION;
+        Self::decode_status(query(self.instance.handle, &mut out))?;
+        Ok(out)
+    }
+
     fn decode_status(status: HeliosTranslatorStatusCode) -> Result<(), DirectTranslatorError> {
         let status = HeliosTranslatorStatus::from_wire(status)
             .map_err(|unknown| DirectTranslatorError::UnknownStatus(unknown.code))?;

@@ -1014,6 +1014,40 @@ pub(crate) unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVI
     log_error!("{}", crate::forward::ddi_refusal_summary());
     // The deferred-context surface, same readout discipline (Phase C).
     log_error!("{}", crate::forward::deferred_summary());
+    // The ICD's OWN refusals. Its dispatch table has carried
+    // query_refusal_counters since A5 and nothing had ever called it, so a
+    // refused vkQueueSubmit was invisible from here — which is exactly the
+    // shape of the 2026-08-29 finding that no GPU work executes at all
+    // (occlusion 0/4096, every pipeline statistic zero, against a WARP control
+    // that reports 4096).
+    {
+        let dev = &*(h_device.pDrvPrivate as *mut HeliosDevice);
+        match dev.outer.translator.refusal_counters() {
+            Ok(c) => log_error!(
+                "ICD refusals: queue_submit_without_scope={} queue_submit2_without_scope={} \
+                 queue_bind_sparse_without_scope={} queue_present_refused={} \
+                 queue_wait_idle_without_scope={} device_wait_idle_without_scope={} \
+                 loader_provenance_rejected={} control_opcode_class_violation={} \
+                 deferred_use_without_outer_batch={} batch_bound_exceeded={} \
+                 foreign_vulkan_handle_rejected={} withheld_proc_addr_refused={} \
+                 reentrant_join_refused={}",
+                c.queue_submit_without_scope,
+                c.queue_submit2_without_scope,
+                c.queue_bind_sparse_without_scope,
+                c.queue_present_refused,
+                c.queue_wait_idle_without_scope,
+                c.device_wait_idle_without_scope,
+                c.loader_provenance_rejected,
+                c.control_opcode_class_violation,
+                c.deferred_use_without_outer_batch,
+                c.batch_bound_exceeded,
+                c.foreign_vulkan_handle_rejected,
+                c.withheld_proc_addr_refused,
+                c.reentrant_join_refused
+            ),
+            Err(e) => log_error!("ICD refusals: unavailable ({:?})", e),
+        }
+    }
     // Bounded, process-global Present/Present1/MPO entry and callback evidence.
     // This is emitted before teardown while the UMD log remains available.
     log_error!("{}", crate::forward::present_boundary_summary());
