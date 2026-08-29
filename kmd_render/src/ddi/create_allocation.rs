@@ -115,6 +115,10 @@ const BACKING_STORE_BOUND: u32 = 2;
 
 extern "C" {
     fn helios_mm_probe_and_lock_pages_seh(mdl: PMDL) -> i32;
+    /// As above, with `UserMode` access. REQUIRED for a creator-supplied VA:
+    /// the KernelMode variant does not check that the range is user address
+    /// space in the current process, so it succeeds over the wrong pages.
+    fn helios_mm_probe_and_lock_user_pages_seh(mdl: PMDL) -> i32;
     fn helios_mm_get_mdl_pfn_array(mdl: PMDL) -> *const u64;
 }
 
@@ -3185,6 +3189,7 @@ static GUEST_BACK_IMPORT: AtomicU32 = AtomicU32::new(0);
 static GUEST_BACK_VIN_REJ: AtomicU32 = AtomicU32::new(0);
 static GUEST_BACK_VOUT_REJ: AtomicU32 = AtomicU32::new(0);
 static GUEST_BACK_WROTE: AtomicU32 = AtomicU32::new(0);
+static GUEST_BACK_HEAD_SAMPLES: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) fn dump_guest_backing_counters() {
     for (name, counter) in [
@@ -3282,10 +3287,15 @@ unsafe fn build_guest_backed_linear(
         GUEST_BACK_MDL.fetch_add(1, Ordering::Relaxed);
         return None;
     }
+    // ⛔ USER access mode, not the KernelMode shim the K2a backing store uses.
+    // KernelMode skips the "is this user address space in THIS process" check,
+    // so it succeeded over pages that were not the creator's buffer at all —
+    // measured: `GbProbe` stayed 0 while a UMD control pattern written into the
+    // buffer never appeared at the resulting guest blob's own first GPA.
     // SAFETY: the SEH shim converts the raise `MmProbeAndLockPages` performs on
     // an invalid or foreign range into a 0 return. This is the ONLY thing
     // standing between an untrusted VA and a bugcheck.
-    if unsafe { helios_mm_probe_and_lock_pages_seh(mdl) } == 0 {
+    if unsafe { helios_mm_probe_and_lock_user_pages_seh(mdl) } == 0 {
         unsafe { IoFreeMdl(mdl) };
         GUEST_BACK_PROBE.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -3328,6 +3338,34 @@ unsafe fn build_guest_backed_linear(
         GUEST_BACK_PFN.fetch_add(1, Ordering::Relaxed);
         return None;
     }
+    // ⭐ THE LAST AMBIGUITY, read through the KMD's OWN mapping of this exact
+    // MDL. The creator writes `0xB00B0000` into page 0 before the allocation
+    // exists and reads it back afterwards; QEMU reads ZERO at the very GPA this
+    // MDL's first entry names. Exactly one of those two can be true of the same
+    // page, and a kernel read through the MDL says which: `0xB00B0000` here
+    // means the MDL describes the creator's buffer and the break is between the
+    // MDL and the host; zero means the lock produced the wrong pages.
+    // Bounded to the first few, because each mapping costs system PTEs.
+    if GUEST_BACK_HEAD_SAMPLES.load(Ordering::Relaxed) < 4 {
+        GUEST_BACK_HEAD_SAMPLES.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: the MDL is locked and describes `bytes` bytes.
+        let head = unsafe { k2a_mdl_system_va_cached(mdl, bytes, _MEMORY_CACHING_TYPE::MmCached) }
+            .map_or(0xFFFF_FFFF, |va| {
+                // SAFETY: `va` maps at least one page of the locked MDL.
+                unsafe { core::ptr::read_unaligned(va as *const u32) }
+            });
+        crate::diag::record_named_bytes(b"GbHead", head);
+    }
+
+    // ⭐ The MATCH KEY against QEMU's own trace. `ranges` and `first` in
+    // `virtio_gpu_virgl_guest_blob_backing` are exactly this entry count and
+    // this first address, so a reader can say WHICH blob is this allocation's
+    // instead of guessing among the several a probe run creates. Without it,
+    // "the blob reads zero" names no blob.
+    crate::diag::record_named_bytes(b"GbEntN", entries.len() as u32);
+    crate::diag::record_named_bytes(b"GbGpaLo", entries[0].addr as u32);
+    crate::diag::record_named_bytes(b"GbGpaHi", (entries[0].addr >> 32) as u32);
+
     // MAPPABLE|SHAREABLE mirrors HVM1 role 2, the one guest-blob shape this
     // host path is exercised with every boot.
     let resource_id = match crate::virtio::ctrl::resource_create_guest_blob(

@@ -671,6 +671,25 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
             log_error!("DXVK internal allocation REFUSED: no CPU backing for {} bytes", bytes);
             return Err(E_OUTOFMEMORY);
         };
+        // ⭐ POSITIVE CONTROL on the page sharing itself, written BEFORE the
+        // allocation exists and never touched again. EVERY page names its own
+        // index, so any guest-physical address QEMU can be pointed at either
+        // identifies itself as this buffer or does not — which the application's
+        // own stamps cannot do, because DXVK suballocates and the map offset is
+        // not knowable from outside. If the guest blob's first GPA reads
+        // `0xB00B0000`, the pages the KMD locked ARE this buffer.
+        // SAFETY: `backing` owns `bytes()` writable bytes; every write below is
+        // the first dword of a page strictly inside that range.
+        unsafe {
+            let base = backing.as_ptr() as *mut u8;
+            let pages = backing.bytes() / 4096;
+            for page in 0..pages {
+                core::ptr::write_unaligned(
+                    base.add(page * 4096) as *mut u32,
+                    0xB00B_0000 | (page as u32 & 0xFFFF),
+                );
+            }
+        }
         Some(backing)
     } else {
         None
@@ -727,6 +746,23 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
         let deallocated = h_allocation == 0 || deallocate_standalone(outer, h_allocation);
         finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
         return Err(if hr != 0 { hr } else { E_OUTOFMEMORY });
+    }
+
+    // Did OUR buffer survive the create, and is the VA we sent the one the KMD
+    // locked? `GbInVaLo` publishes the KMD's view of the same address, so the
+    // two together separate "the UMD sent the wrong VA" from "the MDL over the
+    // right VA does not describe these pages".
+    if let Some(record) = cpu_backing_record {
+        // SAFETY: the buffer is alive until `cpu_backing` is dropped, which is
+        // after every use below.
+        let head = unsafe { core::ptr::read_unaligned(record.va as *const u32) };
+        log_error!(
+            "DDI gb-witness: alloc=0x{:x} va=0x{:x} bytes={} head=0x{:08x}",
+            h_allocation,
+            record.va,
+            record.bytes,
+            head
+        );
     }
 
     // The create-output write-back, from the pointer dxgkrnl was given. Kept:

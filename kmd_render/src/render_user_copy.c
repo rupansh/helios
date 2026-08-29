@@ -102,6 +102,26 @@ helios_mm_probe_and_lock_pages_seh(PMDL Mdl)
     }
 }
 
+/* The same bounded conversion for a USER-mode range, and the access mode is
+ * the whole point. `helios_mm_probe_and_lock_pages_seh` passes KernelMode,
+ * which is right for the K2a backing store (a kernel VA dxgkrnl handed us) and
+ * WRONG for a creator-supplied user VA: KernelMode suppresses the check that
+ * the range is user address space in the CURRENT process, so a probe of a
+ * foreign VA succeeds over whatever this process happens to map there. That is
+ * silent, and it is exactly how a guest-page import ended up describing pages
+ * that were not the creator's buffer. UserMode makes Mm validate the range and
+ * raise otherwise, which the __except turns into a counted refusal. */
+int
+helios_mm_probe_and_lock_user_pages_seh(PMDL Mdl)
+{
+    __try {
+        MmProbeAndLockPages(Mdl, /*UserMode*/ 1, /*IoModifyAccess*/ 2);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
+}
+
 /* MmGetMdlPfnArray is a WDK macro.  Its x64 expansion is the first byte after
  * the fixed MDL header; the compile-time size check above pins that ABI. */
 unsigned long long *
