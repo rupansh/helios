@@ -4,6 +4,107 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ⭐⭐⭐⭐⭐ 2026-08-29 ROOT CAUSE FOUND — the application's map pointer is PROCESS HEAP
+
+⛔ **This supersedes every theory below it, including "F16 / Lock2 is a copy",
+"premature completion" and "the host never executes".** All three were looking
+for a subtle divergence between two views of one buffer. There is no divergence
+to find: **there are two different buffers and nothing ever connected them.**
+
+### The defect, in three lines
+
+* Every CPU-mappable D3D11 resource gets a WDDM allocation from the **UMD**,
+  which hands it `pSystemMem = CpuBacking::new(bytes)` — a plain
+  `alloc_zeroed` process-heap buffer (`umd_common/src/cpu_backing.rs`) — and
+  publishes that same pointer as `HeliosResourceAssociationV1::cpu_mapping`
+  (`umd/src/forward/resource.rs:920-937`, `:595-610`).
+* The ICD, in record-only mode, returns that pointer **verbatim** as the
+  application's Vulkan mapping: `vn_MapMemory2` →
+  `*ppData = mem->helios_outer.cpu_mapping + offset`
+  (`icd/mesa/src/virtio/vulkan/vn_device_memory.c:1619-1631`).
+* The KMD backs the same allocation with a **host-side** venus
+  `VkDeviceMemory` (`allocate_memory_blob`, the `Hwa2Backing::LinearMemory`
+  arm, `create_allocation.rs:3200-3240`) and deliberately asks for **no** OS
+  shared backing: `HWA2_SHARE_BACKING_STORE_WITH_KMD = false`, asserted at
+  compile time (`create_allocation.rs:3341-3348`).
+
+⇒ The GPU reads and writes host memory. The application reads and writes its
+own heap. Neither is a view of the other, so **every GPU-routed read-back is an
+untouched page and every CPU upload is invisible to the host.**
+
+### Measured, three independent ways
+
+| instrument | reading |
+|---|---|
+| `tools/d3d11_hostram_alias_probe.cpp` — `VirtualQuery` on the pointer `Map()` returned for a 4 MiB staging texture | `type=0x20000` **MEM_PRIVATE**, `state=MEM_COMMIT`, region 4,198,400 B. Ordinary committed process heap — not a section, not a WDDM view |
+| QEMU `virtio_gpu_virgl_guest_blob_backing` over a whole probe run | **2** guest-backed blobs, both accounted for (the `HVR1` reply pool — its ASCII magic is readable at its first GPA — and one shmem). **None is the texture.** The 3 remaining 4 MiB blobs are `host3d_blob_charge`, i.e. host memory |
+| the probe itself | stamps all 1,048,576 dwords with a self-naming pattern, GPU-clears an RT and `CopyResource`s onto it: `P3 AFTER_COPY stamped=1048576 cleared=0 zero=0 other=0` — the copy touches nothing |
+
+The stamp pattern is `0xC0DE<low 16 bits of its own dword index>`, so a dword
+read from guest RAM names its own offset. QMP `xp/4xw <gpa>` on every guest
+blob created during the run, sampled every 4 s for 100 s, never showed one.
+
+⭐ **The observer that settled it is outside the whole stack**: QEMU's own view
+of guest physical memory, via QMP `human-monitor-command` `xp`, with the GPAs
+taken from the already-enabled `virtio_gpu_virgl_guest_blob_backing` trace. It
+is neither a query, nor mapped memory, nor a WARP control, so none of the three
+lying instruments applies to it. No relaunch and no owner gate: read-only QMP on
+the running VM.
+
+### Why every earlier reading was consistent with this
+
+* CPU-only round trips pass (`1 CPU match=4096/4096`) — they never leave the
+  heap buffer.
+* The poison survives every GPU route, and a +1 s re-read does not help — the
+  GPU was never going to touch that page, at any time.
+* The host GPU really does rasterise at 42–59% SM — it renders correctly, into
+  its own memory.
+* The KMD backing-store sampler found no poison in what it scanned. That verdict
+  was **right**; only its identity accounting was sloppy.
+* `helios_paintcap` is black because DWM's composed frames are produced into
+  host memory and read back through a heap buffer.
+
+### Why it is a regression, and against the code's own contract
+
+`protocol/src/resource_association.rs:22` documents `cpu_mapping` as *"CPU view
+of the exact outer allocation backing"*. `CpuBacking` is not a view of anything.
+The hardware-accelerated desktop milestone (2026-08-05, Fire Strike GT1 ≈ 221)
+predates the HPS2 retirement's HWA2/HVM1 memory model; the split arrived with it.
+
+### The fix, and why the precedent is already in-tree and measured
+
+`FINDINGS.md` **F18** already built and measured the mechanism this needs —
+Microsoft's *Sharing the backing store with KMD* contract, 52/52 on
+`tools/k2a_shared_backing_probe.c`, with a bidirectional sentinel run proving
+*"the exact guest pages back both Lock2 and the renderer blob"*. HVM1 role 1
+uses it today. **HWA2 does not.** Extending it is three coordinated edits:
+
+1. **KMD** — for a CPU-visible `Hwa2Backing::LinearMemory` allocation, stop
+   calling `allocate_memory_blob`; set `share_backing_store = true` and create
+   the `VIRTIO_GPU_BLOB_MEM_GUEST` resource in
+   `DxgkDdiSetAllocationBackingStore`, exactly as the HVM1 role-1 arm does.
+2. **UMD** — stop allocating `CpuBacking`, pass `pSystemMem = NULL`, and take
+   `cpu_mapping` from `pfnLockCb`. ⚠ This is a **precondition**, not a
+   companion: MS's contract requires the allocation *not* use supplied existing
+   system memory, which is why the historical accidental
+   `HWA2_SHARE_BACKING_STORE_WITH_KMD = true` failed every first D3D11 buffer
+   with `E_INVALIDARG` (the comment at `create_allocation.rs:3341` records that
+   failure and mis-attributes it to the DDI's scope).
+3. **Host** — nothing. The ICD's deferred `vkAllocateMemory` already carries
+   `VkImportMemoryResourceInfoMESA(resourceId = 0)` and the KMD already patches
+   the outer allocation's resource id into it
+   (`vn_device_memory.c:565-580`, `native_render.rs:2290`). Stock virglrenderer
+   1.3.0 turns that into `VkImportMemoryFdInfoKHR` over the udmabuf
+   (`vkr_device_memory.c:13-47`). Point it at a guest blob instead of a host one
+   and the same code binds the host's `VkDeviceMemory` to the guest pages.
+
+⚠ Bound to carry forward: udmabuf's stock `list_limit = 1024` caps one imported
+allocation at ~4 MiB of scattered guest pages (F18 measured 143–853 ranges for
+4 MiB, worst case exactly 1024). A larger CPU-visible resource must fail loudly,
+not silently fall back.
+
+---
+
 ## ✅ CLOSED 2026-08-28 — session FREEZE: a redundant `pfnEvictCb` poisoned the device
 
 **Fixed in `93d3601` (UMD only; KMD 22.22.380.0 unchanged).**
