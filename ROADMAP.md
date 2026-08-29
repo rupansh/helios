@@ -242,6 +242,29 @@ lines crowded the 12 single-occurrence `create_blob` lines off the list. Count
 the event you care about explicitly; never read a null out of a truncated
 histogram.
 
+#### ⛔ 2026-08-29, LATER THE SAME DAY: the section below over-claims
+
+`Nr2BsVa` (KMD 22.22.391.0) records the VA the sampler actually read. It is
+**0xB8000000 on every scan**, for allocations that are supposed to be distinct
+4 MiB pools. A per-allocation `MmMapLockedPagesSpecifyCache` returns a different
+system VA each time, so the sampler reads **one buffer, N times**. `Nr2BsCd=0`
+across 24 scans is therefore `Cd=0` for a single buffer, not for 24 independent
+backing stores.
+
+⇒ **"F16 confirmed" is withdrawn; the question is unresolved again.** What
+survives is guest-side and independent of the sampler: the poison survives every
+GPU route, and the blob/PFN/udmabuf/import chain is wired. Settle first whether
+`args.pBackingStore` is genuinely per-allocation or a fixed aperture window the
+KMD re-maps — until then this sampler must not be quoted.
+
+⭐ Falsified along the way, so nobody repeats them:
+* **ICD supplies `pSystemMem`** (the UMD's `CpuBacking` pattern). dxgkrnl ignores
+  it and reports its own pristine backing store; `ShBkOk` keeps firing, so the
+  OS-owned model is not optional here. Reverted.
+* **Clear `AccessedPhysically` for the host-visible role** — the flag that makes
+  VidMm withhold the real backing on Lock, and the one difference from HOC1,
+  whose Lock2 view the design trusts. No measurable change. Reverted.
+
 #### ⭐⭐ 2026-08-29 ROOT CAUSE: the Lock2 view is not the memory the host gets
 
 ⛔ **An earlier revision of this section claimed the opposite and it was wrong.**
