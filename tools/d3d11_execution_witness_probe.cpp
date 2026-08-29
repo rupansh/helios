@@ -124,6 +124,20 @@ static uint64_t run_once(IDXGIAdapter *adapter, D3D_DRIVER_TYPE type, const char
   ctx->Draw(3, 0);
   if (stats) ctx->End(stats);
   ctx->End(occl);
+
+  /* Instrument validation, and the whole result hinges on it. A REAL GPU query
+   * cannot be resolved before the work is even flushed, so the first GetData
+   * must report S_FALSE. If it returns S_OK here, DXVK has no DxvkQuery
+   * attached and its "0 samples" is a zero-initialised struct rather than a
+   * measurement -- in which case this probe proves nothing about execution. */
+  uint64_t probeEarly = 0;
+  const HRESULT early = ctx->GetData(occl, &probeEarly, sizeof(probeEarly), 0);
+  printf("  PREFLUSH GetData hr=%s  %s\n",
+         early == S_OK ? "S_OK" : early == S_FALSE ? "S_FALSE" : "other",
+         early == S_FALSE
+           ? "query is REAL (pending before flush)"
+           : "⚠ resolved with no work flushed -- the query is NOT a measurement");
+
   ctx->Flush();
 
   uint64_t samples = 0;
