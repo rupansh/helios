@@ -63,19 +63,43 @@ impl ResourceDimension {
     }
 }
 
-/// The application's CPU view of an allocation, from `pfnLockCb`.
+/// The application's CPU view of an allocation.
 ///
 /// ⛔ NOT a heap buffer. `CpuBacking` used to fill this role, and because it is
 /// ordinary process memory the pointer handed to the application was a view of
 /// NOTHING: the GPU worked on the allocation's venus blob while the application
 /// read and wrote its own heap, which is why every GPU-routed read-back came
-/// back untouched and the desktop was black. Lock2/pfnLockCb resolves through
-/// the segment's CPU host aperture, so this pointer addresses the blob bytes.
+/// back untouched and the desktop was black.
+///
+/// Which callback publishes it is `UmdLockMode`; see
+/// [`crate::knobs::UMD_LOCK_MODE`] for what each arm is and for the ETW
+/// measurement that says mode 0 hands back a system-memory copy.
 unsafe fn lock_cpu_view(
     kt_callbacks: *const ddi::D3DDDI_DEVICECALLBACKS,
     h_rt_device: ddi::HANDLE,
     h_allocation: u32,
 ) -> Result<*mut core::ffi::c_void, i32> {
+    let mode = crate::knobs::umd_lock_mode();
+    if mode == 2 {
+        let Some(lock2_cb) = (*kt_callbacks).pfnLock2Cb else {
+            log_error!("DDI lock_cpu_view: UmdLockMode=2 but pfnLock2Cb absent");
+            return Err(E_OUTOFMEMORY);
+        };
+        let mut lock = ddi::D3DDDICB_LOCK2::default();
+        lock.hAllocation = h_allocation;
+        let hr = lock2_cb(h_rt_device, &mut lock);
+        if hr != 0 || lock.pData.is_null() {
+            log_error!(
+                "DDI lock_cpu_view REFUSED (Lock2): hr=0x{:08x} alloc=0x{:x} pData={:p}",
+                hr as u32,
+                h_allocation,
+                lock.pData
+            );
+            return Err(if hr != 0 { hr } else { E_OUTOFMEMORY });
+        }
+        return Ok(lock.pData);
+    }
+
     let Some(lock_cb) = (*kt_callbacks).pfnLockCb else {
         log_error!("DDI lock_cpu_view: pfnLockCb absent");
         return Err(E_OUTOFMEMORY);
@@ -87,10 +111,18 @@ unsafe fn lock_cpu_view(
     // maps at one offset, whole-blob.
     lock.NumPages = 0;
     lock.pPages = core::ptr::null();
+    if mode == 1 {
+        // Ask VidMm to serve the lock where the allocation already is instead
+        // of moving it to an aperture segment. A refusal here is the ANSWER,
+        // not a regression: it says the local segment cannot serve a CPU lock
+        // in place, which mode 0 hides behind a silent copy.
+        lock.Flags.__bindgen_anon_1.__bindgen_anon_1.set_DonotEvict(1);
+    }
     let hr = lock_cb(h_rt_device, &mut lock);
     if hr != 0 || lock.pData.is_null() {
         log_error!(
-            "DDI lock_cpu_view REFUSED: hr=0x{:08x} alloc=0x{:x} pData={:p}",
+            "DDI lock_cpu_view REFUSED: mode={} hr=0x{:08x} alloc=0x{:x} pData={:p}",
+            mode,
             hr as u32,
             h_allocation,
             lock.pData

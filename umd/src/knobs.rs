@@ -23,6 +23,7 @@
 //! | `UmdCommandLists` | DWORD | `true` (explicit 0 reverts to emulated lists) |
 //! | `UmdDeferredDiagnostics` | DWORD | `false` (diagnostic atomics, opt-in) |
 //! | `UmdEvictOnDeallocate` | DWORD | `false` (pair the evict with the deallocate) |
+//! | `UmdLockMode` | DWORD | `0` (`pfnLockCb`, the measured configuration) |
 //!
 //! The surviving policies are `BoolKnob` ("absent = off, non-zero = on") and
 //! `DwordKnob` ("absent = this default, else the stored value").
@@ -232,4 +233,26 @@ pub(crate) static UMD_EVICT_ON_DEALLOCATE: BoolKnob = BoolKnob::new(c"UmdEvictOn
 /// [`UMD_EVICT_ON_DEALLOCATE`].
 pub(crate) fn umd_evict_on_deallocate() -> bool {
     UMD_EVICT_ON_DEALLOCATE.get()
+}
+
+/// Which callback publishes a CPU-visible allocation's application mapping.
+///
+/// DxgKrnl ETW, 2026-08-30, KMD 22.22.398.0: `pfnLockCb` (mode 0) makes VidMm
+/// EVICT the allocation out of the local segment and re-reserve it under
+/// `VidMmPlacementRestrictionApertureSegment`, then serve the pointer from
+/// `LockAllocationBackingStore` — a system-memory copy, never the blob.
+/// `DxgkDdiMapCpuHostAperture` is not called on that path at all, with or
+/// without `CpuVisible` on the segment (both arms measured).
+///
+/// | value | arm |
+/// |---|---|
+/// | 0 | `pfnLockCb`, flags 0 — the measured default |
+/// | 1 | `pfnLockCb` + `DonotEvict` — "serve in place or fail" on the same path |
+/// | 2 | `pfnLock2Cb` — the no-paging lock, the one whose contract requires the
+///       allocation to already be resident and CPU-reachable where it is |
+pub(crate) static UMD_LOCK_MODE: DwordKnob = DwordKnob::new(c"UmdLockMode", 0);
+
+/// `HKLM\SOFTWARE\Helios!UmdLockMode` (REG_DWORD). See [`UMD_LOCK_MODE`].
+pub(crate) fn umd_lock_mode() -> u32 {
+    UMD_LOCK_MODE.get()
 }
