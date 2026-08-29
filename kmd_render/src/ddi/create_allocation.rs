@@ -377,6 +377,13 @@ pub static BS_SAMPLE_NONZERO: AtomicU32 = AtomicU32::new(0);
 /// The last such dword (`Nr2BsVal`). The probe writes 0xCDCDCDCD through the
 /// Lock2 view, so that value here means the two views ARE the same memory.
 pub static BS_SAMPLE_VALUE: AtomicU32 = AtomicU32::new(0);
+/// Low 32 bits of the mapped VA of the last allocation scanned (`Nr2BsVa`).
+///
+/// Validity check, not a finding: 26 independently allocated 4 MiB backing
+/// stores all reporting the same first value is either a deterministic writer
+/// or one shared page read 26 times, and the second would invalidate every
+/// conclusion drawn from `Nr2BsCd`.
+pub static BS_SAMPLE_VA: AtomicU32 = AtomicU32::new(0);
 /// Size in KiB of the last allocation scanned (`Nr2BsSz`). A 4096 here is a
 /// DXVK staging pool at the CPU-visible cap; anything small is a venus shmem,
 /// and the two answer different questions.
@@ -1453,6 +1460,7 @@ pub(crate) fn sample_hvm1_backing(ctx: &AllocationContext) {
         }
         BS_SAMPLE_SCANS.fetch_add(1, Ordering::Relaxed);
         BS_SAMPLE_SIZE_KIB.store((ctx.size as u64 / 1024) as u32, Ordering::Relaxed);
+        BS_SAMPLE_VA.store(va as u32, Ordering::Relaxed);
         // Stride across the WHOLE allocation rather than reading only its first
         // page: DXVK suballocates, so any one offset may simply be unused.
         let total_words = (ctx.size as usize) / 4;

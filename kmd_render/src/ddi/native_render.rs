@@ -350,7 +350,7 @@ const COUNTER_NAMES: [&[u8]; 43] = [
 /// The boundary counters that did not fit [`COUNTER_NAMES`]'s block, mirrored
 /// alongside it. Split only because a `CounterBlock` writes one registry value
 /// per entry and 27 is already the largest block in this driver.
-const BOUNDARY_NAMES: [&[u8]; 14] = [
+const BOUNDARY_NAMES: [&[u8]; 15] = [
     b"Nr2NoStage",
     b"Nr2NoEpoch",
     b"Nr2NoSchWho",
@@ -364,6 +364,7 @@ const BOUNDARY_NAMES: [&[u8]; 14] = [
     b"Nr2BsSeen",
     b"Nr2BsCd",
     b"Nr2BsSz",
+    b"Nr2BsVa",
     // Not a K6 counter by subject, but K6 is what made the hazard reachable:
     // `DxgkDdiPatch`/`DxgkDdiSubmitCommand` deliver the context through a
     // `hDevice`/`hContext` union. It is mirrored here because this block already
@@ -471,7 +472,8 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(BOUNDARY_NAMES[10], &crate::ddi::create_allocation::BS_SAMPLE_SEEN),
         e(BOUNDARY_NAMES[11], &crate::ddi::create_allocation::BS_SAMPLE_POISON),
         e(BOUNDARY_NAMES[12], &crate::ddi::create_allocation::BS_SAMPLE_SIZE_KIB),
-        f(BOUNDARY_NAMES[13], &crate::device::CONTEXT_HANDLE_REFUSED),
+        e(BOUNDARY_NAMES[13], &crate::ddi::create_allocation::BS_SAMPLE_VA),
+        f(BOUNDARY_NAMES[14], &crate::device::CONTEXT_HANDLE_REFUSED),
     ],
     ticks: &NR2_FLUSH_TICKS,
     failures: &NR2_FLUSH_FAILURES,
