@@ -188,30 +188,103 @@ this names which layer loses them"*). The guest's own diag prints
 `HD1 bdaEXT present=1 enable=1 capture=1` and the wire encoder handles both
 feature structs, so the loss is at or past `vn_call_vkCreateDevice`.
 
-#### Where it stands after `f7ef162`
+#### Where it stands after `f7ef162` — and the 2026-08-29 correction
 
-The batches now reach the host in volume — one probe run moves
-`Nr2OuterQ +8`, `Nr2OuterHost +9`, `Nr2Sub +445`, `Nr2Commit +437`, all
-balanced — the host creates the objects, the device tears down clean, and the
-readback is still exactly zero. So the commands arrive and produce nothing the
-CPU can see.
+⛔ **The "everything reads back zero" framing was wrong, and it was wrong in a
+way that pointed the whole investigation at the wrong layer.**
+`tools/d3d11_poison_copy_probe.cpp` fills the DESTINATION staging texture with
+`0xCDCDCDCD` through `Map(WRITE)`, confirms the poison reads back, and only then
+runs the copy. The old probes never wrote the destination, so "reads zero" could
+not distinguish "the GPU wrote zeros" from "these pages were never touched".
+
+```
+A CONTROL  poison=4096/4096   POISON INTACT   (poison round-trips: YES)
+B S2S      poison=4096/4096   POISON INTACT   staging -> staging
+C S2D2S    poison=4096/4096   POISON INTACT   staging -> DEFAULT -> staging
+D CLEAR    poison=4096/4096   POISON INTACT   ClearRenderTargetView -> staging
+D TIMESTAMP  freq=0 t0=0 t1=0 delta=0
+```
+
+⇒ **Nothing writes the CPU's view at all.** Not zeros — nothing. Every earlier
+"exactly zero" reading was an untouched fresh page. So no hypothesis about *what
+value* the GPU produced can be right; the question is why the GPU's writes and
+the CPU's map are not the same memory.
+
+`freq=0` is a second, independent finding: DXVK computes it as
+`1e9f / limits.timestampPeriod` (`d3d11_query.cpp:346`), so the venus device is
+reporting **`timestampPeriod == 0`**, and D3D11 timestamp queries cannot work.
+
+#### What is proven to work, so it can stop being re-measured
+
+Measured 2026-08-29 with six `virtio-gpu` trace events enabled live over QMP
+(`/tmp/helios-tpm/mon.sock`, `trace-event-set-state`; no relaunch needed) and
+read back from `/tmp/helios-qemu-stderr.log`:
+
+| evidence | reading |
+|---|---|
+| `virtio_gpu_cmd_ctx_submit` | **1360** in one probe window — the command stream reaches the host in volume |
+| `virtio_gpu_cmd_res_create_blob` | 12 per run: 2×4 MiB guest-backed, 2×4 MiB HOST3D, 2×16 KiB HOST3D |
+| `virtio_gpu_virgl_guest_blob_backing` | **fires** for the host-visible 4 MiB pools, `ranges 886` / `ranges 379` — real guest PFN scatter lists cross to the host |
+| KMD `ShBkFeat` | `1` — the K2a shared-backing feature is admitted this boot |
+| KMD `ShBkOk` | moved **286 → 292** across a probe run — `DxgkDdiSetAllocationBackingStore` runs and succeeds for host-visible HVM1 allocations |
+| UMD log | zero `DDI refusals:` of any kind; clean teardown |
+
+So: guest pages are described to the host, blobs exist, commands arrive, objects
+are created. The break is in the **last link only** — whether the host's
+`VkDeviceMemory` for a guest-backed pool is actually bound to those guest pages.
+`create_allocation.rs:3766` states the intent: *"Roles 1-3 receive their one
+OS-owned K2a backing later through SetAllocationBackingStore"*, imported host-side
+as one udmabuf scatter list capped at 1024 pages / 4 MiB.
+
+⚠ Do not repeat this mistake: a first pass read `sort | uniq -c | sort -rn |
+head -20` and concluded **no blob was ever created**, because 1360 `ctx_submit`
+lines crowded the 12 single-occurrence `create_blob` lines off the list. Count
+the event you care about explicitly; never read a null out of a truncated
+histogram.
 
 ⭐ Two threads, in order:
 
-1. **`bufferDeviceAddress` is not enabled on the host device.** The host says
-   so 79 + 31 times a boot. `dxvk_device_info.cpp:502` deliberately picks the
-   **EXT** arm for the record-only path and turns the core Vulkan 1.2 feature
-   OFF (`m_recordOnlyDirect` is unconditionally true for our D3D11 bridge,
-   `umd/bridge/dxvk_bridge.cpp:981`), because the unbound-buffer arm of
-   `vkGetBufferDeviceAddress` is EXT-only. The guest chains the EXT struct and
-   its diag confirms it (`HD1 bdaEXT present=1 enable=1`), the venus encoder
-   handles both structs — **so the loss is at or past `vn_call_vkCreateDevice`,
-   most likely vkr filtering the device extension list.** Next step: log the
-   renderer-side extension set the ICD believes it has, then check whether
-   `VK_EXT_buffer_device_address` survives to the host `vkCreateDevice`.
-2. **`vkCreateBuffer` CONCURRENT with `pQueueFamilyIndices[0] = 1000146003`**
-   (= `VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2`), 77 a boot, from
-   `vn_feedback.c`'s feedback buffer — the fence/timeline-completion channel.
+1. **The host-visible aliasing itself — the top defect.** The guest CPU pointer
+   for every venus host-visible allocation comes from `D3DKMTLock2`
+   (`vn_renderer_helios_hvm.c:401`, handed back verbatim by `helios_bo_map`).
+   `docs/retirement/FINDINGS.md` **F16** measured that pointer, nine
+   configurations deep on KMD 22.22.276.0, as *"a copy protocol: VidMm moves
+   HLM1 content by paging transfer and hands the CPU the system backing"* —
+   which is exactly a poison that survives every GPU write. The next step is to
+   determine, on the CURRENT KMD, whether the host really imports the guest
+   scatter list for res `0x122`/`0x124` or silently allocates its own memory;
+   the guest-side counters cannot see that, so it needs host-side evidence.
+   ⛔ The live KMD registers **no `DxgkDdiEscape`** and has no
+   `cpu_host_aperture.rs`, so F16's suggested `HELIOS_ESCAPE_MAP_BLOB` route
+   does not currently exist — that half of F16 is stale.
+2. **`bufferDeviceAddress` is not enabled on the host device.** Unchanged and
+   still unexplained: it fires on **every** host `vkAllocateMemory` (3 per probe
+   run) and on `vkCreateComputePipelines`. `dxvk_device_info.cpp:502` picks the
+   EXT arm and forces the core Vulkan 1.2 feature off; the host reports that
+   *neither* arm is enabled, so the loss is at or below `vn_call_vkCreateDevice`.
+
+#### ✅ Closed 2026-08-29: the corrupt CONCURRENT queue-family index
+
+`pQueueFamilyIndices[0] = 1000146003` (**150 a boot**) was **not** `vn_feedback.c`
+and not wire corruption. It is a dangling pointer in
+`DxvkDevice::queryBufferMemoryRequirements` (`dxvk_device.cpp:129`):
+`getSharingMode()` returns `DxvkSharingModeInfo` **by value**, `fill()` stores
+`queueFamilies.data()` into `info.pQueueFamilyIndices`, and the temporary dies at
+the semicolon — after which the compiler reuses that stack slot for the
+`VkMemoryRequirements2 requirements` declared three lines down, whose `sType` is
+`VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2` = **1000146003**. The value named its
+own cause.
+
+It matters because that query is the **outer-allocation sizing path** for every
+D3D11 buffer (`d3d11_device.cpp:353`, which returns `E_FAIL` when the query
+yields size 0), and venus turns it into a real host `vkCreateBuffer`.
+
+Fixed by naming the temporary. Verified with
+`tools/d3d11_buffer_reqs_probe.cpp` (24 buffers across every usage class, the
+only path that calls it — which is why the texture-only probes never triggered
+it): **0 complaints** against 150 in the boot before, from a fresh
+`virgl_render_server` pid, so this is a real zero and not VVL's
+duplicate-message limit.
 
 ⚠ Only 3 of the probe's 7 textures get WDDM allocations; stages 2 and 3 use
 DXVK-internal memory end to end and STILL read zero, so this is not an
