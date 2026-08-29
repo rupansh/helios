@@ -390,7 +390,7 @@ pub static BS_SAMPLE_POISON: AtomicU32 = AtomicU32::new(0);
 /// What tools/d3d11_poison_copy_probe.cpp fills its staging textures with.
 const BS_PROBE_POISON: u32 = 0xCDCD_CDCD;
 /// System PTEs are a global lease; a per-allocation map is otherwise unbounded.
-const BS_SAMPLE_MAX: u32 = 8;
+const BS_SAMPLE_MAX: u32 = 64;
 /// Cap the all-zero case: this runs per use per submit.
 const BS_SAMPLE_MAX_SCANS: u32 = 20_000;
 /// HOC1 create-input records refused (`AcHoc1Rej`). §17.6:4419-4420 — "every
@@ -2738,6 +2738,7 @@ unsafe fn destroy_allocation_ctx(
     ctx: Box<AllocationContext>,
     seq: u32,
 ) {
+    sample_hvm1_backing(&ctx);
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
     // Retire the exact Windows/KMD allocation identity before any backing
     // resource or Venus image can be torn down. Ambiguous plane retirement
@@ -4823,10 +4824,6 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
         let seq = DESTROY_ALLOC_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         step(b"DaStep", seq, 1);
         if let Some(ctx) = unsafe { take_alloc_ctx(handle) } {
-            // The render `uses` list never carries these pools, so teardown is
-            // where the sampler is guaranteed to meet one — and by then the
-            // process has written everything it is going to.
-            sample_hvm1_backing(&ctx);
             unsafe { destroy_allocation_ctx(passive, adapter, ctx, seq) };
         }
         step(b"DaStep", seq, 9);
