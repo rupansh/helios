@@ -242,6 +242,46 @@ lines crowded the 12 single-occurrence `create_blob` lines off the list. Count
 the event you care about explicitly; never read a null out of a truncated
 histogram.
 
+#### ⭐ 2026-08-29, measured: the guest CPU view IS the host's memory
+
+The hypothesis that `D3DKMTLock2` hands the ICD a private copy — F16's "Lock2
+is a copy protocol", which every other line of evidence was converging on — is
+**refuted by direct measurement** on KMD 22.22.387.0.
+
+`DxgkDdiSetAllocationBackingStore` now maps role-1 HVM1 backing stores into a
+kernel VA (bounded at 64) and `sample_hvm1_backing` scans one at teardown:
+
+```
+10 probe runs -> Nr2BsMap=22 Nr2BsSeen=11 Nr2BsScan=11 Nr2BsNz=11 Nr2BsCd=0
+                 Nr2BsVal=0x0000005A
+```
+
+**All 11 scanned backing stores contained guest-written venus wire data.**
+Venus writes those bytes through `mmap_ptr`, which is the `D3DKMTLock2`
+pointer, and the KMD reads them through the OS-owned backing store. The two
+views are the same memory.
+
+⇒ Combined with the trace evidence, the whole guest half is now accounted for:
+the CPU writes real pages, those pages' PFNs cross to the host
+(`guest_blob_backing`, `ranges 886`/`379`), the import operand is patched with
+their resource id (`Nr2ImpN` +3 per run, matching the 3 host `vkAllocateMemory`
+calls), and the host allocation succeeds (the ICD validates `reply_status` and
+the returned handle). **Everything the guest can be blamed for works.**
+
+⚠ Bound: all 11 samples share a first value, so they are venus shmems — DXVK's
+staging pools are not destroyed within a boot, so `Nr2BsCd=0` is not yet
+evidence about the staging pool specifically. It is evidence about the aliasing
+mechanism, which is what was in question.
+
+⇒ The defect is host-side, and the two threads below have converged on one
+place: **vkr's `vkAllocateMemory`**. It is the call that must honour
+`VkImportMemoryResourceInfoMESA` and bind the guest scatter list, and it is the
+call the host complains about on every single invocation. Either the import is
+not binding (vkr allocates its own memory and the GPU writes that), or the work
+never executes. Next step is host-side: virglrenderer 1.3.0 is the distro
+package with no source in-tree, so read `vkr_dispatch_vkAllocateMemory` and
+check whether the resource lookup and dmabuf import actually run.
+
 ⭐ Two threads, in order:
 
 1. **The host-visible aliasing itself — the top defect.** The guest CPU pointer
