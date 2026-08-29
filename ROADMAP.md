@@ -372,12 +372,59 @@ the only channel. Sending a nonzero `cpu_backing_va` makes the UMD's own input
 fail the output validator it had been passing only because of that same
 discard.
 
-⇒ **Next**: stop validating create-output on a record that never comes back.
-Either exempt the standalone (`hResource == NULL`) path from
-`validate_create_output` — it has no opener to stamp it — or carry the create
-result through the open, which F11 already names as the only channel that
-works. Then re-run the probe: `P3 AFTER_COPY cleared=1048576` is the win
-condition, and both knob defaults flip together on it.
+### ✅ 2026-08-30 — F11 CLOSED. It was not the record that never comes back; it was the record that never should have carried the field
+
+The write-back does work on this path — the earlier reading was right that the
+UMD saw generation 0, and wrong about why. `UmdGuestBacking=2`, a throwaway arm
+that wrote a FAKE page-aligned `0x1000` into `cpu_backing_va` and changed
+NOTHING else, reproduced the failure exactly:
+
+| arm | `sent_gen` | `local_gen` | `ptr_gen` | `sent_va` |
+|---|---|---|---|---|
+| off | 0 | 4294967306 | 4294967306 | 0 |
+| **fake VA only** | 0 | **0** | **0** | 0x1000 |
+| full | 0 | 0 | 0 | 0x226aa93d000 |
+
+⇒ **a nonzero TAIL BYTE in the create-input descriptor is what makes dxgkrnl
+drop the KMD's create-output copy-back.** Not the buffer, not the mapping, not
+the import. (`local` vs `ptr` also excludes a stale local: the UMD read back
+through the pointer dxgkrnl was given and got the same bytes.)
+
+**Fix** (`83088e0`): input-only data does not belong in an echoed record. The
+offer moved to `HeliosCpuBackingV1`, a 24-byte record in the RESOURCE-level
+private data (`DXGKARG_CREATEALLOCATION::pPrivateDriverData`), which nothing
+echoes. `HeliosWddmAllocationDescV2` is back to its historical 168 bytes, so the
+C mirror and `abi_parity.py` revert with it. Also fixed: the UMD had pointed
+BOTH the resource- and allocation-level `pPrivateDriverData` at one buffer, so
+dxgkrnl had two copy-backs into the same place.
+
+Measured on 22.22.412.0, both knobs on: the probe runs to completion, no
+`FAIL staging`, and the UMD logs `alloc_gen=0x100000006`.
+
+### ⛔ WHERE IT STANDS NOW — the probe is not green, and the frontier moved
+
+`P3 AFTER_COPY stamped=1048576 cleared=0` still, but the failure is different
+and narrower: `HNR2 context REFUSED at render status=0xc000000d`, then
+`context_lost`. The session's refused payload decodes to venus command **0x55 =
+`vkCreateCommandPool`** — an ordinary object create, i.e. the
+POISONED-SESSION symptom, not the cause. Something earlier in the stream is
+refused and everything after it dies.
+
+⛔ **It is NOT the memory type**, which was the obvious next suspect and is now
+measured out (`fc47c02`). Importing into the HOST_VISIBLE|HOST_COHERENT type —
+the one the ICD asks for and binds against — makes the IMPORT fail outright
+(`GbImp` 0 -> 1, `GbOk` 1 -> 0). Only the flagless type accepts a dmabuf, on
+the venus device exactly as `tools/udmabuf_import_probe.c` measured on the host
+GPU. The guest never needed a host-visible type: the GUEST holds the CPU view,
+the host does not map these pages.
+
+⇒ **Next**: find the FIRST refused command in the session stream, not the one
+that reports. The KMD's `Nr2*` block already splits refusal predicates
+(`Nr2StaleWhy`/`Nr2StaleSub`/`Nr2OaeWhy`); none of them moved, so the refusal is
+being taken somewhere that does not yet name itself — give the
+`D3DKMTRender` 0xc000000d path a per-predicate counter the way the aperture
+census was split, then read it. The win condition is unchanged:
+`P3 AFTER_COPY cleared=1048576`, and both knob defaults flip together on it.
 
 ---
 
