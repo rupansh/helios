@@ -242,6 +242,112 @@ lines crowded the 12 single-occurrence `create_blob` lines off the list. Count
 the event you care about explicitly; never read a null out of a truncated
 histogram.
 
+### ⭐⭐⭐ 2026-08-29 END-OF-DAY: ranked theories for the next session
+
+⛔ **Read this block before anything else in this file.** Several conclusions
+above it were withdrawn the same day. What follows separates what is *measured*
+from what is *inferred*, and ranks the theories by confidence.
+
+#### PROVEN — measured, with the instrument itself validated
+
+1. The desktop is **black** (`helios_paintcap`, 2026-08-29).
+2. **The guest emits a textbook-correct venus stream.** Opcode dump of the
+   recorded bytes (`HRA2`): `begin=1 end=1 draw=1 bindpipe=1 beginq=1
+   render=1/1 vpcount=1 sccount=1 rasterdiscard=0` — Begin, BeginRendering,
+   BindPipeline, SetViewportWithCount, SetScissorWithCount, BeginQuery, Draw,
+   EndQuery, EndRendering, End.
+3. It is flattened in the **correct order** (deferred → object cmds → command
+   streams → queue submit) and emitted whole: `HRA1 streams=3
+   command_bytes=2176 payload=160` → `HNS1 submit#18 bytes=2288`.
+4. The KMD **accepts** it: `Nr2OuterQ` == `Nr2OuterHost` (+2/run),
+   `Nr2OuterRej=0`.
+5. **QEMU receives** it: `virtio_gpu_cmd_ctx_submit ctx 0x1b, size 2288`.
+6. The host is **silent**: no `vkr_log` decode error, no `vkQueueSubmit` or
+   command-buffer validation anywhere in a boot.
+7. The UMD forwards **correct D3D11 state**: `RSSetViewports num=1
+   first=(0,0 64x64)`, `DDI Draw: a=3 topo=4 vs=… ps=… rt0=64x64`.
+8. ICD refusal counters are **all zero** except the deliberate WSI withhold
+   list; DXVK's own log is clean.
+9. `bufferDeviceAddress` was enabled on **neither** arm — 1672 host complaints a
+   boot. **Fixed** (promoted Vulkan 1.2 arm + captureReplay retained), complaints
+   → 0. The display did not change.
+
+⇒ **Everything from the D3D11 DDI down to QEMU is correct.** Two weeks of
+guest-side hypotheses are closed out by (2)–(8); do not re-open them.
+
+#### ⛔ Instruments known to LIE on this stack — do not build on them
+
+* **Any query-based measurement.** `PREFLUSH GetData` returns `S_OK` on Helios
+  and `S_FALSE` on WARP: the occlusion query **resolves before its work is
+  flushed**. `vn_GetQueryPoolResults`' record-only path
+  (`vn_query_pool.c:441-486`) gates on `vn_helios_query_pool_progress`, and that
+  progress is already satisfied at record time, so the guest reads the host's
+  query pool before the batch executes. Occlusion/pipeline-statistics zeros are
+  read-before-execute, **not** counts.
+* **The KMD backing-store sampler** (`Nr2Bs*`). `Nr2BsVa` is the same VA on every
+  scan: it reads one buffer N times.
+* **A WARP control validates the probe, not the driver** — WARP is Microsoft's
+  own rasterizer and DXVK is not in that path.
+
+#### THEORY 1 — premature completion signalling (confidence: HIGH)
+
+Record-only mode treats a batch as complete when the WDDM outer submit **joins**,
+not when the host has executed it. `DxvkSubmissionQueue::completeRecordOnly
+SubmissionsLocked` calls `joinHeliosOuterSubmit()` and then unconditionally
+`notifyObjects()` / `reset()` / `recycleCommandList()` on every entry — it never
+waits on a Vulkan fence. The query path proves the same premature signal
+independently, and it is the *only* theory that explains all of:
+
+* the query resolving before its work is flushed (**measured**);
+* `D3D11_QUERY_EVENT` signalling in **0 ms** every time;
+* a poisoned staging texture coming back untouched — the map happens before the
+  copy runs;
+* DWM compositing frames it believes are finished, i.e. a black desktop.
+
+**Test:** make `joinHeliosOuterSubmit` actually wait for host completion (or add
+a debug knob that does), then re-run `d3d11_poison_copy_probe`. If the poison is
+replaced by the pattern, this is the root cause.
+**Fix shape:** the record-only completion must be driven by a host-observed
+fence, not by the submit handoff. `helios_scope_track_fence_and_submit1_signals`
+and `vn_helios_query_pool_progress` are the two accounting sites.
+
+⚠ Weakness to check first: the poison also survives a **+1 s** re-read. If the
+work merely ran late, one second is ample. Either the completion signal is early
+*and* the memory is not shared (Theory 2), or the work never runs at all.
+Resolve this before committing to a fix.
+
+#### THEORY 2 — the guest's CPU map is not the host's memory (confidence: MEDIUM)
+
+`FINDINGS.md` F16, still **unresolved** — the sampler that was supposed to settle
+it was invalid. The ICD takes every host-visible CPU pointer from `D3DKMTLock2`
+(`vn_renderer_helios_hvm.c:401`, returned verbatim by `helios_bo_map`).
+Independently supported by the poison surviving a +1 s re-read.
+
+**Ruled out already:** supplying `pSystemMem` from the ICD (dxgkrnl ignores it
+and reports its own pristine backing store, while `ShBkOk` keeps firing), and
+clearing `AccessedPhysically` for the host-visible role (no change).
+**Test:** a KMD instrument that maps **per allocation** and records its VA to
+prove it (the last one did not). Write a signature through Lock2, read it in the
+KMD through the MDL, confirm distinct VAs per allocation.
+
+#### THEORY 3 — the host never executes command-buffer commands (confidence: LOW-MEDIUM)
+
+Weakened but not eliminated. `vkr_context_submit_cmd` dispatches every command
+and logs on failure; the log is silent; `vkr_dispatch_vkQueueSubmit` is a direct
+passthrough with no deferral. But nothing has *positively* witnessed a
+host-side draw, because the only witness available was the broken query channel.
+**Test:** it needs a witness that is neither a query nor mapped memory — the
+cleanest is a deliberate VUID violation planted in the recorded stream (e.g.
+`vkCmdBeginQuery` on an unreset pool). If validation reports it, the stream
+executes; if it never appears, it does not.
+
+#### Cheapest order to attack
+
+1. Settle **execute vs not** with a deliberate host-visible VUID (Theory 3's
+   test). It is one ICD edit and it makes Theories 1 and 2 decidable.
+2. If it executes → Theory 1, then Theory 2.
+3. If it does not → the frontier is vkr dispatch of the flattened stream.
+
 #### ⭐⭐⭐ 2026-08-29 FINAL: it is EXECUTION, not memory. Validated.
 
 `tools/d3d11_execution_witness_probe.cpp`. An occlusion query and
