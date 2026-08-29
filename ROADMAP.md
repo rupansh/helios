@@ -71,37 +71,80 @@ of the exact outer allocation backing"*. `CpuBacking` is not a view of anything.
 The hardware-accelerated desktop milestone (2026-08-05, Fire Strike GT1 ≈ 221)
 predates the HPS2 retirement's HWA2/HVM1 memory model; the split arrived with it.
 
-### The fix, and why the precedent is already in-tree and measured
+### ⛔ The obvious fix is CLOSED, measured: dxgkrnl requires the allocation to be SHARED
 
-`FINDINGS.md` **F18** already built and measured the mechanism this needs —
-Microsoft's *Sharing the backing store with KMD* contract, 52/52 on
-`tools/k2a_shared_backing_probe.c`, with a bidirectional sentinel run proving
-*"the exact guest pages back both Lock2 and the renderer blob"*. HVM1 role 1
-uses it today. **HWA2 does not.** Extending it is three coordinated edits:
+`FINDINGS.md` **F18** already built the mechanism this needs — Microsoft's
+*Sharing the backing store with KMD* contract, 52/52 on
+`tools/k2a_shared_backing_probe.c`, *"the exact guest pages back both Lock2 and
+the renderer blob"*. HVM1 role 1 uses it today. **Extending it to HWA2 is not
+possible.** The contract's four properties include *"The allocation must be
+created as shared"*, and `D3DDDICB_ALLOCATE` (WDK 10.0.26100) has **no field**
+through which a UMD could ask for it — dxgkrnl derives sharing from the runtime
+resource, and ordinary D3D11 staging and dynamic resources are not shared.
 
-1. **KMD** — for a CPU-visible `Hwa2Backing::LinearMemory` allocation, stop
-   calling `allocate_memory_blob`; set `share_backing_store = true` and create
-   the `VIRTIO_GPU_BLOB_MEM_GUEST` resource in
-   `DxgkDdiSetAllocationBackingStore`, exactly as the HVM1 role-1 arm does.
-2. **UMD** — stop allocating `CpuBacking`, pass `pSystemMem = NULL`, and take
-   `cpu_mapping` from `pfnLockCb`. ⚠ This is a **precondition**, not a
-   companion: MS's contract requires the allocation *not* use supplied existing
-   system memory, which is why the historical accidental
-   `HWA2_SHARE_BACKING_STORE_WITH_KMD = true` failed every first D3D11 buffer
-   with `E_INVALIDARG` (the comment at `create_allocation.rs:3341` records that
-   failure and mis-attributes it to the DDI's scope).
-3. **Host** — nothing. The ICD's deferred `vkAllocateMemory` already carries
-   `VkImportMemoryResourceInfoMESA(resourceId = 0)` and the KMD already patches
-   the outer allocation's resource id into it
-   (`vn_device_memory.c:565-580`, `native_render.rs:2290`). Stock virglrenderer
-   1.3.0 turns that into `VkImportMemoryFdInfoKHR` over the udmabuf
-   (`vkr_device_memory.c:13-47`). Point it at a guest blob instead of a host one
-   and the same code binds the host's `VkDeviceMemory` to the guest pages.
+`tools/k2a_unshared_backing_probe.c` asks dxgkrnl directly. The KMD cannot tell
+`CreateShared` from a plain `CreateResource` — both arrive as the single
+`Resource` bit — so the two roles differ only in the flag the KMD set:
 
-⚠ Bound to carry forward: udmabuf's stock `list_limit = 1024` caps one imported
-allocation at ~4 MiB of scattered guest pages (F18 measured 143–853 ranges for
-4 MiB, worst case exactly 1024). A larger CPU-visible resource must fail loudly,
-not silently fall back.
+| arm | role | shared | create |
+|---|---|---|---|
+| A | 1 — cpu-visible, `ShareBackingStoreWithKmd=1` | yes | **SUCCESS** |
+| B | 1 — cpu-visible, `ShareBackingStoreWithKmd=1` | **no** | **`0xC000000D`** |
+| C | 4 — not cpu-visible, no shared backing | yes | SUCCESS |
+| D | 4 — not cpu-visible, no shared backing | **no** | SUCCESS |
+
+**D is the control that splits the bucket**: identical create shape to B, and
+the KMD admits it. So the KMD's own shape check is not what refuses B. ⇒ This
+also re-attributes the historical `E_INVALIDARG` that the comment at
+`create_allocation.rs:3341` blames on the DDI's scope.
+
+⭐ Arm A's Lock2 pointer is **`MEM_MAPPED`** — a real section view of the
+allocation backing — against **`MEM_PRIVATE`** for what a D3D11 staging texture
+gets. The working path and the broken one are distinguishable in one
+`VirtualQuery`.
+
+### The two routes that remain
+
+**(I) ICD-owned storage** — the ICD allocates a role-1 HVM1 allocation itself
+(shared, guest-backed, `MEM_MAPPED` Lock2) and executes `vkAllocateMemory`
+through the session with the import operand, instead of deferring it into the
+outer stream. Both halves already run in record-only mode: they are what the
+D3D12-resource import path uses. **Written and shipped OFF** behind
+`HELIOS_HOST_VISIBLE_SHARED=1` (icd `846efc3793c`). What it needs next, measured
+on KMD 22.22.392.0:
+
+* a role-1 create refuses any size `D3DKMTCreateAllocation` will not take
+  page-aligned, and **DXVK asks for 64-byte host-visible allocations**;
+* `HVM1_CPU_VISIBLE_MAX_BYTES` caps one allocation at **4 MiB** — the KMD's
+  worst-case reading of the host's stock udmabuf `list_limit` of 1024 pages
+  (this host: `list_limit` 1024, `size_limit_mb` 64). Sweep: 1 and 4 MiB
+  succeed, 8 MiB and up return `STATUS_NOT_SUPPORTED`;
+* the surviving 4 MiB arm still fails its session allocate, and the probe
+  process then **wedges in the kernel**. `Nr2Stale` moved by one and named
+  nothing, which is why `f3d0fa9` split its eleven writers — `Nr2StaleWhy`,
+  `Nr2StaleSub`, `Nr2StaleSz`/`Nr2StaleWant`, `Nr2OaeWhy` now answer "which
+  predicate" in one run. **That instrument is deployed and unread.**
+
+✅ Fixed en route and independent of the knob: `vn_renderer_helios_allocate_memory`
+built its payload from `vn_sizeof_vkAllocateMemory` and
+`vn_encode_vkAllocateMemory`, which **disagree — 128 against 144**. Same
+divergence `vn_device_memory_defer_outer_allocate` documents at 120 against 136,
+where the generated wrapper's overrun corrupted the process heap.
+
+**(II) Restore the CPU host aperture** — the pre-retirement design, and the one
+the rest of the driver still assumes: `build_paging_buffer.rs` states outright
+that *"A BAR-segment allocation's content IS its venus blob (the CPU host
+aperture exposes the blob bytes — `cpu_host_aperture.rs`)"*. That file was
+**deleted by K1 in `60a9988`** (490 lines) along with `blob_map.rs` (193), and
+`DxgkDdiMapCpuHostAperture` is `None` today with no segment advertising
+`SupportsCpuHostAperture`. Recover it with
+`git show 60a9988^:kmd_render/src/ddi/cpu_host_aperture.rs`. No 4 MiB cap, since
+the host owns the memory; costs a segment-table change and carries the Code-43
+history the CLAUDE.md invariant records.
+
+⇒ **(I) iterates in minutes (meson + `win_install_umd`, no reboot) and its next
+step is to read the instrument that is already deployed. (II) is the general
+fix.**
 
 ---
 
