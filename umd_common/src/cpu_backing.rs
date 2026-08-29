@@ -33,6 +33,22 @@ impl CpuBacking {
         Some(Self { ptr, layout })
     }
 
+    /// Page-ALIGNED and page-ROUNDED, which is what the KMD's guest-page
+    /// backing requires: it builds an MDL over `round_up_page(byte_size)` and
+    /// locks it, so the last page has to belong to this buffer in full.
+    /// `new` only guarantees the alignment.
+    pub fn new_page_rounded(bytes: u64) -> Option<Self> {
+        let bytes = usize::try_from(bytes).ok()?;
+        if bytes == 0 {
+            return None;
+        }
+        let rounded = bytes.checked_next_multiple_of(WDDM_PAGE_ALIGN)?;
+        let layout = Layout::from_size_align(rounded, WDDM_PAGE_ALIGN).ok()?;
+        // SAFETY: as `new` — nonzero, valid layout, freed with the same one.
+        let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
+        Some(Self { ptr, layout })
+    }
+
     pub fn as_ptr(&self) -> *mut c_void {
         self.ptr.as_ptr().cast()
     }
@@ -58,6 +74,21 @@ impl Drop for CpuBacking {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn page_rounded_backing_is_aligned_and_whole_pages() {
+        // 4 MiB + 1 byte: `new` would leave a partial last page, which an MDL
+        // over `round_up_page` would lock past the end of the allocation.
+        let b = CpuBacking::new_page_rounded((4 << 20) + 1).expect("alloc");
+        assert_eq!(b.bytes() % WDDM_PAGE_ALIGN, 0);
+        assert!(b.bytes() >= (4 << 20) + 1);
+        assert_eq!(b.as_ptr() as usize % WDDM_PAGE_ALIGN, 0);
+    }
+}
+
+#[cfg(test)]
+mod legacy_tests {
     use super::*;
 
     #[test]

@@ -24,6 +24,7 @@
 //! | `UmdDeferredDiagnostics` | DWORD | `false` (diagnostic atomics, opt-in) |
 //! | `UmdEvictOnDeallocate` | DWORD | `false` (pair the evict with the deallocate) |
 //! | `UmdLockMode` | DWORD | `0` (`pfnLockCb`, the measured configuration) |
+//! | `UmdGuestBacking` | DWORD | `false` (KMD `Hwa2GuestMem` is the other half) |
 //!
 //! The surviving policies are `BoolKnob` ("absent = off, non-zero = on") and
 //! `DwordKnob` ("absent = this default, else the stored value").
@@ -255,4 +256,22 @@ pub(crate) static UMD_LOCK_MODE: DwordKnob = DwordKnob::new(c"UmdLockMode", 0);
 /// `HKLM\SOFTWARE\Helios!UmdLockMode` (REG_DWORD). See [`UMD_LOCK_MODE`].
 pub(crate) fn umd_lock_mode() -> u32 {
     UMD_LOCK_MODE.get()
+}
+
+/// Supply this UMD's own page-aligned buffer as the allocation's `pSystemMem`
+/// AND as `HeliosWddmAllocationDescV2::cpu_backing_va`, then publish it as the
+/// resource association's `cpu_mapping` — instead of taking the mapping from
+/// `pfnLockCb`.
+///
+/// The KMD half is `Hwa2GuestMem`, which imports those exact pages as the
+/// allocation's `VkDeviceMemory`. The two are only meaningful TOGETHER: with
+/// this on and the KMD's off, the application's pointer is a heap buffer the
+/// GPU never touches, which is the 2026-08-29 defect exactly. Off by default
+/// for that reason, and both flip together once measured.
+pub(crate) static UMD_GUEST_BACKING: BoolKnob = BoolKnob::new(c"UmdGuestBacking", false);
+
+/// `HKLM\SOFTWARE\Helios!UmdGuestBacking` (REG_DWORD). See
+/// [`UMD_GUEST_BACKING`].
+pub(crate) fn umd_guest_backing() -> bool {
+    UMD_GUEST_BACKING.get()
 }

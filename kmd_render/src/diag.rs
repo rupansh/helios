@@ -650,6 +650,14 @@ pub mod knobs {
     /// `BarSegFlagsX=4`, which supplies the `CpuVisible` bit that objection is
     /// about; that combination has never been measured. Read at AddAdapter.
     pub const BAR_SEGMENT_ONLY: KnobName = KnobName::new(b"BarSegOnly");
+    /// Back a CPU-visible linear HWA2 allocation with the CREATOR'S OWN PAGES
+    /// (`HeliosWddmAllocationDescV2::cpu_backing_va`), imported by the host as
+    /// a guest blob, instead of a fresh host-side `vkAllocateMemory`.
+    ///
+    /// This is the two-buffer fix. Off until measured; the UMD half is
+    /// `UmdGuestBacking` and the two are only meaningful together. Every
+    /// refusal falls back to the host allocation and is counted `Gb*`.
+    pub const HWA2_GUEST_MEM: KnobName = KnobName::new(b"Hwa2GuestMem");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.

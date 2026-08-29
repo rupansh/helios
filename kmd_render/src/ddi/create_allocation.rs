@@ -2892,6 +2892,14 @@ struct CreatedBacking {
     /// blob's size: the plain-buffer arm keeps the requested size, as it always
     /// has.
     blob_size: BackingSize,
+    /// This backing IS the creator's own pages, imported by the host.
+    ///
+    /// It forces APERTURE-ONLY placement. Local placement would be actively
+    /// wrong, not merely wasteful: `bar_transfer` copies a segment-2
+    /// allocation's blob to and from VidMm's system backing on every
+    /// eviction/page-in, and here the blob is the application's live buffer, so
+    /// those copies would overwrite it with a shadow nobody writes.
+    guest_backed: bool,
 }
 
 /// Which backing the KMD must create for one validated HWA2 descriptor.
@@ -2932,6 +2940,11 @@ enum Hwa2Backing {
         bytes: u64,
         mappable: bool,
         shareable: bool,
+        /// The creator's own CPU buffer for this allocation, or zero. When it is
+        /// present and `Hwa2GuestMem` is on, the backing becomes an IMPORT of
+        /// those guest pages instead of a fresh host allocation — which is the
+        /// whole two-buffer fix.
+        cpu_backing_va: u64,
     },
 }
 
@@ -3057,6 +3070,7 @@ fn classify_hwa2(desc: &HeliosWddmAllocationDescV2) -> Result<Hwa2Backing, NTSTA
         bytes: desc.byte_size,
         mappable: desc.has_flag(HELIOS_HWA2_FLAG_CPU_VISIBLE),
         shareable: desc.has_flag(HELIOS_HWA2_FLAG_SHARED),
+        cpu_backing_va: desc.cpu_backing_va,
     };
     match desc.allocation_kind {
         // The scan-out primary. Its bytes must be a real LINEAR VkImage the host
@@ -3131,6 +3145,227 @@ fn classify_hwa2(desc: &HeliosWddmAllocationDescV2) -> Result<Hwa2Backing, NTSTA
     }
 }
 
+/// The largest allocation a guest-page import can serve.
+///
+/// The host turns the memory-entry list into a udmabuf, and stock udmabuf's
+/// `list_limit` is 1024 entries (read from `/sys/module/udmabuf/parameters/
+/// list_limit` on this host, 2026-08-30). Entries are COALESCED runs, not pages,
+/// so 4 MiB is a floor rather than the true ceiling — but it is the number
+/// route (I) measured against, and exceeding the host's limit fails the create
+/// rather than degrading, so the cap stays where the evidence is.
+const HWA2_GUEST_BACKING_MAX_BYTES: u64 = 4 << 20;
+
+/// Counters for the guest-page backing path. Every one of these is a REFUSAL
+/// that silently falls back to a host allocation — i.e. back to the two-buffer
+/// defect — so a nonzero value with a black desktop is the first thing to read.
+static GUEST_BACK_OK: AtomicU32 = AtomicU32::new(0);
+static GUEST_BACK_OFF: AtomicU32 = AtomicU32::new(0);
+static GUEST_BACK_NO_VA: AtomicU32 = AtomicU32::new(0);
+static GUEST_BACK_TOO_BIG: AtomicU32 = AtomicU32::new(0);
+static GUEST_BACK_MDL: AtomicU32 = AtomicU32::new(0);
+/// `MmProbeAndLockPages` refused (SEH). The expected cause is that
+/// `DxgkDdiCreateAllocation` did not run in the creating process, which makes a
+/// user VA meaningless — a clean refusal, never a dereference.
+static GUEST_BACK_PROBE: AtomicU32 = AtomicU32::new(0);
+static GUEST_BACK_PFN: AtomicU32 = AtomicU32::new(0);
+static GUEST_BACK_BLOB: AtomicU32 = AtomicU32::new(0);
+static GUEST_BACK_IMPORT: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn dump_guest_backing_counters() {
+    for (name, counter) in [
+        (&b"GbOk"[..], &GUEST_BACK_OK),
+        (&b"GbOff"[..], &GUEST_BACK_OFF),
+        (&b"GbNoVa"[..], &GUEST_BACK_NO_VA),
+        (&b"GbBig"[..], &GUEST_BACK_TOO_BIG),
+        (&b"GbMdl"[..], &GUEST_BACK_MDL),
+        (&b"GbProbe"[..], &GUEST_BACK_PROBE),
+        (&b"GbPfn"[..], &GUEST_BACK_PFN),
+        (&b"GbBlob"[..], &GUEST_BACK_BLOB),
+        (&b"GbImp"[..], &GUEST_BACK_IMPORT),
+    ] {
+        crate::diag::record_named_bytes(name, counter.load(Ordering::Relaxed));
+    }
+}
+
+/// Back a linear allocation with the CREATOR'S OWN PAGES instead of fresh host
+/// memory, so the application's map pointer and the GPU's memory are one thing.
+///
+/// This is the whole two-buffer fix. WDDM offers no channel to these pages —
+/// `MAP_APERTURE_SEGMENT` never names a D3D11 allocation (measured, .401) and
+/// `ShareBackingStoreWithKmd` is refused for an unshared resource (F18) — so the
+/// creator states them in `HeliosWddmAllocationDescV2::cpu_backing_va` and this
+/// locks them.
+///
+/// `None` on every refusal, and every refusal is counted: the caller falls back
+/// to `allocate_memory_blob`, which is the pre-existing behaviour, so a bad
+/// value costs a counter rather than the allocation.
+///
+/// # Safety
+/// `cpu_backing_va` is an untrusted user-mode address. It is never
+/// dereferenced: it is handed to `IoAllocateMdl` and then to the SEH-guarded
+/// `helios_mm_probe_and_lock_pages_seh`, which converts an invalid or
+/// wrong-process range into a refusal.
+unsafe fn build_guest_backed_linear(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    cpu_backing_va: u64,
+    bytes: u64,
+) -> Option<CreatedBacking> {
+    if !adapter.knobs().hwa2_guest_mem {
+        GUEST_BACK_OFF.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    if cpu_backing_va == 0 {
+        GUEST_BACK_NO_VA.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    // The creator's buffer is page-ALIGNED (`validate_create_input`) and
+    // page-ROUNDED (`CpuBacking::new_page_rounded`), so the MDL covers whole
+    // pages this allocation owns. Everything downstream — blob size, import
+    // size, charged extent — uses `mapped`, not `bytes`.
+    let Some(mapped) = bytes
+        .checked_next_multiple_of(PAGE as u64)
+        .filter(|m| *m != 0 && *m <= HWA2_GUEST_BACKING_MAX_BYTES && *m <= u32::MAX as u64)
+    else {
+        GUEST_BACK_TOO_BIG.fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
+    let bytes = mapped;
+    let page_count = (bytes >> 12) as usize;
+    let mut entries = Vec::<VirtioGpuMemEntry>::new();
+    if entries.try_reserve_exact(page_count).is_err() {
+        GUEST_BACK_MDL.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    // SAFETY: building an MDL over a range does not touch it.
+    let mdl = unsafe {
+        IoAllocateMdl(
+            cpu_backing_va as *mut c_void,
+            bytes as u32,
+            0,
+            0,
+            core::ptr::null_mut(),
+        )
+    };
+    if mdl.is_null() {
+        GUEST_BACK_MDL.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    // SAFETY: the SEH shim converts the raise `MmProbeAndLockPages` performs on
+    // an invalid or foreign range into a 0 return. This is the ONLY thing
+    // standing between an untrusted VA and a bugcheck.
+    if unsafe { helios_mm_probe_and_lock_pages_seh(mdl) } == 0 {
+        unsafe { IoFreeMdl(mdl) };
+        GUEST_BACK_PROBE.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    // SAFETY: the MDL is locked, so its PFN array is populated.
+    let pfns = unsafe { helios_mm_get_mdl_pfn_array(mdl) };
+    let mut valid = !pfns.is_null();
+    if valid {
+        for index in 0..page_count {
+            // SAFETY: index < page_count, and the MDL describes exactly that
+            // many pages.
+            let pfn = unsafe { *pfns.add(index) };
+            if pfn > (u64::MAX >> 12) {
+                valid = false;
+                break;
+            }
+            let address = pfn << 12;
+            if let Some(last) = entries.last_mut() {
+                let end = last.addr.checked_add(last.length as u64);
+                if end == Some(address) && last.length <= u32::MAX - PAGE as u32 {
+                    last.length += PAGE as u32;
+                    continue;
+                }
+            }
+            entries.push(VirtioGpuMemEntry {
+                addr: address,
+                length: PAGE as u32,
+                padding: 0,
+            });
+        }
+    }
+    let exported = entries
+        .iter()
+        .try_fold(0u64, |sum, e| sum.checked_add(e.length as u64));
+    if !valid || exported != Some(bytes) {
+        unsafe {
+            wdk_sys::ntddk::MmUnlockPages(mdl);
+            IoFreeMdl(mdl);
+        }
+        GUEST_BACK_PFN.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    // MAPPABLE|SHAREABLE mirrors HVM1 role 2, the one guest-blob shape this
+    // host path is exercised with every boot.
+    let resource_id = match crate::virtio::ctrl::resource_create_guest_blob(
+        passive,
+        adapter,
+        adapter.venus_ctx_id(),
+        VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE | VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
+        bytes,
+        &entries,
+        mdl as usize,
+    ) {
+        Ok(resource_id) => resource_id,
+        Err(_) => {
+            GUEST_BACK_BLOB.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    // ⛔ FROM HERE THE MDL IS NOT OURS. `resource_create_guest_blob` moved it
+    // into `ResourceBackingFinalizer::guest_pages`, which `release_guest_pages`
+    // calls "its sole release authority" — it unlocks and frees it when the
+    // resource dies. Storing it in `AllocationContext::backing_store_mdl` as
+    // well, which `Drop` also unlocks and frees, is a double free; the
+    // shared-backing path deliberately stores only `backing_store_va` for the
+    // same reason. Nothing below may free it, including the failure paths.
+    let memory_id = match adapter
+        .with_venus_client(passive, |c| c.import_guest_memory(adapter, resource_id, bytes))
+    {
+        Ok(Ok(id)) => id,
+        _ => {
+            // ⛔ The resource MUST go, and not merely to avoid a leak: while it
+            // lives, the host holds a udmabuf over these page frames and the
+            // finalizer keeps them locked, but the CREATOR is about to free its
+            // buffer and the fallback allocation takes its place. Destroying
+            // the resource runs `release_guest_pages`, which unlocks them.
+            // Leaving it would let the host read and write pages the guest has
+            // recycled — silent corruption, not a leak.
+            release_orphan_backing(
+                passive,
+                adapter,
+                &CreatedBacking {
+                    resource_id,
+                    venus_memory_id: 0,
+                    venus_image_id: 0,
+                    pitch: 0,
+                    plane_offset: 0,
+                    venus_alloc_size: bytes,
+                    memory_type_index: 0,
+                    blob_size: BackingSize::HostAuthoritative(bytes),
+                    guest_backed: true,
+                },
+            );
+            GUEST_BACK_IMPORT.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
+    GUEST_BACK_OK.fetch_add(1, Ordering::Relaxed);
+    Some(CreatedBacking {
+        resource_id,
+        venus_memory_id: memory_id.get(),
+        venus_image_id: 0,
+        pitch: 0,
+        plane_offset: 0,
+        venus_alloc_size: bytes,
+        memory_type_index: 0,
+        blob_size: BackingSize::HostAuthoritative(bytes),
+        guest_backed: true,
+    })
+}
+
 /// Produce the backing for one classified allocation.
 ///
 /// Every diag code and every returned NTSTATUS here is byte-identical to the
@@ -3158,6 +3393,7 @@ fn build_backing(
                     venus_alloc_size: scanout.blob.size,
                     memory_type_index: scanout.memory_type_index,
                     blob_size: BackingSize::HostAuthoritative(scanout.blob.size),
+                    guest_backed: false,
                 }),
                 Ok(Err(_ve)) => {
                     crate::diag::record(0x0C01_00E5);
@@ -3201,6 +3437,7 @@ fn build_backing(
                     venus_alloc_size: image.blob.size,
                     memory_type_index: image.memory_type_index,
                     blob_size: BackingSize::HostAuthoritative(image.blob.size),
+                    guest_backed: false,
                 }),
                 Ok(Err(_ve)) => {
                     // The constructor refuses width/height 0 and every DXGI
@@ -3222,7 +3459,21 @@ fn build_backing(
             bytes,
             mappable,
             shareable,
+            cpu_backing_va,
         } => {
+            // The creator's own pages first: that backing IS the application's
+            // map pointer, so there is only one buffer. Every refusal is
+            // counted (`Gb*`) and falls through to the host allocation below,
+            // which is the historical behaviour and the two-buffer defect.
+            // SAFETY: `cpu_backing_va` is untrusted and is never dereferenced
+            // here — see `build_guest_backed_linear`.
+            if let Some(backing) =
+                unsafe { build_guest_backed_linear(passive, adapter, cpu_backing_va, bytes) }
+            {
+                dump_guest_backing_counters();
+                return Ok(backing);
+            }
+            dump_guest_backing_counters();
             // Back it with a REAL venus `VkDeviceMemory` blob through the kernel
             // venus client: user-mode venus contexts import it by resource id and
             // `vkBindImageMemory2` against it — a raw `blob_id = 0` shmem blob
@@ -3256,6 +3507,7 @@ fn build_backing(
                     // `venus_memory_id != 0` set `bar_eligible` used to test, so
                     // the eligible population is unchanged.
                     blob_size: BackingSize::HostAuthoritative(bytes),
+                    guest_backed: false,
                 }),
                 Ok(Err(_ve)) => {
                     crate::diag::record(0x0C01_00E3);
@@ -3708,6 +3960,25 @@ unsafe fn admit_hwa2(
         desc.flags |= HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE;
     }
 
+    // Did the CREATOR offer pages? Captured before the clear below, and
+    // published with the generation this KMD is about to stamp. It separates
+    // "the KMD never reached the write-back" from "the KMD wrote a good record
+    // and it did not reach the UMD" — the UMD reports `AllocationGenerationZero`
+    // for both, and they have opposite fixes.
+    if desc.cpu_backing_va != 0 {
+        crate::diag::record_named_bytes(b"GbWbGen", generation as u32);
+        crate::diag::record_named_bytes(b"GbWbSz", private_size as u32);
+    }
+
+    // ⛔ CLEAR THE CREATOR'S CPU-BUFFER VA FIRST, before the self-check — it is
+    // part of the output record, and `validate_create_output` refuses a record
+    // that still carries one. Clearing it after the check instead cost a whole
+    // deploy: every guest-backed create failed `AcHwa2Out`, which reads as a
+    // driver bug in the descriptor and is really just these two lines in the
+    // wrong order. The VA is a user-mode address in the CREATING process and
+    // means nothing in an opener's, which is why it may not be published.
+    desc.cpu_backing_va = 0;
+
     // Self-check BEFORE the write: the record this KMD is about to publish must
     // pass the validator every opener will run on it. A failure here is a driver
     // bug, not a guest one, and refusing the create is the only way it can be
@@ -3753,8 +4024,12 @@ unsafe fn admit_hwa2(
     // after local placement destabilized LogonUI/DWM, and dxgkrnl now rejects
     // the same shape during pfnAllocateCb after Create/Open have succeeded.
     // Ordinary CPU-visible linear allocations retain local placement.
-    let bar_eligible =
-        helios_kmd_logic::allocation_placement::hwa2_may_prefer_local_memory(
+    // ⛔ A guest-backed allocation is NEVER local. Its blob IS the creator's
+    // live buffer, and `bar_transfer` copies a segment-2 allocation's blob to
+    // and from VidMm's system backing on every eviction and page-in — which
+    // here would overwrite the application's data with a shadow nobody writes.
+    let bar_eligible = !created.guest_backed
+        && helios_kmd_logic::allocation_placement::hwa2_may_prefer_local_memory(
             &desc,
             created.blob_size.is_host_authoritative(),
             local_seg_id.is_some(),
@@ -3916,6 +4191,7 @@ unsafe fn admit_hvm1(
                 venus_alloc_size: blob.size,
                 memory_type_index: blob.memory_type_index,
                 blob_size: BackingSize::HostAuthoritative(blob.size),
+                guest_backed: false,
             }),
             Ok(Err(_)) => {
                 bump_with_code(

@@ -661,11 +661,20 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
         return Err(E_INVALIDARG);
     }
 
-    // ⛔ No CpuBacking, and pSystemMem stays NULL. The CPU view comes from
-    // pfnLockCb after residency (below), which resolves through the segment's
-    // CPU host aperture onto the allocation's own blob. A process-heap buffer
-    // here is a view of nothing -- see `lock_cpu_view`.
-    let mut cpu_backing: Option<helios_umd_common::cpu_backing::CpuBacking> = None;
+    // `UmdGuestBacking`: OUR pages become the allocation's storage on both
+    // sides — pSystemMem for dxgkrnl, `cpu_backing_va` for the KMD to import as
+    // the venus memory. Off: no buffer, and the CPU view comes from pfnLockCb.
+    let mut cpu_backing = if crate::knobs::umd_guest_backing() && cpu_visible {
+        let Some(backing) = helios_umd_common::cpu_backing::CpuBacking::new_page_rounded(bytes)
+        else {
+            log_error!("DXVK internal allocation REFUSED: no CPU backing for {} bytes", bytes);
+            return Err(E_OUTOFMEMORY);
+        };
+        desc.cpu_backing_va = backing.as_ptr() as u64;
+        Some(backing)
+    } else {
+        None
+    };
 
     let sent = desc;
     let private_ptr = (&mut desc as *mut HeliosWddmAllocationDescV2).cast();
@@ -673,6 +682,12 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
     let mut allocation_info = ddi::D3DDDI_ALLOCATIONINFO2::default();
     allocation_info.pPrivateDriverData = private_ptr;
     allocation_info.PrivateDriverDataSize = private_size;
+    // ⛔ pSystemMem stays NULL even under `UmdGuestBacking`. Supplying it made
+    // dxgkrnl refuse the whole transaction with E_INVALIDARG (measured,
+    // 22.22.404.0): a pSystemMem allocation is system memory by definition and
+    // cannot also prefer a video-memory segment. It buys nothing here either —
+    // its only job would be to make `pfnLockCb` return this buffer, and this
+    // mode publishes the pointer directly instead of asking.
     allocation_info.__bindgen_anon_1.pSystemMem = core::ptr::null();
     let mut alloc = ddi::D3DDDICB_ALLOCATE::default();
     alloc.pPrivateDriverData = private_ptr;
@@ -708,6 +723,11 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
     let echoed = HeliosWddmAllocationDescV2 {
         allocation_generation: sent.allocation_generation,
         flags: desc.flags & !HELIOS_HWA2_FLAG_KMD_OWNED_MASK,
+        // The KMD CLEARS this on purpose: a user VA must never reach an opener,
+        // and `validate_create_output` refuses a record that still carries one.
+        // Normalising it here keeps the echo check about fields the KMD is
+        // forbidden to touch.
+        cpu_backing_va: sent.cpu_backing_va,
         ..desc
     };
     if echoed != sent {
@@ -730,18 +750,23 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
     };
     // After residency: locking asks the KMD to populate the CPU host aperture
     // for this allocation, which it can only do once the allocation is placed.
-    let cpu_mapping = if cpu_visible {
-        match lock_cpu_view(outer.kt_callbacks, outer.h_rt_device, h_allocation) {
-            Ok(ptr) => ptr,
-            Err(lock_hr) => {
-                drop(resident);
-                let deallocated = deallocate_standalone(outer, h_allocation);
-                finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
-                return Err(lock_hr);
+    let cpu_mapping = match (cpu_visible, cpu_backing.as_ref()) {
+        (false, _) => core::ptr::null_mut(),
+        // Our own pages, which the KMD imported as this allocation's venus
+        // memory. Publishing them is what makes the app's pointer and the GPU's
+        // memory one buffer.
+        (true, Some(backing)) => backing.as_ptr(),
+        (true, None) => {
+            match lock_cpu_view(outer.kt_callbacks, outer.h_rt_device, h_allocation) {
+                Ok(ptr) => ptr,
+                Err(lock_hr) => {
+                    drop(resident);
+                    let deallocated = deallocate_standalone(outer, h_allocation);
+                    finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
+                    return Err(lock_hr);
+                }
             }
         }
-    } else {
-        core::ptr::null_mut()
     };
     let (identity, association) = match assign_outer_allocation(
         outer,
@@ -998,9 +1023,23 @@ pub(crate) unsafe fn allocate_wddm_resource(
     // AFTER the callback has returned.
     let sent = desc;
 
-    // ⛔ No CpuBacking, and pSystemMem stays NULL -- the CPU view comes from
-    // pfnLockCb after residency. See `lock_cpu_view`.
-    let mut cpu_backing: Option<helios_umd_common::cpu_backing::CpuBacking> = None;
+    // `UmdGuestBacking`: OUR pages back the allocation on both sides. See the
+    // identical block in `allocate_dxvk_internal_wddm_memory`.
+    let mut cpu_backing = if crate::knobs::umd_guest_backing() && needs_cpu_mapping {
+        let Some(backing) =
+            helios_umd_common::cpu_backing::CpuBacking::new_page_rounded(desc.byte_size)
+        else {
+            log_error!(
+                "DDI allocate_wddm_resource REFUSED: no CPU backing for {} bytes",
+                desc.byte_size
+            );
+            return Err(E_OUTOFMEMORY);
+        };
+        desc.cpu_backing_va = backing.as_ptr() as u64;
+        Some(backing)
+    } else {
+        None
+    };
 
     let mut allocation_info = ddi::D3DDDI_ALLOCATIONINFO2::default();
     let private_ptr = (&mut desc as *mut HeliosWddmAllocationDescV2).cast();
@@ -1010,6 +1049,12 @@ pub(crate) unsafe fn allocate_wddm_resource(
     let private_size = u32::from(HELIOS_HWA2_BYTES);
     allocation_info.pPrivateDriverData = private_ptr;
     allocation_info.PrivateDriverDataSize = private_size;
+    // ⛔ pSystemMem stays NULL even under `UmdGuestBacking`. Supplying it made
+    // dxgkrnl refuse the whole transaction with E_INVALIDARG (measured,
+    // 22.22.404.0): a pSystemMem allocation is system memory by definition and
+    // cannot also prefer a video-memory segment. It buys nothing here either —
+    // its only job would be to make `pfnLockCb` return this buffer, and this
+    // mode publishes the pointer directly instead of asking.
     allocation_info.__bindgen_anon_1.pSystemMem = core::ptr::null();
     let is_present = (a.BindFlags & DDI_BIND_PRESENT) != 0;
     let is_primary_allocation = !a.pPrimaryDesc.is_null();
@@ -1149,6 +1194,8 @@ pub(crate) unsafe fn allocate_wddm_resource(
         let echoed = HeliosWddmAllocationDescV2 {
             allocation_generation: sent.allocation_generation,
             flags: desc.flags & !HELIOS_HWA2_FLAG_KMD_OWNED_MASK,
+            // Cleared by the KMD on purpose; see the sibling site.
+            cpu_backing_va: sent.cpu_backing_va,
             ..desc
         };
         if echoed != sent {
@@ -1192,10 +1239,14 @@ pub(crate) unsafe fn allocate_wddm_resource(
     }
 
     match unsafe { make_resident(&dev.outer, h_allocation) } {
-        Ok(resident) => match (if needs_cpu_mapping {
-            unsafe { lock_cpu_view(dev.outer.kt_callbacks, dev.outer.h_rt_device, h_allocation) }
-        } else {
-            Ok(core::ptr::null_mut())
+        Ok(resident) => match (match (needs_cpu_mapping, cpu_backing.as_ref()) {
+            (false, _) => Ok(core::ptr::null_mut()),
+            // Our own pages, imported by the KMD as this allocation's venus
+            // memory: one buffer, not two.
+            (true, Some(backing)) => Ok(backing.as_ptr()),
+            (true, None) => unsafe {
+                lock_cpu_view(dev.outer.kt_callbacks, dev.outer.h_rt_device, h_allocation)
+            },
         })
         .and_then(|cpu_mapping| {
             assign_outer_allocation(

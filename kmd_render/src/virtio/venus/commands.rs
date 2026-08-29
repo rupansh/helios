@@ -112,6 +112,79 @@ impl VenusClient {
         })
     }
 
+    /// Make an EXISTING guest-backed virtio resource into a venus
+    /// `VkDeviceMemory`, instead of allocating fresh host memory for it.
+    ///
+    /// This is the half of the two-buffer fix the host already implements:
+    /// QEMU turns a `VIRTIO_GPU_BLOB_MEM_GUEST` resource's guest pages into a
+    /// udmabuf and virglrenderer imports it (`virtio-gpu-virgl.c:951-964`), so
+    /// the resulting memory IS those pages. `allocate_memory_blob` is the
+    /// opposite: it allocates on the host and hands the guest nothing.
+    ///
+    /// The caller owns `resource_id` and must keep its MDL locked for at least
+    /// the lifetime of the returned memory id — the host holds a udmabuf over
+    /// those page frames.
+    ///
+    /// No blob create here: the resource exists before this is called, which is
+    /// the ordering the import requires.
+    pub fn import_guest_memory(
+        &mut self,
+        adapter: &AdapterContext,
+        resource_id: u32,
+        size: u64,
+    ) -> Result<VkDeviceMemoryId, VirtioError> {
+        if resource_id == 0 || size == 0 {
+            return Err(VirtioError::DeviceError);
+        }
+        if self.owned_memory_blobs.len() >= MAX_OWNED_MEMORY_BLOBS {
+            crate::diag::record_named_bytes(b"GbImpCap", self.owned_memory_blobs.len() as u32);
+            return Err(VirtioError::OutOfMemory);
+        }
+        // "Fewest property flags", measured on the host: only the flagless type
+        // imports a udmabuf. See `choose_importable_memory_type`.
+        let Some(memory_type_index) = helios_kmd_logic::choose_importable_memory_type(
+            &self.memory_type_flags,
+            self.memory_type_count,
+            u32::MAX,
+        ) else {
+            crate::diag::record_named_bytes(b"GbImpMt", 0xFFFF_FFFF);
+            return Err(VirtioError::DeviceError);
+        };
+        // The arm actually taken. A refusal with a plausible-looking index is
+        // otherwise indistinguishable from a refusal with the wrong one.
+        crate::diag::record_named_bytes(b"GbImpMti", memory_type_index);
+        crate::diag::record_named_bytes(
+            b"GbImpMtf",
+            self.memory_type_flags
+                .get(memory_type_index as usize)
+                .copied()
+                .unwrap_or(0xFFFF_FFFF),
+        );
+        let memory_id = self.new_memory_id();
+        let w = encode_memory_allocate(
+            self.device_id.into(),
+            memory_id.into(),
+            &MemoryAllocateSpec {
+                pnext: MemoryPNext::ImportResource { resource_id },
+                size: round_up_page(size),
+                memory_type_index,
+            },
+        );
+        self.ring_command_expect(
+            adapter,
+            w.as_slice()?,
+            ReplyCheck::new(CMD_ALLOCATE_MEMORY)
+                .mismatch(0x00FA)
+                .refuse_result(0x00FB)
+                // The host's own `VkResult`. Without it an import refusal is
+                // just "the host said no", which is not a diagnosis.
+                .result_marks(b"GbImpVk"),
+        )?;
+        // Capacity was reserved above, so push cannot allocate.
+        self.owned_memory_blobs.push(memory_id);
+        Ok(memory_id)
+    }
+
     /// Allocate a shareable HOST3D blob from a pure DEVICE_LOCAL memory type.
     ///
     /// This is the sole backing constructor for HVM1 role 4.  It intentionally

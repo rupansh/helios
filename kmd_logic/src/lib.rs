@@ -1338,6 +1338,42 @@ impl MemoryTypeChoice {
     }
 }
 
+/// Pick the memory type an IMPORTED guest-page resource can actually be
+/// allocated into: the one with the FEWEST property flags.
+///
+/// Not a preference — a measurement. `tools/udmabuf_import_probe.c`, run on the
+/// host GPU outside the whole stack: NVIDIA's `vkGetMemoryFdProperties` mask
+/// for a udmabuf is `0x9`, and only type 0 (`propertyFlags = 0x00`) imports;
+/// the host-visible type returns `VK_ERROR_OUT_OF_DEVICE_MEMORY`. The guest
+/// never needed a host-visible type here: the host does not map this memory,
+/// the GUEST holds the CPU view of the same pages.
+///
+/// `None` when `memory_type_bits` allows nothing, which is a refusal, not a
+/// fallback — importing into a type the host rejects fails the allocate and
+/// would otherwise look like a transport error.
+pub fn choose_importable_memory_type(
+    memory_type_flags: &[u32],
+    memory_type_count: u32,
+    memory_type_bits: u32,
+) -> Option<u32> {
+    let count = memory_type_count.min(VK_MAX_MEMORY_TYPES) as usize;
+    let mut best: Option<(u32, u32)> = None;
+    for index in 0..count.min(memory_type_flags.len()) {
+        if memory_type_bits & (1u32 << index) == 0 {
+            continue;
+        }
+        let flags = memory_type_flags[index];
+        let weight = flags.count_ones();
+        if best.is_none_or(|(_, w)| weight < w) {
+            best = Some((index as u32, weight));
+            if weight == 0 {
+                break;
+            }
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
 /// Pick a HOST_VISIBLE memory type, preferring one that is also HOST_COHERENT.
 ///
 /// `Downgraded` means HOST_VISIBLE but NOT HOST_COHERENT, which for a MAPPABLE
@@ -1656,6 +1692,21 @@ mod tests {
             differing, 2,
             "expected exactly the sType word and the payload word to differ"
         );
+    }
+
+    #[test]
+    fn importable_memory_type_prefers_the_fewest_property_flags() {
+        // Type 0 has no flags at all; 3 is HOST_VISIBLE|HOST_COHERENT and is
+        // the one the host refused for a udmabuf.
+        let flags = [0x0, 0x1, 0x5, 0x7];
+        assert_eq!(choose_importable_memory_type(&flags, 4, 0b1111), Some(0));
+        // With type 0 masked out, the next-fewest wins rather than the first.
+        assert_eq!(choose_importable_memory_type(&flags, 4, 0b1110), Some(1));
+        assert_eq!(choose_importable_memory_type(&flags, 4, 0b1100), Some(2));
+        // Nothing allowed is a refusal, not type 0.
+        assert_eq!(choose_importable_memory_type(&flags, 4, 0), None);
+        // Never returns an index at or above the host's reported count.
+        assert_eq!(choose_importable_memory_type(&flags, 2, 0b1100), None);
     }
 
     #[test]

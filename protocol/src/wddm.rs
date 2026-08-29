@@ -125,7 +125,12 @@ pub const HELIOS_HWA2_MAGIC: u32 = 0x3241_5748;
 /// reject and never selects a legacy parser.
 pub const HELIOS_HWA2_ABI_VERSION: u16 = 2;
 /// HWA2 structure size in bytes (§10.3, offset 6).
-pub const HELIOS_HWA2_BYTES: u16 = 168;
+pub const HELIOS_HWA2_BYTES: u16 = 176;
+
+/// Required alignment of [`HeliosWddmAllocationDescV2::cpu_backing_va`]. One
+/// page: the KMD builds an MDL over the range and takes its page frames, so a
+/// sub-page start would put bytes the creator does not own in the first entry.
+pub const HELIOS_HWA2_CPU_BACKING_ALIGN: u64 = 4096;
 
 // ── allocation kind (§10.3, offset 64) ──────────────────────────────────────
 //
@@ -500,6 +505,22 @@ pub struct HeliosWddmAllocationDescV2 {
     /// Four plane records (offset 104, 64 bytes). Records at or above
     /// [`Self::plane_count`] are zero.
     pub planes: [HeliosWddmPlaneRecordV2; 4],
+    /// CREATE-INPUT ONLY (offset 168): the creator's own page-aligned CPU
+    /// buffer for this allocation, or zero for "none offered".
+    ///
+    /// It exists because WDDM offers the KMD no other channel to the pages an
+    /// application's `Map()` pointer addresses. Measured 2026-08-30 on
+    /// 22.22.401.0: `DXGK_OPERATION_MAP_APERTURE_SEGMENT` never names a D3D11
+    /// allocation (every resolved aperture map in an 8-slot ring is HVM1), and
+    /// `ShareBackingStoreWithKmd` is refused for an unshared resource (F18). So
+    /// the creator states the pages and the KMD locks them.
+    ///
+    /// ⛔ A user-mode VA is meaningful only in the creating process. The KMD
+    /// ZEROES it in the create write-back, so it never reaches an opener, and
+    /// it is never an identity — a wrong value produces a failed
+    /// `MmProbeAndLockPages` (SEH-guarded) and a counted fallback, never a
+    /// dereference.
+    pub cpu_backing_va: u64,
 }
 
 // HELIOS_PRESENT_SYNC_RETIREMENT.md §10.3 — every offset in the 168-byte table.
@@ -511,7 +532,7 @@ const _: () = {
     assert!(core::mem::offset_of!(HeliosWddmPlaneRecordV2, row_pitch) == 8);
     assert!(core::mem::offset_of!(HeliosWddmPlaneRecordV2, slice_pitch) == 12);
 
-    assert!(core::mem::size_of::<HeliosWddmAllocationDescV2>() == 168);
+    assert!(core::mem::size_of::<HeliosWddmAllocationDescV2>() == 176);
     assert!(core::mem::size_of::<HeliosWddmAllocationDescV2>() == HELIOS_HWA2_BYTES as usize);
     assert!(core::mem::align_of::<HeliosWddmAllocationDescV2>() == 8);
     assert!(core::mem::offset_of!(HeliosWddmAllocationDescV2, magic) == 0);
@@ -539,6 +560,7 @@ const _: () = {
     assert!(core::mem::offset_of!(HeliosWddmAllocationDescV2, plane_count) == 96);
     assert!(core::mem::offset_of!(HeliosWddmAllocationDescV2, reserved) == 100);
     assert!(core::mem::offset_of!(HeliosWddmAllocationDescV2, planes) == 104);
+    assert!(core::mem::offset_of!(HeliosWddmAllocationDescV2, cpu_backing_va) == 168);
     // The eleven flag bits of §10.3 offset 68, and nothing else.
     assert!(
         HELIOS_HWA2_FLAG_MASK
@@ -656,6 +678,15 @@ pub enum HeliosAllocDescRejection {
     /// The KMD-assigned allocation generation is zero.
     AllocationGenerationZero,
     ByteSizeZero,
+    /// Create-input `cpu_backing_va` is not page-aligned. An MDL over an
+    /// unaligned range would name a first page the creator does not wholly own.
+    CpuBackingVaMisaligned { found: u64 },
+    /// Create-input offered CPU-backing pages for an allocation that is not
+    /// CPU-visible. Nothing would ever map them.
+    CpuBackingVaWithoutCpuVisible,
+    /// Create-output still carries a `cpu_backing_va`. It is a user-mode
+    /// address in the CREATOR's process and means nothing in an opener's.
+    CpuBackingVaEchoed { found: u64 },
     ReservedNonZero {
         found: u32,
     },
@@ -833,6 +864,7 @@ impl HeliosWddmAllocationDescV2 {
                 row_pitch: 0,
                 slice_pitch: 0,
             }; 4],
+            cpu_backing_va: 0,
         }
     }
 
@@ -948,6 +980,29 @@ impl HeliosWddmAllocationDescV2 {
             return Err(R::ReservedNonZero {
                 found: self.reserved,
             });
+        }
+        // `cpu_backing_va` is CREATE-INPUT ONLY and page-aligned when offered.
+        // Requiring zero on output is what keeps a creator-process VA from ever
+        // reaching an opener: the KMD clears it in the write-back, and an opener
+        // that somehow sees one refuses instead of trusting it.
+        match stage {
+            Hwa2Stage::CreateInput => {
+                if self.cpu_backing_va & (HELIOS_HWA2_CPU_BACKING_ALIGN - 1) != 0 {
+                    return Err(R::CpuBackingVaMisaligned {
+                        found: self.cpu_backing_va,
+                    });
+                }
+                if self.cpu_backing_va != 0 && !self.has_flag(HELIOS_HWA2_FLAG_CPU_VISIBLE) {
+                    return Err(R::CpuBackingVaWithoutCpuVisible);
+                }
+            }
+            Hwa2Stage::CreateOutput => {
+                if self.cpu_backing_va != 0 {
+                    return Err(R::CpuBackingVaEchoed {
+                        found: self.cpu_backing_va,
+                    });
+                }
+            }
         }
         if self.byte_size == 0 {
             return Err(R::ByteSizeZero);
@@ -4226,16 +4281,16 @@ mod tests {
         // neither. It must still parse — the read is unaligned on purpose —
         // and a longer-than-exact buffer must still be refused by length.
         let d = primary_desc();
-        let mut staging = [0u8; 180];
-        staging[1..169].copy_from_slice(bytemuck::bytes_of(&d));
+        let mut staging = [0u8; 188];
+        staging[1..177].copy_from_slice(bytemuck::bytes_of(&d));
         assert_eq!(
-            HeliosWddmAllocationDescV2::from_private_data(&staging[1..169]),
+            HeliosWddmAllocationDescV2::from_private_data(&staging[1..177]),
             Ok(d)
         );
         assert_eq!(
-            HeliosWddmAllocationDescV2::from_private_data(&staging[1..170]),
+            HeliosWddmAllocationDescV2::from_private_data(&staging[1..178]),
             Err(HeliosAllocDescRejection::PrivateDataSize {
-                found: 169,
+                found: 177,
                 expected: HELIOS_HWA2_BYTES as usize,
             })
         );
@@ -5372,7 +5427,7 @@ mod tests {
         // protocol/include/helios_wddm.h
         assert_eq!(HELIOS_HWA2_MAGIC, 0x3241_5748);
         assert_eq!(HELIOS_HWA2_ABI_VERSION, 2);
-        assert_eq!(HELIOS_HWA2_BYTES, 168);
+        assert_eq!(HELIOS_HWA2_BYTES, 176);
         assert_eq!(HELIOS_HWA2_FLAG_MASK, 0x0000_07FF);
         assert_eq!(HELIOS_HWA2_FLAG_KMD_OWNED_MASK, 0x0000_0030);
         assert_eq!(HELIOS_HWA2_BIND_MASK, 0x0000_07FF);
