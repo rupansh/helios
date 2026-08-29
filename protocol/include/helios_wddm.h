@@ -98,8 +98,7 @@ HELIOS_WDDM_STATIC_ASSERT(HELIOS_PACKAGE_GENERATION == UINT64_C(0x48454C49000000
 /* 'HWA2' little-endian. */
 #define HELIOS_HWA2_MAGIC       0x32415748u
 #define HELIOS_HWA2_ABI_VERSION 2u
-#define HELIOS_HWA2_BYTES       176u
-#define HELIOS_HWA2_CPU_BACKING_ALIGN 4096ull
+#define HELIOS_HWA2_BYTES       168u
 
 /* Allocation kind (§10.3, offset 64). */
 #define HELIOS_HWA2_KIND_INVALID          0u
@@ -259,15 +258,10 @@ typedef struct HeliosWddmAllocationDescV2 {
     uint32_t plane_count;              /* 96  0..=4 */
     uint32_t reserved;                 /* 100 zero */
     HeliosWddmPlaneRecordV2 planes[4]; /* 104 records >= plane_count are zero */
-    uint64_t cpu_backing_va;           /* 168 CREATE-INPUT ONLY: the creator's
-                                        *     page-aligned CPU buffer, or zero.
-                                        *     The KMD clears it in the write-back
-                                        *     — a user VA means nothing outside
-                                        *     the creating process. */
 } HeliosWddmAllocationDescV2;
 
-HELIOS_WDDM_STATIC_ASSERT(sizeof(HeliosWddmAllocationDescV2) == 176,
-                          "HWA2 must be the §10.3 descriptor");
+HELIOS_WDDM_STATIC_ASSERT(sizeof(HeliosWddmAllocationDescV2) == 168,
+                          "HWA2 must be the §10.3 168-byte descriptor");
 HELIOS_WDDM_STATIC_ASSERT(sizeof(HeliosWddmAllocationDescV2) == HELIOS_HWA2_BYTES,
                           "HWA2 size constant must match the struct");
 HELIOS_WDDM_STATIC_ASSERT(HELIOS_WDDM_ALIGNOF(HeliosWddmAllocationDescV2) == 8, "");
@@ -296,7 +290,6 @@ HELIOS_WDDM_STATIC_ASSERT(offsetof(HeliosWddmAllocationDescV2, memory_class) == 
 HELIOS_WDDM_STATIC_ASSERT(offsetof(HeliosWddmAllocationDescV2, plane_count) == 96, "");
 HELIOS_WDDM_STATIC_ASSERT(offsetof(HeliosWddmAllocationDescV2, reserved) == 100, "");
 HELIOS_WDDM_STATIC_ASSERT(offsetof(HeliosWddmAllocationDescV2, planes) == 104, "");
-HELIOS_WDDM_STATIC_ASSERT(offsetof(HeliosWddmAllocationDescV2, cpu_backing_va) == 168, "");
 HELIOS_WDDM_STATIC_ASSERT(HELIOS_HWA2_FLAG_MASK ==
                               (HELIOS_HWA2_FLAG_PRIMARY | HELIOS_HWA2_FLAG_STEREO |
                                HELIOS_HWA2_FLAG_SHARED | HELIOS_HWA2_FLAG_DISPLAYABLE |

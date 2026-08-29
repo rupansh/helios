@@ -2945,6 +2945,9 @@ enum Hwa2Backing {
         /// those guest pages instead of a fresh host allocation — which is the
         /// whole two-buffer fix.
         cpu_backing_va: u64,
+        /// Its stated byte length. The MDL may not exceed it — the creator owns
+        /// exactly this much, and a longer lock would pin pages it does not.
+        cpu_backing_bytes: u64,
     },
 }
 
@@ -3062,7 +3065,11 @@ fn hwa2_is_standard_gdi_texture(desc: &HeliosWddmAllocationDescV2) -> bool {
 /// same producer (the tiled GDI texture from the CPU-visible GDI staging
 /// surface). Nothing reaches a permissive default: the one arm with no
 /// constructor is refused by name, and the one downgrade is counted by name.
-fn classify_hwa2(desc: &HeliosWddmAllocationDescV2) -> Result<Hwa2Backing, NTSTATUS> {
+fn classify_hwa2(
+    desc: &HeliosWddmAllocationDescV2,
+    cpu_backing_va: u64,
+    cpu_backing_bytes: u64,
+) -> Result<Hwa2Backing, NTSTATUS> {
     // Spelled ONCE and reached from four arms, for [`CreatedBacking`]'s reason:
     // the defect class here is arms that drift. Constructed eagerly because it
     // has no side effects; only one arm can ever move it.
@@ -3070,7 +3077,9 @@ fn classify_hwa2(desc: &HeliosWddmAllocationDescV2) -> Result<Hwa2Backing, NTSTA
         bytes: desc.byte_size,
         mappable: desc.has_flag(HELIOS_HWA2_FLAG_CPU_VISIBLE),
         shareable: desc.has_flag(HELIOS_HWA2_FLAG_SHARED),
-        cpu_backing_va: desc.cpu_backing_va,
+        // From the resource-level channel, never from `desc`.
+        cpu_backing_va,
+        cpu_backing_bytes,
     };
     match desc.allocation_kind {
         // The scan-out primary. Its bytes must be a real LINEAR VkImage the host
@@ -3170,6 +3179,12 @@ static GUEST_BACK_PROBE: AtomicU32 = AtomicU32::new(0);
 static GUEST_BACK_PFN: AtomicU32 = AtomicU32::new(0);
 static GUEST_BACK_BLOB: AtomicU32 = AtomicU32::new(0);
 static GUEST_BACK_IMPORT: AtomicU32 = AtomicU32::new(0);
+/// Bracket the create-output write for a VA-bearing record. The UMD sees the
+/// record come back byte-identical to what it sent, and there are three ways
+/// that happens; these separate them instead of narrating one.
+static GUEST_BACK_VIN_REJ: AtomicU32 = AtomicU32::new(0);
+static GUEST_BACK_VOUT_REJ: AtomicU32 = AtomicU32::new(0);
+static GUEST_BACK_WROTE: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) fn dump_guest_backing_counters() {
     for (name, counter) in [
@@ -3182,6 +3197,9 @@ pub(crate) fn dump_guest_backing_counters() {
         (&b"GbPfn"[..], &GUEST_BACK_PFN),
         (&b"GbBlob"[..], &GUEST_BACK_BLOB),
         (&b"GbImp"[..], &GUEST_BACK_IMPORT),
+        (&b"GbVIn"[..], &GUEST_BACK_VIN_REJ),
+        (&b"GbVOut"[..], &GUEST_BACK_VOUT_REJ),
+        (&b"GbWrote"[..], &GUEST_BACK_WROTE),
     ] {
         crate::diag::record_named_bytes(name, counter.load(Ordering::Relaxed));
     }
@@ -3209,13 +3227,19 @@ unsafe fn build_guest_backed_linear(
     passive: PassiveLevel,
     adapter: &AdapterContext,
     cpu_backing_va: u64,
+    cpu_backing_bytes: u64,
     bytes: u64,
 ) -> Option<CreatedBacking> {
     if !adapter.knobs().hwa2_guest_mem {
         GUEST_BACK_OFF.fetch_add(1, Ordering::Relaxed);
         return None;
     }
-    if cpu_backing_va == 0 {
+    // Page alignment is checked HERE, not in `validate_create_input`: the VA is
+    // consumed at the parse boundary and the record is already zero by the time
+    // any validator sees it. This is also the right place — it is where the
+    // value is used, and an unaligned start would make the MDL's first page
+    // cover bytes the creator does not wholly own.
+    if cpu_backing_va == 0 || cpu_backing_va & (PAGE as u64 - 1) != 0 {
         GUEST_BACK_NO_VA.fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -3230,6 +3254,13 @@ unsafe fn build_guest_backed_linear(
         GUEST_BACK_TOO_BIG.fetch_add(1, Ordering::Relaxed);
         return None;
     };
+    // ⛔ The MDL may not exceed what the creator says it owns. Locking past the
+    // end of that buffer would pin — and hand the host — pages belonging to
+    // something else in the same process.
+    if mapped > cpu_backing_bytes {
+        GUEST_BACK_TOO_BIG.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     let bytes = mapped;
     let page_count = (bytes >> 12) as usize;
     let mut entries = Vec::<VirtioGpuMemEntry>::new();
@@ -3460,6 +3491,7 @@ fn build_backing(
             mappable,
             shareable,
             cpu_backing_va,
+            cpu_backing_bytes,
         } => {
             // The creator's own pages first: that backing IS the application's
             // map pointer, so there is only one buffer. Every refusal is
@@ -3468,7 +3500,7 @@ fn build_backing(
             // SAFETY: `cpu_backing_va` is untrusted and is never dereferenced
             // here — see `build_guest_backed_linear`.
             if let Some(backing) =
-                unsafe { build_guest_backed_linear(passive, adapter, cpu_backing_va, bytes) }
+                unsafe { build_guest_backed_linear(passive, adapter, cpu_backing_va, cpu_backing_bytes, bytes) }
             {
                 dump_guest_backing_counters();
                 return Ok(backing);
@@ -3542,8 +3574,17 @@ struct CreateCallShape {
     /// `DXGKARG_CREATEALLOCATION::NumAllocations`.
     num_allocations: u32,
     /// `DXGKARG_CREATEALLOCATION::PrivateDriverDataSize` — the RESOURCE-level
-    /// private data. Both records require zero of it.
+    /// private data. HVM1 and HOC1 require zero of it.
     resource_private_size: u32,
+    /// The creator's own CPU buffer, from a `HeliosCpuBackingV1` in the
+    /// RESOURCE-level private data, or zero. It rides the resource-level
+    /// channel and NOT the allocation descriptor because that descriptor is
+    /// echoed: any nonzero tail byte in it makes dxgkrnl drop the KMD's
+    /// create-output write-back entirely (measured, 22.22.411.0, with a
+    /// fake-value control).
+    cpu_backing_va: u64,
+    /// Byte length of the buffer at [`Self::cpu_backing_va`], page-rounded.
+    cpu_backing_bytes: u64,
 }
 
 impl CreateCallShape {
@@ -3666,6 +3707,9 @@ unsafe fn admit_hwa2(
         crate::diag::record(0x0C01_0003);
         return Err(STATUS_INVALID_PARAMETER);
     };
+    // The creator's CPU buffer arrives on the RESOURCE-level channel, never in
+    // this record — see `CreateCallShape::cpu_backing_va`.
+    let offered_backing_va = shape.cpu_backing_va;
     if desc
         .validate_create_input(HELIOS_PACKAGE_GENERATION)
         .is_err()
@@ -3675,6 +3719,10 @@ unsafe fn admit_hwa2(
         // create/open fail; it never selects a legacy parser." There is
         // deliberately no fallback arm below this line.
         bump(&CREATE_HWA2_REJECT, b"AcHwa2Rej");
+        if offered_backing_va != 0 {
+            GUEST_BACK_VIN_REJ.fetch_add(1, Ordering::Relaxed);
+            dump_guest_backing_counters();
+        }
         crate::diag::record(0x0C01_0003);
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -3751,7 +3799,7 @@ unsafe fn admit_hwa2(
         }
     }
 
-    let backing_class = classify_hwa2(&desc)?;
+    let backing_class = classify_hwa2(&desc, offered_backing_va, shape.cpu_backing_bytes)?;
     let created = build_backing(passive, adapter, backing_class)?;
 
     // The extent the AUTHOR claimed, captured before the adoption below can move
@@ -3965,19 +4013,13 @@ unsafe fn admit_hwa2(
     // "the KMD never reached the write-back" from "the KMD wrote a good record
     // and it did not reach the UMD" — the UMD reports `AllocationGenerationZero`
     // for both, and they have opposite fixes.
-    if desc.cpu_backing_va != 0 {
+    // Already zero — consumed at the parse boundary. The witness stays because
+    // it is what proved the write happens.
+    let offered_pages = offered_backing_va != 0;
+    if offered_pages {
         crate::diag::record_named_bytes(b"GbWbGen", generation as u32);
         crate::diag::record_named_bytes(b"GbWbSz", private_size as u32);
     }
-
-    // ⛔ CLEAR THE CREATOR'S CPU-BUFFER VA FIRST, before the self-check — it is
-    // part of the output record, and `validate_create_output` refuses a record
-    // that still carries one. Clearing it after the check instead cost a whole
-    // deploy: every guest-backed create failed `AcHwa2Out`, which reads as a
-    // driver bug in the descriptor and is really just these two lines in the
-    // wrong order. The VA is a user-mode address in the CREATING process and
-    // means nothing in an opener's, which is why it may not be published.
-    desc.cpu_backing_va = 0;
 
     // Self-check BEFORE the write: the record this KMD is about to publish must
     // pass the validator every opener will run on it. A failure here is a driver
@@ -3989,6 +4031,10 @@ unsafe fn admit_hwa2(
         .is_err()
     {
         bump(&CREATE_HWA2_OUTPUT_REJECT, b"AcHwa2Out");
+        if offered_pages {
+            GUEST_BACK_VOUT_REJ.fetch_add(1, Ordering::Relaxed);
+            dump_guest_backing_counters();
+        }
         release_orphan_backing(passive, adapter, &created);
         return Err(STATUS_INVALID_PARAMETER);
     }
@@ -3999,6 +4045,13 @@ unsafe fn admit_hwa2(
     // which the assertion in `protocol` pins at 168.
     let out = unsafe { core::slice::from_raw_parts_mut(private, private_size) };
     out.copy_from_slice(bytes_of(&desc));
+    if offered_pages {
+        // The write HAPPENED, into a buffer of `private_size` bytes at
+        // `private`. If the UMD still reads its own bytes after this, the
+        // discard is dxgkrnl's, not a path this driver failed to take.
+        GUEST_BACK_WROTE.fetch_add(1, Ordering::Relaxed);
+        dump_guest_backing_counters();
+    }
     crate::diag::record(0x0C3B_0000 | (created.resource_id & 0xFFFF));
 
     // The pitch a byte-addressing consumer must use. For the LINEAR scan-out arm
@@ -4769,11 +4822,34 @@ pub unsafe extern "C" fn dxgkddi_create_allocation(
     // `input_resource`, not `args.hResource`: a newly created HVM1 resource and
     // bare HOC1 both require a null input handle. A handle this DDI minted is
     // output state, so reading it here would answer the wrong question.
+    // The creator's CPU-backing offer, if any. Total and bounded: anything that
+    // is not exactly a `HeliosCpuBackingV1` — absent, another length, another
+    // producer's magic, an unaligned VA — reads as "no pages offered".
+    let cpu_backing = if args.pPrivateDriverData.is_null() {
+        None
+    } else {
+        // SAFETY: dxgkrnl owns `PrivateDriverDataSize` readable bytes there for
+        // the call; the slice is bounded by that length and the parse requires
+        // the exact record size before reading any field.
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                args.pPrivateDriverData as *const u8,
+                args.PrivateDriverDataSize as usize,
+            )
+        };
+        helios_protocol::HeliosCpuBackingV1::from_private_data(bytes)
+    };
+    if let Some(record) = cpu_backing {
+        crate::diag::record_named_bytes(b"GbInVaLo", record.va as u32);
+        crate::diag::record_named_bytes(b"GbInSz", args.PrivateDriverDataSize);
+    }
     let shape = CreateCallShape {
         flags: create_flags,
         has_resource_handle: input_resource != 0,
         num_allocations: args.NumAllocations,
         resource_private_size: args.PrivateDriverDataSize,
+        cpu_backing_va: cpu_backing.map_or(0, |r| r.va),
+        cpu_backing_bytes: cpu_backing.map_or(0, |r| r.bytes),
     };
 
     for i in 0..args.NumAllocations as usize {

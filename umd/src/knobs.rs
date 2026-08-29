@@ -268,10 +268,15 @@ pub(crate) fn umd_lock_mode() -> u32 {
 /// this on and the KMD's off, the application's pointer is a heap buffer the
 /// GPU never touches, which is the 2026-08-29 defect exactly. Off by default
 /// for that reason, and both flip together once measured.
-pub(crate) static UMD_GUEST_BACKING: BoolKnob = BoolKnob::new(c"UmdGuestBacking", false);
+/// 0 = off, 1 = on. (An arm 2 existed briefly as an isolating control: it sent
+/// a FAKE page-aligned value in the descriptor and changed nothing else, and it
+/// is what proved a nonzero tail byte in the echoed record — not the buffer,
+/// not the mapping — is what made dxgkrnl drop the create-output write-back.
+/// The offer moved to the resource-level channel and the control went with it.)
+pub(crate) static UMD_GUEST_BACKING: DwordKnob = DwordKnob::new(c"UmdGuestBacking", 0);
 
 /// `HKLM\SOFTWARE\Helios!UmdGuestBacking` (REG_DWORD). See
 /// [`UMD_GUEST_BACKING`].
-pub(crate) fn umd_guest_backing() -> bool {
+pub(crate) fn umd_guest_backing() -> u32 {
     UMD_GUEST_BACKING.get()
 }

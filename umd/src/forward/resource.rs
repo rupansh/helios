@@ -662,19 +662,27 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
     }
 
     // `UmdGuestBacking`: OUR pages become the allocation's storage on both
-    // sides — pSystemMem for dxgkrnl, `cpu_backing_va` for the KMD to import as
-    // the venus memory. Off: no buffer, and the CPU view comes from pfnLockCb.
-    let mut cpu_backing = if crate::knobs::umd_guest_backing() && cpu_visible {
+    // sides — the KMD imports them as the venus memory, and they are what this
+    // UMD publishes as `cpu_mapping`. Off: no buffer, and the CPU view comes
+    // from `pfnLockCb`.
+    let mut cpu_backing = if crate::knobs::umd_guest_backing() == 1 && cpu_visible {
         let Some(backing) = helios_umd_common::cpu_backing::CpuBacking::new_page_rounded(bytes)
         else {
             log_error!("DXVK internal allocation REFUSED: no CPU backing for {} bytes", bytes);
             return Err(E_OUTOFMEMORY);
         };
-        desc.cpu_backing_va = backing.as_ptr() as u64;
         Some(backing)
     } else {
         None
     };
+    // The offer rides the RESOURCE-level buffer. It may NOT go in `desc`: that
+    // record is echoed, and any nonzero tail byte in it makes dxgkrnl drop the
+    // KMD's create-output write-back (isolated with a fake-value control on
+    // 22.22.411.0), after which the allocation fails this UMD's own output
+    // check with `AllocationGenerationZero`.
+    let mut cpu_backing_record = cpu_backing.as_ref().map(|b| {
+        helios_protocol::HeliosCpuBackingV1::new(b.as_ptr() as u64, b.bytes() as u64)
+    });
 
     let sent = desc;
     let private_ptr = (&mut desc as *mut HeliosWddmAllocationDescV2).cast();
@@ -690,8 +698,19 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
     // mode publishes the pointer directly instead of asking.
     allocation_info.__bindgen_anon_1.pSystemMem = core::ptr::null();
     let mut alloc = ddi::D3DDDICB_ALLOCATE::default();
-    alloc.pPrivateDriverData = private_ptr;
-    alloc.PrivateDriverDataSize = private_size;
+    // ⛔ It must NOT alias the allocation's, which is what it used to do.
+    // Either the CPU-backing offer or nothing.
+    match cpu_backing_record.as_mut() {
+        Some(record) => {
+            alloc.pPrivateDriverData = (record as *mut _ as *mut core::ffi::c_void).cast();
+            alloc.PrivateDriverDataSize =
+                u32::from(helios_protocol::HELIOS_CPU_BACKING_BYTES);
+        }
+        None => {
+            alloc.pPrivateDriverData = core::ptr::null_mut();
+            alloc.PrivateDriverDataSize = 0;
+        }
+    }
     alloc.hResource = core::ptr::null_mut();
     alloc.NumAllocations = 1;
     alloc.__bindgen_anon_1.pAllocationInfo2 = &mut allocation_info;
@@ -710,6 +729,25 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
         return Err(if hr != 0 { hr } else { E_OUTOFMEMORY });
     }
 
+    // The create-output write-back, from the pointer dxgkrnl was given. Kept:
+    // it is what proved the write-back exists at all and what will show it
+    // stopping again. `sent_gen` is always 0 — the generation is the KMD's to
+    // assign — so a nonzero `ptr_gen` IS the write-back having landed.
+    // SAFETY: `private_ptr` is `&mut desc` cast; the record is `Copy` and
+    // `private_size` bytes are valid for reads.
+    let returned = unsafe {
+        core::ptr::read_unaligned(private_ptr as *const HeliosWddmAllocationDescV2)
+    };
+    if returned.allocation_generation == 0 {
+        log_error!(
+            "DDI write-back MISSING: alloc=0x{:x} sent_gen={} local_gen={} ptr_gen={} size={}",
+            h_allocation,
+            sent.allocation_generation,
+            desc.allocation_generation,
+            returned.allocation_generation,
+            private_size
+        );
+    }
     if let Err(refusal) = desc.validate_create_output(HELIOS_PACKAGE_GENERATION) {
         log_error!(
             "DXVK internal allocation REFUSED: invalid HWA2 output {:?} alloc=0x{:x}",
@@ -723,11 +761,6 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
     let echoed = HeliosWddmAllocationDescV2 {
         allocation_generation: sent.allocation_generation,
         flags: desc.flags & !HELIOS_HWA2_FLAG_KMD_OWNED_MASK,
-        // The KMD CLEARS this on purpose: a user VA must never reach an opener,
-        // and `validate_create_output` refuses a record that still carries one.
-        // Normalising it here keeps the echo check about fields the KMD is
-        // forbidden to touch.
-        cpu_backing_va: sent.cpu_backing_va,
         ..desc
     };
     if echoed != sent {
@@ -1025,7 +1058,7 @@ pub(crate) unsafe fn allocate_wddm_resource(
 
     // `UmdGuestBacking`: OUR pages back the allocation on both sides. See the
     // identical block in `allocate_dxvk_internal_wddm_memory`.
-    let mut cpu_backing = if crate::knobs::umd_guest_backing() && needs_cpu_mapping {
+    let mut cpu_backing = if crate::knobs::umd_guest_backing() == 1 && needs_cpu_mapping {
         let Some(backing) =
             helios_umd_common::cpu_backing::CpuBacking::new_page_rounded(desc.byte_size)
         else {
@@ -1035,11 +1068,14 @@ pub(crate) unsafe fn allocate_wddm_resource(
             );
             return Err(E_OUTOFMEMORY);
         };
-        desc.cpu_backing_va = backing.as_ptr() as u64;
         Some(backing)
     } else {
         None
     };
+    // Resource-level channel, not the echoed descriptor. See the sibling site.
+    let mut cpu_backing_record = cpu_backing.as_ref().map(|b| {
+        helios_protocol::HeliosCpuBackingV1::new(b.as_ptr() as u64, b.bytes() as u64)
+    });
 
     let mut allocation_info = ddi::D3DDDI_ALLOCATIONINFO2::default();
     let private_ptr = (&mut desc as *mut HeliosWddmAllocationDescV2).cast();
@@ -1071,8 +1107,19 @@ pub(crate) unsafe fn allocate_wddm_resource(
     // surfaces are being allocated. Shared resources additionally return an
     // hKMResource, but the association itself is not optional for present-only
     // allocations.
-    alloc.pPrivateDriverData = private_ptr;
-    alloc.PrivateDriverDataSize = private_size;
+    // ⛔ NOT `private_ptr`: aliasing the allocation's record here gave dxgkrnl
+    // two copy-backs into one buffer. Either the CPU-backing offer or nothing.
+    match cpu_backing_record.as_mut() {
+        Some(record) => {
+            alloc.pPrivateDriverData = (record as *mut _ as *mut core::ffi::c_void).cast();
+            alloc.PrivateDriverDataSize =
+                u32::from(helios_protocol::HELIOS_CPU_BACKING_BYTES);
+        }
+        None => {
+            alloc.pPrivateDriverData = core::ptr::null_mut();
+            alloc.PrivateDriverDataSize = 0;
+        }
+    }
     alloc.hResource = h_rt.handle;
     alloc.NumAllocations = 1;
     alloc.__bindgen_anon_1.pAllocationInfo2 = &mut allocation_info;
@@ -1194,8 +1241,6 @@ pub(crate) unsafe fn allocate_wddm_resource(
         let echoed = HeliosWddmAllocationDescV2 {
             allocation_generation: sent.allocation_generation,
             flags: desc.flags & !HELIOS_HWA2_FLAG_KMD_OWNED_MASK,
-            // Cleared by the KMD on purpose; see the sibling site.
-            cpu_backing_va: sent.cpu_backing_va,
             ..desc
         };
         if echoed != sent {
