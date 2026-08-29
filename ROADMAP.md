@@ -242,6 +242,61 @@ lines crowded the 12 single-occurrence `create_blob` lines off the list. Count
 the event you care about explicitly; never read a null out of a truncated
 histogram.
 
+#### ⭐⭐⭐ 2026-08-29 FINAL: it is EXECUTION, not memory. Validated.
+
+`tools/d3d11_execution_witness_probe.cpp`. An occlusion query and
+PIPELINE_STATISTICS return through `vkGetQueryPoolResults` — a host CALL over
+the venus reply channel, not mapped memory — so they separate "never executes"
+from "executes into memory we do not map". **It runs the identical sequence on
+WARP first**, because this session twice published a conclusion from an
+instrument whose zero had never been shown capable of being nonzero:
+
+| | occlusion | iaVertices | vsInvocations | psInvocations |
+|---|---|---|---|---|
+| **WARP** (control) | 4096/4096 | 3 | 3 | 4224 |
+| **Helios** | **0**/4096 | **0** | **0** | **0** |
+
+⇒ **The input assembler never sees a vertex.** Every memory-aliasing theory —
+F16, Lock2, `pSystemMem`, `AccessedPhysically` — was the wrong layer, and that
+is why none of them changed anything. The whole "is the CPU view the host's
+memory" question is downstream of this and should be parked.
+
+Screen checked directly the same day (`schtasks /run /tn helios_paintcap`):
+**still black**. That is the goal and it is unmet.
+
+#### The guest half is exonerated, byte by byte
+
+| stage | evidence |
+|---|---|
+| D3D11 runtime calls our Draw DDI | `DDI bind_input_layout skipped` is logged from inside `draw()` (`pipeline.rs:290`) |
+| DXVK records it | its own log (`*_helios_umd_dxvk.log`) has no error, no pipeline failure |
+| ICD collects the recording | `HRA1 append streams=3 command_bytes=2176 payload=160` |
+| ICD assembles in the right order | deferred → object commands → **command streams** → **queue submit** (`helios_record_append`) |
+| ICD emits it | `HNS1 submit#18 bytes=2288 enq=17 cmp=17` |
+| ICD refuses nothing | `queue_submit_without_scope=0`, all refusal counters 0 except the deliberate WSI withhold list |
+| KMD accepts it | `Nr2OuterQ` and `Nr2OuterHost` both +2, `Nr2OuterRej=0` |
+| QEMU receives it | `virtio_gpu_cmd_ctx_submit ctx 0x1b, size 2288` |
+| host says nothing | no vkr decode error, no `vkQueueSubmit`/command-buffer validation anywhere in the boot |
+
+⇒ **A correct, complete, 2288-byte batch containing Begin..Draw..End reaches the
+host, and no vertex is processed.** The frontier is host-side decode/execute of
+the flattened record-only stream, and nothing above it.
+
+#### ✅ Fixed on the way, and it did NOT fix the display
+
+`bufferDeviceAddress` was enabled on **neither** arm of the session device:
+`dxvk_device_info.cpp` selected `VK_EXT_buffer_device_address` for record-only,
+and the host then rejected every pipeline declaring
+`PhysicalStorageBufferAddresses` — **769 `vkCreateGraphicsPipelines` + 29
+`vkCreateComputePipelines` + 874 `vkAllocateMemory` complaints in one boot**.
+Switched to the promoted Vulkan 1.2 feature (the EXT-only unbound-buffer arm is
+not exercised: the sole caller queries an already-bound buffer). Verified at
+both ends — guest `HD1 bdaEXT present=0` with sType 51 chained, host complaints
+for the whole class → **0**. The occlusion query stayed at 0, so this removed a
+real defect that was masking the layer below it.
+
+#### ⛔ Superseded: the memory-aliasing branch
+
 #### ⛔ 2026-08-29, LATER THE SAME DAY: the section below over-claims
 
 `Nr2BsVa` (KMD 22.22.391.0) records the VA the sampler actually read. It is
