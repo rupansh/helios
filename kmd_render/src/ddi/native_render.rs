@@ -350,13 +350,19 @@ const COUNTER_NAMES: [&[u8]; 43] = [
 /// The boundary counters that did not fit [`COUNTER_NAMES`]'s block, mirrored
 /// alongside it. Split only because a `CounterBlock` writes one registry value
 /// per entry and 27 is already the largest block in this driver.
-const BOUNDARY_NAMES: [&[u8]; 7] = [
+const BOUNDARY_NAMES: [&[u8]; 13] = [
     b"Nr2NoStage",
     b"Nr2NoEpoch",
     b"Nr2NoSchWho",
     b"Nr2CmpStale",
     b"Nr2DmaNtfF",
     b"Nr2DmaStale",
+    b"Nr2BsMap",
+    b"Nr2BsNz",
+    b"Nr2BsVal",
+    b"Nr2BsScan",
+    b"Nr2BsSeen",
+    b"Nr2BsCd",
     // Not a K6 counter by subject, but K6 is what made the hazard reachable:
     // `DxgkDdiPatch`/`DxgkDdiSubmitCommand` deliver the context through a
     // `hDevice`/`hContext` union. It is mirrored here because this block already
@@ -457,7 +463,13 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         f(BOUNDARY_NAMES[3], &crate::ddi::interrupt::ORDERED_COMPLETION_STALE),
         f(BOUNDARY_NAMES[4], &crate::ddi::submit_command::DMA_NOTIFY_FAILS),
         f(BOUNDARY_NAMES[5], &crate::ddi::submit_command::DMA_STALE_SKIP_COUNT),
-        f(BOUNDARY_NAMES[6], &crate::device::CONTEXT_HANDLE_REFUSED),
+        e(BOUNDARY_NAMES[6], &crate::ddi::create_allocation::BS_SAMPLE_MAPPED),
+        e(BOUNDARY_NAMES[7], &crate::ddi::create_allocation::BS_SAMPLE_NONZERO),
+        e(BOUNDARY_NAMES[8], &crate::ddi::create_allocation::BS_SAMPLE_VALUE),
+        e(BOUNDARY_NAMES[9], &crate::ddi::create_allocation::BS_SAMPLE_SCANS),
+        e(BOUNDARY_NAMES[10], &crate::ddi::create_allocation::BS_SAMPLE_SEEN),
+        e(BOUNDARY_NAMES[11], &crate::ddi::create_allocation::BS_SAMPLE_POISON),
+        f(BOUNDARY_NAMES[12], &crate::device::CONTEXT_HANDLE_REFUSED),
     ],
     ticks: &NR2_FLUSH_TICKS,
     failures: &NR2_FLUSH_FAILURES,
@@ -2226,6 +2238,9 @@ fn execute_outer_pending(
         {
             return Err(OuterExecutionRefusal::TransportMismatch);
         }
+        // Sample here, not at the operand patch: the import operand is patched
+        // at vkAllocateMemory time, when the pool is still empty.
+        guard.sample_backing_store();
         scratch.outer_generations[index] = guard.generation();
         allocations.push(guard);
     }
@@ -2664,6 +2679,9 @@ pub(crate) unsafe fn render_outer_physical(
                 STATUS_INVALID_PARAMETER,
             );
         }
+        // Sample here, not at the operand patch: the import operand is patched
+        // at vkAllocateMemory time, when the pool is still empty.
+        guard.sample_backing_store();
         scratch.outer_generations[index] = guard.generation();
         allocations.push(guard);
     }

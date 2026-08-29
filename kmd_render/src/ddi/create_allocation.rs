@@ -364,6 +364,35 @@ static CREATE_HVM1_REJECT: AtomicU32 = AtomicU32::new(0);
 /// validation refused (`AcHvm1Out`). Must read 0; same reasoning as
 /// [`CREATE_HWA2_OUTPUT_REJECT`].
 static CREATE_HVM1_OUTPUT_REJECT: AtomicU32 = AtomicU32::new(0);
+
+/// K2a backing-store aliasing probe (2026-08-29). The guest's `D3DKMTLock2`
+/// view of a host-visible allocation shows none of the GPU's writes, while the
+/// host demonstrably imports these very pages. These read the pages the host
+/// was given, so "the host wrote nothing" and "the guest is looking at a
+/// different buffer" stop being the same observation.
+/// Role-1 backing stores given a system mapping (`Nr2BsMap`).
+pub static BS_SAMPLE_MAPPED: AtomicU32 = AtomicU32::new(0);
+/// Samples that found a nonzero dword in one (`Nr2BsNz`).
+pub static BS_SAMPLE_NONZERO: AtomicU32 = AtomicU32::new(0);
+/// The last such dword (`Nr2BsVal`). The probe writes 0xCDCDCDCD through the
+/// Lock2 view, so that value here means the two views ARE the same memory.
+pub static BS_SAMPLE_VALUE: AtomicU32 = AtomicU32::new(0);
+/// Scans performed (`Nr2BsScan`), so a zero `Nr2BsNz` cannot be confused with
+/// an instrument that never ran.
+pub static BS_SAMPLE_SCANS: AtomicU32 = AtomicU32::new(0);
+/// Role-1 allocations the sampler was offered (`Nr2BsSeen`), whether or not one
+/// had a mapping to read.
+pub static BS_SAMPLE_SEEN: AtomicU32 = AtomicU32::new(0);
+/// Sampled backing stores containing [`BS_PROBE_POISON`] (`Nr2BsCd`). Only the
+/// guest CPU writes that value, and only through the D3DKMTLock2 view, so a
+/// nonzero count here is direct proof the two views are the same memory.
+pub static BS_SAMPLE_POISON: AtomicU32 = AtomicU32::new(0);
+/// What tools/d3d11_poison_copy_probe.cpp fills its staging textures with.
+const BS_PROBE_POISON: u32 = 0xCDCD_CDCD;
+/// System PTEs are a global lease; a per-allocation map is otherwise unbounded.
+const BS_SAMPLE_MAX: u32 = 8;
+/// Cap the all-zero case: this runs per use per submit.
+const BS_SAMPLE_MAX_SCANS: u32 = 20_000;
 /// HOC1 create-input records refused (`AcHoc1Rej`). §17.6:4419-4420 — "every
 /// other size/flag/cache/node/role combination fails allocation".
 static CREATE_HOC1_REJECT: AtomicU32 = AtomicU32::new(0);
@@ -1380,6 +1409,76 @@ impl OpenOuterUse {
         }
     }
 
+    /// Read the host's own copy of this allocation's pages.
+    ///
+    /// Only role-1 allocations that got one of the bounded system mappings are
+    /// readable; everything else returns without recording, so a zero
+    /// `Nr2BsNz` must be read together with `Nr2BsMap`.
+    pub(crate) fn sample_backing_store(&self) {
+        // SAFETY: as note_import_operand_substitution — the open object
+        // outlives this use guard and `allocation` is its canonical allocation.
+        let allocation = unsafe { self.open.as_ref() }.allocation;
+        if let Some(ctx) = (unsafe { resolve_alloc(allocation as HANDLE) }) {
+            sample_hvm1_backing(ctx);
+        }
+    }
+
+}
+
+/// Read the host's own copy of a host-visible allocation's pages.
+///
+/// `Nr2BsSeen` counts every role-1 allocation this was offered, so a zero
+/// `Nr2BsNz` cannot be read as "the instrument never met one".
+pub(crate) fn sample_hvm1_backing(ctx: &AllocationContext) {
+    {
+        if BS_SAMPLE_SCANS.load(Ordering::Relaxed) >= BS_SAMPLE_MAX_SCANS {
+            return;
+        }
+        if ctx.kind != ALLOC_KIND_HVM1
+            || ctx.hvm1_role != Hvm1Role::VulkanHostVisible.to_u32()
+        {
+            return;
+        }
+        BS_SAMPLE_SEEN.fetch_add(1, Ordering::Relaxed);
+        if ctx.backing_store_state.load(Ordering::Acquire) != BACKING_STORE_BOUND {
+            return;
+        }
+        let va = ctx.backing_store_va.load(Ordering::Relaxed);
+        if va == 0 {
+            return;
+        }
+        BS_SAMPLE_SCANS.fetch_add(1, Ordering::Relaxed);
+        // Stride across the WHOLE allocation rather than reading only its first
+        // page: DXVK suballocates, so any one offset may simply be unused.
+        let total_words = (ctx.size as usize) / 4;
+        let stride = core::cmp::max(1, total_words / 1024);
+        let mut found = 0u32;
+        let mut poison = false;
+        for index in (0..total_words).step_by(stride) {
+            // SAFETY: `va` is this allocation's MDL system mapping, kept alive
+            // by the guest blob resource that owns the MDL, and `index` stays
+            // below `total_words`, the mapped size in dwords.
+            let value = unsafe { core::ptr::read_volatile((va as *const u32).add(index)) };
+            if value == BS_PROBE_POISON {
+                poison = true;
+                found = value;
+                break;
+            }
+            if value != 0 && found == 0 {
+                found = value;
+            }
+        }
+        if found != 0 {
+            BS_SAMPLE_NONZERO.fetch_add(1, Ordering::Relaxed);
+            BS_SAMPLE_VALUE.store(found, Ordering::Relaxed);
+        }
+        if poison {
+            BS_SAMPLE_POISON.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl OpenOuterUse {
     pub(crate) fn transport_instance(&self) -> Option<u64> {
         self.execution
             .as_ref()
@@ -4607,6 +4706,18 @@ pub unsafe extern "C" fn dxgkddi_set_allocation_backing_store(
             return STATUS_NO_MEMORY;
         };
         kernel_va
+    } else if role == Hvm1Role::VulkanHostVisible
+        && BS_SAMPLE_MAPPED.load(Ordering::Relaxed) < BS_SAMPLE_MAX
+    {
+        // Diagnostic only, and non-fatal: failing to map costs a sample, not
+        // the allocation. See BS_SAMPLE_MAPPED.
+        match unsafe { k2a_mdl_system_va(mdl, bytes) } {
+            Some(va) => {
+                BS_SAMPLE_MAPPED.fetch_add(1, Ordering::Relaxed);
+                va
+            }
+            None => 0,
+        }
     } else {
         0
     };
@@ -4712,6 +4823,10 @@ pub unsafe extern "C" fn dxgkddi_destroy_allocation(
         let seq = DESTROY_ALLOC_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         step(b"DaStep", seq, 1);
         if let Some(ctx) = unsafe { take_alloc_ctx(handle) } {
+            // The render `uses` list never carries these pools, so teardown is
+            // where the sampler is guaranteed to meet one — and by then the
+            // process has written everything it is going to.
+            sample_hvm1_backing(&ctx);
             unsafe { destroy_allocation_ctx(passive, adapter, ctx, seq) };
         }
         step(b"DaStep", seq, 9);
