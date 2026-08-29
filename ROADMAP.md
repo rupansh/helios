@@ -213,18 +213,107 @@ reaches for a host-side mechanism again:
   protocol**. Reopening HPM1 means un-parking the branch *and* running its
   adversarial review first — review before reachable, not after.
 
-⇒ **Next, in order.** The question is what makes VidMm route a CPU lock through
-the aperture instead of a system-memory copy, and the untested levers are at the
-ALLOCATION, not the segment:
+### ⛔ 2026-08-30 — `ChMc = 0` IS STRUCTURAL. Route (II) cannot be finished by a knob.
 
-1. `VidMmPlacement::restricted_to_single_segment` — already a field, already
-   plumbed to `Flags2::RestrictedToSingleSegment`, and it is the documented way
-   to pin an allocation to one segment **without** removing the aperture from
-   the supported set, which is what E_INVALIDARGs. Cheapest and most likely.
-2. `EvictionSegmentSet` (currently 0) and `AccessedPhysically` (currently only
-   set for the primary).
-3. If neither moves `ChMc`, take the DxgKrnl ETW trace: it names why VidMm chose
-   a segment, and this is exactly the "AzureTriage in plain text" recipe.
+The DxgKrnl ETW trace was taken (`Microsoft-Windows-DxgKrnl`, all keywords,
+over one `d3d11_hostram_alias_probe` run, KMD 22.22.398.0). It names the
+mechanism, and the answer is that **no allocation-level or segment-level knob
+can put `DxgkDdiMapCpuHostAperture` on the CPU-lock path**, because VidMm does
+not use it for `Lock`. Two independent reasons, both measured:
+
+**1. The mapped class never reaches segment 2 at all.** Every resource DXVK
+actually maps arrives at VidMm as:
+
+```
+AdapterAllocStart  Flags="CpuVisible |Shareable"  size=4194304
+                   SupportedSegmentSet=1  PreferredSegment=1
+```
+
+Segment 1 is the linear aperture. That is **this driver's own rule** —
+`hwa2_may_prefer_local_memory` excludes `HELIOS_HWA2_FLAG_SHARED` — so segment
+2 and its aperture are not candidates for the whole mapped class. `BarLocalShare`
+is the A/B that readmits them; it is off, because on its own it only moves the
+class into case 2.
+
+**2. A CPU lock EVICTS an allocation out of segment 2.** For the allocations
+that do prefer it (`SupportedSegmentSet=3 PreferredSegment=2`):
+
+```
+ReserveResource  2, alloc   ->  ResidentInSeg seg=2   (paged in, fine)
+PageIn ; MarkAlloc ; ResidentInSeg seg=2 -4 MiB
+EvictAllocation  alloc
+AllocationFault  alloc  DXGKETW_ALLOCATIONFAULT_NOT_RESIDENT
+ReserveResource  3, alloc, Restriction=VidMmPlacementRestrictionApertureSegment
+LockAllocationBackingStore  x16
+```
+
+VidMm answers the lock by *moving the allocation to an aperture segment* and
+serving the pointer from the backing store. `MapCpuHostAperture` is not on that
+path, and `PgTo` (blob -> system MDL) is the copy.
+
+**Five single-variable arms, all falsified, each left in the tree as its A/B:**
+
+| arm | knob | result |
+|---|---|---|
+| segment `CpuVisible` + `SupportsCpuHostAperture` | `BarSegFlagsX=4` | boots `CM_PROB_NONE`; ETW re-taken and **identical**, evict and all |
+| `pfnLockCb` + `DonotEvict` | `UmdLockMode=1` | lock still succeeds, `MEM_PRIVATE`, stamps survive |
+| `pfnLock2Cb` | `UmdLockMode=2` | identical to mode 0 |
+| `restricted_to_single_segment` | — | **moot**: `ReserveResource` already reports `VidMmPlacementRestrictionNone` for these, and the restriction VidMm *chooses* on the lock is `ApertureSegment`. Pinning to one segment does not stop a move to a different one |
+| `EvictionSegmentSet` / `AccessedPhysically` | — | same reason; neither is consulted on the lock path |
+
+⚠ The .394/.395 `E_INVALIDARG` that argued against segment `CpuVisible` was
+taken with the aperture ALSO removed from the supported set — a confound. The
+pair alone boots fine. The bit is simply not what decides this.
+
+### ⭐⭐ WHERE THE TWO HALVES ARE ACTUALLY OFFERED: `MAP_APERTURE_SEGMENT`
+
+Because the mapped class lives in the **linear aperture segment**, its content
+pages are ordinary guest system pages, and dxgkrnl hands them to this driver on
+a plate:
+
+```c
+DXGK_OPERATION_MAP_APERTURE_SEGMENT
+  { hAllocation, SegmentId, OffsetInPages, NumberOfPages, pMdl, MdlOffset }
+```
+
+`pMdl` **is** the allocation's real storage. `build_paging_buffer.rs` dropped it
+— the operation fell into `PagingOperation::Other`, the null engine — while the
+GPU side of the same allocation is a separately allocated *host-side* venus
+blob. That is the two-buffer defect, at the exact DDI where WDDM offers to join
+the two halves.
+
+`767df92` NAMES the operation (no behaviour change yet) and adds the census the
+next step needs: `PgAm`/`PgAu` counts, and `PgAbN`/`PgAbR`/`PgAbS`/`PgAbPlo`/
+`PgAbPhi` for maps of >= 1024 pages. **48 aperture maps land before a probe even
+runs.**
+
+⭐ **The census is cross-validated by an oracle outside the guest.** `PgAbP*`
+is a guest page frame; QEMU's own `virtio_gpu_virgl_guest_blob_backing` trace
+reports byte-identical first GPAs for the same resource ids:
+
+| KMD census | QEMU trace |
+|---|---|
+| resid 255, pfn 1907019 -> `0x1d194b000` | `res 0xff, size 4194304, ranges 221, first 0x1d194b000` |
+| resid 258, pfn 8832424 -> `0x86c5a8000` | `res 0x102, ranges 872, first 0x86c5a8000` |
+| resid 260, pfn 1338488 -> `0x146c78000` | `res 0x104, ranges 223, first 0x146c78000` |
+
+So the KMD's view of guest physical memory is provably right, and QEMU can
+already read any page the aperture names. ⛔ `xp` on all three during the
+probe's stamp window reads **zero** — the application's stamps are not in the
+allocation's own pages, which is the root cause restated with a new instrument
+rather than a new theory.
+
+⇒ **Next.** Not another knob. Service `MAP_APERTURE_SEGMENT`: back the
+allocation's host resource with the MDL's guest pages
+(`resource_create_guest_blob` already does exactly this for HVM1 — same
+scatter-gather memory-entry list, same host path, 200-900 ranges per 4 MiB) and
+stop allocating a separate host-side blob for it. This is route (I)'s goal
+reached through the documented WDDM mechanism the OS is already driving:
+no HPM1, no new QEMU protocol, no ICD session execute, and no 4 MiB udmabuf cap.
+⚠ Two things to establish first: which paging op sequence owns the swap
+(`MapApertureSegment` can arrive after the venus blob exists), and whether the
+census's big maps are the D3D11 textures or the HVM1 pool — the three sampled
+above resolve to guest-blob-backed resources, which HWA2 textures are not.
 
 ---
 
