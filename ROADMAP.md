@@ -150,21 +150,47 @@ fixes: a black desktop becomes no desktop. Two sub-limits to carry forward — a
 host-visible allocations; the size is rounded up, and sub-page requests fall
 back).
 
-**(II) Restore the CPU host aperture** — the pre-retirement design, and the one
-the rest of the driver still assumes: `build_paging_buffer.rs` states outright
-that *"A BAR-segment allocation's content IS its venus blob (the CPU host
-aperture exposes the blob bytes — `cpu_host_aperture.rs`)"*. That file was
-**deleted by K1 in `60a9988`** (490 lines) along with `blob_map.rs` (193), and
-`DxgkDdiMapCpuHostAperture` is `None` today with no segment advertising
-`SupportsCpuHostAperture`. Recover it with
-`git show 60a9988^:kmd_render/src/ddi/cpu_host_aperture.rs`. No 4 MiB cap, no
-page-granularity limit, and — decisively — **it does not touch the record-only
-submission machinery at all**, which is where route (I) keeps snagging. Costs a
-segment-table change and carries the Code-43 history the CLAUDE.md invariant
-records.
+**(II) Restore the CPU host aperture — LANDED, NOT YET EFFECTIVE** (`4f4b949`,
+KMD 22.22.397.0). K1 (`60a9988`) deleted `cpu_host_aperture.rs` as part of a
+demolition whose rebuild K2 was **never started** — all three of K2's files are
+still absent and HPM1 was later parked (F5) — so CPU visibility of allocation
+content was left with no owner and the UMD's `CpuBacking` filled the hole.
+`build_paging_buffer.rs` has asserted a false property since 2026-08-21.
 
-⇒ Route (I) is one plumbing change from working and iterates in minutes; route
-(II) is the general fix and avoids the ring/session hazard entirely.
+What is in and working:
+
+* `cpu_host_aperture.rs` restored, keeping the two lessons the deleted file paid
+  for: ONE validation rule for both IRQL paths, and the legal-status rules
+  (never `STATUS_UNSUCCESSFUL` — out of the DDI's set, costs the whole VidPn;
+  defer with `STATUS_NO_MEMORY`).
+* `ctrl::map_blob_at` — maps at the EXACT window offset dxgkrnl chose.
+* Segment 2 (the LAST, per the Code-43 invariant) carries the window and
+  advertises `SupportsCpuHostAperture` + `SupportsCachedCpuHostAperture` +
+  `CacheCoherent`, union made exclusive by construction.
+* The UMD takes `cpu_mapping` from `pfnLockCb`, `pSystemMem = NULL` — what
+  `resource_association.rs` always documented it to be.
+* ✅ **The adapter boots `CM_PROB_NONE` with the aperture-capable segment**,
+  across five KMD versions. That was the single biggest risk in the change.
+
+⛔ **The gap: `ChMc = 0`.** dxgkrnl never calls `DxgkDdiMapCpuHostAperture`, so
+the Lock2 view is still system pages and the poison still survives. Forcing it
+by removing the aperture from the allocation's supported segment set makes
+`pfnAllocateCb` refuse every CPU-visible allocation with `E_INVALIDARG` —
+measured on .394/.395/.396 across three segment-flag shapes including the
+historical `BarSegFlags = 0x1C`, **so it is not the segment flags**.
+
+⇒ **Next, in order.** The question is what makes VidMm route a CPU lock through
+the aperture instead of a system-memory copy, and the untested levers are at the
+ALLOCATION, not the segment:
+
+1. `VidMmPlacement::restricted_to_single_segment` — already a field, already
+   plumbed to `Flags2::RestrictedToSingleSegment`, and it is the documented way
+   to pin an allocation to one segment **without** removing the aperture from
+   the supported set, which is what E_INVALIDARGs. Cheapest and most likely.
+2. `EvictionSegmentSet` (currently 0) and `AccessedPhysically` (currently only
+   set for the primary).
+3. If neither moves `ChMc`, take the DxgKrnl ETW trace: it names why VidMm chose
+   a segment, and this is exactly the "AzureTriage in plain text" recipe.
 
 ---
 
