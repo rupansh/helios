@@ -206,6 +206,30 @@ static BAR_LAST_VIRTUAL_DST: AtomicU64 = AtomicU64::new(0);
 /// have no CPU byte mapping; attempting RESOURCE_MAP_BLOB is a contract error.
 static BAR_DEVICE_OP_SKIPS: AtomicU32 = AtomicU32::new(0);
 
+// ── APERTURE-SEGMENT CENSUS (instrument only; the ops still run the null engine)
+//
+// DxgKrnl ETW, 2026-08-30: EVERY CPU-mapped D3D11 resource DXVK creates is
+// placed in segment 1, the linear APERTURE segment, and dxgkrnl then hands this
+// driver the allocation's real content pages through
+// `DXGK_OPERATION_MAP_APERTURE_SEGMENT`'s `pMdl`. Those are the same pages the
+// application's `Map()` pointer addresses. The driver drops them: the operation
+// falls to `PagingOperation::Other`. That is the two-buffer defect at the exact
+// DDI where WDDM offers to join the two halves, so it gets a census with the
+// MDL's first page frame in it — a page frame is a GUEST PHYSICAL address, which
+// QMP `xp` can read from outside the whole stack.
+static BAR_APMAP: AtomicU32 = AtomicU32::new(0);
+static BAR_APUNMAP: AtomicU32 = AtomicU32::new(0);
+static BAR_APMAP_LAST_PAGES: AtomicU32 = AtomicU32::new(0);
+static BAR_APMAP_LAST_PFN: AtomicU64 = AtomicU64::new(0);
+static BAR_APMAP_LAST_RESID: AtomicU32 = AtomicU32::new(0);
+static BAR_APMAP_LAST_SEG: AtomicU32 = AtomicU32::new(0);
+static BAR_APMAP_NULL_MDL: AtomicU32 = AtomicU32::new(0);
+/// Same, filtered to maps of >= 1024 pages, so the 4 MiB subject of
+/// `d3d11_hostram_alias_probe` stays readable after smaller maps follow it.
+static BAR_APBIG_PAGES: AtomicU32 = AtomicU32::new(0);
+static BAR_APBIG_PFN: AtomicU64 = AtomicU64::new(0);
+static BAR_APBIG_RESID: AtomicU32 = AtomicU32::new(0);
+
 /// The BAR paging counter block, mirrored into the registry through the shared
 /// throttled emitter (R317). Named values and encodings are unchanged; only the
 /// cadence is — this ran at the tail of EVERY content op, i.e. 26 synchronous
@@ -239,6 +263,16 @@ static PAGING_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(b"PgDi", &BAR_DEVICE_OP_SKIPS),
         f(b"PgEh", &BAR_ERR_XFER_HANDLE),
         f(b"PgFh", &BAR_ERR_FILL_HANDLE),
+        e(b"PgAm", &BAR_APMAP),
+        e(b"PgAu", &BAR_APUNMAP),
+        e(b"PgAmN", &BAR_APMAP_LAST_PAGES),
+        e64(b"PgAmP", &BAR_APMAP_LAST_PFN),
+        e(b"PgAmR", &BAR_APMAP_LAST_RESID),
+        e(b"PgAmS", &BAR_APMAP_LAST_SEG),
+        f(b"PgAmE", &BAR_APMAP_NULL_MDL),
+        e(b"PgAbN", &BAR_APBIG_PAGES),
+        e64(b"PgAbP", &BAR_APBIG_PFN),
+        e(b"PgAbR", &BAR_APBIG_RESID),
     ],
     ticks: &PAGING_FLUSH_TICKS,
     failures: &PAGING_FLUSH_FAILURES,
@@ -1015,6 +1049,14 @@ enum PagingOperation<'a> {
     DiscardContent(&'a _DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_3),
     VirtualFill(&'a DXGK_BUILDPAGINGBUFFER_FILLVIRTUAL),
     VirtualTransfer(&'a DXGK_BUILDPAGINGBUFFER_TRANSFERVIRTUAL),
+    /// ⚠ NAMED, NOT SERVICED. `pMdl` is the allocation's real content storage
+    /// in the linear aperture segment — the same pages the application's map
+    /// pointer addresses — and this driver still answers the null engine, which
+    /// is why the GPU's host-side blob and the application's buffer are two
+    /// unrelated allocations. Named so the census below exists and so a future
+    /// implementation is a decision here rather than a new wildcard arm.
+    MapAperture(&'a _DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_6),
+    UnmapAperture(&'a _DXGKARG_BUILDPAGINGBUFFER__bindgen_ty_1__bindgen_ty_7),
     /// Any operation this driver does not service — the null engine.
     Other,
 }
@@ -1048,6 +1090,12 @@ impl<'a> PagingOperation<'a> {
                 PagingOp::DXGK_OPERATION_VIRTUAL_TRANSFER => {
                     Self::VirtualTransfer(args.__bindgen_anon_1.TransferVirtual.as_ref())
                 }
+                PagingOp::DXGK_OPERATION_MAP_APERTURE_SEGMENT => {
+                    Self::MapAperture(args.__bindgen_anon_1.MapApertureSegment.as_ref())
+                }
+                PagingOp::DXGK_OPERATION_UNMAP_APERTURE_SEGMENT => {
+                    Self::UnmapAperture(args.__bindgen_anon_1.UnmapApertureSegment.as_ref())
+                }
                 _ => Self::Other,
             }
         }
@@ -1068,6 +1116,72 @@ impl<'a> PagingOperation<'a> {
                 | Self::VirtualTransfer(_)
         )
     }
+}
+
+/// Record what an aperture map/unmap carried, without servicing it.
+///
+/// ⚠ INSTRUMENT ONLY — the operation still answers the null engine, exactly as
+/// before. What it publishes is the one number no guest-side counter can stand
+/// in for: the MDL's first page frame, i.e. a GUEST PHYSICAL address, which QMP
+/// `xp` reads from outside the guest. If the application's stamps appear there,
+/// the aperture MDL IS the application's buffer and joining it to the host is
+/// the fix; if they do not, this whole lead is dead in one reading.
+///
+/// # Safety
+/// The descriptor and its `pMdl` are dxgkrnl-owned and valid for the call. The
+/// PFN array follows the MDL header (`MmGetMdlPfnArray`) and is populated for a
+/// locked MDL, which a paging MDL always is.
+unsafe fn record_aperture_census(operation: &PagingOperation<'_>) {
+    let map = match operation {
+        PagingOperation::MapAperture(m) => *m,
+        PagingOperation::UnmapAperture(u) => {
+            BAR_APUNMAP.fetch_add(1, Ordering::Relaxed);
+            BAR_APMAP_LAST_SEG.store(u.SegmentId, Ordering::Relaxed);
+            return;
+        }
+        _ => return,
+    };
+    BAR_APMAP.fetch_add(1, Ordering::Relaxed);
+    let pages = map.NumberOfPages as u32;
+    BAR_APMAP_LAST_PAGES.store(pages, Ordering::Relaxed);
+    BAR_APMAP_LAST_SEG.store(map.SegmentId, Ordering::Relaxed);
+    // Zero when the allocation is not one of ours; that is itself the reading.
+    let resid = unsafe { paging_alloc_info(map.hAllocation) }.map_or(0, |a| a.resource_id);
+    BAR_APMAP_LAST_RESID.store(resid, Ordering::Relaxed);
+    if map.pMdl.is_null() {
+        BAR_APMAP_NULL_MDL.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    // SAFETY: `MmGetMdlPfnArray` is `(PPFN_NUMBER)(Mdl + 1)` — the PFN array
+    // immediately follows the header. `MdlOffset` is in pages from its start.
+    let pfn = unsafe {
+        let array = map.pMdl.add(1) as *const usize;
+        core::ptr::read_unaligned(array.add(map.MdlOffset as usize)) as u64
+    };
+    BAR_APMAP_LAST_PFN.store(pfn, Ordering::Relaxed);
+    if pages < 1024 {
+        return;
+    }
+    BAR_APBIG_PAGES.store(pages, Ordering::Relaxed);
+    BAR_APBIG_PFN.store(pfn, Ordering::Relaxed);
+    BAR_APBIG_RESID.store(resid, Ordering::Relaxed);
+    // Published HERE rather than through `PAGING_COUNTERS`: that block flushes
+    // on every 64th CONTENT op, and an aperture map is not one — a whole probe
+    // run produces a handful of them and no transfers, so the throttled path
+    // would never write. Gated to >= 1024 pages so the write rate stays bounded
+    // by the 4 MiB-and-up class instead of DWM's ordinary churn.
+    // SAFETY: KeGetCurrentIrql is callable at any IRQL.
+    if unsafe { KeGetCurrentIrql() } != PASSIVE_LEVEL_IRQL {
+        return;
+    }
+    crate::diag::record_named_bytes(b"PgAm", BAR_APMAP.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PgAu", BAR_APUNMAP.load(Ordering::Relaxed));
+    crate::diag::record_named_bytes(b"PgAbN", pages);
+    crate::diag::record_named_bytes(b"PgAbR", resid);
+    crate::diag::record_named_bytes(b"PgAbS", map.SegmentId);
+    // Split: a page frame is up to 52 bits and the ring value is 32.
+    crate::diag::record_named_bytes(b"PgAbPlo", (pfn & 0xFFFF_FFFF) as u32);
+    crate::diag::record_named_bytes(b"PgAbPhi", (pfn >> 32) as u32);
 }
 
 /// Which end of a classic TRANSFER a `DXGK_TRANSFERVIRTUAL`-style descriptor
@@ -1196,6 +1310,9 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
     // The content-op set is a method on the parsed value, so it cannot drift
     // from the dispatch below.
     if !operation.is_content_op() {
+        // SAFETY: the arms carry dxgkrnl-owned descriptors valid for the call,
+        // and `record_aperture_census` only reads them plus the MDL's PFN array.
+        unsafe { record_aperture_census(&operation) };
         return STATUS_SUCCESS;
     }
     // Content ops need PASSIVE (host round-trips, Mm mapping calls). The DDI
@@ -1287,7 +1404,10 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         // Exhaustive: `is_content_op` already returned for these, so reaching
         // them here is impossible. Named rather than wildcarded so a new variant
         // is a compile error in BOTH places at once.
-        PagingOperation::UpdatePageTable(_) | PagingOperation::Other => PagingOpOutcome::NotOurs,
+        PagingOperation::UpdatePageTable(_)
+        | PagingOperation::MapAperture(_)
+        | PagingOperation::UnmapAperture(_)
+        | PagingOperation::Other => PagingOpOutcome::NotOurs,
     };
     dump_bar_counters(passive);
     match outcome {

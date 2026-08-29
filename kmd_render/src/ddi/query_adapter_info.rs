@@ -827,6 +827,9 @@ struct SegmentDescriptorSpec {
     application_target: bool,
     local_budget_group: bool,
     cpu_access: CpuAccess,
+    /// Extra `DXGK_SEGMENTFLAGS` bits OR'd in AFTER the named ones
+    /// (`BarSegFlagsX`; 0 for every constructor but [`Self::local`]).
+    extra_flags: u32,
 }
 
 impl SegmentDescriptorSpec {
@@ -846,6 +849,7 @@ impl SegmentDescriptorSpec {
             application_target: false,
             local_budget_group: false,
             cpu_access: CpuAccess::None,
+            extra_flags: 0,
         }
     }
 
@@ -857,7 +861,14 @@ impl SegmentDescriptorSpec {
     /// window has to be one dxgkrnl asks us to populate per allocation. That is
     /// exactly `SupportsCpuHostAperture`, and `DxgkDdiMapCpuHostAperture` is
     /// where the allocation's blob gets mapped at the offset dxgkrnl chose.
-    const fn local(base: u64, len: u64, direct_flip: bool, gpa: u64, pages: u32) -> Self {
+    const fn local(
+        base: u64,
+        len: u64,
+        direct_flip: bool,
+        gpa: u64,
+        pages: u32,
+        extra_flags: u32,
+    ) -> Self {
         Self {
             base: base as i64,
             size: len as SIZE_T,
@@ -868,6 +879,7 @@ impl SegmentDescriptorSpec {
             application_target: true,
             local_budget_group: true,
             cpu_access: CpuAccess::HostAperture { gpa, pages },
+            extra_flags,
         }
     }
 
@@ -898,16 +910,11 @@ impl SegmentDescriptorSpec {
                     f.set_LocalBudgetGroup(1);
                 }
                 if let CpuAccess::HostAperture { .. } = self.cpu_access {
-                    // ⛔ CpuVisible stays OFF. The two are alternatives, not a
-                    // pair: the header makes `CpuTranslatedAddress` the member
-                    // for `CpuVisible && !SupportsCpuHostAperture`, and this
-                    // segment has no flat CPU-addressable range to name there --
-                    // it holds venus blobs, each mapped into the window on
-                    // demand. Setting both made pfnAllocateCb refuse every
-                    // CPU-visible allocation with E_INVALIDARG (measured,
-                    // 22.22.394.0 and .395.0). This is the historical
-                    // `BarSegFlags = 0x1C` shape: CacheCoherent +
-                    // SupportsCpuHostAperture + SupportsCachedCpuHostAperture.
+                    // The historical `BarSegFlags = 0x1C` shape. `CpuVisible`
+                    // is NOT set here; `BarSegFlagsX=4` adds it. The .394/.395
+                    // E_INVALIDARG that argued against setting both was taken
+                    // with the aperture ALSO removed from the allocation's
+                    // supported set, so the pair was never measured alone.
                     f.set_CacheCoherent(1);
                     f.set_SupportsCpuHostAperture(1);
                     // The window is RAM-backed host shmem, cache-coherent on
@@ -916,6 +923,9 @@ impl SegmentDescriptorSpec {
                     f.set_SupportsCachedCpuHostAperture(1);
                 }
             }
+            // AFTER the named bits, so the knob can only ADD to the word this
+            // driver decided on. `Value` is the same storage as the bitfields.
+            s.Flags.__bindgen_anon_1.Value |= self.extra_flags;
             if let CpuAccess::HostAperture { gpa, pages } = self.cpu_access {
                 // The union: writing CpuHostAperture is exclusive with
                 // CpuTranslatedAddress by construction (see `CpuAccess`).
@@ -1018,6 +1028,7 @@ unsafe fn write_local_memory_descriptor(
     len: u64,
     aperture_gpa: u64,
     aperture_len: u64,
+    extra_flags: u32,
 ) {
     let pages = u32::try_from(aperture_len >> 12).unwrap_or(u32::MAX);
     unsafe {
@@ -1027,6 +1038,7 @@ unsafe fn write_local_memory_descriptor(
             crate::virtio::KMD_D2_OWNER_ENABLED,
             aperture_gpa,
             pages,
+            extra_flags,
         )
         .write_into_v4(seg)
     };
@@ -1130,6 +1142,7 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
                             size,
                             aperture_gpa,
                             aperture_len,
+                            adapter.knobs().bar_seg_flags_extra,
                         )
                     };
                 }

@@ -14,16 +14,22 @@ use helios_protocol::{
 /// preferred. Before HWA2, the equivalent UMD-owned shared/present resources
 /// were also excluded from local placement after that class destabilized the
 /// LogonUI/DWM path; K8's generic local-memory conversion lost the class term.
+/// DxgKrnl ETW, 2026-08-30: every resource DXVK actually maps arrives
+/// `CpuVisible|Shareable` with `SupportedSegmentSet = 1`, so the SHARED term
+/// alone keeps the CPU host aperture off the table for the whole mapped class.
+/// `allow_shared` (`BarLocalShare`, default false) is the A/B for re-testing
+/// it; the default stays the measured exclusion.
 pub fn hwa2_may_prefer_local_memory(
     desc: &HeliosWddmAllocationDescV2,
     host_authoritative_backing: bool,
     local_segment_present: bool,
+    allow_shared: bool,
 ) -> bool {
     host_authoritative_backing
         && local_segment_present
         && desc.swizzle_class != HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL
         && desc.has_flag(HELIOS_HWA2_FLAG_CPU_VISIBLE)
-        && !desc.has_flag(HELIOS_HWA2_FLAG_SHARED)
+        && (allow_shared || !desc.has_flag(HELIOS_HWA2_FLAG_SHARED))
 }
 
 #[cfg(test)]
@@ -46,7 +52,8 @@ mod tests {
         assert!(hwa2_may_prefer_local_memory(
             &ordinary_cpu_visible(),
             true,
-            true
+            true,
+            false
         ));
     }
 
@@ -54,22 +61,51 @@ mod tests {
     fn shared_dwm_texture_remains_aperture_only() {
         let mut desc = ordinary_cpu_visible();
         desc.flags |= HELIOS_HWA2_FLAG_SHARED;
-        assert!(!hwa2_may_prefer_local_memory(&desc, true, true));
+        assert!(!hwa2_may_prefer_local_memory(&desc, true, true, false));
+    }
+
+    #[test]
+    fn bar_local_share_knob_readmits_the_shared_class() {
+        let mut desc = ordinary_cpu_visible();
+        desc.flags |= HELIOS_HWA2_FLAG_SHARED;
+        assert!(hwa2_may_prefer_local_memory(&desc, true, true, true));
+    }
+
+    #[test]
+    fn the_knob_relaxes_only_the_shared_term() {
+        // It must not resurrect an OPAQUE_OPTIMAL or unbacked allocation.
+        let mut opaque = ordinary_cpu_visible();
+        opaque.swizzle_class = HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL;
+        assert!(!hwa2_may_prefer_local_memory(&opaque, true, true, true));
+        assert!(!hwa2_may_prefer_local_memory(
+            &ordinary_cpu_visible(),
+            false,
+            true,
+            true
+        ));
+        assert!(!hwa2_may_prefer_local_memory(
+            &ordinary_cpu_visible(),
+            true,
+            false,
+            true
+        ));
     }
 
     #[test]
     fn opaque_or_unbacked_resource_cannot_prefer_local_memory() {
         let mut opaque = ordinary_cpu_visible();
         opaque.swizzle_class = HELIOS_HWA2_SWIZZLE_OPAQUE_OPTIMAL;
-        assert!(!hwa2_may_prefer_local_memory(&opaque, true, true));
+        assert!(!hwa2_may_prefer_local_memory(&opaque, true, true, false));
         assert!(!hwa2_may_prefer_local_memory(
             &ordinary_cpu_visible(),
             false,
-            true
+            true,
+            false
         ));
         assert!(!hwa2_may_prefer_local_memory(
             &ordinary_cpu_visible(),
             true,
+            false,
             false
         ));
     }

@@ -614,6 +614,29 @@ pub mod knobs {
     /// `direct_scanout::start`; it leaks one window mapping per scanned-out
     /// resource on purpose.
     pub const PIXEL_PROBE: KnobName = KnobName::new(b"D2PxProbe");
+    /// Extra `DXGK_SEGMENTFLAGS` bits OR'd into the LOCAL (segment 2)
+    /// descriptor only. Default 0 = the driver's own word, bit-identical to a
+    /// build without this knob.
+    ///
+    /// The subject it exists to test is `CpuVisible` (0x04). DxgKrnl ETW
+    /// (2026-08-30) shows VidMm answering a CPU lock of a segment-2 allocation
+    /// by EVICTING it and re-reserving with
+    /// `VidMmPlacementRestrictionApertureSegment`, i.e. it does not treat
+    /// segment 2 as CPU-reachable and never calls `DxgkDdiMapCpuHostAperture`.
+    /// `d3dkmddi.h`'s union comment makes `CpuVisible` the "CPU can reach this
+    /// segment" flag and `SupportsCpuHostAperture` only how; the two were never
+    /// measured together with the aperture still in the allocation's supported
+    /// set. Read at AddAdapter, so `pnputil /restart-device` applies it.
+    pub const BAR_SEG_FLAGS_EXTRA: KnobName = KnobName::new(b"BarSegFlagsX");
+    /// Let an HWA2 `SHARED` allocation prefer local memory (default 0 = no).
+    ///
+    /// Same ETW run: every resource DXVK actually maps arrives
+    /// `CpuVisible|Shareable` with `SupportedSegmentSet = 1` — segment 2 is not
+    /// even a candidate — because `hwa2_may_prefer_local_memory` excludes
+    /// SHARED. The exclusion was earned (local placement destabilized
+    /// LogonUI/DWM), so it stays the default; this is the A/B for re-testing it
+    /// once a CPU lock can be served in place. Read at AddAdapter.
+    pub const BAR_LOCAL_SHARED: KnobName = KnobName::new(b"BarLocalShare");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.

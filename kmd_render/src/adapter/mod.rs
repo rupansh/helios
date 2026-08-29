@@ -121,6 +121,15 @@ pub(crate) struct AdapterKnobs {
     /// with was a `const false` and went with T6/R905; this knob is now the only
     /// way to set the bit.
     pub cross_adapter: bool,
+    /// `BarSegFlagsX` (default 0). Extra `DXGK_SEGMENTFLAGS` bits OR'd into the
+    /// LOCAL segment descriptor only; 0 emits the driver's own word unchanged.
+    /// See [`crate::diag::knobs::BAR_SEG_FLAGS_EXTRA`] for the measurement it
+    /// exists to run.
+    pub bar_seg_flags_extra: u32,
+    /// `BarLocalShare` (default 0 = off). Nonzero lets an HWA2 `SHARED`
+    /// allocation prefer local memory. See
+    /// [`crate::diag::knobs::BAR_LOCAL_SHARED`].
+    pub bar_local_shared: bool,
 }
 
 impl AdapterKnobs {
@@ -136,6 +145,8 @@ impl AdapterKnobs {
         alloc_cached: true,
         display_half: true,
         cross_adapter: false,
+        bar_seg_flags_extra: 0,
+        bar_local_shared: false,
     };
 
     /// Read every knob once. PASSIVE_LEVEL.
@@ -150,6 +161,8 @@ impl AdapterKnobs {
             alloc_cached: read_config_dword(knobs::ALLOC_CACHED, 1) != 0,
             display_half: read_config_dword(knobs::DISPLAY_HALF, 1) != 0,
             cross_adapter: read_config_dword(knobs::CROSS_ADAPT_CAPS, 0) != 0,
+            bar_seg_flags_extra: read_config_dword(knobs::BAR_SEG_FLAGS_EXTRA, 0),
+            bar_local_shared: read_config_dword(knobs::BAR_LOCAL_SHARED, 0) != 0,
         }
     }
 
@@ -159,6 +172,10 @@ impl AdapterKnobs {
         let knobs = Self::read();
         crate::diag::record_named_bytes(b"AlcC", knobs.alloc_cached as u32);
         crate::diag::record_named_bytes(b"DspH", knobs.display_half as u32);
+        // Mirror the arm actually in force: a knob whose value is not in the
+        // transcript cannot be told apart from the default it silently took.
+        crate::diag::record_named_bytes(b"BarSgX", knobs.bar_seg_flags_extra);
+        crate::diag::record_named_bytes(b"BarLcS", knobs.bar_local_shared as u32);
         knobs
     }
 }

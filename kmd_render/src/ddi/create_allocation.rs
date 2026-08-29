@@ -3746,6 +3746,7 @@ unsafe fn admit_hwa2(
             &desc,
             created.blob_size.is_host_authoritative(),
             local_seg_id.is_some(),
+            adapter.knobs().bar_local_shared,
         );
     let placement = vidmm_placement(
         bar_eligible,
