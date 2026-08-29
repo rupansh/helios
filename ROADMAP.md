@@ -179,6 +179,40 @@ by removing the aperture from the allocation's supported segment set makes
 measured on .394/.395/.396 across three segment-flag shapes including the
 historical `BarSegFlags = 0x1C`, **so it is not the segment flags**.
 
+⭐ **No QEMU dependency, and the retirement already ruled on this.** The aperture
+maps blobs through the stock `RESOURCE_MAP_BLOB` window — no host change, no
+HPM1. `FINDINGS.md` **F5** (2026-08-10, owner decision) parked the whole QEMU
+memory lane and named what replaces it, which is worth knowing before anyone
+reaches for a host-side mechanism again:
+
+* **HPM1 is parked, not deleted** — branch `helios/hpm1-parked`, tag
+  `helios-hpm1-parked-2026-08-10` in `qemu-helios`; ~4,500 lines, of which 2,442
+  were in one upstream file. It was *unreviewed and unreachable*: HPM1 is entered
+  only by explicit guest negotiation, and no guest negotiates.
+* **The recommended alternative to HPM1 for C63** (resolving a
+  `DXGKARG_SUBMITCOMMANDVIRTUAL` `DmaBufferVirtualAddress` to command bytes) is
+  **guest-side arithmetic over the KMD's own permanent kernel mapping of the
+  HOC1 pool**, not a host page-table walk:
+  `validate gpuva ∈ [pool_base, pool_base+size)` → `offset = gpuva - pool_base`
+  → `HOB1 = kernel_mapping + offset`, then an ordinary `SUBMIT_3D`. It is
+  **stricter** than HPM1 — "the KMD never dereferences arbitrary user GPUVA"
+  becomes "the KMD dereferences only its own allocation at a bounds-checked
+  offset" — and needs no new mechanism, since §C65 already requires the pool,
+  its lifetime lock and its stable GPUVA. ⚠ An argument from the text, never
+  implemented or measured.
+* **Option zero, which is what actually runs**: do not adopt GPUVA/HOB1 submit
+  for D3D12 at all. vkd3d needs no D3D12 GPUVA semantics from the KMD.
+* **For C55** (renderer-private resource-id substitution after Patch): if still
+  wanted, do it **guest-side in the KMD** while building the `SUBMIT_3D`. The
+  property traded away is "the host is the authority on identity", and that must
+  be recorded wherever it is relied on. Its late-binding benefit is unrealized
+  anyway — it only pays off once allocations actually move, and the working
+  stack pins.
+* **F19** then closed the door further: stock virtio-gpu/Venus is sufficient for
+  one exact per-HTS1 host namespace; **K11 needs no HPM1 and no new QEMU
+  protocol**. Reopening HPM1 means un-parking the branch *and* running its
+  adversarial review first — review before reachable, not after.
+
 ⇒ **Next, in order.** The question is what makes VidMm route a CPU lock through
 the aperture instead of a system-memory copy, and the untested levers are at the
 ALLOCATION, not the segment:
