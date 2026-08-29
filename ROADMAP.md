@@ -418,13 +418,54 @@ the venus device exactly as `tools/udmabuf_import_probe.c` measured on the host
 GPU. The guest never needed a host-visible type: the GUEST holds the CPU view,
 the host does not map these pages.
 
-⇒ **Next**: find the FIRST refused command in the session stream, not the one
-that reports. The KMD's `Nr2*` block already splits refusal predicates
-(`Nr2StaleWhy`/`Nr2StaleSub`/`Nr2OaeWhy`); none of them moved, so the refusal is
-being taken somewhere that does not yet name itself — give the
-`D3DKMTRender` 0xc000000d path a per-predicate counter the way the aperture
-census was split, then read it. The win condition is unchanged:
-`P3 AFTER_COPY cleared=1048576`, and both knob defaults flip together on it.
+### ✅ THE GUEST HALF IS VERIFIED. The page-mapping suspicion is excluded
+
+Four readings from one live run that must all agree, and do:
+
+| reading | value |
+|---|---|
+| UMD `gb-witness` | `va=0x25123a88000 bytes=4194304 head=0xb00b0000` |
+| probe `MAP ptr` | `0x25123a88000` — the app maps OUR buffer |
+| KMD `GbInVaLo` | `0x23a88000` — same VA, low 32 |
+| KMD `GbHead` | `0xB00B0000` — read through the KMD's OWN mapping of the MDL |
+
+`GbHead` settles it: a kernel read of the very MDL the import was built from
+returns the creator's control pattern. The VA crosses, the MDL describes the
+creator's buffer, and the application maps that same buffer.
+
+⛔ **THE QMP PAGE READS THAT SAID OTHERWISE WERE RACING A DYING PROCESS.** With
+the knobs on the probe EXITS during its P1 window, so by sample time the buffer
+was freed and its pages recycled — the same GPA read zero, then `0x20` junk,
+then zero. Two controls make that unarguable:
+
+* `xp` is sound — real code at `0x100000`, an MZ header at `0x100000000`,
+  `"RCRD"` in a live HVR1 pool.
+* the two HVM1 blobs in the same run — **the WORKING kernel-MDL path** — also
+  read zero at their first GPA, because an unused pool is zero.
+
+⇒ **Zero at a guest blob's first GPA is not evidence of anything.** Any future
+host-side reading needs the subject identified first, which is what `GbEntN` +
+`GbGpaLo/Hi` are for: they publish the memory-entry count and first address,
+i.e. exactly `ranges` and `first` in
+`virtio_gpu_virgl_guest_blob_backing`. A probe run creates three or four 4 MiB
+guest blobs and only one is the subject; without this key I had been reading
+HVM1's.
+
+⚠ Also corrected: `MmProbeAndLockPages` now uses a **UserMode** SEH shim for the
+creator's range. The KernelMode one the K2a backing store uses skips the "is
+this user address space in THIS process" check and would succeed over the wrong
+pages silently. It changed nothing here (`GbProbe` stays 0, so the VA is valid
+in that context and `DxgkDdiCreateAllocation` does run in the creating process),
+but locking user pages with KernelMode access was wrong on its own terms.
+
+⇒ **Next**: the probe DIES during P1 with the knobs on — that is the symptom,
+and it is a GUEST-side refusal (`HNR2 context REFUSED at render 0xc000000d`,
+then `context_lost`), not a page-mapping problem. Find the FIRST refused command
+rather than the one that reports: no `Nr2*` predicate counter moves, so the
+refusal is taken somewhere that does not name itself. Give the `D3DKMTRender`
+`0xc000000d` path a per-predicate counter the way the aperture census was split,
+then read it. Win condition unchanged: `P3 AFTER_COPY cleared=1048576`, and both
+knob defaults flip together on it.
 
 ---
 
