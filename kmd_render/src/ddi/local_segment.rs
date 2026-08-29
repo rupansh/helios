@@ -13,7 +13,8 @@ const VIDMM_LOCAL_MAX_BYTES: u64 = 64 << 30;
 pub(super) fn setup_local_segment(
     gpu: &crate::virtio::VirtioGpu,
 ) -> Option<crate::adapter::LocalSegment> {
-    let size = gpu.host_visible()?.len;
+    let window = gpu.host_visible()?;
+    let size = window.len;
     if !(VIDMM_LOCAL_MIN_BYTES..=VIDMM_LOCAL_MAX_BYTES).contains(&size) || size & 4095 != 0 {
         crate::diag::fault(
             crate::diag::FaultCounter::StBar,
@@ -27,7 +28,11 @@ pub(super) fn setup_local_segment(
     Some(crate::adapter::LocalSegment {
         size,
         // Positional: the aperture is index 0/id 1, so local memory is id 2.
+        // It is also the LAST reported segment, which a SupportsCpuHostAperture
+        // segment must be (AddAdapter Code 43, ETW-proven 2026-07-05).
         seg_id: crate::ddi::gpummu::MEMORY_SEGMENT_ID,
+        aperture_gpa: window.base,
+        aperture_len: window.len,
     })
 }
 
@@ -37,9 +42,12 @@ pub(super) fn build_segment_table(
     local_segment: Option<&crate::adapter::LocalSegment>,
 ) -> crate::ddi::segment_table::SegmentTable {
     match local_segment {
-        Some(local) => {
-            crate::ddi::segment_table::SegmentTable::with_local(VIDMM_MEMORY_BASE, local.size)
-        }
+        Some(local) => crate::ddi::segment_table::SegmentTable::with_local(
+            VIDMM_MEMORY_BASE,
+            local.size,
+            local.aperture_gpa,
+            local.aperture_len,
+        ),
         None => crate::ddi::segment_table::SegmentTable::APERTURE_ONLY,
     }
 }

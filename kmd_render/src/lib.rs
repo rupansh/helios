@@ -205,8 +205,12 @@ fn build_ddi_table() -> DRIVER_INITIALIZATION_DATA {
     data.DxgkDdiDestroyAllocation = Some(ddi::dxgkddi_destroy_allocation);
     data.DxgkDdiSetAllocationBackingStore = Some(ddi::dxgkddi_set_allocation_backing_store);
     data.DxgkDdiBuildPagingBuffer = Some(ddi::dxgkddi_build_paging_buffer);
-    data.DxgkDdiMapCpuHostAperture = None;
-    data.DxgkDdiUnmapCpuHostAperture = None;
+    // The CPU side of "a segment-2 allocation's content IS its venus blob".
+    // Registered together with the SupportsCpuHostAperture bit on that segment:
+    // advertising the bit without these two would promise dxgkrnl a CPU window
+    // nothing populates.
+    data.DxgkDdiMapCpuHostAperture = Some(ddi::dxgkddi_map_cpu_host_aperture);
+    data.DxgkDdiUnmapCpuHostAperture = Some(ddi::dxgkddi_unmap_cpu_host_aperture);
 
     // ── Command submission ──────────────────────────────────────────────────
     data.DxgkDdiSubmitCommand = Some(ddi::dxgkddi_submit_command);

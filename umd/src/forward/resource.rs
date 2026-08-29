@@ -63,6 +63,43 @@ impl ResourceDimension {
     }
 }
 
+/// The application's CPU view of an allocation, from `pfnLockCb`.
+///
+/// ⛔ NOT a heap buffer. `CpuBacking` used to fill this role, and because it is
+/// ordinary process memory the pointer handed to the application was a view of
+/// NOTHING: the GPU worked on the allocation's venus blob while the application
+/// read and wrote its own heap, which is why every GPU-routed read-back came
+/// back untouched and the desktop was black. Lock2/pfnLockCb resolves through
+/// the segment's CPU host aperture, so this pointer addresses the blob bytes.
+unsafe fn lock_cpu_view(
+    kt_callbacks: *const ddi::D3DDDI_DEVICECALLBACKS,
+    h_rt_device: ddi::HANDLE,
+    h_allocation: u32,
+) -> Result<*mut core::ffi::c_void, i32> {
+    let Some(lock_cb) = (*kt_callbacks).pfnLockCb else {
+        log_error!("DDI lock_cpu_view: pfnLockCb absent");
+        return Err(E_OUTOFMEMORY);
+    };
+    let mut lock = ddi::D3DDDICB_LOCK::default();
+    lock.hAllocation = h_allocation;
+    // Whole allocation: NumPages 0 with a null page list is the "entire
+    // allocation" form, which is the only shape the aperture serves -- a blob
+    // maps at one offset, whole-blob.
+    lock.NumPages = 0;
+    lock.pPages = core::ptr::null();
+    let hr = lock_cb(h_rt_device, &mut lock);
+    if hr != 0 || lock.pData.is_null() {
+        log_error!(
+            "DDI lock_cpu_view REFUSED: hr=0x{:08x} alloc=0x{:x} pData={:p}",
+            hr as u32,
+            h_allocation,
+            lock.pData
+        );
+        return Err(if hr != 0 { hr } else { E_OUTOFMEMORY });
+    }
+    Ok(lock.pData)
+}
+
 fn resource_needs_cpu_mapping(
     a: &ddi::D3D11DDIARG_CREATERESOURCE,
     dimension: ResourceDimension,
@@ -592,14 +629,11 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
         return Err(E_INVALIDARG);
     }
 
-    let mut cpu_backing = if cpu_visible {
-        Some(helios_umd_common::cpu_backing::CpuBacking::new(bytes).ok_or(E_OUTOFMEMORY)?)
-    } else {
-        None
-    };
-    let cpu_mapping = cpu_backing
-        .as_ref()
-        .map_or(core::ptr::null_mut(), |backing| backing.as_ptr());
+    // ⛔ No CpuBacking, and pSystemMem stays NULL. The CPU view comes from
+    // pfnLockCb after residency (below), which resolves through the segment's
+    // CPU host aperture onto the allocation's own blob. A process-heap buffer
+    // here is a view of nothing -- see `lock_cpu_view`.
+    let mut cpu_backing: Option<helios_umd_common::cpu_backing::CpuBacking> = None;
 
     let sent = desc;
     let private_ptr = (&mut desc as *mut HeliosWddmAllocationDescV2).cast();
@@ -607,7 +641,7 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
     let mut allocation_info = ddi::D3DDDI_ALLOCATIONINFO2::default();
     allocation_info.pPrivateDriverData = private_ptr;
     allocation_info.PrivateDriverDataSize = private_size;
-    allocation_info.__bindgen_anon_1.pSystemMem = cpu_mapping.cast_const();
+    allocation_info.__bindgen_anon_1.pSystemMem = core::ptr::null();
     let mut alloc = ddi::D3DDDICB_ALLOCATE::default();
     alloc.pPrivateDriverData = private_ptr;
     alloc.PrivateDriverDataSize = private_size;
@@ -661,6 +695,21 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
             finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
             return Err(resident_hr);
         }
+    };
+    // After residency: locking asks the KMD to populate the CPU host aperture
+    // for this allocation, which it can only do once the allocation is placed.
+    let cpu_mapping = if cpu_visible {
+        match lock_cpu_view(outer.kt_callbacks, outer.h_rt_device, h_allocation) {
+            Ok(ptr) => ptr,
+            Err(lock_hr) => {
+                drop(resident);
+                let deallocated = deallocate_standalone(outer, h_allocation);
+                finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
+                return Err(lock_hr);
+            }
+        }
+    } else {
+        core::ptr::null_mut()
     };
     let (identity, association) = match assign_outer_allocation(
         outer,
@@ -917,14 +966,9 @@ pub(crate) unsafe fn allocate_wddm_resource(
     // AFTER the callback has returned.
     let sent = desc;
 
-    let mut cpu_backing = if needs_cpu_mapping {
-        Some(helios_umd_common::cpu_backing::CpuBacking::new(desc.byte_size).ok_or(E_OUTOFMEMORY)?)
-    } else {
-        None
-    };
-    let cpu_mapping = cpu_backing
-        .as_ref()
-        .map_or(core::ptr::null_mut(), |backing| backing.as_ptr());
+    // ⛔ No CpuBacking, and pSystemMem stays NULL -- the CPU view comes from
+    // pfnLockCb after residency. See `lock_cpu_view`.
+    let mut cpu_backing: Option<helios_umd_common::cpu_backing::CpuBacking> = None;
 
     let mut allocation_info = ddi::D3DDDI_ALLOCATIONINFO2::default();
     let private_ptr = (&mut desc as *mut HeliosWddmAllocationDescV2).cast();
@@ -934,7 +978,7 @@ pub(crate) unsafe fn allocate_wddm_resource(
     let private_size = u32::from(HELIOS_HWA2_BYTES);
     allocation_info.pPrivateDriverData = private_ptr;
     allocation_info.PrivateDriverDataSize = private_size;
-    allocation_info.__bindgen_anon_1.pSystemMem = cpu_mapping.cast_const();
+    allocation_info.__bindgen_anon_1.pSystemMem = core::ptr::null();
     let is_present = (a.BindFlags & DDI_BIND_PRESENT) != 0;
     let is_primary_allocation = !a.pPrimaryDesc.is_null();
     allocation_info.VidPnSourceId = if !a.pPrimaryDesc.is_null() {
@@ -1116,21 +1160,20 @@ pub(crate) unsafe fn allocate_wddm_resource(
     }
 
     match unsafe { make_resident(&dev.outer, h_allocation) } {
-        Ok(resident) => match assign_outer_allocation(
-            &dev.outer,
-            h_allocation,
-            desc.allocation_generation,
-            desc.byte_size,
-            cpu_mapping,
-        ) {
-            Ok((identity, association)) => Ok(CreatedWddmAllocation {
-                resident: Some(resident),
-                km_resource: alloc.hKMResource,
-                identity,
-                association,
-                cpu_backing,
-            }),
-            Err(refusal) => {
+        Ok(resident) => match (if needs_cpu_mapping {
+            unsafe { lock_cpu_view(dev.outer.kt_callbacks, dev.outer.h_rt_device, h_allocation) }
+        } else {
+            Ok(core::ptr::null_mut())
+        })
+        .and_then(|cpu_mapping| {
+            assign_outer_allocation(
+                &dev.outer,
+                h_allocation,
+                desc.allocation_generation,
+                desc.byte_size,
+                cpu_mapping,
+            )
+            .map_err(|refusal| {
                 log_error!(
                     "DDI allocate_wddm_resource REFUSED: outer association {:?} alloc=0x{:x} generation={} bytes={}",
                     refusal,
@@ -1138,10 +1181,21 @@ pub(crate) unsafe fn allocate_wddm_resource(
                     desc.allocation_generation,
                     desc.byte_size
                 );
+                E_OUTOFMEMORY
+            })
+        }) {
+            Ok((identity, association)) => Ok(CreatedWddmAllocation {
+                resident: Some(resident),
+                km_resource: alloc.hKMResource,
+                identity,
+                association,
+                cpu_backing,
+            }),
+            Err(hr) => {
                 drop(resident);
                 let deallocated = unsafe { deallocate_standalone(&dev.outer, h_allocation) };
                 finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
-                Err(E_OUTOFMEMORY)
+                Err(hr)
             }
         },
         Err(resident_hr) => {

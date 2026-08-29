@@ -791,6 +791,19 @@ const PAGING_BUFFER_BYTES_V4: u32 = 64 * 1024;
 /// have. Which surface serves which build is documented on `query_segments3`.
 const PAGING_BUFFER_BYTES_LEGACY: u32 = 10 * 4096;
 
+/// Which union member of a `DXGK_SEGMENTDESCRIPTOR4` carries CPU access.
+///
+/// `CpuTranslatedAddress` and `CpuHostAperture` SHARE a union, so writing both
+/// is not "two flags set" -- it is one silently overwriting the other. As an
+/// enum, which member gets written is decided by construction and there is no
+/// expressible way to write both.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CpuAccess {
+    None,
+    /// `CpuHostAperture = { PhysicalAddress: gpa, SizeInPages: pages }`.
+    HostAperture { gpa: u64, pages: u32 },
+}
+
 /// Aperture segments redirect system-memory MDLs; memory segments hold bits.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SegmentKind {
@@ -813,6 +826,7 @@ struct SegmentDescriptorSpec {
     direct_flip: bool,
     application_target: bool,
     local_budget_group: bool,
+    cpu_access: CpuAccess,
 }
 
 impl SegmentDescriptorSpec {
@@ -831,12 +845,19 @@ impl SegmentDescriptorSpec {
             direct_flip,
             application_target: false,
             local_budget_group: false,
+            cpu_access: CpuAccess::None,
         }
     }
 
-    /// Exact non-CPU-visible local VidMm capacity. CPU-visible allocations also
-    /// support the ordinary aperture, and the content engine owns migration.
-    const fn local(base: u64, len: u64, direct_flip: bool) -> Self {
+    /// Exact local VidMm capacity, exposed as a CPU host aperture over the
+    /// virtio host-visible window.
+    ///
+    /// `CpuVisible` alone would promise a CPU view this driver cannot deliver:
+    /// the segment holds venus blobs, not a flat CPU-addressable range, so the
+    /// window has to be one dxgkrnl asks us to populate per allocation. That is
+    /// exactly `SupportsCpuHostAperture`, and `DxgkDdiMapCpuHostAperture` is
+    /// where the allocation's blob gets mapped at the offset dxgkrnl chose.
+    const fn local(base: u64, len: u64, direct_flip: bool, gpa: u64, pages: u32) -> Self {
         Self {
             base: base as i64,
             size: len as SIZE_T,
@@ -846,6 +867,7 @@ impl SegmentDescriptorSpec {
             direct_flip,
             application_target: true,
             local_budget_group: true,
+            cpu_access: CpuAccess::HostAperture { gpa, pages },
         }
     }
 
@@ -875,6 +897,35 @@ impl SegmentDescriptorSpec {
                 if self.local_budget_group {
                     f.set_LocalBudgetGroup(1);
                 }
+                if let CpuAccess::HostAperture { .. } = self.cpu_access {
+                    // ⛔ CpuVisible stays OFF. The two are alternatives, not a
+                    // pair: the header makes `CpuTranslatedAddress` the member
+                    // for `CpuVisible && !SupportsCpuHostAperture`, and this
+                    // segment has no flat CPU-addressable range to name there --
+                    // it holds venus blobs, each mapped into the window on
+                    // demand. Setting both made pfnAllocateCb refuse every
+                    // CPU-visible allocation with E_INVALIDARG (measured,
+                    // 22.22.394.0 and .395.0). This is the historical
+                    // `BarSegFlags = 0x1C` shape: CacheCoherent +
+                    // SupportsCpuHostAperture + SupportsCachedCpuHostAperture.
+                    f.set_CacheCoherent(1);
+                    f.set_SupportsCpuHostAperture(1);
+                    // The window is RAM-backed host shmem, cache-coherent on
+                    // x86 for every agent on the same physical pages, so a
+                    // write-back view of it is truthful.
+                    f.set_SupportsCachedCpuHostAperture(1);
+                }
+            }
+            if let CpuAccess::HostAperture { gpa, pages } = self.cpu_access {
+                // The union: writing CpuHostAperture is exclusive with
+                // CpuTranslatedAddress by construction (see `CpuAccess`).
+                // SAFETY: bindgen renders the descriptor's CPU-access union as
+                // `__BindgenUnionField`; writing through it is sound because
+                // `CpuAccess` makes it impossible to also write the other
+                // member, and the whole descriptor was zeroed above.
+                let a = unsafe { s.__bindgen_anon_1.CpuHostAperture.as_mut() };
+                a.PhysicalAddress = gpa;
+                a.SizeInPages = pages;
             }
             s.Size = self.size;
             s.CommitLimit = self.commit_limit;
@@ -965,10 +1016,19 @@ unsafe fn write_local_memory_descriptor(
     seg: *mut DXGK_SEGMENTDESCRIPTOR4,
     gpu_base: u64,
     len: u64,
+    aperture_gpa: u64,
+    aperture_len: u64,
 ) {
+    let pages = u32::try_from(aperture_len >> 12).unwrap_or(u32::MAX);
     unsafe {
-        SegmentDescriptorSpec::local(gpu_base, len, crate::virtio::KMD_D2_OWNER_ENABLED)
-            .write_into_v4(seg)
+        SegmentDescriptorSpec::local(
+            gpu_base,
+            len,
+            crate::virtio::KMD_D2_OWNER_ENABLED,
+            aperture_gpa,
+            pages,
+        )
+        .write_into_v4(seg)
     };
 }
 
@@ -1055,10 +1115,23 @@ unsafe fn query_segments(adapter: &AdapterContext, args: &DXGKARG_QUERYADAPTERIN
                 crate::ddi::segment_table::SegmentSpec::Aperture => unsafe {
                     write_aperture_descriptor(d)
                 },
-                crate::ddi::segment_table::SegmentSpec::Local { gpu_base, size } => {
+                crate::ddi::segment_table::SegmentSpec::Local {
+                    gpu_base,
+                    size,
+                    aperture_gpa,
+                    aperture_len,
+                } => {
                     crate::diag::record(0x0906_0000 | (((size >> 20) as u32) & 0xFFFF));
                     // SAFETY: d is a writable descriptor slot (above).
-                    unsafe { write_local_memory_descriptor(d, gpu_base, size) };
+                    unsafe {
+                        write_local_memory_descriptor(
+                            d,
+                            gpu_base,
+                            size,
+                            aperture_gpa,
+                            aperture_len,
+                        )
+                    };
                 }
             }
         }

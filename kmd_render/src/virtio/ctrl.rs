@@ -2157,6 +2157,47 @@ pub fn map_blob_prepare(
     }
 }
 
+/// Map a blob at the EXACT window offset dxgkrnl chose for a CPU host aperture.
+///
+/// `map_blob_prepare` picks its own offset first-fit, which is wrong here: the
+/// CPU views dxgkrnl builds are over `aperture_gpa + page*4K`, so the blob has
+/// to land at that page or the views read somebody else's bytes. A blob already
+/// mapped at the requested offset is an idempotent success -- dxgkrnl re-issues
+/// the map for a range it already owns.
+pub fn map_blob_at(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    resource_id: u32,
+    window_offset: u64,
+) -> Result<BlobMapPrep, VirtioError> {
+    if let Some(current) = adapter.control_owner().mapped_blob_offset(resource_id)? {
+        if current == window_offset {
+            return adapter
+                .control_owner()
+                .mapped_blob(resource_id)?
+                .ok_or(VirtioError::DeviceError);
+        }
+        // Moving within the window: drop the old placement before reserving the
+        // new one, or the two overlap in the host's address space.
+        resource_unmap_blob(passive, adapter, resource_id)?;
+    }
+    let work = adapter
+        .control_owner()
+        .begin_window_map(resource_id, window_offset)?;
+    let _ = resource_map_blob_owner_work(
+        passive,
+        adapter,
+        resource_id,
+        window_offset,
+        work,
+        CtrlRoundtripMode::LegacyRetry,
+    )?;
+    adapter
+        .control_owner()
+        .mapped_blob(resource_id)?
+        .ok_or(VirtioError::DeviceError)
+}
+
 /// Map the exact K11 private reply blob once with no retry, polling, or owner
 /// discovery.  A pre-existing mapping is rejected because INIT must establish
 /// one fresh, bounded resource/map pair before it can publish capacity.

@@ -11,6 +11,7 @@ mod add_device;
 mod base;
 mod build_paging_buffer;
 mod child;
+mod cpu_host_aperture;
 pub(crate) mod committed_mode;
 pub(crate) mod create_allocation;
 pub(crate) mod diag_etw;
@@ -45,6 +46,7 @@ pub use build_paging_buffer::{
     diag_dump_gpummu_atomics, dxgkddi_build_paging_buffer, dxgkddi_get_root_page_table_size,
     dxgkddi_set_root_page_table,
 };
+pub use cpu_host_aperture::{dxgkddi_map_cpu_host_aperture, dxgkddi_unmap_cpu_host_aperture};
 pub use child::{
     dxgkddi_get_child_container_id, dxgkddi_query_child_relations, dxgkddi_query_child_status,
     dxgkddi_query_device_descriptor,

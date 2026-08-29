@@ -2644,6 +2644,15 @@ fn vidmm_placement(
 
     let (preferred_segment, supported_segments) =
         if let (true, Some(seg_id)) = (bar_eligible, local_seg_id) {
+            // ⚠ The aperture stays in the supported set. Removing it -- to stop
+            // VidMm putting CPU-locked allocations in system memory, which is
+            // NOT where their content lives -- makes pfnAllocateCb refuse every
+            // CPU-visible allocation with E_INVALIDARG. Measured on .394/.395/
+            // .396, across three segment-flag shapes including the historical
+            // BarSegFlags 0x1C, so it is not the flags: dxgkrnl requires a
+            // system-memory home for these allocations. Left as-is until that
+            // requirement is understood; the cost is that `ChMc` stays 0 and
+            // the CPU view is still not the blob.
             (seg_id, segment_bit(seg_id) | aperture_bit)
         } else {
             (crate::ddi::gpummu::APERTURE_SEGMENT_ID, aperture_bit)

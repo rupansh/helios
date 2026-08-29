@@ -943,6 +943,36 @@ impl AdapterContext {
     }
 
     /// The local-memory segment for this transport generation, if any.
+    /// The reported segment that is a CPU host aperture, if this adapter has
+    /// one. Today that is the local-memory segment; the aperture (id 1) holds
+    /// no bits of its own and redirects system-memory MDLs instead.
+    pub(crate) fn bar_segment(&self) -> Option<LocalSegment> {
+        self.local_segment().copied()
+    }
+
+    /// Which resource occupies the host window at `offset`, if any. The unmap
+    /// DDI carries no allocation handle, so offset is the only key it has.
+    pub(crate) fn canonical_mapped_resource_at_offset(
+        &self,
+        offset: u64,
+    ) -> Result<Option<u32>, crate::virtio::VirtioError> {
+        self.control_owner().mapped_resource_at_offset(offset)
+    }
+
+    /// Is this exact resource already mapped at this exact window offset?
+    ///
+    /// Asked resource-first rather than offset-first because the caller always
+    /// holds the allocation, and the offset-keyed direction would need a new
+    /// reverse index in the owner table for the same answer. It is the only
+    /// question the CPU-host-aperture map path may ask when it arrives above
+    /// PASSIVE, where no host round-trip is legal.
+    pub(crate) fn resource_mapped_at_offset(&self, resource_id: u32, offset: u64) -> bool {
+        matches!(
+            self.control_owner().mapped_blob_offset(resource_id),
+            Ok(Some(current)) if current == offset
+        )
+    }
+
     pub(crate) fn local_segment(&self) -> Option<&LocalSegment> {
         self.transport_generation()
             .and_then(|t| t.local_segment.as_ref())

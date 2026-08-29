@@ -1295,6 +1295,18 @@ impl TransportOwner {
         }
     }
 
+    /// The resource whose live window contains `offset`, for the CPU host
+    /// aperture's unmap DDI -- which carries no allocation handle and can only
+    /// resolve by offset.
+    pub(crate) fn mapped_resource_at_offset(
+        &self,
+        offset: u64,
+    ) -> Result<Option<u32>, super::VirtioError> {
+        let mut state = self.state.lock();
+        let table = state.table_mut()?;
+        table.mapped_resource_at_offset(offset).map_err(owner_refusal)
+    }
+
     pub(crate) fn mapped_blob(
         &self,
         resource_id: u32,

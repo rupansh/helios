@@ -11,10 +11,20 @@
 pub(crate) enum SegmentSpec {
     /// The viogpu3d-style linear aperture. Always segment id 1.
     Aperture,
-    /// Exact local VidMm capacity. This is an accounting/residency fact, not a
-    /// CPU mapping window; the KMD content engine owns migration to the
-    /// aperture when a CPU-visible allocation needs a CPU view.
-    Local { gpu_base: u64, size: u64 },
+    /// Exact local VidMm capacity, exposed as a CPU host aperture.
+    ///
+    /// ⚠ It is BOTH: the accounting/residency fact AND the window through which
+    /// a CPU-visible allocation gets a view of its own content. Those were
+    /// separated when K1 deleted `cpu_host_aperture.rs` and K2, which was to
+    /// rebuild the CPU view, was never started -- leaving CPU visibility with
+    /// no owner and the UMD handing applications a process-heap buffer that is
+    /// a view of nothing.
+    Local {
+        gpu_base: u64,
+        size: u64,
+        aperture_gpa: u64,
+        aperture_len: u64,
+    },
 }
 
 /// The reported table, built once during StartDevice and rendered verbatim by
@@ -36,11 +46,21 @@ impl SegmentTable {
     };
 
     /// Add the exact local-memory capacity to the canonical aperture entry.
-    pub(crate) const fn with_local(gpu_base: u64, size: u64) -> Self {
+    pub(crate) const fn with_local(
+        gpu_base: u64,
+        size: u64,
+        aperture_gpa: u64,
+        aperture_len: u64,
+    ) -> Self {
         Self {
             entries: [
                 Some(SegmentSpec::Aperture),
-                Some(SegmentSpec::Local { gpu_base, size }),
+                Some(SegmentSpec::Local {
+                    gpu_base,
+                    size,
+                    aperture_gpa,
+                    aperture_len,
+                }),
             ],
             len: 2,
         }
