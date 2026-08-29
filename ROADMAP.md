@@ -303,17 +303,81 @@ probe's stamp window reads **zero** — the application's stamps are not in the
 allocation's own pages, which is the root cause restated with a new instrument
 rather than a new theory.
 
-⇒ **Next.** Not another knob. Service `MAP_APERTURE_SEGMENT`: back the
-allocation's host resource with the MDL's guest pages
-(`resource_create_guest_blob` already does exactly this for HVM1 — same
-scatter-gather memory-entry list, same host path, 200-900 ranges per 4 MiB) and
-stop allocating a separate host-side blob for it. This is route (I)'s goal
-reached through the documented WDDM mechanism the OS is already driving:
-no HPM1, no new QEMU protocol, no ICD session execute, and no 4 MiB udmabuf cap.
-⚠ Two things to establish first: which paging op sequence owns the swap
-(`MapApertureSegment` can arrive after the venus blob exists), and whether the
-census's big maps are the D3D11 textures or the HVM1 pool — the three sampled
-above resolve to guest-blob-backed resources, which HWA2 textures are not.
+### ⛔ 2026-08-30, later — the aperture join point DOES NOT EXIST, and route (II) is closed
+
+Two corrections and one closure, all measured on 22.22.401-.402.
+
+**The class attribution in the block above was wrong.** Joining
+`AdapterAllocation` to `PagingOpMapApertureSegment` by `hVidMmGlobalAlloc`
+splits a probe run's six allocations cleanly:
+
+| flags | size | set/pref | aperture-mapped | what it is |
+|---|---|---|---|---|
+| `CpuVisible \| Shareable` | 4 MiB | 1 / 1 | YES | the HVM1 pool |
+| `Protected \| FromEndOfSegment` | 15 MiB | 1 / 0 | YES (`hAllocation` NULL) | dxgkrnl's own |
+| `CpuVisible \| Cached` | 4 MiB | **3 / 2** | **no** | the D3D11 allocations |
+
+So the D3D11 class was never excluded from segment 2 — it PREFERS it, and
+`BarLocalShare` is not the lever it was called. An 8-slot ring
+(`PgR0..7{r,n,k,l,h}`, `d51c197`) confirms it from the driver side: every
+resolved aperture map at idle and across a probe is `kind=1`, HVM1 role 1 or 2.
+**`MAP_APERTURE_SEGMENT` never names a D3D11 allocation**, so it is not a
+channel to their pages.
+
+**Route (II) is closed.** `BarSegOnly` removes the linear aperture from a
+local-preferring allocation's supported set — the only shape that can force a
+CPU lock through the aperture DDI, since there is nowhere to evict to. Paired
+with `BarSegFlagsX=4` it covers the cell the .394-.396 `E_INVALIDARG` never
+did: that measurement moved the segment flags and the supported set together,
+so "it is not the flags" was an inference. Measured: the adapter starts
+`CM_PROB_NONE` and `pfnAllocateCb` still refuses every CPU-visible allocation
+with `0x80070057`. dxgkrnl requires a system-memory-capable segment in the
+supported set, and the segment's `CpuVisible` bit does not satisfy it.
+
+### ⭐⭐⭐ THE REPLACEMENT, AND IT WORKS: the creator states its own pages
+
+If WDDM will not hand the driver the application's pages, the application's
+own UMD can. `HeliosWddmAllocationDescV2::cpu_backing_va` (the record is now
+176 bytes; C mirror and `abi_parity.py` updated, gate green) carries a
+page-aligned, page-rounded creator buffer; the KMD locks it with the
+SEH-guarded probe, coalesces its page frames into memory entries, creates a
+`VIRTIO_GPU_BLOB_MEM_GUEST` resource over them, and makes that resource the
+allocation's `VkDeviceMemory` via `VkImportMemoryResourceInfoMESA`. Knobs
+`Hwa2GuestMem` (KMD) + `UmdGuestBacking` (UMD), both OFF, only meaningful
+together.
+
+Measured on 22.22.408.0 with both on:
+
+* QEMU: `guest_blob_backing res 0x4a4, size 4194304, ranges 797` — **the
+  application's own scattered pages are a GPU resource**, through the udmabuf
+  import QEMU already runs thousands of times a session for HVM1.
+* The venus import succeeds. `GbImpMti = 0`, `GbImpMtf = 0x0` — the flagless
+  memory type, which is exactly what `tools/udmabuf_import_probe.c` measured on
+  the host GPU, chosen from the guest's own table rather than hard-coded.
+* `GbProbe = 0`: `MmProbeAndLockPages` on the creator's VA SUCCEEDS, so
+  `DxgkDdiCreateAllocation` runs in the creating process. (It is safe either
+  way — the SEH shim turns a foreign VA into a counted refusal.)
+* KMD knob on, UMD knob off: byte-identical to baseline. The KMD half carries
+  no regression risk on its own.
+
+⛔ **The one thing left, and it is F11, not a mystery.** With the UMD half on,
+the UMD refuses its own create with `invalid HWA2 output
+AllocationGenerationZero`. The KMD reached the write-back and stamped it —
+`GbWbGen = 5`, `GbWbSz = 176`, a witness added for exactly this fork — so the
+record the UMD validates is NOT the record the KMD wrote. `FINDINGS.md` **F11**
+already measured why: a KMD write into `DXGK_ALLOCATIONINFO::pPrivateDriverData`
+at create reaches nobody (7 creates -> 7 zeros,
+`tools/hwa2_writeback_probe.c`), and `DxgkDdiOpenAllocation`'s `in/out` copy is
+the only channel. Sending a nonzero `cpu_backing_va` makes the UMD's own input
+fail the output validator it had been passing only because of that same
+discard.
+
+⇒ **Next**: stop validating create-output on a record that never comes back.
+Either exempt the standalone (`hResource == NULL`) path from
+`validate_create_output` — it has no opener to stamp it — or carry the create
+result through the open, which F11 already names as the only channel that
+works. Then re-run the probe: `P3 AFTER_COPY cleared=1048576` is the win
+condition, and both knob defaults flip together on it.
 
 ---
 
