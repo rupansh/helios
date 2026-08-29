@@ -242,45 +242,68 @@ lines crowded the 12 single-occurrence `create_blob` lines off the list. Count
 the event you care about explicitly; never read a null out of a truncated
 histogram.
 
-#### ⭐ 2026-08-29, measured: the guest CPU view IS the host's memory
+#### ⭐⭐ 2026-08-29 ROOT CAUSE: the Lock2 view is not the memory the host gets
 
-The hypothesis that `D3DKMTLock2` hands the ICD a private copy — F16's "Lock2
-is a copy protocol", which every other line of evidence was converging on — is
-**refuted by direct measurement** on KMD 22.22.387.0.
+⛔ **An earlier revision of this section claimed the opposite and it was wrong.**
+It read 11 sampled backing stores holding a nonzero value and asserted they were
+venus shmems carrying guest-written wire data, therefore that the two views
+alias, therefore that `FINDINGS.md` **F16** was refuted. Nothing established
+that they were shmems, or who wrote that value. Adding one counter — the size of
+what was scanned — showed they were never shmems.
 
-`DxgkDdiSetAllocationBackingStore` now maps role-1 HVM1 backing stores into a
-kernel VA (bounded at 64) and `sample_hvm1_backing` scans one at teardown:
+KMD 22.22.388.0 maps role-1 HVM1 backing stores at
+`DxgkDdiSetAllocationBackingStore` and scans one at teardown.
+`tools/d3d11_pool_churn_probe.cpp` churns **devices**, not textures, because
+DXVK recycles one pool per device (240 textures moved `Nr2BsMap` by 2; 24
+devices move it by 24):
 
 ```
-10 probe runs -> Nr2BsMap=22 Nr2BsSeen=11 Nr2BsScan=11 Nr2BsNz=11 Nr2BsCd=0
-                 Nr2BsVal=0x0000005A
+24 devices, 144 poisoned staging textures, 72 GPU clear+copy
+guest view:  poison_survived=72  clear_value=0  other=0
+KMD:  Nr2BsSeen=24 Nr2BsScan=24 Nr2BsNz=24 Nr2BsCd=0 Nr2BsSz=4096KiB Val=0x5A
 ```
 
-**All 11 scanned backing stores contained guest-written venus wire data.**
-Venus writes those bytes through `mmap_ptr`, which is the `D3DKMTLock2`
-pointer, and the KMD reads them through the OS-owned backing store. The two
-views are the same memory.
+**`Nr2BsSz=4096KiB` is the DXVK staging pool at the CPU-visible cap**, so the
+scanned allocation is exactly the one under test. The guest wrote 0xCDCDCDCD
+across 1 MiB inside each 4 MiB pool; a 1024-point strided scan of that pool's
+backing store expects ~256 hits and found **zero**, in all 24. Meanwhile the
+guest's own read of those textures returned the poison 72 times out of 72.
 
-⇒ Combined with the trace evidence, the whole guest half is now accounted for:
-the CPU writes real pages, those pages' PFNs cross to the host
-(`guest_blob_backing`, `ranges 886`/`379`), the import operand is patched with
-their resource id (`Nr2ImpN` +3 per run, matching the 3 host `vkAllocateMemory`
-calls), and the host allocation succeeds (the ICD validates `reply_status` and
-the returned handle). **Everything the guest can be blamed for works.**
+⇒ **The CPU pointer the ICD hands Vulkan is not the memory whose pages go to the
+host.** `helios_allocation_create` (`vn_renderer_helios_hvm.c:401`) takes it from
+`D3DKMTLock2` and `helios_bo_map` returns it verbatim; the pages the KMD locks,
+udmabufs and imports are a different buffer. F16 stands, and it explains
+everything: CPU-only round trips pass because they stay inside the Lock2 buffer,
+and every GPU-routed read comes back untouched because the GPU is working on the
+other one.
 
-⚠ Bound: all 11 samples share a first value, so they are venus shmems — DXVK's
-staging pools are not destroyed within a boot, so `Nr2BsCd=0` is not yet
-evidence about the staging pool specifically. It is evidence about the aliasing
-mechanism, which is what was in question.
+⚠ Not yet established: who writes the `0x5A` the scan does find. It is the same
+in every pool, so it has a deterministic writer — plausibly the host, into the
+memory it imported. Worth one counter, but it does not change the conclusion:
+the guest's own bytes are absent from the pages the host was given.
 
-⇒ The defect is host-side, and the two threads below have converged on one
-place: **vkr's `vkAllocateMemory`**. It is the call that must honour
-`VkImportMemoryResourceInfoMESA` and bind the guest scatter list, and it is the
-call the host complains about on every single invocation. Either the import is
-not binding (vkr allocates its own memory and the GPU writes that), or the work
-never executes. Next step is host-side: virglrenderer 1.3.0 is the distro
-package with no source in-tree, so read `vkr_dispatch_vkAllocateMemory` and
-check whether the resource lookup and dmabuf import actually run.
+#### The fix, and the precedent already in-tree
+
+The UMD does not have this problem, because it never asks for the backing store
+— it supplies one. `umd/src/forward/resource.rs:610` and `:937`:
+
+```rust
+allocation_info.__bindgen_anon_1.pSystemMem = cpu_mapping.cast_const();
+```
+
+`helios_umd_common::cpu_backing::CpuBacking` is a page-aligned `alloc_zeroed`
+handed to dxgkrnl, so the UMD's CPU pointer **is** the allocation's backing store
+by construction. The ICD sets `info.pSystemMem = NULL` and then reaches for
+Lock2. Give it the same treatment — allocate the buffer, pass it as
+`pSystemMem`, use it as `allocation.cpu`, free it after
+`D3DKMTDestroyAllocation2` — and the two views cannot diverge.
+
+⚠ Open question for that change: the KMD records role-1 HVM1 allocations as
+`BackingSize::SharedBackingStore` (`create_allocation.rs:3934`), the WDDM 3.1+
+OS-owned-section model. Supplying `pSystemMem` makes the allocation
+caller-backed, so it must be confirmed that dxgkrnl still routes it through
+`DxgkDdiSetAllocationBackingStore` — that callback is what sends the PFNs to the
+host, and `ShBkOk` is the counter that says whether it still fires.
 
 ⭐ Two threads, in order:
 

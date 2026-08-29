@@ -377,6 +377,10 @@ pub static BS_SAMPLE_NONZERO: AtomicU32 = AtomicU32::new(0);
 /// The last such dword (`Nr2BsVal`). The probe writes 0xCDCDCDCD through the
 /// Lock2 view, so that value here means the two views ARE the same memory.
 pub static BS_SAMPLE_VALUE: AtomicU32 = AtomicU32::new(0);
+/// Size in KiB of the last allocation scanned (`Nr2BsSz`). A 4096 here is a
+/// DXVK staging pool at the CPU-visible cap; anything small is a venus shmem,
+/// and the two answer different questions.
+pub static BS_SAMPLE_SIZE_KIB: AtomicU32 = AtomicU32::new(0);
 /// Scans performed (`Nr2BsScan`), so a zero `Nr2BsNz` cannot be confused with
 /// an instrument that never ran.
 pub static BS_SAMPLE_SCANS: AtomicU32 = AtomicU32::new(0);
@@ -1448,6 +1452,7 @@ pub(crate) fn sample_hvm1_backing(ctx: &AllocationContext) {
             return;
         }
         BS_SAMPLE_SCANS.fetch_add(1, Ordering::Relaxed);
+        BS_SAMPLE_SIZE_KIB.store((ctx.size as u64 / 1024) as u32, Ordering::Relaxed);
         // Stride across the WHOLE allocation rather than reading only its first
         // page: DXVK suballocates, so any one offset may simply be unused.
         let total_words = (ctx.size as usize) / 4;
@@ -4510,6 +4515,22 @@ const K2A_MDL_HAS_SYSTEM_VA: i16 = 0x0001 | 0x0004;
 /// `MmUnlockPages` in the canonical resource finalizer releases a system mapping
 /// made by this `MmGetSystemAddressForMdlSafe`-equivalent pattern.
 unsafe fn k2a_mdl_system_va(mdl: PMDL, expected_bytes: u64) -> Option<usize> {
+    unsafe { k2a_mdl_system_va_cached(mdl, expected_bytes, _MEMORY_CACHING_TYPE::MmCached) }
+}
+
+/// As [`k2a_mdl_system_va`], with the caching type stated.
+///
+/// ⚠ It must match how the guest maps the same pages. `Hvm1Placement::cached`
+/// is false for every role, so a role-1 allocation is write-combined on the
+/// guest side, and a cached kernel alias of it is not a trustworthy reader.
+///
+/// # Safety
+/// As [`k2a_mdl_system_va`].
+unsafe fn k2a_mdl_system_va_cached(
+    mdl: PMDL,
+    expected_bytes: u64,
+    caching: MEMORY_CACHING_TYPE,
+) -> Option<usize> {
     if mdl.is_null() || u64::from(unsafe { (*mdl).ByteCount }) != expected_bytes {
         return None;
     }
@@ -4521,7 +4542,7 @@ unsafe fn k2a_mdl_system_va(mdl: PMDL, expected_bytes: u64) -> Option<usize> {
         MmMapLockedPagesSpecifyCache(
             mdl,
             0, // KernelMode
-            _MEMORY_CACHING_TYPE::MmCached,
+            caching,
             core::ptr::null_mut(),
             0, // BugCheckOnFailure = FALSE
             K2A_MDL_MAP_PRIORITY,
@@ -4712,7 +4733,9 @@ pub unsafe extern "C" fn dxgkddi_set_allocation_backing_store(
     {
         // Diagnostic only, and non-fatal: failing to map costs a sample, not
         // the allocation. See BS_SAMPLE_MAPPED.
-        match unsafe { k2a_mdl_system_va(mdl, bytes) } {
+        match unsafe {
+            k2a_mdl_system_va_cached(mdl, bytes, _MEMORY_CACHING_TYPE::MmWriteCombined)
+        } {
             Some(va) => {
                 BS_SAMPLE_MAPPED.fetch_add(1, Ordering::Relaxed);
                 va
