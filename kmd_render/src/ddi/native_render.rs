@@ -216,6 +216,23 @@ pub static NR2_NULL_CONTEXT: AtomicU32 = AtomicU32::new(0);
 /// A use record naming an allocation-list entry this driver could not resolve,
 /// or whose published generation the record did not match.
 pub static NR2_ALLOC_STALE: AtomicU32 = AtomicU32::new(0);
+
+/// Which of [`NR2_ALLOC_STALE`]'s eleven writers fired last (`Nr2StaleWhy`).
+/// A bucket eleven predicates share is not evidence.
+pub static NR2_ALLOC_STALE_WHY: AtomicU32 = AtomicU32::new(0);
+
+fn stale(code: u32) {
+    NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+    NR2_ALLOC_STALE_WHY.store(code, Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"Nr2StaleWhy", code);
+}
+
+/// Which disjunct of a multi-predicate stale arm refused (`Nr2StaleSub`), as a
+/// bitmask so a run that trips several still names all of them.
+fn stale_sub(code: u32, bits: u32) {
+    stale(code);
+    crate::diag::record_named_bytes(b"Nr2StaleSub", bits);
+}
 /// Control Renders admitted onto a reply slot.
 pub static NR2_CONTROL_RENDERS: AtomicU32 = AtomicU32::new(0);
 /// The measured `KeGetCurrentIrql()` at `DxgkDdiSubmitCommandVirtual`,
@@ -3298,11 +3315,11 @@ fn prepare_executor_commit(
     for (ordinal, use_record) in uses.iter().enumerate() {
         let index = use_record.allocation_list_index as usize;
         let Some(slot) = use_ordinals.get_mut(index) else {
-            NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+            stale(1);
             return Err(STATUS_INVALID_PARAMETER);
         };
         if *slot != u32::MAX {
-            NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+            stale(2);
             return Err(STATUS_INVALID_PARAMETER);
         }
         *slot = ordinal as u32;
@@ -3316,7 +3333,7 @@ fn prepare_executor_commit(
     for use_record in uses {
         let index = use_record.allocation_list_index as usize;
         if index >= list_count || args.pAllocationList.is_null() {
-            NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+            stale(3);
             return Err(STATUS_INVALID_PARAMETER);
         }
         let handle = unsafe { (*args.pAllocationList.add(index)).hDeviceSpecificAllocation };
@@ -3328,15 +3345,15 @@ fn prepare_executor_commit(
                 passive,
             )
         }) else {
-            NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+            stale(4);
             return Err(STATUS_INVALID_PARAMETER);
         };
-        if guard.transport_instance != building_ref.session.transport_instance
-            || guard.allocation_generation != use_record.expected_allocation_generation
-            || guard.resource_id == 0
-            || guard.byte_size == 0
-        {
-            NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+        let bits = ((guard.transport_instance != building_ref.session.transport_instance) as u32)
+            | (((guard.allocation_generation != use_record.expected_allocation_generation) as u32) << 1)
+            | (((guard.resource_id == 0) as u32) << 2)
+            | (((guard.byte_size == 0) as u32) << 3);
+        if bits != 0 {
+            stale_sub(5, bits);
             return Err(STATUS_INVALID_PARAMETER);
         }
         allocations.push(guard);
@@ -3367,11 +3384,11 @@ fn prepare_executor_commit(
             let set_reply_patch = patches[order[0] as usize];
             let import_patch = patches[order[1] as usize];
             let Some(reply_guard) = guard_for_patch(set_reply_patch) else {
-                NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+                stale(6);
                 return Err(STATUS_INVALID_PARAMETER);
             };
             let Some(import_guard) = guard_for_patch(import_patch) else {
-                NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+                stale(7);
                 return Err(STATUS_INVALID_PARAMETER);
             };
             // Roles 1-3 are OS-owned K2a pages: no host VkDeviceMemory existed
@@ -3385,16 +3402,27 @@ fn prepare_executor_commit(
                 import_guard.hvm1_role,
                 0 | HELIOS_HVM1_ROLE_VULKAN_DEVICE_LOCAL
             );
-            if set_reply_patch.allocation_list_index != header.reply_allocation_list_index
-                || reply_guard.hvm1_role != HELIOS_HVM1_ROLE_REPLY_POOL
-                || reply_guard.kernel_va.is_none()
-                || import_guard.hvm1_role == HELIOS_HVM1_ROLE_REPLY_POOL
-                || import_guard.resource_id == reply_guard.resource_id
-                || import_guard.byte_size != admission.allocation_size
-                || (exact_host_memory_type
+            let bits = ((set_reply_patch.allocation_list_index
+                != header.reply_allocation_list_index) as u32)
+                | (((reply_guard.hvm1_role != HELIOS_HVM1_ROLE_REPLY_POOL) as u32) << 1)
+                | ((reply_guard.kernel_va.is_none() as u32) << 2)
+                | (((import_guard.hvm1_role == HELIOS_HVM1_ROLE_REPLY_POOL) as u32) << 3)
+                | (((import_guard.resource_id == reply_guard.resource_id) as u32) << 4)
+                | (((import_guard.byte_size != admission.allocation_size) as u32) << 5)
+                | (((exact_host_memory_type
                     && import_guard.memory_type_index != admission.memory_type_index)
-            {
-                NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+                    as u32)
+                    << 6);
+            if bits != 0 {
+                crate::diag::record_named_bytes(
+                    b"Nr2StaleSz",
+                    u32::try_from(import_guard.byte_size).unwrap_or(u32::MAX),
+                );
+                crate::diag::record_named_bytes(
+                    b"Nr2StaleWant",
+                    u32::try_from(admission.allocation_size).unwrap_or(u32::MAX),
+                );
+                stale_sub(8, bits);
                 return Err(STATUS_INVALID_PARAMETER);
             }
             let reply_end = header
@@ -4146,14 +4174,14 @@ fn commit(
         let Some(identity) = (unsafe {
             crate::ddi::create_allocation::open_allocation_identity(entry.hDeviceSpecificAllocation)
         }) else {
-            NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+            stale(9);
             return refuse(
                 RenderRefusal::Table(Hnr2TableReject::AllocationIndexOutOfRange),
                 STATUS_INVALID_PARAMETER,
             );
         };
         if record.expected_allocation_generation != identity.generation {
-            NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+            stale(10);
             return refuse(
                 RenderRefusal::Dma(Hnr2DmaReject::AllocationGenerationStale),
                 STATUS_INVALID_PARAMETER,
@@ -4661,7 +4689,7 @@ fn run_control_payload(
             passive,
         )
     }) else {
-        NR2_ALLOC_STALE.fetch_add(1, Ordering::Relaxed);
+        stale(11);
         return ControlPayloadOutcome::Refused;
     };
     let Some(kernel_va) = guard.kernel_va else {

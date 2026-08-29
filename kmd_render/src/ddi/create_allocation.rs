@@ -5533,15 +5533,29 @@ pub(crate) unsafe fn open_allocation_execution_use(
     expected_generation: u64,
     passive: PassiveLevel,
 ) -> Option<OpenExecutionUse> {
-    let open = unsafe { open_allocation_context(h)? };
-    let identity = open.identity?;
+    // `Nr2OaeWhy`: which of this function's five refusals ran last. Its caller
+    // records only "could not resolve", which five different causes share.
+    let why = |code: u32| crate::diag::record_named_bytes(b"Nr2OaeWhy", code);
+    let Some(open) = (unsafe { open_allocation_context(h) }) else {
+        why(1);
+        return None;
+    };
+    let Some(identity) = open.identity else {
+        why(2);
+        return None;
+    };
     if identity.generation != expected_generation {
+        why(3);
         return None;
     }
-    let guard = open
-        .execution
-        .as_ref()?
-        .acquire(passive, session, expected_generation)?;
+    let Some(binding) = open.execution.as_ref() else {
+        why(4);
+        return None;
+    };
+    let Some(guard) = binding.acquire(passive, session, expected_generation) else {
+        why(5);
+        return None;
+    };
     // The open-time record is the only identity Render is allowed to trust.
     // Cross-check every field the direct execution binding cached from the
     // canonical allocation before returning custody; do not let a matching
@@ -5555,6 +5569,7 @@ pub(crate) unsafe fn open_allocation_execution_use(
         || guard.byte_size != identity.byte_size
         || !role_matches
     {
+        why(6);
         return None;
     }
     Some(guard)
