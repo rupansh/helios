@@ -467,6 +467,117 @@ refusal is taken somewhere that does not name itself. Give the `D3DKMTRender`
 then read it. Win condition unchanged: `P3 AFTER_COPY cleared=1048576`, and both
 knob defaults flip together on it.
 
+### ⭐⭐⭐⭐⭐ 2026-08-30 — THE WIN CONDITION IS MET. `P3 AFTER_COPY cleared=1048576`
+
+**KMD 22.22.420.0, both knobs on, one live run:**
+
+```
+HAM1 defer guest_backed bytes=4194304 renderer_type=0
+MAP ptr=0000023a18c16000
+P3 AFTER_COPY stamped=0 cleared=1048576 zero=0 other=0
+```
+
+The GPU's `ClearRenderTargetView`, routed through `CopyResource`, is visible
+through the pointer the application mapped. **The app's buffer and the GPU's
+memory are one buffer.** Every refusal instrument reads zero: `Nr2WhyN`,
+`Nr2Rej`, `Nr2Stale`, `Nr2NoStage`, `Nr2NoResid`, `Nr2NoReply`, `Nr2OuterRej`.
+
+⚠ `MAPKIND` still reports `MEM_PRIVATE`. That is now CORRECT and is no longer a
+tell: the pointer IS the UMD's own committed buffer, and the host works on those
+very pages. `MEM_MAPPED vs MEM_PRIVATE` only ever distinguished the *shared
+backing store* route.
+
+### How it was found — and the instrument that found it
+
+`refuse()` names only the rules it covers. Every other refusal on the HNR2
+`DxgkDdiRender` path returned a bare NTSTATUS with no counter, and the three
+that did bump one (`Nr2NoStage`/`Nr2NoResid`/`Nr2NoReply`) ride `NR2_COUNTERS`,
+**which is flushed only from the SUCCESS paths** — a refusal loses the context,
+so it is the last thing that context does and its bump may never be published.
+That is why "no `Nr2*` predicate counter moves" was true while the driver was
+refusing every run.
+
+`why(site, status)` (`1d08951`) gives all 68 of them a unique site code,
+published immediately and bounded to the first EIGHT IN ORDER (`Nr2WhyN`,
+`Nr2W0`..`Nr2W7`) — in order because one refusal poisons the session and
+everything after it is refused too, so a last-value counter reports the cascade.
+First deploy, first run: `Nr2WhyN=1`, `Nr2W0=101` — ONE unnamed refusal in the
+whole run, at `execute_control_no_reply`. The ICD had been reporting venus
+command `0x55 vkCreateCommandPool`, five commands downstream.
+
+⭐ The host log then named the cause outright, with no further instrument:
+
+```
+vkr: failed to look up object 27 of type 8      (8 = VK_OBJECT_TYPE_DEVICE_MEMORY)
+vkr: vkBindBufferMemory2 resulted in CS error
+vkr: destroying context 2 (helios) with a valid instance
+```
+
+`res 0xa, size 4194304, ranges 89, first 0x1424d7000` in the same log matched
+`GbEntN=89` / `GbGpaLo` / `GbGpaHi` exactly, so the subject was identified rather
+than guessed.
+
+### The defect: the CONSUMER chose the memory type, and could not know it
+
+`vn_device_memory_defer_outer_allocate` always translated to the renderer's
+HOST-VISIBLE type. A guest-page-backed allocation's host resource reaches the
+renderer as a udmabuf, and **only the flagless type accepts one** — the same rule
+`vn_device_memory_alloc_helios_shared` already applied with the same
+`helios_renderer_imported_memory_type_index`, and the same rule
+`tools/udmabuf_import_probe.c` measured on the host GPU. Asking for the
+host-visible type makes the host `vkAllocateMemory` return
+OUT_OF_DEVICE_MEMORY, so object 27 is never created and the next bind kills the
+context.
+
+⛔ **The consumer cannot infer this.** Whether an allocation ends up guest-backed
+is the KERNEL's decision — it can refuse the offer for a dozen counted reasons
+and fall back to host memory, where the host-visible type is right. So the KMD
+reports what it built (`4a36e1f`):
+
+`HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED` (bit 11, KMD-owned, from
+`created.guest_backed`) → UMD reads the create-output → association flag
+`HELIOS_RESOURCE_ASSOCIATION_FLAG_GUEST_PAGE_BACKED` → ICD picks the importable
+type. Adding a third KMD-owned bit needed no edit to either echo check: both
+already clear `HELIOS_HWA2_FLAG_KMD_OWNED_MASK`.
+
+### ⛔ NOT YET A DESKTOP, and this is a REGRESSION while the knobs are on
+
+With both knobs on, **only 1 of 206 guest-backing attempts succeeds.** dwm's all
+fail (`GbImp=205`, `GbImpVk=0xFFFFFFFE` = `VK_ERROR_OUT_OF_DEVICE_MEMORY`) and
+fall back to host memory — which is merely the old defect — except that for
+dwm's 962,560-byte buffer the FALLBACK fails too (`AcBackFail`,
+`hr=0x8007000e`), `create_resource(buffer)` fails, and **dwm crash-loops: no
+logon, no explorer, no desktop.**
+
+Attribution is measured, not inferred: `Hwa2GuestMem=0` + `UmdGuestBacking=0` +
+a device restart, and dwm is single and stable, explorer runs, logon completes,
+and the probe reproduces the ORIGINAL defect exactly
+(`stamped=1048576 cleared=0`). **Both knobs remain OFF by default; the defaults
+were NOT flipped.** The box is on the pre-existing baseline.
+
+### ⛔ The 4 MiB cap question is CLOSED, and the answer is "neither"
+
+`GbImpSuc` / `GbImpSzK` publish the largest accepted and the last refused
+import. **A 4 MiB import SUCCEEDS while a 940 KiB one is refused**, at 24
+coalesced entries, with the new entry bound never firing (`GbEnts=0`). So the
+retired `HWA2_GUEST_BACKING_MAX_BYTES` was not protecting anything real, the
+previous handoff's retraction of the "8 MiB ceiling" was right about the cap and
+wrong about there being no limit, and **the entry-count bound is not it either.**
+
+⇒ **THE FRONTIER:** what makes the host refuse a guest-blob import? It is not
+size, not fragmentation, not the memory type (all three now measured out). The
+QEMU log shows every dwm allocation as a guest-blob create immediately followed
+by a `host3d_blob_charge` of the same size — the attempt and its fallback — down
+to a **single-page, single-range 4 KiB blob**, which also fails. Only the probe's
+succeeded, all boot. Next instrument: `tools/udmabuf_import_probe.c` on the HOST
+(outside the stack, no VM, no owner gate) against a 1-page udmabuf, then a
+dwm-shaped one. Second question, independent and also open: why does
+`allocate_memory_blob` FAIL as a fallback after ~205 failed guest imports —
+that, not the import, is what costs the desktop.
+
+---
+
+
 ---
 
 ## ✅ CLOSED 2026-08-28 — session FREEZE: a redundant `pfnEvictCb` poisoned the device
