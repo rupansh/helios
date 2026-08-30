@@ -418,6 +418,86 @@ the venus device exactly as `tools/udmabuf_import_probe.c` measured on the host
 GPU. The guest never needed a host-visible type: the GUEST holds the CPU view,
 the host does not map these pages.
 
+### ⭐⭐⭐⭐⭐ 2026-08-30 later — THE HOST IMPORTS A udmabuf IFF ITS SIZE IS A MULTIPLE OF 64 KiB
+
+That one rule is why dwm never got guest backing, and it was measured on the
+live GPU outside the whole stack, one size per process
+(`tools/udmabuf_import_sweep.c`):
+
+```
+     4096 REFUSED     61440 REFUSED     962560 REFUSED    1044480 REFUSED
+    16384 REFUSED     65536 IMPORTED    983040 IMPORTED   4190208 REFUSED
+    69632 REFUSED    131072 IMPORTED   1048576 IMPORTED   4194304 IMPORTED
+```
+
+dwm's buffers are 4 KiB, 16 KiB and 962560 bytes — none a multiple of 64 KiB.
+The probe's is 4 MiB, which is. That is the whole 205-versus-1 split.
+
+⛔ **A REFUSED IMPORT POISONS THE VkDevice**: every later import on it fails
+whatever its size (measured — a buffer that imported alone was refused once
+three bad ones ran ahead of it). So one wrong-sized allocation cost every later
+one, and the granularity is a PRECONDITION TO CHECK, never an outcome to retry.
+
+⚠ The probe had to be rewritten to take ONE SIZE PER PROCESS for that reason. A
+loop inside one process reports the first refusal forever and reads as "nothing
+imports at all" — which is exactly how this was nearly misdiagnosed as "the host
+refuses every shape".
+
+**Fixed in `fda7260`** — `HELIOS_CPU_BACKING_HOST_GRANULARITY`, both sides round
+to it, and the KMD self-checks (`GbGran`) before building the resource.
+Measured on 22.22.421.0, both knobs on, one boot:
+
+| | .420 | .421 |
+|---|---|---|
+| `GbImp` (import refused) | 205 | **0** |
+| `GbOk` (guest-backed) | 1 | **98** |
+| dwm | crash-loops, no logon | single, stable, explorer up |
+| probe | `cleared=1048576` | `cleared=1048576` |
+
+### ⛔ THE DESKTOP IS STILL BLACK, and the next blocker is SHARED TEXTURES
+
+`helios_paintcap` is black on 22.22.421.0 with the knobs on. The display lane is
+alive — `set_scanout_blob` rotates three 4,587,520-byte 1280x800 primaries — and
+dwm and explorer are up. The producer defect that remains is now isolated and
+reproducible:
+
+`tools/d3d11_shared_content_probe.exe`, SAME DEVICE, clear a SHARED render
+target then `CopyResource` to a staging texture and read it back:
+
+```
+[A dev1 self] center BGRA = 0 0 0 0  nonzero=0/64
+```
+
+The identical shape on a NON-shared render target
+(`d3d11_hostram_alias_probe`) now passes with `cleared=1048576`. So this is not
+the two-buffer defect that was just fixed; it is specific to
+`D3D11_RESOURCE_MISC_SHARED*`.
+
+What is already excluded:
+* The WDDM/association half of sharing WORKS — device 2's `open_resource`
+  admits the same allocation (`alloc_gen=0x100000007`, `HRA1 ok`).
+* DXVK does NOT fall back to Win32 export for these. Every export path is gated
+  `m_shared && !heliosOuterAssociated`, and the association is present, so the
+  image takes `allocationInfo.heliosAssociation` like any other.
+* The 24 `Failed to create shared resource: VK_KHR_EXTERNAL_MEMORY_WIN32 not
+  supported` lines in dwm's log are gated purely on an ICD device feature and
+  are unrelated to guest backing; `canShareImage` only clears `m_shared`, it
+  does not fail the create. Whether they matter is open — the owner directive
+  [[external-memory-win32-directive]] wants the extension anyway.
+
+⚠ One open oddity found on the way: the shared RT's descriptor carries
+`HELIOS_HWA2_FLAG_CPU_VISIBLE` (`flags=0x304`) while `resource_needs_cpu_mapping`
+returns false for it (a render target requests no CPU access), so the UMD offers
+no pages and it is not guest-backed. The descriptor flag and the UMD's own
+condition disagree; that is worth resolving whether or not it is this defect.
+
+⚠ Also seen once this boot, not yet explained: dwm logged one
+`waitForResource STALLED ... with the submission queue fully drained` followed
+by `device lost`. It recovered. **The knob DEFAULTS were therefore NOT flipped**
+— the registry knobs are on, the code defaults stay off pending a longer soak.
+
+---
+
 ### ✅ THE GUEST HALF IS VERIFIED. The page-mapping suspicion is excluded
 
 Four readings from one live run that must all agree, and do:
