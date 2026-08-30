@@ -10,6 +10,12 @@ use std::ptr::NonNull;
 
 const WDDM_PAGE_ALIGN: usize = 4096;
 
+/// See `HELIOS_CPU_BACKING_HOST_GRANULARITY`. Duplicated as a plain integer
+/// rather than imported because `umd_common` does not depend on `protocol`; the
+/// KMD-side check is what actually gates the import, so a drift here costs a
+/// counted refusal, not a wrong-sized buffer.
+const HOST_IMPORT_GRANULARITY: usize = 64 * 1024;
+
 pub struct CpuBacking {
     ptr: NonNull<u8>,
     layout: Layout,
@@ -33,16 +39,21 @@ impl CpuBacking {
         Some(Self { ptr, layout })
     }
 
-    /// Page-ALIGNED and page-ROUNDED, which is what the KMD's guest-page
-    /// backing requires: it builds an MDL over `round_up_page(byte_size)` and
-    /// locks it, so the last page has to belong to this buffer in full.
-    /// `new` only guarantees the alignment.
+    /// Page-ALIGNED and rounded up to the HOST's dmabuf import granularity,
+    /// which is what the KMD's guest-page backing requires: it builds an MDL
+    /// over the whole buffer and hands those page frames to the host, and the
+    /// host imports a udmabuf only when its size is a multiple of 64 KiB.
+    /// `new` guarantees only the alignment.
+    ///
+    /// The name says "page" for the alignment; the SIZE rounds further. A 4 KiB
+    /// D3D resource therefore costs a 64 KiB buffer — the alternative is that
+    /// its import is refused, which also poisons the next one.
     pub fn new_page_rounded(bytes: u64) -> Option<Self> {
         let bytes = usize::try_from(bytes).ok()?;
         if bytes == 0 {
             return None;
         }
-        let rounded = bytes.checked_next_multiple_of(WDDM_PAGE_ALIGN)?;
+        let rounded = bytes.checked_next_multiple_of(HOST_IMPORT_GRANULARITY)?;
         let layout = Layout::from_size_align(rounded, WDDM_PAGE_ALIGN).ok()?;
         // SAFETY: as `new` — nonzero, valid layout, freed with the same one.
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;

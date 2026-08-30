@@ -132,6 +132,24 @@ pub const HELIOS_HWA2_BYTES: u16 = 168;
 /// put bytes the creator does not own in the first entry.
 pub const HELIOS_CPU_BACKING_ALIGN: u64 = 4096;
 
+/// Granularity the HOST requires of a guest-page import, and therefore of
+/// [`HeliosCpuBackingV1::bytes`].
+///
+/// ⛔ MEASURED, and it is a hard iff, not a heuristic. `vkAllocateMemory` with
+/// `VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT` over a udmabuf succeeds
+/// exactly when the dmabuf's size is a multiple of 64 KiB, on the live GPU
+/// outside the whole stack (`tools/udmabuf_import_sweep.c`): 61440 REFUSED,
+/// 65536 IMPORTED, 69632 REFUSED, 983040 IMPORTED, 1044480 REFUSED, 4190208
+/// REFUSED, 4194304 IMPORTED. Page rounding is NOT enough — it is what made
+/// dwm's 4 KiB, 16 KiB and 962560-byte buffers fail 205 imports in one boot
+/// while the probe's 4 MiB one succeeded.
+///
+/// ⚠ And a refusal is not free: the next import on that VkDevice fails too,
+/// whatever its size (measured — a case that imported on its own was refused
+/// once three small ones ran ahead of it). So this is a precondition to CHECK,
+/// never an outcome to retry.
+pub const HELIOS_CPU_BACKING_HOST_GRANULARITY: u64 = 64 * 1024;
+
 /// `"HCB1"`, the CPU-backing side record's magic.
 pub const HELIOS_CPU_BACKING_MAGIC: u32 = u32::from_le_bytes(*b"HCB1");
 /// Exact wire length of [`HeliosCpuBackingV1`].

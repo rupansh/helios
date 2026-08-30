@@ -75,7 +75,8 @@ use helios_protocol::{
     HELIOS_HOC1_BYTES, HELIOS_HOC1_MAGIC, HELIOS_HOC1_POOL_BYTES, HELIOS_HVM1_MAGIC,
     HELIOS_HVM1_SEGMENT_PAGE_SHIFT, HELIOS_HVM1_SIZE, HELIOS_HWA2_BIND_RENDER_TARGET,
     HELIOS_HWA2_BIND_SHADER_RESOURCE, HELIOS_HWA2_BIND_UNORDERED_ACCESS, HELIOS_HWA2_BYTES,
-    HELIOS_HWA2_FLAG_CPU_VISIBLE, HELIOS_HWA2_FLAG_CROSS_ADAPTER,
+    HELIOS_CPU_BACKING_HOST_GRANULARITY, HELIOS_HWA2_FLAG_CPU_VISIBLE,
+    HELIOS_HWA2_FLAG_CROSS_ADAPTER,
     HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY, HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE,
     HELIOS_HWA2_FLAG_DISPLAYABLE, HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED, HELIOS_HWA2_FLAG_PRIMARY,
     HELIOS_HWA2_FLAG_PROTECTED,
@@ -3181,6 +3182,11 @@ static GUEST_BACK_TOO_BIG: AtomicU32 = AtomicU32::new(0);
 /// `GbEntN`, which is published before the refusal: this is fragmentation, not
 /// size, so the same byte count can pass and fail across runs.
 static GUEST_BACK_ENTRIES: AtomicU32 = AtomicU32::new(0);
+/// The rounded size was not a multiple of the host's import granularity, so the
+/// import was NOT attempted. Must stay zero: a nonzero value means the rounding
+/// and the check disagree, and the import that would have been refused would
+/// also have broken every later one.
+static GUEST_BACK_GRANULARITY: AtomicU32 = AtomicU32::new(0);
 /// Largest successfully imported guest backing this boot, in KiB.
 static GUEST_BACK_IMPORT_OK_BYTES_K: AtomicU32 = AtomicU32::new(0);
 static GUEST_BACK_MDL: AtomicU32 = AtomicU32::new(0);
@@ -3206,6 +3212,7 @@ pub(crate) fn dump_guest_backing_counters() {
         (&b"GbNoVa"[..], &GUEST_BACK_NO_VA),
         (&b"GbBig"[..], &GUEST_BACK_TOO_BIG),
         (&b"GbEnts"[..], &GUEST_BACK_ENTRIES),
+        (&b"GbGran"[..], &GUEST_BACK_GRANULARITY),
         (&b"GbImpSuc"[..], &GUEST_BACK_IMPORT_OK_BYTES_K),
         (&b"GbMdl"[..], &GUEST_BACK_MDL),
         (&b"GbProbe"[..], &GUEST_BACK_PROBE),
@@ -3262,11 +3269,14 @@ unsafe fn build_guest_backed_linear(
     // page-ROUNDED (`CpuBacking::new_page_rounded`), so the MDL covers whole
     // pages this allocation owns. Everything downstream — blob size, import
     // size, charged extent — uses `mapped`, not `bytes`.
-    // No byte cap here: this path COALESCES, so size does not decide whether the
-    // host will take the list — `UDMABUF_LIST_LIMIT_ENTRIES` does, checked below
-    // against the list itself. `u32::MAX` is the blob/import wire bound.
+    // ⛔ ROUNDED TO THE HOST'S IMPORT GRANULARITY, NOT TO A PAGE. The host takes
+    // a udmabuf only when its size is a multiple of 64 KiB — measured as a hard
+    // iff on the live GPU, `HELIOS_CPU_BACKING_HOST_GRANULARITY`. Page rounding
+    // is what made dwm's 4 KiB / 16 KiB / 962560-byte buffers fail 205 imports
+    // in one boot. No byte CAP, though: size does not bound the list, and
+    // `u32::MAX` is the blob/import wire bound.
     let Some(mapped) = bytes
-        .checked_next_multiple_of(PAGE as u64)
+        .checked_next_multiple_of(HELIOS_CPU_BACKING_HOST_GRANULARITY)
         .filter(|m| *m != 0 && *m <= u32::MAX as u64)
     else {
         GUEST_BACK_TOO_BIG.fetch_add(1, Ordering::Relaxed);
@@ -3405,6 +3415,20 @@ unsafe fn build_guest_backed_linear(
     crate::diag::record_named_bytes(b"GbGpaHi", (entries[0].addr >> 32) as u32);
 
     let entries_len = entries.len();
+    // ⛔ NEVER ATTEMPT AN IMPORT THE HOST WILL REFUSE. A refused dmabuf import
+    // poisons the VkDevice: the next import fails whatever its size (measured —
+    // a buffer that imported on its own was refused once three bad ones ran
+    // ahead of it). So one wrong-sized allocation costs every later one,
+    // which is how a single boot reached 205 failures and 1 success. `mapped`
+    // is rounded above, so this is a self-check on that rounding.
+    if bytes % HELIOS_CPU_BACKING_HOST_GRANULARITY != 0 {
+        unsafe {
+            wdk_sys::ntddk::MmUnlockPages(mdl);
+            IoFreeMdl(mdl);
+        }
+        GUEST_BACK_GRANULARITY.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
     // MAPPABLE|SHAREABLE mirrors HVM1 role 2, the one guest-blob shape this
     // host path is exercised with every boot.
     let resource_id = match crate::virtio::ctrl::resource_create_guest_blob(
