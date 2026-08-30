@@ -454,7 +454,34 @@ Measured on 22.22.421.0, both knobs on, one boot:
 | dwm | crash-loops, no logon | single, stable, explorer up |
 | probe | `cleared=1048576` | `cleared=1048576` |
 
-### ⛔ THE DESKTOP IS STILL BLACK, and the next blocker is SHARED TEXTURES
+### ⭐⭐⭐⭐ THE PRODUCER IS NOW LARGELY CORRECT — 3 of 4 round-trip stages pass
+
+`tools/d3d11_roundtrip_split_probe`, the headless four-stage producer test, on
+22.22.421.0 with both knobs on, against its 2026-08-28 baseline:
+
+| stage | 2026-08-28 | 22.22.421.0 |
+|---|---|---|
+| 1 CPU (Map write -> Map read) | PASS | PASS |
+| 2 UPLOAD (staging -> CopyResource -> staging) | **FAIL** `zero=4096/4096` | **PASS** `match=4096/4096` |
+| 3 INIT (`D3D11_SUBRESOURCE_DATA` -> copy) | **FAIL** `zero=4096/4096` | **FAIL** `zero=4096/4096` |
+| 4 CLEAR (`ClearRenderTargetView` -> copy) | **FAIL** `px0=0x00000000` | **PASS** `px0=0xff407fbf` |
+
+Stage 4 is the one that matters most: the GPU's own render result now reaches
+the application's CPU view, **with the right colour**, not zero. That is the
+two-buffer defect closed on the general path.
+
+⚠ Note the DEFAULT textures in that probe (`flags=0x300`, 16 KiB, bind=0x1/0x2)
+are correctly NOT guest-backed — they are GPU-side and have no CPU access. Only
+the staging one is (`gb-witness ... bytes=4194304`). Guest backing is not doing
+the work in stage 4; it is doing it in the staging resource the result lands in.
+
+### ⛔ TWO PRODUCER PATHS REMAIN, and the desktop is still black
+
+**(a) create-time initial data** — stage 3 INIT still reads all zeros. Not the
+same path as stage 2: DXVK uploads `D3D11_SUBRESOURCE_DATA` through its own
+initializer, not through an application staging resource. Untouched, unexplained.
+
+**(b) shared textures** — the blocker below.
 
 `helios_paintcap` is black on 22.22.421.0 with the knobs on. The display lane is
 alive — `set_scanout_blob` rotates three 4,587,520-byte 1280x800 primaries — and
