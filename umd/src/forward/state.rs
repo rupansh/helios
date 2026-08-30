@@ -111,6 +111,10 @@ pub(crate) fn assign_outer_allocation(
     allocation_generation: u64,
     bytes: u64,
     cpu_mapping: *mut c_void,
+    // From the KMD's create-output flags, never from this UMD's own offer: the
+    // kernel can refuse the offered pages and fall back to host memory, and the
+    // ICD picks a different renderer memory type on the strength of this bit.
+    guest_page_backed: bool,
 ) -> Result<(OuterAllocationIdentity, HeliosResourceAssociationV1), OuterAllocationRefusal> {
     use OuterAllocationRefusal as R;
 
@@ -172,6 +176,10 @@ pub(crate) fn assign_outer_allocation(
             0
         } else {
             helios_protocol::HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING
+        } | if guest_page_backed {
+            helios_protocol::HELIOS_RESOURCE_ASSOCIATION_FLAG_GUEST_PAGE_BACKED
+        } else {
+            0
         },
         reserved1: 0,
     };

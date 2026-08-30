@@ -110,7 +110,7 @@ HELIOS_WDDM_STATIC_ASSERT(HELIOS_PACKAGE_GENERATION == UINT64_C(0x48454C49000000
 #define HELIOS_HWA2_KIND_PAGING_OBJECT    6u
 #define HELIOS_HWA2_KIND_MAX              HELIOS_HWA2_KIND_PAGING_OBJECT
 
-/* Flags (§10.3, offset 68) — eleven bits, and nothing else. */
+/* Flags (§10.3, offset 68) — twelve bits, and nothing else. */
 #define HELIOS_HWA2_FLAG_PRIMARY               (1u << 0)
 #define HELIOS_HWA2_FLAG_STEREO                (1u << 1)
 #define HELIOS_HWA2_FLAG_SHARED                (1u << 2)
@@ -122,7 +122,8 @@ HELIOS_WDDM_STATIC_ASSERT(HELIOS_PACKAGE_GENERATION == UINT64_C(0x48454C49000000
 #define HELIOS_HWA2_FLAG_CPU_VISIBLE           (1u << 8)
 #define HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED   (1u << 9)
 #define HELIOS_HWA2_FLAG_STANDARD              (1u << 10)
-#define HELIOS_HWA2_FLAG_MASK                  0x000007FFu
+#define HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED     (1u << 11)
+#define HELIOS_HWA2_FLAG_MASK                  0x00000FFFu
 
 /* The two bits ONLY the KMD may set, and therefore the exact set a create-INPUT
  * descriptor must leave clear. §10.3: "KMD sets `D3D12_RUNTIME_PRIMARY` only
@@ -135,7 +136,8 @@ HELIOS_WDDM_STATIC_ASSERT(HELIOS_PACKAGE_GENERATION == UINT64_C(0x48454C49000000
  * corrected — a silent correction makes the finished descriptor disagree with
  * the resource the producer believes it asked for. */
 #define HELIOS_HWA2_FLAG_KMD_OWNED_MASK \
-    (HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE | HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY)
+    (HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE | HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY | \
+     HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED)
 
 /* Bind flags (§10.3, offset 72) — the shared protocol vocabulary, never a raw
  * D3D11/D3D12 bit reinterpretation. */
@@ -297,12 +299,13 @@ HELIOS_WDDM_STATIC_ASSERT(HELIOS_HWA2_FLAG_MASK ==
                                HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY |
                                HELIOS_HWA2_FLAG_PROTECTED | HELIOS_HWA2_FLAG_CROSS_ADAPTER |
                                HELIOS_HWA2_FLAG_CPU_VISIBLE |
-                               HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED | HELIOS_HWA2_FLAG_STANDARD),
-                          "the §10.3 flag mask is exactly its eleven bits");
-HELIOS_WDDM_STATIC_ASSERT(HELIOS_HWA2_FLAG_KMD_OWNED_MASK == 0x00000030u,
-                          "the KMD-owned pair is exactly DIRECT_FLIP_COMPATIBLE|D3D12_RUNTIME_PRIMARY");
+                               HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED | HELIOS_HWA2_FLAG_STANDARD |
+                               HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED),
+                          "the §10.3 flag mask is exactly its twelve bits");
+HELIOS_WDDM_STATIC_ASSERT(HELIOS_HWA2_FLAG_KMD_OWNED_MASK == 0x00000830u,
+                          "the KMD-owned set is DIRECT_FLIP_COMPATIBLE|D3D12_RUNTIME_PRIMARY|GUEST_PAGE_BACKED");
 HELIOS_WDDM_STATIC_ASSERT((HELIOS_HWA2_FLAG_KMD_OWNED_MASK & ~HELIOS_HWA2_FLAG_MASK) == 0u,
-                          "the KMD-owned pair must be a subset of the defined flags");
+                          "the KMD-owned set must be a subset of the defined flags");
 
 /* ------------------------------------------------------------------------ */
 /* §10.4 — HOB1: one complete contiguous translated outer command           */

@@ -4,7 +4,14 @@ pub const HELIOS_RESOURCE_ASSOCIATION_STRUCTURE_TYPE: u32 = 0x4852_4131;
 pub const HELIOS_RESOURCE_ASSOCIATION_ABI_VERSION: u32 = 1;
 pub const HELIOS_RESOURCE_ASSOCIATION_BYTES: u32 = 72;
 pub const HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING: u32 = 1 << 0;
-pub const HELIOS_RESOURCE_ASSOCIATION_FLAG_MASK: u32 = HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING;
+/// The outer allocation's host resource is backed by GUEST PAGES, so a consumer
+/// importing it must use the importable (fewest-property-flags) renderer memory
+/// type. Forwarded verbatim from the KMD's
+/// `HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED`; the UMD never infers it from its own
+/// offer, because the kernel can refuse the offer and fall back to host memory.
+pub const HELIOS_RESOURCE_ASSOCIATION_FLAG_GUEST_PAGE_BACKED: u32 = 1 << 1;
+pub const HELIOS_RESOURCE_ASSOCIATION_FLAG_MASK: u32 = HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING
+    | HELIOS_RESOURCE_ASSOCIATION_FLAG_GUEST_PAGE_BACKED;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,7 +174,7 @@ mod tests {
         );
         cases[7].0.outer_allocation_bytes = 0;
         cases[8] = (valid(), HeliosResourceAssociationRefusal::AssociationFlags);
-        cases[8].0.association_flags = 2;
+        cases[8].0.association_flags = 1 << 2;
         cases[9] = (valid(), HeliosResourceAssociationRefusal::CpuMapping);
         cases[9].0.association_flags = HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING;
         cases[10] = (valid(), HeliosResourceAssociationRefusal::Reserved1);

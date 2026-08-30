@@ -314,7 +314,19 @@ pub const HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED: u32 = 1 << 9;
 /// exact `D3DKMDT_STANDARDALLOCATION_TYPE`.
 pub const HELIOS_HWA2_FLAG_STANDARD: u32 = 1 << 10;
 /// Union of every defined flag. Any bit outside this mask is a hard reject.
-pub const HELIOS_HWA2_FLAG_MASK: u32 = 0x0000_07FF;
+/// The KMD backed this allocation with the CREATOR'S OWN PAGES rather than
+/// fresh host memory (offset 68, bit 11), so its host resource is a
+/// `VIRTIO_GPU_BLOB_MEM_GUEST` the host imported as a udmabuf.
+///
+/// KMD-owned, and it is a REPORT, not a request: the creator offers a buffer in
+/// [`crate::HeliosCpuBackingV1`] and the kernel alone decides whether it took
+/// it. A consumer that imports this allocation's host resource must therefore
+/// use the importable memory type — only the flagless one accepts a udmabuf,
+/// measured on the host GPU (`tools/udmabuf_import_probe.c`) and in-stack as
+/// `GbImp` 0 -> 1. Asking for the host-visible type leaves the host object
+/// uncreated and the next bind fails "failed to look up object N of type 8".
+pub const HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED: u32 = 1 << 11;
+pub const HELIOS_HWA2_FLAG_MASK: u32 = 0x0000_0FFF;
 /// The flag bits **only the KMD may set** — and therefore the exact set a
 /// create-*input* descriptor must leave clear.
 ///
@@ -334,8 +346,9 @@ pub const HELIOS_HWA2_FLAG_MASK: u32 = 0x0000_07FF;
 /// correction would make the descriptor disagree with the resource the UMD
 /// believes it asked for. Named once here so the input rule, the refusal
 /// payload, and the C mirror cannot drift apart.
-pub const HELIOS_HWA2_FLAG_KMD_OWNED_MASK: u32 =
-    HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE | HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY;
+pub const HELIOS_HWA2_FLAG_KMD_OWNED_MASK: u32 = HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE
+    | HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY
+    | HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED;
 
 // ── bind flags (§10.3, offset 72) ───────────────────────────────────────────
 //
@@ -630,7 +643,7 @@ const _: () = {
     assert!(core::mem::offset_of!(HeliosWddmAllocationDescV2, plane_count) == 96);
     assert!(core::mem::offset_of!(HeliosWddmAllocationDescV2, reserved) == 100);
     assert!(core::mem::offset_of!(HeliosWddmAllocationDescV2, planes) == 104);
-    // The eleven flag bits of §10.3 offset 68, and nothing else.
+    // The twelve flag bits of §10.3 offset 68, and nothing else.
     assert!(
         HELIOS_HWA2_FLAG_MASK
             == HELIOS_HWA2_FLAG_PRIMARY
@@ -644,12 +657,13 @@ const _: () = {
                 | HELIOS_HWA2_FLAG_CPU_VISIBLE
                 | HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED
                 | HELIOS_HWA2_FLAG_STANDARD
+                | HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED
     );
-    // The KMD-owned pair is a subset of the eleven, and is exactly the two bits
+    // The KMD-owned set is a subset of the twelve, and is exactly the bits
     // §10.3 says the kernel sets and no opener infers. The C mirror pins the
     // same literal, because there the union is spelled out by hand.
     assert!(HELIOS_HWA2_FLAG_KMD_OWNED_MASK & !HELIOS_HWA2_FLAG_MASK == 0);
-    assert!(HELIOS_HWA2_FLAG_KMD_OWNED_MASK == 0x0000_0030);
+    assert!(HELIOS_HWA2_FLAG_KMD_OWNED_MASK == 0x0000_0830);
     assert!(HELIOS_HWA2_MAX_PLANES == 4);
 
     // Four ASCII bytes read little-endian; see the same block under HOB1.
@@ -4418,10 +4432,10 @@ mod tests {
     #[test]
     fn hwa2_refuses_every_undefined_bit_and_class() {
         let mut d = primary_desc();
-        d.flags |= 1 << 11;
+        d.flags |= 1 << 12;
         assert_eq!(
             d.validate(PKG),
-            Err(HeliosAllocDescRejection::UnknownFlagBits { found: 1 << 11 })
+            Err(HeliosAllocDescRejection::UnknownFlagBits { found: 1 << 12 })
         );
 
         let mut d = primary_desc();
@@ -5493,8 +5507,8 @@ mod tests {
         assert_eq!(HELIOS_HWA2_MAGIC, 0x3241_5748);
         assert_eq!(HELIOS_HWA2_ABI_VERSION, 2);
         assert_eq!(HELIOS_HWA2_BYTES, 168);
-        assert_eq!(HELIOS_HWA2_FLAG_MASK, 0x0000_07FF);
-        assert_eq!(HELIOS_HWA2_FLAG_KMD_OWNED_MASK, 0x0000_0030);
+        assert_eq!(HELIOS_HWA2_FLAG_MASK, 0x0000_0FFF);
+        assert_eq!(HELIOS_HWA2_FLAG_KMD_OWNED_MASK, 0x0000_0830);
         assert_eq!(HELIOS_HWA2_BIND_MASK, 0x0000_07FF);
         assert_eq!(HELIOS_HWA2_MISC_MASK, 0x0000_000F);
         assert_eq!(HELIOS_HWA2_MAX_PLANES, 4);

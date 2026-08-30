@@ -843,6 +843,7 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
         desc.allocation_generation,
         desc.byte_size,
         cpu_mapping,
+        desc.has_flag(helios_protocol::HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED),
     ) {
         Ok(assigned) => assigned,
         Err(refusal) => {
@@ -1336,6 +1337,7 @@ pub(crate) unsafe fn allocate_wddm_resource(
                 desc.allocation_generation,
                 desc.byte_size,
                 cpu_mapping,
+                desc.has_flag(helios_protocol::HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED),
             )
             .map_err(|refusal| {
                 log_error!(
@@ -2136,6 +2138,7 @@ pub(crate) unsafe extern "C" fn open_resource(
         descriptor.allocation_generation,
         descriptor.byte_size,
         core::ptr::null_mut(),
+        descriptor.has_flag(helios_protocol::HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED),
     ) {
         Ok(assigned) => assigned,
         Err(refusal) => {
