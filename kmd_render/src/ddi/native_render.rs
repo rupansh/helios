@@ -3021,8 +3021,8 @@ fn begin_control_batch(
             .map_err(|refusal| refuse(refusal, STATUS_NO_MEMORY))?;
     }
     NR2_SLOT_TAKEN.fetch_add(1, Ordering::Relaxed);
-    let payload_len =
-        usize::try_from(header.total_payload_bytes).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let payload_len = usize::try_from(header.total_payload_bytes)
+        .map_err(|_| why(40, STATUS_INVALID_PARAMETER))?;
     let adapter = unsafe { native.adapter.as_ref() };
     let payload = adapter
         .with_virtio(|gpu| gpu.take_dma_buffer(payload_len))
@@ -3036,7 +3036,7 @@ fn begin_control_batch(
             .staging_mut()
             .retire(header.total_payload_bytes);
         NR2_SLOT_RETIRED.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_NO_MEMORY);
+        return Err(why(41, STATUS_NO_MEMORY));
     };
     scratch.control_building = Some(ControlBuilding {
         batch_token: header.batch_token,
@@ -3055,28 +3055,28 @@ fn copy_control_fragment(
     accept: &Hnr2Accept,
 ) -> Result<(), NTSTATUS> {
     let Some(building) = scratch.control_building.as_mut() else {
-        return Err(STATUS_INVALID_DEVICE_REQUEST);
+        return Err(why(50, STATUS_INVALID_DEVICE_REQUEST));
     };
     if building.batch_token != header.batch_token
         || building.total_payload_bytes != header.total_payload_bytes
         || building.full_payload_crc64 != header.full_payload_crc64
         || building.fragment_count != header.fragment_count
     {
-        return Err(STATUS_INVALID_DEVICE_REQUEST);
+        return Err(why(51, STATUS_INVALID_DEVICE_REQUEST));
     }
-    let start =
-        usize::try_from(header.fragment_payload_offset).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let start = usize::try_from(header.fragment_payload_offset)
+        .map_err(|_| why(52, STATUS_INVALID_PARAMETER))?;
     let end = start
         .checked_add(header.fragment_payload_bytes as usize)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or_else(|| why(53, STATUS_INVALID_PARAMETER))?;
     let dst = building
         .payload
         .as_mut_slice()
         .get_mut(start..end)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or_else(|| why(54, STATUS_INVALID_PARAMETER))?;
     let src = unsafe { (args.pCommand as *const u8).add(accept.layout.payload_offset as usize) };
     if !unsafe { copy_from_command(dst.as_mut_ptr(), src, dst.len()) } {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(why(55, STATUS_INVALID_PARAMETER));
     }
     Ok(())
 }
@@ -3100,7 +3100,7 @@ fn begin_executor_batch(
         // and may be replaced. A published collecting slot with any ticket is
         // never silently recycled.
         if !abandon_unsubmitted_building(scratch, native) {
-            return Err(STATUS_DEVICE_NOT_READY);
+            return Err(why(11, STATUS_DEVICE_NOT_READY));
         }
     }
 
@@ -3109,7 +3109,7 @@ fn begin_executor_batch(
 
     let context = native
         .acquire_operation()
-        .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        .ok_or_else(|| why(12, STATUS_INVALID_DEVICE_REQUEST))?;
     {
         let mut state = native.state.lock();
         if let Err(refusal) = state.staging_mut().checkout(header.total_payload_bytes) {
@@ -3123,25 +3123,25 @@ fn begin_executor_batch(
         bytes: header.total_payload_bytes,
     };
     let session_operation = crate::ddi::translation_session::acquire_execution_operation(session)
-        .ok_or(STATUS_DEVICE_NOT_READY)?;
+        .ok_or_else(|| why(14, STATUS_DEVICE_NOT_READY))?;
     if session_operation.transport_instance == 0 {
-        return Err(STATUS_DEVICE_NOT_READY);
+        return Err(why(15, STATUS_DEVICE_NOT_READY));
     }
-    let payload_len =
-        usize::try_from(header.total_payload_bytes).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let payload_len = usize::try_from(header.total_payload_bytes)
+        .map_err(|_| why(13, STATUS_INVALID_PARAMETER))?;
     let adapter = unsafe { native.adapter.as_ref() };
     let payload = adapter
         .with_virtio(|v| v.take_dma_buffer(payload_len))
         .ok()
         .flatten()
         .or_else(|| DmaBuffer::new(passive, payload_len))
-        .ok_or(STATUS_NO_MEMORY)?;
+        .ok_or_else(|| why(16, STATUS_NO_MEMORY))?;
     let meta = adapter
         .with_virtio(|v| v.take_dma_buffer(SUBMIT_META_BYTES))
         .ok()
         .flatten()
         .or_else(|| DmaBuffer::new(passive, SUBMIT_META_BYTES))
-        .ok_or(STATUS_NO_MEMORY)?;
+        .ok_or_else(|| why(17, STATUS_NO_MEMORY))?;
 
     let (slot_index, slot_generation) = {
         let mut executor = native.executor.lock();
@@ -3150,10 +3150,10 @@ fn begin_executor_batch(
             .iter()
             .position(|slot| matches!(slot, SubmissionSlot::Free))
         else {
-            return Err(STATUS_NO_MEMORY);
+            return Err(why(18, STATUS_NO_MEMORY));
         };
         let Some(slot_generation) = executor.mint_slot_generation() else {
-            return Err(STATUS_INVALID_DEVICE_REQUEST);
+            return Err(why(19, STATUS_INVALID_DEVICE_REQUEST));
         };
         (slot_index as u32, slot_generation)
     };
@@ -3170,10 +3170,10 @@ fn begin_executor_batch(
     {
         let mut executor = native.executor.lock();
         let Some(slot) = executor.slots.get_mut(slot_index as usize) else {
-            return Err(STATUS_INVALID_DEVICE_REQUEST);
+            return Err(why(20, STATUS_INVALID_DEVICE_REQUEST));
         };
         if !matches!(slot, SubmissionSlot::Free) {
-            return Err(STATUS_INVALID_DEVICE_REQUEST);
+            return Err(why(21, STATUS_INVALID_DEVICE_REQUEST));
         }
         *slot = SubmissionSlot::Collecting {
             identity,
@@ -3198,29 +3198,29 @@ fn copy_executor_fragment(
     accept: &Hnr2Accept,
 ) -> Result<(u64, u32), NTSTATUS> {
     let Some(building) = scratch.building.as_mut() else {
-        return Err(STATUS_INVALID_DEVICE_REQUEST);
+        return Err(why(30, STATUS_INVALID_DEVICE_REQUEST));
     };
     if building.identity.batch_token != header.batch_token
         || building.identity.payload_bytes as u64 != header.total_payload_bytes
         || building.identity.fragment_count != header.fragment_count
         || building.identity.full_payload_crc64 != header.full_payload_crc64
     {
-        return Err(STATUS_INVALID_DEVICE_REQUEST);
+        return Err(why(31, STATUS_INVALID_DEVICE_REQUEST));
     }
-    let dst_offset =
-        usize::try_from(header.fragment_payload_offset).map_err(|_| STATUS_INVALID_PARAMETER)?;
+    let dst_offset = usize::try_from(header.fragment_payload_offset)
+        .map_err(|_| why(32, STATUS_INVALID_PARAMETER))?;
     let bytes = header.fragment_payload_bytes as usize;
     let end = dst_offset
         .checked_add(bytes)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or_else(|| why(33, STATUS_INVALID_PARAMETER))?;
     let dst = building
         .payload
         .as_mut_slice()
         .get_mut(dst_offset..end)
-        .ok_or(STATUS_INVALID_PARAMETER)?;
+        .ok_or_else(|| why(34, STATUS_INVALID_PARAMETER))?;
     let source = unsafe { (args.pCommand as *const u8).add(accept.layout.payload_offset as usize) };
     if !unsafe { copy_from_command(dst.as_mut_ptr(), source, bytes) } {
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(why(35, STATUS_INVALID_PARAMETER));
     }
     Ok((building.identity.slot_generation, building.slot_index))
 }
@@ -3255,7 +3255,7 @@ fn prepare_executor_commit(
     let patches = &patches[..patch_count];
     let Some(building_ref) = building.as_ref() else {
         NR2_NO_STAGE.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_DEVICE_REQUEST);
+        return Err(why(70, STATUS_INVALID_DEVICE_REQUEST));
     };
     if building_ref.identity.batch_token != header.batch_token
         || building_ref.identity.slot_generation == 0
@@ -3266,7 +3266,7 @@ fn prepare_executor_commit(
         || building_ref.session.transport_instance == 0
     {
         NR2_NO_STAGE.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_DEVICE_REQUEST);
+        return Err(why(71, STATUS_INVALID_DEVICE_REQUEST));
     }
 
     let actual_crc = helios_protocol::wddm::crc64_ecma(building_ref.payload.as_slice());
@@ -3274,7 +3274,7 @@ fn prepare_executor_commit(
         || building_ref.identity.full_payload_crc64 != header.full_payload_crc64
     {
         NR2_NO_STAGE.fetch_add(1, Ordering::Relaxed);
-        return Err(STATUS_INVALID_PARAMETER);
+        return Err(why(72, STATUS_INVALID_PARAMETER));
     }
     let admission = match helios_kmd_logic::venus_executor::validate_venus_stream(
         building_ref.payload.as_slice(),
@@ -3306,7 +3306,7 @@ fn prepare_executor_commit(
             || patch.operand_kind != HELIOS_HNR2_OPERAND_KIND_HOST_RESOURCE_ID32
         {
             NR2_NO_RESID.fetch_add(1, Ordering::Relaxed);
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(why(73, STATUS_INVALID_PARAMETER));
         }
     }
 
@@ -3328,7 +3328,7 @@ fn prepare_executor_commit(
     let mut allocations = Vec::new();
     allocations
         .try_reserve_exact(uses.len())
-        .map_err(|_| STATUS_NO_MEMORY)?;
+        .map_err(|_| why(77, STATUS_NO_MEMORY))?;
     let passive = unsafe { PassiveLevel::assume() };
     for use_record in uses {
         let index = use_record.allocation_list_index as usize;
@@ -3376,10 +3376,10 @@ fn prepare_executor_commit(
                     != header
                         .reply_offset
                         .checked_add(HELIOS_HVR1_HEADER_SIZE as u64)
-                        .ok_or(STATUS_INVALID_PARAMETER)?
+                        .ok_or_else(|| why(76, STATUS_INVALID_PARAMETER))?
             {
                 NR2_NO_REPLY.fetch_add(1, Ordering::Relaxed);
-                return Err(STATUS_INVALID_PARAMETER);
+                return Err(why(74, STATUS_INVALID_PARAMETER));
             }
             let set_reply_patch = patches[order[0] as usize];
             let import_patch = patches[order[1] as usize];
@@ -3429,17 +3429,17 @@ fn prepare_executor_commit(
                 .reply_offset
                 .checked_add(HELIOS_HVR1_HEADER_SIZE as u64)
                 .and_then(|offset| offset.checked_add(ExecutionReply::RAW_ALLOCATE_REPLY_BYTES))
-                .ok_or(STATUS_INVALID_PARAMETER)?;
+                .ok_or_else(|| why(78, STATUS_INVALID_PARAMETER))?;
             if reply_end > reply_guard.byte_size
                 || header.reply_capacity_bytes
                     < HELIOS_HVR1_HEADER_SIZE as u64 + ExecutionReply::RAW_ALLOCATE_REPLY_BYTES
             {
                 NR2_NO_REPLY.fetch_add(1, Ordering::Relaxed);
-                return Err(STATUS_INVALID_PARAMETER);
+                return Err(why(75, STATUS_INVALID_PARAMETER));
             }
             let snapshot_generation =
                 crate::ddi::translation_session::mint_execution_snapshot_generation(session)
-                    .ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+                    .ok_or_else(|| why(79, STATUS_INVALID_DEVICE_REQUEST))?;
             let reply_use_ordinal =
                 use_ordinals[set_reply_patch.allocation_list_index as usize] as usize;
             let reply_use = uses[reply_use_ordinal];
@@ -3453,13 +3453,18 @@ fn prepare_executor_commit(
                 batch_token: header.batch_token,
                 owner_context_generation: native.context_generation,
             };
-            let slot = crate::ddi::translation_session::admit_execution_reply(session, &request)?;
-            let slot_index = slot.slot_index.ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+            let slot = crate::ddi::translation_session::admit_execution_reply(session, &request)
+                .map_err(|status| why(80, status))?;
+            let slot_index = slot
+                .slot_index
+                .ok_or_else(|| why(81, STATUS_INVALID_DEVICE_REQUEST))?;
             let facts = crate::ddi::create_allocation::K11ReplyPoolFacts {
                 allocation_generation: reply_guard.allocation_generation,
                 resource_id: reply_guard.resource_id,
                 transport_instance: reply_guard.transport_instance,
-                kernel_va: reply_guard.kernel_va.ok_or(STATUS_INVALID_DEVICE_REQUEST)?,
+                kernel_va: reply_guard
+                    .kernel_va
+                    .ok_or_else(|| why(82, STATUS_INVALID_DEVICE_REQUEST))?,
                 byte_size: reply_guard.byte_size,
             };
             unsafe {
@@ -3518,7 +3523,7 @@ fn prepare_executor_commit(
     // proved every destination is the exact generated zero placeholder in the
     // KMD-owned copy; user memory remains untouched.
     let Some(building) = building.as_mut() else {
-        return Err(STATUS_INVALID_DEVICE_REQUEST);
+        return Err(why(83, STATUS_INVALID_DEVICE_REQUEST));
     };
     if let Some((facts, operand_offset, raw_reply_offset, raw_reply_bytes)) = private_reply_patch {
         crate::ddi::translation_session::prepare_generated_reply(
@@ -3528,7 +3533,8 @@ fn prepare_executor_commit(
             operand_offset,
             raw_reply_offset,
             raw_reply_bytes,
-        )?;
+        )
+        .map_err(|status| why(84, status))?;
     }
     for patch in patches {
         if private_reply_patch
@@ -3537,14 +3543,14 @@ fn prepare_executor_commit(
             continue;
         }
         let Some(guard) = guard_for_patch(*patch) else {
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(why(85, STATUS_INVALID_PARAMETER));
         };
         let start = patch.payload_offset as usize;
         let end = start
             .checked_add(patch.encoded_width as usize)
-            .ok_or(STATUS_INVALID_PARAMETER)?;
+            .ok_or_else(|| why(86, STATUS_INVALID_PARAMETER))?;
         let Some(dst) = building.payload.as_mut_slice().get_mut(start..end) else {
-            return Err(STATUS_INVALID_PARAMETER);
+            return Err(why(87, STATUS_INVALID_PARAMETER));
         };
         dst.copy_from_slice(&guard.resource_id.to_le_bytes());
     }
@@ -3563,14 +3569,14 @@ fn finalize_executor_commit(
     prepared: PreparedExecutorCommit,
 ) -> Result<(), NTSTATUS> {
     let Some(building) = scratch.building.take() else {
-        return Err(STATUS_INVALID_DEVICE_REQUEST);
+        return Err(why(90, STATUS_INVALID_DEVICE_REQUEST));
     };
     if building.slot_index != prepared.slot_index
         || building.identity.batch_token != prepared.identity.batch_token
         || building.identity.slot_generation != prepared.identity.slot_generation
     {
         drop(building);
-        return Err(STATUS_INVALID_DEVICE_REQUEST);
+        return Err(why(91, STATUS_INVALID_DEVICE_REQUEST));
     }
     let batch = ReadyBatch {
         payload: building.payload,
@@ -3587,7 +3593,7 @@ fn finalize_executor_commit(
     let Some(slot) = executor.slots.get_mut(prepared.slot_index as usize) else {
         drop(executor);
         drop(batch);
-        return Err(STATUS_INVALID_DEVICE_REQUEST);
+        return Err(why(92, STATUS_INVALID_DEVICE_REQUEST));
     };
     let old = core::mem::replace(slot, SubmissionSlot::Free);
     match old {
@@ -3606,7 +3612,7 @@ fn finalize_executor_commit(
             *slot = other;
             drop(executor);
             drop(batch);
-            Err(STATUS_INVALID_DEVICE_REQUEST)
+            Err(why(93, STATUS_INVALID_DEVICE_REQUEST))
         }
     }
 }
@@ -3879,6 +3885,42 @@ fn refuse(refusal: RenderRefusal, status: NTSTATUS) -> NTSTATUS {
     status
 }
 
+/// How many Render refusals `refuse()` does NOT name, and the site of the first
+/// eight in order (`Nr2WhyN`, `Nr2W0`..`Nr2W7`).
+///
+/// ⛔ A BLOCK-FLUSHED COUNTER CANNOT REPORT THIS AND A LAST-VALUE ONE CANNOT
+/// EITHER. `Nr2NoStage`/`Nr2NoResid`/`Nr2NoReply` ride `NR2_COUNTERS`, which is
+/// flushed only from the SUCCESS paths — the refusal that loses the context is
+/// the last thing that context does, so its bump may never be published. And one
+/// refusal poisons the session, so every command after it is refused too: the
+/// last value is the cascade, the FIRST is the one with a cause. Publishing
+/// immediately, bounded to eight, costs at most 24 registry writes per boot.
+///
+/// Site codes: 1-8 `render`, 11-21 `begin_executor_batch`, 30-35
+/// `copy_executor_fragment`, 40-41 `begin_control_batch`, 50-55
+/// `copy_control_fragment`, 60-69 `commit`, 70-87 `prepare_executor_commit`,
+/// 90-93 `finalize_executor_commit`, 100-108 the control payload.
+///
+/// PASSIVE-only, like [`refuse`]: every caller is on the Render path.
+const WHY_RING: usize = 8;
+static NR2_WHY_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn why(site: u32, status: NTSTATUS) -> NTSTATUS {
+    let n = NR2_WHY_COUNT.fetch_add(1, Ordering::Relaxed);
+    crate::diag::record_named_bytes(b"Nr2WhyN", n.saturating_add(1));
+    if (n as usize) < WHY_RING {
+        crate::diag::record_named_bytes(&[b'N', b'r', b'2', b'W', b'0' + n as u8], site);
+    }
+    status
+}
+
+/// [`why`] for the control payload, whose refusals are an outcome rather than an
+/// NTSTATUS.
+fn why_ctl(site: u32) -> ControlPayloadOutcome {
+    why(site, STATUS_INVALID_PARAMETER);
+    ControlPayloadOutcome::Refused
+}
+
 // ── `DxgkDdiRender`, the HNR2 arm ────────────────────────────────────────────
 
 /// One HNR2 fragment on an HVC1 context.
@@ -3908,14 +3950,14 @@ pub(crate) unsafe fn render(
         return STATUS_SUCCESS;
     }
     if args.pCommand.is_null() || args.pDmaBuffer.is_null() {
-        return STATUS_INVALID_PARAMETER;
+        return why(1, STATUS_INVALID_PARAMETER);
     }
 
     let Some(mut claim) = native.claim() else {
         // Counted as `Nr2Reent`; the status is the generic refusal because
         // `DxgkDdiRender`'s documented return set is narrow and every reason
         // this arm has lives in a counter, not in the NTSTATUS.
-        return STATUS_INVALID_PARAMETER;
+        return why(2, STATUS_INVALID_PARAMETER);
     };
 
     // ── the header ──────────────────────────────────────────────────────────
@@ -3930,7 +3972,7 @@ pub(crate) unsafe fn render(
     // SAFETY: `raw` is exactly the header size; `pCommand` is untrusted and is
     // read only inside the shim's exception frame.
     if !unsafe { copy_from_command(raw.as_mut_ptr(), args.pCommand as *const u8, header_bytes) } {
-        return STATUS_INVALID_PARAMETER;
+        return why(3, STATUS_INVALID_PARAMETER);
     }
     let Ok(header) = bytemuck::try_pod_read_unaligned::<HeliosNativeRenderV2>(&raw) else {
         return refuse(
@@ -4036,7 +4078,7 @@ pub(crate) unsafe fn render(
                 header.full_payload_crc64,
             )
         } {
-            return STATUS_INVALID_PARAMETER;
+            return why(8, STATUS_INVALID_PARAMETER);
         }
         args.pDmaBuffer = unsafe { (args.pDmaBuffer as *mut u8).add(header_bytes) as *mut c_void };
         unsafe { advance_private_data(args) };
@@ -4078,7 +4120,7 @@ fn commit(
         );
     }
     if list_count != 0 && args.pAllocationList.is_null() {
-        return STATUS_INVALID_PARAMETER;
+        return why(60, STATUS_INVALID_PARAMETER);
     }
 
     // ── the two tables, copied out of the command buffer before anything reads
@@ -4097,7 +4139,7 @@ fn commit(
             )
         };
         if !ok {
-            return STATUS_INVALID_PARAMETER;
+            return why(61, STATUS_INVALID_PARAMETER);
         }
     }
     if patch_count != 0 {
@@ -4111,7 +4153,7 @@ fn commit(
             )
         };
         if !ok {
-            return STATUS_INVALID_PARAMETER;
+            return why(62, STATUS_INVALID_PARAMETER);
         }
     }
 
@@ -4147,7 +4189,7 @@ fn commit(
         Err(refusal) => return refuse(refusal, STATUS_BUFFER_TOO_SMALL),
     };
     if plan.count != 0 && args.pPatchLocationListOut.is_null() {
-        return STATUS_INVALID_PARAMETER;
+        return why(63, STATUS_INVALID_PARAMETER);
     }
 
     for i in 0..plan.count {
@@ -4284,7 +4326,7 @@ fn commit(
         && (args.pDmaBufferPrivateData.is_null()
             || (args.DmaBufferPrivateDataSize as usize) < size_of::<Hnr2KmdDmaPrivateV1>())
     {
-        return STATUS_INVALID_PARAMETER;
+        return why(65, STATUS_INVALID_PARAMETER);
     }
 
     let prepared_executor = if native.class == NativeClass::Queue {
@@ -4341,7 +4383,7 @@ fn commit(
                 .staging_mut()
                 .retire(header.total_payload_bytes);
         }
-        return STATUS_INVALID_PARAMETER;
+        return why(67, STATUS_INVALID_PARAMETER);
     }
 
     // ── the control-context reply slot, and the finite host INIT ─────────────
@@ -4364,7 +4406,7 @@ fn commit(
                     .staging_mut()
                     .retire(header.total_payload_bytes);
                 NR2_SLOT_RETIRED.fetch_add(1, Ordering::Relaxed);
-                return STATUS_INVALID_PARAMETER;
+                return why(68, STATUS_INVALID_PARAMETER);
             }
             building.payload.as_mut_slice()
         } else {
@@ -4377,7 +4419,7 @@ fn commit(
                     .staging_mut()
                     .retire(header.total_payload_bytes);
                 NR2_SLOT_RETIRED.fetch_add(1, Ordering::Relaxed);
-                return STATUS_INVALID_PARAMETER;
+                return why(69, STATUS_INVALID_PARAMETER);
             }
             &mut init_payload
         };
@@ -4541,7 +4583,7 @@ fn control_render(
     };
     let admission = match hts1::admit_control_render(session, &request) {
         Ok(admission) => admission,
-        Err(status) => return status,
+        Err(status) => return why(108, status),
     };
     NR2_CONTROL_RENDERS.fetch_add(1, Ordering::Relaxed);
     // The finite operation and HVR1 publication are synchronous. Success
@@ -4600,7 +4642,7 @@ fn run_control_payload(
             == helios_protocol::translation_session::HELIOS_HTS1_INIT_MAGIC
     {
         if !accept.has_reply || !patches.is_empty() || uses.len() != 1 {
-            return ControlPayloadOutcome::Refused;
+            return why_ctl(100);
         }
         return match crate::ddi::translation_session::session_init(
             session,
@@ -4647,13 +4689,13 @@ fn run_control_payload(
         }
         return match crate::ddi::translation_session::execute_control_no_reply(session, payload) {
             Ok(()) => ControlPayloadOutcome::Completed,
-            Err(_) => ControlPayloadOutcome::Refused,
+            Err(_) => why_ctl(101),
         };
     }
 
     if uses.len() != 1 || patches.len() != 1 || admission.slot_index.is_none() {
         NR2_NO_REPLY.fetch_add(1, Ordering::Relaxed);
-        return ControlPayloadOutcome::Refused;
+        return why_ctl(102);
     }
     let patch = patches[0];
     let expected = expected_operands[0];
@@ -4673,11 +4715,11 @@ fn run_control_payload(
         || args.pAllocationList.is_null()
     {
         NR2_NO_REPLY.fetch_add(1, Ordering::Relaxed);
-        return ControlPayloadOutcome::Refused;
+        return why_ctl(103);
     }
     let use_record = uses[0];
     if use_record.allocation_list_index as usize != reply_index {
-        return ControlPayloadOutcome::Refused;
+        return why_ctl(104);
     }
     let handle = unsafe { (*args.pAllocationList.add(reply_index)).hDeviceSpecificAllocation };
     let passive = unsafe { PassiveLevel::assume() };
@@ -4693,14 +4735,14 @@ fn run_control_payload(
         return ControlPayloadOutcome::Refused;
     };
     let Some(kernel_va) = guard.kernel_va else {
-        return ControlPayloadOutcome::Refused;
+        return why_ctl(105);
     };
     if guard.hvm1_role != HELIOS_HVM1_ROLE_REPLY_POOL
         || guard.allocation_generation != use_record.expected_allocation_generation
         || guard.resource_id == 0
         || guard.transport_instance == 0
     {
-        return ControlPayloadOutcome::Refused;
+        return why_ctl(106);
     }
     let facts = crate::ddi::create_allocation::K11ReplyPoolFacts {
         allocation_generation: guard.allocation_generation,
@@ -4722,7 +4764,7 @@ fn run_control_payload(
         generated.opcode,
     ) {
         Ok(()) => ControlPayloadOutcome::Published,
-        Err(_) => ControlPayloadOutcome::Refused,
+        Err(_) => why_ctl(107),
     }
 }
 
