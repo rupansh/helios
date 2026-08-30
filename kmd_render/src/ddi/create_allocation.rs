@@ -77,7 +77,8 @@ use helios_protocol::{
     HELIOS_HWA2_BIND_SHADER_RESOURCE, HELIOS_HWA2_BIND_UNORDERED_ACCESS, HELIOS_HWA2_BYTES,
     HELIOS_HWA2_FLAG_CPU_VISIBLE, HELIOS_HWA2_FLAG_CROSS_ADAPTER,
     HELIOS_HWA2_FLAG_D3D12_RUNTIME_PRIMARY, HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE,
-    HELIOS_HWA2_FLAG_DISPLAYABLE, HELIOS_HWA2_FLAG_PRIMARY, HELIOS_HWA2_FLAG_PROTECTED,
+    HELIOS_HWA2_FLAG_DISPLAYABLE, HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED, HELIOS_HWA2_FLAG_PRIMARY,
+    HELIOS_HWA2_FLAG_PROTECTED,
     HELIOS_HWA2_FLAG_RESOURCE_ASSOCIATED, HELIOS_HWA2_FLAG_SHARED, HELIOS_HWA2_FLAG_STANDARD,
     HELIOS_HWA2_FLAG_STEREO, HELIOS_HWA2_KIND_BUFFER, HELIOS_HWA2_KIND_IMAGE,
     HELIOS_HWA2_KIND_PAGING_OBJECT, HELIOS_HWA2_KIND_STANDARD_PRIMARY,
@@ -3158,15 +3159,16 @@ fn classify_hwa2(
     }
 }
 
-/// The largest allocation a guest-page import can serve.
+/// The host's stock udmabuf `list_limit`, in ENTRIES — the one bound both
+/// guest-page import paths actually have.
 ///
-/// The host turns the memory-entry list into a udmabuf, and stock udmabuf's
-/// `list_limit` is 1024 entries (read from `/sys/module/udmabuf/parameters/
-/// list_limit` on this host, 2026-08-30). Entries are COALESCED runs, not pages,
-/// so 4 MiB is a floor rather than the true ceiling — but it is the number
-/// route (I) measured against, and exceeding the host's limit fails the create
-/// rather than degrading, so the cap stays where the evidence is.
-const HWA2_GUEST_BACKING_MAX_BYTES: u64 = 4 << 20;
+/// QEMU turns a `VIRTIO_GPU_BLOB_MEM_GUEST` memory-entry list into one udmabuf,
+/// and `/sys/module/udmabuf/parameters/list_limit` is 1024 on this host. Entries
+/// are COALESCED RUNS, not pages, so this bounds FRAGMENTATION, not size: a
+/// 64 MiB trial needed 3,543 ranges and was rejected (`FINDINGS.md`), while
+/// measured 4 MiB HWA2 buffers used 18-797. Each consumer converts it into the
+/// shape of the bound it can actually check.
+const UDMABUF_LIST_LIMIT_ENTRIES: usize = 1024;
 
 /// Counters for the guest-page backing path. Every one of these is a REFUSAL
 /// that silently falls back to a host allocation — i.e. back to the two-buffer
@@ -3175,6 +3177,12 @@ static GUEST_BACK_OK: AtomicU32 = AtomicU32::new(0);
 static GUEST_BACK_OFF: AtomicU32 = AtomicU32::new(0);
 static GUEST_BACK_NO_VA: AtomicU32 = AtomicU32::new(0);
 static GUEST_BACK_TOO_BIG: AtomicU32 = AtomicU32::new(0);
+/// The coalesced list exceeded the host's udmabuf `list_limit`. Read it WITH
+/// `GbEntN`, which is published before the refusal: this is fragmentation, not
+/// size, so the same byte count can pass and fail across runs.
+static GUEST_BACK_ENTRIES: AtomicU32 = AtomicU32::new(0);
+/// Largest successfully imported guest backing this boot, in KiB.
+static GUEST_BACK_IMPORT_OK_BYTES_K: AtomicU32 = AtomicU32::new(0);
 static GUEST_BACK_MDL: AtomicU32 = AtomicU32::new(0);
 /// `MmProbeAndLockPages` refused (SEH). The expected cause is that
 /// `DxgkDdiCreateAllocation` did not run in the creating process, which makes a
@@ -3197,6 +3205,8 @@ pub(crate) fn dump_guest_backing_counters() {
         (&b"GbOff"[..], &GUEST_BACK_OFF),
         (&b"GbNoVa"[..], &GUEST_BACK_NO_VA),
         (&b"GbBig"[..], &GUEST_BACK_TOO_BIG),
+        (&b"GbEnts"[..], &GUEST_BACK_ENTRIES),
+        (&b"GbImpSuc"[..], &GUEST_BACK_IMPORT_OK_BYTES_K),
         (&b"GbMdl"[..], &GUEST_BACK_MDL),
         (&b"GbProbe"[..], &GUEST_BACK_PROBE),
         (&b"GbPfn"[..], &GUEST_BACK_PFN),
@@ -3252,9 +3262,12 @@ unsafe fn build_guest_backed_linear(
     // page-ROUNDED (`CpuBacking::new_page_rounded`), so the MDL covers whole
     // pages this allocation owns. Everything downstream — blob size, import
     // size, charged extent — uses `mapped`, not `bytes`.
+    // No byte cap here: this path COALESCES, so size does not decide whether the
+    // host will take the list — `UDMABUF_LIST_LIMIT_ENTRIES` does, checked below
+    // against the list itself. `u32::MAX` is the blob/import wire bound.
     let Some(mapped) = bytes
         .checked_next_multiple_of(PAGE as u64)
-        .filter(|m| *m != 0 && *m <= HWA2_GUEST_BACKING_MAX_BYTES && *m <= u32::MAX as u64)
+        .filter(|m| *m != 0 && *m <= u32::MAX as u64)
     else {
         GUEST_BACK_TOO_BIG.fetch_add(1, Ordering::Relaxed);
         return None;
@@ -3268,8 +3281,15 @@ unsafe fn build_guest_backed_linear(
     }
     let bytes = mapped;
     let page_count = (bytes >> 12) as usize;
+    // ⛔ RESERVE THE BOUND, NOT THE PAGE COUNT. With no byte cap, `page_count` is
+    // whatever the creator's buffer is, and a list longer than
+    // `UDMABUF_LIST_LIMIT_ENTRIES` is refused anyway — reserving per page would
+    // take megabytes of nonpaged pool to build a list the host would not accept.
     let mut entries = Vec::<VirtioGpuMemEntry>::new();
-    if entries.try_reserve_exact(page_count).is_err() {
+    if entries
+        .try_reserve_exact(UDMABUF_LIST_LIMIT_ENTRIES)
+        .is_err()
+    {
         GUEST_BACK_MDL.fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -3303,6 +3323,7 @@ unsafe fn build_guest_backed_linear(
     // SAFETY: the MDL is locked, so its PFN array is populated.
     let pfns = unsafe { helios_mm_get_mdl_pfn_array(mdl) };
     let mut valid = !pfns.is_null();
+    let mut too_many = false;
     if valid {
         for index in 0..page_count {
             // SAFETY: index < page_count, and the MDL describes exactly that
@@ -3320,12 +3341,29 @@ unsafe fn build_guest_backed_linear(
                     continue;
                 }
             }
+            // A new run, and the list is already full: entry 1025 does not
+            // exist, so stop and refuse rather than truncate.
+            if entries.len() == UDMABUF_LIST_LIMIT_ENTRIES {
+                too_many = true;
+                break;
+            }
             entries.push(VirtioGpuMemEntry {
                 addr: address,
                 length: PAGE as u32,
                 padding: 0,
             });
         }
+    }
+    if too_many {
+        // `GbEntN` reads exactly the limit in this case — the count is where the
+        // walk stopped, not the buffer's true fragmentation.
+        crate::diag::record_named_bytes(b"GbEntN", entries.len() as u32);
+        unsafe {
+            wdk_sys::ntddk::MmUnlockPages(mdl);
+            IoFreeMdl(mdl);
+        }
+        GUEST_BACK_ENTRIES.fetch_add(1, Ordering::Relaxed);
+        return None;
     }
     let exported = entries
         .iter()
@@ -3366,6 +3404,7 @@ unsafe fn build_guest_backed_linear(
     crate::diag::record_named_bytes(b"GbGpaLo", entries[0].addr as u32);
     crate::diag::record_named_bytes(b"GbGpaHi", (entries[0].addr >> 32) as u32);
 
+    let entries_len = entries.len();
     // MAPPABLE|SHAREABLE mirrors HVM1 role 2, the one guest-blob shape this
     // host path is exercised with every boot.
     let resource_id = match crate::virtio::ctrl::resource_create_guest_blob(
@@ -3419,10 +3458,21 @@ unsafe fn build_guest_backed_linear(
                 },
             );
             GUEST_BACK_IMPORT.fetch_add(1, Ordering::Relaxed);
+            // ⭐ WHAT the host refused, not just that it did. The 4 MiB byte cap
+            // this path used to carry was removed as "the wrong shape of bound",
+            // and the host then answered OUT_OF_DEVICE_MEMORY 520 times in one
+            // boot — so either size or fragmentation is a real host limit and
+            // the two are not distinguishable without both numbers.
+            crate::diag::record_named_bytes(b"GbImpSzK", (bytes / 1024) as u32);
+            crate::diag::record_named_bytes(b"GbImpEn", entries_len as u32);
             return None;
         }
     };
     GUEST_BACK_OK.fetch_add(1, Ordering::Relaxed);
+    // The LARGEST import the host has actually accepted this boot. Read as a
+    // pair with `GbImpSzK`: together they bracket the real host limit, which is
+    // what a byte cap here must be named for.
+    GUEST_BACK_IMPORT_OK_BYTES_K.fetch_max((bytes / 1024) as u32, Ordering::Relaxed);
     Some(CreatedBacking {
         resource_id,
         venus_memory_id: memory_id.get(),
@@ -4050,6 +4100,14 @@ unsafe fn admit_hwa2(
         desc.flags |= HELIOS_HWA2_FLAG_DIRECT_FLIP_COMPATIBLE;
     }
 
+    // ⛔ REPORT, not echo: the offer is input-only and the kernel may refuse it
+    // (every refusal is a `Gb*` counter), so only `created.guest_backed` — what
+    // the backing constructor actually built — may set this. A consumer reads it
+    // to choose the importable memory type for the host resource.
+    if created.guest_backed {
+        desc.flags |= HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED;
+    }
+
     // Did the CREATOR offer pages? Captured before the clear below, and
     // published with the generation this KMD is about to stamp. It separates
     // "the KMD never reached the write-back" from "the KMD wrote a good record
@@ -4252,12 +4310,12 @@ unsafe fn admit_hvm1(
         bump(&CREATE_SIZE_REJECT, b"AcSize");
         return Err(STATUS_INVALID_PARAMETER);
     }
-    // K2a imports one finite udmabuf scatter list.  The stock Linux limit is
-    // exactly 1024 pages, so every CPU-visible HVM1 allocation is capped at
-    // 4 MiB rather than relying on the importer to truncate or on an unproved
-    // larger bound.  Role 4 never enters udmabuf and is bounded separately by
-    // the u32/page-granular HVM1 contract above.
-    const HVM1_CPU_VISIBLE_MAX_BYTES: u64 = 1024 * PAGE as u64;
+    // K2a states no memory-entry list of its own — the backing store does — so
+    // the only bound this path can check is size. One page per entry is the
+    // uncoalesced worst case, which makes `UDMABUF_LIST_LIMIT_ENTRIES` pages the
+    // largest size that CANNOT exceed the host's limit however it fragments.
+    // Role 4 never enters udmabuf and is bounded by the u32/page contract above.
+    const HVM1_CPU_VISIBLE_MAX_BYTES: u64 = UDMABUF_LIST_LIMIT_ENTRIES as u64 * PAGE as u64;
     if cpu_visible && record.byte_size > HVM1_CPU_VISIBLE_MAX_BYTES {
         bump(&CREATE_SIZE_REJECT, b"AcSize");
         return Err(STATUS_NOT_SUPPORTED);
