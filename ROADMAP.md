@@ -475,6 +475,68 @@ are correctly NOT guest-backed — they are GPU-side and have no CPU access. Onl
 the staging one is (`gb-witness ... bytes=4194304`). Guest backing is not doing
 the work in stage 4; it is doing it in the staging resource the result lands in.
 
+### ⭐⭐⭐⭐⭐ 2026-08-30 — THE CLASS: ONE ALLOCATION, TWO HOST MATERIALIZATIONS
+
+⛔ **CORRECTION.** "Shared textures are the next blocker" was too broad and was
+reached by comparing two probes that differ in size, format path, readback
+helper AND sharing. `tools/d3d11_shared_variable_probe.cpp` changes ONE thing at
+a time, one process, one device, same 256x256 BGRA target and clear:
+
+```
+1 plain              centre=0xff407fbf  PASS
+2 SHARED             centre=0xff407fbf  PASS
+3 SHARED_NTHANDLE    centre=0xff407fbf  PASS
+5a before open       centre=0xff407fbf  PASS
+5b CreateSharedHandle hr=0
+5c after handle      centre=0xff407fbf  PASS
+5d OpenSharedResource1 hr=0
+5e after open        centre=0x00000000  FAIL
+5f original re-clear centre=0x00000000  FAIL
+```
+
+**Creating a shared texture is fine. Taking the handle is fine. The OPEN is what
+breaks it** — and `5f` proves it is not a contents discard: a fresh clear on the
+ORIGINAL afterwards still reads zero, so the creator's image is permanently
+orphaned.
+
+### The mechanism, and why it is a class rather than a bug
+
+`open_resource` builds the opened texture through the SAME
+`create_associated_resource` path as a fresh create, and
+`assign_outer_allocation` mints a **NEW `outer_allocation_token`** for it. So one
+WDDM allocation acquires a second token, a second `vn_device_memory`, and a
+second deferred `vkAllocateMemory` — which the KMD patches with the SAME host
+resource id. **Two host `VkDeviceMemory` objects import one host resource, and
+the second invalidates the first.**
+
+The ICD already treats this as illegal and cannot catch it:
+* registration refuses a duplicate **token**
+  (`vn_device_memory.c:1102-1111`) — but the open's token is new, so it never
+  fires;
+* `vn_device_memory_helios_binding_memory` returns NULL when two memories claim
+  one token, i.e. "ambiguous, unusable";
+* the run logged `foreign_vulkan_handle_rejected=1`, and the batch carried
+  `uses=1` where the working probe carries `uses=2` — a dropped use.
+
+⇒ **The invariant is enforced on the UMD-minted token, but the identity is the
+KMD's allocation.** Everything this session has been an instance of the same
+class — two objects where there must be one, failing silently as zero pixels:
+the heap-vs-host CpuBacking split, the ICD asking for a memory type the host
+refuses so no object exists, a guest blob whose size the host refuses so the
+fallback silently re-splits it, and now one allocation with two host
+materializations.
+
+**The class fix is to enforce "one allocation, exactly one host materialization"
+at the party that owns the allocation — the KMD** — rather than on a token the
+UMD mints per open. The KMD already holds the allocation's canonical
+`venus_memory_id`; an open should bind to it instead of causing a second import.
+
+⚠ Not yet implemented, and not yet proven to be what blacks out the desktop —
+DWM opens surfaces across processes, and this repro is two devices in one
+process. That is the same shape (two tokens, two memories, one host resource)
+but it is not the same measurement, and the last claim that outran its evidence
+is corrected two paragraphs above.
+
 ### ⛔ TWO PRODUCER PATHS REMAIN, and the desktop is still black
 
 **(a) create-time initial data** — stage 3 INIT still reads all zeros. Not the
