@@ -406,6 +406,24 @@ pub static BS_SAMPLE_SEEN: AtomicU32 = AtomicU32::new(0);
 pub static BS_SAMPLE_POISON: AtomicU32 = AtomicU32::new(0);
 /// What tools/d3d11_poison_copy_probe.cpp fills its staging textures with.
 const BS_PROBE_POISON: u32 = 0xCDCD_CDCD;
+/// Identity witness for the deferred vkAllocateMemory import of PRIMARY
+/// allocations (`Nr2PImp*`): rotating (resource id, generation-low32) pairs
+/// plus the last primary's HWA2 flags — joins UMD `alloc_gen` ↔ patched rid ↔
+/// the scanout's bound rid in one boot.
+pub static IMP_PRIMARY_N: AtomicU32 = AtomicU32::new(0);
+pub static IMP_PRIMARY_RID: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+pub static IMP_PRIMARY_GEN: [AtomicU32; 4] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+pub static IMP_PRIMARY_FLAGS: AtomicU32 = AtomicU32::new(0);
 /// System PTEs are a global lease; a per-allocation map is otherwise unbounded.
 const BS_SAMPLE_MAX: u32 = 64;
 /// Cap the all-zero case: this runs per use per submit.
@@ -1423,6 +1441,16 @@ impl OpenOuterUse {
         if let Some(ctx) = (unsafe { resolve_alloc(allocation as HANDLE) }) {
             ctx.import_operand_substitutions
                 .fetch_add(1, Ordering::Relaxed);
+            if let Some(desc) = ctx.final_hwa2.as_ref() {
+                if desc.has_flag(HELIOS_HWA2_FLAG_PRIMARY) {
+                    let slot =
+                        (IMP_PRIMARY_N.fetch_add(1, Ordering::Relaxed) % 4) as usize;
+                    IMP_PRIMARY_RID[slot]
+                        .store(self.resource_id().unwrap_or(0), Ordering::Relaxed);
+                    IMP_PRIMARY_GEN[slot].store(ctx.generation as u32, Ordering::Relaxed);
+                    IMP_PRIMARY_FLAGS.store(desc.flags, Ordering::Relaxed);
+                }
+            }
         }
     }
 

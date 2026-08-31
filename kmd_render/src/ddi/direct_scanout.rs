@@ -1482,7 +1482,12 @@ fn sample_flushed_blob(passive: PassiveLevel, adapter: &AdapterContext, resource
         return;
     }
     PIXEL_PROBE_RUNS.fetch_add(1, Ordering::Relaxed);
-    PIXEL_PROBE_RESOURCE.store(resource_id, Ordering::Relaxed);
+    // ⚠ Store the rid ONLY beside its own successful sample. Storing it before
+    // the map attempt paired a failed primary's rid with a stale earlier
+    // sample's nonzero/max (two boots read "rid 50 nz 16384 max 255" — the
+    // BOOT LOGO's bytes under a primary's rid) and manufactured a false
+    // two-reader divergence. A device-local venus blob is unmappable, so every
+    // primary sample fails here by construction — D2PxErr says how often.
     let Ok(prep) = crate::virtio::ctrl::map_blob_prepare(
         passive,
         adapter,
@@ -1496,6 +1501,7 @@ fn sample_flushed_blob(passive: PassiveLevel, adapter: &AdapterContext, resource
         PIXEL_PROBE_ERRORS.fetch_add(1, Ordering::Relaxed);
         return;
     };
+    PIXEL_PROBE_RESOURCE.store(resource_id, Ordering::Relaxed);
     PIXEL_PROBE_NONZERO.store(sample.nonzero, Ordering::Relaxed);
     PIXEL_PROBE_MAX.store(sample.max as u32, Ordering::Relaxed);
 }

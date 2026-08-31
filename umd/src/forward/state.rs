@@ -155,6 +155,23 @@ pub(crate) fn assign_outer_allocation(
     });
     drop(set);
 
+    // Identity-chain witness: token ↔ alloc_gen joins the ICD's HBI1 bind log
+    // (image ↔ token) to the KMD's Nr2PImp* slots (generation ↔ resource id).
+    {
+        static ASSOC_LOGGED: core::sync::atomic::AtomicU32 =
+            core::sync::atomic::AtomicU32::new(0);
+        if ASSOC_LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 256 {
+            log_error!(
+                "A7 outer assoc tok={} alloc=0x{:x} gen=0x{:x} bytes={} gpb={}",
+                token,
+                allocation,
+                allocation_generation,
+                bytes,
+                guest_page_backed as u32
+            );
+        }
+    }
+
     let identity = OuterAllocationIdentity {
         device_generation,
         token,
