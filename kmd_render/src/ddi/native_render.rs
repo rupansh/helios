@@ -256,6 +256,15 @@ pub static NR2_OUTER_REJECT: AtomicU32 = AtomicU32::new(0);
 /// Generated resource operands substituted with a real virtio resource id —
 /// the KMD half of the venus memory import, counted globally so a per-allocation
 /// zero (`D2BnImp`) can be told apart from a dead instrument.
+/// Opcode census of the venus payload the KMD FORWARDS to the host, per outer
+/// submit (2026-09-01). The ICD records draws (HRA2) but the host executes 0;
+/// this says whether the draws survive to the KMD's outgoing bytes. Dword scan
+/// (over-counts, never under-counts) for BeginCommandBuffer(90)/CmdDraw(106)/
+/// CmdBeginRendering(213). Published in NR2_COUNTERS.
+pub static FWD_BEGINCB: AtomicU32 = AtomicU32::new(0);
+pub static FWD_DRAW: AtomicU32 = AtomicU32::new(0);
+pub static FWD_RENDER: AtomicU32 = AtomicU32::new(0);
+pub static FWD_MAXLEN: AtomicU32 = AtomicU32::new(0);
 pub static NR2_IMPORT_SUBSTITUTIONS: AtomicU32 = AtomicU32::new(0);
 /// The last resource id substituted into such an operand.
 pub static NR2_IMPORT_LAST_RESOURCE: AtomicU32 = AtomicU32::new(0);
@@ -486,6 +495,10 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(b"Nr2PImpG2", &crate::ddi::create_allocation::IMP_PRIMARY_GEN[2]),
         e(b"Nr2PImpG3", &crate::ddi::create_allocation::IMP_PRIMARY_GEN[3]),
         e(b"Nr2PImpFl", &crate::ddi::create_allocation::IMP_PRIMARY_FLAGS),
+        e(b"FwdBeginCB", &FWD_BEGINCB),
+        e(b"FwdDraw", &FWD_DRAW),
+        e(b"FwdRender", &FWD_RENDER),
+        e(b"FwdMaxLen", &FWD_MAXLEN),
         e(BOUNDARY_NAMES[0], &NR2_NO_STAGE),
         e(BOUNDARY_NAMES[1], &NR2_NO_EPOCH),
         e(BOUNDARY_NAMES[2], &NR2_NO_SCHEMA_WHO),
@@ -2372,6 +2385,34 @@ fn execute_outer_pending(
     } else {
         crate::virtio::gpu::NativeSubmitDomain::Queue(native.ring_index)
     };
+    // Opcode census of the exact bytes about to reach the host, per outer
+    // submit. Dword scan of the finalized venus payload: does the composition's
+    // BeginCommandBuffer/CmdDraw/CmdBeginRendering survive to here, or has the
+    // draw-bearing body already been dropped before the KMD forwards it?
+    {
+        let bytes = record_buffer.as_slice();
+        let end = payload_len.min(bytes.len());
+        if payload_len as u32 > FWD_MAXLEN.load(Ordering::Relaxed) {
+            FWD_MAXLEN.store(payload_len as u32, Ordering::Relaxed);
+        }
+        let mut i = 0usize;
+        while i + 4 <= end {
+            let op = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+            match op {
+                90 => {
+                    FWD_BEGINCB.fetch_add(1, Ordering::Relaxed);
+                }
+                106 => {
+                    FWD_DRAW.fetch_add(1, Ordering::Relaxed);
+                }
+                213 => {
+                    FWD_RENDER.fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
+            i += 4;
+        }
+    }
     let mut pending_buffers = Some((meta, record_buffer, completion));
     let queued = adapter.with_virtio(|gpu| {
         if gpu.scanout_transport_instance() != transport_instance {
@@ -5257,6 +5298,32 @@ pub(crate) unsafe fn submit_outer_physical(
                 slot_index,
                 custody: Some(batch.custody),
             };
+            // Opcode census of the bytes forwarded on the Hnr2/K9 path (the
+            // dwm composition path — the Outer path's scan reads 0 here).
+            {
+                let scan_len = (identity.payload_bytes as usize).min(batch.payload.as_slice().len());
+                let bytes = batch.payload.as_slice();
+                if identity.payload_bytes > FWD_MAXLEN.load(Ordering::Relaxed) {
+                    FWD_MAXLEN.store(identity.payload_bytes, Ordering::Relaxed);
+                }
+                let mut i = 0usize;
+                while i + 4 <= scan_len {
+                    let op = u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]);
+                    match op {
+                        90 => {
+                            FWD_BEGINCB.fetch_add(1, Ordering::Relaxed);
+                        }
+                        106 => {
+                            FWD_DRAW.fetch_add(1, Ordering::Relaxed);
+                        }
+                        213 => {
+                            FWD_RENDER.fetch_add(1, Ordering::Relaxed);
+                        }
+                        _ => {}
+                    }
+                    i += 4;
+                }
+            }
             let mut pending = Some((batch.meta, batch.payload, completion));
             let queued = adapter.with_virtio(|gpu| {
                 if gpu.scanout_transport_instance() != transport_instance {
