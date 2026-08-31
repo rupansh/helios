@@ -606,6 +606,94 @@ resource zeroes it, with identical parameters on both sides. That is host/
 virglrenderer behaviour, not a guest parameter bug, and the next step is to ask
 the host directly rather than to keep reading guest source.
 
+### ⭐⭐⭐⭐⭐ 2026-08-31 (later) — THE INIT REGRESSION IS FOUND AND FIXED: DXVK's transfer queue
+
+**KMD 22.22.424.0. `d3d11_roundtrip_split_probe`: TOTAL failures=0.** Stage 3
+INIT was `zero=4096/4096` for three days; it is `match=4096/4096`.
+
+⛔ **The `uses=0` finding below is a MISREADING and must not be built on.**
+The HRA3 hexdump (new, this session) decodes the two 192-byte `uses=0` streams
+as `begin + vkCmdSetEvent2 + end` — opcode 201, the probe's OWN
+`D3D11_QUERY_EVENT`s. `uses=0` is *correct* for them: they name no allocation.
+They were never the upload. The upload's batch had **no HRA1 line at all**,
+which is what actually pointed at the defect. Command sizes cross-check exactly
+against the venus encoders (`begin`=48, `end`=16, `PipelineBarrier2`(1 image)=164,
+`ClearColorImage`=96, `CopyBufferToImage2`=136), so 228 = begin+barrier+end and
+324 = that plus a clear — arithmetic that also proves no copy flavour fits in 192.
+
+**THE DEFECT.** `DxvkDeviceCapabilities::enableQueues` picked a dedicated
+transfer family (`Transfer : (1, 0)` on this host). `DxvkContext::uploadImageHw`
+— the path every `D3D11_SUBRESOURCE_DATA` texture takes — records its
+`vkCmdCopyBufferToImage2` into `DxvkCmdBuffer::SdmaBuffer`, and
+`DxvkCommandList::submit` sends the Sdma buffers to that queue in **their own
+`vkQueueSubmit2`, before the graphics one**. Helios record-only binds ONE
+translator context to ONE queue endpoint (`vn_helios_direct_dispatch.c` refuses a
+second context on an endpoint), so `helios_record_entry_gate` refuses that
+submit — and the early `return status` then drops the **entire command list**,
+the graphics half with it. Wallpaper, icons, glyph atlases, button bitmaps: every
+one uploaded into nothing, and the driver looked idle.
+
+Paired A/B, one boot, one variable:
+
+| arm | queues | stage 3 INIT | ICD |
+|---|---|---|---|
+| `HELIOS_DXVK_SINGLE_QUEUE=0` | `Transfer : (1, 0)` | `zero=4096/4096` FAIL | `HRQ1 refuse=1 ring=2/3` |
+| default | `Transfer : (0, 0)` | `match=4096/4096` PASS | no refusal |
+
+and the batch that had no HRA1 line at all returns as `streams=3
+command_bytes=1076 uses=2`.
+
+### ⭐⭐⭐⭐ 2026-08-31 — SECOND FIX: a record-only join killed dwm's device
+
+`DxvkSubmissionQueue::synchronizeUntil`'s record-only arm joined the exact outer
+context **once** and, if the predicate was still false, set
+`VK_ERROR_DEVICE_LOST`. But that predicate is false whenever the thread holding
+the resource reference has not *yet* reached its own synchronous `submit()` —
+which `waitForResource`'s own comment already documents as usually transient for
+a multi-threaded caller, recovered in the stock path by waiting on
+`m_finishCond`, which a record-only submit notifies too. The record-only path
+never waited at all, so dwm lost its device ~14 s into every session and
+composited nothing after. Its log **ended** at that stall.
+
+Fixed by a bounded retry (32 × 8 ms, woken early by any submit). Measured on the
+fixed build, same boot: `waitForResource STALLED ... trackId=29 occurrences=1`
+followed by `record-only join resolved after 1 retries`, twice, **no device
+loss** — exactly the transient the old code was killing.
+
+### ⛔ 2026-08-31 — STILL BLACK, and every guest-side readback instrument is unsound
+
+With both fixes in, `helios_desktop_paint_capture` from session 1 still gives one
+distinct sampled colour, `000000`, in both `screen_copy.png` and
+`progman_printwindow.png`. **That is not yet evidence the desktop is black**:
+
+* Both captures are **GDI** (`CopyFromScreen`, `PrintWindow`). On a fully
+  flip-composited WDDM path GDI can read black without the desktop being black.
+* The host cannot arbitrate: QMP `screendump` returns `no surface`, because a
+  **dmabuf** scanout is bound, not a `DisplaySurface`. Confirmed again today.
+* `tools/desktop_duplication_probe.cpp` (new) was written to read DWM's own
+  composition over DXGI instead. It acquires the frame and submits the readback
+  copy (`HRA1 ... i2b=1 uses=2`), then **wedges forever in `ID3D11DeviceContext::Map`**
+  — `d3d11!CContext::Map` → `helios_umd` → `WaitForSingleObjectEx`, an unbounded
+  UMD wait on a completion that never arrives. ⚠ Force-killing it while it held a
+  Desktop Duplication frame then wedged session 1: the capture task hung and dwm
+  became unkillable. Reboot to clear; do not re-run it until the Map wait is
+  bounded.
+
+What IS measured about the present path, from the host trace: the scanout is
+live and correct-shaped — `set_scanout_blob id 0 ... 1280x800`, `stride 5120`,
+`modifier 0xffffffffffffff`, rotating over three blobs (`res 0x174/5/6`,
+4587520 B each), flipping at ~60 Hz (16.5 ms apart) while dwm has work and
+dropping to one flip per minute when idle. So dwm presents, and the host
+receives the frames.
+
+⇒ **The next question is whether the host DISPLAYS them**, and it is the one
+open lead with real support: `display-lane-runtime-admission-chain` already
+records that neither SDL nor `egl-headless` presents the linear blob, and the
+owner authorised adding linear-buf support to `qemu-helios`. A `MOD_INVALID`
+dmabuf scanout that QEMU cannot turn into a visible frame would be black on VNC
+no matter how correct the guest is. Ask the owner what the display actually
+shows before spending another guest-side round.
+
 ### ⭐⭐⭐⭐⭐ 2026-08-31 — THE REGRESSION, MEASURED: an INIT upload declares `uses=0`
 
 `d3d11_roundtrip_split_probe` with the ICD's HRA1/HRA2 batch log on. Every batch
