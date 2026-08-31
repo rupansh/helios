@@ -4,6 +4,76 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ⭐⭐⭐⭐⭐ 2026-09-01 — DEFINITIVE, POSITIVE-CONTROLLED: THE HOST EXECUTES 0 OF 7459 RECORDED DRAWS
+
+Full-logon host ptrace count (all 12 workers, attached before logon, held 110s
+through the entire burst — no window-timing gap), with a working positive
+control:
+
+| signal | host dispatched | ICD recorded (HRA2, same boot) |
+|--------|-----------------|-------------------------------|
+| vkCmdDraw | **0** | 7459 |
+| vkCmdBeginRendering | **0** | 11296 |
+| vkBeginCommandBuffer | **0** | (one per recorded stream) |
+| vkQueueSubmit2 | **7** | ~thousands of frames |
+| vkCreateDescriptorPool | **1292** (positive control ✓) | — |
+
+The positive control (1292 CreateDescriptorPool dispatched) proves the census
+captured the whole logon on every worker. So this is not a timing artifact:
+**dwm records 7459 draws / 11296 render passes, and the host GPU executes
+ZERO of them.** Only descriptor/object setup (ordinary venus path) and 7 stray
+QueueSubmit2 reach vkr. The composition's command-buffer recording
+(Begin..Draw..End) never reaches the host decoder at all. The host submits (at
+most) empty command buffers → the scanned-out primary is black. This is THE
+black desktop, and it is upstream of scanout/readback entirely.
+
+### What is exonerated (do not reopen)
+
+- **UMD render window**: 0 "complete batch exceeds current windows" across all
+  umd logs — the command window grows to 15 MiB, large batches (HRA1
+  command_bytes up to 99356) are NOT dropped at the UMD; render_cb gets them.
+- **HNS1 / native_kmt**: a RED HERRING for dwm. `helios_dispatch_payload` in
+  RECORD_ONLY mode calls `helios_record_append` (records into the scope), it
+  does NOT submit via `helios_native_context_submit_ordered` (HNS1). HNS1's
+  small max (6312 B) is the NORMAL-mode / control path, unrelated to the
+  composition. Do not chase the HNS1 size cap.
+- **Host consumer / readback**: irrelevant — nothing is rendered to read back.
+- **The "freeze"**: was a TRACING ARTIFACT. The user-relaunched QEMU does not
+  enable `virtio_gpu_cmd_ctx_submit` tracing (the launcher only enables
+  scanout/flush); re-enable it via QMP. dwm composits continuously at logon
+  (12597 ctx submits/boot), then idles (1 bare re-scanout/min, no composition)
+  — normal idle, not a freeze.
+
+### The narrowed target (where 7459 draws are lost)
+
+The command buffers reach the KMD (UMD sends full HOB1 batches; the KMD extracts
+`record[header.payload_offset .. +header.payload_bytes]` and submits it,
+`native_render.rs:2323`). But on the host, vkr dispatches 0 BeginCommandBuffer.
+So the venus stream the KMD forwards, OR the HOB1 payload the UMD's
+`encode_hob1` builds, does NOT contain the command-buffer recording — only the
+queue submit and object/descriptor commands. Two exact suspects, decide by
+reading + one instrument:
+1. **`encode_hob1`** (UMD/translator, `umd/src/device_funcs.rs:1496`): does
+   `header.payload_bytes` cover the command-stream section of the sealed
+   payload, or only the queue-submit tail? The ICD's `scope->payload` is laid
+   out `[deferred][object][command_streams][queue_submit]`
+   (`vn_helios_record_submit.c` ~1960-2060); if the HOB1 payload region omits
+   `[command_streams]`, that is the bug.
+2. **The KMD A7 submit**: even given the full payload, only 7 of ~72
+   `Nr2OuterHost` streams produce a host QueueSubmit2 — most outer streams
+   don't decode on the host at all, silently (no vkr error in the host log).
+   Instrument: log, per KMD outer submit, the first venus opcode and length of
+   the bytes actually handed to `enqueue_native_submit`; and on the host, a
+   dump of one outer stream's bytes to confirm what vkr receives.
+
+Method for the host count (reusable): workers share one ASLR base per QEMU
+process (changes only on QEMU relaunch, not guest reset); resolve dispatch
+addrs from the cached debuginfo (`~/.cache/debuginfod_client/<buildid>/
+debuginfo`, LTO `.lto_priv.0` symbols) + base; `gdb -nx -iex 'set debuginfod
+enabled off' -x <silent-printf-continue script>`; attach to ALL workers
+BEFORE logon and re-scan for late-spawning composition workers; hold ≥100s;
+count file lines. `scratchpad/count_full.sh` + `gdbcount3.cmd` do this.
+
 ## ⭐⭐⭐⭐⭐ 2026-08-31 (late night) — HOST ptrace CENSUS: THE COMPOSITION'S DRAWS NEVER REACH vkr'S DISPATCHER; DRAW=0 EVERYWHERE
 
 The owner enabled `ptrace_scope=0`, so gdb can now attach to the render-server
