@@ -584,10 +584,49 @@ host-visible type on a guest-backed allocation is the same defect, caught by the
 same rule. One invariant — *every import of an allocation uses the allocation's
 own canonical host parameters* — removes the family instead of the instances.
 
-⚠ Still to prove before implementing: that the opener's parameters actually
-differ. One ICD diag line at `vn_device_memory_defer_outer_allocate` printing
-token + allocationSize + memoryTypeIndex, compared between creator and opener,
-settles it and costs one deploy.
+### ⛔ 2026-08-31 — MEASURED FALSE. That fix direction is retired unbuilt.
+
+The `HAM2` line was added, deployed (22.22.422.0) and read. Creator and opener
+are byte-identical:
+
+```
+HAM2 defer pid=1380 token=1 outer_bytes=262144 vk_size=262144 renderer_type=1 guest_backed=0
+HAM2 defer pid=2028 token=1 outer_bytes=262144 vk_size=262144 renderer_type=1 guest_backed=0
+```
+
+Same size, same renderer memory type, same resource. **The open does not
+destroy the creator's contents because the opener asks for something
+different**, so the canonical-parameter invariant is not the fix. It is retired
+before a line of it was written — the third source-derived theory to die this
+way (memfd shape, preflight drift, UNDEFINED-layout discard were the others),
+and the reason every one of them was measured first.
+
+⇒ **What remains true**: a second venus import of an already-materialized host
+resource zeroes it, with identical parameters on both sides. That is host/
+virglrenderer behaviour, not a guest parameter bug, and the next step is to ask
+the host directly rather than to keep reading guest source.
+
+### ⛔ AND THE OPEN DISCARD IS NOT WHAT BLACKS OUT THE DESKTOP
+
+Measured on the same boot: the desktop is still black with everything above in
+place. `tools/desktop_paint_capture.ps1` writes TWO images and only one had
+been read; both are uniformly black, and its log is the more useful half:
+
+```
+PrintWindow(PW_RENDERFULLCONTENT) => True gle=203
+sample pixels: (500,300)=black (948,515)=black (100,100)=black
+CopyFromScreen FAILED: GetPixel ... "Parameter must be positive and < Height"
+```
+
+Per the script's own doc, a black `progman_printwindow.png` means "the window
+itself doesn't produce content even on request" — i.e. the failure is upstream
+of composition and delivery, not in them. ⚠ Its `CopyFromScreen` sampling throws
+on a bad `y`, so that half of the script is broken and should be fixed before
+being trusted; the saved PNG still appears valid.
+
+⚠ Window-level probes need a SESSION 1 scheduled task. `win_exec` lands in
+session 0, where a launched `notepad` has no `MainWindowHandle` at all — that is
+how this attempt to PrintWindow an ordinary GDI window failed.
 
 ### ⛔ TWO PRODUCER PATHS REMAIN, and the desktop is still black
 
