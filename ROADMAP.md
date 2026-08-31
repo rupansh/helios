@@ -660,6 +660,63 @@ fixed build, same boot: `waitForResource STALLED ... trackId=29 occurrences=1`
 followed by `record-only join resolved after 1 retries`, twice, **no device
 loss** — exactly the transient the old code was killing.
 
+### ⭐⭐⭐⭐ 2026-08-31 — THE OPEN-DISCARD IS THE LIVE DEFECT, and six mechanisms are measured out
+
+⛔ **Correction to the block below**: the owner points out `helios_paintcap`
+worked before the HPS2 retirement, on this same stack shape. So GDI screen
+readback IS a valid instrument here and "GDI cannot see a flip-composited
+desktop" is not an argument. The guest capture and the owner's QEMU screen are
+two independent instruments and they **agree**: the desktop is black. Do not
+reopen the host-display line without host evidence.
+
+`tools/d3d11_xproc_shared_probe` on KMD 22.22.425.0, still failing:
+
+```
+A parent, before share                 PASS   D parent, after xproc open  FAIL 0
+C parent, after handle                 PASS   E parent, re-clear          PASS
+CHILD read 0 (immediately after open)  FAIL 0    <- new arm, 2026-08-31
+```
+
+⭐ The new arm settles what three sessions could not: the child reads zero
+**immediately after the open, before the parent re-clears**. Both views are
+zero, so the content is genuinely destroyed — it is NOT the parent's view of it
+breaking. And once anyone writes again (E) both sides agree forever, so the
+aliasing itself is correct.
+
+**Six mechanisms, each measured out on this build — do not rebuild any:**
+
+| mechanism | measurement |
+|---|---|
+| KMD re-materializes on open | `dxgkddi_open_allocation` is read-only for an ordinary open (create-flag gated) |
+| DXVK zero-inits the opened texture | `OpenSharedResource` never calls `InitTexture`; no `clear=1` in any batch after the child's import |
+| the opener creates a second host resource | host trace: exactly **one** 262144 blob exists for the whole run |
+| memory parameters differ | `HAM2` identical both pids (previously established) |
+| **image parameters differ** | **`HIM1` identical both pids** — `256x256x1 fmt=44 mips=1 layers=1 samples=1 tiling=0 usage=0x17 flags=0x8 sharing=0 layout=0 ext=0x0` (new today) |
+| dxgkrnl pages/evicts it on open | `PgTs=PgTd=PgTi=PgTm=PgTo=0` and `PgEv=0` across the probe; only `PgAm`/`PgAu` (aperture map/unmap) move |
+
+And the host trace shows **no virtio-gpu command touching the resource** between
+the good read and the zero read — no transfer, no flush, no unref, and no
+`ctx_attach_resource` is ever sent by this driver at all. What is left between
+those two reads is the child's own deferred `vkAllocateMemory` importing that
+one resource id into a second `VkDeviceMemory`. ⚠ `ext=0x0` on both sides is
+the one asymmetry with ordinary Vulkan sharing: neither image declares
+`VkExternalMemoryImageCreateInfo`, so two devices alias one allocation with no
+external declaration on either. That is the next hypothesis, and it is UNTESTED.
+
+⛔ **It does not explain the desktop on its own.** `d3d11_triangle` with a live
+window, submitting a real draw (`HRA2 ... draw=1 bindpipe=1 render=1/1`, swapchain
+`BLT_DISCARD` created), is on screen and the capture is still 1 distinct colour,
+`000000`. A continuously-redrawing window should have survived an open-discard,
+so something more global is also wrong. Both must be explained.
+
+⚠ Instrument traps found today: `PrintWindow(Progman)` **wedges in
+`win32u!NtUserPrintWindow`** intermittently, so a capture that produces no file
+is the instrument failing, not the desktop; the guest **idle-locks** after ~25
+min and a capture then reports `Progman = 0x0` with `CopyFromScreen FAILED`
+(disabled via `powercfg` + `InactivityTimeoutSecs=0`); and
+`tools/desktop_duplication_probe.cpp` wedges in `Map` and takes session 1 down
+when killed.
+
 ### ⛔ 2026-08-31 — STILL BLACK, and every guest-side readback instrument is unsound
 
 With both fixes in, `helios_desktop_paint_capture` from session 1 still gives one
