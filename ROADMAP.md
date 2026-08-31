@@ -4,6 +4,66 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ⭐⭐⭐⭐⭐ 2026-09-01 (KMD-instrument session) — THE KMD FORWARDS 15 OF 9023 DRAWS; THE DRAWS VANISH IN THE KMD, NOT THE HOST
+
+Reliable, persistent KMD counters (no gdb-census timing) place the black desktop
+squarely in the guest KMD. Method: a dword scan for CmdDraw(106)/BeginCB(90)/
+BeginRendering(213) at the single chokepoint `gpu/mod.rs enqueue_submit_inner`,
+which EVERY native + ordinary venus submit funnels through, published as
+`RecvDraw`/`FwdBeginCB`/`FwdRender`/`RecvMaxLen`. Read after a logon burst
+(trigger the gated publish with `[System.Windows.Forms.Screen]::AllScreens`):
+
+| counter | value | meaning |
+|---|---|---|
+| **RecvDraw** | **15** | CmdDraw opcodes the KMD forwards to the host, ALL paths |
+| ICD HRA2 draws | **9023** | draws dwm actually recorded this boot |
+| RecvMaxLen | 5528 | largest venus payload the KMD forwards |
+| ICD HRA1 max command_bytes | 99356 | largest command buffer the ICD records |
+| FwdBeginCB | 290 | command buffers forwarded (of ~13486 recorded) |
+| Nr2Frag / Nr2Commit | 13036 / 13036 | K9/HNR2 fragments + commits processed |
+| Nr2OuterHost / Nr2OuterQ | 78 / 78 | outer-path host submits |
+| Nr2OuterRej / HOB1 Render refused / batch-exceeds | 0 / 0 / 0 | nothing refused anywhere |
+
+**So the KMD forwards 15 of 9023 draws (0.17%) to the host, and the largest
+venus payload it forwards is 5528 bytes while the ICD records batches up to
+99356 bytes.** The draws vanish INSIDE the guest KMD, between the ICD's record
+and the KMD's venus submit — NOT on the host, NOT in the UMD (window grows to
+15 MiB, no LayoutOverflow/HOB1-refusal), NOT in the ICD (encode_hob1 includes
+the command_streams in the payload). This retires every host-side and
+UMD-side theory.
+
+### Exonerated with certainty this session
+
+- **Host / vkr**: it can only execute what it receives; the KMD forwards ~0.
+- **UMD encode_hob1 / render window**: 0 LayoutOverflow, 0 "batch exceeds
+  windows", 0 "HOB1 Render refused" — the UMD sends the full ≤99356 B HOB1.
+- **Context DMA buffer size**: the Hqa1Outer context advertises
+  `HELIOS_HOB1_MAX_BYTES` = 15 MiB up front (`device.rs:938`), so a 99 KiB
+  batch does not need fragmenting for space — yet Nr2Frag=13036. The
+  fragmentation is not a buffer-size shortage.
+
+### The narrowed target: the KMD's HNR2 fragment path drops the draw body
+
+The composition rides the K9/HNR2 ordered-engine path (Nr2Sub≈13656,
+Nr2Frag=Nr2Commit=13036) — heavily fragmented — while only 78 outer submits and
+15 total draws survive to the venus chokepoint. The draw-bearing command-buffer
+bytes are lost in the KMD's fragment reassembly / commit, upstream of
+`enqueue_native_submit`. Next, ONE instrument decides delivery-vs-reassembly:
+at the outer/HNR2 submit entry (`submit_outer_virtual` ~5960, `submit.DmaBuffer
+VirtualAddress`/`submit.DmaBufferSize`, and the reassembled record before the
+chokepoint), scan the RECEIVED bytes for CmdDraw and record the max received
+size. If received draws ≫ 15 → the reassembly/extraction drops them (fix the
+KMD fragment reassembly); if received draws ≈ 15 → dxgkrnl fragmented the render
+before the KMD (fix the KMD's advertised command-buffer size / NewCommandBuffer
+Size honoring so batches arrive whole). The instrument scaffolding is in
+`native_render.rs` (FWD_*/RECV_* statics + the NR2_COUNTERS entries) — extend it
+at the receive entry.
+
+⛔ Do NOT reopen: host transport/decoder, UMD window, context buffer size, the
+raw-page/identity/scanout framings. The draw loss is in the KMD HNR2 fragment
+handling. Instruments FwdDraw/RecvDraw (KMD 22.22.432.0, `31b7064`) are the
+reliable oracle — read them after a burst, no gdb needed.
+
 ## ⚠ 2026-09-01 (cont.) — a size-drop LEAD, later WEAKENED; the solid fact is still "0 draws execute"
 
 ⛔ **Correction (read this first):** the "large submits >8 KB never reach the
