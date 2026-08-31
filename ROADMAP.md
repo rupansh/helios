@@ -606,6 +606,61 @@ resource zeroes it, with identical parameters on both sides. That is host/
 virglrenderer behaviour, not a guest parameter bug, and the next step is to ask
 the host directly rather than to keep reading guest source.
 
+### ⭐⭐⭐⭐ 2026-08-31 — THE BLACK DESKTOP IS NOT IN THIS DRIVER (static + dynamic)
+
+**Dynamic.** `USER32!FillRect` on the screen DC **never returns**. cdb
+non-invasive on the session-1 powershell (works, no KD needed) gives the stack:
+
+```
+win32u!NtGdiPolyPatBlt+0x14
+gdi32full!PolyPatBlt+0x14c
+USER32!FillRect+0x65
+```
+
+Blocked inside win32k. **But a `Microsoft-Windows-DxgKrnl` all-keyword trace
+taken across that exact hang reports `dxgkrnl calls that never returned:
+(none — this capture does not contain a wedge)`.** So dxgkrnl is never entered
+while win32k is stuck: the block is in win32k/DWM, above our driver. ⇒ **The
+FillRect hang is DOWNSTREAM of the black desktop, not its cause**, and it is
+not usable as a canary.
+
+**Static, and it explains why.** `DXGK_PRESENTATIONCAPS::SupportKernelModeCommandBuffer`
+has been hard-coded 0 since 22.22.180.0 (`query_adapter_info`), so dxgkrnl
+routes GDI through **win32k's CPU redirection path** and never drives
+`DxgkDdiRenderGdi`/`DxgkDdiRenderKm` (both registered, both no-op recorders —
+`DxgkDdiRenderGdi` exists only because a null slot bugchecked at
+`DdiRenderGdi+0x140`). GDI drawing therefore does not touch this driver at all,
+which is consistent with the empty wedge report and means **no GDI-path change
+in this KMD can affect it.**
+
+**What the same 27 s of ETW says the driver WAS asked to do:**
+
+| call | n in 27 s |
+|---|---|
+| `DdiNotifyDpc` | 3282 |
+| `DdiCalibrateGpuClock` | 1082 |
+| `DxgkWaitForVerticalBlankEvent` | 30 |
+| `DxgkRender` / `DdiRender` / `DdiSubmitCommand` | 18 / 18 / 18 (9 pairs) |
+| **`DxgkPresent`** | **6** |
+
+`DdiRender` p50 = 0.434 ms, max 0.811 ms; `DdiSubmitCommand` p50 = 0.047 ms.
+Nothing is slow and nothing is stuck. DWM is alive and waiting on vblank, and
+presenting about 0.2 times a second. `DwmIsCompositionEnabled = True`.
+
+⇒ **The driver is idle because almost nothing is being asked of it.** The next
+question is not "what is our driver doing wrong with the frames it gets" but
+"why does DWM have nothing to compose", and the instrument for that is on the
+DWM/shell side, not in `kmd_render`.
+
+⛔ **`screendump` is confirmed unusable**: QMP returns `"no surface"` once a blob
+scanout is bound, so the host cannot be asked for the framebuffer that way. The
+KMD's own `D2PxProbe` is the intended substitute but did NOT run (`D2PxN=0`) —
+it is gated on `PIXEL_PROBE_ENABLED`, which `direct_scanout.rs:1660` reads ONCE
+during parking-blob setup, and it only fires from `issue_pending_flush`. Enable
+it before the display path initialises (set the knob, then reboot — a device
+restart is not enough if setup already ran), and expect it at most once per
+flush.
+
 ### ⛔ AND THE OPEN DISCARD IS NOT WHAT BLACKS OUT THE DESKTOP
 
 Measured on the same boot: the desktop is still black with everything above in
