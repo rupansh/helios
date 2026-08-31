@@ -140,15 +140,35 @@ int main() {
     printf("5b CreateSharedHandle hr=0x%08lx handle=%p\n", (unsigned long)hr, handle);
   }
   read_centre("5c after handle");
+  ID3D11Texture2D *openedTex = nullptr;
   if (handle) {
     ID3D11Device1 *dev1 = nullptr;
     if (SUCCEEDED(dev->QueryInterface(__uuidof(ID3D11Device1), (void **)&dev1))) {
-      ID3D11Texture2D *opened = nullptr;
-      HRESULT hr = dev1->OpenSharedResource1(handle, __uuidof(ID3D11Texture2D), (void **)&opened);
+      HRESULT hr = dev1->OpenSharedResource1(handle, __uuidof(ID3D11Texture2D), (void **)&openedTex);
       printf("5d OpenSharedResource1 hr=0x%08lx\n", (unsigned long)hr);
     }
   }
+  // read a SPECIFIC texture's centre through a fresh staging copy
+  auto read_centre_of = [&](const char *label, ID3D11Texture2D *src) {
+    if (!src) { printf("%-22s (null)\n", label); return; }
+    D3D11_TEXTURE2D_DESC sd = td;
+    sd.MiscFlags = 0; sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Texture2D *stg = nullptr;
+    if (FAILED(dev->CreateTexture2D(&sd, nullptr, &stg))) { printf("%-22s staging failed\n", label); return; }
+    ctx->CopyResource(stg, src);
+    ctx->Flush();
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(ctx->Map(stg, 0, D3D11_MAP_READ, 0, &m))) { printf("%-22s map failed\n", label); stg->Release(); return; }
+    const uint8_t *row = (const uint8_t *)m.pData + (size_t)(H / 2) * m.RowPitch;
+    const uint32_t px = *(const uint32_t *)(row + (W / 2) * 4);
+    ctx->Unmap(stg, 0);
+    stg->Release();
+    printf("%-22s centre=0x%08x  %s\n", label, px,
+           (px & 0xFFFFFF) == 0x407FBF ? "PASS" : "FAIL");
+  };
   read_centre("5e after open");
+  read_centre_of("5e2 read via OPENED", openedTex);
 
   // Which mechanism? Re-clear the ORIGINAL after the open and read it back.
   //  * reads the colour  -> the memory is still ours; the open only DISCARDED
@@ -158,5 +178,14 @@ int main() {
   ctx->ClearRenderTargetView(rtv, CLEAR);
   ctx->Flush();
   read_centre("5f original re-clear");
+  read_centre_of("5g re-clear via OPENED", openedTex);
+  // and the reverse: does a fresh RTV over the ORIGINAL land where reads see it?
+  ID3D11RenderTargetView *rtv2 = nullptr;
+  if (SUCCEEDED(dev->CreateRenderTargetView(tex, nullptr, &rtv2))) {
+    ctx->ClearRenderTargetView(rtv2, CLEAR);
+    ctx->Flush();
+    read_centre("5h fresh-RTV re-clear");
+    read_centre_of("5i fresh-RTV via OPENED", openedTex);
+  }
   return 0;
 }
