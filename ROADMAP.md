@@ -4,7 +4,26 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
-## ⭐⭐⭐⭐⭐ 2026-09-01 (cont.) — ROOT CAUSE: THE DRAW-HEAVY COMPOSITION SUBMITS (>~8 KB) NEVER REACH THE RENDER WORKER
+## ⚠ 2026-09-01 (cont.) — a size-drop LEAD, later WEAKENED; the solid fact is still "0 draws execute"
+
+⛔ **Correction (read this first):** the "large submits >8 KB never reach the
+worker" mechanism below is a LEAD from ONE byte-dump, and it is **not
+confirmed** — it may be a capture artifact (the dump likely missed the
+composition worker's large submits). Two facts weaken it: (a) the entire host
+log has **zero** SOCK_SEQPACKET truncation/receive errors (`truncated`,
+`failed to receive`, `expected N but received M`, `failed to submit … cmd` —
+the errors `render_socket`/`proxy_context` WOULD log on an oversized datagram);
+(b) the KMD's DMA buffer is `HELIOS_HVC1_DMA_BUFFER_BYTES` = **256 KiB**, so a
+99 KiB batch needs no fragmentation and 8092 is not a fragment size. So do NOT
+build on "8 KB transport cap" without re-measuring. What stays solid: **the host
+dispatches 0 `vkCmdDraw` of dwm's 7459 recorded, positive-controlled** — the
+composition renders on the guest, executes zero on the host; the exact drop
+point between the KMD's A7 submit (`Nr2OuterHost=72`) and vkr's decoder is **not
+pinned**. Next probe (needs a captured burst): break `vkr_context_submit_cmd`
+(the common decoder entry) and log its `size` — if large A7 sizes appear there
+yet `vkCmdDraw` stays 0, the loss is in decode, not transport; if they never
+appear, chase the KMD→worker delivery. The byte-dump lead, as originally
+written:
 
 Synthesizing the byte-level dump with the draw census gives a coherent, complete
 mechanism for the black desktop:
