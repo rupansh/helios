@@ -606,6 +606,87 @@ resource zeroes it, with identical parameters on both sides. That is host/
 virglrenderer behaviour, not a guest parameter bug, and the next step is to ask
 the host directly rather than to keep reading guest source.
 
+### ⭐⭐⭐⭐⭐ 2026-08-31 — THE REGRESSION, MEASURED: an INIT upload declares `uses=0`
+
+`d3d11_roundtrip_split_probe` with the ICD's HRA1/HRA2 batch log on. Every batch
+the probe submits, in order:
+
+| batch | streams | cmd bytes | **uses** | stage | result |
+|---|---|---|---|---|---|
+| 1 | 3 | 1456 | **2** | 2 UPLOAD | PASS |
+| 2 | 1 | 192 | **0** | 3 INIT | **FAIL** |
+| 3 | 1 | 192 | **0** | 3 INIT | **FAIL** |
+| 4 | 3 | 1508 | **2** | 4 CLEAR | PASS |
+| 5-7 | 0 | 0 | 1 | teardown | — |
+
+**The two batches that fail are exactly the two that declare ZERO allocation
+uses.** A `vkCmdCopyBufferToImage` from the staging buffer into the DEFAULT
+image touches two Helios outer allocations; the batch names neither, so the KMD
+has no use records, substitutes no host resource ids, and the copy targets
+nothing. The image stays zero — `zero=4096/4096`, which is what stage 3 reports.
+
+⇒ **This is the desktop.** A desktop is overwhelmingly textures created from CPU
+data — wallpaper, icons, glyph atlases, button bitmaps — every one a
+`D3D11_SUBRESOURCE_DATA` create. If each uploads into nothing, DWM composites
+black, still presents a few times a second, and the driver looks idle. That is
+precisely the state measured all session. ⛔ I deprioritised INIT as "not on
+DWM's composition path"; that was wrong.
+
+### The path, end to end
+
+```
+D3D11CommonTexture(pInitialData)
+  -> D3D11Initializer::InitDeviceLocalTexture      d3d11_initializer.cpp:156
+     m_stagingBuffer.alloc(dataSize)               StagingBufferSize = 1 MiB
+       -> DxvkStagingBuffer::alloc                 dxvk_staging.cpp:19
+          m_device->createBuffer(HOST_VISIBLE|HOST_COHERENT)
+     packImageData(stagingSlice.mapPtr(...))       <- the CPU write
+     EmitCs -> ctx->uploadImage(image, slice.buffer(), ...)
+  -> submitted on the INITIALIZER's own context, not the immediate context
+```
+
+Uses are recorded during RECORDING, not submission:
+`vn_CmdCopyBufferToImage` (`vn_command_buffer.c:1683`) calls `HELIOS_TOUCH_BUFFER`
++ `HELIOS_TOUCH_IMAGE` -> `vn_helios_cmd_touch_buffer/image`
+(`vn_helios_record_submit.c:405/427`) -> `helios_cmd_add_binding` (`:313`), which
+appends to `cmd->builder.helios_uses[]`. `helios_collect_command_buffer_uses`
+(`:3631`) then copies that list into the batch.
+
+So `uses=0` means the touch never appended for those two commands. Its guards
+are the place to look: `helios_cmd_add_binding` requires
+`cmd->builder.helios_closure_complete` AND `binding->valid`, and
+`vn_helios_cmd_touch_buffer` refuses outright when
+`!buf->helios_binding.valid`. ⚠ A refusal would also clear
+`helios_closure_complete` and make the whole submit fail — and it did NOT
+(`deferred_use_without_outer_batch=0`, the batch appended). **So the touches
+were not refused; they were not reached.** Whatever those 192 bytes contain, it
+is not a copy that went through `vn_CmdCopyBufferToImage`.
+
+### ⇒ THE NEXT STEP, and it is one ICD change
+
+Decode the failing stream. The HRA2 line already walks the recorded opcodes and
+counts `begin/end/draw/bindpipe/render/vp/sc` — it does **not** count copies.
+Add copy/blit opcodes (`vkCmdCopyBufferToImage` 132 / `...2` 218-range,
+`vkCmdCopyBuffer`, `vkCmdCopyImage`, `vkCmdBlitImage`) to that decoder in
+`vn_helios_record_submit.c:1540-1578`, plus a one-line dump of the 192-byte
+stream's opcode sequence. That names what the initializer actually emits, and
+therefore which recording path is missing its `HELIOS_TOUCH_*`.
+
+⚠ Do NOT assume it is `vkCmdCopyBufferToImage` — the measurement says it is not.
+`DxvkContext::uploadImage` may lower to a different command (a
+`vkCmdCopyBufferToImage2`, a compute upload, or an `initImage` + separate copy),
+and `vn_command_buffer.c` has 32 `vn_helios_cmd_touch*` call sites, so the gap is
+a specific missing one, not a missing mechanism.
+
+### ⛔ 2026-08-31 — SUPERSEDED, AND THE CONCLUSION WAS WRONG (kept for the measurements)
+
+⛔ **"Not in this driver" does not follow from what this block measures.** dxgkrnl
+not being wedged, and GDI not entering our DDIs, say nothing about whether DWM
+has content to composite — and "6 presents in 27 s" is exactly what a
+producer-side driver regression looks like. The desktop rendered before the HPS2
+retirement; the regression is ours. See the INIT finding below, which is the
+concrete one. The ETW numbers and the instrument traps here are still good.
+
 ### ⭐⭐⭐⭐ 2026-08-31 — THE BLACK DESKTOP IS NOT IN THIS DRIVER (static + dynamic)
 
 **Dynamic.** `USER32!FillRect` on the screen DC **never returns**. cdb
