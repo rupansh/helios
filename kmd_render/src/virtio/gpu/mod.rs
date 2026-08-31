@@ -2504,6 +2504,34 @@ impl VirtioGpu {
         cmd.size = venus_len as u32;
         meta.as_mut_slice()[..hdr_len].copy_from_slice(bytemuck::bytes_of(&cmd));
 
+        // Chokepoint draw census: scan the EXACT venus bytes about to reach the
+        // host for CmdDraw(106)/BeginCommandBuffer(90)/BeginRendering(213).
+        // ALL native submit paths funnel here, so this is the true measure of
+        // what the KMD forwards (vs the ICD's recorded 7459 draws).
+        {
+            let n = venus_len.min(venus.as_slice().len());
+            let buf = venus.as_slice();
+            if venus_len as u32 > crate::ddi::native_render::RECV_MAXLEN.load(Ordering::Relaxed) {
+                crate::ddi::native_render::RECV_MAXLEN.store(venus_len as u32, Ordering::Relaxed);
+            }
+            let mut i = 0usize;
+            while i + 4 <= n {
+                match u32::from_le_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) {
+                    90 => {
+                        crate::ddi::native_render::FWD_BEGINCB.fetch_add(1, Ordering::Relaxed);
+                    }
+                    106 => {
+                        crate::ddi::native_render::RECV_DRAW.fetch_add(1, Ordering::Relaxed);
+                    }
+                    213 => {
+                        crate::ddi::native_render::FWD_RENDER.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+                i += 4;
+            }
+        }
+
         let chain = Chain::MetaPlusVenus { hdr_len, venus_len };
         let token = match self.enqueue_core(chain, &meta, Some(&venus), resp_len, None) {
             Ok((token, None)) => token,

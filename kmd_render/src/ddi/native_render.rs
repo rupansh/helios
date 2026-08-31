@@ -265,6 +265,12 @@ pub static FWD_BEGINCB: AtomicU32 = AtomicU32::new(0);
 pub static FWD_DRAW: AtomicU32 = AtomicU32::new(0);
 pub static FWD_RENDER: AtomicU32 = AtomicU32::new(0);
 pub static FWD_MAXLEN: AtomicU32 = AtomicU32::new(0);
+/// Draw-opcode census of the venus bytes the KMD RECEIVES in the HOS1 DMA
+/// buffer, before any extraction. Compared with FWD_DRAW (post-extraction):
+/// Recv >> Fwd ⇒ the KMD drops draws internally; Recv ≈ Fwd ⇒ the draws were
+/// never delivered.
+pub static RECV_DRAW: AtomicU32 = AtomicU32::new(0);
+pub static RECV_MAXLEN: AtomicU32 = AtomicU32::new(0);
 pub static NR2_IMPORT_SUBSTITUTIONS: AtomicU32 = AtomicU32::new(0);
 /// The last resource id substituted into such an operand.
 pub static NR2_IMPORT_LAST_RESOURCE: AtomicU32 = AtomicU32::new(0);
@@ -499,6 +505,8 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(b"FwdDraw", &FWD_DRAW),
         e(b"FwdRender", &FWD_RENDER),
         e(b"FwdMaxLen", &FWD_MAXLEN),
+        e(b"RecvDraw", &RECV_DRAW),
+        e(b"RecvMaxLen", &RECV_MAXLEN),
         e(BOUNDARY_NAMES[0], &NR2_NO_STAGE),
         e(BOUNDARY_NAMES[1], &NR2_NO_EPOCH),
         e(BOUNDARY_NAMES[2], &NR2_NO_SCHEMA_WHO),
