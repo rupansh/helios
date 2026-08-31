@@ -65,7 +65,12 @@ try {
     $g2.CopyFromScreen($vs.X, $vs.Y, 0, 0, $bmp2.Size)
     $g2.Dispose()
     $bmp2.Save('Z:\tmp\screen_copy.png', [System.Drawing.Imaging.ImageFormat]::Png)
-    $s1 = $bmp2.GetPixel(500, 300); $s2 = $bmp2.GetPixel(948, 900)
+    # ⛔ (948,900) is OUTSIDE a 1280x800 screen: GetPixel threw
+    # "Parameter must be positive and < Height" and took the whole CopyFromScreen
+    # arm down with it, so this half of the script reported nothing for weeks
+    # while the PNG it had already saved was fine. Clamp to the bitmap.
+    $sx = [Math]::Min(948, $bmp2.Width - 1); $sy = [Math]::Min(515, $bmp2.Height - 1)
+    $s1 = $bmp2.GetPixel(500, 300); $s2 = $bmp2.GetPixel($sx, $sy)
     W ("screen sample pixels: (500,300)={0} (948,900)={1}" -f $s1, $s2)
     $bmp2.Dispose()
     W "CopyFromScreen saved"
