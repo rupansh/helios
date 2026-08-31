@@ -1375,6 +1375,17 @@ fn issue_fenced_set(
     }
     finish_transition(adapter, transition);
     let bound = terminal && success;
+    // Every latched real bind owes the host a present: QEMU reads a blob
+    // scanout only on RESOURCE_FLUSH. The DIRQL-queue arm already publishes
+    // this in complete_queued; this synchronous mailbox arm latched 127 of 130
+    // binds on 2026-08-31 (host log: ~130 set_scanout_blob vs 3 res_flush) and
+    // published none, so the display froze on the last early flush.
+    // service_pending drains the request immediately after this returns.
+    if bound && matches!(kind, PublishKind::Real) {
+        adapter
+            .direct_scanout
+            .request_flush(geometry.resource_id, geometry.width, geometry.height);
+    }
     // Knob-only: parking is otherwise never flushed, so a painted parking image
     // would never be read. Issued inside the lifecycle lock, which the shipping
     // present path deliberately avoids — acceptable for a diagnostic that is
