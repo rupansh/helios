@@ -531,11 +531,63 @@ at the party that owns the allocation — the KMD** — rather than on a token t
 UMD mints per open. The KMD already holds the allocation's canonical
 `venus_memory_id`; an open should bind to it instead of causing a second import.
 
-⚠ Not yet implemented, and not yet proven to be what blacks out the desktop —
-DWM opens surfaces across processes, and this repro is two devices in one
-process. That is the same shape (two tokens, two memories, one host resource)
-but it is not the same measurement, and the last claim that outran its evidence
-is corrected two paragraphs above.
+### ✅ 2026-08-31 — CROSS-PROCESS MEASURED: sharing WORKS, only the OPEN is destructive
+
+`tools/d3d11_xproc_shared_probe.cpp` runs the sequence with a real second
+process (`OpenSharedResourceByName`), which is DWM's shape. Knobs ON:
+
+```
+A parent, before share                 PASS 0xff407fbf
+C parent, after handle                 PASS
+D parent, after xproc open (untouched) FAIL 0x00000000
+E parent, re-clear after open          PASS
+  CHILD read 1 (first touch, T+5)      PASS
+  CHILD read 2 (after parent re-clear) PASS
+```
+
+⭐ **Cross-process aliasing is CORRECT.** The opener sees the creator's pixels
+and every later update, in both directions, and the creator's binding survives.
+**The sole defect is that content written BEFORE the open is destroyed.**
+
+⛔ And it is the OPEN, not the opener's first use: the child does not touch the
+texture until T+5s while the parent reads D at T+3s, and D is already zero. The
+"opened image transitions from UNDEFINED and discards" theory is dead.
+
+⛔ **Severity correction to the same-process result above:** cross-process the
+creator's binding SURVIVES (E passes); only in the two-devices-one-process case
+was it permanently orphaned. DWM's shape is the milder one.
+
+**Control, knobs OFF: every line fails, including `A parent, before share`.** So
+guest-page backing is what makes cross-process sharing work at all here, and the
+residual D failure sits on top of a far better baseline rather than being a
+regression from it.
+
+The host trace shows exactly ONE `res_create_blob` for the shared 262144-byte
+resource — the open reuses the host resource and does not create a second.
+
+### ⇒ THE SOLUTION THAT IS NEEDED
+
+Not a sharing rework, not `VK_KHR_external_memory_win32`, and not an
+adopt-contents/layout change. The opener's FIRST materialization of an
+already-materialized allocation must ALIAS the creator's backing instead of
+replacing it.
+
+The KMD is the party that can enforce it, because it owns the allocation's
+canonical host parameters (`CreatedBacking::venus_alloc_size`,
+`memory_type_index`) and already validates exactly this pair on the HVM1 path
+(`prepare_executor_commit`, bits 5 and 6). The outer deferred-allocate path has
+no such check, so an opener whose `allocationSize`/`memoryTypeIndex` differ from
+the creator's gets fresh memory instead of an alias — silently.
+
+⭐ That check SUBSUMES the fix landed in `4a36e1f`: the ICD asking for the
+host-visible type on a guest-backed allocation is the same defect, caught by the
+same rule. One invariant — *every import of an allocation uses the allocation's
+own canonical host parameters* — removes the family instead of the instances.
+
+⚠ Still to prove before implementing: that the opener's parameters actually
+differ. One ICD diag line at `vn_device_memory_defer_outer_allocate` printing
+token + allocationSize + memoryTypeIndex, compared between creator and opener,
+settles it and costs one deploy.
 
 ### ⛔ TWO PRODUCER PATHS REMAIN, and the desktop is still black
 
