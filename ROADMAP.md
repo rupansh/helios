@@ -4,6 +4,138 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ⭐⭐⭐⭐⭐ 2026-08-31 (fresh session) — THE PRODUCER DEFECT IS CONFIRMED WITH A POSITIVE CONTROL, AND IT IS SPECIFIC TO THE PRESENTABLE PRIMARY
+
+Everything below was re-derived from scratch on KMD 22.22.425.0 (no code change
+yet); instruments were verified live before being read. This supersedes the
+open-discard framing below as the LEAD: the open-discard is real but secondary.
+
+### The one-sentence state
+
+DWM composites (real draws), those draws EXECUTE on the host GPU with zero
+refusals, the display/flush/readback path provably works — and the scanned-out
+primary is still all-zero at the host. **DWM renders into host resource A; the
+scanout reads host resource B, for the same presentable WDDM allocation.**
+
+### Measured, in causal order (boot 2026-08-31T14:21:41Z unless noted)
+
+1. **Single-device rendering is fully exonerated.** New probe
+   `tools/d3d11_draw_witness_probe.cpp` (mingw, session 0): A CLEAR, B solid
+   VS→PS draw, C textured draw sampling an SRV — all three LANDED
+   (`center=0xff00ff00, green=4096/4096`) through a guest-backed staging
+   readback. Draws, pipelines and texture sampling work end to end. ⇒ every
+   "draws render nothing / IA sees no vertex" theory is dead on this build.
+2. **The producer defect, with a positive control** (host oracle
+   `helios_scanout_read`, enabled at runtime via QMP, no relaunch):
+   KMD parking blob `res 4` reads `nonzero 64000 csum 0x5cccbdb424318000`;
+   DWM primaries `res 5` and `res 52` read `nonzero 0` — res 52 immediately
+   after its own `res_flush`. `bound_ino == read_ino` in every sample, so the
+   host reads exactly the buffer that was bound. Scanout, flush, dma-buf export
+   and readback are all proven good in the same boot that shows the black
+   primary.
+3. **DWM's composition executes on the host.** ICD: 38× 1280x800 BGRA image
+   creates, `HRA2 … draw=2 bindpipe=4 render=1/1 vpcount=3`, `HRA1 … uses=11`.
+   KMD: `Nr2OuterQ=60 = Nr2OuterHost`, `Nr2OuterRej=0`, all 68 `why(site)`
+   codes silent, `Nr2Sub/Commit/Slot/SlotRet` balanced. The recorded venus
+   streams are accepted and run; nothing is refused.
+4. ⇒ with 1–3 together: the render lands in a host resource that is not the
+   one `SET_SCANOUT_BLOB` binds. The divergence is per-allocation host
+   materialization, and it only affects the shared/presentable class (the
+   non-shared probe RT in 1 reads back fine).
+
+### Corrections to standing claims (each measured this session)
+
+- ⛔ "The black desktop is above the driver" stays wrong, now positively:
+  the producer defect reproduces with zero dxgkrnl involvement in the failure.
+- ⛔ The xproc open-discard did NOT reproduce on this boot: the child's
+  `OpenSharedResourceByName` fails outright with `0x80070057` (E_INVALIDARG),
+  so parent D "passes" vacuously. The discard-vs-refusal behaviour of the open
+  is boot-dependent; do not build on either shape without re-measuring.
+- ⚠ The 24× dwm `Failed to create shared resource: VK_KHR_EXTERNAL_MEMORY_WIN32
+  not supported` remain benign-by-code-read (`canShareImage` clears `m_shared`,
+  create proceeds via the association arm) — but dwm's DXVK device DIED at
+  13:57:19 on the prior boot (`Exception on CS thread!` then
+  `vkCreateImageView → VK_ERROR_OUT_OF_HOST_MEMORY`, host not actually OOM,
+  log ends) after ~31 min. Second, slower defect; not the black-from-boot cause.
+- ⚠ D2 registry counters are publication-gated (the known trap): `D2BnReal=2`
+  in the registry while the host log shows ~110 binds — read the HOST log for
+  bind/flush truth, not the registry snapshot.
+
+### The second real defect: steady-state flips never flush
+
+Host log, fresh boot: 110 `set_scanout_blob` (res 0x35/0x37/0x38 rotating) in
+75 s against **8** `res_flush`, all 8 in the first 10 s (res 2/5/4/0x34). The
+display backend (`egl-vnc`) presents only on `res_flush` + `vulkan-readback`,
+so even a correct primary would freeze after the first seconds. Independent of
+the producer defect (res 0x34 was flushed and still black) — both must land.
+egl-headless's own EGL dma-buf import also fails
+(`glEGLImageTargetTexture2DOES → 0x502`, fourcc AR24/XR24, MOD_INVALID) but the
+`vulkan-readback` OPTIMAL arm is what presents, and it works — parking blob
+content was visible through it.
+
+### Landed and VERIFIED this session (KMD 22.22.426/427)
+
+1. **The flush fix** — `issue_fenced_set`'s Real arm now publishes the owed
+   present (`direct_scanout.rs`). Before: ~130 binds, 3 flushes; after: 142
+   binds, 144 flushes, tracking 1:1 through the logon burst and the 1/min idle.
+   The display now re-presents on every latched flip.
+2. **`HRU1`** (ICD, `vn_helios_record_submit.c`) — logs every sealed batch's
+   `token:access` list. Decisive on day one, twice.
+3. Probes: `d3d11_draw_witness_probe.cpp` (draw/texdraw/clear → guest-backed
+   readback, all green), `dmabuf_crosstype_alias_probe.c` (host GPU: every
+   import shape aliases — matched/cross-type/mismatched/no-ext, 6 arms),
+   `d3d11_shared_variable_probe` arms 5e2/5g/5h/5i (post-open both-wrapper
+   reads).
+
+### ⭐⭐⭐⭐⭐ NAMED: the in-process open kills the outer device (the black hole)
+
+`d3d11_shared_variable_probe` on .427: after `OpenSharedResource1` on the SAME
+device, the first batch naming BOTH wrappers is refused by the runtime —
+`A7 D3D11 HOB1 Render refused batch=20 hr=0x80070057 nalloc=3` → `outer device
+lost` → **every later submit on the device is silently dropped** (`exact outer
+join refused: DeviceLost` on every subsequent DDI) while the DDIs keep
+returning success. 5e–5i: all reads/writes through every wrapper and a fresh
+RTV read zero forever. Mechanism: two tokens → two allocation-list entries →
+duplicate `hAllocation` in one `pfnRenderCb`, which WDDM forbids. The KMD would
+refuse it too (`OuterExecutionRefusal::DuplicateUse` via the sorted-generation
+collision at `native_render.rs:2269`, plus the per-use write-flag echo).
+**Fix design (not yet implemented): merge duplicate-allocation uses at the UMD
+before `encode_hob1`** — one use per `hAllocation`, OR'd access flags, operands
+preserved on the surviving use, both HOB1 use records sharing one list index is
+NOT enough (the KMD's echo checks bind use↔entry 1:1). dwm primaries carry
+`D2BnImp=2` (a second import exists), so dwm can hit this; it is the best
+candidate for dwm's DXVK device death (`Exception on CS thread!` at 13:57:19,
+prior boot).
+
+### The remaining open question, exactly
+
+DWM's composition (74 multi-KB ctx-0x3 submissions at logon 15:09:35) reaches
+the host and executes with zero refusals; `HRU1` proves each batch WRITES a
+flip-buffer token (16:3/17:3/18:3 rotating); the host aliasing of a dma-buf
+import is proven sound in every shape — and the `helios_scanout_read` oracle
+reads those very primaries as `nonzero 0` through the same window (140
+samples). Two bounds that constrain the answer: the draw-witness probe's
+DEFAULT RT uses the same deferred-import class and reads back green, so the
+class works for ordinary textures; and the primaries provably carry exported
+dma-buf fds (`helios_scanout_blob_layout` fd 323/325/326). ⇒ whatever breaks is
+**specific to the PRIMARY allocation shape** (`is_primary` ⇒
+`accessed_physically`, `Flags.Value=1`, DISPLAYABLE). Ranked candidates:
+(a) the deferred `vkAllocateMemory` import for a primary fails host-side —
+fire-and-forget in the batch, so it would be silent; (b) `AccessedPhysically`
+placement/paging: exactly one primary-sized `VIRTUAL_TRANSFER` destination ran
+at boot (`PgVd − PgVs = 4587520`), i.e. VidMm content-moves this class, and a
+transfer of the (zero) system copy into the blob after the render would erase
+it. Next instrument, either way: make the deferred-allocate host RESULT
+observable per token, and re-run the pixel probe per-flip (it samples on every
+flush now that flushes track flips).
+
+### Superseded todays-earlier lines
+
+The "flush deficit" above is CLOSED (fix landed + measured). The "producer
+never writes the pages" claim is REFINED: pages provably stay zero while the
+render executes — the write is lost at the host-side import/bind boundary, not
+in the guest chain.
+
 ## ⭐⭐⭐⭐⭐ 2026-08-29 ROOT CAUSE FOUND — the application's map pointer is PROCESS HEAP
 
 ⛔ **This supersedes every theory below it, including "F16 / Lock2 is a copy",
