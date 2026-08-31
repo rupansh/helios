@@ -4,6 +4,88 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ⭐⭐⭐⭐⭐ 2026-08-31 (late night) — HOST ptrace CENSUS: THE COMPOSITION'S DRAWS NEVER REACH vkr'S DISPATCHER; DRAW=0 EVERYWHERE
+
+The owner enabled `ptrace_scope=0`, so gdb can now attach to the render-server
+workers directly. All addresses below are in the worker binary
+`/usr/lib/virgl_render_server` (BuildID 4e8dde5a…), whose debuginfo is cached
+at `~/.cache/debuginfod_client/4e8dde…/debuginfo`. **All 11 ctx workers are
+forked from the master and share ONE ASLR base, `0x561d4adf9000`**, so a
+breakpoint address computed once works in every worker. The dispatch functions
+are LTO-inlined — resolve them from the cached debuginfo by their
+`.lto_priv.0` symbol and add the base (e.g. `vkr_dispatch_vkQueueSubmit2` =
+file-off `0x69200` → `0x561d4ae62200`). Method that works and does NOT stall on
+downloads: `gdb -nx -iex 'set debuginfod enabled off' -x <script> -p <worker>`
+with raw `break *0xADDR` + `commands/silent/printf/continue`; wrap in
+`timeout -s TERM N`. ⚠ gdb output is only flushed on detach, so read the tag
+counts from the file AFTER the run, never treat a mid-run 0 as real.
+
+### The census (positive-controlled; each a live in-window measurement)
+
+- **Positive control PASSES** (ctx-0x3 worker, logon burst, 3756 ctx-3
+  submits): `vkCreateDescriptorPool`=782, `vkAllocateDescriptorSets`=1915. The
+  breakpoint mechanism and the context are provably alive and dispatching.
+- **Yet on that same worker/window: `vkBeginCommandBuffer`=0,
+  `vkQueueSubmit2`=0.** Descriptor *setup* for draws flows; the command-buffer
+  recording and the queue submit do not.
+- **All-11-worker census, steady-state green window (1078 submits):
+  `vkQueueSubmit2`=0, `vkCmdBeginRendering`=0, `vkEndCommandBuffer`=0** — no
+  worker anywhere records or submits a composition.
+- **Logon-burst census (8539 submits): `vkQueueSubmit2`=12,
+  `vkBeginCommandBuffer`=18, but `vkCmdDraw`=0, `vkExecuteCommandStreamsMESA`=0,
+  `vkQueueSubmit`(v1)=0.** So a TINY trickle of command buffers reaches host
+  dispatch during logon, and even those carry **zero draws**.
+- **`render_context_dispatch_submit_cmd` (socket entry, `0x561d4ae029c0`) fired
+  25× for 25 ctx-3 submits** — the worker RECEIVES every command buffer off the
+  socket. And QEMU-side `virgl_renderer_submit_cmd` (`0x7f..d4b890`, addr =
+  lib base + `0x11890`) fired 746× for 808 submits. So commands reach QEMU and
+  reach the worker; the loss is between socket-receive and venus dispatch, or
+  the recorded draws are simply never in the submitted stream.
+
+### The wire stream is descriptor-management, not composition
+
+Raw census at the socket entry (`SZ=*(u32*)($rsi+4)`, first venus opcode
+`*(u32*)($rsi+8)`): 2272 ctx-3 submissions in a burst window, sizes 28–88 B,
+first-opcodes only **74 CreateDescriptorPool / 75 DestroyDescriptorPool / 77
+AllocateDescriptorSets / 87 ResetCommandPool / 88 AllocateCommandBuffers**.
+No large (multi-KB) command-buffer stream ever crosses as a `ctx_submit` for
+dwm's context. The ICD's HCC1 log shows the guest RECORDS hundreds of
+BeginRendering(op213) + CopyImage2 per flip — but on the host only ~12–18
+command buffers per whole logon burst dispatch, and **zero draws**. The vast
+majority of the recorded composition never reaches host dispatch.
+
+### What this means, and the exact open question
+
+The black desktop is now bounded to: **the RECORD_ONLY → HOB1 → KMD-native →
+host-replay path delivers almost none of dwm's recorded command buffers to
+vkr, and the few it does deliver contain no draws.** Either (a) the KMD's
+native submits (`K9Adm`=21025/boot) do NOT decode to the recorded
+Begin..Draw..End/QueueSubmit2 on the host — they carry something else — or
+(b) the recorded command buffers are drained/dropped before submit. This is
+NOT the vsync freeze and NOT a host-semantics bug (both already excluded).
+
+**Next census (QEMU was owner-relaunched after this; re-derive the worker pid
+and reuse base `0x561d4adf9000`):**
+1. The content of the 12 QS2 command buffers — break `vkCmdBeginRendering`
+   `0x561d4ae7d7a0`, `vkCmdClearColorImage` `0x561d4ae73620`, `vkCmdCopyImage2`
+   `0x561d4ae73120`, `vkCmdDrawIndexed` `0x561d4ae72eb0`, `vkCmdDispatch`
+   `0x561d4ae72f60`, `vkQueueSubmit2` `0x561d4ae62200` — during a logon burst.
+   (This census was written, `scratchpad/gdbcontent.cmd`, but QEMU died before
+   it ran.) If clears+copies of black inputs ⇒ input-content; if nothing ⇒
+   the replay path drops them.
+2. Instrument the KMD-native→host bridge: what venus opcode does an A7 outer
+   stream become on the wire? Break in the worker on the ring-thread path
+   (`vkr-queue-N`/CS decoder) too, not only the main dispatch, in case the
+   big streams ride the CS ring in shmem rather than `ctx_submit`.
+3. Rate check: dispatched QS2/sec on the host vs the ICD's HCC1 record/sec —
+   quantify the drop ratio.
+
+⚠ **The freeze is now the dominant test obstacle**: the FIRST green run on a
+fresh boot composits; every subsequent run (and idle after ~a minute)
+freezes the whole ctx-3 pipeline (0 submits). Budget one measurement per boot,
+taken during the logon burst which always has traffic. `helios_green` end+run
+does not reliably un-freeze.
+
 ## ⭐⭐⭐⭐⭐ 2026-08-31 (evening) — IDENTITY CHAIN CLOSED BY WITNESSES; THE RAW-PAGE INSTRUMENT WAS UNSOUND; THE HOST CONSUMER IS 13-ARM EXONERATED; THE LOSS IS AT SUBMIT-EXECUTION OR INPUT-CONTENT
 
 KMD 22.22.428/429 (`213de6a`), icd/mesa `fc6a9bb48bc`, probe `208d5b1`. Every
