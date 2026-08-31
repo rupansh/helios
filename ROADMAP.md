@@ -4,6 +4,165 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ⭐⭐⭐⭐⭐ 2026-08-31 (evening) — IDENTITY CHAIN CLOSED BY WITNESSES; THE RAW-PAGE INSTRUMENT WAS UNSOUND; THE HOST CONSUMER IS 13-ARM EXONERATED; THE LOSS IS AT SUBMIT-EXECUTION OR INPUT-CONTENT
+
+KMD 22.22.428/429 (`213de6a`), icd/mesa `fc6a9bb48bc`, probe `208d5b1`. Every
+claim below is measured this boot unless marked. This supersedes the morning
+block's two ranked candidates and VOIDS its raw-page claim.
+
+### The witness set (new; all verified live)
+
+- **UMD `A7 outer assoc`** (umd log): `tok= alloc= gen= bytes= gpb=` per outer
+  association. **KMD `Nr2PImp*`**: rotating (rid, gen-low32) + flags for
+  PRIMARY-filtered import substitutions. **ICD `HBI1`**: per image bind —
+  extent/fmt/usage/tiling/tag, memory token/reg/bytes/offset. **ICD `HCC1`**:
+  per ≥1280-wide image touch, the recording entrypoint's `VkCommandTypeEXT`
+  (119=ClearColorImage 204=PipelineBarrier2 208=CopyImage2 209=CopyBufToImg2
+  213=BeginRendering).
+- Joined, they close the identity chain end to end: dwm runs THREE devices —
+  the creator device makes the primaries (flags **0x31d** = SHARED|PRIMARY|
+  DISPLAYABLE|DIRECT_FLIP|CPU_VISIBLE|RESOURCE_ASSOCIATED, so the export
+  chain exists and `res->u.fd` is valid), the composition device OPENS them as
+  its toks 16/17/18 (= HRU1's flip tokens; two tokens per allocation ⇒
+  `D2BnImp=2`, `Nr2PImpN=7` = 2×3 shared + 1 unopened); each flip image binds
+  its token memory at offset 0 (HBI1); the deferred imports name exactly the
+  scanned-out rids (gen 0x2a→rid 50, 0x2c→52); and the composition RENDERS
+  INTO those images — `HCC1`: BeginRendering attachment 75–84× per flip image
+  plus CopyImage2 as BOTH src and dst — while the creator device touches them
+  exactly once (one ClearColorImage at creation, i.e. black).
+
+### ⛔ The KMD pixel probe never read a primary (both prior raw claims VOID)
+
+NVIDIA memory table (RTX PRO 6000): type 1 — the primaries' `renderer_type=1`
+class — is pure DEVICE_LOCAL; no host-visible type accepts an OPTIMAL image;
+the export offers no host-visible import type. A device-local venus blob is
+unmappable (`vkr_device_memory_export_blob` refuses USE_MAPPABLE on
+non-host-visible), so `sample_flushed_blob`'s map fails for EVERY primary —
+`D2PxErr` said so all along and was never read — and the probe stored its rid
+BEFORE the map, pairing failed primaries with stale bytes: the two boots'
+"rid 49/50 nz=16384 max=255" were the BOOT LOGO's sample, and the morning's
+"D2PxNz=0 raw-page-proven" was the same artifact on the zero side. Fixed in
+.429 (rid stores only beside its own sample). ⇒ **the consumer-side oracle
+(`helios_scanout_read`) is the ONLY sound content instrument for primaries**,
+and it reads `nonzero 0` at every flush — including with a fullscreen
+animating lime/magenta window up (session-1 task `helios_green`, ~9 Hz flips).
+
+### The host consumer is exonerated — 13 arms (`tools/dmabuf_optimal_readback_probe.c`)
+
+The exact vulkan-readback OPTIMAL consumer (dedicated dma-buf import, MUTABLE,
+EXTERNAL→queue acquire at SHADER_READ_ONLY, CopyImageToBuffer) reads FULL
+GREEN through every producer shape on this GPU: external DMA_BUF /
+OPAQUE-mismatched / non-external; wrong layouts; no ownership release;
+dedicated + non-dedicated DEVICE_LOCAL; transfer clear, attachment clear,
+dynamic rendering; and the REAL topology (memory-only original, writer =
+second device's dedicated import, reader = third device's import). Driver
+aliasing/compression/layout/ownership semantics are NOT the divergence. The
+vk-optimal vs vk-linear arm split (primaries pass the exact-size gate into
+vk-optimal; the LINEAR parking blob takes vk-linear) is real but not the
+defect.
+
+### ⭐ NEW measured defect: GPU-write visibility is late (or readback fences early)
+
+`d3d11_shared_content_probe` on .429: the creator's OWN clear + CopyResource +
+blocking Map reads **all-zero immediately** (arm A FAIL); the content appears
+**≤3 s later** with no further guest activity (C0 zero → C1 full); CPU
+`UpdateSubresource` propagates immediately both ways. Either submissions
+execute seconds late while their fences signal at decode, or the readback
+fence does not cover the writes — both violate the WS1 invariant
+guest-visibly, and both would make every same-device readback "pass" while
+the scanout reads stale zeros. For dwm at ~9 Hz the flip content NEVER
+appears (not merely late) across minutes of flushes.
+
+### ⭐ NEW defect: the composition freeze (.427+, 3/3 boots — and NOT only at transitions)
+
+One recomposite after a monitor off→on, then: dwm compositor parked in
+`CScheduler::WaitForWork` (cdb), `VsEnNow=0` (vsync never re-enabled; 5744
+ticks before), `D2FlqPub−D2FlqTak=1` (the transition rebind's flush request,
+published by the .427 fix's arm, has no drainer on that path), zero further
+binds/flushes; `SendMessage(HWND_BROADCAST)` never returns (so `helios_monoff`
+HANGS every run — its done-file has never existed) and `CopyFromScreen`
+wedges. Mitigation while measuring: `powercfg /change monitor-timeout-ac 0`
+(set on the .429 boots). Root-cause lead: vsync/ControlInterrupt re-enable
+after `SetVidPnSourceVisibility(FALSE→TRUE)`. ⚠ AMENDED on the second .429
+boot: the freeze ALSO triggered spontaneously at an idle flip boundary
+(17:45:25Z, last bind res 0x34, no unbind, no transition, ~4 min after the
+green window closed, monitor timer disabled) — so a visibility transition is
+a sufficient but not necessary trigger, and measurement sessions should do
+their reads within the first minutes after boot or keep a flip source
+animating.
+
+### What the black desktop is, as of tonight
+
+The composition provably renders into the right images bound to the right
+memory whose fd the scanout reads — and that memory contains zeros at every
+flush. With the host semantics probe-excluded, the loss is in one of two
+places, and the next session must split them:
+
+1. **Submit-execution** ← the evidence now leans hard this way, three
+   sharpenings after the block above was first written:
+   - HBI1 for the shared-content probe's pids (4444/6548): its shared RT's
+     images bind token-REGISTERED memories on both devices (`reg=1 tok=1`,
+     off=0) — no private-memory split; the ≤3 s staleness happened against
+     genuinely imported memory.
+   - dwm's composition opens with an attachment clear (HCC1 op213 loadOp
+     path); a landed opaque-black clear writes alpha=255 ⇒ the oracle would
+     read ~25% nonzero. It reads pure zero across 140+ flushes and at idle
+     minutes later (no accumulation of late frames) ⇒ **not even the clear
+     executes — dwm's context's GPU work never runs host-side**, while probe
+     contexts run ≤3 s late. Never-vs-late is a per-context property.
+   - The differentiator candidate: dwm's submits carry bridged WDDM
+     wait-semaphores (flip availability, app-surface sync) that never signal
+     host-side — pending waits park the submits in the render server forever,
+     with zero refusals and decode-signaled guest fences.
+   Sharpenings AND retractions from the late-night measurements (all on the
+   third .429 boot, green window animating, in-window verified):
+   - ⛔ HQS1 is pointless: `vn_helios_queue_submit2` REFUSES any record-only
+     submit carrying semaphores (`HELIOS_RECORD_REFUSE_CONTROL_CLASS`) — the
+     venus stream can contain no waits at all, so nothing host-side can be
+     "blocked on a semaphore".
+   - The wire fences are GPU-true BY DESIGN: HOB1 batches submit with
+     `ring_idx ≥ 1` (`NativeSubmitDomain::Queue`), and vkr's per-queue sync
+     thread WaitForFences a real VkFence before retiring the virtio fence
+     (vkr_queue.c). BUT if an EXECBUFFER is lost while its fence request
+     arrives, an empty queue signals instantly — false completion.
+   - ⛔ RETRACTED: "the worker does no CPU work" and "no composition is
+     transmitted". The steady-state ctx-0x3 wire submissions are tiny
+     (28–88 B) because the venus payload rides shared-memory WINDOWS
+     (`Nr2SubWin/Nr2PchWin/Nr2WinFB`), and the composition goes through the
+     ordinary K9 path — `K9Adm=21025, K9Host=20628` this boot vs
+     `Nr2OuterQ=62` (the outer path is only creates/opens/init). Worker-3
+     CPU during a verified 12 s window of 1170 submits + 109 binds was 5
+     ticks ≈ 43 µs/submission — LOW but compatible with decoding+submitting
+     tiny per-frame command buffers. The CPU angle cannot decide alone.
+   - New counter leads from the live dump (tools/kmd-live-counter-names.sh):
+     `K9Abort=683 K9Early=309 K9Epoch=397` (aborted/early K9 submissions!),
+     `MpoRetry=925` vs `MpoSetOk=896` (more retries than accepts),
+     `CanMiss=CanN=32343` (canonical lookup misses at 100%), `Nr2SubDup=286`.
+     Any of these could be the drop point for the per-frame content — find
+     what K9Abort/CanMiss actually count before theorizing further.
+   - Every guest capture API (CopyFromScreen, paintcap, desktop duplication)
+     WEDGES — consistent with any reader that waits on dwm's GPU work
+     waiting forever, i.e. with dwm's context never reaching real completion.
+   Decide with, in order: (1) read what `K9Abort`/`CanMiss`/`MpoRetry` count
+   and whether their rates track the flip rate; (2) the OWNER-GATED host
+   observation, either of: `sudo gdb -p <virgl-3-gpu_ren pid> -batch -ex
+   'thread apply all bt'` during a green-window run (2 minutes, no relaunch,
+   names exactly what the worker executes/waits), or a relaunch with
+   `VK_LAYER_LUNARG_api_dump` on the render server (VKR_DEBUG has only
+   validate/udmabuf — no command trace); (3) the `ID3D11Query(EVENT)`
+   lag-timing probe for the ≤3 s visibility-lag defect.
+2. **Input-content**: the frames are genuinely black because dwm's INPUTS
+   (cross-process app/GDI surfaces via Lock2 system backing) sample as zero.
+   The green window was GDI (its pixels may sit in system backing that VidMm
+   never transfers); the dcomp D3D presenter produced no flips at all in its
+   task run (inconclusive). Decide with: a session-1 fullscreen FLIP-model
+   D3D presenter with animated bright content, then the per-flush oracle.
+
+Then, still queued: fix A (the duplicate-`hAllocation` use merge — design in
+the morning block), and the freeze root-cause. Do not reopen: host driver
+semantics (13 arms), identity/bind chain (witnessed), the raw-page claims
+(instrument was unsound).
+
 ## ⭐⭐⭐⭐⭐ 2026-08-31 (fresh session) — THE PRODUCER DEFECT IS CONFIRMED WITH A POSITIVE CONTROL, AND IT IS SPECIFIC TO THE PRESENTABLE PRIMARY
 
 Everything below was re-derived from scratch on KMD 22.22.425.0 (no code change
