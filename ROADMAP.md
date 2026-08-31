@@ -4,6 +4,64 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ⭐⭐⭐⭐⭐ 2026-09-01 (cont.) — ROOT CAUSE: THE DRAW-HEAVY COMPOSITION SUBMITS (>~8 KB) NEVER REACH THE RENDER WORKER
+
+Synthesizing the byte-level dump with the draw census gives a coherent, complete
+mechanism for the black desktop:
+
+- **Small A7 streams decode; large ones vanish.** A byte dump at the render
+  worker's socket entry (`render_context_dispatch_submit_cmd`,
+  base+`0x99c0`) over a full logon: **max submit reaching the worker = 8092 B**,
+  while **QEMU's `virtio_gpu_cmd_ctx_submit` receives up to 30548 B** the same
+  boot (14824/15256/16268/18196/27216/30548 all present in QEMU, none at the
+  worker). The composition's draw-heavy A7 streams are recorded up to **99356 B**
+  (ICD HRA1). So the large submits reach QEMU but not the worker's decoder.
+- **This is exactly the draw/no-draw split.** ICD HRA2: the draw=0 streams are
+  small (284–1580 B, copies/clears/barriers); the draw=10 streams are large
+  (18732 B). The small ones reach the worker (`vkBeginCommandBuffer` fired 8×
+  in one census) and decode — but they have no draws. The large draw-bearing
+  ones are dropped → `vkCmdDraw`=0 on the host. The desktop is black because the
+  frames that actually render are the ones that never arrive.
+- **Not ExecuteCommandStreams.** The A7 RECORD_ONLY stream is raw
+  `vkBeginCommandBuffer(90)…vkCmdDraw(106)…vkEndCommandBuffer(91)…vkQueueSubmit2`
+  (the KMD's `validate_venus_a7_outer_stream` keys on opcode 90/91), NOT wrapped
+  in `vkExecuteCommandStreamsMESA(180)` — op 180 never appears as a submit's
+  first opcode. So the draws, if they arrived, WOULD hit `vkr_dispatch_vkCmdDraw`.
+  They don't arrive.
+
+### The exact open question (one measurement from a fix)
+
+The KMD submits the A7 stream inline as a `SUBMIT_3D` (chained venus bytes,
+`gpu/mod.rs` `enqueue_submit_inner`). QEMU receives it (30548 B seen). But the
+render worker's `render_context_dispatch_submit_cmd` never sees >8092 B, and
+there is **no** proxy error in the host log (`failed to submit large cmd
+buffer`, `proxy_log` — 0 occurrences). Two possibilities, decide with ONE probe:
+1. **The render-server proxy silently drops/truncates the SUBMIT_CMD rest-message
+   above a size** (`render_context_op_submit_cmd_request.cmd[256]` inline + the
+   remainder over SOCK_SEQPACKET; `server/render_context.c`,
+   `render_socket_receive_data`). Probe: gdb on the worker, break
+   `render_socket_receive_data`, log its requested length and return value for
+   the large submits — a short read or early return names the drop.
+2. **Large submits take the shmem ring, not SUBMIT_CMD**, and the ring path
+   decodes without hitting `vkr_dispatch_vkCmdDraw` (a different CS decoder).
+   Probe: break `vkr_context_submit_cmd` (the common decoder entry both paths
+   call) and log its `size` — if large sizes appear there but `vkCmdDraw` still
+   never fires, the decode itself drops the command-buffer body.
+
+### The fix, once (1) vs (2) is known
+
+- If (1) transport size limit: the KMD must fragment its venus `SUBMIT_3D` to
+  the proxy's max (like ordinary Mesa venus, which carries command data in the
+  shmem CS ring rather than one giant inline submit), OR raise/telemeter the
+  proxy datagram limit (host-side, owner-gated — establish the limit first).
+- If (2) ring/decoder: fix the decoder path the large A7 streams take.
+
+⚠ This is the first host-side-*touching* lead of the whole effort, but the
+trigger is Helios-specific: bundling a whole frame's Begin..Draw..End into one
+large inline `SUBMIT_3D`. Ordinary Mesa venus never submits inline streams this
+large. So the fix is very likely Helios-side (fragment / use the ring), not a
+host indictment — re-confirm the size threshold before touching QEMU.
+
 ## ⭐⭐⭐⭐⭐ 2026-09-01 — DEFINITIVE, POSITIVE-CONTROLLED: THE HOST EXECUTES 0 OF 7459 RECORDED DRAWS
 
 Full-logon host ptrace count (all 12 workers, attached before logon, held 110s
