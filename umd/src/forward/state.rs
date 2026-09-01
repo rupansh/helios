@@ -1448,13 +1448,23 @@ pub(crate) unsafe fn release_resource(h: Hdevice, h_res: ddi::D3D10DDI_HRESOURCE
                 return;
             }
 
-            /* Construction invariants make this path unreachable.  Keep it
-             * fail-closed: erase a still-live token before COM storage can be
-             * reused, let the lower destructor name its missing-pending
-             * refusal, and only then fall through to ordinary WDDM cleanup. */
+            /* REACHABLE, not "unreachable" (2026-09-01): a shared-resource
+             * create that fails mid-way (VK_KHR_external_memory_win32
+             * unsupported) leaves an outer token with no COM object. DXVK's
+             * own create-unwind already freed the venus memory, so there is
+             * nothing host-side to join — retire the token and the WDDM
+             * allocation normally. The old silent device_lost=1 here made
+             * every later teardown join on this device fail DeviceLost (the
+             * -4 retire storms) and left a zombie device whose object lane
+             * filled to its cap: the start-menu freeze. */
             if let Some(dev) = helios_device(h) {
-                let _ = remove_outer_allocation(&dev.outer, identity);
-                dev.outer.device_lost.store(1, Ordering::Release);
+                let removed = remove_outer_allocation(&dev.outer, identity);
+                log_error!(
+                    "DDI outer orphan retired (no COM): token={} generation={} removed={}",
+                    identity.token,
+                    identity.allocation_generation,
+                    removed
+                );
             }
             if state.com_raw != 0 {
                 let com_raw = core::mem::replace(&mut state.com_raw, 0);

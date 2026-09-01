@@ -50,7 +50,35 @@ known "1 bare re-scanout/min at idle" behaviour, unrelated to the draw drop.
 Owner-reported symptoms after the fix: low-bit color, start menu missing, other
 rendering bugs, and a frozen VNC. Root-caused to four distinct items:
 
-**D1 — HOC1 pending object-command lane overflows and kills the device (~2 h).**
+**D1 — ✅ FIXED 2026-09-01 (two coupled defects, both landed):**
+(1) *Silent zombie-maker* — `umd/src/forward/state.rs` `release_resource`: an
+allocation reaching destruction with an outer token but no COM object (exactly
+what a failed `VK_KHR_external_memory_win32` shared-resource create leaves
+behind, 37/session in dwm) hit a "fail-closed unreachable" arm that silently
+set `device_lost=1` on the whole OuterDevice. Every later teardown join then
+returned DeviceLost (the `result=-4` retire storms, HFM1 `status=33`), detach
+aborted, and the half-dead device kept deferring on an immortal lane. Fix: the
+arm retires the orphan token loudly (`DDI outer orphan retired`) and does NOT
+kill the device — nothing host-side exists to join (DXVK's create-unwind freed
+the venus memory at fail time).
+(2) *No drain without submits* — the ICD's per-device pending object-command
+lane (deferred view creates / descriptor updates, cap 8192) drains only on real
+queue submits, and record-only mode never spawns DXVK's submission threads, so
+a device that defers without submitting fills the lane to the cap; the ICD then
+fails every deferred op with OOM until an image-view create kills dwm's device.
+Fix: `DxvkSubmissionQueue` in record-only mode spawns a 1 Hz
+`recordOnlyFlushLoop` that pushes an empty `vkQueueSubmit2` through the outer
+bracket (serialized on `m_mutexQueue`); `vn_helios_queue_submit2` returns
+immediately for an empty fence-less submit when the lane is empty, so a quiet
+device costs nothing, and carries the whole lane when it is not.
+Acceptance: the start-menu flood repro (schtask `helios_startmenu`, Ctrl+Esc in
+the console session) that ratcheted the lane 52→6272→death now holds it ≤128
+across double floods, flush carries climbing, zero storms, dwm alive.
+Diagnostics kept in-tree: ICD `HOC2`/`HOC3` lane census (128-crossings),
+`HOC4` defer volume (per 1024), `HFM1` teardown-join arm log; DXVK flush tick
+log (first 4 + every 512th).
+
+**D1 (original statement) — HOC1 pending object-command lane overflows and kills the device (~2 h).**
 The freeze. `vn_helios_record_defer_object_command`'s pending lane hit its
 8192-item cap (`HOC1 pending-lane overflow bytes=1211572 count=8192` ×1263);
 from then on every deferred object op returns OOM — 1262 ×
