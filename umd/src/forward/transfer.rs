@@ -293,9 +293,31 @@ pub(crate) unsafe extern "C" fn resource_read_after_write_hazard(
     note_ddi_refusal(&DDI_REFUSALS.resource_raw_hazard);
 }
 
+static FLUSH_TRACE: LogThrottle = LogThrottle::new();
+
+/// `pfnFlush` is a submission point: dwm flushes its composition device 150 us
+/// before presenting the shared primary from another device, and the flip is
+/// ordered behind the render only if the render is already queued. A bare DXVK
+/// `Flush()` is asynchronous — measured 2026-09-01, the frame landed 116-141 ms
+/// after the flip and every first present scanned out zero (ROADMAP D2).
 pub(crate) unsafe extern "C" fn flush(h: Hdevice) {
-    if let Some(context) = d3d11_context(h) {
-        context.Flush();
+    if FLUSH_TRACE.first_n(96).is_some() {
+        log_error!(
+            "DDI Flush t={} hContext={:p}",
+            crate::forward::trace_us(),
+            dev_context_for_log(h)
+        );
+    }
+    let Some(dev) = helios_device(h) else {
+        if let Some(context) = d3d11_context(h) {
+            context.Flush();
+        }
+        return;
+    };
+    if !dev.dxvk.flush_submitted() {
+        note_ddi_refusal(&DDI_REFUSALS.flush_sync_failed);
+        log_error!("DDI Flush: DXVK submission synchronization failed");
+        set_runtime_error(h, E_FAIL);
     }
 }
 

@@ -45,7 +45,7 @@ fresh uncomposited buffer ~1/min (`scanout_read nonzero 0`), so a VNC grab taken
 mid-idle is black; a grab during composition is the full desktop. This is the
 known "1 bare re-scanout/min at idle" behaviour, unrelated to the draw drop.
 
-## 2026-09-01 (post-fix triage) — the FOUR open defects now that composition works
+## 2026-09-01 (post-fix triage) — the FOUR open defects now that composition works (D1 ✅, D2 ✅; D3 open; D4 not ours)
 
 Owner-reported symptoms after the fix: low-bit color, start menu missing, other
 rendering bugs, and a frozen VNC. Root-caused to four distinct items:
@@ -91,14 +91,39 @@ deferred records; items whose deps are never named SKIP forever and accumulate
 (`helios_scope_retire_object_commands`), so the leak is the never-named-dep arm.
 Recovery: `taskkill /f /im dwm.exe` (fresh device; display returns).
 
-**D2 — presents without composition scan out EMPTY primaries (the mostly-black
-desktop).** Every present binds a NEW venus resource (res ids climb 1905→1933 in
-seconds); only the presents immediately following an actual dwm composite read
-back nonzero (csum 0x5c2a47e7fd35fdfa = the desktop), and the very next present
-(~100 ms later) scans out a fresh zero-filled blob, displacing the desktop. An
-uncomposited present must re-show the last composited frame, not fresh pages.
-This — not the old "idle 1/min" framing — is why the display is black except in
-the instant after a composition burst.
+**D2 — ✅ FIXED 2026-09-01 (UMD only): `pfnFlush` was not a submission point.**
+The "fresh blob per present" reading was wrong — within one dwm instance the
+scanout rotates a stable 3-buffer chain (res N, N+1, N+2 ↔ srcAlloc 0x400041c0/
+42c0/4380); what read zero was each buffer's FIRST presents, and the res ids
+"climbed" only across dwm restarts. Root cause, pinned with a DxgKrnl ETW slice
+aligned to the host log (host = guest + 0.457 s, exact on three submits and both
+flips): dwm composites on device **D1** and presents from device **D2**, which
+owns the shared primaries D1 opens (create 0x400041c0 → D1 opens 0x40004240,
+…). dwm's main thread calls `Flush(D1)` 150 µs before `AcquireResource(D2)` +
+`PresentMPO(D2)`; that Flush is what queues D1's render ahead of D2's flip. Our
+`pfnFlush` DDI (all three tables → `transfer.rs::flush`) was DXVK's *asynchronous*
+`Flush()`, so D1's CS thread submitted the frame's HOB1s 116–141 ms after the
+flip (ETW: MMIO flip 57.5307, the 41 160 B render for that buffer at 57.6449;
+host: `set_scanout_blob` 57.9877 → `helios_scanout_read nonzero 0`, the 39 856 B
+batch at 58.1018). dxgkrnl had nothing queued to order the flip behind, so it
+flipped 2 µs after the present call. Fix: `flush` now uses the same
+`flush_submitted()` (Flush + SynchronizeCsThread) as `finish_present`; failure is
+the new `flush_sync_failed` DDI-refusal counter. `dxgi_present_mpo` got the same
+synchronization (`ReleaseResource` already did it for dwm; this closes presents
+without one). Evidence after the fix, same dwm-restart repro: the new chain reads
+`nonzero 63993` on the FIRST present of every buffer (res 4499/4500/4501; before:
+the 2nd buffer read 0 and the desktop went black for 26 s), and the VNC loop shows
+black only for dwm's own restart window (~3.5 s, the transient init devices'
+deliberately black frames) then the desktop continuously. The per-process trace
+that decided it stays in the UMD log (first 96 each): `DDI Flush t=… hContext=`,
+`DDI Acquire/ReleaseResource …`, `DDI PresentMPO …`, and `A7 batch t=… fb=[w0x…]`
+(the 4 587 520-byte allocations each outer batch reads/writes).
+⚠ Named perf residue (not opened — perf is paused): the synchronous Flush now
+stalls dwm's main thread for the CS thread's backlog (6–30 ms per present in the
+restart burst). The backlog is **~105 synchronous ICD control round trips per
+composition frame, each ~1.98 ms inside `DxgkDdiRender`** for a 112-byte HNR2
+command buffer (ETW, D1's CS thread, 206 ms of 230 ms). That is the next causal
+lever for dwm latency — the KMD HNR2 Render cost, not the UMD.
 
 **D3 — shared surfaces fail: `VK_KHR_EXTERNAL_MEMORY_WIN32 not supported`
 (start menu missing).** dwm ×47, explorer ×13, StartMenuExperienceHost ×8 hit

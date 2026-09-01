@@ -1534,6 +1534,32 @@ unsafe fn submit_outer_scope(
             return Err(HeliosTranslatorStatus::HostCallbackFailed);
         }
     };
+    // D2 ordering trace: which 1280x800 (primary-sized) allocations each
+    // outer batch reads/writes, timestamped against the DDI trace lines.
+    static BATCH_TRACE_N: AtomicU32 = AtomicU32::new(0);
+    if BATCH_TRACE_N.fetch_add(1, Ordering::Relaxed) < 256 {
+        use std::fmt::Write as _;
+        let mut targets = String::new();
+        for (state, access) in resolved.iter() {
+            if state.bytes == 4_587_520 {
+                let _ = write!(
+                    targets,
+                    " {}0x{:x}",
+                    if access & HELIOS_HOB1_ACCESS_WRITE != 0 { "w" } else { "r" },
+                    state.allocation
+                );
+            }
+        }
+        log_error!(
+            "A7 batch t={} hContext={:p} id={} bytes={} uses={} fb=[{} ]",
+            crate::forward::trace_us(),
+            context.handle.as_ptr(),
+            hob.header().batch_id,
+            hob.as_bytes().len(),
+            resolved.len(),
+            targets
+        );
+    }
 
     let _render_guard = crate::forward::lock_ignore_poison(&context.render_lock);
     let command_window = context.command.get();

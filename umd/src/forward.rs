@@ -59,6 +59,16 @@ pub(crate) use wddm2::*;
 // `use super::handles::boxed_slot;` -- one line, and the bound stays sealed.
 use handles::boxed_slot;
 
+/// Microseconds since this process first asked. Orders the D2 present trace
+/// (Flush / sync token / PresentMPO / outer batch) across dwm's threads.
+pub(crate) fn trace_us() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_micros() as u64
+}
+
 pub(super) use core::ffi::c_void;
 pub(super) use core::mem::ManuallyDrop;
 pub(super) use std::sync::atomic::{AtomicUsize, Ordering};
@@ -400,6 +410,7 @@ struct DdiRefusals {
     /// 2026-08-28). `DestroyAllocation` has no such race -- dxgkrnl waits for
     /// the packet. Knob `UmdEvictOnDeallocate=1` restores the paired evict.
     residency_evict_suppressed: RefusalCounter,
+    flush_sync_failed: RefusalCounter,
 }
 
 /// ⚠ Each counter now carries its own NAME (`RefusalCounter`, stage S2), so
@@ -432,12 +443,13 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
     hwa2_open_unsupported_shape: RefusalCounter::new("hwa2_open_unsupported_shape"),
     sync_token_identity_unverified: RefusalCounter::new("sync_token_identity_unverified"),
     residency_evict_suppressed: RefusalCounter::new("residency_evict_suppressed"),
+    flush_sync_failed: RefusalCounter::new("flush_sync_failed"),
 };
 
 /// The set, in the order the summary prints them. ⛔ This order is the
 /// evidence contract: `DDI refusals:` lines from different builds are diffed.
 /// The K4 counters are APPENDED so every pre-existing column keeps its place.
-static DDI_REFUSAL_SET: [&RefusalCounter; 24] = [
+static DDI_REFUSAL_SET: [&RefusalCounter; 25] = [
     &DDI_REFUSALS.srv_raw_hazard,
     &DDI_REFUSALS.resource_raw_hazard,
     &DDI_REFUSALS.text_filter_size_ignored,
@@ -462,6 +474,7 @@ static DDI_REFUSAL_SET: [&RefusalCounter; 24] = [
     &DDI_REFUSALS.hwa2_open_unsupported_shape,
     &DDI_REFUSALS.sync_token_identity_unverified,
     &DDI_REFUSALS.residency_evict_suppressed,
+    &DDI_REFUSALS.flush_sync_failed,
 ];
 
 /// One bounded log line carrying every counter.

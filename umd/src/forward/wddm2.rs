@@ -8,6 +8,7 @@
 use super::*;
 
 static WDDM2_REFUSAL_LOG: LogThrottle = LogThrottle::new();
+static SYNC_TOKEN_TRACE: LogThrottle = LogThrottle::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wddm2Refusal {
@@ -516,6 +517,16 @@ unsafe fn run_sync_token(
     };
     let context_handle = context.handle.as_ptr();
     arg.BroadcastContextArray = &context_handle;
+    if SYNC_TOKEN_TRACE.first_n(96).is_some() {
+        log_error!(
+            "DDI {} t={} hContext={:p} res={:p} token={:p}",
+            if release { "ReleaseResource" } else { "AcquireResource" },
+            crate::forward::trace_us(),
+            context_handle,
+            resource.pDrvPrivate,
+            sync_token
+        );
+    }
     if release && !dev.dxvk.flush_submitted() {
         refuse_void(h, "ReleaseResource", Wddm2Refusal::SubmitFailed, E_FAIL);
         return;

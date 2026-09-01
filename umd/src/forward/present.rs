@@ -1169,6 +1169,8 @@ pub(crate) static BLT_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(crate) static BLT1_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(crate) static RESIDENCY_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(crate) static MPO_LOG_COUNT: LogThrottle = LogThrottle::new();
+static MPO_TRACE: LogThrottle = LogThrottle::new();
+static MPO_TRACE_DONE: LogThrottle = LogThrottle::new();
 pub(crate) static PRESENT1_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(crate) static DXGI13_RESERVED_LOG_COUNT: LogThrottle = LogThrottle::new();
 pub(crate) const DXGI_MPO_MAX_PLANES: u32 = 1;
@@ -1723,12 +1725,35 @@ pub(crate) unsafe extern "C" fn dxgi_present_mpo(
 
     probe_mpo_entry(&a, &cb);
 
-    if let Some(context) = d3d11_context(h) {
-        context.Flush();
+    // Same submission synchronization as finish_present: DXVK's Flush() is
+    // asynchronous, and the flip must queue behind this device's own render.
+    // (dwm's cross-device case is ordered by pfnFlush — transfer.rs `flush`.)
+    if MPO_TRACE.first_n(96).is_some() {
+        log_error!(
+            "DDI PresentMPO t={} hContext={:p} srcAlloc=0x{:x}",
+            crate::forward::trace_us(),
+            ctx.handle.as_ptr(),
+            alloc
+        );
+    }
+    if !dev.dxvk.flush_submitted() {
+        probe_early_refusal(
+            PresentBoundaryEntry::Mpo,
+            "DXVK submission synchronization failed",
+        );
+        log_error!("DXGI PresentMultiplaneOverlay: DXVK submission synchronization failed");
+        return E_FAIL;
     }
 
     let hr = present_cb(dev.h_rt_device, &cb);
     probe_mpo_result(hr, &cb);
+    if MPO_TRACE_DONE.first_n(96).is_some() {
+        log_error!(
+            "DDI PresentMPO done t={} hr=0x{:08x}",
+            crate::forward::trace_us(),
+            hr as u32
+        );
+    }
     if MPO_LOG_COUNT.first_n(64).is_some() {
         trace_line!(
             "DXGI PresentMultiplaneOverlay: planes={} enabled={} presentCb=0x{:08x} ctx={:p}",
