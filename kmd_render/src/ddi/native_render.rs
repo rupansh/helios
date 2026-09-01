@@ -2057,78 +2057,116 @@ pub(crate) fn retract_parked_referencing(
 /// Parked batches freed by [`retract_parked_referencing`].
 pub static NR2_RETRACTED: AtomicU32 = AtomicU32::new(0);
 
-/// Worker-queued outer pendings freed by [`retract_session_worker_pendings`].
+/// Ready/Collecting executor slots failed by [`fail_session_ready_slots`].
 pub static NR2_SESSION_RETRACTED: AtomicU32 = AtomicU32::new(0);
 
-/// Release every worker-queued [`OuterPending`] that pins `session`, BEFORE that
-/// session's K11 rundown join.
+/// Fail every Collecting/Ready executor slot of a context bound to
+/// `target_generation`, releasing its `OuterCustody` — and with it the K11
+/// session rundown guard — BEFORE that session's `close_and_wait` join.
 ///
-/// A queued `OuterPending` holds a `SessionExecutionOperation` (K11 rundown
-/// guard) from submit time until the worker submits it to the host. On an
-/// ORDERLY teardown the owning context's `NativeContext::close` drains the
-/// worker first, so no pending survives. On an ABRUPT process exit dxgkrnl runs
-/// `DxgkDdiDestroyProcess` (session teardown) WITHOUT first destroying the
-/// rendering context, so the queued pending's session guard is still held when
-/// `SessionTransport::close_and_wait` joins the rundown untimed — under the
-/// adapter-exclusive DDI lock — and every later D3D process wedges at adapter
-/// enumeration (flip-app exit-zombie, 2026-09-02; census `K11ActN` tag 1).
-/// Failing and dropping the pending here is the release that join needs; a late
-/// worker pass over a freed slot completes via `Nr2RefCmp`, exactly as the
-/// OUTER retraction ([`retract_parked_referencing`]) relies on.
-pub(crate) fn retract_session_worker_pendings(
-    adapter: &crate::adapter::AdapterContext,
-    session: usize,
-) -> u32 {
-    if session == 0 {
+/// This is the flip-app exit-zombie fix. `DxgkDdiRender` (`render_outer_physical`)
+/// builds a Ready batch (`OuterCustody::Physical`, which pins the session
+/// rundown) that then waits in an executor slot for the matching
+/// `DxgkDdiSubmitCommand`. On an ABRUPT process exit dxgkrnl skips both that
+/// SubmitCommand and `DxgkDdiDestroyContext`, so those Ready batches sit in the
+/// slots holding session guards (`Nr2OuterQ`-`Nr2OuterHost` of them), and when
+/// the session's reply pool is closed the untimed `close_and_wait` join
+/// deadlocks on them under the adapter DDI lock — wedging every later D3D
+/// process at adapter enumeration.
+///
+/// It is the exact slot walk of [`NativeContext::close`], but reached by RAW
+/// pointer from the registry (⛔ NOT [`hold_outer_contexts`]: that takes a
+/// context-rundown guard, which `NativeContext::close`'s own `NATIVE_CONTEXT`
+/// join would then wait on forever). The raw read is sound because this runs on
+/// the process cleanup thread with no concurrent `DxgkDdiDestroyContext`, and a
+/// cleanly-destroyed context has already been unregistered here. A later
+/// SubmitCommand or worker pass over a freed slot completes via `Nr2RefCmp`.
+pub(crate) fn fail_session_ready_slots(target_generation: u64) -> u32 {
+    if target_generation == 0 {
         return 0;
     }
-    let held = hold_outer_contexts(core::ptr::from_ref(adapter) as usize);
+    // Snapshot matching context pointers under the registry lock only; the slot
+    // work runs with it released so no wait or ticket settle is held under it.
+    let mut matched = [0usize; MAX_OUTER_CONTEXTS];
+    let mut count = 0usize;
+    {
+        let registry = OUTER_CONTEXTS.lock();
+        for &(_, ctx) in &registry.entries[..registry.count] {
+            if ctx == 0 {
+                continue;
+            }
+            // SAFETY: a registered context box is live until its own
+            // unregister_outer_context (which precedes its free); no concurrent
+            // teardown runs on this thread. One immutable scalar read.
+            let generation = unsafe { (*(ctx as *const NativeContext)).session_generation };
+            if generation == target_generation && count < matched.len() {
+                matched[count] = ctx;
+                count += 1;
+            }
+        }
+    }
     let mut freed = 0u32;
-    for operation in held.iter() {
-        // SAFETY: the guard holds this context's rundown open.
-        let native = unsafe { operation.owner.as_ref() };
-        let Some(worker) = native.outer_worker.as_ref() else {
-            continue;
-        };
-        // One pending per pass: dropping a rundown guard under the worker lock
-        // is illegal (the same rule `retract_parked_referencing` follows).
-        loop {
-            let pending = {
-                let mut state = worker.state.lock();
-                let found = state
-                    .pending
-                    .as_slice()
-                    .iter()
-                    .position(|pending| pending.session.as_ptr() as usize == session);
-                match found {
-                    Some(index) => {
-                        let pending = state.pending.remove(index);
-                        NR2_WORKER_PENDING_LIVE.fetch_sub(1, Ordering::Relaxed);
-                        Some(pending)
+    for &ctx in &matched[..count] {
+        // SAFETY: as above.
+        let native = unsafe { &*(ctx as *const NativeContext) };
+        let adapter = unsafe { native.adapter.as_ref() };
+        for index in 0..EXECUTOR_SLOTS {
+            let work = {
+                let mut executor = native.executor.lock();
+                let Some(slot) = executor.slots.get_mut(index) else {
+                    continue;
+                };
+                match core::mem::replace(slot, SubmissionSlot::Free) {
+                    SubmissionSlot::Collecting { identity, tickets } => {
+                        *slot = SubmissionSlot::Terminal {
+                            identity,
+                            tickets,
+                            success: false,
+                            cleanup: None,
+                        };
+                        CloseSlotWork::Fail(tickets)
                     }
-                    None => None,
+                    SubmissionSlot::Ready {
+                        identity,
+                        tickets,
+                        batch,
+                    } => {
+                        *slot = SubmissionSlot::Terminal {
+                            identity,
+                            tickets,
+                            success: false,
+                            cleanup: None,
+                        };
+                        match batch {
+                            Some(batch) => CloseSlotWork::DropReady(tickets, batch),
+                            None => CloseSlotWork::Fail(tickets),
+                        }
+                    }
+                    other => {
+                        *slot = other;
+                        CloseSlotWork::None
+                    }
                 }
             };
-            let Some(pending) = pending else {
-                break;
-            };
-            let identity = pending.identity;
-            let slot_index = pending.slot_index;
-            // Retire the reserved slot, then drop the pending: dropping releases
-            // the session guard (and the context guard and command-pool use).
-            fail_outer_slot(
-                native,
-                identity,
-                slot_index,
-                OuterExecutionRefusal::SessionClosed,
-            );
-            drop(pending);
-            freed += 1;
+            match work {
+                CloseSlotWork::None => {}
+                CloseSlotWork::Fail(tickets) => settle_batch_tickets(adapter, tickets, false),
+                CloseSlotWork::DropReady(tickets, mut batch) => {
+                    if let Some(reply) = batch.custody.take_reply() {
+                        let _ = reply.finish(false);
+                    }
+                    settle_batch_tickets(adapter, tickets, false);
+                    // Dropping the batch drops its `OuterCustody`, releasing the
+                    // K11 session guard the close_and_wait join is waiting on.
+                    drop(batch);
+                    freed += 1;
+                }
+            }
         }
     }
     if freed != 0 {
         let total = NR2_SESSION_RETRACTED.fetch_add(freed, Ordering::Relaxed) + freed;
-        crate::diag::record_named_bytes(b"Nr2SesRetr", total);
+        crate::diag::record_named_bytes(b"Nr2SlotRetr", total);
     }
     freed
 }

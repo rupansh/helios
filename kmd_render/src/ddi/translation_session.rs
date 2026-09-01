@@ -382,15 +382,17 @@ impl SessionObject {
         let Some(adapter) = (unsafe { self.adapter.as_ref() }) else {
             return;
         };
-        // BEFORE the transport rundown join: release any worker-queued outer
-        // pending that still pins THIS session. On an abrupt process exit the
-        // rendering context is not destroyed first, so its queued pendings hold
-        // this session's K11 guard, and the untimed join under the adapter DDI
-        // lock would deadlock every later D3D process (flip-app exit-zombie).
-        crate::ddi::native_render::retract_session_worker_pendings(
-            adapter,
-            core::ptr::from_ref(self) as usize,
-        );
+        // BEFORE the transport rundown join: fail the Ready/Collecting executor
+        // slots of every outer context bound to THIS session. On an abrupt
+        // process exit dxgkrnl skips DxgkDdiDestroyContext, so a Ready batch that
+        // DxgkDdiRender built and that never got its DxgkDdiSubmitCommand sits in
+        // its slot still holding this session's K11 rundown guard — and the
+        // untimed transport join below would deadlock every later D3D process at
+        // adapter enumeration (flip-app exit-zombie). Failing the slot drops that
+        // guard. `begin_draining_once` above already set the session Draining, so
+        // any concurrent submit refuses rather than re-arming a slot here.
+        let generation = self.model.lock().session_generation();
+        crate::ddi::native_render::fail_session_ready_slots(generation);
         self.transport.teardown(passive, adapter, self.owner);
     }
 }

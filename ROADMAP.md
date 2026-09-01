@@ -133,8 +133,35 @@ alive, clean exit; Start menu PNG-verified open (`tmp/startmenu_start_miss_t2.pn
 — the ps1's windows=0 "miss" verdict remains false on 26100).
 The .439 classic-vsync channel (`VsCls`) is contract-correct — keep — but was
 NOT the root; the ~1.1 s "missed confirmation" reading is retired.
-**Remaining D6 residue (OPEN):**
-- **Flip app exit-zombie — ✅ ROOT-CAUSED 2026-09-02 (KMD .440–.442), fix PARTIAL.**
+**Remaining D6 residue:**
+- **Flip app exit-zombie — ✅ FIXED 2026-09-02 (KMD 22.22.446.0, main `<pending>`).**
+  Verified: 10/10 `helios_triangle_flip` runs exit clean, ZERO zombies, `SxWait`
+  never sets bit 6 (no K11 hang), `Nr2SlotRetr` grows one-or-two per run (the
+  fix firing), and BLT + xproc probes run cleanly AFTER the flips (the poison is
+  gone); dwm alive throughout, `K9Poison`=0. Final root cause: `DxgkDdiRender`
+  (`render_outer_physical`) builds a **Ready batch** (`OuterCustody::Physical`,
+  which pins the K11 session rundown) that waits in an executor slot for the
+  matching `DxgkDdiSubmitCommand`. On an ABRUPT process exit dxgkrnl skips BOTH
+  that SubmitCommand AND `DxgkDdiDestroyContext` (ETW-proven: teardown is
+  `DxgkProcessCallout`→`DdiDestroyDevice`→`DdiCloseAllocation`, and the app has
+  several devices so the leaking context's own DestroyDevice never runs before
+  the hang), so those Ready batches sit in slots holding session guards
+  (`Nr2OuterQ`−`Nr2OuterHost` of them) and the reply-pool `CloseAllocation`'s
+  untimed `close_and_wait` join deadlocks on them under the adapter DDI lock.
+  Fix: `fail_session_ready_slots(session_generation)` in `SessionObject::teardown`
+  (before the transport join) fails the Collecting/Ready executor slots of every
+  context bound to the session, dropping their custody and the session guards.
+  It reaches contexts by RAW pointer from `OUTER_CONTEXTS` — NOT
+  `hold_outer_contexts`, whose context-rundown guard would self-deadlock
+  `NativeContext::close`'s own join — which is sound because session teardown
+  runs on the process-cleanup thread with no concurrent DestroyContext. The
+  `close_and_wait` drain loop (added .441) stays as the interrupt-loss tolerance
+  for a genuinely in-flight batch (`K11ActN`=0x11 clears through it). The
+  earlier .440–.445 attempts (drain loop alone, worker-queue retraction,
+  DdiDestroyDevice context close, and moving the guard off the queued
+  `OuterPending`) are superseded/reverted — the flip app never used the queued
+  worker path (`Nr2OeEnt` stayed sentinel), it uses render→SubmitCommand.
+- **[superseded] Flip app exit-zombie — ROOT-CAUSED 2026-09-02 (KMD .440–.442), fix PARTIAL.**
   What the exit path waits on: the **K11 session rundown join**
   (`SessionTransport::close_and_wait`, `SxWait` bit 6 `K11_RUNDOWN`), untimed,
   under dxgkrnl's adapter-exclusive DDI lock — so when it never returns EVERY
