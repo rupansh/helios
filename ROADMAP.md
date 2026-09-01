@@ -45,9 +45,89 @@ fresh uncomposited buffer ~1/min (`scanout_read nonzero 0`), so a VNC grab taken
 mid-idle is black; a grab during composition is the full desktop. This is the
 known "1 bare re-scanout/min at idle" behaviour, unrelated to the draw drop.
 
-## 2026-09-01 (post-fix triage) — the FOUR open defects now that composition works (D1 ✅, D2 ✅, D3 ✅; D4 not ours) + D5 opened
+## 2026-09-01 (post-fix triage) — the FOUR open defects now that composition works (D1 ✅, D2 ✅, D3 ✅, D5 ✅; D4 not ours) + D5b/D6 opened
 
-**D5 — OPEN (found 2026-09-01 evening, after D2/D3 landed): dwm's device dies on
+**D5 — ✅ FIXED 2026-09-01 (KMD 22.22.434.0 + .435.0; `kmd_logic::present_dma_header`).**
+Three stacked KMD defects, each with its own counter now:
+1. **Trigger — the Present packet was unrecognisable.** `DxgkDdiPresent` emits a
+   4-byte packet for a redirected BLT present (dxgkrnl's classic contract: it
+   hands the KMD src+dst allocations; `DXGI_DDI_ARG_PRESENT.hDstResource` is 0
+   and no `DXGI Blt` DDI is called — the UMD never sees a destination). On the
+   app's outer context `submit_outer_physical` parsed its private bytes as a
+   HOB1 record, failed identity, `Revoked` (`Nr2OuterRej` code 7). Fix: a
+   16-byte header at offset 0 of the DMA private data on EVERY packet the DDI
+   emits (Blt/Flip/Mpo/Other, `"HPDP"`); SubmitCommand peeks it before the HOB1
+   decode and retires the packet in K9 order (a flip is armed first). Counters
+   `Nr2PrBlt/Nr2PrFlip/Nr2PrMpo/Nr2PrOth`.
+2. **Amplifier — a refused submission poisoned the whole engine.** `Revoked` →
+   `fail_ordered_engine_submission` → `OrderedEngine::poison()`: the ONE
+   adapter-wide K9 engine closed, every later fence of every context was
+   accepted-and-never-completed until dxgkrnl's watchdog preempted, the
+   replay hit the same packet, repeat. Before-run (ETW `tmp/dxgk_d5_before.csv`,
+   20.1 s): **1664 `DdiPreemptCommand` (83/s), 765 code-7 refusals**, the app
+   parked in `DXGK_BLOCK_THREAD_FLUSH_DEVICE_QUEUE_PACKET` 0.6 ms after its first
+   present (the unkillable `Executive` wait), K9Poison 5732 by end of boot. Fix:
+   a refused or failed submission COMPLETES its ticket (`Nr2RefCmp`,
+   `Nr2TkFail`); poison is reserved for engine-integrity faults (frontier
+   divergence, fence identity, transport down). The K9 block now flushes on the
+   NR2 cadence (`K9Poison/K9Epoch/K9Adm` were fossils between boots).
+3. **Slot leak under quantum preemption (the dwm `E_OUTOFMEMORY` death).**
+   `reap_terminal_slots` freed a Terminal slot only when all tickets were
+   `ticket_was_retired`, which requires the CURRENT epoch; every preempt
+   advances it (measured ~40–70/s while two contexts compete, `PreN`), so any
+   batch that completed and was reported but not yet reaped was stranded for
+   the life of the context. With 1+2 fixed dwm still died at `HOB1 Render
+   refused batch=346 hr=0x8007000e` (code 6 `SlotExhausted`). Fix: a
+   stale-epoch ticket counts as retired for reaping (`ticket_is_stale_epoch`; a
+   late replay of a freed slot completes via `Nr2RefCmp`).
+After-run (.435, clean boot, `\helios_triangle` BLT_DISCARD 20 s): `Nr2OuterRej`
+0, `Nr2RefCmp` 0, `K9Poison` 0, `Nr2PrBlt` 0→2164, `Nr2Slot−Nr2SlotRet` 1, dwm
+alive with zero lost/refused lines, the app exits on time — through 1870
+preempts / 3584 aborted-and-replayed tickets in 26 s; desktop intact after
+(`tri3_after.png`); D3 regression `HeliosXprocProbe` reader `cc336699/ffffffff`.
+⚠ Deploy trap burned twice today: `win_install_kmd`'s `shutdown /r` sits in
+"Restarting…" for 3–4 min while SSH still answers; a test started in that
+window runs headless (`Nr2PrBlt` stayed 0). Wait for `LastBootUpTime` to change.
+⚠ `win_build_kmd` output always ends with `error: no matching package named
+wdk-build` — that is upstream's `generate-certificate` condition script
+failing (→ "Skipping Task", intended); `Build Done` earlier in the log is the
+verdict.
+
+**D5b — OPEN: the legacy BLT-model window is BLACK (no KMD present blit).** The
+same run's mid-run frame (`tri3_run.png`): desktop and taskbar composite, the
+triangle's 1280×720 window is solid black although its clear is (0.05,0.10,0.55).
+The 4-byte packet does no copy, and nothing else does: dxgkrnl gives the KMD
+src+dst and expects a GPU blit. ⛔ This falsifies the entry below ("Blt-model is
+DEAD on 26100 … DxgkDdiPresent … has NEVER fired"): it fires on every legacy
+DISCARD windowed present (`Nr2PrBlt` 2164 in one 20 s run). Options: a
+host-side copy the KMD can issue (needs a kernel Venus client or a new
+virtio-gpu primitive), or a CPU copy at K9 retirement when both allocations
+are guest-backed (the src back buffer is `misc=0x0`, not shared, and may not be
+CPU-visible). Modern flip-model apps do not take this path.
+
+**D6 — OPEN (found 2026-09-01 21:00, first flip-model windowed run on the fixed
+KMD): dwm device churn + display parked + zombie on exit.** `\helios_triangle_flip`
+(`d3d11_triangle default flip 20`, FLIP_DISCARD, 2 buffers, Present(1,0)):
+15 frames in 20 s (~1.3 s per Present), then "exit after 15 frames" with the
+process left in ONE `Executive` kernel wait (unkillable). dwm (pid 1924) logged
+0 lost/refused lines but **22 `CreateDevice`** and churned 23 distinct primary
+resource ids in 25 s; each teardown parks the scanout on the KMD's parking
+image (res 4, 4096000 B), which QEMU's readback rejects (`OPTIMAL DMA-BUF shape
+mismatch required=4587520 fd_size=4096000` → `set_scanout_blob res 0x0`, VNC
+"Display output is not active"; 10 disables in the window vs 4 in the previous
+5 min). None of the D5 counters moved (`Nr2PrBlt/Nr2PrFlip/Nr2RefCmp/K9Poison`
+flat, `Nr2OuterRej` 0) — the new paths were not in play; the app's presents
+did show `WDDM2.1 sync token identity unverified: MissingResource … token=0xd`
+before each `AcquireResource res=0x0`. Start menu (also flip-model, via
+dcomp) renders, so this is specific to a swapchain-for-hwnd shape. Not
+attributed to today's KMD change (no A/B run yet — rollback package:
+`C:\ProgramData\HeliosDeployBackups\20260901-203717` = .433). Evidence:
+`umd-1924.log` (dwm, boot 20:52), `umd-8260.log`, `tri_flip_stdout.txt`, host
+log 15:28:30–15:28:55Z, `scratchpad/flip_run.png`. Separate cheap fix on the
+side: the parking image should be the primaries' 4587520-byte shape or QEMU
+must accept 4096000, otherwise every park blanks the VNC output.
+
+**D5 — history (OPEN 2026-09-01 evening, after D2/D3 landed): dwm's device dies on
 `A7 D3D11 HOB1 Render refused batch=1591 hr=0x8007000e` (dxgkrnl `pfnRenderCb`
 → E_OUTOFMEMORY) while a windowed BLT_DISCARD D3D11 app (`\helios_triangle`,
 `d3d11_triangle default blt 20`) runs; the display then freezes on stale
@@ -1148,7 +1228,7 @@ page-aligned, page-rounded creator buffer; the KMD locks it with the
 SEH-guarded probe, coalesces its page frames into memory entries, creates a
 `VIRTIO_GPU_BLOB_MEM_GUEST` resource over them, and makes that resource the
 allocation's `VkDeviceMemory` via `VkImportMemoryResourceInfoMESA`. Knobs
-`Hwa2GuestMem` (KMD) + `UmdGuestBacking` (UMD), both OFF, only meaningful
+`Hwa2GuestMem` (KMD) + `UmdGuestBacking` (UMD), both OFF when written (⚠ both DEFAULT ON since 2026-09-01: every accepted desktop since 08-30 ran with them, and OFF was re-measured by the registry wipe as a black desktop — 0 stays reachable as the A/B), only meaningful
 together.
 
 Measured on 22.22.408.0 with both on:
