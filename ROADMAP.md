@@ -4,7 +4,56 @@
 changed on 2026-07-09: Helios is now a WDDM render+display adapter and owns the
 virtio-gpu scanout; IddCx/Looking Glass is no longer the active display path.*
 
+## ✅✅✅✅✅ 2026-09-01 (FIXED) — BLACK DESKTOP RESOLVED: the ICD capped every batch at 8 KiB
+
+**The desktop renders.** `helios_scanout_read` on the composited primary reads
+`nonzero 63993 max 255` (was `nonzero 0`), and `gvnccapture 127.0.0.1:0` shows a
+full Windows 11 desktop — wallpaper, icons, taskbar (`tmp/desktop_fixed_20260901.png`).
+
+**Root cause (one line, host-side ICD, NOT the KMD):** `helios_scope_reserve_payload`
+in `icd/mesa/src/virtio/vulkan/vn_helios_record_submit.c` grew the scope payload
+buffer by doubling, but an `if (capacity < required) return false;` INSIDE the
+doubling loop refused after a SINGLE doubling — capping every batch at
+`4096*2 = 8192` bytes. Every draw-bearing composition batch (10–57 KiB) hit
+`VK_ERROR_OUT_OF_HOST_MEMORY` at `helios_record_append`, and the whole scope was
+abandoned (closed disposition=2) before its payload was ever stored. The append's
+`HRA1` log fired BEFORE the store, so the batch looked recorded; it was dropped
+microseconds later. The bound `required <= HELIOS_HOB1_MAX_BYTES` is proven above
+the loop, so the loop always terminates — the early return was pure defect.
+
+**Why the diagnosis pointed here.** The task's split instrument (receive-side
+`Rcv2Draw` at the KMD's first read) read ≈15 while `RecvDraw` (chokepoint) also
+read ≈15 ⇒ the draws never ARRIVED at the KMD. A UMD bracket census then showed
+297 ICD appends becoming only ~36 host Renders with zero refusals at the UMD/KMD;
+an ICD lifecycle trace (open→append→seal→close, paired by scope pointer) showed
+every >2 KiB append opened, logged HRA1, then closed empty — the loss was between
+the append log and the payload store, i.e. inside `reserve_payload`.
+
+**Evidence (before → after the fix, same boot progression):**
+- KMD `RecvDraw` 15 → 175 and climbing; `RecvMaxLen` 5528 → 67992 B.
+- KMD receive-side `Rcv2Draw` 15 → 174; `Rcv2MaxLen` 5944 → 71464 B.
+- Host `scanout_read` nonzero 0 → 63993 on the DWM primary.
+- `gvnccapture` full desktop (100% non-black).
+
+The KMD was exonerated correctly by the prior session — it forwards verbatim
+what it receives (`enqueue_submit_inner` copies `venus_len` bytes unchanged). The
+draws simply never reached it. The receive-side `Rcv2Draw`/`Rcv3Draw` census is
+retained (KMD 22.22.433.0) as the permanent "arrived vs dropped-in-KMD" oracle.
+
+⚠ Separate, pre-existing observation (NOT this bug): at idle dwm re-scans-out a
+fresh uncomposited buffer ~1/min (`scanout_read nonzero 0`), so a VNC grab taken
+mid-idle is black; a grab during composition is the full desktop. This is the
+known "1 bare re-scanout/min at idle" behaviour, unrelated to the draw drop.
+
 ## ⭐⭐⭐⭐⭐ 2026-09-01 (KMD-instrument session) — THE KMD FORWARDS 15 OF 9023 DRAWS; THE DRAWS VANISH IN THE KMD, NOT THE HOST
+
+> ⛔ SUPERSEDED by the FIXED block above. The localization to "the KMD HNR2
+> fragment path" was WRONG in its final step: the receive-side split (`Rcv2Draw`)
+> proved the draws never arrived at the KMD at all — the drop was one frame
+> upstream, in the ICD's `reserve_payload` 8 KiB cap. The KMD counters and the
+> "not the host" conclusion were correct; only the guest-side owner was misplaced
+> by one component (ICD, not KMD). Kept for the method.
+
 
 Reliable, persistent KMD counters (no gdb-census timing) place the black desktop
 squarely in the guest KMD. Method: a dword scan for CmdDraw(106)/BeginCB(90)/

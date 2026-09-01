@@ -271,6 +271,38 @@ pub static FWD_MAXLEN: AtomicU32 = AtomicU32::new(0);
 /// never delivered.
 pub static RECV_DRAW: AtomicU32 = AtomicU32::new(0);
 pub static RECV_MAXLEN: AtomicU32 = AtomicU32::new(0);
+/// Receive-side census at the KMD's FIRST read of the bytes, before any
+/// validation/extraction. Rcv2* = the outer-physical HOB1 record straight from
+/// `pCommand` (`render_outer_physical`); Rcv3* = the reassembled HNR2 payload
+/// at COMMIT. Against RecvDraw=15: Rcv2 ≫ 15 ⇒ the KMD drops the draws after
+/// receiving them; Rcv2 ≈ 15 ⇒ they never arrive (UMD/ICD seal loss).
+pub static RECV2_DRAW: AtomicU32 = AtomicU32::new(0);
+pub static RECV2_BEGINCB: AtomicU32 = AtomicU32::new(0);
+pub static RECV2_MAXLEN: AtomicU32 = AtomicU32::new(0);
+pub static RECV3_DRAW: AtomicU32 = AtomicU32::new(0);
+pub static RECV3_BEGINCB: AtomicU32 = AtomicU32::new(0);
+pub static RECV3_MAXLEN: AtomicU32 = AtomicU32::new(0);
+
+/// Dword opcode scan for the receive-side census: CmdDraw(106) and
+/// BeginCommandBuffer(90), plus a high-water byte length.
+fn recv_scan(bytes: &[u8], draw: &AtomicU32, begin: &AtomicU32, maxlen: &AtomicU32) {
+    if bytes.len() as u32 > maxlen.load(Ordering::Relaxed) {
+        maxlen.store(bytes.len() as u32, Ordering::Relaxed);
+    }
+    let mut i = 0usize;
+    while i + 4 <= bytes.len() {
+        match u32::from_le_bytes([bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3]]) {
+            106 => {
+                draw.fetch_add(1, Ordering::Relaxed);
+            }
+            90 => {
+                begin.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        i += 4;
+    }
+}
 pub static NR2_IMPORT_SUBSTITUTIONS: AtomicU32 = AtomicU32::new(0);
 /// The last resource id substituted into such an operand.
 pub static NR2_IMPORT_LAST_RESOURCE: AtomicU32 = AtomicU32::new(0);
@@ -507,6 +539,12 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(b"FwdMaxLen", &FWD_MAXLEN),
         e(b"RecvDraw", &RECV_DRAW),
         e(b"RecvMaxLen", &RECV_MAXLEN),
+        e(b"Rcv2Draw", &RECV2_DRAW),
+        e(b"Rcv2CB", &RECV2_BEGINCB),
+        e(b"Rcv2MaxLen", &RECV2_MAXLEN),
+        e(b"Rcv3Draw", &RECV3_DRAW),
+        e(b"Rcv3CB", &RECV3_BEGINCB),
+        e(b"Rcv3MaxLen", &RECV3_MAXLEN),
         e(BOUNDARY_NAMES[0], &NR2_NO_STAGE),
         e(BOUNDARY_NAMES[1], &NR2_NO_EPOCH),
         e(BOUNDARY_NAMES[2], &NR2_NO_SCHEMA_WHO),
@@ -2527,6 +2565,11 @@ pub(crate) unsafe fn render_outer_physical(
             STATUS_INVALID_PARAMETER,
         );
     }
+    // High-water mark BEFORE the shape refusals, so an oversized Render that
+    // trips `CommandLength > DmaSize` still shows up in Rcv2MaxLen.
+    if args.CommandLength > RECV2_MAXLEN.load(Ordering::Relaxed) {
+        RECV2_MAXLEN.store(args.CommandLength, Ordering::Relaxed);
+    }
     if args.CommandLength == 0
         || args.pCommand.is_null()
         || args.pDmaBuffer.is_null()
@@ -2618,6 +2661,12 @@ pub(crate) unsafe fn render_outer_physical(
             STATUS_INVALID_PARAMETER,
         );
     }
+    recv_scan(
+        record_buffer.as_slice(),
+        &RECV2_DRAW,
+        &RECV2_BEGINCB,
+        &RECV2_MAXLEN,
+    );
     let meta = match adapter
         .with_virtio(|gpu| gpu.take_dma_buffer(SUBMIT_META_BYTES))
         .ok()
@@ -3316,6 +3365,12 @@ fn prepare_executor_commit(
         NR2_NO_STAGE.fetch_add(1, Ordering::Relaxed);
         return Err(why(70, STATUS_INVALID_DEVICE_REQUEST));
     };
+    recv_scan(
+        building_ref.payload.as_slice(),
+        &RECV3_DRAW,
+        &RECV3_BEGINCB,
+        &RECV3_MAXLEN,
+    );
     if building_ref.identity.batch_token != header.batch_token
         || building_ref.identity.slot_generation == 0
         || building_ref.identity.session_generation != native.session_generation
@@ -4456,6 +4511,12 @@ fn commit(
             None
         };
         let payload = if let Some(building) = generated.as_mut() {
+            recv_scan(
+                building.payload.as_slice(),
+                &RECV3_DRAW,
+                &RECV3_BEGINCB,
+                &RECV3_MAXLEN,
+            );
             if helios_protocol::wddm::crc64_ecma(building.payload.as_slice())
                 != header.full_payload_crc64
             {
