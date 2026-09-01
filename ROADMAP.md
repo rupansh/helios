@@ -105,8 +105,69 @@ virtio-gpu primitive), or a CPU copy at K9 retirement when both allocations
 are guest-backed (the src back buffer is `misc=0x0`, not shared, and may not be
 CPU-visible). Modern flip-model apps do not take this path.
 
-**D6 — OPEN (found 2026-09-01 21:00, first flip-model windowed run on the fixed
-KMD): dwm device churn + display parked + zombie on exit.** `\helios_triangle_flip`
+**D6 — investigation 2026-09-01 late (fixes staged, verdict pending deploy).**
+The loop, measured twice (ETW `tmp/dxgk_d6.csv`, `tmp/dxgk_d6_consistent.csv`):
+while a flip-model windowed swapchain exists, the OS re-runs a display-config
+evaluation ~18/s — `DdiIsSupportedVidPn` 760–1114/30 s (answered TRUE),
+`DxgkDisplayConfigDeviceInfo` 6–9k, visibility toggles in bursts, **zero
+`CommitVidPn`** — and dwm re-opens the adapter (13–14 `CreateDevice`/run) and
+churns primaries (~16/s). dxgkrnl holds "Driver returned an
+invalid NTSTATUS code: 0xFFFFFFFF C00000BB" records against `DdiQueryAdapterInfo`
+(ETW 494 — ⚠ DCStart RUNDOWN rows, accumulated history replayed at trace
+start, NEVER a live rate; 394–579 accumulated per boot): the KMD refused
+`DXGKQAITYPE_DISPLAY_DRIVERCAPS_EXTENSION` (16), `QUERYCOLORIMETRYOVERRIDES`
+(19) and `DISPLAYID_DESCRIPTOR` (20) — the diag ring (`DiagLevel=1` +
+`pnputil /restart-device`) named them — with STATUS_NOT_SUPPORTED, which this
+DDI's documented return set does not contain. ⛔ Falsified along the way: the
+"pending QEMU-window-resize mismatch" theory — a QMP-reset boot that adopted
+the 2413×1533 VNC size end-to-end (desktop visible at that mode) still churns
+identically, and the evaluation aborts BEFORE `EnumCofuncModality` (0 calls on
+the consistent run vs 30 on the mismatched one). Staged fixes, one commit each:
+(1) KMD .436: zero-fill answers for 16/19 (version-proof "no optional caps /
+no overrides"), fallback → STATUS_INVALID_PARAMETER (legal), counters kept;
+(2) qemu-helios `fc5cde5157`: the vulkan-readback OPTIMAL import demanded
+EXACT fd-size equality — only 1280×800 happened to match; at 2413×1533 every
+primary import was rejected (`required=14843904 fd_size=14913536`) and the
+remote view blanked. Now ≥ is accepted (⚠ needs the owner to relaunch QEMU);
+(3) KMD: mid-session display-info refresh — the HPD worker re-reads
+`GET_DISPLAY_INFO` on virtio config-change, overlays `display_mode()`+EDID
+(regenerated, one value) and replugs the monitor (`HpdMd` breadcrumb) so a
+VNC-client resize renegotiates modes instead of looping. Deploy trap that cost
+one cycle: `devcon update` cannot restart the device while a zombie flip app
+holds it (180 s timeout, reboot skipped) — deploy on a clean boot. ⚠ .438
+(QAI answers live) does NOT stop the loop: idle churn 0, but the flip run
+still drove dwm +13 `CreateDevice`/25 s and the app crawled (24 frames/20 s,
+zombie at exit) — the QAI/status fixes are contract-required but not the
+root. Next probe: Dwm-Core+DXGI ETW during the repro for dwm's own stated
+reset reason. ⚠ `helios_triangle_flip` is `IgnoreNew`: a zombie instance
+silently swallows the next `schtasks /run` — a traced run with no churn and
+an empty trace means the app never launched, not a fix. And a live zombie
+poisons the NEXT flip app at DXGI startup (it loops adapter
+destroy/create around `EnumOutputs(0)` → `DXGI_ERROR_NOT_FOUND` and never
+creates a device) — every valid flip experiment needs a zombie-free boot.
+**Cycle anatomy (Dwm-Core+DXGI trace `tmp/dwmcore_d6.csv`, manifests decoded
+via `wevtutil gp <provider> /ge /gm:true` → UTF-16 parse; DxgKrnl ordering
+from `tmp/dxgk_d6_consistent.csv`):** per ~3.3 s cycle the OS applies
+(`SetVidPnSourceAddress` + `SetVidPnSourceVisibility` back-to-back, sub-ms),
+**~1.1 s later turns visibility OFF, re-evaluates (`IsSupportedVidPn`×~30,
+all TRUE, no `EnumCofuncModality`, no commit) and re-applies**; during the
+off-window the OUTPUT vanishes (the app's `EnumOutputs(0)` returns
+NOT_FOUND mid-run) and dwm builds a fresh HWDEVICE+factory to reopen the
+shared texture (`HWDEVICE/Start` → shader recompiles →
+`OPEN_SHARED_TEXTURE_EVENT`). Eliminated as causes: the QAI/backing illegal
+statuses (fixed in .436/.438, churn unchanged), mode mismatch alone, KMD
+refusals in the apply path (`NotSupM` bits 21–23 never set; NB `NotSup` is
+PACKED `(site<<16)|count`, not a plain count), monitor replug storms
+(`HpdN`=1). ⭐ NEXT LEAD: the ~1.1 s apply→teardown looks like a missed
+post-apply confirmation — first candidate: the classic (non-MPO)
+`SetVidPnSourceAddress` apply is confirmed by the address the CRTC vsync
+reports back, and Helios' vsync path may never report the applied classic
+address (`LastPA`), so a ~1 s timeout reverts the path; instrument the vsync
+address report vs the D4 apply and the visibility flag (the KMD's 0x1314
+crumb records SourceId only, not Visible).
+
+**D6 — original report (2026-09-01 21:00, first flip-model windowed run on the
+fixed KMD): dwm device churn + display parked + zombie on exit.** `\helios_triangle_flip`
 (`d3d11_triangle default flip 20`, FLIP_DISCARD, 2 buffers, Present(1,0)):
 15 frames in 20 s (~1.3 s per Present), then "exit after 15 frames" with the
 process left in ONE `Executive` kernel wait (unkillable). dwm (pid 1924) logged
