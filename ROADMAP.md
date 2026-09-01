@@ -75,6 +75,23 @@ generation-2 (transient) device still logs `A7 D3D11 outer device lost at outer
 allocation terminal batch` (`result=-4` teardown joins on tokens 19/30/31) —
 the D1 teardown-join family on a transient device; the compositor device is
 unaffected. Keep it on the D5 list rather than reopening D1.
+**D5 reproduces deterministically and is NOT today's UMD changes.** Clean boot,
+`\helios_triangle` (BLT_DISCARD, 20 s): the app never returns from its FIRST
+`pfnPresentCb` (`present-boundary entry #1` logged, no callback; main thread in
+a kernel `Executive` wait; unkillable; blocks `shutdown /r` until `/f`), and
+`Nr2OuterRej` climbs 0 → 300–600 (code 7 `ResubmissionMismatch`) while it hangs.
+Same result with `HKLM\SOFTWARE\Helios!UmdFlushSync=0` (the async Flush A/B),
+and the app performs no `open_resource`, so D2/D3 are out. Mechanism, from the
+KMD source: `DxgkDdiPreemptCommand` → `abandon_pending_submissions(Preempted)`
+drops every pending WDDM fence and acks `DMA_PREEMPTED`; dxgkrnl then RESUBMITS
+DMA buffers whose outer (HOS1) batches are already executing on the host, and
+`submit_outer_physical`'s resubmission identity check refuses them
+(`ResubmissionMismatch` → `Revoked` → `fail_ordered_engine_submission`),
+dxgkrnl retries (~1/s per packet: the storm), and the present packet queued
+behind never completes. Fix belongs in the KMD's preemption model for outer
+work (report preempted only what was NOT forwarded, or complete forwarded
+batches normally and let the resubmission match/no-op) — a KMD session; the
+dwm E_OUTOFMEMORY death is the same storm exhausting the 64 executor slots.
 
 Owner-reported symptoms after the fix: low-bit color, start menu missing, other
 rendering bugs, and a frozen VNC. Root-caused to four distinct items:
