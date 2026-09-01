@@ -1626,6 +1626,33 @@ unsafe fn submit_outer_scope(
         render.NewPatchLocationListSize = HELIOS_HVC1_PATCH_LOCATION_ENTRIES;
     }
     let hr = render_cb(outer.h_rt_device, &mut render);
+    // D6 diagnostic: dxgkrnl refuses ONE outer render per dwm cycle with
+    // STATUS_ACCESS_DENIED and the runtime removes the device WITHOUT failing
+    // this callback (JournalEntry 0xC0000022 -> 0x887A002B, 2026-09-01).
+    // Log every outer render's verdict + full allocation list so the refused
+    // batch's entries are visible. Bounded per process.
+    static HOB1R_TRACE_N: AtomicU32 = AtomicU32::new(0);
+    if HOB1R_TRACE_N.fetch_add(1, Ordering::Relaxed) < 4096 {
+        use std::fmt::Write as _;
+        let mut list = String::new();
+        for (state, access) in resolved.iter() {
+            let _ = write!(
+                list,
+                " {}0x{:x}",
+                if access & HELIOS_HOB1_ACCESS_WRITE != 0 { "w" } else { "r" },
+                state.allocation
+            );
+        }
+        log_error!(
+            "HOB1R t={} ctx={:p} id={} hr=0x{:08x} n={} [{} ]",
+            crate::forward::trace_us(),
+            context.handle.as_ptr(),
+            hob.header().batch_id,
+            hr as u32,
+            resolved.len(),
+            list
+        );
+    }
     if hr < 0 {
         log_error!(
             "A7 D3D11 HOB1 Render refused batch={} hr=0x{:08x} cmdlen={} nalloc={} npatch={} \
