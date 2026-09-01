@@ -54,6 +54,20 @@ static SET_SDR_WHITE_IGNORED: AtomicU32 = AtomicU32::new(0);
 static SET_DIRTY_IGNORED: AtomicU32 = AtomicU32::new(0);
 static VSYNC2_ENABLED: AtomicU32 = AtomicU32::new(1);
 
+pub(crate) static VSYNC_CLASSIC: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(1);
+/// Classic `CRTC_VSYNC` packets sent alongside the MPO flavor (`VsCls`).
+pub(crate) static VSYNC_CLASSIC_SENT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+pub(crate) fn set_vsync_classic(value: u32) {
+    VSYNC_CLASSIC.store(value, core::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn vsync_classic_enabled() -> bool {
+    VSYNC_CLASSIC.load(core::sync::atomic::Ordering::Acquire) != 0
+}
+
 pub(crate) fn set_vsync2_enabled(value: u32) {
     VSYNC2_ENABLED.store(value, Ordering::Relaxed);
 }

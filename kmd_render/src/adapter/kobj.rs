@@ -531,6 +531,23 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
             )
         }
     };
+    // The MPO INFO2 packet above carries only the MPO PresentId, so a CLASSIC
+    // `SetVidPnSourceAddress` apply had NO completion channel on this surface:
+    // the OS's re-apply cycle (ROADMAP D6) turned visibility off ~1.1 s after
+    // every apply and looped. The classic packet reports the applied address;
+    // dxgkrnl ignores it for MPO flip retirement (measured, see
+    // `signal_crtc_vsync_mpo3`), so sending both is additive.
+    if crate::virtio::KMD_D2_OWNER_ENABLED && crate::ddi::mpo3::vsync_classic_enabled() {
+        // SAFETY: same live callback interface as above; <= DIRQL.
+        let _ = unsafe {
+            crate::ddi::submit_command::signal_crtc_vsync(
+                dxgkrnl,
+                phys,
+                crate::ddi::vidpn::CHILD_UID,
+            )
+        };
+        crate::ddi::mpo3::VSYNC_CLASSIC_SENT.fetch_add(1, Ordering::Relaxed);
+    }
     adapter.vsync_count.fetch_add(1, Ordering::Relaxed);
 }
 

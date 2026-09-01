@@ -662,6 +662,13 @@ pub mod knobs {
     /// `UmdGuestBacking`; the two flip together. Every refusal falls back to
     /// the host allocation and is counted `Gb*`.
     pub const HWA2_GUEST_MEM: KnobName = KnobName::new(b"Hwa2GuestMem");
+    /// Also send the classic `CRTC_VSYNC` (with the applied primary address)
+    /// beside the MPO vsync each retrace (default 1). The MPO INFO2 packet
+    /// carries only the MPO PresentId, so a CLASSIC `SetVidPnSourceAddress`
+    /// apply had NO completion channel: the OS re-apply cycle (D6) tore the
+    /// path down ~1.1 s after every apply and looped. 0 = the old MPO-only
+    /// shape, the A/B disable. Read at `direct_scanout::start`.
+    pub const VSYNC_CLASSIC: KnobName = KnobName::new(b"VsyncClassic");
 }
 
 /// Read a service-key REG_DWORD knob, or `default` if absent.

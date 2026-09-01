@@ -590,6 +590,10 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_visibility(
             adapter.vsync_count.load(core::sync::atomic::Ordering::Relaxed),
         );
         crate::diag::record_named_bytes(
+            b"VsCls",
+            crate::ddi::mpo3::VSYNC_CLASSIC_SENT.load(core::sync::atomic::Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
             b"VsEnNow",
             adapter.vsync_enabled.load(core::sync::atomic::Ordering::Relaxed),
         );

@@ -1682,6 +1682,10 @@ pub(crate) fn start(
             crate::diag::knobs::MPO_VSYNC2,
             1,
         ));
+        crate::ddi::mpo3::set_vsync_classic(crate::diag::read_config_dword(
+            crate::diag::knobs::VSYNC_CLASSIC,
+            1,
+        ));
         crate::virtio::venus::fill_host_visible_blob(
             passive,
             adapter,
