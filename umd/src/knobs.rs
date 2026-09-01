@@ -25,6 +25,7 @@
 //! | `UmdEvictOnDeallocate` | DWORD | `false` (pair the evict with the deallocate) |
 //! | `UmdLockMode` | DWORD | `0` (`pfnLockCb`, the measured configuration) |
 //! | `UmdGuestBacking` | DWORD | `false` (KMD `Hwa2GuestMem` is the other half) |
+//! | `UmdFlushSync` | DWORD | `1` (`pfnFlush` waits for the CS thread's submission; 0 = the old async Flush, the D2 A/B) |
 //!
 //! The surviving policies are `BoolKnob` ("absent = off, non-zero = on") and
 //! `DwordKnob` ("absent = this default, else the stored value").
@@ -124,7 +125,7 @@ pub(crate) fn log_knob_inventory() {
     helios_umd_common::log::log_knob_inventory(&resolved_inventory());
 }
 
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 5] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 6] {
     [
         ("UmdTrace", UMD_TRACE.get() as u32),
         ("FeatureLevel11", FEATURE_LEVEL_11.get()),
@@ -134,6 +135,7 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 5] {
             "UmdDeferredDiagnostics",
             UMD_DEFERRED_DIAGNOSTICS.get() as u32,
         ),
+        ("UmdFlushSync", UMD_FLUSH_SYNC.get()),
     ]
 }
 
@@ -279,4 +281,16 @@ pub(crate) static UMD_GUEST_BACKING: DwordKnob = DwordKnob::new(c"UmdGuestBackin
 /// [`UMD_GUEST_BACKING`].
 pub(crate) fn umd_guest_backing() -> u32 {
     UMD_GUEST_BACKING.get()
+}
+
+/// Whether `pfnFlush` is a submission point (the fix for ROADMAP D2, 2026-09-01:
+/// dwm flushes its composition device 150 us before presenting from another
+/// device, and only a synchronous Flush queues that render ahead of the flip).
+/// 1 = wait for the CS thread's submission (the measured configuration);
+/// 0 = the old asynchronous DXVK `Flush()` — the same-boot A/B disable.
+pub(crate) static UMD_FLUSH_SYNC: DwordKnob = DwordKnob::new(c"UmdFlushSync", 1);
+
+/// `HKLM\SOFTWARE\Helios!UmdFlushSync` (REG_DWORD). See [`UMD_FLUSH_SYNC`].
+pub(crate) fn umd_flush_sync() -> bool {
+    UMD_FLUSH_SYNC.get() != 0
 }

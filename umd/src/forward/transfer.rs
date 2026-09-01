@@ -314,6 +314,12 @@ pub(crate) unsafe extern "C" fn flush(h: Hdevice) {
         }
         return;
     };
+    if !crate::knobs::umd_flush_sync() {
+        if let Some(context) = d3d11_context(h) {
+            context.Flush();
+        }
+        return;
+    }
     if !dev.dxvk.flush_submitted() {
         note_ddi_refusal(&DDI_REFUSALS.flush_sync_failed);
         log_error!("DDI Flush: DXVK submission synchronization failed");

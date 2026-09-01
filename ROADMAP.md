@@ -68,6 +68,13 @@ was fine (28 GB free). Not reproduced deliberately yet; evidence:
 which NO_MEMORY arm fired (publish the refusal code per Render failure, not only
 `bump_with_code`'s last-code), and why resubmissions after preemption mismatch
 the executor slot.
+Follow-ups measured the same evening: (a) the wedged triangle process blocked
+`shutdown /r` ("A system shutdown is in progress" for >90 s) until `/f`; a
+clean boot restores the desktop with D2/D3 in place. (b) On every boot dwm's
+generation-2 (transient) device still logs `A7 D3D11 outer device lost at outer
+allocation terminal batch` (`result=-4` teardown joins on tokens 19/30/31) —
+the D1 teardown-join family on a transient device; the compositor device is
+unaffected. Keep it on the D5 list rather than reopening D1.
 
 Owner-reported symptoms after the fix: low-bit color, start menu missing, other
 rendering bugs, and a frozen VNC. Root-caused to four distinct items:
