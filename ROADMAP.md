@@ -45,6 +45,46 @@ fresh uncomposited buffer ~1/min (`scanout_read nonzero 0`), so a VNC grab taken
 mid-idle is black; a grab during composition is the full desktop. This is the
 known "1 bare re-scanout/min at idle" behaviour, unrelated to the draw drop.
 
+## 2026-09-01 (post-fix triage) — the FOUR open defects now that composition works
+
+Owner-reported symptoms after the fix: low-bit color, start menu missing, other
+rendering bugs, and a frozen VNC. Root-caused to four distinct items:
+
+**D1 — HOC1 pending object-command lane overflows and kills the device (~2 h).**
+The freeze. `vn_helios_record_defer_object_command`'s pending lane hit its
+8192-item cap (`HOC1 pending-lane overflow bytes=1211572 count=8192` ×1263);
+from then on every deferred object op returns OOM — 1262 ×
+`HOC1 descriptor update defer failed result=-1` — until an image-view create
+failed on dwm's CS thread (`Exception on CS thread!`) → device lost → dwm stops
+presenting → display frozen. Leak: `helios_object_command_disposition_locked`
+CONSUMEs an item only when the batch names a dep memory that still has live
+deferred records; items whose deps are never named SKIP forever and accumulate
+(8192 in ~2 h of healthy compositing). Reservations ARE released on abandon
+(`helios_scope_retire_object_commands`), so the leak is the never-named-dep arm.
+Recovery: `taskkill /f /im dwm.exe` (fresh device; display returns).
+
+**D2 — presents without composition scan out EMPTY primaries (the mostly-black
+desktop).** Every present binds a NEW venus resource (res ids climb 1905→1933 in
+seconds); only the presents immediately following an actual dwm composite read
+back nonzero (csum 0x5c2a47e7fd35fdfa = the desktop), and the very next present
+(~100 ms later) scans out a fresh zero-filled blob, displacing the desktop. An
+uncomposited present must re-show the last composited frame, not fresh pages.
+This — not the old "idle 1/min" framing — is why the display is black except in
+the instant after a composition burst.
+
+**D3 — shared surfaces fail: `VK_KHR_EXTERNAL_MEMORY_WIN32 not supported`
+(start menu missing).** dwm ×47, explorer ×13, StartMenuExperienceHost ×8 hit
+`Failed to create shared resource` (dxvk_image.cpp:675). Shell layers render
+into cross-process shared surfaces; when creation fails the layer never
+composits — the start menu (and search, flyouts) cannot appear. Matches the
+standing owner directive to support VK_KHR_external_memory_win32.
+
+**D4 — "extremely low-bit color" is NOT a Helios render bug.** The captured
+scanout frame is full 8-bit: 256 distinct levels per channel, consecutive
+(gap=1), smooth gradient steps; host readback max=255. The banding is in the
+VNC viewing path (QEMU VNC / viewer pixel-format negotiation), i.e. display
+transport, not the render pipeline.
+
 ## ⭐⭐⭐⭐⭐ 2026-09-01 (KMD-instrument session) — THE KMD FORWARDS 15 OF 9023 DRAWS; THE DRAWS VANISH IN THE KMD, NOT THE HOST
 
 > ⛔ SUPERSEDED by the FIXED block above. The localization to "the KMD HNR2
