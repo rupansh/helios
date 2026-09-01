@@ -12,12 +12,13 @@ use crate::dxgk::_D3DKMDT_COMPUTE_PREEMPTION_GRANULARITY::D3DKMDT_COMPUTE_PREEMP
 use crate::dxgk::_D3DKMDT_GRAPHICS_PREEMPTION_GRANULARITY::D3DKMDT_GRAPHICS_PREEMPTION_DMA_BUFFER_BOUNDARY;
 use crate::dxgk::_DXGK_QUERYADAPTERINFOTYPE::{
     DXGKQAITYPE_64BITONLYCAPS, DXGKQAITYPE_ADAPTERPERFDATA_CAPS, DXGKQAITYPE_DIRTYBITTRACKINGCAPS,
-    DXGKQAITYPE_DRIVERCAPS, DXGKQAITYPE_GPUMMUCAPS, DXGKQAITYPE_GPUVERSION,
-    DXGKQAITYPE_HARDWARERESERVEDRANGES2, DXGKQAITYPE_HISTORYBUFFERPRECISION,
-    DXGKQAITYPE_IOMMU_CAPS, DXGKQAITYPE_NATIVE_FENCE_CAPS, DXGKQAITYPE_PAGETABLELEVELDESC,
-    DXGKQAITYPE_PHYSICALADAPTERCAPS, DXGKQAITYPE_PHYSICAL_MEMORY_CAPS, DXGKQAITYPE_QUERYSEGMENT,
-    DXGKQAITYPE_QUERYSEGMENT3, DXGKQAITYPE_QUERYSEGMENT4, DXGKQAITYPE_UMDRIVERPRIVATE,
-    DXGKQAITYPE_WDDMDEVICECAPS,
+    DXGKQAITYPE_DISPLAY_DRIVERCAPS_EXTENSION, DXGKQAITYPE_DRIVERCAPS, DXGKQAITYPE_GPUMMUCAPS,
+    DXGKQAITYPE_GPUVERSION, DXGKQAITYPE_HARDWARERESERVEDRANGES2,
+    DXGKQAITYPE_HISTORYBUFFERPRECISION, DXGKQAITYPE_IOMMU_CAPS, DXGKQAITYPE_NATIVE_FENCE_CAPS,
+    DXGKQAITYPE_PAGETABLELEVELDESC, DXGKQAITYPE_PHYSICALADAPTERCAPS,
+    DXGKQAITYPE_PHYSICAL_MEMORY_CAPS, DXGKQAITYPE_QUERYCOLORIMETRYOVERRIDES,
+    DXGKQAITYPE_QUERYSEGMENT, DXGKQAITYPE_QUERYSEGMENT3, DXGKQAITYPE_QUERYSEGMENT4,
+    DXGKQAITYPE_UMDRIVERPRIVATE, DXGKQAITYPE_WDDMDEVICECAPS,
 };
 use crate::dxgk::*;
 
@@ -79,6 +80,13 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
         },
         DXGKQAITYPE_HISTORYBUFFERPRECISION => unsafe { query_history_buffer_precision(args) },
         DXGKQAITYPE_64BITONLYCAPS => unsafe { query_zeroed::<DXGK_64_BIT_ONLY_CAPS>(args) },
+        // CCD queries both per display-config evaluation (DiagLevel ring:
+        // 0x02000010/13 live during the D6 flip-window loop), and dxgkrnl
+        // records the NOT_SUPPORTED refusal as an invalid NTSTATUS (ETW 494
+        // rundown). Zero-filling the caller's own buffer is the version-proof
+        // "none of these optional caps / no overrides" answer.
+        DXGKQAITYPE_DISPLAY_DRIVERCAPS_EXTENSION => unsafe { query_zero_filled(args) },
+        DXGKQAITYPE_QUERYCOLORIMETRYOVERRIDES => unsafe { query_zero_filled(args) },
         // Everything else stays unsupported until backed by real implementation
         // (checklist rule: "unknown must stay unadvertised"). Notably dxgkrnl
         // steady-state-polls NODEPERFDATA (0x18) and ADAPTERPERFDATA (0x19) to
@@ -90,14 +98,13 @@ pub unsafe extern "C" fn dxgkddi_query_adapter_info(
             if !is_perf_poll {
                 crate::diag::record(0x0200_0000 | (other as u32 & 0xFFFF));
             }
-            // Site 30. Left untagged in .380, which made the NotSupM reading
-            // ("only site 0") an artifact of the instrument rather than a
-            // result: this arm was invisible to it. QueryAdapterInfo's
-            // documented set is SUCCESS / INVALID_PARAMETER / NO_MEMORY /
-            // GRAPHICS_DRIVER_MISMATCH, but the doc says "such as", so
-            // NOT_SUPPORTED is not provably illegal — measure before changing a
-            // return dxgkrnl polls constantly.
-            crate::diag::not_supported(30)
+            // Site 30 keeps the count and mask. The old NOT_SUPPORTED return
+            // is measured illegal: dxgkrnl 26100 keeps "Driver returned an
+            // invalid NTSTATUS code" rundown records for it (ETW 494/DCStart,
+            // hundreds accumulated per boot). INVALID_PARAMETER is in the
+            // DDI's documented return set.
+            let _ = crate::diag::not_supported(30);
+            STATUS_INVALID_PARAMETER
         }
     }
 }
@@ -617,6 +624,18 @@ unsafe fn query_physical_adapter_caps(
     // been validated. Do not zero or partially mutate dxgkrnl's buffer first.
     unsafe { core::ptr::write(output_ptr, caps) };
     crate::diag::record(0x01DA_0000 | (physical_adapter_flags & 0xFFFF));
+    STATUS_SUCCESS
+}
+
+/// Zero-fill the caller's whole output buffer and succeed: the "none of these
+/// capabilities" answer for versioned caps queries, independent of which struct
+/// revision the requesting OS build passes.
+unsafe fn query_zero_filled(args: &DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
+    if args.pOutputData.is_null() || args.OutputDataSize == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: pOutputData points to OutputDataSize writable bytes.
+    unsafe { core::ptr::write_bytes(args.pOutputData as *mut u8, 0, args.OutputDataSize as usize) };
     STATUS_SUCCESS
 }
 

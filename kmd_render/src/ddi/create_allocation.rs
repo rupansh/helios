@@ -5328,7 +5328,9 @@ pub unsafe extern "C" fn dxgkddi_set_allocation_backing_store(
             }
             ctx.backing_store_state
                 .store(BACKING_STORE_UNBOUND, Ordering::Release);
-            return STATUS_NOT_SUPPORTED;
+            // A caller error, and NOT_SUPPORTED is recorded by dxgkrnl as an
+            // invalid NTSTATUS for this DDI (26100 rundown, 2026-09-01).
+            return STATUS_INVALID_PARAMETER;
         }
     };
     let passive = unsafe { PassiveLevel::assume() };
@@ -5343,7 +5345,12 @@ pub unsafe extern "C" fn dxgkddi_set_allocation_backing_store(
     ) {
         Ok(resource_id) => resource_id,
         Err(error) => {
-            return error.into();
+            // `error.into()` is STATUS_IO_DEVICE_ERROR, which dxgkrnl records
+            // as an invalid NTSTATUS for this DDI (16 rundown entries after
+            // one sick boot, 2026-09-01). A backing the transport cannot bind
+            // is an allocation failure to the caller.
+            crate::diag::record_named_bytes(b"ShBkTxE", NTSTATUS::from(error) as u32);
+            return STATUS_NO_MEMORY;
         }
     };
 
