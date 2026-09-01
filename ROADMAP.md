@@ -92,6 +92,19 @@ behind never completes. Fix belongs in the KMD's preemption model for outer
 work (report preempted only what was NOT forwarded, or complete forwarded
 batches normally and let the resubmission match/no-op) — a KMD session; the
 dwm E_OUTOFMEMORY death is the same storm exhausting the 64 executor slots.
+⛔ **Incident, same evening (not a defect in the tree):** the A/B step used
+`New-Item -Path 'HKLM:\SOFTWARE\Helios' -Force`, which recreates an existing
+key and WIPED the owner's knob set — `UmdGuestBacking=1` was lost. Every boot
+after that came up BLACK with ALL D3D11 render→readback reading zero
+(`d3d11_shared_variable_probe` arm `1 plain` FAIL, `HAM2 … guest_backed=0`,
+KMD `GbOk` frozen, `GbNoVa` climbing) although the binaries had just rendered
+the Start menu. Restored `UmdGuestBacking=1` at 18:27 → desktop back, every
+probe arm 1–5e2 PASS. Rule 8 for the owner: the UMD code default (0) is a black
+desktop on this box; the measured configuration is 1. Residual after restore:
+`d3d11_shared_variable_probe` 5f–5i (the creator's re-clear after a same-process
+second-device `OpenSharedResource1`, and re-clears via the opened handle) read
+0 — the same-process two-device class noted 2026-08-30; cross-process (dwm's
+shape) is fine.
 
 Owner-reported symptoms after the fix: low-bit color, start menu missing, other
 rendering bugs, and a frozen VNC. Root-caused to four distinct items:
