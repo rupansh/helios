@@ -134,7 +134,7 @@ pub(crate) struct AdapterKnobs {
     /// local-preferring allocation's supported segment set. See
     /// [`crate::diag::knobs::BAR_SEGMENT_ONLY`].
     pub bar_segment_only: bool,
-    /// `Hwa2GuestMem` (default 0 = off). See
+    /// `Hwa2GuestMem` (default 1 since 2026-09-01). See
     /// [`crate::diag::knobs::HWA2_GUEST_MEM`].
     pub hwa2_guest_mem: bool,
 }
@@ -155,7 +155,7 @@ impl AdapterKnobs {
         bar_seg_flags_extra: 0,
         bar_local_shared: false,
         bar_segment_only: false,
-        hwa2_guest_mem: false,
+        hwa2_guest_mem: true,
     };
 
     /// Read every knob once. PASSIVE_LEVEL.
@@ -173,7 +173,7 @@ impl AdapterKnobs {
             bar_seg_flags_extra: read_config_dword(knobs::BAR_SEG_FLAGS_EXTRA, 0),
             bar_local_shared: read_config_dword(knobs::BAR_LOCAL_SHARED, 0) != 0,
             bar_segment_only: read_config_dword(knobs::BAR_SEGMENT_ONLY, 0) != 0,
-            hwa2_guest_mem: read_config_dword(knobs::HWA2_GUEST_MEM, 0) != 0,
+            hwa2_guest_mem: read_config_dword(knobs::HWA2_GUEST_MEM, 1) != 0,
         }
     }
 

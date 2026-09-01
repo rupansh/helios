@@ -24,7 +24,7 @@
 //! | `UmdDeferredDiagnostics` | DWORD | `false` (diagnostic atomics, opt-in) |
 //! | `UmdEvictOnDeallocate` | DWORD | `false` (pair the evict with the deallocate) |
 //! | `UmdLockMode` | DWORD | `0` (`pfnLockCb`, the measured configuration) |
-//! | `UmdGuestBacking` | DWORD | `false` (KMD `Hwa2GuestMem` is the other half) |
+//! | `UmdGuestBacking` | DWORD | `1` since 2026-09-01 (KMD `Hwa2GuestMem` is the other half) |
 //! | `UmdFlushSync` | DWORD | `1` (`pfnFlush` waits for the CS thread's submission; 0 = the old async Flush, the D2 A/B) |
 //!
 //! The surviving policies are `BoolKnob` ("absent = off, non-zero = on") and
@@ -268,14 +268,12 @@ pub(crate) fn umd_lock_mode() -> u32 {
 /// The KMD half is `Hwa2GuestMem`, which imports those exact pages as the
 /// allocation's `VkDeviceMemory`. The two are only meaningful TOGETHER: with
 /// this on and the KMD's off, the application's pointer is a heap buffer the
-/// GPU never touches, which is the 2026-08-29 defect exactly. Off by default
-/// for that reason, and both flip together once measured.
-/// 0 = off, 1 = on. (An arm 2 existed briefly as an isolating control: it sent
-/// a FAKE page-aligned value in the descriptor and changed nothing else, and it
-/// is what proved a nonzero tail byte in the echoed record — not the buffer,
-/// not the mapping — is what made dxgkrnl drop the create-output write-back.
-/// The offer moved to the resource-level channel and the control went with it.)
-pub(crate) static UMD_GUEST_BACKING: DwordKnob = DwordKnob::new(c"UmdGuestBacking", 0);
+/// GPU never touches, which is the 2026-08-29 defect exactly.
+/// Default 1 since 2026-09-01: every accepted desktop measurement since
+/// 2026-08-30 ran with the registry value 1, and 0 was re-measured that day by
+/// accident (registry wipe) — every render→readback returned zero and the
+/// desktop booted black. 0 stays reachable as the A/B disable.
+pub(crate) static UMD_GUEST_BACKING: DwordKnob = DwordKnob::new(c"UmdGuestBacking", 1);
 
 /// `HKLM\SOFTWARE\Helios!UmdGuestBacking` (REG_DWORD). See
 /// [`UMD_GUEST_BACKING`].

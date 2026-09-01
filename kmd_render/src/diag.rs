@@ -656,9 +656,11 @@ pub mod knobs {
     /// (`HeliosWddmAllocationDescV2::cpu_backing_va`), imported by the host as
     /// a guest blob, instead of a fresh host-side `vkAllocateMemory`.
     ///
-    /// This is the two-buffer fix. Off until measured; the UMD half is
-    /// `UmdGuestBacking` and the two are only meaningful together. Every
-    /// refusal falls back to the host allocation and is counted `Gb*`.
+    /// This is the two-buffer fix. Default 1 since 2026-09-01: every accepted
+    /// desktop since 2026-08-30 ran with it, and 0 (re-measured by accident
+    /// that day) is a black desktop with every readback zero. The UMD half is
+    /// `UmdGuestBacking`; the two flip together. Every refusal falls back to
+    /// the host allocation and is counted `Gb*`.
     pub const HWA2_GUEST_MEM: KnobName = KnobName::new(b"Hwa2GuestMem");
 }
 
