@@ -10,8 +10,14 @@ pub const HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING: u32 = 1 << 0;
 /// `HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED`; the UMD never infers it from its own
 /// offer, because the kernel can refuse the offer and fall back to host memory.
 pub const HELIOS_RESOURCE_ASSOCIATION_FLAG_GUEST_PAGE_BACKED: u32 = 1 << 1;
+/// The allocation was OPENED (D3D11 OpenSharedResource / dxgkrnl OpenResource),
+/// not created: it already holds the creator's pixels. The engine must bind
+/// it as an import — no initializer clear, no UNDEFINED-layout transition.
+/// Consumed and stripped by the DXVK D3D11 layer; never reaches the ICD wire.
+pub const HELIOS_RESOURCE_ASSOCIATION_FLAG_OPENED: u32 = 1 << 2;
 pub const HELIOS_RESOURCE_ASSOCIATION_FLAG_MASK: u32 = HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING
-    | HELIOS_RESOURCE_ASSOCIATION_FLAG_GUEST_PAGE_BACKED;
+    | HELIOS_RESOURCE_ASSOCIATION_FLAG_GUEST_PAGE_BACKED
+    | HELIOS_RESOURCE_ASSOCIATION_FLAG_OPENED;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,7 +180,7 @@ mod tests {
         );
         cases[7].0.outer_allocation_bytes = 0;
         cases[8] = (valid(), HeliosResourceAssociationRefusal::AssociationFlags);
-        cases[8].0.association_flags = 1 << 2;
+        cases[8].0.association_flags = 1 << 3;
         cases[9] = (valid(), HeliosResourceAssociationRefusal::CpuMapping);
         cases[9].0.association_flags = HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING;
         cases[10] = (valid(), HeliosResourceAssociationRefusal::Reserved1);

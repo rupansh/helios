@@ -19,9 +19,13 @@
 #define HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING (1U << 0)
 
 #define HELIOS_RESOURCE_ASSOCIATION_FLAG_GUEST_PAGE_BACKED (1U << 1)
+/* Opened, not created: already holds the creator's pixels. DXVK binds it as an
+ * import (no initializer clear, no UNDEFINED transition) and strips the bit. */
+#define HELIOS_RESOURCE_ASSOCIATION_FLAG_OPENED (1U << 2)
 #define HELIOS_RESOURCE_ASSOCIATION_FLAG_MASK \
     (HELIOS_RESOURCE_ASSOCIATION_FLAG_CPU_MAPPING | \
-     HELIOS_RESOURCE_ASSOCIATION_FLAG_GUEST_PAGE_BACKED)
+     HELIOS_RESOURCE_ASSOCIATION_FLAG_GUEST_PAGE_BACKED | \
+     HELIOS_RESOURCE_ASSOCIATION_FLAG_OPENED)
 
 typedef struct HeliosResourceAssociationV1 {
   uint32_t s_type;

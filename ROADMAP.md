@@ -45,7 +45,29 @@ fresh uncomposited buffer ~1/min (`scanout_read nonzero 0`), so a VNC grab taken
 mid-idle is black; a grab during composition is the full desktop. This is the
 known "1 bare re-scanout/min at idle" behaviour, unrelated to the draw drop.
 
-## 2026-09-01 (post-fix triage) — the FOUR open defects now that composition works (D1 ✅, D2 ✅; D3 open; D4 not ours)
+## 2026-09-01 (post-fix triage) — the FOUR open defects now that composition works (D1 ✅, D2 ✅, D3 ✅; D4 not ours) + D5 opened
+
+**D5 — OPEN (found 2026-09-01 evening, after D2/D3 landed): dwm's device dies on
+`A7 D3D11 HOB1 Render refused batch=1591 hr=0x8007000e` (dxgkrnl `pfnRenderCb`
+→ E_OUTOFMEMORY) while a windowed BLT_DISCARD D3D11 app (`\helios_triangle`,
+`d3d11_triangle default blt 20`) runs; the display then freezes on stale
+buffers until dwm is restarted. Same run: the triangle process wedges after its
+second Present (entry logged, callback never returns), ends up with ONE thread
+in a kernel `Executive` wait, is unkillable (`taskkill /f` leaves the zombie
+window on screen across a dwm restart), and its window content is black. KMD
+counters at the time: `Nr2OuterRej` = count 3621 → 3672 within minutes, last
+code 7 = `OuterExecutionRefusal::ResubmissionMismatch`; `Nr2Slot−Nr2SlotRet` =
+80 outstanding (> `HELIOS_HNR2_MAX_OUTSTANDING_SUBMISSIONS` = 64 per context);
+`DdiPreemptCommand` ×3 in the ETW window. E_OUTOFMEMORY from Render maps to the
+KMD's `STATUS_NO_MEMORY` arms in `render_outer_physical` (`SlotExhausted` /
+`SnapshotFailed`), and the UMD turns ANY Render failure into a permanent outer
+device loss (`mark_outer_lost`, "outer device lost at HOB1 Render"). Guest RAM
+was fine (28 GB free). Not reproduced deliberately yet; evidence:
+`umd-6616.log` line 2218 (dwm), `umd-7576.log` tail (triangle), `tmp/dxgk_xproc.csv`
+(ETW slice of the same minutes), `tmp/kmd_counters_now.txt`. First questions:
+which NO_MEMORY arm fired (publish the refusal code per Render failure, not only
+`bump_with_code`'s last-code), and why resubmissions after preemption mismatch
+the executor slot.
 
 Owner-reported symptoms after the fix: low-bit color, start menu missing, other
 rendering bugs, and a frozen VNC. Root-caused to four distinct items:
@@ -125,12 +147,36 @@ composition frame, each ~1.98 ms inside `DxgkDdiRender`** for a 112-byte HNR2
 command buffer (ETW, D1's CS thread, 206 ms of 230 ms). That is the next causal
 lever for dwm latency — the KMD HNR2 Render cost, not the UMD.
 
-**D3 — shared surfaces fail: `VK_KHR_EXTERNAL_MEMORY_WIN32 not supported`
-(start menu missing).** dwm ×47, explorer ×13, StartMenuExperienceHost ×8 hit
-`Failed to create shared resource` (dxvk_image.cpp:675). Shell layers render
-into cross-process shared surfaces; when creation fails the layer never
-composits — the start menu (and search, flyouts) cannot appear. Matches the
-standing owner directive to support VK_KHR_external_memory_win32.
+**D3 — ✅ FIXED 2026-09-01 (DXVK d3d11 layer + UMD + protocol flag): the OPENER's
+initializer cleared the creator's shared surface.** The `VK_KHR_EXTERNAL_MEMORY_WIN32
+not supported` line was a red herring: `canShareImage` only logs and returns
+false, creation continues on the association path, and dwm's own shared
+primaries (created + opened cross-device) always worked. The real chain,
+measured with `tools/d3d11_xproc_draw_probe.cpp` (writer/reader processes):
+draw-then-open → opener reads **0/0**; open-then-draw (new `write2`/`read2`
+modes) → opener reads the writer's pixels `cc336699/ffffffff` and the writer's
+view survives. So aliasing was correct and *the open itself* destroyed content.
+The opener's ICD trace named it: its first batch after `OpenSharedResource`
+carries `clear=1` on the opened image (`HRU1 1:3`) — `open_resource` →
+`create_associated_resource` → `CreateTexture2DHelios` → `CreateTexture2DBase` →
+`m_initializer->InitTexture` → `ctx->initImage(UNDEFINED)`, DXVK's new-texture
+zero clear, executed host-side on memory aliasing the creator's live frame.
+Fix: `HELIOS_RESOURCE_ASSOCIATION_FLAG_OPENED` (protocol Rust + C mirror, bit 2;
+engine-side only — the DXVK d3d11 layer strips it before the association
+reaches the ICD, so no ICD rebuild) set by `open_resource`; DXVK treats an
+opened association as `Import` (no initializer, `m_globalLayout` = the image's
+layout, no UNDEFINED transition) and no longer runs the Win32 `canShareImage`
+check for association images (the misleading error line is gone: dwm 0/session).
+Evidence after the fix: draw-then-open probe reads `cc336699/ffffffff` on the
+opener (was 0/0); `d3d11_shared_content_probe` (same process, two devices) passes
+every arm A/B/C/D/E (B/5e/5f used to fail — the "creator permanently orphaned"
+class is the same defect); `start_menu_repro` trial capture shows the full
+Windows 11 Start menu rendered (search, Recommended, All apps, account row);
+dwm's `Failed to create shared resource` count 47 → 0. ⚠ `start_menu_repro`'s
+`windows=0`/`PIXELS_ONLY` verdict is its window heuristic failing on build 26100
+(the Start host has no enumerable top-level window even when the menu is up);
+trust its PNGs, not its verdict. ⚠ The hotkey is a toggle — a VNC grab after an
+odd number of presses shows the menu, after an even number the desktop.
 
 **D4 — "extremely low-bit color" is NOT a Helios render bug.** The captured
 scanout frame is full 8-bit: 256 distinct levels per channel, consecutive

@@ -2163,11 +2163,18 @@ pub(crate) unsafe extern "C" fn open_resource(
         association,
     };
     let token = opened.association.outer_allocation_token;
+    // The engine must not run its new-texture initializer on an OPENED
+    // allocation: the clear lands in the aliased memory and wipes the
+    // creator's pixels (2026-09-01: every cross-process shared surface read
+    // zero — the missing Start menu). The flag is engine-side only.
+    let mut engine_association = opened.association;
+    engine_association.association_flags |=
+        helios_protocol::HELIOS_RESOURCE_ASSOCIATION_FLAG_OPENED;
     let Some(resource) = dev.dxvk.create_associated_resource(
         2,
         (&open_desc as *const D3D11_TEXTURE2D_DESC) as usize,
         0,
-        &opened.association,
+        &engine_association,
         Some(preflight),
     ) else {
         opened.rollback(dev);

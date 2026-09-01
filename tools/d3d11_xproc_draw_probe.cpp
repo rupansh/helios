@@ -188,11 +188,140 @@ static int do_read() {
   return 0;
 }
 
+// ── open-BEFORE-draw arm (2026-09-01) ────────────────────────────────────────
+// Splits "the opener's import zeroes the content once" from "the opener never
+// aliases the creator's memory": the reader opens first (xproc_open.txt), then
+// the writer clears+draws (xproc_drawn.txt), then both read back.
+static const char* kOpenFile  = "C:\\Users\\Rupansh\\helios-probe\\xproc_open.txt";
+static const char* kDrawnFile = "C:\\Users\\Rupansh\\helios-probe\\xproc_drawn.txt";
+
+static bool wait_file(const char* path, int seconds) {
+  for (int i = 0; i < seconds; ++i) {
+    FILE* f = fopen(path, "r");
+    if (f) { fclose(f); return true; }
+    Sleep(1000);
+  }
+  return false;
+}
+static void touch_file(const char* path) {
+  FILE* f = fopen(path, "w");
+  if (f) { fputs("1\n", f); fclose(f); }
+}
+
+static int do_write2() {
+  D3D11_TEXTURE2D_DESC td{};
+  td.Width = 256; td.Height = 256; td.MipLevels = 1; td.ArraySize = 1;
+  td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+  td.SampleDesc.Count = 1;
+  td.Usage = D3D11_USAGE_DEFAULT;
+  td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+  td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+  ID3D11Texture2D* tex = nullptr;
+  HRESULT hr = g_dev->CreateTexture2D(&td, nullptr, &tex);
+  printf("CreateTexture2D hr=0x%08x\n", (unsigned)hr);
+  if (FAILED(hr)) return 2;
+  ID3D11RenderTargetView* rtv = nullptr;
+  if (FAILED(g_dev->CreateRenderTargetView(tex, nullptr, &rtv))) return 3;
+  ID3DBlob *vsb = nullptr, *psb = nullptr, *err = nullptr;
+  if (FAILED(D3DCompile(kVs, strlen(kVs), nullptr, nullptr, nullptr, "main", "vs_4_0", 0, 0, &vsb, &err))) return 4;
+  if (FAILED(D3DCompile(kPs, strlen(kPs), nullptr, nullptr, nullptr, "main", "ps_4_0", 0, 0, &psb, &err))) return 5;
+  ID3D11VertexShader* vs = nullptr;
+  ID3D11PixelShader* ps = nullptr;
+  if (FAILED(g_dev->CreateVertexShader(vsb->GetBufferPointer(), vsb->GetBufferSize(), nullptr, &vs))) return 6;
+  if (FAILED(g_dev->CreatePixelShader(psb->GetBufferPointer(), psb->GetBufferSize(), nullptr, &ps))) return 7;
+  D3D11_INPUT_ELEMENT_DESC ied{"POSITION", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 0,
+                               D3D11_INPUT_PER_VERTEX_DATA, 0};
+  ID3D11InputLayout* layout = nullptr;
+  if (FAILED(g_dev->CreateInputLayout(&ied, 1, vsb->GetBufferPointer(), vsb->GetBufferSize(), &layout))) return 8;
+  const float verts[6] = {-1.f, -1.f, -1.f, 1.f, 1.f, 1.f};
+  D3D11_BUFFER_DESC bd{};
+  bd.ByteWidth = sizeof(verts);
+  bd.Usage = D3D11_USAGE_IMMUTABLE;
+  bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+  D3D11_SUBRESOURCE_DATA init{verts, 0, 0};
+  ID3D11Buffer* vb = nullptr;
+  if (FAILED(g_dev->CreateBuffer(&bd, &init, &vb))) return 9;
+  D3D11_RASTERIZER_DESC rd{};
+  rd.FillMode = D3D11_FILL_SOLID;
+  rd.CullMode = D3D11_CULL_NONE;
+  rd.DepthClipEnable = TRUE;
+  ID3D11RasterizerState* rs = nullptr;
+  if (FAILED(g_dev->CreateRasterizerState(&rd, &rs))) return 10;
+
+  // Publish BEFORE drawing, wait for the reader's open.
+  IDXGIResource* res = nullptr;
+  if (FAILED(tex->QueryInterface(IID_PPV_ARGS(&res)))) return 11;
+  HANDLE handle = nullptr;
+  hr = res->GetSharedHandle(&handle);
+  printf("GetSharedHandle hr=0x%08x handle=%p\n", (unsigned)hr, handle);
+  if (FAILED(hr) || !handle) return 12;
+  FILE* f = fopen(kHandleFile, "w");
+  if (!f) { printf("handle file open failed\n"); return 13; }
+  fprintf(f, "%llx\n", (unsigned long long)(UINT_PTR)handle);
+  fclose(f);
+  if (!wait_file(kOpenFile, 60)) { printf("reader never opened\n"); return 14; }
+  printf("reader opened; drawing now\n");
+
+  const float white[4] = {1.f, 1.f, 1.f, 1.f};
+  g_ctx->ClearRenderTargetView(rtv, white);
+  g_ctx->OMSetRenderTargets(1, &rtv, nullptr);
+  D3D11_VIEWPORT vp{0.f, 0.f, 256.f, 256.f, 0.f, 1.f};
+  g_ctx->RSSetViewports(1, &vp);
+  g_ctx->RSSetState(rs);
+  UINT stride = 8, offset = 0;
+  g_ctx->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+  g_ctx->IASetInputLayout(layout);
+  g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+  g_ctx->VSSetShader(vs, nullptr, 0);
+  g_ctx->PSSetShader(ps, nullptr, 0);
+  g_ctx->Draw(3, 0);
+  ID3D11RenderTargetView* nullrtv = nullptr;
+  g_ctx->OMSetRenderTargets(1, &nullrtv, nullptr);
+  g_ctx->Flush();
+  readback(tex, "[writer2 self after open]");
+  touch_file(kDrawnFile);
+
+  for (int i = 0; i < 30; ++i) Sleep(1000);
+  readback(tex, "[writer2 self late]");
+  return 0;
+}
+
+static int do_read2() {
+  HANDLE handle = nullptr;
+  for (int i = 0; i < 120; ++i) {
+    FILE* f = fopen(kHandleFile, "r");
+    if (f) {
+      unsigned long long v = 0;
+      if (fscanf(f, "%llx", &v) == 1 && v)
+        handle = (HANDLE)(UINT_PTR)v;
+      fclose(f);
+      if (handle) break;
+    }
+    Sleep(1000);
+  }
+  if (!handle) { printf("no handle published\n"); return 2; }
+  printf("opening handle=%p\n", handle);
+  ID3D11Texture2D* tex = nullptr;
+  HRESULT hr = g_dev->OpenSharedResource(handle, IID_PPV_ARGS(&tex));
+  printf("OpenSharedResource hr=0x%08x\n", (unsigned)hr);
+  if (FAILED(hr) || !tex) return 3;
+  readback(tex, "[reader2 before draw]");
+  touch_file(kOpenFile);
+  if (!wait_file(kDrawnFile, 60)) { printf("writer never drew\n"); return 4; }
+  Sleep(1000);
+  readback(tex, "[reader2 after draw]");
+  Sleep(2000);
+  readback(tex, "[reader2 after draw +2s]");
+  return 0;
+}
+
 int main(int argc, char** argv) {
-  if (argc < 2) { printf("usage: %s write|read\n", argv[0]); return 1; }
+  if (argc < 2) { printf("usage: %s write|read|write2|read2\n", argv[0]); return 1; }
   if (make_device()) return 1;
   if (!strcmp(argv[1], "write")) return do_write();
   if (!strcmp(argv[1], "read")) return do_read();
+  if (!strcmp(argv[1], "write2")) return do_write2();
+  if (!strcmp(argv[1], "read2")) return do_read2();
   printf("unknown mode %s\n", argv[1]);
   return 1;
 }
