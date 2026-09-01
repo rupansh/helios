@@ -105,7 +105,55 @@ virtio-gpu primitive), or a CPU copy at K9 retirement when both allocations
 are guest-backed (the src back buffer is `misc=0x0`, not shared, and may not be
 CPU-visible). Modern flip-model apps do not take this path.
 
-**D6 — investigation 2026-09-01 late (fixes staged, verdict pending deploy).**
+**D6 — ✅ ROOT-CAUSED + FIXED 2026-09-02 (mesa 127729df31e + 15e70a58f29; main 748c032).**
+The churn loop was never CCD, vsync, or the KMD: once per ~2.5 s cycle dxgkrnl
+refused ONE of dwm's outer renders with STATUS_ACCESS_DENIED **before calling
+DdiRender** — the D3DDDI allocation list marked `WriteOperation=1` on the app's
+flip-model swapchain buffer, which DWM opens READ-ONLY. The D3D11 runtime
+journals `0xC0000022` → `0x887A002B` "Removing device." (Direct3D11 ETW
+JournalEntry, one per cycle) **and returns a non-failing HRESULT to the UMD**
+— zero failing `HOB1R` lines across 832 renders, which is why no driver log
+ever saw it. dwm expires + rebuilds both devices, visibility toggles, scanout
+parks, the app's Present unblocks once per cycle (14–17 frames/20 s).
+Two ICD WRITE over-claims produced the bit, fixed in two commits:
+(1) `vn_helios_record_memory_teardown` marked the free-ordering use READ|WRITE
+— DWM releases one opened flip buffer per consumed frame; now READ.
+(2) the four barrier recorders (`CmdPipelineBarrier{,2}`, `CmdWaitEvents{,2}`)
+touched every image-barrier target READ|WRITE — a preserving transition is
+ordering; now WRITE only for `oldLayout==UNDEFINED`. Draws/copy-dst/storage
+keep WRITE, so `ReferenceWrittenPrimaries` flip ordering is unchanged (dwm's
+own opened primaries carry write access and never tripped the check — which is
+why exactly `CreateSwapChainForHwnd` triggered the loop).
+**Verdict (clean boot, fixed ICD `EE4A450B`):** `helios_triangle_flip` 20 s →
+**844 frames (~42 fps)**, dwm CreateDevice flat (16→16), `D4AdrOk`/`D2BnDis`
+frozen, **zero** `set_scanout res 0x0` in-run (822 scanouts), desktop visible
+throughout, dwm alive. Regressions same boot: D3 xproc `cc336699/ffffffff`;
+D5 BLT `helios_triangle` 861 frames, `Nr2PrBlt` 0→2991, `K9Poison` 0, dwm
+alive, clean exit; Start menu PNG-verified open (`tmp/startmenu_start_miss_t2.png`
+— the ps1's windows=0 "miss" verdict remains false on 26100).
+The .439 classic-vsync channel (`VsCls`) is contract-correct — keep — but was
+NOT the root; the ~1.1 s "missed confirmation" reading is retired.
+**Remaining D6 residue (OPEN):**
+- **Flip app exit-zombie**: `d3d11_triangle … flip` still exits into one
+  unkillable `Executive` wait, and the zombie poisons EVERY later D3D app's
+  DXGI startup (BLT probe stuck at adapter enumeration, xproc hung pre-print)
+  until reboot — broader than the old "next flip app" reading. Next lead: what
+  the exit path waits on (the last present's outstanding …?).
+- Parking image is 4096000 B; QEMU readback wants ≥ primary (4587520) — every
+  park still blanks the remote view (dormant now the loop is gone).
+- Vsync polish: waiter-visible vblank alternates ~16.5/30 ms (~40 Hz effective;
+  C# D3DKMTWaitForVerticalBlankEvent probe, both timer resolutions) and the
+  heartbeat has 0.2–0.5 s outages around source-ownership transitions;
+  a PlaneCount=0 MPO flip never stores LAST_PRESENT_ID (teardown's 0.41 s
+  FLUSH_DEVICE_FLIP wait). Perf/latency, not correctness.
+- `Nr2OuterRej` code 5 (`SessionClosed`) ×2 per flip run, completed via
+  `Nr2RefCmp` — benign under churn AND on the fixed boot; watch, don't chase.
+- Observability: `VsCls`/`VsLive`/`CtlInt` registry values flush only at the
+  visibility DDI — frozen values on a healthy (toggle-free) boot are stale, not
+  a dead heartbeat. `HOB1R` (umd, first 4096 renders/process) is the permanent
+  view of what dxgkrnl is handed per outer render.
+
+**D6 — superseded investigation record (2026-09-01 late; kept for the tooling).**
 The loop, measured twice (ETW `tmp/dxgk_d6.csv`, `tmp/dxgk_d6_consistent.csv`):
 while a flip-model windowed swapchain exists, the OS re-runs a display-config
 evaluation ~18/s — `DdiIsSupportedVidPn` 760–1114/30 s (answered TRUE),
