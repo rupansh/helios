@@ -382,6 +382,15 @@ impl SessionObject {
         let Some(adapter) = (unsafe { self.adapter.as_ref() }) else {
             return;
         };
+        // BEFORE the transport rundown join: release any worker-queued outer
+        // pending that still pins THIS session. On an abrupt process exit the
+        // rendering context is not destroyed first, so its queued pendings hold
+        // this session's K11 guard, and the untimed join under the adapter DDI
+        // lock would deadlock every later D3D process (flip-app exit-zombie).
+        crate::ddi::native_render::retract_session_worker_pendings(
+            adapter,
+            core::ptr::from_ref(self) as usize,
+        );
         self.transport.teardown(passive, adapter, self.owner);
     }
 }
@@ -1407,7 +1416,7 @@ pub(crate) fn acquire_execution_operation(
         return None;
     }
     let adapter = unsafe { obj.adapter.as_ref() }?;
-    obj.transport.acquire_execution(adapter, obj.owner)
+    obj.transport.acquire_execution(adapter, obj.owner, crate::ddi::session_transport::K11_TAG_SUBMIT)
 }
 
 /// Run one already-host-completed HVC1 admission while this exact session and

@@ -134,11 +134,47 @@ alive, clean exit; Start menu PNG-verified open (`tmp/startmenu_start_miss_t2.pn
 The .439 classic-vsync channel (`VsCls`) is contract-correct — keep — but was
 NOT the root; the ~1.1 s "missed confirmation" reading is retired.
 **Remaining D6 residue (OPEN):**
-- **Flip app exit-zombie**: `d3d11_triangle … flip` still exits into one
-  unkillable `Executive` wait, and the zombie poisons EVERY later D3D app's
-  DXGI startup (BLT probe stuck at adapter enumeration, xproc hung pre-print)
-  until reboot — broader than the old "next flip app" reading. Next lead: what
-  the exit path waits on (the last present's outstanding …?).
+- **Flip app exit-zombie — ✅ ROOT-CAUSED 2026-09-02 (KMD .440–.442), fix PARTIAL.**
+  What the exit path waits on: the **K11 session rundown join**
+  (`SessionTransport::close_and_wait`, `SxWait` bit 6 `K11_RUNDOWN`), untimed,
+  under dxgkrnl's adapter-exclusive DDI lock — so when it never returns EVERY
+  later D3D process wedges at adapter enumeration. The session census instrument
+  (`K11ActN`, added .440: nibbles `0x_321A` = active | tag1 submit | tag2
+  internal-exec | tag3 short) reads **`0x11`/`0x22`** at the hang: 1–2 leaked
+  guards, ALL tag 1 (`K11_TAG_SUBMIT` = an outer-render `SessionExecutionOperation`
+  from `acquire_execution_operation`). Root cause, proven by ETW: on an
+  **abrupt** process exit the app is torn down via `DxgkProcessCallout` →
+  `VidSchMarkDeviceAsError "DeviceTerminatedForProcessCleanup"` → `DdiDestroyDevice`
+  → `DdiCloseAllocation` — **`DdiDestroyContext` is NEVER called** (clean exits
+  DO call it, and then the join is clean). So the outer render `NativeContext` is
+  never closed, its outer worker never drained and its in-flight/queued outer
+  batches never failed, and those batches' session guards are still held when
+  the session teardown joins the rundown. Whether a given flip run hangs is a
+  race: it exits orderly (DestroyContext, clean) if the render/worker thread is
+  idle at `return`, abrupt (ProcessCallout, hang) if a batch is mid-flight.
+  **Fix shipped (.441/.442), PARTIAL — the zombie is REDUCED, not eliminated:**
+  (a) the K11 join now drains the used ring + host terminals per slice instead
+  of a bare untimed wait (`close_and_wait`, mirroring every other transport wait's
+  interrupt-loss tolerance) — this clears the 1-guard case (an in-flight batch
+  whose terminal is merely late); (b) `retract_session_worker_pendings` frees
+  worker-QUEUED outer pendings for the session before the join (`Nr2SesRetr`).
+  ⛔ The 2-guard case STILL hangs: `Nr2SesRetr` never fires (the stuck guard is
+  NOT worker-queued — it is an in-flight or work-item-in-progress outer batch),
+  and its host terminal never comes (the batch was never sent), so draining
+  cannot release it. **The real fix (NEXT SESSION):** close the device's
+  abandoned `NativeContext`s at `DdiDestroyDevice` (which runs in BOTH paths)
+  before releasing the session. ⚠ It CANNOT be done from a `hold_outer_contexts`
+  walk: that holds a `NativeContextOperation` (context-rundown guard), and
+  `NativeContext::close`'s own `NATIVE_CONTEXT` join waits for that rundown to
+  drain → self-deadlock. It needs a per-device context list holding a STRONG
+  reference (not a rundown guard), added at `DxgkDdiCreateContext` /
+  removed at `DxgkDdiDestroyContext`, so DestroyDevice can close the survivors.
+  Evidence: `tmp/dxgk_zombie1.csv` (hung, .440, no DdiDestroyContext),
+  `tmp/dxgk_k11.csv` (clean, .442, DdiDestroyContext present); census read via
+  `K11ActN`. Traps: `K11JoinSpin`'s value arg has a `self.rundown.lock()` call
+  and VANISHES (the record-with-a-call anomaly) — do not trust its absence;
+  first post-boot flip often exits clean, the 2nd+ hangs (warm up before tracing
+  the hang); a live zombie's thread burns 0 CPU (blocking wait, not a spin).
 - Parking image is 4096000 B; QEMU readback wants ≥ primary (4587520) — every
   park still blanks the remote view (dormant now the loop is gone).
 - Vsync polish: waiter-visible vblank alternates ~16.5/30 ms (~40 Hz effective;

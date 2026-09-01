@@ -19,7 +19,7 @@ use wdk_sys::ntddk::{
     KeClearEvent, KeInitializeEvent, KeSetEvent, KeWaitForSingleObject, MmMapIoSpace,
     MmUnmapIoSpace,
 };
-use wdk_sys::{_MEMORY_CACHING_TYPE, KEVENT, PHYSICAL_ADDRESS, PVOID};
+use wdk_sys::{_MEMORY_CACHING_TYPE, KEVENT, LARGE_INTEGER, PHYSICAL_ADDRESS, PVOID};
 
 use crate::adapter::AdapterContext;
 use crate::ddi::create_allocation::{k11_reply_pool_facts, K11ReplyPoolFacts};
@@ -433,9 +433,22 @@ pub(crate) struct HostInitEvidence {
 }
 
 /// Stable, fixed-size K11 state embedded in one heap-pinned `SessionObject`.
+/// Acquire-site tags for the transport rundown, so a hung `close_and_wait`
+/// join can name WHICH site's guard was never returned (packed into `K11ActN`).
+/// 1 = async batch submit (guard held in native custody until the host
+/// terminal); 2 = internal short exec op (attach / prepare); 3 = direct short
+/// synchronous op (initialize / sync submit / reply copy).
+pub(crate) const K11_TAG_SUBMIT: u32 = 1;
+pub(crate) const K11_TAG_EXEC_INTERNAL: u32 = 2;
+pub(crate) const K11_TAG_SHORT: u32 = 3;
+
 pub(crate) struct SessionTransport {
     state: SpinLock<HostState>,
     rundown: SpinLock<RundownState>,
+    /// Outstanding rundown guards per acquire tag, maintained under `rundown`
+    /// so the per-tag sum equals `active` exactly. Read only on the blocking
+    /// teardown path, to name the leaking site.
+    by_tag: [AtomicU32; 3],
     drained: UnsafeCell<KEVENT>,
     /// Keep the complete prepare/submit/reply interval single-owner. The
     /// transport-global fence is minted later under the virtio lock so it also
@@ -491,6 +504,7 @@ impl SessionTransport {
                 open: true,
                 active: 0,
             }),
+            by_tag: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
             // Initialized in place by `init_event` before publication.
             drained: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             ring_zero_control: SpinLock::new(pure::RingZeroControlState::new()),
@@ -543,7 +557,7 @@ impl SessionTransport {
         }
     }
 
-    fn acquire(&self) -> Option<SessionOperation> {
+    fn acquire(&self, tag: u32) -> Option<SessionOperation> {
         let mut rundown = self.rundown.lock();
         if !rundown.open || rundown.active == u32::MAX {
             return None;
@@ -555,8 +569,14 @@ impl SessionTransport {
             unsafe { KeClearEvent(self.drained.get()) };
         }
         rundown.active += 1;
+        // Under `rundown`: the per-tag sum must equal `active` for the join's
+        // census to mean anything.
+        if let Some(counter) = self.by_tag.get(tag.wrapping_sub(1) as usize) {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
         Some(SessionOperation {
             owner: NonNull::from(self),
+            tag,
         })
     }
 
@@ -606,8 +626,9 @@ impl SessionTransport {
         &self,
         adapter: &AdapterContext,
         owner: DeviceOwner,
+        tag: u32,
     ) -> Option<SessionExecutionOperation> {
-        let operation = self.acquire()?;
+        let operation = self.acquire(tag)?;
         let host = match &*self.state.lock() {
             HostState::Live(host) => host.identity(),
             _ => return None,
@@ -651,7 +672,7 @@ impl SessionTransport {
             return Err(STATUS_INVALID_DEVICE_REQUEST);
         }
         let execution = self
-            .acquire_execution(adapter, owner)
+            .acquire_execution(adapter, owner, K11_TAG_EXEC_INTERNAL)
             .ok_or(STATUS_DEVICE_NOT_READY)?;
         if execution.transport_instance != transport_instance {
             return Err(STATUS_DEVICE_NOT_READY);
@@ -798,7 +819,7 @@ impl SessionTransport {
         }
     }
 
-    fn close_and_wait(&self, _passive: PassiveLevel) {
+    fn close_and_wait(&self, _passive: PassiveLevel, adapter: &AdapterContext) {
         let active = {
             let mut rundown = self.rundown.lock();
             rundown.open = false;
@@ -808,13 +829,61 @@ impl SessionTransport {
             return;
         }
         K11_RUNDOWN_WAITED.fetch_add(1, Ordering::Relaxed);
-        // Exact event wait, never polling or a time slice.  Every admitted host
-        // operation owns a Drop guard and the underlying control roundtrip is
-        // itself bounded.
+        // BEFORE the untimed wait, on purpose: this join runs under dxgkrnl's
+        // adapter-exclusive DDI lock, and when it does not return every later
+        // D3D process wedges at adapter enumeration (flip-app exit-zombie,
+        // 2026-09-02). A written `K11ActN` with a nonzero tag nibble names the
+        // acquire site whose guard was never returned. Nibbles, saturating,
+        // read straight from hex as 0x_321A: 0 active | 1 submit | 2 internal
+        // exec | 3 short. A tag nibble of 0xF is an underflowed counter.
+        let mut packed = active.min(0xf);
+        let mut index = 0;
+        while index < self.by_tag.len() {
+            packed |= self.by_tag[index].load(Ordering::Relaxed).min(0xf) << (4 * (index + 1));
+            index += 1;
+        }
+        crate::diag::record_named_bytes(b"K11ActN", packed);
         crate::diag::wait(crate::diag::waits::K11_RUNDOWN, true);
-        let _ = unsafe {
-            KeWaitForSingleObject(self.drained.get() as PVOID, 0, 0, 0, core::ptr::null_mut())
-        };
+        // The one outstanding guard the flip-app exit-zombie leaves is an
+        // in-flight native submit (`K11ActN` tag 1). Its rundown guard returns
+        // only when its used-ring terminal is serviced — and the bare untimed
+        // wait this replaced trusted the completion DPC to do that, which the
+        // process-teardown storm can starve (a lost/late interrupt strands the
+        // terminal forever, deadlocking every later app under the adapter DDI
+        // lock). Every OTHER PASSIVE wait in the transport already re-drains the
+        // used ring per slice for exactly this "interrupt-loss tolerance"
+        // (ctrl.rs); this join was the one that did not. Now it does: adaptive
+        // slices, draining used + host terminals each slice, waking early when
+        // a guard is returned. NEVER returns while active != 0 — a guard still
+        // pins this object, so an early return would be a use-after-free.
+        let mut slice_ms: u32 = 1;
+        let mut slices: u32 = 0;
+        loop {
+            let _ = adapter.with_virtio(|gpu| gpu.drain_used(adapter));
+            crate::ddi::native_render::drain_host_terminals(adapter);
+            if self.rundown.lock().active == 0 {
+                break;
+            }
+            let mut timeout: LARGE_INTEGER = unsafe { core::mem::zeroed() };
+            timeout.QuadPart = -((slice_ms.max(1) as i64) * 10_000);
+            let _ = unsafe {
+                KeWaitForSingleObject(
+                    self.drained.get() as PVOID,
+                    0,
+                    0,
+                    0,
+                    &mut timeout,
+                )
+            };
+            slices = slices.saturating_add(1);
+            if slices == 1 || slices % 64 == 0 {
+                crate::diag::record_named_bytes(
+                    b"K11JoinSpin",
+                    (slices << 8) | (self.rundown.lock().active.min(0xff)),
+                );
+            }
+            slice_ms = (slice_ms * 2).min(20);
+        }
         crate::diag::wait(crate::diag::waits::K11_RUNDOWN, false);
     }
 
@@ -831,7 +900,7 @@ impl SessionTransport {
         owner: DeviceOwner,
         operation: impl FnOnce() -> R,
     ) -> Option<R> {
-        let Some(_operation) = self.acquire() else {
+        let Some(_operation) = self.acquire(K11_TAG_SHORT) else {
             return None;
         };
         let host = match &*self.state.lock() {
@@ -884,7 +953,7 @@ impl SessionTransport {
         raw_reply_bytes: u64,
     ) -> Result<(), NTSTATUS> {
         let operation = self
-            .acquire_execution(adapter, owner)
+            .acquire_execution(adapter, owner, K11_TAG_EXEC_INTERNAL)
             .ok_or(STATUS_DEVICE_NOT_READY)?;
         let host = match &*self.state.lock() {
             HostState::Live(host) => host.identity(),
@@ -928,7 +997,7 @@ impl SessionTransport {
         raw_reply_bytes: u64,
         expected_opcode: u32,
     ) -> Result<(), NTSTATUS> {
-        let _operation = self.acquire().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        let _operation = self.acquire(K11_TAG_SHORT).ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
         let host = match &*self.state.lock() {
             HostState::Live(host) => host.identity(),
             _ => return Err(STATUS_DEVICE_NOT_READY),
@@ -999,7 +1068,7 @@ impl SessionTransport {
         expected_opcode: u32,
     ) -> Result<(), NTSTATUS> {
         let operation = self
-            .acquire_execution(adapter, owner)
+            .acquire_execution(adapter, owner, K11_TAG_EXEC_INTERNAL)
             .ok_or(STATUS_DEVICE_NOT_READY)?;
         let host = match &*self.state.lock() {
             HostState::Live(host) => host.identity(),
@@ -1081,7 +1150,7 @@ impl SessionTransport {
         owner: DeviceOwner,
         payload: &[u8],
     ) -> Result<(), NTSTATUS> {
-        let _operation = self.acquire().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        let _operation = self.acquire(K11_TAG_SHORT).ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
         let host = match &*self.state.lock() {
             HostState::Live(host) => host.identity(),
             _ => return Err(STATUS_DEVICE_NOT_READY),
@@ -1115,7 +1184,7 @@ impl SessionTransport {
         final_payload_bytes: u64,
         publish: impl FnOnce(K11ReplyPoolFacts, &HostInitEvidence) -> Result<R, NTSTATUS>,
     ) -> Result<R, NTSTATUS> {
-        let _operation = self.acquire().ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
+        let _operation = self.acquire(K11_TAG_SHORT).ok_or(STATUS_INVALID_DEVICE_REQUEST)?;
         let allocation = {
             let mut state = self.state.lock();
             let HostState::Provisional { allocation } = &*state else {
@@ -1525,7 +1594,7 @@ impl SessionTransport {
         adapter: &AdapterContext,
         owner: DeviceOwner,
     ) {
-        self.close_and_wait(passive);
+        self.close_and_wait(passive, adapter);
         let old = {
             let mut state = self.state.lock();
             let allocation = match &*state {
@@ -1646,6 +1715,8 @@ pub(crate) struct SessionExecutionOperation {
 
 struct SessionOperation {
     owner: NonNull<SessionTransport>,
+    /// The acquire site, returned to the same per-tag counter in `Drop`.
+    tag: u32,
 }
 
 // SAFETY: SessionTransport is heap-pinned inside SessionObject and teardown
@@ -1660,6 +1731,12 @@ impl Drop for SessionOperation {
             let mut rundown = owner.rundown.lock();
             debug_assert!(rundown.active != 0);
             rundown.active = rundown.active.saturating_sub(1);
+            // WRAPPING, so a tag/acquire mismatch shows as 0xF in the census
+            // nibble rather than clamping to 0 and reading as "nothing here".
+            if let Some(counter) = owner.by_tag.get(self.tag.wrapping_sub(1) as usize) {
+                let previous = counter.load(Ordering::Relaxed);
+                counter.store(previous.wrapping_sub(1), Ordering::Relaxed);
+            }
             rundown.active == 0
         };
         if signal {
