@@ -165,6 +165,16 @@ reports back, and Helios' vsync path may never report the applied classic
 address (`LastPA`), so a ~1 s timeout reverts the path; instrument the vsync
 address report vs the D4 apply and the visibility flag (the KMD's 0x1314
 crumb records SourceId only, not Visible).
+⭐ CONFIRMED STATICALLY + FIX STAGED (.439, `f923ac2`): on the MPO3 surface
+the heartbeat sent ONLY the INFO2 packet (PresentId = the MPO completion
+channel); the classic `signal_crtc_vsync(last_primary_address)` branch was
+dead code — a classic apply had NO completion channel, the exact sibling of
+the .337 ("~6 s modeset wait → rollback to zero paths") and .353-.356
+(INFO3: every MPO flip pending → dwm device removed) incidents. .439 sends
+BOTH packets per retrace (`VsyncClassic` knob, default 1; `VsCls` counter).
+Verdict needs the owner's QEMU relaunch (activates .439 + the readback fix)
+then one clean-boot `helios_triangle_flip` run: expect createdevs flat,
+full-rate presents, no visibility teardowns, no zombie.
 
 **D6 — original report (2026-09-01 21:00, first flip-model windowed run on the
 fixed KMD): dwm device churn + display parked + zombie on exit.** `\helios_triangle_flip`
