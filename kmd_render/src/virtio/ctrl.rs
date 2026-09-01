@@ -1305,6 +1305,41 @@ fn record_fenced_scanout_response_refusal(code: u32) {
 /// this entry, the exact header length was written, and the standard fence
 /// flag/id plus global-command zero fields all echo this mint. The resource is
 /// request-bound in the in-flight tag (virtio-gpu replies do not echo it).
+/// Post-init `GET_DISPLAY_INFO`: the host's CURRENT scanout-0 extent, for the
+/// HPD worker's config-change refresh. `init`'s inline variant busy-polls the
+/// queue and is illegal once interrupts own it.
+pub(crate) fn query_display_info(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+) -> Option<(u32, u32)> {
+    let mut req = helios_protocol::VirtioGpuCtrlHdr::zeroed();
+    req.type_ = helios_protocol::VIRTIO_GPU_CMD_GET_DISPLAY_INFO;
+    let mut response = [0u8; size_of::<helios_protocol::VirtioGpuRespDisplayInfo>()];
+    let observed = ctrl_roundtrip_observed(
+        passive,
+        adapter,
+        bytes_of(&req),
+        None,
+        &mut response,
+        SYNC_ROUNDTRIP_TIMEOUT_MS,
+        None,
+        None,
+        CtrlRoundtripMode::LegacyRetry,
+    );
+    let CtrlRoundtripOutcome::HostResponseCopied { written_length } = observed else {
+        return None;
+    };
+    if written_length as usize != response.len() {
+        return None;
+    }
+    let resp: helios_protocol::VirtioGpuRespDisplayInfo = bytemuck::pod_read_unaligned(&response);
+    if resp.hdr.type_ != helios_protocol::VIRTIO_GPU_RESP_OK_DISPLAY_INFO {
+        return None;
+    }
+    let m0 = resp.pmodes[0].r;
+    Some((m0.width, m0.height))
+}
+
 pub(crate) fn set_scanout_blob_fenced(
     passive: PassiveLevel,
     adapter: &AdapterContext,

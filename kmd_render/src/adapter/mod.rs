@@ -581,6 +581,11 @@ pub struct AdapterContext {
     /// the DPC signals `hpd_event`, then the PASSIVE worker consumes this bit and
     /// re-indicates connection.
     pub config_change_pending: AtomicU32,
+    /// `(w << 16) | h` adopted by the HPD worker's config-change refresh, or 0
+    /// while the StartDevice snapshot still holds. Overlays `display_mode()`
+    /// and the generated EDID so both stay one value (D6: a QEMU UI resize
+    /// left the OS chasing a mode the KMD never offered).
+    pub live_scanout_mode: AtomicU32,
     /// 1 once `DxgkDdiStartDevice` has returned.
     ///
     /// `DxgkCbIndicateChildStatus` is forbidden DURING StartDevice, and the HPD
@@ -732,6 +737,7 @@ impl AdapterContext {
             hpd_stop: AtomicU32::new(0),
             hpd_worker_leaked: AtomicU32::new(0),
             config_change_pending: AtomicU32::new(0),
+            live_scanout_mode: AtomicU32::new(0),
             start_complete: AtomicU32::new(0),
         }
     }
@@ -797,9 +803,20 @@ impl AdapterContext {
     /// bare literals. Returns the same `(u32, u32)` tuple as before, so its five
     /// consumers are untouched.
     pub fn display_mode(&self) -> (u32, u32) {
+        let live = self.live_scanout_mode.load(Ordering::Acquire);
+        if live != 0 {
+            return (live >> 16, live & 0xFFFF);
+        }
         self.started()
             .map_or(DEFAULT_SCANOUT_EXTENT, |s| s.scanout_mode.mode)
             .into()
+    }
+
+    /// Adopt a refreshed host extent mid-session (HPD worker only). The value
+    /// is pre-validated by `DisplayMode::from_host`.
+    pub(crate) fn set_live_scanout_mode(&self, mode: helios_kmd_logic::DisplayMode) {
+        self.live_scanout_mode
+            .store(mode.packed(), Ordering::Release);
     }
 
     /// The packed `(w << 16) | h` the `DspMd` breadcrumb reports.
@@ -922,8 +939,15 @@ impl AdapterContext {
     ///
     /// Generated from — and therefore always consistent with — the extent
     /// `display_mode()` reports: they are one value.
-    pub fn edid(&self) -> Option<&[u8; 128]> {
-        self.started().map(|s| s.scanout_mode.edid())
+    pub fn edid(&self) -> Option<[u8; 128]> {
+        let s = self.started()?;
+        let live = self.live_scanout_mode.load(Ordering::Acquire);
+        if live != 0 {
+            // Regenerated, not cached: build_edid is pure and 128 bytes, and
+            // deriving it here keeps mode and EDID one value with no seqlock.
+            return Some(crate::ddi::vidpn::build_edid(live >> 16, live & 0xFFFF));
+        }
+        Some(*s.scanout_mode.edid())
     }
 
     /// The current transport generation's state, or `None` between StopDevice

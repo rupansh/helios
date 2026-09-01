@@ -56,6 +56,29 @@ fn indicate_child_status(adapter: &AdapterContext, connected: bool) {
 }
 
 /// Count of child-status indications this boot (diag `HpdN`).
+/// A virtio config change is (among other things) QEMU's UI window resizing —
+/// the VNC client on the owner's monitor. Re-read the host extent and, when it
+/// changed, republish the monitor as a real unplug/replug so the OS re-reads
+/// the EDID and enumerates modes that exist. Without this the CCD chased the
+/// new preferred mode against a stale mode set forever (ROADMAP D6).
+fn refresh_display_mode(passive: crate::irql::PassiveLevel, adapter: &AdapterContext) {
+    let Some((w, h)) = crate::virtio::ctrl::query_display_info(passive, adapter) else {
+        return;
+    };
+    let Some(mode) = helios_kmd_logic::DisplayMode::from_host(w, h) else {
+        return;
+    };
+    if adapter.display_mode() == (mode.width(), mode.height()) {
+        return;
+    }
+    adapter.set_live_scanout_mode(mode);
+    crate::diag::record_named_bytes(b"HpdMd", mode.packed());
+    indicate_child_status(adapter, false);
+    // Give the monitor-departure a real edge before the replug; the paired
+    // connected indicate is the caller's existing one.
+    crate::virtio::ctrl::sleep_ms(passive, 120);
+}
+
 static HPD_INDICATE_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// Times the prologue's bounded fallback fired instead of the real start edge
@@ -174,6 +197,7 @@ pub unsafe extern "C" fn hpd_thread_routine(context: *mut c_void) {
         }
 
         if adapter.config_change_pending.swap(0, Ordering::AcqRel) != 0 {
+            refresh_display_mode(passive, adapter);
             indicate_child_status(adapter, true);
         }
         crate::ddi::direct_scanout::service_pending(passive, adapter);
