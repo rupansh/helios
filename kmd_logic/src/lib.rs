@@ -36,6 +36,7 @@ pub mod direct_scanout_admission;
 pub mod direct_scanout_lifetime;
 pub mod display_backing_lifetime;
 pub mod ordered_engine;
+pub mod present_dma_header;
 pub mod outer_execution;
 pub mod umd_private_query;
 pub mod venus_executor;

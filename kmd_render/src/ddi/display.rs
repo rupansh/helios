@@ -397,6 +397,26 @@ unsafe fn dxgkddi_present_inner(
             );
             return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
         }
+        // Every packet this DDI emits is stamped, or SubmitCommand parses it as
+        // an HOB1 record (D5). Written before the DMA cursor moves, so a refusal
+        // leaves no partial packet.
+        let kind = if present_flags & (1 << 2) != 0 {
+            crate::ddi::present_packet::PresentDmaKind::Flip
+        } else if present_flags & 1 != 0 {
+            crate::ddi::present_packet::PresentDmaKind::Blt
+        } else {
+            crate::ddi::present_packet::PresentDmaKind::Other
+        };
+        if let Err(status) = unsafe {
+            crate::ddi::present_packet::PresentDmaHeader::write(
+                args.pDmaBufferPrivateData,
+                args.DmaBufferPrivateDataSize,
+                kind,
+            )
+        } {
+            PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);
+            return status;
+        }
         unsafe {
             // Keep the DMA record structurally non-empty. Its bytes carry no
             // identity; allocation references and the K9 boundary are separate

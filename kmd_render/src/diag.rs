@@ -371,8 +371,9 @@ pub struct CounterBlock {
 
 impl CounterBlock {
     /// Mirror the block into the registry if the policy (or a changed failure
-    /// counter, or `DiagLevel >= 1`) says so. PASSIVE_LEVEL only.
-    pub fn flush(&self) {
+    /// counter, or `DiagLevel >= 1`) says so. PASSIVE_LEVEL only. Returns
+    /// whether it published, so a caller can ride the same cadence.
+    pub fn flush(&self) -> bool {
         let mut fail_sum: u32 = 0;
         let mut i = 0;
         while i < self.entries.len() {
@@ -387,9 +388,10 @@ impl CounterBlock {
         let due = n == 1 || n % period == 0;
         // A changed failure counter always wins over the throttle.
         if !(due || fail_sum != previous || level() >= 1) {
-            return;
+            return false;
         }
         self.publish();
+        true
     }
 
     /// Mirror the block into the registry UNCONDITIONALLY. PASSIVE_LEVEL only.

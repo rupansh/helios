@@ -253,6 +253,9 @@ pub static NR2_HOS1_REJECT: AtomicU32 = AtomicU32::new(0);
 pub static NR2_OUTER_QUEUED: AtomicU32 = AtomicU32::new(0);
 /// Outer execution refusals, packed `(count << 16) | OuterExecutionRefusal`.
 pub static NR2_OUTER_REJECT: AtomicU32 = AtomicU32::new(0);
+/// Batches that terminated unsuccessfully and whose tickets were completed
+/// anyway (`settle_batch_tickets`).
+pub static NR2_TICKETS_FAILED: AtomicU32 = AtomicU32::new(0);
 /// Generated resource operands substituted with a real virtio resource id —
 /// the KMD half of the venus memory import, counted globally so a per-allocation
 /// zero (`D2BnImp`) can be told apart from a dead instrument.
@@ -365,7 +368,7 @@ pub static NR2_NO_STAGE: AtomicU32 = AtomicU32::new(0);
 pub static NR2_NO_EPOCH: AtomicU32 = AtomicU32::new(0);
 /// The counter names, as one list, so the collision proof and the writer cannot
 /// drift apart.
-const COUNTER_NAMES: [&[u8]; 43] = [
+const COUNTER_NAMES: [&[u8]; 50] = [
     b"Nr2QCtx",
     b"Nr2QCtxRej",
     b"Nr2Scratch",
@@ -409,6 +412,13 @@ const COUNTER_NAMES: [&[u8]; 43] = [
     b"Nr2OuterHost",
     b"Nr2ImpN",
     b"Nr2ImpRid",
+    b"Nr2TkFail",
+    b"Nr2RefCmp",
+    b"Nr2PrBlt",
+    b"Nr2PrFlip",
+    b"Nr2PrMpo",
+    b"Nr2PrOth",
+    b"PreN",
 ];
 
 /// The boundary counters that did not fit [`COUNTER_NAMES`]'s block, mirrored
@@ -523,6 +533,13 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(COUNTER_NAMES[40], &NR2_OUTER_HOST),
         e(COUNTER_NAMES[41], &NR2_IMPORT_SUBSTITUTIONS),
         e(COUNTER_NAMES[42], &NR2_IMPORT_LAST_RESOURCE),
+        f(COUNTER_NAMES[43], &NR2_TICKETS_FAILED),
+        f(COUNTER_NAMES[44], &crate::ddi::submit_command::REFUSED_COMPLETED),
+        e(COUNTER_NAMES[45], &crate::ddi::submit_command::PRESENT_PACKETS_BLT),
+        e(COUNTER_NAMES[46], &crate::ddi::submit_command::PRESENT_PACKETS_FLIP),
+        e(COUNTER_NAMES[47], &crate::ddi::submit_command::PRESENT_PACKETS_MPO),
+        e(COUNTER_NAMES[48], &crate::ddi::submit_command::PRESENT_PACKETS_OTHER),
+        e(COUNTER_NAMES[49], &crate::ddi::submit_command::PREEMPT_COUNT),
         e(b"Nr2PImpN", &crate::ddi::create_allocation::IMP_PRIMARY_N),
         e(b"Nr2PImpR0", &crate::ddi::create_allocation::IMP_PRIMARY_RID[0]),
         e(b"Nr2PImpR1", &crate::ddi::create_allocation::IMP_PRIMARY_RID[1]),
@@ -568,7 +585,15 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
 
 /// Mirror the counters into the service key. PASSIVE only.
 pub fn diag_dump_native_render_atomics() {
-    NR2_COUNTERS.flush();
+    flush_nr2_counters();
+}
+
+/// The K9 block used to be mirrored only by the engine diagnostic dump, so it
+/// read as a fossil between boots; ride the NR2 cadence instead.
+fn flush_nr2_counters() {
+    if NR2_COUNTERS.flush() {
+        crate::adapter::dump_ordered_engine_atomics();
+    }
 }
 
 /// Pack a count with a `kmd_logic` reason code into one registry value, so the
@@ -1663,17 +1688,20 @@ impl NativeContext {
     }
 }
 
+/// A failed batch still completes its fences. Its failure already reached the
+/// UMD through the batch reply; failing the tickets instead poisoned the one
+/// adapter-wide K9 engine and held every context's fences until the watchdog
+/// preempted (D5, 2026-09-01). `Nr2TkFail` counts the failed batches.
 fn settle_batch_tickets(
     adapter: &crate::adapter::AdapterContext,
     tickets: BatchTickets,
     success: bool,
 ) {
+    if !success {
+        NR2_TICKETS_FAILED.fetch_add(1, Ordering::Relaxed);
+    }
     for ticket in tickets.entries[..tickets.count as usize].iter().flatten() {
-        if success {
-            let _ = crate::ddi::interrupt::complete_ordered_engine_submission(adapter, *ticket);
-        } else {
-            let _ = crate::ddi::interrupt::fail_ordered_engine_submission(adapter, *ticket);
-        }
+        let _ = crate::ddi::interrupt::complete_ordered_engine_submission(adapter, *ticket);
     }
 }
 
@@ -2179,11 +2207,19 @@ fn reap_terminal_slots(native: &NativeContext, _passive: PassiveLevel) {
         let Some((identity, tickets)) = snapshot else {
             continue;
         };
+        // A preempt advances the K9 epoch, so a ticket from before it never
+        // retires here; a Terminal slot holding one was stranded for the life
+        // of the context, and at ~40 quantum preempts/s dwm slot-exhausted at
+        // batch 346 (2026-09-01). Freeing it is safe: a late resubmission of
+        // that packet completes without the slot (`Nr2RefCmp`).
         let retired = adapter.with_wddm_notify_lock(|guard| {
             tickets.entries[..tickets.count as usize]
                 .iter()
                 .flatten()
-                .all(|ticket| guard.ordered_engine_ticket_was_retired(*ticket))
+                .all(|ticket| {
+                    guard.ordered_engine_ticket_was_retired(*ticket)
+                        || guard.ordered_engine_ticket_is_stale_epoch(*ticket)
+                })
         });
         if !retired {
             continue;
@@ -3045,7 +3081,7 @@ pub(crate) unsafe fn render_outer_physical(
     args.PatchLocationListOutSize = 0;
     args.MultipassOffset = 0;
     NR2_OUTER_QUEUED.fetch_add(1, Ordering::Relaxed);
-    NR2_COUNTERS.flush();
+    flush_nr2_counters();
     STATUS_SUCCESS
 }
 
@@ -4060,7 +4096,7 @@ pub(crate) unsafe fn render(
         NR2_RESIZE.fetch_add(1, Ordering::Relaxed);
         args.PatchLocationListOutSize = 0;
         args.MultipassOffset = 0;
-        NR2_COUNTERS.flush();
+        flush_nr2_counters();
         return STATUS_SUCCESS;
     }
     if args.pCommand.is_null() || args.pDmaBuffer.is_null() {
@@ -4200,7 +4236,7 @@ pub(crate) unsafe fn render(
         args.MultipassOffset = 0;
         apply_render_fragment(&mut native.state.lock(), &header, &accept);
         NR2_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
-        NR2_COUNTERS.flush();
+        flush_nr2_counters();
         return STATUS_SUCCESS;
     }
 
@@ -4600,7 +4636,7 @@ fn commit(
     NR2_FRAGMENTS.fetch_add(1, Ordering::Relaxed);
     NR2_COMMITS.fetch_add(1, Ordering::Relaxed);
     NR2_PATCH_SLOTS.fetch_add(plan.count, Ordering::Relaxed);
-    NR2_COUNTERS.flush();
+    flush_nr2_counters();
     STATUS_SUCCESS
 }
 
@@ -5342,11 +5378,10 @@ pub(crate) unsafe fn submit_outer_physical(
     match action {
         QueueSubmitAction::Pending => NativeSubmitDisposition::Pending,
         QueueSubmitAction::AlreadyTerminal { success } => {
-            if success {
-                let _ = crate::ddi::interrupt::complete_ordered_engine_submission(adapter, ticket);
-            } else {
-                let _ = crate::ddi::interrupt::fail_ordered_engine_submission(adapter, ticket);
+            if !success {
+                NR2_TICKETS_FAILED.fetch_add(1, Ordering::Relaxed);
             }
+            let _ = crate::ddi::interrupt::complete_ordered_engine_submission(adapter, ticket);
             NativeSubmitDisposition::Pending
         }
         QueueSubmitAction::Enqueue {
@@ -5702,12 +5737,10 @@ pub(crate) unsafe fn submit(
         return match action {
             QueueSubmitAction::Pending => NativeSubmitDisposition::Pending,
             QueueSubmitAction::AlreadyTerminal { success } => {
-                if success {
-                    let _ =
-                        crate::ddi::interrupt::complete_ordered_engine_submission(adapter, ticket);
-                } else {
-                    let _ = crate::ddi::interrupt::fail_ordered_engine_submission(adapter, ticket);
+                if !success {
+                    NR2_TICKETS_FAILED.fetch_add(1, Ordering::Relaxed);
                 }
+                let _ = crate::ddi::interrupt::complete_ordered_engine_submission(adapter, ticket);
                 NativeSubmitDisposition::Pending
             }
             QueueSubmitAction::Enqueue {
@@ -5970,12 +6003,10 @@ pub(crate) unsafe fn submit_virtual(
         };
         return match terminal {
             Some(Ok(Some(success))) => {
-                if success {
-                    let _ =
-                        crate::ddi::interrupt::complete_ordered_engine_submission(adapter, ticket);
-                } else {
-                    let _ = crate::ddi::interrupt::fail_ordered_engine_submission(adapter, ticket);
+                if !success {
+                    NR2_TICKETS_FAILED.fetch_add(1, Ordering::Relaxed);
                 }
+                let _ = crate::ddi::interrupt::complete_ordered_engine_submission(adapter, ticket);
                 NR2_HOST_SUBMIT_OK.fetch_add(1, Ordering::Relaxed);
                 NativeSubmitDisposition::Pending
             }

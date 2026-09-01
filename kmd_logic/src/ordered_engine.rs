@@ -369,6 +369,13 @@ impl<const N: usize> OrderedEngine<N> {
             && ticket.serial <= self.last_retired_serial
     }
 
+    /// A ticket minted before the last `invalidate`. It can never retire in
+    /// this engine: VidSch either already saw its fence or will resubmit the
+    /// packet under a fresh ticket.
+    pub const fn ticket_is_stale_epoch(&self, ticket: SubmissionTicket) -> bool {
+        ticket.epoch != self.epoch
+    }
+
     /// Close and invalidate the current scheduler interval. Repeated close on
     /// an already-empty closed generation is idempotent.
     pub fn invalidate(&mut self) -> Invalidation {
@@ -414,6 +421,34 @@ impl<const N: usize> Default for OrderedEngine<N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalidate_makes_every_prior_ticket_stale_and_never_retired() {
+        let mut engine: OrderedEngine<4> = OrderedEngine::new();
+        assert!(engine.reopen(0));
+        let retired = engine.admit(1).unwrap();
+        assert!(matches!(
+            engine.mark_host_completed(retired),
+            CompletionDisposition::Marked { .. }
+        ));
+        let ready = engine.peek_ready().unwrap();
+        assert_eq!(engine.retire_ready(ready), Ok(1));
+        assert!(engine.ticket_was_retired(retired));
+        assert!(!engine.ticket_is_stale_epoch(retired));
+        let pending = engine.admit(2).unwrap();
+
+        assert!(engine.invalidate().epoch_advanced);
+        assert!(engine.reopen(1));
+        // The reaper's predicate used to be `ticket_was_retired` alone, which
+        // is false forever for both of these after the epoch moved.
+        assert!(!engine.ticket_was_retired(retired));
+        assert!(engine.ticket_is_stale_epoch(retired));
+        assert!(!engine.ticket_was_retired(pending));
+        assert!(engine.ticket_is_stale_epoch(pending));
+        let fresh = engine.admit(3).unwrap();
+        assert!(!engine.ticket_is_stale_epoch(fresh));
+        assert!(!engine.ticket_was_retired(fresh));
+    }
 
     fn open<const N: usize>() -> OrderedEngine<N> {
         let mut engine = OrderedEngine::new();

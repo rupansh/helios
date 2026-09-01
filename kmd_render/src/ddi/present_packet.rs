@@ -330,7 +330,7 @@ pub(crate) struct MpoPresentPacketPlan {
 }
 
 const MPO_MAX_PLANES: u32 = 1;
-const MPO_PRIVATE_BYTES: usize = 0;
+const MPO_PRIVATE_BYTES: usize = PRESENT_DMA_HEADER_BYTES;
 const MPO_PATCH_REFERENCES: usize = 0;
 const MPO_PRESENT_RESERVED_FLAGS: u32 = 0xFFFF_C000;
 const SHARED_PRIMARY_STANDARD_ALLOCATION_TYPE: u32 = 1;
@@ -521,11 +521,88 @@ impl MpoPresentPacketPlan {
         );
         unsafe {
             core::ptr::write_unaligned(self.dma.cast::<u32>(), 0);
+            // Infallible: `prepare_mpo_present` proved `MPO_PRIVATE_BYTES`.
+            let _ = PresentDmaHeader::write(
+                args.pDmaBufferPrivateData,
+                args.DmaBufferPrivateDataSize,
+                PresentDmaKind::Mpo,
+            );
         }
         args.pDmaBuffer = self.next_dma;
         args.MultipassOffset = 0;
     }
 }
+
+pub(crate) use helios_kmd_logic::present_dma_header::{PresentDmaKind, PRESENT_DMA_HEADER_BYTES};
+
+/// Offset-0 header on every packet this DDI emits, so SubmitCommand can tell
+/// a Present packet from the HOB1 render record at the same offset on the same
+/// outer context (`helios_kmd_logic::present_dma_header`, ROADMAP D5).
+pub(crate) struct PresentDmaHeader;
+
+impl PresentDmaHeader {
+    /// # Safety
+    /// `private_data` points to `private_size` writable bytes dxgkrnl supplied
+    /// for this Present call.
+    pub(crate) unsafe fn write(
+        private_data: *mut c_void,
+        private_size: u32,
+        kind: PresentDmaKind,
+    ) -> Result<(), NTSTATUS> {
+        if private_data.is_null() || (private_size as usize) < PRESENT_DMA_HEADER_BYTES {
+            return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
+        }
+        let bytes = helios_kmd_logic::present_dma_header::encode(kind);
+        // SAFETY: size-checked above; byte copy, so alignment is irrelevant.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                private_data.cast::<u8>(),
+                PRESENT_DMA_HEADER_BYTES,
+            )
+        };
+        Ok(())
+    }
+
+    /// Read (never consume) the header inside a submission's private window. A
+    /// preempted Present packet is resubmitted and must be recognised again;
+    /// the one-shot flip record at offset 32 is what `take` consumes.
+    ///
+    /// # Safety
+    /// `base` points to `total` readable bytes of a live submission's private
+    /// data.
+    pub(crate) unsafe fn peek(
+        base: *const c_void,
+        total: u32,
+        start: u32,
+        end: u32,
+    ) -> Option<PresentDmaKind> {
+        if base.is_null() {
+            return None;
+        }
+        let (total, mut start, mut end) = (total as usize, start as usize, end as usize);
+        if end <= start {
+            start = 0;
+            end = total;
+        }
+        if start > end || end > total || end - start < PRESENT_DMA_HEADER_BYTES {
+            return None;
+        }
+        let mut raw = [0u8; PRESENT_DMA_HEADER_BYTES];
+        // SAFETY: the window was bounds-checked against `total` just above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                base.cast::<u8>().add(start),
+                raw.as_mut_ptr(),
+                PRESENT_DMA_HEADER_BYTES,
+            )
+        };
+        helios_kmd_logic::present_dma_header::decode(&raw)
+    }
+}
+
+const _: () = assert!(PRESENT_DMA_HEADER_BYTES <= PRESENT_FLIP_PRIVATE_OFFSET);
+const _: () = assert!(PRESENT_DMA_HEADER_BYTES <= PRESENT_DMA_PRIVATE_DATA_BYTES as usize);
 
 /// The fixed present allocation array, as a value only [`PresentPayload::decode`]
 /// can produce.

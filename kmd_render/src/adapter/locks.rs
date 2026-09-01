@@ -265,6 +265,10 @@ impl WddmNotifyGuard<'_> {
         self.ordered_engine_mut().ticket_was_retired(ticket)
     }
 
+    pub(crate) fn ordered_engine_ticket_is_stale_epoch(&self, ticket: OrderedEngineTicket) -> bool {
+        self.ordered_engine_mut().ticket_is_stale_epoch(ticket)
+    }
+
     /// End this scheduler generation. A stale host callback retains only its
     /// own old ticket and cannot publish into the successor.
     pub(crate) fn invalidate_ordered_engine(&self) {

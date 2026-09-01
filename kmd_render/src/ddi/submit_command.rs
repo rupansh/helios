@@ -25,6 +25,15 @@ pub static SUBMIT_LAST_FENCE: AtomicU32 = AtomicU32::new(0);
 pub static RENDER_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PATCH_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static PREEMPT_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Present packets retired on outer contexts, by `PresentDmaKind`.
+pub static PRESENT_PACKETS_BLT: AtomicU32 = AtomicU32::new(0);
+pub static PRESENT_PACKETS_FLIP: AtomicU32 = AtomicU32::new(0);
+pub static PRESENT_PACKETS_MPO: AtomicU32 = AtomicU32::new(0);
+pub static PRESENT_PACKETS_OTHER: AtomicU32 = AtomicU32::new(0);
+/// Submissions a native path refused after K9 admission and that completed
+/// without work instead of poisoning the engine (see
+/// `retire_refused_submission`).
+pub static REFUSED_COMPLETED: AtomicU32 = AtomicU32::new(0);
 pub static DMA_NOTIFY_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DMA_QUEUE_DPC_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DMA_SYNC_STATUS_LOW: AtomicU32 = AtomicU32::new(0);
@@ -388,6 +397,46 @@ fn note_and_maybe_signal(
     SubmitAck::Accepted
 }
 
+/// A Present packet on an outer context carries no work: a BLT's copy was made
+/// by the UMD before `pfnPresentCb`, a DMA flip is armed here. Its fence retires
+/// in K9 order behind the renders admitted before it. DISPATCH_LEVEL.
+///
+/// # Safety
+/// `private` points to `total` bytes of this submission's private data.
+unsafe fn retire_present_packet(
+    adapter: &AdapterContext,
+    private: *mut c_void,
+    total: u32,
+    kind: crate::ddi::present_packet::PresentDmaKind,
+    ticket: crate::adapter::OrderedEngineTicket,
+) {
+    use crate::ddi::present_packet::PresentDmaKind;
+    match kind {
+        PresentDmaKind::Blt => PRESENT_PACKETS_BLT.fetch_add(1, Ordering::Relaxed),
+        PresentDmaKind::Flip => {
+            unsafe { arm_dma_flip(adapter, private, total) };
+            PRESENT_PACKETS_FLIP.fetch_add(1, Ordering::Relaxed)
+        }
+        PresentDmaKind::Mpo => PRESENT_PACKETS_MPO.fetch_add(1, Ordering::Relaxed),
+        PresentDmaKind::Other => PRESENT_PACKETS_OTHER.fetch_add(1, Ordering::Relaxed),
+    };
+    let _ = super::interrupt::complete_ordered_engine_submission(adapter, ticket);
+}
+
+/// A refused submission completes without work. Failing its ticket poisoned
+/// the ONE adapter-wide K9 engine, which then held every later fence of every
+/// context until dxgkrnl's watchdog preempted: measured 2026-09-01 (D5) as 83
+/// `DdiPreemptCommand`/s and 765 `ResubmissionMismatch` in 20 s from a single
+/// BLT present, dwm slot-exhausted, the app unkillable. The refusal stays
+/// counted where it was decided (`Nr2OuterRej`, `Nr2HostRej`).
+fn retire_refused_submission(
+    adapter: &AdapterContext,
+    ticket: crate::adapter::OrderedEngineTicket,
+) {
+    REFUSED_COMPLETED.fetch_add(1, Ordering::Relaxed);
+    let _ = super::interrupt::complete_ordered_engine_submission(adapter, ticket);
+}
+
 /// Pick up a DMA-BUFFER FLIP record from a submission's private data and arm
 /// the scan-out programming for it.
 ///
@@ -466,6 +515,27 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
                 else {
                     return;
                 };
+                // SAFETY: the private-data pair for this submission.
+                if let Some(kind) = unsafe {
+                    crate::ddi::present_packet::PresentDmaHeader::peek(
+                        submit.pDmaBufferPrivateData,
+                        submit.DmaBufferPrivateDataSize,
+                        0,
+                        0,
+                    )
+                } {
+                    // SAFETY: same private-data pair.
+                    unsafe {
+                        retire_present_packet(
+                            adapter,
+                            submit.pDmaBufferPrivateData,
+                            submit.DmaBufferPrivateDataSize,
+                            kind,
+                            ticket,
+                        )
+                    };
+                    return;
+                }
                 // SAFETY: the role resolution above proves all four direct
                 // owners and this submission's private-data/GPUVA pair.
                 let disposition = unsafe {
@@ -477,7 +547,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
                     disposition,
                     crate::ddi::native_render::NativeSubmitDisposition::Pending
                 ) {
-                    let _ = super::interrupt::fail_ordered_engine_submission(adapter, ticket);
+                    retire_refused_submission(adapter, ticket);
                 }
             });
             return STATUS_SUCCESS;
@@ -544,6 +614,28 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
                 else {
                     return;
                 };
+                // SAFETY: the private-data window dxgkrnl supplied for this
+                // submission.
+                if let Some(kind) = unsafe {
+                    crate::ddi::present_packet::PresentDmaHeader::peek(
+                        submit.pDmaBufferPrivateData,
+                        submit.DmaBufferPrivateDataSize,
+                        submit.DmaBufferPrivateDataSubmissionStartOffset,
+                        submit.DmaBufferPrivateDataSubmissionEndOffset,
+                    )
+                } {
+                    // SAFETY: same private-data pair.
+                    unsafe {
+                        retire_present_packet(
+                            adapter,
+                            submit.pDmaBufferPrivateData,
+                            submit.DmaBufferPrivateDataSize,
+                            kind,
+                            ticket,
+                        )
+                    };
+                    return;
+                }
                 // SAFETY: the attached context is the direct owner of this
                 // scheduler private-data window.
                 let disposition = unsafe {
@@ -555,7 +647,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
                     disposition,
                     crate::ddi::native_render::NativeSubmitDisposition::Pending
                 ) {
-                    let _ = super::interrupt::fail_ordered_engine_submission(adapter, ticket);
+                    retire_refused_submission(adapter, ticket);
                 }
             });
             return STATUS_SUCCESS;
@@ -600,7 +692,7 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
                         disposition,
                         crate::ddi::native_render::NativeSubmitDisposition::Revoked
                     ) {
-                        let _ = super::interrupt::fail_ordered_engine_submission(adapter, ticket);
+                        retire_refused_submission(adapter, ticket);
                     }
                     Some((disposition, ticket))
                 })
