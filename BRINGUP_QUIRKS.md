@@ -145,6 +145,18 @@ while ((ring S-value count) -eq 0) { sleep 0.4 }   # bring-up re-ran when breadc
   recv(); send '{"execute":"qmp_capabilities"}'; recv()
   send '{"execute":"system_reset"}'   # → RESET event
   ```
+  ⚠ **READ THE REPLY BEFORE CLOSING (burned 2026-09-02, twice).** A
+  `sendall(system_reset)` followed by an immediate `close()` is silently
+  dropped — the tool prints success, `LastBootUpTime` never changes, and the
+  next 5+ minutes are spent watching a boot that was never started. Always
+  `recv()` until the `RESET` event appears. And a guest can wedge on the way
+  up with ZERO host-log GPU activity for 14+ min; a second (verified)
+  `system_reset` unsticks it. Watch for boot completion by host-log LINE
+  OFFSET (`tail -n +$BASE`), never by timestamp — the log is UTC and the
+  IST day boundary has produced filters that declared a booted guest dead;
+  the completion signal is a new `helios_scanout_blob_layout … blob_size
+  4587520` line (dwm composited), not `set_scanout_blob` (the firmware blob
+  matches too early).
   (Also `query-status` to check `running` vs paused/bugcheck.) Downside: a reboot drops ntoseye
   (it 404s → the user must reconnect) and a KD-attached boot breaks repeatedly on DbgPrints
   (resume past) — so prefer the disable→enable replay above for debug loops.
