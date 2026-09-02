@@ -201,6 +201,13 @@ impl VenusClient {
         adapter: &AdapterContext,
         width: u32,
         height: u32,
+        // D7-3a: a lower bound on the blob so the park matches the desktop
+        // primary's byte size — QEMU's OPTIMAL readback rejects a scanout blob
+        // smaller than the host GPU's tiled requirement (primary 4587520 vs a
+        // tight linear park 4096000 → "OPTIMAL DMA-BUF too small" → black
+        // remote view). 0 = the natural (tight) size. The real backing caller
+        // passes 0; only the park passes a nonzero floor.
+        min_blob_size: u64,
     ) -> Result<ScanoutImageBlob, VirtioError> {
         if crate::virtio::KMD_D2_OWNER_ENABLED && !adapter.control_owner().backing_creation_open() {
             return Err(VirtioError::DeviceError);
@@ -242,7 +249,10 @@ impl VenusClient {
             b"SdgMf",
             self.memory_type_flags[memory_type_index as usize],
         );
-        let alloc_size = round_up_page(req_size.max(4096));
+        let alloc_size = round_up_page(req_size.max(4096)).max(round_up_page(min_blob_size));
+        if min_blob_size != 0 {
+            crate::diag::record_named_bytes(b"SdgParkPad", alloc_size as u32);
+        }
 
         crate::diag::record_named_bytes(b"SdgLStg", 4);
         let memory_id =

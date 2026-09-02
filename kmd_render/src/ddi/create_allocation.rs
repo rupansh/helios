@@ -1861,7 +1861,7 @@ const GDI_SURFACE_TYPE_TEXTURE: u32 = 1;
 /// than a GPU fault. But it surfaces at a DISTANT stage — as an import error, not
 /// a sizing error — which is why `BlbSzD` counts the divergence between this
 /// guess and the exact Vulkan requirement the create path later learns.
-fn linear_blob_size(pitch: u64, height: u64) -> u64 {
+pub(crate) fn linear_blob_size(pitch: u64, height: u64) -> u64 {
     let padded_rows = (height + (NV_LINEAR_ROW_ALIGN - 1)) & !(NV_LINEAR_ROW_ALIGN - 1);
     pitch
         .saturating_mul(padded_rows)
@@ -3619,7 +3619,8 @@ fn build_backing(
     match backing {
         Hwa2Backing::LinearScanoutImage { width, height } => {
             match adapter.with_venus_client(passive, |c| {
-                c.allocate_linear_scanout_image_blob(adapter, width, height)
+                // Real backing: no primary-shape floor (it is not the park).
+                c.allocate_linear_scanout_image_blob(adapter, width, height, 0)
             }) {
                 Ok(Ok(scanout)) => Ok(CreatedBacking {
                     resource_id: scanout.blob.res_id,

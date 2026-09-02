@@ -1666,9 +1666,23 @@ pub(crate) fn start(
         let expected_instance = adapter
             .with_virtio(|gpu| gpu.scanout_transport_instance())
             .map_err(|_| VirtioError::DeviceError)?;
+        // D7-3a: floor the park at the primary's linear shape so the host's
+        // OPTIMAL DMA-BUF readback accepts it (see PARK_MATCH_PRIMARY).
+        let park_floor = if crate::diag::read_config_dword(
+            crate::diag::knobs::PARK_MATCH_PRIMARY,
+            1,
+        ) != 0
+        {
+            crate::ddi::create_allocation::linear_blob_size(
+                helios_kmd_logic::cross_adapter_pitch(width) as u64,
+                height as u64,
+            )
+        } else {
+            0
+        };
         let parking = guard
             .with_venus_client(|client| {
-                client.allocate_linear_scanout_image_blob(adapter, width, height)
+                client.allocate_linear_scanout_image_blob(adapter, width, height, park_floor)
             })
             .map_err(|_| VirtioError::DeviceError)??;
         let paint = (crate::diag::read_config_dword(crate::diag::knobs::PARK_PAINT, 0)

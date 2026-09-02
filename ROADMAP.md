@@ -317,8 +317,22 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   and VANISHES (the record-with-a-call anomaly) — do not trust its absence;
   first post-boot flip often exits clean, the 2nd+ hangs (warm up before tracing
   the hang); a live zombie's thread burns 0 CPU (blocking wait, not a spin).
-- Parking image is 4096000 B; QEMU readback wants ≥ primary (4587520) — every
-  park still blanks the remote view (dormant now the loop is gone).
+- ✅ **FIXED 2026-09-02 (KMD 22.22.456.0): scanout park blanks the remote view.**
+  The park was a host LINEAR venus image sized to the tight Vulkan requirement
+  (4096000 B at 1280x800), smaller than the host GPU's OPTIMAL readback
+  requirement (4587520) — so QEMU rejected it (`OPTIMAL DMA-BUF too small`) and
+  every park showed a rejected-import black. Fix: floor the park blob at the
+  desktop primary's linear shape via the same `linear_blob_size(
+  cross_adapter_pitch(width), height)` the guest-backed primary uses (128-row
+  pad + 64 KiB slack → 4653056), knob `ParkPrimSize` (default 1; 0 = the old
+  tight park), mirrored in `SdgParkPad`. Verified on wire: 3 park scanouts at
+  `blob_size 4653056`, ZERO readback rejections; the only remaining
+  `too small fd_size=4096000` rejections are the pre-OS firmware framebuffer
+  (res 0x5, XRGB), which the KMD does not own. The park image binds at offset 0
+  (image req ≤ padded blob) and a solid-black fill is tiling-invariant, so
+  QEMU's OPTIMAL read of it is clean black. **NOTE:** this also removes the
+  `FLUSH_DEVICE_FLIP`/zombie-adjacent park rejection the D6 write-up cited at
+  line ~411; the flip-teardown park now imports too.
 - Vsync polish: waiter-visible vblank alternates ~16.5/30 ms (~40 Hz effective;
   C# D3DKMTWaitForVerticalBlankEvent probe, both timer resolutions) and the
   heartbeat has 0.2–0.5 s outages around source-ownership transitions;

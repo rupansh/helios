@@ -668,6 +668,11 @@ pub mod knobs {
     /// for 1 ms after any ring command, so an unordered import can run first
     /// ("invalid res_id" → context 1 destroyed). 0 is the A/B.
     pub const D7_IMPORT_ORDER: KnobName = KnobName::new(b"D7ImportOrder");
+    /// D7-3a (default 1): pad the scanout PARK blob to the desktop primary's
+    /// linear byte size so QEMU's OPTIMAL readback accepts it (a tight park is
+    /// smaller than the host tiled requirement → import rejected → black remote
+    /// view on every park). 0 = the old tight park, the A/B.
+    pub const PARK_MATCH_PRIMARY: KnobName = KnobName::new(b"ParkPrimSize");
     /// Also send the classic `CRTC_VSYNC` (with the applied primary address)
     /// beside the MPO vsync each retrace (default 1). The MPO INFO2 packet
     /// carries only the MPO PresentId, so a CLASSIC `SetVidPnSourceAddress`
