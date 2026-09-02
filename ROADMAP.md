@@ -93,17 +93,92 @@ wdk-build` — that is upstream's `generate-certificate` condition script
 failing (→ "Skipping Task", intended); `Build Done` earlier in the log is the
 verdict.
 
-**D5b — OPEN: the legacy BLT-model window is BLACK (no KMD present blit).** The
-same run's mid-run frame (`tri3_run.png`): desktop and taskbar composite, the
-triangle's 1280×720 window is solid black although its clear is (0.05,0.10,0.55).
-The 4-byte packet does no copy, and nothing else does: dxgkrnl gives the KMD
-src+dst and expects a GPU blit. ⛔ This falsifies the entry below ("Blt-model is
-DEAD on 26100 … DxgkDdiPresent … has NEVER fired"): it fires on every legacy
-DISCARD windowed present (`Nr2PrBlt` 2164 in one 20 s run). Options: a
-host-side copy the KMD can issue (needs a kernel Venus client or a new
-virtio-gpu primitive), or a CPU copy at K9 retirement when both allocations
-are guest-backed (the src back buffer is `misc=0x0`, not shared, and may not be
-CPU-visible). Modern flip-model apps do not take this path.
+**D5b — ✅ FIXED 2026-09-02 (KMD 22.22.454.0): the KMD now performs the
+legacy BLT present's copy itself.** Verdict on .454, clean boot: four
+`\helios_triangle` BLT runs (503/561/632/637 frames) all show the window
+rendered (blue clear, green triangle, `tmp/d5b_run3.png`), `PcIssue`=`PcDone`
+per run with zero `PcFallback`/`PcEnqFail`, dwm's `CreateDevice` count flat
+across a flip run (852 frames) and a BLT run, no dwm device loss, no zombie,
+D3 xproc reader `cc336699/ffffffff`. Mechanism (`kmd_logic::present_copy`,
+`kmd_render/src/ddi/present_copy.rs`, `virtio/venus/present_copy.rs`):
+- `DxgkDdiPresent` (PASSIVE) resolves both allocations, builds a Venus
+  stream (`vkBeginCommandBuffer` → barrier → copy → barrier → end →
+  `vkQueueSubmit`) in one of four slots and stamps the packet's private data
+  with a `HPCR` copy reference at offset 16; `SubmitCommand` attaches the K9
+  ticket; the K9 drain issues the copy on the KMD context's own `VkQueue`
+  (`vkGetDeviceQueue2` + `VkDeviceQueueTimelineInfoMESA{ringIdx 1}`) only once
+  the ticket is the head, i.e. after the app's render retired; the ticket
+  completes when the copy's own wire fence retires (a per-entry marker drained
+  in the DPC — NOT the compatibility FIFO watermark, which waits on every
+  outstanding fence and starved dwm's executor slots on .449).
+- Measured shapes: the source is the app's ordinary HWA2 image (ICD `HIM1 …
+  fmt=44 tiling=0 usage=0x13 flags=0x8`, plus DXVK's `[UNORM, SRGB]` format
+  list); its alias is an identical `VkImage` bound to the allocation's own
+  KMD-device `VkDeviceMemory`. The destination is a KMD
+  `D3DKMDT_STANDARDALLOCATION_STAGINGSURFACE` (`PcPair`=0x11035: kind 5, std 3,
+  LINEAR, pitch 5120), so the copy is `vkCmdCopyImageToBuffer` at the
+  authored pitch through a `VkBuffer` alias — an OPTIMAL alias there wrote
+  tiled rows into the linear surface (.449: the frame in sheared bands).
+- ⛔ Measured out: every fresh import of the blob into the KMD device
+  (`VkImportMemoryResourceInfoMESA`, plain or dedicated, at type 0, 1 or the
+  creator's 2) returns `VK_ERROR_INVALID_EXTERNAL_HANDLE` (`PcVkImp`); keying
+  the alias tiling on `swizzle_class` refuses everything (the UMD says LINEAR
+  on every texture). The host validation layer notes on the alias bind (export
+  handle type mismatch; memory type outside `memoryTypeBits`) are the same two
+  the ICD's own binds emit.
+- Residue: `PcAttMiss` grows ~10/run — replays of already-completed copies
+  after preemption, completed without a copy (correct). The blank frame ~4 s
+  after a BLT app exits is the scanout park (Task 3), not the copy. Counters
+  `Pc*`; breadcrumbs `PcPair`, `PcAliasWhy/Desc`, `PcVk*`.
+
+Original root cause (2026-09-02, KMD 22.22.446.0, `\helios_triangle`
+`default blt 20`, mid-run `tmp/screen_copy.png`: desktop + taskbar composite,
+the `helios-tri` 1280×720 window solid black). Two facts pinned it:
+
+1. **The UMD copy is skipped for a redirected present.** `dxgi_present_impl`
+   (`umd/src/forward/present.rs:822`) does the src→dst `CopySubresourceRegion`
+   only when `load_resource(dst_h)` succeeds. For a DWM-redirected windowed BLT
+   present DXGI passes `hDstResource == 0` (the destination is DWM's redirection
+   surface, which the UMD cannot name), so `copied=false` and the UMD does
+   nothing but flush. The `display.rs:287` comment ("the UMD has already copied
+   before pfnPresentCb") is true ONLY for an app-supplied-destination blit.
+2. **The KMD does no copy either.** `DxgkDdiPresent` DOES get both allocations —
+   run crumbs `PBflag=1` (Blt) with `PBsrcH`/`PBdstH` both nonzero — but the Blt
+   arm only writes the 4-byte ordering packet + patch refs; `retire_present_packet`
+   just bumps `Nr2PrBlt` (0→2531 in one 20 s run) and completes the K9 fence. So
+   dxgkrnl hands src+dst and expects a GPU copy into the redirection surface, and
+   nothing performs it.
+
+This falsifies the entry below ("Blt-model DEAD … DxgkDdiPresent NEVER fired"):
+it fires on every legacy DISCARD windowed present.
+
+The UMD comment at `display.rs:287` ("the UMD has already copied before
+pfnPresentCb") was true only for an app-supplied-destination blit; that arm is
+now the one that stages the copy.
+
+**D7 — OPEN: intermittent boot-time death of the KMD's Venus context (guest-blob
+import of an unknown resource id).** Seen twice in `/tmp/helios-qemu-stderr.log`,
+on two different KMDs (22.22.4xx at 20:37Z with `res_id 128`, and the .447
+boot at 23:46Z with `res_id 237`), so it predates the D5b work:
+```
+vkr: failed to import resource: invalid res_id 237
+vkr: vkAllocateMemory resulted in CS error
+vkr: ring_submit_cmd: vn_dispatch_command failed
+vkr: submit_cmd: early bail due to fatal decoder state
+vkr: destroying context 1 (helios) with a valid instance
+```
+The importing command is the KMD's `import_guest_memory` (`MemoryPNext::
+ImportResource`) for a `build_guest_backed_linear` allocation, issued on the
+KMD ring right after `resource_create_guest_blob` on the control queue. Once
+the ring is fatal (`VnRingFt=1`) every later KMD Venus allocation fails
+(`AcBackFail`), the HTS1 role-1 reply pool cannot be created
+(`HTS1 session REFUSED at pool_create … 0xc0000017`), no process gets a D3D
+device (`TsSessNew` churns hundreds per minute), dwm has no Helios device and
+the desktop is black until the next reboot. Suspect: the ring-side import
+racing the virtqueue-side create/attach of the guest blob (the ring is a
+separate host thread; nothing orders it behind the ctrl queue for this pair),
+or the resource being unref'd by a concurrent teardown before the import
+lands. Not root-caused. A QMP reset recovers it; the boot after was clean.
 
 **D6 — ✅ ROOT-CAUSED + FIXED 2026-09-02 (mesa 127729df31e + 15e70a58f29; main 748c032).**
 The churn loop was never CCD, vsync, or the KMD: once per ~2.5 s cycle dxgkrnl
