@@ -58,7 +58,17 @@ pkg-config --modversion virglrenderer
 
 The authoritative launcher is `tools/launch-helios-gtk.sh`. It defaults to the
 `qemu-helios/build-helios` binary and automatically selects its module/data
-directories. The standalone example below is a generic reference, not the
+directories. ⚠ **After changing anything under `ui/` (e.g.
+`vulkan-readback.c`, `egl-headless.c`), rebuild with a FULL `ninja -C
+build-helios`, not `ninja -C build-helios qemu-system-x86_64`.** The EGL/Vulkan
+readback code is compiled into the loadable module `ui-opengl.so`, which QEMU
+`dlopen`s at runtime; the `qemu-system-x86_64` target does not relink that
+module, so a binary that looks freshly built keeps running the OLD module. This
+cost a session 2026-09-02: a committed readback fix (`OPTIMAL DMA-BUF shape
+mismatch` equality check → `too small` `>` check) sat in the object and source
+but the shipped `ui-opengl.so` was 6 weeks stale, so every guest primary at a
+non-1280x800 resolution was rejected → black remote view. Verify with
+`strings build-helios/ui-opengl.so | grep 'OPTIMAL DMA-BUF'`. The standalone example below is a generic reference, not the
 current win11 VM definition.
 
 ```bash
