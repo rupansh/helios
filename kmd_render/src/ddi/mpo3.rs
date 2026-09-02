@@ -82,6 +82,26 @@ pub(crate) fn mpo_last_present_id() -> u64 {
     LAST_PRESENT_ID.load(Ordering::Acquire)
 }
 static LAST_PRESENT_ID: AtomicU64 = AtomicU64::new(0);
+/// 3d: layers currently bound — 0 after a PlaneCount=0 flip, 1 after an
+/// accepted/parked one-plane flip. Starts at 1 so the INFO2 report is
+/// unchanged until the first zero-plane flip.
+static PLANES_ACTIVE: AtomicU32 = AtomicU32::new(1);
+static VSYNC_ZERO_ENABLED: AtomicU32 = AtomicU32::new(1);
+static VSYNC_ZERO_COUNT: AtomicU32 = AtomicU32::new(0);
+/// 3d: PlaneCount=0 flips seen (`MpoZp`), distinct from the count-0 vsyncs
+/// they enable — a 0 in `MpoVs0` alone cannot say the branch never ran.
+static ZERO_PLANE_FLIPS: AtomicU32 = AtomicU32::new(0);
+/// INFO2 `MultiPlaneOverlayVsyncInfoCount` for this retrace. <= DIRQL.
+pub(crate) fn mpo_vsync_info_count() -> u32 {
+    if VSYNC_ZERO_ENABLED.load(Ordering::Relaxed) == 0 {
+        return 1;
+    }
+    let n = PLANES_ACTIVE.load(Ordering::Acquire);
+    if n == 0 {
+        VSYNC_ZERO_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+    n
+}
 static POST_PRESENT_HITS: AtomicU32 = AtomicU32::new(0);
 static UPDATE_REFUSALS: AtomicU32 = AtomicU32::new(0);
 static MODE_REQUESTS: AtomicU32 = AtomicU32::new(0);
@@ -365,6 +385,14 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_with_multi_plane_overl
         if explicit_unbind(passive, adapter) != STATUS_SUCCESS {
             return park_set_refusal(11);
         }
+        // 3d: the plane is off; let the INFO2 vsync say so (see MPO_VSYNC_ZERO).
+        VSYNC_ZERO_ENABLED.store(
+            (crate::diag::read_config_dword(crate::diag::knobs::MPO_VSYNC_ZERO, 1) != 0) as u32,
+            Ordering::Relaxed,
+        );
+        PLANES_ACTIVE.store(0, Ordering::Release);
+        crate::diag::record_named_bytes(b"MpoZp", ZERO_PLANE_FLIPS.fetch_add(1, Ordering::Relaxed) + 1);
+        crate::diag::record_named_bytes(b"MpoVs0", VSYNC_ZERO_COUNT.load(Ordering::Relaxed));
         return STATUS_SUCCESS;
     }
     if args.PlaneCount != 1
@@ -384,6 +412,7 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_address_with_multi_plane_overl
     // completed, and a parked flip that never retires is DEVICEREMOVED for the
     // presenter within seconds (measured .353-.356).
     LAST_PRESENT_ID.store(plane.PresentId, Ordering::Release);
+    PLANES_ACTIVE.store(1, Ordering::Release);
     let plane_flags = unsafe { plane.InputFlags.__bindgen_anon_1.Value };
     // One site per predicate: 0x06000001 was measured on the first parked DWM
     // flip (2026-08-24) and could not say WHICH of four fields tripped.

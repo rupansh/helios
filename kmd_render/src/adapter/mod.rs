@@ -21,6 +21,7 @@ use helios_kmd_logic::DisplayMode;
 
 pub(crate) mod allocation_object;
 mod kobj;
+pub(crate) use kobj::VSYNC_SKIPPED;
 mod locks;
 mod segments;
 

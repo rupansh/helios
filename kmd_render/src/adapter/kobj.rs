@@ -33,6 +33,12 @@ type ExTimerCallback = unsafe extern "system" fn(timer: ExTimer, context: PVOID)
 /// `EX_TIMER_NO_WAKE`: the WDK documents those attributes as mutually
 /// exclusive.
 const EX_TIMER_HIGH_RESOLUTION: u32 = 0x0000_0004;
+/// 3c: vsync periods the one-shot re-arm skipped because the callback ran
+/// late (`next()` advances `late/PERIOD+1` intervals). Mirrored as `VsSkip`
+/// at the PASSIVE `VsLive` site. If this tracks `VsLive`, the ~38 Hz waiter
+/// cadence is the retrace itself dropping periods, not the wait path.
+pub(crate) static VSYNC_SKIPPED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 const BOOLEAN_TRUE: u8 = 1;
 
 #[link(name = "ntoskrnl")]
@@ -447,6 +453,12 @@ impl AdapterContext {
             self.vsync_ex_timer
                 .store(ex_timer as usize, core::sync::atomic::Ordering::Release);
         }
+        // 3c: which vsync source is live. The KTIMER fallback is quantized to
+        // the system tick (15.625 ms default), which alone reproduces the
+        // measured 16/31 ms vblank bimodality; without this crumb a NULL from
+        // ExAllocateTimer was invisible. PASSIVE (AddDevice), so the registry
+        // write is legal.
+        crate::diag::record_named_bytes(b"VsTmrHr", (!ex_timer.is_null()) as u32);
     }
 }
 
@@ -486,6 +498,13 @@ unsafe fn service_vsync_tick(adapter: &AdapterContext) {
         adapter
             .vsync_deadline_100ns
             .store(deadline, Ordering::Release);
+        if previous != 0 {
+            let advanced = deadline.saturating_sub(previous)
+                / helios_kmd_logic::vsync_deadline::PERIOD_100NS;
+            if advanced > 1 {
+                VSYNC_SKIPPED.fetch_add((advanced - 1) as u32, Ordering::Relaxed);
+            }
+        }
         let due = helios_kmd_logic::vsync_deadline::relative_due(deadline, now);
         adapter.set_vsync_one_shot(due);
         // StopDevice may clear the lifecycle arm and cancel immediately before

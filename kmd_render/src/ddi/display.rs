@@ -615,6 +615,10 @@ pub unsafe extern "C" fn dxgkddi_set_vidpn_source_visibility(
             adapter.vsync_enabled.load(core::sync::atomic::Ordering::Relaxed),
         );
         crate::diag::record_named_bytes(
+            b"VsSkip",
+            crate::adapter::VSYNC_SKIPPED.load(core::sync::atomic::Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
             b"LastPA",
             adapter
                 .last_primary_address

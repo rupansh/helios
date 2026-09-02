@@ -284,7 +284,8 @@ pub(crate) unsafe fn signal_crtc_vsync_mpo3(
         let vsync = unsafe { interrupt.__bindgen_anon_1.CrtcVsyncWithMultiPlaneOverlay2.as_mut() };
         vsync.VidPnTargetId = target_id;
         vsync.PhysicalAdapterMask = 1;
-        vsync.MultiPlaneOverlayVsyncInfoCount = 1;
+        // 3d: 0 entries after a zero-plane flip (pointer stays valid).
+        vsync.MultiPlaneOverlayVsyncInfoCount = crate::ddi::mpo3::mpo_vsync_info_count();
         vsync.pMultiPlaneOverlayVsyncInfo = &mut info;
         vsync.GpuFrequency = 0;
         vsync.GpuClockCounter = 0;

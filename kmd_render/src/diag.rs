@@ -594,6 +594,12 @@ pub mod knobs {
     /// DWM's device seconds after its first present. Read at
     /// `direct_scanout::start`, so `pnputil /restart-device` applies it.
     pub const MPO_VSYNC2: KnobName = KnobName::new(b"MpoVsync2");
+    /// 3d (default 1): after a PlaneCount=0 MPO flip report the INFO2 vsync
+    /// with ZERO layer entries. dxgkrnl retires a zero-plane flip only on a
+    /// count-0 vsync; with the always-1 report its FLUSH_DEVICE_FLIP waited
+    /// ~0.41 s per teardown. 0 = the always-1 A/B. Read live at each
+    /// zero-plane flip, so the arm flips without a reboot.
+    pub const MPO_VSYNC_ZERO: KnobName = KnobName::new(b"MpoVsyncZero");
     /// Diagnostic: fill the D2 parking image with this byte instead of zeroing
     /// it, and flush the parking bind so the host reads it. Default 0 = zeroed
     /// and unflushed, the shipping behaviour. Nonzero turns parking into an
