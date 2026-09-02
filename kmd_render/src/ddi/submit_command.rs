@@ -397,29 +397,50 @@ fn note_and_maybe_signal(
     SubmitAck::Accepted
 }
 
-/// A Present packet on an outer context carries no work: a BLT's copy was made
-/// by the UMD before `pfnPresentCb`, a DMA flip is armed here. Its fence retires
+/// A Present packet on an outer context: a DMA flip is armed here; a BLT with
+/// a prepared D5b copy hands its ticket to `present_copy` and completes on the
+/// copy's wire fence; anything else is an ordering marker whose fence retires
 /// in K9 order behind the renders admitted before it. DISPATCH_LEVEL.
 ///
 /// # Safety
-/// `private` points to `total` bytes of this submission's private data.
+/// `private` points to `total` bytes of this submission's private data;
+/// `start`/`end` are the submission window (0,0 = whole buffer).
 unsafe fn retire_present_packet(
     adapter: &AdapterContext,
     private: *mut c_void,
     total: u32,
+    start: u32,
+    end: u32,
     kind: crate::ddi::present_packet::PresentDmaKind,
     ticket: crate::adapter::OrderedEngineTicket,
+    resubmission: bool,
 ) {
     use crate::ddi::present_packet::PresentDmaKind;
     match kind {
-        PresentDmaKind::Blt => PRESENT_PACKETS_BLT.fetch_add(1, Ordering::Relaxed),
+        PresentDmaKind::Blt => {
+            PRESENT_PACKETS_BLT.fetch_add(1, Ordering::Relaxed);
+            if let Some((slot, serial)) = unsafe {
+                crate::ddi::present_packet::PresentCopyRef::peek(private, total, start, end)
+            } {
+                if crate::ddi::present_copy::attach(adapter, slot, serial, ticket, resubmission)
+                    == crate::ddi::present_copy::Attach::Deferred
+                {
+                    super::interrupt::kick_present_copies(adapter);
+                    return;
+                }
+            }
+        }
         PresentDmaKind::Flip => {
             unsafe { arm_dma_flip(adapter, private, total) };
-            PRESENT_PACKETS_FLIP.fetch_add(1, Ordering::Relaxed)
+            PRESENT_PACKETS_FLIP.fetch_add(1, Ordering::Relaxed);
         }
-        PresentDmaKind::Mpo => PRESENT_PACKETS_MPO.fetch_add(1, Ordering::Relaxed),
-        PresentDmaKind::Other => PRESENT_PACKETS_OTHER.fetch_add(1, Ordering::Relaxed),
-    };
+        PresentDmaKind::Mpo => {
+            PRESENT_PACKETS_MPO.fetch_add(1, Ordering::Relaxed);
+        }
+        PresentDmaKind::Other => {
+            PRESENT_PACKETS_OTHER.fetch_add(1, Ordering::Relaxed);
+        }
+    }
     let _ = super::interrupt::complete_ordered_engine_submission(adapter, ticket);
 }
 
@@ -530,8 +551,11 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
                             adapter,
                             submit.pDmaBufferPrivateData,
                             submit.DmaBufferPrivateDataSize,
+                            0,
+                            0,
                             kind,
                             ticket,
+                            false,
                         )
                     };
                     return;
@@ -630,8 +654,11 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
                             adapter,
                             submit.pDmaBufferPrivateData,
                             submit.DmaBufferPrivateDataSize,
+                            submit.DmaBufferPrivateDataSubmissionStartOffset,
+                            submit.DmaBufferPrivateDataSubmissionEndOffset,
                             kind,
                             ticket,
+                            (submit.Flags.__bindgen_anon_1.Value & (1 << 7)) != 0,
                         )
                     };
                     return;

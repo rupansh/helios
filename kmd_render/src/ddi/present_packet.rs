@@ -330,7 +330,7 @@ pub(crate) struct MpoPresentPacketPlan {
 }
 
 const MPO_MAX_PLANES: u32 = 1;
-const MPO_PRIVATE_BYTES: usize = PRESENT_DMA_HEADER_BYTES;
+const MPO_PRIVATE_BYTES: usize = PRESENT_DMA_HEADER_BYTES + PRESENT_COPY_REF_BYTES;
 const MPO_PATCH_REFERENCES: usize = 0;
 const MPO_PRESENT_RESERVED_FLAGS: u32 = 0xFFFF_C000;
 const SHARED_PRIMARY_STANDARD_ALLOCATION_TYPE: u32 = 1;
@@ -535,9 +535,14 @@ impl MpoPresentPacketPlan {
 
 pub(crate) use helios_kmd_logic::present_dma_header::{PresentDmaKind, PRESENT_DMA_HEADER_BYTES};
 
+use helios_kmd_logic::present_copy::{
+    COPY_REF_BYTES as PRESENT_COPY_REF_BYTES, COPY_REF_OFFSET as PRESENT_COPY_REF_OFFSET,
+};
+
 /// Offset-0 header on every packet this DDI emits, so SubmitCommand can tell
 /// a Present packet from the HOB1 render record at the same offset on the same
-/// outer context (`helios_kmd_logic::present_dma_header`, ROADMAP D5).
+/// outer context (`helios_kmd_logic::present_dma_header`, ROADMAP D5). The
+/// D5b copy reference follows it at offset 16, written (or zeroed) every time.
 pub(crate) struct PresentDmaHeader;
 
 impl PresentDmaHeader {
@@ -549,17 +554,36 @@ impl PresentDmaHeader {
         private_size: u32,
         kind: PresentDmaKind,
     ) -> Result<(), NTSTATUS> {
-        if private_data.is_null() || (private_size as usize) < PRESENT_DMA_HEADER_BYTES {
+        unsafe { Self::write_with_copy(private_data, private_size, kind, None) }
+    }
+
+    /// # Safety
+    /// As [`Self::write`].
+    pub(crate) unsafe fn write_with_copy(
+        private_data: *mut c_void,
+        private_size: u32,
+        kind: PresentDmaKind,
+        copy: Option<(u32, u32)>,
+    ) -> Result<(), NTSTATUS> {
+        if private_data.is_null()
+            || (private_size as usize) < PRESENT_COPY_REF_OFFSET + PRESENT_COPY_REF_BYTES
+        {
             return Err(STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER);
         }
         let bytes = helios_kmd_logic::present_dma_header::encode(kind);
-        // SAFETY: size-checked above; byte copy, so alignment is irrelevant.
+        let copy_ref = helios_kmd_logic::present_copy::encode_copy_ref(copy);
+        // SAFETY: size-checked above; byte copies, so alignment is irrelevant.
         unsafe {
             core::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
                 private_data.cast::<u8>(),
                 PRESENT_DMA_HEADER_BYTES,
-            )
+            );
+            core::ptr::copy_nonoverlapping(
+                copy_ref.as_ptr(),
+                private_data.cast::<u8>().add(PRESENT_COPY_REF_OFFSET),
+                PRESENT_COPY_REF_BYTES,
+            );
         };
         Ok(())
     }
@@ -603,6 +627,50 @@ impl PresentDmaHeader {
 
 const _: () = assert!(PRESENT_DMA_HEADER_BYTES <= PRESENT_FLIP_PRIVATE_OFFSET);
 const _: () = assert!(PRESENT_DMA_HEADER_BYTES <= PRESENT_DMA_PRIVATE_DATA_BYTES as usize);
+const _: () = assert!(PRESENT_DMA_HEADER_BYTES <= PRESENT_COPY_REF_OFFSET);
+const _: () = assert!(PRESENT_COPY_REF_OFFSET + PRESENT_COPY_REF_BYTES <= PRESENT_FLIP_PRIVATE_OFFSET);
+
+/// The D5b copy reference a Blt packet carries at offset 16 of its private
+/// data: which prepared slot, and the serial that proves it is still that copy.
+pub(crate) struct PresentCopyRef;
+
+impl PresentCopyRef {
+    /// Read (never consume) the reference inside a submission's private window,
+    /// with the same windowing as [`PresentDmaHeader::peek`].
+    ///
+    /// # Safety
+    /// `base` points to `total` readable bytes of a live submission's private
+    /// data.
+    pub(crate) unsafe fn peek(
+        base: *const c_void,
+        total: u32,
+        start: u32,
+        end: u32,
+    ) -> Option<(u32, u32)> {
+        if base.is_null() {
+            return None;
+        }
+        let (total, mut start, mut end) = (total as usize, start as usize, end as usize);
+        if end <= start {
+            start = 0;
+            end = total;
+        }
+        if start > end || end > total || end - start < PRESENT_COPY_REF_OFFSET + PRESENT_COPY_REF_BYTES
+        {
+            return None;
+        }
+        let mut raw = [0u8; PRESENT_COPY_REF_BYTES];
+        // SAFETY: the window was bounds-checked against `total` just above.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                base.cast::<u8>().add(start + PRESENT_COPY_REF_OFFSET),
+                raw.as_mut_ptr(),
+                PRESENT_COPY_REF_BYTES,
+            )
+        };
+        helios_kmd_logic::present_copy::decode_copy_ref(&raw)
+    }
+}
 
 /// The fixed present allocation array, as a value only [`PresentPayload::decode`]
 /// can produce.

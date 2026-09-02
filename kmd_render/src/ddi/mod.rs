@@ -25,6 +25,7 @@ mod local_segment;
 pub(crate) mod mpo3;
 pub(crate) mod native_fence;
 pub(crate) mod native_render;
+pub(crate) mod present_copy;
 pub(crate) mod present_packet;
 pub(crate) mod query_adapter_info;
 mod scheduler;

@@ -248,7 +248,7 @@ pub(super) trait EncodedStream {
     fn as_slice(&self) -> Result<&[u8], VirtioError>;
 }
 
-impl EncodedStream for Writer {
+impl<const N: usize> EncodedStream for helios_kmd_logic::StreamWriter<N> {
     fn as_slice(&self) -> Result<&[u8], VirtioError> {
         match self.finished() {
             Some(bytes) => Ok(bytes),

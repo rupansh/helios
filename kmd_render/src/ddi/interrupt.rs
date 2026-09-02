@@ -67,6 +67,41 @@ fn drain_ordered_engine_locked(
     };
     let mut delivered = 0u32;
     loop {
+        delivered = delivered.saturating_add(drain_ready_heads(adapter, guard, dxgkrnl));
+        // D5b: a submitted present copy whose ticket just became the head is
+        // issued now, after every earlier ticket retired. `true` means it was
+        // completed synchronously (terminal or refused) and the head is ready.
+        if !crate::ddi::present_copy::issue_at_head(adapter, guard) {
+            break;
+        }
+    }
+    // Publish the delivered edge while the same notification guard still
+    // excludes reset invalidation. Reset can therefore either clear this old
+    // generation's edge or run wholly before it; an old DPC cannot republish a
+    // native-fence rescan after the successor engine has opened.
+    guard.note_ordered_engine_native_rescan(delivered);
+    OrderedDrain { delivered }
+}
+
+/// SubmitCommand attached a copy to a ticket that may already be the K9 head
+/// (an idle engine): run the issue hook without waiting for the next DPC.
+pub(crate) fn kick_present_copies(adapter: &AdapterContext) {
+    let delivered = adapter
+        .with_wddm_notify_lock(|guard| drain_ordered_engine_locked(adapter, guard))
+        .delivered;
+    if delivered != 0 {
+        request_wddm_completion_dpc(adapter);
+    }
+}
+
+/// Report every contiguous host-terminal K9 entry; returns how many.
+fn drain_ready_heads(
+    _adapter: &AdapterContext,
+    guard: &WddmNotifyGuard<'_>,
+    dxgkrnl: &crate::dxgk::DXGKRNL_INTERFACE,
+) -> u32 {
+    let mut delivered = 0u32;
+    loop {
         let Some(ready) = guard.ordered_engine_ready() else {
             break;
         };
@@ -102,12 +137,7 @@ fn drain_ordered_engine_locked(
         }
         delivered = delivered.saturating_add(1);
     }
-    // Publish the delivered edge while the same notification guard still
-    // excludes reset invalidation. Reset can therefore either clear this old
-    // generation's edge or run wholly before it; an old DPC cannot republish a
-    // native-fence rescan after the successor engine has opened.
-    guard.note_ordered_engine_native_rescan(delivered);
-    OrderedDrain { delivered }
+    delivered
 }
 
 /// Retry the K7 empty-array native-fence rescan only downstream of a
@@ -229,6 +259,16 @@ pub(crate) fn drain_used_and_complete(adapter: &AdapterContext) {
             let _ =
                 guard.with_virtio(|order, transport| transport.requeue_wddm_front(order, ready));
             break;
+        }
+
+        // D5b: present copies whose wire fence retired complete their exact
+        // K9 ticket here, in the same notify scope as every other retirement.
+        let mut fences = [0u64; crate::virtio::gpu::PRESENT_COPY_TERMINALS];
+        let count = guard
+            .with_virtio(|_, transport| transport.take_present_copy_terminals(&mut fences))
+            .unwrap_or(0);
+        for fence in &fences[..count] {
+            crate::ddi::present_copy::on_copy_complete(adapter, guard, *fence);
         }
 
         let _ = drain_ordered_engine_locked(adapter, guard);

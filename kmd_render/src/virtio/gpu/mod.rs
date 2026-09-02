@@ -215,6 +215,13 @@ pub(crate) enum NativeSubmitDomain {
     Decoder,
 }
 
+/// D5b present-copy terminal fences the DPC can hold between drains.
+pub const PRESENT_COPY_TERMINALS: usize = 16;
+/// Completed present copies whose terminal could not be queued (list full);
+/// their present ticket then retires only via the slot reclaim path.
+pub static PRESENT_COPY_TERMINAL_LEAKS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 /// Parked (completed, awaiting PASSIVE free) entry capacity. Enqueues are
 /// refused once `parked` crosses [`PARKED_ENQUEUE_GATE`], and one drain can
 /// park at most `MAX_INFLIGHT` entries, so this bound is never exceeded.
@@ -1247,6 +1254,9 @@ enum InFlightKind {
         fence_id: u64,
         ring_idx: u8,
         native_completion: Option<crate::ddi::native_render::NativeHostCompletion>,
+        /// D5b: a KMD present copy. Its fence id is queued for the DPC on
+        /// completion (or transport failure) so the exact K9 ticket retires.
+        present_copy: bool,
     },
 }
 
@@ -1721,6 +1731,9 @@ pub struct VirtioGpu {
     /// only after that lock is released. Both vectors reserve MAX_INFLIGHT at
     /// init, so used-ring and reset paths never allocate.
     native_terminals: Vec<crate::ddi::native_render::NativeHostTerminal>,
+    /// D5b: wire fences of completed present copies, awaiting the DPC's K9
+    /// retirement. Preallocated; a full list is counted, never grown at DPC.
+    present_copy_terminals: Vec<u64>,
     native_terminals_spare: Vec<crate::ddi::native_render::NativeHostTerminal>,
     native_terminal_drain_in_progress: bool,
     /// PASSIVE-reaped DMA buffers ready for another command. Accessed under the
@@ -2032,6 +2045,7 @@ impl VirtioGpu {
             reap_buffers_spare: Vec::with_capacity(2 * MAX_PARKED),
             reap_in_progress: false,
             native_terminals: Vec::with_capacity(MAX_INFLIGHT),
+            present_copy_terminals: Vec::with_capacity(PRESENT_COPY_TERMINALS),
             native_terminals_spare: Vec::with_capacity(MAX_INFLIGHT),
             native_terminal_drain_in_progress: false,
             dma_pool: Vec::with_capacity(MAX_DMA_POOL),
@@ -2447,6 +2461,68 @@ impl VirtioGpu {
         self.enqueue_submit_inner(ctx_id, ring_idx, meta, venus, venus_len, Some(completion))
     }
 
+    /// D5b: one KMD-owned present copy on the KMD context's GPU-completion
+    /// ring. Its fence id is handed to the DPC when the host retires it
+    /// (`take_present_copy_terminals`), which is when its exact K9 ticket
+    /// completes — not the whole-transport watermark the compatibility FIFO
+    /// waits on, which made every present wait for everyone's GPU work.
+    pub(crate) fn enqueue_kmd_copy(
+        &mut self,
+        ctx_id: u32,
+        ring_idx: u32,
+        meta: DmaBuffer,
+        venus: DmaBuffer,
+        venus_len: usize,
+    ) -> Result<u64, (DmaBuffer, DmaBuffer, VirtioError)> {
+        if ctx_id == 0 || ring_idx == 0 {
+            return Err((meta, venus, VirtioError::DeviceError));
+        }
+        let fence = self
+            .enqueue_submit_inner(ctx_id, ring_idx, meta, venus, venus_len, None)
+            .map_err(|(meta, venus, _, error)| (meta, venus, error))?;
+        for entry in self.inflight.iter_mut() {
+            if let InFlightKind::AsyncVenus {
+                fence_id,
+                present_copy,
+                ..
+            } = &mut entry.kind
+            {
+                if *fence_id == fence {
+                    *present_copy = true;
+                }
+            }
+        }
+        Ok(fence)
+    }
+
+    fn note_present_copy_terminal(&mut self, fence_id: u64, adapter: &crate::adapter::AdapterContext) {
+        if self.present_copy_terminals.len() < self.present_copy_terminals.capacity() {
+            self.present_copy_terminals.push(fence_id);
+            crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+        } else {
+            PRESENT_COPY_TERMINAL_LEAKS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Move the completed present-copy fences out for K9 retirement. Called
+    /// under the WDDM notify lock; no allocation.
+    pub(crate) fn take_present_copy_terminals(
+        &mut self,
+        out: &mut [u64; PRESENT_COPY_TERMINALS],
+    ) -> usize {
+        let n = self.present_copy_terminals.len().min(out.len());
+        out[..n].copy_from_slice(&self.present_copy_terminals[..n]);
+        self.present_copy_terminals.clear();
+        n
+    }
+
+    /// Whether the async submission carrying `fence_id` is still in flight.
+    pub(crate) fn async_fence_inflight(&self, fence_id: u64) -> bool {
+        self.inflight.iter().any(|entry| {
+            matches!(entry.kind, InFlightKind::AsyncVenus { fence_id: f, .. } if f == fence_id)
+        })
+    }
+
     /// Shared body for ordinary and native Venus submissions.
     fn enqueue_submit_inner(
         &mut self,
@@ -2551,6 +2627,7 @@ impl VirtioGpu {
                 fence_id,
                 ring_idx: ring,
                 native_completion: native_completion.take(),
+                present_copy: false,
             },
             meta,
             chain,
@@ -2598,7 +2675,20 @@ impl VirtioGpu {
                         }
                     }
                 }
-                InFlightKind::AsyncVenus { .. } => {}
+                InFlightKind::AsyncVenus {
+                    fence_id,
+                    present_copy,
+                    ..
+                } => {
+                    // A failed transport still retires the present's ticket
+                    // (without its copy) rather than leaving the K9 head hung.
+                    if present_copy
+                        && self.present_copy_terminals.len()
+                            < self.present_copy_terminals.capacity()
+                    {
+                        self.present_copy_terminals.push(fence_id);
+                    }
+                }
             }
             // Park, never free: the host may still be DMAing into these buffers,
             // and DmaBuffer frees are PASSIVE-only. Same policy as the success
@@ -2717,13 +2807,17 @@ impl VirtioGpu {
                     }
                 }
                 InFlightKind::AsyncVenus {
-                    fence_id: _,
+                    fence_id,
                     ring_idx,
                     native_completion: _,
+                    present_copy,
                 } => {
                     ASYNC_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
                     if ring_idx != 0 {
                         RING_COMPLETE_COUNT.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if present_copy {
+                        self.note_present_copy_terminal(fence_id, adapter);
                     }
                     let response_ok = written_length as usize == size_of::<VirtioGpuCtrlHdr>()
                         && response_type == Some(VIRTIO_GPU_RESP_OK_NODATA);

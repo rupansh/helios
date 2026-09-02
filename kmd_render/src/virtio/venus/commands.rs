@@ -343,7 +343,9 @@ impl VenusClient {
                 tiling: IMAGE_TILING_LINEAR,
                 usage: IMAGE_USAGE_TRANSFER_SRC | IMAGE_USAGE_TRANSFER_DST,
                 initial_layout: IMAGE_LAYOUT_PREINITIALIZED,
-            },
+                            view_format_count: 0,
+                view_formats: [0; 2],
+},
         );
         // The raw VkResult of the LINEAR external-DMA_BUF image create is the
         // most likely NVIDIA-venus rejection point for the CachyOS shape, which
@@ -417,7 +419,9 @@ impl VenusClient {
                 tiling: IMAGE_TILING_OPTIMAL,
                 usage,
                 initial_layout: IMAGE_LAYOUT_UNDEFINED,
-            },
+                            view_format_count: 0,
+                view_formats: [0; 2],
+},
         );
         let mut r = self.ring_command_expect(
             adapter,

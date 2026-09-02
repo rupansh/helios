@@ -240,6 +240,12 @@ impl WddmNotifyGuard<'_> {
         self.ordered_engine_mut().peek_ready()
     }
 
+    /// The K9 head while it still awaits its host terminal (D5b: the present
+    /// copy may be issued only once every earlier ticket has retired).
+    pub(crate) fn ordered_engine_head_awaiting_host(&self) -> Option<OrderedEngineTicket> {
+        self.ordered_engine_mut().head_awaiting_host()
+    }
+
     pub(crate) fn retire_ordered_engine_ready(&self, ready: OrderedEngineReady) -> bool {
         match self.ordered_engine_mut().retire_ready(ready) {
             Ok(_) => {

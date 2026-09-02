@@ -209,10 +209,12 @@ pub unsafe extern "C" fn dxgkddi_present(
 }
 
 unsafe fn dxgkddi_present_inner(
-    _h_context: IN_CONST_HANDLE,
+    h_context: IN_CONST_HANDLE,
     present: INOUT_PDXGKARG_PRESENT,
 ) -> NTSTATUS {
     PRESENT_COUNT.fetch_add(1, Ordering::Relaxed);
+    // D5b: the prepared copy slot a Blt packet names, if any.
+    let mut copy_ref: Option<(u32, u32)> = None;
     if present.is_null() {
         PRESENT_LAST_STATUS.store(STATUS_INVALID_PARAMETER as u32, Ordering::Relaxed);
         return STATUS_INVALID_PARAMETER;
@@ -284,12 +286,12 @@ unsafe fn dxgkddi_present_inner(
             crate::diag::record_named_bytes(b"PBdstH", (dst_handle as usize as u32) & 0xFFFF);
         }
 
-        // DXGK_PRESENTFLAGS.Blt is bit 0. The UMD has already executed the
-        // source-to-destination copy and flushed its exact direct translator
-        // context before invoking pfnPresentCb. KMD contributes only the
-        // ordinary allocation references and K9-ordered DMA boundary; it does
-        // not reconstruct either allocation from a renderer resource id or
-        // submit a second private Venus copy.
+        // DXGK_PRESENTFLAGS.Blt is bit 0. For a DWM-redirected windowed present
+        // the UMD never saw the destination (`hDstResource == 0`) and copied
+        // nothing; dxgkrnl hands src+dst here and expects the GPU copy (D5b).
+        // `prepare` stages it; the packet carries the slot, and the K9 ticket
+        // completes on the copy's own wire fence. A refusal is counted and the
+        // packet stays the ordering marker it was.
         if present_flags & 1 != 0 {
             let bytes = PRESENT_DMA_PACKET_BYTES as UINT;
             if args.pDmaBuffer.is_null() || args.DmaSize < bytes {
@@ -298,6 +300,20 @@ unsafe fn dxgkddi_present_inner(
                     Ordering::Relaxed,
                 );
                 return STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER;
+            }
+            if present_flags & (1 << 2) == 0 {
+                match (
+                    present_allocations.source(),
+                    present_allocations.destination(),
+                    unsafe { crate::device::ContextHandleRef::from_raw(h_context) }
+                        .and_then(|context| context.adapter()),
+                ) {
+                    (Some(src), Some(dst), Some(adapter)) => {
+                        copy_ref = unsafe { crate::ddi::present_copy::prepare(adapter, args, src, dst) };
+                    }
+                    (Some(_), Some(_), None) => crate::ddi::present_copy::note_no_adapter(),
+                    _ => crate::ddi::present_copy::note_no_pair(),
+                }
             }
         }
     }
@@ -408,10 +424,11 @@ unsafe fn dxgkddi_present_inner(
             crate::ddi::present_packet::PresentDmaKind::Other
         };
         if let Err(status) = unsafe {
-            crate::ddi::present_packet::PresentDmaHeader::write(
+            crate::ddi::present_packet::PresentDmaHeader::write_with_copy(
                 args.pDmaBufferPrivateData,
                 args.DmaBufferPrivateDataSize,
                 kind,
+                copy_ref,
             )
         } {
             PRESENT_LAST_STATUS.store(status as u32, Ordering::Relaxed);

@@ -49,6 +49,7 @@ use crate::irql::PassiveLevel;
 
 mod bringup;
 mod commands;
+mod present_copy;
 mod protocol;
 mod ring;
 mod scanout;
@@ -112,6 +113,22 @@ vk_handle!(
 vk_handle!(
     /// `VkDevice`.
     VkDeviceId
+);
+vk_handle!(
+    /// `VkQueue` — the KMD context's one render queue (D5b present copy).
+    VkQueueId
+);
+vk_handle!(
+    /// `VkCommandPool` for the present-copy command buffers.
+    VkCommandPoolId
+);
+vk_handle!(
+    /// `VkCommandBuffer`, one per present-copy slot.
+    VkCommandBufferId
+);
+vk_handle!(
+    /// `VkBuffer` — the present copy's alias over a pitched standard surface.
+    VkBufferId
 );
 
 /// The result of [`allocate_host_visible_blob`]: a venus-backed, BAR-visible,
@@ -202,6 +219,9 @@ pub struct VenusClient {
     /// by the transport's blob table and teardown removes an id only after the
     /// corresponding Venus free command has been accepted.
     owned_memory_blobs: Vec<VkDeviceMemoryId>,
+    /// D5b render queue + command pool + per-slot command buffers, created on
+    /// the first BLT present rather than at bring-up (StartDevice's stack).
+    present_copy: Option<present_copy::PresentCopyObjects>,
 }
 
 impl VenusClient {

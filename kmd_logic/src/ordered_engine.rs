@@ -316,6 +316,19 @@ impl<const N: usize> OrderedEngine<N> {
         FailureDisposition::Poisoned
     }
 
+    /// The head ticket while it still awaits its host terminal — every earlier
+    /// entry has retired, so a producer whose work must run AFTER them (the
+    /// D5b present copy reads what the app's earlier renders wrote) may now
+    /// submit on this ticket's behalf. `None` if the head is already
+    /// host-complete, the engine is empty, or it is closed.
+    pub fn head_awaiting_host(&self) -> Option<SubmissionTicket> {
+        if !self.is_open() || self.len == 0 {
+            return None;
+        }
+        let slot = self.slots[self.head];
+        matches!(slot.state, SlotState::AwaitingHost).then(|| slot.ticket(self.head))
+    }
+
     pub fn peek_ready(&self) -> Option<ReadySubmission> {
         if !self.is_open() || self.len == 0 {
             return None;
@@ -454,6 +467,41 @@ mod tests {
         let mut engine = OrderedEngine::new();
         assert!(engine.reopen(0));
         engine
+    }
+
+    #[test]
+    fn head_awaiting_host_names_only_an_unfinished_head() {
+        let mut engine = open::<4>();
+        assert_eq!(engine.head_awaiting_host(), None, "empty");
+        let first = engine.admit(1).unwrap();
+        let second = engine.admit(2).unwrap();
+        assert_eq!(engine.head_awaiting_host(), Some(first));
+        // A later entry completing early does not move the head.
+        assert!(matches!(
+            engine.mark_host_completed(second),
+            CompletionDisposition::Marked {
+                retained_early: true
+            }
+        ));
+        assert_eq!(engine.head_awaiting_host(), Some(first));
+        // Once the head is host-complete it is ready, not awaiting.
+        assert!(matches!(
+            engine.mark_host_completed(first),
+            CompletionDisposition::Marked {
+                retained_early: false
+            }
+        ));
+        assert_eq!(engine.head_awaiting_host(), None);
+        let ready = engine.peek_ready().unwrap();
+        assert_eq!(engine.retire_ready(ready), Ok(1));
+        // The second entry is already complete: still not "awaiting".
+        assert_eq!(engine.head_awaiting_host(), None);
+        let ready = engine.peek_ready().unwrap();
+        assert_eq!(engine.retire_ready(ready), Ok(2));
+        let third = engine.admit(3).unwrap();
+        assert_eq!(engine.head_awaiting_host(), Some(third));
+        assert!(engine.invalidate().epoch_advanced);
+        assert_eq!(engine.head_awaiting_host(), None, "closed after invalidate");
     }
 
     #[test]

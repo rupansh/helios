@@ -65,7 +65,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ffi::c_void;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use bytemuck::bytes_of;
 use helios_protocol::{
@@ -206,6 +206,11 @@ struct AllocationContext {
     /// kernel-created Venus `VkImage`. As above, enabled teardown authority is
     /// held only by the canonical resource row.
     venus_image_id: u64,
+    /// D5b: the KMD-device `VkImage` alias the present copy reads this
+    /// allocation through (0 = none yet; [`PRESENT_ALIAS_REFUSED`] = never
+    /// retry). Created under the venus mutex, destroyed in
+    /// `destroy_allocation_ctx` before the backing goes.
+    present_alias_image: AtomicU64,
     /// How many times this allocation's `resource_id` was substituted into a
     /// generated `VkImportMemoryResourceInfoMESA` operand — i.e. how many times
     /// a host `VkDeviceMemory` was bound to THIS blob. Zero on an allocation
@@ -2326,6 +2331,47 @@ pub(crate) unsafe fn open_direct_scanout_allocation_facts(
     Some((allocation, facts))
 }
 
+/// `present_alias_image` value meaning "the alias was refused; do not retry".
+pub(crate) const PRESENT_ALIAS_REFUSED: u64 = u64::MAX;
+
+/// What the D5b present copy needs from one open allocation.
+pub(crate) struct PresentCopyAllocation {
+    pub hwa2: HeliosWddmAllocationDescV2,
+    /// The KMD-device `VkDeviceMemory` behind the blob (the ICD imports the
+    /// same blob into its own device).
+    pub venus_memory_id: u64,
+    /// Nonzero for a KMD-owned image (the GDI-surface redirection target).
+    pub venus_image_id: u64,
+    pub venus_alloc_size: u64,
+    pub alias: &'static AtomicU64,
+}
+
+/// Resolve a present allocation-list handle to its copy facts.
+///
+/// # Safety
+/// `h` is an `hDeviceSpecificAllocation` from a live `DXGKARG_PRESENT` list.
+pub(crate) unsafe fn present_copy_allocation(h: HANDLE) -> Option<PresentCopyAllocation> {
+    let open = unsafe { open_allocation_context(h) }?;
+    if open.allocation == 0 {
+        return None;
+    }
+    let ctx = unsafe { resolve_alloc(open.allocation as HANDLE) }?;
+    let hwa2 = ctx.final_hwa2?;
+    if hwa2.allocation_generation != ctx.generation {
+        return None;
+    }
+    if ctx.resource_id.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    Some(PresentCopyAllocation {
+        hwa2,
+        venus_memory_id: ctx.venus_memory_id,
+        venus_image_id: ctx.venus_image_id,
+        venus_alloc_size: ctx.venus_alloc_size,
+        alias: &ctx.present_alias_image,
+    })
+}
+
 /// Geometry `DxgkDdiDescribeAllocation` reports, from a magic-checked handle.
 pub(crate) struct DescribeInfo {
     pub width: u32,
@@ -2807,6 +2853,22 @@ unsafe fn destroy_allocation_ctx(
     seq: u32,
 ) {
     sample_hvm1_backing(&ctx);
+    // D5b alias first: dxgkrnl retires every present DMA buffer referencing
+    // this allocation before DestroyAllocation, so no copy still reads it.
+    let alias = ctx.present_alias_image.load(Ordering::Acquire);
+    if alias != 0 && alias != PRESENT_ALIAS_REFUSED {
+        use helios_kmd_logic::present_copy::{target_class, TargetClass};
+        let linear = ctx.final_hwa2.as_ref().is_some_and(|desc| {
+            matches!(target_class(desc), Ok(TargetClass::LinearBuffer { .. }))
+        });
+        let _ = adapter.with_venus_client(passive, |c| {
+            if linear {
+                c.destroy_present_alias_buffer(adapter, alias)
+            } else {
+                c.destroy_image(adapter, alias)
+            }
+        });
+    }
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
     // Retire the exact Windows/KMD allocation identity before any backing
     // resource or Venus image can be torn down. Ambiguous plane retirement
@@ -4766,6 +4828,7 @@ unsafe fn create_one(
         final_hwa2: admitted.final_hwa2,
         venus_memory_id: backing.map_or(0, |b| b.venus_memory_id),
         venus_image_id: backing.map_or(0, |b| b.venus_image_id),
+        present_alias_image: AtomicU64::new(0),
         import_operand_substitutions: AtomicU32::new(0),
         size: admitted.vidmm_size,
         width: admitted.width,

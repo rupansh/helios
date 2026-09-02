@@ -392,6 +392,7 @@ impl VenusInstance {
             memory_type_flags,
             memory_type_count,
             owned_memory_blobs: Vec::with_capacity(MAX_OWNED_MEMORY_BLOBS),
+            present_copy: None,
         })
     }
 

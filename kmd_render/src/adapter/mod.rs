@@ -406,6 +406,8 @@ pub struct AdapterContext {
     /// already own an exact host-terminal fence before retiring the scheduler
     /// or transport epoch.
     pub(crate) k11_completion: crate::ddi::session_transport::K11CompletionRundown,
+    /// D5b present-copy slots: prepared at Present, issued at the K9 head.
+    pub(crate) present_copy: crate::ddi::present_copy::PresentCopyRuntime,
     /// Last one-engine scheduler frontier reported to dxgkrnl.
     last_completed_fence: AtomicU32,
     /// Serializes K9 frontier admission/retirement, DMA_COMPLETED notification,
@@ -699,6 +701,7 @@ impl AdapterContext {
             direct_scanout: crate::ddi::direct_scanout::DirectScanoutRuntime::new(),
             native_fence: Arc::new(crate::ddi::native_fence::NativeFenceAdapterState::new()),
             k11_completion: crate::ddi::session_transport::K11CompletionRundown::new(),
+            present_copy: crate::ddi::present_copy::PresentCopyRuntime::new(),
             last_completed_fence: AtomicU32::new(0),
             wddm_notify_lock: UnsafeCell::new(0),
             ordered_engine: UnsafeCell::new(locks::allocate_ordered_engine_frontier()),

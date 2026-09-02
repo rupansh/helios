@@ -36,6 +36,7 @@ pub mod direct_scanout_admission;
 pub mod direct_scanout_lifetime;
 pub mod display_backing_lifetime;
 pub mod ordered_engine;
+pub mod present_copy;
 pub mod present_dma_header;
 pub mod outer_execution;
 pub mod umd_private_query;
@@ -493,27 +494,36 @@ pub const MAX_CMD_BYTES: usize = 512;
 /// / handle / array_size are 8 bytes, and `u32` / `VkResult` / `VkStructureType`
 /// / `VkFlags` / `VkCommandTypeEXT` are 4 bytes.
 ///
-/// Overflow is **sticky and non-panicking**: a write that would exceed
-/// [`MAX_CMD_BYTES`] is dropped, the writer is poisoned, and [`Writer::finished`]
-/// returns `None` forever after. The caller turns that into a refusal with a
-/// named counter. Every write method is infallible so the ~40 encoder bodies
-/// stay linear; the single fallible point is where the bytes are handed out.
-pub struct Writer {
-    buf: [u8; MAX_CMD_BYTES],
+/// Overflow is **sticky and non-panicking**: a write that would exceed the
+/// capacity `N` is dropped, the writer is poisoned, and
+/// [`StreamWriter::finished`] returns `None` forever after. The caller turns
+/// that into a refusal with a named counter. Every write method is infallible
+/// so the ~40 encoder bodies stay linear; the single fallible point is where the
+/// bytes are handed out.
+///
+/// `N` is a const parameter because the present copy stream (D5b) carries up to
+/// [`present_copy::MAX_REGIONS`] `VkImageCopy` records and does not fit the
+/// 512-byte control-command size every other encoder needs; [`Writer`] keeps
+/// that default so no existing encoder changes.
+pub struct StreamWriter<const N: usize> {
+    buf: [u8; N],
     len: usize,
     overflow: bool,
 }
 
-impl Default for Writer {
+/// The control-command writer: [`StreamWriter`] at [`MAX_CMD_BYTES`].
+pub type Writer = StreamWriter<MAX_CMD_BYTES>;
+
+impl<const N: usize> Default for StreamWriter<N> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Writer {
+impl<const N: usize> StreamWriter<N> {
     pub const fn new() -> Self {
         Self {
-            buf: [0u8; MAX_CMD_BYTES],
+            buf: [0u8; N],
             len: 0,
             overflow: false,
         }
@@ -521,7 +531,7 @@ impl Writer {
 
     /// Reserve `n` bytes, or poison the writer and report that there is no room.
     fn reserve(&mut self, n: usize) -> bool {
-        if self.overflow || self.len + n > MAX_CMD_BYTES {
+        if self.overflow || self.len + n > N {
             self.overflow = true;
             return false;
         }
@@ -572,10 +582,10 @@ impl Writer {
         self.len += padded;
     }
 
-    /// A Vulkan object handle. Identical bytes to [`Writer::u64`]; the separate
-    /// name exists so the KMD's per-class handle newtypes can be written without
-    /// spelling out a conversion at every encoder, and so a reader can see at a
-    /// glance which 8-byte words in a stream are handles.
+    /// A Vulkan object handle. Identical bytes to [`StreamWriter::u64`]; the
+    /// separate name exists so the KMD's per-class handle newtypes can be
+    /// written without spelling out a conversion at every encoder, and so a
+    /// reader can see at a glance which 8-byte words in a stream are handles.
     pub fn handle<H: Into<u64>>(&mut self, h: H) {
         self.u64(h.into());
     }
@@ -586,7 +596,7 @@ impl Writer {
         self.u32(flags);
     }
 
-    /// Bytes written so far. Meaningless once [`Writer::overflowed`] is set.
+    /// Bytes written so far. Meaningless once [`StreamWriter::overflowed`] is set.
     pub fn len(&self) -> usize {
         self.len
     }
@@ -1165,7 +1175,7 @@ pub const IMAGE_TILING_LINEAR: u32 = 1;
 /// Everything the two live external image creates differ by. The rest of
 /// `VkImageCreateInfo` — 2D, depth 1, one mip, one layer, 1 sample, exclusive
 /// sharing, no queue families — is fixed by [`encode_image_create`].
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageCreateSpec {
     /// Exact `VkExternalMemoryHandleTypeFlags` for the mandatory external-memory
     /// create chain.
@@ -1177,19 +1187,36 @@ pub struct ImageCreateSpec {
     pub tiling: u32,
     pub usage: u32,
     pub initial_layout: u32,
+    /// `VkImageFormatListCreateInfo` (`view_format_count == 0`: none). DXVK
+    /// attaches the DXGI format family to every MUTABLE_FORMAT color texture,
+    /// and the D5b alias must carry the identical list or the host may pick a
+    /// different (compressed) layout for the same memory.
+    pub view_format_count: u32,
+    pub view_formats: [u32; 2],
 }
 
-/// Encode one `vkCreateImage` command stream.
+pub const ST_IMAGE_FORMAT_LIST_CREATE_INFO: i32 = 1000147000;
+
+/// Encode one `vkCreateImage` command stream. The pNext chain follows DXVK's
+/// order: external-memory info first (when present), then the format list.
 pub fn encode_image_create(device_id: u64, image_id: u64, spec: &ImageCreateSpec) -> Writer {
     let mut w = Writer::new();
     w.header(CMD_CREATE_IMAGE, CMD_FLAG_GENERATE_REPLY);
     w.u64(device_id);
     w.count(true);
     w.i32(ST_IMAGE_CREATE_INFO);
-    w.count(true);
-    w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
-    w.count(false);
-    w.u32(spec.external_handle_type);
+    let format_list = spec.view_format_count.min(2);
+    if spec.external_handle_type != 0 {
+        w.count(true);
+        w.i32(ST_EXTERNAL_MEMORY_IMAGE_CREATE_INFO);
+        // The rest of the chain is encoded before this struct's own fields.
+        encode_format_list_pnext(&mut w, spec, format_list);
+        w.u32(spec.external_handle_type);
+    } else {
+        // No external declaration — the D5b alias mirrors the ICD's `ext=0x0`
+        // image exactly rather than declaring an empty handle set.
+        encode_format_list_pnext(&mut w, spec, format_list);
+    }
     w.u32(spec.flags);
     w.u32(IMAGE_TYPE_2D);
     w.u32(spec.format);
@@ -1209,6 +1236,22 @@ pub fn encode_image_create(device_id: u64, image_id: u64, spec: &ImageCreateSpec
     w.count(true);
     w.u64(image_id);
     w
+}
+
+/// `VkImageFormatListCreateInfo` as a pNext link (or a NULL link).
+fn encode_format_list_pnext(w: &mut Writer, spec: &ImageCreateSpec, count: u32) {
+    if count == 0 {
+        w.count(false);
+        return;
+    }
+    w.count(true);
+    w.i32(ST_IMAGE_FORMAT_LIST_CREATE_INFO);
+    w.count(false); // its pNext
+    w.u32(count);
+    w.u64(u64::from(count)); // array_size(pViewFormats)
+    for format in &spec.view_formats[..count as usize] {
+        w.u32(*format); // vn_encode_VkFormat_array: packed i32s
+    }
 }
 
 /// Which pNext chain a `VkMemoryAllocateInfo` carries.
@@ -1232,6 +1275,17 @@ pub enum MemoryPNext {
     /// (`virtio-gpu-virgl.c:951-964`), so the host GPU and the guest CPU
     /// address the same physical memory.
     ImportResource { resource_id: u32 },
+    /// `VkImportMemoryResourceInfoMESA` -> `VkMemoryDedicatedAllocateInfo`:
+    /// the D5b alias import. The admitted host's dma-buf image/buffer import is
+    /// DEDICATED_ONLY — a bare import of the same blob returned
+    /// `VK_ERROR_INVALID_EXTERNAL_HANDLE` (`PcVkImp`, 2026-09-02); DXVK's
+    /// `forceDedicated` is what makes the ICD's own import of it succeed.
+    /// Exactly one of `image`/`buffer` is nonzero.
+    ImportResourceDedicated {
+        resource_id: u32,
+        image: u64,
+        buffer: u64,
+    },
 }
 
 /// The allocation chain for the KMD-owned OPTIMAL GDI image on the admitted
@@ -1273,6 +1327,21 @@ pub fn encode_memory_allocate(device_id: u64, memory_id: u64, spec: &MemoryAlloc
             w.count(true);
             w.i32(ST_IMPORT_MEMORY_RESOURCE_INFO_MESA);
             w.count(false);
+            w.u32(resource_id);
+        }
+        MemoryPNext::ImportResourceDedicated {
+            resource_id,
+            image,
+            buffer,
+        } => {
+            w.count(true);
+            w.i32(ST_IMPORT_MEMORY_RESOURCE_INFO_MESA);
+            w.count(true);
+            w.i32(ST_MEMORY_DEDICATED_ALLOCATE_INFO);
+            w.count(false);
+            w.u64(image);
+            w.u64(buffer);
+            // The IMPORT struct's own field, after the nested dedicated one.
             w.u32(resource_id);
         }
         MemoryPNext::ExportDedicated { handle_type, image } => {
@@ -1580,8 +1649,10 @@ mod tests {
                 height: 1030,
                 tiling: IMAGE_TILING_LINEAR,
                 usage: 0x1 | 0x2,
-                initial_layout: 8, // PREINITIALIZED
-            },
+                initial_layout: 8, // PREINITIALIZED,
+                view_format_count: 0,
+                view_formats: [0; 2],
+},
         );
         assert_eq!(w.finished(), Some(GOLDEN_LINEAR_SCANOUT_IMAGE));
     }
@@ -1599,8 +1670,10 @@ mod tests {
                 height: 1030,
                 tiling: IMAGE_TILING_OPTIMAL,
                 usage: 0x1 | 0x2 | 0x4 | 0x10,
-                initial_layout: 0, // UNDEFINED
-            },
+                initial_layout: 0, // UNDEFINED,
+                view_format_count: 0,
+                view_formats: [0; 2],
+},
         );
         assert_eq!(w.finished(), Some(GOLDEN_OPTIMAL_GDI_IMAGE));
     }
