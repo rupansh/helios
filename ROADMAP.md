@@ -369,11 +369,50 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   Condvar (wait for `active_scope` to clear, don't fail) — deadlock-free since
   the opener's finish/sync-join never blocks on a scope; `outer_scope_busy` is
   the before/after metric.
-- Vsync polish: waiter-visible vblank alternates ~16.5/30 ms (~40 Hz effective;
+- **3c MEASURED 2026-09-02 (KMD .458): the ~38 Hz vblank cadence is NOT the
+  KMD's retrace.** Reproduced with `tmp/vblank.ps1`: waiter intervals bimodal
+  ~16/~32 ms (15-bin:102 / 30-bin:138, mean 26.3 ms ≈ 38 Hz) on a quiet
+  desktop, and a vsync-locked flip app presents at 35–40 fps with the same
+  p10≈16 / p90≈35 ms intervals in the host log. Two hypotheses FALSIFIED with
+  new crumbs: (1) `VsTmrHr=1` — the high-resolution `ExTimer` is live, not the
+  tick-quantized KTIMER fallback (whose 15.625 ms quantum would have produced
+  exactly 15.6/31.2); `timeBeginPeriod(1)` has no consistent effect (run noise).
+  (2) `VsSkip=8` over `VsLive=4254` retraces (0.19%) — the one-shot re-arm's
+  skip-missed rule is not dropping periods; `VsCls=VsLive` so both the classic
+  and INFO2 notifications go out every tick. ⇒ the KMD emits 60 Hz cleanly and
+  the loss is downstream in dxgkrnl's vsync-DPC/vblank-wait delivery
+  (coalescing) — and for app fps also `MaxQueuedFlipOnVSync=1` pipelining
+  (N+1 waits for N's report; a late DDI lands one retrace later). Next oracle:
+  an ETW `Microsoft-Windows-DxgKrnl` VSync/DPC/Flip slice (the WS2 method).
+  No >40 ms gaps in quiet runs; the 0.2–0.5 s outages need a
+  source-ownership transition to reproduce. Crumbs: `VsTmrHr`, `VsSkip`
+  (mirrored at the PASSIVE `VsLive` site, i.e. on visibility changes —
+  `helios_monoff`/`HeliosWakeDisplay` do NOT trigger that mirror).
+  (was: Vsync polish: waiter-visible vblank alternates ~16.5/30 ms (~40 Hz effective;
   C# D3DKMTWaitForVerticalBlankEvent probe, both timer resolutions) and the
   heartbeat has 0.2–0.5 s outages around source-ownership transitions;
   a PlaneCount=0 MPO flip never stores LAST_PRESENT_ID (teardown's 0.41 s
   FLUSH_DEVICE_FLIP wait). Perf/latency, not correctness.
+  **3d 2026-09-02 (KMD .457/.458): mechanism found, fix landed but
+  UNVALIDATED.** The WDK header settles it: `DXGK_MULTIPLANE_OVERLAY_VSYNC_
+  INFO2` is a per-LAYER `{LayerIndex, PresentId, Flags}` and the INFO2 vsync
+  carries `MultiPlaneOverlayVsyncInfoCount` entries. The KMD hardcoded count=1
+  with the last PresentId every retrace and its zero-plane branch never
+  updated anything, so dxgkrnl could never see a zero-plane flip retire —
+  the natural acknowledgement is a **count-0** vsync. Landed: atomic
+  `PLANES_ACTIVE` (0 after a successful zero-plane unbind, 1 on an
+  accepted/parked one-plane flip; initialised to 1 so behaviour is
+  byte-identical until the first zero-plane flip), read at DIRQL by the INFO2
+  emitter; knob `MpoVsyncZero` (default 1, 0 = always-1 A/B, read live at
+  each zero-plane flip so no reboot); crumbs `MpoZp` (zero-plane flips seen)
+  and `MpoVs0` (count-0 vsyncs). ⚠ **Nothing exercised it:** `MpoZp` stayed 0
+  at boot, after windowed-BLT exits and after flip-app exits (6 A/B runs, all
+  arms ≈20.6 s lifetime, `MpoVs0` 0→0) — a PlaneCount=0 MPO flip is NOT what
+  those teardowns do (the boot park comes via the VidPn path). The
+  "0.41 s per teardown" trigger is therefore unpinned; find it with an ETW
+  DxgKrnl BlockThread(FLUSH_DEVICE_FLIP) slice around whatever teardown
+  produced it (dwm restart / modeset / compositor device teardown are the
+  candidates), then the A/B is `MpoVsyncZero` 1 vs 0 with `MpoVs0` moving.
 - `Nr2OuterRej` code 5 (`SessionClosed`) ×2 per flip run, completed via
   `Nr2RefCmp` — benign under churn AND on the fixed boot; watch, don't chase.
 - Observability: `VsCls`/`VsLive`/`CtlInt` registry values flush only at the

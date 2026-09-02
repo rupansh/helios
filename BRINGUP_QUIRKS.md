@@ -172,6 +172,15 @@ while ((ring S-value count) -eq 0) { sleep 0.4 }   # bring-up re-ran when breadc
   (Also `query-status` to check `running` vs paused/bugcheck.) Downside: a reboot drops ntoseye
   (it 404s → the user must reconnect) and a KD-attached boot breaks repeatedly on DbgPrints
   (resume past) — so prefer the disable→enable replay above for debug loops.
+- ⚠ **`schtasks /run /tn helios_monoff` DPMS-blanks the output and nothing short of a
+  reboot restores it (burned 2026-09-02).** `HeliosWakeDisplay` / `helios_wake` do NOT
+  wake it. While blanked, DWM stops composing windows: the D5b BLT present-copy counters
+  (`PcIssue`/`PcDone`) stop moving, `helios_paintcap` returns an all-black 5 KB PNG, yet
+  flip-model apps still scan out (host log keeps `set_scanout_blob`) and xproc/flip
+  probes pass — so it looks exactly like a KMD BLT regression. It also does NOT go
+  through `SetVidPnSourceVisibility` (the `VsLive`/`VsCls` mirror never fires), so it is
+  useless for bracketing vsync counters. Do not use it in a measurement script; a
+  graceful `shutdown /r /t 2 /f` (48 s, image unchanged) is the recovery.
 - The VM exposes **no ICMP** — don't `ping` to check liveness. `nc -z <ip> 22` gives false
   negatives here; probe SSH with a banner grab instead
   (`timeout 3 bash -c 'exec 3<>/dev/tcp/<ip>/22 && head -c8 <&3' | grep SSH`) or just retry
