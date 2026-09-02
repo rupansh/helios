@@ -333,61 +333,85 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   QEMU's OPTIMAL read of it is clean black. **NOTE:** this also removes the
   `FLUSH_DEVICE_FLIP`/zombie-adjacent park rejection the D6 write-up cited at
   line ~411; the flip-teardown park now imports too.
-- ✅ **ROOT-CAUSED 2026-09-02 + made loud (UMD 4a7d8c8): dwm helper-device
-  "outer device lost at outer allocation terminal batch" during runs.** It
-  MOVES during runs (~1 in 3 BLT+flip runs, at app-exit, on a late helper
-  device gen=1), so per the directive it was root-caused. The `result=-4`
-  (`VK_ERROR_DEVICE_LOST`) is `teardown_result` DXVK passes in: its allocation
-  destructor sets DEVICE_LOST **silently** when `beginHeliosOuterAllocation
-  Teardown` yields no scope, and the UMD's `dxvk_outer_submit_begin` returned
-  a null scope with NO log whenever another outer scope was already active on
-  the context (`active_scope.is_some()` — one scope per context, opened around
-  each lower submit; a teardown colliding with an in-flight submit, or a
-  leaked scope, hits it). `mark_outer_lost` is a sticky once-logging flag, so
-  every later teardown/join/detach on that device then cascades to
-  DEVICE_LOST silently — `outer_lost` staying flat HIDES ongoing failures (a
-  run with a failed terminal token and outer_lost+0 proved it), and that
-  helper's allocation teardowns never run again for its lifetime (a slow
-  leak; dwm survives). Ruled out with evidence: host venus fault (none), KMD
-  refusal (full Nr2*/K11*/TsSess* delta identical on failing vs clean runs),
-  any logged ICD `HTS1`/`HNR2` or UMD `HOB1` refusal (none for dwm). DXVK's
-  own precursor: `waitForResource STALLED … queue fully drained` ×3 then
-  `exact Helios teardown refused` ×4. Distinct from the boot-time 0–2/boot
-  `HOB1 Render refused hr=0x80004005` class (D3DKMTRender E_FAIL, D6-family,
-  first seconds, stable — not chased). **Landed:** log the collision
-  (generation+endpoint) and count it as the 26th `DDI refusals:` column
-  `outer_scope_busy` (appended last, diff contract kept); zero behaviour
-  change; verified loaded in dwm by its process module list (hash 60FF762C).
-  **Instrument seen firing:** 1 in 9 BLT+flip runs — `outer_scope_busy` 0→1,
-  log `… a scope is already active on this context … generation=1
-  endpoint=2`. That hit had `outer_lost+0 failed_terminal+0`: it came from
-  `dxvk_outer_submit_begin`'s OTHER caller, the regular submit path, which
-  tolerates a null scope silently, while the allocation-teardown caller turns
-  the same null into DEVICE_LOST — one mechanism, two severities; a following
-  "failed terminal batch" line tells them apart.
-  **Follow-up (the real fix):** serialize `dxvk_outer_submit_begin` on a
-  Condvar (wait for `active_scope` to clear, don't fail) — deadlock-free since
-  the opener's finish/sync-join never blocks on a scope; `outer_scope_busy` is
-  the before/after metric.
-- **3c MEASURED 2026-09-02 (KMD .458): the ~38 Hz vblank cadence is NOT the
-  KMD's retrace.** Reproduced with `tmp/vblank.ps1`: waiter intervals bimodal
-  ~16/~32 ms (15-bin:102 / 30-bin:138, mean 26.3 ms ≈ 38 Hz) on a quiet
-  desktop, and a vsync-locked flip app presents at 35–40 fps with the same
-  p10≈16 / p90≈35 ms intervals in the host log. Two hypotheses FALSIFIED with
-  new crumbs: (1) `VsTmrHr=1` — the high-resolution `ExTimer` is live, not the
-  tick-quantized KTIMER fallback (whose 15.625 ms quantum would have produced
-  exactly 15.6/31.2); `timeBeginPeriod(1)` has no consistent effect (run noise).
-  (2) `VsSkip=8` over `VsLive=4254` retraces (0.19%) — the one-shot re-arm's
-  skip-missed rule is not dropping periods; `VsCls=VsLive` so both the classic
-  and INFO2 notifications go out every tick. ⇒ the KMD emits 60 Hz cleanly and
-  the loss is downstream in dxgkrnl's vsync-DPC/vblank-wait delivery
-  (coalescing) — and for app fps also `MaxQueuedFlipOnVSync=1` pipelining
-  (N+1 waits for N's report; a late DDI lands one retrace later). Next oracle:
-  an ETW `Microsoft-Windows-DxgKrnl` VSync/DPC/Flip slice (the WS2 method).
-  No >40 ms gaps in quiet runs; the 0.2–0.5 s outages need a
-  source-ownership transition to reproduce. Crumbs: `VsTmrHr`, `VsSkip`
-  (mirrored at the PASSIVE `VsLive` site, i.e. on visibility changes —
-  `helios_monoff`/`HeliosWakeDisplay` do NOT trigger that mirror).
+- ✅ **FIXED 2026-09-02 (UMD b1a2876 + 9d52afe, hash B80BAE66): dwm helper-device
+  "outer device lost at outer allocation terminal batch".** Root cause
+  (measured, 4a7d8c8 instrument): `dxvk_outer_submit_begin` returned a SILENT
+  null whenever another outer scope was active on the runtime context (one
+  `active_scope` per context; a teardown colliding with an in-flight submit);
+  DXVK's allocation destructor maps that null to `VK_ERROR_DEVICE_LOST`,
+  `mark_outer_lost` is sticky, and every later teardown/join on that helper
+  device then failed silently for its lifetime (leak + refused joins).
+  **Fix:** the colliding begin WAITS on a Condvar paired with `active_scope`
+  (every taker — finish, join, context destroy — notifies via a drop guard).
+  Deadlock-free: the opener holds only DXVK's `m_mutexQueue` (submit) or the
+  allocator mutex (teardown) across begin..finish, neither is needed to
+  finish. Bound = knob `UmdScopeWaitMs` (`HKLM\SOFTWARE\Helios`, default 5000;
+  0 = the old refuse-immediately, the same-boot A/B); on timeout the old null,
+  a log line naming the HOLDER (tid, site 1=submit/2=teardown, age) and the
+  27th `DDI refusals:` column `outer_scope_wait_timeout`; a holder that
+  already timed out one wait is latched so later begins skip the wait
+  (one bounded wait per wedge, not one per call). `outer_scope_busy` now
+  counts collisions that had to wait; the first 64 waits log their duration.
+  **Evidence:** 14 BLT+flip runs over three boots + an overlapping-app stress
+  (BLT+flip2+xproc+vkcube ×3) on the fix build: zero new "outer device lost",
+  "retired after failed terminal batch", "exact outer join refused" lines;
+  dwm pid stable; K9Poison/SxWait/VnRingFt 0; xproc passes. ⚠ The collision
+  itself did not fire in any run this session (`outer_scope_busy` 0; it was 1
+  in 9 runs the day before) — the wait path is argued, not field-exercised;
+  the two columns are the watch. It DID fire on the device-restart wedge
+  below, where it named the holder.
+- ✅ **3c RESOLVED 2026-09-02 (KMD .458): the ~38 Hz vblank cadence was a
+  SESSION-0 PROBE ARTEFACT, not a display-path loss.** Every earlier
+  `tmp/vblank.ps1` number was taken over win_exec (session 0), where every
+  enumerated adapter reports `NumOfSources=0` and
+  `D3DKMTOpenAdapterFromGdiDisplayName` fails: dxgkrnl then services
+  `D3DKMTWaitForVerticalBlankEvent` from its software vsync worker — ETW
+  DxgKrnl ids 1123/1121/1122 read `"Software_Dod" … "EnableVSyncEventWorkerCall"`
+  / `"NoWaiters"` around the probe, every waiter release follows a
+  `SignalVSyncEvent` (id 1067, a System thread on CPU 1) on a 16.129 ms grid
+  and never the KMD's DPC, and that worker's wake is quantized by the 15.6 ms
+  clock tick (`Stop − last DPC` uniform 0–16 ms → the 17.5 / 29.6–32 ms
+  split). Run in session 1 (`schtasks /run /tn helios_vblank` →
+  `tmp/vblank_disp.ps1` → `Z:\tmp\vblank_s1.txt`) the same call on Helios (the
+  only adapter with a source) gives mean 16.66 ms, 299/300 in the 16 ms bin,
+  `Stop − last DPC` p50 0.01 ms, zero SignalVSyncEvent; the HeliosBoot trace
+  shows dwm's own waits released 0.02 ms after the DPC. dxgkrnl logs ONE DPC
+  per KMD tick at 60.1/s and processes both notifications in it (no
+  coalescing). Measured NOT to matter: busy vCPUs, `VsyncClassic=0`
+  (INFO2-only: one VSyncDPC per tick, same session-0 cadence), the double
+  notification. ⇒ KMD and dxgkrnl both clean; `VsyncClassic` stays 1.
+  ⛔ Vblank waits join the session-0-is-fake list. The flip app's 35–40 fps
+  is the WS2 `MaxQueuedFlipOnVSync=1` pipelining item (A/B at depth 4 already
+  measured inert, REJECTED — the interleaved re-run attempted here was void
+  because `pnputil /restart-device` wedges dwm, see below; if ever re-measured,
+  switch arms by reboot). Tools: `tools/etw-vsync-report.py`,
+  `tools/etw-vsync-boot.py`, `tools/hostlog-present-rate.py`,
+  `tmp/vs_etw.ps1` (ETW bracket + GZipStream to Z:\tmp — no gzip on the guest).
+- ⚠ **OPEN (2026-09-02, KMD .458): `pnputil /restart-device` wedges dwm.**
+  After one restart dwm re-creates its devices, then a `DDI: DestroyDevice`
+  never reaches the outer teardown and the 3b instrument names the holder:
+  dwm's compositor thread (the CreateDevice thread) inside an
+  allocation-TEARDOWN scope (kind=2) that never finishes — the
+  DestroyAllocation wedge class (`wedge-is-destroyallocation-scanout-lock`)
+  on the restart path. Reproduced with `UmdScopeWaitMs=0` (the wait disabled),
+  so it is not the 3b wait. One restart: idle paintcap still fine, dwm
+  partially wedged, DXVK submit thread refused once per second; four
+  restarts: zero dwm primaries reach the host afterwards, all captures black,
+  `shutdown /r` then takes ~4.5 min. Recovery = reboot. Charter item 3; the
+  2026-08 note "restart-device reproduces the whole display bring-up" no
+  longer holds on this KMD. Next: a cdb non-invasive stack of the holder
+  (attach BEFORE any timed-out cdb — a killed attach leaves dwm
+  un-attachable) or an ETW slice around the restart for the `DestroyAllocation`
+  Start without Stop (`tools/etw-wedge-report.py`).
+- ⚠ **Instrument flake (2026-09-02): `helios_paintcap` during a BLT-model
+  window is all-black about half the time** (uniform 5534-byte PNG), on the
+  unchanged UMD too (previous-source build: 3 good / 2 black; fix build: 1
+  good / 7 black across three boots — same flake, possibly worse odds). Idle
+  captures are always fine, dwm keeps flipping at ~30/s and `PcIssue`/`PcDone`
+  move, so it is the GDI readback, not composition: every capture trips two
+  DXVK `waitForResource STALLED … resolved after 1 retries` in dwm. Take two
+  captures per BLT run and read the one that shows the window. Memory:
+  `paintcap-blt-window-black-flake`.
   (was: Vsync polish: waiter-visible vblank alternates ~16.5/30 ms (~40 Hz effective;
   C# D3DKMTWaitForVerticalBlankEvent probe, both timer resolutions) and the
   heartbeat has 0.2–0.5 s outages around source-ownership transitions;
