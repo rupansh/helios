@@ -383,26 +383,37 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   ⛔ Vblank waits join the session-0-is-fake list. The flip app's 35–40 fps
   is the WS2 `MaxQueuedFlipOnVSync=1` pipelining item (A/B at depth 4 already
   measured inert, REJECTED — the interleaved re-run attempted here was void
-  because `pnputil /restart-device` wedges dwm, see below; if ever re-measured,
-  switch arms by reboot). Tools: `tools/etw-vsync-report.py`,
+  because `pnputil /restart-device` wedged dwm; FIXED the same day, see
+  below, so restart-device arm switching is usable again). Tools: `tools/etw-vsync-report.py`,
   `tools/etw-vsync-boot.py`, `tools/hostlog-present-rate.py`,
   `tmp/vs_etw.ps1` (ETW bracket + GZipStream to Z:\tmp — no gzip on the guest).
-- ⚠ **OPEN (2026-09-02, KMD .458): `pnputil /restart-device` wedges dwm.**
-  After one restart dwm re-creates its devices, then a `DDI: DestroyDevice`
-  never reaches the outer teardown and the 3b instrument names the holder:
-  dwm's compositor thread (the CreateDevice thread) inside an
-  allocation-TEARDOWN scope (kind=2) that never finishes — the
-  DestroyAllocation wedge class (`wedge-is-destroyallocation-scanout-lock`)
-  on the restart path. Reproduced with `UmdScopeWaitMs=0` (the wait disabled),
-  so it is not the 3b wait. One restart: idle paintcap still fine, dwm
-  partially wedged, DXVK submit thread refused once per second; four
-  restarts: zero dwm primaries reach the host afterwards, all captures black,
-  `shutdown /r` then takes ~4.5 min. Recovery = reboot. Charter item 3; the
-  2026-08 note "restart-device reproduces the whole display bring-up" no
-  longer holds on this KMD. Next: a cdb non-invasive stack of the holder
-  (attach BEFORE any timed-out cdb — a killed attach leaves dwm
-  un-attachable) or an ETW slice around the restart for the `DestroyAllocation`
-  Start without Stop (`tools/etw-wedge-report.py`).
+- ✅ **FIXED 2026-09-02 (UMD hash E0EBBD63, KMD .458 unchanged): `pnputil
+  /restart-device` wedged dwm.** Root cause from a cdb stack + an ETW slice
+  of one restart: NOT dxgkrnl and NOT the KMD — no dxgkrnl call from dwm was
+  unreturned and the K9 ledger balanced (`K9Adm = K9Ret + K9Abort`, two
+  packets aborted at the stop). Both wedged threads (compositor
+  `ProcessDeviceLost → DestroyAllResources`, uDWM `HandleGraphicsDeviceLost`)
+  sat in `~DxvkResourceAllocation → vkDestroyBuffer/vkFreeMemory → ICD
+  vn_FreeMemory join → UMD translator_sync_progress_join →
+  join_outer_progress → wait_hqc1 → WaitForSingleObject(INFINITE)`: after
+  the restart dxgkrnl still accepts a FromGpu signal and a FromCpu wait on
+  the removed device's context (both return success) but never executes the
+  signal, so the HQC1 fence wait was unsatisfiable. The 3b `kind=2` holder
+  was this wait, one level below D3DKMTDestroyAllocation. **Fix:**
+  `wait_hqc1` waits in 250 ms slices and on each timeout asks
+  `D3DKMTOpenAdapterFromLuid` for the device's own adapter LUID; a restart
+  starts the adapter under a NEW LUID (measured 0x7630 → 0x30162c → 0x11b640
+  → …) and the old one answers STATUS_INVALID_PARAMETER, which releases the
+  wait as DEVICE_LOST (28th `DDI refusals:` column `hqc1_wait_adapter_gone`,
+  log `HQC1 wait released: adapter luid=… no longer opens`). A live adapter
+  keeps the wait unbounded — no timer release, so no UAF. **Evidence:** five
+  consecutive restarts on one boot, each: 3× release at 250–265 ms, 3×
+  `DDI outer teardown: detach`, 3× `CreateDevice` on the new LUID, dwm pid
+  stable, 17–19 dwm primaries reach the host within 5 s, paintcap shows the
+  desktop, K9Poison/SxWait/VnRingFt 0; `shutdown /r` after the five: 33 s
+  (was ~4.5 min). BLT+flip + xproc regression clean. `restart-device` is a
+  valid knob-switch path again. Files: `tmp/rs/` (rs_1.csv.gz ETW slice,
+  dwm-stacks{,-sym}_1.txt, acc_*), `tmp/rs_exp.ps1`, `tmp/rs_acc.ps1`.
 - ⚠ **Instrument flake (2026-09-02): `helios_paintcap` during a BLT-model
   window is all-black about half the time** (uniform 5534-byte PNG), on the
   unchanged UMD too (previous-source build: 3 good / 2 black; fix build: 1
