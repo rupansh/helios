@@ -194,21 +194,23 @@ in `D7ImOrd`. Breadcrumbs: `D7CrRes/D7CrSeq` (last guest blob created),
 `D7RtFail`, `D7ImFail` (import refused), `D7FtRes/D7FtSeq` (the import that
 found the ring fatal), `D7UnRes/D7UnSeq` (an unref of the last-created id —
 hypothesis (b), never observed).
-*Evidence so far:* fence ON: 3 clean boots (`D7RtN` 97-98 fences by login,
-`D7ImFail=0`, `TsSessNew=11`, `helios_triangle` runs with `PcIssue==PcDone`);
-fence OFF (A/B, crumbs armed): 3 clean boots — the fault has not reproduced
-yet. ⚠ TWICE the boot loop ended with QEMU EXITING: a reset ~100 s after the
-previous boot → four firmware `res_flush` lines → nothing → QEMU gone 61 s
-after the reset, nothing on stderr, no segfault/OOM in `journalctl -k`, no
-coredump. At those two resets the log carried NO `destroying context N` lines
-(every clean reset logs them first), so virglrenderer's contexts were not torn
-down by that reset. 61 s is exactly the launcher's `shutdown_qemu` ladder
-(`system_powerdown` → 45 s → `quit` → 10 s), which only `cleanup_user` /
-`handle_user_int` (Ctrl-C) run — check the launcher terminal for
-`>>> SIGINT received` / `>>> Requesting guest shutdown` before blaming the
-guest. **Open:** 10 consecutive clean boots with the fence ON plus the
-BLT/flip/xproc regressions; ideally one OFF-arm reproduction with
-`D7FtRes == D7CrRes` for the post-mortem. Tooling:
+*Evidence so far:* fence ON: 5 clean boots (`D7RtN` 97 fences by login,
+`D7ImFail=0`, `TsSessNew=11`, `helios_triangle` runs `running=True`
+`PcIssue==PcDone`); fence OFF (A/B, crumbs armed): 3 clean boots — the fault
+has not reproduced. **The 10/10 loop is blocked by a VM-infra flake, not by
+D7.** THREE times a hard QMP `system_reset` of the running guest was followed
+by a guest self-power-off: with a QMP monitor held open across the reset
+(`tools/d7_boot.py`), the `RESET` is `guest=false` (mine) but ~61 s later comes
+`SHUTDOWN {"guest":true,"reason":"guest-shutdown"}` and QEMU exits (the launcher
+`wait`s on it). The guest reached only the firmware framebuffer (host log: a
+few `res 0x2` text-strip flushes, never `blob_size 4587520`) — Windows'
+unclean-shutdown recovery (Kernel-Power event 41 every boot), not QEMU, the
+launcher, or the driver. **Method fix:** the acceptance loop now uses a
+GRACEFUL in-guest reboot (`tmp/d7_greboot{0,1}.ps1` = arm + `shutdown /r /t 2
+/f`; watched by `tools/d7_gwatch.py`, no QMP), which exercises the same
+AddAdapter/StartDevice path without tripping recovery. **Open:** finish 10
+consecutive clean fence-ON boots + BLT/flip/xproc regressions; ideally one
+OFF-arm reproduction with `D7FtRes == D7CrRes`. Tooling:
 `tmp/d7_arm{0,1}.ps1` (arm + zero crumbs + `RegistryKey.Flush()` + 8 s —
 ⚠ a hard QMP reset within seconds of a registry write LOSES the write: the
 first A/B boot ran with the knob silently back at 1), `tmp/d7_read.ps1`,

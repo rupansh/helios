@@ -157,6 +157,18 @@ while ((ring S-value count) -eq 0) { sleep 0.4 }   # bring-up re-ran when breadc
   the completion signal is a new `helios_scanout_blob_layout … blob_size
   4587520` line (dwm composited), not `set_scanout_blob` (the firmware blob
   matches too early).
+  ⚠ **A hard `system_reset` of a RUNNING Windows guest intermittently self-
+  powers-off (burned 2026-09-02, 3 of ~13 resets).** The guest comes up only to
+  the firmware framebuffer (host log gains a few `res 0x2` text-strip flushes,
+  never a `blob_size 4587520` line), and ~61 s later QEMU reports
+  `SHUTDOWN {"guest":true,"reason":"guest-shutdown"}` and exits — the launcher
+  `wait`s on QEMU, so the whole VM dies and needs an owner relaunch. It is the
+  Windows unclean-shutdown recovery path (every hard reset logs Kernel-Power
+  event 41), not QEMU, the launcher, or the driver. For a BOOT LOOP prefer a
+  GRACEFUL in-guest reboot (`shutdown /r /t 2 /f`, authorized) — it exercises
+  the same AddAdapter/StartDevice path, marks a clean shutdown, and does not
+  trip recovery. `tools/d7_gwatch.py` watches the graceful boot by line offset
+  with no QMP. Keep the verified `system_reset` for a WEDGED guest only.
   (Also `query-status` to check `running` vs paused/bugcheck.) Downside: a reboot drops ntoseye
   (it 404s → the user must reconnect) and a KD-attached boot breaks repeatedly on DbgPrints
   (resume past) — so prefer the disable→enable replay above for debug loops.
