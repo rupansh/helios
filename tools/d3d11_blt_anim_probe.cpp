@@ -10,14 +10,21 @@
 #include <string.h>
 static FILE* g_log;
 static void L(const char* f, ...) { va_list a; va_start(a, f); char b[512]; vsnprintf(b, sizeof b, f, a); va_end(a); printf("%s\n", b); if (g_log) { fprintf(g_log, "%s\n", b); fflush(g_log); } }
-static LRESULT CALLBACK wp(HWND h, UINT m, WPARAM w, LPARAM l) { if (m == WM_DESTROY) { PostQuitMessage(0); return 0; } return DefWindowProc(h, m, w, l); }
+static bool g_noerase = false;  // 4th arg "noerase": no background brush, WM_ERASEBKGND/WM_PAINT swallowed
+static LRESULT CALLBACK wp(HWND h, UINT m, WPARAM w, LPARAM l) {
+  if (m == WM_DESTROY) { PostQuitMessage(0); return 0; }
+  if (g_noerase && m == WM_ERASEBKGND) return 1;
+  if (g_noerase && m == WM_PAINT) { PAINTSTRUCT ps; BeginPaint(h, &ps); EndPaint(h, &ps); return 0; }
+  return DefWindowProc(h, m, w, l);
+}
 int main(int argc, char** argv) {
   g_log = fopen("C:\\Users\\Rupansh\\helios-probe\\blt_anim.txt", "w");
   const bool sequential = argc > 1 && !strcmp(argv[1], "sequential");
   const bool shaderInput = argc > 2 && atoi(argv[2]) != 0;
   const int seconds = argc > 3 ? atoi(argv[3]) : 25;
-  L("blt_anim pid=%lu swap=%s shaderinput=%d seconds=%d", GetCurrentProcessId(), sequential ? "sequential" : "discard", (int)shaderInput, seconds);
-  WNDCLASSA wc = {}; wc.lpfnWndProc = wp; wc.hInstance = GetModuleHandle(nullptr); wc.lpszClassName = "helios_anim"; wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1); RegisterClassA(&wc);
+  g_noerase = argc > 4 && !strcmp(argv[4], "noerase");
+  L("blt_anim pid=%lu swap=%s shaderinput=%d seconds=%d noerase=%d", GetCurrentProcessId(), sequential ? "sequential" : "discard", (int)shaderInput, seconds, (int)g_noerase);
+  WNDCLASSA wc = {}; wc.lpfnWndProc = wp; wc.hInstance = GetModuleHandle(nullptr); wc.lpszClassName = "helios_anim"; wc.hbrBackground = g_noerase ? nullptr : (HBRUSH)(COLOR_WINDOW + 1); RegisterClassA(&wc);
   HWND hwnd = CreateWindowA("helios_anim", "helios-anim", WS_OVERLAPPEDWINDOW | WS_VISIBLE, 200, 150, 640, 480, nullptr, nullptr, wc.hInstance, nullptr);
   IDXGIFactory1* f = nullptr; CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&f);
   IDXGIAdapter1* ad = nullptr; IDXGIAdapter1* a = nullptr;
