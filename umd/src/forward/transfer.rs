@@ -339,7 +339,17 @@ pub(crate) unsafe extern "C" fn resource_map(
             }
         }
         Err(e) => {
+            // Without this the runtime returned S_OK with a null pointer.
             log_error!("DDI resource_map failed: {e:?}");
+            let code = e.code().0;
+            set_runtime_error(
+                h,
+                if code == crate::hr::DXGI_ERROR_WAS_STILL_DRAWING {
+                    crate::hr::DXGI_DDI_ERR_WASSTILLDRAWING
+                } else {
+                    code
+                },
+            );
             if !mapped.is_null() {
                 (*mapped).pData = core::ptr::null_mut();
             }

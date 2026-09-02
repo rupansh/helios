@@ -80,8 +80,30 @@ pub(crate) unsafe extern "C" fn query_get_data(
     let Some(q) = load_com::<ID3D11Query>(h_query) else {
         return;
     };
-    if let Ok(async_) = (*q).cast::<ID3D11Asynchronous>() {
-        let _ = context.GetData(&async_, Some(data), data_size, flags);
+    let Ok(async_) = (*q).cast::<ID3D11Asynchronous>() else {
+        return;
+    };
+    // The DDI returns void: "not ready" and failure travel through
+    // pfnSetErrorCb. Dropping DXVK's S_FALSE made the runtime answer S_OK
+    // with unwritten data, so every event query looked complete on its first
+    // poll (3DMark's CEF UI: fences done before the GPU was, white page).
+    // Raw vtable call because windows-rs folds S_FALSE into Ok(()).
+    let hr = (Interface::vtable(&*context).GetData)(
+        Interface::as_raw(&*context),
+        async_.as_raw(),
+        data,
+        data_size,
+        flags,
+    )
+    .0;
+    if hr == crate::hr::S_FALSE {
+        set_runtime_error(h, crate::hr::DXGI_DDI_ERR_WASSTILLDRAWING);
+    } else if hr < 0 {
+        static FAIL_LOG: LogThrottle = LogThrottle::new();
+        if FAIL_LOG.first_n(16).is_some() {
+            log_error!("DDI query_get_data failed: hr=0x{:08x}", hr as u32);
+        }
+        set_runtime_error(h, hr);
     }
 }
 

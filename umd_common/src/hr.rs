@@ -36,6 +36,20 @@ pub type Hresult = i32;
 /// Success.
 pub const S_OK: Hresult = 0;
 
+/// Success, but the asynchronous result is not available yet. `winerror.h`:
+/// `S_FALSE`. What DXVK's `GetData` returns for a pending query.
+pub const S_FALSE: Hresult = 1;
+
+/// The GPU is still working on the object, API level. `winerror.h`:
+/// `DXGI_ERROR_WAS_STILL_DRAWING`. What DXVK returns from a DO_NOT_WAIT map.
+pub const DXGI_ERROR_WAS_STILL_DRAWING: Hresult = 0x887A_000Au32 as Hresult;
+
+/// The DDI-level form the runtime expects through `pfnSetErrorCb`
+/// (`dxgiddi.h`: `MAKE_DXGI_DDI_HRESULT(1)`, facility 0x87B). Measured
+/// 2026-09-03: reporting the 0x887A API code there is a driver fault and
+/// removes the device.
+pub const DXGI_DDI_ERR_WASSTILLDRAWING: Hresult = 0x887B_0001u32 as Hresult;
+
 /// Unspecified failure. `winerror.h`: `E_FAIL`.
 pub const E_FAIL: Hresult = 0x8000_4005u32 as Hresult;
 
