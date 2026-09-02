@@ -419,6 +419,9 @@ struct DdiRefusals {
     /// The wait above ran out (`UmdScopeWaitMs`) and the begin fell back to
     /// returning no scope — the old failure, now only for a wedged opener.
     outer_scope_wait_timeout: RefusalCounter,
+    /// A `wait_hqc1` released because the device's adapter LUID no longer
+    /// opens (PnP restart): the FromGpu signal it waited for can never execute.
+    hqc1_wait_adapter_gone: RefusalCounter,
 }
 
 /// ⚠ Each counter now carries its own NAME (`RefusalCounter`, stage S2), so
@@ -454,12 +457,13 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
     flush_sync_failed: RefusalCounter::new("flush_sync_failed"),
     outer_scope_busy: RefusalCounter::new("outer_scope_busy"),
     outer_scope_wait_timeout: RefusalCounter::new("outer_scope_wait_timeout"),
+    hqc1_wait_adapter_gone: RefusalCounter::new("hqc1_wait_adapter_gone"),
 };
 
 /// The set, in the order the summary prints them. ⛔ This order is the
 /// evidence contract: `DDI refusals:` lines from different builds are diffed.
 /// The K4 counters are APPENDED so every pre-existing column keeps its place.
-static DDI_REFUSAL_SET: [&RefusalCounter; 27] = [
+static DDI_REFUSAL_SET: [&RefusalCounter; 28] = [
     &DDI_REFUSALS.srv_raw_hazard,
     &DDI_REFUSALS.resource_raw_hazard,
     &DDI_REFUSALS.text_filter_size_ignored,
@@ -487,6 +491,7 @@ static DDI_REFUSAL_SET: [&RefusalCounter; 27] = [
     &DDI_REFUSALS.flush_sync_failed,
     &DDI_REFUSALS.outer_scope_busy,
     &DDI_REFUSALS.outer_scope_wait_timeout,
+    &DDI_REFUSALS.hqc1_wait_adapter_gone,
 ];
 
 /// One bounded log line carrying every counter.
@@ -529,6 +534,11 @@ pub(crate) fn note_outer_scope_busy() {
 /// See `DdiRefusals::outer_scope_wait_timeout`.
 pub(crate) fn note_outer_scope_wait_timeout() {
     note_ddi_refusal(&DDI_REFUSALS.outer_scope_wait_timeout);
+}
+
+/// See `DdiRefusals::hqc1_wait_adapter_gone`.
+pub(crate) fn note_hqc1_wait_adapter_gone() {
+    note_ddi_refusal(&DDI_REFUSALS.hqc1_wait_adapter_gone);
 }
 
 /// `state::release_residency` skipped a `pfnEvictCb` the deallocate had

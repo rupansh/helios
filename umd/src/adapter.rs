@@ -468,6 +468,7 @@ unsafe extern "C" fn create_device(
         kt_callbacks: create.pKTCallbacks,
         paging_queue: None,
         device_lost: std::sync::atomic::AtomicU32::new(0),
+        adapter_luid: luid,
     });
     let outer_context = outer.as_mut() as *mut device_funcs::OuterDevice as usize;
     // Snapshot every A5 pointer before entering C++. The bridge synchronously

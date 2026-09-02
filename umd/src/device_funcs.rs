@@ -121,6 +121,10 @@ pub struct OuterDevice {
     pub kt_callbacks: *const ddi::D3DDDI_DEVICECALLBACKS,
     pub paging_queue: Option<RuntimePagingQueue>,
     pub device_lost: AtomicU32,
+    /// The adapter LUID this device was created on. A PnP restart starts the
+    /// adapter under a NEW LUID, so "the old LUID no longer opens" is the
+    /// UMD's only positive proof that dxgkrnl has removed this device.
+    pub adapter_luid: u64,
 }
 
 /// Complete the WDDM half of device admission after DXVK's `vkCreateDevice`
@@ -173,8 +177,59 @@ unsafe extern "system" {
 }
 
 const WAIT_OBJECT_0: u32 = 0;
-const INFINITE: u32 = u32::MAX;
+const WAIT_TIMEOUT: u32 = 0x102;
 const E_PENDING: i32 = 0x8000_000Au32 as i32;
+/// Slice of one HQC1 event wait between adapter-presence checks. Only a wait
+/// that is already stalled pays it; a fence that signals wakes the wait at once.
+const HQC1_WAIT_SLICE_MS: u32 = 250;
+
+#[repr(C)]
+struct KmtOpenAdapterFromLuid {
+    luid_low: u32,
+    luid_high: i32,
+    h_adapter: u32,
+}
+
+#[repr(C)]
+struct KmtCloseAdapter {
+    h_adapter: u32,
+}
+
+#[link(name = "gdi32")]
+unsafe extern "system" {
+    fn D3DKMTOpenAdapterFromLuid(arg: *mut KmtOpenAdapterFromLuid) -> i32;
+    fn D3DKMTCloseAdapter(arg: *mut KmtCloseAdapter) -> i32;
+}
+
+const STATUS_INVALID_PARAMETER: i32 = 0xC000_000Du32 as i32;
+const STATUS_DEVICE_REMOVED: i32 = 0xC000_02B6u32 as i32;
+
+/// `Some(status)` only when dxgkrnl no longer knows the adapter LUID at all
+/// (measured 2026-09-02: `pnputil /restart-device` re-starts the adapter under
+/// a new LUID and the old one answers STATUS_INVALID_PARAMETER). A live adapter
+/// opens and is closed again; any other failure is inconclusive and keeps the
+/// caller waiting, so this can never release a wait on a device that is alive.
+unsafe fn adapter_gone(luid: u64) -> Option<i32> {
+    if luid == 0 {
+        return None;
+    }
+    let mut open = KmtOpenAdapterFromLuid {
+        luid_low: luid as u32,
+        luid_high: (luid >> 32) as u32 as i32,
+        h_adapter: 0,
+    };
+    let status = D3DKMTOpenAdapterFromLuid(&mut open);
+    if status >= 0 {
+        if open.h_adapter != 0 {
+            let mut close = KmtCloseAdapter {
+                h_adapter: open.h_adapter,
+            };
+            let _ = D3DKMTCloseAdapter(&mut close);
+        }
+        return None;
+    }
+    (status == STATUS_INVALID_PARAMETER || status == STATUS_DEVICE_REMOVED).then_some(status)
+}
 
 /// A5 host callbacks dereference only the boxed object that was attached to
 /// this exact context. The context generation is checked before any wait or
@@ -1783,7 +1838,35 @@ unsafe fn wait_hqc1(
         mark_outer_lost(outer, "HQC1 FromCpu callback");
         return Err(HeliosTranslatorStatus::DeviceLost);
     }
-    let wait_result = WaitForSingleObject(event, INFINITE);
+    // Unbounded in time, bounded by proof: the wait ends on the fence or on
+    // the adapter provably gone, never on a timer (a timer release is a UAF).
+    // dxgkrnl accepts a FromGpu signal and a FromCpu wait on a device its
+    // adapter restart has already removed, then never executes the signal;
+    // this is the dwm wedge of 2026-09-02 (compositor stuck here forever).
+    let started = std::time::Instant::now();
+    let wait_result = loop {
+        let result = WaitForSingleObject(event, HQC1_WAIT_SLICE_MS);
+        if result != WAIT_TIMEOUT {
+            break result;
+        }
+        if let Some(status) = adapter_gone(outer.adapter_luid) {
+            CloseHandle(event);
+            log_error!(
+                "A7 D3D11 HQC1 wait released: adapter luid={:08x}:{:08x} no longer opens \
+                 (status=0x{:08x}) after {} ms; value={} completed={} tid={}",
+                (outer.adapter_luid >> 32) as u32,
+                outer.adapter_luid as u32,
+                status as u32,
+                started.elapsed().as_millis(),
+                required,
+                context.hqc1_cpu.as_ptr().read_volatile(),
+                GetCurrentThreadId()
+            );
+            crate::forward::note_hqc1_wait_adapter_gone();
+            mark_outer_lost(outer, "HQC1 wait on a removed adapter");
+            return Err(HeliosTranslatorStatus::DeviceLost);
+        }
+    };
     CloseHandle(event);
     if wait_result != WAIT_OBJECT_0 || context.hqc1_cpu.as_ptr().read_volatile() < required {
         mark_outer_lost(outer, "HQC1 event completion");
