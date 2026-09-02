@@ -194,14 +194,21 @@ in `D7ImOrd`. Breadcrumbs: `D7CrRes/D7CrSeq` (last guest blob created),
 `D7RtFail`, `D7ImFail` (import refused), `D7FtRes/D7FtSeq` (the import that
 found the ring fatal), `D7UnRes/D7UnSeq` (an unref of the last-created id —
 hypothesis (b), never observed).
-*Evidence so far:* fence ON: 2 clean boots (`D7RtN` 97-98 fences by login,
-`D7ImFail=0`, `TsSessNew=11`); fence OFF (A/B, with the crumbs armed): 2 clean
-boots. The fault did NOT reproduce in 2 OFF boots; the loop's 3rd reset ended
-with QEMU exiting ~61 s later with nothing on stderr (only four firmware
-`res_flush` lines after the reset; launcher is `-watchdog-action reset`, so not
-the watchdog) — the VM needs an owner relaunch. **Open:** 10 consecutive
-clean boots with the fence ON plus the BLT/flip/xproc regressions; ideally one
-OFF-arm reproduction with `D7FtRes == D7CrRes` for the post-mortem. Tooling:
+*Evidence so far:* fence ON: 3 clean boots (`D7RtN` 97-98 fences by login,
+`D7ImFail=0`, `TsSessNew=11`, `helios_triangle` runs with `PcIssue==PcDone`);
+fence OFF (A/B, crumbs armed): 3 clean boots — the fault has not reproduced
+yet. ⚠ TWICE the boot loop ended with QEMU EXITING: a reset ~100 s after the
+previous boot → four firmware `res_flush` lines → nothing → QEMU gone 61 s
+after the reset, nothing on stderr, no segfault/OOM in `journalctl -k`, no
+coredump. At those two resets the log carried NO `destroying context N` lines
+(every clean reset logs them first), so virglrenderer's contexts were not torn
+down by that reset. 61 s is exactly the launcher's `shutdown_qemu` ladder
+(`system_powerdown` → 45 s → `quit` → 10 s), which only `cleanup_user` /
+`handle_user_int` (Ctrl-C) run — check the launcher terminal for
+`>>> SIGINT received` / `>>> Requesting guest shutdown` before blaming the
+guest. **Open:** 10 consecutive clean boots with the fence ON plus the
+BLT/flip/xproc regressions; ideally one OFF-arm reproduction with
+`D7FtRes == D7CrRes` for the post-mortem. Tooling:
 `tmp/d7_arm{0,1}.ps1` (arm + zero crumbs + `RegistryKey.Flush()` + 8 s —
 ⚠ a hard QMP reset within seconds of a registry write LOSES the write: the
 first A/B boot ran with the knob silently back at 1), `tmp/d7_read.ps1`,
