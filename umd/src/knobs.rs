@@ -26,6 +26,7 @@
 //! | `UmdLockMode` | DWORD | `0` (`pfnLockCb`, the measured configuration) |
 //! | `UmdGuestBacking` | DWORD | `1` since 2026-09-01 (KMD `Hwa2GuestMem` is the other half) |
 //! | `UmdFlushSync` | DWORD | `1` (`pfnFlush` waits for the CS thread's submission; 0 = the old async Flush, the D2 A/B) |
+//! | `UmdScopeWaitMs` | DWORD | `5000` (outer-scope begin waits this long for a concurrent scope; 0 = the old refuse-immediately, the 3b A/B) |
 //!
 //! The surviving policies are `BoolKnob` ("absent = off, non-zero = on") and
 //! `DwordKnob` ("absent = this default, else the stored value").
@@ -291,4 +292,14 @@ pub(crate) static UMD_FLUSH_SYNC: DwordKnob = DwordKnob::new(c"UmdFlushSync", 1)
 /// `HKLM\SOFTWARE\Helios!UmdFlushSync` (REG_DWORD). See [`UMD_FLUSH_SYNC`].
 pub(crate) fn umd_flush_sync() -> bool {
     UMD_FLUSH_SYNC.get() != 0
+}
+
+/// How long `dxvk_outer_submit_begin` waits for a concurrent outer scope on
+/// the same context before refusing (ROADMAP 3b, 2026-09-02). 0 = the old
+/// refuse-immediately behaviour, the same-boot A/B disable.
+pub(crate) static UMD_SCOPE_WAIT_MS: DwordKnob = DwordKnob::new(c"UmdScopeWaitMs", 5000);
+
+/// `HKLM\SOFTWARE\Helios!UmdScopeWaitMs` (REG_DWORD). See [`UMD_SCOPE_WAIT_MS`].
+pub(crate) fn umd_scope_wait_ms() -> u32 {
+    UMD_SCOPE_WAIT_MS.get()
 }

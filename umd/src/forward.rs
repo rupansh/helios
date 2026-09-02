@@ -412,10 +412,13 @@ struct DdiRefusals {
     residency_evict_suppressed: RefusalCounter,
     flush_sync_failed: RefusalCounter,
     /// `dxvk_outer_submit_begin` found a scope already active on the context
-    /// (a teardown or submit colliding with an in-flight lower submit) and
-    /// returned no scope; DXVK maps that null to `VK_ERROR_DEVICE_LOST`, which
-    /// permanently marks the outer device lost (3b, 2026-09-02). Was silent.
+    /// (a teardown or submit colliding with an in-flight lower submit) and had
+    /// to wait for it (3b, 2026-09-02). Until the serialization fix this was a
+    /// silent null that DXVK mapped to `VK_ERROR_DEVICE_LOST`.
     outer_scope_busy: RefusalCounter,
+    /// The wait above ran out (`UmdScopeWaitMs`) and the begin fell back to
+    /// returning no scope — the old failure, now only for a wedged opener.
+    outer_scope_wait_timeout: RefusalCounter,
 }
 
 /// ⚠ Each counter now carries its own NAME (`RefusalCounter`, stage S2), so
@@ -450,12 +453,13 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
     residency_evict_suppressed: RefusalCounter::new("residency_evict_suppressed"),
     flush_sync_failed: RefusalCounter::new("flush_sync_failed"),
     outer_scope_busy: RefusalCounter::new("outer_scope_busy"),
+    outer_scope_wait_timeout: RefusalCounter::new("outer_scope_wait_timeout"),
 };
 
 /// The set, in the order the summary prints them. ⛔ This order is the
 /// evidence contract: `DDI refusals:` lines from different builds are diffed.
 /// The K4 counters are APPENDED so every pre-existing column keeps its place.
-static DDI_REFUSAL_SET: [&RefusalCounter; 26] = [
+static DDI_REFUSAL_SET: [&RefusalCounter; 27] = [
     &DDI_REFUSALS.srv_raw_hazard,
     &DDI_REFUSALS.resource_raw_hazard,
     &DDI_REFUSALS.text_filter_size_ignored,
@@ -482,6 +486,7 @@ static DDI_REFUSAL_SET: [&RefusalCounter; 26] = [
     &DDI_REFUSALS.residency_evict_suppressed,
     &DDI_REFUSALS.flush_sync_failed,
     &DDI_REFUSALS.outer_scope_busy,
+    &DDI_REFUSALS.outer_scope_wait_timeout,
 ];
 
 /// One bounded log line carrying every counter.
@@ -519,6 +524,11 @@ fn note_ddi_refusal(counter: &RefusalCounter) {
 /// See `DdiRefusals::outer_scope_busy`.
 pub(crate) fn note_outer_scope_busy() {
     note_ddi_refusal(&DDI_REFUSALS.outer_scope_busy);
+}
+
+/// See `DdiRefusals::outer_scope_wait_timeout`.
+pub(crate) fn note_outer_scope_wait_timeout() {
+    note_ddi_refusal(&DDI_REFUSALS.outer_scope_wait_timeout);
 }
 
 /// `state::release_residency` skipped a `pfnEvictCb` the deallocate had

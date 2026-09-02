@@ -81,6 +81,19 @@ pub struct RuntimeContext {
     /// One scope owned by the current DXVK outer operation. A join takes,
     /// seals, closes, and replaces it without TLS or a global registry.
     pub active_scope: std::sync::Mutex<Option<HeliosTranslatorScope>>,
+    /// Notified after every site that takes `active_scope` releases the mutex,
+    /// so a colliding `dxvk_outer_submit_begin` waits instead of failing (3b).
+    pub scope_idle: std::sync::Condvar,
+}
+
+/// Wakes `dxvk_outer_submit_begin` waiters when dropped. Declare it BEFORE the
+/// `active_scope` guard so the notify runs after the mutex is released.
+struct ScopeIdleNotify<'a>(&'a std::sync::Condvar);
+
+impl Drop for ScopeIdleNotify<'_> {
+    fn drop(&mut self) {
+        self.0.notify_all();
+    }
 }
 
 /// The complete outer submission object. It is boxed before HQA1 creation so
@@ -1102,7 +1115,11 @@ pub unsafe fn destroy_outer_runtime_context(outer: &mut OuterDevice) {
     };
     let context_generation = context.context_generation;
 
-    if let Some(scope) = crate::forward::lock_ignore_poison(&context.active_scope).take() {
+    let abandoned = {
+        let _wake = ScopeIdleNotify(&context.scope_idle);
+        crate::forward::lock_ignore_poison(&context.active_scope).take()
+    };
+    if let Some(scope) = abandoned {
         let result = outer.translator.close_outer_scope(scope, None);
         log_error!("DDI outer teardown: abandoned live scope result={result:?}");
     }
@@ -1347,6 +1364,7 @@ pub unsafe fn create_runtime_context(outer: &mut OuterDevice) -> i32 {
         last_batch_id: AtomicU64::new(0),
         render_lock: std::sync::Mutex::new(()),
         active_scope: std::sync::Mutex::new(None),
+        scope_idle: std::sync::Condvar::new(),
     });
     let cookie = outer as *mut OuterDevice as *mut c_void;
     if let Err(error) = outer.translator.attach_outer_context(
@@ -1768,6 +1786,9 @@ unsafe fn join_outer_progress(
         .as_ref()
         .ok_or(HeliosTranslatorStatus::UnknownContext)?;
 
+    // Every `?` below may leave the taken scope unreplaced, so the wake is a
+    // drop guard rather than a call at each exit.
+    let wake = ScopeIdleNotify(&context.scope_idle);
     let mut active = crate::forward::lock_ignore_poison(&context.active_scope);
     let cut_progress = if let Some(scope) = active.take() {
         let submitted = submit_outer_scope(outer, context, scope)?;
@@ -1800,6 +1821,7 @@ unsafe fn join_outer_progress(
         signal_hqc1_locked(outer, context)?
     };
     drop(active);
+    drop(wake);
     wait_hqc1(outer, context, target)?;
     let result = progress_result(outer, context);
     result
@@ -1825,16 +1847,48 @@ pub(crate) extern "C" fn dxvk_outer_submit_begin(context: *mut c_void) -> *mut c
     let mut active = crate::forward::lock_ignore_poison(&runtime.active_scope);
     if active.is_some() {
         // 3b: a null here becomes VK_ERROR_DEVICE_LOST in DXVK's allocation
-        // destructor and permanently marks the outer device lost, so the
-        // collision must be named, not swallowed.
-        log_error!(
-            "A7 D3D11 outer scope begin refused: a scope is already active on this context \
-             (concurrent submit/teardown) generation={} endpoint={}",
-            runtime.context_generation,
-            runtime.endpoint_id
-        );
+        // destructor and permanently marks the outer device lost. The opener's
+        // finish/join never blocks on another scope (DXVK holds only
+        // m_mutexQueue / the allocator mutex across begin..finish, and neither
+        // is needed to finish), so a bounded wait cannot deadlock; the bound
+        // keeps a wedged opener loud instead of hanging.
         crate::forward::note_outer_scope_busy();
-        return core::ptr::null_mut();
+        let started = std::time::Instant::now();
+        let bound =
+            std::time::Duration::from_millis(u64::from(crate::knobs::umd_scope_wait_ms()));
+        let deadline = started + bound;
+        while active.is_some() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                log_error!(
+                    "A7 D3D11 outer scope begin refused: a scope stayed active on this context for \
+                     {} ms (wedged concurrent submit/teardown) generation={} endpoint={}",
+                    started.elapsed().as_millis(),
+                    runtime.context_generation,
+                    runtime.endpoint_id
+                );
+                crate::forward::note_outer_scope_wait_timeout();
+                return core::ptr::null_mut();
+            }
+            active = runtime
+                .scope_idle
+                .wait_timeout(active, deadline - now)
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0;
+        }
+        if outer.device_lost.load(Ordering::Acquire) != 0 {
+            return core::ptr::null_mut();
+        }
+        static WAIT_LOGS: AtomicU32 = AtomicU32::new(0);
+        if WAIT_LOGS.fetch_add(1, Ordering::Relaxed) < 64 {
+            log_error!(
+                "A7 D3D11 outer scope begin waited {} us for the active scope \
+                 (concurrent submit/teardown) generation={} endpoint={}",
+                started.elapsed().as_micros(),
+                runtime.context_generation,
+                runtime.endpoint_id
+            );
+        }
     }
     match outer
         .translator
@@ -1863,6 +1917,7 @@ pub(crate) extern "C" fn dxvk_outer_submit_finish(
     let Some(runtime) = outer.context.as_ref() else {
         return VK_ERROR_DEVICE_LOST;
     };
+    let _wake = ScopeIdleNotify(&runtime.scope_idle);
     let mut active = crate::forward::lock_ignore_poison(&runtime.active_scope);
     let Some(scope) = active.take() else {
         return VK_ERROR_DEVICE_LOST;
