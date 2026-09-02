@@ -156,29 +156,57 @@ The UMD comment at `display.rs:287` ("the UMD has already copied before
 pfnPresentCb") was true only for an app-supplied-destination blit; that arm is
 now the one that stages the copy.
 
-**D7 — OPEN: intermittent boot-time death of the KMD's Venus context (guest-blob
-import of an unknown resource id).** Seen twice in `/tmp/helios-qemu-stderr.log`,
-on two different KMDs (22.22.4xx at 20:37Z with `res_id 128`, and the .447
-boot at 23:46Z with `res_id 237`), so it predates the D5b work:
+**D7 — MECHANISM FOUND + FENCE DEPLOYED 2026-09-02 (KMD 22.22.455.0); acceptance
+loop interrupted by a QEMU exit, not yet 10/10.** Intermittent (~1 boot in 10)
+boot-time death of the KMD's Venus context (context 1). Seen twice, on two KMDs
+(20:37Z `res_id 128`, 23:46Z `res_id 237` on .447):
 ```
 vkr: failed to import resource: invalid res_id 237
 vkr: vkAllocateMemory resulted in CS error
 vkr: ring_submit_cmd: vn_dispatch_command failed
 vkr: submit_cmd: early bail due to fatal decoder state
+failed to dispatch context op 5          ← RENDER_CONTEXT_OP_SUBMIT_CMD (the next direct cmd)
 vkr: destroying context 1 (helios) with a valid instance
 ```
-The importing command is the KMD's `import_guest_memory` (`MemoryPNext::
-ImportResource`) for a `build_guest_backed_linear` allocation, issued on the
-KMD ring right after `resource_create_guest_blob` on the control queue. Once
-the ring is fatal (`VnRingFt=1`) every later KMD Venus allocation fails
-(`AcBackFail`), the HTS1 role-1 reply pool cannot be created
-(`HTS1 session REFUSED at pool_create … 0xc0000017`), no process gets a D3D
-device (`TsSessNew` churns hundreds per minute), dwm has no Helios device and
-the desktop is black until the next reboot. Suspect: the ring-side import
-racing the virtqueue-side create/attach of the guest blob (the ring is a
-separate host thread; nothing orders it behind the ctrl queue for this pair),
-or the resource being unref'd by a concurrent teardown before the import
-lands. Not root-caused. A QMP reset recovers it; the boot after was clean.
+Afterwards `VnRingFt=1`, every KMD Venus allocation fails (`AcBackFail`), the
+HTS1 role-1 reply pool cannot be created, `TsSessNew` churns, dwm has no Helios
+device, black desktop until the next boot.
+*Mechanism, read from virglrenderer 1.3.0 (the installed host package):*
+`proxy_context_attach_resource` sends `RENDER_CONTEXT_OP_IMPORT_RESOURCE` over
+the render-server socket with **no reply**; the context process's main thread
+dispatches it (`render_context_dispatch`). The KMD's ring is a separate thread
+(`vkr_ring_thread`) that keeps polling the tail for `idle_timeout` (the KMD sets
+1 ms) after every ring command and runs a new command the instant the tail
+moves. QEMU acks CREATE and ATTACH on the control queue as soon as virglrenderer
+has *queued* the socket op, so the KMD's `import_guest_memory` on the ring can
+execute before the main thread has attached the resource → `vkr_context_get_
+resource` misses → `vkr_context_set_fatal` → ring FATAL. Mesa avoids exactly
+this with `vn_ring_roundtrip` (direct `vkSubmitVirtqueueSeqnoMESA` + ring-side
+`vkWaitVirtqueueSeqnoMESA`, `vkr_ring_wait_virtqueue_seqno`); the KMD never
+issued it.
+*Fix (.455):* `VenusRing::order_after_virtqueue` — one direct
+`vkSubmitVirtqueueSeqnoMESA(ring, ++seqno)` (socket-ordered after the attach)
+then `vkWaitVirtqueueSeqnoMESA(seqno)` written into the ring ahead of the
+import, so the ring thread parks until the attach has been dispatched. Knob
+`D7ImportOrder` (default 1; 0 = the old unordered import, the A/B), mirrored
+in `D7ImOrd`. Breadcrumbs: `D7CrRes/D7CrSeq` (last guest blob created),
+`D7ImRes/D7ImSeq` (last import), `D7RtN` (fences issued this boot),
+`D7RtFail`, `D7ImFail` (import refused), `D7FtRes/D7FtSeq` (the import that
+found the ring fatal), `D7UnRes/D7UnSeq` (an unref of the last-created id —
+hypothesis (b), never observed).
+*Evidence so far:* fence ON: 2 clean boots (`D7RtN` 97-98 fences by login,
+`D7ImFail=0`, `TsSessNew=11`); fence OFF (A/B, with the crumbs armed): 2 clean
+boots. The fault did NOT reproduce in 2 OFF boots; the loop's 3rd reset ended
+with QEMU exiting ~61 s later with nothing on stderr (only four firmware
+`res_flush` lines after the reset; launcher is `-watchdog-action reset`, so not
+the watchdog) — the VM needs an owner relaunch. **Open:** 10 consecutive
+clean boots with the fence ON plus the BLT/flip/xproc regressions; ideally one
+OFF-arm reproduction with `D7FtRes == D7CrRes` for the post-mortem. Tooling:
+`tmp/d7_arm{0,1}.ps1` (arm + zero crumbs + `RegistryKey.Flush()` + 8 s —
+⚠ a hard QMP reset within seconds of a registry write LOSES the write: the
+first A/B boot ran with the knob silently back at 1), `tmp/d7_read.ps1`,
+`tmp/d7_tri.ps1`, and the host-side `tools/d7_boot.py` (verified reset +
+line-offset watch + settle; exit 0 clean / 2 fault / 3 no completion).
 
 **D6 — ✅ ROOT-CAUSED + FIXED 2026-09-02 (mesa 127729df31e + 15e70a58f29; main 748c032).**
 The churn loop was never CCD, vsync, or the KMD: once per ~2.5 s cycle dxgkrnl
@@ -9328,7 +9356,9 @@ Plan:
   `DiagLevel`, `AllocCached`, `DmaGpuFence`, `BindFlushMode`, `DispatchBind`,
   `PresentProbe`, `DisplayHalf`, `DirectFlipCaps`, `CrossAdaptCaps`,
   `BarSegFlags`, `BarSegBaseMB`, `BarSegMode`, `VidMmVramMB`, `FlipCapsX`,
-  `FlipQueueN`, `PresentWmk`.
+  `FlipQueueN`, `PresentWmk`, `D7ImportOrder` (default 1 since 22.22.455.0:
+  fence each KMD ring import behind the control queue with
+  `vkSubmit/WaitVirtqueueSeqnoMESA`; 0 is the D7 A/B, mirrored in `D7ImOrd`).
   It used to list `ScanoutDiag`, which the very next bullet says was RETIRED in
   T6/R901, and to omit six knobs that do exist. Do not add a knob here without
   adding it there, or the reverse.
