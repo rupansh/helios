@@ -179,6 +179,119 @@ pub(crate) unsafe extern "C" fn resource_is_staging_busy(
     0
 }
 
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentThreadId() -> u32;
+}
+
+/// `UmdMapProbe`: one READ map still held by the runtime. Keyed by the
+/// resource handle + subresource so Unmap can re-sample the same bytes.
+struct MapProbeEntry {
+    key: (usize, u32),
+    data: *const u8,
+    extent: usize,
+    t_us: u64,
+    allocation: u32,
+}
+unsafe impl Send for MapProbeEntry {}
+static MAP_PROBE: std::sync::Mutex<Vec<MapProbeEntry>> = std::sync::Mutex::new(Vec::new());
+
+/// Count nonzero u64 samples every 4 KiB across the mapped extent (≤4096
+/// reads), enough to tell an untouched staging buffer from a landed copy.
+unsafe fn map_probe_sample(data: *const u8, extent: usize) -> (u32, u32) {
+    let mut nonzero = 0u32;
+    let mut total = 0u32;
+    let mut offset = 0usize;
+    while offset + 8 <= extent && total < 4096 {
+        if core::ptr::read_volatile(data.add(offset) as *const u64) != 0 {
+            nonzero += 1;
+        }
+        total += 1;
+        offset += 4096;
+    }
+    (nonzero, total)
+}
+
+unsafe fn map_probe_on_map(
+    h: Hdevice,
+    h_resource: ddi::D3D10DDI_HRESOURCE,
+    subresource: u32,
+    map_type: u32,
+    allocation: u32,
+    out: &D3D11_MAPPED_SUBRESOURCE,
+) {
+    // READ = 1, READ_WRITE = 3.
+    if map_type != 1 && map_type != 3 || out.pData.is_null() {
+        return;
+    }
+    let extent = if out.DepthPitch != 0 { out.DepthPitch } else { out.RowPitch } as usize;
+    if extent == 0 {
+        return;
+    }
+    let data = out.pData as *const u8;
+    let (nonzero, total) = map_probe_sample(data, extent);
+    let (completed, last, lost) = helios_device(h)
+        .and_then(|dev| {
+            dev.outer.context.as_ref().map(|ctx| {
+                let p = crate::device_funcs::progress_result(&dev.outer, ctx);
+                (p.completed_progress_value, p.last_submitted_progress_value, p.flags)
+            })
+        })
+        .unwrap_or((0, 0, 0));
+    let t_us = crate::forward::trace_us();
+    log_error!(
+        "MAPPROBE map t={} alloc=0x{:x} sub={} map={} pData={:p} row={} depth={} nz={}/{} hqc1 completed={} last={} flags={} tid={}",
+        t_us,
+        allocation,
+        subresource,
+        map_type,
+        out.pData,
+        out.RowPitch,
+        out.DepthPitch,
+        nonzero,
+        total,
+        completed,
+        last,
+        lost,
+        GetCurrentThreadId()
+    );
+    let mut held = lock_ignore_poison(&MAP_PROBE);
+    if held.len() >= 32 {
+        held.remove(0);
+    }
+    held.push(MapProbeEntry {
+        key: (h_resource.pDrvPrivate as usize, subresource),
+        data,
+        extent,
+        t_us,
+        allocation,
+    });
+}
+
+unsafe fn map_probe_on_unmap(h_resource: ddi::D3D10DDI_HRESOURCE, subresource: u32) {
+    let key = (h_resource.pDrvPrivate as usize, subresource);
+    let entry = {
+        let mut held = lock_ignore_poison(&MAP_PROBE);
+        held.iter().position(|e| e.key == key).map(|i| held.remove(i))
+    };
+    let Some(entry) = entry else {
+        return;
+    };
+    // The runtime still holds the mapping until Unmap returns, so the pointer
+    // is live here; this runs BEFORE the DXVK Unmap.
+    let (nonzero, total) = map_probe_sample(entry.data, entry.extent);
+    log_error!(
+        "MAPPROBE unmap t={} alloc=0x{:x} sub={} nz={}/{} held_us={} tid={}",
+        crate::forward::trace_us(),
+        entry.allocation,
+        subresource,
+        nonzero,
+        total,
+        crate::forward::trace_us().saturating_sub(entry.t_us),
+        GetCurrentThreadId()
+    );
+}
+
 pub(crate) unsafe extern "C" fn resource_map(
     h: Hdevice,
     h_resource: ddi::D3D10DDI_HRESOURCE,
@@ -204,6 +317,9 @@ pub(crate) unsafe extern "C" fn resource_map(
     ) {
         Ok(()) => {
             let allocation = resource_allocation(h_resource);
+            if crate::knobs::umd_map_probe() {
+                map_probe_on_map(h, h_resource, subresource, map_type as u32, allocation, &out);
+            }
             let n = MAP_LOG_COUNT.next();
             if n < 256 || allocation != 0 {
                 trace_line!(
@@ -272,6 +388,9 @@ pub(crate) unsafe extern "C" fn resource_unmap(
     let Some(res) = load_resource(h_resource) else {
         return;
     };
+    if crate::knobs::umd_map_probe() {
+        map_probe_on_unmap(h_resource, subresource);
+    }
     context.Unmap(&*res, subresource);
 }
 

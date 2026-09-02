@@ -27,6 +27,7 @@
 //! | `UmdGuestBacking` | DWORD | `1` since 2026-09-01 (KMD `Hwa2GuestMem` is the other half) |
 //! | `UmdFlushSync` | DWORD | `1` (`pfnFlush` waits for the CS thread's submission; 0 = the old async Flush, the D2 A/B) |
 //! | `UmdScopeWaitMs` | DWORD | `5000` (outer-scope begin waits this long for a concurrent scope; 0 = the old refuse-immediately, the 3b A/B) |
+//! | `UmdMapProbe` | DWORD | `0` (1 = log a byte sample of every READ map at Map and at Unmap — the black-paintcap instrument) |
 //!
 //! The surviving policies are `BoolKnob` ("absent = off, non-zero = on") and
 //! `DwordKnob` ("absent = this default, else the stored value").
@@ -302,4 +303,14 @@ pub(crate) static UMD_SCOPE_WAIT_MS: DwordKnob = DwordKnob::new(c"UmdScopeWaitMs
 /// `HKLM\SOFTWARE\Helios!UmdScopeWaitMs` (REG_DWORD). See [`UMD_SCOPE_WAIT_MS`].
 pub(crate) fn umd_scope_wait_ms() -> u32 {
     UMD_SCOPE_WAIT_MS.get()
+}
+
+/// Instrument for the black mid-BLT paintcap (ROADMAP 2026-09-02): sample a
+/// READ map's bytes at Map and at Unmap. Off by default; two log lines per
+/// READ map when on.
+pub(crate) static UMD_MAP_PROBE: DwordKnob = DwordKnob::new(c"UmdMapProbe", 0);
+
+/// `HKLM\SOFTWARE\Helios!UmdMapProbe` (REG_DWORD). See [`UMD_MAP_PROBE`].
+pub(crate) fn umd_map_probe() -> bool {
+    UMD_MAP_PROBE.get() != 0
 }

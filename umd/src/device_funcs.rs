@@ -1468,7 +1468,7 @@ fn direct_error_status(
     }
 }
 
-fn progress_result(outer: &OuterDevice, context: &RuntimeContext) -> HeliosSyncProgressResultV1 {
+pub(crate) fn progress_result(outer: &OuterDevice, context: &RuntimeContext) -> HeliosSyncProgressResultV1 {
     let last = context.last_submitted_progress.load(Ordering::Acquire);
     // SAFETY: HQC1 construction proved the runtime mapping non-null and detach
     // cannot run until A5 has released the callback reference.
