@@ -84,6 +84,20 @@ pub struct RuntimeContext {
     /// Notified after every site that takes `active_scope` releases the mutex,
     /// so a colliding `dxvk_outer_submit_begin` waits instead of failing (3b).
     pub scope_idle: std::sync::Condvar,
+    /// Who opened the current scope (Win32 tid), from which site
+    /// (1 = submit, 2 = allocation teardown) and when (`trace_us`), so a wait
+    /// that times out names its holder. `wedged_open_us` remembers the holder a
+    /// wait already timed out on: later begins skip the wait for that same
+    /// holder, so a stuck opener costs one bounded wait, not one per call.
+    pub scope_owner: AtomicU32,
+    pub scope_kind: AtomicU32,
+    pub scope_opened_us: AtomicU64,
+    pub wedged_open_us: AtomicU64,
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetCurrentThreadId() -> u32;
 }
 
 /// Wakes `dxvk_outer_submit_begin` waiters when dropped. Declare it BEFORE the
@@ -1365,6 +1379,10 @@ pub unsafe fn create_runtime_context(outer: &mut OuterDevice) -> i32 {
         render_lock: std::sync::Mutex::new(()),
         active_scope: std::sync::Mutex::new(None),
         scope_idle: std::sync::Condvar::new(),
+        scope_owner: AtomicU32::new(0),
+        scope_kind: AtomicU32::new(0),
+        scope_opened_us: AtomicU64::new(0),
+        wedged_open_us: AtomicU64::new(0),
     });
     let cookie = outer as *mut OuterDevice as *mut c_void;
     if let Err(error) = outer.translator.attach_outer_context(
@@ -1853,6 +1871,26 @@ pub(crate) extern "C" fn dxvk_outer_submit_begin(context: *mut c_void) -> *mut c
         // is needed to finish), so a bounded wait cannot deadlock; the bound
         // keeps a wedged opener loud instead of hanging.
         crate::forward::note_outer_scope_busy();
+        let holder_tid = runtime.scope_owner.load(Ordering::Relaxed);
+        let holder_kind = runtime.scope_kind.load(Ordering::Relaxed);
+        let holder_open_us = runtime.scope_opened_us.load(Ordering::Relaxed);
+        let holder_age_ms = || crate::forward::trace_us().saturating_sub(holder_open_us) / 1000;
+        if holder_open_us != 0 && runtime.wedged_open_us.load(Ordering::Relaxed) == holder_open_us {
+            static WEDGE_LOGS: AtomicU32 = AtomicU32::new(0);
+            if WEDGE_LOGS.fetch_add(1, Ordering::Relaxed) < 8 {
+                log_error!(
+                    "A7 D3D11 outer scope begin refused: holder tid={} kind={} still active \
+                     {} ms after a timed-out wait (not waiting again) generation={} endpoint={}",
+                    holder_tid,
+                    holder_kind,
+                    holder_age_ms(),
+                    runtime.context_generation,
+                    runtime.endpoint_id
+                );
+            }
+            crate::forward::note_outer_scope_wait_timeout();
+            return core::ptr::null_mut();
+        }
         let started = std::time::Instant::now();
         let bound =
             std::time::Duration::from_millis(u64::from(crate::knobs::umd_scope_wait_ms()));
@@ -1860,10 +1898,16 @@ pub(crate) extern "C" fn dxvk_outer_submit_begin(context: *mut c_void) -> *mut c
         while active.is_some() {
             let now = std::time::Instant::now();
             if now >= deadline {
+                runtime.wedged_open_us.store(holder_open_us, Ordering::Relaxed);
                 log_error!(
                     "A7 D3D11 outer scope begin refused: a scope stayed active on this context for \
-                     {} ms (wedged concurrent submit/teardown) generation={} endpoint={}",
+                     {} ms (wedged concurrent submit/teardown) holder tid={} kind={} age={} ms \
+                     waiter tid={} generation={} endpoint={}",
                     started.elapsed().as_millis(),
+                    holder_tid,
+                    holder_kind,
+                    holder_age_ms(),
+                    unsafe { GetCurrentThreadId() },
                     runtime.context_generation,
                     runtime.endpoint_id
                 );
@@ -1883,8 +1927,10 @@ pub(crate) extern "C" fn dxvk_outer_submit_begin(context: *mut c_void) -> *mut c
         if WAIT_LOGS.fetch_add(1, Ordering::Relaxed) < 64 {
             log_error!(
                 "A7 D3D11 outer scope begin waited {} us for the active scope \
-                 (concurrent submit/teardown) generation={} endpoint={}",
+                 (concurrent submit/teardown) holder tid={} kind={} generation={} endpoint={}",
                 started.elapsed().as_micros(),
+                holder_tid,
+                holder_kind,
                 runtime.context_generation,
                 runtime.endpoint_id
             );
@@ -1896,6 +1942,13 @@ pub(crate) extern "C" fn dxvk_outer_submit_begin(context: *mut c_void) -> *mut c
     {
         Ok(scope) => {
             *active = Some(scope);
+            runtime
+                .scope_owner
+                .store(unsafe { GetCurrentThreadId() }, Ordering::Relaxed);
+            runtime.scope_kind.store(1, Ordering::Relaxed);
+            runtime
+                .scope_opened_us
+                .store(crate::forward::trace_us().max(1), Ordering::Relaxed);
             context
         }
         Err(error) => {
@@ -2029,7 +2082,13 @@ pub(crate) extern "C" fn dxvk_outer_allocation_teardown_begin(
         mark_outer_lost(outer, "outer allocation teardown begin");
         return core::ptr::null_mut();
     }
-    dxvk_outer_submit_begin(context)
+    let cookie = dxvk_outer_submit_begin(context);
+    if !cookie.is_null() {
+        if let Some(runtime) = outer.context.as_ref() {
+            runtime.scope_kind.store(2, Ordering::Relaxed);
+        }
+    }
+    cookie
 }
 
 /// Reverse half of the immutable HRA1 construction edge. DXVK calls this
