@@ -357,9 +357,11 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   "retired after failed terminal batch", "exact outer join refused" lines;
   dwm pid stable; K9Poison/SxWait/VnRingFt 0; xproc passes. ⚠ The collision
   itself did not fire in any run this session (`outer_scope_busy` 0; it was 1
-  in 9 runs the day before) — the wait path is argued, not field-exercised;
-  the two columns are the watch. It DID fire on the device-restart wedge
-  below, where it named the holder.
+  in 9 runs the day before). **Field-exercised 2026-09-03 (BAED0138):** one
+  BLT+flip run logged `outer scope begin waited 3170 us … holder kind=1`
+  (a submit), `outer_scope_busy` 0→1, timeout 0, run clean — the wait path
+  works as argued. It also fired on the device-restart wedge below, where it
+  named the holder.
 - ✅ **3c RESOLVED 2026-09-02 (KMD .458): the ~38 Hz vblank cadence was a
   SESSION-0 PROBE ARTEFACT, not a display-path loss.** Every earlier
   `tmp/vblank.ps1` number was taken over win_exec (session 0), where every
@@ -414,15 +416,40 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   (was ~4.5 min). BLT+flip + xproc regression clean. `restart-device` is a
   valid knob-switch path again. Files: `tmp/rs/` (rs_1.csv.gz ETW slice,
   dwm-stacks{,-sym}_1.txt, acc_*), `tmp/rs_exp.ps1`, `tmp/rs_acc.ps1`.
-- ⚠ **Instrument flake (2026-09-02): `helios_paintcap` during a BLT-model
-  window is all-black about half the time** (uniform 5534-byte PNG), on the
-  unchanged UMD too (previous-source build: 3 good / 2 black; fix build: 1
-  good / 7 black across three boots — same flake, possibly worse odds). Idle
-  captures are always fine, dwm keeps flipping at ~30/s and `PcIssue`/`PcDone`
-  move, so it is the GDI readback, not composition: every capture trips two
-  DXVK `waitForResource STALLED … resolved after 1 retries` in dwm. Take two
-  captures per BLT run and read the one that shows the window. Memory:
-  `paintcap-blt-window-black-flake`.
+- ✅ **FIXED 2026-09-03 (UMD d54f446 + instrument e78240f, hash BAED0138; KMD
+  .458 unchanged): `helios_paintcap` during a BLT-model window was all-black
+  ~50% of the time — and it was NOT an instrument flake.** Instrument
+  `UmdMapProbe=1` (`HKLM\SOFTWARE\Helios`, default 0; logs `MAPPROBE
+  map/unmap … nz=` per READ map) showed every black capture mapping a
+  1280x800 staging slice that was all-zero at Map AND at Unmap with HQC1
+  fully joined (`completed == last`) — no fence race — and every black slice
+  lay inside ONE 64 MiB DXVK chunk while good ones lay in others. The UMD's
+  `gb-witness` line named the chunk and the KMD counters said why: `GbEnts`
+  (guest-page import refused because the frames fragment into more than the
+  host udmabuf's 1024 runs) equalled the number of dead chunks. The KMD then
+  backs the allocation with a host blob and REPORTS it
+  (`HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED` clear in the write-back), but the UMD
+  published its private pages as the CPU view regardless → two buffers: the
+  GPU writes the host blob, the CPU reads pages nobody writes. Readbacks from
+  that chunk were zero and CPU uploads through it never reached the GPU —
+  silent corruption, not a probe artefact. **Fix:**
+  `allocate_dxvk_internal_wddm_memory` honours the report: a refused create
+  is torn down and retried with a fresh page set (the refused set is HELD
+  across the retry so the heap cannot return the same pages), up to 3
+  retries, then a loud Lock-view fallback; `DDI refusals:` columns 29/30
+  `guest_backing_refused` / `guest_backing_fallback_lock`. The ordinary
+  resource path applies the same rule without the retry. **Evidence
+  (C2CED8E2):** 10/10 captures during BLT windows show the window (was ~50%
+  black), idle capture good; in that run the KMD refused 3 sets (`GbEnts`
+  0→3), accepted on attempt 2 and 3, fallback 0; PcIssue==PcDone,
+  K9Poison/SxWait/VnRingFt 0, dwm pid stable. **Residual:** the refusal rate
+  grows with physical-memory fragmentation (a 64 MiB chunk is 16384 pages in
+  ≤1024 runs); if `guest_backing_fallback_lock` ever moves, the levers are a
+  smaller DXVK host-visible chunk, KMD-allocated contiguous pages for the
+  backing, or the host's udmabuf `list_limit`. The "take two captures per
+  BLT run" rule is retired: one capture is evidence again. Scripts:
+  `tmp/mp_cap.ps1` (one run, probe-paired captures), `tmp/mp_ten.ps1`
+  (N runs × 2 captures + idle, verdicts + Gb*/column deltas).
   (was: Vsync polish: waiter-visible vblank alternates ~16.5/30 ms (~40 Hz effective;
   C# D3DKMTWaitForVerticalBlankEvent probe, both timer resolutions) and the
   heartbeat has 0.2–0.5 s outages around source-ownership transitions;
