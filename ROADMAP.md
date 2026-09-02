@@ -333,6 +333,42 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   QEMU's OPTIMAL read of it is clean black. **NOTE:** this also removes the
   `FLUSH_DEVICE_FLIP`/zombie-adjacent park rejection the D6 write-up cited at
   line ~411; the flip-teardown park now imports too.
+- ✅ **ROOT-CAUSED 2026-09-02 + made loud (UMD 4a7d8c8): dwm helper-device
+  "outer device lost at outer allocation terminal batch" during runs.** It
+  MOVES during runs (~1 in 3 BLT+flip runs, at app-exit, on a late helper
+  device gen=1), so per the directive it was root-caused. The `result=-4`
+  (`VK_ERROR_DEVICE_LOST`) is `teardown_result` DXVK passes in: its allocation
+  destructor sets DEVICE_LOST **silently** when `beginHeliosOuterAllocation
+  Teardown` yields no scope, and the UMD's `dxvk_outer_submit_begin` returned
+  a null scope with NO log whenever another outer scope was already active on
+  the context (`active_scope.is_some()` — one scope per context, opened around
+  each lower submit; a teardown colliding with an in-flight submit, or a
+  leaked scope, hits it). `mark_outer_lost` is a sticky once-logging flag, so
+  every later teardown/join/detach on that device then cascades to
+  DEVICE_LOST silently — `outer_lost` staying flat HIDES ongoing failures (a
+  run with a failed terminal token and outer_lost+0 proved it), and that
+  helper's allocation teardowns never run again for its lifetime (a slow
+  leak; dwm survives). Ruled out with evidence: host venus fault (none), KMD
+  refusal (full Nr2*/K11*/TsSess* delta identical on failing vs clean runs),
+  any logged ICD `HTS1`/`HNR2` or UMD `HOB1` refusal (none for dwm). DXVK's
+  own precursor: `waitForResource STALLED … queue fully drained` ×3 then
+  `exact Helios teardown refused` ×4. Distinct from the boot-time 0–2/boot
+  `HOB1 Render refused hr=0x80004005` class (D3DKMTRender E_FAIL, D6-family,
+  first seconds, stable — not chased). **Landed:** log the collision
+  (generation+endpoint) and count it as the 26th `DDI refusals:` column
+  `outer_scope_busy` (appended last, diff contract kept); zero behaviour
+  change; verified loaded in dwm by its process module list (hash 60FF762C).
+  **Instrument seen firing:** 1 in 9 BLT+flip runs — `outer_scope_busy` 0→1,
+  log `… a scope is already active on this context … generation=1
+  endpoint=2`. That hit had `outer_lost+0 failed_terminal+0`: it came from
+  `dxvk_outer_submit_begin`'s OTHER caller, the regular submit path, which
+  tolerates a null scope silently, while the allocation-teardown caller turns
+  the same null into DEVICE_LOST — one mechanism, two severities; a following
+  "failed terminal batch" line tells them apart.
+  **Follow-up (the real fix):** serialize `dxvk_outer_submit_begin` on a
+  Condvar (wait for `active_scope` to clear, don't fail) — deadlock-free since
+  the opener's finish/sync-join never blocks on a scope; `outer_scope_busy` is
+  the before/after metric.
 - Vsync polish: waiter-visible vblank alternates ~16.5/30 ms (~40 Hz effective;
   C# D3DKMTWaitForVerticalBlankEvent probe, both timer resolutions) and the
   heartbeat has 0.2–0.5 s outages around source-ownership transitions;
@@ -465,7 +501,10 @@ clean boot restores the desktop with D2/D3 in place. (b) On every boot dwm's
 generation-2 (transient) device still logs `A7 D3D11 outer device lost at outer
 allocation terminal batch` (`result=-4` teardown joins on tokens 19/30/31) —
 the D1 teardown-join family on a transient device; the compositor device is
-unaffected. Keep it on the D5 list rather than reopening D1.
+unaffected. Keep it on the D5 list rather than reopening D1. → **Superseded
+2026-09-02:** not a D1 join — it is the silent `dxvk_outer_submit_begin`
+outer-scope collision (see the Task-3 iron "outer device lost at outer
+allocation terminal batch" and memory `dwm-outer-scope-collision-3b`).
 **D5 reproduces deterministically and is NOT today's UMD changes.** Clean boot,
 `\helios_triangle` (BLT_DISCARD, 20 s): the app never returns from its FIRST
 `pfnPresentCb` (`present-boundary entry #1` logged, no callback; main thread in
