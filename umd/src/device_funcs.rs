@@ -1824,6 +1824,16 @@ pub(crate) extern "C" fn dxvk_outer_submit_begin(context: *mut c_void) -> *mut c
     }
     let mut active = crate::forward::lock_ignore_poison(&runtime.active_scope);
     if active.is_some() {
+        // 3b: a null here becomes VK_ERROR_DEVICE_LOST in DXVK's allocation
+        // destructor and permanently marks the outer device lost, so the
+        // collision must be named, not swallowed.
+        log_error!(
+            "A7 D3D11 outer scope begin refused: a scope is already active on this context \
+             (concurrent submit/teardown) generation={} endpoint={}",
+            runtime.context_generation,
+            runtime.endpoint_id
+        );
+        crate::forward::note_outer_scope_busy();
         return core::ptr::null_mut();
     }
     match outer
