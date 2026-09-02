@@ -475,6 +475,50 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   DxgKrnl BlockThread(FLUSH_DEVICE_FLIP) slice around whatever teardown
   produced it (dwm restart / modeset / compositor device teardown are the
   candidates), then the A/B is `MpoVsyncZero` 1 vs 0 with `MpoVs0` moving.
+- ✅ **FIXED 2026-09-03 (KMD 22.22.468.0, 68e978d; UMD E52D50F9 = 827f55b +
+  dxvk d53d308): every windowed BLT-model window showed only its FIRST frame
+  in dwm's composition — 3DMark's CEF window white/stuck, a window move
+  "unfroze" it once (new surface).** Oracle: `tools/d3d11_blt_anim_probe.cpp`
+  (RED/GREEN/BLUE at 10 fps, the title carries the frame) + PrintWindow
+  (`tmp/win_print.ps1`, `tmp/anim_matrix.ps1`, `tmp/aj_fine.ps1`): every
+  variant (DISCARD/SEQUENTIAL, ±SHADER_INPUT) held RED while the title
+  advanced. Instrumented .462 settled it in one run: the KMD present copy
+  landed FRESH in the destination's host blob every frame (middle pixel
+  cycling), yet `DXGK_ALLOCATIONLIST` said dst **SegmentId 0 / address 0 at
+  every DdiPresent**, no PgTo/PgTi/PgAm carried it, and the PTE shadow held
+  exactly its 336 system PTEs. VidMm homes
+  `D3DKMDT_STANDARDALLOCATION_STAGINGSURFACE` in SYSTEM memory and maps it to
+  the GPU with `UPDATE_PAGE_TABLE` (`AllocationOffsetInBytes` +
+  `FirstPteVirtualAddress`, split at page-table boundaries); dwm's CPU reads
+  those pages; the KMD wrote a blob nobody reads. **Fix:**
+  `create_allocation::system_page_join_update` — once
+  `paging_pte_shadow.resolve()` yields every page of the surface, a guest
+  blob over them (borrowed; VidMm keeps them locked), `import_guest_memory`,
+  and the present copy targets it (alias keyed by memory, `PcAliasSw`);
+  invalidation/destroy release. Staging charges a 64 KiB multiple (udmabuf
+  rule). Pure admit/coalesce: `kmd_logic/src/system_page_join.rs`.
+  **Measured out:** MAP_APERTURE_SEGMENT never carries the dst (its maps were
+  HVM1 pools + 3840-page NULL-handle maps, `PgAzN`); ⛔
+  `ShareBackingStoreWithKmd=1` on the staging surface makes dxgkrnl STOP
+  issuing BLT presents (PcIssue flat) and the window is WHITE — never set it;
+  `Cached` off / `AccessedPhysically` for staging left SegmentId 0 (knob
+  removed). **Evidence (.467/.468):** 9–11/9–11 captures per variant cycle
+  through all three colours; `PgSjP=0`, no `PgSjX`; the residual white
+  captures (2/12, SEQUENTIAL) are the probe's OWN `WM_ERASEBKGND` into the
+  shared redirection surface (0/12 and 0/12 with `noerase`, cf7d767).
+  Regression: 2× BLT+flip with mid-BLT captures, xproc, health, one
+  restart-device (3× HQC1 release, desktop) — clean. Counters: `PgSjN`,
+  `PgSj`, `PgSjP`, `PgSjR`, `PgSjU`, `PgSjE`, `PgSjX` (reason<<8|kind),
+  `PcAliasSw`, `PgAjI`. ⚠ `PgSjX=0x405` from .466 persisted across boots —
+  `Remove-ItemProperty` a refusal column before trusting it.
+  **Found on the way and fixed:** `query_get_data` dropped `S_FALSE`
+  (`pfnSetErrorCb` never got `DXGI_DDI_ERR_WASSTILLDRAWING`, so every event
+  query looked complete at once — 827f55b) and record-only DXVK never
+  flushed a query spin (d53d308, `tools/d3d11_event_query_probe.cpp`).
+  ⚠ dxgkrnl caches the UMD name at adapter start: a fresh `win_install_umd`
+  reaches NEW processes only after `pnputil /restart-device` or a reboot, and
+  `win_install_kmd` refreshes the package UMD from `umd/target/release`.
+  Tools: `tools/etw-present-report.py` (per-pid DxgKrnl function counts).
 - `Nr2OuterRej` code 5 (`SessionClosed`) ×2 per flip run, completed via
   `Nr2RefCmp` — benign under churn AND on the fixed boot; watch, don't chase.
 - Observability: `VsCls`/`VsLive`/`CtlInt` registry values flush only at the
