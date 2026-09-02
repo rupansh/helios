@@ -1729,6 +1729,36 @@ pub(crate) fn resource_create_guest_blob(
     created
 }
 
+/// Guest blob over pages the KMD does NOT own (system pages VidMm mapped for an
+/// allocation and unmaps itself): no finalizer, so the terminal unref releases
+/// nothing. The caller must unref before VidMm invalidates the mapping.
+pub(crate) fn resource_create_guest_blob_borrowed(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx_id: u32,
+    blob_flags: u32,
+    size: u64,
+    entries: &[VirtioGpuMemEntry],
+) -> Result<u32, VirtioError> {
+    if !super::control_owner::KMD_D2_OWNER_ENABLED {
+        return Err(VirtioError::DeviceError);
+    }
+    let mut finalize = |finalizer| finalize_resource_backing(passive, adapter, finalizer);
+    resource_create_blob_owned(
+        passive,
+        adapter,
+        ctx_id,
+        VIRTIO_GPU_BLOB_MEM_GUEST,
+        blob_flags,
+        0,
+        size,
+        entries,
+        None,
+        ResourceBackingFinalizer::none(),
+        &mut finalize,
+    )
+}
+
 fn create_blob_request(
     mut cmd: VirtioGpuResourceCreateBlob,
     entries: &[VirtioGpuMemEntry],

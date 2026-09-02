@@ -211,6 +211,15 @@ struct AllocationContext {
     /// retry). Created under the venus mutex, destroyed in
     /// `destroy_allocation_ctx` before the backing goes.
     present_alias_image: AtomicU64,
+    /// Memory id `present_alias_image` was created over; the alias is dropped
+    /// when the present view's memory differs (system-page join/release).
+    present_alias_memory: AtomicU64,
+    /// System-page join (`system_page_join_update`): guest blob + KMD-device
+    /// memory imported over the system pages VidMm mapped for this staging
+    /// surface, so the present copy lands where dwm's CPU reads. 0 = none.
+    join_resource_id: AtomicU32,
+    join_memory_id: AtomicU64,
+    join_memory_size: AtomicU64,
     /// How many times this allocation's `resource_id` was substituted into a
     /// generated `VkImportMemoryResourceInfoMESA` operand — i.e. how many times
     /// a host `VkDeviceMemory` was bound to THIS blob. Zero on an allocation
@@ -2344,6 +2353,7 @@ pub(crate) struct PresentCopyAllocation {
     pub venus_image_id: u64,
     pub venus_alloc_size: u64,
     pub alias: &'static AtomicU64,
+    pub alias_memory: &'static AtomicU64,
 }
 
 /// Resolve a present allocation-list handle to its copy facts.
@@ -2363,13 +2373,215 @@ pub(crate) unsafe fn present_copy_allocation(h: HANDLE) -> Option<PresentCopyAll
     if ctx.resource_id.load(Ordering::Acquire) == 0 {
         return None;
     }
+    // While joined, the copy targets the memory over VidMm's system pages —
+    // the bytes dwm's CPU reads — not the host blob.
+    let join_memory = ctx.join_memory_id.load(Ordering::Acquire);
+    let (venus_memory_id, venus_alloc_size) = if join_memory != 0 {
+        (join_memory, ctx.join_memory_size.load(Ordering::Acquire))
+    } else {
+        (ctx.venus_memory_id, ctx.venus_alloc_size)
+    };
     Some(PresentCopyAllocation {
         hwa2,
-        venus_memory_id: ctx.venus_memory_id,
+        venus_memory_id,
         venus_image_id: ctx.venus_image_id,
-        venus_alloc_size: ctx.venus_alloc_size,
+        venus_alloc_size,
         alias: &ctx.present_alias_image,
+        alias_memory: &ctx.present_alias_memory,
     })
+}
+
+/// Create a guest blob over VidMm's pages (borrowed: VidMm keeps them locked
+/// while mapped), import it on the KMD device and make it the present-copy
+/// target for `ctx`. Err = host step that failed.
+fn join_import(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    ctx: &AllocationContext,
+    size: u64,
+    entries: &[VirtioGpuMemEntry],
+) -> Result<u32, u32> {
+    let resource_id = crate::virtio::ctrl::resource_create_guest_blob_borrowed(
+        passive,
+        adapter,
+        ctx.ctx_id,
+        VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE | VIRTIO_GPU_BLOB_FLAG_USE_SHAREABLE,
+        size,
+        entries,
+    )
+    .map_err(|_| 1u32)?;
+    let imported = adapter.with_venus_client(passive, |c| {
+        let memory = c.import_guest_memory(adapter, resource_id, size)?;
+        // The alias over the host blob is dead from here; VidMm quiesces the
+        // allocation's GPU work before it rebinds or maps it.
+        let alias = ctx.present_alias_image.swap(0, Ordering::AcqRel);
+        if alias != 0 && alias != PRESENT_ALIAS_REFUSED {
+            let _ = c.destroy_present_alias_buffer(adapter, alias);
+        }
+        Ok::<u64, crate::virtio::VirtioError>(memory.get())
+    });
+    let memory_id = match imported {
+        Ok(Ok(memory_id)) => memory_id,
+        _ => {
+            if crate::virtio::ctrl::ctx_detach_resource(passive, adapter, ctx.ctx_id, resource_id)
+                .is_ok()
+            {
+                let _ = crate::virtio::ctrl::resource_unref(passive, adapter, resource_id);
+            }
+            return Err(2);
+        }
+    };
+    ctx.join_memory_size.store(size, Ordering::Release);
+    ctx.join_resource_id.store(resource_id, Ordering::Release);
+    ctx.join_memory_id.store(memory_id, Ordering::Release);
+    Ok(resource_id)
+}
+
+/// `DXGK_OPERATION_UPDATE_PAGE_TABLE` for a staging surface. VidMm homes the
+/// compositor's present destination in system memory and maps those pages to
+/// the GPU here (allocation-list SegmentId 0, 336 system PTEs per surface,
+/// 2026-09-03); dwm's CPU reads them while the present copy wrote the host
+/// blob. Once the shadow resolves every page of the allocation as a valid
+/// segment-0 PTE the pages are joined (`PgSj`; `PgSjP` counts updates that
+/// left the range incomplete — VidMm splits a surface at page-table
+/// boundaries); an update invalidating any of them releases the join
+/// (`PgSjR`); foreign shapes are refused and counted (`PgSjX` reason<<8|kind).
+///
+/// # Safety
+/// `update` is dxgkrnl's descriptor for this call; its PTE array holds
+/// `NumPageTableEntries` entries (one when `Repeat`).
+pub(crate) unsafe fn system_page_join_update(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    update: &DXGK_BUILDPAGINGBUFFER_UPDATEPAGETABLE,
+) {
+    use helios_kmd_logic::system_page_join as logic;
+    if update.PageTableLevel != 0
+        || update.NumPageTableEntries == 0
+        || update.pPageTableEntries.is_null()
+    {
+        return;
+    }
+    let Some(ctx) = (unsafe { resolve_alloc(update.hAllocation) }) else {
+        return;
+    };
+    let Some(desc) = ctx.final_hwa2.as_ref() else {
+        return;
+    };
+    if desc.allocation_kind != logic::STANDARD_STAGING_KIND {
+        return;
+    }
+    static CALLS: AtomicU32 = AtomicU32::new(0);
+    crate::diag::record_named_bytes(b"PgSjN", CALLS.fetch_add(1, Ordering::Relaxed) + 1);
+    crate::diag::record_named_bytes(b"PgSjOff", update.AllocationOffsetInBytes as u32);
+    crate::diag::record_named_bytes(b"PgSjNum", update.NumPageTableEntries);
+    let refuse = |reason: u32| {
+        crate::diag::record_named_bytes(b"PgSjX", (reason << 8) | desc.allocation_kind);
+    };
+    let repeat = unsafe { update.Flags.Repeat() } != 0;
+    let count = update.NumPageTableEntries as usize;
+    let mut invalid = false;
+    for i in 0..count {
+        let pte = unsafe {
+            core::ptr::read_unaligned(update.pPageTableEntries.add(if repeat { 0 } else { i }))
+        };
+        let bits = unsafe { pte.__bindgen_anon_1.__bindgen_anon_1 };
+        if bits.Valid() == 0 || bits.Zero() != 0 || bits.Segment() != 0 {
+            invalid = true;
+            break;
+        }
+    }
+    let joined = ctx.join_memory_id.load(Ordering::Acquire) != 0;
+    if invalid {
+        if joined {
+            join_release(passive, adapter, ctx);
+            crate::diag::record_named_bytes(b"PgSjR", ctx.resource_id());
+        }
+        return;
+    }
+    if repeat {
+        // One page mapped everywhere is not a backing.
+        return refuse(0xA);
+    }
+    if joined {
+        // VidMm remapped a joined surface: the pages may have moved.
+        join_release(passive, adapter, ctx);
+        crate::diag::record_named_bytes(b"PgSjR", ctx.resource_id());
+    }
+    let request = logic::JoinRequest {
+        allocation_kind: desc.allocation_kind,
+        host_blob: ctx.bar_eligible && ctx.resource_id() != 0 && ctx.venus_memory_id != 0,
+        joined: false,
+        byte_size: desc.byte_size,
+        offset_in_pages: 0,
+        number_of_pages: ctx.size as u64 / PAGE as u64,
+        pages_present: true,
+    };
+    let size = match logic::admit(&request) {
+        Ok(size) => size,
+        Err(reason) => return refuse(reason as u32),
+    };
+    // VidMm maps a surface in as many updates as page tables it spans; the
+    // shadow (`update_leaf`, just run) holds the union. Join once every page
+    // of the allocation resolves; until then count the wait (`PgSjP`).
+    let Some(base_va) = update
+        .FirstPteVirtualAddress
+        .checked_sub(update.AllocationOffsetInBytes)
+    else {
+        return refuse(logic::JoinRefusal::Offset as u32);
+    };
+    let Some(pfns) = adapter.paging_pte_shadow.resolve(base_va, size) else {
+        crate::diag::record_named_bytes(b"PgSjP", update.AllocationOffsetInBytes as u32);
+        return;
+    };
+    let mut entries: Vec<VirtioGpuMemEntry> = Vec::new();
+    if entries.try_reserve_exact(UDMABUF_LIST_LIMIT_ENTRIES).is_err() {
+        return refuse(logic::JoinRefusal::Runs as u32);
+    }
+    entries.resize(
+        UDMABUF_LIST_LIMIT_ENTRIES,
+        VirtioGpuMemEntry {
+            addr: 0,
+            length: 0,
+            padding: 0,
+        },
+    );
+    let runs = match logic::coalesce(&pfns, &mut entries) {
+        Ok(runs) => runs,
+        Err(reason) => return refuse(reason as u32),
+    };
+    entries.truncate(runs);
+    match join_import(passive, adapter, ctx, size, &entries) {
+        Ok(resource_id) => crate::diag::record_named_bytes(b"PgSj", resource_id),
+        Err(stage) => crate::diag::record_named_bytes(b"PgSjE", stage),
+    }
+}
+
+/// Drop the join's alias, memory and guest resource (order: buffer, memory,
+/// resource). Idempotent; a no-op when not joined.
+fn join_release(passive: PassiveLevel, adapter: &AdapterContext, ctx: &AllocationContext) {
+    let memory_id = ctx.join_memory_id.swap(0, Ordering::AcqRel);
+    let resource_id = ctx.join_resource_id.swap(0, Ordering::AcqRel);
+    ctx.join_memory_size.store(0, Ordering::Release);
+    if memory_id == 0 {
+        return;
+    }
+    let _ = adapter.with_venus_client(passive, |c| {
+        if ctx.present_alias_memory.load(Ordering::Acquire) == memory_id {
+            let alias = ctx.present_alias_image.swap(0, Ordering::AcqRel);
+            if alias != 0 && alias != PRESENT_ALIAS_REFUSED {
+                let _ = c.destroy_present_alias_buffer(adapter, alias);
+            }
+        }
+        let _ = c.free_memory_blob(adapter, memory_id);
+    });
+    if resource_id != 0
+        && crate::virtio::ctrl::ctx_detach_resource(passive, adapter, ctx.ctx_id, resource_id)
+            .is_ok()
+    {
+        let _ = crate::virtio::ctrl::resource_unref(passive, adapter, resource_id);
+    }
+    crate::diag::record_named_bytes(b"PgSjU", resource_id);
 }
 
 /// Geometry `DxgkDdiDescribeAllocation` reports, from a magic-checked handle.
@@ -2853,6 +3065,7 @@ unsafe fn destroy_allocation_ctx(
     seq: u32,
 ) {
     sample_hvm1_backing(&ctx);
+    join_release(passive, adapter, &ctx);
     // D5b alias first: dxgkrnl retires every present DMA buffer referencing
     // this allocation before DestroyAllocation, so no copy still reads it.
     let alias = ctx.present_alias_image.load(Ordering::Acquire);
@@ -4316,6 +4529,13 @@ unsafe fn admit_hwa2(
     // host-rounded image requirement; charging the smaller number would make
     // VidMm account less storage than the content engine owns.
     let charged = created.blob_size.bytes().max(desc.byte_size);
+    // A staging surface charges a host-granularity multiple so its aperture
+    // map carries the pages the join's guest blob needs (`system_page_join::admit`).
+    let charged = if desc.allocation_kind == HELIOS_HWA2_KIND_STANDARD_STAGING {
+        charged.div_ceil(HELIOS_CPU_BACKING_HOST_GRANULARITY) * HELIOS_CPU_BACKING_HOST_GRANULARITY
+    } else {
+        charged
+    };
     let vidmm_size = round_up_page(if charged == 0 {
         PAGE
     } else {
@@ -4325,6 +4545,9 @@ unsafe fn admit_hwa2(
     Ok(AdmittedAllocation {
         kind: desc.allocation_kind,
         hvm1_role: 0,
+        // ⛔ Not for staging surfaces either (2026-09-03): with the flag set on
+        // the compositor's present destination, dxgkrnl stopped issuing BLT
+        // presents to DdiPresent (PcIssue flat) and the window went white.
         share_backing_store: HWA2_SHARE_BACKING_STORE_WITH_KMD,
         generation,
         final_hwa2: Some(desc),
@@ -4830,6 +5053,10 @@ unsafe fn create_one(
         venus_memory_id: backing.map_or(0, |b| b.venus_memory_id),
         venus_image_id: backing.map_or(0, |b| b.venus_image_id),
         present_alias_image: AtomicU64::new(0),
+        present_alias_memory: AtomicU64::new(0),
+        join_resource_id: AtomicU32::new(0),
+        join_memory_id: AtomicU64::new(0),
+        join_memory_size: AtomicU64::new(0),
         import_operand_substitutions: AtomicU32::new(0),
         size: admitted.vidmm_size,
         width: admitted.width,

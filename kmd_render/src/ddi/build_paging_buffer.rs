@@ -247,6 +247,10 @@ static BAR_APHVM1_RESID: AtomicU32 = AtomicU32::new(0);
 /// check are different findings and were indistinguishable at 22 on .400.
 static BAR_APMAP_NULL_HANDLE: AtomicU32 = AtomicU32::new(0);
 static BAR_APMAP_FOREIGN: AtomicU32 = AtomicU32::new(0);
+/// A staging page-table update arrived above PASSIVE: the system-page join was skipped.
+static BAR_APJOIN_IRQL: AtomicU32 = AtomicU32::new(0);
+/// Page count of the last aperture map whose `hAllocation` was NULL.
+static BAR_APMAP_NULL_PAGES: AtomicU32 = AtomicU32::new(0);
 
 /// An 8-slot ring of every aperture map of >= 256 pages, resolved or not.
 ///
@@ -313,6 +317,8 @@ static PAGING_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(b"PgAhR", &BAR_APHVM1_RESID),
         f(b"PgAmF", &BAR_APMAP_FOREIGN),
         f(b"PgAmZ", &BAR_APMAP_NULL_HANDLE),
+        f(b"PgAjI", &BAR_APJOIN_IRQL),
+        e(b"PgAzN", &BAR_APMAP_NULL_PAGES),
     ],
     ticks: &PAGING_FLUSH_TICKS,
     failures: &PAGING_FLUSH_FAILURES,
@@ -508,7 +514,7 @@ impl PagingPteShadow {
 
     /// Resolve a paging-process GPU-VA byte range to the exact ordered physical
     /// pages currently supplied by VidMm.
-    fn resolve(&self, virtual_address: u64, size: u64) -> Option<Vec<u64>> {
+    pub(crate) fn resolve(&self, virtual_address: u64, size: u64) -> Option<Vec<u64>> {
         if size == 0 {
             return Some(Vec::new());
         }
@@ -1189,7 +1195,10 @@ unsafe fn record_aperture_census(operation: &PagingOperation<'_>) {
     let null_handle = map.hAllocation.is_null();
     let alloc = unsafe { paging_alloc_info(map.hAllocation) };
     match (&alloc, null_handle) {
-        (None, true) => BAR_APMAP_NULL_HANDLE.fetch_add(1, Ordering::Relaxed),
+        (None, true) => {
+            BAR_APMAP_NULL_PAGES.store(pages, Ordering::Relaxed);
+            BAR_APMAP_NULL_HANDLE.fetch_add(1, Ordering::Relaxed)
+        }
         (None, false) => BAR_APMAP_FOREIGN.fetch_add(1, Ordering::Relaxed),
         (Some(a), _) => {
             BAR_APMAP_LAST_RESID.store(a.resource_id, Ordering::Relaxed);
@@ -1358,8 +1367,14 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         if !unsafe { crate::ddi::create_allocation::update_outer_gpuva_mapping(update) } {
             return STATUS_INSUFFICIENT_RESOURCES;
         }
-        let track_system_pages = unsafe { paging_alloc_info(update.hAllocation) }
-            .is_some_and(|alloc| alloc.bar_eligible);
+        // Staging surfaces are tracked regardless: the system-page join reads
+        // their whole range back out of the shadow.
+        let track_system_pages = unsafe { paging_alloc_info(update.hAllocation) }.is_some_and(
+            |alloc| {
+                alloc.bar_eligible
+                    || alloc.kind == helios_kmd_logic::system_page_join::STANDARD_STAGING_KIND
+            },
+        );
         // Preserve the exact leaf mapping before retiring the page-table update.
         // Every update clears its Windows-supplied VA range first, including
         // updates for unrelated allocations and explicit unmaps.
@@ -1378,6 +1393,17 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
             // (PgEf) into its atomic, and the next PASSIVE content op mirrors the
             // whole block, so only the latency of that one value changes.
             return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        // System-page join for the compositor's present destination; host
+        // round-trips, so PASSIVE only (counted otherwise).
+        if unsafe { KeGetCurrentIrql() } == PASSIVE_LEVEL_IRQL {
+            let passive = unsafe { crate::irql::PassiveLevel::assume() };
+            // SAFETY: dxgkrnl-owned descriptor valid for the call.
+            unsafe {
+                crate::ddi::create_allocation::system_page_join_update(passive, adapter, update)
+            };
+        } else {
+            BAR_APJOIN_IRQL.fetch_add(1, Ordering::Relaxed);
         }
         return STATUS_SUCCESS;
     }

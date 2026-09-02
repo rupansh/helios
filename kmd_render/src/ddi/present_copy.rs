@@ -39,6 +39,8 @@ static PC_SRC_REFUSED: AtomicU32 = AtomicU32::new(0);
 static PC_DST_REFUSED: AtomicU32 = AtomicU32::new(0);
 static PC_NO_OBJECTS: AtomicU32 = AtomicU32::new(0);
 static PC_ALIAS_CREATED: AtomicU32 = AtomicU32::new(0);
+/// Alias dropped because the surface's memory changed (system-page join/release).
+static PC_ALIAS_SWITCHED: AtomicU32 = AtomicU32::new(0);
 static PC_ALIAS_FAILED: AtomicU32 = AtomicU32::new(0);
 static PC_GEOMETRY: AtomicU32 = AtomicU32::new(0);
 static PC_STRETCH: AtomicU32 = AtomicU32::new(0);
@@ -81,6 +83,7 @@ static PC_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         f(b"PcDstRef", &PC_DST_REFUSED),
         f(b"PcNoObj", &PC_NO_OBJECTS),
         e(b"PcAliasNew", &PC_ALIAS_CREATED),
+        e(b"PcAliasSw", &PC_ALIAS_SWITCHED),
         f(b"PcAliasFail", &PC_ALIAS_FAILED),
         f(b"PcGeom", &PC_GEOMETRY),
         f(b"PcStretch", &PC_STRETCH),
@@ -229,7 +232,6 @@ unsafe fn prepare_inner(
         bump(&PC_DST_REFUSED);
         return None;
     };
-
     // Geometry: SrcRect/DstRect plus the destination clip list, bounded.
     let mut sub_rects = [CopyRect::new(0, 0, 0, 0); MAX_REGIONS];
     let sub_count = args.SubRectCnt as usize;
@@ -414,15 +416,36 @@ fn resolve_alias(
         Ok(TargetClass::LinearBuffer { pitch, offset }) => Target::Buffer { id, pitch, offset },
         _ => Target::Image(id),
     };
-    match allocation.alias.load(Ordering::Acquire) {
-        0 => {}
-        PRESENT_ALIAS_REFUSED => return Err(VenusRefusal::Alias),
-        id => return Ok(as_target(id)),
+    let cached = allocation.alias.load(Ordering::Acquire);
+    if cached != 0 && allocation.alias_memory.load(Ordering::Acquire) != allocation.venus_memory_id {
+        // The memory behind the surface changed (system-page join or release):
+        // the alias over the old memory is dead. VidMm quiesces the
+        // allocation's GPU work before it remaps or unmaps it, so no copy is
+        // in flight on the alias.
+        if cached != PRESENT_ALIAS_REFUSED {
+            let _ = match class {
+                Ok(TargetClass::LinearBuffer { .. }) => {
+                    client.destroy_present_alias_buffer(adapter, cached)
+                }
+                _ => client.destroy_image(adapter, cached),
+            };
+        }
+        allocation.alias.store(0, Ordering::Release);
+        bump(&PC_ALIAS_SWITCHED);
+    } else {
+        match cached {
+            0 => {}
+            PRESENT_ALIAS_REFUSED => return Err(VenusRefusal::Alias),
+            id => return Ok(as_target(id)),
+        }
     }
     // First refusal per allocation only (the sentinel short-circuits after).
     // `PcAliasWhy` = side (1 src, 2 dst) << 8 | reason; `PcAliasDesc` = the
     // refused descriptor's kind | std<<4 | swizzle<<8 | bind<<12.
     let refuse = |reason: u32| {
+        allocation
+            .alias_memory
+            .store(allocation.venus_memory_id, Ordering::Release);
         allocation
             .alias
             .store(PRESENT_ALIAS_REFUSED, Ordering::Release);
@@ -462,6 +485,9 @@ fn resolve_alias(
     };
     match created {
         Ok(id) => {
+            allocation
+                .alias_memory
+                .store(allocation.venus_memory_id, Ordering::Release);
             allocation.alias.store(id, Ordering::Release);
             bump(&PC_ALIAS_CREATED);
             Ok(as_target(id))
