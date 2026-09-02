@@ -614,6 +614,17 @@ impl OpenedWddmAllocation {
     }
 }
 
+/// The KMD did NOT import the offered pages (`HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED`
+/// missing after a successful create). The allocation was torn down again;
+/// the backing comes back so the caller can hold it while it retries.
+enum InternalAllocationError {
+    Hr(i32),
+    GuestBackingRefused(Option<helios_umd_common::cpu_backing::CpuBacking>),
+}
+
+/// How many fresh page sets to offer before falling back to the Lock view.
+const GUEST_BACKING_RETRIES: u32 = 3;
+
 /// Create the exact standalone WDDM allocation that backs one DXVK-internal
 /// VkDeviceMemory, then retain its residency and ownership on this device.
 /// The returned HRA1 value is consumed synchronously by that same
@@ -625,17 +636,70 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
     cpu_visible: bool,
     device_local: bool,
 ) -> Result<HeliosResourceAssociationV1, i32> {
+    // Measured 2026-09-02: the KMD refuses a page set whose frames fragment
+    // into more than the host udmabuf's 1024 runs (one 64 MiB chunk per boot),
+    // and the old code then published those pages as the CPU view anyway —
+    // two buffers, every readback from that chunk all-zero (black paintcap).
+    // Holding the refused set while allocating the next one forces the heap
+    // to hand out different pages.
+    let mut refused: Vec<helios_umd_common::cpu_backing::CpuBacking> = Vec::new();
+    for attempt in 0..=GUEST_BACKING_RETRIES {
+        match allocate_dxvk_internal_wddm_memory_attempt(outer, bytes, cpu_visible, device_local, true) {
+            Ok(association) => {
+                if attempt != 0 {
+                    log_error!(
+                        "DXVK internal allocation: guest backing accepted on attempt {} bytes={}",
+                        attempt + 1,
+                        bytes
+                    );
+                }
+                return Ok(association);
+            }
+            Err(InternalAllocationError::Hr(hr)) => return Err(hr),
+            Err(InternalAllocationError::GuestBackingRefused(backing)) => {
+                note_ddi_refusal(&DDI_REFUSALS.guest_backing_refused);
+                log_error!(
+                    "DXVK internal allocation: KMD refused the offered pages (attempt {} of {}) bytes={}",
+                    attempt + 1,
+                    GUEST_BACKING_RETRIES + 1,
+                    bytes
+                );
+                refused.extend(backing);
+            }
+        }
+    }
+    note_ddi_refusal(&DDI_REFUSALS.guest_backing_fallback_lock);
+    log_error!(
+        "DXVK internal allocation: every page set refused, CPU view falls back to Lock bytes={}",
+        bytes
+    );
+    drop(refused);
+    match allocate_dxvk_internal_wddm_memory_attempt(outer, bytes, cpu_visible, device_local, false) {
+        Ok(association) => Ok(association),
+        Err(InternalAllocationError::Hr(hr)) => Err(hr),
+        Err(InternalAllocationError::GuestBackingRefused(_)) => Err(E_FAIL),
+    }
+}
+
+unsafe fn allocate_dxvk_internal_wddm_memory_attempt(
+    outer: &crate::device_funcs::OuterDevice,
+    bytes: u64,
+    cpu_visible: bool,
+    device_local: bool,
+    offer_pages: bool,
+) -> Result<HeliosResourceAssociationV1, InternalAllocationError> {
     use helios_protocol::{
         HELIOS_HWA2_FLAG_CPU_VISIBLE, HELIOS_HWA2_FLAG_KMD_OWNED_MASK, HELIOS_HWA2_KIND_BUFFER,
         HELIOS_HWA2_MEMORY_CPU_VISIBLE, HELIOS_HWA2_MEMORY_DEVICE_LOCAL, HELIOS_HWA2_MEMORY_SHARED,
         HELIOS_HWA2_SWIZZLE_LINEAR,
     };
+    use InternalAllocationError::Hr;
 
     if bytes == 0 || outer.kt_callbacks.is_null() {
-        return Err(E_INVALIDARG);
+        return Err(Hr(E_INVALIDARG));
     }
     let Some(allocate_cb) = (*outer.kt_callbacks).pfnAllocateCb else {
-        return Err(E_FAIL);
+        return Err(Hr(E_FAIL));
     };
 
     let mut desc = HeliosWddmAllocationDescV2::header(HELIOS_PACKAGE_GENERATION, 0);
@@ -658,18 +722,18 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
             cpu_visible,
             device_local
         );
-        return Err(E_INVALIDARG);
+        return Err(Hr(E_INVALIDARG));
     }
 
     // `UmdGuestBacking`: OUR pages become the allocation's storage on both
     // sides — the KMD imports them as the venus memory, and they are what this
     // UMD publishes as `cpu_mapping`. Off: no buffer, and the CPU view comes
     // from `pfnLockCb`.
-    let mut cpu_backing = if crate::knobs::umd_guest_backing() == 1 && cpu_visible {
+    let mut cpu_backing = if offer_pages && crate::knobs::umd_guest_backing() == 1 && cpu_visible {
         let Some(backing) = helios_umd_common::cpu_backing::CpuBacking::new_page_rounded(bytes)
         else {
             log_error!("DXVK internal allocation REFUSED: no CPU backing for {} bytes", bytes);
-            return Err(E_OUTOFMEMORY);
+            return Err(Hr(E_OUTOFMEMORY));
         };
         // ⭐ POSITIVE CONTROL on the page sharing itself, written BEFORE the
         // allocation exists and never touched again. EVERY page names its own
@@ -745,7 +809,7 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
         );
         let deallocated = h_allocation == 0 || deallocate_standalone(outer, h_allocation);
         finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
-        return Err(if hr != 0 { hr } else { E_OUTOFMEMORY });
+        return Err(Hr(if hr != 0 { hr } else { E_OUTOFMEMORY }));
     }
 
     // Did OUR buffer survive the create, and is the VA we sent the one the KMD
@@ -792,7 +856,7 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
         );
         let deallocated = deallocate_standalone(outer, h_allocation);
         finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
-        return Err(E_OUTOFMEMORY);
+        return Err(Hr(E_OUTOFMEMORY));
     }
     let echoed = HeliosWddmAllocationDescV2 {
         allocation_generation: sent.allocation_generation,
@@ -806,7 +870,27 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
         );
         let deallocated = deallocate_standalone(outer, h_allocation);
         finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
-        return Err(E_OUTOFMEMORY);
+        return Err(Hr(E_OUTOFMEMORY));
+    }
+
+    // REPORT, not echo (KMD create_allocation): the flag is set only when the
+    // KMD really imported our pages. Without it this allocation is a host blob
+    // and our pages are nobody's memory — never publish them as its CPU view.
+    if cpu_backing.is_some()
+        && !desc.has_flag(helios_protocol::HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED)
+    {
+        let deallocated = deallocate_standalone(outer, h_allocation);
+        if !deallocated {
+            log_error!(
+                "DXVK internal allocation: deallocate after refused guest backing FAILED alloc=0x{:x}",
+                h_allocation
+            );
+            finish_cpu_backing_rollback(cpu_backing.take(), false);
+            return Err(Hr(E_OUTOFMEMORY));
+        }
+        // The KMD never locked these pages (every refusal path unlocks), so
+        // they are ours to hold or free.
+        return Err(InternalAllocationError::GuestBackingRefused(cpu_backing.take()));
     }
 
     let resident = match make_resident(outer, h_allocation) {
@@ -814,7 +898,7 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
         Err(resident_hr) => {
             let deallocated = deallocate_standalone(outer, h_allocation);
             finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
-            return Err(resident_hr);
+            return Err(Hr(resident_hr));
         }
     };
     // After residency: locking asks the KMD to populate the CPU host aperture
@@ -832,7 +916,7 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
                     drop(resident);
                     let deallocated = deallocate_standalone(outer, h_allocation);
                     finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
-                    return Err(lock_hr);
+                    return Err(Hr(lock_hr));
                 }
             }
         }
@@ -855,7 +939,7 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
             drop(resident);
             let deallocated = deallocate_standalone(outer, h_allocation);
             finish_cpu_backing_rollback(cpu_backing.take(), deallocated);
-            return Err(E_OUTOFMEMORY);
+            return Err(Hr(E_OUTOFMEMORY));
         }
     };
     if let Err((refusal, resident, cpu_backing)) =
@@ -870,7 +954,7 @@ pub(crate) unsafe fn allocate_dxvk_internal_wddm_memory(
         drop(resident);
         let deallocated = deallocate_standalone(outer, h_allocation);
         finish_cpu_backing_rollback(cpu_backing, deallocated);
-        return Err(E_OUTOFMEMORY);
+        return Err(Hr(E_OUTOFMEMORY));
     }
     Ok(association)
 }
@@ -1318,6 +1402,23 @@ pub(crate) unsafe fn allocate_wddm_resource(
                 desc.planes[0].row_pitch,
             );
         }
+    }
+
+    // Same rule as the internal path: the KMD reports whether it imported our
+    // pages; refused pages are not this allocation's memory, so the CPU view
+    // comes from Lock instead. (No retry here — resource-sized page sets
+    // rarely exceed the host's 1024-run udmabuf limit.)
+    if cpu_backing.is_some()
+        && !desc.has_flag(helios_protocol::HELIOS_HWA2_FLAG_GUEST_PAGE_BACKED)
+    {
+        note_ddi_refusal(&DDI_REFUSALS.guest_backing_refused);
+        note_ddi_refusal(&DDI_REFUSALS.guest_backing_fallback_lock);
+        log_error!(
+            "DDI allocate_wddm_resource: KMD refused the offered pages alloc=0x{:x} bytes={} -> Lock view",
+            h_allocation,
+            desc.byte_size
+        );
+        drop(cpu_backing.take());
     }
 
     match unsafe { make_resident(&dev.outer, h_allocation) } {

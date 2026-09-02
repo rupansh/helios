@@ -422,6 +422,13 @@ struct DdiRefusals {
     /// A `wait_hqc1` released because the device's adapter LUID no longer
     /// opens (PnP restart): the FromGpu signal it waited for can never execute.
     hqc1_wait_adapter_gone: RefusalCounter,
+    /// The KMD created a DXVK-internal allocation but did not import the
+    /// offered pages (`Gb*` names why); the UMD tore it down and retried with
+    /// a fresh page set instead of publishing pages that are not its memory.
+    guest_backing_refused: RefusalCounter,
+    /// Every retry was refused; the CPU view of that allocation is the Lock
+    /// view, and its data is not the measured configuration.
+    guest_backing_fallback_lock: RefusalCounter,
 }
 
 /// ⚠ Each counter now carries its own NAME (`RefusalCounter`, stage S2), so
@@ -458,12 +465,14 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
     outer_scope_busy: RefusalCounter::new("outer_scope_busy"),
     outer_scope_wait_timeout: RefusalCounter::new("outer_scope_wait_timeout"),
     hqc1_wait_adapter_gone: RefusalCounter::new("hqc1_wait_adapter_gone"),
+    guest_backing_refused: RefusalCounter::new("guest_backing_refused"),
+    guest_backing_fallback_lock: RefusalCounter::new("guest_backing_fallback_lock"),
 };
 
 /// The set, in the order the summary prints them. ⛔ This order is the
 /// evidence contract: `DDI refusals:` lines from different builds are diffed.
 /// The K4 counters are APPENDED so every pre-existing column keeps its place.
-static DDI_REFUSAL_SET: [&RefusalCounter; 28] = [
+static DDI_REFUSAL_SET: [&RefusalCounter; 30] = [
     &DDI_REFUSALS.srv_raw_hazard,
     &DDI_REFUSALS.resource_raw_hazard,
     &DDI_REFUSALS.text_filter_size_ignored,
@@ -492,6 +501,8 @@ static DDI_REFUSAL_SET: [&RefusalCounter; 28] = [
     &DDI_REFUSALS.outer_scope_busy,
     &DDI_REFUSALS.outer_scope_wait_timeout,
     &DDI_REFUSALS.hqc1_wait_adapter_gone,
+    &DDI_REFUSALS.guest_backing_refused,
+    &DDI_REFUSALS.guest_backing_fallback_lock,
 ];
 
 /// One bounded log line carrying every counter.
