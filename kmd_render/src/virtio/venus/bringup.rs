@@ -136,6 +136,7 @@ impl VenusRing {
             reply_map,
             cur: 0,
             notify_seqno: 0,
+            roundtrip_seqno: 0,
             next_handle: NonZeroU64::MIN,
             ctx_id,
             passive,

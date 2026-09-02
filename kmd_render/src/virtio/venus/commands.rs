@@ -165,6 +165,22 @@ impl VenusClient {
                 .copied()
                 .unwrap_or(0xFFFF_FFFF),
         );
+        // D7: the create/attach were acked on the control queue, but the render
+        // worker's main thread may not have dispatched the ATTACH socket op yet
+        // while the ring thread is still polling — fence the import behind it.
+        let seq = crate::virtio::ctrl::d7_next_seq();
+        crate::diag::record_named_bytes(b"D7ImRes", resource_id);
+        crate::diag::record_named_bytes(b"D7ImSeq", seq);
+        if adapter.knobs().d7_import_order {
+            if let Err(e) = self.ring.order_after_virtqueue(adapter) {
+                crate::diag::record_named_bytes(b"D7RtFail", resource_id);
+                return Err(e);
+            }
+            let n = crate::virtio::ctrl::D7_ROUNDTRIPS
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                + 1;
+            crate::diag::record_named_bytes(b"D7RtN", n);
+        }
         let memory_id = self.new_memory_id();
         let w = encode_memory_allocate(
             self.device_id.into(),
@@ -175,7 +191,7 @@ impl VenusClient {
                 memory_type_index,
             },
         );
-        self.ring_command_expect(
+        let failed = match self.ring_command_expect(
             adapter,
             w.as_slice()?,
             ReplyCheck::new(CMD_ALLOCATE_MEMORY)
@@ -184,7 +200,19 @@ impl VenusClient {
                 // The host's own `VkResult`. Without it an import refusal is
                 // just "the host said no", which is not a diagnosis.
                 .result_marks(b"GbImpVk"),
-        )?;
+        ) {
+            Ok(_) => None,
+            Err(e) => Some(e),
+        };
+        if let Some(e) = failed {
+            crate::diag::record_named_bytes(b"D7ImFail", resource_id);
+            if self.ring.fatal {
+                // The pair that killed the ring: this import of this resource.
+                crate::diag::record_named_bytes(b"D7FtRes", resource_id);
+                crate::diag::record_named_bytes(b"D7FtSeq", seq);
+            }
+            return Err(e);
+        }
         // Capacity was reserved above, so push cannot allocate.
         self.owned_memory_blobs.push(memory_id);
         Ok(memory_id)

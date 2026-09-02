@@ -662,6 +662,12 @@ pub mod knobs {
     /// `UmdGuestBacking`; the two flip together. Every refusal falls back to
     /// the host allocation and is counted `Gb*`.
     pub const HWA2_GUEST_MEM: KnobName = KnobName::new(b"Hwa2GuestMem");
+    /// D7 (default 1): fence each ring-side guest-blob import behind the
+    /// control-queue CREATE/ATTACH. The attach is a fire-and-forget socket op
+    /// on the render worker's main thread while the ring thread still polls
+    /// for 1 ms after any ring command, so an unordered import can run first
+    /// ("invalid res_id" → context 1 destroyed). 0 is the A/B.
+    pub const D7_IMPORT_ORDER: KnobName = KnobName::new(b"D7ImportOrder");
     /// Also send the classic `CRTC_VSYNC` (with the applied primary address)
     /// beside the MPO vsync each retrace (default 1). The MPO INFO2 packet
     /// carries only the MPO PresentId, so a CLASSIC `SetVidPnSourceAddress`

@@ -1551,6 +1551,10 @@ fn resource_unref_with_finalizer_mode<F>(
 where
     F: FnMut(ResourceBackingFinalizer) -> Result<(), ResourceBackingFinalizer>,
 {
+    if resource_id == D7_LAST_GUEST_BLOB.load(Ordering::Relaxed) {
+        crate::diag::record_named_bytes(b"D7UnRes", resource_id);
+        crate::diag::record_named_bytes(b"D7UnSeq", d7_next_seq());
+    }
     if super::control_owner::KMD_D2_OWNER_ENABLED {
         let work = adapter.control_owner().begin_resource_unref(resource_id)?;
         let mut cmd = VirtioGpuResourceUnref::zeroed();
@@ -1672,6 +1676,17 @@ where
     )
 }
 
+// D7 post-mortem state: one sequence shared by the create, import and unref
+// sites plus the last guest blob created, so `reg query` says which pair died
+// and whether an unref of that id landed before its import.
+pub(crate) static D7_SEQ: AtomicU32 = AtomicU32::new(0);
+pub(crate) static D7_LAST_GUEST_BLOB: AtomicU32 = AtomicU32::new(0);
+pub(crate) static D7_ROUNDTRIPS: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) fn d7_next_seq() -> u32 {
+    D7_SEQ.fetch_add(1, Ordering::Relaxed) + 1
+}
+
 /// Create and attach a blob whose exact backing is the supplied guest PFN
 /// ranges. The locked MDL is transferred into canonical owner custody before
 /// CREATE can reach the host.
@@ -1693,7 +1708,7 @@ pub(crate) fn resource_create_guest_blob(
         return Err(VirtioError::DeviceError);
     }
     let mut finalize = |finalizer| finalize_resource_backing(passive, adapter, finalizer);
-    resource_create_blob_owned(
+    let created = resource_create_blob_owned(
         passive,
         adapter,
         ctx_id,
@@ -1705,7 +1720,13 @@ pub(crate) fn resource_create_guest_blob(
         None,
         ResourceBackingFinalizer::guest_pages(mdl),
         &mut finalize,
-    )
+    );
+    if let Ok(&resource_id) = created.as_ref() {
+        D7_LAST_GUEST_BLOB.store(resource_id, Ordering::Relaxed);
+        crate::diag::record_named_bytes(b"D7CrRes", resource_id);
+        crate::diag::record_named_bytes(b"D7CrSeq", d7_next_seq());
+    }
+    created
 }
 
 fn create_blob_request(

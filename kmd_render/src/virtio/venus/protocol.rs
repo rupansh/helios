@@ -20,6 +20,10 @@ pub(crate) const CMD_GET_IMAGE_SUBRESOURCE_LAYOUT: u32 = 56;
 pub(crate) const CMD_SET_REPLY_COMMAND_STREAM_MESA: u32 = 178;
 pub(crate) const CMD_CREATE_RING_MESA: u32 = 188;
 pub(crate) const CMD_NOTIFY_RING_MESA: u32 = 190;
+/// Direct-only: records a virtqueue seqno on the ring (`vkr_transport.c`).
+pub(crate) const CMD_SUBMIT_VIRTQUEUE_SEQNO_MESA: u32 = 251;
+/// Ring-only: blocks the ring thread until that seqno has been submitted.
+pub(crate) const CMD_WAIT_VIRTQUEUE_SEQNO_MESA: u32 = 252;
 
 /// `VK_COMMAND_GENERATE_REPLY_BIT_EXT` — set in a command's flags word to request
 /// a reply written into the previously-set reply command stream.

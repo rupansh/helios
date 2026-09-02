@@ -137,6 +137,8 @@ pub(crate) struct AdapterKnobs {
     /// `Hwa2GuestMem` (default 1 since 2026-09-01). See
     /// [`crate::diag::knobs::HWA2_GUEST_MEM`].
     pub hwa2_guest_mem: bool,
+    /// `D7ImportOrder` (default 1). See [`crate::diag::knobs::D7_IMPORT_ORDER`].
+    pub d7_import_order: bool,
 }
 
 impl AdapterKnobs {
@@ -156,6 +158,7 @@ impl AdapterKnobs {
         bar_local_shared: false,
         bar_segment_only: false,
         hwa2_guest_mem: true,
+        d7_import_order: true,
     };
 
     /// Read every knob once. PASSIVE_LEVEL.
@@ -174,6 +177,7 @@ impl AdapterKnobs {
             bar_local_shared: read_config_dword(knobs::BAR_LOCAL_SHARED, 0) != 0,
             bar_segment_only: read_config_dword(knobs::BAR_SEGMENT_ONLY, 0) != 0,
             hwa2_guest_mem: read_config_dword(knobs::HWA2_GUEST_MEM, 1) != 0,
+            d7_import_order: read_config_dword(knobs::D7_IMPORT_ORDER, 1) != 0,
         }
     }
 
@@ -189,6 +193,7 @@ impl AdapterKnobs {
         crate::diag::record_named_bytes(b"BarLcS", knobs.bar_local_shared as u32);
         crate::diag::record_named_bytes(b"BarSgO", knobs.bar_segment_only as u32);
         crate::diag::record_named_bytes(b"Hwa2Gm", knobs.hwa2_guest_mem as u32);
+        crate::diag::record_named_bytes(b"D7ImOrd", knobs.d7_import_order as u32);
         knobs
     }
 }

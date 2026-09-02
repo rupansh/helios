@@ -507,7 +507,8 @@ pub(super) struct VenusRing {
     pub(super) cur: u32,
     /// Monotonic notify seqno.
     pub(super) notify_seqno: u32,
-    /// Monotonic virtqueue roundtrip seqno (for the reply-shmem warm-up).
+    /// Monotonic `vkSubmitVirtqueueSeqnoMESA` seqno (D7 ordering fences).
+    pub(super) roundtrip_seqno: u64,
     /// Next guest-assigned Vulkan handle id. `NonZeroU64` because 0 is
     /// `VK_NULL_HANDLE`: it is the value the handle newtypes exist to keep out
     /// of the wire stream, so the counter must not be able to produce it.
@@ -618,6 +619,31 @@ impl VenusRing {
         w.u32(self.notify_seqno);
         w.u32(0); // VkRingNotifyFlagsMESA
         self.submit_direct(adapter, w.as_slice()?)?;
+        Ok(seqno)
+    }
+
+    /// D7: fence the NEXT ring command behind everything already acked on the
+    /// control queue. The direct `vkSubmitVirtqueueSeqnoMESA` is socket-ordered
+    /// after the CREATE/ATTACH; the ring-side wait parks the ring thread until
+    /// it lands. Written, not published: the caller's next publish carries it.
+    pub(super) fn order_after_virtqueue(
+        &mut self,
+        adapter: &AdapterContext,
+    ) -> Result<u64, VirtioError> {
+        if self.fatal {
+            return Err(VirtioError::DeviceError);
+        }
+        self.roundtrip_seqno = self.roundtrip_seqno.wrapping_add(1);
+        let seqno = self.roundtrip_seqno;
+        let mut w = Writer::new();
+        w.header(CMD_SUBMIT_VIRTQUEUE_SEQNO_MESA, 0);
+        w.u64(self.ring_id);
+        w.u64(seqno);
+        self.submit_direct(adapter, w.as_slice()?)?;
+        let mut w = Writer::new();
+        w.header(CMD_WAIT_VIRTQUEUE_SEQNO_MESA, 0);
+        w.u64(seqno);
+        self.write_to_ring(w.as_slice()?)?;
         Ok(seqno)
     }
 
