@@ -156,8 +156,8 @@ The UMD comment at `display.rs:287` ("the UMD has already copied before
 pfnPresentCb") was true only for an app-supplied-destination blit; that arm is
 now the one that stages the copy.
 
-**D7 — MECHANISM FOUND + FENCE DEPLOYED 2026-09-02 (KMD 22.22.455.0); acceptance
-loop interrupted by a QEMU exit, not yet 10/10.** Intermittent (~1 boot in 10)
+**D7 — ✅ ROOT-CAUSED + FIXED + ACCEPTED 2026-09-02 (KMD 22.22.455.0; main
+998ea80).** Intermittent (~1 boot in 10)
 boot-time death of the KMD's Venus context (context 1). Seen twice, on two KMDs
 (20:37Z `res_id 128`, 23:46Z `res_id 237` on .447):
 ```
@@ -194,28 +194,31 @@ in `D7ImOrd`. Breadcrumbs: `D7CrRes/D7CrSeq` (last guest blob created),
 `D7RtFail`, `D7ImFail` (import refused), `D7FtRes/D7FtSeq` (the import that
 found the ring fatal), `D7UnRes/D7UnSeq` (an unref of the last-created id —
 hypothesis (b), never observed).
-*Evidence so far:* fence ON: 5 clean boots (`D7RtN` 97 fences by login,
-`D7ImFail=0`, `TsSessNew=11`, `helios_triangle` runs `running=True`
-`PcIssue==PcDone`); fence OFF (A/B, crumbs armed): 3 clean boots — the fault
-has not reproduced. **The 10/10 loop is blocked by a VM-infra flake, not by
-D7.** THREE times a hard QMP `system_reset` of the running guest was followed
-by a guest self-power-off: with a QMP monitor held open across the reset
-(`tools/d7_boot.py`), the `RESET` is `guest=false` (mine) but ~61 s later comes
-`SHUTDOWN {"guest":true,"reason":"guest-shutdown"}` and QEMU exits (the launcher
-`wait`s on it). The guest reached only the firmware framebuffer (host log: a
-few `res 0x2` text-strip flushes, never `blob_size 4587520`) — Windows'
-unclean-shutdown recovery (Kernel-Power event 41 every boot), not QEMU, the
-launcher, or the driver. **Method fix:** the acceptance loop now uses a
-GRACEFUL in-guest reboot (`tmp/d7_greboot{0,1}.ps1` = arm + `shutdown /r /t 2
-/f`; watched by `tools/d7_gwatch.py`, no QMP), which exercises the same
-AddAdapter/StartDevice path without tripping recovery. **Open:** finish 10
-consecutive clean fence-ON boots + BLT/flip/xproc regressions; ideally one
-OFF-arm reproduction with `D7FtRes == D7CrRes`. Tooling:
+*Acceptance (met 2026-09-02, KMD .455):* **10 consecutive clean fence-ON
+boots** via graceful in-guest reboot — every one `D7ImOrd=1`, `D7RtN` 96-99
+fences by login, `D7ImFail=D7RtFail=D7FtRes=0`, `VnRingFt=AcBackFail=K9Poison=
+SxWait=0`, `TsSessNew=11`, `helios_triangle` `running=True` `PcIssue==PcDone`.
+Fence OFF (A/B, crumbs armed): 3 clean boots — the fault did NOT reproduce in
+the OFF budget, so there is no captured `D7FtRes==D7CrRes` post-mortem; the
+fix rests on the virglrenderer source mechanism plus the 10/10 result, not on
+an OFF-arm repro. Regressions all pass on .455: **BLT** `helios_triangle` +
+`helios_paintcap` → `tmp/screen_copy.png` shows the green triangle on the blue
+window composited on the live desktop, `dIssue==dDone`, `dFallback=dEnqFail=0`,
+`dAttMiss=+10`; **flip/D6** `helios_triangle_flip` → no leftover
+`d3d11_triangle`, dwm pid unchanged, `K9Poison`/`SxWait` delta 0; **xproc/D3**
+`HeliosXprocProbe` tail `inside(64,64)=cc336699 outside(192,192)=ffffffff`.
+⚠ A hard QMP `system_reset` of a RUNNING guest self-powers-off ~1 in 4 (proven
+via a held-open QMP monitor: my `RESET` is `guest=false`, then
+`SHUTDOWN {"guest":true,"reason":"guest-shutdown"}` ~61 s later, QEMU exits);
+it is Windows' unclean-shutdown recovery, NOT the driver — the boot loop uses a
+graceful reboot to avoid it (BRINGUP_QUIRKS.md). Tooling:
 `tmp/d7_arm{0,1}.ps1` (arm + zero crumbs + `RegistryKey.Flush()` + 8 s —
 ⚠ a hard QMP reset within seconds of a registry write LOSES the write: the
 first A/B boot ran with the knob silently back at 1), `tmp/d7_read.ps1`,
-`tmp/d7_tri.ps1`, and the host-side `tools/d7_boot.py` (verified reset +
-line-offset watch + settle; exit 0 clean / 2 fault / 3 no completion).
+`tmp/d7_tri.ps1`, `tmp/d7_greboot{0,1}.ps1` (arm + graceful reboot), the
+host-side `tools/d7_gwatch.py` (graceful-boot line-offset watch, no QMP) and
+`tools/d7_boot.py` (verified reset + held-open QMP monitor; exit 4 = QEMU
+exited).
 
 **D6 — ✅ ROOT-CAUSED + FIXED 2026-09-02 (mesa 127729df31e + 15e70a58f29; main 748c032).**
 The churn loop was never CCD, vsync, or the KMD: once per ~2.5 s cycle dxgkrnl
