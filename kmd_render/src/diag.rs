@@ -100,7 +100,14 @@ static SERVICE_NAME: [u16; 18] = [
 /// outside every policy this module documents. With the raw writer private,
 /// a future bypass has to be a deliberate edit to this file.
 fn record_named(name: &[u16], mut code: u32) {
-    // SAFETY: PASSIVE_LEVEL (see module note). `name` is a caller-provided
+    // ⛔ Registry writes are illegal above PASSIVE (invariant #1). The bugcheck
+    // path calls display DDIs (SystemDisplayEnable) at HIGH_LEVEL to paint the
+    // BSOD; a write there double-bugchecks 0x10e -> 0xa (2026-09-03). Every
+    // caller is meant to be PASSIVE; gate it so a violation no-ops not crashes.
+    if unsafe { wdk_sys::ntddk::KeGetCurrentIrql() } != 0 {
+        return;
+    }
+    // SAFETY: PASSIVE_LEVEL (checked above). `name` is a caller-provided
     // NUL-terminated UTF-16 value name; ValueData points to a 4-byte DWORD that
     // RtlWriteRegistryValue copies before returning.
     unsafe {

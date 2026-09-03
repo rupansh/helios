@@ -135,16 +135,20 @@ enum PagingOpOutcome {
     Failed(NTSTATUS),
 }
 
-/// The single failure status this DDI returns, for every arm.
+/// The single degrade status this DDI returns for every internal failure.
 ///
-/// STATUS_INSUFFICIENT_RESOURCES is the value the shadow-full arm of this same
-/// function already returns, and it is what two sibling DDIs
-/// (`create_allocation.rs`, `cpu_host_aperture.rs`) were changed to when
-/// STATUS_UNSUCCESSFUL was proven out of contract — dxgkrnl logged it as
-/// "Driver returned an invalid NTSTATUS" 197x with adapter resets. Routing every
-/// arm through one function keeps the legal-return set a one-line audit.
+/// ⛔ MUST be STATUS_SUCCESS. Bugcheck 0x10e (Arg1=0xb) on 2026-09-03 PROVED
+/// `STATUS_INSUFFICIENT_RESOURCES` (0xc000009a) is NOT in BuildPagingBuffer's
+/// legal return set — 3DMark filled the PTE shadow, `update_leaf` returned
+/// false, and dxgkrnl bugchecked "Driver returned an invalid error code from
+/// BuildPagingBuffer". The two documented legal returns are STATUS_SUCCESS and
+/// STATUS_GRAPHICS_INSUFFICIENT_DMA_BUFFER (grow-and-retry); the latter loops
+/// forever on a non-buffer failure. Paging in this paravirtual driver is
+/// host-managed and these arms are auxiliary bookkeeping or best-effort BAR
+/// mirrors, so the honest, non-looping degrade is SUCCESS with the per-site
+/// counter (BAR_ERR_*, PgEf, PgEg) as the loud signal.
 const fn paging_failure() -> NTSTATUS {
-    STATUS_INSUFFICIENT_RESOURCES
+    STATUS_SUCCESS
 }
 
 /// Translate the host's virtio cache nibble for the surviving transient kernel
@@ -183,6 +187,7 @@ static BAR_ERR_BOUNDS: AtomicU32 = AtomicU32::new(0); // op range outside the bl
 static BAR_ERR_VIRTUAL: AtomicU32 = AtomicU32::new(0); // unresolved paging-process VA
 static BAR_ERR_MDL: AtomicU32 = AtomicU32::new(0); // system-MDL kernel map failed
 static BAR_ERR_SHADOW_FULL: AtomicU32 = AtomicU32::new(0); // PTE shadow capacity exhausted
+static BAR_ERR_GPUVA: AtomicU32 = AtomicU32::new(0); // update_outer_gpuva_mapping refused (degraded, not bugchecked)
 /// A classic TRANSFER (`PgEh`) / FILL (`PgFh`) named an `hAllocation` that does
 /// not resolve to a live Helios allocation. Both were bare `return`s: the op did
 /// not run, nothing was counted, and the DDI still answered STATUS_SUCCESS, so
@@ -295,6 +300,7 @@ static PAGING_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         f(b"PgEv", &BAR_ERR_VIRTUAL),
         f(b"PgEx", &BAR_ERR_MDL),
         f(b"PgEf", &BAR_ERR_SHADOW_FULL),
+        f(b"PgEg", &BAR_ERR_GPUVA),
         e(b"PgVp", &BAR_VIRTUAL_PTES),
         e64(b"PgVs", &BAR_LAST_VIRTUAL_SRC),
         e64(b"PgVd", &BAR_LAST_VIRTUAL_DST),
@@ -514,6 +520,11 @@ impl PagingPteShadow {
 
     /// Resolve a paging-process GPU-VA byte range to the exact ordered physical
     /// pages currently supplied by VidMm.
+    /// Live system-PTE count, for the staging-tracking headroom check.
+    pub(crate) fn len(&self) -> usize {
+        self.entries.lock().len()
+    }
+
     pub(crate) fn resolve(&self, virtual_address: u64, size: u64) -> Option<Vec<u64>> {
         if size == 0 {
             return Some(Vec::new());
@@ -1365,16 +1376,22 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
         // paging fence can retire.  An incomplete update is a hard refusal;
         // virtual HOB1 execution must never observe a prefix as current.
         if !unsafe { crate::ddi::create_allocation::update_outer_gpuva_mapping(update) } {
-            return STATUS_INSUFFICIENT_RESOURCES;
+            // ⛔ Never STATUS_INSUFFICIENT_RESOURCES here — see paging_failure (0x10e).
+            BAR_ERR_GPUVA.fetch_add(1, Ordering::Relaxed);
+            return paging_failure();
         }
-        // Staging surfaces are tracked regardless: the system-page join reads
-        // their whole range back out of the shadow.
-        let track_system_pages = unsafe { paging_alloc_info(update.hAllocation) }.is_some_and(
-            |alloc| {
-                alloc.bar_eligible
-                    || alloc.kind == helios_kmd_logic::system_page_join::STANDARD_STAGING_KIND
-            },
-        );
+        // The system-page join reads a staging surface's whole range back out of
+        // the shadow, but 3DMark keeps dozens of staging textures resident and
+        // they must not starve the BAR-transfer shadow of the real (bar_eligible)
+        // allocations — that overflow returned an illegal status and bugchecked
+        // (0x10e, 2026-09-03). Track staging only while the table is under half
+        // full; above that the join degrades to first-frame for new surfaces.
+        let info = unsafe { paging_alloc_info(update.hAllocation) };
+        let track_system_pages = info.is_some_and(|alloc| {
+            alloc.bar_eligible
+                || (alloc.kind == helios_kmd_logic::system_page_join::STANDARD_STAGING_KIND
+                    && adapter.paging_pte_shadow.len() < MAX_PAGING_SYSTEM_PTES / 2)
+        });
         // Preserve the exact leaf mapping before retiring the page-table update.
         // Every update clears its Windows-supplied VA range first, including
         // updates for unrelated allocations and explicit unmaps.
@@ -1391,8 +1408,9 @@ pub unsafe extern "C" fn dxgkddi_build_paging_buffer(
             // the documented PASSIVE contract is not trusted (k-paging-05).
             // Nothing is lost: `update_leaf` already stored `BAR_ERR_SHADOW_FULL`
             // (PgEf) into its atomic, and the next PASSIVE content op mirrors the
-            // whole block, so only the latency of that one value changes.
-            return STATUS_INSUFFICIENT_RESOURCES;
+            // whole block. ⛔ Never STATUS_INSUFFICIENT_RESOURCES — see
+            // paging_failure (0x10e bugcheck, 2026-09-03).
+            return paging_failure();
         }
         // System-page join for the compositor's present destination; host
         // round-trips, so PASSIVE only (counted otherwise).
