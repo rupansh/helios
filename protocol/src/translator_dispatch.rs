@@ -1077,6 +1077,11 @@ pub struct HeliosSyncProgressResultV1 {
     /// context. `completed <= last_submitted` always. A nonblocking status query
     /// that finds `required > completed` returns "not ready" locally, with no
     /// control round trip (section 10.4, lines 1359-1360).
+    ///
+    /// In a blocking JOIN result this is the boundary the join chose when it
+    /// began, not the live value: other threads keep submitting during the
+    /// wait, and validating the "everything pending" form against a re-read
+    /// value lost every submitting device (UMD 8b6553a, 2026-09-03).
     pub last_submitted_progress_value: u64,
     /// `HELIOS_TRANSLATOR_PROGRESS_FLAG_*`.
     pub flags: u32,
