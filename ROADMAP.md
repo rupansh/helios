@@ -627,6 +627,16 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   note). Fix: rotate both fields in lockstep (present.rs). Oracle after
   deploy: a rotating windowed app (`helios_anim_run`, the Demo) shows
   `MissingToken=0` and `sync_token_identity_unverified≈0`.
+- ⚠ **OPEN (KMD, stability): bugcheck 0x76 PROCESS_HAS_LOCKED_PAGES at
+  `shutdown /r` on KMD .476 (2026-09-03 21:24:17, `090326-7343-01.dmp`,
+  uptime 2:38 from the 18:46 boot, desktop at 2413×1533).** P3=0xEC0 = 3,776
+  pages (≈14.7 MiB, the size of that primary) still MDL-locked when the
+  process died; AutoReboot made it look like an ordinary reboot. Earlier
+  1280×800 reboots today did not dump. Suspect: guest-backing / joined pages
+  (`import_guest_memory`, `cpu_backing`) unlocked after process rundown
+  rather than at DestroyAllocation. `TrackLockedPages=1` is now set (Session
+  Manager\Memory Management): the next occurrence bugchecks 0xCB with the
+  locking driver's address in P1 — analyze with the staged pdb.
 - ⚠ **OPEN (KMD, low): `PgEg` (= `BAR_ERR_GPUVA`, `update_outer_gpuva_mapping`
   refused → counted SUCCESS degrade) moved 0→4 during the 18:08 Fire Strike
   run.** Six unnamed false arms (null hProcess/PTEs, offset overflow, `end >
