@@ -1848,10 +1848,25 @@ unsafe fn wait_hqc1(
     // adapter restart has already removed, then never executes the signal;
     // this is the dwm wedge of 2026-09-02 (compositor stuck here forever).
     let started = std::time::Instant::now();
+    let mut stall_logged = false;
     let wait_result = loop {
         let result = WaitForSingleObject(event, HQC1_WAIT_SLICE_MS);
         if result != WAIT_TIMEOUT {
             break result;
+        }
+        // Fire Strike GT1 parked here forever on 2026-09-03 with the KMD
+        // reporting every submission complete; name the three values once.
+        if !stall_logged && started.elapsed().as_secs() >= 5 {
+            stall_logged = true;
+            log_error!(
+                "A7 D3D11 HQC1 wait stalled 5 s: required={} completed={} last_submitted={} \
+                 next_progress={} tid={}",
+                required,
+                context.hqc1_cpu.as_ptr().read_volatile(),
+                context.last_submitted_progress.load(Ordering::Acquire),
+                context.next_progress.load(Ordering::Acquire),
+                GetCurrentThreadId()
+            );
         }
         if let Some(status) = adapter_gone(outer.adapter_luid) {
             CloseHandle(event);
