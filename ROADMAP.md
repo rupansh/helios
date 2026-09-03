@@ -590,13 +590,29 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   loudly. **A/B first (owner-gated host sysctl, no QEMU restart — each
   render-server context gets a fresh socketpair):** `sysctl -w
   net.core.wmem_default=4194304 net.core.rmem_default=4194304`.
-  **⚙ FIX LANDED (KMD 22.22.477.0, 0789aa8; kmd_logic e05e5cc): each
-  Queue/Outer native context owns a session HOST3D+MAPPABLE stream shmem;
-  `enqueue_native_submit` sends any stream > `Nr2InlineMax` (163840) from it
-  via a 64-byte `vkExecuteCommandStreamsMESA`, regions retire in
-  `finish_with_cleanup`, an unplaceable stream is refused (never inline).
-  Deployed 21:22; validation = a CLI Fire Strike run showing `Nr2Ind≥1`,
-  `Nr2IndMax≈418652`, no host receive error, GT1 completing.**
+  **⚙ FIX LANDED (KMD 22.22.478.0 = 0789aa8 + 8c94d97; kmd_logic e05e5cc):
+  the first DdiRender whose payload exceeds `Nr2InlineMax` (163840) creates
+  the context's session-owned HOST3D+MAPPABLE stream shmem (`ensure_stream_shmem`,
+  once per context, PASSIVE); `enqueue_native_submit` sends the over-cap stream
+  from it via a 64-byte `vkExecuteCommandStreamsMESA`, regions retire in
+  `finish_with_cleanup`, and an over-cap stream with no shmem is refused
+  (`Nr2IndRef`) — never inline. ⛔ .477's eager per-context shmem (28 on an
+  idle desktop + Demo) exhausted a bounded resource once the Demo was killed:
+  dwm died of `allocate_wddm_resource hr=0x8007000e` → `outer device lost at
+  HOB1 Render`, its replacement's session init was refused, `Nr2StrmLeak=8`
+  (releases after the session teardown). Validation = a CLI Fire Strike run
+  showing `Nr2StrmN=1`, `Nr2Ind≥1`, `Nr2IndMax≈418652`, no host receive error,
+  GT1 completing. ⚠ The `Nr2StreamKiB=0` value written under the service key
+  did not survive a boot (the KMD rewrites that key at start) — knobs there
+  need checking before an A/B is trusted.**
+- ✅ **FIXED 2026-09-03 (UMD 6253c4c, hash 87CE7666): the second window of the
+  outer-join race — `exact outer join refused: ScopeForeignThread`.** The ICD
+  seals/copies/closes a scope only on the opening thread; the lock-free
+  flush-thread join sealed whatever scope was active, so landing inside the
+  CS thread's begin..finish bracket was refused and killed the device (the
+  Fire Strike Demo at T+614 s, umd-8812.log L6719). The join now leaves a
+  scope owned by another thread and joins via its own HQC1 signal; column
+  `outer_join_foreign_scope` counts the skips.
   **Second defect, same incident — a dead host context is never surfaced:**
   qemu-helios `virtio_gpu_virgl_process_cmd` `return`s from the
   `context_create_fence` failure WITHOUT completing the request (no used-ring
