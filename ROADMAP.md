@@ -534,6 +534,104 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   .476 boots and runs 3DMark with zero new minidumps, counters clean. Memory:
   [[buildpagingbuffer-illegal-status-bugcheck-10e]]. ⛔ LESSON: any illegal
   NTSTATUS from a WDDM DDI bugchecks 0x10e — worse than the failure it reports.
+- ✅ **FIXED 2026-09-03 (UMD 8b6553a, hash 783E89E0): every submitting process
+  lost its outer device at `exact outer join refused: HostCallbackFailed` —
+  the "dwm black ~20 s into a CLI Fire Strike" of the same afternoon.**
+  `join_outer_progress(required=0)` chose its `target` under the scope lock,
+  waited a host round trip, then validated the result against a LIVE re-read of
+  `last_submitted_progress` (`validate_join(0)`: completed ≥ last_submitted).
+  Any submit by another thread during the wait advanced it past `target` →
+  HostCallbackFailed → `mark_outer_lost`. Until dxvk 7a1dde15 the join ran only
+  under `m_mutexQueue`; its 1 Hz flush-thread retire joins lock-free by design,
+  so the race fired within seconds of any submitter: dwm (umd-1840.log
+  L14201), the 3DMark loader (umd-6772.log L198) and StartMenuExperienceHost
+  (umd-7240.log L170) all died on the flush thread one line after another
+  thread's `A7 batch`. Fix: the join's result is bounded by its own target
+  (`join_result`; the ICD's C twin passes on it; no consumer reads the field
+  except the validators); new `DDI refusals:` column `outer_join_overtaken`
+  counts the race — **8,746 in one Fire Strike Demo**, 6/min on an idle dwm,
+  each a device kill before — and the five silent HostCallbackFailed guards on
+  the join path now log their values. ⛔ The "adapter generation 1→2 mid-run"
+  reading was a stale segment: `umd-<pid>.log` appends across boots and dwm's
+  PID is reused every boot (11 `UMD module:` segments in one file); that
+  `generation=` is the outer DEVICE generation, and the `HQC1 wait released …
+  no longer opens` lines were the recovery `restart-device`, not the cause. No
+  LiveKernelEvent/Kernel-PnP/Display event fell inside the run (WER's 13
+  `1b8` reports were 08-29…09-03 02:19 by `Report.wer` EventTime). Memory:
+  [[outer-join-overtaken-race-device-lost]].
+- ⛔ **OPEN — ROOT-CAUSED 2026-09-03, fix designed: Fire Strike GT1 "loading
+  forever" = one inline `SUBMIT_3D` above the render-server proxy's SEQPACKET
+  limit kills the host context, and nothing in the guest ever learns.**
+  Measured on the host: virglrenderer's QEMU↔`virgl_render_server` proxy is a
+  `SOCK_SEQPACKET` socketpair left at the default SO_SNDBUF (`ss -xmp`: every
+  `virgl-N-gpu_ren` socket `tb212992` = `net.core.wmem_default`); a
+  347,720-byte SEQPACKET `send()` on this host fails `EMSGSIZE` (200,000 OK).
+  `render_protocol.h:187` says it outright: submit_cmd inlines 256 B, the rest
+  is "another message; size still must be small". The proxy's failed send
+  leaves `render_context_dispatch_submit_cmd` reading the next 16-byte request
+  as the payload → `failed to receive data: expected 347720 but received 16` →
+  `destroying context 15 (helios)` → every later
+  `virgl_renderer_context_create_fence error: Operation not permitted`. Guest
+  side: GT1's 12,887 batches include exactly ONE over 212,992 B
+  (`HRA1 command_bytes=423832`); the Demo's max is 79,488 and it completes.
+  QEMU caps at 4 MiB, HOB1 at 15 MiB — nothing guards ~208 KB. This is the
+  09-01 hypothesis above ("SEQPACKET truncation"), now measured; the ICD's
+  8 KiB cap hid it until 09-01. **Why the Escape runtime never hit it:** stock
+  venus puts streams in the 1 MiB ring shmem and goes indirect
+  (`vkExecuteCommandStreamsMESA`) above that — SUBMIT_3D only ever carried a
+  notify; the HOB1 path forwards the whole batch inline
+  (`copy_executor_fragment` → `enqueue_submit_inner`).
+  **Fix (guest):** per-native-context HOST3D shmem stream ring (the KMD already
+  creates/maps/attaches these for its venus ring + reply buffer; vkr requires
+  `VIRGL_RESOURCE_FD_SHM` for stream resources, `vkr_transport.c:21/201`);
+  streams above ~160 KiB are copied there and submitted as a 40-byte
+  `vkExecuteCommandStreamsMESA` (opcode 180, mirror `ring_command_reply`'s
+  encoder for 178); regions retire with the wire fence; ring full → refuse
+  loudly. **A/B first (owner-gated host sysctl, no QEMU restart — each
+  render-server context gets a fresh socketpair):** `sysctl -w
+  net.core.wmem_default=4194304 net.core.rmem_default=4194304`.
+  **Second defect, same incident — a dead host context is never surfaced:**
+  qemu-helios `virtio_gpu_virgl_process_cmd` `return`s from the
+  `context_create_fence` failure WITHOUT completing the request (no used-ring
+  entry), so the KMD's ticket stays outstanding forever (`out` stuck at 2),
+  the UMD's HQC1 wait never returns (`wait_hqc1` releases only on adapter
+  gone), `taskkill` leaves an exit-zombie (1 thread, `HasExited=True`), and a
+  later `pnputil /restart-device` HANGS (5+ min, `Nr2Sub` frozen) → guest
+  reboot. Fixes: (a) qemu-helios completes the request with
+  `VIRTIO_GPU_RESP_ERR_UNSPEC` on fence-create failure; (b) the KMD turns a
+  `!response_ok` native terminal into a refused ticket + dead context
+  (refuse every later submission on it) so the UMD sees DeviceLost and the app
+  fails loudly instead of hanging. Memory: [[gt1-stall-seqpacket-proxy-limit]].
+- ⚠ **OPEN — fix written, deploy pending (UMD, `rotate_ring`): a swapchain
+  buffer's outer token and guest pages do not rotate with its allocation.**
+  `dxgi_rotate_resource_identities` rotates `allocation`/`km_resource`/
+  `ownership` between the buffers' `ResourceState`s but leaves
+  `outer_allocation` (the token identity) and `cpu_backing` behind, so after
+  the first rotation every buffer's token names another buffer's allocation:
+  `arm_outer_allocation_teardown` refuses `MissingToken` (`removed=true`) at
+  the first post-rotation teardown and `release_resource` sets `device_lost`
+  SILENTLY (no `outer device lost at` line — grep `teardown REFUSED`), and
+  `sync_token_resource_identity` fails per present
+  (`sync_token_identity_unverified=3686` ≈ 3,680 rotations in the Demo).
+  Seen in the only two logs that rotate (umd-9648 16:41, umd-5940 18:05); the
+  18:05 trigger was a focus-steal-driven swapchain recreate (see tooling
+  note). Fix: rotate both fields in lockstep (present.rs). Oracle after
+  deploy: a rotating windowed app (`helios_anim_run`, the Demo) shows
+  `MissingToken=0` and `sync_token_identity_unverified≈0`.
+- ⚠ **OPEN (KMD, low): `PgEg` (= `BAR_ERR_GPUVA`, `update_outer_gpuva_mapping`
+  refused → counted SUCCESS degrade) moved 0→4 during the 18:08 Fire Strike
+  run.** Six unnamed false arms (null hProcess/PTEs, offset overflow, `end >
+  allocation.size`, `runs > OUTER_GPUVA_MAX_RANGES`, `!can_fit`, push
+  refused); F21 says a partial outer GPUVA map must not be observed by a
+  virtual HOB1. Name the arm (a `PgEgWhy` last-code) before deciding whether
+  it can corrupt an allocation's virtual addressing.
+- ⛔ **Tooling (owner, 2026-09-03): never run `helios_paintcap` — or any
+  focus-taking task — while a 3DMark run is in progress.** It takes focus from
+  the benchmark and 3DMark CANCELS the run (`run_errors status="CANCEL"`,
+  result FAILED, remaining sets skipped) — the 18:01 CLI run lost GT1…Combined
+  to exactly this. Observe through logs/counters only (`tmp/fs_run.ps1`);
+  capture before the run and after "Benchmark completed". Memory:
+  [[never-paintcap-during-a-benchmark]].
 - ⚠ **OPEN — fix landed, GUI validation pending (KMD 22.22.470/471, fb44f16;
   ICD cfae0d33): GUI Fire Strike GT1 stuck at "loading" (2026-09-03).**
   The workload's main thread sat in DXVK's
