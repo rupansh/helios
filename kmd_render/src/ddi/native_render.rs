@@ -368,7 +368,7 @@ pub static NR2_NO_STAGE: AtomicU32 = AtomicU32::new(0);
 pub static NR2_NO_EPOCH: AtomicU32 = AtomicU32::new(0);
 /// The counter names, as one list, so the collision proof and the writer cannot
 /// drift apart.
-const COUNTER_NAMES: [&[u8]; 50] = [
+const COUNTER_NAMES: [&[u8]; 61] = [
     b"Nr2QCtx",
     b"Nr2QCtxRej",
     b"Nr2Scratch",
@@ -419,6 +419,17 @@ const COUNTER_NAMES: [&[u8]; 50] = [
     b"Nr2PrMpo",
     b"Nr2PrOth",
     b"PreN",
+    b"Nr2RsmN",
+    b"Nr2RsmWhy",
+    b"Nr2Strand",
+    b"Nr2OR0",
+    b"Nr2OR1",
+    b"Nr2OR2",
+    b"Nr2OR3",
+    b"Nr2OR4",
+    b"Nr2OR5",
+    b"Nr2OR6",
+    b"Nr2OR7",
 ];
 
 /// The boundary counters that did not fit [`COUNTER_NAMES`]'s block, mirrored
@@ -540,6 +551,17 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(COUNTER_NAMES[47], &crate::ddi::submit_command::PRESENT_PACKETS_MPO),
         e(COUNTER_NAMES[48], &crate::ddi::submit_command::PRESENT_PACKETS_OTHER),
         e(COUNTER_NAMES[49], &crate::ddi::submit_command::PREEMPT_COUNT),
+        f(COUNTER_NAMES[50], &NR2_RESUB_MISMATCH),
+        e(COUNTER_NAMES[51], &NR2_RESUB_WHY),
+        f(COUNTER_NAMES[52], &crate::ddi::submit_command::STRANDED),
+        e(COUNTER_NAMES[53], &NR2_OR_RING[0]),
+        e(COUNTER_NAMES[54], &NR2_OR_RING[1]),
+        e(COUNTER_NAMES[55], &NR2_OR_RING[2]),
+        e(COUNTER_NAMES[56], &NR2_OR_RING[3]),
+        e(COUNTER_NAMES[57], &NR2_OR_RING[4]),
+        e(COUNTER_NAMES[58], &NR2_OR_RING[5]),
+        e(COUNTER_NAMES[59], &NR2_OR_RING[6]),
+        e(COUNTER_NAMES[60], &NR2_OR_RING[7]),
         e(b"Nr2PImpN", &crate::ddi::create_allocation::IMP_PRIMARY_N),
         e(b"Nr2PImpR0", &crate::ddi::create_allocation::IMP_PRIMARY_RID[0]),
         e(b"Nr2PImpR1", &crate::ddi::create_allocation::IMP_PRIMARY_RID[1]),
@@ -743,7 +765,13 @@ struct BatchIdentity {
 static NR2_APPEND_WHY: AtomicU32 = AtomicU32::new(0);
 /// `submit_outer_physical` fallthroughs: count, and the last one's shape
 /// (`Nr2RsmWhy` = slot<<24 | matched<<16 | append_why<<8 | resubmission).
+/// Atomics only: SubmitCommand runs at DISPATCH; `NR2_COUNTERS` publishes them.
 static NR2_RESUB_MISMATCH: AtomicU32 = AtomicU32::new(0);
+static NR2_RESUB_WHY: AtomicU32 = AtomicU32::new(0);
+/// The first eight outer refusals this boot, `code | site<<8 | extra<<16`
+/// (`Nr2OR0..7`); `Nr2OuterRej` keeps only the last code.
+static NR2_OR_RING: [AtomicU32; 8] = [const { AtomicU32::new(0) }; 8];
+static NR2_OR_SEQ: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy)]
 struct BatchTickets {
@@ -1288,7 +1316,18 @@ enum OuterExecutionRefusal {
 
 impl OuterExecutionRefusal {
     fn record(self) {
+        self.record_at(0, 0);
+    }
+
+    /// `site` names the refusing arm (1 outer-physical slot index, 2
+    /// outer-physical fallthrough, 3 virtual replay unmatched, 4 virtual
+    /// replay booked twice / append refused, 5 virtual slots exhausted).
+    fn record_at(self, site: u32, extra: u32) {
         bump_with_code(&NR2_OUTER_REJECT, self as u32);
+        let n = NR2_OR_SEQ.fetch_add(1, Ordering::Relaxed) as usize;
+        if let Some(slot) = NR2_OR_RING.get(n) {
+            slot.store((self as u32) | (site << 8) | ((extra & 0xFFFF) << 16), Ordering::Relaxed);
+        }
     }
 }
 
@@ -5398,7 +5437,7 @@ pub(crate) unsafe fn submit_outer_physical(
     let action = {
         let mut executor = native.executor.lock();
         let Some(slot) = executor.slots.get_mut(record.slot_index as usize) else {
-            OuterExecutionRefusal::ResubmissionMismatch.record();
+            OuterExecutionRefusal::ResubmissionMismatch.record_at(1, record.slot_index);
             return NativeSubmitDisposition::Revoked;
         };
         (why_slot, why_matched, stranded) = match &*slot {
@@ -5535,16 +5574,13 @@ pub(crate) unsafe fn submit_outer_physical(
         }
     };
     let Some(action) = action else {
-        OuterExecutionRefusal::ResubmissionMismatch.record();
-        let n = NR2_RESUB_MISMATCH.fetch_add(1, Ordering::Relaxed) + 1;
-        crate::diag::record_named_bytes(b"Nr2RsmN", n);
-        crate::diag::record_named_bytes(
-            b"Nr2RsmWhy",
-            (why_slot << 24)
-                | (u32::from(why_matched) << 16)
-                | (NR2_APPEND_WHY.load(Ordering::Relaxed) << 8)
-                | u32::from(resubmission),
-        );
+        let why = (why_slot << 24)
+            | (u32::from(why_matched) << 16)
+            | (NR2_APPEND_WHY.load(Ordering::Relaxed) << 8)
+            | u32::from(resubmission);
+        OuterExecutionRefusal::ResubmissionMismatch.record_at(2, why >> 8);
+        NR2_RESUB_MISMATCH.fetch_add(1, Ordering::Relaxed);
+        NR2_RESUB_WHY.store(why, Ordering::Relaxed);
         if stranded {
             return NativeSubmitDisposition::Stranded;
         }
@@ -6190,8 +6226,13 @@ pub(crate) unsafe fn submit_virtual(
                 NR2_HOST_SUBMIT_OK.fetch_add(1, Ordering::Relaxed);
                 NativeSubmitDisposition::Pending
             }
-            Some(Err(())) | None => {
-                OuterExecutionRefusal::ResubmissionMismatch.record();
+            Some(Err(())) => {
+                OuterExecutionRefusal::ResubmissionMismatch
+                    .record_at(4, NR2_APPEND_WHY.load(Ordering::Relaxed));
+                NativeSubmitDisposition::Revoked
+            }
+            None => {
+                OuterExecutionRefusal::ResubmissionMismatch.record_at(3, record.batch_id as u32);
                 NativeSubmitDisposition::Revoked
             }
         };
@@ -6235,11 +6276,11 @@ pub(crate) unsafe fn submit_virtual(
             .iter()
             .position(|slot| matches!(slot, SubmissionSlot::Free))
         else {
-            OuterExecutionRefusal::SlotExhausted.record();
+            OuterExecutionRefusal::SlotExhausted.record_at(5, 0);
             return NativeSubmitDisposition::Revoked;
         };
         let Some(slot_generation) = executor.mint_slot_generation() else {
-            OuterExecutionRefusal::SlotExhausted.record();
+            OuterExecutionRefusal::SlotExhausted.record_at(5, 0);
             return NativeSubmitDisposition::Revoked;
         };
         let identity = BatchIdentity {
@@ -6254,7 +6295,7 @@ pub(crate) unsafe fn submit_virtual(
         };
         let mut tickets = BatchTickets::new();
         if !append_queue_ticket(adapter, &mut tickets, identity, ticket, false, true) {
-            OuterExecutionRefusal::SlotExhausted.record();
+            OuterExecutionRefusal::SlotExhausted.record_at(5, 0);
             return NativeSubmitDisposition::Revoked;
         }
         executor.slots[slot_index] = SubmissionSlot::InFlight { identity, tickets };

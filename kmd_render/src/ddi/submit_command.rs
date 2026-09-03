@@ -34,6 +34,8 @@ pub static PRESENT_PACKETS_OTHER: AtomicU32 = AtomicU32::new(0);
 /// without work instead of poisoning the engine (see
 /// `retire_refused_submission`).
 pub static REFUSED_COMPLETED: AtomicU32 = AtomicU32::new(0);
+/// Un-run batches whose submission was failed instead of retired (`Nr2Strand`).
+pub static STRANDED: AtomicU32 = AtomicU32::new(0);
 pub static DMA_NOTIFY_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DMA_QUEUE_DPC_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static DMA_SYNC_STATUS_LOW: AtomicU32 = AtomicU32::new(0);
@@ -462,8 +464,7 @@ fn retire_refused_submission(
 /// A batch still sitting un-run in its slot whose submission could not be
 /// booked: fail the packet rather than report it complete (`Nr2Strand`).
 fn strand_submission(adapter: &AdapterContext, ticket: crate::adapter::OrderedEngineTicket) {
-    static STRANDED: AtomicU32 = AtomicU32::new(0);
-    crate::diag::record_named_bytes(b"Nr2Strand", STRANDED.fetch_add(1, Ordering::Relaxed) + 1);
+    STRANDED.fetch_add(1, Ordering::Relaxed);
     let _ = super::interrupt::fail_ordered_engine_submission(adapter, ticket);
 }
 
