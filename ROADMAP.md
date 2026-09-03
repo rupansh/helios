@@ -619,24 +619,41 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   Render DDI every outer submit passes). The stream shmem is created on the
   first over-cap outer Render and released cleanly at context teardown
   (`Nr2StrmLeak=0`).
-- ⛔ **OPEN — NEW, distinct stall past the transport limit: GT1's post-load
-  `Map()` readback hangs in `wait_hqc1` with the KMD reporting everything
-  complete.** On .480, ~T+181 s into GT1 (right after the indirect streams),
-  the workload's main thread parks forever:
-  `resource_map → D3D11ImmediateContext::Map → WaitForResource →
-  completeRecordOnlySubmissions → dxvk_outer_submit_join → join_outer_progress
-  → wait_hqc1 (WaitForSingleObject)`. KMD `Nr2Sub==Nr2HostOk` (out=0), no
-  device loss, no `join refused`, no `HQC1 wait released`, `K9Poison=0` — the
-  work genuinely completed but the WDDM monitored fence HQC1_cpu never reached
-  the join's target, so the CPU wait never returns. This phase (GT1 rendering +
-  a Map readback) had NEVER been reached before — every build died at the
-  transport limit first — so it is likely a pre-existing Map/readback
-  completion gap the transport fix merely unblocked, not a regression from it.
-  ⚠ `outer_join_overtaken=11372` during the run (the race counter; handled, not
-  fatal). NEXT: instrument the HQC1_cpu value vs the join target at the stall
-  (add both to the wait_hqc1 log), and check whether the indirect submit's
-  monitored-fence advance is delayed/missed vs an inline one. Recovers on kill
-  (exit-zombie, `Nr2StrmLeak=0`).
+- ⛔ **OPEN — DEFECT A (blocks the score): a large INDIRECT stream kills the
+  host venus context.** With the QEMU fence-fix live (relaunched 2026-09-04),
+  GT1 on .480/020A83FE no longer hangs — it renders further (`Nr2Ind=8`,
+  `Nr2IndMax≈735116`, `Nr2StrmN=1`, no refuse/fail), then the host dies:
+  `/tmp/helios-qemu-stderr.log` at 20:25:36Z — `vkr: failed to look up object
+  80875 of type 23` -> `vkUpdateDescriptorSets resulted in CS error` ->
+  `submit_cmd: vn_dispatch_command failed` -> `failed to dispatch context op 5`
+  -> `destroying context 13 (helios)`. So a `vkUpdateDescriptorSets` inside a
+  738 KB indirect stream references a descriptor-set object the host cannot
+  find. The KMD then fails 151 tickets (`Nr2TkFail=151`, surfaced now instead
+  of hung), the app goes device-lost and its process crashes (3DMark
+  "PROCESS_EXITED", FAILED result). Hypotheses to separate: (1) an
+  object-creating command is in a DIFFERENT stream than the
+  vkUpdateDescriptorSets that uses it, and going indirect breaks their ordering
+  or the shmem-stream object namespace; (2) the 738 KB copy into the shmem is
+  short/misaligned so the decoder reads a wrong object id -- dump the bytes at
+  `region.offset` vs the source and compare the decoded op stream. Likely a
+  venus/`vkExecuteCommandStreamsMESA` decode-ordering issue, NOT the transport
+  (the host decoded far enough to run vkUpdateDescriptorSets, so the stream
+  arrived intact). ⚠ The prior .480 run (no QEMU fix) HUNG here in `wait_hqc1`
+  instead; same root, different surface. The HQC1-wait instrument (`2a9d32b`)
+  did not fire because the app crashed rather than waited.
+- ⛔ **OPEN — DEFECT B (bugcheck on the app crash): 0xCB
+  DRIVER_LEFT_LOCKED_PAGES_IN_PROCESS.** `090426-7453-01.dmp` (TrackLockedPages
+  named the driver): the KMD left **0xe990 = 59,792 pages (~233 MB)** MDL-locked
+  in the crashing 3DMark process. Source: `create_allocation.rs:3611-3690` --
+  guest-backing does `IoAllocateMdl(cpu_backing_va)` + `MmProbeAndLockPages` on
+  the app's USER pages and unlocks only on the error arms and at
+  DestroyAllocation. An abrupt device-lost app is killed WITHOUT
+  DestroyAllocation, so the locked USER MDL leaks into the dying process ->
+  0xCB. This is the precise form of today's 0x76/0x9F shutdown bugchecks. Fix
+  direction: release the guest-backing MDL when the process/device tears down
+  (a DxgkDdiDestroyDevice / process-rundown path that runs on abrupt exit), not
+  only at DestroyAllocation -- ⚠ unlocking while the host may still read the
+  pages is a UAF, so gate it on the device's host submissions being quiesced.
 - ✅ **FIXED 2026-09-03 (UMD 6253c4c, hash 87CE7666): the second window of the
   outer-join race — `exact outer join refused: ScopeForeignThread`.** The ICD
   seals/copies/closes a scope only on the opening thread; the lock-free
