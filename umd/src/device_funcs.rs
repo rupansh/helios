@@ -1895,7 +1895,19 @@ unsafe fn join_outer_progress(
     // drop guard rather than a call at each exit.
     let wake = ScopeIdleNotify(&context.scope_idle);
     let mut active = crate::forward::lock_ignore_poison(&context.active_scope);
-    let cut_progress = if let Some(scope) = active.take() {
+    // The ICD seals, copies and closes a scope only on the thread that opened
+    // it (ScopeForeignThread). Another thread's open scope is work still being
+    // recorded, not pending work: leave it and join what has been submitted
+    // through a fresh HQC1 signal below. Taking it lost the Fire Strike Demo
+    // to the lock-free flush-thread join (2026-09-03).
+    let foreign_scope = active.is_some()
+        && context.scope_owner.load(Ordering::Relaxed) != unsafe { GetCurrentThreadId() };
+    if foreign_scope {
+        crate::forward::note_outer_join_foreign_scope();
+    }
+    let cut_progress = if foreign_scope {
+        None
+    } else if let Some(scope) = active.take() {
         let submitted = submit_outer_scope(outer, context, scope)?;
         let progress = match submitted {
             Some(progress) => progress,
