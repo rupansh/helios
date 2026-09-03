@@ -1063,6 +1063,12 @@ pub(crate) unsafe fn rotate_ring(
     // runtime handle into the ownership enum -- a variant carrying the handle
     // would change what RotateResourceIdentities moves.
     let first_ownership = (*first).ownership;
+    // The outer token and the guest pages name THIS allocation (the token's
+    // table entry is checked against the allocation handle at teardown), so
+    // they travel with it. Left behind, the first post-rotation teardown
+    // refused MissingToken and set device_lost (3DMark Demo, 2026-09-03).
+    let first_outer_allocation = (*first).outer_allocation.take();
+    let first_cpu_backing = (*first).cpu_backing.take();
     for pair in states.windows(2) {
         let (Some(&cur), Some(&next)) = (pair.first(), pair.get(1)) else {
             continue;
@@ -1070,10 +1076,14 @@ pub(crate) unsafe fn rotate_ring(
         (*cur).allocation = (*next).allocation.take();
         (*cur).km_resource = (*next).km_resource;
         (*cur).ownership = (*next).ownership;
+        (*cur).outer_allocation = (*next).outer_allocation.take();
+        (*cur).cpu_backing = (*next).cpu_backing.take();
     }
     (*last).allocation = first_allocation;
     (*last).km_resource = first_km_resource;
     (*last).ownership = first_ownership;
+    (*last).outer_allocation = first_outer_allocation;
+    (*last).cpu_backing = first_cpu_backing;
 
     RotationOutcome::Rotated
 }
