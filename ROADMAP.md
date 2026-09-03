@@ -519,6 +519,36 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   reaches NEW processes only after `pnputil /restart-device` or a reboot, and
   `win_install_kmd` refreshes the package UMD from `umd/target/release`.
   Tools: `tools/etw-present-report.py` (per-pid DxgKrnl function counts).
+- ⚠ **OPEN — fix landed, GUI validation pending (KMD 22.22.470/471, fb44f16;
+  ICD cfae0d33): GUI Fire Strike GT1 stuck at "loading" (2026-09-03).**
+  The workload's main thread sat in DXVK's
+  `D3D11Initializer::ThrottleAllocationLocked → Fence::wait` (init-upload
+  fence); its host render server's `vkr-queue` thread had 0 CPU (nothing ever
+  executed); the KMD was alive (anim probe live, joins firing) with exactly
+  **7 submissions never host-completed** (`Nr2Sub − Nr2HostOk`), `Nr2RefCmp=7`
+  and `Nr2OuterRej=0x70007` = 7 × code 7 `ResubmissionMismatch`: a replay in
+  the SAME epoch after the batch's first ticket had retired tripped
+  `BatchTickets::append`'s `commit_seen` (reset only on an epoch change), the
+  Ready slot kept the never-run batch, and `retire_refused_submission`
+  completed the ticket toward dxgkrnl — balanced K9 ledger, no TDR, the UMD
+  waits on HQC1 forever. **Fix:** `helios_kmd_logic::batch_replay` (a replay
+  whose earlier tickets are all dead resets in any epoch; live+newer-epoch
+  refuses; live+same-epoch appends — 4 tests) and a Ready slot still holding
+  its batch un-run now returns `NativeSubmitDisposition::Stranded` →
+  `fail_ordered_engine_submission` (`Nr2Strand`) instead of silent completion;
+  `Nr2RsmN`/`Nr2RsmWhy` (slot<<24|matched<<16|append_why<<8|resub) name every
+  remaining fallthrough. ⚠ Not yet reproduced-and-cleared: only the GUI run
+  reaches loading. **Found on the way, fixed:** the KMD control schema refuses
+  a wire `vkDestroyDevice` (opcode 12, `no_schema(6,3)`, `Nr2NoSchWho=0x603`)
+  and the refusal loses the context; 3DMarkCmd's workload creates+destroys a
+  probe device before each test and died at render #1
+  (`HNR2 context REFUSED … 0xc000000d`). Record-only devices are session-owned
+  (HTS1 init), so the ICD now skips the wire destroy (cfae0d33; probe device
+  tears down clean, `Nr2NoSchema=0`). **Tooling limit:** `3DMarkCmd` from a
+  session-1 task (`tmp/fs_run.ps1`) fails in SystemInfo ("dx info timed out
+  after 60 s") and aborts every workload set in ~1 s — it cannot reach the
+  loading phase, so GT1 loading is GUI-only for now. Files: `tmp/rs/wl_stacks.txt`
+  (workload stacks), `tmp/rs/dwm_stacks_gt1.txt`.
 - `Nr2OuterRej` code 5 (`SessionClosed`) ×2 per flip run, completed via
   `Nr2RefCmp` — benign under churn AND on the fixed boot; watch, don't chase.
 - Observability: `VsCls`/`VsLive`/`CtlInt` registry values flush only at the
