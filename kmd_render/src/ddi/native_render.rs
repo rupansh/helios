@@ -3126,6 +3126,12 @@ pub(crate) unsafe fn render_outer_physical(
     crate::virtio::ctrl::reap_parked(passive, adapter);
     reap_terminal_slots(native, passive);
 
+    // The over-cap A7 batch reaches the host through dxgkddi_submit_command
+    // (DISPATCH), where a shmem cannot be created. This outer Render DDI runs
+    // first at PASSIVE and sees the same batch's size, so create the context's
+    // stream shmem here — the one choke every outer submit path passes through.
+    native.ensure_stream_shmem(passive, session, args.CommandLength as u64);
+
     let record_len = args.CommandLength as usize;
     let mut record_buffer = match adapter
         .with_virtio(|gpu| gpu.take_dma_buffer(record_len))
