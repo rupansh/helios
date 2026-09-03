@@ -807,7 +807,6 @@ pub unsafe extern "C" fn dxgkddi_create_context(
                 unsafe { hts1::release_queue_context(session) };
                 return STATUS_NO_MEMORY;
             };
-            native.attach_stream_shmem(unsafe { PassiveLevel::assume() }, session);
             (
                 HeliosContextRole::Queue { session, native },
                 ContextInfoProfile::Hvc1,
@@ -848,7 +847,6 @@ pub unsafe extern "C" fn dxgkddi_create_context(
                 unsafe { hts1::release_attached_context(session, context_generation) };
                 return STATUS_NO_MEMORY;
             };
-            native.attach_stream_shmem(unsafe { PassiveLevel::assume() }, session);
             (
                 HeliosContextRole::Attached {
                     session,

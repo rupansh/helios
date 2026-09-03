@@ -1076,13 +1076,17 @@ impl NativeHostCompletion {
     ) -> Result<usize, ()> {
         use helios_kmd_logic::stream_ring::{execute_stub, EXECUTE_STUB_BYTES};
         let native = unsafe { self.context.as_ref() };
-        let mut guard = native.stream.lock();
-        let Some(stream) = guard.as_mut() else {
-            return Ok(len);
-        };
-        if stream.inline_max == 0 || len <= stream.inline_max as usize {
+        let cap = native.inline_max.load(Ordering::Relaxed) as usize;
+        if cap == 0 || len <= cap {
             return Ok(len);
         }
+        let mut guard = native.stream.lock();
+        let Some(stream) = guard.as_mut() else {
+            // Over the proxy cap with nowhere to put it: inline would kill
+            // the host context, so refuse and count.
+            NR2_INDIRECT_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return Err(());
+        };
         if len < EXECUTE_STUB_BYTES
             || len > venus.as_slice().len()
             || len as u64 > stream.mapped_bytes
@@ -1643,9 +1647,15 @@ pub(crate) struct NativeContext {
     busy: AtomicU32,
     /// Touched only while [`Self::busy`] is claimed.
     scratch: UnsafeCell<Hnr2Scratch>,
-    /// Queue/Outer only; `None` when the knob is 0 or creation failed
-    /// (`Nr2StrmFail`), in which case over-cap streams are refused.
+    /// Created by the first Render whose payload exceeds `inline_max`
+    /// (`ensure_stream_shmem`); idle contexts own nothing. `None` after a
+    /// failed attempt (`Nr2StrmFail`) or with the knob at 0, and then every
+    /// over-cap stream is refused rather than sent inline.
     stream: SpinLock<Option<StreamShmem>>,
+    /// `Nr2InlineMax` read once at creation; 0 = never indirect.
+    inline_max: AtomicU32,
+    /// Creation is attempted once per context.
+    stream_attempted: AtomicU32,
 }
 
 // SAFETY: `state` and `host_submissions` are reachable only through their
@@ -1708,6 +1718,11 @@ impl NativeContext {
             busy: AtomicU32::new(0),
             scratch: UnsafeCell::new(scratch),
             stream: SpinLock::new(None),
+            inline_max: AtomicU32::new(crate::diag::read_config_dword(
+                crate::diag::knobs::NR2_INLINE_MAX,
+                163_840,
+            )),
+            stream_attempted: AtomicU32::new(0),
         });
         unsafe { KeInitializeEvent(native.drained.get(), 0, 1) };
         if let Some(worker) = native.outer_worker.as_ref() {
@@ -1735,8 +1750,7 @@ impl NativeContext {
             VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED, VIRTIO_GPU_MAP_CACHE_WC,
         };
         let kib = crate::diag::read_config_dword(crate::diag::knobs::NR2_STREAM_KIB, 4096);
-        let inline_max =
-            crate::diag::read_config_dword(crate::diag::knobs::NR2_INLINE_MAX, 163_840);
+        let inline_max = self.inline_max.load(Ordering::Relaxed);
         if kib == 0 || kib > 65_536 || kib % 64 != 0 {
             return;
         }
@@ -1781,6 +1795,29 @@ impl NativeContext {
         };
         *self.stream.lock() = Some(shmem);
         NR2_STREAM_CREATED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// First Render with an over-cap payload on this context: create the
+    /// stream shmem once (PASSIVE). A failed attempt is not retried; the
+    /// submit then refuses the over-cap stream (`Nr2IndRef`).
+    pub(crate) fn ensure_stream_shmem(
+        &self,
+        passive: PassiveLevel,
+        session: NonNull<crate::ddi::translation_session::SessionObject>,
+        payload_bytes: u64,
+    ) {
+        let cap = self.inline_max.load(Ordering::Relaxed);
+        if cap == 0 || payload_bytes <= u64::from(cap) {
+            return;
+        }
+        if self
+            .stream_attempted
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        self.attach_stream_shmem(passive, session);
     }
 
     /// Unmap and release the stream shmem. Only after the rundown drained:
@@ -4661,6 +4698,13 @@ fn commit(
     header: &HeliosNativeRenderV2,
     accept: &Hnr2Accept,
 ) -> NTSTATUS {
+    // DdiRender is PASSIVE and knows the session: the only place a stream
+    // shmem can be created before SubmitCommand (DISPATCH) needs it.
+    native.ensure_stream_shmem(
+        unsafe { PassiveLevel::assume() },
+        session,
+        header.total_payload_bytes,
+    );
     let use_count = header.use_record_count as usize;
     let patch_count = header.patch_record_count as usize;
     let list_count = args.AllocationListSize as usize;
