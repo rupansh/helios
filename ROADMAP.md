@@ -590,6 +590,13 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   loudly. **A/B first (owner-gated host sysctl, no QEMU restart — each
   render-server context gets a fresh socketpair):** `sysctl -w
   net.core.wmem_default=4194304 net.core.rmem_default=4194304`.
+  **⚙ FIX LANDED (KMD 22.22.477.0, 0789aa8; kmd_logic e05e5cc): each
+  Queue/Outer native context owns a session HOST3D+MAPPABLE stream shmem;
+  `enqueue_native_submit` sends any stream > `Nr2InlineMax` (163840) from it
+  via a 64-byte `vkExecuteCommandStreamsMESA`, regions retire in
+  `finish_with_cleanup`, an unplaceable stream is refused (never inline).
+  Deployed 21:22; validation = a CLI Fire Strike run showing `Nr2Ind≥1`,
+  `Nr2IndMax≈418652`, no host receive error, GT1 completing.**
   **Second defect, same incident — a dead host context is never surfaced:**
   qemu-helios `virtio_gpu_virgl_process_cmd` `return`s from the
   `context_create_fence` failure WITHOUT completing the request (no used-ring
@@ -597,8 +604,10 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   the UMD's HQC1 wait never returns (`wait_hqc1` releases only on adapter
   gone), `taskkill` leaves an exit-zombie (1 thread, `HasExited=True`), and a
   later `pnputil /restart-device` HANGS (5+ min, `Nr2Sub` frozen) → guest
-  reboot. Fixes: (a) qemu-helios completes the request with
-  `VIRTIO_GPU_RESP_ERR_UNSPEC` on fence-create failure; (b) the KMD turns a
+  reboot. Fixes: (a) ✅ qemu-helios aa3a7ac801 completes the request with
+  `VIRTIO_GPU_RESP_ERR_UNSPEC` on fence-create failure — built into
+  `qemu-helios/build-helios` (module + binary, 18:47) but NOT live until the
+  owner relaunches QEMU; (b) the KMD turns a
   `!response_ok` native terminal into a refused ticket + dead context
   (refuse every later submission on it) so the UMD sees DeviceLost and the app
   fails loudly instead of hanging. Memory: [[gt1-stall-seqpacket-proxy-limit]].
