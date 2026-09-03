@@ -605,6 +605,38 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   GT1 completing. ⚠ The `Nr2StreamKiB=0` value written under the service key
   did not survive a boot (the KMD rewrites that key at start) — knobs there
   need checking before an A/B is trusted.**
+- ✅✅ **VALIDATED 2026-09-03 23:38 (KMD 22.22.480.0, 79cd437; UMD 87CE7666):
+  the SEQPACKET transport fix WORKS end-to-end.** Fire Strike GT1 on .480:
+  `Nr2StrmN=1`, `Nr2Ind=5` streams went indirect, `Nr2IndMax=738848` (a 738 KB
+  command buffer — larger than the 418 KB that crashed .476), `Nr2IndFull=0`,
+  `Nr2IndRef=0`, ZERO host transport/context errors (`expected N but received`,
+  `destroying context`, CS errors all absent), no bugcheck, no device loss.
+  GT1 rendered frames PAST the loading/pipeline phase that killed every prior
+  build (`HOB1R id=7266..7270 hr=0` — real batches). It took 4 KMD iterations
+  to place the creation hook: .477 eager (window exhaustion) → .478 commit()
+  only (Queue class, missed) → .479 execute_outer_pending (worker-deferred,
+  missed the direct submit) → .480 `render_outer_physical` (the PASSIVE outer
+  Render DDI every outer submit passes). The stream shmem is created on the
+  first over-cap outer Render and released cleanly at context teardown
+  (`Nr2StrmLeak=0`).
+- ⛔ **OPEN — NEW, distinct stall past the transport limit: GT1's post-load
+  `Map()` readback hangs in `wait_hqc1` with the KMD reporting everything
+  complete.** On .480, ~T+181 s into GT1 (right after the indirect streams),
+  the workload's main thread parks forever:
+  `resource_map → D3D11ImmediateContext::Map → WaitForResource →
+  completeRecordOnlySubmissions → dxvk_outer_submit_join → join_outer_progress
+  → wait_hqc1 (WaitForSingleObject)`. KMD `Nr2Sub==Nr2HostOk` (out=0), no
+  device loss, no `join refused`, no `HQC1 wait released`, `K9Poison=0` — the
+  work genuinely completed but the WDDM monitored fence HQC1_cpu never reached
+  the join's target, so the CPU wait never returns. This phase (GT1 rendering +
+  a Map readback) had NEVER been reached before — every build died at the
+  transport limit first — so it is likely a pre-existing Map/readback
+  completion gap the transport fix merely unblocked, not a regression from it.
+  ⚠ `outer_join_overtaken=11372` during the run (the race counter; handled, not
+  fatal). NEXT: instrument the HQC1_cpu value vs the join target at the stall
+  (add both to the wait_hqc1 log), and check whether the indirect submit's
+  monitored-fence advance is delayed/missed vs an inline one. Recovers on kill
+  (exit-zombie, `Nr2StrmLeak=0`).
 - ✅ **FIXED 2026-09-03 (UMD 6253c4c, hash 87CE7666): the second window of the
   outer-join race — `exact outer join refused: ScopeForeignThread`.** The ICD
   seals/copies/closes a scope only on the opening thread; the lock-free
