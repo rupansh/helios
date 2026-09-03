@@ -1749,7 +1749,7 @@ impl NativeContext {
         use helios_protocol::{
             VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED, VIRTIO_GPU_MAP_CACHE_WC,
         };
-        let kib = crate::diag::read_config_dword(crate::diag::knobs::NR2_STREAM_KIB, 4096);
+        let kib = crate::diag::read_config_dword(crate::diag::knobs::NR2_STREAM_KIB, 1024);
         let inline_max = self.inline_max.load(Ordering::Relaxed);
         if kib == 0 || kib > 65_536 || kib % 64 != 0 {
             return;
@@ -2727,6 +2727,12 @@ fn execute_outer_pending(
 
     crate::virtio::ctrl::reap_parked(passive, adapter);
     reap_terminal_slots(native, passive);
+
+    // The outer A7 batch is the one that crosses the render-server proxy's
+    // inline cap (3DMark GT1's 418 KB command buffer). Create the context's
+    // stream shmem before the submit needs it — PASSIVE, and the K11 session
+    // is Live by now (it was not at DdiCreateContext). One-shot per context.
+    native.ensure_stream_shmem(passive, session, submit.hob1_bytes as u64);
 
     let record_len =
         usize::try_from(submit.hob1_bytes).map_err(|_| OuterExecutionRefusal::Descriptor)?;

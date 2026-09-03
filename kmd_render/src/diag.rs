@@ -692,8 +692,9 @@ pub mod knobs {
     /// (measured 2026-09-03); 160 KiB leaves the proxy's own framing room.
     /// 0 = never indirect (the A/B; a >208 KB batch then kills the context).
     pub const NR2_INLINE_MAX: KnobName = KnobName::new(b"Nr2InlineMax");
-    /// Per-context stream shmem size in KiB (default 4096; 0 = no shmem, so
-    /// every stream above NR2_INLINE_MAX is refused loudly instead).
+    /// Per-context stream shmem size in KiB (default 1024 — two 418 KB GT1
+    /// regions; 0 = no shmem, so every stream above NR2_INLINE_MAX is refused
+    /// loudly instead). Bigger only pressures the host-visible window.
     pub const NR2_STREAM_KIB: KnobName = KnobName::new(b"Nr2StreamKiB");
     /// Also send the classic `CRTC_VSYNC` (with the applied primary address)
     /// beside the MPO vsync each retrace (default 1). The MPO INFO2 packet
