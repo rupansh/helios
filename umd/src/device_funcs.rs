@@ -1656,15 +1656,15 @@ unsafe fn submit_outer_scope(
     let command_window = context.command.get();
     let allocation_window = context.allocations.get();
     let patch_window = context.patches.get();
-    let Some(command_window) = command_window else {
-        let _ = outer.translator.close_outer_scope(scope, None);
-        return Err(HeliosTranslatorStatus::HostCallbackFailed);
-    };
-    let Some(allocation_window) = allocation_window else {
-        let _ = outer.translator.close_outer_scope(scope, None);
-        return Err(HeliosTranslatorStatus::HostCallbackFailed);
-    };
-    let Some(patch_window) = patch_window else {
+    let (Some(command_window), Some(allocation_window), Some(patch_window)) =
+        (command_window, allocation_window, patch_window)
+    else {
+        log_error!(
+            "A7 D3D11 outer submit refused: missing window cmd={} alloc={} patch={}",
+            command_window.is_some(),
+            allocation_window.is_some(),
+            patch_window.is_some()
+        );
         let _ = outer.translator.close_outer_scope(scope, None);
         return Err(HeliosTranslatorStatus::HostCallbackFailed);
     };
@@ -1808,7 +1808,11 @@ unsafe fn wait_hqc1(
     context: &RuntimeContext,
     required: u64,
 ) -> Result<(), HeliosTranslatorStatus> {
-    if required == 0 || required > context.last_submitted_progress.load(Ordering::Acquire) {
+    let last_submitted = context.last_submitted_progress.load(Ordering::Acquire);
+    if required == 0 || required > last_submitted {
+        log_error!(
+            "A7 D3D11 HQC1 wait refused: value={required} beyond last submitted {last_submitted}"
+        );
         return Err(HeliosTranslatorStatus::HostCallbackFailed);
     }
     let event = CreateEventW(core::ptr::null_mut(), 0, 0, core::ptr::null());
@@ -1911,7 +1915,12 @@ unsafe fn join_outer_progress(
     };
 
     let target = if required_progress != 0 {
-        if required_progress > context.last_submitted_progress.load(Ordering::Acquire) {
+        let last_submitted = context.last_submitted_progress.load(Ordering::Acquire);
+        if required_progress > last_submitted {
+            log_error!(
+                "A7 D3D11 outer join refused: required={required_progress} beyond last submitted \
+                 {last_submitted}"
+            );
             return Err(HeliosTranslatorStatus::HostCallbackFailed);
         }
         required_progress
@@ -1924,11 +1933,39 @@ unsafe fn join_outer_progress(
     drop(active);
     drop(wake);
     wait_hqc1(outer, context, target)?;
-    let result = progress_result(outer, context);
-    result
-        .validate_join(required_progress)
-        .map_err(|_| HeliosTranslatorStatus::HostCallbackFailed)?;
+    // The result describes THIS join, whose boundary is `target` (chosen under
+    // the scope lock). Reading the live last_submitted here raced every submit
+    // made during the wait once the flush thread joined lock-free (dxvk
+    // 7a1dde15): validate_join(0) then lost dwm, 3DMark and the start menu
+    // within seconds (2026-09-03).
+    if required_progress == 0 && context.last_submitted_progress.load(Ordering::Acquire) > target {
+        crate::forward::note_outer_join_overtaken();
+    }
+    let result = join_result(outer, context, target);
+    if let Err(status) = result.validate_join(required_progress) {
+        log_error!(
+            "A7 D3D11 outer join result rejected: {status:?} required={required_progress} \
+             target={target} completed={} last={}",
+            result.completed_progress_value,
+            result.last_submitted_progress_value
+        );
+        return Err(HeliosTranslatorStatus::HostCallbackFailed);
+    }
     Ok(result)
+}
+
+/// `progress_result` bounded by one join's own obligation: `boundary` is the
+/// progress that join chose, so `completed <= last_submitted` holds for the
+/// join even while other threads keep submitting.
+fn join_result(
+    outer: &OuterDevice,
+    context: &RuntimeContext,
+    boundary: u64,
+) -> HeliosSyncProgressResultV1 {
+    let mut result = progress_result(outer, context);
+    result.last_submitted_progress_value = boundary;
+    result.completed_progress_value = result.completed_progress_value.min(boundary);
+    result
 }
 
 /// DXVK opens one scope immediately around each actual lower queue submit.

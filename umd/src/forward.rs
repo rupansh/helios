@@ -422,6 +422,10 @@ struct DdiRefusals {
     /// A `wait_hqc1` released because the device's adapter LUID no longer
     /// opens (PnP restart): the FromGpu signal it waited for can never execute.
     hqc1_wait_adapter_gone: RefusalCounter,
+    /// An "everything pending" outer join whose wait was overtaken by another
+    /// thread's submit. Not a refusal since 2026-09-03 — a measurement of how
+    /// often the lock-free flush-thread join (dxvk 7a1dde15) races a submitter.
+    outer_join_overtaken: RefusalCounter,
     /// The KMD created a DXVK-internal allocation but did not import the
     /// offered pages (`Gb*` names why); the UMD tore it down and retried with
     /// a fresh page set instead of publishing pages that are not its memory.
@@ -465,6 +469,7 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
     outer_scope_busy: RefusalCounter::new("outer_scope_busy"),
     outer_scope_wait_timeout: RefusalCounter::new("outer_scope_wait_timeout"),
     hqc1_wait_adapter_gone: RefusalCounter::new("hqc1_wait_adapter_gone"),
+    outer_join_overtaken: RefusalCounter::new("outer_join_overtaken"),
     guest_backing_refused: RefusalCounter::new("guest_backing_refused"),
     guest_backing_fallback_lock: RefusalCounter::new("guest_backing_fallback_lock"),
 };
@@ -472,7 +477,7 @@ static DDI_REFUSALS: DdiRefusals = DdiRefusals {
 /// The set, in the order the summary prints them. ⛔ This order is the
 /// evidence contract: `DDI refusals:` lines from different builds are diffed.
 /// The K4 counters are APPENDED so every pre-existing column keeps its place.
-static DDI_REFUSAL_SET: [&RefusalCounter; 30] = [
+static DDI_REFUSAL_SET: [&RefusalCounter; 31] = [
     &DDI_REFUSALS.srv_raw_hazard,
     &DDI_REFUSALS.resource_raw_hazard,
     &DDI_REFUSALS.text_filter_size_ignored,
@@ -501,6 +506,7 @@ static DDI_REFUSAL_SET: [&RefusalCounter; 30] = [
     &DDI_REFUSALS.outer_scope_busy,
     &DDI_REFUSALS.outer_scope_wait_timeout,
     &DDI_REFUSALS.hqc1_wait_adapter_gone,
+    &DDI_REFUSALS.outer_join_overtaken,
     &DDI_REFUSALS.guest_backing_refused,
     &DDI_REFUSALS.guest_backing_fallback_lock,
 ];
@@ -550,6 +556,11 @@ pub(crate) fn note_outer_scope_wait_timeout() {
 /// See `DdiRefusals::hqc1_wait_adapter_gone`.
 pub(crate) fn note_hqc1_wait_adapter_gone() {
     note_ddi_refusal(&DDI_REFUSALS.hqc1_wait_adapter_gone);
+}
+
+/// See `DdiRefusals::outer_join_overtaken`.
+pub(crate) fn note_outer_join_overtaken() {
+    note_ddi_refusal(&DDI_REFUSALS.outer_join_overtaken);
 }
 
 /// `state::release_residency` skipped a `pfnEvictCb` the deallocate had
