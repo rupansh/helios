@@ -24,6 +24,7 @@
 #![no_std]
 
 pub mod allocation_placement;
+pub mod batch_replay;
 pub mod system_page_join;
 pub mod committed_mode;
 pub mod committed_mode_lifecycle;

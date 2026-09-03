@@ -459,6 +459,14 @@ fn retire_refused_submission(
     let _ = super::interrupt::complete_ordered_engine_submission(adapter, ticket);
 }
 
+/// A batch still sitting un-run in its slot whose submission could not be
+/// booked: fail the packet rather than report it complete (`Nr2Strand`).
+fn strand_submission(adapter: &AdapterContext, ticket: crate::adapter::OrderedEngineTicket) {
+    static STRANDED: AtomicU32 = AtomicU32::new(0);
+    crate::diag::record_named_bytes(b"Nr2Strand", STRANDED.fetch_add(1, Ordering::Relaxed) + 1);
+    let _ = super::interrupt::fail_ordered_engine_submission(adapter, ticket);
+}
+
 /// Pick up a DMA-BUFFER FLIP record from a submission's private data and arm
 /// the scan-out programming for it.
 ///
@@ -568,11 +576,12 @@ pub unsafe extern "C" fn dxgkddi_submit_command_virtual(
                         native, session, device, outer, submit, ticket,
                     )
                 };
-                if !matches!(
-                    disposition,
-                    crate::ddi::native_render::NativeSubmitDisposition::Pending
-                ) {
-                    retire_refused_submission(adapter, ticket);
+                match disposition {
+                    crate::ddi::native_render::NativeSubmitDisposition::Pending => {}
+                    crate::ddi::native_render::NativeSubmitDisposition::Stranded => {
+                        strand_submission(adapter, ticket)
+                    }
+                    _ => retire_refused_submission(adapter, ticket),
                 }
             });
             return STATUS_SUCCESS;
@@ -671,11 +680,12 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
                         native, session, submit, ticket,
                     )
                 };
-                if !matches!(
-                    disposition,
-                    crate::ddi::native_render::NativeSubmitDisposition::Pending
-                ) {
-                    retire_refused_submission(adapter, ticket);
+                match disposition {
+                    crate::ddi::native_render::NativeSubmitDisposition::Pending => {}
+                    crate::ddi::native_render::NativeSubmitDisposition::Stranded => {
+                        strand_submission(adapter, ticket)
+                    }
+                    _ => retire_refused_submission(adapter, ticket),
                 }
             });
             return STATUS_SUCCESS;
@@ -730,7 +740,9 @@ pub unsafe extern "C" fn dxgkddi_submit_command(
                 | Some((crate::ddi::native_render::NativeSubmitDisposition::Pending, _)) => {
                     SubmitAck::Accepted
                 }
-                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, _)) | None => {
+                Some((crate::ddi::native_render::NativeSubmitDisposition::Revoked, _))
+                | Some((crate::ddi::native_render::NativeSubmitDisposition::Stranded, _))
+                | None => {
                     // The host-completed marker belonged to a session whose
                     // exact transport/fence authority was revoked before this
                     // callback, or reset already closed the adapter completion

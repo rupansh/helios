@@ -738,6 +738,13 @@ struct BatchIdentity {
     ring_index: u32,
 }
 
+/// Last `BatchTickets::append` refusal: 1 replay refused (live ticket, newer
+/// epoch), 2 commit already seen, 3/4 fragment count, 5 capacity.
+static NR2_APPEND_WHY: AtomicU32 = AtomicU32::new(0);
+/// `submit_outer_physical` fallthroughs: count, and the last one's shape
+/// (`Nr2RsmWhy` = slot<<24 | matched<<16 | append_why<<8 | resubmission).
+static NR2_RESUB_MISMATCH: AtomicU32 = AtomicU32::new(0);
+
 #[derive(Clone, Copy)]
 struct BatchTickets {
     entries: [Option<crate::adapter::OrderedEngineTicket>; BATCH_TICKETS],
@@ -784,27 +791,39 @@ impl BatchTickets {
                 .iter()
                 .flatten()
                 .any(|old| ticket_is_live(*old));
-            if new_epoch {
-                if any_live {
+            // A replay whose earlier tickets are all dead starts over even in
+            // the same epoch (helios_kmd_logic::batch_replay): keeping
+            // `commit_seen` refused it and stranded the batch (GT1, 2026-09-03).
+            use helios_kmd_logic::batch_replay::{replay_action, ReplayAction};
+            match replay_action(new_epoch, any_live) {
+                ReplayAction::Refuse => {
+                    NR2_APPEND_WHY.store(1, Ordering::Relaxed);
                     return false;
                 }
-                self.entries = [None; BATCH_TICKETS];
-                self.count = 0;
-                self.commit_seen = false;
+                ReplayAction::Reset => {
+                    self.entries = [None; BATCH_TICKETS];
+                    self.count = 0;
+                    self.commit_seen = false;
+                }
+                ReplayAction::Continue => {}
             }
             self.resubmit_count = self.resubmit_count.saturating_add(1);
         }
         if commit_record && self.commit_seen {
+            NR2_APPEND_WHY.store(2, Ordering::Relaxed);
             return false;
         }
         let Some(next_count) = self.count.checked_add(1) else {
+            NR2_APPEND_WHY.store(3, Ordering::Relaxed);
             return false;
         };
         if next_count > fragment_count || commit_record != (next_count == fragment_count) {
+            NR2_APPEND_WHY.store(4, Ordering::Relaxed);
             return false;
         }
         let index = self.count as usize;
         let Some(slot) = self.entries.get_mut(index) else {
+            NR2_APPEND_WHY.store(5, Ordering::Relaxed);
             return false;
         };
         *slot = Some(ticket);
@@ -5239,6 +5258,10 @@ pub(crate) enum NativeSubmitDisposition {
     /// This packet never crossed K11's finite host boundary. Preserve K6's
     /// existing scheduler retirement behavior without claiming host execution.
     Refused,
+    /// The slot still holds this batch un-run and the (re)submission could not
+    /// be booked: completing it would report work that never happened, so the
+    /// DDI fails the submission instead (`Nr2Strand`).
+    Stranded,
     /// Render crossed K11's finite host boundary, but teardown/reset or an
     /// invalid context-local fence transition revoked completion authority
     /// before SubmitCommand. The DDI must accept the callback without routing
@@ -5368,11 +5391,38 @@ pub(crate) unsafe fn submit_outer_physical(
         return NativeSubmitDisposition::Revoked;
     }
     let adapter = unsafe { native.adapter.as_ref() };
+    let why_slot: u32;
+    let why_matched: bool;
+    let stranded: bool;
+    NR2_APPEND_WHY.store(0, Ordering::Relaxed);
     let action = {
         let mut executor = native.executor.lock();
         let Some(slot) = executor.slots.get_mut(record.slot_index as usize) else {
             OuterExecutionRefusal::ResubmissionMismatch.record();
             return NativeSubmitDisposition::Revoked;
+        };
+        (why_slot, why_matched, stranded) = match &*slot {
+            SubmissionSlot::Ready { identity, batch, .. } => {
+                let matched = outer_physical_record_matches(
+                    native,
+                    &record,
+                    *identity,
+                    record.slot_index as usize,
+                );
+                (1, matched, matched && batch.is_some())
+            }
+            SubmissionSlot::InFlight { identity, .. } => (
+                2,
+                outer_physical_record_matches(native, &record, *identity, record.slot_index as usize),
+                false,
+            ),
+            SubmissionSlot::Terminal { identity, .. } => (
+                3,
+                outer_physical_record_matches(native, &record, *identity, record.slot_index as usize),
+                false,
+            ),
+            SubmissionSlot::Free => (4, false, false),
+            _ => (5, false, false),
         };
         let old = core::mem::replace(slot, SubmissionSlot::Free);
         match old {
@@ -5486,6 +5536,18 @@ pub(crate) unsafe fn submit_outer_physical(
     };
     let Some(action) = action else {
         OuterExecutionRefusal::ResubmissionMismatch.record();
+        let n = NR2_RESUB_MISMATCH.fetch_add(1, Ordering::Relaxed) + 1;
+        crate::diag::record_named_bytes(b"Nr2RsmN", n);
+        crate::diag::record_named_bytes(
+            b"Nr2RsmWhy",
+            (why_slot << 24)
+                | (u32::from(why_matched) << 16)
+                | (NR2_APPEND_WHY.load(Ordering::Relaxed) << 8)
+                | u32::from(resubmission),
+        );
+        if stranded {
+            return NativeSubmitDisposition::Stranded;
+        }
         return NativeSubmitDisposition::Revoked;
     };
     NR2_HOST_SUBMIT_OK.fetch_add(1, Ordering::Relaxed);
