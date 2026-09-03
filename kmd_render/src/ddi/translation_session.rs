@@ -1410,6 +1410,57 @@ pub(crate) fn detach_execution_resource(
 }
 
 /// Acquire the direct session/context rundown carried by an async host submit.
+/// A HOST3D+MAPPABLE shmem (blob 0) the session's live host context owns and
+/// has attached: the stream resource a `vkExecuteCommandStreamsMESA` names.
+pub(crate) struct StreamShmemHost {
+    pub(crate) resource_id: u32,
+    pub(crate) context_id: u32,
+    pub(crate) owner: crate::virtio::gpu::DeviceOwner,
+    pub(crate) prep: crate::virtio::gpu::BlobMapPrep,
+}
+
+pub(crate) fn create_stream_shmem(
+    session: NonNull<SessionObject>,
+    passive: PassiveLevel,
+    size: u64,
+) -> Option<StreamShmemHost> {
+    let obj = unsafe { session.as_ref() };
+    if obj.model.lock().phase() != model::SessionPhase::Live {
+        return None;
+    }
+    let adapter = unsafe { obj.adapter.as_ref() }?;
+    let operation = obj.transport.acquire_execution(
+        adapter,
+        obj.owner,
+        crate::ddi::session_transport::K11_TAG_SUBMIT,
+    )?;
+    let context_id = operation.context_id;
+    drop(operation);
+    let resource_id = crate::virtio::ctrl::resource_create_session_reply_blob(
+        passive, adapter, context_id, obj.owner, size,
+    )
+    .ok()?;
+    match crate::virtio::ctrl::map_session_reply_blob(
+        passive, adapter, obj.owner, context_id, resource_id,
+    ) {
+        Ok(prep) => Some(StreamShmemHost {
+            resource_id,
+            context_id,
+            owner: obj.owner,
+            prep,
+        }),
+        Err(_) => {
+            let _ = crate::virtio::ctrl::ctx_detach_session_resource(
+                passive, adapter, context_id, resource_id,
+            );
+            let _ = crate::virtio::ctrl::resource_unref_session_reply(
+                passive, adapter, obj.owner, context_id, resource_id,
+            );
+            None
+        }
+    }
+}
+
 pub(crate) fn acquire_execution_operation(
     session: NonNull<SessionObject>,
 ) -> Option<crate::ddi::session_transport::SessionExecutionOperation> {

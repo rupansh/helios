@@ -686,6 +686,15 @@ pub mod knobs {
     /// smaller than the host tiled requirement → import rejected → black remote
     /// view on every park). 0 = the old tight park, the A/B.
     pub const PARK_MATCH_PRIMARY: KnobName = KnobName::new(b"ParkPrimSize");
+    /// Venus streams longer than this go indirect through the context's
+    /// stream shmem instead of inline in SUBMIT_3D. The render-server proxy
+    /// sends one SEQPACKET datagram per submit, capped at SO_SNDBUF 212992
+    /// (measured 2026-09-03); 160 KiB leaves the proxy's own framing room.
+    /// 0 = never indirect (the A/B; a >208 KB batch then kills the context).
+    pub const NR2_INLINE_MAX: KnobName = KnobName::new(b"Nr2InlineMax");
+    /// Per-context stream shmem size in KiB (default 4096; 0 = no shmem, so
+    /// every stream above NR2_INLINE_MAX is refused loudly instead).
+    pub const NR2_STREAM_KIB: KnobName = KnobName::new(b"Nr2StreamKiB");
     /// Also send the classic `CRTC_VSYNC` (with the applied primary address)
     /// beside the MPO vsync each retrace (default 1). The MPO INFO2 packet
     /// carries only the MPO PresentId, so a CLASSIC `SetVidPnSourceAddress`

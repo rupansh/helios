@@ -2436,9 +2436,9 @@ impl VirtioGpu {
         ctx_id: u32,
         domain: NativeSubmitDomain,
         meta: DmaBuffer,
-        venus: DmaBuffer,
+        mut venus: DmaBuffer,
         venus_len: usize,
-        completion: crate::ddi::native_render::NativeHostCompletion,
+        mut completion: crate::ddi::native_render::NativeHostCompletion,
     ) -> Result<
         u64,
         (
@@ -2458,6 +2458,12 @@ impl VirtioGpu {
         if ctx_id == 0 {
             return Err((meta, venus, Some(completion), VirtioError::DeviceError));
         }
+        // Over-cap streams execute from the context's stream shmem; inline
+        // they exceed the render-server proxy's datagram and kill the context.
+        let venus_len = match completion.indirect_stream(&mut venus, venus_len) {
+            Ok(len) => len,
+            Err(()) => return Err((meta, venus, Some(completion), VirtioError::DeviceError)),
+        };
         self.enqueue_submit_inner(ctx_id, ring_idx, meta, venus, venus_len, Some(completion))
     }
 

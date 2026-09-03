@@ -256,6 +256,18 @@ pub static NR2_OUTER_REJECT: AtomicU32 = AtomicU32::new(0);
 /// Batches that terminated unsuccessfully and whose tickets were completed
 /// anyway (`settle_batch_tickets`).
 pub static NR2_TICKETS_FAILED: AtomicU32 = AtomicU32::new(0);
+/// Streams sent indirect through the context's stream shmem.
+pub static NR2_INDIRECT: AtomicU32 = AtomicU32::new(0);
+pub static NR2_INDIRECT_KIB: AtomicU32 = AtomicU32::new(0);
+pub static NR2_INDIRECT_MAX: AtomicU32 = AtomicU32::new(0);
+/// Over-cap streams refused: the ring had no room (Full/QueueFull).
+pub static NR2_INDIRECT_FULL: AtomicU32 = AtomicU32::new(0);
+/// Over-cap streams refused: no shmem, or a stream longer than the ring.
+pub static NR2_INDIRECT_REFUSED: AtomicU32 = AtomicU32::new(0);
+pub static NR2_STREAM_CREATED: AtomicU32 = AtomicU32::new(0);
+pub static NR2_STREAM_FAILED: AtomicU32 = AtomicU32::new(0);
+pub static NR2_STREAM_LEAK: AtomicU32 = AtomicU32::new(0);
+pub static NR2_STREAM_RETIRE_MISS: AtomicU32 = AtomicU32::new(0);
 /// Generated resource operands substituted with a real virtio resource id —
 /// the KMD half of the venus memory import, counted globally so a per-allocation
 /// zero (`D2BnImp`) can be told apart from a dead instrument.
@@ -562,6 +574,15 @@ static NR2_COUNTERS: crate::diag::CounterBlock = crate::diag::CounterBlock {
         e(COUNTER_NAMES[58], &NR2_OR_RING[5]),
         e(COUNTER_NAMES[59], &NR2_OR_RING[6]),
         e(COUNTER_NAMES[60], &NR2_OR_RING[7]),
+        e(b"Nr2Ind", &NR2_INDIRECT),
+        e(b"Nr2IndKiB", &NR2_INDIRECT_KIB),
+        e(b"Nr2IndMax", &NR2_INDIRECT_MAX),
+        f(b"Nr2IndFull", &NR2_INDIRECT_FULL),
+        f(b"Nr2IndRef", &NR2_INDIRECT_REFUSED),
+        e(b"Nr2StrmN", &NR2_STREAM_CREATED),
+        f(b"Nr2StrmFail", &NR2_STREAM_FAILED),
+        f(b"Nr2StrmLeak", &NR2_STREAM_LEAK),
+        f(b"Nr2StrmMiss", &NR2_STREAM_RETIRE_MISS),
         e(b"Nr2PImpN", &crate::ddi::create_allocation::IMP_PRIMARY_N),
         e(b"Nr2PImpR0", &crate::ddi::create_allocation::IMP_PRIMARY_RID[0]),
         e(b"Nr2PImpR1", &crate::ddi::create_allocation::IMP_PRIMARY_RID[1]),
@@ -1037,7 +1058,96 @@ pub(crate) struct NativeHostCompletion {
     identity: BatchIdentity,
     slot_index: u32,
     custody: Option<NativeCustody>,
+    /// The stream-shmem region this submission executes from, retired when
+    /// the submission terminates (host done reading, or never sent).
+    stream_region: Option<helios_kmd_logic::stream_ring::Region>,
 }
+
+impl NativeHostCompletion {
+    /// Replace an over-cap inline venus stream with the 64-byte
+    /// `vkExecuteCommandStreamsMESA` that runs it from the context's stream
+    /// shmem. Returns the bytes to submit inline. `Err` = the stream cannot
+    /// travel at all (no room, or longer than the ring): the caller refuses
+    /// the submission — inline it would kill the host context.
+    pub(crate) fn indirect_stream(
+        &mut self,
+        venus: &mut DmaBuffer,
+        len: usize,
+    ) -> Result<usize, ()> {
+        use helios_kmd_logic::stream_ring::{execute_stub, EXECUTE_STUB_BYTES};
+        let native = unsafe { self.context.as_ref() };
+        let mut guard = native.stream.lock();
+        let Some(stream) = guard.as_mut() else {
+            return Ok(len);
+        };
+        if stream.inline_max == 0 || len <= stream.inline_max as usize {
+            return Ok(len);
+        }
+        if len < EXECUTE_STUB_BYTES
+            || len > venus.as_slice().len()
+            || len as u64 > stream.mapped_bytes
+        {
+            NR2_INDIRECT_REFUSED.fetch_add(1, Ordering::Relaxed);
+            return Err(());
+        }
+        let region = match stream.ring.reserve(len as u64) {
+            Ok(region) => region,
+            Err(_) => {
+                NR2_INDIRECT_FULL.fetch_add(1, Ordering::Relaxed);
+                return Err(());
+            }
+        };
+        // SAFETY: `reserve` bounds `[offset, offset+len)` inside the ring,
+        // which is exactly the `mapped_bytes` the VA covers; `venus[..len]`
+        // was bounds-checked above; the two buffers are distinct mappings.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                venus.as_slice().as_ptr(),
+                stream.va.as_ptr().add(region.offset as usize),
+                len,
+            );
+        }
+        // The host reads the shmem after the virtqueue kick; order the copy
+        // before the descriptor publish explicitly rather than by TSO alone.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let stub = execute_stub(stream.resource_id, region.offset, len as u64);
+        venus.as_mut_slice()[..EXECUTE_STUB_BYTES].copy_from_slice(&stub);
+        self.stream_region = Some(region);
+        NR2_INDIRECT.fetch_add(1, Ordering::Relaxed);
+        NR2_INDIRECT_KIB.fetch_add((len / 1024) as u32, Ordering::Relaxed);
+        NR2_INDIRECT_MAX.fetch_max(len as u32, Ordering::Relaxed);
+        Ok(EXECUTE_STUB_BYTES)
+    }
+
+    fn retire_stream_region(&mut self) {
+        let Some(region) = self.stream_region.take() else {
+            return;
+        };
+        let native = unsafe { self.context.as_ref() };
+        let mut guard = native.stream.lock();
+        if let Some(stream) = guard.as_mut() {
+            if stream.ring.retire(region) {
+                return;
+            }
+        }
+        NR2_STREAM_RETIRE_MISS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// One context's host-visible stream ring: a session-owned HOST3D shmem
+/// mapped into kernel VA, with the offsets `StreamRing` hands out.
+pub(crate) struct StreamShmem {
+    host: crate::ddi::translation_session::StreamShmemHost,
+    va: NonNull<u8>,
+    mapped_bytes: u64,
+    resource_id: u32,
+    inline_max: u32,
+    ring: helios_kmd_logic::stream_ring::StreamRing<64>,
+}
+
+// SAFETY: the VA is a nonpaged MmMapIoSpace mapping owned by this object and
+// reached only under `NativeContext::stream`.
+unsafe impl Send for StreamShmem {}
 
 // SAFETY: the context/session/allocation operation guards touch only pinned
 // nonpaged objects and their leaf locks/events. Their rundown joins before the
@@ -1533,6 +1643,9 @@ pub(crate) struct NativeContext {
     busy: AtomicU32,
     /// Touched only while [`Self::busy`] is claimed.
     scratch: UnsafeCell<Hnr2Scratch>,
+    /// Queue/Outer only; `None` when the knob is 0 or creation failed
+    /// (`Nr2StrmFail`), in which case over-cap streams are refused.
+    stream: SpinLock<Option<StreamShmem>>,
 }
 
 // SAFETY: `state` and `host_submissions` are reachable only through their
@@ -1594,6 +1707,7 @@ impl NativeContext {
             drained: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             busy: AtomicU32::new(0),
             scratch: UnsafeCell::new(scratch),
+            stream: SpinLock::new(None),
         });
         unsafe { KeInitializeEvent(native.drained.get(), 0, 1) };
         if let Some(worker) = native.outer_worker.as_ref() {
@@ -1608,6 +1722,79 @@ impl NativeContext {
             );
         }
         Some(native)
+    }
+
+    /// Create, attach and map this context's stream shmem (PASSIVE, at
+    /// context creation). Failure is counted and leaves `stream` None.
+    pub(crate) fn attach_stream_shmem(
+        &self,
+        passive: PassiveLevel,
+        session: NonNull<crate::ddi::translation_session::SessionObject>,
+    ) {
+        use helios_protocol::{
+            VIRTIO_GPU_MAP_CACHE_CACHED, VIRTIO_GPU_MAP_CACHE_UNCACHED, VIRTIO_GPU_MAP_CACHE_WC,
+        };
+        let kib = crate::diag::read_config_dword(crate::diag::knobs::NR2_STREAM_KIB, 4096);
+        let inline_max =
+            crate::diag::read_config_dword(crate::diag::knobs::NR2_INLINE_MAX, 163_840);
+        if kib == 0 || kib > 65_536 || kib % 64 != 0 {
+            return;
+        }
+        let size = kib as u64 * 1024;
+        let Some(host) =
+            crate::ddi::translation_session::create_stream_shmem(session, passive, size)
+        else {
+            NR2_STREAM_FAILED.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
+        let caching = match host.prep.map_cache {
+            VIRTIO_GPU_MAP_CACHE_CACHED => wdk_sys::_MEMORY_CACHING_TYPE::MmCached,
+            VIRTIO_GPU_MAP_CACHE_WC => wdk_sys::_MEMORY_CACHING_TYPE::MmWriteCombined,
+            VIRTIO_GPU_MAP_CACHE_UNCACHED => wdk_sys::_MEMORY_CACHING_TYPE::MmNonCached,
+            _ => wdk_sys::_MEMORY_CACHING_TYPE::MmCached,
+        };
+        let mut physical: wdk_sys::PHYSICAL_ADDRESS = unsafe { core::mem::zeroed() };
+        physical.QuadPart = host.prep.gpa as i64;
+        let va = if host.prep.gpa & 0xFFF != 0 || host.prep.size < size {
+            None
+        } else {
+            NonNull::new(
+                unsafe {
+                    wdk_sys::ntddk::MmMapIoSpace(physical, host.prep.size, caching)
+                }
+                .cast::<u8>(),
+            )
+        };
+        let Some(va) = va else {
+            NR2_STREAM_FAILED.fetch_add(1, Ordering::Relaxed);
+            let adapter = unsafe { self.adapter.as_ref() };
+            release_stream_shmem_host(passive, adapter, &host, false);
+            return;
+        };
+        let shmem = StreamShmem {
+            resource_id: host.resource_id,
+            host,
+            va,
+            mapped_bytes: size,
+            inline_max,
+            ring: helios_kmd_logic::stream_ring::StreamRing::new(size),
+        };
+        *self.stream.lock() = Some(shmem);
+        NR2_STREAM_CREATED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Unmap and release the stream shmem. Only after the rundown drained:
+    /// every completion that could retire into the ring has finished.
+    fn release_stream_shmem(&self, passive: PassiveLevel) {
+        let taken = self.stream.lock().take();
+        let Some(shmem) = taken else {
+            return;
+        };
+        unsafe {
+            wdk_sys::ntddk::MmUnmapIoSpace(shmem.va.as_ptr().cast(), shmem.host.prep.size)
+        };
+        let adapter = unsafe { self.adapter.as_ref() };
+        release_stream_shmem_host(passive, adapter, &shmem.host, true);
     }
 
     /// Take exclusive use of [`Self::scratch`] for one `DxgkDdiRender`, or
@@ -1743,6 +1930,53 @@ impl NativeContext {
         // enqueue-failure buffers before the context box disappears.
         drain_host_terminals(adapter);
         reap_terminal_slots(self, passive);
+        self.release_stream_shmem(passive);
+    }
+}
+
+/// Host-side release of a stream shmem: unmap (if mapped), detach, unref.
+/// A failed step is counted as a leak and stops the sequence; a resource the
+/// host no longer knows must not be re-released.
+fn release_stream_shmem_host(
+    passive: PassiveLevel,
+    adapter: &crate::adapter::AdapterContext,
+    host: &crate::ddi::translation_session::StreamShmemHost,
+    host_mapped: bool,
+) {
+    if host_mapped
+        && crate::virtio::ctrl::unmap_session_reply_blob(
+            passive,
+            adapter,
+            host.owner,
+            host.context_id,
+            host.resource_id,
+        )
+        .is_err()
+    {
+        NR2_STREAM_LEAK.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if crate::virtio::ctrl::ctx_detach_session_resource(
+        passive,
+        adapter,
+        host.context_id,
+        host.resource_id,
+    )
+    .is_err()
+    {
+        NR2_STREAM_LEAK.fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    if crate::virtio::ctrl::resource_unref_session_reply(
+        passive,
+        adapter,
+        host.owner,
+        host.context_id,
+        host.resource_id,
+    )
+    .is_err()
+    {
+        NR2_STREAM_LEAK.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -2236,6 +2470,7 @@ impl NativeHostCompletion {
         host_ok: bool,
         cleanup: Option<(DmaBuffer, DmaBuffer)>,
     ) {
+        self.retire_stream_region();
         let native = unsafe { self.context.as_ref() };
         let exact_adapter = core::ptr::eq(unsafe { native.adapter.as_ref() }, adapter);
         // Prove the terminal still belongs to this exact parked slot before a
@@ -2628,6 +2863,7 @@ fn execute_outer_pending(
         identity,
         slot_index,
         custody: Some(custody),
+        stream_region: None,
     };
     // A nonzero INFO_RING_IDX is a Vulkan queue object id at the renderer.
     // The terminal A7 form contains no queue operation and Mesa joined every
@@ -5613,6 +5849,7 @@ pub(crate) unsafe fn submit_outer_physical(
                 identity,
                 slot_index,
                 custody: Some(batch.custody),
+                stream_region: None,
             };
             // Opcode census of the bytes forwarded on the Hnr2/K9 path (the
             // dwm composition path — the Outer path's scan reads 0 here).
@@ -5967,6 +6204,7 @@ pub(crate) unsafe fn submit(
                     identity,
                     slot_index,
                     custody: Some(batch.custody),
+                    stream_region: None,
                 };
                 let mut pending = Some((batch.meta, batch.payload, completion));
                 let queued = adapter.with_virtio(|gpu| {
