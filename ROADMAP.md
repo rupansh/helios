@@ -519,6 +519,21 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   reaches NEW processes only after `pnputil /restart-device` or a reboot, and
   `win_install_kmd` refreshes the package UMD from `umd/target/release`.
   Tools: `tools/etw-present-report.py` (per-pid DxgKrnl function counts).
+- ✅ **FIXED 2026-09-03 (KMD 22.22.476.0, b618443): the recurring "unexpected
+  reboot" under 3DMark was a KERNEL BUGCHECK 0x10e** (Arg1=0xb, Arg3=0xc000009a),
+  not a stall. `DxgkDdiBuildPagingBuffer` returned STATUS_INSUFFICIENT_RESOURCES,
+  which is NOT in that DDI's legal return set; `paging_failure()` returned it for
+  every internal failure. The windowed-BLT system-page join (68e978d) added
+  staging surfaces to the 65536-page PTE shadow, 3DMark overflowed it,
+  `update_leaf` returned false → illegal status → machine crash + autoreboot.
+  A SECOND bugcheck in the same dump (→0x0a): the BSOD path calls
+  SystemDisplayEnable at HIGH_LEVEL → `record_named` → RtlWriteRegistryValue,
+  a registry write above PASSIVE. Fixes: `paging_failure()`→STATUS_SUCCESS
+  (counters PgEf/PgEg the loud signal); staging shadow bounded to <half the
+  table (`PagingPteShadow::len()`); `record_named` IRQL-gated. Validated: KMD
+  .476 boots and runs 3DMark with zero new minidumps, counters clean. Memory:
+  [[buildpagingbuffer-illegal-status-bugcheck-10e]]. ⛔ LESSON: any illegal
+  NTSTATUS from a WDDM DDI bugchecks 0x10e — worse than the failure it reports.
 - ⚠ **OPEN — fix landed, GUI validation pending (KMD 22.22.470/471, fb44f16;
   ICD cfae0d33): GUI Fire Strike GT1 stuck at "loading" (2026-09-03).**
   The workload's main thread sat in DXVK's
