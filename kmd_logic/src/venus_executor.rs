@@ -1000,6 +1000,101 @@ mod tests {
     use super::*;
     use std::vec::Vec;
 
+    // Offline decode of a dumped A7 outer payload (defect A, 2026-09-04). Set
+    // HELIOS_A7DUMP to a file written by the ICD's A7DUMP diag: 32-byte header
+    // {magic, total, def, obj, cmd, q, seq, 0} then the payload. Lists each
+    // command the KMD validator decodes with its byte offset, so the point
+    // where the KMD and the host venus decoder disagree (the desync) is visible.
+    #[test]
+    fn trace_a7_dump() {
+        let Ok(path) = std::env::var("HELIOS_A7DUMP") else {
+            return;
+        };
+        let raw = std::fs::read(&path).expect("read dump");
+        assert!(raw.len() >= 32, "dump too small");
+        let rd32 = |o: usize| u32::from_le_bytes([raw[o], raw[o + 1], raw[o + 2], raw[o + 3]]);
+        assert_eq!(rd32(0), 0x4137_4431, "bad magic");
+        let (total, def, obj, cmd, q, seq) = (
+            rd32(4) as usize,
+            rd32(8) as usize,
+            rd32(12) as usize,
+            rd32(16) as usize,
+            rd32(20) as usize,
+            rd32(24),
+        );
+        std::eprintln!(
+            "A7 dump seq={seq} total={total} def={def} obj={obj} cmd={cmd} q={q} (file={} payload={})",
+            path,
+            raw.len() - 32
+        );
+        let payload = &raw[32..32 + total];
+        let seg = |off: usize| -> &'static str {
+            if off < def {
+                "DEFERRED"
+            } else if off < def + obj {
+                "OBJECT"
+            } else if off < def + obj + cmd {
+                "STREAM"
+            } else {
+                "QUEUEOP"
+            }
+        };
+
+        let mut c = Cursor::new(payload);
+        let mut op_store = [VenusOperand {
+            payload_offset: 0,
+            operand_kind: 0,
+        }; 4096];
+        let mut geom = [0u32; 4096];
+        let mut operands = OperandWriter {
+            out: &mut op_store,
+            count: 0,
+        };
+        let mut scratch = SchemaScratch::new(&mut geom);
+        let mut n = 0u32;
+        loop {
+            if c.offset == payload.len() {
+                std::eprintln!("END: consumed all {} bytes, {n} commands", payload.len());
+                break;
+            }
+            let at = c.offset;
+            let (opcode, flags) = match command_header(&mut c) {
+                Ok(h) => h,
+                Err(e) => {
+                    std::eprintln!("HEADER FAIL at {at} ({}) cmd#{n}: {e:?}", seg(at));
+                    break;
+                }
+            };
+            match a7_schema::parse_a7_command(opcode, flags, &mut c, &mut operands, &mut scratch) {
+                Ok(f) => {
+                    // Print the last ~12 commands before the queue op and any large ones.
+                    if at + 200 >= def + obj + cmd || opcode == OP_QUEUE_SUBMIT2 || opcode == OP_QUEUE_SUBMIT {
+                        std::eprintln!(
+                            "  cmd#{n} @{at} [{}] op={opcode} flags={flags} -> {:?} span={}",
+                            seg(at),
+                            f.kind,
+                            c.offset - at
+                        );
+                    }
+                    n += 1;
+                }
+                Err(e) => {
+                    std::eprintln!(
+                        "PARSE FAIL at {at} ({}) cmd#{n} op={opcode} flags={flags}: {e:?}",
+                        seg(at)
+                    );
+                    // Dump 48 bytes around the failure for hand-decode.
+                    let lo = at.saturating_sub(8);
+                    let hi = (at + 40).min(payload.len());
+                    let hex: std::string::String =
+                        payload[lo..hi].iter().map(|b| std::format!("{b:02x}")).collect();
+                    std::eprintln!("  bytes[{lo}..{hi}]={hex}");
+                    break;
+                }
+            }
+        }
+    }
+
     fn put32(out: &mut Vec<u8>, n: u32) {
         out.extend_from_slice(&n.to_le_bytes());
     }
