@@ -619,8 +619,37 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   Render DDI every outer submit passes). The stream shmem is created on the
   first over-cap outer Render and released cleanly at context teardown
   (`Nr2StrmLeak=0`).
-- ⛔ **OPEN — DEFECT A (blocks the score): a large INDIRECT stream kills the
-  host venus context.** With the QEMU fence-fix live (relaunched 2026-09-04),
+- ✅✅ **FIXED 2026-09-04 — DEFECT A (the descriptor context-death crash): a
+  deferred vkUpdateDescriptorSets outlives its descriptor set.** ROOT CAUSE: a
+  record-only `vkUpdateDescriptorSets` is deferred into the ICD object-command
+  FIFO (memory-dep tracked only); if it LINGERS past the DXVK per-frame pool's
+  `notifyCompletion→vkResetDescriptorPool` that frees the set on the host, a
+  later batch splices the stale update → `vkr: failed to look up object N of
+  type 23` → CS error → destroying context. FIX (ICD): each deferred update
+  records its dstSet `vn_object_id`s; `vn_descriptor_set_destroy` drops any
+  pending non-reserved object-command referencing the freed set
+  (`vn_helios_record_drop_object_commands_for_set`). ⛔⛔ **The fix went
+  untested for a whole session because of a DEPLOY-PATH BUG: the UMD loads the
+  ICD from `C:\ProgramData\HeliosUmd\vulkan_virtio.dll`, NOT the Khronos
+  registry / `C:\ProgramData\HeliosVulkan\` that `tools/install-helios-icd.ps1`
+  writes.** Deploy the ICD to `HeliosUmd` (rename the locked old one, copy the
+  new build; verify `(Get-Process dwm).Modules` hash). Once loaded (ICD
+  91418CB8), GT1 RUNS TO COMPLETION: Demo→GT1(End)→GT2(End)→"Benchmark
+  completed", NO PROCESS_EXITED, NO context death in the run window, NO 0xCB
+  reboot; the drop fired 165× (timing-dependent — the linger race needs
+  normal-speed execution). ✅ Memory [[icd-deploy-path-heliosumd-not-heliosvulkan]],
+  [[gt1-indirect-stream-host-context-death]].
+- ⚠ **OPEN — NEW blocker exposed once DEFECT A was fixed: the Graphics score is
+  still 0.** The 08:09 run wrote `<status code="10000">Workload produced no
+  results</status>`, `FireStrikeGt1P = 0.0 fps`, though GT1/GT2 rendered and
+  PRESENTED fine (umd GT1 3664/3664, GT2 3184/3184 presents, 0 fail, no device
+  loss) and no host context died. So the crash is gone but 3DMark collected no
+  FPS. NOT defect A. Leads: (a) 3DMark result collection fails in the session-1
+  schtask; (b) a D3D11 timestamp-query / FPS-measurement conformance gap (no
+  timestamp-query DDI logged; DDI refusals show `alloc_meta_format_unknown=2601`,
+  `srv_raw_hazard`). This is the next thing to chase for a real score.
+- ⛔ **SUPERSEDED prior DEFECT A framing (kept for history):** a large INDIRECT
+  stream kills the host venus context.** With the QEMU fence-fix live (relaunched 2026-09-04),
   GT1 on .480/020A83FE no longer hangs — it renders further (`Nr2Ind=8`,
   `Nr2IndMax≈735116`, `Nr2StrmN=1`, no refuse/fail), then the host dies:
   `/tmp/helios-qemu-stderr.log` at 20:25:36Z — `vkr: failed to look up object
@@ -641,19 +670,27 @@ NOT the root; the ~1.1 s "missed confirmation" reading is retired.
   arrived intact). ⚠ The prior .480 run (no QEMU fix) HUNG here in `wait_hqc1`
   instead; same root, different surface. The HQC1-wait instrument (`2a9d32b`)
   did not fire because the app crashed rather than waited.
-- ⛔ **OPEN — DEFECT B (bugcheck on the app crash): 0xCB
-  DRIVER_LEFT_LOCKED_PAGES_IN_PROCESS.** `090426-7453-01.dmp` (TrackLockedPages
-  named the driver): the KMD left **0xe990 = 59,792 pages (~233 MB)** MDL-locked
-  in the crashing 3DMark process. Source: `create_allocation.rs:3611-3690` --
-  guest-backing does `IoAllocateMdl(cpu_backing_va)` + `MmProbeAndLockPages` on
-  the app's USER pages and unlocks only on the error arms and at
-  DestroyAllocation. An abrupt device-lost app is killed WITHOUT
-  DestroyAllocation, so the locked USER MDL leaks into the dying process ->
-  0xCB. This is the precise form of today's 0x76/0x9F shutdown bugchecks. Fix
-  direction: release the guest-backing MDL when the process/device tears down
-  (a DxgkDdiDestroyDevice / process-rundown path that runs on abrupt exit), not
-  only at DestroyAllocation -- ⚠ unlocking while the host may still read the
-  pages is a UAF, so gate it on the device's host submissions being quiesced.
+- ⛔ **OPEN (root-caused + fix designed, NOT shipped) — DEFECT B: 0xCB
+  DRIVER_LEFT_LOCKED_PAGES_IN_PROCESS on the app crash.** CONFIRMED FIRING every
+  GT1 crash this session (multiple `090426-*.dmp`, all Arg4=0xe990 = 59,792
+  pages ≈ 233 MB) → auto-reboot that wiped counters and made runs look
+  non-deterministic. Precise chain (verified in code): guest-backing locks USER
+  pages (`create_allocation.rs:3611-3690`) into
+  `ResourceBackingFinalizer::guest_pages(mdl)` (SOLE release authority, a plain
+  struct with NO unlocking Drop); `control_owner.rs finish_resource` runs the
+  finalizer ONLY on `UnrefCompleted`; a dead-host UNREF is
+  DefiniteNotEnqueued/Ambiguous → finalizer retained + `release_blobs_for_owner`
+  breaks → the locked USER MDL leaks to process death → 0xCB. FIX (designed):
+  after `destroy_contexts_for_owner` in DestroyDevice (host contexts gone → no
+  DMA reads the pages; in the crash case the host already destroyed the
+  context), sweep the owner's resources, swap each `guest_mdl` finalizer to
+  `none()` under the table lock and run `finalize_resource_backing_after_reset`
+  (unlock); leave the rows (bounded blob-slot leak, cleared at reset). ⚠ NEEDS
+  a mutable owner-table accessor (`ResourceLifecycle::backing_mut` +
+  `StableSlots::get_mut` + a table sweep) — `StableSlots` is an `unsafe`
+  epoch/stability type all owner-table correctness depends on; not shipped blind
+  (kernel code = zero tolerance for bugs). ⭐ Once DEFECT A holds (GT1 stops
+  crashing), B stops firing in the GT1 flow. [[gt1-locked-pages-0xcb-on-app-crash]].
 - ✅ **FIXED 2026-09-03 (UMD 6253c4c, hash 87CE7666): the second window of the
   outer-join race — `exact outer join refused: ScopeForeignThread`.** The ICD
   seals/copies/closes a scope only on the opening thread; the lock-free
