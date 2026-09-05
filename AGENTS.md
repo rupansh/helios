@@ -37,8 +37,14 @@ perf work needs a new lever, not another sweep. The charter is now, in priority 
    question is CLOSED (2026-08-05):** Helios ships a real D3D12 UMD, `helios_umd12.dll`,
    implementing `d3d12umddi` and forwarding into vkd3d-proton's `ID3D12*` COM objects — the D3D11
    architecture with DXVK swapped for vkd3d and `UserModeDriverName[2]` for `[3]`. The app-local
-   vkd3d arm is Phase 0 of that plan, not an alternative. `OpenAdapter12` still refuses and must
-   keep refusing until the commit that makes its body reachable.
+   vkd3d arm is Phase 0 of that plan, not an alternative. ⭐ **Stage S5 HAS LANDED** (the older
+   entry here said `OpenAdapter12` "still refuses and must keep refusing until the commit that
+   makes its body reachable" — that commit is in): the INF registers `UserModeDriverName[3]`,
+   `umd`'s duplicate `OpenAdapter12` export is gone (`umd/src/adapter.rs`), and
+   `adapter12::OpenAdapter12`'s body is reachable behind the `UmdD3D12` kill switch
+   (`umd12/src/knobs12.rs`). ⚠ Absent = OFF is still the shipping default, and flipping it is a
+   change to dwm's behaviour, not a test app's. Verified 2026-09-05 with `UmdD3D12=1`:
+   `OpenAdapter12=0` refusals and a real `CreateDevice` in `umd12-<pid>.log`.
 3. **Stability** — unchanged and still non-negotiable: buffer rotation, resize, suspend/resume,
    device restart, cold boot, DWM recovery, TDR. No hacks; loud failure over fake success.
 4. **Performance** — paused. Do not open a perf sweep without a new causal hypothesis; ROADMAP
@@ -63,6 +69,27 @@ is the VM's `Z:\` drive) but use different toolchains and produce incompatible a
 
 Set this via the environment on each cargo invocation. Do **NOT** commit `target-dir` in
 `.cargo/config.toml` — that file is read on both platforms.
+
+## ⚠ Toolchain floor: bindgen 0.72, because libclang is 22.1.8
+
+Every bindgen in the tree is **0.72** and must stay there. Under libclang 22, bindgen 0.70/0.71
+bind the FORWARD DECLARATION instead of the definition for a struct declared before it is
+defined, emitting `pub _address: u8` (size 1) *beside* the real layout assertion — so a bump
+backwards fails as ~300 errors in `umd` and 42 in `wdk-sys`, in two shapes at once:
+
+```
+error[E0609]: no field `pfnCalcPrivateResourceSize` on type `&mut D3D11DDI_DEVICEFUNCS`
+error[E0080]: attempt to compute `1_usize - 1200_usize`, which would overflow
+```
+
+⛔ **Never "fix" that by disabling bindgen's layout tests.** Those assertions are the only reason
+1-byte `_IRP` / `_DEVICE_OBJECT` / `_KDPC` were a build failure instead of a running driver —
+suppressing them is exactly the fake success rule 2 forbids, in the component that bugchecks.
+
+`kmd_render` cannot bump bindgen alone: it must match the version `wdk-build` uses, so
+`Builder::wdk_default` extends the same `bindgen::Builder` type. Published `wdk-build 0.5.1` caps
+at `bindgen ^0.71`, so the wdk crates are **pinned to an upstream git rev** that already carries
+0.72.1. Return them to crates.io the day a `wdk-build > 0.5.1` ships.
 
 **Driving the VM:** prefer the **`win` MCP server** — `win_exec`, `win_cargo` (mirrors `Z:\` to
 `C:\Users\Rupansh\helios-vgpu` and sets the local target dir + `LIBCLANG_PATH`),
@@ -119,7 +146,10 @@ helios-vgpu/
 ├── HELIOS_DRIVER_DEPLOYMENT.md
 ├── WINDOWS_CI_PACKAGE.md   ← the GH Actions bundle + Install/Verify-Helios.ps1
 ├── docs/archive/           ← Frozen history. Read-only; code comments may cite by
-│                             name. ARCH/OVERVIEW/KMD/ICD (the System-class stack),
+│                             name. ⭐ ROADMAP_HISTORY_THROUGH_2026-09-05.md — the
+│                             4,472-line ROADMAP verbatim, before it was rebuilt lean
+│                             on 2026-09-05; every WS number and defect id still
+│                             resolves there. ARCH/OVERVIEW/KMD/ICD (the System-class stack),
 │                             WINDOWED_BLT_DESIGN, SCANOUT_DRM_MODIFIER_DESIGN, the
 │                             GATE*/WDDM_*/DISPLAY*/PHASE*/HANDOFF_* corpus, and
 │                             REFACTOR_* (the completed T0–T8 quality refactor).
@@ -185,12 +215,15 @@ helios-vgpu/
 │                             umd12/src/forward12/resource12.rs across two repositories with
 │                             NO compile-time check — the highest-risk divergence in the fork
 │                             and the one a lane reading only the old entry would miss.
-│                             ⭐ Its 3 nested submodules ARE checked out and the fork
-│                             BUILDS NATIVELY ON LINUX, tests included (widl/meson/ninja/
-│                             glslang all present) — so vkd3d changes are verifiable on the
-│                             host with no VM and no WDK. The older "nested submodules are
-│                             uninitialised, nothing builds" line was wrong and cost a round
-│                             a stated inability to verify. The D3D12 engine; see
+│                             ⭐ The fork BUILDS NATIVELY ON LINUX, tests included
+│                             (widl/meson/ninja/glslang all present) — so vkd3d changes are
+│                             verifiable on the host with no VM and no WDK. ⚠ But its nested
+│                             submodules are a WORKING-COPY property, not a repo one: they
+│                             were NOT initialised in this checkout on 2026-09-05 and meson
+│                             will not configure without them. Run `git submodule update
+│                             --init --recursive` inside the submodule and check, rather than
+│                             trusting either this line or the older "nothing builds" one.
+│                             (dxvk-helios needs the same.) The D3D12 engine; see
 │                             docs/dx12/SUBSTRATE.md
 ├── LookingGlass/           ← HISTORICAL: former IddCx capture path. Retained only
 │                             because tools/win-mcp still implements win_looking_glass*
@@ -237,6 +270,11 @@ re-create them; if you need a host-side or user-mode probe, add it under `tools/
 
 - `*.inx` — only with explicit instruction (active shape: WDDM render miniport INF).
 - `docs/archive/**` — frozen history; do not edit, do not resurrect into the live tree.
+  ⚠ Its files still cite this document by its old name, `CLAUDE.md` (renamed to
+  `AGENTS.md` on 2026-09-05). That is correct — they record what was true when frozen.
+  A tree-wide rename must exclude `docs/archive/`; note that this repo's `grep` is
+  `ugrep`, which does **not** prefix results with `./`, so a `^\./docs/archive/` filter
+  silently matches nothing and rewrites the archive.
 
 ## Code Style
 
