@@ -111,6 +111,7 @@ mod ffi {
             scanout_linear: bool,
             linear_scanout_target: bool,
             cross_context_optimal: bool,
+            dedicated_present_buffer: bool,
         ) -> usize;
 
         /// Create a dedicated OPTIMAL, DMA_BUF-exportable image and report
@@ -171,6 +172,23 @@ mod ffi {
             d3d11_resource_ptrs: *const usize,
             count: usize,
         ) -> bool;
+        /// DXGI Blt cross-format path. Numerically converts the selected
+        /// source region instead of preserving equal-sized packed texel bits.
+        /// `use_src_box == false` selects the complete source mip.
+        unsafe fn dxgi_blt_convert(
+            self: &HeliosDxvkDevice,
+            dst_resource_ptr: usize,
+            dst_subresource: u32,
+            dst_x: u32,
+            dst_y: u32,
+            src_resource_ptr: usize,
+            src_subresource: u32,
+            use_src_box: bool,
+            src_left: u32,
+            src_top: u32,
+            src_right: u32,
+            src_bottom: u32,
+        ) -> i32;
         /// Present-path frame-completion gate: bounded wait (timeout_us)
         /// until the current flush's submission completes on the GPU, so the
         /// IddCx consumer never copies a buffer whose writes are in flight.
@@ -329,6 +347,7 @@ impl ffi::HeliosDxvkDevice {
         scanout_linear: bool,
         linear_scanout_target: bool,
         cross_context_optimal: bool,
+        dedicated_present_buffer: bool,
     ) -> Option<ID3D11Resource> {
         // SAFETY: the caller upholds the resource-id/handle preconditions
         // above, and the bridge transfers one reference on success.
@@ -347,6 +366,7 @@ impl ffi::HeliosDxvkDevice {
                 scanout_linear,
                 linear_scanout_target,
                 cross_context_optimal,
+                dedicated_present_buffer,
             ))
         }
     }
@@ -525,6 +545,7 @@ impl BridgeDevice {
         scanout_linear: bool,
         linear_scanout_target: bool,
         cross_context_optimal: bool,
+        dedicated_present_buffer: bool,
     ) -> Option<ID3D11Resource> {
         unsafe {
             self.get()?.open_texture2d(
@@ -541,6 +562,7 @@ impl BridgeDevice {
                 scanout_linear,
                 linear_scanout_target,
                 cross_context_optimal,
+                dedicated_present_buffer,
             )
         }
     }
@@ -697,6 +719,42 @@ impl BridgeDevice {
     ) -> bool {
         self.get()
             .is_some_and(|d| unsafe { d.rotate_resource_backings(d3d11_resource_ptrs, count) })
+    }
+
+    /// # Safety
+    /// Both resource words must be live `ID3D11Resource*` values belonging to
+    /// this bridge device. Subresource and region bounds are validated again
+    /// by the C++ side before it records any work.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn dxgi_blt_convert(
+        &self,
+        dst: DstRes,
+        dst_subresource: u32,
+        dst_x: u32,
+        dst_y: u32,
+        src: SrcRes,
+        src_subresource: u32,
+        use_src_box: bool,
+        src_left: u32,
+        src_top: u32,
+        src_right: u32,
+        src_bottom: u32,
+    ) -> i32 {
+        self.get().map_or(-1, |d| unsafe {
+            d.dxgi_blt_convert(
+                dst.0,
+                dst_subresource,
+                dst_x,
+                dst_y,
+                src.0,
+                src_subresource,
+                use_src_box,
+                src_left,
+                src_top,
+                src_right,
+                src_bottom,
+            )
+        })
     }
 
     /// # Safety

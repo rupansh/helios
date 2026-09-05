@@ -83,7 +83,8 @@ struct HeliosDxvkDevice {
       std::uint64_t global_vidmm_tracker,
       bool scanout_linear,
       bool linear_scanout_target,
-      bool cross_context_optimal) const;
+      bool cross_context_optimal,
+      bool dedicated_present_buffer) const;
 
   // Create a dedicated OPTIMAL, DMA_BUF-exportable image (via the
   // D3D11_HELIOS_CREATE_INFO marker) and report logical scanout metadata for
@@ -139,6 +140,24 @@ struct HeliosDxvkDevice {
   bool rotate_resource_backings(
       const std::size_t* d3d11_resource_ptrs,
       std::size_t count) const;
+
+  // DXGI pfnBlt/pfnBlt1 cross-format path. Records a numerical color
+  // conversion rather than CopySubresourceRegion's equal-texel-size bit copy.
+  // `use_src_box == false` selects the source mip's complete extent.
+  // Returns 0 on success and a negative value without recording work when any
+  // resource/subresource/region precondition is invalid.
+  std::int32_t dxgi_blt_convert(
+      std::size_t dst_resource_ptr,
+      std::uint32_t dst_subresource,
+      std::uint32_t dst_x,
+      std::uint32_t dst_y,
+      std::size_t src_resource_ptr,
+      std::uint32_t src_subresource,
+      bool use_src_box,
+      std::uint32_t src_left,
+      std::uint32_t src_top,
+      std::uint32_t src_right,
+      std::uint32_t src_bottom) const;
 
   // Cross-process present ordering, PRODUCER side. Records a signal on this
   // device's named present timeline at the presented frame's GPU completion and

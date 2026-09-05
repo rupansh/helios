@@ -67,8 +67,11 @@ pub struct SnapshotSlot {
     pub pitch: u32,
     /// Memory-plane-0 offset, same source as `pitch`.
     pub plane_offset: u64,
-    /// Venus blob size backing `resid`, for the KMD's bind-time undersize
-    /// guard (`alloc_size >= plane_offset + pitch*height`).
+    /// Venus blob size backing `resid`. Direct LINEAR scanout applies the
+    /// bind-time `plane_offset + pitch*height` guard. WindowedBlt recreates an
+    /// OPTIMAL VkImage instead, so its importer compares this exact allocation
+    /// size with `vkGetImageMemoryRequirements`; logical pitch is not a byte
+    /// layout for optimal tiling.
     pub alloc_size: u64,
     /// Exact allocation memory type. Direct scanout never consumes this field,
     /// but a WindowedBlt snapshot imports the same image in the KMD Venus
@@ -102,7 +105,12 @@ impl Drop for SnapshotSlot {
 pub struct SnapshotRing {
     pub width: u32,
     pub height: u32,
-    pub dxgi_format: u32,
+    /// Format of the application's presented source. This is part of the
+    /// cache key because it determines whether the snapshot copy converts.
+    pub source_dxgi_format: u32,
+    /// Scan-out-safe format of every slot in this ring. It normally matches
+    /// the source, except that packed 10-bit sources are converted to RGBA8.
+    pub scanout_dxgi_format: u32,
     /// Direct scan-out snapshots retain SHADER_READ_ONLY_OPTIMAL for QEMU;
     /// WindowedBlt snapshots are born GENERAL for the KMD transfer importer.
     /// The two contracts must never share slots even at identical geometry.

@@ -1,15 +1,17 @@
-# Helios Windows x64 bundle
+# Helios Windows x64 bundle with WoW64 OpenGL/Vulkan
 
-This archive installs the Helios WDDM driver and its x64 user-mode graphics and
-compute stack:
+This archive installs the Helios WDDM driver, its x64 user-mode graphics and
+compute stack, and the 32-bit Vulkan/OpenGL components needed by WoW64 games:
 
 - Direct3D 11 through the DXVK core embedded in `helios_umd.dll`
 - Vulkan through Mesa Venus (`vulkan_virtio.dll`)
 - desktop OpenGL through Mesa Zink's Microsoft WGL ICD
+- 32-bit Vulkan through a separately built x86 Mesa Venus ICD
+- 32-bit desktop OpenGL through a separately built x86 Zink WGL ICD
 - OpenCL through CLVK with its clspv compiler embedded
 - official Khronos Vulkan and OpenCL loaders when Windows has no loader yet
 - the Microsoft Visual C++ x64 runtime required by the WDDM/DXVK UMD
-- an optional, app-local DaVinci Resolve GPU-detection shim
+- optional, app-local DaVinci Resolve GPU-detection shim
 
 ## Install
 
@@ -57,17 +59,25 @@ C:\ProgramData\Helios\Verify-Helios.ps1 -RunSmokeTests
 Run that command after the final reboot; the installer performs only the
 non-rendering registration/hash checks before rebooting.
 
+The smoke-test pass includes a 1920x1080 RGBA16F WGL/OpenCL sharing case. It
+requires the matching Helios host image as well as the Windows bundle and
+verifies texture import, acquire, pixel readback, release, and queue finish.
+
 ## DaVinci Resolve compatibility
 
 Resolve's Windows GPU detector requires a vendor-specific enumeration path and
-does not admit a generic DXGI/OpenCL adapter by itself. If Resolve reports
-`Unsupported GPU Processing Mode`, copy
-`compatibility\DaVinci Resolve\atiadlxx.dll` beside `Resolve.exe` (normally in
-`C:\Program Files\Blackmagic Design\DaVinci Resolve`), then relaunch Resolve.
+does not admit a generic DXGI/OpenCL adapter by itself. The app-local ADL shim
+reports the real Helios display adapter through the AMD enumeration surface
+Resolve expects. CLVK directly accepts Resolve 21.0.4's nonstandard context
+combining WGL and D3D11 sharing for compatibility with AMD and Intel runtimes.
 
-The DLL is an app-local detection shim and is never installed automatically.
-Do not place it in a Windows system directory. Remove the copied DLL to undo
-the workaround. See its adjacent README for implementation details and scope.
+Close Resolve and run the compatibility directory's
+`Install-Resolve-Compatibility.ps1` from an elevated PowerShell. Resolve can
+then be started normally; no special launcher is required. The compatibility
+installer is explicit and separate from the system-stack installer. It backs
+up and hash-tracks its target, supports verified upgrades, and includes a saved
+uninstaller that restores the pre-Helios file. See the adjacent README for the
+exact command, implementation scope, and rollback behavior.
 
 Uninstall with:
 
@@ -82,8 +92,10 @@ The shared Microsoft Visual C++ runtime is also left installed.
 
 ## Current limits
 
-- This package is x64-only. Native 32-bit applications need separately built
-  x86 UMD, Mesa, CLVK, and loader binaries.
+- Native 32-bit Vulkan and OpenGL applications are supported through the x86
+  Vulkan loader, Mesa Venus ICD, and Zink WGL ICD included in the bundle.
+  Native 32-bit Direct3D and OpenCL applications remain unsupported; the DXVK
+  WDDM UMD and CLVK runtime are still x64-only.
 - The QEMU Helios/Venus protocol changes quickly. Build the host QEMU/render
   side from a compatible source revision recorded in `manifest.json`.
 - CI uses an ephemeral public test certificate whose private key is destroyed
