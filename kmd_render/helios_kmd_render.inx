@@ -102,6 +102,30 @@ HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLim
 HKR,, UserModeDriverName,       %REG_MULTI_SZ%, %13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd12.dll
 HKR,, InstalledDisplayDrivers,  %REG_MULTI_SZ%, helios_umd,helios_umd12
 
+; ⛔⛔ HardwareInformation.AdapterString is LOAD-BEARING FOR THE VULKAN ICD, and
+; its absence here cost a full bring-up on 2026-09-05.
+;
+; Dxgkrnl answers KMTQAITYPE_ADAPTERREGISTRYINFO's AdapterString from THIS value.
+; The ICD's adapter discovery (icd/mesa/src/virtio/vulkan/vn_renderer_helios.c,
+; helios_open_d3dkmt) matches on wcsstr(AdapterString, L"Helios") or L"VIRTIO
+; GPU", and only falls back to probing every adapter when the query FAILS.
+;
+; ⚠ The failure mode when this value is unset is not "no match" — it is worse.
+; The value is not created by this INF, so the display class key RETAINS whatever
+; the previously bound driver wrote; on this VM that was the literal string
+; "Microsoft Basic Display Adapter". The query then SUCCEEDS with a foreign name,
+; so name_match is false AND the !query_ok fallback does not fire, and the real
+; Helios adapter is silently never probed. The ICD then probes only the Microsoft
+; Basic Render Drivers, which correctly reject the private escape with
+; STATUS_NOT_SUPPORTED (0xc00000bb) — so the symptom is "no Helios adapter passed
+; CTX_CREATE probe", DXVK gets no VkPhysicalDevice named "Virtio-GPU Venus",
+; D3D11 CreateDevice returns E_FAIL and dwm.exe crash-loops on 0x889800b0. None
+; of that names this registry value.
+;
+; ⇒ Setting it here makes discovery independent of what any earlier driver left
+; behind. Keep the literal "Helios" substring: the ICD matcher depends on it.
+HKR,, HardwareInformation.AdapterString, %REG_SZ%, "Helios vGPU Render Adapter"
+
 ; ──── Vulkan ICD registration ──────────────────────────────────────────────
 ; A universal INF may only write device-relative (HKR) registry keys, not the
 ; absolute HKLM\SOFTWARE\Khronos\Vulkan\Drivers value the Vulkan loader reads.
@@ -115,6 +139,7 @@ HKR,, InstalledDisplayDrivers,  %REG_MULTI_SZ%, helios_umd,helios_umd12
 ProviderName = "Helios Project"
 DeviceDesc   = "Helios vGPU Render Adapter (WDDM bring-up)"
 DiskName     = "Helios vGPU Driver Disk"
+REG_SZ       = 0x00000000
 REG_DWORD    = 0x00010001
 REG_MULTI_SZ = 0x00010000
 REG_EXPAND_SZ = 0x00020000
