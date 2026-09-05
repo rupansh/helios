@@ -3,7 +3,7 @@
 The non-obvious mechanics of iterating on `helios_kmd_render` against the live win11 guest.
 Every item here cost real time to discover. Pairs with [NTOSEYE.md](NTOSEYE.md) (kernel
 debugging). The win11 guest IS the build host — drive it via the **win MCP** (`win_cargo`,
-`win_exec`), not raw ssh (see CLAUDE.md / TOOLCHAIN.md).
+`win_exec`), not raw ssh (see AGENTS.md / TOOLCHAIN.md).
 
 > **Architecture note (2026-07-11):** Helios is now the live render+display
 > adapter and drives `SET_SCANOUT_BLOB` through `qemu-helios`. Sections describing
@@ -151,7 +151,7 @@ procedure (the user runs it):
 3. Re-add the gpu-gl device → Helios enumerates → bring-up runs.
 4. The user enables the **ntoseye MCP** (KD over `/tmp/ntoseye-kd.sock`).
 
-When changing the VM launch / device set, STOP and let the user drive it (CLAUDE.md guardrail).
+When changing the VM launch / device set, STOP and let the user drive it (AGENTS.md guardrail).
 
 ## 6. Reading driver state without a debugger
 

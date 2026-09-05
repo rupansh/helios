@@ -24,7 +24,7 @@
 //! because distinguishing those API origins before then required heuristics;
 //! this driver does not use one.
 //!
-//! ⛔ CLAUDE.md's *"validate every runtime-supplied size & offset per-arm, not
+//! ⛔ AGENTS.md's *"validate every runtime-supplied size & offset per-arm, not
 //! max-union"* applies literally here: the RenderGdi ~48 % drop bug was exactly
 //! this mistake in D3D11. Each arm below reads only the fields its own arm
 //! guarantees.
@@ -154,7 +154,7 @@
 //!   `pfnCheckResourceAllocationHandle` before sharing. Placed resources remain
 //!   represented by their explicit heap; reserved resources are refused above.
 //!
-//! Each is a named counter, never a silent stub (CLAUDE.md rule 2).
+//! Each is a named counter, never a silent stub (AGENTS.md rule 2).
 
 use core::ffi::c_void;
 
@@ -231,7 +231,7 @@ const HELIOS_HEAP_FLAG_VENUS_EXPORT: D3D12_HEAP_FLAGS = D3D12_HEAP_FLAGS(1 << 30
 /// `ResourceHeaps.md:897` says that combination should not exist, and the fork would
 /// silently ignore the export bit on a bare `CreateHeap` (nothing in
 /// `vkd3d_allocate_heap_memory` reads it) — so passing it there would be a request
-/// this driver knows is dropped, which is the shape CLAUDE.md rule 2 forbids.
+/// this driver knows is dropped, which is the shape AGENTS.md rule 2 forbids.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PrimaryTranslation {
     /// Translate `PRIMARY` into the fork's private venus-export bit.
@@ -1601,7 +1601,7 @@ fn meta_bind_flags(flags: ddi12::D3D12DDI_RESOURCE_FLAGS_0003) -> u32 {
 /// point at which the driver can associate `hRTResource` with a WDDM allocation;
 /// unlike bind flags, formats or geometry, it is not a heuristic admission test.
 /// Returning `S_OK` with the allocation missing would hand the runtime an object
-/// that can be created but not shared — the survivable lie CLAUDE.md rule 2 and
+/// that can be created but not shared — the survivable lie AGENTS.md rule 2 and
 /// `METHOD.md` §2 Phase 4 both forbid — and the failure would surface much later as
 /// `E_INVALIDARG` or a black window with no counter naming its cause. ⛔ It is
 /// deliberately **not**

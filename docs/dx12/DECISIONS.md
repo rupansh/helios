@@ -427,7 +427,7 @@ table below is still correct as a list of *hygiene* items.** For Phase 0 the KMD
 
 | # | Item | Why | Size | Required for first frame? |
 |---|---|---|---|---|
-| K1 | Validate `NodeOrdinal`/`EngineAffinity` in `DxgkDdiCreateContext` and count refusals (`CtxNode`) | Today a context for a node that does not exist is accepted silently; `DxgkDdiCreateHwContext` already checks (`scheduler.rs:135-137`). CLAUDE.md rule 2. | S | No |
+| K1 | Validate `NodeOrdinal`/`EngineAffinity` in `DxgkDdiCreateContext` and count refusals (`CtxNode`) | Today a context for a node that does not exist is accepted silently; `DxgkDdiCreateHwContext` already checks (`scheduler.rs:135-137`). AGENTS.md rule 2. | S | No |
 | K2 | Set `ContextInfo.Caps.NoPatchingRequired` and shrink `AllocationListSize`/`PatchLocationListSize` for `VirtualAddressing` contexts | The documented shape for a GPU-VA context; Helios asks 256+256 on every context and no-ops `DxgkDdiPatch`. Wasteful, not wrong. | S | No — and it touches the Present allocation list, so knob + paired A/B |
 | K3 | Revisit `ApertureSegmentCommitLimit` (64 MiB) | Only if D3D12 residency budgets read too small. Needs a measurement first. | S | No |
 
@@ -795,7 +795,7 @@ These are not new; they are the ones most likely to be violated by a D3D12 imple
 top of `OpenAdapter12`. Absent ⇒ `DXGI_ERROR_UNSUPPORTED`, i.e. bit-identical to a build without the
 D3D12 path. `HKLM\SOFTWARE\Helios` is writable over SSH with the desktop down; the knob is read once
 per process so a running dwm keeps its behaviour while new processes pick up the change. The flip to
-default-ON requires the evidence in the comment at the read site (CLAUDE.md rule 8).
+default-ON requires the evidence in the comment at the read site (AGENTS.md rule 8).
 
 **Decision D12 — the DDI version is `D3D12DDI_SUPPORTED_0110`, advertised as a set of exactly ONE
 token, with the `_0109`-generation tables. Decided 2026-08-06, before the S6 fan-out.**

@@ -139,7 +139,7 @@
 //!   `ID3D12CommandQueue::Signal` does give bottom-of-pipe ordering **within the
 //!   engine** — vkd3d signals the timeline semaphore after the submission — and
 //!   the WDDM half is `pfnExecuteCommandLists`' `pfnRenderCb` packet carrying the
-//!   frame's own completion boundary (`EclFenceSampled`, CLAUDE.md's fence
+//!   frame's own completion boundary (`EclFenceSampled`, AGENTS.md's fence
 //!   invariant). ⛔ Its old text said that boundary is *"knob-gated and off by
 //!   default (A1, `knobs12::UMD12_ECL_DRAIN`)"* — **FALSE since `f71fef4`**:
 //!   `Umd12EclFence` defaults **ON** and samples on **both** drain arms, so

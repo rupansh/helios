@@ -1457,7 +1457,7 @@ Two more reasons the C++ sides stay in separate crates and separate DLLs, both v
 
 ### 9.1 The INF
 
-⛔ **`*.inx` is only edited with explicit instruction** (CLAUDE.md, "Files Not to Touch"). What
+⛔ **`*.inx` is only edited with explicit instruction** (AGENTS.md, "Files Not to Touch"). What
 follows is the proposal, not an applied change.
 
 Current relevant lines of `kmd_render/helios_kmd_render.inx` (verified):
@@ -1666,7 +1666,7 @@ Exact declaration, in `umd12/src/knobs12.rs`, using `umd_common`'s `BoolKnob`:
 /// an install with the knob unset is bit-identical to a build without the D3D12
 /// path.
 ///
-/// CLAUDE.md rule 8: flipping this default to ON requires the evidence in the
+/// AGENTS.md rule 8: flipping this default to ON requires the evidence in the
 /// comment at THIS site, and OFF must stay reachable as the A/B disable.
 pub(crate) static UMD_D3D12: BoolKnob = BoolKnob::new(c"UmdD3D12", false);
 ```
@@ -1721,7 +1721,7 @@ the `-DisableD3D12` switch from §9.2.
 `tools/install-helios-kmd.ps1` backs up the active DriverStore files under
 `C:\ProgramData\HeliosDeployBackups\<timestamp>` (`HELIOS_DRIVER_DEPLOYMENT.md:87`), and a recovery
 boot without the `virtio-gpu-gl-pci` device (`BRINGUP_QUIRKS.md:142-153`) unlocks the live
-`.sys`/`.dll` for replacement. VM device-set changes are owner-gated (CLAUDE.md).
+`.sys`/`.dll` for replacement. VM device-set changes are owner-gated (AGENTS.md).
 
 ### ⛔ What NOT to do
 

@@ -7,7 +7,7 @@
 > source — NOT a System-class device, and it DOES appear
 > under Display adapters. The ICD builds as the C **Mesa-Venus** port
 > (`vulkan_virtio.dll` via `win_meson`), not a Rust `icd` crate. Use the
-> platform build rules and `win_*` MCP tooling in **CLAUDE.md** and the deploy
+> platform build rules and `win_*` MCP tooling in **AGENTS.md** and the deploy
 > steps in **HELIOS_DRIVER_DEPLOYMENT.md**; those are authoritative.
 
 > **DIRECTION RESET (2026-06-07):** active KMD work is System-class KMDF + DeviceIoControl + Mesa Venus.

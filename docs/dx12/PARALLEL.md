@@ -207,7 +207,7 @@ dies with ``failed to find tool "lib.exe"``, taking the whole check down. The sc
 cargo's first-class `[target.<triple>.<links>]` build-script overrides for the two `links` keys
 involved (`cplusplus` = `link-cplusplus`, `cxxbridge1` = `cxx`) so neither build script runs.
 ⛔ Those overrides are passed with `--config` **on the command line and never committed to
-`.cargo/config.toml`**: that file is read on **both** platforms (`CLAUDE.md`), so an override there
+`.cargo/config.toml`**: that file is read on **both** platforms (`AGENTS.md`), so an override there
 would also skip cxx's build script on the real Windows build and silently produce a
 `helios_umd12.dll` with no bridge object in it. ⛔ For the same reason the script is `check` only —
 with the build scripts elided there is no `cxxbridge1` static lib to link, so a `build` here would
@@ -269,7 +269,7 @@ plumbing in `umd-check.ps1` — that whole prerequisite dissolved.
 A lane is done when **all** of:
 
 1. Its slots are implemented or **explicitly refused with a named counter** — never silently
-   stubbed. `CLAUDE.md` rule 2; a refusal uses `helios_umd_common::refusals::RefusalCounter` and its
+   stubbed. `AGENTS.md` rule 2; a refusal uses `helios_umd_common::refusals::RefusalCounter` and its
    set's summary line, exactly as D3D11's `DDI refusals:` does.
 2. Its noop hit counters read **zero** for its slots under a real workload.
 3. Every `unsafe` carries a `// SAFETY:`; no `panic!`/`todo!`/`unwrap` on runtime data.
@@ -317,7 +317,7 @@ reviewer adds nothing a `grep` does not, and an agent's attention is better spen
 
 | invariant | scar |
 |---|---|
-| every `unsafe` has a `// SAFETY:` | `CLAUDE.md` rule 4 |
+| every `unsafe` has a `// SAFETY:` | `AGENTS.md` rule 4 |
 | no `panic!` / `todo!` / `unimplemented!` / `.unwrap()` / `.expect()` on runtime data | a panic in any DDI is a **silent graphics deadlock**; `panic = "abort"` makes it a dead compositor |
 | no `#[allow(...)]` on a hand-written line | generated code may be allowed, hand-written code may not — R908 |
 | `grep -rnE '^[[:space:]]*static_assert\(' umd/bridge umd12/bridge umd_common/bridge` → **1** | `ead692e`. ⚠ the **anchor** is what works — both the bare word and the trailing-paren form count the comments that quote them, and reported 3. ⛔ never `git grep`: it skips untracked files, so a new `umd12/bridge/` reads 0 |

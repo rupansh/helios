@@ -1197,7 +1197,7 @@ must be done deliberately; (ii) `widl` must run on the win11 VM (Strawberry Perl
 *Settling experiment:* after `git submodule update --init --recursive` in
 `vkd3d-proton-helios`, install Strawberry Perl + glslangValidator + meson on win11, then
 `win_exec` the two `meson setup --backend vs2022` + `msbuild` lines from
-`test-build-windows.yml`, mirroring to a **local C: path** (never `Z:\`, per CLAUDE.md).
+`test-build-windows.yml`, mirroring to a **local C: path** (never `Z:\`, per AGENTS.md).
 
 ---
 

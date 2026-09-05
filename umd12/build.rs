@@ -61,7 +61,7 @@ fn def(var: &str, default: &str) -> String {
 /// missing-archive link error, or a "program not found" from `cc` — and none of
 /// those name the variable that would fix it.
 ///
-/// ⚠ This is the one sanctioned `panic!` in the crate (CLAUDE.md's no-panic rule
+/// ⚠ This is the one sanctioned `panic!` in the crate (AGENTS.md's no-panic rule
 /// is about runtime data; a build script panicking on a missing toolchain path
 /// is the `require_path` idiom and is correct).
 fn require_path(env_var: &str, value: &str, dir: bool) {

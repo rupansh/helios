@@ -312,7 +312,7 @@ static BACKTRACES_SPENT: AtomicUsize = AtomicUsize::new(0);
 /// (`umd_common::noop::UniformFn`).
 ///
 /// ⚠ Answering `S_OK` from an unimplemented slot is *not* the loud failure
-/// CLAUDE.md rule 2 asks for, and it is a deliberate, bounded exception for S6-0
+/// AGENTS.md rule 2 asks for, and it is a deliberate, bounded exception for S6-0
 /// only: a stub table exists so `D3D12CreateDevice` can be reached at all, and a
 /// failure HRESULT from an arbitrary slot would abort device creation before any
 /// lane could measure anything. The counter is what keeps it honest — every hit

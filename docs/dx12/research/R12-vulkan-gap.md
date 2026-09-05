@@ -794,7 +794,7 @@ pgrep -af qemu-system-x86_64
 This session: pid 4447, `HELIOS_QEMU_BIN=…/qemu-helios/build-helios/qemu-system-x86_64`,
 `-device {"driver":"virtio-gpu-gl-pci",…,"venus":true,"blob":true,…}`, `-display sdl,gl=on`.
 If it prints nothing, the VM is down and every `[LIVE]` number below must be re-taken —
-**relaunching the VM is owner-gated** (CLAUDE.md).
+**relaunching the VM is owner-gated** (AGENTS.md).
 
 **B. Guest capability set** — via the `win` MCP `win_exec` (no window needed; `vulkaninfo` is
 session-0 safe):
@@ -826,7 +826,7 @@ $env:VN_DEBUG = "no_ray_tracing"         # A/B: remove DXR
 Names from `icd/mesa/src/virtio/vulkan/vn_common.c:23-38`, parsed at `:70`
 (`parse_debug_string(os_get_option("VN_DEBUG"), vn_debug_options)`).
 ⚠ `win_exec` lands in **session 0** — anything that needs a window must go through a cloned
-scheduled task (CLAUDE.md / memory 60th).
+scheduled task (AGENTS.md / memory 60th).
 
 **E. Host renderer identity**
 ```bash

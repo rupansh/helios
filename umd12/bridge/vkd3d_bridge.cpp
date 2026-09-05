@@ -194,7 +194,7 @@ namespace helios_bridge {
 
 // ── named counters ──────────────────────────────────────────────────────────
 //
-// CLAUDE.md operating rule 2: every skipped or refused path gets a named
+// AGENTS.md operating rule 2: every skipped or refused path gets a named
 // counter, so "it silently did nothing" is never a possible reading of a log.
 // These are process-local atomics rather than registry counters because this is
 // user mode and the log is per-process and per-pid anyway; each is also logged

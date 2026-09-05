@@ -299,7 +299,7 @@ const LOG_BUDGET: usize = 32;
 /// ⛔ Ten of this lane's fifteen slots return `VOID`, so without this a
 /// refused view write is indistinguishable from a successful one and the
 /// application renders from a descriptor nobody filled in — precisely the "fake
-/// success" `CLAUDE.md` rule 2 forbids. `device12::set_error` returns whether the
+/// success" `AGENTS.md` rule 2 forbids. `device12::set_error` returns whether the
 /// runtime's callback existed; a missing one is itself counted, because losing
 /// the only error channel turns a removed device into corrupt output.
 fn report_error(dev: &HeliosD3D12Device, hr: Hresult) {
@@ -2081,7 +2081,7 @@ fn api_sampler_flags(f: ddi12::D3D12DDI_SAMPLER_FLAGS_0096) -> D3D12_SAMPLER_FLA
 /// ⚠ The `QueryInterface` is per call. It is a GUID-compare chain plus an
 /// AddRef/Release inside vkd3d, against a `CreateSampler2` that builds or looks
 /// up a `VkSampler`; measuring before caching it in a device field would be the
-/// order of work `CLAUDE.md` rule 7 asks for, and no measurement exists yet.
+/// order of work `AGENTS.md` rule 7 asks for, and no measurement exists yet.
 ///
 /// # Safety
 /// `arg` must point at a live `D3D12DDIARG_CREATE_SAMPLER_0096` whose
@@ -2322,7 +2322,7 @@ pub(crate) fn api_gpu_handle(
 ///
 /// ⛔ Every runtime-supplied count is validated **per arm** before its array is
 /// read: a non-zero range count with a null array pointer is the read that
-/// `CLAUDE.md`'s "validate every runtime/guest-supplied size & offset before
+/// `AGENTS.md`'s "validate every runtime/guest-supplied size & offset before
 /// reading" exists for. The two `*RangeSizes` arrays are legitimately optional
 /// (a null one means "one descriptor per range"), and that is the only null this
 /// slot accepts.

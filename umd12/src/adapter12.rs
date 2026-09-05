@@ -32,7 +32,7 @@
 //! | `pfnDestroyDevice` | **real** as of S6-0b — `device12` |
 //!
 //! ⛔ Those are **documented refusals with named counters, not silent stubs**
-//! (CLAUDE.md rule 2). Each is reached by the runtime on a knob-ON adapter open,
+//! (AGENTS.md rule 2). Each is reached by the runtime on a knob-ON adapter open,
 //! so none of it is the unreachable scaffolding R908 deleted.
 //!
 //! ⭐ The two bounded log lines are not decoration. `D12-G5` had to be run

@@ -52,7 +52,7 @@
 # running it.
 #
 # ⛔ And it is passed with `--config` on the COMMAND LINE, never written into
-# `.cargo/config.toml`. `CLAUDE.md` (the `CARGO_TARGET_DIR` section) records why
+# `.cargo/config.toml`. `AGENTS.md` (the `CARGO_TARGET_DIR` section) records why
 # that file is off limits for platform-specific settings: the Linux host and the
 # `win11` VM share this source tree, so `.cargo/config.toml` is read on BOTH
 # platforms. An override committed there would also skip cxx's build script on
@@ -81,7 +81,7 @@ readonly REPO_ROOT="$(cd -- "${script_dir}/.." && pwd)"
 # workspace manifest at the repo root — so the check runs from the crate
 # directory. `CARGO_TARGET_DIR=target/linux` is therefore relative to
 # `umd12/`, matching the recipe PARALLEL.md §7 documented and keeping Linux
-# artifacts out of the Windows target dir (CLAUDE.md: the two toolchains
+# artifacts out of the Windows target dir (AGENTS.md: the two toolchains
 # produce incompatible artifacts and must never share one target dir).
 readonly CRATE_DIR="${REPO_ROOT}/umd12"
 

@@ -426,7 +426,7 @@ fn budget(t: &LogThrottle) -> Option<usize> {
 
 /// Sanity bound on `pfnExecuteCommandLists`' `Count`.
 ///
-/// CLAUDE.md: *validate every runtime-supplied size before reading.* The DDI
+/// AGENTS.md: *validate every runtime-supplied size before reading.* The DDI
 /// declares the array `_In_reads_(Count)` and the runtime is the authority, so
 /// this is not a semantic cap — no D3D12 rule limits how many lists one
 /// `ExecuteCommandLists` may carry. It bounds the allocation a corrupt count
@@ -1178,7 +1178,7 @@ unsafe extern "C" fn create_command_queue(
         Ok(pair) => pair,
         Err(hr) => {
             // ⚠ The engine queue is dropped here, releasing it: a queue that can
-            // never present or submit is not a queue, and CLAUDE.md rule 2 is
+            // never present or submit is not a queue, and AGENTS.md rule 2 is
             // loud failure over fake success. See the module doc for why this
             // cannot be deferred to a later lane.
             drop(engine_queue);
@@ -2192,7 +2192,7 @@ fn indirect_argument_class(t: ddi12::D3D12DDI_INDIRECT_ARGUMENT_TYPE) -> Indirec
 
 /// Sanity bound on `D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001::NumArgumentDescs`.
 ///
-/// CLAUDE.md: *validate every runtime-supplied size before reading.* No D3D12 rule
+/// AGENTS.md: *validate every runtime-supplied size before reading.* No D3D12 rule
 /// caps the count, so this is not a semantic limit — it bounds the loop a corrupt
 /// count would run, and its counter says if a real workload ever approached it.
 /// ⚠ Signatures this driver *accepts* have exactly one desc; the bound exists for
@@ -2360,7 +2360,7 @@ unsafe extern "C" fn create_command_signature(
     let a = unsafe { &*arg };
 
     // ⛔ Validate the runtime-supplied count and pointer BEFORE reading the array,
-    // per-arm. CLAUDE.md's rule.
+    // per-arm. AGENTS.md's rule.
     let count = a.NumArgumentDescs as usize;
     if a.pArgumentDescs.is_null() || count == 0 || count > MAX_INDIRECT_ARGUMENT_DESCS {
         note_refusal(&L2_REFUSALS.command_signature_bad_arg);
@@ -2828,7 +2828,7 @@ unsafe fn submit_wddm_render<T: Copy>(
         return WddmSubmit::Unavailable;
     }
     // ⛔ Validate the RUNTIME's capacity against our length, per-arm, before
-    // writing. CLAUDE.md's rule, and the reason it is not a formality: the window
+    // writing. AGENTS.md's rule, and the reason it is not a formality: the window
     // is dxgkrnl's and its size is dxgkrnl's choice — a driver that assumes
     // "surely at least 16 bytes" is one whose first out-of-bounds write lands in
     // the kernel's own command buffer.
@@ -3078,7 +3078,7 @@ pub(crate) unsafe fn report_present_submit_error(
 /// not build a packet at all, which is *the same state the OFF arm of
 /// `Umd12EclSubmit` produces on purpose* — so it cannot coherently be a
 /// device-removing error while that arm is legal. It is counted and logged, which is
-/// CLAUDE.md rule 2's requirement, and it leaves a queue that behaves exactly as it
+/// AGENTS.md rule 2's requirement, and it leaves a queue that behaves exactly as it
 /// did before this submission existed.
 fn report_ecl_submit_error(queue: &QueueState, hr: ddi12::HRESULT) {
     // SAFETY: `h_device` is the device this queue was created against; the borrow
@@ -3121,7 +3121,7 @@ unsafe extern "C" fn execute_command_lists(
         return;
     }
     // ⛔ Validate the runtime-supplied count and pointer BEFORE reading the
-    // array. CLAUDE.md's rule, and the bound is `MAX_EXECUTE_COMMAND_LISTS`.
+    // array. AGENTS.md's rule, and the bound is `MAX_EXECUTE_COMMAND_LISTS`.
     if lists.is_null() || n > MAX_EXECUTE_COMMAND_LISTS {
         note_refusal(&L2_REFUSALS.execute_command_lists_bad_arg);
         // ⚠ `k`, not `n`: `n` is the list count in this function and shadowing it
@@ -3489,7 +3489,7 @@ unsafe extern "C" fn execute_command_lists(
             }
         }
     } else {
-        // ⭐ The OFF arm, and it is reachable on purpose (CLAUDE.md rule 8): this
+        // ⭐ The OFF arm, and it is reachable on purpose (AGENTS.md rule 8): this
         // is byte-for-byte the pre-K-F1 behaviour that `tmp/dx12/gates/
         // G8-r0-settle/` measured, which is what makes the paired comparison a
         // comparison. `EclNoWddmSubmission` is its readout.

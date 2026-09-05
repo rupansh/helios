@@ -28,7 +28,7 @@
 //!   present slot and fails fast with `E_NOTIMPL`.
 //!
 //! ⚠ The 2.1 level is why `RAISE_WDDM_3_2_GPUMMU` was a misleading name: with both
-//! old bools `true` the adapter advertised `DXGKDDI_WDDMv2_1`, not 3.2. CLAUDE.md's
+//! old bools `true` the adapter advertised `DXGKDDI_WDDMv2_1`, not 3.2. AGENTS.md's
 //! "WDDM 3.2 miniport" describes the DDI table's ABI shape (the bindgen structs are
 //! the 26100/3.2 ones), not the level this reports.
 

@@ -102,7 +102,7 @@ pub static WDDM_HEAD_BLOCKED_BLT: AtomicU32 = AtomicU32::new(0);
 ///
 /// ⇒ **PRECONDITION: `WfBHold` must have MOVED during the measured window.** If
 /// it did not, the run measured nothing and the correct report is "the experiment
-/// did not run", not UV1 ✗. Registry values persist across boots (CLAUDE.md rule
+/// did not run", not UV1 ✗. Registry values persist across boots (AGENTS.md rule
 /// 6), so it is the movement that counts, never the absolute value.
 pub static WDDM_HEAD_BLOCKED_HOLD: AtomicU32 = AtomicU32::new(0);
 /// WDDM FIFO heads whose TAGGED-namespace dependency was REBASED onto the
@@ -290,7 +290,7 @@ pub static ESCAPE_SUBMIT_RING_COUNT: AtomicU32 = AtomicU32::new(0);
 ///
 /// ⚠ NOT RESET AT StartDevice (a plain image-lifetime static), while the standard
 /// deploy is `pnputil /restart-device`. A value therefore spans every device
-/// generation since the image loaded, and CLAUDE.md rule 6 applies in full:
+/// generation since the image loaded, and AGENTS.md rule 6 applies in full:
 /// verify it MOVES within the window you are attributing before reading anything
 /// into it.
 ///
@@ -472,7 +472,7 @@ pub static PRESENT_STREAM_HIGH_WATER: AtomicU32 = AtomicU32::new(0);
 // beats the marker — and the acceptance-side guard K-F2 asked for was viable
 // after all. That inversion is the entire reason these are worth a deploy.
 //
-// ⚠ Registry values persist across boots (CLAUDE.md rule 6): verify both MOVE
+// ⚠ Registry values persist across boots (AGENTS.md rule 6): verify both MOVE
 // this boot before reading anything into them, and read them AFTER a desktop +
 // Fire Strike run, not after a bare boot — an idle desktop presents little and
 // a zero then means "nothing measured", not "nothing ahead".

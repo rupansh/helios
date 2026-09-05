@@ -326,7 +326,7 @@ static GPU_CLOCK_NO_GPU_COUNTER: AtomicU32 = AtomicU32::new(0);
 /// lock, virtio-gpu carries no clock-control command, and the host's clock policy
 /// is not this driver's to change. The defect is that a no-op was
 /// INDISTINGUISHABLE from a working one. These two make it distinguishable
-/// without pretending to a capability, which is CLAUDE.md rule 2's "loud failure
+/// without pretending to a capability, which is AGENTS.md rule 2's "loud failure
 /// over fake success" in the only form available to a `void` DDI.
 ///
 /// WHOSE ACTIVITY INCREMENTS THEM: any process calling
@@ -389,7 +389,7 @@ pub(crate) fn fabricated_success_counters() -> (u32, u32, u32) {
 /// Until 2026-08-06 this zero-filled `DXGKARG_CALIBRATEGPUCLOCK` and returned
 /// `STATUS_SUCCESS` with no counter and no diag record — fabricated data, claimed
 /// success, and said nothing about it, on the exact path a benchmark score depends
-/// on (CLAUDE.md rule 2).
+/// on (AGENTS.md rule 2).
 ///
 /// ⛔ THE ORIGINAL FORM OF THIS SENTENCE CALLED IT *"the ONE DDI in this driver
 /// that"* did so, and that was FALSE WHEN WRITTEN. Its sibling further down this
@@ -426,7 +426,7 @@ pub(crate) fn fabricated_success_counters() -> (u32, u32, u32) {
 ///   considered and REFUSED: at `GpuFrequency = 1e9` a nanosecond count derived
 ///   from `KeQueryInterruptTimePrecise` would have the right *rate* and a
 ///   completely wrong *epoch*, so every GPU→CPU correlation would be silently
-///   wrong while looking healthy — a survivable lie, which CLAUDE.md rule 2
+///   wrong while looking healthy — a survivable lie, which AGENTS.md rule 2
 ///   forbids in favour of loud failure. The honest interim is a zero plus
 ///   `ClkNoGpu`; the honest answer is `VK_KHR_calibrated_timestamps` read in the
 ///   ICD and carried in by escape (`PENDING.md` S-1 sizes that **M**).
@@ -485,7 +485,7 @@ pub unsafe extern "C" fn dxgkddi_calibrate_gpu_clock(
     // A guest-derived nanosecond count would have the correct RATE and a completely
     // wrong EPOCH, so every GPU→CPU correlation built on it would be silently wrong
     // while `ClkCal`, `ClkNoGpu` and `ClkFreq` all read healthy. That is fake
-    // success, which CLAUDE.md rule 2 forbids in favour of loud failure. The honest
+    // success, which AGENTS.md rule 2 forbids in favour of loud failure. The honest
     // interim is this zero plus its counter; the honest ANSWER is
     // `VK_KHR_calibrated_timestamps` read in the ICD and carried in by escape
     // (`docs/dx12/PENDING.md` S-1 sizes that **M**).

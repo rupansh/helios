@@ -120,7 +120,7 @@
 //!   (`pMap[0] = 0`) and `pfnGetImplicitPhysicalAdapterMask` returns `1`."* A
 //!   noop returns 0, i.e. *"this device has no physical adapters"*. Landing one
 //!   half of a two-part invariant and leaving the other answering zero is the
-//!   silent stub CLAUDE.md rule 2 exists to forbid, so both land together.
+//!   silent stub AGENTS.md rule 2 exists to forbid, so both land together.
 //! * `pfnGetDebugAllocationInfo` is the same output-the-runtime-acts-on class,
 //!   arriving through a second slot. Its two array counts are **`_Inout_`**
 //!   (`d3d12umddi.h:3541-3548`): the runtime writes each array's *capacity* in
@@ -204,7 +204,7 @@ const PRIVATE_SLOT_SIZE: usize = core::mem::size_of::<*mut c_void>();
 
 /// Sanity bound on `pfnWriteBufferImmediate`'s `Count`.
 ///
-/// CLAUDE.md: *validate every runtime-supplied size before reading.* The DDI
+/// AGENTS.md: *validate every runtime-supplied size before reading.* The DDI
 /// declares both arrays `_In_reads_(Count)` and the runtime is the authority, so
 /// this is not a semantic cap — no D3D12 rule limits how many immediates one
 /// `WriteBufferImmediate` may carry. It bounds the allocation a corrupt count
@@ -772,7 +772,7 @@ unsafe extern "C" fn enumerate_meta_command_parameters(
 ///
 /// ⚠ The one thing validated here is the creation-parameter blob's own
 /// self-consistency: a non-zero byte count with a null pointer is never legal
-/// (CLAUDE.md's per-arm validation rule), and it is counted even though this body
+/// (AGENTS.md's per-arm validation rule), and it is counted even though this body
 /// never reads the blob, because the paired create would.
 ///
 /// # Safety
@@ -1499,7 +1499,7 @@ unsafe extern "C" fn write_buffer_immediate(
         return;
     }
     // ⛔ Validate the runtime-supplied count and pointer BEFORE reading the
-    // array. CLAUDE.md's rule; the bound is `MAX_WRITE_BUFFER_IMMEDIATE_PARAMS`.
+    // array. AGENTS.md's rule; the bound is `MAX_WRITE_BUFFER_IMMEDIATE_PARAMS`.
     if p_params.is_null() || n > MAX_WRITE_BUFFER_IMMEDIATE_PARAMS {
         note_refusal(&L9_REFUSALS.write_buffer_immediate_bad_arg);
         if let Some(k) = budget(&CL_LOG) {
@@ -1918,7 +1918,7 @@ unsafe extern "C" fn rs_set_shading_rate_image(
 ///
 /// ⛔ **The symptom of dropping it is missing geometry with no error anywhere**,
 /// which is why this arm logs rather than only counting. It is the same failure
-/// shape CLAUDE.md rule 2 is written against — a skipped path that looks like a
+/// shape AGENTS.md rule 2 is written against — a skipped path that looks like a
 /// working one.
 ///
 /// ⚠ **Not forwarded**, even though vkd3d implements `DispatchMesh`

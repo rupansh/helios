@@ -31,7 +31,7 @@ driver-type = "WDM"
 # assertions are the only reason this was a build failure instead of a running
 # driver with 1-byte kernel structures.** Suppressing them — the "obvious" fix,
 # since nothing in this crate names most of these types — would have converted a
-# loud failure into precisely the silent one CLAUDE.md rule 2 forbids, in the
+# loud failure into precisely the silent one AGENTS.md rule 2 forbids, in the
 # component where it bugchecks. They stay on, and the generator gets fixed.
 #
 # Upstream `main` already carries `bindgen = "0.72.1"` (the release that fixes

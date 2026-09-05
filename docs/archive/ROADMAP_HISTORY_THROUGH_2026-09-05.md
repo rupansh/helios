@@ -1,3 +1,18 @@
+# ROADMAP history — everything through 2026-09-05
+
+⛔ **Frozen. Do not edit, do not resurrect into the live tree.** This is the
+`ROADMAP.md` as it stood on 2026-09-05, immediately before it was rebuilt as a lean
+living document. It had reached 4,472 lines, most of it dated per-defect narrative that
+was no longer actionable, and a living doc nobody can read is not a living doc.
+
+Nothing here was summarised or rewritten on the way in — this is the file, verbatim. The
+live `ROADMAP.md` carries the stage, the current baseline, the priorities, the open
+workstream status and the tooling inventory, and points here for the full record of how
+each closed item was reached. Code and docs that cite a WS number or a defect id
+(`0ab-B`, `WS2 PresentWmk`, …) still resolve against this file.
+
+---
+
 # ROADMAP — Stage: Correctness and D3D12 (since 2026-08-05)
 
 *The desktop first rendered end-to-end on 2026-07-05. The active architecture
@@ -290,153 +305,12 @@ and repairs the same file so an upgrade cannot retain the old ACL.
   next performance session tuning scanout unless an epoch-correlated trace
   actually shows scanout back-pressure reaching rendering.
 
-## Earlier direct-primary baseline (2026-07-23, KMD 22.22.142.0)
+## Earlier direct-primary baseline (2026-07-23, KMD 22.22.142.0) — REMOVED 2026-09-05
 
-- `DisplayHalf=1` exposes one connected child and one VidPn source. DWM composes
-  the whole desktop on Helios and `SetVidPnSourceAddress` selects the real
-  primary for `SET_SCANOUT_BLOB`.
-- `ScanoutDiag` is **deleted/off**. Mode 16 remains a diagnostic only and must
-  never overwrite the real primary during a desktop test.
-- The LINEAR diagnostic image is proven on NVIDIA. The old failure was a guest
-  constant bug (`VK_IMAGE_TILING_LINEAR` was encoded as `0`; it is `1`). After
-  the fix, same-boot breadcrumbs reached `SdgLStg=0x10`, host-visible/coherent
-  memory was selected, and the owner saw its fill pattern in VNC.
-- The real DWM primary is a dedicated, DMA_BUF-exportable Venus
-  `VK_IMAGE_TILING_OPTIMAL` allocation. The UMD marks the actual
-  `CDD_SHAREDPRIMARYSURFACE`; the KMD uses that allocation in
-  `SetVidPnSourceAddress`. There is no heuristic selection and no guest-side
-  primary-to-scanout copy.
-- The QEMU fork propagates virglrenderer DMA_BUF modifier metadata and the
-  existing `RESOURCE_CREATE_BLOB.size` internally, without changing the public
-  virtio-gpu wire ABI. Plain OPTIMAL exports currently arrive as
-  `DRM_FORMAT_MOD_INVALID`; EGL cannot describe that layout. QEMU reconstructs
-  the exact producer VkImage, verifies its Vulkan memory requirement equals the
-  original blob allocation size, copies image-to-staging on the host GPU, and
-  publishes a CPU `DisplaySurface` to VNC. This is direct guest-primary scanout,
-  but **not end-to-end zero-copy** because the host display backend reads back.
-- Visible desktop output is verified. A DComp scheduled-task probe completed
-  1576 Presents in 25 seconds (63.0 fps), and interaction was responsive while
-  that continuous producer ran. This isolated the perceived lag to the
-  idle-to-active scanout edge, not steady-state GPU throughput. The UMD now
-  emits a refresh marker after the exact DWM primary operation. KMD
-  `DxgkDdiRender` captures the current Venus wire-fence watermark under the
-  statically witnessed notification lock; the used-ring DPC coalesces markers
-  and dirties scanout only after all preceding Venus work retires. This does not
-  depend on VidSch choosing `SubmitCommand` versus `SubmitCommandVirtual`.
-- The v142 wake test advanced the live 16-refresh telemetry snapshot
-  (`AsSub`/`AsDone` caught up, `WtOut=CtOut=QfRet=0`). Same-boot QEMU evidence
-  then rebound the real 1896x1030 OPTIMAL primary and completed Vulkan readback
-  in about 1.0–1.9 ms. The owner confirmed excellent idle-to-active
-  responsiveness.
-- The KMD watermark orders Venus commands which already exist when the marker
-  reaches `DxgkDdiRender`; it cannot cover work still queued on DXVK's
-  submission thread. With `PresentGateUs=0`, fast cursor motion exposed that
-  producer race as stale cursor replicas. A 5 ms A/B still leaked six stale
-  frames in one 128-present burst, so the direct-primary default is now a
-  bounded 10 ms `HeliosWaitFrameComplete` before the kernel present callback.
-  It sleeps on DXVK's submission-fence condition variable instead of polling.
-  The 10 ms A/B measured 0.48 ms cumulative average after 384 presents and
-  zero timeouts after its six startup expirations. The owner confirmed both
-  excellent responsiveness and no cursor ghosting.
-- The old synchronous KMD `RESOURCE_FLUSH` control roundtrip is gone from the
-  frame path. One interrupt-completed async bind/flush is allowed in flight and
-  later flips coalesce. Control DMA buffers are reaped/reused outside the
-  spinlock. Mesa's Windows ring notifies an idle renderer eagerly, folds
-  side-effect-free wait-only timeline submits on the guest, and reuses its
-  escape staging buffer; per-submit shape logging is opt-in.
-- The same exact OPTIMAL Vulkan fallback is shared by `egl-headless`, GTK EGL,
-  GTK GLArea, and SDL OpenGL. `egl-headless`+VNC and SDL OpenGL on native
-  Wayland are visually verified. The launcher leaves interactive EGL vendor
-  selection to the compositor while pinning Venus/readback Vulkan to NVIDIA.
-  GTK/Wayland still fails during the full run with repeated GDK
-  `eglMakeCurrent` errors and remains unverified.
-
-### VidMm / Task Manager validation (2026-08-04, KMD 22.22.250.0 / 22.22.254.0)
-
-- Task Manager's 4.0 GiB dedicated capacity is now backed by the configured
-  `VidMmVramMB=4096` local segment while the CPU-visible aperture remains
-  separately capped. A live SDL-window check showed `0.5/4.0 GB` dedicated,
-  `0.0/6.0 GB` shared and `0.5/10.0 GB` total.
-- Venus `VkDeviceMemory` tracking allocations follow the Vulkan memory heap:
-  device-local allocations use the local non-aperture segment without becoming
-  BAR-mappable, while non-device-local allocations use the aperture/shared
-  segment. Direct KMT and native-Vulkan four-by-64 MiB probes each measured
-  exactly `+256.00 MiB` in the selected segment, no movement in the other
-  segment, and a return to baseline after destroy.
-- Exportable DXVK/Venus memory initially had two full VidMm charges: its local
-  `VkDeviceMemory` tracking allocation and the WDDM allocation that adopts the
-  same renderer resource in the aperture. The adopted allocation is now an
-  identity-only one-page VidMm object only when the current ICD positively
-  attests that the full-size tracker exists; missing exports and tracker
-  failures retain the safe full-size adopted charge. Its private open identity
-  and KMD context retain the exact renderer size. Eight shared 64 MiB D3D11
-  render targets consequently measured exactly `+512.00 MiB` local and only
-  `+0.03 MiB` aperture (eight pages), then released both. An attempted
-  local-segment placement for the adopted WDDM allocation was rejected: its
-  first `CreateTexture2D` device-removed the UMD, so that policy never shipped.
-- The `.249` hardware gate passed 12/12 direct-KMT cycles, 12/12 native-Vulkan
-  cycles and 12/12 shared-D3D11 cycles. A 40-allocation Vulkan high-water test
-  charged exactly 2560 MiB locally with no aperture movement, and four
-  concurrent eight-allocation processes charged exactly 2048 MiB locally;
-  DWM kept the same responsive process throughout.
-- The `.250` heap-aware gate passed exact local and non-local direct-KMT tests,
-  exact local and non-local native-Vulkan tests, and the eight-allocation D3D11
-  adoption test above. A pre-tracking ICD retained one full shared charge; an
-  older tracking ICD without the attestation export retained both its exact
-  local tracker and one conservative full shared charge, proving the mixed
-  deployment cannot under-report. Private export lookup is pinned to one ICD
-  module so a missing old export cannot fall through to a newer DLL and receive
-  a foreign Vulkan handle. The UMD build now watches every compiled bridge
-  source and header, preventing incremental builds from silently reusing stale
-  C++ objects. The installed signed package reports `22.22.250.0`, PnP status
-  is Code 0, DWM stayed responsive, and no new display/PnP/WHEA/BugCheck
-  critical or error events appeared.
-- The `.254` follow-up closes the cross-process lifetime boundary. Each tracker
-  is now a globally shared WDDM resource, its global KMT handle travels in a
-  typed private allocation flag/open identity, and an importer opens the same
-  tracker before returning the shared D3D resource. The KMD shrinks the adopted
-  payload to one page only when the cookie names a live tracker whose size
-  matches the KMD's recorded adopted-blob size; either mixed-version direction
-  therefore keeps the conservative full payload charge. If the shared tracker
-  disappears during an import race, Mesa creates a full-size tracker in the
-  imported memory's actual heap. If that fallback also fails, the bridge
-  rejects the D3D shared-resource open.
-- The `.254` cross-process gate created and cleared a 4096x4096 shared D3D11
-  texture in a child, opened it in the parent, exited the creator, and retained
-  exactly `+64.00 MiB` in both adapter-global and importer-process dedicated
-  counters. The importer then read the expected `ffff00ff` pixel and returned
-  both counters to baseline after its device was destroyed. The both-open and
-  creator-exited checks then passed 50 consecutive cycles. Raw KMT shared and
-  two-process probes independently retained exactly `+128.00 MiB` and
-  `+64.00 MiB`, respectively, after creator handle/process teardown and
-  returned to baseline after the final close.
-- With the final ICD loaded in DWM, an automated interactive Task Manager smoke
-  left both processes responsive and produced no DWM/Task Manager error event.
-  During validation, three deliberate PnP restart cycles still reproduced
-  defect 0z in the pre-existing `vn_ring_load_head` teardown path (also present
-  in the pre-branch ICD); DWM recovered each time. This branch does not claim to
-  fix that separate adapter-removal race.
-- **Re-gated after the merge, on the version that actually ships (2026-08-05).**
-  The bullets above say `.254`; `kmd_render/driver-version.env` says
-  **22.22.255.0** (the branch bumped 252 -> 255 directly), so read `.254` as the
-  development build and `.255` as the shipped one. The merge also joined this
-  branch to the ICD `HOST_CACHED` mapping fix, two changes that had never seen
-  each other — the submodule conflict resolved to `e7ad5b238ec`, which strictly
-  contains the branch's own `c3262452217`. Re-gated on the merged image:
-  `d3d11_xproc_lifetime_probe` **PASS** (both-open and creator-exited each
-  retained exactly `+64.00 MiB` adapter and process, pixel `ffff00ff` survived
-  the creator's exit, exact return to baseline); `vidmm_tracking_probe` **PASS**
-  in all four modes — local, `nonlocal`, `shared` (each exactly `+256.00 MiB`
-  for 4x64 MiB) and the new `crossproc` (`+64.00 MiB` retained past creator
-  exit). PnP `OK`/`CM_PROB_NONE`, desktop composites (screenshot), no
-  display/Dxgkrnl/WHEA/BugCheck critical or error events since boot,
-  `WdSigF`/`DmaNtfF`/`TxGone`/`RclBadH` all **0**, and `umd-gate-surface.ps1`
-  reports `UMD GATE SURFACE CLEAN` with its must-not-appear set `all clear`.
-- The Task Manager-triggered DWM abort was a mixed-source Mesa deployment: the
-  installed ICD combined the old `vn_queue.c` with only four files from the
-  newer VidMm work. Deploying one coherent Mesa `1a02ba9` image restored the
-  imported-Win32-timeline path; Task Manager then stayed open with a stable DWM
-  process. The separate, pre-existing PnP-restart DWM fault remains defect 0z.
+Superseded in full by "Current verified correction (2026-08-04, KMD 22.22.238.0)"
+above, which is the live baseline. The 142.0-era detail (DisplayHalf=1, ScanoutDiag
+deleted, the LINEAR-on-NVIDIA proof) is preserved in git history rather than here,
+because a living doc that carries two baselines invites reasoning from the older one.
 
 ## Current priorities
 
@@ -557,79 +431,14 @@ and repairs the same file so an upgrade cannot retain the old ACL.
    refusal, DWM failures, and NVIDIA Xid 31 when bypassed.
 4. Continue D3D11 stability and conformance work now that the quality pass is done.
 
-## Historical PSC workstreams
+## Historical PSC workstreams — REMOVED 2026-09-05
 
-The dated IDD/Looking Glass investigations below explain how the display pivot
-was reached. They are historical evidence, not descriptions of the active
-display architecture, and are superseded by the baseline above wherever they
-conflict.
-
-1. **D3D11 windowed apps render transparent — investigate & fix.** Windowed
-   D3D11 swapchains (FaceWorks, Fire Strike windowed) show a transparent/black
-   client area even when placed on-screen at the right size, while the desktop
-   and window frames composite fine. Established this session: the app DOES
-   render correct content (`HELIOS_PRESENT_READBACK` source non-black at
-   1264×681); it is NOT alpha (`HELIOS_PRESENT_FORCE_OPAQUE` no-op, owner-
-   confirmed); it is NOT a two-memory split (the KMD adopt path backs the alloc
-   with the DXVK venus image — an earlier "KMD zeroes the resid" reading was a
-   UMD struct-layout misread, see below); and it is NOT the IDD (both the D3D11
-   fallback and the dead D3D12 path capture the same single composed IddCx
-   surface — D3D12 is dead only because our UMD has no D3D12). The live thread:
-   **DXGI `EnumOutputs`/`GetDisplayModeList` racily return `0x887a0022`** on the
-   Helios adapters, DWM never imports the app's flip backbuffer (its max
-   imported resid trails the app's). **ROOT-CAUSED 2026-07-08 (34th) — see
-   `WINDOWED_BLT_DESIGN.md` (full design + implementation plan) and memory
-   `windowed-blt-occluded-root-34th-session`.** It is specifically the legacy
-   **`DXGI_SWAP_EFFECT_DISCARD` (BLT) swap model** returning `DXGI_STATUS_OCCLUDED`;
-   **flip composites fine** (proven with `tools/d3d11_triangle.cpp`). Falsified:
-   alpha, IDD, two-memory-split, phantom-LUID/EnumOutputs, adapter selection, AND
-   the cross-adapter cap (present is same-adapter, not cross). Real cause: a legacy
-   DISCARD windowed present needs a **real active VidPn output** in the path; ours
-   has none — the only monitor is the indirect IddCx one, enumerated on Helios's
-   **runtime-synthesized *facade* output** (`NumOfSources=0`), and there is no real
-   display adapter to cross-adapter to. FIX = give Helios a **real (virtual) VidPn
-   source** (RDP/display-miniport model) so DISCARD resolves a real output; do the
-   **Stage-0 WARP A/B first** (WINDOWED_BLT_DESIGN.md §6). The "two Helios adapters"
-   are the Helios render adapter + the Looking Glass IddCx adapter (which inherits
-   the render adapter's name) — NOT stale residue.
-   **STAGE 0 DONE + STAGE 1 IMPLEMENTED (2026-07-08, 35th):** Stage 0 validated
-   Option A on-screen (disable Helios → WARP presentable → BLT composites). §6.3
-   resolved from MS docs — a VidPn source+target+monitor must be same-adapter, so
-   Helios gets its OWN 2nd (virtual, no-scanout) monitor (owner-approved; IDD
-   renders unchanged, monitor unobserved). **Built KMD v22.22.63.0** with the full
-   display half behind a `DisplayHalf` REG_DWORD knob (default 0 = today's
-   render-only surface): `start_device` sources/children=1 + child DDIs +
-   GetChildContainerId; new `ddi/vidpn.rs` (viogpudo-style
-   EnumVidPnCofuncModality/RecommendMonitorModes, single 1920x1080@60); VidPn DDIs
-   in `display.rs` (IsSupportedVidPn=TRUE, RecommendFunctionalVidPn=NO_RECOMMENDED,
-   Commit/SetAddr/SetVisibility=SUCCESS no-op scanout). Compiles + signed; NOT yet
-   installed. **NEXT: owner install (reboot) → `DisplayHalf`=1 + `pnputil
-   /restart-device` → BLT triangle un-occlusion test** (WINDOWED_BLT_DESIGN.md §9,
-   memory `windowed-blt-display-half-implemented-35th`). Honest caveat: docs don't
-   tie OCCLUDED to a VidPn source — the knob A/B is the arbiter.
-
-2. **Slow first-paint on some windows — our UMD makes DWM wait.** Settings app,
-   parts of Explorer on fresh open, and (easiest repro) the **UAC dimmed
-   window** take several seconds to render. Suspected a UMD-side present/consumer
-   wait or a per-window gate stalling DWM's first composition of these surfaces.
-   Likely related to #1's consumer/import path. NEXT: measure — instrument the
-   present-wait / gate-flush / consumer-wait counters against a UAC-window repro,
-   find which wait blocks and why it only bites first-paint.
-
-3. **Codebase cleanup (HIGH).** Many paths accreted across bring-up sessions add
-   overhead or cause minor misbehaviours: retired diagnostic scaffolding, dead
-   knobs, superseded present/staging paths, force-* diagnostics, staged-probe
-   machinery, and now-falsified experiments (e.g. the `DECLARE_CROSS_ADAPTER_RESOURCE`
-   line, broad-adopted-BAR remnants). Audit the UMD present path, dxvk-helios
-   staging/refresh layers, and KMD segment/adopt code; delete or gate what is not
-   load-bearing, with before/after behaviour verified. Do this before large new
-   feature work so #1/#2/#4 land on a clean base.
-
-4. **Performance — Fire Strike fullscreen (~100 fps @1080p, GT1).** Owner
-   believes near-2× is reachable. Render path is healthy (fullscreen renders
-   correctly). Measure first (venus submit/fence latency, copy/acquire gates,
-   present-to-scanout) then remove known costs. See WS2 for the levers already
-   mapped (feedback-shadow retire, dcomp vehicle, copy-latency).
+The dated IDD/Looking Glass investigations that explained how the display pivot was
+reached lived here. They were explicitly "historical evidence, not descriptions of the
+active display architecture, and superseded by the baseline above wherever they
+conflict" — i.e. nothing in them was actionable. Read them at
+`git log -S"Historical PSC workstreams" -- ROADMAP.md` if a provenance question ever
+needs them; the active display architecture is the baseline sections above.
 
 ## Fullscreen scan-out — 0aa FIXED, 0ab STILL OPEN (2026-07-29, KMD 22.22.201.0)
 
@@ -4072,11 +3881,16 @@ State, so this file is not silent on it:
   which is also where `DECISIONS.md` D3c and `PARALLEL.md` §5's *"the first lane that needs a
   crossing record adds it"* finally bite. `D12-G8` rungs 1 and 2 are blocked on it; rung 0 is
   not, and rung 0 is where the current defect lives.
-- ⚠ **The deferred INF / cold-boot half of S5 is still deferred** and is now worth doing: the
-  DriverStore package carries no `helios_umd12.dll`, so a cold boot has no D3D12 UMD.
-  Harmless while `UmdD3D12` is off, and one reboot would validate a device that can actually
-  be created.
-  (`PARALLEL.md` §9.2).
+- ⭐ **DONE (2026-09-05): the deferred INF / cold-boot half of S5 has landed.** The INF
+  `CopyFiles` carries `helios_umd12.dll` and registers it at `UserModeDriverName[3]`, so the
+  D3D12 UMD ships inside the signed DriverStore package rather than as a ProgramData
+  override, and it survives a cold boot. Verified across a reboot: slot 3 resolves to
+  `…\DriverStore\FileRepository\helios_kmd_render.inf_amd64_<hash>\helios_umd12.dll`, and
+  with `UmdD3D12=1` a real `CreateDevice` appears in `umd12-<pid>.log` with
+  `OpenAdapter12=0` refusals. (`PARALLEL.md` §9.2.)
+  ⚠ `install-helios-kmd.ps1` had to learn `-Umd12Dll` for this: `cargo make` stages a DEBUG
+  `helios_umd12.dll` into the package and only `helios_umd.dll` was ever refreshed, so the
+  first install of this shipped a debug D3D12 UMD.
 - ⭐⭐ **THE FEATURE-LEVEL TARGET IS FL 12_1. FL 12_2 IS OUT OF SCOPE, AND THE BLOCKER
   IS WDDM, NOT CAPS** (owner, 2026-08-06). `DX12.md` **§4.4** is the ladder. FL 11_0 is
   what `caps12.rs` ships today and is a **staging value**.

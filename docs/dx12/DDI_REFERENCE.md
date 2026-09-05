@@ -538,7 +538,7 @@ explicitly, so there is no excuse. The shape to write:
 // helios_umd12: the only legal fill.
 let n = core::cmp::min(table_size, core::mem::size_of::<ddi12::D3D12DDI_DEVICE_FUNCS_CORE_0109>());
 if n < core::mem::size_of::<ddi12::D3D12DDI_DEVICE_FUNCS_CORE_0109>() {
-    FILL_TRUNCATED.fetch_add(1, Ordering::Relaxed);   // named counter, CLAUDE.md rule 2
+    FILL_TRUNCATED.fetch_add(1, Ordering::Relaxed);   // named counter, AGENTS.md rule 2
 }
 core::ptr::copy_nonoverlapping(&filled as *const _ as *const u8, p_table as *mut u8, n);
 ```
@@ -1235,7 +1235,7 @@ typedef HRESULT ( APIENTRY* PFND3D12DDI_CREATEHEAPANDRESOURCE_0109)(
 | NULL | non-NULL | `CreatePlacedResource` / `CreateReservedResource` |
 | NULL | NULL | — illegal; refuse and count |
 
-**The NULL combinations ARE the arm structure**, and CLAUDE.md's "validate every runtime-supplied
+**The NULL combinations ARE the arm structure**, and AGENTS.md's "validate every runtime-supplied
 length per-arm, not max-union" applies literally: the RenderGdi ~48 % drop bug was exactly this
 mistake in D3D11.
 
@@ -1449,7 +1449,7 @@ into the ICD present-stream cookie, or reach the `VkQueue` via `vkd3d_acquire_vk
 (`vkd3d-proton-helios/include/vkd3d.h:104-142`) and signal an extra timeline semaphore itself. The
 first is smaller and keeps vkd3d's ordering guarantees. `docs/dx12/SUBSTRATE.md` owns that choice.
 
-⛔ **The invariant from CLAUDE.md applies unchanged: never signal a wire fence before host
+⛔ **The invariant from AGENTS.md applies unchanged: never signal a wire fence before host
 completion.** An ECL that completes its WDDM fence immediately would reproduce the
 DEVICE_LOST/freeze class the C3/M3.4 work fixed.
 
@@ -1794,7 +1794,7 @@ hits each; the header stops at `_0110`, which is what `D12-G5` negotiated). So t
 — the binding reason is the DDI version, not Helios' `NOT_SUPPORTED` answer. Helios should still report
 `NOT_SUPPORTED`, and should additionally treat a non-zero `CreateAtVirtualAddress` or `NumReserveRanges`
 as a **named refusal counter** rather than silently ignoring the fields, because arrival would mean the
-build assumption is wrong (CLAUDE.md rule 2).
+build assumption is wrong (AGENTS.md rule 2).
 
 ⚠ **This does not settle §15.1 #10** — see the verdict there. `RecreateAtGpuva-public.md` is the closest
 the corpus comes and it describes **no provenance check anywhere**: the runtime *reads* VAs back out of
@@ -2346,7 +2346,7 @@ application's fence wait grows by N (`tmp/dx12/gates/G8-r0-settle/` established 
 ⛔ **Do not claim `D3D12DDI_FENCE_FLAG_BOTTOM_OF_PIPE` semantics the stack cannot deliver.** The
 flag is an input the driver *receives*, so the obligation runs the other way: if a fence carries it,
 the queued software signal packet must be ordered behind the frame's own producer completion, not
-merely behind submission. That is exactly the `PresentWmk` lesson in fence form (CLAUDE.md's
+merely behind submission. That is exactly the `PresentWmk` lesson in fence form (AGENTS.md's
 invariant: *a WDDM fence may wait on the frame's OWN boundary, never on the whole `next_wire_fence`
 backlog*).
 
@@ -2726,7 +2726,7 @@ up untested.
 into a field whose enum stops at 3 hits the measured `D12-G5` rule that an **out-of-range tier is
 clamped silently** (tier 99 → the app sees 3, debug layer included) — so the bug would not announce
 itself; it would just be a driver shipping a number nobody chose. ⛔ This is the exact shape of
-CLAUDE.md rule 8: the clamp must be explicit, at the site, with the reason in a comment — never left to
+AGENTS.md rule 8: the clamp must be explicit, at the site, with the reason in a comment — never left to
 the runtime.
 
 ⚠ **The same pattern, opposite direction, for `SamplerFeedbackTier`:** `SamplerFeedback.md:79` says
@@ -2844,7 +2844,7 @@ Two worked failures, both on the retail path with no debug layer, both reproduci
 > — clamping the `_0011_SHADER_MODELS` list to 6.5 while leaving `OPTIONS1_0103` alone
 
 ⛔ **The clamp is the dangerous half, not the failure.** A wrong tier does not become a loud error;
-it becomes a *wrong advertised tier*, which is CLAUDE.md's "advertising a capability that is not
+it becomes a *wrong advertised tier*, which is AGENTS.md's "advertising a capability that is not
 backed" with the loud failure removed. Answer in range, and answer consistently.
 
 **ETW recipe** — ⚠ `Microsoft-Windows-DxgKrnl` / `AzureTriage` contributed **nothing** here; the
@@ -3122,7 +3122,7 @@ caps table for 6.0 and treat everything above as upside until the `driverID` pro
 turns out to be extending vkd3d's denorm exemption to `VK_DRIVER_ID_MESA_VENUS`, that is the
 `vkd3d-proton-helios` fork's first justified patch, it must be conditioned on something venus can
 actually observe about the host, and it carries the evidence in a comment at the change site —
-CLAUDE.md rule 8 applies to a forked constant exactly as to a registry knob.
+AGENTS.md rule 8 applies to a forked constant exactly as to a registry knob.
 
 ### 11.8 Two structural notes on answering caps
 
@@ -3258,7 +3258,7 @@ pub(crate) unsafe fn shader_code_len(code: *const u32) -> usize {
 
 **Copy it verbatim into `helios_umd12`, including both bounds checks and the log line.** Those two
 bounds (`total < 32 || total > 4 MiB`, `dwords < 2 || dwords > 1 Mi`) are precisely the validation
-CLAUDE.md's "validate every runtime-supplied size & offset before reading" demands on this input.
+AGENTS.md's "validate every runtime-supplied size & offset before reading" demands on this input.
 `umd/src/forward/shaders.rs:41-59`, `log_shader_code()`, is the matching instrument — it prints
 `len`, `dxbc=`, and the first four dwords; port that too.
 
@@ -3352,7 +3352,7 @@ knob covers both UMDs.
 | What compiles DXIL, then? | **`dxil-spirv`**, a vkd3d-proton subproject, driven by `libs/vkd3d-shader/dxil.c` (2 474 lines of `dxil_spv_option_*` plumbing). vkd3d-proton contains **no** DXBC-TPF→SPIR-V compiler — *both* DXBC and DXIL go to dxil-spirv. (Upstream WineHQ *vkd3d* does have a TPF compiler; vkd3d-**proton** does not. Do not confuse them.) | `libs/vkd3d-shader/vkd3d_shader_main.c:196-215`, `meson.build` |
 | Is it in the tree? | ⚠ **No.** `vkd3d-proton-helios/subprojects/dxil-spirv/` is an **empty directory** and is the *only* entry under `subprojects/`; the `khronos/Vulkan-Headers` and `khronos/SPIRV-Headers` submodules are registered at **repo-root paths, not under `subprojects/`**, and neither directory exists on disk at all. `git -C vkd3d-proton-helios submodule status` prints all three prefixed `-` (uninitialised). vkd3d-proton **cannot be built from this tree as-is**; `git submodule update --init` (from `vkd3d-proton-helios/`) is a prerequisite for every D3D12 gate. | `research/R8` §3.1; `vkd3d-proton-helios/.gitmodules`, `submodule status` re-run 2026-08-05 |
 | Who validates the DXIL hash? | **The D3D12 runtime, in `d3d12core.dll`, before the UMD is called.** "The DirectX runtime validates the hash on each shader by computing the hash from DXIL and comparing the computed value against the value written in the shader binary." (<https://devblogs.microsoft.com/directx/open-sourcing-dxil-validator-hash/>) | |
-| Does the driver sign or validate anything? | **No.** A Helios D3D12 UMD has no signing obligation and no validation obligation — the blob reached it only because the runtime accepted the hash. ⚠ **It must still bounds-check every offset it reads out of the blob** (§12.2): a correct hash says nothing about a container being well-formed against *this* parser. | CLAUDE.md rule "validate every runtime/guest-supplied size & offset before reading" |
+| Does the driver sign or validate anything? | **No.** A Helios D3D12 UMD has no signing obligation and no validation obligation — the blob reached it only because the runtime accepted the hash. ⚠ **It must still bounds-check every offset it reads out of the blob** (§12.2): a correct hash says nothing about a container being well-formed against *this* parser. | AGENTS.md rule "validate every runtime/guest-supplied size & offset before reading" |
 | Does the DXBC container checksum matter? | Not to vkd3d: `dxbc.c:124` is literally `WARN("Ignoring DXBC checksum.\n"); skip_dword_unknown(&ptr, 4);`. Helios' D3D11 bridge *computes* one only because it synthesises containers (`umd/bridge/bridge_dxbc.cpp:303-304`). Neither is a security check. | |
 
 **And when you go to build it, the build is decided** (`DECISIONS.md` §6.1, gate `D12-G0`): the
@@ -3490,7 +3490,7 @@ Four facts a `PRESENT.md` reader needs from here:
 
    ⛔ **Do not design a new `DxgkDdiSubmitCommandVirtual` decode for the present identity.** That
    DDI runs at **DISPATCH_LEVEL** (`kmd_render/src/ddi/submit_command.rs:723-724`), where the stash
-   machinery's `diag::record*` calls are illegal (CLAUDE.md's first invariant), and it would add a
+   machinery's `diag::record*` calls are illegal (AGENTS.md's first invariant), and it would add a
    fourth KMD item that `DECISIONS.md` D5 does not have. The `pfnRenderCb` route is the
    recommendation.
 
@@ -3682,7 +3682,7 @@ enumerated — see §17.1.
 1. **Fill every slot with a named, counting stub first, then overwrite the implemented ones.** The
    D3D11 installers are documented as running "over the stub fill" (`umd/src/forward/tables.rs:11`,
    `:43`). For D3D12 the stub must be *per-slot*, so that a counter readout names which unimplemented
-   DDI was called — CLAUDE.md rule 2 ("every skipped/refused path gets a named counter"), and the
+   DDI was called — AGENTS.md rule 2 ("every skipped/refused path gets a named counter"), and the
    direct analogue of the noop-DDI hit counters `CONFORMANCE.md` is driving to zero for D3D11.
 
 2. **Make install ORDER structural with `#[must_use]` proof tokens.** `umd/src/forward/tables.rs:44-70`

@@ -10,7 +10,7 @@
 #   * do the pixels in the flyout region change?                      (screen capture)
 #   * did the host process get RESTARTED by the shell?                (pid/start time)
 #
-# The pixel comparison, not a log line, is the arbiter (CLAUDE.md evidence rule).
+# The pixel comparison, not a log line, is the arbiter (AGENTS.md evidence rule).
 # Verdicts:
 #   APPEARED                 window created + uncloaked + pixels changed
 #   SHOWN_BUT_NOT_PAINTED    window created + uncloaked, pixels identical -> ours

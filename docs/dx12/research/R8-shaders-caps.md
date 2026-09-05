@@ -218,7 +218,7 @@ Two things follow, both load-bearing for Helios:
 - **Therefore:** the check happens in `d3d12core.dll` **before** the UMD is called. A Helios
   D3D12 UMD has **no signing obligation and no validation obligation** — it may assume the blob
   reached it only because the runtime accepted the hash. It must still bounds-check every
-  offset it reads out of the blob (CLAUDE.md rule: "Validate every runtime/guest-supplied size
+  offset it reads out of the blob (AGENTS.md rule: "Validate every runtime/guest-supplied size
   & offset before reading"), because a *correct* hash says nothing about a container being
   well-formed against the driver's parser.
 - **Corollary for strategy (b) (vkd3d-proton as `d3d12.dll`/`d3d12core.dll`):** replacing
@@ -244,7 +244,7 @@ gap by *synthesising a container in the UMD*:
 - `umd/src/forward/shaders.rs:68-100` — `create_vertex_shader`: `clear_handle` → resolve device
   → length → `core::slice::from_raw_parts` → `dxvk.create_vertex_shader(ptr, len)` → on success
   `store_raw_com`, and cache the bytecode so input layouts can be built lazily from the ISGN.
-  On failure: `log_error!` and leave the handle cleared — **no panic, ever** (CLAUDE.md
+  On failure: `log_error!` and leave the handle cleared — **no panic, ever** (AGENTS.md
   invariant).
 - `umd/src/forward/shaders.rs:129-186` — the wire format for flattened signatures:
   `SIG_ENTRY_WORDS = 5`, `SigEntry { sysval, register_, mask, comptype, stream }`, and
@@ -270,7 +270,7 @@ gap by *synthesising a container in the UMD*:
     parameter so the offset table has no runtime bound to get wrong.
   - Refusal discipline: `signature_count_ok` (`:98-110`) bounds entry counts at 512 and
     increments the named atomic `g_signatureCountRefused`, logging `"… REFUSED: signature entry
-    count %u exceeds %u (x%u)"`. That is the CLAUDE.md "every refusal gets a named counter"
+    count %u exceeds %u (x%u)"`. That is the AGENTS.md "every refusal gets a named counter"
     rule, in the shader path.
   - Optional forensics: `HKLM\SOFTWARE\Helios\ShaderBytecodeDumpPath` dumps every blob as
     `shader-<pid>-<seq>-<stage>-<form>-<len>.dxbc` (`:39-83`). **This knob is the single
@@ -879,7 +879,7 @@ way, which is the point: **it is a caps ladder, not a code ladder.**
    recorded): extending the SM-6.2 denorm exemption to `VK_DRIVER_ID_MESA_VENUS`. That is a
    two-line change with real semantics and a real risk (§4.3 fix 2). It should be taken only
    after fix 1 (`VKD3D_SHADER_MODEL=6_8`) has measured what actually breaks, and it must carry
-   the evidence in a comment at the change site — CLAUDE.md's "a knob's default is a decision"
+   the evidence in a comment at the change site — AGENTS.md's "a knob's default is a decision"
    rule applies to a forked constant exactly as it does to a registry knob.
 4. **Reuse `shader_code_len()` verbatim.** `umd/src/forward/shaders.rs:13-39` already implements
    the exact container-vs-token discrimination and bounds-checking a D3D12 UMD needs on a

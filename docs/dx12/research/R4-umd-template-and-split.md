@@ -448,7 +448,7 @@ is the *firewall* pattern, not the code.
   `libvkcommon.a`, `libdisplay-info.a`. Plus nine system libs
   (`setupapi gdi32 user32 ole32 oleaut32 version advapi32 shell32 cfgmgr32`) — **no dxgi**.
 - **Env / target dirs.** `CARGO_TARGET_DIR` must be a **local C: path** on Windows, never `Z:\`
-  (CLAUDE.md; `tools/win-mcp/src/main.rs:36-38` cites windows-drivers-rs#481 / OS error 87).
+  (AGENTS.md; `tools/win-mcp/src/main.rs:36-38` cites windows-drivers-rs#481 / OS error 87).
   `LIBCLANG_PATH = C:\Program Files\LLVM\bin` (`main.rs:40`, set by `win_cargo` at `:565`).
 - **Command:** `win_cargo crate_dir:"umd" args:["build","--release"]`. It robocopy-mirrors
   `Z:\` → `C:\Users\Rupansh\helios-vgpu` excluding `target/`, all `.git`, and `icd/mesa`
@@ -910,7 +910,7 @@ The public API it needs is all in `vkd3d-proton-helios/include/vkd3d.h`:
 ### 6.6 INF and win-mcp tooling changes
 
 INF (`kmd_render/helios_kmd_render.inx`) — **do not edit without explicit instruction**
-(CLAUDE.md "Files Not to Touch"). The change, when authorised, is three lines:
+(AGENTS.md "Files Not to Touch"). The change, when authorised, is three lines:
 
 ```inf
 [SourceDisksFiles]             ; lines 20-22 today: helios_kmd_render.sys, helios_umd.dll

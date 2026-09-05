@@ -88,7 +88,7 @@ pub unsafe extern "C" fn evt_io_device_control(
         IOCTL_HELIOS_MAP_BLOB => handle_map_blob(adapter, request),
         IOCTL_HELIOS_PRESENT_BLOB => handle_present_blob(adapter, request),
         IOCTL_HELIOS_RELEASE_BLOB => handle_release_blob(adapter, request),
-        // Unknown control codes are rejected (CLAUDE.md invariant).
+        // Unknown control codes are rejected (AGENTS.md invariant).
         _ => (STATUS_INVALID_DEVICE_REQUEST, 0),
     };
     complete(request, status, info);

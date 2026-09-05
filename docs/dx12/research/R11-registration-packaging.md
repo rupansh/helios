@@ -376,7 +376,7 @@ invoked as `powershell -NoProfile -ExecutionPolicy Bypass -File …` or they sil
 
 ## 3. The INF diff
 
-⚠ **Project rule: `*.inx` is only edited with explicit instruction** (CLAUDE.md, "Files Not to
+⚠ **Project rule: `*.inx` is only edited with explicit instruction** (AGENTS.md, "Files Not to
 Touch"). What follows is a *proposal*, not an applied change.
 
 Current relevant lines, `kmd_render/helios_kmd_render.inx`:
@@ -801,7 +801,7 @@ Why this is the right shape here:
 - **No length limit** applies: the UMD reads via `RegGetValueA` (`knobs.rs:63-71,89-99`). (The ≤14-char
   cap is a *KMD* constraint — `kmd_render/src/diag.rs:380,468,487,517` — because those knobs go
   through `RtlQueryRegistryValues` on the service key. Do not confuse the two hives.)
-- **CLAUDE.md rule:** "A knob's default is a decision, and it must match the measured configuration."
+- **AGENTS.md rule:** "A knob's default is a decision, and it must match the measured configuration."
   Default OFF is correct *during bring-up*, and the flip to ON must land with the evidence in the
   comment at the read site — exactly as `UmdCommandLists` did (`knobs.rs:240-260`, ROADMAP.md:32-46).
 
@@ -822,7 +822,7 @@ one: it converts "a broken D3D12 UMD" from a desktop-down event into a registry 
 `tools/install-helios-kmd.ps1` backs up the active DriverStore files under
 `C:\ProgramData\HeliosDeployBackups\<timestamp>` (`HELIOS_DRIVER_DEPLOYMENT.md:87`), and the
 recovery boot without the `virtio-gpu-gl-pci` device (`BRINGUP_QUIRKS.md:142-153`) unlocks the live
-`.sys`/`.dll` for replacement. Owner-driven; VM device-set changes are owner-gated (CLAUDE.md).
+`.sys`/`.dll` for replacement. Owner-driven; VM device-set changes are owner-gated (AGENTS.md).
 
 ### What NOT to do
 

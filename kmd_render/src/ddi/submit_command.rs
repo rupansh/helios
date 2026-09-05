@@ -193,7 +193,7 @@ pub(crate) fn record_present_handoff_telemetry() {
     // incremented on a real refusal/failure path and then loaded by nobody:
     // no `.load`, no `CounterEntry`, no `HeliosEscapeQueryStats*` field. Their
     // own doc comments claim they exist so the failure "shows up as itself",
-    // and CLAUDE.md's rule is that every skipped or refused path gets a named
+    // and AGENTS.md's rule is that every skipped or refused path gets a named
     // registry counter — so a write-only counter is the rule being violated
     // silently. They are mirrored here rather than added to the escape stats
     // ABI because this site already runs at PASSIVE on the same teardown edge
@@ -224,7 +224,7 @@ pub(crate) fn record_present_handoff_telemetry() {
         crate::virtio::gpu::PRESENT_EXACT_WATERMARK_USED.load(Ordering::Relaxed),
     );
     // A4: D3D12 ECL packets gated on the EXACT wire fence their batch ends at,
-    // instead of on the whole prefix below it (the invariant CLAUDE.md's table
+    // instead of on the whole prefix below it (the invariant AGENTS.md's table
     // states verbatim).
     //
     // ⛔⛔ NO EXACT IDENTITY EXISTS FOR THIS COUNTER. This comment used to claim
@@ -715,7 +715,7 @@ unsafe fn signal_dma_preempted_locked(
 /// R209 turns into a retry on the DPC path - was returned to VidSch as
 /// STATUS_DEVICE_NOT_READY, and this file's own record says a non-SUCCESS return
 /// here bugchecks dxgmms2!VidSchiSendToExecutionQueue with 0x119
-/// VIDEO_SCHEDULER_INTERNAL_ERROR Arg1=2. CLAUDE.md's DDI rule says the same
+/// VIDEO_SCHEDULER_INTERNAL_ERROR Arg1=2. AGENTS.md's DDI rule says the same
 /// thing in general: an illegal NTSTATUS is itself logged by dxgkrnl as a driver
 /// bug. A failed notify has to be handled where it can be retried, not escalated.
 enum SubmitAck {
@@ -757,7 +757,7 @@ fn note_and_maybe_signal(
                 //   1. `wddm_boundary::select` reads it to choose `Kind::Exact`
                 //      over `Kind::Prefix` — i.e. it DOES decide what to wait for.
                 //      That is the A4 repair and it is deliberate: `Exact` names
-                //      the frame's OWN fence, which is what CLAUDE.md's invariant
+                //      the frame's OWN fence, which is what AGENTS.md's invariant
                 //      requires, instead of the whole `next_wire_fence` prefix.
                 //      ⚠ "Identity, not a boundary" survives only in the narrow
                 //      sense that the bit is not itself a fence VALUE.

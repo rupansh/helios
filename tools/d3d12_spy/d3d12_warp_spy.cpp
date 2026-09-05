@@ -262,7 +262,7 @@ static void log_hex(const char* label, const void* p, size_t n) {
     logf("%s [%zu bytes, first %zu] %s", label, n, k, buf);
 }
 
-// Named refusal counters. CLAUDE.md rule 2: every skipped or refused path gets a name.
+// Named refusal counters. AGENTS.md rule 2: every skipped or refused path gets a name.
 static struct {
     LONG warp_load_failed;
     LONG warp_wrong_path;

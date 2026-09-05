@@ -127,7 +127,7 @@ pub(crate) use log::log_self_module_path;
 
 /// This driver's refusal counters.
 ///
-/// CLAUDE.md rule 2: *every skipped/refused path gets a named counter — loud
+/// AGENTS.md rule 2: *every skipped/refused path gets a named counter — loud
 /// failure over fake success.*
 ///
 /// ⛔ A separate set from `umd`'s eleven, and that is D3b's instruction: a

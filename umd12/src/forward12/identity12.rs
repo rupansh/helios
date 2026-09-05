@@ -264,7 +264,7 @@ pub(crate) struct AllocationIdentity {
 /// What [`record`] did, so the caller can count it.
 ///
 /// `#[must_use]`: an ignored outcome is a dropped identity nobody counted, which
-/// is the silent-failure shape CLAUDE.md rule 2 forbids.
+/// is the silent-failure shape AGENTS.md rule 2 forbids.
 #[must_use = "every outcome has a named counter; dropping it makes an identity failure silent"]
 pub(crate) enum RecordOutcome {
     /// The registry took a new entry.
@@ -322,7 +322,7 @@ static IDENTITIES: OnceLock<Mutex<IdentityRegistry>> = OnceLock::new();
 /// ⚠ Poisoning cannot occur: both `umd12` profiles set `panic = "abort"`
 /// (`umd12/Cargo.toml`), so no unwind can leave the guard poisoned in the first
 /// place. `unwrap_or_else(PoisonError::into_inner)` rather than `unwrap()`
-/// because a `panic!` in a DDI is a silent graphics deadlock (CLAUDE.md's
+/// because a `panic!` in a DDI is a silent graphics deadlock (AGENTS.md's
 /// invariant table) and this crate must not contain a reachable one, even a
 /// theoretically unreachable one.
 fn identities() -> MutexGuard<'static, IdentityRegistry> {

@@ -1768,7 +1768,7 @@ unsafe extern "C" fn discard_resource(
         // so a non-null pointer addresses one live struct for the call.
         let a = unsafe { &*arg };
         // ⛔ Per arm, before the array is handed on: a non-zero count with a
-        // null pointer is the read `CLAUDE.md`'s validation rule exists for.
+        // null pointer is the read `AGENTS.md`'s validation rule exists for.
         if a.NumRects != 0 && a.pRects.is_null() {
             note_refusal(&L3B_REFUSALS.clear_bad_arg);
             if let Some(n) = budget(&ERROR_LOG) {

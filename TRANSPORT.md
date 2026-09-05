@@ -14,7 +14,7 @@
 > active driver does NOT reach the KMD via `DeviceIoControl`/`GUID_DEVINTERFACE_HELIOS`.
 > User mode reaches the WDDM render miniport (`kmd_render/`) through the **dxgkrnl
 > DDI + venus-over-`D3DKMTEscape`** (`kmd_render/src/ddi/escape.rs`, `submit_command`).
-> Treat the "ICD → DeviceIoControl → KMD" spine as archived; **CLAUDE.md/ROADMAP.md
+> Treat the "ICD → DeviceIoControl → KMD" spine as archived; **AGENTS.md/ROADMAP.md
 > are authoritative** for transport.
 >
 > **Current display transport (2026-07-11):** the same control queue also carries

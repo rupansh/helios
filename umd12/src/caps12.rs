@@ -44,7 +44,7 @@
 //!    * `1088 OPTIONS_0110` — `D3D12DDI_EXECUTE_INDIRECT_TIER` has **no zero
 //!      enumerator**: the only values are `_1_0 = 10` and `_1_1 = 11`, so a
 //!      zero-fill writes an out-of-range tier, which the runtime **clamps
-//!      silently**. That is CLAUDE.md rule 8 with the loud failure removed.
+//!      silently**. That is AGENTS.md rule 8 with the loud failure removed.
 //!
 //! # ⭐ THE COUPLING: the feature level is 11_0, and it is a FLOOR mechanism —
 //! one-directional
@@ -605,7 +605,7 @@ pub(crate) unsafe fn get_caps(arg: *const ddi12::D3D12DDIARG_GETCAPS) -> Hresult
 /// back to `1007` on failure, and `1007` may never answer above 12_1
 /// (`DX12.md` §4.3 row 2). WARP answers `E_UNEXPECTED` here on every run and its
 /// device still creates, so a refusal is *tolerated* — but it is tolerated at
-/// the cost of a cap nobody chose, which is the thing CLAUDE.md rule 8 is about.
+/// the cost of a cap nobody chose, which is the thing AGENTS.md rule 8 is about.
 ///
 /// # Safety
 /// As [`get_caps`].
@@ -954,7 +954,7 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
 /// ⭐ `DX12.md` §4.3 row 3 / `DDI_REFERENCE.md` §11.4.1: a live vkd3d device on
 /// this guest reports **tier 4**, `D3D12DDI_TILED_RESOURCES_TIER` stops at 3 in
 /// SDK 26100, and an out-of-range tier is **clamped silently** — so without an
-/// explicit clamp Helios ships a number nobody chose, which is CLAUDE.md rule 8
+/// explicit clamp Helios ships a number nobody chose, which is AGENTS.md rule 8
 /// in its purest form.
 ///
 /// This driver reports `NOT_SUPPORTED` today for one reason only:
@@ -1533,7 +1533,7 @@ unsafe fn umd_queue_priority(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -
 /// value here.** `D3D12DDI_EXECUTE_INDIRECT_TIER` has no zero enumerator: the
 /// only values are `_1_0 = 10` and `_1_1 = 11`. An out-of-range tier is
 /// **clamped silently** by the runtime, so a zero-fill would ship a tier nobody
-/// chose — CLAUDE.md rule 8 with the loud failure removed.
+/// chose — AGENTS.md rule 8 with the loud failure removed.
 ///
 /// `_1_0` is the floor and is what the substrate backs: `VK_EXT_device_generated_commands`
 /// is absent from this guest, which is exactly what separates 1_1 from 1_0

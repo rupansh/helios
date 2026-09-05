@@ -449,7 +449,7 @@ vkd3d adds a fourth of the *same shape as #2*. `I:` there is nothing structurall
 - `D:` `context-monitoring.md` — CPU signal *"immediately unwaits any satisfied waits"*; GPU
   wait *"Command buffers submitted after the wait operation aren't scheduled for execution until
   the wait operation is satisfied."*
-- The project's standing invariant (CLAUDE.md): *"A WDDM fence may wait on the frame's OWN
+- The project's standing invariant (AGENTS.md): *"A WDDM fence may wait on the frame's OWN
   boundary, never on the whole `next_wire_fence` backlog"* — implemented as `PresentWmk`.
 - Under (b) a D3D12 `ID3D12Fence` is a **Vulkan timeline semaphore inside vkd3d**, not a WDDM
   monitored fence — vkd3d only exports it to KMT for *sharing* (`d3dkmt.c:51-77`). So D3D12

@@ -130,7 +130,7 @@ worth knowing because it is the profile independently flagging the same bit §7 
 ### 1.2 Re-measuring it: the exact commands
 
 **A. Is the VM up?** (Linux host — if this prints nothing every `[LIVE]` number is stale, and
-⛔ relaunching the VM is owner-gated per CLAUDE.md.)
+⛔ relaunching the VM is owner-gated per AGENTS.md.)
 
 ```bash
 pgrep -af qemu-system-x86_64
@@ -1622,7 +1622,7 @@ memory is stale for the toolchain, and irrelevant here since this arm uses MSVC.
 
 ### 8.4 ⚠ The local-C:-path rule, and the mirror
 
-⛔ **Never configure or build on `Z:\`.** CLAUDE.md's `CARGO_TARGET_DIR` rule is about cargo, but the
+⛔ **Never configure or build on `Z:\`.** AGENTS.md's `CARGO_TARGET_DIR` rule is about cargo, but the
 underlying failure — build-system artifact IO on the 9p/virtio share failing with `OS error 87` — is
 not cargo-specific, and `win_dxvk` exists precisely because the DXVK meson build has to read a
 **local** checkout. Configure into `C:\Users\Rupansh\vkd3d-build-x64`; keep sources on the mirror.
@@ -2003,7 +2003,7 @@ second process — run **against WARP first** to isolate Helios, then against He
 (`device.c:~7690`). ⚠ §5.1 says this probe may **crash** rather than fail; treat it accordingly.
 
 ⚠ Note for `kmd_render`: an escape with an unrecognised `Type` should be **counted, not silently
-dropped** (CLAUDE.md rule 2). If a D3D12 client starts firing `0x80000000` escapes, a named counter
+dropped** (AGENTS.md rule 2). If a D3D12 client starts firing `0x80000000` escapes, a named counter
 is what tells you.
 
 **And, clearly: this does not block a first milestone.** Nothing in the single-process D3D12 path —

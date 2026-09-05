@@ -941,7 +941,7 @@ software GDI/DIB blit**.
 ⚠ **The picture is correct.** A screenshot shows a moving D3D12 triangle. What you measured is the
 CPU blit path, not the hardware present — a Phase-0 fps number taken this way is meaningless and a
 "D3D12 works on Helios" claim taken this way is false in the way that costs the most later. This is
-the exact failure shape `CLAUDE.md` rule 6 exists for: *log lines are not frames, and a correct
+the exact failure shape `AGENTS.md` rule 6 exists for: *log lines are not frames, and a correct
 picture is not the path you think you measured.*
 
 ⚠ Note the demotion is **silent to the screen but loud in the diag** — §11 makes reading that diag
@@ -1019,7 +1019,7 @@ wsi_win32_load_system_dll(const WCHAR *sysdir, const WCHAR *base)
 is sufficient.** The loader's already-loaded check matches on **base name**, so in a vkd3d process —
 where DXVK's `dxgi.dll` is mapped before any swapchain is created — either form can return DXVK's
 module. The `GetModuleFileNameW` check is what turns a silent wrong answer into a counted refusal,
-and `helios_vehicle_syslib_hijacked` is the named counter CLAUDE.md rule 2 requires for it. [INFER
+and `helios_vehicle_syslib_hijacked` is the named counter AGENTS.md rule 2 requires for it. [INFER
 from documented loader behaviour, adopted as the decision in `DECISIONS.md` §3-H2 P-A.]
 
 ⚠ **The §6.6 probe does not test this.** `tools/dcomp_present_probe.cpp` links `-ldxgi`
@@ -1342,7 +1342,7 @@ this section did, and it is wrong on the project's most-repeated invariant:
   PASSIVE_LEVEL — only call [`record`] from PASSIVE DDIs (never the DPC/ISR or DISPATCH paging
   paths)"*).
 
-Copying that code into a DISPATCH-level DDI violates the CLAUDE.md invariant *"No pageable code /
+Copying that code into a DISPATCH-level DDI violates the AGENTS.md invariant *"No pageable code /
 `diag::record` (registry writes) above PASSIVE"* — a BSOD/deadlock class this project has already
 paid for — and it would add a **fourth** KMD item that `DECISIONS.md` D5 does not have. The
 `pfnRenderCb` route has neither problem: it lands at PASSIVE, in code that already exists.
@@ -1389,7 +1389,7 @@ is not re-proposed as if it were untried.
    prefix-compatible at 48 / 56 / 72 bytes) and stashes on the context (`:1099-1160`) through
    `ContextHandleRef::stash_snapshot` (`kmd_render/src/device.rs:129`) and
    `stash_present_stream_marker` (`:175`). The magic + version + per-arm length validation the
-   `CLAUDE.md` invariant demands is **already there** and already counted — a flagged-but-short
+   `AGENTS.md` invariant demands is **already there** and already counted — a flagged-but-short
    command falls back through `scanout_trace::note_snapshot_fallback()` (`:1140`, `:1162`).
 
    ⚠ `PresentFlipPrivate` occupies the *present packet's* kernel-only private data
@@ -1400,7 +1400,7 @@ is not re-proposed as if it were untried.
    every arm (`:296-313`), and the orphan bound (clear-on-take) already covers a Render whose
    present never came.
 
-4. **New counters (CLAUDE.md rule 2).** The route is unchanged but the *caller* is new, so the
+4. **New counters (AGENTS.md rule 2).** The route is unchanged but the *caller* is new, so the
    pairing must be observable from the D3D12 arm alone. Add, all in the existing
    `HKLM\SOFTWARE\Helios` namespace and all short — `diag::record_named_bytes` truncates the value
    name at **14** characters (`kmd_render/src/diag.rs:471`):
@@ -1702,7 +1702,7 @@ that (b)'s default suppresses for the *desktop* still happens for a maximized co
 
 ## 11. How to prove a D3D12 frame
 
-⛔ **Log lines are not frames** (`CLAUDE.md` rule 6, `DECISIONS.md` §7.11). ⛔ **Anything with a
+⛔ **Log lines are not frames** (`AGENTS.md` rule 6, `DECISIONS.md` §7.11). ⛔ **Anything with a
 window runs in session 1** via a scheduled task — `win_exec`/SSH land in session 0 and a session-0
 run fakes results. ⛔ **Registry counters persist across boots** — prove a counter *moves this boot*.
 
@@ -1738,7 +1738,7 @@ schtasks /create /tn helios_d3d12_sample /sc once /st 00:00 /f `
   /tr "cmd /c C:\ProgramData\Helios\d3d12_sample.cmd" `
   /ru "$env:USERDOMAIN\$env:USERNAME" /it
 #   /it == InteractiveToken == SESSION 1. Without it the window never appears
-#   and the run is a session-0 lie (CLAUDE.md, 60th-session trap).
+#   and the run is a session-0 lie (AGENTS.md, 60th-session trap).
 ```
 
 *(The `[Environment]::SetEnvironmentVariable(…, 'Machine')` route also works and survives reboots,
@@ -1774,7 +1774,7 @@ reg query "HKLM\SOFTWARE\Helios" /v PBcall
 
 ⛔ **Do not `cmp` the whole capture.** A whole-desktop diff passes on a **frozen** sample: the
 taskbar clock alone repaints every minute, and the cursor moves. That is the same false-positive
-class §6.3 and §11.2 exist to prevent, sitting in the one step CLAUDE.md rule 6 makes ground truth.
+class §6.3 and §11.2 exist to prevent, sitting in the one step AGENTS.md rule 6 makes ground truth.
 Crop to the window rect from step 3b first — `magick`/`compare` are on the Linux host:
 
 ```bash
@@ -1828,7 +1828,7 @@ Additional cross-checks:
   puts venus's own complaints into `/tmp/helios-qemu-stderr.log` (`ROADMAP.md:1901-1903`). ⛔ It is
   **not** `VIRGL_LOG_LEVEL=debug` — venus runs in the render-server child and only WARN+ reaches the
   qemu stderr log (`HOST.md` §5.1). ⚠ Changing it is a QEMU relaunch: **owner-gated**, ask first
-  (CLAUDE.md, VM launch ownership). And per the standing directive, never reach for host evidence to
+  (AGENTS.md, VM launch ownership). And per the standing directive, never reach for host evidence to
   explain a guest failure until the guest evidence above is exhausted.
 
 ### 11.3 The Phase-0 experiment in order

@@ -264,7 +264,7 @@ fn budget(t: &LogThrottle) -> Option<usize> {
 
 /// Sanity bound on the barrier `Count` / `NumBarriers` both barrier slots take.
 ///
-/// CLAUDE.md: *validate every runtime-supplied size before reading.* Both DDIs
+/// AGENTS.md: *validate every runtime-supplied size before reading.* Both DDIs
 /// declare their array `_In_reads_(Count)` and the runtime is the authority, so
 /// this is not a semantic cap — no D3D12 rule limits how many barriers one call
 /// may carry. It bounds the allocation a corrupt count would demand, and its
@@ -330,7 +330,7 @@ const MAX_BARRIERS: usize = 65_536;
 /// *"removing the device would not fix a capability gap"* — true, and no longer
 /// the alternative. Both now report: a recording call that provably did not
 /// happen is exactly what a quarantined list is for, and silence there is the
-/// fake success CLAUDE.md forbids. See each slot's doc.
+/// fake success AGENTS.md forbids. See each slot's doc.
 ///
 /// # Safety
 /// `state` must be the live list state the caller resolved for this DDI call.
@@ -743,7 +743,7 @@ fn describe_location(l: &D3D12_TEXTURE_COPY_LOCATION) -> String {
     } else {
         // ⛔ Unreachable through `texture_copy_location`, which returns only the
         // two arms above — printed rather than asserted because a trace helper
-        // that can panic is a graphics deadlock (CLAUDE.md's DDI rule).
+        // that can panic is a graphics deadlock (AGENTS.md's DDI rule).
         format!("res={resource:p},TYPE={}", l.Type.0)
     }
 }
@@ -967,7 +967,7 @@ unsafe extern "C" fn resource_copy(
 /// else and removing the device would not fix it"*. The first half stands; the
 /// second described `pfnSetErrorCb`, which is no longer the channel — see
 /// [`report_error`]. Whoever's fault the call is, the tile copy **did not
-/// happen**, and a `VOID` return that says nothing is the fake success CLAUDE.md
+/// happen**, and a `VOID` return that says nothing is the fake success AGENTS.md
 /// forbids. Quarantining the one list that recorded it is the proportionate
 /// answer and hands the application a failing `Close()`.
 ///
@@ -1382,7 +1382,7 @@ unsafe fn barrier_array_len(
         return None;
     }
     // ⛔ Validate the runtime-supplied count and pointer BEFORE reading the
-    // array. CLAUDE.md's rule; the bound is `MAX_BARRIERS`.
+    // array. AGENTS.md's rule; the bound is `MAX_BARRIERS`.
     if ptr.is_null() || n > MAX_BARRIERS {
         counter.bump();
         if let Some(k) = budget(&BARRIER_LOG) {

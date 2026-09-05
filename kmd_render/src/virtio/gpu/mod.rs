@@ -351,7 +351,7 @@ pub static WDDM_HOLD_MS: AtomicU32 = AtomicU32::new(0);
 /// A static, not a `VirtioGpu` field, for the same reason as [`WDDM_HOLD_MS`]: one
 /// read site, and readable without `virtio_lock`.
 pub static WDDM_HEAD_MS: AtomicU32 = AtomicU32::new(WDDM_HEAD_MS_DEFAULT);
-/// `WddmHeadMs`'s shipping default, in ms, and it is a DECISION (CLAUDE.md rule 8).
+/// `WddmHeadMs`'s shipping default, in ms, and it is a DECISION (AGENTS.md rule 8).
 ///
 /// The bound exists because `present_stream_marker_boundary` accepts any nonzero
 /// marker value and bounds it in no way, so a guest can name a boundary
@@ -1700,7 +1700,7 @@ enum RetireDomain {
 
 /// How a [`WddmPending::watermark`] is compared against the in-flight wire fences.
 ///
-/// ⛔ THE DISTINCTION IS A CLAUDE.md INVARIANT, not a tuning choice: *"a WDDM fence
+/// ⛔ THE DISTINCTION IS A AGENTS.md INVARIANT, not a tuning choice: *"a WDDM fence
 /// may wait on the frame's OWN boundary, never on the whole `next_wire_fence`
 /// backlog."* A prefix wait is satisfied only when EVERY async fence below the
 /// watermark has retired — every ring, every process, DWM's ring-1 scanout copies
@@ -6068,7 +6068,7 @@ impl VirtioGpu {
             }
             let wire_boundary = match selection.kind {
                 boundary::Kind::Prefix => WireBoundary::Prefix,
-                // ⛔⛔ THE EXACT D3D12 BOUNDARY (A4). CLAUDE.md's invariant table:
+                // ⛔⛔ THE EXACT D3D12 BOUNDARY (A4). AGENTS.md's invariant table:
                 // *"A WDDM fence may wait on the frame's OWN boundary, never on the
                 // whole `next_wire_fence` backlog."* Until 2026-08-06 this arm
                 // produced `gpu_fence_id + 1` as a PREFIX, so a D3D12 packet waited
@@ -6094,7 +6094,7 @@ impl VirtioGpu {
                 // (1) that arm IS the shipping, measured desktop configuration —
                 // every accepted present-path measurement, `PresentWmk`'s
                 // +3.7…+4.3 % paired GT1 delta included, was taken with the prefix
-                // on the wire-fence boundary, and CLAUDE.md rule 8 forbids shipping
+                // on the wire-fence boundary, and AGENTS.md rule 8 forbids shipping
                 // a default nobody measured; (2) A4 is a defect report about THIS
                 // arm, and widening the repair to the desktop path would mean the
                 // first D3D12 deploy could not attribute a present regression.
@@ -6624,7 +6624,7 @@ impl VirtioGpu {
 // the pure helpers it covered. FIVE tests (not six, as `docs/dx12/PENDING.md` §6
 // said), none of which had ever executed: this crate is a `panic = "abort"`
 // cdylib whose `build.rs` runs bindgen and shells to `rc.exe`, so a libtest
-// harness cannot exist here at all — CLAUDE.md's invariant table says exactly
+// harness cannot exist here at all — AGENTS.md's invariant table says exactly
 // that. Do not reintroduce tests in this file; add them to `kmd_logic`.
 
 impl Drop for VirtioGpu {

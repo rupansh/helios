@@ -549,7 +549,7 @@ unsafe extern "C" fn present(
             // each look correct while its buffer rotation does not, on a runtime
             // that expected the driver to claim more than one physical buffer per
             // logical back buffer. That is a measurement against the screen
-            // (CLAUDE.md rule 6), and no instrument at this slot can stand in for
+            // (AGENTS.md rule 6), and no instrument at this slot can stand in for
             // it.
             out.BackBufferMultiplicity = 1;
             // The driver does not override the application's sync interval, so

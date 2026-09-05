@@ -92,7 +92,7 @@ issued the state twice.
 Exit, per obligation in the subsystem's contract — every one, not the ones a probe reaches:
 
 * implemented and forwarding, **or**
-* refused with a named counter and a documented error code (CLAUDE.md rule 2), **or**
+* refused with a named counter and a documented error code (AGENTS.md rule 2), **or**
 * explicitly recorded as unreachable, with the argument for why.
 
 ⛔ **"Implemented but never exercised" is not done, and must never be reported as done.** It is a
@@ -146,7 +146,7 @@ consecutive sessions.
    run alive rather than to be correct is a hack wearing a knob's clothes. Concretely: a refused
    `pfnRenderCb` is a device-removing error because the contract says so, and it ships that way —
    not gated OFF "so the first run still produces a reading".
-2. **Loud failure beats a survivable lie, at every severity.** This was always CLAUDE.md rule 2; the
+2. **Loud failure beats a survivable lie, at every severity.** This was always AGENTS.md rule 2; the
    directive removes the last excuse for softening it.
 3. ⛔ **But a crash is still not a substitute for reading.** "Deploy and see" is the rejected loop
    with a bigger blast radius. Phase 4 happens *after* saturation, and a crash that static analysis

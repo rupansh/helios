@@ -55,7 +55,7 @@ static TRACE: AtomicBool = AtomicBool::new(false);
 /// DIFFERENT basename — i.e. something logged before the driver named itself
 /// and the lines went to the wrong module's file.
 ///
-/// CLAUDE.md rule 2: every skipped path gets a named counter. Expected 0. A
+/// AGENTS.md rule 2: every skipped path gets a named counter. Expected 0. A
 /// non-zero value here (and the `log_error!` on the first hit) is what stops
 /// `umd12` silently appending to `umd-<pid>.log` forever.
 pub static LOG_INIT_LATE: AtomicUsize = AtomicUsize::new(0);

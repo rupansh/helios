@@ -727,7 +727,7 @@ and Helios must report **no** hardware scheduling, because `DxgkDdiCreateHwQueue
 `pfnCalcPrivateSchedulingGroupSize` / `pfnCreateSchedulingGroup` / `pfnDestroySchedulingGroup`
 (umddi:13579-13581) belong to the same hardware-scheduling family and can be refused consistently.
 
-**Risk: MEDIUM** (a caps-honesty risk of exactly the class CLAUDE.md/DX12.md §5.5 warns about:
+**Risk: MEDIUM** (a caps-honesty risk of exactly the class AGENTS.md/DX12.md §5.5 warns about:
 `SupportDirectFlip=1` and `FlipImmediateMmIo`).
 
 ### 2.11 Debug layer / SDK layers interactions the driver must tolerate — **must be designed in from day one**

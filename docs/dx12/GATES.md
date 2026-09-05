@@ -140,7 +140,7 @@ These are not advice. A gate result taken without them is not citable.
    not exist.** Two separate constraints, and conflating them has cost a cycle:
 
    * **Rust/cargo only:** cargo file IO fails on the `Z:\` 9p/virtio share with `OS error 87`
-     (CLAUDE.md, windows-drivers-rs#481). `CARGO_TARGET_DIR` must be a local `C:` path.
+     (AGENTS.md, windows-drivers-rs#481). `CARGO_TARGET_DIR` must be a local `C:` path.
    * **`cl.exe` is *not* subject to that.** Verified: `cl /nologo /EHsc Z:\tmp\clprobe\t.cpp` with
      the cwd on the share compiles and writes its `.obj` onto `Z:\` successfully. The real `cl`
      constraints are different and both bite in this file's commands:
@@ -160,7 +160,7 @@ These are not advice. A gate result taken without them is not citable.
 
    The Linux-side vkd3d build goes to `tmp/dx12/build/` on the native Linux fs.
 
-9. **Never blame the host stack without host-side evidence** (CLAUDE.md rule 6). virglrenderer's
+9. **Never blame the host stack without host-side evidence** (AGENTS.md rule 6). virglrenderer's
    `vkr_log`/`proxy_log` are INFO-level and silent on the release build — absence of host lines
    below WARNING proves nothing.
 
@@ -1245,7 +1245,7 @@ wsi-perf.txt,vk_recreate.log}`.
   `-display sdl,gl=on` with no `-vnc` (verified: `pgrep -af qemu-system-x86_64`;
   `tools/launch-helios-gtk.sh:464-466` only adds `-vnc` for `HELIOS_DISPLAY=egl-vnc|vnc`). Both
   `vnc_shot.py` and `vnc_frame_probe.py` therefore have nothing to connect to. **Switching the
-  display arm is an owner-gated QEMU relaunch** (CLAUDE.md "VM launch ownership"; memory: "Same-boot
+  display arm is an owner-gated QEMU relaunch** (AGENTS.md "VM launch ownership"; memory: "Same-boot
   QEMU scanout evidence … Needs an owner-run relaunch with `HELIOS_DISPLAY=egl-vnc`"). Ask, and
   until then run the **guest-only arm**: `helios_paintcap` sampling + the scanout timeline ring,
   which gives ordering but not a black-frame %. Record which arm produced the numbers.
@@ -1669,7 +1669,7 @@ nothing to "rebuild".
 
 ⛔ **Do not design a `DxgkDdiSubmitCommandVirtual` decode for the identity.** That DDI runs at
 **DISPATCH_LEVEL** (`kmd_render/src/ddi/submit_command.rs:723-724`, *"Runs at DISPATCH_LEVEL"*),
-where the stash machinery's `diag::record*` registry writes are illegal (CLAUDE.md's first
+where the stash machinery's `diag::record*` registry writes are illegal (AGENTS.md's first
 invariant), and it would add a **fourth** KMD work item that `DECISIONS.md` D5 does not have.
 `pfnRenderCb` is the recommendation, and it is the only one.
 
@@ -1937,7 +1937,7 @@ shot-*.png,counter-diffs/,timeline.csv}`.
 
 **Entry:** G10.
 
-**Work:** the CLAUDE.md stability list, then the shipping surface. Stability is non-negotiable and
+**Work:** the AGENTS.md stability list, then the shipping surface. Stability is non-negotiable and
 is not graded on a curve.
 
 | Item | How it is exercised | Status on this box |
@@ -2004,7 +2004,7 @@ is a gate of its own — each is a criterion inside a gate that was going to run
 | # | Item | Owning gate | What "done" is, concretely | Why there |
 |---|---|---|---|---|
 | **K1** | Validate `NodeOrdinal`/`EngineAffinity` in `DxgkDdiCreateContext`, count refusals as **`CtxNode`** | **G7**, read again at **G9** | Two-step, in this order: (1) the **counter** ships and `CtxNode` is recorded in G7's pre/post diff — `CtxNode = 0` across G7 **and** G9 is the evidence that every live caller passes node 0; (2) only then may the **refusal** ship, and it re-runs G7 + a Fire Strike parity run to prove DWM's contexts are unaffected. ⛔ Shipping the refusal before the counter has moved-or-not-moved on a real workload is a new refusal on a live path with no evidence behind it | G7 is the first gate where a second UMD creates contexts, so it is the first reading that is not just DWM |
-| **K2** | `ContextInfo.Caps.NoPatchingRequired = 1` + shrink `AllocationListSize`/`PatchLocationListSize` for `VirtualAddressing` contexts | **G10** | Behind a knob (default OFF), with a **paired, interleaved** GT1/GT2 A/B in the shape of `tmp/perf/ab-presentwmk.ps1` — never all-A-then-all-B, because GT1 drifts across a session. Done = the paired delta is recorded with its spread, the default is set to whichever value was measured, and the opposite value stays reachable as the disable (CLAUDE.md rule 8) | It touches the **Present allocation list**, i.e. every client including DWM. D5 explicitly flags it as "knob + paired A/B", and G10 is the only gate that runs interleaved arms |
+| **K2** | `ContextInfo.Caps.NoPatchingRequired = 1` + shrink `AllocationListSize`/`PatchLocationListSize` for `VirtualAddressing` contexts | **G10** | Behind a knob (default OFF), with a **paired, interleaved** GT1/GT2 A/B in the shape of `tmp/perf/ab-presentwmk.ps1` — never all-A-then-all-B, because GT1 drifts across a session. Done = the paired delta is recorded with its spread, the default is set to whichever value was measured, and the opposite value stays reachable as the disable (AGENTS.md rule 8) | It touches the **Present allocation list**, i.e. every client including DWM. D5 explicitly flags it as "knob + paired A/B", and G10 is the only gate that runs interleaved arms |
 | **K3** | Revisit `ApertureSegmentCommitLimit` (64 MiB) | **G10** (measurement), **G7** (first reading) | Done = a **number**, not a change. Capture `QueryVideoMemoryInfo` (`tools/vram_report_probe.cpp` — §3.1 already names it as the natural home for a D3D12 arm) at G7 once a device exists, and again under load at G10. If the D3D12 budget is not squeezed by the 64 MiB limit, K3 closes as *"measured 2026-xx-xx, no change needed"* in ROADMAP. Only a squeeze reopens it | D5: *"Only if D3D12 residency budgets read too small. Needs a measurement first."* The measurement is the item |
 
 **Gate on this:** `D12-G11` may not be signed off while any of the three is unresolved. Each must

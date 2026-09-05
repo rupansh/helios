@@ -1,6 +1,6 @@
 # start_menu_shot.ps1 — press Win, let the flyout settle, screenshot it.
 # Session-1 probe. Screen pixels are the only rendering evidence that counts
-# (CLAUDE.md), so this exists to photograph the Start menu rather than infer it
+# (AGENTS.md), so this exists to photograph the Start menu rather than infer it
 # from counters. Output: Z:\tmp\start_menu_open.png
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms

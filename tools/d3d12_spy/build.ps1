@@ -1,7 +1,7 @@
 # build.ps1 -- build the D12-G5 WARP spy proxy and its workloads on win11.
 #
 # [STOP] Builds to a LOCAL C: path, never Z:\ -- the 9p/virtio share fails file IO with
-#    OS error 87 and the same class bites linkers (CLAUDE.md, BRINGUP_QUIRKS.md).
+#    OS error 87 and the same class bites linkers (AGENTS.md, BRINGUP_QUIRKS.md).
 # [STOP] Never touches C:\Windows\System32. It COPIES d3d10warp.dll out of it (a read) and
 #    records both hashes, because the proxy must load the real WARP under a different base
 #    name: the loader's already-loaded check matches on base name, so a full-path load of

@@ -22,7 +22,7 @@ if [ ${#SRC[@]} -eq 0 ]; then echo "FAIL setup: no source files in $BASE..HEAD";
 echo "== A1 over ${#SRC[@]} changed source files, base $BASE =="
 
 # ---------------------------------------------------------------------------
-# 1. Every `unsafe` block/fn in a CHANGED HUNK carries a `// SAFETY:` (CLAUDE.md rule 4).
+# 1. Every `unsafe` block/fn in a CHANGED HUNK carries a `// SAFETY:` (AGENTS.md rule 4).
 #    Scoped to added lines only: pre-existing unsafe is not this changeset's debt, and sweeping
 #    whole files would drown the real signal.
 # ---------------------------------------------------------------------------
@@ -33,7 +33,7 @@ for f in "${SRC[@]}"; do
   # Added lines introducing an unsafe block or unsafe fn.
   while IFS= read -r ln; do
     n_unsafe=$((n_unsafe+1))
-    # Three forms are legal and all three are in use: the `// SAFETY:` CLAUDE.md rule 4 names,
+    # Three forms are legal and all three are in use: the `// SAFETY:` AGENTS.md rule 4 names,
     # the QUALIFIED form `// SAFETY (both arms):`, and rustdoc's `# Safety` section, which is how
     # an `unsafe fn`'s contract is written here.
     # ⛔ Tightening past this is how a lint manufactures work: demanding the colon immediately

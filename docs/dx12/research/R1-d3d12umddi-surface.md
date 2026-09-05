@@ -1062,7 +1062,7 @@ typedef HRESULT ( APIENTRY* PFND3D12DDI_CREATEHEAPANDRESOURCE_0109)(
 ```
 Both `_In_opt_` args are how D3D12's three resource shapes (committed = both, placed = resource
 only, reserved = resource only with no heap) collapse into one entry point. **The NULL combinations
-are the arm structure**, and CLAUDE.md's "validate every runtime-supplied length per-arm, not
+are the arm structure**, and AGENTS.md's "validate every runtime-supplied length per-arm, not
 max-union" applies directly.
 
 **(2) Mixed return conventions.** Some creates return `VOID` and report via `pfnSetErrorCb`
@@ -1370,7 +1370,7 @@ and is strictly cheaper than any of `DX12.md` §2's four settling questions exce
 read. It should be run *before* any D3D12 DDI code is written, and it is the R1-lane equivalent of
 what R908 exists to prevent.
 
-⚠ Write it under `tools/` (per CLAUDE.md's note that `probe/` and `host/` were retired), and run it
+⚠ Write it under `tools/` (per AGENTS.md's note that `probe/` and `host/` were retired), and run it
 in **session 1 via a cloned scheduled task** — a windowed D3D12 sample launched from `win_exec`
 lands in session 0 and will fake a driver regression (memory `lease-gate-falsified-60th.md`).
 

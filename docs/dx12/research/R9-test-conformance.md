@@ -283,7 +283,7 @@ belt-and-braces on the Vulkan side.
   `IDXGIVkSwapChainFactory`, not DXGI itself — §2.4). Screen evidence needs the demos or a probe.
 * **Nothing about performance.** `descriptor-performance` and `pso-library-bloat` are separate
   binaries and are micro-benchmarks, not the frame-level numbers this project reports.
-* **Not a substitute for owner-visible evidence.** Per CLAUDE.md rule 6, a green suite is a log,
+* **Not a substitute for owner-visible evidence.** Per AGENTS.md rule 6, a green suite is a log,
   not a frame.
 
 ---
@@ -400,7 +400,7 @@ Compile recipe (from `CONFORMANCE.md:307-315`), unchanged except the libs:
 ```
 cl /nologo /EHsc /W4 Z:\tools\d3d12_triangle.cpp /Fe:C:\Windows\Temp\x\p.exe /link d3d12.lib dxgi.lib dxguid.lib
 ```
-Never build onto `Z:\` (`CLAUDE.md` — `OS error 87` on the 9p share).
+Never build onto `Z:\` (`AGENTS.md` — `OS error 87` on the 9p share).
 
 ### 3.3 The one automated gate today, and what D3D12 adds to it
 
@@ -525,7 +525,7 @@ Time Spy: it is the lowest-demand installed D3D12 workload, it is the one whose 
 likely to be a real driver defect rather than a missing tier, and it has a Win32 build for the
 WOW64 arm. **Time Spy Graphics score** is the credible *second* result and the natural headline
 number, directly comparable in kind to the existing Fire Strike Graphics ≈ 49k
-(`CLAUDE.md` stage paragraph).
+(`AGENTS.md` stage paragraph).
 
 **Deployment trick that makes this cheap and reversible:** each workload is its own exe in its own
 directory (`C:\ProgramData\UL\3DMark\chops\dlc\night-raid-test\bin\x64\3DMarkNightRaid.exe`), and
@@ -608,7 +608,7 @@ D3D12 runtime for every process is a far larger blast radius than any Helios com
 
 ## 6. The gate ladder: `D12-G0 … D12-G9`
 
-Rules every gate obeys (from `CLAUDE.md` and the memory index):
+Rules every gate obeys (from `AGENTS.md` and the memory index):
 * **Only screen evidence counts as rendering evidence** — `helios_paintcap` → `Z:\tmp\screen_copy.png`.
 * **Registry counters persist across boots** — always a pre/post `kmd-counter-snapshot.ps1` diff.
 * **Anything with a window runs in session 1** through a cloned scheduled task.
@@ -791,7 +791,7 @@ Recipes, straight from the D3D11 experience:
 * **"what is dxgkrnl doing to my thread"** —
   `logman create trace -p Microsoft-Windows-DxgKrnl 0xFFFFFFFFFFFFFFFF 0xFF` → tracerpt → grep
   `AzureTriage` for failure reasons in plain text (`ROADMAP.md:3452-3454`); a ~2 s circular slice
-  mid-run and read `Present`/`Flip`/`QueuePacket`/`DmaPacket`/`BlockThread` (`CLAUDE.md` §When
+  mid-run and read `Present`/`Flip`/`QueuePacket`/`DmaPacket`/`BlockThread` (`AGENTS.md` §When
   You're Stuck 2 — how the present-queue stall was found).
 
 **D3D12 debug layer — available for strategy (a), a no-op for strategy (b).**
@@ -819,7 +819,7 @@ persists across boots), `tools/scanout_timeline_dump.c`, `tools/read_ledger_dump
 are INFO-level and therefore **silent on the release build** — absence of host lines below WARNING
 proves nothing; a real host bisect needs a relaunch with `VIRGL_LOG_LEVEL=debug`
 (`ROADMAP.md:3431-3434`), and VM/QEMU relaunches are owner-gated. `HELIOS_VKR_DEBUG=validate`
-enables host validation layers (`CLAUDE.md`).
+enables host validation layers (`AGENTS.md`).
 
 **KD:** `NTOSEYE.md`; `tools/take-minidump.ps1` / `tools/live_dump.cpp` for a wedged test process;
 `.frame /r`, not `.trap` (memory 62nd).

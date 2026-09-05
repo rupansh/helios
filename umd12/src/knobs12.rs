@@ -55,7 +55,7 @@ use helios_umd_common::knobs::{BoolKnob, DwordKnob};
 /// API generation later, and it would present exactly as `D12-G7` does: a
 /// device-creation failure whose ETW reason moves every time the answer changes.
 /// ⛔ This knob exists so that question is settled by a measurement instead of a
-/// third guess, and so the losing arm stays reachable afterwards (CLAUDE.md
+/// third guess, and so the losing arm stays reachable afterwards (AGENTS.md
 /// rule 8's other half).
 ///
 /// | value | meaning |
@@ -91,7 +91,7 @@ pub(crate) static UMD12_TRACE: BoolKnob = BoolKnob::new(c"Umd12Trace", false);
 /// dereferenced, no table is written, and the only trace is the
 /// `OpenAdapter12` refusal counter ticking.
 ///
-/// ⚠ **The default is a decision** (CLAUDE.md rule 8), and this one is OFF
+/// ⚠ **The default is a decision** (AGENTS.md rule 8), and this one is OFF
 /// because `dwm.exe` already calls `OpenAdapter12` on the Helios adapter in
 /// production (`DECISIONS.md` §7.13). The first boot with `UmdD3D12=1` is a
 /// change to the compositor's behaviour, not a change to a test app's.
@@ -205,7 +205,7 @@ const MAX_DIAGNOSTIC_DELAY_US: u32 = 2_000_000;
 /// # Why this is inert by default and stays that way
 ///
 /// Absent = `0` = **no delay**, so a machine with no registry value behaves
-/// byte-identically to the build that has never heard of this knob (CLAUDE.md
+/// byte-identically to the build that has never heard of this knob (AGENTS.md
 /// rule 8 is satisfied trivially: the shipping default is the measured one,
 /// because every accepted measurement was taken with the value absent). The
 /// non-zero arm is a producer-side CPU stall of exactly the kind
@@ -260,7 +260,7 @@ pub(crate) static UMD12_ECL_DELAY_US: DwordKnob = DwordKnob::new(c"Umd12EclDelay
 /// ⭐⭐ **K-F1: the `pfnRenderCb` WDDM submission during `pfnExecuteCommandLists`.
 /// DEFAULT ON.**
 ///
-/// # Why the default is ON, and what evidence that rests on (CLAUDE.md rule 8)
+/// # Why the default is ON, and what evidence that rests on (AGENTS.md rule 8)
 ///
 /// The default is a decision, and this one is **decision D5a**
 /// (`docs/dx12/DECISIONS.md`), the owner's: *"stop gaps are not acceptable, we
@@ -361,7 +361,7 @@ pub(crate) static UMD12_ECL_SUBMIT: BoolKnob = BoolKnob::new(c"Umd12EclSubmit", 
 /// crash is *"a hack wearing a knob's clothes"*. This default is not that, and the
 /// distinction is the whole content of this doc: **the ON arm's failure mode is an
 /// untimed wait with no counter and no TDR, and the OFF arm's failure mode is a
-/// counted, named, on-the-wire fact.** CLAUDE.md rule 2 — loud failure over fake
+/// counted, named, on-the-wire fact.** AGENTS.md rule 2 — loud failure over fake
 /// success — decides between exactly that pair, and it decides for OFF.
 ///
 /// What the ON arm does, from the engine's source rather than from its intent:
@@ -413,7 +413,7 @@ pub(crate) static UMD12_ECL_SUBMIT: BoolKnob = BoolKnob::new(c"Umd12EclSubmit", 
 /// ⛔ **The record's PRESENCE is unaffected.** `Umd12EclSubmit` still defaults ON, so
 /// the `pfnRenderCb` packet still goes in with `'HE12'`; only its fence field is 0.
 /// That is exactly the K-F1 plumbing arm `tmp/dx12/gates/G8-r0-settle/` measured, so
-/// this default *is* the measured configuration (CLAUDE.md rule 8) and the KMD can
+/// this default *is* the measured configuration (AGENTS.md rule 8) and the KMD can
 /// still recognise and scope-hold D3D12 packets — its decode counts the zero arm by
 /// name (`D3D12_SUBMIT_ZERO_FENCE`, `kmd_render/src/ddi/submit_command.rs`'s D3D12
 /// ECL arm), so this configuration is first-class on both sides rather than an

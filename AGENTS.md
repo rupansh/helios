@@ -1,4 +1,4 @@
-# CLAUDE.md — Primary Implementor Instructions
+# AGENTS.md — Primary Implementor Instructions
 
 ## Project: Helios vGPU — Windows WDDM render+display driver over virtio-gpu/Venus
 
@@ -107,7 +107,7 @@ cold boots / guest reboots; `pnputil /restart-device` re-runs AddAdapter without
 
 ```
 helios-vgpu/
-├── CLAUDE.md               ← You are here
+├── AGENTS.md               ← You are here
 ├── ROADMAP.md              ← living stage doc: defects, per-workstream plans, tooling
 ├── CONFORMANCE.md          ← D3D11 correctness charter (priority 1)
 ├── DX12.md                 ← D3D12 charter (priority 2) — decision, phases, checkpoints

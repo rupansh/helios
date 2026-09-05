@@ -4985,7 +4985,7 @@ pub mod wddm_head_bound {
     /// adapter-wide TDR the bound exists to prevent, too SMALL turns a last-resort
     /// release into a continuous early-fence generator (the 0ab-B stale-frame
     /// class). 0 is preserved exactly — it is the A/B disable and must stay
-    /// reachable (CLAUDE.md rule 8).
+    /// reachable (AGENTS.md rule 8).
     pub const fn clamp_bound_ms(raw: u32, min: u32, max: u32) -> u32 {
         if raw == 0 {
             return 0;
@@ -5524,7 +5524,7 @@ mod present_stream_tests {
 /// `rc.exe`, i.e. a crate that **cannot host a libtest harness at all**. They had
 /// therefore never executed, on any platform, since the day they were written,
 /// while covering exactly the boundary/handle helpers the D3D12 fence bridge now
-/// depends on. CLAUDE.md's invariant table forbids that shape in `kmd_render`;
+/// depends on. AGENTS.md's invariant table forbids that shape in `kmd_render`;
 /// this is the violation being repaid rather than deleted.
 #[cfg(test)]
 mod present_stream_boundary_tests {

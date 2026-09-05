@@ -1,5 +1,5 @@
 # Build artifacts — Linux and Windows MUST use separate target dirs.
-# See CLAUDE.md: CARGO_TARGET_DIR=target/linux (Linux) / target/windows (Windows).
+# See AGENTS.md: CARGO_TARGET_DIR=target/linux (Linux) / target/windows (Windows).
 /target
 /**/target
 target/

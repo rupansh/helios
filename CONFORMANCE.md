@@ -128,7 +128,7 @@ an unfilled slot lands on a counted stub rather than a wild pointer.
   name-diffed against the generated structs): `install_dxgi` / `install_dxgi_1_1` /
   `install_dxgi_1_3` overwrite all 7 / 8 / 18 slots, so no slot points here.
 
-**⚠ Finding — the WS3 metric is currently unreadable.** CLAUDE.md's stage charter says "drive the
+**⚠ Finding — the WS3 metric is currently unreadable.** AGENTS.md's stage charter says "drive the
 noop-DDI hit counters to zero", and `device_funcs.rs:711-713` calls the counter "the WS3 metric".
 But there is **no `noop_summary()`**, nothing loads `DEVICE_NOOP_LOG_COUNT`, and
 `umd-gate-surface.ps1` has no pattern for it. The only readout is throttled `DDI noop(device)
@@ -318,7 +318,7 @@ rejection string (recipe at `ROADMAP.md:3018-3022`).
 
 ⇒ The code comment's own confession (*"a table assertion, not a capability probe"*) is now measurable
 against a written floor: the assertion is **too generous in two specific places**, both of which are
-"advertise only what is backed" violations of exactly the class CLAUDE.md names. ⛔ Do **not** change
+"advertise only what is backed" violations of exactly the class AGENTS.md names. ⛔ Do **not** change
 the code on the strength of this alone — the residual runtime rejection is still UNVERIFIED, and
 narrowing the answer could change which format/count first trips it. Land the probe first (§6).
 
@@ -477,7 +477,7 @@ so ICD A/B probes must run through a `/rl LIMITED` scheduled task (`ROADMAP.md:3
 
 **Then read the instruments, not the exit code alone.** `tools/umd-gate-surface.ps1 -AllProcesses`
 for the UMD half, `tools/kmd-gate-surface.ps1` + a `tools/kmd-counter-snapshot.ps1` diff for the
-KMD half. Per CLAUDE.md's evidence rule, only user-visible desktop state counts as *rendering*
+KMD half. Per AGENTS.md's evidence rule, only user-visible desktop state counts as *rendering*
 evidence (`helios_paintcap` → `Z:\tmp\screen_copy.png`); a probe's log line is not a frame.
 
 ---
@@ -486,7 +486,7 @@ evidence (`helios_paintcap` → `Z:\tmp\screen_copy.png`); a probe's log line is
 
 Each item: the evidence that motivates it, and what "done" means.
 
-**C1 — Make the noop-DDI hit count readable.** *Evidence:* CLAUDE.md names it as the WS3 metric
+**C1 — Make the noop-DDI hit count readable.** *Evidence:* AGENTS.md names it as the WS3 metric
 and `device_funcs.rs:711-713` calls it that, but nothing loads `DEVICE_NOOP_LOG_COUNT` and the only
 output is throttled and `trace_enabled()`-gated (§2.2) — the exact T5 defect `ddi_refusal_summary`
 exists to prevent. *Done:* a `noop_summary()` emitted beside it at `DestroyDevice` and on first hit;

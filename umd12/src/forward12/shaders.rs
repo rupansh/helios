@@ -235,7 +235,7 @@ pub struct ShaderState {
 /// Ported from `umd/src/forward/shaders.rs:13-39` **including both bounds
 /// checks**, which is what `DDI_REFERENCE.md` §12.2 asks for in as many words:
 /// *"Copy it verbatim into `helios_umd12`, including both bounds checks and the
-/// log line."* CLAUDE.md's *validate every runtime-supplied size & offset before
+/// log line."* AGENTS.md's *validate every runtime-supplied size & offset before
 /// reading* is the rule they discharge — ten call sites downstream build a slice
 /// out of the result.
 ///
