@@ -504,34 +504,49 @@ struct WinInstallKmdArgs {
     /// Set false to install now and let the user reboot later.
     #[serde(default)]
     restart_vm: Option<bool>,
-    /// The signed driver package to publish. Defaults to
-    /// `DEFAULT_KMD_PACKAGE_DIR`, the one `win_build_kmd` writes.
+    /// ⛔ **REQUIRED, no default.** The signed driver package to publish —
+    /// normally the one `win_build_kmd` writes,
+    /// `kmd_render\target\debug\helios_kmd_render_package`.
     ///
-    /// ⚠ WHY THIS IS EXPLICIT (2026-07-27, R614): the two paths below are the
-    /// artifacts a deploy actually ships, and both used to be invisible script
-    /// defaults. `win_build_kmd`'s copy-umd-to-package step was blocked by
-    /// Defender and left a STALE DEBUG helios_umd.dll in the package; nothing in
-    /// any tool's output named which UMD was about to be published, so the swap
-    /// was only caught by hand-checking file sizes against the live DriverStore
-    /// copy. Passing both explicitly and echoing them makes the deployed pair a
-    /// fact in the transcript.
-    #[serde(default)]
-    package_dir: Option<String>,
-    /// The UMD binary to publish alongside the KMD. Defaults to the RELEASE build
-    /// (`DEFAULT_UMD_DLL`).
+    /// ⚠ WHY THERE IS NO DEFAULT (2026-09-05, superseding the 2026-07-27 R614
+    /// note that made these merely *echoed*): the three paths here are the
+    /// artifacts a deploy actually ships, and echoing an inherited default is
+    /// not the same as choosing it. Twice now a wrong binary reached the
+    /// DriverStore because nobody had to name it — R614's Defender-blocked
+    /// stale DEBUG `helios_umd.dll`, and on 2026-09-05 a DEBUG
+    /// `helios_umd12.dll` that `cargo make` staged and the install script never
+    /// refreshed. A default is an answer nobody had to think about; for the
+    /// binaries that reach the DriverStore, the caller states them or the call
+    /// is refused. The script enforces the same rule independently.
+    package_dir: String,
+    /// ⛔ **REQUIRED, no default.** The D3D11 UMD to publish alongside the KMD;
+    /// use the RELEASE build (`umd\target\release\helios_umd.dll`) unless you
+    /// are deliberately shipping a debug binary.
     ///
     /// This is load-bearing, not cosmetic: `install-helios-kmd.ps1`'s
     /// `Sync-HeliosPackageUmd` overwrites whatever cargo-make staged in the
     /// package with THIS file BEFORE the catalog is generated and signed — so
     /// this argument, not the packaging task, decides which UMD reaches the
     /// DriverStore.
-    #[serde(default)]
-    umd_dll: Option<String>,
+    umd_dll: String,
+    /// ⛔ **REQUIRED, no default.** The D3D12 UMD
+    /// (`umd12\target\release\helios_umd12.dll`).
+    ///
+    /// ⭐ The INF's `CopyFiles` carries `helios_umd12.dll` and registers it at
+    /// `UserModeDriverName` slot 3, so it ships in the DriverStore package like
+    /// any other file — this is NOT the `win_install_umd` ProgramData override,
+    /// and it DOES survive a cold boot.
+    ///
+    /// ⛔ It is synced into the package on the same terms as `umd_dll` and
+    /// BEFORE the catalog is generated, which is the only moment it can be
+    /// corrected: the DriverStore copy is catalog-signed, so overwriting the
+    /// file afterwards breaks the signature instead of fixing the binary.
+    umd12_dll: String,
     /// Extra flags passed through to `tools\install-helios-kmd.ps1` in
     /// addition to the always-passed -AllowRebootRequired (e.g. ["-PlanOnly"],
-    /// ["-BinaryOnly"], ["-SkipSign"]). Do NOT pass -PackageDir/-UmdDll here —
-    /// use the fields above; a duplicate named argument is a PowerShell
-    /// parameter-binding error.
+    /// ["-BinaryOnly"], ["-SkipSign"]). Do NOT pass
+    /// -PackageDir/-UmdDll/-Umd12Dll here — use the fields above; a duplicate
+    /// named argument is a PowerShell parameter-binding error.
     #[serde(default)]
     args: Vec<String>,
     /// Timeout in seconds for the install step. Defaults to 900.
@@ -1073,30 +1088,38 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Install the built Helios KMD package on win11 via `tools\\install-helios-kmd.ps1 -AllowRebootRequired` (ExecutionPolicy Bypass — required, machine policy is Restricted; the script re-signs, backs up the active DriverStore files to C:\\ProgramData\\HeliosDeployBackups\\<stamp>, and publishes with devcon). Build first with win_build_kmd. ARTIFACT PATHS ARE EXPLICIT: a deploy ships TWO binaries, and both are named as parameters — `package_dir` (default kmd_render\\target\\debug\\helios_kmd_render_package) and `umd_dll` (default umd\\target\\release\\helios_umd.dll). Both are always passed to the script and ECHOED as the first output lines, marked NON-DEFAULT when overridden. `umd_dll` is load-bearing, not cosmetic: the script's Sync-HeliosPackageUmd overwrites whatever cargo-make staged in the package with THAT file BEFORE the catalog is generated and signed, so this argument — not the packaging task — decides which UMD reaches the DriverStore. (2026-07-27: win_build_kmd's copy-umd-to-package was blocked by Defender and left a stale DEBUG UMD in the package, and no tool output named it.) Do not pass -PackageDir/-UmdDll through `args` — that is refused. A new KMD image only loads at BOOT, so by default (restart_vm=true, RECOMMENDED) a successful install is followed by a graceful guest reboot (`shutdown /r /t 5`) — SSH drops for 1-3 minutes; poll win_exec until it returns, then verify DriverVersion + CM_PROB_NONE + a paintcap screenshot. Pass restart_vm=false to install now and reboot later (the device may sit in FAILED_POST_START limbo on the old image until then). Only invoke with the user's consent to the reboot, or with restart_vm=false."
+        description = "Install the built Helios KMD package on win11 via `tools\\install-helios-kmd.ps1 -AllowRebootRequired` (ExecutionPolicy Bypass — required, machine policy is Restricted; the script re-signs, backs up the active DriverStore files to C:\\ProgramData\\HeliosDeployBackups\\<stamp>, and publishes with devcon). Build first with win_build_kmd. ARTIFACT PATHS ARE REQUIRED AND HAVE NO DEFAULTS: a deploy ships THREE binaries and the caller must name all three — `package_dir` (normally kmd_render\\target\\debug\\helios_kmd_render_package), `umd_dll` (normally umd\\target\\release\\helios_umd.dll) and `umd12_dll` (normally umd12\\target\\release\\helios_umd12.dll). All three are passed to the script and ECHOED as the first output lines. ⛔ The defaults were REMOVED on 2026-09-05 because echoing an inherited default is not the same as choosing it: twice a wrong binary reached the DriverStore without anyone naming it (R614 stale debug helios_umd.dll, and a debug helios_umd12.dll that cargo make staged and the script never refreshed). ⭐ helios_umd12.dll ships INSIDE the signed DriverStore package — the INF CopyFiles it and registers UserModeDriverName slot 3 — so unlike the win_install_umd ProgramData override it survives a cold boot; it is synced BEFORE catalog generation, the only point at which it can be corrected. `umd_dll` is load-bearing, not cosmetic: the script's Sync-HeliosPackageUmd overwrites whatever cargo-make staged in the package with THAT file BEFORE the catalog is generated and signed, so this argument — not the packaging task — decides which UMD reaches the DriverStore. (2026-07-27: win_build_kmd's copy-umd-to-package was blocked by Defender and left a stale DEBUG UMD in the package, and no tool output named it.) Do not pass -PackageDir/-UmdDll/-Umd12Dll through `args` — that is refused. A new KMD image only loads at BOOT, so by default (restart_vm=true, RECOMMENDED) a successful install is followed by a graceful guest reboot (`shutdown /r /t 5`) — SSH drops for 1-3 minutes; poll win_exec until it returns, then verify DriverVersion + CM_PROB_NONE + a paintcap screenshot. Pass restart_vm=false to install now and reboot later (the device may sit in FAILED_POST_START limbo on the old image until then). Only invoke with the user's consent to the reboot, or with restart_vm=false."
     )]
     async fn win_install_kmd(&self, Parameters(a): Parameters<WinInstallKmdArgs>) -> String {
-        let package_dir = a.package_dir.as_deref().unwrap_or(DEFAULT_KMD_PACKAGE_DIR);
-        let umd_dll = a.umd_dll.as_deref().unwrap_or(DEFAULT_UMD_DLL);
+        // ⛔ No `unwrap_or(DEFAULT_*)` here, deliberately: the three artifact
+        // paths are required fields, so a caller that omits one gets a schema
+        // error instead of a silent deploy of whatever the constant happened to
+        // name. See `WinInstallKmdArgs::package_dir` for the two wrong binaries
+        // that reached the DriverStore under the old defaulted contract.
+        let package_dir = a.package_dir.as_str();
+        let umd_dll = a.umd_dll.as_str();
+        let umd12_dll = a.umd12_dll.as_str();
+        // All three are echoed unconditionally: which binaries a deploy shipped
+        // must be a fact in the transcript, not a reconstruction.
         let header = format!(
-            "{}{}",
-            artifact_line("pkg  ", package_dir, DEFAULT_KMD_PACKAGE_DIR),
-            artifact_line("UMD  ", umd_dll, DEFAULT_UMD_DLL),
+            "pkg   : {package_dir}\nUMD   : {umd_dll}\nUMD12 : {umd12_dll}\n"
         );
-        if a.args
-            .iter()
-            .any(|f| f.eq_ignore_ascii_case("-PackageDir") || f.eq_ignore_ascii_case("-UmdDll"))
-        {
+        if a.args.iter().any(|f| {
+            f.eq_ignore_ascii_case("-PackageDir")
+                || f.eq_ignore_ascii_case("-UmdDll")
+                || f.eq_ignore_ascii_case("-Umd12Dll")
+        }) {
             return format!(
-                "{header}\nwin_install_kmd: REFUSED — -PackageDir / -UmdDll passed through \
-                 `args` would bind twice against the explicit ones. Use the `package_dir` / \
-                 `umd_dll` fields instead."
+                "{header}win_install_kmd: REFUSED — -PackageDir / -UmdDll / -Umd12Dll passed \
+                 through `args` would bind twice against the explicit ones. Use the \
+                 `package_dir` / `umd_dll` / `umd12_dll` fields instead."
             );
         }
         let extra = a.args.join(" ");
         let command = format!(
             "& powershell -NoProfile -ExecutionPolicy Bypass -File '{PROJECT_DRIVE}tools\\install-helios-kmd.ps1' \
-             -AllowRebootRequired -PackageDir '{package_dir}' -UmdDll '{umd_dll}' {extra}"
+             -AllowRebootRequired -PackageDir '{package_dir}' -UmdDll '{umd_dll}' \
+             -Umd12Dll '{umd12_dll}' {extra}"
         );
         let install = match run_ssh(
             &command,

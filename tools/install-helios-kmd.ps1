@@ -1,13 +1,30 @@
 param(
-  [string]$PackageDir = "C:\Users\Rupansh\helios-vgpu\kmd_render\target\debug\helios_kmd_render_package",
-  # RELEASE by default. Sync-HeliosPackageUmd overwrites whatever
-  # copy-umd-to-package staged with THIS file before the catalog is created and
-  # signed, so this parameter — not the packaging task — decides which binary
-  # reaches the DriverStore. The PSC stage measures present-gate timing, and the
-  # debug profile is opt-level 1 with no LTO, so a debug default silently made
-  # every cadence and wake-latency number a measurement of the wrong binary.
-  # Pass -UmdDll ...\target\debug\helios_umd.dll for a deliberate debug deploy.
-  [string]$UmdDll = "C:\Users\Rupansh\helios-vgpu\umd\target\release\helios_umd.dll",
+  # ⛔⛔ THE THREE ARTIFACT PATHS ARE REQUIRED AND HAVE NO FALLBACK.
+  #
+  # They used to carry hardcoded defaults, and on 2026-09-05 that cost a wrong
+  # deploy that nothing in the output named: `cargo make` stages a DEBUG
+  # helios_umd12.dll into the package, this script only ever refreshed
+  # helios_umd.dll, and so the DriverStore received a debug D3D12 UMD while the
+  # release build sat unused. A default is an answer nobody had to think about;
+  # for the binaries that actually reach the DriverStore, the caller states them
+  # or the script refuses.
+  #
+  # ⚠ Deliberately NOT `[Parameter(Mandatory)]`: a missing mandatory parameter
+  # makes PowerShell prompt on stdin, and this script is normally invoked
+  # non-interactively over SSH, where that is an indefinite hang instead of an
+  # error. The explicit emptiness check below fails fast and says which one.
+  [string]$PackageDir = "",
+  # Sync-HeliosPackageUmd overwrites whatever copy-umd-to-package staged with
+  # THIS file before the catalog is created and signed, so this parameter — not
+  # the packaging task — decides which binary reaches the DriverStore. The PSC
+  # stage measures present-gate timing, and the debug profile is opt-level 1
+  # with no LTO, so a debug build silently makes every cadence and wake-latency
+  # number a measurement of the wrong binary.
+  [string]$UmdDll = "",
+  # The D3D12 UMD, synced into the package on exactly the same terms as $UmdDll
+  # and BEFORE the catalog is generated — the DriverStore copy is catalog-signed,
+  # so it cannot be corrected by overwriting the file afterwards.
+  [string]$Umd12Dll = "",
   [string]$InstanceId = "",
   [switch]$SkipSign,
   [switch]$BinaryOnly,
@@ -23,6 +40,13 @@ param(
 )
 
 . "$PSScriptRoot\helios-deploy-common.ps1"
+
+# No implicit fallback: name the artifacts or get a refusal, never a default.
+foreach ($req in @(@("PackageDir", $PackageDir), @("UmdDll", $UmdDll), @("Umd12Dll", $Umd12Dll))) {
+  if ([string]::IsNullOrWhiteSpace($req[1])) {
+    throw "-$($req[0]) is required and has no default. Name the artifact explicitly; see the param block for why."
+  }
+}
 
 function Find-Signtool {
   $cmd = Get-Command signtool.exe -ErrorAction SilentlyContinue
@@ -320,21 +344,28 @@ if (-not (Test-Path -LiteralPath $PackageDir -PathType Container)) { throw "Pack
 $inf = Join-Path $PackageDir "helios_kmd_render.inf"
 $sys = Join-Path $PackageDir "helios_kmd_render.sys"
 $umd = Join-Path $PackageDir "helios_umd.dll"
+$umd12 = Join-Path $PackageDir "helios_umd12.dll"
 $cat = Join-Path $PackageDir "helios_kmd_render.cat"
 foreach ($path in @($inf, $sys, $cat)) {
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing package file $path" }
 }
 if ((-not $BinaryOnly -or $IncludeUmd) -and -not (Test-Path -LiteralPath $umd -PathType Leaf)) { throw "Missing package UMD file $umd" }
+# The INF's CopyFiles carries helios_umd12.dll and registers it at
+# UserModeDriverName slot 3, so it is a package file like any other.
+if ((-not $BinaryOnly -or $IncludeUmd) -and -not (Test-Path -LiteralPath $umd12 -PathType Leaf)) { throw "Missing package D3D12 UMD file $umd12" }
 
 if ($StageOnly) {
   Write-HeliosPlan "Helios KMD stage-only install" @{
     PackageDir = $PackageDir
     UmdSource = $UmdDll
+    Umd12Source = $Umd12Dll
     UmdProfile = (Split-Path -Leaf (Split-Path -Parent $UmdDll))
+    Umd12Profile = (Split-Path -Leaf (Split-Path -Parent $Umd12Dll))
     StageOnly = [bool]$StageOnly
   }
   if ($PlanOnly) { return }
   Sync-HeliosPackageUmd $UmdDll $umd
+  Sync-HeliosPackageUmd $Umd12Dll $umd12
   New-HeliosCatalog $PackageDir $cat
   Sign-HeliosPackage $sys $cat
   Publish-HeliosPackageOnly $inf
@@ -346,8 +377,8 @@ $id = Get-HeliosInstanceId $InstanceId
 $hwid = Get-HeliosHardwareId $id
 $activeInf = Get-HeliosActiveInfName $id
 $store = Get-HeliosActiveStoreDir $id $activeInf
-$copyNames = if ($BinaryOnly) { @("helios_kmd_render.sys", "helios_kmd_render.cat") } else { @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_kmd_render.cat", "helios_umd.dll") }
-if ($IncludeUmd) { $copyNames += "helios_umd.dll" }
+$copyNames = if ($BinaryOnly) { @("helios_kmd_render.sys", "helios_kmd_render.cat") } else { @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_kmd_render.cat", "helios_umd.dll", "helios_umd12.dll") }
+if ($IncludeUmd) { $copyNames += @("helios_umd.dll", "helios_umd12.dll") }
 $copyNames = $copyNames | Select-Object -Unique
 
 Write-HeliosPlan "Helios KMD install" @{
@@ -371,6 +402,7 @@ Write-HeliosPlan "Helios KMD install" @{
 if ($PlanOnly) { return }
 
 Sync-HeliosPackageUmd $UmdDll $umd
+Sync-HeliosPackageUmd $Umd12Dll $umd12
 New-HeliosCatalog $PackageDir $cat
 Sign-HeliosPackage $sys $cat
 
@@ -448,6 +480,7 @@ $sources = @{
   "helios_kmd_render.sys" = $sys
   "helios_kmd_render.cat" = $cat
   "helios_umd.dll" = $umd
+  "helios_umd12.dll" = $umd12
 }
 $backup = Backup-HeliosActiveFiles $store $copyNames
 
