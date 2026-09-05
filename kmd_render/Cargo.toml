@@ -14,11 +14,42 @@ crate-type = ["cdylib"]
 driver-type = "WDM"
 
 [dependencies]
-# windows-drivers-rs family — coherent set published 2025-11-14.
-wdk = "0.4"
-wdk-sys = "0.5"
-wdk-alloc = "0.4"
-wdk-panic = "0.4"
+# windows-drivers-rs family — coherent set, PINNED TO AN UPSTREAM GIT REV.
+#
+# ⭐⭐ **Why git and not crates.io** (owner decision 2026-09-05). The published
+# `wdk-build 0.5.1` — still the newest release — requires `bindgen = "0.71.0"`,
+# and bindgen 0.71 under the installed **libclang 22.1.8** binds the FORWARD
+# DECLARATION instead of the definition for structs declared before they are
+# defined. `wdk-sys` then failed to compile with 42 layout assertions, every one
+# an underflow of the same shape:
+#
+#     error[E0080]: attempt to compute `1_usize - 208_usize`, which would overflow
+#       --> ...out/types.rs: ["Size of _IRP"][size_of::<_IRP>() - 208usize];
+#
+# ⛔ `_IRP`, `_DEVICE_OBJECT`, `_DRIVER_OBJECT`, `_KDPC`, `_CONTEXT` and
+# `_DMA_OPERATIONS` all came out as 1-byte opaque structs. ⛔⛔ **The layout
+# assertions are the only reason this was a build failure instead of a running
+# driver with 1-byte kernel structures.** Suppressing them — the "obvious" fix,
+# since nothing in this crate names most of these types — would have converted a
+# loud failure into precisely the silent one CLAUDE.md rule 2 forbids, in the
+# component where it bugchecks. They stay on, and the generator gets fixed.
+#
+# Upstream `main` already carries `bindgen = "0.72.1"` (the release that fixes
+# the forward-declaration handling) while still versioning these crates
+# 0.5.1/0.4.1, i.e. upstream considers it a non-breaking change on top of what
+# is published. That is the whole delta being taken here.
+#
+# ⚠ **Pinned to a REV, never a branch.** A floating `main` would make the ABI
+# these bindings describe depend on when the tree was last built, which is the
+# same class of defect as the stale cached bindings in `umd12`. Re-pin
+# deliberately, and rebuild the KMD when you do.
+#
+# ⇒ Revisit when a `wdk-build > 0.5.1` is published with bindgen 0.72; this
+# should go back to crates.io the day that exists.
+wdk = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "36558802149bc92455bf5719fe77f3a829d8580f" }
+wdk-sys = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "36558802149bc92455bf5719fe77f3a829d8580f" }
+wdk-alloc = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "36558802149bc92455bf5719fe77f3a829d8580f" }
+wdk-panic = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "36558802149bc92455bf5719fe77f3a829d8580f" }
 # Shared wire-format definitions (no_std), so virtio-gpu structs match the ICD.
 helios_protocol = { path = "../protocol" }
 # Host-testable no_std leaf logic (page/pitch arithmetic). Deliberately has no
@@ -41,16 +72,24 @@ bytemuck = { version = "1", default-features = false, features = ["derive"] }
 virtio-drivers = { version = "0.13", default-features = false }
 
 [build-dependencies]
-wdk-build = "0.5"
+# Same upstream git rev as the runtime crates above — see the note there. This
+# one is load-bearing for the pin: `wdk-build` is what actually runs bindgen, so
+# it is the crate whose bindgen version decides whether `wdk-sys` compiles.
+wdk-build = { git = "https://github.com/microsoft/windows-drivers-rs", rev = "36558802149bc92455bf5719fe77f3a829d8580f" }
 # Compiles src/seh_shim.c — a C __try/__except wrapper for
 # MmMapLockedPagesSpecifyCache(UserMode), which RAISES on failure (no SEH in
 # no_std Rust → bugcheck, reachable from any process via Escape MAP_BLOB).
 cc = "1"
 # We generate the WDDM display-miniport DDIs ourselves: wdk-sys has no display
 # ApiSubset, so build.rs runs bindgen over dispmprt.h + d3dkmddi.h. See build.rs.
-# MUST match the bindgen version wdk-build uses (0.71), so its BuilderExt
-# (Builder::wdk_default) applies to the same bindgen::Builder type we construct.
-bindgen = "0.71"
+# ⛔ MUST match the bindgen version `wdk-build` uses, so its BuilderExt
+# (`Builder::wdk_default`) applies to the same `bindgen::Builder` TYPE we
+# construct — a mismatch is not a version warning, it is two incompatible types
+# with the same name and a build error that reads like nonsense.
+# 0.71 -> 0.72 on 2026-09-05, moving in lockstep with the `wdk-build` git pin
+# above (which is itself on 0.72.1) and for the same libclang 22 reason the
+# `umd`/`umd12` bump records.
+bindgen = "0.72"
 
 [profile.dev]
 panic = "abort"

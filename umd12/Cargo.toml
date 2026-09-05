@@ -124,7 +124,15 @@ windows = { version = "0.58", features = [
 # ARE the deliverable -- if this crate compiles, the D3D12 DDI ABI is
 # machine-checked against the SDK header. Same bindgen version as `umd`, so both
 # drivers' generated ABI comes out of one code generator.
-bindgen = "0.70"
+#
+# ⭐ 0.70 -> 0.72 on 2026-09-05 with `umd`, forced by libclang 22.1.8 -- see
+# `umd/Cargo.toml` for the evidence. ⛔ The lockstep is not cosmetic HERE: this
+# crate's whole claim is that the layout assertions machine-check the D3D12 DDI,
+# and 0.70 under libclang 22 emits an opaque `_address: u8` struct *beside* the
+# real layout assertion. That is the one failure this crate cannot tolerate --
+# an ABI "check" that is actually checking a 1-byte placeholder. The version
+# moves with `umd`'s or neither moves.
+bindgen = "0.72"
 
 # S4: compiles `bridge/vkd3d_bridge.cpp` + the cxx glue with clang-cl and links
 # the engine. ⭐ The link set is MEASURED, not a guess (`D12-G1` static arm,

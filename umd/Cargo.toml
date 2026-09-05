@@ -28,7 +28,28 @@ windows = { version = "0.58", features = [
 
 [build-dependencies]
 cxx-build = "1"
-bindgen = "0.70"
+# ⭐ 0.70 -> 0.72 on 2026-09-05, forced by the installed libclang being 22.1.8.
+#
+# Under libclang 22, bindgen 0.70 binds the FORWARD DECLARATION instead of the
+# definition for a struct that `d3d10umddi.h` declares before it defines. The
+# generated `D3D11DDI_DEVICEFUNCS` came out as `pub _address: u8` (size 1) while
+# bindgen still emitted the real layout assertion beside it, so the build failed
+# 300 times over in two shapes at once:
+#
+#   error[E0609]: no field `pfnCalcPrivateResourceSize` on type
+#                 `&mut D3D11DDI_DEVICEFUNCS`
+#   error[E0080]: attempt to compute `1_usize - 1200_usize`, which would overflow
+#
+# ⚠ NOT a header or WDK problem, and that was checked rather than assumed: the
+# same run generated 37,385 lines with no clang diagnostic, and the tag struct
+# `_D3D11DDI_DEVICEFUNCS` came out COMPLETE with every field offset asserted --
+# only the typedef alias was opaque. The WDK include path resolves and
+# `bindgen/d3d10umddi_wrapper.h` is unchanged.
+#
+# Kept in lockstep with `umd12` (see its own note): both drivers' generated ABI
+# must come out of one code generator, or the two DDI surfaces are checked
+# against each other by nothing.
+bindgen = "0.72"
 
 [profile.dev]
 panic = "abort"
