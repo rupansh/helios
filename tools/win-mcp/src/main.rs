@@ -31,7 +31,29 @@ const PROJECT_DRIVE: &str = "Z:\\";
 /// The same tree on the Linux side (where this server runs). Used by tools that
 /// edit sources before a build (e.g. the KMD version bump); the robocopy mirror
 /// then carries the edits to the Windows build.
-const LINUX_PROJECT_ROOT: &str = "/home/rupansh/helios-vgpu";
+///
+/// ⛔⛔ **This MUST name the same directory the launcher exports as `Z:\`**
+/// (`tools/launch-helios-gtk.sh`'s `HELIOS_SHARE`, which defaults to the repo
+/// root). It is the ONE constant here that is not a Windows-side path, so it is
+/// the one that silently goes wrong when the tree moves — every other tool in
+/// this server addresses the source through `PROJECT_DRIVE`, which follows the
+/// share automatically.
+///
+/// ⚠ It HAS gone wrong: on 2026-09-05 this read `/home/rupansh/helios-vgpu`
+/// while `Z:\` was `/home/rupansh/helios-vgpu-dx12`, and `win_build_kmd`
+/// reported "KMD version: 22.22.501.0" for a tree whose
+/// `driver-version.env` says `22.22.257.0`. `no_bump` made that a false
+/// REPORT rather than a false BUILD — the package still stamped the mirrored
+/// (correct) version — but a real bump would have edited the *other* tree's
+/// file and left this one untouched, i.e. an INF DriverVer that never moved.
+///
+/// ⇒ overridable by `HELIOS_LINUX_PROJECT_ROOT` so a relocated tree is one env
+/// var rather than a recompile, and so this literal cannot be the only thing
+/// standing between two checkouts.
+fn linux_project_root() -> String {
+    std::env::var("HELIOS_LINUX_PROJECT_ROOT")
+        .unwrap_or_else(|_| "/home/rupansh/helios-vgpu-dx12".to_string())
+}
 /// Local build mirror. cargo/wdk build IO fails on the Z:\ 9p share (OS error 87,
 /// see windows-drivers-rs#481), so win_cargo robocopy-syncs here and builds on
 /// local disk. Edit sources on Linux/Z:\; the mirror is re-synced each build.
@@ -532,7 +554,7 @@ struct WinInstallKmdArgs {
 /// server. All this does is parse, validate four components, and rewrite the one
 /// line. Returns (old_version, new_version) as dotted strings.
 fn bump_kmd_version(explicit: Option<&str>, no_bump: bool) -> Result<(String, String), String> {
-    bump_kmd_version_at(LINUX_PROJECT_ROOT, explicit, no_bump)
+    bump_kmd_version_at(&linux_project_root(), explicit, no_bump)
 }
 
 /// The one line that carries the version.
@@ -1157,7 +1179,7 @@ mod tests {
         std::fs::create_dir_all(&kmd).unwrap();
         for f in ["driver-version.env", "build.rs", "Cargo.make.toml"] {
             std::fs::copy(
-                format!("{}/kmd_render/{f}", super::LINUX_PROJECT_ROOT),
+                format!("{}/kmd_render/{f}", super::linux_project_root()),
                 kmd.join(f),
             )
             .unwrap();
