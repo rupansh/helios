@@ -64,6 +64,33 @@ const LLVM_BIN: &str = "C:\\Program Files\\LLVM\\bin";
 const DXVK_SRC: &str = "Z:\\dxvk-helios";
 const DXVK_MIRROR: &str = "C:\\Users\\Rupansh\\dxvk-helios";
 const DXVK_BUILD: &str = "C:\\Users\\Rupansh\\dxvk-build";
+/// The meson native file that pins DXVK's compiler to clang-cl/lld-link, and the
+/// C forced-include the engine's C sources need. Both are read from `Z:\`
+/// deliberately: they live OUTSIDE the `dxvk-helios` subtree, so `DXVK_MIRROR`
+/// does not contain them, and `MIRROR_ROOT` is not guaranteed to exist when only
+/// the engine is being built. Reading a header off the share is the same thing
+/// the Mesa build does for its whole source tree.
+const DXVK_NATIVE_FILE: &str = "Z:\\ci\\windows\\clang-cl-native.ini";
+const DXVK_C_COMPAT_HEADER: &str = "Z:\\umd\\build-support\\dxvk_c_compat.h";
+/// ⛔ **`-Db_vscrt=mt` — the STATIC CRT, and it is load-bearing.**
+/// `umd/build.rs`'s header states the coherence rule: DXVK, the cxx shim and the
+/// Rust crate must all use the MSVC C++ ABI with the **static** CRT, because a
+/// display UMD is loaded into arbitrary application directories and `/MD` lets an
+/// app's own MSVCP/VCRUNTIME DLL override the toolset the driver was compiled
+/// against. `umd/.cargo/config.toml` sets `crt-static` for the Rust half and
+/// `ci/windows/Build-Driver.ps1` asserts the shipped DLL imports no dynamic CRT.
+///
+/// ⚠ This is the one place DXVK and vkd3d deliberately DIVERGE: vkd3d/`umd12`
+/// use the **dynamic** CRT (`-Db_vscrt=md`, `umd12/build.rs:32`). Do not
+/// "harmonise" them — each archive set must match the Rust crate that links it.
+///
+/// The flag set is otherwise `ci/windows/Build-Driver.ps1`'s, which is the
+/// reference build; `_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH` carries the same
+/// caveat recorded there and in `win_vkd3d`.
+const DXVK_CPP_ARGS: &str = "/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH \
+     -Wno-deprecated-declarations -Wno-delete-non-abstract-non-virtual-dtor \
+     -Wno-unused-private-field -Wno-unused-lambda-capture -Wno-c++20-extensions \
+     -Wno-unused-const-variable";
 
 /// vkd3d-proton, built exactly like DXVK: clang-cl + MSVC ABI + `-Db_vscrt=md`,
 /// into static archives that `helios_umd12.dll` links directly.
@@ -863,13 +890,35 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Build the DXVK-helios C++ engine (the UMD's render backend) on win11 with the clang-cl (MSVC ABI) toolchain. Mirrors the source Z:\\dxvk-helios -> the local git checkout C:\\Users\\Rupansh\\dxvk-helios (the meson build reads the LOCAL copy, NOT the Z:\\ share) with robocopy, then runs meson in the pre-configured build dir C:\\Users\\Rupansh\\dxvk-build. CRITICAL and the reason this tool exists: it prepends LLVM (clang-cl) to PATH BEFORE calling vcvars64 (which supplies MSVC lib.exe/link.exe). The reverse order silently drops the MSVC archiver because cmd expands %PATH% at PARSE time, and the archive step then fails 'CreateProcess failed'. Empty `args` defaults to `compile -C <build dir>` (the common rebuild-after-edit). After this, relink the UMD with `win_cargo crate_dir:\"umd\" args:[\"build\"]` (its build.rs reruns on the changed .a archives), then deploy with win_install_umd. Edit DXVK sources on the Linux/Z:\\ side; the mirror re-syncs on every call."
+        description = "Build the DXVK-helios C++ engine (the UMD's render backend) on win11 with the clang-cl (MSVC ABI) toolchain. Mirrors the source Z:\\dxvk-helios -> the local git checkout C:\\Users\\Rupansh\\dxvk-helios (the meson build reads the LOCAL copy, NOT the Z:\\ share) with robocopy, then runs meson in the build dir C:\\Users\\Rupansh\\dxvk-build. CRITICAL and the reason this tool exists: it prepends LLVM (clang-cl) to PATH BEFORE calling vcvars64 (which supplies MSVC lib.exe/link.exe). The reverse order silently drops the MSVC archiver because cmd expands %PATH% at PARSE time, and the archive step then fails 'CreateProcess failed'. Empty `args` is the normal case and does the right thing: it configures the build dir with the canonical setup if it is not configured yet, then compiles. ⛔ That canonical setup carries `-Db_vscrt=mt` — the STATIC CRT — which must match `umd/.cargo/config.toml`'s `crt-static`; vkd3d/umd12 deliberately use the DYNAMIC CRT instead, so the two engines' flags are NOT interchangeable (see DXVK_CPP_ARGS). After this, relink the UMD with `win_cargo crate_dir:\"umd\" args:[\"build\"]` (its build.rs reruns on the changed .a archives), then deploy with win_install_umd. Edit DXVK sources on the Linux/Z:\\ side; the mirror re-syncs on every call."
     )]
     async fn win_dxvk(&self, Parameters(a): Parameters<WinDxvkArgs>) -> String {
-        let meson_args = if a.args.is_empty() {
-            format!("compile -C {DXVK_BUILD}")
+        // The canonical configure, kept HERE rather than only in the transcript of
+        // whoever last ran it. Before this existed, `args: []` was a bare
+        // `meson compile` that failed outright if DXVK_BUILD was missing, and the
+        // setup line — including the load-bearing `-Db_vscrt=mt` — lived only in
+        // `ci/windows/Build-Driver.ps1` under CI-specific paths. A build dir that
+        // has to be reconstructed by hand from a CI script is a flag set that can
+        // silently come back WRONG, and a CRT mismatch does not fail the build; it
+        // fails in an app's process later. Same shape as `win_vkd3d`.
+        let setup = format!(
+            "meson setup {DXVK_BUILD} {DXVK_MIRROR} --native-file {DXVK_NATIVE_FILE} \
+             --buildtype release -Db_vscrt=mt \"-Dcpp_args={DXVK_CPP_ARGS}\" \
+             \"-Dc_args=/FI{DXVK_C_COMPAT_HEADER}\" -Denable_d3d8=false -Denable_d3d9=false \
+             -Denable_d3d10=false -Denable_d3d11=true -Denable_dxgi=true"
+        );
+        // ⚠ Full command, NOT an argv tail: this used to interpolate into a
+        // `meson {args}` template, which cannot express "configure, then compile"
+        // (two meson invocations). Same shape as `win_vkd3d`'s `meson_cmd`.
+        let meson_cmd = if a.args.is_empty() {
+            // Configure only when not configured yet, so the common call stays a
+            // plain incremental compile.
+            format!(
+                "(if not exist \"{DXVK_BUILD}\\build.ninja\" ({setup}) ) && \
+                 meson compile -C {DXVK_BUILD}"
+            )
         } else {
-            a.args.join(" ")
+            format!("meson {}", a.args.join(" "))
         };
         // Mirror the DXVK source share -> local checkout. /XD+/XF .git skip all git
         // metadata (submodule .git dirs AND the submodule .git pointer files), so
@@ -892,7 +941,7 @@ impl WinHost {
         // archiver/linker from MSVC.
         let command = format!(
             "{sync}\n\
-             cmd /c 'set \"PATH={LLVM_BIN};%PATH%\" && call \"{VCVARS}\" && meson {meson_args}'"
+             cmd /c 'set \"PATH={LLVM_BIN};%PATH%\" && call \"{VCVARS}\" && {meson_cmd}'"
         );
         match run_ssh(
             &command,
