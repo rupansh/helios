@@ -114,6 +114,8 @@ cxx = "1"
 # ⛔ `Win32_Graphics_Direct3D_Fxc` stays forbidden for the reason above it.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D12",
     "Win32_Graphics_Dxgi_Common",

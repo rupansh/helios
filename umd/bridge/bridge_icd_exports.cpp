@@ -305,7 +305,6 @@ namespace helios_bridge {
     MemoryAllocInfo,
     MemoryVidMmGlobalIdentity,
     MemoryOpenVidMmTracker,
-    RegisterPresentStream,
     Count,
   };
 
@@ -325,8 +324,6 @@ namespace helios_bridge {
       return "helios_venus_memory_vidmm_global_identity";
     case HeliosIcdExport::MemoryOpenVidMmTracker:
       return "helios_venus_memory_open_vidmm_tracker";
-    case HeliosIcdExport::RegisterPresentStream:
-      return "helios_venus_register_present_stream";
     default: return "";
     }
   }
@@ -528,22 +525,6 @@ namespace helios_bridge {
       return fn(memory, global_identity);
 
     log_export_unavailable(HeliosIcdExport::MemoryOpenVidMmTracker);
-    return false;
-  }
-
-  bool venus_register_present_stream(VkDevice device,
-                                     VkSemaphore semaphore,
-                                     std::uint64_t* out_cookie) {
-    if (out_cookie)
-      *out_cookie = 0;
-    if (device == VK_NULL_HANDLE || semaphore == VK_NULL_HANDLE || !out_cookie)
-      return false;
-
-    using Fn = bool (__cdecl*)(VkDevice, VkSemaphore, std::uint64_t*);
-    if (auto fn = helios_icd_export<Fn>(HeliosIcdExport::RegisterPresentStream))
-      return fn(device, semaphore, out_cookie) && *out_cookie != 0;
-
-    log_export_unavailable(HeliosIcdExport::RegisterPresentStream);
     return false;
   }
 

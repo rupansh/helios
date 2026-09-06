@@ -1,190 +1,23 @@
-//! L7 — fences and query heaps.
+//! Runtime fence lifetime and engine query heaps.
 //!
-//! Owns 6 of `DEVICE_FUNCS_CORE_0109` (groups (i) 3, (j) 3).
-//!
-//! ⭐ **A D3D12 fence object IS a pair of GPU virtual addresses**
-//! (`DDI_REFERENCE.md` §10.1), and there are exactly **two** fence operations,
-//! both queue-level: `pfnSignalFence` and `pfnWaitForFence` on the command-queue
-//! table (L2's). ⛔ There is **no** CPU-signal DDI and **no** CPU-wait DDI
-//! (§10.3) — a reading that looks like a missing slot and is not.
-//!
-//! `DECISIONS.md` §6 downgraded the monitored-fence risk to MEDIUM; the residual
-//! probe is G-fence.
-//!
-//! # ⭐ What the driver gets, and what it therefore builds
-//!
-//! `D3D12DDIARG_CREATE_FENCE` carries **only** `{FenceCount, Fences}`, and each
-//! `D3D12DDI_FENCE` is `{FenceValue.BaseAddress, FenceMonitoredValue.BaseAddress,
-//! Flags}` — three values the *runtime* chose. The driver never receives a
-//! `D3DKMT_HANDLE` for the fence and never gets the CPU mapping; the runtime
-//! created the monitored fence with `D3DKMTCreateSynchronizationObject2` and kept
-//! the CPU half and the kernel handle for itself (§10.1). So there is nothing
-//! here for the driver to *own* on the WDDM side.
-//!
-//! What the driver must own is the other half: **an engine fence to order its own
-//! pipeline with.** §10.3 states the shape — `pfnSignalFence` / `pfnWaitForFence`
-//! are *ordering instructions to the driver's own pipeline* plus an
-//! adapter-mask report, and the kernel-side signal/wait is the runtime's job.
-//! Helios' pipeline is vkd3d, so this lane creates one `ID3D12Fence` on the
-//! engine device per DDI fence, and L2's two queue slots forward
-//! `ID3D12CommandQueue::Signal` / `::Wait` onto it. That is the whole object.
-//!
-//! ⛔ **The runtime's GPU VAs are therefore deliberately NOT stored, and there is
-//! no future lane that will want them.** They are logged at create — which is the
-//! only thing this driver can honestly do with them — and a field nothing reads
-//! would be exactly the dead state `PARALLEL.md` §10 forbids.
-//!
-//! ⛔⛔ **The old text here named a consumer that CANNOT EXIST, and it is quoted so
-//! nobody re-derives it:** *"The lane that gains a real consumer (a
-//! `pfnSignalSynchronizationObjectFromGpuCb` queued software signal packet on the
-//! queue's WDDM context, §10.4's table) adds them then."* `DDI_REFERENCE.md`
-//! §10.4's correction block (`:2306-2331`) **struck those rows** and states why
-//! from the bindings: every `pfnSignal*Cb` / `pfnWait*Cb` names its target by
-//! `D3DKMT_HANDLE`, and `D3D12DDIARG_CREATE_FENCE` carries no `D3DKMT_HANDLE`, no
-//! `hRTFence` and no CPU pointer — so **the driver can never name a D3D12 fence to
-//! the kernel.** Measured on Helios, both `BaseAddress`es arrive **0**
-//! (`CreateFence: valueVA=0x0 monitoredVA=0x0`,
-//! `tmp/dx12/gates/G8-r0/umd12-trace-pid10836.log`), so there is not even fence
-//! memory to write. `KMD_IMPACT.md` §14a.5 then **forbids** the design outright:
-//! *"No `pfnSignal*Cb` for the application's fence."*
-//!
-//! ⭐ What is true instead: the runtime owns the fence and its signal, and this
-//! driver's only lever is **what dxgkrnl orders that signal behind** — the DMA
-//! packets already submitted on the queue's WDDM context. That is `EclWddmSubmitted`
-//! and nothing in this file.
-//!
-//! # ⛔⛔ The engine fence is a SHADOW, and it CAN diverge from the runtime's
-//!
-//! ⚠ **Read this before touching either fence slot: the naive forward deadlocks
-//! the stack, silently.** The engine `ID3D12Fence` is created at **0** and the
-//! only thing in this driver that ever advances it is L2's `pfnSignalFence`. Two
-//! ordinary application behaviours move the *runtime's* fence without moving this
-//! one:
-//!
-//! * `ID3D12Device::CreateFence(InitialValue = N)` — `D3D12DDIARG_CREATE_FENCE`
-//!   carries only `{FenceCount, Fences}`
-//!   (`umd12/bindgen/cached/d3d12umddi.rs:51121-51124`), so the initial value
-//!   never reaches the driver. `CreateFence(1)` + `queue->Wait(f, 1)` is a common
-//!   idiom precisely because the runtime considers that wait already satisfied;
-//! * `ID3D12Fence::Signal(N)` from the CPU — §10.3: the CPU signal, the CPU wait
-//!   and `GetCompletedValue` are all executed by the *runtime* against the
-//!   monitored fence's own mapping and **never reach the driver**.
-//!
-//! ⛔ An `ID3D12CommandQueue::Wait` issued on the shadow for a value the shadow
-//! can never reach does not fail — it **blocks that engine queue forever**. Every
-//! later submit on that queue then never executes, and the readout is a TDR or a
-//! frozen compositor with `FenceOpBadArg = FenceOpFenceMissing =
-//! FenceOpEngineFailed = 0` and not one log line. ⚠ §14.0's measurement that WARP
-//! never entered these two slots across 20 frames is **not** a defence: a zero
-//! reading is not evidence a path works, and WARP is one software-scheduled
-//! implementation rather than the contract.
-//!
-//! ⇒ [`FenceState`] therefore carries a **watermark of every `Value` this driver
-//! has itself issued a signal for**, plus a **count of the signals it has issued at
-//! all**, and L2's `pfnWaitForFence` forwards only the waits that watermark can
-//! satisfy. Everything else is counted and left to the kernel-side ordering §10.3
-//! says the runtime performs itself.
-//!
-//! # ⛔⛔ Two arms, because a dropped wait has two very different meanings
-//!
-//! ⚠ **The cost of the watermark choice, named rather than hidden:** a legal
-//! wait-before-signal — an application enqueuing `queueB->Wait(f, N)` *before*
-//! `queueA->Signal(f, N)`, which D3D12 permits — is above the watermark at the
-//! moment it arrives and is dropped rather than carried. **Dropping it produces
-//! wrong pixels**, silently, and the async-compute subtest of a real benchmark is
-//! exactly the shape that issues it.
-//!
-//! ⛔ **The old text said this "closes when §10.4's
-//! `pfnWaitForSynchronizationObjectFromGpuCb` half lands". That is REFUTED and
-//! FORBIDDEN** — see the correction quoted above: no such callback can ever name a
-//! `D3D12DDI_HFENCE`, and `KMD_IMPACT.md` §14a.5 rules the design out. There is no
-//! pending work that closes this gap; the **only** channel that orders anything is
-//! the engine forward `queue::fence_operation` already makes, which vkd3d resolves
-//! into the signalling queue's `submission_timeline`.
-//!
-//! ⇒ so the dropped waits are **split by whether this driver participates in the
-//! fence's timeline at all**, and only one of the two arms can be honest about it:
-//!
-//! | condition | counter | treatment | why |
-//! |---|---|---|---|
-//! | [`FenceState::driver_signals_issued`] is **false** | `FenceWaitRuntimeOwned` | dropped, counted, **not** reported | the value's provenance is entirely outside this DDI: a `CreateFence(InitialValue = N)` the DDI never delivers, or a CPU `ID3D12Fence::Signal` §10.3 says never reaches the driver. Both are waits the runtime **already considers satisfied**, so dropping is exactly right, and `CreateFence(1)` + `queue->Wait(f, 1)` is a common idiom. Reporting it would answer a legal call with *"Removing device due to bad UMD error"* — `descriptors.rs`'s scar |
-//! | it is **> 0** and `Value` is above the watermark | `FenceWaitNotForwarded` | dropped, counted, logged — ⛔ **NOT** reported through `pfnSetErrorCb` | this driver *is* on that fence's timeline and is being asked for ordering beyond what it has issued, so the drop is a real gap (`PENDING.md` §S-2). ⛔ **But it is NOT a driver fault, and until 2026-08-07 this row said it was**: the legal wait-before-signal named four paragraphs above lands here **deterministically**, so removing the `ID3D12Device` would answer an ordinary async-compute frame with *"Removing device due to bad UMD error"*. The *"empty scene with a score"* shape is what the **counter and the log** exist to prevent; device removal adds no attribution and costs the whole run. Argument at the site, `queue::fence_operation` |
-//!
-//! ⛔ **And the first arm is NOT clean, which is stated here rather than hidden in a
-//! counter's grading.** A CPU `Signal` that has *not happened yet* — `queueB->Wait(f,
-//! N)` followed later by `fence->Signal(N)` from the CPU — is **indistinguishable at
-//! this DDI** from the already-satisfied case, because the driver is never told the
-//! initial value and never sees a CPU signal. It lands in `FenceWaitRuntimeOwned`
-//! and it is a real ordering gap. Forwarding it instead is not an option: the engine
-//! fence can never reach `N`, so an engine wait for it blocks that vkd3d queue
-//! **forever**. ⇒ the counter's grading says exactly this, and the only real fix is
-//! the runtime's monitored fence, which §10.4 proves this driver cannot reach.
-//!
-//! ⚠ **Shared fences are the third source and they are not separable either.**
-//! `D3D12DDI_FENCE_FLAGS` has no shared bit at all (see below), so a fence shared
-//! through `D3DKMTShareObjects` on the runtime's own kernel handle arrives here
-//! looking exactly like any other. It belongs with the shared-handle work, not with
-//! a counter here.
-//!
-//! # ⚠ The two fence shapes this driver cannot honour, and what it does instead
-//!
-//! * **`FenceCount > 1`** is the multi-adapter (LDA) case — one placement per
-//!   physical adapter (§10.1). Helios is single-adapter and
-//!   `pfnGetImplicitPhysicalAdapterMask` says so, so a multi-placement fence is
-//!   refused rather than silently backed by one engine fence.
-//! * **`D3D12DDI_FENCE_FLAG_BOTTOM_OF_PIPE`** is the driver being told the fence
-//!   must be signalled after *all* preceding GPU work retires, not at
-//!   command-processor front-end time. ⛔ §10.4: *"Do not claim
-//!   `BOTTOM_OF_PIPE` semantics the stack cannot deliver."* Forwarding to
-//!   `ID3D12CommandQueue::Signal` does give bottom-of-pipe ordering **within the
-//!   engine** — vkd3d signals the timeline semaphore after the submission — and
-//!   the WDDM half is `pfnExecuteCommandLists`' `pfnRenderCb` packet carrying the
-//!   frame's own completion boundary (`EclFenceSampled`, AGENTS.md's fence
-//!   invariant). ⛔ Its old text said that boundary is *"knob-gated and off by
-//!   default (A1, `knobs12::UMD12_ECL_DRAIN`)"* — **FALSE since `f71fef4`**:
-//!   `Umd12EclFence` defaults **ON** and samples on **both** drain arms, so
-//!   `EclFenceSampled` is nonzero on a default build. `Umd12EclDrain` (default
-//!   OFF) decides only EXACT vs a **prefix that may under-wait**, and
-//!   `EclFenceNoDrain` — not `EclFenceSampled` — is what says which you got.
-//!   ⛔ It is **not** a queued software signal packet on this fence; that design
-//!   is struck and forbidden, see above. The flag is accepted and **counted**.
-//!
-//! ⚠ **There is no shared / cross-adapter fence flag at this DDI.**
-//! `D3D12DDI_FENCE_FLAGS` has exactly two enumerators, `NONE = 0x0` and
-//! `BOTTOM_OF_PIPE = 0x1` (`d3d12umddi.h:1156-1161`); `D3D12_FENCE_FLAG_SHARED`
-//! and `..._CROSS_ADAPTER` are **API** flags that never reach the driver, because
-//! sharing a fence is `D3DKMTShareObjects` on the runtime's own kernel handle —
-//! the one the driver never sees. A bit outside the two the header defines is
-//! still counted, because the header is the only authority here and an unknown
-//! bit is a contract this driver has not read.
-//!
-//! # Query heaps
-//!
-//! Straight forward to `ID3D12Device::CreateQueryHeap`. ⛔ The type is
-//! **translated**, never passed through: `DDI_REFERENCE.md` §9.6.1 is the scar —
-//! the descriptor-heap flag enums collide on value `0x1` with different meanings
-//! and forwarding the DDI value produced the wrong heap with no error. The DDI
-//! and API query-heap enumerators happen to agree numerically today
-//! (0,1,2,3,4,5,7); the match below makes that a fact the compiler re-checks
-//! rather than an assumption, and a value in neither list is refused.
-//!
-//! ⚠ Their consumer is L3c (`copy.rs` — `pfnBeginQuery`/`pfnEndQuery`/
-//! `pfnResolveQueryData`), which is not in this round. Creating them correctly
-//! now is still this lane's job: the runtime creates a query heap when the
-//! application does, not when the first query is recorded.
+//! On this software-scheduled surface dxgkrnl owns fence values, CPU signals,
+//! shared opens and context waits. Exact ECL admission/completion orders the
+//! real engine work against those operations. CreateFence supplies no kernel
+//! handle or initial value, so a private engine fence cannot represent it.
+//! Nonzero GPU fence placements require a real GPU-VA fence implementation and
+//! are explicitly refused. Queue fence DDIs are likewise refused if entered;
+//! their absence in a workload is not proof of native-fence support.
 
-use core::sync::atomic::{AtomicU64, Ordering};
-
-use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, S_OK};
+use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_NOTIMPL, S_OK};
 use helios_umd_common::refusals::RefusalCounter;
 use helios_umd_common::slot::{Boxed, Com, DdiHandle, Slot};
 use helios_umd_common::throttle::LogThrottle;
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12Fence, ID3D12QueryHeap, D3D12_FENCE_FLAG_NONE, D3D12_QUERY_HEAP_DESC,
-    D3D12_QUERY_HEAP_TYPE, D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP,
-    D3D12_QUERY_HEAP_TYPE_OCCLUSION, D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
-    D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1, D3D12_QUERY_HEAP_TYPE_SO_STATISTICS,
-    D3D12_QUERY_HEAP_TYPE_TIMESTAMP, D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS,
+    ID3D12QueryHeap, D3D12_QUERY_HEAP_DESC, D3D12_QUERY_HEAP_TYPE,
+    D3D12_QUERY_HEAP_TYPE_COPY_QUEUE_TIMESTAMP, D3D12_QUERY_HEAP_TYPE_OCCLUSION,
+    D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS1,
+    D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, D3D12_QUERY_HEAP_TYPE_TIMESTAMP,
+    D3D12_QUERY_HEAP_TYPE_VIDEO_DECODE_STATISTICS,
 };
 
 use super::tables12::{stage, DeviceCoreTable, Filling};
@@ -199,12 +32,8 @@ use crate::{ddi12, device12, log_error, note_refusal};
 // call site compiled and produced a `ManuallyDrop` whose vtable pointer was a
 // struct field — a wild call on first use.
 //
-// ⚠ A query heap is a bare owning COM pointer and nothing else — it needs no
-// shadow state, so `com_handles!`. ⛔ A **fence** is not: it carries the
-// signalled watermark the module doc's shadow-divergence section exists for, and
-// a watermark that lived anywhere but on the fence object could not answer
-// "can this driver's timeline reach `Value`?" for the fence actually named by
-// `D3D12DDIARG_FENCE_OPERATION::Fence`. So it is `boxed_handles!`.
+// Query heaps own engine COM objects. Runtime fences own only a device
+// association: CREATE_FENCE supplies no KMT handle, CPU mapping or initial value.
 helios_umd_common::com_handles!(crate::ddi12::D3D12DDI_HQUERYHEAP,);
 
 helios_umd_common::boxed_handles!(crate::ddi12::D3D12DDI_HFENCE => FenceState);
@@ -249,103 +78,14 @@ fn budget(t: &LogThrottle) -> Option<usize> {
 /// still answered.
 const PRIVATE_SLOT_SIZE: usize = core::mem::size_of::<*mut core::ffi::c_void>();
 
-/// Per-`D3D12DDI_HFENCE` shadow state.
-///
-/// ⚠ **`pub`, not `pub(crate)`, and that is forced rather than chosen.**
-/// `BoxedHandle` is a `pub` trait in `helios_umd_common`, so an associated type
-/// less visible than the trait is E0446. It escapes nowhere: `forward12` and
-/// `fence` are both `pub(crate) mod` inside a `cdylib` that exports no Rust API,
-/// every field below is private, and the three methods are the whole surface L2
-/// can reach. Same shape as `queue::QueueState`.
+/// Exact runtime object lifetime; no shadow timeline or guessed fence identity.
 pub struct FenceState {
-    /// The engine fence. **Owned** — dropping this state releases it.
-    engine: ID3D12Fence,
-    /// The highest `D3D12DDIARG_FENCE_OPERATION::Value` this driver has issued an
-    /// `ID3D12CommandQueue::Signal` for on [`Self::engine`], **biased by one** so
-    /// that `0` means *"never signalled"*.
-    ///
-    /// ⛔ This is a lower bound on what the engine timeline will reach, and it is
-    /// the *only* such bound the DDI gives this driver — the initial value and
-    /// every CPU signal are invisible here.
-    ///
-    /// ⛔⛔ **ONE word, deliberately, and it was TWO until 2026-08-07.** The
-    /// predecessor kept `signalled_watermark` and a separate `signals_issued`
-    /// count, because a legal `pfnSignalFence` with `Value = 0` raises no
-    /// watermark and a bare `> 0` test could not tell *"never touched"* from
-    /// *"signalled 0"* — the distinction both dropped-wait arms turn on. That
-    /// reasoning is right; **two atomics were the wrong way to get it.**
-    /// `note_signal` had to publish them in some order, and whichever order it
-    /// chose left a window in which the pair is torn: a concurrent
-    /// `queue::fence_operation` wait arm reads one fact from before the signal and
-    /// the other from after, and takes an arm neither state justifies. No
-    /// reader-side fix closes a writer-side tear — reading the count first only
-    /// moves the window, since the writer can be preempted between its two stores.
-    ///
-    /// ⭐ The bias makes both predicates derive from **one load**, so they can
-    /// never disagree: `0` = never signalled; `N + 1` = watermark `N`. `Signal(0)`
-    /// stores `1`, which is distinguishable from never-signalled, so the ambiguity
-    /// the two-field design existed to remove is still removed.
-    ///
-    /// ⚠ Honest edge: `saturating_add` makes `Signal(u64::MAX - 1)` and
-    /// `Signal(u64::MAX)` both store `u64::MAX`, so a wait for exactly `u64::MAX`
-    /// reads reachable after only `MAX - 1` was signalled. A D3D12 fence timeline
-    /// would have to be advanced 2^64 times to reach it; recorded rather than
-    /// hidden.
-    signalled_biased: AtomicU64,
+    device: ddi12::D3D12DDI_HDEVICE,
 }
 
 impl FenceState {
-    /// The engine fence to order against.
-    pub(crate) fn engine(&self) -> &ID3D12Fence {
-        &self.engine
-    }
-
-    /// Record that a queue-level signal for `value` has been **issued** on the
-    /// engine timeline.
-    ///
-    /// ⚠ Called *before* `ID3D12CommandQueue::Signal`, not after, and that is
-    /// deliberate. The predicate a wait needs is "a signal for this value is on
-    /// the engine timeline", which becomes true at issue; raising the mark only
-    /// on success would open a window in which a legitimately paired wait
-    /// arriving on another thread is dropped instead of forwarded. The engine
-    /// call failing is already a device-scope error reported through
-    /// `pfnSetErrorCb` and counted as `FenceOpEngineFailed`, so it does not need
-    /// a second, weaker instrument here.
-    ///
-    /// `fetch_max` because D3D12 fence values are not required to arrive in
-    /// order and a lower one must not lower the bound.
-    ///
-    /// ⭐ **One store, so there is no publication order to get wrong.** Both facts
-    /// the wait arm needs live in [`Self::signalled_biased`], whose doc carries
-    /// why two atomics could not be made correct from the reader's side.
-    pub(crate) fn note_signal(&self, value: u64) {
-        self.signalled_biased
-            .fetch_max(value.saturating_add(1), Ordering::AcqRel);
-    }
-
-    /// Whether this driver has issued **any** signal on this fence's engine
-    /// timeline.
-    ///
-    /// `false` means the fence's whole timeline is the runtime's — a
-    /// `CreateFence` initial value and/or CPU `ID3D12Fence::Signal`s, neither of
-    /// which reaches this DDI (`DDI_REFERENCE.md` §10.3) — which is the module
-    /// doc's first dropped-wait arm.
-    pub(crate) fn driver_signals_issued(&self) -> bool {
-        self.signalled_biased.load(Ordering::Acquire) != 0
-    }
-
-    /// Whether this driver's own engine timeline can reach `value`.
-    ///
-    /// `false` means the value's provenance is outside what this DDI shows the
-    /// driver — a `CreateFence` initial value, a CPU `ID3D12Fence::Signal`, or a
-    /// signal not yet issued — and forwarding a wait for it would be
-    /// unsatisfiable. See the module doc for what the caller must do instead.
-    ///
-    /// ⚠ Compares in the **biased** domain so it never has to subtract from a
-    /// value that may be `0`: `value + 1 <= biased` is `value <= watermark` for
-    /// every signalled state, and is false for all `value` when `biased == 0`.
-    pub(crate) fn signal_reachable(&self, value: u64) -> bool {
-        value.saturating_add(1) <= self.signalled_biased.load(Ordering::Acquire)
+    pub(crate) fn belongs_to(&self, device: ddi12::D3D12DDI_HDEVICE) -> bool {
+        self.device.pDrvPrivate == device.pDrvPrivate
     }
 }
 
@@ -385,11 +125,8 @@ unsafe fn query_heap_slot(h: ddi12::D3D12DDI_HQUERYHEAP) -> Option<Slot<Com<ID3D
 /// declares, and splitting them would have made L2 refuse two slots on a
 /// dependency that costs six to remove.
 ///
-/// ⛔ It hands back the **state**, not the bare `ID3D12Fence`, because the
-/// watermark and the engine fence must be read as one object: a caller holding
-/// only the fence has no way to ask whether a wait on it is satisfiable, which is
-/// exactly the mistake the module doc's shadow-divergence section exists to
-/// prevent.
+/// The returned state authenticates the runtime device association. It carries
+/// no private engine fence or invented signal watermark.
 ///
 /// ⚠ `Slot::ptr()`, never `Slot::<Boxed<_>>::get()` — the same second door
 /// `queue.rs`'s accessors take, with the D3D12 argument re-derived there: the
@@ -533,56 +270,21 @@ unsafe extern "C" fn create_fence(
     let placement = unsafe { &*a.Fences };
 
     let flags = placement.Flags;
-    if flags & ddi12::D3D12DDI_FENCE_FLAGS_D3D12DDI_FENCE_FLAG_BOTTOM_OF_PIPE != 0 {
-        note_refusal(&L7_REFUSALS.fence_bottom_of_pipe_unproven);
-    }
     let known = ddi12::D3D12DDI_FENCE_FLAGS_D3D12DDI_FENCE_FLAG_BOTTOM_OF_PIPE;
     if flags & !known != 0 {
         note_refusal(&L7_REFUSALS.fence_flags_unknown);
-        if budget(&FENCE_LOG).is_some() {
-            log_error!("CreateFence: unknown D3D12DDI_FENCE_FLAGS bits in {flags:#x}");
-        }
+        return E_INVALIDARG;
     }
-
-    // SAFETY: this is a device-scope DDI, so the runtime passes a handle
-    // `create_device` returned `S_OK` for; the borrow lives only until the end
-    // of this call, which is `device12::device`'s stated precondition.
-    let Some(dev) = (unsafe { device12::device(h_device) }) else {
+    if placement.FenceValue.BaseAddress != 0 || placement.FenceMonitoredValue.BaseAddress != 0 {
+        note_refusal(&L7_REFUSALS.fence_gpu_va_refused);
+        return E_NOTIMPL;
+    }
+    // SAFETY: this device-scope DDI supplies its live creating device.
+    if unsafe { device12::device(h_device) }.is_none() {
         note_refusal(&L7_REFUSALS.fence_no_device);
         return E_FAIL;
-    };
-    let Some(engine) = dev.engine.d3d12_device() else {
-        note_refusal(&L7_REFUSALS.fence_no_device);
-        return E_FAIL;
-    };
-
-    // ⚠ Initial value 0 and `D3D12_FENCE_FLAG_NONE`, both deliberate:
-    //   * the runtime owns the *observable* fence value (it holds the CPU
-    //     mapping and services `GetCompletedValue`), and every value that ever
-    //     reaches this engine fence arrives as an absolute `Value` on
-    //     `D3D12DDIARG_FENCE_OPERATION`. Starting anywhere but 0 would make a
-    //     first `Signal(1)` a backwards step on a monotonic timeline;
-    //   * `SHARED`/`CROSS_ADAPTER` are API flags the DDI does not carry (module
-    //     doc), and asking vkd3d for a shared fence would engage
-    //     `VK_KHR_external_memory_win32`, which venus does not expose
-    //     (`DECISIONS.md` V1).
-    // SAFETY: `engine` is the bridge's live borrowed `ID3D12Device` and the call
-    // takes only by-value scalars plus the out-param the wrapper owns.
-    let created = unsafe { engine.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE) };
-    let fence = match created {
-        Ok(f) => f,
-        Err(e) => {
-            note_refusal(&L7_REFUSALS.fence_engine_failed);
-            if let Some(n) = budget(&FENCE_LOG) {
-                log_error!(
-                    "CreateFence: engine CreateFence failed hr={:#010x} (x{})",
-                    e.code().0 as u32,
-                    n + 1,
-                );
-            }
-            return E_FAIL;
-        }
-    };
+    }
+    note_refusal(&L7_REFUSALS.fence_runtime_owned);
 
     // ⚠ On the SUCCESS path, and budgeted: this is the only capture anywhere of
     // the GPU virtual addresses the runtime picks for a D3D12 monitored fence on
@@ -591,7 +293,7 @@ unsafe extern "C" fn create_fence(
     // against.
     if let Some(n) = budget(&FENCE_LOG) {
         log_error!(
-            "CreateFence: valueVA={:#x} monitoredVA={:#x} flags={:#x} -> engine fence (x{})",
+            "CreateFence: valueVA={:#x} monitoredVA={:#x} flags={:#x} -> runtime-owned fence (x{})",
             placement.FenceValue.BaseAddress,
             placement.FenceMonitoredValue.BaseAddress,
             flags,
@@ -599,24 +301,9 @@ unsafe extern "C" fn create_fence(
         );
     }
 
-    // SAFETY: the slot lies in the sized private block and is currently null
-    // (cleared above); `store` boxes the state and moves the box into it, so the
-    // slot owns both the box and, through it, the single reference `CreateFence`
-    // returned. `destroy_fence` takes the box back out and drops it.
+    // SAFETY: validated empty runtime-private slot; it owns this object until DestroyFence.
     unsafe {
-        slot.store(FenceState {
-            engine: fence,
-            // ⛔ 0 is the BIASED "never signalled" value, not a watermark of 0 —
-            // the field's doc carries the bias. Nothing on this fence's engine
-            // timeline is this driver's yet, which is what routes a wait arriving
-            // now to the module doc's benign `FenceWaitRuntimeOwned` arm.
-            //
-            // ⚠ It must start where the ENGINE timeline starts and not where the
-            // runtime's monitored fence does — which the DDI never says. A
-            // `CreateFence(InitialValue = N)` is invisible here, so biased-0 is
-            // the only honest initial claim.
-            signalled_biased: AtomicU64::new(0),
-        });
+        slot.store(FenceState { device: h_device });
     }
     S_OK
 }
@@ -850,41 +537,16 @@ pub(crate) struct L7Refusals {
     /// multi-adapter assumption behind `ARCHITECTURE.md` §13 UNVERIFIED-11 has
     /// been reached for real, and a single engine fence cannot honour it.
     fence_multi_adapter_refused: RefusalCounter,
-    /// A fence carried `D3D12DDI_FENCE_FLAG_BOTTOM_OF_PIPE`, which this driver
-    /// backs **only inside the engine**.
-    ///
-    /// ⚠ **Expected non-zero, and it is a coupling rather than a fault.**
-    /// `ID3D12CommandQueue::Signal` on the vkd3d queue does retire behind that
-    /// queue's submitted work, so the engine half is honoured.
-    ///
-    /// ⛔ **The WDDM half this doc used to name — *"the queued software signal
-    /// packet"* on this fence — CANNOT EXIST.** `DDI_REFERENCE.md` §10.4's
-    /// correction block (`:2306-2331`) struck it, because every `pfnSignal*Cb`
-    /// names its target by `D3DKMT_HANDLE` and `D3D12DDIARG_CREATE_FENCE` carries
-    /// none; `KMD_IMPACT.md` §14a.5 forbids the design by name. The real WDDM half
-    /// is the `pfnRenderCb` packet `pfnExecuteCommandLists` submits with the
-    /// frame's own GPU-completion boundary (`EclFenceSampled`).
-    ///
-    /// ⛔ **GRADING CORRECTED 2026-08-07.** This said the boundary is *"off by
-    /// default under A1 (`knobs12::UMD12_ECL_DRAIN`)"*, which has been false since
-    /// `f71fef4`. Reading it that way inverts the conclusion on a default build:
-    /// `Umd12EclFence` is **ON**, so `EclFenceSampled` is nonzero on every ECL,
-    /// and someone told to expect 0 would read a flat fence measurement as
-    /// unattributable when in fact a boundary was carried.
-    ///
-    /// ⇒ read this counter beside **`EclFenceNoDrain`**, not beside
-    /// `EclFenceSampled`. `EclFenceSampled` only says a boundary was sampled;
-    /// `EclFenceNoDrain` is what distinguishes an EXACT boundary from a **prefix**
-    /// that may name less work than the frame contains — which is the distinction
-    /// a bottom-of-pipe claim actually turns on.
+    /// Retired counter, preserved at its diagnostic index; always zero.
     fence_bottom_of_pipe_unproven: RefusalCounter,
     /// A `D3D12DDI_FENCE::Flags` carried a bit outside the two enumerators
     /// `d3d12umddi.h` defines. **Expected 0**; a hit means the header this build
     /// was generated from is older than the runtime asking.
     fence_flags_unknown: RefusalCounter,
-    /// `ID3D12Device::CreateFence` on the engine failed. **Expected 0** — it
-    /// allocates a Vulkan timeline semaphore and nothing else.
+    /// Retired counter, preserved at its diagnostic index; always zero.
     fence_engine_failed: RefusalCounter,
+    fence_runtime_owned: RefusalCounter,
+    fence_gpu_va_refused: RefusalCounter,
     /// A query-heap slot was called with a null arg or a null `pDrvPrivate`.
     /// **Expected 0.**
     query_heap_bad_arg: RefusalCounter,
@@ -912,6 +574,8 @@ pub(crate) static L7_REFUSALS: L7Refusals = L7Refusals {
     fence_bottom_of_pipe_unproven: RefusalCounter::new("FenceBottomOfPipeUnproven"),
     fence_flags_unknown: RefusalCounter::new("FenceFlagsUnknown"),
     fence_engine_failed: RefusalCounter::new("FenceEngineFailed"),
+    fence_runtime_owned: RefusalCounter::new("FenceRuntimeOwned"),
+    fence_gpu_va_refused: RefusalCounter::new("FenceGpuVaRefused"),
     query_heap_bad_arg: RefusalCounter::new("QueryHeapBadArg"),
     query_heap_no_device: RefusalCounter::new("QueryHeapNoDevice"),
     query_heap_type_unsupported: RefusalCounter::new("QueryHeapTypeUnsupported"),
@@ -943,6 +607,8 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L7_REFUSALS.query_heap_no_device,
     &L7_REFUSALS.query_heap_type_unsupported,
     &L7_REFUSALS.query_heap_engine_failed,
+    &L7_REFUSALS.fence_runtime_owned,
+    &L7_REFUSALS.fence_gpu_va_refused,
 ];
 
 // ⚠ `Hresult` is imported for the `E_*`/`S_OK` constants this file returns; the

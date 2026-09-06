@@ -48,6 +48,8 @@ const MAX_MAPPINGS: usize = 8192;
 /// id: venus resource ids are assigned monotonically from 1 and a boot cannot
 /// mint 2^32 of them.
 pub const READ_LEDGER_MAPPING_ID: u32 = u32::MAX;
+/// Separate producer status mapping, never interpreted as a scanout ledger.
+pub const PRODUCER_MAPPING_ID: u32 = u32::MAX - 1;
 
 /// `insert` refusals because the table was at capacity (each one is a failed
 /// user MAP_BLOB — loud-failure rule; reported via QUERY_STATS v2).

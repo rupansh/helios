@@ -2173,6 +2173,18 @@ class.
 
 ## 10. Fences
 
+**Current source amendment:** [EXECUTION_SYNC.md](EXECUTION_SYNC.md) supersedes
+this section's historical private engine fence/watermark implementation. HE12
+v2 provides runtime admission and exact worker completion, with native
+software-fence acceptance still pending. Nonzero monitored-fence GPU placements
+and direct D3D12 queue fence DDIs are refused explicitly; no KMT handle or initial value
+is inferred from the DDI's GPU placement. The reconstructed runtime-routing
+assumption below remains an acceptance obligation.
+
+These GPU placements and D3D12 queue DDIs predate WDDM 3.2 native GPU fence
+objects. That optional, separately advertised feature is outside this WDDM 2.1
+repair; its absence is not a conformance gap on the selected surface.
+
 ### 10.1 The fence object IS a pair of GPU virtual addresses
 
 Verbatim, umddi:1575-1598:

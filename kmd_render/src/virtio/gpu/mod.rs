@@ -946,7 +946,7 @@ struct PresentStreamSlot {
     /// deliberately share it.
     claimed_value: u32,
     submitted_value: u32,
-    retired_value: u32,
+    progress: helios_kmd_logic::execution_completion::Progress,
 }
 
 impl PresentStreamSlot {
@@ -961,7 +961,7 @@ impl PresentStreamSlot {
         creator_process: 0,
         claimed_value: 0,
         submitted_value: 0,
-        retired_value: 0,
+        progress: helios_kmd_logic::execution_completion::Progress::EMPTY,
     };
 
     fn handle(self, index: usize) -> u32 {
@@ -1175,13 +1175,8 @@ fn present_stream_slot_ready(
         index,
         handle,
         value,
-        slot.retired_value,
+        slot.progress.retired(),
     )
-}
-
-#[inline]
-fn advance_present_stream_retired(retired_value: u32, completed_value: u32) -> u32 {
-    helios_kmd_logic::present_stream::advance_retired(retired_value, completed_value)
 }
 
 /// Encode a generation-qualified opaque present-stream boundary.
@@ -1860,6 +1855,9 @@ struct WddmPending {
     /// Optional generation-qualified registered-stream marker carried by the
     /// KMD private DMA record.  A WDDM completion requires BOTH boundaries.
     stream_boundary: Option<u64>,
+    /// Exact ECL completion. Only real stream retirement may satisfy it;
+    /// present rebase, timeout, generation death and cancellation cannot.
+    execution: Option<helios_kmd_logic::execution_completion::Wait>,
     /// Exact WindowedBlt request admitted by this scheduler submission. A
     /// token is not comparable across streams; readiness tests membership in
     /// the bounded terminal set, never a global numeric watermark.
@@ -2224,6 +2222,8 @@ pub struct VirtioGpu {
     /// allocation-free on registration, tagging, completion, and DISPATCH
     /// marker-readiness paths.
     present_streams: Vec<PresentStreamSlot>,
+    producer_adapter: usize,
+    producer_generation: u32,
     /// Dedicated standard-buffer ownership table. Fixed-length heap storage keeps all
     /// claim/retire/dispatch paths allocation-free under `virtio_lock`.
     present_buffer_syncs: Vec<PresentBufferSync>,
@@ -2553,6 +2553,8 @@ impl VirtioGpu {
             fence_waiters: Vec::with_capacity(MAX_FENCE_WAITERS),
             fence_events: Vec::with_capacity(MAX_FENCE_EVENTS),
             present_streams,
+            producer_adapter: 0,
+            producer_generation: 0,
             present_buffer_syncs,
             present_buffer_opens,
             next_present_stream_cookie: 1,
@@ -4490,7 +4492,7 @@ impl VirtioGpu {
                     // that the producer ran when the host said it did not.
                     if let Some(retire) = present_stream {
                         if response_ok {
-                            self.retire_present_stream_value(retire);
+                            self.retire_present_stream_value(retire, fence_id);
                         } else {
                             self.fail_present_stream_value(retire);
                         }
@@ -4919,6 +4921,64 @@ impl VirtioGpu {
 
     // ── Registered async present streams ───────────────────────────────────
 
+    pub(crate) fn attach_producer_completion(
+        &mut self,
+        adapter: &crate::adapter::AdapterContext,
+        generation: u32,
+    ) {
+        self.producer_adapter = adapter as *const _ as usize;
+        self.producer_generation = generation;
+    }
+
+    fn producer_completion(&self) -> Option<&crate::adapter::producer::ProducerCompletion> {
+        if self.producer_adapter == 0 {
+            return None;
+        }
+        // SAFETY: attached before transport publication; AdapterContext owns
+        // and drops this transport before freeing itself or the status pages.
+        Some(
+            &unsafe { &*(self.producer_adapter as *const crate::adapter::AdapterContext) }.producer,
+        )
+    }
+
+    fn producer_stream_key(&self, handle: u32) -> u64 {
+        ((self.producer_generation as u64) << 32) | handle as u64
+    }
+
+    pub(crate) fn publish_producer(
+        &self,
+        owner: DeviceOwner,
+        binding: u64,
+        ctx: u32,
+        cookie: u64,
+        value: u32,
+    ) -> Result<u64, helios_kmd_logic::producer_completion::Error> {
+        use helios_kmd_logic::producer_completion::Error;
+        if self.failed || value == 0 {
+            return Err(Error::Invalid);
+        }
+        let (i, s) = self
+            .present_streams
+            .iter()
+            .enumerate()
+            .find(|(_, s)| {
+                s.live
+                    && !s.closing
+                    && s.owner == Some(owner)
+                    && s.ctx_id == ctx
+                    && s.cookie == cookie
+            })
+            .ok_or(Error::Invalid)?;
+        let producer = self.producer_completion().ok_or(Error::Invalid)?;
+        producer.publish(
+            owner.raw(),
+            binding,
+            self.producer_stream_key(s.handle(i)),
+            value,
+            s.progress.completed() >= value,
+        )
+    }
+
     /// Reserve one bounded, owner-scoped stream for an ICD context.  The
     /// process association is the exact opaque `hKmdProcess` handle dxgkrnl
     /// supplied to both devices. It is compared byte-for-byte with the UMD
@@ -4970,7 +5030,7 @@ impl VirtioGpu {
             creator_process,
             claimed_value: 0,
             submitted_value: 0,
-            retired_value: 0,
+            progress: helios_kmd_logic::execution_completion::Progress::EMPTY,
         };
         let live = PRESENT_STREAM_LIVE.fetch_add(1, Ordering::Relaxed) as usize + 1;
         bump_high_water(&PRESENT_STREAM_HIGH_WATER, live);
@@ -5045,6 +5105,9 @@ impl VirtioGpu {
 
     /// Purge all registrations for this transport generation (failure/reset).
     pub fn purge_all_present_streams(&mut self) {
+        if let Some(producer) = self.producer_completion() {
+            producer.reset();
+        }
         for index in 0..self.present_streams.len() {
             if self.present_streams[index].live {
                 self.release_retired_present_buffer_consumers_for_stream(index);
@@ -5102,7 +5165,7 @@ impl VirtioGpu {
                 continue;
             };
             if decode_present_stream_boundary(boundary).is_some_and(|(candidate, value)| {
-                candidate == handle && value <= slot.retired_value
+                candidate == handle && value <= slot.progress.retired()
             }) {
                 buffer.access = PresentBufferAccess::ExternalReady;
             }
@@ -5113,9 +5176,13 @@ impl VirtioGpu {
     /// while an already-enqueued (or claimed-not-yet-enqueued) value still owns
     /// the only proof that externally imported buffers are no longer in use.
     fn close_present_stream_slot(&mut self, index: usize) {
+        if let Some(producer) = self.producer_completion() {
+            producer
+                .fail_stream(self.producer_stream_key(self.present_streams[index].handle(index)));
+        }
         self.release_retired_present_buffer_consumers_for_stream(index);
         let slot = self.present_streams[index];
-        if slot.claimed_value == 0 && slot.retired_value >= slot.submitted_value {
+        if slot.claimed_value == 0 && slot.progress.retired() >= slot.submitted_value {
             self.retire_present_stream_slot(index);
         } else {
             self.present_streams[index].closing = true;
@@ -5209,6 +5276,9 @@ impl VirtioGpu {
     ) -> u32 {
         let mut discharged = 0u32;
         for index in 0..self.wddm_pending.len() {
+            if self.wddm_pending[index].execution.is_some() {
+                continue;
+            }
             let Some(boundary) = self.wddm_pending[index].stream_boundary else {
                 continue;
             };
@@ -5755,18 +5825,100 @@ impl VirtioGpu {
         PRESENT_STREAM_TAGS.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn retire_present_stream_value(&mut self, retire: PresentStreamRetire) {
+    /// GPU proof advances allocation epochs and HE12 execution waits only.
+    /// Transport retirement and Present consumer ownership stay on the wire.
+    fn complete_present_stream_gpu(&mut self, index: usize, handle: u32) {
+        let completed = self.present_streams[index].progress.completed();
+        if let Some(producer) = self.producer_completion() {
+            producer.complete(self.producer_stream_key(handle), completed);
+        }
+        for pending in self.wddm_pending.iter_mut() {
+            if let Some(wait) = pending.execution.as_mut() {
+                wait.observe(handle, completed);
+            }
+        }
+    }
+
+    pub fn observe_stream_feedback(
+        &mut self,
+        _order: &crate::adapter::NotifyOrdered<'_>,
+        owner: DeviceOwner,
+        ctx_id: u32,
+        cookie: u64,
+        value: u32,
+        wire_fence: u64,
+    ) -> helios_kmd_logic::execution_completion::FeedbackResult {
+        use helios_kmd_logic::execution_completion::{FeedbackResult, Submission};
+        let found = self.present_streams.iter().position(|slot| {
+            !self.failed
+                && slot.live
+                && !slot.closing
+                && slot.owner == Some(owner)
+                && slot.ctx_id == ctx_id
+                && slot.cookie == cookie
+                && value != 0
+                && value <= slot.submitted_value
+        });
+        let Some(index) = found else {
+            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
+            return FeedbackResult::Rejected;
+        };
+        let handle = self.present_streams[index].handle(index);
+        let tag = Submission {
+            stream: handle,
+            value,
+            wire_fence,
+        };
+        let admitted = self.inflight.iter().find_map(|entry| match entry.kind {
+            InFlightKind::AsyncVenus {
+                fence_id,
+                present_stream: Some(retire),
+                ..
+            } if fence_id == wire_fence => Some(Submission {
+                stream: retire.handle,
+                value: retire.value,
+                wire_fence: fence_id,
+            }),
+            _ => None,
+        });
+        let result = self.present_streams[index]
+            .progress
+            .feedback(handle, tag, admitted);
+        if result == FeedbackResult::Rejected {
+            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.complete_present_stream_gpu(index, handle);
+        }
+        result
+    }
+
+    fn retire_present_stream_value(&mut self, retire: PresentStreamRetire, wire_fence: u64) {
         let Some(index) = Self::present_stream_index(retire.handle) else {
             return;
         };
         let slot = self.present_streams[index];
-        let advanced = advance_present_stream_retired(slot.retired_value, retire.value);
-        if slot.live && slot.handle(index) == retire.handle && advanced != slot.retired_value {
-            self.present_streams[index].retired_value = advanced;
+        if !slot.live || slot.handle(index) != retire.handle {
+            return;
+        }
+        let tag = helios_kmd_logic::execution_completion::Submission {
+            stream: retire.handle,
+            value: retire.value,
+            wire_fence,
+        };
+        if !self.present_streams[index]
+            .progress
+            .wire(retire.handle, tag)
+        {
+            return;
+        }
+        self.complete_present_stream_gpu(index, retire.handle);
+        if self.present_streams[index].progress.retired() != slot.progress.retired() {
             PRESENT_STREAM_RETIRES.fetch_add(1, Ordering::Relaxed);
             self.release_retired_present_buffer_consumers_for_stream(index);
             let slot = self.present_streams[index];
-            if slot.closing && slot.claimed_value == 0 && slot.retired_value >= slot.submitted_value
+            if slot.closing
+                && slot.claimed_value == 0
+                && slot.progress.retired() >= slot.submitted_value
             {
                 self.retire_present_stream_slot(index);
             }
@@ -6415,24 +6567,6 @@ impl VirtioGpu {
         }
     }
 
-    /// Clear every WDDM FIFO entry after an overflow and detach the exact
-    /// WindowedBlt prefix each entry used to own. `current` is the submission
-    /// that discovered the full FIFO and is never enqueued, but its newly
-    /// admitted prefix must be abandoned too.
-    fn overflow_wddm_pending(&mut self, current: Option<WindowedBltTerminalPrefix>) {
-        while let Some(pending) = self.wddm_pending.pop_front() {
-            if let (Some(token), Some(boundary)) = (pending.blt_token, pending.blt_stream_boundary)
-            {
-                if let Some(prefix) = WindowedBltTerminalPrefix::new(token, boundary) {
-                    self.abandon_windowed_blt_wddm_prefix(prefix);
-                }
-            }
-        }
-        if let Some(prefix) = current {
-            self.abandon_windowed_blt_wddm_prefix(prefix);
-        }
-    }
-
     /// Allocation teardown cancels every transaction that names this exact
     /// snapshot source or DXGI destination before cache/resource destruction.
     /// Each request becomes a terminal cancellation so an already admitted
@@ -6553,20 +6687,25 @@ impl VirtioGpu {
         stream_boundary: Option<u64>,
         blt_token: Option<u64>,
         d3d12: bool,
+        execution_boundary: Option<u64>,
     ) -> bool {
         if self.failed {
-            // Nothing will ever retire, so queueing this fence guarantees a TDR.
-            // Signal it now - and clear the FIFO in the SAME critical section:
-            // dxgkrnl requires monotonic SubmissionFenceId completion, so
-            // signalling the newest fence while older ones stay queued would
-            // break the invariant.
+            // Transport failure is not producer completion. Let the scheduler
+            // reset the failed epoch; never advance its successful watermark.
             WDDM_SIGNAL_AFTER_FAILURE.fetch_add(1, Ordering::Relaxed);
-            self.wddm_pending.clear();
-            // A failure latch aborted every WindowedBlt reader before this
-            // path can be reached. Clear any stale membership defensively: no
-            // WDDM FIFO entry remains that could consume it.
-            self.windowed_blt.terminal.clear();
-            return true;
+            return false;
+        }
+        let mut execution =
+            execution_boundary.and_then(helios_kmd_logic::execution_completion::Wait::new);
+        if let Some(wait) = execution.as_mut() {
+            if let Some((handle, _)) = decode_present_stream_boundary(wait.boundary()) {
+                if let Some(index) = Self::present_stream_index(handle) {
+                    let slot = self.present_streams[index];
+                    if slot.live && slot.handle(index) == handle {
+                        wait.observe(handle, slot.progress.completed());
+                    }
+                }
+            }
         }
         // A non-paging DMA fence must mean "the GPU is finished", because that
         // is what dxgkrnl schedules on. Retiring it at DECODE reports completion
@@ -6775,6 +6914,9 @@ impl VirtioGpu {
                 }
             };
             (selection.watermark, wire_boundary)
+        } else if execution.is_some() {
+            D3D12_EXACT_WATERMARK_USED.fetch_add(1, Ordering::Relaxed);
+            (0, WireBoundary::Prefix)
         } else if stream_boundary.is_some() && self.present_exact_watermark {
             // EXACT PRESENT WATERMARK (2026-08-04). `next_wire_fence` is "every
             // transport entry enqueued before this WDDM buffer" — a superset
@@ -6819,11 +6961,13 @@ impl VirtioGpu {
         if self.wddm_pending.is_empty()
             && self.wire_boundary_ready(watermark, domain, wire_boundary)
             && stream_ready
+            && execution.map_or(true, |wait| wait.completed())
             && blt_ready
             // A held packet must not take the immediate-signal path: that is the
             // exact case the experiment measures (a packet with nothing real to
             // wait for), so the hold has to be able to reach it.
             && hold_until_100ns == 0
+            && execution.is_none()
             // A WindowedBlt terminal can predate a preempted DMA replay. It
             // still must enter the FIFO so a failed NotifyInterrupt leaves a
             // retryable owner; only the DPC's successful callback consumes
@@ -6833,37 +6977,11 @@ impl VirtioGpu {
             return true;
         }
         if self.wddm_pending.len() >= MAX_WDDM_PENDING {
-            // Degrade to the old immediate model for this fence — signaling the
-            // newest (monotonically largest) fence implicitly completes the
-            // queued older ones, so drop them too. Loud and counted.
-            //
-            // ⚠ THE "PRACTICALLY UNREACHABLE (VidSch queues far fewer than 256)"
-            // LINE THAT USED TO BE HERE IS RETIRED (A5, 2026-08-06). It was an
-            // assumption about dxgkrnl's queue depths — closed source, and this
-            // FIFO is adapter-global across every context, so no single queue depth
-            // bounds it — and the D3D12 arm adds a writer at
-            // `pfnExecuteCommandLists` frequency rather than at present frequency.
-            // What actually keeps this path away is now stated and measured:
-            // `WddmHeadMs` bounds how long a head may block on a boundary that may
-            // be unsatisfiable, so 256 outstanding entries requires 256 genuinely
-            // in-flight producers. If this counter ever moves, `WfBWire`/`WfBReb`
-            // say whether the host stopped retiring or the bound was disabled.
-            //
-            // ⚠ The caller still releases every outstanding scan-out lease when
-            // this returns true after an overflow. The leases no longer gate a
-            // retirement, but they DO decide the flush executor's ownership
-            // gate, and an epoch whose presentation was just dropped on the
-            // floor must not read as one that is still coming.
-            // `note_wddm_submission` cannot do it itself — the lease state lives
-            // on the adapter and this runs under `virtio_lock`, inside
-            // `wddm_notify_lock`.
+            // Losing a pending boundary cannot complete any of its successors.
+            // Fail the transport and retain the FIFO until scheduler reset.
             WDDM_PENDING_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
-            let current = match (blt_token, blt_stream_boundary) {
-                (Some(token), Some(boundary)) => WindowedBltTerminalPrefix::new(token, boundary),
-                _ => None,
-            };
-            self.overflow_wddm_pending(current);
-            return true;
+            self.failed = true;
+            return false;
         }
         self.wddm_pending.push_back(WddmPending {
             fence,
@@ -6871,6 +6989,7 @@ impl VirtioGpu {
             wire_boundary,
             domain,
             stream_boundary,
+            execution,
             blt_token,
             blt_stream_boundary,
             hold_until_100ns,
@@ -7002,6 +7121,18 @@ impl VirtioGpu {
     /// `SubmissionFenceId` as a watermark and requires monotonic completion, so
     /// skipping ahead is bugcheck 0x119/1.
     pub fn take_one_ready_wddm(&mut self, _order: &crate::adapter::NotifyOrdered<'_>) -> WddmTake {
+        if self.failed {
+            return WddmTake::BlockedOnProducer;
+        }
+        if self
+            .wddm_pending
+            .front()
+            .and_then(|head| head.execution)
+            .is_some_and(|wait| !wait.completed())
+        {
+            WDDM_HEAD_BLOCKED_STREAM.fetch_add(1, Ordering::Relaxed);
+            return WddmTake::BlockedOnProducer;
+        }
         // TWO PASSES AT MOST, and the loop exists for LIVENESS, not for retrying:
         // `rebase_blocked_head` can succeed at most once per entry
         // (`WddmPending::rebased`), and the `pass` guard bounds it again in case
@@ -7160,6 +7291,15 @@ impl VirtioGpu {
     /// them, and turns an undiagnosable price tag into an attributed one
     /// (`WfBRebS`/`WfBRebB`, which partition `WfBReb`).
     fn rebase_blocked_head(&mut self, arm: RebaseArm) -> bool {
+        // Exact execution packets must preserve every completion obligation,
+        // including a Present copy batched beside the ECL tail.
+        if self
+            .wddm_pending
+            .front()
+            .is_some_and(|head| head.execution.is_some())
+        {
+            return false;
+        }
         let ms = WDDM_HEAD_MS.load(Ordering::Relaxed);
         if ms == 0 {
             return false;

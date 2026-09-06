@@ -55,42 +55,8 @@
 //! omitted, it is vacuous: it is "one `from_raw` per **owning entry point**",
 //! and S4 has none.
 //!
-//! # ⭐ The sample-only boundary, and why it landed WITH its call site
-//!
-//! `helios_vkd3d_bridge_sample_queue_fence` was in `umd12/bridge/vkd3d_bridge.h` and
-//! `.cpp` for one commit with **no Rust half**, because nothing in this crate called
-//! it: its one caller is `pfnExecuteCommandLists` in `forward12::queue.rs`. A cxx
-//! declaration plus a wrapper with no caller is two hand-written lines carrying
-//! `#[allow(dead_code)]`, which `PARALLEL.md` §10 forbids outright (R908) — the same
-//! reason `adopt_d3d12_device` above was written and then removed. ⇒ the declaration,
-//! [`sample_queue_fence`] and the call site are one commit, and the shape recorded in
-//! this block's earlier form is what landed.
-//!
-//! ⚠ **Why it mattered, because "no Rust half" reads as optional and was not.**
-//! `Umd12EclDrain` defaults **OFF** — `vkd3d_acquire_vk_queue` reaches an untimed
-//! `pthread_cond_wait` from inside a DDI — and the drain was the only place a
-//! `VkQueue` was obtainable. So on the shipping default every submission carried
-//! `gpu_wire_fence = 0`, `Umd12EclFence`'s ON default was inert, and the kernel's
-//! exact-boundary arm could never fire: the whole fence bridge shipped doing nothing,
-//! knowingly. The C++ side reaches the same boundary through `vkd3d_lock_vk_queue`,
-//! which drains nothing; that header carries the full argument and the under-wait it
-//! costs, and [`sample_queue_fence`] repeats the cost rather than relying on the
-//! reader following the link.
+//! ECL completion uses an exact worker stream; admission uses the runtime context event.
 
-// ⚠ `too_many_arguments` is allowed for this MODULE and not for a function,
-// because the lint fires on a declaration inside a `#[cxx::bridge]` block and cxx
-// passes through only a fixed set of attributes — an `#[allow]` on the extern `fn`
-// itself is not one of them.
-//
-// The declaration it fires on is `resource_venus_identity`, and its width is the
-// FFI's shape rather than a design choice: the alternative is a shared `#[repr(C)]`
-// struct, which cxx emits into its own generated header — a header
-// `vkd3d_bridge.cpp` deliberately does not include (it hand-declares every
-// signature instead, see `vkd3d_bridge.h`'s banner), and which itself includes
-// `vkd3d_bridge.h`. So a struct out-param would mean either a duplicated POD
-// declaration or an include cycle. Seven out-params it is, cleared by the C++ side
-// before anything that can fail. The precedent is `umd/src/bridge.rs:315`, the same
-// lint on the same kind of accessor in the D3D11 bridge.
 #[allow(clippy::too_many_arguments)]
 #[cxx::bridge]
 mod ffi {
@@ -150,10 +116,7 @@ mod ffi {
         /// # Safety
         /// As [`resource_venus_identity`](Self::resource_venus_identity)'s
         /// `resource`.
-        unsafe fn transfer_resource_ownership(
-            self: &HeliosVkd3dDevice,
-            resource: usize,
-        ) -> u32;
+        unsafe fn transfer_resource_ownership(self: &HeliosVkd3dDevice, resource: usize) -> u32;
 
         /// Create a vkd3d device on the Helios adapter identified by the split
         /// LUID. Returns a null `UniquePtr` on failure (adapter not found,
@@ -181,56 +144,37 @@ mod ffi {
             err_out: *mut usize,
         ) -> i32;
 
-        /// Drain one `ID3D12CommandQueue`'s vkd3d submission worker (K-F1).
-        ///
-        /// ⭐ A CPU-side wait for `vkQueueSubmit`, **not** for GPU completion —
-        /// see the Rust wrapper [`drain_queue`], which carries the whole
-        /// argument for why that distinction makes this legal.
-        ///
-        /// `queue` is an `ID3D12CommandQueue*` as a `usize`, **BORROWED**: the
-        /// C++ side takes no reference and releases none, so the caller's
-        /// interface must outlive the call. Returns `false` (counted and logged
-        /// on the C++ side) for a 0 queue or an engine that declined.
-        ///
-        /// ⚠ Declared `unsafe` because the integer is a raw pointer in
-        /// disguise: nothing in the signature stops a caller passing a stale or
-        /// foreign value, and the C++ body dereferences it through vkd3d's
-        /// `CONTAINING_RECORD`.
-        ///
-        /// `out_wire_fence` / `out_fence_status` are passed **both or neither**
-        /// and both are always written when non-null (0 and a status). See
-        /// [`drain_queue`] for the status mapping and [`FenceStatus`] for why a
-        /// zero fence has four distinguishable causes.
-        unsafe fn helios_vkd3d_bridge_drain_queue(
+        /// Queue a complete ECL batch behind the runtime's exact context event.
+        /// # Safety
+        /// Queue/lists and event are live for the call; the worker duplicates
+        /// the event and retains all command allocators before returning.
+        unsafe fn helios_vkd3d_bridge_execute(
             queue: usize,
-            out_wire_fence: *mut u64,
-            out_fence_status: *mut u32,
+            lists: &[usize],
+            admission_event: usize,
+            ctx: *mut u32,
+            value: *mut u32,
+            cookie: *mut u64,
+        ) -> i32;
+
+        /// # Safety
+        /// Queue is live. Called after runtime context destruction, or on failure.
+        unsafe fn helios_vkd3d_bridge_cancel_execution(queue: usize, reason: i32);
+
+        /// Commit a producer boundary after preceding work on the exact queue.
+        /// # Safety
+        /// Queue/resource are live engine objects of the same device; allocation
+        /// names this resource's exact dxgkrnl allocation. Outputs are writable.
+        unsafe fn helios_vkd3d_bridge_publish_producer(
+            queue: usize,
+            resource: usize,
+            allocation: u32,
+            admission_event: usize,
+            ctx: *mut u32,
+            value: *mut u32,
+            cookie: *mut u64,
         ) -> bool;
 
-        /// Sample the venus GPU-completion boundary **without draining**.
-        ///
-        /// ⭐ Same `queue`/borrowing contract and the same `HELIOS_VKD3D_FENCE_*`
-        /// status set as [`helios_vkd3d_bridge_drain_queue`]; the difference is
-        /// `vkd3d_lock_vk_queue` in place of `vkd3d_acquire_vk_queue`, so no
-        /// `VKD3D_SUBMISSION_DRAIN` is enqueued and nothing waits on vkd3d's
-        /// submission worker. See the Rust wrapper [`sample_queue_fence`] for the
-        /// under-wait that buys.
-        ///
-        /// ⚠ Both out-params are **mandatory** here, unlike the drain's
-        /// both-or-neither: a null pair there means *"drain but do not sample"*,
-        /// which is a real mode, while a sample with nowhere to put the answer
-        /// would be a lock/unlock around nothing.
-        ///
-        /// # Safety
-        /// As [`helios_vkd3d_bridge_drain_queue`], plus: both out-pointers must be
-        /// non-null and address writable storage. Both are cleared before anything
-        /// that can fail, so both are defined on every path including a `false`
-        /// return.
-        unsafe fn helios_vkd3d_bridge_sample_queue_fence(
-            queue: usize,
-            out_wire_fence: *mut u64,
-            out_fence_status: *mut u32,
-        ) -> bool;
     }
 }
 
@@ -444,7 +388,7 @@ pub(crate) struct ResourceVenusIdentity {
 
 /// Why a resource's venus identity came back as it did.
 ///
-/// ⛔ Seven outcomes and not a `bool`, for the reason [`FenceStatus`] gives: they
+/// ⛔ Seven outcomes and not a `bool`, to distinguish each failed interface boundary: they
 /// are different findings and sharing one counter produces exactly the
 /// un-attributable number this project has corrected four times in the KMD's own
 /// counters. In particular [`Self::IcdRefused`] — *"vkd3d bound memory the ICD has
@@ -522,199 +466,62 @@ pub(crate) unsafe fn serialize_root_signature(
     unsafe { ffi::helios_vkd3d_bridge_serialize_root_signature(desc, version, blob_out, err_out) }
 }
 
-/// Drain one command queue's vkd3d submission worker. `true` when the drain ran.
-///
-/// # ⭐⭐ This is a wait for `vkQueueSubmit`, NOT for GPU completion
-///
-/// State that plainly, because a later reader will otherwise mistake it for
-/// `tmp/dx12/FENCE-BRIDGE-DESIGN.md`'s **design A — which is REJECTED** and must
-/// not be reintroduced under any name. The difference is the whole permission:
-///
-/// * design A blocks the producer thread until the GPU has *finished*, which
-///   destroys CPU/GPU overlap and is the producer-side CPU present stall the owner
-///   forbade outright (`umd/src/knobs.rs:31-43`, `KMD_IMPACT.md` §14a.5);
-/// * this blocks only until vkd3d's own submission worker has *handed the work to
-///   Vulkan*. The GPU has typically not started, and nothing waits for it.
-///
-/// What it buys: vkd3d's `ID3D12CommandQueue::ExecuteCommandLists` is asynchronous —
-/// it pushes a submission onto a worker thread's queue (`libs/vkd3d/command.c`'s
-/// `d3d12_command_queue_add_submission`) — so without the drain the WDDM packet
-/// submitted immediately afterwards can be *ordered ahead of* the `vkQueueSubmit` it
-/// is supposed to fence, and the boundary the packet carries then covers less work
-/// than the frame contains.
-///
-/// ⚠⚠ **This doc used to call the drain *"required rather than defensive"*. That is
-/// no longer true and the correction matters.** `Umd12EclDrain` defaults **OFF**,
-/// because `vkd3d_acquire_vk_queue` reaches an untimed, unbounded
-/// `pthread_cond_wait` from inside a DDI (`PENDING.md` §1 A1). So the drained
-/// boundary is the *best* boundary and not the only one:
-/// [`sample_queue_fence`] obtains the same boundary through `vkd3d_lock_vk_queue`,
-/// which drains nothing, and accepts a possible under-wait in exchange for being
-/// reachable at all. ⛔ The two are separately switchable on purpose: folding them
-/// back into one knob would put the fence bridge back to carrying 0 on the shipping
-/// default.
-///
-/// ⭐ It is the same discipline `HeliosWaitFrameSubmitted` gives the D3D11 present
-/// path, and `KMD_IMPACT.md` §14a.2 says so in as many words.
-///
-/// ⚠ One cost, stated because it is not visible from here: the paired
-/// `vkd3d_release_vk_queue` submits an empty `vkQueueSubmit2` that signals the
-/// queue's submission timeline. `vkd3d_bridge.cpp`'s comment at the call has the
-/// citation and the reason it must not be avoided.
-///
 /// # Safety
-/// `queue` must be a live `ID3D12CommandQueue*` **created by this bridge's vkd3d
-/// engine**, valid for the duration of the call. It is borrowed: no reference is
-/// taken and none is released. ⛔ A queue from any other D3D12 implementation
-/// would be `CONTAINING_RECORD`-cast to a `struct d3d12_command_queue` it is not.
-pub(crate) unsafe fn drain_queue(queue: usize) -> bool {
-    // SAFETY: forwarded unchanged; the caller's guarantee above is exactly the
-    // cxx declaration's precondition, and the C++ side additionally refuses a 0.
-    // Null out-params ask for no fence sample and the C++ side skips resolving the
-    // export entirely — which is the `Umd12EclFence=0` arm's whole cost.
-    unsafe {
-        ffi::helios_vkd3d_bridge_drain_queue(queue, core::ptr::null_mut(), core::ptr::null_mut())
-    }
-}
-
-/// Why a GPU-completion boundary came back as it did.
-///
-/// ⛔ **A zero fence is a LEGAL outcome** — `HeliosD3D12SubmitCmd`'s documented
-/// "submit the packet, order it against nothing" arm — so the caller cannot learn
-/// anything from the value alone. These are the four *reasons*, and they are four
-/// different findings: an ICD that is not there, an ICD too old to have the export,
-/// an export that ran and declined (ring 0, an undecodable handle, no venus ctx),
-/// and a real boundary. ⛔ Sharing one counter between them would produce exactly
-/// the un-attributable number this project has now corrected four times in the
-/// KMD's own counters.
-///
-/// ⚠ **The numbers are the C++ side's** — `HELIOS_VKD3D_FENCE_*` in
-/// `umd12/bridge/vkd3d_bridge.h`, which is the single declaration. This mapping is
-/// by value across an FFI the type system cannot check, so [`Self::Unknown`] exists
-/// rather than a `_ => Refused` that would silently absorb a drift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FenceStatus {
-    /// A non-zero wire fence retiring at host GPU completion. The real boundary.
-    Sampled,
-    /// No venus ICD module in this process, or the S4b anchor refused because two
-    /// ICD images are live. Counted and logged once, at resolution.
-    NoIcd,
-    /// The anchored ICD module predates `helios_venus_queue_gpu_fence`. ⛔ The
-    /// designed graceful path, not an error: an older ICD still gets a submission,
-    /// carrying the 0 boundary.
-    NoExport,
-    /// The export ran and declined. ⚠ Its own most important arm is `ring_idx == 0`,
-    /// which it refuses unconditionally because a ring-0 wire fence retires at
-    /// decode — a fence that would lie about GPU completion.
-    Refused,
-    /// The C++ side returned a value this enum does not know. ⛔ A drift between
-    /// `vkd3d_bridge.h`'s constants and this mapping, and it must be loud: silently
-    /// folding it into `Refused` would make the next status added invisible.
-    Unknown(u32),
-}
-
-impl FenceStatus {
-    /// Map the C++ side's `HELIOS_VKD3D_FENCE_*` value. ⛔ The authority for these
-    /// numbers is `umd12/bridge/vkd3d_bridge.h`; keep both in sync.
-    fn from_raw(raw: u32) -> Self {
-        match raw {
-            0 => Self::Sampled,
-            1 => Self::NoIcd,
-            2 => Self::NoExport,
-            3 => Self::Refused,
-            other => Self::Unknown(other),
-        }
-    }
-}
-
-/// Drain one command queue **and** sample the venus wire fence that retires at host
-/// GPU completion of everything now submitted to it.
-///
-/// Returns `(drained, wire_fence, status)`. `drained` is [`drain_queue`]'s value and
-/// is independent of the fence: a queue can drain successfully and still yield no
-/// boundary, which is what `status` explains.
-///
-/// # ⛔ The ordering obligation lives at the C++ call site, not here
-///
-/// The sample happens **after** the `VKD3D_SUBMISSION_DRAIN` and **while both of
-/// vkd3d's queue locks are still held** — see `vkd3d_bridge.cpp`, which carries the
-/// argument in full. The short form, because it is the whole correctness of the
-/// boundary: reading a *larger* ring seqno than needed is harmless (it over-orders),
-/// while reading a **stale smaller** one yields a fence covering less work than the
-/// caller believes, and nothing inside the ICD export can detect that — only the
-/// call's position can.
-///
-/// # Safety
-/// As [`drain_queue`].
-pub(crate) unsafe fn drain_queue_with_fence(queue: usize) -> (bool, u64, FenceStatus) {
-    let mut wire_fence: u64 = 0;
-    let mut raw_status: u32 = 0;
-    // SAFETY: as `drain_queue`, plus two live writable locals for the out-params.
-    // The C++ side clears both before anything that can fail, so they are defined on
-    // every path including a false return.
-    let drained =
-        unsafe { ffi::helios_vkd3d_bridge_drain_queue(queue, &mut wire_fence, &mut raw_status) };
-    (drained, wire_fence, FenceStatus::from_raw(raw_status))
-}
-
-/// Sample the venus wire fence that retires at host GPU completion of everything
-/// **already submitted** to this queue, without draining vkd3d's submission worker.
-///
-/// Returns `(wire_fence, status)`. A `0` fence is legal and only `status` says why.
-///
-/// # ⛔⛔ This is NOT the drained boundary, and it must never be described as one
-///
-/// [`drain_queue_with_fence`] waits for vkd3d's worker to hand *everything the
-/// application enqueued* to Vulkan and then samples. This takes only the
-/// `vkd3d_queue` mutex (`vkd3d_lock_vk_queue`, upstream, already in this link) and
-/// samples immediately — so **the boundary may name less work than the frame
-/// contains**, an under-wait, i.e. the application's fence can still complete before
-/// its GPU work does. The C++ header carries the same statement at the same strength.
-///
-/// ⭐ **Why that is acceptable rather than merely cheaper**, and it is an ordering of
-/// three states and not a preference:
-///
-/// * a **drained** boundary is exact;
-/// * an **undrained** boundary names a prefix of the frame — it can under-wait, and
-///   the asymmetry is that a *larger* seqno only over-orders while only a stale
-///   *smaller* one under-waits;
-/// * **no** boundary orders the packet against nothing at all, which is where the
-///   `Umd12EclDrain=0` default sat before this existed — and that is strictly worse
-///   than an under-wait, because it is an under-wait of the entire frame.
-///
-/// ⛔ And the reason the middle state has to exist: the drain reaches an **untimed,
-/// unbounded** `pthread_cond_wait` from inside a DDI (`PENDING.md` §1 A1), so it
-/// cannot be the default. Without a sample-only path the fence bridge ships inert on
-/// every default build — `Umd12EclFence`'s ON default resolving to a 0 boundary — and
-/// the kernel's exact-boundary arm can never fire.
-///
-/// ⚠ It also carries **no** cost the drain does: no `VKD3D_SUBMISSION_DRAIN`, no
-/// `queue_lock` (so a failed lock leaks nothing, unlike the drain's identical arm),
-/// and no empty `vkQueueSubmit2` on release.
-///
-/// # Safety
-/// As [`drain_queue`].
-pub(crate) unsafe fn sample_queue_fence(queue: usize) -> (u64, FenceStatus) {
-    let mut wire_fence: u64 = 0;
-    let mut raw_status: u32 = 0;
-    // SAFETY: as `drain_queue`, plus two live writable locals for the two out-params
-    // this entry point requires. The C++ side clears both before anything that can
-    // fail, so they are defined on every path including a `false` return.
-    let sampled = unsafe {
-        ffi::helios_vkd3d_bridge_sample_queue_fence(queue, &mut wire_fence, &mut raw_status)
+/// queue and resource are live engine COM objects of the same device for this
+/// call. The allocation belongs to that exact resource's current incarnation.
+pub(crate) unsafe fn publish_producer(
+    queue: usize,
+    resource: usize,
+    allocation: u32,
+    admission_event: usize,
+) -> Option<(u32, u32, u64)> {
+    let (mut ctx, mut value, mut cookie) = (0, 0, 0);
+    // SAFETY: caller supplies exact live objects; outputs are writable locals.
+    let ok = unsafe {
+        ffi::helios_vkd3d_bridge_publish_producer(
+            queue,
+            resource,
+            allocation,
+            admission_event,
+            &mut ctx,
+            &mut value,
+            &mut cookie,
+        )
     };
-    let status = FenceStatus::from_raw(raw_status);
-    // ⛔ The intersection, not either alone — the identical rule and the identical
-    // reason as `resource_venus_identity`: the C++ side returns `true` on exactly the
-    // path that sets `SAMPLED`, so the two agree by construction today, and this is an
-    // FFI the type system cannot check. A future divergence must fall to the SAFE side
-    // (a 0 boundary, loudly attributed) rather than to whichever of the two the caller
-    // happened to read.
-    if sampled && status == FenceStatus::Sampled {
-        (wire_fence, status)
-    } else if status == FenceStatus::Sampled {
-        (0, FenceStatus::Unknown(raw_status))
+    (ok && ctx != 0 && value != 0 && cookie != 0).then_some((ctx, value, cookie))
+}
+
+/// # Safety
+/// Exact live engine queue, command lists and runtime admission event.
+pub(crate) unsafe fn execute(
+    queue: usize,
+    lists: &[usize],
+    admission_event: usize,
+) -> Result<(u32, u32, u64), i32> {
+    let (mut ctx, mut value, mut cookie) = (0, 0, 0);
+    // SAFETY: forwarded live borrowed objects; outputs are writable locals.
+    let hr = unsafe {
+        ffi::helios_vkd3d_bridge_execute(
+            queue,
+            lists,
+            admission_event,
+            &mut ctx,
+            &mut value,
+            &mut cookie,
+        )
+    };
+    if hr < 0 {
+        Err(hr)
+    } else if ctx == 0 || value == 0 || cookie == 0 {
+        Err(helios_umd_common::hr::E_FAIL)
     } else {
-        (0, status)
+        Ok((ctx, value, cookie))
     }
+}
+
+/// # Safety
+/// Queue is still owned by QueueState while workers are cancelled.
+pub(crate) unsafe fn cancel_execution(queue: usize, reason: i32) {
+    // SAFETY: forwarded live queue; no reference escapes the call.
+    unsafe { ffi::helios_vkd3d_bridge_cancel_execution(queue, reason) };
 }

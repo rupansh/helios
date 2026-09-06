@@ -20,6 +20,7 @@ use core::ffi::c_void;
 use core::mem::size_of;
 
 use bytemuck::{bytes_of, pod_read_unaligned};
+use helios_protocol::producer::*;
 use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeAttachResource, HeliosEscapeCtxCreate,
     HeliosEscapeCtxDestroy, HeliosEscapeFenceEvent, HeliosEscapeHeader, HeliosEscapeMapBlob,
@@ -46,6 +47,10 @@ use helios_protocol::{
     HELIOS_SCANOUT_CAP_SNAPSHOT_BIND, HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT,
     HELIOS_SCANOUT_TIMELINE_BATCH_CAP, HELIOS_SCANOUT_TIMELINE_OP_META,
     HELIOS_SCANOUT_TIMELINE_OP_READ, HELIOS_SCANOUT_TIMELINE_TIME_100NS,
+};
+use helios_protocol::{
+    HeliosEscapeStreamFeedback, HELIOS_ESCAPE_STREAM_FEEDBACK, HELIOS_STREAM_FEEDBACK_ACCEPTED,
+    HELIOS_STREAM_FEEDBACK_REJECTED, HELIOS_STREAM_FEEDBACK_WIRE_RETIRED,
 };
 
 use super::blob_map::{
@@ -322,6 +327,25 @@ pub unsafe extern "C" fn dxgkddi_escape(
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
 
     match hdr.cmd_type {
+        HELIOS_ESCAPE_PRODUCER => match owner {
+            Some(owner) => {
+                // SAFETY: the runtime supplies our live DeviceContext for this Escape.
+                let process = unsafe { crate::device::DeviceHandleRef::from_raw(args.hDevice) }
+                    .map(|d| d.creator_process())
+                    .unwrap_or(0);
+                let status = escape_producer(passive, adapter, buf, &hdr, owner, process);
+                if status != STATUS_SUCCESS {
+                    let n = crate::adapter::producer::REFUSED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    if n == 1 || n % 64 == 0 {
+                        crate::diag::record_named_bytes(b"PrRef", n);
+                    }
+                }
+                status
+            }
+            None => refuse_no_device(),
+        },
         HELIOS_ESCAPE_CTX_CREATE => match owner {
             Some(owner) => escape_ctx_create(passive, adapter, buf, &hdr, owner),
             None => refuse_no_device(),
@@ -346,6 +370,10 @@ pub unsafe extern "C" fn dxgkddi_escape(
                     None => STATUS_INVALID_PARAMETER,
                 }
             }
+            None => refuse_no_device(),
+        },
+        HELIOS_ESCAPE_STREAM_FEEDBACK => match owner {
+            Some(owner) => escape_stream_feedback(adapter, buf, &hdr, owner),
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_PRESENT_BUFFER_READ => match owner {
@@ -1132,6 +1160,164 @@ fn escape_ctx_create(
 /// `HELIOS_ESCAPE_PRESENT_STREAM` — one-time stream lifecycle.  The register
 /// reply is an opaque KMD cookie; unknown KMDs never reach this function and
 /// reject the verb from the dispatcher, which is the UMD's capability gate.
+fn producer_error(error: helios_kmd_logic::producer_completion::Error) -> NTSTATUS {
+    use helios_kmd_logic::producer_completion::Error;
+    match error {
+        Error::Capacity => STATUS_INSUFFICIENT_RESOURCES,
+        Error::Invalid => STATUS_INVALID_PARAMETER,
+        Error::Terminal(_) => STATUS_DEVICE_NOT_READY,
+    }
+}
+
+fn escape_producer(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+    process: usize,
+) -> NTSTATUS {
+    use helios_kmd_logic::producer_completion::Predicate;
+    let mut wire = match EscapeBuf::<HeliosEscapeProducer>::new(buf, hdr) {
+        Ok(w) => w,
+        Err(st) => return st,
+    };
+    let mut req = wire.read();
+    if req.version != HELIOS_PRODUCER_VERSION {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let result: Result<(), NTSTATUS> = (|| {
+        match req.op {
+            HELIOS_PRODUCER_MAP => {
+                let page = adapter.producer.page().ok_or(STATUS_DEVICE_NOT_READY)?;
+                let mapping_id = crate::mapping::PRODUCER_MAPPING_ID;
+                let size = crate::adapter::producer::MAP_BYTES;
+                if let Some(va) = adapter.mappings.find_user_va(owner.raw(), mapping_id) {
+                    req.user_va = va;
+                } else {
+                    // SAFETY: PASSIVE Escape in the owning process. Nonpaged
+                    // status pages outlive every mapping until adapter removal.
+                    let (va, mdl) =
+                        unsafe { map_nonpaged_page_to_user_readonly(page as *mut u8, size as u64) }
+                            .ok_or(STATUS_INSUFFICIENT_RESOURCES)?;
+                    match adapter
+                        .mappings
+                        .insert_unique(owner.raw(), mapping_id, va, mdl as usize)
+                    {
+                        crate::mapping::InsertResult::Inserted => req.user_va = va,
+                        other => {
+                            // SAFETY: just-created pair in this process, unpublished.
+                            unsafe { unmap_io_pages_from_user(va, mdl) };
+                            if other == crate::mapping::InsertResult::Full {
+                                return Err(STATUS_INSUFFICIENT_RESOURCES);
+                            }
+                            req.user_va = adapter
+                                .mappings
+                                .find_user_va(owner.raw(), mapping_id)
+                                .ok_or(STATUS_DEVICE_BUSY)?;
+                        }
+                    }
+                }
+                req.size = size as u32;
+            }
+            HELIOS_PRODUCER_BIND => {
+                if req.allocation == 0 || process == 0 {
+                    return Err(STATUS_INVALID_PARAMETER);
+                }
+                let dxg = adapter.dxgkrnl().map_err(escape_device_gone)?;
+                let mut stage = 1;
+                let bound = crate::adapter::producer::with_allocation_reference(
+                    passive,
+                    dxg,
+                    req.allocation,
+                    true,
+                    |open| {
+                        stage = 3;
+                        adapter.producer.bind(owner.raw(), process, open)
+                    },
+                );
+                if bound.is_err() {
+                    crate::diag::record_named_bytes(b"PrBindAt", stage);
+                }
+                let (token, key) = bound.map_err(producer_error)?;
+                req.binding = token;
+                req.slot = key.slot;
+                req.generation = key.generation;
+            }
+            HELIOS_PRODUCER_PUBLISH => {
+                req.epoch = adapter
+                    .with_virtio(|v| {
+                        v.publish_producer(
+                            owner,
+                            req.binding,
+                            req.ctx_id,
+                            req.stream_cookie,
+                            req.value,
+                        )
+                    })
+                    .map_err(escape_device_gone)?
+                    .map_err(producer_error)?;
+                let published =
+                    crate::adapter::producer::PUBLISHED.load(core::sync::atomic::Ordering::Relaxed);
+                if published % 1024 == 1 {
+                    crate::diag::record_named_bytes(b"PrPub", published);
+                    crate::diag::record_named_bytes(
+                        b"PrRet",
+                        crate::adapter::producer::RETIRED
+                            .load(core::sync::atomic::Ordering::Relaxed),
+                    );
+                }
+            }
+            HELIOS_PRODUCER_WAIT => {
+                let event = reference_user_event(req.event).ok_or(STATUS_INVALID_PARAMETER)?;
+                let result = adapter.producer.wait(
+                    owner.raw(),
+                    req.binding,
+                    req.epoch,
+                    event.as_ptr() as usize,
+                );
+                if result != Ok(Predicate::Pending) {
+                    dereference_user_event(event);
+                }
+                req.state = match result.map_err(producer_error)? {
+                    Predicate::Ready => HELIOS_PRODUCER_READY,
+                    Predicate::Pending => HELIOS_PRODUCER_PENDING,
+                    Predicate::Terminal(_) => HELIOS_PRODUCER_TERMINAL,
+                };
+            }
+            HELIOS_PRODUCER_CANCEL => {
+                let event = reference_user_event(req.event).ok_or(STATUS_INVALID_PARAMETER)?;
+                if adapter
+                    .producer
+                    .cancel(owner.raw(), req.binding, event.as_ptr() as usize)
+                    .is_some()
+                {
+                    // Release the TABLE reference and then our lookup reference.
+                    dereference_user_event(event);
+                }
+                dereference_user_event(event);
+            }
+            HELIOS_PRODUCER_RELEASE => adapter
+                .producer
+                .release(owner.raw(), req.binding)
+                .map_err(producer_error)?,
+            HELIOS_PRODUCER_ABORT => adapter
+                .producer
+                .abort(owner.raw(), req.binding)
+                .map_err(producer_error)?,
+            _ => return Err(STATUS_INVALID_PARAMETER),
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            wire.write_back(&req);
+            STATUS_SUCCESS
+        }
+        Err(status) => status,
+    }
+}
+
 fn escape_present_stream(
     adapter: &AdapterContext,
     buf: &mut [u8],
@@ -1178,6 +1364,53 @@ fn escape_present_stream(
         }
         _ => STATUS_INVALID_PARAMETER,
     }
+}
+
+/// Completion notification on the existing retire worker, never a draw query.
+fn escape_stream_feedback(
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    owner: DeviceOwner,
+) -> NTSTATUS {
+    use helios_kmd_logic::execution_completion::FeedbackResult;
+    if hdr.size as usize != size_of::<HeliosEscapeStreamFeedback>() {
+        ESCAPE_BAD_HEADER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    }
+    let mut wire = match EscapeBuf::<HeliosEscapeStreamFeedback>::new(buf, hdr) {
+        Ok(wire) => wire,
+        Err(status) => return status,
+    };
+    let mut req = wire.read();
+    if req.reserved != 0 {
+        ESCAPE_BAD_HEADER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return STATUS_INVALID_PARAMETER;
+    }
+    let result = adapter.with_wddm_notify_lock(|guard| {
+        guard.with_virtio(|order, v| {
+            v.observe_stream_feedback(
+                order,
+                owner,
+                req.ctx_id,
+                req.cookie,
+                req.value,
+                req.wire_fence,
+            )
+        })
+    });
+    req.state = match result {
+        Ok(FeedbackResult::Accepted) => HELIOS_STREAM_FEEDBACK_ACCEPTED,
+        Ok(FeedbackResult::WireRetired) => HELIOS_STREAM_FEEDBACK_WIRE_RETIRED,
+        Ok(FeedbackResult::Rejected) => HELIOS_STREAM_FEEDBACK_REJECTED,
+        Err(error) => return error.into(),
+    };
+    wire.write_back(&req);
+    if req.state != HELIOS_STREAM_FEEDBACK_REJECTED {
+        // Release both locks before waking the ordinary completion DPC.
+        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
+    }
+    STATUS_SUCCESS
 }
 
 /// Claim a KMD Present buffer for one exact consumer-timeline value. The

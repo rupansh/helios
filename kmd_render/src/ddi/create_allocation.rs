@@ -214,6 +214,8 @@ static RESOURCE_FOREIGN_HANDLES: AtomicU32 = AtomicU32::new(0);
 /// have to exist before anything is tuned for multi-surface opens. Every writer
 /// in this tree sets NumAllocations = 1.
 static MULTI_ENTRY_OPENS: AtomicU32 = AtomicU32::new(0);
+static PRODUCER_OPEN_FAILURES: AtomicU32 = AtomicU32::new(0);
+static PRODUCER_CREATED: AtomicU32 = AtomicU32::new(0);
 
 /// Ticks the per-CreateAllocation breadcrumb throttle (R317 / k-alloc-05).
 static CREATE_BREADCRUMB_TICKS: AtomicU32 = AtomicU32::new(0);
@@ -1864,6 +1866,7 @@ unsafe fn destroy_allocation_ctx(
     ctx: Box<AllocationContext>,
 ) {
     let allocation_handle = (&*ctx as *const AllocationContext) as usize;
+    adapter.producer.remove_allocation(allocation_handle);
     adapter.vidmm_trackers.remove(ctx.vidmm_tracker_cookie);
     // Withdraw the DMA-flip lookup FIRST: after this no Present can resolve
     // this resource id to a handle whose Box is about to be dropped.
@@ -2718,7 +2721,23 @@ unsafe fn create_one(
     // ── VidMm metadata: segment placement + CPU visibility ──────────────────
     let is_direct_scanout = ctx.direct_scanout;
     let ctx_resource_id = ctx.resource_id;
+    if adapter
+        .producer
+        .register_allocation((&*ctx as *const AllocationContext) as usize)
+        .is_err()
+    {
+        crate::adapter::producer::REFUSED.fetch_add(1, Ordering::Relaxed);
+        // SAFETY: unpublished allocation, owned by this create attempt.
+        unsafe { destroy_allocation_ctx(passive, adapter, ctx) };
+        return Err(STATUS_INSUFFICIENT_RESOURCES);
+    }
     info.hAllocation = Box::into_raw(ctx) as HANDLE;
+    let producer_created = PRODUCER_CREATED.fetch_add(1, Ordering::Relaxed) + 1;
+    if producer_created == 1 || producer_created % 64 == 0 {
+        crate::diag::record_named_bytes(b"PrCreate", producer_created);
+        crate::diag::record_named_bytes(b"PrCreateLo", info.hAllocation as usize as u32);
+        crate::diag::record_named_bytes(b"PrCreateHi", (info.hAllocation as usize as u64 >> 32) as u32);
+    }
     // Register AFTER the Box is leaked, so the pointer published here is the
     // one dxgkrnl will hand back.
     if is_direct_scanout {
@@ -2999,6 +3018,9 @@ unsafe fn unwind_opens(adapter: &AdapterContext, args: &mut DXGKARG_OPENALLOCATI
         // SAFETY: j < upto <= NumAllocations, checked by the caller.
         let prev = unsafe { &mut *args.pOpenAllocation.add(j) };
         if let Some(open) = unsafe { take_open_ctx(prev.hDeviceSpecificAllocation) } {
+            adapter
+                .producer
+                .remove_open(prev.hDeviceSpecificAllocation as usize);
             release_present_buffer_capability(adapter, open.present_buffer_capability);
             drop(open);
         }
@@ -3045,6 +3067,16 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
         return STATUS_INVALID_PARAMETER;
     };
     let creator_process = device.creator_process();
+    // SAFETY: DXGKDDI_OPENALLOCATION is documented PASSIVE_LEVEL. The scoped
+    // WDDM2 reference below is acquired and released on this thread.
+    let passive = unsafe { crate::irql::PassiveLevel::assume() };
+    let dxg = match adapter.dxgkrnl() {
+        Ok(dxg) => dxg,
+        Err(_) => {
+            crate::adapter::producer::REFUSED.fetch_add(1, Ordering::Relaxed);
+            return STATUS_DEVICE_NOT_READY;
+        }
+    };
     // SAFETY: valid per the DDI contract; `pOpenAllocation` is a `*mut` array of
     // `NumAllocations` entries whose `hDeviceSpecificAllocation` we fill.
     // The struct has output fields (`Pitch`, `SubresourceOffset`) despite the WDK
@@ -3192,6 +3224,38 @@ pub unsafe extern "C" fn dxgkddi_open_allocation(
             present_diag,
             present_buffer_capability,
         });
+        let registered = crate::adapter::producer::with_allocation_reference(
+            passive,
+            dxg,
+            info.hAllocation,
+            false,
+            |global| adapter.producer.register_open(
+                (&*open as *const OpenAllocationContext) as usize,
+                creator_process,
+                global,
+            ),
+        );
+        if let Err(error) = registered {
+            crate::adapter::producer::REFUSED.fetch_add(1, Ordering::Relaxed);
+            let n = PRODUCER_OPEN_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+            if n == 1 || n % 64 == 0 {
+                crate::diag::record_named_bytes(b"PrOpenF", n);
+                crate::diag::record_named_bytes(b"PrOpenH", info.hAllocation);
+                let reason = match error {
+                    helios_kmd_logic::producer_completion::Error::Invalid => 1,
+                    helios_kmd_logic::producer_completion::Error::Capacity => 2,
+                    helios_kmd_logic::producer_completion::Error::Terminal(status) => status,
+                };
+                crate::diag::record_named_bytes(b"PrOpenWhy", reason);
+            }
+            release_present_buffer_capability(adapter, open.present_buffer_capability);
+            // SAFETY: i is the initialized prefix of this open call.
+            unsafe { unwind_opens(adapter, args, i) };
+            return match error {
+                helios_kmd_logic::producer_completion::Error::Invalid => STATUS_INVALID_HANDLE,
+                _ => STATUS_INSUFFICIENT_RESOURCES,
+            };
+        }
         record_alloc_event(
             resource_id,
             meta.map(|m| m.width).unwrap_or(0),
@@ -3287,6 +3351,7 @@ pub unsafe extern "C" fn dxgkddi_close_allocation(
         if !handle.is_null() {
             crate::diag::record(0x0C37_0000 | ((handle as usize as u32) & 0xFFFF));
             if let Some(open) = unsafe { take_open_ctx(handle) } {
+                adapter.producer.remove_open(handle as usize);
                 release_present_buffer_capability(adapter, open.present_buffer_capability);
                 drop(open);
             }

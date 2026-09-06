@@ -89,6 +89,8 @@ pub struct ContextContext {
     /// nor blocks below DISPATCH; `SpinLock` raises/restores IRQL around the
     /// handful of scalar accesses.
     present_stream_marker: crate::sync::SpinLock<Option<(u32, u32, u64)>>,
+    /// One authenticated, generation-qualified execution stream per context.
+    execution_stream: AtomicU64,
 }
 
 /// Typed borrowed view of a scheduler context handle.
@@ -119,6 +121,24 @@ impl<'a> ContextHandleRef<'a> {
     pub fn creator_process(&self) -> Option<usize> {
         let device = unsafe { self.context.device.as_ref() }?;
         Some(device.creator_process)
+    }
+
+    pub fn execution_stream(&self) -> u32 {
+        helios_kmd_logic::execution_completion::stream(
+            self.context.execution_stream.load(Ordering::Acquire),
+        )
+        .unwrap_or(0)
+    }
+
+    /// Called only after authenticating the registered stream's process/cookie.
+    pub fn bind_execution_stream(&self, boundary: u64) -> bool {
+        self.context
+            .execution_stream
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+                helios_kmd_logic::execution_completion::advances_context(previous, boundary)
+                    .then_some(boundary)
+            })
+            .is_ok()
     }
 
     /// Stash a VALIDATED-shape D4b snapshot descriptor from `DxgkDdiRender`'s
@@ -350,6 +370,7 @@ pub unsafe extern "C" fn dxgkddi_destroy_device(h_device: *mut c_void) -> NTSTAT
         // land nowhere). Its read-ledger page mapping needs nothing here: it
         // rides the MappingTable and was unmapped by the drain above.
         adapter.read_ledger.reclaim_events_for_owner(owner);
+        adapter.producer.remove_device(owner);
         // Sweep exactly this device's slots. A null hDevice would sweep the
         // KMD-owned ones, so the token is minted rather than cast.
         let device_owner = crate::virtio::gpu::DeviceOwner::new(owner);
@@ -408,6 +429,7 @@ pub unsafe extern "C" fn dxgkddi_create_context(
         snap_memory_type: AtomicU32::new(0),
         snap_purpose: AtomicU32::new(0),
         present_stream_marker: crate::sync::SpinLock::new(None),
+        execution_stream: AtomicU64::new(0),
     });
     args.hContext = Box::into_raw(ctx) as HANDLE;
 

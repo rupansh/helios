@@ -25,6 +25,7 @@ mod backing;
 mod kobj;
 mod locks;
 mod read_ledger;
+pub(crate) mod producer;
 mod scanout;
 mod segments;
 mod tracking;
@@ -490,6 +491,7 @@ pub struct AdapterContext {
     /// context is built by value inside `create` and the boot chain's stack
     /// budget has no room for a 4 KiB array (the T3 lesson).
     pub(crate) read_ledger: ReadLedger,
+    pub(crate) producer: producer::ProducerCompletion,
     /// Exact paging-process system-memory leaf PTEs supplied by VidMm for
     /// virtual content transfers. This is the software VA-walk state used by
     /// `DxgkDdiBuildPagingBuffer`, independent of the decorative hardware page
@@ -1059,6 +1061,7 @@ impl AdapterContext {
             scanout_mutex: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             mappings: crate::mapping::MappingTable::new(),
             read_ledger: ReadLedger::new(),
+            producer: producer::ProducerCompletion::new(),
             paging_pte_shadow: crate::ddi::PagingPteShadow::new(),
             system_backings: SystemBackingTable::new(passive),
             vidmm_trackers: VidMmTrackerTable::new(),
@@ -1601,6 +1604,9 @@ impl Drop for AdapterContext {
         self.stop_vsync();
         self.delete_vsync_ex_timer();
         self.stop_hpd();
+        // The transport owns callbacks into producer status. Drop it before
+        // that page, including the RemoveDevice-without-StopDevice path.
+        self.set_virtio(None);
         // Free the contiguous paging-RAM segment. RemoveDevice (which drops the
         // boxed AdapterContext) runs at PASSIVE_LEVEL, where MmFreeContiguousMemory
         // is legal.
@@ -1623,6 +1629,13 @@ impl Drop for AdapterContext {
         // event registration left in the table holds an object reference and
         // must be dropped with the adapter (deref only — nothing to signal).
         self.read_ledger.drop_all_event_references();
+        self.producer.reset();
+        let producer_va = self.producer.take_page();
+        if producer_va != 0 {
+            // SAFETY: PASSIVE adapter removal after all mappings, devices and
+            // transport callbacks; this is the allocation from producer::init.
+            unsafe { MmFreeContiguousMemory(producer_va as *mut _) };
+        }
         let ledger_va = self.read_ledger.take_page_va();
         if ledger_va != 0 {
             // SAFETY: came from MmAllocateContiguousMemory in

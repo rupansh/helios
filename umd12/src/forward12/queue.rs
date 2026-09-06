@@ -180,108 +180,23 @@
 //! §14a.4 point 2 says in as many words that FB-1 is *"shared by both
 //! `pfnRenderCb` users. Land it once, in the fence work."*
 //!
-//! # ⭐⭐ What `pfnExecuteCommandLists` DOES — K-F1, the WDDM submission
+//! # Runtime admission and exact completion
 //!
-//! `DDI_REFERENCE.md` §8.2/§8.3: the driver must submit to the kernel **during**
-//! `pfnExecuteCommandLists`, from the thread that entered the DDI, with a DXGK
-//! context minted at queue creation. All three hold as of K-F1: the DDI forwards
-//! to the engine, optionally **drains** the engine's submission worker, and then
-//! calls `pfnRenderCb` on [`QueueState::h_context`] — synchronously, on the
-//! entering thread. [`submit_wddm_render`] is the one call site;
-//! `knobs12::UMD12_ECL_SUBMIT` (**default ON**, decision D5a) is the arm.
+//! Each ECL commits retained engine work and a generation-qualified stream value
+//! to the queue worker. On the entering DDI thread, the UMD submits HE12 v2 on
+//! the exact runtime context, then queues an unnamed CPU event with
+//! SignalAtSubmission | EnqueueCpuEvent. The worker waits for that admission
+//! before executing, and signals the registered stream after all preceding
+//! queue work. The KMD withholds DMA completion until that exact value retires.
 //!
-//! ⛔⛔ **"optionally" is A1, and it is the DEFAULT.** The drain is
-//! `d3d12_command_queue_acquire_serialized`
-//! (`vkd3d-proton-helios/libs/vkd3d/command.c:25202-25217`): an **untimed**
-//! `pthread_cond_wait` until vkd3d's worker has drained everything queued ahead of
-//! its marker, FIFO — and a `VKD3D_SUBMISSION_WAIT` in that queue resolves through
-//! a second untimed `pthread_cond_wait` (`command.c:1226`). So the drain can park
-//! the application's own thread inside this DDI with no timeout, no counter and no
-//! GPU packet outstanding for TDR. `knobs12::UMD12_ECL_DRAIN` (**default OFF**)
-//! carries the contract argument, what the OFF arm costs — the packet may precede the
-//! frame's `vkQueueSubmit`, so its boundary may name a **prefix** of the frame — and
-//! where the real fix belongs (a WAIT-skipping or bounded acquire in the fork, which
-//! is not this file's).
+//! Present producer callbacks use the same admission pair, including when a
+//! runtime Queue::Wait precedes Present without another ECL. A queue operation
+//! mutex keeps each Render/event pair contiguous on its context. The separate
+//! kernel execution tail survives Present batching and preemption replay.
 //!
-//! ⚠ The OFF arm's **second** cost is gone, and the correction is recorded because it
-//! was the larger of the two. This block used to say there was *"no GPU-completion
-//! boundary at all, because the sample lives inside the acquire"* — which meant the
-//! fence bridge shipped inert on every default build.
-//! `bridge12::sample_queue_fence` samples the same venus boundary through upstream's
-//! `vkd3d_lock_vk_queue`, which enqueues no `VKD3D_SUBMISSION_DRAIN`, so the default
-//! arm now carries a real fence: possibly a prefix, never absent.
-//!
-//! ⚠ **The order of the forward and the acquire is load-bearing.** The engine
-//! `ExecuteCommandLists` comes FIRST and the acquire second; inverting them would
-//! hold vkd3d's `queue_lock` across a call into the same queue.
-//!
-//! The packet carries `HeliosD3D12SubmitCmd` — 16 bytes, magic `'HE12'`, declared
-//! once in `protocol/` per D13. Its `gpu_wire_fence` is a real venus GPU-completion
-//! boundary on **both** knob arms now — exact behind the drain, a possible prefix
-//! without it (`EclFenceNoDrain` is the census of the second case). `0` remains legal
-//! and means what the record's own doc says, *"submit the packet, order it against
-//! nothing"*; with the fence knob ON it is now a **finding** with one counter per
-//! cause rather than the default outcome.
-//! [`ecl_submit_command`] has why 16 is the **minimum** recognisable length and why
-//! the earlier "keep it under 16" reasoning was the wrong lever (the KMD's decode
-//! arms reject on **magic**, not on length).
-//!
-//! ⛔ **The old text here said step 2 of §8.3 — *"obtaining a monotonic completion
-//! watermark for that submission"* — had no existing answer, and that premise is
-//! what kept the gap open.** `KMD_IMPACT.md` §14a replaced it: the KMD's existing
-//! fall-through for a packet with no trusted boundary is
-//! `RetireDomain::IncludingGpu` with `watermark = next_wire_fence` (both in
-//! `kmd_render/src/virtio/gpu/mod.rs`'s WDDM-submission arm — cited by symbol, not
-//! line: that file and `submit_command.rs` are under concurrent edit for the KMD
-//! half of this work list and drifted ~60 lines while this was written), i.e.
-//! *every transport entry enqueued before this WDDM buffer* — conservative, already
-//! correct, and **zero KMD change**. A real per-frame GPU-completion boundary is a
-//! nonzero `gpu_wire_fence`, which needs the ICD export that produces it and the
-//! KMD decode that honours it; both are separate lanes and this record is already
-//! their shape.
-//!
-//! ⛔ The invariant that governs the KMD side is unchanged: *never signal a wire
-//! fence before host completion.*
-//!
-//! # ⛔⛔ What K-F1 settles, and what it very deliberately does not
-//!
-//! **It settles the PLUMBING**, which nothing before it had: that dxgkrnl accepts
-//! `pfnRenderCb` on a D3D12 queue's *legacy* context at all, that the callback
-//! returns success and hands back the three windows, and that nothing bugchecks.
-//! ⭐ The instruments for that are this driver's own, and that is not incidental —
-//! `EclWddmSubmitted`, `EclSubmitRenderFailed` and the `next_cmd=` trace line are
-//! per-process and D3D12-only, in `umd12-<pid>.log`.
-//!
-//! ⛔ **It does NOT settle `PRESENT.md` §12's P7 — whether `DxgkDdiRender` fires on
-//! the D3D12 path — and the counter §14a.4 item 3 named for that is CONFOUNDED.**
-//! `RENDER_COUNT` is adapter-global, incremented from three sites, and DWM's own
-//! D3D11 present path calls `pfnRenderCb` every frame
-//! (`umd/src/forward/present.rs:860`), so it moves continuously with no D3D12
-//! client in existence. §14a.4 now records that, plus the general trap it is the
-//! third instance of: every KMD counter here is adapter-global and DWM is always
-//! running, so attributing anything to one client needs a client-specific arm or
-//! counter. P7 is settled by the record-seen counter on the KMD's decode of
-//! `HeliosD3D12SubmitCmd`, which is D3D12-specific by construction — a separate
-//! lane, reached by the packet this commit submits.
-//!
-//! ⛔ **It does NOT settle whether the application's `ID3D12Fence` became
-//! truthful, and a flat fence-wait reading does NOT mean dxgkrnl refused to order
-//! behind us.** §14a.1's table says a flat reading implies "UV1 ✗"; that inference
-//! is **known false**. The venus shared ring emits *no virtio submission at all*
-//! while it is busier than 1 ms — the command stream is written into the shared
-//! ring with no virtio traffic (`icd/mesa/src/virtio/vulkan/vn_ring.c:630-636`) and
-//! the doorbell is sent only when the host ring advertises IDLE, then only past a
-//! 1 ms limiter (`vn_ring.c:672-690`, `VN_RING_IDLE_TIMEOUT_NS` at `:22`). So
-//! during a D3D12 frame `next_wire_fence` is typically **frozen**, and an unheld
-//! packet's `async_retired_up_to(watermark, …)` is satisfied instantly for a reason
-//! that has nothing to do with dxgkrnl's ordering. ⇒ UV1 needs a deliberate
-//! KMD-side hold scoped to this path, which is a separate lane; the record's
-//! *presence* is what lets that hold find the D3D12 packets instead of stalling
-//! DWM through the adapter-global FIFO.
-//!
-//! ⚠ Which is why the two `Umd12*DelayUs` arms are kept rather than deleted:
-//! `knobs12::UMD12_ECL_DELAY_US` records why its own "delete me" note was
-//! superseded.
+//! Software fence values, CPU signals and shared opens remain runtime-owned.
+//! Native GPU-VA fence placements and queue fence DDIs are explicitly refused.
+//! See docs/dx12/EXECUTION_SYNC.md for the contract and runtime acceptance gaps.
 
 use core::ffi::c_void;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
@@ -314,7 +229,6 @@ use windows::Win32::Graphics::Direct3D12::{
 use super::fence;
 use super::pso;
 use super::tables12::{self, stage, CommandQueueTable, DeviceCoreTable, Filling};
-use crate::bridge12::FenceStatus;
 use crate::{ddi12, device12, log_error, note_refusal, trace_line};
 
 // ---------------------------------------------------------------------------
@@ -516,9 +430,10 @@ impl ContextWindows {
             }
         }
         if render.NewPatchLocationListSize != 0 {
-            if let Some(w) =
-                Window::new(render.pNewPatchLocationList, render.NewPatchLocationListSize)
-            {
+            if let Some(w) = Window::new(
+                render.pNewPatchLocationList,
+                render.NewPatchLocationListSize,
+            ) {
                 self.patches = Some(w);
             }
         }
@@ -610,6 +525,8 @@ pub struct QueueState {
     /// (`umd12/Cargo.toml:146`, `:150`), so no lock in it can be poisoned, and
     /// `PARALLEL.md` §9.3 forbids `.unwrap()` on runtime data regardless.
     windows: Mutex<ContextWindows>,
+    /// Orders admission, worker commit and Render across concurrent ECL calls.
+    execution: Mutex<()>,
 }
 
 /// Engine allocators materialised for one DDI command pool, indexed by command
@@ -913,6 +830,66 @@ pub(crate) unsafe fn present_context(h: ddi12::D3D12DDI_HCOMMANDQUEUE) -> Option
     (!queue.h_context.is_null()).then_some(queue.h_context)
 }
 
+/// Enqueue the exact resource boundary on this queue's engine worker.
+/// # Safety
+/// As queue_state; resource is a live engine object and allocation is its
+/// identity12 allocation. No queue state borrow escapes this function.
+pub(crate) unsafe fn publish_present_producer(
+    h: ddi12::D3D12DDI_HCOMMANDQUEUE,
+    resource: usize,
+    allocation: u32,
+) -> Option<(u32, u32, u64)> {
+    // SAFETY: the caller supplies a live runtime queue private block.
+    let queue = unsafe { queue_state(h) }?;
+    // Admission also matters for Queue::Wait followed directly by Present,
+    // without an intervening ECL. Give this callback its own exact packet.
+    // SAFETY: the live queue retains its creating device.
+    let dev = unsafe { device12::device(queue.h_device) }?;
+    let _execution = queue
+        .execution
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: unnamed manual-reset event, initially unsignaled.
+    let admission =
+        match unsafe { windows::Win32::System::Threading::CreateEventW(None, true, false, None) } {
+            Ok(event) => AdmissionEvent(event),
+            Err(error) => {
+                report_ecl_submit_error(queue, error.code().0);
+                return None;
+            }
+        };
+    // SAFETY: exact live queue/resource/allocation; the worker duplicates the event.
+    let boundary = unsafe {
+        crate::bridge12::publish_producer(
+            queue.engine_queue.as_raw() as usize,
+            resource,
+            allocation,
+            admission.0 .0 as usize,
+        )
+    }?;
+    // SAFETY: Present's entering DDI thread, exact queue context and complete record.
+    let outcome = unsafe {
+        submit_wddm_render(
+            dev,
+            queue,
+            &ecl_submit_command(boundary),
+            "Present producer",
+        )
+    };
+    let result = match outcome {
+        // SAFETY: signal directly follows this packet under the context operation lock.
+        WddmSubmit::Submitted => unsafe { enqueue_runtime_admission(dev, queue, &admission) },
+        WddmSubmit::Refused(hr) => Err(hr),
+        WddmSubmit::Unavailable => Err(E_NOTIMPL),
+    };
+    if let Err(hr) = result {
+        report_ecl_submit_error(queue, hr);
+        return None;
+    }
+    note_refusal(&L2_REFUSALS.present_producer_admitted);
+    Some(boundary)
+}
+
 /// Take a queue's context-window lock, treating a poisoned lock as a live one.
 ///
 /// ⛔ `unwrap_or_else(|e| e.into_inner())`, never `.unwrap()` — the same shape and
@@ -1200,6 +1177,7 @@ unsafe extern "C" fn create_command_queue(
             // window paired with another context's handle would have
             // `pfnRenderCb` record into memory dxgkrnl never lent this context.
             windows: Mutex::new(windows),
+            execution: Mutex::new(()),
         });
     }
     S_OK
@@ -1356,12 +1334,18 @@ unsafe extern "C" fn destroy_command_queue(
         return;
     };
 
-    // ⚠ The context goes first: it is the object the *runtime* tracks against
-    // this queue, and tearing it down while the box still owns the engine queue
-    // keeps the two teardowns independently attributable in the log.
+    // DestroyContextCb drains queued context work. Keep worker admission live
+    // during that call: an unsignaled event can still belong to valid work that
+    // the runtime has not submitted yet. The DDI queue slot is already empty,
+    // so no new operation can acquire this queue through it.
     // SAFETY: `state` is the live box this call took out of the slot, so its
     // `h_rt_queue` and `h_context` are the pair `create_wddm_context` produced.
-    unsafe { destroy_wddm_context(&state) };
+    let hr = unsafe { destroy_wddm_context(&state) };
+    // A successful context destroy has drained all admitted packets. Failure
+    // must cancel remaining admissions and remove the engine device before
+    // Release joins its workers; neither case fabricates stream completion.
+    // SAFETY: the box still owns the engine queue and its registered stream.
+    unsafe { crate::bridge12::cancel_execution(state.engine_queue.as_raw() as usize, hr) };
 
     // Dropping the box releases the engine queue's single reference.
     drop(state);
@@ -1372,24 +1356,24 @@ unsafe extern "C" fn destroy_command_queue(
 /// # Safety
 /// `state` must be a live `QueueState` whose `h_context` came from
 /// [`create_wddm_context`] and has not been destroyed.
-unsafe fn destroy_wddm_context(state: &QueueState) {
+unsafe fn destroy_wddm_context(state: &QueueState) -> ddi12::HRESULT {
     if state.h_context.is_null() {
-        return;
+        return S_OK;
     }
     // SAFETY: `h_device` is the device this queue was created against, and the
     // borrow lives only until the end of this function.
     let Some(dev) = (unsafe { device12::device(state.h_device) }) else {
         note_refusal(&L2_REFUSALS.queue_context_destroy_failed);
-        return;
+        return E_FAIL;
     };
     if dev.um_callbacks.is_null() {
         note_refusal(&L2_REFUSALS.queue_context_destroy_failed);
-        return;
+        return E_FAIL;
     }
     // SAFETY: as `create_wddm_context`.
     let Some(destroy_context_cb) = (unsafe { (*dev.um_callbacks).pfnDestroyContextCb }) else {
         note_refusal(&L2_REFUSALS.queue_context_destroy_failed);
-        return;
+        return E_FAIL;
     };
     let arg = ddi12::D3DDDICB_DESTROYCONTEXT {
         hContext: state.h_context,
@@ -1403,6 +1387,7 @@ unsafe fn destroy_wddm_context(state: &QueueState) {
             log_error!("DestroyCommandQueue: DestroyContext hr={:#010x}", hr as u32);
         }
     }
+    hr
 }
 
 // ---------------------------------------------------------------------------
@@ -1560,8 +1545,7 @@ unsafe extern "C" fn create_command_recorder(
     h_recorder: ddi12::D3D12DDI_HCOMMANDRECORDER_0040,
 ) -> ddi12::HRESULT {
     // SAFETY: the caller guarantees the slot lies in the sized private block.
-    let Some(slot) =
-        (unsafe { Slot::<Boxed<RecorderState>>::from_priv(h_recorder.drv_private()) })
+    let Some(slot) = (unsafe { Slot::<Boxed<RecorderState>>::from_priv(h_recorder.drv_private()) })
     else {
         note_refusal(&L2_REFUSALS.recorder_bad_arg);
         return E_INVALIDARG;
@@ -1644,11 +1628,7 @@ unsafe extern "C" fn command_recorder_set_command_pool_as_target(
         h_pool.pDrvPrivate,
     );
 
-    bind_target(
-        recorder,
-        h_pool.drv_private() as usize,
-        &pool.allocators,
-    );
+    bind_target(recorder, h_pool.drv_private() as usize, &pool.allocators);
 }
 
 /// This recorder's current pool identity, or 0.
@@ -1771,24 +1751,23 @@ pub(crate) unsafe fn recorder_allocator(
     };
     // SAFETY: `engine` is the live bridge device and `list_type` is the exact
     // class carried by the DDI command list being reset.
-    let allocator = match unsafe {
-        engine.CreateCommandAllocator::<ID3D12CommandAllocator>(list_type)
-    } {
-        Ok(allocator) => allocator,
-        Err(e) => {
-            note_refusal(&L2_REFUSALS.pool_allocator_engine_failed);
-            if let Some(n) = budget(&POOL_LOG) {
-                log_error!(
-                    "ResetCommandList: engine CreateCommandAllocator(type={}) failed \
+    let allocator =
+        match unsafe { engine.CreateCommandAllocator::<ID3D12CommandAllocator>(list_type) } {
+            Ok(allocator) => allocator,
+            Err(e) => {
+                note_refusal(&L2_REFUSALS.pool_allocator_engine_failed);
+                if let Some(n) = budget(&POOL_LOG) {
+                    log_error!(
+                        "ResetCommandList: engine CreateCommandAllocator(type={}) failed \
                      hr={:#010x} (x{})",
-                    list_type.0,
-                    e.code().0 as u32,
-                    n + 1,
-                );
+                        list_type.0,
+                        e.code().0 as u32,
+                        n + 1,
+                    );
+                }
+                return RecorderAllocator::EngineFailed;
             }
-            return RecorderAllocator::EngineFailed;
-        }
-    };
+        };
     if slot.set(allocator).is_err() {
         trace_line!(
             "ResetCommandList: lost type-{} allocator init race",
@@ -1819,8 +1798,7 @@ unsafe extern "C" fn destroy_command_recorder(
     h_recorder: ddi12::D3D12DDI_HCOMMANDRECORDER_0040,
 ) {
     // SAFETY: the caller guarantees a live handle from `create_command_recorder`.
-    let Some(slot) =
-        (unsafe { Slot::<Boxed<RecorderState>>::from_priv(h_recorder.drv_private()) })
+    let Some(slot) = (unsafe { Slot::<Boxed<RecorderState>>::from_priv(h_recorder.drv_private()) })
     else {
         note_refusal(&L2_REFUSALS.recorder_bad_arg);
         return;
@@ -1904,8 +1882,7 @@ unsafe extern "C" fn create_command_list(
     h_rt_list: ddi12::D3D12DDI_HRTCOMMANDLIST,
 ) -> ddi12::HRESULT {
     // SAFETY: the caller guarantees the slot lies in the sized private block.
-    let Some(slot) =
-        (unsafe { Slot::<Boxed<CommandListState>>::from_priv(h_list.drv_private()) })
+    let Some(slot) = (unsafe { Slot::<Boxed<CommandListState>>::from_priv(h_list.drv_private()) })
     else {
         note_refusal(&L2_REFUSALS.command_list_bad_arg);
         return E_INVALIDARG;
@@ -1925,13 +1902,10 @@ unsafe extern "C" fn create_command_list(
     // other DDI type must be translated through the queue flags. The resulting
     // API class is also the class that lazily selects this pool's allocator at
     // reset, so the two engine objects cannot disagree.
-    let list_type = if a.Type
-        == ddi12::D3D12DDI_COMMAND_LIST_TYPE_D3D12DDI_COMMAND_LIST_TYPE_BUNDLE
+    let list_type = if a.Type == ddi12::D3D12DDI_COMMAND_LIST_TYPE_D3D12DDI_COMMAND_LIST_TYPE_BUNDLE
     {
         Some(D3D12_COMMAND_LIST_TYPE_BUNDLE)
-    } else if a.Type
-        == ddi12::D3D12DDI_COMMAND_LIST_TYPE_D3D12DDI_COMMAND_LIST_TYPE_DIRECT
-    {
+    } else if a.Type == ddi12::D3D12DDI_COMMAND_LIST_TYPE_D3D12DDI_COMMAND_LIST_TYPE_DIRECT {
         engine_list_type(a.QueueFlags)
     } else {
         None
@@ -1955,9 +1929,7 @@ unsafe extern "C" fn create_command_list(
     // `D3D12_COMMAND_LIST_FLAGS` has no counterpart for — it defines only `NONE`.
     // They are debug-tooling hints, so they are dropped and counted rather than
     // refused.
-    if a.CommandListFlags
-        != ddi12::D3D12DDI_COMMAND_LIST_FLAGS_D3D12DDI_COMMAND_LIST_FLAG_NONE
-    {
+    if a.CommandListFlags != ddi12::D3D12DDI_COMMAND_LIST_FLAGS_D3D12DDI_COMMAND_LIST_FLAG_NONE {
         note_refusal(&L2_REFUSALS.command_list_flags_ignored);
     }
 
@@ -2100,8 +2072,7 @@ unsafe extern "C" fn destroy_command_list(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
 ) {
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
-    let Some(slot) =
-        (unsafe { Slot::<Boxed<CommandListState>>::from_priv(h_list.drv_private()) })
+    let Some(slot) = (unsafe { Slot::<Boxed<CommandListState>>::from_priv(h_list.drv_private()) })
     else {
         note_refusal(&L2_REFUSALS.command_list_bad_arg);
         return;
@@ -2175,9 +2146,7 @@ fn indirect_argument_class(t: ddi12::D3D12DDI_INDIRECT_ARGUMENT_TYPE) -> Indirec
         DDI_DRAW => IndirectArgClass::Action(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW),
         DDI_DRAW_INDEXED => IndirectArgClass::Action(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED),
         DDI_DISPATCH => IndirectArgClass::Action(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH),
-        DDI_DISPATCH_MESH => {
-            IndirectArgClass::Action(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH)
-        }
+        DDI_DISPATCH_MESH => IndirectArgClass::Action(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH),
         DDI_DISPATCH_RAYS => IndirectArgClass::Raytracing,
         // The eight that set `requires_state_template` (`command.c:26350`, `:26356`,
         // `:26363`, `:26371`, `:26377`).
@@ -2514,9 +2483,9 @@ unsafe extern "C" fn create_command_signature(
     // `pArgumentDescs` addresses `api_desc`, which outlives it; `root_signature` is
     // a borrowed engine object (or `None`) and the wrapper takes it by reference;
     // `signature` is writable storage the wrapper initialises on success.
-    if let Err(e) = unsafe {
-        engine.CreateCommandSignature(&desc, root_signature.as_deref(), &mut signature)
-    } {
+    if let Err(e) =
+        unsafe { engine.CreateCommandSignature(&desc, root_signature.as_deref(), &mut signature) }
+    {
         note_refusal(&L2_REFUSALS.command_signature_engine_failed);
         if let Some(n) = budget(&QUEUE_LOG) {
             log_error!(
@@ -2571,101 +2540,14 @@ unsafe extern "C" fn destroy_command_signature(
 // The WDDM submission — K-F1
 // ---------------------------------------------------------------------------
 
-/// The record `pfnExecuteCommandLists` writes into the context's command window.
-///
-/// ⛔ **The shape is not this lane's to choose.** `HeliosD3D12SubmitCmd` is
-/// declared once, in `protocol/src/wddm.rs:539-545`, per `DECISIONS.md` **D13**;
-/// its magic is `'HE12'` (`:378`), its version `1`, and it is **16 bytes** with
-/// every size relation asserted at the declaration
-/// (`protocol/src/wddm.rs:568-579`). ⚠ No assert is restated here on purpose —
-/// `umd12/Cargo.toml`'s own dependency note gives the rule: *"a second copy of an
-/// assert is a second thing that can drift."*
-///
-/// # ⭐⭐ Why 16 bytes, and why the LENGTH is not the guard
-///
-/// ⛔ **`KMD_IMPACT.md` §14a.2 and an earlier draft of this commit both got this
-/// backwards, so the corrected reasoning is written out.** The instruction was
-/// *"`CommandLength` must be < 16 and the payload zeroed"*, on the argument that
-/// the KMD's `dxgkddi_render` decodes a `HeliosPresentRefreshCmd` whenever
-/// `cmd_len >= offset_of!(HeliosPresentRefreshCmd, present_ctx_id)` = 16 — its
-/// `PRESENT_REFRESH_PREFIX` gate — and that its arm *unconditionally* arms a
-/// scanout refresh, which a compute or graphics ECL must never do.
-///
-/// ⚠ **Cited by SYMBOL, not by line, and deliberately.**
-/// `kmd_render/src/ddi/submit_command.rs` and `kmd_render/src/virtio/gpu/mod.rs`
-/// are under active concurrent edit for the KMD half of this same work list; every
-/// line number in them drifted by ~60 while this commit was being written, which is
-/// the citation-drift failure the commit before it was written to fix. `grep` for
-/// the named item instead.
-///
-/// The decode threshold is real; the conclusion is not. That arm's body sits inside
-/// an `if command.is_valid()`, and `is_valid()` compares **magic and version**
-/// (`protocol/src/wddm.rs:484-489`). The same holds for the second decode arm,
-/// which reads a `HeliosPresentRenderCmd` behind its own `PRESENT_RENDER_CMD_PREFIX`
-/// gate. ⇒ **a distinct magic is the actual guard, and the length never was one.** `'HE12'` is not `'HERF'` and is not `'HEPR'`, so both
-/// existing arms decode our 16 bytes and reject them.
-///
-/// And once the guard is the magic, the length inverts: **16 is the *minimum* at
-/// which any KMD arm can recognise this record at all**, because the decode block
-/// that will identify it is the one gated at 16. A shorter payload is not safer,
-/// it is unreadable — the packet would go in and nothing in the kernel could tell
-/// it apart from an empty buffer.
-///
-/// # ⚠ `gpu_wire_fence` — RE-GRADED: 0 was the steady state, and now it is a finding
-///
-/// ⛔ **This field's grading has gone stale THREE times, so all four states are
-/// recorded.** (1) It began as *"0 — the plumbing arm, and it is what K-F1 is"*. (2)
-/// The ICD export landed and made it a real venus wire fence retiring at **host GPU
-/// completion**, sampled inside the drain window, so a zero became one of three named
-/// findings (`EclFenceNoIcd` / `EclFenceNoExport` / `EclFenceRefused`). (3) **A1 gated
-/// the drain OFF by default** and the sample lived inside the acquire, so the default
-/// value went back to **0** for a fifth, differently-named reason
-/// (`EclFenceNoDrain`). (4) `bridge12::sample_queue_fence` reaches the same boundary
-/// through upstream's `vkd3d_lock_vk_queue`, so the default value is a **real fence
-/// again** — one that may name a *prefix* of the frame, with `EclFenceNoDrain`
-/// re-graded to say exactly that.
-///
-/// ⇒ **A zero here means nothing on its own; only the counter beside it does.** Read
-/// the run's `Umd12EclDrain` inventory value first: with it 0, expect
-/// `EclFenceSampled` to carry every submit **and** `EclFenceNoDrain` to equal it —
-/// every boundary is a prefix. With it 1, expect `EclFenceSampled` to carry every
-/// submit, `EclFenceNoDrain` to be 0, and the boundaries to be exact.
-///
-/// Zero remains **legal** and unchanged in meaning — *"submit the packet, order it
-/// against nothing"*, which is why `is_valid()` deliberately does not check the
-/// fence — and it is exactly what the `Umd12EclFence=0` arm submits. ⛔ It is **no
-/// longer** what `Umd12EclDrain=0` submits; that clause was true for one commit and is
-/// corrected here. What changed each time is which value is the default, and therefore
-/// what a reader should conclude from a zero.
-///
-/// ⚠ On the zero arm the packet takes the KMD's fall-through for a boundary-less
-/// submission — `RetireDomain::IncludingGpu` with `watermark = next_wire_fence` (in
-/// `gpu/mod.rs`'s WDDM-submission arm, `grep` `let domain = if stream_boundary`) —
-/// a conservative superset needing no KMD change. ⛔ That superset is also why the
-/// zero arm cannot settle anything about ordering: the venus ring emits no virtio
-/// submission while it is busy, so `next_wire_fence` is typically frozen and an
-/// unheld packet retires instantly. A real boundary is what makes the dependency mean
-/// the frame's own work.
-///
-/// ⛔ **The record's PRESENCE is never conditional on a knob.** `Umd12EclSubmit`
-/// gates the whole `pfnRenderCb` call — packet or no packet — while `Umd12EclFence`
-/// and `Umd12EclDrain` between them gate only the *value of one field*. Presence is
-/// what lets a KMD-side experiment
-/// scope a deliberate hold to the D3D12 path instead of to the adapter-global WDDM
-/// FIFO, where it would stall DWM; a knob that removed the record while keeping the
-/// packet would take that scoping away and leave a packet the kernel cannot
-/// attribute.
-///
-/// ⚠ The fence is **not validated here**, and that is deliberate rather than lax: the
-/// consumer clamps a value at or beyond `next_wire_fence` down to it, so an impossible
-/// future dependency is unrepresentable on the wire and the worst a wrong value can do
-/// is name an earlier boundary and under-wait. The type's own "safety of a
-/// guest-supplied fence" section is the authority.
-fn ecl_submit_command(gpu_wire_fence: u64) -> helios_protocol::HeliosD3D12SubmitCmd {
+/// Exact registered worker boundary for an ECL or Present producer packet.
+fn ecl_submit_command(boundary: (u32, u32, u64)) -> helios_protocol::HeliosD3D12SubmitCmd {
     helios_protocol::HeliosD3D12SubmitCmd {
         magic: helios_protocol::HELIOS_D3D12_SUBMIT_MAGIC,
         version: helios_protocol::HELIOS_D3D12_SUBMIT_VERSION,
-        gpu_wire_fence,
+        ctx_id: boundary.0,
+        value: boundary.1,
+        cookie: boundary.2,
     }
 }
 
@@ -2676,22 +2558,18 @@ fn ecl_submit_command(gpu_wire_fence: u64) -> helios_protocol::HeliosD3D12Submit
 /// different error channels, and collapsing any two would decide the severity of a
 /// refused present by accident.
 ///
-/// ⭐ Three and not two, because the middle one decides whether the runtime is told
-/// at all — see [`report_ecl_submit_error`] for that line and the argument behind
-/// it. An `Option`/`Result` here would have collapsed exactly the distinction that
-/// matters.
+/// Missing prerequisites and callback rejection remain distinguishable for
+/// diagnosis. Both cancel execution and report an error to the runtime.
 pub(crate) enum WddmSubmit {
     /// The packet went in and the windows were re-latched from its out-fields.
     Submitted,
     /// **This driver could not make a packet** — no `pfnRenderCb`, no context, no
-    /// command window, or a window smaller than the payload. Counted, logged, and
-    /// deliberately **never** raised to the runtime — it is the same state
-    /// `Umd12EclSubmit=0` produces on purpose.
+    /// command window, or a window smaller than the payload. The caller counts
+    /// the failure and cancels the queue with E_NOTIMPL.
     Unavailable,
     /// **`pfnRenderCb` refused a packet this driver did make**, carrying dxgkrnl's
-    /// own HRESULT. **The only arm that reaches `pfnSetErrorCb`**, which removes the
-    /// `ID3D12Device` — [`report_ecl_submit_error`] has why that severity is the
-    /// contract and why no knob softens it.
+    /// own HRESULT. The caller cancels execution and passes that error through
+    /// `pfnSetErrorCb`.
     Refused(ddi12::HRESULT),
 }
 
@@ -2795,10 +2673,7 @@ unsafe fn submit_wddm_render<T: Copy>(
         // one above.
         note_refusal(&L2_REFUSALS.ecl_submit_render_cb_missing);
         if let Some(n) = budget(&ECL_LOG) {
-            log_error!(
-                "{label}: pKTCallbacks->pfnRenderCb is absent (x{})",
-                n + 1,
-            );
+            log_error!("{label}: pKTCallbacks->pfnRenderCb is absent (x{})", n + 1,);
         }
         return WddmSubmit::Unavailable;
     };
@@ -2948,6 +2823,12 @@ pub(crate) unsafe fn submit_present_identity(
     // SAFETY: `dev` is the live device `queue` was created against, `queue` is live
     // for this call, and the caller guarantees we are inside `pfnPresent` on the
     // entering thread — `submit_wddm_render`'s three obligations.
+    // Keep an ECL's Render + admission signal contiguous on this context.
+    let _execution = queue
+        .execution
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: runtime-owned context and windows, on the entering Present thread.
     let outcome = unsafe { submit_wddm_render(dev, queue, record, "Present identity") };
     if matches!(outcome, WddmSubmit::Submitted) {
         // ⭐ Counted HERE and not in L8, because this function is present-scoped by
@@ -2999,92 +2880,59 @@ pub(crate) unsafe fn report_present_submit_error(
         note_refusal(&L2_REFUSALS.queue_set_error_unavailable);
         return;
     };
-    // SAFETY: as `submit_present_identity` — the device behind a live queue; the
-    // borrow lives only until the end of this statement.
-    let reported =
-        unsafe { device12::device(queue.h_device) }.is_some_and(|dev| device12::set_error(dev, hr));
-    if !reported {
-        note_refusal(&L2_REFUSALS.queue_set_error_unavailable);
+    report_ecl_submit_error(queue, hr);
+}
+
+struct AdmissionEvent(windows::Win32::Foundation::HANDLE);
+impl Drop for AdmissionEvent {
+    fn drop(&mut self) {
+        // SAFETY: this owns exactly one CreateEvent handle. The worker and
+        // dxgkrnl retain their own references before this owner is dropped.
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
     }
 }
 
-/// Report a **refused** WDDM submission to the runtime.
-///
-/// # ⛔⛔ Which error channel, and why this one — the argument, not the habit
-///
-/// `pfnExecuteCommandLists` returns `VOID`, so its return value is not a channel;
-/// `DDI_REFERENCE.md` §14.2 point 4 states the consequence — *"a stub's only legal
-/// report channel is `pfnSetErrorCb` / `pfnSetCommandListErrorCb` plus its
-/// counter"*. Picking between those two is the whole content of this function, and
-/// this project has already got the choice wrong in the other direction: 49 call
-/// sites once used the **device** callback where the list-scoped one was right
-/// (`device12::set_command_list_error`'s doc has that account, and the two fields
-/// are adjacent in `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062`). So it is argued
-/// here rather than copied.
-///
-/// **It is `pfnSetErrorCb`.** Three reasons, and the first alone settles it:
-///
-/// 1. ⛔ **`pfnSetCommandListErrorCb` quarantines RECORDING, and recording is
-///    over.** Its documented effect is *"the runtime will drop all calls into the
-///    driver which record commands on the specified command list"*. At
-///    `pfnExecuteCommandLists` every list is closed and already handed to the
-///    engine, and the application's `Close()` — the point at which the runtime
-///    surfaces a list error — has already returned. Dropping future recording
-///    calls on such a list reports the failure to nobody.
-/// 2. **It is not one list's failure.** `pfnExecuteCommandLists` is on the
-///    **queue** table (`D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001`,
-///    `DDI_REFERENCE.md` §5) and what failed is the queue's kernel submission for
-///    the whole batch. Naming one arbitrary member of the array would be a claim
-///    about provenance this driver cannot support.
-/// 3. **There is no per-queue error callback in `_0062`.** So the device callback
-///    is the only channel left — the identical conclusion [`fence_operation`]
-///    reaches for the sibling queue-table failure, down to reusing
-///    `QueueSetErrorUnavailable` when the channel itself is absent.
-///
-/// # ⚠ The HRESULT is passed through unnarrowed
-///
-/// `device12::command_list_error_code`'s three-value narrowing is
-/// `pfnSetCommandListErrorCb`'s contract (`CPUEfficiency.md:2143-2158`), not
-/// `pfnSetErrorCb`'s; [`fence_operation`] likewise forwards the engine's raw code.
-/// §9.12 asks a driver to distinguish *app* errors from *driver* errors, and
-/// dxgkrnl refusing a packet this driver built is unambiguously the latter — so
-/// dxgkrnl's own code is both legal and the most informative thing available.
-///
-/// # ⚠ It removes the `ID3D12Device`, unconditionally, and that is the contract
-///
-/// The runtime's response to `pfnSetErrorCb` is *"Removing device due to bad UMD
-/// error"* (`DDI_REFERENCE.md` §9.12 — it is not a log function). That is the right
-/// severity: a refused packet means the frame's fence ordering did not happen and
-/// every later frame's will not either, and a silently untruthful fence is the exact
-/// defect this submission exists to end.
-///
-/// ⛔ **There is deliberately no knob softening this, and one was tried and backed
-/// out.** A `Umd12EclSubmitStrict` gate defaulting OFF existed here for one commit,
-/// on the argument that the first run of an unverified path should yield a
-/// measurement rather than a removed device. `docs/dx12/METHOD.md` §2 Phase 4 retires
-/// that argument by owner directive — *"UMD crashes DWM → No problem, its a dev box,
-/// we diagnose, fix and continue"* — and names the shape it produced: consequence 1,
-/// *"a knob whose default was chosen to keep a run alive rather than to be correct is
-/// a hack wearing a knob's clothes"*, with this exact site as its example. ⇒
-/// optimising for a reading instead of for the contract is the loop being retired,
-/// and the severity ships as the contract states it.
-///
-/// ⚠ The real A/B disable is `Umd12EclSubmit`, which removes the submission itself.
-/// That is a configuration with a stated meaning; a second knob that kept the
-/// submission but hid its failures was not.
-///
-/// ⛔ **And [`WddmSubmit::Unavailable`] still does NOT come here.** That is not a
-/// softening and it does not fall to the same rule: that arm means this driver could
-/// not build a packet at all, which is *the same state the OFF arm of
-/// `Umd12EclSubmit` produces on purpose* — so it cannot coherently be a
-/// device-removing error while that arm is legal. It is counted and logged, which is
-/// AGENTS.md rule 2's requirement, and it leaves a queue that behaves exactly as it
-/// did before this submission existed.
+/// Queue a one-shot CPU event immediately AFTER this ECL's Render packet.
+/// SignalAtSubmission signals when that packet is submitted, before completion;
+/// therefore its own pending completion cannot cycle with the worker's wait.
+/// Prior runtime fence waits must be satisfied before the packet is submitted.
+/// Contract: d3dumddi D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2 and SIGNALFLAGS.
+/// # Safety
+/// Live runtime device/queue, called on the entering ECL or Present DDI thread.
+unsafe fn enqueue_runtime_admission(
+    dev: &device12::HeliosD3D12Device,
+    queue: &QueueState,
+    event: &AdmissionEvent,
+) -> Result<(), ddi12::HRESULT> {
+    if dev.kt_callbacks.is_null() {
+        return Err(E_NOTIMPL);
+    }
+    // SAFETY: the device keeps its runtime-owned callback table alive.
+    let callback =
+        unsafe { (*dev.kt_callbacks).pfnSignalSynchronizationObject2Cb }.ok_or(E_NOTIMPL)?;
+    let mut args = ddi12::D3DDDICB_SIGNALSYNCHRONIZATIONOBJECT2 {
+        hContext: queue.h_context,
+        ..Default::default()
+    };
+    args.Flags.__bindgen_anon_1.Value = 3; // SignalAtSubmission | EnqueueCpuEvent
+    args.__bindgen_anon_1.CpuEventHandle = event.0 .0;
+    // SAFETY: ObjectCount=0, valid owned event, no broadcasts, exact runtime context.
+    let hr = unsafe { callback(dev.h_rt_device.handle, &args) };
+    if hr < 0 {
+        Err(hr)
+    } else {
+        Ok(())
+    }
+}
+
 fn report_ecl_submit_error(queue: &QueueState, hr: ddi12::HRESULT) {
+    // SAFETY: QueueState owns this engine queue throughout error propagation.
+    unsafe { crate::bridge12::cancel_execution(queue.engine_queue.as_raw() as usize, hr) };
+
     // SAFETY: `h_device` is the device this queue was created against; the borrow
     // lives only until the end of this statement.
-    let reported = unsafe { device12::device(queue.h_device) }
-        .is_some_and(|dev| device12::set_error(dev, hr));
+    let reported =
+        unsafe { device12::device(queue.h_device) }.is_some_and(|dev| device12::set_error(dev, hr));
     if !reported {
         note_refusal(&L2_REFUSALS.queue_set_error_unavailable);
     }
@@ -3098,9 +2946,8 @@ fn report_ecl_submit_error(queue: &QueueState, hr: ddi12::HRESULT) {
 /// baseline set (`DDI_REFERENCE.md` §5), and the one queue slot `D12-G5` ever
 /// saw called.
 ///
-/// ⭐ **The WDDM half is here as of K-F1** — the module doc's last section has the
-/// account, [`submit_wddm_render`] the mechanics, and `knobs12::UMD12_ECL_SUBMIT`
-/// the default and the A/B.
+/// Commits the exact worker boundary, submits it on the runtime context, and
+/// queues admission before returning. Failure cancels the engine operation.
 ///
 /// # Safety
 /// `h_queue` must be a live queue handle; `lists` must address `count` readable
@@ -3218,307 +3065,83 @@ unsafe extern "C" fn execute_command_lists(
         );
     }
 
-    // SAFETY: `engine_lists` is a live slice of owned interfaces for the whole
-    // call, and `engine_queue` is the live queue this state owns.
-    unsafe { queue.engine_queue.ExecuteCommandLists(&engine_lists) };
-
-    // ⭐ `bump`, not `note_refusal`: the K-F1 block below always reaches exactly
-    // one `note_refusal` — `EclWddmSubmitted` on the success path, or
-    // `EclNoWddmSubmission` on the OFF/unavailable/refused paths — so this set's
-    // summary is already emitted once on this submit's first occurrence. R911 is
-    // explicit that an already-loud arm must not emit it a second time for one
-    // event; here that would be the whole ~300-counter line twice. The count is
-    // still readable, because it is inside the very summary those calls print.
-    // ⚠ The pre-K-F1 version of this comment named `EclNoWddmSubmission` as the
-    // emitter, which was true when it was the only arm and would now be true only
-    // half the time.
-    L2_REFUSALS.ecl_forwarded.bump();
-
-    // ── K-F1: the WDDM half ──────────────────────────────────────────────────
-    //
-    // `ResourceHeaps.md:1678` requires a kernel submission DURING this DDI, on
-    // the thread that entered it, against a context minted at queue creation
-    // (`DDI_REFERENCE.md` §8.2's three obligations). All three hold here: the
-    // context is `QueueState::h_context`, this is the entering thread, and the
-    // call happens before this function returns.
-    //
-    // ⚠ The callback is not a choice made here — this queue's context is LEGACY,
-    // so the submission is `pfnRenderCb` and `pKTCallbacks->pfnSubmitCommandCb`
-    // (§6.4 scopes it to GPU-VA contexts) is unreachable from this file. The
-    // module doc has why that was decided in `pfnCreateCommandQueue`.
-    //
-    // ⛔⛔ **The knob's default is ON and that is decision D5a**; the OFF arm is the
-    // control arm of the PLUMBING comparison, not a safety valve.
-    // `knobs12::UMD12_ECL_SUBMIT` carries the measured baseline
-    // (`tmp/dx12/gates/G8-r0-settle/`), what the arm does and does not settle, and
-    // why a flat fence-wait reading is not evidence against the design. ⚠ Read once
-    // per process, so the arm cannot change under a run.
-    if crate::knobs12::umd12_ecl_submit() {
-        // ⭐⭐ DRAIN FIRST, and it is a wait for `vkQueueSubmit` — **NOT** for GPU
-        // completion. That distinction is the entire reason this is permitted
-        // where `tmp/dx12/FENCE-BRIDGE-DESIGN.md`'s design **A is REJECTED**: A
-        // blocks the producer until the GPU has finished, which is the
-        // producer-side CPU stall `umd/src/knobs.rs:31-43` forbids and the owner
-        // rejected outright; this blocks only until vkd3d's submission worker has
-        // handed the batch to Vulkan, so no CPU/GPU overlap is lost.
-        //
-        // It is what makes the ORDERING real rather than cautious:
-        // `ID3D12CommandQueue::ExecuteCommandLists` above is ASYNCHRONOUS — it
-        // pushes onto a worker thread — so without the drain the WDDM packet could
-        // be ordered *ahead of* the `vkQueueSubmit` it exists to fence, and the
-        // application's fence would be exactly as untruthful as it is with no
-        // packet at all. Same discipline `HeliosWaitFrameSubmitted` gives the
-        // D3D11 present path (`KMD_IMPACT.md` §14a.2).
-        //
-        // ⛔⛔ **AND IT IS KNOB-GATED, DEFAULT OFF — A1.** The drain is
-        // `d3d12_command_queue_acquire_serialized`
-        // (`vkd3d-proton-helios/libs/vkd3d/command.c:25202-25217`), which
-        // `pthread_cond_wait`s **untimed** until vkd3d's worker has processed
-        // everything already queued ahead of its marker, FIFO — and one of the
-        // things that can be ahead of it is a `VKD3D_SUBMISSION_WAIT`, resolved
-        // through a second untimed `pthread_cond_wait` (`command.c:1226`, reached
-        // from `:23745`). So the ON arm can park the application's own thread
-        // inside this DDI with no timeout, no counter, and no outstanding GPU
-        // packet for TDR to catch. `knobs12::UMD12_ECL_DRAIN` carries the full
-        // argument for why a *counted* ordering gap beats an *uninstrumented*
-        // hang, exactly what the OFF arm costs, and what the real fix is (a
-        // WAIT-skipping or bounded acquire in the fork — not this crate's).
-        //
-        // ⚠ **Do NOT move the drain above `engine_queue.ExecuteCommandLists`.**
-        // The forward deliberately precedes the acquire: taking vkd3d's
-        // `queue_lock` first and then calling into the same queue's
-        // `ExecuteCommandLists` would be a self-deadlock on a non-recursive lock.
-        //
-        // ⭐⭐ AND THE GPU-COMPLETION BOUNDARY IS SAMPLED IN THE SAME WINDOW, which
-        // is why the drain and the sample are one bridge call rather than two.
-        // `helios_venus_queue_gpu_fence` is read AFTER the drain marker has
-        // completed and WHILE both of vkd3d's queue locks are still held; reading a
-        // larger ring seqno than needed only over-orders, while a stale smaller one
-        // yields a fence covering less work than this packet claims, and nothing
-        // inside the ICD export can detect that — only the call's position can.
-        // `bridge12::drain_queue_with_fence` and the C++ site carry the full
-        // argument, including why the release's own empty `vkQueueSubmit2` is
-        // deliberately outside the boundary.
-        //
-        // ⛔ The boundary is a knob (`Umd12EclFence`, **default ON**) because the
-        // record's own declaration requires the zero arm to stay reachable as the
-        // A/B disable for the fence itself. OFF calls the drain with no out-params,
-        // so the export is never even resolved.
-        //
-        // ⛔⛔ **AND THE BOUNDARY IS NOW REACHABLE WITHOUT THE DRAIN — that claim
-        // moved and the old form is quoted because it was load-bearing.** It read:
-        // *"the sample needs the `VkQueue` that only `vkd3d_acquire_vk_queue` hands
-        // back, and it happens inside the one bridge call that performs the acquire,
-        // so the `Umd12EclDrain=0` default arm carries no boundary at all"*. True of
-        // `helios_vkd3d_bridge_drain_queue`, and it meant the fence bridge shipped
-        // inert on every default build. `bridge12::sample_queue_fence` takes the
-        // `vkd3d_queue` mutex through upstream's `vkd3d_lock_vk_queue` instead —
-        // enqueueing no `VKD3D_SUBMISSION_DRAIN` — so the default arm now carries a
-        // real venus boundary that may name a **prefix** of the frame. Three states,
-        // ordered: drained (exact) > undrained (may under-wait) > absent (under-waits
-        // the whole frame).
-        //
-        // ⚠ Exactly ONE fence-CAUSE counter fires per submit on every arm below,
-        // which is what keeps them readable as a partition of `EclForwarded`.
-        // `EclFenceNoDrain` is not one of the causes any more: it is the census of
-        // the undrained arm and fires *beside* a cause. Its doc carries the
-        // re-grading.
-        let mut gpu_wire_fence: u64 = 0;
-        if crate::knobs12::umd12_ecl_drain() {
-            // SAFETY (both arms): `engine_queue` is the live `ID3D12CommandQueue`
-            // this state owns, created by this bridge's own vkd3d engine —
-            // `bridge12::drain_queue`'s stated precondition — and it is borrowed
-            // for the call only.
-            let drained = if crate::knobs12::umd12_ecl_fence() {
-                let (drained, fence, status) = unsafe {
-                    crate::bridge12::drain_queue_with_fence(queue.engine_queue.as_raw() as usize)
-                };
-                // ⛔ One counter per cause, never one for "the fence was 0". A zero is
-                // a LEGAL record value, so the value says nothing on its own and only
-                // the reason is a finding: an absent ICD, an ICD too old for the
-                // export, or an export that ran and declined (its loudest arm being
-                // `ring_idx == 0`, which retires at decode and would lie about GPU
-                // completion).
-                note_refusal(match status {
-                    FenceStatus::Sampled => &L2_REFUSALS.ecl_fence_sampled,
-                    FenceStatus::NoIcd => &L2_REFUSALS.ecl_fence_no_icd,
-                    FenceStatus::NoExport => &L2_REFUSALS.ecl_fence_no_export,
-                    FenceStatus::Refused => &L2_REFUSALS.ecl_fence_refused,
-                    // ⛔ A status this build's mapping does not know = the C++ header
-                    // and `bridge12::FenceStatus` have drifted apart. Loud, not
-                    // absorbed.
-                    FenceStatus::Unknown(_) => &L2_REFUSALS.ecl_fence_status_bad,
-                });
-                if let FenceStatus::Unknown(raw) = status {
-                    if let Some(n) = budget(&ECL_LOG) {
-                        log_error!(
-                            "ExecuteCommandLists: bridge returned fence status {raw}, which this \
-                             build does not know -- vkd3d_bridge.h's HELIOS_VKD3D_FENCE_* and \
-                             bridge12::FenceStatus have drifted (x{})",
-                            n + 1,
-                        );
-                    }
-                }
-                gpu_wire_fence = fence;
-                drained
-            } else {
-                // ⭐ The fence A/B disable, and it is the K-F1 plumbing arm exactly:
-                // same packet, same magic, `gpu_wire_fence = 0`, drain still taken.
-                note_refusal(&L2_REFUSALS.ecl_fence_disabled);
-                // SAFETY: as the sibling arm above — `engine_queue` is the live
-                // `ID3D12CommandQueue` this state owns, created by this bridge's own
-                // vkd3d engine, and it is borrowed for the call only. ⚠ Restated
-                // rather than left to the shared comment 30 lines up: the rule is
-                // that every `unsafe` block carries its own `// SAFETY:`, and a
-                // grep-able check is what enforces it.
-                unsafe { crate::bridge12::drain_queue(queue.engine_queue.as_raw() as usize) }
-            };
-            if !drained {
-                // Counted, and the submission still goes: a failed drain is an
-                // ORDERING risk, not a reason to withhold the packet. Withholding it
-                // would leave the fence untruthful for certain instead of possibly
-                // early, and the counter is what says which run was which.
-                note_refusal(&L2_REFUSALS.ecl_drain_failed);
-            }
-        } else {
-            // ⛔⛔ A1's containment arm, and it is the DEFAULT. No acquire, so no
-            // untimed `pthread_cond_wait` inside this DDI.
-            note_refusal(&L2_REFUSALS.ecl_drain_disabled);
-            if crate::knobs12::umd12_ecl_fence() {
-                // ⭐⭐ **AND THE BOUNDARY IS STILL SAMPLED, WITHOUT THE DRAIN.** This
-                // arm used to carry no boundary at all and count
-                // `EclFenceNoDrain` — which meant the fence bridge shipped INERT on
-                // every default build, `Umd12EclFence`'s ON default resolving to a 0
-                // and the kernel's exact-boundary arm unable to fire. That is not a
-                // containment, it is a deletion.
-                //
-                // `bridge12::sample_queue_fence` takes only the `vkd3d_queue` mutex
-                // (`vkd3d_lock_vk_queue`, upstream, already in this link): no
-                // `VKD3D_SUBMISSION_DRAIN`, no `queue_lock`, no empty
-                // `vkQueueSubmit2`, and a failed lock leaks nothing.
-                //
-                // ⛔ **The cost, stated here and not only in the wrapper: this is an
-                // UNDER-WAIT, not the drained boundary.** Nothing guarantees the
-                // frame's `vkQueueSubmit` has happened when the ring seqno is read,
-                // so the fence may name a PREFIX of the frame. It is strictly better
-                // than no boundary — which under-waits the whole frame — and strictly
-                // worse than a drained one. `EclFenceNoDrain` is what says a run took
-                // it; its doc carries the re-grading.
-                //
-                // ⚠ No lock of this file's is held here: `lock_windows` is taken
-                // inside `submit_wddm_render`, below and after.
-                //
-                // SAFETY: `engine_queue` is the live `ID3D12CommandQueue` this state
-                // owns, created by this bridge's own vkd3d engine —
-                // `bridge12::sample_queue_fence`'s stated precondition — and it is
-                // borrowed for the call only.
-                let (fence, status) = unsafe {
-                    crate::bridge12::sample_queue_fence(queue.engine_queue.as_raw() as usize)
-                };
-                // The same five-way partition as the drained arm, by the same rule:
-                // one counter per CAUSE, never one for "the fence was 0".
-                note_refusal(match status {
-                    FenceStatus::Sampled => &L2_REFUSALS.ecl_fence_sampled,
-                    FenceStatus::NoIcd => &L2_REFUSALS.ecl_fence_no_icd,
-                    FenceStatus::NoExport => &L2_REFUSALS.ecl_fence_no_export,
-                    FenceStatus::Refused => &L2_REFUSALS.ecl_fence_refused,
-                    FenceStatus::Unknown(_) => &L2_REFUSALS.ecl_fence_status_bad,
-                });
-                if let FenceStatus::Unknown(raw) = status {
-                    if let Some(n) = budget(&ECL_LOG) {
-                        log_error!(
-                            "ExecuteCommandLists: bridge returned fence status {raw} from the \
-                             undrained sample, which this build does not know -- \
-                             vkd3d_bridge.h's HELIOS_VKD3D_FENCE_* and bridge12::FenceStatus \
-                             have drifted (x{})",
-                            n + 1,
-                        );
-                    }
-                }
-                // ⭐ The census of the reduced path, fired BESIDE the cause counter
-                // rather than instead of it: the causes still partition
-                // `EclForwarded`, and this says how many of them were sampled with no
-                // drain behind them, i.e. how many boundaries may be prefixes.
-                note_refusal(&L2_REFUSALS.ecl_fence_no_drain);
-                gpu_wire_fence = fence;
-            } else {
-                note_refusal(&L2_REFUSALS.ecl_fence_disabled);
-            }
-        }
-
-        // SAFETY: this is the DDI that owns the submission and we are on the
-        // thread that entered it; `dev` below is the device this queue was created
-        // against, and `queue` is live for this call.
-        let outcome = unsafe { device12::device(queue.h_device) }.map(|dev| unsafe {
-            submit_wddm_render(
-                dev,
-                queue,
-                &ecl_submit_command(gpu_wire_fence),
-                "ExecuteCommandLists",
-            )
-        });
-        match outcome {
-            Some(WddmSubmit::Submitted) => {
-                // ⭐ The success counter moved OUT of `submit_wddm_render` when UP-9
-                // became its second caller: `EclForwarded == EclWddmSubmitted +
-                // EclNoWddmSubmission` is documented as checkable arithmetic, and a
-                // present bumping the same counter would break it silently.
-                note_refusal(&L2_REFUSALS.ecl_wddm_submitted);
-            }
-            // ⛔ `EclNoWddmSubmission` fires for every arm below, including the
-            // refused one: each of them is "a submission was forwarded to the
-            // engine with no WDDM submission behind it", which is exactly what
-            // that counter's own doc says it means. It also keeps
-            // `EclForwarded == EclWddmSubmitted + EclNoWddmSubmission` an
-            // invariant that a single `D3D12 DDI refusals:` line can be checked
-            // against — the counter's doc predicted the two would diverge once
-            // this half landed, and this is that divergence made arithmetic.
-            Some(WddmSubmit::Unavailable) => {
-                note_refusal(&L2_REFUSALS.ecl_no_wddm_submission);
-            }
-            Some(WddmSubmit::Refused(hr)) => {
-                note_refusal(&L2_REFUSALS.ecl_no_wddm_submission);
-                report_ecl_submit_error(queue, hr);
-            }
-            None => {
-                // The device handle this queue was created against no longer
-                // resolves. Expected unreachable — a live queue implies a live
-                // device — and counted in the existing set rather than a new one.
-                note_refusal(&L2_REFUSALS.queue_no_device);
-                note_refusal(&L2_REFUSALS.ecl_no_wddm_submission);
-            }
-        }
-    } else {
-        // ⭐ The OFF arm, and it is reachable on purpose (AGENTS.md rule 8): this
-        // is byte-for-byte the pre-K-F1 behaviour that `tmp/dx12/gates/
-        // G8-r0-settle/` measured, which is what makes the paired comparison a
-        // comparison. `EclNoWddmSubmission` is its readout.
+    let _execution = queue
+        .execution
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // SAFETY: the queue carries its live device and exact runtime context.
+    let Some(dev) = (unsafe { device12::device(queue.h_device) }) else {
         note_refusal(&L2_REFUSALS.ecl_no_wddm_submission);
+        report_ecl_submit_error(queue, E_FAIL);
+        return;
+    };
+    // The worker must wait until the matching Render packet is admitted. Create
+    // its initially unsignaled event now; enqueue the runtime signal after Render.
+    // SAFETY: unnamed manual-reset event, no borrowed security attributes.
+    let admission =
+        match unsafe { windows::Win32::System::Threading::CreateEventW(None, true, false, None) } {
+            Ok(event) => AdmissionEvent(event),
+            Err(error) => {
+                note_refusal(&L2_REFUSALS.ecl_admission_failed);
+                report_ecl_submit_error(queue, error.code().0);
+                return;
+            }
+        };
+    let commands: Vec<usize> = engine_lists
+        .iter()
+        .flatten()
+        .map(|list| list.as_raw() as usize)
+        .collect();
+    // SAFETY: owned list interfaces and event outlive this call. The engine
+    // duplicates the event and retains allocator/command-buffer lifetimes.
+    let boundary = match unsafe {
+        crate::bridge12::execute(
+            queue.engine_queue.as_raw() as usize,
+            &commands,
+            admission.0 .0 as usize,
+        )
+    } {
+        Ok(boundary) => boundary,
+        Err(hr) => {
+            note_refusal(&L2_REFUSALS.ecl_worker_failed);
+            report_ecl_submit_error(queue, hr);
+            return;
+        }
+    };
+    L2_REFUSALS.ecl_forwarded.bump();
+    L2_REFUSALS.ecl_exact_boundary.bump();
+    // SAFETY: required runtime callback stays on the entering DDI thread.
+    match unsafe {
+        submit_wddm_render(
+            dev,
+            queue,
+            &ecl_submit_command(boundary),
+            "ExecuteCommandLists",
+        )
+    } {
+        WddmSubmit::Submitted => {
+            L2_REFUSALS.ecl_wddm_submitted.bump();
+            // SAFETY: same entering thread and exact context as the Render above.
+            // SignalAtSubmission is essential: a completion event here deadlocks.
+            match unsafe { enqueue_runtime_admission(dev, queue, &admission) } {
+                Ok(()) => note_refusal(&L2_REFUSALS.ecl_admission_queued),
+                Err(hr) => {
+                    note_refusal(&L2_REFUSALS.ecl_admission_failed);
+                    report_ecl_submit_error(queue, hr);
+                }
+            }
+        }
+        WddmSubmit::Refused(hr) => {
+            note_refusal(&L2_REFUSALS.ecl_no_wddm_submission);
+            report_ecl_submit_error(queue, hr);
+        }
+        WddmSubmit::Unavailable => {
+            note_refusal(&L2_REFUSALS.ecl_no_wddm_submission);
+            report_ecl_submit_error(queue, E_NOTIMPL);
+        }
     }
 
-    // ⛔⛔ DIAGNOSTIC ARM — INERT BY DEFAULT (`Umd12EclDelayUs` absent = 0 = no
-    // delay, so a run with no knob set is byte-identical to the build that never
-    // heard of it). It is a producer-side CPU stall, which
-    // `umd/src/knobs.rs:31-43` forbids as a *fix*; it is legal here only as a
-    // MEASUREMENT with a question attached.
-    //
-    // ⛔ **KEPT BY K-F1, and the earlier instruction here — "it must be DELETED by
-    // the commit that lands the `pfnRenderCb` WDDM submission" — is SUPERSEDED.**
-    // Deleting it in this commit would have removed the only lever that separates
-    // the two readings the submission above still has to be attributed against:
-    //
-    //   * the app's fence wait grows with THIS delay ⇒ the runtime's advance is
-    //     downstream of this DDI **returning** (the submission is inside the DDI,
-    //     so a delay after it still delays the return);
-    //   * it does not grow here, but a hold the KMD imposes on the DMA packet DOES
-    //     move it ⇒ the advance is downstream of our packet **retiring**, which is
-    //     the ordering K-F1 is built on.
-    //
-    // Only the second is what §14a.1's UV1 asks, no other instrument in this
-    // driver tells them apart, and K-F1 does not answer it: a submission that
-    // exists is not evidence that dxgkrnl orders anything behind it. ⇒ this arm
-    // retires with UV1, not with the callback.
-    // `knobs12::UMD12_ECL_DELAY_US` carries the full table and the citations.
+    // Existing diagnostic return delay; never used as completion evidence.
     let ecl_delay_us = crate::knobs12::umd12_ecl_delay_us();
     if ecl_delay_us != 0 {
         note_refusal(&L2_REFUSALS.ecl_delayed);
@@ -3627,293 +3250,51 @@ impl FenceOp {
     }
 }
 
-/// The body behind `pfnSignalFence` and `pfnWaitForFence`.
-///
-/// ⭐ **`PhysicalAdapterMask` is an OUT parameter** — `d3d12umddi.h:2716` marks it
-/// `// Out:` and `DDI_REFERENCE.md` §10.2 spells out what it means: the *driver*
-/// tells the runtime which adapters the operation must be broadcast to. On
-/// single-adapter Helios that is `1`, and it is written on **every** path,
-/// including the refusals, because the runtime reads the field back regardless
-/// and leaving its own struct untouched turns "we could not answer" into whatever
-/// was there.
-///
-/// ⚠ These forward to the **engine** fence, not to the kernel.
-/// `DDI_REFERENCE.md` §10.3: there is no CPU-signal and no CPU-wait DDI, and
-/// these two are *ordering instructions to the driver's own pipeline* — the
-/// kernel-side monitored-fence signal/wait is the runtime's. §14.0 also measured
-/// that WARP was **never** called here across 20 frames of
-/// `ID3D12CommandQueue::Signal` + `SetEventOnCompletion`, so a zero reading on
-/// these two is the expected shape rather than evidence they do not work. ⛔ It
-/// is equally not evidence that they *do*: a zero reading proves nothing about a
-/// path, and WARP is one software-scheduled implementation rather than the
-/// contract.
-///
-/// ⛔⛔ **The two directions are NOT symmetric, and that asymmetry is the whole
-/// shape of this function.** A signal can only advance a timeline, so forwarding
-/// it is always safe. A **wait** on the engine fence for a value the engine
-/// timeline can never reach does not fail — it blocks that vkd3d queue forever.
-/// `fence::FenceState`'s module doc has the two reachable ways the shadow gets
-/// behind the runtime's fence (a `CreateFence` initial value and a CPU
-/// `ID3D12Fence::Signal`, neither of which reaches this DDI). ⇒ a wait above the
-/// watermark this driver has itself signalled is **not forwarded**. Read
-/// `fence.rs`'s module doc before changing either arm — the cost of that choice is
-/// named there too.
-///
-/// # ⛔⛔ S-2: a dropped wait has TWO arms, and only one of them may be quiet
-///
-/// A dropped GPU wait is *wrong pixels, silently* whenever the app really needed
-/// the ordering, and this driver's DMA packets carry no GPU commands, so a `Wait`
-/// enforced only in the kernel orders nothing at all. The single
-/// `FenceWaitNotForwarded` counter that used to absorb every drop therefore could
-/// not distinguish a correct no-op from a correctness failure. It is split:
-///
-/// * **`FenceWaitRuntimeOwned`** — this driver has issued *no* signal on that
-///   fence ([`fence::FenceState::driver_signals_issued`] is false). The value's
-///   whole provenance is the runtime's: a `CreateFence(InitialValue = N)` the DDI
-///   never delivers, or a CPU `ID3D12Fence::Signal` §10.3 says never reaches the
-///   driver — both **already satisfied**, so dropping is exactly right, and
-///   `CreateFence(1)` + `queue->Wait(f, 1)` is a common idiom. ⛔ Quiet, because
-///   answering a legal call with `pfnSetErrorCb` means *"Removing device due to
-///   bad UMD error"* (`descriptors.rs`'s scar). ⚠ Its grading records the
-///   indistinguishable bad case.
-/// * **`FenceWaitNotForwarded`** — this driver *has* signalled that fence and is
-///   being asked to wait beyond what it issued. **Loud**: there is no reading
-///   under which dropping this is correct, so it goes to `pfnSetErrorCb`.
-///
-/// ⛔⛔ **THE WATERMARK GATE IS ALSO WHAT KEEPS THE ECL DRAIN FROM DEADLOCKING, and
-/// that coupling is not obvious from either site.** A forwarded wait becomes a
-/// `VKD3D_SUBMISSION_WAIT` on vkd3d's worker queue, resolved by an **untimed**
-/// `pthread_cond_wait` (`command.c:1226`), and `pfnExecuteCommandLists`' drain waits
-/// FIFO behind it (`:25216-25217`). The reason that is not a permanent hang today is
-/// this gate: a forwarded wait for `V` implies some `pfnSignalFence(V' >= V)` was
-/// **issued earlier**, hence enqueued earlier on its own queue, so the dependency
-/// graph follows issue order and cannot contain a cycle. ⇒ **any change that
-/// forwards waits above the watermark — the obvious "fix" for the
-/// `FenceWaitNotForwarded` gap — must land together with a bounded or WAIT-skipping
-/// acquire in the fork.** `knobs12::UMD12_ECL_DRAIN` carries the same note from the
-/// drain's side.
-///
-/// ⛔ **`pfnSetErrorCb`, not `pfnSetCommandListErrorCb`, and that is decided by
-/// the TABLE and not by severity.** `pfnWaitForFence` is on
-/// `D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001` — there is no command list to
-/// quarantine and no per-queue error callback in
-/// `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062` — which is the identical conclusion
-/// [`report_ecl_submit_error`] reaches for the sibling queue-table failure and the
-/// same one the engine-failure path below already takes. The list-scoped callback
-/// sits one field below the device one and using it here would report a queue's
-/// failure against an arbitrary list, or against no list at all.
-///
+/// Native queue fence operations cannot be implemented by inventing an engine
+/// fence: CreateFence gives no runtime sync-object handle, CPU mapping or initial
+/// value. Software runtime waits/signals are enforced at the ECL context edges.
+/// If a workload enters these native DDIs, fail explicitly instead of dropping
+/// a wait or forwarding it to an unrelated timeline.
 /// # Safety
-/// `h_queue` must be a live queue handle and `op_arg` must address one writable
-/// `D3D12DDIARG_FENCE_OPERATION` the runtime owns.
+/// Live queue and one writable runtime fence-operation argument.
 unsafe fn fence_operation(
     which: FenceOp,
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     op_arg: *mut ddi12::D3D12DDIARG_FENCE_OPERATION,
 ) {
-    // ⭐⭐ THE ENTRY IS COUNTED, per direction, as the FIRST statement — above even
-    // the null check, because the question it answers is *"did the runtime enter this
-    // slot"* and a refused argument is still an entry.
-    //
-    // ⛔ This is S-2's instrument and it is not a duplicate of the six counters
-    // below. `KMD_IMPACT.md` §14a.5 and the 83rd session both state *"`pfnSignalFence`
-    // is never called"*, resting on `FenceSignalForwarded = 0` plus *"no trace line
-    // ever emitted"* — and the trace line is gated on `Umd12Trace`, which is OFF by
-    // default, so the second half of that evidence was unavailable on every default
-    // run. The remaining counters cannot substitute: `FenceOpBadArg`,
-    // `FenceOpFenceMissing` and `FenceOpEngineFailed` are SHARED between the two
-    // directions, so no arithmetic over them recovers "how many times did the runtime
-    // enter `pfnSignalFence`". These two do, in one number each, with no knob in the
-    // path. `METHOD.md` §5's *"trusting a zero"* is the anti-pattern they close.
     note_refusal(match which {
         FenceOp::Signal => &L2_REFUSALS.fence_signal_entered,
         FenceOp::Wait => &L2_REFUSALS.fence_wait_entered,
     });
-
     if op_arg.is_null() {
         note_refusal(&L2_REFUSALS.fence_op_bad_arg);
         return;
     }
-    // SAFETY: non-null per the check; the DDI declares it a writable pointer to
-    // one struct the runtime owns for the duration of the call.
+    // SAFETY: checked writable argument; PhysicalAdapterMask is an output.
     let op = unsafe { &mut *op_arg };
-    // ⛔ Written before anything can fail — see the doc above.
     op.PhysicalAdapterMask = 1;
-
-    // SAFETY: the caller guarantees a live handle from `create_command_queue`.
+    // SAFETY: live queue and fence handles supplied by the runtime.
     let Some(queue) = (unsafe { queue_state(h_queue) }) else {
         note_refusal(&L2_REFUSALS.fence_op_bad_arg);
         return;
     };
-    // SAFETY: `op.Fence` is the handle the runtime associated with a
-    // `pfnCreateFence` on this device; `fence_state` borrows the fence's state
-    // for the rest of this call only.
-    let Some(fence_state) = (unsafe { fence::fence_state(op.Fence) }) else {
+    // SAFETY: runtime supplies a live fence private block for this operation.
+    let valid =
+        unsafe { fence::fence_state(op.Fence) }.is_some_and(|f| f.belongs_to(queue.h_device));
+    if !valid {
         note_refusal(&L2_REFUSALS.fence_op_fence_missing);
+        report_ecl_submit_error(queue, E_INVALIDARG);
         return;
-    };
-
-    // ⚠ Emitted before either arm can return, so a refused wait is as visible as
-    // a forwarded one. `pDrvPrivate` is what ties this line to L7's
-    // `CreateFence: valueVA=… monitoredVA=… flags=…` for the SAME fence — the
-    // runtime hands the driver no other name for it (`FENCE-BRIDGE-DESIGN.md`
-    // §1.3), so without it two fences in one process are indistinguishable here.
-    trace_line!(
-        "{}: value={} fence={:p}",
-        which.name(),
-        op.Value,
-        op.Fence.drv_private(),
-    );
-
-    match which {
-        // ⚠ The watermark is raised BEFORE the engine call — `note_signal`'s doc
-        // has the ordering argument.
-        FenceOp::Signal => fence_state.note_signal(op.Value),
-        FenceOp::Wait => {
-            if !fence_state.signal_reachable(op.Value) {
-                // ⛔ THE SPLIT — see this function's S-2 section. Which arm a dropped
-                // wait takes is decided by whether this driver is on that fence's
-                // engine timeline at all, because that is the only thing the DDI
-                // makes observable.
-                if fence_state.driver_signals_issued() {
-                    // ⛔⛔ COUNTED AND LOGGED, **not** device-removing — and the
-                    // severity was WRONG until 2026-08-07, on the one pattern the
-                    // stated target depends on.
-                    //
-                    // The retired text here read *"There is no reading under which
-                    // dropping it is correct"*, and reported `E_FAIL` through
-                    // `pfnSetErrorCb`, which removes the whole `ID3D12Device`
-                    // (`DDI_REFERENCE.md:2157`, `D3D12Core.dll`: *"Removing device due
-                    // to bad UMD error."*). ⛔ **This module's OWN doc names the
-                    // reading it says does not exist**, ~3900 lines up: a legal
-                    // wait-before-signal — `queueB->Wait(f, N)` enqueued *before*
-                    // `queueA->Signal(f, N)`, which D3D12 permits — is above the
-                    // watermark at the instant it arrives, on a fence this driver
-                    // *has* signalled before. `signals_issued > 0 && Value >
-                    // watermark` is therefore reached **deterministically, with no
-                    // race**, by an ordinary async-compute frame. Time Spy's
-                    // async-compute subtest is exactly that shape.
-                    //
-                    // ⛔ The two cases this predicate covers are INDISTINGUISHABLE
-                    // here, and only one of them is a fault:
-                    //   (a) a wait for a value this driver will never signal — a real
-                    //       unsatisfiable ordering request;
-                    //   (b) a wait for a value this driver will signal microseconds
-                    //       later — legal, common, and NOT an error of any kind.
-                    // Removing the device answers (b) with *"bad UMD error"* and makes
-                    // every affected application fail to run at all.
-                    //
-                    // ⚠ This is NOT a knob default chosen for survivability
-                    // (`METHOD.md` §2 Phase 4 forbids that, and it is why
-                    // `report_ecl_submit_error`'s softening knob was backed out). The
-                    // distinction is that Phase 4 forbids softening a severity the
-                    // CONTRACT requires. No DDI contract requires this one: the driver
-                    // invented it, and it misclassifies a legal application call as a
-                    // driver fault. `pfnSetErrorCb`'s severity is reserved for *"this
-                    // UMD is broken"*, which is not what happened.
-                    //
-                    // ⭐ What the loud severity was actually defending against — a
-                    // SILENT drop yielding wrong pixels *with a score* — is fully
-                    // discharged by the counter plus the log line below. Device
-                    // removal adds nothing to attribution and subtracts the entire
-                    // run, including the run that would let anyone read the counter.
-                    //
-                    // ⛔ Forwarding the wait instead is the real fix and is NOT
-                    // available here: an engine wait for a value the engine timeline
-                    // cannot reach never completes, and `PENDING.md`'s wave-1
-                    // correction 1 proves forwarding above the watermark destroys the
-                    // acyclicity that keeps `vkd3d_acquire_vk_queue`'s drain from
-                    // hanging — so it must land TOGETHER with a bounded/WAIT-skipping
-                    // acquire. Until then this stays a NAMED, COUNTED ordering gap:
-                    // `PENDING.md` §S-2, whose grading carries it.
-                    note_refusal(&L2_REFUSALS.fence_wait_not_forwarded);
-                    if let Some(n) = budget(&FENCE_OP_LOG) {
-                        log_error!(
-                            "WaitForFence: value={} is above this driver's signalled watermark on a \
-                             fence it HAS signalled -- real cross-queue ordering that cannot be \
-                             forwarded (an engine wait for an unreachable value never completes). \
-                             DROPPED and counted; this is S-2's ordering gap, and a legal \
-                             wait-before-signal lands here too (x{})",
-                            op.Value,
-                            n + 1,
-                        );
-                    }
-                } else {
-                    // ⚠ QUIET, and correct for the reachable-and-legal case: this
-                    // driver has never signalled this fence, so the value can only
-                    // have come from a `CreateFence(InitialValue)` or a CPU
-                    // `ID3D12Fence::Signal` — both of which the runtime already
-                    // considers satisfied. `CreateFence(1)` + `queue->Wait(f, 1)` is a
-                    // common idiom and must not remove the device.
-                    //
-                    // ⛔ The counter's grading carries the case this cannot tell apart
-                    // (a CPU signal that has not happened YET), because that one is a
-                    // genuine gap with no channel to report it through and no way to
-                    // forward it without hanging the engine queue forever.
-                    note_refusal(&L2_REFUSALS.fence_wait_runtime_owned);
-                    if let Some(n) = budget(&FENCE_OP_LOG) {
-                        log_error!(
-                            "WaitForFence: value={} on a fence this driver has never signalled -- \
-                             its whole timeline is the runtime's (initial value or CPU Signal), so \
-                             the wait is dropped as already-satisfied (x{})",
-                            op.Value,
-                            n + 1,
-                        );
-                    }
-                }
-                return;
-            }
-        }
     }
-
-    // SAFETY: both take a borrowed fence and a by-value `u64`; the queue and the
-    // fence are live for the call.
-    let result = unsafe {
-        match which {
-            FenceOp::Signal => queue.engine_queue.Signal(fence_state.engine(), op.Value),
-            FenceOp::Wait => queue.engine_queue.Wait(fence_state.engine(), op.Value),
-        }
-    };
-    let Err(e) = result else {
-        // ⭐⭐ THE SUCCESS PATH, counted — and it was not, until the F1 round.
-        // `tmp/dx12/gates/G8-r0/RESULT.md` claimed *"the queue-table `Signal`
-        // path ran"* on the strength of `FenceOpEngineFailed = FenceOpBadArg =
-        // FenceWaitNotForwarded = 0`, i.e. three ZERO readings, while this
-        // branch incremented nothing and logged nothing. A zero reading is not
-        // evidence a path works — this file says so 40 lines above, and
-        // `fence.rs:61-64` says it again — so the claim was unsupported and the
-        // whole A-vs-C decision (`FENCE-BRIDGE-DESIGN.md` §5) rests on it.
-        note_refusal(match which {
-            FenceOp::Signal => &L2_REFUSALS.fence_signal_forwarded,
-            FenceOp::Wait => &L2_REFUSALS.fence_wait_forwarded,
-        });
-        return;
-    };
-
-    let hr = e.code().0;
-    note_refusal(&L2_REFUSALS.fence_op_engine_failed);
-    if let Some(n) = budget(&FENCE_OP_LOG) {
+    note_refusal(&L2_REFUSALS.fence_native_refused);
+    if budget(&FENCE_OP_LOG).is_some() {
         log_error!(
-            "{}: engine failed value={} hr={:#010x} (x{})",
+            "{}: native fence operation value={} is unsupported on the software context",
             which.name(),
-            op.Value,
-            hr as u32,
-            n + 1,
+            op.Value
         );
     }
-    // ⭐ This slot returns `VOID`, so `pfnSetErrorCb` is the only channel it has
-    // (`DECISIONS.md` §7.6) and it is **device**-scoped: there is no per-queue
-    // error callback in `D3D12DDI_CORELAYER_DEVICECALLBACKS_0062`. A queue whose
-    // fence ordering silently did not happen is a correctness failure the
-    // application must be told about, which is what separates this from the
-    // tiled-resource refusals above.
-    // SAFETY: `h_device` is the device this queue was created against; the
-    // borrow lives only until the end of this block.
-    let reported = unsafe { device12::device(queue.h_device) }
-        .is_some_and(|dev| device12::set_error(dev, hr));
-    if !reported {
-        note_refusal(&L2_REFUSALS.queue_set_error_unavailable);
-    }
+    report_ecl_submit_error(queue, E_NOTIMPL);
 }
 
 /// `pfnSignalFence`.
@@ -4197,35 +3578,7 @@ pub(crate) struct L2Refusals {
     /// list, and the whole submit was refused rather than partially forwarded.
     /// **Expected 0** — a list the runtime submits is a list this driver created.
     execute_command_lists_list_missing: RefusalCounter,
-    /// A submission was forwarded to the engine with **no WDDM submission behind
-    /// it**: no `pfnSubmitCommandCb`, no `pfnRenderCb`, no DMA fence.
-    ///
-    /// ⛔⛔ **RE-GRADED BY K-F1, and the old grading is quoted because it is the
-    /// kind of claim that goes stale silently.** It read: *"Expected non-zero on
-    /// every frame, and it is this lane's largest deliberate gap"*, on the
-    /// then-true premise that the monotonic completion watermark
-    /// (`DDI_REFERENCE.md` §8.3 step 2) had no answer. `KMD_IMPACT.md` §14a
-    /// replaced that premise — the KMD's existing fall-through
-    /// (`RetireDomain::IncludingGpu`, `watermark = next_wire_fence`, in
-    /// `kmd_render/src/virtio/gpu/mod.rs`'s WDDM-submission arm) **is** the
-    /// watermark, conservatively — so the gap is closed with zero KMD change and
-    /// this counter's meaning inverts.
-    ///
-    /// ⭐ **Expected 0 on a submitting workload with the default knob**
-    /// (`Umd12EclSubmit` absent = ON). Its complement is
-    /// [`Self::ecl_wddm_submitted`], and the two partition every forward exactly:
-    /// `EclForwarded == EclWddmSubmitted + EclNoWddmSubmission`. The three ways it
-    /// can still be non-zero, each with its own counter beside it: the knob is OFF
-    /// (the deliberate control arm), a precondition was missing
-    /// (`EclSubmit*`), or dxgkrnl refused the packet
-    /// (`EclSubmitRenderFailed`).
-    ///
-    /// ⚠ The *callback* was never the open question and still is not:
-    /// `create_command_queue` mints a legacy context, so this submission is
-    /// `pfnRenderCb` and `pKTCallbacks->pfnSubmitCommandCb` — which §6.4 scopes to
-    /// GPU-VA contexts — is not reachable from here without re-opening queue
-    /// creation. ⛔ And the invariant that governs the KMD side is unchanged:
-    /// never signal a wire fence before host completion.
+    /// ECL could not submit its required HE12 packet. Execution is cancelled; expected zero.
     ecl_no_wddm_submission: RefusalCounter,
     /// The queue table's `pfnUnused` was actually called. ⛔ **Expected 0** — the
     /// header names it unused (`DDI_REFERENCE.md` §14.1.1 classifies it
@@ -4250,83 +3603,22 @@ pub(crate) struct L2Refusals {
     /// behind it. **Expected 0** — L7's `pfnCreateFence` either stores one or
     /// fails.
     fence_op_fence_missing: RefusalCounter,
-    /// `ID3D12CommandQueue::Signal` or `::Wait` on the engine failed, and the
-    /// failure was raised to the runtime through `pfnSetErrorCb`. **Expected 0.**
+    /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     fence_op_engine_failed: RefusalCounter,
-    /// `pfnWaitForFence` asked for a `Value` above the watermark **on a fence this
-    /// driver HAS signalled**, so real cross-queue ordering was dropped — and the
-    /// drop was raised to the runtime through `pfnSetErrorCb`, which removes the
-    /// `ID3D12Device`.
-    ///
-    /// ⛔⛔ **Expected 0, and RE-GRADED: this counter used to absorb three cases and
-    /// was graded *"may legitimately be non-zero"*.** It no longer does. The benign
-    /// two moved to `FenceWaitRuntimeOwned`, and what is left is the one case with no
-    /// honest reading: this driver is on that fence's engine timeline and is being
-    /// asked for a value it has not issued. Forwarding would block the vkd3d queue
-    /// forever; dropping silently produces wrong pixels. ⇒ it is loud.
-    ///
-    /// ⛔ The old grading also named a fix that **cannot exist** — *"until §10.4's
-    /// `pfnWaitForSynchronizationObjectFromGpuCb` half exists"*. §10.4's own
-    /// correction block (`DDI_REFERENCE.md:2306-2331`) struck that design because no
-    /// such callback can name a `D3D12DDI_HFENCE`, and `KMD_IMPACT.md` §14a.5
-    /// forbids it. Nothing pending closes this gap; `fence.rs`'s module doc has what
-    /// would.
+    /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     fence_wait_not_forwarded: RefusalCounter,
-    /// `pfnSignalFence` reached its engine forward and
-    /// `ID3D12CommandQueue::Signal` returned success.
-    ///
-    /// ⚠ **Expected NON-ZERO once any D3D12 workload signals a fence.**
-    ///
-    /// ⛔ **RE-GRADED: a zero here does NOT mean "the runtime never enters this
-    /// slot".** That inference was in this doc and it was unsound — a zero is equally
-    /// consistent with entering and being diverted by `FenceOpBadArg`,
-    /// `FenceOpFenceMissing` or `FenceOpEngineFailed`, all three of which are shared
-    /// with `pfnWaitForFence` and so cannot be attributed to a direction.
-    /// **`FenceSignalEntered` is the counter that answers it**, and it was added
-    /// (S-2) precisely because this one was being read as if it did. `METHOD.md` §5,
-    /// *"trusting a zero"*.
-    ///
-    /// ⚠ `DDI_REFERENCE.md` §14.0's WARP reading — WARP never entering this slot
-    /// across 20 frames of `ID3D12CommandQueue::Signal` + `SetEventOnCompletion` — is
-    /// still the expected shape, and still not evidence either way about this driver.
-    ///
-    /// ⭐ **Why a success counter exists at all**, against this file's own
-    /// convention that counters name refusals: until it did, `pfnSignalFence`
-    /// succeeding was **invisible**. `fence_operation` incremented nothing and
-    /// logged nothing on its success path, so `tmp/dx12/gates/G8-r0/RESULT.md`'s
-    /// claim that *"the queue-table `Signal` path ran"* rested on three **zero**
-    /// readings — `FenceOpEngineFailed`, `FenceOpBadArg`, `FenceWaitNotForwarded`
-    /// — and this project has twice written, in this very file
-    /// (`queue.rs`'s `fence_operation` doc) and in `fence.rs:61-64`, that a zero
-    /// reading is not evidence a path works.
+    /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     fence_signal_forwarded: RefusalCounter,
-    /// `pfnWaitForFence` reached its engine forward and
-    /// `ID3D12CommandQueue::Wait` returned success. Same grading and the same
-    /// reason for existing as [`Self::fence_signal_forwarded`].
-    ///
-    /// ⚠ Expected non-zero only on a workload that waits on a value this driver
-    /// has itself signalled: everything above that watermark is diverted by
-    /// `FenceWaitRuntimeOwned` (benign) or `FenceWaitNotForwarded` (loud) before it
-    /// can reach the forward. ⇒ read all three together —
-    /// `FenceWaitForwarded = 0` with `FenceWaitRuntimeOwned > 0` is the shadow-fence
-    /// policy working on runtime-owned timelines, whereas
-    /// `FenceWaitNotForwarded > 0` is dropped ordering and removes the device.
-    /// ⛔ And read `FenceWaitEntered` first: only that one distinguishes any of this
-    /// from a slot the runtime never enters.
+    /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     fence_wait_forwarded: RefusalCounter,
-    /// `pfnExecuteCommandLists` forwarded a submit to the engine's
-    /// `ID3D12CommandQueue::ExecuteCommandLists`.
-    ///
-    /// ⚠ **Expected non-zero on any workload that submits.** It is the
-    /// denominator for `EclNoWddmSubmission` — which today tracks it exactly,
-    /// one for one, because every forward is missing the WDDM half — and it is
-    /// what makes that ratio a fact rather than an assumption once the WDDM half
-    /// lands and the two counts diverge.
-    ///
-    /// ⭐ Same reason for existing as [`Self::fence_signal_forwarded`]: a submit
-    /// that reached the engine left no trace of its own, so "the engine was
-    /// given the work" was inferred from the pixels rather than counted.
+    /// Retained engine ECL committed to the worker FIFO; not proof of GPU completion.
     ecl_forwarded: RefusalCounter,
+    ecl_admission_queued: RefusalCounter,
+    ecl_admission_failed: RefusalCounter,
+    ecl_worker_failed: RefusalCounter,
+    ecl_exact_boundary: RefusalCounter,
+    fence_native_refused: RefusalCounter,
+    present_producer_admitted: RefusalCounter,
     /// `Umd12FenceSignalDelayUs` was non-zero and `pfnSignalFence` slept before
     /// returning. **Expected 0** on any run that did not deliberately set the
     /// knob; see `knobs12::UMD12_FENCE_SIGNAL_DELAY_US` for the question it is
@@ -4338,46 +3630,7 @@ pub(crate) struct L2Refusals {
     /// returning. **Expected 0** on any run that did not deliberately set the
     /// knob; see `knobs12::UMD12_ECL_DELAY_US`.
     ecl_delayed: RefusalCounter,
-    /// ⭐⭐ **K-F1's success counter: a `pfnRenderCb` WDDM submission carrying
-    /// `HeliosD3D12SubmitCmd` went in on this queue's context and dxgkrnl accepted
-    /// it.**
-    ///
-    /// ⛔ **Expected NON-ZERO on every submitting workload with the default knob**
-    /// (`Umd12EclSubmit` absent = ON), and it is the UMD-side readout of
-    /// `KMD_IMPACT.md` §14a.2 K-F1. A **zero** here on a workload that draws means
-    /// one of three things and they are distinguishable by their own counters:
-    /// the knob is OFF (`EclNoWddmSubmission` tracks `EclForwarded` exactly, as it
-    /// did before K-F1), a precondition is missing (`EclSubmitNoRenderCb` /
-    /// `EclSubmitNoContext` / `EclSubmitNoCmdWindow` / `EclSubmitWindowSmall`), or
-    /// dxgkrnl refused every packet (`EclSubmitRenderFailed`).
-    ///
-    /// ⭐ **The arithmetic is the check**: `EclForwarded == EclWddmSubmitted +
-    /// EclNoWddmSubmission`, always, because every forward takes exactly one of
-    /// the two arms. A `D3D12 DDI refusals:` line where that does not hold is
-    /// reporting something other than what this code does.
-    ///
-    /// ⚠⚠ **RE-GRADED BY UP-9, and the re-grading is what KEEPS the arithmetic
-    /// above true.** `submit_wddm_render` used to bump this counter itself, which
-    /// was exact while `pfnExecuteCommandLists` was its only caller. UP-9 made the
-    /// present a second caller, so the bump moved out to the ECL call site and this
-    /// counter's scope **narrowed to ECL submissions alone**. Had it stayed inside,
-    /// every present would have added to it and the invariant would have broken
-    /// silently — the `METHOD.md` instrument-attribution failure, in the one counter
-    /// whose whole value is that it is client-specific. The present arm's
-    /// counterpart is `PresentIdentitySubmitted`.
-    ///
-    /// ⚠ **It says the PACKET was accepted; it does not say the fence became
-    /// truthful.** What it settles is the plumbing — that dxgkrnl takes
-    /// `pfnRenderCb` on a *legacy* D3D12 context and returns success — and, unlike
-    /// every KMD-side counter, it settles it **for this client**: it is per-process
-    /// and D3D12-only. ⛔ It does not say the call reached `DxgkDdiRender`; the KMD's
-    /// `RENDER_COUNT` cannot say that either, because it is adapter-global and DWM's
-    /// D3D11 presents move it every frame (§14a.4 item 3). ⛔ And a
-    /// fence wait that stays flat with this counter moving is **not** evidence that
-    /// dxgkrnl refused to order behind us: the venus ring emits no virtio
-    /// submission while it is busy, so `next_wire_fence` is typically frozen and an
-    /// unheld packet retires instantly. `knobs12::UMD12_ECL_SUBMIT` has that
-    /// correction with its ICD citations, and the module doc repeats it.
+    /// ECL HE12 Render accepted by the runtime. EclAdmissionQueued counts the following event; neither proves runtime fence correctness.
     ecl_wddm_submitted: RefusalCounter,
     // ⚠⚠ THE SIX COUNTERS BELOW ARE SHARED BY BOTH `pfnRenderCb` USERS SINCE UP-9,
     // and their `Ecl` names are LEGACY. Every one of them is a fact about dxgkrnl's
@@ -4436,131 +3689,23 @@ pub(crate) struct L2Refusals {
     /// failure could not even be reported, which is strictly worse than a removed
     /// device — a queue whose fence ordering silently did not happen.
     ecl_submit_render_failed: RefusalCounter,
-    /// `vkd3d_acquire_vk_queue` declined to drain the engine's submission worker
-    /// before the WDDM packet went in.
-    ///
-    /// ⛔ **Expected 0, and a non-zero count invalidates the ORDERING rather than
-    /// the frame.** The drain is what guarantees the frame's `vkQueueSubmit` has
-    /// already happened when the packet is submitted; without it the packet can be
-    /// ordered ahead of the work it exists to fence, which is the same untruthful
-    /// fence K-F1 is fixing. ⚠ The submission still goes on this path
-    /// deliberately — withholding it would make the fence untruthful for certain
-    /// instead of possibly early — so this counter is the only thing that says a
-    /// run's numbers came from an unordered submission.
-    ///
-    /// ⛔ **RE-GRADED by A1: on a default build this counter CANNOT move**, because
-    /// `Umd12EclDrain` defaults OFF and no acquire is attempted. A 0 here is
-    /// therefore not evidence the drain succeeded — read `EclDrainDisabled` first,
-    /// and only interpret this counter on a run whose inventory line records
-    /// `Umd12EclDrain=1`. This is the same *"trusting a zero"* trap
-    /// (`METHOD.md` §5) the fence-success counters were added to close.
+    /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     ecl_drain_failed: RefusalCounter,
-    /// ⭐⭐ **A REAL GPU-completion boundary went into the submitted record**:
-    /// `helios_venus_queue_gpu_fence` returned a non-zero venus wire fence, sampled
-    /// inside the drain window.
-    ///
-    /// ⚠⚠ **RE-GRADED TWICE, and both moves are kept because the second undoes the
-    /// first.** (1) Originally *"expected non-zero on every submitting workload with
-    /// `Umd12EclFence` at its ON default"*. (2) A1 gated the drain OFF and the sample
-    /// lived inside it, so it became *"expected 0 on a DEFAULT build"*. (3)
-    /// `bridge12::sample_queue_fence` made the boundary reachable without the drain,
-    /// so grading (1) applies again — **expected non-zero on every submitting
-    /// workload** — with one difference: on a default build the fence it counts is a
-    /// possible **prefix** of the frame, and `EclFenceNoDrain` fires beside it to say
-    /// so.
-    ///
-    /// ⛔ It remains **the only counter that means the fence is real**.
-    /// `EclWddmSubmitted` says a packet went in; this says the packet asked for
-    /// something. A run with `EclWddmSubmitted > 0` and `EclFenceSampled == 0`
-    /// submitted only "order against nothing" packets, and its **four** possible
-    /// causes each have their own counter below — `EclFenceNoIcd`,
-    /// `EclFenceNoExport`, `EclFenceRefused`, `EclFenceStatusBad` — plus
-    /// `EclFenceDisabled` for the knob.
+    /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     ecl_fence_sampled: RefusalCounter,
-    /// The venus ICD module could not be resolved for the fence export — no loaded
-    /// module exports the probe symbol, or the **S4b anchor refused** because two ICD
-    /// images are live in this process.
-    ///
-    /// ⛔ **Expected 0.** Resolution happens once per process, so a non-zero count is
-    /// one finding repeated per submit, not N findings. ⚠ Read `IcdAnchorMismatch` in
-    /// the bridge log beside it: that separates "no venus ICD at all" from "two of
-    /// them, and this driver refused to pick".
+    /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     ecl_fence_no_icd: RefusalCounter,
-    /// The anchored venus ICD does not export `helios_venus_queue_gpu_fence`.
-    ///
-    /// ⚠ **Expected 0 against a current ICD, and it is a VERSION statement rather
-    /// than a fault**: an older image predating the export is the designed graceful
-    /// path, and the submission still goes with a zero boundary. A non-zero count
-    /// means the deployed `vulkan_venus.dll` is behind the driver — which is a
-    /// deploy-order finding (`win_meson` before `umd12`), not a code defect.
+    /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     ecl_fence_no_export: RefusalCounter,
-    /// The export ran and **declined**, leaving the fence 0.
-    ///
-    /// ⛔ **Expected 0, and its loudest cause is `ring_idx == 0`, which the export
-    /// refuses unconditionally** — a ring-0 wire fence retires at *decode*, so
-    /// honouring one would put a fence on the wire that lies about GPU completion.
-    /// Its other arms are a handle it could not decode as a `VkQueue`, a device or
-    /// renderer whose two independent instance pointers disagree, and a missing venus
-    /// ctx id. ⚠ The bridge log's `queue_gpu_fence(...) declined` line and the ICD's
-    /// own `helios_qgf_refused_*` counters say which.
+    /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     ecl_fence_refused: RefusalCounter,
-    /// `Umd12EclFence` is off, so the record deliberately carried a zero boundary.
-    ///
-    /// ⚠ **Expected 0 on a default build and expected to equal `EclForwarded` on the
-    /// A/B arm** — it is what makes "this run had no boundary" a positive statement
-    /// rather than an absence, and it is why the three findings above cannot be
-    /// confused with the disable.
-    ///
-    /// ⚠ It fires on **both** `Umd12EclFence=0` arms, with the drain on or off, and it
-    /// is the only arm on which no sample is attempted at all. ⛔ Its old sentence
-    /// *"the arm where the fence knob is on and the drain is off is `EclFenceNoDrain`
-    /// instead"* is stale: that arm now samples, so it reaches one of the five cause
-    /// counters **and** `EclFenceNoDrain` as the undrained census.
+    /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     ecl_fence_disabled: RefusalCounter,
-    /// The bridge reported a fence status this build's mapping does not know.
-    ///
-    /// ⛔ **Expected 0, and a hit is a DRIFT between two declarations**:
-    /// `HELIOS_VKD3D_FENCE_*` in `umd12/bridge/vkd3d_bridge.h` and
-    /// `bridge12::FenceStatus`. The status crosses an FFI as a bare `u32`, so nothing
-    /// but this counter can notice a value added on one side only — which is exactly
-    /// why the mapping has an explicit unknown arm instead of folding into
-    /// `EclFenceRefused`.
+    /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     ecl_fence_status_bad: RefusalCounter,
-    /// ⛔⛔ **A1: `Umd12EclDrain` is off, so `pfnExecuteCommandLists` made no
-    /// `vkd3d_acquire_vk_queue` call at all.**
-    ///
-    /// ⛔ **Expected to EQUAL `EclForwarded` on a default build**, because the knob
-    /// defaults OFF — `knobs12::UMD12_ECL_DRAIN` carries why, and the short form is
-    /// that the ON arm's failure mode is an untimed `pthread_cond_wait` inside a DDI
-    /// with no counter and no TDR, while this arm's failure mode is the counted
-    /// ordering gap named here and in `EclFenceNoDrain`.
-    ///
-    /// ⚠ **This counter is what makes `EclDrainFailed = 0` readable.** Without it a
-    /// zero there says either "the drain succeeded every time" or "the drain never
-    /// ran", and those are opposite facts.
+    /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     ecl_drain_disabled: RefusalCounter,
-    /// ⭐ **The boundary in the submitted record was sampled WITHOUT a drain**, so it
-    /// may name a **prefix** of the frame rather than all of it.
-    ///
-    /// ⚠⚠ **RE-GRADED, and the old grading is quoted because it was a cause and this
-    /// is not.** It used to mean *"`Umd12EclFence` asked for a boundary and the
-    /// drain's absence made it unobtainable, so the record carried 0"* — the fifth
-    /// distinguishable cause of a zero fence, expected to equal `EclForwarded` on a
-    /// default build. `bridge12::sample_queue_fence` removed that state: the default
-    /// arm samples through upstream's `vkd3d_lock_vk_queue` and gets a real fence.
-    ///
-    /// ⛔ **It is no longer part of the cause partition.** It fires *beside* exactly
-    /// one of `EclFenceSampled` / `EclFenceNoIcd` / `EclFenceNoExport` /
-    /// `EclFenceRefused` / `EclFenceStatusBad`, never instead of one, so those five
-    /// plus `EclFenceDisabled` still sum to `EclForwarded` while this one counts the
-    /// arm they were reached on.
-    ///
-    /// ⛔ **Expected to equal `EclForwarded` on a default build** — same number as
-    /// before, opposite meaning — and expected **0** on a run with
-    /// `Umd12EclDrain=1`. ⚠ Read it as the *under-wait census*: on a run where it
-    /// equals `EclFenceSampled`, every boundary this driver put on the wire is a
-    /// prefix, and an application fence completing early is explained by this counter
-    /// and not by the KMD.
+    /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     ecl_fence_no_drain: RefusalCounter,
     /// ⭐ **S-2's entry instrument: the runtime entered `pfnSignalFence`.** Counted as
     /// the function's first statement, above the null-argument check, so it counts
@@ -4578,38 +3723,9 @@ pub(crate) struct L2Refusals {
     /// different finding from both being 0, and before this counter the two were
     /// indistinguishable.
     fence_signal_entered: RefusalCounter,
-    /// ⭐ **S-2's entry instrument for `pfnWaitForFence`.** Same construction and the
-    /// same reason as [`Self::fence_signal_entered`].
-    ///
-    /// ⚠ Its partition is exact and worth checking as arithmetic:
-    /// `FenceWaitEntered == FenceWaitForwarded + FenceWaitRuntimeOwned +
-    /// FenceWaitNotForwarded +` (that direction's share of `FenceOpBadArg` /
-    /// `FenceOpFenceMissing` / `FenceOpEngineFailed`). A run where
-    /// `FenceWaitEntered` exceeds everything accountable is a path this file does not
-    /// know it has.
+    /// Entry to the native queue Wait DDI, before validation. Valid entries are explicitly refused with FenceNativeRefused.
     fence_wait_entered: RefusalCounter,
-    /// `pfnWaitForFence` asked for a value on a fence **this driver has never
-    /// signalled**, so the wait was dropped as already-satisfied.
-    ///
-    /// ⚠ **Expected NON-ZERO and correct in the reachable-and-legal case**: a
-    /// `CreateFence(InitialValue = N)` — the DDI carries no initial value
-    /// (`D3D12DDIARG_CREATE_FENCE` is `{FenceCount, Fences}`) — or a CPU
-    /// `ID3D12Fence::Signal` that `DDI_REFERENCE.md` §10.3 says never reaches the
-    /// driver. Both are waits the runtime **already considers satisfied**, so
-    /// dropping them is exact rather than approximate, and `CreateFence(1)` +
-    /// `queue->Wait(f, 1)` is a common idiom this driver must not answer by removing
-    /// the device.
-    ///
-    /// ⛔⛔ **AND IT IS NOT CLEAN, which is the whole reason it is graded here rather
-    /// than called benign.** A CPU `Signal` that has **not happened yet** —
-    /// `queueB->Wait(f, N)` and only later `fence->Signal(N)` from the CPU — is
-    /// **indistinguishable** from the satisfied case at this DDI, and it is a real
-    /// ordering gap that yields wrong pixels. It cannot be routed elsewhere (nothing
-    /// observable separates it) and it cannot be forwarded (the engine fence can
-    /// never reach `N`, so the engine wait would block that vkd3d queue forever).
-    /// ⇒ **a large count next to visible cross-queue corruption is this case**, and
-    /// the only real fix is the runtime's monitored fence — which §10.4's correction
-    /// proves this driver can never name.
+    /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     fence_wait_runtime_owned: RefusalCounter,
     /// ⭐ **S-4's success counter: a real `ID3D12CommandSignature` was built.**
     ///
@@ -4754,6 +3870,12 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     fence_signal_forwarded: RefusalCounter::new("FenceSignalForwarded"),
     fence_wait_forwarded: RefusalCounter::new("FenceWaitForwarded"),
     ecl_forwarded: RefusalCounter::new("EclForwarded"),
+    ecl_admission_queued: RefusalCounter::new("EclAdmissionQueued"),
+    ecl_admission_failed: RefusalCounter::new("EclAdmissionFailed"),
+    ecl_worker_failed: RefusalCounter::new("EclWorkerFailed"),
+    ecl_exact_boundary: RefusalCounter::new("EclExactBoundary"),
+    fence_native_refused: RefusalCounter::new("FenceNativeRefused"),
+    present_producer_admitted: RefusalCounter::new("PresentProducerAdmitted"),
     fence_signal_delayed: RefusalCounter::new("FenceSignalDelayed"),
     ecl_delayed: RefusalCounter::new("EclDelayed"),
     ecl_wddm_submitted: RefusalCounter::new("EclWddmSubmitted"),
@@ -4917,6 +4039,12 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L2_REFUSALS.present_identity_submitted,
     &L2_REFUSALS.present_submit_no_queue,
     &L2_REFUSALS.present_submit_no_device,
+    &L2_REFUSALS.ecl_admission_queued,
+    &L2_REFUSALS.ecl_admission_failed,
+    &L2_REFUSALS.ecl_worker_failed,
+    &L2_REFUSALS.ecl_exact_boundary,
+    &L2_REFUSALS.fence_native_refused,
+    &L2_REFUSALS.present_producer_admitted,
 ];
 
 // ⚠ `Hresult` is imported for the `E_*`/`S_OK` constants this file returns; the

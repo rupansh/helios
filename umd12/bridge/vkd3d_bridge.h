@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <memory>
+#include "rust/cxx.h"
 
 // Owns the `ID3D12Device*`; defined in vkd3d_bridge.cpp.
 struct HeliosVkd3dDeviceImpl;
@@ -153,41 +154,6 @@ std::int32_t helios_vkd3d_bridge_serialize_root_signature(
     std::size_t desc, std::uint32_t version,
     std::size_t* blob_out, std::size_t* err_out) noexcept;
 
-// K-F1 (`docs/dx12/KMD_IMPACT.md` §14a.2). Drain one `ID3D12CommandQueue`'s vkd3d
-// submission worker, and — while the queue is still held — sample the venus wire
-// fence that retires at host GPU completion of everything now submitted to it.
-//
-// ⭐ The drain is a CPU-side wait for SUBMISSION, NOT for GPU completion. That
-// distinction is the whole reason this call is permitted where
-// `FENCE-BRIDGE-DESIGN.md`'s design A is rejected: it costs no CPU/GPU overlap.
-// The fence sample is not a wait at all — it reads a boundary and returns.
-//
-// `queue` is an `ID3D12CommandQueue*` carried as an integer, for the same
-// header-isolation reason as `d3d12_device_ptr` above. BORROWED — no reference is
-// taken and none is released. Returns false and counts if `queue` is 0 or if the
-// engine declined to hand over the Vulkan queue. Never throws: `bridge_guard`.
-//
-// `out_wire_fence` / `out_fence_status`: pass **both or neither**. Non-null asks
-// for the fence and both are always written before this returns. A **0 fence is a
-// legal outcome**, not an error — it is `HeliosD3D12SubmitCmd`'s documented "order
-// against nothing" arm — so the status is what says WHY, and the four values are
-// four different findings that must not share a counter:
-//
-//   0 `HELIOS_VKD3D_FENCE_SAMPLED`    — a non-zero fence; the boundary is real
-//   1 `HELIOS_VKD3D_FENCE_NO_ICD`     — no venus ICD module in this process, or the
-//                                       S4b anchor refused (two ICD images live)
-//   2 `HELIOS_VKD3D_FENCE_NO_EXPORT`  — the module predates
-//                                       `helios_venus_queue_gpu_fence`
-//   3 `HELIOS_VKD3D_FENCE_REFUSED`    — the export ran and declined (ring 0, a
-//                                       handle it could not decode, no ctx, ...)
-//
-// ⛔ Keep these values in sync with `bridge12.rs`'s `FenceStatus`, which maps them
-// by number and counts an unknown value rather than assuming.
-constexpr std::uint32_t HELIOS_VKD3D_FENCE_SAMPLED = 0;
-constexpr std::uint32_t HELIOS_VKD3D_FENCE_NO_ICD = 1;
-constexpr std::uint32_t HELIOS_VKD3D_FENCE_NO_EXPORT = 2;
-constexpr std::uint32_t HELIOS_VKD3D_FENCE_REFUSED = 3;
-
 // The `out_status` values of `resource_venus_identity` above. Declared here, at the
 // seam, for the same reason as the fence family: `bridge12.rs` maps them by number.
 constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_RESOLVED = 0;
@@ -198,50 +164,10 @@ constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_NO_ICD = 4;
 constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_NO_EXPORT = 5;
 constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_ICD_REFUSED = 6;
 
-bool helios_vkd3d_bridge_drain_queue(std::size_t queue,
-                                     std::uint64_t* out_wire_fence,
-                                     std::uint32_t* out_fence_status) noexcept;
+// Exact resource/queue producer boundary, enqueued on the engine worker.
+bool helios_vkd3d_bridge_publish_producer(std::size_t queue, std::size_t resource,
+    std::uint32_t allocation, std::size_t admission_event, std::uint32_t* ctx, std::uint32_t* value, std::uint64_t* cookie);
 
-// Sample the same venus GPU-completion boundary **without draining**.
-//
-// ⛔⛔ **Why this exists, and it is not an optimisation.** The boundary can only be
-// read from a `VkQueue`, and until now the only way to obtain one here was
-// `vkd3d_acquire_vk_queue`, which is *inside* `helios_vkd3d_bridge_drain_queue`. With
-// the drain gated OFF (`Umd12EclDrain`, default 0, because the acquire contains an
-// untimed `pthread_cond_wait` reachable from inside a DDI) every submission would
-// carry `gpu_wire_fence = 0` — so `Umd12EclFence`'s ON default would be inert and the
-// kernel's exact-boundary arm could never fire. The fence bridge would ship doing
-// nothing, knowingly. This entry point is what makes the sample reachable with the
-// drain off, and the two must stay independently switchable for exactly that reason.
-//
-// ⭐ The primitive is upstream and already in this link: `vkd3d_lock_vk_queue` /
-// `vkd3d_unlock_vk_queue` (`vkd3d.h:122-123`, `command.c:25572`/`:25584`) take the
-// `vkd3d_queue` mutex through `vkd3d_queue_acquire` and **enqueue no
-// `VKD3D_SUBMISSION_DRAIN`**, so nothing waits on the submission worker. Two further
-// differences from the drain, both in this call's favour: the release issues **no**
-// empty `vkQueueSubmit2` (it is a bare `vkd3d_queue_release`), and a failed lock leaks
-// nothing — the drain's null-acquire arm leaves `queue_lock` held, and there is no
-// `queue_lock` here.
-//
-// ⚠⚠ **THE CORRECTNESS COST, stated precisely because it is real and it is the whole
-// reason the drain existed.** Without the DRAIN nothing guarantees that everything the
-// application enqueued has reached `vkQueueSubmit` at the moment the ring seqno is
-// sampled, so the boundary may name **less work than the frame contains** — an
-// under-wait, i.e. the application's fence can still complete before its GPU work
-// does. ⛔ This is therefore **NOT** equivalent to the drained boundary and must never
-// be described as such. It is strictly better than *no* boundary, which is where the
-// drain-off arm sits today, and strictly worse than a drained one.
-//
-// ⭐ The asymmetry that makes it acceptable rather than merely cheaper: reading a
-// *larger* seqno than needed over-orders and is harmless, only a stale *smaller* one
-// under-waits; and a refused sample is `0`, which `HeliosD3D12SubmitCmd` already
-// documents as "order against nothing" rather than as a lie.
-//
-// `queue` is an `ID3D12CommandQueue*` as an integer, BORROWED. Both out-params are
-// mandatory here (unlike the drain's both-or-neither, where a null pair means "do not
-// sample"): a call with nowhere to put the answer would be a lock/unlock around
-// nothing. Returns false with the fence 0 and a `HELIOS_VKD3D_FENCE_*` status
-// explaining why. Never throws: `bridge_guard`.
-bool helios_vkd3d_bridge_sample_queue_fence(std::size_t queue,
-                                            std::uint64_t* out_wire_fence,
-                                            std::uint32_t* out_fence_status) noexcept;
+std::int32_t helios_vkd3d_bridge_execute(std::size_t queue, rust::Slice<const std::size_t> lists,
+    std::size_t admission_event, std::uint32_t* ctx, std::uint32_t* value, std::uint64_t* cookie);
+void helios_vkd3d_bridge_cancel_execution(std::size_t queue, std::int32_t reason);

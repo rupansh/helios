@@ -224,6 +224,8 @@ mod ffi {
             self: &HeliosDxvkDevice,
             dst_resource_ptr: usize,
             src_resource_ptr: usize,
+            semaphore_handle: usize,
+            semaphore_value: u64,
         ) -> i32;
         /// D4b snapshot ring: image-level copy of the presented primary (src)
         /// into a snapshot-ring image (dst), recorded on the open command
@@ -759,12 +761,19 @@ impl BridgeDevice {
 
     /// # Safety
     /// Both pointers must be live `ID3D11Resource*`.
-    pub(crate) unsafe fn present_vehicle_copy(&self, dst: DstRes, src: SrcRes) -> i32 {
+    pub(crate) unsafe fn present_vehicle_copy(
+        &self,
+        dst: DstRes,
+        src: SrcRes,
+        semaphore: usize,
+        value: u64,
+    ) -> i32 {
         // C++ order here is (dst, src) -- the opposite of publish above, which
         // is the whole hazard. The named types mean the two orders no longer
         // have to agree for the call to be correct.
-        self.get()
-            .map_or(-1, |d| unsafe { d.present_vehicle_copy(dst.0, src.0) })
+        self.get().map_or(-1, |d| unsafe {
+            d.present_vehicle_copy(dst.0, src.0, semaphore, value)
+        })
     }
 
     /// D4b snapshot blit: S_i <- presented primary, recorded before the

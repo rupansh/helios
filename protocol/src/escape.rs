@@ -77,6 +77,28 @@ pub const HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE: u32 = 0x0011;
 /// registered timeline reaches `value`. This is the consumer half of the
 /// bidirectional queue-family ownership protocol.
 pub const HELIOS_ESCAPE_PRESENT_BUFFER_READ: u32 = 0x0012;
+/// Exact GPU feedback observation; does not retire the tagged wire command.
+/// 0x0013 is the allocation producer interface (producer.rs).
+pub const HELIOS_ESCAPE_STREAM_FEEDBACK: u32 = 0x0014;
+pub const HELIOS_STREAM_FEEDBACK_ACCEPTED: u32 = 0;
+pub const HELIOS_STREAM_FEEDBACK_WIRE_RETIRED: u32 = 1;
+pub const HELIOS_STREAM_FEEDBACK_REJECTED: u32 = 2;
+
+/// Versioned by the escape header. The ICD observed this registered GPU-only
+/// semaphore's actual feedback slot. KMD authenticates the exact original
+/// submitted tag and wire fence under its owner/context/generation locks.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+pub struct HeliosEscapeStreamFeedback {
+    pub hdr: HeliosEscapeHeader,
+    pub cookie: u64,
+    pub wire_fence: u64,
+    pub ctx_id: u32,
+    pub value: u32,
+    pub state: u32,
+    pub reserved: u32,
+}
+const _: () = assert!(core::mem::size_of::<HeliosEscapeStreamFeedback>() == 48);
 
 pub const HELIOS_SCANOUT_TIMELINE_OP_META: u32 = 0;
 pub const HELIOS_SCANOUT_TIMELINE_OP_READ: u32 = 1;

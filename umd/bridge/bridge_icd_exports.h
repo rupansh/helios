@@ -37,11 +37,4 @@ std::uint64_t venus_memory_vidmm_global_identity_from_handle(
 bool venus_memory_open_vidmm_tracker(VkDeviceMemory memory,
                                      std::uint64_t global_identity);
 
-/* Register the exact UMD-created OPAQUE_WIN32 timeline with this Vulkan device
- * as a monotonic present stream.  Resolved by private ICD DLL export so an old
- * ICD returns false without any loader/proc-table assumption. */
-bool venus_register_present_stream(VkDevice device,
-                                  VkSemaphore semaphore,
-                                  std::uint64_t* out_cookie);
-
 }  // namespace helios_bridge

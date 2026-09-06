@@ -52,12 +52,9 @@ wdk_build::cargo_make::load_rust_driver_makefile()?
 # DriverStore. Keep the two profiles in agreement or the package hash moves
 # between build and install.
 #
-# ⚠ There is no Sync-HeliosPackageUmd equivalent for helios_umd12.dll, so the
-# D3D12 UMD that reaches the DriverStore is exactly what THIS task built, at
-# THIS task's profile. That asymmetry is deliberate for now — the D3D12 kill
-# switch is off by default, so the packaged D3D12 binary changes nothing until
-# someone sets UmdD3D12 — but it means a cold-boot D3D12 experiment must
-# re-run `cargo make`, not just re-run the installer with a different -UmdDll.
+# The installer requires explicit paths for BOTH UMDs and synchronizes both
+# before catalog generation. Each inner build sets its own local target dir
+# so an inherited KMD CARGO_TARGET_DIR cannot redirect its fresh artifact.
 [tasks.copy-umd-to-package]
 private = true
 dependencies = ["copy-driver-binary-to-package", "copy-inf-to-package"]
@@ -71,7 +68,7 @@ let repo = kmd_dir.parent().unwrap().to_path_buf();
 
 // One source of truth for the profile, used for the inner build's flag, the UMD
 // source directory and the package destination — previously all three were the
-// hardcoded string "debug", so a `cargo make --profile production` built release
+// hardcoded string "debug", so a `cargo make default --release` built release
 // and then copied a stale debug DLL.
 let cargo_profile =
     std::env::var("CARGO_MAKE_CARGO_PROFILE").unwrap_or_else(|_| "dev".to_string());
@@ -98,7 +95,8 @@ for (crate_name, dll_name, engine_hint) in umds {
     let crate_dir = repo.join(crate_name);
 
     let mut build = Command::new("cargo");
-    build.arg("build").current_dir(&crate_dir);
+    build.arg("build").current_dir(&crate_dir)
+        .env("CARGO_TARGET_DIR", crate_dir.join("target"));
     match cargo_profile.as_str() {
         "dev" => {}
         "release" => { build.arg("--release"); }
@@ -114,13 +112,11 @@ for (crate_name, dll_name, engine_hint) in umds {
     );
 
     let source = crate_dir.join("target").join(profile_dir).join(dll_name);
-    // Loud failure over a stale copy: CARGO_TARGET_DIR set in the environment sends
-    // the inner build's output elsewhere, in which case `source` is either absent or
-    // a leftover from an older build and the package would ship it silently.
+    // The explicit per-crate CARGO_TARGET_DIR above makes this the output of
+    // the successful build, including when the outer build sets its own target.
     assert!(
         source.exists(),
-        "{dll_name} not found at {} after a successful build (profile {cargo_profile}) — \
-         CARGO_TARGET_DIR set in the environment redirects the inner cargo build's output",
+        "{dll_name} not found at {} after a successful build (profile {cargo_profile})",
         source.display()
     );
     let destination = package.join(dll_name);

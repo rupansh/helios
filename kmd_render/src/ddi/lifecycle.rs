@@ -167,6 +167,21 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // Idempotent; failure is counted (`RdPgF`) and only latches the acquire
     // feature off, never the adapter.
     adapter.read_ledger.init_page();
+    let producer_ready = adapter.producer.init();
+    crate::diag::record_named_bytes(b"PrInitF", u32::from(!producer_ready));
+    crate::diag::record_named_bytes(b"PrOpenF", 0);
+    crate::diag::record_named_bytes(b"PrBindAt", 0);
+    // SAFETY: StartDevice supplies the callback table for this live adapter.
+    let producer_callbacks = unsafe { &*dxgkrnl_interface };
+    crate::diag::record_named_bytes(
+        b"PrCb",
+        u32::from(producer_callbacks.DxgkCbGetHandleData.is_some())
+            | (u32::from(producer_callbacks.DxgkCbAcquireHandleData.is_some()) << 1)
+            | (u32::from(producer_callbacks.DxgkCbReleaseHandleData.is_some()) << 2),
+    );
+    if !producer_ready {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     // ── Phase 2: bring up the virtio-gpu transport ──────────────────────────
     // VirtioGpu::init reads PCI config + maps BARs through the Dxgkrnl callbacks
@@ -197,7 +212,12 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // reference: see `crate::irql` and tools/kmd-frame-sizes.ps1.
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
     match crate::virtio::VirtioGpu::init(passive, unsafe { &*dxgkrnl_interface }) {
-        Ok(gpu) => {
+        Ok(mut gpu) => {
+            let Some(generation) = adapter.producer.start_transport() else {
+                crate::diag::record_named_bytes(b"PrGenF", 1);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            };
+            gpu.attach_producer_completion(adapter, generation);
             crate::kmsg(c"Helios: virtio-gpu transport up\n");
             crate::diag::record(0x0B00_0003);
             let host_visible_bytes = gpu.host_visible().map(|window| window.len);

@@ -337,6 +337,34 @@ echo "udmabuf" >> /etc/modules-load.d/helios.conf
 | Command submission latency | < 1ms | Fence to completion |
 | Memory bandwidth (blob) | ≥50% of PCIe bandwidth | Zero-copy path |
 
-QEMU has a default 100fps cap on fence polling for display output. This does NOT affect 3D command submission — only applies to scanout. Your 3D pipeline throughput is not limited to 100fps.
+`hw/display/virtio-gpu-virgl.c::virtio_gpu_fence_poll` rearms a 10 ms timer
+while either the command queue or fence queue is nonempty. Its scope is not
+limited to display flushes. The active renderer also supplies async fence
+callbacks which schedule a QEMU bottom half; the timer alone therefore does not
+establish a 100 FPS limit or explain a measured 10 ms completion delay.
 
-Source of the cap (QEMU code): `hw/display/virtio-gpu-virgl.c` function `virtio_gpu_virgl_fence_poll` uses a 10ms timer. This only fires when there's a pending display flush, not for pure compute/3D.
+On 2026-09-06, the .265 Time Spy regression was traced with that async path
+enabled. Create-to-callback intervals frequently exceeded 10 ms, while callback
+to QEMU dispatch averaged 0.410 ms under the debugger. A native host Vulkan
+reproduction on NVIDIA 610.57.04 narrowed the delay to the renderer's private
+`SYNC_FD`-exportable completion fence: the full GPU-fill submit, empty queue
+marker submit and `vkWaitForFences` sequence averaged 8.060 ms, versus 0.329 ms
+for a non-exportable fence. These are sequence timings, not wait-call-only times.
+This is a host wait-cost diagnosis, not recovered VM throughput or visual proof.
+
+**Use stock virglrenderer.** The owner rejects maintaining a fork; the private
+server proposal and launcher override were withdrawn before activation. Their
+diagnostic evidence remains under `tmp/dx12-sync-265-perf/`.
+
+The shipped workaround is already recorded in the
+[archived WS2 continuation](docs/archive/ROADMAP_HISTORY_THROUGH_2026-09-05.md)
+(lines 3096–3127): `HELIOS_RETIRE_FEEDBACK`, default on, observes the exact
+exported semaphore's GPU-written Venus feedback counter. The archive records
+retirement dropping from 5.6–9.2 ms to 0.25–0.33 ms. Current Mesa retains that
+path, and the .265 Time Spy capture reports feedback completions with zero
+wire fallback. The deployed .266 build connects that exact observation to KMD
+producer epochs and HE12 execution completion using the original registered
+cookie/value and returned wire-fence receipt. Wire responses still own transport
+reclamation and Present-reader release. See `docs/dx12/EXECUTION_SYNC.md` for the
+proof, revocation and runtime acceptance boundaries. Keep the .265 wait/signal
+guarantees and `HELIOS_WSI_ASYNC_PRESENT=1`; no host-server build is required.

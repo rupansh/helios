@@ -22,9 +22,6 @@
 //! | `Umd12FormatCaps` | DWORD | `0` — `pfnCheckFormatSupport`'s encoding, as an A/B |
 //! | `Umd12FenceSignalDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnSignalFence` |
 //! | `Umd12EclDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnExecuteCommandLists` |
-//! | `Umd12EclSubmit` | DWORD | **`1` — ON.** K-F1's `pfnRenderCb` WDDM submission during `pfnExecuteCommandLists` |
-//! | `Umd12EclDrain` | DWORD | **`0` — OFF.** Whether `pfnExecuteCommandLists` drains vkd3d's submission worker (A1) |
-//! | `Umd12EclFence` | DWORD | **`1` — ON.** Whether the ECL record carries a real venus GPU-completion boundary. ⛔ Its old entry here said *"has no effect unless `Umd12EclDrain` is also on"* — **FALSE since `f71fef4`**, and that sentence is why the fence bridge once shipped inert. ON samples on **both** drain arms; `Umd12EclDrain` decides only whether the boundary is EXACT or a **prefix** that may under-wait (`EclFenceNoDrain` is the census of the prefix arm). See the knob's own declaration below |
 //!
 //! ⭐ **`UmdD3D12` lands here at S5, and not one commit earlier.** A kill switch
 //! for a driver that cannot be reached kills nothing, so declaring it before
@@ -166,7 +163,7 @@ const MAX_DIAGNOSTIC_DELAY_US: u32 = 2_000_000;
 /// work lands; only the ordering is wrong.
 ///
 /// ⭐ **The architecture is decided, and as of K-F1 the UMD half is LANDED**
-/// ([`UMD12_ECL_SUBMIT`]): a real `pfnRenderCb` WDDM submission on the queue's
+/// (now the mandatory HE12 v2 packet): a real `pfnRenderCb` WDDM submission on the queue's
 /// context during `pfnExecuteCommandLists`, so that the runtime's own kernel fence
 /// signal queues *behind* work the KMD already withholds
 /// `DXGK_INTERRUPT_DMA_COMPLETED` for. No stopgap, no producer-side stall in the
@@ -197,10 +194,8 @@ const MAX_DIAGNOSTIC_DELAY_US: u32 = 2_000_000;
 /// | N ~ 1 µs | N >= 50 000 µs | it gates on **`pfnExecuteCommandLists` returning** — exactly where the `pfnRenderCb` submission goes. The best case. |
 /// | N ~ 1 µs | N ~ 1 µs | ⛔ the runtime advances the fence independently of **both** DDIs, so the precondition is in doubt and must be settled directly — submit a DMA packet the KMD deliberately holds and see whether the app's fence wait grows |
 ///
-/// ⚠ Read `FenceSignalForwarded` alongside it. A **zero** there means the
-/// runtime never enters `pfnSignalFence` at all — a fact the submission design
-/// has to accommodate, and one that makes this arm's own reading unobservable
-/// rather than negative.
+/// Read `FenceSignalEntered` alongside it: a zero means the runtime did not
+/// enter the native DDI, so this delay cannot attribute that run.
 ///
 /// # Why this is inert by default and stays that way
 ///
@@ -212,7 +207,7 @@ const MAX_DIAGNOSTIC_DELAY_US: u32 = 2_000_000;
 /// `umd/src/knobs.rs:31-43` forbids as a *fix*; it is legal here only because it
 /// is a **measurement**, run deliberately for one probe at a time and never
 /// shipped on. ⛔ It is not, and never becomes, the answer to the ordering defect
-/// — that is [`UMD12_ECL_SUBMIT`]'s job, and a delay that "fixes" the pixels is
+/// — that is the exact execution bridge's job, and a delay that "fixes" the pixels is
 /// consistent with every mechanism and therefore evidence for none.
 ///
 /// Clamped to [`MAX_DIAGNOSTIC_DELAY_US`]; each firing bumps
@@ -235,7 +230,7 @@ pub(crate) static UMD12_FENCE_SIGNAL_DELAY_US: DwordKnob =
 ///
 /// **what this arm measures now** — it delays the DDI's *return*, and the
 /// `pfnRenderCb` submission happens *before* that return. So with
-/// [`UMD12_ECL_SUBMIT`] ON, a fence wait that grows with this delay says the
+/// the exact execution bridge ON, a fence wait that grows with this delay says the
 /// runtime's advance is downstream of **the DDI returning**; a fence wait that
 /// does *not* grow, while a KMD-imposed hold on the DMA packet *does* move it,
 /// says the advance is downstream of **our packet retiring**. Only the second is
@@ -246,7 +241,7 @@ pub(crate) static UMD12_FENCE_SIGNAL_DELAY_US: DwordKnob =
 ///
 /// ⇒ it retires with **UV1**, not with the callback. ⚠ And it must never be read
 /// as the fix for the ordering: it is a CPU stall, `umd/src/knobs.rs:31-43`
-/// forbids that as a fix, and [`UMD12_ECL_SUBMIT`] is what actually closes the
+/// forbids that as a fix, and the exact execution bridge is what actually closes the
 /// defect.
 ///
 /// ⚠ The two delay arms are run **separately**, never together: their whole
@@ -257,320 +252,23 @@ pub(crate) static UMD12_FENCE_SIGNAL_DELAY_US: DwordKnob =
 /// bumps `EclDelayed`.
 pub(crate) static UMD12_ECL_DELAY_US: DwordKnob = DwordKnob::new(c"Umd12EclDelayUs", 0);
 
-/// ⭐⭐ **K-F1: the `pfnRenderCb` WDDM submission during `pfnExecuteCommandLists`.
-/// DEFAULT ON.**
-///
-/// # Why the default is ON, and what evidence that rests on (AGENTS.md rule 8)
-///
-/// The default is a decision, and this one is **decision D5a**
-/// (`docs/dx12/DECISIONS.md`), the owner's: *"stop gaps are not acceptable, we
-/// must do the correct, expected and performant implementation … doesn't matter
-/// if its complex or if changes are needed to be done in KMD."* An OFF default
-/// would ship the measured-broken configuration as the driver's behaviour, which
-/// is the exact inversion rule 8 exists to stop.
-///
-/// What "measured-broken" means, precisely (`tmp/dx12/gates/G8-r0-settle/`):
-/// with **no** kernel submission, `D12-G8` rung 0's `WaitForSingleObject` returns
-/// in **0.8–1.1 µs** against WARP's **561 µs**, `GetDeviceRemovedReason` is 0
-/// throughout, vkd3d logs no errors — and the readback surface is **0/65536 exact
-/// at T+0 and 65536/65536 exact at +2000 ms** through the same still-live
-/// mapping. The GPU work lands; the application's fence completes with no causal
-/// dependency on it. `EclNoWddmSubmission = 1` was the defect, not a standing gap
-/// (`KMD_IMPACT.md` §14a.0).
-///
-/// # ⭐ What the ON arm SETTLES: the plumbing, and nothing grander
-///
-/// ⛔ Read this before quoting a number from a run with this knob on. What the arm
-/// establishes is that the **submission path exists and is accepted**, which
-/// nothing before it had shown:
-///
-/// * dxgkrnl accepts `pfnRenderCb` on a D3D12 queue's **legacy** context at all —
-///   the class was chosen inside `pfnCreateCommandQueue` against a doc set that
-///   contradicted itself, and this is the first evidence either way;
-/// * the callback returns success and hands back the three context windows, which
-///   `EclWddmSubmitted` and the re-latched `next_cmd=` trace line report together;
-/// * nothing bugchecks, and `pfnRenderCb`'s HRESULT is a real reading rather than
-///   an assumption (`EclSubmitRenderFailed`).
-///
-/// ⭐ All three instruments are **this driver's own** — per-process, D3D12-only, in
-/// `umd12-<pid>.log` — and that is load-bearing rather than convenient.
-///
-/// ⛔ **It does NOT settle `PRESENT.md` §12's P7 — whether `DxgkDdiRender` fires on
-/// the D3D12 path.** `KMD_IMPACT.md` §14a.4 item 3 named `RENDER_COUNT` moving as
-/// "the whole test" and that instrument is **confounded**: it is adapter-global,
-/// incremented from three sites, and DWM's own D3D11 present path calls
-/// `pfnRenderCb` every frame (`umd/src/forward/present.rs:860`), so it moves with
-/// no D3D12 client in existence. §14a.4 now records it as the third member of a
-/// family (`WfBWire`, `RING_SUBMIT_COUNT`, `RENDER_COUNT`) with one cause: every
-/// KMD counter there is adapter-global and DWM is always running. P7 needs the
-/// D3D12-specific record-seen counter on the KMD's decode of
-/// `HeliosD3D12SubmitCmd` — a separate lane, reached by the packet this arm sends.
-///
-/// # ⛔⛔ What it does NOT settle — and why a FLAT reading is not evidence against it
-///
-/// It does **not** make the application's `ID3D12Fence` truthful on its own, and a
-/// fence wait that stays at ~1 µs with the knob ON does **not** mean dxgkrnl
-/// refused to order behind our packets.
-///
-/// ⛔ `KMD_IMPACT.md` §14a.1's table says a flat reading implies **UV1 ✗**. That
-/// inference is **known false**, and the reason is in the ICD: the venus shared
-/// ring emits *no virtio submission at all* while it is busier than 1 ms. The
-/// command stream is written straight into the shared ring with no virtio traffic
-/// (`icd/mesa/src/virtio/vulkan/vn_ring.c:630-636`), and the doorbell escape is
-/// sent only when the host ring advertises IDLE — and then only past a 1 ms rate
-/// limiter (`vn_ring.c:672-690`, `VN_RING_IDLE_TIMEOUT_NS` at `:22`). So through a
-/// D3D12 frame `next_wire_fence` is typically **frozen**, and the KMD's
-/// `async_retired_up_to(watermark, IncludingGpu)` for an unheld packet is satisfied
-/// instantly — for a reason that has nothing to do with what dxgkrnl would have
-/// done with a packet that was actually outstanding.
-///
-/// ⇒ **UV1 needs a deliberate KMD-side hold scoped to the D3D12 path**, which is a
-/// separate lane. What this arm contributes to that is the packet the hold attaches
-/// to: `HeliosD3D12SubmitCmd`'s *presence* is how the KMD recognises a D3D12 ECL
-/// submission, so the hold can find those packets instead of stalling DWM through
-/// the adapter-global WDDM FIFO.
-///
-/// # ⛔ Why the OFF arm must stay reachable
-///
-/// It is the control arm of that plumbing comparison: `Umd12EclSubmit=0` is
-/// byte-for-byte the pre-K-F1 driver, and it is what a run is compared *against*
-/// when `RENDER_COUNT`, `EclWddmSubmitted` or a fence wait is read. Rule 8's other
-/// half, and the only honest way to attribute a change to this commit.
-///
-/// ⛔ A run whose arm is not recorded is not a measurement. The knob is in
-/// [`resolved_inventory`], so every `UMD knob:` capture states which arm produced
-/// the numbers next to it.
-///
-/// ⚠ Read once per process, like every other knob here. A running `dwm` keeps the
-/// arm it started with; `HKLM\SOFTWARE\Helios` is writable over SSH with the
-/// desktop down, and `pnputil /restart-device` re-runs the load without a reboot.
-///
-/// ⚠ Absent = ON. So a machine that has never heard of this value gets the
-/// submission — which is the point: the *shipping* configuration must be the one
-/// under test, and the disable is what an operator adds to reproduce the old
-/// behaviour, never what the code assumes.
-pub(crate) static UMD12_ECL_SUBMIT: BoolKnob = BoolKnob::new(c"Umd12EclSubmit", true);
-
-/// ⛔⛔ **A1: whether `pfnExecuteCommandLists` DRAINS vkd3d's submission worker.
-/// DEFAULT OFF.**
-///
-/// # ⛔⛔ Why the default is OFF, and it is a CONTRACT argument rather than survivability
-///
-/// `docs/dx12/METHOD.md` §2 Phase 4 consequence 1 forbids a default chosen *"to keep
-/// a run alive rather than to be correct"*, and a knob whose OFF default is fear of a
-/// crash is *"a hack wearing a knob's clothes"*. This default is not that, and the
-/// distinction is the whole content of this doc: **the ON arm's failure mode is an
-/// untimed wait with no counter and no TDR, and the OFF arm's failure mode is a
-/// counted, named, on-the-wire fact.** AGENTS.md rule 2 — loud failure over fake
-/// success — decides between exactly that pair, and it decides for OFF.
-///
-/// What the ON arm does, from the engine's source rather than from its intent:
-/// `bridge12::drain_queue` calls `vkd3d_acquire_vk_queue`, which is
-/// `d3d12_command_queue_acquire_serialized`
-/// (`vkd3d-proton-helios/libs/vkd3d/command.c:25202-25217`). That function pushes a
-/// `VKD3D_SUBMISSION_DRAIN` marker and then
-///
-/// ```text
-///     while (current_drain > queue->queue_drain_count)
-///         pthread_cond_wait(&queue->queue_cond, &queue->queue_lock);
-/// ```
-///
-/// — an **untimed** wait until the worker thread has processed *everything already
-/// queued ahead of the marker, FIFO*. One of the things that can be ahead of it is a
-/// `VKD3D_SUBMISSION_WAIT`, which the worker resolves through
-/// `d3d12_fence_block_until_pending_value_reaches_locked` — a second **untimed**
-/// `pthread_cond_wait` (`command.c:1226`, reached from `d3d12_command_queue_wait` at
-/// `:23745`). ⇒ the ON arm can park **the application's own thread, inside a DDI,
-/// with no timeout, no counter and no outstanding GPU packet for TDR to catch.**
-/// A hang with no instrument is the one failure this project refuses to ship
-/// (`METHOD.md` §5, *"trusting a zero"*): there would be nothing to read afterwards.
-///
-/// ⚠ **What the OFF arm costs, stated precisely and NOT minimised.** Two things, and
-/// the second is larger than `PENDING.md` A1 assumed:
-///
-/// 1. `ID3D12CommandQueue::ExecuteCommandLists` is asynchronous — it pushes onto
-///    vkd3d's worker (`d3d12_command_queue_add_submission`) — so **the frame's
-///    `vkQueueSubmit` may not have happened when the WDDM packet is submitted.** The
-///    packet can therefore be ordered *ahead of* work it is supposed to fence, and the
-///    boundary it carries names less work than the frame contains.
-/// 2. ⚠ **The boundary this arm carries names a PREFIX of the frame, so it can
-///    under-wait.** `bridge12::sample_queue_fence` reads the same venus wire fence
-///    through upstream's `vkd3d_lock_vk_queue`, which enqueues no
-///    `VKD3D_SUBMISSION_DRAIN` — so the sample happens without waiting for the
-///    worker, and consequence 1 above is exactly what makes it a prefix. Counted as
-///    `EclFenceNoDrain`, which now fires **beside** one of the five cause counters
-///    rather than instead of one.
-///
-///    ⛔ **This bullet used to say something much worse and it was true:** *"there is
-///    no boundary at all on this arm, not merely a smaller one"*, because the sample
-///    lived inside `helios_vkd3d_bridge_drain_queue` and skipping the drain skipped
-///    the sample. That made the whole fence bridge inert on every default build —
-///    `Umd12EclFence`'s ON default resolving to a 0 — which is a deletion wearing a
-///    containment's clothes. The sample-only entry point is what closed it, and the
-///    correction is kept here because *"no boundary"* and *"a prefix boundary"* are
-///    different enough to change what a run means.
-///
-/// ⛔ **The record's PRESENCE is unaffected.** `Umd12EclSubmit` still defaults ON, so
-/// the `pfnRenderCb` packet still goes in with `'HE12'`; only its fence field is 0.
-/// That is exactly the K-F1 plumbing arm `tmp/dx12/gates/G8-r0-settle/` measured, so
-/// this default *is* the measured configuration (AGENTS.md rule 8) and the KMD can
-/// still recognise and scope-hold D3D12 packets — its decode counts the zero arm by
-/// name (`D3D12_SUBMIT_ZERO_FENCE`, `kmd_render/src/ddi/submit_command.rs`'s D3D12
-/// ECL arm), so this configuration is first-class on both sides rather than an
-/// unhandled edge.
-///
-/// # ⚠⚠ ONE NARROWING OF THE HAZARD, recorded because a hazard claim has premises too
-///
-/// `PENDING.md` A1 names the trigger as *"`queue->Wait(f,N);
-/// ExecuteCommandLists(...); …later… Signal(N)`"* and calls it a permanent hang.
-/// ⛔ **That specific pattern is REFUTED by code already in the tree.** A CPU
-/// `ID3D12Fence::Signal` never reaches this driver (`DDI_REFERENCE.md` §10.3), so at
-/// the moment `pfnWaitForFence` arrives `N` is above `FenceState`'s watermark and the
-/// wait is **not forwarded** (`FenceWaitRuntimeOwned`) — so no
-/// `VKD3D_SUBMISSION_WAIT` is ever enqueued and the drain has nothing to block
-/// behind. `d3d12_command_queue_Wait` (`command.c:23208`) is vkd3d's **only**
-/// producer of that submission type, so this is exhaustive rather than indicative.
-///
-/// ⇒ what is actually established, stated at the strength the source supports:
-///
-/// | claim | status |
-/// |---|---|
-/// | the drain is an **untimed** wait on another thread's progress, taken inside a DDI, with no counter and no GPU packet for TDR | **CONFIRMED** from source (`command.c:25216-25217`, `:1226`) |
-/// | its length is unbounded — it waits for the signalling queue's worker to reach a SIGNAL that sits behind that queue's whole pending FIFO | **CONFIRMED** |
-/// | the *permanent* hang requires a **cycle** among queue workers | and no cycle is constructible while the watermark gate stands: a forwarded wait for `V` implies some `pfnSignalFence(V' >= V)` was **issued earlier**, hence enqueued earlier on its own queue, so the dependency graph follows issue order and is acyclic |
-///
-/// ⛔⛔ **Which makes the watermark gate LOAD-BEARING FOR THIS KNOB, a coupling
-/// nobody had written down.** If a future change ever forwards waits above the
-/// watermark — the obvious "fix" for the `FenceWaitNotForwarded` ordering gap — the
-/// acyclicity argument dies and A1's permanent deadlock becomes reachable *through
-/// the ON arm*. ⇒ that change and a bounded acquire must land together, and
-/// `queue::fence_operation`'s wait arm carries the same note.
-///
-/// # ⭐ The real fix, and it is not this knob and not in this crate
-///
-/// A **WAIT-skipping or bounded acquire in the fork** — an `vkd3d_try_acquire_vk_queue`
-/// that either refuses rather than blocking behind a `VKD3D_SUBMISSION_WAIT`, or takes
-/// a deadline. Sized **M**, in `vkd3d-proton-helios/`. ⚠ The *"plus a bridge entry
-/// point that samples the boundary through it"* half of this row is **done** —
-/// `helios_vkd3d_bridge_sample_queue_fence` / `bridge12::sample_queue_fence` — which
-/// is what turned the OFF arm from *no* boundary into a *prefix* boundary. What
-/// remains is the exactness, not the existence. Until it lands, the ON arm stays
-/// reachable so the drain's effect on ordering can still be measured deliberately, one
-/// run at a time, on a box where a wedged app thread is a diagnosis.
-///
-/// ⚠ Read once per process, like every knob here, and reported in
-/// [`resolved_inventory`] — a run whose arm is not recorded is not a measurement.
-pub(crate) static UMD12_ECL_DRAIN: BoolKnob = BoolKnob::new(c"Umd12EclDrain", false);
-
-/// ⭐⭐ **Whether the ECL record carries a REAL GPU-completion boundary.
-/// DEFAULT ON.**
-///
-/// ⛔⛔ **Its old first line — *"it has NO EFFECT unless [`UMD12_ECL_DRAIN`] is also
-/// on"* — is FALSE now, and it was the reason the fence bridge shipped inert.** The
-/// coupling was mechanical: the boundary was sampled from the `VkQueue` that only
-/// `vkd3d_acquire_vk_queue` hands back, inside the same bridge call that drains, so
-/// with the drain at its OFF default this knob's ON default resolved to a **0**
-/// counted as `EclFenceNoDrain`. `bridge12::sample_queue_fence` broke the coupling by
-/// taking upstream's `vkd3d_lock_vk_queue` instead, which drains nothing.
-///
-/// ⇒ **ON now samples on BOTH drain arms**, and the drain decides only how much work
-/// the boundary covers:
-///
-/// | `Umd12EclDrain` | boundary | counters |
-/// |---|---|---|
-/// | 1 | **exact** — everything the application enqueued has reached `vkQueueSubmit` | `EclFenceSampled` |
-/// | 0 (default) | a **prefix** of the frame; may under-wait | `EclFenceSampled` **and** `EclFenceNoDrain` |
-///
-/// OFF submits the same record with the fence left **0**, which is that field's
-/// documented *"submit the packet, order it against nothing"* value, counted as
-/// `EclFenceDisabled` — and it is the only arm on which no sample is attempted.
-///
-/// # Why ON
-///
-/// A real fence **IS** the measurement: a zero boundary orders the packet against
-/// nothing, so a run with the fence off cannot distinguish "dxgkrnl does not order
-/// behind our packets" from "our packet asked for no ordering". Shipping the zero arm
-/// as the default would be shipping the plumbing arm as the product, which is exactly
-/// what decision **D5a** forbids — *"stop gaps are not acceptable"*.
-///
-/// ⚠ ⛔ **And it is ON for a reason about the CONTRACT, never about survivability.**
-/// `docs/dx12/METHOD.md` §2 Phase 4 consequence 1: *"a knob whose default was chosen
-/// to keep a run alive rather than to be correct is a hack wearing a knob's
-/// clothes"*. A `Umd12EclSubmitStrict` knob existed here for one commit and was
-/// backed out as exactly that anti-pattern; this knob is not it, and the wedge
-/// paragraph below is why ON is survivable rather than why it is right.
-///
-/// ⚠ **And the wedge hazard that would otherwise argue for OFF is closed in the
-/// KMD, not hoped away.** A boundary naming work that never retires would park an
-/// **adapter-global head-of-line FIFO** and stall every context including DWM until
-/// TDR. It cannot: the consumer clamps a value at or beyond `next_wire_fence` down
-/// to `next_wire_fence` rather than trusting it — *"a malformed/stale private marker
-/// must not manufacture an impossible future dependency"* — so the worst a wrong
-/// fence can do is name an **earlier** boundary and under-wait, which is a
-/// correctness bug with a counter rather than a hang.
-/// `HeliosD3D12SubmitCmd`'s own "safety of a guest-supplied fence" section is the
-/// authority; that asymmetry is why ON is survivable.
-///
-/// # ⛔ Why the OFF arm must stay reachable
-///
-/// `HeliosD3D12SubmitCmd`'s declaration requires it in as many words: the zero-fence
-/// arm *"must stay reachable as the A/B disable for the fence itself"*, and
-/// `is_valid()` deliberately does not check the fence so that the disabled arm is
-/// still a recognisable D3D12 packet to the KMD. ⇒ `Umd12EclFence=0` is the paired
-/// comparison for any change the boundary causes, and it keeps the K-F1 plumbing arm
-/// runnable after the fence lands.
-///
-/// # ⚠ A zero fence with this knob ON is a FINDING, not a fallback
-///
-/// It has three distinguishable causes and each has its own counter, because a
-/// single number here would be unattributable: `EclFenceNoIcd` (no venus ICD module,
-/// or the S4b anchor refused), `EclFenceNoExport` (an ICD image predating
-/// `helios_venus_queue_gpu_fence`), `EclFenceRefused` (the export ran and declined —
-/// its loudest arm being `ring_idx == 0`, which it refuses unconditionally because a
-/// ring-0 wire fence retires at *decode* and would lie about GPU completion).
-/// `EclFenceDisabled` is the fourth and belongs to this knob's OFF arm; a fifth,
-/// `EclFenceStatusBad`, means the C++ header and `bridge12::FenceStatus` have drifted.
-/// ⛔ `EclFenceSampled` is the only one that means the boundary is real, and
-/// `EclFenceNoDrain` beside it is the only thing that says whether it is exact.
-///
-/// ⚠ Read once per process, like every knob here, and reported in
-/// [`resolved_inventory`] — a fence reading whose arm is not recorded cannot be
-/// attributed.
-pub(crate) static UMD12_ECL_FENCE: BoolKnob = BoolKnob::new(c"Umd12EclFence", true);
+// HE12 v2 has mandatory admission and completion. The old EclSubmit,
+// EclDrain and EclFence registry switches are retired; an exact packet cannot
+// be disabled or replaced with a sampled prefix. Their inventory positions
+// remain below for existing log parsers, followed by ExecutionSyncVersion.
 
 /// The `pfnSignalFence` diagnostic delay in microseconds, clamped. `0` = off.
 /// See [`UMD12_FENCE_SIGNAL_DELAY_US`].
 pub(crate) fn umd12_fence_signal_delay_us() -> u32 {
-    UMD12_FENCE_SIGNAL_DELAY_US.get().min(MAX_DIAGNOSTIC_DELAY_US)
+    UMD12_FENCE_SIGNAL_DELAY_US
+        .get()
+        .min(MAX_DIAGNOSTIC_DELAY_US)
 }
 
 /// The `pfnExecuteCommandLists` diagnostic delay in microseconds, clamped.
 /// `0` = off. See [`UMD12_ECL_DELAY_US`].
 pub(crate) fn umd12_ecl_delay_us() -> u32 {
     UMD12_ECL_DELAY_US.get().min(MAX_DIAGNOSTIC_DELAY_US)
-}
-
-/// Whether `pfnExecuteCommandLists` makes K-F1's `pfnRenderCb` WDDM submission.
-/// **Absent = ON**; see [`UMD12_ECL_SUBMIT`] for the evidence behind that default
-/// and for what the OFF arm is used to measure.
-pub(crate) fn umd12_ecl_submit() -> bool {
-    UMD12_ECL_SUBMIT.get()
-}
-
-/// Whether the ECL record carries a real venus GPU-completion boundary.
-/// **Absent = ON**; see [`UMD12_ECL_FENCE`] for why, for the ways an ON run can still
-/// produce a zero fence, and for the exact-vs-prefix table that replaced this
-/// sentence's old *"why it is inert while [`umd12_ecl_drain`] is off"*.
-pub(crate) fn umd12_ecl_fence() -> bool {
-    UMD12_ECL_FENCE.get()
-}
-
-/// Whether `pfnExecuteCommandLists` drains vkd3d's submission worker.
-/// **Absent = OFF** (A1 containment); see [`UMD12_ECL_DRAIN`] for the contract
-/// argument behind that default, what the OFF arm costs — a boundary that names a
-/// prefix of the frame, not the absence of one — and what the real fix is.
-pub(crate) fn umd12_ecl_drain() -> bool {
-    UMD12_ECL_DRAIN.get()
 }
 
 /// Emit this crate's knob inventory through the shared reader, once per process.
@@ -595,7 +293,7 @@ pub(crate) fn log_knob_inventory() {
 /// are the evidence contract `tools/capture-knob-inventory.ps1` parses and that
 /// S2 proved the crate split byte-identical against; reordering makes two
 /// captures differ for a reason that is not a behaviour change.
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 8] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 9] {
     [
         ("Umd12Trace", UMD12_TRACE.get() as u32),
         ("UmdD3D12", UMD_D3D12.get() as u32),
@@ -607,21 +305,11 @@ pub(crate) fn resolved_inventory() -> [(&'static str, u32); 8] {
         // configuration the run never had.
         ("Umd12FenceSignalDelayUs", umd12_fence_signal_delay_us()),
         ("Umd12EclDelayUs", umd12_ecl_delay_us()),
-        // ⭐ APPENDED (K-F1), never inserted — see the rule above. ⛔ This one is
-        // load-bearing rather than informational: it is the only record of WHICH
-        // ARM produced a run's numbers, and its default is ON, so a capture that
-        // does not name it cannot be attributed at all.
-        ("Umd12EclSubmit", umd12_ecl_submit() as u32),
-        // ⭐ APPENDED, the fence-boundary commit. It says whether the run's
-        // submissions carried a real GPU-completion boundary or the zero "order
-        // against nothing" arm — without which a fence-wait number cannot be
-        // attributed to either, and the two are the whole A/B.
-        ("Umd12EclFence", umd12_ecl_fence() as u32),
-        // ⭐ APPENDED, A1's containment. ⛔ Load-bearing rather than
-        // informational, and it must be read BEFORE `Umd12EclFence` in any
-        // capture: with this at its OFF default the fence knob is inert, so a
-        // capture that records `Umd12EclFence=1` alone describes a boundary the
-        // run did not have.
-        ("Umd12EclDrain", umd12_ecl_drain() as u32),
+        // Retired registry switches: report the fixed behavior while preserving
+        // inventory order. ExecutionSyncVersion distinguishes v2 from old arms.
+        ("Umd12EclSubmit", 1),
+        ("Umd12EclFence", 1),
+        ("Umd12EclDrain", 0),
+        ("ExecutionSyncVersion", 2),
     ]
 }

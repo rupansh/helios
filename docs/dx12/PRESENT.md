@@ -1,5 +1,18 @@
 # PRESENT.md — how a D3D12 frame reaches the Helios scanout
 
+**Current source amendment — bounded HPS2 replacement:**
+[`../HPS2_REFACTOR.md`](../HPS2_REFACTOR.md#implementation-and-runtime-acceptance)
+supersedes this document's historical HPS2 and zero-stream HEPR descriptions.
+UMD12 Present now commits an exact queue/resource producer operation on vkd3d's
+existing callback FIFO and stamps its registered stream/value into HEPR. WSI
+passes an unnamed NT semaphore/value through the versioned helper seam, while
+retaining copy-completion and recycling protection. Producer completion alone
+does not transfer external-memory ownership or release a consumer. This source
+cutover is built; mixed-API/WSI runtime acceptance remains pending. The
+[HE12 v2 execution repair](EXECUTION_SYNC.md) also admits Present callbacks
+through the exact runtime context, covering a preceding Queue::Wait without an
+ECL. That repair is built but not deployed. Performance work is paused.
+
 **What this is.** The presentation reference for `docs/dx12/`: the D3D11 present chain as it runs
 today hop by hop, the D3D12 `pfnPresent` DDI as the SDK header actually declares it, what the Helios
 Venus ICD's Win32 WSI already does for a Vulkan client, how vkd3d-proton presents, and the three

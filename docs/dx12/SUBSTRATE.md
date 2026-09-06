@@ -1,5 +1,18 @@
 # SUBSTRATE.md — vkd3d-proton and the Vulkan substrate
 
+**Current source amendment — producer completion:**
+`libs/vkd3d/helios_producer.h`, included by `command.c`, adds the narrow
+`helios_vkd3d_enqueue_producer` bridge. It retains the exact resource, uses the
+existing queue callback and fence-worker lifetime machinery, and signals a
+registered timeline after preceding queue work. It performs no GPU-idle wait or
+sample-only ECL lookup. Handled predecessor failures are terminal so a later
+signal cannot certify dropped work. This does not add a generic Vulkan external
+ownership protocol. The subsequent [HE12 v2 execution repair](EXECUTION_SYNC.md)
+adds runtime admission and exact ECL completion using the same worker stream;
+its native acceptance and independent review remain pending. See
+[`../HPS2_REFACTOR.md`](../HPS2_REFACTOR.md#implementation-and-runtime-acceptance)
+for the source/build checks and remaining runtime acceptance.
+
 **What this is:** everything a future session needs to build vkd3d-proton, point it at Helios, know
 exactly what the engine demands of the Vulkan layer, know exactly what Helios supplies, and know
 which gaps are real work. It is the reference behind `DECISIONS.md` **D6** ("the substrate is

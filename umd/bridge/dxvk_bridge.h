@@ -208,7 +208,9 @@ struct HeliosDxvkDevice {
   // rather than flip a stale backbuffer.
   std::int32_t present_vehicle_copy(
       std::size_t dst_resource_ptr,
-      std::size_t src_resource_ptr) const;
+      std::size_t src_resource_ptr,
+      std::size_t semaphore_handle,
+      std::uint64_t semaphore_value) const;
 
   // D4b snapshot ring: record an image-level copy of the presented primary
   // (src) into a snapshot-ring image (dst) on the open command list, BEFORE

@@ -69,6 +69,7 @@
 //! the handles and *then* failing to submit would hand the runtime a descriptor
 //! that looks complete for a frame the kernel never learned the identity of.
 
+use helios_umd_common::hr::E_NOTIMPL;
 use helios_umd_common::refusals::RefusalCounter;
 
 use windows::core::Interface;
@@ -351,6 +352,20 @@ unsafe extern "C" fn present(
     // on **magic** — which `protocol/src/wddm.rs`'s const asserts pin — and only the
     // HEPR arm accepts. One submission, one arm; the two records are never one
     // packet.
+    // Commit a worker callback after the exact queue's preceding work. The
+    // registered signal completes the allocation epoch at host retirement.
+    // SAFETY: the runtime retains h_queue and engine for this present DDI;
+    // identity12 supplies the exact resource's dxgkrnl allocation handle.
+    let Some((producer_ctx, producer_value, producer_cookie)) = (unsafe {
+        queue::publish_present_producer(h_queue, engine.as_raw() as usize, identity.h_allocation)
+    }) else {
+        note_refusal(&L8_REFUSALS.present_producer_failed);
+        log_error!("Present refused: exact producer boundary could not be committed");
+        // SAFETY: the same live queue handle was validated above.
+        unsafe { queue::report_present_submit_error(h_queue, 0x887a0005u32 as i32) };
+        return;
+    };
+
     let private = helios_protocol::HeliosPresentPrivateData {
         // The resource's byte offset inside the venus resource. UP-3's dedicated
         // export makes this 0 for a committed resource and
@@ -380,15 +395,9 @@ unsafe extern "C" fn present(
         // does not use.
         reserved: 0,
         venus_alloc_size: identity.venus_alloc_size,
-        // ⛔ No present-stream marker. The D3D11 path registers a stream through an
-        // escape and stamps the triple here; this driver registers none, and an
-        // all-zero tail is exactly what the KMD reads as *"no registered stream, use
-        // the current wire watermark"* — its own documented legacy path, not a
-        // malformed record. ⚠ Fabricating a triple would arm a boundary lookup
-        // against a stream that does not exist.
-        present_ctx_id: 0,
-        present_value: 0,
-        present_cookie: 0,
+        present_ctx_id: producer_ctx,
+        present_value: producer_value,
+        present_cookie: producer_cookie,
         // Reserved-zero without the snapshot bits above.
         snapshot_memory_type_index: 0,
         snapshot_purpose: helios_protocol::HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE,
@@ -436,17 +445,12 @@ unsafe extern "C" fn present(
     match unsafe { queue::submit_present_identity(h_queue, &record) } {
         queue::WddmSubmit::Submitted => {}
         queue::WddmSubmit::Unavailable => {
-            // ⛔ Counted, NOT raised, and the present PROCEEDS. This arm means this
-            // driver could not build a packet — no callback, no window, no list
-            // window — which is the same state `Umd12EclSubmit=0` produces on purpose
-            // on the ECL path, so it cannot coherently remove the device here.
-            //
-            // ⚠ And the present must still go: a windowed D3D12 frame reaches the
-            // screen through DWM's own D3D11 composition, which carries its own
-            // identity for the primary. This record is the KMD's per-frame watermark
-            // and identity channel, not a precondition for a pixel. Refusing the
-            // whole present over it would turn a lost diagnostic into a black window.
+            // The exact identity channel is required for Present ordering and
+            // ownership. Missing runtime windows/callbacks cannot be success.
             note_refusal(&L8_REFUSALS.present_identity_unavailable);
+            // SAFETY: the same live queue handle as the submission above.
+            unsafe { queue::report_present_submit_error(h_queue, E_NOTIMPL) };
+            return;
         }
         queue::WddmSubmit::Refused(hr) => {
             // ⛔⛔ dxgkrnl refused a packet this driver DID build, on the context
@@ -675,6 +679,7 @@ struct L8Refusals {
     /// would drop the frame's identity **silently**, which is the failure shape this
     /// counter exists to convert into a loud one.
     present_identity_invalid: RefusalCounter,
+    present_producer_failed: RefusalCounter,
     /// A present resolved to a recorded identity whose `h_allocation` was **0**, so
     /// no allocation list could be built.
     ///
@@ -683,18 +688,8 @@ struct L8Refusals {
     /// because "unreachable by construction" is a claim about another module's
     /// invariant, and this is the site that would observe it breaking.
     present_source_allocation_zero: RefusalCounter,
-    /// The identity submission could not be built — no `pfnRenderCb`, no context, no
-    /// command window. **The present PROCEEDS.**
-    ///
-    /// ⚠ **Expected 0, and it is deliberately NOT a device-removing error.** It is
-    /// the same state `Umd12EclSubmit=0` produces on purpose on the ECL path, so it
-    /// cannot coherently remove the device here. ⭐ And the present must still go: a
-    /// windowed D3D12 frame reaches the screen through DWM's own D3D11 composition,
-    /// which carries its own identity for the primary, so this record is the KMD's
-    /// per-frame watermark channel rather than a precondition for a pixel. ⇒ read it
-    /// against `PresentIdentitySubmitted` (in L2's set) and against
-    /// `EclSubmitNoCmdWindow` / `WddmAllocListUnavailable`, which say *which*
-    /// precondition was missing.
+    /// Required identity packet could not be built. Execution is cancelled and
+    /// E_NOTIMPL is reported; no present descriptor is returned. Expected zero.
     present_identity_unavailable: RefusalCounter,
     /// ⛔⛔ **dxgkrnl REFUSED a present identity packet this driver built**, so the
     /// `ID3D12Device` is removed and no present descriptor is written.
@@ -719,6 +714,7 @@ static L8_REFUSALS: L8Refusals = L8Refusals {
     present_queue_context_unavailable: RefusalCounter::new("PresentQueueContextUnavailable"),
     present_entered: RefusalCounter::new("PresentEntered"),
     present_identity_invalid: RefusalCounter::new("PresentIdentityInvalid"),
+    present_producer_failed: RefusalCounter::new("PresentProducerFailed"),
     present_source_allocation_zero: RefusalCounter::new("PresentSourceAllocationZero"),
     present_identity_unavailable: RefusalCounter::new("PresentIdentityUnavailable"),
     present_identity_refused: RefusalCounter::new("PresentIdentityRefused"),
@@ -754,6 +750,7 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     // set, beside the code that submits -- see `queue::submit_present_identity`.
     &L8_REFUSALS.present_entered,
     &L8_REFUSALS.present_identity_invalid,
+    &L8_REFUSALS.present_producer_failed,
     &L8_REFUSALS.present_source_allocation_zero,
     &L8_REFUSALS.present_identity_unavailable,
     &L8_REFUSALS.present_identity_refused,

@@ -12,6 +12,37 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## Current baseline and next work, 2026-09-06
+
+**The owner confirms that realtime Time Spy shadows are fixed on .266 and
+observed approximately 100 FPS in their benchmark.** This supersedes the .265
+20 FPS visual check, where low throughput could hide a race. The automated
+74.26 FPS result below is a separate, instrumented GT1-only run; its settings
+are not established as equivalent to the owner's run. Do not use 75 FPS as the
+owner's baseline or attribute the difference to instrumentation without evidence.
+
+The accepted stack uses KMD **22.22.266.0 / oem50.inf**, the updated Mesa ICD,
+release UMD11/UMD12, `UmdD3D12=1`, `HELIOS_WSI_ASYNC_PRESENT=1` and the existing
+`HELIOS_RETIRE_FEEDBACK` workaround with stock virglrenderer. Source/build and
+four-case native ordering checks pass; broad sharing, unchanged SRV bindings,
+rotation/resize, teardown and WSI stress remain separate acceptance work.
+
+**Next task: investigate whether a further 10–20% gain is achievable in both
+DX11 and DX12 while preserving the synchronization repair.** Establish clean,
+matching-settings Fire Strike and Time Spy baselines on the actual loaded stack,
+then identify a measured bottleneck before changing code. Check shared ICD
+submission/completion, queue batching and staging/WSI costs before choosing a
+lever; these are investigation targets, not established causes. Read archived
+WS2 results before repeating a rejected approach. The old 3.7 ms producer floor
+is historical and must not be assumed for this stack.
+
+The owner explicitly requests a focused completed before/after benchmark per
+API, without a complex interleaved A/B campaign. Repeat only to resolve a failure
+or material uncertainty. Preserve visibly changing frames; the owner remains
+the shadow oracle. Keep async WSI enabled, use stock virglrenderer, and retain
+exact runtime admission, GPU completion, producer epochs and independent
+consumer release. No gain is promised and broader DX12 gaps remain explicit.
+
 ## Branch state, 2026-09-05 — `wddm-dx12`
 
 Development moved off `/home/rupansh/helios-vgpu` (KMD 22.22.501.0) to this tree,
@@ -344,11 +375,12 @@ Stability".** Its contracts remain permanently in force regardless of stage.
   **Why the queue filled was OUR defect:** `note_wddm_submission` gated every
   non-paging WDDM fence on `async_retired_up_to(next_wire_fence, IncludingGpu)`
 
-⇒ **WS2 is PAUSED.** ⛔ Do not open a perf sweep without a new causal hypothesis: the
+⇒ **The historical sweep is closed; bounded investigation resumes on 2026-09-06
+under the current task above.** Do not open a perf sweep without a new causal hypothesis: the
 archive's "Workstream 2 — Performance" is ~980 lines that are mostly a list of levers
-already tried, measured and rejected, with numbers. The remaining limit is named — the
-frame's own producer completion on the host, producer floor ~3.7 ms/frame — so the next
-gain needs a new mechanism, not another arm.
+already tried, measured and rejected, with numbers. Its measured limit was the
+frame's own producer completion on the host, at ~3.7 ms/frame. Re-establish the
+bottleneck on the repaired stack before selecting a new mechanism.
 
 ## Workstream 3 — D3D11 Conformance  ← **PRIORITY 1 since 2026-08-05**
 
@@ -404,6 +436,213 @@ charter first.
    `kmd_render`"* — that sentence is wrong about provenance, not about arithmetic.
 
 ## Workstream 4 — D3D12  ← **PRIORITY 2 since 2026-08-05**
+
+**HPS2 removal investigation, 2026-09-05:**
+[`docs/HPS2_REFACTOR.md`](docs/HPS2_REFACTOR.md) inventories the live file users
+and recommends allocation-bound KMD completion state, cached read-only status
+and event waits on WDDM 2.1, plus explicit WSI dependencies and a narrow DX12
+worker-queue hook. Approximately one implementation day is a planning target;
+runtime/performance validation may extend it. The broader queue-admission
+redesign was outside the original scope. The proposal preceded the implementation
+and owner-directed execution repair recorded below.
+
+**Bounded HPS2 implementation follow-up (source/build validated):** the vertical
+replacement described in that investigation is now implemented in this checkout.
+Exact dxgkrnl allocation/open references bind one KMD producer state; ABI v1
+publishes resource epochs against registered stream boundaries and exposes cached
+read-only status and cancellable event waits. DXVK retains dependencies through
+submission and stamps the consumed refresh epoch. UMD12 uses the vkd3d callback
+FIFO for its exact queue/resource signal and HEPR correlation. WSI carries an
+unnamed NT semaphore/value through the helper seam and retains its separate copy
+completion/recycle guard. Both HPS2 implementations/callers and installer ACL
+setup are removed. WDDM stays `Wddm2_1GpuMmu`.
+
+`kmd_logic` passes 198 tests (20 new producer state/reference/wait tests); protocol
+passes 14. The initial cutover passed Windows release builds for KMD, UMD11,
+UMD12, DXVK, Mesa and vkd3d. The `.264` correction also passed normal and release
+KMD package builds and the complete normal-profile stack gate (4936 bytes). One
+complete-change review repaired dropped-predecessor error handling and WSI
+fallback/failed-copy lifetime paths. Runtime acceptance remains pending: mixed
+API/cross-process sharing, unchanged bindings, delayed/reordered producer work,
+rotation, resize, teardown/cancellation and async WSI. The owner initially reported
+an approximately 10% performance regression and paused performance work for DX12
+correctness. The .266 shadow acceptance and next task above supersede that pause. Keep
+`HELIOS_WSI_ASYNC_PRESENT=1`; the inline path is outside this acceptance work.
+The required stimuli and pass evidence are in
+[`HPS2_REFACTOR.md`](docs/HPS2_REFACTOR.md#runtime-acceptance-packet--pending).
+The original hook did not close general DX12 ECL/fence/wait coverage. Its
+HE12 v2 successor is described below. Missing external queue-family ownership
+transfers remain an obstruction to general mixed-API runtime correctness.
+
+**.265 synchronization checkpoint, superseded by .266 acceptance below:**
+The owner saw no realtime Time Spy shadow/black-flash defect on .265 at about
+20 FPS, and explicitly cautioned that low throughput could conceal a remaining
+race. That observation alone did not confirm a visual fix. The subsequent .266
+work recovered throughput while retaining the demonstrated wait/signal guarantees.
+The original Time Spy shadows disagreed with the current frame; Steel Nomad DX12
+was unaffected. This is distinct from whole-frame presentation order. UL documents Time
+Spy overlapping light culling, SSAO and unshadowed illumination with shadow
+rendering, plus render-target heap aliasing. Steel Nomad also uses async compute,
+for its first volume-illumination pass, and has a different contact-shadow path.
+Sources: [Time Spy engine](https://support.benchmarks.ul.com/support/solutions/articles/44002136148-time-spy-engine),
+[Steel Nomad engine](https://support.benchmarks.ul.com/support/solutions/articles/44002528067-steel-nomad-engine).
+HE12 v2 replaces the undrained sampled ECL boundary with an authenticated
+registered worker-stream value and uses the exact runtime context's
+`SignalAtSubmission | EnqueueCpuEvent` admission before executing work. Present
+callbacks receive the same pair, covering Queue::Wait -> Present without ECL.
+The separate KMD private tail preserves batched predecessors and preemption
+replay; stream teardown, timed rebasing and FIFO overflow cannot fake execution
+completion. The private engine fence/shadow watermark and sample/drain switches
+are removed. Nonzero monitored-fence GPU placements and direct D3D12 queue fence
+DDIs are currently refused; zero-VA software fences remain runtime-owned.
+These older paths must not be conflated with optional WDDM 3.2 native GPU fence
+objects. The latter are outside the WDDM 2.1 contract and are not a blocker.
+
+The .265 candidate passes 206 KMD logic tests, 14 protocol tests, UMD12 host
+Clippy `-D warnings`, Windows vkd3d, release UMD11/UMD12 and normal KMD package
+builds. Its stack gate remains 4936/17936 bytes. The native cross-queue/CPU/
+shared-fence readback probe builds with `/W4 /WX`. On deployed .264 it now
+reproduces early completion: a signaled event precedes the required GPU readback
+bytes (word 0 is zero, expected `3c6ef372`). The recent Time Spy log additionally
+has 2956 allocator resets with command lists awaiting execution. **Independent
+whole-change review resumed and completed; it found and verified a repair for
+premature cancellation during normal queue teardown.** The repaired .265 is
+deployed as oem49.inf with the explicit release UMDs. The native Windows runtime
+suite now passes all four queue/CPU/shared-fence cases, with exact data in both
+producer and consumer readbacks and no writes through the deliberately blocked
+waits. Evidence: `tmp/dx12-sync-265-runtime/20260906-040507-991/`.
+Time Spy's visual acceptance remained open at this checkpoint. The native probe
+establishes its exercised ordering cases, not the shadow defect's cause or
+correctness at higher throughput; the owner subsequently accepted .266 shadows.
+The exact contract, monitored-fence routing and
+external-ownership gaps, and scheduled-task acceptance commands are in
+[`EXECUTION_SYNC.md`](docs/dx12/EXECUTION_SYNC.md). The following investigation
+addressed the .265 execution/admission regression with async WSI enabled.
+
+**Completion delay isolated; reuse shipped feedback workaround, 2026-09-06:**
+Two GT1-only .265 runs completed at 19.02 and 20.03 FPS. The aligned render-phase
+ETW slice measured direct/compute DMA medians of 10.19/10.58 ms and about 68 ms
+median queue-to-admission delay. Live QEMU debugging verified async context-fence
+callbacks were enabled; callback-to-dispatch averaged 0.410 ms, while the delay
+occurred before the callback. A native NVIDIA 610.57.04 GPU-fill plus empty-marker
+reproduction measured the full work-submit / marker-submit / wait sequence at
+8.060 ms average with `SYNC_FD`-exportable fences and `vkWaitForFences`, 0.329 ms
+with ordinary fences, and 0.220 ms waiting on the exported fd.
+Bare empty submissions were insufficient to reproduce the wait cost.
+
+**Owner constraint: stock virglrenderer; no fork.** The unaccepted private
+server patch/build helper and launcher override have been withdrawn; the
+candidate was never activated. Evidence remains in `tmp/dx12-sync-265-perf/`,
+with the withdrawn proposal under `withdrawn-virglrenderer-candidate/`.
+
+The [archived WS2 workaround](docs/archive/ROADMAP_HISTORY_THROUGH_2026-09-05.md)
+(lines 3096–3127) is `HELIOS_RETIRE_FEEDBACK`, default on: the ICD observes the
+exported semaphore's GPU-written feedback counter instead of waiting for the
+slow wire response. Historical retirement was 5.6–9.2 ms before and 0.25–0.33 ms
+after. The current code still implements it. The same .265 Time Spy capture
+reports `retire_fb fast=4607 fallback=0 wire=0`; it is not a missing environment
+toggle. On .265 that observation advanced the ICD sync and its WDDM external
+fence only, leaving KMD allocation producer state and HE12 execution completion
+on the slow tagged AsyncVenus response.
+
+**.266 deployed; throughput recovered and shadows accepted:** the
+ICD retire worker sends an exact GPU feedback notification (escape 0x14). KMD
+validates the owner/context/cookie/value and original admitted wire-fence receipt.
+`execution_completion::Progress` separates GPU completion from wire retirement;
+producer publications and HE12 submissions consult GPU progress, while transport,
+Present readers and closing stream reclamation remain wire-owned. Feedback reads
+hold the same mutex as detach/recycle. Registered private streams must start at
+zero, with no prior signal/import, and refuse CPU signal or payload replacement.
+A non-feedback queue permanently detaches the backend slot before CPU resync;
+timeout/detach/refusal falls back to real wire completion. New telemetry is
+`stream_fb accepted/wire_retired/rejected` beside the existing retire counters.
+213 production logic tests and 14 protocol tests pass, including both response
+orders, late publication/submission, exact receipts, generation reuse, cancellation
+and independent consumer retirement. Windows Mesa and the normal signed KMD
+package build. The conservative startup unwind gate is 5248/17936 bytes,
+including saved registers and return addresses (the older 4936 figure counted
+stack allocations only). Two independent review rounds are dry. Deployed as
+oem50.inf with the new content-hashed ICD, rebooted to Code 0 with D3D12 enabled
+and a visible desktop. All four native synchronization cases pass in session 1
+(`tmp/dx12-sync-266-runtime/20260906-155029-223/`). The completed instrumented GT1 run reports
+**74.26 FPS versus 20.03 on .265 (3.71 times)** with the same definition/options
+and async WSI enabled, `HELIOS_PERF=1`, `--debug-log` and a four-second ETW slice.
+Render PID 5556 loaded the new driver pair; 49240 KMD
+feedback notifications were accepted, 720 matched an already-retired exact wire
+receipt and 151 were conservatively refused (the counter does not classify the
+refusal reason). Local sync retirement reports 50111 feedback completions and
+zero wire fallback. Post-run device status remains Code 0. Results/hashes are in
+`tmp/dx12-sync-266-perf/validation.json`. The exported 3DMark result supplies FPS;
+the ETW parser's mixed-offset negative durations are not acceptance evidence.
+The owner subsequently confirmed the shadows are fixed and observed about
+100 FPS in their own benchmark. This is the visual acceptance at recovered
+throughput; it is separate from the instrumented GT1 result. Sharing, unchanged
+bindings, rotation/resize and WSI stress remain open. Debugger/native timings are
+diagnostic, not VM performance acceptance. Upstream host device-loss/disconnect retirement
+still lacks an error status through the callback/proxy interface, an explicit
+remaining failure-path gap in `EXECUTION_SYNC.md`.
+
+**Resolution-dependent VNC recovery:** after .265 boot, QEMU's 2397x1517
+scanout import required 14745600 bytes but the DMA-BUF carried 14565376; VNC was
+black although the guest composed desktop had content. Restored the previously
+working 1280x800 through the existing RFB SetDesktopSize request, then restarted
+the exact Helios display device so its start-time mode cache refreshed. Actual
+VNC pixels are visible in `tmp/dx12-sync-265-runtime/desktop-restored-vnc.png`.
+This restores runtime visibility; it does not fix general arbitrary-resolution
+import or dynamic VidPn mode refresh. QEMU source and the launcher are unchanged.
+
+
+**Deployment and crash repair, 2026-09-06:** the authorized stack deployment found and
+fixed a hardcoded ICD basename in both new producer resolvers; they now resolve
+the live device dispatch module, supporting the installer's content-hashed DLLs.
+DXVK/vkd3d and both release UMDs rebuilt successfully. The deployed replacement
+uses the normal KMD package profile, which passed the complete stack gate at
+4936 / 17936 bytes. Release KMD also built, but its inlined symbols leave the
+existing stack gate incomplete, so it is not the selected deployment image.
+Per-crate packaging builds now set
+their own local `CARGO_TARGET_DIR` to prevent inherited-target stale UMD copies.
+
+Reboot was subsequently authorized. `.261/.262` refused allocation opens; `.263`
+then bugchecked in DWM startup. The matching dump proves **0x113/0x26/1** at
+`dxgkrnl!DxgGetHandleDataCB`, reached from the new producer BIND while an acquired
+allocation reference remained outstanding. Dxgkrnl explicitly diagnoses a WDDM2
+driver calling a WDDM1.x callback. The prior explanation of the open-time null
+result as unpublished handles was incorrect: the legacy callback is rejected on
+this WDDM2 path. `.264` removes the legacy lookup: OpenAllocation associates the
+global state under an acquired reference; BIND acquires only the exact open.
+Both use the tested scoped acquire/release helper on one PASSIVE thread.
+
+The user booted without virtio-gpu for repair and explicitly prohibited rollback.
+`.264` was signed/staged as **oem48.inf**, with both explicit release UMDs;
+`pnputil /add-driver /install` marked the non-present GPU for reinstall. The user
+restored virtio-gpu and booted at **01:16:27 on 2026-09-06**. `.264 / oem48.inf`
+was live at that checkpoint, Code 0; DWM's UMD/ICD hashes matched the replacement artifacts. A fresh
+desktop capture renders, `PrOpenF=PrBindAt=IrqlBad=0`, and no new bugcheck was
+recorded. The observed startup crash is repaired; this is not broader runtime
+or performance acceptance.
+The normal-profile SYS SHA256 is
+`E66C19BBFD212F16228DB8483B3A0E6F1E2894401D39F79DF7B9C9EC112199F8`.
+Full Fire Strike completed at **01:31:06**: **35669 overall / 57396 graphics**,
+GT1 **249.06 FPS**, GT2 **250.04 FPS**, Physics **40451**, Combined **8881**.
+All five workload statuses are successful; host VNC captures show changing
+demo, GT2 and Combined frames. An earlier run was cancelled by display/focus
+loss coincident with the guest capture task; that incomplete result is preserved
+and excluded. The successful retry used host-only capture and a hidden task
+wrapper. Full Time Spy then completed at **01:41:56**: **15934 overall /
+16222 graphics**, GT1 **101.28 FPS**, GT2 **96.74 FPS**, CPU **14482**.
+All four workload statuses are successful; the native UMD12/ICD module hashes
+match the deployed artifacts, with changing demo/GT1 captures and a GT2 scene
+capture. After both benchmarks the desktop is visible, the original DWM process
+and boot remain live, and no new System bugcheck/shutdown event is recorded.
+`PrPub/PrRet` advanced to **95233/95232** (rate-limited snapshots), with
+`PrInitF=PrOpenF=PrBindAt=IrqlBad=D12MrgF=0`.
+These are single observed results, not interleaved performance comparisons.
+Activation and benchmark evidence is under `tmp/hps2-264-runtime/`.
+Four minidump files were preserved; CDB could parse only the latest,
+which matches the full dump. Dumps and analysis are under `tmp/hps2-263-crash/`;
+the full dump and matching `.263` SYS/PDB are preserved in the guest at
+`C:\ProgramData\HeliosDeployBackups\producer263-crash`. Earlier deployment
+evidence is under `tmp/hps2-261-acceptance/`.
 
 **The charter is `DX12.md`; the implementation set is `docs/dx12/`.
 `docs/dx12/DECISIONS.md` is authoritative over both for ARCHITECTURE, and

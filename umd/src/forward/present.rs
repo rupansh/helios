@@ -1299,6 +1299,14 @@ unsafe fn dxgi_present_impl(
             match vehicle_present_prepare(h, src_h, src_info) {
                 Ok(()) => {
                     copied = true;
+                    // A recorded helper read must be drained even if DXGI's
+                    // later Present callback fails. This is copy ownership,
+                    // independent of whether a presentation token is minted.
+                    VEHICLE.with(|c| {
+                        c.set(VehicleSlot::Minted {
+                            device: h.pDrvPrivate as usize,
+                        })
+                    });
                 }
                 Err(hr) => {
                     VEHICLE.with(|c| c.set(VehicleSlot::Idle));
@@ -1375,12 +1383,11 @@ unsafe fn dxgi_present_impl(
                         resource_com_raw(src_h)
                     };
                     if consumed != 0 {
-                        // Only suppress the historical post-Flush path when
-                        // publication actually succeeded. A failed early
-                        // attempt must retain that path as its recovery try;
-                        // otherwise a transient slot failure would leave the
-                        // consumer unordered without even the old fallback.
                         let (published, correlation) = dev.dxvk.publish_present_order(consumed);
+                        if !published {
+                            log_error!("Present refused: producer publication failed");
+                            return E_FAIL;
+                        }
                         present_order_folded = published;
                         if published {
                             present_stream_correlation = correlation;
@@ -1400,28 +1407,9 @@ unsafe fn dxgi_present_impl(
     maybe_force_present_alpha_opaque(h, src_h);
     maybe_log_present_readback(h, src_h);
 
-    // Cross-process present ordering, PRODUCER half. Record a signal on this
-    // device's named present timeline for the frame just flushed and publish
-    // (resid -> pid, fenceId, value). A consumer compositing this surface --
-    // dwm, sampling it as an SRV -- turns that into a GPU-side wait on its own
-    // submission, so the ordering costs neither side a blocked CPU thread.
-    //
-    // This is what makes the submission-ordered present CORRECT rather than
-    // merely fast — it is the GPU-timeline half of the ordering that the
-    // deleted `PresentOrder`/`PresentGateUs` CPU gate was standing in for. It
-    // must run before the gate: the gate's flush is what pushes the signal to
-    // the wire, and the publish has to name a value this device has already
-    // committed to reaching.
-    //
-    // Deliberately NOT applied to a vehicle present: that path's source is the
-    // ICD's frame, which publishes its own slot from the ICD side.
-    //
-    // WHICH resource: the one the CONSUMER imports, which is not always the
-    // source. On the flip path (`dst_h` empty) dwm reads the presented
-    // backbuffer itself. On the windowed/BLT path we have just copied
-    // src -> dst, and `dst` is win32k's redirection surface -- the one dwm
-    // composes -- so publishing `src` there would key the slot on a resource no
-    // consumer ever looks up, and the wait would silently not happen.
+    // Publish the allocation actually consumed: dst after a BLT, src after a
+    // flip. The exact registered signal follows this device's preceding work.
+    // WSI carries its source dependency directly through the helper seam.
     if !is_vehicle_present && !present_order_folded {
         if let Some(dev) = helios_device(h) {
             let consumed = if copied {
@@ -1430,7 +1418,11 @@ unsafe fn dxgi_present_impl(
                 resource_com_raw(src_h)
             };
             if consumed != 0 {
-                let _ = dev.dxvk.publish_present_order(consumed);
+                let (published, _) = dev.dxvk.publish_present_order(consumed);
+                if !published {
+                    log_error!("Present refused: producer publication failed");
+                    return E_FAIL;
+                }
             }
         }
     }

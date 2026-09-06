@@ -22,6 +22,8 @@ use super::*;
 pub struct PresentSource {
     pub resid: u32,
     pub fence_value: u64,
+    /// Borrowed until the same-thread Present returns; the bridge duplicates it.
+    pub semaphore_handle: usize,
     pub width: u32,
     pub height: u32,
     pub dxgi_format: u32,
@@ -43,8 +45,8 @@ pub struct PresentSource {
 /// an image on a fence that had already retired.
 ///
 /// Cross-DLL sequence, one thread, once per frame:
-/// `helios_umd_set_present_source` -> `Present` ->
-/// `helios_umd_get_present_result` -> optional `helios_umd_wait_last_present`.
+/// `helios_umd_set_present_source_v2` -> `Present` ->
+/// `helios_umd_clear_present_source_v2` -> mandatory wait if a copy was recorded.
 /// Every exit now has to name a next state.
 ///
 /// `Copy` on purpose: a `Cell` cannot panic, where a `RefCell` can double-borrow
@@ -90,8 +92,15 @@ pub fn set_present_source(
     dxgi_format: u32,
     alloc_size: u64,
     memory_type_index: u32,
+    semaphore_handle: usize,
 ) -> i32 {
-    if resid == 0 || width == 0 || height == 0 || dxgi_format == 0 {
+    if resid == 0
+        || width == 0
+        || height == 0
+        || dxgi_format == 0
+        || semaphore_handle == 0
+        || fence_value == 0
+    {
         EXT_SOURCE_REFUSED.fetch_add(1, Ordering::Relaxed);
         log_error!(
             "set_present_source REFUSED: resid={} {}x{} fmt={}",
@@ -106,6 +115,7 @@ pub fn set_present_source(
         c.replace(VehicleSlot::Armed(PresentSource {
             resid,
             fence_value,
+            semaphore_handle,
             width,
             height,
             dxgi_format,
@@ -181,9 +191,8 @@ pub fn wait_last_present(timeout_us: u32) -> i32 {
 /// pfnPresentCb) so the ICD latches its sw fallback instead of flipping a
 /// stale backbuffer.
 ///
-/// It used to also publish the backbuffer slot with this device's fence and
-/// return `(sync_value, fence_id)`; R912(a) retired that producer, so there is
-/// nothing left to hand back.
+/// The source semaphore/value is explicit; copy completion remains the
+/// separate image-recycle guard exposed by `wait_last_present`.
 pub(crate) unsafe fn vehicle_present_prepare(
     h: Hdevice,
     backbuffer_h: ddi::D3D10DDI_HRESOURCE,
@@ -276,10 +285,12 @@ pub(crate) unsafe fn vehicle_present_prepare(
         imported_raw = raw;
     }
 
-    match dev
-        .dxvk
-        .present_vehicle_copy(DstRes(backbuffer_raw), SrcRes(imported_raw))
-    {
+    match dev.dxvk.present_vehicle_copy(
+        DstRes(backbuffer_raw),
+        SrcRes(imported_raw),
+        info.semaphore_handle,
+        info.fence_value,
+    ) {
         0 => {}
         1 => {
             EXT_GEOM_MISMATCH.fetch_add(1, Ordering::Relaxed);
@@ -299,4 +310,18 @@ pub(crate) unsafe fn vehicle_present_prepare(
     }
 
     Ok(())
+}
+
+/// End the borrowed-handle scope even if DXGI did not enter our Present DDI.
+/// Return whether a copy was minted so WSI never mistakes an occluded Present
+/// with no DDI for a completed copy.
+pub fn clear_present_source() -> i32 {
+    VEHICLE.with(|cell| match cell.get() {
+        VehicleSlot::Armed(_) => {
+            cell.set(VehicleSlot::Idle);
+            0
+        }
+        VehicleSlot::Minted { .. } => 1,
+        VehicleSlot::Idle => 0,
+    })
 }

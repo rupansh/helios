@@ -640,7 +640,8 @@ pub(crate) unsafe fn stamp_dxvk_resource_kmt_handles(
         local,
         global
     );
-    let local = if local != 0 { local } else { global };
+    // An allocation binding must precede all resource-handle fallback logic.
+    // There is no conversion from a resource token to an allocation token.
     if local == 0 {
         trace_line!("DDI resource KMT stamp skipped: no usable handle");
         return;
@@ -668,6 +669,7 @@ pub(crate) unsafe fn stamp_dxvk_resource_kmt_handles(
             local,
             global
         );
+        set_runtime_error(h, E_FAIL);
     }
 }
 
