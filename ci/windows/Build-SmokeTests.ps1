@@ -33,6 +33,10 @@ if (-not $OpenClInclude -or -not $OpenClLibrary) {
 }
 & cl.exe /nologo /O2 /W4 /MT /EHsc (Join-Path $source "d3d11-smoke.cpp") "/Fe:$(Join-Path $OutputDir 'd3d11-smoke.exe')" /link d3d11.lib dxgi.lib
 if ($LASTEXITCODE -ne 0) { throw "D3D11 smoke probe compilation failed." }
+& cl.exe /nologo /O2 /W4 /MT /EHsc `
+    (Join-Path $RepoRoot "tools\d3d12_devicecreate_probe.cpp") `
+    "/Fe:$(Join-Path $OutputDir 'd3d12-smoke.exe')" /link d3d12.lib dxgi.lib dxguid.lib
+if ($LASTEXITCODE -ne 0) { throw "D3D12 smoke probe compilation failed." }
 & cl.exe /nologo /O2 /W4 /MT (Join-Path $source "opencl-smoke.c") "/I$OpenClInclude" "/Fe:$(Join-Path $OutputDir 'opencl-smoke.exe')" /link $OpenClLibrary
 if ($LASTEXITCODE -ne 0) { throw "OpenCL smoke probe compilation failed." }
 & cl.exe /nologo /O2 /W4 /MT /EHsc `

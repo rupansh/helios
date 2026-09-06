@@ -790,12 +790,15 @@ These are not new; they are the ones most likely to be violated by a D3D12 imple
 13. ⚠ **dwm.exe already calls our `OpenAdapter12` in production.** Enabling D3D12 is a change to the
     compositor's behaviour on the next boot. Hence D11.
 
-**Decision D11 — D3D12 ships behind an off-by-default kill switch.**
-`HKLM\SOFTWARE\Helios!UmdD3D12` (`BoolKnob::new(c"UmdD3D12", false)`), read once per process at the
-top of `OpenAdapter12`. Absent ⇒ `DXGI_ERROR_UNSUPPORTED`, i.e. bit-identical to a build without the
+**Decision D11 — D3D12 keeps an explicit kill switch; default ON from 2026-09-07.**
+The owner directed this default change after the enabled .270 stack passed native
+ordering cases and completed Time Spy/Fire Strike. Exact evidence and remaining
+acceptance limits are in `PERFORMANCE_FEEDBACK.md`; this does not close broader gates.
+`HKLM\SOFTWARE\Helios!UmdD3D12` (`BoolKnob::new(c"UmdD3D12", true)`), read once per process at the
+top of `OpenAdapter12`. Explicit 0 ⇒ `DXGI_ERROR_UNSUPPORTED`, i.e. bit-identical to a build without the
 D3D12 path. `HKLM\SOFTWARE\Helios` is writable over SSH with the desktop down; the knob is read once
 per process so a running dwm keeps its behaviour while new processes pick up the change. The flip to
-default-ON requires the evidence in the comment at the read site (AGENTS.md rule 8).
+default-ON has its evidence in the comment at the read site (AGENTS.md rule 8).
 
 **Decision D12 — the DDI version is `D3D12DDI_SUPPORTED_0110`, advertised as a set of exactly ONE
 token, with the `_0109`-generation tables. Decided 2026-08-06, before the S6 fan-out.**

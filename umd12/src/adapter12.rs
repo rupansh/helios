@@ -247,7 +247,7 @@ const LOG_BUDGET: usize = 64;
 /// Steps, matching `ARCHITECTURE.md` §1.2 rows 1-6:
 ///
 /// 1. `init_once()` — name this DLL's log file **above the first log line**;
-/// 2. the `UmdD3D12` kill switch (D11). Absent ⇒ `DXGI_ERROR_UNSUPPORTED`,
+/// 2. the `UmdD3D12` kill switch (D11). Explicit 0 ⇒ `DXGI_ERROR_UNSUPPORTED`,
 ///    i.e. bit-identical to a build with no D3D12 path;
 /// 3. validate `open_data` and the two out-pointers inside it;
 /// 4. hand out the adapter token;
@@ -281,13 +281,13 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut c_void) -> Hresult {
 
     // ── 2. The kill switch (D11) ────────────────────────────────────────────
     // ⛔ Above every other check, including the null test, and that ordering is
-    // deliberate: with the knob absent this function must be indistinguishable
+    // deliberate: with the knob set to 0 this function must be indistinguishable
     // from the pre-S5 refusal, which examined nothing. A null-argument counter
     // that could tick on a knob-OFF machine would make "D3D12 is off" and "the
     // runtime handed us a bad pointer" share an evidence channel.
     //
     // ⚠ dwm.exe already calls this in production (`DECISIONS.md` §7.13). The
-    // first boot with `UmdD3D12=1` is a change to the compositor.
+    // default is enabled; explicit `UmdD3D12=0` is the compositor's rollback.
     if !knobs12::umd_d3d12() {
         // ⚠ ONE log line for one event, and it is the set summary rather than a
         // bespoke "OpenAdapter12 refused" line beside it. R911: an already-loud

@@ -391,6 +391,7 @@ once per lane.
 - `umd-check.ps1 -Mode check -Crate both` → 0 errors, and `umd`'s warning count **unchanged**
 - the knob inventory still byte-identical for **`umd`** (S2's instrument,
   `tools/capture-knob-inventory.ps1`) — a lane that perturbs the D3D11 driver has broken the split
-- `OpenAdapter12` refuses until S5; after S5, `UmdD3D12` defaults OFF
+- `OpenAdapter12` is in `umd12` after S5; `UmdD3D12` defaults ON since the owner's
+  2026-09-07 change, with explicit DWORD `0` retaining the refusal path
 - Fire Strike 3-run median at parity — ⚠ D3D12 work must not regress D3D11, and the two DLLs share
   the ICD

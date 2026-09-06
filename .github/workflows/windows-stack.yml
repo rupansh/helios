@@ -21,8 +21,9 @@ env:
   RUST_TOOLCHAIN: nightly-2026-07-14
   CARGO_MAKE_VERSION: '0.37.24'
   RUST_SCRIPT_VERSION: '0.36.0'
-  LLVM_VERSION: '17.0.6'
-  VULKAN_SDK_VERSION: '1.4.309.0'
+  # Matches the active DXVK/vkd3d compiler and shader tools on win11 (2026-09-07).
+  LLVM_VERSION: '22.1.8'
+  VULKAN_SDK_VERSION: '1.4.350.0'
   CLVK_REPOSITORY: https://github.com/winboat-org/clvk-helios.git
   CLVK_COMMIT: 56c626132782bf083a80a6c17f5ca763be0ff8fb
   VULKAN_LOADER_COMMIT: 06830240f7a70599053f47b5f10af543e8c3daf6
@@ -32,7 +33,7 @@ env:
 
 jobs:
   driver:
-    name: WDDM driver and Direct3D 11 UMD
+    name: WDDM driver and Direct3D 11/12 UMDs
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
@@ -40,19 +41,34 @@ jobs:
         with:
           submodules: false
           fetch-depth: 1
-      - name: Initialize DXVK sources
+      - name: Initialize DXVK and vkd3d sources
         shell: pwsh
-        run: git submodule update --init --recursive dxvk-helios
+        run: git submodule update --init --recursive dxvk-helios vkd3d-proton-helios
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}
       - name: Install Meson and Ninja
         shell: pwsh
         run: python -m pip install "meson==${env:MESON_VERSION}" ninja
+      - name: Install Wine IDL compiler
+        id: widl
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-tools
+      - name: Expose native widl to Meson
+        shell: pwsh
+        env:
+          MSYS2_LOCATION: ${{ steps.widl.outputs.msys2-location }}
+        run: |
+          Join-Path $env:MSYS2_LOCATION 'ucrt64/bin' >> $env:GITHUB_PATH
       - name: Install LLVM
         uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
         with:
           version: ${{ env.LLVM_VERSION }}
+          # This action revision's asset table stops at LLVM 21. Use the
+          # official Windows installer explicitly for the VM-matched version.
+          force-url: https://github.com/llvm/llvm-project/releases/download/llvmorg-${{ env.LLVM_VERSION }}/LLVM-${{ env.LLVM_VERSION }}-win64.exe
       - name: Install Vulkan SDK tools
         uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff
         with:
@@ -293,6 +309,7 @@ jobs:
           "version=$version" >> $env:GITHUB_OUTPUT
           "mesa=$(git rev-parse HEAD:icd/mesa)" >> $env:GITHUB_OUTPUT
           "dxvk=$(git rev-parse HEAD:dxvk-helios)" >> $env:GITHUB_OUTPUT
+          "vkd3d=$(git rev-parse HEAD:vkd3d-proton-helios)" >> $env:GITHUB_OUTPUT
       - name: Assemble and test-sign bundle
         shell: pwsh
         run: >-
@@ -309,6 +326,7 @@ jobs:
           -RepositoryCommit $env:GITHUB_SHA
           -MesaCommit '${{ steps.metadata.outputs.mesa }}'
           -DxvkCommit '${{ steps.metadata.outputs.dxvk }}'
+          -Vkd3dCommit '${{ steps.metadata.outputs.vkd3d }}'
           -ClvkCommit $env:CLVK_COMMIT
           -VulkanLoaderCommit $env:VULKAN_LOADER_COMMIT
           -VulkanHeadersCommit $env:VULKAN_HEADERS_COMMIT

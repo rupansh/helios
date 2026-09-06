@@ -1407,7 +1407,9 @@ which is what settled Q1; a single shader model cannot show a conversion.
 **Work:** `docs/dx12/ARCHITECTURE.md` owns the shape. This gate proves the *refactor* is inert.
 `OpenAdapter12` still returns `DXGI_ERROR_UNSUPPORTED`; `helios_umd12.dll` builds, is signed,
 installs, and is referenced by `UserModeDriverName[3]` — but D11 (`DECISIONS.md`) says the D3D12
-path is behind `HKLM\SOFTWARE\Helios!UmdD3D12`, absent ⇒ off, so nothing changes behaviour.
+path is behind `HKLM\SOFTWARE\Helios!UmdD3D12`. This historical S5 gate used the
+then-default OFF. Since the owner's 2026-09-07 default change, set explicit DWORD
+0 when rerunning this disabled-path gate; deleting the value now enables D3D12.
 
 **Commands:**
 
@@ -1490,8 +1492,8 @@ desktop evidence and the fault log.
   — four copies of one name, which is semantically wrong and is fixed as part of this gate's INF
   change, not filed as a separate item. A four-entry `InstalledDisplayDrivers` after G6 is a
   failure even if `UserModeDriverName` is correct.
-* `D3D12CreateDevice` on the Helios adapter still fails — the kill switch is absent, so the D3D12
-  path is bit-identical to a build without it.
+* `D3D12CreateDevice` on the Helios adapter still fails with explicit DWORD
+  `UmdD3D12=0`, exercising the disabled path.
 * **`log_knob_inventory()` output byte-identical before and after the split** (empty
   `Compare-Object` above). This is the `umd_common` extraction's own instrument and the only one in
   this gate that can see a silently-changed knob table.
@@ -1599,7 +1601,8 @@ Compare-Object (Get-Content Z:\docs\dx12\baselines\d3d12-caps.csv) (Get-Content 
 * `caps-diff.txt` is **empty**, or every line is an intentional, justified divergence recorded in
   `notes.md` with the reason. An unexplained divergence is the caps-honesty failure this gate
   exists to catch.
-* Setting `UmdD3D12` back to 0 (or deleting it) restores the refusal exactly.
+* Setting `UmdD3D12` explicitly to 0 restores the refusal exactly. Deleting it
+  restores the enabled default as of 2026-09-07.
 
 **Counters:** KMD pre/post diff, `kmd-gate-surface.ps1` exit 0. **`HwQRef` must not move** — a
 D3D12 device must never reach `DxgkDdiCreateHwQueue` (which refuses at
@@ -1987,8 +1990,9 @@ package-manifest.txt}` and the ROADMAP entries for the two untestable rows.
 * ⚠ Shipping a `d3d12.dll` in the bundle is **not** a system-wide install and must never become
   one. Replacing the system D3D12 runtime for every process is a far larger blast radius than any
   Helios component has today. Per-app drop or explicit opt-in only.
-* ⚠ D11's kill switch must survive packaging: a fresh install with no `UmdD3D12` value is
-  bit-identical to a build without the D3D12 path.
+* ⚠ D11's kill switch must survive packaging: explicit `UmdD3D12=0` refuses D3D12;
+  a fresh install with no value enables it. Installation must preserve an existing
+  explicit disable instead of writing an unconditional enable over it.
 * ⚠ A new KMD image only loads at **boot**; `restart-device` cannot enable the S-ring
   (`DiagLevel` is cached at driver load).
 

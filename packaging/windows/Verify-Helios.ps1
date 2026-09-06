@@ -79,6 +79,9 @@ if ($null -eq $openClValue -or [int]$openClValue -ne 0) {
 } else { Write-Host "OpenCL: registered $($state.openClVendor)" }
 
 if ($RunSmokeTests) {
+    if ([Diagnostics.Process]::GetCurrentProcess().SessionId -eq 0) {
+        throw "Run graphics smoke tests in the logged-in desktop session (or an interactive scheduled task), not session 0."
+    }
     $smokeRoot = Join-Path ([string]$state.installRoot) "runtime\smoke"
     $tests = @(
         [ordered]@{ name = "Vulkan"; exe = "vulkan-smoke.exe"; arguments = @() },
@@ -99,10 +102,19 @@ if ($RunSmokeTests) {
         [ordered]@{ name = "Vulkan WSI x86"; exe = "x86\vulkan-wsi-probe.exe"; arguments = @() },
         [ordered]@{ name = "OpenGL x86"; exe = "x86\opengl-smoke.exe"; arguments = @() }
     )
+    $heliosKey = Get-Item "HKLM:\SOFTWARE\Helios" -ErrorAction SilentlyContinue
+    $dx12Disabled = $heliosKey -and ($null -ne $heliosKey.GetValue("UmdD3D12", $null)) -and
+        ($heliosKey.GetValueKind("UmdD3D12") -eq [Microsoft.Win32.RegistryValueKind]::DWord) -and
+        ($heliosKey.GetValue("UmdD3D12") -eq 0)
+    $tests += [ordered]@{
+        name = if ($dx12Disabled) { "Direct3D 12 explicit disable" } else { "Direct3D 12" }
+        exe = "d3d12-smoke.exe"
+        arguments = @("--expect", $(if ($dx12Disabled) { "fail" } else { "ok" }))
+    }
     foreach ($test in $tests) {
         $executable = Join-Path $smokeRoot $test.exe
         if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
-            Write-Warning "$($test.name) smoke probe is not present in this bundle."
+            $failures.Add("$($test.name) smoke probe is not present in this bundle.")
             continue
         }
         Write-Host "Running $($test.name) smoke probe..."

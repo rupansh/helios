@@ -3,7 +3,8 @@
 //
 // This is `GATES.md` D12-G6's and D12-G7's first command. G6 requires that
 // D3D12CreateDevice on Helios still FAILS with the `UmdD3D12` kill switch
-// absent; G7 requires that it SUCCEEDS with the switch on. One probe, one
+// explicitly set to DWORD 0; G7 requires that it SUCCEEDS with the switch on
+// (also the absent-value default since 2026-09-07). One probe, one
 // `--expect` argument, so the same binary is the pass criterion for both and
 // the two gates cannot drift apart.
 //
@@ -180,11 +181,11 @@ int main(int argc, char** argv) {
         case Expect::Fail:
             if (created) {
                 printf("\nFAIL: expected D3D12CreateDevice to FAIL and it SUCCEEDED.\n");
-                printf("      With UmdD3D12 absent the D3D12 path must be bit-identical to a\n");
-                printf("      build without it (DECISIONS.md D11). Check the knob really is absent.\n");
+                printf("      UmdD3D12 must be explicitly set to DWORD 0 to disable D3D12.\n");
+                printf("      An absent value enables it by default (DECISIONS.md D11).\n");
                 return 1;
             }
-            printf("\nPASS: D3D12CreateDevice failed, as required with the kill switch absent.\n");
+            printf("\nPASS: D3D12CreateDevice failed, as required with UmdD3D12=0.\n");
             return 0;
         case Expect::Ok:
             if (!created) {

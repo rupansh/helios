@@ -9,8 +9,9 @@ components for WoW64 applications alongside the native x64 stack.
 
 The jobs are independent so an error points at the actual component:
 
-1. `driver` builds the DXVK static D3D11 core, embeds it in `helios_umd.dll`,
-   and builds/packages the Rust WDDM kernel driver.
+1. `driver` builds the DXVK and vkd3d-proton static cores, embeds them in
+   `helios_umd.dll` (D3D11) and `helios_umd12.dll` (D3D12), and builds/packages
+   the Rust WDDM kernel driver. Both UMDs are required package inputs.
 2. `mesa` and `mesa_x86` build the pinned Mesa submodule for x64 and x86 with
    both the Venus Vulkan ICD and the Zink WGL OpenGL ICD enabled.
 3. `opencl` builds pinned CLVK with the clspv online compiler embedded. End-user
@@ -22,27 +23,27 @@ The jobs are independent so an error points at the actual component:
    every distributed binary,
    and creates `helios-windows-x64-<version>-<commit>.zip`.
 
-The workflow runs for pull requests and pushes to `wddm`, and can be started
+The workflow runs for pull requests and pushes to `master`, and can be started
 manually. A tag beginning with `v` also publishes the zip and its SHA-256 file
 as a GitHub Release.
 
 ## Reproducibility and source pins
 
-The Helios, Mesa, and DXVK revisions come from the checked-out commit and its
+The Helios, Mesa, DXVK, and vkd3d-proton revisions come from the checked-out commit and its
 gitlinks. The Windows OpenCL build uses the `winboat-org/clvk-helios` fork for
 guest DXGI/OpenCL device association. Its repository and commit, along with the
 Vulkan-Loader, Vulkan-Headers, and OpenCL-ICD-Loader commits, are pinned in
 `.github/workflows/windows-stack.yml`. Toolchain versions are pinned there as
 well. Every resulting source revision is written to `manifest.json`.
 
-When updating an external pin, first build and run all four packaged probes in
+When updating an external pin, first build and run the packaged probes in
 the VM. In particular, CLVK and Zink are consumers of the Venus ICD and can
 expose synchronization/protocol mismatches that a successful compile cannot.
 
 ## Signing model
 
 CI creates a unique, non-exportable test-signing key for each bundle. It signs
-the SYS and UMD before creating the catalog, signs the final catalog, exports
+the SYS and both UMDs before creating the catalog, signs the final catalog, exports
 only the public certificate, then destroys the CI private key. The installer
 adds that public certificate to `Root` and `TrustedPublisher`.
 
@@ -72,8 +73,10 @@ installation managed by another bundle; uninstall it first so rollback state
 cannot be lost.
 
 `Verify-Helios.ps1 -RunSmokeTests` checks hashes and registrations, then creates
-a Vulkan instance, creates a D3D11 device on Helios, creates a WGL context, and
-compiles/runs an OpenCL kernel. The OpenCL probe validates every output value.
+a Vulkan instance, creates D3D11 and D3D12 devices on Helios, creates a WGL context, and
+compiles/runs an OpenCL kernel. The OpenCL probe validates every output value. Run graphics probes in the
+logged-in desktop session or an interactive scheduled task; session 0 is refused.
+The D3D12 smoke checks native runtime device creation, not rendering or conformance.
 
 ## Application compatibility files
 
@@ -81,6 +84,13 @@ The archive includes the separately deployed DaVinci Resolve ADL shim at
 `compatibility\DaVinci Resolve\atiadlxx.dll`. It is not installed system-wide or
 copied by `Install-Helios.ps1`. The adjacent installer safely backs up and
 places the DLL beside `Resolve.exe`; no special launcher is required.
+
+D3D12 is enabled when `HKLM\SOFTWARE\Helios!UmdD3D12` is absent. Explicit
+DWORD `0` disables it, and the installer preserves that override. The D3D12
+smoke then expects device creation to fail. Deleting the value restores the
+enabled default. Resource ownership and failure-path limits remain documented
+in [EXECUTION_SYNC.md](docs/dx12/EXECUTION_SYNC.md) and
+[HPS2_REFACTOR.md](docs/HPS2_REFACTOR.md); the default change does not close them.
 
 ## Hosted runner requirements
 
@@ -93,3 +103,22 @@ The bundle supports WoW64 Vulkan and OpenGL using independently built x86 Mesa
 and Vulkan-loader binaries. WoW64 Direct3D and OpenCL still require separately
 built x86 WDDM UMD/DXVK and CLVK/OpenCL-loader components; copying x64 DLLs into
 `SysWOW64` is not a valid substitute.
+
+The driver job installs native `widl` through MSYS2's
+`mingw-w64-ucrt-x86_64-tools` package and initializes vkd3d's recursive submodules.
+It builds only `helios_d3d12_static`; no app-local `d3d12.dll`, `d3d12core.dll`,
+or `helios_vkd3d.dll` is shipped. The build verifies `OpenAdapter12` and rejects
+DXGI/D3D12 runtime imports in `helios_umd12.dll`. DXVK uses `/MT`; vkd3d and
+UMD12 keep their existing `/MD` contract and the bundle includes the VC runtime.
+Engine licenses, optional UMD PDBs, vkd3d source provenance, and the actual driver
+build tool versions (`payload/driver/toolchain.json`) travel with the package.
+
+The VM comparison on 2026-09-07 found LLVM/clang-cl/libclang **22.1.8** in both
+active engine builds and Vulkan SDK **1.4.350.0** (glslang **16.2.0**). CI now
+pins those versions instead of LLVM 17.0.6 / SDK 1.4.309.0. VM Meson is 1.11.1,
+Python 3.12.10, widl 11.5, and cargo-make 0.37.24; CI retains Meson 1.11.2,
+Python 3.12, and cargo-make 0.37.24, and records the resolved widl version.
+The VM has both VS 2022 and VS 18 and several SDKs; CI uses its Windows 2022
+runner's installed MSVC/WDK. `toolchain.json` records their selected versions.
+The VM's nightly is dated 2026-06-03 and its default Rust is 1.96.0; CI retains
+its explicit nightly-2026-07-14 pin and applies it to cargo-make and both UMDs.

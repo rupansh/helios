@@ -12,6 +12,30 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## D3D12 default and Windows CI, 2026-09-07
+
+The owner requested default DX12 admission and a Windows CI bundle containing
+the native D3D12 UMD. `UmdD3D12` now defaults ON; explicit DWORD `0` still
+refuses admission, and installation preserves that override. CI initializes
+both engine trees, builds their static archives and both release UMDs, signs
+both before catalog generation, and records vkd3d provenance and tool versions.
+LLVM **22.1.8** and Vulkan SDK **1.4.350.0** match the active VM engine builds;
+see `WINDOWS_CI_PACKAGE.md` for the remaining runner/VM toolchain differences.
+
+Validation in `tmp/ci-dx12-20260907/`: the isolated Windows driver build and INF
+validation pass. Bundle assembly rejects a missing UMD12; hashes and catalog
+membership pass for the KMD and both UMDs. That assembly test uses real driver
+outputs and labelled inert fixtures for unrelated components, not a deployable
+full-stack bundle. Separate processes loading the built DLL with a private
+registry override reach argument validation for absent/one and return
+`DXGI_ERROR_UNSUPPORTED` for zero. The newly compiled native D3D12 device smoke
+passes on the existing enabled guest stack via an interactive scheduled task.
+
+Hosted CI has not run, and this default change has not been deployed. The live
+guest still has explicit `UmdD3D12=1`. Existing performance/visual evidence below
+belongs to the earlier deployed artifacts; broader ownership and failure-path
+gaps in `docs/dx12/EXECUTION_SYNC.md` and `docs/HPS2_REFACTOR.md` remain open.
+
 ## Current baseline and next work, 2026-09-06
 
 **The owner confirms that realtime Time Spy shadows are fixed on .266 and
@@ -188,7 +212,10 @@ a new causal hypothesis, not another arm.
    `docs/dx12/GATES.md` (`D12-G0 … D12-G11`). ⭐ **S5 has since LANDED** (2026-08-06, cold-boot half
    2026-09-05): the INF registers `UserModeDriverName[3]`, `umd`'s duplicate
    `OpenAdapter12` export is gone, and `adapter12::OpenAdapter12`'s body is reachable
-   behind the `UmdD3D12` kill switch — absent = refuse, still the shipping default.
+   behind the `UmdD3D12` kill switch. **Source default is ON as of the owner's
+   2026-09-07 direction**; explicit DWORD 0 disables it for new processes.
+   The enabled .270 runtime evidence is above; this default change does not
+   establish broader ownership/failure-path or new owner visual acceptance.
    *Measured up front:* the guest satisfies vkd3d-proton's
    `VP_D3D12_FL_12_2_baseline` in full (zero feature/extension misses), and the
    KMD work list is empty for Phase 0 / three small items for the DDI arm.

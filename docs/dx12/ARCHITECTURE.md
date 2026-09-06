@@ -1652,7 +1652,7 @@ package binary. `Inf2Cat.exe` ships **x86-only**. A bare `& signtool …` not on
 desktop. The disable path must work (a) without a rebuild, (b) **without a working desktop**, and
 (c) without a reboot for *new* processes.
 
-**DECISIONS D11 — D3D12 ships behind an off-by-default kill switch.** Three layers, increasing blast
+**DECISIONS D11 — D3D12 is enabled by default; explicit DWORD `0` disables it.** Three layers, increasing blast
 radius.
 
 ### L1 — the registry knob (primary)
@@ -1661,14 +1661,12 @@ Exact declaration, in `umd12/src/knobs12.rs`, using `umd_common`'s `BoolKnob`:
 
 ```rust
 /// D3D12 DDI enable. `HKLM\SOFTWARE\Helios!UmdD3D12` (REG_DWORD), read once per
-/// process. **Absent = OFF** during bring-up: `OpenAdapter12` returns
-/// DXGI_ERROR_UNSUPPORTED exactly as `umd/src/adapter.rs:177-189` does today, so
-/// an install with the knob unset is bit-identical to a build without the D3D12
-/// path.
+/// process. **Absent = ON** following the owner's 2026-09-07 default change.
+/// Explicit 0 returns DXGI_ERROR_UNSUPPORTED before reading adapter arguments.
 ///
-/// AGENTS.md rule 8: flipping this default to ON requires the evidence in the
-/// comment at THIS site, and OFF must stay reachable as the A/B disable.
-pub(crate) static UMD_D3D12: BoolKnob = BoolKnob::new(c"UmdD3D12", false);
+/// The real read site in knobs12.rs records enabled .270 runtime evidence;
+/// broader ownership/failure and owner visual acceptance remain separate.
+pub(crate) static UMD_D3D12: BoolKnob = BoolKnob::new(c"UmdD3D12", true);
 ```
 
 read at the very top of `OpenAdapter12`, and added to `umd12`'s `resolved_inventory()` so
@@ -1689,7 +1687,8 @@ Set / clear it:
 
 ```powershell
 reg add    "HKLM\SOFTWARE\Helios" /v UmdD3D12 /t REG_DWORD /d 1 /f    # enable  (new processes)
-reg delete "HKLM\SOFTWARE\Helios" /v UmdD3D12 /f                      # disable (new processes)
+reg add    "HKLM\SOFTWARE\Helios" /v UmdD3D12 /t REG_DWORD /d 0 /f    # disable (new processes)
+reg delete "HKLM\SOFTWARE\Helios" /v UmdD3D12 /f                      # restore enabled default
 ```
 
 ⛔ The disabled path returns `DXGI_ERROR_UNSUPPORTED` = `0x887A_0004`, **never**
@@ -1764,7 +1763,7 @@ delivery changed from an export to an archive symbol. S4's bridge design is unaf
 | **S3** | New `umd12` crate: `build.rs` + bindgen + `ddi12.rs` only. `OpenAdapter12` in `umd12` **still refuses** with `DXGI_ERROR_UNSUPPORTED`; `umd` keeps its own refusing `OpenAdapter12`. **Nothing deployed** | Nothing shipped changes. The bindgen layout assertions ARE the deliverable: if `d3d12umddi.rs` compiles, the ABI is machine-checked | **G0** |
 | **S4** | `vkd3d_bridge.{h,cpp}` + `bridge12.rs`: `helios_vkd3d_create_device` only, returning a live `ID3D12Device*`. A `tools/` probe `LoadLibrary`s `helios_umd12.dll` directly and calls the bridge — **no runtime, no INF change, no registry change** | Still nothing shipped. First real evidence that vkd3d runs on venus *through our bridge* | **G1** |
 | **S4b** | **The ICD anchor (§6.4), which must land before the first two-engine run.** Add `helios_icd_anchor_v1` to both DLLs, route both `resolve_helios_icd_module`s through it, add the `IcdAnchorMismatch` counter and its first-hit `log_error!` | Still nothing shipped in the D3D11 sense beyond one added export on `helios_umd.dll` (a superset change; no existing export moves). Proof = UNVERIFIED-4's probe (§13), promoted from detector to pass criterion: one process creates a D3D11 device *and* calls `helios_vkd3d_create_device`; both modules report the **same** ICD path, both venus context ids are non-zero and **equal**, and `IcdAnchorMismatch` reads 0 | **G1** |
-| **S5** | INF + hotplug name `helios_umd12.dll` in slot 3; `umd` **drops** its `OpenAdapter12` export and `umd12`'s becomes reachable and stops refusing — **all in one commit**; the `UmdD3D12` knob lands in that same commit, default OFF | Rollback = revert `UserModeDriverName[3]` (§10-L2). The D3D11 binary changes by exactly one deleted export. Knob absent ⇒ bit-identical to a build without D3D12 | **G6** (knob absent — the split gate is the deploy that registers slot 3), then **G7** (knob ON) |
+| **S5** | INF + hotplug name `helios_umd12.dll` in slot 3; `umd` **drops** its `OpenAdapter12` export and `umd12`'s becomes reachable and stops refusing — **all in one commit**; the `UmdD3D12` knob lands in that same commit, then-default OFF (enabled by default since 2026-09-07) | Rollback = revert `UserModeDriverName[3]` (§10-L2). The D3D11 binary changes by exactly one deleted export. Explicit DWORD `0` disables D3D12 | **G6** (explicit DWORD `0` — the split gate is the deploy that registers slot 3), then **G7** (knob ON) |
 | **S6** | The D3D12 DDI surface, built out in `forward12/*` — caps first (H4), then device/queue/command-list, then descriptors, then present. ⭐ **214 slots; this is the stage that fans out across agents — see `PARALLEL.md`.** It opens with **S6-0**, which stubs all 214 with counting noops so every lane is *substitutive* rather than *additive* | Each sub-stage is knob-gated OFF by default until its gate passes | **G3** (DDI arm), **G8–G11** |
 
 **⚠ On the two "—" cells: S1 and S2 have no `D12-G*` id, and that is a gap in the ladder, not a
@@ -1798,7 +1797,7 @@ attempted:
 | G3 | first frame | S0b (app-local) / S6 (DDI) |
 | G4 | present characterisation | S0b — read with P-B in mind (`helios_umd_get_present_result` returns −1 unconditionally, so every vehicle present takes the worker-serial `wait_last_present` fallback, measured **5.57 ms/frame**) |
 | G5 | contract capture (the `d3d10warp.dll` `OpenAdapter12` shim, H1) | independent of all stages — do it early |
-| G6 | split gate (`umd_common` + `umd12` exist, D3D11 unregressed) | **S5** — ⚠ *not* S2+S3, which was wrong and made G6 unreachable at the stage it was assigned to. `GATES.md` §4.7 requires that `helios_umd12.dll` *"builds, is signed, installs, and is referenced by `UserModeDriverName[3]`"*, with pass criteria that include a `REG_MULTI_SZ` of **exactly four** entries and deployed-hash capture for **both** DLLs. Nothing is deployed at S3, so the earliest stage that can satisfy it is S5, run with the `UmdD3D12` knob **absent** (which is why the same GATES section also demands `D3D12CreateDevice` still fail). The *content* G6 proves inert comes from S1–S3; the *deploy* it gates on is S5 |
+| G6 | split gate (`umd_common` + `umd12` exist, D3D11 unregressed) | **S5** — ⚠ *not* S2+S3, which was wrong and made G6 unreachable at the stage it was assigned to. `GATES.md` §4.7 requires that `helios_umd12.dll` *"builds, is signed, installs, and is referenced by `UserModeDriverName[3]`"*, with pass criteria that include a `REG_MULTI_SZ` of **exactly four** entries and deployed-hash capture for **both** DLLs. Nothing is deployed at S3, so the earliest stage that can satisfy it is S5, run with the `UmdD3D12` knob **explicitly `0`** (historically absent before the 2026-09-07 default change, which is why the same GATES section also demands `D3D12CreateDevice` still fail). The *content* G6 proves inert comes from S1–S3; the *deploy* it gates on is S5 |
 | G7 | DDI device | S5, with the knob ON — plus S4/S4b for the bridge it exercises |
 | G8 | DDI first frame | S6 |
 | G9 | DDI conformance | S6 |

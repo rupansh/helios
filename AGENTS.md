@@ -42,8 +42,11 @@ perf work needs a new lever, not another sweep. The charter is now, in priority 
    makes its body reachable" — that commit is in): the INF registers `UserModeDriverName[3]`,
    `umd`'s duplicate `OpenAdapter12` export is gone (`umd/src/adapter.rs`), and
    `adapter12::OpenAdapter12`'s body is reachable behind the `UmdD3D12` kill switch
-   (`umd12/src/knobs12.rs`). ⚠ Absent = OFF is still the shipping default, and flipping it is a
-   change to dwm's behaviour, not a test app's. Verified 2026-09-05 with `UmdD3D12=1`:
+   (`umd12/src/knobs12.rs`). **Absent = ON as of the owner's 2026-09-07 default change**;
+   explicit `UmdD3D12=0` preserves the disable for new processes, including dwm.
+   The enabled .270 stack passed the four native ordering cases and completed
+   Time Spy/Fire Strike; broader acceptance limits remain in ROADMAP.md.
+   Verified 2026-09-05 with `UmdD3D12=1`:
    `OpenAdapter12=0` refusals and a real `CreateDevice` in `umd12-<pid>.log`.
 3. **Stability** — unchanged and still non-negotiable: buffer rotation, resize, suspend/resume,
    device restart, cold boot, DWM recovery, TDR. No hacks; loud failure over fake success.

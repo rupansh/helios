@@ -3744,8 +3744,9 @@ enumerated — see §17.1.
    *driver fault*, so an ordinary negotiation looks like a bug.
 
 6. **The whole D3D12 path stays behind `HKLM\SOFTWARE\Helios!UmdD3D12` (`DECISIONS.md` D11),** read
-   once per process at the top of `OpenAdapter12`; absent ⇒ `DXGI_ERROR_UNSUPPORTED`, bit-identical
-   to a build without D3D12. ⚠ dwm.exe already calls `OpenAdapter12` in production.
+   once per process at the top of `OpenAdapter12`; explicit DWORD `0` returns
+   `DXGI_ERROR_UNSUPPORTED` before reading adapter arguments. Absent enables D3D12
+   since the owner's 2026-09-07 default change. ⚠ dwm.exe already calls this in production.
 
 ---
 

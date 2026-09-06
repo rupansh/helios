@@ -17,12 +17,18 @@ Assert-Command "meson.exe" | Out-Null
 Assert-Command "ninja.exe" | Out-Null
 Assert-Command "cargo.exe" | Out-Null
 Assert-Command "cargo-make.exe" | Out-Null
+Assert-Command "widl.exe" | Out-Null
+Assert-Command "glslangValidator.exe" | Out-Null
 
 $stampInf = Find-WindowsKitTool "stampinf.exe"
 $inf2Cat = Find-WindowsKitTool "Inf2Cat.exe"
 $kitBin = Split-Path -Parent $stampInf
 $env:PATH = "$kitBin;$env:PATH"
 $env:LIBCLANG_PATH = Split-Path -Parent $clangCl
+$env:CC = $clangCl
+$env:CXX = $clangCl
+# Keep rustup's per-directory `nightly` override from bypassing the CI pin.
+if ($env:RUST_TOOLCHAIN) { $env:RUSTUP_TOOLCHAIN = $env:RUST_TOOLCHAIN }
 
 $dxvkSource = Join-Path $RepoRoot "dxvk-helios"
 $dxvkBuild = Join-Path $BuildRoot "dxvk"
@@ -60,8 +66,27 @@ if ($LASTEXITCODE -ne 0) { throw "DXVK meson setup failed with exit code $LASTEX
 & meson.exe compile -C $dxvkBuild
 if ($LASTEXITCODE -ne 0) { throw "DXVK build failed with exit code $LASTEXITCODE." }
 
+$vkd3dSource = Join-Path $RepoRoot "vkd3d-proton-helios"
+$vkd3dBuild = Join-Path $BuildRoot "vkd3d"
+if (Test-Path -LiteralPath $vkd3dBuild) {
+    Remove-Item -LiteralPath $vkd3dBuild -Recurse -Force
+}
+# Match the active win11 vkd3d build: clang-cl 22.1.8, release, /MD.
+# The C pointer diagnostic remains a warning, as in that build. Do not copy
+# DXVK's /MT setting: umd12's engine, bridge and Rust target use the dynamic CRT.
+& meson.exe setup $vkd3dBuild $vkd3dSource `
+    --native-file $nativeFile `
+    --buildtype release `
+    -Db_vscrt=md `
+    -Denable_tests=false `
+    "-Dc_args=-Wno-error=incompatible-pointer-types"
+if ($LASTEXITCODE -ne 0) { throw "vkd3d meson setup failed with exit code $LASTEXITCODE." }
+& meson.exe compile -C $vkd3dBuild helios_d3d12_static
+if ($LASTEXITCODE -ne 0) { throw "vkd3d static engine build failed with exit code $LASTEXITCODE." }
+
 $env:HELIOS_DXVK_SRC = $dxvkSource
 $env:HELIOS_DXVK_BUILD = $dxvkBuild
+$env:HELIOS_VKD3D_BUILD = $vkd3dBuild
 $env:HELIOS_CLANG_CL = $clangCl
 $env:HELIOS_MSVC_LIB = $llvmLib
 $env:HELIOS_WDK_INCLUDE = Find-WindowsKitInclude
@@ -83,18 +108,23 @@ Set-ItemProperty -LiteralPath $shellFoldersKey -Name $localAppDataName -Value $s
 $env:LOCALAPPDATA = $shortLocalAppData
 
 $kmdRoot = Join-Path $RepoRoot "kmd_render"
+$previousCargoTargetDir = $env:CARGO_TARGET_DIR
+$env:CARGO_TARGET_DIR = Join-Path $kmdRoot "target"
 Push-Location $kmdRoot
 try {
+    $rustcVersion = (& rustc.exe --version) -join "`n"
+    $cargoVersion = (& cargo.exe --version) -join "`n"
     & cargo.exe make --profile release --makefile Cargo.make.toml
     if ($LASTEXITCODE -ne 0) { throw "Helios driver build failed with exit code $LASTEXITCODE." }
 } finally {
     Pop-Location
     Set-ItemProperty -LiteralPath $shellFoldersKey -Name $localAppDataName -Value $previousLocalAppData
     $env:LOCALAPPDATA = $previousLocalAppDataEnvironment
+    $env:CARGO_TARGET_DIR = $previousCargoTargetDir
 }
 
 $package = Join-Path $kmdRoot "target\release\helios_kmd_render_package"
-$required = @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll")
+$required = @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll")
 foreach ($name in $required) {
     if (-not (Test-Path -LiteralPath (Join-Path $package $name) -PathType Leaf)) {
         throw "Driver package output is missing $name in $package."
@@ -122,6 +152,18 @@ if ($dynamicCrtImports.Count -ne 0) {
     throw "helios_umd.dll imports an application-resolvable dynamic CRT: $($dynamicCrtImports -join '; ')"
 }
 
+# D3D12 is a native WDDM UMD with a static engine, never an app-local runtime.
+$umd12Dll = Join-Path $package "helios_umd12.dll"
+$umd12Exports = @(& $llvmReadObj --coff-exports $umd12Dll 2>&1)
+if ($LASTEXITCODE -ne 0 -or -not ($umd12Exports -match '^\s*Name: OpenAdapter12\s*$')) {
+    throw "helios_umd12.dll does not export the required OpenAdapter12 entry point."
+}
+$umd12Imports = @(& $llvmReadObj --coff-imports $umd12Dll 2>&1)
+if ($LASTEXITCODE -ne 0) { throw "Failed to inspect helios_umd12.dll imports." }
+if ($umd12Imports -match '(?i)^\s*Name: (dxgi|d3d12|d3d12core|helios_vkd3d)\.dll\s*$') {
+    throw "helios_umd12.dll imports a DXGI/D3D12 runtime instead of embedding its engine."
+}
+
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 Copy-Item -Path (Join-Path $package "*") -Destination $OutputDir -Recurse -Force
 
@@ -129,7 +171,43 @@ $umdPdb = Join-Path $RepoRoot "umd\target\release\helios_umd.pdb"
 if (Test-Path -LiteralPath $umdPdb -PathType Leaf) {
     Copy-Item -LiteralPath $umdPdb -Destination $OutputDir -Force
 }
+$umd12Pdb = Join-Path $RepoRoot "umd12\target\release\helios_umd12.pdb"
+if (Test-Path -LiteralPath $umd12Pdb -PathType Leaf) {
+    Copy-Item -LiteralPath $umd12Pdb -Destination $OutputDir -Force
+}
 New-Item -ItemType Directory -Force -Path (Join-Path $OutputDir "licenses\dxvk") | Out-Null
 Copy-Item -LiteralPath (Join-Path $dxvkSource "LICENSE") -Destination (Join-Path $OutputDir "licenses\dxvk\LICENSE") -Force
+foreach ($license in @(
+    "LICENSE", "COPYING",
+    "khronos\SPIRV-Headers\LICENSE", "khronos\Vulkan-Headers\LICENSE.md",
+    "subprojects\dxil-spirv\LICENSE.MIT",
+    "subprojects\dxil-spirv\third_party\spirv-headers\LICENSE",
+    "subprojects\dxil-spirv\third_party\SPIRV-Tools\LICENSE",
+    "subprojects\dxil-spirv\third_party\SPIRV-Cross\LICENSE",
+    "subprojects\dxil-spirv\subprojects\dxbc-spirv\LICENSE",
+    "subprojects\dxil-spirv\subprojects\dxbc-spirv\submodules\spirv_headers\LICENSE"
+)) {
+    $destination = Join-Path $OutputDir "licenses\vkd3d\$license"
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
+    Copy-Item -LiteralPath (Join-Path $vkd3dSource $license) -Destination $destination -Force
+}
+
+# Record the selected tools, rather than treating the workflow pins as proof
+# of which compiler Meson or rustup actually used.
+$toolchain = [ordered]@{
+    clang = (& $clangCl --version) -join "`n"
+    libclang = (Get-Item (Join-Path $env:LIBCLANG_PATH "libclang.dll")).VersionInfo.FileVersion
+    rustc = $rustcVersion
+    cargo = $cargoVersion
+    meson = (& meson.exe --version) -join "`n"
+    ninja = (& ninja.exe --version) -join "`n"
+    widl = (& widl.exe -V) -join "`n"
+    glslang = (& glslangValidator.exe --version) -join "`n"
+    msvc = $env:VCToolsVersion
+    wdkInclude = $env:HELIOS_WDK_INCLUDE
+    dxvk = Get-Content (Join-Path $dxvkBuild "meson-info\intro-compilers.json") -Raw | ConvertFrom-Json
+    vkd3d = Get-Content (Join-Path $vkd3dBuild "meson-info\intro-compilers.json") -Raw | ConvertFrom-Json
+}
+$toolchain | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $OutputDir "toolchain.json") -Encoding UTF8
 
 Write-Host "Driver artifact staged at $OutputDir"

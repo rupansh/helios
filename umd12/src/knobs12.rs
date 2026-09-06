@@ -18,7 +18,7 @@
 //! | Value | Type | Absent |
 //! |---|---|---|
 //! | `Umd12Trace` | DWORD | `false` (explicit non-zero enables) |
-//! | `UmdD3D12` | DWORD | `false` — **the D3D12 kill switch** (D11) |
+//! | `UmdD3D12` | DWORD | `true` — explicit `0` disables D3D12 (D11) |
 //! | `Umd12FormatCaps` | DWORD | `0` — `pfnCheckFormatSupport`'s encoding, as an A/B |
 //! | `Umd12FenceSignalDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnSignalFence` |
 //! | `Umd12EclDelayUs` | DWORD | `0` — **diagnostic**, the F1 delay probe on `pfnExecuteCommandLists` |
@@ -80,30 +80,27 @@ pub(crate) fn umd12_format_caps() -> u32 {
 /// Absent = OFF.
 pub(crate) static UMD12_TRACE: BoolKnob = BoolKnob::new(c"Umd12Trace", false);
 
-/// **The D3D12 kill switch** (`DECISIONS.md` D11). Absent = OFF.
+/// **The D3D12 kill switch** (`DECISIONS.md` D11). Absent = ON; explicit 0 = OFF.
 ///
 /// Read once per process at the top of `adapter12::OpenAdapter12`, above every
-/// other check including the null test. Absent ⇒ `DXGI_ERROR_UNSUPPORTED`, i.e.
+/// other check including the null test. Explicit 0 ⇒ `DXGI_ERROR_UNSUPPORTED`, i.e.
 /// **bit-identical behaviour to a build with no D3D12 path at all**: nothing is
 /// dereferenced, no table is written, and the only trace is the
 /// `OpenAdapter12` refusal counter ticking.
 ///
-/// ⚠ **The default is a decision** (AGENTS.md rule 8), and this one is OFF
-/// because `dwm.exe` already calls `OpenAdapter12` on the Helios adapter in
-/// production (`DECISIONS.md` §7.13). The first boot with `UmdD3D12=1` is a
-/// change to the compositor's behaviour, not a change to a test app's.
-///
-/// ⛔ **Flipping this default to ON requires the evidence in a comment right
-/// here** — the D12-G7…G11 ladder, a cold boot with zero `helios_umd12.dll`
-/// entries in the id-1000 Application log, and a Fire Strike 3-run median at
-/// D3D11 parity. Until then the opposite value stays reachable as the A/B
-/// disable, which is the other half of that rule.
+/// Owner-directed default change, 2026-09-07. The enabled configuration already
+/// passed all four native runtime ordering cases on .270 after reboot, with
+/// Code 0 and a visible desktop. Completed Time Spy GT1 runs were 118.746094 /
+/// 136.251602 FPS; Fire Strike GT1 was 248.231491 FPS. See
+/// docs/PERFORMANCE_FEEDBACK.md for exact artifacts and post-boot variability.
+/// The owner's shadow acceptance applies to .266; broader ownership, failure
+/// and lifecycle gates remain open. This default change does not close them.
 ///
 /// ⚠ Read once per process, deliberately: a running `dwm` keeps whatever
 /// behaviour it started with while newly created processes pick the change up.
 /// `HKLM\SOFTWARE\Helios` is writable over SSH with the desktop down, so the
 /// switch is usable in exactly the situation it exists for.
-pub(crate) static UMD_D3D12: BoolKnob = BoolKnob::new(c"UmdD3D12", false);
+pub(crate) static UMD_D3D12: BoolKnob = BoolKnob::new(c"UmdD3D12", true);
 
 /// Resolve `HKLM\SOFTWARE\Helios!Umd12Trace` (REG_DWORD) != 0, forcing its
 /// `OnceLock`. Read once per process.

@@ -1,16 +1,20 @@
 //! `helios_umd12.dll` — the Helios D3D12 user-mode display driver.
 //!
-//! # Status: S5. `OpenAdapter12` is REACHABLE, behind the `UmdD3D12` kill switch.
+//! # Status: native D3D12 is enabled by default; `UmdD3D12=0` disables it.
 //!
-//! This crate exists so the two-cdylib layout — build, mirror, sign, install,
+//! The historical S3-S6 bring-up sequence below explains the split. Current
+//! runtime admission/completion and remaining acceptance limits are documented
+//! in `docs/dx12/EXECUTION_SYNC.md` and `ROADMAP.md`.
+//!
+//! This crate was introduced so the two-cdylib layout — build, mirror, sign, install,
 //! and `UserModeDriverName[3]` — can be proven end to end **before** the DDI
 //! surface is written. As of S4 it links the vkd3d engine and can create a real
 //! `ID3D12Device` through [`bridge12`]. As of **S5** it is registered at
 //! `UserModeDriverName[3]`, `umd`'s duplicate `OpenAdapter12` export is gone,
 //! and [`adapter12::OpenAdapter12`] fills all eight adapter slots when
-//! `HKLM\SOFTWARE\Helios!UmdD3D12` is non-zero. It still fills **no DDI table**:
-//! `pfnGetCaps` and `pfnFillDDITable` refuse with named counters until L1 and
-//! S6-0.
+//! `HKLM\SOFTWARE\Helios!UmdD3D12` is non-zero or absent. At S5 it filled no
+//! device DDI table; the subsequent implementation fills the negotiated tables
+//! and retains named refusals for unsupported paths.
 //!
 //! ⛔ **The standing rule this crate was shaped by** (`DECISIONS.md` §7.1,
 //! `DX12.md` §3.2):
@@ -39,14 +43,14 @@
 //! DLL. Code nothing can run is what R908 forbids; code only a probe runs is
 //! evidence.
 //!
-//! # What comes next, in order (`ARCHITECTURE.md` §11)
+//! # Historical bring-up sequence (`ARCHITECTURE.md` §11)
 //!
 //! | stage | content |
 //! |---|---|
 //! | **S3** | `build.rs` + bindgen of `d3d12umddi.h` with `layout_tests(true)` + `ddi12.rs`. The layout assertions ARE the deliverable: if it compiles, the ABI is machine-checked. **DONE.** |
 //! | **S4** | `vkd3d_bridge.{h,cpp}` + `bridge12.rs` — `helios_vkd3d_create_device` and the root-signature serializer, reached by a `tools/` probe. **DONE.** |
 //! | **S4b** | The ICD anchor (`helios_icd_anchor_v1`) — one venus ICD module per process. **DONE.** |
-//! | **S5** | INF + slot 3; `umd` **drops** its `OpenAdapter12` export and this one becomes reachable — **all in one commit** — with the `UmdD3D12` kill switch, default OFF. **This stage.** |
+//! | **S5** | INF + slot 3; `umd` **drops** its `OpenAdapter12` export and this one becomes reachable — **all in one commit** — with the `UmdD3D12` kill switch, originally default OFF. |
 //! | **S6-0** | All 214 device/command-list/queue slots stubbed with counting noops, plus one `install_<lane>()` per lane, so every lane is *substitutive* rather than *additive* (`PARALLEL.md` §3). |
 //! | **S6** | The DDI surface in `forward12/*` across 11 lanes: caps first (H4), then queue, PSO, descriptors, resources, recording, present. |
 //!
@@ -137,16 +141,16 @@ pub(crate) use log::log_self_module_path;
 /// the two lines are greppable apart even when both DLLs are in one process.
 pub(crate) struct Umd12Refusals {
     /// How many times the runtime asked this driver for a D3D12 adapter and was
-    /// refused **because the `UmdD3D12` kill switch is absent or zero** (D11).
+    /// refused **because the `UmdD3D12` kill switch is explicitly zero** (D11).
     ///
     /// ⚠ Its meaning changed at S5 and its name deliberately did not. Before S5
     /// it counted "there is no D3D12 DDI"; now it counts "the D3D12 DDI is
     /// switched off". Both are the same observable fact for the client —
     /// `OpenAdapter12` returned `DXGI_ERROR_UNSUPPORTED` — and keeping the name
     /// keeps `D3D12 DDI refusals:` lines diffable across the S5 boundary.
-    /// **Expected non-zero on every ordinary boot**: dwm calls `OpenAdapter12`
-    /// in production and the knob defaults OFF, so this is the counter that
-    /// proves the kill switch is doing its job.
+    /// **Expected zero with the enabled default.** With explicit DWORD
+    /// `UmdD3D12=0`, calls (including dwm's) increment this counter and prove
+    /// the kill switch refused admission.
     pub(crate) open_adapter12: RefusalCounter,
     /// A `helios_umd12_probe_*_v1` export called with a null out-param or a
     /// null descriptor. Expected 0 — the only caller is
@@ -645,4 +649,3 @@ pub extern "system" fn DllMain(
     }
     1
 }
-

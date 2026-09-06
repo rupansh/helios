@@ -4,13 +4,14 @@ This archive installs the Helios WDDM driver, its x64 user-mode graphics and
 compute stack, and the 32-bit Vulkan/OpenGL components needed by WoW64 games:
 
 - Direct3D 11 through the DXVK core embedded in `helios_umd.dll`
+- Direct3D 12 through vkd3d-proton embedded in `helios_umd12.dll`
 - Vulkan through Mesa Venus (`vulkan_virtio.dll`)
 - desktop OpenGL through Mesa Zink's Microsoft WGL ICD
 - 32-bit Vulkan through a separately built x86 Mesa Venus ICD
 - 32-bit desktop OpenGL through a separately built x86 Zink WGL ICD
 - OpenCL through CLVK with its clspv compiler embedded
 - official Khronos Vulkan and OpenCL loaders when Windows has no loader yet
-- the Microsoft Visual C++ x64 runtime required by the WDDM/DXVK UMD
+- the Microsoft Visual C++ x64 runtime required by the D3D12 UMD
 - optional, app-local DaVinci Resolve GPU-detection shim
 
 ## Install
@@ -56,12 +57,18 @@ Run the health check later with:
 C:\ProgramData\Helios\Verify-Helios.ps1 -RunSmokeTests
 ```
 
-Run that command after the final reboot; the installer performs only the
+Run that command in the logged-in desktop session after the final reboot; the installer performs only the
 non-rendering registration/hash checks before rebooting.
 
 The smoke-test pass includes a 1920x1080 RGBA16F WGL/OpenCL sharing case. It
 requires the matching Helios host image as well as the Windows bundle and
 verifies texture import, acquire, pixel readback, release, and queue finish.
+
+D3D12 is enabled by default. To disable it, set DWORD `UmdD3D12=0` under
+`HKLM\SOFTWARE\Helios` and restart affected applications (reboot for DWM).
+Deleting the value restores the enabled default. Installation preserves an
+existing explicit disable. The D3D12 smoke checks native device creation and
+expects failure when that disable is present.
 
 ## DaVinci Resolve compatibility
 
@@ -91,6 +98,10 @@ this package originally installed, but only if their hashes are unchanged.
 The shared Microsoft Visual C++ runtime is also left installed.
 
 ## Current limits
+
+- D3D12 resource ownership across APIs, host-loss/error propagation, and some
+  teardown paths remain incomplete. Default enablement and device creation
+  smoke coverage do not establish full conformance or visual correctness.
 
 - Native 32-bit Vulkan and OpenGL applications are supported through the x86
   Vulkan loader, Mesa Venus ICD, and Zink WGL ICD included in the bundle.

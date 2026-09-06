@@ -11,6 +11,7 @@ param(
     [Parameter(Mandatory)][string]$RepositoryCommit,
     [Parameter(Mandatory)][string]$MesaCommit,
     [Parameter(Mandatory)][string]$DxvkCommit,
+    [Parameter(Mandatory)][string]$Vkd3dCommit,
     [Parameter(Mandatory)][string]$ClvkCommit,
     [Parameter(Mandatory)][string]$VulkanLoaderCommit,
     [Parameter(Mandatory)][string]$VulkanHeadersCommit,
@@ -48,10 +49,10 @@ foreach ($script in @("Install-Helios.cmd", "Install-Helios.ps1", "Uninstall-Hel
 }
 
 $driverOut = Join-Path $payload "driver"
-foreach ($name in @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll")) {
+foreach ($name in @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll", "toolchain.json")) {
     Copy-Required (Join-Path $DriverArtifact $name) (Join-Path $driverOut $name)
 }
-foreach ($optional in @("helios_kmd_render.pdb", "helios_kmd_render.map", "helios_umd.pdb")) {
+foreach ($optional in @("helios_kmd_render.pdb", "helios_kmd_render.map", "helios_umd.pdb", "helios_umd12.pdb")) {
     $source = Join-Path $DriverArtifact $optional
     if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Required $source (Join-Path $driverOut $optional) }
 }
@@ -86,6 +87,7 @@ foreach ($probe in @(
     "vulkan-smoke.exe",
     "vulkan-wsi-probe.exe",
     "d3d11-smoke.exe",
+    "d3d12-smoke.exe",
     "opengl-smoke.exe",
     "opencl-smoke.exe",
     "opencl-gl-sharing-smoke.exe"
@@ -140,10 +142,11 @@ try {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $certificateOut) | Out-Null
     Export-Certificate -Cert $certificate -FilePath $certificateOut -Type CERT | Out-Null
 
-    # The catalog hashes the SYS and UMD. Sign those first, generate the
+    # The catalog hashes the SYS and both UMDs. Sign those first, generate the
     # catalog over the final bytes, and sign the catalog last.
     Invoke-SignTool $signTool $certificate.Thumbprint (Join-Path $driverOut "helios_kmd_render.sys")
     Invoke-SignTool $signTool $certificate.Thumbprint (Join-Path $driverOut "helios_umd.dll")
+    Invoke-SignTool $signTool $certificate.Thumbprint (Join-Path $driverOut "helios_umd12.dll")
     & $inf2Cat "/driver:$driverOut" "/os:10_X64" /uselocaltime
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $catalog -PathType Leaf)) {
         throw "Inf2Cat failed to produce the Helios catalog."
@@ -186,6 +189,7 @@ $manifest = [ordered]@{
         helios = $RepositoryCommit
         mesa = $MesaCommit
         dxvk = $DxvkCommit
+        vkd3d = $Vkd3dCommit
         clvk = $ClvkCommit
         vulkanLoader = $VulkanLoaderCommit
         vulkanHeaders = $VulkanHeadersCommit
@@ -199,7 +203,11 @@ $manifest = [ordered]@{
         certificate = "certificate/helios-ci-test.cer"
     }
     components = [ordered]@{
-        driver = [ordered]@{ version = $Version; direct3D = "DXVK embedded WDDM UMD" }
+        driver = [ordered]@{
+            version = $Version
+            direct3D = "DXVK D3D11 and vkd3d-proton D3D12 embedded WDDM UMDs"
+            direct3D12DefaultEnabled = $true
+        }
         mesa = [ordered]@{ vulkan = "Venus"; openGL = "Zink WGL ICD"; architectures = @("x64", "x86"); vulkanApiVersion = "1.4.352" }
         openCl = [ordered]@{ implementation = "CLVK"; onlineCompiler = $true }
         compatibility = [ordered]@{ davinciResolve = "App-local AMD ADL detection shim" }
