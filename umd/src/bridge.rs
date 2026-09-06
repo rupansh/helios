@@ -194,6 +194,8 @@ mod ffi {
         /// IddCx consumer never copies a buffer whose writes are in flight.
         /// Returns false on timeout (caller proceeds — bounded by design).
         fn present_frame_gate(self: &HeliosDxvkDevice, timeout_us: u32, order_mode: u32) -> bool;
+        fn flush_present_copy(self: &HeliosDxvkDevice) -> u64;
+        fn wait_present_copy(self: &HeliosDxvkDevice, submission_id: u64, timeout_us: u32) -> i32;
 
         /// # Safety
         /// The three output pointers are live writable u32/u32/u64 storage for
@@ -613,6 +615,15 @@ impl BridgeDevice {
     pub(crate) fn present_frame_gate(&self, timeout_us: u32, order_mode: u32) -> bool {
         self.get()
             .is_some_and(|d| d.present_frame_gate(timeout_us, order_mode))
+    }
+
+    pub(crate) fn flush_present_copy(&self) -> u64 {
+        self.get().map_or(0, |d| d.flush_present_copy())
+    }
+
+    pub(crate) fn wait_present_copy(&self, submission_id: u64, timeout_us: u32) -> i32 {
+        self.get()
+            .map_or(-1, |d| d.wait_present_copy(submission_id, timeout_us))
     }
 
     /// Publish this present on the device's named timeline so a consumer can

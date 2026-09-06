@@ -403,6 +403,9 @@ impl AdapterContext {
     /// thread. PASSIVE_LEVEL only: it allocates the optional system
     /// high-resolution timer exactly once, before this context is published.
     pub unsafe fn init_kernel_events(&self) {
+        // SAFETY: final stable address, before publication. NotificationEvent
+        // wakes all competing submitters; each must retry the protected enqueue.
+        unsafe { KeInitializeEvent(self.control_space_event.get(), 0, 0) };
         // SAFETY: per the fn contract; SynchronizationEvent (type 1), initially
         // signaled (the mutex starts free).
         unsafe { KeInitializeEvent(self.venus_mutex.get(), 1, 1) };

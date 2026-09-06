@@ -2309,6 +2309,9 @@ pub struct VirtioGpu {
     /// old model, a slow host does NOT set this — waiter timeouts abandon
     /// their entry and the transport keeps working.
     failed: bool,
+    /// Retry hint after actual capacity reclamation or terminal failure.
+    /// Protected by virtio_lock; never used to retire any obligation.
+    control_space_epoch: u64,
     /// Scanout-0 preferred size `(width, height)` reported by the host in the
     /// `GET_DISPLAY_INFO` reply at `init` (`pmodes[0]`), or `None` if the host
     /// reported nothing usable. The display half uses this as the VidPn mode +
@@ -2318,6 +2321,10 @@ pub struct VirtioGpu {
 }
 
 impl VirtioGpu {
+    pub(crate) fn control_space_epoch(&self) -> u64 {
+        self.control_space_epoch
+    }
+
     /// Bring the virtio-gpu device online and prove it with `GET_DISPLAY_INFO`.
     /// `passive` is threaded only to reach `DmaBuffer::new` for the
     /// GET_DISPLAY_INFO scratch page; the rest of bring-up is MMIO and PCI
@@ -2594,6 +2601,7 @@ impl VirtioGpu {
             ) != 0,
             scanout_refresh: allocate_scanout_refresh_state(),
             failed: false,
+            control_space_epoch: 0,
             display_mode,
         });
         // `WddmHoldMs` (UV1's instrument). Snapshotted here with every other knob
@@ -3992,6 +4000,7 @@ impl VirtioGpu {
     /// mistake in the Sync-waiter sequence is a use-after-free of a stack block.
     fn latch_failed_and_fail_inflight(&mut self) {
         self.failed = true;
+        self.control_space_epoch = self.control_space_epoch.wrapping_add(1);
         // Neither a host-accepted completion nor a deferred producer boundary
         // survives a terminal transport failure. Clear both value-only slots so
         // no later DPC can publish bookkeeping from this generation.
@@ -4211,6 +4220,7 @@ impl VirtioGpu {
                 self.latch_failed_and_fail_inflight();
                 return;
             }
+            self.control_space_epoch = self.control_space_epoch.wrapping_add(1);
             let mut entry = self.inflight.swap_remove(idx);
             // As in `latch_failed_and_fail_inflight`: take the ownership token
             // out before the `match entry.kind` moves the other fields, so the
@@ -4658,6 +4668,7 @@ impl VirtioGpu {
         let fresh = core::mem::take(&mut self.parked_spare);
         debug_assert!(fresh.capacity() >= MAX_PARKED);
         let dead = core::mem::replace(&mut self.parked, fresh);
+        self.control_space_epoch = self.control_space_epoch.wrapping_add(1);
         let buffers = core::mem::take(&mut self.reap_buffers_spare);
         debug_assert!(buffers.capacity() >= 2 * MAX_PARKED);
         Some((dead, buffers))
@@ -4683,6 +4694,7 @@ impl VirtioGpu {
         self.parked_spare = entries;
         self.reap_buffers_spare = buffers;
         self.reap_in_progress = false;
+        self.control_space_epoch = self.control_space_epoch.wrapping_add(1);
     }
 
     /// Undo [`Self::begin_parked_reap`] on a failure path, restoring both spares

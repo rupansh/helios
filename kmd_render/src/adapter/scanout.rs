@@ -774,6 +774,23 @@ impl AdapterContext {
             b"QfRet",
             crate::virtio::gpu::QUEUE_FULL_RETRIES.load(Ordering::Relaxed),
         );
+        crate::diag::record_named_bytes(b"QSpOn", self.knobs().submit_space_wake as u32);
+        crate::diag::record_named_bytes(
+            b"QSpNtf",
+            super::locks::CONTROL_SPACE_NOTIFIES.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"QSpWake",
+            super::locks::CONTROL_SPACE_WAKES.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"QSpTout",
+            super::locks::CONTROL_SPACE_TIMEOUTS.load(Ordering::Relaxed),
+        );
+        crate::diag::record_named_bytes(
+            b"QSpErr",
+            super::locks::CONTROL_SPACE_ERRORS.load(Ordering::Relaxed),
+        );
         crate::diag::record_named_bytes(
             b"IfHi",
             crate::virtio::gpu::INFLIGHT_HIGH_WATER.load(Ordering::Relaxed),

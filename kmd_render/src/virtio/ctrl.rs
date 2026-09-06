@@ -57,7 +57,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::AtomicU32;
 
 use bytemuck::{bytes_of, Zeroable};
-use wdk_sys::ntddk::{KeDelayExecutionThread, KeWaitForSingleObject};
+use wdk_sys::ntddk::{KeDelayExecutionThread, KeQueryInterruptTimePrecise, KeWaitForSingleObject};
 use wdk_sys::{KEVENT, LARGE_INTEGER, PVOID, STATUS_SUCCESS};
 
 use super::gpu::{
@@ -1437,15 +1437,26 @@ fn submit_venus_async_inner(
     venus.as_mut_slice()[..stream.len()].copy_from_slice(stream);
     let venus_len = stream.len();
 
+    let space_wake = adapter.knobs().submit_space_wake;
+    let mut space_waiter: Option<crate::adapter::ControlSpaceWaiter<'_>> = None;
+    let mut retry_qpc = 0;
+    // SAFETY: nonpageable monotonic query with valid required QPC output storage.
+    let retry_started = if space_wake {
+        unsafe { KeQueryInterruptTimePrecise(&mut retry_qpc) }
+    } else {
+        0
+    };
+
     // Both buffers are carried as loop values for the reason given in
     // `ctrl_roundtrip`: this loop has two of them, so an arm that returns only
     // one is exactly the maintenance mistake the take-then-expect pair used to
     // turn into a bugcheck. As loop values it does not compile.
     let mut budget = Budget::new(ENQUEUE_RETRY_MAX_MS);
     loop {
+        let waiter_ref = &space_waiter;
         let res = adapter.with_virtio(move |v| {
             v.drain_used();
-            match present_stream {
+            let result = match present_stream {
                 Some((stream_owner, cookie, value)) => v.enqueue_async_submit_present_stream(
                     stream_owner,
                     ctx_id,
@@ -1457,7 +1468,13 @@ fn submit_venus_async_inner(
                     venus_len,
                 ),
                 None => v.enqueue_async_submit(ctx_id, ring_idx, meta, venus, venus_len),
+            };
+            if matches!(result, Err((_, _, VirtioError::QueueFull))) {
+                if let Some(waiter) = waiter_ref {
+                    waiter.reset_after_full(v);
+                }
             }
+            result
         });
         match res {
             Err(_) => return Err(VirtioError::DeviceError), // transport gone
@@ -1494,11 +1511,33 @@ fn submit_venus_async_inner(
             Ok(Err((m_back, v_back, VirtioError::QueueFull))) => {
                 meta = m_back;
                 venus = v_back;
-                if budget.charge_slice() {
+                // Preserve the legacy number of retry opportunities and its
+                // no-wake timing. Early signals must not spend that budget in
+                // milliseconds; additionally require five seconds of elapsed
+                // interrupt time. This is not a new hard five-second deadline.
+                let retries_exhausted = budget.charge_slice();
+                // SAFETY: valid required QPC output storage, as above.
+                let elapsed = if space_wake {
+                    unsafe { KeQueryInterruptTimePrecise(&mut retry_qpc) }
+                        .saturating_sub(retry_started)
+                } else {
+                    u64::MAX
+                };
+                if retries_exhausted && elapsed >= ENQUEUE_RETRY_MAX_MS * 10_000 {
                     return Err(VirtioError::QueueFull);
                 }
+                if space_wake && space_waiter.is_none() {
+                    space_waiter = Some(adapter.control_space_waiter());
+                    // Registration may race reclamation: retry under the lock
+                    // before the first wait, so that wake cannot be lost.
+                    continue;
+                }
                 reap_parked(passive, adapter);
-                sleep_ms(passive, RETRY_SLICE_MS);
+                if let Some(waiter) = &space_waiter {
+                    waiter.wait(passive)?;
+                } else {
+                    sleep_ms(passive, RETRY_SLICE_MS);
+                }
             }
             Ok(Err((_m, _v, e))) => return Err(e), // buffers dropped at PASSIVE
         }

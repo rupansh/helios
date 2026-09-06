@@ -403,7 +403,8 @@ the handle until chain teardown; the helper duplicates it, caches an imported
 Vulkan semaphore using exact kernel-object comparison, and retains the import
 through the recorded copy. `clear_present_source_v2` ends the borrowed scope
 and reports whether the DDI recorded a copy, including Present HRESULT failures.
-`helios_umd_wait_last_present` remains the mandatory copy-completion guard.
+The helper copy wait remains the mandatory copy-completion guard; the
+fixed-target pending protocol below supersedes its original timeout policy.
 Steady-state WSI still skips its frame-fence wait. GDI fallback and dropped or
 resize-rejected frames wait their own source fence before reading/recycling.
 A failed copy wait makes the chain terminal and retains the source allocation
@@ -492,7 +493,9 @@ Keep `HELIOS_WSI_ASYNC_PRESENT=1`; the inline path remains outside this work.
 Use clean matching-settings before/after benchmarks per API, without a complex
 interleaved campaign, and preserve visibly correct changing frames. The automated
 74.26 FPS GT1 result used instrumentation and is a separate observation; settings
-equivalence with the owner's benchmark is unproven. No further gain is claimed.
+equivalence with the owner's benchmark is unproven. That acceptance did not
+establish further gains; the separate transport-capacity wake measurements are
+reported in `PERFORMANCE_FEEDBACK.md`.
 
 ### Explicit remaining DX12 synchronization gaps
 
@@ -500,9 +503,9 @@ The bounded HPS2 hook supplies the presented resource's producer boundary.
 The subsequent [HE12 v2 repair](dx12/EXECUTION_SYNC.md) replaces the general
 sample-only ECL bridge and removes the above-watermark private-fence policy.
 It adds runtime-context admission plus exact registered worker completion for
-ECL and Present callbacks. This repair has completed independent review, is
-deployed on .266, and passes the four native ordering cases described in
-EXECUTION_SYNC.md. Those cases and the owner's Time Spy shadow acceptance do
+ECL and Present callbacks. This repair completed independent review, was
+deployed on .266 and is retained in .270. It passes the four native ordering
+cases described in EXECUTION_SYNC.md. Those cases and the owner's .266 Time Spy shadow acceptance do
 not establish all runtime fence, resource-use or lifecycle contracts.
 Nonzero monitored-fence GPU placements and direct D3D12 queue fence DDIs remain
 explicit E_NOTIMPL paths pending their negotiated-contract analysis. These are
@@ -519,3 +522,75 @@ Present-buffer/scanout-reader contracts are preserved. Mixed-API acceptance
 must establish the concrete path's ownership proof; if absent, that path remains
 blocked on this separate contract rather than being declared fixed by HPS2
 retirement. No scheduler, memory-manager or presenter rewrite was introduced.
+
+### Vehicle copy completion: fixed target and pending waits
+
+The 2026-09-06 Steel Nomad Vulkan control failed at acquire after WSI's
+post-Present copy guard exhausted its 32 ms wait. That error does not establish
+a host device failure. The old helper return also conflated pending work with
+a missing context or bridge exception, and each wait selected a fresh flush
+boundary. The repair was deployed in .268 and remains in .270/oem53.inf with release UMD11
+`245D1BC3...` and ICD `3349607B...`; UMD12 is unchanged. The finite-work
+regression probe passed on .268, where Steel Nomad Vulkan completed at
+93.228233 FPS. The final .270 control also completes, at 90.683228 FPS.
+Owner acceptance of the moving scene remains unreceived.
+
+* The vehicle's existing explicit copy flush captures its DXVK submission ID
+  once. The same-thread token retains that ID and its helper device identity;
+  later Present work cannot replace the target. Capture failure keeps a zero,
+  invalid token and the recorded-read obligation, even if Present later fails.
+* `helios_umd_wait_present_copy_v2` returns completed / pending / failure
+  separately. Pending waits never flush. Any non-success device status before
+  or after waiting is failure: CPU cleanup notifications cannot prove a copy
+  completed after submission failure. A stopped CS worker's recording-exception
+  latch also makes the wait fail, including exceptions before queue submission.
+  The old export remains for old ICDs;
+  new ICDs require v2 and report missing exports before falling back to GDI.
+* WSI waits in sleeping slices, default 32 ms, for the fixed copy target.
+  `HELIOS_WSI_VEHICLE_WAIT_US` selects a slice clamped to 1..32 ms, not a
+  device-loss deadline. The first pending slice is counted in the existing
+  `vehicle_wait_timeouts` telemetry and logged with resource/producer identity;
+  eventual completion is logged with elapsed time. A pending slice alone is
+  informational. `wait_err` counts terminal helper/capture errors and must stay
+  zero in healthy acceptance runs; `wait_cancel` counts retained-read cancellation
+  and is expected only in deliberate resize/stop cases. Both are printed in WSI
+  telemetry and on the always-readable terminal diagnostic line.
+* Only confirmed copy completion clears `read_unproven` and permits recycling.
+  Chain error, changed/destroyed surface, helper failure or async-worker stop
+  cancels the wait without releasing the image. Such images retain the existing
+  device-teardown lifetime. The helper COM device is released only after the
+  async worker joins. The raw UMD device registry is not itself a lifetime pin.
+* Acquire's own timeout and status signaling remain unchanged. Pending work
+  keeps an image unavailable; it does not invent `VK_ERROR_DEVICE_LOST`.
+  This follows [Vulkan acquire semantics](https://docs.vulkan.org/refpages/latest/refpages/source/vkAcquireNextImageKHR.html).
+
+No producer wait, consumer-release guard, staging barrier, submission batch or
+scanout protection is removed. No GPU-idle wait is added. Reported engine
+failure and swapchain cancellation end the retry; the previously documented
+host-disconnect/device-loss propagation gap can still prevent an engine from
+reporting failure. Inline WSI and fault/cancellation stress require separate
+runtime acceptance. A completed benchmark will not establish those paths or
+the owner's visible correctness acceptance.
+The new CS-exception latch makes this copy wait fail; it does not repair the
+pre-existing general immediate-context destructor synchronization on a dead
+CS worker. Full CS-failure teardown remains unaccepted.
+
+`tools/vk_vehicle_completion_probe.cpp` is the focused pending regression test:
+warm the real vehicle, submit finite ordered GPU work before the frame, acquire
+the other images and require the submit fence still pending after 80 ms.
+Require NOT_READY/TIMEOUT, wait that exact submission and reacquire the original
+image. All semaphore dependencies are submitted before Present; no future
+host signal or idle wait is used. A GPU that finishes too soon makes this
+test inconclusive, not a pass.
+Require same-PID vehicle LIVE and pending/completed diagnostics alongside its
+PASS result; software GDI can otherwise satisfy the application's checks.
+
+Runtime evidence is `tmp/steel-fix-20260906/candidate-completion-exit`: exit 0,
+same-PID vehicle LIVE, exact delayed producer 602 pending then completed, and
+reacquisition of the original image. The initial run also passed its application
+checks but had a wrapper exit-code collection error; it was not counted as a
+passing harness run. `steel-vulkan-fixed` completed with workload status 0,
+archive/export and 4814 successful helper Presents. Copy waits exceeding 32 ms
+completed without invented device loss. Its final surface-loss cancellation
+retained the outstanding read as the window closed (`wait_cancel=1`); this is
+not evidence for general fault teardown or consumer release.

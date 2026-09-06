@@ -1,6 +1,23 @@
 # DX12 runtime admission and exact execution completion
 
-**State:** .266/oem50.inf is deployed with the updated Mesa ICD after two
+**State:** the .266 HE12 implementation is retained in deployed .270/oem53.inf,
+with the unchanged release UMD12 and a reviewed Steel Nomad Vulkan vehicle-copy
+repair in UMD11/Mesa. .268 changed only the KMD version stamp; .269 adds a
+transport-capacity notification whose wake grants only another protected enqueue
+attempt. It grants no HE12 admission, GPU completion or consumer release. All
+four native ordering cases pass on .269 and .270 with independent GPU readback witnesses.
+The first .269 clean Time Spy comparison improves 112.16 → 137.72 FPS; the
+first .270 check is lower at 118.75 FPS, then one same-build repeat reaches
+136.25 FPS. The larger improvement reproduces later in the boot; the lower
+early run and unresolved variability remain explicit. Final Fire Strike is
+248.23 versus 244.77 FPS.
+See `docs/PERFORMANCE_FEEDBACK.md` for settings, artifacts and limits. .270
+selects the measured capacity-wake default and is active with the override absent,
+Code 0 and the visible desktop. The Vulkan control completes at 90.68 FPS, and
+the same-build Time Spy repeat also completes. Ordering acceptance does not
+establish a stable FPS gain or broader ownership/failure-path correctness.
+The original
+.266/oem50.inf was deployed with the updated Mesa ICD after two
 consecutive dry independent review rounds. Guest reboot and Code 0 are verified;
 D3D12 remains enabled and the desktop is visible. All four native runtime ordering
 cases pass on .266 (session 1, GPU readback witnesses). The owner confirms
@@ -277,15 +294,18 @@ zero. Native runtime software-fence routing is therefore exercised, including
 the cross-process CPU signal. This does not prove all resource-sharing or
 presentation paths.
 
-The owner has accepted realtime Time Spy shadows at recovered throughput.
-Preserve that result during the next bounded DX11/DX12 performance investigation
-in ROADMAP.md. Broader acceptance still requires:
+On .266, the owner accepted realtime Time Spy shadows at recovered throughput.
+That acceptance is not new visual acceptance of .270; the current performance
+investigation and its remaining visual gate are recorded in ROADMAP.md. Broader
+acceptance still requires:
 
 - Queue/device teardown while waiting, producer loss, cancellation and normal
   completed teardown; no stuck worker, synthetic DMA completion or new crash.
 - Native Time Spy GT1/GT2 coverage with visibly changing frames and correct
-  moving shadows; the owner reports a shadow pass, without specifying individual
-  subtests. Steel Nomad DX12 remains the reported unaffected rendering control.
+  moving shadows; the owner's .266 shadow pass did not specify individual
+  subtests. Steel Nomad DX12 was the historically reported unaffected rendering
+  control; the current performance investigation explicitly uses Steel Nomad
+  **Vulkan**, as recorded in `docs/PERFORMANCE_FEEDBACK.md`.
   Collect runtime/ETW ordering evidence for a regression. Do not infer rendering
   correctness from scores or introduce a focus-stealing capture during 3DMark.
 - Mixed DX11/DX12 and cross-process resource sharing, unchanged SRV bindings,

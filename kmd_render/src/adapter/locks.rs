@@ -18,7 +18,7 @@ use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use wdk_sys::ntddk::{
-    KeAcquireSpinLockRaiseToDpc, KeReleaseSpinLock, KeSetEvent, KeWaitForSingleObject,
+    KeAcquireSpinLockRaiseToDpc, KeClearEvent, KeReleaseSpinLock, KeSetEvent, KeWaitForSingleObject,
 };
 use wdk_sys::PVOID;
 
@@ -37,6 +37,68 @@ use super::AdapterContext;
 /// call was made with was not the one it woke up with. Mirrored from
 /// `pacing_snapshot`, a PASSIVE site, because this one runs at DISPATCH.
 pub(crate) static WITH_VIRTIO_TORN: AtomicU32 = AtomicU32::new(0);
+
+pub(crate) static CONTROL_SPACE_NOTIFIES: AtomicU32 = AtomicU32::new(0);
+pub(crate) static CONTROL_SPACE_WAKES: AtomicU32 = AtomicU32::new(0);
+pub(crate) static CONTROL_SPACE_TIMEOUTS: AtomicU32 = AtomicU32::new(0);
+pub(crate) static CONTROL_SPACE_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+/// A retry hint registration, borrowing the stable adapter rather than its
+/// replaceable transport. Constructed lazily after the first QueueFull.
+pub(crate) struct ControlSpaceWaiter<'a> {
+    adapter: &'a AdapterContext,
+}
+
+impl ControlSpaceWaiter<'_> {
+    /// Called only inside the failed enqueue's virtio_lock hold. A successful
+    /// competing enqueue must never clear a useful capacity notification.
+    pub(crate) fn reset_after_full(&self, _transport: &mut VirtioGpu) {
+        // SAFETY: initialized adapter-owned event, stable for this borrow;
+        // KeClearEvent is legal at DISPATCH_LEVEL and does not wait.
+        unsafe { KeClearEvent(self.adapter.control_space_event.get()) };
+    }
+
+    pub(crate) fn wait(&self, _passive: PassiveLevel) -> Result<(), crate::virtio::VirtioError> {
+        // SAFETY: LARGE_INTEGER is an initialized plain integer union.
+        let mut timeout: wdk_sys::LARGE_INTEGER = unsafe { core::mem::zeroed() };
+        timeout.QuadPart = -10_000; // Existing 1 ms fallback, in 100 ns units.
+                                    // SAFETY: stable adapter-owned dispatcher object; PASSIVE, non-alertable
+                                    // KernelMode wait outside every transport/notification lock. The borrow
+                                    // lasts until this wait and its RAII registration have both ended.
+        let status = unsafe {
+            KeWaitForSingleObject(
+                self.adapter.control_space_event.get() as PVOID,
+                0,
+                0,
+                0,
+                &mut timeout,
+            )
+        };
+        match status {
+            wdk_sys::STATUS_SUCCESS => {
+                CONTROL_SPACE_WAKES.fetch_add(1, Ordering::Relaxed);
+            }
+            wdk_sys::STATUS_TIMEOUT => {
+                CONTROL_SPACE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {
+                CONTROL_SPACE_ERRORS.fetch_add(1, Ordering::Relaxed);
+                return Err(crate::virtio::VirtioError::DeviceError);
+            }
+        }
+        // Neither result is admission or completion. Both require a fresh
+        // protected enqueue; timeout only covers absent/delayed interrupts.
+        Ok(())
+    }
+}
+
+impl Drop for ControlSpaceWaiter<'_> {
+    fn drop(&mut self) {
+        self.adapter
+            .control_space_waiters
+            .fetch_sub(1, Ordering::Release);
+    }
+}
 
 /// Proof that this adapter's WDDM notification spinlock is currently held.
 ///
@@ -321,11 +383,34 @@ impl AdapterContext {
         // SAFETY: spinlock-guarded exclusive access to the cell's contents for the
         // duration of the critical section.
         let result = match unsafe { &mut *self.virtio.get() } {
-            Some(v) => Ok(f(v)),
+            Some(v) => {
+                let before = v.control_space_epoch();
+                let result = f(v);
+                if v.control_space_epoch() != before {
+                    self.signal_control_space();
+                }
+                Ok(result)
+            }
             None => Err(NotStarted),
         };
         // SAFETY: same address/IRQL pair the acquire above produced.
         unsafe { KeReleaseSpinLock(lock, irql) };
         result
+    }
+
+    pub(crate) fn control_space_waiter(&self) -> ControlSpaceWaiter<'_> {
+        self.control_space_waiters.fetch_add(1, Ordering::AcqRel);
+        ControlSpaceWaiter { adapter: self }
+    }
+
+    /// Called under virtio_lock after real reclamation/failure or transport
+    /// replacement. No GPU/wire/consumer state is changed by this notification.
+    pub(super) fn signal_control_space(&self) {
+        if self.control_space_waiters.load(Ordering::Acquire) != 0 {
+            CONTROL_SPACE_NOTIFIES.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: initialized in place for the live adapter; Wait=FALSE is
+            // DISPATCH-safe. No ISR calls this accessor or takes virtio_lock.
+            unsafe { KeSetEvent(self.control_space_event.get(), 0, 0) };
+        }
     }
 }

@@ -1305,6 +1305,8 @@ unsafe fn dxgi_present_impl(
                     VEHICLE.with(|c| {
                         c.set(VehicleSlot::Minted {
                             device: h.pDrvPrivate as usize,
+                            submission_id: 0,
+                            pending_reported: false,
                         })
                     });
                 }
@@ -1313,7 +1315,16 @@ unsafe fn dxgi_present_impl(
                     return hr;
                 }
             }
-            context.Flush();
+            // The same explicit copy flush as before, now retaining its exact
+            // completion boundary before later Present work can advance it.
+            let submission_id = helios_device(h).map_or(0, |dev| dev.dxvk.flush_present_copy());
+            VEHICLE.with(|c| {
+                c.set(VehicleSlot::Minted {
+                    device: h.pDrvPrivate as usize,
+                    submission_id,
+                    pending_reported: false,
+                })
+            });
         } else {
             // A direct primary already is the scanout backing. Do not copy it
             // through the adapter-owned LINEAR target; Present will publish its
@@ -1541,14 +1552,7 @@ unsafe fn dxgi_present_impl(
     };
 
     if is_vehicle_present {
-        // `wait_last_present` targets the device recorded here. The
-        // `result: Option<(fenceId, value)>` this slot used to carry went with
-        // R912(a) -- it could only ever be None.
-        VEHICLE.with(|c| {
-            c.set(VehicleSlot::Minted {
-                device: h.pDrvPrivate as usize,
-            })
-        });
+        // Keep the copy token captured above, including on later failures.
         let n = EXT_PRESENTS.fetch_add(1, Ordering::Relaxed);
         if n < 4 || (n + 1) % 512 == 0 {
             log_error!(

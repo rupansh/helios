@@ -21,20 +21,103 @@ observed approximately 100 FPS in their benchmark.** This supersedes the .265
 are not established as equivalent to the owner's run. Do not use 75 FPS as the
 owner's baseline or attribute the difference to instrumentation without evidence.
 
-The accepted stack uses KMD **22.22.266.0 / oem50.inf**, the updated Mesa ICD,
+The owner's accepted stack used KMD **22.22.266.0 / oem50.inf**, the updated Mesa ICD,
 release UMD11/UMD12, `UmdD3D12=1`, `HELIOS_WSI_ASYNC_PRESENT=1` and the existing
 `HELIOS_RETIRE_FEEDBACK` workaround with stock virglrenderer. Source/build and
 four-case native ordering checks pass; broad sharing, unchanged SRV bindings,
 rotation/resize, teardown and WSI stress remain separate acceptance work.
 
-**Next task: investigate whether a further 10–20% gain is achievable in both
-DX11 and DX12 while preserving the synchronization repair.** Establish clean,
-matching-settings Fire Strike and Time Spy baselines on the actual loaded stack,
-then identify a measured bottleneck before changing code. Check shared ICD
-submission/completion, queue batching and staging/WSI costs before choosing a
-lever; these are investigation targets, not established causes. Read archived
-WS2 results before repeating a rejected approach. The old 3.7 ms producer floor
-is historical and must not be assumed for this stack.
+**Performance follow-up: DX12 first, Steel Nomad Vulkan as the control.**
+The initial capacity-wake comparison improves Time Spy **112.16 → 137.72 FPS
+(+22.79%)**, with Fire Strike **244.77 → 245.57 FPS (+0.33%, effectively flat)**.
+On the final default-enabled .270 package after reboot, the first checks are
+**118.75 FPS Time Spy (+5.87%) / 248.23 FPS Fire Strike (+1.41%)**. One same-build
+Time Spy repeat reaches **136.25 FPS (+21.47%)**, reproducing the initial larger
+DX12 gain later in the boot. Keep the lower early run and unresolved variability
+explicit; this is not a minimum-gain guarantee.
+No 10–20% gain in both APIs has been demonstrated. Earlier standard GT1 baselines
+were **243.93 FPS Fire Strike / 112.78 FPS Time Spy**. A reviewed coherent-
+cached feedback allocation experiment measured **203.73 FPS DX11 (-16.48%) /
+111.50 FPS DX12 (-1.13%)**. It was reversed; the exact accepted ICD restored
+Fire Strike to **244.43 FPS**. Do not repeat that allocation experiment or the
+archived WS2 queue-depth/allocation-cache sweeps without new causal evidence.
+The old 3.7 ms producer floor is historical, not an assumed current bound.
+
+The subsequent native Time Spy CPU/queue profile identifies approximately
+**eight graphics EXECUTEs and two compute EXECUTEs per frame**. In an 8.014 s
+window, the graphics worker spends **5.003 s before Vulkan execution, including
+4.805 s blocked**, 0.303 s in the Vulkan execution region and 1.712 s afterward.
+Actual loaded-DLL disassembly and context-switch stacks locate the long waits
+in the runtime-admission event. Required cross-queue dependencies have not yet
+been separated from excess completion/admission delivery latency. Those waits
+must remain; queue spans overlap and are not GPU hardware timings.
+
+Raw PCs also prove **23.87% of process CPU samples spinning on the vkd3d
+logger lock**, over the full 8.898 s CPU trace. A reviewed logger mutex change
+preserved every diagnostic and removed that sampled body hotspot, but clean
+Time Spy measured **113.56 → 111.94 FPS (-1.43%)**: no demonstrated FPS gain.
+The small difference is not a statistically established regression. The
+candidate was tested through .267/oem51.inf (version stamp only; executable
+KMD sections unchanged), then reversed from source and deployment. The guest
+was restored to **.266/oem50.inf** with the exact original release UMDs and ICD.
+Final restoration GT1 checks completed at **249.11 FPS Fire Strike / 108.33 FPS
+Time Spy**, with original DLLs verified. These are restoration results, not
+gains; the Time Spy variation also precludes treating -1.43% as a proven
+regression. Candidate moving-scene/shadow acceptance was not received from the
+owner. Steel Nomad Vulkan again failed at swapchain acquisition on restored
+.266 at that stage.
+
+**Steel Nomad Vulkan repair landed in .268 and remains deployed on .270/oem53.inf.** The previous
+32 ms consumer-copy timeout was incorrectly treated as device loss. The helper
+now captures one exact DXVK submission and distinguishes pending/completed/error;
+WSI waits in sleeping slices while retaining the consumer read and source image.
+Two dry independent review rounds, the finite-work pending/reacquire probe and
+the standard Vulkan benchmark pass: **93.228233 FPS / score 9322**, status 0,
+archive/export, 4814 successful helper Presents. .268's KMD executable sections
+and UMD12 were unchanged; .269 retains that UMD12 and adds capacity wakes below.
+Owner moving-scene acceptance and broader failure/inline
+WSI stress remain open; see HPS2_REFACTOR and the performance report.
+
+Guest capture/interactive observer tasks caused benchmark-isolation concerns;
+the owner did not interact with either workload. Captures now use host VNC;
+profiling observers run through win MCP in session 0. Benchmarks alone run in
+interactive scheduled tasks. Isolated matching GT1 baselines on .268 completed
+at **244.769699 FPS Fire Strike / 112.164719 FPS Time Spy**. Two prior Fire
+Strike attempts failed entering fullscreen and are excluded.
+
+The measured improvement targets transport backpressure. In a one-second Time
+Spy CSwitch slice, 14 graphics completion submits spent **92.846 ms** in the KMD
+QueueFull retry sleep; a fresh isolated .268 profile corroborated **104.056 ms**
+across 12 such delays. .269 adds a stable
+adapter event notified by real descriptor/parked-capacity reclamation; every wake
+retries the same protected enqueue. .269 was measured with `SubSpaceWake=1`;
+.270 selects that measured default and is deployed as oem53.inf, Code 0, with
+the override absent. It passed the Windows build, two dry finalization reviews
+and all four native ordering cases. Both final per-API runs complete; the Vulkan
+control also completes at **90.68 FPS / score 9068**, with 4721 successful helper
+Presents. The same-build Time Spy repeat also completes; all final settings and
+artifacts are verified, with no new wake errors.
+`SubSpaceWake=0` remains the timed-polling disable.
+`QSpOn` records the arm; healthy **QSpErr=0**. `QSpNtf`, `QSpWake` and `QSpTout`
+are notification/wake/fallback counts, never completion or performance proof.
+Two consecutive dry reviews, the Windows build, 213 existing logic tests and all
+four native synchronization cases pass on .269. Both clean after benchmarks have
+status 0, archive/export, matching completed workload settings (excluding run
+identifiers, output paths and reboot-dependent LUIDs) and matching non-KMD
+binaries. QSpErr remained 0. In separate profiles, graphics post-execution
+waiting falls **0.807 → 0.122 ms per frame callback (-84.8%)**; exact completion
+submit waits in the one-second stack slice fall **104.056 → 13.239 ms**. These
+are CPU worker waits, not hardware GPU time. Host VNC confirms changing Time
+Spy frames; owner shadow acceptance remains open. No queue capacity,
+batching, wire/GPU retirement, ownership or consumer-release rule is relaxed.
+
+The [performance report](docs/PERFORMANCE_FEEDBACK.md) records completed
+comparisons, exact artifacts, raw-PC and clock-alignment evidence, rejected
+patches, diagnostic limitations and the Vulkan-control acquisition repair.
+**The clean Time Spy baseline emitted 77691 pending-allocator-reset
+diagnostics**; fence-worker reference-release lag and premature pool reuse
+remain unresolved. Reducing logger contention does not repair that lifetime
+question. Keep it and the broader DX12 ownership/failure-path gaps explicit.
 
 The owner explicitly requests a focused completed before/after benchmark per
 API, without a complex interleaved A/B campaign. Repeat only to resolve a failure

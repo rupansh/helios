@@ -1488,6 +1488,25 @@ bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us,
   return *outcome;
 }
 
+std::uint64_t HeliosDxvkDevice::flush_present_copy() const {
+  return bridge_guard("flush_present_copy", std::uint64_t(0), [&]() -> std::uint64_t {
+    if (!impl || !impl->context || impl->device->getDeviceStatus() != VK_SUCCESS)
+      return 0;
+    return static_cast<dxvk::D3D11ImmediateContext*>(impl->context)->HeliosFlushFrame();
+  });
+}
+
+std::int32_t HeliosDxvkDevice::wait_present_copy(
+    std::uint64_t submission_id, std::uint32_t timeout_us) const {
+  return bridge_guard("wait_present_copy", -1, [&]() -> std::int32_t {
+    if (!impl || !impl->context || !submission_id)
+      return -1;
+    const auto status = static_cast<dxvk::D3D11ImmediateContext*>(impl->context)
+      ->HeliosWaitSubmissionComplete(submission_id, timeout_us);
+    return status == VK_SUCCESS ? 0 : status == VK_TIMEOUT ? 1 : -1;
+  });
+}
+
 std::int32_t HeliosDxvkDevice::present_vehicle_copy(
     std::size_t dst_resource_ptr,
     std::size_t src_resource_ptr,

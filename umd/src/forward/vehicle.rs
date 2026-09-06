@@ -56,13 +56,13 @@ pub(crate) enum VehicleSlot {
     Idle,
     /// A source was armed and the vehicle `Present` has not consumed it yet.
     Armed(PresentSource),
-    /// A vehicle present was MINTED on `device`, which
-    /// `helios_umd_wait_last_present` then targets. R912(a) removed the
-    /// `result: Option<(u32, u64)>` half: it could only ever be `None`, since
-    /// its only producer was `present_sync_publish` behind a knob that
-    /// defaulted off.
+    /// A helper read was recorded. Its existing flush captures one submission
+    /// boundary; zero means capture failed and never permits source release.
+    /// The ICD retains the helper device through every same-thread wait.
     Minted {
         device: usize,
+        submission_id: u64,
+        pending_reported: bool,
     },
 }
 
@@ -142,12 +142,16 @@ pub fn set_present_source(
 }
 
 /// Backing for the `helios_umd_wait_last_present` C export: bounded wait for
-/// the last vehicle present's submission (frame copy included) to complete
-/// on the GPU. 0 = complete, 1 = timeout, -1 = no vehicle present recorded
-/// on this thread.
+/// the recorded vehicle copy's fixed submission to complete on the GPU.
+/// 0 = complete, 1 = pending, -1 = missing token/context or device/bridge error.
+/// Repeated pending waits neither flush nor move the captured boundary.
 pub fn wait_last_present(timeout_us: u32) -> i32 {
-    let dev_ptr = match VEHICLE.with(|c| c.get()) {
-        VehicleSlot::Minted { device, .. } => device,
+    let (dev_ptr, submission_id, pending_reported) = match VEHICLE.with(|c| c.get()) {
+        VehicleSlot::Minted {
+            device,
+            submission_id,
+            pending_reported,
+        } => (device, submission_id, pending_reported),
         VehicleSlot::Idle | VehicleSlot::Armed(_) => return -1,
     };
     if dev_ptr == 0 {
@@ -179,11 +183,28 @@ pub fn wait_last_present(timeout_us: u32) -> i32 {
     // that the ordinary present path answers is a different question with a
     // different answer -- which is why deleting the `PresentOrder` knob (owner
     // directive, 2026-07-29) does not touch this call.
-    if dev.dxvk.present_frame_gate(timeout_us, PRESENT_ORDER_COMPLETE) {
-        0
-    } else {
-        1
+    let result = dev.dxvk.wait_present_copy(submission_id, timeout_us);
+    if result != 1 || !pending_reported {
+        if result != 0 || pending_reported {
+            log_error!(
+                "vehicle copy wait: device=0x{:x} submission={} result={} pending_before={}",
+                dev_ptr,
+                submission_id,
+                result,
+                pending_reported as u32
+            );
+        }
     }
+    if result == 1 && !pending_reported {
+        VEHICLE.with(|c| {
+            c.set(VehicleSlot::Minted {
+                device: dev_ptr,
+                submission_id,
+                pending_reported: true,
+            })
+        });
+    }
+    result
 }
 
 /// The vehicle present body: cached alias-import of the ICD frame, image copy

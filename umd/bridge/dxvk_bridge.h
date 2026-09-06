@@ -196,6 +196,13 @@ struct HeliosDxvkDevice {
   //     still outstanding — the stale-frame window this gate exists to close.
   bool present_frame_gate(std::uint32_t timeout_us, std::uint32_t order_mode) const;
 
+  // Vehicle consumer release: capture once at the existing copy flush, then
+  // wait for that immutable submission. 0 capture / negative wait = failure;
+  // wait 0 = completed, 1 = still pending. Neither wait arm submits more work.
+  std::uint64_t flush_present_copy() const;
+  std::int32_t wait_present_copy(std::uint64_t submission_id,
+                               std::uint32_t timeout_us) const;
+
   // Dcomp present vehicle (road 4 unit 2): record an image-level copy of the
   // imported ICD frame (src) into the vehicle backbuffer texture (dst) on
   // the open command list. Sources the import's LIVE storage (the

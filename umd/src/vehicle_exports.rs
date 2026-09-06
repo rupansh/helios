@@ -42,6 +42,15 @@ pub extern "system" fn helios_umd_wait_last_present(timeout_us: u32) -> i32 {
     forward::wait_last_present(timeout_us)
 }
 
+/// Fixed-copy completion protocol. The helper device stays retained by WSI
+/// throughout the same-thread set/Present/clear/wait sequence. 0 = complete,
+/// 1 = pending (safe to retry the SAME captured submission), negative = error.
+/// This separate export prevents new ICDs retrying the older ambiguous wait.
+#[no_mangle]
+pub extern "system" fn helios_umd_wait_present_copy_v2(timeout_us: u32) -> i32 {
+    forward::wait_last_present(timeout_us)
+}
+
 /// Ends the same-thread borrowed handle scope. See forward::clear_present_source.
 #[no_mangle]
 pub extern "system" fn helios_umd_clear_present_source_v2() -> i32 {

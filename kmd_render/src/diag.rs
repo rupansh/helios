@@ -603,6 +603,10 @@ pub mod knobs {
     /// exactly. Snapshotted at transport init, so `pnputil /restart-device`
     /// flips it without a reboot.
     pub const PRESENT_EXACT_WATERMARK: KnobName = KnobName::new(b"PresentWmk");
+
+    /// Default-enabled capacity notification for retry of a full Venus transport
+    /// queue. 0 preserves historical 1 ms polling; no capacity change.
+    pub const SUBMIT_SPACE_WAKE: KnobName = KnobName::new(b"SubSpaceWake");
     /// `WddmHoldMs` (default 0 = OFF, and OFF is the only shipping value).
     ///
     /// # THE KNOB IS THE EXPERIMENT (UV1, `docs/dx12/KMD_IMPACT.md` §14a.1)

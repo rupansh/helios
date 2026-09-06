@@ -24,8 +24,9 @@ use helios_kmd_logic::DisplayMode;
 mod backing;
 mod kobj;
 mod locks;
-mod read_ledger;
+pub(crate) use locks::ControlSpaceWaiter;
 pub(crate) mod producer;
+mod read_ledger;
 mod scanout;
 mod segments;
 mod tracking;
@@ -121,6 +122,8 @@ pub(crate) const VIDMM_VRAM_MB_AUTO: u32 = u32::MAX;
 
 #[derive(Clone, Copy)]
 pub(crate) struct AdapterKnobs {
+    /// Event-driven Venus backpressure retry. 0 restores timed polling.
+    pub submit_space_wake: bool,
     /// `AllocCached` (default 1). When set, CpuVisible allocations are
     /// additionally flagged `Cached` so dxgkrnl maps CPU views write-back
     /// instead of write-combined. The BAR window is RAM-backed host shmem (x86
@@ -222,6 +225,7 @@ impl AdapterKnobs {
     /// "what does this driver do with no registry configuration at all".
     #[allow(dead_code)]
     pub const DEFAULTS: Self = Self {
+        submit_space_wake: true,
         alloc_cached: true,
         bind_flush_immediate: false,
         dispatch_bind: true,
@@ -247,6 +251,12 @@ impl AdapterKnobs {
         use crate::diag::{knobs, read_config_dword};
         Self {
             alloc_cached: read_config_dword(knobs::ALLOC_CACHED, 1) != 0,
+            // 2026-09-06, completed matching GT1 runs on .269 with this enabled:
+            // Time Spy 112.164719 -> 137.724655 FPS (+22.79%); Fire Strike
+            // 244.769699 -> 245.570770 (+0.33%, no established DX11 gain).
+            // See docs/PERFORMANCE_FEEDBACK.md and
+            // tmp/dx12-profile-20260906/space-comparison.json. Keep 0 reachable.
+            submit_space_wake: read_config_dword(knobs::SUBMIT_SPACE_WAKE, 1) != 0,
             bind_flush_immediate: read_config_dword(knobs::BIND_FLUSH_MODE, 0) == 1,
             dispatch_bind: read_config_dword(knobs::DISPATCH_BIND, 1) != 0,
             present_probe: read_config_dword(knobs::PRESENT_PROBE, 0) != 0,
@@ -470,6 +480,11 @@ pub struct AdapterContext {
     /// boot-stack budget; see `VirtioGpu::init`.
     /// Guarded by `virtio_lock`; `None` until StartDevice (and after StopDevice).
     virtio: UnsafeCell<Option<Box<VirtioGpu>>>,
+    /// Capacity retry hint only, never GPU or wire completion authority. Kept at
+    /// the adapter's stable address across transport replacement. Initialized in
+    /// place before publication; DDI/adapter rundown protects waiting callers.
+    control_space_event: UnsafeCell<KEVENT>,
+    control_space_waiters: AtomicU32,
     /// PASSIVE-level serialization for scanout selection versus allocation
     /// destruction. A Windows primary can be replaced while an asynchronous
     /// SET_SCANOUT_BLOB/RESOURCE_FLUSH is outstanding; destruction must first
@@ -1057,6 +1072,9 @@ impl AdapterContext {
             isr_status: AtomicUsize::new(0),
             virtio_lock: UnsafeCell::new(0),
             virtio: UnsafeCell::new(None),
+            // SAFETY: inert placeholder, initialized in place before publication.
+            control_space_event: UnsafeCell::new(unsafe { core::mem::zeroed() }),
+            control_space_waiters: AtomicU32::new(0),
             // Zeroed placeholder — initialized in place by init_kernel_events.
             scanout_mutex: UnsafeCell::new(unsafe { core::mem::zeroed() }),
             mappings: crate::mapping::MappingTable::new(),
@@ -1569,6 +1587,8 @@ impl AdapterContext {
         // swaps the Option in/out of the cell (no allocation, no device I/O).
         let irql = unsafe { KeAcquireSpinLockRaiseToDpc(self.virtio_lock.get()) };
         let old = core::mem::replace(unsafe { &mut *self.virtio.get() }, new);
+        // Retry against the new/absent transport; the event belongs to the adapter.
+        self.signal_control_space();
         unsafe { KeReleaseSpinLock(self.virtio_lock.get(), irql) };
         // Dropped here, at PASSIVE_LEVEL, outside the lock.
         drop(old);
