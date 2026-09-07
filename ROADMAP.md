@@ -14,6 +14,27 @@ inventory. Sections retained are carried **verbatim**; only the connective text 
 
 ## D3D12 default and Windows CI, 2026-09-07
 
+Hosted run `34055565048` built the driver and both UMDs successfully, but CLVK
+failed to configure because the SDK extraction action omitted Vulkan headers
+and the loader import library; final bundle assembly was skipped. The CI setup
+now uses the official unattended copy-only installer with a complete-directory
+cache and checks development files before CLVK starts. On `firstheberg2-win`,
+SDK 1.4.350.0 download/install took 53.4 seconds; a second validation took 0.1
+seconds. A CMake Vulkan discovery/compile/link probe passes, and a missing SDK
+is rejected before existing source/build trees are removed. CLVK also configures
+and builds against the new SDK in 133.5 seconds using a warm tree whose source
+pin, LLVM dependency, and two clspv patches were verified. Hosted validation
+of this installer change remains pending.
+
+The full 22.22.270.0 package was also built and test-signed on `firstheberg2-win`
+from `dcdb8b38`, using a separate checkout to preserve existing QA source edits.
+DXVK, vkd3d, the KMD, both UMDs, both Mesa architectures, loaders and probes
+were rebuilt; CLVK reused only its verified warm compiler tree. Driver INF and
+UMD import/export checks, compatibility lifecycle tests, and all 35 package
+manifest entries/signing-certificate checks passed. The package records actual
+tool versions, including LLVM 22.1.8, Meson 1.12.0 and widl 11.12; this is a
+build-box validation, not a new Helios GPU/runtime acceptance result.
+
 The owner requested default DX12 admission and a Windows CI bundle containing
 the native D3D12 UMD. `UmdD3D12` now defaults ON; explicit DWORD `0` still
 refuses admission, and installation preserves that override. CI initializes
@@ -31,7 +52,7 @@ registry override reach argument validation for absent/one and return
 `DXGI_ERROR_UNSUPPORTED` for zero. The newly compiled native D3D12 device smoke
 passes on the existing enabled guest stack via an interactive scheduled task.
 
-Hosted CI has not run, and this default change has not been deployed. The live
+The original validation preceded hosted CI, and this default change had not been deployed. The live
 guest still has explicit `UmdD3D12=1`. Existing performance/visual evidence below
 belongs to the earlier deployed artifacts; broader ownership and failure-path
 gaps in `docs/dx12/EXECUTION_SYNC.md` and `docs/HPS2_REFACTOR.md` remain open.

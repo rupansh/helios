@@ -15,6 +15,15 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Fail before cloning LLVM or removing existing build trees when SDK setup is
+# incomplete. Shader tools alone are insufficient for CLVK's system Vulkan.
+if (-not $env:VULKAN_SDK) { throw "VULKAN_SDK must point to an installed Vulkan SDK." }
+foreach ($relativePath in @("Include\vulkan\vulkan.h", "Lib\vulkan-1.lib")) {
+    if (-not (Test-Path -LiteralPath (Join-Path $env:VULKAN_SDK $relativePath) -PathType Leaf)) {
+        throw "Vulkan SDK is missing $relativePath in $env:VULKAN_SDK."
+    }
+}
+
 if (Test-Path -LiteralPath $SourceRoot) { Remove-Item -LiteralPath $SourceRoot -Recurse -Force }
 if (Test-Path -LiteralPath $BuildRoot) { Remove-Item -LiteralPath $BuildRoot -Recurse -Force }
 
