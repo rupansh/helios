@@ -469,6 +469,26 @@ verified correction" above.
 
 ## Workstream 1 — Stability
 
+**2026-09-08 — WinBoat Blender / Mesa buffer-map failure (open).** The installed
+`.270/dcdb8b38` bundle's `libgallium_wgl.dll` COFF symbols resolve Blender 5.2's
+recorded write to address `0x143` to `tc_buffer_map+0x23c`, not the nearest
+export (`stw_unbind_context`) printed by Blender's crash reporter. That
+instruction writes through an unchanged transfer pointer after the driver's
+`buffer_map` call. Gallium explicitly permits a failed map to return NULL
+without changing the transfer output (`docs/gallium/context.rst`, Transfers).
+The Mesa fix pinned by the submodule checks the return before initializing the transfer;
+it also frees incomplete CPU shadow storage and returns failure if the initial
+GPU-to-CPU copy cannot be mapped. No map failure is reported as success.
+`CC=clang python tools/test_tc_buffer_map.py` runs the actual function body
+against a fake pipe driver under ASan/UBSan: all seven cases pass, including
+failure cleanup/retry and synchronized/unsynchronized success. The same test
+with `--revision a04516a702dff81d3a2e44019cdd79abf3fb7423` crashes in all four failure cases and passes the three
+success cases. This harness does not validate the Windows ABI or driver stack.
+The source fix is **not deployed**. The original map failure's cause and the
+stalled RDP session's relationship to it remain unproven; both factory-startup
+and normal-argument Blender reached their viewports under CDB after the
+owner-authorized VM restart without triggering the first-chance AV handler.
+
 **IDD frame freeze: DIAGNOSED 2026-07-05 (17th session), live on the frozen boot** — full chain
 in memory `idd-freeze-root-cause-chain`. Summary: (1) routine multi-second completion stalls
 (per-present full-GPU drain in `rotate_resource_backings` + event-cadence desktop) →
