@@ -12,6 +12,45 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## D3D12 on AMD/RADV: every D3D12 present scrambled, root-caused and fixed, 2026-09-09
+
+**Symptom (first AMD host run of the D3D12 stack, RX 6600 / RADV, WinBoat guest, .270):**
+every frame a D3D12 swapchain presents reaches the screen as horizontal stripes
+in 128-px columns - Steel Nomad Light, and equally a 30-line D3D12 test that only
+clears rectangles (`tmp/steel-nomad-20260909/d12pat.cpp`). The test's own readback
+of its back buffer is pixel-exact, so the app renders correctly; the buffer is
+misread when DWM opens it as a D3D11 shared surface. The stripe geometry is exact:
+128-px source bars become 12.8-row stripes, i.e. a 64 KB-tiled image read as linear
+rows of 5120 bytes. Time Spy is affected the same way on AMD; on the owner's NVIDIA
+host none of this shows.
+
+**Cause.** UMD12's fused `pfnCreateHeapAndResource` arm forwards a swapchain buffer
+as an explicit vkd3d heap (`VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT`) plus a texture
+placed at offset zero. `d3d12_heap_init()` allocated that heap's memory at
+CreateHeap time - before any image existed - as a plain exportable, buffer-backed
+allocation (API dump of the live path: `vkAllocateMemory` with
+`VkMemoryAllocateFlagsInfo` + `VkExportMemoryAllocateInfo`, no
+`VkMemoryDedicatedAllocateInfo`, then `vkBindBufferMemory2`, then the image). RADV
+only records an image's tiling metadata on exported memory when that memory is a
+dedicated allocation of the image (`radv_GetMemoryFdKHR` ->
+`radv_image_bo_set_metadata`), and DWM's DXVK import is a dedicated import that
+re-derives its image layout from that metadata, falling back to LINEAR when the
+metadata is absent (`radv_patch_surface_from_metadata`). NVIDIA's layout is a
+function of the create parameters alone, which is why the buffer-backed export
+was never noticed. Reproduced in isolation by `tmp/steel-nomad-20260909/vkshare.cpp`
+(in-guest Vulkan: export/import round trip is correct for every dedicated-image
+variant and wrong only when the exported memory has no image attached).
+
+**Fix (vkd3d fork, `libs/vkd3d/{heap.c,resource.c,vkd3d_private.h}`):** an export
+heap no longer allocates in `d3d12_heap_init()`; it is marked pending and
+`d3d12_resource_create_placed()` materialises it at the first placement through
+`d3d12_heap_helios_allocate_pending()`. A texture placed at offset zero on a
+GPU-local heap makes the exported memory a `VkMemoryDedicatedAllocateInfo`
+allocation of that image, sized exactly to the image (VUID 02964); buffers,
+non-zero offsets and CPU-accessible heaps materialise the previous plain
+exportable heap. The committed fallback for memory-less heaps is preserved. The
+D3D11 side, the ICD and the KMD are unchanged. Packaged as **22.22.271.0**.
+
 ## D3D12 default and Windows CI, 2026-09-07
 
 Hosted run `34055565048` built the driver and both UMDs successfully, but CLVK

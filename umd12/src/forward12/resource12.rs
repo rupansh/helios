@@ -2313,7 +2313,14 @@ unsafe fn create_fused_heap_and_resource(
     // resource's allocation. Therefore every fused resource must be born
     // adoptable: this is the exact DDI arm that creates the backing heap, not a
     // format/bind/geometry guess. The fork's private flag makes the memory
-    // allocator-dedicated and venus-exportable so pfnAllocateCb can adopt it below.
+    // venus-exportable so pfnAllocateCb can adopt it below, and it defers the
+    // heap's allocation to the CreatePlacedResource2 at offset 0 that follows:
+    // a texture there makes the exported memory a VkMemoryDedicatedAllocateInfo
+    // allocation of ITS image. That is what lets the host driver (RADV) stamp
+    // the image's tiling metadata on the export, which DWM's cross-process
+    // dedicated import needs to decode the tiles -- without it RADV imports the
+    // buffer as LINEAR and every D3D12 present shows as horizontal stripes on
+    // AMD (2026-09-09, vkd3d fork `d3d12_heap_helios_allocate_pending`).
     engine_heap_flags |= HELIOS_HEAP_FLAG_VENUS_EXPORT;
     L4_REFUSALS.committed_venus_export.bump();
 
