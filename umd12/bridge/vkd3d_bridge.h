@@ -39,6 +39,10 @@ struct HeliosVkd3dDevice {
 
   std::unique_ptr<HeliosVkd3dDeviceImpl> impl;
 
+  // Engine-derived values, rechecking native admission including override refusal.
+  bool native_optional_caps(std::uint32_t& shader_model, std::uint32_t& raytracing_tier,
+                            rust::Slice<std::uint8_t> device_uuid) const noexcept;
+
   // BORROWED — the bridge keeps the owning reference. 0 if not created.
   // The caller must NOT `Release()` this, and on the Rust side must not let a
   // `windows::ID3D12Device` own it (that is a double release at drop).

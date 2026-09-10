@@ -253,6 +253,10 @@ pub(crate) struct Umd12Refusals {
     /// `pfnGetCaps` with a null arg, a null `pData`, or a null `pInfo` on a cap
     /// that requires one. Expected 0.
     pub(crate) caps_bad_arg: RefusalCounter,
+    /// Engine capability discovery failed; adapter support cannot be reported.
+    pub(crate) caps_engine_unavailable: RefusalCounter,
+    /// Native device identity or optional support differs from adapter discovery.
+    pub(crate) caps_engine_mismatch: RefusalCounter,
     /// The runtime's `pData` buffer was smaller than the struct this build's
     /// header describes for that cap, so **nothing was written**. Expected 0 —
     /// and a hit is the R702 class arriving through `pfnGetCaps` rather than
@@ -436,6 +440,8 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
     reserve_ranges_ignored: RefusalCounter::new("ReserveRangesIgnored"),
     destroy_device_bad_arg: RefusalCounter::new("DestroyDeviceBadArg"),
     caps_bad_arg: RefusalCounter::new("CapsBadArg"),
+    caps_engine_unavailable: RefusalCounter::new("CapsEngineUnavailable"),
+    caps_engine_mismatch: RefusalCounter::new("CapsEngineMismatch"),
     caps_data_size_too_small: RefusalCounter::new("CapsDataSizeTooSmall"),
     caps_defaulted: RefusalCounter::new("CapsDefaulted"),
     caps_calls: RefusalCounter::new("CapsCalls"),
@@ -470,7 +476,7 @@ pub(crate) static UMD12_REFUSALS: Umd12Refusals = Umd12Refusals {
 /// FIRST in [`UMD12_REFUSAL_SETS`] precisely so every pre-fan-out
 /// `D3D12 DDI refusals:` line is still a byte-for-byte prefix of a post-fan-out
 /// one. A lane appends to **its own** set, in its own file.
-static UMD12_REFUSAL_SET: [&RefusalCounter; 42] = [
+static UMD12_REFUSAL_SET: [&RefusalCounter; 44] = [
     &UMD12_REFUSALS.open_adapter12,
     &UMD12_REFUSALS.probe12_bad_arg,
     &UMD12_REFUSALS.probe12_create_failed,
@@ -491,6 +497,8 @@ static UMD12_REFUSAL_SET: [&RefusalCounter; 42] = [
     &UMD12_REFUSALS.reserve_ranges_ignored,
     &UMD12_REFUSALS.destroy_device_bad_arg,
     &UMD12_REFUSALS.caps_bad_arg,
+    &UMD12_REFUSALS.caps_engine_unavailable,
+    &UMD12_REFUSALS.caps_engine_mismatch,
     &UMD12_REFUSALS.caps_data_size_too_small,
     &UMD12_REFUSALS.caps_defaulted,
     &UMD12_REFUSALS.caps_calls,

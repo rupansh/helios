@@ -131,6 +131,13 @@ mod ffi {
             minimum_feature_level: u32,
         ) -> UniquePtr<HeliosVkd3dDevice>;
 
+        fn native_optional_caps(
+            self: &HeliosVkd3dDevice,
+            shader_model: &mut u32,
+            raytracing_tier: &mut u32,
+            device_uuid: &mut [u8],
+        ) -> bool;
+
         /// Stateless forward to the engine's second entry point.
         ///
         /// # Safety
@@ -294,11 +301,86 @@ pub struct BridgeDevice12 {
     inner: cxx::UniquePtr<ffi::HeliosVkd3dDevice>,
 }
 
+// SAFETY: the uniquely owned C++ holder contains a free-threaded ID3D12Device
+// and immutable context identities captured at creation. Its normal native DDI
+// owner already permits destruction on another thread. This grants ownership
+// transfer only, not unsynchronized shared access (no Sync implementation).
+unsafe impl Send for BridgeDevice12 {}
+
+// Keep the capability-discovery engine until the first native CreateDevice can
+// take ownership. Closing an adapter discards any unclaimed engine. The mutex
+// protects only the handoff; device creation/destruction run outside that lock.
+static CAPABILITY_ENGINE: std::sync::Mutex<Option<BridgeDevice12>> = std::sync::Mutex::new(None);
+
+pub(crate) fn discard_capability_engine() {
+    let pending = match CAPABILITY_ENGINE.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => {
+            crate::note_refusal(&crate::UMD12_REFUSALS.caps_engine_unavailable);
+            return;
+        }
+    };
+    drop(pending);
+}
+
+/// Actual selected-engine capabilities, before the native UMD's tier ceilings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) struct NativeOptionalCaps {
+    pub shader_model: u32,
+    pub raytracing_tier: u32,
+    pub device_uuid: [u8; 16],
+}
+
 impl BridgeDevice12 {
     /// Create a vkd3d device on the Helios adapter with this LUID. `None` when
     /// the bridge returned nothing — folding the old `is_null()` check into
     /// construction so a `BridgeDevice12` that exists is always usable.
     pub fn create(luid_low: u32, luid_high: i32) -> Option<Self> {
+        let expected = crate::caps12::native_optional_caps()?;
+        let pending = if luid_low == 0 && luid_high == 0 {
+            CAPABILITY_ENGINE.lock().ok()?.take()
+        } else {
+            None
+        };
+        let device = match pending {
+            Some(device) => {
+                crate::log_error!(
+                    "Native CreateDevice takes ownership of capability-discovery engine"
+                );
+                device
+            }
+            None => Self::create_for_caps(luid_low, luid_high)?,
+        };
+        let actual = device.optional_caps()?;
+        if actual != expected {
+            crate::note_refusal(&crate::UMD12_REFUSALS.caps_engine_mismatch);
+            crate::log_error!("Native adapter/device capability mismatch: advertised={expected:?} actual={actual:?}");
+            return None;
+        }
+        Some(device)
+    }
+
+    // Discovery runs once under caps12's initialization mutex. Native creation
+    // consumes the engine; caps-only adapter closure releases it normally.
+    pub(crate) fn probe_optional_caps() -> Option<NativeOptionalCaps> {
+        let device = Self::create_for_caps(0, 0)?;
+        let caps = device.optional_caps()?;
+        *CAPABILITY_ENGINE.lock().ok()? = Some(device);
+        Some(caps)
+    }
+
+    fn optional_caps(&self) -> Option<NativeOptionalCaps> {
+        let mut caps = NativeOptionalCaps::default();
+        self.get()?
+            .native_optional_caps(
+                &mut caps.shader_model,
+                &mut caps.raytracing_tier,
+                &mut caps.device_uuid,
+            )
+            .then_some(caps)
+    }
+
+    fn create_for_caps(luid_low: u32, luid_high: i32) -> Option<Self> {
         let inner = ffi::helios_vkd3d_bridge_create_device(
             luid_low,
             luid_high,

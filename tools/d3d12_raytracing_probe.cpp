@@ -163,7 +163,7 @@ struct Context {
     HANDLE event = nullptr;
     UINT64 value = 0;
 
-    Context()
+    explicit Context(bool without_raytracing = false)
     {
         DWORD session = 0;
         require(ProcessIdToSessionId(GetCurrentProcessId(), &session) && session != 0, "interactive session required");
@@ -198,7 +198,10 @@ struct Context {
         D3D12_FEATURE_DATA_D3D12_OPTIONS5 options{};
         check(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS5, &options, sizeof(options)), "OPTIONS5");
         printf("CAP,RaytracingTier,%u\n", static_cast<unsigned>(options.RaytracingTier));
-        if (options.RaytracingTier < D3D12_RAYTRACING_TIER_1_0)
+        if (without_raytracing)
+            require(options.RaytracingTier == D3D12_RAYTRACING_TIER_NOT_SUPPORTED,
+                    "DXR must be unavailable when the engine RT extensions are disabled");
+        else if (options.RaytracingTier < D3D12_RAYTRACING_TIER_1_0)
             throw AdmissionBlocked("native DXR tier unavailable");
         check(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)), "CreateFence");
         event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -287,6 +290,42 @@ static void readback(ID3D12GraphicsCommandList4 *list, ID3D12Resource *source, I
     transition(list, source, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     list->CopyBufferRegion(dest, 0, source, 0, bytes);
     transition(list, source, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+}
+
+// A valid pipeline without local roots also reaches CreateStateObject on a
+// non-RT adapter: native local-root creation is itself unavailable there.
+// Run the exact same descriptor on RT hardware to prove the negative fixture.
+static void optional_state_object(Context &ctx, const std::filesystem::path &path, bool expect_unsupported)
+{
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    require(input.good(), "open optional DXIL library");
+    const auto end = input.tellg();
+    require(end > 0 && static_cast<uint64_t>(end) <= 64 * 1024 * 1024, "optional DXIL library extent");
+    std::vector<char> dxil(static_cast<size_t>(end));
+    input.seekg(0);
+    require(static_cast<bool>(input.read(dxil.data(), static_cast<std::streamsize>(dxil.size()))), "read optional DXIL");
+    D3D12_EXPORT_DESC export_desc{L"OptionalRayGen", nullptr, D3D12_EXPORT_FLAG_NONE};
+    D3D12_DXIL_LIBRARY_DESC library{{dxil.data(), dxil.size()}, 1, &export_desc};
+    D3D12_RAYTRACING_SHADER_CONFIG shader_config{0, 0};
+    D3D12_RAYTRACING_PIPELINE_CONFIG pipeline_config{0};
+    D3D12_STATE_SUBOBJECT objects[] = {
+        {D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &library},
+        {D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG, &shader_config},
+        {D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG, &pipeline_config},
+    };
+    D3D12_STATE_OBJECT_DESC desc{D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, static_cast<UINT>(std::size(objects)), objects};
+    ComPtr<ID3D12StateObject> state;
+    const HRESULT created = ctx.device->CreateStateObject(&desc, IID_PPV_ARGS(&state));
+    printf("CAP,OptionalStateObjectHRESULT,%08lx\n", static_cast<unsigned long>(created));
+    if (expect_unsupported) {
+        require((created == E_INVALIDARG || created == E_NOTIMPL || created == DXGI_ERROR_UNSUPPORTED || created == E_FAIL)
+                && !state, "valid DXR pipeline must be refused without RT support");
+        printf("PASS,no_rt_state_object_refused\n");
+    } else {
+        check(created, "optional pipeline positive control");
+        require(state != nullptr, "optional pipeline returned no state object");
+        printf("PASS,optional_rt_state_object_created\n");
+    }
 }
 
 struct Pipeline {
@@ -494,6 +533,7 @@ static D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO prebuild(Context &c
 static void run(const std::filesystem::path &dxil)
 {
     Context ctx;
+    optional_state_object(ctx, dxil, false);
     Queue compute(ctx.device.Get(), D3D12_COMMAND_LIST_TYPE_COMPUTE);
     Queue direct(ctx.device.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
     Pipeline pipeline(ctx, dxil);
@@ -711,11 +751,33 @@ static void run(const std::filesystem::path &dxil)
     printf("PASS,native_dxr_probe_completed\n");
 }
 
+static void run_without_raytracing(const std::filesystem::path &path)
+{
+    Context ctx(true);
+    optional_state_object(ctx, path, true);
+    Queue direct(ctx.device.Get(), D3D12_COMMAND_LIST_TYPE_DIRECT);
+    std::array<UINT, 4096> words{};
+    for (UINT i = 0; i < words.size(); ++i) words[i] = (i * 0x1020305u) ^ 0xdeadbeefu;
+    auto upload = ctx.upload(words.data(), sizeof(words));
+    auto gpu = ctx.buffer(sizeof(words), D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COPY_DEST);
+    auto readback_buffer = ctx.buffer(sizeof(words), D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST);
+    direct.list->CopyBufferRegion(gpu.Get(), 0, upload.Get(), 0, sizeof(words));
+    transition(direct.list.Get(), gpu.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    direct.list->CopyBufferRegion(readback_buffer.Get(), 0, gpu.Get(), 0, sizeof(words));
+    ctx.submit(direct);
+    const auto result = Context::read(readback_buffer.Get(), sizeof(words));
+    require(!memcmp(result.data(), words.data(), sizeof(words)), "non-RT GPU readback differs");
+    printf("PASS,no_rt_gpu_readback_4096_words\n");
+    printf("PASS,native_no_rt_probe_completed\n");
+}
+
 int wmain(int argc, wchar_t **argv)
 {
     try {
-        require(argc == 2, "usage: d3d12_raytracing_probe.exe <library.dxil>");
-        run(argv[1]);
+        require(argc == 2 || (argc == 3 && !wcscmp(argv[2], L"--without-raytracing")),
+                "usage: d3d12_raytracing_probe.exe <library.dxil> [--without-raytracing]");
+        if (argc == 3) run_without_raytracing(argv[1]);
+        else run(argv[1]);
         return 0;
     } catch (const AdmissionBlocked &error) {
         fprintf(stderr, "BLOCKED77,%s\n", error.what());

@@ -1,5 +1,32 @@
 # ARCHITECTURE.md — the D3D12 UMD split
 
+## Optional adapter capabilities
+
+`OpenAdapter12` discovers optional shader-model/DXR support before publishing the
+adapter. It creates a temporary device through the same static vkd3d bridge and
+baseline admission used by native `CreateDevice`, reads the engine-derived caps
+and physical-device UUID. The bridge retains the uniquely owned engine for the
+first native `CreateDevice`, which takes ownership under a mutex. `CloseAdapter`
+releases an unclaimed engine; concurrent opens/closes cannot release an engine
+already transferred to a device. The mutex protecting the engine transfer is not held over creation or
+teardown; a separate initialization mutex serializes capability discovery. Only successful metadata is cached for the process; initialization is
+serialized and failed queries remain retryable. Every native device rechecks
+baseline admission, override refusal, actual capabilities and UUID before
+publication, including the transferred engine. There is no DXGI recursion or
+new renderer protocol. The engine keeps its ordinary initialization and teardown;
+this is not a claim that vkd3d performs no internal initialization work. `CapsEngineUnavailable` and
+`CapsEngineMismatch` distinguish query failure from disagreement.
+
+The existing single-Helios-adapter selection contract remains: this adds no LUID
+matching or support for choosing between multiple guest Vulkan devices. Other
+pinned base capabilities retain their existing admission requirements. DXR is
+optional even at FL12_1: report at most RT1.0 when engine RT>=1.0 and SM>=6.3,
+otherwise NOT_SUPPORTED. The native shader-model list is the gapless implemented
+release-token set 5.1 through min(engine support, 6.3), translated explicitly from
+API shader-model values to the different WDK DDI encoding. See
+[validation and limits](DXR_SERIALIZATION.md#conditional-dxr-support).
+
+
 **Owner update, 2026-09-09:** the native static UMD/WDDM2.1 architecture is retained,
 with paired renderer/protocol forks now authorized. Native DGC replaces the private
 engine emulation; ordinary renderer fences and authenticated wire receipts replace

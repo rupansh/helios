@@ -68,7 +68,8 @@
 extern "C" HRESULT helios_vkd3d_create_device(LUID adapter_luid, REFIID iid,
                                               void** device);
 extern "C" HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device* device,
-    std::uint32_t minimum_feature_level) noexcept(false);
+    std::uint32_t minimum_feature_level, std::uint32_t* shader_model,
+    std::uint32_t* raytracing_tier, std::uint8_t* device_uuid) noexcept(false);
 extern "C" HRESULT helios_vkd3d_serialize_root_signature(
     const D3D12_ROOT_SIGNATURE_DESC* desc, D3D_ROOT_SIGNATURE_VERSION version,
     ID3DBlob** blob, ID3DBlob** error_blob);
@@ -260,6 +261,8 @@ using helios_bridge::umd_log;
 // image, so there is no module whose lifetime could end under a live device.
 struct HeliosVkd3dDeviceImpl {
   ID3D12Device* d3d12 = nullptr;
+  std::uint32_t minimum_feature_level = 0;
+
   // UP-2c. The engine's interop interface, queried ONCE at device create.
   //
   // ⛔ Once, and for the same class of reason the ICD export is resolved once: a
@@ -450,6 +453,16 @@ std::size_t HeliosVkd3dDevice::d3d12_device_ptr() const noexcept {
   // owning `ID3D12Device` is a double release at drop, and the crash lands
   // nowhere near here.
   return impl ? reinterpret_cast<std::size_t>(impl->d3d12) : 0;
+}
+
+bool HeliosVkd3dDevice::native_optional_caps(std::uint32_t& shader_model,
+    std::uint32_t& raytracing_tier, rust::Slice<std::uint8_t> device_uuid) const noexcept {
+  if (!impl || !impl->d3d12 || device_uuid.size() != 16)
+    return false;
+  // Revalidate even when adopting the discovery engine: an environment override
+  // installed after adapter discovery must not bypass native admission.
+  return SUCCEEDED(helios_vkd3d_validate_native_feature_level(impl->d3d12,
+      impl->minimum_feature_level, &shader_model, &raytracing_tier, device_uuid.data()));
 }
 
 std::uint32_t HeliosVkd3dDevice::venus_context_id() const noexcept {
@@ -767,7 +780,11 @@ std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
 
         // The native maximum is supplied by caps12, not an environment override.
         // Keep ownership in Impl so refusal or an exception releases the engine.
-        const HRESULT admission = helios_vkd3d_validate_native_feature_level(dev, minimum_feature_level);
+        out->impl->minimum_feature_level = minimum_feature_level;
+        std::uint32_t shader_model = 0, raytracing_tier = 0;
+        std::uint8_t device_uuid[16] = {};
+        const HRESULT admission = helios_vkd3d_validate_native_feature_level(dev, minimum_feature_level,
+            &shader_model, &raytracing_tier, device_uuid);
         if (FAILED(admission)) {
           const std::uint32_t n = helios_bridge::g_vkd3dCreateDeviceFailed.fetch_add(1, std::memory_order_relaxed) + 1;
           char msg[192];

@@ -1,5 +1,126 @@
 # DXR serialization and reference lifetimes
 
+## Conditional DXR support
+
+Release UMD12 `465CBE13528F1BA7802200D1E620DD16D9B00F082ABFE22AA4227C2B180206CF`
+fixes an unconditional RT requirement in the preceding 057934F9 native admission.
+An otherwise eligible non-RT engine now retains native FL11_0..12_1 admission
+and reports `RaytracingTier=NOT_SUPPORTED`. RT-capable engines report the
+implemented RT1.0 tier. Shader models are capped at the engine's actual support
+and the UMD's SM6.3 ceiling. Admission still refuses feature/shader overrides;
+this is no capability override or RT emulation.
+
+Adapter discovery and native device creation use the same static bridge, compare
+engine capabilities and Vulkan device UUID, and release a refused device through
+its existing owner. The bridge retains the discovery engine for transfer into
+the first native device, or normal release on caps-only `CloseAdapter`. Permanent
+process caching holds metadata only and does not cache a failed query. No queue synchronization, backing lifetime, renderer/KMD interface,
+WDDM2.1 version, or async-WSI policy changed. The single-guest-adapter limitation
+is unchanged. See [architecture](ARCHITECTURE.md#optional-adapter-capabilities).
+
+| Requirement / optional feature | Host Vulkan | Venus / renderer | vkd3d | Helios / native runtime | Validation |
+|---|---|---|---|---|---|
+| Optional DXR1.0 | AS + RT pipeline features, required formats and shader-table limits | Mesa intersects its implemented passthrough set with renderer-advertised extensions; feature/property queries are conditional. Renderer starts from actual host enumeration. | Derives `options5.RaytracingTier`; no UMD-side extension-name heuristic | Native state-object/AS/ray callbacks retain engine-tier refusals; caps expose at most1.0 only with SM>=6.3 | Native positive state/AS/ray readback; RT-disabled API refusal and ordinary GPU readback |
+| No RT support | RT extensions/features absent | `VN_DEBUG=no_ray_tracing` removes RT exposure at the ICD for the restricted-feature test | Also tested with engine-only extension suppression | Reports RT0 without rejecting an otherwise eligible FL12_1 device | Native tier/creation checks and four ordering cases; actual non-RT hardware remains untested |
+| Shader models | Engine-required subgroup/float-controls features | Existing feature/property transport | Real `max_shader_model` | Explicit API-to-DDI release-token translation,5.1..min(engine,6.3) | Native6.3 in both modes; a lower-SM engine remains unexercised |
+
+Source boundaries: `vn_physical_device_init_supported_extensions` and its
+conditional feature/property chains in Mesa; `vkr_physical_device_init_extensions`
+in the renderer; `d3d12_device_determine_ray_tracing_tier` in the engine;
+`caps12::native_optional_caps`, `BridgeDevice12` and `raytracing::require_engine_dxr`
+in the UMD. The last rejects unbacked AS/state/dispatch commands instead of
+silently dropping them. Native creation still requires the existing base-feature
+guards; this change does not claim support for every GPU regardless of those
+requirements.
+
+Evidence is under `tmp/dxr-conditional-20260911/`. `owned-source-manifest.json` and
+`owned-build-windows/provenance.json` reconcile 63 mirrored driver/engine sources and
+freeze the release DLL/static archives. The snapshot was collected after the
+build and verified against its Windows local mirrors; it is not a pre-build
+attestation. Engine code is committed locally as38ecb6f7286b8df5573cd619384cc4e6dc71aa26;
+the frozen build was produced from bb46e7c6 plus those verified working-tree inputs.
+The commit does not change the already captured build/version metadata;
+compiler f4651bd0, Mesa2d4e910b, renderer2121d5d0 and protocolfe08e82c are unchanged.
+LLVM/libclang22.1.8, VulkanSDK1.4.350.0 and bindgen0.72 remain. The subsequent
+probe changes have their own independent build receipts and are not linked into
+the DLL. Linux/Windows engine builds, Windows release UMD, and A1 pass, including
+211 KMD logic tests. Deployment is a ProgramData override, verified by hash,
+with a device disable/enable; .271/oem54/Code0 and UMD11/ICD remain unchanged.
+It is not signed-package or hosted-CI validation.
+
+Final465CBE13 acceptance, with System32 D3D12/Core10.0.26100.9278,
+DXGI10.0.26100.9444 and exact UMD465CBE13 / ICD43394BBD identities:
+
+| Configuration | Native caps / admission | GPU and refusal checks |
+|---|---|---|
+| Ordinary RT | PID5756: FL11_0..12_1 S_OK;12_2 unsupported; SM6.3 / RT1.0 | PID1908: eight DXR behavior groups and20 ray words pass; PID3584: all four ordering cases,65,536 words each |
+| RT extensions suppressed in engine | PID3168: same FL admission / SM6.3, RT0 | PID9468: valid RT pipeline refused with E_INVALIDARG, then4,096 GPU readback words pass; PID11248: all four ordering cases pass with original deadlines |
+| Only ray-query extension suppressed | PID2296: native RT1.0 remains available; DXR1.0 does not depend on ray query | Capability check only; no RT1.1 claim |
+| RT exposure disabled in Venus ICD | PID2080: same FL admission / SM6.3, RT0; `VKD3D_DISABLE_EXTENSIONS` absent | PID8456: all four native ordering cases pass; `VN_DEBUG=no_ray_tracing` is process-local |
+
+Receipts: `owned-native-caps/`, `owned-native-dxr/`, `owned-native-no-rt/`,
+`owned-sync-rt/`, `owned-sync-no-rt/`, `venus-no-rt-caps/`, `venus-sync-no-rt/`.
+The original10-second cross-process helper deadline is unchanged. These tests
+close the discovered startup regression; they do not measure benchmark speed.
+Repeated adapter/device creation, normal cleanup and cross-process shared-fence
+signalling are exercised. Concurrent caps initialization, a changed physical
+UUID, retry after failed discovery, lower-SM hardware and caps-only cleanup are
+implemented but not specifically fault-injected/exercised by this suite.
+
+The first candidate41BAC916 passed the positive fixture (PID2604), passes all eight behavior groups plus the
+completion marker and all20 ray-result words. Its restricted-RT fixture,
+PID10320, reports RT0, refuses the valid pipeline with E_INVALIDARG (0x80070057),
+and passes all4,096 readback words. Both return0 with hash-verified module
+identities and archived results under `verified-native-dxr/` and
+`verified-native-no-rt/`. Earlier original-suite PID7040 also passed on this DLL.
+The helper refuses to replace an already-running scheduled probe task.
+However,41BAC916 failed the four-case ordering control: three cases passed,
+then the cross-process helper exceeded the unchanged10-second startup deadline
+during a second engine creation. That candidate discarded its discovery engine.
+The465CBE13 candidate instead transfers that engine to the native device. The
+failed `sync-rt/` receipt is retained; no timeout was increased and no queued
+wait, completion or resource-lifetime check was removed.
+
+The first candidate's native Windows cap probes PID11044 (normal) and PID5360 (RT extensions disabled)
+load exactly 41BAC916/43394BBD and System32 D3D12/Core10.0.26100.9278,
+DXGI10.0.26100.9444. Both admit FL11_0,11_1,12_0,12_1 and refuse12_2; both report
+SM6.3, while their RT tiers are10 and0 respectively. The restricted process uses
+`VKD3D_DISABLE_EXTENSIONS=VK_KHR_ray_tracing_pipeline,VK_KHR_acceleration_structure,VK_KHR_ray_query`:
+these features are removed from engine discovery and device creation. This is a
+missing-feature test on the current RT GPU, **not validation on actual non-RT
+hardware**. No feature-level or shader-model override is set. Raw PID logs can
+contain earlier PID-reuse records; module hashes and each run's API output are
+the attribution evidence, not whole-file historical counter totals.
+
+`tools/d3d12-raytracing-probe.ps1 -WithoutRaytracing` is the repeatable negative
+mode. A valid minimal RT state object is created in the positive mode; the same
+descriptor is refused in the negative mode, followed by a 4,096-word upload ->
+default GPU buffer -> readback comparison and authenticated fence completion on
+the same FL12_1 device. The existing positive suite retains cross-queue AS/ray
+ordering, bundles, compaction/cloning/updating, serialization/relocation and
+lifetime checks. Every graphical probe runs in an interactive scheduled task.
+An earlier negative fixture failed before this boundary at local-root creation;
+an intermediate positive fixture completed GPU checks but duplicated module
+records and failed attribution. Neither failed receipt is treated as acceptance.
+
+The owner-accepted Port Royal result below remains scoped to 057934F9. This
+capability change has no new benchmark score, performance claim, or owner visual
+acceptance. Full FL12_1/DXR compliance remains open: committed sparse fallback
+mapping is not alias/residency compliance, tools visualization still refuses,
+and pending allocator/fence-worker retirement remains unresolved.
+
+The current engine's RT tier is also not proof of every DXR limit. Its
+`d3d12_device_determine_ray_tracing_tier` deliberately admits recursion depths
+below31, deferring failure until pipeline creation. The current NVIDIA host
+reports depth31, stride4096 and dispatch limit2^30, but AS geometry/instance
+limits2^24-1 and primitive limit2^29-1 (`host-vulkaninfo.txt`), whereas Microsoft's
+[geometry-limit specification](https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html#geometry-limits)
+states2^24 and2^29. The extreme-count boundary is unexercised and unresolved;
+this is an additional conformance audit item, not evidence that Port Royal failed.
+Native limit gating and meaningful limit tests still need to distinguish
+vkd3d's compatibility reporting from the full Microsoft contract.
+
+
 ## Completed native Port Royal, 2026-09-11
 
 The stock Port Royal collection completes on release UMD12

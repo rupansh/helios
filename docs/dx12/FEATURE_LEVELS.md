@@ -1,5 +1,15 @@
 # Native DX12 feature-level contract
 
+**Current optional-DXR contract, 2026-09-11:** release465CBE13 replaces unconditional
+RT admission with engine-derived adapter caps and per-device identity/capability
+revalidation. An otherwise eligible non-RT engine reports RT0 and retains
+FL11_0..12_1. Native caps and GPU/refusal validation, including the restricted-RT
+test's hardware limits, are in
+[conditional DXR support](DXR_SERIALIZATION.md#conditional-dxr-support).
+Full FL/DXR compliance and extreme AS-count/recursion limits remain open;
+the owner-accepted Port Royal run remains the preceding057934F9 artifact.
+
+
 **Native DXR, 2026-09-11:** release 057934F9 reports RT1.0/SM6.3 with matching
 engine admission checks. The native Windows DXR probe passes state-object,
 AS mutation/copy/serialization, shader-table, bundle and cross-queue ray readback.

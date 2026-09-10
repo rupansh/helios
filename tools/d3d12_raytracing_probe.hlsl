@@ -51,3 +51,7 @@ void Callable(inout CallableData data)
 {
     data.value += RecordValue;
 }
+
+// Capability/refusal fixture without local-root or descriptor dependencies.
+[shader("raygeneration")]
+void OptionalRayGen() {}

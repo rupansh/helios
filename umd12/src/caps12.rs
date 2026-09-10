@@ -105,11 +105,43 @@
 //! `_NOT_SUPPORTED`-sentinel trap, and the one coherence check that looks right
 //! and is not.
 
-use helios_umd_common::hr::{Hresult, E_INVALIDARG, S_OK};
+use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, S_OK};
 
 use crate::ddi12;
 use crate::forward12::tables12::{stage, DeviceCoreTable, Filling};
 use crate::{log_error, note_refusal, trace_line, UMD12_REFUSALS};
+
+// GetCaps precedes native CreateDevice. Discover optional support through the
+// same static engine once per process. The bridge retains that engine for the
+// first native device or releases it on caps-only CloseAdapter; only successful
+// metadata is cached permanently. Recheck the device UUID and caps at every native
+// creation. This follows the existing single-Helios-adapter selection contract;
+// it does not add LUID matching for multi-adapter guests.
+static OPTIONAL_CAPS: std::sync::OnceLock<crate::bridge12::NativeOptionalCaps> =
+    std::sync::OnceLock::new();
+static OPTIONAL_CAPS_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn native_optional_caps() -> Option<crate::bridge12::NativeOptionalCaps> {
+    if let Some(caps) = OPTIONAL_CAPS.get() {
+        return Some(*caps);
+    }
+    let Ok(_guard) = OPTIONAL_CAPS_INIT.lock() else {
+        note_refusal(&UMD12_REFUSALS.caps_engine_unavailable);
+        return None;
+    };
+    if let Some(caps) = OPTIONAL_CAPS.get() {
+        return Some(*caps);
+    }
+    let Some(caps) = crate::bridge12::BridgeDevice12::probe_optional_caps() else {
+        note_refusal(&UMD12_REFUSALS.caps_engine_unavailable);
+        log_error!("Native optional-capability discovery failed; no caps cached");
+        return None;
+    };
+    log_error!("Native optional-capability discovery: {caps:?}");
+    // Initialization is serialized; only successful discovery reaches this site.
+    let _ = OPTIONAL_CAPS.set(caps);
+    Some(caps)
+}
 
 /// Short aliases for the bindgen enumerator names.
 ///
@@ -179,6 +211,8 @@ mod v {
         D3D12DDI_VIEW_INSTANCING_TIER_D3D12DDI_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
     pub(super) const RENDER_PASS_NONE: D3D12DDI_RENDER_PASS_TIER =
         D3D12DDI_RENDER_PASS_TIER_D3D12DDI_RENDER_PASS_TIER_NOT_SUPPORTED;
+    pub(super) const RAYTRACING_NONE: D3D12DDI_RAYTRACING_TIER =
+        D3D12DDI_RAYTRACING_TIER_D3D12DDI_RAYTRACING_TIER_NOT_SUPPORTED;
     pub(super) const RAYTRACING_1_0: D3D12DDI_RAYTRACING_TIER =
         D3D12DDI_RAYTRACING_TIER_D3D12DDI_RAYTRACING_TIER_1_0;
     pub(super) const VRS_NONE: D3D12DDI_VARIABLE_SHADING_RATE_TIER =
@@ -265,7 +299,10 @@ pub(crate) const REQUIRED_ENGINE_FEATURE_LEVEL: u32 = match DRIVER_MAX_FEATURE_L
     v::FL_12_1 => windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_1.0 as u32,
     _ => 0,
 };
-const _: () = assert!(REQUIRED_ENGINE_FEATURE_LEVEL != 0, "add the API/DDI feature-level translation");
+const _: () = assert!(
+    REQUIRED_ENGINE_FEATURE_LEVEL != 0,
+    "add the API/DDI feature-level translation"
+);
 
 // ---------------------------------------------------------------------------
 // The three caps that a per-format answer is coupled to
@@ -550,7 +587,9 @@ unsafe fn pipeline_support1(a: &ddi12::D3D12DDIARG_GETCAPS) -> Hresult {
     // SAFETY: the input member is initialized by the runtime. The output member
     // need not be initialized, so do not read the entire in/out structure.
     let runtime_max = unsafe {
-        core::ptr::read_unaligned(core::ptr::addr_of!((*slot).HighestRuntimeSupportedFeatureLevel))
+        core::ptr::read_unaligned(core::ptr::addr_of!(
+            (*slot).HighestRuntimeSupportedFeatureLevel
+        ))
     };
     let levels = [
         ddi12::D3D12DDI_3DPIPELINELEVEL_D3D12DDI_3DPIPELINELEVEL_12_2,
@@ -561,9 +600,10 @@ unsafe fn pipeline_support1(a: &ddi12::D3D12DDIARG_GETCAPS) -> Hresult {
         ddi12::D3D12DDI_3DPIPELINELEVEL_D3D12DDI_3DPIPELINELEVEL_1_0_CORE,
         ddi12::D3D12DDI_3DPIPELINELEVEL_D3D12DDI_3DPIPELINELEVEL_1_0_GENERIC,
     ];
-    let Some(answer) = levels.into_iter().find(|level| {
-        *level <= DRIVER_MAX_FEATURE_LEVEL && *level <= runtime_max
-    }) else {
+    let Some(answer) = levels
+        .into_iter()
+        .find(|level| *level <= DRIVER_MAX_FEATURE_LEVEL && *level <= runtime_max)
+    else {
         note_refusal(&UMD12_REFUSALS.caps_bad_arg);
         return E_INVALIDARG;
     };
@@ -638,15 +678,10 @@ unsafe fn pipeline_support(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> 
 /// and a log budget, and would have concluded the caps answer was unbacked. All six
 /// are symbols now, and `misc.rs` has been added to the list above.
 ///
-/// ⚠ **NO VALUE HERE CAN BE FORWARDED FROM THE ENGINE, and that is structural.**
-/// `pfnGetCaps` is an **adapter** slot — `get_caps(h_adapter, arg)`,
-/// `adapter12.rs:433-435` — with no `ID3D12Device` in scope and none created yet
-/// (the measured order is `OpenAdapter12 -> GetCaps -> GetSupportedVersions`).
-/// The per-format slots at the bottom of this file *do* have a live engine
-/// (`engine_format_support`), which is why they ask and this cannot. So every
-/// number here is a pinned constant justified by the measured baseline, and
-/// "forward the engine's answer instead of pinning" is not an option at this
-/// slot however desirable it reads.
+/// GetCaps is adapter-scoped and precedes native CreateDevice. Optional DXR
+/// and shader models use a cached capability-discovery device created through
+/// the same static engine, with identity/caps revalidated at native creation.
+/// Other pinned fields retain their individual backing requirements below.
 ///
 /// Two values that are pinned for Helios-specific reasons rather than tier
 /// policy, both from `DDI_REFERENCE.md` §11.6:
@@ -663,6 +698,9 @@ unsafe fn pipeline_support(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> 
 /// # Safety
 /// As [`get_caps`].
 unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresult {
+    let Some(optional) = native_optional_caps() else {
+        return E_FAIL;
+    };
     let options = ddi12::D3D12DDI_D3D12_OPTIONS_DATA_0089 {
         // ⭐ RAISED 1 -> 3, 2026-08-06. Engine: 3 (`baselines/d3d12-caps.csv:13`).
         //
@@ -860,12 +898,17 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         SRVOnlyTiledResourceTier3: 0,
         // ⛔ A tier without the render-pass DDI table is an error.
         RenderPassTier: v::RENDER_PASS_NONE,
-        // misc::install_misc installs the native state-object/AS/DispatchRays
-        // forwards into vkd3d. Native device admission verifies engine RT1.0
-        // and SM6.3 before publishing the device, even for an FL11_0 request.
-        // Remaining conformance gaps are explicit in DXR_SERIALIZATION.md;
-        // this value alone is not native DXR or Port Royal acceptance.
-        RaytracingTier: v::RAYTRACING_1_0,
+        // DXR is optional, including on FL12_1. Only expose the implemented
+        // RT1.0 tier when the selected engine backs RT and lib_6_3 shaders.
+        RaytracingTier: if optional.raytracing_tier
+            >= windows::Win32::Graphics::Direct3D12::D3D12_RAYTRACING_TIER_1_0.0 as u32
+            && optional.shader_model
+                >= windows::Win32::Graphics::Direct3D12::D3D_SHADER_MODEL_6_3.0 as u32
+        {
+            v::RAYTRACING_1_0
+        } else {
+            v::RAYTRACING_NONE
+        },
         VariableShadingRateTier: v::VRS_NONE,
         PerPrimitiveShadingRateSupportedWithViewportIndexing: 0,
         AdditionalShadingRatesSupported: 0,
@@ -1091,8 +1134,26 @@ unsafe fn shader_caps(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresu
 /// # Safety
 /// As [`get_caps`].
 unsafe fn shader_models(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresult {
-    const MODELS: [ddi12::D3D12DDI_SHADER_MODEL; 5] =
-        [v::SM_5_1, v::SM_6_0, v::SM_6_1, v::SM_6_2, v::SM_6_3];
+    use windows::Win32::Graphics::Direct3D12::{
+        D3D_SHADER_MODEL, D3D_SHADER_MODEL_5_1, D3D_SHADER_MODEL_6_0, D3D_SHADER_MODEL_6_1,
+        D3D_SHADER_MODEL_6_2, D3D_SHADER_MODEL_6_3,
+    };
+    // API shader-model values and DDI release tokens have different encodings.
+    const MODELS: [(D3D_SHADER_MODEL, ddi12::D3D12DDI_SHADER_MODEL); 5] = [
+        (D3D_SHADER_MODEL_5_1, v::SM_5_1),
+        (D3D_SHADER_MODEL_6_0, v::SM_6_0),
+        (D3D_SHADER_MODEL_6_1, v::SM_6_1),
+        (D3D_SHADER_MODEL_6_2, v::SM_6_2),
+        (D3D_SHADER_MODEL_6_3, v::SM_6_3),
+    ];
+
+    let Some(optional) = native_optional_caps() else {
+        return E_FAIL;
+    };
+    let models = &MODELS[..MODELS
+        .iter()
+        .take_while(|&&(api, _)| api.0 as u32 <= optional.shader_model)
+        .count()];
 
     let needed = core::mem::size_of::<ddi12::D3D12DDI_D3D12_SHADER_MODELS_DATA_0011>();
     if data_size < needed {
@@ -1117,23 +1178,23 @@ unsafe fn shader_models(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
 
     if slots.pShaderModelsSupported.is_null() {
         // The count query. Report how many we have and write no models.
-        log_error!("GetCaps SHADER_MODELS: count query -> {}", MODELS.len());
+        log_error!("GetCaps SHADER_MODELS: count query -> {}", models.len());
         // SAFETY: the count slot is non-null per the check above.
         unsafe {
-            core::ptr::write_unaligned(slots.pNumShaderModelsSupported, MODELS.len() as ddi12::UINT)
+            core::ptr::write_unaligned(slots.pNumShaderModelsSupported, models.len() as ddi12::UINT)
         };
         return S_OK;
     }
 
-    let written = capacity.min(MODELS.len());
-    if written < MODELS.len() {
+    let written = capacity.min(models.len());
+    if written < models.len() {
         // ⚠ Counted rather than refused: a short buffer is the caller's choice,
         // and the count written back tells it the truth. A truncated list that
         // still contains 5.1 is legal; one that does not is the failure this
         // counter exists to make visible.
         note_refusal(&UMD12_REFUSALS.caps_shader_models_truncated);
     }
-    for (index, model) in MODELS.iter().take(written).enumerate() {
+    for (index, (_, model)) in models.iter().take(written).enumerate() {
         // SAFETY: the caller advertised `capacity` entries and `written <=
         // capacity`, so every index is inside the caller's array.
         unsafe { core::ptr::write_unaligned(slots.pShaderModelsSupported.add(index), *model) };
@@ -1586,9 +1647,10 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER, D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD,
     D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET, D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
     D3D12_FORMAT_SUPPORT1_SHADER_GATHER, D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE,
-    D3D12_FORMAT_SUPPORT2, D3D12_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP, D3D12_FORMAT_SUPPORT2_TILED,
-    D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD, D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE,
-    D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE, D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS,
+    D3D12_FORMAT_SUPPORT2, D3D12_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP,
+    D3D12_FORMAT_SUPPORT2_TILED, D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD,
+    D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE,
+    D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 

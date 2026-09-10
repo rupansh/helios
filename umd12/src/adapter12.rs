@@ -325,6 +325,12 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut c_void) -> Hresult {
         SUPPORTED_DDI_VERSIONS,
     );
 
+    // Discover optional support before publishing any adapter caps. Failed
+    // discovery is retryable on a later open and never implies RT support.
+    if caps12::native_optional_caps().is_none() {
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+
     // ── 4. The driver's adapter handle ──────────────────────────────────────
     open.hAdapter.pDrvPrivate = core::ptr::addr_of!(ADAPTER_TOKEN) as *mut c_void;
 
@@ -596,6 +602,7 @@ unsafe extern "C" fn close_adapter(h_adapter: ddi12::D3D12DDI_HADAPTER) -> ddi12
     if !adapter_ok(h_adapter) {
         return E_INVALIDARG;
     }
+    crate::bridge12::discard_capability_engine();
     log_error!("CloseAdapter");
     log_refusal_summary();
     // ⭐ And the other instrument, for the same reason: the per-slot noop hit

@@ -4,7 +4,8 @@ param(
     [string]$BuildDir = 'C:\ProgramData\Helios\raytracing-probe',
     [string]$ArchiveRoot = 'Z:\tmp\fl12-raytracing',
     [string]$InteractiveUser = 'Rupansh',
-    [string]$ExpectedUmd12SHA256 = ''
+    [string]$ExpectedUmd12SHA256 = '',
+    [switch]$WithoutRaytracing
 )
 $executedRunnerSource = $MyInvocation.MyCommand.ScriptBlock.Ast.Extent.Text
 $ErrorActionPreference = 'Stop'
@@ -112,10 +113,13 @@ if ($Mode -eq 'Build') {
     exit 0
 }
 if ($Mode -eq 'Schedule') {
+    $previous = Get-ScheduledTask -TaskName 'helios_raytracing_acceptance' -ErrorAction SilentlyContinue
+    if ($previous -and $previous.State -eq 'Running') { throw 'Previous DXR probe is still running; preserve its task and archive.' }
     Assert-ExpectedDriver
     $null = Assert-Build
     Assert-NoOverrides
     $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$localRunner`" -Mode Run -BuildDir `"$BuildDir`" -ArchiveRoot `"$ArchiveRoot`" -ExpectedUmd12SHA256 $ExpectedUmd12SHA256"
+    if ($WithoutRaytracing) { $arguments += ' -WithoutRaytracing' }
     $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
     $principal = New-ScheduledTaskPrincipal -UserId $InteractiveUser -LogonType Interactive -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
@@ -130,11 +134,16 @@ New-Item -ItemType Directory $runDir | Out-Null
 $env:HELIOS_WSI_ASYNC_PRESENT = '1'
 Remove-Item Env:\HELIOS_RETIRE_FEEDBACK -ErrorAction SilentlyContinue
 $env:VKD3D_SHADER_CACHE_PATH = '0'
+# Restrict engine feature discovery, never force a feature level or shader model.
+# This tests missing RT support on the current GPU, not another GPU model.
+if ($WithoutRaytracing) {
+    $env:VKD3D_DISABLE_EXTENSIONS = 'VK_KHR_ray_tracing_pipeline,VK_KHR_acceleration_structure,VK_KHR_ray_query'
+} else { Remove-Item Env:\VKD3D_DISABLE_EXTENSIONS -ErrorAction SilentlyContinue }
 $result = [ordered]@{
     UTC = [DateTime]::UtcNow.ToString('o'); Session = (Get-Process -Id $PID).SessionId
     Completed = $false; Blocked = $false; ExitCode = 1; ExpectedUmd12SHA256 = $ExpectedUmd12SHA256
-    ProcessId = 0; Errors = @()
-    Environment = [ordered]@{ HELIOS_WSI_ASYNC_PRESENT = '1'; VKD3D_SHADER_CACHE_PATH = '0' }
+    ProcessId = 0; Errors = @(); WithoutRaytracing = [bool]$WithoutRaytracing
+    Environment = [ordered]@{ HELIOS_WSI_ASYNC_PRESENT = '1'; VKD3D_SHADER_CACHE_PATH = '0'; VKD3D_DISABLE_EXTENSIONS = $env:VKD3D_DISABLE_EXTENSIONS }
 }
 function Set-RunFailure([string]$Message) {
     $result.Completed = $false; $result.Blocked = $false; $result.ExitCode = 1
@@ -164,6 +173,7 @@ try {
     $info = New-Object System.Diagnostics.ProcessStartInfo
     $info.FileName = "$runDir\d3d12_raytracing_probe.exe"
     $info.Arguments = "`"$runDir\raytracing.dxil`""
+    if ($WithoutRaytracing) { $info.Arguments += ' --without-raytracing' }
     $info.WorkingDirectory = $runDir
     $info.UseShellExecute = $false; $info.RedirectStandardOutput = $true; $info.RedirectStandardError = $true
     $process = New-Object System.Diagnostics.Process
@@ -181,11 +191,15 @@ try {
     $blocked = $process.ExitCode -eq 77 -and $errText.Contains('BLOCKED77,')
     $admitted = $outText -match '(?m)^CAP,NativeFL12_1Admission,00000000\r?$'
     $result.NativeFL12_1Admitted = $admitted
-    $required = @('PASS,cross_queue_build_dispatch', 'PASS,bundle_pipeline_and_dispatch',
+    $required = @('PASS,optional_rt_state_object_created', 'PASS,cross_queue_build_dispatch', 'PASS,bundle_pipeline_and_dispatch',
                   'PASS,bundle_inherited_root_dispatch', 'PASS,compact_clone_update_source_lifetime',
                   'PASS,tlas_restore_completed_before_blas_recording',
                   'PASS,serialization_query_after_tlas_restore',
                   'PASS,serialize_relocate_tlas_first_deserialize_lifetime', 'PASS,native_dxr_probe_completed')
+    if ($WithoutRaytracing) {
+        $required = @('CAP,RaytracingTier,0', 'PASS,no_rt_state_object_refused',
+                      'PASS,no_rt_gpu_readback_4096_words', 'PASS,native_no_rt_probe_completed')
+    }
     $workloadPassed = $process.ExitCode -eq 0 -and @($required | Where-Object { !$outText.Contains($_) }).Count -eq 0
     $result.Modules = @($errText -split "`r?`n" | Where-Object { $_ -like 'MODULE,*' } | ForEach-Object {
         $parts = $_ -split ',', 3

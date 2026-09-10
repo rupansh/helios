@@ -12,6 +12,28 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## Conditional DXR admission, 2026-09-11
+
+Current release UMD12 `465CBE13…` makes DXR optional. Adapter caps are discovered
+through the actual engine and revalidated at native device creation; non-RT
+engines retain otherwise-backed FL11_0..12_1 support, with RT0 and an engine-bounded
+shader-model list. Native Windows admission/caps checks pass with RT enabled and
+with RT extensions removed from engine discovery. WDDM2.1/.271/oem54, UMD11,
+Mesa, native completion and async WSI are unchanged. Eight DXR behavior groups
+and20 ray words pass. The no-RT fixture refuses a valid RT pipeline and reads
+back4,096 correct words; all four native ordering cases pass in ordinary RT,
+engine-disabled RT and Venus-disabled RT configurations. The first candidate's
+cross-process startup failure is repaired by transferring the discovery engine
+to the native device, with the original test deadlines preserved.
+
+[Conditional DXR support](docs/dx12/DXR_SERIALIZATION.md#conditional-dxr-support)
+records source/build/deployment identities, native GPU/refusal checks and the
+limits of the restricted-feature test. It is not a run on a different GPU.
+The accepted Port Royal result below remains tied to 057934F9; this increment
+has no new benchmark or performance claim. Full FL12_1/DXR compliance is still
+open, including sparse mapping, tools visualization, allocator retirement and
+newly recorded extreme AS-count/recursion-limit audit items.
+
 ## Native DXR and completed Port Royal, 2026-09-11
 
 Release UMD12 `057934F9…` completes native Port Royal with **12,337 / 57.12 FPS**.
@@ -43,8 +65,7 @@ failures, and unexercised/refused behavior. Time Spy, Fire Strike and Steel Noma
 Vulkan also complete all workloads with matching rendering settings and changing
 frames: graphics scores 23,816 / 59,231 / 9,409 respectively. These are single-run
 controls, not a performance comparison. Root implementation `c65b77e` and engine
-`54e759e1` / `bb46e7c6` are committed locally; nothing new was pushed. The guest
-is left idle. The [control receipt](docs/dx12/DXR_SERIALIZATION.md#completed-regression-controls-2026-09-11)
+`54e759e1` / `bb46e7c6` are committed locally; nothing new was pushed. That validation left the guest idle. The [control receipt](docs/dx12/DXR_SERIALIZATION.md#completed-regression-controls-2026-09-11)
 records exact hashes, runtime identities and the remaining acceptance limits.
 
 Complete FL12_0/12_1 and DXR conformance remain open: the authorized sparse
