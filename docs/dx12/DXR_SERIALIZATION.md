@@ -1,5 +1,13 @@
 # DXR serialization and reference lifetimes
 
+**Sequencing correction, 2026-09-11:** reuse vkd3d's existing DXR implementation.
+The immediate work is native Helios DDI/capability agreement and Windows runtime
+validation. Tools visualization is a known unsupported operation, but no Port
+Royal trace establishes its use. The dated proposal to implement decoded AS
+storage next is deferred; its uncommitted CPU-layout experiment was removed
+from the implementation tree and was never deployed. This does not close the
+tools conformance gap or authorize capability spoofing. Native RT0/SM6.0 remain.
+
 The engine now prepares referenced Vulkan AS objects at the execution boundary
 before deserializing an ordinary DXR acceleration structure. This closes the
 TLAS-first, later-BLAS-recording gap in the host engine tests. Native DXR remains

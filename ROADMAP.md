@@ -12,6 +12,26 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## DXR integration sequencing correction, 2026-09-11
+
+vkd3d already implements raytracing pipelines, DXIL compilation, AS operations,
+shader tables and ray dispatch. Helios installs native forwarding callbacks for
+those operations in `forward12/misc.rs`, implemented by `raytracing.rs`. Current
+native admission is still hard-coded RT0 and the shader-model list stops at6.0.
+The next work is checking that native DDI contract and capability agreement with
+the actual engine, then exercising the native Windows probe. Engine changes
+need a demonstrated forwarding/backing defect, rather than a replacement DXR
+implementation.
+
+The tools-visualization layout experiment was set aside uncommitted and never
+deployed. Its library compiled, but its standalone test did not link; no passing
+validation is claimed. Tools visualization remains an explicit unsupported
+engine/DDI operation and conformance gap. No Port Royal trace establishes that
+it uses this operation, so the older "next subsystem" statements below are not
+evidence that an inverse-AS implementation is a prerequisite for Port Royal.
+No capability was raised and no complete DXR conformance claim follows from this
+sequencing correction. The tested installed8F15F9DC build remains unchanged.
+
 ## Committed dependency checkpoint, 2026-09-10
 
 The owner authorized committing the accumulated native FL/DXR work and pushing

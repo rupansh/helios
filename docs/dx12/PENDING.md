@@ -1,5 +1,13 @@
 # PENDING.md — native FL12_0/FL12_1 and higher-feature contracts
 
+**2026-09-11 sequencing correction:** vkd3d already supplies the DXR engine.
+Helios has installed native state-object/AS/DispatchRays forwarding, but reports
+RT0 and SM6.0. Prioritize its DDI/capability agreement and native runtime tests.
+Tools visualization remains unsupported; no Port Royal trace demonstrates that
+it is needed. Its speculative layout work was set aside, not committed or
+deployed. Keep the conformance gap explicit without treating it as a proven
+benchmark dependency. No caps changed in this correction.
+
 
 Current release UMD12 `8F15F9DC…` adds checked AS input envelopes/counts, defined
 prebuild failure output and temporary-allocation cleanup, plus the low-32-bit

@@ -1,5 +1,11 @@
 # Native DX12 feature-level contract
 
+**DXR sequencing, 2026-09-11:** use the existing vkd3d DXR engine and validate
+Helios's installed native forwarding/capability contract. RT0/SM6.0 currently
+prevent native admission. Tools visualization remains an unsupported operation
+and conformance gap, but its use by Port Royal has not been demonstrated. The
+proposed decoder work is deferred; no native cap was raised by this correction.
+
 The current owner-directed work is genuine native FL12_0 and FL12_1. DX12 has
 priority. Feature-level conformance and DXR/Port Royal are separate acceptance
 requirements; neither FL12_0 nor FL12_1 alone requires ray tracing. FL12_2 and
