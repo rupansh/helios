@@ -14,6 +14,9 @@ worker, and Reset returns without resetting while internal references remain.
 A completed benchmark cannot distinguish delayed retirement from premature reuse;
 that focused native lifetime investigation remains open. No synchronization or
 backing-retention policy changes are part of this DXR admission increment.
+Time Spy, Fire Strike and Steel Nomad Vulkan also complete on that same stack;
+[the control receipt](DXR_SERIALIZATION.md#completed-regression-controls-2026-09-11)
+records settings, loaded identities and changing host-VNC frames.
 
 **Earlier deployment, 2026-09-09:** the paired local renderer and .271/oem54
 guest package are active. All four native ordering/readback cases pass using

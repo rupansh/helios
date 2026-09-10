@@ -9,7 +9,9 @@ the RT1.0 payload and explicit-export association repairs. Tools
 visualization remains an unsupported operation and conformance gap; its use by
 Port Royal has not been demonstrated. Port Royal now completes at 12,337 / 57.12 FPS
 with changing frames; owner visual acceptance and full conformance remain separate.
-See the [completed run](DXR_SERIALIZATION.md#completed-native-port-royal-2026-09-11).
+See the [completed run](DXR_SERIALIZATION.md#completed-native-port-royal-2026-09-11)
+and [regression controls](DXR_SERIALIZATION.md#completed-regression-controls-2026-09-11)
+on the same 057934F9/.271/43394BBD stack.
 
 The current owner-directed work is genuine native FL12_0 and FL12_1. DX12 has
 priority. Feature-level conformance and DXR/Port Royal are separate acceptance

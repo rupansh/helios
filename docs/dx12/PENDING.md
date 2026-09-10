@@ -8,7 +8,9 @@ on 057934F9 at 12,337 / 57.12 FPS with both workload statuses 0, archived/export
 results and changing frames. Owner visual acceptance remains pending. Full DXR
 and FL conformance, including the tools-visualization and sparse compatibility
 gaps, remain separate acceptance. Pending allocator/fence-worker lifetime work
-is not closed by successful benchmark completion.
+is not closed by successful benchmark completion. Time Spy, Fire Strike and
+Steel Nomad Vulkan complete on the same stack; see the
+[control receipt](DXR_SERIALIZATION.md#completed-regression-controls-2026-09-11).
 
 **2026-09-11 sequencing correction:** vkd3d already supplies the DXR engine.
 Helios has installed native state-object/AS/DispatchRays forwarding, but reports

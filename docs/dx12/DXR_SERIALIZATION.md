@@ -17,9 +17,10 @@ System32 D3D12/Core 10.0.26100.9278 / DXGI 10.0.26100.9444. WARP and app-local
 vkd3d substitution are excluded by the recorded module lists. The wrapper uses
 HELIOS_WSI_ASYNC_PRESENT=1, ordinary logging, no retired feedback workaround and
 no feature/shader overrides. Host VNC captures 42 frames with 33 distinct hashes;
-manual inspection of demo 13.png and graphics 35.png shows different rendered
-scenes. **Owner visual acceptance is pending.** A black transition capture 24.png
-is between the completed workloads, not evidence of a frozen benchmark.
+manual inspection of demo 13.png and graphics 35.png/39.png shows different
+rendered scenes, including GT1 frame 2311→5011. **Owner visual acceptance is
+pending.** A black transition capture 24.png is between the completed workloads,
+not evidence of a frozen benchmark.
 
 Evidence under `tmp/dxr-native-admission-20260911/`:
 
@@ -36,6 +37,9 @@ Evidence under `tmp/dxr-native-admission-20260911/`:
   ordering cases, each with 65,536 exact readback words and loaded identities.
 - `guest-final.json`: .271/oem54/Code0, explicit UmdD3D12=1, unchanged UMD11/ICD,
   LLVM 22.1.8 and Vulkan SDK 1.4.350.0. No new signed package or hosted-CI validation.
+  `kmd-artifact.json` records the running service and installed DriverStore image
+  SHA256 `BEE454883A4800EA38ABE0C271DDF48EF0A1F087C6D7E75D2972F3473CC0738B`;
+  it is an on-disk service-image hash, not an in-memory kernel dump.
 
 Each Port Royal workload creates 29 RT state objects. Demo forwards 249,932 AS
 builds and 32,534 ray dispatches; GT1 forwards 121,634 builds and 18,552 dispatches.
@@ -48,11 +52,67 @@ success without resetting when internal references remain; completion of this
 benchmark does not prove those references are merely delayed worker bookkeeping.
 The next focused lifetime probe must distinguish that case from pending GPU use.
 
-The deployment was built from the source/patch inputs frozen in
-`export-build-windows/`; a later module-comment correction changes no executable
-code. Source commits do not imply a rebuild or a new deployed binary. Time Spy,
-Fire Strike and Steel Nomad Vulkan regression controls are being collected on
-this same artifact; older control scores remain bound to their original builds.
+The implementation is committed locally at root `c65b77e`, with engine admission
+`54e759e1` and opt-in RT diagnostics `bb46e7c6`. Nothing new was pushed. Mesa
+`2d4e910bd04`, DXIL compiler `f4651bd0`, renderer `2121d5d0` and protocol `fe08e82c`
+remain. The deployment was built before those commits from source/patch inputs
+frozen in `export-build-windows/`. `committed-build-reconciliation.json` checks
+all 63 final input files: 62 are byte-identical to committed source; the remaining
+file differs only by the corrected module comment. Export/trace input manifests
+inherited their first inventory's UTC/repo-status metadata, while updating file
+hashes; use the build-receipt UTC and the reconciliation for the final build.
+Source commits do not imply a rebuild or a new deployed binary. The three
+regression controls below complete on this same deployed stack; older scores
+remain bound to their original builds.
+
+## Completed regression controls, 2026-09-11
+
+All stock workloads complete through interactive scheduled tasks, with status 0,
+archived `.3dmark-result` files and XML exports. Resolved rendering settings match
+the preceding completed 22C31F11 controls after excluding only run-result UUIDs,
+output paths and adapter LUIDs. These are single completed runs; no performance
+gain or regression is attributed to this DXR increment.
+
+| Control | Completed workloads | Graphics score | Measured FPS |
+|---|---|---:|---|
+| Time Spy | Demo, GT1, GT2, CPU | 23,816 | GT1 164.54; GT2 130.06; CPU 55.68 |
+| Fire Strike | Demo, GT1, GT2, physics, combined | 59,231 | GT1 254.75; GT2 260.37; physics 129.88; combined 45.39 |
+| Steel Nomad Vulkan | SteelNomadGt1VK | 9,409 | 94.10 |
+
+Overall scores are Time Spy 22,351 and Fire Strike 37,628. All four Time Spy
+processes load the exact 057934F9 UMD12, 43394BBD ICD and Microsoft System32
+D3D12/Core. All five Fire Strike processes load the unchanged 57C84ED4 DX11 UMD
+and System32 D3D11. Steel Nomad loads the exact ICD and uses the Vulkan workload;
+it does not load UMD12 or D3D12Core. All workload processes are in session 1;
+WARP and app-local vkd3d substitution are excluded by the module receipts.
+
+Under `tmp/dxr-native-admission-20260911/`, `controls/native-dxr-export-*`
+contains the results, settings, identities and logs. Matching `*-review.json`
+and `*-settings.json` files check completion, loaded implementation, output
+hashes and rendering-setting equivalence. `controls-summary.json` aggregates
+those receipts. The settings checker initially flagged differently named LUID
+and result-UUID fields; the retained `*-settings-initial.json` files show those
+non-rendering differences. No benchmark rerun or setting change was used to
+resolve them.
+
+`frame-inspection.json` records manually viewed host-VNC pairs: Port Royal GT1
+frame 2311→5011, Time Spy GT1 frame 2188→3753, Fire Strike GT2 frame 7637→10211 and
+Steel Nomad Vulkan frame 545→1192. These show changing scenes; owner visual
+acceptance remains pending. No paintcap or focus-taking observer ran. Existing
+.266 shadow/~100FPS acceptance and the instrumented 74.26 FPS run remain separate.
+
+`benchmark-artifacts.json` refreshes installed x64 workload hashes/versions:
+Time Spy 1.2.6.5, Fire Strike 1.1.0.0, Steel Nomad 1.0.5.1, Port Royal 1.0.0.0 and
+Speed Way 1.1.1.2 (not run). These are executable file versions, not inferred
+benchmark-engine/catalog versions. The CLI is 2.32.8454. `guest-complete.json`
+records unchanged .271/oem54/Code0, UmdD3D12=1, boot, UMD11/ICD and toolchain,
+with no remaining benchmark/probe process or running task from this work. The
+host capture processes have exited. No launcher restart was performed.
+
+The native Time Spy logs still emit pending-allocator-reset diagnostics; both
+that lifetime question and the broader ownership/consumer-release/host-loss
+limits remain open. The source/build tests and successful benchmark completion
+do not establish full FL12_0/12_1, DXR or WSI conformance.
 
 
 ## Public export associations, 2026-09-11

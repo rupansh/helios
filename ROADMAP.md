@@ -37,7 +37,12 @@ this is a ProgramData deployment, not a new signed package or hosted-CI result.
 [DXR_SERIALIZATION.md](docs/dx12/DXR_SERIALIZATION.md#completed-native-port-royal-2026-09-11)
 records exact source/build/runtime provenance, results, the two diagnosed DDI
 failures, and unexercised/refused behavior. Time Spy, Fire Strike and Steel Nomad
-Vulkan are being rerun as separate regression controls.
+Vulkan also complete all workloads with matching rendering settings and changing
+frames: graphics scores 23,816 / 59,231 / 9,409 respectively. These are single-run
+controls, not a performance comparison. Root implementation `c65b77e` and engine
+`54e759e1` / `bb46e7c6` are committed locally; nothing new was pushed. The guest
+is left idle. The [control receipt](docs/dx12/DXR_SERIALIZATION.md#completed-regression-controls-2026-09-11)
+records exact hashes, runtime identities and the remaining acceptance limits.
 
 Complete FL12_0/12_1 and DXR conformance remain open: the authorized sparse
 compatibility gap, unsupported tools visualization, estimated lane count and
