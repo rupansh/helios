@@ -1,5 +1,15 @@
 # PENDING.md — native FL12_0/FL12_1 and higher-feature contracts
 
+**2026-09-11 superseding DXR result:** 057934F9 now admits native RT1.0/SM6.3
+with engine backing checks. The seven native raytracing probe groups pass;
+see [DXR_SERIALIZATION.md](DXR_SERIALIZATION.md#native-dxr-admission-and-readback-2026-09-11).
+Older RT0 statements below describe their dated artifacts. Port Royal completes
+on 057934F9 at 12,337 / 57.12 FPS with both workload statuses 0, archived/exported
+results and changing frames. Owner visual acceptance remains pending. Full DXR
+and FL conformance, including the tools-visualization and sparse compatibility
+gaps, remain separate acceptance. Pending allocator/fence-worker lifetime work
+is not closed by successful benchmark completion.
+
 **2026-09-11 sequencing correction:** vkd3d already supplies the DXR engine.
 Helios has installed native state-object/AS/DispatchRays forwarding, but reports
 RT0 and SM6.0. Prioritize its DDI/capability agreement and native runtime tests.
@@ -9,7 +19,7 @@ deployed. Keep the conformance gap explicit without treating it as a proven
 benchmark dependency. No caps changed in this correction.
 
 
-Current release UMD12 `8F15F9DC…` adds checked AS input envelopes/counts, defined
+The preceding release UMD12 `8F15F9DC…` adds checked AS input envelopes/counts, defined
 prebuild failure output and temporary-allocation cleanup, plus the low-32-bit
 geometry stride rule. [DXR_SERIALIZATION.md](DXR_SERIALIZATION.md#as-build-inputs-and-prebuild-failures-2026-09-10)
 records 34,489 engine checks per direct NVIDIA/paired Venus stack and the exact
@@ -51,7 +61,7 @@ the former stock-renderer and private-emulation policies. Its D3D12 compute-quer
 Vulkan counter observation remains. The paired guest is deployed.
 DXR/Port Royal and later FL12_2/Speed Way require separate acceptance.
 
-Current UMD12 `8F15F9DC…` with guest Mesa `43394BBD…` admits native FL12_0/FL12_1,
+The preceding UMD12 `8F15F9DC…` with guest Mesa `43394BBD…` admits native FL12_0/FL12_1,
 tiled2 and SM6.0; RT remains0. These are compatibility-candidate caps, not a
 claim of complete feature-level conformance. The owner authorized committed
 reserved-image backing with explicit missing mapping/alias/residency semantics;

@@ -3,8 +3,8 @@
 //! GPU recording. Neither boundary may be replaced by a successful noop.
 //!
 //! DDI sources: d3d12umddi.h _0054 state objects and RT commands, _0072
-//! additions, _0075 pipeline config. The negotiated _0110 interface uses the
-//! _0075 config payload even though the subobject tag remains unchanged.
+//! additions, and _0075 pipeline config. Native RT1.0 consumes the shorter
+//! _0054 config payload even when the negotiated interface is _0110.
 //! https://microsoft.github.io/DirectX-Specs/d3d/Raytracing.html
 //!
 //! DDI GPUVAs are UINT64 values originally returned by this driver's
@@ -20,7 +20,7 @@
 
 use core::ffi::c_void;
 use core::mem::{align_of, size_of, ManuallyDrop};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, S_OK};
 use helios_umd_common::refusals::RefusalCounter;
@@ -143,6 +143,9 @@ struct StateObject {
     properties: ID3D12StateObjectProperties,
     h_device: ddi12::D3D12DDI_HDEVICE,
     kind: D3D12_STATE_OBJECT_TYPE,
+    // Explicit API exports replace internal/mangled names in vkd3d. Retain
+    // their public namespace for later implicit collection imports and Add.
+    explicit_exports: HashSet<Vec<u16>>,
 }
 
 fn valid_slot(h: ddi12::D3D12DDI_HSTATEOBJECT_0054) -> bool {
@@ -319,7 +322,7 @@ enum Payload {
     Library(D3D12_DXIL_LIBRARY_DESC, Vec<u8>, Vec<D3D12_EXPORT_DESC>),
     Collection(D3D12_EXISTING_COLLECTION_DESC, Vec<D3D12_EXPORT_DESC>),
     Shader(D3D12_RAYTRACING_SHADER_CONFIG),
-    Pipeline(D3D12_RAYTRACING_PIPELINE_CONFIG1),
+    Pipeline(D3D12_RAYTRACING_PIPELINE_CONFIG),
     Hit(D3D12_HIT_GROUP_DESC),
     Association(D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION, usize, [PCWSTR; 1]),
 }
@@ -356,7 +359,7 @@ impl Payload {
                 core::ptr::from_ref(p).cast(),
             ),
             Self::Pipeline(p) => (
-                D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1,
+                D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG,
                 core::ptr::from_ref(p).cast(),
             ),
             Self::Hit(p) => (
@@ -396,6 +399,7 @@ struct Translation {
     api: Vec<D3D12_STATE_SUBOBJECT>,
     empty_global: Option<usize>,
     empty_local: Option<usize>,
+    explicit_exports: HashSet<Vec<u16>>,
 }
 
 impl Translation {
@@ -406,6 +410,61 @@ impl Translation {
             api: Vec::new(),
             empty_global: None,
             empty_local: None,
+            explicit_exports: HashSet::new(),
+        }
+    }
+
+    fn retain_export(&mut self, units: &[u16]) -> RtResult<()> {
+        if self.explicit_exports.contains(units) {
+            return Ok(());
+        }
+        self.explicit_exports
+            .try_reserve(1)
+            .map_err(|_| error(E_OUTOFMEMORY, "DXR export namespace allocation failed"))?;
+        let mut copy = Vec::new();
+        reserve(&mut copy, units.len())?;
+        copy.extend_from_slice(units);
+        self.explicit_exports.insert(copy);
+        Ok(())
+    }
+
+    fn inherit_exports(&mut self, object: &StateObject) -> RtResult<()> {
+        for units in &object.explicit_exports {
+            self.retain_export(units)?;
+        }
+        Ok(())
+    }
+
+    /// SAFETY: exports() has checked these runtime-owned terminated UTF-16
+    /// names; each remains readable until this Create/Add call returns.
+    unsafe fn retain_api_exports(&mut self, exports: &[D3D12_EXPORT_DESC]) -> RtResult<()> {
+        for export in exports {
+            // SAFETY: validated, non-null LPCWSTR supplied by the runtime.
+            self.retain_export(unsafe { export.Name.as_wide() })?;
+        }
+        Ok(())
+    }
+
+    /// SAFETY: non-null names are validated terminated strings supplied by the
+    /// current runtime summary; the returned pointer is borrowed for this call.
+    unsafe fn summary_export(&self, mangled: PCWSTR, plain: PCWSTR) -> PCWSTR {
+        // Explicit exports in vkd3d carry only their declared public Name:
+        // libs/vkd3d-shader/dxil.c sets mangled_entry_point=NULL for that arm.
+        // Prefer an exact declared name, preserving explicitly mangled exports
+        // and renamed aliases. An unfiltered library retains both spellings,
+        // so its fallback remains mangled to distinguish overloaded functions.
+        for candidate in [mangled, plain] {
+            if !candidate.is_null()
+                // SAFETY: the current DDI summary owns this validated string.
+                && self.explicit_exports.contains(unsafe { candidate.as_wide() })
+            {
+                return candidate;
+            }
+        }
+        if mangled.is_null() {
+            plain
+        } else {
+            mangled
         }
     }
 
@@ -481,6 +540,7 @@ impl Translation {
                     let p = input(src.pDesc.cast::<ddi12::D3D12DDI_DXIL_LIBRARY_DESC_0054>())?;
                     let blob = library_container(p.pDXILLibrary)?;
                     let exports = exports(p.pExports, p.NumExports)?;
+                    self.retain_api_exports(&exports)?;
                     Payload::Library(
                         D3D12_DXIL_LIBRARY_DESC {
                             DXILLibrary: D3D12_SHADER_BYTECODE {
@@ -509,6 +569,11 @@ impl Translation {
                         ));
                     }
                     let exports = exports(p.pExports, p.NumExports)?;
+                    if p.NumExports == 0 {
+                        self.inherit_exports(collection)?;
+                    } else {
+                        self.retain_api_exports(&exports)?;
+                    }
                     Payload::Collection(
                         D3D12_EXISTING_COLLECTION_DESC {
                             pExistingCollection: ManuallyDrop::new(Some(collection.engine.clone())),
@@ -532,17 +597,22 @@ impl Translation {
                     })
                 }
                 10 => {
-                    // _0110 uses the _0075 payload, not the shorter _0054.
+                    // Native caps expose RT1.0. DDI _0110 negotiation alone
+                    // does not extend this payload to the RT1.1 _0075 form:
+                    // on runtime 26100.9278 Port Royal's valid depth=1 has
+                    // unrelated bytes (e.g. 0x6c617645) after the _0054 UINT.
+                    // Consume exactly the RT1.0 payload and forward the API's
+                    // depth-only CONFIG. RT1.1/CONFIG1 needs separate admission
+                    // and runtime payload validation before reading Flags.
                     let p = input(
                         src.pDesc
-                            .cast::<ddi12::D3D12DDI_RAYTRACING_PIPELINE_CONFIG_0075>(),
+                            .cast::<ddi12::D3D12DDI_RAYTRACING_PIPELINE_CONFIG_0054>(),
                     )?;
-                    if p.MaxTraceRecursionDepth > 31 || p.Flags & !0x300 != 0 {
-                        return Err(error(E_INVALIDARG, "invalid DXR pipeline config"));
+                    if p.MaxTraceRecursionDepth > 31 {
+                        return Err(error(E_INVALIDARG, "invalid DXR recursion depth"));
                     }
-                    Payload::Pipeline(D3D12_RAYTRACING_PIPELINE_CONFIG1 {
+                    Payload::Pipeline(D3D12_RAYTRACING_PIPELINE_CONFIG {
                         MaxTraceRecursionDepth: p.MaxTraceRecursionDepth,
-                        Flags: D3D12_RAYTRACING_PIPELINE_FLAGS(p.Flags as i32),
                     })
                 }
                 11 => {
@@ -630,19 +700,15 @@ impl Translation {
             }
             let mut has_global = false;
             let mut has_local = false;
-            // Use the mangled name when available: overloaded exports cannot be
-            // distinguished by their unmangled spellings.
-            // SAFETY: summary names are runtime-owned terminated UTF-16.
+            // Resolve against the public namespace actually given to vkd3d;
+            // runtime summaries may still name the internal DXIL symbol.
+            // SAFETY: summary names are runtime-owned terminated UTF-16 and
+            // remain readable until the engine has consumed this descriptor.
             let export = unsafe {
-                name(
-                    if function.ExportNameMangled.is_null() {
-                        function.ExportNameUnmangled
-                    } else {
-                        function.ExportNameMangled
-                    },
-                    false,
-                )
-            }?;
+                let mangled = name(function.ExportNameMangled, true)?;
+                let plain = name(function.ExportNameUnmangled, !mangled.is_null())?;
+                self.summary_export(mangled, plain)
+            };
             // SAFETY: runtime's associated-subobject pointer array is live.
             for ptr in unsafe {
                 array(
@@ -793,6 +859,11 @@ unsafe fn create_inner(
     // SAFETY: runtime guarantees count live subobjects; arrays are checked.
     let src = unsafe { array(ptr, count) }?;
     let mut translated = Translation::new();
+    if let Some(parent) = parent {
+        // SAFETY: the runtime keeps AddToStateObject's parent alive for this
+        // call; metadata is copied so no borrowed name escapes its lifetime.
+        translated.inherit_exports(unsafe { state(parent) }?)?;
+    }
     for object in src {
         if object.Type != 0x100000 {
             // SAFETY: object is inside the checked live runtime array.
@@ -831,6 +902,7 @@ unsafe fn create_inner(
         properties,
         h_device,
         kind,
+        explicit_exports: translated.explicit_exports,
     })
 }
 
@@ -1656,8 +1728,9 @@ pub(super) unsafe extern "C" fn set_pipeline_state1(
 fn shader_table(
     src: &ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE,
 ) -> RtResult<D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE> {
-    // RANGE_AND_STRIDE has the same low-32-bit DDI stride contract as geometry.
-    let stride = u64::from(src.StrideInBytes as u32);
+    // Shader-table RANGE_AND_STRIDE uses all 64 bits. Only the separate
+    // geometry ADDRESS_AND_STRIDE type specifies ignoring its upper 32 bits.
+    let stride = src.StrideInBytes;
     if src.SizeInBytes != 0 {
         gpu_range(src.StartAddress, src.SizeInBytes, 64, false)?;
         if !stride.is_multiple_of(32) || stride > 4096 {

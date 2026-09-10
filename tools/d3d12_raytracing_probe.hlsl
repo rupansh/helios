@@ -3,6 +3,7 @@ RaytracingAccelerationStructure Scene : register(t0);
 RWStructuredBuffer<uint> Results : register(u0);
 cbuffer Globals : register(b0) { uint Epoch; }
 cbuffer LocalRecord : register(b1) { uint RecordValue; }
+StructuredBuffer<uint> RayGenRecord : register(t0, space1);
 
 struct Payload { uint value; };
 struct CallableData { uint value; };
@@ -19,7 +20,7 @@ void RayGen()
     Payload payload;
     payload.value = 0xbaad0000;
     TraceRay(Scene, RAY_FLAG_NONE, 1, 0, 1, 0, ray, payload);
-    Results[index] = payload.value + Epoch;
+    Results[index] = payload.value + Epoch + RayGenRecord[0];
 }
 
 [shader("miss")]

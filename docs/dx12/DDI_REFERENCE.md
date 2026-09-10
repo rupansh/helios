@@ -1,5 +1,28 @@
 # DDI_REFERENCE.md — the `d3d12umddi` contract, reconstructed
 
+**Runtime correction, 2026-09-11 — DXR export namespace:** function summaries
+may supply an internal mangled symbol even when `DXIL_LIBRARY.pExports` gives
+the engine an explicit public name or alias. vkd3d keeps only that public name
+for explicit exports (`libs/vkd3d-shader/dxil.c`); blindly associating the summary's
+mangled spelling can miss and select conflicting default roots. Helios now
+resolves exact declared names and retains their namespace across collection
+imports. Unfiltered libraries keep the mangled fallback for overloads. The
+aliased raygen/local-SRV probe reproduces SRV1:0 failure on E21352DA and passes
+on 057934F9. See [DXR_SERIALIZATION.md](DXR_SERIALIZATION.md#public-export-associations-2026-09-11).
+
+**Runtime correction, 2026-09-11 — RT1.0 pipeline config:** do not infer the
+`D3D12DDI_RAYTRACING_PIPELINE_CONFIG_0075` payload solely from device DDI0110.
+On System32 D3D12Core10.0.26100.9278 with native RT1.0, Port Royal supplies a
+valid depth1 but the following word contains unrelated bytes (`0x6c617645`,
+`0x56666472` in two recorded workloads). Reading it as Flags rejected valid
+state objects. The native RT1.0 frontend now reads the four-byte `_0054` depth
+and forwards API `D3D12_RAYTRACING_PIPELINE_CONFIG`. A future RT1.1 cap raise must
+establish its `_0075` selection/flags contract separately. The minimal native
+probe, including a poison word after its public API config, passes both before
+and after this repair: it does not reproduce Port Royal's internal DDI allocation
+layout. Exact diagnostic/repaired binaries and runtime evidence are in
+`tmp/dxr-native-admission-20260911/`; see [DXR_SERIALIZATION.md](DXR_SERIALIZATION.md).
+
 **What this is.** The reference manual for the D3D12 user-mode display driver DDI as Helios must
 implement it (`DECISIONS.md` D1: `helios_umd12.dll` implements `d3d12umddi.h` and forwards into
 vkd3d-proton's `ID3D12*` COM objects). It is a *reconstruction*: every table, every slot, every

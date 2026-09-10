@@ -293,7 +293,7 @@ struct Pipeline {
     ComPtr<ID3D12RootSignature> global;
     ComPtr<ID3D12StateObject> state;
     ComPtr<ID3D12DescriptorHeap> heap;
-    Resource table, output, result;
+    Resource table, output, result, raygen_record;
     D3D12_DISPATCH_RAYS_DESC dispatch{};
     UINT descriptor_size = 0;
 
@@ -325,14 +325,36 @@ struct Pipeline {
         check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors), "serialize local root");
         ComPtr<ID3D12RootSignature> local;
         check(ctx.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&local)), "local root");
-        D3D12_DXIL_LIBRARY_DESC library{{dxil.data(), dxil.size()}, 0, nullptr};
+        // A distinct raygen local root exercises SRV register-space translation
+        // and per-export associations, independently of the hit/callable roots.
+        D3D12_ROOT_PARAMETER raygen_param{};
+        raygen_param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+        raygen_param.Descriptor = {0, 1};
+        root_desc = {1, &raygen_param, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE};
+        blob.Reset(); errors.Reset();
+        check(D3D12SerializeRootSignature(&root_desc, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &errors), "serialize raygen local root");
+        ComPtr<ID3D12RootSignature> raygen_local;
+        check(ctx.device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&raygen_local)), "raygen local root");
+        // Explicit API exports replace the engine's internal/mangled namespace.
+        // Native summary associations must follow these public names, including
+        // aliases, while the DXIL entry itself retains its original symbol.
+        const D3D12_EXPORT_DESC library_exports[] = {
+            {L"TraceRayGen", L"RayGen", D3D12_EXPORT_FLAG_NONE},
+            {L"Miss", nullptr, D3D12_EXPORT_FLAG_NONE},
+            {L"ClosestHit", nullptr, D3D12_EXPORT_FLAG_NONE},
+            {L"Intersection", nullptr, D3D12_EXPORT_FLAG_NONE},
+            {L"Callable", nullptr, D3D12_EXPORT_FLAG_NONE},
+        };
+        D3D12_DXIL_LIBRARY_DESC library{{dxil.data(), dxil.size()},
+            static_cast<UINT>(std::size(library_exports)), library_exports};
         D3D12_GLOBAL_ROOT_SIGNATURE global_desc{global.Get()};
         D3D12_LOCAL_ROOT_SIGNATURE local_desc{local.Get()};
+        D3D12_LOCAL_ROOT_SIGNATURE raygen_local_desc{raygen_local.Get()};
         D3D12_RAYTRACING_SHADER_CONFIG shader_config{4, 8};
         D3D12_RAYTRACING_PIPELINE_CONFIG pipeline_config{1};
         D3D12_HIT_GROUP_DESC triangle{L"TriangleHit", D3D12_HIT_GROUP_TYPE_TRIANGLES, nullptr, L"ClosestHit", nullptr};
         D3D12_HIT_GROUP_DESC box{L"BoxHit", D3D12_HIT_GROUP_TYPE_PROCEDURAL_PRIMITIVE, nullptr, L"ClosestHit", L"Intersection"};
-        std::array<D3D12_STATE_SUBOBJECT, 8> objects{{
+        std::array<D3D12_STATE_SUBOBJECT, 10> objects{{
             {D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY, &library},
             {D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE, &global_desc},
             {D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &local_desc},
@@ -341,10 +363,15 @@ struct Pipeline {
             {D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &triangle},
             {D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP, &box},
             {D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, nullptr},
+            {D3D12_STATE_SUBOBJECT_TYPE_LOCAL_ROOT_SIGNATURE, &raygen_local_desc},
+            {D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION, nullptr},
         }};
         const wchar_t *associated[] = {L"TriangleHit", L"BoxHit", L"Callable"};
         D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION association{&objects[2], 3, associated};
         objects[7].pDesc = &association;
+        const wchar_t *raygen_export = L"TraceRayGen";
+        D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION raygen_association{&objects[8], 1, &raygen_export};
+        objects[9].pDesc = &raygen_association;
         D3D12_STATE_OBJECT_DESC desc{D3D12_STATE_OBJECT_TYPE_COLLECTION, static_cast<UINT>(objects.size()), objects.data()};
         ComPtr<ID3D12StateObject> collection;
         check(ctx.device->CreateStateObject(&desc, IID_PPV_ARGS(&collection)), "complete collection with export associations");
@@ -352,7 +379,7 @@ struct Pipeline {
         D3D12_STATE_SUBOBJECT sub{D3D12_STATE_SUBOBJECT_TYPE_EXISTING_COLLECTION, &existing};
         desc = {D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE, 1, &sub};
         check(ctx.device->CreateStateObject(&desc, IID_PPV_ARGS(&state)), "pipeline from existing collection");
-        collection.Reset(); local.Reset(); // Pipeline must retain both ancestors.
+        collection.Reset(); local.Reset(); raygen_local.Reset(); // Pipeline retains ancestors.
         ComPtr<ID3D12StateObjectProperties> properties;
         check(state.As(&properties), "state properties");
         require(properties->GetShaderIdentifier(L"AbsentExport") == nullptr, "absent export has no identifier");
@@ -361,7 +388,7 @@ struct Pipeline {
         properties->SetPipelineStackSize(stack);
         require(properties->GetPipelineStackSize() == stack, "stack round trip");
         std::array<uint8_t, 320> records{};
-        const wchar_t *exports[] = {L"RayGen", L"Miss", L"TriangleHit", L"BoxHit", L"Callable"};
+        const wchar_t *exports[] = {L"TraceRayGen", L"Miss", L"TriangleHit", L"BoxHit", L"Callable"};
         for (UINT i = 0; i < 5; ++i) {
             void *id = properties->GetShaderIdentifier(exports[i]);
             require(id != nullptr, "shader identifier");
@@ -370,9 +397,13 @@ struct Pipeline {
         }
         const UINT local_values[3] = {0x111, 0x222, 0x1000};
         for (UINT i = 0; i < 3; ++i) memcpy(records.data() + (i + 2) * 64 + 32, &local_values[i], 4);
+        const UINT raygen_value = 0x4000;
+        raygen_record = ctx.upload(&raygen_value, sizeof(raygen_value));
+        const UINT64 raygen_address = raygen_record->GetGPUVirtualAddress();
+        memcpy(records.data() + 32, &raygen_address, sizeof(raygen_address));
         table = ctx.upload(records.data(), records.size());
         UINT64 va = table->GetGPUVirtualAddress();
-        dispatch.RayGenerationShaderRecord = {va, 32};
+        dispatch.RayGenerationShaderRecord = {va, 64};
         dispatch.MissShaderTable = {va + 64, 32, 32};
         dispatch.HitGroupTable = {va + 128, 128, 64};
         dispatch.CallableShaderTable = {va + 256, 64, 64};
@@ -442,7 +473,7 @@ struct Pipeline {
     void verify(UINT epoch)
     {
         auto bytes = Context::read(result.Get(), 16);
-        const UINT expected[] = {0x1111 + epoch, 0xdead0000 + epoch, 0x1222 + epoch, 0xdead0000 + epoch};
+        const UINT expected[] = {0x5111 + epoch, 0xdead4000 + epoch, 0x5222 + epoch, 0xdead4000 + epoch};
         for (UINT i = 0; i < 4; ++i) {
             UINT value; memcpy(&value, bytes.data() + i * 4, 4);
             printf("PIXEL,%u,%u,%08x,%08x\n", epoch, i, value, expected[i]);

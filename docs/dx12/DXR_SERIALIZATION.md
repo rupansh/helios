@@ -1,28 +1,174 @@
 # DXR serialization and reference lifetimes
 
-**Sequencing correction, 2026-09-11:** reuse vkd3d's existing DXR implementation.
-The immediate work is native Helios DDI/capability agreement and Windows runtime
-validation. Tools visualization is a known unsupported operation, but no Port
-Royal trace establishes its use. The dated proposal to implement decoded AS
-storage next is deferred; its uncommitted CPU-layout experiment was removed
-from the implementation tree and was never deployed. This does not close the
-tools conformance gap or authorize capability spoofing. Native RT0/SM6.0 remain.
+## Completed native Port Royal, 2026-09-11
 
-The engine now prepares referenced Vulkan AS objects at the execution boundary
-before deserializing an ordinary DXR acceleration structure. This closes the
-TLAS-first, later-BLAS-recording gap in the host engine tests. Native DXR remains
-unadmitted; this document does not establish a complete DXR tier or Port Royal
-acceptance.
+The stock Port Royal collection completes on release UMD12
+`057934F90BFBC8B50D1A50FAC1AECB53661658311F9DCAC762CA1289EC4F7F05`.
+Demo PID 11064 and graphics-test PID 2668 run in session 1 on Helios LUID
+`00000000:002572e3`; both workload statuses are 0. The graphics score is 12,337,
+GT1 is 57.118721 FPS (export 57.12). Resolved graphics settings are 2560×1440,
+ray-traced reflections, RT shadows enabled, medium reflection filtering and
+16 temporal-AA samples. Demo rendering is 1280×800. The unmodified stock
+`.3dmdef` SHA256 is `3D4EE2596D8295E6C5255E4B4EB282434C8ECB2CC8B71A7A930A797DB5A0351B`.
+This is a single completed result, not a before/after performance claim.
 
-The subsequent AS input repair is deployed as UMD12 `8F15F9DC…`; the section
-below records its engine and native regression evidence. The adapter admission
-repair was deployed as UMD12 `898F75F9…`.
-[FEATURE_LEVELS.md](FEATURE_LEVELS.md#adapter-admission-contract-2026-09-10)
-records its direct DDI and native FL/ordering tests. That adapter increment kept
-all seven static engine archives byte-identical to 2D90C57E; its AS implementation
-and DXR cap did not change.
-The dated results retain their original binary and scope. The current native
-RT0 query confirms that Port Royal remains blocked.
+Both processes load the exact 057934F9 native UMD, Mesa ICD 43394BBD and Microsoft
+System32 D3D12/Core 10.0.26100.9278 / DXGI 10.0.26100.9444. WARP and app-local
+vkd3d substitution are excluded by the recorded module lists. The wrapper uses
+HELIOS_WSI_ASYNC_PRESENT=1, ordinary logging, no retired feedback workaround and
+no feature/shader overrides. Host VNC captures 42 frames with 33 distinct hashes;
+manual inspection of demo 13.png and graphics 35.png shows different rendered
+scenes. **Owner visual acceptance is pending.** A black transition capture 24.png
+is between the completed workloads, not evidence of a frozen benchmark.
+
+Evidence under `tmp/dxr-native-admission-20260911/`:
+
+- `controls/native-dxr-export-portroyal/`: invocation, resolved settings, loaded
+  modules, driver logs, result archive and XML export; the wrapper hash-verifies
+  copies from the guest's local C: output.
+- `native-dxr-export-portroyal-review.json`: workload-status/settings/identity
+  checks, scores, output and frame hashes. Result archive SHA256
+  `e72bbbcac2ee7f8dc579073f19894360479c9529ab4aee4a5f399a11e4cd147c`;
+  XML `6db9677677a40998a04d483a85895fc93446563ed886efe8553040d8555257b1`.
+- `portroyal-export-frames/`: timestamped host captures; no focus-taking observer.
+- `final-native-caps/` and `final-native-sync/`: the installed 057934F9 build
+  admits FL11_0 through FL12_1, refuses FL12_2, reports SM6.3/RT1.0 and passes all four native
+  ordering cases, each with 65,536 exact readback words and loaded identities.
+- `guest-final.json`: .271/oem54/Code0, explicit UmdD3D12=1, unchanged UMD11/ICD,
+  LLVM 22.1.8 and Vulkan SDK 1.4.350.0. No new signed package or hosted-CI validation.
+
+Each Port Royal workload creates 29 RT state objects. Demo forwards 249,932 AS
+builds and 32,534 ray dispatches; GT1 forwards 121,634 builds and 18,552 dispatches.
+No native DXR refusal is recorded. Tools visualization is unexercised and remains
+unsupported; this successful workload does not prove complete DXR conformance.
+Other existing gaps remain, including sparse compatibility, arbitrary alias and
+host-loss lifetimes, native RT1.1 and the estimated TotalLaneCount 1024. The logs
+retain 91,993 demo / 41,715 GT1 pending-allocator-reset errors. Engine Reset returns
+success without resetting when internal references remain; completion of this
+benchmark does not prove those references are merely delayed worker bookkeeping.
+The next focused lifetime probe must distinguish that case from pending GPU use.
+
+The deployment was built from the source/patch inputs frozen in
+`export-build-windows/`; a later module-comment correction changes no executable
+code. Source commits do not imply a rebuild or a new deployed binary. Time Spy,
+Fire Strike and Steel Nomad Vulkan regression controls are being collected on
+this same artifact; older control scores remain bound to their original builds.
+
+
+## Public export associations, 2026-09-11
+
+Release UMD12 `057934F90BFBC8B50D1A50FAC1AECB53661658311F9DCAC762CA1289EC4F7F05`
+fixes the next Port Royal state-object boundary. Its RTPSO trace showed native
+associations using internal symbols such as `\1?rayGen@@YAXXZ` while explicit
+library exports gave vkd3d only the public name `rayGen`. The association missed;
+vkd3d fell back to conflicting default local roots and failed to remap SRV1:0.
+
+The frontend now retains explicit public export names, prefers an exact declared
+mangled/public name for each runtime summary, and uses its former mangled-name
+fallback for unfiltered libraries. This preserves aliases without collapsing
+unfiltered overloaded functions to a common plain name. Implicit collection imports
+and Add inherit independently owned name metadata; filtered/renamed imports retain
+their new names. Allocation is fallible and all metadata is released with its
+state object. No queue, shader-table GPU lifetime or execution policy changed.
+
+The native probe now has a distinct raygen local root with an SRV at t0/space1,
+a GPU address in its shader record, and an explicit `TraceRayGen` alias. The same
+executable/shader fails on E21352DA at CreateStateObject with SRV1:0 unmapped, then
+passes all seven groups and 20 ray-result words on 057934F9 (PID 8620/session 1).
+The pipeline outlives its source collection and local roots. This is a reproduced
+native regression; the earlier public-config poison experiment was not retained
+as a test because it did not reproduce the separate payload overread.
+
+Release/A1 pass, including 211 KMD logic tests. All seven static archives match
+the E21352DA trace build. The engine's existing RT construction diagnostics are
+now available in release only at explicit VKD3D_DEBUG=trace; default logging
+remains unchanged. Linux/Windows engine builds pass. Known inputs and frozen
+artifacts are in `export-source-manifest.json` / `export-build-windows`, native
+before/after receipts in `export-before` / `export-after`, under
+`tmp/dxr-native-admission-20260911/`. The register-space-only probe separately
+passes on E76997FA and E21352DA; it did not reproduce the explicit-export defect.
+
+Two trace attempts stopped before DXR at exclusive-fullscreen initialization;
+they are not evidence about the binding failure. Authorized guest reboot at
+2026-09-11 00:52:43 +05:30 restored benchmark entry, and the next traced run
+reproduced the binding failure with exact system-runtime/Helios/ICD identities.
+KMD .271/oem54/Code0/WDDM2.1, UMD11 and ICD remain. Port Royal subsequently
+completes on 057934F9 with ordinary logging, as recorded above; owner visual
+acceptance remains open. Namespace OOM, overloaded-library and Add-specific
+runtime tests remain separate from the covered aliased collection case.
+
+## RT1.0 pipeline-config repair, 2026-09-11
+
+The first admitted Port Royal run on AC1818B6 fails both workloads at native
+CreateStateObject (workload status 10000, score 0, no exported result). VNC shows
+loading screens, not a rendered benchmark sequence. Diagnostic UMD12
+`82E16046D3EF422EB44AFE7712A4BF86412B927F1B693E17B47BC2121D341F7D`
+records depth 1 with invalid trailing Flags 0x6c617645/0x56666472. The driver had
+assumed DDI0110 always supplies the eight-byte RT1.1 `_0075` payload. For the
+advertised RT1.0 contract it now reads only the four-byte `_0054` depth and
+forwards API CONFIG instead of CONFIG1. No unknown flag is silently masked.
+RT1.1 payload selection remains a separate obligation before raising that tier.
+
+Release UMD12 `E76997FAAFDA50BDAF8B8AAB380E47D7F326AE7FAA54EE3A9B41C834DB55FE6F`
+is deployed with the same KMD/ICD/UMD11 and seven unchanged static engine archives.
+Windows release/A1 pass; the native DXR probe again passes all seven groups,
+PID 6304/session 1 with exact E76997FA/43394BBD/system-runtime module identities.
+The strengthened probe places a poison word after its public depth-only config;
+it also passed on 82E16046, so it is not a reproduction of the observed Port Royal
+DDI overread. Failed and diagnostic benchmark archives, input/build hashes and
+native before/after receipts are separate directories under
+`tmp/dxr-native-admission-20260911/`. Port Royal is being rerun on the repaired
+build; no completed benchmark or performance claim follows from the probe.
+
+## Native DXR admission and readback, 2026-09-11
+
+Release UMD12 `AC1818B6CBFBDAD8AE80D610D431E067F04763CF040EA04852B89C418C786946`
+reports RT1.0 and the gapless release shader-model list 5.1/6.0/6.1/6.2/6.3.
+The static engine admission guard checks its Vulkan-derived SM>=6.3 and RT>=1.0
+before publishing every native device, independent of the requested FL. Existing
+feature/shader overrides remain refused. Optional SM features retain their own
+caps; this does not enable mesh, VRS, native16-bit or sampler feedback.
+
+Helios reuses the existing vkd3d DXR engine through the installed `misc.rs` /
+`raytracing.rs` forwards. The native shader-table range stride now preserves all
+64 bits and rejects out-of-range values instead of applying the unrelated
+geometry-address stride truncation rule. Valid shader tables are exercised below;
+the upper-bit negative case has not been independently exercised through the DDI.
+
+The interactive native Windows probe, PID 8220/session 1, passes all seven behavior
+groups and 20 ray-result words: triangle/AABB/callable hit/miss results,
+collection/export/local-root retention, direct/compute ordering, explicit and
+inherited-root bundles, compact/clone/update and source lifetimes, and serialized
+BLAS/TLAS relocation with TLAS completion before BLAS recording. Serialized sizes
+and reference-count queries agree with readback; a foreign driver identifier is
+rejected. The log records 2 state objects, 3 prebuild queries, 4 AS builds, 3 postbuild
+queries, 8 copies and 5 ray dispatches. These are native frontend results, distinct
+from the earlier direct engine tests. Tools visualization remains explicitly
+unsupported and no full DXR conformance claim follows; arbitrary alias/lifetime,
+malformed inputs and host-loss behavior still need broader coverage.
+
+The probe loads Microsoft System32 D3D12/Core 10.0.26100.9278, DXGI 10.0.26100.9444,
+the exact AC1818B6 UMD12 and ICD 43394BBD on Helios1af4:1050; no WARP or app-local
+engine substitute. Native creation separately admits FL11_0 through12_1, refuses
+12_2, and reports SM6.3/RT1.0. All four ordinary ordering cases pass 65,536 words
+each with the same loaded identities. KMD 22.22.271.0/oem54/Code0/WDDM2.1 and
+UMD11 remain unchanged; this is a ProgramData deployment, not a signed package
+or hosted-CI result. Async WSI remains enabled; no retired feedback workaround.
+
+Linux engine, Windows static engine, release UMD and A1 pass (211 KMD logic tests).
+Source/build/mirror receipts, all seven frozen archives, native results and hashes
+are in `tmp/dxr-native-admission-20260911/`. Build source is root d831e6b plus the
+caps/stride changes, engine 10efa8af plus its admission guard, Mesa 2d4e910bd04 and
+DXIL f4651bd0. Compiler LLVM/libclang22.1.8, Vulkan SDK 1.4.350.0 and bindgen0.72
+remain. The renderer file hash still matches 06ce3964; reading the privileged live
+process mappings was unavailable in this run, so this is not fresh loaded-host
+hash verification. The existing QEMU/renderer processes were not restarted.
+
+Port Royal is now eligible for its first admitted native correctness run. Its
+completion, changing rendered frames and owner visual acceptance remain separate
+from these probe results. The tools-visualization experiment remains set aside;
+no Port Royal trace has established it as a dependency. Dated sections below
+retain their original artifacts and RT0 scope.
 
 ## AS build inputs and prebuild failures, 2026-09-10
 

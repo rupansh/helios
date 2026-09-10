@@ -179,8 +179,8 @@ mod v {
         D3D12DDI_VIEW_INSTANCING_TIER_D3D12DDI_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
     pub(super) const RENDER_PASS_NONE: D3D12DDI_RENDER_PASS_TIER =
         D3D12DDI_RENDER_PASS_TIER_D3D12DDI_RENDER_PASS_TIER_NOT_SUPPORTED;
-    pub(super) const RAYTRACING_NONE: D3D12DDI_RAYTRACING_TIER =
-        D3D12DDI_RAYTRACING_TIER_D3D12DDI_RAYTRACING_TIER_NOT_SUPPORTED;
+    pub(super) const RAYTRACING_1_0: D3D12DDI_RAYTRACING_TIER =
+        D3D12DDI_RAYTRACING_TIER_D3D12DDI_RAYTRACING_TIER_1_0;
     pub(super) const VRS_NONE: D3D12DDI_VARIABLE_SHADING_RATE_TIER =
         D3D12DDI_VARIABLE_SHADING_RATE_TIER_D3D12DDI_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED;
     pub(super) const MESH_NONE: D3D12DDI_MESH_SHADER_TIER =
@@ -210,6 +210,12 @@ mod v {
         D3D12DDI_SHADER_MODEL_D3D12DDI_SHADER_MODEL_5_1_RELEASE_0011;
     pub(super) const SM_6_0: D3D12DDI_SHADER_MODEL =
         D3D12DDI_SHADER_MODEL_D3D12DDI_SHADER_MODEL_6_0_RELEASE_0011;
+    pub(super) const SM_6_1: D3D12DDI_SHADER_MODEL =
+        D3D12DDI_SHADER_MODEL_D3D12DDI_SHADER_MODEL_6_1_RELEASE_0033;
+    pub(super) const SM_6_2: D3D12DDI_SHADER_MODEL =
+        D3D12DDI_SHADER_MODEL_D3D12DDI_SHADER_MODEL_6_2_RELEASE_0042;
+    pub(super) const SM_6_3: D3D12DDI_SHADER_MODEL =
+        D3D12DDI_SHADER_MODEL_D3D12DDI_SHADER_MODEL_6_3_RELEASE_0054;
 
     pub(super) const CAPS_TEXTURE_LAYOUT: D3D12DDICAPS_TYPE =
         D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_TEXTURE_LAYOUT;
@@ -854,7 +860,12 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         SRVOnlyTiledResourceTier3: 0,
         // ⛔ A tier without the render-pass DDI table is an error.
         RenderPassTier: v::RENDER_PASS_NONE,
-        RaytracingTier: v::RAYTRACING_NONE,
+        // misc::install_misc installs the native state-object/AS/DispatchRays
+        // forwards into vkd3d. Native device admission verifies engine RT1.0
+        // and SM6.3 before publishing the device, even for an FL11_0 request.
+        // Remaining conformance gaps are explicit in DXR_SERIALIZATION.md;
+        // this value alone is not native DXR or Port Royal acceptance.
+        RaytracingTier: v::RAYTRACING_1_0,
         VariableShadingRateTier: v::VRS_NONE,
         PerPrimitiveShadingRateSupportedWithViewportIndexing: 0,
         AdditionalShadingRatesSupported: 0,
@@ -1070,33 +1081,18 @@ unsafe fn shader_caps(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresu
 /// The list must be **non-empty**, **gapless** across release shader models, and
 /// **must include 5.1** (strings:24-25 and the §11.5(a) rules).
 ///
-/// ⚠ **The substrate measures SM 6.8** on a live vkd3d device
-/// (`baselines/d3d12-caps.csv:7`). Reporting `{5.1, 6.0}` is a deliberate
-/// under-report: the coupling rules run **tier ⇒ shader model**, never the
-/// reverse, so a short list constrains nothing except what an application may
-/// compile.
-///
-/// ⛔ **STALE REASON REMOVED, 2026-08-06.** This used to read *"a deliberate
-/// under-report while `pfnCreate*Shader` is a counting noop … L6 raises it, in
-/// the commit that makes the shader creates real"*. The shader creates ARE real:
-/// `forward12/shaders.rs` reads the blob's own length, rejects bytecode that does
-/// not describe itself (`shader_length_unknown`), checks dword 0's DXIL program
-/// kind against the arriving slot (`shader_program_kind_mismatch`), encodes the
-/// IO signatures, and hands vkd3d a container — all instrumented in `L6Refusals`
-/// (`forward12/pso.rs:2430-2470`), and `D12-G7` reached
-/// `pfnCreateVertexShader`/`pfnCreateComputeShader` inside `D3D12CreateDevice`.
-///
-/// ⚠ The list stays `{5.1, 6.0}` anyway, for a reason that is NOT the one above
-/// and is not this lane's to change: the SM list is what forces the whole
-/// raytracing / mesh / VRS / sampler-feedback family off as a group
-/// (`PENDING.md` §5), and un-forcing it while those slots are noops would
-/// advertise DXR that does not work. Raising it belongs to the lane that lands
-/// those slots, together with them.
+/// Shader compilation uses the existing vkd3d/dxil-spirv engine. Its native
+/// admission guard requires SM6.3 and RT1.0, matching this gapless release list
+/// and the installed raytracing forwards. Optional barycentrics, native 16-bit,
+/// view instancing, mesh, VRS and sampler feedback retain their own caps; SM6.3
+/// does not imply those optional features. Do not infer full conformance or
+/// workload acceptance from a successful capability query.
 ///
 /// # Safety
 /// As [`get_caps`].
 unsafe fn shader_models(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresult {
-    const MODELS: [ddi12::D3D12DDI_SHADER_MODEL; 2] = [v::SM_5_1, v::SM_6_0];
+    const MODELS: [ddi12::D3D12DDI_SHADER_MODEL; 5] =
+        [v::SM_5_1, v::SM_6_0, v::SM_6_1, v::SM_6_2, v::SM_6_3];
 
     let needed = core::mem::size_of::<ddi12::D3D12DDI_D3D12_SHADER_MODELS_DATA_0011>();
     if data_size < needed {

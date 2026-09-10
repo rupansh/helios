@@ -12,6 +12,42 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## Native DXR and completed Port Royal, 2026-09-11
+
+Release UMD12 `057934F9…` completes native Port Royal with **12,337 / 57.12 FPS**.
+Both the demo and graphics test return workload status 0; the stock definition,
+resolved settings, `.3dmark-result`, XML export, loaded module identities and
+changing host-VNC frames are archived. The graphics test renders at 2560×1440
+with ray-traced reflections and RT shadows enabled. This is one completed run,
+not evidence of a performance gain. **Owner visual acceptance remains pending.**
+
+The native frontend reuses vkd3d's existing DXR engine. This increment admits
+RT1.0/SM6.3 with matching engine backing checks, preserves 64-bit shader-table
+strides, reads the correct four-byte RT1.0 pipeline config, and resolves runtime
+summary associations against explicit public export names and aliases. The
+last two defects were reached by Port Royal itself. The same aliased-export /
+local-SRV native probe fails before the namespace fix and passes all seven
+behavior groups and 20 ray-result words afterward, including collection and
+local-root lifetimes. Final native FL11_0..12_1 creation, FL12_2 refusal and all
+four ordering cases (65,536 words each) pass on the exact installed build.
+
+Linux/Windows engine builds, Windows release UMD and A1 pass, including 211 KMD
+logic tests. KMD .271/oem54/Code0/WDDM2.1, UMD11 and Mesa ICD remain unchanged;
+this is a ProgramData deployment, not a new signed package or hosted-CI result.
+[DXR_SERIALIZATION.md](docs/dx12/DXR_SERIALIZATION.md#completed-native-port-royal-2026-09-11)
+records exact source/build/runtime provenance, results, the two diagnosed DDI
+failures, and unexercised/refused behavior. Time Spy, Fire Strike and Steel Nomad
+Vulkan are being rerun as separate regression controls.
+
+Complete FL12_0/12_1 and DXR conformance remain open: the authorized sparse
+compatibility gap, unsupported tools visualization, estimated lane count and
+broader sharing/ownership/host-loss/WSI limits are unchanged. Port Royal emits
+91,993 demo and 41,715 graphics-test pending-allocator-reset diagnostics; successful
+completion does not settle the allocator/fence-worker lifetime question. The next
+concrete correctness work is to distinguish completed GPU work with delayed
+reference retirement from premature pool reuse, using a bounded native ordering
+probe. Do not remove retention, skip synchronization or insert a GPU-idle wait.
+
 ## DXR integration sequencing correction, 2026-09-11
 
 vkd3d already implements raytracing pipelines, DXIL compilation, AS operations,

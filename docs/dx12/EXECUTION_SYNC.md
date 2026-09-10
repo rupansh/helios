@@ -4,7 +4,18 @@
 feedback workaround with authenticated wire completion. See the current contract
 below and [NATIVE_DGC.md](NATIVE_DGC.md). Older deployment receipts remain historical.
 
-**Current deployment, 2026-09-09:** the paired local renderer and .271/oem54
+**Current native DXR deployment, 2026-09-11:** UMD12 `057934F9…` passes all four
+native ordering cases after the completed Port Royal run, each with 65,536 exact
+readback words. Loaded system-runtime, native UMD and ICD identities are recorded
+in `tmp/dxr-native-admission-20260911/final-native-sync/`. The .271/oem54/WDDM2.1
+KMD and 43394BBD ICD are unchanged. Port Royal has 91,993 demo and 41,715 GT1 pending
+allocator Reset diagnostics. Source still defers allocator release to the fence
+worker, and Reset returns without resetting while internal references remain.
+A completed benchmark cannot distinguish delayed retirement from premature reuse;
+that focused native lifetime investigation remains open. No synchronization or
+backing-retention policy changes are part of this DXR admission increment.
+
+**Earlier deployment, 2026-09-09:** the paired local renderer and .271/oem54
 guest package are active. All four native ordering/readback cases pass using
 authenticated wire retirement, including the cross-process signal case with
 both process module identities verified. Time Spy, Fire Strike and Steel Nomad

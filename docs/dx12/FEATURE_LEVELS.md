@@ -1,10 +1,15 @@
 # Native DX12 feature-level contract
 
-**DXR sequencing, 2026-09-11:** use the existing vkd3d DXR engine and validate
-Helios's installed native forwarding/capability contract. RT0/SM6.0 currently
-prevent native admission. Tools visualization remains an unsupported operation
-and conformance gap, but its use by Port Royal has not been demonstrated. The
-proposed decoder work is deferred; no native cap was raised by this correction.
+**Native DXR, 2026-09-11:** release 057934F9 reports RT1.0/SM6.3 with matching
+engine admission checks. The native Windows DXR probe passes state-object,
+AS mutation/copy/serialization, shader-table, bundle and cross-queue ray readback.
+[DXR_SERIALIZATION.md](DXR_SERIALIZATION.md#native-dxr-admission-and-readback-2026-09-11)
+records exact source/build/deployment and loaded-runtime evidence, including
+the RT1.0 payload and explicit-export association repairs. Tools
+visualization remains an unsupported operation and conformance gap; its use by
+Port Royal has not been demonstrated. Port Royal now completes at 12,337 / 57.12 FPS
+with changing frames; owner visual acceptance and full conformance remain separate.
+See the [completed run](DXR_SERIALIZATION.md#completed-native-port-royal-2026-09-11).
 
 The current owner-directed work is genuine native FL12_0 and FL12_1. DX12 has
 priority. Feature-level conformance and DXR/Port Royal are separate acceptance
@@ -42,8 +47,8 @@ is required even at FL11_0. Native DGC now supplies root-state and IA VBV/IBV
 changes in source. Previous fallback readback evidence does not validate this
 replacement; see [NATIVE_DGC.md](NATIVE_DGC.md).
 The current compatibility candidate admits FL12_1 with tiled2 after the
-no-output rasterization repair below. Raytracing remains NOT_SUPPORTED; native
-admission and complete conformance are separate acceptance requirements.
+no-output rasterization repair below. Native RT1.0/SM6.3 is now admitted with
+engine backing checks; admission and complete conformance remain separate requirements.
 
 Keep WDDM 2.1. Microsoft's [FL12_2 specification](https://microsoft.github.io/DirectX-Specs/d3d/D3D12_FeatureLevel12_2.html)
 lists WDDM 2.0 as its driver-model minimum. This corrects the older automatic
@@ -623,11 +628,11 @@ bounded to their recorded binaries. No inherited row is closed by admission alon
 | Forced sampling and no-output rasterization | NV mixed samples, EXT sample locations, maintenance5 | Paired fork carries features/properties | Coverage reduction, sample-mask/A2C lowering, forced1 query normalization | ForcedSampleCount preserved in rasterizer | No-output counts1/2/4/8/16, six mandatory attachment cases | Current native no-output17,280 words and TIR420 readback records pass; optional RGBA32_FLOAT16 unavailable |
 | Root signatures, bundle state, pipeline libraries | Push constants, descriptors and engine cache support | Exposed | Public64 DWORD roots; private expanded instrumentation still exceeds native DGC push-UBO support in one engine-only case | Versioned flags, clear arguments, native bundles and PSO plumbing | Root signature1.1; public64 | Prior native root flag/clear checks pass; >64 private native instrumentation unexercised, not a validated public-root refusal |
 | GPU VA, queue ordering, resource epochs/lifetimes | BDA, timeline semaphores, native fences | Native authenticated retirement through paired renderer | Queue batching, allocator ownership and resource tracking | Exact runtime admission, epoch and staging/barrier handling | VA40, direct/compute/copy queues | Current build passes all four native ordering cases, 65,536 words each; pending-allocator Reset/fence-worker lifetime and loss callback remain unresolved |
-| DXR for Port Royal (independent of FL12_1) | AS, ray pipeline/query/culling/indirect trace/maintenance1; required vertex formats | Features exposed; opacity micromaps absent and not required | Ordinary AS/state/DispatchRays, checked recording addresses and packed copy/serialization work implemented; tools formats and arbitrary alias/lifetime cases incomplete | Candidate state objects/DXIL libraries/AS operations/DispatchRays | RT0 retained; native RT commands unreachable | Direct NVIDIA/Venus each pass33,859 AS checks;27 copy-view diagnostics have fixture-specific accessed-range attribution; native RT0; no Port Royal completion |
-| FL12_2 SM6.5/DXR1.1/mesh1/VRS2/feedback0.9 | Most backing features present; float32 denorm preservation false | Corresponding features exposed | Higher-SM exception and mesh/VRS/feedback paths require behavior checks | Mesh/VRS/feedback incomplete, RT unadmitted | Withheld; SM6.0/RT0 | No FL12_2 or Speed Way acceptance |
+| DXR for Port Royal (independent of FL12_1) | AS, ray pipeline/query/culling/indirect trace/maintenance1; required vertex formats | Features exposed; opacity micromaps absent and not required | Existing state/AS/DispatchRays engine; native guard verifies SM6.3/RT1.0; tools formats and arbitrary alias/lifetime cases incomplete | Installed state objects, reconstructed DXIL libraries, AS operations, descriptors, shader tables and DispatchRays | 057934F9 native RT1.0/SM6.3; FL12_1 ceiling | PID8620/session1: seven native DXR groups and20 ray words pass with explicit alias/local-SRV/collection lifetime; same probe fails on E21352DA; Port Royal acceptance separate |
+| FL12_2 SM6.5/DXR1.1/mesh1/VRS2/feedback0.9 | Most backing features present; float32 denorm preservation false | Corresponding features exposed | Higher-SM exception and mesh/VRS/feedback paths require behavior checks | Mesh/VRS/feedback and DXR1.1 incomplete | FL12_2 withheld; SM6.3/RT1.0 | No FL12_2 or Speed Way acceptance |
 | Remaining FL12_2 tiers/flags/limits | Binding3/tiled3/conservative3 and related shader/timing/format features require full reconciliation | Host capability is not native support | Some engine paths exist | Depth bounds, extended formats, bundles and shader obligations still pending | binding3/conservative3, but tiled2/depth bounds0 | Full Microsoft FL12_2 requirement audit and behavior suite remain subsequent |
 | Both FL query forms and DDI negotiation | Not GPU capabilities | Not ICD capabilities | Guarded native engine admission | Extended query writes only output and selects a supported enumerant within runtime limit; legacy clamps <=12_1; one R8_0110 token; foreign adapter handles refused | Native runtime understands12_2, driver reports12_1 | 898F75F9:184 direct DDI checks pass across both selectors and synthetic limits/buffer/version/handle failures; native FL11_0..12_1 creation passes separately |
-| Reported SM6.0 wave properties (beyond the FL12_1 SM5.1 floor) | Subgroup size is known; physical lane-count derivation needs a supported topology source | Native source still lacks a measured lane-count path | Engine uses the 32-times-subgroup fallback without vendor topology properties | shader_caps retains the counted estimate | Wave32/32, TotalLaneCount1024 | Current native inventory confirms the report, not its accuracy; CapsTotalLaneCountGuess remains nonzero. This pre-existing reporting obligation is open, see DDI_REFERENCE.md section11.7 |
+| Reported SM6.3 wave properties (beyond the FL12_1 SM5.1 floor) | Subgroup size is known; physical lane-count derivation needs a supported topology source | Native source still lacks a measured lane-count path | Engine uses the 32-times-subgroup fallback without vendor topology properties | shader_caps retains the counted estimate | Wave32/32, TotalLaneCount1024 | Current native inventory confirms the report, not its accuracy; CapsTotalLaneCountGuess remains nonzero. This pre-existing reporting obligation is open, see DDI_REFERENCE.md section11.7 |
 
 Native FL12_1 admission, TIR and the demonstrated DGC compute query defect are
 implemented and have native evidence. The reserved-resource compatibility
