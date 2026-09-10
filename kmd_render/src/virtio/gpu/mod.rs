@@ -5837,8 +5837,8 @@ impl VirtioGpu {
         PRESENT_STREAM_TAGS.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// GPU proof advances allocation epochs and HE12 execution waits only.
-    /// Transport retirement and Present consumer ownership stay on the wire.
+    /// The exact successful queue-marker response advances allocation epochs
+    /// and HE12 execution waits. Present consumer ownership is retired separately.
     fn complete_present_stream_gpu(&mut self, index: usize, handle: u32) {
         let completed = self.present_streams[index].progress.completed();
         if let Some(producer) = self.producer_completion() {
@@ -5849,59 +5849,6 @@ impl VirtioGpu {
                 wait.observe(handle, completed);
             }
         }
-    }
-
-    pub fn observe_stream_feedback(
-        &mut self,
-        _order: &crate::adapter::NotifyOrdered<'_>,
-        owner: DeviceOwner,
-        ctx_id: u32,
-        cookie: u64,
-        value: u32,
-        wire_fence: u64,
-    ) -> helios_kmd_logic::execution_completion::FeedbackResult {
-        use helios_kmd_logic::execution_completion::{FeedbackResult, Submission};
-        let found = self.present_streams.iter().position(|slot| {
-            !self.failed
-                && slot.live
-                && !slot.closing
-                && slot.owner == Some(owner)
-                && slot.ctx_id == ctx_id
-                && slot.cookie == cookie
-                && value != 0
-                && value <= slot.submitted_value
-        });
-        let Some(index) = found else {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-            return FeedbackResult::Rejected;
-        };
-        let handle = self.present_streams[index].handle(index);
-        let tag = Submission {
-            stream: handle,
-            value,
-            wire_fence,
-        };
-        let admitted = self.inflight.iter().find_map(|entry| match entry.kind {
-            InFlightKind::AsyncVenus {
-                fence_id,
-                present_stream: Some(retire),
-                ..
-            } if fence_id == wire_fence => Some(Submission {
-                stream: retire.handle,
-                value: retire.value,
-                wire_fence: fence_id,
-            }),
-            _ => None,
-        });
-        let result = self.present_streams[index]
-            .progress
-            .feedback(handle, tag, admitted);
-        if result == FeedbackResult::Rejected {
-            PRESENT_STREAM_REJECTS.fetch_add(1, Ordering::Relaxed);
-        } else {
-            self.complete_present_stream_gpu(index, handle);
-        }
-        result
     }
 
     fn retire_present_stream_value(&mut self, retire: PresentStreamRetire, wire_fence: u64) {

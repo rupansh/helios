@@ -46,34 +46,23 @@
 //!      zero-fill writes an out-of-range tier, which the runtime **clamps
 //!      silently**. That is AGENTS.md rule 8 with the loud failure removed.
 //!
-//! # ⭐ THE COUPLING: the feature level is 11_0, and it is a FLOOR mechanism —
-//! one-directional
+//! # Feature-level floors and per-feature eligibility
 //!
-//! `D12-G5` measured a reproducible retail `D3D12CreateDevice` failure —
-//! `DXGI_ERROR_DRIVER_INTERNAL_ERROR` (`0x887A0020`) with an English reason on
-//! ETW `Microsoft-Windows-Direct3D12`:
+//! The driver reports its maximum level; runtime admission checks the required
+//! floors. The recorded D12-G5 FL12+ binding-tier rejection demonstrates a floor,
+//! not an unrestricted right to expose every optional cap at every lower level.
+//! Optional caps may exceed mandatory floors only within their own eligibility
+//! rules. Microsoft's D3D12 Hardware Feature Levels table lists ROVs and
+//! conservative rasterization as unavailable at maximum FL11_0, optional at
+//! FL11_1/12_0, and required at FL12_1. Both feature designs require WDDM 2.0+.
 //!
-//! > `FL12+ driver incorrectly did not report support for resource binding tier 2+.`
-//!
-//! The feature level is **asserted by the driver**, never inferred by the
-//! runtime (`DDI_REFERENCE.md` §11.5.0), and asserting 12_0 arms a set of cap
-//! floors: typed-UAV-load additional formats, `ResourceBindingTier >= 2`,
-//! `TiledResourcesTier >= 2`; 12_1 adds ROVs and conservative rasterisation;
-//! 12_2 adds eighteen more.
-//!
-//! ⛔⛔ **BUT THE IMPLICATION RUNS ONE WAY ONLY, and reading it as two cost this
-//! file three caps.** A declared level *requires* its floors; it never *forbids* a
-//! cap above them. Every string in this family rejects a cap for being too LOW at
-//! a declared level — never for being higher than the floor. An earlier revision
-//! of this section said the level and its floors *"must move together"* in both
-//! directions, and that reading held `ResourceBindingTier`,
-//! `TypedUAVLoadAdditionalFormats` and `ROVs` at their absent values while all
-//! three were fully backed. `63b8f1b` corrected the same error class for `ROVs`'
-//! stated reason; `DX12.md` §4.4 corrected it once before for tiled resources.
-//!
-//! ⇒ **The real rule is the one at [`d3d12_options`]: a cap is raised with its
-//! SLOTS, not with the feature level.** The level is raised when its floors
-//! happen to be met, which is a consequence, not a precondition.
+//! The 2026-09-07 native candidate probe (PID9380) observes successful DDI replies
+//! of ROV1/conservative3, but API replies of zero for both and maximum FL11_0.
+//! The exact typed buffers match the WDK/runtime sizes. This is consistent with
+//! published eligibility rules; the internal D3D12Core decision is untraced.
+//! See docs/dx12/FEATURE_LEVELS.md for primary references and the exact archive.
+//! Raising any cap still requires its backing implementation and native behavior;
+//! raising the level requires the complete inherited contract, not just its caps.
 //!
 //! ⭐ **And read the converse, because it is where this file kept under-reporting:
 //! a substrate-backed cap with NO SLOT AT ALL needs no implementation work, so
@@ -88,24 +77,12 @@
 //! returns a false negative, the application picks its own fallback, and no
 //! counter in this driver moves. Each field carries what its FALSE cost.
 //!
-//! ⚠ **The substrate is more capable than this file reports, and the remaining
-//! gaps are now specific rather than wholesale.** Measured on a live vkd3d device
-//! on this guest (`docs/dx12/baselines/d3d12-caps.csv`): SM **6.8**, RT tier 1_1,
-//! mesh tier 1, `TiledResourcesTier 4`. Those are what the *engine* can do and
-//! their slots are still noops, so this file still reports what the *driver* can
-//! do. As of 2026-08-06 that includes binding tier 3, heap tier 2, conservative
-//! raster 3, typed UAV load, ROVs, logic ops, `WriteBufferImmediate` and
-//! copy-queue timestamps — each with its slot evidence at the field — and as of
-//! 2026-08-07 the three slot-free shader caps below
-//! (`VPAndRTArrayIndexFromAnyShaderFeedingRasterizerSupportedWithoutGSEmulation`,
-//! `WaveOps`, `Int64Ops`), each with the argument that no slot exists at all.
-//!
-//! ⭐ **Consequence for FL 12_1, stated so the next lane does not re-derive it:**
-//! four of its five floors are now met — typed-UAV-load, binding tier >= 2, ROVs,
-//! conservative raster >= 1. **Only `TiledResourcesTier >= 2` remains**, and it is
-//! `PENDING.md` S-6 (five sites, near-pure forwards, no KMD dependency). Raising
-//! [`DRIVER_MAX_FEATURE_LEVEL`] is that commit's job, not this one's, and it must
-//! still confirm the level rather than assume it.
+//! Feature-level scope and current evidence live in `docs/dx12/FEATURE_LEVELS.md`.
+//! Native FL12_1 plus Port Royal precedes FL12_2 plus Speed Way. Keep WDDM 2.1;
+//! Microsoft's FL12_2 driver-model minimum is 2.0, not proof of KMD completeness.
+//! Tiled resources are not the only missing inherited obligation. In particular,
+//! the paired renderer/Mesa fork now carries native DGC, but its query and
+//! expanded-root paths still need independent conformance evidence. See NATIVE_DGC.md.
 //!
 //! # ⭐ The per-format half, at the bottom of this file
 //!
@@ -165,6 +142,8 @@ mod v {
         CONSERVATIVE_RASTER_3;
     pub(super) const TILED_NONE: D3D12DDI_TILED_RESOURCES_TIER =
         D3D12DDI_TILED_RESOURCES_TIER_D3D12DDI_TILED_RESOURCES_TIER_NOT_SUPPORTED;
+    pub(super) const TILED_2: D3D12DDI_TILED_RESOURCES_TIER =
+        D3D12DDI_TILED_RESOURCES_TIER_D3D12DDI_TILED_RESOURCES_TIER_2;
     /// The ceiling this SDK's enum can express. ⛔ The clamp target, not a value
     /// this driver reports today — see `tiled_resources_tier`.
     pub(super) const TILED_MAX: D3D12DDI_TILED_RESOURCES_TIER =
@@ -245,8 +224,7 @@ mod v {
         D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_D3D12_OPTIONS;
     pub(super) const CAPS_3DPIPELINESUPPORT: D3D12DDICAPS_TYPE =
         D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_3DPIPELINESUPPORT;
-    pub(super) const CAPS_GPUVA: D3D12DDICAPS_TYPE =
-        D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_GPUVA_CAPS;
+    pub(super) const CAPS_GPUVA: D3D12DDICAPS_TYPE = D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_GPUVA_CAPS;
     pub(super) const CAPS_TEXTURE_LAYOUT1: D3D12DDICAPS_TYPE =
         D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_TEXTURE_LAYOUT1;
     pub(super) const CAPS_SHADER_MODELS: D3D12DDICAPS_TYPE =
@@ -269,75 +247,19 @@ mod v {
         D3D12DDICAPS_TYPE_D3D12DDICAPS_TYPE_0023_UMD_BASED_COMMAND_QUEUE_PRIORITY;
 }
 
-/// ⭐ **The feature level this driver asserts, and the single value the whole
-/// OPTIONS answer is coupled to.**
-///
-/// 11_0 arms **no** cap floor. Raising it arms them all at once — see the module
-/// doc — so raising THIS constant requires that every floor it arms already reads
-/// at or above its floor value.
-///
-/// ⛔ **The converse is NOT true, and this line used to say it was.** It read
-/// *"this constant, `d3d12_options`'s tiers and `shader_caps`'s `ROVs` /
-/// `TypedUAVLoadAdditionalFormats` move **together or not at all**"*. They do not:
-/// a cap may exceed its floor at any level, and on 2026-08-06 four of the five
-/// 12_1 floors were raised on their own slot evidence with this constant
-/// untouched. What moves together is the level and the *check* that its floors are
-/// met — a one-way implication.
-///
-/// # ⭐ 11_0 IS A STAGING VALUE. THE TARGET IS **FL 12_1**.
-///
-/// Owner directive, 2026-08-06: aim for **FL 12_1** through the D3D12
-/// implementation. **FL 12_2 ("DirectX Ultimate") is OUT OF SCOPE**, and the
-/// blocker is not caps — it is **WDDM**. `DX12.md` §4.4 is the ladder.
-///
-/// ⛔ **FL 12_2 requires a WDDM 2.9 adapter, and Helios declares 2.1 on
-/// purpose.** `kmd_render/src/ddi/wddm_surface.rs`'s module doc records why:
-/// 2.1 is *"below the MPO3 requirement boundary"*, while at **2.2+** DWM treats
-/// the adapter as a Display-Core/MPO3 presentation device and — since Helios
-/// registers no MPO3 KMD interface — *"fails fast with `E_NOTIMPL`"*. So 12_2
-/// costs a new `WddmSurface` level across five coupled sites, **plus** the MPO3
-/// interface, **plus** re-validating the display path that currently composites
-/// the whole desktop. That is a display-stack workstream wagered against a
-/// milestone already met, not a caps change.
-///
-/// ⭐ **FL 12_1 needs no KMD change at all.** Its five floors — typed-UAV-load,
-/// `ResourceBindingTier >= 2`, `TiledResourcesTier >= 2` (12_0), plus ROVs and
-/// `ConservativeRasterizationTier >= 1` (12_1) — are **L5, L4, L2 and L6**,
-/// which is the triangle's own lane order, so it adds no lane `D12-G8` did not
-/// already need and leaves L9/L3c free to trail. None of the five is marginal:
-/// the substrate reports binding tier 3, tiled tier 4, conservative raster 3.
-///
-/// ⭐ **FOUR OF THE FIVE ARE NOW MET (2026-08-06).** `TypedUAVLoadAdditionalFormats`
-/// = 1, `ResourceBindingTier` = 3, `ROVs` = 1, `ConservativeRasterizationTier` = 3,
-/// each raised on its own slot evidence at its own site. ⛔ The fifth,
-/// `TiledResourcesTier >= 2`, is the ONLY thing between this constant and 12_1: it
-/// needs bodies at five sites (`PENDING.md` S-6 — the create arm's `E_NOTIMPL`, the
-/// two tile-mapping noops, `pfnCopyTiles`, `pfnGetMipPacking`) plus the two caps
-/// withholding sites here. Near-pure forwards, and verified NOT a KMD dependency.
-/// ⇒ The commit that lands S-6 is the commit that raises this constant, and it
-/// still owes the confirmation below rather than the assumption.
-///
-/// ⚠ FL 12_1 is *expected* to be reachable at the current WDDM 2.1 surface —
-/// D3D12 requires only WDDM 2.0 and none of the five floors is a display-path
-/// feature. The commit that raises the level must **confirm** that, not assume
-/// it: a WDDM-shaped ETW refusal at 12_0/12_1 is what would falsify it.
-///
-/// ⚠ SM `>= 6_5` is a **12_2** floor, so `shader_models`' short `{5.1, 6.0}`
-/// list stays legal all the way to 12_1.
-///
-/// ⛔ So this constant is not "raise it when someone feels brave". It is
-/// **`min(what every lane has landed)`**, and the commit that raises it is the
-/// commit that raises its floors — never one without the other, which is the
-/// failure `D12-G5` measured verbatim.
-///
-/// ⛔ Two values this must never be, both by precedent:
-/// * a **bitmask**. `D3D12DDICAPS_TYPE_3DPIPELINESUPPORT` is a *maximum level*
-///   for D3D12 — the exact opposite of `D3D11DDICAPS_3DPIPELINESUPPORT`, which
-///   `umd/src/caps.rs:57-66` builds as `0x8F`. Writing `0x8F` here reads as
-///   "level 143".
-/// * `1_0_CORE`. That is the **compute-only** level, and it is what the retired
-///   R908 body reported. Do not resurrect it by copy-paste.
-const DRIVER_MAX_FEATURE_LEVEL: ddi12::D3D12DDI_3DPIPELINELEVEL = v::FL_11_0;
+/// Native FL12_1 validation candidate. SO, root signatures, indirect state and
+/// tile copies now have implementations; native admission/behavior is recorded
+/// in FEATURE_LEVELS.md. The owner-authorized sparse compatibility exception
+/// still prevents claiming complete conformance. Both runtime query forms and
+/// the engine creation check derive from this one maximum enumerator.
+const DRIVER_MAX_FEATURE_LEVEL: ddi12::D3D12DDI_3DPIPELINELEVEL = v::FL_12_1;
+
+pub(crate) const REQUIRED_ENGINE_FEATURE_LEVEL: u32 = match DRIVER_MAX_FEATURE_LEVEL {
+    v::FL_11_0 => windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0.0 as u32,
+    v::FL_12_1 => windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_1.0 as u32,
+    _ => 0,
+};
+const _: () = assert!(REQUIRED_ENGINE_FEATURE_LEVEL != 0, "add the API/DDI feature-level translation");
 
 // ---------------------------------------------------------------------------
 // The three caps that a per-format answer is coupled to
@@ -351,13 +273,14 @@ const DRIVER_MAX_FEATURE_LEVEL: ddi12::D3D12DDI_3DPIPELINELEVEL = v::FL_11_0;
 // on. Each is read at **both** sites, so the lane that raises one finds the
 // other by following the constant rather than by remembering.
 
-/// The tiled-resources tier this driver reports, and the reason
-/// `D3D12DDI_FORMAT_SUPPORT_TILED` is withheld from every format and a
-/// `TILED_RESOURCE` multisample query is answered with zero quality levels.
-///
-/// See [`tiled_resources_tier`] for why it is `NOT_SUPPORTED` while the engine
-/// backs tier 4.
-const TILED_RESOURCES_TIER_REPORTED: ddi12::D3D12DDI_TILED_RESOURCES_TIER = v::TILED_NONE;
+/// Native tiled validation candidate. Resource creation, tile geometry, copies
+/// and exact mapping admission are implemented. Unsupported sparse 2D formats
+/// use the owner-authorized committed fallback; its missing residency/alias
+/// semantics remain explicit in docs/dx12/SPARSE_COMPATIBILITY.md. This is not
+/// a claim of complete tiled conformance. FL11_0 caused the measured native
+/// runtime to return tier1 despite this DDI's tier2 reply; FL12_1 admission and
+/// the newly reachable paths require their own native validation.
+const TILED_RESOURCES_TIER_REPORTED: ddi12::D3D12DDI_TILED_RESOURCES_TIER = v::TILED_2;
 
 /// `D3D12DDI_SHADER_CAPS_0084::TypedUAVLoadAdditionalFormats`, and the switch
 /// that decides whether `D3D12DDI_FORMAT_SUPPORT_UAV_READS` is narrowed to the
@@ -374,11 +297,9 @@ const TILED_RESOURCES_TIER_REPORTED: ddi12::D3D12DDI_TILED_RESOURCES_TIER = v::T
 /// ⛔ **The FL coupling is ONE-DIRECTIONAL and was being read as two.** strings:169
 /// is *"FL 12+ driver incorrectly does **not** report support for typed UAV load
 /// additional formats"* — it rejects FALSE at 12+, and says nothing whatever about
-/// TRUE below 12_0. A driver may back more than its declared level's floor; that
-/// is the normal shape of every cap in this struct. The previous line here read
-/// *"so this constant and [`DRIVER_MAX_FEATURE_LEVEL`] move together"*, which turned
-/// a conditional hazard into an unconditional dependency — the same error class
-/// `63b8f1b` corrected for `ROVs` and `DX12.md` §4.4 corrected for tiled resources.
+/// TRUE below 12_0. This field is exposed as TRUE by the native FL11_0 probe.
+/// That does not generalize to ROVs or conservative rasterization, whose own
+/// eligibility rules require a maximum supported level of at least FL11_1.
 const TYPED_UAV_LOAD_ADDITIONAL_FORMATS: ddi12::BOOL = 1;
 
 /// `D3D12DDI_D3D12_OPTIONS_DATA_0089::OutputMergerLogicOp`, and the gate on
@@ -598,10 +519,12 @@ pub(crate) unsafe fn get_caps(arg: *const ddi12::D3D12DDIARG_GETCAPS) -> Hresult
 ///
 /// ⛔ **Never zero-filled**: `HighestRuntimeSupportedFeatureLevel` is the
 /// runtime's *input*, and destroying it destroys the question.
-/// `out = min(driver_max, in)` (`DDI_REFERENCE.md` §11.3).
+/// Return the highest supported enumerant no greater than the runtime limit.
+/// The WDK enum has gaps (CORE=2, 11_0=10), so a numerical minimum alone could
+/// return a value that is not a feature level for an unknown runtime limit.
 ///
 /// ⭐ **Not implementing this is a SILENT demotion**, which is why it is
-/// answered even though the driver's own maximum is only 11_0: the runtime falls
+/// answered even while the driver's own maximum is 12_1: the runtime falls
 /// back to `1007` on failure, and `1007` may never answer above 12_1
 /// (`DX12.md` §4.3 row 2). WARP answers `E_UNEXPECTED` here on every run and its
 /// device still creates, so a refusal is *tolerated* — but it is tolerated at
@@ -615,27 +538,39 @@ unsafe fn pipeline_support1(a: &ddi12::D3D12DDIARG_GETCAPS) -> Hresult {
         note_refusal(&UMD12_REFUSALS.caps_data_size_too_small);
         return E_INVALIDARG;
     }
-    let slot = a.pData.cast::<ddi12::D3D12DDI_3DPIPELINESUPPORT1_DATA_0081>();
-    // SAFETY: non-null and at least `needed` writable bytes per the check above.
-    // Read first, write second, and never `write_bytes` over it.
-    let runtime_max = unsafe { core::ptr::read_unaligned(slot) }.HighestRuntimeSupportedFeatureLevel;
-    let answer = if DRIVER_MAX_FEATURE_LEVEL <= runtime_max {
-        DRIVER_MAX_FEATURE_LEVEL
-    } else {
-        runtime_max
+    let slot = a
+        .pData
+        .cast::<ddi12::D3D12DDI_3DPIPELINESUPPORT1_DATA_0081>();
+    // SAFETY: the input member is initialized by the runtime. The output member
+    // need not be initialized, so do not read the entire in/out structure.
+    let runtime_max = unsafe {
+        core::ptr::read_unaligned(core::ptr::addr_of!((*slot).HighestRuntimeSupportedFeatureLevel))
+    };
+    let levels = [
+        ddi12::D3D12DDI_3DPIPELINELEVEL_D3D12DDI_3DPIPELINELEVEL_12_2,
+        v::FL_12_1,
+        ddi12::D3D12DDI_3DPIPELINELEVEL_D3D12DDI_3DPIPELINELEVEL_12_0,
+        ddi12::D3D12DDI_3DPIPELINELEVEL_D3D12DDI_3DPIPELINELEVEL_11_1,
+        v::FL_11_0,
+        ddi12::D3D12DDI_3DPIPELINELEVEL_D3D12DDI_3DPIPELINELEVEL_1_0_CORE,
+        ddi12::D3D12DDI_3DPIPELINELEVEL_D3D12DDI_3DPIPELINELEVEL_1_0_GENERIC,
+    ];
+    let Some(answer) = levels.into_iter().find(|level| {
+        *level <= DRIVER_MAX_FEATURE_LEVEL && *level <= runtime_max
+    }) else {
+        note_refusal(&UMD12_REFUSALS.caps_bad_arg);
+        return E_INVALIDARG;
     };
     log_error!(
         "GetCaps 3DPIPELINESUPPORT1: runtime understands {runtime_max}, driver max \
          {DRIVER_MAX_FEATURE_LEVEL} -> {answer}"
     );
-    // SAFETY: as above. Only the OUT field is written.
+    // SAFETY: the checked buffer contains this output member. Preserve the input
+    // and any unknown tail without reading or writing either of them.
     unsafe {
         core::ptr::write_unaligned(
-            slot,
-            ddi12::D3D12DDI_3DPIPELINESUPPORT1_DATA_0081 {
-                HighestRuntimeSupportedFeatureLevel: runtime_max,
-                MaximumDriverSupportedFeatureLevel: answer,
-            },
+            core::ptr::addr_of_mut!((*slot).MaximumDriverSupportedFeatureLevel),
+            answer,
         );
     }
     S_OK
@@ -646,8 +581,8 @@ unsafe fn pipeline_support1(a: &ddi12::D3D12DDIARG_GETCAPS) -> Hresult {
 /// ⛔ The header mandates it: *"the driver must not return anything higher than
 /// 12_1"*, because a pre-Vibranium runtime sanitises anything it does not
 /// understand down to `1_0 core`. The clamp is explicit here even though this
-/// driver's maximum is 11_0, so raising [`DRIVER_MAX_FEATURE_LEVEL`] cannot
-/// silently break it.
+/// driver's maximum is currently 12_1, so a later increase to
+/// [`DRIVER_MAX_FEATURE_LEVEL`] cannot silently break it.
 ///
 /// # Safety
 /// As [`get_caps`].
@@ -748,17 +683,11 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         // Unbounded descriptor ranges survive the root-signature 1.1 -> 1.0
         // down-conversion because `NumDescriptors` exists in both versions.
         ResourceBindingTier: v::BINDING_TIER_MAX,
-        // ⭐ RAISED NOT_SUPPORTED -> 3, 2026-08-06. Engine: 3
-        // (`baselines/d3d12-caps.csv:17`), and the slot work is already done:
-        // `pfnCreateRasterizerState` forwards `ConservativeRasterizationMode`
-        // VERBATIM into `D3D12_RASTERIZER_DESC2::ConservativeRaster`
-        // (`forward12/pso.rs:940-942`), with `_MODE_OFF` as the default when a PSO
-        // carries no rasterizer handle (`:2084`). Tier 3's inner input coverage
-        // (`SV_InnerCoverage`) is a DXIL-side feature vkd3d translates itself, and
-        // shaders reach it whole — so the engine's 3 already encodes the whole
-        // question. ⚠ Unlike `tiled_resources_tier` there is nothing to clamp:
-        // this SDK's enum stops at `_3` and the engine says 3
-        // (see [`v::CONSERVATIVE_RASTER_MAX`]).
+        // The rasterizer state forwards the mode, and the engine provides
+        // conservative rasterization and inner coverage. This driver-side tier
+        // is not native API admission: PID9380 receives tier0 at maximum FL11_0,
+        // consistent with Microsoft's FL11_1+ eligibility requirement. Full
+        // native tier3 behavior remains unvalidated; see FEATURE_LEVELS.md.
         ConservativeRasterizationTier: v::CONSERVATIVE_RASTER_MAX,
         TiledResourcesTier: tiled_resources_tier(),
         CrossNodeSharingTier: v::CROSS_NODE_NONE,
@@ -777,8 +706,8 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         // `vulkan_1_2_features.shaderOutputViewportIndex && ...shaderOutputLayer`,
         // both `true` on this guest. Bytecode reaches vkd3d whole
         // (`forward12/pso.rs`'s shader lane) and dxil-spirv lowers it, so the
-        // engine's own answer already encodes the whole question. Same shape as
-        // `ROVs` in [`shader_caps`].
+        // engine supplies the shader lowering. Native API eligibility is a
+        // separate check; PID9380 reports this field as TRUE at maximum FL11_0.
         //
         // ⭐ **And the engine keeps enforcing it whatever this file reports.**
         // `d3d12_device_validate_shader_meta` fails PSO creation for a shader
@@ -946,46 +875,24 @@ unsafe fn d3d12_options(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         EnhancedBarriersSupported: 0,
     };
     // SAFETY: as [`get_caps`].
-    unsafe { write_caps("D3D12_OPTIONS", a.pData, data_size, options) }
+    let result = unsafe { write_caps("D3D12_OPTIONS", a.pData, data_size, options) };
+    log_error!(
+        "GetCaps D3D12_OPTIONS: binding={} conservative={} tiled={} bytes={} hr={:#x}",
+        options.ResourceBindingTier,
+        options.ConservativeRasterizationTier,
+        options.TiledResourcesTier,
+        data_size,
+        result
+    );
+    result
 }
 
 /// The tiled-resources tier, **clamped explicitly**.
 ///
-/// ⭐ `DX12.md` §4.3 row 3 / `DDI_REFERENCE.md` §11.4.1: a live vkd3d device on
-/// this guest reports **tier 4**, `D3D12DDI_TILED_RESOURCES_TIER` stops at 3 in
-/// SDK 26100, and an out-of-range tier is **clamped silently** — so without an
-/// explicit clamp Helios ships a number nobody chose, which is AGENTS.md rule 8
-/// in its purest form.
-///
-/// This driver reports `NOT_SUPPORTED` today for one reason only:
-/// `pfnUpdateTileMappings` and `pfnCopyTileMappings` are counting noops. The
-/// clamp is written now, at the site, so the lane which raises this cannot
-/// forget it.
-///
-/// ⛔ **CORRECTION — this comment used to blame the KMD, and that was wrong.**
-/// It read: *"the KMD's guest page tables are decorative
-/// (`kmd_render/src/ddi/gpummu.rs:1-14`), so reads from unmapped tiles would
-/// return whatever was there instead of zero"*. D3D12 tiled resources are
-/// implemented on Vulkan **sparse binding** — vkd3d maps tiles with
-/// `vkQueueBindSparse` — so no guest page table is in that path, which is also
-/// what `gpummu.rs` itself says is decorative *about*: venus addresses host
-/// resources by opaque id and the host GPU owns the real MMU. And the
-/// zero-read guarantee tier 2 requires is exposed by the guest already:
-/// `residencyNonResidentStrict = true`, beside `sparseResidencyImage2D/3D`,
-/// `sparseResidencyAliased` and the standard block shapes
-/// (`docs/dx12/research/guest-vulkaninfo-full.txt`).
-///
-/// ⇒ `TiledResourcesTier >= 2` — which **FL 12_0 requires**, so the FL 12_1
-/// target needs it — is a **UMD-only job**: this lane plus L2's two tile-mapping
-/// slots on the command-queue table. ⚠ Backed on paper, **unexercised**: no gate
-/// has run a tiled resource through venus, so it is a `D12-G9` item to verify.
-///
-/// ⭐ The lesson is general: *a code comment asserting a dependency is not
-/// evidence of one* — one grep of `guest-vulkaninfo-full.txt` settled it, after
-/// the wrong claim had propagated into three documents. ⚠ And note the
-/// symmetry: the KMD dependency that IS real (WDDM 2.9 / MPO3, which puts FL
-/// 12_2 out of scope) was also sitting in a module doc. Read the KMD's own docs
-/// before costing a feature level, in both directions.
+/// The DDI enumeration ends at tier3 even when the engine reports tier4.
+/// Sparse binding uses the host MMU, but native queue admission and exact GPU
+/// completion still require the existing HE12 runtime/KMD contract. The current
+/// implementation is being validated as a whole before this cap is promoted.
 fn tiled_resources_tier() -> ddi12::D3D12DDI_TILED_RESOURCES_TIER {
     let engine_reports = TILED_RESOURCES_TIER_REPORTED;
     if engine_reports > v::TILED_MAX {
@@ -1035,45 +942,19 @@ unsafe fn architecture_info(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) ->
 /// `WaveMMATier`) are FALSE because the shader-model list below stops at 6.0 —
 /// strings:116, which `D12-G5` proved is a live retail gate.
 ///
-/// ⭐ **`ROVs` RAISED 0 -> 1, 2026-08-06 — and it is legal to report
-/// INDEPENDENTLY of the feature level.** The two facts that decide it:
+/// ROV bytecode uses the engine's fragment-shader interlock path, with both
+/// pixel and sample interlock exposed by the current guest ICD. This supplies
+/// substrate backing, not a complete native capability or behavior witness.
+/// Microsoft lists ROVs as unavailable when the driver's maximum level is
+/// FL11_0, optional at FL11_1/12_0, and required at FL12_1. The feature also needs
+/// WDDM 2.0+. The current WDDM 2.1 version is therefore not this eligibility gap.
 ///
-/// * **It needs no slot.** Rasterizer-ordered views are a *shader-side* feature:
-///   there is no `pfn*` in this DDI for them. Bytecode reaches vkd3d whole
-///   (`forward12/pso.rs`'s shader lane), vkd3d lowers the DXIL to
-///   `VK_EXT_fragment_shader_interlock`, and the engine's own answer therefore
-///   already encodes the whole question — 1, `baselines/d3d12-caps.csv:16`. There
-///   is nothing in umd12 that could be missing.
-/// * **The floor is one-directional.** *"FL 11_0 arms no floor"* means the level
-///   imposes no *requirement*; it does not make TRUE illegal below 12_1. Every
-///   runtime string in this family rejects a cap for being too *low* at a
-///   declared level, never for being higher than the floor. Reporting the
-///   substrate truthfully at 11_0 is the normal shape of this whole struct — see
-///   `ResourceBindingTier` 3 and `ConservativeRasterizationTier` 3 above.
-///
-/// ⇒ The previous line here, *"`ROVs` moves with [the feature level] as a const
-/// flip"*, coupled two things that are not coupled. Raising the level is still a
-/// coordinated commit, but ROVs is no longer one of the things it has to carry.
-///
-/// ⛔⛔ **CORRECTED 2026-08-06. The second reason this comment used to give was
-/// FALSE, and it mattered: it read *"there is no real fragment-shader
-/// interlock"*, which documented one of FL 12_1's five floors as
-/// substrate-blocked when it is a one-line flip.** Refuted three ways: vkd3d
-/// derives the cap as `fragmentShaderPixelInterlock && fragmentShaderSampleInterlock`
-/// (`vkd3d-proton-helios/libs/vkd3d/device.c:10181-10182`); this guest reports
-/// **both true** with the extension present
-/// (`docs/dx12/research/guest-vulkaninfo-full.txt:952`, `:1425-1426`); and the
-/// measured baseline records `OPTIONS,ROVsSupported,1`
-/// (`docs/dx12/baselines/d3d12-caps.csv:16`).
-///
-/// ⚠ **How the error was made, because it is a repeatable one.**
-/// `DDI_REFERENCE.md` §11.6 hazard 2 is *conditional* — it warns against
-/// `ROVsSupported = TRUE` **without** real interlock, calling that
-/// *"non-deterministically wrong and frame-rate dependent"*. That conditional
-/// was read as an unconditional claim about this substrate. `DX12.md` §4.4 had
-/// already corrected the identical mistake once, for **tiled resources**, about
-/// a floor in the same five-item list, and closed it with *"a code comment
-/// asserting a dependency is not evidence of one"*.
+/// Native PID9380 records this DDI's ROV1 reply and the API's ROV0 reply while
+/// the maximum remains FL11_0. That agrees with the published eligibility rule;
+/// the runtime's internal branch has not been traced. The older unconditional
+/// claim that this cap was independent of the maximum level was incorrect.
+/// No native ROV ordering/readback acceptance is established by the DDI value.
+/// Primary sources and exact loaded identities are in FEATURE_LEVELS.md.
 ///
 /// # Safety
 /// As [`get_caps`].
@@ -1093,8 +974,8 @@ unsafe fn shader_caps(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresu
         // it is what narrows the per-format `UAV_READS` bit at the bottom of
         // this file to the three formats FL 11_0 mandates.
         TypedUAVLoadAdditionalFormats: TYPED_UAV_LOAD_ADDITIONAL_FORMATS,
-        // ⭐ See the doc above: no slot, engine reports 1, and the FL floor is
-        // one-directional.
+        // Driver-side backing; native eligibility and validation are separate
+        // from this value, as documented above.
         ROVs: 1,
         // ⭐ RAISED 0 -> 1, 2026-08-07. Engine: 1 — `OPTIONS1,WaveOps,1`
         // (`baselines/d3d12-caps.csv:24`), sitting in the baseline directly above
@@ -1165,7 +1046,17 @@ unsafe fn shader_caps(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresu
         AtomicInt64OnDescriptorHeapResource: 0,
     };
     // SAFETY: as [`get_caps`].
-    unsafe { write_caps("SHADER", a.pData, data_size, caps) }
+    let result = unsafe { write_caps("SHADER", a.pData, data_size, caps) };
+    log_error!(
+        "GetCaps SHADER: ROVs={} typed_uav_loads={} waves={} int64={} bytes={} hr={:#x}",
+        caps.ROVs,
+        caps.TypedUAVLoadAdditionalFormats,
+        caps.WaveOps,
+        caps.Int64Ops,
+        data_size,
+        result
+    );
+    result
 }
 
 /// `1012 _0011_SHADER_MODELS` — **the caller owns both pointers**, so this is
@@ -1215,7 +1106,10 @@ unsafe fn shader_models(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
     // SAFETY: `pData` is non-null with at least `needed` readable bytes; the two
     // members are the caller's own pointers and are read, never overwritten.
     let slots = unsafe {
-        core::ptr::read_unaligned(a.pData.cast::<ddi12::D3D12DDI_D3D12_SHADER_MODELS_DATA_0011>())
+        core::ptr::read_unaligned(
+            a.pData
+                .cast::<ddi12::D3D12DDI_D3D12_SHADER_MODELS_DATA_0011>(),
+        )
     };
     if slots.pNumShaderModelsSupported.is_null() {
         note_refusal(&UMD12_REFUSALS.caps_bad_arg);
@@ -1230,10 +1124,7 @@ unsafe fn shader_models(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         log_error!("GetCaps SHADER_MODELS: count query -> {}", MODELS.len());
         // SAFETY: the count slot is non-null per the check above.
         unsafe {
-            core::ptr::write_unaligned(
-                slots.pNumShaderModelsSupported,
-                MODELS.len() as ddi12::UINT,
-            )
+            core::ptr::write_unaligned(slots.pNumShaderModelsSupported, MODELS.len() as ddi12::UINT)
         };
         return S_OK;
     }
@@ -1252,9 +1143,7 @@ unsafe fn shader_models(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hre
         unsafe { core::ptr::write_unaligned(slots.pShaderModelsSupported.add(index), *model) };
     }
     // SAFETY: the count slot is non-null per the check above.
-    unsafe {
-        core::ptr::write_unaligned(slots.pNumShaderModelsSupported, written as ddi12::UINT)
-    };
+    unsafe { core::ptr::write_unaligned(slots.pNumShaderModelsSupported, written as ddi12::UINT) };
     log_error!("GetCaps SHADER_MODELS: capacity={capacity} -> wrote {written}");
     S_OK
 }
@@ -1357,10 +1246,7 @@ unsafe fn cpu_page_table_false_positives(
 ///
 /// # Safety
 /// As [`get_caps`].
-unsafe fn texture_layout_deprecated(
-    a: &ddi12::D3D12DDIARG_GETCAPS,
-    data_size: usize,
-) -> Hresult {
+unsafe fn texture_layout_deprecated(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hresult {
     let caps = ddi12::D3D12DDI_TEXTURE_LAYOUT_CAPS {
         DeviceDependentLayoutCount: 0,
         DeviceDependentSwizzleCount: 0,
@@ -1459,7 +1345,8 @@ unsafe fn texture_layout_sets(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) 
     // alignment may be zero or non-power-of-two, and the depth pitch cannot be
     // aligned more strictly than the row pitch it is a multiple of.
     const _: () = assert!(SUB.PitchAlignment != 0 && SUB.PitchAlignment.is_power_of_two());
-    const _: () = assert!(SUB.BaseOffsetAlignment != 0 && SUB.BaseOffsetAlignment.is_power_of_two());
+    const _: () =
+        assert!(SUB.BaseOffsetAlignment != 0 && SUB.BaseOffsetAlignment.is_power_of_two());
     const _: () = assert!(
         SUB.DepthPitchAlignment != 0
             && SUB.DepthPitchAlignment.is_power_of_two()
@@ -1621,9 +1508,10 @@ unsafe fn options_0110(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hres
 /// `E_INVALIDARG` from the engine. Today it is neither counted nor logged as its
 /// own class.
 ///
-/// `SupportedSampleCountsWithNoOutputs = 1` (count 1 only) is likewise the
-/// measured baseline (`:80`) rather than the spec-prose `0x1D`; raising it needs
-/// a probe that sample-frequency PS with zero bound outputs actually works.
+/// DDI0102+ at FL11_1+ requires no-output sample counts 1,4,8,16. The native
+/// runtime rejected the old count1 answer on 2026-09-09 (Direct3D12 ETW).
+/// Count2 is also implemented. Device creation checks the engine's mask;
+/// the native no-output-msaa probe checks pixel/sample frequency and replay.
 ///
 /// # Safety
 /// As [`get_caps`].
@@ -1637,7 +1525,7 @@ unsafe fn options_0102(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hres
     const MAX_VIEW_HEAP: ddi12::UINT = 1_000_000;
 
     let options = ddi12::D3D12DDI_OPTIONS_0102 {
-        SupportedSampleCountsWithNoOutputs: 1,
+        SupportedSampleCountsWithNoOutputs: 0x1f,
         MaxSamplerDescriptorHeapSize: MAX_SAMPLER_HEAP,
         MaxSamplerDescriptorHeapSizeWithStaticSamplers: MAX_SAMPLER_HEAP,
         MaxViewDescriptorHeapSize: MAX_VIEW_HEAP,
@@ -1697,15 +1585,14 @@ unsafe fn options_0102(a: &ddi12::D3D12DDIARG_GETCAPS, data_size: usize) -> Hres
 use windows::Win32::Graphics::Direct3D12::{
     D3D12_FEATURE_DATA_FORMAT_SUPPORT, D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS,
     D3D12_FEATURE_FORMAT_SUPPORT, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, D3D12_FORMAT_SUPPORT1,
-    D3D12_FORMAT_SUPPORT1_BLENDABLE, D3D12_FORMAT_SUPPORT1_BUFFER, D3D12_FORMAT_SUPPORT1_DISPLAY,
+    D3D12_FORMAT_SUPPORT1_BLENDABLE, D3D12_FORMAT_SUPPORT1_BUFFER,
+    D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL, D3D12_FORMAT_SUPPORT1_DISPLAY,
     D3D12_FORMAT_SUPPORT1_IA_VERTEX_BUFFER, D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD,
-    D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL, D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET,
-    D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
+    D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET, D3D12_FORMAT_SUPPORT1_RENDER_TARGET,
     D3D12_FORMAT_SUPPORT1_SHADER_GATHER, D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE,
-    D3D12_FORMAT_SUPPORT2, D3D12_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP,
-    D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD,
-    D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE, D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE,
-    D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS,
+    D3D12_FORMAT_SUPPORT2, D3D12_FORMAT_SUPPORT2_OUTPUT_MERGER_LOGIC_OP, D3D12_FORMAT_SUPPORT2_TILED,
+    D3D12_FORMAT_SUPPORT2_UAV_TYPED_LOAD, D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE,
+    D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_TILED_RESOURCE, D3D12_MULTISAMPLE_QUALITY_LEVEL_FLAGS,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
 
@@ -1771,8 +1658,14 @@ mod fs {
 /// `D32_FLOAT_S8X24_UINT` answers `MULTISAMPLE_RENDERTARGET` alone — and the
 /// runtime already knows which formats are depth formats without asking.
 const SUPPORT1_TO_DDI: &[(u32, u32)] = &[
-    (D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE.0 as u32, fs::SHADER_SAMPLE),
-    (D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32, fs::RENDERTARGET),
+    (
+        D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE.0 as u32,
+        fs::SHADER_SAMPLE,
+    ),
+    (
+        D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 as u32,
+        fs::RENDERTARGET,
+    ),
     (D3D12_FORMAT_SUPPORT1_BLENDABLE.0 as u32, fs::BLENDABLE),
     (
         D3D12_FORMAT_SUPPORT1_MULTISAMPLE_RENDERTARGET.0 as u32,
@@ -1787,7 +1680,10 @@ const SUPPORT1_TO_DDI: &[(u32, u32)] = &[
         fs::VERTEX_BUFFER,
     ),
     (D3D12_FORMAT_SUPPORT1_BUFFER.0 as u32, fs::BUFFER),
-    (D3D12_FORMAT_SUPPORT1_SHADER_GATHER.0 as u32, fs::SHADER_GATHER),
+    (
+        D3D12_FORMAT_SUPPORT1_SHADER_GATHER.0 as u32,
+        fs::SHADER_GATHER,
+    ),
     // ⚠ Scan-out capability, and the one bit here that another Helios component
     // has to back. The KMD owns a real VidPn source and sends DWM's shared
     // primary through `SET_SCANOUT_BLOB`, so the capability exists; the engine's
@@ -1798,7 +1694,11 @@ const SUPPORT1_TO_DDI: &[(u32, u32)] = &[
 
 /// The engine's `D3D12_FORMAT_SUPPORT2` bit -> this DDI's bit.
 const SUPPORT2_TO_DDI: &[(u32, u32)] = &[
-    (D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 as u32, fs::UAV_WRITES),
+    (D3D12_FORMAT_SUPPORT2_TILED.0 as u32, fs::TILED),
+    (
+        D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 as u32,
+        fs::UAV_WRITES,
+    ),
     // ⚠ Additionally narrowed by [`FL11_TYPED_UAV_LOAD_FORMATS`] when
     // [`TYPED_UAV_LOAD_ADDITIONAL_FORMATS`] is FALSE. It is TRUE now, so the
     // narrowing falls away by construction and this is a plain forward.
@@ -1836,21 +1736,14 @@ const ENGINE_DERIVED_BITS: u32 = or_ddi_bits(SUPPORT1_TO_DDI) | or_ddi_bits(SUPP
 /// * `MULTIPLANE_OVERLAY` — there is no overlay path: `pfnGetOptionalDDITables`
 ///   answers zero tables and `D12-G5` measured that this runtime never requests
 ///   `D3D12DDI_TABLE_TYPE_DXGI` at all.
-/// * `TILED` — [`TILED_RESOURCES_TIER_REPORTED`] is `NOT_SUPPORTED`, so no
-///   tiled resource can exist and no format can be usable in one.
-///   ⚠ **No runtime string is known to enforce this**, and an earlier revision
-///   of this comment wrongly cited strings:48 for it: that string is a *range*
-///   check on the value of `D3D12DDI_D3D12_OPTIONS_DATA::TiledResourcesTier`,
-///   which `NOT_SUPPORTED` passes, in a different DDI call. The bit is withheld
-///   because `DECISIONS.md` §7.8 says an unbacked capability is a lie the OS
-///   acts on — not because a check was found that would catch it.
+///
+/// Tiled format support is engine-derived and gated on the native tier per call.
 const WITHHELD_BITS: u32 = fs::DECODER_OUTPUT
     | fs::VIDEO_PROCESSOR_OUTPUT
     | fs::VIDEO_PROCESSOR_INPUT
     | fs::VIDEO_ENCODER
     | fs::CAPTURE
-    | fs::MULTIPLANE_OVERLAY
-    | fs::TILED;
+    | fs::MULTIPLANE_OVERLAY;
 
 /// Every `D3D12DDI_FORMAT_SUPPORT_*` bit this build's header defines, except the
 /// `NOT_SUPPORTED` sentinel — which is not a capability and is never combined
@@ -1937,7 +1830,10 @@ fn translate(pairs: &[(u32, u32)], src: u32) -> u32 {
 
 /// Ask the engine what it supports for one format. `None` when there is no
 /// engine to ask or it refused; both are counted.
-fn engine_format_support(dev: &HeliosD3D12Device, format: ddi12::DXGI_FORMAT) -> Option<(u32, u32)> {
+fn engine_format_support(
+    dev: &HeliosD3D12Device,
+    format: ddi12::DXGI_FORMAT,
+) -> Option<(u32, u32)> {
     let Some(engine) = dev.engine.d3d12_device() else {
         // Unreachable by construction — `helios_vkd3d_bridge_create_device`
         // returns a null `unique_ptr` rather than an empty one on every failure
@@ -2021,6 +1917,9 @@ fn driver_format_support(dev: &HeliosD3D12Device, format: ddi12::DXGI_FORMAT) ->
 
     let mut caps = translate(SUPPORT1_TO_DDI, support1) | translate(SUPPORT2_TO_DDI, support2);
     caps &= !WITHHELD_BITS;
+    if TILED_RESOURCES_TIER_REPORTED == v::TILED_NONE {
+        caps &= !fs::TILED;
+    }
 
     // ⛔ Typed UAV *loads*, narrowed rather than dropped. See
     // [`FL11_TYPED_UAV_LOAD_FORMATS`]: the cap is named *additional* formats, so
@@ -2039,25 +1938,9 @@ fn driver_format_support(dev: &HeliosD3D12Device, format: ddi12::DXGI_FORMAT) ->
         caps &= !fs::OUTPUT_MERGER_LOGIC_OP;
     }
 
-    // ── The multisample answer: ONE predicate, both slots ──────────────────
-    //
-    // ⭐ **This is transliterated from the D3D11 driver, and the structure is
-    // the hard-won part.** `umd/src/forward/queries.rs:104-164` does not forward
-    // the engine's quality-level answer at all -- it *derives* it from the same
-    // `dxgi_msaa_bits_per_sample(fmt, caps).is_some()` predicate that decides
-    // the format-support multisample bits, and says why in as many words:
-    //
-    // > "The Microsoft runtime validates `CheckFormatSupport` and
-    // > `CheckMultisampleQualityLevels` as a coherent feature-level contract
-    // > during `CDevice::LLOCompleteLayerConstruction`. ... the caps/quality
-    // > pair stays internally coherent either way because `check_format_support`
-    // > uses the SAME predicate."
-    //
-    // ⛔ Forwarding two independent engine queries -- which is what this file did
-    // first -- makes the pair a *coincidence*, and `D12-G7` measured the runtime
-    // rejecting it four different ways on one format. Deriving both from
-    // [`msaa_capable`] makes disagreement unrepresentable, which is the same
-    // move `forward12::noop12` makes for slot ordinals.
+    // Both queries use the native format eligibility filter. These bits mean
+    // some multisample count is available; the quality query additionally asks
+    // the engine about the exact count and sparse/non-sparse flags.
     let msaa = msaa_capable(dev, format, support1);
     if msaa {
         caps |= fs::MULTISAMPLE_RENDERTARGET;
@@ -2249,50 +2132,11 @@ unsafe extern "C" fn check_format_support(
     unsafe { core::ptr::write_unaligned(out, caps) };
 }
 
-/// `pfnCheckMultisampleQualityLevels` — **2 730** calls inside one
-/// `D3D12CreateDevice`, and the single hottest DDI on the device-creation path.
-///
-/// Exactly **one** gate sits between the engine's answer and the runtime's: a
-/// `TILED_RESOURCE` query is answered with zero quality levels, because
-/// [`TILED_RESOURCES_TIER_REPORTED`] is `NOT_SUPPORTED`. The engine backs tier 4
-/// and answers from `supported_sparse_sample_counts` otherwise
-/// (`vkd3d-proton-helios/libs/vkd3d/device.c:5113-5115`), so without the gate
-/// this driver would offer multisampled tiled resources on the same device that
-/// reports no tiled tier at all.
-///
-/// # ⛔ The coherence check that looks obviously right, and is not
-///
-/// The first draft of this function also refused a `SampleCount > 1` answer
-/// whose format did not carry `MULTISAMPLE_RENDERTARGET` in
-/// [`driver_format_support`], reasoning that *"Driver claimed MSAA support when
-/// it shouldn't"* (strings:20) is a device-creation failure and that the two
-/// answers, coming from one engine, could not disagree.
-///
-/// **They can, they do, and the disagreement is deliberate.** vkd3d computes
-/// them in two unrelated functions:
-///
-/// * `d3d12_device_get_format_support` wraps its ENTIRE rendering-and-shader
-///   block — including both sites that set `MULTISAMPLE_RENDERTARGET` — in
-///   `if (format->type != VKD3D_FORMAT_TYPE_TYPELESS || (aspect & PLANE_0))`
-///   (`device.c:5300`), with the comment *"Rendering and shader usage features
-///   are not set for typeless formats"*;
-/// * `d3d12_device_check_multisample_quality_levels` never looks at
-///   `format->type` at all — it tests `format->supported_sample_counts`
-///   (`device.c:5113-5119`), which `vkd3d_init_format_sample_counts` fills for
-///   every table entry, typeless included.
-///
-/// So `R24G8_TYPELESS` and `R32_TYPELESS` — **the formats an application
-/// actually creates an MSAA depth buffer with** — report no
-/// `MULTISAMPLE_RENDERTARGET` and 1 quality level at 4x, simultaneously and
-/// correctly. vkd3d's typeless suppression exists precisely to match what
-/// native drivers report. The check would therefore have zeroed the quality
-/// levels for the whole typeless family, `CreateCommittedResource` with
-/// `SampleDesc.Count > 1` would have failed, and its counter — documented
-/// "expected 0" — would have read tens per device.
-///
-/// ⇒ The engine's answer is forwarded. The invariant the check enforced does
-/// not exist, and a gate defending an invariant that does not exist is worse
-/// than no gate: it breaks the working case and reports that as health.
+/// Query the exact format/sample-count/tiled-flags combination from the engine.
+/// The native format-eligibility filter is shared with `driver_format_support`;
+/// support at one sample count must never manufacture support at another.
+/// Typeless output-family formats retain their existing eligibility, while
+/// depth/stencil view-only formats do not become MSAA render targets.
 ///
 /// # Safety
 /// `h_device` must be a live handle from `device12::create_device`, and
@@ -2333,21 +2177,20 @@ unsafe extern "C" fn check_multisample_quality_levels(
         return;
     }
 
-    // ⭐ **DERIVED, NOT FORWARDED.** The engine's own quality-level answer is
-    // deliberately not used here: it comes from a different vkd3d function than
-    // its format-support answer (`device.c:5104-5121` vs `:5290-5345`) and the
-    // two disagree, which the runtime rejects as one contract. Both slots now
-    // read [`msaa_capable`], so the pair is coherent by construction — the
-    // structure `umd/src/forward/queries.rs:129-164` arrived at for D3D11.
-    let (support1, _support2) = engine_format_support(dev, format).unwrap_or((0, 0));
-    let capable = msaa_capable(dev, format, support1);
-
-    // ⛔ Only the power-of-two counts D3D11's predicate admits: *"The runtime
-    // rejects arbitrary non-power-of-two sample counts"*
-    // (`queries.rs:110-112`). The runtime sweeps 2..31 per format, so this is
-    // what makes 27 of every 30 answers zero.
-    let levels = if capable && matches!(sample_count, 1 | 2 | 4 | 8 | 16) {
-        1
+    if flags & !tiled_flag != 0 {
+        note_refusal(&UMD12_REFUSALS.caps_slot_bad_arg);
+        return;
+    }
+    let (support1, support2) = engine_format_support(dev, format).unwrap_or((0, 0));
+    // A tiled 1x query also applies to sampled-only and BC textures. They do
+    // not need render-target/MSAA eligibility; they need logical tiled backing.
+    let capable = if flags & tiled_flag != 0 && sample_count == 1 {
+        support2 & D3D12_FORMAT_SUPPORT2_TILED.0 as u32 != 0
+    } else {
+        msaa_capable(dev, format, support1)
+    };
+    let levels = if capable && matches!(sample_count, 1 | 2 | 4 | 8 | 16 | 32) {
+        engine_msaa_quality_levels(dev, format, sample_count, flags).unwrap_or(0)
     } else {
         0
     };
@@ -2377,7 +2220,8 @@ unsafe extern "C" fn check_multisample_quality_levels(
         );
     }
     // SAFETY: as above.
-    unsafe { core::ptr::write_unaligned(num_quality_levels, levels) };}
+    unsafe { core::ptr::write_unaligned(num_quality_levels, levels) };
+}
 
 /// Ask the engine how many quality levels one (format, sample count, flags)
 /// triple has. `None` when there is no engine or it refused; both are counted.
@@ -2425,23 +2269,12 @@ fn engine_msaa_quality_levels(
     Some(data.NumQualityLevels)
 }
 
-/// `pfnGetMipPacking` — never called on this driver, and answered as such.
-///
-/// ⛔ It describes the packed-mip tail of a **tiled** resource, and
-/// [`TILED_RESOURCES_TIER_REPORTED`] is `NOT_SUPPORTED`, so no tiled resource
-/// can exist for it to be asked about. It answers "no packed mips, no tiles"
-/// and counts, which is the honest pair: a slot that cannot be reached legally
-/// still must not leave the runtime's two out-parameters holding stack garbage.
-///
-/// ⚠ The lane that raises the tiled tier owns this body — it is
-/// `pfnUpdateTileMappings`' partner and cannot be written before it.
-///
+/// Return packed mip information from the actual reserved engine resource.
 /// # Safety
-/// `num_packed_mips` and `num_tiles_for_packed_mips` must each address one
-/// writable `UINT` the runtime owns.
+/// Live device/resource handles and two writable UINT outputs from the runtime.
 unsafe extern "C" fn get_mip_packing(
-    _h_device: ddi12::D3D12DDI_HDEVICE,
-    _h_tiled_resource: ddi12::D3D12DDI_HRESOURCE,
+    h_device: ddi12::D3D12DDI_HDEVICE,
+    h_tiled_resource: ddi12::D3D12DDI_HRESOURCE,
     num_packed_mips: *mut ddi12::UINT,
     num_tiles_for_packed_mips: *mut ddi12::UINT,
 ) {
@@ -2449,12 +2282,46 @@ unsafe extern "C" fn get_mip_packing(
         note_refusal(&UMD12_REFUSALS.caps_slot_bad_arg);
         return;
     }
-    // SAFETY: both non-null per the check above; the DDI declares both `_Out_`.
+    // SAFETY: both pointers address individual writable outputs.
     unsafe {
         core::ptr::write_unaligned(num_packed_mips, 0);
         core::ptr::write_unaligned(num_tiles_for_packed_mips, 0);
     }
-    note_refusal(&UMD12_REFUSALS.caps_mip_packing_refused);
+    // SAFETY: runtime keeps both driver-private handle blocks live for the DDI.
+    let (Some(dev), Some(resource)) = (unsafe { device12::device(h_device) }, unsafe {
+        crate::forward12::resource12::engine_resource(h_tiled_resource)
+    }) else {
+        note_refusal(&UMD12_REFUSALS.caps_mip_packing_refused);
+        return;
+    };
+    let Some(engine) = dev.engine.d3d12_device() else {
+        note_refusal(&UMD12_REFUSALS.caps_slot_no_device);
+        return;
+    };
+    let mut packed = windows::Win32::Graphics::Direct3D12::D3D12_PACKED_MIP_INFO::default();
+    let mut count = 0;
+    // SAFETY: borrowed engine resource, writable local outputs, no tiling array
+    // requested. The result is immutable resource geometry, not mapping state.
+    unsafe {
+        engine.GetResourceTiling(
+            resource,
+            Some(&mut count),
+            Some(&mut packed),
+            None,
+            None,
+            0,
+            core::ptr::null_mut(),
+        )
+    };
+    if count == 0 {
+        note_refusal(&UMD12_REFUSALS.caps_mip_packing_refused);
+        return;
+    }
+    // SAFETY: the two original writable outputs remain live.
+    unsafe {
+        core::ptr::write_unaligned(num_packed_mips, packed.NumPackedMips.into());
+        core::ptr::write_unaligned(num_tiles_for_packed_mips, packed.NumTilesForPackedMips);
+    }
 }
 
 /// Install L1's 3 device-core slots: `pfnCheckFormatSupport`,

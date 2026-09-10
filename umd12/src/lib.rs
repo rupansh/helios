@@ -538,16 +538,16 @@ static UMD12_REFUSAL_SET: [&RefusalCounter; 42] = [
 /// lands its counters appear at exactly this position.
 static UMD12_REFUSAL_SETS: &[&[&RefusalCounter]] = &[
     &UMD12_REFUSAL_SET,
-    forward12::queue::REFUSALS,       // L2: queue, pool, recorder, list lifetime
-    forward12::cmdlist::REFUSALS,     // L3a: draw, fixed function, IA/SO/OM
-    forward12::rootargs::REFUSALS,    // L3b: root arguments, binding, clears
-    forward12::copy::REFUSALS,        // L3c: copy, resolve, barriers, queries
-    forward12::resource12::REFUSALS,  // L4: resources, heaps, residency
+    forward12::queue::REFUSALS, // L2: queue, pool, recorder, list lifetime
+    forward12::cmdlist::REFUSALS, // L3a: draw, fixed function, IA/SO/OM
+    forward12::rootargs::REFUSALS, // L3b: root arguments, binding, clears
+    forward12::copy::REFUSALS,  // L3c: copy, resolve, barriers, queries
+    forward12::resource12::REFUSALS, // L4: resources, heaps, residency
     forward12::descriptors::REFUSALS, // L5: descriptor heaps and views
-    forward12::pso::REFUSALS,         // L6: PSO, root signatures, shaders
-    forward12::fence::REFUSALS,       // L7: fences and query heaps
-    forward12::present12::REFUSALS,   // L8: present
-    forward12::misc::REFUSALS,        // L9: the tail
+    forward12::pso::REFUSALS,   // L6: PSO, root signatures, shaders
+    forward12::fence::REFUSALS, // L7: fences and query heaps
+    forward12::present12::REFUSALS, // L8: present
+    forward12::misc::REFUSALS,  // L9: the tail
 ];
 
 /// Bump one refusal counter and emit the whole set's summary on its FIRST hit.

@@ -130,51 +130,118 @@ use helios_umd_common::slot::{Com, DdiHandle, Slot};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12DescriptorHeap, ID3D12Device11, ID3D12Resource, D3D12_BUFFER_RTV, D3D12_BUFFER_SRV,
-    D3D12_BUFFER_SRV_FLAGS, D3D12_BUFFER_SRV_FLAG_NONE, D3D12_BUFFER_SRV_FLAG_RAW,
-    D3D12_BUFFER_UAV, D3D12_BUFFER_UAV_FLAGS, D3D12_BUFFER_UAV_FLAG_NONE,
-    D3D12_BUFFER_UAV_FLAG_RAW, D3D12_COMPARISON_FUNC, D3D12_CONSTANT_BUFFER_VIEW_DESC,
+    ID3D12DescriptorHeap,
+    ID3D12Device11,
+    ID3D12Resource,
+    D3D12_BUFFER_RTV,
+    D3D12_BUFFER_SRV,
+    D3D12_BUFFER_SRV_FLAGS,
+    D3D12_BUFFER_SRV_FLAG_NONE,
+    D3D12_BUFFER_SRV_FLAG_RAW,
+    D3D12_BUFFER_UAV,
+    D3D12_BUFFER_UAV_FLAGS,
+    D3D12_BUFFER_UAV_FLAG_NONE,
+    D3D12_BUFFER_UAV_FLAG_RAW,
+    D3D12_COMPARISON_FUNC,
+    D3D12_CONSTANT_BUFFER_VIEW_DESC,
     D3D12_CPU_DESCRIPTOR_HANDLE,
-    D3D12_DEPTH_STENCIL_VIEW_DESC, D3D12_DEPTH_STENCIL_VIEW_DESC_0, D3D12_DESCRIPTOR_HEAP_DESC,
-    D3D12_DESCRIPTOR_HEAP_FLAGS, D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
-    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, D3D12_DESCRIPTOR_HEAP_TYPE,
-    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
-    D3D12_DESCRIPTOR_HEAP_TYPE_RTV, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, D3D12_DSV_DIMENSION,
+    D3D12_DEPTH_STENCIL_VIEW_DESC,
+    D3D12_DEPTH_STENCIL_VIEW_DESC_0,
+    D3D12_DESCRIPTOR_HEAP_DESC,
+    D3D12_DESCRIPTOR_HEAP_FLAGS,
+    D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
+    D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+    D3D12_DESCRIPTOR_HEAP_TYPE,
+    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+    D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+    D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+    D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
+    D3D12_DSV_DIMENSION,
     D3D12_DSV_DIMENSION_TEXTURE1D,
-    D3D12_DSV_DIMENSION_TEXTURE1DARRAY, D3D12_DSV_DIMENSION_TEXTURE2D,
-    D3D12_DSV_DIMENSION_TEXTURE2DARRAY, D3D12_DSV_DIMENSION_TEXTURE2DMS,
-    D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY, D3D12_DSV_FLAGS, D3D12_DSV_FLAG_NONE,
-    D3D12_DSV_FLAG_READ_ONLY_DEPTH, D3D12_DSV_FLAG_READ_ONLY_STENCIL, D3D12_FILTER,
+    D3D12_DSV_DIMENSION_TEXTURE1DARRAY,
+    D3D12_DSV_DIMENSION_TEXTURE2D,
+    D3D12_DSV_DIMENSION_TEXTURE2DARRAY,
+    D3D12_DSV_DIMENSION_TEXTURE2DMS,
+    D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY,
+    D3D12_DSV_FLAGS,
+    D3D12_DSV_FLAG_NONE,
+    D3D12_DSV_FLAG_READ_ONLY_DEPTH,
+    D3D12_DSV_FLAG_READ_ONLY_STENCIL,
+    D3D12_FILTER,
     // ⬇ L3b: the GPU sibling of `D3D12_CPU_DESCRIPTOR_HANDLE`, for
     // [`api_gpu_handle`]. Type-only, like every other name in this list.
     D3D12_GPU_DESCRIPTOR_HANDLE,
-    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV, D3D12_RENDER_TARGET_VIEW_DESC,
-    D3D12_RENDER_TARGET_VIEW_DESC_0, D3D12_RESOURCE_DESC, D3D12_RTV_DIMENSION,
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_SRV,
+    D3D12_RENDER_TARGET_VIEW_DESC,
+    D3D12_RENDER_TARGET_VIEW_DESC_0,
+    D3D12_RESOURCE_DESC,
+    D3D12_RTV_DIMENSION,
     D3D12_RTV_DIMENSION_BUFFER,
-    D3D12_RTV_DIMENSION_TEXTURE1D, D3D12_RTV_DIMENSION_TEXTURE1DARRAY,
-    D3D12_RTV_DIMENSION_TEXTURE2D, D3D12_RTV_DIMENSION_TEXTURE2DARRAY,
-    D3D12_RTV_DIMENSION_TEXTURE2DMS, D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY,
-    D3D12_RTV_DIMENSION_TEXTURE3D, D3D12_SAMPLER_DESC2, D3D12_SAMPLER_DESC2_0, D3D12_SAMPLER_FLAGS,
-    D3D12_SAMPLER_FLAG_NONE, D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES,
-    D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR, D3D12_SHADER_RESOURCE_VIEW_DESC,
-    D3D12_SHADER_RESOURCE_VIEW_DESC_0, D3D12_SRV_DIMENSION_BUFFER,
-    D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE, D3D12_SRV_DIMENSION_TEXTURE1D,
-    D3D12_SRV_DIMENSION_TEXTURE1DARRAY, D3D12_SRV_DIMENSION_TEXTURE2D,
-    D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_SRV_DIMENSION_TEXTURE2DMS,
-    D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY, D3D12_SRV_DIMENSION_TEXTURE3D,
-    D3D12_SRV_DIMENSION_TEXTURECUBE, D3D12_SRV_DIMENSION_TEXTURECUBEARRAY, D3D12_TEX1D_ARRAY_DSV,
-    D3D12_TEX1D_ARRAY_RTV, D3D12_TEX1D_ARRAY_SRV, D3D12_TEX1D_ARRAY_UAV, D3D12_TEX1D_DSV,
-    D3D12_TEX1D_RTV, D3D12_TEX1D_SRV, D3D12_TEX1D_UAV, D3D12_TEX2DMS_ARRAY_DSV,
-    D3D12_TEX2DMS_ARRAY_RTV, D3D12_TEX2DMS_ARRAY_SRV, D3D12_TEX2DMS_ARRAY_UAV, D3D12_TEX2DMS_DSV,
-    D3D12_TEX2DMS_RTV, D3D12_TEX2DMS_SRV, D3D12_TEX2DMS_UAV, D3D12_TEX2D_ARRAY_DSV,
-    D3D12_TEX2D_ARRAY_RTV, D3D12_TEX2D_ARRAY_SRV, D3D12_TEX2D_ARRAY_UAV, D3D12_TEX2D_DSV,
-    D3D12_TEX2D_RTV, D3D12_TEX2D_SRV, D3D12_TEX2D_UAV, D3D12_TEX3D_RTV, D3D12_TEX3D_SRV,
-    D3D12_TEX3D_UAV, D3D12_TEXCUBE_ARRAY_SRV, D3D12_TEXCUBE_SRV, D3D12_TEXTURE_ADDRESS_MODE,
+    D3D12_RTV_DIMENSION_TEXTURE1D,
+    D3D12_RTV_DIMENSION_TEXTURE1DARRAY,
+    D3D12_RTV_DIMENSION_TEXTURE2D,
+    D3D12_RTV_DIMENSION_TEXTURE2DARRAY,
+    D3D12_RTV_DIMENSION_TEXTURE2DMS,
+    D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY,
+    D3D12_RTV_DIMENSION_TEXTURE3D,
+    D3D12_SAMPLER_DESC2,
+    D3D12_SAMPLER_DESC2_0,
+    D3D12_SAMPLER_FLAGS,
+    D3D12_SAMPLER_FLAG_NONE,
+    D3D12_SAMPLER_FLAG_NON_NORMALIZED_COORDINATES,
+    D3D12_SAMPLER_FLAG_UINT_BORDER_COLOR,
+    D3D12_SHADER_RESOURCE_VIEW_DESC,
+    D3D12_SHADER_RESOURCE_VIEW_DESC_0,
+    D3D12_SRV_DIMENSION_BUFFER,
+    D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE,
+    D3D12_SRV_DIMENSION_TEXTURE1D,
+    D3D12_SRV_DIMENSION_TEXTURE1DARRAY,
+    D3D12_SRV_DIMENSION_TEXTURE2D,
+    D3D12_SRV_DIMENSION_TEXTURE2DARRAY,
+    D3D12_SRV_DIMENSION_TEXTURE2DMS,
+    D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY,
+    D3D12_SRV_DIMENSION_TEXTURE3D,
+    D3D12_SRV_DIMENSION_TEXTURECUBE,
+    D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+    D3D12_TEX1D_ARRAY_DSV,
+    D3D12_TEX1D_ARRAY_RTV,
+    D3D12_TEX1D_ARRAY_SRV,
+    D3D12_TEX1D_ARRAY_UAV,
+    D3D12_TEX1D_DSV,
+    D3D12_TEX1D_RTV,
+    D3D12_TEX1D_SRV,
+    D3D12_TEX1D_UAV,
+    D3D12_TEX2DMS_ARRAY_DSV,
+    D3D12_TEX2DMS_ARRAY_RTV,
+    D3D12_TEX2DMS_ARRAY_SRV,
+    D3D12_TEX2DMS_ARRAY_UAV,
+    D3D12_TEX2DMS_DSV,
+    D3D12_TEX2DMS_RTV,
+    D3D12_TEX2DMS_SRV,
+    D3D12_TEX2DMS_UAV,
+    D3D12_TEX2D_ARRAY_DSV,
+    D3D12_TEX2D_ARRAY_RTV,
+    D3D12_TEX2D_ARRAY_SRV,
+    D3D12_TEX2D_ARRAY_UAV,
+    D3D12_TEX2D_DSV,
+    D3D12_TEX2D_RTV,
+    D3D12_TEX2D_SRV,
+    D3D12_TEX2D_UAV,
+    D3D12_TEX3D_RTV,
+    D3D12_TEX3D_SRV,
+    D3D12_TEX3D_UAV,
+    D3D12_TEXCUBE_ARRAY_SRV,
+    D3D12_TEXCUBE_SRV,
+    D3D12_TEXTURE_ADDRESS_MODE,
     D3D12_UAV_DIMENSION_BUFFER,
-    D3D12_UAV_DIMENSION_TEXTURE1D, D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
-    D3D12_UAV_DIMENSION_TEXTURE2D, D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
-    D3D12_UAV_DIMENSION_TEXTURE2DMS, D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY,
-    D3D12_UAV_DIMENSION_TEXTURE3D, D3D12_UNORDERED_ACCESS_VIEW_DESC,
+    D3D12_UAV_DIMENSION_TEXTURE1D,
+    D3D12_UAV_DIMENSION_TEXTURE1DARRAY,
+    D3D12_UAV_DIMENSION_TEXTURE2D,
+    D3D12_UAV_DIMENSION_TEXTURE2DARRAY,
+    D3D12_UAV_DIMENSION_TEXTURE2DMS,
+    D3D12_UAV_DIMENSION_TEXTURE2DMSARRAY,
+    D3D12_UAV_DIMENSION_TEXTURE3D,
+    D3D12_UNORDERED_ACCESS_VIEW_DESC,
     D3D12_UNORDERED_ACCESS_VIEW_DESC_0,
 };
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
@@ -589,7 +656,9 @@ unsafe extern "C" fn get_descriptor_size_in_bytes(
         DESCRIPTOR_REFUSALS.descriptor_stride_zero.bump();
         let n = DESCRIPTOR_REFUSALS.descriptor_stride_zero.get();
         if n <= LOG_BUDGET {
-            log_error!("GetDescriptorSizeInBytes: engine reports stride 0 for type {heap_type} (x{n})");
+            log_error!(
+                "GetDescriptorSizeInBytes: engine reports stride 0 for type {heap_type} (x{n})"
+            );
         }
     }
     trace_line!("GetDescriptorSizeInBytes: type={heap_type} -> {stride}");
@@ -651,7 +720,10 @@ unsafe extern "C" fn get_cpu_descriptor_handle_for_heap_start(
         let n = DESCRIPTOR_REFUSALS.heap_start_handles.get();
         DESCRIPTOR_REFUSALS.heap_start_handles.bump();
         if n < LOG_BUDGET {
-            log_error!("GetCPUDescriptorHandleForHeapStart -> {:#018x} (x{n})", out.ptr);
+            log_error!(
+                "GetCPUDescriptorHandleForHeapStart -> {:#018x} (x{n})",
+                out.ptr
+            );
         }
     }
     out
@@ -700,7 +772,10 @@ unsafe extern "C" fn get_gpu_descriptor_handle_for_heap_start(
         let n = DESCRIPTOR_REFUSALS.heap_start_handles.get();
         DESCRIPTOR_REFUSALS.heap_start_handles.bump();
         if n < LOG_BUDGET {
-            log_error!("GetGPUDescriptorHandleForHeapStart -> {:#018x} (x{n})", out.ptr);
+            log_error!(
+                "GetGPUDescriptorHandleForHeapStart -> {:#018x} (x{n})",
+                out.ptr
+            );
         }
     }
     out
@@ -754,9 +829,7 @@ unsafe extern "C" fn get_gpu_descriptor_handle_for_heap_start(
 /// outlive the DDI call that obtained it. Both hold at every call site, because
 /// the only caller is [`view_resource`], which is called from a view-creation
 /// DDI with the runtime's own handle and drops the borrow before returning.
-unsafe fn engine_resource<'a>(
-    h_resource: ddi12::D3D12DDI_HRESOURCE,
-) -> Option<&'a ID3D12Resource> {
+unsafe fn engine_resource<'a>(h_resource: ddi12::D3D12DDI_HRESOURCE) -> Option<&'a ID3D12Resource> {
     // SAFETY: forwarded unchanged; the caller's guarantee above is this
     // function's, and `view_resource` has already rejected a null private word.
     unsafe { crate::forward12::resource12::engine_resource(h_resource) }
@@ -1470,7 +1543,11 @@ unsafe extern "C" fn create_unordered_access_view(
             // diagnosable event, a hung guest is not.
             ViewResource::Unresolved => {
                 note_refusal(&DESCRIPTOR_REFUSALS.uav_counter_unavailable);
-                log_view_refusal("CreateUnorderedAccessView counter", a.Format, a.ResourceDimension);
+                log_view_refusal(
+                    "CreateUnorderedAccessView counter",
+                    a.Format,
+                    a.ResourceDimension,
+                );
                 report_error(dev, E_FAIL);
                 return;
             }
@@ -1558,7 +1635,13 @@ unsafe fn rtv_desc(
         ddi12::D3D12DDI_RESOURCE_DIMENSION_D3D12DDI_RD_TEXTURE2D => {
             // SAFETY: `ResourceDimension` names the `Tex2D` arm.
             let t = unsafe { a.__bindgen_anon_1.Tex2D };
-            rtv_tex2d(t.MipSlice, t.FirstArraySlice, t.ArraySize, t.PlaneSlice, samples)
+            rtv_tex2d(
+                t.MipSlice,
+                t.FirstArraySlice,
+                t.ArraySize,
+                t.PlaneSlice,
+                samples,
+            )
         }
         ddi12::D3D12DDI_RESOURCE_DIMENSION_D3D12DDI_RD_TEXTURE3D => {
             // SAFETY: `ResourceDimension` names the `Tex3D` arm.
@@ -1598,10 +1681,7 @@ fn rtv_tex2d(
     array_size: u32,
     plane_slice: u32,
     samples: u32,
-) -> (
-    D3D12_RTV_DIMENSION,
-    D3D12_RENDER_TARGET_VIEW_DESC_0,
-) {
+) -> (D3D12_RTV_DIMENSION, D3D12_RENDER_TARGET_VIEW_DESC_0) {
     match tex2d_shape(array_size, first_array_slice, samples) {
         Tex2DShape::MsArray => (
             D3D12_RTV_DIMENSION_TEXTURE2DMSARRAY,
@@ -1732,7 +1812,8 @@ fn api_dsv_flags(f: ddi12::D3D12DDI_CREATE_DEPTH_STENCIL_VIEW_FLAGS) -> D3D12_DS
     {
         out |= D3D12_DSV_FLAG_READ_ONLY_DEPTH;
     }
-    if f & ddi12::D3D12DDI_CREATE_DEPTH_STENCIL_VIEW_FLAGS_D3D12DDI_CREATE_DSV_FLAG_READ_ONLY_STENCIL
+    if f
+        & ddi12::D3D12DDI_CREATE_DEPTH_STENCIL_VIEW_FLAGS_D3D12DDI_CREATE_DSV_FLAG_READ_ONLY_STENCIL
         != 0
     {
         out |= D3D12_DSV_FLAG_READ_ONLY_STENCIL;
@@ -1803,10 +1884,7 @@ fn dsv_tex2d(
     first_array_slice: u32,
     array_size: u32,
     samples: u32,
-) -> (
-    D3D12_DSV_DIMENSION,
-    D3D12_DEPTH_STENCIL_VIEW_DESC_0,
-) {
+) -> (D3D12_DSV_DIMENSION, D3D12_DEPTH_STENCIL_VIEW_DESC_0) {
     match tex2d_shape(array_size, first_array_slice, samples) {
         Tex2DShape::MsArray => (
             D3D12_DSV_DIMENSION_TEXTURE2DMSARRAY,
@@ -1977,10 +2055,8 @@ unsafe extern "C" fn create_constant_buffer_view(
     // present, is a live local whose address does not escape the call; `dest`
     // addresses engine descriptor storage this driver minted.
     unsafe {
-        engine.CreateConstantBufferView(
-            desc.as_ref().map(core::ptr::from_ref),
-            api_cpu_handle(dest),
-        );
+        engine
+            .CreateConstantBufferView(desc.as_ref().map(core::ptr::from_ref), api_cpu_handle(dest));
     }
 }
 

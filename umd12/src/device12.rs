@@ -186,10 +186,7 @@ pub(crate) unsafe fn calc_private_device_size(
     }
 
     let size = device_private_size(a.Flags);
-    log_error!(
-        "CalcPrivateDeviceSize: Flags={:#x} -> {size}",
-        a.Flags,
-    );
+    log_error!("CalcPrivateDeviceSize: Flags={:#x} -> {size}", a.Flags,);
     size
 }
 
@@ -214,9 +211,7 @@ pub(crate) unsafe fn calc_private_device_size(
 /// of the call, and its `hDrvDevice.pDrvPrivate` at
 /// [`device_private_size`]-many writable bytes the runtime allocated for this
 /// device.
-pub(crate) unsafe fn create_device(
-    arg: *const ddi12::D3D12DDIARG_CREATEDEVICE_0109,
-) -> Hresult {
+pub(crate) unsafe fn create_device(arg: *const ddi12::D3D12DDIARG_CREATEDEVICE_0109) -> Hresult {
     if arg.is_null() {
         note_refusal(&UMD12_REFUSALS.create_device_bad_arg);
         return E_INVALIDARG;

@@ -12,6 +12,982 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## Committed dependency checkpoint, 2026-09-10
+
+The owner authorized committing the accumulated native FL/DXR work and pushing
+only the new renderer/protocol forks. Their GitHub `main` refs are verified at
+virglrenderer `2121d5d0e82a58edc321ced3309c1ce7b7c41905` and venus-protocol
+`fe08e82c3819e8ee3c547b1ea810fde61f46fa78`; `.gitmodules` uses those owner forks.
+The upstream remotes remain available separately. Mesa `2d4e910bd04`, engine
+`10efa8af` and nested DXIL compiler `f4651bd0` are committed locally and are not
+pushed. The root checkpoint therefore still has unpublished dependencies.
+DXVK, QEMU and unrelated dependencies remain at their existing revisions.
+
+This records source publication, not a new deployment. Installed release UMD12
+remains `8F15F9DC…` with the validation below. Commit preparation removed one
+trailing blank line in Mesa and normalized whitespace in generated TIR test
+headers without changing shader tokens. Protocol round-trip and renderer queue
+tests pass again. No rebuild or benchmark result is inferred from committing.
+Native RT0/tools visualization still block Port Royal. Local receipts are in
+`tmp/commit-dxr-20260910/`; no memory or archive files were changed.
+
+## DXR AS input and allocation failures, 2026-09-10
+
+Current ProgramData release UMD12 `8F15F9DC…` validates AS descriptor envelopes
+and primitive-count narrowing, clears failed prebuild output, checks/frees all
+three temporary arrays and applies DXR's low-32-bit vertex/AABB stride rule.
+[DXR_SERIALIZATION.md](docs/dx12/DXR_SERIALIZATION.md#as-build-inputs-and-prebuild-failures-2026-09-10)
+records 34,489 passing engine checks on each of direct NVIDIA and paired Linux
+Venus, including allocation fault injection and build/update/copy/serialization
+ray readback. The old engine reproduces stale prebuild output. Raw Vulkan
+creation-view overlap diagnostics retain fixture-specific attribution.
+
+Linux/Windows/release/A1 pass. Native interactive FL creation/caps and all four
+GPU ordering cases pass with exact loaded 8F15F9DC/43394BBD identities; .271,
+oem54, Code0 and WDDM2.1 remain. These native tests do not reach the changed RT
+code: RT0 and the tools visualization refusals remain. The next subsystem is
+decoded AS data with complete GPU mutation/copy/serialization lifetimes, then
+native DXR acceptance and Port Royal. No benchmark, performance or owner visual
+acceptance is transferred to this build. No commit or push was made.
+
+## FL12 adapter admission, 2026-09-10
+
+Release UMD12 `898F75F9…` was deployed on unchanged .271/oem54/WDDM2.1,
+UMD11/ICD and engine archives. All seven adapter-handle callbacks now refuse
+foreign handles before forwarding. The extended feature-level query reads only
+the runtime input, writes only the output and selects a supported enumerant
+within that limit; the legacy ceiling remains12_1. The exact same direct DDI
+probe passes184 checks on this build versus36 failures on2D90C57E. A1 and the
+Windows release build pass. Native system-runtime creation succeeds through
+FL12_1 and refuses12_2; all four native GPU ordering cases pass. Exact loaded
+identities and the direct-versus-native evidence boundary are in
+[FEATURE_LEVELS.md](docs/dx12/FEATURE_LEVELS.md#adapter-admission-contract-2026-09-10)
+and `tmp/fl12-admission-20260910/`.
+
+Port Royal is not ready: RaytracingTier remains0 and tools-visualization AS
+query/copy modes remain explicitly unsupported. The complete representation and
+its build/update/copy/serialization lifetimes precede native DXR acceptance.
+FL12_0/12_1 compatibility admission is working; full genuine conformance remains
+open under the sparse exception and existing lifetime/ownership limits. No
+benchmark, performance claim, guest/QEMU reboot, commit or push in this increment.
+
+## Previous DXR copy and address contracts, 2026-09-10
+
+[DXR_SERIALIZATION.md](docs/dx12/DXR_SERIALIZATION.md#as-address-and-copy-range-validation-2026-09-10)
+records deployed release UMD12 `2D90C57E…` on .271/oem54/WDDM2.1, unchanged
+UMD11/ICD and the paired renderer. The engine now fails Close on malformed AS
+build/update/copy/query addresses, preserving batch rollback and backing
+ownership. Thirteen recording-rejection cases and expanded packed clone/compact,
+serialization/replay and ray-readback tests pass33,859 checks on each of direct
+NVIDIA and Linux Venus. Linux/Windows/UMD/A1 pass. Copy-stage masks are explicit;
+the final synchronization run has no hazards. Its27 raw copy-range diagnostics
+compare whole creation views, while every fixture pair's accessed-size bounds
+are disjoint. The evidence distinguishes this layer discrepancy from general
+AS aliasing conformance; no message was suppressed and no performance gain is
+claimed. On this exact build, all19 native query/filter/raster groups pass
+781,199 checks and all four native ordering cases pass65,536 words each. Native
+caps retain FL12_1/tiled2/SM6.0/RT0; the native DXR probe exits BLOCKED77 before
+RT commands. Exact loaded runtime/UMD/ICD receipts and Code0 desktop capture
+are archived. No benchmark or performance comparison was run on2D90C57E.
+
+FL12_0/FL12_1 compatibility admission remains; the sparse exception still
+prevents a full genuine-conformance claim. Native RT0 and missing tools decode
+remain the Port Royal boundary. The next subsystem is tools visualization with
+complete AS mutation/copy/serialization lifetimes, then native DXR validation.
+The benchmark results below belong to22C31F11 and are not current-build visual
+or performance acceptance.
+
+## FL12_1 pipeline statistics, 2026-09-10
+
+[DGC_QUERIES.md](docs/dx12/DGC_QUERIES.md) records the native DGC compute
+statistics repair. Native Windows reproduced missing dispatch counts on
+5B8A411E; release UMD12 `22C31F11…` now passes all four query groups: 2,218
+checks and 56 expanded readback records, with shader counters independently
+matching query results. Direct NVIDIA, paired Venus and Intel each pass 2,166
+checks. Expanded NVIDIA synchronization validation has no diagnostics. Native
+DGC execution remains; the removed command emulation is not restored. The pass
+runs only for queried DGC compute, with allocator-owned GPU scratch and no CPU
+argument readback or idle wait. Linux/Windows/release UMD/A1 checks pass.
+
+The new UMD is a ProgramData hotplug on unchanged .271/oem54/Code0/WDDM2.1,
+UMD11 `57C84ED4…` and ICD `43394BBD…`; the signed package remains older. Native
+FL12_1 admission is retained and RT remains withheld. Native inherited
+format/UAV/shader coverage passes 23 groups / 529,085 checks; all 13 raster
+groups pass 778,722 checks / 420 TIR readbacks. The four native ordering cases
+pass, including cross-process GPU completion. The tiled suite passes 18 cases;
+reserved 3D textures return the expected tier-2 refusal (overall suite exit77,
+not an all-pass result). New min/max filter tests pass 259 native checks and
+60 pixel readbacks across DXBC/DXIL and static/dynamic samplers, including mip
+reduction and zero-weight texels; NVIDIA, Intel and Venus each pass 249 checks.
+The native inventory creates FL11_0 through FL12_1 and refuses FL12_2.
+The authorized reserved-resource
+compatibility exception, native DXR/Port Royal and existing lifetime/sharing
+acceptance limits remain explicit. The old TotalLaneCount1024 estimate is also
+an open reporting issue, distinct from the FL12_1 SM5.1 floor.
+
+Full stock Time Spy, Fire Strike and Steel Nomad Vulkan now complete on this
+stack, with archived results/XML, exact loaded identities and changing host-VNC
+benchmark frames. Graphics scores / measured FPS: Time Spy23,071 / GT1 154.94 /
+GT2 128.93; Fire Strike59,806 / GT1 265.00 / GT2 255.24; Steel Nomad Vulkan9,384 /
+93.84. Workload settings match the earlier2AD1 stock controls after excluding
+adapter/result identity fields. These are single-run measurements with no
+attributed performance gain. The owner has not visually accepted these runs.
+The guest remains Code0 with no remaining benchmark processes. This is usable
+native FL12_0/FL12_1 compatibility support; complete genuine conformance is not
+claimed. Native RT0 is still the first Port Royal admission boundary; the next
+DXR work is AS accessed-range correctness and tools-visualization operations,
+followed by native state-object/AS/DispatchRays validation.
+
+## DXR serialization queries, 2026-09-10
+
+[DXR_SERIALIZATION.md](docs/dx12/DXR_SERIALIZATION.md) now records the
+execution-time serialization postbuild implementation. The query no longer
+relies on a recorded AS type. Direct NVIDIA and paired Linux Venus each pass
+33,642 checks, including a query list recorded before its producer and replayed
+over TLAS -> BLAS -> TLAS at one GPU address. Vulkan synchronization validation
+reports no hazards; the later copy-range analysis above attributes the six
+fixture diagnostics to creation-view extents.
+Linux/Windows engine, release UMD12 and A1 pass. ProgramData UMD12 `5B8A411E…`
+is hotplugged on unchanged .271/oem54/Code0/WDDM2.1; UMD11 and ICD are unchanged.
+All 13 native rasterization groups pass 778,722 checks/420 readback records, and
+all four native ordering cases pass. Exact loaded modules are recorded; the
+revised native DXR probe admits FL12_1 and exits BLOCKED77 at RT0. The signed
+DriverStore UMD12 remains 41A7. Valid scoped queries are virtualized on the native DGC surface; the generic
+non-DGC split refusal is not a native admission blocker. Tools visualization,
+arbitrary AS alias/lifetime cases and native DXR behavior remain open. No
+performance or owner-visible benchmark acceptance is claimed.
+
+## DXR deserialization, 2026-09-09
+
+[DXR_SERIALIZATION.md](docs/dx12/DXR_SERIALIZATION.md) records the new bounded
+metadata reader and execution boundary for TLAS-first deserialization. Small and
+8,194-reference replay/readback tests and five malformed-header cases pass on
+direct NVIDIA and the paired Linux Venus stack: 33,518 checks per stack, no
+failures/skips. Linux/Windows engine, release UMD12 and A1 build/checks pass.
+UMD12 `CBABC0B8…` is hotplugged on unchanged .271/oem54/Code0, WDDM2.1,
+UMD11 `57C84ED4…` and ICD `43394BBD…`; no reboot was needed. All 13 native
+rasterization groups pass (778,722 checks, 420 TIR readback records), as do all
+four native ordering cases. Exact loaded hashes and system D3D12/Core/DXGI
+paths are recorded. The revised native DXR probe admits FL12_1 and exits
+BLOCKED77 at RT0; its AS paths remain unexercised. The signed DriverStore UMD12
+still carries 41A7. Native RT remains unadmitted. AS view-range/type
+validation diagnostics, serialization postbuild queries after GPU-only type
+changes, tools visualization and native DXR behavior still require work before
+Port Royal. No performance or owner-visible scene acceptance is claimed.
+
+## TIR implementation, 2026-09-09
+
+[TIR.md](docs/dx12/TIR.md) records the forced-sampling contract and current
+validation. UMD12 `0C292592…` is hotplugged on unchanged .271/oem54/Code0,
+UMD11 `57C84ED4…`, ICD `43394BBD…` and the paired renderer. Host mixed-sample,
+MRT/logic and invalid-PSO tests pass; Linux/Windows builds and A1 pass. All 13 native groups now complete with zero failures/skips, including 420 TIR
+readback records (210 scenarios replayed twice), six legal creation cases,
+invalid inputs, ROV and conservative rasterization. TIR positive GPU cases
+have no native debug-queue errors. Optional RGBA32_FLOAT target16 is unavailable;
+pending-allocator diagnostics remain unresolved. This is a ProgramData UMD12
+hotplug; the signed package still carries 41A7. Full FL12_0/12_1 conformance and
+DXR/Port Royal remain open. The subsequent deserialization work is recorded
+above; RT/SM capability reporting has not been raised. No benchmark
+performance or owner scene acceptance is claimed for this TIR build.
+
+## Native renderer fork, 2026-09-09 — deployed validation
+
+The owner now authorizes virglrenderer changes and requires removal of the
+private vkd3d DGC emulation and feedback-fence workaround. The new paired
+`virglrenderer` / `venus-protocol` submodules implement native EXT DGC and
+NV mixed-sample extension forwarding through Mesa. The engine's private GPU
+root and CPU-assisted IA paths are removed. The renderer uses ordinary internal
+queue-marker fences; Mesa/KMD retire through authenticated wire receipts and
+the 0x14 feedback escape is retired. Keep WDDM2.1, native static UMD and async WSI.
+
+The full contract, capability matrix, provenance, build/activation commands and
+remaining limits are in [NATIVE_DGC.md](docs/dx12/NATIVE_DGC.md). Linux Venus on
+the actual NVIDIA GPU passes 2,404 indirect checks with no host validation
+diagnostics after repairing Mesa's dropped 64-bit buffer-usage chain. Protocol,
+renderer worker and 211 KMD logic tests pass. Windows engine/ICD/release UMD and
+signed .271 package builds pass. The owner restarted QEMU with the local paired
+renderer and the guest package was installed/rebooted: **.271/oem54.inf/Code0**,
+WDDM2.1, UmdD3D12=1. Loaded host hashes match; DWM uses release UMD11 `57C84ED4…`
+and ICD `43394BBD…`; native probes use release UMD12 `41A7E290…`. The installer
+re-signed the KMD to `BEE45488…` (prepared hash `CD282F11…`). Full source/build
+and deployed receipts are under `tmp/native-dgc-renderer-20260909/`.
+No push or host system installation occurred.
+
+Native FL12_0/12_1 creation and maximum query pass on updated system runtime/Core
+10.0.26100.9278 and DXGI10.0.26100.9444. Native DGC root and IA each pass12 cases /
+48 words; root signatures12 cases /48 words, SO34 cases and all four native
+ordering cases pass. Tiled/inherited suite:18 passes, 3D tiling BLOCKED at tier2;
+the overall suite is not a pass. DXR remains BLOCKED77 at RT0. Host VNC confirms
+the desktop; benchmark scene acceptance remains the owner's decision.
+
+The stricter DGC query probe remains **failed**: GPU output/guards pass, but
+NVIDIA reports zero compute invocations through both direct Vulkan and Venus;
+an ordinary-dispatch control counts correctly. The broader multiview query
+expectation also fails on direct host and Venus; native view instancing remains
+unadvertised. This is not full FL12_0/12_1 conformance. DXR/Port Royal, TIR,
+expanded-root native-DGC support and existing sharing/lifetime/host-loss limits
+remain open.
+
+All three stock interactive controls complete and export results on this stack:
+
+| Control | Scores | FPS |
+|---|---|---|
+| Time Spy | overall21,813; graphics22,903; CPU17,181 | GT1 157.847717; GT2 125.318718 |
+| Fire Strike | overall36,018; graphics59,097; physics40,946; combined8,765 | GT1 259.785706; GT2 254.168198; combined40.768192 |
+| Steel Nomad Vulkan | 9,387 | 93.877197 |
+
+All selected workloads have status0, exact loaded native identities and changing
+host-VNC scene captures. Render settings and stock definitions match the earlier
+2AD1 controls; only generated result IDs/adapter LUID differ. The updated Windows
+runtime prevents isolating either the DGC or marker-fence change's performance
+effect. Owner visual acceptance remains pending. The allocator Reset diagnostics
+recur; benchmark completion does not close that lifetime question. Full receipts
+are in `tmp/native-dgc-renderer-20260909/controls/native-dgc-*-validation.json`.
+
+TIR and native DXR were outstanding at the 41A7 checkpoint; the TIR implementation
+and native results above supersede that rasterization boundary. Earlier stock-renderer and feedback/fallback
+sections below describe prior deployments and no longer set implementation policy.
+
+## Native feature levels and ray tracing, 2026-09-08
+
+The current owner-directed work is genuine native FL12_0 and FL12_1. Neither
+feature level requires advertising DXR; the DXR/Port Royal acceptance remains
+separate, followed by FL12_2/Speed Way. Preserve the existing higher-feature
+implementation work. DX12 has priority. Keep WDDM 2.1 and the native UMD architecture;
+the withdrawn automatic WDDM 2.9 target is not a requirement. The complete
+capability/evidence matrix and acceptance limits are in
+[`docs/dx12/FEATURE_LEVELS.md`](docs/dx12/FEATURE_LEVELS.md).
+
+## Native FL12_1 admission candidate, 2026-09-09
+
+Release UMD12 `2AD1D25D480822DE675A667E30D4F756ACBD2A6B1BCEF765D351CB15E93411F2`
+is hotplugged on unchanged KMD22.22.270.0/oem53.inf/WDDM2.1, UMD11 `245D1BC3` and
+Mesa ICD `BF021927`. Native system runtime/Core10.0.26100.8972 and DXGI10.0.26100.9168
+now create FL11_0, FL11_1, FL12_0 and FL12_1; FL12_2 returns `0x887a0004`.
+PID3948 reports tiled2, binding3, ROV1, conservative3, SM6.0 and RT0 on Helios
+LUID `00000000:01d1c4d3`. Exact module hashes and the unmodified native runtime
+are recorded in `tmp/fl12-maintenance8-native-20260908/native-20260909-001745-560-f650e42104174fce8ca96409db873861/`.
+This is admission of a compatibility candidate, not complete FL conformance.
+
+Both DDI feature-level queries and native engine admission derive from the
+same FL12_1 maximum; the extended query preserves/clamps the runtime maximum.
+A new owned-device check refuses missing engine FL/SM, binding/conservative
+requirements, no-output sample counts and raw/predicated tiled-copy features.
+It also refuses developer feature-level/shader-model overrides. The host check
+accepts the real backing and rejects disabled maintenance8. The native negative
+case now confirms the same boundary: PID1392 loads exact2AD1/BF02, the engine
+reports maintenance8=0 and returns `0x887a0004`; the bridge maps this to native
+CreateDevice `E_FAIL` (`0x80004005`). The process terminates normally with the
+expected failed creation. `native-missing-m8-validation-2ad1.json` records the
+pinned driver-file hashes, loaded-path ETW evidence and zero lost events/buffers.
+This denial-only test changes the child environment, not installed capabilities.
+
+The first FL12_1 candidate `06024105` reached the engine but the native retail
+runtime rejected its count1 no-output rasterization cap. Direct3D12 ETW records
+"Driver reported insufficient sample counts for no-output rendering" with
+`0x887a0020`, PID8672, zero lost events. The
+[DDI0102 requirement](https://microsoft.github.io/DirectX-Specs/d3d/VulkanOn12.html#sample-frequency-msaa-with-no-render-targets-bound)
+is counts1/4/8/16 above FL11_0. The implementation now reports the guarded 1/2/4/8/16
+mask and specializes both shaders and rasterization from the effective no-output
+sample count. The native `no-output-msaa` case passes 15 PSO cases over two replays,
+17,280 words, pixel/sample-frequency invocation, coverage and guard regions,
+with no native debug errors. It is independent of tiled resources. Forced
+sampling with attachments was previously ignored in vkd3d; nontrivial mixed-sample
+TIR now returns E_NOTIMPL. That inherited contract remains an explicit gap.
+
+The 877-production-input manifest is
+`9a2e7fd287229d965fdc97300745349da857b686ea611afdbb19f050c487bf9e`;
+`no-output-build-final/` under the evidence directory above retains inputs,
+patches, the matching Windows mirrors, UMD and seven static archives, imports,
+exports and check/release logs. Linux engine and Windows builds pass; A1 is clean
+including 213 KMD logic tests. Shader interface revision3 invalidates dirty-build
+caches for the effective sample-count specialization (revision2 previously fixed
+AS5 immediate-buffer cache invalidation).
+
+Eight native tiled cases pass on this UMD: 53 format checks; buffer/2D tiling
+including ten mip readbacks; buffer map/null/skip/reuse/alias and mapping-copy
+operations; 2D CopyTiles and predication at byte offsets65536/32/1; and color4
+CopyTiles with independent resolve. These are bounded tests, not validation of
+the committed fallback's deliberately absent mapping/alias semantics.
+The initial depth-array probe was invalid because its mips were smaller than a
+tile. After correcting its dimensions, all98,304 sample words matched, but the
+native debug layer correctly rejected uninitialized RT/DS destination metadata.
+The clear variant first exited1 while process teardown and output-pipe draining
+stalled (PID6320). That run remains failed/unresolved stability evidence, not
+GPU acceptance. The authorized guest reboot completed at00:38:33 IST; QEMU and
+its launcher were not restarted. The same2AD1/ICD/UMD11 identities and Code0
+survived reboot. Native inventory PID9108 again admits through FL12_1 on LUID
+`00000000:00007823` (`native-20260909-004315-602-46f01df8100b459eb19b111ee87137db/`).
+
+The streamed repetition now passes the initialized D32 array case:98,304 exact
+sample words, both CopyTiles directions, independent producer/consumer, raw tile
+layout, special values and no debug errors. Five further cases pass: buffer
+unmap/lifetime/churn, mapping-signal, a held-wait/remap with independent old/new
+GPU witnesses, and two native invalid-input rejections. Those negative cases
+prove runtime rejection; DDI delivery is unproven. The complete six-case receipt
+is `native-depth-streamed-2ad1/run-20260909-004446-397-0e8a1987/`.
+`native-tile-validation-2ad1.json` verifies archived evidence hashes and retains
+failed/unrun earlier cases. Fourteen distinct tiled cases plus the separate
+no-output case now have bounded native passes. Sparse compatibility mapping/
+alias semantics, depth predication and all-format conformance are not thereby
+validated.
+
+The tiled runner now streams both output pipes into files during execution,
+bounds final draining, freezes partial failure evidence before archiving, and
+requires confirmed process termination for acceptance.33 synthetic archive
+cases (including an open pipe and a failed read) and17 provenance cases pass.
+This repairs the capture hang, not the cause of PID6320's driver teardown.
+
+A dedicated native entry point reuses vkd3d's ROV and conservative-raster tests.
+It pins the Helios adapter, checks the loaded UMD's full hash before GPU work,
+requires the system runtime and interactive session, and never enables
+experimental shader models. DXBC/DXIL ROV each pass798 assertions; conservative
+rasterization each passes27 (1,650 total, zero failure/skip/todo/bug). The loader
+trace loses zero events/buffers. Its D3D12 messages are four shader-cache registry
+`0x80070002` diagnostics and two expected unbound-RT output warnings. Exact test
+inputs (94 compiler dependencies), binaries and native receipts are in
+`native-features-build/`, `features-20260909-010026-899/` and
+`native-features-trace-20260909-010025-786/`. This does not validate every
+inherited shader, format or raster limit.
+
+The first remaining native inherited boundary is now demonstrated TIR with
+attachments. `tir-20260909-010542-243/`, PID2356, creates ordinary/forced1
+single-sample PSOs, but legal forced4/8/16→single-sample and forced1→MSAA4 PSOs
+fail. The engine returns E_NOTIMPL; the runtime records a bad UMD error and
+returns DEVICE_REMOVED (`0x887a0005`). This is a six-check conformance diagnostic
+with four failures, not a passed negative test. NVIDIA610.57.04 exposes
+`VK_NV_framebuffer_mixed_samples`; the current Venus encoder has no such
+extension or mixed-sample coverage chain. The selected NVIDIA device does not
+expose `VK_EXT_multisampled_render_to_single_sampled`; its presence on host
+llvmpipe is irrelevant to Helios. The stock-renderer boundary is unchanged. Full TIR coverage/output/sample-mask/blending/occlusion needs
+an implementation before claiming complete FL12_0/12_1 conformance.
+
+The owner stopped other GPU work before these completed2AD1 controls, so they
+are current performance observations. All selected workloads have status0;
+stock definitions, actual settings, exported XML, result archives and exact
+loaded native identities are verified in `controls/2ad1-*-validation.json`.
+
+| Completed stock control | Scores | Measured FPS |
+|---|---|---|
+| Time Spy | overall19,410; graphics20,832; CPU13,999 | GT1 138.871033; GT2 117.138313 |
+| Fire Strike | overall35,089; graphics57,616; physics40,676; combined8,479 | GT1 249.901779; GT2 251.116684; combined39.441200 |
+| Steel Nomad **Vulkan** | 9,075 | 90.756996 |
+
+Time Spy's preceding6F29 stock run was19,122 overall /20,656 graphics,
+GT1=136.699768 and GT2=116.869568FPS. Completed workload settings match except
+for the reboot's adapter LUID; driver environment is identical. Observed GT1
++1.59% /GT2 +0.23% is not isolated attribution to a compiler or sampling change:
+the shader-cache revision and guest epoch differ. Earlier shared-GPU runs are
+not performance comparison baselines for these controls.
+
+Viewed host-VNC pairs show changing Time Spy GT2 and Steel Nomad Vulkan test
+scenes. The full Fire Strike run has only a viewed demo frame; a separate
+completed GT1 control supplies changing graphics-test frames at frame830/time3.23
+and frame4679/time19.00. It runs identical GT1 settings and measures250.660751FPS;
+its deliberately incomplete full-score fields are not a new full benchmark
+score. `controls/viewed-frames-2ad1.json` keeps the attribution separate. No
+paintcap/focus-taking observer, ETW or performance trace ran during benchmarks;
+the read-only module observer samples every3 seconds. Owner visual acceptance
+is still pending and the accepted .266 shadows/about100FPS remain separate.
+
+The fresh native DXR probe PID4252 successfully creates FL12_1 on exact2AD1/BF02,
+then exits BLOCKED77 with `RaytracingTier=0` before any RT command. Its rebuilt
+probe/shader, inputs and receipt are under `native-dxr-2ad1/`. Port Royal is not
+ready or completed. Full inherited/format behavior, mixed-sample TIR, the sparse
+exception, DXR contracts and existing sharing/retirement/lifetime limits remain
+separate acceptance work.
+
+Final reconciliation is in `final-2ad1-{source,guest,host}.json`. All877 current
+production inputs still match the frozen build manifest; the root remains
+master atdcdb8b38 and no dependency HEAD moved. The final guest is Code0 with
+explicit DWORD UmdD3D12=1, the same ProgramData UMD/ICD paths and loaded DWM
+identities, no active graphical test process, and a viewed normal desktop.
+The engine test-build option was restored to `enable_tests=false`. QEMU and
+the upstream renderer retain the recorded loaded identities. No new work was
+committed or pushed, and hosted CI/package validation remains unverified.
+
+
+### Preceding raw-copy baseline, 2026-09-08
+
+The owner restarted QEMU after installing upstream system virglrenderer
+`cf6c62da`. The new server/library are loaded, and the deployed guest Mesa
+`BF0219279E958E18BD76170FE8D2BB1AB3937BCB5ED98B5EDF2B2C2312966767` now exposes
+maintenance8. The normal launcher suffices; the isolated wrapper is unnecessary.
+No host Mesa update is needed on the NVIDIA Vulkan path. See
+[D32_COPY.md](docs/dx12/D32_COPY.md) for exact host/guest identities.
+
+Current release UMD12 is
+`6F29859B2585912A241800628E2C66CA59E8079494661B3FFC707B3931ED96B5`, hotplugged
+with Code0 on unchanged .270/oem53.inf/WDDM2.1 and UMD11. It includes raw D32
+MSAA transfers and the subsequent native immediate-buffer compiler repair.
+The runtime converts DXBC ICB words into float arrays in DXIL address space5;
+SPIR-V float constant handling quieted signaling NaNs before the depth copy.
+The engine now stores these words as integers, preserves pointer aliases and
+bitcasts float users, and implements mandatory zero OOB reads. It adds no GPU
+wait or CPU readback. The 877-input source manifest is
+`64fc0a76321b336425a3b6c21b72a6b93da60e3c935dc15339ef488169afb38c`.
+
+On native Windows, both committed raw-copy controls and the ICB compute control
+pass all 1,536 words, including special bits, four samples and two array layers.
+These committed-resource controls do not exercise CopyTiles or bypass tiled0.
+Native IA12/48-word/12-query/lifetime, root12/48-word, SO34 and all four ordering
+cases also pass. Loader traces lose no events; exact system runtime/UMD/ICD
+identities are archived. Ten compiler pointer/indexing fixtures validate, and
+44 existing shaders produce unchanged output with the same DXC. A1, including
+213 KMD logic tests, Linux engine and Windows check/release builds pass.
+Evidence is under `tmp/fl12-maintenance8-native-20260908/`.
+
+Native admission remains FL11_0/tiled0/RT0. Full tiled/inherited/format/ROV/
+conservative/DXR acceptance remains open, separately from the authorized sparse
+compatibility exception. Port Royal has not run on these artifacts. The owner
+has stopped other GPU workloads, so new completed controls can establish
+performance; earlier shared-GPU results remain unsuitable comparisons.
+
+The owner now authorizes reserved-resource committed backing as an explicit
+compatibility exception. [SPARSE_COMPATIBILITY.md](docs/dx12/SPARSE_COMPATIBILITY.md)
+records its ignored mappings/aliases and full-allocation cost. Color4 backing is
+selected from an identity-bound GPU behavior probe, with no driver allowlist;
+unknown/stale/failed results select compatibility backing. This restores progress
+past the stock sparse-MSAA failure without claiming that the host defect or the
+full tiled contract is fixed. Native caps remain FL11_0/tiled0/RT0. The current
+implementation/build/diagnostic work is under `tmp/fl12-sparse-compat-20260908/`;
+the following 22D1 and 8C747 records describe distinct, older artifacts.
+
+The preceding deployed UMD12 was
+`BE9D0EBE5F3A021848429A8ED0F641CC908BB1809DF8EC9F3192B1BD44F343A6`,
+adding GPU-predicated single-sample CopyTiles for buffers, color, BC and raw
+depth images. One allocator-owned 64-KB scratch tile preserves byte offsets,
+edge padding and false-predicate destinations; internal compute does not enter
+application query counts. Source/build/deploy records and the 876-input manifest
+`2d1989ae0f260231c5c88aeef0ade441f84f44794e4799cfbed32383148c00b0`
+are in `tmp/fl12-predicated-tiles-20260908/`. Host tile regressions pass 12,151
+assertions with no skips/failures or Vulkan validation errors. Mechanical checks
+and Windows release builds pass. See
+[SPARSE_COMPATIBILITY.md](docs/dx12/SPARSE_COMPATIBILITY.md#predicated-single-sample-copytiles).
+
+Code0, .270/oem53.inf/WDDM2.1, UMD11 and ICD are unchanged; the native adapter
+LUID is `00000000:0711b78c`. Native BE9D IA12/48-word/12-query/lifetime and four
+ordering cases pass with exact loaded identities; the loader trace loses no
+events. The predicated tiled probe is built but BLOCKED77 at tiled0, before GPU
+tile commands. FL11_0/tiled0/RT0 remain the admitted surface. Raw D32 MSAA copies,
+full formats/inherited/ROV/conservative/DXR validation and the documented sparse
+compatibility exception still prevent complete FL12_0/12_1 and Port Royal
+acceptance. No commit, push, KMD or launcher change occurred.
+
+All three BE9D stock controls completed in Session1 with matching workload
+settings, loaded artifact identities, agreeing archives/exports and changing
+host-VNC rendered frames. The graded receipt is
+`tmp/fl12-predicated-tiles-20260908/benchmark-controls-be9d.json`.
+
+| Control | Prior 9BDA FPS | BE9D FPS | BE9D score |
+|---|---|---|---|
+| Time Spy | GT1 132.444885 / GT2 115.121292 | GT1 134.943024 / GT2 95.854523 | overall 16,344 / graphics 18,374 |
+| Fire Strike | GT1 242.445877 / GT2 254.851700 / combined 44.970276 | GT1 167.547668 / GT2 196.592453 / combined 45.349815 | overall 31,238 / graphics 41,609 |
+| Steel Nomad Vulkan | 88.768120 | 90.496490 | 9,049 |
+
+Those shared-GPU runs do not establish performance regressions: Time Spy GT2
+is down16.74% and Fire Strike
+GT1/GT2 down30.89%/22.86%; causes are not established. Time Spy CPU FPS also
+drops from45.704536 to33.772419. DX11 UMD/ICD/KMD are unchanged. A ten-sample
+host GPU observer during the later Vulkan control finds two unrelated Python
+workers resident in57,056 MiB; their utilization fields are unavailable/dash,
+so neither concurrent execution nor its effect on earlier controls is proven.
+No unrelated process was changed. Sampled benchmark frames need owner visual
+acceptance, and these controls do not exercise native tiled or RT commands.
+The owner confirmed concurrent GPU use for those runs. Their completion and
+rendered frames remain correctness evidence; their FPS/scores cannot attribute
+a performance change. The owner subsequently stopped the other GPU workloads,
+as recorded above.
+
+The BE9D final guest state was Code0 with no remaining benchmark/probe processes.
+`final-guest-state.json` verifies ProgramData BE9D, unchanged UMD11/ICD/KMD and
+the older packaged UMD12 ADC0B0EA in DriverStore. The hotplug script's warning
+that DriverStore has no DX12 UMD is stale; this deployment still does not prove
+cold-boot or rebuilt-package acceptance. Hosted CI for the dirty candidate is
+unverified. The D32 investigation and implementation have advanced as recorded
+above. Renderer activation and the guest updates are now complete. Native
+format/inherited/ROV/conservative/DXR checks remain necessary before increasing
+admission.
+
+The preceding IA continuation build is
+`361C9767AC9B772D5F9CEAE998E68D2669AF7DFA46E999F63471DD17170129F4`,
+hotplugged with Code0 on unchanged .270/oem53.inf/WDDM2.1, UMD11 and ICD.
+Its 875-input production manifest is
+`835042eda2b114d0954ad40ca32a1090a002de0846874c387cb2479e258f3c8d`;
+source, build, deployment and native receipts are in
+`tmp/fl12-indirect-ia-20260908/`. Its native adapter LUID was
+`00000000:06d904c0`. Caps remain FL11_0/tiled0/RT0.
+
+VBV/IBV ExecuteIndirect now uses an isolated, execution-time CPU continuation
+when native DGC is absent. Root-only signatures retain GPU processing. Each ECL
+owns staging and a private recorder, waits only its exact prefix outside the
+Vulkan queue lock, and completes HE12 after generated work and the suffix.
+Native Session1 PID9632 passes 12 GPU-producer/replay cases, 48 words, 12 query
+results, false predication and pending public-list Reset behind another queue's
+dependency. The first readback failure was a probe SV_VertexID assumption:
+an ordinary indexed-draw control failed identically and passed after correcting
+the triangle. No production change was needed for that failure. Host IA/query
+tests and A1/Windows release checks also pass. See
+[INDIRECT_EMULATION.md](docs/dx12/INDIRECT_EMULATION.md#ia-continuation-implementation-and-validation).
+
+This is bounded IA acceptance, not complete feature-level or DXR admission.
+Two existing pending-allocator Reset diagnostics occurred after native fence
+completion; the allocator/fence-worker retirement question remains open.
+Broader IA topology, inherited descriptor state and asynchronous failure paths
+still need native validation. No IA performance comparison or benchmark result
+has yet been collected on 361C; the completed controls below belong to 9BDA.
+That artifact still refused predicated single-sample CopyTiles, now implemented
+in BE9D. Raw D32 MSAA copies remain a concrete implementation gap, alongside the
+documented sparse compatibility exception and remaining format/inherited/ROV/
+conservative/DXR obligations.
+
+The preceding combined build was
+`9BDA548C4577008F237978A1658D53005227B0C0E3E0F0EF3DBA02E60BE401A6`, hotplugged
+with Code0 on unchanged .270/oem53.inf/WDDM2.1, UMD11 and ICD. Its 874-input
+production manifest is
+`0223d596610fe81c050d285b773ac08eae6b954d21595c3cc4fac99ce7dadad8`.
+Host tests pass for compatibility mappings, color/D16 sample copies, tile/queue
+regressions and cache parsing. Raw D32 MSAA copies explicitly refuse after
+special-value bit loss. All seven color4 sparse Vulkan probes fail on both host
+and guest while committed controls pass. Native 9BDA root12/48-word,
+indirect12/48-word, SO34 and four ordering cases pass with loaded identities;
+tiled commands remain BLOCKED77. Adapter restart changes the LUID to
+`00000000:06376d04`; native initialization rejects the old cache and reads the
+seven FAIL records after re-probing. This establishes cache consumption, not
+native tiled conformance. See SPARSE_COMPATIBILITY.md for receipts and remaining
+failure/lifetime/format limits. No commit, push, KMD or launcher change occurred.
+
+All three 9BDA controls completed through interactive scheduled tasks with exact
+loaded identities, stock settings and archived/exported results. Comparison:
+`tmp/fl12-sparse-compat-20260908/benchmark-controls-9bda.json`.
+
+| Control | Prior 22D1 FPS | 9BDA FPS | 9BDA score |
+|---|---|---|---|
+| Time Spy | GT1 136.182602 / GT2 116.635201 | GT1 132.444885 / GT2 115.121292 | overall 18,824 / graphics 20,192 |
+| Fire Strike | GT1 246.294510 / GT2 249.597260 / combined 41.122017 | GT1 242.445877 / GT2 254.851700 / combined 44.970276 | overall 36,557 / graphics 57,153 |
+| Steel Nomad Vulkan | 90.797775 | 88.768120 | 8,876 |
+
+Changing host-VNC frames cover Time Spy demo, Fire Strike demo and the Steel
+Nomad Vulkan graphics test. The first Steel Nomad run also completed (88.469772
+FPS, score8,846), but its captures missed rendered frames; that result is
+preserved and the control was repeated once for timed capture. No owner visual
+acceptance or causal performance gain is established. Time Spy GT1/GT2 are
+2.74%/1.30% lower and the unchanged Vulkan control is 2.24% lower; Fire Strike
+varies in both directions despite unchanged UMD11/ICD. These are single
+comparisons, with different VNC sampling. The existing allocator-reset/fence-worker
+question remains open. Final inspection records Code0, exact configured9BDA,
+unchanged DWM UMD11/ICD, a visible desktop and no active probe/benchmark; the
+host capture loop completed. Full receipts are in
+`tmp/fl12-sparse-compat-20260908/evidence.json`.
+
+Root signatures now preserve the parsed DDI's range/root/static-sampler flags
+through a private versioned engine factory. The driver path accepts 128-DWORD
+roots while the public API remains limited to 64; masks, ordinary uploads and
+indirect layouts cover the full driver range. ClearRootArguments zeros only
+root arguments and preserves other command-list state and bundle inheritance.
+The contract, source/build provenance and test limits are in
+[ROOT_SIGNATURES.md](docs/dx12/ROOT_SIGNATURES.md). Root-only candidate 6125
+passes native root 12/48-word, indirect 12/48-word, SO 34 and four ordering cases.
+Host tests cover the private 128-DWORD path; native runtime-added roots beyond 64
+and native sampler 1.2/OOM injection remain unexercised.
+
+A further CopyTiles regression exposed an invalid 64-KB buffer-offset refusal
+in the UMD and engine. Buffer offsets are byte offsets. The repair preserves
+aligned direct copies and uses one allocator-owned 64-KB tile for Vulkan-unaligned
+image copies, including transfer barriers and edge-row preservation. The original
+364-assertion host test and 27 new format/offset cases pass; the combined latest
+run has 936 assertions, no failures or skips. The native tiled probe now includes
+64-KB, 32-byte and 1-byte offsets, but tiled 0 still blocks native execution. The
+deployed build refuses MSAA CopyTiles; the subsequent candidate below does not
+yet satisfy tier 2.
+
+The prior root/byte-offset UMD12 build was
+`22D1323318320016F19CA9BBD38605AB51E6A724FEAE730BFD1C01FFFA8182C1`,
+hotplugged as `C:\ProgramData\HeliosUmd\helios_umd12_22d1323318320016.dll`.
+Windows engine/UMD12 check+release, native probe compilation and A1 checks pass.
+Source/build and deployment receipts are in `tmp/fl12-root-contract-20260908/`;
+the 863-input production manifest is
+`0b19b6a28faee04002944708518ab9bbd029c2185735b1aac96763178ba8726f`.
+The KMD remains 22.22.270.0/oem53.inf, Code 0, WDDM 2.1; UMD11 and ICD are unchanged.
+DriverStore UMD12 remains ADC0B0EA; this is a ProgramData override. Native 22D1
+root and indirect suites each pass 12 cases/48 words; SO passes 34 cases and
+the four ordering cases each verify 65,536 words. The verified receipt is
+`tmp/fl12-root-contract-20260908/native-validation-22d1.json`; both ordering
+processes have ETW-confirmed system-runtime/UMD/ICD identities. That deployment
+used Helios LUID `00000000:05296ca9`. The expanded native CopyTiles case returns
+BLOCKED77 at tiled tier 0, without executing tile copies. Benchmark controls
+complete on this build; no new work has been committed or pushed.
+
+All three stock controls completed through interactive scheduled tasks, with
+archived/exported results, matching settings and loaded artifact identities.
+The exact comparison is `tmp/fl12-root-contract-20260908/benchmark-controls-22d1.json`.
+
+| Control | Previous CB48 FPS | Prior 22D1 FPS | 22D1 score |
+|---|---|---|---|
+| Time Spy | GT1 133.570267 / GT2 116.756340 | GT1 136.182602 / GT2 116.635201 | overall 19,073 / graphics 20,598 |
+| Fire Strike | GT1 245.357132 / GT2 247.547211 / combined 44.061520 | GT1 246.294510 / GT2 249.597260 / combined 41.122017 | overall 35,391 / graphics 57,025 |
+| Steel Nomad Vulkan | 91.006409 | 90.797775 | 9,079 |
+
+The VNC pairs show changing Time Spy **demo**, Fire Strike GT2 and Steel Nomad
+Vulkan graphics frames. They do not establish owner visual acceptance. These
+single completed comparisons establish no causal performance gain; Fire Strike's
+combined FPS is 6.67% lower despite unchanged UMD11/ICD, with the cause unresolved.
+The owner's accepted .266 Time Spy shadows/about 100 FPS and the instrumented
+74.26 FPS run remain separate evidence.
+
+The final native inventory, PID2216/session1, loads exact 22D1 with system
+D3D12/Core and the expected ICD, on LUID `00000000:05296ca9`. FL11_0 creation
+succeeds; FL11_1/12_0/12_1/12_2 return `0x887a0004`. Maximum FL11_0, tiled 0,
+RT0, SM6.0 and root-signature API 1.1 remain unchanged. Evidence is
+`tmp/fl12-audit-20260907/native-20260908-022139-573-fa8349c66b514cfaae86a840f4217472/`.
+This inventory does not establish full FL11_0 conformance.
+`tmp/fl12-root-contract-20260908/validated-checkpoint-22d1.json` links all current
+receipts. Final guest inspection confirms Code 0, the unchanged DriverStore UMD12,
+the intended configured UMD12, loaded DWM UMD11/ICD and a visible desktop. No probe
+or benchmark remains running; all host capture loops completed. The 863 production
+input hashes matched that deployed checkpoint. The following failed 8C747
+checkpoint was never deployed; the subsequent compatibility build is described above.
+
+The archived 8C747 candidate implements isolated per-sample MSAA CopyTiles shaders, raw
+color views, depth attachment writes, byte offsets and GPU predication, plus
+mandatory compute/graphics queue continuations with error propagation and retained
+allocator ownership. It removes the committed-resource substitution for an
+unsupported reserved format. Single-sample predicated CopyTiles and unvirtualized
+scoped queries now refuse explicitly; those contracts remain unfinished.
+Ordinary depth copies also use the required graphics continuation when Vulkan
+cannot execute them on compute/transfer queues. See
+[FEATURE_LEVELS.md](docs/dx12/FEATURE_LEVELS.md#msaa-candidate-and-stock-host-boundary)
+and [EXECUTION_SYNC.md](docs/dx12/EXECUTION_SYNC.md#required-queue-continuations).
+
+**A stock-host blocker is now demonstrated.** The prior global sparse-MSAA
+inventory was insufficient: NVIDIA 610.57.04 and the loaded Venus ICD both return
+zero sparse format properties for four-sample D16/D32, with transfer-only and
+depth-attachment usages. A standalone Vulkan color control additionally passes
+single-sample readback but loses half a four-sample tile; an array-edge sparse
+bind returns device lost. Explicit core/synchronization validation reports zero
+errors in these reproductions. The color failures occur without vkd3d, Helios,
+Venus, storage usage or the new shaders. Evidence is under
+`tmp/fl12-msaa-20260908/`; the guest query is interactive, records the exact loaded
+`3349607B…` ICD, and does not execute D3D12 commands.
+
+The final undeployed UMD12 SHA256 is
+`8C7471DA959FF699FA11B7804580B3101D1DB271D0B0F0BC09E1686568592C0D`.
+Linux engine and Windows engine/release UMD builds pass; all 872 production
+inputs match the Windows mirrors (manifest `c9906620…`). The final host copy-queue
+suite passes 6,291,594 assertions, single-sample CopyTiles936, indirect138/1570
+and query continuation140, with zero Vulkan validation errors. A1 passes,
+including213 KMD logic tests. The MSAA suite instead completes with189 readback
+failures and18 required-depth-format skips; it is a failed acceptance run.
+`tmp/fl12-msaa-20260908/evidence.json` records exact source/build hashes and
+validation attribution. That pre-compatibility guest inspection found configured22D1, unchanged
+loaded DWM UMD11/ICD, Code0 and a visible VNC desktop. No benchmark, performance
+measurement or owner visual acceptance belongs to the new candidate.
+
+The failed 8C747 candidate was not deployed. The compatibility implementation
+supersedes its strict refusal policy, while the independent IA VBV/IBV work,
+remaining sample/predication cases and native validation still prevent a
+capability increase. A corrected stock host can be rechecked with the dynamic
+probe to restore sparse backing; current work does not depend on a driver-name
+exception. No host driver, renderer or VM-launcher change has been made.
+
+Initial native inventory on .270/oem53.inf, Code 0, explicit `UmdD3D12=1` loads the
+packaged UMD12 (`ADC0B0EA…`) with Microsoft D3D12/D3D12Core 10.0.26100.8972 and
+Venus ICD `3349607B…`. FL11_0 creation succeeds; FL11_1/12_0/12_1/12_2 return
+`DXGI_ERROR_UNSUPPORTED`. The runtime advertises understanding FL12_2 and
+negotiates R8_0110 with Helios. This is admission evidence, not full FL11_0
+conformance. Source and guest artifacts are distinct; the separately built
+default-change DLL (`21339235…`) is not the installed DLL.
+
+The first confirmed stock-stack boundary for the current engine's state-changing
+ExecuteIndirect path is `VK_EXT_device_generated_commands`: present on the host,
+absent from the loaded Venus ICD and the stock renderer protocol. This is an engine
+dependency, not a Vulkan extension mandated by a D3D feature level. FL12_0 still
+inherits this mandatory D3D12 behavior; lowering the target does not remove the
+boundary. Ordinary indirect draws and
+dispatches already have non-DGC paths. The upstream/history audit found a separate
+compute root-parameter fallback, removed in `76c11d2e` on 2026-04-08 and still absent
+at fetched upstream `35bdee1435c94f8c3548725fcb046595b263bd7e` on 2026-09-07.
+That historical implementation did not cover graphics VBV/IBV/root changes.
+The owner authorized an isolated, removable engine fallback using available
+extensions, with native EXT DGC preferred automatically when present. Its
+contract is [`INDIRECT_EMULATION.md`](docs/dx12/INDIRECT_EMULATION.md).
+Owned root/PSO creation inputs, lazy shader-layout variants, GPU argument
+patching and root-state execution now build on Linux. Native signature creation
+translates constants and root CBV/SRV/UAV changes into this engine path.
+The old non-DGC silent skip is not an accepted fallback. The detailed source receipt and
+application-fallback distinction are in `docs/dx12/FEATURE_LEVELS.md`.
+Keep unsupported IA/optional-tier refusals and the FL11_0 ceiling. Sparse binding and the RT feature
+chain reach the guest, including recursion31, but engine/native correctness must
+still be established. Remaining inherited obligations include complete stream-output limits and
+native runtime instrumentation of expanded root signatures. FL12_0 still needs
+complete tiled tier 2, format/MSAA, binding, typed-UAV and inherited behavior.
+FL12_1 additionally requires ROV and conservative-raster behavior. Native
+admission remains FL11_0 until each higher contract is backed and validated.
+
+The fallback has host tests passing for root descriptors (33 assertions), partial
+constants/state clearing (25), graphics/compute predication (1,570), indexed draw
+offsets (26) and query continuation (140), with DGC and descriptor-buffer
+extensions disabled. The latter four enabled Vulkan validation. Independent
+review then repaired raw-CBV visibility, predicated internal reductions, query
+address arithmetic and failure propagation through Close/Reset. A new
+GPU-producer test caught indirect hoisting across combined read states. Its
+expanded 138 assertions now pass with Vulkan validation, covering COMMON
+promotion and buffer aliasing as well as replay, counts, predicates and
+root-constant clearing. The earlier NULL-CBV clearing oracle was invalid and
+removed; the corrected test rebinds a valid CBV before drawing. The repaired
+query continuation passes 140. A host
+DGC comparison instead refuses the root-CBV signature under NVIDIA's existing
+push-descriptor policy; this is a separate recorded native-DGC boundary. The
+multiview statistics test has 194 failures in 605 assertions, an explicit engine
+gap outside native ViewInstancingNONE and FL12_0. The first 73-file whole-change
+review was not dry: repairs cover AS HRESULT propagation, signature OOM
+diagnostics, the tiled probe's loss-sentinel check and the invalid test oracle.
+The host AS recording-failure test passes ten assertions; allocation/device
+loss fault injection remains unexercised. The next 76-file whole-change round
+was also not dry: it found allocating diagnostics before native Close/Reset
+could deliver OOM, and a legal public SO semantic colliding with the private
+DDI register marker. Repairs defer OOM diagnostics and carry explicit per-PSO
+DDI origin through a private engine factory, owned compiler metadata and cache
+keys. Public legacy/stream SO creation plus cached recreation each pass 36 host
+assertions; private physical capture passes 34, ordinary DXBC user capture 33,
+and the indirect GPU-producer regression 138, all with Vulkan validation.
+Fresh Windows engine and both-UMD check/release builds pass after the repairs.
+The third round covered all 79 files and was not dry: it found the private SO
+factory's unguarded exception boundary and the DXR harness's unbounded wait
+after requesting child termination. The bridge now uses the shared guard with
+an explicit throwing C declaration, preserves E_OUTOFMEMORY without allocating
+diagnostics, and leaves failed outputs clear. Eight synthetic cases exercise
+the actual extracted wrapper under clang-cl /EHsc. This contains escaping
+exceptions; compiler-wide OOM cleanup and safe retry remain unestablished.
+The DXR wrapper now bounds termination/output waits and archives failure even
+when the child may remain running. The native indirect probe builds; 17
+provenance and 30 archive/timeout synthetic cases pass. The full host SO filter
+passes 9,316 assertions with Vulkan validation. Both-UMD Windows check/release
+and A1 pass after these repairs; A1 uses the task's dcdb8b38 starting commit.
+The fourth round read all 81 files and found scratch-allocation HRESULTs
+collapsing to boolean failure: NULL-SO backing OOM became E_INVALIDARG, while
+other new recording paths assumed every Vulkan failure was OOM. The allocator
+now preserves its HRESULT for these paths, retaining the existing boolean API
+for unrelated callers. Definite AS reserve/calloc failures also retain OOM;
+native RT admission still withholds those paths. Focused host regressions pass
+138/1,570/140/10 assertions and the full SO filter passes 9,316 with validation.
+An extracted-helper test with ASan/UBSan passes synthetic error propagation,
+first-error preservation and scratch reuse checks; it is not native fault
+injection. Linux engine and Windows engine/UMD12 check/release builds pass.
+The fifth round also read all 81 files and found an unguarded lazy pipeline
+compilation inside the new source mutex. A private C++ callback guard now
+returns allocation/other exceptions as HRESULTs within that ownership scope;
+temporary-root release and mutex unlock still run, and only success publishes
+the variant. Twelve synthetic graphics/compute cases and two cached lookups
+pass on Linux and Windows using the actual factory extraction and Windows
+mutex operations. Compiler-wide allocation cleanup/safe retry remains open.
+Linux engine, Windows engine/both UMD builds and the 138/1,570/140 focused GPU
+regressions pass after this repair. The sixth round read all 83 files, closed
+the local factory guard and found allocating native diagnostics after the void
+ExecuteIndirect call. Under sustained OOM those diagnostics could abort before
+Close delivered the latched error. Forwarding now bumps its existing atomic
+counter without a per-call trace or first-hit summary. The counter remains
+readable through the device summary and counts recording calls, not completed
+GPU actions. Sibling recording handlers have no equivalent post-call allocation.
+A1 and both-UMD Windows check/release pass after this repair. The candidate is
+UMD12 `CB48D9DB…`; the earlier `1400C52F…` archive predates it. This is a local
+return-path repair, not proof of general sustained-OOM tolerance or fault injection.
+Whole-change rounds IR7 and IR8 are consecutive dry rounds with different lens
+compositions over the same 83-file freeze. Every reviewer covered the complete
+diff, peer-refuted hypotheses and reverified the source/build receipts. The
+manifest is `f81f76e3…`, in `source-freeze-indirect-round7/`; review dispositions
+are `reviews/indirect-round7.json` and `indirect-round8.json` under the audit
+directory. Subsequent evidence documentation does not change those driver bytes.
+
+UMD12 `CB48D9DB…` was hotplugged from
+`fl12-build-20260907-214407-218/`, with unchanged UMD11 `245D1BC3…`, ICD
+`3349607B…` and KMD .270/oem53.inf. PnP restart succeeded, Code 0 and the desktop
+returned, and the new adapter LUID is `042a5ac7`. No guest reboot or launcher
+change was needed. This is a ProgramData override; DriverStore still contains
+UMD12 `ADC0B0EA…`, so it is not a signed-package upgrade.
+
+On the exact loaded candidate and Microsoft system runtime, the interactive
+native indirect probe passes all 12 cases/48 readback words: GPU-produced root
+constants/CBVs, three producer-barrier routes and four closed-list executions
+with counts 3/1/0/7. It records one variant, three patch recordings, nine maximum
+action slots and 4,176 scratch payload bytes; those counters are not executed
+action counts. The 34-case SO regression and all four native ordering cases
+also pass, including 65,536-word producer/consumer readbacks and negative wait
+intervals. Zero-loss loader ETW identifies both ordering processes. Receipts are
+`native-cb48-root-validation.json` and
+`native-sync-cb48d9db/root-validation.json`. Native compute/indexed/SRV/UAV
+indirect forms, real OOM injection and broader lifetime/failure acceptance remain
+unexercised. Caps still report FL11_0/tiled 0/RT0/ViewInstancingNONE; full FL12_0
+and owner visual acceptance are not established.
+A fresh completed Time Spy baseline on the installed `6344CB09…` build scored
+18,907 (GT1 136.838531 FPS, GT2 112.928223 FPS), with exported results, native
+module identities and changing rendered stages. This precedes deployment of
+the fallback and establishes no gain over the older nonmatching ~100 FPS run.
+Fresh matching baseline controls also complete: Fire Strike GT1/GT2/combined
+246.812607/249.133408/39.256428 FPS, and Steel Nomad Vulkan 89.869423 FPS.
+All three have exported/archive results, workload module identities and
+changing rendered frames; none establishes owner visual acceptance. The first
+candidate Time Spy attempt (`timespy-after-indirect-cb48d9db`) was cancelled
+after GT1, with no completed score/export. Its result records GT1 status1000
+and CANCEL because the workload reported windowed mode despite fullscreen
+settings. VNC captures show a persistent Start menu overlay; who opened it
+and what caused the mode transition are unproven. The invalid partial result
+is excluded from performance comparisons.
+The fullscreen retry completed with matching settings and all four workload
+statuses0: score19,036, GT1 133.570267 FPS and GT2 116.756340 FPS. This is -2.39%
+and +3.39% respectively against the preceding6344 baseline, with total score
++0.68%; no consistent gain is established. Exact loaded identities, export and
+changing unobstructed scored GT1 frames are graded in
+`controls/timespy-after-indirect-cb48d9db-fullscreen/root-validation.json`.
+The matching Fire Strike control completes at GT1/GT2/combined
+245.357132/247.547211/44.061520 FPS. Its graphics tests change by less than 1%;
+the combined-test increase is on the unchanged DX11 UMD. Steel Nomad Vulkan
+completes at 91.006409 FPS (+1.27%), with exact ICD identity, exported results
+and changing scored frames. All three comparisons and excluded attempts are
+recorded in `controls/indirect-cb48-comparison.json`; they establish no fallback
+speedup. Owner visual acceptance remains pending. An optional native direct/indirect
+measurement mode is under review; it separates QPC recording costs from
+same-queue GPU timestamp deltas and grades every pixel. No measurement from it
+is claimed yet.
+Fixed-function indirect
+VBV/IBV execution remains unimplemented; see INDIRECT_EMULATION.md for exact
+implemented/refused/unreachable/unexercised behavior and diagnostic grading.
+
+In-progress source implements admitted sparse mappings with heap retirement,
+reserved creation/tiling/copies, native DXR state/AS/dispatch translation and SO
+translation/compiler work. The earlier reviewed `6344CB09…` UMD supplied the
+baseline evidence below and is now superseded by `CB48D9DB…`. Acceptance remains
+bounded. Exact
+unsupported forms, mechanical results and review/validation status belong in the
+live feature contract, never inferred from slot coverage or an engine cap dump.
+The engine build and latest both-UMD Windows check/release passed
+(`6344CB09…` UMD12), including SO overflow/counter handling, DXR bundle admission,
+fallible SO-owned array construction and OOM reporting without Rust diagnostic
+allocation in the new reserved/tiled/DXR failure paths. UMD11 and the engine
+archives are unchanged by these Rust repairs. The full host SO suite passes
+9,246 assertions, and the deferred DXR collection suite passes 64, with no
+failures/skips. SO's corrected 34-case native probe now passes on the candidate,
+including authenticated GPU readback. Host engine mapping/remap and sparse-buffer lifetime checks pass
+15,816 and 36 assertions; they do not enter guarded native admission. Review
+rounds 1–5, 7 and 8 were not dry; round 6 was dry. Repairs cover DXR collection/stride
+translation, allocation failure, native probe lifetime, executable/parsed-runner
+attribution and archive publication. Sixteen synthetic archive cases, thirteen
+synthetic provenance cases and the Windows build-lock check pass. All three
+probe builds pass after the latest wrapper repairs, and the
+`fl12-build-20260907-062651-506/` capture binds their receipts and the unchanged
+driver bytes to that earlier reviewed source. The fourth round corrected stale
+validation text. The fifth repaired the shared DXR guard to allow bundle pipeline
+binding and ray dispatch; AS operations remain prohibited in bundles. Two added
+native bundle readback cases build but remain unexercised behind RT_NONE. The
+seventh round repaired SO-owned allocation failure with a named E_OUTOFMEMORY
+callback and a cleared shader handle. Shared shader/Slot allocation still has
+infallible OOM paths, and native allocation-failure injection is unexercised.
+The eighth round extended nonallocating OOM diagnostics to reserved-resource
+creation, tiled mapping and DXR, including their missing-error-channel counters.
+Its closure review also repaired diagnostic allocation before returning a legal
+RenderCb E_OUTOFMEMORY from the shared submission helper to tiled cancellation.
+The original tiled reservation witness occurs before mapping commit and proves
+lost failure propagation, not an orphaned committed mapping. Per-round
+review dispositions live in `tmp/fl12-audit-20260907/reviews/`. Rounds 9 and 10
+were consecutive dry whole-diff rounds with rotated lenses over all 55 files.
+
+UMD12 `6344CB09…` is deployed through the ProgramData hotplug, with unchanged
+UMD11 `245D1BC3…`, KMD .270/oem53, ICD `3349607B…`, explicit `UmdD3D12=1` and
+Code 0. The first native check caught the old cached DriverStore UMD; a successful
+PnP device restart refreshed it without a guest reboot. PID9380 then loaded the
+exact candidate and system runtime. DriverStore UMD12 remains `ADC0B0EA…`;
+this hotplug is not an updated signed package. The current Helios LUID is
+`00000000:022f39b4`. Both async WSI and retire feedback remain enabled.
+
+Native SO PID8440 passes all 34 cases, with 34 authenticated submissions and
+GPU-readback checks, plus the negative SO root-permission case. The first runs
+exposed a probe-oracle error: SV_VertexID excludes StartVertexLocation. Explicit
+VS root-constant draw tags now retain distinct iteration/phase data; the negative
+root has identical parameters and differs only in ALLOW_STREAM_OUTPUT. Two
+independent reviewers closed this probe-only repair; driver bytes are unchanged.
+The exact receipt is `native-so-tagged-6344cb09/run-20260907-092322-874-8c557f35/`
+in the audit directory. Full SO limits and allocation-failure injection remain open.
+
+The existing four native synchronization cases also pass on candidate6344 in
+session1, with both producer and consumer 65,536-word GPU readback patterns and
+the negative unsignaled intervals. The freshly built, unchanged probe is archived
+in `native-sync-6344cb09/`. A zero-loss process/image trace in
+`fl12-sync-loader-6344/` identifies parent PID10136 and shared-fence child PID9192
+loading the exact candidate, system D3D12/Core/DXGI and ICD. No WARP or app-local
+engine substitution is present in their complete traced lifetimes. This is bounded
+ordering regression acceptance at FL11_0; sparse/DXR and broader lifetime/failure
+obligations remain separate.
+
+All 12 tiled cases return BLOCKED77 at TiledResourcesTier0, with exact loaded
+candidate identities. The DXR probe returns BLOCKED77 at native FL12_1 creation;
+its post-call snapshot contains system runtime modules, no admitted UMD/ICD.
+Neither result exercises tiled or ray-tracing commands. Native caps remain
+FL11_0/tiled 0/RT0. DDI ROV1/conservative3 replies become API0/0, consistent with
+Microsoft's published FL11_1+ eligibility requirements; the runtime's internal
+branch is untraced. These results are not full FL12_1 or Port Royal acceptance.
+
+The installed ADC0B0EA stack completed full stock Time Spy at **18,950 overall /
+20,335 graphics / 13,673 CPU**, GT1 **134.903915 FPS**, GT2 **114.811371 FPS**.
+All four workload processes loaded the expected native stack on Helios; the
+archive/export and settings are in
+`tmp/fl12-audit-20260907/controls/timespy-before-adc0b0ea/`. Host VNC captured
+changing demo and GT1 frames; GT2/CPU were not captured. This baseline has no
+owner visual acceptance and establishes neither a candidate result nor a gain.
+The installed stack also completed full stock Fire Strike: **36,284 overall /
+56,972 graphics**, GT1 **245.321411 FPS**, GT2 **250.140366 FPS**. All five native
+DX11 workloads loaded the expected UMD11/ICD and returned status zero. The
+archive/export, 1920x1080 settings, host VNC and corrected capture-stage grading
+are in `controls/firestrike-before-adc0b0ea/` under the same audit directory.
+Owner visual acceptance remains separate; no candidate result is implied.
+Two stock Steel Nomad Vulkan baseline collections also completed (8,934 and
+8,848), but the captures establish at most one rendered frame per run. Their
+results/exports and exact ICD identities are retained under the audit's controls
+directory; changing-frame and owner visual acceptance are not established.
+
+Candidate6344 completed the same full stock controls through interactive tasks:
+
+| Control | Before | Candidate6344 | Evidence |
+|---|---|---|---|
+| Time Spy | 18,950 overall / 20,335 graphics; GT1 134.903915, GT2 114.811371 FPS | 19,111 / 20,418; GT1 136.239441, GT2 114.720390 FPS | All four workloads status0, exact candidate/system runtime/ICD in every process; changing GT2 frames |
+| Fire Strike | 36,284 overall / 56,972 graphics; GT1 245.321411, GT2 250.140366 FPS | 33,605 / 55,791; GT1 243.482605, GT2 241.663803 FPS | All five workloads status0, unchanged native UMD11/ICD; changing demo and GT2 frames |
+| Steel Nomad Vulkan | 8,848 / 88.486877 FPS in the second baseline collection | 8,777 / 87.771965 FPS | Vulkan backend, Helios adapter and exact ICD; changing rendered frames |
+
+Results, exports, settings comparisons and module identities are in the audit's
+`controls/*-after-6344cb09/root-validation.json` records. Benchmark settings and
+the three-second read-only module observer match; the PnP restart changes the
+Helios LUID, result paths/IDs differ, and VNC sampling differs. Fire Strike's
+combined test falls from 43.629429 to 36.958103 FPS in this comparison despite
+unchanged DX11 UMD/ICD bytes. Its cause is unresolved, not an established DX12
+implementation regression or an accepted performance result. No gain or owner
+visual acceptance is claimed. The earlier Steel Nomad captures remain incomplete.
+
+One focused Fire Strike repeat on the unchanged candidate completes at
+35,126 overall / 56,747 graphics, GT1 246.286224 and GT2 247.174545 FPS.
+Combined performance is 40.316246 FPS, still below the 43.629429 baseline.
+All five workloads return status0 and load the same native UMD11/ICD. Candidate
+UMD12 is not observed by the three-second module polling. Settings match, and
+host VNC captures changing combined frames.
+Its result/export and grading are in `controls/firestrike-after-6344cb09-repeat/`.
+The two candidate combined results vary; neither establishes the cause of the
+decrease. Performance acceptance remains unresolved, and no optimization follows
+from this observation.
+
+Port Royal fails both stock workloads at native `D3D12CreateDevice` with
+`DXGI_ERROR_UNSUPPORTED` (0x887a0004). The CLI exits0 and writes a result containing
+workload status10000/zero scores, but produces no export; the wrapper correctly
+returns1. A separate loader-trace repeat in `fl12-pr-loader-6344/` records both
+31–33 ms session1 workload processes loading candidate6344 and Microsoft's system
+D3D12/Core/DXGI. Neither loads the Vulkan ICD or reaches UMD CreateDevice.
+There are zero lost ETW events/buffers, and no WARP/app-local vkd3d module.
+The saved error does not expose the numeric requested minimum feature level.
+This diagnoses native admission failure; it is not a completed Port Royal run.
+
+Postdeployment whole-diff round11 is dry under rotated independent lenses,
+including current SO probe attribution and the comments-only caps correction.
+Its frozen source and 17 counter gradings are recorded alongside the predeployment
+round9/10 saturation. The driver binary remains the round9 build; these probe,
+comment and evidence updates do not constitute a new driver compilation.
+
 ## D3D12 default and Windows CI, 2026-09-07
 
 The owner requested default DX12 admission and a Windows CI bundle containing
@@ -31,8 +1007,12 @@ registry override reach argument validation for absent/one and return
 `DXGI_ERROR_UNSUPPORTED` for zero. The newly compiled native D3D12 device smoke
 passes on the existing enabled guest stack via an interactive scheduled task.
 
-Hosted CI has not run, and this default change has not been deployed. The live
-guest still has explicit `UmdD3D12=1`. Existing performance/visual evidence below
+Hosted run [34055565048](https://github.com/winboat-org/helios/actions/runs/34055565048)
+at the exact root checkpoint completed: KMD/native DX11/DX12 UMD and Mesa jobs
+succeeded; CLVK failed at its build step, so final signing/bundle assembly was
+skipped. Candidate `6344CB09…` includes the default-ON policy in its ProgramData
+hotplug; this validation retains explicit `UmdD3D12=1` and does not repeat the
+absent/zero policy checks. The signed package has not been updated. Existing performance/visual evidence below
 belongs to the earlier deployed artifacts; broader ownership and failure-path
 gaps in `docs/dx12/EXECUTION_SYNC.md` and `docs/HPS2_REFACTOR.md` remain open.
 
@@ -146,7 +1126,7 @@ question. Keep it and the broader DX12 ownership/failure-path gaps explicit.
 The owner explicitly requests a focused completed before/after benchmark per
 API, without a complex interleaved A/B campaign. Repeat only to resolve a failure
 or material uncertainty. Preserve visibly changing frames; the owner remains
-the shadow oracle. Keep async WSI enabled, use stock virglrenderer, and retain
+the shadow oracle. Keep async WSI enabled, use the paired renderer, and retain
 exact runtime admission, GPU completion, producer epochs and independent
 consumer release. No gain is promised and broader DX12 gaps remain explicit.
 
@@ -640,7 +1620,7 @@ reproduction measured the full work-submit / marker-submit / wait sequence at
 with ordinary fences, and 0.220 ms waiting on the exported fd.
 Bare empty submissions were insufficient to reproduce the wait cost.
 
-**Owner constraint: stock virglrenderer; no fork.** The unaccepted private
+**Historical owner constraint, withdrawn 2026-09-09: stock virglrenderer.** The unaccepted private
 server patch/build helper and launcher override have been withdrawn; the
 candidate was never activated. Evidence remains in `tmp/dx12-sync-265-perf/`,
 with the withdrawn proposal under `withdrawn-virglrenderer-candidate/`.
@@ -649,7 +1629,7 @@ The [archived WS2 workaround](docs/archive/ROADMAP_HISTORY_THROUGH_2026-09-05.md
 (lines 3096–3127) is `HELIOS_RETIRE_FEEDBACK`, default on: the ICD observes the
 exported semaphore's GPU-written feedback counter instead of waiting for the
 slow wire response. Historical retirement was 5.6–9.2 ms before and 0.25–0.33 ms
-after. The current code still implements it. The same .265 Time Spy capture
+after. The .270 deployed code implements it; the .271 candidate removes it. The same .265 Time Spy capture
 reports `retire_fb fast=4607 fallback=0 wire=0`; it is not a missing environment
 toggle. On .265 that observation advanced the ICD sync and its WDDM external
 fence only, leaving KMD allocation producer state and HE12 execution completion
@@ -755,25 +1735,18 @@ the full dump and matching `.263` SYS/PDB are preserved in the guest at
 evidence is under `tmp/hps2-261-acceptance/`.
 
 **The charter is `DX12.md`; the implementation set is `docs/dx12/`.
-`docs/dx12/DECISIONS.md` is authoritative over both for ARCHITECTURE, and
-⭐ `docs/dx12/METHOD.md` is authoritative over both for SEQUENCING.**
+`docs/dx12/DECISIONS.md` governs architecture.**
 
-⛔⛔ **HOW THIS WORKSTREAM IS WORKED CHANGED ON 2026-08-06 (owner directive).** The
-probe-driven loop — implement a bit, run a probe, repeat until it passes, discover the
-contract violations only when a later probe trips over them — is **retired**. The loop
-is now: implement a whole subsystem to its contract (UMD + KMD + ICD + engine
-together) → adversarial review of the entire changeset, fanned out by lens with every
-finding refuted before it is routed → repair → **repeat until saturated** → then
-deploy. `METHOD.md` §3 states the saturation test; §2 Phase 4 records that a BSOD or a
-dead DWM is a diagnosis on a dev box and therefore that **fear of a crash may not shape
-the implementation**.
-⇒ Every `D12-G*` gate named below is now an **acceptance** step, not a driver of work,
-and `GATES.md` is demoted accordingly. ⛔ A gate passing is not evidence the code is
-right: with `Umd12EclDelayUs=50000`, `D12-G8` rung 0 **passed** with correct pixels
-while the fence wait stayed 0.6 µs and the dependency it existed to prove was absent.
-⇒ **The target is real D3D12 applications and benchmarks** (owner: *"Rendering triangle
-is useless … unless we can render REAL DX12 apps and benchmarks"*), so a rung that
-renders something is not a milestone unless a real workload follows it.
+**Owner update, 2026-09-08:** the mandatory multi-agent review loop, fixed lane
+ownership and two-dry-round deployment requirement are retired. Use review and
+validation appropriate to the concrete change. The prior CB48 driver completed
+its recorded IR7/IR8 reviews; the later IR11 measurement-harness review was
+cancelled by this directive, not completed or counted as dry.
+`GATES.md` remains an acceptance suite. Its observations establish only the
+behavior exercised: the historical delayed `D12-G8` run produced correct pixels
+while its fence wait stayed 0.6 us and the required dependency was absent.
+Real D3D12 workloads, native correctness and the owner's visual acceptance remain
+the targets.
 
 ### ⭐⭐ THE GOAL, set by the owner 2026-08-06 — three deliverables, in this order
 
@@ -781,13 +1754,11 @@ renders something is not a milestone unless a real workload follows it.
 
 Not a triangle, not a rung, not a green suite. `docs/dx12/PENDING.md` is the full gap inventory;
 this is the **critical path through it**, and the ordering is forced by dependencies rather than
-chosen. `docs/dx12/METHOD.md` governs *how* each stage is worked: implement the whole subsystem
-to its contract (UMD + KMD + ICD + engine together) → adversarial review of the entire changeset
-→ repair → repeat until saturated → then deploy. ⛔ A `D12-G*` gate passing is an *acceptance*
-step, not evidence the code is right.
+chosen. A `D12-G*` gate passing is an acceptance observation, not proof of the
+complete subsystem contract.
 
 ⇒ The critical path, the gap inventory and the full D3D12 session record live in
-`DX12.md`, `docs/dx12/` (`METHOD.md` governs sequencing, `DECISIONS.md` architecture,
+`DX12.md`, `docs/dx12/` (`DECISIONS.md` governs architecture,
 `PENDING.md` the gap list) and, for the dated narrative, the archive under
 "Workstream 4 — D3D12".
 

@@ -3,8 +3,8 @@
 # noops, and does any slot have TWO owners.
 #
 # ⭐ THE STATIC HALF OF THE `CONFORMANCE.md` CHARTER. That charter — *drive the noop-DDI
-# hit counters to zero* — and `PARALLEL.md` §9.2's per-lane definition of done are both
-# written against the RUNTIME instrument, `forward12::noop12::log_noop_hits()`. That
+# hit counters to zero* — uses the RUNTIME instrument,
+# `forward12::noop12::log_noop_hits()`. That
 # instrument is exact, and it is also the most expensive readout this project has: it
 # needs a build, a signed deploy, a `-RestartDevice` and a gate run on the single `win11`
 # VM. This script answers the cheap 90% of the same question from the source tree, in
@@ -22,8 +22,8 @@
 # table, so if two lanes both assign `pfnCreateCommandSignature`, the LATER lane in the
 # chain wins and the earlier one's handler is never reachable. Nothing warns: it compiles,
 # both files look complete, both lanes report the slot done, and the defect surfaces as a
-# behaviour nobody can attribute. `PARALLEL.md` §4 says "each lane owns its files
-# exclusively" but the thing lanes actually contend for is SLOTS, and the slot partition
+# behaviour nobody can attribute. Separate file ownership does not prevent slot
+# collisions, and the slot partition
 # lives in prose (`DDI_REFERENCE.md` §3.2), not in any type. This makes the collision an
 # exit code.
 #
@@ -38,7 +38,7 @@
 # build (the `OFFSETS[i] == i * size_of::<usize>()` proof) — so the name list is derived
 # from the ABI and cannot silently drift. The ASSIGNMENTS come from a grep for
 # `.pfn<Name> = Some(` across the DDI surface. That is textual, and it is deliberately
-# narrow: it matches the one form `PARALLEL.md` §7 asks a lane to write, so a lane using a
+# narrow: it matches the assignment form used by the current installers, so a
 # different form reads as *unfilled* here — which is the safe direction for an instrument
 # whose failure mode would otherwise be over-reporting progress.
 
@@ -95,8 +95,7 @@ fi
 # ⚠ `caps12.rs` is included: L1 lives there rather than under `forward12/`, and its three
 # device-core slots are as much a slot owner as any lane.
 #
-# ⛔ COMMENT LINES ARE DROPPED, AND THIS SCRIPT'S FIRST RUN IS WHY. `PARALLEL.md` §10 lists
-# *"a grep check can count its own documentation"* as a scar — the `static_assert`
+# COMMENT LINES ARE DROPPED because a text check can count its own documentation. The `static_assert`
 # invariant reported 3 for months because both its patterns matched the comments quoting
 # them. The very first run of this script reported `pfnCreateCommandQueue` installed
 # **twice**, by `noop12.rs:365` and `tables12.rs:21`: both are prose, teaching a lane to

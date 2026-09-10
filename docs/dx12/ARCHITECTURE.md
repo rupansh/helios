@@ -1,5 +1,10 @@
 # ARCHITECTURE.md — the D3D12 UMD split
 
+**Owner update, 2026-09-09:** the native static UMD/WDDM2.1 architecture is retained,
+with paired renderer/protocol forks now authorized. Native DGC replaces the private
+engine emulation; ordinary renderer fences and authenticated wire receipts replace
+the feedback shadow. See [NATIVE_DGC.md](NATIVE_DGC.md) for contracts and boundaries.
+
 **What this is:** the mechanical guide to creating the D3D12 user-mode driver as a *second* DLL
 beside the shipping D3D11 one — which crates exist, what moves into a shared crate and what change
 each move needs, what `umd12` may and may not export, how the cxx bridge to vkd3d-proton is shaped,
@@ -18,6 +23,14 @@ unaffected; only the "Phase 0" framing in stage S0b changed.
 
 It is also not a re-argument of the decisions: the D-, H-, P-, K- and V-series entries are
 settled in `DECISIONS.md` and cited here by id.
+
+**Root-signature update, 2026-09-08:** the native parsed DDI now calls a private
+versioned engine factory through the existing static cxx bridge. It preserves
+flags and admits driver roots up to 128 DWORDs; the public COM factory stays at
+64. ClearRootArguments has a separate private operation. The old serializer is
+retained for internal empty/probe roots. This supersedes the older requirement
+below to serialize every DDI root into RTS0, without changing the native runtime
+or static-link architecture. See [ROOT_SIGNATURES.md](ROOT_SIGNATURES.md).
 
 **Sources:** `research/R4-umd-template-and-split.md` (anatomy + split plan),
 `research/R11-registration-packaging.md` (registration, packaging, rollback),
@@ -1764,7 +1777,7 @@ delivery changed from an export to an archive symbol. S4's bridge design is unaf
 | **S4** | `vkd3d_bridge.{h,cpp}` + `bridge12.rs`: `helios_vkd3d_create_device` only, returning a live `ID3D12Device*`. A `tools/` probe `LoadLibrary`s `helios_umd12.dll` directly and calls the bridge — **no runtime, no INF change, no registry change** | Still nothing shipped. First real evidence that vkd3d runs on venus *through our bridge* | **G1** |
 | **S4b** | **The ICD anchor (§6.4), which must land before the first two-engine run.** Add `helios_icd_anchor_v1` to both DLLs, route both `resolve_helios_icd_module`s through it, add the `IcdAnchorMismatch` counter and its first-hit `log_error!` | Still nothing shipped in the D3D11 sense beyond one added export on `helios_umd.dll` (a superset change; no existing export moves). Proof = UNVERIFIED-4's probe (§13), promoted from detector to pass criterion: one process creates a D3D11 device *and* calls `helios_vkd3d_create_device`; both modules report the **same** ICD path, both venus context ids are non-zero and **equal**, and `IcdAnchorMismatch` reads 0 | **G1** |
 | **S5** | INF + hotplug name `helios_umd12.dll` in slot 3; `umd` **drops** its `OpenAdapter12` export and `umd12`'s becomes reachable and stops refusing — **all in one commit**; the `UmdD3D12` knob lands in that same commit, then-default OFF (enabled by default since 2026-09-07) | Rollback = revert `UserModeDriverName[3]` (§10-L2). The D3D11 binary changes by exactly one deleted export. Explicit DWORD `0` disables D3D12 | **G6** (explicit DWORD `0` — the split gate is the deploy that registers slot 3), then **G7** (knob ON) |
-| **S6** | The D3D12 DDI surface, built out in `forward12/*` — caps first (H4), then device/queue/command-list, then descriptors, then present. ⭐ **214 slots; this is the stage that fans out across agents — see `PARALLEL.md`.** It opens with **S6-0**, which stubs all 214 with counting noops so every lane is *substitutive* rather than *additive* | Each sub-stage is knob-gated OFF by default until its gate passes | **G3** (DDI arm), **G8–G11** |
+| **S6** | The D3D12 DDI surface, built out in `forward12/*` — caps first (H4), then device/queue/command-list, then descriptors, then present. The historical S6-0 scaffolding filled all 214 slots with counting noops before their implementations replaced them. | Historical stage plan; current admission and validation are recorded in `FEATURE_LEVELS.md` and `ROADMAP.md` | **G3** (DDI arm), **G8–G11** |
 
 **⚠ On the two "—" cells: S1 and S2 have no `D12-G*` id, and that is a gap in the ladder, not a
 judgement that they need no proof.** `GATES.md`'s ladder starts the UMD-side sequence at

@@ -1,8 +1,7 @@
 // d3d12_fill_table_probe.cpp -- does S6-0's pfnFillDDITable honour the runtime's
 // SIZE_T, in BOTH directions, and does it leave zero NULL slots?
 //
-// This is the execution evidence for what PARALLEL.md section 3 calls "the
-// single highest-consequence line in S6-0". It needs no adapter, no device and
+// This directly exercises table filling. It needs no adapter, no device and
 // no caps answer, which matters: with pfnGetCaps still refusing (L1 has not
 // landed), the D3D12 runtime abandons device creation two calls in and never
 // reaches pfnFillDDITable at all -- measured at S5, tmp/dx12/gates/G6/RESULT.md.

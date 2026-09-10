@@ -13,3 +13,9 @@
 [submodule "qemu-helios"]
 	path = qemu-helios
 	url = https://github.com/rupansh/qemu-helios.git
+[submodule "virglrenderer"]
+	path = virglrenderer
+	url = https://github.com/winboat-org/virglrenderer.git
+[submodule "venus-protocol"]
+	path = venus-protocol
+	url = https://github.com/winboat-org/venus-protocol.git

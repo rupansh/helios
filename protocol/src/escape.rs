@@ -77,28 +77,9 @@ pub const HELIOS_ESCAPE_QUERY_SCANOUT_TIMELINE: u32 = 0x0011;
 /// registered timeline reaches `value`. This is the consumer half of the
 /// bidirectional queue-family ownership protocol.
 pub const HELIOS_ESCAPE_PRESENT_BUFFER_READ: u32 = 0x0012;
-/// Exact GPU feedback observation; does not retire the tagged wire command.
-/// 0x0013 is the allocation producer interface (producer.rs).
-pub const HELIOS_ESCAPE_STREAM_FEEDBACK: u32 = 0x0014;
-pub const HELIOS_STREAM_FEEDBACK_ACCEPTED: u32 = 0;
-pub const HELIOS_STREAM_FEEDBACK_WIRE_RETIRED: u32 = 1;
-pub const HELIOS_STREAM_FEEDBACK_REJECTED: u32 = 2;
-
-/// Versioned by the escape header. The ICD observed this registered GPU-only
-/// semaphore's actual feedback slot. KMD authenticates the exact original
-/// submitted tag and wire fence under its owner/context/generation locks.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
-pub struct HeliosEscapeStreamFeedback {
-    pub hdr: HeliosEscapeHeader,
-    pub cookie: u64,
-    pub wire_fence: u64,
-    pub ctx_id: u32,
-    pub value: u32,
-    pub state: u32,
-    pub reserved: u32,
-}
-const _: () = assert!(core::mem::size_of::<HeliosEscapeStreamFeedback>() == 48);
+// 0x0013 is the allocation producer interface (producer.rs).
+// 0x0014 was STREAM_FEEDBACK. Retired with the renderer queue-fence fix; never
+// reuse it. Older ICD requests are rejected by the ordinary unknown-verb path.
 
 pub const HELIOS_SCANOUT_TIMELINE_OP_META: u32 = 0;
 pub const HELIOS_SCANOUT_TIMELINE_OP_READ: u32 = 1;
@@ -138,7 +119,7 @@ impl HeliosEscapeHeader {
 ///
 /// `ring_idx` is the venus per-queue host timeline this submission targets (0 =
 /// the CPU/primary ring). The KMD forwards it as `VIRTIO_GPU_FLAG_INFO_RING_IDX`
-/// + `ctrl_hdr.ring_idx` on the SUBMIT_3D so the host routes the fence to the
+/// together with `ctrl_hdr.ring_idx` on SUBMIT_3D so the host routes the fence to the
 /// matching context+ring timeline (`virgl_renderer_context_create_fence`) — which
 /// is what venus waits on for a queue (vkQueueWaitIdle). Without it the host
 /// signals only the global fence and the per-queue wait never completes.

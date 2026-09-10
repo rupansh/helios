@@ -202,7 +202,7 @@ use core::ffi::c_void;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_NOTIMPL, S_OK};
+use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, S_OK};
 use helios_umd_common::refusals::RefusalCounter;
 use helios_umd_common::slot::{Boxed, Com, DdiHandle, Slot};
 use helios_umd_common::throttle::LogThrottle;
@@ -221,9 +221,15 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_LIST_TYPE_BUNDLE, D3D12_COMMAND_LIST_TYPE_COMPUTE,
     D3D12_COMMAND_LIST_TYPE_COPY, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC,
     D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_COMMAND_SIGNATURE_DESC, D3D12_INDIRECT_ARGUMENT_DESC,
-    D3D12_INDIRECT_ARGUMENT_TYPE, D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH,
-    D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
-    D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
+    D3D12_INDIRECT_ARGUMENT_DESC_0_0, D3D12_INDIRECT_ARGUMENT_DESC_0_1,
+    D3D12_INDIRECT_ARGUMENT_DESC_0_3, D3D12_INDIRECT_ARGUMENT_DESC_0_4,
+    D3D12_INDIRECT_ARGUMENT_DESC_0_5, D3D12_INDIRECT_ARGUMENT_TYPE,
+    D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT, D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW,
+    D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, D3D12_INDIRECT_ARGUMENT_TYPE_DRAW,
+    D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED, D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW,
+    D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW,
+    D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW,
+    D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW,
 };
 
 use super::fence;
@@ -2088,33 +2094,16 @@ unsafe extern "C" fn destroy_command_list(
 }
 
 // ---------------------------------------------------------------------------
-// (d) Command signatures — 3 slots. S-4: the NATIVE classes are implemented;
-//     the state-template classes are refused LOUDLY, at create.
+// (d) Command signatures: translate the DDI contract and let the engine select
+//     native DGC or its isolated fallback. Unsupported paths fail at creation.
 // ---------------------------------------------------------------------------
 
-/// What one `D3D12DDI_INDIRECT_ARGUMENT_DESC::Type` means for this driver.
-///
-/// ⛔ **Four classes, not two, and the split comes from the ENGINE's source rather
-/// than from the header.** `d3d12_command_signature_create`
-/// (`vkd3d-proton-helios/libs/vkd3d/command.c:26289`) sorts the twelve DDI argument
-/// types into *action* commands — which it lowers to a native
-/// `vkCmdDraw*Indirect*` / `vkCmdDispatchIndirect` — and everything else, which sets
-/// `requires_state_template` and needs `VK_EXT_device_generated_commands`.
-///
-/// ⚠ No derives: it is produced and matched in one expression, and a `PartialEq`
-/// nothing compares would be capability this file does not use.
+/// Admission and translation for one indirect argument. Mesh and incrementing
+/// constants require tiers this native UMD does not report; DXR stays separate.
 enum IndirectArgClass {
-    /// An action command with a native Vulkan lowering on this guest.
-    Action(D3D12_INDIRECT_ARGUMENT_TYPE),
-    /// A class that sets vkd3d's `requires_state_template` — root constants, root
-    /// descriptors, and the VBV/IBV rebinds. ⛔ **Refused**, see
-    /// [`create_command_signature`].
+    Forwarded(D3D12_INDIRECT_ARGUMENT_TYPE),
     StateTemplate,
-    /// `DISPATCH_RAYS`. An action command *to vkd3d*, but this driver reports no
-    /// raytracing tier, so a signature naming it is a caps inconsistency rather
-    /// than a capability gap and gets its own counter.
     Raytracing,
-    /// A value this build's `d3d12umddi.h` does not name.
     Unknown,
 }
 
@@ -2143,30 +2132,74 @@ fn indirect_argument_class(t: ddi12::D3D12DDI_INDIRECT_ARGUMENT_TYPE) -> Indirec
         D3D12DDI_INDIRECT_ARGUMENT_TYPE_D3D12DDI_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW as DDI_VBV,
     };
     match t {
-        DDI_DRAW => IndirectArgClass::Action(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW),
-        DDI_DRAW_INDEXED => IndirectArgClass::Action(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED),
-        DDI_DISPATCH => IndirectArgClass::Action(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH),
-        DDI_DISPATCH_MESH => IndirectArgClass::Action(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH),
+        DDI_DRAW => IndirectArgClass::Forwarded(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW),
+        DDI_DRAW_INDEXED => IndirectArgClass::Forwarded(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED),
+        DDI_DISPATCH => IndirectArgClass::Forwarded(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH),
+        DDI_DISPATCH_MESH | DDI_INCR_CONSTANT => IndirectArgClass::StateTemplate,
         DDI_DISPATCH_RAYS => IndirectArgClass::Raytracing,
-        // The eight that set `requires_state_template` (`command.c:26350`, `:26356`,
-        // `:26363`, `:26371`, `:26377`).
-        DDI_CONSTANT | DDI_INCR_CONSTANT | DDI_SRV | DDI_UAV | DDI_CBV | DDI_VBV | DDI_IBV => {
-            IndirectArgClass::StateTemplate
-        }
+        DDI_CONSTANT => IndirectArgClass::Forwarded(D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT),
+        DDI_CBV => IndirectArgClass::Forwarded(D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW),
+        DDI_SRV => IndirectArgClass::Forwarded(D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW),
+        DDI_UAV => IndirectArgClass::Forwarded(D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW),
+        DDI_VBV => IndirectArgClass::Forwarded(D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW),
+        DDI_IBV => IndirectArgClass::Forwarded(D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW),
         // ⚠ Not an `else` that picks the largest arm (`DECISIONS.md` §7.4): a type
         // this header does not name is refused, never guessed at.
         _ => IndirectArgClass::Unknown,
     }
 }
 
-/// Sanity bound on `D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001::NumArgumentDescs`.
-///
-/// AGENTS.md: *validate every runtime-supplied size before reading.* No D3D12 rule
-/// caps the count, so this is not a semantic limit — it bounds the loop a corrupt
-/// count would run, and its counter says if a real workload ever approached it.
-/// ⚠ Signatures this driver *accepts* have exactly one desc; the bound exists for
-/// the ones it walks in order to refuse them with the offending type named.
-const MAX_INDIRECT_ARGUMENT_DESCS: usize = 256;
+/// Translate the active union arm after the enum has been classified. The DDI
+/// and API structs have separate generated definitions; do not transmute them.
+fn translate_indirect_argument(
+    input: &ddi12::D3D12DDI_INDIRECT_ARGUMENT_DESC,
+    ty: D3D12_INDIRECT_ARGUMENT_TYPE,
+) -> D3D12_INDIRECT_ARGUMENT_DESC {
+    let mut output = D3D12_INDIRECT_ARGUMENT_DESC {
+        Type: ty,
+        ..Default::default()
+    };
+    match ty {
+        D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT => {
+            // SAFETY: the caller classified Type as CONSTANT; read only that arm.
+            let value = unsafe { input.__bindgen_anon_1.Constant };
+            output.Anonymous.Constant = D3D12_INDIRECT_ARGUMENT_DESC_0_1 {
+                RootParameterIndex: value.RootParameterIndex,
+                DestOffsetIn32BitValues: value.DestOffsetIn32BitValues,
+                Num32BitValuesToSet: value.Num32BitValuesToSet,
+            };
+        }
+        D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW => {
+            // SAFETY: Type is CONSTANT_BUFFER_VIEW, whose arm contains one UINT.
+            let value = unsafe { input.__bindgen_anon_1.ConstantBufferView };
+            output.Anonymous.ConstantBufferView = D3D12_INDIRECT_ARGUMENT_DESC_0_0 {
+                RootParameterIndex: value.RootParameterIndex,
+            };
+        }
+        D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW => {
+            // SAFETY: Type is SHADER_RESOURCE_VIEW; no other union arm is read.
+            let value = unsafe { input.__bindgen_anon_1.ShaderResourceView };
+            output.Anonymous.ShaderResourceView = D3D12_INDIRECT_ARGUMENT_DESC_0_3 {
+                RootParameterIndex: value.RootParameterIndex,
+            };
+        }
+        D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW => {
+            // SAFETY: Type is UNORDERED_ACCESS_VIEW; no other union arm is read.
+            let value = unsafe { input.__bindgen_anon_1.UnorderedAccessView };
+            output.Anonymous.UnorderedAccessView = D3D12_INDIRECT_ARGUMENT_DESC_0_4 {
+                RootParameterIndex: value.RootParameterIndex,
+            };
+        }
+        D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW => {
+            // SAFETY: Type is VERTEX_BUFFER_VIEW, whose arm contains the slot.
+            let value = unsafe { input.__bindgen_anon_1.VertexBuffer };
+            output.Anonymous.VertexBuffer = D3D12_INDIRECT_ARGUMENT_DESC_0_5 { Slot: value.Slot };
+        }
+        // Action commands and INDEX_BUFFER_VIEW have no payload in this desc.
+        _ => {}
+    }
+    output
+}
 
 /// `pfnCalcPrivateCommandSignatureSize`.
 ///
@@ -2222,205 +2255,83 @@ pub(crate) unsafe fn engine_command_signature(
     unsafe { slot.load() }
 }
 
-/// `pfnCreateCommandSignature` — **IMPLEMENTED for the four native action classes,
-/// refused loudly for everything else.**
-///
-/// # ⛔⛔ Why a partial implementation is the CORRECT answer here, and a full
-/// forward would be the dangerous one
-///
-/// `VK_EXT_device_generated_commands` is **absent on this guest** (zero occurrences
-/// in `docs/dx12/research/guest-vulkaninfo-full.txt`), and vkd3d's response to that
-/// is not a failure — it is a **silent downgrade**:
-///
-/// ```text
-///     if ((object->requires_state_template = requires_state_template))
-///     {
-///         if (!device->device_info.device_generated_commands_features.deviceGeneratedCommands)
-///         {
-///             FIXME("Device generated commands is not supported by implementation.\n");
-///             object->requires_state_template = false;
-///             goto out;                       // ← command.c:26447-26453, still S_OK
-///         }
-/// ```
-///
-/// and the paired `ExecuteIndirect` then discards the whole call:
-///
-/// ```text
-///     arg_buffer_offset += sig_impl->argument_buffer_offset_for_command;
-///     if (sig_impl->argument_buffer_offset_for_command)
-///     {
-///         d3d12_command_list_debug_mark_label(list, "DGC skip", …);
-///         return;                             // ← command.c:17811-17818
-///     }
-/// ```
-///
-/// ⇒ **a naive forward turns a loud `E_NOTIMPL` into an empty scene with a score.**
-/// That is exactly the failure shape this project has burned sessions on, and it is
-/// why the classification lives in the driver rather than being delegated to an
-/// engine that answers `S_OK` and then draws nothing.
-///
-/// ⚠ **And the offset check is not conditional on DGC**, which is why the refusal is
-/// keyed on the argument TYPES and not on "does the engine have DGC". Any signature
-/// with a non-action argument before its action has a non-zero
-/// `argument_buffer_offset_for_command` (`command.c:26306-26383` sets it to the byte
-/// offset of the action) and takes the skip above regardless. There is even a
-/// pathological middle case — `[CONSTANT{Num32BitValuesToSet: 0}, DRAW]`, whose
-/// offset stays 0 — where the draw *would* execute with the root constants silently
-/// unapplied. Keying on the types covers that one too.
-///
-/// # ⛔ The `DDI_REFERENCE.md` §14.2 argument this slot used to make is INVALID
-///
-/// Its previous doc closed with *"`DDI_REFERENCE.md` §14.2's 99-slot minimum-viable
-/// list does not include the command-signature triple"*, and `cmdlist.rs`'s
-/// `pfnExecuteIndirect` said the same. ⛔ **§14.0 of that same document forbids that
-/// reading in as many words**: *"treat a slot in 99-but-not-70 as 'not exercised
-/// yet', never as 'not needed'."* The list was being used as licence for the exact
-/// inference it rules out. What actually settles the priority is that every engine
-/// with GPU-driven rendering calls `CreateCommandSignature` **at startup**, so an
-/// `E_NOTIMPL` here is an init-time failure for a whole class of applications.
-///
-/// # ⭐ The two blockers the old doc named are both discharged
-///
-/// * the `D3D12DDI_INDIRECT_ARGUMENT_DESC` → `D3D12_INDIRECT_ARGUMENT_DESC`
-///   translation is [`indirect_argument_class`], and for the shapes this driver
-///   accepts it is only the `Type` field: an action desc's union arm is unused by
-///   both the API and the engine;
-/// * `hRootSignature`'s payload is **L6's, declared once, in `pso.rs`**, and
-///   `pso::root_signature` is already `pub(crate)`. Reading it from here is one call
-///   to that accessor, not a second declaration — `DECISIONS.md` D13 is satisfied,
-///   and the old doc's claim that it could not be is stale.
-///
-/// ⚠ The root signature is **forwarded as given**, including when it is non-null on
-/// an action-only signature — a case vkd3d answers `E_INVALIDARG`
-/// (`command.c:26421-26425`: *"Command signature does not require root signature"*).
-/// Passing `None` instead would make such a call succeed, and nothing semantic would
-/// be lost, but it would be this driver silently discarding something the
-/// application passed. `CommandSignatureRootSigUnexpected` counts it so the decision
-/// can be revisited with evidence rather than by preference.
+/// Create an engine signature from an explicit per-arm DDI translation.
+/// Root-state signatures reach native DGC or the isolated GPU fallback. IA
+/// rebinding currently returns E_NOTIMPL on Venus; mesh, incrementing constants
+/// and ray dispatch remain refused while their native tiers are unreported.
+/// Engine validation errors are preserved, and every failure leaves a null slot.
 ///
 /// # Safety
-/// `h_device` must be a live handle from `device12::create_device`; `arg` must point
-/// at a live `D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001` whose `pArgumentDescs`
-/// addresses `NumArgumentDescs` readable `D3D12DDI_INDIRECT_ARGUMENT_DESC`s for the
-/// call; `h_signature`'s `pDrvPrivate` must address the private block
-/// [`calc_private_command_signature_size`] sized.
+/// The runtime supplies a live device, a readable create descriptor and its
+/// declared argument array. The output handle addresses the private block sized
+/// by `calc_private_command_signature_size`; non-null root handles are live.
 unsafe extern "C" fn create_command_signature(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001,
     h_signature: ddi12::D3D12DDI_HCOMMANDSIGNATURE,
 ) -> ddi12::HRESULT {
-    // SAFETY: the caller guarantees the slot lies in the sized private block.
+    // SAFETY: the runtime supplied the sized private output block.
     let Some(slot) =
         (unsafe { Slot::<Com<ID3D12CommandSignature>>::from_priv(h_signature.drv_private()) })
     else {
         note_refusal(&L2_REFUSALS.command_signature_bad_arg);
         return E_INVALIDARG;
     };
-    // ⛔ Clear first, so every refusal below leaves a null slot rather than whatever
-    // the runtime's allocator left there, and the paired destroy finds `None`.
-    // SAFETY: as above.
+    // SAFETY: the block is writable and contains no prior live signature.
     unsafe { slot.clear() };
-
     if arg.is_null() {
         note_refusal(&L2_REFUSALS.command_signature_bad_arg);
         return E_INVALIDARG;
     }
-    // SAFETY: non-null per the check; the DDI declares it `_In_ CONST`.
+    // SAFETY: arg is non-null and the DDI declares a readable create descriptor.
     let a = unsafe { &*arg };
-
-    // ⛔ Validate the runtime-supplied count and pointer BEFORE reading the array,
-    // per-arm. AGENTS.md's rule.
     let count = a.NumArgumentDescs as usize;
-    if a.pArgumentDescs.is_null() || count == 0 || count > MAX_INDIRECT_ARGUMENT_DESCS {
+    if a.pArgumentDescs.is_null()
+        || count == 0
+        || count
+            > isize::MAX as usize / core::mem::size_of::<ddi12::D3D12DDI_INDIRECT_ARGUMENT_DESC>()
+        || a.NodeMask > 1
+    {
         note_refusal(&L2_REFUSALS.command_signature_bad_arg);
-        if let Some(n) = budget(&QUEUE_LOG) {
-            log_error!(
-                "CreateCommandSignature: NumArgumentDescs={} pArgumentDescs={:p} -- refused (x{})",
-                a.NumArgumentDescs,
-                a.pArgumentDescs,
-                n + 1,
-            );
-        }
         return E_INVALIDARG;
     }
-
-    // ⚠ Every desc is classified even though only a one-desc signature can be
-    // accepted, so a refusal names the argument type that caused it instead of just
-    // the count. That is the difference between a counter that says "some engine
-    // wanted GPU-driven rendering" and one that says which class to implement next.
-    let mut action: Option<D3D12_INDIRECT_ARGUMENT_TYPE> = None;
-    let mut state_template = false;
-    let mut raytracing = false;
-    let mut unknown: Option<ddi12::D3D12DDI_INDIRECT_ARGUMENT_TYPE> = None;
+    let mut api_descs = Vec::new();
+    if api_descs.try_reserve_exact(count).is_err() {
+        // Allocation failure must reach the HRESULT return without building
+        // the allocating refusal summary. The normal summary reads this atomic.
+        L2_REFUSALS.command_signature_translation_oom.bump();
+        return E_OUTOFMEMORY;
+    }
+    let mut requires_root = false;
     for i in 0..count {
-        // SAFETY: `pArgumentDescs` is non-null and `i < count == NumArgumentDescs`,
-        // so this element is inside the array the DDI declares
-        // `_Field_size_(NumArgumentDescs)`.
-        let ty = unsafe { (*a.pArgumentDescs.add(i)).Type };
-        match indirect_argument_class(ty) {
-            IndirectArgClass::Action(api) => action = Some(api),
-            IndirectArgClass::StateTemplate => state_template = true,
-            IndirectArgClass::Raytracing => raytracing = true,
-            IndirectArgClass::Unknown => unknown = Some(ty),
-        }
+        // SAFETY: count's byte extent is representable, the array is non-null,
+        // and the runtime guarantees every declared element is readable.
+        let input = unsafe { &*a.pArgumentDescs.add(i) };
+        let ty = match indirect_argument_class(input.Type) {
+            IndirectArgClass::Forwarded(ty) => ty,
+            IndirectArgClass::StateTemplate => {
+                note_refusal(&L2_REFUSALS.command_signature_state_template_refused);
+                return E_NOTIMPL;
+            }
+            IndirectArgClass::Raytracing => {
+                note_refusal(&L2_REFUSALS.command_signature_raytracing_refused);
+                return E_NOTIMPL;
+            }
+            IndirectArgClass::Unknown => {
+                note_refusal(&L2_REFUSALS.command_signature_arg_type_unknown);
+                return E_INVALIDARG;
+            }
+        };
+        requires_root |= matches!(
+            ty,
+            D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT
+                | D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW
+                | D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW
+                | D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW
+        );
+        api_descs.push(translate_indirect_argument(input, ty));
     }
-
-    if let Some(ty) = unknown {
-        note_refusal(&L2_REFUSALS.command_signature_arg_type_unknown);
-        if let Some(n) = budget(&QUEUE_LOG) {
-            log_error!(
-                "CreateCommandSignature: D3D12DDI_INDIRECT_ARGUMENT_TYPE {ty} is not named by this \
-                 build's header -> E_INVALIDARG (x{})",
-                n + 1,
-            );
-        }
-        return E_INVALIDARG;
-    }
-    if raytracing {
-        // ⛔ Coherent with the caps this driver publishes rather than with what the
-        // engine could do: `RaytracingTier` is NOT_SUPPORTED, so no raytracing
-        // pipeline can exist for an indirect dispatch to reach.
-        note_refusal(&L2_REFUSALS.command_signature_raytracing_refused);
-        if let Some(n) = budget(&QUEUE_LOG) {
-            log_error!(
-                "CreateCommandSignature: DISPATCH_RAYS refused -- this driver reports no \
-                 raytracing tier (x{})",
-                n + 1,
-            );
-        }
-        return E_NOTIMPL;
-    }
-    // ⛔⛔ THE LOUD REFUSAL S-4 EXISTS FOR. `count != 1` and `state_template` are one
-    // condition in practice — vkd3d requires exactly one action and requires it LAST
-    // (`command.c:26385-26401`), and every non-action class sets
-    // `requires_state_template` — but they are tested together rather than assumed
-    // equivalent, because the equivalence is a property of the engine's validator
-    // and not of the DDI.
-    if state_template || count != 1 || action.is_none() {
-        note_refusal(&L2_REFUSALS.command_signature_state_template_refused);
-        if let Some(n) = budget(&QUEUE_LOG) {
-            log_error!(
-                "CreateCommandSignature: {} argument desc(s), stateTemplate={state_template}, \
-                 action={} -- this driver backs only a single DRAW / DRAW_INDEXED / DISPATCH / \
-                 DISPATCH_MESH desc, because VK_EXT_device_generated_commands is absent on this \
-                 guest and vkd3d would accept the signature and then SILENTLY SKIP every \
-                 ExecuteIndirect (command.c:17811-17818) -> E_NOTIMPL (x{})",
-                count,
-                action.is_some(),
-                n + 1,
-            );
-        }
-        return E_NOTIMPL;
-    }
-    // Established by the refusal above.
-    let Some(action) = action else {
-        note_refusal(&L2_REFUSALS.command_signature_state_template_refused);
-        return E_NOTIMPL;
-    };
-
-    // SAFETY: this is a device-scope DDI, so the runtime passes a handle
-    // `create_device` returned `S_OK` for; the borrow lives only until the end of
-    // this call.
+    // SAFETY: device-scope DDI; this borrow remains inside the current call.
     let Some(dev) = (unsafe { device12::device(h_device) }) else {
         note_refusal(&L2_REFUSALS.command_signature_no_device);
         return E_FAIL;
@@ -2429,85 +2340,59 @@ unsafe extern "C" fn create_command_signature(
         note_refusal(&L2_REFUSALS.command_signature_no_device);
         return E_FAIL;
     };
-
-    // ⚠ `pDrvPrivate` is tested directly rather than through the accessor, because
-    // `pso::root_signature` folds "the runtime named none" and "this driver could
-    // not resolve one it named" into the same `None` and its own doc says the caller
-    // must separate them.
     let root_signature = if a.hRootSignature.pDrvPrivate.is_null() {
         None
     } else {
-        note_refusal(&L2_REFUSALS.command_signature_root_sig_unexpected);
-        // SAFETY: a non-null `pDrvPrivate` on a root-signature handle the runtime
-        // handed this create is a handle L6's `pfnCreateRootSignature` sized and
-        // wrote; the borrow does not outlive this call.
+        if !requires_root {
+            note_refusal(&L2_REFUSALS.command_signature_root_sig_unexpected);
+        }
+        // SAFETY: the non-null root handle names a live private block from L6.
         let resolved = unsafe { pso::root_signature(a.hRootSignature) };
         if resolved.is_none() {
             note_refusal(&L2_REFUSALS.command_signature_root_sig_unresolved);
-            if let Some(n) = budget(&QUEUE_LOG) {
-                log_error!(
-                    "CreateCommandSignature: hRootSignature={:p} carries no engine root signature \
-                     -> E_INVALIDARG (x{})",
-                    a.hRootSignature.pDrvPrivate,
-                    n + 1,
-                );
-            }
             return E_INVALIDARG;
         }
         resolved
     };
-
-    // ⚠ One desc, `Type` translated and the union left zeroed. An action desc has no
-    // union arm — the API's `D3D12_INDIRECT_ARGUMENT_DESC_0` members all describe
-    // root or buffer-view rebinds — and `Default` zero-fills it, so this is exact
-    // rather than a partial copy.
-    let api_desc = D3D12_INDIRECT_ARGUMENT_DESC {
-        Type: action,
-        ..Default::default()
-    };
-    // ⚠ `ByteStride` and `NodeMask` are forwarded verbatim. The stride's minimum is
-    // the engine's own validation (`command.c:26409-26414` refuses a stride below
-    // the computed signature size) and duplicating it here would be a second
-    // authority that can drift; `NodeMask`'s only legal values on a one-node adapter
-    // are 0 and 1 and both mean "the single node" to vkd3d, so narrowing it would
-    // hide a multi-node request instead of letting the engine reject it — the same
-    // reasoning `fence::create_query_heap` records.
     let desc = D3D12_COMMAND_SIGNATURE_DESC {
         ByteStride: a.ByteStride,
-        NumArgumentDescs: 1,
-        pArgumentDescs: &api_desc,
+        NumArgumentDescs: a.NumArgumentDescs,
+        pArgumentDescs: api_descs.as_ptr(),
         NodeMask: a.NodeMask,
     };
     let mut signature: Option<ID3D12CommandSignature> = None;
-    // SAFETY: `desc` and `api_desc` are live locals for the call and `desc`'s
-    // `pArgumentDescs` addresses `api_desc`, which outlives it; `root_signature` is
-    // a borrowed engine object (or `None`) and the wrapper takes it by reference;
-    // `signature` is writable storage the wrapper initialises on success.
+    // SAFETY: the translated array and borrowed root live through this call;
+    // vkd3d copies the descriptors and returns one owned COM reference.
     if let Err(e) =
         unsafe { engine.CreateCommandSignature(&desc, root_signature.as_deref(), &mut signature) }
     {
-        note_refusal(&L2_REFUSALS.command_signature_engine_failed);
+        if e.code().0 == E_OUTOFMEMORY {
+            // As above, neither note_refusal nor formatted logging is safe
+            // while recovering from sustained allocation exhaustion.
+            L2_REFUSALS.command_signature_engine_failed.bump();
+            return E_OUTOFMEMORY;
+        }
+        if e.code().0 == E_NOTIMPL {
+            note_refusal(&L2_REFUSALS.command_signature_state_template_refused);
+        } else {
+            note_refusal(&L2_REFUSALS.command_signature_engine_failed);
+        }
         if let Some(n) = budget(&QUEUE_LOG) {
             log_error!(
-                "CreateCommandSignature: engine refused stride={} type={} hr={:#010x} (x{})",
+                "CreateCommandSignature: engine refused stride={} arguments={} hr={:#010x} (x{})",
                 a.ByteStride,
-                action.0,
+                count,
                 e.code().0 as u32,
                 n + 1,
             );
         }
-        return E_FAIL;
+        return e.code().0;
     }
     let Some(signature) = signature else {
-        // ⚠ `S_OK` with no object out — the engine breaking its own COM contract.
-        // Counted rather than assumed impossible, same as `create_query_heap`.
         note_refusal(&L2_REFUSALS.command_signature_engine_failed);
         return E_FAIL;
     };
-
-    // SAFETY: the slot lies in the sized private block and is currently null
-    // (cleared above); `store` moves the single reference the engine returned into
-    // it, and `destroy_command_signature` releases it.
+    // SAFETY: the writable slot is null; it now owns the returned reference.
     unsafe { slot.store(signature) };
     note_refusal(&L2_REFUSALS.command_signature_created);
     S_OK
@@ -2753,15 +2638,22 @@ unsafe fn submit_wddm_render<T: Copy>(
         // non-`S_OK` value is a SUCCESS code, and treating `S_FALSE` as a failure
         // here would report a device error for a submission that happened.
         // ⛔ And NO re-latch on this path: the out-fields promise nothing.
-        note_refusal(&L2_REFUSALS.ecl_submit_render_failed);
-        if let Some(n) = budget(&ECL_LOG) {
-            log_error!(
-                "{label}: pfnRenderCb(ctx={:p}, len={command_length}) failed \
-                 hr={:#010x} (x{})",
-                queue.h_context,
-                hr as u32,
-                n + 1,
-            );
+        // RenderCb may legally return E_OUTOFMEMORY after the engine operation
+        // was committed. Reach the caller's cancellation/error path without
+        // allocating a diagnostic summary or formatted message first.
+        if hr == helios_umd_common::hr::E_OUTOFMEMORY {
+            L2_REFUSALS.ecl_submit_render_failed.bump();
+        } else {
+            note_refusal(&L2_REFUSALS.ecl_submit_render_failed);
+            if let Some(n) = budget(&ECL_LOG) {
+                log_error!(
+                    "{label}: pfnRenderCb(ctx={:p}, len={command_length}) failed \
+                     hr={:#010x} (x{})",
+                    queue.h_context,
+                    hr as u32,
+                    n + 1,
+                );
+            }
         }
         return WddmSubmit::Refused(hr);
     }
@@ -2934,7 +2826,12 @@ fn report_ecl_submit_error(queue: &QueueState, hr: ddi12::HRESULT) {
     let reported =
         unsafe { device12::device(queue.h_device) }.is_some_and(|dev| device12::set_error(dev, hr));
     if !reported {
-        note_refusal(&L2_REFUSALS.queue_set_error_unavailable);
+        // An unavailable error channel must not reallocate on OOM recovery.
+        if hr == helios_umd_common::hr::E_OUTOFMEMORY {
+            L2_REFUSALS.queue_set_error_unavailable.bump();
+        } else {
+            note_refusal(&L2_REFUSALS.queue_set_error_unavailable);
+        }
     }
 }
 
@@ -3180,58 +3077,8 @@ unsafe extern "C" fn queue_unused2_slot() {
     note_refusal(&L2_REFUSALS.queue_unused2_slot_called);
 }
 
-/// `pfnUpdateTileMappings` — **REFUSED**, `TileMappingsRefused`.
-///
-/// ⛔ This driver reports `TiledResourcesTier = NOT_SUPPORTED` (`caps12.rs`), so
-/// no tiled resource can exist for this DDI to remap. Refusing is the coherent
-/// answer, and it is the same shape `caps12::get_mip_packing` takes for the same
-/// reason: counted, and deliberately **not** raised through `pfnSetErrorCb`,
-/// because a hit means a caps inconsistency somewhere else and removing the
-/// device would not fix it. ⚠ No log line either: the counter is the readout,
-/// and this DDI is per-remap traffic that a budgeted line would only half cover.
-///
-/// ⚠ **`DX12.md` §4.4 makes `TiledResourcesTier >= 2` a feature-level 12_1
-/// floor**, and it lands with these two slots plus `pfnCopyTiles`,
-/// `pfnGetMipPacking` and the reserved-resource arm of `pfnCreateHeapAndResource`.
-/// ⛔ The tier is **UMD-only** — Vulkan sparse binding, which the guest supports
-/// end to end (`DECISIONS.md` §2) — and **not** a KMD dependency. That claim was
-/// made twice and falsified twice; do not cost the feature level as if the KMD
-/// were on its critical path.
-///
-/// # Safety
-/// The arguments are the runtime's and this body reads none of them.
-unsafe extern "C" fn update_tile_mappings(
-    _h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
-    _h_resource: ddi12::D3D12DDI_HRESOURCE,
-    _num_regions: ddi12::UINT,
-    _region_start_coords: *const ddi12::D3D12DDI_TILED_RESOURCE_COORDINATE,
-    _region_sizes: *const ddi12::D3D12DDI_TILE_REGION_SIZE,
-    _h_heap: ddi12::D3D12DDI_HHEAP,
-    _num_ranges: ddi12::UINT,
-    _range_flags: *const ddi12::D3D12DDI_TILE_RANGE_FLAGS,
-    _heap_start_offsets: *const ddi12::UINT,
-    _range_tile_counts: *const ddi12::UINT,
-    _flags: ddi12::D3D12DDI_TILE_MAPPING_FLAGS,
-) {
-    note_refusal(&L2_REFUSALS.tile_mappings_refused);
-}
-
-/// `pfnCopyTileMappings` — **REFUSED**, `TileMappingsRefused`. Same reasoning as
-/// [`update_tile_mappings`]; same counter, because the two are one capability.
-///
-/// # Safety
-/// The arguments are the runtime's and this body reads none of them.
-unsafe extern "C" fn copy_tile_mappings(
-    _h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
-    _h_dst_resource: ddi12::D3D12DDI_HRESOURCE,
-    _dst_start_coord: *const ddi12::D3D12DDI_TILED_RESOURCE_COORDINATE,
-    _h_src_resource: ddi12::D3D12DDI_HRESOURCE,
-    _src_start_coord: *const ddi12::D3D12DDI_TILED_RESOURCE_COORDINATE,
-    _region_size: *const ddi12::D3D12DDI_TILE_REGION_SIZE,
-    _flags: ddi12::D3D12DDI_TILE_MAPPING_FLAGS,
-) {
-    note_refusal(&L2_REFUSALS.tile_mappings_refused);
-}
+#[path = "tiles.rs"]
+pub(crate) mod tiles;
 
 /// What a fence operation is: the two queue slots differ only in which engine
 /// method they reach, so they share [`fence_operation`] and name themselves here.
@@ -3411,8 +3258,8 @@ pub(crate) fn install_queue(
     // a counting stub rather than a NULL.
     table.pfnUnused = queue_unused_slot as *mut c_void;
     table.pfnUnused2 = queue_unused2_slot as *mut c_void;
-    table.pfnUpdateTileMappings = Some(update_tile_mappings);
-    table.pfnCopyTileMappings = Some(copy_tile_mappings);
+    table.pfnUpdateTileMappings = Some(tiles::update_tile_mappings);
+    table.pfnCopyTileMappings = Some(tiles::copy_tile_mappings);
     table.pfnSignalFence = Some(signal_fence);
     table.pfnWaitForFence = Some(wait_for_fence);
     filling.advance()
@@ -3727,30 +3574,13 @@ pub(crate) struct L2Refusals {
     fence_wait_entered: RefusalCounter,
     /// Retired counter, retained at its diagnostic index; always zero in HE12 v2.
     fence_wait_runtime_owned: RefusalCounter,
-    /// ⭐ **S-4's success counter: a real `ID3D12CommandSignature` was built.**
-    ///
-    /// ⚠ **Expected non-zero on any engine with GPU-driven rendering**, which calls
-    /// `CreateCommandSignature` at startup. ⛔ Read it beside
-    /// `CommandSignatureStateTemplateRefused`: the two partition every create, and
-    /// the ratio is how much of a workload's indirect rendering this driver actually
-    /// backs. `L3aExecuteIndirectForwarded` is its downstream half — a signature that
-    /// is created and never executed is `METHOD.md` saturation criterion 6's
-    /// *implemented-but-never-exercised*, and only those two together can show it.
+    /// A real engine signature was created. Expected to move in indirect
+    /// workloads. Aggregate create/forward counts do not prove each signature
+    /// class executed; read them with class-specific readback tests and refusals.
     command_signature_created: RefusalCounter,
-    /// ⛔⛔ **A command signature named a root-argument / state-template class, or
-    /// more than one argument desc, and was refused `E_NOTIMPL` AT CREATE.**
-    ///
-    /// ⚠ **Expected NON-ZERO on any modern engine, and that is a real capability gap
-    /// rather than an instrument.** `VK_EXT_device_generated_commands` is absent on
-    /// this guest, and vkd3d's response is to accept the signature (clearing
-    /// `requires_state_template`, `command.c:26447-26453`) and then **silently skip**
-    /// every `ExecuteIndirect` that uses it (`command.c:17811-17818`). Refusing at
-    /// create converts *"an empty scene with a score"* into a failure the application
-    /// can act on — the bundle lesson, one DDI earlier.
-    ///
-    /// ⛔ **It is the counter that says whether DGC is worth pursuing.** A large count
-    /// on a real workload promotes `VK_EXT_device_generated_commands` in the ICD/host
-    /// from a named gap to scheduled work; a zero says the native four are enough.
+    /// A signature needs an unreported native tier or an engine translation
+    /// returned E_NOTIMPL. Expected zero for supported root-state workloads;
+    /// VBV/IBV on Venus remain a known contract gap. A hit is never success.
     command_signature_state_template_refused: RefusalCounter,
     /// A command signature named `DISPATCH_RAYS` and was refused `E_NOTIMPL`.
     ///
@@ -3768,34 +3598,16 @@ pub(crate) struct L2Refusals {
     /// A command-signature slot could not reach the engine. **Expected 0** — it is a
     /// device-scope DDI and a device exists by construction.
     command_signature_no_device: RefusalCounter,
-    /// `ID3D12Device::CreateCommandSignature` on the engine failed, or returned
-    /// `S_OK` with no object.
-    ///
-    /// ⚠ **May legitimately be non-zero**: vkd3d validates the stride against the
-    /// computed signature size (`command.c:26409-26414`) and the root-signature
-    /// pairing (`:26412-26424`), and this driver forwards both verbatim rather than
-    /// duplicating checks that would then be a second authority able to drift.
-    /// ⇒ read it beside `CommandSignatureRootSigUnexpected`.
+    /// Engine creation failed with an error other than E_NOTIMPL, or returned
+    /// success without an object. Zero for valid workloads; expected E_INVALIDARG
+    /// failures are counted by deliberate malformed-signature tests. OOM bumps
+    /// the atomic without formatting; a later normal summary reads its value.
     command_signature_engine_failed: RefusalCounter,
-    /// An action-only command signature arrived with a **non-null**
-    /// `hRootSignature`, which this driver forwarded as given.
-    ///
-    /// ⚠ **Expected 0, and a hit is a decision to revisit rather than a fault.**
-    /// vkd3d refuses that pairing (`command.c:26421-26425`: *"Command signature does
-    /// not require root signature, root signature must be NULL"*), so a hit here
-    /// arrives with `CommandSignatureEngineFailed` and the application's create
-    /// fails. Passing `None` instead would make it succeed and lose nothing semantic
-    /// — an action-only signature binds no root arguments — but it would be this
-    /// driver silently discarding something the application passed. ⇒ the counter
-    /// exists so that trade is settled by evidence.
+    /// A signature without root arguments supplied a root signature. It is
+    /// forwarded unchanged and rejected by the engine. Zero for valid inputs.
     command_signature_root_sig_unexpected: RefusalCounter,
-    /// `hRootSignature` was non-null and carried no engine `ID3D12RootSignature`, so
-    /// the create was refused `E_INVALIDARG` rather than forwarded with `None`.
-    ///
-    /// ⛔ **Expected 0** — L6's `pfnCreateRootSignature` either stores one or fails.
-    /// ⚠ Forwarding `None` here would silently reinterpret *"this driver lost the
-    /// root signature"* as *"the application passed none"*, which is the exact
-    /// conflation `pso::root_signature`'s own doc warns callers to separate.
+    /// A named root handle has no engine object. Expected zero: a live root
+    /// create stores an object or fails, and absence must not become a null root.
     command_signature_root_sig_unresolved: RefusalCounter,
     /// ⛔ Retired append-only telemetry slot. D3D12 Render callbacks in this driver
     /// carry metadata only and submit `NumAllocations = 0`; the D3D12 runtime owns
@@ -3825,6 +3637,14 @@ pub(crate) struct L2Refusals {
     /// rather than [`Self::present_submit_no_queue`]'s because the two would need
     /// different fixes.
     present_submit_no_device: RefusalCounter,
+    /// Successfully committed native mapping operations; not GPU completion.
+    tile_mappings_forwarded: RefusalCounter,
+    /// Mapping HE12 Render and admission event both queued; not GPU completion.
+    tile_mappings_admitted: RefusalCounter,
+    /// Fallible allocation of the translated signature array failed. Expected
+    /// zero normally; E_OUTOFMEMORY is returned with no object on exhaustion.
+    /// Atomic-only on the error path; readable in the next normal summary.
+    command_signature_translation_oom: RefusalCounter,
 }
 
 pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
@@ -3911,6 +3731,9 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     present_identity_submitted: RefusalCounter::new("PresentIdentitySubmitted"),
     present_submit_no_queue: RefusalCounter::new("PresentSubmitNoQueue"),
     present_submit_no_device: RefusalCounter::new("PresentSubmitNoDevice"),
+    tile_mappings_forwarded: RefusalCounter::new("TileMappingsForwarded"),
+    tile_mappings_admitted: RefusalCounter::new("TileMappingsAdmitted"),
+    command_signature_translation_oom: RefusalCounter::new("CommandSignatureTranslationOom"),
 };
 
 /// L2's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -4039,12 +3862,15 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L2_REFUSALS.present_identity_submitted,
     &L2_REFUSALS.present_submit_no_queue,
     &L2_REFUSALS.present_submit_no_device,
+    &L2_REFUSALS.tile_mappings_forwarded,
+    &L2_REFUSALS.tile_mappings_admitted,
     &L2_REFUSALS.ecl_admission_queued,
     &L2_REFUSALS.ecl_admission_failed,
     &L2_REFUSALS.ecl_worker_failed,
     &L2_REFUSALS.ecl_exact_boundary,
     &L2_REFUSALS.fence_native_refused,
     &L2_REFUSALS.present_producer_admitted,
+    &L2_REFUSALS.command_signature_translation_oom,
 ];
 
 // ⚠ `Hresult` is imported for the `E_*`/`S_OK` constants this file returns; the

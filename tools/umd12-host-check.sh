@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # tools/umd12-host-check.sh — the LINUX-HOST cross-check for `umd12`.
 #
-# This is the per-lane inner loop described in `docs/dx12/PARALLEL.md` §7: every
+# This checks the Rust side without occupying the VM: every
 # Rust type, every one of the 214 DDI slot signatures and all 1 904 bindgen
 # layout assertions type-check here, on the Linux host, with no VM, no WDK and
 # no contention for the single `win11` adapter. `umd12/build.rs` serves the
@@ -15,14 +15,9 @@
 # `--clippy` (first argument only) runs `cargo clippy` instead of `cargo check`;
 # every other argument is forwarded verbatim.
 #
-# ⭐ The `--clippy` mode is not a convenience. `PARALLEL.md` §10's per-lane merge
-# bar requires `-D warnings` clippy over 214 hand-written handlers — that row is
-# where `missing_safety_doc` earns its keep — and the bare command in that table
-# dies in `link-cplusplus` exactly like the bare `cargo check` did, with an error
-# naming `lib.exe` and nothing about clippy. A lane hitting that concludes the
-# tree is broken, or quietly drops the row. Both overrides belong in ONE place,
-# so §10 points here. Clippy links nothing, so this is not the `build` mode
-# forbidden below.
+# The `--clippy` mode supplies the same cross-check overrides as `cargo check`.
+# Without them, `link-cplusplus` fails looking for `lib.exe` before clippy can
+# inspect the Rust code. Clippy links nothing, so this is not a shipping build.
 #
 # ⛔ `check`/`clippy` ONLY — never `build`, and this script must never grow a `build`
 # mode. The two `--config` overrides below tell cargo that the build scripts of
@@ -35,8 +30,7 @@
 #     tools\umd-check.ps1 -Mode release -Crate umd12
 # on the VM, where clang-cl, the MSVC STL and the vkd3d archive actually exist.
 #
-# ⚠ Equally, a clean run here says nothing about the C++ half. `PARALLEL.md` §7's
-# "what it does NOT cover" table is the authority: the cxx bridge's C++
+# A clean run here says nothing about the C++ half: the cxx bridge's C++
 # compilation, the link set, bindgen regeneration from the real SDK header and
 # anything that runs are all VM-only.
 #
@@ -72,15 +66,14 @@ set -euo pipefail
 readonly TARGET_TRIPLE="x86_64-pc-windows-msvc"
 
 # Resolve the repo root from this script's own location, so the script works
-# from any cwd (agents run in worktrees; PARALLEL.md §7 recommends `isolation:
-# "worktree"`).
+# from any cwd, including worktrees.
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd -- "${script_dir}/.." && pwd)"
 
 # ⚠ `umd12` is a standalone crate with its own `Cargo.lock` — there is no
 # workspace manifest at the repo root — so the check runs from the crate
 # directory. `CARGO_TARGET_DIR=target/linux` is therefore relative to
-# `umd12/`, matching the recipe PARALLEL.md §7 documented and keeping Linux
+# `umd12/`, keeping Linux
 # artifacts out of the Windows target dir (AGENTS.md: the two toolchains
 # produce incompatible artifacts and must never share one target dir).
 readonly CRATE_DIR="${REPO_ROOT}/umd12"

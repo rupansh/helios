@@ -59,8 +59,8 @@ use core::marker::PhantomData;
 use helios_umd_common::hr::{Hresult, E_INVALIDARG, S_OK};
 use helios_umd_common::noop::stub_fill_bytes;
 
-use super::{cmdlist, copy, descriptors, fence, misc, present12, pso, queue, resource12, rootargs};
 use super::noop12;
+use super::{cmdlist, copy, descriptors, fence, misc, present12, pso, queue, resource12, rootargs};
 use crate::{caps12, ddi12, log_error, note_refusal, UMD12_REFUSALS};
 
 /// `D3D12DDI_DEVICE_FUNCS_CORE_0109` — 124 slots.

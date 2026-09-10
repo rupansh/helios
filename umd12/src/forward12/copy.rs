@@ -956,68 +956,68 @@ unsafe extern "C" fn resource_copy(
     unsafe { state.engine().CopyResource(dst, src) };
 }
 
-/// `pfnCopyTiles` — **REFUSED**, `L3cCopyTilesRefused`.
-///
-/// ⛔ This driver reports `TiledResourcesTier = NOT_SUPPORTED`
-/// (`caps12.rs:278`), so no tiled resource can exist for this DDI to copy
-/// through. Refusing is the coherent answer.
-///
-/// ⭐ **And it is now reported, which it was not.** The earlier revision counted
-/// this silently, reasoning that *"a hit means a caps inconsistency somewhere
-/// else and removing the device would not fix it"*. The first half stands; the
-/// second described `pfnSetErrorCb`, which is no longer the channel — see
-/// [`report_error`]. Whoever's fault the call is, the tile copy **did not
-/// happen**, and a `VOID` return that says nothing is the fake success AGENTS.md
-/// forbids. Quarantining the one list that recorded it is the proportionate
-/// answer and hands the application a failing `Close()`.
-///
-/// ⚠ Still no log line: the counter plus the summary `note_refusal` emits on its
-/// first hit is the readout, and this DDI is per-region traffic that a budgeted
-/// line would only half cover.
-///
-/// ⚠ **`DX12.md` §4.4 makes `TiledResourcesTier >= 2` a feature-level 12_1
-/// floor**, and it lands with this slot plus `pfnUpdateTileMappings`,
-/// `pfnCopyTileMappings`, `pfnGetMipPacking` and the reserved-resource arm of
-/// `pfnCreateHeapAndResource`. ⛔ The tier is **UMD-only** — Vulkan sparse
-/// binding, which the guest supports end to end (`DECISIONS.md` §2) — and **not**
-/// a KMD dependency. That claim was made twice and falsified twice; do not cost
-/// the feature level as if the KMD were on its critical path.
-///
+/// Translate tile geometry; the engine validates resource geometry and records
+/// copies with its ordinary copy barriers and submission lifetime handling.
 /// # Safety
-/// `h_list` must be a live handle from `queue::create_command_list`; the
-/// remaining arguments are the runtime's and this body reads none of them.
+/// Live list/resources and pointers to individual runtime coordinate/size inputs.
 unsafe extern "C" fn copy_tiles(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
-    _h_resource: ddi12::D3D12DDI_HRESOURCE,
-    _region_start_coord: *const ddi12::D3D12DDI_TILED_RESOURCE_COORDINATE,
-    _region_size: *const ddi12::D3D12DDI_TILE_REGION_SIZE,
-    _h_buffer: ddi12::D3D12DDI_HRESOURCE,
-    _buffer_start_offset_in_bytes: ddi12::UINT64,
-    _flags: ddi12::D3D12DDI_TILE_COPY_FLAGS,
+    h_resource: ddi12::D3D12DDI_HRESOURCE,
+    region_start_coord: *const ddi12::D3D12DDI_TILED_RESOURCE_COORDINATE,
+    region_size: *const ddi12::D3D12DDI_TILE_REGION_SIZE,
+    h_buffer: ddi12::D3D12DDI_HRESOURCE,
+    buffer_start_offset_in_bytes: ddi12::UINT64,
+    flags: ddi12::D3D12DDI_TILE_COPY_FLAGS,
 ) {
-    L3C_REFUSALS.copy_tiles_refused.bump();
-    // ⛔ A budgeted line, and it is not decoration: `report_error` narrows every
-    // HRESULT this file passes to `D3DDDIERR_APPLICATIONERROR`, so the log line
-    // at the call site is the ONLY place the reason survives. This slot was the
-    // one reporting arm in the file without one, which made `report_error`'s own
-    // doc — *"every reporting arm here has one"* — false.
-    //
-    // ⚠ `bump`, not `note_refusal`, now that the line exists: R911, an
-    // already-loud arm must not also print the whole refusal set.
-    if let Some(n) = budget(&COPY_LOG) {
-        log_error!(
-            "CopyTiles: refused -- this driver reports TiledResourcesTier = NOT_SUPPORTED, so no \
-             tiled resource can exist for this DDI to copy (x{})",
-            n + 1,
-        );
-    }
-    // SAFETY: the caller guarantees a live handle from `create_command_list`.
+    // SAFETY: runtime keeps this driver's list private block live for the call.
     let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
         note_refusal(&L3C_REFUSALS.command_list_missing);
         return;
     };
-    // SAFETY: `state` is the live list state resolved above.
-    unsafe { report_error(state, E_INVALIDARG) };
+    // SAFETY: runtime keeps both resource private blocks live for this call.
+    let (resource, buffer) = unsafe {
+        (
+            resource12::engine_resource(h_resource),
+            resource12::engine_resource(h_buffer),
+        )
+    };
+    if region_start_coord.is_null()
+        || region_size.is_null()
+        || flags & !7 != 0
+        || flags & 6 == 6
+        || resource.is_none()
+        || buffer.is_none()
+    {
+        note_refusal(&L3C_REFUSALS.copy_tiles_refused);
+        log_error!("CopyTiles: invalid resource, geometry pointer or flags");
+        // SAFETY: state is the live list error channel, not the entire device.
+        unsafe { report_error(state, E_INVALIDARG) };
+        return;
+    }
+    let (Some(resource), Some(buffer)) = (resource, buffer) else {
+        return;
+    };
+    // SAFETY: non-null pointers address one live input each; API structs are
+    // translated field by field and live until the synchronous call returns.
+    let (coord, size) = unsafe {
+        (
+            queue::tiles::coordinate(core::ptr::read_unaligned(region_start_coord)),
+            queue::tiles::region(core::ptr::read_unaligned(region_size)),
+        )
+    };
+    // SAFETY: all arguments are live engine objects/API descriptors. The engine
+    // validates geometry, packed mip exclusion, ranges and unsupported formats;
+    // recording failures propagate through the engine Close error channel.
+    unsafe {
+        state.engine().CopyTiles(
+            resource,
+            &coord,
+            &size,
+            buffer,
+            buffer_start_offset_in_bytes,
+            windows::Win32::Graphics::Direct3D12::D3D12_TILE_COPY_FLAGS(flags),
+        )
+    };
 }
 
 /// The two buffer-region slots' shared body: resolve both placements, then hand

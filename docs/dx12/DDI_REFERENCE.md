@@ -1865,6 +1865,15 @@ without a valid `pPagingFenceValue`/`WaitMask` hangs the caller with no error an
 
 ### 9.9 Root signatures, PSOs, PSO libraries, state objects
 
+**Current implementation (2026-09-08):** the native DDI translates the parsed
+tree into owned version-1.2 API descriptors and calls a private statically linked
+engine factory. It preserves all range/root/static-sampler flags and supports
+the driver's 128-DWORD capacity while retaining the public API's 64-DWORD limit.
+ClearRootArguments has its own engine operation; it does not call ClearState.
+See [ROOT_SIGNATURES.md](ROOT_SIGNATURES.md) for implementation and validation
+boundaries. The earlier serializer/export discussion below describes the former
+path; that serializer is retained only for internal empty/probe roots.
+
 **Root signatures arrive PARSED, not as a blob.** Verbatim (umddi:12269-12290):
 
 ```c
@@ -1903,7 +1912,7 @@ a serialized blob, never a 1.0 arm. ⚠ The same spec contains a sentence claimi
 version"* arrives and that the DDK ships deserializer source: that is **dead text**, contradicted by the
 spec's own DDI struct and by the `D12-G5` measurement. The measurement wins.
 
-**Three constraints on the H3 re-serializer that nothing here recorded before:**
+**Three constraints on the H3 translation:**
 
 1. **Defaults are already applied.** For descriptor-range flags and root-descriptor flags the runtime
    fills in the documented API defaults before the driver sees them, so the driver **cannot distinguish
@@ -1948,17 +1957,18 @@ the descriptor-heap flags genuinely do collide on `0x1` with different meanings 
 `descriptors.rs::api_heap_flags` translates them with a `const _` pinning the collision. A half-true
 row is worse than a false one, because the true half lends it credibility.
 
-⇒ The generalisable form, which is `PARALLEL.md` §10's **claim-integrity** lens: *an ABI claim in a
+⇒ The generalisable form: *an ABI claim in a
 document is a claim, and both sides of it are machine-generated — so it can always be checked, and
-it must be, before a lane writes code against it.*
+it must be, before writing code against it.*
 
 At `_0100` the union has exactly one arm, `pRootSignature_1_2` — **the driver is handed
 1.2-shaped root signatures only**; the runtime up-converts 1.0 and 1.1. (⚠ Still switch on
 `Version` with an exhaustive match: a future revision adds arms, and `DECISIONS.md` §7.4 forbids an
 `else`.)
 
-⚠ **vkd3d's `ID3D12Device::CreateRootSignature` wants a serialized DXBC `RTS0` blob**
-(`vkd3d-proton-helios/libs/vkd3d/device.c:6514-6531`), so **the UMD must re-serialize**. The
+**Earlier implementation rationale:** vkd3d's public `ID3D12Device::CreateRootSignature`
+wants a serialized DXBC `RTS0` blob, so the original UMD re-serialized. The current
+private driver factory accepts the parsed versioned tree directly. The retained
 function exists — `vkd3d_serialize_root_signature(const D3D12_ROOT_SIGNATURE_DESC*, version, blob,
 error_blob)` at `vkd3d-proton-helios/include/vkd3d.h:129` and `libs/vkd3d/vkd3d_main.c:453`, layered
 on `vkd3d_shader_serialize_root_signature` (`libs/vkd3d-shader/dxbc.c:1384`, writer at
@@ -2681,8 +2691,19 @@ typedef struct D3D12DDI_3DPIPELINESUPPORT1_DATA_0081
 
 ```
 cap 1007  ->  min(driver_max, D3D12DDI_3DPIPELINELEVEL_12_1)
-cap 1074  ->  out = min(driver_max, in.HighestRuntimeSupportedFeatureLevel)
+cap 1074  ->  highest supported enumerant <= driver_max and <= runtime input
 ```
+
+The numerical minimum is sufficient for known runtime enumerants, but the enum
+has gaps. Current `caps12` selects from supported enumerants, refuses a limit
+below the lowest one and touches only the output member. The input member is
+read alone; the output need not be initialized. `tools/d3d12_adapter_probe.cpp`
+exercises both actual adapter-table selectors, short/unaligned buffers, guards,
+unknown limits and a protected input member. On 2026-09-10, the exact 898F75F9
+release passes all184 direct DDI checks, including version and foreign-handle
+refusals. Native runtime PID8076 separately exercises input14 -> output13 and
+creates through FL12_1. See FEATURE_LEVELS.md for the evidence scope; this does
+not establish admission of the synthetic lower/future feature levels.
 
 Below FL 11_0 there are only `1_0_GENERIC` and `1_0_CORE` — compute-only profiles paired with
 `D3D12DDICAPS_TYPE_0033_ADAPTER_COMPUTE_ONLY` (1066), which a render+display adapter answers
@@ -4077,7 +4098,7 @@ exists, and the substrate is measured green (`DECISIONS.md` D6).
 
 **The three things with no D3D11 analogue at all**, in the order they will cost time:
 
-1. **Root signatures** — parsed in, `RTS0` blob out (§9.9), plus the 16 root-argument slots on the
+1. **Root signatures** — parsed DDI tree into the private versioned engine factory (§9.9), plus the 16 root-argument slots on the
    command-list table.
 2. **PSOs from handle bundles** — four sub-state objects retained and reassembled (§9.9).
 3. **Descriptor heaps** — driver-owned storage, driver-chosen stride, opaque handles. ⭐ And this is

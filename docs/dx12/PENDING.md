@@ -1,9 +1,101 @@
-# PENDING.md — what is left before FL 12_1 and before a real D3D12 app runs
+# PENDING.md — native FL12_0/FL12_1 and higher-feature contracts
+
+
+Current release UMD12 `8F15F9DC…` adds checked AS input envelopes/counts, defined
+prebuild failure output and temporary-allocation cleanup, plus the low-32-bit
+geometry stride rule. [DXR_SERIALIZATION.md](DXR_SERIALIZATION.md#as-build-inputs-and-prebuild-failures-2026-09-10)
+records 34,489 engine checks per direct NVIDIA/paired Venus stack and the exact
+native caps/four-case ordering regression. Native RT remains0; those native
+tests cannot exercise the changed RT code. Tools visualization, arbitrary AS
+alias/lifetime behavior, native DXR and Port Royal acceptance remain open.
+
+Preceding release UMD12 `898F75F9…` enforces adapter-token refusals and repairs
+extended-query member access and supported-enumerant selection. Both FL query
+forms, runtime-limit/buffer cases and DDI negotiation now have184 passing direct
+DDI checks, with36 failures reproduced on2D90C57E. Native FL11_0..12_1 creation
+and all four GPU ordering cases pass on898F75F9; RT0 remains. The seven static
+engine archives are unchanged. [FEATURE_LEVELS.md](FEATURE_LEVELS.md#adapter-admission-contract-2026-09-10)
+records the exact deployment and separates synthetic DDI tests from native GPU
+evidence. Full sparse compatibility, DXR tools visualization, native DXR and
+Port Royal acceptance remain open.
+
+The preceding release UMD12 `2D90C57E…` adds checked AS recording addresses and
+explicit AS copy-stage masks. [DXR_SERIALIZATION.md](DXR_SERIALIZATION.md#as-address-and-copy-range-validation-2026-09-10)
+records33,859 direct NVIDIA and paired Venus engine checks, copy-range diagnostic
+attribution and the current native validation:19 query/filter/raster groups
+pass781,199 checks and all four ordering cases pass. The exact native DXR probe
+exits BLOCKED77 at RT0; native DXR remains unadmitted.
+The13 recording refusals are engine tests; the native runtime can reject these
+malformed calls before the DDI. General GPU extent/alias validation is separate.
+
+The earlier22C31F11 build passed the DGC query repair,23 inherited groups,
+filtering,13 raster groups, four ordering cases and completed Time Spy, Fire
+Strike and Steel Nomad Vulkan. [DGC_QUERIES.md](DGC_QUERIES.md) records those
+exact binary-bound results. Its graphics scores23,071/59,806/9,384 and changing
+frames are not acceptance of2D90C57E. No performance gain is attributed and owner
+visual acceptance remains pending. TotalLaneCount1024 remains an explicit,
+counted reporting estimate.
+
+Current evidence and full capability matrix: [FEATURE_LEVELS.md](FEATURE_LEVELS.md).
+DX12 has priority. Keep the native static UMD and WDDM2.1. The owner authorized
+the renderer/protocol fork on 2026-09-09; [NATIVE_DGC.md](NATIVE_DGC.md) supersedes
+the former stock-renderer and private-emulation policies. Its D3D12 compute-query discrepancy is repaired by DGC_QUERIES.md; the raw
+Vulkan counter observation remains. The paired guest is deployed.
+DXR/Port Royal and later FL12_2/Speed Way require separate acceptance.
+
+Current UMD12 `8F15F9DC…` with guest Mesa `43394BBD…` admits native FL12_0/FL12_1,
+tiled2 and SM6.0; RT remains0. These are compatibility-candidate caps, not a
+claim of complete feature-level conformance. The owner authorized committed
+reserved-image backing with explicit missing mapping/alias/residency semantics;
+[SPARSE_COMPATIBILITY.md](SPARSE_COMPATIBILITY.md) defines that exception.
+
+Eighteen bounded native tiled cases passed on22C31F11; reserved 3D
+textures have the expected tier-2 refusal. Coverage includes initialized D32 MSAA
+CopyTiles (98,304 exact words), buffer mapping ordering and lifetime. Separate
+no-output multisampling passes17,280 words; DXBC/DXIL ROV and conservative-raster
+tests pass1,650 assertions. [D32_COPY.md](D32_COPY.md) records raw-copy and compiler
+work. [INDIRECT_EMULATION.md](INDIRECT_EMULATION.md),
+[ROOT_SIGNATURES.md](ROOT_SIGNATURES.md) and [STREAM_OUTPUT.md](STREAM_OUTPUT.md)
+retain their preceding-build validation scopes. Do not transfer a prior build's
+behavioral acceptance to a later binary solely because device creation succeeds.
+
+The earlier 2AD1 TIR refusal is repaired by [TIR.md](TIR.md) on UMD12
+`0C292592…`, unchanged .271/43394BBD and the paired renderer. All 13 native
+TIR/ROV/conservative groups complete with zero failures/skips, including 420
+TIR readback records. Optional RGBA32_FLOAT target16 remains unavailable.
+Complete formats/raster limits, sparse compatibility semantics and broader
+failure/lifetime paths remain separate acceptance work.
+
+Native missing-maintenance8 denial is now proven with exact loaded identities
+and zero-loss ETW: the engine guard refuses, and native CreateDevice returns
+E_FAIL. Native DXR probe PID4252 admits FL12_1 but returns BLOCKED77 at RT0 before
+any RT command. Tools-visualization AS operations, arbitrary AS alias/lifetime cases and native
+RT behavior remain unresolved; Port Royal is not ready. The recorded copy-range
+messages have fixture-specific accessed-range attribution in DXR_SERIALIZATION.md.
+[DXR_SERIALIZATION.md](DXR_SERIALIZATION.md) records the repaired execution-time
+TLAS restore and serialization query, and distinguishes the non-DGC engine
+query-split refusal from the paired native surface where that refusal is unreachable.
+
+Earlier full stock Time Spy, Fire Strike and Steel Nomad Vulkan completed on2AD1, with
+exported results and loaded identities. Changing test frames cover Time Spy and
+Steel Nomad; a separate completed Fire Strike GT1 control supplies its frame
+pair. The owner stopped other GPU work, so new measurements can describe current
+performance. Earlier shared-GPU runs cannot attribute performance changes. Owner
+visual acceptance remains pending.
+
+The prior PID6320 failed teardown remains unresolved despite an authorized guest
+reboot and passing corrected depth repetition. Producer completion is not
+consumer release. General DX12-to-DX11 external ownership, error-bearing host-loss
+retirement, sharing/unchanged bindings, resize/rotation, teardown/cancellation,
+async WSI stress and pending allocator Reset/fence-worker lifetime remain open.
+Exact source/build/deployment and test receipts are linked from ROADMAP.md and
+FEATURE_LEVELS.md. The older dated sections below retain their original scopes.
 
 **Written 2026-08-06** from four independent read-only inventories (DDI surface + caps, present/swapchain,
 sync/queues/residency, resources/descriptors/state), each `file:line`-cited, cross-checked, and with the
-load-bearing claims re-verified by the integrator. Organised as **`METHOD.md` Phase 1 subsystems**, because
-that is now the unit of work.
+load-bearing claims re-verified by the integrator. Organised by subsystem.
+The dated review rounds below record the former workflow; their round counts
+and sequencing requirements were retired by the owner on 2026-09-08.
 
 ⚠ **This is a gap list, not a plan.** Sizes are S/M/L with the reason. Nothing here is scheduled.
 
@@ -126,11 +218,10 @@ design question, not a patch, and it is the next real piece of work.
 `dumpbin /IMPORTS` → **no `dxgi.dll`**, link set still `libhelios_d3d12_static.a` + `gdi32`;
 `kmd-check.ps1 -Mode build` → 0 errors, 11 pre-existing dead-code warnings; `win_build_kmd`
 packaged + signed with `inf2cat`/`infverif` clean; `win_vkd3d` and `win_meson` clean; slot
-coverage **205/206**. ⇒ **no compile error revealed a wrong assumption**, so nothing was fed
-back as a new lens under `METHOD.md` §2 Phase 4.
+coverage **205/206**. No compile error revealed a wrong assumption in that build.
 
-⛔ **The KMD was deliberately NOT installed.** `METHOD.md` §2 puts deploy in Phase 4, after
-saturation; installing at Phase 1 is the rejected loop with a bigger blast radius.
+**The KMD was deliberately not installed at this historical checkpoint:**
+deployment was waiting on the review workflow then in force.
 
 ### The round-1 result: ~41 raw findings → **3 refuted, 5 survived (all narrowed)**
 
@@ -288,13 +379,11 @@ changeset (fixed: it no longer names a count, and it now names the hand-mirrored
 ⭐ `caps12.rs`'s "symbols, not lines" rule works — the six citations that drifted (+118, two of
 them the sole evidence for a cap decision) were into `misc.rs`, the one file not on its list.
 
-### ⚠ Round 1 is NOT saturation
+### Historical round-1 review status
 
-`METHOD.md` §3 needs **two consecutive dry rounds with different lens compositions**, a
-completeness critic returning nothing, and every grading re-checked at the END of the merge.
-Round 1 was not dry. Round 2 must rotate at least two lenses — and the four-lens false
-convergence above says one of the new ones should be **"which of these findings share a
-source?"**
+Round 1 left unresolved findings. The four-lens false convergence above motivated
+checking whether purportedly independent findings shared a source. The prescribed
+follow-up rounds belonged to the retired workflow.
 
 ---
 
@@ -376,7 +465,7 @@ duplicate cannot drift without failing to compile.
 
 ## ⭐ STATUS 2026-08-06 — WAVE 1 LANDED, and five of this document's own claims were wrong
 
-A four-lane `METHOD.md` Phase 1 wave landed after this document was written. **Read this block before
+A four-lane implementation wave landed after this document was written. **Read this block before
 any row below it.** Everything landed is still **`implemented-but-never-exercised`** — `kmd_render`
 does not typecheck on Linux at all (`bytemuck_derive` proc-macro for the linux target, *not* only
 bindgen), so no compiler has seen the KMD half; the mitigation was to extract every decision table
@@ -441,13 +530,14 @@ Also: the five unrunnable `kmd_render` tests recovered into `kmd_logic`.
   2049..=4000 samplers will fail `E_INVALIDARG` — but 2048 is what the runtime rejects as *too
   small*, which fails **device creation**. The repair is a named counter, not a lower cap.
 
-### ⭐ Why four FL 12_1 floors moved with no implementation work
+### Optional capabilities still have eligibility requirements
 
-The doc and the code both said the level and its floors *"move together or not at all"*. **That
-implication is one-way**: you must not raise the level without the floors, but you *may* report a
-backed floor without raising the level. That misreading held three fully-backed caps at their absent
-values with their slots already forwarding verbatim. **Only `TiledResourcesTier` (§3 S-6) now
-remains, and the level is still not raised.**
+A cap may exceed a feature level's mandatory minimum only within that feature's
+eligibility rules. The earlier unrestricted one-way implication was overbroad:
+Microsoft's D3D12 feature table excludes ROV and conservative rasterization at
+maximum FL11_0. Candidate6344's DDI answers ROV1/conservative3, while the native
+API answers0/0, consistent with FL11_1+ eligibility. The internal runtime branch
+is untraced. See FEATURE_LEVELS.md for primary sources and exact native evidence.
 
 ---
 
@@ -455,16 +545,11 @@ remains, and the level is still not raised.**
 
 ### 0a. ⛔ "FL 12_1" and "real apps and benchmarks" are DIFFERENT targets, and the second is harder
 
-**Night Raid and Time Spy require FL 11_0, which this driver already reports.** So the feature level is *not*
-what stands between Helios and a benchmark score. And FL 12_1 is far cheaper than the doc set says: the
-measured engine backs **all five** floors (`docs/dx12/baselines/d3d12-caps.csv` — binding tier 3, tiled tier 4,
-typed-UAV-load 1, ROVs 1, conservative raster 3), and four of the five are **caps constants whose slots are
-already real**. Only tiled/reserved resources needs bodies, and that is **S across five sites**, not the "long
-pole" §4.4 implies.
-
-⇒ **Two of the five were held back by stale reasons written in code comments** — claims that named a blocker
-which no longer exists (`ROVs`, corrected in `63b8f1b`; `ResourceBindingTier`'s "L5 has not written a
-descriptor handler yet", stale since all 15 descriptor slots landed).
+Feature-level conformance and benchmark completion are separate acceptance
+requirements. The current FL11_0 ceiling admits Time Spy, while the FL12_1/12_2
+contracts include inherited obligations that earlier five-floor summaries missed.
+The fresh stack matrix, concrete refusals and implementation state are in
+[FEATURE_LEVELS.md](FEATURE_LEVELS.md).
 
 ### 0b. ⛔ Slot coverage is being read as capability, and the gap is enormous
 
@@ -476,7 +561,7 @@ SamplerFeedbackUAV — i.e. ~95 % of view translation, every cube/array/3D/MSAA/
 map/upload path** (`MapHeapCalls = 0`), **every query slot**, **every placed resource**, every tiled resource,
 `pfnWriteBufferImmediate`, `pfnExecuteIndirect`, and `pfnCheckResourceAllocationHandle`.
 
-⇒ This is `METHOD.md` saturation criterion 6 — *implemented but never exercised* — and it is the single
+⇒ These paths were *implemented but never exercised* at that checkpoint, the single
 largest unsized quantity in the doc set.
 
 ---
@@ -576,47 +661,55 @@ engine's heap-tier answer rather than pinning a number (`SUBSTRATE.md:1055-1078`
 
 ---
 
-## 3. FL 12_1 itself — four constants and one subsystem
+## 3. FL12_0 and FL12_1 contracts
 
-| floor | engine | driver | in the way |
-|---|---|---|---|
-| `TypedUAVLoadAdditionalFormats` | 1 | 0 | one const + one format mask |
-| `ResourceBindingTier` | 3 | 1 | ⛔ nothing — the stated reason is **stale** |
-| `ROVs` | 1 | 0 | ⛔ nothing — the stated reason was **false**, corrected `63b8f1b` |
-| `ConservativeRasterizationTier` | 3 | 0 | ⛔ nothing — `pfnCreateRasterizerState` already forwards the mode verbatim |
-| `TiledResourcesTier` | 4 | 0 | **S-6 below** |
+The earlier five-floor sketch was not a complete contract. Current native
+admission remains FL11_0, tiled 0 and RT0. Candidate6344 implements the reserved,
+mapping, SO and DXR paths listed in FEATURE_LEVELS.md. Its bounded native SO
+suite passes34 cases; the tiled/DXR probes stop at advertised admission boundaries.
 
-**S-6 · Tiled/reserved resources. S across five sites** — the create arm (`E_NOTIMPL`), two tile-mapping slots
-(VOID counted noops, so an app gets **no error**), `pfnCopyTiles`, `pfnGetMipPacking`, plus two caps
-withholding sites. Near-pure forwards: the structs are field-identical and the flag enums value-identical.
-⭐ **Verified: it is not a KMD dependency.** vkd3d derives the tier purely from Vulkan sparse features and all
-ten preconditions hold on this guest; tile mapping is `vkQueueBindSparse`, ordered inside vkd3d by its own
-timeline semaphore, imposing **no new WDDM ordering requirement**. The venus wire protocol carries the command
-and the Mesa ICD implements it — the guest side is complete end to end.
-
-Then the level itself, in **one commit with its floors** (the rule at `caps12.rs:246-249`).
+Mandatory inherited state-changing ExecuteIndirect has bounded acceptance, with
+full contract coverage still incomplete. The isolated fallback implements root
+constants/CBV/SRV/UAV plus draw/indexed draw/dispatch, and execution-time VBV/IBV
+continuation without DGC. Native signatures connect those tokens; CB48 graphics
+constants/CBVs pass 12 cases/48 readback words, and 361C/BE9D mixed root/VBV/IBV/
+indexed draws pass 12 cases/48 words plus query and pending-list Reset checks.
+Compute/SRV/UAV and broader inherited graphics forms still need native tests.
+See INDIRECT_EMULATION.md for exact test status. Native runtime instrumentation of expanded root
+signatures, complete formats/MSAA and SO limits remain separate obligations.
+Sparse mapping also needs exact runtime queue admission and authenticated
+completion; the older claim of no WDDM ordering obligation is withdrawn.
+FL12_0 retains tiled tier 2 and every inherited D3D12 requirement, including
+state-changing indirect graphics and compute. FL12_1 additionally requires ROV/conservative raster
+behavior; its conformance and a completed, owner-accepted Port Royal run remain distinct.
 
 ---
 
 ## 4. DEGRADES — runs, wrong or slow
 
-Root signatures down-converted to 1.0, losing **1.2 static-sampler flags** (correctness, **S**) · single-slice
-array/cube views collapse to non-array dimensions ⇒ wrong `VkImageViewType` (**M**) · stream output dropped
-*including* `RasterizedStream`, so a discard-only GS **rasterizes** (**S**) · pipeline libraries refused while
+Root-signature flag loss and ClearRootArguments are repaired; their remaining
+acceptance limits are in ROOT_SIGNATURES.md. Other gaps: single-slice
+array/cube views collapse to non-array dimensions ⇒ wrong `VkImageViewType` (**M**) · the older stream-output
+loss is repaired in candidate6344 with34 bounded native cases passing; complete SO limits remain open · pipeline libraries refused while
 vkd3d ships a complete implementation ⇒ every PSO recompiled per launch (**L**) · `WriteBufferImmediateQueueFlags`,
-`DepthBoundsTest`, `OutputMergerLogicOp`, `ViewInstancing`, `CopyQueueTimestampQueries` all reported unsupported
+`DepthBoundsTest`, `OutputMergerLogicOp`, `CopyQueueTimestampQueries` all reported unsupported
 while backed (**XS** each) · `MaxSamplerDescriptorHeapSize = 4000` vs a possible engine ceiling of 2048 (**S**)
-· `pfnClearRootArguments` mid-list `ClearState` (**S**) · per-fence completion unbatched at ~1800/s (**M**) ·
+· per-fence completion unbatched at ~1800/s (**M**) ·
 three WDDM contexts × 256+256 lists + 256 KiB each (**S**, knob-gated) · `QueryVideoMemoryInfo(NON_LOCAL).Budget`
 reads small ⇒ engines trim, pop-in (**XS** to measure).
+
+`ViewInstancing` remains unreported. The new multiview query test exposes a
+Vulkan-to-D3D statistics mismatch; an engine tier report alone does not establish
+this optional feature's native contract. It is outside the FL12_0 requirement set.
 
 **Residency needs nothing.** D3D12 heaps are venus-ICD memory, never dxgkrnl segment commitments, so
 `ApertureSegmentCommitLimit = 64 MiB` **cannot fail an allocation**; `MakeResident`/`Evict` return `S_OK`
 honestly and `E_PENDING` is unreachable by construction.
 
-**Command-allocator lifetime needs nothing from us** — retirement is vkd3d's own per-VkQueue timeline, genuinely
-GPU-truthful, no `ID3D12Fence` involved. ⚠ But `pool_reset_engine_failed` **can never fire** (vkd3d returns
-`S_OK` on the early-reset path), so umd12 is blind to it: re-grade that counter.
+**Command-allocator lifetime remains acceptance work.** The pending-allocator-reset/
+fence-worker lifetime question is unresolved. Engine timeline retirement alone
+is not proof of every native reset/teardown interleaving; see EXECUTION_SYNC.md.
+A successful API Reset and a silent counter do not discharge that question.
 
 ---
 
@@ -685,3 +778,13 @@ survive in someone's notes. Everything unmarked is still open.
   (`slot_63_and_new_generation_never_alias`) — which is why `kmd_logic`'s own doc comment still says
   *"These six tests lived in `kmd_render`"*. That sentence is wrong about provenance, not arithmetic,
   and `gpu/mod.rs`'s note (*"FIVE tests (not six …)"*) is the one to trust for the original.
+
+The 2026-09-09 execution-time AS metadata reader closes the host-engine
+TLAS-first/later-BLAS-recording case with direct NVIDIA and Linux Venus readback
+and rejection tests. See [DXR_SERIALIZATION.md](DXR_SERIALIZATION.md). Native
+DXR admission, tools visualization and broader AS alias/lifetime acceptance
+remain open. The copy-range diagnostics have fixture-specific attribution in
+the linked document; this is not Port Royal readiness. The 2026-09-10
+execution-time serialization-query implementation additionally passes closed-list
+TLAS -> BLAS -> TLAS replays on direct NVIDIA and Linux Venus. Unsplittable query
+scopes and arbitrary alias/lifetime/failure cases still need acceptance.

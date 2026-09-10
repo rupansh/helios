@@ -76,6 +76,8 @@
 use core::ffi::c_void;
 
 use helios_umd_common::slot::{Boxed, BoxedHandle, DdiHandle, Slot};
+use windows::core::PCSTR;
+use windows::Win32::Graphics::Direct3D12::{D3D12_SO_DECLARATION_ENTRY, D3D12_STREAM_OUTPUT_DESC};
 
 use super::pso::{set_error_if_possible, L6_REFUSALS};
 use super::tables12::{stage, DeviceCoreTable, Filling};
@@ -220,6 +222,169 @@ pub struct ShaderState {
     /// [`crate::forward12::pso::create_pipeline_state`] compares them and bumps
     /// `L6ShaderRootSignatureMismatch`.
     pub(crate) h_root_signature: *mut c_void,
+
+    /// An SO-only handle has no GS program. Its declaration captures the last
+    /// active pre-raster stage when a pipeline is assembled.
+    pub(crate) stream_output: Option<StreamOutputState>,
+}
+
+/// Owned stream-output description. The DDI arrays are borrowed only during
+/// shader creation; every pointer subsequently handed to the engine addresses
+/// these owned arrays or the static private register semantic below.
+pub(crate) struct StreamOutputState {
+    entries: Vec<D3D12_SO_DECLARATION_ENTRY>,
+    strides: Vec<u32>,
+    rasterized_stream: u32,
+}
+
+impl StreamOutputState {
+    pub(crate) fn desc(&self) -> D3D12_STREAM_OUTPUT_DESC {
+        D3D12_STREAM_OUTPUT_DESC {
+            pSODeclaration: self.entries.as_ptr(),
+            NumEntries: self.entries.len() as u32,
+            pBufferStrides: self.strides.as_ptr(),
+            NumStrides: self.strides.len() as u32,
+            RasterizedStream: self.rasterized_stream,
+        }
+    }
+}
+
+// Private UMD/engine ABI: semantic index denotes the physical DDI output
+// register, StartComponent denotes an absolute register component, and Stream
+// retains the geometry stream. The private SO pipeline factory explicitly
+// supplies DDI origin before libs/vkd3d-shader/dxil.c recognizes this name;
+// public shaders may legally use the same spelling as an ordinary semantic.
+// Original DXIL semantics are unavailable at the DDI and the compiler
+// reads them from bitcode, so fabricated OSG1 names cannot be used for SO.
+const SO_REGISTER_SEMANTIC: &[u8] = b"__HELIOS_DDI_SO_REGISTER\0";
+
+enum StreamOutputError {
+    InvalidArgument,
+    OutOfMemory,
+}
+
+/// Translate and validate the complete declaration before retaining anything.
+/// A gap is the WDK's explicit register sentinel; its low four mask bits count
+/// skipped components, exactly as for a non-gap entry.
+///
+/// # Safety
+/// `a` and its counted arrays are runtime-owned, unchanged and live for this DDI call.
+unsafe fn stream_output_state(
+    a: &ddi12::D3D12DDIARG_CREATE_GEOMETRY_SHADER_WITH_STREAM_OUTPUT_0026,
+) -> Result<StreamOutputState, StreamOutputError> {
+    let count = a.NumEntries as usize;
+    let stride_count = a.NumStrides as usize;
+    // Each entry consumes at least one component of a stream's 128-component
+    // output window. Four streams and four buffers are the WDK limits.
+    if count > (ddi12::D3D12_SO_OUTPUT_COMPONENT_COUNT * ddi12::D3D12_SO_STREAM_COUNT) as usize
+        || stride_count > ddi12::D3D12_SO_BUFFER_SLOT_COUNT as usize
+        || (count != 0 && a.pOutputStreamDecl.is_null())
+        || (stride_count != 0 && a.BufferStridesInBytes.is_null())
+        || (a.RasterizedStream >= ddi12::D3D12_SO_STREAM_COUNT
+            && a.RasterizedStream != ddi12::D3D12_SO_NO_RASTERIZED_STREAM)
+    {
+        return Err(StreamOutputError::InvalidArgument);
+    }
+    let declarations = if count == 0 {
+        &[]
+    } else {
+        // SAFETY: count/pointer checked above; caller guarantees array extent.
+        unsafe { core::slice::from_raw_parts(a.pOutputStreamDecl, count) }
+    };
+    let strides = if stride_count == 0 {
+        &[]
+    } else {
+        // SAFETY: count/pointer checked above; caller guarantees array extent.
+        unsafe { core::slice::from_raw_parts(a.BufferStridesInBytes, stride_count) }
+    };
+    if strides
+        .iter()
+        .any(|stride| *stride > ddi12::D3D12_SO_BUFFER_MAX_STRIDE_IN_BYTES || *stride % 4 != 0)
+    {
+        return Err(StreamOutputError::InvalidArgument);
+    }
+    let mut stream_components = [0u32; 4];
+    let mut buffer_components = [0u32; 4];
+    let mut buffer_streams = [None; 4];
+    let mut translated_count = 0usize;
+    for entry in declarations {
+        if entry.Stream >= ddi12::D3D12_SO_STREAM_COUNT
+            || entry.OutputSlot >= ddi12::D3D12_SO_BUFFER_SLOT_COUNT
+            || entry.RegisterMask == 0
+            || entry.RegisterMask & !0xf != 0
+        {
+            return Err(StreamOutputError::InvalidArgument);
+        }
+        let gap = entry.RegisterIndex == ddi12::D3D12_SO_DDI_REGISTER_INDEX_DENOTING_GAP;
+        if !gap && entry.RegisterIndex >= ddi12::D3D12_SO_OUTPUT_COMPONENT_COUNT / 4 {
+            return Err(StreamOutputError::InvalidArgument);
+        }
+        let stream = entry.Stream as usize;
+        let buffer = entry.OutputSlot as usize;
+        if buffer_streams[buffer].is_some_and(|prior| prior != stream) {
+            return Err(StreamOutputError::InvalidArgument);
+        }
+        buffer_streams[buffer] = Some(stream);
+        let components = entry.RegisterMask.count_ones();
+        stream_components[stream] += components;
+        buffer_components[buffer] += components;
+        if stream_components[stream] > ddi12::D3D12_SO_OUTPUT_COMPONENT_COUNT
+            || buffer_components[buffer] * 4 > ddi12::D3D12_SO_BUFFER_MAX_WRITE_WINDOW_IN_BYTES
+        {
+            return Err(StreamOutputError::InvalidArgument);
+        }
+        // The validated four 128-component streams bound this sum to 512.
+        translated_count += if gap { 1 } else { components as usize };
+    }
+
+    // Reserve the expanded component count before any push. Retain Vec owners
+    // to avoid infallible allocation when shrinking into boxed slices. This
+    // handles only the SO-owned arrays; common shader/slot allocation is separate.
+    let mut entries = Vec::new();
+    entries
+        .try_reserve_exact(translated_count)
+        .map_err(|_| StreamOutputError::OutOfMemory)?;
+    let mut owned_strides = Vec::new();
+    owned_strides
+        .try_reserve_exact(stride_count)
+        .map_err(|_| StreamOutputError::OutOfMemory)?;
+    owned_strides.extend_from_slice(strides);
+
+    for entry in declarations {
+        let gap = entry.RegisterIndex == ddi12::D3D12_SO_DDI_REGISTER_INDEX_DENOTING_GAP;
+        let components = entry.RegisterMask.count_ones();
+        if gap {
+            entries.push(D3D12_SO_DECLARATION_ENTRY {
+                Stream: entry.Stream,
+                SemanticName: PCSTR::null(),
+                SemanticIndex: 0,
+                StartComponent: 0,
+                ComponentCount: components as u8,
+                OutputSlot: entry.OutputSlot as u8,
+            });
+        } else {
+            // A DDI mask can cross logical packed semantics. Individual
+            // components retain register identity and declaration order, and
+            // avoid inventing one semantic spanning two original DXIL values.
+            for component in 0..4 {
+                if entry.RegisterMask & (1 << component) != 0 {
+                    entries.push(D3D12_SO_DECLARATION_ENTRY {
+                        Stream: entry.Stream,
+                        SemanticName: PCSTR(SO_REGISTER_SEMANTIC.as_ptr()),
+                        SemanticIndex: entry.RegisterIndex,
+                        StartComponent: component,
+                        ComponentCount: 1,
+                        OutputSlot: entry.OutputSlot as u8,
+                    });
+                }
+            }
+        }
+    }
+    Ok(StreamOutputState {
+        entries,
+        strides: owned_strides,
+        rasterized_stream: a.RasterizedStream,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -477,18 +642,66 @@ fn encode_entry(is_patch_part: bool, system_value: u32, register: u32, mask: u8)
     // `…TRI_EDGE…` 13, `…TRI_INSIDE…` 14, `…LINE_DETAIL…` 15,
     // `…LINE_DENSITY…` 16.
     match system_value {
-        11 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 0, system_value: 11 },
-        12 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 1, system_value: 11 },
-        13 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 2, system_value: 11 },
-        14 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 3, system_value: 11 },
-        15 => EncodedEntry { name: NAME_INSIDE_TESS_FACTOR, semantic_index: 0, system_value: 12 },
-        16 => EncodedEntry { name: NAME_INSIDE_TESS_FACTOR, semantic_index: 1, system_value: 12 },
-        17 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 0, system_value: 13 },
-        18 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 1, system_value: 13 },
-        19 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 2, system_value: 13 },
-        20 => EncodedEntry { name: NAME_INSIDE_TESS_FACTOR, semantic_index: 0, system_value: 14 },
-        21 => EncodedEntry { name: NAME_TESS_FACTOR, semantic_index: 0, system_value: 15 },
-        22 => EncodedEntry { name: NAME_INSIDE_TESS_FACTOR, semantic_index: 0, system_value: 16 },
+        11 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 0,
+            system_value: 11,
+        },
+        12 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 1,
+            system_value: 11,
+        },
+        13 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 2,
+            system_value: 11,
+        },
+        14 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 3,
+            system_value: 11,
+        },
+        15 => EncodedEntry {
+            name: NAME_INSIDE_TESS_FACTOR,
+            semantic_index: 0,
+            system_value: 12,
+        },
+        16 => EncodedEntry {
+            name: NAME_INSIDE_TESS_FACTOR,
+            semantic_index: 1,
+            system_value: 12,
+        },
+        17 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 0,
+            system_value: 13,
+        },
+        18 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 1,
+            system_value: 13,
+        },
+        19 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 2,
+            system_value: 13,
+        },
+        20 => EncodedEntry {
+            name: NAME_INSIDE_TESS_FACTOR,
+            semantic_index: 0,
+            system_value: 14,
+        },
+        21 => EncodedEntry {
+            name: NAME_TESS_FACTOR,
+            semantic_index: 0,
+            system_value: 15,
+        },
+        22 => EncodedEntry {
+            name: NAME_INSIDE_TESS_FACTOR,
+            semantic_index: 0,
+            system_value: 16,
+        },
         _ => passthrough,
     }
 }
@@ -699,17 +912,28 @@ unsafe fn signature_parts<'a>(
             // SAFETY: non-null per the check, live per the caller.
             let s = unsafe { &*p };
             // SAFETY: every arm of these two unions is a pointer at offset 0.
-            let (inputs, outputs) = unsafe { (s.__bindgen_anon_1.pInputSignature, s.__bindgen_anon_2.pOutputSignature) };
+            let (inputs, outputs) = unsafe {
+                (
+                    s.__bindgen_anon_1.pInputSignature,
+                    s.__bindgen_anon_2.pOutputSignature,
+                )
+            };
             // SAFETY: the runtime owns both arrays for this call and states
             // their lengths in the same struct.
             let input = unsafe { signature_slice(inputs, s.NumInputSignatureEntries) };
             // SAFETY: as above.
             let output = unsafe { signature_slice(outputs, s.NumOutputSignatureEntries) };
             if !input.is_empty() {
-                parts.push(SignaturePart { tag: b"ISG1", entries: input });
+                parts.push(SignaturePart {
+                    tag: b"ISG1",
+                    entries: input,
+                });
             }
             if !output.is_empty() {
-                parts.push(SignaturePart { tag: b"OSG1", entries: output });
+                parts.push(SignaturePart {
+                    tag: b"OSG1",
+                    entries: output,
+                });
             }
         }
         IoArm::Tessellation => {
@@ -736,13 +960,22 @@ unsafe fn signature_parts<'a>(
             // SAFETY: as above.
             let pc = unsafe { signature_slice(patch, s.NumPatchConstantSignatureEntries) };
             if !input.is_empty() {
-                parts.push(SignaturePart { tag: b"ISG1", entries: input });
+                parts.push(SignaturePart {
+                    tag: b"ISG1",
+                    entries: input,
+                });
             }
             if !output.is_empty() {
-                parts.push(SignaturePart { tag: b"OSG1", entries: output });
+                parts.push(SignaturePart {
+                    tag: b"OSG1",
+                    entries: output,
+                });
             }
             if !pc.is_empty() {
-                parts.push(SignaturePart { tag: b"PSG1", entries: pc });
+                parts.push(SignaturePart {
+                    tag: b"PSG1",
+                    entries: pc,
+                });
             }
         }
         IoArm::Mesh => {
@@ -767,7 +1000,10 @@ unsafe fn signature_parts<'a>(
                 note_refusal(&L6_REFUSALS.mesh_primitive_signature_dropped);
             }
             if !vertex.is_empty() {
-                parts.push(SignaturePart { tag: b"OSG1", entries: vertex });
+                parts.push(SignaturePart {
+                    tag: b"OSG1",
+                    entries: vertex,
+                });
             }
         }
     }
@@ -859,6 +1095,7 @@ unsafe fn create_shader_common(
     arg: *const ddi12::D3D12DDIARG_CREATE_SHADER_0026,
     h_shader: ddi12::D3D12DDI_HSHADER,
     stage: ShaderStage,
+    stream_output: Option<StreamOutputState>,
 ) {
     // SAFETY: the caller guarantees the slot; clearing touches only the word.
     unsafe { clear_shader_handle(h_shader) };
@@ -880,7 +1117,8 @@ unsafe fn create_shader_common(
     let len = unsafe { shader_code_len(a.pShaderCode) };
     // SAFETY: as above — four dwords, and the function null-checks first.
     unsafe { log_shader_code(stage, a.pShaderCode, len) };
-    if len == 0 {
+    let passthrough = a.pShaderCode.is_null() && stream_output.is_some();
+    if len == 0 && !passthrough {
         note_refusal(&L6_REFUSALS.shader_length_unknown);
         // SAFETY: as the null-arg arm above.
         unsafe { set_error_if_possible(h_device, helios_umd_common::hr::E_INVALIDARG) };
@@ -890,18 +1128,25 @@ unsafe fn create_shader_common(
     // SAFETY: `len` came from the blob's own self-description and was bounded
     // by `shader_code_len` to at most 4 MiB; the runtime declares `pShaderCode`
     // readable for the length the blob states.
-    let code = unsafe { core::slice::from_raw_parts(a.pShaderCode.cast::<u8>(), len) };
+    let code = if passthrough {
+        &[]
+    } else {
+        // SAFETY: non-null, self-described and bounded as established above.
+        unsafe { core::slice::from_raw_parts(a.pShaderCode.cast::<u8>(), len) }
+    };
 
     // ⭐ The one cross-check available on data this driver otherwise forwards
     // blind: dword 0's high 16 bits are the DXIL program kind, and
     // `DDI_REFERENCE.md` §12.2 measured it matching the slot in every sample.
-    let program_kind = u32::from_le_bytes([code[0], code[1], code[2], code[3]]) >> 16;
-    if program_kind != stage.dxil_program_kind() {
+    let program_kind = code
+        .get(..4)
+        .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]) >> 16);
+    if program_kind.is_some_and(|kind| kind != stage.dxil_program_kind()) {
         L6_REFUSALS.shader_program_kind_mismatch.bump();
         let n = L6_REFUSALS.shader_program_kind_mismatch.get();
         if n <= LOG_BUDGET {
             log_error!(
-                "Create{}Shader: bytecode declares DXIL program kind {program_kind}, expected {} \
+                "Create{}Shader: bytecode declares DXIL program kind {program_kind:?}, expected {} \
                  (x{n})",
                 stage.name(),
                 stage.dxil_program_kind(),
@@ -911,9 +1156,18 @@ unsafe fn create_shader_common(
 
     // SAFETY: the caller guarantees the IO signature block is live, and the arm
     // is selected by `stage` rather than by any runtime-supplied tag.
-    let parts = unsafe { signature_parts(stage, &a.IOSignatures) };
+    let parts = if passthrough {
+        Vec::new()
+    } else {
+        // SAFETY: stage selects the runtime-owned signature union arm.
+        unsafe { signature_parts(stage, &a.IOSignatures) }
+    };
     trace_signature_parts(stage, &parts);
-    let container = build_dxbc_container(&parts, code);
+    let container = if passthrough {
+        Box::default()
+    } else {
+        build_dxbc_container(&parts, code)
+    };
     trace_line!(
         "Create{}Shader: container={} bytes, {} signature part(s), code={len}",
         stage.name(),
@@ -938,6 +1192,7 @@ unsafe fn create_shader_common(
             stage,
             container,
             h_root_signature: a.hRootSignature.pDrvPrivate,
+            stream_output,
         })
     };
 }
@@ -1010,7 +1265,7 @@ macro_rules! create_shader_slot {
         ) {
             // SAFETY: forwarded unchanged; the caller's guarantees above are
             // exactly `create_shader_common`'s preconditions.
-            unsafe { create_shader_common(h_device, arg, h_shader, $stage) }
+            unsafe { create_shader_common(h_device, arg, h_shader, $stage, None) }
         }
     };
 }
@@ -1058,24 +1313,11 @@ create_shader_slot!(
 
 /// `pfnCreateGeometryShaderWithStreamOutput`.
 ///
-/// ⚠ **The geometry shader is created; the stream-output declaration is
-/// DROPPED and counted.** That is the same answer the shipping D3D11 driver
-/// gives (`umd/src/forward/shaders.rs:676-684`,
-/// `DdiRefusals::gs_so_declaration_dropped`) and for the same reason, restated
-/// for D3D12:
-///
-/// `D3D12_STREAM_OUTPUT_DESC` entries are matched against the GS output
-/// signature by `SemanticName`/`SemanticIndex`, and this file **fabricates**
-/// those names. Fabricating them on the SO side too would be self-consistent
-/// for real entries — but a D3D12 SO declaration also encodes **gap** entries
-/// (`SemanticName == NULL`), and `D3D12DDIARG_STREAM_OUTPUT_DECLARATION_ENTRY`
-/// has no field this driver has evidence for as the gap marker. Guessing it
-/// mis-lays-out the whole SO buffer with no error anywhere.
-///
-/// The consequence when an app depends on SO, spelled out because a counter
-/// without one is not readable: `SOSetTargets` binds buffers that are never
-/// written and `DrawAuto` reads zero vertices, so the app renders nothing.
-/// `GsStreamOutputDropped` is what makes that a number instead of a silence.
+/// Retain the complete declaration, stride array and rasterized-stream choice.
+/// The WDK's gap sentinel maps to a null API semantic; real entries use the
+/// private register semantic understood by the engine's DXIL component mapper.
+/// A null program is a valid SO-only object and leaves the last active VS/DS
+/// as the producer when the pipeline is assembled.
 ///
 /// # Safety
 /// `arg` must point at a live
@@ -1086,21 +1328,53 @@ unsafe extern "C" fn create_geometry_shader_with_stream_output(
     arg: *const ddi12::D3D12DDIARG_CREATE_GEOMETRY_SHADER_WITH_STREAM_OUTPUT_0026,
     h_shader: ddi12::D3D12DDI_HSHADER,
 ) {
+    // SAFETY: the runtime guarantees the private word; clear it before SO
+    // validation or allocation can fail, as every shader-create slot requires.
+    unsafe { clear_shader_handle(h_shader) };
     if arg.is_null() {
-        // SAFETY: the caller guarantees the slot word.
-        unsafe { clear_shader_handle(h_shader) };
         note_refusal(&L6_REFUSALS.shader_bad_arg);
         // SAFETY: `h_device` is this DDI's device handle.
         unsafe { set_error_if_possible(h_device, helios_umd_common::hr::E_INVALIDARG) };
         return;
     }
-    note_refusal(&L6_REFUSALS.gs_stream_output_dropped);
+    // SAFETY: non-null runtime argument and counted arrays are unchanged and
+    // live for this call, including both validation and owned translation.
+    let stream_output = match unsafe { stream_output_state(&*arg) } {
+        Ok(state) => state,
+        Err(error) => {
+            let hr = match error {
+                StreamOutputError::InvalidArgument => {
+                    note_refusal(&L6_REFUSALS.stream_output_bad_arg);
+                    helios_umd_common::hr::E_INVALIDARG
+                }
+                StreamOutputError::OutOfMemory => {
+                    // Do not allocate a first-hit diagnostic while handling OOM.
+                    // Normal device/adapter summaries read this atomic later.
+                    L6_REFUSALS.stream_output_out_of_memory.bump();
+                    helios_umd_common::hr::E_OUTOFMEMORY
+                }
+            };
+            // SAFETY: the DDI supplies this live device handle; its shader word
+            // remains clear and no translated arrays escape this failed call.
+            unsafe { set_error_if_possible(h_device, hr) };
+            return;
+        }
+    };
+    L6_REFUSALS.stream_output_creates.bump();
     // SAFETY: non-null per the check; `CreateShader` is its first member and is
     // the same `_In_ CONST` block every other create slot receives.
     let inner = unsafe { core::ptr::addr_of!((*arg).CreateShader) };
     // SAFETY: forwarded unchanged — `inner` points inside the runtime's live
     // argument struct, so it satisfies `create_shader_common`'s precondition.
-    unsafe { create_shader_common(h_device, inner, h_shader, ShaderStage::Geometry) }
+    unsafe {
+        create_shader_common(
+            h_device,
+            inner,
+            h_shader,
+            ShaderStage::Geometry,
+            Some(stream_output),
+        )
+    }
 }
 
 /// `pfnDestroyShader`.
@@ -1164,7 +1438,8 @@ pub(crate) fn install(
 // `L6ShaderCreates`, `L6ShaderBadArg`, `L6ShaderLengthUnknown`,
 // `L6ShaderDxbcContainerSeen`, `L6ShaderProgramKindMismatch`,
 // `L6ShaderSignatureCountRefused`, `L6MeshPrimitiveSignatureDropped`,
-// `L6GsStreamOutputDropped`, plus `L6SetErrorNoDevice` / `L6SetErrorCbAbsent`
+// `L6StreamOutputBadArg` / `L6StreamOutputCreates` / `L6StreamOutputOutOfMemory`,
+// plus `L6SetErrorNoDevice` / `L6SetErrorCbAbsent`
 // through `pso::set_error_if_possible` — is declared beside the rest of L6's in
 // `pso.rs`, inside the one array `lib.rs` prints. A second array in this file
 // would be counters in no summary at all, which is T5's *"an instrument nothing

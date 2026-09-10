@@ -25,13 +25,10 @@
 //! | `pfnSetSamplePositions` | `L3aSamplePositionsRefused` | `ProgrammableSamplePositionsTier = NONE` **and** the engine's own body is a `FIXME(...) stub!` |
 //! | `pfnOmSetAlphaBlendFactor` | `L3aAlphaBlendFactorRetired` | RETIRED by Microsoft; `pfnOmSetBlendFactor`'s component `[3]` replaced it |
 //!
-//! ⭐ **`pfnExecuteIndirect` LEFT that table with S-4** and now forwards; the
-//! refusal moved one DDI earlier, to `queue::create_command_signature`, which is
-//! the only place it can be honest — vkd3d accepts a state-template signature on a
-//! guest without `VK_EXT_device_generated_commands` and then **silently skips**
-//! every `ExecuteIndirect` through it (`command.c:26447-26453`, `:17811-17818`).
-//! Refusing here instead would be the "succeed at create, fail at submit" shape
-//! the bundle lesson already cost this lane once.
+//! `pfnExecuteIndirect` forwards signatures created by `queue::create_command_signature`.
+//! That create translates the DDI arguments and preserves engine failures. Root
+//! changes use native DGC or the engine's isolated GPU fallback; unsupported IA
+//! rebinding is refused at creation. Admission still follows native reported caps.
 //!
 //! # ⭐ The two exceptions, and why they landed with the Round 2 spine
 //!
@@ -78,7 +75,7 @@
 //! file landed; read its doc in `pso.rs` before treating a non-zero reading as
 //! an exposure.
 
-use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG};
+use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_OUTOFMEMORY};
 use helios_umd_common::refusals::RefusalCounter;
 use helios_umd_common::slot::DdiHandle;
 use helios_umd_common::throttle::LogThrottle;
@@ -99,14 +96,14 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP_ADJ, D3D_PRIMITIVE_TOPOLOGY_UNDEFINED,
 };
 use windows::Win32::Graphics::Direct3D12::{
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF,
     ID3D12CommandAllocator, ID3D12GraphicsCommandList9, ID3D12Resource, D3D12_COMMAND_LIST_TYPE,
     D3D12_COMMAND_LIST_TYPE_BUNDLE, D3D12_CPU_DESCRIPTOR_HANDLE,
     D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE,
-    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFF, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF,
     D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_DISABLED, D3D12_INDEX_BUFFER_VIEW,
     D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT, D3D12_SO_BUFFER_SLOT_COUNT,
-    D3D12_STREAM_OUTPUT_BUFFER_VIEW, D3D12_VERTEX_BUFFER_VIEW,
-    D3D12_VIEWPORT, D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE,
+    D3D12_STREAM_OUTPUT_BUFFER_VIEW, D3D12_VERTEX_BUFFER_VIEW, D3D12_VIEWPORT,
+    D3D12_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE,
 };
 
 use super::pso;
@@ -195,11 +192,19 @@ unsafe fn report_error(state: &CommandListState, hr: Hresult) {
     // `create_command_list` recorded for it — a device that outlives its lists.
     // The borrow does not outlive this call.
     let Some(dev) = (unsafe { device12::device(state.h_device()) }) else {
-        note_refusal(&L3A_REFUSALS.set_error_no_device);
+        if hr == E_OUTOFMEMORY {
+            L3A_REFUSALS.set_error_no_device.bump();
+        } else {
+            note_refusal(&L3A_REFUSALS.set_error_no_device);
+        }
         return;
     };
     if !device12::set_command_list_error(dev, state.h_rt_list(), hr) {
-        note_refusal(&L3A_REFUSALS.set_error_cb_absent);
+        if hr == E_OUTOFMEMORY {
+            L3A_REFUSALS.set_error_cb_absent.bump();
+        } else {
+            note_refusal(&L3A_REFUSALS.set_error_cb_absent);
+        }
     }
 }
 
@@ -301,7 +306,17 @@ unsafe extern "C" fn close_command_list(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
     // SAFETY: `engine()` borrows the list this box owns; `Close` takes no
     // arguments and returns an HRESULT.
     let result = unsafe { state.engine().Close() };
-    // ⚠ Traced on BOTH outcomes, and it is the SUCCESS one that was missing: a
+    let hr = result.as_ref().err().map_or(0, |e| e.code().0);
+    if hr == E_OUTOFMEMORY {
+        // The recording failure may be persistent process-heap exhaustion.
+        // Tracing, first-hit refusal summaries and formatted error logging all
+        // allocate. Deliver the callback using only an atomic counter here.
+        L3A_REFUSALS.close_engine_failed.bump();
+        // SAFETY: the live state borrow remains within this DDI call.
+        unsafe { report_error(state, hr) };
+        return;
+    }
+    // Traced on success and non-OOM failure. The SUCCESS one was missing: a
     // closed list that never reaches `pfnExecuteCommandLists`, and one that
     // reaches it having recorded nothing, are the two readings
     // `tmp/dx12/gates/G8-r0/RESULT.md` could not separate. `pDrvPrivate` is the
@@ -310,7 +325,7 @@ unsafe extern "C" fn close_command_list(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
     trace_line!(
         "CloseCommandList: list={:p} hr={:#010x}",
         h_list.drv_private(),
-        result.as_ref().err().map_or(0u32, |e| e.code().0 as u32),
+        hr as u32,
     );
     let Err(err) = result else {
         return;
@@ -394,58 +409,49 @@ unsafe extern "C" fn reset_command_list(
         // stream-output splits were made to remove, in the one arm that had it
         // by construction rather than by accident.
         L3A_REFUSALS.reset_flags_ignored.bump();
-        let n = L3A_REFUSALS.reset_flags_ignored.get();
-        if n <= 8 {
-            log_error!(
-                "ResetCommandList: CommandListFlags={:#x} carries marker hints the API enum has \
-                 no counterpart for; dropped (x{n})",
-                a.CommandListFlags,
-            );
-        }
     }
 
     // SAFETY: the caller guarantees `hDrvCommandRecorder` is a live recorder
     // handle; the returned allocator is owned by this call.
-    let (allocator, allocator_type): (ID3D12CommandAllocator, D3D12_COMMAND_LIST_TYPE) =
-        match unsafe {
-            queue::recorder_allocator(state.h_device(), a.hDrvCommandRecorder, state.list_type())
-        } {
-            RecorderAllocator::Ready {
-                allocator,
-                list_type,
-            } => (allocator, list_type),
-            RecorderAllocator::NoRecorder => {
-                note_refusal(&L3A_REFUSALS.reset_recorder_missing);
-                // SAFETY: `state` is live for this DDI call, as above.
-                unsafe { report_error(state, E_INVALIDARG) };
-                return;
-            }
-            RecorderAllocator::NoPoolBound => {
-                note_refusal(&L3A_REFUSALS.reset_no_allocator);
-                if let Some(n) = budget() {
-                    log_error!(
-                        "ResetCommandList: the recorder has never been bound to a command pool, \
+    let (allocator, allocator_type): (ID3D12CommandAllocator, D3D12_COMMAND_LIST_TYPE) = match unsafe {
+        queue::recorder_allocator(state.h_device(), a.hDrvCommandRecorder, state.list_type())
+    } {
+        RecorderAllocator::Ready {
+            allocator,
+            list_type,
+        } => (allocator, list_type),
+        RecorderAllocator::NoRecorder => {
+            note_refusal(&L3A_REFUSALS.reset_recorder_missing);
+            // SAFETY: `state` is live for this DDI call, as above.
+            unsafe { report_error(state, E_INVALIDARG) };
+            return;
+        }
+        RecorderAllocator::NoPoolBound => {
+            note_refusal(&L3A_REFUSALS.reset_no_allocator);
+            if let Some(n) = budget() {
+                log_error!(
+                    "ResetCommandList: the recorder has never been bound to a command pool, \
                          so there is no ID3D12CommandAllocator to reset against (x{})",
-                        n + 1,
-                    );
-                }
-                // SAFETY: `state` is live for this DDI call, as above.
-                unsafe { report_error(state, E_FAIL) };
-                return;
+                    n + 1,
+                );
             }
-            RecorderAllocator::NoDevice | RecorderAllocator::EngineFailed => {
-                // The queue lane already counted and logged the exact engine-side
-                // reason. This VOID DDI still owes the runtime a list-scoped
-                // failure so it will not record into an unreset engine list.
-                unsafe { report_error(state, E_FAIL) };
-                return;
-            }
-            RecorderAllocator::UnsupportedClass => {
-                note_refusal(&L3A_REFUSALS.reset_list_type_mismatch);
-                unsafe { report_error(state, E_INVALIDARG) };
-                return;
-            }
-        };
+            // SAFETY: `state` is live for this DDI call, as above.
+            unsafe { report_error(state, E_FAIL) };
+            return;
+        }
+        RecorderAllocator::NoDevice | RecorderAllocator::EngineFailed => {
+            // The queue lane already counted and logged the exact engine-side
+            // reason. This VOID DDI still owes the runtime a list-scoped
+            // failure so it will not record into an unreset engine list.
+            unsafe { report_error(state, E_FAIL) };
+            return;
+        }
+        RecorderAllocator::UnsupportedClass => {
+            note_refusal(&L3A_REFUSALS.reset_list_type_mismatch);
+            unsafe { report_error(state, E_INVALIDARG) };
+            return;
+        }
+    };
 
     // ⛔ The class check, and it REFUSES rather than falling through. See the doc
     // above: both `d3d12_command_list_Reset` (command.c:7378-7382) and
@@ -477,6 +483,29 @@ unsafe extern "C" fn reset_command_list(
         return;
     }
 
+    // SAFETY: `allocator` is an owned reference live for this call, `engine()`
+    // borrows the list this box owns, and `None` is the DDI's own answer for the
+    // initial pipeline state -- it carries none.
+    let result = unsafe { state.engine().Reset(&allocator, None) };
+    let hr = result.as_ref().err().map_or(0, |e| e.code().0);
+    if hr == E_OUTOFMEMORY {
+        // Reset repeats a failed Close's permanent HRESULT. Do not allocate
+        // diagnostics before delivering that error under persistent OOM.
+        L3A_REFUSALS.reset_engine_failed.bump();
+        // SAFETY: `state` is live for this DDI call.
+        unsafe { report_error(state, hr) };
+        return;
+    }
+    if a.CommandListFlags != ddi12::D3D12DDI_COMMAND_LIST_FLAGS_D3D12DDI_COMMAND_LIST_FLAG_NONE {
+        let n = L3A_REFUSALS.reset_flags_ignored.get();
+        if n <= 8 {
+            log_error!(
+                "ResetCommandList: CommandListFlags={:#x} carries marker hints the API enum has \
+                 no counterpart for; dropped (x{n})",
+                a.CommandListFlags,
+            );
+        }
+    }
     trace_line!(
         "ResetCommandList: list={:p} type={} id={} allocatorType={}",
         h_list.pDrvPrivate,
@@ -485,10 +514,7 @@ unsafe extern "C" fn reset_command_list(
         allocator_type.0,
     );
 
-    // SAFETY: `allocator` is an owned reference live for this call, `engine()`
-    // borrows the list this box owns, and `None` is the DDI's own answer for the
-    // initial pipeline state — it carries none.
-    let Err(err) = (unsafe { state.engine().Reset(&allocator, None) }) else {
+    let Err(err) = result else {
         return;
     };
     let hr = err.code().0;
@@ -594,9 +620,11 @@ unsafe extern "C" fn dispatch(
     };
     // SAFETY: as `draw_instanced`; three by-value scalars.
     unsafe {
-        state
-            .engine()
-            .Dispatch(thread_group_count_x, thread_group_count_y, thread_group_count_z);
+        state.engine().Dispatch(
+            thread_group_count_x,
+            thread_group_count_y,
+            thread_group_count_z,
+        );
     }
 }
 
@@ -1437,38 +1465,10 @@ unsafe extern "C" fn ia_set_vertex_buffers(
 }
 
 /// `pfnSOSetTargets` -> `ID3D12GraphicsCommandList::SOSetTargets`.
-///
-/// ⛔ The bound is `D3D12_SO_BUFFER_SLOT_COUNT` (4), and a range outside it is
-/// refused and reported, exactly as in [`ia_set_vertex_buffers`].
-///
-/// # ⭐ A null `pViews` with a non-zero count FORWARDS, and does not remove
-/// anything
-///
-/// ⚠ It used to be folded into the range check and answered with an error
-/// report, which the `PARALLEL.md` §10 review caught as an asymmetry: the twin
-/// slot one screen up takes the **identical** `(HCOMMANDLIST, StartSlot,
-/// NumViews, pViews)` shape, sits in the **same** measured 15-call per-reset
-/// block (`DDI_REFERENCE.md:3499-3504`), and treats that shape as a legal no-op
-/// on vkd3d's own authority — *"Native drivers appear to ignore this call"*
-/// (`vkd3d-proton-helios/libs/vkd3d/command.c:14556-14558`). One slot cannot
-/// answer a shape with a driver error while its twin forwards it.
-///
-/// ⚠ **Reachability is UNPROVEN** — `tmp/dx12/gates/G5/D-triangle.log:307` shows
-/// `cl[47] pfnSOSetTargets 7` against 7 `pfnResetCommandList` calls, so this slot
-/// does fire once per reset, but the trace records slot names and not arguments.
-/// If the runtime ever lowers "no stream-output targets" as `(0, N, NULL)`, the
-/// old code answered the first reset of the first frame with an error report.
-///
-/// ⛔ **Forwarding is strictly safer in both directions**, which is why it is not
-/// a coin toss. `SOSetTargets(start, None)` reaches the engine as
-/// `view_count = 0, views = NULL` (windows-rs `map_or(0, len)`), so the loop that
-/// dereferences `views[i]` with **no** null test (`command.c:14641-14660`) runs
-/// zero times — the fault the old check existed to prevent is prevented by the
-/// count, not by the refusal — and a possibly-legal unbind stops being fatal.
-///
-/// ⚠ Stream output needs `VK_EXT_transform_feedback`; without it vkd3d prints a
-/// `FIXME` and returns, which is the engine's answer to give and is not
-/// something this driver can see from here. UNVERIFIED on this substrate.
+/// A null view array unbinds the addressed slots (ResourceBinding.md's NULL
+/// descriptor contract). Preserve its count with zero-sized views: passing
+/// `None` to windows-rs would turn the operation into a zero-count call.
+/// The engine validates GPU address ranges and reports invalid lists on Close.
 ///
 /// # Safety
 /// As [`ia_set_vertex_buffers`], for `D3D12DDI_STREAM_OUTPUT_BUFFER_VIEW`s.
@@ -1498,29 +1498,23 @@ unsafe extern "C" fn so_set_targets(
         unsafe { report_error(state, E_INVALIDARG) };
         return;
     }
-    let slice: Option<&[D3D12_STREAM_OUTPUT_BUFFER_VIEW]> = if views.is_null() {
+    let unbound = [D3D12_STREAM_OUTPUT_BUFFER_VIEW::default(); D3D12_SO_BUFFER_SLOT_COUNT as usize];
+    let slice: &[D3D12_STREAM_OUTPUT_BUFFER_VIEW] = if views.is_null() {
         if n != 0 {
-            // ⚠ Not a refusal, and ⛔ `bump` rather than `note_refusal` for the
-            // same reason as the triangle-fan arm: this arm FORWARDS, and
-            // `note_refusal` would print the whole `D3D12 DDI refusals:` set at
-            // error level on its first hit. If the runtime does lower the null
-            // form, that first hit is the first reset of the first frame — a
-            // refusal record for a call this driver honoured.
+            // This counts a successful translation, not a refusal or GPU write.
             L3A_REFUSALS.so_targets_null_array.bump();
         }
-        None
+        &unbound[..n]
     } else if n == 0 {
-        Some(&[])
+        &[]
     } else {
         // SAFETY: non-null and bounded per the check; layout-identical by the
-        // assertion above.
-        Some(unsafe {
-            core::slice::from_raw_parts(views.cast::<D3D12_STREAM_OUTPUT_BUFFER_VIEW>(), n)
-        })
+        // assertion above and live for the duration of this DDI call.
+        unsafe { core::slice::from_raw_parts(views.cast::<D3D12_STREAM_OUTPUT_BUFFER_VIEW>(), n) }
     };
     trace_line!("SOSetTargets: start={start_slot} n={num_views}");
     // SAFETY: the slice, when present, is live for the whole call.
-    unsafe { state.engine().SOSetTargets(start_slot, slice) };
+    unsafe { state.engine().SOSetTargets(start_slot, Some(slice)) };
 }
 
 /// `pfnOMSetRenderTargets` -> `ID3D12GraphicsCommandList::OMSetRenderTargets`.
@@ -1747,15 +1741,9 @@ unsafe fn buffer_placement<'a>(
 
 /// `pfnExecuteIndirect` — **IMPLEMENTED**, `L3aExecuteIndirectForwarded`.
 ///
-/// # ⭐ It forwards, and both halves of the old blocker are discharged
-///
-/// The old body was a **silent counted noop** justified by
-/// `queue::create_command_signature` returning `E_NOTIMPL`. That create now builds a
-/// real `ID3D12CommandSignature` for the four native action classes and refuses the
-/// state-template classes **at create** (`queue.rs`'s S-4 block has why refusing at
-/// create rather than here is the only honest split — vkd3d would otherwise accept
-/// the signature and silently skip every call through it). ⇒ every signature that
-/// reaches this slot is one this driver built and can execute.
+/// Signature creation supplies an executable engine object or an explicit error.
+/// Recording errors, including allocation failures in the fallback, invalidate
+/// the engine list and are reported through the Close/error path.
 ///
 /// The two objects this needed are both reached through their owning lane's single
 /// accessor, so no handle payload is declared twice (`DECISIONS.md` D13):
@@ -1893,11 +1881,10 @@ unsafe extern "C" fn execute_indirect(
             count_offset,
         );
     }
-    note_refusal(&L3A_REFUSALS.execute_indirect_forwarded);
-    trace_line!(
-        "ExecuteIndirect: max={max_command_count} arg={arg_offset} countBuf={} count={count_offset}",
-        count_resource.is_some(),
-    );
+    // The void engine call can latch E_OUTOFMEMORY for Close to report. Keep
+    // this return allocation-free: even first-hit refusal logging can allocate.
+    // The counter remains readable through the existing device summary.
+    L3A_REFUSALS.execute_indirect_forwarded.bump();
 }
 
 // ---------------------------------------------------------------------------
@@ -1970,6 +1957,8 @@ pub(crate) struct L3aRefusals {
     /// counters moving together is *one* defect, not two, and this file cannot
     /// tell the cases apart without holding a second copy of the engine's
     /// recording flag, which `queue::CommandListState`'s doc says not to do.
+    /// OOM hits use only atomic counting until the normal later summary; the
+    /// error callback must remain reachable without diagnostic allocation.
     close_engine_failed: RefusalCounter,
     /// `pfnResetCommandList` with a null `D3D12DDIARG_RESETCOMMANDLIST_0040`.
     /// **Expected 0** — the DDI declares it `_In_ CONST` and never optional.
@@ -2019,6 +2008,7 @@ pub(crate) struct L3aRefusals {
     /// unreachable. What is left is the *unforeseen* failure — chiefly an
     /// allocator the GPU is not done with, which is the application's obligation
     /// rather than this driver's.
+    /// A latched OOM uses atomic counting and callback delivery without logging.
     reset_engine_failed: RefusalCounter,
     /// A command-list slot needed to report a failure, and the `h_device` its
     /// `CommandListState` recorded did not resolve to a live device.
@@ -2221,21 +2211,10 @@ pub(crate) struct L3aRefusals {
     /// built, not the API boundary having already answered.
     execute_indirect_refused: RefusalCounter,
     // ── appended by the §10 error-channel repair; ⛔ append only ─────────────
-    /// `pfnSOSetTargets` arrived with a non-zero `NumViews` and a **null**
-    /// `pViews`, and the call was **forwarded** as `SOSetTargets(start, None)`.
-    ///
-    /// ⚠ **Not a refusal**, and nothing was dropped that the twin slot would have
-    /// kept: `pfnIASetVertexBuffers` answers the identical shape by forwarding
-    /// `None` on vkd3d's own authority (*"Native drivers appear to ignore this
-    /// call"*, `command.c:14556-14558`), and this counter exists so the two can
-    /// stop disagreeing without the disagreement becoming invisible.
-    ///
-    /// ⛔ **Expected 0, and a NON-zero reading is the valuable one** — it would be
-    /// the first evidence that the runtime lowers "no stream-output targets" as
-    /// `(0, N, NULL)`, which `tmp/dx12/gates/G5/D-triangle.log` cannot show
-    /// because it records slot names and not arguments. Until it moves, the null
-    /// form is UNPROVEN rather than absent. ⚠ Read it beside `SoTargetsBadArg`,
-    /// which used to absorb this case and answered it with an error report.
+    /// Non-zero `NumViews` and null `pViews`, translated into the same number
+    /// of unbound views. This is a successful CPU translation counter. A probe
+    /// must separately check GPU output after unbinding; zero only means this
+    /// DDI form was not observed, since the runtime can supply explicit zeros.
     so_targets_null_array: RefusalCounter,
     /// `pfnOMSetDepthBounds` with the `[0, 1]` default range — dropped.
     ///
@@ -2252,19 +2231,12 @@ pub(crate) struct L3aRefusals {
     /// `L9ShadingRateDefaultDropped`.
     depth_bounds_default_dropped: RefusalCounter,
     // ── appended by S-4 (`pfnExecuteIndirect` implemented); ⛔ append only ────
-    /// ⭐ **S-4's success counter: an indirect draw/dispatch was forwarded to the
-    /// engine.**
-    ///
-    /// ⛔ **Read it beside `CommandSignatureCreated`** (L2's). A non-zero
-    /// `CommandSignatureCreated` with a **zero** here is `METHOD.md` saturation
-    /// criterion 6 exactly — *implemented but never exercised* — and it is the only
-    /// pair of numbers that can show it: the signature create happens at engine
-    /// startup, the execute happens per frame, and either can be reached without the
-    /// other.
-    ///
-    /// ⚠ Non-zero here means the native path ran. It does **not** mean the scene is
-    /// right: `CommandSignatureStateTemplateRefused` is where the root-argument
-    /// classes an engine also wanted went, and those draws are absent.
+    /// A native indirect operation was forwarded to the engine. Expected to
+    /// move in indirect workloads. This counts recording calls, not GPU actions
+    /// or completion; replay and zero/predicated counts do not change that meaning.
+    /// Bumped without logging after the void engine call, which can have latched
+    /// E_OUTOFMEMORY. Read through the device summary, not a per-call trace.
+    /// Read with signature creation/refusal counters and GPU readback evidence.
     execute_indirect_forwarded: RefusalCounter,
     /// `pfnExecuteIndirect`'s `D3D12DDI_HCOMMANDSIGNATURE` carried no engine
     /// signature, so the indirect draw was dropped **and reported** through

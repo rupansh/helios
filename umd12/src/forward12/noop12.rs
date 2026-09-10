@@ -138,7 +138,6 @@ macro_rules! ddi_noop_table {
     };
 }
 
-
 // ── The three driver-side DDI tables, 206 slots ────────────────────────────
 //
 // ⭐ The slot lists below were EXTRACTED from `umd12/bindgen/cached/d3d12umddi.rs`

@@ -145,14 +145,15 @@
 //!
 //! * **Cross-DDI / cross-process resource opening** (`pfnOpenHeapAndResource`,
 //!   `pfnCalcPrivateOpenedHeapAndResourceSizes`) — refused with named counters.
-//! * **Reserved (tiled) resources** — refused, because `caps12.rs:278` reports
-//!   `TiledResourcesTier = NOT_SUPPORTED` and creating one would contradict the
-//!   caps this device was accepted on.
+//! * **Reserved (tiled) resources** — translation is implemented, but native
+//!   admission remains unreachable at the reported tiled tier0. The engine may
+//!   select the documented committed compatibility fallback when this gate opens.
 //! * **Kernel allocation identity for non-committed arms.** Every committed
 //!   resource receives one at create time because the negotiated DDI carries no
 //!   later `SHARED` declaration and the runtime does not call
 //!   `pfnCheckResourceAllocationHandle` before sharing. Placed resources remain
-//!   represented by their explicit heap; reserved resources are refused above.
+//!   represented by their explicit heap; reserved resources have no shareable
+//!   native allocation identity in this path, including compatibility backing.
 //!
 //! Each is a named counter, never a silent stub (AGENTS.md rule 2).
 
@@ -164,19 +165,19 @@ use helios_umd_common::slot::{Boxed, Slot};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12Device10, ID3D12Heap, ID3D12Resource,
+    ID3D12Device10, ID3D12Heap, ID3D12ProtectedResourceSession, ID3D12Resource,
     D3D12_BARRIER_LAYOUT, D3D12_BARRIER_LAYOUT_COMMON, D3D12_BARRIER_LAYOUT_COPY_DEST,
     D3D12_BARRIER_LAYOUT_COPY_SOURCE, D3D12_BARRIER_LAYOUT_GENERIC_READ,
     D3D12_BARRIER_LAYOUT_SHADER_RESOURCE, D3D12_BARRIER_LAYOUT_UNDEFINED,
     D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON, D3D12_CLEAR_VALUE, D3D12_CLEAR_VALUE_0,
     D3D12_CPU_PAGE_PROPERTY, D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE,
     D3D12_CPU_PAGE_PROPERTY_WRITE_BACK, D3D12_CPU_PAGE_PROPERTY_WRITE_COMBINE,
-    D3D12_DEPTH_STENCIL_VALUE, D3D12_HEAP_DESC, D3D12_HEAP_FLAGS, D3D12_HEAP_FLAG_DENY_BUFFERS,
+    D3D12_DEPTH_STENCIL_VALUE, D3D12_FEATURE_D3D12_OPTIONS, D3D12_FEATURE_DATA_D3D12_OPTIONS,
+    D3D12_HEAP_DESC, D3D12_HEAP_FLAGS, D3D12_HEAP_FLAG_DENY_BUFFERS,
     D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES, D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES,
     D3D12_HEAP_FLAG_NONE, D3D12_HEAP_PROPERTIES, D3D12_HEAP_TYPE_CUSTOM, D3D12_MEMORY_POOL,
     D3D12_MEMORY_POOL_L0, D3D12_MEMORY_POOL_L1, D3D12_MIP_REGION,
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT, D3D12_RESOURCE_DESC, D3D12_RESOURCE_DESC1,
-    D3D12_SUBRESOURCE_FOOTPRINT, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT,
     D3D12_RESOURCE_DIMENSION, D3D12_RESOURCE_DIMENSION_BUFFER, D3D12_RESOURCE_DIMENSION_TEXTURE1D,
     D3D12_RESOURCE_DIMENSION_TEXTURE2D, D3D12_RESOURCE_DIMENSION_TEXTURE3D, D3D12_RESOURCE_FLAGS,
     D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL,
@@ -184,9 +185,11 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE,
     D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_FLAG_RAYTRACING_ACCELERATION_STRUCTURE,
     D3D12_RESOURCE_FLAG_VIDEO_DECODE_REFERENCE_ONLY,
-    D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY, D3D12_TEXTURE_LAYOUT,
+    D3D12_RESOURCE_FLAG_VIDEO_ENCODE_REFERENCE_ONLY, D3D12_SUBRESOURCE_FOOTPRINT,
+    D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, D3D12_TEXTURE_LAYOUT,
     D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE, D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE,
     D3D12_TEXTURE_LAYOUT_ROW_MAJOR, D3D12_TEXTURE_LAYOUT_UNKNOWN,
+    D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
@@ -648,6 +651,13 @@ pub(crate) unsafe fn engine_resource<'a>(
     state.resource.as_ref()
 }
 
+/// # Safety
+/// A live heap private block from this driver; the borrow ends with the DDI.
+pub(crate) unsafe fn engine_heap<'a>(h_heap: ddi12::D3D12DDI_HHEAP) -> Option<&'a ID3D12Heap> {
+    // SAFETY: the caller guarantees the heap slot's lifetime and provenance.
+    unsafe { heap_state(h_heap) }?.heap.as_ref()
+}
+
 /// The engine device, at the `ID3D12Device10` revision this lane forwards to.
 ///
 /// Returns an **owned** reference (`Interface::cast` is a `QueryInterface`), so
@@ -768,10 +778,7 @@ fn cpu_page_property(prop: ddi12::D3D12DDI_CPU_PAGE_PROPERTY) -> D3D12_CPU_PAGE_
 /// [`PrimaryTranslation::Dropped`] keeps the old behaviour and the old counter, and
 /// is reachable only from the heap-only arm — where the declaration cannot be
 /// honoured at all.
-fn heap_flags(
-    flags: ddi12::D3D12DDI_HEAP_FLAGS,
-    primary: PrimaryTranslation,
-) -> D3D12_HEAP_FLAGS {
+fn heap_flags(flags: ddi12::D3D12DDI_HEAP_FLAGS, primary: PrimaryTranslation) -> D3D12_HEAP_FLAGS {
     let mut out = D3D12_HEAP_FLAG_NONE;
     if flags & v::HEAP_ALLOW_BUFFERS == 0 {
         out |= D3D12_HEAP_FLAG_DENY_BUFFERS;
@@ -956,10 +963,7 @@ fn resource_flags(flags: ddi12::D3D12DDI_RESOURCE_FLAGS_0003) -> D3D12_RESOURCE_
 /// allowed."*, `libs/vkd3d/device.c:9427` and `:9463`, `E_INVALIDARG`. That is
 /// the API's rule, not vkd3d's invention, so a buffer's layout is forced and
 /// counted here rather than discovered as a failed create.
-fn barrier_layout(
-    layout: ddi12::D3D12DDI_BARRIER_LAYOUT,
-    is_buffer: bool,
-) -> D3D12_BARRIER_LAYOUT {
+fn barrier_layout(layout: ddi12::D3D12DDI_BARRIER_LAYOUT, is_buffer: bool) -> D3D12_BARRIER_LAYOUT {
     if is_buffer {
         if layout != v::LAYOUT_UNDEFINED {
             L4_REFUSALS.resource_barrier_layout_coerced.bump();
@@ -978,7 +982,8 @@ fn barrier_layout(
     // asserted at compile time so "the enums agree" is checked, not claimed.
     const _: () = assert!(v::LAYOUT_UNDEFINED == D3D12_BARRIER_LAYOUT_UNDEFINED.0);
     const _: () = assert!(v::LAYOUT_COMMON == D3D12_BARRIER_LAYOUT_COMMON.0);
-    const _: () = assert!(v::LAYOUT_VIDEO_QUEUE_COMMON == D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON.0);
+    const _: () =
+        assert!(v::LAYOUT_VIDEO_QUEUE_COMMON == D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON.0);
     if (v::LAYOUT_UNDEFINED..=v::LAYOUT_VIDEO_QUEUE_COMMON).contains(&layout) {
         return D3D12_BARRIER_LAYOUT(layout);
     }
@@ -2469,45 +2474,10 @@ unsafe fn create_fused_heap_and_resource(
     S_OK
 }
 
-/// Arm 3 of the fused create: `pCreateResource` alone.
-///
-/// `ReuseBufferGPUVA.BaseAddress.UMD.hResource` is the spec's discriminator:
-/// non-NULL is a **placed** resource whose parent's span gives the engine heap
-/// and base offset; NULL is a **reserved** (tiled) resource
-/// (`ResourceHeaps.md:1204`), which this driver refuses because `caps12.rs:278`
-/// reports `TiledResourcesTier = NOT_SUPPORTED` and creating one would
-/// contradict the caps this device was accepted on.
-///
-/// # ⭐ Two ways to find the target heap, tried in the spec's order
-///
-/// 1. **`ReuseBufferGPUVA`**, which is what `ResourceHeaps.md:1212` documents as
-///    the only placement parent the DDI can express. Resolving the parent
-///    resource yields its [`HeapSpan`], i.e. an engine heap and the parent's own
-///    base offset within it; the child lands at `base + requested`.
-/// 2. **`hHeap`**, the argument `pfnCreateHeapAndResource` carries on *every*
-///    arm. ⚠ Whether the runtime populates it on the placed arm is not
-///    established by any document in this set, so it is a **fallback and not the
-///    primary**: taking it first would make the driver depend on behaviour
-///    nobody has measured, while taking it second turns an unresolved
-///    `ReuseBufferGPUVA` from a refusal into a working create wherever the
-///    runtime does supply it. Which path was taken is visible, because path 2
-///    only runs after path 1 has already bumped `ResourcePlacementUnresolved`.
-///
-/// ⛔ **The reserved test comes AFTER both paths, not before, and the ordering
-/// is load-bearing.** Testing `hResource == NULL` first made path 2 unreachable
-/// on every possible input — a NULL parent returned `E_NOTIMPL` before `hHeap`
-/// was ever consulted, and a non-NULL one that failed to resolve then landed on
-/// a slot the caller had just nulled. An unreachable fallback is not an
-/// instrument, and `ResourcePlacementUnresolved` could never have read non-zero
-/// with placed creates still succeeding, which is exactly the gate check the
-/// lane's own §6 U3 rests on. So a resource is declared *reserved* only when
-/// **neither** channel names a heap: no `ReuseBufferGPUVA` parent and no usable
-/// `hHeap`. ⚠ The residual risk is the converse — a genuine reserved create that
-/// arrives carrying a live `hHeap` would be placed rather than refused. That
-/// cannot happen through the sizing contract this driver states (a reserved
-/// resource has no heap for the runtime to name), and if it ever does it shows
-/// up as a `CreatePlacedResource2` that succeeded for a resource `caps12` says
-/// cannot exist, not as a silent wrong answer.
+/// Placed resources resolve their documented ReuseBufferGPUVA parent, with
+/// hHeap as the existing fallback. When neither channel names a heap, create a
+/// logical reserved resource. The engine selects sparse or documented committed
+/// compatibility backing; this arm never imports a caller's allocation.
 ///
 /// # Safety
 /// `res_arg` must be live for the call, and `resource_slot` must be this
@@ -2566,19 +2536,9 @@ unsafe fn create_placed_or_reserved(
 
     let Some((heap, heap_offset)) = target else {
         if !names_parent {
-            // ⛔ Both channels are empty, which is `ResourceHeaps.md:1204`'s
-            // definition of a reserved (tiled) resource.
-            note_refusal(&L4_REFUSALS.resource_reserved_refused);
-            log_error!(
-                "L4: reserved (tiled) resource refused -- no ReuseBufferGPUVA parent and no \
-                 hHeap, and this driver reports TiledResourcesTier = NOT_SUPPORTED (caps12), so \
-                 no tiled resource may exist. type={} fmt={} {}x{}",
-                res_arg.ResourceType,
-                res_arg.Format,
-                res_arg.Width,
-                res_arg.Height,
-            );
-            return E_NOTIMPL;
+            // SAFETY: the validated create arguments and cleared output slot
+            // have the same lifetime/provenance as the placed arm below.
+            return unsafe { create_reserved(device10, res_arg, p_clear, resource_slot) };
         }
         log_error!(
             "L4: placed resource refused -- neither ReuseBufferGPUVA nor hHeap names an engine \
@@ -2660,6 +2620,94 @@ unsafe fn create_placed_or_reserved(
     S_OK
 }
 
+/// # Safety
+/// The resource description and optional clear value are live, and the resource
+/// slot is this driver's cleared output block for a resource-only create.
+unsafe fn create_reserved(
+    device: &ID3D12Device10,
+    arg: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
+    p_clear: *const ddi12::D3D12DDI_CLEAR_VALUES,
+    slot: Slot<Boxed<ResourceState>>,
+) -> Hresult {
+    // SAFETY: the resource-only argument is live for this create.
+    let Some(desc) = (unsafe { resource_desc1(arg) }) else {
+        note_refusal(&L4_REFUSALS.heap_resource_create_bad_arg);
+        return E_INVALIDARG;
+    };
+    if (arg.NumCastableFormats != 0 && arg.pCastableFormats.is_null())
+        || arg.NumCastableFormats as usize > CASTABLE_FORMAT_LIMIT
+    {
+        note_refusal(&L4_REFUSALS.heap_resource_create_bad_arg);
+        return E_INVALIDARG;
+    }
+    // Require an engine tiled implementation. Per-image backing selection belongs
+    // to the engine, including the owner's documented committed compatibility
+    // fallback (SPARSE_COMPATIBILITY.md). Its sparse queries remain distinct from
+    // that fallback's creation success; native tier reporting is gated separately.
+    let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();
+    // SAFETY: exact feature structure and byte size, live borrowed engine device.
+    if unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS,
+            core::ptr::from_mut(&mut options).cast(),
+            core::mem::size_of_val(&options) as u32,
+        )
+    }
+    .is_err()
+        || options.TiledResourcesTier == D3D12_TILED_RESOURCES_TIER_NOT_SUPPORTED
+    {
+        note_refusal(&L4_REFUSALS.resource_reserved_refused);
+        return E_NOTIMPL;
+    }
+    let is_buffer = desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER;
+    // SAFETY: pointers are valid for this call and were bounded above.
+    let (clear, castable) = unsafe { (clear_value(p_clear, arg.Flags), castable_formats(arg)) };
+    let mut out: Option<ID3D12Resource> = None;
+    // SAFETY: API descriptors are owned locals and output is cleared. No
+    // protected session exists in the native heap/resource creation contract.
+    let created = unsafe {
+        device.CreateReservedResource2(
+            &resource_desc(&desc),
+            barrier_layout(arg.InitialBarrierLayout, is_buffer),
+            clear.as_ref().map(core::ptr::from_ref),
+            None::<&ID3D12ProtectedResourceSession>,
+            castable,
+            &mut out,
+        )
+    };
+    let resource = match created {
+        Ok(()) => match out {
+            Some(resource) => resource,
+            None => {
+                note_refusal(&L4_REFUSALS.resource_create_engine_failed);
+                return E_FAIL;
+            }
+        },
+        Err(err) => {
+            let hr = err.code().0;
+            // The slot is already clear. Avoid allocating a first-hit summary
+            // before returning the engine's recoverable allocation failure.
+            if hr == helios_umd_common::hr::E_OUTOFMEMORY {
+                L4_REFUSALS.resource_create_engine_failed.bump();
+            } else {
+                note_refusal(&L4_REFUSALS.resource_create_engine_failed);
+            }
+            return hr;
+        }
+    };
+    // SAFETY: this driver's cleared, writable private resource block.
+    unsafe {
+        slot.store(ResourceState {
+            resource: Some(resource),
+            span: None,
+            desc,
+            alloc_info: allocation_info_from_engine(device, &desc, arg, 1),
+            owns_heap_block: false,
+        })
+    };
+    S_OK
+}
+
 /// The castable-format list, borrowed from the runtime's array.
 ///
 /// `DXGI_FORMAT` is `#[repr(transparent)]` over `i32` in the `windows` crate and
@@ -2671,9 +2719,7 @@ unsafe fn create_placed_or_reserved(
 /// # Safety
 /// `a` must be live, and `a.pCastableFormats` must address
 /// `a.NumCastableFormats` `DXGI_FORMAT`s for the duration of the call.
-unsafe fn castable_formats(
-    a: &ddi12::D3D12DDIARG_CREATERESOURCE_0109,
-) -> Option<&[DXGI_FORMAT]> {
+unsafe fn castable_formats(a: &ddi12::D3D12DDIARG_CREATERESOURCE_0109) -> Option<&[DXGI_FORMAT]> {
     let count = a.NumCastableFormats as usize;
     if count == 0 || a.pCastableFormats.is_null() {
         return None;
@@ -2862,9 +2908,7 @@ unsafe extern "C" fn create_heap_and_resource(
                 return E_INVALIDARG;
             };
             // SAFETY: as above.
-            unsafe {
-                create_heap_only(&device10, heap_arg, heap_slot, resource_slot)
-            }
+            unsafe { create_heap_only(&device10, heap_arg, heap_slot, resource_slot) }
         }
         (None, Some(res_arg)) => {
             let Some(resource_slot) = resource_slot else {
@@ -2872,15 +2916,7 @@ unsafe extern "C" fn create_heap_and_resource(
                 return E_INVALIDARG;
             };
             // SAFETY: as above.
-            unsafe {
-                create_placed_or_reserved(
-                    &device10,
-                    res_arg,
-                    h_heap,
-                    p_clear,
-                    resource_slot,
-                )
-            }
+            unsafe { create_placed_or_reserved(&device10, res_arg, h_heap, p_clear, resource_slot) }
         }
         (None, None) => {
             // Row four of the arm table.
@@ -3536,7 +3572,10 @@ unsafe extern "C" fn check_resource_allocation_info(
     // ⛔ A defined answer on every path, before anything can fail.
     // SAFETY: non-null per the check; the DDI declares it an out-parameter.
     unsafe {
-        core::ptr::write_unaligned(out, ddi12::D3D12DDI_RESOURCE_ALLOCATION_INFO_0022::default())
+        core::ptr::write_unaligned(
+            out,
+            ddi12::D3D12DDI_RESOURCE_ALLOCATION_INFO_0022::default(),
+        )
     };
 
     if p_resource.is_null() {
@@ -3638,7 +3677,10 @@ unsafe extern "C" fn check_existing_resource_allocation_info(
     }
     // SAFETY: non-null per the check; the DDI declares it an out-parameter.
     unsafe {
-        core::ptr::write_unaligned(out, ddi12::D3D12DDI_RESOURCE_ALLOCATION_INFO_0022::default())
+        core::ptr::write_unaligned(
+            out,
+            ddi12::D3D12DDI_RESOURCE_ALLOCATION_INFO_0022::default(),
+        )
     };
 
     // SAFETY: the runtime passes a resource handle this driver wrote; the borrow
