@@ -19,7 +19,10 @@ Both the demo and graphics test return workload status 0; the stock definition,
 resolved settings, `.3dmark-result`, XML export, loaded module identities and
 changing host-VNC frames are archived. The graphics test renders at 2560×1440
 with ray-traced reflections and RT shadows enabled. This is one completed run,
-not evidence of a performance gain. **Owner visual acceptance remains pending.**
+not evidence of a performance gain. **The owner visually accepted this Port Royal
+run on 2026-09-11: "Looks correct"**, responding to the demo 13.png and graphics 35.png
+captures. This acceptance is scoped to 057934F9 and the recorded settings; the
+regression controls and full FL/DXR conformance retain their separate acceptance.
 
 The native frontend reuses vkd3d's existing DXR engine. This increment admits
 RT1.0/SM6.3 with matching engine backing checks, preserves 64-bit shader-table

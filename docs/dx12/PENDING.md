@@ -5,7 +5,8 @@ with engine backing checks. The seven native raytracing probe groups pass;
 see [DXR_SERIALIZATION.md](DXR_SERIALIZATION.md#native-dxr-admission-and-readback-2026-09-11).
 Older RT0 statements below describe their dated artifacts. Port Royal completes
 on 057934F9 at 12,337 / 57.12 FPS with both workload statuses 0, archived/exported
-results and changing frames. Owner visual acceptance remains pending. Full DXR
+results and changing frames. The owner visually accepted that run on 2026-09-11:
+"Looks correct", responding to its demo 13.png and graphics 35.png captures. Full DXR
 and FL conformance, including the tools-visualization and sparse compatibility
 gaps, remain separate acceptance. Pending allocator/fence-worker lifetime work
 is not closed by successful benchmark completion. Time Spy, Fire Strike and

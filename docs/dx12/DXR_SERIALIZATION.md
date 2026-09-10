@@ -18,9 +18,13 @@ vkd3d substitution are excluded by the recorded module lists. The wrapper uses
 HELIOS_WSI_ASYNC_PRESENT=1, ordinary logging, no retired feedback workaround and
 no feature/shader overrides. Host VNC captures 42 frames with 33 distinct hashes;
 manual inspection of demo 13.png and graphics 35.png/39.png shows different
-rendered scenes, including GT1 frame 2311→5011. **Owner visual acceptance is
-pending.** A black transition capture 24.png is between the completed workloads,
-not evidence of a frozen benchmark.
+rendered scenes, including GT1 frame 2311→5011. **The owner visually accepted
+this Port Royal run on 2026-09-11: "Looks correct"**, responding to demo 13.png
+and graphics 35.png. Acceptance applies to the exact 057934F9 artifact and recorded
+settings. A black transition capture 24.png is between the completed workloads,
+not evidence of a frozen benchmark. The subsequent owner acknowledgment is
+recorded in `owner-portroyal-visual-acceptance.json` under the evidence directory;
+earlier receipts retain their original pending status.
 
 Evidence under `tmp/dxr-native-admission-20260911/`:
 
@@ -97,8 +101,9 @@ resolve them.
 
 `frame-inspection.json` records manually viewed host-VNC pairs: Port Royal GT1
 frame 2311→5011, Time Spy GT1 frame 2188→3753, Fire Strike GT2 frame 7637→10211 and
-Steel Nomad Vulkan frame 545→1192. These show changing scenes; owner visual
-acceptance remains pending. No paintcap or focus-taking observer ran. Existing
+Steel Nomad Vulkan frame 545→1192. These show changing scenes. The owner accepted
+Port Royal as recorded above; visual acceptance of these three regression
+controls remains pending. No paintcap or focus-taking observer ran. Existing
 .266 shadow/~100FPS acceptance and the instrumented 74.26 FPS run remain separate.
 
 `benchmark-artifacts.json` refreshes installed x64 workload hashes/versions:
@@ -153,8 +158,8 @@ they are not evidence about the binding failure. Authorized guest reboot at
 2026-09-11 00:52:43 +05:30 restored benchmark entry, and the next traced run
 reproduced the binding failure with exact system-runtime/Helios/ICD identities.
 KMD .271/oem54/Code0/WDDM2.1, UMD11 and ICD remain. Port Royal subsequently
-completes on 057934F9 with ordinary logging, as recorded above; owner visual
-acceptance remains open. Namespace OOM, overloaded-library and Add-specific
+completes on 057934F9 with ordinary logging and receives owner visual acceptance,
+as recorded above. Namespace OOM, overloaded-library and Add-specific
 runtime tests remain separate from the covered aliased collection case.
 
 ## RT1.0 pipeline-config repair, 2026-09-11
