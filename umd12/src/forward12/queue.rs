@@ -199,7 +199,7 @@
 //! See docs/dx12/EXECUTION_SYNC.md for the contract and runtime acceptance gaps.
 
 use core::ffi::c_void;
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, S_OK};
@@ -217,7 +217,7 @@ use helios_umd_common::window::Window;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12CommandAllocator, ID3D12CommandList, ID3D12CommandQueue, ID3D12CommandSignature,
-    ID3D12Device4, ID3D12GraphicsCommandList, D3D12_COMMAND_LIST_FLAG_NONE,
+    ID3D12Device, ID3D12Device4, ID3D12GraphicsCommandList, D3D12_COMMAND_LIST_FLAG_NONE,
     D3D12_COMMAND_LIST_TYPE, D3D12_COMMAND_LIST_TYPE_BUNDLE, D3D12_COMMAND_LIST_TYPE_COMPUTE,
     D3D12_COMMAND_LIST_TYPE_COPY, D3D12_COMMAND_LIST_TYPE_DIRECT, D3D12_COMMAND_QUEUE_DESC,
     D3D12_COMMAND_QUEUE_FLAG_NONE, D3D12_COMMAND_SIGNATURE_DESC, D3D12_INDIRECT_ARGUMENT_DESC,
@@ -544,27 +544,71 @@ pub struct QueueState {
 /// those can differ: a COMPUTE list arrived through a recorder whose queue class
 /// was DIRECT. The list itself is therefore the first authoritative class, so
 /// each class is initialised independently on first reset.
+#[derive(Default)]
+struct AllocatorGenerations {
+    current: Option<ID3D12CommandAllocator>,
+    retired: Vec<ID3D12CommandAllocator>,
+}
+
+impl AllocatorGenerations {
+    /// Native completion and engine retirement are independent. Reuse only an
+    /// allocator with no execution references. Otherwise retain the old storage
+    /// and change generations. No GPU wait, timeline query or early release.
+    fn reset(&mut self, engine: &ID3D12Device, list_type: D3D12_COMMAND_LIST_TYPE) -> Result<(), Hresult> {
+        let Some(current) = self.current.as_ref() else { return Ok(()); };
+        // SAFETY: the class mutex serializes reset/selection; current is owned.
+        let hr = unsafe { crate::bridge12::try_reset_allocator(current.as_raw() as usize) };
+        if hr < 0 { return Err(hr); }
+        if hr == S_OK {
+            note_refusal(&L2_REFUSALS.pool_generation_reset);
+            return Ok(());
+        }
+        // Reserve ownership storage before creating or exchanging anything.
+        self.retired.try_reserve(1).map_err(|_| E_OUTOFMEMORY)?;
+        let mut reusable = None;
+        for (index, allocator) in self.retired.iter().enumerate() {
+            // SAFETY: retired generation is owned, no longer selected for new
+            // recording, and its storage is reset only after execution refs retire.
+            let hr = unsafe { crate::bridge12::try_reset_allocator(allocator.as_raw() as usize) };
+            if hr < 0 { return Err(hr); }
+            if hr == S_OK { reusable = Some(index); break; }
+        }
+        let replacement = if let Some(index) = reusable {
+            note_refusal(&L2_REFUSALS.pool_generation_reused);
+            self.retired.swap_remove(index)
+        } else {
+            // SAFETY: live owning device; list class was validated by slot().
+            let allocator = unsafe { engine.CreateCommandAllocator::<ID3D12CommandAllocator>(list_type) }
+                .map_err(|e| e.code().0)?;
+            note_refusal(&L2_REFUSALS.pool_generation_created);
+            allocator
+        };
+        if let Some(previous) = self.current.replace(replacement) {
+            self.retired.push(previous);
+        }
+        note_refusal(&L2_REFUSALS.pool_generation_rotated);
+        Ok(())
+    }
+}
+
 struct PoolAllocators {
-    direct: OnceLock<ID3D12CommandAllocator>,
-    bundle: OnceLock<ID3D12CommandAllocator>,
-    compute: OnceLock<ID3D12CommandAllocator>,
-    copy: OnceLock<ID3D12CommandAllocator>,
+    direct: Mutex<AllocatorGenerations>,
+    bundle: Mutex<AllocatorGenerations>,
+    compute: Mutex<AllocatorGenerations>,
+    copy: Mutex<AllocatorGenerations>,
 }
 
 impl PoolAllocators {
     fn new() -> Self {
         Self {
-            direct: OnceLock::new(),
-            bundle: OnceLock::new(),
-            compute: OnceLock::new(),
-            copy: OnceLock::new(),
+            direct: Mutex::new(AllocatorGenerations::default()),
+            bundle: Mutex::new(AllocatorGenerations::default()),
+            compute: Mutex::new(AllocatorGenerations::default()),
+            copy: Mutex::new(AllocatorGenerations::default()),
         }
     }
 
-    fn slot(
-        &self,
-        list_type: D3D12_COMMAND_LIST_TYPE,
-    ) -> Option<&OnceLock<ID3D12CommandAllocator>> {
+    fn slot(&self, list_type: D3D12_COMMAND_LIST_TYPE) -> Option<&Mutex<AllocatorGenerations>> {
         match list_type {
             D3D12_COMMAND_LIST_TYPE_DIRECT => Some(&self.direct),
             D3D12_COMMAND_LIST_TYPE_BUNDLE => Some(&self.bundle),
@@ -574,17 +618,13 @@ impl PoolAllocators {
         }
     }
 
-    fn initialized(
-        &self,
-    ) -> impl Iterator<Item = (D3D12_COMMAND_LIST_TYPE, &ID3D12CommandAllocator)> {
+    fn slots(&self) -> [(D3D12_COMMAND_LIST_TYPE, &Mutex<AllocatorGenerations>); 4] {
         [
-            (D3D12_COMMAND_LIST_TYPE_DIRECT, self.direct.get()),
-            (D3D12_COMMAND_LIST_TYPE_BUNDLE, self.bundle.get()),
-            (D3D12_COMMAND_LIST_TYPE_COMPUTE, self.compute.get()),
-            (D3D12_COMMAND_LIST_TYPE_COPY, self.copy.get()),
+            (D3D12_COMMAND_LIST_TYPE_DIRECT, &self.direct),
+            (D3D12_COMMAND_LIST_TYPE_BUNDLE, &self.bundle),
+            (D3D12_COMMAND_LIST_TYPE_COMPUTE, &self.compute),
+            (D3D12_COMMAND_LIST_TYPE_COPY, &self.copy),
         ]
-        .into_iter()
-        .filter_map(|(list_type, allocator)| allocator.map(|allocator| (list_type, allocator)))
     }
 }
 
@@ -592,8 +632,8 @@ impl PoolAllocators {
 ///
 /// The `Arc` lets a recorder retain the pool's allocator set without ever
 /// dereferencing runtime-owned pool private memory after `pfnDestroyCommandPool`.
-/// Each allocator slot is a `OnceLock`, so free-threaded first use has one winner
-/// and releases the losing engine object.
+/// Per-class mutexes serialize lazy creation and generation exchange. Recorders
+/// retain this set and obtain an owned reference to its current generation.
 pub struct PoolState {
     allocators: Arc<PoolAllocators>,
 }
@@ -711,7 +751,7 @@ pub struct RecorderState {
     queue_type: D3D12_COMMAND_LIST_TYPE,
     /// The pool this recorder last targeted, and that pool's allocator.
     ///
-    /// ⚠ A `Mutex` rather than the `OnceLock`+atomic pair the pool uses, because
+    /// A `Mutex` protects the recorder target because
     /// unlike a pool's allocator this is **rebindable**: the runtime may point a
     /// recorder at a different pool at any time, so there is no
     /// initialise-once shape to exploit. The critical section is one `Option`
@@ -759,8 +799,8 @@ pub struct RecorderState {
 //     none is expected to;
 //   * ⚠ concurrent **reads** across free-threaded workers are permitted by `&`
 //     and are the expected case. The two fields that change after construction
-//     are the `OnceLock` slots inside `PoolState::allocators`, each initialised
-//     once for one list class, and `RecorderState::target`, a
+//     are the mutex-protected generations inside `PoolState::allocators`
+//     and `RecorderState::target`, a
 //     `Mutex<Option<RecorderTarget>>` because a recorder's target is
 //     **rebindable** and so has no initialise-once shape to exploit. There is
 //     deliberately no `&mut` accessor.
@@ -772,7 +812,9 @@ pub struct RecorderState {
 //     a `pfnResetCommandList` is about to reset against. ⚠ Every holder —
 //     `bind_target`, `unbind_target`, `target_pool_identity`,
 //     `recorder_allocator` — releases the guard before returning, so no lock is
-//     ever held across a call back into the runtime or into the engine.
+//     ever held across a call back into the runtime. Class locks serialize
+//     engine allocator reset and creation; the engine does not acquire these
+//     frontend locks or invoke runtime callbacks from those operations.
 //
 //     ⚠ The premise the compiler never checks, stated because it is a premise:
 //     `RecorderTarget` holds an `Arc` whose allocator slots contain windows-rs
@@ -1466,34 +1508,40 @@ unsafe extern "C" fn create_command_pool(
 /// # Safety
 /// `h_pool` must be a handle [`create_command_pool`] returned `S_OK` for.
 unsafe extern "C" fn reset_command_pool(
-    _h_device: ddi12::D3D12DDI_HDEVICE,
+    h_device: ddi12::D3D12DDI_HDEVICE,
     h_pool: ddi12::D3D12DDI_HCOMMANDPOOL_0040,
 ) {
-    // SAFETY: the caller guarantees a live handle from `create_command_pool`.
+    // SAFETY: the runtime supplies live device and pool handles for this call.
     let Some(pool) = (unsafe { pool_state(h_pool) }) else {
         note_refusal(&L2_REFUSALS.pool_bad_arg);
         return;
     };
+    // SAFETY: device is borrowed for this DDI only.
+    let Some(dev) = (unsafe { device12::device(h_device) }) else {
+        note_refusal(&L2_REFUSALS.pool_no_device);
+        return;
+    };
     let mut any = false;
-    for (list_type, allocator) in pool.allocators.initialized() {
+    let mut error = None;
+    for (list_type, slot) in pool.allocators.slots() {
+        let Ok(mut generations) = slot.lock() else { error = Some(E_FAIL); break; };
+        if generations.current.is_none() { continue; }
         any = true;
-        // SAFETY: the allocator is an owned member of the pool's `Arc`; `Reset`
-        // takes no arguments and returns an HRESULT.
-        if let Err(e) = unsafe { allocator.Reset() } {
-            note_refusal(&L2_REFUSALS.pool_reset_engine_failed);
-            if let Some(n) = budget(&POOL_LOG) {
-                log_error!(
-                    "ResetCommandPool: engine Reset(type={}) failed hr={:#010x} (x{})",
-                    list_type.0,
-                    e.code().0 as u32,
-                    n + 1,
-                );
-            }
+        let Some(engine) = dev.engine.d3d12_device() else { error = Some(E_FAIL); break; };
+        if let Err(hr) = generations.reset(&engine, list_type) {
+            error = Some(hr);
+            break;
         }
     }
-    if !any {
-        note_refusal(&L2_REFUSALS.pool_reset_no_allocator);
+    // No allocator/recorder mutex is held across the runtime error callback.
+    if let Some(hr) = error {
+        L2_REFUSALS.pool_reset_engine_failed.bump();
+        if !device12::set_error(dev, hr) {
+            L2_REFUSALS.pool_reset_error_unavailable.bump();
+        }
+        return;
     }
+    if !any { note_refusal(&L2_REFUSALS.pool_reset_no_allocator); }
 }
 
 /// `pfnDestroyCommandPool`.
@@ -1739,11 +1787,12 @@ pub(crate) unsafe fn recorder_allocator(
     let Some(slot) = allocators.slot(list_type) else {
         return RecorderAllocator::UnsupportedClass;
     };
-    if let Some(allocator) = slot.get() {
-        return RecorderAllocator::Ready {
-            allocator: allocator.clone(),
-            list_type,
-        };
+    let Ok(mut generations) = slot.lock() else {
+        note_refusal(&L2_REFUSALS.pool_allocator_engine_failed);
+        return RecorderAllocator::EngineFailed;
+    };
+    if let Some(allocator) = &generations.current {
+        return RecorderAllocator::Ready { allocator: allocator.clone(), list_type };
     }
 
     // SAFETY: device-scope lookup; the borrow lives only for this call.
@@ -1774,20 +1823,8 @@ pub(crate) unsafe fn recorder_allocator(
                 return RecorderAllocator::EngineFailed;
             }
         };
-    if slot.set(allocator).is_err() {
-        trace_line!(
-            "ResetCommandList: lost type-{} allocator init race",
-            list_type.0
-        );
-    }
-    let Some(allocator) = slot.get() else {
-        note_refusal(&L2_REFUSALS.pool_allocator_engine_failed);
-        return RecorderAllocator::EngineFailed;
-    };
-    RecorderAllocator::Ready {
-        allocator: allocator.clone(),
-        list_type,
-    }
+    generations.current = Some(allocator.clone());
+    RecorderAllocator::Ready { allocator, list_type }
 }
 
 /// `pfnDestroyCommandRecorder`.
@@ -3336,6 +3373,11 @@ pub(crate) struct L2Refusals {
     /// `ID3D12CommandAllocator::Reset` failed. ⚠ May legitimately be non-zero:
     /// D3D12 requires the GPU to be done with the allocator's lists first, and
     /// that is the application's obligation, not the driver's.
+    pool_generation_reset: RefusalCounter,
+    pool_generation_rotated: RefusalCounter,
+    pool_generation_created: RefusalCounter,
+    pool_generation_reused: RefusalCounter,
+    pool_reset_error_unavailable: RefusalCounter,
     pool_reset_engine_failed: RefusalCounter,
     /// A recorder slot was called with a null arg or a null `pDrvPrivate`, or a
     /// destroy hit an already-empty slot. **Expected 0.**
@@ -3663,6 +3705,11 @@ pub(crate) static L2_REFUSALS: L2Refusals = L2Refusals {
     pool_allocator_engine_failed: RefusalCounter::new("PoolAllocatorEngineFailed"),
     pool_type_mismatch: RefusalCounter::new("PoolTypeMismatch"),
     pool_reset_no_allocator: RefusalCounter::new("PoolResetNoAllocator"),
+    pool_generation_reset: RefusalCounter::new("PoolGenerationReset"),
+    pool_generation_rotated: RefusalCounter::new("PoolGenerationRotated"),
+    pool_generation_created: RefusalCounter::new("PoolGenerationCreated"),
+    pool_generation_reused: RefusalCounter::new("PoolGenerationReused"),
+    pool_reset_error_unavailable: RefusalCounter::new("PoolResetErrorUnavailable"),
     pool_reset_engine_failed: RefusalCounter::new("PoolResetEngineFailed"),
     recorder_bad_arg: RefusalCounter::new("RecorderBadArg"),
     recorder_class_unsupported: RefusalCounter::new("RecorderClassUnsupported"),
@@ -3766,6 +3813,11 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L2_REFUSALS.pool_allocator_engine_failed,
     &L2_REFUSALS.pool_type_mismatch,
     &L2_REFUSALS.pool_reset_no_allocator,
+    &L2_REFUSALS.pool_generation_reset,
+    &L2_REFUSALS.pool_generation_rotated,
+    &L2_REFUSALS.pool_generation_created,
+    &L2_REFUSALS.pool_generation_reused,
+    &L2_REFUSALS.pool_reset_error_unavailable,
     &L2_REFUSALS.pool_reset_engine_failed,
     &L2_REFUSALS.recorder_bad_arg,
     &L2_REFUSALS.recorder_class_unsupported,

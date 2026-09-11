@@ -12,9 +12,26 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## Native allocator generations, 2026-09-11
+
+Current ProgramData UMD12 `F6D00A83…` gives a DDI command pool a separate
+allocator generation when the engine still owns its previous execution storage.
+Completed generations are recycled through the existing fence-worker reference
+release; no GPU-idle wait or completion shortcut is added. Two allocator OOM
+paths now preserve pending command buffers and check recycling-array allocation.
+Linux/Windows builds, A1, the focused native allocator readbacks, native DXR,
+no-RT refusal/readback and all four ordering cases pass. The small allocator
+probe does not reproduce Port Royal's pending-reset diagnostics; benchmark
+rotation/recycling coverage is still being collected.
+
+[ALLOCATOR_LIFETIME.md](docs/dx12/ALLOCATOR_LIFETIME.md) records the contract,
+source/build/deployment provenance, counters, tests and remaining acceptance.
+WDDM2.1/.271/oem54, UMD11, Mesa and async WSI are unchanged. Full FL12_1/DXR
+compliance and owner visual acceptance of this build remain separate.
+
 ## Conditional DXR admission, 2026-09-11
 
-Current release UMD12 `465CBE13…` makes DXR optional. Adapter caps are discovered
+Preceding release UMD12 `465CBE13…` makes DXR optional. Adapter caps are discovered
 through the actual engine and revalidated at native device creation; non-RT
 engines retain otherwise-backed FL11_0..12_1 support, with RT0 and an engine-bounded
 shader-model list. Native Windows admission/caps checks pass with RT enabled and

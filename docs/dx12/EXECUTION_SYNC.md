@@ -1,5 +1,14 @@
 # DX12 runtime admission and exact execution completion
 
+**Allocator update, 2026-09-11:** the native frontend now rotates and recycles
+allocator generations when engine retirement references remain. This preserves
+pending backing without waiting for GPU idle or treating reference counts as
+completion. UMD12 F6D00A83 passes the focused native readback, DXR, no-RT and
+four ordering cases. See [ALLOCATOR_LIFETIME.md](ALLOCATOR_LIFETIME.md) for the
+exact contract, OOM repairs, provenance and unexercised failure/stress paths;
+older pending-reset observations below describe the preceding implementation.
+
+
 **Current source policy:** the owner-authorized renderer fork replaces the
 feedback workaround with authenticated wire completion. See the current contract
 below and [NATIVE_DGC.md](NATIVE_DGC.md). Older deployment receipts remain historical.

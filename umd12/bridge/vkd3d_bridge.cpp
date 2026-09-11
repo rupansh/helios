@@ -990,6 +990,13 @@ extern "C" HRESULT helios_vkd3d_execute_command_lists(ID3D12CommandQueue*, UINT,
     ID3D12CommandList* const*, HANDLE, std::uint32_t*, std::uint32_t*, std::uint64_t*);
 extern "C" void helios_vkd3d_cancel_execution(ID3D12CommandQueue*, HRESULT);
 
+extern "C" HRESULT helios_vkd3d_try_reset_command_allocator(ID3D12CommandAllocator*);
+std::int32_t helios_vkd3d_bridge_try_reset_allocator(std::size_t allocator) {
+  return helios_bridge::bridge_guard("try_reset_allocator12", std::int32_t(E_FAIL), [&]() -> std::int32_t {
+    return helios_vkd3d_try_reset_command_allocator(reinterpret_cast<ID3D12CommandAllocator*>(allocator));
+  });
+}
+
 std::int32_t helios_vkd3d_bridge_execute(std::size_t queue, rust::Slice<const std::size_t> lists,
     std::size_t admission_event, std::uint32_t* ctx, std::uint32_t* value, std::uint64_t* cookie) {
   return helios_bridge::bridge_guard("execute12", std::int32_t(E_FAIL), [&]() -> std::int32_t {

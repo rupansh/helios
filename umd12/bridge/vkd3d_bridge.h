@@ -183,6 +183,8 @@ constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_ICD_REFUSED = 6;
 bool helios_vkd3d_bridge_publish_producer(std::size_t queue, std::size_t resource,
     std::uint32_t allocation, std::size_t admission_event, std::uint32_t* ctx, std::uint32_t* value, std::uint64_t* cookie);
 
+// Borrowed engine allocator; S_FALSE retains pending storage without resetting.
+std::int32_t helios_vkd3d_bridge_try_reset_allocator(std::size_t allocator);
 std::int32_t helios_vkd3d_bridge_execute(std::size_t queue, rust::Slice<const std::size_t> lists,
     std::size_t admission_event, std::uint32_t* ctx, std::uint32_t* value, std::uint64_t* cookie);
 void helios_vkd3d_bridge_cancel_execution(std::size_t queue, std::int32_t reason);

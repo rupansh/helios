@@ -1,5 +1,12 @@
 # DXR serialization and reference lifetimes
 
+**Allocator follow-up, 2026-09-11:** UMD12 F6D00A83 preserves execution-owned
+command-pool generations and recycles them after engine retirement. Native DXR,
+conditional no-RT and ordering probes pass. [ALLOCATOR_LIFETIME.md](ALLOCATOR_LIFETIME.md)
+contains the new contract and benchmark/lifetime receipt; older pending-reset
+counts below remain observations of their explicitly identified builds.
+
+
 ## Conditional DXR support
 
 Release UMD12 `465CBE13528F1BA7802200D1E620DD16D9B00F082ABFE22AA4227C2B180206CF`

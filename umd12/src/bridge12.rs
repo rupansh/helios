@@ -229,6 +229,11 @@ mod ffi {
         /// Queue is live. Called after runtime context destruction, or on failure.
         unsafe fn helios_vkd3d_bridge_cancel_execution(queue: usize, reason: i32);
 
+        /// S_FALSE preserves execution-owned storage; S_OK resets it.
+        /// # Safety
+        /// Live borrowed engine allocator with externally serialized use.
+        unsafe fn helios_vkd3d_bridge_try_reset_allocator(allocator: usize) -> i32;
+
         /// Commit a producer boundary after preceding work on the exact queue.
         /// # Safety
         /// Queue/resource are live engine objects of the same device; allocation
@@ -665,6 +670,15 @@ pub(crate) unsafe fn create_root_signature(
 pub(crate) unsafe fn clear_root_arguments(list: usize) -> i32 {
     // SAFETY: the native DDI owns the list during this synchronous operation.
     unsafe { ffi::helios_vkd3d_bridge_clear_root_arguments(list) }
+}
+
+/// Reset only when the engine's execution references have retired. S_FALSE is
+/// an ownership result, never an attestation of GPU completion.
+/// # Safety
+/// `allocator` is a live borrowed engine allocator; its use is serialized.
+pub(crate) unsafe fn try_reset_allocator(allocator: usize) -> i32 {
+    // SAFETY: the caller owns and serializes the engine allocator.
+    unsafe { ffi::helios_vkd3d_bridge_try_reset_allocator(allocator) }
 }
 
 /// # Safety

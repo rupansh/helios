@@ -1,5 +1,14 @@
 # PENDING.md — native FL12_0/FL12_1 and higher-feature contracts
 
+**Allocator update, 2026-09-11:** the native frontend now rotates and recycles
+allocator generations when engine retirement references remain. This preserves
+pending backing without waiting for GPU idle or treating reference counts as
+completion. UMD12 F6D00A83 passes the focused native readback, DXR, no-RT and
+four ordering cases. See [ALLOCATOR_LIFETIME.md](ALLOCATOR_LIFETIME.md) for the
+exact contract, OOM repairs, provenance and unexercised failure/stress paths;
+older pending-reset observations below describe the preceding implementation.
+
+
 **Current optional-DXR contract, 2026-09-11:** release465CBE13 replaces unconditional
 RT admission with engine-derived adapter caps and per-device identity/capability
 revalidation. An otherwise eligible non-RT engine reports RT0 and retains
