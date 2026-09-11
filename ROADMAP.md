@@ -18,11 +18,15 @@ Current ProgramData UMD12 `F6D00A83…` gives a DDI command pool a separate
 allocator generation when the engine still owns its previous execution storage.
 Completed generations are recycled through the existing fence-worker reference
 release; no GPU-idle wait or completion shortcut is added. Two allocator OOM
-paths now preserve pending command buffers and check recycling-array allocation.
+paths now preserve recorded command storage, check recycling-array allocation
+and propagate sticky E_OUTOFMEMORY from Close.
 Linux/Windows builds, A1, the focused native allocator readbacks, native DXR,
 no-RT refusal/readback and all four ordering cases pass. The small allocator
-probe does not reproduce Port Royal's pending-reset diagnostics; benchmark
-rotation/recycling coverage is still being collected.
+probe passes 832 resets. Final Port Royal completes at **12,163 / 56.31 FPS**,
+with matching settings, changing rendered frames and zero pending-reset errors.
+The graphics test performs 42,353 rotations, including 42,180 reuses, without
+reset failures. The owner has been asked to judge the new captures; acceptance
+is pending. This is not a performance-gain claim.
 
 [ALLOCATOR_LIFETIME.md](docs/dx12/ALLOCATOR_LIFETIME.md) records the contract,
 source/build/deployment provenance, counters, tests and remaining acceptance.

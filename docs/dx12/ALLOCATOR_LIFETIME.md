@@ -83,8 +83,8 @@ Final deployed UMD12 SHA256:
 `F6D00A83BF18B93E365FACEAEF666CE21A34203244A5FD7839CEA2B217D69252`.
 The ProgramData path is
 `C:\ProgramData\HeliosUmd\helios_umd12_f6d00a83bf18b93e.dll`.
-Device disable/enable completed with Code0. KMD .271/oem54/WDDM2.1, UMD11
-57C84ED4 and ICD43394BBD are unchanged. This is a ProgramData update, not a new
+Device disable/enable completed with Code 0. KMD .271/oem54/WDDM2.1, UMD11
+57C84ED4 and ICD 43394BBD are unchanged. This is a ProgramData update, not a new
 signed package, hosted-CI result or guest reboot. Engine source is committed locally as
 `5e8b2998cc350dac3d1b6ddb40232ef4e66e8074`; build metadata retains its actual
 pre-commit base plus dirty source. The failed first Windows
@@ -104,13 +104,13 @@ unexercised.
 `tools/d3d12_allocator_probe.cpp` uses system D3D12 on the exact Helios hardware
 adapter at FL12_1. Its scheduled-task runner verifies source/executable receipts,
 loaded module paths and the intended UMD hash, and archives output/driver logs.
-Both baseline 465CBE13 and candidates E8A1551C and F6D00A83 pass 768 epochs across DIRECT, COMPUTE
-and COPY, 64 epochs sharing an allocator across two queues, and a pending-list
+Baseline 465CBE13 and candidates E8A1551C and F6D00A83 pass 768 epochs across
+DIRECT, COMPUTE and COPY, 64 epochs sharing an allocator across two queues, and a pending-list
 Reset to different storage followed by release of the original public allocator.
 Every epoch checks 4,096 words. The negative gate checks both unchanged readback
 and absent completion. It never calls allocator Reset while GPU work is pending.
-These small tests do not reproduce the old Reset warnings; the first candidate records 832 resets
-succeed with zero rotations and zero reset failures.
+These small tests do not reproduce the old Reset warnings. The first candidate
+records 832 successful resets with zero rotations and zero reset failures.
 
 The candidate also passes the existing native DXR fixture (eight behavior groups,
 20 ray words), no-RT valid-state-object refusal plus 4,096 GPU readback words, and
@@ -143,6 +143,56 @@ The later F6D00A83 repair changes OOM propagation and needs its own runtime rece
 This is not a settings-equivalent, focused performance comparison establishing
 a gain.
 
+## Final native Port Royal and capability receipt
+
+F6D00A83 completes the stock demo and graphics test, both status 0, with score
+**12,163 / 56.31345 FPS**. Every resolved setting matches the accepted 057934F9
+run: demo 1280x800, graphics 2560x1440, RT reflections and shadows enabled.
+Demo PID 11076 and graphics PID 7276 each load system D3D12/Core 10.0.26100.9278,
+DXGI 10.0.26100.9444, the exact F6D00A83 native UMD and ICD 43394BBD. WARP and
+app-local engine/runtime substitution are absent. The installed application
+is 3DMark 2.32.8454.0 with SystemInfo 5.92.1497.0; the PortRoyal workload executable
+reports 1.0.0.0 and SHA256
+`0E4B6B7896328157A3BE5281CF5A6E876242E4B9CF812186640B250B962ADA68`.
+
+| Workload | Ordinary resets | Rotations | Reused generations | Additional generations created | Reset failures |
+|---|---:|---:|---:|---:|---:|
+| Demo 11076 |243718|102534|102211|323|0|
+| Graphics 7276 |160104|42353|42180|173|0|
+
+Both workloads have zero old pending-Reset errors and zero missing reset-error
+callbacks. These are final per-process counters, not cache peaks. Full result,
+XML export, module identities, stock definition and driver logs are archived in
+`controls/allocator-epochs-final-portroyal/`; the review is
+`allocator-epochs-final-portroyal-review.json`. The result SHA256 is
+`39163374e6818ea7101cdb14002e33521c4beef0292702c9c4d61fcee516fff6`;
+the XML SHA256 is
+`091540792fa77b4e3bb6dab8f7f8da40d037d7cefb2e367434400dcff94808e7`.
+
+Host VNC capture ran throughout completion and was stopped afterward. Its 91
+captures include changing demo pixels and graphics-test frames 3434 and 5276
+(57.png and 62.png), with advancing on-screen test time. Demo 20.png and GT 62.png
+were presented to the owner; visual acceptance is pending. Desktop capture and
+final inventory confirm a live desktop, Code 0, UmdD3D12=1 and no active probes or
+benchmarks. Task definitions are restored to ordinary RT mode without rerunning.
+No guest reboot, host renderer or VM-launcher change was made.
+
+`final-native/`, `final-dxr/`, `final-no-rt/`, `final-sync/` and
+`final-native-caps/` contain the final-build native receipts. Capability probes
+8152 (normal) and 9356(RT extensions disabled) admit 11_0, 11_1, 12_0 and 12_1,
+refuse 12_2 with 0x887a0004, report maximum 12_1 and SM6.3, and report RT1.0 versus
+RT0 respectively. The no-RT state-object refusal/readback test also passes.
+A physical non-RT GPU is still untested. The final source digest manifest matches root implementation
+`1edb6366ab81e14248abf9e8b1176a19efdabc5e` and engine
+`5e8b2998cc350dac3d1b6ddb40232ef4e66e8074`; the earlier intermediate benchmark is not
+substituted for this final-build evidence.
+
+The two candidates score 13,013 and 12,163; this variation is not attributed to
+the OOM repair or presented as a measured speedup. No performance optimization
+or baseline comparison is claimed. Remaining heap-allocation, concurrency and
+host-loss fault injection are separate from the exercised ownership and sticky
+error checks.
+
 ## Remaining acceptance
 
 Full FL12_1/DXR compliance is not established by this allocator change. Committed
@@ -150,4 +200,7 @@ sparse fallback lacks mapping alias/residency semantics. DXR tools visualization
 extreme RT limits and other capability/behavior work remain open. General
 DX12-to-DX11 external ownership and consumer release, host-loss error-bearing
 completion, sharing/resize/rotation/teardown and async WSI stress retain their
-existing limits. The owner's prior Port Royal acceptance belongs to 057934F9.
+existing limits. The owner's prior Port Royal acceptance belongs to 057934F9. Time Spy, Fire
+Strike and Steel Nomad Vulkan remain regression controls; their completed
+057934F9 receipts do not constitute tests of this allocator increment. They
+have not been rerun on F6D00A83.

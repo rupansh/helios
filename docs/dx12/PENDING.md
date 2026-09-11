@@ -746,10 +746,12 @@ this optional feature's native contract. It is outside the FL12_0 requirement se
 `ApertureSegmentCommitLimit = 64 MiB` **cannot fail an allocation**; `MakeResident`/`Evict` return `S_OK`
 honestly and `E_PENDING` is unreachable by construction.
 
-**Command-allocator lifetime remains acceptance work.** The pending-allocator-reset/
-fence-worker lifetime question is unresolved. Engine timeline retirement alone
-is not proof of every native reset/teardown interleaving; see EXECUTION_SYNC.md.
-A successful API Reset and a silent counter do not discharge that question.
+**Command-allocator generation reuse is implemented and exercised.** The
+F6D00A83 native probe and completed Port Royal validate independent recording
+storage while execution references retire. Rotation/reuse counters and GPU
+witnesses accompany zero reset failures; see ALLOCATOR_LIFETIME.md. Heap OOM,
+concurrent teardown and host-loss injection remain acceptance work; this does
+not claim every native reset/teardown interleaving is validated.
 
 ---
 
