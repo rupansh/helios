@@ -103,10 +103,15 @@ win11. SSH/win_exec land in **session 0** — window/desktop probes and every be
 via scheduled tasks (`schtasks /run /tn <name>`; a 3DMark run launched from session 0 fakes a
 driver regression). See TOOLCHAIN.md and ROADMAP.md tooling.
 
-**VM launch ownership:** if you change the standalone VM launch command,
-`tools/launch-helios-gtk.sh`, QEMU display/debug transport, or launcher environment variables,
-stop after making/documenting the change and ask the user to run or restart the VM. Ask before
-cold boots / guest reboots; `pnputil /restart-device` re-runs AddAdapter without one.
+**Standing VM authorization (owner directive, 2026-09-12):** start, stop, restart,
+cold-boot or reboot the test VM and build slave whenever needed for Helios work.
+This includes changing and relaunching `tools/launch-helios-gtk.sh`, QEMU
+display/debug transport and launcher environment variables. Do not pause for
+approval or require the owner to be present; the owner is often AFK. This
+authorization supersedes older approval requirements in the project docs.
+Document launch changes, report disruptive restarts, and verify guest health and
+loaded driver versions afterward. `pnputil /restart-device` re-runs AddAdapter
+when a full guest reboot is unnecessary.
 
 ---
 
