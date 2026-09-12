@@ -42,13 +42,34 @@ try {
             $failures.Add("Helios PnP device status is $($device.Status).")
         }
     }
-    $signedDriver = Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceID -eq $instanceId } | Select-Object -First 1
-    if ($signedDriver) {
-        Write-Host "Driver provider/version: $($signedDriver.DriverProviderName) $($signedDriver.DriverVersion)"
-        $expectedPublisher = Get-HeliosPackagePublisher $state
-        if ($signedDriver.DriverProviderName -ne $expectedPublisher) {
-            $failures.Add("The active display driver provider is $($signedDriver.DriverProviderName), expected $expectedPublisher.")
+    $expectedPublisher = Get-HeliosPackagePublisher $state
+    # Read the bound device's provider first. Win32_PnPSignedDriver can leave
+    # its provider empty even for a healthy, activated Helios device.
+    $providerProperty = Get-PnpDeviceProperty -InstanceId $instanceId -KeyName DEVPKEY_Device_DriverProvider -ErrorAction SilentlyContinue
+    $providerName = ""
+    $providerSource = "PnP"
+    if ($providerProperty -and $providerProperty.PSObject.Properties["Data"]) {
+        $providerName = [string]$providerProperty.Data
+    }
+    if ([string]::IsNullOrWhiteSpace($providerName)) {
+        $signedDriver = Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceID -eq $instanceId } | Select-Object -First 1
+        $providerSource = "CIM fallback"
+        if ($signedDriver) { $providerName = [string]$signedDriver.DriverProviderName }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($providerName)) {
+        Write-Host "Driver provider ($providerSource): $providerName"
+    }
+    if ([string]::IsNullOrWhiteSpace($providerName)) {
+        # A staged driver awaiting activation may lack provider metadata in
+        # both sources. Registration and file checks below remain mandatory;
+        # only this metadata check waits.
+        if ($AllowPendingReboot -and $device.Status -ne "OK") {
+            Write-Warning "Active driver provider metadata is unavailable while Helios PnP status is $($device.Status). Verify again without -AllowPendingReboot after reboot."
+        } else {
+            $failures.Add("The active display driver provider metadata is unavailable, expected $expectedPublisher.")
         }
+    } elseif ($providerName -ne $expectedPublisher) {
+        $failures.Add("The active display driver provider is $providerName, expected $expectedPublisher.")
     }
 } catch {
     $failures.Add($_.Exception.Message)

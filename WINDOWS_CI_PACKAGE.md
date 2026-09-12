@@ -82,6 +82,14 @@ D3D11 requires feature level 11.0 and verifies every pixel of a 31x17 readback.
 D3D12 runs the existing clear/readback probe with `--expect ok`; neither check
 establishes presentation correctness or full conformance.
 
+Provider verification reads the bound adapter's `DEVPKEY_Device_DriverProvider`,
+falling back to CIM only when that PnP property is unavailable. CIM can omit its
+provider even on a healthy activated adapter. Before reboot, `-AllowPendingReboot`
+defers provider metadata missing from both sources only
+while the PnP device is not `OK`; a reported wrong provider still fails. Normal
+verification after reboot requires both healthy PnP status and the expected
+provider from either source.
+
 ## Application compatibility files
 
 The archive includes the separately deployed DaVinci Resolve ADL shim at
