@@ -192,7 +192,7 @@ static int run(UINT samples,bool srgb,UINT seconds,bool resize) {
     HWND window=CreateWindowExW(WS_EX_TOPMOST,wc.lpszClassName,title,WS_POPUP,
         (screenWidth-static_cast<int>(width))/2,(screenHeight-static_cast<int>(height))/2,width,height,nullptr,nullptr,wc.hInstance,nullptr);
     require(window!=nullptr,"create visible window"); ShowWindow(window,SW_SHOW); pump(window);
-    RECT rectangle{}; require(GetClientRect(window,&rectangle) && rectangle.right==width && rectangle.bottom==height,"exact client size");
+    RECT rectangle{}; require(GetClientRect(window,&rectangle) && rectangle.right==static_cast<LONG>(width) && rectangle.bottom==static_cast<LONG>(height),"exact client size");
     POINT origin{}; require(ClientToScreen(window,&origin),"client origin");
     std::printf("START pid=%lu bits=%zu samples=%u format=%s seconds=%u window=%p client=%ld,%ld %ux%u\n",
         GetCurrentProcessId(),sizeof(void*)*8,samples,srgb?"sRGB":"UNORM",seconds,window,origin.x,origin.y,width,height);
