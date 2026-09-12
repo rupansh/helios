@@ -330,7 +330,7 @@ on runtime data or on a compile-time constant?*).
 
 | lens | looking for | the scar that justifies it |
 |---|---|---|
-| **ABI & tables** | slot **index** vs member index; table size from the runtime's `SIZE_T` not `size_of::<T>()`; `extern "C"` not `extern "system"`; no hand-transcribed struct | `DECISIONS.md` §4.1's "slots 38-40" was a `sed` line offset misread as a member index. R702: 24H2 passed 576 B for a 592 B struct. R908 |
+| **ABI & tables** | slot **index** vs member index; table size from the runtime's `SIZE_T` not `size_of::<T>()`; `extern "system"` for Windows DDIs, preserving private cdecl bridge signatures; no hand-transcribed struct | `DECISIONS.md` §4.1's "slots 38-40" was a `sed` line offset misread as a member index. R702: 24H2 passed 576 B for a 592 B struct. R908 |
 | **Handles & lifetimes** | payload type **derived** from the handle type, never chosen at the call site; every `Slot<Boxed<S>>::get()` carrying a **re-derived** D3D12 argument | §12 rule 7 — `load_com::<ID3D11RenderTargetView>(h_rtv)` compiled and produced a `ManuallyDrop` whose vtable pointer was a struct field: a wild call on first use |
 | **Loud failure** | every refusal counted **and readable** — a counter that appears in no summary is not an instrument | T5: three of four scan-out counters were atomics **nothing ever loaded**, so ROADMAP's own instruction to read them was not executable |
 | **Concurrency** | state touched from create/destroy DDIs under FREETHREADED; anything that refills a live table | §12 rule 10 — `RelocateDeviceFuncs` is a **NOTIFICATION**; the old refill made a concurrent `CalcPrivate*Size` return 0 → zero-byte private region → heap corruption |

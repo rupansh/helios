@@ -21,16 +21,78 @@ function Import-VisualStudioEnvironment(
     }
 
     $devCmd = Join-Path $installation "Common7\Tools\VsDevCmd.bat"
-    $environment = & cmd.exe /s /c "`"$devCmd`" -no_logo -arch=$Architecture -host_arch=x64 && set"
-    if ($LASTEXITCODE -ne 0) {
-        throw "VsDevCmd.bat failed with exit code $LASTEXITCODE."
-    }
-    foreach ($line in $environment) {
-        $parts = $line -split "=", 2
-        if ($parts.Count -eq 2) {
-            Set-Item -LiteralPath "Env:$($parts[0])" -Value $parts[1]
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = Join-Path $env:SystemRoot "System32\cmd.exe"
+    $start.UseShellExecute = $false
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    $clean = ""
+    if ($env:__VSCMD_PREINIT_PATH) {
+        # Repeated imports otherwise accumulate VS paths until cmd's 8191-byte
+        # line limit is reached. Reset in the child before even -clean_env runs;
+        # its batch files also expand PATH. VS owns the rest of its cleanup.
+        $baseline = $env:__VSCMD_PREINIT_PATH
+        $additions = @()
+        if ($env:HELIOS_VS_IMPORTED_PATH) {
+            # Preserve paths added by our caller after the previous import
+            # (LLVM/WDK/MSYS2, for example). This marker travels to Cargo's
+            # child PowerShell process, unlike a script-scoped cache.
+            $imported = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($entry in $env:HELIOS_VS_IMPORTED_PATH.Split(';')) { [void]$imported.Add($entry) }
+            $additions = @($env:PATH.Split(';') | Where-Object { $_ -and -not $imported.Contains($_) } | Select-Object -Unique)
+        } else {
+            # A caller may enter from a Developer shell we did not initialize.
+            # Preserve its extra tools while discarding VS-owned paths (which
+            # include the old architecture's compiler). The explicit LLVM
+            # selection may itself live inside the VS installation.
+            $vsRoots = @($env:VSINSTALLDIR, $installation) | Where-Object { $_ } | ForEach-Object { $_.TrimEnd('\') + '\' }
+            $additions = @($env:PATH.Split(';') | Where-Object {
+                $entry = $_
+                $entry -and -not @($vsRoots | Where-Object { $entry.StartsWith($_, [StringComparison]::OrdinalIgnoreCase) }).Count
+            })
+            if ($env:LIBCLANG_PATH) { $additions = @($env:LIBCLANG_PATH) + $additions }
         }
+        if ($additions.Count -gt 0) {
+            $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            $baseline = (@($additions + $baseline.Split(';') | Where-Object { $_ -and $seen.Add($_) }) -join ';')
+        }
+        $start.Environment["PATH"] = $baseline
+        $start.Environment["__VSCMD_PREINIT_PATH"] = $baseline
+        foreach ($name in @("INCLUDE", "LIB", "LIBPATH", "EXTERNAL_INCLUDE")) {
+            $previous = [Environment]::GetEnvironmentVariable("__VSCMD_PREINIT_$name")
+            if ($previous) { $start.Environment[$name] = $previous }
+            else { [void]$start.Environment.Remove($name) }
+        }
+        $clean = "call `"$devCmd`" -no_logo -clean_env && "
     }
+    $start.Arguments = "/d /s /c `"${clean}call `"$devCmd`" -no_logo -arch=$Architecture -host_arch=x64 && set`""
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    try {
+        if (-not $process.Start()) { throw "Could not start VsDevCmd.bat." }
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            throw "VsDevCmd.bat failed with exit code $($process.ExitCode): $($stderr.Result)"
+        }
+        $environment = @{}
+        foreach ($line in ($stdout.Result -split "`r?`n")) {
+            $parts = $line -split "=", 2
+            if ($parts.Count -eq 2 -and $parts[0]) { $environment[$parts[0]] = $parts[1] }
+        }
+    } finally {
+        $process.Dispose()
+    }
+    # Mirror removals too: assigning only returned variables would retain stale
+    # architecture-specific state that -clean_env removed in the child.
+    foreach ($entry in @(Get-ChildItem Env:)) {
+        if (-not $environment.ContainsKey($entry.Name)) { Remove-Item -LiteralPath "Env:$($entry.Name)" }
+    }
+    foreach ($name in $environment.Keys) {
+        Set-Item -LiteralPath "Env:$name" -Value $environment[$name]
+    }
+    $env:HELIOS_VS_IMPORTED_PATH = $env:PATH
 }
 
 function Find-WindowsKitTool([Parameter(Mandatory)][string]$Name) {
