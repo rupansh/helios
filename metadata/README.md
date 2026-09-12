@@ -96,7 +96,7 @@ license/copyright notices remain intact. No blanket copyright replacement was ma
 - Local cargo-make certificate generation, copying and signing override the WDK
   sample's WDRLocalTestCert settings. The local installer and CI also use WinBoat
   subjects. Building generates/reuses a suitable development certificate; no
-  certificates or trust stores were changed during this source edit. Old trusted
+  trust stores were changed during the build verification. Old trusted
   certificates are not removed. An obsolete WDR certificate file is removed from
   a reused package output directory when the new certificate is copied there.
 - Package discovery still recognizes older adapter descriptions. Provider
@@ -140,9 +140,26 @@ and ADL resource generation; C vendor-selection tests; metadata synchronization;
 EDID conformity via edid-decode for 1920x1080, 3840x2160 and 1080x1920. Signing-task
 overrides were checked against the inherited WDK task definitions.
 
-These checks do not replace full Windows driver/Mesa builds, actual certificate
-signing, installation and visible rendering validation. Those remain pending;
-nothing was deployed or rebooted, and the release version was not bumped.
+Windows build and package validation passed on 2026-09-12 at source commit
+`6e8de38366d27475fdfb7d11760bbcc3b1f22967`: KMD, D3D11/D3D12 UMDs,
+DXVK/vkd3d, Mesa x64/x86, loaders, smoke-probe compilation, and ADL compatibility
+lifecycle tests. Actual ADL1/ADL2 version queries returned the shared branding.
+The unchanged CLVK binary was reused after checking its source/patch provenance
+and SHA256 against the existing build output.
+
+The test-signed 22.22.271.0 bundle passed all 35 manifest hash/size checks, all four
+WinBoat version-resource checks, INF publisher/name checks, Mesa architecture
+checks and signer-certificate identity checks. The self-signed package root is
+not trusted on the builder; signature inspection reported that specific chain
+error, which the validation allowed without modifying trust stores. Installation
+and visible rendering validation remain pending. Nothing was deployed or
+rebooted, and the release version was not bumped.
+
+The Windows build exposed and corrected locale-dependent Python metadata I/O
+(now explicitly UTF-8), PowerShell 7 module-path leakage into Windows PowerShell
+signing tasks (task-local `PSModulePath` removal plus explicit security-provider
+import), and stale KMD/D3D11 lockfiles (now matching the already-required bindgen
+0.72 and WDK git dependencies used by the successful build).
 
 References: [VESA E-EDID A2](https://glenwing.github.io/docs/VESA-EEDID-A2.pdf),
 [WDK node metadata](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/d3dkmdt/ns-d3dkmdt-_dxgk_nodemetadata),

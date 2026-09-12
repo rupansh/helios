@@ -79,7 +79,8 @@ The script:
 - Regenerates `helios_kmd_render.cat` with `Inf2Cat.exe` before signing. `Inf2Cat.exe` may only
   exist under the WDK `x86` bin directory; the script searches both `x64` and `x86`.
 - Signs both `helios_kmd_render.sys` and `helios_kmd_render.cat` with a machine-store
-  `CN=WDRLocalTestCert` if needed.
+  development certificate derived from `metadata/helios.env` (currently
+  `CN=WinBoat Helios vGPU Development Test Signing`) if needed.
 - Imports that cert into `LocalMachine\Root` and `LocalMachine\TrustedPublisher`. This is required
   when LoginUI/Explorer are crash-looping and CurrentUser certs are unavailable.
 - Stops/disables the Looking Glass host service so it cannot fight IDD mode.
