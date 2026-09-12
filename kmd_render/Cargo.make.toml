@@ -266,10 +266,13 @@ args = [
 
 # Replace the WDK sample's hardcoded WDRLocalTestCert identity on every local
 # package path. clear removes its old makecert command and condition script.
+# cargo-make is an intermediate process between pwsh and Windows PowerShell;
+# remove inherited PS7 module paths so the child loads its own built-in modules.
 [tasks.generate-certificate]
 clear = true
 private = true
 dependencies = ["setup-wdk-config-env-vars"]
+env = { PSModulePath = { unset = true } }
 command = "powershell"
 args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CARGO_MAKE_WORKING_DIRECTORY}/../tools/sign-helios-development.ps1", "-OutputDirectory", "${WDK_BUILD_OUTPUT_DIRECTORY}"]
 
@@ -277,6 +280,7 @@ args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CARGO_MAKE_WORKI
 clear = true
 private = true
 dependencies = ["setup-wdk-config-env-vars"]
+env = { PSModulePath = { unset = true } }
 command = "powershell"
 args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CARGO_MAKE_WORKING_DIRECTORY}/../tools/sign-helios-development.ps1", "-OutputDirectory", "${WDK_BUILD_OUTPUT_DIRECTORY}", "-PackageDirectory", "${WDK_BUILD_OUTPUT_DIRECTORY}/${CARGO_MAKE_CRATE_FS_NAME}_package"]
 
@@ -284,5 +288,6 @@ args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CARGO_MAKE_WORKI
 clear = true
 private = true
 dependencies = ["setup-wdk-config-env-vars"]
+env = { PSModulePath = { unset = true } }
 command = "powershell"
 args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CARGO_MAKE_WORKING_DIRECTORY}/../tools/sign-helios-development.ps1", "-OutputDirectory", "${WDK_BUILD_OUTPUT_DIRECTORY}", "-SignFile", "${WDK_BUILD_SIGNTOOL_SIGN_INPUT_FILE}"]
