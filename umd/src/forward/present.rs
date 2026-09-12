@@ -1651,7 +1651,7 @@ unsafe fn dxgi_present_impl(
             PRESENT_SKIP_NO_CALLBACKS.load(Ordering::Relaxed),
             PRESENT_SKIP_NO_CONTEXT.load(Ordering::Relaxed),
             PRESENT_SKIP_NO_SRC_ALLOC.load(Ordering::Relaxed),
-            PRESENT_GATE_TIMEOUTS.load(Ordering::Relaxed),
+            EXT_FLIP_GATE_TIMEOUTS.load(Ordering::Relaxed),
         );
     }
     present_hr
