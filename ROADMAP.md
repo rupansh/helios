@@ -60,8 +60,9 @@ statistics query (kind 8, 88 bytes) was cast directly to the API enum (kind 8,
 device, and PassMark ignored a later failed `CreateBuffer` before mapping NULL.
 The .273 source explicitly translates query kinds and legacy 64-byte statistics,
 keeps pending/error output untouched, and honors `DONOTFLUSH`. A native query
-regression probe reproduces removal on .272 in both architectures; acceptance
-on the corrected loaded DLLs and a completed PassMark score remain pending.
+regression probe reproduces removal on .272 in both architectures. PassMark
+now completes on the corrected loaded DLLs; the query probe still has a separate
+`S_FALSE` caller-buffer assertion pending (see current guest state below).
 Seven pure query tests, both Windows UMD checks, and independent reviews pass.
 
 A separate DXVK worker-failure path could strand DWM's device destruction in a
@@ -101,18 +102,66 @@ DriverStore, including junction/path aliases. Its 31-case harness passed Linux
 and Windows PowerShell; independent review closed both path-alias findings.
 Registration/file checks must be followed by actual loaded-module verification.
 
-**Current guest state:** .273 is staged as `oem14.inf`; installer exit **3010**.
-All runtime/DriverStore file and native/WoW64 registration checks pass, but the
-adapter still reports **Code 31 / 0xc000000e** after the same-INF restart. A new
-owner-approved reboot is required before further GPU testing; none was performed
-during this upgrade. The old .272 signed package remains available, with manager
-state/scripts under `C:\ProgramData\Helios\wow64-evidence\before273` and repaired
-registration evidence under `registry-repair`. The installed common helper is the
-fixed one. No PassMark IFEO debugger override remains. After reboot, verify
-activation, run `Helios-WoW64-Query273`, then the clean interactive
-`Helios-WoW64-PassMark273` task and capture visible frames via host VNC. Do not
-count the registration-only trial as exercising .273 or report a PassMark score
-before the real workload completes.
+**Current guest state:** signed .274 (`7d6412df`) is active with Code 0 after
+reboot under the owner's standing authorization. This WinBoat launch stops the
+container on guest reboot; `docker start WinBoat` resumes it. The installed
+bundle is `helios-windows-x64-22.22.274.0-7d6412df.zip`, SHA256
+`5f1a99384d92d27aafef1fbd73f2ec1ccde6873717c27886bc07074ecf8ca5c5`.
+PassMark and the x86/x64 probes logged the .274 DriverStore modules; their
+versions and hashes match the installed package. Previous .273 rollback state
+and scripts remain under `C:\ProgramData\Helios\wow64-evidence\before274`.
+
+**Closed: MSAA/sRGB presentation corruption.** PassMark's x86 helper presents
+1280x800, DXGI format 29 (sRGB), 4x MSAA through `Present1-single` with BLT set
+and no destination handle. The old snapshot format whitelist refused sRGB,
+so KMD imported the original four-sample backing under its fixed single-sample
+image contract. The allocation metadata has no sample count; that raw fallback
+cannot represent this source correctly. The owner confirmed the visible glitch.
+
+The native-runtime `tools/d3d11_msaa_present_probe.cpp` isolates the defect.
+On .273, all eight x86/x64 × 1x/4x × UNORM/sRGB source-readback cases exited 0
+with exact RGBA agreement over **3,794 frames / 3,885,056,000 pixels**, and zero
+final device references. Host VNC nevertheless showed scrambled geometry in
+both 4x sRGB cases, black instead of the 128 average in both 4x UNORM sample
+bands, and 128 instead of 188 midtones in both 1x sRGB cases. Only the two 1x
+UNORM controls passed the visible-frame comparison. This is a common
+presentation defect exposed by WoW64, not an architecture-specific draw error.
+The confirmed baseline supersedes an earlier launcher that lost process exit
+codes. Evidence: `tmp/wow64-20260912/msaa-baseline273-confirm/` and its `-vnc/`
+folder, plus `passmark-msaa-presentation-review.txt`.
+
+The .274 correction resolves MSAA in its source format, then preserves sRGB
+encoded bytes in the corresponding UNORM snapshot. Required normalization
+stays enabled with optional snapshot isolation off. Missing capability,
+producer ordering, geometry, cache capacity or copy fails Present explicitly.
+The KMD admits only the exact canonical format pairs. All 12 snapshot validation
+tests pass, including wrong-format/extent/purpose rejection. All five driver
+images build, pass PE/export/CRT and INF checks, and have verified catalog
+membership; all 44 package manifest/signature checks pass.
+
+**.274 rendering acceptance:** all eight cases pass both source readback and
+host VNC comparison, with advancing frame serials, exact geometry and midtones:
+**3,724 frames / 3,813,376,000 source pixels**. With `ScanoutSnapshot=0`, the same
+eight cases pass again: **3,770 frames / 3,860,480,000 source pixels**. Image
+comparison excludes the separately checked serial strip and the visually
+identified mouse cursor; both baseline and fix allow three seconds for process
+startup. Disabling `UmdAsyncPresentStream` makes 4x sRGB Present fail immediately
+in both architectures: named required-normalization refusal count 1, probe exit
+2, API result `DXGI_ERROR_DEVICE_REMOVED` (the DDI returns `E_FAIL`). Original
+registry values were restored, and the adapter remains Code 0. A fresh x86
+4x sRGB run then exited 0 after 292 frames with correct host VNC output and
+zero final device references (`msaa-recovery274-confirm/`).
+
+Real PassMark DX11 completed using `helios_umd32.dll` .274. Multiple host VNC
+frames show coherent, changing jellyfish/terrain geometry without the old
+scrambling. The report records 10.7 fps with its resolution penalty; this is
+correctness evidence, not a performance comparison. All **14 installed-package
+smoke cases** pass, including native/x86 D3D11 and D3D12 creation plus exact
+65,536-pixel D3D12 clear/readback in each architecture. Evidence under
+`tmp/wow64-20260912/`: `msaa-fixed274{,-vnc}/`,
+`msaa-snapshot-off274{,-vnc}/`, `msaa-no-stream274/`, `passmark-274{,-vnc}/`,
+and `verify-274/`. Full conformance is not claimed: the separate query probe's
+`S_FALSE` caller-buffer assertion remains to be investigated.
 
 ## Metadata consistency, 2026-09-12
 

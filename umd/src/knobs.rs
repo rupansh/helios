@@ -109,9 +109,10 @@ pub(crate) static SCANOUT_ACQUIRE: BoolKnob = BoolKnob::new(c"ScanoutAcquire", t
 /// this is command-stream ordering the GPU already provides). Substitution
 /// additionally requires the KMD to advertise
 /// `HELIOS_SCANOUT_CAP_SNAPSHOT_BIND` in the D4a probe reply
-/// (`scanout_acquire::scanout_snapshot_capable`); knob off or an incapable
-/// KMD leaves the present path bit-identical to a build without the
-/// mechanism, behind one cheap check.
+/// (`scanout_acquire::scanout_snapshot_capable`). The knob disables optional
+/// isolation only: MSAA and sRGB sources still require normalization before
+/// the single-sample, encoded-byte consumer may read them. An incapable KMD
+/// makes those presents fail explicitly rather than publishing raw memory.
 pub(crate) static SCANOUT_SNAPSHOT: BoolKnob = BoolKnob::new(c"ScanoutSnapshot", true);
 
 /// Ordinary-present batch-fold kill switch. Absent = ON; explicit 0 keeps the
@@ -126,6 +127,7 @@ pub(crate) static UMD_PRESENT_BATCH_FOLD: BoolKnob = BoolKnob::new(c"UmdPresentB
 /// preserves the old frame gate even when an early folded publication has a
 /// valid KMD correlation. This gates only the final skip decision: it never
 /// changes publication or the existing Flush that dispatches the frame batch.
+/// Required normalized WindowedBlt presents refuse without that correlation.
 pub(crate) static UMD_ASYNC_PRESENT_STREAM: BoolKnob =
     BoolKnob::new(c"UmdAsyncPresentStream", true);
 
@@ -292,10 +294,8 @@ pub(crate) fn scanout_acquire_knob() -> bool {
 
 /// D4b ordered-snapshot substitution kill switch:
 /// `HKLM\SOFTWARE\Helios!ScanoutSnapshot` (REG_DWORD). Read once per process.
-/// Absent = ON. `false` means the direct-flip present path never touches the
-/// snapshot ring — no ring create, no blit, no descriptor override — so the
-/// off path is bit-identical to a build without the mechanism. See
-/// [`SCANOUT_SNAPSHOT`].
+/// Absent = ON. `false` disables optional isolation; MSAA resolve and sRGB
+/// encoded-byte normalization still require a snapshot. See [`SCANOUT_SNAPSHOT`].
 pub(crate) fn scanout_snapshot_knob() -> bool {
     SCANOUT_SNAPSHOT.get()
 }
