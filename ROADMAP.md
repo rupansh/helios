@@ -12,7 +12,7 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
-## General FL12 testing candidate, 2026-09-12
+## Ready for general FL12 testing, 2026-09-12
 
 The owner prioritizes general native FL12_0/12_1 and optional DXR1.0 application
 testing over exhaustive conformance. Tools-visualization output and extreme RT
@@ -30,25 +30,67 @@ allocator changes. Mesa merge `259f8e4e` retains our Venus work and includes the
 Gallium buffer-map failure repair `b7033eee`; that Gallium-only change does not
 alter the deployed Venus ICD. No unrelated dependency was reset or moved.
 
-Release UMD12 `C7241DE6` is deployed through ProgramData on unchanged
+Release UMD12 `C7241DE6` is ready for general native FL12_0/FL12_1 and optional
+DXR1.0 application testing. It is deployed through ProgramData on unchanged
 WDDM2.1/.271/oem54, UMD11 `57C84ED4` and ICD `43394BBD`. Linux/Windows engine
 builds, Windows release UMD and A1 pass, including 211 KMD logic tests. The
 engine allocator test and all seven extracted threaded-map sanitizer cases pass.
 Native session1 caps, allocator, DXR, RT-disabled refusal/readback and all four
 ordering cases pass on the identified C7241DE6 UMD and system runtime. The
-benchmark and broader native regression receipts are pending; F6D00A83's owner
-visual acceptance remains scoped to that earlier build.
+allocator probe completes 832 resets; eight DXR behavior groups read back 20
+ray-result words. The restricted-RT fixture refuses a valid RT state object and
+reads back 4,096 correct words; it does not simulate another GPU's
+entire behavior. All four queue-ordering cases read back 65,536 correct words each.
+The broader native suite passes 23 inherited-feature groups / 529,085 checks and
+13 raster groups / 778,722 checks, with no failures, skips or todos. Positive
+raster cases grade the debug InfoQueue; the inherited suite's debug-layer setup
+does not establish that every InfoQueue message was graded.
+
+All four full stock benchmarks complete in interactive scheduled tasks, with
+matching rendering settings against the preceding completed 057934F9 controls,
+archived `.3dmark-result` and XML exports, per-workload loaded-module attribution,
+and changing rendered scenes captured through host VNC. No paintcap/focus-taking
+observer runs during them. Native D3D12 workloads load the system runtime and
+C7241DE6; Fire Strike uses UMD11, and Steel Nomad is explicitly the Vulkan control.
+No WARP or app-local D3D12/engine substitution is present in the recorded modules.
+
+| Benchmark | Completed workloads | Graphics score | Graphics FPS | VNC frames |
+|---|---:|---:|---|---:|
+| Port Royal | 2/2 | 12,134 | 56.18 | 73 |
+| Time Spy | 4/4 | 23,878 | 164.27 / 130.84 | 84 |
+| Fire Strike | 5/5 | 59,315 | 259.37 / 256.43 | 70 |
+| Steel Nomad Vulkan | 1/1 | 8,282 | 82.82 | 20 |
+
+Every workload returns status 0. Port Royal and Time Spy have no recorded
+pending-allocator-reset errors. These are single completed controls, not a
+focused performance comparison or evidence of a gain. In particular, the Vulkan
+score is below the preceding 9,409 result; this run does not establish a cause.
+Agent inspection confirms changing benchmark scenes, while the owner's visual
+acceptance remains scoped to the earlier F6D00A83 Port Royal build. The final
+inventory reports Code0, explicit UmdD3D12=1 and no running benchmark/probe.
+The guest is left idle with C7241DE6 installed for general application testing;
+report concrete application failures before reopening the deferred work.
 
 Evidence: `tmp/fl12-general-testing-20260912/`. `source-provenance.json` corrects
 the captured manifest template's stale descriptive fields while retaining its
 72 verified source digests and original manifest hash. The Windows build receipt
 checks 67 mirrored production files, seven static archives and DLL imports/exports.
+The compiled root is `e1882037bceb3d88cba1bef72d55038ee98133ec`, engine is
+`f17f79366b91dbab77c85707d612d4147c58b57b`, and Mesa source is
+`259f8e4e306c7c4a02686071f98a0636c4dbc16d`. UMD12 SHA256 is
+`C7241DE61AABE4F8AAF31F02941AC2BC8109BEEE14C86C4FC86B082242755044`.
+`readiness-summary.json`, `source-provenance.json`, `guest-final.json`,
+`feature-review.json` and the four `fl12-general-*-review.json` / settings receipts
+record exact artifacts, completed checks and retained limitations. Native
+runtime D3D12/Core is 10.0.26100.9278 with DDI _0110; native FL11_0..12_1 creation
+passes, FL12_2 is refused, maximum FL is 12_1, SM is 6.3 and RT tier is 1.0.
+The Windows build uses LLVM/libclang 22.1.8 and Vulkan SDK 1.4.350.0.
 This is a local integration and ProgramData update, not a new signed package,
 hosted-CI acceptance, host renderer change or VM-launcher restart. No work is pushed.
 
 ## Native allocator generations, 2026-09-11
 
-Current ProgramData UMD12 `F6D00A83…` gives a DDI command pool a separate
+Preceding ProgramData UMD12 `F6D00A83…` gives a DDI command pool a separate
 allocator generation when the engine still owns its previous execution storage.
 Completed generations are recycled through the existing fence-worker reference
 release; no GPU-idle wait or completion shortcut is added. Two allocator OOM

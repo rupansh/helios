@@ -9,7 +9,12 @@ Only bounded fallback improvements justified by actual failures are in scope;
 do not pursue a general sparse emulation project. These exceptions prevent a
 full conformance claim but do not independently block general testing. The
 F6D00A83 allocator build's completed Port Royal was visually accepted on
-2026-09-12. ROADMAP.md records subsequent master integration and validation.
+2026-09-12. The merged C7241DE6 build is now ready for general testing: native
+admission, GPU readback, conditional-RT refusal, allocator and ordering checks
+pass, along with 36 broader native feature groups and all four full benchmarks.
+Port Royal completes at 12,134; the earlier owner's visual acceptance is not
+automatically transferred to this build. See the current
+[readiness and provenance record](../../ROADMAP.md#ready-for-general-fl12-testing-2026-09-12).
 
 **Current optional-DXR contract, 2026-09-11:** release465CBE13 replaces unconditional
 RT admission with engine-derived adapter caps and per-device identity/capability
