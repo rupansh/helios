@@ -7,8 +7,11 @@ $ErrorActionPreference = 'Stop'
 $fixture = Join-Path ([IO.Path]::GetTempPath()) ('helios-hotplug-test-' + [guid]::NewGuid())
 $oldWindir = $env:windir
 $cases = 0
-New-Item -ItemType Directory -Path $fixture | Out-Null
-Copy-Item -LiteralPath (Join-Path $RepoRoot 'tools/hotplug-helios-umd.ps1') -Destination $fixture
+$fixtureTools = Join-Path $fixture 'tools'
+$fixturePackage = Join-Path $fixture 'packaging/windows'
+New-Item -ItemType Directory -Path $fixtureTools, $fixturePackage -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'tools/hotplug-helios-umd.ps1') -Destination $fixtureTools
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'packaging/windows/Helios-PackageCommon.ps1') -Destination $fixturePackage
 @'
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -85,7 +88,18 @@ function Invoke-HeliosPnpUtil {
 # A reintroduction of either old DriverStore command fails even on Windows.
 function takeown.exe { throw 'forbidden takeown command' }
 function icacls.exe { throw 'forbidden icacls command' }
-'@ | Set-Content -LiteralPath (Join-Path $fixture 'helios-deploy-common.ps1') -Encoding UTF8
+'@ | Set-Content -LiteralPath (Join-Path $fixtureTools 'helios-deploy-common.ps1') -Encoding UTF8
+
+# Only the PE header is needed by the real architecture validator. These
+# fixture files are never executable or passed to a real deployment command.
+function Write-PeFixture([string]$Path, [uint16]$Machine = 0x8664) {
+  $bytes = [byte[]]::new(128)
+  [BitConverter]::GetBytes([uint16]0x5A4D).CopyTo($bytes, 0)
+  [BitConverter]::GetBytes([uint32]64).CopyTo($bytes, 0x3C)
+  [BitConverter]::GetBytes([uint32]0x4550).CopyTo($bytes, 64)
+  [BitConverter]::GetBytes($Machine).CopyTo($bytes, 68)
+  [IO.File]::WriteAllBytes($Path, $bytes)
+}
 
 function Assert([bool]$Condition, [string]$Message) {
   if (-not $Condition) { throw $Message }
@@ -98,9 +112,12 @@ function Assert-Array($Actual, $Expected, [string]$Message) {
 }
 function New-Fixture {
   $root = Join-Path $fixture 'mock'
+  New-Item -ItemType Directory -Path $root -Force | Out-Null
   $store = Join-Path $root 'DriverStore'
   $source = Join-Path $root 'source11.dll'
   $source12 = Join-Path $root 'source12.dll'
+  Write-PeFixture $source
+  Write-PeFixture $source12
   $dll = Join-Path $store 'helios_umd.dll'
   $dll12 = Join-Path $store 'helios_umd12.dll'
   $wow = Join-Path $store 'helios_umd32.dll'
@@ -129,7 +146,7 @@ function New-Fixture {
 }
 function Invoke-Fixture($Parameters, [string]$ExpectedFailure = '') {
   $caught = ''
-  try { & (Join-Path $fixture 'hotplug-helios-umd.ps1') @Parameters | Out-Null }
+  try { & (Join-Path $fixtureTools 'hotplug-helios-umd.ps1') @Parameters | Out-Null }
   catch { $caught = $_.Exception.Message }
   if ($ExpectedFailure) {
     Assert ($caught -like "*$ExpectedFailure*") "Expected '$ExpectedFailure', got '$caught'"
@@ -138,6 +155,15 @@ function Invoke-Fixture($Parameters, [string]$ExpectedFailure = '') {
 }
 
 try {
+  foreach ($artifact in @('UmdDll', 'Umd12Dll')) {
+    $p = New-Fixture
+    $s = $global:HeliosHotplugTest
+    $p.Umd12Dll = $s.Source12
+    Write-PeFixture $p[$artifact] 0x14C
+    Invoke-Fixture $p 'Expected x64 PE image'
+    Assert ($s.Mutations.Count -eq 0) "x86 $artifact mutated native deployment"
+  }
+
   foreach ($with12 in @($false, $true)) {
     $p = New-Fixture
     $s = $global:HeliosHotplugTest

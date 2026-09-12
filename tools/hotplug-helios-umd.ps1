@@ -19,6 +19,7 @@ param(
 )
 
 . "$PSScriptRoot\helios-deploy-common.ps1"
+. "$PSScriptRoot\..\packaging\windows\Helios-PackageCommon.ps1"
 
 function Stop-UmdUsers([string]$DllPath) {
   $paths = @()
@@ -70,9 +71,11 @@ function Assert-UmdRegistrationEqual([string]$Name, [string[]]$Expected, [string
 
 Assert-HeliosAdmin
 if (-not (Test-Path -LiteralPath $UmdDll -PathType Leaf)) { throw "UMD DLL not found: $UmdDll" }
+Assert-HeliosPeArchitecture $UmdDll x64
 $deployUmd12 = -not [string]::IsNullOrWhiteSpace($Umd12Dll)
 if ($deployUmd12) {
   if (-not (Test-Path -LiteralPath $Umd12Dll -PathType Leaf)) { throw "D3D12 UMD DLL not found: $Umd12Dll" }
+  Assert-HeliosPeArchitecture $Umd12Dll x64
   if ($Mode -ne "ProgramData") {
     throw "-Umd12Dll is only supported in -Mode ProgramData; use the complete package installer to update packaged D3D12 binaries."
   }

@@ -88,7 +88,7 @@ for (crate_name, native_name, x86_name, _) in umds {
         // A fresh PowerShell child imports the matching VS environment. Inherit
         // neither x64 LIB paths for x86 linking nor x86 LIB paths for the KMD.
         let mut build = Command::new("pwsh");
-        build.args(["-NoProfile", "-File"])
+        build.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
             .arg(repo.join("ci/windows/Build-Umd.ps1"))
             .arg("-RepoRoot").arg(&repo)
             .arg("-Crate").arg(crate_name)

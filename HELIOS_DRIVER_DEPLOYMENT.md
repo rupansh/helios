@@ -69,8 +69,8 @@ $driverArtifacts = @{
 ```
 
 When the VM is intentionally booted without the Helios PCI device, use
-`-StageOnly` with the same artifacts to publish without binding. A guest reboot
-still requires the owner's authorization; the deploy helper does not reboot.
+`-StageOnly` with the same artifacts to publish without binding. The deploy helper
+does not reboot; test VM restarts have standing authorization in `AGENTS.md`.
 
 The script:
 
@@ -135,8 +135,8 @@ Cargo's `i686-pc-windows-msvc/<profile>/helios_umd{12}.dll` outputs; the install
 stages them as `helios_umd32.dll` and `helios_umd12_32.dll`. Omit both x86 fields
 only when installing an older native-only package. Artifact flags in `args`,
 including colon notation or abbreviations, are refused; use the named fields.
-All artifact paths are echoed. Set `restart_vm=false` unless the user authorized
-a guest reboot; `-PlanOnly` and `-PlanOnly:$true` always suppress that reboot.
+All artifact paths are echoed. Test VM restarts have standing authorization;
+set `restart_vm=false` to defer one. `-PlanOnly` and `-PlanOnly:$true` suppress it.
 The installer runs in a child PowerShell with execution policy bypass and an
 encoded script, so explicit switch booleans also bind on Windows PowerShell 5.1.
 
@@ -174,7 +174,7 @@ ProgramData mode never writes the DriverStore. Verified files and registry value
 do not prove which UMD a process loaded: Windows can retain a cached UMD path,
 even for new processes. If the override is not selected, activate a complete
 package through the normal installer, perform its required restart, and verify the
-actual loaded module paths. A guest reboot still requires the owner's authorization.
+actual loaded module paths. Test VM restarts have standing authorization in `AGENTS.md`.
 The helper leaves the Helios PCI adapter running by default; `-RestartDevice` is
 an explicit controlled adapter-restart test, not proof that the new DLL was selected.
 
