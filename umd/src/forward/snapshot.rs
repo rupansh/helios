@@ -22,7 +22,9 @@
 //! Venus resource ID, not a WDDM allocation reference, and its deferred host
 //! read can begin after Present returns. The cache is consequently bounded and
 //! non-evicting for the device lifetime; when full, an unknown geometry falls
-//! back to the ordinary present path.
+//! back to the ordinary present path only when no normalization is required.
+//! Multisampled resources require the KMD's 1x image contract; sRGB resources
+//! require an encoded-byte UNORM view. Inability to publish either fails Present.
 //!
 //! The control flow is deliberately value-threaded, never device-latched:
 //! `snapshot_for_present` returns a [`SnapshotPlan`] ONLY when the blit was
@@ -106,6 +108,32 @@ pub(crate) static SNAP_CACHE_REFUSALS: AtomicUsize = AtomicUsize::new(0);
 /// `finish_present` was absent or no longer matched the geometry the blit
 /// was recorded against. The stale-descriptor guard's loud half.
 pub(crate) static SNAP_PRIVATE_SKIPS: AtomicUsize = AtomicUsize::new(0);
+/// A source could not be normalized to the single-sample, encoded-byte
+/// presentation/import contract. No incompatible allocation may be published.
+pub(crate) static SNAP_REQUIRED_REFUSALS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether the raw allocation violates the presentation consumer's contract.
+///
+/// # Safety
+/// `src_h` is the live source handle of the current presentation DDI.
+pub(crate) unsafe fn requires_present_snapshot(src_h: ddi::D3D10DDI_HRESOURCE) -> bool {
+    // SAFETY: both helpers inspect the live resource specified by the caller.
+    unsafe {
+        resource_sample_count(src_h) > 1 || matches!(resource_dxgi_format(src_h).0, 29 | 91 | 93)
+    }
+}
+
+pub(crate) fn required_snapshot_refused(reason: &str) -> i32 {
+    let n = SNAP_REQUIRED_REFUSALS.fetch_add(1, Ordering::Relaxed);
+    if n < 16 || n % 512 == 0 {
+        log_error!(
+            "Present refused: required sample/color normalization unavailable: {} (count={})",
+            reason,
+            n + 1
+        );
+    }
+    E_FAIL
+}
 
 /// Select the format carried by a scan-out snapshot.
 ///
@@ -116,6 +144,12 @@ pub(crate) static SNAP_PRIVATE_SKIPS: AtomicUsize = AtomicUsize::new(0);
 fn snapshot_scanout_format(source_dxgi_format: u32) -> Option<u32> {
     match source_dxgi_format {
         24 => Some(28),
+        // Present preserves sRGB encoded bytes in the corresponding UNORM
+        // scanout format. The bridge resolves MSAA in the source format
+        // before doing a compatible bit copy; no sRGB-to-linear conversion.
+        29 => Some(28),
+        91 => Some(87),
+        93 => Some(88),
         28 | 87 | 88 => Some(source_dxgi_format),
         _ => None,
     }
@@ -123,12 +157,13 @@ fn snapshot_scanout_format(source_dxgi_format: u32) -> Option<u32> {
 
 fn counter_summary() -> String {
     format!(
-        "sub={} ring_fails={} copy_fails={} cache_refusals={} private_skips={}",
+        "sub={} ring_fails={} copy_fails={} cache_refusals={} private_skips={} required_refusals={}",
         SNAP_SUBSTITUTED.load(Ordering::Relaxed),
         SNAP_RING_CREATE_FAILS.load(Ordering::Relaxed),
         SNAP_COPY_FAILS.load(Ordering::Relaxed),
         SNAP_CACHE_REFUSALS.load(Ordering::Relaxed),
         SNAP_PRIVATE_SKIPS.load(Ordering::Relaxed),
+        SNAP_REQUIRED_REFUSALS.load(Ordering::Relaxed),
     )
 }
 
@@ -273,10 +308,12 @@ pub(crate) unsafe fn snapshot_for_present(
     dxgi_format: u32,
     purpose: SnapshotPurpose,
 ) -> Option<SnapshotPlan> {
-    // The single cheap gate (§6 row 1): knob off or a KMD without
-    // CAP_SNAPSHOT_BIND leaves the present path bit-identical to a build
-    // without the mechanism — no ring, no blit, no logs.
-    if !crate::scanout_snapshot_knob()
+    // The knob controls optional snapshot isolation. Sample/color normalization
+    // is a correctness requirement even with that optimization disabled. The
+    // caller fails Present if the required capability/copy is unavailable.
+    // SAFETY: src_h is the live source of this DDI call.
+    let required = unsafe { requires_present_snapshot(src_h) };
+    if (!crate::scanout_snapshot_knob() && !required)
         || !(match purpose {
             SnapshotPurpose::DirectFlip => crate::scanout_acquire::scanout_snapshot_capable(),
             SnapshotPurpose::WindowedBlt => crate::scanout_acquire::windowed_blt_snapshot_capable(),
@@ -467,9 +504,9 @@ pub(crate) unsafe fn snapshot_for_present(
             Some(plan)
         }
         1 => {
-            // The bridge copied a min region: the ring matches the PRIVATE
-            // geometry but the resource's own extent disagreed. The slot is
-            // partially stale, so it must not be bound. The ring is KEPT —
+            // The ring matches the PRIVATE geometry but the resource's
+            // own extent disagreed. The bridge refused the copy before
+            // recording work, so the slot must not be bound. The ring is KEPT —
             // its key still matches the private, so tearing it down would
             // rebuild an identical ring every present (a create storm); if
             // this state persists the counter and line below stay loud.
@@ -514,7 +551,7 @@ pub(crate) unsafe fn snapshot_for_present(
 pub(crate) fn apply_snapshot_override(
     present_private: &mut Option<HeliosPresentPrivateData>,
     plan: &SnapshotPlan,
-) {
+) -> bool {
     if plan.purpose == SnapshotPurpose::WindowedBlt {
         // Windowed DXGI Present has no direct primary private record. Build a
         // fresh typed *source* descriptor, which is deliberately not marked
@@ -537,7 +574,7 @@ pub(crate) fn apply_snapshot_override(
             snapshot_memory_type_index: plan.memory_type_index,
             snapshot_purpose: HELIOS_PRESENT_SNAPSHOT_PURPOSE_WINDOWED_BLT,
         });
-        return;
+        return true;
     }
     let Some(private) = present_private.as_mut() else {
         let n = SNAP_PRIVATE_SKIPS.fetch_add(1, Ordering::Relaxed);
@@ -548,7 +585,7 @@ pub(crate) fn apply_snapshot_override(
                 counter_summary()
             );
         }
-        return;
+        return false;
     };
     if private.width != plan.width
         || private.height != plan.height
@@ -568,7 +605,7 @@ pub(crate) fn apply_snapshot_override(
                 counter_summary()
             );
         }
-        return;
+        return false;
     }
     private.resource_id = plan.resid;
     private.width = plan.width;
@@ -580,6 +617,7 @@ pub(crate) fn apply_snapshot_override(
     private.reserved |= HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT;
     private.snapshot_memory_type_index = plan.memory_type_index;
     private.snapshot_purpose = HELIOS_PRESENT_SNAPSHOT_PURPOSE_NONE;
+    true
 }
 
 #[cfg(test)]
@@ -596,6 +634,13 @@ mod tests {
         assert_eq!(snapshot_scanout_format(28), Some(28));
         assert_eq!(snapshot_scanout_format(87), Some(87));
         assert_eq!(snapshot_scanout_format(88), Some(88));
+    }
+
+    #[test]
+    fn srgb_snapshots_use_matching_encoded_unorm_bytes() {
+        assert_eq!(snapshot_scanout_format(29), Some(28));
+        assert_eq!(snapshot_scanout_format(91), Some(87));
+        assert_eq!(snapshot_scanout_format(93), Some(88));
     }
 
     #[test]

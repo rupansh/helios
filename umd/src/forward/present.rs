@@ -1183,14 +1183,21 @@ pub(crate) unsafe fn finish_present(
 
     let mut cb = ddi::DXGIDDICB_PRESENT::default();
     let mut present_private = presented_primary_private(h, src_h);
+    // SAFETY: src_h is the runtime's live source for this Present.
+    let snapshot_required = unsafe { requires_present_snapshot(src_h) };
     // D4b: substitute the snapshot descriptor into the OWNED LOCAL above —
     // before BOTH consumers (`pPrivateDriverData` below and the
     // `HeliosPresentRenderCmd` inside `submit_runtime_present_then_call`).
     // The override re-validates the private's geometry against the plan and
     // refuses loudly on any divergence; `ResourceState::present_private` and
     // `direct_scanout_allocations` (rotation-coupled) are never touched.
-    if let Some(ref plan) = snapshot {
-        apply_snapshot_override(&mut present_private, plan);
+    let snapshot_applied = if let Some(ref plan) = snapshot {
+        apply_snapshot_override(&mut present_private, plan)
+    } else {
+        false
+    };
+    if snapshot_required && !snapshot_applied {
+        return Err(required_snapshot_refused("no validated single-sample descriptor"));
     }
     // `ready` carries the same two values both entry points used to spell out
     // by hand -- `src_alloc` proved non-zero, and the context handle proved
@@ -1292,6 +1299,11 @@ unsafe fn dxgi_present_impl(
     let dst_h = dxgi_resource_handle(a.hDstResource);
     let src_alloc = resource_allocation(src_h);
     let dst_alloc = resource_allocation(dst_h);
+    // SAFETY: src_h is the runtime's live source for this Present.
+    let snapshot_required = unsafe { requires_present_snapshot(src_h) };
+    if snapshot_required && a.SrcSubResourceIndex != 0 {
+        return required_snapshot_refused("resolve supports only the base presentation subresource");
+    }
     probe_present_entry(boundary, a, src_alloc, dst_alloc);
     let mut copied = false;
     // D4b snapshot plan: `Some` iff the direct-flip arm below RECORDED the
@@ -1371,7 +1383,10 @@ unsafe fn dxgi_present_impl(
             // resource would hand the snapshot arm a stale geometry/identity.
             let direct_private = presented_primary_private(h, src_h);
             let published_to_scanout = direct_private.is_some();
-            let copy_pair = if published_to_scanout {
+            // Sources needing sample/color normalization use the canonical
+            // snapshot consumed by the KMD BLT. In particular, MSAA cannot
+            // use CopySubresourceRegion into a 1x destination.
+            let copy_pair = if published_to_scanout || snapshot_required {
                 None
             } else {
                 match (load_resource(dst_h), load_resource(src_h)) {
@@ -1388,7 +1403,8 @@ unsafe fn dxgi_present_impl(
             // inside frame N's command list — the same list the frame gate's
             // `HeliosWaitFrameSubmitted` later covers, which is what keeps
             // the KMD's completion watermark valid for the substituted resid.
-            // Every refusal inside returns None (present exactly as today).
+            // Optional snapshots may fall back. A required normalization
+            // refusal fails below before any source descriptor is published.
             if let Some(ref private) = direct_private {
                 snapshot = snapshot_for_present(
                     h,
@@ -1539,6 +1555,9 @@ unsafe fn dxgi_present_impl(
         && !async_stream_eligible
     {
         snapshot = None;
+    }
+    if snapshot_required && snapshot.is_none() {
+        return required_snapshot_refused("snapshot creation or producer stream unavailable");
     }
     if async_stream_eligible {
         // Timed-path evidence is trace-gated: no logging or atomic RMW when

@@ -1643,26 +1643,8 @@ std::int32_t HeliosDxvkDevice::present_snapshot_copy(
 
       const VkExtent3D dstExtent = dstImage->info().extent;
       const VkExtent3D srcExtent = srcImage->info().extent;
-      const VkExtent3D extent = {
-        std::min(dstExtent.width,  srcExtent.width),
-        std::min(dstExtent.height, srcExtent.height),
-        1u,
-      };
-
-      if (!static_cast<dxvk::D3D11ImmediateContext*>(impl->context)
-            ->HeliosCopyPresentSnapshot(
-              dstImage, srcImage, extent, windowed_blt_reservation)) {
-        // A WindowedBlt reader lease is reserved by KMD Present. Without the
-        // pre-arm reservation the producer list could wait on that same lease,
-        // so this is a hard snapshot refusal, never a best-effort copy.
-        umd_log("present_snapshot_copy: WindowedBlt reuse reservation unavailable");
-        return -1;
-      }
-
-      // A mismatch means the ring was built against stale geometry. The min
-      // region has been copied, but the caller must NOT substitute this
-      // present — the slot's remaining pixels are whatever a previous frame
-      // left there — so this is loud on every early occurrence.
+      // Reject stale geometry before recording work: a partial snapshot
+      // would retain pixels from a previous frame outside the copied region.
       const bool mismatch = dstExtent.width != srcExtent.width
                          || dstExtent.height != srcExtent.height;
       if (mismatch) {
@@ -1677,6 +1659,18 @@ std::int32_t HeliosDxvkDevice::present_snapshot_copy(
         }
         return 1;
       }
+      const VkExtent3D extent = srcExtent;
+
+      if (!static_cast<dxvk::D3D11ImmediateContext*>(impl->context)
+            ->HeliosCopyPresentSnapshot(
+              dstImage, srcImage, extent, windowed_blt_reservation)) {
+        // A WindowedBlt reader lease is reserved by KMD Present. Without the
+        // pre-arm reservation the producer list could wait on that same lease,
+        // so this is a hard snapshot refusal, never a best-effort copy.
+        umd_log("present_snapshot_copy: incompatible image geometry or WindowedBlt reuse reservation unavailable");
+        return -1;
+      }
+
       return 0;
   });
 }

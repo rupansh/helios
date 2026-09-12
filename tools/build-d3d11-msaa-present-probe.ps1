@@ -1,0 +1,30 @@
+param(
+    [Parameter(Mandatory)][string]$RepoRoot,
+    [Parameter(Mandatory)][string]$OutputRoot,
+    [ValidateSet("x86", "x64", "all")][string]$Architecture = "all"
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+. (Join-Path $RepoRoot "ci\windows\Initialize-HeliosBuild.ps1")
+. (Join-Path $RepoRoot "packaging\windows\Helios-PackageCommon.ps1")
+$source = Join-Path $RepoRoot "tools\d3d11_msaa_present_probe.cpp"
+if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing probe input: $source" }
+New-Item -ItemType Directory -Force -Path $OutputRoot | Out-Null
+$OutputRoot = (Resolve-Path -LiteralPath $OutputRoot).Path
+$architectures = if ($Architecture -eq "all") { @("x86", "x64") } else { @($Architecture) }
+foreach ($targetArchitecture in $architectures) {
+    Import-VisualStudioEnvironment -Architecture $targetArchitecture
+    $directory = Join-Path $OutputRoot $targetArchitecture
+    New-Item -ItemType Directory -Force -Path $directory | Out-Null
+    $executable = Join-Path $directory "d3d11-msaa-present.exe"
+    & cl.exe /nologo /EHsc /std:c++17 /O2 /W4 /WX /MT /DUNICODE /D_UNICODE `
+        $source "/Fo:$(Join-Path $directory 'd3d11-msaa-present.obj')" "/Fe:$executable" `
+        /link user32.lib
+    if ($LASTEXITCODE -ne 0) { throw "D3D11 MSAA presentation probe $targetArchitecture compilation failed." }
+    Assert-HeliosPeArchitecture $executable $targetArchitecture
+    # This mode is CPU-only and is safe on build machines with no Helios GPU.
+    & $executable --self-test
+    if ($LASTEXITCODE -ne 0) { throw "MSAA presentation probe $targetArchitecture CPU self-test failed." }
+    Write-Host "Built Windows-runtime presentation probe: $executable"
+}
