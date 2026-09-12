@@ -44,9 +44,47 @@ Linux-only). Both D3D12 target checks and strict Clippy passed. Generated layout
 assertions stay enabled. Raw evidence: `tmp/wow64-20260912/`; initial failure:
 `tmp/passmark-20260912/`.
 
-**Acceptance pending:** clean package build/signing, guest installation, matching
-GPU clear/readback probes, visible x86 rendering and the actual PassMark workload.
-These builds and CPU-side checks are not GPU rendering acceptance.
+**GPU acceptance on .272:** after the approved reboot and console login, both
+architectures passed D3D11 rendering, D3D12 device creation, a 65,536-pixel exact
+clear/readback, four cross-queue/CPU/cross-process ordering cases, and a real
+shader draw with clean COM teardown. Strict D3D12 presentation runs checked every
+RGBA pixel over 1,201–1,202 frames per architecture, including all three back
+buffers and final zero device references. Host VNC captured advancing, correct
+frames from both runs; a separate x86 D3D11 triangle was visibly rendered.
+Installed-package smoke verification also passed native/x86 Vulkan and OpenGL,
+native OpenCL and GL sharing. OpenCL x86 is still outside this implementation.
+
+**PassMark exposed a second bug after device creation:** its DDI pipeline
+statistics query (kind 8, 88 bytes) was cast directly to the API enum (kind 8,
+16-byte stream-output statistics). `GetData` failed, the runtime removed the
+device, and PassMark ignored a later failed `CreateBuffer` before mapping NULL.
+The .273 source explicitly translates query kinds and legacy 64-byte statistics,
+keeps pending/error output untouched, and honors `DONOTFLUSH`. A native query
+regression probe reproduces removal on .272 in both architectures; acceptance
+on the corrected loaded DLLs and a completed PassMark score remain pending.
+Seven pure query tests, both Windows UMD checks, and independent reviews pass.
+
+A separate DXVK worker-failure path could strand DWM's device destruction in a
+condition-variable wait after the command-stream worker exited. Failure now
+wakes waiters, rejects new work and propagates through present gates; 96 actual
+worker-failure cases per architecture and present/query guard fixtures pass.
+The original worker exception trigger remains unconfirmed. Guest GDI screen
+capture also coincided with strict D3D12 fence stalls, whereas runs without that
+capture and runs captured externally via VNC passed; recheck this interaction
+after activating .273 before assigning its cause.
+
+All four .273 UMDs and the KMD built, linked, passed PE/export/CRT checks, and
+were signed before catalog generation. Catalog membership and all 44 package
+manifest entries passed. A registration-only ProgramData trial did **not** load
+the new DLLs: fresh processes still logged the cached .272 DriverStore paths.
+Use normal package activation and verify the loaded module, not just registry
+contents. During rollback, a preexisting `New-Item -Force` helper was found to
+replace the whole class key rather than preserve neighboring values. Repair and
+real Windows registry regression coverage are in progress; the same unsafe
+pattern in Khronos registration must preserve other vendors too. The same-INF
+PnP repair restored the INF entries but the adapter reported Code 31; standard
+metadata recovery and final package activation remain pending. Do not treat
+these source/build checks as a successful PassMark run.
 
 ## Metadata consistency, 2026-09-12
 
