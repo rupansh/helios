@@ -14,6 +14,32 @@ function Get-HeliosSha256([Parameter(Mandatory)][string]$Path) {
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToUpperInvariant()
 }
 
+function Assert-HeliosPeArchitecture(
+    [Parameter(Mandatory)][string]$Path,
+    [Parameter(Mandatory)][ValidateSet("x64", "x86")][string]$Architecture
+) {
+    $stream = [IO.File]::OpenRead($Path)
+    $reader = [IO.BinaryReader]::new($stream)
+    try {
+        if ($stream.Length -lt 64 -or $reader.ReadUInt16() -ne 0x5A4D) {
+            throw "Not a DOS/PE image: $Path"
+        }
+        $stream.Position = 0x3C
+        $peOffset = $reader.ReadUInt32()
+        if ($peOffset -gt $stream.Length - 26) { throw "Invalid PE header offset: $Path" }
+        $stream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne 0x00004550) { throw "Invalid PE signature: $Path" }
+        $machine = $reader.ReadUInt16()
+        $expected = if ($Architecture -eq "x86") { 0x14C } else { 0x8664 }
+        if ($machine -ne $expected) {
+            throw ("Expected {0} PE image, found machine 0x{1:X4}: {2}" -f $Architecture, $machine, $Path)
+        }
+    } finally {
+        $reader.Dispose()
+        $stream.Dispose()
+    }
+}
+
 function Read-HeliosManifest([Parameter(Mandatory)][string]$BundleRoot) {
     $manifestPath = Join-Path $BundleRoot "manifest.json"
     if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
@@ -137,6 +163,67 @@ function Restore-HeliosRegistrySnapshot([Parameter(Mandatory)][string]$Path, [Pa
         New-ItemProperty -LiteralPath $Path -Name $Name -Value $Snapshot.value -PropertyType ([string]$Snapshot.kind) -Force | Out-Null
     } elseif (Test-Path -LiteralPath $Path) {
         Remove-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction SilentlyContinue
+    }
+}
+
+function Restore-HeliosDirect3DAfterRemoval(
+    [Parameter(Mandatory)]$State,
+    [string]$CurrentInf,
+    [string]$CurrentClassKey,
+    [string]$CurrentInfSha256
+) {
+    # Older bundles had no WoW64 UMDs and saved neither snapshot.
+    if (-not $State.PSObject.Properties["installedDirect3D"]) { return }
+    $restoredKey = ""
+    if ($CurrentInf -and $CurrentClassKey -and $State.PSObject.Properties["previousDirect3D"] -and
+        $State.previousDirect3D.activeInf -and $CurrentInf -ieq $State.previousDirect3D.activeInf -and
+        $CurrentInf -ine $State.activeInf -and
+        $State.previousDirect3D.infSha256 -and $CurrentInfSha256 -ieq $State.previousDirect3D.infSha256) {
+        foreach ($name in @("UserModeDriverName", "UserModeDriverNameWoW", "InstalledDisplayDrivers")) {
+            Restore-HeliosRegistrySnapshot $CurrentClassKey $name $State.previousDirect3D.values.$name
+        }
+        $restoredKey = $CurrentClassKey
+    }
+    $wowSnapshot = $State.installedDirect3D.PSObject.Properties["UserModeDriverNameWoW"]
+    if (-not $wowSnapshot -or -not $wowSnapshot.Value.exists) { return }
+    $ownedPaths = @($wowSnapshot.Value.value)
+    $ownedNames = @($ownedPaths | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension([string]$_) } | Select-Object -Unique)
+    $keys = @(@([string]$State.classKey, $CurrentClassKey) | Where-Object { $_ } | Select-Object -Unique)
+    foreach ($keyPath in $keys) {
+        if ($keyPath -ieq $restoredKey -or -not (Test-Path -LiteralPath $keyPath)) { continue }
+        $wow = Get-HeliosRegistrySnapshot $keyPath "UserModeDriverNameWoW"
+        if ($wow.exists) {
+            $paths = @($wow.value)
+            $owned = @($paths | Where-Object { $_ -in $ownedPaths })
+            if ($owned.Count -gt 0 -and $owned.Count -eq $paths.Count) {
+                Remove-ItemProperty -LiteralPath $keyPath -Name "UserModeDriverNameWoW" -ErrorAction Stop
+            } elseif ($owned.Count -gt 0) {
+                # A REG_MULTI_SZ is indexed by API; filtering individual slots
+                # would change their meaning. Preserve a mixed/manual override.
+                Write-Warning "Keeping mixed WoW64 registration on ${keyPath}; only some slots reference the removed package."
+            }
+        }
+        # Do not delete the inventory entry of a newly selected driver that
+        # uses the same filename in a different DriverStore directory.
+        $registeredNames = @(
+            foreach ($name in @("UserModeDriverName", "UserModeDriverNameWoW")) {
+                $snapshot = Get-HeliosRegistrySnapshot $keyPath $name
+                if ($snapshot.exists) {
+                    @($snapshot.value) | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension([string]$_) }
+                }
+            }
+        )
+        $inventory = Get-HeliosRegistrySnapshot $keyPath "InstalledDisplayDrivers"
+        if ($inventory.exists) {
+            $remaining = @($inventory.value | Where-Object { $_ -notin $ownedNames -or $_ -in $registeredNames })
+            if ($remaining.Count -ne @($inventory.value).Count) {
+                if ($remaining.Count -eq 0) {
+                    Remove-ItemProperty -LiteralPath $keyPath -Name "InstalledDisplayDrivers" -ErrorAction Stop
+                } else {
+                    New-ItemProperty -LiteralPath $keyPath -Name "InstalledDisplayDrivers" -Value $remaining -PropertyType MultiString -Force | Out-Null
+                }
+            }
+        }
     }
 }
 

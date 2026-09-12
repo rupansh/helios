@@ -44,31 +44,33 @@ References:
 
 ## KMD Install
 
-Build first with the Windows build helper:
+Build the package on a local Windows disk. `ci/windows/Build-Driver.ps1`
+builds both engines and both UMDs for x64 and x86, then packages the native KMD.
+For a direct `cargo make` build, set `HELIOS_DXVK_BUILD_X86` and
+`HELIOS_VKD3D_BUILD_X86` to matching clang-cl x86 engine builds first.
+
+Name the exact artifacts when invoking the deploy helper. The four UMDs are
+required for an INF that registers `UserModeDriverNameWoW`; older native-only
+packages accept just `UmdDll` and `Umd12Dll`.
 
 ```powershell
-# From Codex MCP:
-# win_cargo crate_dir:"kmd_render" args:["make","--makefile","Cargo.make.toml"]
+$package = 'C:\path\to\built-driver-package'
+$driverArtifacts = @{
+    PackageDir = $package
+    UmdDll = Join-Path $package 'helios_umd.dll'
+    Umd12Dll = Join-Path $package 'helios_umd12.dll'
+    Umd32Dll = Join-Path $package 'helios_umd32.dll'
+    Umd12_32Dll = Join-Path $package 'helios_umd12_32.dll'
+}
+# Read-only discovery and validation:
+& Z:\tools\install-helios-kmd.ps1 @driverArtifacts -PlanOnly
+# Publish and bind the package:
+& Z:\tools\install-helios-kmd.ps1 @driverArtifacts
 ```
 
-Dry-run discovery:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File Z:\tools\install-helios-kmd.ps1 -PlanOnly
-```
-
-When the VM is intentionally booted without the Helios `virtio-gpu-gl-pci` device, the PCI devnode
-does not exist and `devcon update` cannot bind anything. Stage the signed package only:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File Z:\tools\install-helios-kmd.ps1 -StageOnly
-```
-
-Install the KMD only:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File Z:\tools\install-helios-kmd.ps1
-```
+When the VM is intentionally booted without the Helios PCI device, use
+`-StageOnly` with the same artifacts to publish without binding. A guest reboot
+still requires the owner's authorization; the deploy helper does not reboot.
 
 The script:
 
@@ -76,9 +78,10 @@ The script:
 - Uses `HKLM\SYSTEM\CurrentControlSet\Services\helios_kmd_render\ImagePath` as the first
   DriverStore source of truth. This handles in-place active package replacement where
   `C:\Windows\INF\oemNN.inf` metadata can lag the actual loaded DriverStore directory.
-- Regenerates `helios_kmd_render.cat` with `Inf2Cat.exe` before signing. `Inf2Cat.exe` may only
+- Signs SYS and all four UMDs before regenerating `helios_kmd_render.cat` with
+  `Inf2Cat.exe`, then signs the catalog over those final bytes. `Inf2Cat.exe` may only
   exist under the WDK `x86` bin directory; the script searches both `x64` and `x86`.
-- Signs both `helios_kmd_render.sys` and `helios_kmd_render.cat` with a machine-store
+- Uses a machine-store
   development certificate derived from `metadata/helios.env` (currently
   `CN=WinBoat Helios vGPU Development Test Signing`) if needed.
 - Imports that cert into `LocalMachine\Root` and `LocalMachine\TrustedPublisher`. This is required
@@ -86,8 +89,8 @@ The script:
 - Stops/disables the Looking Glass host service so it cannot fight IDD mode.
 - Clears stale Helios pending rename operations.
 - Backs up active DriverStore files under `C:\ProgramData\HeliosDeployBackups\<timestamp>`.
-- Full KMD package installs always include `helios_umd.dll`, because the INF `CopyFiles` and catalog
-  include it. A package missing the UMD fails `pnputil /add-driver` with "file not found".
+- Full installs include both architectures of both UMDs, because the INF and catalog
+  name all four. Architecture checks reject a renamed x64 DLL in an x86 slot.
 - Full KMD package installs publish with `devcon update <inf> <hardware-id>` when the WDK DevCon
   tool is present. `pnputil /add-driver ... /install` is only the fallback or explicit
   `-UsePnPUtil` path.

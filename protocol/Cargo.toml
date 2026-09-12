@@ -13,8 +13,10 @@ crate-type = ["lib"]
 # bytemuck is no_std by default; `derive` works without std.
 bytemuck = { version = "1", features = ["derive"] }
 
-[dev-dependencies]
+[target.'cfg(target_os = "linux")'.dev-dependencies]
 # Authoritative virtio-gpu constants (generated from the Linux uapi headers).
+# These bindings encode the Linux C ABI and cannot compile for Windows; keep
+# their comparison tests on Linux. Helios wire assertions/tests run on both.
 # Dev-dep only: the crate is std (bindgen `::std::os::raw`), so it cannot go in
 # the no_std build — instead the `virtio_gpu::tests` module pins our hand-defined
 # wire constants to it, so `cargo test` fails if they ever drift.

@@ -9,16 +9,16 @@ use super::*;
 
 // --- CalcPrivate*Size (all store one COM pointer) ---------------------------
 
-pub(crate) unsafe extern "C" fn calc_size_resource(
+pub(crate) unsafe extern "system" fn calc_size_resource(
     _h: Hdevice,
     _a: *const ddi::D3D11DDIARG_CREATERESOURCE,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
-pub(crate) unsafe extern "C" fn calc_size_rtv(
+pub(crate) unsafe extern "system" fn calc_size_rtv(
     _h: Hdevice,
     _a: *const ddi::D3D10DDIARG_CREATERENDERTARGETVIEW,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
@@ -657,7 +657,7 @@ pub(crate) unsafe fn finish_wddm_tex2d(
     }
 }
 
-pub(crate) unsafe extern "C" fn create_resource(
+pub(crate) unsafe extern "system" fn create_resource(
     h: Hdevice,
     arg: *const ddi::D3D11DDIARG_CREATERESOURCE,
     h_resource: ddi::D3D10DDI_HRESOURCE,
@@ -1293,11 +1293,11 @@ pub(crate) unsafe extern "C" fn create_resource(
     }
 }
 
-pub(crate) unsafe extern "C" fn destroy_resource(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE) {
+pub(crate) unsafe extern "system" fn destroy_resource(h: Hdevice, h_resource: ddi::D3D10DDI_HRESOURCE) {
     release_resource(h, h_resource);
 }
 
-pub(crate) unsafe extern "C" fn open_resource(
+pub(crate) unsafe extern "system" fn open_resource(
     h: Hdevice,
     arg: *const ddi::D3D10DDIARG_OPENRESOURCE,
     h_resource: ddi::D3D10DDI_HRESOURCE,
@@ -1569,14 +1569,14 @@ pub(crate) unsafe extern "C" fn open_resource(
     );
 }
 
-pub(crate) unsafe extern "C" fn calc_size_opened_resource(
+pub(crate) unsafe extern "system" fn calc_size_opened_resource(
     _h: Hdevice,
     _arg: *const ddi::D3D10DDIARG_OPENRESOURCE,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
-pub(crate) unsafe extern "C" fn resolve_shared_resource(
+pub(crate) unsafe extern "system" fn resolve_shared_resource(
     h: ddi::HANDLE,
     arg: *const ddi::D3DDDIARG_RESOLVESHAREDRESOURCE,
 ) -> i32 {
@@ -1606,7 +1606,7 @@ pub(crate) unsafe extern "C" fn resolve_shared_resource(
     0
 }
 
-pub(crate) unsafe extern "C" fn dxgi_resolve_shared_resource(
+pub(crate) unsafe extern "system" fn dxgi_resolve_shared_resource(
     arg: *mut ddi::DXGI_DDI_ARG_RESOLVESHAREDRESOURCE,
 ) -> i32 {
     let (h_device, h_resource): (usize, usize) = if arg.is_null() {

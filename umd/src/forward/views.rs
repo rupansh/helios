@@ -7,7 +7,7 @@ use super::*;
 
 // --- Render target views ----------------------------------------------------
 
-pub(crate) unsafe extern "C" fn create_rtv(
+pub(crate) unsafe extern "system" fn create_rtv(
     h: Hdevice,
     arg: *const ddi::D3D10DDIARG_CREATERENDERTARGETVIEW,
     h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW,
@@ -197,20 +197,20 @@ pub(crate) unsafe fn rtv_desc(
     }
 }
 
-pub(crate) unsafe extern "C" fn destroy_rtv(_h: Hdevice, h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW) {
+pub(crate) unsafe extern "system" fn destroy_rtv(_h: Hdevice, h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW) {
     release_rtv(h_rtv);
 }
 
 // --- Depth-stencil views ----------------------------------------------------
 
-pub(crate) unsafe extern "C" fn calc_size_dsv(
+pub(crate) unsafe extern "system" fn calc_size_dsv(
     _h: Hdevice,
     _a: *const ddi::D3D11DDIARG_CREATEDEPTHSTENCILVIEW,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
-pub(crate) unsafe extern "C" fn create_dsv(
+pub(crate) unsafe extern "system" fn create_dsv(
     h: Hdevice,
     arg: *const ddi::D3D11DDIARG_CREATEDEPTHSTENCILVIEW,
     h_dsv: ddi::D3D10DDI_HDEPTHSTENCILVIEW,
@@ -363,11 +363,11 @@ pub(crate) unsafe fn dsv_desc(
     }
 }
 
-pub(crate) unsafe extern "C" fn destroy_dsv(_h: Hdevice, h_dsv: ddi::D3D10DDI_HDEPTHSTENCILVIEW) {
+pub(crate) unsafe extern "system" fn destroy_dsv(_h: Hdevice, h_dsv: ddi::D3D10DDI_HDEPTHSTENCILVIEW) {
     release_com(h_dsv);
 }
 
-pub(crate) unsafe extern "C" fn clear_rtv(
+pub(crate) unsafe extern "system" fn clear_rtv(
     h: Hdevice,
     h_rtv: ddi::D3D10DDI_HRENDERTARGETVIEW,
     color: *mut f32,
@@ -405,7 +405,7 @@ pub(crate) unsafe extern "C" fn clear_rtv(
     context.ClearRenderTargetView(&*rtv, &rgba);
 }
 
-pub(crate) unsafe extern "C" fn clear_dsv(
+pub(crate) unsafe extern "system" fn clear_dsv(
     h: Hdevice,
     h_dsv: ddi::D3D10DDI_HDEPTHSTENCILVIEW,
     flags: u32,
@@ -423,14 +423,14 @@ pub(crate) unsafe extern "C" fn clear_dsv(
 
 // --- Shader resource views, samplers, constant buffers ----------------------
 
-pub(crate) unsafe extern "C" fn calc_size_srv(
+pub(crate) unsafe extern "system" fn calc_size_srv(
     _h: Hdevice,
     _a: *const ddi::D3D11DDIARG_CREATESHADERRESOURCEVIEW,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
-pub(crate) unsafe extern "C" fn create_srv(
+pub(crate) unsafe extern "system" fn create_srv(
     h: Hdevice,
     arg: *const ddi::D3D11DDIARG_CREATESHADERRESOURCEVIEW,
     h_srv: ddi::D3D10DDI_HSHADERRESOURCEVIEW,
@@ -649,11 +649,11 @@ pub(crate) unsafe fn srv_desc(
     }
 }
 
-pub(crate) unsafe extern "C" fn destroy_srv(_h: Hdevice, h_srv: ddi::D3D10DDI_HSHADERRESOURCEVIEW) {
+pub(crate) unsafe extern "system" fn destroy_srv(_h: Hdevice, h_srv: ddi::D3D10DDI_HSHADERRESOURCEVIEW) {
     release_com(h_srv);
 }
 
-pub(crate) unsafe extern "C" fn gen_mips(h: Hdevice, h_srv: ddi::D3D10DDI_HSHADERRESOURCEVIEW) {
+pub(crate) unsafe extern "system" fn gen_mips(h: Hdevice, h_srv: ddi::D3D10DDI_HSHADERRESOURCEVIEW) {
     let Some(context) = d3d11_context(h) else {
         return;
     };
@@ -663,14 +663,14 @@ pub(crate) unsafe extern "C" fn gen_mips(h: Hdevice, h_srv: ddi::D3D10DDI_HSHADE
     context.GenerateMips(&*srv);
 }
 
-pub(crate) unsafe extern "C" fn calc_size_uav(
+pub(crate) unsafe extern "system" fn calc_size_uav(
     _h: Hdevice,
     _a: *const ddi::D3D11DDIARG_CREATEUNORDEREDACCESSVIEW,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
-pub(crate) unsafe extern "C" fn create_uav(
+pub(crate) unsafe extern "system" fn create_uav(
     h: Hdevice,
     arg: *const ddi::D3D11DDIARG_CREATEUNORDEREDACCESSVIEW,
     h_uav: ddi::D3D11DDI_HUNORDEREDACCESSVIEW,
@@ -845,14 +845,14 @@ pub(crate) unsafe fn uav_desc(
     }
 }
 
-pub(crate) unsafe extern "C" fn destroy_uav(
+pub(crate) unsafe extern "system" fn destroy_uav(
     _h: Hdevice,
     h_uav: ddi::D3D11DDI_HUNORDEREDACCESSVIEW,
 ) {
     release_com(h_uav);
 }
 
-pub(crate) unsafe extern "C" fn clear_uav_uint(
+pub(crate) unsafe extern "system" fn clear_uav_uint(
     h: Hdevice,
     h_uav: ddi::D3D11DDI_HUNORDEREDACCESSVIEW,
     values: *const u32,
@@ -871,7 +871,7 @@ pub(crate) unsafe extern "C" fn clear_uav_uint(
     context.ClearUnorderedAccessViewUint(&*uav, &v);
 }
 
-pub(crate) unsafe extern "C" fn clear_uav_float(
+pub(crate) unsafe extern "system" fn clear_uav_float(
     h: Hdevice,
     h_uav: ddi::D3D11DDI_HUNORDEREDACCESSVIEW,
     values: *const f32,
@@ -890,7 +890,7 @@ pub(crate) unsafe extern "C" fn clear_uav_float(
     context.ClearUnorderedAccessViewFloat(&*uav, &v);
 }
 
-pub(crate) unsafe extern "C" fn cs_set_uavs(
+pub(crate) unsafe extern "system" fn cs_set_uavs(
     h: Hdevice,
     start: u32,
     num: u32,
@@ -939,7 +939,7 @@ pub(crate) unsafe extern "C" fn cs_set_uavs(
     );
 }
 
-pub(crate) unsafe extern "C" fn copy_structure_count(
+pub(crate) unsafe extern "system" fn copy_structure_count(
     h: Hdevice,
     h_dst: ddi::D3D10DDI_HRESOURCE,
     dst_offset: u32,
@@ -957,14 +957,14 @@ pub(crate) unsafe extern "C" fn copy_structure_count(
     context.CopyStructureCount(&dst, dst_offset, &*src);
 }
 
-pub(crate) unsafe extern "C" fn calc_size_sampler(
+pub(crate) unsafe extern "system" fn calc_size_sampler(
     _h: Hdevice,
     _d: *const ddi::D3D10_DDI_SAMPLER_DESC,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
-pub(crate) unsafe extern "C" fn create_sampler(
+pub(crate) unsafe extern "system" fn create_sampler(
     h: Hdevice,
     desc: *const ddi::D3D10_DDI_SAMPLER_DESC,
     h_sampler: ddi::D3D10DDI_HSAMPLER,
@@ -995,6 +995,6 @@ pub(crate) unsafe extern "C" fn create_sampler(
     finish_create(h, created, s, |o| store_com(h_sampler, o));
 }
 
-pub(crate) unsafe extern "C" fn destroy_sampler(_h: Hdevice, h_sampler: ddi::D3D10DDI_HSAMPLER) {
+pub(crate) unsafe extern "system" fn destroy_sampler(_h: Hdevice, h_sampler: ddi::D3D10DDI_HSAMPLER) {
     release_com(h_sampler);
 }

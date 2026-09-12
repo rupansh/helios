@@ -60,15 +60,15 @@ pub(crate) unsafe fn log_shader_code(kind: &str, code: *const u32, len: usize) {
     );
 }
 
-pub(crate) unsafe extern "C" fn calc_size_shader(
+pub(crate) unsafe extern "system" fn calc_size_shader(
     _h: Hdevice,
     _code: *const u32,
     _sig: *const ddi::D3D10DDIARG_STAGE_IO_SIGNATURES,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
-pub(crate) unsafe extern "C" fn create_vertex_shader(
+pub(crate) unsafe extern "system" fn create_vertex_shader(
     h: Hdevice,
     code: *const u32,
     h_shader: ddi::D3D10DDI_HSHADER,
@@ -104,7 +104,7 @@ pub(crate) unsafe extern "C" fn create_vertex_shader(
     }
 }
 
-pub(crate) unsafe extern "C" fn create_pixel_shader(
+pub(crate) unsafe extern "system" fn create_pixel_shader(
     h: Hdevice,
     code: *const u32,
     h_shader: ddi::D3D10DDI_HSHADER,
@@ -237,7 +237,7 @@ impl<'a> SigBlock<'a> {
     /// if the block is shorter than its header claims. Never a partial entry.
     pub(crate) fn entry(self, preceding: usize, i: usize) -> Option<SigEntry> {
         let base = entry_base(self.header, preceding, i);
-        let w = self.words.get(base..base + SIG_ENTRY_WORDS)?;
+        let w = self.words.get(base..base.checked_add(SIG_ENTRY_WORDS)?)?;
         Some(SigEntry {
             sysval: w[0],
             register_: w[1],
@@ -256,7 +256,9 @@ impl<'a> SigBlock<'a> {
 ///
 /// The `2 + i * 5` / `3 + (n_in + i) * 5` arithmetic, once.
 pub(crate) fn entry_base(header: SigHeader, preceding: usize, i: usize) -> usize {
-    header.words() + (preceding + i) * SIG_ENTRY_WORDS
+    header
+        .words()
+        .saturating_add(preceding.saturating_add(i).saturating_mul(SIG_ENTRY_WORDS))
 }
 
 /// An owned flattened signature block. Holds the exact `Vec<u32>` handed across
@@ -325,7 +327,7 @@ impl SigWords {
     /// must be synthesized wholesale from the bound layout.
     pub(crate) fn replace_inputs(&mut self, entries: &[SigEntry]) {
         let header = self.header.words();
-        let old_end = (header + self.n_in() * SIG_ENTRY_WORDS).min(self.words.len());
+        let old_end = entry_base(self.header, self.n_in(), 0).min(self.words.len());
         let tail = self.words.split_off(old_end);
         self.words.truncate(header);
         self.words[0] = entries.len() as u32;
@@ -587,7 +589,7 @@ pub(crate) unsafe fn create_shader_11_1_common(
     }
 }
 
-pub(crate) unsafe extern "C" fn create_vertex_shader_11_1(
+pub(crate) unsafe extern "system" fn create_vertex_shader_11_1(
     h: Hdevice,
     code: *const u32,
     h_shader: ddi::D3D10DDI_HSHADER,
@@ -597,7 +599,7 @@ pub(crate) unsafe extern "C" fn create_vertex_shader_11_1(
     create_shader_11_1_common(h, 0, code, h_shader, sig, "create_vertex_shader_11_1");
 }
 
-pub(crate) unsafe extern "C" fn create_pixel_shader_11_1(
+pub(crate) unsafe extern "system" fn create_pixel_shader_11_1(
     h: Hdevice,
     code: *const u32,
     h_shader: ddi::D3D10DDI_HSHADER,
@@ -607,7 +609,7 @@ pub(crate) unsafe extern "C" fn create_pixel_shader_11_1(
     create_shader_11_1_common(h, 1, code, h_shader, sig, "create_pixel_shader_11_1");
 }
 
-pub(crate) unsafe extern "C" fn create_geometry_shader_11_1(
+pub(crate) unsafe extern "system" fn create_geometry_shader_11_1(
     h: Hdevice,
     code: *const u32,
     h_shader: ddi::D3D10DDI_HSHADER,
@@ -617,7 +619,7 @@ pub(crate) unsafe extern "C" fn create_geometry_shader_11_1(
     create_shader_11_1_common(h, 2, code, h_shader, sig, "create_geometry_shader_11_1");
 }
 
-pub(crate) unsafe extern "C" fn create_geometry_shader(
+pub(crate) unsafe extern "system" fn create_geometry_shader(
     h: Hdevice,
     code: *const u32,
     h_shader: ddi::D3D10DDI_HSHADER,
@@ -644,15 +646,15 @@ pub(crate) unsafe extern "C" fn create_geometry_shader(
     }
 }
 
-pub(crate) unsafe extern "C" fn calc_size_geometry_shader_so(
+pub(crate) unsafe extern "system" fn calc_size_geometry_shader_so(
     _h: Hdevice,
     _arg: *const ddi::D3D11DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT,
     _sig: *const ddi::D3D10DDIARG_STAGE_IO_SIGNATURES,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
-pub(crate) unsafe extern "C" fn create_geometry_shader_so(
+pub(crate) unsafe extern "system" fn create_geometry_shader_so(
     h: Hdevice,
     arg: *const ddi::D3D11DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT,
     h_shader: ddi::D3D10DDI_HSHADER,
@@ -691,23 +693,23 @@ pub(crate) unsafe extern "C" fn create_geometry_shader_so(
     }
 }
 
-pub(crate) unsafe extern "C" fn calc_size_tess_shader(
+pub(crate) unsafe extern "system" fn calc_size_tess_shader(
     _h: Hdevice,
     _code: *const u32,
     _sig: *const ddi::D3D11DDIARG_TESSELLATION_IO_SIGNATURES,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
-pub(crate) unsafe extern "C" fn calc_size_tess_shader_11_1(
+pub(crate) unsafe extern "system" fn calc_size_tess_shader_11_1(
     _h: Hdevice,
     _code: *const u32,
     _sig: *const ddi::D3D11_1DDIARG_TESSELLATION_IO_SIGNATURES,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
-pub(crate) unsafe extern "C" fn create_hull_shader(
+pub(crate) unsafe extern "system" fn create_hull_shader(
     h: Hdevice,
     code: *const u32,
     h_shader: ddi::D3D10DDI_HSHADER,
@@ -747,7 +749,7 @@ pub(crate) unsafe extern "C" fn create_hull_shader(
     }
 }
 
-pub(crate) unsafe extern "C" fn create_hull_shader_11_1(
+pub(crate) unsafe extern "system" fn create_hull_shader_11_1(
     h: Hdevice,
     code: *const u32,
     h_shader: ddi::D3D10DDI_HSHADER,
@@ -789,7 +791,7 @@ pub(crate) unsafe extern "C" fn create_hull_shader_11_1(
     }
 }
 
-pub(crate) unsafe extern "C" fn create_domain_shader(
+pub(crate) unsafe extern "system" fn create_domain_shader(
     h: Hdevice,
     code: *const u32,
     h_shader: ddi::D3D10DDI_HSHADER,
@@ -829,7 +831,7 @@ pub(crate) unsafe extern "C" fn create_domain_shader(
     }
 }
 
-pub(crate) unsafe extern "C" fn create_domain_shader_11_1(
+pub(crate) unsafe extern "system" fn create_domain_shader_11_1(
     h: Hdevice,
     code: *const u32,
     h_shader: ddi::D3D10DDI_HSHADER,
@@ -871,7 +873,7 @@ pub(crate) unsafe extern "C" fn create_domain_shader_11_1(
     }
 }
 
-pub(crate) unsafe extern "C" fn create_compute_shader(
+pub(crate) unsafe extern "system" fn create_compute_shader(
     h: Hdevice,
     code: *const u32,
     h_shader: ddi::D3D10DDI_HSHADER,
@@ -897,7 +899,7 @@ pub(crate) unsafe extern "C" fn create_compute_shader(
     }
 }
 
-pub(crate) unsafe extern "C" fn destroy_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
+pub(crate) unsafe extern "system" fn destroy_shader(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
     let raw = handle_com_raw(h_shader);
     if raw != 0 {
         if let Some(dev) = helios_device(h) {
@@ -968,7 +970,7 @@ pub(crate) unsafe extern "C" fn destroy_shader(h: Hdevice, h_shader: ddi::D3D10D
 
 /// Generate one stage's `pfn*SetShader` entry point.
 ///
-/// The DDI table demands six distinct `extern "C"` symbols, so this is a macro
+/// The DDI table demands six distinct `extern "system"` symbols, so this is a macro
 /// expansion and not a shared function — there is no type-level guarantee to
 /// win here. What it wins is that the fourteen shared lines and the ONE
 /// stage-specific line stop being indistinguishable to a reviewer: `vs` alone
@@ -978,7 +980,7 @@ pub(crate) unsafe extern "C" fn destroy_shader(h: Hdevice, h_shader: ddi::D3D10D
 macro_rules! stage_set_shader {
     ($name:ident, $tag:literal, $current:ident, $com:ty, $method:ident
      $(, also_set: $extra:ident)?) => {
-        pub(crate) unsafe extern "C" fn $name(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
+        pub(crate) unsafe extern "system" fn $name(h: Hdevice, h_shader: ddi::D3D10DDI_HSHADER) {
             let com = handle_com_raw(h_shader);
             if let Some(bindings) = ctx_bindings(h) {
                 bindings.$current.store(com, Ordering::Relaxed);
@@ -1048,7 +1050,7 @@ stage_set_shader!(
 /// like six independent decisions.
 macro_rules! stage_set_shader_with_ifaces {
     ($name:ident, $plain:ident) => {
-        pub(crate) unsafe extern "C" fn $name(
+        pub(crate) unsafe extern "system" fn $name(
             h: Hdevice,
             h_shader: ddi::D3D10DDI_HSHADER,
             _num_class_instances: u32,

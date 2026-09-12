@@ -52,11 +52,10 @@
 //! The C++ route would also have taken this whole lane off the Linux host
 //! cross-check (`PARALLEL.md` §7), which is the same trade `caps12` recorded.
 //!
-//! ⚠ **The direction still open is the DDI side, not the engine side.**
-//! `PFND3D12DDI_GET_CPU_DESCRIPTOR_HANDLE_FOR_HEAP_START` (`:51939`) returns the
-//! one-`usize` `#[repr(C)]` struct by value, and a Rust `unsafe extern "C" fn`
-//! returns an 8-byte POD in RAX — which is what an MSVC-compiled runtime expects
-//! of it. If a handle ever comes back wrong, that is where to look.
+//! The DDI returns these POD handles by value through `extern "system"`.
+//! Its compiler-checked field assignment preserves both the x86 stdcall return
+//! convention and the x64 ABI; CPU handles narrow with SIZE_T while GPU handles
+//! remain UINT64. The engine COM call keeps its explicit out-pointer convention.
 //! [`DESCRIPTOR_REFUSALS.heap_cpu_handle_zero`] is the canary: vkd3d always
 //! assigns a real host pointer to `cpu_va` (`resource.c:10367-10420`), so a zero
 //! CPU handle cannot be the engine's answer and must be a truncation.
@@ -211,7 +210,7 @@ com_handles!(crate::ddi12::D3D12DDI_HDESCRIPTORHEAP);
 /// `DEBUGGABLE`. Stated because the two look like they should have the same
 /// shape and must not.
 ///
-/// ⚠ Typed `ddi12::SIZE_T` (`= c_ulonglong`, `d3d12umddi.rs:352-353`) rather than
+/// Typed `ddi12::SIZE_T` (the target architecture's pointer-sized type) rather than
 /// `usize`, because that is what `PFND3D12DDI_CALC_PRIVATE_DESCRIPTOR_HEAP_SIZE`
 /// returns. The two are the same width on this target - see the assertion beside
 /// [`api_cpu_handle`], which is what the descriptor-handle casts rest on.
@@ -386,7 +385,7 @@ fn api_heap_flags(ddi_flags: ddi12::D3D12DDI_DESCRIPTOR_HEAP_FLAGS) -> D3D12_DES
 /// # Safety
 /// `arg`, when non-null, must point at a live
 /// `D3D12DDIARG_CREATE_DESCRIPTOR_HEAP_0001` for the duration of the call.
-unsafe extern "C" fn calc_private_descriptor_heap_size(
+unsafe extern "system" fn calc_private_descriptor_heap_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_DESCRIPTOR_HEAP_0001,
 ) -> ddi12::SIZE_T {
@@ -420,7 +419,7 @@ unsafe extern "C" fn calc_private_descriptor_heap_size(
 /// `arg` must point at a live `D3D12DDIARG_CREATE_DESCRIPTOR_HEAP_0001`, and
 /// `h_heap.pDrvPrivate` at the [`HEAP_PRIVATE_SIZE`] writable bytes the runtime
 /// allocated for this heap.
-unsafe extern "C" fn create_descriptor_heap(
+unsafe extern "system" fn create_descriptor_heap(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_DESCRIPTOR_HEAP_0001,
     h_heap: ddi12::D3D12DDI_HDESCRIPTORHEAP,
@@ -536,7 +535,7 @@ unsafe extern "C" fn create_descriptor_heap(
 /// # Safety
 /// `h_heap` must be a handle [`create_descriptor_heap`] returned `S_OK` for and
 /// which has not already been destroyed.
-unsafe extern "C" fn destroy_descriptor_heap(
+unsafe extern "system" fn destroy_descriptor_heap(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_heap: ddi12::D3D12DDI_HDESCRIPTORHEAP,
 ) {
@@ -565,7 +564,7 @@ unsafe extern "C" fn destroy_descriptor_heap(
 ///
 /// # Safety
 /// `h_device` must be a live handle from `device12::create_device`.
-unsafe extern "C" fn get_descriptor_size_in_bytes(
+unsafe extern "system" fn get_descriptor_size_in_bytes(
     h_device: ddi12::D3D12DDI_HDEVICE,
     heap_type: ddi12::D3D12DDI_DESCRIPTOR_HEAP_TYPE,
 ) -> ddi12::UINT {
@@ -613,7 +612,7 @@ unsafe extern "C" fn get_descriptor_size_in_bytes(
 ///
 /// # Safety
 /// `h_heap` must be a live handle from [`create_descriptor_heap`].
-unsafe extern "C" fn get_cpu_descriptor_handle_for_heap_start(
+unsafe extern "system" fn get_cpu_descriptor_handle_for_heap_start(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_heap: ddi12::D3D12DDI_HDESCRIPTORHEAP,
 ) -> ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE {
@@ -675,7 +674,7 @@ unsafe extern "C" fn get_cpu_descriptor_handle_for_heap_start(
 ///
 /// # Safety
 /// `h_heap` must be a live handle from [`create_descriptor_heap`].
-unsafe extern "C" fn get_gpu_descriptor_handle_for_heap_start(
+unsafe extern "system" fn get_gpu_descriptor_handle_for_heap_start(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_heap: ddi12::D3D12DDI_HDESCRIPTORHEAP,
 ) -> ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE {
@@ -1159,7 +1158,7 @@ fn api_buffer_uav_flags(f: ddi12::D3D12DDI_BUFFER_UAV_FLAGS) -> D3D12_BUFFER_UAV
 /// `arg` must point at a live `D3D12DDIARG_CREATE_SHADER_RESOURCE_VIEW_0002`
 /// whose union arm is the one `ResourceDimension` names, and `dest` must be a
 /// CPU descriptor handle this driver minted.
-unsafe extern "C" fn create_shader_resource_view(
+unsafe extern "system" fn create_shader_resource_view(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_SHADER_RESOURCE_VIEW_0002,
     dest: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
@@ -1389,7 +1388,7 @@ unsafe fn uav_desc(
 ///
 /// # Safety
 /// As [`create_shader_resource_view`].
-unsafe extern "C" fn create_unordered_access_view(
+unsafe extern "system" fn create_unordered_access_view(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_UNORDERED_ACCESS_VIEW_0002,
     dest: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
@@ -1647,7 +1646,7 @@ fn rtv_tex2d(
 ///
 /// # Safety
 /// As [`create_shader_resource_view`].
-unsafe extern "C" fn create_render_target_view(
+unsafe extern "system" fn create_render_target_view(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_RENDER_TARGET_VIEW_0002,
     dest: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
@@ -1850,7 +1849,7 @@ fn dsv_tex2d(
 ///
 /// # Safety
 /// As [`create_shader_resource_view`].
-unsafe extern "C" fn create_depth_stencil_view(
+unsafe extern "system" fn create_depth_stencil_view(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_DEPTH_STENCIL_VIEW,
     dest: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
@@ -1936,7 +1935,7 @@ unsafe extern "C" fn create_depth_stencil_view(
 /// # Safety
 /// `arg` must point at a live `D3D12DDI_CONSTANT_BUFFER_VIEW_DESC`, and `dest`
 /// at a CPU descriptor handle this driver minted.
-unsafe extern "C" fn create_constant_buffer_view(
+unsafe extern "system" fn create_constant_buffer_view(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDI_CONSTANT_BUFFER_VIEW_DESC,
     dest: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
@@ -2087,7 +2086,7 @@ fn api_sampler_flags(f: ddi12::D3D12DDI_SAMPLER_FLAGS_0096) -> D3D12_SAMPLER_FLA
 /// `arg` must point at a live `D3D12DDIARG_CREATE_SAMPLER_0096` whose
 /// `pSamplerDesc` is a live `D3D12DDI_SAMPLER_DESC_0096`, and `dest` at a CPU
 /// descriptor handle this driver minted.
-unsafe extern "C" fn create_sampler(
+unsafe extern "system" fn create_sampler(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_SAMPLER_0096,
     dest: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
@@ -2209,7 +2208,7 @@ unsafe extern "C" fn create_sampler(
 ///
 /// # Safety
 /// `dest` must be a CPU descriptor handle this driver minted.
-unsafe extern "C" fn create_sampler_feedback_unordered_access_view(
+unsafe extern "system" fn create_sampler_feedback_unordered_access_view(
     h_device: ddi12::D3D12DDI_HDEVICE,
     _h_targeted_resource: ddi12::D3D12DDI_HRESOURCE,
     _h_feedback_resource: ddi12::D3D12DDI_HRESOURCE,
@@ -2254,12 +2253,8 @@ const _: () = assert!(
 );
 const _: () = assert!(core::mem::offset_of!(ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE, ptr) == 0);
 const _: () = assert!(core::mem::offset_of!(D3D12_CPU_DESCRIPTOR_HANDLE, ptr) == 0);
-// ⚠ And the reason the assertions above are not redundant with "both are one
-// machine word": the two generators do not even agree on the Rust integer TYPE.
-// bindgen renders C `SIZE_T` as `c_ulonglong` (`d3d12umddi.rs:352-353`, so `u64`)
-// while windows-rs renders it as `usize`. They are the same width on
-// `x86_64-pc-windows-msvc` -- pinned here -- which is what makes both the `as`
-// conversions below and the array casts above lossless and layout-preserving.
+// Bindgen's SIZE_T spelling depends on the target's Windows headers; windows-rs
+// uses usize. Prove their widths equal in each architecture before casting.
 const _: () = assert!(core::mem::size_of::<usize>() == core::mem::size_of::<ddi12::SIZE_T>());
 
 /// One DDI CPU descriptor handle as the API's, by field.
@@ -2330,7 +2325,7 @@ pub(crate) fn api_gpu_handle(
 /// # Safety
 /// The four array pointers, when non-null, must each address at least the number
 /// of elements their paired count states, for the duration of the call.
-unsafe extern "C" fn copy_descriptors(
+unsafe extern "system" fn copy_descriptors(
     h_device: ddi12::D3D12DDI_HDEVICE,
     num_dest_ranges: ddi12::UINT,
     dest_range_starts: *const ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
@@ -2396,7 +2391,7 @@ unsafe extern "C" fn copy_descriptors(
 /// # Safety
 /// `dest` and `src` must each be the start of at least `num_descriptors`
 /// descriptors this driver minted, in a heap of `heap_type`.
-unsafe extern "C" fn copy_descriptors_simple(
+unsafe extern "system" fn copy_descriptors_simple(
     h_device: ddi12::D3D12DDI_HDEVICE,
     num_descriptors: ddi12::UINT,
     dest: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,

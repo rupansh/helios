@@ -223,7 +223,7 @@ pub(crate) unsafe fn collect_samplers(
 /// remaining wrapper.
 macro_rules! stage_set_constant_buffers {
     ($name:ident, $method:ident) => {
-        pub(crate) unsafe extern "C" fn $name(
+        pub(crate) unsafe extern "system" fn $name(
             h: Hdevice,
             start: u32,
             num: u32,
@@ -358,7 +358,7 @@ pub(crate) unsafe fn set_constant_buffers1_common(
 /// error.
 macro_rules! stage_set_constant_buffers1 {
     ($name:ident, $stage:ident) => {
-        pub(crate) unsafe extern "C" fn $name(
+        pub(crate) unsafe extern "system" fn $name(
             h: Hdevice,
             start: u32,
             num: u32,
@@ -392,7 +392,7 @@ stage_set_constant_buffers1!(cs_set_constant_buffers1, Cs);
 /// T5/R827's `ShaderStage`; this removes the repeated signature only.
 macro_rules! stage_set_shader_resources {
     ($name:ident, $stage:ident) => {
-        pub(crate) unsafe extern "C" fn $name(
+        pub(crate) unsafe extern "system" fn $name(
             h: Hdevice,
             start: u32,
             num: u32,
@@ -448,7 +448,7 @@ stage_set_shader_resources!(cs_set_shader_resources, Cs);
 /// Generate one stage's `pfn*SetSamplers` entry point.
 macro_rules! stage_set_samplers {
     ($name:ident, $method:ident) => {
-        pub(crate) unsafe extern "C" fn $name(
+        pub(crate) unsafe extern "system" fn $name(
             h: Hdevice,
             start: u32,
             num: u32,

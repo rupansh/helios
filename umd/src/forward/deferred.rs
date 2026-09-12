@@ -129,7 +129,10 @@ pub(crate) fn note_deferred_context_destroyed() {
     }
     let n = DC_DESTROYED.fetch_add(1, Ordering::Relaxed);
     if n < 16 {
-        log_error!("DDI DestroyDevice(DC): deferred context destroyed (x{})", n + 1);
+        log_error!(
+            "DDI DestroyDevice(DC): deferred context destroyed (x{})",
+            n + 1
+        );
     }
 }
 
@@ -167,7 +170,7 @@ const DC_HANDLE_TYPES: [ddi::D3D11DDI_HANDLETYPE; 13] = [
 /// (count only), second with `*pHSizes` entries to fill. This firing at all
 /// is the first sign of deferred-context life (the runtime only polls it once
 /// it has seen the COMMANDLISTS caps bit).
-pub(crate) unsafe extern "C" fn check_deferred_context_handle_sizes(
+pub(crate) unsafe extern "system" fn check_deferred_context_handle_sizes(
     _h_device: Hdevice,
     p_h_sizes: *mut ddi::UINT,
     sizes: *mut ddi::D3D11DDI_HANDLESIZE,
@@ -215,7 +218,7 @@ pub(crate) unsafe extern "C" fn check_deferred_context_handle_sizes(
 /// the IC table right after every IC create. Free-threaded by WDK retro-rule;
 /// trivially so — it reads no state. The answer must be a member of the
 /// Check array above, which every entry is.
-pub(crate) unsafe extern "C" fn calc_deferred_context_handle_size(
+pub(crate) unsafe extern "system" fn calc_deferred_context_handle_size(
     _h_device: Hdevice,
     _handle_type: ddi::D3D11DDI_HANDLETYPE,
     _p_ic_handle: *mut c_void,
@@ -223,7 +226,7 @@ pub(crate) unsafe extern "C" fn calc_deferred_context_handle_size(
     DC_HANDLE_WORD as ddi::SIZE_T
 }
 
-pub(crate) unsafe extern "C" fn calc_private_deferred_context_size(
+pub(crate) unsafe extern "system" fn calc_private_deferred_context_size(
     _h_device: Hdevice,
     _args: *const ddi::D3D11DDIARG_CALCPRIVATEDEFERREDCONTEXTSIZE,
 ) -> ddi::SIZE_T {
@@ -233,7 +236,7 @@ pub(crate) unsafe extern "C" fn calc_private_deferred_context_size(
 /// The IC-side command-list region: one owned `ID3D11CommandList` COM word,
 /// stored/loaded/released through the `Slot<Com<_>>` machinery like every
 /// bare-COM handle.
-pub(crate) unsafe extern "C" fn calc_private_command_list_size(
+pub(crate) unsafe extern "system" fn calc_private_command_list_size(
     _h_device: Hdevice,
     _args: *const ddi::D3D11DDIARG_CREATECOMMANDLIST,
 ) -> ddi::SIZE_T {
@@ -249,7 +252,10 @@ pub(crate) unsafe extern "C" fn calc_private_command_list_size(
 /// `set_runtime_error`'s tag dispatch.
 unsafe fn report_dc_error(core_layer: *mut c_void, um_callbacks: *const c_void, hr: i32) {
     if um_callbacks.is_null() {
-        log_error!("CreateDeferredContext: no DC corelayer callbacks to report hr=0x{:08x}", hr as u32);
+        log_error!(
+            "CreateDeferredContext: no DC corelayer callbacks to report hr=0x{:08x}",
+            hr as u32
+        );
         return;
     }
     let cb = &*(um_callbacks as *const ddi::D3D11DDI_CORELAYER_DEVICECALLBACKS);
@@ -258,7 +264,7 @@ unsafe fn report_dc_error(core_layer: *mut c_void, um_callbacks: *const c_void, 
     }
 }
 
-pub(crate) unsafe extern "C" fn create_deferred_context(
+pub(crate) unsafe extern "system" fn create_deferred_context(
     h: Hdevice,
     args: *const ddi::D3D11DDIARG_CREATEDEFERREDCONTEXT,
 ) {
@@ -309,7 +315,10 @@ pub(crate) unsafe extern "C" fn create_deferred_context(
             return;
         }
     };
-    if !dev.dxvk.enable_deferred_context_ddi_logical_reset(ctx.as_raw() as usize) {
+    if !dev
+        .dxvk
+        .enable_deferred_context_ddi_logical_reset(ctx.as_raw() as usize)
+    {
         log_error!("DDI CreateDeferredContext: failed to mark DXVK DC fast-reset eligible");
         report_dc_error(dc_core_layer, dc_um_callbacks, E_OUTOFMEMORY);
         return;
@@ -344,7 +353,7 @@ pub(crate) unsafe extern "C" fn create_deferred_context(
 /// context, so the object-level work is only our shadow state + the funcs
 /// table + the per-DC error channel. Returns HRESULT directly (BUILD_2
 /// recycle contract), never pfnSetErrorCb.
-pub(crate) unsafe extern "C" fn recycle_create_deferred_context(
+pub(crate) unsafe extern "system" fn recycle_create_deferred_context(
     _h: Hdevice,
     args: *const ddi::D3D11DDIARG_CREATEDEFERREDCONTEXT,
 ) -> ddi::HRESULT {
@@ -441,7 +450,7 @@ unsafe fn finish_command_list_into(
     }
 }
 
-pub(crate) unsafe extern "C" fn create_command_list(
+pub(crate) unsafe extern "system" fn create_command_list(
     h: Hdevice,
     args: *const ddi::D3D11DDIARG_CREATECOMMANDLIST,
     h_cl: ddi::D3D11DDI_HCOMMANDLIST,
@@ -456,7 +465,7 @@ pub(crate) unsafe extern "C" fn create_command_list(
 /// BUILD_2: Finish into an already-allocated (recycled) region. Errors return
 /// as HRESULT directly — the WDK documents E_OUTOFMEMORY, so the create-set
 /// codes are clamped to it.
-pub(crate) unsafe extern "C" fn recycle_create_command_list(
+pub(crate) unsafe extern "system" fn recycle_create_command_list(
     _h: Hdevice,
     args: *const ddi::D3D11DDIARG_CREATECOMMANDLIST,
     h_cl: ddi::D3D11DDI_HCOMMANDLIST,
@@ -471,7 +480,7 @@ pub(crate) unsafe extern "C" fn recycle_create_command_list(
 /// Normal IC-side destroy: release the owned COM word and leave the slot
 /// empty. This is also the mandatory cleanup if a DC dies before its retired
 /// hCL escrow can reach `DC::RecycleCommandList`.
-pub(crate) unsafe extern "C" fn destroy_command_list(
+pub(crate) unsafe extern "system" fn destroy_command_list(
     _h: Hdevice,
     h_cl: ddi::D3D11DDI_HCOMMANDLIST,
 ) {
@@ -482,7 +491,7 @@ pub(crate) unsafe extern "C" fn destroy_command_list(
 /// release or clear `h_cl`: the one-word IC slot is the owned COM escrow that
 /// the later DC::RecycleCommandList callback receives. This callback is
 /// free-threaded and deliberately has no DC/cache access.
-pub(crate) unsafe extern "C" fn recycle_destroy_command_list(
+pub(crate) unsafe extern "system" fn recycle_destroy_command_list(
     _h: Hdevice,
     _h_cl: ddi::D3D11DDI_HCOMMANDLIST,
 ) {
@@ -496,14 +505,17 @@ pub(crate) unsafe extern "C" fn recycle_destroy_command_list(
 /// context's shadow resets. The target may be the immediate context or
 /// (nested execution) another DC — `d3d11_context`/`ctx_bindings` dispatch by
 /// tag.
-pub(crate) unsafe extern "C" fn command_list_execute(
+pub(crate) unsafe extern "system" fn command_list_execute(
     h: Hdevice,
     h_cl: ddi::D3D11DDI_HCOMMANDLIST,
 ) {
     let Some(cl) = load_com::<ID3D11CommandList>(h_cl) else {
         let n = CL_EXECUTE_EMPTY.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
-            log_error!("DDI CommandListExecute: empty command-list slot (x{}) — refused", n + 1);
+            log_error!(
+                "DDI CommandListExecute: empty command-list slot (x{}) — refused",
+                n + 1
+            );
         }
         return;
     };
@@ -528,7 +540,7 @@ pub(crate) unsafe extern "C" fn command_list_execute(
 /// `pfnAbandonCommandList(hDC)`: the app/runtime abandoned a recording.
 /// DXVK has no discard primitive; Finish-and-drop both discards the recorded
 /// chunks and self-resets the DC for its next recording.
-pub(crate) unsafe extern "C" fn abandon_command_list(h: Hdevice) {
+pub(crate) unsafe extern "system" fn abandon_command_list(h: Hdevice) {
     if crate::umd_deferred_diagnostics() {
         let n = CL_ABANDONED.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
@@ -553,7 +565,7 @@ pub(crate) unsafe extern "C" fn abandon_command_list(h: Hdevice) {
 /// normal empty no-op, then give the live object only to its originating DXVK
 /// deferred context. The owned raw reference transfers directly into an
 /// admitted DXVK cache entry; a rejection reconstructs and drops it here.
-pub(crate) unsafe extern "C" fn recycle_command_list(
+pub(crate) unsafe extern "system" fn recycle_command_list(
     h: Hdevice,
     h_cl: ddi::D3D11DDI_HCOMMANDLIST,
 ) {
@@ -580,10 +592,9 @@ pub(crate) unsafe extern "C" fn recycle_command_list(
     // result means DXVK attached that exact reference to its bounded cache;
     // false means ownership remained here and must be reconstructed/dropped.
     let raw_command_list = command_list.into_raw() as usize;
-    let cached = (*dc.parent).dxvk.recycle_deferred_command_list(
-        dc_context.as_raw() as usize,
-        raw_command_list,
-    );
+    let cached = (*dc.parent)
+        .dxvk
+        .recycle_deferred_command_list(dc_context.as_raw() as usize, raw_command_list);
     if !cached {
         drop(ID3D11CommandList::from_raw(
             raw_command_list as *mut core::ffi::c_void,
@@ -602,83 +613,118 @@ pub(crate) unsafe extern "C" fn recycle_command_list(
 // The DC-table shims
 // ---------------------------------------------------------------------------
 
-/// Uniform DC-local OPEN shim, transmuted into every DC-table `pfnCreate*`
-/// slot. Every create DDI has the shape `(hDevice, args, hHandle, hRT…, …)`
-/// — driver handle third, RT handle fourth — and x64's caller-clean
-/// convention makes extra trailing args ignorable and the usize return
-/// harmless for void DDIs (the same ABI argument `ddi_noop_device` documents).
-/// Under the DC-create contract hRT\* IS the immediate context's driver
-/// handle, so the shim copies the IC region's identity word into the DC-local
-/// region: COM pointer for bare-COM slots, Box pointer for boxed slots,
-/// command-list COM word for HT_COMMANDLIST. The copy is a borrow — the DC
-/// close shim clears, never releases.
-unsafe extern "C" fn dc_open_handle(
-    _h_device: usize,
-    _args: usize,
-    h_priv: usize,
-    ic_priv: usize,
-) -> usize {
-    if h_priv == 0 {
-        return 0;
+/// A driver handle and its corresponding runtime handle. On a deferred
+/// context the latter carries the immediate-context private slot identity.
+trait DcHandle: DdiHandle {
+    type Runtime;
+    fn immediate_private(runtime: Self::Runtime) -> *mut c_void;
+}
+
+macro_rules! dc_handles {
+    ($($driver:ty => $runtime:ty),* $(,)?) => {$(
+        impl DcHandle for $driver {
+            type Runtime = $runtime;
+            fn immediate_private(runtime: Self::Runtime) -> *mut c_void { runtime.handle }
+        }
+    )*};
+}
+
+dc_handles!(
+    ddi::D3D10DDI_HRESOURCE => ddi::D3D10DDI_HRTRESOURCE,
+    ddi::D3D10DDI_HRENDERTARGETVIEW => ddi::D3D10DDI_HRTRENDERTARGETVIEW,
+    ddi::D3D10DDI_HDEPTHSTENCILVIEW => ddi::D3D10DDI_HRTDEPTHSTENCILVIEW,
+    ddi::D3D10DDI_HSHADER => ddi::D3D10DDI_HRTSHADER,
+    ddi::D3D10DDI_HRASTERIZERSTATE => ddi::D3D10DDI_HRTRASTERIZERSTATE,
+    ddi::D3D10DDI_HDEPTHSTENCILSTATE => ddi::D3D10DDI_HRTDEPTHSTENCILSTATE,
+    ddi::D3D10DDI_HSHADERRESOURCEVIEW => ddi::D3D10DDI_HRTSHADERRESOURCEVIEW,
+    ddi::D3D10DDI_HSAMPLER => ddi::D3D10DDI_HRTSAMPLER,
+    ddi::D3D10DDI_HQUERY => ddi::D3D10DDI_HRTQUERY,
+    ddi::D3D11DDI_HUNORDEREDACCESSVIEW => ddi::D3D11DDI_HRTUNORDEREDACCESSVIEW,
+    ddi::D3D10DDI_HELEMENTLAYOUT => ddi::D3D10DDI_HRTELEMENTLAYOUT,
+    ddi::D3D10DDI_HBLENDSTATE => ddi::D3D10DDI_HRTBLENDSTATE,
+    ddi::D3D11DDI_HCOMMANDLIST => ddi::D3D11DDI_HRTCOMMANDLIST,
+);
+
+/// Copy one borrowed identity. The IC allocation outlives the DC allocation
+/// under the runtime's deferred-context create/destroy ordering.
+unsafe fn dc_open_handle<H: DcHandle>(handle: H, runtime: H::Runtime) {
+    let private = handle.drv_private();
+    if private.is_null() {
+        return;
     }
-    let word = if ic_priv == 0 {
+    let immediate = H::immediate_private(runtime);
+    // SAFETY: both pointers name runtime-sized private slots; the IC identity
+    // was initialized before the DC open, and its lifetime spans this borrow.
+    let word = if immediate.is_null() {
         0
     } else {
-        *(ic_priv as *const usize)
+        unsafe { immediate.cast::<usize>().read() }
     };
     if word == 0 {
         let n = DC_OPEN_EMPTY.fetch_add(1, Ordering::Relaxed);
         if n < 16 {
-            log_error!("DC open: empty IC identity word ic_priv=0x{ic_priv:x} (x{})", n + 1);
+            log_error!(
+                "DC open: empty IC identity word ic_priv={immediate:p} (x{})",
+                n + 1
+            );
         }
     }
-    *(h_priv as *mut usize) = word;
-    0
+    // SAFETY: private names the writable DC-local slot sized by Calc*.
+    unsafe { private.cast::<usize>().write(word) };
 }
 
-/// Uniform DC-local CLOSE shim for every DC-table `pfnDestroy*` slot
-/// (`(hDevice, hHandle)` uniformly): clear the borrowed word, touch nothing
-/// it pointed at. The IC handle is guaranteed to outlive every DC-local open
-/// (first-created/last-destroyed + use counting), so no read can race the
-/// underlying object's real teardown.
-unsafe extern "C" fn dc_close_handle(_h_device: usize, h_priv: usize) -> usize {
-    if h_priv != 0 {
-        *(h_priv as *mut usize) = 0;
+/// Every create entry gets its full signature, including trailing shader
+/// signatures. A four-argument universal thunk cannot pop five x86 arguments.
+trait DcOpen: Sized {
+    fn open() -> Self;
+}
+macro_rules! dc_open_signature {
+    ($($extra:ident),* $(,)?) => {
+        impl<A, H: DcHandle, $($extra,)*> DcOpen
+            for Option<unsafe extern "system" fn(Hdevice, A, H, H::Runtime, $($extra),*)>
+        {
+            fn open() -> Self {
+                unsafe extern "system" fn invoke<A, H: DcHandle, $($extra,)*>(
+                    _device: Hdevice, _args: A, handle: H, runtime: H::Runtime, $(_: $extra),*
+                ) {
+                    // SAFETY: this is the runtime's paired DC-create callback;
+                    // its typed handles identify the borrowed IC and writable DC slots.
+                    unsafe { dc_open_handle(handle, runtime) };
+                }
+                Some(invoke::<A, H, $($extra,)*>)
+            }
+        }
+    };
+}
+dc_open_signature!();
+dc_open_signature!(Extra);
+
+unsafe extern "system" fn dc_close_handle<H: DdiHandle>(_device: Hdevice, handle: H) {
+    let private = handle.drv_private();
+    if !private.is_null() {
+        // SAFETY: the runtime owns this writable DC slot. Clearing the borrow
+        // does not release the IC object and cannot touch its lifetime.
+        unsafe { private.cast::<usize>().write(0) };
     }
-    0
 }
 
-/// Loud-failure stub pre-filling every DC-table slot before the real install:
-/// anything still pointing here after the fill is a DDI the runtime was never
-/// expected to call on a deferred context. Counted; first hit backtraced.
-unsafe extern "C" fn dc_unexpected(_h: usize) -> usize {
+pub(crate) fn note_dc_unexpected() {
     let n = DC_UNEXPECTED_SLOT.fetch_add(1, Ordering::Relaxed);
     if n == 0 {
-        log_backtrace("DC DDI unexpected-slot");
+        // SAFETY: this is an ordinary user-mode DDI call outside unwinding.
+        unsafe { log_backtrace("DC DDI unexpected-slot") };
     } else if n < 64 {
         log_error!("DC DDI unexpected-slot hit (x{})", n + 1);
     }
-    0
 }
 
-type Uniform1 = unsafe extern "C" fn(usize) -> usize;
-type Uniform2 = unsafe extern "C" fn(usize, usize) -> usize;
-type Uniform4 = unsafe extern "C" fn(usize, usize, usize, usize) -> usize;
-
-/// Pre-fill a DC funcs table with the loud-failure stub (the DC counterpart
-/// of `stub_fill_device_table`; same size-derived slot count, same safety
-/// argument) and return the D3D11.0-typed view.
-///
-/// # Safety
-/// As `stub_fill_device_table`: `funcs` must be a writable table of
-/// pointer-sized `Option<fn>` slots that layout-extends `D3D11DDI_DEVICEFUNCS`.
-unsafe fn stub_fill_dc_table<T>(funcs: *mut T) -> *mut ddi::D3D11DDI_DEVICEFUNCS {
-    let n = core::mem::size_of::<T>() / core::mem::size_of::<usize>();
-    let slots = funcs as *mut Option<Uniform1>;
-    for i in 0..n {
-        *slots.add(i) = Some(dc_unexpected);
-    }
-    funcs as *mut ddi::D3D11DDI_DEVICEFUNCS
+unsafe fn stub_fill_dc_table<T: crate::device_funcs::DdiStubTable>(
+    funcs: *mut T,
+) -> *mut ddi::D3D11DDI_DEVICEFUNCS {
+    // SAFETY: the caller supplies the complete negotiated DC table. Typed
+    // initialization gives every field its exact argument and return ABI.
+    unsafe { funcs.write(T::stubbed::<2>()) };
+    funcs.cast()
 }
 
 /// The DC-specific slot surgery applied AFTER the standard forwarder install
@@ -694,7 +740,7 @@ unsafe fn apply_dc_overrides(f: &mut ddi::D3D11DDI_DEVICEFUNCS) {
     // prefix slots, so overriding through the 11.0 view covers every level.
     macro_rules! open {
         ($($field:ident),* $(,)?) => {$(
-            f.$field = core::mem::transmute::<Uniform4, _>(dc_open_handle as Uniform4);
+            f.$field = DcOpen::open();
         )*};
     }
     open!(
@@ -722,7 +768,7 @@ unsafe fn apply_dc_overrides(f: &mut ddi::D3D11DDI_DEVICEFUNCS) {
     // DC-local command-list word is a borrow of the IC region's.
     macro_rules! close {
         ($($field:ident),* $(,)?) => {$(
-            f.$field = core::mem::transmute::<Uniform2, _>(dc_close_handle as Uniform2);
+            f.$field = Some(dc_close_handle);
         )*};
     }
     close!(
@@ -783,9 +829,20 @@ unsafe fn apply_dc_overrides(f: &mut ddi::D3D11DDI_DEVICEFUNCS) {
     f.pfnRecycleCommandList = Some(recycle_command_list);
     f.pfnRecycleCreateCommandList = Some(recycle_create_command_list);
     f.pfnRecycleCreateDeferredContext = Some(recycle_create_deferred_context);
-    f.pfnRecycleDestroyCommandList =
-        core::mem::transmute::<Uniform2, _>(dc_close_handle as Uniform2);
+    f.pfnRecycleDestroyCommandList = Some(dc_close_handle);
     f.pfnDestroyDevice = Some(ddi_destroy_device);
+}
+
+/// The 11.1 prefix changes the argument types of these slots. Install their
+/// DC shims through that exact view after applying the common 11.0 overrides.
+unsafe fn apply_dc_overrides_11_1(f: &mut ddi::D3D11_1DDI_DEVICEFUNCS) {
+    f.pfnCreateVertexShader = DcOpen::open();
+    f.pfnCreateGeometryShader = DcOpen::open();
+    f.pfnCreatePixelShader = DcOpen::open();
+    f.pfnCreateGeometryShaderWithStreamOutput = DcOpen::open();
+    f.pfnCreateHullShader = DcOpen::open();
+    f.pfnCreateDomainShader = DcOpen::open();
+    f.pfnCreateBlendState = DcOpen::open();
 }
 
 /// Notification-only, exactly like the device relocates (see
@@ -797,25 +854,28 @@ static DC_RELOCATE_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 fn dc_relocate_log(tag: &str) {
     let n = DC_RELOCATE_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 8 || n % 65536 == 0 {
-        log_error!("DDI RelocateDeviceFuncs(DC {tag}) (x{}) — noted, table untouched", n + 1);
+        log_error!(
+            "DDI RelocateDeviceFuncs(DC {tag}) (x{}) — noted, table untouched",
+            n + 1
+        );
     }
 }
 
-unsafe extern "C" fn dc_relocate_11_0(
+unsafe extern "system" fn dc_relocate_11_0(
     _h_device: Hdevice,
     _funcs: *mut ddi::D3D11DDI_DEVICEFUNCS,
 ) {
     dc_relocate_log("11.0");
 }
 
-unsafe extern "C" fn dc_relocate_11_1(
+unsafe extern "system" fn dc_relocate_11_1(
     _h_device: Hdevice,
     _funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS,
 ) {
     dc_relocate_log("11.1");
 }
 
-unsafe extern "C" fn dc_relocate_wddm1_3(
+unsafe extern "system" fn dc_relocate_wddm1_3(
     _h_device: Hdevice,
     _funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
 ) {
@@ -842,6 +902,7 @@ pub(crate) unsafe fn fill_dc_11_1(funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS) {
     let base = install(f);
     let _l1 = install_11_1(base, funcs);
     apply_dc_overrides(f);
+    apply_dc_overrides_11_1(&mut *funcs);
     (*funcs).pfnRelocateDeviceFuncs = Some(dc_relocate_11_1);
 }
 
@@ -855,6 +916,7 @@ pub(crate) unsafe fn fill_dc_wddm1_3(funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS)
     let l1 = install_11_1(base, funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS);
     let _l13 = install_wddm1_3(l1, funcs);
     apply_dc_overrides(f);
+    apply_dc_overrides_11_1(&mut *(funcs as *mut ddi::D3D11_1DDI_DEVICEFUNCS));
     (*funcs).pfnRelocateDeviceFuncs = Some(dc_relocate_wddm1_3);
 }
 

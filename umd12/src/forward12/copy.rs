@@ -816,7 +816,7 @@ unsafe fn refuse_location(state: &CommandListState, role: &str, why: &LocationRe
 /// `D3D12DDIARG_BUFFER_PLACEMENT`s; `src_box`, when non-null, at a live
 /// `D3D12DDI_BOX`; and each `D3D12DDIARG_PLACED_RESOURCE::pLayout` at the struct
 /// its `Layout` selects.
-unsafe extern "C" fn copy_texture_region(
+unsafe extern "system" fn copy_texture_region(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     dst_placement: *const ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
     dst_resource: ddi12::D3D12DDIARG_PLACED_RESOURCE,
@@ -920,7 +920,7 @@ unsafe extern "C" fn copy_texture_region(
 /// # Safety
 /// `h_list` must be a live command-list handle and both resource handles live
 /// handles this driver created.
-unsafe extern "C" fn resource_copy(
+unsafe extern "system" fn resource_copy(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_dst: ddi12::D3D12DDI_HRESOURCE,
     h_src: ddi12::D3D12DDI_HRESOURCE,
@@ -986,7 +986,7 @@ unsafe extern "C" fn resource_copy(
 /// # Safety
 /// `h_list` must be a live handle from `queue::create_command_list`; the
 /// remaining arguments are the runtime's and this body reads none of them.
-unsafe extern "C" fn copy_tiles(
+unsafe extern "system" fn copy_tiles(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     _h_resource: ddi12::D3D12DDI_HRESOURCE,
     _region_start_coord: *const ddi12::D3D12DDI_TILED_RESOURCE_COORDINATE,
@@ -1068,7 +1068,7 @@ unsafe fn buffer_region(
 ///
 /// # Safety
 /// As [`buffer_region`].
-unsafe extern "C" fn copy_buffer_region(
+unsafe extern "system" fn copy_buffer_region(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     dst: ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
     src: ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
@@ -1132,7 +1132,7 @@ unsafe extern "C" fn copy_buffer_region(
 /// # Safety
 /// `h_list` must be a live handle from `queue::create_command_list`; the
 /// remaining arguments are the runtime's and this body reads none of them.
-unsafe extern "C" fn atomic_copy_buffer_region(
+unsafe extern "system" fn atomic_copy_buffer_region(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     _dst: ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
     _src: ddi12::D3D12DDIARG_BUFFER_PLACEMENT,
@@ -1165,7 +1165,7 @@ unsafe extern "C" fn atomic_copy_buffer_region(
 /// # Safety
 /// `h_list` must be a live command-list handle and both resource handles live
 /// handles this driver created.
-unsafe extern "C" fn resource_resolve_subresource(
+unsafe extern "system" fn resource_resolve_subresource(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_dst: ddi12::D3D12DDI_HRESOURCE,
     dst_subresource: ddi12::UINT,
@@ -1251,7 +1251,7 @@ fn api_resolve_mode(m: ddi12::D3D12DDI_RESOLVE_MODE) -> Option<D3D12_RESOLVE_MOD
 /// `h_list` must be a live command-list handle, both resource handles live
 /// handles this driver created, and `src_rect`, when non-null, must point at a
 /// live `D3D12DDI_RECT`.
-unsafe extern "C" fn resource_resolve_subresource_region(
+unsafe extern "system" fn resource_resolve_subresource_region(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_dst: ddi12::D3D12DDI_HRESOURCE,
     dst_subresource: ddi12::UINT,
@@ -1467,7 +1467,7 @@ unsafe fn barrier_array_len(
 /// # Safety
 /// `h_list` must be a live command-list handle and `barriers`, when `count` is
 /// non-zero, must point at `count` live `D3D12DDIARG_RESOURCE_BARRIER_0022`s.
-unsafe extern "C" fn resource_barrier(
+unsafe extern "system" fn resource_barrier(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     count: ddi12::UINT,
     barriers: *const ddi12::D3D12DDIARG_RESOURCE_BARRIER_0022,
@@ -1745,7 +1745,7 @@ fn api_barrier_layout(l: ddi12::D3D12DDI_BARRIER_LAYOUT) -> (D3D12_BARRIER_LAYOU
 /// `h_list` must be a live command-list handle and `barriers`, when
 /// `num_barriers` is non-zero, must point at `num_barriers` live
 /// `D3D12DDIARG_BARRIER_0094`s.
-unsafe extern "C" fn barrier(
+unsafe extern "system" fn barrier(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     num_barriers: ddi12::UINT32,
     barriers: *const ddi12::D3D12DDIARG_BARRIER_0094,
@@ -2110,7 +2110,7 @@ unsafe fn query_edge(
 ///
 /// # Safety
 /// As [`query_edge`].
-unsafe extern "C" fn begin_query(
+unsafe extern "system" fn begin_query(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_heap: ddi12::D3D12DDI_HQUERYHEAP,
     query_type: ddi12::D3D12DDI_QUERY_TYPE,
@@ -2127,7 +2127,7 @@ unsafe extern "C" fn begin_query(
 ///
 /// # Safety
 /// As [`query_edge`].
-unsafe extern "C" fn end_query(
+unsafe extern "system" fn end_query(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_heap: ddi12::D3D12DDI_HQUERYHEAP,
     query_type: ddi12::D3D12DDI_QUERY_TYPE,
@@ -2142,7 +2142,7 @@ unsafe extern "C" fn end_query(
 /// # Safety
 /// `h_list` must be a live command-list handle, `h_heap` a live handle from
 /// `fence::create_query_heap`, and `h_destination_buffer` a live resource handle.
-unsafe extern "C" fn resolve_query_data(
+unsafe extern "system" fn resolve_query_data(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_heap: ddi12::D3D12DDI_HQUERYHEAP,
     query_type: ddi12::D3D12DDI_QUERY_TYPE,
@@ -2234,7 +2234,7 @@ unsafe extern "C" fn resolve_query_data(
 /// # Safety
 /// `h_list` must be a live command-list handle and `h_buffer`, when its private
 /// word is non-null, a live resource handle this driver created.
-unsafe extern "C" fn set_predication(
+unsafe extern "system" fn set_predication(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_buffer: ddi12::D3D12DDI_HRESOURCE,
     aligned_buffer_offset: ddi12::UINT64,

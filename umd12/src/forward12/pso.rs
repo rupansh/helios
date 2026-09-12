@@ -549,7 +549,7 @@ fn note_library_reference(reference: &ddi12::D3D12DDI_LIBRARY_REFERENCE_0010) {
 /// # Safety
 /// Trivially safe: no argument is dereferenced. `unsafe` because the DDI typedef
 /// is.
-unsafe extern "C" fn calc_private_element_layout_size(
+unsafe extern "system" fn calc_private_element_layout_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATEELEMENTLAYOUT_0010,
 ) -> ddi12::SIZE_T {
@@ -573,7 +573,7 @@ const MAX_INPUT_ELEMENTS: usize = 512;
 /// `arg`, when non-null, must point at a live `D3D12DDIARG_CREATEELEMENTLAYOUT_0010`
 /// whose `pVertexElements` addresses `NumElements` live descs, and `h_layout`
 /// must carry the machine word `pfnCalcPrivateElementLayoutSize` sized.
-unsafe extern "C" fn create_element_layout(
+unsafe extern "system" fn create_element_layout(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATEELEMENTLAYOUT_0010,
     h_layout: ddi12::D3D12DDI_HELEMENTLAYOUT,
@@ -643,7 +643,7 @@ unsafe extern "C" fn create_element_layout(
 /// # Safety
 /// `h_layout` must be a handle [`create_element_layout`] stored into, destroyed
 /// at most once.
-unsafe extern "C" fn destroy_element_layout(
+unsafe extern "system" fn destroy_element_layout(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_layout: ddi12::D3D12DDI_HELEMENTLAYOUT,
 ) {
@@ -659,7 +659,7 @@ unsafe extern "C" fn destroy_element_layout(
 ///
 /// # Safety
 /// As [`calc_private_element_layout_size`].
-unsafe extern "C" fn calc_private_blend_state_size(
+unsafe extern "system" fn calc_private_blend_state_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _desc: *const ddi12::D3D12DDI_BLEND_DESC_0010,
 ) -> ddi12::SIZE_T {
@@ -671,7 +671,7 @@ unsafe extern "C" fn calc_private_blend_state_size(
 /// # Safety
 /// `desc`, when non-null, must point at a live `D3D12DDI_BLEND_DESC_0010`, and
 /// `h_blend` must carry the machine word the paired calc-size sized.
-unsafe extern "C" fn create_blend_state(
+unsafe extern "system" fn create_blend_state(
     h_device: ddi12::D3D12DDI_HDEVICE,
     desc: *const ddi12::D3D12DDI_BLEND_DESC_0010,
     h_blend: ddi12::D3D12DDI_HBLENDSTATE,
@@ -739,7 +739,7 @@ unsafe extern "C" fn create_blend_state(
 ///
 /// # Safety
 /// As [`destroy_element_layout`].
-unsafe extern "C" fn destroy_blend_state(
+unsafe extern "system" fn destroy_blend_state(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_blend: ddi12::D3D12DDI_HBLENDSTATE,
 ) {
@@ -754,7 +754,7 @@ unsafe extern "C" fn destroy_blend_state(
 ///
 /// # Safety
 /// As [`calc_private_element_layout_size`].
-unsafe extern "C" fn calc_private_depth_stencil_state_size(
+unsafe extern "system" fn calc_private_depth_stencil_state_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _desc: *const ddi12::D3D12DDI_DEPTH_STENCIL_DESC_0095,
 ) -> ddi12::SIZE_T {
@@ -794,7 +794,7 @@ fn stencil_op(
 /// # Safety
 /// `desc`, when non-null, must point at a live `D3D12DDI_DEPTH_STENCIL_DESC_0095`,
 /// and `h_ds` must carry the machine word the paired calc-size sized.
-unsafe extern "C" fn create_depth_stencil_state(
+unsafe extern "system" fn create_depth_stencil_state(
     h_device: ddi12::D3D12DDI_HDEVICE,
     desc: *const ddi12::D3D12DDI_DEPTH_STENCIL_DESC_0095,
     h_ds: ddi12::D3D12DDI_HDEPTHSTENCILSTATE,
@@ -865,7 +865,7 @@ unsafe extern "C" fn create_depth_stencil_state(
 ///
 /// # Safety
 /// As [`destroy_element_layout`].
-unsafe extern "C" fn destroy_depth_stencil_state(
+unsafe extern "system" fn destroy_depth_stencil_state(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_ds: ddi12::D3D12DDI_HDEPTHSTENCILSTATE,
 ) {
@@ -880,7 +880,7 @@ unsafe extern "C" fn destroy_depth_stencil_state(
 ///
 /// # Safety
 /// As [`calc_private_element_layout_size`].
-unsafe extern "C" fn calc_private_rasterizer_state_size(
+unsafe extern "system" fn calc_private_rasterizer_state_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _desc: *const ddi12::D3D12DDI_RASTERIZER_DESC_0102,
 ) -> ddi12::SIZE_T {
@@ -904,7 +904,7 @@ unsafe extern "C" fn calc_private_rasterizer_state_size(
 /// # Safety
 /// `desc`, when non-null, must point at a live `D3D12DDI_RASTERIZER_DESC_0102`,
 /// and `h_rs` must carry the machine word the paired calc-size sized.
-unsafe extern "C" fn create_rasterizer_state(
+unsafe extern "system" fn create_rasterizer_state(
     h_device: ddi12::D3D12DDI_HDEVICE,
     desc: *const ddi12::D3D12DDI_RASTERIZER_DESC_0102,
     h_rs: ddi12::D3D12DDI_HRASTERIZERSTATE,
@@ -975,7 +975,7 @@ unsafe extern "C" fn create_rasterizer_state(
 ///
 /// # Safety
 /// As [`destroy_element_layout`].
-unsafe extern "C" fn destroy_rasterizer_state(
+unsafe extern "system" fn destroy_rasterizer_state(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_rs: ddi12::D3D12DDI_HRASTERIZERSTATE,
 ) {
@@ -1012,7 +1012,7 @@ const MAX_DESCRIPTOR_RANGES: usize = 4096;
 ///
 /// # Safety
 /// As [`calc_private_element_layout_size`].
-unsafe extern "C" fn calc_private_root_signature_size(
+unsafe extern "system" fn calc_private_root_signature_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATE_ROOT_SIGNATURE_0100,
 ) -> ddi12::SIZE_T {
@@ -1291,7 +1291,7 @@ const MAX_ROOT_SIGNATURE_BLOB: usize = 1 << 20;
 /// `arg`, when non-null, must point at a live
 /// `D3D12DDIARG_CREATE_ROOT_SIGNATURE_0100`, and `h_rs` must carry the machine
 /// word `pfnCalcPrivateRootSignatureSize` sized.
-unsafe extern "C" fn create_root_signature(
+unsafe extern "system" fn create_root_signature(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_ROOT_SIGNATURE_0100,
     h_rs: ddi12::D3D12DDI_HROOTSIGNATURE,
@@ -1428,7 +1428,7 @@ unsafe extern "C" fn create_root_signature(
 /// # Safety
 /// `h_rs` must be a handle [`create_root_signature`] stored into, destroyed at
 /// most once.
-unsafe extern "C" fn destroy_root_signature(
+unsafe extern "system" fn destroy_root_signature(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_rs: ddi12::D3D12DDI_HROOTSIGNATURE,
 ) {
@@ -1451,18 +1451,12 @@ unsafe extern "C" fn destroy_root_signature(
 /// comment.** vkd3d reads each subobject as `struct { TYPE type; T data; }` with
 /// **natural** C alignment and then advances by
 /// `align(sizeof(*subobject), sizeof(void*))` (`libs/vkd3d/state.c:2477-2493`).
-/// `#[repr(C, align(8))]` reproduces exactly that: the attribute does not move
-/// `data` — which stays at `align_up(4, align_of::<T>())`, the natural C offset
-/// — and it rounds the struct's SIZE up to the pointer-size multiple the reader
-/// steps by. The assertions below pin both halves.
-///
-/// ⭐ And the consequence that makes [`GraphicsStream`] safe to write as a plain
-/// `#[repr(C)]` struct rather than a hand-packed byte buffer: a type's size is
-/// always a multiple of its alignment, so every `Sub<T>` is a multiple of 8
-/// long, so a `#[repr(C)]` sequence of them has **no interior padding** and each
-/// subobject begins exactly where the reader's `align(…, sizeof(void*))` step
-/// says it does.
-#[repr(C, align(8))]
+/// Each record has at least pointer alignment while its payload retains natural
+/// C alignment. This reproduces that stride on both x86 and x64; always using
+/// align(8) inserts extra bytes between x86 subobjects and corrupts the stream.
+#[repr(C)]
+#[cfg_attr(target_pointer_width = "64", repr(align(8)))]
+#[cfg_attr(target_pointer_width = "32", repr(align(4)))]
 struct Sub<T> {
     ty: D3D12_PIPELINE_STATE_SUBOBJECT_TYPE,
     data: T,
@@ -1474,23 +1468,14 @@ impl<T> Sub<T> {
     }
 }
 
-// The two representative cases, one payload with 4-byte alignment and one with
-// 8. If either rule broke, every subobject after the first would be read from
-// the wrong offset — silently, because the type tag of the *next* subobject
-// would be whatever byte happened to be there.
-const _: () = assert!(
-    core::mem::offset_of!(Sub<u32>, data) == 4 && core::mem::size_of::<Sub<u32>>() == 8,
-    "a 4-byte-aligned subobject payload sits at offset 4 and the record is pointer-size padded"
-);
-const _: () = assert!(
-    core::mem::offset_of!(Sub<D3D12_SHADER_BYTECODE>, data) == 8
-        && core::mem::size_of::<Sub<D3D12_SHADER_BYTECODE>>().is_multiple_of(8),
-    "an 8-byte-aligned subobject payload sits at offset 8 and the record is pointer-size padded"
-);
-const _: () = assert!(
-    core::mem::size_of::<*mut c_void>() == 8,
-    "the subobject stride rule above is `sizeof(void*)`, hard-coded as align(8)"
-);
+// Pin the payload offset and pointer-rounded stride against vkd3d's parser.
+const _: () = {
+    const WORD: usize = core::mem::size_of::<usize>();
+    assert!(core::mem::offset_of!(Sub<u32>, data) == 4);
+    assert!(core::mem::size_of::<Sub<u32>>() == 8);
+    assert!(core::mem::offset_of!(Sub<D3D12_SHADER_BYTECODE>, data) == WORD);
+    assert!(core::mem::size_of::<Sub<D3D12_SHADER_BYTECODE>>() == 3 * WORD);
+};
 
 /// The graphics/mesh pipeline stream, in the order vkd3d's parser will walk it.
 ///
@@ -1537,6 +1522,43 @@ struct GraphicsStream {
     view_instancing: Sub<D3D12_VIEW_INSTANCING_DESC>,
     flags: Sub<D3D12_PIPELINE_STATE_FLAGS>,
 }
+
+// The consumer advances by each record's pointer-rounded size. Verify every
+// boundary so a newly added payload with stronger alignment cannot introduce
+// invisible padding between records, particularly in the x86 stream.
+const _: () = {
+    let records = [
+        (core::mem::offset_of!(GraphicsStream, root_signature), core::mem::size_of::<Sub<*mut c_void>>()),
+        (core::mem::offset_of!(GraphicsStream, vs), core::mem::size_of::<Sub<D3D12_SHADER_BYTECODE>>()),
+        (core::mem::offset_of!(GraphicsStream, ps), core::mem::size_of::<Sub<D3D12_SHADER_BYTECODE>>()),
+        (core::mem::offset_of!(GraphicsStream, ds), core::mem::size_of::<Sub<D3D12_SHADER_BYTECODE>>()),
+        (core::mem::offset_of!(GraphicsStream, hs), core::mem::size_of::<Sub<D3D12_SHADER_BYTECODE>>()),
+        (core::mem::offset_of!(GraphicsStream, gs), core::mem::size_of::<Sub<D3D12_SHADER_BYTECODE>>()),
+        (core::mem::offset_of!(GraphicsStream, amplification), core::mem::size_of::<Sub<D3D12_SHADER_BYTECODE>>()),
+        (core::mem::offset_of!(GraphicsStream, mesh), core::mem::size_of::<Sub<D3D12_SHADER_BYTECODE>>()),
+        (core::mem::offset_of!(GraphicsStream, blend), core::mem::size_of::<Sub<D3D12_BLEND_DESC>>()),
+        (core::mem::offset_of!(GraphicsStream, sample_mask), core::mem::size_of::<Sub<u32>>()),
+        (core::mem::offset_of!(GraphicsStream, rasterizer), core::mem::size_of::<Sub<D3D12_RASTERIZER_DESC2>>()),
+        (core::mem::offset_of!(GraphicsStream, depth_stencil), core::mem::size_of::<Sub<D3D12_DEPTH_STENCIL_DESC2>>()),
+        (core::mem::offset_of!(GraphicsStream, input_layout), core::mem::size_of::<Sub<D3D12_INPUT_LAYOUT_DESC>>()),
+        (core::mem::offset_of!(GraphicsStream, ib_strip_cut), core::mem::size_of::<Sub<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>>()),
+        (core::mem::offset_of!(GraphicsStream, topology), core::mem::size_of::<Sub<D3D12_PRIMITIVE_TOPOLOGY_TYPE>>()),
+        (core::mem::offset_of!(GraphicsStream, rtv_formats), core::mem::size_of::<Sub<D3D12_RT_FORMAT_ARRAY>>()),
+        (core::mem::offset_of!(GraphicsStream, dsv_format), core::mem::size_of::<Sub<DXGI_FORMAT>>()),
+        (core::mem::offset_of!(GraphicsStream, sample_desc), core::mem::size_of::<Sub<DXGI_SAMPLE_DESC>>()),
+        (core::mem::offset_of!(GraphicsStream, node_mask), core::mem::size_of::<Sub<u32>>()),
+        (core::mem::offset_of!(GraphicsStream, view_instancing), core::mem::size_of::<Sub<D3D12_VIEW_INSTANCING_DESC>>()),
+        (core::mem::offset_of!(GraphicsStream, flags), core::mem::size_of::<Sub<D3D12_PIPELINE_STATE_FLAGS>>()),
+    ];
+    let mut offset = 0;
+    let mut i = 0;
+    while i < records.len() {
+        assert!(records[i].0 == offset);
+        offset += records[i].1;
+        i += 1;
+    }
+    assert!(offset == core::mem::size_of::<GraphicsStream>());
+};
 
 /// An empty bytecode: `BytecodeLength == 0` is how vkd3d decides a stage is
 /// absent (`vkd3d_pipeline_state_desc_get_shader_stages`, `state.c:2497-2521`).
@@ -1624,7 +1646,7 @@ unsafe fn bytecode_of(
 ///
 /// # Safety
 /// As [`calc_private_element_layout_size`].
-unsafe extern "C" fn calc_private_pipeline_state_size(
+unsafe extern "system" fn calc_private_pipeline_state_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATE_PIPELINE_STATE_0099,
 ) -> ddi12::SIZE_T {
@@ -1651,7 +1673,7 @@ unsafe extern "C" fn calc_private_pipeline_state_size(
 /// `D3D12DDIARG_CREATE_PIPELINE_STATE_0099` whose handles are live for the call,
 /// and `h_pso` must carry the machine word
 /// `pfnCalcPrivatePipelineStateSize` sized.
-unsafe extern "C" fn create_pipeline_state(
+unsafe extern "system" fn create_pipeline_state(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_PIPELINE_STATE_0099,
     h_pso: ddi12::D3D12DDI_HPIPELINESTATE,
@@ -2195,7 +2217,7 @@ unsafe fn view_instance_locations(
 /// # Safety
 /// `h_pso` must be a handle [`create_pipeline_state`] stored into, destroyed at
 /// most once.
-unsafe extern "C" fn destroy_pipeline_state(
+unsafe extern "system" fn destroy_pipeline_state(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_pso: ddi12::D3D12DDI_HPIPELINESTATE,
 ) {
@@ -2245,7 +2267,7 @@ unsafe extern "C" fn destroy_pipeline_state(
 ///
 /// # Safety
 /// As [`calc_private_element_layout_size`].
-unsafe extern "C" fn calc_private_pipeline_library_size(
+unsafe extern "system" fn calc_private_pipeline_library_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATE_PIPELINE_LIBRARY_0010,
 ) -> ddi12::SIZE_T {
@@ -2257,7 +2279,7 @@ unsafe extern "C" fn calc_private_pipeline_library_size(
 /// # Safety
 /// `h_library`'s `pDrvPrivate`, when non-null, must address the machine word
 /// [`calc_private_pipeline_library_size`] sized.
-unsafe extern "C" fn create_pipeline_library(
+unsafe extern "system" fn create_pipeline_library(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATE_PIPELINE_LIBRARY_0010,
     h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
@@ -2279,7 +2301,7 @@ unsafe extern "C" fn create_pipeline_library(
 ///
 /// # Safety
 /// Trivially safe: the handle is not dereferenced.
-unsafe extern "C" fn destroy_pipeline_library(
+unsafe extern "system" fn destroy_pipeline_library(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
 ) {
@@ -2290,7 +2312,7 @@ unsafe extern "C" fn destroy_pipeline_library(
 ///
 /// # Safety
 /// Trivially safe: no handle is dereferenced.
-unsafe extern "C" fn add_pipeline_state_to_library(
+unsafe extern "system" fn add_pipeline_state_to_library(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
     _h_pipeline_state: ddi12::D3D12DDI_HPIPELINESTATE,
@@ -2308,7 +2330,7 @@ unsafe extern "C" fn add_pipeline_state_to_library(
 ///
 /// # Safety
 /// Trivially safe: no handle is dereferenced.
-unsafe extern "C" fn calc_serialized_library_size(
+unsafe extern "system" fn calc_serialized_library_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
 ) -> ddi12::SIZE_T {
@@ -2321,7 +2343,7 @@ unsafe extern "C" fn calc_serialized_library_size(
 /// # Safety
 /// Trivially safe: `p_blob` is not dereferenced, which is the whole of the
 /// refusal.
-unsafe extern "C" fn serialize_library(
+unsafe extern "system" fn serialize_library(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _h_library: ddi12::D3D12DDI_HPIPELINELIBRARY,
     _p_blob: *mut c_void,

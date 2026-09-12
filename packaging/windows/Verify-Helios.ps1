@@ -6,6 +6,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "Helios-PackageCommon.ps1")
+if (-not [Environment]::Is64BitProcess) {
+    throw "Run this script with native 64-bit PowerShell to manage both registry views and system directories."
+}
 
 $statePath = Join-Path $env:ProgramData "Helios\install-state.json"
 if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
@@ -49,6 +52,55 @@ try {
     }
 } catch {
     $failures.Add($_.Exception.Message)
+}
+
+# Registration is indexed by API version, independently for AMD64 and WoW64.
+# Windows loads an absolute DriverStore path from each slot; validate both the
+# selected architecture and installed bytes against the bundle's recorded hash.
+$driverDirectories = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($registration in @(
+    @{ name = "UserModeDriverName"; architecture = "x64"; files = @("helios_umd.dll", "helios_umd.dll", "helios_umd.dll", "helios_umd12.dll") },
+    @{ name = "UserModeDriverNameWoW"; architecture = "x86"; files = @("helios_umd32.dll", "helios_umd32.dll", "helios_umd32.dll", "helios_umd12_32.dll") }
+)) {
+    try {
+        if (-not $classKey) { throw "No display software key for $($registration.name)." }
+        $key = Get-Item -LiteralPath $classKey
+        $paths = @($key.GetValue($registration.name, $null))
+        if ($key.GetValueKind($registration.name) -ne [Microsoft.Win32.RegistryValueKind]::MultiString -or $paths.Count -ne 4) {
+            throw "$($registration.name) must have four REG_MULTI_SZ API slots."
+        }
+        for ($slot = 0; $slot -lt 4; $slot++) {
+            $path = [string]$paths[$slot]
+            if (-not [IO.Path]::IsPathRooted($path) -or [IO.Path]::GetFileName($path) -ine $registration.files[$slot]) {
+                throw "$($registration.name) slot $slot does not select $($registration.files[$slot]): $path"
+            }
+            Assert-HeliosPeArchitecture $path $registration.architecture
+            [void]$driverDirectories.Add((Split-Path -Parent $path))
+        }
+        Write-Host "Direct3D 11/12 $($registration.architecture): registered and architecture checked."
+    } catch { $failures.Add($_.Exception.Message) }
+}
+if ($driverDirectories.Count -ne 1) {
+    $failures.Add("The native and WoW64 UMDs must belong to one DriverStore package.")
+} elseif (-not $state.PSObject.Properties["driverFiles"] -or @($state.driverFiles).Count -ne 5) {
+    $failures.Add("Installation state is missing the five driver-image hashes; reinstall this bundle.")
+} else {
+    $driverDirectory = @($driverDirectories)[0]
+    foreach ($entry in @($state.driverFiles)) {
+        try {
+            $path = Join-Path $driverDirectory ([string]$entry.name)
+            if ((Get-HeliosSha256 $path) -ne ([string]$entry.sha256).ToUpperInvariant()) {
+                $failures.Add("Installed driver hash mismatch: $path")
+            }
+        } catch { $failures.Add($_.Exception.Message) }
+    }
+}
+if ($classKey) {
+    $installedDrivers = @((Get-Item -LiteralPath $classKey).GetValue("InstalledDisplayDrivers", $null))
+    $expectedDrivers = @("helios_umd", "helios_umd12", "helios_umd32", "helios_umd12_32")
+    if ($installedDrivers.Count -ne 4 -or (Compare-Object $expectedDrivers $installedDrivers)) {
+        $failures.Add("InstalledDisplayDrivers does not list all four distinct Helios UMDs.")
+    }
 }
 
 $vulkanRegistry = "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers"
@@ -99,6 +151,7 @@ if ($RunSmokeTests) {
             exe = "opencl-gl-sharing-smoke.exe"
             arguments = @("rgba16f", "d3d11-context")
         },
+        [ordered]@{ name = "Direct3D 11 x86"; exe = "x86\d3d11-smoke.exe"; arguments = @() },
         [ordered]@{ name = "Vulkan x86"; exe = "x86\vulkan-smoke.exe"; arguments = @() },
         [ordered]@{ name = "Vulkan WSI x86"; exe = "x86\vulkan-wsi-probe.exe"; arguments = @() },
         [ordered]@{ name = "OpenGL x86"; exe = "x86\opengl-smoke.exe"; arguments = @() }
@@ -107,15 +160,30 @@ if ($RunSmokeTests) {
     $dx12Disabled = $heliosKey -and ($null -ne $heliosKey.GetValue("UmdD3D12", $null)) -and
         ($heliosKey.GetValueKind("UmdD3D12") -eq [Microsoft.Win32.RegistryValueKind]::DWord) -and
         ($heliosKey.GetValue("UmdD3D12") -eq 0)
-    $tests += [ordered]@{
-        name = if ($dx12Disabled) { "Direct3D 12 explicit disable" } else { "Direct3D 12" }
-        exe = "d3d12-smoke.exe"
-        arguments = @("--expect", $(if ($dx12Disabled) { "fail" } else { "ok" }))
+    foreach ($architecture in @("x64", "x86")) {
+        $prefix = if ($architecture -eq "x86") { "x86\" } else { "" }
+        $tests += [ordered]@{
+            name = if ($dx12Disabled) { "Direct3D 12 $architecture explicit disable" } else { "Direct3D 12 $architecture" }
+            exe = "${prefix}d3d12-smoke.exe"
+            arguments = @("--expect", $(if ($dx12Disabled) { "fail" } else { "ok" }))
+        }
+        if (-not $dx12Disabled) {
+            $tests += [ordered]@{
+                name = "Direct3D 12 $architecture clear/readback"
+                exe = "${prefix}d3d12-clear.exe"
+                arguments = @("--expect", "ok")
+            }
+        }
     }
     foreach ($test in $tests) {
         $executable = Join-Path $smokeRoot $test.exe
         if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
             $failures.Add("$($test.name) smoke probe is not present in this bundle.")
+            continue
+        }
+        $architecture = if ($test.exe.StartsWith("x86\")) { "x86" } else { "x64" }
+        try { Assert-HeliosPeArchitecture $executable $architecture } catch {
+            $failures.Add($_.Exception.Message)
             continue
         }
         Write-Host "Running $($test.name) smoke probe..."
@@ -129,4 +197,4 @@ if ($failures.Count -gt 0) {
     foreach ($failure in $failures) { Write-Error $failure -ErrorAction Continue }
     throw "Helios verification failed with $($failures.Count) problem(s)."
 }
-Write-Host "Helios x64/WoW64 Vulkan and OpenGL, Direct3D 11, and OpenCL registrations are healthy."
+Write-Host "Helios x64/WoW64 Direct3D 11/12, Vulkan and OpenGL, and x64 OpenCL registrations and files are healthy."

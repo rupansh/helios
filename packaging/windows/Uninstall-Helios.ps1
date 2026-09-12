@@ -6,6 +6,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "Helios-PackageCommon.ps1")
+if (-not [Environment]::Is64BitProcess) {
+    throw "Run this script with native 64-bit PowerShell to manage both registry views and system directories."
+}
 
 Assert-HeliosAdministrator
 $stateRoot = Join-Path $env:ProgramData "Helios"
@@ -74,7 +77,16 @@ $driverRemovalFailed = $false
 if (-not $KeepDriver -and [string]$state.activeInf) {
     Write-Host "Removing driver package $($state.activeInf)..."
     try {
-        Invoke-HeliosNative "pnputil.exe" @("/delete-driver", [string]$state.activeInf, "/uninstall", "/force")
+        $publishedInfPath = Join-Path $env:windir "INF\$($state.activeInf)"
+        $published = Test-Path -LiteralPath $publishedInfPath -PathType Leaf
+        $hasInfHash = $state.PSObject.Properties["activeInfSha256"] -and $state.activeInfSha256
+        if ($published -and $hasInfHash -and (Get-HeliosSha256 $publishedInfPath) -ine $state.activeInfSha256) {
+            Write-Host "Keeping $($state.activeInf): that published name now belongs to another package."
+        } elseif ($published) {
+            Invoke-HeliosNative "pnputil.exe" @("/delete-driver", [string]$state.activeInf, "/uninstall", "/force")
+        } else {
+            Write-Host "Package $($state.activeInf) is already unpublished; completing saved rollback cleanup."
+        }
     } catch {
         $driverRemovalFailed = $true
         Write-Warning "Driver removal did not complete: $($_.Exception.Message)"
@@ -83,6 +95,24 @@ if (-not $KeepDriver -and [string]$state.activeInf) {
 } elseif (-not $KeepDriver) {
     $driverRemovalFailed = $true
     Write-Warning "The installed OEM INF name was not recorded, so the driver and test certificate were kept."
+}
+
+if (-not $KeepDriver -and -not $driverRemovalFailed) {
+    try {
+        $currentInstanceId = Get-HeliosDeviceInstanceId
+        $currentInf = Get-HeliosActiveInf $currentInstanceId
+        $currentInfPath = if ($currentInf) { Join-Path $env:windir "INF\$currentInf" } else { "" }
+        $currentInfHash = if ($currentInfPath -and (Test-Path -LiteralPath $currentInfPath -PathType Leaf)) { Get-HeliosSha256 $currentInfPath } else { "" }
+        if ($currentInf -ieq [string]$state.activeInf -and
+            (-not $currentInfHash -or -not $hasInfHash -or $currentInfHash -ieq $state.activeInfSha256)) {
+            throw "PnP still selects the package being removed; retry uninstall after the required restart."
+        }
+        $currentClassKey = Get-HeliosDisplayClassKey $currentInstanceId
+        Restore-HeliosDirect3DAfterRemoval $state $currentInf $currentClassKey $currentInfHash
+    } catch {
+        $driverRemovalFailed = $true
+        Write-Warning "Direct3D rollback did not complete; retaining the install state for retry: $($_.Exception.Message)"
+    }
 }
 
 if ($RemoveKhronosLoaders) {

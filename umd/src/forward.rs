@@ -237,7 +237,7 @@ pub(super) use crate::hr::{DXGI_ERROR_UNSUPPORTED, E_FAIL, E_INVALIDARG, E_OUTOF
 /// frees can then be reused by an unrelated device.
 ///
 /// This is a runtime-guarded REFUSAL, not a proof: a compile-time lifetime is
-/// not achievable across the `extern "C"` export boundary, and the ICD may
+/// not achievable across the `extern "system"` export boundary, and the ICD may
 /// still call on a thread whose device dies between the check and the
 /// dereference. Deliberately NOT a global epoch bumped on any destroy — a
 /// stale-epoch refusal returns -1, which the ICD reads as "no gate" and then

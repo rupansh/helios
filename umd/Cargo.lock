@@ -250,6 +250,7 @@ dependencies = [
  "cxx-build",
  "helios_protocol",
  "helios_umd_common",
+ "syn",
  "windows",
 ]
 

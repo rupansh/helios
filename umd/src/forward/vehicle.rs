@@ -50,7 +50,7 @@ pub struct PresentSource {
 /// Every exit now has to name a next state.
 ///
 /// `Copy` on purpose: a `Cell` cannot panic, where a `RefCell` can double-borrow
-/// — and these are reached from `extern "C"` exports under `panic = "abort"`.
+/// — and these are reached from `extern "system"` exports under `panic = "abort"`.
 #[derive(Clone, Copy)]
 pub(crate) enum VehicleSlot {
     Idle,

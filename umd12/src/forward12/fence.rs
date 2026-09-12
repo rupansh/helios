@@ -204,7 +204,7 @@ pub(crate) unsafe fn engine_query_heap(
 /// # Safety
 /// `arg`, when non-null, must point at a live `D3D12DDIARG_CREATE_FENCE` for the
 /// duration of the call.
-unsafe extern "C" fn calc_private_fence_size(
+unsafe extern "system" fn calc_private_fence_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_FENCE,
 ) -> ddi12::SIZE_T {
@@ -227,7 +227,7 @@ unsafe extern "C" fn calc_private_fence_size(
 /// `pDrvPrivate` must address the private block [`calc_private_fence_size`]
 /// sized; `arg` must point at a live `D3D12DDIARG_CREATE_FENCE` whose `Fences`
 /// addresses `FenceCount` readable `D3D12DDI_FENCE`s for the call.
-unsafe extern "C" fn create_fence(
+unsafe extern "system" fn create_fence(
     h_device: ddi12::D3D12DDI_HDEVICE,
     h_fence: ddi12::D3D12DDI_HFENCE,
     arg: *const ddi12::D3D12DDIARG_CREATE_FENCE,
@@ -316,7 +316,7 @@ unsafe extern "C" fn create_fence(
 /// # Safety
 /// `h_fence` must be a handle [`create_fence`] returned `S_OK` for and which has
 /// not already been destroyed.
-unsafe extern "C" fn destroy_fence(
+unsafe extern "system" fn destroy_fence(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_fence: ddi12::D3D12DDI_HFENCE,
 ) {
@@ -375,7 +375,7 @@ fn engine_query_heap_type(t: ddi12::D3D12DDI_QUERY_HEAP_TYPE) -> Option<D3D12_QU
 /// # Safety
 /// `arg`, when non-null, must point at a live
 /// `D3D12DDIARG_CREATE_QUERY_HEAP_0001` for the duration of the call.
-unsafe extern "C" fn calc_private_query_heap_size(
+unsafe extern "system" fn calc_private_query_heap_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_QUERY_HEAP_0001,
 ) -> ddi12::SIZE_T {
@@ -393,7 +393,7 @@ unsafe extern "C" fn calc_private_query_heap_size(
 /// point at a live `D3D12DDIARG_CREATE_QUERY_HEAP_0001`; `h_heap`'s
 /// `pDrvPrivate` must address the private block
 /// [`calc_private_query_heap_size`] sized.
-unsafe extern "C" fn create_query_heap(
+unsafe extern "system" fn create_query_heap(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_QUERY_HEAP_0001,
     h_heap: ddi12::D3D12DDI_HQUERYHEAP,
@@ -481,7 +481,7 @@ unsafe extern "C" fn create_query_heap(
 /// # Safety
 /// `h_heap` must be a handle [`create_query_heap`] returned `S_OK` for and which
 /// has not already been destroyed.
-unsafe extern "C" fn destroy_query_heap(
+unsafe extern "system" fn destroy_query_heap(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_heap: ddi12::D3D12DDI_HQUERYHEAP,
 ) {

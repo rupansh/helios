@@ -29,6 +29,8 @@ windows = { version = "0.58", features = [
 
 [build-dependencies]
 cxx-build = "1"
+# Parse bindgen output structurally even when rustfmt is not installed.
+syn = { version = "2", features = ["full"] }
 # ⭐ 0.70 -> 0.72 on 2026-09-05, forced by the installed libclang being 22.1.8.
 #
 # Under libclang 22, bindgen 0.70 binds the FORWARD DECLARATION instead of the

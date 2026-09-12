@@ -139,7 +139,7 @@ pub(crate) fn feature_profile() -> &'static FeatureProfile {
     }
 }
 
-pub(crate) unsafe extern "C" fn get_caps(
+pub(crate) unsafe extern "system" fn get_caps(
     _h_adapter: ddi::D3D10DDI_HADAPTER,
     args: *const ddi::D3D10_2DDIARG_GETCAPS,
 ) -> Hresult {

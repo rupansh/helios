@@ -7,7 +7,7 @@ use super::*;
 
 // --- Copy / Map / Flush -----------------------------------------------------
 
-pub(crate) unsafe extern "C" fn resource_copy(
+pub(crate) unsafe extern "system" fn resource_copy(
     h: Hdevice,
     h_dst: ddi::D3D10DDI_HRESOURCE,
     h_src: ddi::D3D10DDI_HRESOURCE,
@@ -38,7 +38,7 @@ pub(crate) unsafe extern "C" fn resource_copy(
     context.CopyResource(&*dst, &*src);
 }
 
-pub(crate) unsafe extern "C" fn resource_copy_region(
+pub(crate) unsafe extern "system" fn resource_copy_region(
     h: Hdevice,
     h_dst: ddi::D3D10DDI_HRESOURCE,
     dst_subresource: u32,
@@ -120,7 +120,7 @@ pub(crate) unsafe extern "C" fn resource_copy_region(
     );
 }
 
-pub(crate) unsafe extern "C" fn resource_copy_region_11_1(
+pub(crate) unsafe extern "system" fn resource_copy_region_11_1(
     h: Hdevice,
     h_dst: ddi::D3D10DDI_HRESOURCE,
     dst_subresource: u32,
@@ -145,7 +145,7 @@ pub(crate) unsafe extern "C" fn resource_copy_region_11_1(
     );
 }
 
-pub(crate) unsafe extern "C" fn resource_resolve_subresource(
+pub(crate) unsafe extern "system" fn resource_resolve_subresource(
     h: Hdevice,
     h_dst: ddi::D3D10DDI_HRESOURCE,
     dst_subresource: u32,
@@ -171,7 +171,7 @@ pub(crate) unsafe extern "C" fn resource_resolve_subresource(
 /// Returns 0 = "not busy", unconditionally. That is a semantic CLAIM the
 /// runtime acts on, not a no-op: an app polling this to avoid a stalling Map is
 /// told the staging resource is always free. Counted, behaviour unchanged. R911.
-pub(crate) unsafe extern "C" fn resource_is_staging_busy(
+pub(crate) unsafe extern "system" fn resource_is_staging_busy(
     _h: Hdevice,
     _h_resource: ddi::D3D10DDI_HRESOURCE,
 ) -> i32 {
@@ -179,7 +179,7 @@ pub(crate) unsafe extern "C" fn resource_is_staging_busy(
     0
 }
 
-pub(crate) unsafe extern "C" fn resource_map(
+pub(crate) unsafe extern "system" fn resource_map(
     h: Hdevice,
     h_resource: ddi::D3D10DDI_HRESOURCE,
     subresource: u32,
@@ -242,7 +242,7 @@ pub(crate) unsafe extern "C" fn resource_map(
 /// its life on `ddi_noop_device`, a stub that returns without touching the
 /// caller's `D3D10DDI_MAPPED_SUBRESOURCE` even though filling it is this
 /// slot's entire job.
-pub(crate) unsafe extern "C" fn dynamic_cb_map_no_overwrite(
+pub(crate) unsafe extern "system" fn dynamic_cb_map_no_overwrite(
     h: Hdevice,
     h_resource: ddi::D3D10DDI_HRESOURCE,
     subresource: u32,
@@ -261,7 +261,7 @@ pub(crate) unsafe extern "C" fn dynamic_cb_map_no_overwrite(
     resource_map(h, h_resource, subresource, map_type, map_flags, mapped);
 }
 
-pub(crate) unsafe extern "C" fn resource_unmap(
+pub(crate) unsafe extern "system" fn resource_unmap(
     h: Hdevice,
     h_resource: ddi::D3D10DDI_HRESOURCE,
     subresource: u32,
@@ -278,7 +278,7 @@ pub(crate) unsafe extern "C" fn resource_unmap(
 // DXVK tracks read-after-write hazards itself from the barrier state it already
 // maintains, so forwarding these adds nothing -- but "we deliberately do nothing
 // here" and "nobody ever wired this up" were the same empty body. R911.
-pub(crate) unsafe extern "C" fn srv_read_after_write_hazard(
+pub(crate) unsafe extern "system" fn srv_read_after_write_hazard(
     _h: Hdevice,
     _srv: ddi::D3D10DDI_HSHADERRESOURCEVIEW,
     _resource: ddi::D3D10DDI_HRESOURCE,
@@ -286,25 +286,25 @@ pub(crate) unsafe extern "C" fn srv_read_after_write_hazard(
     note_ddi_refusal(&DDI_REFUSALS.srv_raw_hazard);
 }
 
-pub(crate) unsafe extern "C" fn resource_read_after_write_hazard(
+pub(crate) unsafe extern "system" fn resource_read_after_write_hazard(
     _h: Hdevice,
     _resource: ddi::D3D10DDI_HRESOURCE,
 ) {
     note_ddi_refusal(&DDI_REFUSALS.resource_raw_hazard);
 }
 
-pub(crate) unsafe extern "C" fn flush(h: Hdevice) {
+pub(crate) unsafe extern "system" fn flush(h: Hdevice) {
     if let Some(context) = d3d11_context(h) {
         context.Flush();
     }
 }
 
-pub(crate) unsafe extern "C" fn flush_11_1(h: Hdevice, _flush_flags: u32) -> ddi::BOOL {
+pub(crate) unsafe extern "system" fn flush_11_1(h: Hdevice, _flush_flags: u32) -> ddi::BOOL {
     flush(h);
     1
 }
 
-pub(crate) unsafe extern "C" fn discard_11_1(
+pub(crate) unsafe extern "system" fn discard_11_1(
     h: Hdevice,
     handle_type: ddi::D3D11DDI_HANDLETYPE,
     handle: *mut c_void,
@@ -366,7 +366,7 @@ pub(crate) unsafe extern "C" fn discard_11_1(
     }
 }
 
-pub(crate) unsafe extern "C" fn check_direct_flip_support_11_1(
+pub(crate) unsafe extern "system" fn check_direct_flip_support_11_1(
     _h: Hdevice,
     _resource1: ddi::D3D10DDI_HRESOURCE,
     _resource2: ddi::D3D10DDI_HRESOURCE,
@@ -381,7 +381,7 @@ pub(crate) unsafe extern "C" fn check_direct_flip_support_11_1(
     }
 }
 
-pub(crate) unsafe extern "C" fn clear_view_11_1(
+pub(crate) unsafe extern "system" fn clear_view_11_1(
     h: Hdevice,
     view_type: ddi::D3D11DDI_HANDLETYPE,
     view: *mut c_void,
@@ -433,7 +433,7 @@ pub(crate) unsafe extern "C" fn clear_view_11_1(
     }
 }
 
-pub(crate) unsafe extern "C" fn resource_update_subresource(
+pub(crate) unsafe extern "system" fn resource_update_subresource(
     h: Hdevice,
     h_res: ddi::D3D10DDI_HRESOURCE,
     subresource: u32,
@@ -559,7 +559,7 @@ pub(crate) unsafe extern "C" fn resource_update_subresource(
     context.UpdateSubresource(&*res, subresource, bx_ptr, data, row_pitch, depth_pitch);
 }
 
-pub(crate) unsafe extern "C" fn resource_update_subresource_11_1(
+pub(crate) unsafe extern "system" fn resource_update_subresource_11_1(
     h: Hdevice,
     h_res: ddi::D3D10DDI_HRESOURCE,
     subresource: u32,

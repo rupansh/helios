@@ -52,7 +52,7 @@
 //! | [`log`] | `umd/src/log.rs` | ✅ moved — with [`log::init`] so D3D11 keeps `umd-<pid>.log` and D3D12 writes `umd12-<pid>.log` |
 //! | [`knobs`] | `umd/src/knobs.rs` | ✅ moved — the `reg_dword` FFI site and the two knob policies. ⛔ The knob VALUES stay per-crate |
 //! | [`refusals`] | `umd/src/forward.rs` | ✅ moved — the MECHANISM, generalised to `RefusalCounter { count, name }`. ⛔ The eleven D3D11 counters stay in `umd` |
-//! | [`noop`] | `umd/src/device_funcs.rs` | ✅ moved — `UniformFn`, `log_backtrace`, the table stubber. ⛔ `ddi_calc_size`'s 256-byte answer did NOT move; that is a D3D11 claim |
+//! | [`noop`] | `umd/src/device_funcs.rs` | ✅ moved — `TypedStub`, `log_backtrace`, typed stub installation. ⛔ `ddi_calc_size`'s 256-byte answer did NOT move; that is a D3D11 claim |
 //!
 //! **S1–S2 are complete. This crate is what `umd12` builds on.**
 //!
@@ -75,6 +75,8 @@
 
 pub mod format;
 pub mod hr;
+// Typed ABI adapters are portable; only noop::log_backtrace requires Windows.
+pub mod noop;
 pub mod refusals;
 pub mod throttle;
 pub mod window;
@@ -88,7 +90,5 @@ pub mod window;
 pub mod knobs;
 #[cfg(windows)]
 pub mod log;
-#[cfg(windows)]
-pub mod noop;
 #[cfg(windows)]
 pub mod slot;

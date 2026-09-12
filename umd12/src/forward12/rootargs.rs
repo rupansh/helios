@@ -24,7 +24,7 @@
 //! `_SET_ROOT_32BIT_CONSTANTS_0003` and `_SET_ROOT_BUFFER_VIEW` are each one
 //! typedef used by two (or, for the buffer view, six) table members
 //! (`d3d12umddi.rs:87117-87131`). Each operation therefore has **one body**,
-//! named by [`Pipeline`] and [`RootView`], with thin `extern "C"` wrappers —
+//! named by [`Pipeline`] and [`RootView`], with thin `extern "system"` wrappers —
 //! `queue.rs`'s `FenceOp` is the established shape. Fourteen near-identical
 //! bodies is fourteen places for the validation to drift.
 //!
@@ -489,7 +489,7 @@ unsafe fn set_root_signature(
 ///
 /// # Safety
 /// As [`set_root_signature`].
-unsafe extern "C" fn set_compute_root_signature(
+unsafe extern "system" fn set_compute_root_signature(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_rs: ddi12::D3D12DDI_HROOTSIGNATURE,
 ) {
@@ -501,7 +501,7 @@ unsafe extern "C" fn set_compute_root_signature(
 ///
 /// # Safety
 /// As [`set_root_signature`].
-unsafe extern "C" fn set_graphics_root_signature(
+unsafe extern "system" fn set_graphics_root_signature(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_rs: ddi12::D3D12DDI_HROOTSIGNATURE,
 ) {
@@ -576,7 +576,7 @@ unsafe fn set_root_descriptor_table(
 ///
 /// # Safety
 /// As [`set_root_descriptor_table`].
-unsafe extern "C" fn set_compute_root_descriptor_table(
+unsafe extern "system" fn set_compute_root_descriptor_table(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     root_parameter_index: ddi12::UINT,
     base: ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE,
@@ -589,7 +589,7 @@ unsafe extern "C" fn set_compute_root_descriptor_table(
 ///
 /// # Safety
 /// As [`set_root_descriptor_table`].
-unsafe extern "C" fn set_graphics_root_descriptor_table(
+unsafe extern "system" fn set_graphics_root_descriptor_table(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     root_parameter_index: ddi12::UINT,
     base: ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE,
@@ -651,7 +651,7 @@ unsafe fn set_root_32bit_constant(
 ///
 /// # Safety
 /// As [`set_root_32bit_constant`].
-unsafe extern "C" fn set_compute_root_32bit_constant(
+unsafe extern "system" fn set_compute_root_32bit_constant(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     root_parameter_index: ddi12::UINT,
     src_data: ddi12::UINT,
@@ -673,7 +673,7 @@ unsafe extern "C" fn set_compute_root_32bit_constant(
 ///
 /// # Safety
 /// As [`set_root_32bit_constant`].
-unsafe extern "C" fn set_graphics_root_32bit_constant(
+unsafe extern "system" fn set_graphics_root_32bit_constant(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     root_parameter_index: ddi12::UINT,
     src_data: ddi12::UINT,
@@ -778,7 +778,7 @@ unsafe fn set_root_32bit_constants(
 ///
 /// # Safety
 /// As [`set_root_32bit_constants`].
-unsafe extern "C" fn set_compute_root_32bit_constants(
+unsafe extern "system" fn set_compute_root_32bit_constants(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     root_parameter_index: ddi12::UINT,
     num_32bit_values_to_set: ddi12::UINT,
@@ -802,7 +802,7 @@ unsafe extern "C" fn set_compute_root_32bit_constants(
 ///
 /// # Safety
 /// As [`set_root_32bit_constants`].
-unsafe extern "C" fn set_graphics_root_32bit_constants(
+unsafe extern "system" fn set_graphics_root_32bit_constants(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     root_parameter_index: ddi12::UINT,
     num_32bit_values_to_set: ddi12::UINT,
@@ -894,7 +894,7 @@ unsafe fn set_root_buffer_view(
 ///
 /// # Safety
 /// As [`set_root_buffer_view`].
-unsafe extern "C" fn set_compute_root_constant_buffer_view(
+unsafe extern "system" fn set_compute_root_constant_buffer_view(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     root_parameter_index: ddi12::UINT,
     buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
@@ -915,7 +915,7 @@ unsafe extern "C" fn set_compute_root_constant_buffer_view(
 ///
 /// # Safety
 /// As [`set_root_buffer_view`].
-unsafe extern "C" fn set_graphics_root_constant_buffer_view(
+unsafe extern "system" fn set_graphics_root_constant_buffer_view(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     root_parameter_index: ddi12::UINT,
     buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
@@ -936,7 +936,7 @@ unsafe extern "C" fn set_graphics_root_constant_buffer_view(
 ///
 /// # Safety
 /// As [`set_root_buffer_view`].
-unsafe extern "C" fn set_compute_root_shader_resource_view(
+unsafe extern "system" fn set_compute_root_shader_resource_view(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     root_parameter_index: ddi12::UINT,
     buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
@@ -957,7 +957,7 @@ unsafe extern "C" fn set_compute_root_shader_resource_view(
 ///
 /// # Safety
 /// As [`set_root_buffer_view`].
-unsafe extern "C" fn set_graphics_root_shader_resource_view(
+unsafe extern "system" fn set_graphics_root_shader_resource_view(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     root_parameter_index: ddi12::UINT,
     buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
@@ -978,7 +978,7 @@ unsafe extern "C" fn set_graphics_root_shader_resource_view(
 ///
 /// # Safety
 /// As [`set_root_buffer_view`].
-unsafe extern "C" fn set_compute_root_unordered_access_view(
+unsafe extern "system" fn set_compute_root_unordered_access_view(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     root_parameter_index: ddi12::UINT,
     buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
@@ -999,7 +999,7 @@ unsafe extern "C" fn set_compute_root_unordered_access_view(
 ///
 /// # Safety
 /// As [`set_root_buffer_view`].
-unsafe extern "C" fn set_graphics_root_unordered_access_view(
+unsafe extern "system" fn set_graphics_root_unordered_access_view(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     root_parameter_index: ddi12::UINT,
     buffer_location: ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS,
@@ -1060,7 +1060,7 @@ const MAX_DESCRIPTOR_HEAPS: usize = 8;
 /// `h_list` must be a live handle from `queue::create_command_list`, and
 /// `heaps`, when `num` is non-zero, must address at least `num`
 /// `D3D12DDI_HDESCRIPTORHEAP`s for the duration of the call.
-unsafe extern "C" fn set_descriptor_heaps(
+unsafe extern "system" fn set_descriptor_heaps(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     num: ddi12::UINT,
     heaps: *mut ddi12::D3D12DDI_HDESCRIPTORHEAP,
@@ -1216,7 +1216,7 @@ unsafe extern "C" fn set_descriptor_heaps(
 /// # Safety
 /// `h_list` must be a live handle from `queue::create_command_list`. The body
 /// reads nothing through it beyond the state lookup.
-unsafe extern "C" fn clear_root_arguments(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
+unsafe extern "system" fn clear_root_arguments(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
     // SAFETY: the caller guarantees a live command-list handle. The lookup is
     // kept even though nothing is forwarded, so that a stale list handle is
     // attributed to `L3bCommandListMissing` here as it is everywhere else in
@@ -1513,7 +1513,7 @@ unsafe fn clear_unordered_access_view(
 ///
 /// # Safety
 /// As [`clear_unordered_access_view`].
-unsafe extern "C" fn clear_unordered_access_view_uint(
+unsafe extern "system" fn clear_unordered_access_view_uint(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     gpu_handle: ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE,
     cpu_handle: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
@@ -1540,7 +1540,7 @@ unsafe extern "C" fn clear_unordered_access_view_uint(
 ///
 /// # Safety
 /// As [`clear_unordered_access_view`].
-unsafe extern "C" fn clear_unordered_access_view_float(
+unsafe extern "system" fn clear_unordered_access_view_float(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     gpu_handle: ddi12::D3D12DDI_GPU_DESCRIPTOR_HANDLE,
     cpu_handle: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
@@ -1578,7 +1578,7 @@ unsafe extern "C" fn clear_unordered_access_view_float(
 /// `h_list` must be a live handle from `queue::create_command_list`; `colour`
 /// must address four `FLOAT`s; `p_rects`, when `num_rects` is non-zero, must
 /// address that many rects.
-unsafe extern "C" fn clear_render_target_view(
+unsafe extern "system" fn clear_render_target_view(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     cpu_handle: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
     colour: *const ddi12::FLOAT,
@@ -1664,7 +1664,7 @@ const DDI_CLEAR_FLAGS_KNOWN: ddi12::UINT =
 /// # Safety
 /// `h_list` must be a live handle from `queue::create_command_list`; `p_rects`,
 /// when `num_rects` is non-zero, must address that many rects.
-unsafe extern "C" fn clear_depth_stencil_view(
+unsafe extern "system" fn clear_depth_stencil_view(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     cpu_handle: ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
     flags: ddi12::UINT,
@@ -1741,7 +1741,7 @@ unsafe extern "C" fn clear_depth_stencil_view(
 /// `h_list` must be a live handle from `queue::create_command_list`; `arg`, when
 /// non-null, must point at a live `D3D12DDIARG_DISCARD_RESOURCE_0003` whose
 /// `pRects` addresses at least `NumRects` rects.
-unsafe extern "C" fn discard_resource(
+unsafe extern "system" fn discard_resource(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_resource: ddi12::D3D12DDI_HRESOURCE,
     arg: *const ddi12::D3D12DDIARG_DISCARD_RESOURCE_0003,

@@ -6,7 +6,7 @@
 use super::*;
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe extern "C" fn set_render_targets(
+pub(crate) unsafe extern "system" fn set_render_targets(
     h: Hdevice,
     rtvs: *const ddi::D3D10DDI_HRENDERTARGETVIEW,
     num_views: u32,
@@ -124,7 +124,7 @@ pub(crate) unsafe extern "C" fn set_render_targets(
     }
 }
 
-pub(crate) unsafe extern "C" fn set_viewports(
+pub(crate) unsafe extern "system" fn set_viewports(
     h: Hdevice,
     num: u32,
     _clear: u32,
@@ -166,7 +166,7 @@ pub(crate) unsafe extern "C" fn set_viewports(
     context.RSSetViewports(Some(&out));
 }
 
-pub(crate) unsafe extern "C" fn set_scissor_rects(
+pub(crate) unsafe extern "system" fn set_scissor_rects(
     h: Hdevice,
     num: u32,
     _clear: u32,
@@ -211,11 +211,11 @@ pub(crate) unsafe extern "C" fn set_scissor_rects(
     context.RSSetScissorRects(Some(&out));
 }
 
-pub(crate) unsafe extern "C" fn set_text_filter_size(_h: Hdevice, _w: u32, _hgt: u32) {
+pub(crate) unsafe extern "system" fn set_text_filter_size(_h: Hdevice, _w: u32, _hgt: u32) {
     note_ddi_refusal(&DDI_REFUSALS.text_filter_size_ignored);
 }
 
-pub(crate) unsafe extern "C" fn ia_set_topology(
+pub(crate) unsafe extern "system" fn ia_set_topology(
     h: Hdevice,
     topo: ddi::D3D10_DDI_PRIMITIVE_TOPOLOGY,
 ) {
@@ -284,7 +284,7 @@ pub(crate) unsafe fn log_draw_state(
     );
 }
 
-pub(crate) unsafe extern "C" fn draw(h: Hdevice, vertex_count: u32, start_vertex: u32) {
+pub(crate) unsafe extern "system" fn draw(h: Hdevice, vertex_count: u32, start_vertex: u32) {
     bind_input_layout(h);
     log_draw_state(h, "Draw", vertex_count, start_vertex, 0, 0);
     if let Some(context) = d3d11_context(h) {
@@ -292,7 +292,7 @@ pub(crate) unsafe extern "C" fn draw(h: Hdevice, vertex_count: u32, start_vertex
     }
 }
 
-pub(crate) unsafe extern "C" fn draw_indexed(
+pub(crate) unsafe extern "system" fn draw_indexed(
     h: Hdevice,
     index_count: u32,
     start_index: u32,
@@ -312,7 +312,7 @@ pub(crate) unsafe extern "C" fn draw_indexed(
     }
 }
 
-pub(crate) unsafe extern "C" fn draw_instanced(
+pub(crate) unsafe extern "system" fn draw_instanced(
     h: Hdevice,
     vertex_count_per_instance: u32,
     instance_count: u32,
@@ -338,7 +338,7 @@ pub(crate) unsafe extern "C" fn draw_instanced(
     }
 }
 
-pub(crate) unsafe extern "C" fn draw_indexed_instanced(
+pub(crate) unsafe extern "system" fn draw_indexed_instanced(
     h: Hdevice,
     index_count_per_instance: u32,
     instance_count: u32,
@@ -366,7 +366,7 @@ pub(crate) unsafe extern "C" fn draw_indexed_instanced(
     }
 }
 
-pub(crate) unsafe extern "C" fn draw_auto(h: Hdevice) {
+pub(crate) unsafe extern "system" fn draw_auto(h: Hdevice) {
     bind_input_layout(h);
     log_draw_state(h, "DrawAuto", 0, 0, 0, 0);
     if let Some(context) = d3d11_context(h) {
@@ -374,7 +374,7 @@ pub(crate) unsafe extern "C" fn draw_auto(h: Hdevice) {
     }
 }
 
-pub(crate) unsafe extern "C" fn draw_instanced_indirect(
+pub(crate) unsafe extern "system" fn draw_instanced_indirect(
     h: Hdevice,
     h_args: ddi::D3D10DDI_HRESOURCE,
     aligned_byte_offset: u32,
@@ -406,7 +406,7 @@ pub(crate) unsafe extern "C" fn draw_instanced_indirect(
     context.DrawInstancedIndirect(&buf, aligned_byte_offset);
 }
 
-pub(crate) unsafe extern "C" fn draw_indexed_instanced_indirect(
+pub(crate) unsafe extern "system" fn draw_indexed_instanced_indirect(
     h: Hdevice,
     h_args: ddi::D3D10DDI_HRESOURCE,
     aligned_byte_offset: u32,
@@ -445,7 +445,7 @@ pub(crate) unsafe extern "C" fn draw_indexed_instanced_indirect(
     context.DrawIndexedInstancedIndirect(&buf, aligned_byte_offset);
 }
 
-pub(crate) unsafe extern "C" fn so_set_targets(
+pub(crate) unsafe extern "system" fn so_set_targets(
     h: Hdevice,
     num: u32,
     _clear: u32,
@@ -476,7 +476,7 @@ pub(crate) unsafe extern "C" fn so_set_targets(
 
 // --- Compute ---------------------------------------------------------------
 
-pub(crate) unsafe extern "C" fn dispatch(h: Hdevice, x: u32, y: u32, z: u32) {
+pub(crate) unsafe extern "system" fn dispatch(h: Hdevice, x: u32, y: u32, z: u32) {
     if DISPATCH_LOG_COUNT.first_n_then_every(1024, 1024).is_some() {
         if let Some(b) = ctx_bindings(h) {
             trace_line!(
@@ -497,7 +497,7 @@ pub(crate) unsafe extern "C" fn dispatch(h: Hdevice, x: u32, y: u32, z: u32) {
     }
 }
 
-pub(crate) unsafe extern "C" fn dispatch_indirect(
+pub(crate) unsafe extern "system" fn dispatch_indirect(
     h: Hdevice,
     h_args: ddi::D3D10DDI_HRESOURCE,
     aligned_byte_offset: u32,
@@ -518,7 +518,7 @@ pub(crate) unsafe extern "C" fn dispatch_indirect(
     context.DispatchIndirect(&buf, aligned_byte_offset);
 }
 
-pub(crate) unsafe extern "C" fn set_resource_min_lod(
+pub(crate) unsafe extern "system" fn set_resource_min_lod(
     h: Hdevice,
     h_resource: ddi::D3D10DDI_HRESOURCE,
     min_lod: f32,

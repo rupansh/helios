@@ -959,7 +959,7 @@ unsafe fn create_shader_common(
 /// # Safety
 /// Trivially safe: neither argument is dereferenced. `unsafe` because the DDI
 /// typedef is.
-unsafe extern "C" fn calc_private_shader_size(
+unsafe extern "system" fn calc_private_shader_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATE_SHADER_0026,
 ) -> ddi12::SIZE_T {
@@ -970,7 +970,7 @@ unsafe extern "C" fn calc_private_shader_size(
 ///
 /// # Safety
 /// As [`calc_private_shader_size`].
-unsafe extern "C" fn calc_private_mesh_shader_size(
+unsafe extern "system" fn calc_private_mesh_shader_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATE_SHADER_0026,
 ) -> ddi12::SIZE_T {
@@ -981,7 +981,7 @@ unsafe extern "C" fn calc_private_mesh_shader_size(
 ///
 /// # Safety
 /// As [`calc_private_shader_size`].
-unsafe extern "C" fn calc_private_geometry_shader_with_stream_output(
+unsafe extern "system" fn calc_private_geometry_shader_with_stream_output(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATE_GEOMETRY_SHADER_WITH_STREAM_OUTPUT_0026,
 ) -> ddi12::SIZE_T {
@@ -1003,7 +1003,7 @@ macro_rules! create_shader_slot {
         /// `pShaderCode` and IO signature block are live for the call, and
         /// `h_shader` must carry the machine word
         /// `pfnCalcPrivateShaderSize` sized.
-        unsafe extern "C" fn $name(
+        unsafe extern "system" fn $name(
             h_device: ddi12::D3D12DDI_HDEVICE,
             arg: *const ddi12::D3D12DDIARG_CREATE_SHADER_0026,
             h_shader: ddi12::D3D12DDI_HSHADER,
@@ -1081,7 +1081,7 @@ create_shader_slot!(
 /// `arg` must point at a live
 /// `D3D12DDIARG_CREATE_GEOMETRY_SHADER_WITH_STREAM_OUTPUT_0026`, and `h_shader`
 /// must carry the machine word the paired calc-size slot sized.
-unsafe extern "C" fn create_geometry_shader_with_stream_output(
+unsafe extern "system" fn create_geometry_shader_with_stream_output(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_GEOMETRY_SHADER_WITH_STREAM_OUTPUT_0026,
     h_shader: ddi12::D3D12DDI_HSHADER,
@@ -1108,7 +1108,7 @@ unsafe extern "C" fn create_geometry_shader_with_stream_output(
 /// # Safety
 /// `h_shader` must be a handle a create slot in this file stored into, and must
 /// not be destroyed twice.
-unsafe extern "C" fn destroy_shader(
+unsafe extern "system" fn destroy_shader(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_shader: ddi12::D3D12DDI_HSHADER,
 ) {

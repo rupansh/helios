@@ -7,7 +7,7 @@
 
 use super::*;
 
-pub(crate) unsafe extern "C" fn check_format_support(
+pub(crate) unsafe extern "system" fn check_format_support(
     h: Hdevice,
     fmt: ddi::DXGI_FORMAT,
     out: *mut u32,

@@ -17,6 +17,9 @@
 #[path = "../metadata/windows_resource.rs"]
 mod metadata;
 
+#[path = "build-support/typed_tables.rs"]
+mod typed_tables;
+
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -87,10 +90,14 @@ fn generate_d3d10umddi_bindings() {
     let out = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     let bindings = bindgen::Builder::default()
+        // APIENTRY is stdcall on x86; normalize its Rust spelling across both
+        // Windows architectures while preserving the WDK-defined ABI. Inline
+        // DXGI table fields are named pfn*, without a PFN typedef.
+        .override_abi(bindgen::Abi::System, "PFN(D3D|DXGI).*|pfn.*")
         .header("bindgen/d3d10umddi_wrapper.h")
         .clang_args([
             "-target".to_string(),
-            "x86_64-pc-windows-msvc".to_string(),
+            env::var("TARGET").expect("Cargo must set TARGET"),
             format!("-I{msvc_inc}"),
             format!(r"-I{sdk_inc}\um"),
             format!(r"-I{sdk_inc}\shared"),
@@ -130,6 +137,8 @@ fn generate_d3d10umddi_bindings() {
         .generate()
         .expect("bindgen failed to generate d3d10umddi bindings");
 
+    typed_tables::generate(&bindings.to_string(), &out);
+
     bindings
         .write_to_file(out.join("d3d10umddi.rs"))
         .expect("failed to write d3d10umddi.rs");
@@ -142,6 +151,7 @@ fn generate_d3d10umddi_bindings() {
 }
 
 fn main() {
+    println!("cargo:rerun-if-changed=build-support/typed_tables.rs");
     let target = env::var("TARGET").unwrap_or_default();
     if !target.contains("windows") {
         // The crate is Windows-only. This guard exists so the build script does

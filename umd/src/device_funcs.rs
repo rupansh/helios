@@ -8,11 +8,9 @@
 //! device (Milestone 1 = D3D11CreateDevice S_OK → DWM stops fail-fasting); real
 //! rendering DDIs come later, backed by the DXVK device this object holds.
 //!
-//! ABI note: every device DDI takes `D3D10DDI_HDEVICE` (one pointer) as its first
-//! arg and the x64 calling convention is caller-clean, so a uniform
-//! `extern "C" fn(usize) -> usize` stub transmuted into each slot reads only the
-//! first arg, ignores the rest, and returns in RAX — valid for the void / HRESULT
-//! / SIZE_T return shapes alike.
+//! Every callback uses the WDK's APIENTRY ABI (`extern "system"`), including
+//! fallback handlers. Typed table literals preserve x86 callee stack cleanup
+//! and the exact return shape instead of transmuting one universal function.
 
 use crate::bridge;
 use crate::ddi;
@@ -321,10 +319,13 @@ pub fn threading_caps() -> u32 {
 /// the DDI level (there is no pfnDestroyContext — DCs are destroyed through
 /// pfnDestroyDevice), so once command lists exist two different types share
 /// one handle namespace and every resolver must discriminate BEFORE casting.
-/// Full-word magic values, not small enums: a stray private block cannot
-/// alias a valid tag by accident.
-pub const HELIOS_TAG_DEVICE: usize = 0x4845_4C49_4F44_4556; // "HELIODEV"
-pub const HELIOS_TAG_DEFERRED: usize = 0x4845_4C49_4F44_4643; // "HELIODFC"
+/// Process-local full-word tags. The explicit casts retain the established
+/// x64 values and their distinct "ODEV" / "ODFC" low words on x86. These
+/// private objects never cross a process or the UMD/KMD protocol boundary.
+pub const HELIOS_TAG_DEVICE: usize = 0x4845_4C49_4F44_4556u64 as usize;
+pub const HELIOS_TAG_DEFERRED: usize = 0x4845_4C49_4F44_4643u64 as usize;
+const _: () = assert!(HELIOS_TAG_DEVICE != 0 && HELIOS_TAG_DEFERRED != 0);
+const _: () = assert!(HELIOS_TAG_DEVICE != HELIOS_TAG_DEFERRED);
 
 /// `D3D10DDI_HDEVICE` handles whose private block carried neither tag.
 /// Count + refuse, never cast: a wild cast here is the worst-risk failure of
@@ -419,6 +420,10 @@ pub struct HeliosDeferredContext {
     pub dc_core_layer: *mut core::ffi::c_void,
     pub dc_um_callbacks: *const core::ffi::c_void,
 }
+
+// Every resolver first reads a native word before selecting either layout.
+const _: () = assert!(core::mem::offset_of!(HeliosDevice, tag) == 0);
+const _: () = assert!(core::mem::offset_of!(HeliosDeferredContext, tag) == 0);
 
 pub fn deferred_context_private_size() -> usize {
     core::mem::size_of::<HeliosDeferredContext>()
@@ -667,22 +672,34 @@ pub fn device_private_size() -> usize {
     core::mem::size_of::<HeliosDevice>()
 }
 
-// `UniformFn` and `log_backtrace` moved to `helios_umd_common::noop`
-// (`DECISIONS.md` D3b, stage S2) — a WDDM UMD of either D3D version must fill
-// every slot of a table it is handed, so the stub signature, the counting
-// idiom and the one-shot backtrace are engine- and version-agnostic.
-// Re-exported at their original paths so no call site in this crate moved.
-use helios_umd_common::noop::{stub_fill_sized_table, UniformFn};
-// `pub(crate)`, matching what this module exported before the move:
-// `forward/deferred.rs` reaches for `crate::device_funcs::log_backtrace`.
 pub(crate) use helios_umd_common::noop::log_backtrace;
+use helios_umd_common::noop::{install_stub, StubReport};
+
+pub(crate) trait DdiStubTable {
+    fn stubbed<const KIND: usize>() -> Self;
+}
+
+struct FallbackReport<const KIND: usize>;
+impl<Return: Default, const KIND: usize> StubReport<Return> for FallbackReport<KIND> {
+    fn hit() -> Return {
+        match KIND {
+            0 => note_device_noop(),
+            1 => note_dxgi_noop(),
+            _ => crate::forward::note_dc_unexpected(),
+        }
+        Return::default()
+    }
+}
+
+include!(concat!(env!("OUT_DIR"), "/d3d11_typed_tables.rs"));
 
 static DEVICE_NOOP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DXGI_NOOP_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 static WDDM13_TABLE_AUDIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static DXGI13_TABLE_AUDIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// No-op DDI stub: returns 0 (S_OK for HRESULT funcs; ignored for void funcs).
+/// Count the existing fallback DDIs (zero return values, no output writes).
+/// STUB: unimplemented slots remain observable through this counter.
 ///
 /// The counter is the WS3 "drive noop-DDI hit counts to zero" metric and stays
 /// unconditional. Only the I/O is gated: this used to do a heap-allocating
@@ -690,16 +707,16 @@ static DXGI13_TABLE_AUDIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// inside the runtime's call — and the very first hit additionally captured and
 /// formatted 32 stack frames through `RtlCaptureStackBackTrace` — none of it
 /// behind `trace_enabled()`, unlike the rest of the repeat traffic.
-unsafe extern "C" fn ddi_noop_device(_a: usize) -> usize {
+fn note_device_noop() {
     let n = DEVICE_NOOP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 512 && crate::trace_enabled() {
         if n == 0 {
-            log_backtrace("DDI noop(device)");
+            // SAFETY: an ordinary DDI call is outside stack unwinding.
+            unsafe { log_backtrace("DDI noop(device)") };
         } else {
             log_error!("DDI noop(device) hit={n}");
         }
     }
-    0
 }
 
 /// DXGI base no-op DDI stub. Kept separate so Present-adjacent missing funcs are
@@ -710,23 +727,26 @@ unsafe extern "C" fn ddi_noop_device(_a: usize) -> usize {
 /// 7 / 8 / 18 slots of every DXGI table, so no slot is left pointing here. The
 /// deletion belongs to T6, which owns deletions; this comment records the proof
 /// so the next reader does not re-derive it.
-unsafe extern "C" fn ddi_noop_dxgi(_a: usize) -> usize {
+fn note_dxgi_noop() {
     let n = DXGI_NOOP_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
     if n < 256 && crate::trace_enabled() {
         if n == 0 {
-            log_backtrace("DDI noop(dxgi)");
+            // SAFETY: an ordinary DDI call is outside stack unwinding.
+            unsafe { log_backtrace("DDI noop(dxgi)") };
         } else {
             log_error!("DDI noop(dxgi) hit={n}");
         }
     }
-    0
 }
 
-/// CalcPrivate*Size stub: return a small nonzero, pointer-aligned size so the
+/// STUB: unimplemented CalcPrivate*Size entries retain a small nonzero size so the
 /// runtime's driver-private object allocation is valid. Our Create* stubs never
 /// write into it and no other stub reads it, so the exact size is immaterial.
-unsafe extern "C" fn ddi_calc_size(_a: usize) -> usize {
-    256
+struct CalcSizeReport;
+impl StubReport<ddi::SIZE_T> for CalcSizeReport {
+    fn hit() -> ddi::SIZE_T {
+        256
+    }
 }
 
 /// `pfnRelocateDeviceFuncs` is a NOTIFICATION: the runtime has already
@@ -738,7 +758,7 @@ unsafe extern "C" fn ddi_calc_size(_a: usize) -> usize {
 /// TWICE PER pfnCommandListExecute (measured 1,585,160 calls = 2 × 792k
 /// executes in one Fire Strike run) on the render thread, while FREETHREADED
 /// create/calc DDIs read the same table from worker threads. The old
-/// refill-on-relocate (stub-sweep every slot to `ddi_noop_device`, then
+/// refill-on-relocate (stub-sweep every slot to `note_device_noop`, then
 /// reinstall) made a concurrent `CalcPrivate*Size` transiently return 0 —
 /// the runtime then allocates a zero-byte private region, the paired Create
 /// writes through it, and the heap corruption surfaces as a wild
@@ -757,21 +777,21 @@ fn relocate_log(tag: &str) {
     }
 }
 
-unsafe extern "C" fn ddi_relocate_device_funcs(
+unsafe extern "system" fn ddi_relocate_device_funcs(
     _h_device: ddi::D3D10DDI_HDEVICE,
     _funcs: *mut ddi::D3D11DDI_DEVICEFUNCS,
 ) {
     relocate_log("D3D11");
 }
 
-unsafe extern "C" fn ddi_relocate_device_funcs_11_1(
+unsafe extern "system" fn ddi_relocate_device_funcs_11_1(
     _h_device: ddi::D3D10DDI_HDEVICE,
     _funcs: *mut ddi::D3D11_1DDI_DEVICEFUNCS,
 ) {
     relocate_log("D3D11.1");
 }
 
-unsafe extern "C" fn ddi_relocate_device_funcs_wddm1_3(
+unsafe extern "system" fn ddi_relocate_device_funcs_wddm1_3(
     _h_device: ddi::D3D10DDI_HDEVICE,
     _funcs: *mut ddi::D3DWDDM1_3DDI_DEVICEFUNCS,
 ) {
@@ -818,8 +838,14 @@ unsafe fn audit_wddm1_3_device_funcs(tag: &str, funcs: *mut ddi::D3DWDDM1_3DDI_D
     // addresses are already in scope here, so the classification is exact and
     // per-slot — that is what answers "which DDI is still a stub", at fill
     // time and by index, instead of a 32-frame backtrace at hit time.
-    let noop = ddi_noop_device as UniformFn as usize;
-    let calc = ddi_calc_size as UniformFn as usize;
+    let fallback = ddi::D3DWDDM1_3DDI_DEVICEFUNCS::stubbed::<0>();
+    let mut with_calc = ddi::D3DWDDM1_3DDI_DEVICEFUNCS::stubbed::<0>();
+    // SAFETY: WDDM1.3 extends the D3D11 prefix and both locals are complete.
+    unsafe {
+        install_calc_stubs(&mut *(&mut with_calc as *mut _ as *mut ddi::D3D11DDI_DEVICEFUNCS))
+    };
+    let noops = &fallback as *const _ as *const usize;
+    let calcs = &with_calc as *const _ as *const usize;
     let mut null_slots = 0usize;
     let mut noop_slots = 0usize;
     let mut calc_slots = 0usize;
@@ -828,12 +854,12 @@ unsafe fn audit_wddm1_3_device_funcs(tag: &str, funcs: *mut ddi::D3DWDDM1_3DDI_D
         if value == 0 {
             null_slots += 1;
             log_error!("{tag}: WDDM1.3 NULL slot[{i:03}]");
-        } else if value == noop {
+        } else if value == *noops.add(i) {
             noop_slots += 1;
             if noop_slots <= 32 {
                 log_error!("{tag}: WDDM1.3 noop slot[{i:03}]");
             }
-        } else if value == calc {
+        } else if value == *calcs.add(i) && value != *noops.add(i) {
             calc_slots += 1;
         }
     }
@@ -890,9 +916,10 @@ unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE
 
     // Same exact classification as the device-funcs auditor. `noop` here should
     // never be found: install_dxgi/_1_1/_1_3 overwrite every slot of every DXGI
-    // table (the proof recorded on ddi_noop_dxgi), and this line is what would
+    // table (the proof recorded on note_dxgi_noop), and this line is what would
     // contradict that if it ever stopped holding.
-    let noop = ddi_noop_dxgi as UniformFn as usize;
+    let fallback = ddi::DXGI1_3_DDI_BASE_FUNCTIONS::stubbed::<1>();
+    let noops = &fallback as *const _ as *const usize;
     let mut null_slots = 0usize;
     let mut noop_slots = 0usize;
     for i in 0..n {
@@ -900,7 +927,7 @@ unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE
         if value == 0 {
             null_slots += 1;
             log_error!("{tag}: DXGI1.3 NULL slot[{i:02}]");
-        } else if value == noop {
+        } else if value == *noops.add(i) {
             noop_slots += 1;
             log_error!("{tag}: DXGI1.3 noop slot[{i:02}]");
         }
@@ -921,7 +948,7 @@ unsafe fn audit_dxgi_1_3_base_funcs(tag: &str, funcs: *mut ddi::DXGI1_3_DDI_BASE
 /// device teardown below on a DC handle would unregister/release/drop state
 /// the parent device still owns — the single highest-risk confusion of the
 /// command-list feature, which is why the tag is checked before any cast.
-pub(crate) unsafe extern "C" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVICE) {
+pub(crate) unsafe extern "system" fn ddi_destroy_device(h_device: ddi::D3D10DDI_HDEVICE) {
     if h_device.pDrvPrivate.is_null() {
         log_error!("DDI: DestroyDevice on null handle — refused");
         return;
@@ -1128,29 +1155,19 @@ pub unsafe fn create_runtime_paging_queue(dev: &mut HeliosDevice) -> i32 {
     0
 }
 
-/// Bulk-fill every pointer slot of a device-funcs table with `ddi_noop_device`
-/// and return the D3D11.0-typed view of it.
-///
-/// The slot count comes from `size_of::<T>()`, so it CANNOT disagree with the
-/// table actually being filled. That matters: the failure mode this replaces is
-/// a wrong length under-stubbing a table and leaving uninitialised slots past
-/// the prefix, which is precisely what `fill_dxgi_1_3_base_funcs`'s comment
-/// exists to warn about. The three fills each spelled the length out by hand.
+/// Initialize every field from its WDK type and return the D3D11.0 prefix.
+/// The generated complete literal fails compilation if any field is missing;
+/// no pointer casts select a fallback signature.
 ///
 /// # Safety
 /// `funcs` must point to a writable `T` whose every field is a pointer-sized
 /// `Option<fn>`, and `T` must be a layout-compatible extension of
 /// `D3D11DDI_DEVICEFUNCS` (a WDK header property no Rust type can assert).
-unsafe fn stub_fill_device_table<T>(funcs: *mut T) -> *mut ddi::D3D11DDI_DEVICEFUNCS {
-    // ⚠ Deriving the slot count from `size_of::<T>()` is correct HERE and only
-    // here: the d3d10umddi device-funcs tables carry no size argument, so the
-    // type IS the contract. `d3d12umddi`'s `pfnFillDDITable` passes a `SIZE_T`
-    // (`:2527-2528`) and the D3D12 filler must use it — `umd_common`'s
-    // `stub_fill_bytes` is that primitive, and this is the convenience on top.
-    // ARCHITECTURE §12 rule 16 / R702: 24H2 passed 576 bytes for a 592-byte
-    // DRIVERCAPS.
-    unsafe { stub_fill_sized_table(funcs, ddi_noop_device) };
-    funcs as *mut ddi::D3D11DDI_DEVICEFUNCS
+unsafe fn stub_fill_device_table<T: DdiStubTable>(funcs: *mut T) -> *mut ddi::D3D11DDI_DEVICEFUNCS {
+    // SAFETY: the caller owns one complete table selected by the negotiated
+    // interface. A typed literal initializes every target-specific field.
+    unsafe { funcs.write(T::stubbed::<0>()) };
+    funcs.cast()
 }
 
 /// The `CalcPrivate*Size` entries and the two real lifecycle entries every
@@ -1161,11 +1178,11 @@ unsafe fn stub_fill_device_table<T>(funcs: *mut T) -> *mut ddi::D3D11DDI_DEVICEF
 ///
 /// # Safety
 /// `f` must be the D3D11.0-typed view of a stub-filled table.
-unsafe fn install_calc_and_lifecycle(f: &mut ddi::D3D11DDI_DEVICEFUNCS) {
+unsafe fn install_calc_stubs(f: &mut ddi::D3D11DDI_DEVICEFUNCS) {
     // CalcPrivate*Size funcs must return a valid nonzero size.
     macro_rules! calc {
         ($($field:ident),* $(,)?) => {$(
-            f.$field = core::mem::transmute::<UniformFn, _>(ddi_calc_size as UniformFn);
+            install_stub::<CalcSizeReport, _>(&mut f.$field);
         )*};
     }
     calc!(
@@ -1185,6 +1202,12 @@ unsafe fn install_calc_and_lifecycle(f: &mut ddi::D3D11DDI_DEVICEFUNCS) {
         pfnCalcPrivateTessellationShaderSize,
         pfnCalcPrivateUnorderedAccessViewSize,
     );
+    // All fallback sizes use the target's SIZE_T return type and signature.
+}
+
+unsafe fn install_calc_and_lifecycle(f: &mut ddi::D3D11DDI_DEVICEFUNCS) {
+    // SAFETY: f is a writable local/negotiated D3D11 prefix table.
+    unsafe { install_calc_stubs(f) };
     // The deferred-context/command-list size family is REAL (Phase C), no
     // longer the 256-byte stub: the paired Create slots are live in
     // `forward::install`, so a stub size here would be exactly the R812 heap
@@ -1254,11 +1277,8 @@ pub unsafe fn fill_dxgi_base_funcs(funcs: *mut ddi::DXGI_DDI_BASE_FUNCTIONS) {
     if funcs.is_null() {
         return;
     }
-    let n = core::mem::size_of::<ddi::DXGI_DDI_BASE_FUNCTIONS>() / core::mem::size_of::<usize>();
-    let slots = funcs as *mut Option<UniformFn>;
-    for i in 0..n {
-        *slots.add(i) = Some(ddi_noop_dxgi);
-    }
+    // SAFETY: the caller supplies the full negotiated DXGI table.
+    unsafe { funcs.write(ddi::DXGI_DDI_BASE_FUNCTIONS::stubbed::<1>()) };
     // Real (benign) present so LogonUI/DWM don't fail-fast on present.
     crate::forward::install_dxgi(funcs);
 }
@@ -1269,11 +1289,8 @@ pub unsafe fn fill_dxgi_1_1_base_funcs(funcs: *mut ddi::DXGI1_1_DDI_BASE_FUNCTIO
     if funcs.is_null() {
         return;
     }
-    let n = core::mem::size_of::<ddi::DXGI1_1_DDI_BASE_FUNCTIONS>() / core::mem::size_of::<usize>();
-    let slots = funcs as *mut Option<UniformFn>;
-    for i in 0..n {
-        *slots.add(i) = Some(ddi_noop_dxgi);
-    }
+    // SAFETY: the caller supplies the full negotiated DXGI table.
+    unsafe { funcs.write(ddi::DXGI1_1_DDI_BASE_FUNCTIONS::stubbed::<1>()) };
     crate::forward::install_dxgi(funcs as *mut ddi::DXGI_DDI_BASE_FUNCTIONS);
     crate::forward::install_dxgi_1_1(funcs);
 }
@@ -1285,11 +1302,8 @@ pub unsafe fn fill_dxgi_1_3_base_funcs(funcs: *mut ddi::DXGI1_3_DDI_BASE_FUNCTIO
     if funcs.is_null() {
         return;
     }
-    let n = core::mem::size_of::<ddi::DXGI1_3_DDI_BASE_FUNCTIONS>() / core::mem::size_of::<usize>();
-    let slots = funcs as *mut Option<UniformFn>;
-    for i in 0..n {
-        *slots.add(i) = Some(ddi_noop_dxgi);
-    }
+    // SAFETY: the caller supplies the full negotiated DXGI table.
+    unsafe { funcs.write(ddi::DXGI1_3_DDI_BASE_FUNCTIONS::stubbed::<1>()) };
     crate::forward::install_dxgi(funcs as *mut ddi::DXGI_DDI_BASE_FUNCTIONS);
     crate::forward::install_dxgi_1_1(funcs as *mut ddi::DXGI1_1_DDI_BASE_FUNCTIONS);
     crate::forward::install_dxgi_1_3(funcs);

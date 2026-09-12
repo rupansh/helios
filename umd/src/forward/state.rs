@@ -130,7 +130,7 @@ impl DeallocateForm {
 }
 
 pub(crate) type EvictCallback =
-    unsafe extern "C" fn(ddi::HANDLE, *mut ddi::D3DDDICB_EVICT) -> ddi::HRESULT;
+    unsafe extern "system" fn(ddi::HANDLE, *mut ddi::D3DDDICB_EVICT) -> ddi::HRESULT;
 
 /// One persistent WDDM 2.x device-residency reference.
 ///
@@ -543,7 +543,7 @@ pub(crate) fn create_error_hr(e: &windows::core::Error) -> i32 {
 /// `result` is the DXVK call's `Result<()>` and `obj` its out-param: S_OK with
 /// no object is as much a fake success as an error HRESULT, so both report.
 /// Panic-free by construction (no `unwrap`, no indexing) — these are
-/// `extern "C"` entry points under `panic = "abort"`.
+/// `extern "system"` entry points under `panic = "abort"`.
 pub(crate) unsafe fn finish_create<T: Interface>(
     h: Hdevice,
     result: windows::core::Result<()>,

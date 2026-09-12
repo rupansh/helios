@@ -1,5 +1,6 @@
 param(
-  # ⛔⛔ THE THREE ARTIFACT PATHS ARE REQUIRED AND HAVE NO FALLBACK.
+  # Artifact paths have no fallback: native paths are always required; x86
+  # paths are also required when the INF declares UserModeDriverNameWoW.
   #
   # They used to carry hardcoded defaults, and on 2026-09-05 that cost a wrong
   # deploy that nothing in the output named: `cargo make` stages a DEBUG
@@ -25,6 +26,10 @@ param(
   # and BEFORE the catalog is generated — the DriverStore copy is catalog-signed,
   # so it cannot be corrected by overwriting the file afterwards.
   [string]$Umd12Dll = "",
+  # Required for packages that declare UserModeDriverNameWoW. Optional only to
+  # allow deliberate rollback to an older package with native UMDs alone.
+  [string]$Umd32Dll = "",
+  [string]$Umd12_32Dll = "",
   [string]$InstanceId = "",
   [switch]$SkipSign,
   [switch]$BinaryOnly,
@@ -40,6 +45,7 @@ param(
 )
 
 . "$PSScriptRoot\helios-deploy-common.ps1"
+. (Join-Path (Split-Path -Parent $PSScriptRoot) "packaging\windows\Helios-PackageCommon.ps1")
 
 # No implicit fallback: name the artifacts or get a refusal, never a default.
 foreach ($req in @(@("PackageDir", $PackageDir), @("UmdDll", $UmdDll), @("Umd12Dll", $Umd12Dll))) {
@@ -188,8 +194,7 @@ function Sign-FileWithMachineCert([string]$Path) {
   $cert = Ensure-MachineCodeSigningCert
   $signtool = Find-Signtool
   if (-not $signtool) {
-    Write-Warning "signtool.exe not found; leaving existing signature unchanged for $Path."
-    return
+    throw "signtool.exe not found; refusing to publish an unsigned or stale package for $Path."
   }
   & $signtool sign /v /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /sm /s My /sha1 $cert.Thumbprint $Path
   if ($LASTEXITCODE -ne 0) {
@@ -199,9 +204,19 @@ function Sign-FileWithMachineCert([string]$Path) {
   if ($LASTEXITCODE -ne 0) { throw "signtool failed for $Path" }
 }
 
-function Sign-HeliosPackage([string]$SysPath, [string]$CatPath) {
+function Sign-HeliosPackage([string]$SysPath, [string]$CatPath, [string[]]$UmdPaths) {
+  # A signature changes the image hash: finalize every copied image BEFORE
+  # generating its catalog. Signing SYS after Inf2Cat invalidates the catalog.
   Sign-FileWithMachineCert $SysPath
+  foreach ($path in $UmdPaths) { Sign-FileWithMachineCert $path }
+  New-HeliosCatalog (Split-Path -Parent $SysPath) $CatPath
   Sign-FileWithMachineCert $CatPath
+}
+
+function Prepare-HeliosDeploy {
+  Stop-LookingGlassHostService
+  $cleared = Clear-HeliosPendingRenames
+  if ($cleared -gt 0) { Write-Host "Removed $cleared stale Helios pending rename operation(s)." }
 }
 
 function Sync-HeliosPackageUmd([string]$Source, [string]$Destination) {
@@ -223,7 +238,7 @@ function Sync-HeliosPackageUmd([string]$Source, [string]$Destination) {
   }
 }
 
-function Restore-HeliosPreviousPackage([string]$InstanceId, [string]$PreviousInf, [string]$CurrentInf) {
+function Restore-HeliosPreviousPackage([string]$InstanceId, [string]$PreviousInf, [string]$CurrentInf, $RegistrationSnapshot) {
   if ($CurrentInf -and $CurrentInf -ne $PreviousInf) {
     Write-Warning "Removing failed Helios package $CurrentInf and returning to $PreviousInf."
     & pnputil.exe /delete-driver "$CurrentInf" /uninstall /force | Out-Host
@@ -235,6 +250,14 @@ function Restore-HeliosPreviousPackage([string]$InstanceId, [string]$PreviousInf
   Start-Sleep -Seconds 2
   & pnputil.exe /enable-device "$InstanceId" | Out-Host
   Start-Sleep -Seconds 3
+  # An older INF has no deletion directive for a WoW64 value introduced by a
+  # newer package. Restore the previous registration explicitly on rollback.
+  if ($RegistrationSnapshot -and (Get-HeliosActiveInfName $InstanceId) -eq $PreviousInf) {
+    $classKey = Get-HeliosClassKey $InstanceId
+    foreach ($name in $RegistrationSnapshot.Keys) {
+      Restore-HeliosRegistrySnapshot $classKey $name $RegistrationSnapshot[$name]
+    }
+  }
 }
 
 function Test-HeliosRebootRequiredFailure([string]$InstanceId) {
@@ -324,7 +347,7 @@ function Save-HeliosKmdSymbols([string]$BackupDir, [string]$PackageDir) {
   Write-Host "Archived staged KMD symbols to $dir ($($saved -join ', '))"
 }
 
-function Backup-HeliosActiveFiles([string]$Store, [string[]]$Names) {
+function Backup-HeliosActiveFiles([string]$Store, [string[]]$Names, $RegistrationSnapshot) {
   $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
   $dir = Join-Path "C:\ProgramData\HeliosDeployBackups" $stamp
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -334,44 +357,70 @@ function Backup-HeliosActiveFiles([string]$Store, [string[]]$Names) {
       Copy-Item -LiteralPath $src -Destination (Join-Path $dir $name) -Force
     }
   }
+  if ($RegistrationSnapshot) {
+    $RegistrationSnapshot | ConvertTo-Json -Depth 8 |
+      Set-Content -LiteralPath (Join-Path $dir "display-registration.json") -Encoding UTF8
+  }
   Write-Host "Backed up active DriverStore files to $dir"
   Save-HeliosKmdSymbols $dir $PackageDir
   return $dir
 }
 
-Assert-HeliosAdmin
-Stop-LookingGlassHostService
-$cleared = Clear-HeliosPendingRenames
-if ($cleared -gt 0) { Write-Host "Removed $cleared stale Helios pending rename operation(s)." }
-
 if (-not (Test-Path -LiteralPath $PackageDir -PathType Container)) { throw "PackageDir not found: $PackageDir" }
 $inf = Join-Path $PackageDir "helios_kmd_render.inf"
 $sys = Join-Path $PackageDir "helios_kmd_render.sys"
-$umd = Join-Path $PackageDir "helios_umd.dll"
-$umd12 = Join-Path $PackageDir "helios_umd12.dll"
 $cat = Join-Path $PackageDir "helios_kmd_render.cat"
 foreach ($path in @($inf, $sys, $cat)) {
   if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing package file $path" }
 }
-if ((-not $BinaryOnly -or $IncludeUmd) -and -not (Test-Path -LiteralPath $umd -PathType Leaf)) { throw "Missing package UMD file $umd" }
-# The INF's CopyFiles carries helios_umd12.dll and registers it at
-# UserModeDriverName slot 3, so it is a package file like any other.
-if ((-not $BinaryOnly -or $IncludeUmd) -and -not (Test-Path -LiteralPath $umd12 -PathType Leaf)) { throw "Missing package D3D12 UMD file $umd12" }
+$infText = (Get-Content -LiteralPath $inf | Where-Object { $_ -notmatch '^\s*;' }) -join "`n"
+$packageHasWow64 = $infText -match '(?im)^\s*HKR\s*,[^\r\n;]*,\s*"?UserModeDriverNameWoW"?\s*,'
+$packageUmds = @(
+  @{ Name = "helios_umd.dll"; Source = $UmdDll; Architecture = "x64" },
+  @{ Name = "helios_umd12.dll"; Source = $Umd12Dll; Architecture = "x64" }
+)
+if ($packageHasWow64) {
+  foreach ($req in @(@("Umd32Dll", $Umd32Dll), @("Umd12_32Dll", $Umd12_32Dll))) {
+    if ([string]::IsNullOrWhiteSpace($req[1])) {
+      throw "-$($req[0]) is required: $inf declares UserModeDriverNameWoW. Name the x86 artifact explicitly."
+    }
+  }
+  $packageUmds += @(
+    @{ Name = "helios_umd32.dll"; Source = $Umd32Dll; Architecture = "x86" },
+    @{ Name = "helios_umd12_32.dll"; Source = $Umd12_32Dll; Architecture = "x86" }
+  )
+} elseif ($Umd32Dll -or $Umd12_32Dll) {
+  throw "x86 UMD paths were supplied but $inf has no UserModeDriverNameWoW registration."
+}
+if ($StageOnly -and $BinaryOnly) { throw "-StageOnly and -BinaryOnly cannot be combined." }
+$umdNames = @($packageUmds | ForEach-Object { $_.Name })
+$umdPaths = @($umdNames | ForEach-Object { Join-Path $PackageDir $_ })
+foreach ($entry in $packageUmds) {
+  if (-not $BinaryOnly -or $IncludeUmd) {
+    Assert-HeliosPeArchitecture $entry.Source $entry.Architecture
+  }
+}
+Assert-HeliosPeArchitecture $sys x64
+Assert-HeliosAdmin
+if (-not [Environment]::Is64BitProcess) { throw "Run this installer with native 64-bit PowerShell." }
 
 if ($StageOnly) {
   Write-HeliosPlan "Helios KMD stage-only install" @{
     PackageDir = $PackageDir
     UmdSource = $UmdDll
     Umd12Source = $Umd12Dll
+    Umd32Source = $Umd32Dll
+    Umd12_32Source = $Umd12_32Dll
     UmdProfile = (Split-Path -Leaf (Split-Path -Parent $UmdDll))
     Umd12Profile = (Split-Path -Leaf (Split-Path -Parent $Umd12Dll))
     StageOnly = [bool]$StageOnly
   }
   if ($PlanOnly) { return }
-  Sync-HeliosPackageUmd $UmdDll $umd
-  Sync-HeliosPackageUmd $Umd12Dll $umd12
-  New-HeliosCatalog $PackageDir $cat
-  Sign-HeliosPackage $sys $cat
+  Prepare-HeliosDeploy
+  foreach ($entry in $packageUmds) {
+    Sync-HeliosPackageUmd $entry.Source (Join-Path $PackageDir $entry.Name)
+  }
+  Sign-HeliosPackage $sys $cat $umdPaths
   Publish-HeliosPackageOnly $inf
   Write-Host "Helios KMD package staged. Reboot/start with the Helios PCI device present, then bind with devcon update if PnP does not pick the highest DriverVer automatically."
   return
@@ -381,8 +430,32 @@ $id = Get-HeliosInstanceId $InstanceId
 $hwid = Get-HeliosHardwareId $id
 $activeInf = Get-HeliosActiveInfName $id
 $store = Get-HeliosActiveStoreDir $id $activeInf
-$copyNames = if ($BinaryOnly) { @("helios_kmd_render.sys", "helios_kmd_render.cat") } else { @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_kmd_render.cat", "helios_umd.dll", "helios_umd12.dll") }
-if ($IncludeUmd) { $copyNames += @("helios_umd.dll", "helios_umd12.dll") }
+$activeClassKey = Get-HeliosClassKey $id
+$registrationSnapshot = [ordered]@{}
+foreach ($name in @("UserModeDriverName", "UserModeDriverNameWoW", "InstalledDisplayDrivers")) {
+  $registrationSnapshot[$name] = Get-HeliosRegistrySnapshot $activeClassKey $name
+}
+if ($BinaryOnly) {
+  $activeInfPath = Join-Path $store "helios_kmd_render.inf"
+  $activeInfText = (Get-Content -LiteralPath $activeInfPath | Where-Object { $_ -notmatch '^\s*;' }) -join "`n"
+  $activeHasWow64 = $activeInfText -match '(?im)^\s*HKR\s*,[^\r\n;]*,\s*"?UserModeDriverNameWoW"?\s*,'
+  if ($activeHasWow64 -ne $packageHasWow64) {
+    throw "-BinaryOnly cannot add or remove WoW64 registration. Install the full package with PnP."
+  }
+}
+$copyNames = if ($BinaryOnly) { @("helios_kmd_render.sys", "helios_kmd_render.cat") } else { @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_kmd_render.cat") + $umdNames }
+if ($IncludeUmd) { $copyNames += $umdNames }
+if ($BinaryOnly -and -not $IncludeUmd) {
+  # This mode copies a new catalog but leaves active UMDs alone. Its catalog
+  # must therefore cover those exact bytes, not different staged UMDs.
+  foreach ($entry in $packageUmds) {
+    $staged = Join-Path $PackageDir $entry.Name
+    $active = Join-Path $store $entry.Name
+    if ((Get-HeliosFileHash $staged) -ne (Get-HeliosFileHash $active)) {
+      throw "-BinaryOnly cannot replace the catalog while $($entry.Name) differs. Include all UMDs or stage matching active bytes."
+    }
+  }
+}
 $copyNames = $copyNames | Select-Object -Unique
 
 Write-HeliosPlan "Helios KMD install" @{
@@ -392,6 +465,9 @@ Write-HeliosPlan "Helios KMD install" @{
   ActiveInf = $activeInf
   DriverStore = $store
   UmdSource = $UmdDll
+  Umd12Source = $Umd12Dll
+  Umd32Source = $Umd32Dll
+  Umd12_32Source = $Umd12_32Dll
   UmdProfile = (Split-Path -Leaf (Split-Path -Parent $UmdDll))
   BinaryOnly = [bool]$BinaryOnly
   IncludeUmd = [bool]$IncludeUmd
@@ -405,13 +481,15 @@ Write-HeliosPlan "Helios KMD install" @{
 }
 if ($PlanOnly) { return }
 
-Sync-HeliosPackageUmd $UmdDll $umd
-Sync-HeliosPackageUmd $Umd12Dll $umd12
-New-HeliosCatalog $PackageDir $cat
-Sign-HeliosPackage $sys $cat
+Prepare-HeliosDeploy
+foreach ($entry in $packageUmds) {
+  Sync-HeliosPackageUmd $entry.Source (Join-Path $PackageDir $entry.Name)
+}
+$signUmdPaths = if (-not $BinaryOnly -or $IncludeUmd) { $umdPaths } else { @() }
+Sign-HeliosPackage $sys $cat $signUmdPaths
 
 if (-not $BinaryOnly) {
-  $backup = Backup-HeliosActiveFiles $store $copyNames
+  $backup = Backup-HeliosActiveFiles $store $copyNames $registrationSnapshot
   $oldSvc = Get-ItemProperty -LiteralPath "HKLM:\SYSTEM\CurrentControlSet\Services\helios_kmd_render" -ErrorAction SilentlyContinue
   $oldImagePath = if ($oldSvc -and $oldSvc.PSObject.Properties["ImagePath"]) { $oldSvc.ImagePath } else { $null }
   $update = Invoke-HeliosPackageUpdate $inf $id
@@ -426,6 +504,26 @@ if (-not $BinaryOnly) {
     throw "devcon/pnputil did not bind the staged KMD image. activeInf=$newActiveInf activeSys=$activeSys activeHash=$activeSysHash packageHash=$packageSysHash. Bump DriverVer or remove the stale active package with pnputil; do not continue with a stale DriverStore image."
   }
   Write-Host "Active KMD image verified: $activeSys hash $activeSysHash"
+  foreach ($entry in $packageUmds) {
+    $staged = Join-Path $PackageDir $entry.Name
+    $active = Join-Path $newStore $entry.Name
+    if ((Get-HeliosFileHash $staged) -ne (Get-HeliosFileHash $active)) {
+      throw "devcon/pnputil did not bind the staged $($entry.Name): $active"
+    }
+    Assert-HeliosPeArchitecture $active $entry.Architecture
+    Write-Host "Active UMD image verified: $active"
+  }
+  if (-not $packageHasWow64) {
+    # Deliberate downgrade to an older native-only package. PnP does not clear
+    # a software-key value just because the older INF never mentioned it.
+    $newClassKey = Get-HeliosClassKey $id
+    Remove-ItemProperty -LiteralPath $newClassKey -Name "UserModeDriverNameWoW" -ErrorAction SilentlyContinue
+    $installedNames = @((Get-Item -LiteralPath $newClassKey).GetValue("InstalledDisplayDrivers", @()) |
+      Where-Object { $_ -notin @("helios_umd32", "helios_umd12_32") })
+    if ($installedNames.Count -gt 0) {
+      New-ItemProperty -LiteralPath $newClassKey -Name "InstalledDisplayDrivers" -PropertyType MultiString -Value $installedNames -Force | Out-Null
+    }
+  }
   $serviceImageChanged = ($oldImagePath -and $newImagePath -and ([string]$oldImagePath -ne [string]$newImagePath))
   if ($serviceImageChanged -or $update.RestartRequired) {
     Write-Warning "The Helios service image path changed or SetupAPI reported restart required. A reboot is the reliable KMD activation path for this package."
@@ -463,7 +561,7 @@ if (-not $BinaryOnly) {
       return
     }
     $newInf = Get-HeliosActiveInfName $id
-    Restore-HeliosPreviousPackage $id $activeInf $newInf
+    Restore-HeliosPreviousPackage $id $activeInf $newInf $registrationSnapshot
     throw "Helios KMD package published, but device is Code $($state.ConfigManagerErrorCode)."
   }
   Write-Host "Helios KMD package install verified. Backup: $backup"
@@ -483,10 +581,9 @@ $sources = @{
   "helios_kmd_render.inf" = $inf
   "helios_kmd_render.sys" = $sys
   "helios_kmd_render.cat" = $cat
-  "helios_umd.dll" = $umd
-  "helios_umd12.dll" = $umd12
 }
-$backup = Backup-HeliosActiveFiles $store $copyNames
+foreach ($entry in $packageUmds) { $sources[$entry.Name] = Join-Path $PackageDir $entry.Name }
+$backup = Backup-HeliosActiveFiles $store $copyNames $registrationSnapshot
 
 Write-Warning "-BinaryOnly directly edits the active DriverStore package. Use it only as an emergency debug override; normal KMD installs must use devcon update or pnputil."
 Write-Host "Stopping Helios device with pnputil /disable-device /force"

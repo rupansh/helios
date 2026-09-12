@@ -70,6 +70,12 @@ $id = Get-HeliosInstanceId $InstanceId
 $srcHash = Get-HeliosFileHash $UmdDll
 $src12Hash = if ($deployUmd12) { Get-HeliosFileHash $Umd12Dll } else { "" }
 $classKey = Get-HeliosClassKey $id
+# Native hotplug does not replace the installed WoW64 UMDs. Keep their flat
+# inventory entries when rewriting InstalledDisplayDrivers for native clients.
+$wowUmdNames = @((Get-Item -LiteralPath $classKey).GetValue("UserModeDriverNameWoW", @()) |
+  Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+  ForEach-Object { [IO.Path]::GetFileNameWithoutExtension([string]$_) } |
+  Select-Object -Unique)
 $activeInf = Get-HeliosActiveInfName $id
 $store = Get-HeliosActiveStoreDir $id $activeInf
 $programDataDll = Join-Path $ProgramDataDir ("helios_umd_{0}.dll" -f $srcHash.Substring(0, 16).ToLowerInvariant())
@@ -150,6 +156,7 @@ if ($Mode -eq "PackageUpgrade") {
       $umdPaths = @($programDataDll, $programDataDll, $programDataDll, $programDataDll)
       $umdNames = @("helios_umd", "helios_umd", "helios_umd", "helios_umd")
     }
+    if ($wowUmdNames.Count -gt 0) { $umdNames = @($umdNames + $wowUmdNames | Select-Object -Unique) }
     New-ItemProperty -LiteralPath $classKey -Name "UserModeDriverName" -PropertyType MultiString -Value $umdPaths -Force | Out-Null
     New-ItemProperty -LiteralPath $classKey -Name "InstalledDisplayDrivers" -PropertyType MultiString -Value $umdNames -Force | Out-Null
     Write-Host "Installed ProgramData UMD: $($copy.Destination)"
@@ -229,7 +236,10 @@ if ($deployUmd12) {
   if (@($names[0..2] | Where-Object { $_ -notmatch 'helios_umd_[0-9a-f]{16}\.dll$' }).Count -ne 0) { throw "UserModeDriverName[0..2] must all stay on helios_umd" }
   if (-not (Test-Path -LiteralPath $names[3] -PathType Leaf)) { throw "UserModeDriverName[3] path does not exist on disk: $($names[3])" }
   $installed = @((Get-ItemProperty -LiteralPath $classKey).InstalledDisplayDrivers)
-  if ($installed.Count -ne 2) { throw "InstalledDisplayDrivers has $($installed.Count) entries, want exactly 2 (helios_umd,helios_umd12)" }
+  $expectedInstalled = @(@("helios_umd", "helios_umd12") + $wowUmdNames | Select-Object -Unique)
+  if ($installed.Count -ne $expectedInstalled.Count -or (Compare-Object $expectedInstalled $installed)) {
+    throw "InstalledDisplayDrivers must retain the native and installed WoW64 UMD names: $($expectedInstalled -join ',')"
+  }
   Write-Host "UserModeDriverName[3]     -> $($names[3])"
   Write-Host "InstalledDisplayDrivers   -> $($installed -join ',')"
 

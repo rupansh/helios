@@ -198,16 +198,8 @@ pub(crate) struct Umd12Refusals {
     /// `pfnFillDDITable` with a null table pointer, or a byte count too small to
     /// hold even one slot. Expected 0.
     pub(crate) fill_ddi_table_bad_arg: RefusalCounter,
-    /// `pfnFillDDITable` for a `D3D12DDI_TABLE_TYPE` this driver has no typed
-    /// handler for. The table is filled with counting stubs at the **runtime's**
-    /// byte count, so no slot is NULL and no shape is selected; nothing in it is
-    /// implemented.
-    ///
-    /// ⚠ **Expected non-zero, and 1 per device is the measured normal**:
-    /// `D12-G7` showed the runtime asking for
-    /// `D3D12DDI_TABLE_TYPE_0096_EXTENDED_FEATURES` (27, 32 B) on a baseline
-    /// device, and refusing it **loses the device**. A count above 1 per device
-    /// means a table nobody has looked at yet.
+    /// An unsupported table type was refused without writing the runtime's
+    /// buffer. Expected zero: extended-feature negotiation has a typed handler.
     pub(crate) fill_ddi_table_unknown_type: RefusalCounter,
     /// The runtime's table was **smaller** than the struct this build's
     /// `d3d12umddi.h` describes, so the fill was bounded to the runtime's count.
@@ -218,9 +210,8 @@ pub(crate) struct Umd12Refusals {
     /// measured — so non-zero means the negotiated revision is not the one
     /// `ddi12` was generated from.
     pub(crate) fill_ddi_table_truncated: RefusalCounter,
-    /// The runtime's table was **larger** than this build's struct. The tail is
-    /// served by counted stubs rather than left NULL, but those slots can never
-    /// do anything: refresh the bindings.
+    /// The runtime requested more slots than this header declares. Refused
+    /// without writes because an unknown signature cannot be called safely on x86.
     pub(crate) fill_ddi_table_oversized: RefusalCounter,
     /// `pfnFillDDITable` asked for a command-list table index beyond the two
     /// `D12-G5` measured, so its `D3D12DDI_HRTTABLE` was not stashed. Expected 0.
@@ -548,6 +539,7 @@ static UMD12_REFUSAL_SETS: &[&[&RefusalCounter]] = &[
     forward12::fence::REFUSALS,       // L7: fences and query heaps
     forward12::present12::REFUSALS,   // L8: present
     forward12::misc::REFUSALS,        // L9: the tail
+    forward12::tables12::REFUSALS,    // typed extended-feature negotiation
 ];
 
 /// Bump one refusal counter and emit the whole set's summary on its FIRST hit.

@@ -43,12 +43,12 @@ pub(crate) unsafe fn isgn_lookup(dxbc: &[u8], register: u32) -> Option<(std::ffi
     }
     let chunk_count = u32::from_le_bytes(dxbc[28..32].try_into().ok()?) as usize;
     for i in 0..chunk_count {
-        let off_pos = 32 + i * 4;
-        if off_pos + 4 > dxbc.len() {
+        let off_pos = i.checked_mul(4)?.checked_add(32)?;
+        if off_pos.checked_add(4)? > dxbc.len() {
             return None;
         }
         let coff = u32::from_le_bytes(dxbc[off_pos..off_pos + 4].try_into().ok()?) as usize;
-        if coff + 8 > dxbc.len() || &dxbc[coff..coff + 4] != b"ISGN" {
+        if coff.checked_add(8)? > dxbc.len() || &dxbc[coff..coff + 4] != b"ISGN" {
             continue;
         }
         let data = coff + 8; // skip FourCC + chunk size
@@ -57,15 +57,15 @@ pub(crate) unsafe fn isgn_lookup(dxbc: &[u8], register: u32) -> Option<(std::ffi
         }
         let elem_count = u32::from_le_bytes(dxbc[data..data + 4].try_into().ok()?) as usize;
         for e in 0..elem_count {
-            let ep = data + 8 + e * 24;
-            if ep + 24 > dxbc.len() {
+            let ep = e.checked_mul(24)?.checked_add(data)?.checked_add(8)?;
+            if ep.checked_add(24)? > dxbc.len() {
                 return None;
             }
             let name_off = u32::from_le_bytes(dxbc[ep..ep + 4].try_into().ok()?) as usize;
             let sem_index = u32::from_le_bytes(dxbc[ep + 4..ep + 8].try_into().ok()?);
             let reg = u32::from_le_bytes(dxbc[ep + 16..ep + 20].try_into().ok()?);
             if reg == register {
-                let nstart = data + name_off;
+                let nstart = data.checked_add(name_off)?;
                 // Every other offset in this function is checked; this one was
                 // not, and `&v[a..a]` with `a > len` is out of bounds in Rust —
                 // a panic in a DDI is a silent graphics deadlock.
@@ -166,14 +166,14 @@ pub(crate) fn build_layout_signature_blob(registers: &[u32], tokens: &[u8]) -> V
     blob
 }
 
-pub(crate) unsafe extern "C" fn calc_size_element_layout(
+pub(crate) unsafe extern "system" fn calc_size_element_layout(
     _h: Hdevice,
     _a: *const ddi::D3D10DDIARG_CREATEELEMENTLAYOUT,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
-pub(crate) unsafe extern "C" fn create_element_layout(
+pub(crate) unsafe extern "system" fn create_element_layout(
     _h: Hdevice,
     arg: *const ddi::D3D10DDIARG_CREATEELEMENTLAYOUT,
     h_el: ddi::D3D10DDI_HELEMENTLAYOUT,
@@ -203,7 +203,7 @@ pub(crate) unsafe extern "C" fn create_element_layout(
     slot.store(LayoutData { elements: elems });
 }
 
-pub(crate) unsafe extern "C" fn destroy_element_layout(
+pub(crate) unsafe extern "system" fn destroy_element_layout(
     h: Hdevice,
     h_el: ddi::D3D10DDI_HELEMENTLAYOUT,
 ) {
@@ -250,7 +250,7 @@ pub(crate) unsafe extern "C" fn destroy_element_layout(
     }
 }
 
-pub(crate) unsafe extern "C" fn ia_set_input_layout(
+pub(crate) unsafe extern "system" fn ia_set_input_layout(
     h: Hdevice,
     h_el: ddi::D3D10DDI_HELEMENTLAYOUT,
 ) {
@@ -612,7 +612,7 @@ pub(crate) unsafe fn create_vs_input_variant(
     raw
 }
 
-pub(crate) unsafe extern "C" fn ia_set_vertex_buffers(
+pub(crate) unsafe extern "system" fn ia_set_vertex_buffers(
     h: Hdevice,
     start: u32,
     num: u32,
@@ -682,7 +682,7 @@ pub(crate) unsafe extern "C" fn ia_set_vertex_buffers(
     );
 }
 
-pub(crate) unsafe extern "C" fn ia_set_index_buffer(
+pub(crate) unsafe extern "system" fn ia_set_index_buffer(
     h: Hdevice,
     h_buf: ddi::D3D10DDI_HRESOURCE,
     format: ddi::DXGI_FORMAT,
@@ -697,7 +697,9 @@ pub(crate) unsafe extern "C" fn ia_set_index_buffer(
             buf.as_ref().map(|b| b.as_raw() as usize).unwrap_or(0),
             Ordering::Relaxed,
         );
-        bindings.current_ib_format.store(format as u32, Ordering::Relaxed);
+        bindings
+            .current_ib_format
+            .store(format as u32, Ordering::Relaxed);
         bindings.current_ib_offset.store(offset, Ordering::Relaxed);
     }
     if IA_BIND_LOG_COUNT.first_n(128).is_some() {

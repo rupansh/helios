@@ -297,7 +297,7 @@ unsafe fn clear_refused_slot(p_drv_private: *mut c_void, bad_slot: &RefusalCount
 /// `h_device` is not dereferenced: the answer is a property of the adapter, not
 /// of any device state, and is the same for every device this driver creates.
 /// Declared `unsafe` because the DDI's PFN typedef is.
-unsafe extern "C" fn get_implicit_physical_adapter_mask(
+unsafe extern "system" fn get_implicit_physical_adapter_mask(
     _h_device: ddi12::D3D12DDI_HDEVICE,
 ) -> ddi12::UINT {
     HELIOS_PHYSICAL_ADAPTER_MASK
@@ -321,7 +321,7 @@ unsafe extern "C" fn get_implicit_physical_adapter_mask(
 /// # Safety
 /// `p_map` must address `num_physical_adapters` writable `UINT`s the runtime
 /// owns, as the DDI's `_Out_writes_(NumPhysicalAdapters)` declares.
-unsafe extern "C" fn query_node_map(
+unsafe extern "system" fn query_node_map(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     num_physical_adapters: ddi12::UINT,
     p_map: *mut ddi12::UINT,
@@ -377,7 +377,7 @@ unsafe extern "C" fn query_node_map(
 /// # Safety
 /// `character_count_including_null_terminator`, when non-null, must address one
 /// writable `SIZE_T` the runtime owns. `p_buffer` is never dereferenced.
-unsafe extern "C" fn retrieve_shader_comment(
+unsafe extern "system" fn retrieve_shader_comment(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _h_pipeline_state: ddi12::D3D12DDI_HPIPELINESTATE,
     _p_buffer: *mut ddi12::WCHAR,
@@ -466,7 +466,7 @@ unsafe extern "C" fn retrieve_shader_comment(
 /// `0` — but a future real body must read them before writing either array, and
 /// that obligation belongs in this contract rather than in a comment. The two
 /// array pointers are not dereferenced at all, because both counts are `0`.
-unsafe extern "C" fn get_debug_allocation_info(
+unsafe extern "system" fn get_debug_allocation_info(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     object: ddi12::D3D12DDI_HANDLE_AND_TYPE,
     p_num_virtual_address_infos: *mut ddi12::UINT,
@@ -619,7 +619,7 @@ unsafe fn fill_kmt_allocation_info(
 /// # Safety
 /// `arg`, when non-null, must point at a live
 /// `D3D12DDIARG_CREATESCHEDULINGGROUP_0050` for the duration of the call.
-unsafe extern "C" fn calc_private_scheduling_group_size(
+unsafe extern "system" fn calc_private_scheduling_group_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATESCHEDULINGGROUP_0050,
 ) -> ddi12::SIZE_T {
@@ -645,7 +645,7 @@ unsafe extern "C" fn calc_private_scheduling_group_size(
 /// # Safety
 /// `h_group`'s `pDrvPrivate`, when non-null, must address the private block
 /// [`calc_private_scheduling_group_size`] sized.
-unsafe extern "C" fn create_scheduling_group(
+unsafe extern "system" fn create_scheduling_group(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_CREATESCHEDULINGGROUP_0050,
     h_group: ddi12::D3D12DDI_HSCHEDULINGGROUP_0050,
@@ -674,7 +674,7 @@ unsafe extern "C" fn create_scheduling_group(
 /// # Safety
 /// `_h_group` must be a handle the runtime associated with a
 /// `pfnCreateSchedulingGroup` call on this device.
-unsafe extern "C" fn destroy_scheduling_group(
+unsafe extern "system" fn destroy_scheduling_group(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _h_group: ddi12::D3D12DDI_HSCHEDULINGGROUP_0050,
 ) {
@@ -716,7 +716,7 @@ unsafe extern "C" fn destroy_scheduling_group(
 /// # Safety
 /// `p_num_meta_commands`, when non-null, must address one writable `UINT` the
 /// runtime owns. `p_descs` is never dereferenced.
-unsafe extern "C" fn enumerate_meta_commands(
+unsafe extern "system" fn enumerate_meta_commands(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     p_num_meta_commands: *mut ddi12::UINT,
     _p_descs: *mut ddi12::D3D12DDIARG_META_COMMAND_DESC,
@@ -749,7 +749,7 @@ unsafe extern "C" fn enumerate_meta_commands(
 /// # Safety
 /// `p_parameter_count`, when non-null, must address one writable `UINT` the
 /// runtime owns. `p_parameter_descs` is never dereferenced.
-unsafe extern "C" fn enumerate_meta_command_parameters(
+unsafe extern "system" fn enumerate_meta_command_parameters(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _command_id: ddi12::GUID,
     _stage: ddi12::D3D12DDI_META_COMMAND_PARAMETER_STAGE,
@@ -779,7 +779,7 @@ unsafe extern "C" fn enumerate_meta_command_parameters(
 /// `p_creation_parameters`, when non-null, must address
 /// `creation_parameters_data_size_in_bytes` readable bytes. Neither is
 /// dereferenced here.
-unsafe extern "C" fn calc_private_meta_command_size(
+unsafe extern "system" fn calc_private_meta_command_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _command_id: ddi12::GUID,
     _node_mask: ddi12::UINT,
@@ -801,7 +801,7 @@ unsafe extern "C" fn calc_private_meta_command_size(
 /// # Safety
 /// `h_meta_command`'s `pDrvPrivate`, when non-null, must address the private
 /// block [`calc_private_meta_command_size`] sized.
-unsafe extern "C" fn create_meta_command(
+unsafe extern "system" fn create_meta_command(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _command_id: ddi12::GUID,
     _node_mask: ddi12::UINT,
@@ -835,7 +835,7 @@ unsafe extern "C" fn create_meta_command(
 /// # Safety
 /// `_h_meta_command` must be a handle the runtime associated with a
 /// `pfnCreateMetaCommand` call on this device.
-unsafe extern "C" fn destroy_meta_command(
+unsafe extern "system" fn destroy_meta_command(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _h_meta_command: ddi12::D3D12DDI_HMETACOMMAND_0052,
 ) {
@@ -857,7 +857,7 @@ unsafe extern "C" fn destroy_meta_command(
 /// # Safety
 /// `p_info`, when non-null, must address one writable
 /// `D3D12DDIARG_META_COMMAND_REQUIRED_PARAMETER_INFO` the runtime owns.
-unsafe extern "C" fn get_meta_command_required_parameter_info(
+unsafe extern "system" fn get_meta_command_required_parameter_info(
     _h_meta_command: ddi12::D3D12DDI_HMETACOMMAND_0052,
     _stage: ddi12::D3D12DDI_META_COMMAND_PARAMETER_STAGE,
     _parameter_index: ddi12::UINT,
@@ -912,7 +912,7 @@ unsafe extern "C" fn get_meta_command_required_parameter_info(
 /// # Safety
 /// `arg`, when non-null, must point at a live
 /// `D3D12DDIARG_CREATE_STATE_OBJECT_0054` for the duration of the call.
-unsafe extern "C" fn calc_private_state_object_size(
+unsafe extern "system" fn calc_private_state_object_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_STATE_OBJECT_0054,
 ) -> ddi12::SIZE_T {
@@ -936,7 +936,7 @@ unsafe extern "C" fn calc_private_state_object_size(
 /// `h_state_object`'s `pDrvPrivate`, when non-null, must address the private
 /// block [`calc_private_state_object_size`] sized. `arg`, when non-null, must
 /// point at a live `D3D12DDIARG_CREATE_STATE_OBJECT_0054`.
-unsafe extern "C" fn create_state_object(
+unsafe extern "system" fn create_state_object(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_STATE_OBJECT_0054,
     h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
@@ -977,7 +977,7 @@ unsafe extern "C" fn create_state_object(
 /// # Safety
 /// `_h_state_object` must be a handle the runtime associated with a
 /// `pfnCreateStateObject` or `pfnAddToStateObject` call on this device.
-unsafe extern "C" fn destroy_state_object(
+unsafe extern "system" fn destroy_state_object(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
 ) {
@@ -999,7 +999,7 @@ unsafe extern "C" fn destroy_state_object(
 /// `p_info`, when non-null, must address one writable
 /// `D3D12DDI_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO_0054` the runtime
 /// owns. `p_inputs` is never dereferenced.
-unsafe extern "C" fn get_raytracing_acceleration_structure_prebuild_info(
+unsafe extern "system" fn get_raytracing_acceleration_structure_prebuild_info(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _p_inputs: *const ddi12::D3D12DDI_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0054,
     p_info: *mut ddi12::D3D12DDI_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO_0054,
@@ -1041,7 +1041,7 @@ unsafe extern "C" fn get_raytracing_acceleration_structure_prebuild_info(
 /// # Safety
 /// Neither pointer argument is dereferenced. Declared `unsafe` because the DDI's
 /// PFN typedef is.
-unsafe extern "C" fn check_driver_matching_identifier(
+unsafe extern "system" fn check_driver_matching_identifier(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _data_type: ddi12::D3D12DDI_SERIALIZED_DATA_TYPE,
     _identifier: *const ddi12::D3D12DDI_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER_0054,
@@ -1061,7 +1061,7 @@ unsafe extern "C" fn check_driver_matching_identifier(
 /// # Safety
 /// `_p_export_name` is never dereferenced, and the returned pointer is null, so
 /// no lifetime is implied. Declared `unsafe` because the DDI's PFN typedef is.
-unsafe extern "C" fn get_shader_identifier(
+unsafe extern "system" fn get_shader_identifier(
     _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
     _p_export_name: ddi12::LPCWSTR,
 ) -> *mut c_void {
@@ -1080,7 +1080,7 @@ unsafe extern "C" fn get_shader_identifier(
 /// # Safety
 /// `_p_export_name` is never dereferenced. Declared `unsafe` because the DDI's
 /// PFN typedef is.
-unsafe extern "C" fn get_shader_stack_size(
+unsafe extern "system" fn get_shader_stack_size(
     _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
     _p_export_name: ddi12::LPCWSTR,
 ) -> ddi12::UINT {
@@ -1099,7 +1099,7 @@ unsafe extern "C" fn get_shader_stack_size(
 /// # Safety
 /// The handle is not dereferenced. Declared `unsafe` because the DDI's PFN
 /// typedef is.
-unsafe extern "C" fn get_pipeline_stack_size(
+unsafe extern "system" fn get_pipeline_stack_size(
     _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
 ) -> ddi12::UINT {
     note_refusal(&L9_REFUSALS.pipeline_stack_size_absent);
@@ -1115,7 +1115,7 @@ unsafe extern "C" fn get_pipeline_stack_size(
 /// # Safety
 /// The handle is not dereferenced. Declared `unsafe` because the DDI's PFN
 /// typedef is.
-unsafe extern "C" fn set_pipeline_stack_size(
+unsafe extern "system" fn set_pipeline_stack_size(
     _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
     _stack_size: ddi12::UINT,
 ) {
@@ -1130,7 +1130,7 @@ unsafe extern "C" fn set_pipeline_stack_size(
 /// # Safety
 /// `arg`, when non-null, must point at a live
 /// `D3D12DDIARG_ADD_TO_STATE_OBJECT_0072` for the duration of the call.
-unsafe extern "C" fn calc_private_add_to_state_object_size(
+unsafe extern "system" fn calc_private_add_to_state_object_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_ADD_TO_STATE_OBJECT_0072,
 ) -> ddi12::SIZE_T {
@@ -1149,7 +1149,7 @@ unsafe extern "C" fn calc_private_add_to_state_object_size(
 /// # Safety
 /// `h_state_object`'s `pDrvPrivate`, when non-null, must address the private
 /// block [`calc_private_add_to_state_object_size`] sized.
-unsafe extern "C" fn add_to_state_object(
+unsafe extern "system" fn add_to_state_object(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_ADD_TO_STATE_OBJECT_0072,
     h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
@@ -1183,7 +1183,7 @@ unsafe extern "C" fn add_to_state_object(
 /// # Safety
 /// Neither the handle nor `_p_program_name` is dereferenced. Declared `unsafe`
 /// because the DDI's PFN typedef is.
-unsafe extern "C" fn get_program_identifier(
+unsafe extern "system" fn get_program_identifier(
     _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
     _p_program_name: ddi12::LPCWSTR,
 ) -> ddi12::D3D12DDI_PROGRAM_IDENTIFIER_0108 {
@@ -1203,7 +1203,7 @@ unsafe extern "C" fn get_program_identifier(
 /// `p_requirements`, when non-null, must address one writable
 /// `D3D12DDI_WORK_GRAPH_MEMORY_REQUIREMENTS_0108` the runtime owns.
 /// `_p_program_name` is never dereferenced.
-unsafe extern "C" fn get_work_graph_memory_requirements(
+unsafe extern "system" fn get_work_graph_memory_requirements(
     _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
     _p_program_name: ddi12::LPCWSTR,
     p_requirements: *mut ddi12::D3D12DDI_WORK_GRAPH_MEMORY_REQUIREMENTS_0108,
@@ -1255,7 +1255,7 @@ unsafe extern "C" fn get_work_graph_memory_requirements(
 /// # Safety
 /// `p_further_measurements_desired`, when non-null, must address one writable
 /// `BOOL` the runtime owns.
-unsafe extern "C" fn set_background_processing_mode(
+unsafe extern "system" fn set_background_processing_mode(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     mode: ddi12::D3D12DDI_BACKGROUND_PROCESSING_MODE_0062,
     measurements_action: ddi12::D3D12DDI_MEASUREMENTS_ACTION_0062,
@@ -1295,7 +1295,7 @@ unsafe extern "C" fn set_background_processing_mode(
 ///
 /// # Safety
 /// Nothing is dereferenced. Declared `unsafe` because the DDI's PFN typedef is.
-unsafe extern "C" fn implicit_shader_cache_control(
+unsafe extern "system" fn implicit_shader_cache_control(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _flags: ddi12::D3D12DDI_IMPLICIT_SHADER_CACHE_CONTROL_FLAGS_0080,
 ) {
@@ -1374,7 +1374,7 @@ const _: () = assert!(
 /// # Safety
 /// The handle is not dereferenced. Declared `unsafe` because the DDI's PFN
 /// typedef is.
-unsafe extern "C" fn set_marker(_h_list: ddi12::D3D12DDI_HCOMMANDLIST, _marker: ddi12::UINT64) {
+unsafe extern "system" fn set_marker(_h_list: ddi12::D3D12DDI_HCOMMANDLIST, _marker: ddi12::UINT64) {
     note_refusal(&L9_REFUSALS.marker_dropped);
 }
 
@@ -1409,7 +1409,7 @@ unsafe extern "C" fn set_marker(_h_list: ddi12::D3D12DDI_HCOMMANDLIST, _marker: 
 /// # Safety
 /// Neither handle is dereferenced; only the session handle's `pDrvPrivate` word
 /// is compared against null. Declared `unsafe` because the DDI's PFN typedef is.
-unsafe extern "C" fn set_protected_resource_session(
+unsafe extern "system" fn set_protected_resource_session(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_session: ddi12::D3D12DDI_HPROTECTEDRESOURCESESSION_0030,
 ) {
@@ -1482,7 +1482,7 @@ unsafe extern "C" fn set_protected_resource_session(
 /// `D3D12DDI_WRITEBUFFERIMMEDIATE_PARAMETER_0032`s; `p_modes`, when non-null,
 /// must address `count` readable `D3D12DDI_WRITEBUFFERIMMEDIATE_MODE_0032`s. Both
 /// are what the DDI declares `_In_reads_(Count)`.
-unsafe extern "C" fn write_buffer_immediate(
+unsafe extern "system" fn write_buffer_immediate(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     count: ddi12::UINT,
     p_params: *const ddi12::D3D12DDI_WRITEBUFFERIMMEDIATE_PARAMETER_0032,
@@ -1625,7 +1625,7 @@ unsafe extern "C" fn write_buffer_immediate(
 /// # Safety
 /// The handle is not dereferenced. Declared `unsafe` because the DDI's PFN
 /// typedef is.
-unsafe extern "C" fn set_view_instance_mask(
+unsafe extern "system" fn set_view_instance_mask(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     mask: ddi12::UINT,
 ) {
@@ -1659,7 +1659,7 @@ unsafe extern "C" fn set_view_instance_mask(
 /// # Safety
 /// No pointer is dereferenced. Declared `unsafe` because the DDI's PFN typedef
 /// is.
-unsafe extern "C" fn initialize_meta_command(
+unsafe extern "system" fn initialize_meta_command(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     _h_meta_command: ddi12::D3D12DDI_HMETACOMMAND_0052,
     _p_parameters: *const c_void,
@@ -1674,7 +1674,7 @@ unsafe extern "C" fn initialize_meta_command(
 /// # Safety
 /// No pointer is dereferenced. Declared `unsafe` because the DDI's PFN typedef
 /// is.
-unsafe extern "C" fn execute_meta_command(
+unsafe extern "system" fn execute_meta_command(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     _h_meta_command: ddi12::D3D12DDI_HMETACOMMAND_0052,
     _p_parameters: *const c_void,
@@ -1698,7 +1698,7 @@ unsafe extern "C" fn execute_meta_command(
 /// # Safety
 /// `_arg` is never dereferenced. Declared `unsafe` because the DDI's PFN typedef
 /// is.
-unsafe extern "C" fn build_raytracing_acceleration_structure(
+unsafe extern "system" fn build_raytracing_acceleration_structure(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     _arg: *const ddi12::D3D12DDIARG_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_0054,
 ) {
@@ -1720,7 +1720,7 @@ unsafe extern "C" fn build_raytracing_acceleration_structure(
 /// # Safety
 /// `_arg` is never dereferenced. Declared `unsafe` because the DDI's PFN typedef
 /// is.
-unsafe extern "C" fn emit_raytracing_acceleration_structure_postbuild_info(
+unsafe extern "system" fn emit_raytracing_acceleration_structure_postbuild_info(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     _arg: *const ddi12::D3D12DDIARG_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_0054,
 ) {
@@ -1732,7 +1732,7 @@ unsafe extern "C" fn emit_raytracing_acceleration_structure_postbuild_info(
 /// # Safety
 /// `_arg` is never dereferenced. Declared `unsafe` because the DDI's PFN typedef
 /// is.
-unsafe extern "C" fn copy_raytracing_acceleration_structure(
+unsafe extern "system" fn copy_raytracing_acceleration_structure(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     _arg: *const ddi12::D3D12DDIARG_COPY_RAYTRACING_ACCELERATION_STRUCTURE_0054,
 ) {
@@ -1752,7 +1752,7 @@ unsafe extern "C" fn copy_raytracing_acceleration_structure(
 /// # Safety
 /// The handle is not dereferenced. Declared `unsafe` because the DDI's PFN
 /// typedef is.
-unsafe extern "C" fn set_pipeline_state1(
+unsafe extern "system" fn set_pipeline_state1(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
 ) {
@@ -1768,7 +1768,7 @@ unsafe extern "C" fn set_pipeline_state1(
 /// # Safety
 /// `_arg` is never dereferenced. Declared `unsafe` because the DDI's PFN typedef
 /// is.
-unsafe extern "C" fn dispatch_rays(
+unsafe extern "system" fn dispatch_rays(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     _arg: *const ddi12::D3D12DDIARG_DISPATCH_RAYS_0054,
 ) {
@@ -1819,7 +1819,7 @@ unsafe extern "C" fn dispatch_rays(
 /// `D3D12_RS_SET_SHADING_RATE_COMBINER_COUNT` readable
 /// `D3D12DDI_SHADING_RATE_COMBINER_0062`s, as the API's fixed-size array
 /// declares.
-unsafe extern "C" fn rs_set_shading_rate(
+unsafe extern "system" fn rs_set_shading_rate(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     shading_rate: ddi12::D3D12DDI_SHADING_RATE_0062,
     combiners: *const ddi12::D3D12DDI_SHADING_RATE_COMBINER_0062,
@@ -1888,7 +1888,7 @@ unsafe extern "C" fn rs_set_shading_rate(
 /// # Safety
 /// The resource handle is not dereferenced; only its `pDrvPrivate` word is
 /// compared against null. Declared `unsafe` because the DDI's PFN typedef is.
-unsafe extern "C" fn rs_set_shading_rate_image(
+unsafe extern "system" fn rs_set_shading_rate_image(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_image: ddi12::D3D12DDI_HRESOURCE,
 ) {
@@ -1931,7 +1931,7 @@ unsafe extern "C" fn rs_set_shading_rate_image(
 /// # Safety
 /// The handle is not dereferenced. Declared `unsafe` because the DDI's PFN
 /// typedef is.
-unsafe extern "C" fn dispatch_mesh(
+unsafe extern "system" fn dispatch_mesh(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     x: ddi12::UINT,
     y: ddi12::UINT,
@@ -1964,7 +1964,7 @@ unsafe extern "C" fn dispatch_mesh(
 /// # Safety
 /// `p_desc`, when non-null, must point at a live `D3D12DDI_SET_PROGRAM_DESC_0108`
 /// for the duration of the call. Only its first (non-union) field is read.
-unsafe extern "C" fn set_program(
+unsafe extern "system" fn set_program(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     p_desc: *const ddi12::D3D12DDI_SET_PROGRAM_DESC_0108,
 ) {
@@ -1994,7 +1994,7 @@ unsafe extern "C" fn set_program(
 /// `p_desc`, when non-null, must point at a live
 /// `D3D12DDI_DISPATCH_GRAPH_DESC_0108` for the duration of the call. Only its
 /// first (non-union) field is read.
-unsafe extern "C" fn dispatch_graph(
+unsafe extern "system" fn dispatch_graph(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     p_desc: *const ddi12::D3D12DDI_DISPATCH_GRAPH_DESC_0108,
 ) {

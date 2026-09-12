@@ -10,10 +10,11 @@
 #
 # Usage (from anywhere; the script locates the repo itself):
 #     tools/umd12-host-check.sh
-#     tools/umd12-host-check.sh --message-format short
+#     tools/umd12-host-check.sh --arch x86 --message-format short
 #     tools/umd12-host-check.sh --clippy -- -D warnings
-# `--clippy` (first argument only) runs `cargo clippy` instead of `cargo check`;
-# every other argument is forwarded verbatim.
+# `--arch x86|x64` selects the matching WDK cache (default x64).
+# `--clippy` runs `cargo clippy` instead of `cargo check`; put these options
+# before any arguments forwarded to cargo.
 #
 # ⭐ The `--clippy` mode is not a convenience. `PARALLEL.md` §10's per-lane merge
 # bar requires `-D warnings` clippy over 214 hand-written handlers — that row is
@@ -69,7 +70,32 @@
 
 set -euo pipefail
 
-readonly TARGET_TRIPLE="x86_64-pc-windows-msvc"
+target_arch="x64"
+cargo_cmd="check"
+target_dir="target/linux"
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --arch)
+            if [[ $# -lt 2 || ( "$2" != "x86" && "$2" != "x64" ) ]]; then
+                echo "umd12-host-check: --arch requires x86 or x64" >&2
+                exit 2
+            fi
+            target_arch="$2"
+            shift 2
+            ;;
+        --clippy)
+            cargo_cmd="clippy"
+            target_dir="target/linux-clippy"
+            shift
+            ;;
+        *) break ;;
+    esac
+done
+case "$target_arch" in
+    x86) TARGET_TRIPLE="i686-pc-windows-msvc" ;;
+    x64) TARGET_TRIPLE="x86_64-pc-windows-msvc" ;;
+esac
+readonly TARGET_TRIPLE
 
 # Resolve the repo root from this script's own location, so the script works
 # from any cwd (agents run in worktrees; PARALLEL.md §7 recommends `isolation:
@@ -115,14 +141,6 @@ cd -- "${CRATE_DIR}"
 # mutually invalidating fingerprints into one directory, so sharing it makes
 # every alternation a full rebuild — which on the S6 fan-out is the difference
 # between a 7-second loop and a minute-long one.
-cargo_cmd="check"
-target_dir="target/linux"
-if [[ "${1:-}" == "--clippy" ]]; then
-    shift
-    cargo_cmd="clippy"
-    target_dir="target/linux-clippy"
-fi
-
 # `"$@"` is forwarded so a lane can add e.g. `--message-format short`,
 # `--quiet`, or (with `--clippy`) `-- -D warnings`.
 CARGO_TARGET_DIR="${target_dir}" exec cargo "${cargo_cmd}" \

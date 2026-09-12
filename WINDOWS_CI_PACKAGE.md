@@ -2,7 +2,7 @@
 
 The `Windows graphics and compute bundle` GitHub Actions workflow builds one
 x64 Windows archive that turns a clean Helios Windows 11 guest into a
-system-wide graphics/compute installation. It includes x86 Vulkan/OpenGL
+system-wide graphics/compute installation. It includes x86 Direct3D 11/12 and Vulkan/OpenGL
 components for WoW64 applications alongside the native x64 stack.
 
 ## What the workflow builds
@@ -10,8 +10,9 @@ components for WoW64 applications alongside the native x64 stack.
 The jobs are independent so an error points at the actual component:
 
 1. `driver` builds the DXVK and vkd3d-proton static cores, embeds them in
-   `helios_umd.dll` (D3D11) and `helios_umd12.dll` (D3D12), and builds/packages
-   the Rust WDDM kernel driver. Both UMDs are required package inputs.
+   `helios_umd.dll` (D3D11) and `helios_umd12.dll` (D3D12) for AMD64, and
+   `helios_umd32.dll` / `helios_umd12_32.dll` for WoW64. It builds/packages the
+   AMD64 Rust WDDM kernel driver. All four UMDs are required package inputs.
 2. `mesa` and `mesa_x86` build the pinned Mesa submodule for x64 and x86 with
    both the Venus Vulkan ICD and the Zink WGL OpenGL ICD enabled.
 3. `opencl` builds pinned CLVK with the clspv online compiler embedded. End-user
@@ -43,7 +44,7 @@ expose synchronization/protocol mismatches that a successful compile cannot.
 ## Signing model
 
 CI creates a unique, non-exportable test-signing key for each bundle. It signs
-the SYS and both UMDs before creating the catalog, signs the final catalog, exports
+the SYS and all four UMDs before creating the catalog, signs the final catalog, exports
 only the public certificate, then destroys the CI private key. The installer
 adds that public certificate to `Root` and `TrustedPublisher`.
 
@@ -58,7 +59,7 @@ the ephemeral certificate.
 
 `Install-Helios.ps1` verifies the payload manifest before making changes, then:
 
-- installs the Visual C++ x64 runtime and the prebuilt PnP driver package;
+- installs the Visual C++ x64 and x86 runtimes and the prebuilt PnP driver package;
 - installs Mesa and CLVK in a versioned directory below `Program Files`;
 - installs official x64 and x86 `vulkan-1.dll` loaders and the x64 `OpenCL.dll`
   only when the matching system loader is absent;
@@ -73,10 +74,13 @@ installation managed by another bundle; uninstall it first so rollback state
 cannot be lost.
 
 `Verify-Helios.ps1 -RunSmokeTests` checks hashes and registrations, then creates
-a Vulkan instance, creates D3D11 and D3D12 devices on Helios, creates a WGL context, and
-compiles/runs an OpenCL kernel. The OpenCL probe validates every output value. Run graphics probes in the
+Vulkan instances, D3D11 and D3D12 devices on Helios, and WGL contexts in both
+x64 and x86 processes. Direct3D probes also clear/copy/read back textures in
+both architectures. It compiles/runs an x64 OpenCL kernel. The OpenCL probe validates every output value. Run graphics probes in the
 logged-in desktop session or an interactive scheduled task; session 0 is refused.
-The D3D12 smoke checks native runtime device creation, not rendering or conformance.
+D3D11 requires feature level 11.0 and verifies every pixel of a 31x17 readback.
+D3D12 runs the existing clear/readback probe with `--expect ok`; neither check
+establishes presentation correctness or full conformance.
 
 ## Application compatibility files
 
@@ -107,17 +111,20 @@ and WDK. The setup script uses an already installed WDK when available and
 otherwise installs the official 10.0.26100 SDK/WDK packages with winget. A
 self-hosted runner should preinstall those tools if winget is unavailable.
 
-The bundle supports WoW64 Vulkan and OpenGL using independently built x86 Mesa
-and Vulkan-loader binaries. WoW64 Direct3D and OpenCL still require separately
-built x86 WDDM UMD/DXVK and CLVK/OpenCL-loader components; copying x64 DLLs into
-`SysWOW64` is not a valid substitute.
+The bundle builds native x86 Direct3D UMDs alongside the independent x86 Mesa
+and Vulkan-loader binaries. `UserModeDriverNameWoW` registers the x86 UMDs in
+API slots 0–2 (D3D11) and 3 (D3D12), using distinct DriverStore filenames.
+`InstalledDisplayDrivers` lists all four UMDs. PnP installs/removes both
+architectures together, including rollback to the previous complete package.
+OpenCL remains x64-only.
 
 The driver job installs native `widl` through MSYS2's
 `mingw-w64-ucrt-x86_64-tools` package and initializes vkd3d's recursive submodules.
 It builds only `helios_d3d12_static`; no app-local `d3d12.dll`, `d3d12core.dll`,
-or `helios_vkd3d.dll` is shipped. The build verifies `OpenAdapter12` and rejects
-DXGI/D3D12 runtime imports in `helios_umd12.dll`. DXVK uses `/MT`; vkd3d and
-UMD12 keep their existing `/MD` contract and the bundle includes the VC runtime.
+or `helios_vkd3d.dll` is shipped. The build verifies PE machine types and undecorated `OpenAdapter10`,
+`OpenAdapter10_2`, and `OpenAdapter12` exports, rejects DXGI/D3D12 runtime imports
+in both D3D12 UMDs, and rejects dynamic CRT imports in both D3D11 UMDs. DXVK uses `/MT`; vkd3d and
+UMD12 keep their existing `/MD` contract and the bundle includes both VC runtimes.
 Engine licenses, optional UMD PDBs, vkd3d source provenance, and the actual driver
 build tool versions (`payload/driver/toolchain.json`) travel with the package.
 
@@ -130,3 +137,12 @@ The VM has both VS 2022 and VS 18 and several SDKs; CI uses its Windows 2022
 runner's installed MSVC/WDK. `toolchain.json` records their selected versions.
 The VM's nightly is dated 2026-06-03 and its default Rust is 1.96.0; CI retains
 its explicit nightly-2026-07-14 pin and applies it to cargo-make and both UMDs.
+
+The local build requires `HELIOS_DXVK_BUILD_X86` and `HELIOS_VKD3D_BUILD_X86`
+for `cargo make` packaging; `Build-Driver.ps1` sets these after building the
+engines with the x86 Visual Studio environment and
+`ci/windows/clang-cl-x86-native.ini`. x86 Cargo outputs live under each crate's
+`target/i686-pc-windows-msvc/<profile>` and are renamed only when staged.
+Verifier checks installed image hashes against the bundle, PE architectures,
+and both four-slot registrations. The shared VC runtimes remain installed on
+uninstall, as before.

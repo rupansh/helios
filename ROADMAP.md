@@ -12,6 +12,42 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## WoW64 Direct3D 11/12 support and PassMark, 2026-09-12
+
+PassMark's `PerformanceTest64.exe` starts a **32-bit** `PT-D3D11Test.exe`.
+On the .271 guest, `UserModeDriverNameWoW` was absent: an interactive x86
+`D3D11CreateDevice(HARDWARE, FL_11_0)` probe returned **0x887A0004**, while the
+identical x64 probe succeeded. WARP worked in both, and the display was landscape.
+This explains the generic initialization dialog before swapchain creation.
+
+The .272 source builds separate `helios_umd32.dll` / `helios_umd12_32.dll`,
+registered in WoW64 slots 0–2 / 3 alongside their native counterparts. Both
+DXVK and vkd3d engines build with the MSVC x86 ABI. All DDI callbacks, including
+fallbacks and deferred-context adapters, preserve their exact WDK signatures;
+bindgen selects Cargo's target, including separate x86/x64 D3D12 caches. Vulkan
+memory handles retain 64 bits, process pointers and PSO streams follow target
+width/alignment, and both architectures read the same Helios registry knobs.
+No KMD wire layout changed. OpenCL remains x64-only.
+
+Packaging includes four UMDs, both VC runtimes, matching D3D device/readback
+probes, PE/export/CRT checks, catalog signing over final image bytes, and
+registration/hash verification. Rollback preserves or removes WoW64 registration
+by package ownership. Independent ABI, lifetime, build and rollback reviews
+closed the findings before guest deployment.
+
+Build-box validation on `firstheberg2-win`: all four release UMDs linked; x86
+D3D11 exports the expected undecorated entry points with no dynamic CRT imports;
+D3D12 table tests passed **54 x86 / 53 x64 checks**, including x86 callee stack
+cleanup. Shared UMD tests passed **5** on Windows x86; protocol tests passed
+**11** on Windows x86 and **14** on Linux (three Linux UAPI comparisons remain
+Linux-only). Both D3D12 target checks and strict Clippy passed. Generated layout
+assertions stay enabled. Raw evidence: `tmp/wow64-20260912/`; initial failure:
+`tmp/passmark-20260912/`.
+
+**Acceptance pending:** clean package build/signing, guest installation, matching
+GPU clear/readback probes, visible x86 rendering and the actual PassMark workload.
+These builds and CPU-side checks are not GPU rendering acceptance.
+
 ## Metadata consistency, 2026-09-12
 
 The product/adapter/monitor name is **Helios vGPU**, published and developed by

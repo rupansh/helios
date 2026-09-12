@@ -1,50 +1,22 @@
-// d3d12_fill_table_probe.cpp -- does S6-0's pfnFillDDITable honour the runtime's
-// SIZE_T, in BOTH directions, and does it leave zero NULL slots?
+// Validate D3D12 DDI table publication without creating an adapter or device.
+// Exact and short buffers must be filled without touching their canaries;
+// unknown tables, oversized buffers and partial pointer slots must be refused
+// without writes. Exercise the remaining Blt fallback and feature negotiation
+// through WDK function types so x86 stdcall cleanup is part of the check.
 //
-// This is the execution evidence for what PARALLEL.md section 3 calls "the
-// single highest-consequence line in S6-0". It needs no adapter, no device and
-// no caps answer, which matters: with pfnGetCaps still refusing (L1 has not
-// landed), the D3D12 runtime abandons device creation two calls in and never
-// reaches pfnFillDDITable at all -- measured at S5, tmp/dx12/gates/G6/RESULT.md.
-// So the fill is driven directly, through helios_umd12.dll's
-// helios_umd12_probe_fill_ddi_table_v1 export.
-//
-// WHAT IT PROVES, and why each check is the shape it is.
-//
-//  1. NO NULL SLOT. Every pointer-sized slot inside the byte count is non-NULL
-//     after the fill. A WDDM UMD must fill every slot before returning or the
-//     runtime calls through an uninitialised one.
-//
-//  2. R702, THE DANGEROUS DIRECTION. Ask for size_of(T) - 8 and check that the
-//     GUARD BAND past the count is byte-for-byte the poison it was written with.
-//     That is the failure the R702 class actually is: 24H2 passed 576 bytes for
-//     a 592-byte DRIVERCAPS and the D3D11 driver wrote past it. A test that only
-//     checks the filled prefix cannot see it.
-//
-//  3. THE OTHER DIRECTION. Ask for size_of(T) + 64 and check every slot in the
-//     larger buffer is non-NULL -- i.e. a table shape newer than this build's
-//     header leaves no hole, because the driver stubs the tail it cannot name.
-//
-//  4. THE STUBS ARE CALLABLE and they count. Call one slot through its
-//     function-pointer type and check it returns 0 and does not fault.
-//
-//  5. AN UNSERVED TABLE TYPE WRITES NOTHING. Ask for a table type the driver
-//     does not serve and check the whole buffer is still poison -- the property
-//     DECISIONS.md section 7.4 actually demands of the closed dispatch.
-//
-// ASCII only, on purpose: this file lives on the Z:\ 9p share.
-//
-// Build (on the VM, from an x64 developer prompt):
-//   cl /nologo /EHsc /W4 Z:\tools\d3d12_fill_table_probe.cpp
-//      /Fe:C:\Users\Rupansh\d12s60\filltable.exe /link
-//
-// Run:
-//   filltable.exe [path-to-helios_umd12.dll]
-// Default path is the ProgramData hotplug location's newest helios_umd12_*.dll.
+// Build from an x86 or x64 developer prompt with WDK headers available:
+//   cl /nologo /EHsc /W4 tools\d3d12_fill_table_probe.cpp /Fe:filltable.exe
+// Run with an explicit same-bitness driver:
+//   filltable.exe path-to-helios_umd12.dll
+// Without a path, the x64 probe finds the newest ProgramData hotplug driver.
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <winternl.h> // NTSTATUS is required by d3d12umddi.h's d3dkmddi.h include.
+#include <d3d12umddi.h>
+
+#include <cstddef>
 
 #include <cstdio>
 #include <cstring>
@@ -56,7 +28,6 @@ namespace {
 typedef long HRESULT_T;
 typedef HRESULT_T(__cdecl* PFN_FILL)(int table_type, void* table, size_t table_size, unsigned index);
 typedef size_t(__cdecl* PFN_SIZE)(int table_type);
-typedef size_t(__cdecl* PFN_SLOT)(size_t);
 
 const unsigned char kPoison = 0xA5;
 const size_t kSlot = sizeof(void*);
@@ -124,6 +95,10 @@ struct Table {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (sizeof(void*) == 4 && argc < 2) {
+        printf("FAIL: x86 probe requires an explicit x86 helios_umd12 DLL path\n");
+        return 2;
+    }
     std::string dll = argc > 1 ? argv[1] : newest_programdata_umd12();
     if (dll.empty()) {
         printf("FAIL: no helios_umd12 DLL given and none found in C:\\ProgramData\\HeliosUmd\\\n");
@@ -150,6 +125,7 @@ int main(int argc, char** argv) {
         {0, "DEVICE_FUNCS_CORE_0109", 124},
         {1, "COMMAND_LIST_FUNCS_3D_0108", 75},
         {2, "COMMAND_QUEUE_FUNCS_CORE_0001", 7},
+        {27, "EXTENDED_FEATURES_FUNCS_0096", 4},
     };
 
     for (const Table& t : tables) {
@@ -179,13 +155,63 @@ int main(int argc, char** argv) {
                         "%s: exact -> %zu-byte guard band untouched", t.name, guard);
             check(untouched(buf, bytes, bytes + guard), msg);
 
-            // --- 4. a stub is callable and returns 0 -----------------------
-            PFN_SLOT slot0 = nullptr;
-            std::memcpy(&slot0, buf.data(), kSlot);
-            size_t rv = slot0 ? slot0(0) : 1;
-            _snprintf_s(msg, sizeof(msg), _TRUNCATE, "%s: slot 0 stub returned %zu (want 0)",
-                        t.name, rv);
-            check(slot0 != nullptr && rv == 0, msg);
+            if (t.type == D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D && hr == 0 &&
+                bytes == sizeof(D3D12DDI_COMMAND_LIST_FUNCS_3D_0108)) {
+                D3D12DDI_COMMAND_LIST_FUNCS_3D_0108 typed = {};
+                std::memcpy(&typed, buf.data(), sizeof(typed));
+                check(typed.pfnBlt != nullptr, "Blt fallback has a callable WDK signature");
+                if (typed.pfnBlt) {
+                    // Blt remains a counted fallback. Do not call arbitrary slots
+                    // with dummy arguments: most now own real device state.
+                    D3D12DDI_HCOMMANDLIST list = {};
+                    D3D12DDIARG_BLT args = {};
+#if defined(_M_IX86)
+                    unsigned stack_before = 0, stack_after = 0;
+                    __asm mov stack_before, esp
+#endif
+                    typed.pfnBlt(list, &args);
+#if defined(_M_IX86)
+                    __asm mov stack_after, esp
+                    check(stack_before == stack_after,
+                          "x86 Blt fallback performs stdcall stack cleanup");
+#endif
+                    check(untouched(buf, bytes, bytes + guard),
+                          "typed Blt fallback returned with the canary intact");
+                }
+            }
+            if (t.type == D3D12DDI_TABLE_TYPE_0096_EXTENDED_FEATURES && hr == 0 &&
+                bytes == sizeof(D3D12DDI_EXTENDED_FEATURES_FUNCS_0096)) {
+                D3D12DDI_EXTENDED_FEATURES_FUNCS_0096 typed = {};
+                std::memcpy(&typed, buf.data(), sizeof(typed));
+                const bool callable = typed.pfnGetSupportedExtendedFeatures &&
+                    typed.pfnGetSupportedExtendedFeatureVersions &&
+                    typed.pfnEnableExtendedFeature && typed.pfnSetExtendedFeatureCallbacks;
+                check(callable, "all extended-feature callbacks are callable");
+                if (!callable) {
+                    continue;
+                }
+                D3D12DDI_HDEVICE device = {};
+                UINT32 count = 123;
+                const auto feature = D3D12DDI_FEATURE_0054_DOWNLEVEL_SUPPORT;
+                HRESULT feature_hr = typed.pfnGetSupportedExtendedFeatures(
+                    device, feature, &count, nullptr);
+                check(feature_hr == S_OK && count == 0,
+                      "typed feature enumeration writes an empty supported set");
+                feature_hr = typed.pfnGetSupportedExtendedFeatures(
+                    device, feature, nullptr, nullptr);
+                check(FAILED(feature_hr), "null feature-count pointer is refused");
+                count = 123;
+                feature_hr = typed.pfnGetSupportedExtendedFeatureVersions(
+                    device, feature, &count, nullptr);
+                check(FAILED(feature_hr) && count == 0,
+                      "unsupported feature has no versions and is refused");
+                feature_hr = typed.pfnEnableExtendedFeature(device, feature, 1);
+                check(FAILED(feature_hr), "unsupported extended feature cannot be enabled");
+                feature_hr = typed.pfnSetExtendedFeatureCallbacks(
+                    device, D3D12DDI_TABLE_TYPE_0054_DOWNLEVEL_SUPPORT_CALLBACKS,
+                    nullptr, 0);
+                check(FAILED(feature_hr), "absent extended-feature callbacks are refused");
+            }
         }
 
         // --- 2. R702: the runtime's count is SHORTER than our struct -------
@@ -215,14 +241,10 @@ int main(int argc, char** argv) {
             HRESULT_T hr = fill(t.type, buf.data(), asked, 0);
             _snprintf_s(msg, sizeof(msg), _TRUNCATE, "%s: fill(long=%zu) hr=0x%08lX",
                         t.name, asked, (unsigned long)hr);
-            check(hr == 0, msg);
+            check(FAILED(hr), msg);
             _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-                        "%s: long -> all %zu slots non-NULL incl. the unknown tail",
-                        t.name, asked / kSlot);
-            check(all_slots_filled(buf, asked / kSlot), msg);
-            _snprintf_s(msg, sizeof(msg), _TRUNCATE,
-                        "%s: long -> %zu-byte guard band untouched", t.name, guard);
-            check(untouched(buf, asked, asked + guard), msg);
+                        "%s: oversized table and %zu-byte guard entirely untouched", t.name, guard);
+            check(untouched(buf, 0, buf.size()), msg);
         }
     }
 
@@ -253,6 +275,13 @@ int main(int argc, char** argv) {
         HRESULT_T hr = fill(0, buf.data(), 0, 0);
         check(hr != 0, "zero table size is refused");
         check(untouched(buf, 0, buf.size()), "zero table size wrote NOTHING");
+    }
+
+    {
+        std::vector<unsigned char> buf(64, kPoison);
+        HRESULT_T hr = fill(0, buf.data(), kSlot + 1, 0);
+        check(FAILED(hr), "partial function-pointer slot is refused");
+        check(untouched(buf, 0, buf.size()), "partial-slot request wrote NOTHING");
     }
 
     printf("\n%d steps, %d failures\n", g_steps, g_failures);

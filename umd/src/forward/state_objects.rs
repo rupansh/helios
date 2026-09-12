@@ -6,20 +6,20 @@ use super::*;
 
 // --- Rasterizer / depth-stencil state ---------------------------------------
 
-pub(crate) unsafe extern "C" fn calc_size_raster(
+pub(crate) unsafe extern "system" fn calc_size_raster(
     _h: Hdevice,
     _d: *const ddi::D3D10_DDI_RASTERIZER_DESC,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
-pub(crate) unsafe extern "C" fn calc_size_depth(
+pub(crate) unsafe extern "system" fn calc_size_depth(
     _h: Hdevice,
     _d: *const ddi::D3D10_DDI_DEPTH_STENCIL_DESC,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
-pub(crate) unsafe extern "C" fn create_rasterizer_state(
+pub(crate) unsafe extern "system" fn create_rasterizer_state(
     h: Hdevice,
     desc: *const ddi::D3D10_DDI_RASTERIZER_DESC,
     h_rs: ddi::D3D10DDI_HRASTERIZERSTATE,
@@ -64,7 +64,7 @@ pub(crate) unsafe extern "C" fn create_rasterizer_state(
     finish_create(h, created, rs, |s| store_com(h_rs, s));
 }
 
-pub(crate) unsafe extern "C" fn set_rasterizer_state(
+pub(crate) unsafe extern "system" fn set_rasterizer_state(
     h: Hdevice,
     h_rs: ddi::D3D10DDI_HRASTERIZERSTATE,
 ) {
@@ -91,7 +91,7 @@ pub(crate) unsafe fn cvt_stencilop(
     }
 }
 
-pub(crate) unsafe extern "C" fn create_depth_stencil_state(
+pub(crate) unsafe extern "system" fn create_depth_stencil_state(
     h: Hdevice,
     desc: *const ddi::D3D10_DDI_DEPTH_STENCIL_DESC,
     h_ds: ddi::D3D10DDI_HDEPTHSTENCILSTATE,
@@ -120,7 +120,7 @@ pub(crate) unsafe extern "C" fn create_depth_stencil_state(
     finish_create(h, created, ds, |s| store_com(h_ds, s));
 }
 
-pub(crate) unsafe extern "C" fn set_depth_stencil_state(
+pub(crate) unsafe extern "system" fn set_depth_stencil_state(
     h: Hdevice,
     h_ds: ddi::D3D10DDI_HDEPTHSTENCILSTATE,
     stencil_ref: u32,
@@ -134,14 +134,14 @@ pub(crate) unsafe extern "C" fn set_depth_stencil_state(
     }
 }
 
-pub(crate) unsafe extern "C" fn destroy_raster_state(
+pub(crate) unsafe extern "system" fn destroy_raster_state(
     _h: Hdevice,
     h_state: ddi::D3D10DDI_HRASTERIZERSTATE,
 ) {
     release_com(h_state);
 }
 
-pub(crate) unsafe extern "C" fn destroy_depth_state(
+pub(crate) unsafe extern "system" fn destroy_depth_state(
     _h: Hdevice,
     h_state: ddi::D3D10DDI_HDEPTHSTENCILSTATE,
 ) {
@@ -152,14 +152,14 @@ pub(crate) unsafe extern "C" fn destroy_depth_state(
 
 // --- Blend state ------------------------------------------------------------
 
-pub(crate) unsafe extern "C" fn calc_size_blend(
+pub(crate) unsafe extern "system" fn calc_size_blend(
     _h: Hdevice,
     _d: *const ddi::D3D10_1_DDI_BLEND_DESC,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
-pub(crate) unsafe extern "C" fn create_blend_state(
+pub(crate) unsafe extern "system" fn create_blend_state(
     h: Hdevice,
     desc: *const ddi::D3D10_1_DDI_BLEND_DESC,
     h_bs: ddi::D3D10DDI_HBLENDSTATE,
@@ -199,10 +199,10 @@ pub(crate) unsafe extern "C" fn create_blend_state(
 
 /// D3D11.1-interface `pfnCalcPrivateBlendStateSize` (same 8-byte COM-pointer
 /// slot as `calc_size_blend`; only the desc type differs).
-pub(crate) unsafe extern "C" fn calc_size_blend_11_1(
+pub(crate) unsafe extern "system" fn calc_size_blend_11_1(
     _h: Hdevice,
     _d: *const ddi::D3D11_1_DDI_BLEND_DESC,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
@@ -216,7 +216,7 @@ pub(crate) unsafe extern "C" fn calc_size_blend_11_1(
 /// RED-only and every draw on the stack wrote just the R channel (the
 /// black/red-tinted composition class; minimal repro
 /// tools/d3d11_shared_draw_probe.cpp, 2026-07-03).
-pub(crate) unsafe extern "C" fn create_blend_state_11_1(
+pub(crate) unsafe extern "system" fn create_blend_state_11_1(
     h: Hdevice,
     desc: *const ddi::D3D11_1_DDI_BLEND_DESC,
     h_bs: ddi::D3D10DDI_HBLENDSTATE,
@@ -274,7 +274,7 @@ pub(crate) unsafe extern "C" fn create_blend_state_11_1(
     finish_create(h, created, base, |b| store_com(h_bs, b));
 }
 
-pub(crate) unsafe extern "C" fn set_blend_state(
+pub(crate) unsafe extern "system" fn set_blend_state(
     h: Hdevice,
     h_bs: ddi::D3D10DDI_HBLENDSTATE,
     factor: *const f32,
@@ -294,7 +294,7 @@ pub(crate) unsafe extern "C" fn set_blend_state(
     }
 }
 
-pub(crate) unsafe extern "C" fn destroy_blend_state(_h: Hdevice, h_bs: ddi::D3D10DDI_HBLENDSTATE) {
+pub(crate) unsafe extern "system" fn destroy_blend_state(_h: Hdevice, h_bs: ddi::D3D10DDI_HBLENDSTATE) {
     release_com(h_bs);
 }
 

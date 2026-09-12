@@ -292,7 +292,7 @@ fn engine_list9(state: &CommandListState) -> Option<ID3D12GraphicsCommandList9> 
 /// # Safety
 /// `h_list` must be a handle `queue::create_command_list` returned `S_OK` for and
 /// which `pfnDestroyCommandList` has not been called on.
-unsafe extern "C" fn close_command_list(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
+unsafe extern "system" fn close_command_list(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
     // SAFETY: the caller guarantees a live handle from `create_command_list`.
     let Some(state) = (unsafe { queue::command_list_state(h_list) }) else {
         note_refusal(&L3A_REFUSALS.command_list_missing);
@@ -360,7 +360,7 @@ unsafe extern "C" fn close_command_list(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
 /// `h_list` must be a live handle from `queue::create_command_list`; `arg`, when
 /// non-null, must point at a live `D3D12DDIARG_RESETCOMMANDLIST_0040` whose
 /// `hDrvCommandRecorder` is a live handle from `queue::create_command_recorder`.
-unsafe extern "C" fn reset_command_list(
+unsafe extern "system" fn reset_command_list(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     arg: *const ddi12::D3D12DDIARG_RESETCOMMANDLIST_0040,
 ) {
@@ -522,7 +522,7 @@ unsafe extern "C" fn reset_command_list(
 ///
 /// # Safety
 /// `h_list` must be a live handle from `queue::create_command_list`.
-unsafe extern "C" fn draw_instanced(
+unsafe extern "system" fn draw_instanced(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     vertex_count_per_instance: ddi12::UINT,
     instance_count: ddi12::UINT,
@@ -554,7 +554,7 @@ unsafe extern "C" fn draw_instanced(
 ///
 /// # Safety
 /// As [`draw_instanced`].
-unsafe extern "C" fn draw_indexed_instanced(
+unsafe extern "system" fn draw_indexed_instanced(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     index_count_per_instance: ddi12::UINT,
     instance_count: ddi12::UINT,
@@ -582,7 +582,7 @@ unsafe extern "C" fn draw_indexed_instanced(
 ///
 /// # Safety
 /// As [`draw_instanced`].
-unsafe extern "C" fn dispatch(
+unsafe extern "system" fn dispatch(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     thread_group_count_x: ddi12::UINT,
     thread_group_count_y: ddi12::UINT,
@@ -878,7 +878,7 @@ const DEPTH_BOUNDS_DEFAULT_MAX: ddi12::FLOAT = 1.0;
 ///
 /// # Safety
 /// As [`draw_instanced`].
-unsafe extern "C" fn ia_set_topology(
+unsafe extern "system" fn ia_set_topology(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     topology: ddi12::D3D12DDI_PRIMITIVE_TOPOLOGY,
 ) {
@@ -930,7 +930,7 @@ unsafe extern "C" fn ia_set_topology(
 /// # Safety
 /// As [`draw_instanced`], and `viewports` must address at least `count`
 /// readable `D3D12DDI_VIEWPORT`s for the duration of the call.
-unsafe extern "C" fn rs_set_viewports(
+unsafe extern "system" fn rs_set_viewports(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     count: ddi12::UINT,
     viewports: *const ddi12::D3D12DDI_VIEWPORT,
@@ -974,7 +974,7 @@ unsafe extern "C" fn rs_set_viewports(
 ///
 /// # Safety
 /// As [`rs_set_viewports`], for `D3D12DDI_RECT`s.
-unsafe extern "C" fn rs_set_scissor_rects(
+unsafe extern "system" fn rs_set_scissor_rects(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     count: ddi12::UINT,
     rects: *const ddi12::D3D12DDI_RECT,
@@ -1015,7 +1015,7 @@ unsafe extern "C" fn rs_set_scissor_rects(
 /// # Safety
 /// As [`draw_instanced`], and `factor`, when non-null, must address four
 /// readable `FLOAT`s — which is what the DDI's `const FLOAT[4]` declares.
-unsafe extern "C" fn om_set_blend_factor(
+unsafe extern "system" fn om_set_blend_factor(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     factor: *const ddi12::FLOAT,
 ) {
@@ -1051,7 +1051,7 @@ unsafe extern "C" fn om_set_blend_factor(
 ///
 /// # Safety
 /// As [`draw_instanced`].
-unsafe extern "C" fn om_set_stencil_ref(
+unsafe extern "system" fn om_set_stencil_ref(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     stencil_ref: ddi12::UINT,
 ) {
@@ -1094,7 +1094,7 @@ unsafe extern "C" fn om_set_stencil_ref(
 /// # Safety
 /// As [`draw_instanced`]; `h_pso`, when its `pDrvPrivate` is non-null, must
 /// address the private block `pfnCalcPrivatePipelineStateSize` sized.
-unsafe extern "C" fn set_pipeline_state(
+unsafe extern "system" fn set_pipeline_state(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_pso: ddi12::D3D12DDI_HPIPELINESTATE,
 ) {
@@ -1194,7 +1194,7 @@ unsafe extern "C" fn set_pipeline_state(
 /// # Safety
 /// Trivially safe: no argument is dereferenced. Declared `unsafe` because the
 /// DDI's PFN typedef is.
-unsafe extern "C" fn om_set_depth_bounds(
+unsafe extern "system" fn om_set_depth_bounds(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     min: ddi12::FLOAT,
     max: ddi12::FLOAT,
@@ -1230,7 +1230,7 @@ unsafe extern "C" fn om_set_depth_bounds(
 ///
 /// # Safety
 /// Trivially safe: no argument is dereferenced.
-unsafe extern "C" fn set_sample_positions(
+unsafe extern "system" fn set_sample_positions(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     _num_samples_per_pixel: ddi12::UINT,
     _num_pixels: ddi12::UINT,
@@ -1257,7 +1257,7 @@ unsafe extern "C" fn set_sample_positions(
 ///
 /// # Safety
 /// Trivially safe: no argument is dereferenced.
-unsafe extern "C" fn om_set_alpha_blend_factor(
+unsafe extern "system" fn om_set_alpha_blend_factor(
     _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     _factor: ddi12::FLOAT,
 ) {
@@ -1269,7 +1269,7 @@ unsafe extern "C" fn om_set_alpha_blend_factor(
 ///
 /// # Safety
 /// As [`draw_instanced`].
-unsafe extern "C" fn om_set_front_and_back_stencil_ref(
+unsafe extern "system" fn om_set_front_and_back_stencil_ref(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     front: ddi12::UINT,
     back: ddi12::UINT,
@@ -1305,7 +1305,7 @@ unsafe extern "C" fn om_set_front_and_back_stencil_ref(
 ///
 /// # Safety
 /// As [`draw_instanced`].
-unsafe extern "C" fn rs_set_depth_bias(
+unsafe extern "system" fn rs_set_depth_bias(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     depth_bias: ddi12::FLOAT,
     depth_bias_clamp: ddi12::FLOAT,
@@ -1362,7 +1362,7 @@ fn api_strip_cut(
 /// # Safety
 /// As [`draw_instanced`]; `desc`, when non-null, must address one readable
 /// `D3D12DDI_INDEX_BUFFER_VIEW`.
-unsafe extern "C" fn ia_set_index_buffer(
+unsafe extern "system" fn ia_set_index_buffer(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     desc: *const ddi12::D3D12DDI_INDEX_BUFFER_VIEW,
 ) {
@@ -1395,7 +1395,7 @@ unsafe extern "C" fn ia_set_index_buffer(
 /// # Safety
 /// As [`draw_instanced`], and `views`, when non-null, must address at least
 /// `num_views` readable `D3D12DDI_VERTEX_BUFFER_VIEW`s.
-unsafe extern "C" fn ia_set_vertex_buffers(
+unsafe extern "system" fn ia_set_vertex_buffers(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     start_slot: ddi12::UINT,
     num_views: ddi12::UINT,
@@ -1472,7 +1472,7 @@ unsafe extern "C" fn ia_set_vertex_buffers(
 ///
 /// # Safety
 /// As [`ia_set_vertex_buffers`], for `D3D12DDI_STREAM_OUTPUT_BUFFER_VIEW`s.
-unsafe extern "C" fn so_set_targets(
+unsafe extern "system" fn so_set_targets(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     start_slot: ddi12::UINT,
     num_views: ddi12::UINT,
@@ -1540,7 +1540,7 @@ unsafe extern "C" fn so_set_targets(
 /// As [`draw_instanced`]. `render_targets`, when non-null, must address one
 /// handle if `rts_single_handle` is TRUE and at least `num_render_targets`
 /// otherwise; `depth_stencil`, when non-null, must address one.
-unsafe extern "C" fn om_set_render_targets(
+unsafe extern "system" fn om_set_render_targets(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     num_render_targets: ddi12::UINT,
     render_targets: *const ddi12::D3D12DDI_CPU_DESCRIPTOR_HANDLE,
@@ -1593,7 +1593,7 @@ unsafe extern "C" fn om_set_render_targets(
 ///
 /// # Safety
 /// As [`draw_instanced`].
-unsafe extern "C" fn ia_set_index_buffer_strip_cut_value(
+unsafe extern "system" fn ia_set_index_buffer_strip_cut_value(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     strip_cut: ddi12::D3D12DDI_INDEX_BUFFER_STRIP_CUT_VALUE,
 ) {
@@ -1654,7 +1654,7 @@ unsafe extern "C" fn ia_set_index_buffer_strip_cut_value(
 ///
 /// # Safety
 /// As [`draw_instanced`], for **both** handles.
-unsafe extern "C" fn execute_bundle(
+unsafe extern "system" fn execute_bundle(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_bundle: ddi12::D3D12DDI_HCOMMANDLIST,
 ) {
@@ -1795,7 +1795,7 @@ unsafe fn buffer_placement<'a>(
 /// live handle from `queue::create_command_signature`; the two
 /// `D3D12DDIARG_BUFFER_PLACEMENT`s arrive **by value** and their `hResource`s, when
 /// non-null, must be live resource handles.
-unsafe extern "C" fn execute_indirect(
+unsafe extern "system" fn execute_indirect(
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_signature: ddi12::D3D12DDI_HCOMMANDSIGNATURE,
     max_command_count: ddi12::UINT,

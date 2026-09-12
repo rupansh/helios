@@ -1,17 +1,17 @@
-# Helios Windows x64 bundle with WoW64 OpenGL/Vulkan
+# Helios Windows x64 bundle with WoW64 Direct3D/OpenGL/Vulkan
 
 This archive installs the Helios WDDM driver, its x64 user-mode graphics and
-compute stack, and the 32-bit Vulkan/OpenGL components needed by WoW64 games:
+compute stack, and the 32-bit Direct3D/Vulkan/OpenGL components needed by WoW64 games:
 
-- Direct3D 11 through the DXVK core embedded in `helios_umd.dll`
-- Direct3D 12 through vkd3d-proton embedded in `helios_umd12.dll`
+- Direct3D 11 through DXVK embedded in `helios_umd.dll` (x64) / `helios_umd32.dll` (x86)
+- Direct3D 12 through vkd3d-proton embedded in `helios_umd12.dll` (x64) / `helios_umd12_32.dll` (x86)
 - Vulkan through Mesa Venus (`vulkan_virtio.dll`)
 - desktop OpenGL through Mesa Zink's Microsoft WGL ICD
 - 32-bit Vulkan through a separately built x86 Mesa Venus ICD
 - 32-bit desktop OpenGL through a separately built x86 Zink WGL ICD
 - OpenCL through CLVK with its clspv compiler embedded
 - official Khronos Vulkan and OpenCL loaders when Windows has no loader yet
-- the Microsoft Visual C++ x64 runtime required by the D3D12 UMD
+- the Microsoft Visual C++ x64 and x86 runtimes required by the D3D12 UMDs
 - optional, app-local DaVinci Resolve GPU-detection shim
 
 ## Install
@@ -33,8 +33,8 @@ DLLs. Vulkan and OpenCL coexist with other vendors through their standard ICD
 registries. OpenGL is registered only on the Helios display adapter software
 key.
 
-An installed Visual C++ x64 runtime at least as new as the bundled version is
-kept. Otherwise, setup runs the bundled redistributable installer.
+Each installed Visual C++ runtime (x64 and x86) at least as new as the bundled
+version is kept. Otherwise, setup runs its matching redistributable installer.
 
 If the virtio-gpu device is using Red Hat's `viogpudo` driver, desktop setup
 shows a Yes/No dialog (default No) before uninstalling that driver package and
@@ -70,8 +70,9 @@ verifies texture import, acquire, pixel readback, release, and queue finish.
 D3D12 is enabled by default. To disable it, set DWORD `UmdD3D12=0` under
 `HKLM\SOFTWARE\Helios` and restart affected applications (reboot for DWM).
 Deleting the value restores the enabled default. Installation preserves an
-existing explicit disable. The D3D12 smoke checks native device creation and
-expects failure when that disable is present.
+existing explicit disable. The Direct3D smoke probes run as both x64 and x86
+processes, testing device creation and texture clear/readback. D3D12 creation
+expects failure when that disable is present and then skips its readback test.
 
 ## DaVinci Resolve compatibility
 
@@ -106,10 +107,9 @@ The shared Microsoft Visual C++ runtime is also left installed.
   teardown paths remain incomplete. Default enablement and device creation
   smoke coverage do not establish full conformance or visual correctness.
 
-- Native 32-bit Vulkan and OpenGL applications are supported through the x86
-  Vulkan loader, Mesa Venus ICD, and Zink WGL ICD included in the bundle.
-  Native 32-bit Direct3D and OpenCL applications remain unsupported; the DXVK
-  WDDM UMD and CLVK runtime are still x64-only.
+- The bundle includes separate x86 Direct3D 11/12 UMDs and Vulkan/OpenGL
+  components. Device creation and offscreen readback are smoke checks;
+  application and presentation acceptance are separate. OpenCL remains x64-only.
 - The QEMU Helios/Venus protocol changes quickly. Build the host QEMU/render
   side from a compatible source revision recorded in `manifest.json`.
 - CI uses an ephemeral public test certificate whose private key is destroyed

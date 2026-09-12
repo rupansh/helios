@@ -15,9 +15,7 @@ use core::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::get_caps;
-use crate::hr::{
-    Hresult, DXGI_STATUS_NO_REDIRECTION, E_FAIL, E_NOTIMPL, E_OUTOFMEMORY, S_OK,
-};
+use crate::hr::{Hresult, DXGI_STATUS_NO_REDIRECTION, E_FAIL, E_NOTIMPL, E_OUTOFMEMORY, S_OK};
 use crate::{bridge, ddi, device_funcs, forward};
 use crate::{log_error, trace_line};
 use crate::{log_knob_inventory, log_self_module_path, trace_enabled};
@@ -259,26 +257,19 @@ unsafe fn open_adapter_common(
     S_OK
 }
 
-// NOTE on the calling convention: the five functions below are `extern "C"`,
-// not `extern "system"`, because they are stored into the generated
-// `D3D10DDI_ADAPTERFUNCS` / `D3D10_2DDI_ADAPTERFUNCS` tables and bindgen types
-// every `PFND3D10DDI_*` as `extern "C"`. On x86_64-pc-windows-msvc the two are
-// the same calling convention, so this is a no-op in the emitted code -- but
-// rustc treats them as distinct TYPES, so the tables will not accept a
-// "system" fn. The `OpenAdapter*` exports above stay `extern "system"`: they
-// are resolved by the loader against an exported name, not through a PFN type.
-unsafe extern "C" fn calc_private_device_size(
+// WDK APIENTRY is stdcall on x86 and the platform C ABI on x64. Bindgen
+// normalizes these PFNs to `system`, keeping the Rust types and OS ABI paired.
+unsafe extern "system" fn calc_private_device_size(
     _h_adapter: ddi::D3D10DDI_HADAPTER,
     _args: *const ddi::D3D10DDIARG_CALCPRIVATEDEVICESIZE,
 ) -> ddi::SIZE_T {
     let size = device_funcs::device_private_size();
     log_error!("CalcPrivateDeviceSize -> {size}");
-    // `SIZE_T` is the WDK's spelling and is a distinct type from `usize` even
-    // though both are 64-bit here, so the PFN type needs the conversion.
+    // WDK SIZE_T tracks the process pointer width on both architectures.
     size as ddi::SIZE_T
 }
 
-unsafe extern "C" fn create_device(
+unsafe extern "system" fn create_device(
     h_adapter: ddi::D3D10DDI_HADAPTER,
     args: *mut ddi::D3D10DDIARG_CREATEDEVICE,
 ) -> Hresult {
@@ -316,27 +307,22 @@ unsafe extern "C" fn create_device(
     // singlethreaded devices were observed hitting the UNTYPED shader creates
     // → float32-typed SPIR-V inputs vs SINT vertex data, VUID-Input-08733).
     if trace_enabled() {
-        // Bound the dump by the struct being interpreted, not by a literal. The
-        // hand copy is 88 bytes (ppfnRetrieveSubObject@80) and that member only
-        // exists from minor >= 3, so the runtime's object can be 80 bytes; the
-        // old `0..12` read bytes 0..96, which is 8 past the largest possible
-        // layout and 16 past the smallest — an access violation inside the
-        // caller's D3D11CreateDevice if the arg sits at the end of a page, or a
-        // garbage dump that reads as real ABI evidence.
-        //
-        // Words 0..9 cover every field this code actually interprets: hRTDevice,
-        // interface/version, pKTCallbacks, pDeviceFuncs, hDrvDevice, the 16-byte
-        // DXGIBaseDDI, hRTCoreLayer, pUMCallbacks, flags. Word 10 is read only
-        // when the negotiated interface says it is there, keyed on the same
-        // closed set R405 introduced; an unknown interface reads the short shape.
-        let words = match NegotiatedInterface::from_interface(create.Interface) {
-            Some(NegotiatedInterface::D3D11_1) | Some(NegotiatedInterface::Wddm1_3) => 11,
-            Some(NegotiatedInterface::D3D11_0) | None => 10,
+        // The final callback field was added in 11.1. Read only the negotiated
+        // prefix, using pointer-sized words so x86 never walks an x64 bound.
+        let bytes = match NegotiatedInterface::from_interface(create.Interface) {
+            Some(NegotiatedInterface::D3D11_1) | Some(NegotiatedInterface::Wddm1_3) => {
+                core::mem::size_of::<ddi::D3D10DDIARG_CREATEDEVICE>()
+            }
+            Some(NegotiatedInterface::D3D11_0) | None => {
+                core::mem::offset_of!(ddi::D3D10DDIARG_CREATEDEVICE, ppfnRetrieveSubObject)
+            }
         };
-        let q = args as *const u64;
+        let words = bytes / core::mem::size_of::<usize>();
+        let q = args.cast::<usize>();
         let mut raw = String::from("CreateDevice raw args:");
         for i in 0..words {
-            raw.push_str(&format!(" [{}]=0x{:016x}", i, unsafe {
+            // SAFETY: words is bounded by the negotiated argument prefix.
+            raw.push_str(&format!(" [{}]=0x{:x}", i, unsafe {
                 q.add(i).read_unaligned()
             }));
         }
@@ -577,13 +563,13 @@ impl Drop for DeviceUnderConstruction {
     }
 }
 
-unsafe extern "C" fn close_adapter(h_adapter: ddi::D3D10DDI_HADAPTER) -> Hresult {
+unsafe extern "system" fn close_adapter(h_adapter: ddi::D3D10DDI_HADAPTER) -> Hresult {
     let _ = adapter_ok(h_adapter);
     log_error!("CloseAdapter");
     S_OK
 }
 
-unsafe extern "C" fn get_supported_versions(
+unsafe extern "system" fn get_supported_versions(
     _h_adapter: ddi::D3D10DDI_HADAPTER,
     entries: *mut u32,
     supported_versions: *mut u64,

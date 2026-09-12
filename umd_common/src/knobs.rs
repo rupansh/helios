@@ -50,6 +50,9 @@ unsafe extern "system" {
 
 const HKEY_LOCAL_MACHINE: usize = 0x8000_0002;
 const RRF_RT_REG_DWORD: u32 = 0x10;
+// Both native and WoW64 UMDs obey the same administrator-controlled knobs,
+// including UmdD3D12=0. The process-default x86 view would miss that disable.
+const RRF_SUBKEY_WOW6464KEY: u32 = 0x0001_0000;
 
 /// The one hive both drivers read. ⚠ Shared on purpose: the owner types these
 /// values by hand, and a second subkey would be a second thing to remember.
@@ -72,7 +75,7 @@ pub fn reg_dword(name: &CStr) -> Option<u32> {
             HKEY_LOCAL_MACHINE,
             SUBKEY.as_ptr().cast(),
             name.as_ptr().cast(),
-            RRF_RT_REG_DWORD,
+            RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY,
             core::ptr::null_mut(),
             (&mut value as *mut u32).cast(),
             &mut len,

@@ -57,7 +57,7 @@ pub(crate) unsafe fn resource_as_buffer(
     (*res).cast::<ID3D11Buffer>().ok().map(ManuallyDrop::new)
 }
 
-pub(crate) unsafe extern "C" fn update_tile_mappings(
+pub(crate) unsafe extern "system" fn update_tile_mappings(
     h: Hdevice,
     h_tiled_resource: ddi::D3D10DDI_HRESOURCE,
     region_count: u32,
@@ -104,7 +104,7 @@ pub(crate) unsafe extern "C" fn update_tile_mappings(
     );
 }
 
-pub(crate) unsafe extern "C" fn copy_tile_mappings(
+pub(crate) unsafe extern "system" fn copy_tile_mappings(
     h: Hdevice,
     h_dst_resource: ddi::D3D10DDI_HRESOURCE,
     dst_start_coord: *const ddi::D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE,
@@ -131,7 +131,7 @@ pub(crate) unsafe extern "C" fn copy_tile_mappings(
     let _ = context.CopyTileMappings(&*dst, &dst_coord, &*src, &src_coord, &size, flags);
 }
 
-pub(crate) unsafe extern "C" fn copy_tiles(
+pub(crate) unsafe extern "system" fn copy_tiles(
     h: Hdevice,
     h_tiled_resource: ddi::D3D10DDI_HRESOURCE,
     region_start_coord: *const ddi::D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE,
@@ -164,7 +164,7 @@ pub(crate) unsafe extern "C" fn copy_tiles(
     );
 }
 
-pub(crate) unsafe extern "C" fn update_tiles(
+pub(crate) unsafe extern "system" fn update_tiles(
     h: Hdevice,
     h_dst_resource: ddi::D3D10DDI_HRESOURCE,
     dst_start_coord: *const ddi::D3DWDDM1_3DDI_TILED_RESOURCE_COORDINATE,
@@ -215,7 +215,7 @@ pub(crate) unsafe fn tiled_barrier_child(
     }
 }
 
-pub(crate) unsafe extern "C" fn tiled_resource_barrier(
+pub(crate) unsafe extern "system" fn tiled_resource_barrier(
     h: Hdevice,
     before_type: ddi::D3D11DDI_HANDLETYPE,
     before: *mut c_void,
@@ -230,7 +230,7 @@ pub(crate) unsafe extern "C" fn tiled_resource_barrier(
     context.TiledResourceBarrier(before_child.as_ref(), after_child.as_ref());
 }
 
-pub(crate) unsafe extern "C" fn get_mip_packing(
+pub(crate) unsafe extern "system" fn get_mip_packing(
     h: Hdevice,
     h_tiled_resource: ddi::D3D10DDI_HRESOURCE,
     packed_mips: *mut u32,
@@ -269,7 +269,7 @@ pub(crate) unsafe extern "C" fn get_mip_packing(
     }
 }
 
-pub(crate) unsafe extern "C" fn resize_tile_pool(
+pub(crate) unsafe extern "system" fn resize_tile_pool(
     h: Hdevice,
     h_tile_pool: ddi::D3D10DDI_HRESOURCE,
     new_size: u64,
@@ -285,13 +285,13 @@ pub(crate) unsafe extern "C" fn resize_tile_pool(
 
 pub(crate) static WDDM13_MARKER_LOG_COUNT: LogThrottle = LogThrottle::new();
 
-pub(crate) unsafe extern "C" fn set_marker(h: Hdevice) {
+pub(crate) unsafe extern "system" fn set_marker(h: Hdevice) {
     if let Some(n) = WDDM13_MARKER_LOG_COUNT.first_n_then_every(16, 1024) {
         log_error!("WDDM1.3 SetMarker h={:p} hit={}", h.pDrvPrivate, n + 1);
     }
 }
 
-pub(crate) unsafe extern "C" fn set_marker_mode(
+pub(crate) unsafe extern "system" fn set_marker_mode(
     h: Hdevice,
     marker_type: ddi::D3DWDDM1_3DDI_MARKER_TYPE,
     flags: u32,

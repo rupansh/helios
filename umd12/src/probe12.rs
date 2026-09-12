@@ -83,10 +83,7 @@ pub unsafe extern "C" fn helios_umd12_probe_fill_ddi_table_v1(
         forward12::tables12::fill(
             table_type,
             table,
-            // `SIZE_T` is `ULONG_PTR` is `c_ulonglong`; `usize` is what a C++
-            // caller spells `size_t`. Identical on x86_64-msvc, which is the
-            // only target this crate builds for (`lib.rs`'s `compile_error!`),
-            // and asserted below rather than assumed.
+            // Both types have the target's pointer width, asserted above.
             table_size as ddi12::SIZE_T,
             index,
             crate::ddi12::D3D12DDI_HRTTABLE {
@@ -311,7 +308,7 @@ pub unsafe extern "C" fn helios_umd12_probe_serialize_root_signature_v1(
     }
 
     // Locals rather than a cast of the caller's `void**` to `usize*`: the two
-    // are the same width on x64, but the bridge's declared type is `*mut usize`
+    // have the same target pointer width, but the bridge's declared type is `*mut usize`
     // and laundering a pointer-to-pointer through it is the kind of "obviously
     // fine" cast that stops being fine the moment either side's type changes.
     let mut blob: usize = 0;

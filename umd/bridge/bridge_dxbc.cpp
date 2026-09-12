@@ -42,7 +42,7 @@ namespace helios_bridge {
       char value[MAX_PATH] = {};
       DWORD size = sizeof(value);
       if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "ShaderBytecodeDumpPath",
-                       RRF_RT_REG_SZ, nullptr, value, &size) != ERROR_SUCCESS ||
+                       RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, nullptr, value, &size) != ERROR_SUCCESS ||
           !value[0])
         return std::string();
 

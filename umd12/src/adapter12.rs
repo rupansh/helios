@@ -348,7 +348,7 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut c_void) -> Hresult {
     };
     // SAFETY: `funcs` is non-null per the check above and the caller guarantees
     // it points at a writable `D3D12DDI_ADAPTERFUNCS` the runtime owns. The cast
-    // to the `_0109` shape writes exactly the same 64 bytes at the same offsets
+    // to the `_0109` shape writes exactly the same eight pointer-sized slots at the same offsets
     // — asserted at compile time at the top of this file — and D12's one-token
     // set makes the `_0003`-generation `pfnCreateDevice` signature unreachable.
     unsafe {
@@ -361,14 +361,9 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut c_void) -> Hresult {
 // ---------------------------------------------------------------------------
 // The eight slots
 //
-// ⛔ Every one is `unsafe extern "C"`, not `extern "system"`. Measured by
-// fault-injection against the host cross-check (`PARALLEL.md` §5): the
-// `d3d12umddi` PFN typedefs are `extern "C"`. On x86_64 Windows the two are the
-// same ABI, so this is a *type* error and not a calling-convention bug — which
-// is exactly why it would otherwise have been written wrong 214 times and
-// caught by nothing until the first compile. ⚠ Note this differs from
-// `OpenAdapter12` above, which the loader resolves by name and which keeps the
-// D3D11 side's `extern "system"`.
+// WDK DDI function pointers use APIENTRY. `extern "system"` preserves stdcall
+// callee stack cleanup on x86 and the unified Windows ABI on x64. Bindgen
+// normalizes these PFN typedefs to the same spelling on both architectures.
 // ---------------------------------------------------------------------------
 
 /// `pfnGetSupportedVersions` — the count-then-fill idiom, D12's one-token set.
@@ -379,7 +374,7 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut c_void) -> Hresult {
 /// buffer (`DDI_REFERENCE.md` §1.3); this handles both shapes, and the log line
 /// below records which one arrived — settling it as a side effect of S5 rather
 /// than needing the §15 spy again.
-unsafe extern "C" fn get_supported_versions(
+unsafe extern "system" fn get_supported_versions(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     entries: *mut ddi12::UINT32,
     supported_versions: *mut ddi12::UINT64,
@@ -430,7 +425,7 @@ unsafe extern "C" fn get_supported_versions(
 /// in — measured at S5 (`tmp/dx12/gates/G6/RESULT.md`), and the reason
 /// `ARCHITECTURE.md` §1.2's step order was corrected. Nothing `caps12` answers
 /// may depend on a negotiated version, because there is not one yet.
-unsafe extern "C" fn get_caps(
+unsafe extern "system" fn get_caps(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     arg: *const ddi12::D3D12DDIARG_GETCAPS,
 ) -> ddi12::HRESULT {
@@ -448,7 +443,7 @@ unsafe extern "C" fn get_caps(
 /// only legal use of this entry point in its own strings — *"…only supports
 /// `D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D`. An unsupported table type was
 /// requested."* — so 0 is the answer that cannot be misread.
-unsafe extern "C" fn get_optional_ddi_tables(
+unsafe extern "system" fn get_optional_ddi_tables(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     entries: *mut ddi12::UINT32,
     requests: *mut ddi12::D3D12DDI_TABLE_REQUEST,
@@ -490,7 +485,7 @@ unsafe extern "C" fn get_optional_ddi_tables(
 ///
 /// The line below records the runtime's own numbers on *this* adapter, which is
 /// what `D12-G5` needed a WARP spy proxy to obtain.
-unsafe extern "C" fn fill_ddi_table(
+unsafe extern "system" fn fill_ddi_table(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     table_type: ddi12::D3D12DDI_TABLE_TYPE,
     table: *mut c_void,
@@ -533,7 +528,7 @@ static FILL_DDI_TABLE_CALLS: AtomicUsize = AtomicUsize::new(0);
 /// `D3D12DDIARG_CREATEDEVICE_0109` (`DDI_REFERENCE.md` §1.4), so a size computed
 /// here and a `size_of::<Device>()` written there is a buffer overrun waiting
 /// for a debug-layer client. Both sites call `device12::device_private_size`.
-unsafe extern "C" fn calc_private_device_size(
+unsafe extern "system" fn calc_private_device_size(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     arg: *const ddi12::D3D12DDIARG_CALCPRIVATEDEVICESIZE,
 ) -> ddi12::SIZE_T {
@@ -541,8 +536,8 @@ unsafe extern "C" fn calc_private_device_size(
     // SAFETY: forwarded unchanged; the DDI declares `arg` `_In_ CONST`, and
     // `device12` null-checks it rather than trusting that.
     let size = unsafe { device12::calc_private_device_size(arg) };
-    // `SIZE_T` is the WDK's spelling and is a distinct type from `usize` even
-    // though both are 64-bit here, so the PFN type needs the conversion.
+    // SIZE_T is pointer-sized in the target WDK; keep its generated spelling
+    // at the DDI boundary on both x86 and x64.
     size as ddi12::SIZE_T
 }
 
@@ -552,7 +547,7 @@ unsafe extern "C" fn calc_private_device_size(
 /// through `pfnFillDDITable`, before any device exists — measured at S5, and the
 /// opposite of the D3D11 shape where `CreateDevice` writes the device-funcs
 /// table itself.
-unsafe extern "C" fn create_device(
+unsafe extern "system" fn create_device(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     arg: *const ddi12::D3D12DDIARG_CREATEDEVICE_0109,
 ) -> ddi12::HRESULT {
@@ -568,7 +563,7 @@ unsafe extern "C" fn create_device(
 /// ⚠ It lives on the **adapter** table (`d3d12umddi.h:13649`), not the device
 /// table. That is a shape difference from D3D11 and a classic place to leave a
 /// NULL (`DDI_REFERENCE.md` §1.3).
-unsafe extern "C" fn destroy_device(h_device: ddi12::D3D12DDI_HDEVICE) {
+unsafe extern "system" fn destroy_device(h_device: ddi12::D3D12DDI_HDEVICE) {
     // SAFETY: the runtime passes back a handle this driver returned `S_OK` for
     // from `create_device`, exactly once.
     unsafe { device12::destroy_device(h_device) }
@@ -582,7 +577,7 @@ unsafe extern "C" fn destroy_device(h_device: ddi12::D3D12DDI_HDEVICE) {
 /// because they already log their own line (R911) — so without a readout here a
 /// run in which only those fired would leave the set unprinted. T5's lesson,
 /// restated: *an instrument nothing can read is not an instrument.*
-unsafe extern "C" fn close_adapter(h_adapter: ddi12::D3D12DDI_HADAPTER) -> ddi12::HRESULT {
+unsafe extern "system" fn close_adapter(h_adapter: ddi12::D3D12DDI_HADAPTER) -> ddi12::HRESULT {
     let _ = adapter_ok(h_adapter);
     log_error!("CloseAdapter");
     log_refusal_summary();

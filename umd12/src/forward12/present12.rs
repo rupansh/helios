@@ -110,7 +110,7 @@ const LOG_BUDGET: usize = 32;
 /// # Safety
 /// `_p_present` is not dereferenced. Declared `unsafe` because the DDI's PFN typedef
 /// is.
-unsafe extern "C" fn get_present_private_driver_data_size(
+unsafe extern "system" fn get_present_private_driver_data_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _p_present: *const ddi12::D3D12DDIARG_PRESENT_0001,
 ) -> ddi12::UINT {
@@ -161,7 +161,7 @@ unsafe extern "C" fn get_present_private_driver_data_size(
 /// `SurfacesToPresent` valid entries at `phSurfacesToPresent`. The three out-structs
 /// must be live for the call when non-null. `h_queue`'s private block, when
 /// non-null, must be one `pfnCreateCommandQueue` wrote.
-unsafe extern "C" fn present(
+unsafe extern "system" fn present(
     _h_command_list: ddi12::D3D12DDI_HCOMMANDLIST,
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     p_present: *const ddi12::D3D12DDIARG_PRESENT_0001,

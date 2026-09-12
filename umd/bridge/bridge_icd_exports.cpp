@@ -190,7 +190,9 @@ namespace helios_bridge {
 
   void add_registry_manifests_from(HKEY root, const char* subkey, std::vector<std::string>& manifests) {
     HKEY key = nullptr;
-    if (RegOpenKeyExA(root, subkey, 0, KEY_READ | KEY_WOW64_64KEY, &key) != ERROR_SUCCESS)
+    // Vulkan registration follows the process bitness; a WoW64 UMD needs the
+    // 32-bit Khronos view and cannot load the 64-bit ICD.
+    if (RegOpenKeyExA(root, subkey, 0, KEY_READ, &key) != ERROR_SUCCESS)
       return;
 
     for (DWORD i = 0;; i++) {
@@ -217,7 +219,12 @@ namespace helios_bridge {
     add_env_manifests(manifests);
     add_registry_manifests_from(HKEY_LOCAL_MACHINE, "SOFTWARE\\Khronos\\Vulkan\\Drivers", manifests);
     add_registry_manifests_from(HKEY_CURRENT_USER, "SOFTWARE\\Khronos\\Vulkan\\Drivers", manifests);
+#if defined(_WIN64)
     manifests.push_back("C:\\ProgramData\\HeliosVulkan\\virtio_devenv_icd.x86_64.json");
+#endif
+    // The legacy developer installer has an x64-only fallback location. x86
+    // uses its registered or explicitly overridden manifest, whose installed
+    // path includes the package version and cannot be hard-coded here.
     return manifests;
   }
 

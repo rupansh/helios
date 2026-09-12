@@ -33,7 +33,7 @@ env:
 
 jobs:
   driver:
-    name: WDDM driver and Direct3D 11/12 UMDs
+    name: WDDM driver and x64/x86 Direct3D 11/12 UMDs
     runs-on: windows-2022
     timeout-minutes: 120
     steps:
@@ -82,6 +82,7 @@ jobs:
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rust-src
+          targets: i686-pc-windows-msvc
       - name: Install Rust build helpers
         shell: pwsh
         run: |

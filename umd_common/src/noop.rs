@@ -11,19 +11,75 @@
 //!
 //! A WDDM UMD is handed a table of function pointers and must fill **every**
 //! slot before returning, or the runtime calls through an uninitialised one.
-//! Both drivers therefore need: a uniform stub signature, a stub that counts
-//! its hits, a one-shot backtrace so an unexpected hit names its caller, and a
-//! "fill every slot" primitive that cannot disagree with the table's size.
+//! Both drivers therefore need signature-preserving stubs, counters and a
+//! one-shot backtrace so an unexpected hit names its caller. Table field lists
+//! live with the generated WDK types in each driver.
 
+// The signature, including argument widths and return shape, comes from the
+// target's WDK field type. This is essential on x86: APIENTRY is stdcall and
+// the callee must pop exactly its declared arguments.
+
+/// The action performed by an unimplemented DDI, with its exact return type.
+/// Reporters own the counter and explicit fallback policy; the shared adapter
+/// owns only the calling convention and argument signature.
+pub trait StubReport<Return> {
+    fn hit() -> Return;
+}
+
+/// A function-pointer field that can receive a signature-preserving stub.
+pub trait TypedStub<Report>: Sized {
+    fn typed_stub() -> Self;
+}
+
+/// Install a stub inferred from the WDK-generated field type, without a cast.
+pub fn install_stub<Report, Field: TypedStub<Report>>(field: &mut Field) {
+    *field = Field::typed_stub();
+}
+
+macro_rules! typed_stub {
+    ($($arg:ident),* $(,)?) => {
+        impl<Report, Return, $($arg,)*> TypedStub<Report>
+            for Option<unsafe extern "system" fn($($arg),*) -> Return>
+        where
+            Report: StubReport<Return>,
+        {
+            fn typed_stub() -> Self {
+                unsafe extern "system" fn invoke<Report, Return, $($arg,)*>(
+                    $(_: $arg),*
+                ) -> Return
+                where
+                    Report: StubReport<Return>,
+                {
+                    Report::hit()
+                }
+                Some(invoke::<Report, Return, $($arg,)*>)
+            }
+        }
+    };
+}
+
+typed_stub!();
+typed_stub!(A);
+typed_stub!(A, B);
+typed_stub!(A, B, C);
+typed_stub!(A, B, C, D);
+typed_stub!(A, B, C, D, E);
+typed_stub!(A, B, C, D, E, F);
+typed_stub!(A, B, C, D, E, F, G);
+typed_stub!(A, B, C, D, E, F, G, H);
+typed_stub!(A, B, C, D, E, F, G, H, I);
+typed_stub!(A, B, C, D, E, F, G, H, I, J);
+typed_stub!(A, B, C, D, E, F, G, H, I, J, K);
+typed_stub!(A, B, C, D, E, F, G, H, I, J, K, L);
+typed_stub!(A, B, C, D, E, F, G, H, I, J, K, L, M);
+typed_stub!(A, B, C, D, E, F, G, H, I, J, K, L, M, N);
+typed_stub!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O);
+typed_stub!(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P);
+
+#[cfg(windows)]
 use core::ffi::c_void;
 
-/// Uniform stub signature (one machine word in, one out).
-///
-/// Legal to install in any DDI slot on this ABI: the callee pops nothing on
-/// x64, and a stub that ignores its argument and returns 0 is correct for both
-/// the `HRESULT`-returning slots (`S_OK`) and the `void` ones (ignored).
-pub type UniformFn = unsafe extern "C" fn(usize) -> usize;
-
+#[cfg(windows)]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn RtlCaptureStackBackTrace(
@@ -46,8 +102,11 @@ unsafe extern "system" {
 /// Calls `RtlCaptureStackBackTrace`, which walks the caller's stack. Safe in
 /// any ordinary user-mode context; not callable from a context where the stack
 /// is being unwound.
+#[cfg(windows)]
 pub unsafe fn log_backtrace(tag: &str) {
     let mut frames = [core::ptr::null_mut::<c_void>(); 32];
+    // SAFETY: the caller promises an ordinary user-mode stack outside unwind;
+    // the frame array provides frames.len() writable pointer slots.
     let captured = unsafe {
         RtlCaptureStackBackTrace(
             0,
@@ -57,53 +116,65 @@ pub unsafe fn log_backtrace(tag: &str) {
         )
     };
     let mut out = String::new();
-    for i in 0..captured as usize {
-        out.push_str(&format!(" #{i}=0x{:x}", frames[i] as usize));
+    for (i, frame) in frames.iter().take(captured as usize).enumerate() {
+        out.push_str(&format!(" #{i}=0x{:x}", *frame as usize));
     }
     crate::log_error!("{tag} stack{out}");
 }
 
-/// Write `noop` into every pointer-sized slot of a `bytes`-byte DDI table.
-///
-/// ⭐ **This is the primitive, and it takes a BYTE COUNT, not a type.**
-/// `ARCHITECTURE.md` §12 rule 16 is the R702 class: 24H2 passed **576** bytes
-/// for a 592-byte `DRIVERCAPS`, and `pfnFillDDITable` parameterises the size
-/// explicitly (`d3d12umddi.h:2527-2528`). A D3D12 filler must derive its slot
-/// count from the runtime's argument; deriving it from `size_of::<T>()` would
-/// write past the end of a table the runtime deliberately sized smaller.
-///
-/// [`stub_fill_sized_table`] is the D3D11-shaped convenience on top, and it is
-/// the one that is *only* correct because the D3D11 DDI does not pass a size.
-///
-/// # Safety
-/// `funcs` must point at `bytes` writable bytes, pointer-aligned, every one of
-/// which the caller owns and intends to be a function-pointer slot. `bytes` is
-/// rounded DOWN to a whole number of slots; a trailing partial slot is left
-/// untouched rather than half-written.
-pub unsafe fn stub_fill_bytes(funcs: *mut c_void, bytes: usize, noop: UniformFn) {
-    let n = bytes / core::mem::size_of::<usize>();
-    let slots = funcs as *mut Option<UniformFn>;
-    for i in 0..n {
-        unsafe { *slots.add(i) = Some(noop) };
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::{install_stub, StubReport};
+    use core::sync::atomic::{AtomicUsize, Ordering};
 
-/// Fill every entry of a `T`-shaped DDI table with `noop`, deriving the slot
-/// count from `size_of::<T>()`.
-///
-/// The slot count cannot disagree with the table actually being filled. That
-/// matters: the failure mode this replaces is a wrong length under-stubbing a
-/// table and leaving uninitialised slots past the prefix, which is precisely
-/// what `fill_dxgi_1_3_base_funcs`'s comment exists to warn about — the three
-/// D3D11 fills each spelled the length out by hand.
-///
-/// ⚠ Correct **only** where the runtime does not tell the driver the table
-/// size. That is true of the d3d10umddi device-funcs tables and NOT of
-/// `pfnFillDDITable` — see [`stub_fill_bytes`].
-///
-/// # Safety
-/// `funcs` must point to a writable `T` whose every field is a pointer-sized
-/// `Option<fn>`.
-pub unsafe fn stub_fill_sized_table<T>(funcs: *mut T, noop: UniformFn) {
-    unsafe { stub_fill_bytes(funcs.cast::<c_void>(), core::mem::size_of::<T>(), noop) }
+    static HITS: AtomicUsize = AtomicUsize::new(0);
+    struct Refuse;
+    impl StubReport<i32> for Refuse {
+        fn hit() -> i32 {
+            HITS.fetch_add(1, Ordering::Relaxed);
+            0x80004001u32 as i32
+        }
+    }
+
+    #[repr(C)]
+    #[derive(Debug, PartialEq)]
+    struct Pair {
+        first: u64,
+        second: u32,
+    }
+    struct StructResult;
+    impl StubReport<Pair> for StructResult {
+        fn hit() -> Pair {
+            Pair {
+                first: 0x123456789abcdef0,
+                second: 17,
+            }
+        }
+    }
+
+    #[test]
+    fn preserves_mixed_width_arguments_and_hresult() {
+        let mut slot: Option<unsafe extern "system" fn(u32, u64, *const u8, f32, usize) -> i32> =
+            None;
+        install_stub::<Refuse, _>(&mut slot);
+        // SAFETY: install_stub initializes the exact signature; no argument is dereferenced.
+        let result = unsafe { slot.unwrap()(3, u64::MAX, core::ptr::null(), 1.5, 7) };
+        assert_eq!(result, 0x80004001u32 as i32);
+        assert_eq!(HITS.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn preserves_struct_return_abi() {
+        let mut slot: Option<unsafe extern "system" fn(u32, u64) -> Pair> = None;
+        install_stub::<StructResult, _>(&mut slot);
+        // SAFETY: install_stub initializes the exact signature and does not use its arguments.
+        let result = unsafe { slot.unwrap()(5, u64::MAX) };
+        assert_eq!(
+            result,
+            Pair {
+                first: 0x123456789abcdef0,
+                second: 17
+            }
+        );
+    }
 }

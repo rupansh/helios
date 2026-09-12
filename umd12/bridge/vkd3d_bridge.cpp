@@ -87,13 +87,10 @@ extern "C" HRESULT helios_vkd3d_serialize_root_signature(
 // (v -> v1 -> v2 -> v3 -> v4), and every method of every revision must appear
 // here even though this bridge calls two.
 //
-// ⚠ Vulkan and vkd3d types are substituted, and each substitution is
-// ABI-identical on x64: every `Vk*` handle is a pointer (dispatchable handles are
-// `struct T*`; non-dispatchable handles are `struct T*` too under
-// `VK_DEFINE_NON_DISPATCHABLE_HANDLE` on a 64-bit build), and `VkImageLayout` /
-// `VkFormat` are `int`-sized enums. The `D3D12_*` types are the SDK's own, which
-// this file already includes. Same substitution and same argument as the
-// `vkd3d_acquire_vk_queue` declarations below.
+// Vulkan dispatchable handles remain pointer-sized on both architectures;
+// non-dispatchable resource/memory handles are uint64_t in this interop IDL.
+// VkImageLayout and VkFormat are int-sized enums. Preserve these widths even
+// when the UMD itself is x86.
 struct ID3D12DXVKInteropDevice4 : public IUnknown {
   // ID3D12DXVKInteropDevice
   virtual HRESULT STDMETHODCALLTYPE GetDXGIAdapter(REFIID iid, void** object) = 0;
@@ -317,24 +314,32 @@ bool read_venus_ctx_id_now(std::uint32_t* out) {
 // handing it to a different ICD build is precisely the foreign-handle bug S4b
 // exists to prevent.
 //
-// ⚠ `void*` stands in for `VkDeviceMemory` and `VkInstance`. `VkInstance` is a
-// dispatchable handle (a pointer); `VkDeviceMemory` is non-dispatchable, which is
-// also a pointer on a 64-bit build (`VK_DEFINE_NON_DISPATCHABLE_HANDLE` is
-// `struct T*` when `VK_USE_64_BIT_PTR_DEFINES == 1`, and this DLL is x64 only). ⛔
-// On a 32-bit build it would be `uint64_t` and this substitution would be wrong —
-// which is stated rather than guarded because `helios_umd12.dll` has no 32-bit
-// target and the `.def`/INF surface has none either.
-//
+// Match Vulkan's VK_DEFINE_NON_DISPATCHABLE_HANDLE on each architecture.
+// VkDeviceMemory stays 64 bits on x86; reducing it to a pointer both truncates
+// its value and places subsequent cdecl arguments at the wrong stack offsets.
+#if INTPTR_MAX == INT64_MAX
+using VenusDeviceMemory = void*;
+static VenusDeviceMemory venus_device_memory(std::uint64_t value) noexcept {
+  return reinterpret_cast<VenusDeviceMemory>(value);
+}
+#else
+using VenusDeviceMemory = std::uint64_t;
+static VenusDeviceMemory venus_device_memory(std::uint64_t value) noexcept {
+  return value;
+}
+#endif
+static_assert(sizeof(VenusDeviceMemory) == sizeof(std::uint64_t));
+
 // ⚠ **All four are resolved or none is.** The ICD exports them from the same
 // image, so a module with `helios_venus_memory_res_id` but not
 // `helios_venus_memory_alloc_info` is not an old ICD, it is a broken one — and
 // filling half an identity is worse than filling none, because the halves are what
 // a later reader compares to detect drift. `NO_EXPORT` therefore covers the whole
 // group.
-using MemoryResIdFn = std::uint32_t(__cdecl*)(void* /*VkDeviceMemory*/);
-using MemoryAllocInfoFn = bool(__cdecl*)(void* /*VkDeviceMemory*/, std::uint64_t*,
+using MemoryResIdFn = std::uint32_t(__cdecl*)(VenusDeviceMemory);
+using MemoryAllocInfoFn = bool(__cdecl*)(VenusDeviceMemory, std::uint64_t*,
                                          std::uint32_t*);
-using MemoryTransferOwnershipFn = std::uint32_t(__cdecl*)(void* /*VkDeviceMemory*/);
+using MemoryTransferOwnershipFn = std::uint32_t(__cdecl*)(VenusDeviceMemory);
 using InstanceCtxIdFn = std::uint32_t(__cdecl*)(void* /*VkInstance*/);
 
 struct MemoryIdentityExports {
@@ -539,7 +544,7 @@ bool HeliosVkd3dDevice::resource_venus_identity(
           return false;
         }
 
-        void* memory = reinterpret_cast<void*>(*out_vk_memory);
+        const VenusDeviceMemory memory = venus_device_memory(*out_vk_memory);
         const std::uint32_t res_id = e.res_id(memory);
         std::uint64_t alloc_size = 0;
         std::uint32_t alloc_mti = 0;
@@ -605,7 +610,7 @@ std::uint32_t HeliosVkd3dDevice::transfer_resource_ownership(
         const MemoryIdentityExports& e = memory_identity_exports();
         std::uint32_t handed = 0;
         if (status == HELIOS_VKD3D_IDENTITY_RESOLVED && e.transfer_ownership) {
-          handed = e.transfer_ownership(reinterpret_cast<void*>(vk_memory));
+          handed = e.transfer_ownership(venus_device_memory(vk_memory));
         }
         if (handed == 0) {
           // ⛔ Loud, and the caller treats it as a defect: `pfnAllocateCb` has

@@ -27,16 +27,20 @@ if ($LASTEXITCODE -ne 0) { throw "Vulkan smoke probe compilation failed." }
 if ($LASTEXITCODE -ne 0) { throw "Vulkan WSI probe compilation failed." }
 & cl.exe /nologo /O2 /W4 /MT (Join-Path $source "opengl-smoke.c") "/Fe:$(Join-Path $OutputDir 'opengl-smoke.exe')" /link opengl32.lib gdi32.lib user32.lib
 if ($LASTEXITCODE -ne 0) { throw "OpenGL smoke probe compilation failed." }
-if ($GraphicsOnly) { return }
-if (-not $OpenClInclude -or -not $OpenClLibrary) {
-    throw "OpenCL include and library paths are required for the full smoke-probe set."
-}
 & cl.exe /nologo /O2 /W4 /MT /EHsc (Join-Path $source "d3d11-smoke.cpp") "/Fe:$(Join-Path $OutputDir 'd3d11-smoke.exe')" /link d3d11.lib dxgi.lib
 if ($LASTEXITCODE -ne 0) { throw "D3D11 smoke probe compilation failed." }
 & cl.exe /nologo /O2 /W4 /MT /EHsc `
     (Join-Path $RepoRoot "tools\d3d12_devicecreate_probe.cpp") `
     "/Fe:$(Join-Path $OutputDir 'd3d12-smoke.exe')" /link d3d12.lib dxgi.lib dxguid.lib
 if ($LASTEXITCODE -ne 0) { throw "D3D12 smoke probe compilation failed." }
+& cl.exe /nologo /O2 /W4 /MT /EHsc `
+    (Join-Path $RepoRoot "tools\d3d12_clear_probe.cpp") `
+    "/Fe:$(Join-Path $OutputDir 'd3d12-clear.exe')" /link d3d12.lib dxgi.lib dxguid.lib
+if ($LASTEXITCODE -ne 0) { throw "D3D12 clear/readback probe compilation failed." }
+if ($GraphicsOnly) { return }
+if (-not $OpenClInclude -or -not $OpenClLibrary) {
+    throw "OpenCL include and library paths are required for the full smoke-probe set."
+}
 & cl.exe /nologo /O2 /W4 /MT (Join-Path $source "opencl-smoke.c") "/I$OpenClInclude" "/Fe:$(Join-Path $OutputDir 'opencl-smoke.exe')" /link $OpenClLibrary
 if ($LASTEXITCODE -ne 0) { throw "OpenCL smoke probe compilation failed." }
 & cl.exe /nologo /O2 /W4 /MT /EHsc `

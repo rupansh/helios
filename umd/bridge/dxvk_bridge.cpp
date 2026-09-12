@@ -99,6 +99,17 @@ namespace dxvk {
 }
 
 namespace helios_bridge {
+
+// Non-dispatchable Vulkan handles are pointer-shaped only in 64-bit builds;
+// in x86 they remain uint64_t and must never truncate through uintptr_t.
+static std::uint64_t memory_handle_bits(VkDeviceMemory memory) {
+#if VK_USE_64_BIT_PTR_DEFINES
+  return reinterpret_cast<std::uint64_t>(memory);
+#else
+  return static_cast<std::uint64_t>(memory);
+#endif
+}
+
   // The rotate-sample instrument reads rows as std::uint32_t, so it is only
   // valid against a 32-bit-per-pixel format.
   bool is_32bpp_dxgi_format(DXGI_FORMAT format) {
@@ -464,7 +475,7 @@ bool HeliosDxvkDevice::get_resource_memory_info(
       return false;
 
     auto info = texture->GetImage()->storage()->getMemoryInfo();
-    const auto rawMemory = reinterpret_cast<std::uintptr_t>(info.memory);
+    const auto rawMemory = memory_handle_bits(info.memory);
     const auto venusId = venus_memory_id_from_handle(info.memory);
     const auto resourceId = venus_memory_resource_id_from_handle(info.memory);
     if (memory)
@@ -545,7 +556,7 @@ bool HeliosDxvkDevice::transfer_resource_ownership(
       std::snprintf(msg, sizeof(msg),
         "transfer_resource_ownership resource=%p memory=0x%llx res_id=%u",
         resource,
-        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(info.memory)),
+        static_cast<unsigned long long>(memory_handle_bits(info.memory)),
         resourceId);
       umd_log(msg);
     }
@@ -1051,7 +1062,7 @@ bool HeliosDxvkDevice::rotate_resource_backings(
       if (sampleEvery == ~0u) {
         DWORD value = 0, size = sizeof(value);
         if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "RotateSample",
-                         RRF_RT_REG_DWORD, nullptr, &value, &size) != ERROR_SUCCESS)
+                         RRF_RT_REG_DWORD | RRF_SUBKEY_WOW6464KEY, nullptr, &value, &size) != ERROR_SUCCESS)
           value = 0;
         sampleEvery = value;
         s_sampleEvery.store(sampleEvery, std::memory_order_relaxed);
@@ -1717,7 +1728,7 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     DWORD size = sizeof(dumpPath);
     const bool haveDump =
         RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Helios", "ShaderDumpPath",
-                     RRF_RT_REG_SZ, nullptr, dumpPath, &size) == ERROR_SUCCESS &&
+                     RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY, nullptr, dumpPath, &size) == ERROR_SUCCESS &&
         dumpPath[0];
     if (haveDump)
       _putenv_s("DXVK_SHADER_DUMP_PATH", dumpPath);

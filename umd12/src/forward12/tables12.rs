@@ -1,40 +1,9 @@
-//! `pfnFillDDITable` — the three driver-side tables, and the 11-lane install
-//! sequencer.
+//! Typed D3D12 table construction and the subsystem install sequencer.
 //!
-//! ⭐ **This file is the sequencer, and S6-0 wrote all of it.** `PARALLEL.md` §5
-//! originally had each lane appending one line here; that was inverted once
-//! S6-0 could name all eleven lanes up front, because a file eleven agents
-//! append to is a merge point, and one they never touch is not. A lane's diff
-//! against this file is **empty**.
-//!
-//! # The fill, in four steps, and why it is four and not one
-//!
-//! 1. **`stub_fill_bytes(p_table, table_size, unknown_slot_noop)`** — over the
-//!    **runtime's** buffer, with the **runtime's** byte count. This is the "no
-//!    NULL slot, ever" guarantee, and it covers the case this driver cannot
-//!    otherwise reach: a table the runtime sized *larger* than the SDK header
-//!    `ddi12` was generated from. Those slots have no name here; they get a
-//!    counted stub rather than whatever was in the runtime's heap.
-//! 2. **Build the table as a typed local**, every slot a per-slot counting noop
-//!    ([`noop12::stubbed_table`]).
-//! 3. **Run the install chain** over that local. Lanes write
-//!    `f.pfnCreateCommandQueue = Some(create_command_queue)` — a **typed field
-//!    assignment the compiler checks against the bindgen signature**, which is
-//!    the whole premise of `PARALLEL.md` §7.
-//! 4. **Copy `min(table_size, size_of::<T>())` bytes** into the runtime's
-//!    buffer.
-//!
-//! ⛔ **Step 4's count comes from the argument, never from `size_of::<T>()`.**
-//! `d3d12umddi.h:2527-2528` parameterises the size explicitly and it **moves
-//! with the negotiated version** — 992/600/56 at `_0110`, 768/464/56 at `_0040`
-//! (`DDI_REFERENCE.md` §2.2). `ARCHITECTURE.md` §12 rule 16 / R702 is the scar:
-//! 24H2 passed 576 bytes for a 592-byte `DRIVERCAPS` and the D3D11 driver wrote
-//! past it. Both directions are counted, so a mismatch is visible rather than
-//! merely survived.
-//!
-//! ⚠ Steps 1 and 3 are the only places `size_of::<T>()` appears, and both are
-//! about memory **this driver owns**: step 1's `table_size` is the runtime's,
-//! and step 3's local is ours.
+//! Build a local table with signature-preserving counting fallbacks, run the
+//! typed install chain, then copy only the runtime's validated byte count.
+//! Unknown tables and oversized tails are refused before any write: no callable
+//! x86 stub can be synthesized without knowing its stdcall argument list.
 //!
 //! # ⭐ Install order is structural, not textual
 //!
@@ -56,11 +25,11 @@
 use core::ffi::c_void;
 use core::marker::PhantomData;
 
-use helios_umd_common::hr::{Hresult, E_INVALIDARG, S_OK};
-use helios_umd_common::noop::stub_fill_bytes;
+use helios_umd_common::hr::{Hresult, E_INVALIDARG, E_NOTIMPL, S_OK};
+use helios_umd_common::refusals::RefusalCounter;
 
-use super::{cmdlist, copy, descriptors, fence, misc, present12, pso, queue, resource12, rootargs};
 use super::noop12;
+use super::{cmdlist, copy, descriptors, fence, misc, present12, pso, queue, resource12, rootargs};
 use crate::{caps12, ddi12, log_error, note_refusal, UMD12_REFUSALS};
 
 /// `D3D12DDI_DEVICE_FUNCS_CORE_0109` — 124 slots.
@@ -222,21 +191,28 @@ pub(crate) unsafe fn fill(
     h_rt_table: ddi12::D3D12DDI_HRTTABLE,
 ) -> Hresult {
     let bytes = table_size as usize;
-    if table.is_null() || bytes < core::mem::size_of::<usize>() {
+    if table.is_null()
+        || bytes < core::mem::size_of::<usize>()
+        || !bytes.is_multiple_of(core::mem::size_of::<usize>())
+    {
         note_refusal(&UMD12_REFUSALS.fill_ddi_table_bad_arg);
         return E_INVALIDARG;
     }
 
-    // ⛔ A closed dispatch: exactly three values reach a fill, and every other
-    // value — known-but-unimplemented, retired, or one this header has never
-    // heard of — refuses **without writing a byte**.
-    //
-    // ⚠ `ARCHITECTURE.md` §1.2 step 9 asks for "an exhaustive match with 25
-    // arms". Twenty-two of those arms would be textually identical refusals, and
-    // the property `DECISIONS.md` §7.4 actually demands is *that no unrecognised
-    // value may select a table shape* — which this has, with 22 fewer chances to
-    // paste the wrong constant into one of them. The refused type is logged, so
-    // the evidence an enumerated match would have produced is produced anyway.
+    let header_bytes = header_table_size(table_type);
+    if header_bytes == 0 {
+        note_refusal(&UMD12_REFUSALS.fill_ddi_table_unknown_type);
+        log_error!("FillDDITable: unsupported table type {table_type}, {bytes} bytes");
+        return E_NOTIMPL;
+    }
+    if bytes > header_bytes {
+        note_refusal(&UMD12_REFUSALS.fill_ddi_table_oversized);
+        log_error!(
+            "FillDDITable: type {table_type} asks for {bytes} bytes; header has {header_bytes}"
+        );
+        return E_INVALIDARG;
+    }
+
     match table_type {
         ddi12::D3D12DDI_TABLE_TYPE_D3D12DDI_TABLE_TYPE_DEVICE_CORE => {
             // SAFETY: forwarded unchanged; the caller's guarantee is this
@@ -252,38 +228,29 @@ pub(crate) unsafe fn fill(
             // SAFETY: as above.
             unsafe { fill_command_queue(table, bytes) }
         }
-        // ⛔ **MEASURED, and it corrects the obvious design.** The first cut
-        // refused every other table type without writing a byte, reasoning that
-        // a driver must never fill a shape it does not understand. `D12-G7`
-        // failed on exactly that: the runtime asks for
-        // `D3D12DDI_TABLE_TYPE_0096_EXTENDED_FEATURES` (**27**, 32 bytes, four
-        // slots) on a baseline device — `DDI_REFERENCE.md` §2.1 already records
-        // it as *"filled with no extended-features handshake, for a baseline
-        // device"* — and a refusal there loses the device, with `S_OK`
-        // everywhere else and nothing else refused.
-        //
-        // ⭐ Filling it selects no *shape*, which is what `DECISIONS.md` §7.4
-        // actually forbids: the slot count comes from the runtime's own
-        // `SIZE_T` and every slot gets the same uniform counting stub. That is
-        // strictly safer than refusing — a refused table is a table the runtime
-        // may still call through, and those slots are NULL.
-        //
-        // ⚠ It is also honest about what it is: nothing here is implemented.
-        // `unknown_slot_noop` returns 0, which for the extended-features
-        // handshake means "zero supported features" — the answer this driver
-        // can defend. The counter is what stops that reading as support.
-        other => {
-            note_refusal(&UMD12_REFUSALS.fill_ddi_table_unknown_type);
-            log_error!(
-                "FillDDITable: table type {other} has no typed handler; filling {bytes} B \
-                 ({} slots) with counting stubs (index={index})",
-                bytes / core::mem::size_of::<usize>(),
-            );
-            // SAFETY: the caller guarantees `bytes` writable, pointer-aligned
-            // bytes; the count is the runtime's own and is never `size_of::<T>()`.
-            unsafe { stub_fill_bytes(table, bytes, noop12::unknown_slot_noop) };
+        ddi12::D3D12DDI_TABLE_TYPE_D3D12DDI_TABLE_TYPE_0096_EXTENDED_FEATURES => {
+            let built = ddi12::D3D12DDI_EXTENDED_FEATURES_FUNCS_0096 {
+                pfnGetSupportedExtendedFeatures: Some(get_extended_features_0096),
+                pfnGetSupportedExtendedFeatureVersions: Some(get_extended_feature_versions),
+                pfnEnableExtendedFeature: Some(enable_extended_feature),
+                pfnSetExtendedFeatureCallbacks: Some(set_extended_feature_callbacks),
+            };
+            // SAFETY: validated runtime buffer; built has the negotiated table's type.
+            unsafe { publish("EXTENDED_FEATURES_0096", table, bytes, &built) };
             S_OK
         }
+        ddi12::D3D12DDI_TABLE_TYPE_D3D12DDI_TABLE_TYPE_0020_EXTENDED_FEATURES => {
+            let built = ddi12::D3D12DDI_EXTENDED_FEATURES_FUNCS_0021 {
+                pfnGetSupportedExtendedFeatures: Some(get_extended_features_0020),
+                pfnGetSupportedExtendedFeatureVersions: Some(get_extended_feature_versions),
+                pfnEnableExtendedFeature: Some(enable_extended_feature),
+                pfnSetExtendedFeatureCallbacks: Some(set_extended_feature_callbacks),
+            };
+            // SAFETY: the _0020 table is the first three slots of this _0021 type.
+            unsafe { publish("EXTENDED_FEATURES_0021", table, bytes, &built) };
+            S_OK
+        }
+        _ => E_NOTIMPL,
     }
 }
 
@@ -305,12 +272,17 @@ pub(crate) fn header_table_size(table_type: ddi12::D3D12DDI_TABLE_TYPE) -> usize
         ddi12::D3D12DDI_TABLE_TYPE_D3D12DDI_TABLE_TYPE_COMMAND_QUEUE_3D => {
             core::mem::size_of::<CommandQueueTable>()
         }
+        ddi12::D3D12DDI_TABLE_TYPE_D3D12DDI_TABLE_TYPE_0096_EXTENDED_FEATURES => {
+            core::mem::size_of::<ddi12::D3D12DDI_EXTENDED_FEATURES_FUNCS_0096>()
+        }
+        ddi12::D3D12DDI_TABLE_TYPE_D3D12DDI_TABLE_TYPE_0020_EXTENDED_FEATURES => {
+            core::mem::size_of::<ddi12::D3D12DDI_EXTENDED_FEATURES_FUNCS_0021>()
+        }
         _ => 0,
     }
 }
 
-/// Count and log the two ways the runtime's table size can differ from this
-/// header's struct, and return how many bytes may be copied.
+/// Count shorter runtime tables and return the bounded copy length.
 fn agreed_bytes(name: &str, runtime_bytes: usize, header_bytes: usize) -> usize {
     if runtime_bytes < header_bytes {
         // The R702 direction: the runtime's buffer is SHORTER than the struct
@@ -323,16 +295,6 @@ fn agreed_bytes(name: &str, runtime_bytes: usize, header_bytes: usize) -> usize 
         );
         runtime_bytes
     } else {
-        if runtime_bytes > header_bytes {
-            // The other direction: a table shape newer than `ddi12`. Step 1
-            // already stubbed the tail, so nothing is NULL; it is still worth a
-            // line, because those slots can never do anything.
-            note_refusal(&UMD12_REFUSALS.fill_ddi_table_oversized);
-            log_error!(
-                "FillDDITable {name}: runtime table is {runtime_bytes} B, this header's struct is \
-                 only {header_bytes} B -- the tail is served by counted stubs; refresh the bindings"
-            );
-        }
         header_bytes
     }
 }
@@ -355,23 +317,9 @@ unsafe fn publish<T>(name: &str, dst: *mut c_void, runtime_bytes: usize, built: 
 /// # Safety
 /// As [`fill`].
 unsafe fn fill_device_core(table: *mut c_void, bytes: usize) -> Hresult {
-    // Step 1 — every slot the RUNTIME asked for is non-NULL, including any past
-    // the end of this header's struct. Byte count from the argument.
-    // SAFETY: the caller guarantees `bytes` writable, pointer-aligned bytes.
-    unsafe { stub_fill_bytes(table, bytes, noop12::unknown_slot_noop) };
+    let mut built = noop12::device_core::stubbed_table();
 
-    // Step 2 — the typed local, every slot a per-slot counting noop.
-    const _: () = assert!(
-        noop12::device_core::STUBS.len() * core::mem::size_of::<usize>()
-            == core::mem::size_of::<DeviceCoreTable>()
-    );
-    // SAFETY: `DeviceCoreTable` is a `#[repr(C)]` struct of exactly
-    // `STUBS.len()` pointer-sized `Option<fn>` fields — asserted immediately
-    // above from `size_of`, and by the macro's per-field offset proof in
-    // `noop12`.
-    let mut built: DeviceCoreTable = unsafe { noop12::stubbed_table(noop12::device_core::STUBS) };
-
-    // Step 3 — the install chain. Order is structural (see the module doc).
+    // The install chain. Order is structural (see the module doc).
     let t = Filling::<DeviceCoreTable, stage::Stubbed> {
         table: &mut built,
         _stage: PhantomData,
@@ -387,7 +335,7 @@ unsafe fn fill_device_core(table: *mut c_void, bytes: usize) -> Hresult {
     let t = misc::install_core(t);
     seal(t);
 
-    // Step 4 — publish, bounded by the runtime's count.
+    // Publish, bounded by the runtime's count.
     // SAFETY: as the caller's guarantee.
     unsafe { publish("DEVICE_CORE", table, bytes, &built) };
     S_OK
@@ -396,15 +344,7 @@ unsafe fn fill_device_core(table: *mut c_void, bytes: usize) -> Hresult {
 /// # Safety
 /// As [`fill`].
 unsafe fn fill_command_list(table: *mut c_void, bytes: usize) -> Hresult {
-    // SAFETY: as `fill_device_core`.
-    unsafe { stub_fill_bytes(table, bytes, noop12::unknown_slot_noop) };
-
-    const _: () = assert!(
-        noop12::command_list::STUBS.len() * core::mem::size_of::<usize>()
-            == core::mem::size_of::<CommandListTable>()
-    );
-    // SAFETY: as `fill_device_core`.
-    let mut built: CommandListTable = unsafe { noop12::stubbed_table(noop12::command_list::STUBS) };
+    let mut built = noop12::command_list::stubbed_table();
 
     let t = Filling::<CommandListTable, stage::Stubbed> {
         table: &mut built,
@@ -425,16 +365,7 @@ unsafe fn fill_command_list(table: *mut c_void, bytes: usize) -> Hresult {
 /// # Safety
 /// As [`fill`].
 unsafe fn fill_command_queue(table: *mut c_void, bytes: usize) -> Hresult {
-    // SAFETY: as `fill_device_core`.
-    unsafe { stub_fill_bytes(table, bytes, noop12::unknown_slot_noop) };
-
-    const _: () = assert!(
-        noop12::command_queue::STUBS.len() * core::mem::size_of::<usize>()
-            == core::mem::size_of::<CommandQueueTable>()
-    );
-    // SAFETY: as `fill_device_core`.
-    let mut built: CommandQueueTable =
-        unsafe { noop12::stubbed_table(noop12::command_queue::STUBS) };
+    let mut built = noop12::command_queue::stubbed_table();
 
     let t = Filling::<CommandQueueTable, stage::Stubbed> {
         table: &mut built,
@@ -446,4 +377,91 @@ unsafe fn fill_command_queue(table: *mut c_void, bytes: usize) -> Hresult {
     // SAFETY: as `fill_device_core`.
     unsafe { publish("COMMAND_QUEUE_CORE", table, bytes, &built) };
     S_OK
+}
+
+// Extended-feature negotiation is part of ordinary device creation. The old
+// signature-erased fallback returned S_OK without writing the feature count.
+// Advertise an explicitly empty set and reject requests to enable absent features.
+static EXTENDED_FEATURE_BAD_ARG: RefusalCounter = RefusalCounter::new("ExtendedFeatureBadArg");
+static EXTENDED_FEATURE_UNSUPPORTED: RefusalCounter =
+    RefusalCounter::new("ExtendedFeatureUnsupported");
+pub(crate) static REFUSALS: &[&RefusalCounter] =
+    &[&EXTENDED_FEATURE_BAD_ARG, &EXTENDED_FEATURE_UNSUPPORTED];
+
+/// # Safety
+/// A non-null `count` points to the runtime's writable feature-count word.
+unsafe fn empty_extended_features(count: *mut ddi12::UINT32) -> ddi12::HRESULT {
+    if count.is_null() {
+        note_refusal(&EXTENDED_FEATURE_BAD_ARG);
+        return E_INVALIDARG;
+    }
+    // SAFETY: writable count per the DDI contract; an empty set has no entries.
+    unsafe { count.write(0) };
+    S_OK
+}
+
+/// # Safety
+/// `count` is writable when non-null; an empty feature set never reads `features`.
+unsafe extern "system" fn get_extended_features_0020(
+    _device: ddi12::D3D12DDI_HDEVICE,
+    count: *mut ddi12::UINT32,
+    _features: *mut ddi12::D3D12DDI_FEATURE_0020,
+) -> ddi12::HRESULT {
+    // SAFETY: forwarded unchanged from the runtime.
+    unsafe { empty_extended_features(count) }
+}
+
+/// # Safety
+/// As `get_extended_features_0020`; the highest feature index cannot add support.
+unsafe extern "system" fn get_extended_features_0096(
+    _device: ddi12::D3D12DDI_HDEVICE,
+    _highest: ddi12::D3D12DDI_FEATURE_0020,
+    count: *mut ddi12::UINT32,
+    _features: *mut ddi12::D3D12DDI_FEATURE_0020,
+) -> ddi12::HRESULT {
+    // SAFETY: forwarded unchanged from the runtime.
+    unsafe { empty_extended_features(count) }
+}
+
+/// # Safety
+/// A non-null `count` is writable; no version entries exist.
+unsafe extern "system" fn get_extended_feature_versions(
+    _device: ddi12::D3D12DDI_HDEVICE,
+    _feature: ddi12::D3D12DDI_FEATURE_0020,
+    count: *mut ddi12::UINT32,
+    _versions: *mut ddi12::UINT32,
+) -> ddi12::HRESULT {
+    note_refusal(&EXTENDED_FEATURE_UNSUPPORTED);
+    // SAFETY: forwarded unchanged from the runtime.
+    let hr = unsafe { empty_extended_features(count) };
+    if hr == S_OK {
+        E_INVALIDARG
+    } else {
+        hr
+    }
+}
+
+/// STUB: no extended features are advertised, so none can be enabled.
+/// # Safety
+/// No handle or pointer is dereferenced.
+unsafe extern "system" fn enable_extended_feature(
+    _device: ddi12::D3D12DDI_HDEVICE,
+    _feature: ddi12::D3D12DDI_FEATURE_0020,
+    _version: ddi12::UINT32,
+) -> ddi12::HRESULT {
+    note_refusal(&EXTENDED_FEATURE_UNSUPPORTED);
+    E_INVALIDARG
+}
+
+/// STUB: no enabled extended feature owns a callback table.
+/// # Safety
+/// No handle or pointer is dereferenced.
+unsafe extern "system" fn set_extended_feature_callbacks(
+    _device: ddi12::D3D12DDI_HDEVICE,
+    _table: ddi12::D3D12DDI_TABLE_TYPE,
+    _data: *const c_void,
+    _bytes: ddi12::SIZE_T,
+) -> ddi12::HRESULT {
+    note_refusal(&EXTENDED_FEATURE_UNSUPPORTED);
+    E_NOTIMPL
 }

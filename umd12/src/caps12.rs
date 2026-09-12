@@ -2219,7 +2219,7 @@ const DXGI_FORMAT_R10G10B10_XR_BIAS_A2_UNORM: ddi12::DXGI_FORMAT = 89;
 /// # Safety
 /// `h_device` must be a live handle from `device12::create_device`, and `out`
 /// must address one writable `UINT` the runtime owns.
-unsafe extern "C" fn check_format_support(
+unsafe extern "system" fn check_format_support(
     h_device: ddi12::D3D12DDI_HDEVICE,
     format: ddi12::DXGI_FORMAT,
     out: *mut ddi12::UINT,
@@ -2297,7 +2297,7 @@ unsafe extern "C" fn check_format_support(
 /// # Safety
 /// `h_device` must be a live handle from `device12::create_device`, and
 /// `num_quality_levels` must address one writable `UINT` the runtime owns.
-unsafe extern "C" fn check_multisample_quality_levels(
+unsafe extern "system" fn check_multisample_quality_levels(
     h_device: ddi12::D3D12DDI_HDEVICE,
     format: ddi12::DXGI_FORMAT,
     sample_count: ddi12::UINT,
@@ -2439,7 +2439,7 @@ fn engine_msaa_quality_levels(
 /// # Safety
 /// `num_packed_mips` and `num_tiles_for_packed_mips` must each address one
 /// writable `UINT` the runtime owns.
-unsafe extern "C" fn get_mip_packing(
+unsafe extern "system" fn get_mip_packing(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _h_tiled_resource: ddi12::D3D12DDI_HRESOURCE,
     num_packed_mips: *mut ddi12::UINT,

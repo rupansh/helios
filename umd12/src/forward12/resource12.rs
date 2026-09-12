@@ -1169,7 +1169,7 @@ fn heap_and_resource_private_sizes(
 /// # Safety
 /// `p_heap` and `p_resource`, when non-null, must be live for the call. Neither
 /// is dereferenced here — only their nullness selects the answer.
-unsafe extern "C" fn calc_private_heap_and_resource_sizes(
+unsafe extern "system" fn calc_private_heap_and_resource_sizes(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     p_heap: *const ddi12::D3D12DDIARG_CREATEHEAP_0001,
     p_resource: *const ddi12::D3D12DDIARG_CREATERESOURCE_0109,
@@ -2716,7 +2716,7 @@ unsafe fn castable_formats(
 /// is a live parameter of this DDI and [`adopt_committed_allocation`] runs inside it, so the
 /// only place it needs to survive to is the identity table, which keeps it as an
 /// integer for the paired `pfnDeallocateCb`.
-unsafe extern "C" fn create_heap_and_resource(
+unsafe extern "system" fn create_heap_and_resource(
     h_device: ddi12::D3D12DDI_HDEVICE,
     p_heap: *const ddi12::D3D12DDIARG_CREATEHEAP_0001,
     h_heap: ddi12::D3D12DDI_HHEAP,
@@ -2914,7 +2914,7 @@ unsafe extern "C" fn create_heap_and_resource(
 /// `h_heap` and `h_resource`, when their `pDrvPrivate` is non-null, must be
 /// handles [`create_heap_and_resource`] returned `S_OK` for and which have not
 /// already been destroyed. Passing one twice is a double free.
-unsafe extern "C" fn destroy_heap_and_resource(
+unsafe extern "system" fn destroy_heap_and_resource(
     h_device: ddi12::D3D12DDI_HDEVICE,
     h_heap: ddi12::D3D12DDI_HHEAP,
     h_resource: ddi12::D3D12DDI_HRESOURCE,
@@ -3065,7 +3065,7 @@ unsafe extern "C" fn destroy_heap_and_resource(
 /// # Safety
 /// `h_heap` must be a live heap handle from [`create_heap_and_resource`], and
 /// `out` must address one writable pointer the runtime owns.
-unsafe extern "C" fn map_heap(
+unsafe extern "system" fn map_heap(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_heap: ddi12::D3D12DDI_HHEAP,
     out: *mut *mut c_void,
@@ -3128,7 +3128,7 @@ unsafe extern "C" fn map_heap(
 ///
 /// # Safety
 /// `h_heap` must be a live heap handle that [`map_heap`] returned `S_OK` for.
-unsafe extern "C" fn unmap_heap(_h_device: ddi12::D3D12DDI_HDEVICE, h_heap: ddi12::D3D12DDI_HHEAP) {
+unsafe extern "system" fn unmap_heap(_h_device: ddi12::D3D12DDI_HDEVICE, h_heap: ddi12::D3D12DDI_HHEAP) {
     // SAFETY: as `map_heap`.
     let Some(state) = (unsafe { heap_state(h_heap) }) else {
         note_refusal(&L4_REFUSALS.resource_handle_unresolved);
@@ -3199,7 +3199,7 @@ unsafe fn zero_paging_fences(values: *mut ddi12::UINT64, count: ddi12::UINT) {
 /// # Safety
 /// `arg`, when non-null, must be a live `D3D12DDIARG_MAKERESIDENT_0001` whose
 /// `pPagingFenceValue` addresses `NumAdapters` writable `UINT64`s.
-unsafe extern "C" fn make_resident(
+unsafe extern "system" fn make_resident(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *mut ddi12::D3D12DDIARG_MAKERESIDENT_0001,
 ) -> Hresult {
@@ -3239,7 +3239,7 @@ unsafe extern "C" fn make_resident(
 ///
 /// # Safety
 /// `arg`, when non-null, must be a live `D3D12DDIARG_EVICT`.
-unsafe extern "C" fn evict(
+unsafe extern "system" fn evict(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_EVICT,
 ) -> Hresult {
@@ -3261,7 +3261,7 @@ unsafe extern "C" fn evict(
 ///
 /// # Safety
 /// `arg`, when non-null, must be a live `D3D12DDIARG_OFFERRESOURCES`.
-unsafe extern "C" fn offer_resources(
+unsafe extern "system" fn offer_resources(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_OFFERRESOURCES,
 ) -> Hresult {
@@ -3286,7 +3286,7 @@ unsafe extern "C" fn offer_resources(
 /// `arg`, when non-null, must be a live `D3D12DDIARG_RECLAIMRESOURCES_0001`
 /// whose `pDiscarded` addresses `NumObjects` writable `BOOL`s and whose
 /// `pPagingFenceValue` addresses `NumAdapters` writable `UINT64`s.
-unsafe extern "C" fn reclaim_resources(
+unsafe extern "system" fn reclaim_resources(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *mut ddi12::D3D12DDIARG_RECLAIMRESOURCES_0001,
 ) -> Hresult {
@@ -3322,7 +3322,7 @@ unsafe extern "C" fn reclaim_resources(
 ///
 /// # Safety
 /// `_arg`, when non-null, must be live for the call. It is not dereferenced.
-unsafe extern "C" fn calc_private_opened_heap_and_resource_sizes(
+unsafe extern "system" fn calc_private_opened_heap_and_resource_sizes(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_OPENHEAP_0003,
     _h_protected_session: ddi12::D3D12DDI_HPROTECTEDRESOURCESESSION_0030,
@@ -3386,7 +3386,7 @@ unsafe extern "C" fn calc_private_opened_heap_and_resource_sizes(
 /// # Safety
 /// `_arg`, when non-null, must be live for the call. Nothing is dereferenced and
 /// nothing is written.
-unsafe extern "C" fn open_heap_and_resource(
+unsafe extern "system" fn open_heap_and_resource(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     _arg: *const ddi12::D3D12DDIARG_OPENHEAP_0003,
     _h_heap: ddi12::D3D12DDI_HHEAP,
@@ -3528,7 +3528,7 @@ fn allocation_info_from_engine(
 /// # Safety
 /// `p_resource` must be a live `D3D12DDIARG_CREATERESOURCE_0109`, and `out` must
 /// address one writable `D3D12DDI_RESOURCE_ALLOCATION_INFO_0022`.
-unsafe extern "C" fn check_resource_allocation_info(
+unsafe extern "system" fn check_resource_allocation_info(
     h_device: ddi12::D3D12DDI_HDEVICE,
     p_resource: *const ddi12::D3D12DDIARG_CREATERESOURCE_0109,
     optimization_flags: ddi12::D3D12DDI_RESOURCE_OPTIMIZATION_FLAGS,
@@ -3634,7 +3634,7 @@ unsafe extern "C" fn check_resource_allocation_info(
 /// `h_resource` must be a live resource handle from
 /// [`create_heap_and_resource`], and `out` must address one writable
 /// `D3D12DDI_RESOURCE_ALLOCATION_INFO_0022`.
-unsafe extern "C" fn check_existing_resource_allocation_info(
+unsafe extern "system" fn check_existing_resource_allocation_info(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_resource: ddi12::D3D12DDI_HRESOURCE,
     out: *mut ddi12::D3D12DDI_RESOURCE_ALLOCATION_INFO_0022,
@@ -3715,7 +3715,7 @@ unsafe extern "C" fn check_existing_resource_allocation_info(
 /// `h_resource` must be a live resource handle from
 /// [`create_heap_and_resource`], and `out` must address one writable
 /// `D3D12DDI_SUBRESOURCE_INFO`.
-unsafe extern "C" fn check_subresource_info(
+unsafe extern "system" fn check_subresource_info(
     h_device: ddi12::D3D12DDI_HDEVICE,
     h_resource: ddi12::D3D12DDI_HRESOURCE,
     subresource: ddi12::UINT,
@@ -3869,7 +3869,7 @@ unsafe extern "C" fn check_subresource_info(
 /// # Safety
 /// `h_resource` must be a live resource handle from
 /// [`create_heap_and_resource`].
-unsafe extern "C" fn check_resource_virtual_address(
+unsafe extern "system" fn check_resource_virtual_address(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_resource: ddi12::D3D12DDI_HRESOURCE,
 ) -> ddi12::D3D12DDI_GPU_VIRTUAL_ADDRESS {
@@ -3919,7 +3919,7 @@ unsafe extern "C" fn check_resource_virtual_address(
 /// # Safety
 /// `h_resource`, when its `pDrvPrivate` is non-null, must be a resource handle
 /// [`create_heap_and_resource`] returned `S_OK` for.
-unsafe extern "C" fn check_resource_allocation_handle(
+unsafe extern "system" fn check_resource_allocation_handle(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_resource: ddi12::D3D10DDI_HRESOURCE,
 ) -> ddi12::D3DKMT_HANDLE {
@@ -3947,7 +3947,7 @@ unsafe extern "C" fn check_resource_allocation_handle(
 /// Chain position: `QueueSlots` -> `ResourceSlots` on the device-core table.
 ///
 /// Every assignment below is checked by the compiler against the bindgen
-/// `Option<unsafe extern "C" fn(...)>` signature for that field, which is the
+/// `Option<unsafe extern "system" fn(...)>` signature for that field, which is the
 /// whole premise of the fan-out (`PARALLEL.md` §7).
 pub(crate) fn install(
     mut filling: Filling<'_, DeviceCoreTable, stage::QueueSlots>,

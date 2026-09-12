@@ -6,14 +6,14 @@ use super::*;
 
 // --- Queries / counters -----------------------------------------------------
 
-pub(crate) unsafe extern "C" fn calc_size_query(
+pub(crate) unsafe extern "system" fn calc_size_query(
     _h: Hdevice,
     _a: *const ddi::D3D10DDIARG_CREATEQUERY,
-) -> u64 {
+) -> ddi::SIZE_T {
     8
 }
 
-pub(crate) unsafe extern "C" fn create_query(
+pub(crate) unsafe extern "system" fn create_query(
     h: Hdevice,
     arg: *const ddi::D3D10DDIARG_CREATEQUERY,
     h_query: ddi::D3D10DDI_HQUERY,
@@ -39,11 +39,11 @@ pub(crate) unsafe extern "C" fn create_query(
     }
 }
 
-pub(crate) unsafe extern "C" fn destroy_query(_h: Hdevice, h_query: ddi::D3D10DDI_HQUERY) {
+pub(crate) unsafe extern "system" fn destroy_query(_h: Hdevice, h_query: ddi::D3D10DDI_HQUERY) {
     release_com(h_query);
 }
 
-pub(crate) unsafe extern "C" fn query_begin(h: Hdevice, h_query: ddi::D3D10DDI_HQUERY) {
+pub(crate) unsafe extern "system" fn query_begin(h: Hdevice, h_query: ddi::D3D10DDI_HQUERY) {
     let Some(context) = d3d11_context(h) else {
         return;
     };
@@ -55,7 +55,7 @@ pub(crate) unsafe extern "C" fn query_begin(h: Hdevice, h_query: ddi::D3D10DDI_H
     }
 }
 
-pub(crate) unsafe extern "C" fn query_end(h: Hdevice, h_query: ddi::D3D10DDI_HQUERY) {
+pub(crate) unsafe extern "system" fn query_end(h: Hdevice, h_query: ddi::D3D10DDI_HQUERY) {
     let Some(context) = d3d11_context(h) else {
         return;
     };
@@ -67,7 +67,7 @@ pub(crate) unsafe extern "C" fn query_end(h: Hdevice, h_query: ddi::D3D10DDI_HQU
     }
 }
 
-pub(crate) unsafe extern "C" fn query_get_data(
+pub(crate) unsafe extern "system" fn query_get_data(
     h: Hdevice,
     h_query: ddi::D3D10DDI_HQUERY,
     data: *mut c_void,
@@ -105,7 +105,7 @@ pub(crate) unsafe extern "C" fn query_get_data(
     }
 }
 
-pub(crate) unsafe extern "C" fn set_predication(
+pub(crate) unsafe extern "system" fn set_predication(
     h: Hdevice,
     h_query: ddi::D3D10DDI_HQUERY,
     predicate_value: i32,
@@ -183,7 +183,7 @@ pub(crate) unsafe fn helios_multisample_quality_levels(
     val
 }
 
-pub(crate) unsafe extern "C" fn check_multisample_quality_levels(
+pub(crate) unsafe extern "system" fn check_multisample_quality_levels(
     h: Hdevice,
     fmt: ddi::DXGI_FORMAT,
     sample_count: u32,
@@ -198,7 +198,7 @@ pub(crate) unsafe extern "C" fn check_multisample_quality_levels(
     }
 }
 
-pub(crate) unsafe extern "C" fn check_multisample_quality_levels_wddm1_3(
+pub(crate) unsafe extern "system" fn check_multisample_quality_levels_wddm1_3(
     h: Hdevice,
     fmt: ddi::DXGI_FORMAT,
     sample_count: u32,
@@ -223,7 +223,7 @@ pub(crate) unsafe extern "C" fn check_multisample_quality_levels_wddm1_3(
 /// failure during `LLOCompleteLayerConstruction`). We expose no device-dependent
 /// counters: zero the struct (LastDeviceDependentCounter = 0, 0 simultaneous
 /// counters) and report a single detectable parallel unit. PATH-A (2026-06-22).
-pub(crate) unsafe extern "C" fn check_counter_info(
+pub(crate) unsafe extern "system" fn check_counter_info(
     _h: Hdevice,
     info: *mut ddi::D3D10DDI_COUNTER_INFO,
 ) {
@@ -237,7 +237,7 @@ pub(crate) unsafe extern "C" fn check_counter_info(
     }
 }
 
-pub(crate) unsafe extern "C" fn check_counter(
+pub(crate) unsafe extern "system" fn check_counter(
     _h: Hdevice,
     _query: ddi::D3D10DDI_QUERY,
     counter_type: *mut ddi::D3D10DDI_COUNTER_TYPE,

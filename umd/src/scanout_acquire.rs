@@ -49,11 +49,10 @@ use helios_protocol::{
     HeliosReadLedgerSlot, HELIOS_ESCAPE_MAP_READ_LEDGER, HELIOS_ESCAPE_SCANOUT_EVENT,
     HELIOS_READ_LEDGER_MAGIC, HELIOS_READ_LEDGER_SLOTS, HELIOS_READ_LEDGER_VERSION,
     HELIOS_SCANOUT_ACQ_OK, HELIOS_SCANOUT_ACQ_OP_MAP, HELIOS_SCANOUT_ACQ_OP_PROBE,
-    HELIOS_SCANOUT_ACQ_OP_REGISTER, HELIOS_SCANOUT_ACQ_OP_UNMAP,
-    HELIOS_SCANOUT_ACQ_OP_UNREGISTER, HELIOS_SCANOUT_ACQ_PROBE_ACK,
-    HELIOS_SCANOUT_ACQ_TABLE_FULL, HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM,
-    HELIOS_SCANOUT_CAP_READ_LEDGER, HELIOS_SCANOUT_CAP_SNAPSHOT_BIND,
-    HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT,
+    HELIOS_SCANOUT_ACQ_OP_REGISTER, HELIOS_SCANOUT_ACQ_OP_UNMAP, HELIOS_SCANOUT_ACQ_OP_UNREGISTER,
+    HELIOS_SCANOUT_ACQ_PROBE_ACK, HELIOS_SCANOUT_ACQ_TABLE_FULL,
+    HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM, HELIOS_SCANOUT_CAP_READ_LEDGER,
+    HELIOS_SCANOUT_CAP_SNAPSHOT_BIND, HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT,
 };
 
 use crate::ddi;
@@ -78,6 +77,7 @@ const PROBE_UNKNOWN: u32 = 0;
 const PROBE_OK: u32 = 1;
 const PROBE_OFF: u32 = 2;
 static PROBE_STATE: AtomicU32 = AtomicU32::new(PROBE_UNKNOWN);
+static LEDGER_ADDRESS_REFUSALS: AtomicUsize = AtomicUsize::new(0);
 
 /// The PROBE reply's `out_size` capability bitmask
 /// (`HELIOS_SCANOUT_CAP_*`), latched beside [`PROBE_STATE`] when the ACK
@@ -113,17 +113,15 @@ pub(crate) fn async_present_stream_capable() -> bool {
 /// is deliberately a separate capability: a direct-bind-only KMD must retain
 /// its existing windowed copy path.
 pub(crate) fn windowed_blt_snapshot_capable() -> bool {
-    PROBE_STATE.load(Ordering::Acquire) == PROBE_OK
-        && {
-            let caps = PROBE_CAPS.load(Ordering::Relaxed);
-            caps
-                & (HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT
-                    | HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM
-                    | HELIOS_SCANOUT_CAP_READ_LEDGER)
-                == (HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT
-                    | HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM
-                    | HELIOS_SCANOUT_CAP_READ_LEDGER)
-        }
+    PROBE_STATE.load(Ordering::Acquire) == PROBE_OK && {
+        let caps = PROBE_CAPS.load(Ordering::Relaxed);
+        caps & (HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT
+            | HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM
+            | HELIOS_SCANOUT_CAP_READ_LEDGER)
+            == (HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT
+                | HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM
+                | HELIOS_SCANOUT_CAP_READ_LEDGER)
+    }
 }
 
 /// The lock-free fast-path flag the DXVK export reads once per flush:
@@ -365,7 +363,9 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
     }
     let rt_adapter = LAST_RT_ADAPTER.load(Ordering::Acquire);
     if rt_adapter == 0 {
-        log_error!("scanout-acquire: no runtime adapter handle captured; feature off for this device");
+        log_error!(
+            "scanout-acquire: no runtime adapter handle captured; feature off for this device"
+        );
         return 0;
     }
     let key = dev as *const HeliosDevice as usize;
@@ -386,7 +386,12 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
             // SAFETY: `kt_callbacks` is the device's live callback table and
             // the payload is a stack struct sized to its own advertisement.
             let probed = unsafe {
-                escape_map_ledger(kt_callbacks, rt_adapter, h_rt_device, HELIOS_SCANOUT_ACQ_OP_PROBE)
+                escape_map_ledger(
+                    kt_callbacks,
+                    rt_adapter,
+                    h_rt_device,
+                    HELIOS_SCANOUT_ACQ_OP_PROBE,
+                )
             };
             match probed {
                 Ok(p) if p.out_state == HELIOS_SCANOUT_ACQ_PROBE_ACK => {
@@ -425,17 +430,32 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
     // Map this device's read-only view of the ledger page.
     // SAFETY: as for the probe above.
     let ledger_va = match unsafe {
-        escape_map_ledger(kt_callbacks, rt_adapter, h_rt_device, HELIOS_SCANOUT_ACQ_OP_MAP)
+        escape_map_ledger(
+            kt_callbacks,
+            rt_adapter,
+            h_rt_device,
+            HELIOS_SCANOUT_ACQ_OP_MAP,
+        )
     } {
         Ok(m)
             if m.out_state == HELIOS_SCANOUT_ACQ_OK
                 && m.out_user_va != 0
                 && (m.out_size as usize) >= size_of::<HeliosReadLedgerPage>() =>
         {
-            let va = m.out_user_va as usize;
-            // SAFETY: the KMD just mapped `out_size >= page` bytes at `va` for
-            // this process; the header reads are inside that range.
-            if unsafe { ledger_page_valid(va) } {
+            let va = usize::try_from(m.out_user_va)
+                .ok()
+                .filter(|va| va.checked_add(size_of::<HeliosReadLedgerPage>()).is_some());
+            if va.is_none() {
+                let n = LEDGER_ADDRESS_REFUSALS.fetch_add(1, Ordering::Relaxed) + 1;
+                log_error!(
+                    "scanout-acquire: ledger address exceeds process width va=0x{:x} refusals={n}",
+                    m.out_user_va
+                );
+            }
+            // SAFETY: the KMD mapped the complete page into this process;
+            // the checked conversion preserves its address and full extent.
+            let valid = va.filter(|va| unsafe { ledger_page_valid(*va) });
+            if let Some(va) = valid {
                 va
             } else {
                 log_error!(
@@ -444,7 +464,12 @@ pub(crate) fn init_for_device(dev: &HeliosDevice) -> usize {
                 // Best effort: return the bogus mapping rather than leak it.
                 // SAFETY: as for the map call.
                 let _ = unsafe {
-                    escape_map_ledger(kt_callbacks, rt_adapter, h_rt_device, HELIOS_SCANOUT_ACQ_OP_UNMAP)
+                    escape_map_ledger(
+                        kt_callbacks,
+                        rt_adapter,
+                        h_rt_device,
+                        HELIOS_SCANOUT_ACQ_OP_UNMAP,
+                    )
                 };
                 0
             }

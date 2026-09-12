@@ -22,6 +22,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "Initialize-HeliosBuild.ps1")
+. (Join-Path $RepoRoot "packaging\windows\Helios-PackageCommon.ps1")
 . (Join-Path $RepoRoot "metadata\Read-HeliosMetadata.ps1")
 $metadata = Read-HeliosMetadata $RepoRoot
 if ($Version -ne $metadata.HELIOS_KMD_VERSION) {
@@ -54,17 +55,23 @@ foreach ($script in @("Install-Helios.cmd", "Install-Helios.ps1", "Uninstall-Hel
 }
 
 $driverOut = Join-Path $payload "driver"
-foreach ($name in @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll", "toolchain.json")) {
+foreach ($name in @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll", "helios_umd32.dll", "helios_umd12_32.dll", "toolchain.json")) {
     Copy-Required (Join-Path $DriverArtifact $name) (Join-Path $driverOut $name)
 }
-foreach ($name in @("helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll")) {
+foreach ($name in @("helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll", "helios_umd32.dll", "helios_umd12_32.dll")) {
     $info = (Get-Item -LiteralPath (Join-Path $driverOut $name)).VersionInfo
     if ($info.FileVersion -ne $Version -or $info.ProductVersion -ne $Version -or
         $info.ProductName -ne $metadata.HELIOS_PRODUCT -or $info.CompanyName -ne $metadata.HELIOS_PUBLISHER) {
-        throw "$name has stale version/branding resources. Rebuild all three driver images from this checkout."
+        throw "$name has stale version/branding resources. Rebuild all five driver images from this checkout."
     }
 }
-foreach ($optional in @("helios_kmd_render.pdb", "helios_kmd_render.map", "helios_umd.pdb", "helios_umd12.pdb")) {
+foreach ($name in @("helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll")) {
+    Assert-HeliosPeArchitecture (Join-Path $driverOut $name) x64
+}
+foreach ($name in @("helios_umd32.dll", "helios_umd12_32.dll")) {
+    Assert-HeliosPeArchitecture (Join-Path $driverOut $name) x86
+}
+foreach ($optional in @("helios_kmd_render.pdb", "helios_kmd_render.map", "helios_umd.pdb", "helios_umd12.pdb", "helios_umd32.pdb", "helios_umd12_32.pdb")) {
     $source = Join-Path $DriverArtifact $optional
     if (Test-Path -LiteralPath $source -PathType Leaf) { Copy-Required $source (Join-Path $driverOut $optional) }
 }
@@ -100,14 +107,20 @@ foreach ($probe in @(
     "vulkan-wsi-probe.exe",
     "d3d11-smoke.exe",
     "d3d12-smoke.exe",
+    "d3d12-clear.exe",
     "opengl-smoke.exe",
     "opencl-smoke.exe",
     "opencl-gl-sharing-smoke.exe"
 )) {
     Copy-Required (Join-Path $LoadersArtifact "smoke\$probe") (Join-Path $payload "smoke\$probe")
 }
-foreach ($probe in @("vulkan-smoke.exe", "vulkan-wsi-probe.exe", "opengl-smoke.exe")) {
+foreach ($probe in @("vulkan-smoke.exe", "vulkan-wsi-probe.exe", "opengl-smoke.exe", "d3d11-smoke.exe", "d3d12-smoke.exe", "d3d12-clear.exe")) {
     Copy-Required (Join-Path $LoadersArtifact "smoke\x86\$probe") (Join-Path $payload "smoke\x86\$probe")
+}
+
+foreach ($probe in Get-ChildItem -LiteralPath (Join-Path $payload "smoke") -Filter "*.exe" -File -Recurse) {
+    $architecture = if ($probe.Directory.Name -eq "x86") { "x86" } else { "x64" }
+    Assert-HeliosPeArchitecture $probe.FullName $architecture
 }
 
 $resolveCompatibilityOut = Join-Path $stagingRoot "compatibility\DaVinci Resolve"
@@ -121,9 +134,12 @@ foreach ($name in @(
     Copy-Required (Join-Path $CompatibilityArtifact $name) (Join-Path $resolveCompatibilityOut $name)
 }
 
-$redist = Get-ChildItem -LiteralPath $env:VCToolsRedistDir -Filter "vc_redist.x64.exe" -File -Recurse | Select-Object -First 1
-if (-not $redist) { throw "The Visual C++ x64 redistributable was not found below $env:VCToolsRedistDir." }
-Copy-Required $redist.FullName (Join-Path $payload "prerequisites\vc_redist.x64.exe")
+foreach ($architecture in @("x64", "x86")) {
+    $redistName = "vc_redist.$architecture.exe"
+    $redist = Get-ChildItem -LiteralPath $env:VCToolsRedistDir -Filter $redistName -File -Recurse | Select-Object -First 1
+    if (-not $redist) { throw "The Visual C++ $architecture redistributable was not found below $env:VCToolsRedistDir." }
+    Copy-Required $redist.FullName (Join-Path $payload "prerequisites\$redistName")
+}
 
 $licenseOut = Join-Path $stagingRoot "licenses"
 foreach ($artifact in @($DriverArtifact, $MesaArtifact, $MesaX86Artifact, $OpenClArtifact, $LoadersArtifact, $CompatibilityArtifact)) {
@@ -154,11 +170,13 @@ try {
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $certificateOut) | Out-Null
     Export-Certificate -Cert $certificate -FilePath $certificateOut -Type CERT | Out-Null
 
-    # The catalog hashes the SYS and both UMDs. Sign those first, generate the
+    # The catalog hashes the SYS and all four UMDs. Sign those first, generate the
     # catalog over the final bytes, and sign the catalog last.
     Invoke-SignTool $signTool $certificate.Thumbprint (Join-Path $driverOut "helios_kmd_render.sys")
     Invoke-SignTool $signTool $certificate.Thumbprint (Join-Path $driverOut "helios_umd.dll")
     Invoke-SignTool $signTool $certificate.Thumbprint (Join-Path $driverOut "helios_umd12.dll")
+    Invoke-SignTool $signTool $certificate.Thumbprint (Join-Path $driverOut "helios_umd32.dll")
+    Invoke-SignTool $signTool $certificate.Thumbprint (Join-Path $driverOut "helios_umd12_32.dll")
     & $inf2Cat "/driver:$driverOut" "/os:10_X64" /uselocaltime
     if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $catalog -PathType Leaf)) {
         throw "Inf2Cat failed to produce the Helios catalog."
@@ -221,9 +239,10 @@ $manifest = [ordered]@{
             version = $Version
             direct3D = "DXVK D3D11 and vkd3d-proton D3D12 embedded WDDM UMDs"
             direct3D12DefaultEnabled = $true
+            architectures = @("x64", "x86")
         }
         mesa = [ordered]@{ vulkan = "Venus"; openGL = "Zink WGL ICD"; architectures = @("x64", "x86"); vulkanApiVersion = "1.4.352" }
-        openCl = [ordered]@{ implementation = "CLVK"; onlineCompiler = $true }
+        openCl = [ordered]@{ implementation = "CLVK"; onlineCompiler = $true; architectures = @("x64") }
         compatibility = [ordered]@{ davinciResolve = "App-local AMD ADL detection shim" }
     }
     files = $files

@@ -156,22 +156,19 @@ single file would otherwise be the contention point that serialises the whole fa
 `umd/build.rs` already compiles `bridge_dxbc.cpp` and `bridge_icd_exports.cpp` as extra TUs off one
 `cc::Build`.
 
-⭐ **The DDI typedefs are `extern "C"`, not `extern "system"`.** Measured by fault-injecting a wrong
-signature against the host cross-check:
-
-```
-expected fn pointer `unsafe extern "C" fn(D3D12DDI_HCOMMANDLIST, u32, u32, u32, u32) -> ()`
-   found fn pointer `unsafe extern "system" fn(u8) -> u8`
-```
-
-On x86_64 Windows the two are the same ABI, so this is a *type* error and not a calling-convention
-bug — which is exactly why it would have been written wrong 214 times and caught by nothing until
-the first compile. ⛔ Declare every handler `unsafe extern "C"`. ⚠ Note this differs from the
-D3D11 side's exported entry points, which are `extern "system"`.
+⭐ **DDI typedefs and callbacks use `extern "system"`.** The WDK declares
+these function pointers with APIENTRY. Both UMD bindgen builders normalize the
+`PFND3D*` / `PFNDXGI*` typedefs and inline `pfn*` table fields to Rust's
+system ABI for the selected target.
+This is stdcall on x86 and the unified Windows ABI on x64. A cdecl fallback
+would leave the x86 stack unbalanced, so even refused slots must retain their
+exact typed signature. Private C++ bridge and probe exports keep their declared
+cdecl ABI. `umd12` has separate WDK-generated x86 and x64 caches; run
+`tools/umd12-host-check.sh --arch x86` and the default x64 check.
 
 ⛔ **`bridge_guard` stays singular.** Lanes use the shared `umd_common/bridge/bridge_guard.h`; no
 lane writes a second guard template, and no lane defines `HELIOS_BRIDGE_ENGINE_CATCH` (vkd3d throws
-nothing). `grep -rnE '^[[:space:]]*static_assert\(' umd/bridge umd12/bridge umd_common/bridge` must stay at **1**.
+nothing). The shared guard owns its one exception-contract assertion; independent ABI assertions in bridge translation units are encouraged.
 
 ## 6. The VM lease
 
@@ -320,8 +317,8 @@ reviewer adds nothing a `grep` does not, and an agent's attention is better spen
 | every `unsafe` has a `// SAFETY:` | `AGENTS.md` rule 4 |
 | no `panic!` / `todo!` / `unimplemented!` / `.unwrap()` / `.expect()` on runtime data | a panic in any DDI is a **silent graphics deadlock**; `panic = "abort"` makes it a dead compositor |
 | no `#[allow(...)]` on a hand-written line | generated code may be allowed, hand-written code may not — R908 |
-| `grep -rnE '^[[:space:]]*static_assert\(' umd/bridge umd12/bridge umd_common/bridge` → **1** | `ead692e`. ⚠ the **anchor** is what works — both the bare word and the trailing-paren form count the comments that quote them, and reported 3. ⛔ never `git grep`: it skips untracked files, so a new `umd12/bridge/` reads 0 |
-| `tools/umd12-host-check.sh --clippy -- -D warnings` | 214 hand-written handlers is where `missing_safety_doc` earns its keep. ⚠ **Through the script, not a bare `cargo clippy`** — the bare form dies in `link-cplusplus`'s build script with an error naming `lib.exe` and nothing about clippy (§7), so a lane reads it as a broken tree and drops the row. It caught a real one the moment it was wired up: `umd12`'s `OpenAdapter12` had no `# Safety` section |
+| `test "$(rg -c '^[[:space:]]*static_assert\(' umd_common/bridge/bridge_guard.h)" = 1` | `ead692e`. ⚠ the **anchor** is what works — both the bare word and the trailing-paren form count the comments that quote them, and reported 3. ⛔ never `git grep`: it skips untracked files, so a new `umd12/bridge/` reads 0 |
+| `tools/umd12-host-check.sh --arch x64 --clippy -- -D warnings` and `--arch x86` | 214 hand-written handlers is where `missing_safety_doc` earns its keep. ⚠ **Through the script, not a bare `cargo clippy`** — the bare form dies in `link-cplusplus`'s build script with an error naming `lib.exe` and nothing about clippy (§7), so a lane reads it as a broken tree and drops the row. It caught a real one the moment it was wired up: `umd12`'s `OpenAdapter12` had no `# Safety` section |
 | `tools/umd12-log-ascii-check.sh` | ⭐ **the reader, not the writer.** The UMD writes UTF-8 correctly, but every gate script and every triage step reads `umd12-<pid>.log` with `Get-Content`, and PowerShell 5.1 defaults to the ANSI code page — so an em dash in a format string renders as `<?"` in the one reader anyone uses. Found by the S6-0 fill-table run, with the bytes checked both ways before blaming the writer. Comments are exempt and must stay so: the ⭐/⛔/⚠ markers are load-bearing |
 | `tools/umd12-slot-coverage.sh` | ⛔ **a slot with TWO owners is silent.** The install chain runs each lane's `install*` in turn over one table, so if two lanes both assign `pfnCreateCommandSignature` the later lane wins and the earlier handler is unreachable — it compiles, both files look complete, both lanes report the slot done. §4 says lanes own *files* exclusively, but what they contend for is *slots*, and the slot partition lives in `DDI_REFERENCE.md` §3.2's prose, not in any type. This makes the collision an exit code. It also prints how many of the 206 are still counting noops, which is the static half of §9.2's per-lane definition of done — answerable between VM leases instead of only across them. ⚠ It measures **installation, not correctness**, and the runtime counters remain the authority for *was it called*. ⭐ Its own first run reported a false collision from the two doc comments that teach a lane to write `f.pfnCreateCommandQueue = Some(handler)` — the §10 scar *"a grep check can count its own documentation"*, reproduced on the check written to catch a different silent failure. Comment lines are dropped now |
 | `git diff` on the shared files is append-only, and empty for `tables12.rs` | §5 |
@@ -387,7 +384,7 @@ once per lane.
 
 ## 11. Integrator's checklist per merge
 
-- `grep -rnE '^[[:space:]]*static_assert\(' umd/bridge umd12/bridge umd_common/bridge` → **1**
+- `test "$(rg -c '^[[:space:]]*static_assert\(' umd_common/bridge/bridge_guard.h)" = 1`
 - `umd-check.ps1 -Mode check -Crate both` → 0 errors, and `umd`'s warning count **unchanged**
 - the knob inventory still byte-identical for **`umd`** (S2's instrument,
   `tools/capture-knob-inventory.ps1`) — a lane that perturbs the D3D11 driver has broken the split

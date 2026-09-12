@@ -329,7 +329,7 @@ const _: () = {
 /// a normal dependency of this no_std crate; it is a dev-dependency and this test
 /// is the single source of truth that catches any drift. Run with
 /// `cargo test -p helios_protocol` (host/Linux, std available).
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod virtio_bindings_pin {
     use virtio_bindings::virtio_gpu as vb;
 

@@ -101,7 +101,12 @@ pub(crate) unsafe fn maybe_log_present_readback(h: Hdevice, src_h: ddi::D3D10DDI
     let last_sample_end = (desc.Width.saturating_sub(1) as usize)
         .saturating_mul(bpp)
         .saturating_add(bpp.min(4));
-    if row_pitch == 0 || last_sample_end > row_pitch {
+    if row_pitch == 0
+        || last_sample_end > row_pitch
+        || row_pitch
+            .checked_mul(desc.Height as usize)
+            .is_none_or(|size| size > isize::MAX as usize)
+    {
         note_ddi_refusal(&DDI_REFUSALS.readback_stride_unsafe);
         log_error!(
             "DXGI Present readback: stride would leave the mapping, refusing \
@@ -208,9 +213,27 @@ pub(crate) unsafe fn write_bgra32_bmp(
 ) -> std::io::Result<()> {
     use std::io::Write;
 
-    let row_bytes = width as usize * 4;
-    let image_size = row_bytes * height as usize;
-    let file_size = 14usize + 40usize + image_size;
+    let invalid_size = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "BMP dimensions exceed process address space",
+        )
+    };
+    let row_bytes = (width as usize).checked_mul(4).ok_or_else(invalid_size)?;
+    let image_size = row_bytes
+        .checked_mul(height as usize)
+        .ok_or_else(invalid_size)?;
+    let file_size = image_size.checked_add(54).ok_or_else(invalid_size)?;
+    if file_size > u32::MAX as usize
+        || width > i32::MAX as u32
+        || height > i32::MAX as u32
+        || row_bytes > row_pitch
+        || row_pitch
+            .checked_mul(height as usize)
+            .is_none_or(|size| size > isize::MAX as usize)
+    {
+        return Err(invalid_size());
+    }
 
     let mut file = std::fs::File::create(path)?;
     file.write_all(b"BM")?;
@@ -328,6 +351,18 @@ pub(crate) unsafe fn maybe_force_present_alpha_opaque(h: Hdevice, src_h: ddi::D3
     }
 
     let row_pitch = mapped.RowPitch as usize;
+    if (desc.Width as usize)
+        .checked_mul(4)
+        .is_none_or(|width| width > row_pitch)
+        || row_pitch
+            .checked_mul(desc.Height as usize)
+            .is_none_or(|size| size > isize::MAX as usize)
+    {
+        note_ddi_refusal(&DDI_REFUSALS.readback_stride_unsafe);
+        log_error!("DXGI Present force-opaque: mapped extent exceeds process address space");
+        context.Unmap(&staging_res, 0);
+        return;
+    }
     let data = mapped.pData as *mut u8;
     let mut alpha_zero = 0u64;
     let mut alpha_non_opaque = 0u64;
@@ -1228,7 +1263,7 @@ pub(crate) unsafe fn finish_present(
 
 /// DXGI `pfnPresent`: copy the source resource to the destination resource when
 /// DXGI provides both handles, then flush submitted GPU work.
-pub(crate) unsafe extern "C" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
+pub(crate) unsafe extern "system" fn dxgi_present(arg: *mut ddi::DXGI_DDI_ARG_PRESENT) -> i32 {
     probe_entry_attempt(PresentBoundaryEntry::Present);
     dxgi_present_impl(arg, PresentBoundaryEntry::Present)
 }
@@ -1612,7 +1647,7 @@ pub(crate) fn dev_context_for_log(h: ddi::D3D10DDI_HDEVICE) -> *mut core::ffi::c
     }
 }
 
-pub(crate) unsafe extern "C" fn dxgi_get_gamma_caps(
+pub(crate) unsafe extern "system" fn dxgi_get_gamma_caps(
     arg: *mut ddi::DXGI_DDI_ARG_GET_GAMMA_CONTROL_CAPS,
 ) -> i32 {
     if arg.is_null() {
@@ -1631,7 +1666,7 @@ pub(crate) unsafe extern "C" fn dxgi_get_gamma_caps(
     0
 }
 
-pub(crate) unsafe extern "C" fn dxgi_set_display_mode(
+pub(crate) unsafe extern "system" fn dxgi_set_display_mode(
     arg: *mut ddi::DXGI_DDI_ARG_SETDISPLAYMODE,
 ) -> i32 {
     if arg.is_null() {
@@ -1686,13 +1721,13 @@ pub(crate) unsafe extern "C" fn dxgi_set_display_mode(
     hr
 }
 
-pub(crate) unsafe extern "C" fn dxgi_set_resource_priority(
+pub(crate) unsafe extern "system" fn dxgi_set_resource_priority(
     _arg: *mut ddi::DXGI_DDI_ARG_SETRESOURCEPRIORITY,
 ) -> i32 {
     0
 }
 
-pub(crate) unsafe extern "C" fn dxgi_query_resource_residency(
+pub(crate) unsafe extern "system" fn dxgi_query_resource_residency(
     arg: *mut ddi::DXGI_DDI_ARG_QUERYRESOURCERESIDENCY,
 ) -> i32 {
     if arg.is_null() {
@@ -1812,7 +1847,7 @@ pub(crate) unsafe fn rotate_ring(
     RotationOutcome::Rotated
 }
 
-pub(crate) unsafe extern "C" fn dxgi_rotate_resource_identities(
+pub(crate) unsafe extern "system" fn dxgi_rotate_resource_identities(
     arg: *mut ddi::DXGI_DDI_ARG_ROTATE_RESOURCE_IDENTITIES,
 ) -> i32 {
     if arg.is_null() {
@@ -1920,7 +1955,7 @@ fn dxgi_blt_needs_conversion(src_format: u32, dst_format: u32) -> Option<bool> {
     (src_format != 0 && dst_format != 0).then_some(src_format != dst_format)
 }
 
-pub(crate) unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32 {
+pub(crate) unsafe extern "system" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32 {
     if arg.is_null() {
         return 0;
     }
@@ -2032,7 +2067,7 @@ pub(crate) unsafe extern "C" fn dxgi_blt(arg: *mut ddi::DXGI_DDI_ARG_BLT) -> i32
     0
 }
 
-pub(crate) unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i32 {
+pub(crate) unsafe extern "system" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i32 {
     if arg.is_null() {
         return 0;
     }
@@ -2165,7 +2200,7 @@ pub(crate) unsafe extern "C" fn dxgi_blt1(arg: *mut ddi::DXGI_DDI_ARG_BLT1) -> i
     0
 }
 
-pub(crate) unsafe extern "C" fn dxgi_offer_resources(
+pub(crate) unsafe extern "system" fn dxgi_offer_resources(
     arg: *mut ddi::DXGI_DDI_ARG_OFFERRESOURCES,
 ) -> i32 {
     if arg.is_null() {
@@ -2182,7 +2217,7 @@ pub(crate) unsafe extern "C" fn dxgi_offer_resources(
     0
 }
 
-pub(crate) unsafe extern "C" fn dxgi_reclaim_resources(
+pub(crate) unsafe extern "system" fn dxgi_reclaim_resources(
     arg: *mut ddi::DXGI_DDI_ARG_RECLAIMRESOURCES,
 ) -> i32 {
     if arg.is_null() {
@@ -2252,7 +2287,7 @@ pub(crate) const HELIOS_MPO_GROUPS: u32 = 1;
 /// there is no filter path behind it.
 pub(crate) const HELIOS_MPO_OVERLAY_CAPS: u32 = RGB | BILINEAR | SHARED | IMMEDIATE;
 
-pub(crate) unsafe extern "C" fn dxgi_get_mpo_caps(
+pub(crate) unsafe extern "system" fn dxgi_get_mpo_caps(
     arg: *mut ddi::DXGI_DDI_ARG_GETMULTIPLANEOVERLAYCAPS,
 ) -> i32 {
     if arg.is_null() {
@@ -2272,7 +2307,7 @@ pub(crate) unsafe extern "C" fn dxgi_get_mpo_caps(
     0
 }
 
-pub(crate) unsafe extern "C" fn dxgi_get_mpo_group_caps(
+pub(crate) unsafe extern "system" fn dxgi_get_mpo_group_caps(
     arg: *mut ddi::DXGI_DDI_ARG_GETMULTIPLANEOVERLAYGROUPCAPS,
 ) -> i32 {
     if arg.is_null() {
@@ -2301,7 +2336,7 @@ pub(crate) unsafe extern "C" fn dxgi_get_mpo_group_caps(
     0
 }
 
-pub(crate) unsafe extern "C" fn dxgi_present_mpo(
+pub(crate) unsafe extern "system" fn dxgi_present_mpo(
     arg: *mut ddi::DXGI_DDI_ARG_PRESENTMULTIPLANEOVERLAY,
 ) -> i32 {
     probe_entry_attempt(PresentBoundaryEntry::Mpo);
@@ -2451,14 +2486,14 @@ pub(crate) unsafe extern "C" fn dxgi_present_mpo(
     hr
 }
 
-pub(crate) unsafe extern "C" fn dxgi_reserved_unsupported(_arg: *mut c_void) -> i32 {
+pub(crate) unsafe extern "system" fn dxgi_reserved_unsupported(_arg: *mut c_void) -> i32 {
     if DXGI13_RESERVED_LOG_COUNT.first_n(16).is_some() {
         log_error!("DXGI reserved callback -> DXGI_ERROR_UNSUPPORTED");
     }
     DXGI_ERROR_UNSUPPORTED
 }
 
-pub(crate) unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 {
+pub(crate) unsafe extern "system" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESENT1) -> i32 {
     if arg.is_null() {
         probe_early_refusal(
             PresentBoundaryEntry::Present1Multi,
@@ -2594,7 +2629,7 @@ pub(crate) unsafe extern "C" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_PRESEN
     present_hr
 }
 
-pub(crate) unsafe extern "C" fn dxgi_check_present_duration_support(
+pub(crate) unsafe extern "system" fn dxgi_check_present_duration_support(
     arg: *mut ddi::DXGI_DDI_ARG_CHECKPRESENTDURATIONSUPPORT,
 ) -> i32 {
     if arg.is_null() {

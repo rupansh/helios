@@ -69,7 +69,7 @@ trap {
 
 Assert-HeliosAdministrator
 if (-not [Environment]::Is64BitProcess) {
-    throw "Run the installer with 64-bit Windows PowerShell. This package contains x64 drivers only."
+    throw "Run the installer with native 64-bit Windows PowerShell to manage both registry views and system directories."
 }
 
 $bundleRoot = $PSScriptRoot
@@ -117,6 +117,16 @@ $certificatePath = Join-Path $bundleRoot ([string]$manifest.signing.certificate)
 $instanceId = Get-HeliosDeviceInstanceId
 $replacedViogpudo = $false
 $activeInfBeforeInstall = Get-HeliosActiveInf $instanceId
+# Snapshot before any PnP change: an older native-only INF cannot delete a
+# UserModeDriverNameWoW value that a newer package introduces into its key.
+$previousDirect3D = [ordered]@{ activeInf = $activeInfBeforeInstall; infSha256 = ""; values = [ordered]@{} }
+if ($activeInfBeforeInstall) {
+    $previousDirect3D.infSha256 = Get-HeliosSha256 (Join-Path $env:windir "INF\$activeInfBeforeInstall")
+    $previousClassKey = Get-HeliosDisplayClassKey $instanceId
+    foreach ($name in @("UserModeDriverName", "UserModeDriverNameWoW", "InstalledDisplayDrivers")) {
+        $previousDirect3D.values[$name] = Get-HeliosRegistrySnapshot $previousClassKey $name
+    }
+}
 if ($activeInfBeforeInstall -and (Test-HeliosViogpudoDriver $activeInfBeforeInstall)) {
     if (-not $Automatic) {
         Write-Warning "The virtio-gpu device is currently using viogpudo ($activeInfBeforeInstall)."
@@ -190,6 +200,7 @@ $state = [ordered]@{
     instanceId = $instanceId
     classKey = $classKey
     activeInf = ""
+    activeInfSha256 = ""
     signingCertificateThumbprint = ""
     vulkanManifest = $vulkanManifestPath
     vulkanManifestX86 = $vulkanManifestX86Path
@@ -201,8 +212,11 @@ $state = [ordered]@{
     systemVulkanLoaderX86Hash = ""
     systemOpenClLoaderHash = ""
     previousOpenGL = $previousOpenGL
+    previousDirect3D = $previousDirect3D
+    installedDirect3D = [ordered]@{}
     replacedViogpudo = $replacedViogpudo
     runtimeFiles = @()
+    driverFiles = @()
 }
 
 New-Item -ItemType Directory -Force -Path $runtimeRoot,$stateRoot | Out-Null
@@ -216,6 +230,15 @@ if (Test-Path -LiteralPath (Join-Path $payloadRoot "smoke")) {
 
 foreach ($file in Get-ChildItem -LiteralPath $runtimeRoot -File -Recurse) {
     $state.runtimeFiles += [ordered]@{ path = $file.FullName; sha256 = Get-HeliosSha256 $file.FullName }
+}
+# PnP owns all four UMD copies and registrations as one catalogued package.
+# Retain the source hashes so verification can reject stale DriverStore images,
+# including accidentally renamed AMD64 binaries in the WoW64 slots.
+foreach ($name in @("helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll", "helios_umd32.dll", "helios_umd12_32.dll")) {
+    $state.driverFiles += [ordered]@{
+        name = $name
+        sha256 = Get-HeliosSha256 (Join-Path $payloadRoot "driver\$name")
+    }
 }
 Write-HeliosJson $state $statePath
 
@@ -266,28 +289,31 @@ foreach ($store in @("Root", "TrustedPublisher")) {
 }
 Write-HeliosJson $state $statePath
 
-Write-Host "Installing/updating the Microsoft Visual C++ x64 runtime..."
-$redistPath = Join-Path $payloadRoot "prerequisites\vc_redist.x64.exe"
-$requiredRuntimeVersion = [version](Get-Item -LiteralPath $redistPath).VersionInfo.FileVersion
-$installedRuntimeVersion = [version]"0.0"
-# Microsoft recommends checking the runtime registry before running an older
-# redistributable, which otherwise fails with ERROR_PRODUCT_VERSION (1638).
-foreach ($runtimeKey in @(
-    "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64",
-    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
-)) {
-    $runtime = Get-Item -LiteralPath $runtimeKey -ErrorAction SilentlyContinue
-    $version = [version]"0.0"
-    if ($runtime -and $runtime.GetValue("Installed", 0) -eq 1 -and
-        [version]::TryParse(([string]$runtime.GetValue("Version", "")).TrimStart("v", "V"), [ref]$version) -and
-        $version -gt $installedRuntimeVersion) {
-        $installedRuntimeVersion = $version
+# Both D3D12 UMDs retain the dynamic CRT. Installing x64 does not satisfy
+# an x86 process, so independently preserve-or-update each architecture.
+foreach ($architecture in @("x64", "x86")) {
+    Write-Host "Installing/updating the Microsoft Visual C++ $architecture runtime..."
+    $redistPath = Join-Path $payloadRoot "prerequisites\vc_redist.$architecture.exe"
+    $requiredRuntimeVersion = [version](Get-Item -LiteralPath $redistPath).VersionInfo.FileVersion
+    $installedRuntimeVersion = [version]"0.0"
+    # Avoid ERROR_PRODUCT_VERSION (1638) when a newer runtime is installed.
+    foreach ($runtimeKey in @(
+        "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\$architecture",
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\$architecture"
+    )) {
+        $runtime = Get-Item -LiteralPath $runtimeKey -ErrorAction SilentlyContinue
+        $version = [version]"0.0"
+        if ($runtime -and $runtime.GetValue("Installed", 0) -eq 1 -and
+            [version]::TryParse(([string]$runtime.GetValue("Version", "")).TrimStart("v", "V"), [ref]$version) -and
+            $version -gt $installedRuntimeVersion) {
+            $installedRuntimeVersion = $version
+        }
     }
-}
-if ($installedRuntimeVersion -ge $requiredRuntimeVersion) {
-    Write-Host "Keeping installed Visual C++ x64 runtime $installedRuntimeVersion (bundle: $requiredRuntimeVersion)."
-} else {
-    Invoke-HeliosNative $redistPath @("/install", "/quiet", "/norestart") -SuccessExitCodes @(0, 3010) -WaitForProcess
+    if ($installedRuntimeVersion -ge $requiredRuntimeVersion) {
+        Write-Host "Keeping installed Visual C++ $architecture runtime $installedRuntimeVersion (bundle: $requiredRuntimeVersion)."
+    } else {
+        Invoke-HeliosNative $redistPath @("/install", "/quiet", "/norestart") -SuccessExitCodes @(0, 3010) -WaitForProcess
+    }
 }
 
 $systemVulkanLoader = Join-Path $env:windir "System32\vulkan-1.dll"
@@ -335,6 +361,10 @@ $state.previousOpenGL = [ordered]@{
     OpenGLFlagsWow = Get-HeliosRegistrySnapshot $classKey "OpenGLFlagsWow"
 }
 $state.activeInf = $activeInf
+$state.activeInfSha256 = Get-HeliosSha256 $activeInfPath
+foreach ($name in @("UserModeDriverName", "UserModeDriverNameWoW", "InstalledDisplayDrivers")) {
+    $state.installedDirect3D[$name] = Get-HeliosRegistrySnapshot $classKey $name
+}
 Write-HeliosJson $state $statePath
 
 $vulkanDll = Join-Path $runtimeRoot "mesa\vulkan_virtio.dll"
@@ -379,7 +409,7 @@ Copy-Item -LiteralPath (Join-Path $bundleRoot "Verify-Helios.ps1") -Destination 
 Write-HeliosJson $state $statePath
 
 Write-Host ""
-Write-Host "Helios $($manifest.version) is installed system-wide with x64 and WoW64 OpenGL/Vulkan support."
+Write-Host "Helios $($manifest.version) is installed system-wide with x64 and WoW64 Direct3D 11/12, OpenGL, and Vulkan support."
 if ($RunSmokeTests) {
     & (Join-Path $stateRoot "Verify-Helios.ps1") -RunSmokeTests
 } else {

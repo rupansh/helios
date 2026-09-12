@@ -29,32 +29,16 @@ load_script = '''
 wdk_build::cargo_make::load_rust_driver_makefile()?
 '''
 
-# Builds BOTH user-mode drivers and stages them into the driver package.
+# Build D3D11 and D3D12 for AMD64 and WoW64, and stage all four images before
+# catalog generation. The kernel remains AMD64. The x86 DLLs have distinct
+# package names but cargo still produces helios_umd{12}.dll in the i686 target.
 #
-# helios_umd.dll   — D3D9/10/11, DXVK-backed. UserModeDriverName slots 0-2.
-# helios_umd12.dll — D3D12, vkd3d-backed.     UserModeDriverName slot 3.
-#
-# ⛔ helios_umd12.dll is staged here because stage S5 put it in the INF's
-# [SourceDisksFiles] and [Helios_CopyFiles]. An INF that names a file the
-# package does not contain fails the install — loudly, but after the build — so
-# the two edits are one change and belong in one commit.
-#
-# PREREQUISITE: this task cannot succeed without a prior `win_dxvk` build AND a
-# prior `win_vkd3d` build. umd/build.rs links libhelios_d3d11_static.a /
-# libdxvk.a / ... out of C:\Users\Rupansh\dxvk-build; umd12/build.rs links
-# libhelios_d3d12_static.a out of C:\Users\Rupansh\vkd3d-build. A missing or
-# stale engine build fails here, in the inner cargo build, not in kmd_render.
-#
-# NOTE: whatever this task stages for helios_umd.dll is overwritten by
-# install-helios-kmd.ps1's Sync-HeliosPackageUmd ($UmdDll, release by default)
-# before the catalog is created and signed. This task decides what a bare
-# `cargo make` packages; the install script decides what actually reaches the
-# DriverStore. Keep the two profiles in agreement or the package hash moves
-# between build and install.
-#
-# The installer requires explicit paths for BOTH UMDs and synchronizes both
-# before catalog generation. Each inner build sets its own local target dir
-# so an inherited KMD CARGO_TARGET_DIR cannot redirect its fresh artifact.
+# Engine prerequisites: HELIOS_DXVK_BUILD / HELIOS_VKD3D_BUILD are the native
+# engine paths (or build.rs defaults); HELIOS_DXVK_BUILD_X86 and
+# HELIOS_VKD3D_BUILD_X86 MUST name prior clang-cl x86 builds. No architecture
+# fallback is safe. ci/windows/Build-Driver.ps1 builds and passes all four paths.
+# Every Rust invocation uses a crate-local target directory on local Windows
+# disk, and the profile is shared by build, source, and package paths.
 [tasks.copy-umd-to-package]
 private = true
 dependencies = ["copy-driver-binary-to-package", "copy-inf-to-package"]
@@ -82,48 +66,51 @@ let package = kmd_dir
     .join("helios_kmd_render_package");
 std::fs::create_dir_all(&package).unwrap();
 
-// (crate directory, produced DLL, the engine build whose absence is the usual
-// cause of a failure in the inner build). Both entries are required: the INF's
-// [SourceDisksFiles] / [Helios_CopyFiles] name both files as of S5, so a package
-// missing either one fails the install.
 let umds = [
-    ("umd",   "helios_umd.dll",   "DXVK build in C:\\Users\\Rupansh\\dxvk-build (run win_dxvk first)"),
-    ("umd12", "helios_umd12.dll", "vkd3d build in C:\\Users\\Rupansh\\vkd3d-build (run win_vkd3d first)"),
+    ("umd", "helios_umd.dll", "helios_umd32.dll", "HELIOS_DXVK_BUILD"),
+    ("umd12", "helios_umd12.dll", "helios_umd12_32.dll", "HELIOS_VKD3D_BUILD"),
 ];
 
-for (crate_name, dll_name, engine_hint) in umds {
-    let crate_dir = repo.join(crate_name);
-
-    let mut build = Command::new("cargo");
-    build.arg("build").current_dir(&crate_dir)
-        .env("CARGO_TARGET_DIR", crate_dir.join("target"));
-    match cargo_profile.as_str() {
-        "dev" => {}
-        "release" => { build.arg("--release"); }
-        other => { build.arg("--profile").arg(other); }
-    }
-    let status = build
-        .status()
-        .unwrap_or_else(|e| panic!("launch cargo build for {crate_name}: {e}"));
-    assert!(
-        status.success(),
-        "{crate_name} build failed (profile {cargo_profile}); a missing or stale {engine_hint} \
-         is the usual cause"
-    );
-
-    let source = crate_dir.join("target").join(profile_dir).join(dll_name);
-    // The explicit per-crate CARGO_TARGET_DIR above makes this the output of
-    // the successful build, including when the outer build sets its own target.
-    assert!(
-        source.exists(),
-        "{dll_name} not found at {} after a successful build (profile {cargo_profile})",
-        source.display()
-    );
-    let destination = package.join(dll_name);
-    std::fs::copy(&source, &destination).unwrap_or_else(|e| {
-        panic!("copy {} -> {}: {e}", source.display(), destination.display())
+// Validate prerequisites before mutating any package UMD. Never package an old
+// x86 artifact just because a new engine directory was not supplied.
+for (_, _, _, engine_var) in umds {
+    let x86_var = format!("{engine_var}_X86");
+    let engine = std::env::var(&x86_var).unwrap_or_else(|_| {
+        panic!("{x86_var} must name the matching clang-cl x86 engine build")
     });
+    assert!(PathBuf::from(&engine).is_dir(), "{x86_var} is not a directory: {engine}");
 }
+
+for (crate_name, native_name, x86_name, _) in umds {
+    let crate_dir = repo.join(crate_name);
+    for is_x86 in [false, true] {
+        let dll_name = if is_x86 { x86_name } else { native_name };
+        // A fresh PowerShell child imports the matching VS environment. Inherit
+        // neither x64 LIB paths for x86 linking nor x86 LIB paths for the KMD.
+        let mut build = Command::new("pwsh");
+        build.args(["-NoProfile", "-File"])
+            .arg(repo.join("ci/windows/Build-Umd.ps1"))
+            .arg("-RepoRoot").arg(&repo)
+            .arg("-Crate").arg(crate_name)
+            .arg("-Architecture").arg(if is_x86 { "x86" } else { "x64" })
+            .arg("-Profile").arg(&cargo_profile)
+            .current_dir(&crate_dir);
+        let mut source_dir = crate_dir.join("target");
+        if is_x86 {
+            source_dir = source_dir.join("i686-pc-windows-msvc");
+        }
+        let status = build.status()
+            .unwrap_or_else(|e| panic!("launch cargo build for {dll_name}: {e}"));
+        assert!(status.success(), "{dll_name} build failed (profile {cargo_profile})");
+        let source = source_dir.join(profile_dir).join(native_name);
+        assert!(source.exists(), "{dll_name} missing after successful build: {}", source.display());
+        let destination = package.join(dll_name);
+        std::fs::copy(&source, &destination).unwrap_or_else(|e| {
+            panic!("copy {} -> {}: {e}", source.display(), destination.display())
+        });
+    }
+}
+
 '''
 
 # Rust/link.exe toolchain revisions have emitted the /MAP output in both

@@ -22,6 +22,8 @@ Helios_CopyFiles = 13  ; driver store (DIRID 13) — required for a universal IN
 helios_kmd_render.sys = 1,,
 helios_umd.dll = 1,,
 helios_umd12.dll = 1,,
+helios_umd32.dll = 1,,
+helios_umd12_32.dll = 1,,
 
 ; ──── Manufacturer / Models ────────────────────────────────────────────────
 
@@ -45,6 +47,8 @@ AddReg = Helios_DeviceSettings
 helios_kmd_render.sys
 helios_umd.dll
 helios_umd12.dll
+helios_umd32.dll
+helios_umd12_32.dll
 
 [Helios_Install.Services]
 AddService = helios_kmd_render, 0x00000002, Helios_ServiceInstall, Helios_EventLog
@@ -76,7 +80,7 @@ HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, %R
 HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, %REG_DWORD%, 1
 
 ; ──── Software key / UMD registration ──────────────────────────────────────
-; TWO user-mode drivers, since stage S5 (docs/dx12/ARCHITECTURE.md 9.1
+; TWO user-mode APIs, each built for AMD64 and x86, since stage S5 (docs/dx12/ARCHITECTURE.md 9.1
 ; "Variant B", DECISIONS.md D3):
 ;
 ;   helios_umd.dll    - D3D9/D3D10/D3D11, the DXVK-backed driver DWM composites
@@ -94,14 +98,14 @@ HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLim
 ; InstalledDisplayDrivers is NOT index-parallel to UserModeDriverName. It is a
 ; flat list of the DISTINCT package binaries with the extension stripped - its
 ; stated purpose is that WHQL test programs use it to check the driver binaries
-; are unchanged across a run - so TWO entries here is correct against FOUR
-; above (DECISIONS.md 6.1; tools/hotplug-helios-umd.ps1 writes the same shape
-; and its verifier asserts exactly it). The historical four-copies-of-one-name
-; value was harmless but semantically wrong.
+; are unchanged across a run. List all FOUR distinct package binaries, without
+; extensions; the WoW64 registration below has the same four API slots and
+; points to separate x86 binaries in the DriverStore. The kernel remains AMD64.
 
 [Helios_DeviceSettings]
 HKR,, UserModeDriverName,       %REG_MULTI_SZ%, %13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd.dll,%13%\helios_umd12.dll
-HKR,, InstalledDisplayDrivers,  %REG_MULTI_SZ%, helios_umd,helios_umd12
+HKR,, UserModeDriverNameWoW,    %REG_MULTI_SZ%, %13%\helios_umd32.dll,%13%\helios_umd32.dll,%13%\helios_umd32.dll,%13%\helios_umd12_32.dll
+HKR,, InstalledDisplayDrivers,  %REG_MULTI_SZ%, helios_umd,helios_umd12,helios_umd32,helios_umd12_32
 
 ; ⛔⛔ HardwareInformation.AdapterString is LOAD-BEARING FOR THE VULKAN ICD, and
 ; its absence here cost a full bring-up on 2026-09-05.

@@ -1022,7 +1022,7 @@ fn engine_list_type(
 /// # Safety
 /// `arg`, when non-null, must point at a live
 /// `D3D12DDIARG_CREATECOMMANDQUEUE_0050` for the duration of the call.
-unsafe extern "C" fn calc_private_command_queue_size(
+unsafe extern "system" fn calc_private_command_queue_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATECOMMANDQUEUE_0050,
 ) -> ddi12::SIZE_T {
@@ -1043,7 +1043,7 @@ unsafe extern "C" fn calc_private_command_queue_size(
 /// `pDrvPrivate` must address the private block
 /// [`calc_private_command_queue_size`] sized; `h_rt_queue` must be the runtime's
 /// handle for this queue.
-unsafe extern "C" fn create_command_queue(
+unsafe extern "system" fn create_command_queue(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATECOMMANDQUEUE_0050,
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
@@ -1316,7 +1316,7 @@ unsafe fn create_wddm_context(
 /// # Safety
 /// `h_queue` must be a handle [`create_command_queue`] returned `S_OK` for and
 /// which has not already been destroyed.
-unsafe extern "C" fn destroy_command_queue(
+unsafe extern "system" fn destroy_command_queue(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
 ) {
@@ -1399,7 +1399,7 @@ unsafe fn destroy_wddm_context(state: &QueueState) -> ddi12::HRESULT {
 /// # Safety
 /// `arg`, when non-null, must point at a live
 /// `D3D12DDIARG_CREATE_COMMAND_POOL_0040` for the duration of the call.
-unsafe extern "C" fn calc_private_command_pool_size(
+unsafe extern "system" fn calc_private_command_pool_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_POOL_0040,
 ) -> ddi12::SIZE_T {
@@ -1420,7 +1420,7 @@ unsafe extern "C" fn calc_private_command_pool_size(
 /// # Safety
 /// `h_pool`'s `pDrvPrivate` must address the private block
 /// [`calc_private_command_pool_size`] sized.
-unsafe extern "C" fn create_command_pool(
+unsafe extern "system" fn create_command_pool(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_POOL_0040,
     h_pool: ddi12::D3D12DDI_HCOMMANDPOOL_0040,
@@ -1459,7 +1459,7 @@ unsafe extern "C" fn create_command_pool(
 ///
 /// # Safety
 /// `h_pool` must be a handle [`create_command_pool`] returned `S_OK` for.
-unsafe extern "C" fn reset_command_pool(
+unsafe extern "system" fn reset_command_pool(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_pool: ddi12::D3D12DDI_HCOMMANDPOOL_0040,
 ) {
@@ -1495,7 +1495,7 @@ unsafe extern "C" fn reset_command_pool(
 /// # Safety
 /// `h_pool` must be a handle [`create_command_pool`] returned `S_OK` for and
 /// which has not already been destroyed.
-unsafe extern "C" fn destroy_command_pool(
+unsafe extern "system" fn destroy_command_pool(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_pool: ddi12::D3D12DDI_HCOMMANDPOOL_0040,
 ) {
@@ -1523,7 +1523,7 @@ unsafe extern "C" fn destroy_command_pool(
 /// # Safety
 /// `arg`, when non-null, must point at a live
 /// `D3D12DDIARG_CREATE_COMMAND_RECORDER_0040` for the duration of the call.
-unsafe extern "C" fn calc_private_command_recorder_size(
+unsafe extern "system" fn calc_private_command_recorder_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_RECORDER_0040,
 ) -> ddi12::SIZE_T {
@@ -1539,7 +1539,7 @@ unsafe extern "C" fn calc_private_command_recorder_size(
 /// # Safety
 /// `h_recorder`'s `pDrvPrivate` must address the private block
 /// [`calc_private_command_recorder_size`] sized.
-unsafe extern "C" fn create_command_recorder(
+unsafe extern "system" fn create_command_recorder(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_RECORDER_0040,
     h_recorder: ddi12::D3D12DDI_HCOMMANDRECORDER_0040,
@@ -1598,7 +1598,7 @@ unsafe extern "C" fn create_command_recorder(
 /// # Safety
 /// `h_device` must be a live device handle, `h_recorder` a live recorder handle
 /// and `h_pool` a live pool handle.
-unsafe extern "C" fn command_recorder_set_command_pool_as_target(
+unsafe extern "system" fn command_recorder_set_command_pool_as_target(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_recorder: ddi12::D3D12DDI_HCOMMANDRECORDER_0040,
     h_pool: ddi12::D3D12DDI_HCOMMANDPOOL_0040,
@@ -1793,7 +1793,7 @@ pub(crate) unsafe fn recorder_allocator(
 /// # Safety
 /// `h_recorder` must be a handle [`create_command_recorder`] returned `S_OK` for
 /// and which has not already been destroyed.
-unsafe extern "C" fn destroy_command_recorder(
+unsafe extern "system" fn destroy_command_recorder(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_recorder: ddi12::D3D12DDI_HCOMMANDRECORDER_0040,
 ) {
@@ -1828,7 +1828,7 @@ unsafe extern "C" fn destroy_command_recorder(
 /// # Safety
 /// `arg`, when non-null, must point at a live
 /// `D3D12DDIARG_CREATE_COMMAND_LIST_0040` for the duration of the call.
-unsafe extern "C" fn calc_private_command_list_size(
+unsafe extern "system" fn calc_private_command_list_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_LIST_0040,
 ) -> ddi12::SIZE_T {
@@ -1875,7 +1875,7 @@ unsafe extern "C" fn calc_private_command_list_size(
 /// `D3D12DDIARG_CREATE_COMMAND_LIST_0040`; `h_list`'s `pDrvPrivate` must address
 /// the private block [`calc_private_command_list_size`] sized; `h_rt_list` must
 /// be the runtime's handle for this list.
-unsafe extern "C" fn create_command_list(
+unsafe extern "system" fn create_command_list(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_LIST_0040,
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
@@ -2067,7 +2067,7 @@ unsafe fn set_command_list_ddi_table(
 /// # Safety
 /// `h_list` must be a handle [`create_command_list`] returned `S_OK` for and
 /// which has not already been destroyed.
-unsafe extern "C" fn destroy_command_list(
+unsafe extern "system" fn destroy_command_list(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_list: ddi12::D3D12DDI_HCOMMANDLIST,
 ) {
@@ -2177,7 +2177,7 @@ const MAX_INDIRECT_ARGUMENT_DESCS: usize = 256;
 /// # Safety
 /// `arg`, when non-null, must point at a live
 /// `D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001` for the duration of the call.
-unsafe extern "C" fn calc_private_command_signature_size(
+unsafe extern "system" fn calc_private_command_signature_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001,
 ) -> ddi12::SIZE_T {
@@ -2304,7 +2304,7 @@ pub(crate) unsafe fn engine_command_signature(
 /// addresses `NumArgumentDescs` readable `D3D12DDI_INDIRECT_ARGUMENT_DESC`s for the
 /// call; `h_signature`'s `pDrvPrivate` must address the private block
 /// [`calc_private_command_signature_size`] sized.
-unsafe extern "C" fn create_command_signature(
+unsafe extern "system" fn create_command_signature(
     h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_COMMAND_SIGNATURE_0001,
     h_signature: ddi12::D3D12DDI_HCOMMANDSIGNATURE,
@@ -2518,7 +2518,7 @@ unsafe extern "C" fn create_command_signature(
 /// # Safety
 /// `h_signature` must be a handle the runtime associated with a
 /// `pfnCreateCommandSignature` call on this device.
-unsafe extern "C" fn destroy_command_signature(
+unsafe extern "system" fn destroy_command_signature(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     h_signature: ddi12::D3D12DDI_HCOMMANDSIGNATURE,
 ) {
@@ -2952,7 +2952,7 @@ fn report_ecl_submit_error(queue: &QueueState, hr: ddi12::HRESULT) {
 /// # Safety
 /// `h_queue` must be a live queue handle; `lists` must address `count` readable
 /// `D3D12DDI_HCOMMANDLIST`s, each a live handle from [`create_command_list`].
-unsafe extern "C" fn execute_command_lists(
+unsafe extern "system" fn execute_command_lists(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     count: ddi12::UINT,
     lists: *const ddi12::D3D12DDI_HCOMMANDLIST,
@@ -3158,26 +3158,20 @@ unsafe extern "C" fn execute_command_lists(
 /// that never had a function, as against `cl[69]`'s **RETIRED** and
 /// `core[121]`'s **OPTIONAL FEATURE**.
 ///
-/// **What a driver legitimately puts here**, and why this shape: the field is a
-/// bare `void*`, so the header states no signature at all and none can be
-/// written. A nullary `unsafe extern "C" fn` is nevertheless safe to *enter*
-/// under the Microsoft x64 ABI whatever the caller believed it was calling — the
-/// caller owns the stack and the shadow space, arguments live in volatile
-/// registers this body never reads, and there is nothing to clean up on return.
-/// So the worst case if the header ever lies is a caller reading an
-/// uninitialised `RAX`, against a guaranteed access violation for the NULL. The
-/// counter is what makes that case visible instead of silent, and it is a real
-/// instrument rather than a decoration: it moves the first time this slot is
-/// ever called by anything.
-unsafe extern "C" fn queue_unused_slot() {
+/// The WDK declares a reserved `void*`, so no callable signature exists.
+/// Count and terminate if it is ever invoked: returning would invent a stack
+/// cleanup convention, which corrupts the caller on x86.
+unsafe extern "system" fn queue_unused_slot() -> ! {
     note_refusal(&L2_REFUSALS.queue_unused_slot_called);
+    std::process::abort();
 }
 
 /// `pfnUnused2` — queue-table slot 2. Separate function, separate counter, for
 /// the one reason that matters: a shared body could not say *which* of the two
 /// the runtime called, and that is the entire content of the observation.
-unsafe extern "C" fn queue_unused2_slot() {
+unsafe extern "system" fn queue_unused2_slot() -> ! {
     note_refusal(&L2_REFUSALS.queue_unused2_slot_called);
+    std::process::abort();
 }
 
 /// `pfnUpdateTileMappings` — **REFUSED**, `TileMappingsRefused`.
@@ -3200,7 +3194,7 @@ unsafe extern "C" fn queue_unused2_slot() {
 ///
 /// # Safety
 /// The arguments are the runtime's and this body reads none of them.
-unsafe extern "C" fn update_tile_mappings(
+unsafe extern "system" fn update_tile_mappings(
     _h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     _h_resource: ddi12::D3D12DDI_HRESOURCE,
     _num_regions: ddi12::UINT,
@@ -3221,7 +3215,7 @@ unsafe extern "C" fn update_tile_mappings(
 ///
 /// # Safety
 /// The arguments are the runtime's and this body reads none of them.
-unsafe extern "C" fn copy_tile_mappings(
+unsafe extern "system" fn copy_tile_mappings(
     _h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     _h_dst_resource: ddi12::D3D12DDI_HRESOURCE,
     _dst_start_coord: *const ddi12::D3D12DDI_TILED_RESOURCE_COORDINATE,
@@ -3301,7 +3295,7 @@ unsafe fn fence_operation(
 ///
 /// # Safety
 /// As [`fence_operation`].
-unsafe extern "C" fn signal_fence(
+unsafe extern "system" fn signal_fence(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     op_arg: *mut ddi12::D3D12DDIARG_FENCE_OPERATION,
 ) {
@@ -3352,7 +3346,7 @@ unsafe extern "C" fn signal_fence(
 ///
 /// # Safety
 /// As [`fence_operation`].
-unsafe extern "C" fn wait_for_fence(
+unsafe extern "system" fn wait_for_fence(
     h_queue: ddi12::D3D12DDI_HCOMMANDQUEUE,
     op_arg: *mut ddi12::D3D12DDIARG_FENCE_OPERATION,
 ) {
