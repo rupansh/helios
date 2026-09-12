@@ -27,8 +27,8 @@
 //! `DeviceOwner` from (kmd_render ddi/escape.rs). Flags stay all-zero:
 //! `HardwareAccess = 0` is the 26th-session owner directive (a HardwareAccess
 //! escape serializes on the dxgkrnl adapter CORE resource), and these verbs
-//! are PASSIVE + non-blocking by contract. `hContext` stays null — both verbs
-//! are device-scoped.
+//! are PASSIVE. Ledger/event operations are device-scoped; snapshot release
+//! queries also pass the presenting context to inspect its pending descriptor.
 //!
 //! Concurrency model: one process-global registry (`Mutex<Vec<DeviceEntry>>`).
 //! Every ledger read — the DXVK exports below — happens UNDER that mutex and
@@ -45,6 +45,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use helios_protocol::{
+    HeliosEscapeSnapshotStatus, HELIOS_ESCAPE_SNAPSHOT_STATUS, HELIOS_SCANOUT_CAP_SNAPSHOT_STATUS,
+    HELIOS_SNAPSHOT_BUSY, HELIOS_SNAPSHOT_IDLE,
     HeliosEscapeHeader, HeliosEscapeMapReadLedger, HeliosEscapeScanoutEvent, HeliosReadLedgerPage,
     HeliosReadLedgerSlot, HELIOS_ESCAPE_MAP_READ_LEDGER, HELIOS_ESCAPE_SCANOUT_EVENT,
     HELIOS_READ_LEDGER_MAGIC, HELIOS_READ_LEDGER_SLOTS, HELIOS_READ_LEDGER_VERSION,
@@ -180,6 +182,7 @@ unsafe fn call_escape(
     kt_callbacks: *const ddi::D3DDDI_DEVICECALLBACKS,
     rt_adapter: usize,
     h_rt_device: usize,
+    h_rt_context: usize,
     payload: *mut core::ffi::c_void,
     payload_size: u32,
 ) -> i32 {
@@ -192,9 +195,9 @@ unsafe fn call_escape(
     // Flags stay zero-initialized: HardwareAccess = 0 (owner directive; these
     // verbs are PASSIVE and non-blocking), no DeviceStatusQuery, nothing else.
     esc.hDevice = h_rt_device as ddi::HANDLE;
+    esc.hContext = h_rt_context as ddi::HANDLE;
     esc.pPrivateDriverData = payload;
     esc.PrivateDriverDataSize = payload_size;
-    // hContext stays null: MAP_READ_LEDGER / SCANOUT_EVENT are device-scoped.
     // SAFETY: the callback contract (PFND3DDDI_ESCAPECB) takes the runtime
     // adapter handle and a fully-initialized D3DDDICB_ESCAPE whose buffer
     // outlives the call; both hold here.
@@ -228,6 +231,7 @@ unsafe fn escape_map_ledger(
             kt_callbacks,
             rt_adapter,
             h_rt_device,
+            0,
             (&mut payload as *mut HeliosEscapeMapReadLedger).cast(),
             size_of::<HeliosEscapeMapReadLedger>() as u32,
         )
@@ -265,6 +269,7 @@ unsafe fn escape_scanout_event(
             kt_callbacks,
             rt_adapter,
             h_rt_device,
+            0,
             (&mut payload as *mut HeliosEscapeScanoutEvent).cast(),
             size_of::<HeliosEscapeScanoutEvent>() as u32,
         )
@@ -274,6 +279,42 @@ unsafe fn escape_scanout_event(
     } else {
         Ok(payload.out_state)
     }
+}
+
+/// Called only between serialized presents, after the caller stops selecting
+/// this private WindowedBlt ring. Direct-flip ownership is outside this query.
+pub(crate) fn windowed_snapshot_idle(dev: &HeliosDevice, resource_id: u32) -> bool {
+    if PROBE_CAPS.load(Ordering::Acquire) & HELIOS_SCANOUT_CAP_SNAPSHOT_STATUS == 0 {
+        return false;
+    }
+    let Some(context) = dev.context.as_ref() else {
+        return false;
+    };
+    let rt_adapter = LAST_RT_ADAPTER.load(Ordering::Acquire);
+    if rt_adapter == 0 || dev.kt_callbacks.is_null() {
+        return false;
+    }
+    let mut payload = HeliosEscapeSnapshotStatus {
+        hdr: HeliosEscapeHeader::new(
+            HELIOS_ESCAPE_SNAPSHOT_STATUS,
+            size_of::<HeliosEscapeSnapshotStatus>() as u32,
+        ),
+        resource_id,
+        out_state: HELIOS_SNAPSHOT_BUSY,
+    };
+    // SAFETY: device/context and callback table outlive this DDI; payload is a
+    // writable stack struct with the exact advertised size.
+    let hr = unsafe {
+        call_escape(
+            dev.kt_callbacks,
+            rt_adapter,
+            dev.h_rt_device as usize,
+            context.handle.as_ptr() as usize,
+            (&mut payload as *mut HeliosEscapeSnapshotStatus).cast(),
+            size_of::<HeliosEscapeSnapshotStatus>() as u32,
+        )
+    };
+    hr == 0 && payload.out_state == HELIOS_SNAPSHOT_IDLE
 }
 
 /// Acquire-load one `u32` field of the mapped ledger page.

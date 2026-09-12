@@ -130,6 +130,14 @@ impl<'a> ContextHandleRef<'a> {
         .unwrap_or(0)
     }
 
+    pub fn belongs_to_device(&self, device: HANDLE) -> bool {
+        self.context.device.cast::<c_void>() == device
+    }
+
+    pub fn has_snapshot_stash(&self, resource_id: u32) -> bool {
+        self.context.snap_resid.load(Ordering::Acquire) == resource_id
+    }
+
     /// Called only after authenticating the registered stream's process/cookie.
     pub fn bind_execution_stream(&self, boundary: u64) -> bool {
         self.context

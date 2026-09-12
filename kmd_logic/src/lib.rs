@@ -4896,6 +4896,26 @@ pub mod snapshot_bind {
 /// monotonically minted only as local request identities; they are not an
 /// ordering relation across generation-qualified present streams.
 pub mod windowed_blt_token {
+    /// Resolve a prepared command by identity after unrelated cache removals.
+    pub fn prepared_cache_index(
+        mut entries: impl Iterator<Item = (u64, u32)>,
+        command_buffer: u64,
+        destination: u32,
+    ) -> Option<usize> {
+        entries.position(|entry| entry == (command_buffer, destination))
+    }
+
+    #[test]
+    fn prepared_command_survives_unrelated_cache_removal() {
+        extern crate alloc;
+        let mut entries = alloc::vec![(11, 101), (22, 202), (33, 303)];
+        assert_eq!(prepared_cache_index(entries.iter().copied(), 33, 303), Some(2));
+        entries.swap_remove(0);
+        assert_eq!(prepared_cache_index(entries.iter().copied(), 33, 303), Some(0));
+        assert_eq!(prepared_cache_index(entries.iter().copied(), 11, 101), None);
+        assert_eq!(prepared_cache_index(entries.iter().copied(), 33, 202), None);
+    }
+
     /// Returns true only for the exact terminal `(token, stream_boundary)`
     /// pair. A greater token on another stream proves nothing about this one.
     pub fn terminal_contains(terminal: &[(u64, u64)], token: u64, stream_boundary: u64) -> bool {

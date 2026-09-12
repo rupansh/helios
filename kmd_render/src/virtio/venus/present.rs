@@ -290,7 +290,6 @@ pub(super) struct PreparedPresentBlt {
 /// separate later operation after SubmitCommand has admitted residency.
 #[derive(Clone, Copy)]
 pub(crate) struct PreparedPresentBltSubmission {
-    blt_index: usize,
     command_buffer_id: VkCommandBufferId,
     destination: PresentDestinationDesc,
 }
@@ -1268,7 +1267,6 @@ impl VenusClient {
 
         let command_buffer_id = self.present_blits[blt_index].command_buffer_id;
         Ok(PreparedPresentBltSubmission {
-            blt_index,
             command_buffer_id,
             destination,
         })
@@ -1285,7 +1283,7 @@ impl VenusClient {
         destination: PresentDestinationDesc,
     ) -> Result<u64, VirtioError> {
         let prepared = self.prepare_present_blt(adapter, source, destination)?;
-        self.validate_prepared_present_blt(prepared)?;
+        let blt_index = self.validate_prepared_present_blt(prepared)?;
         let submit = self.encode_command_buffer_submit(prepared.command_buffer_id);
         let present_buffer_write = match prepared.destination {
             PresentDestinationDesc::StandardBuffer(destination) => Some(destination.resource_id),
@@ -1298,32 +1296,36 @@ impl VenusClient {
             submit.as_slice()?,
             present_buffer_write,
         )?;
-        self.note_prepared_present_blt_submit(adapter, prepared, fence_id);
+        self.note_prepared_present_blt_submit(adapter, prepared, blt_index, fence_id);
         Ok(fence_id)
     }
 
     fn validate_prepared_present_blt(
         &self,
         prepared: PreparedPresentBltSubmission,
-    ) -> Result<(), VirtioError> {
-        let Some(blt) = self.present_blits.get(prepared.blt_index) else {
-            return Err(VirtioError::DeviceError);
-        };
-        if blt.command_buffer_id != prepared.command_buffer_id
-            || blt.destination_resource_id != prepared.destination.resource_id()
-        {
-            return Err(VirtioError::DeviceError);
-        }
-        Ok(())
+    ) -> Result<usize, VirtioError> {
+        // Resource teardown can swap-remove an unrelated cache entry between
+        // preparation and submission. Command IDs stay stable across that move.
+        helios_kmd_logic::windowed_blt_token::prepared_cache_index(
+            self.present_blits.iter().map(|blt| {
+                (blt.command_buffer_id.get(), blt.destination_resource_id)
+            }),
+            prepared.command_buffer_id.get(),
+            prepared.destination.resource_id(),
+        )
+        .ok_or(VirtioError::DeviceError)
     }
 
     fn note_prepared_present_blt_submit(
         &mut self,
         adapter: &AdapterContext,
         prepared: PreparedPresentBltSubmission,
+        blt_index: usize,
         fence_id: u64,
     ) {
-        let blt = &mut self.present_blits[prepared.blt_index];
+        // Validation and submission hold the same Venus lock, so the resolved
+        // index cannot move before this update.
+        let blt = &mut self.present_blits[blt_index];
         blt.last_wire_fence_id = fence_id;
         blt.submit_count = blt.submit_count.saturating_add(1);
         let run_probe = if adapter.present_probe()
@@ -1356,7 +1358,7 @@ impl VenusClient {
         token: u64,
         stream_boundary: u64,
     ) -> Result<u64, VirtioError> {
-        self.validate_prepared_present_blt(prepared)?;
+        let blt_index = self.validate_prepared_present_blt(prepared)?;
         let command_buffer_id = prepared.command_buffer_id;
         let submit = self.encode_command_buffer_submit(command_buffer_id);
         let fence_id = ctrl::submit_venus_async_windowed_blt(
@@ -1367,7 +1369,7 @@ impl VenusClient {
             token,
             stream_boundary,
         )?;
-        self.note_prepared_present_blt_submit(adapter, prepared, fence_id);
+        self.note_prepared_present_blt_submit(adapter, prepared, blt_index, fence_id);
         Ok(fence_id)
     }
 

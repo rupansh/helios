@@ -180,8 +180,8 @@ static ComPtr<ID3DBlob> compile(Module& compiler,const char* source,const char* 
     if (errors) std::printf("shader: %.*s\n",static_cast<int>(errors->GetBufferSize()),static_cast<const char*>(errors->GetBufferPointer()));
     CHECK(hr); require(code != nullptr,"shader bytecode"); return code;
 }
-static int run(UINT samples,bool srgb,UINT seconds) {
-    constexpr UINT width=1280,height=800;
+static int run(UINT samples,bool srgb,UINT seconds,bool resize) {
+    UINT width=1280,height=800;
     DWORD session=0; require(ProcessIdToSessionId(GetCurrentProcessId(),&session) && session!=0,"interactive desktop session");
     require(SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)!=nullptr,"physical window coordinates");
     const int screenWidth=GetSystemMetrics(SM_CXSCREEN),screenHeight=GetSystemMetrics(SM_CYSCREEN);
@@ -228,15 +228,19 @@ static int run(UINT samples,bool srgb,UINT seconds) {
     ComPtr<IDXGISwapChain> swap; CHECK(factory->CreateSwapChain(device.Get(),&swapDesc,&swap));
     CHECK(factory->MakeWindowAssociation(window,DXGI_MWA_NO_ALT_ENTER));
     ComPtr<ID3D11Texture2D> back,resolved,staging;
-    CHECK(swap->GetBuffer(0,IID_PPV_ARGS(&back)));
-    D3D11_TEXTURE2D_DESC texture{}; back->GetDesc(&texture);
-    require(texture.Width==width && texture.Height==height && texture.Format==format && texture.SampleDesc.Count==samples && texture.SampleDesc.Quality==0,"actual swapchain format/samples");
-    std::printf("backbuffer fmt=%u sample=%ux%u size=%ux%u\n",static_cast<UINT>(texture.Format),texture.SampleDesc.Count,texture.SampleDesc.Quality,texture.Width,texture.Height);
-    ComPtr<ID3D11RenderTargetView> rtv; CHECK(device->CreateRenderTargetView(back.Get(),nullptr,&rtv));
-    texture.SampleDesc={1,0}; texture.Usage=D3D11_USAGE_DEFAULT; texture.BindFlags=0; texture.CPUAccessFlags=0; texture.MiscFlags=0;
-    CHECK(device->CreateTexture2D(&texture,nullptr,&resolved));
-    texture.Usage=D3D11_USAGE_STAGING; texture.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
-    CHECK(device->CreateTexture2D(&texture,nullptr,&staging));
+    ComPtr<ID3D11RenderTargetView> rtv;
+    const auto createBuffers=[&]() {
+        CHECK(swap->GetBuffer(0,IID_PPV_ARGS(&back)));
+        D3D11_TEXTURE2D_DESC texture{}; back->GetDesc(&texture);
+        require(texture.Width==width && texture.Height==height && texture.Format==format && texture.SampleDesc.Count==samples && texture.SampleDesc.Quality==0,"actual swapchain format/samples");
+        CHECK(device->CreateRenderTargetView(back.Get(),nullptr,&rtv));
+        texture.SampleDesc={1,0}; texture.Usage=D3D11_USAGE_DEFAULT; texture.BindFlags=0; texture.CPUAccessFlags=0; texture.MiscFlags=0;
+        CHECK(device->CreateTexture2D(&texture,nullptr,&resolved));
+        texture.Usage=D3D11_USAGE_STAGING; texture.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+        CHECK(device->CreateTexture2D(&texture,nullptr,&staging));
+        std::printf("backbuffer fmt=%u sample=%ux%u size=%ux%u\n",static_cast<UINT>(format),samples,0u,width,height);
+    };
+    createBuffers();
     const char* vsText="float4 main(uint id:SV_VertexID):SV_Position { return float4(id==2?3:-1,id==1?3:-1,0,1); }";
     const char* psText=
         "cbuffer C:register(b0){uint W,H,serial,pad;}"
@@ -257,11 +261,25 @@ static int run(UINT samples,bool srgb,UINT seconds) {
     ComPtr<ID3D11RasterizerState> rs; CHECK(device->CreateRasterizerState(&raster,&rs));
     D3D11_QUERY_DESC queryDesc{D3D11_QUERY_EVENT,0}; ComPtr<ID3D11Query> event; CHECK(device->CreateQuery(&queryDesc,&event));
     bool pending=false; PendingGuard guard{pending}; // Declared after all GPU owners; runs before their unwind.
-    const D3D11_VIEWPORT viewport{0,0,static_cast<float>(width),static_cast<float>(height),0,1};
+    UINT geometry=0;
     UINT frames=0; uint64_t pixels=0;
     const ULONGLONG start=GetTickCount64(),finish=start+static_cast<ULONGLONG>(seconds)*1000;
     do {
-        pump(window); pending=true;
+        pump(window);
+        const UINT nextGeometry=resize?static_cast<UINT>((GetTickCount64()-start)*12/(seconds*1000u)):0;
+        if (nextGeometry>geometry && geometry<11) {
+            // Retire API work and release every backbuffer reference before
+            // ResizeBuffers. KMD presentation readers retire independently.
+            pending=true; context->ClearState(); wait_gpu(device.Get(),context.Get(),event.Get(),window,pending);
+            rtv.Reset(); staging.Reset(); resolved.Reset(); back.Reset();
+            ++geometry; width=1280-geometry*16; height=800-geometry*8;
+            require(SetWindowPos(window,nullptr,0,0,width,height,SWP_NOMOVE|SWP_NOZORDER),"resize visible window");
+            CHECK(swap->ResizeBuffers(1,width,height,format,0));
+            createBuffers();
+            std::printf("RESIZE geometry=%u frame=%u client=%ld,%ld %ux%u\n",geometry,frames,origin.x,origin.y,width,height);
+        }
+        const D3D11_VIEWPORT viewport{0,0,static_cast<float>(width),static_cast<float>(height),0,1};
+        pending=true;
         const UINT constants[4]={width,height,frames,0}; context->UpdateSubresource(cb.Get(),0,nullptr,constants,0,0);
         context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         context->VSSetShader(vs.Get(),nullptr,0); context->PSSetShader(ps.Get(),nullptr,0);
@@ -302,6 +320,7 @@ static int run(UINT samples,bool srgb,UINT seconds) {
         if (frames==1 || frames%120==0) std::printf("frame=%u exact_pixels=%llu midpoint=%u sample_band=%u\n",frames,pixels,srgb?188u:128u,samples==4?(srgb?188u:128u):0u);
     } while (GetTickCount64()<finish);
     require(frames>=2,"multiple presented frames");
+    require(!resize || geometry==11,"twelve distinct presented geometries");
     pump(window); pending=true; context->ClearState(); wait_gpu(device.Get(),context.Get(),event.Get(),window,pending);
     const ULONGLONG elapsed=GetTickCount64()-start;
     event.Reset(); rs.Reset(); cb.Reset(); ps.Reset(); vs.Reset(); rtv.Reset(); staging.Reset(); resolved.Reset(); back.Reset(); swap.Reset(); context.Reset();
@@ -316,7 +335,7 @@ int main(int argc,char** argv) {
     setvbuf(stdout,nullptr,_IONBF,0);
     try {
         if (argc==2 && std::strcmp(argv[1],"--self-test")==0) return self_test();
-        require(argc<=4,"usage: d3d11-msaa-present.exe [1|4 [unorm|srgb [seconds]]]");
+        require(argc<=5,"usage: d3d11-msaa-present.exe [1|4 [unorm|srgb [seconds [resize]]]]");
         UINT samples=4,seconds=10; bool srgb=true;
         if (argc>1) { require(std::strcmp(argv[1],"1")==0 || std::strcmp(argv[1],"4")==0,"sample count must be1 or4"); samples=static_cast<UINT>(argv[1][0]-'0'); }
         if (argc>2) { require(std::strcmp(argv[2],"unorm")==0 || std::strcmp(argv[2],"srgb")==0,"format must be unorm or srgb"); srgb=std::strcmp(argv[2],"srgb")==0; }
@@ -324,7 +343,10 @@ int main(int argc,char** argv) {
             char* end=nullptr; errno=0; const unsigned long value=std::strtoul(argv[3],&end,10);
             require(errno==0 && end!=argv[3] && *end=='\0' && value>=1 && value<=120,"seconds must be1..120"); seconds=static_cast<UINT>(value);
         }
-        return run(samples,srgb,seconds);
+        const bool resize=argc==5;
+        require(!resize || std::strcmp(argv[4],"resize")==0,"last argument must be resize");
+        require(!resize || seconds>=12,"resize run needs at least12 seconds");
+        return run(samples,srgb,seconds,resize);
     } catch (const Failure&) { return 2; }
       catch (const std::exception& e) { std::printf("FAIL exception %s\n",e.what()); return 2; }
 }

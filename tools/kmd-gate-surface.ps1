@@ -32,6 +32,8 @@ param(
         'VnEncOvf', 'VnRingFt', 'VnRingWd', 'VnRingSz', 'VnMtDown', 'CpNoDrn',
         'PBTdErr', 'CtNotOurs', 'ChSzMm', 'ChSzPv', 'MapDup',
         'PciCapOob', 'WnRcf',
+        # Invalid snapshot release-status queries (normal busy replies are not failures).
+        'SnQrF',
         # R614. Packed (count << 8) | last_irql, so ANY nonzero value means a
         # `PassiveLevel::assume()` site was reached above PASSIVE_LEVEL — i.e. a
         # `// SAFETY:` claim at one of the twelve audited mints is FALSE on this

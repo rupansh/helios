@@ -107,7 +107,7 @@ pub struct SnapshotRing {
     /// cache key because it determines whether the snapshot copy converts.
     pub source_dxgi_format: u32,
     /// Scan-out-safe format of every slot in this ring. It normally matches
-    /// the source, except that packed 10-bit sources are converted to RGBA8.
+    /// the source; packed 10-bit and sRGB sources normalize to UNORM.
     pub scanout_dxgi_format: u32,
     /// Direct scan-out snapshots retain SHADER_READ_ONLY_OPTIMAL for QEMU;
     /// WindowedBlt snapshots are born GENERAL for the KMD transfer importer.
@@ -119,19 +119,20 @@ pub struct SnapshotRing {
     pub next: usize,
 }
 
-/// Device-local D4b rings, one per concurrently presented geometry.
-///
-/// Snapshot descriptors cross into the KMD as raw Venus resource IDs. There
-/// is no WDDM allocation reference in that descriptor which could make a
-/// geometry-change eviction scheduler-safe, so a ring that has ever been
-/// published stays alive until device teardown. The forward path enforces a
-/// hard count/byte budget and seals the cache when a new ring would exceed it;
-/// later unknown geometries fail closed to the ordinary present path.
+impl SnapshotRing {
+    pub fn byte_size(&self) -> u64 {
+        self.slots.iter().fold(0u64, |sum, slot| sum.saturating_add(slot.alloc_size))
+    }
+}
+
+/// Bounded device-local rings. WindowedBlt eviction requires a KMD idle query;
+/// direct-scanout descriptors retain their resources until device teardown.
 #[derive(Default)]
 pub struct SnapshotRingCache {
     pub rings: Vec<SnapshotRing>,
     pub bytes: u64,
-    pub sealed: bool,
+    /// Last geometry whose ring alone exceeded the byte budget.
+    pub oversized_geometry: Option<(u32, u32, u32, crate::forward::SnapshotPurpose)>,
 }
 
 /// WDDM 2.x paging queue used to order explicit residency operations.
@@ -198,7 +199,7 @@ pub struct BridgeOwned {
     /// present-path DDIs touch it, and those stay runtime-serialized with the
     /// rest of the immediate context even under FREETHREADED caps.
     pub present_src_cache: core::cell::RefCell<Vec<PresentSrcEntry>>,
-    /// D4b rings, keyed by geometry and retained until device teardown. Same
+    /// Snapshot rings, keyed by geometry and purpose. Same
     /// immediate-path-only RefCell contract as `present_src_cache`.
     pub snapshot_rings: core::cell::RefCell<SnapshotRingCache>,
     /// Device-global shader/layout caches for lazy `ID3D11InputLayout`
@@ -249,13 +250,7 @@ impl BridgeOwned {
     /// but they move from "released here" to "released whenever the field
     /// drops", which is the ordering this type exists to stop depending on.
     pub fn release(&mut self) -> (usize, usize) {
-        // Order: present caches first, shader caches last, matching the
-        // pre-R807 sequence where `ia` was the field released explicitly. The
-        // Snapshot rings are a cache too: dropping the slots releases their
-        // COM refs, and that is ALL their teardown — no WDDM handles or KMD
-        // registrations to unwind. This happens only at device teardown;
-        // mid-device eviction is forbidden because the KMD carries snapshot
-        // identities by value and may consume them after Present returns.
+        // Release the remaining presentation resources while DXVK is alive.
         self.present_src_cache.get_mut().clear();
         *self.snapshot_rings.get_mut() = SnapshotRingCache::default();
         self.bindings.bound_vs_com.store(0, Ordering::Relaxed);

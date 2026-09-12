@@ -80,6 +80,24 @@ pub const HELIOS_ESCAPE_PRESENT_BUFFER_READ: u32 = 0x0012;
 /// Exact GPU feedback observation; does not retire the tagged wire command.
 /// 0x0013 is the allocation producer interface (producer.rs).
 pub const HELIOS_ESCAPE_STREAM_FEEDBACK: u32 = 0x0014;
+/// Read-only release eligibility for a private WindowedBlt snapshot.
+pub const HELIOS_ESCAPE_SNAPSHOT_STATUS: u32 = 0x0015;
+
+pub const HELIOS_SNAPSHOT_BUSY: u32 = 0;
+pub const HELIOS_SNAPSHOT_IDLE: u32 = 1;
+
+/// Context-scoped query, including pending GPU and CPU-mirror reads. IDLE is
+/// usable only after the caller stops publishing this private resource ID;
+/// it does not reserve the resource or authorize direct-scanout reclamation.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct HeliosEscapeSnapshotStatus {
+    pub hdr: HeliosEscapeHeader,
+    pub resource_id: u32,
+    pub out_state: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<HeliosEscapeSnapshotStatus>() == 24);
 pub const HELIOS_STREAM_FEEDBACK_ACCEPTED: u32 = 0;
 pub const HELIOS_STREAM_FEEDBACK_WIRE_RETIRED: u32 = 1;
 pub const HELIOS_STREAM_FEEDBACK_REJECTED: u32 = 2;
@@ -565,6 +583,8 @@ pub const HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM: u32 = 1 << 2;
 /// `SNAPSHOT_BIND`: a windowed snapshot is imported as the *copy source*, never
 /// as a scanout bind target.
 pub const HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT: u32 = 1 << 3;
+/// SNAPSHOT_STATUS includes deferred WindowedBlt CPU mirrors and context stashes.
+pub const HELIOS_SCANOUT_CAP_SNAPSHOT_STATUS: u32 = 1 << 4;
 
 /// out_state values for the two D4a escapes.
 pub const HELIOS_SCANOUT_ACQ_OK: u32 = 0;

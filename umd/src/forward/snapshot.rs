@@ -1,51 +1,19 @@
-//! D4b ordered-snapshot substitution — the UMD half
-//! (FIX-DESIGN-d4b-snapshot.md §3).
+//! Ordered snapshots for direct scan-out and WindowedBlt presentation.
 //!
-//! On the direct-flip present path the app's own venus submission stream is
-//! the only insertion point that orders capture between frame N and the app's
-//! clear of frame N+2. So, at present time, DXVK records a GPU image copy of
-//! the presented primary X into S_i — one slot of a 4-deep ring of ICD-owned
-//! DirectOptimalScanout OPTIMAL images — and the present's private data then
-//! describes S_i (`HELIOS_PRESENT_PRIVATE_FLAG_SNAPSHOT`) so the KMD binds
-//! and flushes the snapshot instead of X. Nothing ever clears S; the black
-//! margin race dies structurally. **No CPU waits anywhere**: the blit rides
-//! frame N's own command list (recorded BEFORE the present-time
-//! `context.Flush()`, so `HeliosWaitFrameSubmitted` — the existing SUBMITTED
-//! gate — covers it), and ordering against frame N+1 is queue order.
+//! DXVK copies/resolves the presented source before the frame submission gate.
+//! The resulting private descriptor carries the snapshot's exact resource ID
+//! and layout through the KMD. MSAA and sRGB normalization is mandatory;
+//! failure to produce that representation refuses Present.
 //!
-//! A device may present multiple swapchains/child surfaces with different
-//! geometries and may route the same geometry either to direct scan-out or the
-//! KMD transfer importer. Rings are therefore cached per exact
-//! `(width, height, format, purpose)` instead of replacing one device-global
-//! ring or mixing incompatible canonical layouts. Once a ring identity has
-//! crossed into the KMD it is not safe to evict: the descriptor contains a raw
-//! Venus resource ID, not a WDDM allocation reference, and its deferred host
-//! read can begin after Present returns. The cache is consequently bounded and
-//! non-evicting for the device lifetime; when full, an unknown geometry falls
-//! back to the ordinary present path only when no normalization is required.
-//! Multisampled resources require the KMD's 1x image contract; sRGB resources
-//! require an encoded-byte UNORM view. Inability to publish either fails Present.
-//!
-//! The control flow is deliberately value-threaded, never device-latched:
-//! `snapshot_for_present` returns a [`SnapshotPlan`] ONLY when the blit was
-//! recorded this present, `dxgi_present` moves that plan into
-//! `finish_present`, and [`apply_snapshot_override`] mutates the OWNED LOCAL
-//! `present_private` before both of its consumers. A present whose blit arm
-//! was skipped can therefore never carry a snapshot descriptor — a stale
-//! descriptor would be a stale-frame display, the exact defect class this
-//! mechanism exists to close.
-//!
-//! What the ring deliberately is NOT: it has no runtime objects, no WDDM
-//! allocations, no KMT stamps, no `transfer_resource_ownership` (that is the
-//! WDDM-adopt path; snapshots stay ICD-owned blobs — the KMD needs only the
-//! resid + descriptor and its executor's `resource_is_live` arm refuses a
-//! dead resid loudly), and no entry in `direct_scanout_allocations` or the
-//! `dxgi_rotate_resource_identities` list (that list is `a.pResources` only).
-//! Teardown is exactly the COM releases in `BridgeOwned::release`.
+//! Rings are keyed by geometry, source format, and presentation purpose. Direct
+//! scan-out rings remain alive until device teardown. A WindowedBlt ring may
+//! be reclaimed between serialized presents only after the KMD reports every
+//! slot idle, including deferred GPU reads and CPU mirrors. Both paths share a
+//! fixed retained-memory and ring-count budget.
 
 use super::*;
 
-use crate::device_funcs::{SnapshotRing, SnapshotSlot};
+use crate::device_funcs::{SnapshotRing, SnapshotRingCache, SnapshotSlot};
 
 /// Ring depth. 4 matches the deepest DXGI flip ring the direct primary
 /// rotates through, giving a reuse distance of ~4 present periods before a
@@ -55,8 +23,7 @@ pub(crate) const SNAPSHOT_RING_SLOTS: usize = 4;
 
 /// A browser can own several independently presented child surfaces. Eight
 /// geometry keys covers that shape while keeping the cache's object count
-/// strictly bounded. Reaching either limit seals new-key insertion; existing
-/// rings continue to operate.
+/// strictly bounded. Idle WindowedBlt rings make room for new geometries.
 const SNAPSHOT_CACHE_MAX_RINGS: usize = 8;
 /// Retained dedicated backing across all rings. At 32bpp this admits one 4K
 /// ring with ample tiling/alignment headroom, or many normal window surfaces,
@@ -96,14 +63,13 @@ pub(crate) enum SnapshotPurpose {
 /// Presents whose descriptor was substituted with a snapshot (the UMD-side
 /// twin of the KMD's `SnSub`).
 pub(crate) static SNAP_SUBSTITUTED: AtomicUsize = AtomicUsize::new(0);
-/// Ring builds that failed (create/identity/pitch). Present ran as today.
+/// Ring builds that failed (create/identity/pitch).
 pub(crate) static SNAP_RING_CREATE_FAILS: AtomicUsize = AtomicUsize::new(0);
-/// Blit bridge calls that failed or reported an extent mismatch. Present ran
-/// as today.
+/// Blit bridge calls that failed or reported an extent mismatch.
 pub(crate) static SNAP_COPY_FAILS: AtomicUsize = AtomicUsize::new(0);
-/// New geometry keys refused because the non-evicting cache is sealed at its
-/// hard count/byte budget. The present follows the ordinary fallback path.
+/// New geometry keys refused at the hard count/byte budget.
 pub(crate) static SNAP_CACHE_REFUSALS: AtomicUsize = AtomicUsize::new(0);
+static SNAP_RING_RECLAIMS: AtomicUsize = AtomicUsize::new(0);
 /// `apply_snapshot_override` refusals: the private data re-read in
 /// `finish_present` was absent or no longer matched the geometry the blit
 /// was recorded against. The stale-descriptor guard's loud half.
@@ -157,11 +123,12 @@ fn snapshot_scanout_format(source_dxgi_format: u32) -> Option<u32> {
 
 fn counter_summary() -> String {
     format!(
-        "sub={} ring_fails={} copy_fails={} cache_refusals={} private_skips={} required_refusals={}",
+        "sub={} ring_fails={} copy_fails={} cache_refusals={} ring_reclaims={} private_skips={} required_refusals={}",
         SNAP_SUBSTITUTED.load(Ordering::Relaxed),
         SNAP_RING_CREATE_FAILS.load(Ordering::Relaxed),
         SNAP_COPY_FAILS.load(Ordering::Relaxed),
         SNAP_CACHE_REFUSALS.load(Ordering::Relaxed),
+        SNAP_RING_RECLAIMS.load(Ordering::Relaxed),
         SNAP_PRIVATE_SKIPS.load(Ordering::Relaxed),
         SNAP_REQUIRED_REFUSALS.load(Ordering::Relaxed),
     )
@@ -169,9 +136,7 @@ fn counter_summary() -> String {
 
 /// Build the 4-slot ring against the presented primary's geometry.
 ///
-/// Any per-slot failure abandons the whole build: the partially-filled `Vec`
-/// drops, releasing the earlier slots' COM refs, and the caller presents as
-/// today (§6 "ring create fails" row). Loud on every early failure.
+/// Any per-slot failure releases the unpublished slots and counts the refusal.
 ///
 /// # Safety
 /// `h` must be the live device the caller resolved `dev` from.
@@ -287,16 +252,33 @@ unsafe fn build_ring(
     })
 }
 
-/// The per-present snapshot arm, called from `dxgi_present`'s direct-flip
-/// path ONLY (`published_to_scanout`), BEFORE the present-time
-/// `context.Flush()` — that position is what keeps the blit inside frame N's
-/// command list and under the frame watermark. Vehicle, windowed-BLT and
-/// Present1-multi paths never call this.
-///
-/// `private` is the presented primary's private data, read from THIS present
-/// (it rotates with the allocation — never cache it per resource); its
-/// geometry keys the ring. Returns the substitution plan iff the blit was
-/// recorded; every refusal presents exactly as today, counted and logged.
+fn make_cache_room(dev: &HeliosDevice, cache: &mut SnapshotRingCache, additional_bytes: u64) -> bool {
+    while cache.rings.len() >= SNAPSHOT_CACHE_MAX_RINGS
+        || cache.bytes.saturating_add(additional_bytes) > SNAPSHOT_CACHE_MAX_BYTES
+    {
+        let Some(index) = cache.rings.iter().position(|ring| {
+            ring.purpose == SnapshotPurpose::WindowedBlt
+                && ring.slots.iter().all(|slot| {
+                    crate::scanout_acquire::windowed_snapshot_idle(dev, slot.resid)
+                })
+        }) else {
+            return false;
+        };
+        // No future Present can select the removed ring. The KMD query covers
+        // prior consumers; any queued DXVK copy retains its image references.
+        let ring = cache.rings.swap_remove(index);
+        cache.bytes = cache.bytes.saturating_sub(ring.byte_size());
+        drop(ring);
+        let n = SNAP_RING_RECLAIMS.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 16 || n % 512 == 0 {
+            log_error!("scanout-snapshot: reclaimed idle ring ({})", counter_summary());
+        }
+    }
+    true
+}
+
+/// Record the snapshot before the frame submission gate. A missing plan is
+/// fatal when the source requires sample/color normalization.
 ///
 /// # Safety
 /// `h`/`src_h` are the live device/source handles of the present in progress.
@@ -356,15 +338,12 @@ pub(crate) unsafe fn snapshot_for_present(
             && ring.purpose == purpose
     });
     if ring_index.is_none() {
-        // Never evict a published ring here. The KMD can defer consuming its
-        // raw resid until after this Present returns; releasing the last COM
-        // reference would make that delayed import fatal to the Venus decoder.
-        if cache.sealed || cache.rings.len() >= SNAPSHOT_CACHE_MAX_RINGS {
-            cache.sealed = true;
+        let key = (width, height, dxgi_format, purpose);
+        if cache.oversized_geometry == Some(key) || !make_cache_room(dev, &mut cache, 0) {
             let n = SNAP_CACHE_REFUSALS.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n % 512 == 0 {
                 log_error!(
-                    "scanout-snapshot: cache sealed, refusing purpose={:?} geometry {}x{} fmt={} \
+                    "scanout-snapshot: cache limit refuses purpose={:?} geometry {}x{} fmt={} \
                      rings={} bytes={} limits={}/{} ({})",
                     purpose,
                     width,
@@ -390,16 +369,15 @@ pub(crate) unsafe fn snapshot_for_present(
         ) else {
             return None; // counted + logged in build_ring
         };
-        let ring_bytes = ring
-            .slots
-            .iter()
-            .fold(0u64, |sum, slot| sum.saturating_add(slot.alloc_size));
-        let new_bytes = cache.bytes.saturating_add(ring_bytes);
-        if new_bytes > SNAPSHOT_CACHE_MAX_BYTES {
-            // This ring has never been submitted or published, so dropping it
-            // is safe. Seal before return so an over-budget geometry cannot
-            // create/drop four dedicated images every present.
-            cache.sealed = true;
+        let ring_bytes = ring.byte_size();
+        if ring_bytes > SNAPSHOT_CACHE_MAX_BYTES {
+            // This geometry cannot fit even in an empty cache. Avoid allocating
+            // four doomed images again on each optional-snapshot Present.
+            cache.oversized_geometry = Some(key);
+        }
+        if ring_bytes > SNAPSHOT_CACHE_MAX_BYTES
+            || !make_cache_room(dev, &mut cache, ring_bytes)
+        {
             let n = SNAP_CACHE_REFUSALS.fetch_add(1, Ordering::Relaxed);
             if n < 16 || n % 512 == 0 {
                 log_error!(
@@ -417,7 +395,7 @@ pub(crate) unsafe fn snapshot_for_present(
             }
             return None;
         }
-        cache.bytes = new_bytes;
+        cache.bytes += ring_bytes;
         cache.rings.push(ring);
         ring_index = Some(cache.rings.len() - 1);
     }

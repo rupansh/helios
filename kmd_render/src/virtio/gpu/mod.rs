@@ -6552,6 +6552,17 @@ impl VirtioGpu {
         n
     }
 
+    /// A completed wire read may still own a pending StandardBuffer CPU mirror.
+    pub(crate) fn windowed_snapshot_idle(&self, resource_id: u32) -> bool {
+        !self.failed
+            && resource_id != 0
+            && self.resource_is_live(resource_id)
+            && !self.windowed_blt.pending.iter().any(|request| {
+                request.source_resource_id == resource_id
+                    || request.destination_resource_id == resource_id
+            })
+    }
+
     /// Terminal transport death is stronger than scheduler preemption: after
     /// the transport latches failed (or its device status is reset), no host
     /// reader can complete. Retire EVERY exact WindowedBlt ledger issue now and

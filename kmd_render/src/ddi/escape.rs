@@ -22,6 +22,10 @@ use core::mem::size_of;
 use bytemuck::{bytes_of, pod_read_unaligned};
 use helios_protocol::producer::*;
 use helios_protocol::{
+    HeliosEscapeSnapshotStatus, HELIOS_ESCAPE_SNAPSHOT_STATUS, HELIOS_SCANOUT_CAP_SNAPSHOT_STATUS,
+    HELIOS_SNAPSHOT_BUSY, HELIOS_SNAPSHOT_IDLE,
+};
+use helios_protocol::{
     HeliosEscapeAllocBlob, HeliosEscapeAttachResource, HeliosEscapeCtxCreate,
     HeliosEscapeCtxDestroy, HeliosEscapeFenceEvent, HeliosEscapeHeader, HeliosEscapeMapBlob,
     HeliosEscapeMapReadLedger, HeliosEscapePresentBufferRead, HeliosEscapePresentStream,
@@ -327,6 +331,17 @@ pub unsafe extern "C" fn dxgkddi_escape(
     let passive = unsafe { crate::irql::PassiveLevel::assume() };
 
     match hdr.cmd_type {
+        HELIOS_ESCAPE_SNAPSHOT_STATUS => {
+            let status = escape_snapshot_status(passive, adapter, buf, &hdr, args.hDevice, args.hContext);
+            if status != STATUS_SUCCESS {
+                static REFUSED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+                let n = REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1;
+                if n == 1 || n % 64 == 0 {
+                    crate::diag::record_named_bytes(b"SnQrF", n);
+                }
+            }
+            status
+        }
         HELIOS_ESCAPE_PRODUCER => match owner {
             Some(owner) => {
                 // SAFETY: the runtime supplies our live DeviceContext for this Escape.
@@ -789,6 +804,46 @@ fn refuse_read_ledger_map(status: NTSTATUS) -> NTSTATUS {
     status
 }
 
+fn escape_snapshot_status(
+    passive: PassiveLevel,
+    adapter: &AdapterContext,
+    buf: &mut [u8],
+    hdr: &HeliosEscapeHeader,
+    device: HANDLE,
+    context: HANDLE,
+) -> NTSTATUS {
+    let mut wire = match EscapeBuf::<HeliosEscapeSnapshotStatus>::new(buf, hdr) {
+        Ok(wire) => wire,
+        Err(status) => return status,
+    };
+    let mut out = wire.read();
+    if device.is_null() || out.resource_id == 0 {
+        return STATUS_INVALID_PARAMETER;
+    }
+    // SAFETY: dxgkrnl resolves hContext to our live context for this Escape.
+    let Some(context) = (unsafe { crate::device::ContextHandleRef::from_raw(context) }) else {
+        return STATUS_INVALID_PARAMETER;
+    };
+    if !context.belongs_to_device(device)
+        || !context.adapter().is_some_and(|owner| core::ptr::eq(owner, adapter))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    let idle = adapter.with_scanout_lifecycle(passive, |_| {
+        adapter.with_virtio(|v| {
+            !context.has_snapshot_stash(out.resource_id)
+                && v.windowed_snapshot_idle(out.resource_id)
+        })
+    });
+    out.out_state = match idle {
+        Ok(true) => HELIOS_SNAPSHOT_IDLE,
+        Ok(false) => HELIOS_SNAPSHOT_BUSY,
+        Err(error) => return escape_device_gone(error),
+    };
+    wire.write_back(&out);
+    STATUS_SUCCESS
+}
+
 /// Count one scanout-event refusal (`AqRgF`) and return the given status.
 fn refuse_scanout_event(status: NTSTATUS) -> NTSTATUS {
     crate::adapter::AQ_REGISTER_REFUSED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -839,7 +894,8 @@ fn escape_map_read_ledger(
             HELIOS_SCANOUT_CAP_READ_LEDGER
                 | HELIOS_SCANOUT_CAP_SNAPSHOT_BIND
                 | HELIOS_SCANOUT_CAP_ASYNC_PRESENT_STREAM
-                | HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT,
+                | HELIOS_SCANOUT_CAP_WINDOWED_BLT_SNAPSHOT
+                | HELIOS_SCANOUT_CAP_SNAPSHOT_STATUS,
             HELIOS_SCANOUT_ACQ_PROBE_ACK,
         ),
         HELIOS_SCANOUT_ACQ_OP_MAP => {

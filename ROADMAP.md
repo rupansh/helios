@@ -67,7 +67,8 @@ Seven pure query tests, both Windows UMD checks, and independent reviews pass.
 
 A separate DXVK worker-failure path could strand DWM's device destruction in a
 condition-variable wait after the command-stream worker exited. Failure now
-wakes waiters, rejects new work and propagates through present gates; 96 actual
+wakes waiters and rejects new work; the .275 review below closes a remaining
+Present error-propagation gap. The 96 actual
 worker-failure cases per architecture and present/query guard fixtures pass.
 The original worker exception trigger remains unconfirmed. Guest GDI screen
 capture also coincided with strict D3D12 fence stalls, whereas runs without that
@@ -162,6 +163,43 @@ smoke cases** pass, including native/x86 D3D11 and D3D12 creation plus exact
 `msaa-snapshot-off274{,-vnc}/`, `msaa-no-stream274/`, `passmark-274{,-vnc}/`,
 and `verify-274/`. Full conformance is not claimed: the separate query probe's
 `S_FALSE` caller-buffer assertion remains to be investigated.
+
+**Senior review repairs (.275, runtime acceptance pending):** full-change reviews
+covered ABI/tables, lifetimes/concurrency, error propagation, deployment, and claim
+integrity. The review found and repaired these concrete defects:
+
+- The C++ frame gate collapsed submission/device failure into a false value that
+  Rust treated as an ignorable timeout. HRESULTs now distinguish completion,
+  bounded vehicle timeout, and failure; both Present callers return before
+  publication on failure. Actual-source fixtures cover 13 C++ and 10 Rust outcomes.
+- Mandatory normalization inherited a permanent eight-geometry cache limit.
+  WindowedBlt rings can now be reclaimed only after the new capability-negotiated,
+  read-only `SNAPSHOT_STATUS` escape confirms all slots idle, including context
+  stashes, queued GPU work, and pending CPU mirrors. Direct-scanout rings remain
+  retained. Count/byte limits still apply; older KMDs do not permit reclamation.
+  Prepared KMD blits resolve stable command identity at submission, so reclaiming
+  an unrelated cache entry cannot invalidate a deferred vector index.
+- Native hotplug now checks both input PE machine types before any mutation;
+  its 33-case harness and the seven win-MCP tests pass. The KMD resource helper
+  explicitly starts PowerShell with execution-policy bypass. Stale tool/deployment
+  instructions and snapshot fallback comments were corrected.
+- The query probe incorrectly required the public API's `S_FALSE` payload to stay
+  untouched. That requirement belongs to the DDI, where private staging and seven
+  contract tests enforce it. The API probe now validates payload on `S_OK` and
+  always checks buffer canaries; its corrected guest run is still pending.
+
+The resize probe adds twelve geometries in one process; source/readback plus
+host VNC, positive `ring_reclaims`, and no `SnQrF`/required-normalization refusals
+are the acceptance checks. The new status refusal counter is in the KMD gate;
+frame-gate and required-normalization failures are in the UMD gate. The .274
+rendering evidence above does not establish acceptance of these new changes.
+
+**Open workload issues:** the owner reports PassMark's DX12 initialization dialog
+on .274 despite successful native/x86 D3D12 probes, and the DX11 score remains
+about 10 fps. Both need workload-specific diagnosis after review acceptance.
+An independent preexisting conformance gap also remains: DXVK predication is
+stubbed, and SO-overflow predicate `QueryInterface(ID3D11Predicate)` fails. Query
+result translation alone does not claim predicate-controlled rendering support.
 
 ## Metadata consistency, 2026-09-12
 
