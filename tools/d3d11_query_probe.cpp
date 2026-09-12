@@ -117,8 +117,14 @@ static void modern_queries(Module& runtime,IDXGIAdapter1* adapter,ID3DBlob* shad
     for (int kind=0; kind<16; ++kind) {
         const D3D11_QUERY_DESC desc{static_cast<D3D11_QUERY>(kind),0};
         ComPtr<ID3D11Query> query;
-        const bool predicate=kind == 5 || (kind >= 7 && (kind & 1));
-        if (predicate) {
+        const bool booleanResult=kind == 5 || (kind >= 7 && (kind & 1));
+        // CreatePredicate accepts only these two API query kinds. The stream-
+        // specific overflow queries also return BOOL, but use CreateQuery.
+        // https://learn.microsoft.com/en-us/windows/win32/api/d3d11/nf-d3d11-id3d11device-createpredicate
+        const bool createPredicate=desc.Query == D3D11_QUERY_OCCLUSION_PREDICATE ||
+            desc.Query == D3D11_QUERY_SO_OVERFLOW_PREDICATE;
+        std::printf("CREATE D3D11 query=%d via=%s\n",kind,createPredicate?"CreatePredicate":"CreateQuery");
+        if (createPredicate) {
             ComPtr<ID3D11Predicate> p;
             CHECK(device->CreatePredicate(&desc,&p));
             CHECK(p.As(&query));
@@ -150,7 +156,7 @@ static void modern_queries(Module& runtime,IDXGIAdapter1* adapter,ID3DBlob* shad
                 "timestamp frequency was written and is nonzero");
         else if (kind == D3D11_QUERY_OCCLUSION)
             require(result.read<UINT64>() == 0,"empty occlusion result is zero across all 64 bits");
-        else if (predicate) require(result.read<BOOL>() == FALSE,"empty predicate is FALSE");
+        else if (booleanResult) require(result.read<BOOL>() == FALSE,"empty predicate is FALSE");
         else if (kind >= 6 && !(kind & 1)) {
             const auto stats=result.read<D3D11_QUERY_DATA_SO_STATISTICS>();
             require(stats.NumPrimitivesWritten == 0 && stats.PrimitivesStorageNeeded == 0,"unused SO stream statistics are zero");
