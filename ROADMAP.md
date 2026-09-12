@@ -103,7 +103,7 @@ DriverStore, including junction/path aliases. Its 31-case harness passed Linux
 and Windows PowerShell; independent review closed both path-alias findings.
 Registration/file checks must be followed by actual loaded-module verification.
 
-**Current guest state:** signed .274 (`7d6412df`) is active with Code 0 after
+**.274 acceptance baseline:** signed .274 (`7d6412df`) was active with Code 0 after
 reboot under the owner's standing authorization. This WinBoat launch stops the
 container on guest reboot; `docker start WinBoat` resumes it. The installed
 bundle is `helios-windows-x64-22.22.274.0-7d6412df.zip`, SHA256
@@ -164,7 +164,7 @@ smoke cases** pass, including native/x86 D3D11 and D3D12 creation plus exact
 and `verify-274/`. The senior review below resolves the separate query probe's
 `S_FALSE` assertion; full conformance is not claimed.
 
-**Senior review repairs (.275, runtime acceptance pending):** full-change reviews
+**Senior review repairs (.275, accepted):** full-change reviews
 covered ABI/tables, lifetimes/concurrency, error propagation, deployment, and claim
 integrity. The review found and repaired these concrete defects:
 
@@ -195,9 +195,32 @@ both had exact source readback through the failure. The probe's resized windows
 now stay within the desktop work area so the taskbar cannot obscure the oracle.
 Source/readback plus
 host VNC, positive `ring_reclaims`, and no `SnQrF`/required-normalization refusals
-are the acceptance checks. The new status refusal counter is in the KMD gate;
-frame-gate and required-normalization failures are in the UMD gate. The .274
-rendering evidence above does not establish acceptance of these new changes.
+are the acceptance checks; .275 passes all of them. The new status refusal counter is in the KMD gate;
+frame-gate and required-normalization failures are in the UMD gate.
+
+**Current guest state:** signed .275 (`46f79f01`) is installed, rebooted, and Code 0.
+All five DriverStore images match the package's versions and SHA256 hashes;
+probe logs name those native/x86 UMD modules. Both architectures completed all
+**twelve resized geometries**, with four explicit ring reclamations apiece,
+exact source pixels, and zero final COM references. All eight 1x/4x UNORM/sRGB
+presentation cases and both query suites also pass. Independent host VNC grading
+checks **122 exact frames**, including every resized geometry and advancing frame
+serials; fixed phase-interior sampling excludes startup and resize transitions.
+The same DWM process survived the suite; `SnQrF` stayed absent before/after, and
+no frame-gate or required-normalization refusal appeared in the probe processes.
+All **14 installed-package smoke cases** pass, including native/x86 DX12 exact
+clear/readback. Submission-failure propagation was checked with actual-source
+fixtures, not a new guest fault injection.
+
+Bundle: `helios-windows-x64-22.22.275.0-46f79f01.zip`, SHA256
+`020e432234cc0068d747aaa5165f69a6e2c6d11388e54152022106e729b42ecb`.
+Its 44 manifest entries and catalog membership of all five driver images pass;
+594 DXVK source files and 18 linked archives were checked for provenance.
+Later `a5df271` only refines the external resize probe and comments/diagnosis;
+it changes no driver behavior. Raw evidence: `tmp/review-20260912/`, especially
+`resize-workarea274{,-vnc}/`, `acceptance275{,-vnc}/`, `verify-275/`, the before/after
+guest inventory, and build/catalog logs. Rollback state remains in
+`C:\ProgramData\Helios\wow64-evidence\before275`.
 
 **Open workload issues:** the owner reports PassMark's DX12 initialization dialog
 on .274 despite successful native/x86 D3D12 probes, and the DX11 score remains
