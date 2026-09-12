@@ -181,16 +181,20 @@ static ComPtr<ID3DBlob> compile(Module& compiler,const char* source,const char* 
     CHECK(hr); require(code != nullptr,"shader bytecode"); return code;
 }
 static int run(UINT samples,bool srgb,UINT seconds,bool resize) {
-    UINT width=1280,height=800;
+    const UINT initialWidth=resize?1248:1280,initialHeight=resize?704:800;
+    UINT width=initialWidth,height=initialHeight;
     DWORD session=0; require(ProcessIdToSessionId(GetCurrentProcessId(),&session) && session!=0,"interactive desktop session");
     require(SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)!=nullptr,"physical window coordinates");
     const int screenWidth=GetSystemMetrics(SM_CXSCREEN),screenHeight=GetSystemMetrics(SM_CYSCREEN);
-    require(screenWidth>=static_cast<int>(width) && screenHeight>=static_cast<int>(height),"1280x800 fits the primary screen");
+    require(screenWidth>=static_cast<int>(width) && screenHeight>=static_cast<int>(height),"initial dimensions fit the primary screen");
+    RECT area{0,0,screenWidth,screenHeight};
+    if (resize) require(SystemParametersInfoW(SPI_GETWORKAREA,0,&area,0),"primary work area");
+    require(area.right-area.left>=static_cast<LONG>(width) && area.bottom-area.top>=static_cast<LONG>(height),"probe fits unobscured work area");
     WNDCLASSW wc{}; wc.lpfnWndProc=window_proc; wc.hInstance=GetModuleHandleW(nullptr); wc.lpszClassName=L"HeliosMsaaPresent";
     require(RegisterClassW(&wc)!=0,"register window");
     wchar_t title[128]{}; swprintf_s(title,L"Helios D3D11 %ux %ls - native resolve/readback",samples,srgb?L"sRGB":L"UNORM");
     HWND window=CreateWindowExW(WS_EX_TOPMOST,wc.lpszClassName,title,WS_POPUP,
-        (screenWidth-static_cast<int>(width))/2,(screenHeight-static_cast<int>(height))/2,width,height,nullptr,nullptr,wc.hInstance,nullptr);
+        area.left+(area.right-area.left-static_cast<LONG>(width))/2,area.top+(area.bottom-area.top-static_cast<LONG>(height))/2,width,height,nullptr,nullptr,wc.hInstance,nullptr);
     require(window!=nullptr,"create visible window"); ShowWindow(window,SW_SHOW); pump(window);
     RECT rectangle{}; require(GetClientRect(window,&rectangle) && rectangle.right==static_cast<LONG>(width) && rectangle.bottom==static_cast<LONG>(height),"exact client size");
     POINT origin{}; require(ClientToScreen(window,&origin),"client origin");
@@ -272,7 +276,7 @@ static int run(UINT samples,bool srgb,UINT seconds,bool resize) {
             // ResizeBuffers. KMD presentation readers retire independently.
             pending=true; context->ClearState(); wait_gpu(device.Get(),context.Get(),event.Get(),window,pending);
             rtv.Reset(); staging.Reset(); resolved.Reset(); back.Reset();
-            ++geometry; width=1280-geometry*16; height=800-geometry*8;
+            ++geometry; width=initialWidth-geometry*16; height=initialHeight-geometry*8;
             require(SetWindowPos(window,nullptr,0,0,width,height,SWP_NOMOVE|SWP_NOZORDER),"resize visible window");
             CHECK(swap->ResizeBuffers(1,width,height,format,0));
             createBuffers();

@@ -2222,81 +2222,16 @@ pub(crate) unsafe fn engine_command_signature(
     unsafe { slot.load() }
 }
 
-/// `pfnCreateCommandSignature` — **IMPLEMENTED for the four native action classes,
-/// refused loudly for everything else.**
+/// Create action-only DRAW, DRAW_INDEXED, DISPATCH, or DISPATCH_MESH signatures.
+/// State-changing signatures are refused until the whole execution path supports
+/// them. The current Venus stack lacks EXT device-generated commands; vkd3d can
+/// still return S_OK for such a signature, then skip its draw or ignore its state.
+/// Its DGC-enabled path does implement state templates, so adding transport
+/// support also requires translating the DDI argument unions before lifting this
+/// refusal. See SUBSTRATE.md S10 and ROADMAP's PassMark DX12 diagnosis.
 ///
-/// # ⛔⛔ Why a partial implementation is the CORRECT answer here, and a full
-/// forward would be the dangerous one
-///
-/// `VK_EXT_device_generated_commands` is **absent on this guest** (zero occurrences
-/// in `docs/dx12/research/guest-vulkaninfo-full.txt`), and vkd3d's response to that
-/// is not a failure — it is a **silent downgrade**:
-///
-/// ```text
-///     if ((object->requires_state_template = requires_state_template))
-///     {
-///         if (!device->device_info.device_generated_commands_features.deviceGeneratedCommands)
-///         {
-///             FIXME("Device generated commands is not supported by implementation.\n");
-///             object->requires_state_template = false;
-///             goto out;                       // ← command.c:26447-26453, still S_OK
-///         }
-/// ```
-///
-/// and the paired `ExecuteIndirect` then discards the whole call:
-///
-/// ```text
-///     arg_buffer_offset += sig_impl->argument_buffer_offset_for_command;
-///     if (sig_impl->argument_buffer_offset_for_command)
-///     {
-///         d3d12_command_list_debug_mark_label(list, "DGC skip", …);
-///         return;                             // ← command.c:17811-17818
-///     }
-/// ```
-///
-/// ⇒ **a naive forward turns a loud `E_NOTIMPL` into an empty scene with a score.**
-/// That is exactly the failure shape this project has burned sessions on, and it is
-/// why the classification lives in the driver rather than being delegated to an
-/// engine that answers `S_OK` and then draws nothing.
-///
-/// ⚠ **And the offset check is not conditional on DGC**, which is why the refusal is
-/// keyed on the argument TYPES and not on "does the engine have DGC". Any signature
-/// with a non-action argument before its action has a non-zero
-/// `argument_buffer_offset_for_command` (`command.c:26306-26383` sets it to the byte
-/// offset of the action) and takes the skip above regardless. There is even a
-/// pathological middle case — `[CONSTANT{Num32BitValuesToSet: 0}, DRAW]`, whose
-/// offset stays 0 — where the draw *would* execute with the root constants silently
-/// unapplied. Keying on the types covers that one too.
-///
-/// # ⛔ The `DDI_REFERENCE.md` §14.2 argument this slot used to make is INVALID
-///
-/// Its previous doc closed with *"`DDI_REFERENCE.md` §14.2's 99-slot minimum-viable
-/// list does not include the command-signature triple"*, and `cmdlist.rs`'s
-/// `pfnExecuteIndirect` said the same. ⛔ **§14.0 of that same document forbids that
-/// reading in as many words**: *"treat a slot in 99-but-not-70 as 'not exercised
-/// yet', never as 'not needed'."* The list was being used as licence for the exact
-/// inference it rules out. What actually settles the priority is that every engine
-/// with GPU-driven rendering calls `CreateCommandSignature` **at startup**, so an
-/// `E_NOTIMPL` here is an init-time failure for a whole class of applications.
-///
-/// # ⭐ The two blockers the old doc named are both discharged
-///
-/// * the `D3D12DDI_INDIRECT_ARGUMENT_DESC` → `D3D12_INDIRECT_ARGUMENT_DESC`
-///   translation is [`indirect_argument_class`], and for the shapes this driver
-///   accepts it is only the `Type` field: an action desc's union arm is unused by
-///   both the API and the engine;
-/// * `hRootSignature`'s payload is **L6's, declared once, in `pso.rs`**, and
-///   `pso::root_signature` is already `pub(crate)`. Reading it from here is one call
-///   to that accessor, not a second declaration — `DECISIONS.md` D13 is satisfied,
-///   and the old doc's claim that it could not be is stale.
-///
-/// ⚠ The root signature is **forwarded as given**, including when it is non-null on
-/// an action-only signature — a case vkd3d answers `E_INVALIDARG`
-/// (`command.c:26421-26425`: *"Command signature does not require root signature"*).
-/// Passing `None` instead would make such a call succeed, and nothing semantic would
-/// be lost, but it would be this driver silently discarding something the
-/// application passed. `CommandSignatureRootSigUnexpected` counts it so the decision
-/// can be revisited with evidence rather than by preference.
+/// The root signature is forwarded unchanged. An unexpected root signature on an
+/// action-only signature remains an engine error and is counted.
 ///
 /// # Safety
 /// `h_device` must be a live handle from `device12::create_device`; `arg` must point

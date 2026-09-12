@@ -61,8 +61,8 @@ device, and PassMark ignored a later failed `CreateBuffer` before mapping NULL.
 The .273 source explicitly translates query kinds and legacy 64-byte statistics,
 keeps pending/error output untouched, and honors `DONOTFLUSH`. A native query
 regression probe reproduces removal on .272 in both architectures. PassMark
-now completes on the corrected loaded DLLs; the query probe still has a separate
-`S_FALSE` caller-buffer assertion pending (see current guest state below).
+now completes on the corrected loaded DLLs. The query probe initially failed a
+separate `S_FALSE` payload assertion, resolved in the senior review below.
 Seven pure query tests, both Windows UMD checks, and independent reviews pass.
 
 A separate DXVK worker-failure path could strand DWM's device destruction in a
@@ -161,8 +161,8 @@ smoke cases** pass, including native/x86 D3D11 and D3D12 creation plus exact
 65,536-pixel D3D12 clear/readback in each architecture. Evidence under
 `tmp/wow64-20260912/`: `msaa-fixed274{,-vnc}/`,
 `msaa-snapshot-off274{,-vnc}/`, `msaa-no-stream274/`, `passmark-274{,-vnc}/`,
-and `verify-274/`. Full conformance is not claimed: the separate query probe's
-`S_FALSE` caller-buffer assertion remains to be investigated.
+and `verify-274/`. The senior review below resolves the separate query probe's
+`S_FALSE` assertion; full conformance is not claimed.
 
 **Senior review repairs (.275, runtime acceptance pending):** full-change reviews
 covered ABI/tables, lifetimes/concurrency, error propagation, deployment, and claim
@@ -186,9 +186,14 @@ integrity. The review found and repaired these concrete defects:
 - The query probe incorrectly required the public API's `S_FALSE` payload to stay
   untouched. That requirement belongs to the DDI, where private staging and seven
   contract tests enforce it. The API probe now validates payload on `S_OK` and
-  always checks buffer canaries; its corrected guest run is still pending.
+  always checks buffer canaries. On .274 the corrected probe passes all sixteen
+  D3D11 query variants and legacy D3D10 pipeline statistics in x86 and x64.
 
-The resize probe adds twelve geometries in one process; source/readback plus
+The resize probe adds twelve geometries in one process. On .274 both architectures
+fail on the ninth geometry with the cache-limit and required-normalization refusal;
+both had exact source readback through the failure. The probe's resized windows
+now stay within the desktop work area so the taskbar cannot obscure the oracle.
+Source/readback plus
 host VNC, positive `ring_reclaims`, and no `SnQrF`/required-normalization refusals
 are the acceptance checks. The new status refusal counter is in the KMD gate;
 frame-gate and required-normalization failures are in the UMD gate. The .274
@@ -196,7 +201,17 @@ rendering evidence above does not establish acceptance of these new changes.
 
 **Open workload issues:** the owner reports PassMark's DX12 initialization dialog
 on .274 despite successful native/x86 D3D12 probes, and the DX11 score remains
-about 10 fps. Both need workload-specific diagnosis after review acceptance.
+about 10 fps. The DX12 log identifies the native `PT-D3D12Test64.exe`: device
+and root-signature creation succeed, then a two-argument state-changing
+`CreateCommandSignature` is refused with `E_NOTIMPL`. The current Venus
+protocol/ICD lacks EXT device-generated commands, and this process's vkd3d
+log confirms effective DGC is disabled. Without it, the engine can accept that
+signature and then skip its action or ignore its state; removing the UMD guard
+would produce incorrect rendering. There is no active NV or stateful-compute
+fallback. The proper fix is SUBSTRATE S10 transport support plus full DDI
+argument-union translation. The exact PassMark argument types are not logged;
+only the state-plus-action shape is established. Evidence:
+`tmp/review-20260912/umd12-4788{,-vkd3d}.log`. DX11 performance is not yet diagnosed.
 An independent preexisting conformance gap also remains: DXVK predication is
 stubbed, and SO-overflow predicate `QueryInterface(ID3D11Predicate)` fails. Query
 result translation alone does not claim predicate-controlled rendering support.
