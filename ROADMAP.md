@@ -198,7 +198,7 @@ host VNC, positive `ring_reclaims`, and no `SnQrF`/required-normalization refusa
 are the acceptance checks; .275 passes all of them. The new status refusal counter is in the KMD gate;
 frame-gate and required-normalization failures are in the UMD gate.
 
-**Current guest state:** signed .275 (`46f79f01`) is installed, rebooted, and Code 0.
+**.275 review acceptance:** signed .275 (`46f79f01`) was installed, rebooted, and Code 0.
 All five DriverStore images match the package's versions and SHA256 hashes;
 probe logs name those native/x86 UMD modules. Both architectures completed all
 **twelve resized geometries**, with four explicit ring reclamations apiece,
@@ -222,9 +222,37 @@ it changes no driver behavior. Raw evidence: `tmp/review-20260912/`, especially
 guest inventory, and build/catalog logs. Rollback state remains in
 `C:\ProgramData\Helios\wow64-evidence\before275`.
 
+**PassMark DX11 performance, 2026-09-12:** the local WinBoat guest now runs
+signed **22.22.276.0 / oem23.inf**, default enabled with no `UmdTimerRes`
+override. Profiling found Mesa's 1 ms polling delays taking roughly 10–11 ms
+on DXVK workers. Each DX11 device now owns a balanced 1 ms Windows timer
+request, released after its workers; API failures are counted and gated.
+Both native/x86 lifetime probes confirm the request takes effect and releases.
+The timer request can increase wakeups/power use while a DX11 device exists.
+
+Four clean alternating disabled/default runs score **11.4 / 20.6 / 10.9 /
+21.1**, averaging **11.15 → 20.85 (+87.0%)**. They use the same .276 binaries,
+settings and 1280×800 desktop, without tracing/capture. PassMark penalizes this
+resolution; the reported score is distinct from the roughly 31 FPS live scene.
+This RX 6600 / Ryzen 5 5600 machine is not the earlier 3DMark baseline.
+
+The signed bundle is `helios-windows-x64-22.22.276.0-bad9ff18.zip`, SHA256
+`90461b12568a32cc712b939fab369adb41872afcb2828eeaa6adbce38831ad32`.
+All five DriverStore versions/hashes and 44 manifest entries pass. After reboot,
+all twelve resize/query/MSAA cases pass, with exact pattern checks across **122 host VNC frames**,
+all twelve geometries per architecture and advancing serials. All **14 packaged
+smokes** pass, including native/x86 DX12 exact clear/readback. DWM survives,
+Code 0 remains, `SnQrF` stays absent and `QSpErr` stays zero. No timer,
+frame-gate or normalization failures appear in the tested DX11 processes.
+The source passed two dry whole-change review rounds; native/x86 builds and
+six timer-lifetime failure/unwind cases pass. Evidence and profiling detail:
+[PERFORMANCE_FEEDBACK.md](docs/PERFORMANCE_FEEDBACK.md#passmark-dx11-timer-resolution-2026-09-12),
+`tmp/passmark-perf-20260912/`. Rollback is saved under
+`C:\ProgramData\Helios\wow64-evidence\before276`.
+
 **Open workload issues:** the owner reports PassMark's DX12 initialization dialog
-on .274 despite successful native/x86 D3D12 probes, and the DX11 score remains
-about 10 fps. The DX12 log identifies the native `PT-D3D12Test64.exe`: device
+on .274 despite successful native/x86 D3D12 probes. The DX12 log identifies the
+native `PT-D3D12Test64.exe`: device
 and root-signature creation succeed, then a two-argument state-changing
 `CreateCommandSignature` is refused with `E_NOTIMPL`. The current Venus
 protocol/ICD lacks EXT device-generated commands, and this process's vkd3d
@@ -234,7 +262,8 @@ would produce incorrect rendering. There is no active NV or stateful-compute
 fallback. The proper fix is SUBSTRATE S10 transport support plus full DDI
 argument-union translation. The exact PassMark argument types are not logged;
 only the state-plus-action shape is established. Evidence:
-`tmp/review-20260912/umd12-4788{,-vkd3d}.log`. DX11 performance is not yet diagnosed.
+`tmp/review-20260912/umd12-4788{,-vkd3d}.log`. The timer fix above leaves this
+DX12 contract gap unchanged.
 An independent preexisting conformance gap also remains: DXVK predication is
 stubbed, and SO-overflow predicate `QueryInterface(ID3D11Predicate)` fails. Query
 result translation alone does not claim predicate-controlled rendering support.

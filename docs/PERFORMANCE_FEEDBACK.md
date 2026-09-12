@@ -1,5 +1,124 @@
 # DX11/DX12 performance investigation
 
+## PassMark DX11 timer resolution, 2026-09-12
+
+The local WinBoat guest now runs signed **22.22.276.0**, with a measured DX11
+improvement: alternating disabled/default-enabled runs score **11.4 / 20.6 /
+10.9 / 21.1**. The means are **11.15 → 20.85 (+87.0%)**; individual paired gains
+are +80.7% and +93.6%. This is four completed runs, not a confidence interval or
+a native-GPU performance claim. PassMark DX12's stateful command-signature
+refusal remains open; this change does not implement device-generated commands.
+
+This machine has a Ryzen 5 5600 and Radeon RX 6600 (RADV NAVI23, host Mesa
+26.2.2), with four guest vCPUs and 12 GB RAM. It is a separate configuration
+from the earlier 3DMark measurements below. The actual workload is the **32-bit
+`PT-D3D11Test.exe`** launched by PerformanceTest64 in interactive session 2.
+The 1280×800 desktop and benchmark settings stayed fixed. These reported
+PassMark results include its low-resolution penalty; the live scene displays
+about 31 FPS with the fix. Do not compare the penalized result directly with
+raw callback throughput.
+
+| Clean run order | `UmdTimerRes` | Reported DX11 result | Successful Presents |
+|---|---|---:|---:|
+| off1-276 | 0 | 11.4 | 484 |
+| on1-276 | absent: shipping default | 20.6 | 879 |
+| off2-276 | 0 | 10.9 | 463 |
+| on2-276 | absent: shipping default | 21.1 | 902 |
+
+All four use the same installed .276 binaries and complete HTML exports.
+Their final benchmark UMD log incarnation names the same DriverStore x86
+module and the expected knob value, with matching Render/Present attempts
+and successes and no frame-gate, normalization or timer failures. CPU tracing,
+feed tracing and VNC capture were disabled for this alternating comparison.
+
+### Cause and independent profile check
+
+CPU context-switch traces identified long `DelayExecution` waits in both the
+DXVK CS worker and its completion worker. A separate noninvasive 32-bit CDB
+stack capture puts both in `KERNELBASE!Sleep`; the exact installed ICD's return
+PC maps to Mesa `os_time_sleep`, and the completion path also maps to `vn_relax`.
+The main thread is waiting in the runtime's Present callback. A temporary
+process-local `timeBeginPeriod(1)` diagnostic increased active throughput from
+roughly 16 to 31 FPS, motivating the production change.
+
+Separate before/after CPU/feed profiles confirm the intended wait reduction.
+Both ETW traces have zero lost events/buffers. The comparison uses their first
+7.5 seconds, with only complete 5 ms feed bins (7.495 seconds). Neither compared
+run has a VNC collector. The earlier after trace (`trace276`) is retained as
+capture evidence; `trace276-clean` supplies the after numbers below.
+
+| Diagnostic measurement | .275 | .276 default |
+|---|---:|---:|
+| CS `DelayExecution`, mean / median | 10.20 / 11.20 ms | 1.51 / 1.48 ms |
+| Completion `DelayExecution`, mean / median | 10.73 / 11.18 ms | 1.62 / 1.62 ms |
+| CS delay count / total | 283 / 2885.9 ms | 308 / 463.6 ms |
+| Completion delay count / total | 407 / 4366.7 ms | 1060 / 1713.9 ms |
+| Present callback wall time per frame | 38.52 ms | 20.03 ms |
+| CS work wall time per frame | 41.32 ms | 23.42 ms |
+| Raw Presents / second | 19.61 | 30.55 |
+
+Delay measurements are complete observed off-CPU intervals, including
+wake-to-run scheduling; waits crossing the window boundary are excluded.
+These worker intervals overlap and include waiting; do not sum them or call
+them GPU execution time. The diagnostic FPS is distinct from the clean full-run
+results. The fix does not bypass frame completion, snapshots, resolves or
+synchronization. Remaining CPU work and the resolution penalty are not solved
+by requesting finer timers; further optimization needs fresh attribution.
+
+### Implementation, cleanup and acceptance
+
+Each DX11 bridge device owns a balanced 1 ms timer request, declared before its
+DXVK members so it outlives worker destruction and partial initialization.
+Successful requests receive one `timeEndPeriod(1)`; failed requests receive
+none. API failures are counted, logged and included in the UMD failure gate.
+`HKLM\SOFTWARE\Helios\UmdTimerRes=0` disables this driver's request for new
+processes; the absent default is enabled and the override was removed afterward.
+Other code can independently request fine timers. Microsoft documents the
+[matched request contract](https://learn.microsoft.com/en-us/windows/win32/api/timeapi/nf-timeapi-timebeginperiod)
+and Windows 11's possible reduction of timer resolution for fully occluded
+processes. More frequent timer wakeups while a DX11 device exists are a power
+and scheduling tradeoff; this change does not disable Windows' occlusion policy.
+
+A real D3D11 device-lifetime probe measured average `Sleep(1)` duration before,
+during and after release: **14.81 / 1.90 / 15.17 ms (x86)** and **15.46 / 1.89 /
+15.16 ms (x64)**, with zero remaining COM references. On .275 the same probe
+stayed around 15 ms throughout. An actual-source fixture separately exercises
+six success/failure/unwind/overlap cases. Both architectures build with WinMM
+imports; the gate's literal failure patterns were exercised. Whole-change
+review completed two dry rounds with different lenses after repairing a gate
+pattern that initially used regex syntax in a literal substring matcher.
+
+All twelve resize/query/MSAA cases pass on the installed .276 drivers.
+Independent host VNC grading checks the complete pattern body across **122
+captured frames**, all twelve resized geometries in each architecture,
+sRGB midpoint 188, UNORM midpoint 128,
+and advancing serials. The bottom 16-pixel serial strip is decoded separately;
+window borders and the surrounding desktop are outside the exact pattern oracle.
+Both resize runs reclaim four idle rings. All **14 packaged smoke cases** pass,
+including native/x86 DX12 clear/readback of 65536
+exact pixels each. The same DWM process (PID 5000) survives, the device remains
+Code 0, all five DriverStore hashes/versions stay correct, `SnQrF` stays absent
+and `QSpErr` stays zero. A separate PassMark host capture shows changing terrain,
+buildings and translucent objects
+without the earlier scrambling; it is visual progress evidence, not an exact
+reference oracle for the benchmark.
+
+The signed bundle is `helios-windows-x64-22.22.276.0-bad9ff18.zip`, SHA256
+`90461b12568a32cc712b939fab369adb41872afcb2828eeaa6adbce38831ad32`.
+It was built from `bad9ff18`; all 44 manifest entries and catalog membership
+of all five driver images pass. The unchanged DXVK engine's 594 source inputs
+and 18 linked archives were revalidated. Rollback state is saved under
+`C:\ProgramData\Helios\wow64-evidence\before276`.
+
+Evidence lives in `tmp/passmark-perf-20260912/`: `ab-summary.json`, the four
+run directories and original exports, `profile-comparison.json`, `trace275/`,
+`trace276{,-clean}/`, `stacks275/`, `lifetime27{5,6}/`, `acceptance276{,-vnc}/`,
+`verify-276/`, and build, manifest, catalog and guest-inventory records.
+Production commits are
+`b02260e` (timer lifetime) and `bad9ff18` (version stamp).
+
+## Earlier 3DMark investigation, 2026-09-06
+
 **Steel Nomad Vulkan is repaired and the measured submission retry improvement
 is deployed in .270/oem53.inf**, enabled by default with no override. Code 0,
 the desktop and all four native runtime ordering cases pass.
