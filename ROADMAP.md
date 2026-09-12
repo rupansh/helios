@@ -75,16 +75,44 @@ after activating .273 before assigning its cause.
 
 All four .273 UMDs and the KMD built, linked, passed PE/export/CRT checks, and
 were signed before catalog generation. Catalog membership and all 44 package
-manifest entries passed. A registration-only ProgramData trial did **not** load
-the new DLLs: fresh processes still logged the cached .272 DriverStore paths.
-Use normal package activation and verify the loaded module, not just registry
-contents. During rollback, a preexisting `New-Item -Force` helper was found to
-replace the whole class key rather than preserve neighboring values. Repair and
-real Windows registry regression coverage are in progress; the same unsafe
-pattern in Khronos registration must preserve other vendors too. The same-INF
-PnP repair restored the INF entries but the adapter reported Code 31; standard
-metadata recovery and final package activation remain pending. Do not treat
-these source/build checks as a successful PassMark run.
+manifest entries passed. The installed bundle is
+`helios-windows-x64-22.22.273.0-5de1710e.zip`, SHA256
+`fd1df48752b2457bb9fe0af238d3bb2cb609d6d0c59dd3b25901594c7a133474`.
+The runtime build remains `f7d477e0`; `5de1710e` adds the reviewed registry
+scripts. `runtime-source-equivalence.json` records the checked source difference,
+and `engine-inputs.json` preserves the original linked archive provenance.
+
+A registration-only ProgramData trial did **not** load the new DLLs: fresh
+processes still logged cached .272 DriverStore paths. During rollback, a
+preexisting `New-Item -Force` helper replaced the entire class key, deleting
+neighboring metadata. The same-INF PnP repair restored INF entries; missing
+standard metadata was then recovered from current PnP properties and the verified
+.272 INF, and WGL paths from hash-verified installed files. The temporary override
+and its certificate trust were removed. The repaired helper preserves keys and
+creates missing ancestors without Force; all seven unsafe sites in package/ICD/
+knob tools were repaired. Real registry tests and independent checks passed on
+PS7 x64 and PS5 x64/x86, including typed neighbors, child keys and ACLs; the old
+helper fails the negative control. CI runs the regression in both shells.
+
+Native UMD hotplug also overwrote DX12 slot 3 during DX11-only updates and
+silently wrote DriverStore in ProgramData mode. It now preserves DX12/WoW64,
+verifies the resulting inventory, and keeps ProgramData updates outside
+DriverStore, including junction/path aliases. Its 31-case harness passed Linux
+and Windows PowerShell; independent review closed both path-alias findings.
+Registration/file checks must be followed by actual loaded-module verification.
+
+**Current guest state:** .273 is staged as `oem14.inf`; installer exit **3010**.
+All runtime/DriverStore file and native/WoW64 registration checks pass, but the
+adapter still reports **Code 31 / 0xc000000e** after the same-INF restart. A new
+owner-approved reboot is required before further GPU testing; none was performed
+during this upgrade. The old .272 signed package remains available, with manager
+state/scripts under `C:\ProgramData\Helios\wow64-evidence\before273` and repaired
+registration evidence under `registry-repair`. The installed common helper is the
+fixed one. No PassMark IFEO debugger override remains. After reboot, verify
+activation, run `Helios-WoW64-Query273`, then the clean interactive
+`Helios-WoW64-PassMark273` task and capture visible frames via host VNC. Do not
+count the registration-only trial as exercising .273 or report a PassMark score
+before the real workload completes.
 
 ## Metadata consistency, 2026-09-12
 
