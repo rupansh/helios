@@ -1,4 +1,12 @@
-// tools/d3d12_bridge_probe.cpp — gate D12-G1, the engine gate.
+// tools/d3d12_bridge_probe.cpp — D12-G1 engine gate and native DDI draw acceptance.
+//
+// -DHELIOS_G1_NATIVE selects the Windows-runtime arm: load d3d12.dll and
+// dxgi.dll from the system directory, select the Helios hardware adapter, and
+// call D3D12CreateDevice. It exercises the shipping DDI's shader/PSO/draw path
+// with the same offscreen workload and pixel checks as the engine arms below.
+// Build both native architectures with tools/build-d3d12-draw-probe.ps1.
+// Run d3d12-draw.exe without arguments in the logged-in desktop session.
+// The remaining historical engine-arm description applies without this define.
 //
 // Proves the engine path `umd12` will actually use, one layer BELOW the DDI:
 //
@@ -71,6 +79,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
+#if defined(HELIOS_G1_NATIVE)
+#include <dxgi1_4.h>
+#endif
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -82,7 +93,42 @@
 // ---- the two Helios entry points (DECISIONS.md D4) --------------------------
 // Same functions, same signatures, in both arms — D4 changed only their
 // delivery, from a DLL export to an archive symbol.
-#if defined(HELIOS_G1_STATIC)
+#if defined(HELIOS_G1_NATIVE)
+#if defined(HELIOS_G1_STATIC) || defined(HELIOS_G1_UMD12)
+#error Select only one D3D12 probe arm.
+#endif
+static PFN_D3D12_CREATE_DEVICE g_runtime_create;
+static PFN_D3D12_SERIALIZE_ROOT_SIGNATURE g_runtime_serialize;
+typedef HRESULT(WINAPI *PFN_RUNTIME_FACTORY)(REFIID iid, void **factory);
+static PFN_RUNTIME_FACTORY g_runtime_factory;
+
+static HRESULT runtime_create_device(LUID luid, REFIID iid, void **out)
+{
+    if (iid != __uuidof(ID3D12Device)) return E_NOINTERFACE;
+    *out = nullptr;
+    IDXGIFactory4 *factory = nullptr;
+    HRESULT hr = g_runtime_factory(__uuidof(IDXGIFactory4), (void **)&factory);
+    if (FAILED(hr)) return hr;
+    IDXGIAdapter1 *adapter = nullptr;
+    hr = factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter1), (void **)&adapter);
+    factory->Release();
+    if (FAILED(hr)) return hr;
+    hr = g_runtime_create(adapter, D3D_FEATURE_LEVEL_11_0, iid, out);
+    adapter->Release();
+    if (SUCCEEDED(hr)) {
+        ID3D12Device *device = (ID3D12Device *)*out;
+        if (!device) return E_FAIL;
+        const LUID actual = device->GetAdapterLuid();
+        if (actual.LowPart != luid.LowPart || actual.HighPart != luid.HighPart) {
+            device->Release();
+            *out = nullptr;
+            return E_FAIL;
+        }
+    }
+    return hr;
+}
+
+#elif defined(HELIOS_G1_STATIC)
 extern "C" HRESULT helios_vkd3d_create_device(LUID adapter_luid, REFIID iid, void **device);
 extern "C" HRESULT helios_vkd3d_serialize_root_signature(
         const D3D12_ROOT_SIGNATURE_DESC *desc, D3D_ROOT_SIGNATURE_VERSION version,
@@ -249,6 +295,35 @@ static void dump_caps(ID3D12Device *dev)
            (unsigned long)l.HighPart, (unsigned long)l.LowPart);
 }
 
+#if defined(HELIOS_G1_NATIVE)
+static bool find_helios_luid(LUID *out, wchar_t *name_out, size_t name_cch)
+{
+    IDXGIFactory4 *factory = nullptr;
+    if (FAILED(g_runtime_factory(__uuidof(IDXGIFactory4), (void **)&factory))) return false;
+    bool found = false;
+    for (UINT index = 0; ; ++index) {
+        IDXGIAdapter1 *adapter = nullptr;
+        const HRESULT hr = factory->EnumAdapters1(index, &adapter);
+        if (hr == DXGI_ERROR_NOT_FOUND) break;
+        if (FAILED(hr)) break;
+        DXGI_ADAPTER_DESC1 desc = {};
+        if (SUCCEEDED(adapter->GetDesc1(&desc))) {
+            printf("       adapter[%u] luid=%08lx:%08lx flags=0x%x desc=%ls\n", index,
+                   (unsigned long)desc.AdapterLuid.HighPart, (unsigned long)desc.AdapterLuid.LowPart,
+                   desc.Flags, desc.Description);
+            if (!(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) && wcsstr(desc.Description, L"Helios")) {
+                *out = desc.AdapterLuid;
+                wcsncpy_s(name_out, name_cch, desc.Description, _TRUNCATE);
+                found = true;
+            }
+        }
+        adapter->Release();
+        if (found) break;
+    }
+    factory->Release();
+    return found;
+}
+#else
 // ---- D3DKMT adapter enumeration (replaces DXGI; see the dxgi.lib note above) --
 //
 // Hand-declared rather than #include <d3dkmthk.h> for the same reason
@@ -390,10 +465,39 @@ static bool find_helios_luid(LUID *out, wchar_t *name_out, size_t name_cch)
     free(ea.pAdapters);
     return found;
 }
+#endif
 
 int main(int argc, char **argv)
 {
-#if defined(HELIOS_G1_STATIC)
+#if defined(HELIOS_G1_NATIVE)
+    (void)argv;
+    setvbuf(stdout, nullptr, _IONBF, 0);
+    printf("d3d12-draw - Windows D3D12 runtime arm (%u-bit)\n", (unsigned)(sizeof(void *) * 8));
+    if (argc != 1) { FAILSTEP("native runtime arm takes no arguments%s", ""); return 1; }
+    DWORD session = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &session) || session == 0) {
+        FAILSTEP("run in the logged-in desktop session (session=%lu)", session);
+        return 1;
+    }
+    HMODULE runtime = LoadLibraryExW(L"d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    HMODULE dxgi = LoadLibraryExW(L"dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!runtime || !dxgi) { FAILSTEP("load Windows D3D12/DXGI runtime -> %lu", GetLastError()); return 1; }
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(runtime, path, ARRAYSIZE(path));
+    STEP("Windows D3D12 runtime loaded from %ls", path);
+    GetModuleFileNameW(dxgi, path, ARRAYSIZE(path));
+    printf("       Windows DXGI runtime loaded from %ls\n", path);
+    g_runtime_create = (PFN_D3D12_CREATE_DEVICE)GetProcAddress(runtime, "D3D12CreateDevice");
+    g_runtime_serialize = (PFN_D3D12_SERIALIZE_ROOT_SIGNATURE)GetProcAddress(runtime, "D3D12SerializeRootSignature");
+    g_runtime_factory = (PFN_RUNTIME_FACTORY)GetProcAddress(dxgi, "CreateDXGIFactory1");
+    if (!g_runtime_create || !g_runtime_serialize || !g_runtime_factory) {
+        FAILSTEP("Windows runtime entry point missing -> %lu", GetLastError());
+        return 1;
+    }
+    auto create_device = &runtime_create_device;
+    auto serialize_rs = g_runtime_serialize;
+    STEP("Windows runtime entry points resolved%s", "");
+#elif defined(HELIOS_G1_STATIC)
     (void)argc; (void)argv;
     printf("d3d12_bridge_probe — D12-G1 engine gate (STATIC arm, DECISIONS.md D4)\n");
     printf("       engine = statically linked (libhelios_d3d12_static.a); no engine DLL\n");
@@ -504,7 +608,7 @@ int main(int argc, char **argv)
     LUID luid = {};
     wchar_t adapter_name[128] = L"(none)";
     if (!find_helios_luid(&luid, adapter_name, ARRAYSIZE(adapter_name))) {
-        FAILSTEP("no adapter served by helios_umd.dll found via D3DKMT%s", "");
+        FAILSTEP("no Helios hardware adapter found%s", "");
         return 1;
     }
     STEP("Helios adapter luid=%08lx:%08lx name=%ls",
@@ -513,7 +617,11 @@ int main(int argc, char **argv)
     // ---- 3. the device, through the Helios export ---------------------------
     ID3D12Device *dev = nullptr;
     HRESULT hr = create_device(luid, __uuidof(ID3D12Device), (void **)&dev);
+#if defined(HELIOS_G1_NATIVE)
+    if (!check(hr, "D3D12CreateDevice(Helios, FL11_0, IID_ID3D12Device)")) return 1;
+#else
     if (!check(hr, "helios_vkd3d_create_device(IID_ID3D12Device)")) return 1;
+#endif
     dump_caps(dev);
 
     // ---- 4. queue / allocator / list ----------------------------------------
@@ -534,7 +642,7 @@ int main(int argc, char **argv)
     rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
     ID3DBlob *rs_blob = nullptr, *rs_err = nullptr;
     if (!check(serialize_rs(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, &rs_err),
-               "helios_vkd3d_serialize_root_signature")) {
+               "serialize_root_signature")) {
         if (rs_err) printf("       serializer said: %.*s\n",
                            (int)rs_err->GetBufferSize(), (const char *)rs_err->GetBufferPointer());
         return 1;
@@ -557,9 +665,25 @@ int main(int argc, char **argv)
     pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
     pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     pd.RasterizerState.DepthClipEnable = TRUE;
+    // Use legal enum values even for disabled operations: the native Windows
+    // runtime validates this descriptor before it reaches the engine.
+    pd.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+    pd.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_ZERO;
+    pd.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+    pd.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    pd.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+    pd.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    pd.BlendState.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_NOOP;
     pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     pd.DepthStencilState.DepthEnable = FALSE;
+    pd.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    pd.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     pd.DepthStencilState.StencilEnable = FALSE;
+    pd.DepthStencilState.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    pd.DepthStencilState.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    pd.DepthStencilState.FrontFace = { D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP,
+                                     D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS };
+    pd.DepthStencilState.BackFace = pd.DepthStencilState.FrontFace;
     pd.SampleMask = UINT_MAX;
     pd.NumRenderTargets = 1;
     pd.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -681,6 +805,7 @@ int main(int argc, char **argv)
     if (!check(dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), (void **)&fence),
                "CreateFence")) return 1;
     HANDLE ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!ev) { FAILSTEP("CreateEventW -> %lu", GetLastError()); return 1; }
     if (!check(queue->Signal(fence, 1), "queue->Signal(1)")) return 1;
     if (!check(fence->SetEventOnCompletion(1, ev), "SetEventOnCompletion")) return 1;
     DWORD w = WaitForSingleObject(ev, 10000);
@@ -721,9 +846,6 @@ int main(int argc, char **argv)
     D3D12_RANGE none = { 0, 0 };
     rb->Unmap(0, &none);
 
-    printf("\nD12-G1 %s — %d failure(s) across %d steps\n",
-           g_failures ? "FAIL" : "PASS", g_failures, g_step);
-
     // Release in reverse order; a clean teardown is part of the gate (a hang or
     // a crash here is a real finding for the UMD, which tears devices down
     // constantly — see the six-handles-per-device leak, memory 54th).
@@ -740,5 +862,11 @@ int main(int argc, char **argv)
     printf("       device final Release() -> refcount %lu (0 expected)\n", left);
     if (left != 0) g_failures++;
 
+#if defined(HELIOS_G1_NATIVE)
+    printf("\nWindows D3D12 draw %s - %d failure(s) across %d steps\n",
+#else
+    printf("\nD12-G1 %s — %d failure(s) across %d steps\n",
+#endif
+           g_failures ? "FAIL" : "PASS", g_failures, g_step);
     return g_failures ? 1 : 0;
 }
