@@ -1,6 +1,7 @@
 //! Platform-neutral query translation and publication rules.
 //! The WDK/API constants and layouts are checked against this table in queries.rs.
-//! Run without a Windows linker: rustc --test query_contract.rs -o <test-path>.
+//! Run without a Windows linker:
+//! rustc --edition 2021 --test query_contract.rs -o <test-path>.
 
 use core::ffi::c_void;
 use core::mem::MaybeUninit;
