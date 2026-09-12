@@ -22,6 +22,11 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "Initialize-HeliosBuild.ps1")
+. (Join-Path $RepoRoot "metadata\Read-HeliosMetadata.ps1")
+$metadata = Read-HeliosMetadata $RepoRoot
+if ($Version -ne $metadata.HELIOS_KMD_VERSION) {
+    throw "Package version $Version differs from kmd_render/driver-version.env ($($metadata.HELIOS_KMD_VERSION))."
+}
 Import-VisualStudioEnvironment
 
 function Copy-Required([string]$Source, [string]$Destination) {
@@ -51,6 +56,13 @@ foreach ($script in @("Install-Helios.cmd", "Install-Helios.ps1", "Uninstall-Hel
 $driverOut = Join-Path $payload "driver"
 foreach ($name in @("helios_kmd_render.inf", "helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll", "toolchain.json")) {
     Copy-Required (Join-Path $DriverArtifact $name) (Join-Path $driverOut $name)
+}
+foreach ($name in @("helios_kmd_render.sys", "helios_umd.dll", "helios_umd12.dll")) {
+    $info = (Get-Item -LiteralPath (Join-Path $driverOut $name)).VersionInfo
+    if ($info.FileVersion -ne $Version -or $info.ProductVersion -ne $Version -or
+        $info.ProductName -ne $metadata.HELIOS_PRODUCT -or $info.CompanyName -ne $metadata.HELIOS_PUBLISHER) {
+        throw "$name has stale version/branding resources. Rebuild all three driver images from this checkout."
+    }
 }
 foreach ($optional in @("helios_kmd_render.pdb", "helios_kmd_render.map", "helios_umd.pdb", "helios_umd12.pdb")) {
     $source = Join-Path $DriverArtifact $optional
@@ -127,7 +139,7 @@ $signTool = Find-WindowsKitTool "signtool.exe"
 $catalog = Join-Path $driverOut "helios_kmd_render.cat"
 Remove-Item -LiteralPath $catalog -Force -ErrorAction SilentlyContinue
 
-$subject = "CN=Helios GitHub CI Test Signing $shortCommit"
+$subject = "CN=$($metadata.HELIOS_PUBLISHER) $($metadata.HELIOS_PRODUCT) GitHub CI Test Signing $shortCommit"
 $certificate = New-SelfSignedCertificate `
     -Type CodeSigningCert `
     -Subject $subject `
@@ -180,6 +192,8 @@ foreach ($file in Get-ChildItem -LiteralPath $stagingRoot -File -Recurse | Where
 
 $manifest = [ordered]@{
     schemaVersion = 1
+    productName = $metadata.HELIOS_PRODUCT
+    publisher = $metadata.HELIOS_PUBLISHER
     packageId = $packageId
     version = $Version
     architecture = "x64"

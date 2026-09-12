@@ -1282,6 +1282,7 @@ pub unsafe extern "C" fn dxgkddi_get_node_metadata(
     // IoMmu are mutually exclusive.
     node.GpuMmuSupported = BOOLEAN::from(SURFACE.gpu_mmu());
     node.IoMmuSupported = 0;
-    // FriendlyName, Flags stay zeroed.
+    // WDK requires an empty FriendlyName for standard engines such as 3D;
+    // custom names are for DXGK_ENGINE_TYPE_OTHER. Flags stay zeroed.
     STATUS_SUCCESS
 }

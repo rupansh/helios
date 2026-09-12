@@ -30,6 +30,10 @@ pub const DEFAULT_MODE_WIDTH: u32 = 1920;
 pub const DEFAULT_MODE_HEIGHT: u32 = 1080;
 const REFRESH_HZ: u32 = 60;
 
+mod monitor_metadata {
+    include!(concat!(env!("OUT_DIR"), "/monitor_metadata.rs"));
+}
+
 /// Build a valid EDID 1.4 (checksum `sum % 256 == 0`) whose preferred detailed
 /// timing (DTD1) is exactly `w × h @ ~60 Hz`. `DxgkDdiQueryDeviceDescriptor` serves
 /// this so the OS builds a REAL monitor (not the EDID-less "default monitor") —
@@ -40,68 +44,15 @@ const REFRESH_HZ: u32 = 60;
 /// (cofunctional). QEMU's virtio-gpu display is not a real panel, so the timing
 /// only needs valid structure + active-pixel fields — Windows reads HActive/VActive
 /// for the native mode and validates the header/checksum, not the electrical clock.
-pub fn build_edid(w: u32, h: u32) -> [u8; 128] {
-    let mut e = [0u8; 128];
-    // Header + manufacturer "HLS" (5-bit letters, A=1) + product 0x0001.
-    e[0..8].copy_from_slice(&[0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00]);
-    let mfg: u16 = (8 << 10) | (12 << 5) | 19;
-    e[8] = (mfg >> 8) as u8;
-    e[9] = (mfg & 0xFF) as u8;
-    e[10] = 0x01;
-    e[16] = 1; // week
-    e[17] = 34; // year 1990+34 = 2024
-    e[18] = 1; // EDID 1.4
-    e[19] = 4;
-    e[20] = 0xA5; // digital, 8bpc, DisplayPort
-    e[21] = 51; // max h image size (cm)
-    e[22] = 29; // max v image size (cm)
-    e[23] = 120; // gamma 2.2
-    e[24] = 0x02; // features: preferred timing is native
-    e[25..35].copy_from_slice(&[0xEE, 0x95, 0xA3, 0x54, 0x4C, 0x99, 0x26, 0x0F, 0x50, 0x54]);
-    // Standard timings unused (0x0101 × 8).
-    for b in e.iter_mut().take(54).skip(38) {
-        *b = 0x01;
-    }
-    // Detailed Timing Descriptor 1 (bytes 54..72): w × h, ~60 Hz.
-    let hb: u32 = ((w / 4) & !7).max(160); // horizontal blanking
-    let vb: u32 = 45; // vertical blanking
-    let ht = w + hb;
-    let vt = h + vb;
-    let pc = ((ht as u64 * vt as u64 * 60) / 10_000).clamp(1, 0xFFFF) as u32; // pixel clock /10 kHz
-    let hfp = (hb / 3).min(88);
-    let hsw = (hb / 5).min(44);
-    let (vfp, vsw) = (3u32, 5u32);
-    let d = &mut e[54..72];
-    d[0] = (pc & 0xFF) as u8;
-    d[1] = (pc >> 8) as u8;
-    d[2] = (w & 0xFF) as u8;
-    d[3] = (hb & 0xFF) as u8;
-    d[4] = ((((w >> 8) & 0xF) << 4) | ((hb >> 8) & 0xF)) as u8;
-    d[5] = (h & 0xFF) as u8;
-    d[6] = (vb & 0xFF) as u8;
-    d[7] = ((((h >> 8) & 0xF) << 4) | ((vb >> 8) & 0xF)) as u8;
-    d[8] = (hfp & 0xFF) as u8;
-    d[9] = (hsw & 0xFF) as u8;
-    d[10] = (((vfp & 0xF) << 4) | (vsw & 0xF)) as u8;
-    d[17] = 0x1E; // digital separate sync, +H +V
-                  // Descriptor 2: monitor range limits (0xFD).
-    e[72..90].copy_from_slice(&[
-        0x00, 0x00, 0x00, 0xFD, 0x00, 0x32, 0x4B, 0x1E, 0x50, 0x14, 0x00, 0x0A, 0x20, 0x20, 0x20,
-        0x20, 0x20, 0x20,
-    ]);
-    // Descriptor 3: monitor name "Helios" (0xFC).
-    e[90..95].copy_from_slice(&[0x00, 0x00, 0x00, 0xFC, 0x00]);
-    let name = b"Helios\n";
-    e[95..95 + name.len()].copy_from_slice(name);
-    for b in e.iter_mut().take(108).skip(95 + name.len()) {
-        *b = 0x20;
-    }
-    // Descriptor 4: unused (0x10).
-    e[108..113].copy_from_slice(&[0x00, 0x00, 0x00, 0x10, 0x00]);
-    // Byte 126 = extension count (0). Byte 127 = checksum: sum of all 128 == 0 mod 256.
-    let sum: u32 = e[..127].iter().map(|&b| b as u32).sum();
-    e[127] = ((256 - (sum % 256)) % 256) as u8;
-    e
+/// Returns None when the base block cannot represent the extent/clock.
+pub fn build_edid(w: u32, h: u32) -> Option<[u8; 128]> {
+    helios_kmd_logic::edid::build_edid(
+        w,
+        h,
+        monitor_metadata::NAME,
+        monitor_metadata::PUBLISHER,
+        monitor_metadata::MODEL_YEAR,
+    )
 }
 
 /// Stable container id for the virtual monitor devnode (DxgkDdiGetChildContainerId).

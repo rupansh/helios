@@ -33,6 +33,9 @@ DLLs. Vulkan and OpenCL coexist with other vendors through their standard ICD
 registries. OpenGL is registered only on the Helios display adapter software
 key.
 
+An installed Visual C++ x64 runtime at least as new as the bundled version is
+kept. Otherwise, setup runs the bundled redistributable installer.
+
 If the virtio-gpu device is using Red Hat's `viogpudo` driver, desktop setup
 shows a Yes/No dialog (default No) before uninstalling that driver package and
 replacing it with Helios. A remote console uses the equivalent `[y/N]` prompt.

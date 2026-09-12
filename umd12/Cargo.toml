@@ -1,8 +1,9 @@
 [package]
+authors = ["WinBoat"]
 name = "helios_umd12"
 version = "0.1.0"
 edition = "2021"
-description = "Helios vGPU WDDM D3D12 user-mode display driver (skeleton; OpenAdapter12 refuses)."
+description = "Helios vGPU Direct3D 12 User-Mode Driver"
 
 [lib]
 # The second cdylib. `DECISIONS.md` D3: `helios_umd.dll` keeps

@@ -15,6 +15,8 @@ mesa_src="${repo_root}/icd/mesa"
 native_file="${repo_root}/ci/windows/mingw-native.ini"
 compat_header="${repo_root}/icd/win-build/helios_win_compat.h"
 
+python "${repo_root}/tools/sync-metadata.py" --check
+
 setup_mode=()
 case "${build_mode}" in
   --clean)

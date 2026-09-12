@@ -54,7 +54,7 @@ function Get-HeliosDeviceInstanceId {
     $presentDevices = @(Get-PnpDevice -PresentOnly -ErrorAction SilentlyContinue |
         Where-Object { $_.InstanceId -like "PCI\VEN_1AF4&DEV_1050*" })
     $device = $presentDevices |
-        Where-Object { $_.FriendlyName -like "Helios vGPU Render Adapter*" } |
+        Where-Object { $_.FriendlyName -like "Helios*" } |
         Select-Object -First 1
     if (-not $device) {
         $device = $presentDevices | Select-Object -First 1
@@ -62,7 +62,7 @@ function Get-HeliosDeviceInstanceId {
     if ($device) { return [string]$device.InstanceId }
 
     $device = Get-CimInstance Win32_PnPEntity |
-        Where-Object { $_.PNPDeviceID -like "PCI\VEN_1AF4&DEV_1050*" -and $_.Name -like "Helios vGPU Render Adapter*" } |
+        Where-Object { $_.PNPDeviceID -like "PCI\VEN_1AF4&DEV_1050*" -and $_.Name -like "Helios*" } |
         Select-Object -First 1
     if (-not $device) {
         $device = Get-CimInstance Win32_PnPEntity |
@@ -209,4 +209,14 @@ function Write-HeliosJson(
     $temporary = "$Path.tmp"
     $Value | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $temporary -Encoding $Encoding
     Move-Item -LiteralPath $temporary -Destination $Path -Force
+}
+
+# Old bundles predate explicit publisher metadata. Keep their known identity for
+# upgrade/uninstall verification; new bundles carry the publisher from the source.
+function Get-HeliosPackagePublisher($Package) {
+    if ($Package.PSObject.Properties["publisher"] -and
+        -not [string]::IsNullOrWhiteSpace([string]$Package.publisher)) {
+        return [string]$Package.publisher
+    }
+    return "Helios Project"
 }

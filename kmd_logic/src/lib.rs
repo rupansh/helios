@@ -18,6 +18,7 @@
 
 #![no_std]
 
+pub mod edid;
 pub mod producer_completion;
 pub mod execution_completion;
 

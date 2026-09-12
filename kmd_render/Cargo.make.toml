@@ -263,3 +263,26 @@ args = [
   "/os:${WDK_BUILD_INF2CAT_OS}",
   "/uselocaltime",
 ]
+
+# Replace the WDK sample's hardcoded WDRLocalTestCert identity on every local
+# package path. clear removes its old makecert command and condition script.
+[tasks.generate-certificate]
+clear = true
+private = true
+dependencies = ["setup-wdk-config-env-vars"]
+command = "powershell"
+args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CARGO_MAKE_WORKING_DIRECTORY}/../tools/sign-helios-development.ps1", "-OutputDirectory", "${WDK_BUILD_OUTPUT_DIRECTORY}"]
+
+[tasks.copy-certificate-to-package]
+clear = true
+private = true
+dependencies = ["setup-wdk-config-env-vars"]
+command = "powershell"
+args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CARGO_MAKE_WORKING_DIRECTORY}/../tools/sign-helios-development.ps1", "-OutputDirectory", "${WDK_BUILD_OUTPUT_DIRECTORY}", "-PackageDirectory", "${WDK_BUILD_OUTPUT_DIRECTORY}/${CARGO_MAKE_CRATE_FS_NAME}_package"]
+
+[tasks.signtool-sign]
+clear = true
+private = true
+dependencies = ["setup-wdk-config-env-vars"]
+command = "powershell"
+args = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "${CARGO_MAKE_WORKING_DIRECTORY}/../tools/sign-helios-development.ps1", "-OutputDirectory", "${WDK_BUILD_OUTPUT_DIRECTORY}", "-SignFile", "${WDK_BUILD_SIGNTOOL_SIGN_INPUT_FILE}"]

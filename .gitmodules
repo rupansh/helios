@@ -3,7 +3,7 @@
 	url = https://github.com/winboat-org/mesa-helios.git
 [submodule "LookingGlass"]
 	path = LookingGlass
-	url = https://github.com/gnif/LookingGlass
+	url = https://github.com/winboat-org/LookingGlass.git
 [submodule "dxvk-helios"]
 	path = dxvk-helios
 	url = https://github.com/rupansh/dxvk

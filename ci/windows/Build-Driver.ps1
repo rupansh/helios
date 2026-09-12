@@ -9,6 +9,9 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "Initialize-HeliosBuild.ps1")
 
 $RepoRoot = (Resolve-Path -LiteralPath $RepoRoot).Path
+# Reject stale checked-in INF/Cargo descriptions before starting engine builds.
+& python (Join-Path $RepoRoot "tools\sync-metadata.py") --check
+if ($LASTEXITCODE -ne 0) { throw "Metadata is stale; run tools/sync-metadata.py." }
 Import-VisualStudioEnvironment
 $clangCl = Assert-Command "clang-cl.exe"
 $llvmLib = Assert-Command "llvm-lib.exe"

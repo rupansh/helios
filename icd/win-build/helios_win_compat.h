@@ -4,15 +4,9 @@
  *
  * This header is FORCE-INCLUDED into every Mesa translation unit via the meson
  * `c_args`/`cpp_args` flag (`-include` for gcc/clang, `/FI` for cl/clang-cl). It
- * is NOT part of the vendored Mesa submodule (icd/mesa), so venus stays
- * byte-identical to upstream — the whole point is to keep all Windows changes
- * OUTSIDE the tree we sync from upstream.
- *
- * VALIDATED 2026-06-05: with this single forced-include, BOTH mingw-w64 gcc 16.1
- * and clang-cl 17 compile 100% of venus (every src/virtio/vulkan/vn_*.c plus the
- * generated src/virtio/venus-protocol/vn_protocol_driver_*.h) with ZERO edits to
- * the Mesa tree, reaching the final link step. Each block self-gates to the
- * toolchain that needs it; the others see a no-op. See icd/PHASE5_HANDOVER.md §6.
+ * carries shared WinBoat branding from metadata/helios.env as well as compiler
+ * compatibility definitions. Mesa itself is the icd/mesa fork; its Helios
+ * backend and Windows support are maintained there.
  *
  * The `__ASSEMBLER__` guard matters: meson force-includes this onto .S files too
  * (e.g. blake3 SIMD), where it must be completely inert.
@@ -21,6 +15,8 @@
 #define HELIOS_WIN_COMPAT_H
 
 #if defined(_WIN32) && !defined(__ASSEMBLER__)
+
+#include "../../metadata/helios_branding.h"
 
 /* (1) pid_t — venus vn_common.h uses it as the return type of vn_gettid()
  *     (which already has a DETECT_OS_WINDOWS arm returning GetCurrentThreadId()).
