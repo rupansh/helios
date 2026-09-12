@@ -12,6 +12,31 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## Publication integration, 2026-09-12
+
+The owner authorized publishing all accumulated changes. Root merge `9509107`
+preserves the newer upstream `36d575e` metadata, packaging and capture fixes;
+Mesa merge `d2ee351e185` preserves its matching branding changes and the tested
+native Venus work. Mesa is published and verified on `winboat-org/mesa-helios`
+`main`. DXVK, QEMU, virglrenderer and venus-protocol revisions are unchanged.
+
+The DXIL compiler's local `f4651bd0` contains required stream-output and
+mixed-sample lowering. Engine `9d4731f1` points that dependency at the intended
+`winboat-org/dxil-spirv` fork. Compiler, engine and root publication await creation
+of that repository: neither the organization nor personal fork exists, and the
+available GitHub API credentials return HTTP 401. SSH pushes work. Publish and
+verify the compiler before the engine, then publish the root gitlinks.
+
+Metadata synchronization, two resource-parser tests, 213 KMD logic tests, native
+UMD host clippy, DDI slot coverage and log checks pass after integration. A1's
+text scan reports seven panic-pattern matches, all in metadata tests or Cargo
+build scripts; inspection confirms they are not driver-runtime paths. Other A1
+checks pass; its unmodified aggregate exit status remains 1. Receipts are in
+`tmp/publish-fl12-20260912/`. These source/publication changes were not deployed.
+The general-testing evidence below remains tied to UMD12 C7241DE6 and its exact
+compiled sources; the newer metadata integration has no new Windows build or
+runtime acceptance.
+
 ## Metadata consistency, 2026-09-12
 
 The product/adapter/monitor name is **Helios vGPU**, published and developed by
