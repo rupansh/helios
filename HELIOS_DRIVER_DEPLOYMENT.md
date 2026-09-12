@@ -119,6 +119,27 @@ Build first:
 # win_cargo crate_dir:"umd" args:["build"]
 ```
 
+For WoW64 packages, `win_build_kmd` reuses engines already built for each
+architecture. Pass `env` with `HELIOS_DXVK_BUILD_X86` and
+`HELIOS_VKD3D_BUILD_X86` set to their local x86 build directories. It preserves
+an explicit `LIBCLANG_PATH`, supplies the dev VM default otherwise, and forces
+`CARGO_TARGET_DIR` to the local KMD mirror. Environment names are case insensitive;
+conflicting case variants are rejected before the version changes. The Rust toolchain needs
+`i686-pc-windows-msvc` installed and `pwsh` (PowerShell 7) on PATH.
+`win_dxvk`/`win_vkd3d` remain native-only helpers; use
+`ci/windows/Build-Driver.ps1` for a complete build of both architectures.
+
+`win_install_kmd` requires `package_dir`, `umd_dll`, and `umd12_dll`, plus
+`umd32_dll` and `umd12_32_dll` for the current WoW64 INF. The x86 fields name
+Cargo's `i686-pc-windows-msvc/<profile>/helios_umd{12}.dll` outputs; the installer
+stages them as `helios_umd32.dll` and `helios_umd12_32.dll`. Omit both x86 fields
+only when installing an older native-only package. Artifact flags in `args`,
+including colon notation or abbreviations, are refused; use the named fields.
+All artifact paths are echoed. Set `restart_vm=false` unless the user authorized
+a guest reboot; `-PlanOnly` and `-PlanOnly:$true` always suppress that reboot.
+The installer runs in a child PowerShell with execution policy bypass and an
+encoded script, so explicit switch booleans also bind on Windows PowerShell 5.1.
+
 Dry-run discovery:
 
 ```powershell

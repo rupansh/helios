@@ -495,6 +495,14 @@ struct WinBuildKmdArgs {
     /// still verified.
     #[serde(default)]
     no_bump: bool,
+    /// Extra build environment, including explicit HELIOS_DXVK_BUILD_X86 and
+    /// HELIOS_VKD3D_BUILD_X86 directories for already-built x86 engines.
+    /// LIBCLANG_PATH defaults to the dev VM toolchain. CARGO_TARGET_DIR is
+    /// always the KMD mirror's local target directory, overriding this map.
+    /// Names are case insensitive; duplicate names with different casing fail.
+    /// Install the i686 Rust target and PowerShell 7 before WoW64 packaging.
+    #[serde(default)]
+    env: Option<HashMap<String, String>>,
     /// Timeout in seconds. Defaults to 1800.
     #[serde(default)]
     timeout_secs: Option<u64>,
@@ -513,7 +521,7 @@ struct WinInstallKmdArgs {
     /// `kmd_render\target\debug\helios_kmd_render_package`.
     ///
     /// ⚠ WHY THERE IS NO DEFAULT (2026-09-05, superseding the 2026-07-27 R614
-    /// note that made these merely *echoed*): the three paths here are the
+    /// note that made these merely *echoed*): these explicit paths are the
     /// artifacts a deploy actually ships, and echoing an inherited default is
     /// not the same as choosing it. Twice now a wrong binary reached the
     /// DriverStore because nobody had to name it — R614's Defender-blocked
@@ -546,16 +554,148 @@ struct WinInstallKmdArgs {
     /// corrected: the DriverStore copy is catalog-signed, so overwriting the
     /// file afterwards breaks the signature instead of fixing the binary.
     umd12_dll: String,
+    /// Explicit x86 D3D11 artifact, normally
+    /// `umd\target\i686-pc-windows-msvc\release\helios_umd.dll`.
+    /// The installer stages it as helios_umd32.dll. Required with umd12_32_dll
+    /// whenever the package INF declares UserModeDriverNameWoW; omit both only
+    /// for an older native-only package. There is no x64 fallback.
+    #[serde(default)]
+    umd32_dll: Option<String>,
+    /// Explicit x86 D3D12 artifact, normally
+    /// `umd12\target\i686-pc-windows-msvc\release\helios_umd12.dll`.
+    /// Staged as helios_umd12_32.dll. Required with umd32_dll for WoW64 packages.
+    #[serde(default)]
+    umd12_32_dll: Option<String>,
     /// Extra flags passed through to `tools\install-helios-kmd.ps1` in
     /// addition to the always-passed -AllowRebootRequired (e.g. ["-PlanOnly"],
     /// ["-BinaryOnly"], ["-SkipSign"]). Do NOT pass
-    /// -PackageDir/-UmdDll/-Umd12Dll here — use the fields above; a duplicate
+    /// -PackageDir/-UmdDll/-Umd12Dll/-Umd32Dll/-Umd12_32Dll here (including
+    /// colon notation) — use the fields above; a duplicate
     /// named argument is a PowerShell parameter-binding error.
     #[serde(default)]
     args: Vec<String>,
     /// Timeout in seconds for the install step. Defaults to 900.
     #[serde(default)]
     timeout_secs: Option<u64>,
+}
+
+/// PowerShell accepts `-Name value`, `-Name:value`, and unambiguous prefixes.
+/// A passthrough artifact flag must not bind an explicit field a second time.
+fn script_argument_is(token: &str, expected: &str) -> bool {
+    let token = token.trim_matches(['\'', '"']);
+    let name = token.split_once(':').map_or(token, |(name, _)| name);
+    name.len() > 1
+        && expected
+            .get(..name.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(name))
+}
+
+fn has_script_argument(args: &[String], names: &[&str]) -> bool {
+    args.iter()
+        .flat_map(|arg| arg.split_whitespace())
+        .any(|token| names.iter().any(|name| script_argument_is(token, name)))
+}
+
+/// A successful preview must never be followed by the default reboot. Honor
+/// explicit false when PowerShell supports it; suppress reboot conservatively
+/// for other colon spellings rather than treating a preview as an install.
+fn script_switch_enabled(args: &[String], name: &str) -> bool {
+    args.iter()
+        .flat_map(|arg| arg.split_whitespace())
+        .find(|token| script_argument_is(token, name))
+        .is_some_and(|token| {
+            let value = token
+                .split_once(':')
+                .map(|(_, value)| value.trim_matches(['\'', '"']));
+            !value.is_some_and(|value| {
+                value.eq_ignore_ascii_case("$false")
+                    || value.eq_ignore_ascii_case("false")
+                    || value == "0"
+            })
+        })
+}
+
+fn kmd_build_environment(
+    extra: Option<HashMap<String, String>>,
+) -> Result<HashMap<String, String>, String> {
+    // Windows environment names are case insensitive; assigning differently
+    // cased keys in HashMap order would make engine selection nondeterministic.
+    let mut env = HashMap::new();
+    for (key, value) in extra.unwrap_or_default() {
+        let key = key.to_ascii_uppercase();
+        if env.insert(key.clone(), value).is_some() {
+            return Err(format!("duplicate Windows environment variable: {key}"));
+        }
+    }
+    env.entry("LIBCLANG_PATH".to_string())
+        .or_insert_with(|| LIBCLANG_PATH.to_string());
+    // Never inherit an unrelated target directory or the Z: share.
+    env.insert(
+        "CARGO_TARGET_DIR".to_string(),
+        format!("{MIRROR_ROOT}\\kmd_render\\target"),
+    );
+    Ok(env)
+}
+
+fn kmd_install_script(a: &WinInstallKmdArgs) -> Result<String, String> {
+    if has_script_argument(
+        &a.args,
+        &[
+            "-PackageDir",
+            "-UmdDll",
+            "-Umd12Dll",
+            "-Umd32Dll",
+            "-Umd12_32Dll",
+        ],
+    ) {
+        return Err("artifact flags must use package_dir / umd_dll / umd12_dll / umd32_dll / umd12_32_dll fields, not args (including -Name:value)".to_string());
+    }
+    if a.umd32_dll.is_some() != a.umd12_32_dll.is_some() {
+        return Err(
+            "supply both umd32_dll and umd12_32_dll, or omit both for a native-only package"
+                .to_string(),
+        );
+    }
+    let mut paths = vec![
+        ("PackageDir", a.package_dir.as_str()),
+        ("UmdDll", a.umd_dll.as_str()),
+        ("Umd12Dll", a.umd12_dll.as_str()),
+    ];
+    if let Some(path) = a.umd32_dll.as_deref() {
+        paths.push(("Umd32Dll", path));
+    }
+    if let Some(path) = a.umd12_32_dll.as_deref() {
+        paths.push(("Umd12_32Dll", path));
+    }
+    let mut command =
+        format!("& '{PROJECT_DRIVE}tools\\install-helios-kmd.ps1' -AllowRebootRequired");
+    for (name, value) in paths {
+        if value.trim().is_empty() {
+            return Err(format!(
+                "{name} requires an explicit nonempty artifact path"
+            ));
+        }
+        command.push_str(&format!(" -{name} '{}'", ps_single_quote(value)));
+    }
+    if !a.args.is_empty() {
+        command.push_str(&format!(" {}", a.args.join(" ")));
+    }
+    Ok(command)
+}
+
+fn kmd_install_command(a: &WinInstallKmdArgs) -> Result<String, String> {
+    let command = kmd_install_script(a)?;
+    // Keep the child process and policy bypass, but bind script parameters
+    // inside PowerShell: powershell.exe 5.1 -File cannot pass switch booleans.
+    // Catch script/binding failures explicitly so no failure requests a reboot.
+    let script = format!(
+        "$ProgressPreference = 'SilentlyContinue'\n$ErrorActionPreference = 'Stop'\n\
+         try {{\n{command}\nexit 0\n}} catch {{\n[Console]::Error.WriteLine($_.ToString())\nexit 1\n}}"
+    );
+    Ok(format!(
+        "& powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {}",
+        encode_powershell(&script)
+    ))
 }
 
 /// Bump (or verify) the KMD version at its single source of truth,
@@ -998,7 +1138,7 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Install/hotplug the Helios UMD (helios_umd.dll) on win11 by running tools\\hotplug-helios-umd.ps1 via `powershell -NoProfile -ExecutionPolicy Bypass -File`. The -ExecutionPolicy Bypass is REQUIRED: the VM's machine ExecutionPolicy is Restricted, so invoking the .ps1 any other way silently no-ops (no output, no deploy). ARTIFACT PATHS ARE EXPLICIT: `umd_dll` (default umd\\target\\release\\helios_umd.dll — RELEASE, because debug is opt-level 1 with no LTO and silently invalidates every timing number) and `package_dir` are always passed to the script and ECHOED as the first output lines, marked NON-DEFAULT when overridden, so which binary shipped is a fact in the transcript instead of an inherited script default. Do not pass -UmdDll/-Umd12Dll/-PackageDir through `args` — that is refused, since a duplicate named argument is a PowerShell binding error. Build the UMD first: `win_cargo crate_dir:\"umd\" args:[\"build\",\"--release\"]`, or both UMDs at once with `win_exec` on tools\\umd-check.ps1 -Mode release. D3D12: pass `umd12_dll` (suggested umd12\\target\\release\\helios_umd12.dll) to ALSO deploy helios_umd12.dll and register it at UserModeDriverName slot 3, with InstalledDisplayDrivers corrected to the two-entry form helios_umd,helios_umd12 (DECISIONS.md D3 / §6.1). OMIT `umd12_dll` and no D3D12 UMD is deployed and the registry writes stay bit-identical to a pre-D3D12 deploy — there is deliberately no default, because deploying it changes what dwm resolves at device start. ProgramData mode only — a HOTPLUG convenience since 2026-09-05, not how D3D12 ships: stage S5's INF change landed, so the signed DriverStore package carries helios_umd12.dll and registers UserModeDriverName slot 3 itself (that copy survives a cold boot; this override does not). Use win_install_kmd, which requires umd12_dll, for a real deploy. The script copies the build to C:\\ProgramData\\HeliosUmd, rewrites the display software key (UserModeDriverName), syncs the active DriverStore copy, verifies the destination SHA256 against the source, and prints final state. Pass script flags via `args`: [] = default ProgramData hotplug; [\"-PlanOnly\"] = dry run; [\"-KillUmdUsers\",\"-RestartDevice\",\"-NoProbe\"] = force existing UMD users off + an adapter restart so the new DLL loads immediately. NOTE: dxgkrnl caches the UMD path at DEVICE start, so without -RestartDevice (or a reboot) already-running processes keep the old DLL. See HELIOS_DRIVER_DEPLOYMENT.md."
+        description = "Install/hotplug the Helios UMD (helios_umd.dll) on win11 by running tools\\hotplug-helios-umd.ps1 via `powershell -NoProfile -ExecutionPolicy Bypass -File`. The -ExecutionPolicy Bypass is REQUIRED: the VM's machine ExecutionPolicy is Restricted, so invoking the .ps1 any other way silently no-ops (no output, no deploy). ARTIFACT PATHS ARE EXPLICIT: `umd_dll` (default umd\\target\\release\\helios_umd.dll — RELEASE, because debug is opt-level 1 with no LTO and silently invalidates every timing number) and `package_dir` are always passed to the script and ECHOED as the first output lines, marked NON-DEFAULT when overridden, so which binary shipped is a fact in the transcript instead of an inherited script default. Do not pass -UmdDll/-Umd12Dll/-PackageDir through `args` — that is refused, since a duplicate named argument is a PowerShell binding error. Build the UMD first: `win_cargo crate_dir:\"umd\" args:[\"build\",\"--release\"]`, or both UMDs at once with `win_exec` on tools\\umd-check.ps1 -Mode release. D3D12: pass `umd12_dll` (suggested umd12\\target\\release\\helios_umd12.dll) to ALSO deploy helios_umd12.dll and register it at UserModeDriverName slot 3, with InstalledDisplayDrivers containing helios_umd,helios_umd12 plus preserved installed WoW64 names (DECISIONS.md D3 / §6.1). OMIT `umd12_dll` and no D3D12 UMD is deployed and the registry writes stay bit-identical to a pre-D3D12 deploy — there is deliberately no default, because deploying it changes what dwm resolves at device start. ProgramData mode only — a HOTPLUG convenience since 2026-09-05, not how D3D12 ships: stage S5's INF change landed, so the signed DriverStore package carries helios_umd12.dll and registers UserModeDriverName slot 3 itself (that copy survives a cold boot; this override does not). Use win_install_kmd, which requires umd12_dll, for a real deploy. The script copies the build to C:\\ProgramData\\HeliosUmd, rewrites the display software key (UserModeDriverName), syncs the active DriverStore copy, verifies the destination SHA256 against the source, and prints final state. Pass script flags via `args`: [] = default ProgramData hotplug; [\"-PlanOnly\"] = dry run; [\"-KillUmdUsers\",\"-RestartDevice\",\"-NoProbe\"] = force existing UMD users off + an adapter restart so the new DLL loads immediately. NOTE: dxgkrnl caches the UMD path at DEVICE start, so without -RestartDevice (or a reboot) already-running processes keep the old DLL. See HELIOS_DRIVER_DEPLOYMENT.md."
     )]
     async fn win_install_umd(&self, Parameters(a): Parameters<WinInstallUmdArgs>) -> String {
         let umd_dll = a.umd_dll.as_deref().unwrap_or(DEFAULT_UMD_DLL);
@@ -1014,8 +1154,9 @@ impl WinHost {
             artifact_line("UMD  ", umd_dll, DEFAULT_UMD_DLL),
             match umd12_dll {
                 Some(p) => artifact_line("UMD12", p, SUGGESTED_UMD12_DLL),
-                None => "UMD12: (not deployed — pass `umd12_dll` to register UserModeDriverName[3])\n"
-                    .to_string(),
+                None =>
+                    "UMD12: (not deployed — pass `umd12_dll` to register UserModeDriverName[3])\n"
+                        .to_string(),
             },
             artifact_line("pkg  ", package_dir, DEFAULT_KMD_PACKAGE_DIR),
         );
@@ -1062,9 +1203,13 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Bump the Helios KMD (kmd_render) version and build the signed driver package. The version lives at ONE site, kmd_render/driver-version.env (HELIOS_KMD_VERSION): build.rs renders the .sys FILEVERSION/PRODUCTVERSION numerics and FileVersion/ProductVersion strings from one parse of it, and Cargo.make.toml reads it via cargo-make env_files for the stampinf -v that stamps the INF DriverVer — an INF/FILEVERSION mismatch is FAILED_ADD 0xc0000182. Coherence is enforced by kmd_render/build.rs itself (verify_version_wiring), so a hand-run `cargo make --makefile Cargo.make.toml` is covered too — this tool is only a convenience bumper. It bumps the third component by default (or uses `version`, or `no_bump` to rebuild the current version), edits the Linux-side source, then mirrors + runs `cargo make --makefile Cargo.make.toml` on the VM (build, inf2cat, test-sign, package). Output starts with the old -> new version line; the package lands in kmd_render\\target\\debug\\helios_kmd_render_package on the VM mirror. Deploy with win_install_kmd. The version edit persists on the Linux tree — commit it with the change it ships."
+        description = "Bump the Helios KMD (kmd_render) version and build the signed driver package. The version lives at ONE site, kmd_render/driver-version.env (HELIOS_KMD_VERSION): build.rs renders the .sys FILEVERSION/PRODUCTVERSION numerics and FileVersion/ProductVersion strings from one parse of it, and Cargo.make.toml reads it via cargo-make env_files for the stampinf -v that stamps the INF DriverVer — an INF/FILEVERSION mismatch is FAILED_ADD 0xc0000182. Coherence is enforced by kmd_render/build.rs itself (verify_version_wiring), so a hand-run `cargo make --makefile Cargo.make.toml` is covered too — this tool is only a convenience bumper. It bumps the third component by default (or uses `version`, or `no_bump` to rebuild the current version), edits the Linux-side source, then mirrors + runs `cargo make --makefile Cargo.make.toml` on the VM (build, inf2cat, test-sign, package). Output starts with the old -> new version line; the package lands in kmd_render\\target\\debug\\helios_kmd_render_package on the VM mirror. WoW64 prerequisites: build the x86 DXVK and vkd3d engines first, pass their HELIOS_DXVK_BUILD_X86 and HELIOS_VKD3D_BUILD_X86 directories in `env`, install the i686-pc-windows-msvc Rust target and put PowerShell 7 (pwsh) on PATH. The engine helpers win_dxvk/win_vkd3d are native-only; ci/windows/Build-Driver.ps1 is the complete x64/x86 build path. CARGO_TARGET_DIR is always the local KMD mirror target directory. Deploy with win_install_kmd. The version edit persists on the Linux tree — commit it with the change it ships."
     )]
     async fn win_build_kmd(&self, Parameters(a): Parameters<WinBuildKmdArgs>) -> String {
+        let env = match kmd_build_environment(a.env) {
+            Ok(env) => env,
+            Err(error) => return format!("win_build_kmd: REFUSED — {error}"),
+        };
         let (old_v, new_v) = match bump_kmd_version(a.version.as_deref(), a.no_bump) {
             Ok(v) => v,
             Err(e) => return format!("win_build_kmd: version bump failed: {e}"),
@@ -1074,8 +1219,6 @@ impl WinHost {
         } else {
             format!("KMD version: {old_v} -> {new_v}\n")
         };
-        let mut env = HashMap::new();
-        env.insert("LIBCLANG_PATH".to_string(), LIBCLANG_PATH.to_string());
         // Same mirror-then-build flow as win_cargo (see its comments) with the
         // kmd_render package makefile.
         let command = format!(
@@ -1092,39 +1235,27 @@ impl WinHost {
     }
 
     #[tool(
-        description = "Install the built Helios KMD package on win11 via `tools\\install-helios-kmd.ps1 -AllowRebootRequired` (ExecutionPolicy Bypass — required, machine policy is Restricted; the script re-signs, backs up the active DriverStore files to C:\\ProgramData\\HeliosDeployBackups\\<stamp>, and publishes with devcon). Build first with win_build_kmd. ARTIFACT PATHS ARE REQUIRED AND HAVE NO DEFAULTS: a deploy ships THREE binaries and the caller must name all three — `package_dir` (normally kmd_render\\target\\debug\\helios_kmd_render_package), `umd_dll` (normally umd\\target\\release\\helios_umd.dll) and `umd12_dll` (normally umd12\\target\\release\\helios_umd12.dll). All three are passed to the script and ECHOED as the first output lines. ⛔ The defaults were REMOVED on 2026-09-05 because echoing an inherited default is not the same as choosing it: twice a wrong binary reached the DriverStore without anyone naming it (R614 stale debug helios_umd.dll, and a debug helios_umd12.dll that cargo make staged and the script never refreshed). ⭐ helios_umd12.dll ships INSIDE the signed DriverStore package — the INF CopyFiles it and registers UserModeDriverName slot 3 — so unlike the win_install_umd ProgramData override it survives a cold boot; it is synced BEFORE catalog generation, the only point at which it can be corrected. `umd_dll` is load-bearing, not cosmetic: the script's Sync-HeliosPackageUmd overwrites whatever cargo-make staged in the package with THAT file BEFORE the catalog is generated and signed, so this argument — not the packaging task — decides which UMD reaches the DriverStore. (2026-07-27: win_build_kmd's copy-umd-to-package was blocked by Defender and left a stale DEBUG UMD in the package, and no tool output named it.) Do not pass -PackageDir/-UmdDll/-Umd12Dll through `args` — that is refused. A new KMD image only loads at BOOT, so by default (restart_vm=true, RECOMMENDED) a successful install is followed by a graceful guest reboot (`shutdown /r /t 5`) — SSH drops for 1-3 minutes; poll win_exec until it returns, then verify DriverVersion + CM_PROB_NONE + a paintcap screenshot. Pass restart_vm=false to install now and reboot later (the device may sit in FAILED_POST_START limbo on the old image until then). Only invoke with the user's consent to the reboot, or with restart_vm=false."
+        description = "Install the built Helios KMD package on win11 via `tools\\install-helios-kmd.ps1 -AllowRebootRequired` (ExecutionPolicy Bypass — required, machine policy is Restricted; the script re-signs, backs up the active DriverStore files to C:\\ProgramData\\HeliosDeployBackups\\<stamp>, and publishes with devcon). Build first with win_build_kmd. ARTIFACT PATHS ARE REQUIRED AND HAVE NO DEFAULTS: native package/artifact paths are always required and the caller must name all three — `package_dir` (normally kmd_render\\target\\debug\\helios_kmd_render_package), `umd_dll` (normally umd\\target\\release\\helios_umd.dll) and `umd12_dll` (normally umd12\\target\\release\\helios_umd12.dll). For the current WoW64 INF also supply `umd32_dll` and `umd12_32_dll`, the i686 artifacts staged as helios_umd32.dll and helios_umd12_32.dll; omit them only for an older native-only package. Every artifact field is ECHOED and forwarded explicitly; the installer requires both x86 paths when its INF declares UserModeDriverNameWoW. ⛔ The defaults were REMOVED on 2026-09-05 because echoing an inherited default is not the same as choosing it: twice a wrong binary reached the DriverStore without anyone naming it (R614 stale debug helios_umd.dll, and a debug helios_umd12.dll that cargo make staged and the script never refreshed). ⭐ helios_umd12.dll ships INSIDE the signed DriverStore package — the INF CopyFiles it and registers UserModeDriverName slot 3 — so unlike the win_install_umd ProgramData override it survives a cold boot; it is synced BEFORE catalog generation, the only point at which it can be corrected. `umd_dll` is load-bearing, not cosmetic: the script's Sync-HeliosPackageUmd overwrites whatever cargo-make staged in the package with THAT file BEFORE the catalog is generated and signed, so this argument — not the packaging task — decides which UMD reaches the DriverStore. (2026-07-27: win_build_kmd's copy-umd-to-package was blocked by Defender and left a stale DEBUG UMD in the package, and no tool output named it.) Do not pass -PackageDir/-UmdDll/-Umd12Dll/-Umd32Dll/-Umd12_32Dll through `args`, including colon notation — that is refused. A new KMD image only loads at BOOT, so by default (restart_vm=true, RECOMMENDED) a successful install is followed by a graceful guest reboot (`shutdown /r /t 5`) — SSH drops for 1-3 minutes; poll win_exec until it returns, then verify DriverVersion + CM_PROB_NONE + a paintcap screenshot. Pass restart_vm=false to install now and reboot later (the device may sit in FAILED_POST_START limbo on the old image until then). -PlanOnly, including -PlanOnly:$true, suppresses the post-install reboot. Only invoke with the user's consent to the reboot, or with restart_vm=false."
     )]
     async fn win_install_kmd(&self, Parameters(a): Parameters<WinInstallKmdArgs>) -> String {
-        // ⛔ No `unwrap_or(DEFAULT_*)` here, deliberately: the three artifact
-        // paths are required fields, so a caller that omits one gets a schema
-        // error instead of a silent deploy of whatever the constant happened to
-        // name. See `WinInstallKmdArgs::package_dir` for the two wrong binaries
-        // that reached the DriverStore under the old defaulted contract.
-        let package_dir = a.package_dir.as_str();
-        let umd_dll = a.umd_dll.as_str();
-        let umd12_dll = a.umd12_dll.as_str();
-        // All three are echoed unconditionally: which binaries a deploy shipped
-        // must be a fact in the transcript, not a reconstruction.
+        // Native paths stay required. The optional x86 fields preserve old
+        // package compatibility; the script enforces their INF dependency.
         let header = format!(
-            "pkg   : {package_dir}\nUMD   : {umd_dll}\nUMD12 : {umd12_dll}\n"
+            "pkg      : {}\nUMD      : {}\nUMD12    : {}\nUMD32    : {}\nUMD12_32 : {}\n",
+            a.package_dir,
+            a.umd_dll,
+            a.umd12_dll,
+            a.umd32_dll
+                .as_deref()
+                .unwrap_or("(not supplied; native-only package)"),
+            a.umd12_32_dll
+                .as_deref()
+                .unwrap_or("(not supplied; native-only package)"),
         );
-        if a.args.iter().any(|f| {
-            f.eq_ignore_ascii_case("-PackageDir")
-                || f.eq_ignore_ascii_case("-UmdDll")
-                || f.eq_ignore_ascii_case("-Umd12Dll")
-        }) {
-            return format!(
-                "{header}win_install_kmd: REFUSED — -PackageDir / -UmdDll / -Umd12Dll passed \
-                 through `args` would bind twice against the explicit ones. Use the \
-                 `package_dir` / `umd_dll` / `umd12_dll` fields instead."
-            );
-        }
-        let extra = a.args.join(" ");
-        let command = format!(
-            "& powershell -NoProfile -ExecutionPolicy Bypass -File '{PROJECT_DRIVE}tools\\install-helios-kmd.ps1' \
-             -AllowRebootRequired -PackageDir '{package_dir}' -UmdDll '{umd_dll}' \
-             -Umd12Dll '{umd12_dll}' {extra}"
-        );
+        let command = match kmd_install_command(&a) {
+            Ok(command) => command,
+            Err(error) => return format!("{header}win_install_kmd: REFUSED — {error}"),
+        };
         let install = match run_ssh(
             &command,
             None,
@@ -1134,12 +1265,12 @@ impl WinHost {
         .await
         {
             Ok(o) => o,
-            Err(e) => return format!("error launching ssh: {e}"),
+            Err(e) => return format!("{header}error launching ssh: {e}"),
         };
         let installed_ok = install.code == Some(0) && !install.timed_out;
         let mut out = format!("{header}{}", format_output(&install));
 
-        let plan_only = a.args.iter().any(|f| f.eq_ignore_ascii_case("-PlanOnly"));
+        let plan_only = script_switch_enabled(&a.args, "-PlanOnly");
         if a.restart_vm.unwrap_or(true) && !plan_only {
             if installed_ok {
                 let reboot = run_ssh(
@@ -1196,6 +1327,180 @@ impl ServerHandler for WinHost {
 #[cfg(test)]
 mod tests {
     use super::bump_kmd_version_at;
+
+    fn install_args() -> super::WinInstallKmdArgs {
+        super::WinInstallKmdArgs {
+            restart_vm: Some(false),
+            package_dir: r"C:\build\package".into(),
+            umd_dll: r"C:\build\native\helios_umd.dll".into(),
+            umd12_dll: r"C:\build\native\helios_umd12.dll".into(),
+            umd32_dll: None,
+            umd12_32_dll: None,
+            args: vec!["-PlanOnly".into()],
+            timeout_secs: None,
+        }
+    }
+
+    #[test]
+    fn kmd_install_explicit_architecture_paths() {
+        let mut args = install_args();
+        let native = super::kmd_install_script(&args).unwrap();
+        assert!(!native.contains("-Umd32Dll"));
+        assert!(!native.contains("-Umd12_32Dll"));
+        args.umd32_dll = Some(r"C:\Chef's builds\i686\helios_umd.dll".into());
+        assert!(
+            super::kmd_install_command(&args).is_err(),
+            "incomplete x86 pair accepted"
+        );
+        args.umd12_32_dll = Some(r"C:\Chef's builds\i686\helios_umd12.dll".into());
+        let wow64 = super::kmd_install_script(&args).unwrap();
+        assert!(wow64.contains(r"-Umd32Dll 'C:\Chef''s builds\i686\helios_umd.dll'"));
+        assert!(wow64.contains(r"-Umd12_32Dll 'C:\Chef''s builds\i686\helios_umd12.dll'"));
+        args.umd12_32_dll = Some("   ".into());
+        assert!(
+            super::kmd_install_command(&args).is_err(),
+            "empty x86 path accepted"
+        );
+    }
+
+    #[test]
+    fn kmd_install_refuses_passthrough_artifacts() {
+        for flag in [
+            "-PackageDir",
+            "-UmdDll",
+            "-Umd12Dll",
+            "-Umd32Dll",
+            "-Umd12_32Dll",
+            "-Umd12_32D",
+        ] {
+            for arg in [
+                flag.to_string(),
+                format!("{}:C:\\wrong.dll", flag.to_lowercase()),
+                format!("-PlanOnly {flag} 'C:\\wrong.dll'"),
+            ] {
+                let mut args = install_args();
+                args.args = vec![arg];
+                assert!(
+                    super::kmd_install_command(&args).is_err(),
+                    "passthrough accepted: {:?}",
+                    args.args
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kmd_preview_switch_never_requests_reboot() {
+        for arg in [
+            "-PlanOnly",
+            "-planonly:$true",
+            "-PlanO:True",
+            "-PlanOnly:'$true'",
+        ] {
+            assert!(
+                super::script_switch_enabled(&[arg.into()], "-PlanOnly"),
+                "{arg}"
+            );
+        }
+        for arg in [
+            "-PlanOnly:$false",
+            "-PlanOnly:False",
+            "-PlanOnly:0",
+            "-RestartDevice",
+        ] {
+            assert!(
+                !super::script_switch_enabled(&[arg.into()], "-PlanOnly"),
+                "{arg}"
+            );
+        }
+    }
+
+    #[test]
+    fn kmd_install_child_binds_switches_inside_powershell() {
+        use base64::Engine as _;
+        for switch in ["-PlanOnly:$true", "-PlanOnly:$false"] {
+            let mut args = install_args();
+            args.args = vec![switch.into()];
+            let command = super::kmd_install_command(&args).unwrap();
+            let encoded = command
+                .strip_prefix("& powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ")
+                .expect("must bind switches inside PowerShell, not powershell.exe -File");
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(encoded)
+                .unwrap();
+            let wide: Vec<u16> = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .collect();
+            let script = String::from_utf16(&wide).unwrap();
+            assert!(script.contains(&super::kmd_install_script(&args).unwrap()));
+            assert!(script.contains(switch));
+            assert!(script.contains("$ErrorActionPreference = 'Stop'"));
+            assert!(script.contains("exit 0\n} catch {"));
+            assert!(script.contains("exit 1"));
+        }
+    }
+
+    #[test]
+    fn kmd_build_preserves_explicit_engines_on_local_target() {
+        let extra = std::collections::HashMap::from([
+            (
+                "helios_dxvk_build_x86".into(),
+                r"C:\engines\dxvk-x86".into(),
+            ),
+            (
+                "HELIOS_VKD3D_BUILD_X86".into(),
+                r"C:\engines\vkd3d-x86".into(),
+            ),
+            ("Libclang_Path".into(), r"C:\llvm22\bin".into()),
+            ("cargo_target_dir".into(), r"Z:\unsafe-target".into()),
+        ]);
+        let env = super::kmd_build_environment(Some(extra)).unwrap();
+        assert_eq!(env["HELIOS_DXVK_BUILD_X86"], r"C:\engines\dxvk-x86");
+        assert_eq!(env["HELIOS_VKD3D_BUILD_X86"], r"C:\engines\vkd3d-x86");
+        assert_eq!(env["LIBCLANG_PATH"], r"C:\llvm22\bin");
+        assert_eq!(
+            env["CARGO_TARGET_DIR"],
+            format!("{}\\kmd_render\\target", super::MIRROR_ROOT)
+        );
+        assert_eq!(
+            super::kmd_build_environment(None).unwrap()["LIBCLANG_PATH"],
+            super::LIBCLANG_PATH
+        );
+        assert!(env.keys().all(|key| key == &key.to_ascii_uppercase()));
+        assert!(
+            super::kmd_build_environment(Some(std::collections::HashMap::from([
+                ("LIBCLANG_PATH".into(), r"C:\first\bin".into()),
+                ("libclang_path".into(), r"C:\second\bin".into()),
+            ])))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn kmd_install_schema_keeps_native_package_compatibility() {
+        let schema = super::schemars::schema_for!(super::WinInstallKmdArgs);
+        let object = schema.as_object().unwrap();
+        let required = object["required"].as_array().unwrap();
+        let properties = object["properties"].as_object().unwrap();
+        for field in ["package_dir", "umd_dll", "umd12_dll"] {
+            assert!(required.iter().any(|value| value == field));
+        }
+        for field in ["umd32_dll", "umd12_32_dll"] {
+            assert!(properties.contains_key(field));
+            assert!(!required.iter().any(|value| value == field));
+        }
+        let build_schema = super::schemars::schema_for!(super::WinBuildKmdArgs);
+        let build = build_schema.as_object().unwrap();
+        assert!(build["properties"].as_object().unwrap().contains_key("env"));
+        assert!(build.get("required").is_none_or(|required| {
+            !required
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value == "env")
+        }));
+    }
 
     /// Copy the real kmd_render version-site files into a temp root and
     /// exercise verify (no_bump), auto-bump, and explicit-bump against them.
