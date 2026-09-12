@@ -6,6 +6,9 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+# A fresh powershell -NoProfile process does not load the Certificate provider
+# merely because Get-ChildItem receives a Cert: path.
+Import-Module Microsoft.PowerShell.Security -ErrorAction Stop
 $repo = Split-Path -Parent $PSScriptRoot
 . (Join-Path $repo "metadata\Read-HeliosMetadata.ps1")
 $metadata = Read-HeliosMetadata $repo
