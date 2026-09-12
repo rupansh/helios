@@ -1454,10 +1454,18 @@ bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us,
     // one entry point with one telemetry line so the two compare directly.
     bool completed;
     if (order_mode == kPresentOrderSubmitted) {
-      immediateContext->HeliosWaitFrameSubmitted();
+      if (!immediateContext->HeliosWaitFrameSubmitted()) {
+        umd_log("present_frame_gate: command stream/submission failed");
+        return std::nullopt;
+      }
       completed = true;
     } else {
-      completed = immediateContext->HeliosWaitFrameComplete(timeout_us);
+      const auto result = immediateContext->HeliosWaitFrameComplete(timeout_us);
+      if (result != VK_SUCCESS && result != VK_TIMEOUT) {
+        umd_log("present_frame_gate: command stream/submission failed");
+        return std::nullopt;
+      }
+      completed = result == VK_SUCCESS;
     }
 
     // Gate-cost telemetry (PSC WS2 discipline): one line per 128 presents.
