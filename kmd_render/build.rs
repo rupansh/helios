@@ -21,17 +21,18 @@
 //! definition conflicts, which get added here. This is expected for layered
 //! bindgen and is not a design problem.
 
+#[path = "../metadata/windows_resource.rs"]
+mod metadata;
+
 use wdk_build::{BuilderExt, Config};
 
 /// Headers that declare the WDDM render-path DDIs we implement.
 ///
 /// `DXGKDDI_INTERFACE_VERSION` is left at the header default (WDDM 3.2 on the
-/// 26100 WDK) so every generated struct matches the buffers 24H2 dxgkrnl hands a
-/// native driver. We declare the same version in `DriverEntry` (consistent → no
-/// BUFFER_TOO_SMALL). An earlier experiment pinned this to WDDM 2.0 (0x5023) to
-/// shrink the cap surface, but 24H2 then rejects the UMD revision
-/// (STATUS_REVISION_MISMATCH) — a 2.0 adapter is too old for the OS's user-mode
-/// driver, so we stay OS-native.
+/// 26100 WDK) so bindgen uses the installed SDK's complete struct definitions.
+/// The interface advertised to dxgkrnl is a separate decision, centralized in
+/// `src/ddi/wddm_surface.rs` (currently WDDM 2.1 GPU MMU). Header availability
+/// must not be mistaken for the driver's advertised WDDM version.
 const DXGK_HEADER_CONTENTS: &str = r#"
 #include <ntddk.h>
 #include <dispmprt.h>
@@ -103,41 +104,6 @@ fn compile_seh_shim() {
 /// reboot.
 const DRIVER_VERSION_FILE: &str = "driver-version.env";
 
-/// Parse `HELIOS_KMD_VERSION=a.b.c.d` out of [`DRIVER_VERSION_FILE`].
-///
-/// Every failure returns `Err`, which `main` propagates as a build failure with
-/// a named cause. The alternative — defaulting, or emitting a resource from a
-/// partially parsed version — is exactly the silent incoherence this file exists
-/// to remove.
-fn read_driver_version() -> Result<[u32; 4], Box<dyn std::error::Error>> {
-    let text = std::fs::read_to_string(DRIVER_VERSION_FILE)
-        .map_err(|e| format!("read {DRIVER_VERSION_FILE}: {e}"))?;
-    let raw = text
-        .lines()
-        .map(str::trim)
-        .find_map(|l| l.strip_prefix("HELIOS_KMD_VERSION="))
-        .ok_or_else(|| format!("{DRIVER_VERSION_FILE}: no HELIOS_KMD_VERSION= line"))?
-        .trim();
-
-    let parts: Vec<&str> = raw.split('.').collect();
-    if parts.len() != 4 {
-        return Err(format!(
-            "{DRIVER_VERSION_FILE}: HELIOS_KMD_VERSION={raw:?} has {} components, expected 4 (a.b.c.d)",
-            parts.len()
-        )
-        .into());
-    }
-    let mut version = [0u32; 4];
-    for (i, part) in parts.iter().enumerate() {
-        version[i] = part.parse::<u32>().map_err(|e| {
-            format!(
-                "{DRIVER_VERSION_FILE}: HELIOS_KMD_VERSION={raw:?} component {i} ({part:?}): {e}"
-            )
-        })?;
-    }
-    Ok(version)
-}
-
 /// The cargo-make makefile, checked by [`verify_version_wiring`].
 const DRIVER_MAKEFILE: &str = "Cargo.make.toml";
 
@@ -190,92 +156,8 @@ fn verify_version_wiring() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn compile_version_resource() -> Result<(), Box<dyn std::error::Error>> {
-    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR")?);
-    let rc_path = out_dir.join("helios_kmd_render_version.rc");
-    let res_path = out_dir.join("helios_kmd_render_version.res");
-
-    // One parse renders both forms, so the numerics and the strings cannot
-    // disagree with each other or with the stamped INF.
-    let v = read_driver_version()?;
     verify_version_wiring()?;
-    let comma = format!("{},{},{},{}", v[0], v[1], v[2], v[3]);
-    let dotted = format!("{}.{}.{}.{}", v[0], v[1], v[2], v[3]);
-
-    std::fs::write(
-        &rc_path,
-        format!(
-            r#"1 VERSIONINFO
-FILEVERSION {comma}
-PRODUCTVERSION {comma}
-FILEFLAGSMASK 0x3fL
-FILEFLAGS 0
-FILEOS 0x00040004L
-FILETYPE 0x00000003L
-FILESUBTYPE 0x00000004L
-BEGIN
-    BLOCK "StringFileInfo"
-    BEGIN
-        BLOCK "040904b0"
-        BEGIN
-            VALUE "CompanyName", "Helios Project\0"
-            VALUE "FileDescription", "Helios vGPU WDDM render miniport\0"
-            VALUE "FileVersion", "{dotted}\0"
-            VALUE "InternalName", "helios_kmd_render.sys\0"
-            VALUE "OriginalFilename", "helios_kmd_render.sys\0"
-            VALUE "ProductName", "Helios vGPU\0"
-            VALUE "ProductVersion", "{dotted}\0"
-        END
-    END
-    BLOCK "VarFileInfo"
-    BEGIN
-        VALUE "Translation", 0x0409, 1200
-    END
-END
-"#
-        ),
-    )?;
-
-    let rc = find_windows_sdk_tool("rc.exe");
-    let status = std::process::Command::new(&rc)
-        .arg("/nologo")
-        .arg(format!("/fo{}", res_path.display()))
-        .arg(&rc_path)
-        .status()?;
-    if !status.success() {
-        return Err(format!("{} failed with {status}", rc.display()).into());
-    }
-
-    println!("cargo:rerun-if-changed=build.rs");
-    // Without this, editing the version alone would not regenerate the resource:
-    // `rerun-if-changed=build.rs` only covers the script itself.
-    println!("cargo:rerun-if-changed={DRIVER_VERSION_FILE}");
-    println!("cargo:rustc-link-arg={}", res_path.display());
-    Ok(())
-}
-
-fn find_windows_sdk_tool(name: &str) -> std::path::PathBuf {
-    if let (Ok(sdk_dir), Ok(sdk_ver)) = (
-        std::env::var("WindowsSdkDir"),
-        std::env::var("WindowsSDKVersion"),
-    ) {
-        let candidate = std::path::Path::new(&sdk_dir)
-            .join("bin")
-            .join(sdk_ver.trim_end_matches('\\'))
-            .join("x64")
-            .join(name);
-        if candidate.exists() {
-            return candidate;
-        }
-    }
-
-    let candidate =
-        std::path::Path::new(r"C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64")
-            .join(name);
-    if candidate.exists() {
-        return candidate;
-    }
-
-    name.into()
+    metadata::compile("kmd_render")
 }
 
 fn generate_dxgk_bindings() -> Result<(), Box<dyn std::error::Error>> {

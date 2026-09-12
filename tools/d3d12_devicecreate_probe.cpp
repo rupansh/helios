@@ -28,7 +28,7 @@
 // gate's whole point is to exercise the real client path.
 //
 // ADAPTER SELECTION. Helios is matched on its DXGI description, which is the
-// `DeviceDesc` string the INF installs ("Helios vGPU Render Adapter"). The
+// `DeviceDesc` string the INF installs ("Helios vGPU"). The
 // D3DKMT route the D3D11 probes use (KMTQAITYPE_UMDRIVERNAME, because
 // KMTQAITYPE_ADAPTERREGISTRYINFO fails on every adapter on this box) is not
 // available here: D3D12CreateDevice wants an IDXGIAdapter, so the enumeration
@@ -48,8 +48,7 @@
 namespace {
 
 // The substring that identifies Helios in a DXGI adapter description. Matches
-// "Helios vGPU Render Adapter (WDDM bring-up)" without pinning the parenthetical,
-// which is a bring-up label and is expected to change.
+// both the current product name and older adapter descriptions.
 const wchar_t* kHeliosDescription = L"Helios";
 
 enum class Expect { Report, Fail, Ok };

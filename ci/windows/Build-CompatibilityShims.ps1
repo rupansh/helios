@@ -6,6 +6,8 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "Initialize-HeliosBuild.ps1")
+. (Join-Path $RepoRoot "metadata\Read-HeliosMetadata.ps1")
+$metadata = Read-HeliosMetadata $RepoRoot
 Import-VisualStudioEnvironment
 
 $compatibilityRoot = Join-Path $RepoRoot "packaging\windows\compat"
@@ -36,9 +38,22 @@ $buildDir = Join-Path ([IO.Path]::GetTempPath()) ("helios-compatibility-" + [Gui
 New-Item -ItemType Directory -Path $buildDir | Out-Null
 
 try {
+    # Generated in the build directory so every release-version bump reaches
+    # both ADL version queries without a checked-in stale version literal.
+    $metadataHeader = Join-Path $buildDir "helios_metadata.h"
+    @"
+#define HELIOS_ADL_VERSION "$($metadata.HELIOS_KMD_VERSION) $($metadata.HELIOS_PRODUCT) $($metadata.HELIOS_ADL_ROLE)"
+#define HELIOS_PRODUCT "$($metadata.HELIOS_PRODUCT)"
+"@ | Set-Content -LiteralPath $metadataHeader -Encoding ascii
     $adlObject = Join-Path $buildDir "helios-adl-shim.obj"
     $adlDll = Join-Path $OutputDir "atiadlxx.dll"
     $adlImportLibrary = Join-Path $buildDir "atiadlxx.lib"
+    $adlResourceSource = Join-Path $buildDir "atiadlxx.rc"
+    $adlResource = Join-Path $buildDir "atiadlxx.res"
+    Write-HeliosAdlVersionResource -RepoRoot $RepoRoot -OutputPath $adlResourceSource
+    $resourceCompiler = Find-WindowsKitTool "rc.exe"
+    & $resourceCompiler /nologo "/fo$adlResource" $adlResourceSource
+    if ($LASTEXITCODE -ne 0) { throw "rc.exe failed to compile ADL version metadata." }
 
     $compileArguments = @(
         "/nologo",
@@ -52,6 +67,7 @@ try {
         "/GS",
         "/guard:cf",
         "/Brepro",
+        "/I$buildDir",
         "/Fo$adlObject",
         $adlSource
     )
@@ -73,6 +89,7 @@ try {
         "/IMPLIB:$adlImportLibrary",
         "/DEF:$adlDefinition",
         $adlObject,
+        $adlResource,
         "setupapi.lib",
         "user32.lib",
         "uuid.lib"

@@ -365,14 +365,22 @@ impl ScanoutMode {
     /// `host` is `VirtioGpu::display_mode`'s answer — note that method and
     /// `AdapterContext::display_mode` are different methods with the same name;
     /// only the latter reads this value.
-    pub(crate) fn adopt(host: Option<(u32, u32)>) -> Self {
-        let mode = host
-            .and_then(|(w, h)| DisplayMode::from_host(w, h))
-            .unwrap_or(DEFAULT_SCANOUT_EXTENT);
-        Self {
-            mode,
-            edid: crate::ddi::vidpn::build_edid(mode.width(), mode.height()),
+    pub(crate) fn adopt(host: Option<(u32, u32)>) -> Option<Self> {
+        let build = |mode: DisplayMode| {
+            crate::ddi::vidpn::build_edid(mode.width(), mode.height())
+                .map(|edid| Self { mode, edid })
+        };
+        if let Some((w, h)) = host {
+            if let Some(value) = DisplayMode::from_host(w, h).and_then(build) {
+                return Some(value);
+            }
+            // StartDevice/PASSIVE only. Reject an extent the base EDID cannot
+            // encode, with a named counter, before choosing the matching fallback.
+            static REJECTIONS: AtomicU32 = AtomicU32::new(0);
+            let count = REJECTIONS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            crate::diag::record_named_bytes(b"EdidModeRejectCount", count);
         }
+        build(DEFAULT_SCANOUT_EXTENT)
     }
 
     /// A zeroed-EDID mode for the render-only surface, where no monitor is

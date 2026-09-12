@@ -14,6 +14,9 @@
 //! DXVK is compiled with clang-cl + `-Db_vscrt=mt`; the shim explicitly uses
 //! `/MT`, and the Rust msvc target enables `crt-static` in `.cargo/config.toml`.
 
+#[path = "../metadata/windows_resource.rs"]
+mod metadata;
+
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -151,6 +154,8 @@ fn main() {
         println!("cargo:warning=helios_umd: skipping DXVK bridge on non-Windows target");
         return;
     }
+
+    metadata::compile("umd").expect("Helios metadata/resource compilation failed");
 
     let dxvk_src = def("HELIOS_DXVK_SRC", r"C:\Users\Rupansh\dxvk-helios");
     let dxvk_build = def("HELIOS_DXVK_BUILD", r"C:\Users\Rupansh\dxvk-build");

@@ -45,6 +45,9 @@
 //! *never hand-transcribe a DDI ABI struct* — and R908 is what ignoring it
 //! cost.
 
+#[path = "../metadata/windows_resource.rs"]
+mod metadata;
+
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -415,6 +418,8 @@ fn main() {
         );
         return;
     }
+
+    metadata::compile("umd12").expect("Helios metadata/resource compilation failed");
 
     // The real path: the build host is Windows. Regenerate from the SDK header
     // (ground truth), then build and link the engine bridge.

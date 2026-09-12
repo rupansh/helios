@@ -2,6 +2,7 @@
 #define _WIN32_WINNT 0x0A00
 
 #include <windows.h>
+#include "helios_metadata.h"
 
 #include <devguid.h>
 #include <devpkey.h>
@@ -272,15 +273,15 @@ bool valid_adapter_index(int adapter_index) {
 
 void fill_version_info(AdlVersionsInfo* info) {
     std::memset(info, 0, sizeof(*info));
-    copy_string(info->driver_version, "22.22.256.0 Helios compatibility adapter");
-    copy_string(info->catalyst_version, "Helios");
+    copy_string(info->driver_version, HELIOS_ADL_VERSION);
+    copy_string(info->catalyst_version, HELIOS_PRODUCT);
 }
 
 void fill_version_info(AdlVersionsInfoX2* info) {
     std::memset(info, 0, sizeof(*info));
-    copy_string(info->driver_version, "22.22.256.0 Helios compatibility adapter");
-    copy_string(info->catalyst_version, "Helios");
-    copy_string(info->crimson_version, "Helios");
+    copy_string(info->driver_version, HELIOS_ADL_VERSION);
+    copy_string(info->catalyst_version, HELIOS_PRODUCT);
+    copy_string(info->crimson_version, HELIOS_PRODUCT);
 }
 
 } // namespace

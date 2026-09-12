@@ -213,7 +213,7 @@ function Copy-HeliosFileVerified([string]$Source, [string]$Destination, [int]$Re
 function Get-HeliosInstanceId([string]$InstanceId = "") {
   if ($InstanceId) { return $InstanceId }
   $dev = Get-CimInstance Win32_PnPEntity |
-    Where-Object { $_.PNPDeviceID -like "PCI\VEN_1AF4&DEV_1050*" -and $_.Name -like "Helios vGPU Render Adapter*" } |
+    Where-Object { $_.PNPDeviceID -like "PCI\VEN_1AF4&DEV_1050*" -and $_.Name -like "Helios*" } |
     Select-Object -First 1
   if (-not $dev) {
     $dev = Get-CimInstance Win32_PnPEntity |

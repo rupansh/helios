@@ -42,8 +42,9 @@ try {
     $signedDriver = Get-CimInstance Win32_PnPSignedDriver | Where-Object { $_.DeviceID -eq $instanceId } | Select-Object -First 1
     if ($signedDriver) {
         Write-Host "Driver provider/version: $($signedDriver.DriverProviderName) $($signedDriver.DriverVersion)"
-        if ($signedDriver.DriverProviderName -notlike "Helios*") {
-            $failures.Add("The active display driver provider is $($signedDriver.DriverProviderName), not Helios.")
+        $expectedPublisher = Get-HeliosPackagePublisher $state
+        if ($signedDriver.DriverProviderName -ne $expectedPublisher) {
+            $failures.Add("The active display driver provider is $($signedDriver.DriverProviderName), expected $expectedPublisher.")
         }
     }
 } catch {

@@ -1,9 +1,10 @@
 [package]
+authors = ["WinBoat"]
 name = "helios_kmd_render"
 version = "0.1.0"
 edition = "2021"
 build = "build.rs"
-description = "Helios vGPU WDDM 3.2 render-only miniport bring-up driver."
+description = "Helios vGPU WDDM Render and Display Driver"
 
 [lib]
 crate-type = ["cdylib"]

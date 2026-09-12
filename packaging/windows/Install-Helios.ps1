@@ -183,6 +183,7 @@ $previousOpenGL = [ordered]@{
 $state = [ordered]@{
     schemaVersion = 1
     packageId = [string]$manifest.packageId
+    publisher = Get-HeliosPackagePublisher $manifest
     version = [string]$manifest.version
     installedAtUtc = [DateTime]::UtcNow.ToString("o")
     installRoot = $installRoot

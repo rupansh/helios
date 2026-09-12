@@ -1,7 +1,8 @@
-; helios_kmd_render.inx — Helios vGPU render-only WDDM miniport driver.
+; helios_kmd_render.inx — Helios vGPU WDDM render and display miniport driver.
 ; Matches the virtio-gpu PCI device (VEN_1AF4 & DEV_1050). The wdk-build
 ; toolchain stamps DriverVer and produces helios_kmd_render.inf during packaging.
-; Gate-1 test package only: intentionally worse-ranked than production drivers.
+; Test-signed package: intentionally worse-ranked than production drivers.
+; Branding strings are synchronized from metadata/helios.env by tools/sync-metadata.py.
 
 [Version]
 Signature   = "$Windows NT$"
@@ -82,7 +83,7 @@ HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLim
 ;                       on. Slots 0-2.
 ;   helios_umd12.dll  - D3D12, the vkd3d-backed driver. Slot 3 only, and behind
 ;                       the HKLM\SOFTWARE\Helios!UmdD3D12 kill switch, which is
-;                       absent by default so OpenAdapter12 refuses.
+;                       enabled by default; UmdD3D12=0 disables new processes.
 ;
 ; UserModeDriverName is a REG_MULTI_SZ indexed by KMTUMDVERSION:
 ; DX9=0, DX10=1, DX11=2, DX12=3.
@@ -124,7 +125,7 @@ HKR,, InstalledDisplayDrivers,  %REG_MULTI_SZ%, helios_umd,helios_umd12
 ;
 ; ⇒ Setting it here makes discovery independent of what any earlier driver left
 ; behind. Keep the literal "Helios" substring: the ICD matcher depends on it.
-HKR,, HardwareInformation.AdapterString, %REG_SZ%, "Helios vGPU Render Adapter"
+HKR,, HardwareInformation.AdapterString, %REG_SZ%, %DeviceDesc%
 
 ; ──── Vulkan ICD registration ──────────────────────────────────────────────
 ; A universal INF may only write device-relative (HKR) registry keys, not the
@@ -136,9 +137,9 @@ HKR,, HardwareInformation.AdapterString, %REG_SZ%, "Helios vGPU Render Adapter"
 ; ──── Strings ──────────────────────────────────────────────────────────────
 
 [Strings]
-ProviderName = "Helios Project"
-DeviceDesc   = "Helios vGPU Render Adapter (WDDM bring-up)"
-DiskName     = "Helios vGPU Driver Disk"
+ProviderName = "WinBoat"
+DeviceDesc   = "Helios vGPU"
+DiskName     = "Helios vGPU Driver Package"
 REG_SZ       = 0x00000000
 REG_DWORD    = 0x00010001
 REG_MULTI_SZ = 0x00010000

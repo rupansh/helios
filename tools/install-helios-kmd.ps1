@@ -142,9 +142,13 @@ function New-HeliosCatalog([string]$PackageDir, [string]$CatPath) {
 }
 
 function Ensure-MachineCodeSigningCert {
-  $subject = "CN=WDRLocalTestCert"
+  $repo = Split-Path -Parent $PSScriptRoot
+  . (Join-Path $repo "metadata\Read-HeliosMetadata.ps1")
+  $metadata = Read-HeliosMetadata $repo
+  $subject = "CN=$($metadata.HELIOS_PUBLISHER) $($metadata.HELIOS_PRODUCT) Development Test Signing"
+  $now = Get-Date
   $cert = Get-ChildItem Cert:\LocalMachine\My -ErrorAction SilentlyContinue |
-    Where-Object { $_.Subject -eq $subject -and $_.HasPrivateKey } |
+    Where-Object { $_.Subject -eq $subject -and $_.HasPrivateKey -and $_.NotBefore -le $now -and $_.NotAfter -gt $now.AddDays(30) } |
     Sort-Object NotAfter -Descending |
     Select-Object -First 1
 
@@ -161,7 +165,7 @@ function Ensure-MachineCodeSigningCert {
       -NotAfter (Get-Date).AddYears(10)
   }
 
-  $tmp = Join-Path $env:TEMP "WDRLocalTestCert.cer"
+  $tmp = Join-Path $env:TEMP ("helios-dev-test-" + [Guid]::NewGuid().ToString("N") + ".cer")
   Export-Certificate -Cert $cert -FilePath $tmp | Out-Null
   foreach ($store in @("Root", "TrustedPublisher")) {
     try {

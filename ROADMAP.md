@@ -12,6 +12,31 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## Metadata consistency, 2026-09-12
+
+The product/adapter/monitor name is **Helios vGPU**, published and developed by
+**WinBoat**. `metadata/helios.env` owns branding, component roles and monitor model
+year; the release version stays in `kmd_render/driver-version.env`. KMD, both UMDs
+and the ADL shim use the same Windows resource template. Cargo authors, INF,
+package publisher verification, local/CI signer labels, and the Windows Mesa
+branding now follow the shared source. Legacy package verification remains valid.
+
+The EDID now reports model year 2026, mode-derived aspect ratio, standard sRGB
+coordinates and WinBoat publisher text. It no longer invents a manufacture week,
+physical panel size, physical connector, or a 200 MHz range limit that contradicts
+4K60. The base-block encoder rejects oversized extents/clocks; StartDevice counts
+these under `EdidModeRejectCount` and uses the matching 1920x1080 fallback rather
+than publishing truncated timing fields. Supporting widths >=4096 or clocks above
+655.35 MHz still requires an EDID extension/DisplayID implementation. HLS, product
+code and container GUID remain stable virtual-display identities; zero serial and
+empty standard-3D engine FriendlyName are correct, not unfinished metadata.
+
+See `metadata/README.md` for the final field table and validation boundaries.
+215 host logic tests, resource compilation for all four Helios binaries,
+PowerShell parsing/publisher checks, vendor mapping tests and EDID conformity at
+1080p, 4K UHD and portrait pass. Full Windows/Mesa builds, actual signing and
+installed-device validation remain pending. No deployment or version bump occurred.
+
 ## D3D12 on AMD/RADV: every D3D12 present scrambled, root-caused and fixed, 2026-09-09
 
 **Symptom (first AMD host run of the D3D12 stack, RX 6600 / RADV, WinBoat guest, .270):**

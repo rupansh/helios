@@ -350,7 +350,15 @@ pub unsafe extern "C" fn dxgkddi_start_device(
     // monitor, so its EDID is zeroed and QueryDeviceDescriptor answers
     // NOT_SUPPORTED before ever reading it.
     let scanout_mode = if knobs.display_half {
-        crate::adapter::ScanoutMode::adopt(host_mode)
+        match crate::adapter::ScanoutMode::adopt(host_mode) {
+            Some(mode) => mode,
+            None => {
+                // Invalid identity or fallback metadata must not become a zero
+                // EDID attached to a supposedly working display child.
+                crate::diag::record_named_bytes(b"EdidBuildFailed", 1);
+                return STATUS_UNSUCCESSFUL;
+            }
+        }
     } else {
         crate::adapter::ScanoutMode::render_only()
     };
