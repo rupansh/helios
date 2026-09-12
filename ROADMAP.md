@@ -59,8 +59,14 @@ empty standard-3D engine FriendlyName are correct, not unfinished metadata.
 See `metadata/README.md` for the final field table and validation boundaries.
 215 host logic tests, resource compilation for all four Helios binaries,
 PowerShell parsing/publisher checks, vendor mapping tests and EDID conformity at
-1080p, 4K UHD and portrait pass. Full Windows/Mesa builds, actual signing and
-installed-device validation remain pending. No deployment or version bump occurred.
+1080p, 4K UHD and portrait pass. Windows driver/engine, Mesa x64/x86, loader and
+compatibility builds/tests also passed at source commit `6e8de383` on 2026-09-12.
+The test-signed .271 bundle passed 35 manifest hash/size checks, WinBoat resources,
+INF metadata and certificate identity checks; its self-signed root remains
+untrusted on the builder. Unchanged CLVK was reused with source/patch/hash
+provenance verified. Build fixes cover explicit UTF-8 metadata I/O, PowerShell
+signing module isolation and stale lockfiles. Installed-device and visible
+rendering validation remain pending. No deployment or version bump occurred.
 
 
 ## Ready for general FL12 testing, 2026-09-12
