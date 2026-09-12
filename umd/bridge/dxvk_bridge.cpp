@@ -1251,16 +1251,8 @@ std::int32_t HeliosDxvkDevice::dxgi_blt_convert(
   });
 }
 
-// R826 counters. The gate is the stage's own measurement instrument and it
-// could not see one of its own failure modes: the catch arms returned false
-// without touching s_gateTimeouts, so a thrown exception was indistinguishable
-// from a timeout to every consumer -- forward.rs maps false to return code
-// 1 = timeout and increments EXT_FLIP_GATE_TIMEOUTS. Since R1014(4) the arms
-// live in bridge_guard and the distinction is the std::nullopt outcome.
-static std::atomic<std::uint32_t> s_gateExceptions{0};
-// The no-context arm. Counted at zero cost, but NOT a live failure mode:
-// GetImmediateContext runs before the device is handed to Rust, so this is
-// unreachable rather than rare. Recorded so the distinction is in the code.
+// Keep backend failures separate from bounded completion timeouts.
+static std::atomic<std::uint32_t> s_gateFailures{0};
 static std::atomic<std::uint32_t> s_gateNoContext{0};
 
 // Producers whose present could not be published, by stage. Every one of these
@@ -1431,41 +1423,35 @@ bool HeliosDxvkDevice::set_scanout_acquire_event(std::size_t event_handle) const
   });
 }
 
-bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us,
-                                          std::uint32_t order_mode) const {
+std::int32_t HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us,
+                                               std::uint32_t order_mode) const {
   if (!impl || !impl->context) {
     s_gateNoContext.fetch_add(1, std::memory_order_relaxed);
-    return false;
+    return E_FAIL;
   }
-  // A tri-state rather than a plain `bool` sentinel: an exception is a
-  // DIFFERENT outcome from a timeout (R826) and bumps its own counter, so
-  // `bridge_guard`'s error value has to be distinguishable from `false`.
-  const auto outcome = bridge_guard<std::optional<bool>>(
-      "present_frame_gate", std::nullopt, [&]() -> std::optional<bool> {
+  const auto outcome = bridge_guard<std::int32_t>(
+      "present_frame_gate", E_FAIL, [&]() -> std::int32_t {
     LARGE_INTEGER qpcFreq, qpcT0, qpcT1;
     QueryPerformanceFrequency(&qpcFreq);
     QueryPerformanceCounter(&qpcT0);
 
     auto* immediateContext = static_cast<dxvk::D3D11ImmediateContext*>(impl->context);
-    // Both arms satisfy the same ordering contract -- the frame's Venus work is
-    // on the wire before pfnRenderCb samples the KMD watermark. The SUBMITTED
-    // arm stops there; the COMPLETE arm additionally waits out the GPU, which
-    // is a whole frame of CPU/GPU overlap the contract never asked for. Kept as
-    // one entry point with one telemetry line so the two compare directly.
     bool completed;
     if (order_mode == kPresentOrderSubmitted) {
       if (!immediateContext->HeliosWaitFrameSubmitted()) {
         umd_log("present_frame_gate: command stream/submission failed");
-        return std::nullopt;
+        return E_FAIL;
       }
       completed = true;
-    } else {
+    } else if (order_mode == kPresentOrderComplete) {
       const auto result = immediateContext->HeliosWaitFrameComplete(timeout_us);
       if (result != VK_SUCCESS && result != VK_TIMEOUT) {
         umd_log("present_frame_gate: command stream/submission failed");
-        return std::nullopt;
+        return E_FAIL;
       }
       completed = result == VK_SUCCESS;
+    } else {
+      return E_FAIL;
     }
 
     // Gate-cost telemetry (PSC WS2 discipline): one line per 128 presents.
@@ -1487,24 +1473,16 @@ bool HeliosDxvkDevice::present_frame_gate(std::uint32_t timeout_us,
                     static_cast<unsigned long long>(sample->avg_us),
                     static_cast<unsigned long long>(sample->max_us),
                     s_gateTimeouts.load(std::memory_order_relaxed),
-                    s_gateExceptions.load(std::memory_order_relaxed),
+                    s_gateFailures.load(std::memory_order_relaxed),
                     s_gateNoContext.load(std::memory_order_relaxed),
                     order_mode);
       umd_log(msg);
     }
-    return completed;
+    return completed ? S_OK : S_FALSE;
   });
-  // R826: the exception arms are a DIFFERENT outcome from a timeout and are
-  // counted as one. The `bool` return and the bounded timeout are KEPT -- this
-  // is a real event wait with a safety bound, which the frozen baseline keeps.
-  // A later, separate commit may return an
-  // `enum class GateOutcome { Completed, TimedOut, Failed }` so the Rust caller
-  // must handle Failed explicitly instead of reporting it as a timeout.
-  if (!outcome) {
-    s_gateExceptions.fetch_add(1, std::memory_order_relaxed);
-    return false;
-  }
-  return *outcome;
+  if (outcome < 0)
+    s_gateFailures.fetch_add(1, std::memory_order_relaxed);
+  return outcome;
 }
 
 std::uint64_t HeliosDxvkDevice::flush_present_copy() const {

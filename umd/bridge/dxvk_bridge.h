@@ -15,9 +15,7 @@
 // Owns the DXVK Rc<DxvkInstance/Adapter/Device>; defined in dxvk_bridge.cpp.
 struct HeliosDxvkDeviceImpl;
 
-// `order_mode` of HeliosDxvkDevice::present_frame_gate. The values are the
-// `HKLM\SOFTWARE\Helios!PresentOrder` registry values, spelled here so the
-// wire meaning of the knob lives beside the code that branches on it.
+// `order_mode` of HeliosDxvkDevice::present_frame_gate.
 inline constexpr std::uint32_t kPresentOrderComplete = 0;
 inline constexpr std::uint32_t kPresentOrderSubmitted = 1;
 
@@ -183,18 +181,10 @@ struct HeliosDxvkDevice {
   // device.
   bool set_scanout_acquire_event(std::size_t event_handle) const noexcept;
 
-  // Present-path ordering gate. `order_mode` selects WHAT is waited for:
-  //
-  //   kPresentOrderSubmitted — wait until the frame's Venus work has reached
-  //     vkQueueSubmit (D3D11ImmediateContext::HeliosWaitFrameSubmitted). This
-  //     is the KMD's actual requirement: pfnRenderCb then samples a watermark
-  //     that covers the frame. `timeout_us` is unused; the wait is on guest CPU
-  //     threads only and always reports true.
-  //   kPresentOrderComplete — additionally wait, bounded by `timeout_us`, for
-  //     the GPU to finish it (HeliosWaitFrameComplete). Returns false on
-  //     timeout/error, and a timeout means the present is published with work
-  //     still outstanding — the stale-frame window this gate exists to close.
-  bool present_frame_gate(std::uint32_t timeout_us, std::uint32_t order_mode) const;
+  // Submitted waits for the frame's vkQueueSubmit; Complete additionally
+  // waits for GPU completion, bounded by timeout_us. Returns S_OK, S_FALSE
+  // for a Complete timeout, or E_FAIL if the command stream/device failed.
+  std::int32_t present_frame_gate(std::uint32_t timeout_us, std::uint32_t order_mode) const;
 
   // Vehicle consumer release: capture once at the existing copy flush, then
   // wait for that immutable submission. 0 capture / negative wait = failure;

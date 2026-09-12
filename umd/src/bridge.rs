@@ -189,11 +189,9 @@ mod ffi {
             src_right: u32,
             src_bottom: u32,
         ) -> i32;
-        /// Present-path frame-completion gate: bounded wait (timeout_us)
-        /// until the current flush's submission completes on the GPU, so the
-        /// IddCx consumer never copies a buffer whose writes are in flight.
-        /// Returns false on timeout (caller proceeds — bounded by design).
-        fn present_frame_gate(self: &HeliosDxvkDevice, timeout_us: u32, order_mode: u32) -> bool;
+        /// S_OK after ordering, S_FALSE on a bounded completion timeout,
+        /// E_FAIL on command-stream/device failure.
+        fn present_frame_gate(self: &HeliosDxvkDevice, timeout_us: u32, order_mode: u32) -> i32;
         fn flush_present_copy(self: &HeliosDxvkDevice) -> u64;
         fn wait_present_copy(self: &HeliosDxvkDevice, submission_id: u64, timeout_us: u32) -> i32;
 
@@ -612,9 +610,9 @@ impl BridgeDevice {
         }
     }
 
-    pub(crate) fn present_frame_gate(&self, timeout_us: u32, order_mode: u32) -> bool {
+    pub(crate) fn present_frame_gate(&self, timeout_us: u32, order_mode: u32) -> i32 {
         self.get()
-            .is_some_and(|d| d.present_frame_gate(timeout_us, order_mode))
+            .map_or(crate::hr::E_FAIL, |d| d.present_frame_gate(timeout_us, order_mode))
     }
 
     pub(crate) fn flush_present_copy(&self) -> u64 {

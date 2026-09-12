@@ -495,75 +495,38 @@ unsafe fn present_prerequisites(
 pub(super) const PRESENT_ORDER_COMPLETE: u32 = 0;
 pub(super) const PRESENT_ORDER_SUBMITTED: u32 = 1;
 
-/// Outcome of the bounded frame gate. `#[must_use]` because `dxgi_present1`'s
-/// multi arm silently discarded the boolean this replaces.
-///
-/// "Did not confirm completion", not "timed out": `present_frame_gate` also
-/// returns false when the bridge impl/context is missing or an exception was
-/// caught, so a nonzero count folds those in.
-#[must_use]
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum GateOutcome {
-    Completed,
-    NotConfirmed,
-}
-
-/// Frame-gate non-confirmations on EVERY path. `EXT_FLIP_GATE_TIMEOUTS` is
-/// conditioned on `is_vehicle_present`, so an expiry on the direct-primary
-/// path — the one that ships — incremented nothing and logged nothing, and the
-/// only trace was the aggregated C++ `present-gate: ... timeouts=` line every
-/// 128 presents. A gate expiry means the present is published while DXVK still
-/// has queued work: exactly the producer race the gate exists to close, so a
-/// steady-state expiry was indistinguishable from a healthy run in the guest
-/// counters and the stale-frame symptom got blamed on the KMD marker or the
-/// host.
-static PRESENT_GATE_TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
+/// Bounded vehicle completion timeouts retain the existing continue policy.
+/// Submission or device failure must stop Present before publishing a frame.
+static PRESENT_GATE_FAILURES: AtomicUsize = AtomicUsize::new(0);
 static PRESENT_GATE_LOG_COUNT: LogThrottle = LogThrottle::new();
 
-/// Run the bounded gate and count every non-confirmation. The present proceeds
-/// either way — a stale frame beats a wedged worker — so the outcome is
-/// telemetry, not control flow, but it must not be droppable by accident.
-unsafe fn run_present_frame_gate(
+fn run_present_frame_gate(
     dev: &crate::device_funcs::HeliosDevice,
     gate_us: u32,
     is_vehicle_present: bool,
-) -> GateOutcome {
-    // The vehicle keeps the COMPLETE wait, and it is the ONLY path that may.
-    // Its ordering requirement is genuinely different and genuinely stronger:
-    // the vehicle backbuffer is scanned out on a direct/independent flip
-    // ordered only on the KMD's DMA fence, which completes at DECODE, so the
-    // copy's host-GPU completion is what has to be waited for (24th session).
-    // It has its own bound, `VehicleFlipGateUs`.
-    //
-    // The DIRECT-PRIMARY / ordinary-app path is SUBMITTED, unconditionally and
-    // with no knob. It is ordered by the `DxgkDdiRender` watermark, which needs
-    // only that the frame's Venus work has reached `vkQueueSubmit`; waiting for
-    // GPU completion here is a producer-side CPU stall that removes all
-    // CPU/GPU overlap and does not fix the ordering anyway (owner-verified
-    // 2026-07-29: an unexpirable 200 ms completion gate still flashed black).
-    // The `PresentOrder`/`PresentGateUs` knobs that used to select and bound it
-    // were deleted with it — see the ⛔ note in `crate::knobs`.
+) -> Result<(), i32> {
+    // Ordinary presents need submission before the KMD samples its watermark.
+    // The vehicle additionally waits for GPU completion of its copy.
     let order_mode = if is_vehicle_present {
         PRESENT_ORDER_COMPLETE
     } else {
         PRESENT_ORDER_SUBMITTED
     };
-    if dev.dxvk.present_frame_gate(gate_us, order_mode) {
-        return GateOutcome::Completed;
-    }
-    let total = PRESENT_GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
-    if is_vehicle_present {
-        // Unchanged text and cadence: this is the pre-existing vehicle line.
-        let n = EXT_FLIP_GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-        if n < 16 || n % 512 == 0 {
-            log_error!("vehicle flip gate TIMEOUT (x{}) — flipping anyway", n + 1);
+    match dev.dxvk.present_frame_gate(gate_us, order_mode) {
+        0 => Ok(()),
+        1 if is_vehicle_present => {
+            let n = EXT_FLIP_GATE_TIMEOUTS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n <= 16 || n % 512 == 0 {
+                log_error!("vehicle flip gate TIMEOUT (x{n}) - flipping anyway");
+            }
+            Ok(())
         }
-    } else {
-        if PRESENT_GATE_LOG_COUNT.first_n_then_every(16, 512).is_some() {
-            log_error!(
-                "present frame gate did not confirm completion (x{total}) — presenting anyway"
-            );
+        hr => {
+            let n = PRESENT_GATE_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
+            if PRESENT_GATE_LOG_COUNT.first_n_then_every(16, 512).is_some() {
+                log_error!("Present refused: frame gate failed (count={n} hr=0x{:08x})", hr as u32);
+            }
+            Err(E_FAIL)
         }
     }
-    GateOutcome::NotConfirmed
 }

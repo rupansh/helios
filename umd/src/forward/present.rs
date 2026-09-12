@@ -1580,7 +1580,9 @@ unsafe fn dxgi_present_impl(
     }
     if !async_stream_eligible && (!is_vehicle_present || gate_us != 0) {
         if let Some(dev) = helios_device(h) {
-            let _outcome = run_present_frame_gate(dev, gate_us, is_vehicle_present);
+            if let Err(hr) = run_present_frame_gate(dev, gate_us, is_vehicle_present) {
+                return hr;
+            }
         }
     }
 
@@ -2602,12 +2604,9 @@ pub(crate) unsafe extern "system" fn dxgi_present1(arg: *mut ddi::DXGI_DDI_ARG_P
     }
 
     if let Some(dev) = helios_device(h) {
-        // Present1-multi discarded this boolean entirely; #[must_use] on
-        // GateOutcome makes that a compiler warning rather than a silence.
-        // Unconditional and unbounded-by-nothing: the SUBMITTED wait is on two
-        // guest CPU threads and has no slow-GPU case to bound, so it takes the
-        // `0` the vehicle-only timeout would have carried.
-        let _outcome = run_present_frame_gate(dev, 0, false);
+        if let Err(hr) = run_present_frame_gate(dev, 0, false) {
+            return hr;
+        }
     }
 
     let present_hr = match finish_present(

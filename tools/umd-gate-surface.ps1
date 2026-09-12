@@ -63,7 +63,9 @@ param(
         # "%s: DxvkError" (umd/bridge/dxvk_bridge.cpp:313) with the guard name,
         # so the text carries a COLON. 2026-08-05: colon added; the old
         # colon-less pattern could never match.
-        'present_frame_gate: DxvkError'
+        'present_frame_gate: DxvkError',
+        'Present refused: frame gate failed',
+        'Present refused: required sample/color normalization unavailable'
         # 2026-08-05: the 'DEVICE REMOVED' pattern was DELETED. Nothing in
         # umd/, umd/bridge/, kmd_render/ or dxvk-helios/src/ ever logs that
         # text (the only "DeviceRemoved" hits are D3D11 API method names), so
