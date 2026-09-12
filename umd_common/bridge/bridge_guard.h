@@ -35,8 +35,9 @@
 // ── The one engine-specific customization point ─────────────────────────────
 //
 // DXVK throws `dxvk::DxvkError`, which is not a `std::exception`, so the D3D11
-// bridge needs an arm for it BEFORE the generic ones. vkd3d is a C library
-// behind a COM ABI and throws nothing, so the D3D12 bridge needs no arm at all.
+// bridge needs an arm for it BEFORE the generic ones. vkd3d can reach C++
+// compiler allocations through its C ABI; the D3D12 bridge uses the generic
+// arms for escaping exceptions and needs no engine-specific exception type.
 //
 // A bridge that wants one defines this macro to a complete `catch` clause
 // before including this header:

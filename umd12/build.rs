@@ -306,7 +306,8 @@ fn build_vkd3d_bridge() {
         // cxx-build disables C++ exceptions by default; the shared
         // `bridge_guard` is a try/catch and will not compile without this.
         // ⛔ Enabling EH is NOT permission to define
-        // `HELIOS_BRIDGE_ENGINE_CATCH` — vkd3d throws nothing.
+        // `HELIOS_BRIDGE_ENGINE_CATCH` — compiler exceptions use the shared
+        // generic arms, with explicit throwing C declarations where needed.
         .flag("/EHsc")
         // ⚠ `"bridge"` comes FIRST deliberately: a same-named header in this
         // crate must win, so a future D3D12-only override of a shared header is

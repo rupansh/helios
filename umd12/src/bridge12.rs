@@ -128,7 +128,15 @@ mod ffi {
         fn helios_vkd3d_bridge_create_device(
             luid_low: u32,
             luid_high: i32,
+            minimum_feature_level: u32,
         ) -> UniquePtr<HeliosVkd3dDevice>;
+
+        fn native_optional_caps(
+            self: &HeliosVkd3dDevice,
+            shader_model: &mut u32,
+            raytracing_tier: &mut u32,
+            device_uuid: &mut [u8],
+        ) -> bool;
 
         /// Stateless forward to the engine's second entry point.
         ///
@@ -142,6 +150,29 @@ mod ffi {
             version: u32,
             blob_out: *mut usize,
             err_out: *mut usize,
+        ) -> i32;
+
+        /// # Safety
+        /// Device and versioned descriptor tree are borrowed for the call;
+        /// output receives one owned root-signature COM reference.
+        unsafe fn helios_vkd3d_bridge_create_root_signature(
+            device: usize,
+            node_mask: u32,
+            desc: usize,
+            root_out: *mut usize,
+        ) -> i32;
+
+        /// # Safety
+        /// A live engine command list, exclusively borrowed during its DDI.
+        unsafe fn helios_vkd3d_bridge_clear_root_arguments(list: usize) -> i32;
+
+        /// # Safety
+        /// Device and complete pipeline stream are borrowed engine/API objects
+        /// live through this call. Output receives one owned PSO reference.
+        unsafe fn helios_vkd3d_bridge_create_stream_output_pipeline(
+            device: usize,
+            desc: usize,
+            pipeline_out: *mut usize,
         ) -> i32;
 
         /// Queue a complete ECL batch behind the runtime's exact context event.
@@ -158,8 +189,50 @@ mod ffi {
         ) -> i32;
 
         /// # Safety
+        /// All engine objects and API-typed arrays are live for this call.
+        /// The engine copies mapping data and duplicates the admission event.
+        unsafe fn helios_vkd3d_bridge_update_tiles(
+            queue: usize,
+            resource: usize,
+            region_count: u32,
+            coords: usize,
+            sizes: usize,
+            heap: usize,
+            range_count: u32,
+            flags: usize,
+            offsets: usize,
+            counts: usize,
+            mapping_flags: i32,
+            admission: usize,
+            ctx: *mut u32,
+            value: *mut u32,
+            cookie: *mut u64,
+        ) -> i32;
+        /// # Safety
+        /// Engine objects and API coordinate/size structures are live for the
+        /// call. Source mappings are resolved on the worker after admission.
+        unsafe fn helios_vkd3d_bridge_copy_tiles(
+            queue: usize,
+            dst: usize,
+            dst_coord: usize,
+            src: usize,
+            src_coord: usize,
+            size: usize,
+            flags: i32,
+            admission: usize,
+            ctx: *mut u32,
+            value: *mut u32,
+            cookie: *mut u64,
+        ) -> i32;
+
+        /// # Safety
         /// Queue is live. Called after runtime context destruction, or on failure.
         unsafe fn helios_vkd3d_bridge_cancel_execution(queue: usize, reason: i32);
+
+        /// S_FALSE preserves execution-owned storage; S_OK resets it.
+        /// # Safety
+        /// Live borrowed engine allocator with externally serialized use.
+        unsafe fn helios_vkd3d_bridge_try_reset_allocator(allocator: usize) -> i32;
 
         /// Commit a producer boundary after preceding work on the exact queue.
         /// # Safety
@@ -184,6 +257,40 @@ use core::mem::ManuallyDrop;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::ID3D12Device;
 
+/// Compile a native-DDI SO pipeline with explicit physical-register origin.
+/// # Safety
+/// Every pointer inside `desc` is valid and unchanged for this call, and
+/// `device` is the live bridge engine device owning its referenced objects.
+pub(crate) unsafe fn create_stream_output_pipeline(
+    device: &ID3D12Device,
+    desc: &windows::Win32::Graphics::Direct3D12::D3D12_PIPELINE_STATE_STREAM_DESC,
+) -> windows::core::Result<windows::Win32::Graphics::Direct3D12::ID3D12PipelineState> {
+    let mut raw = 0usize;
+    // SAFETY: the caller guarantees the device and complete borrowed stream;
+    // `raw` is writable storage and the bridge initializes it on every path.
+    let hr = unsafe {
+        ffi::helios_vkd3d_bridge_create_stream_output_pipeline(
+            device.as_raw() as usize,
+            core::ptr::from_ref(desc) as usize,
+            &mut raw,
+        )
+    };
+    if hr < 0 {
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+            hr,
+        )));
+    }
+    if raw == 0 {
+        return Err(windows::core::Error::from_hresult(windows::core::HRESULT(
+            helios_umd_common::hr::E_FAIL,
+        )));
+    }
+    // SAFETY: success transfers exactly one owned ID3D12PipelineState reference.
+    Ok(unsafe {
+        windows::Win32::Graphics::Direct3D12::ID3D12PipelineState::from_raw(raw as *mut c_void)
+    })
+}
+
 /// The vkd3d bridge device, with the raw cxx surface sealed off.
 ///
 /// ⛔ **No `Deref`, and `inner` is private.** Module privacy alone is NOT
@@ -199,12 +306,91 @@ pub struct BridgeDevice12 {
     inner: cxx::UniquePtr<ffi::HeliosVkd3dDevice>,
 }
 
+// SAFETY: the uniquely owned C++ holder contains a free-threaded ID3D12Device
+// and immutable context identities captured at creation. Its normal native DDI
+// owner already permits destruction on another thread. This grants ownership
+// transfer only, not unsynchronized shared access (no Sync implementation).
+unsafe impl Send for BridgeDevice12 {}
+
+// Keep the capability-discovery engine until the first native CreateDevice can
+// take ownership. Closing an adapter discards any unclaimed engine. The mutex
+// protects only the handoff; device creation/destruction run outside that lock.
+static CAPABILITY_ENGINE: std::sync::Mutex<Option<BridgeDevice12>> = std::sync::Mutex::new(None);
+
+pub(crate) fn discard_capability_engine() {
+    let pending = match CAPABILITY_ENGINE.lock() {
+        Ok(mut slot) => slot.take(),
+        Err(_) => {
+            crate::note_refusal(&crate::UMD12_REFUSALS.caps_engine_unavailable);
+            return;
+        }
+    };
+    drop(pending);
+}
+
+/// Actual selected-engine capabilities, before the native UMD's tier ceilings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) struct NativeOptionalCaps {
+    pub shader_model: u32,
+    pub raytracing_tier: u32,
+    pub device_uuid: [u8; 16],
+}
+
 impl BridgeDevice12 {
     /// Create a vkd3d device on the Helios adapter with this LUID. `None` when
     /// the bridge returned nothing — folding the old `is_null()` check into
     /// construction so a `BridgeDevice12` that exists is always usable.
     pub fn create(luid_low: u32, luid_high: i32) -> Option<Self> {
-        let inner = ffi::helios_vkd3d_bridge_create_device(luid_low, luid_high);
+        let expected = crate::caps12::native_optional_caps()?;
+        let pending = if luid_low == 0 && luid_high == 0 {
+            CAPABILITY_ENGINE.lock().ok()?.take()
+        } else {
+            None
+        };
+        let device = match pending {
+            Some(device) => {
+                crate::log_error!(
+                    "Native CreateDevice takes ownership of capability-discovery engine"
+                );
+                device
+            }
+            None => Self::create_for_caps(luid_low, luid_high)?,
+        };
+        let actual = device.optional_caps()?;
+        if actual != expected {
+            crate::note_refusal(&crate::UMD12_REFUSALS.caps_engine_mismatch);
+            crate::log_error!("Native adapter/device capability mismatch: advertised={expected:?} actual={actual:?}");
+            return None;
+        }
+        Some(device)
+    }
+
+    // Discovery runs once under caps12's initialization mutex. Native creation
+    // consumes the engine; caps-only adapter closure releases it normally.
+    pub(crate) fn probe_optional_caps() -> Option<NativeOptionalCaps> {
+        let device = Self::create_for_caps(0, 0)?;
+        let caps = device.optional_caps()?;
+        *CAPABILITY_ENGINE.lock().ok()? = Some(device);
+        Some(caps)
+    }
+
+    fn optional_caps(&self) -> Option<NativeOptionalCaps> {
+        let mut caps = NativeOptionalCaps::default();
+        self.get()?
+            .native_optional_caps(
+                &mut caps.shader_model,
+                &mut caps.raytracing_tier,
+                &mut caps.device_uuid,
+            )
+            .then_some(caps)
+    }
+
+    fn create_for_caps(luid_low: u32, luid_high: i32) -> Option<Self> {
+        let inner = ffi::helios_vkd3d_bridge_create_device(
+            luid_low,
+            luid_high,
+            crate::caps12::REQUIRED_ENGINE_FEATURE_LEVEL,
+        );
         (!inner.is_null()).then_some(Self { inner })
     }
 
@@ -467,6 +653,35 @@ pub(crate) unsafe fn serialize_root_signature(
 }
 
 /// # Safety
+/// Device and all pointers in the versioned descriptor tree remain live for the
+/// synchronous call. The output receives an owned engine COM reference.
+pub(crate) unsafe fn create_root_signature(
+    device: usize,
+    node_mask: u32,
+    desc: usize,
+    root_out: *mut usize,
+) -> i32 {
+    // SAFETY: caller supplies the complete borrowed tree and writable output.
+    unsafe { ffi::helios_vkd3d_bridge_create_root_signature(device, node_mask, desc, root_out) }
+}
+
+/// # Safety
+/// List is an exclusively borrowed live engine command list for this DDI.
+pub(crate) unsafe fn clear_root_arguments(list: usize) -> i32 {
+    // SAFETY: the native DDI owns the list during this synchronous operation.
+    unsafe { ffi::helios_vkd3d_bridge_clear_root_arguments(list) }
+}
+
+/// Reset only when the engine's execution references have retired. S_FALSE is
+/// an ownership result, never an attestation of GPU completion.
+/// # Safety
+/// `allocator` is a live borrowed engine allocator; its use is serialized.
+pub(crate) unsafe fn try_reset_allocator(allocator: usize) -> i32 {
+    // SAFETY: the caller owns and serializes the engine allocator.
+    unsafe { ffi::helios_vkd3d_bridge_try_reset_allocator(allocator) }
+}
+
+/// # Safety
 /// queue and resource are live engine COM objects of the same device for this
 /// call. The allocation belongs to that exact resource's current incarnation.
 pub(crate) unsafe fn publish_producer(
@@ -524,4 +739,99 @@ pub(crate) unsafe fn execute(
 pub(crate) unsafe fn cancel_execution(queue: usize, reason: i32) {
     // SAFETY: forwarded live queue; no reference escapes the call.
     unsafe { ffi::helios_vkd3d_bridge_cancel_execution(queue, reason) };
+}
+
+/// Borrowed API data for an admitted tile update. Optional arrays are represented
+/// by null pointers; their counts still describe the API's documented defaults.
+pub(crate) struct TileUpdate {
+    pub resource: usize,
+    pub region_count: u32,
+    pub coords: usize,
+    pub sizes: usize,
+    pub heap: usize,
+    pub range_count: u32,
+    pub range_flags: usize,
+    pub offsets: usize,
+    pub counts: usize,
+    pub flags: i32,
+}
+
+/// # Safety
+/// Live engine queue/resource/heap and correctly typed API arrays in `update`.
+/// All pointers and the event remain live through this synchronous call.
+pub(crate) unsafe fn update_tiles(
+    queue: usize,
+    update: &TileUpdate,
+    admission: usize,
+) -> Result<(u32, u32, u64), i32> {
+    let (mut ctx, mut value, mut cookie) = (0, 0, 0);
+    // SAFETY: the caller owns the borrowed engine objects/arrays/event; outputs
+    // are writable locals. The engine retains its own worker dependencies.
+    let hr = unsafe {
+        ffi::helios_vkd3d_bridge_update_tiles(
+            queue,
+            update.resource,
+            update.region_count,
+            update.coords,
+            update.sizes,
+            update.heap,
+            update.range_count,
+            update.range_flags,
+            update.offsets,
+            update.counts,
+            update.flags,
+            admission,
+            &mut ctx,
+            &mut value,
+            &mut cookie,
+        )
+    };
+    tile_boundary(hr, ctx, value, cookie)
+}
+
+pub(crate) struct TileCopy {
+    pub dst: usize,
+    pub dst_coord: usize,
+    pub src: usize,
+    pub src_coord: usize,
+    pub size: usize,
+    pub flags: i32,
+}
+
+/// # Safety
+/// Live engine queue/resources, API coordinates/size and admission event. The
+/// worker retains the resources and copies the scalar mapping description.
+pub(crate) unsafe fn copy_tiles(
+    queue: usize,
+    copy: &TileCopy,
+    admission: usize,
+) -> Result<(u32, u32, u64), i32> {
+    let (mut ctx, mut value, mut cookie) = (0, 0, 0);
+    // SAFETY: caller's live API-typed arguments, writable output locals.
+    let hr = unsafe {
+        ffi::helios_vkd3d_bridge_copy_tiles(
+            queue,
+            copy.dst,
+            copy.dst_coord,
+            copy.src,
+            copy.src_coord,
+            copy.size,
+            copy.flags,
+            admission,
+            &mut ctx,
+            &mut value,
+            &mut cookie,
+        )
+    };
+    tile_boundary(hr, ctx, value, cookie)
+}
+
+fn tile_boundary(hr: i32, ctx: u32, value: u32, cookie: u64) -> Result<(u32, u32, u64), i32> {
+    if hr < 0 {
+        Err(hr)
+    } else if ctx == 0 || value == 0 || cookie == 0 {
+        Err(helios_umd_common::hr::E_FAIL)
+    } else {
+        Ok((ctx, value, cookie))
+    }
 }

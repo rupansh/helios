@@ -5,6 +5,14 @@ x64 Windows archive that turns a clean Helios Windows 11 guest into a
 system-wide graphics/compute installation. It includes x86 Direct3D 11/12 and Vulkan/OpenGL
 components for WoW64 applications alongside the native x64 stack.
 
+The 2026-09-09 native-DGC source requires the paired renderer/protocol fork
+described in [NATIVE_DGC.md](docs/dx12/NATIVE_DGC.md) for its state-changing
+indirect path. This Windows bundle does not install the Linux renderer. Mesa's
+generated driver headers must match that protocol; regenerate them with
+`tools/build-native-renderer.sh` before packaging source changes. Existing
+LLVM/libclang22.1.8, VulkanSDK1.4.350.0 and bindgen0.72 pins remain. The new local
+builds are not hosted-CI or native guest acceptance evidence.
+
 ## What the workflow builds
 
 The jobs are independent so an error points at the actual component:

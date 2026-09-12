@@ -39,6 +39,10 @@ struct HeliosVkd3dDevice {
 
   std::unique_ptr<HeliosVkd3dDeviceImpl> impl;
 
+  // Engine-derived values, rechecking native admission including override refusal.
+  bool native_optional_caps(std::uint32_t& shader_model, std::uint32_t& raytracing_tier,
+                            rust::Slice<std::uint8_t> device_uuid) const noexcept;
+
   // BORROWED — the bridge keeps the owning reference. 0 if not created.
   // The caller must NOT `Release()` this, and on the Rust side must not let a
   // `windows::ID3D12Device` own it (that is a double release at drop).
@@ -143,7 +147,7 @@ struct HeliosVkd3dDevice {
 // error at best and — because the engine symbol is `extern "C"` while this one
 // is C++-mangled — a silently different function at worst.
 std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
-    std::uint32_t luid_low, std::int32_t luid_high);
+    std::uint32_t luid_low, std::int32_t luid_high, std::uint32_t minimum_feature_level);
 
 // Stateless forward to the engine's second entry point (`helios_entry.c:190`).
 // `desc` is a `const D3D12_ROOT_SIGNATURE_DESC*` carried as an integer for the
@@ -153,6 +157,17 @@ std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
 std::int32_t helios_vkd3d_bridge_serialize_root_signature(
     std::size_t desc, std::uint32_t version,
     std::size_t* blob_out, std::size_t* err_out) noexcept;
+
+// Native root-signature and root-argument DDI operations. All input pointers
+// are borrowed; root_out receives one owned COM reference on success.
+std::int32_t helios_vkd3d_bridge_create_root_signature(std::size_t device,
+    std::uint32_t node_mask, std::size_t desc, std::size_t* root_out) noexcept;
+std::int32_t helios_vkd3d_bridge_clear_root_arguments(std::size_t list) noexcept;
+
+// Private native-DDI SO origin. Inputs are borrowed ID3D12Device* and
+// D3D12_PIPELINE_STATE_STREAM_DESC*; output receives one owned PSO reference.
+std::int32_t helios_vkd3d_bridge_create_stream_output_pipeline(
+    std::size_t device, std::size_t desc, std::size_t* pipeline_out) noexcept;
 
 // The `out_status` values of `resource_venus_identity` above. Declared here, at the
 // seam, for the same reason as the fence family: `bridge12.rs` maps them by number.
@@ -168,6 +183,18 @@ constexpr std::uint32_t HELIOS_VKD3D_IDENTITY_ICD_REFUSED = 6;
 bool helios_vkd3d_bridge_publish_producer(std::size_t queue, std::size_t resource,
     std::uint32_t allocation, std::size_t admission_event, std::uint32_t* ctx, std::uint32_t* value, std::uint64_t* cookie);
 
+// Borrowed engine allocator; S_FALSE retains pending storage without resetting.
+std::int32_t helios_vkd3d_bridge_try_reset_allocator(std::size_t allocator);
 std::int32_t helios_vkd3d_bridge_execute(std::size_t queue, rust::Slice<const std::size_t> lists,
     std::size_t admission_event, std::uint32_t* ctx, std::uint32_t* value, std::uint64_t* cookie);
 void helios_vkd3d_bridge_cancel_execution(std::size_t queue, std::int32_t reason);
+
+std::int32_t helios_vkd3d_bridge_update_tiles(std::size_t queue, std::size_t resource,
+    std::uint32_t region_count, std::size_t coords, std::size_t sizes, std::size_t heap,
+    std::uint32_t range_count, std::size_t flags, std::size_t offsets, std::size_t counts,
+    std::int32_t mapping_flags, std::size_t admission, std::uint32_t* ctx,
+    std::uint32_t* value, std::uint64_t* cookie);
+std::int32_t helios_vkd3d_bridge_copy_tiles(std::size_t queue, std::size_t dst,
+    std::size_t dst_coord, std::size_t src, std::size_t src_coord, std::size_t size,
+    std::int32_t flags, std::size_t admission, std::uint32_t* ctx, std::uint32_t* value,
+    std::uint64_t* cookie);

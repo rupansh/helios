@@ -772,9 +772,9 @@ WDDM context. Measured: Helios `WaitForSingleObject` returns in **0.8–1.1 µs*
 (`tmp/dx12/gates/G8-r0-settle/`). Present sits on top of the same context and the same callback, so
 the two are one piece of work.
 
-### 14a.1 ⛔ Two unknowns gate everything, and they are separable in ONE experiment
+### 14a.1 Historical investigation of two unknowns
 
-> ⛔⛔ **THIS SECTION'S SEQUENCING IS REJECTED, 2026-08-06 (owner directive; `docs/dx12/METHOD.md`).**
+> **This section's sequencing was withdrawn on 2026-08-06.**
 > Its instruction *"Do not write anything below the experiment until the experiment has run"* is
 > precisely the implement-a-bit-then-run-a-probe loop that has now been retired — and this section is
 > its own best argument, because the experiment it gates everything on turned out to be **unable to
@@ -783,10 +783,9 @@ the two are one piece of work.
 >
 > ⇒ **Implement the subsystem to its contract. The experiment is a diagnostic carried alongside it,
 > never a gate in front of it.** What remains true and valuable here is the *content*: UV1 is a real
-> unknown about closed-source dxgkrnl behaviour, and `METHOD.md` §3 lists it among the few questions
-> static analysis provably cannot settle. UV3 is answered.
-
-Do not write anything below the experiment until the experiment has run.
+> unknown about closed-source dxgkrnl behaviour that requires runtime evidence.
+> UV3 is answered. These are historical investigation notes; current completion
+> contracts and acceptance limits are in `EXECUTION_SYNC.md`.
 
 | id | Question | Why it decides the design |
 |---|---|---|

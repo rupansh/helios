@@ -52,10 +52,6 @@ use helios_protocol::{
     HELIOS_SCANOUT_TIMELINE_BATCH_CAP, HELIOS_SCANOUT_TIMELINE_OP_META,
     HELIOS_SCANOUT_TIMELINE_OP_READ, HELIOS_SCANOUT_TIMELINE_TIME_100NS,
 };
-use helios_protocol::{
-    HeliosEscapeStreamFeedback, HELIOS_ESCAPE_STREAM_FEEDBACK, HELIOS_STREAM_FEEDBACK_ACCEPTED,
-    HELIOS_STREAM_FEEDBACK_REJECTED, HELIOS_STREAM_FEEDBACK_WIRE_RETIRED,
-};
 
 use super::blob_map::{
     effective_map_cache, map_cache_to_mm, map_io_pages_to_user, map_nonpaged_page_to_user_readonly,
@@ -385,10 +381,6 @@ pub unsafe extern "C" fn dxgkddi_escape(
                     None => STATUS_INVALID_PARAMETER,
                 }
             }
-            None => refuse_no_device(),
-        },
-        HELIOS_ESCAPE_STREAM_FEEDBACK => match owner {
-            Some(owner) => escape_stream_feedback(adapter, buf, &hdr, owner),
             None => refuse_no_device(),
         },
         HELIOS_ESCAPE_PRESENT_BUFFER_READ => match owner {
@@ -1420,53 +1412,6 @@ fn escape_present_stream(
         }
         _ => STATUS_INVALID_PARAMETER,
     }
-}
-
-/// Completion notification on the existing retire worker, never a draw query.
-fn escape_stream_feedback(
-    adapter: &AdapterContext,
-    buf: &mut [u8],
-    hdr: &HeliosEscapeHeader,
-    owner: DeviceOwner,
-) -> NTSTATUS {
-    use helios_kmd_logic::execution_completion::FeedbackResult;
-    if hdr.size as usize != size_of::<HeliosEscapeStreamFeedback>() {
-        ESCAPE_BAD_HEADER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        return STATUS_INVALID_PARAMETER;
-    }
-    let mut wire = match EscapeBuf::<HeliosEscapeStreamFeedback>::new(buf, hdr) {
-        Ok(wire) => wire,
-        Err(status) => return status,
-    };
-    let mut req = wire.read();
-    if req.reserved != 0 {
-        ESCAPE_BAD_HEADER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-        return STATUS_INVALID_PARAMETER;
-    }
-    let result = adapter.with_wddm_notify_lock(|guard| {
-        guard.with_virtio(|order, v| {
-            v.observe_stream_feedback(
-                order,
-                owner,
-                req.ctx_id,
-                req.cookie,
-                req.value,
-                req.wire_fence,
-            )
-        })
-    });
-    req.state = match result {
-        Ok(FeedbackResult::Accepted) => HELIOS_STREAM_FEEDBACK_ACCEPTED,
-        Ok(FeedbackResult::WireRetired) => HELIOS_STREAM_FEEDBACK_WIRE_RETIRED,
-        Ok(FeedbackResult::Rejected) => HELIOS_STREAM_FEEDBACK_REJECTED,
-        Err(error) => return error.into(),
-    };
-    wire.write_back(&req);
-    if req.state != HELIOS_STREAM_FEEDBACK_REJECTED {
-        // Release both locks before waking the ordinary completion DPC.
-        crate::ddi::interrupt::request_wddm_completion_dpc(adapter);
-    }
-    STATUS_SUCCESS
 }
 
 /// Claim a KMD Present buffer for one exact consumer-timeline value. The

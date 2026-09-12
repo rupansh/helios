@@ -14,7 +14,7 @@
 //! (`:5232`). So the work here is not translation — it is
 //! **handle decode, per-arm validation, and naming every case this driver cannot
 //! honour**. The twenty-first, [`clear_root_arguments`], has no API counterpart
-//! at all and is refused with its reasoning written down.
+//! at all and uses a private engine operation that preserves other state.
 //!
 //! # ⛔ The fourteen `Set*Root*` slots are SEVEN operations, not fourteen
 //!
@@ -54,7 +54,7 @@
 //!
 //! ⚠ The struct does not appear in this lane at all — it is a **root-signature
 //! creation** shape and belongs to L6, which reached the same conclusion
-//! independently and recorded it in `pso.rs`'s `root_signature_to_1_0`, in the
+//! independently and recorded it in `pso.rs`'s `root_signature_to_1_2`, in the
 //! `D3D12DDI_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS` arm — the comment beginning
 //! *"`DDI_REFERENCE.md` §9.9 warns that `D3D12DDI_ROOT_CONSTANTS` is not
 //! field-order-compatible"* — copying by field name so the code is correct
@@ -68,7 +68,7 @@
 //! the independent second check the `463154f` correction rests on, so a reader
 //! who follows it and finds nothing reads the corroboration as fabricated.
 //! ⚠ The raw §10 finding proposed re-citing it against `create_root_signature`;
-//! that is the wrong function — the arm is inside `root_signature_to_1_0`, which
+//! that is the wrong function — the arm is inside `root_signature_to_1_2`, which
 //! `create_root_signature` calls.
 //!
 //! ⛔ The hazard that IS real in the same `DX12.md` row — the descriptor-heap
@@ -118,6 +118,7 @@ use helios_umd_common::hr::{Hresult, E_INVALIDARG};
 use helios_umd_common::refusals::RefusalCounter;
 use helios_umd_common::throttle::LogThrottle;
 
+use windows::core::Interface;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::{
     ID3D12DescriptorHeap, ID3D12Resource, ID3D12RootSignature, D3D12_CLEAR_FLAGS,
@@ -144,15 +145,6 @@ use crate::{ddi12, device12, log_error, note_refusal, trace_line};
 /// **per-draw** path, so an unbudgeted line here is not a per-frame writer, it
 /// is a per-draw one.
 static ERROR_LOG: LogThrottle = LogThrottle::new();
-
-/// A budget of its own for [`clear_root_arguments`], whose line is **expected**
-/// rather than exceptional.
-///
-/// ⚠ Separate from [`ERROR_LOG`] deliberately: that slot fires once per
-/// command-list create and once per `pfnResetCommandList`, so sharing one budget
-/// would let the expected traffic consume the whole allowance and hide the
-/// first occurrence of a real error behind it.
-static CLEAR_ROOT_ARGS_LOG: LogThrottle = LogThrottle::new();
 
 /// Returns the occurrence ordinal (0-based) when the line should be emitted.
 fn budget(throttle: &LogThrottle) -> Option<usize> {
@@ -195,9 +187,7 @@ fn budget(throttle: &LogThrottle) -> Option<usize> {
 /// runtime array this driver cannot read, and a null resource on a slot whose
 /// API counterpart requires one. What stays **counted only** is the traffic this
 /// driver *forwards* correctly — a null root signature, a zero GPU address, a
-/// null descriptor-heap entry — plus [`clear_root_arguments`], which is refused
-/// on every list create and every `pfnResetCommandList`; reporting there would
-/// quarantine every list in the process.
+/// null descriptor-heap entry — and successful private root-argument clears.
 ///
 /// # Safety
 /// `state` must be borrowed from a live `queue::CommandListState`, i.e. one
@@ -1149,92 +1139,26 @@ unsafe extern "system" fn set_descriptor_heaps(
 // Clearing root arguments — 1 slot, and the only refusal in this lane
 // ---------------------------------------------------------------------------
 
-/// `pfnClearRootArguments` — **refused and counted**; there is no API
-/// counterpart narrow enough to forward to.
-///
-/// # What the DDI asks for
-///
-/// *"This DDI zero-initializes root arguments. The purpose is to ensure that
-/// applications cannot leak root arguments (root constants, root views,
-/// descriptor tables) from 1 command list to the next. The runtime calls this
-/// DDI when creating a new command list, during ID3D12CommandList::Reset, and
-/// during ID3D12CommandList::ClearState. Note that there are separate DDI calls
-/// to clear other command list state (vertex buffers, render targets, PSO,
-/// etc)."* — `ResourceBinding.md:5287-5295`.
-///
-/// # ⛔ Why forwarding to `ClearState` is WRONG, measured rather than argued
-///
-/// The narrowest engine operation that zeroes root arguments is
-/// `ID3D12GraphicsCommandList::ClearState`, and vkd3d implements it as
-/// `d3d12_command_list_reset_api_state(list, pipeline_state)`
-/// (`vkd3d-proton-helios/libs/vkd3d/command.c:7399-7411`) — the **whole** API
-/// state: PSO, render targets, viewports, scissors, blend factor, stencil ref,
-/// index buffer, and the two root-argument binding sets.
-///
-/// `DDI_REFERENCE.md` §14.0 (`D12-G5`'s measured per-slot call counts), in the
-/// bullet that begins *"`pfnResetCommandList` is followed by a fixed 15-call
-/// state-reset block"*, records the measured call order: that block begins with
-/// `pfnSetPipelineState` and **ends with `pfnClearRootArguments`**. ⚠ Cited by
-/// section and by its opening words rather than by line span on purpose — the
-/// span this lane was written against moved 30 lines the same afternoon, when a
-/// correction block was inserted earlier in the file. So forwarding
-/// `ClearState` here would discard the
-/// pipeline state, render targets and viewports that the preceding fourteen
-/// calls had just set — on every single reset, silently, as wrong pixels. That
-/// is the `ARCHITECTURE.md` §12 rule 9 failure shape (*"wrong blending for DWM,
-/// no counter, no log, only pixels"*) arrived at from a different direction.
-///
-/// ⛔ `SetGraphicsRootSignature(NULL)` is not the narrower alternative either:
-/// vkd3d's `set_root_signature` early-returns when the signature is unchanged
-/// (`command.c:14024-14025`), so it clears nothing unless it also **drops the
-/// bound root signature**, which this DDI explicitly must not depend on
-/// (*"this DDI should apply the same operation regardless of the currently set
-/// root signature"*).
-///
-/// # ⭐ What is therefore already discharged, and what is left
-///
-/// Two of the DDI's three call sites are covered by the forward this driver
-/// already performs elsewhere:
-///
-/// * **command-list creation** — `d3d12_command_list_init` opens with
-///   `memset(list, 0, sizeof(*list))` (`command.c:22126`, `:22131`), so both
-///   `vkd3d_pipeline_bindings` are zero before the runtime can call this slot;
-/// * **`Reset`** — `cmdlist.rs::reset_command_list` forwards to
-///   `ID3D12GraphicsCommandList::Reset`, and vkd3d's `Reset` calls
-///   `d3d12_command_list_reset_state` (`command.c:7392-7393`), which resets both
-///   binding sets.
-///
-/// ⚠ **The residual, named:** a mid-list `ID3D12GraphicsCommandList::ClearState`.
-/// There, vkd3d's root bindings keep the application's previous root arguments
-/// instead of being zeroed. The exposure is bounded — after `ClearState` the
-/// application's own next draw is reading root arguments D3D12 defines as
-/// undefined — but it is real, and it is what [`L3B_REFUSALS.clear_root_arguments_not_forwarded`]
-/// is the instrument for. Closing it needs an engine entry point that resets the
-/// two `vkd3d_pipeline_bindings` and nothing else; that is a vkd3d change and a
-/// `DECISIONS.md` D4 export, not something this file can do.
+/// `pfnClearRootArguments` zeroes both engine root-argument banks. The private
+/// operation preserves signatures, descriptor heaps, PSO and dynamic state.
+/// Bundles own recorded setters rather than a root shadow and retain the API's
+/// caller-state inheritance at replay.
 ///
 /// # Safety
-/// `h_list` must be a live handle from `queue::create_command_list`. The body
-/// reads nothing through it beyond the state lookup.
+/// The runtime exclusively borrows a live list for this DDI invocation.
 unsafe extern "system" fn clear_root_arguments(h_list: ddi12::D3D12DDI_HCOMMANDLIST) {
-    // SAFETY: the caller guarantees a live command-list handle. The lookup is
-    // kept even though nothing is forwarded, so that a stale list handle is
-    // attributed to `L3bCommandListMissing` here as it is everywhere else in
-    // this file rather than reading as a silent success.
-    if unsafe { list_state(h_list) }.is_none() {
+    // SAFETY: the runtime supplies the live list handle for this invocation.
+    let Some(state) = (unsafe { list_state(h_list) }) else {
         return;
-    }
-    // R911: this arm logs its own line, so it bumps rather than `note_refusal`s.
-    L3B_REFUSALS.clear_root_arguments_not_forwarded.bump();
-    if let Some(n) = budget(&CLEAR_ROOT_ARGS_LOG) {
-        log_error!(
-            "ClearRootArguments: not forwarded -- the narrowest engine operation that zeroes \
-             root arguments is ClearState, which also drops the PSO, render targets and \
-             viewports that the runtime's own 15-call reset block set immediately before this \
-             call. Creation and Reset are already covered by the engine's own list reset; the \
-             residual is a mid-list ID3D12GraphicsCommandList::ClearState (x{})",
-            n + 1,
-        );
+    };
+    // SAFETY: the bridge borrows the engine list and clears only its root state.
+    let hr = unsafe { crate::bridge12::clear_root_arguments(state.engine().as_raw() as usize) };
+    if hr < 0 {
+        L3B_REFUSALS.clear_root_arguments_failed.bump();
+        // SAFETY: same live DDI list; failures are delivered on the entering thread.
+        unsafe { report_error(state, hr) };
+    } else {
+        L3B_REFUSALS.clear_root_arguments_forwarded.bump();
     }
 }
 
@@ -2032,32 +1956,10 @@ pub(crate) struct L3bRefusals {
     /// define; failing the whole list over a bit a future header added would be
     /// a worse answer than the partial clear.
     clear_depth_stencil_flags_unknown: RefusalCounter,
-    /// `pfnClearRootArguments` was called and **not forwarded**.
-    ///
-    /// ⚠⚠ **Expected LARGE and NON-ZERO** — roughly once per command-list
-    /// creation plus once per `pfnResetCommandList`, because the measured
-    /// 15-call state-reset block in `DDI_REFERENCE.md` §14.0 (the
-    /// *"`pfnResetCommandList` is followed by a fixed 15-call state-reset
-    /// block"* bullet) ends with this slot. A **zero** reading is the finding
-    /// here, not a non-zero
-    /// one: it would mean the runtime does not call the slot at all and this
-    /// whole refusal is dead weight.
-    ///
-    /// ⛔ What it does **not** measure is the exposure. Two of the DDI's three
-    /// call sites — command-list creation and `Reset` — are already discharged
-    /// by vkd3d's own list reset, which `cmdlist.rs::reset_command_list`
-    /// forwards to. The residual is a mid-list
-    /// `ID3D12GraphicsCommandList::ClearState`, which this counter cannot
-    /// distinguish; see [`clear_root_arguments`] for why forwarding
-    /// `ClearState` here would be worse than refusing, and for what closing the
-    /// gap would take.
-    ///
-    /// ⛔ **And it must never be reported**, cheap channel or not. It fires on
-    /// every command-list create and every `pfnResetCommandList`, so a
-    /// `pfnSetCommandListErrorCb` here would quarantine every list the process
-    /// ever records into — the device-scope outcome by a slower road. The
-    /// counter and its own log line are the whole instrument.
-    clear_root_arguments_not_forwarded: RefusalCounter,
+    /// Successful private root clears; includes creation and Reset traffic.
+    clear_root_arguments_forwarded: RefusalCounter,
+    /// The private operation failed; the command-list error channel was notified.
+    clear_root_arguments_failed: RefusalCounter,
 }
 
 pub(crate) static L3B_REFUSALS: L3bRefusals = L3bRefusals {
@@ -2077,7 +1979,8 @@ pub(crate) static L3B_REFUSALS: L3bRefusals = L3bRefusals {
     clear_resource_null: RefusalCounter::new("L3bClearResourceNull"),
     clear_resource_missing: RefusalCounter::new("L3bClearResourceMissing"),
     clear_depth_stencil_flags_unknown: RefusalCounter::new("L3bClearDepthStencilFlagsUnknown"),
-    clear_root_arguments_not_forwarded: RefusalCounter::new("L3bClearRootArgumentsNotForwarded"),
+    clear_root_arguments_forwarded: RefusalCounter::new("L3bClearRootArgumentsForwarded"),
+    clear_root_arguments_failed: RefusalCounter::new("L3bClearRootArgumentsFailed"),
 };
 
 /// L3b's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -2111,5 +2014,6 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L3B_REFUSALS.clear_resource_null,
     &L3B_REFUSALS.clear_resource_missing,
     &L3B_REFUSALS.clear_depth_stencil_flags_unknown,
-    &L3B_REFUSALS.clear_root_arguments_not_forwarded,
+    &L3B_REFUSALS.clear_root_arguments_forwarded,
+    &L3B_REFUSALS.clear_root_arguments_failed,
 ];

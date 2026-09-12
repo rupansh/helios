@@ -57,8 +57,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use helios_umd_common::hr::{Hresult, DXGI_ERROR_UNSUPPORTED, E_INVALIDARG, E_OUTOFMEMORY, S_OK};
 
-use crate::ddi12;
 use crate::caps12;
+use crate::ddi12;
 use crate::device12;
 use crate::forward12;
 use crate::knobs12;
@@ -201,12 +201,10 @@ const _: () = {
 struct AdapterToken;
 static ADAPTER_TOKEN: AdapterToken = AdapterToken;
 
-/// Validate an adapter handle against the token we handed out. **Reports only.**
-///
-/// Deliberately not a refusal, exactly as `umd/src/adapter.rs:132-149` is: the
-/// counter has to be observed at zero on a real boot before any DDI starts
-/// rejecting on it. Returning `bool` rather than nothing keeps that decision at
-/// the call site if it ever changes.
+/// Validate an adapter handle before reading arguments or writing caller storage.
+/// Native PID8308 on the 2026-09-10 boot reports AdapterUnrecognised=0 through
+/// FL11_0..12_1 creation (tmp/dxr-copy-ranges-20260910/native-caps). All adapter
+/// callbacks now enforce this check; a foreign token is a counted refusal.
 fn adapter_ok(h: ddi12::D3D12DDI_HADAPTER) -> bool {
     let expected = core::ptr::addr_of!(ADAPTER_TOKEN) as *const c_void;
     if core::ptr::eq(h.pDrvPrivate as *const c_void, expected) {
@@ -216,7 +214,7 @@ fn adapter_ok(h: ddi12::D3D12DDI_HADAPTER) -> bool {
     let n = UMD12_REFUSALS.adapter_unrecognised.get();
     if n <= LOG_BUDGET {
         log_error!(
-            "adapter handle not ours: pDrvPrivate={:p} expected={:p} (x{n}) -- counted only",
+            "adapter handle not ours: pDrvPrivate={:p} expected={:p} (x{n}) -- refused",
             h.pDrvPrivate,
             expected,
         );
@@ -327,6 +325,12 @@ pub unsafe extern "system" fn OpenAdapter12(open_data: *mut c_void) -> Hresult {
         SUPPORTED_DDI_VERSIONS,
     );
 
+    // Discover optional support before publishing any adapter caps. Failed
+    // discovery is retryable on a later open and never implies RT support.
+    if caps12::native_optional_caps().is_none() {
+        return DXGI_ERROR_UNSUPPORTED;
+    }
+
     // ── 4. The driver's adapter handle ──────────────────────────────────────
     open.hAdapter.pDrvPrivate = core::ptr::addr_of!(ADAPTER_TOKEN) as *mut c_void;
 
@@ -379,7 +383,9 @@ unsafe extern "system" fn get_supported_versions(
     entries: *mut ddi12::UINT32,
     supported_versions: *mut ddi12::UINT64,
 ) -> ddi12::HRESULT {
-    let _ = adapter_ok(h_adapter);
+    if !adapter_ok(h_adapter) {
+        return E_INVALIDARG;
+    }
 
     if entries.is_null() {
         note_refusal(&UMD12_REFUSALS.get_supported_versions_bad_arg);
@@ -429,7 +435,9 @@ unsafe extern "system" fn get_caps(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     arg: *const ddi12::D3D12DDIARG_GETCAPS,
 ) -> ddi12::HRESULT {
-    let _ = adapter_ok(h_adapter);
+    if !adapter_ok(h_adapter) {
+        return E_INVALIDARG;
+    }
     // SAFETY: forwarded unchanged; the DDI declares `arg` `_In_ CONST`, and
     // `caps12` null-checks both it and its `pData` rather than trusting them.
     unsafe { caps12::get_caps(arg) }
@@ -448,7 +456,9 @@ unsafe extern "system" fn get_optional_ddi_tables(
     entries: *mut ddi12::UINT32,
     requests: *mut ddi12::D3D12DDI_TABLE_REQUEST,
 ) -> ddi12::HRESULT {
-    let _ = adapter_ok(h_adapter);
+    if !adapter_ok(h_adapter) {
+        return E_INVALIDARG;
+    }
 
     if entries.is_null() {
         note_refusal(&UMD12_REFUSALS.get_optional_ddi_tables_bad_arg);
@@ -493,7 +503,9 @@ unsafe extern "system" fn fill_ddi_table(
     index: ddi12::UINT,
     h_rt_table: ddi12::D3D12DDI_HRTTABLE,
 ) -> ddi12::HRESULT {
-    let _ = adapter_ok(h_adapter);
+    if !adapter_ok(h_adapter) {
+        return E_INVALIDARG;
+    }
 
     FILL_DDI_TABLE_CALLS.fetch_add(1, Ordering::Relaxed);
     let n = FILL_DDI_TABLE_CALLS.load(Ordering::Relaxed);
@@ -532,7 +544,9 @@ unsafe extern "system" fn calc_private_device_size(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     arg: *const ddi12::D3D12DDIARG_CALCPRIVATEDEVICESIZE,
 ) -> ddi12::SIZE_T {
-    let _ = adapter_ok(h_adapter);
+    if !adapter_ok(h_adapter) {
+        return 0;
+    }
     // SAFETY: forwarded unchanged; the DDI declares `arg` `_In_ CONST`, and
     // `device12` null-checks it rather than trusting that.
     let size = unsafe { device12::calc_private_device_size(arg) };
@@ -551,7 +565,9 @@ unsafe extern "system" fn create_device(
     h_adapter: ddi12::D3D12DDI_HADAPTER,
     arg: *const ddi12::D3D12DDIARG_CREATEDEVICE_0109,
 ) -> ddi12::HRESULT {
-    let _ = adapter_ok(h_adapter);
+    if !adapter_ok(h_adapter) {
+        return E_INVALIDARG;
+    }
     // SAFETY: forwarded unchanged; `device12::create_device` validates every
     // runtime-supplied pointer before constructing anything, which is the
     // ordering `DeviceUnderConstruction`'s docstring exists to record.
@@ -578,7 +594,10 @@ unsafe extern "system" fn destroy_device(h_device: ddi12::D3D12DDI_HDEVICE) {
 /// run in which only those fired would leave the set unprinted. T5's lesson,
 /// restated: *an instrument nothing can read is not an instrument.*
 unsafe extern "system" fn close_adapter(h_adapter: ddi12::D3D12DDI_HADAPTER) -> ddi12::HRESULT {
-    let _ = adapter_ok(h_adapter);
+    if !adapter_ok(h_adapter) {
+        return E_INVALIDARG;
+    }
+    crate::bridge12::discard_capability_engine();
     log_error!("CloseAdapter");
     log_refusal_summary();
     // ⭐ And the other instrument, for the same reason: the per-slot noop hit

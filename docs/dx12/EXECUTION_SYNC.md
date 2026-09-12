@@ -1,6 +1,97 @@
 # DX12 runtime admission and exact execution completion
 
-**State:** the .266 HE12 implementation is retained in deployed .270/oem53.inf,
+**Allocator update, 2026-09-11:** the native frontend now rotates and recycles
+allocator generations when engine retirement references remain. This preserves
+pending backing without waiting for GPU idle or treating reference counts as
+completion. UMD12 F6D00A83 passes the focused native readback, DXR, no-RT and
+four ordering cases. See [ALLOCATOR_LIFETIME.md](ALLOCATOR_LIFETIME.md) for the
+exact contract, OOM repairs, provenance and unexercised failure/stress paths;
+older pending-reset observations below describe the preceding implementation.
+
+
+**Current source policy:** the owner-authorized renderer fork replaces the
+feedback workaround with authenticated wire completion. See the current contract
+below and [NATIVE_DGC.md](NATIVE_DGC.md). Older deployment receipts remain historical.
+
+**Current native DXR deployment, 2026-09-11:** UMD12 `057934F9…` passes all four
+native ordering cases after the completed Port Royal run, each with 65,536 exact
+readback words. Loaded system-runtime, native UMD and ICD identities are recorded
+in `tmp/dxr-native-admission-20260911/final-native-sync/`. The .271/oem54/WDDM2.1
+KMD and 43394BBD ICD are unchanged. Port Royal has 91,993 demo and 41,715 GT1 pending
+allocator Reset diagnostics. Source still defers allocator release to the fence
+worker, and Reset returns without resetting while internal references remain.
+A completed benchmark cannot distinguish delayed retirement from premature reuse;
+that focused native lifetime investigation remains open. No synchronization or
+backing-retention policy changes are part of this DXR admission increment.
+Time Spy, Fire Strike and Steel Nomad Vulkan also complete on that same stack;
+[the control receipt](DXR_SERIALIZATION.md#completed-regression-controls-2026-09-11)
+records settings, loaded identities and changing host-VNC frames.
+
+**Earlier deployment, 2026-09-09:** the paired local renderer and .271/oem54
+guest package are active. All four native ordering/readback cases pass using
+authenticated wire retirement, including the cross-process signal case with
+both process module identities verified. Time Spy, Fire Strike and Steel Nomad
+Vulkan complete with exported results and changing frames; owner visual
+acceptance remains pending. [NATIVE_DGC.md](NATIVE_DGC.md) records exact hashes,
+updated system runtime versions and evidence. Pending allocator Reset diagnostics
+remain unresolved, as do the broader ownership and host-loss boundaries below.
+
+**Earlier deployment, 2026-09-08:** UMD12 `BE9D0EBE…` adds GPU-predicated
+single-sample CopyTiles with allocator-owned scratch, internal query suspension
+and required queue continuations. No new CPU prefix wait is needed. Host
+readbacks pass; native tiled commands remain blocked at tier0. Native IA and
+all four existing ordering cases pass on this artifact, with authenticated
+completion, exact loaded runtime/UMD/ICD identities and a zero-loss loader trace.
+The receipt is `tmp/fl12-predicated-tiles-20260908/native-validation.json`.
+The two existing allocator Reset diagnostics recur in the native IA check;
+this does not settle the allocator/fence-worker question. WDDM2.1 and the
+broader ownership/sharing/host-loss acceptance boundaries below are unchanged.
+Time Spy, Fire Strike and Steel Nomad Vulkan subsequently complete with exact
+identities and changing VNC frames. ROADMAP.md records matching settings and
+the unresolved Time Spy GT2/Fire Strike graphics slowdowns. Completion is not
+performance or owner visual acceptance; no new synchronization shortcut was
+introduced in response to the measurements.
+
+**Preceding deployment, 2026-09-08:** UMD12 `361C9767…` adds isolated IA continuation
+on the unchanged .270/oem53.inf/WDDM2.1 stack. Native IA GPU readback, query
+continuation and a pending public-list Reset behind an unsignaled dependency
+pass; another queue submits and releases that dependency before final completion.
+The receipt is `tmp/fl12-indirect-ia-20260908/native-ia-validation.json`.
+The worker releases the Vulkan queue mutex for its exact prefix wait and owns
+private recording storage until the last successful submission retires.
+HE12 admission is still one operation and its completion follows every generated
+draw and suffix. Host-loss retirement and the pending allocator/fence-worker
+question remain open; two existing allocator Reset diagnostics were observed.
+See [INDIRECT_EMULATION.md](INDIRECT_EMULATION.md#ia-continuation-implementation-and-validation).
+The four older ordering controls and benchmark results below are separate
+evidence until rerun on this build.
+
+**Preceding deployment, 2026-09-08:** UMD12 `9BDA548C…` is hotplugged on the same
+.270/oem53.inf/WDDM2.1 stack. All four native ordering cases pass on that exact
+build; both process identities are verified in
+`tmp/fl12-sparse-compat-20260908/native-validation-9bda.json`. See ROADMAP.md and
+[SPARSE_COMPATIBILITY.md](SPARSE_COMPATIBILITY.md) for complete provenance and
+separate benchmark/visual limits. The required queue continuations are deployed,
+but native MSAA tiled work remains unreachable at tiled0.
+
+**Earlier deployment, 2026-09-07:** KMD .270/oem53.inf remains Code0 with WDDM2.1;
+native UMD12 candidate `CB48D9DB…` is hotplugged with unchanged UMD11 and ICD.
+All four existing native ordering cases pass again in session1 on this candidate,
+including both producer and consumer 65,536-word GPU readbacks and the gated
+negative intervals. `tmp/fl12-audit-20260907/native-sync-cb48d9db/` retains the
+same verified probe executable `1AA1853E…` and source `45345226…` used for the
+preceding6344 check. The sibling `fl12-sync-loader-cb48/`
+zero-loss ETW trace identifies parent PID2056 and shared-fence child PID5544
+loading exact candidate/system-runtime/ICD artifacts, with no WARP or app-local
+vkd3d. Async WSI and retire feedback remain1. These FL11_0 regression checks do
+not exercise sparse/DXR commands or close the broader obligations below. The
+independent `native-sync-cb48d9db/root-validation.json` verifies 35 evidence files,
+all four readback cases and both exact loader identities. The PnP restart used
+for this hotplug changed the adapter LUID to `042a5ac7`; no reboot was needed.
+DriverStore still carries the older packaged UMD12, so this is not a package
+upgrade or cold-boot validation.
+
+**Earlier HE12 baseline:** the .266 implementation is retained in .270/oem53.inf,
 with the unchanged release UMD12 and a reviewed Steel Nomad Vulkan vehicle-copy
 repair in UMD11/Mesa. .268 changed only the KMD version stamp; .269 adds a
 transport-capacity notification whose wake grants only another protected enqueue
@@ -31,6 +122,48 @@ sampled ECL bridge. It keeps `WddmSurface::Wddm2_1GpuMmu`, the existing software
 scheduler, submission workers, Present ownership and scanout protection.
 The native probe covers only its exercised ordering cases; the owner supplies
 the shadow acceptance at recovered throughput. Broader acceptance remains below.
+
+## Required queue continuations
+
+The new engine candidate distinguishes primary, compute and graphics command
+streams. A copy may require a more capable Vulkan queue even on a D3D12 copy or
+compute list. Depth buffer/image copies require graphics without maintenance10;
+MSAA depth image copies and internal attachment writes always require graphics.
+Advertised format bits cannot replace enabling the relevant Vulkan feature.
+Queue selection happens before recording the operation's barriers and commands.
+
+Two optional primary streams leave capacity for mandatory compute then graphics
+continuations. A stream never moves back to a less capable queue. Pools are lazy
+and allocator-owned; allocation/begin/end errors retain their HRESULT and make
+Close fail. Failure to prepare a replacement leaves the original stream intact;
+failure ending the original is fatal even for an optional split. No required
+operation silently consumes an unavailable stream slot.
+
+The split drains pending transfers, ends physical rendering/conditional state,
+invalidates bindings and preserves the logical root/query/predicate state. Meta
+indirect/predicate setup stays in the current stream instead of moving into an
+initializer from the wrong queue family. Unvirtualized active queries that cannot
+cross the operation are explicit failures. MSAA internal shader work likewise
+refuses unvirtualized statistics scopes; complete cross-backend query behavior
+and OOM/failure injection remain open.
+
+Submission batches coalesce only equal queue tags, including the low-cost
+staggering path. Existing GPU timeline edges order each family transition and
+the final primary/serializing boundary. Locks progress transfer to compute or
+graphics, or compute to graphics; graphics does not acquire a less capable queue.
+Allocator-owned views, scratch and command pools retire through existing GPU
+completion. HE12 admission, producer feedback, consumer release, present/scanout
+ownership and the unresolved pending-reset/fence-worker lifetime question are
+unchanged. Native completion of the new continuations remains unexercised.
+
+The candidate's host-only queue/copy tests and discovered stock sparse MSAA
+failures are recorded in
+[FEATURE_LEVELS.md](FEATURE_LEVELS.md#msaa-candidate-and-stock-host-boundary).
+That 8C747 record predates the owner-authorized committed fallback. Current
+host engine tests exercise the D16 depth-write shader through compatibility
+backing. Raw D32 copies now explicitly refuse after the expanded test demonstrated
+special-value bit loss. Native MSAA/queue-continuation behavior remains unexercised
+at tiled0; see [SPARSE_COMPATIBILITY.md](SPARSE_COMPATIBILITY.md).
 
 ## Contract and ordering
 
@@ -80,6 +213,52 @@ descriptor retain their existing identity and ownership duties; inability to
 submit that required identity is now an error.
 
 ## Kernel proof and lifetime
+
+### Sparse mapping candidate (2026-09-07, deployed but unexercised)
+
+The current [compatibility extension](SPARSE_COMPATIBILITY.md) also prepares
+mapping operations for committed fallback images. After complete validation it
+commits a zero-bind operation through the same admission/event/stream path.
+CopyTileMappings involving either fallback endpoint cannot mutate real sparse
+maps. Ignored mappings retain exact queue ordering and GPU completion; they do
+not imply aliasing, sparse unmapping or a CPU completion shortcut. The committed
+image owns its allocation independently of mapping heaps. Native exercise of
+this extension remains blocked by the reported tiled tier0.
+
+`forward12/tiles.rs` and the private engine `helios_sparse.h` apply the same
+context-operation mutex, FIFO stream reservation, HE12 Render and submission
+event to UpdateTileMappings and CopyTileMappings. Preparation validates counts,
+coordinates, range flags and heap bounds before committing owned descriptions.
+The worker waits for the exact operation's admission before inspecting source
+mappings or changing destination mappings. A Queue::Wait followed by mappings
+therefore cannot change bindings before the runtime releases that wait.
+
+Consecutive already-admitted mappings retain sparse batching. Before waiting
+for another admission, consuming a different operation, or sleeping on an
+empty FIFO, the worker submits pending sparse binds and emits the highest
+covered HE12 stream value. Mapping-only work needs this boundary even when no
+command list follows it. QueueBindSparse joins the original queue timeline;
+when a different physical sparse queue is necessary, its completion is joined
+back before later queue work. No GPU-idle wait or submission-worker drain is
+introduced.
+
+Pending updates retain their heap and destination, and copies retain both
+resources. Copy source bindings are snapshotted before destination mutation,
+including overlapping self-copy. Each mapped native tile owns its heap.
+Replacing/unmapping a tile transfers its former heap reference into the sparse
+completion record; destination resources and retired heaps survive until the
+fence worker observes successful completion. Resource destruction releases
+remaining mapped heap references after destroying its Vulkan resource.
+
+A refused commit/admission or failed sparse submission removes the device;
+neither publishes invented completion. Failed retirement without a proven
+completion/quiescence witness quarantines references instead of releasing
+backing. This is a deliberate failure-path leak, not a solution to the existing
+host-loss/disconnect callback limitation below. Two consecutive dry whole-diff
+review rounds preceded candidate6344 hotplug. Native tiled probes stop at tier0;
+ordering, lifetime and failure-path validation remain unexercised. Advertised
+tiled support remains NONE because the full contract, including MSAA CopyTiles,
+is not complete. See `FEATURE_LEVELS.md` for per-path status and counter grading.
 
 `DxgkDdiRender` authenticates the stream/cookie against the context's exact
 `ContextContext -> DeviceContext -> hKmdProcess` chain. Each context binds one
@@ -167,41 +346,34 @@ These differences are leads, not proof that a particular shadow pass caused
 the observed defect. Whole-frame ordering and stale in-frame shadows need
 separate visible acceptance.
 
-## Exact GPU feedback completion (.266)
+## Authenticated wire completion (2026-09-09 source candidate)
 
-The existing retire worker carries the exact registered cookie, signal value,
-context and KMD-returned wire fence from the tagged submit. After observing the
-GPU-written feedback slot, it sends the 48-byte version-1 `STREAM_FEEDBACK`
-escape (0x14). KMD requires the live device owner/context/cookie and exact
-in-flight `AsyncVenus` receipt, including generation-qualified stream handle,
-value and wire fence. An exact recorded successful response can acknowledge a
-notification that raced wire retirement. A missing, cancelled, older or different
-receipt never becomes completion merely because a higher watermark exists.
+The owner authorized the renderer fork and removal of the native-fence workaround.
+The renderer's internal markers are ordinary, non-exportable VkFence objects;
+guest external fence APIs remain unchanged. The measured delay belongs to the
+unnecessary SYNC_FD-exportable marker path, not proof of an active 10 ms polling
+sleep. Successful callbacks now require a successful Vulkan completion result.
+Reset/submit/wait failures and pending teardown do not manufacture completion.
 
-`execution_completion::Progress` has separate GPU-completed and wire-retired
-values. The GPU edge advances allocation producer state and latches HE12 waits,
-including publication/submission after observation. It never releases transport
-storage, wire waiters, Present consumer claims, scanout leases or closing stream
-slots. The real response retains those duties. Notification holds notify then
-virtio locks; it requests the existing completion DPC after releasing both.
-There is one notification per actual registered boundary on the retire worker,
-with no additional draw-time query or renderer batch.
+Mesa's retire worker waits on KMD's exact wire response. Exported Win32 timelines
+have no feedback slots or counter polling; STREAM_FEEDBACK escape 0x14 is removed
+and its number remains reserved. KMD `execution_completion::Progress` has one
+wire-retired watermark, advanced only by generation-qualified receipts. Producer
+publication and HE12 waits use this progress; consumer claims, scanout leases and
+backing recycling still require their own release conditions. Initially-zero,
+GPU-only stream registration and import/CPU-signal refusals remain.
 
-Only a fresh, initially-zero, permanent exported Win32 timeline can register.
-A registered private stream refuses CPU signals and imports, with a named
-refusal counter/log. Feedback notification is eligible only for the exact
-queue submit containing the semaphore feedback command. A queue lacking
-feedback support permanently revokes the backend feedback pointer before the
-CPU counter-resync path becomes reachable. Neither `GetSemaphoreCounterValue`
-nor its WDDM-folded result supplies this proof. Pointer load and dereference
-hold `dev_mutex`, also held by detach before slot pool return. A sync reference
-alone does not pin that slot. Detach, timeout, unsupported feedback or a rejected
-notification leave KMD completion on the real wire path; none is success.
+[NATIVE_DGC.md](NATIVE_DGC.md) records the implementation, tests, measured host
+marker times and owner-operated activation. The current guest has not loaded
+this candidate. Host device-loss/disconnect error delivery, cross-API external
+ownership and the pending allocator-reset/fence-worker issue remain open.
 
-`stream_fb accepted/wire_retired/rejected` measures the new seam. The prior
-`retire_fb fast/fallback/wire` counters measure local external-sync retirement.
-Both are needed to establish that HE12 completion uses feedback in a live run.
-The normal host renderer and VM launch command remain unchanged.
+## Historical .265/.266 validation (superseded implementation)
+
+The evidence below belongs to the retired feedback workaround and its earlier
+stock-renderer constraint. It establishes no acceptance for the new wire-only
+candidate. The owner's .266 shadows/~100 FPS acceptance remains separate from
+the instrumented74.26 FPS run and later builds.
 
 ## Validation and runtime acceptance
 
@@ -212,12 +384,12 @@ fill followed by the same empty queue marker reproduces an 8.060 ms average
 work-submit / marker-submit / wait sequence with `SYNC_FD`-exportable fences
 on NVIDIA 610.57.04, versus 0.329 ms for ordinary fences. This measures the
 complete sequence, not `vkWaitForFences` alone. The private host patch proposal
-was withdrawn at the owner's request; keep stock virglrenderer.
+was withdrawn at that time; the owner authorized the new fork on 2026-09-09.
 
-The existing solution is the
+The then-deployed solution was the
 [archived WS2 feedback workaround](../archive/ROADMAP_HISTORY_THROUGH_2026-09-05.md)
-(lines 3096–3127), `HELIOS_RETIRE_FEEDBACK`, already on by default. Current
-`vn_renderer_helios.c::helios_sync_retire_thread` reads the exact semaphore's
+(lines 3096–3127), `HELIOS_RETIRE_FEEDBACK`, then on by default. That
+`vn_renderer_helios.c::helios_sync_retire_thread` read the exact semaphore's
 GPU-written counter and advances its external sync; the captured .265 run
 already reports `retire_fb fast=4607 fallback=0 wire=0`. On .265 KMD producer/HE12
 progress still advanced only from the tagged AsyncVenus response. The .266

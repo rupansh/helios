@@ -316,7 +316,8 @@ pub unsafe extern "C" fn helios_umd12_probe_serialize_root_signature_v1(
     // SAFETY: `desc` is live per the caller's guarantee above; `blob` and `err`
     // are stack locals borrowed only for this call. The C++ side zeroes both
     // outs before forwarding and writes them only on success.
-    let hr = unsafe { bridge12::serialize_root_signature(desc as usize, version, &mut blob, &mut err) };
+    let hr =
+        unsafe { bridge12::serialize_root_signature(desc as usize, version, &mut blob, &mut err) };
 
     // SAFETY: `blob_out` was null-checked above. This write transfers the
     // engine's owned `ID3DBlob*` reference to the caller.

@@ -81,8 +81,8 @@ impl Wait {
     }
 }
 
-/// Receipt for one actually enqueued tagged Venus submission. A feedback
-/// notification must match this receipt, never just a watermark or cookie.
+/// Receipt for an enqueued tagged Venus submission. Only its authenticated,
+/// successful used-ring response may advance stream completion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Submission {
     pub stream: u32,
@@ -90,57 +90,20 @@ pub struct Submission {
     pub wire_fence: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FeedbackResult {
-    Accepted,
-    WireRetired,
-    Rejected,
-}
-
-/// GPU execution and wire retirement protect different lifetimes. This state
-/// is embedded in the live KMD stream slot; only the wire edge can release
-/// Present readers, transport storage, or the closing registration.
+/// Queue-marker retirement is the sole GPU completion source. Consumer release
+/// still requires the separate Present reader/ownership contract.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Progress {
-    completed: u32,
     retired: u32,
-    last_wire: Option<Submission>,
 }
 
 impl Progress {
-    pub const EMPTY: Self = Self {
-        completed: 0,
-        retired: 0,
-        last_wire: None,
-    };
+    pub const EMPTY: Self = Self { retired: 0 };
     pub fn completed(self) -> u32 {
-        self.completed
+        self.retired
     }
     pub fn retired(self) -> u32 {
         self.retired
-    }
-
-    /// The caller holds notify -> virtio locks, authenticates the live owner /
-    /// context / cookie, and supplies the original in-flight receipt if present.
-    /// A removed receipt is NOT evidence. Only its exact successful wire
-    /// retirement may acknowledge a notification racing the real response.
-    pub fn feedback(
-        &mut self,
-        handle: u32,
-        tag: Submission,
-        admitted: Option<Submission>,
-    ) -> FeedbackResult {
-        if tag.stream != handle || handle == 0 || tag.value == 0 || tag.wire_fence == 0 {
-            return FeedbackResult::Rejected;
-        }
-        if admitted == Some(tag) {
-            self.completed = self.completed.max(tag.value);
-            FeedbackResult::Accepted
-        } else if self.last_wire == Some(tag) {
-            FeedbackResult::WireRetired
-        } else {
-            FeedbackResult::Rejected
-        }
     }
 
     /// Called only on a successful used-ring response for the original tag.
@@ -148,11 +111,7 @@ impl Progress {
         if tag.stream != handle || handle == 0 || tag.value == 0 || tag.wire_fence == 0 {
             return false;
         }
-        self.completed = self.completed.max(tag.value);
-        if tag.value > self.retired {
-            self.retired = tag.value;
-            self.last_wire = Some(tag);
-        }
+        self.retired = self.retired.max(tag.value);
         true
     }
 }
@@ -255,184 +214,70 @@ mod tests {
     }
 
     #[test]
-    fn feedback_completes_execution_without_retiring_wire_or_consumer() {
+    fn execution_waits_for_exact_successful_wire_response() {
         let mut progress = Progress::EMPTY;
-        let tag = tag(3, 9, 500);
         let mut wait = Wait::new(boundary(3, 9)).unwrap();
-        assert_eq!(
-            progress.feedback(3, tag, Some(tag)),
-            FeedbackResult::Accepted
-        );
+        wait.observe(3, progress.completed());
+        assert!(!wait.completed());
+        for invalid in [tag(4, 9, 500), tag(0, 9, 500), tag(3, 0, 500), tag(3, 9, 0)] {
+            assert!(!progress.wire(3, invalid));
+            assert_eq!(progress.completed(), 0);
+        }
+        assert!(progress.wire(3, tag(3, 9, 500)));
         wait.observe(3, progress.completed());
         assert!(wait.completed());
-        assert_eq!(progress.retired(), 0);
-        assert!(!crate::present_stream::slot_ready(
-            true,
-            1,
-            0,
-            64,
-            9,
-            progress.retired()
-        ));
-        assert!(progress.wire(3, tag));
         assert_eq!(progress.retired(), 9);
-        assert!(crate::present_stream::slot_ready(
-            true,
-            1,
-            0,
-            64,
-            9,
-            progress.retired()
-        ));
     }
 
     #[test]
-    fn feedback_and_wire_response_can_arrive_in_either_order() {
-        for wire_first in [false, true] {
-            let mut progress = Progress::EMPTY;
-            let tag = tag(3, 9, 500);
-            if wire_first {
-                assert!(progress.wire(3, tag));
-                assert_eq!(progress.feedback(3, tag, None), FeedbackResult::WireRetired);
-            } else {
-                assert_eq!(
-                    progress.feedback(3, tag, Some(tag)),
-                    FeedbackResult::Accepted
-                );
-                assert!(progress.wire(3, tag));
-            }
-            assert_eq!(progress.completed(), 9);
-            assert_eq!(progress.retired(), 9);
-        }
-    }
-
-    #[test]
-    fn missing_mismatched_and_cancelled_receipts_cannot_complete() {
+    fn out_of_order_wire_responses_never_regress_progress() {
         let mut progress = Progress::EMPTY;
-        let tag = tag(3, 9, 500);
-        for admitted in [
-            None,
-            Some(Submission { stream: 4, ..tag }),
-            Some(Submission { value: 10, ..tag }),
-            Some(Submission {
-                wire_fence: 501,
-                ..tag
-            }),
-        ] {
-            assert_eq!(
-                progress.feedback(3, tag, admitted),
-                FeedbackResult::Rejected
-            );
-        }
-        assert_eq!(progress.completed(), 0);
-        assert_eq!(progress.retired(), 0);
-        // Cancellation removes the real in-flight receipt. It creates no
-        // successful wire receipt, even when the same numeric value is reused.
-        let next = Submission {
-            stream: 4,
-            value: 9,
-            wire_fence: 501,
-        };
-        assert_eq!(
-            progress.feedback(4, tag, Some(next)),
-            FeedbackResult::Rejected
-        );
-        assert!(!progress.wire(4, tag));
-        assert_eq!(progress.completed(), 0);
-    }
-
-    #[test]
-    fn out_of_order_feedback_never_moves_wire_or_gpu_progress_backwards() {
-        let mut progress = Progress::EMPTY;
-        let older = tag(3, 9, 500);
-        let newer = tag(3, 12, 510);
-        assert_eq!(
-            progress.feedback(3, newer, Some(newer)),
-            FeedbackResult::Accepted
-        );
-        assert!(progress.wire(3, older));
-        assert_eq!(progress.completed(), 12);
-        assert_eq!(progress.retired(), 9);
-        assert_eq!(
-            progress.feedback(3, older, None),
-            FeedbackResult::WireRetired
-        );
-        assert!(progress.wire(3, newer));
-        assert!(progress.wire(3, older));
+        assert!(progress.wire(3, tag(3, 12, 510)));
+        assert!(progress.wire(3, tag(3, 9, 500)));
         assert_eq!(progress.completed(), 12);
         assert_eq!(progress.retired(), 12);
-        // No historical receipt guessing from the higher watermark. An old
-        // notification may be refused; its real response has already completed.
-        assert_eq!(progress.feedback(3, older, None), FeedbackResult::Rejected);
     }
 
     #[test]
-    fn delayed_notification_cannot_reuse_a_recreated_stream() {
-        let old = tag(3, 9, 500);
-        let new = tag(4, 1, 600);
+    fn late_response_cannot_complete_a_recreated_stream() {
         let mut progress = Progress::EMPTY;
-        assert_eq!(
-            progress.feedback(4, old, Some(new)),
-            FeedbackResult::Rejected
-        );
-        let mut wait = Wait::new(boundary(4, 1)).unwrap();
-        wait.observe(4, progress.completed());
-        assert!(!wait.completed());
-        assert_eq!(
-            progress.feedback(4, new, Some(new)),
-            FeedbackResult::Accepted
-        );
-        wait.observe(4, progress.completed());
-        assert!(wait.completed());
+        assert!(!progress.wire(4, tag(3, 9, 500)));
+        assert_eq!(progress.completed(), 0);
+        assert!(progress.wire(4, tag(4, 1, 600)));
+        assert_eq!(progress.completed(), 1);
     }
 
     #[test]
-    fn publication_and_submission_observe_already_completed_feedback() {
+    fn publication_before_or_after_wire_observes_same_producer_epoch() {
         use crate::producer_completion::{Predicate, Table};
         for publish_first in [false, true] {
             let mut progress = Progress::EMPTY;
             let mut table = Table::new(1, 2, 2).unwrap();
             let key = table.register(100).unwrap();
-            let tag = tag(3, 9, 500);
             let mut epoch = 0;
             if publish_first {
-                epoch = table.publish(key, 3, 9, progress.completed() >= 9).unwrap();
+                epoch = table.publish(key, 3, 9, false).unwrap();
                 assert_eq!(table.predicate(key, epoch), Ok(Predicate::Pending));
             }
-            assert_eq!(
-                progress.feedback(3, tag, Some(tag)),
-                FeedbackResult::Accepted
-            );
+            assert!(progress.wire(3, tag(3, 9, 500)));
             table.complete(3, progress.completed());
             if !publish_first {
                 epoch = table.publish(key, 3, 9, progress.completed() >= 9).unwrap();
             }
             assert_eq!(table.predicate(key, epoch), Ok(Predicate::Ready));
-            let mut wait = Wait::new(boundary(3, 9)).unwrap();
-            wait.observe(3, progress.completed());
-            assert!(wait.completed());
-            assert_eq!(progress.retired(), 0);
         }
     }
 
     #[test]
-    fn producer_cancellation_is_terminal_even_after_a_late_gpu_observation() {
+    fn producer_cancellation_is_terminal_after_a_late_wire_response() {
         use crate::producer_completion::{Predicate, Table, CANCELLED};
         let mut table = Table::new(1, 2, 2).unwrap();
         let key = table.register(100).unwrap();
         let epoch = table.publish(key, 3, 9, false).unwrap();
         table.fail_stream(3, CANCELLED);
         let mut progress = Progress::EMPTY;
-        let tag = tag(3, 9, 500);
-        assert_eq!(
-            progress.feedback(3, tag, Some(tag)),
-            FeedbackResult::Accepted
-        );
+        assert!(progress.wire(3, tag(3, 9, 500)));
         table.complete(3, progress.completed());
-        assert_eq!(
-            table.predicate(key, epoch),
-            Ok(Predicate::Terminal(CANCELLED))
-        );
-        assert_eq!(progress.retired(), 0);
+        assert_eq!(table.predicate(key, epoch), Ok(Predicate::Terminal(CANCELLED)));
     }
 }

@@ -4,6 +4,25 @@
 directory may contradict this file. If evidence later overturns a decision here, change it *here*
 first and then propagate.
 
+**Owner update, 2026-09-09:** the stock-renderer constraint is withdrawn.
+Virglrenderer and Venus protocol are now paired root submodules, with native
+EXT DGC and NV mixed-sample extension forwarding through Mesa. Remove the private
+vkd3d indirect emulation and replace feedback-shadow retirement with the corrected
+ordinary-fence renderer path and authenticated wire completion. The architectural
+contract and current query/validation gaps are in [NATIVE_DGC.md](NATIVE_DGC.md).
+No QEMU redesign or WDDM version change follows from this authorization. The
+owner retains launcher restart ownership; guest reboots are authorized.
+
+**Owner update, 2026-09-08:** native FL12_0/FL12_1 work may use the upstream
+committed fallback for reserved resources. Advertised-but-broken color4 support
+must be handled by dynamic behavior evidence, without a driver-combination
+allowlist. [SPARSE_COMPATIBILITY.md](SPARSE_COMPATIBILITY.md) defines selection,
+ignored mapping/alias semantics and memory costs. This supersedes the later
+strict reserved-format refusal policy; it does not establish full conformance,
+authorize a cap raise by itself or alter the native static UMD/WDDM2.1 architecture.
+The current2AD1 admission candidate and its remaining TIR/conformance gaps are
+recorded separately in FEATURE_LEVELS.md.
+
 **Provenance:** twelve independent research lanes (`docs/dx12/research/R1..R12`), each
 adversarially fact-checked by a second reader, merged 2026-08-05. Where two lanes disagreed, §6
 records the resolution and the evidence that settled it.
@@ -221,10 +240,11 @@ D3's rollback and blast-radius arguments are unaffected.
 
 **Decision D4 — ⛔ SUPERSEDED 2026-08-05. `helios_umd12.dll` STATICALLY LINKS vkd3d, exactly as
 `helios_umd.dll` statically links DXVK. Read "✅ D4 IS DECIDED — STATIC" below before this
-paragraph.** What follows is the original DLL-and-two-exports decision, retained because the **two
-Helios entry points it introduced are unchanged and still the interface** — only their delivery
-changed, from an exported DLL to a static archive. Every *rationale* below is dead; see the status
-table in the decided section.
+paragraph.** What follows is the original DLL-and-two-exports decision. Its device factory
+remains in use, and its serializer remains for internal empty/probe roots. Native parsed
+roots now use the private versioned factory described in H3 and ROOT_SIGNATURES.md.
+Delivery changed from an exported DLL to a static archive. The original rationale below
+is historical; see the status table in the decided section.
 
 *Original text:* the vkd3d engine is reached through a Helios-added export on vkd3d's own DLL, not
 by statically linking `libvkd3d` into the UMD. The UMD `LoadLibrary`s a Helios-built
@@ -605,8 +625,12 @@ The real present issues are three, all named:
 recording surface forwards almost 1:1 into `ID3D12GraphicsCommandList`. What does not:
 
 - **Root signatures arrive parsed**, as `D3D12DDI_ROOT_SIGNATURE` — vkd3d's
-  `CreateRootSignature` wants a serialized `RTS0` blob, so the UMD must **re-serialize**
-  (`vkd3d_serialize_root_signature`, `include/vkd3d.h:129`, exists but is not exported today).
+  public `CreateRootSignature` takes an `RTS0` blob. The current native path
+  (2026-09-08) instead translates the parsed tree into owned versioned API
+  descriptors and calls a private factory inside the statically linked engine.
+  This preserves flags and the driver's 128-DWORD instrumentation capacity while
+  the public API retains its 64-DWORD limit. The original serializer remains for
+  internal empty/probe roots. See [ROOT_SIGNATURES.md](ROOT_SIGNATURES.md).
 - **PSOs arrive as handle bundles** — blend / rasterizer / depth-stencil / element-layout are
   separate driver objects referenced by handle; the UMD must retain each one's desc and reassemble a
   `D3D12_GRAPHICS_PIPELINE_STATE_DESC`.
@@ -803,9 +827,9 @@ default-ON has its evidence in the comment at the read site (AGENTS.md rule 8).
 **Decision D12 — the DDI version is `D3D12DDI_SUPPORTED_0110`, advertised as a set of exactly ONE
 token, with the `_0109`-generation tables. Decided 2026-08-06, before the S6 fan-out.**
 
-`PARALLEL.md` §8 lists this as the one remaining not-parallelisable choice and requires it be made
-*before* lanes start, because the lane split, every slot count in §4.1 and `DDI_REFERENCE.md` §3.2 /
-§4.2's group boundaries are all derived from the chosen revision. It is decided here, once.
+The revision was selected before implementation was divided among agents,
+because every slot count in §4.1 and `DDI_REFERENCE.md` §3.2 / §4.2's group
+boundaries derive from it.
 
 | | `_0110` — **chosen** | `_0040` — rejected |
 |---|---|---|
@@ -820,13 +844,13 @@ Reasons, in order:
 1. ✅ **Measured: `_0110` is what this runtime asks for first.** `D12-G5` logged WARP's 77-token list
    and the runtime picking `_0110` out of it (`DDI_REFERENCE.md` §1.5). `_0040` is *accepted* and a
    triangle presents on it (§15.4), so the trade was real — but taking it means every count in §4.1,
-   every group boundary in `DDI_REFERENCE.md` §3.2/§4.2 and the whole `PARALLEL.md` §4 lane table
+   every group boundary in `DDI_REFERENCE.md` §3.2/§4.2 and the then-used work allocation
    would have to be re-derived against `CORE_0040`/`_0040`-generation command lists, for which this
    directory holds **no** counts at all. That is a doc re-derivation with its own miscount risk
    (§4.1's own warning: "several were miscounted independently by more than one research lane") in
    exchange for 45 stubbed slots.
 2. **The 45 slots `_0040` saves are the cheap ones.** They are state objects, mesh shaders, work
-   graphs, enhanced barriers and VRS — `PARALLEL.md`'s L9, *"mostly refuse-and-count"*. The
+   graphs, enhanced barriers and VRS — then grouped as L9, *"mostly refuse-and-count"*. The
    expensive surface (caps, queue, recording, descriptors, PSO) is present in both.
 3. **`_0040`'s saving is paid back immediately in the object model.** It predates the pool + recorder
    split and carries `pfnCalcPrivateCommandAllocatorSize` / `pfnCreateCommandAllocator` /
@@ -906,8 +930,8 @@ first and then withdrawn. `CORE_0109` has 26 `CalcPrivate*` slots, and those blo
   `BoxedHandle::State` fixes that by naming the payload from the *handle type*, and `slot.rs:94-97`
   records that the associated type *"may be a type private to the implementing crate. That is
   deliberate."*
-* **hostile to the fan-out.** A single shared payload file would be the hottest merge point in an
-  11-lane split — the exact contention `PARALLEL.md` §5 exists to remove.
+* **a shared editing bottleneck.** A single shared payload file would have been the hottest
+  merge point in the then-used 11-lane implementation split.
 * **forced to lose type safety.** `umd_common` must keep building on Linux and must not grow a
   `build.rs` (D3b), so it cannot name a `ddi12` type; every payload field would degrade to a bare
   integer at precisely the sites that most need typing.
@@ -931,7 +955,7 @@ first and then withdrawn. `CORE_0109` has 26 `CalcPrivate*` slots, and those blo
    version, added there and nowhere else.
 
 ⚠ D13 shares declarations, not claims: `Slot<Boxed<S>>::get()`'s soundness argument is still D3D11's
-`CUseCountedObject` one and is **not** established for D3D12 (`slot.rs:304-322`, `PARALLEL.md` §9.4).
+`CUseCountedObject` one and is **not** established for D3D12 (`slot.rs:304-322`).
 
 ---
 

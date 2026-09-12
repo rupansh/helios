@@ -43,38 +43,26 @@ Check Vulkan support:
 vulkaninfo --summary | grep -E "apiVersion|driverVersion"
 ```
 
-### 1.2 Build virglrenderer with Venus
+### 1.2 Build the paired virglrenderer and Venus protocol forks
+
+Use the root submodules, not a separately cloned system renderer:
 
 ```bash
-# Dependencies (Ubuntu/Debian)
-sudo apt install -y \
-  meson ninja-build pkg-config \
-  libepoxy-dev libgbm-dev \
-  libdrm-dev libvulkan-dev \
-  libpng-dev cmake
-
-git clone https://gitlab.freedesktop.org/virgl/virglrenderer.git
-cd virglrenderer
-# Use a recent stable commit or tag — and PIN it. The Venus protocol/capset is
-# version-coupled between the guest Venus encoder (Mesa / the Helios ICD) and
-# host virglrenderer; record the exact virglrenderer commit + matching Mesa-Venus
-# version and bump them together. (mvisor-win-vgpu-driver pins exact Mesa +
-# virglrenderer commits for the same reason — see TRANSPORT.md §7.)
-meson setup build \
-  -Dvenus=true \
-  -Dvenus-validate=false \
-  -Ddrm-renderers=auto \
-  -Dprefix=/usr/local
-ninja -C build
-sudo ninja -C build install
-sudo ldconfig
+bash tools/build-native-renderer.sh
 ```
 
-Verify:
-```bash
-virgl_test_server --help 2>&1 | grep venus
-# Should show: --venus   Enable Venus (VirtIO-GPU Vulkan)
-```
+This builds/tests the protocol and renderer into `target/linux`, synchronizes
+Mesa's generated headers and installs the host artifacts into a local prefix.
+It does not replace `/usr` or restart QEMU. Python Mako/PyYAML, Meson/Ninja and
+Vulkan/DRM/GBM/epoxy development packages are required. The local tools venv
+uses Mako1.4.1, MarkupSafe3.0.3 and PyYAML6.0.3 in the recorded build.
+
+The owner selects `tools/qemu-with-native-renderer.sh` through the existing
+HELIOS_QEMU_BIN option at their next launcher restart. The wrapper sets the
+paired library/render-server paths after sudo has stripped loader variables.
+Read [NATIVE_DGC.md](docs/dx12/NATIVE_DGC.md) for exact activation, source/build
+versus loaded-artifact verification, and the unresolved host query discrepancy.
+Keep the native Windows guest artifacts paired with this protocol build.
 
 ### 1.3 Build the pinned QEMU fork
 
@@ -161,7 +149,7 @@ A Windows 11 dev VM named `win11` is reachable via `ssh win` (preconfigured). It
 
 - **VS 2022 Build Tools** — "Desktop development with C++" (MSVC v143 + Spectre-mitigated x64 libs).
 - **WDK** — kit **10.0.26100.0**. Must be a *complete* kit (SDK **and** WDK at the same version): `wdk-build` picks the **highest** installed kit with **no override**, so an incomplete higher kit (e.g. a winget WDK with no matching SDK → missing `specstrings.h`) breaks the build. Keep only complete kits.
-- **LLVM 17.0.6** at `C:\Program Files\LLVM\bin`; set `LIBCLANG_PATH` to it for bindgen (LLVM 18 has a bindgen bug). bindgen/LLVM is needed only for active WDF/PCI support or archived dxgk reference builds; the System-class KMDF build should not depend on display DDIs.
+- **LLVM/libclang 22.1.8**, reverified 2026-09-08 at `C:\Program Files\LLVM\bin`; set `LIBCLANG_PATH` to it. Active KMD and both UMDs require **bindgen 0.72** with layout assertions enabled. The older LLVM17 downgrade advice below has been retired. CI uses the same LLVM version and Vulkan SDK **1.4.350.0**, also reverified in the VM.
 - **Rust nightly + `rust-src`** (for `no_std` build-std), target `x86_64-pc-windows-msvc`.
 - **cargo-make** — `cargo install --locked cargo-make`.
 - **coreutils** are installed (Unix tools like `ls`/`cp`/`grep` work in `win_exec`).
@@ -200,15 +188,15 @@ Install the WDK matching your VS 2022. The WDK installs as a VS extension.
 
 Verify: Open VS → Extensions → should show "Windows Driver Kit".
 
-#### LLVM 17.0.6 (not 18 — has a bindgen bug)
+#### LLVM 22.1.8 and bindgen 0.72
 ```powershell
-winget install -i LLVM.LLVM --version 17.0.6 --force
+winget install -i LLVM.LLVM --version 22.1.8 --force
 # Select "Add LLVM to PATH" in the GUI
 ```
 
 Verify:
 ```powershell
-clang --version  # should print 17.0.6
+clang --version  # should print 22.1.8
 ```
 
 #### Rust (nightly channel — required for no_std kernel mode)
@@ -463,7 +451,7 @@ unsafe { KdPrint!("Helios: adapter started\n\0"); }
 | Mesa (Linux guest test) | 24.2 | Latest | Venus ICD |
 | WDK | 10.0.26100.0 | 10.0.26100.0 | For KMDF/WDF (KMDF 1.33) |
 | VS | 2022 | 2022 | Earlier versions may work |
-| LLVM | 17.0.6 | 17.0.6 | 18 has bindgen bug, avoid |
+| LLVM/libclang | 22.1.8 pinned | 22.1.8 | Match CI and bindgen0.72; keep layout assertions |
 | Rust | nightly-2024-11+ | Latest nightly | 2024 edition |
 | windows-drivers-rs | 0.4.x / 0.5.x | Latest | wdk = 0.4, wdk-sys = 0.5 |
 
@@ -476,7 +464,10 @@ The WDK is not on PATH or VS Developer Command Prompt was not used.
 Fix: Build inside "x64 Native Tools Command Prompt for VS 2022".
 
 ### bindgen fails with LLVM error
-LLVM 18 has a known bug. Downgrade to 17.0.6.
+Verify `LIBCLANG_PATH` resolves LLVM22.1.8 and every bindgen dependency is0.72.
+Older bindgen versions can emit one-byte forward-declaration layouts under
+libclang22. Do not disable layout assertions or downgrade bindgen; see AGENTS.md
+for the matching `wdk-build` git pin requirement.
 
 ### KMD loads but crashes on start
 Check IRQL. A common mistake is calling pageable functions at DISPATCH_LEVEL during virtqueue init. Use `KeGetCurrentIrql()` assertions in debug.

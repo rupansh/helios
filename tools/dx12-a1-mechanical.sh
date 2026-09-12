@@ -1,25 +1,38 @@
 #!/usr/bin/env bash
-# A1 mechanical sweep for a D3D12 changeset (PARALLEL.md §10 A1, METHOD.md §3 criterion 3).
+# A1 mechanical sweep for a D3D12 changeset.
 #
-# Every check here is an EXIT CODE, not a human's reading -- METHOD.md saturation criterion 3
-# exists because "a grep check has twice counted its own documentation here".
+# Every check has an exit status so a failed check cannot be mistaken for a pass.
 #
-# Usage: tools/dx12-a1-mechanical.sh [BASE_REF]   (default 3e750c0)
+# Usage: tools/dx12-a1-mechanical.sh [BASE_REF]   (default HEAD for dirty work)
+# Pass the actual pre-change ref when checking a changeset with new commits.
 #
 # Exit 0 only if every check passes. Findings print as "FAIL <check>: <detail>".
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-BASE="${1:-3e750c0}"
+BASE="${1:-HEAD}"
 rc=0
 fail() { echo "FAIL $1: $2"; rc=1; }
 pass() { echo "ok   $1${2:+: $2}"; }
 
-# The changeset's Rust + C++ sources (submodules and docs excluded -- they are reviewed by lens,
-# not by grep, and a submodule path is a gitlink with no lines).
-mapfile -t SRC < <(git diff --name-only "$BASE" -- '*.rs' '*.cpp' '*.h' | grep -v '^docs/')
+# The changeset's Rust + C++ sources. Submodules need their own checks;
+# a submodule path is a gitlink with no source lines.
+mapfile -t SRC < <(
+  { git diff --name-only "$BASE" -- '*.rs' '*.cpp' '*.h'
+    git ls-files --others --exclude-standard -- '*.rs' '*.cpp' '*.h'; } | sort -u | grep -v '^docs/'
+)
 if [ ${#SRC[@]} -eq 0 ]; then echo "FAIL setup: no source files in $BASE..HEAD"; exit 1; fi
 echo "== A1 over ${#SRC[@]} changed source files, base $BASE =="
+
+# New, unstaged handlers are part of the changeset too. A plain git diff
+# silently excluded them from the unsafe/panic/allow checks.
+source_diff() {
+  if git ls-files --error-unmatch -- "$1" >/dev/null 2>&1; then
+    git diff -U0 "$BASE" -- "$1"
+  else
+    git diff --no-index -U0 -- /dev/null "$1" || [ "$?" -eq 1 ]
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # 1. Every `unsafe` block/fn in a CHANGED HUNK carries a `// SAFETY:` (AGENTS.md rule 4).
@@ -45,7 +58,7 @@ for f in "${SRC[@]}"; do
     if ! sed -n "${lo},${ln}p" "$f" | grep -qE 'SAFETY|#[[:space:]]*Safety'; then
       n_missing=$((n_missing+1)); missing_list+=$'\n'"    $f:$ln"
     fi
-  done < <(git diff -U0 "$BASE" -- "$f" \
+  done < <(source_diff "$f" \
             | awk '/^(\+\+\+|---|diff |index |new file|deleted file|similarity|rename |old mode|new mode)/ { next }
                    /^@@/{ if (match($0,/\+[0-9]+/)) { ln=substr($0,RSTART+1,RLENGTH-1)+0 } ; next }
                    /^\+/ { if ($0 ~ /unsafe[[:space:]]*[{]/ || $0 ~ /unsafe[[:space:]]+(fn|extern|impl)/) print ln; ln++ ; next }
@@ -73,7 +86,7 @@ for f in "${SRC[@]}"; do
       *"const _"*|*"static_assert"*) continue ;;
     esac
     panic_hits+=$'\n'"    $f:$ln: $(echo "$txt" | sed 's/^[[:space:]]*//' | cut -c1-100)"
-  done < <(git diff -U0 "$BASE" -- "$f" \
+  done < <(source_diff "$f" \
             | awk '/^(\+\+\+|---|diff |index |new file|deleted file|similarity|rename |old mode|new mode)/ { next }
                    /^@@/{ if (match($0,/\+[0-9]+/)) { ln=substr($0,RSTART+1,RLENGTH-1)+0 } ; next }
                    /^\+/ { s=substr($0,2);
@@ -95,7 +108,7 @@ for f in "${SRC[@]}"; do
   [ -f "$f" ] || continue
   while IFS= read -r ln; do
     allow_hits+=$'\n'"    $f:$ln: $(sed -n "${ln}p" "$f" | sed 's/^[[:space:]]*//')"
-  done < <(git diff -U0 "$BASE" -- "$f" \
+  done < <(source_diff "$f" \
             | awk '/^(\+\+\+|---|diff |index |new file|deleted file|similarity|rename |old mode|new mode)/ { next }
                    /^@@/{ if (match($0,/\+[0-9]+/)) { ln=substr($0,RSTART+1,RLENGTH-1)+0 } ; next }
                    /^\+/ { s=substr($0,2);
@@ -111,12 +124,15 @@ if [ -n "$allow_hits" ]; then fail "no-hand-written-allow" "$allow_hits"
 else pass "no-hand-written-allow"; fi
 
 # ---------------------------------------------------------------------------
-# 4. static_assert anchor count == 1 (ead692e). The ANCHORED form is what works: the bare word
-#    and the trailing-paren form both count the comments that quote them and report 3.
-#    NEVER `git grep` -- it skips untracked files, so a new umd12/bridge/ reads 0.
+# 4. Preserve the bridge's return-type and non-dispatchable-handle assertions.
+#    Check their identities so adding another assertion does not fail the gate.
 # ---------------------------------------------------------------------------
-sa=$(grep -rnE '^[[:space:]]*static_assert\(' umd/bridge umd12/bridge umd_common/bridge 2>/dev/null | wc -l)
-if [ "$sa" -ne 1 ]; then fail "static_assert-count" "expected 1, got $sa"; else pass "static_assert-count" "1"; fi
+if grep -qF 'static_assert(std::is_same_v<R, decltype(fn())>,' umd_common/bridge/bridge_guard.h &&
+   grep -qF 'static_assert(sizeof(VenusDeviceMemory) == sizeof(std::uint64_t));' umd12/bridge/vkd3d_bridge.cpp; then
+    pass "bridge-assertions"
+else
+    fail "bridge-assertions" "required return-type or Vulkan handle-width assertion missing"
+fi
 
 # ---------------------------------------------------------------------------
 # 5. Shared files: tables12.rs must have an EMPTY diff (§5).
@@ -160,13 +176,22 @@ else pass "kmd_logic-tests" "$(echo "$kl" | grep -oE '[0-9]+ passed' | head -1)"
 # ---------------------------------------------------------------------------
 proto_sites() { (cd "$1/protocol" && CARGO_TARGET_DIR="$2" cargo clippy --quiet --all-targets -- -D warnings 2>&1 \
                  | grep -E '^\s+-->' | sed 's/^[[:space:]]*//' | sort); }
-BASE_WT=/tmp/claude-1000/dx12-a1-base
-if [ ! -d "$BASE_WT" ]; then git worktree add -q --detach "$BASE_WT" "$BASE" >/dev/null 2>&1; fi
-now=$(proto_sites . target/linux)
-was=$(proto_sites "$BASE_WT" "$BASE_WT/tgt")
-newly=$(comm -13 <(echo "$was") <(echo "$now"))
-if [ -n "$newly" ]; then fail "protocol-clippy" "sites NOT present at $BASE: $newly"
-else pass "protocol-clippy" "$(echo "$now" | grep -c . ) sites, identical to $BASE"; fi
+BASE_TMP=$(mktemp -d /tmp/helios-dx12-a1.XXXXXX)
+BASE_WT="$BASE_TMP/base"
+cleanup_base() {
+  git worktree remove --force "$BASE_WT" >/dev/null 2>&1 || true
+  rm -rf -- "$BASE_TMP"
+}
+trap cleanup_base EXIT
+if ! git worktree add -q --detach "$BASE_WT" "$BASE"; then
+  fail "protocol-clippy" "cannot create isolated base worktree for $BASE"
+else
+  now=$(proto_sites . target/linux)
+  was=$(proto_sites "$BASE_WT" "$BASE_WT/target/linux")
+  newly=$(comm -13 <(echo "$was") <(echo "$now"))
+  if [ -n "$newly" ]; then fail "protocol-clippy" "sites NOT present at $BASE: $newly"
+  else pass "protocol-clippy" "$(echo "$now" | grep -c . ) sites, identical to $BASE"; fi
+fi
 
 echo
 [ $rc -eq 0 ] && echo "== A1 CLEAN ==" || echo "== A1 HAS FINDINGS =="

@@ -21,8 +21,8 @@
 //
 // ⛔ `HELIOS_BRIDGE_ENGINE_CATCH` is deliberately NOT defined here. It is
 // `bridge_guard.h`'s one customization point and exists for `dxvk::DxvkError`,
-// which is not a `std::exception`; vkd3d is a C library behind a COM ABI and
-// throws nothing, so the generic arms are the whole story.
+// which is not a `std::exception`. vkd3d's C entry points can reach C++ shader
+// compiler allocations; the shared generic arms contain escaping exceptions.
 
 // ⚠ Guarded, not bare `#define`s as `dxvk_bridge.cpp:8-9` has them: `build.rs`
 // passes both on the clang-cl command line for this crate, and a redefinition
@@ -53,6 +53,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <new>
 #include <share.h>
 
 // ── the two engine entry points ─────────────────────────────────────────────
@@ -66,9 +67,45 @@
 // `extern "C"` here is load-bearing, not decorative.
 extern "C" HRESULT helios_vkd3d_create_device(LUID adapter_luid, REFIID iid,
                                               void** device);
+extern "C" HRESULT helios_vkd3d_validate_native_feature_level(ID3D12Device* device,
+    std::uint32_t minimum_feature_level, std::uint32_t* shader_model,
+    std::uint32_t* raytracing_tier, std::uint8_t* device_uuid) noexcept(false);
 extern "C" HRESULT helios_vkd3d_serialize_root_signature(
     const D3D12_ROOT_SIGNATURE_DESC* desc, D3D_ROOT_SIGNATURE_VERSION version,
     ID3DBlob** blob, ID3DBlob** error_blob);
+extern "C" HRESULT helios_vkd3d_create_root_signature(ID3D12Device* device, UINT node_mask,
+    const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc, ID3D12RootSignature** root) noexcept(false);
+extern "C" HRESULT helios_vkd3d_clear_root_arguments(ID3D12GraphicsCommandList* list) noexcept(false);
+// Same SDK/widl COM ABI as the public pipeline factory; the separate symbol
+// supplies SO origin without reserving a legal application semantic name.
+extern "C" HRESULT helios_vkd3d_create_stream_output_pipeline(ID3D12Device* device,
+    const D3D12_PIPELINE_STATE_STREAM_DESC* desc, ID3D12PipelineState** pipeline) noexcept(false);
+
+std::int32_t helios_vkd3d_bridge_create_stream_output_pipeline(
+    std::size_t device, std::size_t desc, std::size_t* pipeline_out) noexcept {
+  if (!pipeline_out) return E_INVALIDARG;
+  *pipeline_out = 0;
+  if (!device || !desc) return E_INVALIDARG;
+  // /EHsc assumes an extern C call cannot throw unless explicitly declared
+  // otherwise above. The C engine reaches the C++ DXIL compiler. Contain an
+  // escaping exception at this Rust boundary; this does not repair compiler
+  // allocations owned by C frames skipped during unwinding.
+  return helios_bridge::bridge_guard("create_stream_output_pipeline",
+      std::int32_t(E_FAIL), [&]() -> std::int32_t {
+        try {
+          ID3D12PipelineState* pipeline = nullptr;
+          const HRESULT hr = helios_vkd3d_create_stream_output_pipeline(
+              reinterpret_cast<ID3D12Device*>(device),
+              reinterpret_cast<const D3D12_PIPELINE_STATE_STREAM_DESC*>(desc), &pipeline);
+          if (SUCCEEDED(hr)) *pipeline_out = reinterpret_cast<std::size_t>(pipeline);
+          return hr;
+        } catch (const std::bad_alloc&) {
+          // Preserve OOM without diagnostic allocation. The native DDI counts
+          // the failure before returning it; its output slot remains clear.
+          return E_OUTOFMEMORY;
+        }
+      });
+}
 
 // ── ID3D12DXVKInteropDevice4, hand-declared ─────────────────────────────────
 //
@@ -221,6 +258,8 @@ using helios_bridge::umd_log;
 // image, so there is no module whose lifetime could end under a live device.
 struct HeliosVkd3dDeviceImpl {
   ID3D12Device* d3d12 = nullptr;
+  std::uint32_t minimum_feature_level = 0;
+
   // UP-2c. The engine's interop interface, queried ONCE at device create.
   //
   // ⛔ Once, and for the same class of reason the ICD export is resolved once: a
@@ -419,6 +458,16 @@ std::size_t HeliosVkd3dDevice::d3d12_device_ptr() const noexcept {
   // owning `ID3D12Device` is a double release at drop, and the crash lands
   // nowhere near here.
   return impl ? reinterpret_cast<std::size_t>(impl->d3d12) : 0;
+}
+
+bool HeliosVkd3dDevice::native_optional_caps(std::uint32_t& shader_model,
+    std::uint32_t& raytracing_tier, rust::Slice<std::uint8_t> device_uuid) const noexcept {
+  if (!impl || !impl->d3d12 || device_uuid.size() != 16)
+    return false;
+  // Revalidate even when adopting the discovery engine: an environment override
+  // installed after adapter discovery must not bypass native admission.
+  return SUCCEEDED(helios_vkd3d_validate_native_feature_level(impl->d3d12,
+      impl->minimum_feature_level, &shader_model, &raytracing_tier, device_uuid.data()));
 }
 
 std::uint32_t HeliosVkd3dDevice::venus_context_id() const noexcept {
@@ -632,7 +681,7 @@ std::uint32_t HeliosVkd3dDevice::transfer_resource_ownership(
 }
 
 std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
-    std::uint32_t luid_low, std::int32_t luid_high) {
+    std::uint32_t luid_low, std::int32_t luid_high, std::uint32_t minimum_feature_level) {
   // ── process-global env configuration, exactly once ────────────────────────
   //
   // `std::call_once` and not "do it on every create": `_putenv_s` is not safe
@@ -677,10 +726,6 @@ std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
   // pointer to 32 bits; dwm and LogonUI crash-looped at cold boot and nothing
   // warned. The `static_assert` in `umd_common/bridge/bridge_guard.h` is the
   // fix — ⛔ never defeat it with a cast; if it fires, the sentinel is wrong.
-  // (Deliberately no line number: it is the only `static_assert` in any bridge
-  // directory, so `grep` finds it and a pointer cannot go stale. This comment
-  // cited `:94` for about an hour, until the same commit's edit to that header
-  // pushed the assert to `:103`.)
   return helios_bridge::bridge_guard(
       "helios_vkd3d_bridge_create_device", std::unique_ptr<HeliosVkd3dDevice>{},
       [&]() -> std::unique_ptr<HeliosVkd3dDevice> {
@@ -733,6 +778,22 @@ std::unique_ptr<HeliosVkd3dDevice> helios_vkd3d_bridge_create_device(
         // `Impl` now owns the one reference; its destructor releases it, on
         // every exit path including an exception unwinding out of the guard.
         out->impl->d3d12 = dev;
+
+        // The native maximum is supplied by caps12, not an environment override.
+        // Keep ownership in Impl so refusal or an exception releases the engine.
+        out->impl->minimum_feature_level = minimum_feature_level;
+        std::uint32_t shader_model = 0, raytracing_tier = 0;
+        std::uint8_t device_uuid[16] = {};
+        const HRESULT admission = helios_vkd3d_validate_native_feature_level(dev, minimum_feature_level,
+            &shader_model, &raytracing_tier, device_uuid);
+        if (FAILED(admission)) {
+          const std::uint32_t n = helios_bridge::g_vkd3dCreateDeviceFailed.fetch_add(1, std::memory_order_relaxed) + 1;
+          char msg[192];
+          std::snprintf(msg, sizeof(msg), "Native feature contract 0x%x unavailable hr=0x%08lx (Vkd3dCreateDeviceFailed=%u)",
+                        minimum_feature_level, (unsigned long)admission, n);
+          umd_log(msg);
+          return std::unique_ptr<HeliosVkd3dDevice>{};
+        }
 
         // ⛔ S4b: on THIS thread, before returning. The ICD's ctx-id export is
         // thread-local, and vkd3d created its `VkInstance` on this thread
@@ -884,6 +945,36 @@ std::int32_t helios_vkd3d_bridge_serialize_root_signature(
       });
 }
 
+std::int32_t helios_vkd3d_bridge_create_root_signature(std::size_t device,
+    std::uint32_t node_mask, std::size_t desc, std::size_t* root_out) noexcept {
+  if (!root_out) return E_INVALIDARG;
+  *root_out = 0;
+  if (!device || !desc) return E_INVALIDARG;
+  try {
+    ID3D12RootSignature* root = nullptr;
+    const HRESULT hr = helios_vkd3d_create_root_signature(
+        reinterpret_cast<ID3D12Device*>(device), node_mask,
+        reinterpret_cast<const D3D12_VERSIONED_ROOT_SIGNATURE_DESC*>(desc), &root);
+    if (SUCCEEDED(hr)) *root_out = reinterpret_cast<std::size_t>(root);
+    return hr;
+  } catch (const std::bad_alloc&) {
+    return E_OUTOFMEMORY;
+  } catch (...) {
+    return E_FAIL;
+  }
+}
+
+std::int32_t helios_vkd3d_bridge_clear_root_arguments(std::size_t list) noexcept {
+  if (!list) return E_INVALIDARG;
+  try {
+    return helios_vkd3d_clear_root_arguments(reinterpret_cast<ID3D12GraphicsCommandList*>(list));
+  } catch (const std::bad_alloc&) {
+    return E_OUTOFMEMORY;
+  } catch (...) {
+    return E_FAIL;
+  }
+}
+
 extern "C" HRESULT helios_vkd3d_enqueue_producer(ID3D12CommandQueue*, ID3D12Resource*,
     std::uint32_t, HANDLE, std::uint32_t*, std::uint32_t*, std::uint64_t*);
 
@@ -900,6 +991,13 @@ extern "C" HRESULT helios_vkd3d_execute_command_lists(ID3D12CommandQueue*, UINT,
     ID3D12CommandList* const*, HANDLE, std::uint32_t*, std::uint32_t*, std::uint64_t*);
 extern "C" void helios_vkd3d_cancel_execution(ID3D12CommandQueue*, HRESULT);
 
+extern "C" HRESULT helios_vkd3d_try_reset_command_allocator(ID3D12CommandAllocator*);
+std::int32_t helios_vkd3d_bridge_try_reset_allocator(std::size_t allocator) {
+  return helios_bridge::bridge_guard("try_reset_allocator12", std::int32_t(E_FAIL), [&]() -> std::int32_t {
+    return helios_vkd3d_try_reset_command_allocator(reinterpret_cast<ID3D12CommandAllocator*>(allocator));
+  });
+}
+
 std::int32_t helios_vkd3d_bridge_execute(std::size_t queue, rust::Slice<const std::size_t> lists,
     std::size_t admission_event, std::uint32_t* ctx, std::uint32_t* value, std::uint64_t* cookie) {
   return helios_bridge::bridge_guard("execute12", std::int32_t(E_FAIL), [&]() -> std::int32_t {
@@ -915,4 +1013,43 @@ std::int32_t helios_vkd3d_bridge_execute(std::size_t queue, rust::Slice<const st
 
 void helios_vkd3d_bridge_cancel_execution(std::size_t queue, std::int32_t reason) {
   helios_vkd3d_cancel_execution(reinterpret_cast<ID3D12CommandQueue*>(queue), reason);
+}
+
+extern "C" HRESULT helios_vkd3d_update_tile_mappings(ID3D12CommandQueue*, ID3D12Resource*, UINT,
+    const D3D12_TILED_RESOURCE_COORDINATE*, const D3D12_TILE_REGION_SIZE*, ID3D12Heap*, UINT,
+    const D3D12_TILE_RANGE_FLAGS*, const UINT*, const UINT*, D3D12_TILE_MAPPING_FLAGS,
+    HANDLE, std::uint32_t*, std::uint32_t*, std::uint64_t*);
+extern "C" HRESULT helios_vkd3d_copy_tile_mappings(ID3D12CommandQueue*, ID3D12Resource*,
+    const D3D12_TILED_RESOURCE_COORDINATE*, ID3D12Resource*, const D3D12_TILED_RESOURCE_COORDINATE*,
+    const D3D12_TILE_REGION_SIZE*, D3D12_TILE_MAPPING_FLAGS, HANDLE,
+    std::uint32_t*, std::uint32_t*, std::uint64_t*);
+
+std::int32_t helios_vkd3d_bridge_update_tiles(std::size_t queue, std::size_t resource,
+    std::uint32_t region_count, std::size_t coords, std::size_t sizes, std::size_t heap,
+    std::uint32_t range_count, std::size_t flags, std::size_t offsets, std::size_t counts,
+    std::int32_t mapping_flags, std::size_t admission, std::uint32_t* ctx,
+    std::uint32_t* value, std::uint64_t* cookie) {
+  return helios_bridge::bridge_guard("update_tiles12", std::int32_t(E_FAIL), [&]() -> std::int32_t {
+    return helios_vkd3d_update_tile_mappings(reinterpret_cast<ID3D12CommandQueue*>(queue),
+      reinterpret_cast<ID3D12Resource*>(resource), region_count,
+      reinterpret_cast<const D3D12_TILED_RESOURCE_COORDINATE*>(coords),
+      reinterpret_cast<const D3D12_TILE_REGION_SIZE*>(sizes), reinterpret_cast<ID3D12Heap*>(heap),
+      range_count, reinterpret_cast<const D3D12_TILE_RANGE_FLAGS*>(flags),
+      reinterpret_cast<const UINT*>(offsets), reinterpret_cast<const UINT*>(counts),
+      static_cast<D3D12_TILE_MAPPING_FLAGS>(mapping_flags), reinterpret_cast<HANDLE>(admission),
+      ctx, value, cookie);
+  });
+}
+
+std::int32_t helios_vkd3d_bridge_copy_tiles(std::size_t queue, std::size_t dst,
+    std::size_t dst_coord, std::size_t src, std::size_t src_coord, std::size_t size,
+    std::int32_t flags, std::size_t admission, std::uint32_t* ctx, std::uint32_t* value,
+    std::uint64_t* cookie) {
+  return helios_bridge::bridge_guard("copy_tile_mappings12", std::int32_t(E_FAIL), [&]() -> std::int32_t {
+    return helios_vkd3d_copy_tile_mappings(reinterpret_cast<ID3D12CommandQueue*>(queue),
+      reinterpret_cast<ID3D12Resource*>(dst), reinterpret_cast<const D3D12_TILED_RESOURCE_COORDINATE*>(dst_coord),
+      reinterpret_cast<ID3D12Resource*>(src), reinterpret_cast<const D3D12_TILED_RESOURCE_COORDINATE*>(src_coord),
+      reinterpret_cast<const D3D12_TILE_REGION_SIZE*>(size), static_cast<D3D12_TILE_MAPPING_FLAGS>(flags),
+      reinterpret_cast<HANDLE>(admission), ctx, value, cookie);
+  });
 }

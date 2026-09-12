@@ -58,6 +58,19 @@ tooling inventory (registry knobs, counters, ETW recipes, guest probe schtasks).
 it as items close or appear. Session-by-session state lives in the agent memory; do not create
 per-session HANDOFF_*.md docs — distill into memory + ROADMAP.md.
 
+**Owner update, 2026-09-08:** the old mandatory multi-agent review loop, fixed lane ownership
+and two-dry-round deployment requirement are retired. Use review and validation appropriate to
+the concrete change. Historical review instructions and source-comment citations do not revive
+that workflow. Preserve the architecture, synchronization invariants and evidence requirements.
+
+**Owner update, 2026-09-09:** virglrenderer forks are authorized. The paired
+`virglrenderer` and `venus-protocol` submodules plus Mesa provide native DGC;
+the private vkd3d indirect emulation and `HELIOS_RETIRE_FEEDBACK` workaround are
+removed. See `docs/dx12/NATIVE_DGC.md` for the new wire-completion contract,
+host query discrepancy, local renderer build and owner-operated QEMU restart.
+WDDM2.1, the native static UMD and async WSI remain. Guest reboots are already
+authorized. Do not update memory unless explicitly requested.
+
 ---
 
 ## ⚠️ VERY IMPORTANT: `CARGO_TARGET_DIR`
@@ -161,19 +174,13 @@ helios-vgpu/
 │                             WINDOWED_BLT_DESIGN, SCANOUT_DRM_MODIFIER_DESIGN, the
 │                             GATE*/WDDM_*/DISPLAY*/PHASE*/HANDOFF_* corpus, and
 │                             REFACTOR_* (the completed T0–T8 quality refactor).
-├── docs/dx12/              ← D3D12 implementation doc set. ⭐ **METHOD.md is the working
-│                             loop and is authoritative over SEQUENCING in all of them**
-│                             (owner directive 2026-08-06: implement a subsystem to its
-│                             contract → adversarial review of the whole changeset →
-│                             repair → repeat until saturated → then deploy. The old
-│                             implement-a-bit-then-run-a-probe ladder is retired, and
-│                             GATES.md is demoted to an acceptance suite). DECISIONS.md
+├── docs/dx12/              ← D3D12 implementation doc set. DECISIONS.md
 │                             remains authoritative for ARCHITECTURE (nothing may
 │                             contradict it); ARCHITECTURE (the UMD split: umd_common +
 │                             umd12 + the vkd3d bridge), DDI_REFERENCE (the d3d12umddi
 │                             contract, reconstructed — MS does not document it), PRESENT,
 │                             SUBSTRATE, KMD_IMPACT, GATES (D12-G0..G11, acceptance only),
-│                             PARALLEL (§10 is the review protocol), research/ (12 dossiers)
+│                             research/ (12 dossiers)
 ├── docs/reference/         ← Non-narrative reference data (host vulkaninfo profile)
 │
 ├── kmd_render/             ← ACTIVE: WDDM render+display miniport (Rust, no_std)

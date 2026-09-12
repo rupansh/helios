@@ -36,45 +36,37 @@
 //! which — mesh and amplification shaders — is not expressible in the legacy
 //! struct at all.
 //!
-//! # ⚠ Feature level: this lane's half is ready for **12_1**
+//! # Feature-level evidence
 //!
-//! `caps12.rs` ships FL 11_0 as a staging value and `DX12.md` §4.4 makes 12_1
-//! the standing target. The two floors 12_1 arms that belong to L6 are
-//! **ROVs** and `ConservativeRasterizationTier >= 1`, and both are pure
-//! pass-through here: `D3D12DDI_RASTERIZER_DESC_0102::ConservativeRasterizationMode`
-//! is forwarded verbatim to `D3D12_RASTERIZER_DESC2::ConservativeRaster`, and
-//! ROVs are a shader-model feature that never touches this file — the bytecode
-//! is copied, not inspected. ⛔ **This lane does not raise the level**:
-//! `caps12.rs` is not its file and the level moves in one commit with all of
-//! its floors.
+//! ROV shader and conservative-raster state forwarding are backed paths, not
+//! native conformance evidence. Root creation preserves the versioned DDI and
+//! runtime instrumentation capacity through the private engine factory. The
+//! remaining obligations and admission limits live in FEATURE_LEVELS.md.
 
 use core::ffi::c_void;
 use core::mem::ManuallyDrop;
 
-use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, S_OK};
+use helios_umd_common::hr::{Hresult, E_FAIL, E_INVALIDARG, E_OUTOFMEMORY, S_OK};
 use helios_umd_common::refusals::RefusalCounter;
 use helios_umd_common::slot::{Boxed, BoxedHandle, Com, ComHandle, Slot};
 
 use windows::core::Interface;
-use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::{
-    ID3D12Device2, ID3D12PipelineState, ID3D12RootSignature, D3D12_BLEND, D3D12_BLEND_DESC,
-    D3D12_BLEND_OP, D3D12_BLEND_OP_ADD, D3D12_BLEND_ONE, D3D12_BLEND_ZERO,
-    D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMPARISON_FUNC, D3D12_COMPARISON_FUNC_ALWAYS,
-    D3D12_COMPARISON_FUNC_LESS, D3D12_COMPUTE_PIPELINE_STATE_DESC,
+    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF, ID3D12Device2, ID3D12PipelineState,
+    ID3D12RootSignature, D3D12_BLEND, D3D12_BLEND_DESC, D3D12_BLEND_ONE, D3D12_BLEND_OP,
+    D3D12_BLEND_OP_ADD, D3D12_BLEND_ZERO, D3D12_COLOR_WRITE_ENABLE_ALL, D3D12_COMPARISON_FUNC,
+    D3D12_COMPARISON_FUNC_ALWAYS, D3D12_COMPARISON_FUNC_LESS, D3D12_COMPUTE_PIPELINE_STATE_DESC,
     D3D12_CONSERVATIVE_RASTERIZATION_MODE, D3D12_CONSERVATIVE_RASTERIZATION_MODE_OFF,
     D3D12_CONSERVATIVE_RASTERIZATION_MODE_ON, D3D12_CULL_MODE, D3D12_CULL_MODE_BACK,
-    D3D12_DEFAULT_STENCIL_READ_MASK, D3D12_DEFAULT_STENCIL_WRITE_MASK,
-    D3D12_DEPTH_STENCILOP_DESC1, D3D12_DEPTH_STENCIL_DESC2,
-    D3D12_DEPTH_WRITE_MASK, D3D12_DEPTH_WRITE_MASK_ALL, D3D12_DESCRIPTOR_RANGE,
-    D3D12_DESCRIPTOR_RANGE_TYPE, D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, D3D12_FILL_MODE,
-    D3D12_FILL_MODE_SOLID, D3D12_FILTER, D3D12_FILTER_ANISOTROPIC,
-    D3D12_INDEX_BUFFER_STRIP_CUT_VALUE, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE_0xFFFFFFFF,
-    D3D12_INPUT_CLASSIFICATION, D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,
-    D3D12_INPUT_ELEMENT_DESC, D3D12_INPUT_LAYOUT_DESC, D3D12_LINE_RASTERIZATION_MODE,
-    D3D12_LINE_RASTERIZATION_MODE_ALIASED, D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW,
-    D3D12_LOGIC_OP, D3D12_LOGIC_OP_NOOP, D3D12_PIPELINE_STATE_FLAGS,
-    D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS,
+    D3D12_DEFAULT_STENCIL_READ_MASK, D3D12_DEFAULT_STENCIL_WRITE_MASK, D3D12_DEPTH_STENCILOP_DESC1,
+    D3D12_DEPTH_STENCIL_DESC2, D3D12_DEPTH_WRITE_MASK, D3D12_DEPTH_WRITE_MASK_ALL,
+    D3D12_DESCRIPTOR_RANGE1, D3D12_DESCRIPTOR_RANGE_FLAGS, D3D12_DESCRIPTOR_RANGE_TYPE,
+    D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER, D3D12_FILL_MODE, D3D12_FILL_MODE_SOLID, D3D12_FILTER,
+    D3D12_FILTER_ANISOTROPIC, D3D12_INDEX_BUFFER_STRIP_CUT_VALUE, D3D12_INPUT_CLASSIFICATION,
+    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA, D3D12_INPUT_ELEMENT_DESC,
+    D3D12_INPUT_LAYOUT_DESC, D3D12_LINE_RASTERIZATION_MODE, D3D12_LINE_RASTERIZATION_MODE_ALIASED,
+    D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW, D3D12_LOGIC_OP, D3D12_LOGIC_OP_NOOP,
+    D3D12_PIPELINE_STATE_FLAGS, D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS,
     D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT, D3D12_PIPELINE_STATE_STREAM_DESC,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2,
@@ -83,26 +75,29 @@ use windows::Win32::Graphics::Direct3D12::{
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS,
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY,
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC,
     D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK,
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING,
-    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_PRIMITIVE_TOPOLOGY_TYPE,
-    D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH, D3D12_RASTERIZER_DESC2, D3D12_RENDER_TARGET_BLEND_DESC,
-    D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR, D3D12_ROOT_DESCRIPTOR_TABLE, D3D12_ROOT_PARAMETER,
-    D3D12_ROOT_PARAMETER_0, D3D12_ROOT_PARAMETER_TYPE, D3D12_ROOT_PARAMETER_TYPE_UAV,
-    D3D12_ROOT_SIGNATURE_DESC,
-    D3D12_ROOT_SIGNATURE_FLAGS, D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT,
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE, D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH, D3D12_RASTERIZER_DESC2,
+    D3D12_RENDER_TARGET_BLEND_DESC, D3D12_ROOT_CONSTANTS, D3D12_ROOT_DESCRIPTOR1,
+    D3D12_ROOT_DESCRIPTOR_FLAGS, D3D12_ROOT_DESCRIPTOR_TABLE1, D3D12_ROOT_PARAMETER1,
+    D3D12_ROOT_PARAMETER1_0, D3D12_ROOT_PARAMETER_TYPE, D3D12_ROOT_PARAMETER_TYPE_UAV,
+    D3D12_ROOT_SIGNATURE_DESC2, D3D12_ROOT_SIGNATURE_FLAGS,
+    D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
     D3D12_ROOT_SIGNATURE_FLAG_SAMPLER_HEAP_DIRECTLY_INDEXED, D3D12_RT_FORMAT_ARRAY,
-    D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY, D3D12_SHADER_VISIBILITY_MESH,
-    D3D12_STATIC_BORDER_COLOR, D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT,
-    D3D12_STATIC_SAMPLER_DESC, D3D12_STENCIL_OP_KEEP, D3D12_TEXTURE_ADDRESS_MODE,
-    D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
+    D3D12_SAMPLER_FLAGS, D3D12_SHADER_BYTECODE, D3D12_SHADER_VISIBILITY,
+    D3D12_SHADER_VISIBILITY_MESH, D3D12_STATIC_BORDER_COLOR,
+    D3D12_STATIC_BORDER_COLOR_OPAQUE_WHITE_UINT, D3D12_STATIC_SAMPLER_DESC1, D3D12_STENCIL_OP_KEEP,
+    D3D12_STREAM_OUTPUT_DESC, D3D12_TEXTURE_ADDRESS_MODE, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE,
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC, D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0,
     D3D12_VIEW_INSTANCE_LOCATION, D3D12_VIEW_INSTANCING_DESC, D3D12_VIEW_INSTANCING_FLAGS,
-    D3D_ROOT_SIGNATURE_VERSION_1_0,
+    D3D_ROOT_SIGNATURE_VERSION_1_2,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
@@ -326,7 +321,13 @@ unsafe fn clear_com<H: ComHandle>(h: H) {
 pub(crate) unsafe fn set_error_if_possible(h_device: ddi12::D3D12DDI_HDEVICE, hr: Hresult) {
     // SAFETY: the caller guarantees a live device handle from `create_device`.
     let Some(dev) = (unsafe { device12::device(h_device) }) else {
-        note_refusal(&L6_REFUSALS.set_error_no_device);
+        // OOM recovery must reach its callback/return without allocating a
+        // first-hit summary, including when the error channel is unavailable.
+        if hr == helios_umd_common::hr::E_OUTOFMEMORY {
+            L6_REFUSALS.set_error_no_device.bump();
+        } else {
+            note_refusal(&L6_REFUSALS.set_error_no_device);
+        }
         return;
     };
     // ⚠ Safe: `device12::set_error` takes `&HeliosD3D12Device`, and the validity
@@ -334,7 +335,11 @@ pub(crate) unsafe fn set_error_if_possible(h_device: ddi12::D3D12DDI_HDEVICE, hr
     // caller obligation. L6 submitted it as an `unsafe fn`; the integrator merged
     // the safe shape two other lanes independently arrived at.
     if !device12::set_error(dev, hr) {
-        note_refusal(&L6_REFUSALS.set_error_cb_absent);
+        if hr == helios_umd_common::hr::E_OUTOFMEMORY {
+            L6_REFUSALS.set_error_cb_absent.bump();
+        } else {
+            note_refusal(&L6_REFUSALS.set_error_cb_absent);
+        }
     }
 }
 
@@ -1019,70 +1024,40 @@ unsafe extern "system" fn calc_private_root_signature_size(
     core::mem::size_of::<*mut c_void>() as ddi12::SIZE_T
 }
 
-/// The 1.0 API form of one DDI root signature, with the arrays its pointers
-/// address kept alive alongside it.
-///
-/// ⚠ `desc` holds raw pointers into `ranges` and the two vectors below, so this
-/// struct exists purely to make the borrow one object with one lifetime rather
-/// than four locals a future edit could reorder.
-struct RootSignature10 {
-    desc: D3D12_ROOT_SIGNATURE_DESC,
-    /// ⛔ Never resized after `parameters` is built: `D3D12_ROOT_DESCRIPTOR_TABLE`
-    /// entries point into the inner `Vec`s' buffers, and a reallocation of the
-    /// OUTER vector would move the inner `Vec` headers but not their buffers —
-    /// which is why only the outer one has a stability requirement, and why it
-    /// is stated here rather than assumed.
-    _ranges: Vec<Vec<D3D12_DESCRIPTOR_RANGE>>,
-    _parameters: Vec<D3D12_ROOT_PARAMETER>,
-    _samplers: Vec<D3D12_STATIC_SAMPLER_DESC>,
+/// Version 1.2 preserves all fields of the negotiated 0100 DDI, including
+/// descriptor volatility and integer-border/non-normalized sampler flags.
+/// Inner range buffers and parameter/sampler arrays remain owned until the
+/// synchronous bridge factory has copied and serialized them.
+struct RootSignature12 {
+    desc: D3D12_ROOT_SIGNATURE_DESC2,
+    _ranges: Vec<Vec<D3D12_DESCRIPTOR_RANGE1>>,
+    _parameters: Vec<D3D12_ROOT_PARAMETER1>,
+    _samplers: Vec<D3D12_STATIC_SAMPLER_DESC1>,
 }
 
-/// Down-convert the DDI's 1.1/1.2-shaped root signature into the 1.0 API struct
-/// the engine's serializer takes.
-///
-/// ⛔ **What is lost, and why that is acceptable.** The bridged engine export is
-/// `vkd3d_serialize_root_signature`, which **rejects any version but 1.0**
-/// outright (`libs/vkd3d/vkd3d_main.c:464-468`), so 1.0 is not a shortcut — it
-/// is the only shape reachable through the entry point `D12-G1`'s third arm
-/// proved. Down-converting drops exactly three things:
-///
-/// * `D3D12DDI_DESCRIPTOR_RANGE_0013::Flags` and
-///   `D3D12DDI_ROOT_DESCRIPTOR_0013::Flags`. vkd3d's 1.0 deserializer supplies
-///   `DESCRIPTORS_VOLATILE | DATA_VOLATILE` for every range and `DATA_VOLATILE`
-///   for every root descriptor (`libs/vkd3d-shader/dxbc.c:355-359`) — the
-///   **most conservative** interpretation, and a strict superset of what any
-///   `STATIC` flag promises. So the loss is optimisation, not correctness, and
-///   `DDI_REFERENCE.md` §9.9 constraint 1 already forbids reconstructing app
-///   intent from the defaults the runtime filled in;
-/// * `D3D12DDI_STATIC_SAMPLER_0100::Flags` (`UINT_BORDER_COLOR`,
-///   `NON_NORMALIZED_COORDINATES`). ⚠ **This one IS a correctness loss** and is
-///   counted separately, because a non-normalised static sampler silently
-///   samples at the wrong coordinates rather than failing.
-///
-/// ⇒ The fix is a **versioned bridge entry point** over
-/// `vkd3d_serialize_versioned_root_signature`
-/// (`vkd3d-proton-helios/include/vkd3d.h:139-140`), which takes a
-/// `D3D12_VERSIONED_ROOT_SIGNATURE_DESC` and handles 1.0/1.1/1.2. That is new
-/// **C++**, which this lane deliberately does not write (`PARALLEL.md` §7: a
-/// bridge module cannot be host-checked, and the whole lane type-checks on Linux
-/// today). It is reported instead.
-///
+fn root_vec<T>(count: usize) -> Result<Vec<T>, Hresult> {
+    let mut data = Vec::new();
+    data.try_reserve_exact(count).map_err(|_| E_OUTOFMEMORY)?;
+    Ok(data)
+}
+
 /// # Safety
-/// `src` must point at a live `D3D12DDI_ROOT_SIGNATURE_0100` whose parameter and
-/// sampler arrays are live for the call.
-unsafe fn root_signature_to_1_0(src: &ddi12::D3D12DDI_ROOT_SIGNATURE_0100) -> Option<RootSignature10> {
+/// All counted DDI arrays are borrowed from the runtime for this invocation.
+unsafe fn root_signature_to_1_2(
+    src: &ddi12::D3D12DDI_ROOT_SIGNATURE_0100,
+) -> Result<RootSignature12, Hresult> {
     let n_params = src.NumParameters as usize;
     let n_samplers = src.NumStaticSamplers as usize;
     if n_params > MAX_ROOT_PARAMETERS || n_samplers > MAX_STATIC_SAMPLERS {
         log_error!(
             "CreateRootSignature: refusing NumParameters={n_params} NumStaticSamplers={n_samplers}"
         );
-        return None;
+        return Err(E_INVALIDARG);
     }
     if (n_params != 0 && src.pRootParameters.is_null())
         || (n_samplers != 0 && src.pStaticSamplers.is_null())
     {
-        return None;
+        return Err(E_INVALIDARG);
     }
     // SAFETY: both counts are bounded above and each pointer is non-null
     // whenever its count is non-zero; the runtime declares both arrays `_In_`
@@ -1104,9 +1079,10 @@ unsafe fn root_signature_to_1_0(src: &ddi12::D3D12DDI_ROOT_SIGNATURE_0100) -> Op
 
     // Pass 1: every descriptor table's ranges, into an outer vector that is
     // never resized once pass 2 starts taking pointers into it.
-    let mut ranges: Vec<Vec<D3D12_DESCRIPTOR_RANGE>> = Vec::with_capacity(n_params);
+    let mut ranges: Vec<Vec<D3D12_DESCRIPTOR_RANGE1>> = root_vec(n_params)?;
     for p in ddi_params {
-        if p.ParameterType != ddi12::D3D12DDI_ROOT_PARAMETER_TYPE_D3D12DDI_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE
+        if p.ParameterType
+            != ddi12::D3D12DDI_ROOT_PARAMETER_TYPE_D3D12DDI_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE
         {
             ranges.push(Vec::new());
             continue;
@@ -1117,7 +1093,7 @@ unsafe fn root_signature_to_1_0(src: &ddi12::D3D12DDI_ROOT_SIGNATURE_0100) -> Op
         let n = table.NumDescriptorRanges as usize;
         if n > MAX_DESCRIPTOR_RANGES || (n != 0 && table.pDescriptorRanges.is_null()) {
             log_error!("CreateRootSignature: refusing NumDescriptorRanges={n}");
-            return None;
+            return Err(E_INVALIDARG);
         }
         // SAFETY: bounded above and non-null whenever non-empty; `_In_` for the
         // call.
@@ -1126,15 +1102,11 @@ unsafe fn root_signature_to_1_0(src: &ddi12::D3D12DDI_ROOT_SIGNATURE_0100) -> Op
         } else {
             unsafe { core::slice::from_raw_parts(table.pDescriptorRanges, n) }
         };
-        let mut out = Vec::with_capacity(n);
+        let mut out = root_vec(n)?;
         for r in src_ranges {
-            if r.Flags
-                != ddi12::D3D12DDI_DESCRIPTOR_RANGE_FLAGS_D3D12DDI_DESCRIPTOR_RANGE_FLAG_0013_NONE
-            {
-                L6_REFUSALS.root_sig_range_flags_dropped.bump();
-            }
-            out.push(D3D12_DESCRIPTOR_RANGE {
+            out.push(D3D12_DESCRIPTOR_RANGE1 {
                 RangeType: D3D12_DESCRIPTOR_RANGE_TYPE(r.RangeType),
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAGS(r.Flags),
                 // ⚠ `0xFFFFFFFF` here means an unbounded range, legal as the
                 // last entry of a table (`DDI_REFERENCE.md` §9.9 constraint 2).
                 // It is copied, never arithmetic'd — which is the whole of what
@@ -1149,12 +1121,12 @@ unsafe fn root_signature_to_1_0(src: &ddi12::D3D12DDI_ROOT_SIGNATURE_0100) -> Op
     }
 
     // Pass 2: the parameters, now that no `ranges` element can move.
-    let mut parameters = Vec::with_capacity(n_params);
+    let mut parameters = root_vec(n_params)?;
     for (i, p) in ddi_params.iter().enumerate() {
         let anonymous = match p.ParameterType {
             ddi12::D3D12DDI_ROOT_PARAMETER_TYPE_D3D12DDI_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE => {
-                D3D12_ROOT_PARAMETER_0 {
-                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                D3D12_ROOT_PARAMETER1_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
                         NumDescriptorRanges: ranges[i].len() as u32,
                         pDescriptorRanges: ranges[i].as_ptr(),
                     },
@@ -1175,7 +1147,7 @@ unsafe fn root_signature_to_1_0(src: &ddi12::D3D12DDI_ROOT_SIGNATURE_0100) -> Op
                 // the API struct to it. The copy below is by NAME, so it is
                 // correct either way — but the doc's claim does not hold here
                 // and is reported rather than silently worked around.
-                D3D12_ROOT_PARAMETER_0 {
+                D3D12_ROOT_PARAMETER1_0 {
                     Constants: D3D12_ROOT_CONSTANTS {
                         ShaderRegister: c.ShaderRegister,
                         RegisterSpace: c.RegisterSpace,
@@ -1188,13 +1160,9 @@ unsafe fn root_signature_to_1_0(src: &ddi12::D3D12DDI_ROOT_SIGNATURE_0100) -> Op
             | ddi12::D3D12DDI_ROOT_PARAMETER_TYPE_D3D12DDI_ROOT_PARAMETER_TYPE_UAV => {
                 // SAFETY: arm selected by `ParameterType`.
                 let d = unsafe { p.__bindgen_anon_1.Descriptor };
-                if d.Flags
-                    != ddi12::D3D12DDI_ROOT_DESCRIPTOR_FLAGS_D3D12DDI_ROOT_DESCRIPTOR_FLAG_0013_NONE
-                {
-                    L6_REFUSALS.root_sig_range_flags_dropped.bump();
-                }
-                D3D12_ROOT_PARAMETER_0 {
-                    Descriptor: D3D12_ROOT_DESCRIPTOR {
+                D3D12_ROOT_PARAMETER1_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                        Flags: D3D12_ROOT_DESCRIPTOR_FLAGS(d.Flags),
                         ShaderRegister: d.ShaderRegister,
                         RegisterSpace: d.RegisterSpace,
                     },
@@ -1206,38 +1174,20 @@ unsafe fn root_signature_to_1_0(src: &ddi12::D3D12DDI_ROOT_SIGNATURE_0100) -> Op
             // runtime's array.
             other => {
                 log_error!("CreateRootSignature: unknown root parameter type {other}");
-                return None;
+                return Err(E_INVALIDARG);
             }
         };
-        parameters.push(D3D12_ROOT_PARAMETER {
+        parameters.push(D3D12_ROOT_PARAMETER1 {
             ParameterType: D3D12_ROOT_PARAMETER_TYPE(p.ParameterType),
             Anonymous: anonymous,
             ShaderVisibility: D3D12_SHADER_VISIBILITY(p.ShaderVisibility),
         });
     }
 
-    let mut samplers = Vec::with_capacity(n_samplers);
+    let mut samplers = root_vec(n_samplers)?;
     for s in ddi_samplers {
-        if s.Flags != ddi12::D3D12DDI_SAMPLER_FLAGS_0096_D3D12DDI_SAMPLER_FLAG_NONE {
-            L6_REFUSALS.root_sig_sampler_flags_dropped.bump();
-            // ⛔ Loud at the moment it moves, not only in the summary. This is
-            // the lane's one *correctness* loss (§4 / `SUBSTRATE.md` §4.5): a
-            // non-normalised static sampler silently samples at the wrong
-            // coordinates, and the process that hits it is exactly the kind that
-            // gets killed or wedged before a clean `pfnDestroyDevice` prints the
-            // set. A counter nobody can read after the fact is not an instrument.
-            let n = L6_REFUSALS.root_sig_sampler_flags_dropped.get();
-            if n <= LOG_BUDGET {
-                log_error!(
-                    "CreateRootSignature: static sampler s{} space{} flags={:#x} DROPPED \
-                     (1.0 serialization cannot carry them) (x{n})",
-                    s.ShaderRegister,
-                    s.RegisterSpace,
-                    s.Flags,
-                );
-            }
-        }
-        samplers.push(D3D12_STATIC_SAMPLER_DESC {
+        samplers.push(D3D12_STATIC_SAMPLER_DESC1 {
+            Flags: D3D12_SAMPLER_FLAGS(s.Flags),
             Filter: D3D12_FILTER(s.Filter),
             AddressU: D3D12_TEXTURE_ADDRESS_MODE(s.AddressU),
             AddressV: D3D12_TEXTURE_ADDRESS_MODE(s.AddressV),
@@ -1254,14 +1204,14 @@ unsafe fn root_signature_to_1_0(src: &ddi12::D3D12DDI_ROOT_SIGNATURE_0100) -> Op
         });
     }
 
-    let desc = D3D12_ROOT_SIGNATURE_DESC {
+    let desc = D3D12_ROOT_SIGNATURE_DESC2 {
         NumParameters: parameters.len() as u32,
         pParameters: parameters.as_ptr(),
         NumStaticSamplers: samplers.len() as u32,
         pStaticSamplers: samplers.as_ptr(),
         Flags: D3D12_ROOT_SIGNATURE_FLAGS(src.Flags),
     };
-    Some(RootSignature10 {
+    Ok(RootSignature12 {
         desc,
         _ranges: ranges,
         _parameters: parameters,
@@ -1269,23 +1219,9 @@ unsafe fn root_signature_to_1_0(src: &ddi12::D3D12DDI_ROOT_SIGNATURE_0100) -> Op
     })
 }
 
-/// The largest serialized root-signature blob this driver will hand back to the
-/// engine.
-///
-/// ⚠ Not decoration: `ID3D12Device::CreateRootSignature`'s generated wrapper
-/// does `pblobwithrootsignature.len().try_into().unwrap()` to narrow the length
-/// to a `u32`. That `.unwrap()` is inside the `windows` crate and cannot be
-/// removed, so the length is bounded **here**, where a failure is a counted
-/// refusal rather than a panic in a DDI.
-const MAX_ROOT_SIGNATURE_BLOB: usize = 1 << 20;
-
-/// `pfnCreateRootSignature` — returns `HRESULT`, so failures need no
-/// `pfnSetErrorCb`.
-///
-/// ⭐ **Root signatures arrive already PARSED and vkd3d wants a serialized DXBC
-/// `RTS0` blob**, so this slot re-serializes through the engine's second export
-/// (`DDI_REFERENCE.md` §9.9; `bridge12::serialize_root_signature`, proven end to
-/// end by `D12-G1`'s third arm).
+/// `pfnCreateRootSignature`: preserve the parsed DDI through a versioned
+/// private engine factory, including the runtime's 128-DWORD capacity.
+/// Failures return HRESULT directly and leave the output handle empty.
 ///
 /// # Safety
 /// `arg`, when non-null, must point at a live
@@ -1326,52 +1262,24 @@ unsafe extern "system" fn create_root_signature(
         note_refusal(&L6_REFUSALS.root_sig_bad_arg);
         return E_INVALIDARG;
     }
-    // SAFETY: non-null per the check; `_In_ CONST` for the call.
-    let Some(converted) = (unsafe { root_signature_to_1_0(&*src) }) else {
-        note_refusal(&L6_REFUSALS.root_sig_bad_arg);
-        return E_INVALIDARG;
+    // SAFETY: the runtime supplies the parsed 0100 tree for this call.
+    let converted = match unsafe { root_signature_to_1_2(&*src) } {
+        Ok(converted) => converted,
+        Err(hr) => {
+            if hr == E_OUTOFMEMORY {
+                L6_REFUSALS.root_sig_oom.bump();
+            } else {
+                note_refusal(&L6_REFUSALS.root_sig_bad_arg);
+            }
+            return hr;
+        }
     };
-    L6_REFUSALS.root_sig_downgraded_to_1_0.bump();
-
-    let mut blob_raw: usize = 0;
-    let mut err_raw: usize = 0;
-    // SAFETY: `converted.desc` is live for this call and every pointer it holds
-    // addresses a vector `converted` owns. `blob_out`/`err_out` are stack
-    // locals; the C++ side zeroes both before forwarding and writes them only
-    // on success, and both receive OWNED `ID3DBlob*` this function releases.
-    let hr = unsafe {
-        bridge12::serialize_root_signature(
-            core::ptr::from_ref(&converted.desc) as usize,
-            D3D_ROOT_SIGNATURE_VERSION_1_0.0 as u32,
-            &mut blob_raw,
-            &mut err_raw,
-        )
+    let versioned = D3D12_VERSIONED_ROOT_SIGNATURE_DESC {
+        Version: D3D_ROOT_SIGNATURE_VERSION_1_2,
+        Anonymous: D3D12_VERSIONED_ROOT_SIGNATURE_DESC_0 {
+            Desc_1_2: converted.desc,
+        },
     };
-
-    if err_raw != 0 {
-        // SAFETY: non-zero, so it is an `ID3DBlob*` the engine AddRef'd for this
-        // caller. Adopted as `IUnknown` because only `Release` is wanted.
-        drop(unsafe { windows::core::IUnknown::from_raw(err_raw as *mut c_void) });
-    }
-    if hr < 0 || blob_raw == 0 {
-        note_refusal(&L6_REFUSALS.root_sig_serialize_failed);
-        log_error!("CreateRootSignature: serialize failed hr={:#010x}", hr as u32);
-        return if hr < 0 { hr } else { E_FAIL };
-    }
-    // SAFETY: `blob_raw` is the OWNED `ID3DBlob*` the bridge produced; adopting
-    // it here is the single `from_raw` for this reference and the `blob`
-    // binding releases it at end of scope.
-    let blob = unsafe { ID3DBlob::from_raw(blob_raw as *mut c_void) };
-    // SAFETY: `blob` is a live `ID3DBlob`; both accessors are const on it.
-    let (ptr, len) = unsafe { (blob.GetBufferPointer(), blob.GetBufferSize()) };
-    if ptr.is_null() || len == 0 || len > MAX_ROOT_SIGNATURE_BLOB {
-        note_refusal(&L6_REFUSALS.root_sig_serialize_failed);
-        log_error!("CreateRootSignature: serialized blob is {len} bytes -> E_FAIL");
-        return E_FAIL;
-    }
-    // SAFETY: the blob owns `len` readable bytes at `ptr` for as long as `blob`
-    // is alive, which is the whole of this scope.
-    let bytes = unsafe { core::slice::from_raw_parts(ptr.cast::<u8>(), len) };
 
     // SAFETY: `h_device` is this DDI's device handle.
     let Some(dev) = (unsafe { device12::device(h_device) }) else {
@@ -1382,22 +1290,24 @@ unsafe extern "system" fn create_root_signature(
         note_refusal(&L6_REFUSALS.no_device);
         return E_FAIL;
     };
-    // SAFETY: `engine` is the bridge's BORROWED `ID3D12Device`, never released
-    // here; `bytes` is live for the call and its length was bounded above so the
-    // generated wrapper's `u32` narrowing cannot fail.
-    let created: windows::core::Result<ID3D12RootSignature> =
-        unsafe { engine.CreateRootSignature(a.NodeMask, bytes) };
-    let rs = match created {
-        Ok(rs) => rs,
-        Err(e) => {
-            note_refusal(&L6_REFUSALS.root_sig_engine_failed);
-            log_error!(
-                "CreateRootSignature: engine refused hr={:#010x}",
-                e.code().0 as u32
-            );
-            return e.code().0;
-        }
+    let mut root_raw = 0usize;
+    // SAFETY: engine and the complete owned versioned tree live through the
+    // synchronous call; output receives one owned engine root-signature COM ref.
+    let hr = unsafe {
+        bridge12::create_root_signature(
+            engine.as_raw() as usize,
+            a.NodeMask,
+            core::ptr::from_ref(&versioned) as usize,
+            &mut root_raw,
+        )
     };
+    if hr < 0 || root_raw == 0 {
+        // An OOM must reach the runtime without allocating diagnostic text.
+        L6_REFUSALS.root_sig_engine_failed.bump();
+        return if hr < 0 { hr } else { E_FAIL };
+    }
+    // SAFETY: adopt the sole reference returned by the private engine factory.
+    let rs = unsafe { ID3D12RootSignature::from_raw(root_raw as *mut c_void) };
 
     let Some(slot) = (
         // SAFETY: the caller guarantees the runtime-allocated word.
@@ -1406,10 +1316,11 @@ unsafe extern "system" fn create_root_signature(
         note_refusal(&L6_REFUSALS.root_sig_bad_arg);
         return E_INVALIDARG;
     };
-    let n = L6_REFUSALS.root_sig_downgraded_to_1_0.get();
+    L6_REFUSALS.root_sig_created.bump();
+    let n = L6_REFUSALS.root_sig_created.get();
     if n <= LOG_BUDGET {
         log_error!(
-            "CreateRootSignature: {} param(s), {} static sampler(s), flags={:#x}, blob={len} B \
+            "CreateRootSignature: {} param(s), {} static sampler(s), flags={:#x}, version=1.2 \
              (x{n})",
             converted.desc.NumParameters,
             converted.desc.NumStaticSamplers,
@@ -1493,11 +1404,9 @@ const _: () = {
 ///    `hAmplificationShader` and the legacy struct has no field for either, so
 ///    the legacy route would have to refuse every mesh pipeline.
 ///
-/// ⚠ There is deliberately **no `STREAM_OUTPUT` subobject**: `shaders.rs`
-/// declines the stream-output declaration (`GsStreamOutputDropped`), so omitting
-/// it here leaves vkd3d's own default of zero entries and the two halves agree.
-/// ⚠ There is no `CACHED_PSO` subobject either: this driver declines the shader
-/// cache, so it has no blob to offer and the runtime's is not forwarded.
+/// `STREAM_OUTPUT` carries the owned declaration retained with the GS handle.
+/// For an SO-only handle the GS bytecode is empty, so the engine selects the
+/// domain shader, or the vertex shader when tessellation is inactive.
 #[repr(C)]
 struct GraphicsStream {
     root_signature: Sub<*mut c_void>,
@@ -1506,6 +1415,7 @@ struct GraphicsStream {
     ds: Sub<D3D12_SHADER_BYTECODE>,
     hs: Sub<D3D12_SHADER_BYTECODE>,
     gs: Sub<D3D12_SHADER_BYTECODE>,
+    stream_output: Sub<D3D12_STREAM_OUTPUT_DESC>,
     amplification: Sub<D3D12_SHADER_BYTECODE>,
     mesh: Sub<D3D12_SHADER_BYTECODE>,
     blend: Sub<D3D12_BLEND_DESC>,
@@ -1534,6 +1444,7 @@ const _: () = {
         (core::mem::offset_of!(GraphicsStream, ds), core::mem::size_of::<Sub<D3D12_SHADER_BYTECODE>>()),
         (core::mem::offset_of!(GraphicsStream, hs), core::mem::size_of::<Sub<D3D12_SHADER_BYTECODE>>()),
         (core::mem::offset_of!(GraphicsStream, gs), core::mem::size_of::<Sub<D3D12_SHADER_BYTECODE>>()),
+        (core::mem::offset_of!(GraphicsStream, stream_output), core::mem::size_of::<Sub<D3D12_STREAM_OUTPUT_DESC>>()),
         (core::mem::offset_of!(GraphicsStream, amplification), core::mem::size_of::<Sub<D3D12_SHADER_BYTECODE>>()),
         (core::mem::offset_of!(GraphicsStream, mesh), core::mem::size_of::<Sub<D3D12_SHADER_BYTECODE>>()),
         (core::mem::offset_of!(GraphicsStream, blend), core::mem::size_of::<Sub<D3D12_BLEND_DESC>>()),
@@ -1750,7 +1661,13 @@ unsafe extern "system" fn create_pipeline_state(
 
     let created = if !a.hComputeShader.pDrvPrivate.is_null() {
         // SAFETY: the runtime handed this handle in this call, so it is live.
-        let cs = unsafe { bytecode_of(a.hComputeShader, shaders::ShaderStage::Compute, root_signature_raw) };
+        let cs = unsafe {
+            bytecode_of(
+                a.hComputeShader,
+                shaders::ShaderStage::Compute,
+                root_signature_raw,
+            )
+        };
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             // SAFETY: `root_signature_com` is the slot's BORROWED reference;
             // `ManuallyDrop` is what stops the descriptor from releasing a
@@ -1815,6 +1732,13 @@ unsafe extern "system" fn create_pipeline_state(
             return E_INVALIDARG;
         };
 
+        // SAFETY: the runtime keeps every shader handle alive throughout this
+        // PSO-create call. The immutable SO arrays are copied by the engine
+        // before it returns, including asynchronous pipeline-compilation paths.
+        let geometry_state = unsafe { shaders::shader(a.hGeometryShader) };
+        let stream_output = geometry_state
+            .and_then(|shader| shader.stream_output.as_ref())
+            .map_or_else(D3D12_STREAM_OUTPUT_DESC::default, |so| so.desc());
         let stream = GraphicsStream {
             root_signature: Sub::new(
                 D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE,
@@ -1823,31 +1747,64 @@ unsafe extern "system" fn create_pipeline_state(
             // SAFETY: every one of these handles was passed in this call and is
             // live for it.
             vs: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, unsafe {
-                bytecode_of(a.hVertexShader, shaders::ShaderStage::Vertex, root_signature_raw)
+                bytecode_of(
+                    a.hVertexShader,
+                    shaders::ShaderStage::Vertex,
+                    root_signature_raw,
+                )
             }),
             // SAFETY: as above.
             ps: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, unsafe {
-                bytecode_of(a.hPixelShader, shaders::ShaderStage::Pixel, root_signature_raw)
+                bytecode_of(
+                    a.hPixelShader,
+                    shaders::ShaderStage::Pixel,
+                    root_signature_raw,
+                )
             }),
             // SAFETY: as above.
             ds: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, unsafe {
-                bytecode_of(a.hDomainShader, shaders::ShaderStage::Domain, root_signature_raw)
+                bytecode_of(
+                    a.hDomainShader,
+                    shaders::ShaderStage::Domain,
+                    root_signature_raw,
+                )
             }),
             // SAFETY: as above.
             hs: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS, unsafe {
-                bytecode_of(a.hHullShader, shaders::ShaderStage::Hull, root_signature_raw)
+                bytecode_of(
+                    a.hHullShader,
+                    shaders::ShaderStage::Hull,
+                    root_signature_raw,
+                )
             }),
             // SAFETY: as above.
             gs: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, unsafe {
-                bytecode_of(a.hGeometryShader, shaders::ShaderStage::Geometry, root_signature_raw)
+                bytecode_of(
+                    a.hGeometryShader,
+                    shaders::ShaderStage::Geometry,
+                    root_signature_raw,
+                )
             }),
             // SAFETY: as above.
+            stream_output: Sub::new(
+                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT,
+                stream_output,
+            ),
+            // SAFETY: the shader handle is live for this runtime DDI call.
             amplification: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, unsafe {
-                bytecode_of(a.hAmplificationShader, shaders::ShaderStage::Amplification, root_signature_raw)
+                bytecode_of(
+                    a.hAmplificationShader,
+                    shaders::ShaderStage::Amplification,
+                    root_signature_raw,
+                )
             }),
             // SAFETY: as above.
             mesh: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, unsafe {
-                bytecode_of(a.hMeshShader, shaders::ShaderStage::Mesh, root_signature_raw)
+                bytecode_of(
+                    a.hMeshShader,
+                    shaders::ShaderStage::Mesh,
+                    root_signature_raw,
+                )
             }),
             blend: Sub::new(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend),
             sample_mask: Sub::new(
@@ -1859,8 +1816,7 @@ unsafe extern "system" fn create_pipeline_state(
             input_layout: Sub::new(
                 D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT,
                 D3D12_INPUT_LAYOUT_DESC {
-                    pInputElementDescs: layout
-                        .map_or(core::ptr::null(), |l| l.elements.as_ptr()),
+                    pInputElementDescs: layout.map_or(core::ptr::null(), |l| l.elements.as_ptr()),
                     NumElements: layout.map_or(0, |l| l.elements.len() as u32),
                 },
             ),
@@ -1939,12 +1895,25 @@ unsafe extern "system" fn create_pipeline_state(
         // size is its own `size_of`, and every pointer it holds addresses
         // storage that outlives the call (the shader containers, the element
         // layout's vector, `view_locations`, and the borrowed root signature).
-        unsafe { device2.CreatePipelineState::<ID3D12PipelineState>(&stream_desc) }
+        if stream_output.NumEntries != 0 {
+            // SAFETY: the same complete stream lifetime applies. This private
+            // factory supplies DDI SO origin; public semantic text cannot do so.
+            unsafe { crate::bridge12::create_stream_output_pipeline(&engine, &stream_desc) }
+        } else {
+            // SAFETY: the local stream and all its borrowed inputs outlive the call.
+            unsafe { device2.CreatePipelineState::<ID3D12PipelineState>(&stream_desc) }
+        }
     };
 
     let pso = match created {
         Ok(p) => p,
         Err(e) => {
+            if e.code().0 == helios_umd_common::hr::E_OUTOFMEMORY {
+                // The private SO bridge can return compiler allocation failure.
+                // Do not allocate diagnostics before delivering that HRESULT.
+                L6_REFUSALS.pso_engine_failed.bump();
+                return e.code().0;
+            }
             note_refusal(&L6_REFUSALS.pso_engine_failed);
             let n = L6_REFUSALS.pso_engine_failed.get();
             if n <= LOG_BUDGET {
@@ -2288,7 +2257,12 @@ unsafe extern "system" fn create_pipeline_library(
         // SAFETY: non-null per the check, and it is the word the paired
         // calc-size sized. Nulling it leaves a refused create with a clear
         // handle rather than stale garbage.
-        unsafe { core::ptr::write(h_library.pDrvPrivate.cast::<*mut c_void>(), core::ptr::null_mut()) };
+        unsafe {
+            core::ptr::write(
+                h_library.pDrvPrivate.cast::<*mut c_void>(),
+                core::ptr::null_mut(),
+            )
+        };
     }
     note_refusal(&L6_REFUSALS.pipeline_library_refused);
     helios_umd_common::hr::E_NOTIMPL
@@ -2493,12 +2467,13 @@ pub(crate) struct L6Refusals {
     /// observable. vkd3d would otherwise surface it much later, as a binding
     /// mismatch with no line pointing here.
     pub(crate) shader_root_signature_mismatch: RefusalCounter,
-    /// `pfnCreateGeometryShaderWithStreamOutput` created the geometry shader and
-    /// **dropped the stream-output declaration**, exactly as the shipping D3D11
-    /// driver does (`umd/src/forward/shaders.rs:676-684`). ⚠ Expected 0. When it
-    /// moves: `SOSetTargets` binds buffers that are never written and `DrawAuto`
-    /// reads zero vertices, so the app renders nothing.
-    pub(crate) gs_stream_output_dropped: RefusalCounter,
+    /// A stream-output create retained the full declaration and strides. This
+    /// is an execution counter; it does not prove GPU writes or PSO acceptance.
+    pub(crate) stream_output_creates: RefusalCounter,
+    /// The DDI stream-output description violated a count, pointer, stream,
+    /// slot, mask, stride or write-window constraint. Expected zero for valid
+    /// workloads; the shader handle remains empty and SetErrorCb is called.
+    pub(crate) stream_output_bad_arg: RefusalCounter,
 
     // ── root signatures (e) ────────────────────────────────────────────────
     /// A root-signature create was handed a null arg, a null parsed signature,
@@ -2509,31 +2484,10 @@ pub(crate) struct L6Refusals {
     /// defines, and `DDI_REFERENCE.md` §9.9 records that the runtime
     /// up-converts 1.0 before the driver sees it.
     pub(crate) root_sig_version_unknown: RefusalCounter,
-    /// A root signature was serialized as **version 1.0** because that is the
-    /// only version the bridged engine export accepts
-    /// (`libs/vkd3d/vkd3d_main.c:464-468`).
-    ///
-    /// ⚠ **Expected non-zero — one per root signature — and that is not a
-    /// fault.** It is the denominator for the two flag-drop counters below and
-    /// the number that says how much a versioned bridge entry point would buy.
-    pub(crate) root_sig_downgraded_to_1_0: RefusalCounter,
-    /// A descriptor range or root descriptor carried non-`NONE` flags that the
-    /// 1.0 serialization cannot express. ⚠ Expected non-zero on any app that
-    /// uses 1.1 root signatures. The loss is **optimisation only**: vkd3d's 1.0
-    /// deserializer supplies `DESCRIPTORS_VOLATILE | DATA_VOLATILE`, a strict
-    /// superset of what any `STATIC` flag promises.
-    pub(crate) root_sig_range_flags_dropped: RefusalCounter,
-    /// A static sampler carried `D3D12DDI_SAMPLER_FLAGS_0096` bits
-    /// (`UINT_BORDER_COLOR`, `NON_NORMALIZED_COORDINATES`) that the 1.0
-    /// serialization cannot express.
-    ///
-    /// ⛔ **Unlike the range flags, this IS a correctness loss** — a
-    /// non-normalised static sampler silently samples at the wrong coordinates.
-    /// Expected 0 today; a non-zero reading is the trigger for the versioned
-    /// bridge entry point.
-    pub(crate) root_sig_sampler_flags_dropped: RefusalCounter,
-    /// The engine's serializer returned a failure, or an empty blob. Expected 0.
-    pub(crate) root_sig_serialize_failed: RefusalCounter,
+    /// Successfully created versioned driver roots (not a refusal).
+    pub(crate) root_sig_created: RefusalCounter,
+    /// A fallible allocation of translated root arrays failed.
+    pub(crate) root_sig_oom: RefusalCounter,
     /// `ID3D12Device::CreateRootSignature` refused the re-serialized blob.
     /// ⛔ Expected 0, and a hit is the sharpest possible signal that the
     /// down-conversion above is wrong: the engine parsed what this driver wrote.
@@ -2671,6 +2625,10 @@ pub(crate) struct L6Refusals {
     /// array unconditionally (`state.c:5347-5349`), so forwarding it would fault
     /// inside the engine. The sibling arm is `L6PsoViewInstancingRefused`.
     pub(crate) pso_view_instancing_bad_arg: RefusalCounter,
+    /// SO declaration/stride allocation failed before shader creation. The
+    /// shader handle stays clear and SetErrorCb receives E_OUTOFMEMORY.
+    /// Expected zero in valid runs without allocation-failure injection.
+    pub(crate) stream_output_out_of_memory: RefusalCounter,
 }
 
 pub(crate) static L6_REFUSALS: L6Refusals = L6Refusals {
@@ -2687,13 +2645,12 @@ pub(crate) static L6_REFUSALS: L6Refusals = L6Refusals {
     mesh_primitive_signature_dropped: RefusalCounter::new("L6MeshPrimitiveSignatureDropped"),
     shader_stage_mismatch: RefusalCounter::new("L6ShaderStageMismatch"),
     shader_root_signature_mismatch: RefusalCounter::new("L6ShaderRootSignatureMismatch"),
-    gs_stream_output_dropped: RefusalCounter::new("L6GsStreamOutputDropped"),
+    stream_output_creates: RefusalCounter::new("L6StreamOutputCreates"),
+    stream_output_bad_arg: RefusalCounter::new("L6StreamOutputBadArg"),
+    root_sig_created: RefusalCounter::new("L6RootSigCreated"),
+    root_sig_oom: RefusalCounter::new("L6RootSigOutOfMemory"),
     root_sig_bad_arg: RefusalCounter::new("L6RootSigBadArg"),
     root_sig_version_unknown: RefusalCounter::new("L6RootSigVersionUnknown"),
-    root_sig_downgraded_to_1_0: RefusalCounter::new("L6RootSigDowngradedTo10"),
-    root_sig_range_flags_dropped: RefusalCounter::new("L6RootSigRangeFlagsDropped"),
-    root_sig_sampler_flags_dropped: RefusalCounter::new("L6RootSigSamplerFlagsDropped"),
-    root_sig_serialize_failed: RefusalCounter::new("L6RootSigSerializeFailed"),
     root_sig_engine_failed: RefusalCounter::new("L6RootSigEngineFailed"),
     pso_creates: RefusalCounter::new("L6PsoCreates"),
     pso_bad_arg: RefusalCounter::new("L6PsoBadArg"),
@@ -2710,6 +2667,7 @@ pub(crate) static L6_REFUSALS: L6Refusals = L6Refusals {
     pso_sub_state_absent: RefusalCounter::new("L6PsoSubStateAbsent"),
     pso_sub_state_unresolved: RefusalCounter::new("L6PsoSubStateUnresolved"),
     pso_view_instancing_bad_arg: RefusalCounter::new("L6PsoViewInstancingBadArg"),
+    stream_output_out_of_memory: RefusalCounter::new("L6StreamOutputOutOfMemory"),
 };
 
 /// L6's refusal counters, printed by `crate::log_refusal_summary` at this
@@ -2730,13 +2688,12 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L6_REFUSALS.mesh_primitive_signature_dropped,
     &L6_REFUSALS.shader_stage_mismatch,
     &L6_REFUSALS.shader_root_signature_mismatch,
-    &L6_REFUSALS.gs_stream_output_dropped,
+    &L6_REFUSALS.stream_output_creates,
+    &L6_REFUSALS.stream_output_bad_arg,
+    &L6_REFUSALS.root_sig_created,
+    &L6_REFUSALS.root_sig_oom,
     &L6_REFUSALS.root_sig_bad_arg,
     &L6_REFUSALS.root_sig_version_unknown,
-    &L6_REFUSALS.root_sig_downgraded_to_1_0,
-    &L6_REFUSALS.root_sig_range_flags_dropped,
-    &L6_REFUSALS.root_sig_sampler_flags_dropped,
-    &L6_REFUSALS.root_sig_serialize_failed,
     &L6_REFUSALS.root_sig_engine_failed,
     &L6_REFUSALS.pso_creates,
     &L6_REFUSALS.pso_bad_arg,
@@ -2753,4 +2710,5 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L6_REFUSALS.pso_sub_state_absent,
     &L6_REFUSALS.pso_sub_state_unresolved,
     &L6_REFUSALS.pso_view_instancing_bad_arg,
+    &L6_REFUSALS.stream_output_out_of_memory,
 ];

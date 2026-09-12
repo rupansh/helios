@@ -1,11 +1,8 @@
 // tools/d3d12_caps_dump.cpp — the D3D12 caps baseline (GATES.md D12-G2 / D12-G9).
 //
-// Prints every D3D12 capability the runtime will ask the driver for, as
-// `feature,field,value` CSV, so that:
-//
-//   * G2 freezes what the ENGINE answers (vkd3d's d3d12.dll beside this exe), and
-//   * G9 diffs what the DDI ARM answers (system d3d12.dll -> helios_umd12.dll)
-//     against it, one row at a time.
+// Native runtime capability inventory, as `feature,field,value` CSV. Engine
+// capability probes are separate: this executable requires the system runtime,
+// exact Helios PCI adapter and loaded native UMD/ICD. Run interactively.
 //
 // That diff is the whole point. D3D12's tiered caps are the densest version of
 // the advertise-only-what-is-backed hazard this project has faced (DECISIONS.md
@@ -20,19 +17,104 @@
 // run: they raise advertised tiers without backing them.
 //
 // Build (VM, through vcvars64 — cl is not on PATH in a win_exec shell):
-//   cl /nologo /EHsc /W4 tools\d3d12_caps_dump.cpp /Fe:caps.exe /link d3d12.lib dxgi.lib
-// Run it from the directory that selects the arm: with vkd3d's d3d12.dll +
-// d3d12core.dll beside it (G2), or without them (G9).
+//   cl /nologo /EHsc /W4 tools\d3d12_caps_dump.cpp /Fe:caps.exe /link d3d12.lib dxgi.lib bcrypt.lib
+// Run: caps.exe <expected-deployed-UMD12-SHA256>
+// Device creation and cap queries are admission evidence, not GPU conformance.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <tlhelp32.h>
+#include <bcrypt.h>
 #include <stdio.h>
+#include <string.h>
+#include <wchar.h>
+#include <initializer_list>
+#include "d3d12_native_identity.h"
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 static ID3D12Device *g_dev;
+
+static bool file_sha256(const wchar_t *path, char (&hex)[65])
+{
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    bool valid = BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) >= 0;
+    if (valid) valid = BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0) >= 0;
+    unsigned char buffer[65536];
+    while (valid) {
+        DWORD bytes = 0;
+        if (!ReadFile(file, buffer, sizeof(buffer), &bytes, nullptr)) { valid = false; break; }
+        if (!bytes) break;
+        valid = BCryptHashData(hash, buffer, bytes, 0) >= 0;
+    }
+    unsigned char digest[32];
+    if (valid) valid = BCryptFinishHash(hash, digest, sizeof(digest), 0) >= 0;
+    if (hash) BCryptDestroyHash(hash);
+    if (algorithm) BCryptCloseAlgorithmProvider(algorithm, 0);
+    CloseHandle(file);
+    if (!valid) return false;
+    const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(digest); ++i) {
+        hex[2 * i] = digits[digest[i] >> 4];
+        hex[2 * i + 1] = digits[digest[i] & 15];
+    }
+    hex[64] = 0;
+    return true;
+}
+
+static bool native_modules(const char *expected_umd12_sha256)
+{
+    wchar_t system[MAX_PATH];
+    if (!GetSystemDirectoryW(system, ARRAYSIZE(system))) return false;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, GetCurrentProcessId());
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+    bool runtime = false, core = false, dxgi = false, umd = false, icd = false, valid = true;
+    unsigned umd_count = 0;
+    MODULEENTRY32W entry = {}; entry.dwSize = sizeof(entry);
+    if (!Module32FirstW(snapshot, &entry)) valid = false;
+    else do {
+        const bool is_runtime = !_wcsicmp(entry.szModule, L"d3d12.dll");
+        const bool is_core = !_wcsicmp(entry.szModule, L"D3D12Core.dll");
+        const bool is_dxgi = !_wcsicmp(entry.szModule, L"dxgi.dll");
+        const bool is_umd = helios_native_umd12_name(entry.szModule);
+        const bool is_icd = !_wcsnicmp(entry.szModule, L"vulkan_virtio", 13);
+        if (is_runtime || is_core || is_dxgi || is_umd || is_icd)
+            fprintf(stderr, "MODULE,%ls,%ls\n", entry.szModule, entry.szExePath);
+        if (is_runtime || is_core || is_dxgi) {
+            wchar_t expected[MAX_PATH];
+            if (swprintf_s(expected, L"%ls\\%ls", system, entry.szModule) < 0 ||
+                _wcsicmp(entry.szExePath, expected)) valid = false;
+        }
+        runtime |= is_runtime; core |= is_core; dxgi |= is_dxgi;
+        umd |= is_umd; icd |= is_icd;
+        if (is_umd) {
+            ++umd_count;
+            char digest[65] = {};
+            const bool hashed = file_sha256(entry.szExePath, digest);
+            if (hashed) fprintf(stderr, "MODULE_SHA256,%ls,%s\n", entry.szModule, digest);
+            if (!hashed || _stricmp(digest, expected_umd12_sha256)) valid = false;
+            const size_t base_length = wcslen(L"helios_umd12");
+            if (hashed && entry.szModule[base_length] == L'_')
+                for (size_t i = 0; i < 16; ++i)
+                    if (helios_native_ascii_lower(entry.szModule[base_length + 1 + i]) != digest[i])
+                        valid = false;
+        }
+        if (!_wcsicmp(entry.szModule, L"helios_vkd3d.dll") ||
+                !_wcsicmp(entry.szModule, L"d3d10warp.dll")) valid = false;
+    } while (Module32NextW(snapshot, &entry));
+    CloseHandle(snapshot);
+    valid = valid && umd_count == 1;
+    if (!(valid && runtime && core && dxgi && umd && icd))
+        fprintf(stderr, "FAIL native runtime/UMD/ICD module identity\n");
+    return valid && runtime && core && dxgi && umd && icd;
+}
 
 static void row(const char *feature, const char *field, long long value)
 {
@@ -50,8 +132,27 @@ static void row(const char *feature, const char *field, long long value)
 
 #define F(feat, var, member) row(#feat, #member, (long long)var.member)
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc != 2 || strlen(argv[1]) != 64) {
+        fprintf(stderr, "Usage: caps.exe <expected-deployed-UMD12-SHA256>\n");
+        return 1;
+    }
+    for (const char *p = argv[1]; *p; ++p) {
+        if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f') || (*p >= 'A' && *p <= 'F'))) {
+            fprintf(stderr, "FAIL expected UMD12 digest is not SHA256 hex\n"); return 1;
+        }
+    }
+    DWORD session = 0;
+    if (!ProcessIdToSessionId(GetCurrentProcessId(), &session) || !session) {
+        fprintf(stderr, "FAIL run through an interactive scheduled task\n");
+        return 1;
+    }
+    const wchar_t *overrides[] = {L"VKD3D_FEATURE_LEVEL", L"VKD3D_SHADER_MODEL"};
+    for (auto name : overrides) if (GetEnvironmentVariableW(name, nullptr, 0)) {
+        fprintf(stderr, "FAIL capability override present: %ls\n", name); return 1;
+    }
+    fprintf(stderr, "PROCESS,pid,%lu,session,%lu\n", GetCurrentProcessId(), session);
     // Never assume adapter 0 is Helios.
     IDXGIFactory1 *factory = nullptr;
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory))) {
@@ -61,9 +162,9 @@ int main(void)
     IDXGIAdapter1 *adapter = nullptr, *chosen = nullptr;
     DXGI_ADAPTER_DESC1 chosen_desc = {};
     for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
-        DXGI_ADAPTER_DESC1 d;
-        adapter->GetDesc1(&d);
-        if (!chosen && d.VendorId == 0x1af4 && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
+        DXGI_ADAPTER_DESC1 d = {};
+        if (FAILED(adapter->GetDesc1(&d))) { adapter->Release(); factory->Release(); return 1; }
+        if (!chosen && d.VendorId == 0x1af4 && d.DeviceId == 0x1050 && !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
             chosen = adapter; chosen_desc = d;   // keep the reference
             continue;
         }
@@ -79,8 +180,16 @@ int main(void)
                 (unsigned long)hr, chosen_desc.Description);
         return 1;
     }
+    if (!native_modules(argv[1])) { g_dev->Release(); chosen->Release(); return 1; }
 
     printf("feature,field,value\n");
+    for (const auto level : {D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+            D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_2}) {
+        ID3D12Device *created = nullptr;
+        HRESULT create_hr = D3D12CreateDevice(chosen, level, __uuidof(ID3D12Device), (void **)&created);
+        printf("CREATE_DEVICE,0x%04x,0x%08lx\n", unsigned(level), (unsigned long)create_hr);
+        if (created) created->Release();
+    }
     printf("ADAPTER,Description,0\n");          // the name goes to stderr; CSV stays numeric
     fprintf(stderr, "adapter: %ls  luid=%08lx:%08lx vendor=0x%04x device=0x%04x\n",
             chosen_desc.Description,

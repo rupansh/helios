@@ -1,98 +1,16 @@
-//! L9 — the tail: meta-commands, state objects, RT, work graphs, VRS, mesh, scheduling groups, multi-adapter, policy.
+//! Tail device and command-list DDIs: raytracing, optional work graphs/VRS/mesh,
+//! meta commands, scheduling, multi-adapter queries and policy.
 //!
-//! Owns 28 of `DEVICE_FUNCS_CORE_0109` (groups (k) 4, (l) 3, (m) 6, (n) 13,
-//! (o) 2) and 16 of `COMMAND_LIST_FUNCS_3D_0108` (markers/protection 4, meta 2,
-//! RT 5, VRS 2, mesh 1, work graphs 2). 44 slots, the largest lane and the
-//! cheapest.
+//! Native raytracing translation lives in [`raytracing`]. It owns state-object
+//! graphs and forwards GPU operations through the ordinary engine command list,
+//! which preserves the queue's existing HE12 admission/completion path. Caps
+//! remain an independent, whole-contract admission decision. Unsupported DXR
+//! variants return an HRESULT or report a command-list error with a counter;
+//! forwarding counts are CPU recording evidence, never GPU completion evidence.
 //!
-//! ⚠ **The 44 is 28 + 16, and the 28 already nets out L8's slot** — re-derived
-//! rather than inherited, because the near-miss is easy: `DDI_REFERENCE.md` §3.2
-//! puts **five** slots in group (k), and `pfnGetPresentPrivateDriverDataSize` is
-//! `present12.rs`'s. So L9's (k) share is 4, its device-core total is
-//! `4 + 3 + 6 + 13 + 2 = 28`, and `PARALLEL.md` §4's device-core sum
-//! (`… + 1 + 28 = 124`) counts L8's one separately. `install_core` below assigns
-//! 28 fields; `install_cmdlist` assigns 16.
-//!
-//! ⭐ **Mostly refuse-and-count, and that is the finished state, not a stub.**
-//! `PARALLEL.md` §4 calls this the natural first task for a new agent for
-//! exactly that reason: nearly every slot here is behind a cap `caps12.rs`
-//! reports as `NOT_SUPPORTED`, so the honest body is a named refusal. A refusal
-//! whose counter says what reading is expected **is** a finished slot
-//! (`PARALLEL.md` §9.1); a silent noop is not.
-//!
-//! ⚠ The exception to watch: `DDI_REFERENCE.md` §14.1.1 splits "may a slot be
-//! NULL" into three different questions — retired, optional-feature, reserved —
-//! and finds the **command-list table has no opt-out mechanism at all**. So the
-//! command-list half of this lane is non-NULL-or-nothing regardless of caps.
-//!
-//! # ⭐ The rule this lane decides every slot by
-//!
-//! Exactly **one** slot here forwards into an engine that implements it
-//! (`pfnWriteBufferImmediate`); every other slot in the lane refuses. The line
-//! between them is not "does vkd3d have the method" — vkd3d has nearly all of
-//! them — it is:
-//!
-//! > **Forward when the slot is self-contained and the engine implements it.
-//! > Refuse when the slot is one member of a feature whose *other* members this
-//! > driver does not implement.**
-//!
-//! Forwarding one member of a feature whose siblings refuse is the worse
-//! failure: it produces a half-built feature whose behaviour depends on which
-//! half the workload happened to touch, and no counter can describe that. A
-//! whole feature declined at the cap, with every one of its slots counted, is a
-//! state a reader can act on.
-//!
-//! Applied:
-//!
-//! * `pfnWriteBufferImmediate` — **forwarded**. It has no companion DDI slot, no
-//!   PSO subobject and no tier that gates a *feature*; the only thing gating it
-//!   is `WriteBufferImmediateQueueFlags`, whose own comment
-//!   (`caps12.rs`, `d3d12_options`) USED to read `NONE` *"which is the honest answer
-//!   while `pfnWriteBufferImmediate` is a noop"*. The cap follows the slot here,
-//!   not the other way round — see [`write_buffer_immediate`] and the coherence
-//!   note in this lane's REPORT.
-//! * `pfnSetViewInstanceMask` — **refused**. vkd3d implements it, but view
-//!   instancing's other half is the PSO's view-instancing subobject, which L6
-//!   does not translate, and `caps12.rs:577` reports
-//!   `ViewInstancingTier = NONE` on the strength of that. Forwarding a mask with
-//!   no view-instanced pipeline to apply it to is inert either way, so the
-//!   instrument is worth more than the call: see [`set_view_instance_mask`].
-//! * `pfnSetMarker` — **refused, and it is not the PIX marker.** See
-//!   [`set_marker`]; this is the one slot in the lane whose refusal rests on a
-//!   *signature* argument rather than on a cap.
-//! * `pfnSetBackgroundProcessingMode` — **refused, and the engine agrees**:
-//!   vkd3d's own `d3d12_device_SetBackgroundProcessingMode` is a `FIXME(...
-//!   stub!)` returning `E_NOTIMPL` (`libs/vkd3d/device.c:8941-8949`), so there is
-//!   nothing behind the cap to forward to even if it were raised.
-//! * Everything else — refused behind a cap, each counter naming the cap.
-//!
-//! # ⛔ What every refused `Create` in this file still does
-//!
-//! Two shapes that are not optional and whose absence is a heap bug rather than
-//! a missing feature:
-//!
-//! 1. **Every `pfnCalcPrivate*Size` answers a non-zero size**, even though its
-//!    paired create refuses. `queue.rs`'s `PRIVATE_SLOT_SIZE` records why: a `0`
-//!    hands the paired `Create` a **zero-byte region** to write through, and
-//!    `umd/src/device_funcs.rs:708-723` is where a transient 0 produced heap
-//!    corruption surfacing as a wild call inside a 3DMark worker.
-//! 2. **Every refusing `Create` nulls its handle slot first**, so the paired
-//!    `Destroy` finds a defined null rather than the runtime allocator's
-//!    leftovers. [`clear_refused_slot`] is that one line, once.
-//!
-//! # ⚠ There is deliberately no `report_error` in this lane
-//!
-//! `cmdlist.rs`, `pso.rs` and `descriptors.rs` each carry a `report_error` that
-//! reaches `device12::set_error`. This file does not, and that is a decision
-//! rather than an omission: **every** command-list slot here is either a
-//! capability refusal — which `PARALLEL.md` §5 says is *counted, not reported* —
-//! or a forward whose only failure mode is a malformed argument on a path the
-//! caps already say is unreachable. `DDI_REFERENCE.md` §9.12: `pfnSetErrorCb`
-//! **removes the device** (*"Removing device due to bad UMD error"*), so
-//! escalating a feature this driver declared unsupported would take the
-//! compositor down for a question the counter already answers. ⚠ The one arm
-//! where that judgement is worth re-testing is named in
-//! `L9WriteBufferImmediateBadArg`'s doc.
+//! Optional features outside that subsystem keep their existing counted
+//! refusals. All creates initialize a non-zero-sized private slot before fallible
+//! work, and every CPU-output DDI writes a defined result on failure.
 //!
 //! # ⭐ The three exceptions, and why they landed before the rest of the lane
 //!
@@ -157,8 +75,8 @@ use windows::Win32::Graphics::Direct3D12::{
 
 use super::queue;
 use super::tables12::{stage, Filling};
-use super::{identity12, resource12};
 use super::tables12::{CommandListTable, DeviceCoreTable};
+use super::{identity12, resource12};
 use crate::{ddi12, log_error, note_refusal, UMD12_REFUSALS};
 
 /// How many physical adapters this driver's node map describes.
@@ -879,39 +797,21 @@ unsafe extern "system" fn get_meta_command_required_parameter_info(
 }
 
 // ---------------------------------------------------------------------------
-// (n) State objects / raytracing / work graphs — 13 slots, REFUSED
+// State-object sizing; DXR graph/query/recording implementation is in raytracing.
 // ---------------------------------------------------------------------------
-//
-// ⛔ **Two caps decide this whole group, and both read NOT_SUPPORTED:**
-//
-// * `caps12.rs:585` — `RaytracingTier: v::RAYTRACING_NONE`. `DDI_REFERENCE.md`
-//   §9.9 already plans for it: *"State objects / DXR map to `ID3D12StateObject`
-//   and are a large second tranche -- declinable at first via
-//   `RaytracingTier = NOT_SUPPORTED`"*.
-// * Work graphs' tier lives in `D3D12DDI_OPTIONS1_DATA_0103::WorkGraphsTier`,
-//   which `caps12::get_caps` does not answer individually and therefore
-//   **zero-fills** through its documented safe default (`caps12.rs:447-462`) —
-//   and `D3D12DDI_WORK_GRAPHS_TIER_NOT_SUPPORTED` is 0. ⚠ That is a real answer
-//   arrived at by a default rather than by a decision; it is coherent, and this
-//   lane's REPORT flags it to L1 as worth stating explicitly.
-//
-// ⭐ **Where a refusal needs a VALUE, it is the engine's own vocabulary for "no
-// such thing", read out of vkd3d rather than invented.** All four verified in
-// `vkd3d-proton-helios/libs/vkd3d/raytracing_pipeline.c`:
-// `GetShaderIdentifier` answers `NULL` (`:301`, `:325`), `GetShaderStackSize`
-// answers `UINT32_MAX` (`:340`), `GetProgramIdentifier` answers a `memset`-zeroed
-// struct (`:381`). Those are documented not-found answers the runtime already
-// has to handle -- which is why returning them is safe where inventing a value
-// would not be.
 
-/// `pfnCalcPrivateStateObjectSize`.
-///
-/// Answers the ordinary one-word size even though [`create_state_object`]
-/// refuses — see [`PRIVATE_SLOT_SIZE`].
-///
+#[path = "raytracing.rs"]
+mod raytracing;
+use raytracing::{
+    add_to_state_object, build_raytracing_acceleration_structure, check_driver_matching_identifier,
+    copy_raytracing_acceleration_structure, create_state_object, destroy_state_object,
+    dispatch_rays, emit_raytracing_acceleration_structure_postbuild_info, get_pipeline_stack_size,
+    get_raytracing_acceleration_structure_prebuild_info, get_shader_identifier,
+    get_shader_stack_size, set_pipeline_stack_size, set_pipeline_state1,
+};
+
 /// # Safety
-/// `arg`, when non-null, must point at a live
-/// `D3D12DDIARG_CREATE_STATE_OBJECT_0054` for the duration of the call.
+/// A non-null descriptor remains readable during this runtime sizing call.
 unsafe extern "system" fn calc_private_state_object_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_CREATE_STATE_OBJECT_0054,
@@ -922,214 +822,8 @@ unsafe extern "system" fn calc_private_state_object_size(
     PRIVATE_SLOT_SIZE as ddi12::SIZE_T
 }
 
-/// `pfnCreateStateObject` — **REFUSED**, `L9StateObjectRefused`.
-///
-/// `RaytracingTier = NOT_SUPPORTED` (`caps12.rs:585`) and work graphs' tier
-/// zero-fills to `NOT_SUPPORTED`, so neither of the two state-object types this
-/// DDI can carry is a feature this driver advertises.
-///
-/// ⚠ `E_NOTIMPL` here and not `E_INVALIDARG`: unlike the meta-command creates,
-/// nothing about the *argument* is wrong — a well-formed DXR state object
-/// description is being refused because the feature behind it is absent.
-///
 /// # Safety
-/// `h_state_object`'s `pDrvPrivate`, when non-null, must address the private
-/// block [`calc_private_state_object_size`] sized. `arg`, when non-null, must
-/// point at a live `D3D12DDIARG_CREATE_STATE_OBJECT_0054`.
-unsafe extern "system" fn create_state_object(
-    _h_device: ddi12::D3D12DDI_HDEVICE,
-    arg: *const ddi12::D3D12DDIARG_CREATE_STATE_OBJECT_0054,
-    h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
-    _h_rt_state_object: ddi12::D3D12DDI_HRTSTATEOBJECT_0054,
-) -> ddi12::HRESULT {
-    // SAFETY: the caller guarantees the slot lies in the sized private block.
-    unsafe {
-        clear_refused_slot(
-            h_state_object.pDrvPrivate,
-            &L9_REFUSALS.state_object_bad_slot,
-        )
-    };
-    note_refusal(&L9_REFUSALS.state_object_refused);
-    if let Some(n) = budget(&CREATE_LOG) {
-        // ⛔ Read the two scalars only after the null check, and never the
-        // subobject array: `pSubobjects` is a tagged union this driver has no
-        // translation for, and a log line is not a reason to walk one.
-        let (kind, subobjects) = if arg.is_null() {
-            (-1, 0)
-        } else {
-            // SAFETY: non-null per the check; the DDI declares it `_In_ CONST`.
-            let a = unsafe { &*arg };
-            (a.Type, a.NumSubobjects)
-        };
-        log_error!(
-            "CreateStateObject: refused type={kind} subobjects={subobjects} -- RaytracingTier and \
-             WorkGraphsTier both read NOT_SUPPORTED (x{})",
-            n + 1,
-        );
-    }
-    E_NOTIMPL
-}
-
-/// `pfnDestroyStateObject`.
-///
-/// Nothing was ever stored, so this only counts.
-///
-/// # Safety
-/// `_h_state_object` must be a handle the runtime associated with a
-/// `pfnCreateStateObject` or `pfnAddToStateObject` call on this device.
-unsafe extern "system" fn destroy_state_object(
-    _h_device: ddi12::D3D12DDI_HDEVICE,
-    _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
-) {
-    note_refusal(&L9_REFUSALS.state_object_destroy_unexpected);
-}
-
-/// `pfnGetRaytracingAccelerationStructurePrebuildInfo` — **writes three zeros**.
-///
-/// ⛔ The `_Out_`-the-runtime-acts-on class again, and the most consequential
-/// instance of it in this file: an application reads all three sizes and
-/// allocates buffers from them. Returning without writing hands it three values
-/// off its own stack to size GPU allocations with.
-///
-/// ⚠ **Zero is the refusal, and it is a legible one.** A result size of 0 cannot
-/// build anything, so an application that ignores `RaytracingTier` and calls
-/// anyway fails at its own allocation rather than at a garbage-sized one.
-///
-/// # Safety
-/// `p_info`, when non-null, must address one writable
-/// `D3D12DDI_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO_0054` the runtime
-/// owns. `p_inputs` is never dereferenced.
-unsafe extern "system" fn get_raytracing_acceleration_structure_prebuild_info(
-    _h_device: ddi12::D3D12DDI_HDEVICE,
-    _p_inputs: *const ddi12::D3D12DDI_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0054,
-    p_info: *mut ddi12::D3D12DDI_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO_0054,
-) {
-    if p_info.is_null() {
-        note_refusal(&L9_REFUSALS.rt_prebuild_info_bad_arg);
-        return;
-    }
-    // SAFETY: non-null per the check; the DDI declares it a writable `_Out_`
-    // struct the runtime owns for the duration of the call.
-    unsafe {
-        core::ptr::write_unaligned(
-            p_info,
-            ddi12::D3D12DDI_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO_0054 {
-                ResultDataMaxSizeInBytes: 0,
-                ScratchDataSizeInBytes: 0,
-                UpdateScratchDataSizeInBytes: 0,
-            },
-        );
-    }
-    note_refusal(&L9_REFUSALS.rt_prebuild_info_empty);
-}
-
-/// `pfnCheckDriverMatchingIdentifier` — **`UNSUPPORTED_TYPE`**.
-///
-/// ⭐ The enumeration has a value that means exactly what this driver has to say,
-/// and it is used rather than a nearby one:
-/// `D3D12DDI_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE` is *"the driver does
-/// not support this serialized data type"*, and the only type the enum defines is
-/// `D3D12DDI_SERIALIZED_DATA_RAYTRACING_ACCELERATION_STRUCTURE`
-/// (`d3d12umddi.rs:70723`). With `RaytracingTier = NOT_SUPPORTED` that is
-/// precisely true.
-///
-/// ⛔ **Never `COMPATIBLE_WITH_DEVICE`.** That is the value that tells an
-/// application a serialized acceleration structure on disk may be deserialized
-/// and used — a claim this driver cannot back, and one whose failure would be a
-/// GPU fault rather than an error code.
-///
-/// # Safety
-/// Neither pointer argument is dereferenced. Declared `unsafe` because the DDI's
-/// PFN typedef is.
-unsafe extern "system" fn check_driver_matching_identifier(
-    _h_device: ddi12::D3D12DDI_HDEVICE,
-    _data_type: ddi12::D3D12DDI_SERIALIZED_DATA_TYPE,
-    _identifier: *const ddi12::D3D12DDI_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER_0054,
-) -> ddi12::D3D12DDI_DRIVER_MATCHING_IDENTIFIER_STATUS {
-    note_refusal(&L9_REFUSALS.driver_matching_identifier_refused);
-    ddi12::D3D12DDI_DRIVER_MATCHING_IDENTIFIER_STATUS_D3D12DDI_DRIVER_MATCHING_IDENTIFIER_UNSUPPORTED_TYPE
-}
-
-/// `pfnGetShaderIdentifier` — **NULL**, which is the documented not-found answer.
-///
-/// No state object can exist ([`create_state_object`] refuses every one), so
-/// there is no export table to look a name up in. ⭐ `NULL` is not a crash
-/// hazard here: it is what the engine itself answers for an export it cannot
-/// find (`vkd3d-proton-helios/libs/vkd3d/raytracing_pipeline.c:301` and `:325`),
-/// so every caller of this DDI already has to handle it.
-///
-/// # Safety
-/// `_p_export_name` is never dereferenced, and the returned pointer is null, so
-/// no lifetime is implied. Declared `unsafe` because the DDI's PFN typedef is.
-unsafe extern "system" fn get_shader_identifier(
-    _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
-    _p_export_name: ddi12::LPCWSTR,
-) -> *mut c_void {
-    note_refusal(&L9_REFUSALS.shader_identifier_absent);
-    core::ptr::null_mut()
-}
-
-/// `pfnGetShaderStackSize` — **`UINT_MAX`**, the engine's own not-found value.
-///
-/// ⛔ **Not 0.** A stack size of 0 is a *legal* answer that says "this shader
-/// needs no stack", and a caller would sum it into a pipeline stack size and
-/// proceed. `UINT32_MAX` is what vkd3d returns when the export index does not
-/// resolve (`libs/vkd3d/raytracing_pipeline.c:340`), and it is the value the
-/// D3D12 contract reserves for "no such export".
-///
-/// # Safety
-/// `_p_export_name` is never dereferenced. Declared `unsafe` because the DDI's
-/// PFN typedef is.
-unsafe extern "system" fn get_shader_stack_size(
-    _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
-    _p_export_name: ddi12::LPCWSTR,
-) -> ddi12::UINT {
-    note_refusal(&L9_REFUSALS.shader_stack_size_absent);
-    ddi12::UINT::MAX
-}
-
-/// `pfnGetPipelineStackSize` — **0**.
-///
-/// ⚠ Unlike [`get_shader_stack_size`] there is no reserved not-found value here:
-/// the API's `GetPipelineStackSize` has no failure encoding at all, and vkd3d
-/// simply returns the object's stored size (`libs/vkd3d/raytracing_pipeline.c:359`).
-/// With no state object in existence, 0 is the only number that is not a
-/// fabrication, and the counter is what stops it reading as a measured answer.
-///
-/// # Safety
-/// The handle is not dereferenced. Declared `unsafe` because the DDI's PFN
-/// typedef is.
-unsafe extern "system" fn get_pipeline_stack_size(
-    _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
-) -> ddi12::UINT {
-    note_refusal(&L9_REFUSALS.pipeline_stack_size_absent);
-    0
-}
-
-/// `pfnSetPipelineStackSize` — **dropped and counted**.
-///
-/// A `VOID` slot with no output and no device handle: there is nothing to write
-/// and no channel to complain through. With no state object in existence there is
-/// nothing to store the size on either.
-///
-/// # Safety
-/// The handle is not dereferenced. Declared `unsafe` because the DDI's PFN
-/// typedef is.
-unsafe extern "system" fn set_pipeline_stack_size(
-    _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
-    _stack_size: ddi12::UINT,
-) {
-    note_refusal(&L9_REFUSALS.set_pipeline_stack_size_dropped);
-}
-
-/// `pfnCalcPrivateAddToStateObjectSize`.
-///
-/// Answers the ordinary one-word size even though [`add_to_state_object`]
-/// refuses — see [`PRIVATE_SLOT_SIZE`].
-///
-/// # Safety
-/// `arg`, when non-null, must point at a live
-/// `D3D12DDIARG_ADD_TO_STATE_OBJECT_0072` for the duration of the call.
+/// A non-null descriptor remains readable during this runtime sizing call.
 unsafe extern "system" fn calc_private_add_to_state_object_size(
     _h_device: ddi12::D3D12DDI_HDEVICE,
     arg: *const ddi12::D3D12DDIARG_ADD_TO_STATE_OBJECT_0072,
@@ -1138,32 +832,6 @@ unsafe extern "system" fn calc_private_add_to_state_object_size(
         note_refusal(&L9_REFUSALS.add_to_state_object_calc_bad_arg);
     }
     PRIVATE_SLOT_SIZE as ddi12::SIZE_T
-}
-
-/// `pfnAddToStateObject` — **REFUSED**, `L9AddToStateObjectRefused`.
-///
-/// Its `StateObjectToGrowFrom` can only ever be a handle
-/// [`create_state_object`] refused, so this cannot be reached with anything to
-/// grow. Refused on the same cap.
-///
-/// # Safety
-/// `h_state_object`'s `pDrvPrivate`, when non-null, must address the private
-/// block [`calc_private_add_to_state_object_size`] sized.
-unsafe extern "system" fn add_to_state_object(
-    _h_device: ddi12::D3D12DDI_HDEVICE,
-    _arg: *const ddi12::D3D12DDIARG_ADD_TO_STATE_OBJECT_0072,
-    h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
-    _h_rt_state_object: ddi12::D3D12DDI_HRTSTATEOBJECT_0054,
-) -> ddi12::HRESULT {
-    // SAFETY: the caller guarantees the slot lies in the sized private block.
-    unsafe {
-        clear_refused_slot(
-            h_state_object.pDrvPrivate,
-            &L9_REFUSALS.add_to_state_object_bad_slot,
-        )
-    };
-    note_refusal(&L9_REFUSALS.add_to_state_object_refused);
-    E_NOTIMPL
 }
 
 /// `pfnGetProgramIdentifier` — **a zeroed identifier**, which is the engine's own
@@ -1684,105 +1352,6 @@ unsafe extern "system" fn execute_meta_command(
 }
 
 // ---------------------------------------------------------------------------
-// Command list: raytracing — 5 slots, REFUSED on RaytracingTier = NONE
-// ---------------------------------------------------------------------------
-
-/// `pfnBuildRaytracingAccelerationStructure` — **counted.**
-///
-/// ⚠ Its destination is a GPU virtual address, not a CPU out-parameter, so there
-/// is nothing to write: the acceleration structure simply never appears, and any
-/// later trace against it reads whatever the app's own buffer held. That is why
-/// this arm logs as well as counting — it is the first point at which a workload
-/// that ignored `RaytracingTier` becomes visible.
-///
-/// # Safety
-/// `_arg` is never dereferenced. Declared `unsafe` because the DDI's PFN typedef
-/// is.
-unsafe extern "system" fn build_raytracing_acceleration_structure(
-    _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
-    _arg: *const ddi12::D3D12DDIARG_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_0054,
-) {
-    note_refusal(&L9_REFUSALS.rt_build_refused);
-    if let Some(n) = budget(&RT_LOG) {
-        log_error!(
-            "BuildRaytracingAccelerationStructure: refused -- this driver reports \
-             RaytracingTier=NOT_SUPPORTED (x{})",
-            n + 1,
-        );
-    }
-}
-
-/// `pfnEmitRaytracingAccelerationStructurePostbuildInfo` — **counted.**
-///
-/// Postbuild info is written to a GPU virtual address by the *build* this driver
-/// never performed, so there is no CPU output to zero here either.
-///
-/// # Safety
-/// `_arg` is never dereferenced. Declared `unsafe` because the DDI's PFN typedef
-/// is.
-unsafe extern "system" fn emit_raytracing_acceleration_structure_postbuild_info(
-    _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
-    _arg: *const ddi12::D3D12DDIARG_EMIT_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_0054,
-) {
-    note_refusal(&L9_REFUSALS.rt_postbuild_info_refused);
-}
-
-/// `pfnCopyRaytracingAccelerationStructure` — **counted.**
-///
-/// # Safety
-/// `_arg` is never dereferenced. Declared `unsafe` because the DDI's PFN typedef
-/// is.
-unsafe extern "system" fn copy_raytracing_acceleration_structure(
-    _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
-    _arg: *const ddi12::D3D12DDIARG_COPY_RAYTRACING_ACCELERATION_STRUCTURE_0054,
-) {
-    note_refusal(&L9_REFUSALS.rt_copy_refused);
-}
-
-/// `pfnSetPipelineState1` — **counted.**
-///
-/// The DXR/work-graph counterpart of `pfnSetPipelineState`: it binds an
-/// `ID3D12StateObject`. [`create_state_object`] refuses every one, so the handle
-/// names nothing.
-///
-/// ⚠ **Do not confuse it with L3a's `pfnSetPipelineState`.** They are separate
-/// slots with separate handle types; this one binds a state object and the other
-/// binds a PSO, and only this one is L9's.
-///
-/// # Safety
-/// The handle is not dereferenced. Declared `unsafe` because the DDI's PFN
-/// typedef is.
-unsafe extern "system" fn set_pipeline_state1(
-    _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
-    _h_state_object: ddi12::D3D12DDI_HSTATEOBJECT_0054,
-) {
-    note_refusal(&L9_REFUSALS.set_pipeline_state1_refused);
-}
-
-/// `pfnDispatchRays` — **counted, and logged.**
-///
-/// With no state object bound there is no shader table to dispatch against, and
-/// the visible symptom is an empty render target rather than an error — which is
-/// exactly the class the counters exist for.
-///
-/// # Safety
-/// `_arg` is never dereferenced. Declared `unsafe` because the DDI's PFN typedef
-/// is.
-unsafe extern "system" fn dispatch_rays(
-    _h_list: ddi12::D3D12DDI_HCOMMANDLIST,
-    _arg: *const ddi12::D3D12DDIARG_DISPATCH_RAYS_0054,
-) {
-    note_refusal(&L9_REFUSALS.dispatch_rays_refused);
-    if let Some(n) = budget(&RT_LOG) {
-        log_error!(
-            "DispatchRays: refused -- this driver reports RaytracingTier=NOT_SUPPORTED, so no \
-             state object was ever created to dispatch against (x{})",
-            n + 1,
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Command list: VRS — 2 slots, REFUSED on VariableShadingRateTier = NONE
 // ---------------------------------------------------------------------------
 
@@ -1955,8 +1524,8 @@ unsafe extern "system" fn dispatch_mesh(
 /// `pfnSetProgram` — **counted.**
 ///
 /// The `_0108` generalisation of pipeline binding: it selects a *program* out of
-/// a state object (generic, raytracing, or work-graph). Every state object create
-/// refuses, so the descriptor names nothing.
+/// a state object (generic, raytracing, or work-graph). This newer program
+/// identifier/binding contract remains refused; native DXR uses SetPipelineState1.
 ///
 /// ⚠ The descriptor's `Type` is read for the log line only, and only after the
 /// null check; its union arm is deliberately never touched.
@@ -1978,7 +1547,7 @@ unsafe extern "system" fn set_program(
             unsafe { (*p_desc).Type }
         };
         log_error!(
-            "SetProgram: refused program type={kind} -- no state object exists on this device \
+            "SetProgram: refused program type={kind} -- program identifier binding is unsupported \
              (x{})",
             n + 1,
         );
@@ -2207,6 +1776,15 @@ pub(crate) static REFUSALS: &[&RefusalCounter] = &[
     &L9_REFUSALS.dispatch_mesh_refused,
     &L9_REFUSALS.set_program_refused,
     &L9_REFUSALS.dispatch_graph_refused,
+    &L9_REFUSALS.rt_state_objects_created,
+    &L9_REFUSALS.rt_state_objects_added,
+    &L9_REFUSALS.rt_prebuild_info_forwarded,
+    &L9_REFUSALS.rt_build_forwarded,
+    &L9_REFUSALS.rt_postbuild_info_forwarded,
+    &L9_REFUSALS.rt_copy_forwarded,
+    &L9_REFUSALS.rt_pipeline_bound,
+    &L9_REFUSALS.rt_dispatch_forwarded,
+    &L9_REFUSALS.rt_error_callback_unavailable,
 ];
 
 /// `pfnGetDebugAllocationInfo` answered "no VA infos, no KMT infos".
@@ -2333,48 +1911,38 @@ pub(crate) struct L9Refusals {
     meta_command_required_parameter_bad_arg: RefusalCounter,
     /// `pfnCalcPrivateStateObjectSize` with a null arg. **Expected 0.**
     state_object_calc_bad_arg: RefusalCounter,
-    /// `pfnCreateStateObject` refused.
-    ///
-    /// ⚠ **Expected 0 while `RaytracingTier` and `WorkGraphsTier` both read
-    /// `NOT_SUPPORTED`; expected non-zero the moment a DXR or work-graph workload
-    /// runs anyway.** It is the single number that says whether raytracing is
-    /// worth costing: nothing else in this driver distinguishes "no app asked"
-    /// from "apps ask constantly and we decline".
+    /// State creation failed or its type/subobject was unsupported. Expected
+    /// zero for supported DXR workloads; nonzero for deliberate failure tests.
     state_object_refused: RefusalCounter,
-    /// `pfnCreateStateObject` was handed a null private slot. **Expected 0.**
+    /// Create received a null or misaligned private slot. Expected zero.
     state_object_bad_slot: RefusalCounter,
-    /// `pfnDestroyStateObject` on an object that was never created. ⚠ Expected to
-    /// track `StateObjectRefused` plus `AddToStateObjectRefused`.
+    /// Destroy received an invalid private slot. Expected zero; destroying the
+    /// initialized null from a failed create is permitted and does not count.
     state_object_destroy_unexpected: RefusalCounter,
-    /// `pfnGetRaytracingAccelerationStructurePrebuildInfo` answered three zeros.
-    ///
-    /// ⚠ **Expected 0**; a hit means an application is sizing acceleration-
-    /// structure buffers on a device that reports no raytracing, and it will get
-    /// zero-byte allocations. Read it beside `RtBuildRefused` — this one fires
-    /// *before* the build, so it is the earlier warning of the same workload.
+    /// A prebuild query failed and wrote zero sizes, with a device error.
+    /// Expected zero for supported inputs; deliberate invalid probes may move it.
     rt_prebuild_info_empty: RefusalCounter,
-    /// `pfnGetRaytracingAccelerationStructurePrebuildInfo` with a null
-    /// out-struct. **Expected 0.**
+    /// Missing/invalid prebuild output. Expected zero in every valid workload.
     rt_prebuild_info_bad_arg: RefusalCounter,
-    /// `pfnCheckDriverMatchingIdentifier` answered `UNSUPPORTED_TYPE`.
-    /// **Expected 0**; a hit means something is trying to deserialize a
-    /// previously-built acceleration structure against this driver.
+    /// A serialized identifier cannot be accepted. Expected nonzero for foreign
+    /// or unsupported formats, zero for compatible serialization round trips.
     driver_matching_identifier_refused: RefusalCounter,
-    /// `pfnGetShaderIdentifier` answered NULL. **Expected 0** — it can only be
-    /// reached with a state-object handle whose create refused.
+    /// Identifier query returned null. Valid for absent/collection exports;
+    /// nonzero for an expected executable export is a test failure.
     shader_identifier_absent: RefusalCounter,
-    /// `pfnGetShaderStackSize` answered `UINT_MAX`. **Expected 0.**
+    /// Stack query returned UINT_MAX (unknown export/subtype). Expected zero
+    /// except for deliberate absent-export validation.
     shader_stack_size_absent: RefusalCounter,
-    /// `pfnGetPipelineStackSize` answered 0. **Expected 0.**
+    /// Pipeline stack query failed. Expected zero.
     pipeline_stack_size_absent: RefusalCounter,
-    /// `pfnSetPipelineStackSize` was dropped. **Expected 0.**
+    /// Pipeline stack update had an invalid state object. Expected zero.
     set_pipeline_stack_size_dropped: RefusalCounter,
-    /// `pfnCalcPrivateAddToStateObjectSize` with a null arg. **Expected 0.**
+    /// AddToStateObject sizing received a null argument. Expected zero.
     add_to_state_object_calc_bad_arg: RefusalCounter,
-    /// `pfnAddToStateObject` refused. **Expected 0** — its
-    /// `StateObjectToGrowFrom` can only name an object whose create refused.
+    /// AddToStateObject failed. Expected zero for supported DXR additions;
+    /// nonzero for deliberately incompatible additions.
     add_to_state_object_refused: RefusalCounter,
-    /// `pfnAddToStateObject` was handed a null private slot. **Expected 0.**
+    /// Addition received a null or misaligned private slot. Expected zero.
     add_to_state_object_bad_slot: RefusalCounter,
     /// `pfnGetProgramIdentifier` answered a zeroed identifier. **Expected 0.**
     program_identifier_absent: RefusalCounter,
@@ -2410,10 +1978,7 @@ pub(crate) struct L9Refusals {
     /// 0** — the runtime only records into a list `pfnCreateCommandList` returned
     /// `S_OK` for.
     ///
-    /// ⚠ Only [`write_buffer_immediate`] can move it: it is the one slot here
-    /// that needs the engine list. Every other command-list slot in this lane
-    /// refuses without touching the handle, which is deliberate — a refusal has
-    /// no reason to dereference anything.
+    /// Immediate writes and native DXR recording can move this counter.
     command_list_missing: RefusalCounter,
     /// `pfnSetMarker` was dropped.
     ///
@@ -2514,20 +2079,20 @@ pub(crate) struct L9Refusals {
     meta_command_initialize_refused: RefusalCounter,
     /// `pfnExecuteMetaCommand` refused. **Expected 0.**
     meta_command_execute_refused: RefusalCounter,
-    /// `pfnBuildRaytracingAccelerationStructure` refused. **Expected 0**; a hit
-    /// means a DXR workload is running against `RaytracingTier = NOT_SUPPORTED`
-    /// and its acceleration structures do not exist.
+    /// Build/update refused, with a command-list error. Expected zero for
+    /// supported geometry; deliberate invalid/unsupported probes may move it.
     rt_build_refused: RefusalCounter,
-    /// `pfnEmitRaytracingAccelerationStructurePostbuildInfo` refused. **Expected
-    /// 0**; expected to trail `RtBuildRefused` when it moves.
+    /// Postbuild query refused, with a command-list error. Expected zero for
+    /// implemented information types; unsupported tools variants move it.
     rt_postbuild_info_refused: RefusalCounter,
-    /// `pfnCopyRaytracingAccelerationStructure` refused. **Expected 0.**
+    /// AS copy refused, with a command-list error. Expected zero for supported
+    /// modes; unsupported tools visualization must move it and fail Close.
     rt_copy_refused: RefusalCounter,
-    /// `pfnSetPipelineState1` refused. **Expected 0** — it binds a state object,
-    /// and every state-object create refused.
+    /// Invalid state-object/list binding, reported on the command list.
+    /// Expected zero for valid DXR workloads.
     set_pipeline_state1_refused: RefusalCounter,
-    /// `pfnDispatchRays` refused. **Expected 0**; a hit is an empty render target
-    /// with no error, which is why it also logs.
+    /// DispatchRays rejected, with a command-list error. Expected zero for
+    /// valid dimensions and shader-table ranges; negative probes may move it.
     dispatch_rays_refused: RefusalCounter,
     /// `pfnRSSetShadingRate` with the default `1X1` / all-`PASSTHROUGH` state,
     /// dropped.
@@ -2561,12 +2126,33 @@ pub(crate) struct L9Refusals {
     /// beside L6's mesh-shader creates: if those refuse and this moves, an
     /// application ignored the tier.
     dispatch_mesh_refused: RefusalCounter,
-    /// `pfnSetProgram` refused. **Expected 0** — it selects a program out of a
-    /// state object, and every state-object create refused.
+    /// `pfnSetProgram` refused. **Expected 0** — program identifier binding is
+    /// unsupported; DXR state-object binding uses SetPipelineState1 instead.
     set_program_refused: RefusalCounter,
     /// `pfnDispatchGraph` refused. **Expected 0**; like `DispatchMeshRefused`,
     /// its symptom is silence.
     dispatch_graph_refused: RefusalCounter,
+    /// Successful native state-object creates. Expected nonzero in DXR workloads;
+    /// compilation success does not establish rendering or full feature support.
+    rt_state_objects_created: RefusalCounter,
+    /// Successful AddToStateObject calls. Expected nonzero only when exercised.
+    rt_state_objects_added: RefusalCounter,
+    /// Engine prebuild sizes returned. Expected nonzero when AS sizing is used.
+    rt_prebuild_info_forwarded: RefusalCounter,
+    /// Build/update calls recorded into the engine. Expected nonzero in DXR;
+    /// this cannot establish submission, authenticated completion, or correct AS data.
+    rt_build_forwarded: RefusalCounter,
+    /// Explicit postbuild queries recorded. Zero is valid when build embeds them.
+    rt_postbuild_info_forwarded: RefusalCounter,
+    /// AS copies recorded, including compaction. Expected nonzero when exercised.
+    rt_copy_forwarded: RefusalCounter,
+    /// Pipeline bindings/unbindings forwarded. Expected nonzero during DXR.
+    rt_pipeline_bound: RefusalCounter,
+    /// DispatchRays calls recorded; dimensions may include zero. Expected nonzero
+    /// in DXR rendering. This is not proof of a changed pixel or GPU execution.
+    rt_dispatch_forwarded: RefusalCounter,
+    /// An error had no reachable runtime callback. Expected zero in every run.
+    rt_error_callback_unavailable: RefusalCounter,
 }
 
 pub(crate) static L9_REFUSALS: L9Refusals = L9Refusals {
@@ -2612,9 +2198,7 @@ pub(crate) static L9_REFUSALS: L9Refusals = L9Refusals {
     marker_dropped: RefusalCounter::new("L9MarkerDropped"),
     protected_resource_session_none: RefusalCounter::new("L9ProtectedResourceSessionNone"),
     protected_resource_session_refused: RefusalCounter::new("L9ProtectedResourceSessionRefused"),
-    write_buffer_immediate_calls: RefusalCounter::new(
-        "L9WriteBufferImmediateCalls",
-    ),
+    write_buffer_immediate_calls: RefusalCounter::new("L9WriteBufferImmediateCalls"),
     write_buffer_immediate_bad_arg: RefusalCounter::new("L9WriteBufferImmediateBadArg"),
     write_buffer_immediate_mode_unknown: RefusalCounter::new("L9WriteBufferImmediateModeUnknown"),
     write_buffer_immediate_engine_missing: RefusalCounter::new(
@@ -2636,4 +2220,13 @@ pub(crate) static L9_REFUSALS: L9Refusals = L9Refusals {
     dispatch_mesh_refused: RefusalCounter::new("L9DispatchMeshRefused"),
     set_program_refused: RefusalCounter::new("L9SetProgramRefused"),
     dispatch_graph_refused: RefusalCounter::new("L9DispatchGraphRefused"),
+    rt_state_objects_created: RefusalCounter::new("L9RaytracingStateObjectsCreated"),
+    rt_state_objects_added: RefusalCounter::new("L9RaytracingStateObjectsAdded"),
+    rt_prebuild_info_forwarded: RefusalCounter::new("L9RaytracingPrebuildInfoForwarded"),
+    rt_build_forwarded: RefusalCounter::new("L9RaytracingBuildForwarded"),
+    rt_postbuild_info_forwarded: RefusalCounter::new("L9RaytracingPostbuildInfoForwarded"),
+    rt_copy_forwarded: RefusalCounter::new("L9RaytracingCopyForwarded"),
+    rt_pipeline_bound: RefusalCounter::new("L9RaytracingPipelineBound"),
+    rt_dispatch_forwarded: RefusalCounter::new("L9RaytracingDispatchForwarded"),
+    rt_error_callback_unavailable: RefusalCounter::new("L9RaytracingErrorCallbackUnavailable"),
 };

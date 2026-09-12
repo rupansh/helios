@@ -1,13 +1,8 @@
 # GATES.md — the D3D12 acceptance suite, `D12-G0` … `D12-G11`
 
-> ⛔⛔ **DEMOTED 2026-08-06 BY OWNER DIRECTIVE — this file is no longer the order of work.**
-> It was written as a *ladder*: twelve rungs climbed in sequence, each driving the implementation
-> until its probe passed. That loop is rejected — see **`docs/dx12/METHOD.md`**, which is
-> authoritative over sequencing in every file in this directory.
->
-> **What changed:** a gate is now run **after** static analysis is saturated, to *accept* a
-> subsystem that was implemented to its contract. A gate no longer tells anyone what to build next,
-> and no gate is an entry condition for writing code.
+> **This file is an acceptance suite, not a required order of work.** The owner
+> retired the old mandatory review-round workflow on 2026-09-08. Select checks
+> appropriate to the subsystem and the behavior being validated.
 >
 > ⛔ **And a gate passing is not evidence that the code is right.** The proof is in this ladder's own
 > record: with `Umd12EclDelayUs=50000`, `D12-G8` rung 0 **passed** — pixels exactly correct — while
@@ -17,7 +12,7 @@
 >
 > **§1 below stands verbatim and is the most valuable part of this file.** It is about how to read
 > evidence from any run — session 0, counters persisting across boots, exit codes that lie — and none
-> of that is affected by the demotion.
+> of that is affected by the workflow change.
 
 **What this is:** the twelve checkpoints that accept Helios's D3D12 implementation, subsystem by
 subsystem. Each gate states an entry condition, the exact commands (verbatim, copy-pasteable), a pass
@@ -33,7 +28,7 @@ kernel-side impact of all of it — including the K1–K3 work items §4.13 assi
 `docs/dx12/KMD_IMPACT.md`. It is also
 not a performance document: only `D12-G10` reports a score, and it reports it as a 3-run median.
 
-**Gate → phase map** — ⚠ **read as scope, not as order.** `METHOD.md` owns sequencing; the phases
+**Gate → phase map** — ⚠ **read as scope, not as order.** The phases
 below describe *what a gate accepts*, and the P0→P7 progression no longer implies that work happens
 in that sequence or that one gate must pass before the next subsystem is implemented.
 
