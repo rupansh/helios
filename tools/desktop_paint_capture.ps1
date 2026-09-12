@@ -51,8 +51,11 @@ if ($script:progman -ne [IntPtr]::Zero) {
     W "PrintWindow(PW_RENDERFULLCONTENT) => $ok gle=$gle"
     $bmp.Save('Z:\tmp\progman_printwindow.png', [System.Drawing.Imaging.ImageFormat]::Png)
     # quick stats
-    $c1 = $bmp.GetPixel(500, 300); $c2 = $bmp.GetPixel(948, 515); $c3 = $bmp.GetPixel(100, 100)
-    W ("sample pixels: (500,300)={0} (948,515)={1} (100,100)={2}" -f $c1, $c2, $c3)
+    $px1 = [Math]::Min(500, $bmp.Width - 1); $py1 = [Math]::Min(300, $bmp.Height - 1)
+    $px2 = [Math]::Min(948, $bmp.Width - 1); $py2 = [Math]::Min(515, $bmp.Height - 1)
+    $px3 = [Math]::Min(100, $bmp.Width - 1); $py3 = [Math]::Min(100, $bmp.Height - 1)
+    $c1 = $bmp.GetPixel($px1, $py1); $c2 = $bmp.GetPixel($px2, $py2); $c3 = $bmp.GetPixel($px3, $py3)
+    W ("sample pixels: ({0},{1})={2} ({3},{4})={5} ({6},{7})={8}" -f $px1, $py1, $c1, $px2, $py2, $c2, $px3, $py3, $c3)
     $bmp.Dispose()
 }
 
@@ -65,8 +68,10 @@ try {
     $g2.CopyFromScreen($vs.X, $vs.Y, 0, 0, $bmp2.Size)
     $g2.Dispose()
     $bmp2.Save('Z:\tmp\screen_copy.png', [System.Drawing.Imaging.ImageFormat]::Png)
-    $s1 = $bmp2.GetPixel(500, 300); $s2 = $bmp2.GetPixel(948, 900)
-    W ("screen sample pixels: (500,300)={0} (948,900)={1}" -f $s1, $s2)
+    $x1 = [Math]::Min(500, $bmp2.Width - 1); $y1 = [Math]::Min(300, $bmp2.Height - 1)
+    $x2 = [Math]::Min(948, $bmp2.Width - 1); $y2 = [Math]::Min(900, $bmp2.Height - 1)
+    $s1 = $bmp2.GetPixel($x1, $y1); $s2 = $bmp2.GetPixel($x2, $y2)
+    W ("screen sample pixels: ({0},{1})={2} ({3},{4})={5}" -f $x1, $y1, $s1, $x2, $y2, $s2)
     $bmp2.Dispose()
     W "CopyFromScreen saved"
 } catch { W "CopyFromScreen FAILED: $_" }
