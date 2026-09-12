@@ -172,8 +172,11 @@ the XML SHA256 is
 Host VNC capture ran throughout completion and was stopped afterward. Its 91
 captures include changing demo pixels and graphics-test frames 3434 and 5276
 (57.png and 62.png), with advancing on-screen test time. Demo 20.png and GT 62.png
-were presented to the owner; visual acceptance is pending. Desktop capture and
-final inventory confirm a live desktop, Code 0, UmdD3D12=1 and no active probes or
+were accepted by the owner on 2026-09-12: "Looks correct". This acceptance applies
+to the F6D00A83 final allocator build and its 12,163 result. The captures are
+`tmp/allocator-epochs-20260911/portroyal-final-frames/20.png` and `62.png`.
+Desktop capture and final inventory confirm a live desktop, Code 0, UmdD3D12=1
+and no active probes or
 benchmarks. Task definitions are restored to ordinary RT mode without rerunning.
 No guest reboot, host renderer or VM-launcher change was made.
 
@@ -200,7 +203,8 @@ sparse fallback lacks mapping alias/residency semantics. DXR tools visualization
 extreme RT limits and other capability/behavior work remain open. General
 DX12-to-DX11 external ownership and consumer release, host-loss error-bearing
 completion, sharing/resize/rotation/teardown and async WSI stress retain their
-existing limits. The owner's prior Port Royal acceptance belongs to 057934F9. Time Spy, Fire
-Strike and Steel Nomad Vulkan remain regression controls; their completed
+existing limits. The owner accepted Port Royal separately on 057934F9 and this
+F6D00A83 final allocator build. Time Spy, Fire Strike and Steel Nomad Vulkan
+remain regression controls; their completed
 057934F9 receipts do not constitute tests of this allocator increment. They
 have not been rerun on F6D00A83.

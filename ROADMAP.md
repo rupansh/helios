@@ -25,13 +25,13 @@ no-RT refusal/readback and all four ordering cases pass. The small allocator
 probe passes 832 resets. Final Port Royal completes at **12,163 / 56.31 FPS**,
 with matching settings, changing rendered frames and zero pending-reset errors.
 The graphics test performs 42,353 rotations, including 42,180 reuses, without
-reset failures. The owner has been asked to judge the new captures; acceptance
-is pending. This is not a performance-gain claim.
+reset failures. On 2026-09-12 the owner accepted the final build's demo 20.png
+and graphics-test 62.png as visually correct. This is not a performance-gain claim.
 
 [ALLOCATOR_LIFETIME.md](docs/dx12/ALLOCATOR_LIFETIME.md) records the contract,
 source/build/deployment provenance, counters, tests and remaining acceptance.
 WDDM2.1/.271/oem54, UMD11, Mesa and async WSI are unchanged. Full FL12_1/DXR
-compliance and owner visual acceptance of this build remain separate.
+compliance remains open independently of this build's accepted Port Royal rendering.
 
 ## Conditional DXR admission, 2026-09-11
 
