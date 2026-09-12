@@ -12,6 +12,40 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
+## General FL12 testing candidate, 2026-09-12
+
+The owner prioritizes general native FL12_0/12_1 and optional DXR1.0 application
+testing over exhaustive conformance. Tools-visualization output and extreme RT
+limits are deferred unless an actual workload makes them blockers. Physical
+non-RT hardware testing belongs to the owner's later work; retain conditional
+RT support and the automated missing-feature refusal/readback checks. Keep the
+authorized sparse fallback and its explicit semantics/memory-cost exceptions;
+do not start broad sparse emulation work. General testing readiness does not
+mean complete FL/DXR conformance or general sharing/host-loss/WSI acceptance.
+
+Root master now merges origin/master `7133483`, including the AMD/RADV exported
+texture layout fix and the complete Windows Vulkan SDK installation path.
+Engine merge `f17f7936` combines upstream `fd348a8a` with the native DXR and
+allocator changes. Mesa merge `259f8e4e` retains our Venus work and includes the
+Gallium buffer-map failure repair `b7033eee`; that Gallium-only change does not
+alter the deployed Venus ICD. No unrelated dependency was reset or moved.
+
+Release UMD12 `C7241DE6` is deployed through ProgramData on unchanged
+WDDM2.1/.271/oem54, UMD11 `57C84ED4` and ICD `43394BBD`. Linux/Windows engine
+builds, Windows release UMD and A1 pass, including 211 KMD logic tests. The
+engine allocator test and all seven extracted threaded-map sanitizer cases pass.
+Native session1 caps, allocator, DXR, RT-disabled refusal/readback and all four
+ordering cases pass on the identified C7241DE6 UMD and system runtime. The
+benchmark and broader native regression receipts are pending; F6D00A83's owner
+visual acceptance remains scoped to that earlier build.
+
+Evidence: `tmp/fl12-general-testing-20260912/`. `source-provenance.json` corrects
+the captured manifest template's stale descriptive fields while retaining its
+72 verified source digests and original manifest hash. The Windows build receipt
+checks 67 mirrored production files, seven static archives and DLL imports/exports.
+This is a local integration and ProgramData update, not a new signed package,
+hosted-CI acceptance, host renderer change or VM-launcher restart. No work is pushed.
+
 ## Native allocator generations, 2026-09-11
 
 Current ProgramData UMD12 `F6D00A83…` gives a DDI command pool a separate
@@ -1177,9 +1211,8 @@ at the exact root checkpoint completed: KMD/native DX11/DX12 UMD and Mesa jobs
 succeeded; CLVK failed at its build step, so final signing/bundle assembly was
 skipped. Candidate `6344CB09…` includes the default-ON policy in its ProgramData
 hotplug; this validation retains explicit `UmdD3D12=1` and does not repeat the
-absent/zero policy checks. The signed package has not been updated. Existing performance/visual evidence below
-The original validation preceded hosted CI, and this default change had not been deployed. The live
-guest still has explicit `UmdD3D12=1`. Existing performance/visual evidence below
+absent/zero policy checks. The signed package has not been updated. The original
+validation preceded hosted CI. Existing performance/visual evidence below
 belongs to the earlier deployed artifacts; broader ownership and failure-path
 gaps in `docs/dx12/EXECUTION_SYNC.md` and `docs/HPS2_REFACTOR.md` remain open.
 

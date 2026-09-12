@@ -1,5 +1,13 @@
 # Reserved-resource compatibility backing
 
+**Owner scope, 2026-09-12:** retain this fallback for general testing. Do not
+spend further time on complete sparse semantics; make bounded improvements only
+when justified by real workload failures. A working host-driver sparse path is
+the practical route back to native backing, selected through the existing
+behavior probe. A driver update alone is not proof that the path works, and
+does not validate every remaining D3D tiled-resource obligation. The documented
+semantic and memory-cost exceptions remain; no new emulation project is authorized.
+
 On 2026-09-08 the owner authorized the upstream committed-backing fallback and
 required the advertised-but-broken color4 case to be handled dynamically. This
 is an explicit exception to complete sparse semantics. Native FL12_0/FL12_1

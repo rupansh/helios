@@ -1,5 +1,14 @@
 # PENDING.md — native FL12_0/FL12_1 and higher-feature contracts
 
+**Owner priority, 2026-09-12:** general-testing readiness supersedes exhaustive
+FL/DXR compliance as the immediate milestone. Tools visualization, extreme
+DXR limits and physical non-RT hardware tests are deferred unless real workloads
+demonstrate blockers. The owner handles physical non-RT testing later. Keep
+conditional RT support, safe failures and the existing sparse fallback; no
+further broad sparse work is requested. See FEATURE_LEVELS.md and ROADMAP.md
+for the current testing scope. Older "next subsystem" statements below do not
+override this direction or revive already repaired allocator work.
+
 **Allocator update, 2026-09-11:** the native frontend now rotates and recycles
 allocator generations when engine retirement references remain. This preserves
 pending backing without waiting for GPU idle or treating reference counts as

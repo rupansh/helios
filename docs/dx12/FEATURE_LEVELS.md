@@ -1,5 +1,16 @@
 # Native DX12 feature-level contract
 
+**Owner scope, 2026-09-12:** prioritize readiness for general native FL12_0/12_1
+and DXR1.0 application testing. Tools-visualization output, extreme DXR limit
+audits and physical non-RT hardware validation are deferred unless a concrete
+workload makes them blockers; the owner will test non-RT hardware separately.
+Retain conditional DXR admission and the documented sparse compatibility fallback.
+Only bounded fallback improvements justified by actual failures are in scope;
+do not pursue a general sparse emulation project. These exceptions prevent a
+full conformance claim but do not independently block general testing. The
+F6D00A83 allocator build's completed Port Royal was visually accepted on
+2026-09-12. ROADMAP.md records subsequent master integration and validation.
+
 **Current optional-DXR contract, 2026-09-11:** release465CBE13 replaces unconditional
 RT admission with engine-derived adapter caps and per-device identity/capability
 revalidation. An otherwise eligible non-RT engine reports RT0 and retains
