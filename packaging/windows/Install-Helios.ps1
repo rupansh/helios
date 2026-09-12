@@ -266,7 +266,28 @@ foreach ($store in @("Root", "TrustedPublisher")) {
 Write-HeliosJson $state $statePath
 
 Write-Host "Installing/updating the Microsoft Visual C++ x64 runtime..."
-Invoke-HeliosNative (Join-Path $payloadRoot "prerequisites\vc_redist.x64.exe") @("/install", "/quiet", "/norestart") -SuccessExitCodes @(0, 3010) -WaitForProcess
+$redistPath = Join-Path $payloadRoot "prerequisites\vc_redist.x64.exe"
+$requiredRuntimeVersion = [version](Get-Item -LiteralPath $redistPath).VersionInfo.FileVersion
+$installedRuntimeVersion = [version]"0.0"
+# Microsoft recommends checking the runtime registry before running an older
+# redistributable, which otherwise fails with ERROR_PRODUCT_VERSION (1638).
+foreach ($runtimeKey in @(
+    "HKLM:\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64",
+    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\VisualStudio\14.0\VC\Runtimes\x64"
+)) {
+    $runtime = Get-Item -LiteralPath $runtimeKey -ErrorAction SilentlyContinue
+    $version = [version]"0.0"
+    if ($runtime -and $runtime.GetValue("Installed", 0) -eq 1 -and
+        [version]::TryParse(([string]$runtime.GetValue("Version", "")).TrimStart("v", "V"), [ref]$version) -and
+        $version -gt $installedRuntimeVersion) {
+        $installedRuntimeVersion = $version
+    }
+}
+if ($installedRuntimeVersion -ge $requiredRuntimeVersion) {
+    Write-Host "Keeping installed Visual C++ x64 runtime $installedRuntimeVersion (bundle: $requiredRuntimeVersion)."
+} else {
+    Invoke-HeliosNative $redistPath @("/install", "/quiet", "/norestart") -SuccessExitCodes @(0, 3010) -WaitForProcess
+}
 
 $systemVulkanLoader = Join-Path $env:windir "System32\vulkan-1.dll"
 if (-not (Test-Path -LiteralPath $systemVulkanLoader -PathType Leaf)) {
