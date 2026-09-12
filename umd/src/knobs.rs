@@ -18,6 +18,7 @@
 //! | Value | Type | Absent |
 //! |---|---|---|
 //! | `UmdTrace` | DWORD | `false` (explicit non-zero enables) |
+//! | `UmdTimerRes` | DWORD | `true` (explicit 0 disables our timer request) |
 //! | `FeatureLevel11` | DWORD | `1` |
 //! | `VehicleFlipGateUs` | DWORD | `32000` |
 //! | `ScanoutAcquire` | DWORD | `true` (explicit 0 is the kill switch) |
@@ -71,6 +72,11 @@ use helios_umd_common::knobs::{BoolKnob, DwordKnob};
 
 /// Per-frame/per-op DDI chatter (`trace_line!`). Absent = OFF.
 pub(crate) static UMD_TRACE: BoolKnob = BoolKnob::new(c"UmdTrace", false);
+
+/// Native DXGI bypasses DXVK's swapchain timer setup. On 2026-09-12, PassMark's
+/// Venus polling sleeps lasted about 11 ms; a process-local 1 ms request raised
+/// its active DX11 frame rate from about 16 to 31 FPS. Keep 0 for paired A/B runs.
+pub(crate) static UMD_TIMER_RESOLUTION: BoolKnob = BoolKnob::new(c"UmdTimerRes", true);
 
 /// Feature-level profile selector. Absent = 1 (the full FL11 profile).
 pub(crate) static FEATURE_LEVEL_11: DwordKnob = DwordKnob::new(c"FeatureLevel11", 1);
@@ -199,9 +205,10 @@ pub(crate) fn log_knob_inventory() {
     helios_umd_common::log::log_knob_inventory(&resolved_inventory());
 }
 
-pub(crate) fn resolved_inventory() -> [(&'static str, u32); 10] {
+pub(crate) fn resolved_inventory() -> [(&'static str, u32); 11] {
     [
         ("UmdTrace", UMD_TRACE.get() as u32),
+        ("UmdTimerRes", UMD_TIMER_RESOLUTION.get() as u32),
         ("FeatureLevel11", FEATURE_LEVEL_11.get()),
         ("VehicleFlipGateUs", VEHICLE_FLIP_GATE_US.get()),
         ("ScanoutAcquire", SCANOUT_ACQUIRE.get() as u32),

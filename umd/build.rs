@@ -274,7 +274,7 @@ fn main() {
     // so that object is never pulled out of the static archive.
     for lib in [
         "setupapi", "gdi32", "user32", "ole32", "oleaut32", "version", "advapi32", "shell32",
-        "cfgmgr32",
+        "cfgmgr32", "winmm",
     ] {
         println!("cargo:rustc-link-lib=dylib={lib}");
     }

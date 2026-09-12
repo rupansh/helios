@@ -65,7 +65,9 @@ param(
         # colon-less pattern could never match.
         'present_frame_gate: DxvkError',
         'Present refused: frame gate failed',
-        'Present refused: required sample/color normalization unavailable'
+        'Present refused: required sample/color normalization unavailable',
+        'timer-resolution: timeBeginPeriod failed',
+        'timer-resolution: timeEndPeriod failed'
         # 2026-08-05: the 'DEVICE REMOVED' pattern was DELETED. Nothing in
         # umd/, umd/bridge/, kmd_render/ or dxvk-helios/src/ ever logs that
         # text (the only "DeviceRemoved" hits are D3D11 API method names), so

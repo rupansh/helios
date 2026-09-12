@@ -266,7 +266,11 @@ mod ffi {
         /// to take the first enumerated adapter. Returns a null `UniquePtr` on
         /// failure (no adapter, device creation threw, etc.). Never panics across
         /// the FFI boundary — the C++ side catches all exceptions.
-        fn helios_dxvk_create_device(luid_low: u32, luid_high: i32) -> UniquePtr<HeliosDxvkDevice>;
+        fn helios_dxvk_create_device(
+            luid_low: u32,
+            luid_high: i32,
+            timer_resolution: bool,
+        ) -> UniquePtr<HeliosDxvkDevice>;
     }
 }
 
@@ -482,7 +486,11 @@ impl BridgeDevice {
     /// threw, ...) -- folding the old `is_null()` check into construction so a
     /// `BridgeDevice` that exists is always usable.
     pub fn create(luid_low: u32, luid_high: i32) -> Option<Self> {
-        let inner = ffi::helios_dxvk_create_device(luid_low, luid_high);
+        let inner = ffi::helios_dxvk_create_device(
+            luid_low,
+            luid_high,
+            crate::knobs::UMD_TIMER_RESOLUTION.get(),
+        );
         (!inner.is_null()).then_some(Self { inner })
     }
 

@@ -235,4 +235,5 @@ struct HeliosDxvkDevice {
 // Returns nullptr on failure. Matches the cxx bridge signature in src/bridge.rs.
 std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     std::uint32_t luid_low,
-    std::int32_t  luid_high);
+    std::int32_t  luid_high,
+    bool timer_resolution);

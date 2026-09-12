@@ -8,6 +8,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <mmsystem.h>
 #include <sddl.h>
 
 #include <cstddef>
@@ -274,7 +275,46 @@ struct ScanoutFormat {
   }
 };
 
+class TimerResolution {
+public:
+  explicit TimerResolution(bool enabled) noexcept {
+    if (enabled) {
+      const auto result = timeBeginPeriod(1);
+      active = result == TIMERR_NOERROR;
+      if (!active)
+        record_failure("timeBeginPeriod", result);
+    }
+  }
+
+  ~TimerResolution() {
+    if (active) {
+      const auto result = timeEndPeriod(1);
+      if (result != TIMERR_NOERROR)
+        record_failure("timeEndPeriod", result);
+    }
+  }
+
+  TimerResolution(const TimerResolution&) = delete;
+  TimerResolution& operator=(const TimerResolution&) = delete;
+
+private:
+  bool active = false;
+
+  static void record_failure(const char* operation, MMRESULT result) noexcept {
+    static std::atomic<std::uint32_t> failures { 0 };
+    char message[128];
+    std::snprintf(message, sizeof(message),
+      "timer-resolution: %s failed code=%u failures=%u", operation,
+      unsigned(result), unsigned(failures.fetch_add(1, std::memory_order_relaxed) + 1));
+    umd_log(message);
+  }
+};
+
 struct HeliosDxvkDeviceImpl {
+  explicit HeliosDxvkDeviceImpl(bool timer_enabled) : timer_resolution(timer_enabled) { }
+
+  // Declared first so the request outlives all DXVK workers, including failed initialization.
+  TimerResolution timer_resolution;
   dxvk::Rc<dxvk::DxvkInstance> instance;
   dxvk::Rc<dxvk::DxvkAdapter>  adapter;
   dxvk::Rc<dxvk::DxvkDevice>   device;
@@ -1679,7 +1719,8 @@ std::size_t HeliosDxvkDevice::create_compute_shader(const std::uint8_t* code, st
 
 std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
     std::uint32_t luid_low,
-    std::int32_t  luid_high) {
+    std::int32_t  luid_high,
+    bool timer_resolution) {
   // R824: configuration delivered as a process-global side effect, whose
   // correctness used to be statement position -- these writes happened on EVERY
   // CreateDevice DDI, and one process (dwm) creates several D3D11 devices, so
@@ -1725,7 +1766,7 @@ std::unique_ptr<HeliosDxvkDevice> helios_dxvk_create_device(
       "helios_dxvk_create_device", nullptr,
       [&]() -> std::unique_ptr<HeliosDxvkDevice> {
       auto out = std::make_unique<HeliosDxvkDevice>();
-      out->impl = std::make_unique<HeliosDxvkDeviceImpl>();
+      out->impl = std::make_unique<HeliosDxvkDeviceImpl>(timer_resolution);
       auto& d = *out->impl;
 
       d.instance = new dxvk::DxvkInstance(dxvk::DxvkInstanceFlags());
