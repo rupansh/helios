@@ -1093,8 +1093,67 @@ including current SO probe attribution and the comments-only caps correction.
 Its frozen source and 17 counter gradings are recorded alongside the predeployment
 round9/10 saturation. The driver binary remains the round9 build; these probe,
 comment and evidence updates do not constitute a new driver compilation.
+## D3D12 on AMD/RADV: every D3D12 present scrambled, root-caused and fixed, 2026-09-09
+
+**Symptom (first AMD host run of the D3D12 stack, RX 6600 / RADV, WinBoat guest, .270):**
+every frame a D3D12 swapchain presents reaches the screen as horizontal stripes
+in 128-px columns - Steel Nomad Light, and equally a 30-line D3D12 test that only
+clears rectangles (`tmp/steel-nomad-20260909/d12pat.cpp`). The test's own readback
+of its back buffer is pixel-exact, so the app renders correctly; the buffer is
+misread when DWM opens it as a D3D11 shared surface. The stripe geometry is exact:
+128-px source bars become 12.8-row stripes, i.e. a 64 KB-tiled image read as linear
+rows of 5120 bytes. Time Spy is affected the same way on AMD; on the owner's NVIDIA
+host none of this shows.
+
+**Cause.** UMD12's fused `pfnCreateHeapAndResource` arm forwards a swapchain buffer
+as an explicit vkd3d heap (`VKD3D_HEAP_FLAG_HELIOS_VENUS_EXPORT`) plus a texture
+placed at offset zero. `d3d12_heap_init()` allocated that heap's memory at
+CreateHeap time - before any image existed - as a plain exportable, buffer-backed
+allocation (API dump of the live path: `vkAllocateMemory` with
+`VkMemoryAllocateFlagsInfo` + `VkExportMemoryAllocateInfo`, no
+`VkMemoryDedicatedAllocateInfo`, then `vkBindBufferMemory2`, then the image). RADV
+only records an image's tiling metadata on exported memory when that memory is a
+dedicated allocation of the image (`radv_GetMemoryFdKHR` ->
+`radv_image_bo_set_metadata`), and DWM's DXVK import is a dedicated import that
+re-derives its image layout from that metadata, falling back to LINEAR when the
+metadata is absent (`radv_patch_surface_from_metadata`). NVIDIA's layout is a
+function of the create parameters alone, which is why the buffer-backed export
+was never noticed. Reproduced in isolation by `tmp/steel-nomad-20260909/vkshare.cpp`
+(in-guest Vulkan: export/import round trip is correct for every dedicated-image
+variant and wrong only when the exported memory has no image attached).
+
+**Fix (vkd3d fork, `libs/vkd3d/{heap.c,resource.c,vkd3d_private.h}`):** an export
+heap no longer allocates in `d3d12_heap_init()`; it is marked pending and
+`d3d12_resource_create_placed()` materialises it at the first placement through
+`d3d12_heap_helios_allocate_pending()`. A texture placed at offset zero on a
+GPU-local heap makes the exported memory a `VkMemoryDedicatedAllocateInfo`
+allocation of that image, sized exactly to the image (VUID 02964); buffers,
+non-zero offsets and CPU-accessible heaps materialise the previous plain
+exportable heap. The committed fallback for memory-less heaps is preserved. The
+D3D11 side, the ICD and the KMD are unchanged. Packaged as **22.22.271.0**.
 
 ## D3D12 default and Windows CI, 2026-09-07
+
+Hosted run `34055565048` built the driver and both UMDs successfully, but CLVK
+failed to configure because the SDK extraction action omitted Vulkan headers
+and the loader import library; final bundle assembly was skipped. The CI setup
+now uses the official unattended copy-only installer with a complete-directory
+cache and checks development files before CLVK starts. On `firstheberg2-win`,
+SDK 1.4.350.0 download/install took 53.4 seconds; a second validation took 0.1
+seconds. A CMake Vulkan discovery/compile/link probe passes, and a missing SDK
+is rejected before existing source/build trees are removed. CLVK also configures
+and builds against the new SDK in 133.5 seconds using a warm tree whose source
+pin, LLVM dependency, and two clspv patches were verified. Hosted validation
+of this installer change remains pending.
+
+The full 22.22.270.0 package was also built and test-signed on `firstheberg2-win`
+from `dcdb8b38`, using a separate checkout to preserve existing QA source edits.
+DXVK, vkd3d, the KMD, both UMDs, both Mesa architectures, loaders and probes
+were rebuilt; CLVK reused only its verified warm compiler tree. Driver INF and
+UMD import/export checks, compatibility lifecycle tests, and all 35 package
+manifest entries/signing-certificate checks passed. The package records actual
+tool versions, including LLVM 22.1.8, Meson 1.12.0 and widl 11.12; this is a
+build-box validation, not a new Helios GPU/runtime acceptance result.
 
 The owner requested default DX12 admission and a Windows CI bundle containing
 the native D3D12 UMD. `UmdD3D12` now defaults ON; explicit DWORD `0` still
@@ -1119,6 +1178,8 @@ succeeded; CLVK failed at its build step, so final signing/bundle assembly was
 skipped. Candidate `6344CB09…` includes the default-ON policy in its ProgramData
 hotplug; this validation retains explicit `UmdD3D12=1` and does not repeat the
 absent/zero policy checks. The signed package has not been updated. Existing performance/visual evidence below
+The original validation preceded hosted CI, and this default change had not been deployed. The live
+guest still has explicit `UmdD3D12=1`. Existing performance/visual evidence below
 belongs to the earlier deployed artifacts; broader ownership and failure-path
 gaps in `docs/dx12/EXECUTION_SYNC.md` and `docs/HPS2_REFACTOR.md` remain open.
 
@@ -1533,6 +1594,26 @@ including the wedge experiments, are in the archive under
 verified correction" above.
 
 ## Workstream 1 — Stability
+
+**2026-09-08 — WinBoat Blender / Mesa buffer-map failure (open).** The installed
+`.270/dcdb8b38` bundle's `libgallium_wgl.dll` COFF symbols resolve Blender 5.2's
+recorded write to address `0x143` to `tc_buffer_map+0x23c`, not the nearest
+export (`stw_unbind_context`) printed by Blender's crash reporter. That
+instruction writes through an unchanged transfer pointer after the driver's
+`buffer_map` call. Gallium explicitly permits a failed map to return NULL
+without changing the transfer output (`docs/gallium/context.rst`, Transfers).
+The Mesa fix pinned by the submodule checks the return before initializing the transfer;
+it also frees incomplete CPU shadow storage and returns failure if the initial
+GPU-to-CPU copy cannot be mapped. No map failure is reported as success.
+`CC=clang python tools/test_tc_buffer_map.py` runs the actual function body
+against a fake pipe driver under ASan/UBSan: all seven cases pass, including
+failure cleanup/retry and synchronized/unsynchronized success. The same test
+with `--revision a04516a702dff81d3a2e44019cdd79abf3fb7423` crashes in all four failure cases and passes the three
+success cases. This harness does not validate the Windows ABI or driver stack.
+The source fix is **not deployed**. The original map failure's cause and the
+stalled RDP session's relationship to it remain unproven; both factory-startup
+and normal-argument Blender reached their viewports under CDB after the
+owner-authorized VM restart without triggering the first-chance AV handler.
 
 **IDD frame freeze: DIAGNOSED 2026-07-05 (17th session), live on the frozen boot** — full chain
 in memory `idd-freeze-root-cause-chain`. Summary: (1) routine multi-second completion stalls

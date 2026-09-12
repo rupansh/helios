@@ -69,11 +69,14 @@ jobs:
           # This action revision's asset table stops at LLVM 21. Use the
           # official Windows installer explicitly for the VM-matched version.
           force-url: https://github.com/llvm/llvm-project/releases/download/llvmorg-${{ env.LLVM_VERSION }}/LLVM-${{ env.LLVM_VERSION }}-win64.exe
-      - name: Install Vulkan SDK tools
-        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff
+      - name: Restore Vulkan SDK
+        uses: actions/cache@v4
         with:
-          version: ${{ env.VULKAN_SDK_VERSION }}
-          cache: true
+          path: C:/VulkanSDK/${{ env.VULKAN_SDK_VERSION }}
+          key: vulkan-sdk-windows-x64-full-v1-${{ env.VULKAN_SDK_VERSION }}
+      - name: Install and validate Vulkan SDK
+        shell: pwsh
+        run: ./ci/windows/Install-VulkanSdk.ps1 -Version $env:VULKAN_SDK_VERSION
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
@@ -199,11 +202,14 @@ jobs:
           variant: sccache
           max-size: 2G
           key: windows-2022-clvk-online
-      - name: Install Vulkan SDK
-        uses: humbletim/install-vulkan-sdk@30ba978f977e81b72d091fc8888feb1fb26f9aff
+      - name: Restore Vulkan SDK
+        uses: actions/cache@v4
         with:
-          version: ${{ env.VULKAN_SDK_VERSION }}
-          cache: true
+          path: C:/VulkanSDK/${{ env.VULKAN_SDK_VERSION }}
+          key: vulkan-sdk-windows-x64-full-v1-${{ env.VULKAN_SDK_VERSION }}
+      - name: Install and validate Vulkan SDK
+        shell: pwsh
+        run: ./ci/windows/Install-VulkanSdk.ps1 -Version $env:VULKAN_SDK_VERSION
       - name: Build CLVK
         shell: pwsh
         run: ./ci/windows/Build-OpenCL.ps1 -OutputDir "$env:RUNNER_TEMP/helios-opencl" -ClvkRepository $env:CLVK_REPOSITORY -ClvkCommit $env:CLVK_COMMIT

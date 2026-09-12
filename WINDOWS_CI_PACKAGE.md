@@ -102,6 +102,14 @@ in [EXECUTION_SYNC.md](docs/dx12/EXECUTION_SYNC.md) and
 
 ## Hosted runner requirements
 
+The driver and OpenCL jobs use `ci/windows/Install-VulkanSdk.ps1` to run the
+official LunarG installer in unattended copy-only mode. The complete versioned
+SDK directory is cached. Both jobs validate the Vulkan header, x64 loader
+import library, and shader compiler on cache hits as well as fresh installs.
+Extracting the installer with 7-Zip is insufficient for SDK 1.4.350.0: it can
+produce working shader tools while omitting the development files CLVK needs.
+`Build-OpenCL.ps1` checks those files before deleting build trees or fetching LLVM.
+
 The driver and package jobs require Visual Studio 2022 and the Windows 11 SDK
 and WDK. The setup script uses an already installed WDK when available and
 otherwise installs the official 10.0.26100 SDK/WDK packages with winget. A
