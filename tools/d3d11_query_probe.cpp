@@ -66,6 +66,7 @@ template<class Poll,class Flush> static Result poll_query(UINT size,Poll poll,Fl
     const ULONGLONG deadline=GetTickCount64()+10000;
     bool flushed=false;
     for (;;) {
+        result=Result{};
         const HRESULT hr=poll(result.data(),size,D3D11_ASYNC_GETDATA_DONOTFLUSH);
         // Also reject a blocking GetData that eventually returns S_OK late.
         // An external task watchdog is still needed if the call never returns.
@@ -76,7 +77,8 @@ template<class Poll,class Flush> static Result poll_query(UINT size,Poll poll,Fl
             return result;
         }
         CHECK(hr == S_FALSE ? S_OK : hr);
-        require(result.untouched(),"S_FALSE leaves the entire caller buffer unchanged");
+        // API payload is readable only after S_OK. Pending-buffer preservation
+        // is a separate DDI obligation, tested in query_contract.rs.
         ++pending;
         if (!flushed) { flush(); flushed=true; }
         require(GetTickCount64() < deadline,"query completion within 10 seconds");
