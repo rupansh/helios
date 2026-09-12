@@ -12,20 +12,29 @@ resolves there. What is kept below is what a reader needs *now*: the stage, the 
 baseline, the priorities, per-workstream status with its open items, and the tooling
 inventory. Sections retained are carried **verbatim**; only the connective text is new.
 
-## Publication integration, 2026-09-12
+## GitHub publication, 2026-09-12
 
-The owner authorized publishing all accumulated changes. Root merge `9509107`
-preserves the newer upstream `36d575e` metadata, packaging and capture fixes;
-Mesa merge `d2ee351e185` preserves its matching branding changes and the tested
-native Venus work. Mesa is published and verified on `winboat-org/mesa-helios`
-`main`. DXVK, QEMU, virglrenderer and venus-protocol revisions are unchanged.
+The owner authorized publishing all accumulated changes. Root master incorporates
+upstream through `0752648`, preserving its metadata, packaging, capture, signing,
+UTF-8 and lockfile fixes alongside the native FL12/DXR work. Mesa merge
+`d2ee351e185` preserves its matching branding changes and the tested native Venus
+work. DXVK, QEMU, virglrenderer and venus-protocol revisions are unchanged.
 
-The DXIL compiler's local `f4651bd0` contains required stream-output and
-mixed-sample lowering. Engine `9d4731f1` points that dependency at the intended
-`winboat-org/dxil-spirv` fork. Compiler, engine and root publication await creation
-of that repository: neither the organization nor personal fork exists, and the
-available GitHub API credentials return HTTP 401. SSH pushes work. Publish and
-verify the compiler before the engine, then publish the root gitlinks.
+The owner created the missing DXIL fork. Its `f4651bd0` contains required
+stream-output and mixed-sample lowering; engine `9d4731f1` points the compiler
+submodule at that fork. The compiler and engine `master` branches and Mesa `main`
+are pushed and verified before publishing the root pointers:
+
+| GitHub repository | Branch | Published revision |
+|---|---|---|
+| winboat-org/dxil-spirv | master | f4651bd076a2613728823ec289abc121a348a48a |
+| winboat-org/vkd3d-proton | master | 9d4731f154ee3dc45f33eb900aba1f2233e2f14b |
+| winboat-org/mesa-helios | main | d2ee351e185db9b28e7dfcc1d9d91dd1a168577e |
+
+The root submodule URL now uses the engine's canonical WinBoat location, confirmed
+by GitHub's repository-move response. Compiler, engine and root history are
+preserved without force pushes. The existing renderer/protocol publications and
+the unchanged DXVK/QEMU branch references are also verified.
 
 Metadata synchronization, two resource-parser tests, 213 KMD logic tests, native
 UMD host clippy, DDI slot coverage and log checks pass after integration. A1's
@@ -33,9 +42,11 @@ text scan reports seven panic-pattern matches, all in metadata tests or Cargo
 build scripts; inspection confirms they are not driver-runtime paths. Other A1
 checks pass; its unmodified aggregate exit status remains 1. Receipts are in
 `tmp/publish-fl12-20260912/`. These source/publication changes were not deployed.
-The general-testing evidence below remains tied to UMD12 C7241DE6 and its exact
-compiled sources; the newer metadata integration has no new Windows build or
-runtime acceptance.
+Metadata and both updated lockfiles pass the final consistency/parse checks,
+including bindgen 0.72.1. The general-testing evidence below remains tied to UMD12
+C7241DE6 and its exact compiled sources. The incoming Windows package-validation
+record remains scoped to upstream `6e8de383`; no new Windows build or guest
+validation is claimed for this combined publication merge.
 
 ## Metadata consistency, 2026-09-12
 
@@ -143,7 +154,8 @@ runtime D3D12/Core is 10.0.26100.9278 with DDI _0110; native FL11_0..12_1 creati
 passes, FL12_2 is refused, maximum FL is 12_1, SM is 6.3 and RT tier is 1.0.
 The Windows build uses LLVM/libclang 22.1.8 and Vulkan SDK 1.4.350.0.
 This is a local integration and ProgramData update, not a new signed package,
-hosted-CI acceptance, host renderer change or VM-launcher restart. No work is pushed.
+hosted-CI acceptance, host renderer change or VM-launcher restart. Nothing was
+pushed during that validation; the publication checkpoint above supersedes this.
 
 ## Native allocator generations, 2026-09-11
 

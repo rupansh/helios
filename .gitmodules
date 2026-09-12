@@ -9,7 +9,7 @@
 	url = https://github.com/rupansh/dxvk
 [submodule "vkd3d-proton-helios"]
 	path = vkd3d-proton-helios
-	url = https://github.com/rupansh/vkd3d-proton
+	url = https://github.com/winboat-org/vkd3d-proton.git
 [submodule "qemu-helios"]
 	path = qemu-helios
 	url = https://github.com/rupansh/qemu-helios.git
