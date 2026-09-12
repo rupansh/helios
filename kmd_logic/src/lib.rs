@@ -4782,8 +4782,8 @@ pub mod snapshot_bind {
         Layout,
         /// No virtio scan-out encoding for `dxgi_format`.
         Format,
-        /// Descriptor format differs from the DXGI allocation-list source.
-        /// Both can be individually supported but are not interchangeable.
+        /// Descriptor format is not the canonical normalization of the DXGI
+        /// allocation-list source. Supported channel layouts are not interchangeable.
         SourceFormatMismatch,
         /// A WindowedBlt path received a direct-bind descriptor (or vice
         /// versa). These are different consumers and must never be inferred.
@@ -4849,7 +4849,19 @@ pub mod snapshot_bind {
         if d.purpose != 1 {
             return Err(SnapshotReject::Purpose);
         }
-        if d.dxgi_format != source_dxgi_format {
+        // The UMD resolves/converts into a canonical single-sample snapshot:
+        // packed RGB10 becomes RGBA8; sRGB keeps its encoded bytes in UNORM.
+        // Keep this exact mapping in sync with UMD snapshot_scanout_format.
+        // Accepting arbitrary supported format pairs would silently swizzle
+        // channels; requiring the original sRGB format would reject the very
+        // normalization that prevents the KMD blit from decoding it to linear.
+        let normalized_source_format = match source_dxgi_format {
+            24 | 29 => 28,
+            91 => 87,
+            93 => 88,
+            other => other,
+        };
+        if d.dxgi_format != normalized_source_format {
             return Err(SnapshotReject::SourceFormatMismatch);
         }
         if d.resource_id == 0 {
@@ -5147,6 +5159,38 @@ mod snapshot_bind_tests {
             validate_windowed_blt(&d, 1920, 1080, 87),
             Err(SnapshotReject::Purpose)
         );
+    }
+
+    #[test]
+    fn windowed_blt_accepts_only_the_canonical_normalized_source() {
+        let mut d = good();
+        d.purpose = 1;
+        for (source, normalized) in [(24, 28), (29, 28), (91, 87), (93, 88)] {
+            for candidate in [0, 24, 28, 29, 87, 88, 91, 93] {
+                d.dxgi_format = candidate;
+                let expected = if candidate == normalized {
+                    Ok(())
+                } else {
+                    Err(SnapshotReject::SourceFormatMismatch)
+                };
+                assert_eq!(
+                    validate_windowed_blt(&d, 1920, 1080, source),
+                    expected,
+                    "source {source}, snapshot {candidate}"
+                );
+            }
+            d.dxgi_format = normalized;
+            assert_eq!(
+                validate_windowed_blt(&d, 1280, 800, source),
+                Err(SnapshotReject::ExtentMismatch)
+            );
+            d.purpose = 0;
+            assert_eq!(
+                validate_windowed_blt(&d, 1920, 1080, source),
+                Err(SnapshotReject::Purpose)
+            );
+            d.purpose = 1;
+        }
     }
 
     /// OPTIMAL image allocation size is a Vulkan memory requirement, not a
