@@ -107,7 +107,7 @@ function Assert-NoOverrides {
 }
 function Get-RepositoryProvenance([string]$Repository) {
     $workTree = [IO.Path]::GetFullPath($Repository)
-    $marker = Get-Item -LiteralPath (Join-Path $workTree '.git')
+    $marker = Get-Item -Force -LiteralPath (Join-Path $workTree '.git')
     if ($marker.PSIsContainer) {
         $gitDirectory = $marker.FullName
     } else {
