@@ -2,19 +2,8 @@ param(
   # RELEASE by default, matching install-helios-kmd.ps1. Pass
   # -UmdDll ...\target\debug\helios_umd.dll for a deliberate debug deploy.
   [string]$UmdDll = "C:\Users\Rupansh\helios-vgpu\umd\target\release\helios_umd.dll",
-  # The D3D12 UMD (`DECISIONS.md` D3 -- UserModeDriverName slot 3).
-  #
-  # ⛔ EMPTY BY DEFAULT, and that is deliberate. Passing it is an explicit,
-  # opt-in act that rewrites slot 3 of a REG_MULTI_SZ dwm resolves at device
-  # start. When empty this script's registry writes are bit-identical to what
-  # they were before D3D12 existed, so a routine D3D11 deploy cannot acquire a
-  # D3D12 path by accident.
-  #
-  # ⚠ Wiring slot 3 for real is stage S5 (`ARCHITECTURE.md` §11), which also
-  # deletes `umd`'s own refusing OpenAdapter12 export and lands the `UmdD3D12`
-  # kill switch in the same commit. Until then `helios_umd12.dll` refuses with
-  # DXGI_ERROR_UNSUPPORTED, so registering it is inert -- but it is still a
-  # change to what dwm resolves, so it must be asked for.
+  # Optional native D3D12 replacement. When omitted, preserve the installed
+  # UserModeDriverName[3] exactly; the package may already enable D3D12.
   [string]$Umd12Dll = "",
   [ValidateSet("ProgramData", "DriverStore", "PackageUpgrade")]
   [string]$Mode = "ProgramData",
@@ -51,37 +40,110 @@ function Stop-UmdUsers([string]$DllPath) {
   }
 }
 
-Assert-HeliosAdmin
-Stop-LookingGlassHostService
-$cleared = Clear-HeliosPendingRenames
-if ($cleared -gt 0) { Write-Host "Removed $cleared stale Helios pending rename operation(s)." }
+function Get-UmdRegistration($Key, [string]$Name, [switch]$Optional) {
+  if ($Name -notin $Key.GetValueNames()) {
+    if ($Optional) { return }
+    throw "$Name is missing; activate a complete Helios package before hotplug."
+  }
+  if ($Key.GetValueKind($Name) -ne [Microsoft.Win32.RegistryValueKind]::MultiString) {
+    throw "$Name must be REG_MULTI_SZ."
+  }
+  $paths = @($Key.GetValue($Name))
+  if ($paths.Count -ne 4) { throw "$Name has $($paths.Count) entries, want 4." }
+  foreach ($path in $paths) {
+    if ($path -isnot [string] -or [string]::IsNullOrWhiteSpace($path) -or
+        $path -ne $path.Trim() -or $path -notmatch '(?i)(^|[\\/])[^\\/:*?"<>|]+\.dll$') {
+      throw "$Name contains an invalid DLL registration: '$path'."
+    }
+  }
+  return $paths
+}
 
+function Assert-UmdRegistrationEqual([string]$Name, [string[]]$Expected, [string[]]$Actual) {
+  if ($Expected.Count -ne $Actual.Count) { throw "$Name changed length unexpectedly." }
+  for ($i = 0; $i -lt $Expected.Count; $i++) {
+    if ($Expected[$i] -cne $Actual[$i]) {
+      throw "$Name[$i] is '$($Actual[$i])', expected '$($Expected[$i])'."
+    }
+  }
+}
+
+Assert-HeliosAdmin
 if (-not (Test-Path -LiteralPath $UmdDll -PathType Leaf)) { throw "UMD DLL not found: $UmdDll" }
 $deployUmd12 = -not [string]::IsNullOrWhiteSpace($Umd12Dll)
 if ($deployUmd12) {
   if (-not (Test-Path -LiteralPath $Umd12Dll -PathType Leaf)) { throw "D3D12 UMD DLL not found: $Umd12Dll" }
   if ($Mode -ne "ProgramData") {
-    # DriverStore/PackageUpgrade ship helios_umd12.dll through the INF, which is
-    # stage S5 work and not this script's to fake.
-    throw "-Umd12Dll is only supported in -Mode ProgramData; the DriverStore/package path ships the D3D12 UMD via the INF (ARCHITECTURE.md S5)"
+    throw "-Umd12Dll is only supported in -Mode ProgramData; use the complete package installer to update packaged D3D12 binaries."
   }
 }
 $id = Get-HeliosInstanceId $InstanceId
 $srcHash = Get-HeliosFileHash $UmdDll
 $src12Hash = if ($deployUmd12) { Get-HeliosFileHash $Umd12Dll } else { "" }
 $classKey = Get-HeliosClassKey $id
-# Native hotplug does not replace the installed WoW64 UMDs. Keep their flat
-# inventory entries when rewriting InstalledDisplayDrivers for native clients.
-$wowUmdNames = @((Get-Item -LiteralPath $classKey).GetValue("UserModeDriverNameWoW", @()) |
-  Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-  ForEach-Object { [IO.Path]::GetFileNameWithoutExtension([string]$_) } |
-  Select-Object -Unique)
 $activeInf = Get-HeliosActiveInfName $id
 $store = Get-HeliosActiveStoreDir $id $activeInf
+if ($Mode -eq "ProgramData") {
+  # This local debug helper accepts ordinary filesystem paths, not UNC or
+  # extended/device namespaces that can alias a protected DriverStore path.
+  if ($ProgramDataDir -match '^(\\\\|//)') {
+    throw "ProgramDataDir must use an ordinary local drive path: $ProgramDataDir"
+  }
+  $ProgramDataDir = [IO.Path]::GetFullPath($ProgramDataDir)
+  if ([IO.Path]::DirectorySeparatorChar -eq '\' -and $ProgramDataDir -notmatch '^[A-Za-z]:\\') {
+    throw "ProgramDataDir must use an ordinary local drive path: $ProgramDataDir"
+  }
+}
 $programDataDll = Join-Path $ProgramDataDir ("helios_umd_{0}.dll" -f $srcHash.Substring(0, 16).ToLowerInvariant())
 $programData12Dll = if ($deployUmd12) {
   Join-Path $ProgramDataDir ("helios_umd12_{0}.dll" -f $src12Hash.Substring(0, 16).ToLowerInvariant())
 } else { "" }
+
+if ($Mode -eq "ProgramData") {
+  # Validate the existing registration before any file, service or device changes.
+  # Native-only historical packages may omit WoW64, but a present value must be
+  # a complete table. This helper never writes UserModeDriverNameWoW.
+  $key = Get-Item -LiteralPath $classKey
+  $nativePaths = @(Get-UmdRegistration $key "UserModeDriverName")
+  $wowPaths = @(Get-UmdRegistration $key "UserModeDriverNameWoW" -Optional)
+  $umdPaths = @($programDataDll, $programDataDll, $programDataDll, $nativePaths[3])
+  if ($deployUmd12) { $umdPaths[3] = $programData12Dll }
+  # InstalledDisplayDrivers is a flat inventory, not an indexed DDI table.
+  $seenNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+  $umdNames = @(foreach ($path in ($umdPaths + $wowPaths)) {
+    $name = [IO.Path]::GetFileNameWithoutExtension($path)
+    if ($seenNames.Add($name)) { $name }
+  })
+
+  # ProgramData mode must not become a DriverStore edit via an alternate path.
+  $destinationRoot = [IO.Path]::GetFullPath($ProgramDataDir).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+  foreach ($protected in @($store, (Join-Path $env:windir 'System32\DriverStore'))) {
+    $protectedRoot = [IO.Path]::GetFullPath($protected).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    if ($destinationRoot.StartsWith($protectedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+      throw "ProgramDataDir must be outside DriverStore: $ProgramDataDir"
+    }
+  }
+  # Lexical path checks do not follow junctions. Refuse any reparse point in
+  # the destination ancestry, including an existing leaf or a dangling link.
+  # Missing directories are allowed; access/provider errors remain fatal.
+  $ancestor = $ProgramDataDir
+  while ($ancestor) {
+    $item = $null
+    try { $item = Get-Item -LiteralPath $ancestor -Force -ErrorAction Stop }
+    catch [System.Management.Automation.ItemNotFoundException] { }
+    if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+      throw "ProgramDataDir must not traverse a reparse point: $ancestor"
+    }
+    $parent = Split-Path -Parent $ancestor
+    if ($parent -eq $ancestor) { break }
+    $ancestor = $parent
+  }
+} elseif ($Mode -eq "DriverStore" -and -not $ForceDriverStoreEdit) {
+  throw "-Mode DriverStore edits the active DriverStore package. Pass -ForceDriverStoreEdit only for an emergency debug override."
+} elseif ($Mode -eq "PackageUpgrade") {
+  $inf = Join-Path $PackageDir "helios_kmd_render.inf"
+  if (-not (Test-Path -LiteralPath $inf -PathType Leaf)) { throw "Package INF not found: $inf" }
+}
 
 Write-HeliosPlan "Helios UMD hotplug" @{
   Mode = $Mode
@@ -99,9 +161,11 @@ Write-HeliosPlan "Helios UMD hotplug" @{
 }
 if ($PlanOnly) { return }
 
+Stop-LookingGlassHostService
+$cleared = Clear-HeliosPendingRenames
+if ($cleared -gt 0) { Write-Host "Removed $cleared stale Helios pending rename operation(s)." }
+
 if ($Mode -eq "PackageUpgrade") {
-  $inf = Join-Path $PackageDir "helios_kmd_render.inf"
-  if (-not (Test-Path -LiteralPath $inf -PathType Leaf)) { throw "Package INF not found: $inf" }
   Invoke-HeliosPnpUtil @("/add-driver", $inf, "/install") 120 | Out-Null
   if ($RestartDevice) {
     Invoke-HeliosPnpUtil @("/restart-device", $id) 90 | Out-Null
@@ -109,9 +173,6 @@ if ($Mode -eq "PackageUpgrade") {
     Write-Host "Package upgraded. Skipping adapter restart; reboot or pass -RestartDevice for a controlled test."
   }
 } elseif ($Mode -eq "DriverStore") {
-  if (-not $ForceDriverStoreEdit) {
-    throw "-Mode DriverStore edits the active DriverStore package. Pass -ForceDriverStoreEdit only for an emergency debug override."
-  }
   $dst = Join-Path $store "helios_umd.dll"
   if ($RestartDevice) { Invoke-HeliosPnpUtil @("/disable-device", $id, "/force") 90 | Out-Null }
   try {
@@ -137,58 +198,10 @@ if ($Mode -eq "PackageUpgrade") {
       $copy12 = Copy-HeliosFileVerified $Umd12Dll $programData12Dll 10 1000
       Grant-HeliosReadExecute $ProgramDataDir
       Write-Host "Installed ProgramData D3D12 UMD: $($copy12.Destination)"
-
-      # `DECISIONS.md` D3: UserModeDriverName is a REG_MULTI_SZ indexed by
-      # KMTUMDVERSION (DX9=0, DX10=1, DX11=2, DX12=3). Slots 0-2 stay on
-      # helios_umd.dll; slot 3 is the D3D12 UMD.
-      #
-      # ⛔ FOUR entries, never six. D3DKMTQueryAdapterInfo(KMTQAITYPE_UMDRIVERNAME)
-      # returns STATUS_INVALID_PARAMETER for versions 4/5 on this adapter, so
-      # DX12_WSA32/DX12_WSA64 must not be written.
-      $umdPaths = @($programDataDll, $programDataDll, $programDataDll, $programData12Dll)
-      # ⚠ InstalledDisplayDrivers is NOT index-parallel to UserModeDriverName --
-      # it is a flat list of the DISTINCT package binaries, so it is TWO entries
-      # here, not four (`DECISIONS.md` §6.1). The pre-D3D12 value was four copies
-      # of "helios_umd", which is semantically wrong; it is corrected on this arm
-      # only, so a D3D11-only deploy keeps its historical value bit-for-bit.
-      $umdNames = @("helios_umd", "helios_umd12")
-    } else {
-      $umdPaths = @($programDataDll, $programDataDll, $programDataDll, $programDataDll)
-      $umdNames = @("helios_umd", "helios_umd", "helios_umd", "helios_umd")
     }
-    if ($wowUmdNames.Count -gt 0) { $umdNames = @($umdNames + $wowUmdNames | Select-Object -Unique) }
     New-ItemProperty -LiteralPath $classKey -Name "UserModeDriverName" -PropertyType MultiString -Value $umdPaths -Force | Out-Null
     New-ItemProperty -LiteralPath $classKey -Name "InstalledDisplayDrivers" -PropertyType MultiString -Value $umdNames -Force | Out-Null
     Write-Host "Installed ProgramData UMD: $($copy.Destination)"
-    # ALSO sync the active DriverStore package copy: at COLD BOOT dxgkrnl's
-    # first UMD-path resolution loads the package's helios_umd.dll (before the
-    # registry override takes effect for later device creates), so a stale
-    # DriverStore copy means dwm's first — composition — device runs an old
-    # UMD every boot (proven 2026-07-03: two different handler generations in
-    # one dwm process, early devices on the stale DLL).
-    $storeDll = Join-Path $store "helios_umd.dll"
-    if (Test-Path -LiteralPath $storeDll -PathType Leaf) {
-      & takeown.exe /F $storeDll | Out-Null
-      & icacls.exe $storeDll /grant "Administrators:F" | Out-Null
-      # The package copy is routinely MAPPED by long-lived shell processes
-      # (observed 2026-07-27: ShellHost, SystemSettings, CrossDeviceResume), so
-      # the plain Copy-Item this replaces hit a sharing violation and every
-      # deploy of a session silently left the cold-boot copy stale — measured
-      # that day: store SHA 56473A67 against a current F0C7A2E6, last written
-      # eight hours and six deploys earlier. -DisplaceInUse renames the loaded
-      # image aside so the new one lands at the real path.
-      #
-      # Verified by hash like every other copy in this script, and it THROWS on
-      # failure instead of printing a red blob while the deploy reports success:
-      # a stale package copy is exactly the cold-boot hazard the comment above
-      # describes, so it must not be possible to miss it.
-      $storeCopy = Copy-HeliosFileVerified $UmdDll $storeDll 5 750 -DisplaceInUse
-      Write-Host "Synced DriverStore UMD: $($storeCopy.Destination)"
-      $reaped = Remove-HeliosDisplacedCopies $storeDll
-      if ($reaped -gt 0) { Write-Host "Reaped $reaped displaced DriverStore UMD copy(ies)." }
-    } else {
-      Write-Warning "DriverStore UMD not found at $storeDll - cold boots may load a stale UMD"
-    }
   } finally {
     if ($RestartDevice) {
       Write-Host "Re-enabling Helios after ProgramData UMD replacement."
@@ -213,43 +226,33 @@ if ($Mode -eq "PackageUpgrade") {
 Start-Sleep -Seconds 2
 $state = Get-HeliosPnpState $id
 $state | Format-List
-$activeUmd = if ($Mode -eq "ProgramData") { $programDataDll } else { Join-Path (Get-HeliosActiveStoreDir $id (Get-HeliosActiveInfName $id)) "helios_umd.dll" }
-$activeHash = Get-HeliosFileHash $activeUmd
-Write-Host "Active UMD:  $activeUmd"
-Write-Host "Active hash: $activeHash"
-if ($activeHash -ne $srcHash) { throw "UMD hotplug failed: active hash $activeHash does not match source $srcHash" }
+$deployedUmd = if ($Mode -eq "ProgramData") { $programDataDll } else { Join-Path (Get-HeliosActiveStoreDir $id (Get-HeliosActiveInfName $id)) "helios_umd.dll" }
+$deployedHash = Get-HeliosFileHash $deployedUmd
+Write-Host "Deployed UMD file: $deployedUmd"
+Write-Host "Deployed SHA256:   $deployedHash"
+if ($deployedHash -ne $srcHash) { throw "UMD hotplug failed: destination hash $deployedHash does not match source $srcHash" }
 
-if ($deployUmd12) {
-  $active12Hash = Get-HeliosFileHash $programData12Dll
-  Write-Host "Active D3D12 UMD:  $programData12Dll"
-  Write-Host "Active D3D12 hash: $active12Hash"
-  if ($active12Hash -ne $src12Hash) { throw "D3D12 UMD hotplug failed: active hash $active12Hash does not match source $src12Hash" }
-
-  # Read the registry BACK and assert the shape, rather than trusting the write.
-  # This is `GATES.md` D12-G6's pass criterion in miniature, and it exists
-  # because "four entries" alone passes on the pre-split driver: every one of
-  # the four used to point at helios_umd.dll, so only the VALUE of index 3
-  # distinguishes a real D3D12 registration from the historical value.
-  $names = @((Get-ItemProperty -LiteralPath $classKey).UserModeDriverName)
-  if ($names.Count -ne 4) { throw "UserModeDriverName has $($names.Count) entries, want 4" }
-  if ($names[3] -notmatch 'helios_umd12_[0-9a-f]{16}\.dll$') { throw "UserModeDriverName[3] is '$($names[3])', want the deployed helios_umd12 DLL" }
-  if (@($names[0..2] | Where-Object { $_ -notmatch 'helios_umd_[0-9a-f]{16}\.dll$' }).Count -ne 0) { throw "UserModeDriverName[0..2] must all stay on helios_umd" }
-  if (-not (Test-Path -LiteralPath $names[3] -PathType Leaf)) { throw "UserModeDriverName[3] path does not exist on disk: $($names[3])" }
-  $installed = @((Get-ItemProperty -LiteralPath $classKey).InstalledDisplayDrivers)
-  $expectedInstalled = @(@("helios_umd", "helios_umd12") + $wowUmdNames | Select-Object -Unique)
-  if ($installed.Count -ne $expectedInstalled.Count -or (Compare-Object $expectedInstalled $installed)) {
-    throw "InstalledDisplayDrivers must retain the native and installed WoW64 UMD names: $($expectedInstalled -join ',')"
+if ($Mode -eq "ProgramData") {
+  if ($deployUmd12) {
+    $deployed12Hash = Get-HeliosFileHash $programData12Dll
+    Write-Host "Deployed D3D12 UMD file: $programData12Dll"
+    Write-Host "Deployed D3D12 SHA256:   $deployed12Hash"
+    if ($deployed12Hash -ne $src12Hash) { throw "D3D12 UMD hotplug failed: destination hash $deployed12Hash does not match source $src12Hash" }
   }
-  Write-Host "UserModeDriverName[3]     -> $($names[3])"
-  Write-Host "InstalledDisplayDrivers   -> $($installed -join ',')"
 
-  # ⚠ COLD BOOT: dxgkrnl's first UMD-path resolution reads the DriverStore
-  # package, not this registry override. The package ships helios_umd12.dll only
-  # once the INF carries it, which is stage S5 -- so until then a cold boot has
-  # NO D3D12 UMD and D3D12 device creation falls back to whatever slot 3 held
-  # before. That is harmless while OpenAdapter12 refuses, and it is exactly why
-  # this arm is opt-in.
-  Write-Warning "D3D12 UMD is registered in the ProgramData override only; the DriverStore package does not carry helios_umd12.dll until the INF change (ARCHITECTURE.md S5). Cold boots will not see it."
+  $key = Get-Item -LiteralPath $classKey
+  $registered = @(Get-UmdRegistration $key "UserModeDriverName")
+  Assert-UmdRegistrationEqual "UserModeDriverName" $umdPaths $registered
+  $registeredWow = @(Get-UmdRegistration $key "UserModeDriverNameWoW" -Optional)
+  Assert-UmdRegistrationEqual "UserModeDriverNameWoW" $wowPaths $registeredWow
+  if ($key.GetValueKind("InstalledDisplayDrivers") -ne [Microsoft.Win32.RegistryValueKind]::MultiString) {
+    throw "InstalledDisplayDrivers must be REG_MULTI_SZ."
+  }
+  $installed = @($key.GetValue("InstalledDisplayDrivers"))
+  Assert-UmdRegistrationEqual "InstalledDisplayDrivers" $umdNames $installed
+  Write-Host "Registered native UMD paths: $($registered -join ', ')"
+  Write-Host "InstalledDisplayDrivers:     $($installed -join ', ')"
+  Write-Warning "Registration and file hashes are verified; loaded modules are not. Windows may retain a cached UMD path, even for new processes. If the override is not selected, activate a complete package through the normal installer and perform its required restart, then verify the loaded module paths. DriverStore was not modified."
 }
 
 if (-not $NoProbe -and (Test-Path -LiteralPath $Probe -PathType Leaf)) {

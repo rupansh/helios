@@ -15,8 +15,8 @@ instructions below are retained only for restoring or diagnosing the former mode
   hash and prints the final device or registry state.
 - Do not manually copy into DriverStore during normal iteration. DriverStore writes bypass SetupAPI
   catalog/package state and can leave Windows bound to stale or inconsistent package metadata.
-- ProgramData is the normal UMD/ICD hotplug location because those paths are selected by registry
-  values read by new user-mode clients.
+- ProgramData is the normal UMD/ICD hotplug location for registry overrides. Windows may cache
+  UMD selection even for new clients; verify loaded module paths after activation.
 - In the historical Looking Glass IDD mode, keep `Looking Glass (host)`
   stopped/disabled. Only `LGIddHelper` should run.
 - The VM exposes no reliable ICMP. SSH failing with ping-like checks is not proof the guest is down.
@@ -152,27 +152,36 @@ Default UMD hotplug:
 powershell -NoProfile -ExecutionPolicy Bypass -File Z:\tools\hotplug-helios-umd.ps1
 ```
 
-The default mode installs the UMD to:
+ProgramData mode copies the native D3D11 UMD to a content-hashed filename:
 
 ```text
-C:\ProgramData\HeliosUmd\helios_umd.dll
+C:\ProgramData\HeliosUmd\helios_umd_<first-16-SHA256-digits>.dll
 ```
 
-and rewrites the active display software key:
+It sets `UserModeDriverName[0..2]` to that path and preserves the existing
+`UserModeDriverName[3]` (D3D12) exactly. To replace the native D3D12 UMD too,
+pass `-Umd12Dll <path>`; slot 3 then names
+`C:\ProgramData\HeliosUmd\helios_umd12_<first-16-SHA256-digits>.dll`.
+`UserModeDriverNameWoW` remains unchanged. `InstalledDisplayDrivers` lists the
+unique extensionless filenames from both resulting registrations, including the
+content-hashed native filenames and any installed WoW64 binaries. Missing or
+malformed native registration, or a malformed present WoW64 table, fails preflight.
+The destination must use an ordinary local drive path outside DriverStore and must
+not traverse junctions or other reparse points. This helper updates native UMDs only;
+use the complete package installer to update all four binaries.
 
-```text
-UserModeDriverName = C:\ProgramData\HeliosUmd\helios_umd.dll x4
-InstalledDisplayDrivers = helios_umd
-```
-
-This avoids repeated active DriverStore writes during UMD-only iteration. The script still rebinds
-the display software key so new D3D processes load the new DLL. It does not disable/re-enable the
-Helios PCI adapter by default; pass `-RestartDevice` only for a controlled adapter-restart test.
+ProgramData mode never writes the DriverStore. Verified files and registry values
+do not prove which UMD a process loaded: Windows can retain a cached UMD path,
+even for new processes. If the override is not selected, activate a complete
+package through the normal installer, perform its required restart, and verify the
+actual loaded module paths. A guest reboot still requires the owner's authorization.
+The helper leaves the Helios PCI adapter running by default; `-RestartDevice` is
+an explicit controlled adapter-restart test, not proof that the new DLL was selected.
 
 Alternative modes:
 
 ```powershell
-# Active DriverStore fallback. Use only if ProgramData override is suspected.
+# Emergency active DriverStore edit; use normal package activation for cached UMD paths.
 powershell -NoProfile -ExecutionPolicy Bypass -File Z:\tools\hotplug-helios-umd.ps1 -Mode DriverStore -ForceDriverStoreEdit
 
 # Microsoft-supported package-upgrade shape for DIRID 13 packages.
@@ -188,6 +197,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File Z:\tools\hotplug-helios-umd.
 
 The UMD script:
 
+- Validates inputs and registration before mutation; `-PlanOnly` performs read-only discovery.
 - Stops/disables the Looking Glass host service.
 - Clears stale Helios pending rename operations.
 - Copies through a temporary file, moves into place, and verifies SHA256.
