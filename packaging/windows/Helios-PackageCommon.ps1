@@ -157,9 +157,20 @@ function Get-HeliosRegistrySnapshot([Parameter(Mandatory)][string]$Path, [Parame
     }
 }
 
+function Ensure-HeliosRegistryKey([Parameter(Mandatory)][string]$Path) {
+    # Registry New-Item -Force REPLACES existing keys and all their contents.
+    # Build missing parents individually without Force; a racing creator must
+    # fail safely rather than erase that creator's values or children.
+    if (Test-Path -LiteralPath $Path) { return }
+    $parent = Split-Path -Path $Path -Parent
+    if (-not $parent -or $parent -eq $Path) { throw "No existing registry root for $Path." }
+    Ensure-HeliosRegistryKey $parent
+    New-Item -Path $Path -ErrorAction Stop | Out-Null
+}
+
 function Restore-HeliosRegistrySnapshot([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)]$Snapshot) {
     if ([bool]$Snapshot.exists) {
-        New-Item -Path $Path -Force | Out-Null
+        Ensure-HeliosRegistryKey $Path
         New-ItemProperty -LiteralPath $Path -Name $Name -Value $Snapshot.value -PropertyType ([string]$Snapshot.kind) -Force | Out-Null
     } elseif (Test-Path -LiteralPath $Path) {
         Remove-ItemProperty -LiteralPath $Path -Name $Name -ErrorAction SilentlyContinue

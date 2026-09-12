@@ -26,7 +26,9 @@ $logDir = 'C:\ProgramData\Helios'
 $out = "Z:\tmp\abi-$Label.txt"
 
 # Knob on. Absent = off, so this is the only value that matters.
-New-Item -Path 'HKLM:\SOFTWARE\Helios' -Force | Out-Null
+if (-not (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Helios')) {
+    New-Item -Path 'HKLM:\SOFTWARE\Helios' -ErrorAction Stop | Out-Null
+}
 Set-ItemProperty -Path 'HKLM:\SOFTWARE\Helios' -Name 'UmdTrace' -Value 1 -Type DWord
 
 $exe = 'C:\Users\Rupansh\helios-probe\helios_ownership_soak.exe'

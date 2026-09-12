@@ -44,6 +44,12 @@ jobs:
       - name: Initialize DXVK and vkd3d sources
         shell: pwsh
         run: git submodule update --init --recursive dxvk-helios vkd3d-proton-helios
+      - name: Check registry snapshot preservation (PowerShell 7)
+        shell: pwsh
+        run: ./packaging/windows/Test-HeliosRegistrySnapshots.ps1
+      - name: Check registry snapshot preservation (Windows PowerShell)
+        shell: powershell
+        run: ./packaging/windows/Test-HeliosRegistrySnapshots.ps1
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ env.PYTHON_VERSION }}

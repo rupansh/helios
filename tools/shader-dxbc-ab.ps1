@@ -60,7 +60,9 @@ New-Item -ItemType Directory -Path $dumpDir -Force | Out-Null
 
 # The knob is read ONCE per process (a function-local static), so it must be set
 # before the workload starts, and only a NEW process picks it up.
-New-Item -Path 'HKLM:\SOFTWARE\Helios' -Force | Out-Null
+if (-not (Test-Path -LiteralPath 'HKLM:\SOFTWARE\Helios')) {
+    New-Item -Path 'HKLM:\SOFTWARE\Helios' -ErrorAction Stop | Out-Null
+}
 Set-ItemProperty -Path 'HKLM:\SOFTWARE\Helios' -Name 'ShaderBytecodeDumpPath' `
     -Value $dumpDir -Type String
 

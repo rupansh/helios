@@ -18,6 +18,16 @@ function Test-IsAdmin {
   return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Ensure-HeliosIcdRegistryKey([Parameter(Mandatory)][string]$Path) {
+  # Preserve other vendors and create missing ancestors without the Registry
+  # provider's destructive New-Item -Force behavior.
+  if (Test-Path -LiteralPath $Path) { return }
+  $parent = Split-Path -Path $Path -Parent
+  if (-not $parent -or $parent -eq $Path) { throw "No existing registry root for $Path." }
+  Ensure-HeliosIcdRegistryKey $parent
+  New-Item -Path $Path -ErrorAction Stop | Out-Null
+}
+
 function Remove-StaleHeliosIcdValues([string]$RegPath) {
   if (-not (Test-Path -LiteralPath $RegPath)) { return }
   $item = Get-Item -LiteralPath $RegPath
@@ -171,7 +181,7 @@ $installRegPath = if ($Scope -eq "Machine") { "HKLM:\SOFTWARE\Khronos\Vulkan\Dri
 if (-not $NoRegistryCleanup) {
   foreach ($regPath in $cleanupRegPaths) { Remove-StaleHeliosIcdValues $regPath }
 }
-New-Item -Path $installRegPath -Force | Out-Null
+Ensure-HeliosIcdRegistryKey $installRegPath
 New-ItemProperty -LiteralPath $installRegPath -Name $manifest -Value 0 -PropertyType DWord -Force | Out-Null
 
 $destHash = Get-HeliosFileHash $destDll

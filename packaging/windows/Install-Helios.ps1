@@ -377,7 +377,7 @@ $vulkanJson = [ordered]@{
     }
 }
 Write-HeliosJson $vulkanJson $vulkanManifestPath -Encoding ASCII
-New-Item -Path $vulkanRegistry -Force | Out-Null
+Ensure-HeliosRegistryKey $vulkanRegistry
 New-ItemProperty -LiteralPath $vulkanRegistry -Name $vulkanManifestPath -Value 0 -PropertyType DWord -Force | Out-Null
 
 $vulkanX86Dll = Join-Path $runtimeRoot "mesa\x86\vulkan_virtio.dll"
@@ -390,7 +390,7 @@ $vulkanX86Json = [ordered]@{
     }
 }
 Write-HeliosJson $vulkanX86Json $vulkanManifestX86Path -Encoding ASCII
-New-Item -Path $vulkanRegistryX86 -Force | Out-Null
+Ensure-HeliosRegistryKey $vulkanRegistryX86
 New-ItemProperty -LiteralPath $vulkanRegistryX86 -Name $vulkanManifestX86Path -Value 0 -PropertyType DWord -Force | Out-Null
 
 New-ItemProperty -LiteralPath $classKey -Name "OpenGLDriverName" -Value $wglPath -PropertyType String -Force | Out-Null
@@ -400,7 +400,7 @@ New-ItemProperty -LiteralPath $classKey -Name "OpenGLDriverNameWow" -Value $wglX
 New-ItemProperty -LiteralPath $classKey -Name "OpenGLVersionWow" -Value 2 -PropertyType DWord -Force | Out-Null
 New-ItemProperty -LiteralPath $classKey -Name "OpenGLFlagsWow" -Value 1 -PropertyType DWord -Force | Out-Null
 
-New-Item -Path $openClRegistry -Force | Out-Null
+Ensure-HeliosRegistryKey $openClRegistry
 New-ItemProperty -LiteralPath $openClRegistry -Name $clvkPath -Value 0 -PropertyType DWord -Force | Out-Null
 
 Copy-Item -LiteralPath (Join-Path $bundleRoot "Helios-PackageCommon.ps1") -Destination $stateRoot -Force
